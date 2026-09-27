@@ -142,6 +142,22 @@ plausible-looking failure first:
   has read it.
 
 The recurrence state is `[layer, head, key_dim, val_dim]`, fp32 or bf16.
+### Attention front-end: per-head QK-norm and RoPE
+
+`rope_check.hip` covers the two transforms between the q/k projections and the
+attention kernel, at head_dim 256 with rotary_dim 64 and theta 1e7:
+
+| batch | q rel | k rel |
+| ---: | ---: | ---: |
+| 8 | 5.8e-8 | 6.0e-8 |
+| 64 | 1.3e-7 | 1.3e-7 |
+| 256 | 4.6e-7 | 4.6e-7 |
+
+RoPE is the half-split form applied to the first `rotary_dim` of `head_dim`:
+`freq = theta^(-2i/rotary_dim)`, `angle = pos * freq`, and the rotation pairs
+element `i` with element `i + rotary_dim/2`. The per-head norm is RMS over the
+whole `head_dim` (256), not over `rotary_dim` -- a distinction the two constants
+invite and that the check now pins.
 ## Clock
 
 A rate here is not comparable without the clock it ran at. Use
