@@ -1,8 +1,8 @@
-# Strix Halo inference engine — design notes
+# YAH — yet another halo engine
 
 Design notes and measured evidence for a **narrow-scope GGUF inference engine** on AMD Strix Halo: text and image parsing, three routing modes (GPU, NPU, GPU+NPU), and minimal resident memory.
 
-This is the scoping repo for a greenfield engine: [scope.md](docs/scope.md) is the plan, [targets.md](docs/targets.md) fixes the model artifacts and the quant-decoder matrix, and the rest records the measurements the plan is built on. The numbers come from work on [gufo](https://github.com/gufo-org/gufo), a general GGUF engine, where the NPU is attached behind environment-variable-gated xclbin paths; the argument here is that the *narrow* scope is what makes a purpose-built engine worth writing.
+This is the scoping repo for a greenfield engine: [scope.md](docs/scope.md) is the plan, [targets.md](docs/targets.md) fixes the model artifacts and the quant-decoder matrix, [engine/](engine/) is the implementation tree, and the rest records the measurements the plan is built on. The numbers come from work on [gufo](https://github.com/gufo-org/gufo), a general GGUF engine, where the NPU is attached behind environment-variable-gated xclbin paths; the argument here is that the *narrow* scope is what makes a purpose-built engine worth writing.
 
 ## Hardware and model
 

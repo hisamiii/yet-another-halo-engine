@@ -1,6 +1,6 @@
-# Scope: the greenfield engine
+# Scope: YAH (yet another halo engine)
 
-**Decision: greenfield.** A new codebase and a new execution architecture, not a fork. The reason to go greenfield is precisely the thing the measurements exposed: the NPU is currently a bolt-on behind environment variables in a general engine, and its costs (a serial chain, a host-blocking wait, a duplicated launch, a per-layer repack) are structural. In a new engine the two engines and the power budget are the architecture, not an optimisation.
+**Decision: greenfield.** A new codebase and a new execution architecture, not a fork. The reason to go greenfield is precisely the thing the measurements exposed: the NPU is currently a bolt-on behind environment variables in a general engine, and its costs (a serial chain, a host-blocking wait, a duplicated launch, a per-layer repack) are structural. In a new engine the two engines and the power budget are the architecture, not an optimisation. The implementation tree is [../engine/](../engine/); its layout maps one directory per workstream below.
 
 ## Frozen scope
 
