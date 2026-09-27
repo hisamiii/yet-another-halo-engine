@@ -25,3 +25,8 @@ three fixed prompts; the second requires 20 greedy tokens to match the
 reference's, token for token. Both pass on the IQ4_XS artifact. Prefill is
 chunked and carries KV plus recurrent state across chunks; decode uses the GEMV
 and single-token kernels and runs at about 14 tok/s.
+
+Weights are a single registered mapping: the GGUF's own `mmap` is registered
+with HIP from its page-aligned base, so there is no second copy. Peak RSS on a
+5-token run is 12.4 GiB against 24.6 GiB when the tensor region is copied,
+which is the headroom a long context needs.

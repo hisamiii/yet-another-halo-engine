@@ -48,6 +48,22 @@ every tensor at `hipHostGetDevicePointer`. The engine does the same in
 in the session that produced this note was the embedding kernel reading the
 unregistered mapping, not the recurrence it was first blamed on.
 
+The copy is not actually required. `hipHostRegister` refuses the tensor region
+because it starts after the metadata and so is not page aligned, but registering
+the *whole file mapping* from its page-aligned base and offsetting the device
+pointer by the data region's start works, after `mprotect` widens the read-only
+mapping to read-write (a private copy-on-write mapping; the GPU only reads, so
+no page is copied). The engine does this by default now and falls back to the
+copy only if the driver refuses the registration.
+
+Measured peak RSS on the same 5-token run: the copy path peaks at **24.6 GiB**
+because the file's source pages and the anonymous copy are resident at once
+during the `memcpy`, and the registration pins only the copy. Direct
+registration peaks at **12.4 GiB** for about 0.6 s more load time (7.9 s vs
+7.3 s). That 12 GiB of headroom is what makes a long context plausible at all:
+16 fp16 attention layers at 128k is 8.6 GiB of cache, and 12.4 + 8.6 fits where
+24.6 + 8.6 does not.
+
 The diagnostic that found it in one boot was a stage-synchronous mode
 (`YAH_SYNC_STAGES`) writing an unbuffered line to a persistent file after every
 kernel group: the last line before the hang names the kernel. `/tmp` is wiped

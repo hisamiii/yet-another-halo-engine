@@ -17,9 +17,11 @@
 #include <hip/hip_runtime.h>
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstddef>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -113,50 +115,100 @@ class HipWeightRegion {
  public:
   explicit HipWeightRegion(const core::Gguf& gguf) {
     const auto* source = gguf.tensor_data_base();
+    const std::size_t data_offset = gguf.tensor_data_offset();
+    tensor_data_host_ = const_cast<std::uint8_t*>(source);
     size_ = gguf.tensor_data_size();
     if (size_ == 0) {
       throw std::runtime_error("yah weights: empty tensor region");
     }
-    void* copy = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (copy == MAP_FAILED) {
-      throw std::runtime_error("yah weights: anonymous mapping failed");
+    // Preferred: register the file mapping in place, so the GGUF stays the
+    // single copy the scope requires. The tensor region starts after the
+    // metadata and is not page aligned, while hipHostRegister needs an aligned
+    // base, so the whole file mapping is registered from its page-aligned base
+    // and the device pointer is offset by the data region's start. The mapping
+    // is widened to read-write first (private copy-on-write; the GPU only
+    // reads, so no page is actually copied) because the driver may reject
+    // read-only memory. The copy path is the fallback, and YAH_WEIGHTS_COPY
+    // forces it for comparison.
+    if (std::getenv("YAH_WEIGHTS_COPY") == nullptr) {
+      const long page = ::sysconf(_SC_PAGESIZE);
+      const std::size_t page_size =
+          page > 0 ? static_cast<std::size_t>(page) : 4096;
+      const std::size_t mapped =
+          (gguf.file_size() + page_size - 1) & ~(page_size - 1);
+      auto* file_base = const_cast<std::uint8_t*>(source - data_offset);
+      const int protect = ::mprotect(file_base, mapped, PROT_READ | PROT_WRITE);
+      if (protect != 0) {
+        std::fprintf(stderr, "yah weights: mprotect failed errno=%d\n", errno);
+      } else {
+        const hipError_t status = hipHostRegister(
+            file_base, mapped, hipHostRegisterMapped | hipHostRegisterReadOnly);
+        void* device = nullptr;
+        if (status == hipSuccess &&
+            hipHostGetDevicePointer(&device, file_base, 0) == hipSuccess) {
+          host_ = file_base;
+          device_region_ = static_cast<std::uint8_t*>(device) + data_offset;
+          direct_ = true;
+          registered_ = true;
+          std::fprintf(stderr,
+                       "yah weights: registered the file mapping in place\n");
+        } else if (status != hipSuccess) {
+          std::fprintf(stderr,
+                       "yah weights: file-mapping register refused: %s\n",
+                       hipGetErrorString(status));
+        }
+      }
     }
-    host_ = static_cast<std::uint8_t*>(copy);
-    (void)::madvise(host_, size_, MADV_HUGEPAGE);
-    std::memcpy(host_, source, size_);
-    if (hipHostRegister(host_, size_,
-                        hipHostRegisterMapped | hipHostRegisterReadOnly) !=
-        hipSuccess) {
-      ::munmap(host_, size_);
-      host_ = nullptr;
-      throw std::runtime_error("yah weights: hipHostRegister failed");
+    if (!direct_) {
+      void* copy = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (copy == MAP_FAILED) {
+        throw std::runtime_error("yah weights: anonymous mapping failed");
+      }
+      host_ = static_cast<std::uint8_t*>(copy);
+      (void)::madvise(host_, size_, MADV_HUGEPAGE);
+      std::memcpy(host_, source, size_);
+      // The registered copy is now the source of truth; drop the file-mapping
+      // pages so the resident set is the pinned copy alone.
+      (void)::madvise(const_cast<std::uint8_t*>(source), size_, MADV_DONTNEED);
+      if (hipHostRegister(host_, size_,
+                          hipHostRegisterMapped | hipHostRegisterReadOnly) !=
+          hipSuccess) {
+        ::munmap(host_, size_);
+        host_ = nullptr;
+        throw std::runtime_error("yah weights: hipHostRegister failed");
+      }
+      registered_ = true;
     }
-    registered_ = true;
-    void* device = nullptr;
-    if (hipHostGetDevicePointer(&device, host_, 0) != hipSuccess) {
-      throw std::runtime_error("yah weights: hipHostGetDevicePointer failed");
+    if (!direct_) {
+      void* device = nullptr;
+      if (hipHostGetDevicePointer(&device, host_, 0) != hipSuccess) {
+        throw std::runtime_error("yah weights: hipHostGetDevicePointer failed");
+      }
+      device_region_ = static_cast<std::uint8_t*>(device);
     }
-    device_ = static_cast<std::uint8_t*>(device);
   }
 
   ~HipWeightRegion() {
-    if (registered_) (void)hipHostUnregister(host_);
-    if (host_ != nullptr) (void)::munmap(host_, size_);
+    // The direct case must not munmap the mapping the Gguf owns.
+    if (registered_ && host_ != nullptr) (void)hipHostUnregister(host_);
+    if (!direct_ && host_ != nullptr) (void)::munmap(host_, size_);
   }
   HipWeightRegion(const HipWeightRegion&) = delete;
   HipWeightRegion& operator=(const HipWeightRegion&) = delete;
 
-  [[nodiscard]] std::uint8_t* device_base() const { return device_; }
-  [[nodiscard]] std::ptrdiff_t delta(const core::Gguf& gguf) const {
-    return device_ - gguf.tensor_data_base();
+  [[nodiscard]] std::uint8_t* device_base() const { return device_region_; }
+  [[nodiscard]] std::ptrdiff_t delta(const core::Gguf&) const {
+    return device_region_ - tensor_data_host_;
   }
 
  private:
-  std::uint8_t* host_{nullptr};
-  std::uint8_t* device_{nullptr};
+  std::uint8_t* host_{nullptr};  // registered base: file mapping or copy
+  std::uint8_t* tensor_data_host_{nullptr};
+  std::uint8_t* device_region_{nullptr};
   std::size_t size_{0};
   bool registered_{false};
+  bool direct_{false};
 };
 
 class Forward {
