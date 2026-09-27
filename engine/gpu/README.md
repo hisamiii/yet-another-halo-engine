@@ -158,6 +158,27 @@ RoPE is the half-split form applied to the first `rotary_dim` of `head_dim`:
 element `i` with element `i + rotary_dim/2`. The per-head norm is RMS over the
 whole `head_dim` (256), not over `rotary_dim` -- a distinction the two constants
 invite and that the check now pins.
+### q+gate unpack
+
+`unpack_check.hip`: the fused query projection emits
+`[head][q(head_dim) | gate(head_dim)]` per token, and the unpack splits it into
+the query and the per-element gate. **Bit-exact** (0 error) at the model's
+shapes.
+
+## Coverage
+
+| stage | check | result |
+| --- | --- | --- |
+| 13 quant types, raw GEMM | `gemm_check` | rel RMS 1.7e-4 to 3.6e-4 |
+| FFN chain (norm -> SwiGLU -> down) | `ffn_check` | rel RMS 4.7e-5 to 2.1e-4 |
+| q+gate unpack | `unpack_check` | bit-exact |
+| per-head QK-norm + RoPE | `rope_check` | rel 5.8e-8 to 4.6e-7 |
+| causal GQA attention | `attention_check` | rel RMS 2.5e-9 to 3.8e-7 |
+| Gated DeltaNet recurrence | `ssm_check` | rel RMS 9.5e-8 to 1.1e-7 |
+
+Every stage of a layer body now has an independent numeric check against a
+reference derived from the definition rather than from the code under test.
+The layer loop and `serve` are what remain for M0.
 ## Clock
 
 A rate here is not comparable without the clock it ran at. Use
