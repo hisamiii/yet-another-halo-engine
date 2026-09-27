@@ -49,6 +49,21 @@ paper (the IQ2 family) are also slowest in practice, so the ordering is
 consistent. IQ3_XXS being both a fifth of the target and unpaired is the
 concrete first coverage target.
 
+## Correctness
+
+The gate for trusting the rates above. `gemm_check.hip` decodes the same weight
+bytes twice -- once by the device kernel, once by the host `DotProduct`
+reference -- and compares the whole output matrix:
+
+    hipcc -std=c++20 -O3 -Iengine/gpu/ported -Iengine engine/gpu/gemm_check.hip \
+      engine/gpu/ported/src/core/quant/ggml_dequant.cpp \
+      -o engine/build/yah-gemm-check --offload-arch=gfx1151
+    ./engine/build/yah-gemm-check <type> 512 512 512
+
+All thirteen types pass, relative RMS between **1.7e-4 and 3.6e-4**. That is
+fp32 accumulation-order agreement: the device and host decoders are reading the
+same bytes the same way, which is what a correct port looks like. Worst is Q5_K
+at 3.6e-4; the target's FFN types are 1.8-2.4e-4.
 ## Clock
 
 A rate here is not comparable without the clock it ran at. Use
@@ -62,8 +77,8 @@ type at 12 iterations finishes in well under a second, before the part has
 ramped, so its rate and clock are not meaningful on their own. Any measurement
 needs several seconds of steady load behind it.
 
-## Not done yet
+## Next here
 
-The ported bench checks only for non-finite output, not correctness. A bit-exact
-check against the host decoder is the next step here, and it is the gate for
-trusting any of the above beyond relative ordering.
+The per-type rates and their correctness are settled. What is not wired yet is
+the engine's own layer loop, and the promotion gate that samples `pp_dpm_sclk`
+around a full prefill rather than a synthetic GEMM.
