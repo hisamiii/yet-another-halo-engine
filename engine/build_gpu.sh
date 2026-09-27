@@ -60,6 +60,7 @@ compile() {
 target="${1:-yah-run}"
 case "$target" in
   yah-run) main="$root/engine/run/yah_run.hip"; name="yah_run" ;;
+  kv-quant-check) main="$root/engine/kv/kv_quant_check.hip"; name="kv_quant_check" ;;
   *) main="$root/engine/gpu/$target.hip"; name="$target" ;;
 esac
 

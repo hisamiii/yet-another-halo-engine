@@ -49,7 +49,8 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: yah-run <model.gguf> [--text TEXT] [--ids \"1 2\"] "
-                 "[--repeat N] [--chunk N] [--gen N] [--max-context N] [--dump-logits F]\n");
+                 "[--repeat N] [--chunk N] [--gen N] [--kv f16|q8|q4] [--max-context N]\n"
+                 "       [--dump-logits F]\n");
     return 2;
   }
   const std::string model = argv[1];
@@ -61,6 +62,7 @@ int main(int argc, char** argv) {
   std::uint32_t batch = 0;
   std::uint32_t chunk = 0;
   std::uint32_t gen = 0;
+  yah::kv::KvStorage kv = yah::kv::KvStorage::kF16;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -75,6 +77,13 @@ int main(int argc, char** argv) {
     else if (a == "--repeat") repeat = static_cast<std::uint32_t>(std::stoul(next()));
     else if (a == "--chunk") chunk = static_cast<std::uint32_t>(std::stoul(next()));
     else if (a == "--gen") gen = static_cast<std::uint32_t>(std::stoul(next()));
+    else if (a == "--kv") {
+      const std::string value = next();
+      if (value == "f16") kv = yah::kv::KvStorage::kF16;
+      else if (value == "q8") kv = yah::kv::KvStorage::kQ8;
+      else if (value == "q4") kv = yah::kv::KvStorage::kQ4;
+      else throw std::runtime_error("yah-run: --kv must be f16, q8 or q4");
+    }
     else if (!text.empty()) text += " " + a;
     else text = a;
   }
@@ -129,7 +138,7 @@ int main(int argc, char** argv) {
     const std::uint32_t max_batch =
         chunk == 0 ? static_cast<std::uint32_t>(tokens.size())
                    : std::min(chunk, static_cast<std::uint32_t>(tokens.size()));
-    yah::model::Forward forward(config, weights, max_batch, max_context);
+    yah::model::Forward forward(config, weights, max_batch, max_context, kv);
     std::uint32_t argmax = 0;
     double best_ms = 1e30;
     for (std::uint32_t r = 0; r < repeat; ++r) {

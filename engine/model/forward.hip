@@ -35,6 +35,8 @@
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
+#include "kv/kv_cache.hpp"
+#include "kv/kv_quant.hip"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 
@@ -44,6 +46,13 @@ namespace yah::model {
 // own enums have to be bridged at the call sites. Both enums list the GGML
 // type codes in the same order, so the conversion is the underlying value.
 using namespace gufo::hip;  // NOLINT(google-build-using-namespace)
+using yah::kv::GenerateHadamard;
+using yah::kv::KvRowBytes;
+using yah::kv::KvStorage;
+using yah::kv::LaunchDequantizeKvRows;
+using yah::kv::LaunchHadamardInPlace;
+using yah::kv::LaunchHadamardInPlaceHalf;
+using yah::kv::LaunchQuantizeKvRows;
 
 [[nodiscard]] inline gufo::core::GgmlType Gt(core::GgmlType type) {
   return static_cast<gufo::core::GgmlType>(
@@ -79,6 +88,10 @@ struct Buffers {
   float* ffn_gate{nullptr};
   float* ffn_up{nullptr};
   std::uint16_t* kv_f16{nullptr};
+  std::uint8_t* packed_kv{nullptr};
+  std::uint16_t* scratch_k{nullptr};
+  std::uint16_t* scratch_v{nullptr};
+  float* hadamard{nullptr};
   std::uint32_t* tokens{nullptr};
   std::uint32_t* argmax{nullptr};
   float* conv_state{nullptr};
@@ -147,9 +160,16 @@ class HipWeightRegion {
 class Forward {
  public:
   Forward(const core::Qwen35Config& config, const Qwen35Weights& weights,
-          std::uint32_t batch, std::uint32_t max_context)
+          std::uint32_t batch, std::uint32_t max_context,
+          KvStorage kv_storage = KvStorage::kF16)
       : config_(config), weights_(weights), max_batch_(batch),
-        max_context_(max_context) {
+        max_context_(max_context), kv_storage_(kv_storage) {
+    // Off by default: measured on this model at 32-element blocks, the
+    // rotation made 4-bit worse (logit cosine 0.980 vs 0.998; generation
+    // diverged at token 47 vs no divergence in 100). At 8 bits it is exact
+    // either way. It is kept as an opt-in for the larger-block experiment.
+    kv_rotate_ = kv_storage_ != KvStorage::kF16 &&
+                 std::getenv("YAH_KV_ROT") != nullptr;
     if (batch == 0 || max_context == 0) {
       throw std::runtime_error("yah forward: zero batch or context");
     }
@@ -196,10 +216,93 @@ class Forward {
                          static_cast<std::size_t>(recurrent_layers_) *
                              ssm_qkv_ * config_.ssm_conv_kernel * sizeof(float),
                          stream_), "memset conv");
-    const std::size_t plane = KvPlaneElements();
-    Check(hipMemsetAsync(buffers_.kv_f16, 0, 2 * plane * sizeof(std::uint16_t),
-                         stream_), "memset kv");
+    if (kv_storage_ == KvStorage::kF16) {
+      const std::size_t plane = KvPlaneElements();
+      Check(hipMemsetAsync(buffers_.kv_f16, 0,
+                           2 * plane * sizeof(std::uint16_t), stream_),
+            "memset kv");
+    } else {
+      const std::size_t row_bytes = KvRowBytes(kv_storage_, kv_);
+      Check(hipMemsetAsync(buffers_.packed_kv, 0,
+                           2 * attn_layers_ * row_bytes * max_context_,
+                           stream_),
+            "memset packed kv");
+    }
     Check(hipStreamSynchronize(stream_), "sync reset");
+  }
+
+  // The KV cache a single attention layer reads and writes. When the storage
+  // is quantized, the fused QK-norm/RoPE write targets a one-layer fp16
+  // scratch, the new rows are packed into the per-layer cache, and the prefix
+  // is expanded back into the scratch. Attention always sees fp16, so no
+  // attention kernel changes; the cost is the extra pack and prefix dequant.
+  struct KvView {
+    void* k{nullptr};
+    void* v{nullptr};
+    std::uint32_t layer{0};
+  };
+
+  KvView WriteKvCache(const Qwen35Layer& layer, std::uint32_t attn_idx,
+                      std::uint32_t batch, std::uint32_t start_pos) {
+    KvView view;
+    const bool quantized = kv_storage_ != KvStorage::kF16;
+    if (quantized) {
+      view.k = buffers_.scratch_k;
+      view.v = buffers_.scratch_v;
+      view.layer = 0;
+    } else {
+      view.k = buffers_.kv_f16;
+      view.v = buffers_.kv_f16 + KvPlaneElements();
+      view.layer = attn_idx;
+    }
+    LaunchBatchedFusedQKNormRoPEKvWrite(
+        buffers_.q, buffers_.k, buffers_.v,
+        reinterpret_cast<const float*>(layer.attn_q_norm.data),
+        reinterpret_cast<const float*>(layer.attn_k_norm.data),
+        buffers_.q, buffers_.k, /*k_cache=*/nullptr, /*v_cache=*/nullptr,
+        view.k, view.v, view.layer, start_pos, batch, max_context_,
+        config_.head_count, config_.head_count_kv, config_.key_length,
+        config_.rope_dimension_count, config_.rope_freq_base,
+        config_.rms_eps, stream_);
+    if (!quantized) return view;
+
+    // Rotate Q and K by the same orthonormal Hadamard. QK^T is unchanged in
+    // exact arithmetic, so only the quantizer's error changes. V is not
+    // rotated: the attention kernel applies the output gate per element, and
+    // a rotation mixes exactly the elements that gate treats independently, so
+    // the inverse cannot be applied after it. K is also where the per-channel
+    // outliers live, which is the case the rotation exists to fix.
+    if (kv_rotate_) {
+      LaunchHadamardInPlace(
+          buffers_.q, static_cast<std::size_t>(batch) * config_.head_count,
+          config_.key_length, buffers_.hadamard, stream_);
+      LaunchHadamardInPlaceHalf(
+          buffers_.scratch_k + (start_pos * kv_),
+          static_cast<std::size_t>(batch) * config_.head_count_kv,
+          config_.key_length, buffers_.hadamard, stream_);
+    }
+
+    const std::size_t row_bytes = KvRowBytes(kv_storage_, kv_);
+    const std::size_t layer_bytes = row_bytes * max_context_;
+    const std::size_t plane_bytes = layer_bytes * attn_layers_;
+    auto* packed_k = buffers_.packed_kv + (attn_idx * layer_bytes);
+    auto* packed_v =
+        buffers_.packed_kv + plane_bytes + (attn_idx * layer_bytes);
+    LaunchQuantizeKvRows(buffers_.scratch_k + (start_pos * kv_),
+                         packed_k + (start_pos * row_bytes), batch, kv_,
+                         kv_storage_, stream_);
+    LaunchQuantizeKvRows(buffers_.scratch_v + (start_pos * kv_),
+                         packed_v + (start_pos * row_bytes), batch, kv_,
+                         kv_storage_, stream_);
+    // Expand the whole visible prefix, this chunk included, so attention reads
+    // the quantized representation and not the exact fp16 the fused write left
+    // in the scratch. Expanding only the older prefix would make the cache
+    // quantized in name only for a single-chunk prompt.
+    LaunchDequantizeKvRows(packed_k, buffers_.scratch_k, start_pos + batch, kv_,
+                           kv_storage_, stream_);
+    LaunchDequantizeKvRows(packed_v, buffers_.scratch_v, start_pos + batch, kv_,
+                           kv_storage_, stream_);
+    return view;
   }
 
   // Runs the main stack over `batch` tokens starting at `start_pos` and
@@ -270,32 +373,21 @@ class Forward {
         LaunchBatchedUnpackQG(buffers_.ssm_qkv, buffers_.q,
                               buffers_.ssm_gate, batch, config_.head_count,
                               config_.key_length, stream_);
-        const std::size_t plane = KvPlaneElements();
-        LaunchBatchedFusedQKNormRoPEKvWrite(
-            buffers_.q, buffers_.k, buffers_.v,
-            reinterpret_cast<const float*>(layer.attn_q_norm.data),
-            reinterpret_cast<const float*>(layer.attn_k_norm.data),
-            buffers_.q, buffers_.k, /*k_cache=*/nullptr, /*v_cache=*/nullptr,
-            buffers_.kv_f16, buffers_.kv_f16 + plane, attn_idx, start_pos,
-            batch, max_context_, config_.head_count,
-            config_.head_count_kv, config_.key_length,
-            config_.rope_dimension_count, config_.rope_freq_base,
-            config_.rms_eps, stream_);
+        const KvView kv_view = WriteKvCache(layer, attn_idx, batch, start_pos);
         const bool wmma = LaunchQwenWmmaAttention(
             buffers_.q, buffers_.k, buffers_.v, buffers_.ssm_gate,
-            /*k_cache=*/nullptr, /*v_cache=*/nullptr, buffers_.kv_f16,
-            buffers_.kv_f16 + plane, buffers_.ssm_out, attn_idx, start_pos,
-            batch, max_context_, config_.head_count, config_.head_count_kv,
-            config_.key_length, stream_, /*lse_out=*/nullptr,
-            /*key_begin=*/0, /*skip_kv_write=*/true);
+            /*k_cache=*/nullptr, /*v_cache=*/nullptr, kv_view.k, kv_view.v,
+            buffers_.ssm_out, kv_view.layer, start_pos, batch, max_context_,
+            config_.head_count, config_.head_count_kv, config_.key_length,
+            stream_, /*lse_out=*/nullptr, /*key_begin=*/0,
+            /*skip_kv_write=*/true);
         if (!wmma) {
           LaunchBatchedAttention(
               buffers_.q, buffers_.k, buffers_.v, buffers_.ssm_gate,
-              /*k_cache=*/nullptr, /*v_cache=*/nullptr, buffers_.kv_f16,
-              buffers_.kv_f16 + plane, buffers_.ssm_out, attn_idx, start_pos,
-              batch, max_context_, config_.head_count,
-              config_.head_count_kv, config_.key_length, stream_,
-              /*skip_kv_write=*/true);
+              /*k_cache=*/nullptr, /*v_cache=*/nullptr, kv_view.k, kv_view.v,
+              buffers_.ssm_out, kv_view.layer, start_pos, batch, max_context_,
+              config_.head_count, config_.head_count_kv, config_.key_length,
+              stream_, /*skip_kv_write=*/true);
         }
         LaunchFloatToFp16(buffers_.ssm_out, buffers_.scratch_f16,
                           static_cast<std::size_t>(batch) * attn_,
@@ -441,24 +533,13 @@ class Forward {
             kv_, hidden_, stream_);
         LaunchUnpackQG(buffers_.ssm_qkv, buffers_.q, buffers_.ssm_gate,
                        config_.head_count, config_.key_length, stream_);
-        const std::size_t plane = KvPlaneElements();
-        LaunchBatchedFusedQKNormRoPEKvWrite(
-            buffers_.q, buffers_.k, buffers_.v,
-            reinterpret_cast<const float*>(layer.attn_q_norm.data),
-            reinterpret_cast<const float*>(layer.attn_k_norm.data),
-            buffers_.q, buffers_.k, /*k_cache=*/nullptr, /*v_cache=*/nullptr,
-            buffers_.kv_f16, buffers_.kv_f16 + plane, attn_idx, pos,
-            /*batch=*/1, max_context_, config_.head_count,
-            config_.head_count_kv, config_.key_length,
-            config_.rope_dimension_count, config_.rope_freq_base,
-            config_.rms_eps, stream_);
+        const KvView kv_view = WriteKvCache(layer, attn_idx, 1, pos);
         LaunchAttention(
             buffers_.q, buffers_.k, buffers_.v, buffers_.ssm_gate,
-            /*k_cache=*/nullptr, /*v_cache=*/nullptr, buffers_.kv_f16,
-            buffers_.kv_f16 + plane, buffers_.ssm_out, attn_idx, pos,
-            max_context_, config_.head_count, config_.head_count_kv,
-            config_.key_length, stream_, /*split_k_scratch=*/nullptr,
-            /*skip_kv_write=*/true);
+            /*k_cache=*/nullptr, /*v_cache=*/nullptr, kv_view.k, kv_view.v,
+            buffers_.ssm_out, kv_view.layer, pos, max_context_,
+            config_.head_count, config_.head_count_kv, config_.key_length,
+            stream_, /*split_k_scratch=*/nullptr, /*skip_kv_write=*/true);
         LaunchGEMV(layer.attn_output.data, Gt(layer.attn_output.type),
                    buffers_.ssm_out, buffers_.normed, hidden_, attn_, stream_);
       } else {
@@ -572,9 +653,29 @@ class Forward {
           batch * ffn_ * sizeof(float), "ffn_gate");
     alloc(reinterpret_cast<void**>(&buffers_.ffn_up),
           batch * ffn_ * sizeof(float), "ffn_up");
-    const std::size_t plane = KvPlaneElements();
-    alloc(reinterpret_cast<void**>(&buffers_.kv_f16),
-          2 * plane * sizeof(std::uint16_t), "kv_f16");
+    if (kv_storage_ == KvStorage::kF16) {
+      const std::size_t plane = KvPlaneElements();
+      alloc(reinterpret_cast<void**>(&buffers_.kv_f16),
+            2 * plane * sizeof(std::uint16_t), "kv_f16");
+    } else {
+      const std::size_t row_bytes = KvRowBytes(kv_storage_, kv_);
+      const std::size_t layer_bytes = row_bytes * max_context_;
+      alloc(reinterpret_cast<void**>(&buffers_.packed_kv),
+            2 * attn_layers_ * layer_bytes, "packed_kv");
+      alloc(reinterpret_cast<void**>(&buffers_.scratch_k),
+            max_context_ * kv_ * sizeof(std::uint16_t), "scratch_k");
+      alloc(reinterpret_cast<void**>(&buffers_.scratch_v),
+            max_context_ * kv_ * sizeof(std::uint16_t), "scratch_v");
+      // The rotation is what keeps a 4-bit block quantizer from crushing the
+      // normal channels around a per-channel outlier; see the format header.
+      const std::vector<float> hadamard = GenerateHadamard(config_.key_length);
+      alloc(reinterpret_cast<void**>(&buffers_.hadamard),
+            hadamard.size() * sizeof(float), "hadamard");
+      Check(hipMemcpyAsync(buffers_.hadamard, hadamard.data(),
+                           hadamard.size() * sizeof(float),
+                           hipMemcpyHostToDevice, stream_),
+            "upload hadamard");
+    }
     alloc(reinterpret_cast<void**>(&buffers_.tokens),
           batch * sizeof(std::uint32_t), "tokens");
     alloc(reinterpret_cast<void**>(&buffers_.argmax), sizeof(std::uint32_t),
@@ -610,6 +711,10 @@ class Forward {
     hipFree(buffers_.ffn_gate);
     hipFree(buffers_.ffn_up);
     hipFree(buffers_.kv_f16);
+    hipFree(buffers_.packed_kv);
+    hipFree(buffers_.scratch_k);
+    hipFree(buffers_.scratch_v);
+    hipFree(buffers_.hadamard);
     hipFree(buffers_.tokens);
     hipFree(buffers_.argmax);
     hipFree(buffers_.conv_state);
@@ -635,6 +740,8 @@ class Forward {
   std::uint32_t attn_layers_{0};
   std::uint32_t recurrent_layers_{0};
   std::uint32_t vocab_{0};
+  KvStorage kv_storage_{KvStorage::kF16};
+  bool kv_rotate_{false};
   hipStream_t stream_{nullptr};
   Buffers buffers_;
 };
