@@ -116,9 +116,11 @@ int main(int argc, char** argv) {
                  static_cast<unsigned long long>(weights.output.rows()), batch,
                  max_context);
     std::fprintf(stderr, "tokens=%zu\n", tokens.size());
-    for (std::size_t i = 0; i < tokens.size(); ++i) {
-      std::fprintf(stderr, "%u%s", tokens[i],
-                   i + 1 == tokens.size() ? "\n" : " ");
+    if (tokens.size() <= 32) {
+      for (std::size_t i = 0; i < tokens.size(); ++i) {
+        std::fprintf(stderr, "%u%s", tokens[i],
+                     i + 1 == tokens.size() ? "\n" : " ");
+      }
     }
 
     // The chunk size bounds one prefill call; the whole prompt is split into
