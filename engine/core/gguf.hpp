@@ -62,6 +62,15 @@ class Gguf {
   [[nodiscard]] const MetadataValue* Meta(const std::string& key) const;
   [[nodiscard]] std::size_t file_size() const { return size_; }
   [[nodiscard]] std::size_t tensor_data_offset() const { return data_offset_; }
+  // The contiguous tensor-data region the whole tensor table addresses. A
+  // device backend registers a copy of exactly this region and rebases every
+  // TensorRef by the pointer delta.
+  [[nodiscard]] const std::uint8_t* tensor_data_base() const {
+    return base_ + data_offset_;
+  }
+  [[nodiscard]] std::size_t tensor_data_size() const {
+    return size_ - data_offset_;
+  }
   [[nodiscard]] std::size_t metadata_count() const { return meta_.size(); }
   [[nodiscard]] const std::uint8_t* Data(const TensorInfo& tensor) const {
     return base_ + data_offset_ + tensor.offset;

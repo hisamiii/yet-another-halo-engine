@@ -51,6 +51,13 @@ int main(int argc, char** argv) {
                     yah::core::TypeName(layer.ssm_out.type),
                     static_cast<unsigned long long>(layer.ssm_out.cols()),
                     static_cast<unsigned long long>(layer.ssm_out.rows()));
+        std::printf("   alpha=%s beta=%s conv1d=%s a=%s dt=%s norm=%s\n",
+                    yah::core::TypeName(layer.ssm_alpha.type),
+                    yah::core::TypeName(layer.ssm_beta.type),
+                    yah::core::TypeName(layer.ssm_conv1d.type),
+                    yah::core::TypeName(layer.ssm_a.type),
+                    yah::core::TypeName(layer.ssm_dt.type),
+                    yah::core::TypeName(layer.ssm_norm.type));
       }
     }
     std::printf("WEIGHTS OK\n");

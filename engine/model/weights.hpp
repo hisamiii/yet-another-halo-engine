@@ -1,6 +1,7 @@
 #ifndef YAH_MODEL_WEIGHTS_HPP_
 #define YAH_MODEL_WEIGHTS_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -57,6 +58,10 @@ struct Qwen35Weights {
   // table.
   static Qwen35Weights FromGguf(const core::Gguf& gguf,
                                 const core::Qwen35Config& config);
+
+  // Shifts every resolved tensor pointer by `delta` bytes. Used to repoint the
+  // table from the file mapping onto the HIP-registered copy the device reads.
+  void Rebase(std::ptrdiff_t delta);
 
   [[nodiscard]] std::uint64_t bytes() const;
 };

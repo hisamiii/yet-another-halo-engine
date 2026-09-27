@@ -135,6 +135,41 @@ Qwen35Weights Qwen35Weights::FromGguf(const core::Gguf& gguf,
   return weights;
 }
 
+void Qwen35Weights::Rebase(std::ptrdiff_t delta) {
+  auto shift = [delta](TensorRef& ref) {
+    if (ref.data != nullptr) ref.data += delta;
+  };
+  shift(token_embd);
+  shift(output_norm);
+  shift(output);
+  shift(nextn_eh_proj);
+  shift(nextn_enorm);
+  shift(nextn_hnorm);
+  shift(nextn_shared_head_norm);
+  for (auto& layer : layers) {
+    shift(layer.attn_norm);
+    shift(layer.post_attention_norm);
+    shift(layer.attn_q);
+    shift(layer.attn_k);
+    shift(layer.attn_v);
+    shift(layer.attn_output);
+    shift(layer.attn_q_norm);
+    shift(layer.attn_k_norm);
+    shift(layer.attn_qkv);
+    shift(layer.attn_gate);
+    shift(layer.ssm_a);
+    shift(layer.ssm_alpha);
+    shift(layer.ssm_beta);
+    shift(layer.ssm_conv1d);
+    shift(layer.ssm_dt);
+    shift(layer.ssm_norm);
+    shift(layer.ssm_out);
+    shift(layer.ffn_gate);
+    shift(layer.ffn_up);
+    shift(layer.ffn_down);
+  }
+}
+
 std::uint64_t Qwen35Weights::bytes() const {
   std::uint64_t total = token_embd.bytes + output_norm.bytes + output.bytes;
   for (const auto& layer : layers) {

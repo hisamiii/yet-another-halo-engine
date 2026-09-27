@@ -50,6 +50,17 @@ struct Qwen35Config {
   [[nodiscard]] std::uint32_t RecurrentLayers() const {
     return main_block_count() - AttentionLayers();
   }
+  // Dense index of a Gated DeltaNet layer among the recurrent layers, which is
+  // the slot its convolution and recurrent states live in.
+  [[nodiscard]] std::uint32_t SsmLayerIndex(std::uint32_t layer) const {
+    return full_attention_interval == 0
+               ? layer
+               : layer - layer / full_attention_interval;
+  }
+  // Width of one DeltaNet value head group, ssm_inner_size / time_step_rank.
+  [[nodiscard]] std::uint32_t SsmValueSize() const {
+    return ssm_time_step_rank == 0 ? 0 : ssm_inner_size / ssm_time_step_rank;
+  }
   // Attention width (q for each token), and the fused qkv width.
   [[nodiscard]] std::uint32_t attention_q_dim() const {
     return head_count * key_length;
