@@ -85,6 +85,34 @@ still have no case in `TryLaunchBatchedDualQuantGEMMSwiGLUFp16`, so those blocks
 fall back to a gate store plus an up SwiGLU. The fallback is numerically
 correct; its cost is an extra GEMM pass, which is the coverage gap the kernel
 workstream exists to close.
+### Causal GQA attention
+
+`attention_check.hip` runs the ported prefill attention at the model's own shapes
+(24 query heads, 4 KV heads, head_dim 256) against a from-definition reference:
+softmax over the causal prefix with `1/sqrt(head_dim)`, then the output gate.
+
+| batch | rel RMS |
+| ---: | ---: |
+| 2 | 2.5e-9 |
+| 64 | 3.5e-7 |
+| 256 | 3.8e-7 |
+| 1024 | 3.0e-7 |
+
+Two semantics the reference had to get right, both learned by failing first:
+
+- **The gate is per element, not per head.** The kernel indexes it with the same
+  `[token, head, d]` layout as the output. An early reference applied a single
+  gate value per head, which read as a 100%-relative-error kernel failure and
+  was entirely the reference's fault -- the device values matched the inputs
+  exactly.
+- **The cache representation is selected by null-ness.** `BatchedAttentionKernel`
+  reads the FP32 cache when `k_cache != nullptr` and the FP16 cache when it is
+  null, and it only *reads*: the host wrapper writes the cache first unless
+  `skip_kv_write`, which is the fused QK-norm/RoPE path. The layout is
+  `[layer, kv_head, position, head_dim]`.
+
+The reference is O(batch^2), so this stops at 1024; the kernel is unchanged at
+the 2048 production batch.
 ## Clock
 
 A rate here is not comparable without the clock it ran at. Use
