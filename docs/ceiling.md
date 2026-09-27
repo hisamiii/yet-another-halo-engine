@@ -75,6 +75,18 @@ The cost is that the NPU kernel set grows from two block-GEMMs to a handful that
 
 And 2.0x assumes both engines are equally good at everything, which is false. If the NPU is much slower at softmax or at a scan, the balance shifts back toward the GPU and the achieved number lands between 1.6x and 2.0x. The practical target is therefore: give the NPU the token prefix for the GEMMs and the attention, keep the irregular ops on the GPU, and rebalance per layer type.
 
+## Correction: the FFN-only ceiling is ~1.3x, not 1.6x
+
+The model above derives the ceiling from an FFN share `f` and assumes the split itself is a clean 2x on the FFN. The engine log has a stricter accounting that uses the *measured* engine rates instead:
+
+- GEMM is 91.9% of prefill; the FFN is 67% of GEMM FLOPs.
+- The measured FFN-split speedup is 1.61x (iGPU 40.6 TFLOPS against the concurrent NPU's 24.6, balance at 0.377), not 2x.
+- `1 / (1 - 0.919 x 0.67 x (1 - 1/1.61))` = **~1.30x on prefill**.
+
+So the `1.61x` in this document is the ceiling for a *perfect* FFN split, and the realistic FFN-only figure is ~1.30x. The measured token split at ~1.30x over the derived GPU-only baseline is therefore already near this ceiling, and the remaining headroom is the overlap rather than more FFN.
+
+The all-work 2.0x bound is unchanged, but it is not reachable while a third of the GEMM stays on one engine and the NPU is derated 21% under concurrency.
+
 ## What would move the ceiling
 
 The bound comes from `f`: the NPU only ever removes FFN time while all `A` stays on the GPU. Two things break it:

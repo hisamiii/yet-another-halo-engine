@@ -2,6 +2,8 @@
 
 The current engine already does most of the *scheduling* fusion: fused RMSNorm + quantize, a dual gate/up GEMM with the SwiGLU epilogue, SwiGLU folded into the quantize, residual adds folded into the next norm, and a template instantiation per weight type with tail-free variants when the shapes are tile-aligned. The narrow scope does not add more of the same; it changes the *kind* of tuning that is possible, from runtime heuristics to a build-time search over a tiny, known shape set.
 
+**What is already closed, so this does not read as an open search.** The tile space has been swept and is exhausted: only the 256x256 family is competitive, LDS is full at 64 KiB (one block per CU) and 1024 threads is the hardware workgroup limit. The store epilogue costs +0.13%, wave64 measures identically to wave32, and the fp16 instruction ceiling is a measured 48.35 TFLOPS against a production kernel at 63-66% of it (the paired gate/up kernel reaches 84% in isolation). The remaining ~28% is localised to the K loop and unexplained, and `Complete` costs 15% on the exact quant (IQ4_XS) this model uses. So the levers below are shape-specialisation, fusion, formats and the K-loop residual -- not a tile sweep. Measurements in [kernel-tuning.md](kernel-tuning.md).
+
 ## What specialization buys
 
 - **Compile-time shapes.** A general engine passes `m`, `k` and `batch` as runtime integers and carries bounds checks for whatever it is handed. A fixed model has `M`, `N`, `K` per projection as constants: the grid is static, the K loop unrolls fully, and the tail-free kernel is always the correct one. This is codegen headroom, not a new algorithm.
