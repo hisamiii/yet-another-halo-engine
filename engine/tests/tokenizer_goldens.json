@@ -1,0 +1,67 @@
+{
+  "source": "Qwen/Qwen3.8-27B",
+  "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "note": "token-id hashes from HF for Qwen3.8-27B; the tokenizer must reproduce them exactly",
+  "cases": [
+    {
+      "name": "spaces",
+      "text": "hello  world   return x;    indented\t\tword",
+      "token_count": 12,
+      "sha256": "15ac41cdd7b3a0df17096a33aab26022bca3b9ff0f798d0b6034ce8eec4bc594"
+    },
+    {
+      "name": "newlines",
+      "text": "  \r\n  one\n\n  two \r\n\tthree\n ",
+      "token_count": 11,
+      "sha256": "d1f7b2b2a5e8d12b4612b0811b891250f3351ff2961e28d9f0a148d942f2b859"
+    },
+    {
+      "name": "unicode_spaces",
+      "text": "  word  next end  ",
+      "token_count": 12,
+      "sha256": "039c77dcd636cb800449468aec6de04e587c3b140b7f6e751cfdd02c01c48eef"
+    },
+    {
+      "name": "nfc",
+      "text": "Café é ä Å 각",
+      "token_count": 7,
+      "sha256": "1a76bd7843eb6847a5de85889aba42807cb5d8a10eb7db2839eeeef3a17684ef"
+    },
+    {
+      "name": "marks",
+      "text": "किताबें क्‍षेत्र हिन्दी বাংলাภาษาไทย ٱلْعَرَبِيَّةُ",
+      "token_count": 24,
+      "sha256": "b5d5bdc82c205b8160651b5ce2a32adc30d42e2fd6aef0aa13385e4d2f53d25d"
+    },
+    {
+      "name": "isolated_marks",
+      "text": "́̈x !́y  ̧́z",
+      "token_count": 13,
+      "sha256": "0f2a1867abd6f94ab189728384c5a60413ed33734d1717896a30fa9868d2316b"
+    },
+    {
+      "name": "categories",
+      "text": "abcⅠ²٣𐐀ᵃͅⅢ999",
+      "token_count": 20,
+      "sha256": "44b2df97c3f04f3cd989dc71f4db31233646ce0eeecb418bbf6a38fe6849a2ef"
+    },
+    {
+      "name": "contractions",
+      "text": "I'm I'M we'll WE'LL I'ſ 'ſame 'K 'İ 'ı",
+      "token_count": 23,
+      "sha256": "07a9f678533e84f1bb20882f5ef2d6f3ffecbc772ef6d4d57e69e7162932da8e"
+    },
+    {
+      "name": "special_nfc",
+      "text": "é<|im_start|>user\né<|im_end|>\n",
+      "token_count": 7,
+      "sha256": "3281c41200454e694d73e8659eac7dc1d5ed29fb062f575e54ae4a1ba6a92efa"
+    },
+    {
+      "name": "code",
+      "text": "def main():\n    if x == 12:\n        return \"café\"\n\t\t# 😀\n",
+      "token_count": 25,
+      "sha256": "8ed5c45932e6cf7c91c97fe7a98b22645411ff246b910dc488e59933770ab019"
+    }
+  ]
+}

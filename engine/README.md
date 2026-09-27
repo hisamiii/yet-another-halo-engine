@@ -4,7 +4,7 @@ The greenfield implementation. The layout maps to the workstreams in [../docs/sc
 
 | dir | contents | status |
 | --- | --- | --- |
-| `core/` | GGUF reader, mmap, tensor table, tokenizer | not started |
+| `core/` | GGUF reader, mmap, tensor table, config, tokenizer | reader/config/**tokenizer done** |
 | `model/` | Qwen3.8 27B graph: Gated DeltaNet, attention, RoPE, norms, FFN, state | not started |
 | `gpu/` | ported WMMA framework, 12 decoders, fusions | not started |
 | `npu/` | XRT executor, xclbin set, dma-buf operands, async launch | not started |
