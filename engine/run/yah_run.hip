@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: yah-run <model.gguf> [--text TEXT] [--ids \"1 2\"] "
-                 "[--repeat N] [--chunk N] [--max-context N] [--dump-logits F]\n");
+                 "[--repeat N] [--chunk N] [--gen N] [--max-context N] [--dump-logits F]\n");
     return 2;
   }
   const std::string model = argv[1];
@@ -60,6 +60,7 @@ int main(int argc, char** argv) {
   std::uint32_t repeat = 1;
   std::uint32_t batch = 0;
   std::uint32_t chunk = 0;
+  std::uint32_t gen = 0;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -73,6 +74,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::stoul(next()));
     else if (a == "--repeat") repeat = static_cast<std::uint32_t>(std::stoul(next()));
     else if (a == "--chunk") chunk = static_cast<std::uint32_t>(std::stoul(next()));
+    else if (a == "--gen") gen = static_cast<std::uint32_t>(std::stoul(next()));
     else if (!text.empty()) text += " " + a;
     else text = a;
   }
@@ -89,12 +91,12 @@ int main(int argc, char** argv) {
                  "yah-run: registered %.2f GiB of weights for the GPU\n",
                  static_cast<double>(gguf.tensor_data_size()) / 1073741824.0);
 
+    const auto tconfig = yah::core::TokenizerConfig::FromGguf(gguf);
+    const auto tokenizer = yah::core::Tokenizer::FromGguf(gguf, tconfig);
     std::vector<std::uint32_t> tokens;
     if (!ids_arg.empty()) {
       tokens = ParseIds(ids_arg);
     } else {
-      const auto tconfig = yah::core::TokenizerConfig::FromGguf(gguf);
-      const auto tokenizer = yah::core::Tokenizer::FromGguf(gguf, tconfig);
       tokens = tokenizer.Encode(text);
     }
     if (tokens.empty()) {
@@ -145,6 +147,38 @@ int main(int argc, char** argv) {
     }
     std::printf("argmax=%u\n", argmax);
     std::printf("best_ms=%.3f\n", best_ms);
+
+    // Generation runs the same kernel chain one token at a time. A dedicated
+    // GEMV decode path is a later optimization; the goal of this loop is a
+    // working end-to-end text path, and the single-token forward is the
+    // chunked prefill with a chunk of one, already exercised above.
+    if (gen != 0) {
+      std::vector<std::uint32_t> generated;
+      std::uint32_t next = argmax;
+      std::uint32_t pos = static_cast<std::uint32_t>(tokens.size());
+      const auto gen_start = std::chrono::steady_clock::now();
+      for (std::uint32_t i = 0; i < gen; ++i) {
+        generated.push_back(next);
+        if (next == tconfig.eos_id) break;
+        if (pos + 1 > max_context) break;
+        next = forward.Prefill(&next, 1, pos);
+        ++pos;
+      }
+      const double gen_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - gen_start)
+                                .count();
+      std::printf("generated_ids=");
+      for (std::size_t i = 0; i < generated.size(); ++i) {
+        std::printf("%u%s", generated[i],
+                    i + 1 == generated.size() ? "" : " ");
+      }
+      std::printf("\n");
+      std::printf("generated_text=%s\n", tokenizer.Decode(generated).c_str());
+      std::fprintf(stderr, "generated %zu tokens in %.3f ms (%.2f tok/s)\n",
+                   generated.size(), gen_ms,
+                   generated.empty() ? 0.0
+                                     : generated.size() * 1000.0 / gen_ms);
+    }
     if (!dump.empty()) {
       std::vector<float> logits(forward.vocab_size());
       forward.CopyLogits(logits.data());

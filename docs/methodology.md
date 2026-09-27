@@ -31,3 +31,24 @@ A sweep of one parameter answers where the optimum is; it does not reveal the re
 ## Record the protocol with the number
 
 Prompt length, repetition count, arm order, warm-up and temperature all change the result. A number without its protocol, or compared against a number from a different protocol, is not evidence.
+
+## A GPU kernel cannot read the file mapping
+
+The engine's weight table points straight into the GGUF's `mmap`. That is a
+host page-cache mapping, not device memory, and it is not registered with HIP.
+A kernel launched against it does not fault cleanly: it stalls the graphics
+ring, the driver reports `ring gfx_0.0.0 timeout`, and on this part the reset
+often fails, wedging the GPU until reboot. The failure is indistinguishable, in
+the kernel log, from a bad kernel.
+
+The reference engine avoids this by copying the tensor region into an anonymous
+mapping, pinning it with `hipHostRegister(Mapped | ReadOnly)`, and repointing
+every tensor at `hipHostGetDevicePointer`. The engine does the same in
+`HipWeightRegion`, and the token gate then passes on the first run. Every hang
+in the session that produced this note was the embedding kernel reading the
+unregistered mapping, not the recurrence it was first blamed on.
+
+The diagnostic that found it in one boot was a stage-synchronous mode
+(`YAH_SYNC_STAGES`) writing an unbuffered line to a persistent file after every
+kernel group: the last line before the hang names the kernel. `/tmp` is wiped
+by the reboot the hang causes, so the log must live outside it.
