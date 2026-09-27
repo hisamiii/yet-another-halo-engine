@@ -14,9 +14,10 @@
 Greenfield means new structure, not new arithmetic for its own sake, but the kernel set is **not** an untouchable asset. The distinction matters:
 
 - **Port the framework**: the WMMA tiling, the LDS and staging structure, the decoder scaffolding, the GGUF reader and the tokenizer. Those encode measured instruction behaviour and rewriting them is pure delay.
-- **Do not port the efficiency claim, and do not expect to beat it.** The best single kernel measures 40.6 TFLOPS and the aggregate ~30, but that 26% gap is **not headroom**: it is the GPU boost clock moving with the data. Zeroed operands toggle fewer bits, draw less switching power and let the part boost ~20% higher; efficiency per clock agrees to **0.3%** between the fast and slow harnesses, and the rate under real weight data is **~31.5 TFLOPS at ~2141 MHz**, which the model-level wall clock independently confirms. The 38-40 and 40.6 figures are synthetic-data artifacts. So the GPU workstream is **coverage and correctness**, not efficiency: twelve decoders, paired gate/up for the target types, and the per-type `Complete` choice.
+- **Port the framework, then treat power-per-FLOP as the GPU lever.** The 26% harness disagreement is real and is *clock*, not code -- but the clock is a function of the kernel's power draw, not a constant. The part has three SCLK levels (600 / 1408 / 2900 MHz) and **never reaches the top one**: sustained prefill sits at ~2000-2200 MHz at ~0.0144 TF/MHz, work-per-clock is flat across power limits, and the log's own conclusion is that "what is broken is the conversion of watts into clock". At the 2900 MHz level the peak is on the order of **60 TFLOPS**, so a realistic ~2200 MHz ceiling is ~45 and the production ~30 is about two thirds of it.
+- **A kernel that draws less switching power for the same FLOPs raises the clock as well as the work per clock, so efficiency and clock are one lever, not two.** That is M2g. Decoder coverage -- twelve types, paired gate/up, per-type `Complete` -- is the other half of the GPU workstream.
 
-So the kernel workstream is: port the framework and cover the target decoders. There is no unclaimed GPU efficiency left. The iGPU and the NPU are at **parity** on the FFN -- iGPU ~31.5 TF under production data, NPU 32.4 and data-independent -- which is exactly why the split is worth having rather than redundant.
+So the kernel workstream has two halves: cover the target decoders, and reduce power per FLOP so the SMU grants a higher clock. At the current operating point the iGPU (~31.5 TF under production data) and the NPU (32.4, data-independent) are at parity, which is why the split pays; pushing the iGPU toward ~45 at a higher clock moves that balance back toward the GPU.
 
 Everything above the kernels is new: the execution graph, the two-engine scheduler, the NPU executor, the memory policy.
 
@@ -32,7 +33,7 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 | # | workstream | new or ported | rough |
 | --- | --- | --- | --- |
 | 1 | GGUF reader, mmap, tensor table, tokenizer | ported | 1 wk |
-| 2 | GPU kernel set: port the framework, 12 decoders, paired coverage, per-type `Complete` | ported + coverage | 2-3 wk |
+| 2 | GPU kernel set: port the framework, 12 decoders, paired coverage, per-type `Complete`, then power-per-FLOP and clock | ported + workstream | 3-6 wk |
 | 3 | Model graph: Gated DeltaNet, attention, RoPE, norms, SwiGLU FFN, KV | new | 2-3 wk |
 | 4 | NPU executor: xclbins, dma-buf operands, async launch, join | new | 2 wk |
 | 5 | Scheduler: phase routing, per-layer-type split, overlap, power budget | new | 1-2 wk |
@@ -47,12 +48,13 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 | --- | --- | --- |
 | **M0** | text runs end to end on the iGPU, correct | token-for-token match on a fixed prompt against a reference; pp2048 in the 400+ tok/s class |
 | **M1** | NPU executor + FFN token split, async and overlapped | validation passes at every chunk length **including the all-NPU case**; GPU stream idle < 5%; >= 1.3x over M0 |
-| **M2** (parallel from week 1) | int8 / int4 ATB GEMM -- the only item that raises the ceiling | >= 45 TFLOPS at both FFN shapes, numerics pass, power inside 130 W |
+| **M2** (parallel from week 1) | int8 / int4 ATB GEMM -- halves the NPU's operand bytes | >= 45 TFLOPS at both FFN shapes, numerics pass, power inside 130 W |
+| **M2g** (parallel) | GPU power-per-FLOP and clock: fewer instructions and less switching for the same FLOPs | sustained clock **and** aggregate both up, sampled from `pp_dpm_sclk` |
 | **M3** | split the non-FFN GEMM (attention projections) | >= 1.5x over M0 |
 | **M4** (parallel) | memory: quantized KV, single-copy weights | peak RSS = mmap + KV + transients, measured |
 | **M5** | vision via mmproj-F16 | image prompt produces correct output; measured |
 
-**The affordable ceiling is ~1.42x on prefill.** The FFN split with the corrected iGPU rate (~31.5 TF) against the concurrent NPU (24.6 TF) balances at 0.438 and is worth 1.78x on the FFN GEMM, which is **1.42x on prefill** with the FFN at 67% of GEMM FLOPs. Splitting the rest of the GEMM would give more, but the non-FFN weights are another ~5.13 GiB and packing them at 9 bits/weight adds ~13 GiB on top of the 18.21 the FFN already needs -- which minimal memory does not allow. **The FFN-only split is the memory-optimal one, and 1.42x is its ceiling.**
+**The affordable split ceiling is ~1.42x on prefill at today's clock.** The FFN split with the current iGPU rate (~31.5 TF) against the concurrent NPU (24.6 TF) balances at 0.438 and is worth 1.78x on the FFN GEMM, which is **1.42x on prefill** with the FFN at 67% of GEMM FLOPs. Two things move it: raising the iGPU's clock and compute (M2g) shifts work back to the GPU, the NPU's int8 path (M2) shifts it the other way, and the split fraction is re-tuned after both. Splitting the rest of the GEMM would give more, but the non-FFN weights are another ~5.13 GiB and packing them at 9 bits/weight adds ~13 GiB on top of the 18.21 the FFN already needs -- which minimal memory does not allow.
 
 **Critical path is M0 -> M1 -> M3.** M2 runs in parallel from day one because it is the long pole and the only item that moves the ceiling; M4 also parallel; M5 is after M1 and off the critical path.
 
@@ -72,7 +74,7 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 
 ## Rules that keep it fast
 
-- Port the kernel framework and the GGUF/tokenizer; do not rewrite the measured instruction structure. ~31.5 TFLOPS under production data is the iGPU's real rate, not a floor.
+- Port the kernel framework and the GGUF/tokenizer. The measured ~31.5 TFLOPS is the *current operating point*, limited by the clock the kernel's own power draw buys -- `pp_dpm_sclk` is a first-class signal, not a footnote.
 - One binary, one architecture, hardcoded shapes.
 - Iterate on the 3.84 bpw shard (13 GB, loads faster, and is the harder decoder set); gate on UD-Q4_K_S before promoting.
 - Keep the measurement protocol from [methodology.md](methodology.md): warm-up, alternating arms, one repetition, pairs only.
