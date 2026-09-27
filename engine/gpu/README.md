@@ -113,6 +113,35 @@ Two semantics the reference had to get right, both learned by failing first:
 
 The reference is O(batch^2), so this stops at 1024; the kernel is unchanged at
 the 2048 production batch.
+### Gated DeltaNet (SSM)
+
+`ssm_check.hip` runs the ported prefill recurrence at the model's shapes -- qkv
+10240 (q 16x128, k 16x128, v 48x128), 48 value heads, key = value dim 128, conv
+kernel 4 -- against a from-definition reference: a causal conv, the delta rule
+with exponential decay, then per-head RMSNorm and a SiLU gate.
+
+| batch | rel RMS |
+| ---: | ---: |
+| 8 | 9.5e-8 |
+| 64 | 1.0e-7 |
+| 256 | 1.1e-7 |
+
+Three things the reference had to get right, each of which produced a
+plausible-looking failure first:
+
+- **The qkv layout is q, then k, then v**, and the kernel's `q_h` reads the
+  *first* section while `k_h` reads the second. Swapping them -- which the name
+  `qkv` and the module's own `qkv` ordering invite -- gives a 2-4% error that
+  reads like a precision problem rather than a layout one.
+- **`ssm_a` must be negative.** The decay is `exp(softplus(alpha + dt) * ssm_a)`
+  and the kernel's default is -0.05. Random bytes can make it positive, the
+  state then grows without bound, and *both* device and reference NaN -- which
+  looks like a broken kernel until you notice the reference did it too.
+- **The conv is causal, taps `[w0..w3]` at offsets `[-3..0]`, zero initial
+  history**, and the launcher updates the conv state only after the conv kernel
+  has read it.
+
+The recurrence state is `[layer, head, key_dim, val_dim]`, fp32 or bf16.
 ## Clock
 
 A rate here is not comparable without the clock it ran at. Use
