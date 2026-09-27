@@ -35,14 +35,21 @@ step is in-kernel dequant, which removes both the scratch and the extra pass.
 
 ## Rotation
 
-The reference engine (llama.cpp) applies an orthonormal Walsh-Hadamard rotation
-to K and V whenever the KV cache is quantized (`attn_rot_k`/`attn_rot_v`, gated
-on `ggml_is_quantized(type) && head_dim % 64 == 0`). The rotation is exact for
-QK^T when Q and K are rotated identically, and needs an inverse on the V
-contribution.
+The reference engine (llama.cpp) builds an orthonormal Walsh-Hadamard rotation
+and sets `attn_rot_k`/`attn_rot_v` for any quantized KV cache with a head dim
+divisible by 64. That is a trap: the flags are generic, but the rotation is only
+**applied** by the model builders that read `inp->self_k_rot` / `self_v_rot`,
+which are the MLA / lightning-indexer / DSA families (`deepseek32`, `deepseek4`,
+`dflash`, `dots3note`, `glm-dsa`, `minimax-m3`, and the experimental
+`qwen4exp`). The ordinary Qwen builders — `qwen3.cpp`, `qwen35.cpp`,
+`qwen3next.cpp` — contain zero uses. So for a plain Qwen3.8, llama.cpp's
+quantized KV is plain per-32 block quantization, no rotation. That is the
+behaviour this engine matches.
 
-This engine implements the K half (Q and K rotated; `YAH_KV_ROT=1`), measured
-it, and left it **off by default**. On Qwen3.8 IQ4_XS at 2k context:
+The engine still implements the K half as an option (`YAH_KV_ROT=1`; Q and K
+rotated, which is exact for QK^T) because the mechanism is worth measuring for
+larger blocks. Measured on Qwen3.8 IQ4_XS at 2k context it made 4-bit worse, so
+it stays off by default:
 
 | | logit cosine vs f16 | 100-token greedy divergence |
 | --- | ---: | ---: |
