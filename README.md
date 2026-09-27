@@ -55,7 +55,8 @@ See [docs/design.md](docs/design.md) for the proposed shape of the engine, [docs
 
 ## Status and open items
 
-- **The all-NPU placement fails numerics at some shapes.** M=1024 with N=1024 and M=2048 with N=2048 both give cosine 0.953 against a sequential reference and flip the top-1 token, while M=512/N=512 is near-exact at 0.99999 and M=1024/N=1025 passes at 0.987. This is unresolved and currently disqualifies the 100%-NPU mode. See [docs/open-questions.md](docs/open-questions.md).
+- **The greenfield GPU path works end to end.** `engine/run/yah-run.hip` runs the full 64-block graph, chunked prefill with KV and recurrent state carried across chunks, and a GEMV decode path. `engine/tests/m0_gate.sh` matches the reference engine's greedy next token on three prompts and `engine/tests/generate_gate.sh` matches 20 generated tokens token for token. Decode runs at about 14 tok/s.
+- **The all-NPU placement fails numerics at M=1024 only.** M=512/1536/2048 all pass with the regenerated xclbins, and the M=1024 xclbins themselves pass 30 varying-data stress iterations standalone at 32 TF, but the engine's M=1024 cosine varies run to run (0.827/0.938/0.970). That is a race in the host overlap path, not a tiling or precision fault, and it still disqualifies the 100%-NPU mode. See [docs/open-questions.md](docs/open-questions.md).
 - **The GPU-only baseline is missing.** Every NPU number here is relative to other NPU configurations. The engine has a harness for the GPU-only arm but it has not been run, so the total value of the NPU is not yet bounded.
 - **Batch-1 NPU behaviour is unmeasured**, as is the whole vision tower.
 - **The AIE int4/int8 B path is unproven.** The compiler example is about block datatypes, but a per-block-scale int4 B GEMM matching GGUF has not been built.

@@ -2,25 +2,24 @@
 
 Each entry states the observation, the competing explanations, and the cheapest test that separates them.
 
-## 1. The all-NPU placement fails numerics at some shapes
+## 1. The all-NPU placement fails numerics at M=1024 only
 
-**Observation.** `--validate-prefill` compares batched-prefill logits against a sequential reference and requires a top-1 match.
+**Observation.** `--validate-prefill` compares batched-prefill logits against a sequential reference and requires a top-1 match. Re-run after regenerating the stale xclbins:
 
-| N | NPU tokens M | GPU remainder | top-1 | cosine |
-| ---: | ---: | ---: | :---: | ---: |
-| 512 | 512 | 0 | yes | 0.999993 |
-| 1025 | 1024 | 1 | yes | 0.987133 |
-| 1300 | 1024 | 276 | yes | 0.999228 |
-| 1536 | 1024 | 512 | yes | 0.998556 |
-| 2048 | 1024 | 1024 | yes | 0.985100 |
-| 1024 | 1024 | 0 | **no** | 0.953139 |
-| 2048 | 2048 | 0 | **no** | 0.953542 |
+| N = M | top-1 | cosine |
+| ---: | :---: | ---: |
+| 512 | yes | 0.999993 |
+| 1536 | yes | 0.997575 |
+| 2048 | yes | 0.967327 |
+| 1024 | **no** | 0.827 / 0.938 / 0.970 |
 
-**Why it is not simple.** The obvious hypotheses both fail. It is not "the last token was computed on the NPU": N=1025 leaves exactly one token on the GPU and passes, while M=512/N=512 puts every token on the NPU and is near-exact. It is not bf16 precision: the same bf16 path gives 0.99999 at M=512.
+The M=2048 point that used to fail now passes. Its xclbin (`npu_gu_t2048_exact`) was regenerated at 17:30, after the slot-tail generator fix; `npu_gu_t1024_exact` was not, which is why M=1024 was the apparent outlier. Regenerating the M=1024 pair with the patched generator does not change the result, so the stale xclbin was a red herring for this shape.
 
-**What is left.** Either a host-path interaction when the chunk length equals the xclbin's M at M >= 1024 (the down projection accumulating across the whole hidden state with no GPU residual to compare against), or a generator/xclbin issue that only appears at those exact shapes and not at M=512. The two failing cosines being nearly identical (0.9531 and 0.9535) across different M values points away from a shape-specific packing bug and toward something systematic.
+**What the xclbin is not.** The M=1024 xclbins are numerically correct. `atb_npu_run npu_gu_t1024_exact.xclbin ... 1024 5120 17408 3 dev 30` passes 30 varying-data stress iterations at 32.11 TFLOPS, and the down xclbin passes at 32.20. The generator and the kernel are not the fault.
 
-**Cheapest separating test.** Run M=1024 with N=1024 but with the down projection disabled (gate/up on the NPU, down on the GPU). If it passes, the gate/up all-NPU path is sound and the fault is in the down all-NPU accumulation; if it fails, the fault is earlier and precision-related. Also worth running M=1536 with N=1536, which gives a third all-NPU point at a different M.
+**What is left.** The M=1024 cosine varies run to run with the same binaries and the same inputs (0.827, 0.938, 0.970) while M=512/1536/2048 are stable. That is a race, not a tiling or precision effect. The separating test points the same way: keeping the down projection on the GPU (gate/up all-NPU) is *worse* (0.918) than the full split, so the fault is in gate/up, not the down accumulation. M=1024 is exactly the balance point (GPU 20.9% idle), the one shape where the NPU is the critical path and the GPU has no work to hide a missing dependency, which is consistent with a host-side ordering or dma-buf coherence bug rather than a kernel bug.
+
+**Cheapest separating test.** Serialize the engine's NPU handoff at M=1024: after `LaunchAtbEncodeAFp16` and the repack, insert a full `hipDeviceSynchronize` (not `WaitStreamSleeping`) before `atb->Launch()`, and a full device sync before the decode. If the cosine becomes stable, the fault is the host ordering around the dma-buf handoff; if it stays variable, the fault is in the xclbin's internal scheduling. A second, cheaper check is to drop the concurrent GPU token rows (already zero at M=1024) and confirm the down branch is not writing the wrong rows.
 
 **Impact.** Until closed, the 100%-NPU mode is a correctness risk, and the shipped split is unsound for a prompt whose final chunk is exactly the NPU width.
 
