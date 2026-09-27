@@ -49,6 +49,32 @@ For 1.5x you need `f >= 0.67`. For 1.8x you need `f >= 0.89`. For 2.0x you need 
 - Against the **split engine that exists today**, the remaining headroom is the 20.9% GPU idle: about **1.2x** at most, taking 551 to roughly 660–680 tok/s.
 - The 1.5–1.8x range is therefore right only for the first reading, and it sits at the optimistic end of the ceiling rather than in the middle.
 
+## Splitting all the work, not just the FFN
+
+The `1/(1-f/2)` bound exists only because today's split stops at the FFN. Give the NPU a token prefix for every projection and the layer is divided 50/50, so the same model gives:
+
+```
+T_split = max( (A/2 + F/2) / R , (A/2 + F/2) / R ) = (A + F) / (2R)
+speedup = 2.0x  (hard bound: two engines, equal rates)
+```
+
+Two engines is the bound. Splitting more finely cannot exceed it, because every fine split still has at most two engines to place work on.
+
+Which operations can actually join:
+
+| operation | split | cross-engine cost |
+| --- | --- | --- |
+| QKV, output, FFN gate/up/down | token prefix | none; both engines write full-width rows |
+| causal attention core | token prefix | the GPU's tokens need the NPU's K/V: a one-way write into the KV cache the engine already keeps, not a reduction |
+| recurrent / SSM layers | not by token; the recurrence is sequential | must split by head, which needs the two partial outputs summed before the output projection |
+| norms, RoPE, softmax, residuals, quantize | leave alone | memory-bound on one shared pool; moving them adds sync and no bandwidth |
+
+So the GEMM-shaped work and the attention core both join cheaply; the SSM recurrence is the one that needs a real reduction, and the elementwise work should not be touched. The attention case is the important one, because it is what makes the split 50/50 of the layer rather than 50/50 of the FFN.
+
+The cost is that the NPU kernel set grows from two block-GEMMs to a handful that include softmax and, for the SSM path, a scan, and the number of NPU submissions per layer multiplies. That is the custom engine in full, and it is what the `block_datatypes` examples are a starting point for.
+
+And 2.0x assumes both engines are equally good at everything, which is false. If the NPU is much slower at softmax or at a scan, the balance shifts back toward the GPU and the achieved number lands between 1.6x and 2.0x. The practical target is therefore: give the NPU the token prefix for the GEMMs and the attention, keep the irregular ops on the GPU, and rebalance per layer type.
+
 ## What would move the ceiling
 
 The bound comes from `f`: the NPU only ever removes FFN time while all `A` stays on the GPU. Two things break it:
