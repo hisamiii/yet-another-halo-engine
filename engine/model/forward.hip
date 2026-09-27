@@ -147,7 +147,7 @@ class Forward {
  public:
   Forward(const core::Qwen35Config& config, const Qwen35Weights& weights,
           std::uint32_t batch, std::uint32_t max_context)
-      : config_(config), weights_(weights), batch_(batch),
+      : config_(config), weights_(weights), max_batch_(batch),
         max_context_(max_context) {
     if (batch == 0 || max_context == 0) {
       throw std::runtime_error("yah forward: zero batch or context");
@@ -201,18 +201,21 @@ class Forward {
     Check(hipStreamSynchronize(stream_), "sync reset");
   }
 
-  // Runs the main stack over `batch_` tokens starting at `start_pos` and
+  // Runs the main stack over `batch` tokens starting at `start_pos` and
   // returns the argmax token of the final position.
   std::uint32_t Prefill(const std::uint32_t* host_tokens,
-                        std::uint32_t start_pos) {
-    if (start_pos + batch_ > max_context_ && !config_.IsFullAttention(0)) {
+                        std::uint32_t batch, std::uint32_t start_pos) {
+    if (batch == 0 || batch > max_batch_) {
+      throw std::runtime_error("yah forward: chunk exceeds max batch");
+    }
+    if (start_pos + batch > max_context_ && !config_.IsFullAttention(0)) {
       // The KV cache bounds only the full-attention layers.
     }
-    if (start_pos + batch_ > max_context_) {
+    if (start_pos + batch > max_context_) {
       throw std::runtime_error("yah forward: batch exceeds context");
     }
     Check(hipMemcpyAsync(buffers_.tokens, host_tokens,
-                         batch_ * sizeof(std::uint32_t),
+                         batch * sizeof(std::uint32_t),
                          hipMemcpyHostToDevice, stream_), "copy tokens");
 
     const bool sync_stages = std::getenv("YAH_SYNC_STAGES") != nullptr;
@@ -225,7 +228,7 @@ class Forward {
 
     LaunchBatchedEmbeddingLookup(
         weights_.token_embd.data, Gt(weights_.token_embd.type), buffers_.tokens,
-        buffers_.hidden, batch_, hidden_, stream_);
+        buffers_.hidden, batch, hidden_, stream_);
     stage("embed", 0);
 
     // Debug staging: YAH_LAYER_LIMIT bounds the stack and YAH_SYNC_LAYERS
@@ -248,7 +251,7 @@ class Forward {
       LaunchBatchedRMSNormFp16(
           buffers_.hidden, /*residual=*/nullptr,
           reinterpret_cast<const float*>(layer.attn_norm.data),
-          /*sum_out=*/nullptr, buffers_.scratch_f16, batch_, hidden_,
+          /*sum_out=*/nullptr, buffers_.scratch_f16, batch, hidden_,
           config_.rms_eps, stream_);
       stage("norm", l);
 
@@ -256,15 +259,15 @@ class Forward {
         const std::uint32_t attn_idx = l / config_.full_attention_interval;
         LaunchBatchedQuantGEMMFp16(Gt(layer.attn_q.type), layer.attn_q.data,
                                    buffers_.scratch_f16, buffers_.ssm_qkv,
-                                   batch_, q_proj_, hidden_, stream_);
+                                   batch, q_proj_, hidden_, stream_);
         LaunchBatchedQuantGEMMFp16(Gt(layer.attn_k.type), layer.attn_k.data,
-                                   buffers_.scratch_f16, buffers_.k, batch_,
+                                   buffers_.scratch_f16, buffers_.k, batch,
                                    kv_, hidden_, stream_);
         LaunchBatchedQuantGEMMFp16(Gt(layer.attn_v.type), layer.attn_v.data,
-                                   buffers_.scratch_f16, buffers_.v, batch_,
+                                   buffers_.scratch_f16, buffers_.v, batch,
                                    kv_, hidden_, stream_);
         LaunchBatchedUnpackQG(buffers_.ssm_qkv, buffers_.q,
-                              buffers_.ssm_gate, batch_, config_.head_count,
+                              buffers_.ssm_gate, batch, config_.head_count,
                               config_.key_length, stream_);
         const std::size_t plane = KvPlaneElements();
         LaunchBatchedFusedQKNormRoPEKvWrite(
@@ -273,7 +276,7 @@ class Forward {
             reinterpret_cast<const float*>(layer.attn_k_norm.data),
             buffers_.q, buffers_.k, /*k_cache=*/nullptr, /*v_cache=*/nullptr,
             buffers_.kv_f16, buffers_.kv_f16 + plane, attn_idx, start_pos,
-            batch_, max_context_, config_.head_count,
+            batch, max_context_, config_.head_count,
             config_.head_count_kv, config_.key_length,
             config_.rope_dimension_count, config_.rope_freq_base,
             config_.rms_eps, stream_);
@@ -281,7 +284,7 @@ class Forward {
             buffers_.q, buffers_.k, buffers_.v, buffers_.ssm_gate,
             /*k_cache=*/nullptr, /*v_cache=*/nullptr, buffers_.kv_f16,
             buffers_.kv_f16 + plane, buffers_.ssm_out, attn_idx, start_pos,
-            batch_, max_context_, config_.head_count, config_.head_count_kv,
+            batch, max_context_, config_.head_count, config_.head_count_kv,
             config_.key_length, stream_, /*lse_out=*/nullptr,
             /*key_begin=*/0, /*skip_kv_write=*/true);
         if (!wmma) {
@@ -289,34 +292,34 @@ class Forward {
               buffers_.q, buffers_.k, buffers_.v, buffers_.ssm_gate,
               /*k_cache=*/nullptr, /*v_cache=*/nullptr, buffers_.kv_f16,
               buffers_.kv_f16 + plane, buffers_.ssm_out, attn_idx, start_pos,
-              batch_, max_context_, config_.head_count,
+              batch, max_context_, config_.head_count,
               config_.head_count_kv, config_.key_length, stream_,
               /*skip_kv_write=*/true);
         }
         LaunchFloatToFp16(buffers_.ssm_out, buffers_.scratch_f16,
-                          static_cast<std::size_t>(batch_) * attn_,
+                          static_cast<std::size_t>(batch) * attn_,
                           stream_);
         LaunchBatchedQuantGEMMResidualFp16(
             Gt(layer.attn_output.type), layer.attn_output.data,
-            buffers_.scratch_f16, buffers_.hidden, batch_, hidden_, attn_,
+            buffers_.scratch_f16, buffers_.hidden, batch, hidden_, attn_,
             stream_);
         stage("attn", l);
       } else {
         const std::uint32_t ssm_idx = config_.SsmLayerIndex(l);
         LaunchBatchedQuantGEMMFp16(Gt(layer.attn_qkv.type), layer.attn_qkv.data,
                                    buffers_.scratch_f16, buffers_.ssm_qkv,
-                                   batch_, ssm_qkv_, hidden_, stream_);
+                                   batch, ssm_qkv_, hidden_, stream_);
         LaunchBatchedQuantGEMMFp16(Gt(layer.attn_gate.type),
                                    layer.attn_gate.data, buffers_.scratch_f16,
-                                   buffers_.ssm_gate, batch_, ssm_inner_,
+                                   buffers_.ssm_gate, batch, ssm_inner_,
                                    hidden_, stream_);
         LaunchBatchedQuantGEMMFp16(Gt(layer.ssm_alpha.type),
                                    layer.ssm_alpha.data, buffers_.scratch_f16,
-                                   buffers_.alpha, batch_, ts_rank_, hidden_,
+                                   buffers_.alpha, batch, ts_rank_, hidden_,
                                    stream_);
         LaunchBatchedQuantGEMMFp16(Gt(layer.ssm_beta.type),
                                    layer.ssm_beta.data, buffers_.scratch_f16,
-                                   buffers_.beta, batch_, ts_rank_, hidden_,
+                                   buffers_.beta, batch, ts_rank_, hidden_,
                                    stream_);
         stage("ssm_proj", l);
         // The row-split recurrence fuses the norm, gate, and FP16 conversion
@@ -333,7 +336,7 @@ class Forward {
               reinterpret_cast<const float*>(layer.ssm_dt.data),
               reinterpret_cast<const float*>(layer.ssm_norm.data),
               buffers_.ssm_gate, buffers_.ssm_out, /*q8_out=*/nullptr,
-              buffers_.kq_scales, buffers_.alpha_beta, ssm_idx, batch_,
+              buffers_.kq_scales, buffers_.alpha_beta, ssm_idx, batch,
               ssm_qkv_, config_.ssm_group_count, ts_rank_,
               config_.ssm_state_size, value_, stream_,
               QwenRecurrentStateStorage::kFp32,
@@ -347,16 +350,16 @@ class Forward {
               reinterpret_cast<const float*>(layer.ssm_a.data),
               reinterpret_cast<const float*>(layer.ssm_dt.data),
               reinterpret_cast<const float*>(layer.ssm_norm.data),
-              buffers_.ssm_gate, buffers_.ssm_out, ssm_idx, batch_, ssm_qkv_,
+              buffers_.ssm_gate, buffers_.ssm_out, ssm_idx, batch, ssm_qkv_,
               config_.ssm_group_count, ts_rank_, config_.ssm_state_size,
               value_, stream_, QwenRecurrentStateStorage::kFp32);
           LaunchFloatToFp16(buffers_.ssm_out, buffers_.scratch_f16,
-                            static_cast<std::size_t>(batch_) * ssm_inner_,
+                            static_cast<std::size_t>(batch) * ssm_inner_,
                             stream_);
         }
         LaunchBatchedQuantGEMMResidualFp16(
             Gt(layer.ssm_out.type), layer.ssm_out.data, buffers_.scratch_f16,
-            buffers_.hidden, batch_, hidden_, ssm_inner_, stream_);
+            buffers_.hidden, batch, hidden_, ssm_inner_, stream_);
         stage("ssm", l);
       }
       stage("mixer", l);
@@ -364,25 +367,25 @@ class Forward {
       LaunchBatchedRMSNormFp16(
           buffers_.hidden, /*residual=*/nullptr,
           reinterpret_cast<const float*>(layer.post_attention_norm.data),
-          /*sum_out=*/nullptr, buffers_.scratch_f16, batch_, hidden_,
+          /*sum_out=*/nullptr, buffers_.scratch_f16, batch, hidden_,
           config_.rms_eps, stream_);
       const bool paired = TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
           Gt(layer.ffn_gate.type), Gt(layer.ffn_up.type), layer.ffn_gate.data,
-          layer.ffn_up.data, buffers_.scratch_f16, buffers_.ffn_up, batch_,
+          layer.ffn_up.data, buffers_.scratch_f16, buffers_.ffn_up, batch,
           ffn_, hidden_, stream_);
       if (!paired) {
         LaunchBatchedQuantGEMMFp16(Gt(layer.ffn_gate.type), layer.ffn_gate.data,
                                    buffers_.scratch_f16, buffers_.ffn_gate,
-                                   batch_, ffn_, hidden_, stream_);
+                                   batch, ffn_, hidden_, stream_);
         LaunchBatchedQuantGEMMSwiGLUFp16(
             Gt(layer.ffn_up.type), layer.ffn_up.data, buffers_.scratch_f16,
-            buffers_.ffn_gate, buffers_.ffn_up, batch_, ffn_, hidden_,
+            buffers_.ffn_gate, buffers_.ffn_up, batch, ffn_, hidden_,
             stream_);
       }
       stage("gate_up", l);
       LaunchBatchedQuantGEMMResidualFp16(
           Gt(layer.ffn_down.type), layer.ffn_down.data, buffers_.ffn_up,
-          buffers_.hidden, batch_, hidden_, ffn_, stream_);
+          buffers_.hidden, batch, hidden_, ffn_, stream_);
       if (sync_layers) {
         Check(hipStreamSynchronize(stream_), "layer sync");
         std::fprintf(stderr, "yah forward: layer %u (%s) ok\n", l,
@@ -391,7 +394,7 @@ class Forward {
     }
 
     const float* final_hidden =
-        buffers_.hidden + (static_cast<std::size_t>(batch_ - 1) * hidden_);
+        buffers_.hidden + (static_cast<std::size_t>(batch - 1) * hidden_);
     LaunchRMSNorm(final_hidden,
                   reinterpret_cast<const float*>(weights_.output_norm.data),
                   buffers_.normed, hidden_, config_.rms_eps, stream_);
@@ -418,7 +421,7 @@ class Forward {
   }
 
   [[nodiscard]] std::uint32_t vocab_size() const { return vocab_; }
-  [[nodiscard]] std::uint32_t batch() const { return batch_; }
+  [[nodiscard]] std::uint32_t max_batch() const { return max_batch_; }
 
  private:
   [[nodiscard]] std::size_t KvPlaneElements() const {
@@ -427,7 +430,7 @@ class Forward {
   }
 
   void Allocate() {
-    const std::size_t batch = batch_;
+    const std::size_t batch = max_batch_;
     hipStreamCreate(&stream_);
     auto alloc = [&](void** p, std::size_t bytes, const char* what) {
       Check(hipMalloc(p, bytes), what);
@@ -512,7 +515,7 @@ class Forward {
 
   const core::Qwen35Config& config_;
   const Qwen35Weights& weights_;
-  std::uint32_t batch_{0};
+  std::uint32_t max_batch_{0};
   std::uint32_t max_context_{0};
   std::uint32_t hidden_{0};
   std::uint32_t ffn_{0};
