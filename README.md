@@ -51,7 +51,7 @@ Full tables, provenance and the validation results are in [docs/measurements.md]
 3. **Pipeline across requests.** Fixed NPU shapes plus a flexible GPU means request A can run on the NPU while request B runs on the GPU. This is the structural win a single-stream graph cannot express, and it is what returns the GPU to full occupancy without needing the NPU to be faster.
 4. **Keep memory minimal.** Resident memory is dominated by the 12.18 GiB model and the KV cache, not by NPU operands. The ATB operands are transient (~250 MB at M=1024). Minimal memory means mmap the GGUF as the single source of truth, quantize KV, share one pool across both engines, and avoid ever materialising a second copy of the weights.
 
-See [docs/design.md](docs/design.md) for the proposed shape of the engine.
+See [docs/design.md](docs/design.md) for the proposed shape of the engine, and [docs/gpu-tuning.md](docs/gpu-tuning.md) for what the narrow scope makes possible on the GPU side.
 
 ## Status and open items
 
