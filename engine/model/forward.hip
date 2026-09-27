@@ -319,11 +319,11 @@ class Forward {
                                    buffers_.beta, batch_, ts_rank_, hidden_,
                                    stream_);
         stage("ssm_proj", l);
-        // The row-split recurrence fuses the norm, gate, and FP16 conversion,
-        // but it is the one kernel the engine has not checked against a
-        // reference yet. It stays behind a flag until it has been, so the
-        // default path is the recurrence the SSM check did verify.
-        if (std::getenv("YAH_SSM_ROWSPLIT") != nullptr) {
+        // The row-split recurrence fuses the norm, gate, and FP16 conversion
+        // and is the path the reference runs by default. The unfused variant
+        // the SSM check verified directly stays available behind
+        // YAH_SSM_BASELINE as the independent cross-check.
+        if (std::getenv("YAH_SSM_BASELINE") == nullptr) {
           LaunchBatchedSSMConvRecurrenceRowSplit(
               buffers_.ssm_qkv,
               reinterpret_cast<const float*>(layer.ssm_conv1d.data),
