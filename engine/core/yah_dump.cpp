@@ -3,6 +3,7 @@
 #include <map>
 #include <string>
 
+#include "core/config.hpp"
 #include "core/gguf.hpp"
 
 int main(int argc, char** argv) {
@@ -56,6 +57,36 @@ int main(int argc, char** argv) {
       std::printf("%s%" PRIu64, i == 0 ? "" : "x", t->dims[i]);
     }
     std::printf(" bytes=%" PRIu64 "\n", t->bytes);
+  }
+
+  const auto* arch = gguf.Meta("general.architecture");
+  if (arch != nullptr && arch->kind == yah::core::MetadataValue::Kind::kString &&
+      arch->s == "qwen35") {
+    const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
+    std::printf("config: arch=%s blocks=%u ctx=%u hidden=%u ffn=%u\n",
+                cfg.architecture.c_str(), cfg.block_count, cfg.context_length,
+                cfg.embedding_length, cfg.feed_forward_length);
+    std::printf("config: heads=%u kv=%u key=%u val=%u q_dim=%u kv_dim=%u\n",
+                cfg.head_count, cfg.head_count_kv, cfg.key_length,
+                cfg.value_length, cfg.attention_q_dim(), cfg.attention_kv_dim());
+    std::printf("config: rope_dim=%u rope_base=%.1f eps=%.1e full_attn_every=%u first_full=%u\n",
+                cfg.rope_dimension_count, static_cast<double>(cfg.rope_freq_base),
+                static_cast<double>(cfg.rms_eps), cfg.full_attention_interval,
+                cfg.full_attention_interval);
+    std::printf("config: ssm conv=%u state=%u groups=%u dt_rank=%u inner=%u\n",
+                cfg.ssm_conv_kernel, cfg.ssm_state_size, cfg.ssm_group_count,
+                cfg.ssm_time_step_rank, cfg.ssm_inner_size);
+    std::printf("config: full_attention_layers=%u recurrent_layers=%u nextn=%u\n",
+                cfg.AttentionLayers(), cfg.RecurrentLayers(),
+                cfg.nextn_predict_layers);
+    const auto tok = yah::core::TokenizerConfig::FromGguf(gguf);
+    std::printf("tokenizer: model=%s pre=%s bos=%u eos=%u pad=%u add_bos=%d\n",
+                tok.model.c_str(), tok.pre.c_str(), tok.bos_id, tok.eos_id,
+                tok.padding_id, tok.add_bos ? 1 : 0);
+    std::printf("tokenizer: tokens=%zu merges=%zu template=%zu bytes\n",
+                tok.tokens != nullptr ? tok.tokens->size() : 0,
+                tok.merges != nullptr ? tok.merges->size() : 0,
+                tok.chat_template.size());
   }
   return 0;
 }

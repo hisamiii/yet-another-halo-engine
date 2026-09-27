@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # core: GGUF reader, mmap, tensor table, tokenizer. No GPU or NPU dependency.
-add_library(yah_core STATIC core/gguf.cpp)
+add_library(yah_core STATIC core/gguf.cpp core/config.cpp)
 target_include_directories(yah_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(yah_core PRIVATE -Wall -Wextra -Wpedantic)
 

@@ -1,12 +1,12 @@
 # Targets
 
-These are the only model artifacts the engine has to serve. All are already on this machine.
+The target is one GGUF and one projector. UD-Q4_K_S is deferred until the pipeline works; its census is kept below so nothing has to be re-derived when it comes back.
 
 | file | size | bpw | role |
 | --- | ---: | ---: | --- |
 | `Qwen3.8-27B-IQ4_XS-3.84bpw.gguf` | 12.17 GiB | 3.828 | primary target |
-| `Qwen3.8-27B-UD-Q4_K_S.gguf` | 14.29 GiB | 4.494 | second target |
-| `Qwen3.8-27B-UD-Q4_K_S-requant294-Q4K.gguf` | 14.95 GiB | -- | requant experiment, not yet censused |
+| `Qwen3.8-27B-UD-Q4_K_S.gguf` | 14.29 GiB | 4.494 | **deferred** (metadata omits `add_bos_token`) |
+| `Qwen3.8-27B-UD-Q4_K_S-requant294-Q4K.gguf` | 14.95 GiB | -- | deferred experiment, not censused |
 | `mmproj-F16.gguf` | 0.86 GiB | 16 | vision projector |
 
 836 tensors each, GGUF v3. Architecture: Qwen3.8 27B, dense text/image, hybrid Gated DeltaNet plus one full-attention layer every `full_attention_interval`; hidden 5120, intermediate 17408.
@@ -47,18 +47,18 @@ FFN is 61.6% of the file and is **IQ4_XS plus the K-quants** (Q4_K, Q5_K, Q6_K, 
 
 ## The decoder union
 
-Covering both targets needs **twelve** formats: `IQ4_XS`, `IQ3_S`, `IQ3_XXS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ4_NL`, `Q2_K`(trace), `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, plus `Q8_0`/`F32` for the projector and small tensors.
+The 3.84 bpw target needs **eleven** formats: `IQ4_XS`, `IQ3_S`, `IQ3_XXS`, `IQ2_XXS`, `IQ2_XS`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, plus `Q8_0` and `F32` for small tensors and the projector. (UD-Q4_K_S would add `IQ4_NL` and `IQ2_S`.)
 
-`IQ4_XS` is the crossover: 27.5% of the 3.84 bpw file and 41.0% of UD-Q4_K_S. It is the one decoder that must be excellent on both.
+`IQ4_XS` is 27.5% of the target, and `IQ3_S` + `IQ3_XXS` another 46%, so the IQ family carries the FFN; the K-quants still matter for attention, SSM, `lm_head` and the small tensors.
 
 ## What this costs, and where the current engine is incomplete
 
 - **The 3.84 bpw target is an IQ-family shard.** IQ3_S + IQ3_XXS + IQ4_XS are 73% of it, and IQ3_XXS alone is ~19% of the file. The existing paired gate/up kernel has **no IQ3_XXS case**, so a third of the FFN on the primary target runs unpaired, as two separate store kernels with tail predicates. That is a concrete, target-specific win for a greenfield engine.
-- **UD-Q4_K_S wants the opposite**: the Q4_K/Q5_K paired path with the tail-free `Complete` variant is exactly what it needs, and it is the minority case on the 3.84 bpw shard.
+- **The deferred target wants the opposite** (Q4_K/Q5_K paired with the tail-free `Complete` variant), so dropping it simplifies the first kernel matrix to the IQ family plus the K-quant coverage the non-FFN tensors still need.
 - **`Complete` is type-dependent**: worth ~4% on Q4_K, neutral on Q6_K/IQ3_XXS, and **-15% on IQ4_XS**, so the kernel choice has to be per (type, shape), which a fixed-shape engine can bake.
 - **`lm_head` is Q6_K at 7-8% of both files** and is decode-only (a GEMV), so it is a `tg` concern, not prefill.
 - **`embed` is a lookup**, not a GEMM: IQ4_XS on one target and Q3_K on the other.
 
 ## Why this is the right thing to bake
 
-Twelve decoders and two files is a small, closed set. The current engine carries a route table over many more combinations and still has coverage gaps on these two artifacts. A fixed-shape engine can instantiate exactly these, pick `Complete` per type, and skip every format it will never see -- which is the whole argument for the narrow scope.
+Eleven decoders and one file is a small, closed set. The current engine carries a route table over many more combinations and still has coverage gaps on this artifact. A fixed-shape engine can instantiate exactly these, pick `Complete` per type, and skip every format it will never see -- which is the whole argument for the narrow scope.

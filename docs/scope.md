@@ -5,7 +5,7 @@
 ## Frozen scope
 
 - **One architecture**: Qwen3.8 27B, dense text/image, hybrid Gated DeltaNet plus full attention, hidden 5120, intermediate 17408.
-- **Two GGUFs and one projector**, all already on the machine: `Qwen3.8-27B-IQ4_XS-3.84bpw.gguf`, `Qwen3.8-27B-UD-Q4_K_S.gguf`, `mmproj-F16.gguf`. Twelve quant decoders cover both ([targets.md](targets.md)).
+- **One GGUF and one projector**: `Qwen3.8-27B-IQ4_XS-3.84bpw.gguf` and `mmproj-F16.gguf`. Eleven quant decoders cover it ([targets.md](targets.md)). UD-Q4_K_S is deferred until the pipeline works.
 - **Three routing modes**: GPU-only, NPU-only, GPU+NPU.
 - **Minimal memory**: mmap the GGUF as the single source of truth, quantized KV, transient NPU operands.
 
@@ -15,7 +15,7 @@ Greenfield means new structure, not new arithmetic for its own sake, but the ker
 
 - **Port the framework**: the WMMA tiling, the LDS and staging structure, the decoder scaffolding, the GGUF reader and the tokenizer. Those encode measured instruction behaviour and rewriting them is pure delay.
 - **Port the framework, then treat power-per-FLOP as the GPU lever.** The 26% harness disagreement is real and is *clock*, not code -- but the clock is a function of the kernel's power draw, not a constant. The part has three SCLK levels (600 / 1408 / 2900 MHz) and **never reaches the top one**: sustained prefill sits at ~2000-2200 MHz at ~0.0144 TF/MHz, work-per-clock is flat across power limits, and the log's own conclusion is that "what is broken is the conversion of watts into clock". At the 2900 MHz level the peak is on the order of **60 TFLOPS**, so a realistic ~2200 MHz ceiling is ~45 and the production ~30 is about two thirds of it.
-- **A kernel that draws less switching power for the same FLOPs raises the clock as well as the work per clock, so efficiency and clock are one lever, not two.** That is M2g. Decoder coverage -- twelve types, paired gate/up, per-type `Complete` -- is the other half of the GPU workstream.
+- **A kernel that draws less switching power for the same FLOPs raises the clock as well as the work per clock, so efficiency and clock are one lever, not two.** That is M2g. Decoder coverage -- eleven types, paired gate/up, per-type `Complete` -- is the other half of the GPU workstream.
 
 So the kernel workstream has two halves: cover the target decoders, and reduce power per FLOP so the SMU grants a higher clock. At the current operating point the iGPU (~31.5 TF under production data) and the NPU (32.4, data-independent) are at parity, which is why the split pays; pushing the iGPU toward ~45 at a higher clock moves that balance back toward the GPU.
 
@@ -33,7 +33,7 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 | # | workstream | new or ported | rough |
 | --- | --- | --- | --- |
 | 1 | GGUF reader, mmap, tensor table, tokenizer | ported | 1 wk |
-| 2 | GPU kernel set: port the framework, 12 decoders, paired coverage, per-type `Complete`, then power-per-FLOP and clock | ported + workstream | 3-6 wk |
+| 2 | GPU kernel set: port the framework, 11 decoders, paired coverage, per-type `Complete`, then power-per-FLOP and clock | ported + workstream | 3-6 wk |
 | 3 | Model graph: Gated DeltaNet, attention, RoPE, norms, SwiGLU FFN, KV | new | 2-3 wk |
 | 4 | NPU executor: xclbins, dma-buf operands, async launch, join | new | 2 wk |
 | 5 | Scheduler: phase routing, per-layer-type split, overlap, power budget | new | 1-2 wk |
@@ -76,6 +76,6 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 
 - Port the kernel framework and the GGUF/tokenizer. The measured ~31.5 TFLOPS is the *current operating point*, limited by the clock the kernel's own power draw buys -- `pp_dpm_sclk` is a first-class signal, not a footnote.
 - One binary, one architecture, hardcoded shapes.
-- Iterate on the 3.84 bpw shard (13 GB, loads faster, and is the harder decoder set); gate on UD-Q4_K_S before promoting.
+- One target: iterate on the 3.84 bpw shard. It is the harder decoder set and it is the whole matrix.
 - Keep the measurement protocol from [methodology.md](methodology.md): warm-up, alternating arms, one repetition, pairs only.
 - Every change is gated by the validate-prefill top-1 check, not by throughput.
