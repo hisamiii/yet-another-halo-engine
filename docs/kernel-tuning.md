@@ -98,6 +98,36 @@ The shipped shard's FFN is not one quant. A byte-weighted census gives seven typ
 
 **Falsifier on record:** a batch-2048 A/B of Q4_K against IQ3_XXS at m=17408 k=5120. Near +25% means the gap is the decoder and repacking/coverage is the lever; near +3% means the format hypothesis is dead too. A batch-512 run gave only +2.8%, but at that batch the shape is weight-bandwidth-bound and hides decode cost.
 
+## The two matrix units are shaped on different axes
+
+The same datatype switch costs differently on the GPU and the NPU because the
+two units are sized differently:
+
+- **GPU WMMA is element-count-shaped.** `wmma_f32_16x16x16_f16` and
+  `wmma_i32_16x16x16_iu8` both do 4096 MACs per instruction and issue at about
+  the same rate, so fp16 and int8 measure 48.35 and 50.31 TF — a 4% spread.
+  int8's narrower operands buy nothing. Only int4 changes the shape
+  (`..._16x16x32_iu4`, 8192 MACs), which is where 52.6 TMAC/s, 2.1x int8,
+  comes from.
+- **NPU AIE2P is bit-width-shaped.** `I512.I512.ACC1024.acc32.mac` moves 512-bit
+  operands (64 int8) and `I1024.I1024.ACC2048.bf.mac` moves 1024-bit operands
+  (64 bf16). Same MAC count per instruction, twice the operand bits, so bf16
+  does half the work per operand fetch: 56.9 TOPS int8 against 38.9 bf16,
+  1.46x. There is **no int4 MAC**; the AIE2P has an int4 **unpack**
+  (`llvm.aie2p.unpack.I512.I8.I4`, 64 packed nibbles to 64 int8) whose lowering
+  names its purpose — AWQ packed weights with the signed offset folded into a
+  per-group zero point. So NPU int4 is w4a8 with packed weights, a byte-width
+  format, not a rate.
+
+So on the GPU there is nothing between fp16 and int4, while on the NPU int8 is
+a free 1.46x over bfp16 before any tiling work. The shipped split runs bfp16 B,
+i.e. it sits on the 38.9 TOPS rung when 56.9 is available with fewer bytes per
+weight; int4-B then attacks the operand-traffic gap, not the MAC rate.
+
+**Falsifier:** build the same ATB shape with an int8 B and compare against the
+bfp16 build at the same M/K/N. Near 1.4x on the achieved rate confirms the
+datatype rung; near 1.0x means the kernel was already operand-bound and the
+byte width, not the MAC width, is the lever.
 ## Method notes worth keeping
 
 - Measure the instruction ceiling separately from any kernel; a peak harness that read two of eight accumulators reported 4x the real rate.
