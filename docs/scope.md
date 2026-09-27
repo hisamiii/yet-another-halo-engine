@@ -9,12 +9,14 @@
 - **Three routing modes**: GPU-only, NPU-only, GPU+NPU.
 - **Minimal memory**: mmap the GGUF as the single source of truth, quantized KV, transient NPU operands.
 
-## What is ported, not rewritten
+## What is ported, and what is not
 
-Greenfield means new structure, not new arithmetic. Two assets are already at the limit and rewriting them is the largest avoidable delay in the plan:
+Greenfield means new structure, not new arithmetic for its own sake, but the kernel set is **not** an untouchable asset. The distinction matters:
 
-1. **The HIP GEMM kernels.** The fp16 WMMA tile space is swept and exhausted, the instruction ceiling is a measured 48.35 TFLOPS, and the paired kernel already runs at 40.6. Rewriting this buys nothing and costs months. Port it, then extend it to the twelve decoders in the union.
-2. **The GGUF reader and tokenizer.** A file-format parser and a BPE table. Port.
+- **Port the framework**: the WMMA tiling, the LDS and staging structure, the decoder scaffolding, the GGUF reader and the tokenizer. Those encode measured instruction behaviour and rewriting them is pure delay.
+- **Do not port the efficiency claim.** The best single kernel (paired gate/up, 256x256) measures 40.6 TFLOPS, but **the aggregate across all prefill kernels is ~30 TFLOPS** -- about 62% of the measured 48.35 instruction ceiling. That ~18-TFLOPS gap is a first-class workstream. The recorded 27.7% model-level gap against the plain-store bench is split between the IQ3_XXS decode (a third of the primary target's FFN, and the most expensive decoder measured), the non-FFN GEMMs, and shape and `Complete` choices; the batch-2048 A/B that would separate them was never run.
+
+So the kernel workstream is: port the framework, then raise the aggregate toward the instruction ceiling with the twelve decoders and the fixed shapes. That is comparable in value to the NPU's int8 work and cheaper to reach.
 
 Everything above the kernels is new: the execution graph, the two-engine scheduler, the NPU executor, the memory policy.
 
@@ -30,7 +32,7 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 | # | workstream | new or ported | rough |
 | --- | --- | --- | --- |
 | 1 | GGUF reader, mmap, tensor table, tokenizer | ported | 1 wk |
-| 2 | GPU GEMM kernels + 12 decoders + paired gate/up coverage | ported + extended | 2-3 wk |
+| 2 | GPU kernel set: port the framework, 12 decoders, paired coverage, per-type `Complete`, raise the aggregate 30 -> 40+ | ported + workstream | 3-5 wk |
 | 3 | Model graph: Gated DeltaNet, attention, RoPE, norms, SwiGLU FFN, KV | new | 2-3 wk |
 | 4 | NPU executor: xclbins, dma-buf operands, async launch, join | new | 2 wk |
 | 5 | Scheduler: phase routing, per-layer-type split, overlap, power budget | new | 1-2 wk |
@@ -46,6 +48,7 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 | **M0** | text runs end to end on the iGPU, correct | token-for-token match on a fixed prompt against a reference; pp2048 in the 400+ tok/s class |
 | **M1** | NPU executor + FFN token split, async and overlapped | validation passes at every chunk length **including the all-NPU case**; GPU stream idle < 5%; >= 1.3x over M0 |
 | **M2** (parallel from week 1) | int8 / int4 ATB GEMM | >= 40 TFLOPS at both FFN shapes, numerics pass, power inside 130 W |
+| **M2g** (parallel) | GPU kernel set: aggregate efficiency on all target types | >= 38-40 TFLOPS **aggregate** at model level (from ~30), top-1 validation unchanged |
 | **M3** | split the non-FFN GEMM (attention projections) | >= 1.5x over M0 |
 | **M4** (parallel) | memory: quantized KV, single-copy weights | peak RSS = mmap + KV + transients, measured |
 | **M5** | vision via mmproj-F16 | image prompt produces correct output; measured |
@@ -68,7 +71,7 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 
 ## Rules that keep it fast
 
-- Port the kernels and the GGUF/tokenizer; write nothing that already exists and is measured.
+- Port the kernel framework and the GGUF/tokenizer; do not rewrite the measured instruction structure, but do not inherit the aggregate either (~30 TFLOPS is the starting point, not the ceiling).
 - One binary, one architecture, hardcoded shapes.
 - Iterate on the 3.84 bpw shard (13 GB, loads faster, and is the harder decoder set); gate on UD-Q4_K_S before promoting.
 - Keep the measurement protocol from [methodology.md](methodology.md): warm-up, alternating arms, one repetition, pairs only.

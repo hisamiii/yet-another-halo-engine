@@ -26,6 +26,12 @@ Production efficiency:
 
 Ablations on the real kernel: weight and activation staging costs ~10% on Q4_K and ~22% on IQ3_XXS; the store epilogue costs **+0.13%**, i.e. nothing. With staging removed the kernel runs at 34.9 TFLOPS, 72% of ceiling, and the remaining ~28% is localised to the K loop (six swizzled LDS reads, eight WMMA per K step, loop overhead across forty stages, barriers) but is **not explained**. The obvious next structure, a reduced inner-loop microbenchmark, measured *slower* than the real kernel and is not a valid reference.
 
+### The aggregate is ~30 TFLOPS, not 40.6
+
+`40.6` is one kernel on one shape. Across the whole prefill kernel set the GPU delivers **~30 TFLOPS aggregate**, about **62% of the 48.35 instruction ceiling**, against the best kernel's 84%. The recorded model-level gap versus the plain-store bench is **27.7%**: part of it is the IQ3_XXS decode (a third of the FFN on the 3.84 bpw target and the most expensive decoder measured, +26% loop instructions over Q4_K), part is the non-FFN GEMMs, and part is shape and `Complete` choices. The batch-2048 Q4_K against IQ3_XXS A/B that would separate the format from the rest was never run.
+
+So the kernel *set* has ~60% headroom to the instruction ceiling even though its best kernel is within 16% of it. That gap is a workstream, not a sunk cost, and it is cheaper to close than the NPU's.
+
 int4 is the only measured lever above 1.5x: 52.6 TMAC/s, 2.1x int8 and 2.2x fp16. It requires four-bit activations, so it is a quality decision, and it is eligibility-bound (Q4_K/Q3_K, a low-double-digit percent of these shards).
 
 **So "autotune the GPU" is not an open tile search.** The tile space is closed and the structural limits (LDS, workgroup size) are hit. What remains is the unexplained K-loop residual and format-level choices, not parameter sweeps.
