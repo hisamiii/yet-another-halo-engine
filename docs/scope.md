@@ -14,9 +14,9 @@
 Greenfield means new structure, not new arithmetic for its own sake, but the kernel set is **not** an untouchable asset. The distinction matters:
 
 - **Port the framework**: the WMMA tiling, the LDS and staging structure, the decoder scaffolding, the GGUF reader and the tokenizer. Those encode measured instruction behaviour and rewriting them is pure delay.
-- **Do not port the efficiency claim.** The best single kernel (paired gate/up, 256x256) measures 40.6 TFLOPS, but **the aggregate across all prefill kernels is ~30 TFLOPS** -- about 62% of the measured 48.35 instruction ceiling. That ~18-TFLOPS gap is a first-class workstream. The recorded 27.7% model-level gap against the plain-store bench is split between the IQ3_XXS decode (a third of the primary target's FFN, and the most expensive decoder measured), the non-FFN GEMMs, and shape and `Complete` choices; the batch-2048 A/B that would separate them was never run.
+- **Do not port the efficiency claim, and do not expect to beat it.** The best single kernel measures 40.6 TFLOPS and the aggregate ~30, but that 26% gap is **not headroom**: it is the GPU boost clock moving with the data. Zeroed operands toggle fewer bits, draw less switching power and let the part boost ~20% higher; efficiency per clock agrees to **0.3%** between the fast and slow harnesses, and the rate under real weight data is **~31.5 TFLOPS at ~2141 MHz**, which the model-level wall clock independently confirms. The 38-40 and 40.6 figures are synthetic-data artifacts. So the GPU workstream is **coverage and correctness**, not efficiency: twelve decoders, paired gate/up for the target types, and the per-type `Complete` choice.
 
-So the kernel workstream is: port the framework, then raise the aggregate toward the instruction ceiling with the twelve decoders and the fixed shapes. That is comparable in value to the NPU's int8 work and cheaper to reach.
+So the kernel workstream is: port the framework and cover the target decoders. There is no unclaimed GPU efficiency left. The iGPU and the NPU are at **parity** on the FFN -- iGPU ~31.5 TF under production data, NPU 32.4 and data-independent -- which is exactly why the split is worth having rather than redundant.
 
 Everything above the kernels is new: the execution graph, the two-engine scheduler, the NPU executor, the memory policy.
 
@@ -32,7 +32,7 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 | # | workstream | new or ported | rough |
 | --- | --- | --- | --- |
 | 1 | GGUF reader, mmap, tensor table, tokenizer | ported | 1 wk |
-| 2 | GPU kernel set: port the framework, 12 decoders, paired coverage, per-type `Complete`, raise the aggregate 30 -> 40+ | ported + workstream | 3-5 wk |
+| 2 | GPU kernel set: port the framework, 12 decoders, paired coverage, per-type `Complete` | ported + coverage | 2-3 wk |
 | 3 | Model graph: Gated DeltaNet, attention, RoPE, norms, SwiGLU FFN, KV | new | 2-3 wk |
 | 4 | NPU executor: xclbins, dma-buf operands, async launch, join | new | 2 wk |
 | 5 | Scheduler: phase routing, per-layer-type split, overlap, power budget | new | 1-2 wk |
@@ -47,11 +47,12 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 | --- | --- | --- |
 | **M0** | text runs end to end on the iGPU, correct | token-for-token match on a fixed prompt against a reference; pp2048 in the 400+ tok/s class |
 | **M1** | NPU executor + FFN token split, async and overlapped | validation passes at every chunk length **including the all-NPU case**; GPU stream idle < 5%; >= 1.3x over M0 |
-| **M2** (parallel from week 1) | int8 / int4 ATB GEMM | >= 40 TFLOPS at both FFN shapes, numerics pass, power inside 130 W |
-| **M2g** (parallel) | GPU kernel set: aggregate efficiency on all target types | >= 38-40 TFLOPS **aggregate** at model level (from ~30), top-1 validation unchanged |
+| **M2** (parallel from week 1) | int8 / int4 ATB GEMM -- the only item that raises the ceiling | >= 45 TFLOPS at both FFN shapes, numerics pass, power inside 130 W |
 | **M3** | split the non-FFN GEMM (attention projections) | >= 1.5x over M0 |
 | **M4** (parallel) | memory: quantized KV, single-copy weights | peak RSS = mmap + KV + transients, measured |
 | **M5** | vision via mmproj-F16 | image prompt produces correct output; measured |
+
+**The affordable ceiling is ~1.42x on prefill.** The FFN split with the corrected iGPU rate (~31.5 TF) against the concurrent NPU (24.6 TF) balances at 0.438 and is worth 1.78x on the FFN GEMM, which is **1.42x on prefill** with the FFN at 67% of GEMM FLOPs. Splitting the rest of the GEMM would give more, but the non-FFN weights are another ~5.13 GiB and packing them at 9 bits/weight adds ~13 GiB on top of the 18.21 the FFN already needs -- which minimal memory does not allow. **The FFN-only split is the memory-optimal one, and 1.42x is its ceiling.**
 
 **Critical path is M0 -> M1 -> M3.** M2 runs in parallel from day one because it is the long pole and the only item that moves the ceiling; M4 also parallel; M5 is after M1 and off the critical path.
 
@@ -71,7 +72,7 @@ Everything above the kernels is new: the execution graph, the two-engine schedul
 
 ## Rules that keep it fast
 
-- Port the kernel framework and the GGUF/tokenizer; do not rewrite the measured instruction structure, but do not inherit the aggregate either (~30 TFLOPS is the starting point, not the ceiling).
+- Port the kernel framework and the GGUF/tokenizer; do not rewrite the measured instruction structure. ~31.5 TFLOPS under production data is the iGPU's real rate, not a floor.
 - One binary, one architecture, hardcoded shapes.
 - Iterate on the 3.84 bpw shard (13 GB, loads faster, and is the harder decoder set); gate on UD-Q4_K_S before promoting.
 - Keep the measurement protocol from [methodology.md](methodology.md): warm-up, alternating arms, one repetition, pairs only.
