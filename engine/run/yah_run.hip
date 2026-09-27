@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -50,12 +51,13 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: yah-run <model.gguf> [--text TEXT] [--ids \"1 2\"] "
                  "[--repeat N] [--chunk N] [--gen N] [--kv f16|q8|q4] [--max-context N]\n"
-                 "       [--dump-logits F] [--dump-all-logits F]\n");
+                 "       [--ids-file F] [--dump-logits F] [--dump-all-logits F]\n");
     return 2;
   }
   const std::string model = argv[1];
   std::string text;
   std::string ids_arg;
+  std::string ids_file;
   std::string dump;
   std::string all_logits;
   std::uint32_t max_context = 4096;
@@ -72,6 +74,7 @@ int main(int argc, char** argv) {
     };
     if (a == "--text") text = next();
     else if (a == "--ids") ids_arg = next();
+    else if (a == "--ids-file") ids_file = next();
     else if (a == "--dump-logits") dump = next();
     else if (a == "--dump-all-logits") all_logits = next();
     else if (a == "--batch") batch = static_cast<std::uint32_t>(std::stoul(next()));
@@ -105,7 +108,14 @@ int main(int argc, char** argv) {
     const auto tconfig = yah::core::TokenizerConfig::FromGguf(gguf);
     const auto tokenizer = yah::core::Tokenizer::FromGguf(gguf, tconfig);
     std::vector<std::uint32_t> tokens;
-    if (!ids_arg.empty()) {
+    if (!ids_file.empty()) {
+      std::ifstream file(ids_file);
+      if (!file) {
+        throw std::runtime_error("yah-run: cannot read " + ids_file);
+      }
+      tokens = ParseIds(std::string(std::istreambuf_iterator<char>(file),
+                                    std::istreambuf_iterator<char>()));
+    } else if (!ids_arg.empty()) {
       tokens = ParseIds(ids_arg);
     } else {
       tokens = tokenizer.Encode(text);

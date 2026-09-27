@@ -95,6 +95,7 @@ struct Buffers {
   std::uint16_t* scratch_k{nullptr};
   std::uint16_t* scratch_v{nullptr};
   float* hadamard{nullptr};
+  std::uint8_t* attn_workspace{nullptr};
   bool kv_dumped{false};
   std::uint32_t* tokens{nullptr};
   std::uint32_t* argmax{nullptr};
@@ -477,13 +478,22 @@ class Forward {
                               buffers_.ssm_gate, batch, config_.head_count,
                               config_.key_length, stream_);
         const KvView kv_view = WriteKvCache(layer, attn_idx, batch, start_pos);
+        const std::size_t ws_bytes =
+            static_cast<std::size_t>(config_.head_count_kv) * max_context_ *
+            config_.key_length * sizeof(std::uint16_t);
+        const std::span<float> k_workspace(
+            reinterpret_cast<float*>(buffers_.attn_workspace),
+            ws_bytes / sizeof(float));
+        const std::span<float> v_workspace(
+            reinterpret_cast<float*>(buffers_.attn_workspace + ws_bytes),
+            ws_bytes / sizeof(float));
         const bool wmma = LaunchQwenWmmaAttention(
             buffers_.q, buffers_.k, buffers_.v, buffers_.ssm_gate,
             /*k_cache=*/nullptr, /*v_cache=*/nullptr, kv_view.k, kv_view.v,
             buffers_.ssm_out, kv_view.layer, start_pos, batch, max_context_,
             config_.head_count, config_.head_count_kv, config_.key_length,
             stream_, /*lse_out=*/nullptr, /*key_begin=*/0,
-            /*skip_kv_write=*/true);
+            /*skip_kv_write=*/true, k_workspace, v_workspace);
         if (!wmma) {
           LaunchBatchedAttention(
               buffers_.q, buffers_.k, buffers_.v, buffers_.ssm_gate,
@@ -803,6 +813,14 @@ class Forward {
                            hipMemcpyHostToDevice, stream_),
             "upload hadamard");
     }
+    // The WMMA attention kernel reuses a packed K/V layout across query
+    // blocks only when it is given a workspace large enough for all KV heads
+    // at the maximum context; without it, batch >= 1024 falls back to the
+    // direct path. One K plane plus one V plane.
+    alloc(reinterpret_cast<void**>(&buffers_.attn_workspace),
+          2 * config_.head_count_kv * max_context_ * config_.key_length *
+              sizeof(std::uint16_t),
+          "attn_workspace");
     alloc(reinterpret_cast<void**>(&buffers_.tokens),
           batch * sizeof(std::uint32_t), "tokens");
     alloc(reinterpret_cast<void**>(&buffers_.argmax), sizeof(std::uint32_t),
@@ -839,6 +857,7 @@ class Forward {
     hipFree(buffers_.ffn_up);
     hipFree(buffers_.kv_f16);
     hipFree(buffers_.packed_kv);
+    hipFree(buffers_.attn_workspace);
     hipFree(buffers_.scratch_k);
     hipFree(buffers_.scratch_v);
     hipFree(buffers_.hadamard);

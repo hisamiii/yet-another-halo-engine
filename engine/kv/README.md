@@ -95,6 +95,21 @@ kernel. A rotation mixes exactly the elements the gate treats independently, so
 the inverse cannot be applied after it. Matching the reference on V would mean
 splitting the gate out of the attention kernel.
 
+## Long context
+
+A 32768-token prompt through the chunked path (chunk 2048, max_context 32768):
+
+| config | prefill | argmax |
+| --- | ---: | ---: |
+| f16 | 77.5 s | 9338 |
+| q4 | 83.0 s (+2.4%) | 9338 |
+
+Same token at 32k depth, so the cache is validated where it matters, and the
+scratch costs 2.4% of prefill. That is small enough that in-kernel dequant is
+not worth its risk at this context; it only becomes the right move when the
+cache read, not the FFN, is the critical path. The q4 cache costs 2.9x memory
+(packed plus a one-layer fp16 scratch against the fp16 cache).
+
 ## Gate
 
 `kv-quant-check` verifies the pack/unpack against a host reference bit for bit,
