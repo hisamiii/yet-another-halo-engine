@@ -10,7 +10,7 @@ endif()
 # core: GGUF reader, mmap, tensor table, tokenizer. No GPU or NPU dependency.
 find_package(ICU COMPONENTS uc REQUIRED)
 
-add_library(yah_core STATIC core/gguf.cpp core/config.cpp core/tokenizer.cpp)
+add_library(yah_core STATIC core/gguf.cpp core/config.cpp core/tokenizer.cpp model/weights.cpp)
 target_include_directories(yah_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(yah_core PUBLIC ICU::uc)
 target_compile_options(yah_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -24,3 +24,7 @@ target_link_libraries(yah-dump PRIVATE yah_core)
 # verification step for the tokenizer is the HF golden hash fixture.
 add_executable(yah-tokenize core/yah_tokenize.cpp)
 target_link_libraries(yah-tokenize PRIVATE yah_core)
+
+# yah-weights: resolve and validate the typed weight table the layer loop needs.
+add_executable(yah-weights model/yah_weights.cpp)
+target_link_libraries(yah-weights PRIVATE yah_core)
