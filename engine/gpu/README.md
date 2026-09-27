@@ -64,6 +64,27 @@ All thirteen types pass, relative RMS between **1.7e-4 and 3.6e-4**. That is
 fp32 accumulation-order agreement: the device and host decoders are reading the
 same bytes the same way, which is what a correct port looks like. Worst is Q5_K
 at 3.6e-4; the target's FFN types are 1.8-2.4e-4.
+### The FFN launcher chain
+
+`ffn_check.hip` runs a whole FFN block through the production launchers --
+RMSNorm -> gate/up SwiGLU -> down with residual -- and compares the output
+against the host decoder, reading the device's own FP16 intermediates back so
+that only the kernels and launchers are under test:
+
+    ./engine/build/yah-ffn-check <gate> <up> <down> <batch>
+
+| gate/up/down | paired path | norm max abs | rel RMS |
+| --- | :---: | ---: | ---: |
+| Q4_K | yes | 1.9e-6 | 4.7e-5 |
+| IQ4_XS | yes | 1.9e-6 | 8.2e-5 |
+| IQ3_XXS | **no** | 1.9e-6 | 8.4e-5 |
+| IQ3_S | **no** | 1.9e-6 | 2.1e-4 |
+
+The `paired` column is the one that matters for the target: IQ3_XXS and IQ3_S
+still have no case in `TryLaunchBatchedDualQuantGEMMSwiGLUFp16`, so those blocks
+fall back to a gate store plus an up SwiGLU. The fallback is numerically
+correct; its cost is an extra GEMM pass, which is the coverage gap the kernel
+workstream exists to close.
 ## Clock
 
 A rate here is not comparable without the clock it ran at. Use
