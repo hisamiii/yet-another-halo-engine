@@ -81,9 +81,14 @@ crest is 1.435 (p90 1.719) and the channel RMS spread is 1.43x (p90/p10), so
 KIVI-style per-channel K scales give 0.0121 relative MSE against 0.0120 for the
 blocks — no gain. K after QK-norm and RoPE is flat in both axes.
 
-So plain per-32 blocks are the right quantizer here and the rotation is
-contraindicated, not merely unhelpful. Revisit it if another model or a larger
-block size shows a high crest factor.
+The reconstruction numbers say the rotation should hurt, and on a repeated-prompt
+logit comparison it did (cosine 0.980 vs 0.998). But the next-token KLD over
+real prose is *mixed*: the rotation lowers the KLD by ~22% (0.0050 vs 0.0064)
+and the tail (max 0.033 vs 0.030) is a wash, while the argmax agreement drops
+slightly (95.3% vs 95.9%). So a larger reconstruction error can still land
+closer in distribution, because only the component along the query matters for
+the logits. The rotation is not a clean win here and not a clean loss; it stays
+off by default and the flag is there to revisit.
 
 V is not rotated because the attention gate is fused per element inside the
 kernel. A rotation mixes exactly the elements the gate treats independently, so
@@ -96,6 +101,28 @@ splitting the gate out of the attention kernel.
 the round trip inside the block layout's error bound, and the Hadamard identity
 (`H*H = I`). The token gates run with `--kv q8` and `--kv q4`: three prefill
 prompts and 20 generated tokens match the f16 result.
+
+## KLD
+
+`tests/kld.sh <model> <text> [tokens]` runs the engine once per configuration,
+dumps the next-token logits at every position, and reports
+`KL(softmax(f16) || softmax(candidate))` plus the argmax agreement. 512 tokens
+of repo prose, mean/p99/max in nats:
+
+| config | KLD mean | KLD p99 | KLD max | top-1 same | implied perplexity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| q8 | 0.000025 | 0.000115 | 0.000235 | 99.80% | +0.002% |
+| q4 | 0.006449 | 0.026297 | 0.030372 | 95.90% | +0.65% |
+| q4 + rotation | 0.005035 | 0.022502 | 0.033072 | 95.31% | +0.50% |
+| q4 + Q4 (w4a4) | 0.008694 | 0.043999 | 0.119704 | 95.70% | +0.87% |
+| q4 + Q3 (w4a3) | 0.019152 | 0.131046 | 0.249166 | 91.21% | +1.93% |
+| q4 + Q4 + rotation | 0.006567 | 0.043413 | 0.062868 | 94.73% | +0.66% |
+
+`YAH_QATTN=4` rounds Q to the same 4-bit block grid before attention, which
+reproduces a w4a4 QK^T's operand error without an int4 MMA kernel (the
+accumulation is fp32 either way). It costs +35% KLD over q4 KV; Q at 3 bits
+costs 3x. The argmax agrees 95.9% of the time at q4, so the damage is a ~4%
+single-step flip rate on a sub-percent perplexity shift, not a collapse.
 
 ## Open
 

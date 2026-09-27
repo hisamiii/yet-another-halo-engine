@@ -50,13 +50,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: yah-run <model.gguf> [--text TEXT] [--ids \"1 2\"] "
                  "[--repeat N] [--chunk N] [--gen N] [--kv f16|q8|q4] [--max-context N]\n"
-                 "       [--dump-logits F]\n");
+                 "       [--dump-logits F] [--dump-all-logits F]\n");
     return 2;
   }
   const std::string model = argv[1];
   std::string text;
   std::string ids_arg;
   std::string dump;
+  std::string all_logits;
   std::uint32_t max_context = 4096;
   std::uint32_t repeat = 1;
   std::uint32_t batch = 0;
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
     if (a == "--text") text = next();
     else if (a == "--ids") ids_arg = next();
     else if (a == "--dump-logits") dump = next();
+    else if (a == "--dump-all-logits") all_logits = next();
     else if (a == "--batch") batch = static_cast<std::uint32_t>(std::stoul(next()));
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::stoul(next()));
     else if (a == "--repeat") repeat = static_cast<std::uint32_t>(std::stoul(next()));
@@ -140,6 +142,7 @@ int main(int argc, char** argv) {
                    : std::min(chunk, static_cast<std::uint32_t>(tokens.size()));
     yah::model::Forward forward(config, weights, max_batch, max_context, kv);
     std::uint32_t argmax = 0;
+    std::uint32_t last_batch = 0;
     double best_ms = 1e30;
     for (std::uint32_t r = 0; r < repeat; ++r) {
       forward.Reset();
@@ -149,6 +152,7 @@ int main(int argc, char** argv) {
             std::min<std::size_t>(max_batch, tokens.size() - off));
         argmax = forward.Prefill(tokens.data() + off, n,
                                  static_cast<std::uint32_t>(off));
+        last_batch = n;
       }
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - start)
@@ -158,6 +162,17 @@ int main(int argc, char** argv) {
     }
     std::printf("argmax=%u\n", argmax);
     std::printf("best_ms=%.3f\n", best_ms);
+    if (!all_logits.empty()) {
+      const std::size_t count =
+          static_cast<std::size_t>(last_batch) * forward.vocab_size();
+      std::vector<float> every(count);
+      forward.AllLogits(last_batch, every.data());
+      std::ofstream out(all_logits, std::ios::binary);
+      out.write(reinterpret_cast<const char*>(every.data()),
+                static_cast<std::streamsize>(count * sizeof(float)));
+      std::fprintf(stderr, "wrote %u x %u all-position logits to %s\n",
+                   last_batch, forward.vocab_size(), all_logits.c_str());
+    }
 
     // Generation runs the same kernel chain one token at a time. A dedicated
     // GEMV decode path is a later optimization; the goal of this loop is a

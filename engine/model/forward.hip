@@ -51,6 +51,7 @@ using yah::kv::KvRowBytes;
 using yah::kv::KvStorage;
 using yah::kv::LaunchDequantizeKvRows;
 using yah::kv::LaunchHadamardInPlace;
+using yah::kv::LaunchQuantizeDequantizeFp32;
 using yah::kv::LaunchHadamardInPlaceHalf;
 using yah::kv::LaunchQuantizeKvRows;
 
@@ -171,6 +172,14 @@ class Forward {
     // either way. It is kept as an opt-in for the larger-block experiment.
     kv_rotate_ = kv_storage_ != KvStorage::kF16 &&
                  std::getenv("YAH_KV_ROT") != nullptr;
+    if (const char* qattn = std::getenv("YAH_QATTN")) {
+      switch (std::atoi(qattn)) {
+        case 4: qattn_levels_ = 7; break;
+        case 3: qattn_levels_ = 3; break;
+        case 2: qattn_levels_ = 1; break;
+        default: qattn_levels_ = 0; break;
+      }
+    }
     if (batch == 0 || max_context == 0) {
       throw std::runtime_error("yah forward: zero batch or context");
     }
@@ -316,6 +325,12 @@ class Forward {
           buffers_.scratch_k + (start_pos * kv_),
           static_cast<std::size_t>(batch) * config_.head_count_kv,
           config_.key_length, buffers_.hadamard, stream_);
+    }
+    if (qattn_levels_ > 0) {
+      LaunchQuantizeDequantizeFp32(
+          buffers_.q,
+          static_cast<std::size_t>(batch) * config_.head_count,
+          config_.key_length, qattn_levels_, stream_);
     }
 
     const std::size_t row_bytes = KvRowBytes(kv_storage_, kv_);
@@ -636,6 +651,30 @@ class Forward {
     Check(hipStreamSynchronize(stream_), "sync decode");
     return out;
   }
+  // Computes and copies the fp32 logits of every position in the chunk, the
+  // input to a KLD against a reference run. The hidden states are already
+  // causal, so position t's logits predict token t+1.
+  void AllLogits(std::uint32_t batch, float* out) {
+    for (std::uint32_t t = 0; t < batch; ++t) {
+      const float* h = buffers_.hidden + (static_cast<std::size_t>(t) * hidden_);
+      LaunchRMSNorm(
+          h, reinterpret_cast<const float*>(weights_.output_norm.data),
+          buffers_.normed, hidden_, config_.rms_eps, stream_);
+      if (weights_.output.present) {
+        LaunchGEMV(weights_.output.data, Gt(weights_.output.type),
+                   buffers_.normed, buffers_.logits, vocab_, hidden_, stream_);
+      } else {
+        LaunchGEMV(weights_.token_embd.data, Gt(weights_.token_embd.type),
+                   buffers_.normed, buffers_.logits, vocab_, hidden_, stream_);
+      }
+      Check(hipMemcpyAsync(out + (static_cast<std::size_t>(t) * vocab_),
+                           buffers_.logits, vocab_ * sizeof(float),
+                           hipMemcpyDeviceToHost, stream_),
+            "all logits copy");
+    }
+    Check(hipStreamSynchronize(stream_), "sync all logits");
+  }
+
   // Copies the fp32 logits of the last position to the host.
   void CopyLogits(float* out) {
     Check(hipMemcpyAsync(out, buffers_.logits, vocab_ * sizeof(float),
@@ -778,6 +817,9 @@ class Forward {
   std::uint32_t vocab_{0};
   KvStorage kv_storage_{KvStorage::kF16};
   bool kv_rotate_{false};
+  // Diagnostic: levels Q is rounded to before attention, reproducing a w4a4
+  // QK^T's operand error. 7 for 4 bits, 3 for 3, 1 for 2; 0 disables.
+  int qattn_levels_{0};
   hipStream_t stream_{nullptr};
   Buffers buffers_;
 };
