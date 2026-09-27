@@ -35,6 +35,7 @@
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
+#include "src/models/qwen/hip/ops/swiglu.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 
 namespace yah::model {
@@ -413,6 +414,111 @@ class Forward {
     return out;
   }
 
+
+  // One decode step. The math is the same as Prefill with a batch of one,
+  // but the projections are GEMVs and the attention and recurrence are the
+  // single-token kernels, which is where the reference decode path gets its
+  // speed. The KV cache and recurrent state are the ones Prefill left.
+  std::uint32_t Decode(std::uint32_t token, std::uint32_t pos) {
+    Check(hipMemcpyAsync(buffers_.tokens, &token, sizeof(token),
+                         hipMemcpyHostToDevice, stream_),
+          "copy decode token");
+    LaunchEmbeddingLookup(
+        weights_.token_embd.data, Gt(weights_.token_embd.type),
+        buffers_.tokens, buffers_.hidden, hidden_, stream_);
+    for (std::uint32_t l = 0; l < config_.main_block_count(); ++l) {
+      const Qwen35Layer& layer = weights_.layers[l];
+      const bool full = config_.IsFullAttention(l);
+      LaunchRMSNorm(buffers_.hidden,
+                    reinterpret_cast<const float*>(layer.attn_norm.data),
+                    buffers_.normed, hidden_, config_.rms_eps, stream_);
+      if (full) {
+        const std::uint32_t attn_idx = l / config_.full_attention_interval;
+        LaunchFusedQKVProjections(
+            layer.attn_q.data, Gt(layer.attn_q.type), layer.attn_k.data,
+            Gt(layer.attn_k.type), layer.attn_v.data, Gt(layer.attn_v.type),
+            buffers_.normed, buffers_.ssm_qkv, buffers_.k, buffers_.v, q_proj_,
+            kv_, hidden_, stream_);
+        LaunchUnpackQG(buffers_.ssm_qkv, buffers_.q, buffers_.ssm_gate,
+                       config_.head_count, config_.key_length, stream_);
+        const std::size_t plane = KvPlaneElements();
+        LaunchBatchedFusedQKNormRoPEKvWrite(
+            buffers_.q, buffers_.k, buffers_.v,
+            reinterpret_cast<const float*>(layer.attn_q_norm.data),
+            reinterpret_cast<const float*>(layer.attn_k_norm.data),
+            buffers_.q, buffers_.k, /*k_cache=*/nullptr, /*v_cache=*/nullptr,
+            buffers_.kv_f16, buffers_.kv_f16 + plane, attn_idx, pos,
+            /*batch=*/1, max_context_, config_.head_count,
+            config_.head_count_kv, config_.key_length,
+            config_.rope_dimension_count, config_.rope_freq_base,
+            config_.rms_eps, stream_);
+        LaunchAttention(
+            buffers_.q, buffers_.k, buffers_.v, buffers_.ssm_gate,
+            /*k_cache=*/nullptr, /*v_cache=*/nullptr, buffers_.kv_f16,
+            buffers_.kv_f16 + plane, buffers_.ssm_out, attn_idx, pos,
+            max_context_, config_.head_count, config_.head_count_kv,
+            config_.key_length, stream_, /*split_k_scratch=*/nullptr,
+            /*skip_kv_write=*/true);
+        LaunchGEMV(layer.attn_output.data, Gt(layer.attn_output.type),
+                   buffers_.ssm_out, buffers_.normed, hidden_, attn_, stream_);
+      } else {
+        const std::uint32_t ssm_idx = config_.SsmLayerIndex(l);
+        LaunchFusedSSMInputProjections(
+            layer.attn_qkv.data, Gt(layer.attn_qkv.type), layer.attn_gate.data,
+            Gt(layer.attn_gate.type), layer.ssm_alpha.data,
+            Gt(layer.ssm_alpha.type), layer.ssm_beta.data,
+            Gt(layer.ssm_beta.type), buffers_.normed, buffers_.ssm_qkv,
+            buffers_.ssm_gate, buffers_.alpha, buffers_.beta, hidden_,
+            ssm_qkv_, ssm_inner_, ts_rank_, stream_);
+        LaunchSSMConvRecurrence(
+            buffers_.ssm_qkv,
+            reinterpret_cast<const float*>(layer.ssm_conv1d.data),
+            buffers_.conv_state, buffers_.conv_out, buffers_.deltanet_state,
+            buffers_.alpha, buffers_.beta,
+            reinterpret_cast<const float*>(layer.ssm_a.data),
+            reinterpret_cast<const float*>(layer.ssm_dt.data),
+            reinterpret_cast<const float*>(layer.ssm_norm.data),
+            buffers_.ssm_gate, buffers_.ssm_out, ssm_idx, ssm_qkv_,
+            config_.ssm_group_count, ts_rank_, config_.ssm_state_size,
+            value_, stream_, SsmReplayCapture{},
+            QwenRecurrentStateStorage::kFp32);
+        LaunchGEMV(layer.ssm_out.data, Gt(layer.ssm_out.type),
+                   buffers_.ssm_out, buffers_.normed, hidden_, ssm_inner_,
+                   stream_);
+      }
+      LaunchResidualAdd(buffers_.hidden, buffers_.normed, buffers_.hidden,
+                        hidden_, stream_);
+      LaunchRMSNorm(
+          buffers_.hidden,
+          reinterpret_cast<const float*>(layer.post_attention_norm.data),
+          buffers_.normed, hidden_, config_.rms_eps, stream_);
+      LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, Gt(layer.ffn_gate.type),
+                            layer.ffn_up.data, Gt(layer.ffn_up.type),
+                            buffers_.normed, buffers_.ffn_gate, ffn_,
+                            hidden_, stream_);
+      LaunchGEMV(layer.ffn_down.data, Gt(layer.ffn_down.type),
+                 buffers_.ffn_gate, buffers_.normed, hidden_, ffn_, stream_);
+      LaunchResidualAdd(buffers_.hidden, buffers_.normed, buffers_.hidden,
+                        hidden_, stream_);
+    }
+    LaunchRMSNorm(buffers_.hidden,
+                  reinterpret_cast<const float*>(weights_.output_norm.data),
+                  buffers_.normed, hidden_, config_.rms_eps, stream_);
+    if (weights_.output.present) {
+      LaunchGEMV(weights_.output.data, Gt(weights_.output.type),
+                 buffers_.normed, buffers_.logits, vocab_, hidden_, stream_);
+    } else {
+      LaunchGEMV(weights_.token_embd.data, Gt(weights_.token_embd.type),
+                 buffers_.normed, buffers_.logits, vocab_, hidden_, stream_);
+    }
+    LaunchGPUArgmax(buffers_.logits, buffers_.argmax, vocab_, stream_);
+    std::uint32_t out = 0;
+    Check(hipMemcpyAsync(&out, buffers_.argmax, sizeof(std::uint32_t),
+                         hipMemcpyDeviceToHost, stream_),
+          "copy decode argmax");
+    Check(hipStreamSynchronize(stream_), "sync decode");
+    return out;
+  }
   // Copies the fp32 logits of the last position to the host.
   void CopyLogits(float* out) {
     Check(hipMemcpyAsync(out, buffers_.logits, vocab_ * sizeof(float),

@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
         generated.push_back(next);
         if (next == tconfig.eos_id) break;
         if (pos + 1 > max_context) break;
-        next = forward.Prefill(&next, 1, pos);
+        next = forward.Decode(next, pos);
         ++pos;
       }
       const double gen_ms = std::chrono::duration<double, std::milli>(
