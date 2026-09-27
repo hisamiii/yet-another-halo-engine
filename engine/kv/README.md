@@ -58,11 +58,32 @@ it stays off by default:
 | q4, no rotation | 0.998 | none |
 
 The rotation is implemented correctly — q8 with it is exact — so the difference
-is the quantizer, not the transform. The mechanism is the block size: at 32
-elements a per-channel outlier already spoils only 32 of the 256 values in a
-head, while the rotation spreads that energy into every block and raises the
-scale floor for all of them. Rotation should pay off with larger blocks; that
-is the next experiment.
+is the quantizer, not the transform. Dumping layer 0's real K (2048-token
+prefill, 8192 rows x 256; `YAH_DUMP_KV=<prefix>`) and measuring it says why:
+
+| quantity | no rotation | rotated |
+| --- | ---: | ---: |
+| per-32-block crest (max/rms), mean | **1.405** | 2.781 |
+| per-32-block crest, p90 | 1.549 | 5.539 |
+| q4 relative MSE of K | **0.0120** | 0.0426 |
+| q8 relative MSE of K | **1.4e-5** | 1.8e-4 |
+| QK logit error, mean | **0.297** | 0.818 |
+
+K is *flatter than uniform*: a uniform block has crest 1.73 and a Gaussian
+max-of-32 about 2.5. At crest 1.4 there is no outlier for the rotation to
+remove, and the transform only makes the block more Gaussian, raising the crest
+and coarsening the scale. The per-32 block quantizer is already near the 4-bit
+floor for this signal (exactly uniform would be 0.51% relative MSE; this is
+1.2%).
+
+Per-channel structure does not rescue it either. Across tokens, the per-channel
+crest is 1.435 (p90 1.719) and the channel RMS spread is 1.43x (p90/p10), so
+KIVI-style per-channel K scales give 0.0121 relative MSE against 0.0120 for the
+blocks — no gain. K after QK-norm and RoPE is flat in both axes.
+
+So plain per-32 blocks are the right quantizer here and the rotation is
+contraindicated, not merely unhelpful. Revisit it if another model or a larger
+block size shows a high crest factor.
 
 V is not rotated because the attention gate is fused per element inside the
 kernel. A rotation mixes exactly the elements the gate treats independently, so

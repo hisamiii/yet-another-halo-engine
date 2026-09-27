@@ -92,6 +92,7 @@ struct Buffers {
   std::uint16_t* scratch_k{nullptr};
   std::uint16_t* scratch_v{nullptr};
   float* hadamard{nullptr};
+  bool kv_dumped{false};
   std::uint32_t* tokens{nullptr};
   std::uint32_t* argmax{nullptr};
   float* conv_state{nullptr};
@@ -265,6 +266,41 @@ class Forward {
         config_.rope_dimension_count, config_.rope_freq_base,
         config_.rms_eps, stream_);
     if (!quantized) return view;
+
+    // Diagnostic, env-gated: dump one layer's pre-rotation Q and K so the
+    // quantizer's crest factor can be measured on real activations rather than
+    // synthetic data.
+    const char* dump_prefix = std::getenv("YAH_DUMP_KV");
+    if (attn_idx == 0 && dump_prefix != nullptr && !buffers_.kv_dumped) {
+      buffers_.kv_dumped = true;
+      const std::string qpath = std::string(dump_prefix) + "_q.bin";
+      const std::string kpath = std::string(dump_prefix) + "_k.bin";
+      const std::size_t q_count = static_cast<std::size_t>(batch) *
+                                  config_.head_count * config_.key_length;
+      const std::size_t k_count = static_cast<std::size_t>(batch) *
+                                  config_.head_count_kv * config_.key_length;
+      std::vector<float> host_q(q_count);
+      std::vector<std::uint16_t> host_k(k_count);
+      Check(hipMemcpyAsync(host_q.data(), buffers_.q,
+                           q_count * sizeof(float), hipMemcpyDeviceToHost,
+                           stream_),
+            "dump q");
+      Check(hipMemcpyAsync(host_k.data(), buffers_.scratch_k,
+                           k_count * sizeof(std::uint16_t),
+                           hipMemcpyDeviceToHost, stream_),
+            "dump k");
+      Check(hipStreamSynchronize(stream_), "dump sync");
+      if (FILE* fq = std::fopen(qpath.c_str(), "wb")) {
+        std::fwrite(host_q.data(), sizeof(float), q_count, fq);
+        std::fclose(fq);
+      }
+      if (FILE* fk = std::fopen(kpath.c_str(), "wb")) {
+        std::fwrite(host_k.data(), sizeof(std::uint16_t), k_count, fk);
+        std::fclose(fk);
+      }
+      std::fprintf(stderr, "yah forward: dumped q=%zu k=%zu to %s_*.bin\n",
+                   q_count, k_count, dump_prefix);
+    }
 
     // Rotate Q and K by the same orthonormal Hadamard. QK^T is unchanged in
     // exact arithmetic, so only the quantizer's error changes. V is not
