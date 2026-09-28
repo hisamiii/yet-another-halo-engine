@@ -46,7 +46,8 @@ explicitly deferred.
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
 | yah_dequant_q8k_bf16.loom | prefill_gemm.hip | Q8_K weight dequant to bf16 | ported, 0.0076 ms; exact periodic expectation |
 | yah_dequant_q8_0_bf16.loom | prefill_gemm.hip | Q8_0 weight dequant to bf16 | ported, 0.0081 ms; exact periodic expectation |
-| - | prefill_gemm.hip | Q5_K and Q6_K dequant to bf16, generic sub-16 element decoder | todo |
+| yah_dequant_q5k_bf16.loom | prefill_gemm.hip | Q5_K dequant to bf16 (packed 6-bit scales) | ported, 0.0078 ms; bit-exact via `check.tensor.view` |
+| - | prefill_gemm.hip | Q6_K dequant to bf16, generic sub-16 element decoder | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
@@ -62,7 +63,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 32 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 33 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -213,6 +214,14 @@ profile gives one, so the expensive paths move first rather than the convenient 
   to bf16` is a direct narrowing with no separate lowering recipe. Eight explicit
   mantissa bits means every integer up to 256 round-trips exactly, which is what
   lets a bf16 conversion be checked with `atol=0` and no fixture.
+- **A bf16 expectation can be a bit fixture, and `check.tensor.view` is how.** numpy
+  has no bf16 dtype, so a bf16 value the oracle computes cannot be written to an
+  `.npy` directly. Write the raw 16-bit patterns as `int16` and reinterpret the
+  kernel output in the case:
+  `%bits = check.tensor.view %out offset(0) : tensor<512xbf16> -> tensor<512xi16>`,
+  then `check.expect.equal` against the fixture. This made the Q5_K port checkable
+  exactly, and it also confirmed that `scalar.fptrunc f32 to bf16` and
+  `hip_bfloat16(float)` round identically (round to nearest even).
 - **Re-tile a tuned kernel freely for the first port; say so in the header.**
   `BatchedDeltaNetRowSplitKernel` is templated over four orthogonal tile choices
   with DPP reductions and LDS staging. The port picks the instantiation whose
