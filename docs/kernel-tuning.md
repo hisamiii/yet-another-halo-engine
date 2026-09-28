@@ -1441,20 +1441,22 @@ session.
 
 | lever | size | evidence |
 | --- | --- | --- |
-| work per clock 0.01269 -> 0.0144 TF/MHz | ~12%, plus whatever clock it buys back | bracketed prefill window |
-| GEMM at 79% of the clock-scaled ceiling | 21% of 87% | not moved by any of ~25 interventions |
-| non-GEMM kernels (norms, SSM, attention, residual) | 11.6% | 396 ms, unexamined |
-| decode GEMV | 1.5% | off-target |
+| GEMM at 77.9% of the same-session fp16 WMMA peak | ~22% | paired protocol, ~1% reproducible |
+| non-GEMM kernels (norms, SSM, attention, residual) | 11.6% of GPU time | 396 ms, unexamined |
+| decode GEMV | 1.5% of GPU time | off-target |
+| operating clock under sustained load | not recoverable | max fans and the 80->130 W sweep both fail to move it |
 
 that numerator. Shrinking LDS to fit a second block necessarily lowers that ratio,
 which is why every occupancy win is a traffic loss and every traffic loss is
 bigger than the occupancy win. Moving an operand to global instead makes the
 traffic loss worse still, by the operand's reuse factor.
 
-**What remains unexplained is the gap between traffic-optimal and ceiling**: the
-kernel is at ~63% of the fp16 WMMA ceiling and none of the counters above, nor any
-of the ~25 interventions in this document, accounts for the other 37%. Answering
-that needs stall attribution, which gfx1151 does not expose, or a structural
+**What remains unexplained is the gap between traffic-optimal and the ceiling.**
+The kernel reaches 77.9% of a same-session fp16 WMMA peak; none of the counters
+above, nor any of the ~25 interventions in this document, accounts for the
+remaining 22%. Answering that needs stall attribution, which gfx1151 does not
+expose, or a structural change that alters the instruction stream rather than its
+resources.
 
 ### Efficiency, measured by the protocol that already existed
 
