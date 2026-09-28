@@ -63,7 +63,17 @@ source engine/hrx-env.sh && /tmp/loom_probe <bundle>/hal_executables/*.hal gfx11
 Verified: `exports: 1 [0] name=yah_residual_1d bindings=3 params=3 consts=0`
 and `LOOM PROBE PASS: out = 100 + 2*i for 8 elements`.
 
-## 3. Remaining work
+## 3. Tooling and runtime layer
+
+- `engine/gpu/loom/emit_hal.sh <file.loom> <case> <bench> <outdir> [config=value ...]`
+  wraps the benchmark artifact bundle and prints the `.hal` path.
+- `engine/model/loom_runtime.hpp` is the engine-facing HRX layer (no HIP):
+  `LoomDevice` (initialize/device/stream/load/allocate/copy/dispatch/sync),
+  `LoomExecutable` (export name -> ordinal plus binding/parameter/constant
+  metadata), `LoomBuffer`, and `LoomDevice::Config(...)`.
+  `engine/run/loom_probe.cc` is now written against it and still passes.
+
+## 4. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape
    (a build step; `iree-benchmark-loom` needs a case+benchmark per compile).
