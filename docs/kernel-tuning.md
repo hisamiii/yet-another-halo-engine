@@ -105,22 +105,29 @@ takes the dual gate/up kernel on **64/64** blocks against the mixed artifact's
 flipping (section below). So the 7.3% is **decoder cost**.
 
 **That fixes the target, and it is not the artifact.** Requantizing the shard is
-out of scope by decision, so the only way to recover the 7.3% is the decoder:
-make the sub-8-bit paths in `HalfPrefillGemmKernel` decode as cheaply as
-Q4_K's. One structural difference is already visible and is the first thing to
-test — Q4_K/Q5_K/Q6_K/Q8_0 take the deferred-decode path (`DecodeStage == 2`,
-raw weight registers held across the pipeline), while every IQ3/IQ2 type takes
-`DecodeStage == 0` and decodes inline in the fetch stage
-(`prefill_fp16.hip` line 264). Flipping that for the IQ3 types is a one-line
-experiment, and the caveat is on record at line 262: deferring the decode
-changes the dot-product rounding, so it would need re-validating, not just
-re-measuring.
+out of scope by decision, so the only way to recover the 7.3% is the decoder.
 
-**Falsifier:** set `DecodeStage = 2` for `IQ3_XXS`/`IQ3_S`/`IQ4_XS` and rerun
-the per-type sweep. If IQ3_XXS moves from 28.99 toward Q4_K's 38.05, the gap is
-decode *scheduling* and the 7.3% is available without touching the format. If it
-does not move, the gap is the decoder arithmetic itself and the work is a new
-decode routine.
+**The obvious explanation is already refuted by the table above.** Q4_K differs
+from the IQ types in that it takes the deferred-decode path (`DecodeStage == 2`,
+raw weight registers held across the pipeline: `prefill_fp16.hip` line 264),
+while `IQ3_XXS`/`IQ3_S` take `DecodeStage == 0` and decode inline in the fetch
+stage. But `Q5_K`, `Q6_K` and `Q8_0` *also* take `DecodeStage == 2` and measure
+32.60, 30.24 and 30.89 against Q4_K's 38.05 — decode scheduling does not carry
+the advantage. The one-line version of the experiment is not available anyway:
+`RawWeights<Type>` is `static_assert`-gated to those four types, and the IQ raw
+helper covers only `IQ4_XS`/`IQ4_NL`, so a deferred IQ3 decode would be new
+code, not a switch.
+
+What is left is the per-weight decode arithmetic: Q4_K's four-bit unpack with
+precomputed scale words is measurably cheaper than the IQ3 grid lookup on this
+part. A raw form for `IQ3_XXS`/`IQ3_S` — grouped grid index, sign byte and
+block scale held in registers and expanded by table lookup the way
+`DecodeIqRaw` does for `IQ4_NL` — is the only route to it. That is a real
+kernel change with a numerics re-validation (deferring a decode changes the
+dot-product rounding) against a model-level ceiling of 7.3%, only part of which
+is IQ3 (the mixed file has non-FFN IQ3 tensors too). Not obviously the next
+place to spend the machine now that decode at depth is 3x faster and the format
+question is answered.
 
 **This is clock, and the clock is a function of the kernel.** Efficiency per clock agrees to **0.3%** across the two harnesses that disagreed -- 0.0144 TF/MHz in both -- so there is no hidden code difference. The part has three SCLK levels (600 / 1408 / **2900 MHz**) and **never reaches the top one**: measured across power limits, 80 W gives 1799 MHz / 25.9 TF and 130 W gives 2016 MHz / 28.6 TF, work-per-clock is flat (0.0144, -1.5% between them), `gpu_busy` is ~85% at both, and the sampled maximum is 2221 MHz. The log's own line is that "what is broken is the conversion of watts into clock".
 
