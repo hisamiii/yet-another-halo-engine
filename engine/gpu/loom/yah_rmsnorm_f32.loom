@@ -1,0 +1,73 @@
+// YAH batched RMSNorm, Loom port of BatchedRMSNormKernel.
+//
+// HIP source: prefill_norm.hip. One subgroup per row: each lane accumulates the
+// sum of squares over its stride-32 slice, the subgroup reduces, and every lane
+// then writes its slice of the normalised row.
+//
+//   mean_sq = sum(x^2) / dim
+//   inv_rms = rsqrt(mean_sq + eps)
+//   out[i]  = (x[i] * inv_rms) * weight[i]
+//
+// First port: correctness and coverage, one subgroup per row. The HIP kernel uses
+// 256 threads per row with a shared-memory tree; that is a tuning question.
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_rmsnorm.rows : %value: index where [range(%value, 1, 4096)]
+
+config.def @yah_rmsnorm.eps = 0.0 : f32
+
+kernel.def target(@yah_wave32) @yah_rmsnorm() {
+  %unit = index.constant 1 : index
+  %rows = config.get @yah_rmsnorm.rows : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%x: buffer, %weight: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %dim = index.constant 5120 : index
+  %dimf = scalar.constant 5120.0 : f32
+  %eps = config.get @yah_rmsnorm.eps : f32
+  %zero = scalar.constant 0.0 : f32
+
+  %rows = config.get @yah_rmsnorm.rows : index
+  %lane = kernel.workitem.id<x> : index
+  %row = kernel.workgroup.id<x> : index
+
+  %x_noalias, %weight_noalias, %out_noalias = buffer.assume.noalias %x, %weight, %out : buffer, buffer, buffer
+  %x_view = buffer.view %x_noalias[%base] : buffer -> view<[%rows]x5120xf32>
+  %w_view = buffer.view %weight_noalias[%base] : buffer -> view<5120xf32>
+  %out_view = buffer.view %out_noalias[%base] : buffer -> view<[%rows]x5120xf32>
+
+  %sq = scf.for %i = [%lane to %dim step %c32](%acc = %zero : f32) -> (f32) {
+    %v = view.load %x_view[%row, %i] : view<[%rows]x5120xf32> -> f32
+    %p = scalar.mulf %v, %v : f32
+    %next = scalar.addf %acc, %p : f32
+    scf.yield %next : f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %sq : f32
+  %mean = scalar.divf %sum, %dimf : f32
+  %shifted = scalar.addf %mean, %eps : f32
+  %inv = scalar.rsqrtf %shifted : f32
+  %sink = scf.for %i = [%lane to %dim step %c32](%tick = %zero : f32) -> (f32) {
+    %v2 = view.load %x_view[%row, %i] : view<[%rows]x5120xf32> -> f32
+    %w = view.load %w_view[%i] : view<5120xf32> -> f32
+    %n0 = scalar.mulf %v2, %inv : f32
+    %n1 = scalar.mulf %n0, %w : f32
+    view.store %n1, %out_view[%row, %i] : f32, view<[%rows]x5120xf32>
+    scf.yield %tick : f32
+  }
+  kernel.return
+}
+
+check.case public @yah_rmsnorm_case {
+  %x = check.generate.fill value(2.0) : tensor<64x5120xf32>
+  %weight = check.generate.fill value(3.0) : tensor<5120xf32>
+  %out = check.generate.fill value(-1.0) : tensor<64x5120xf32>
+  %expected = check.generate.fill value(3.0) : tensor<64x5120xf32>
+  kernel.launch @yah_rmsnorm(%x, %weight, %out) : (tensor<64x5120xf32>, tensor<5120xf32>, tensor<64x5120xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(1.0000000000000001e-05) rtol(0.0) nan(same) : tensor<64x5120xf32>
+  check.return
+}
+
+check.benchmark<@yah_rmsnorm_case> @yah_rmsnorm_bench
