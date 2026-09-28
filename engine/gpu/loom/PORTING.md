@@ -58,6 +58,7 @@ explicitly deferred.
 | yah_gemv_q4k_f32.loom | gemv_quant.hip | Q4_K block GEMV (Q8KBlockGEMVKernel, Q4_K arm) | ported, 1.33 ms at 17408 rows x 5120; sparse-activation fixture exact |
 | yah_fused_swiglu_q4k_f32.loom | swiglu.hip | fused quantized SwiGLU GEMV, Q4_K (Wave32FusedQuantSwiGLUGEMVKernel) | ported, 2.08 ms at 17408 rows x 5120; gate and up share the sparse fixture |
 | yah_qkv_q4k_f32.loom | qkv.hip | fused quantized QKV projection, Q4_K (Wave32FusedQKVProjectionsKernel_1Row) | ported, 0.447 ms at q=6144/kv=1024; three row bands each checked |
+| yah_ffn_gemm_q5k_f32.loom | prefill_fp16.hip | batched Q5_K FFN GEMM with in-kernel decode (kStore) | ported, 15.54 ms at m_tiles=1088; fixture exact at m_tiles=1 |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -156,8 +157,9 @@ three are tuning items, explicitly deferred. The residual and SwiGLU epilogues
 have the same Q4_K port (yah_ffn_gemm_q4k_residual_f32, yah_ffn_gemm_q4k_swiglu_f16,
 23.11/16.98 ms at production size), and yah_ffn_gemm_q4k_gateup_f16 (32.03 ms)
 shares one activation tile and one output between two decoders. The remaining
-format work is the other quant formats (Q5_K, Q6_K, IQ*), which the Q4_K shard
-does not use.
+format work is the other quant formats (Q6_K, IQ*) and the Q5_K residual/SwiGLU/
+paired epilogues; the mixed Unsloth dynamic shard carries Q5_K tensors, so
+yah_ffn_gemm_q5k_f32 now covers the Q5_K store arm.
 
 Reachability evidence for the entries that are not on that route:
 
