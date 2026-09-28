@@ -1634,3 +1634,121 @@ every other rep, a 2x outlier. The median is used rather than the mean, and the
 other three reps agree to 0.4%. A mean over the four would have reported -3.5% and
 been wrong.
 
+## The cost of scheduling, measured: a register budget that is already spent
+
+The decode closure ended with "the 16% is a scheduling cost, not an instruction
+cost", which is a label rather than a mechanism. Pricing that scheduling directly
+gives a resource ceiling, not a placement error.
+
+### Moving work between phases is the most expensive thing that can be done
+
+If the commit phase is a post-barrier bubble the K loop could absorb, then moving
+its work into the K loop should recover part of it. It does the opposite, by up to
+6.3x. Paired arms, `one:q4k 17408 5120 2048 1 0 store <ablate>`, four interleaved
+cycles with a 15 s gap before every run, and the baseline arm measured both first
+and last in each cycle:
+
+| ablate | what moves | ms (4 reps) | spread | vs baseline |
+| --- | --- | ---: | ---: | ---: |
+| 16 | nothing (baseline) | 8.91-9.07 | 1.8% | -- |
+| 272 | global weight fetch into the K loop | 12.37-12.53 | 1.3% | **+38.0%** |
+| 528 | weight decode into the K loop | 18.48-18.77 | 1.6% | **+106.4%** |
+| 1040 | decode staggered per warp | 57.04-57.22 | 0.3% | **+533.0%** |
+| 16 | (measured straight after 1040) | 8.89-8.99 | 1.1% | -1.2% |
+
+The arms are deterministic to 0.3-1.8% over four cycles, and the baseline taken
+immediately after the 57 ms arm returns to 8.9 ms, so nothing is leaking between
+runs. An earlier attempt at this pair was discarded as instrument error when the
+baselines came back at 18-22 ms; on re-measurement with the clock bracketed the
+same arms reproduce to 0.3%, so the discard was the mistake and these are the
+numbers.
+
+### The mechanism is register spilling, and it is monotone in the spill count
+
+Read out of the linked code object (`llvm-objcopy --dump-section .hip_fatbin`,
+`clang-offload-bundler --unbundle`, then `llvm-readelf --notes`), with the
+static scratch instruction count and its span over the function body from
+`llvm-objdump -d`:
+
+| ablate | ms | VGPR | private seg | spilled VGPR | static scratch insns |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 9.03 | 192 | 0 B | **0** | 0 |
+| 272 | 12.46 | 192 | 68 B | **16** | 31 (span 36% of body) |
+| 528 | 18.63 | 192 | 148 B | **74** | 65 (span 43%) |
+| 1040 | 57.15 | 192 | 648 B | **230** | 168 (span 49%) |
+
+`vgpr_count` is pinned at exactly 192 in all four: the allocator does not exceed
+the budget, it spills to scratch, and the scratch instructions are spread across
+36-49% of the body rather than confined to a cold prologue, so they execute in the
+stage loop. The cost is monotone in spilled registers, 0 -> 16 -> 74 -> 230.
+
+### Why 192 is a hard budget, and why it cannot be bought
+
+49152 VGPRs per SIMD / 256 threads per SIMD (a 1024-thread block is 8 waves per
+SIMD) = 192. At 512 threads the budget is 384, clamped to the 256 architectural
+maximum, and the 512-thread arm of the same tile then uses 242. This is the same
+constraint the occupancy section found from the other side -- "one block per CU
+set by 64 KiB of LDS, 8 waves per SIMD" -- read numerically: LDS and VGPR are
+saturated by the **same** block, so neither can be relieved without the other, and
+there is no reordering of the staging pipeline that does not need more
+simultaneously-live values than the budget holds.
+
+### The two levers that follow are both dead
+
+**Chain count is not a limiter, so there is no dependent-latency term.** The
+`dot_peak` chain sweep, re-run per process with the 15 s gap, shows every chain
+count from 1 to 16 reaching **27.55-27.72 TMAC/s** in at least one cycle, and every
+count also dropping to 24.5, sometimes 22.0, in others. The dips move between
+cycles and are not attached to any chain count, so they are an uncontrolled clock
+state, not a chain effect -- and the earlier in-process sweep that read as "chain
+8 is 12% slow" was exactly that artefact. A single accumulator chain already
+reaches 27.57 TMAC/s, so the GEMM's eight chains (WRS=2 x WTS=4) cover the WMMA
+latency many times over. This also moves the ceiling the GEMM is scored against:
+the recorded 25.99-26.06 was an eight-chain in-process reading and sits between the
+two observed states, while the reproducible maximum is **27.6**, which puts the
+GEMM's 20.32 TMAC/s at **74%** of ceiling. Against the low state (24.5) the same
+kernel is 83%. The ceiling being two-state is itself the largest measurement
+caveat in this document.
+
+**LDS operand reads are not a limiter either.** The 256x256 tile split 4x4 over 512
+threads (WRS=WTS=4) reads 0.50 fragments per WMMA against the shipped 0.75, 33%
+fewer -- statically 64 `ds_load_b128` per 64 WMMA against 48 per 32 -- at 242 VGPR
+with zero spills and 14 registers of headroom. Paired against the shipped arm, six
+reps with alternating order and 15 s gaps: **-0.56% median** (all: -0.51 -0.08
++0.53 -0.87 -0.62 -1.88), a wash. Going the other way under the same protocol,
+128x384 (0.833) is **+13.3%** and 128x128 w4n4 (1.0) is **+15.7%**. So loads/WMMA
+is a threshold at 0.75 and not the critical path: halving it buys nothing, raising
+it costs.
+
+### Where the deficit actually is
+
+The commit decomposition, paired against the baseline on one basis, three cycles,
+15 s gaps:
+
+| arm | ms | vs baseline |
+| --- | ---: | ---: |
+| 16 full commit | 8.97 | -- |
+| 80 decode removed, LDS store kept | 7.49 | **-16.5%** |
+| 48 decode kept live, LDS store removed | 7.92 | **-11.7%** |
+| 2 no commit at all | 6.90 | **-23.1%** |
+| 4 no global fetch | 7.84 | **-12.6%** |
+
+The two terms of the commit overlap rather than adding (16.5 + 11.7 > 23.1): each
+one alone already recovers most of the other's slack, which is what a shared
+resource looks like. The decode is the larger term at 16.5% of wall time while
+being worth only ~7% of block cycles in the phase clock, and halving its
+instruction count is worth -0.28% -- so its cost is not the arithmetic but the
+occupancy of the one pipeline stage the commit can run in, at a register budget
+that forbids overlapping it with the K loop.
+
+**Falsifier:** a configuration that keeps this staging structure and beats 20.3
+TMAC/s moves the cost off the commit phase. Every arm that changes the staging
+structure has landed at parity or worse -- activations from global, weights from
+global, double buffering in three forms, BK=2, the 512-thread split -- which is
+what the register budget predicts. The one structure not yet tried is removing the
+LDS round trip for the weights entirely by keeping the decoded fragments in
+registers across the barrier, which needs the accumulator footprint to fall enough
+to pay for it; 192 - 64 (accumulators) = 128 registers is the space that makes it
+possible or not.
+
+
