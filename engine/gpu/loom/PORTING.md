@@ -88,12 +88,14 @@ explicitly deferred.
 | yah_fused_rmsnorm_q8_f32.loom | prefill_quant_gemm.hip | fused RMSNorm + Q8_1 quantize | ported, 0.0068 ms; byte-exact fixture (constant row) |
 | yah_fused_ssm_gate_q8_f32.loom | prefill_quant_gemm.hip | fused SSM post-norm gate + Q8_1 | ported, 0.0056/0.0078 ms; two byte-exact fixtures |
 | yah_sparse_penalties_f32.loom | sample.hip | sparse repeat/frequency/presence penalties | ported, 0.0065 ms; exact fixture |
+| yah_sample_candidate_f32.loom | sample.hip | candidate-logit prep (finite filter + ids) | ported, 0.0052/0.0083 ms; finite exact, no fixture |
+| yah_scatter_draft_f32.loom | sample.hip | scatter sparse draft probabilities dense | ported, 0.0084 ms; exact fixture |
 | - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | all eight **ported** |
 
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 63 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 65 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -111,7 +113,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path), ZeroQ8ActTailKernel, BatchedFusedRMSNormQuantizeQ8_1Kernel, BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel (tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, the clip variant, BatchedQuantGEMVKernel |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16. **todo**: AtbEncodeA, AtbDecodeC, AtbDecodeSwiGLU, AtbRepack(+Slice) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
-| sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel. **todo**: PrepareCandidateLogits, ScatterDraftProbabilities, batched argmax, linear/sorted sampling, the speculative segment set |
+| sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel. **todo**: batched argmax, linear/sorted sampling, the speculative segment set |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both). **todo**: RoPEPtr, EmbeddingLookupPtr, FastFusedSwiGLUGEMVBlockKernel |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
@@ -347,3 +349,8 @@ profile gives one, so the expensive paths move first rather than the convenient 
   fails to parse (`unexpected token 3, expected SSA value`); declare an index
   constant (`%c3 = index.constant 3 : index`) and write `view<[%n]x[%c3]xi32>`.
   Literals are fine only in the un-bracketed shaped form (`view<17408x5120xf16>`).
+- **A Loom loop cannot break out of a kernel.** A HIP scan that returns early
+  (`for previous < index: if ids[previous] == token return`) becomes an
+  accumulator: run the whole loop, OR a found flag into an i32, and guard the rest
+  with `scf.if` on the final value. `yah_scatter_draft_f32.loom` does this for the
+  duplicate-prefix scan, whose cost is quadratic in the candidate count.

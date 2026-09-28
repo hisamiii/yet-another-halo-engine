@@ -1,0 +1,70 @@
+// YAH candidate-logit preparation, Loom port of PrepareCandidateLogitsKernel.
+//
+// HIP source: sample.hip. Identical arithmetic to PrepareSamplingKernel, with the
+// vocabulary clamped to `size`: each logit is passed through if finite and replaced
+// by -infinity otherwise, and the parallel id array is the index.
+//
+// `isfinite` has no AMDGPU target-low contract, so finiteness is the bound test
+// `|v| <= FLT_MAX`; anything else (either infinity or NaN) fails it, and the
+// -infinity replacement is a literal that overflows f32.
+//
+// Required config: --config=yah_sample_candidate.size=8
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_sample_candidate.size : %value: index where [range(%value, 1, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_sample_candidate() {
+  %unit = index.constant 1 : index
+  %size = config.get @yah_sample_candidate.size : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %size, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%logits: buffer, %scores: buffer, %ids: buffer) {
+  %base = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %size = config.get @yah_sample_candidate.size : index
+  %limit = scalar.constant 3.4028234663852886e+38 : f32
+  %neg_infinite = scalar.constant -3.9999999999999999e+38 : f32
+  %logits_na, %scores_na, %ids_na = buffer.assume.noalias %logits, %scores, %ids : buffer, buffer, buffer
+  %logits_view = buffer.view %logits_na[%base] : buffer -> view<[%size]xf32>
+  %scores_view = buffer.view %scores_na[%base] : buffer -> view<[%size]xf32>
+  %ids_view = buffer.view %ids_na[%base] : buffer -> view<[%size]xi32>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %index = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %index, %size : index
+  scf.if %in_range {
+    %value = view.load %logits_view[%index] : view<[%size]xf32> -> f32
+    %magnitude = scalar.absf %value : f32
+    %finite = scalar.cmpf ole, %magnitude, %limit : f32
+    %result = scf.if %finite -> (f32) {
+      scf.yield %value : f32
+    } else {
+      scf.yield %neg_infinite : f32
+    }
+    %id = index.cast %index : index to i32
+    view.store %result, %scores_view[%index] : f32, view<[%size]xf32>
+    view.store %id, %ids_view[%index] : i32, view<[%size]xi32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_sample_candidate.size=8.
+//
+// Finite path: an iota comes back unchanged and the ids are the index.
+check.case public @yah_sample_candidate_finite {
+  %logits = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %scores = check.generate.fill value(0.0) : tensor<8xf32>
+  %ids = check.generate.fill value(0) : tensor<8xi32>
+  %expected_scores = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %expected_ids = check.generate.iota offset(0) step(1) : tensor<8xi32>
+  kernel.launch @yah_sample_candidate(%logits, %scores, %ids) : (tensor<8xf32>, tensor<8xf32>, tensor<8xi32>)
+  check.expect.close actual(%scores) expected(%expected_scores) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.expect.equal actual(%ids) expected(%expected_ids) : tensor<8xi32>
+  check.return
+}
+
+check.benchmark<@yah_sample_candidate_finite> @yah_sample_candidate_finite_bench
