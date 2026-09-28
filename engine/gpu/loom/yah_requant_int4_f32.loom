@@ -1,0 +1,204 @@
+// YAH prefill Q8_1 to int4 requantizer, Loom port of RequantizeActivationInt4Kernel.
+//
+// HIP source: models/qwen/hip/kernels/prefill_quant_gemm.hip. In place: reads each
+// (tile, block, token) 32-element Q8_1 group, recomputes the int4 scale
+// d4 = d*127/7 (no clip path; the clip variant is env-gated and separate), rounds
+// every element to nearest-even into [-7, 7], writes the int4 back into the same
+// int8 bytes, replaces the block scale with d4, and refreshes the sum sidecar.
+//
+// The HIP kernel keeps the 32 decoded values in a register array and also computes
+// their sum of squares for the env-gated clip path. The port reads the payload once
+// and skips the sum of squares, because clip_alpha <= 0 (the default and the path
+// LaunchRequantizeActivationInt4InPlace uses) never consults it. The clipped variant
+// is a separate port. `__float2int_rn` is `scalar.roundevenf`, which is rintf.
+//
+// Required config: --config=yah_requant_int4.batch=16 --config=yah_requant_int4.num_blocks=1
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_requant_int4.batch : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_requant_int4.num_blocks : %value: index where [range(%value, 1, 65536)]
+
+kernel.def target(@yah_wave32) @yah_requant_int4() {
+  %unit = index.constant 1 : index
+  %batch = config.get @yah_requant_int4.batch : index
+  %num_blocks = config.get @yah_requant_int4.num_blocks : index
+  %batch_i = index.cast %batch : index to i32
+  %c15i = scalar.constant 15 : i32
+  %c4i = scalar.constant 4 : i32
+  %c8i = scalar.constant 8 : i32
+  %c7i = scalar.constant 7 : i32
+  %cneg7i = scalar.constant -7 : i32
+  %batch15_i = scalar.addi %batch_i, %c15i : i32
+  %tiles_i = scalar.shrui %batch15_i, %c4i : i32
+  %tiles = index.cast %tiles_i : i32 to index
+  %tiles_blocks = index.mul %tiles, %num_blocks : index
+  %c16 = index.constant 16 : index
+  %units = index.mul %tiles_blocks, %c16 : index
+  %units_i = index.cast %units : index to i32
+  %c255i = scalar.constant 255 : i32
+  %units255_i = scalar.addi %units_i, %c255i : i32
+  %grid_i = scalar.shrui %units255_i, %c8i : i32
+  %grid = index.cast %grid_i : i32 to index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%grid, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%y: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c7 = index.constant 7 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %c144 = index.constant 144 : index
+  %c176 = index.constant 176 : index
+  %c256 = index.constant 256 : index
+  %c512 = index.constant 512 : index
+  %c576 = index.constant 576 : index
+  %c704 = index.constant 704 : index
+  %c0i = scalar.constant 0 : i32
+  %c1i = scalar.constant 1 : i32
+  %c4i = scalar.constant 4 : i32
+  %c7i = scalar.constant 7 : i32
+  %cneg7i = scalar.constant -7 : i32
+  %c15i = scalar.constant 15 : i32
+  %c16i = scalar.constant 16 : i32
+  %c32i = scalar.constant 32 : i32
+  %c127f = scalar.constant 127.0 : f32
+  %c7f = scalar.constant 7.0 : f32
+  %c32f = scalar.constant 32.0 : f32
+  %zero = scalar.constant 0.0 : f32
+  %batch = config.get @yah_requant_int4.batch : index
+  %num_blocks = config.get @yah_requant_int4.num_blocks : index
+  %batch_i = index.cast %batch : index to i32
+  %batch15_i = scalar.addi %batch_i, %c15i : i32
+  %tiles_i = scalar.shrui %batch15_i, %c4i : i32
+  %tiles = index.cast %tiles_i : i32 to index
+  %tiles_blocks = index.mul %tiles, %num_blocks : index
+  %total_bytes = index.mul %tiles_blocks, %c704 : index
+  %sum_base_words = index.mul %tiles_blocks, %c144 : index
+  %total_words = index.mul %tiles_blocks, %c176 : index
+  %units = index.mul %tiles_blocks, %c16 : index
+  %y_na = buffer.assume.noalias %y : buffer
+  %y_i8 = buffer.view %y_na[%base] : buffer -> view<[%total_bytes]xi8>
+  %y_f32 = buffer.view %y_na[%base] : buffer -> view<[%total_words]xf32>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg256 = index.mul %wg, %c256 : index
+  %idx = index.add %wg256, %lane : index
+  %in_range = index.cmp ult, %idx, %units : index
+  %sink = scf.if %in_range -> (index) {
+    %idx_i = index.cast %idx : index to i32
+    %tl_i = scalar.andi %idx_i, %c15i : i32
+    %idx16_i = scalar.shrui %idx_i, %c4i : i32
+    %nb_i = index.cast %num_blocks : index to i32
+    %kb_i = scalar.remsi %idx16_i, %nb_i : i32
+    %tt_i = scalar.divsi %idx16_i, %nb_i : i32
+    %tt_16_i = scalar.shli %tt_i, %c4i : i32
+    %last_i = scalar.addi %tt_16_i, %tl_i : i32
+    %last = index.cast %last_i : i32 to index
+    %in_batch = index.cmp ult, %last, %batch : index
+    %work = scf.if %in_batch -> (index) {
+      %tl = index.cast %tl_i : i32 to index
+      %kb = index.cast %kb_i : i32 to index
+      %tt = index.cast %tt_i : i32 to index
+      %tt_nb = index.mul %tt, %num_blocks : index
+      %tile_raw = index.add %tt_nb, %kb : index
+      %tile_max = index.sub %tiles_blocks, %c1 : index
+      %tile_raw_i = index.cast %tile_raw : index to i32
+      %tile_max_i = index.cast %tile_max : index to i32
+      %tile_clamp_i = scalar.minsi %tile_raw_i, %tile_max_i : i32
+      %tile = index.cast %tile_clamp_i : i32 to index
+      %tile_words = index.mul %tile, %c144 : index
+      %scale_off = index.add %c128, %tl : index
+      %d_idx = index.add %tile_words, %scale_off : index
+      %d = view.load %y_f32[%d_idx] : view<[%total_words]xf32> -> f32
+      %d_zero = scalar.cmpf oeq, %d, %zero : f32
+      %nonzero = scf.if %d_zero -> (index) {
+        scf.yield %c0 : index
+      } else {
+        %tile_bytes = index.mul %tile, %c576 : index
+        %tl16 = index.mul %tl, %c16 : index
+        %level = scalar.mulf %d, %c127f : f32
+        %d4 = scalar.divf %level, %c7f : f32
+        // Pass 2: requantize, clamp to [-7, 7], accumulate the half sums.
+        %lo_final_i, %hi_final_i = scf.for %i2 = [%c0 to %c32 step %c1](%lo_acc = %c0i : i32, %hi_acc = %c0i : i32) -> (i32, i32) {
+          %i2_i = index.cast %i2 : index to i32
+          %hi2_i = scalar.shrui %i2_i, %c4i : i32
+          %lo2_i = scalar.andi %i2_i, %c15i : i32
+          %hi2 = index.cast %hi2_i : i32 to index
+          %lo2 = index.cast %lo2_i : i32 to index
+          %hi256_2 = index.mul %hi2, %c256 : index
+          %tl16_lo2 = index.add %tl16, %lo2 : index
+          %off2 = index.add %hi256_2, %tl16_lo2 : index
+          %p2 = index.add %tile_bytes, %off2 : index
+          %q2 = view.load %y_i8[%p2] : view<[%total_bytes]xi8> -> i8
+          %q32b = scalar.extsi %q2 : i8 to i32
+          %qf2 = scalar.sitofp %q32b : i32 to f32
+          %a2 = scalar.mulf %qf2, %d : f32
+          %ratio = scalar.divf %a2, %d4 : f32
+          %rounded = scalar.roundevenf %ratio : f32
+          %v_raw = scalar.fptosi %rounded : f32 to i32
+          %v_hi = scalar.minsi %v_raw, %c7i : i32
+          %v = scalar.maxsi %v_hi, %cneg7i : i32
+          %v8 = scalar.trunci %v : i32 to i8
+          view.store %v8, %y_i8[%p2] : i8, view<[%total_bytes]xi8>
+          %low_half = index.cmp ult, %i2, %c16 : index
+          %lo_next = scf.if %low_half -> (i32) {
+            %s = scalar.addi %lo_acc, %v : i32
+            scf.yield %s : i32
+          } else {
+            scf.yield %lo_acc : i32
+          }
+          %hi_next = scf.if %low_half -> (i32) {
+            scf.yield %hi_acc : i32
+          } else {
+            %s2 = scalar.addi %hi_acc, %v : i32
+            scf.yield %s2 : i32
+          }
+          scf.yield %lo_next, %hi_next : i32, i32
+        }
+        %lo_final = index.cast %lo_final_i : i32 to index
+        view.store %d4, %y_f32[%d_idx] : f32, view<[%total_words]xf32>
+        %tile16 = index.mul %tile, %c16 : index
+        %tile16_tl = index.add %tile16, %tl : index
+        %slot_pair = index.mul %tile16_tl, %c2 : index
+        %slot = index.add %sum_base_words, %slot_pair : index
+        %lo_f = scalar.sitofp %lo_final_i : i32 to f32
+        %hi_f = scalar.sitofp %hi_final_i : i32 to f32
+        %total_sum = scalar.addf %lo_f, %hi_f : f32
+        %slot0 = scalar.mulf %d4, %total_sum : f32
+        %slot1 = scalar.mulf %d4, %lo_f : f32
+        view.store %slot0, %y_f32[%slot] : f32, view<[%total_words]xf32>
+        %slot_next = index.add %slot, %c1 : index
+        view.store %slot1, %y_f32[%slot_next] : f32, view<[%total_words]xf32>
+        scf.yield %lo_final : index
+      }
+      scf.yield %nonzero : index
+    } else {
+      scf.yield %c0 : index
+    }
+    scf.yield %work : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.return
+}
+
+// Requires --config=yah_requant_int4.batch=16 --config=yah_requant_int4.num_blocks=1.
+//
+// One 16-token tile with one 32-element block per token. The input fixture is a
+// hand-built Q8_1 tile: block scale 0.25 and a -112..105 int8 ramp, which the
+// kernel must requantize to [-7, 7] and rewrite in place. Both the payload and the
+// scale/sum region are compared as raw bytes.
+check.case public @yah_requant_int4_case {
+  %input = check.file.read.npy path("fixtures/int4_requant/input_bytes.npy") : tensor<704xi8>
+  %expected = check.file.read.npy path("fixtures/int4_requant/expected_bytes.npy") : tensor<704xi8>
+  kernel.launch @yah_requant_int4(%input) : (tensor<704xi8>)
+  check.expect.equal actual(%input) expected(%expected) : tensor<704xi8>
+  check.return
+}
+
+check.benchmark<@yah_requant_int4_case> @yah_requant_int4_bench

@@ -83,12 +83,13 @@ explicitly deferred.
 | yah_sample_prepare_f32.loom | sample.hip | sampling prep (non-finite filter + token map) | ported, 0.0068/0.0073 ms; finite exact, non-finite fixture |
 | yah_quant_act_q8_f32.loom | prefill_quant_gemm.hip | Q8_1 activation quantizer, tiled ATB layout | ported, 0.0063 ms; byte-exact fixture |
 | yah_quant_act_swiglu_q8_f32.loom | prefill_quant_gemm.hip | SwiGLU epilogue + Q8_1 quantize | ported, 0.0054/0.0077 ms; byte-exact fixture |
+| yah_requant_int4_f32.loom | prefill_quant_gemm.hip | Q8_1 to int4 requantize in place | ported, 0.0158 ms; byte-exact in/out fixtures; env clip path skipped |
 | - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | all eight **ported** |
 
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 58 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 59 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -103,7 +104,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | fused RoPE | prefill_rope.hip | BatchedFusedQKNormRoPEKvWriteKernel, BatchedRoPEKernel |
 | fused.hip | fused.hip | FusedQKNormRoPEKvWriteKernel |
 | dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
-| W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel (tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, RequantizeActivationInt4Kernel, the fused RMSNorm and SSM-norm quantize kernels, ZeroQ8ActTailKernel, BatchedQuantGEMVKernel |
+| W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path; tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, the clip variant, the fused RMSNorm and SSM-norm quantize kernels, ZeroQ8ActTailKernel, BatchedQuantGEMVKernel |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16. **todo**: AtbEncodeA, AtbDecodeC, AtbDecodeSwiGLU, AtbRepack(+Slice) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
 | sampling | sample.hip | **ported**: PrepareSamplingKernel. **todo**: PrepareCandidateLogits, ApplySparsePenalties, batched argmax, linear/sorted sampling, the speculative segment set |
@@ -315,10 +316,10 @@ profile gives one, so the expensive paths move first rather than the convenient 
   case. That is a property of the case, not a guarantee -- an element sitting on a
   bf16 rounding boundary would still differ -- but it is enough to pin the rotation
   formula, the band switch and the angle, which is what the port owes.
-- **`scalar.negi` is integer negate; there is no `scalar.negf`.** Float negation is
-  `scalar.subf 0.0, %x`, which is exact including the sign of a zero result.
-  `scalar.negi %x : f32` fails with `TYPE/003: operand input has type f32, expected
-  integer`.
+- **`scalar.negi` is integer negate; the float negate is `scalar.negf`.** Reaching
+  for `negi` on an f32 fails with `TYPE/003: operand input has type f32, expected
+  integer`, and `scalar.subf 0.0, %x` also works. (An earlier revision of this
+  note claimed there was no `negf`; that was wrong.)
 - **A `check.tensor.view` may change element size.** `yah_quant_act_q8_f32.loom`
   writes one buffer that is int8 in its payload region and fp32 in its scale and
   sum regions; `check.tensor.view %y offset(0) : tensor<704xi8> -> tensor<176xf32>`
