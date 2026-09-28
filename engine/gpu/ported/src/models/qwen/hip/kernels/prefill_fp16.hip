@@ -47,6 +47,30 @@ __device__ __forceinline__ void StoreSwizzled(short* p, uint4 lo, uint4 hi,
 // One 64-bit address computation per K step gives a lane-local base; advancing j
 // is then a 32-bit add, because one j step is sixteen tokens, i.e. 16*16 halves.
 // Recomputing the full 64-bit address per load cost more than the load itself.
+// Ablation 8388608: the same decode, with the multiply and subtract folded into a
+// single fp16 fused multiply-add instead of an fp32 mul/sub pair plus two
+// converts. It halves the decode's VALU count but rounds the product in half
+// precision, so it is a measurement of what the fp32 chain costs, not a default.
+template<int Ablate>
+__device__ __forceinline__ void DecodeToHalves(const gufo::hip::QuantSub16& q,
+                                               v16bf& out) {
+  if constexpr ((Ablate & 8388608) != 0) {
+    const _Float16 hs = static_cast<_Float16>(q.scale);
+    const _Float16 ho = static_cast<_Float16>(q.offset);
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+      out[j] = static_cast<_Float16>(
+          __builtin_fmaf(static_cast<float>(hs),
+                         static_cast<float>(static_cast<_Float16>(q.q[j])),
+                         -static_cast<float>(ho)));
+  } else {
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+      out[j] = static_cast<_Float16>(__fsub_rn(
+          __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+  }
+}
+
 __device__ __forceinline__ v16bf LoadBlockedBAt(const short* src) {
   union {
     v16bf f;
@@ -570,10 +594,7 @@ __launch_bounds__(WM * WN * 32) __global__
           v16bf f;
           uint4 u[2];
         } packed;
-#pragma unroll
-        for (int j = 0; j < 16; ++j)
-          packed.f[j] = static_cast<_Float16>(__fsub_rn(
-              __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+        DecodeToHalves<Ablate>(q, packed.f);
         StoreCommit<Ablate>(dst, packed.u[0], packed.u[1], row);
       } else if constexpr (CacheIqHeader &&
                            UpType == gufo::core::GgmlType::kIQ4_XS) {
@@ -599,10 +620,7 @@ __launch_bounds__(WM * WN * 32) __global__
             v16bf f;
             uint4 u[2];
           } packed;
-#pragma unroll
-          for (int j = 0; j < 16; ++j)
-            packed.f[j] = static_cast<_Float16>(__fsub_rn(
-                __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+          DecodeToHalves<Ablate>(q, packed.f);
           if constexpr ((Ablate & 32) != 0) {
             // All eight words are readonly-in practice but the asm claims
             // read-write, so the decode above cannot be deleted while no LDS
@@ -669,10 +687,7 @@ __launch_bounds__(WM * WN * 32) __global__
             v16bf f;
             uint4 u[2];
           } packed;
-#pragma unroll
-          for (int j = 0; j < 16; ++j)
-            packed.f[j] = static_cast<_Float16>(__fsub_rn(
-                __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+          DecodeToHalves<Ablate>(q, packed.f);
           ra[p][0] = packed.u[0];
           ra[p][1] = packed.u[1];
         }

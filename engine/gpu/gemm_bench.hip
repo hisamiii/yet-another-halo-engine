@@ -1671,6 +1671,94 @@ void DispatchGbDb(GgmlType type, std::size_t m, std::size_t k, std::size_t batch
   }
 }
 
+
+// Decode cost, measured with the LDS instruction counts held fixed. All three
+// arms emit 48 LDS loads and 4 LDS stores per thread per stage, so any delta is
+// the decode itself rather than an array that dead-code elimination removed:
+//
+//   fp32  16          decode in fp32 (mul, sub, two converts)
+//   fp16  8388624     the same decode through one fp16 fused multiply-add
+//   none  80          decode skipped, value kept live with an opaque asm
+template<gufo::core::GgmlType Type, int Ablate>
+void LaunchDec(const void* w, const short* x, float* y, std::size_t batch,
+               std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type>
+void RunDec(std::size_t m, std::size_t k, std::size_t batch, unsigned iterations,
+            int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const int values[3] = {16, 16 | 8388608, 80};
+  const char* names[3] = {"fp32", "fp16", "none"};
+  const auto launch = [&](int v) {
+    if (v == (16 | 8388608))
+      LaunchDec<Type, 16 | 8388608>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr);
+    else if (v == 80)
+      LaunchDec<Type, 80>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr);
+    else
+      LaunchDec<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr);
+  };
+  const auto timed = [&](int v) {
+    for (unsigned i = 0; i < 2; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  for (int round = 0; round < 5; ++round) {
+    for (int i = 0; i < 3; ++i) {
+      const int idx = (i + round) % 3;
+      const double ms = timed(values[idx]);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("dec type=%s arm=%s ablate=%d round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], values[idx], round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchDec(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                 unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunDec<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ5_K:
+      RunDec<GgmlType::kQ5_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ6_K:
+      RunDec<GgmlType::kQ6_K>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "dec sweep covers q4k, q5k, q6k\n");
+      return;
+  }
+}
+
 void DispatchStore(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
                    unsigned iterations, int pattern) {
   using gufo::core::GgmlType;
@@ -1921,6 +2009,8 @@ int main(int argc, char** argv) {
   if (gb8) name = name.substr(4);
   const bool gbdb = name.rfind("gbdb:", 0) == 0;
   if (gbdb) name = name.substr(5);
+  const bool decsweep = name.rfind("dec:", 0) == 0;
+  if (decsweep) name = name.substr(4);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -1969,6 +2059,8 @@ int main(int argc, char** argv) {
           DispatchGb8(entry.type, m, k, batch, iterations, pattern);
         else if (gbdb)
           DispatchGbDb(entry.type, m, k, batch, iterations, pattern);
+        else if (decsweep)
+          DispatchDec(entry.type, m, k, batch, iterations, pattern);
 #ifdef GUFO_FP16_PROTO_CLOCK
         else if (proto)
           DispatchProto(entry.type, m, k, batch);

@@ -857,10 +857,10 @@ both staging tiles are half the size and the whole working set is 32 KiB.
 | bk4 full | on | 11.9 |
 | bk2 full | on | 12.5 |
 
-So the deficit is a **two-region** effect: it appears when the second staging
-array is written and not otherwise, at an approximately fixed absolute cost. It
-survives every one of store width, store count, store bytes, LDS footprint size,
-BK, bank conflicts, barriers and double buffering.
+**SUPERSEDED -- this reading was an artifact of dead-code elimination. See
+"The ablation lattice was invalid" below.** The store-removal arms also deleted
+the dependent LDS *loads*, so what looked like a store cost was mostly load count
+plus schedule. The measurements above are real; their attribution is not.
 
 ### Occupancy and register pressure are ruled out
 
@@ -984,6 +984,68 @@ BK=2, at BK=4 with a runtime index, and at BK=4 unrolled.
 **Net result:** the second staging region can be replaced at parity, and the LDS it
 frees has no configuration that reliably beats the current design. The activation
 staging stays.
+
+### The ablation lattice was invalid
+
+Every "removing a store stream costs X" number in this document was measured with
+an ablation that also deleted work. Dropping the store makes the corresponding
+staging array dead, LLVM elides the array, and then **the K loop's loads of that
+array are eliminated too**. Counting the LDS instructions per kernel makes it
+plain:
+
+| arm | ablate | `ds_load` | `ds_store` | wmma | ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| full | 16 | 48 | 4 | 32 | 13.67 |
+| noStoreB (A store only) | 16400 | 16 | 2 | 32 | 9.40 |
+| noStoreA (B store only) | 48 | 32 | 2 | 32 | 8.74 |
+| noStoreAB | 16432 | 0 | 0 | 32 | 8.48 |
+| noCommit | 18 | 0 | 0 | 32 | 7.14 |
+| sameRegion | 32784 | 16 | 2 | 32 | 8.89 |
+
+`sameRegion` was meant to write one staging array twice and it did not even do
+that: the two stores coalesced to two instructions and the B loads vanished, which
+is why it looked cheap. `noStoreAB` is a kernel with *no LDS traffic at all*, not
+a kernel with the stores removed.
+
+### What survives when the counts are held fixed
+
+Two comparisons do hold the LDS instruction counts constant, and they reverse the
+earlier conclusion:
+
+| arm | ablate | `ds_load` | `ds_store` | ms |
+| --- | ---: | ---: | ---: | ---: |
+| full | 16 | 48 | 4 | 13.67 |
+| bothHalf (each store half width) | 524304 | 48 | 2 | 12.10 |
+| no decode | 80 | 48 | 4 | 9.56 |
+
+- **Stores are nearly free.** Halving the store instructions at a fixed 48 loads
+  is worth 1.57 ms; the earlier ladder attributed ~4 ms to the same change. The
+  store *width* sweep is consistent: b128, b64 and b32 move the same bytes in the
+  same time.
+- **The decode is the largest single component: 13.67 -> 9.56 = 4.11 ms (23%)**
+  with byte-identical LDS counts. This is the one attribution in this document
+  that a count audit supports.
+
+Reducing the decode's instruction count does not recover it, though. Rewriting the
+per-element fp32 mul/sub/convert chain as a single fp16 fused multiply-add halves
+its VALU count and is worth only **2.8%** (11.40 vs 11.73 ms, faster in three of
+four paired rounds, again with identical LDS counts). So the decode costs 23% of
+the kernel but its instructions are not the reason.
+
+That is the same shape as every other result here: the cost is real and
+reproducible, and it resists being removed by making the work cheaper. The most
+consistent explanation left is register live range and scheduling -- the decode's
+outputs must stay live across the commit -- but this part exposes no counter that
+can confirm it.
+
+**Consequence:** the activation staging stays, and LDS restructuring is the wrong
+target. The measurements that were valid all say the same thing -- BK, tile shape,
+warp aspect, store width, staging strategy and double buffering are neutral or
+worse, and the LDS stores themselves cost ~0.3 ms. What remains unaddressed is the
+decode's 23%, and the only lever with a known mechanism is removing the decode
+from the kernel entirely by materialising fp16 weights (the `no decode` arm is
+that upper bound).
+
 
 **Falsifier:** if a variant that keeps both staging arrays separate and spends the
 freed LDS on more K depth runs under the noStoreB floor (~8.5 ms at this shape),
