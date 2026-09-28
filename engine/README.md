@@ -661,3 +661,49 @@ workgroup, each keeping the same per-warp schedule, so that many more independen
 requests are in flight at the same per-thread register budget. That also makes the
 residency boundary load-bearing rather than incidental, since the whole point is to
 add waves without crossing roughly 192 registers.
+
+### Reversal: both control kernels use 64 KiB of LDS, and LDS staging is the difference
+
+The previous section claimed the fp16 control uses no shared memory and that LDS
+staging therefore cannot explain the gap. **That claim was wrong, and it is retracted
+here.** It came from a parsing bug: each kernel note block prints
+`.group_segment_fixed_size` *before* `.name`, but the extraction script searched only
+the text after `.name`, so it reported the following kernel LDS value. Parsing each
+block from `.group_segment_fixed_size` to the next one gives:
+
+| kernel | VGPR | SGPR | LDS | spills |
+| --- | ---: | ---: | ---: | ---: |
+| one:q4k control (ablate 16) | 192 | 42 | **65536** | 0 |
+| fp16w:q4k control (ablate 16777232) | 190 | 42 | **65536** | 0 |
+
+The VGPR figures were unaffected (that field really does follow `.name`), so 192 and
+190 stand. Only the LDS column was wrong.
+
+The disassembly settles it independently, and this is the comparison that matters:
+
+| instruction | Loom v3 | HIP fp16 control | HIP Q4_K control |
+| --- | ---: | ---: | ---: |
+| global_load_b128 | **40** | 8 | 6 |
+| ds_load_b128 (LDS) | **0** | **48** | 48 |
+| ds_store_b128 | 0 | 4 | 4 |
+| v_wmma_f32_16x16x16_f16 | 16 | 32 | 32 |
+
+The HIP kernel fetches each operand byte once from global memory into 64 KiB of
+shared memory and then serves 48 of its operand reads per body from LDS, where the
+Loom kernel issues 40 global gathers and never touches shared memory. That is the
+structural difference, and it explains the numbers without any new assumption: the
+Loom load path alone costs 1.727 ms while HIP completes the same loads *and* the
+matrix work in 1.353 ms, because HIP pays L2/L1 bandwidth and latency for each
+operand once and then reads LDS, while every Loom MMA operand goes back out to the
+memory hierarchy.
+
+It also retroactively explains the whole falsification list. Every experiment in this
+document reshuffled global accesses -- tile, schedule, layout, workgroup packing --
+and none of them introduced shared-memory staging, so none of them could touch the
+operand-delivery path that the load-only proxy measured at 95% of the time.
+
+Method note worth keeping: a plausible-looking number from a hand-written parser was
+wrong for two rounds and produced a confidently-stated retraction of a correct
+claim. The native disassembly is what caught it. Compiler metadata and native
+evidence are not interchangeable, which is exactly why the Loom development guide
+keeps them as separate evidence classes.
