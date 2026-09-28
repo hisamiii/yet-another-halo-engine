@@ -62,12 +62,15 @@
 amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_iq3s.m_tiles : %value: index where [range(%value, 1, 4096)]
+config.decl @yah_ffn_gemm_iq3s.k_blocks : %value: index where [range(%value, 1, 4096)]
+config.decl @yah_ffn_gemm_iq3s.token_tiles : %value: index where [range(%value, 1, 4096)]
 
 kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
   %unit = index.constant 1 : index
   %m_tiles = config.get @yah_ffn_gemm_iq3s.m_tiles : index
+  %token_tiles = config.get @yah_ffn_gemm_iq3s.token_tiles : index
   %c32 = index.constant 32 : index
-  kernel.launch.config workgroups(%m_tiles, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index
+  kernel.launch.config workgroups(%m_tiles, %token_tiles, %unit) workgroup_size(%c32, %unit, %unit) : index
 } launch(%weight: buffer, %grid: buffer, %input: buffer, %wstage: buffer, %ostage: buffer, %output: buffer) {
   %base = index.constant 0 : offset
   %c0 = index.constant 0 : index
@@ -107,31 +110,43 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
   %c255i = scalar.constant 255 : i32
   %c2200i = scalar.constant 2200 : i32
   %m_tiles = config.get @yah_ffn_gemm_iq3s.m_tiles : index
+  %k_blocks = config.get @yah_ffn_gemm_iq3s.k_blocks : index
+  %token_tiles = config.get @yah_ffn_gemm_iq3s.token_tiles : index
+  %cbb = index.constant 110 : index
+  %cbb2 = index.constant 55 : index
+  %ktot = index.mul %k_blocks, %c256 : index
+  %tokens = index.mul %token_tiles, %c64 : index
   %m_rows = index.mul %m_tiles, %c16 : index
-  %w_bytes = index.mul %m_tiles, %c35200 : index
-  %w_halfs = index.mul %m_tiles, %c17600 : index
+  %bpr = index.mul %k_blocks, %cbb : index
+  %hpr = index.mul %k_blocks, %cbb2 : index
+  %w_bytes = index.mul %m_rows, %bpr : index
+  %w_halfs = index.mul %m_rows, %hpr : index
   %w_last = index.sub %w_bytes, %c1 : index
   %w_half_last = index.sub %w_halfs, %c1 : index
-  %out_total = index.mul %m_rows, %c64 : index
+  %out_total = index.mul %m_rows, %tokens : index
   %stage_rows = index.mul %m_tiles, %c16 : index
   %stage_last = index.sub %stage_rows, %c1 : index
-  %a_layout = encoding.layout.strided [1, 5120] : encoding<layout>
+  %a_layout = encoding.layout.strided [%c1, %ktot] : encoding<layout>
   %weight_na, %grid_na, %input_na, %wstage_na, %ostage_na, %output_na = buffer.assume.noalias %weight, %grid, %input, %wstage, %ostage, %output : buffer, buffer, buffer, buffer, buffer, buffer
+  %wg_y = kernel.workgroup.id<y> : index
+  %token_base = index.mul %wg_y, %c64 : index
   %w_view = buffer.view %weight_na[%base] : buffer -> view<[%w_bytes]xi8>
   %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>
-  %a_t_view = buffer.view %input_na[%base] : buffer -> view<5120x64xf16, %a_layout>
+  %a_t_view = buffer.view %input_na[%base] : buffer -> view<[%ktot]x[%tokens]xf16, %a_layout>
   %out_view = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>
   %grid_view = buffer.view %grid_na[%base] : buffer -> view<512xi32>
-  %wstage_view = buffer.view %wstage_na[%base] : buffer -> view<[%stage_rows]x5120xf16>
-  %ostage_view = buffer.view %ostage_na[%base] : buffer -> view<[%stage_rows]x64xf32>
+  %wstage_view = buffer.view %wstage_na[%base] : buffer -> view<[%stage_rows]x[%ktot]xf16>
+  %ostage_view = buffer.view %ostage_na[%base] : buffer -> view<[%stage_rows]x[%tokens]xf32>
   %wg_x = kernel.workgroup.id<x> : index
   %m_origin = index.mul %wg_x, %c16 : index
   %lane = kernel.workitem.id<x> : index
   %lane_i = index.cast %lane : index to i32
   %m_origin_i = index.cast %m_origin : index to i32
+  %k_blocks_i = index.cast %k_blocks : index to i32
+  %bpr_i = scalar.muli %k_blocks_i, %c110i : i32
   %zeros = vector.constant 0.0 : vector<8xf32>
   %init = vector.fragment<init> %zeros shape [%m, %n] : vector<8xf32>
-  %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %c5120 step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+  %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %ktot step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
     %kk_i = index.cast %kk : index to i32
     %kbase = scalar.andi %kk_i, %c255i : i32
@@ -144,7 +159,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
       %c_i = scalar.andi %e_i, %c15i : i32
       %i_i = scalar.addi %kbase, %c_i : i32
       %row_i = scalar.addi %m_origin_i, %r_i : i32
-      %row_off = scalar.muli %row_i, %c2200i : i32
+      %row_off = scalar.muli %row_i, %bpr_i : i32
       %blk_off0 = scalar.muli %kblk, %c110i : i32
       %blk_off = scalar.addi %row_off, %blk_off0 : i32
       %group = scalar.shrui %i_i, %c5i : i32
@@ -248,25 +263,31 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
       %row_ix = index.cast %row_i : i32 to index
       %row_lo = index.max %row_ix, %c0 : index
       %row = index.min %row_lo, %stage_last : index
-      view.store %h, %wstage_view[%row, %kx] : f16, view<[%stage_rows]x5120xf16>
+      view.store %h, %wstage_view[%row, %kx] : f16, view<[%stage_rows]x[%ktot]xf16>
       scf.yield %mk : index
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    %lhs = vector.fragment.load<lhs> %wstage_view[%m_origin, %kk] shape [%m, %k] : view<[%stage_rows]x5120xf16> -> vector<16xf16>
-    %rhs0 = vector.fragment.load<rhs> %a_t_view[%kk, %c0] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
-    %rhs1 = vector.fragment.load<rhs> %a_t_view[%kk, %c16] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
-    %rhs2 = vector.fragment.load<rhs> %a_t_view[%kk, %c32] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
-    %rhs3 = vector.fragment.load<rhs> %a_t_view[%kk, %c48] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %lhs = vector.fragment.load<lhs> %wstage_view[%m_origin, %kk] shape [%m, %k] : view<[%stage_rows]x[%ktot]xf16> -> vector<16xf16>
+    %t16 = index.add %token_base, %c16 : index
+    %t32 = index.add %token_base, %c32 : index
+    %t48 = index.add %token_base, %c48 : index
+    %rhs0 = vector.fragment.load<rhs> %a_t_view[%kk, %token_base] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>
+    %rhs1 = vector.fragment.load<rhs> %a_t_view[%kk, %t16] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>
+    %rhs2 = vector.fragment.load<rhs> %a_t_view[%kk, %t32] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>
+    %rhs3 = vector.fragment.load<rhs> %a_t_view[%kk, %t48] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>
     %n0 = vector.mma %lhs, %rhs0, %a0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %n1 = vector.mma %lhs, %rhs1, %a1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %n2 = vector.mma %lhs, %rhs2, %a2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %n3 = vector.mma %lhs, %rhs3, %a3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     scf.yield %n0, %n1, %n2, %n3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
   }
-  vector.fragment.store<result> %acc0, %ostage_view[%m_origin, %c0] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x64xf32>
-  vector.fragment.store<result> %acc1, %ostage_view[%m_origin, %c16] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x64xf32>
-  vector.fragment.store<result> %acc2, %ostage_view[%m_origin, %c32] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x64xf32>
-  vector.fragment.store<result> %acc3, %ostage_view[%m_origin, %c48] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x64xf32>
+  %o16 = index.add %token_base, %c16 : index
+  %o32 = index.add %token_base, %c32 : index
+  %o48 = index.add %token_base, %c48 : index
+  vector.fragment.store<result> %acc0, %ostage_view[%m_origin, %token_base] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x[%tokens]xf32>
+  vector.fragment.store<result> %acc1, %ostage_view[%m_origin, %o16] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x[%tokens]xf32>
+  vector.fragment.store<result> %acc2, %ostage_view[%m_origin, %o32] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x[%tokens]xf32>
+  vector.fragment.store<result> %acc3, %ostage_view[%m_origin, %o48] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x[%tokens]xf32>
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   %store_sink = scf.for %j2 = [%c0 to %c32 step %c1](%mk2 = %c0 : index) -> (index) {
     %j2_i = index.cast %j2 : index to i32
@@ -280,8 +301,9 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
     %tok = index.max %tok_ix, %c0 : index
     %gr2_ix = index.add %m_origin, %r2 : index
     %gr2 = index.min %gr2_ix, %stage_last : index
-    %val = view.load %ostage_view[%gr2, %tok] : view<[%stage_rows]x64xf32> -> f32
-    %tok_off = index.mul %tok, %m_rows : index
+    %tok_g = index.add %token_base, %tok : index
+    %val = view.load %ostage_view[%gr2, %tok_g] : view<[%stage_rows]x[%tokens]xf32> -> f32
+    %tok_off = index.mul %tok_g, %m_rows : index
     %gflat = index.add %tok_off, %gr2 : index
     view.store %val, %out_view[%gflat] : f32, view<[%out_total]xf32>
     scf.yield %mk2 : index
