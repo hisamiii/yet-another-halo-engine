@@ -857,9 +857,45 @@ both staging tiles are half the size and the whole working set is 32 KiB.
 | bk4 full | on | 11.9 |
 | bk2 full | on | 12.5 |
 
-So the deficit is a **two-region** effect with an approximately fixed absolute
-cost, and it survives every one of: store width, store count, store bytes, LDS
-footprint size, bank conflicts, barriers and double buffering.
+So the deficit is a **two-region** effect: it appears when the second staging
+array is written and not otherwise, at an approximately fixed absolute cost. It
+survives every one of store width, store count, store bytes, LDS footprint size,
+BK, bank conflicts, barriers and double buffering.
+
+### Occupancy and register pressure are ruled out
+
+Two reads of the same lattice looked promising and are both wrong. Removing a
+store stream lets the compiler delete that array, so the declared LDS size falls
+64 KiB -> 32 KiB -> 0 and the VGPR count falls 192 -> ~110. That suggested the
+cost was really the occupancy cliff at 64 KiB (one block per CU) or at 192 VGPRs.
+Neither survives:
+
+| tile | threads | declared LDS | VGPR | none | full | gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256x256 w8n4 | 1024 | 65536 | 192 | 7.91 | 11.10 | 3.19 |
+| 128x128 w4n4 | 512 | 32768 | 112 | 8.48 | 12.57 | 4.09 |
+| 128x128 w8n4 | 1024 | 32768 | **80** | 8.73 | **15.03** | **6.30** |
+
+A 128x128 tile declares half the LDS and needs far fewer accumulator registers,
+so it is the configuration that should be able to hold two blocks per CU -- and it
+has the *largest* store gap, not the smallest. The 128x128 w8n4 arm has the
+**lowest** VGPR count of any full-store arm and is the **slowest**, so VGPR count
+does not track the cost either. Without staging, all three tiles land at 7.9-8.7 ms,
+i.e. the tile barely matters; with staging, the tile matters a lot.
+
+### Where this leaves it
+
+The mechanism is unresolved, and the reason is instrumentation: on gfx1151 this
+ROCm exposes no `SQ_WAIT_*` stall counters and no working `OccupancyPercent`,
+so every conclusion here is black-box wall-clock, and each ablation changes the
+whole compiled artifact rather than one quantity. What can be said precisely is
+that the staging chain costs 30-60% of the kernel, that the trigger is writing a
+second distinct staging region rather than any measurable property of the stores
+themselves, and that no store-side tuning helps.
+
+Note also that the absolute gap is not stable across sessions: the same
+full-vs-none pair measured 5.19 ms in one process and 3.19 ms in another, because
+the box's operating point drifts. Only within-session comparisons are valid here.
 
 **Falsifier:** any change that keeps both staging arrays separate and still runs
 under ~10 ms at this shape falsifies the two-region reading; the reduction must

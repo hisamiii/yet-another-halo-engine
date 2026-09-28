@@ -1192,6 +1192,93 @@ void DispatchRegBk(GgmlType type, std::size_t m, std::size_t k, std::size_t batc
   }
 }
 
+
+// Occupancy cross-check. The 256x256 BK=4 tile declares 64 KiB of LDS and
+// compiles to 192 VGPRs, so exactly one 1024-thread block is resident per CU and
+// the per-SIMD wave count is halved. A 128x128 BK=4 tile declares 32 KiB and
+// needs far fewer accumulator registers, so two blocks fit. If the "store cost"
+// is really the 2-blocks-to-1-blocks occupancy transition then the -full versus
+// -none gap must collapse here even with both staging stores present, and the
+// falsifier recorded for the two-region reading is met by occupancy instead.
+template<gufo::core::GgmlType Type, int BM, int BN, int WM, int WN, int Ablate>
+void LaunchTt(const void* w, const short* x, float* y, std::size_t batch,
+              std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + BN - 1) / BN),
+                  static_cast<unsigned>((m + BM - 1) / BM));
+  gufo::hip::HalfPrefillGemmKernel<BM, BN, WM, WN, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, WM * WN * 32, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type>
+void RunTt(std::size_t m, std::size_t k, std::size_t batch,
+           unsigned iterations, int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const char* names[6] = {"t256_full", "t256_none", "t128w8n4_full",
+                          "t128w8n4_none", "t128w4n4_full", "t128w4n4_none"};
+  const auto launch = [&](int v) {
+    switch (v) {
+      case 1: LaunchTt<Type, 256, 256, 8, 4, 16432>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 2: LaunchTt<Type, 128, 128, 8, 4, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 3: LaunchTt<Type, 128, 128, 8, 4, 16432>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 4: LaunchTt<Type, 128, 128, 4, 4, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 5: LaunchTt<Type, 128, 128, 4, 4, 16432>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      default: LaunchTt<Type, 256, 256, 8, 4, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+    }
+  };
+  const auto timed = [&](int v) {
+    for (unsigned i = 0; i < 2; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  for (int round = 0; round < 6; ++round) {
+    for (int i = 0; i < 6; ++i) {
+      const int idx = (i + round) % 6;
+      const double ms = timed(idx);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("tt type=%s arm=%s round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchTt(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunTt<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ5_K:
+      RunTt<GgmlType::kQ5_K>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "tt sweep covers q4k, q5k\n");
+      return;
+  }
+}
+
 void DispatchStore(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
                    unsigned iterations, int pattern) {
   using gufo::core::GgmlType;
@@ -1432,6 +1519,8 @@ int main(int argc, char** argv) {
   if (regsweep) name = name.substr(4);
   const bool regbk = name.rfind("regbk:", 0) == 0;
   if (regbk) name = name.substr(6);
+  const bool tt = name.rfind("tt:", 0) == 0;
+  if (tt) name = name.substr(3);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -1470,6 +1559,8 @@ int main(int argc, char** argv) {
           DispatchReg(entry.type, m, k, batch, iterations, pattern);
         else if (regbk)
           DispatchRegBk(entry.type, m, k, batch, iterations, pattern);
+        else if (tt)
+          DispatchTt(entry.type, m, k, batch, iterations, pattern);
 #ifdef GUFO_FP16_PROTO_CLOCK
         else if (proto)
           DispatchProto(entry.type, m, k, batch);
