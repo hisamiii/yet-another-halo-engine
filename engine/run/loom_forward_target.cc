@@ -36,6 +36,11 @@ constexpr std::uint32_t kHeadDim = 256;
 constexpr std::uint32_t kCtx = 8;
 constexpr std::uint32_t kCache = kCtx * kKvHeads * kHeadDim;
 constexpr std::uint32_t kVocab = 248320;
+// hidden elements per dispatch: 5120 rows x the 64-token tile.
+constexpr std::uint32_t kOutTotal = kHidden * 64;
+// K-split factor for the residual projections (even: the reduction ping-pongs).
+constexpr std::uint32_t kSplit = 4;
+static_assert(kSplit % 2 == 0, "kSplit must be even");
 
 const float kKvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                             1, 13, 25, 38, 53, 69, 89, 113};
@@ -218,7 +223,9 @@ int main(int argc, char** argv) {
     LoomBuffer ogate = gpu.Allocate(std::size_t{kFfn} * kP * 4);
     LoomBuffer oup = gpu.Allocate(std::size_t{kFfn} * kP * 4);
     LoomBuffer wstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
-    LoomBuffer ostage = gpu.Allocate(std::size_t{kFfn} * kP * 4);
+    LoomBuffer ostage = gpu.Allocate(std::size_t{4} * kHidden * kP * 4);
+    LoomBuffer partial = gpu.Allocate(std::size_t{4} * kOutTotal * 4);
+    LoomBuffer hidden2 = gpu.Allocate(std::size_t{kOutTotal} * 4);
     LoomBuffer normed = gpu.Allocate(std::size_t{kHidden} * 4);
     LoomBuffer logits = gpu.Allocate(std::size_t{kVocab} * 4);
     LoomBuffer token = gpu.Allocate(4);
@@ -254,6 +261,7 @@ int main(int argc, char** argv) {
     LoomExecutable& e_gemv = load(dir + "/gemv.hal");
     LoomExecutable& e_rms = load(dir + "/rmsnorm.hal");
     LoomExecutable& e_argmax = load(dir + "/argmax.hal");
+    LoomExecutable& e_accum = load(dir + "/accum.hal");
 
     auto run_norm = [&](const std::string& wname) {
       const auto* tw = find(wname);
@@ -328,11 +336,21 @@ int main(int argc, char** argv) {
       b.push_back({input.handle, 0, hb(input)});
       b.push_back({wstage.handle, 0, hb(wstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
-      b.push_back({hidden.handle, 0, hb(hidden)});
-      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_residual").c_str(),
-               mt, 1, 1, 32, 1, 1, b);
+      b.push_back({partial.handle, 0, hb(partial)});
+      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_residual").c_str(), mt, 1, kSplit, 32, 1, 1, b);
+      // Reduce the k_split partials into the residual: hidden += sum_s partial[s].
+      // Ping-pong through a scratch buffer so the reduction's `a` and `out`
+      // bindings never alias; kSplit is even so the last step lands in hidden.
+      for (std::uint32_t s = 0; s < kSplit; ++s) {
+        const LoomBuffer& src = (s % 2 == 0) ? hidden : hidden2;
+        const LoomBuffer& dst = (s % 2 == 0) ? hidden2 : hidden;
+        std::vector<hrx_buffer_ref_t> r = {
+            {src.handle, 0, hb(src)},
+            {partial.handle, std::size_t{s} * kOutTotal * 4, std::size_t{kOutTotal} * 4},
+            {dst.handle, 0, hb(dst)}};
+        Dispatch(gpu, e_accum, "yah_residual_1d", kOutTotal / 256, 1, 1, 256, 1, 1, r);
+      }
     };
-
     double t_norm = 0.0, t_mixer = 0.0, t_ffn = 0.0;
     double t_ffn_norm = 0.0, t_ffn_gate = 0.0, t_ffn_up = 0.0, t_ffn_down = 0.0;
     std::chrono::steady_clock::time_point mark = std::chrono::steady_clock::now();
@@ -462,6 +480,7 @@ int main(int argc, char** argv) {
       t_ffn_up += tick();
       run_residual(pre + "ffn_down.weight", ffnup);
       t_ffn_down += tick();
+
     }
     gpu.Synchronize();
     const double layer_ms = std::chrono::duration<double, std::milli>(

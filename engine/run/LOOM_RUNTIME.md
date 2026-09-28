@@ -271,8 +271,8 @@ cleaned source and re-running reproduces argmax 11751.
    the next target: GEMV, decode attention, resident DeltaNet and the
    state-advancing decode convolution, then remove the HIP build
    (`engine/build_gpu.sh`, hipcc) and the HIP sources.
-5. Prefill tuning is now unblocked (correctness matches HIP): the quantized GEMM
-   staging is the target, see section 6.
+5. Prefill tuning is unblocked (correctness matches HIP): the quantized GEMM
+   staging was the first lever, split-K the second, see section 6.
 ## 6. Prefill performance
 
 `YAH_LOOM_TIME=1` makes `loom_forward_target` synchronize at category boundaries
@@ -322,6 +322,32 @@ are now unblocked: `engine/gpu/loom/docs/fragment-layout.md` shows lane L holds
 logical row `L%16` and that a `buffer.alloca<workgroup>` LDS fragment load is
 correct (the port note claiming otherwise was wrong); the LDS form already saves
 ~10% on the iq4xs kStore.
+### Split-K on the residual arms
+
+The three residual projections (`attn_output`, `ssm_out`, `ffn_down`) are the
+lowest-occupancy arms: `m_tiles=320` workgroups of 320/320/1088 serial K steps,
+so there is no second wave to hide the per-step latency. They now take a
+`k_split` config (grid `workgroups(m_tiles, token_tiles, k_split)`) and write
+`k_split` partial tiles instead of adding the residual in the epilogue
+(`accum=0`); the driver reduces them with `yah_residual_add_1d` into the
+residual. `emit_prefill.py` emits every residual arm with `k_split=4 accum=0`.
+
+This took the full prefill from 1558 ms to **~1190 ms** (`ffn_down` 438 -> 214
+ms) with argmax 11751 and the final residual matching HIP to max_abs 0.081.
+
+One arm, `yah_ffn_gemm_q5k_residual_f32.loom`, was missed by the rollout: its
+staging view stayed `view<[stage_rows]x64xf32>` and its epilogue loaded
+`[gr2, tok]` with no split offset, so a `q5k` residual read another split's
+staging tile. The run drifted (layer 0 max_abs 3.8 vs HIP, 65 at layer 63) but
+argmax stayed 11751 because the head is robust. Isolating it needed a
+controlled old-vs-split comparison at the production shape: emit the arm with
+`k_split=1 accum=1` (the pre-split epilogue), run both, and the first divergent
+residual names the arm. Fixed by matching the other seven; the in-tree case
+does not catch it because it is emitted at `m_tiles=1`.
+
+The reduction ping-pongs `hidden` and a scratch buffer so the accumulator's
+`a`/`out` bindings never alias (`kSplit` is even, so the last step lands in
+`hidden`); a same-buffer reduction violates the kernel's `noalias`.
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.

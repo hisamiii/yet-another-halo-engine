@@ -95,12 +95,18 @@ def main():
                  f"gemm_kstore_{fmt}_{mt}_{kb}.hal", outdir); n += 1
         elif kind == "residual":
             f = f"yah_ffn_gemm_{port}_residual_f32.loom"; sym = sym_of(f)
-            emit(f, [f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}", f"{sym}.token_tiles=1"],
+            # Every residual arm has m_tiles=320 (the projection writes hidden),
+            # so a 4-way K split raises the grid from 320 to 1280 workgroups.
+            emit(f, [f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}",
+                     f"{sym}.token_tiles=1", f"{sym}.k_split=4", f"{sym}.accum=0"],
                  f"gemm_residual_{fmt}_{mt}_{kb}.hal", outdir); n += 1
         else:
             f = f"yah_ffn_gemm_{port}_swiglu_f16.loom"; sym = sym_of(f)
             emit(f, [f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}", f"{sym}.token_tiles=1"],
                  f"gemm_swiglu_{fmt}_{mt}_{kb}.hal", outdir); n += 1
+    # The residual reduction: hidden += sum_s partial[s], dim = hidden * 64 tokens.
+    emit("yah_residual_add_1d_f32.loom", ["yah_residual_1d.dim=327680"],
+         "accum.hal", outdir); n += 1
     print("emitted", n, "GEMM HALs")
 
 

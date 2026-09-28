@@ -37,6 +37,10 @@ constexpr std::uint32_t kHeads = 24;
 constexpr std::uint32_t kKvHeads = 4;
 constexpr std::uint32_t kHeadDim = 256;
 constexpr std::uint32_t kVocab = 248320;
+// hidden elements per dispatch: 5120 rows x the 64-token tile.
+constexpr std::uint32_t kOutTotal = kHidden * 64;
+constexpr std::uint32_t kSplit = 4;
+static_assert(kSplit % 2 == 0, "kSplit must be even");
 constexpr std::uint32_t kMaxContext = 64;
 constexpr std::uint32_t kCacheLayer = kMaxContext * kKvHeads * kHeadDim;
 constexpr std::uint32_t kConvState = kQkv * 4;
@@ -231,7 +235,9 @@ int main(int argc, char** argv) {
     LoomBuffer token = gpu.Allocate(4);
     LoomBuffer wstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
     LoomBuffer uwstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
-    LoomBuffer ostage = gpu.Allocate(std::size_t{kFfn} * 64 * 4);
+    LoomBuffer ostage = gpu.Allocate(std::size_t{4} * kHidden * 64 * 4);
+    LoomBuffer partial = gpu.Allocate(std::size_t{4} * kOutTotal * 4);
+    LoomBuffer hidden2 = gpu.Allocate(std::size_t{kOutTotal} * 4);
     LoomBuffer kv16 = gpu.Allocate(std::size_t{2} * 16 * kCacheLayer * 2);
     LoomBuffer cache32 = gpu.Allocate(std::size_t{kCacheLayer} * 4);
     LoomBuffer convstate = gpu.Allocate(std::size_t{48} * kConvState * 4);
@@ -254,6 +260,7 @@ int main(int argc, char** argv) {
     LoomExecutable& e_rms = load(dir + "/rmsnorm.hal");
     LoomExecutable& e_gemv = load(dir + "/gemv.hal");
     LoomExecutable& e_argmax = load(dir + "/argmax.hal");
+    LoomExecutable& e_accum = load(dir + "/accum.hal");
 
     auto run_norm = [&](const std::string& wname) {
       const auto* tw = find(wname);
@@ -318,8 +325,17 @@ int main(int argc, char** argv) {
       b.push_back({input.handle, 0, hb(input)});
       b.push_back({wstage.handle, 0, hb(wstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
-      b.push_back({hidden.handle, 0, hb(hidden)});
-      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_residual").c_str(), mt, 1, 1, 32, 1, 1, b);
+      b.push_back({partial.handle, 0, hb(partial)});
+      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_residual").c_str(), mt, 1, 4, 32, 1, 1, b);
+      for (std::uint32_t s = 0; s < kSplit; ++s) {
+        const LoomBuffer& src = (s % 2 == 0) ? hidden : hidden2;
+        const LoomBuffer& dst = (s % 2 == 0) ? hidden2 : hidden;
+        std::vector<hrx_buffer_ref_t> r = {
+            {src.handle, 0, hb(src)},
+            {partial.handle, std::size_t{s} * kOutTotal * 4, std::size_t{kOutTotal} * 4},
+            {dst.handle, 0, hb(dst)}};
+        Dispatch(gpu, e_accum, "yah_residual_1d", kOutTotal / 256, 1, 1, 256, 1, 1, r);
+      }
     };
     const auto* emb = find("token_embd.weight");
     std::vector<float> host_hidden(std::size_t{kHidden}, 0.0f);
