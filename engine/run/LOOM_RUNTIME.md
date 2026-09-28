@@ -348,6 +348,19 @@ does not catch it because it is emitted at `m_tiles=1`.
 The reduction ping-pongs `hidden` and a scratch buffer so the accumulator's
 `a`/`out` bindings never alias (`kSplit` is even, so the last step lands in
 `hidden`); a same-buffer reduction violates the kernel's `noalias`.
+### Host-side: import the GGUF tensor region once
+
+The driver used to call `hrx_allocator_import_buffer` once per GEMM dispatch
+(~192 times per run) and `hrx_synchronous_h2d` for every per-layer norm/conv/
+state weight. Both are driver round-trips, and even though they overlap the GPU
+they were the dominant host cost: the run was 22% host-bound (944 ms of GPU work
+inside a 1206 ms wall). `Gguf` already exposes the whole contiguous tensor-data
+region, so importing it once and binding each tensor as `(offset, bytes)` into
+that one buffer removed the per-dispatch imports.
+
+That alone took the prefill from 1206 ms to **963 ms** with identical output
+(argmax 11751, final residual vs HIP max_abs 0.081), and the per-dispatch GPU
+sum now matches the wall time, i.e. the host is no longer on the critical path.
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
