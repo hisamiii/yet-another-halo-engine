@@ -10,7 +10,12 @@ explicitly deferred.
 3. Give it an in-source `check.case` with distinct input values, and an expectation
    computed analytically where one exists (identity and all-zero patterns do not
    catch a transposed index).
-4. Verify with `loom-check`, then measure with `iree-benchmark-loom --measure=dispatch_complete`.
+4. Verify correctness and measure through `./loom_run.sh <file> <case> <benchmark> <config>`.
+   It runs the correctness case and the benchmark under **one** config, and
+   refuses any config whose declared operand footprint exceeds what the case binds.
+   Do not hand-roll `iree-benchmark-loom` invocations for a check.case: re-running a
+   validated case under a larger config is an out-of-bounds access on this target and
+   hangs the GPU (docs/gpu-ring-hang-qdq.md).
 5. Do not tune during the port. Record the number and move on.
 
 ## Status
@@ -32,7 +37,8 @@ explicitly deferred.
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
-| - | engine/kv/kv_quant.hip | quantize/dequantize fp32 + fp16, q8/q4 blocks | todo |
+| yah_qdq_f32.loom | engine/kv/kv_quant.hip | quantize/dequantize over 32-element blocks | ported, 0.0546 ms at 10240 blocks (327680 f32) |
+| - | engine/kv/kv_quant.hip | fp16 quantize/dequantize, q8/q4 block formats | todo |
 | - | vision/encoder.hip, device_input.hip | vision tower | todo |
 
 ## Notes carried over from the FFN GEMM port
@@ -65,3 +71,19 @@ explicitly deferred.
 - Float literals in expectations are canonicalised by the formatter (1.0e-4 -> 0.0001).
 - Fragment loads from global memory are what this compiler is good at; LDS staging
   measured slower in all three variants tried.
+- **A kernel cannot learn its operand size on this target.** `buffer.length` exists
+  but has no AMDGPU target-low contract, launch arguments are not in scope in the
+  launch-config region, and a raw buffer carries no device-visible length. Every
+  extent comes from `config.*`, so the config is a promise from the caller. An
+  over-declared config is an out-of-bounds write that wedges the gfx ring --
+  that is the `yah_qdq_f32` hang, and `tools/loom_preflight.py` now blocks it.
+- **A dynamic view extent is only provable from a `config.decl ... where [range(...)]`.**
+  `index.assume` on a buffer-derived value did not satisfy the subrange verifier
+  (`SUBRANGE/024`, "view_bound is <dynamic>"). Keep the config-derived bound and
+  derive nothing about extents from runtime queries.
+- **`index.div` by a power of two can be rejected on AMDGPU.** `index.div %x, 128`
+  lowers to `index.shrui`, which hits `TARGET/004` / `low_register_unit_count`.
+  Compare in the offset domain with `index.scale` and a byte length instead.
+- `--compile-report=details` reports the operand footprint the kernel was told to
+  touch (`source_low.memory.roots[].interval_envelope.byte_count`). It is the
+  cheapest way to see a config/operand mismatch before it reaches the GPU.

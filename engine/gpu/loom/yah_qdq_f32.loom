@@ -1,0 +1,137 @@
+// YAH quantize-then-dequantize over 32-element blocks, Loom port of
+// QuantizeDequantizeFp32Kernel.
+//
+// HIP source: engine/kv/kv_quant.hip. One work-item owns one 32-element block:
+//
+//   amax  = max_i |x[i]|
+//   scale = amax > 0 ? amax / levels : 0
+//   if scale == 0: return                      (block left untouched)
+//   x[i]  = clamp(round(x[i] / scale), -levels, levels) * scale
+//
+// This reproduces the numerics of a `levels`-bit operand without writing the
+// quantized form, which is how the engine measures KV operand error.
+//
+// BOUNDING AND THE 2026-02 GPU HANG. The block count is `config @yah_qdq.blocks`
+// and it bounds BOTH the grid and the view extent. There is no second, runtime
+// bound available: `buffer.length` has no AMDGPU target-low contract, so a kernel
+// on this target cannot query its own operand size, and a raw buffer carries no
+// device-visible length. The config is therefore the only size channel, which
+// makes it a promise from the caller rather than a fact the kernel can check.
+//
+// That promise was broken, and it wedged the GPU. Benchmarking the 1024-element
+// case with --config=yah_qdq.blocks=10240 gave the kernel a 1.3 MB view over a
+// 4 KB buffer; it wrote the difference past the end, faulted UTCL2, and left
+// gfx_0.0.0 hung until the kernel watchdog reset the GPU twice and tore down the
+// benchmark process (docs/gpu-ring-hang-qdq.md). The lesson is not 'add a guard'
+// -- there is nothing to guard with -- but 'the config you validate with is the
+// config you benchmark with'. loom_run.sh exists to enforce exactly that: it
+// runs the correctness case and the benchmark under one config and refuses to
+// let them differ.
+//
+// Required configs, one per case. A case run under any other config is
+// out-of-bounds by construction:
+//
+//   @yah_qdq_small  blocks=32    (32 x 32 = 1024 f32 = 4096 B)
+//   @yah_qdq_full   blocks=10240 (10240 x 32 = 327680 f32 = 1310720 B)
+//
+// Check coverage note: the clamp cannot be observed, because scale is defined as
+// amax / levels so every |x[i] / scale| is at most levels by construction. What
+// the cases verify is the magnitude scan, the scale, the rounding and the
+// multiply, through an exact round trip: with uniform input the scale divides it
+// exactly, so the output must equal the input. Quantization *error*, and
+// under-coverage of the tail, need a non-uniform fixture plus a
+// check.oracle.call reference implementation; PORTING.md tracks that work.
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+// Declared capacity in 32-element blocks. 1048576 blocks = 128 MiB of f32, about
+// 100x the largest KV operand this engine produces.
+config.decl @yah_qdq.blocks : %value: index where [range(%value, 1, 1048576)]
+
+config.def @yah_qdq.levels = 8 : i32
+
+kernel.def target(@yah_wave32) @yah_qdq() {
+  %unit = index.constant 1 : index
+  %blocks = config.get @yah_qdq.blocks : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %blocks, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%x: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %negone = scalar.constant -1.0 : f32
+  %c256 = index.constant 256 : index
+  %blocks = config.get @yah_qdq.blocks : index
+  %total = index.mul %blocks, %c32 : index
+  %levels_i = config.get @yah_qdq.levels : i32
+  %levels = scalar.sitofp %levels_i : i32 to f32
+  %zero = scalar.constant 0.0 : f32
+  %neg_levels = scalar.mulf %levels, %negone : f32
+  %x_noalias = buffer.assume.noalias %x : buffer
+  %x_view = buffer.view %x_noalias[%base] : buffer -> view<[%total]xf32>
+  %lane = kernel.workitem.id<x> : index
+  %wg = kernel.workgroup.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %blk = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %blk, %blocks : index
+  scf.if %in_range {
+    %blk_base = index.mul %blk, %c32 : index
+    %amax = scf.for %i = [%c0 to %c32 step %c1](%a = %zero : f32) -> (f32) {
+      %off = index.add %blk_base, %i : index
+      %v = view.load %x_view[%off] : view<[%total]xf32> -> f32
+      %av = scalar.absf %v : f32
+      %m = scalar.maxnumf %a, %av : f32
+      scf.yield %m : f32
+    }
+    %positive = scalar.cmpf ogt, %amax, %zero : f32
+    %scale0 = scalar.divf %amax, %levels : f32
+    %scale = scf.if %positive -> (f32) {
+      scf.yield %scale0 : f32
+    } else {
+      scf.yield %zero : f32
+    }
+    %nonzero = scalar.cmpf one, %scale, %zero : f32
+    scf.if %nonzero {
+      %sink = scf.for %j = [%c0 to %c32 step %c1](%t = %zero : f32) -> (f32) {
+        %off2 = index.add %blk_base, %j : index
+        %v2 = view.load %x_view[%off2] : view<[%total]xf32> -> f32
+        %scaled = scalar.divf %v2, %scale : f32
+        %r = scalar.roundf %scaled : f32
+        %hi = scalar.minimumf %r, %levels : f32
+        %lo = scalar.maximumf %hi, %neg_levels : f32
+        %back = scalar.mulf %lo, %scale : f32
+        view.store %back, %x_view[%off2] : f32, view<[%total]xf32>
+        scf.yield %t : f32
+      }
+    }
+  }
+  kernel.return
+}
+
+// Requires --config=yah_qdq.blocks=32. Exercises the partial workgroup guard:
+// 32 blocks over a 256-lane workgroup leaves 224 lanes taking the early exit.
+check.case public @yah_qdq_small {
+  %x = check.generate.fill value(3.0) : tensor<1024xf32>
+  %expected = check.generate.fill value(3.0) : tensor<1024xf32>
+  kernel.launch @yah_qdq(%x) : (tensor<1024xf32>)
+  check.expect.close actual(%x) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1024xf32>
+  check.return
+}
+
+check.benchmark<@yah_qdq_small> @yah_qdq_small_bench
+
+// Requires --config=yah_qdq.blocks=10240. The real shape: 64 x 5120 f32, a whole
+// multiple of the workgroup size, so no lane takes the guard.
+check.case public @yah_qdq_full {
+  %x = check.generate.fill value(3.0) : tensor<327680xf32>
+  %expected = check.generate.fill value(3.0) : tensor<327680xf32>
+  kernel.launch @yah_qdq(%x) : (tensor<327680xf32>)
+  check.expect.close actual(%x) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<327680xf32>
+  check.return
+}
+
+check.benchmark<@yah_qdq_full> @yah_qdq_full_bench
