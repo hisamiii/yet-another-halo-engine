@@ -124,7 +124,6 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs() {
   %m_origin_i = index.cast %m_origin : index to i32
   %k_blocks_i = index.cast %k_blocks : index to i32
   %bpr_i = scalar.muli %k_blocks_i, %c144i : i32
-  %u8 = index.constant 8 : index
   %zeros = vector.constant 0.0 : vector<8xf32>
   %init = vector.fragment<init> %zeros shape [%m, %n] : vector<8xf32>
   %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %ktot step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
@@ -132,7 +131,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs() {
     %kk_i = index.cast %kk : index to i32
     %kbase = scalar.andi %kk_i, %c255i : i32
     %kblk = scalar.shrui %kk_i, %c8i : i32
-    %j_sink = scf.for %j = [%c0 to %c8 step %c1](%mk = %c0 : index) -> (index) unroll(%u8) {
+    %j_sink = scf.for %j = [%c0 to %c8 step %c1](%mk = %c0 : index) -> (index) {
       %j_i = index.cast %j : index to i32
       %j32 = scalar.shli %j_i, %c5i : i32
       %e_i = scalar.addi %lane_i, %j32 : i32

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <string>
@@ -76,15 +77,24 @@ Imported ImportTensor(LoomDevice& gpu, const yah::core::Gguf& gguf,
   return out;
 }
 
-bool g_time = false;
+int g_time = 0;
+std::map<std::string, double> g_per_name;
+std::chrono::steady_clock::time_point g_mark = std::chrono::steady_clock::now();
 
 void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
               std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
               const std::vector<hrx_buffer_ref_t>& b) {
+  if (g_time >= 2) gpu.Synchronize();
   gpu.Dispatch(exe, exe.OrdinalOrZero(name),
                LoomDevice::Config(gx, gy, gz, sx, sy, sz), nullptr, 0, b.data(),
                b.size());
+  if (g_time >= 2) {
+    gpu.Synchronize();
+    g_per_name[name] += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - g_mark).count();
+    g_mark = std::chrono::steady_clock::now();
+  }
 }
 
 void ReadFile(const char* path, void* dst, std::size_t bytes) {
@@ -146,7 +156,8 @@ int main(int argc, char** argv) {
   const char* model = argv[1];
   const std::string dir = argv[2];
   const char* out_path = argv[3];
-  g_time = std::getenv("YAH_LOOM_TIME") != nullptr;
+  { const char* t = std::getenv("YAH_LOOM_TIME");
+    g_time = t ? (std::atoi(t) >= 2 ? 2 : 1) : 0; }
   try {
     auto gguf = yah::core::Gguf::Open(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
@@ -323,6 +334,7 @@ int main(int argc, char** argv) {
     };
 
     double t_norm = 0.0, t_mixer = 0.0, t_ffn = 0.0;
+    double t_ffn_norm = 0.0, t_ffn_gate = 0.0, t_ffn_up = 0.0, t_ffn_down = 0.0;
     std::chrono::steady_clock::time_point mark = std::chrono::steady_clock::now();
     const auto tick = [&]() {
       if (!g_time) return 0.0;
@@ -443,10 +455,13 @@ int main(int argc, char** argv) {
       }
       t_mixer += tick();
       run_norm(pre + "post_attention_norm.weight");
+      t_ffn_norm += tick();
       run_kstore(pre + "ffn_gate.weight", gateffn);
+      t_ffn_gate += tick();
       run_swiglu(pre + "ffn_up.weight");
+      t_ffn_up += tick();
       run_residual(pre + "ffn_down.weight", ffnup);
-      t_ffn += tick();
+      t_ffn_down += tick();
     }
     gpu.Synchronize();
     const double layer_ms = std::chrono::duration<double, std::milli>(
@@ -485,10 +500,24 @@ int main(int argc, char** argv) {
     std::fclose(fo);
     std::printf("argmax=%u\n", tok);
     if (g_time) {
+      const double ffn = t_ffn_norm + t_ffn_gate + t_ffn_up + t_ffn_down;
       std::fprintf(stderr,
                    "== loom category timing: norm=%.1f mixer=%.1f ffn=%.1f "
-                   "sum=%.1f ms ==\n",
-                   t_norm, t_mixer, t_ffn, t_norm + t_mixer + t_ffn);
+                   "(ffn_norm=%.1f gate=%.1f up=%.1f down=%.1f) sum=%.1f ms ==\n",
+                   t_norm, t_mixer, ffn, t_ffn_norm, t_ffn_gate, t_ffn_up,
+                   t_ffn_down, t_norm + t_mixer + ffn);
+    }
+    if (g_time >= 2) {
+      std::vector<std::pair<double, std::string>> rows;
+      double sum = 0.0;
+      for (auto& kv : g_per_name) {
+        rows.push_back({kv.second, kv.first});
+        sum += kv.second;
+      }
+      std::sort(rows.rbegin(), rows.rend());
+      std::fprintf(stderr, "== loom per-dispatch timing sum=%.1f ms ==\n", sum);
+      for (auto& r : rows)
+        std::fprintf(stderr, "%9.1f  %s\n", r.first, r.second.c_str());
     }
     return 0;
   } catch (const std::exception& error) {

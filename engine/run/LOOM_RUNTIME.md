@@ -288,6 +288,14 @@ and print a breakdown of the 64-layer loop. On the IQ4_XS shard:
 argmax is 11751 in both runs and the final residual matches the HIP dump to
 max_abs 0.062, mean 0.002.
 
+Splitting the FFN category per arm gives: `post_attention_norm` 10.6 ms,
+`ffn_gate` kStore 242.2, `ffn_up` kSwiGLU 249.1, `ffn_down` kResidual 464.7. The
+down arm is the largest because its K is the FFN width (17408, `k_blocks=68`)
+while its N is hidden (5120, `m_tiles=320`) — the same total work as the
+gate/up arms but only 320 workgroups of 1088 serial K steps, so there is barely
+one wave to hide the per-step latency. Split-K (or a shorter critical path) is
+the next lever.
+
 The quantized GEMM family (`yah_ffn_gemm_*_kstore/_swiglu/_residual`) is ~99% of
 the time. The port staged the decoded weights through a **full-width** global
 buffer (`view<[stage_rows]x[ktot]xf16>`, up to 178 MB at production shape): each
