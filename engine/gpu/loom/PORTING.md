@@ -232,6 +232,11 @@ profile gives one, so the expensive paths move first rather than the convenient 
   `lane / 16`; writing the element loop as nested passes over `seg_hi`, `seg_lo`,
   `l16` and `lane16` supplies all three as loop variables and removes the division
   entirely. The Q5_K decoder does the same for its `/64` and `/32`.
+- **`RoundActivation` in `prefill_fp16.hip` is `scalar.fptrunc`.** It is an empty
+  `asm volatile` barrier followed by `__float2half_rn`, so it pins which rounding
+  boundary the source sees and emits no instruction. Ports of `HalfNorm`,
+  `HalfNorm5120` and `AtbDecodeSwiGLU` can use `scalar.fptrunc %v : f32 to f16`
+  directly; the barrier is a codegen concern Loom does not need a source form for.
 - **Re-tile a tuned kernel freely for the first port; say so in the header.**
   `BatchedDeltaNetRowSplitKernel` is templated over four orthogonal tile choices
   with DPP reductions and LDS staging. The port picks the instantiation whose
