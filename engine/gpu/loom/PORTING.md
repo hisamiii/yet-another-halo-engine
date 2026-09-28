@@ -38,7 +38,8 @@ explicitly deferred.
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
 | yah_qdq_f32.loom | engine/kv/kv_quant.hip | quantize/dequantize over 32-element blocks | ported, 0.0546 ms at 10240 blocks (327680 f32) |
-| - | engine/kv/kv_quant.hip | fp16 quantize/dequantize, q8/q4 block formats | todo |
+| yah_qdq_f16.loom | engine/kv/kv_quant.hip | fp16 quantize/dequantize over 32-element blocks | ported, 0.0434 ms at 10240 blocks (327680 f16) |
+| - | engine/kv/kv_quant.hip | q8/q4 packed block formats, quantize + dequantize | todo |
 | - | vision/encoder.hip, device_input.hip | vision tower | todo |
 
 ## Notes carried over from the FFN GEMM port
@@ -87,3 +88,11 @@ explicitly deferred.
 - `--compile-report=details` reports the operand footprint the kernel was told to
   touch (`source_low.memory.roots[].interval_envelope.byte_count`). It is the
   cheapest way to see a config/operand mismatch before it reaches the GPU.
+- **Float width changes use `scalar.extf` and `scalar.fptrunc`.** `scalar.truncf`
+  is C `truncf` (round toward zero at the same width), not a narrowing conversion:
+  `scalar.extf %v : f16 to f32` widens, `scalar.fptrunc %v : f32 to f16` narrows
+  with the usual round-to-nearest-even. `scalar.truncf` on a float tensor is a
+  different operation and would silently round the wrong way.
+- `scalar.roundf` rounds ties away from zero, which is what `lroundf` and
+  `__float2half_rn`-adjacent code expect; pair it with `scalar.fptosi`, whose own
+  conversion rounds toward zero.
