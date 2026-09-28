@@ -415,6 +415,10 @@ int main(int argc, char** argv) {
       run_kstore(pre + "ffn_gate.weight", gateffn);
       run_swiglu(pre + "ffn_up.weight");
       run_residual(pre + "ffn_down.weight", ffnup);
+      { gpu.Synchronize(); std::vector<float> h(std::size_t{kB} * kHidden);
+        gpu.D2H(hidden, h.data(), h.size() * 4, 0);
+        char pp[128]; std::snprintf(pp, sizeof(pp), "/tmp/loom_iq4xs_layers/layer_%u.bin", l);
+        FILE* ff = std::fopen(pp, "wb"); std::fwrite(h.data(), 4, h.size(), ff); std::fclose(ff); }
     }
     gpu.Synchronize();
     const double layer_ms = std::chrono::duration<double, std::milli>(

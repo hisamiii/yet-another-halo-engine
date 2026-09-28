@@ -246,7 +246,9 @@ argmax) and the IQ3_S/IQ3_XXS grid/ksigns tables.
 `Qwen35Config` for the layer schedule, picks the HAL per tensor from its type,
 host-dequantizes the embedding (Q4_K and IQ4_XS), and runs the same 64-layer
 prefill. It runs the IQ4_XS shard through every layer whose format is ported and
-stops at `blk.3.ffn_gate.weight`, whose type is IQ2_XXS.
+stops at `blk.3.ffn_gate.weight`, whose type is IQ2_XXS. Its layers 0-2 match
+the HIP shard dumps to max_abs ~0.026-0.029, mean ~1e-04, so the mixed-format
+GEMM/swiglu selection is correct on real data.
 
 The two formats still missing a port are the only thing between this driver and a
 full IQ4_XS-shard run: **IQ2_XXS** (3 FFN gate/up tensors) and **Q2_K** (1
