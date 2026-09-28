@@ -1,0 +1,116 @@
+// YAH FFN GEMM residual epilogue, Loom port of HalfPrefillGemmKernel<kResidual>.
+//
+// HIP source: prefill_fp16.hip. The same GEMM as yah_ffn_gemm_f16
+// (out[t][m] = sum_k W[m][k] * A[t][k], token-major) with the accumulator added
+// into the existing f32 residual rows in place instead of overwriting them:
+//
+//   y[token*m + row] += acc[row][token]
+//
+// This is the arm the down projection uses in forward.hip
+// (LaunchBatchedQuantGEMMResidualFp16), three times per prefill layer. Only the
+// epilogue differs from the store arm, so the K loop and schedule are unchanged.
+// The residual fragment loads with the same result layout the accumulator
+// already has, so the add is a register operation and needs no scratch or
+// barrier.
+//
+// Layout: as in yah_ffn_gemm_f16, HIP writes token-major y[token*m + row], so
+// the destination is a strided view as [1, 17408].
+//
+// The correctness case is layout-sensitive in the same way: the weight varies
+// with output-row parity, the residual starts at a period-2 iota, and the
+// expected value is the sum of the two.
+//
+// Required config: --config=yah_ffn_gemm_residual.m_tiles=1088
+amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+
+config.decl @yah_ffn_gemm_residual.m_tiles : %value: index where [range(%value, 1, 4096)]
+
+config.def @yah_ffn_gemm_residual.depth = 3 : index
+
+config.def @yah_ffn_gemm_residual.unroll = 2 : index
+
+kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_residual() {
+  %unit = index.constant 1 : index
+  %m_tiles = config.get @yah_ffn_gemm_residual.m_tiles : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%m_tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%weight: buffer, %input: buffer, %output: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c5120 = index.constant 5120 : index
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %k = index.constant 16 : index
+
+  // Activation viewed [k][t]: element (k,t) is A[t][k] = base + t*5120 + k.
+  %a_layout = encoding.layout.strided [1, 5120] : encoding<layout>
+  // HIP stores its result token-major, y[token*m + row], for coalesced
+  // stores. A default row-major view would write out[row][token] instead,
+  // which is a different layout from the HIP kernel. The strided layout
+  // gives element (row,token) the address token*17408 + row without a
+  // transposed register copy.
+  %out_layout = encoding.layout.strided [1, 17408] : encoding<layout>
+
+  %weight_noalias, %input_noalias, %output_noalias = buffer.assume.noalias %weight, %input, %output : buffer, buffer, buffer
+  %w_view = buffer.view %weight_noalias[%base] : buffer -> view<17408x5120xf16>
+  %a_t_view = buffer.view %input_noalias[%base] : buffer -> view<5120x64xf16, %a_layout>
+  %out_view = buffer.view %output_noalias[%base] : buffer -> view<17408x64xf32, %out_layout>
+
+  %wg_x = kernel.workgroup.id<x> : index
+  %m_origin = index.mul %wg_x, %c16 : index
+
+  %depth = config.get @yah_ffn_gemm_residual.depth : index
+  %factor = config.get @yah_ffn_gemm_residual.unroll : index
+
+  %zeros = vector.constant 0.0 : vector<8xf32>
+  %init = vector.fragment<init> %zeros shape [%m, %n] : vector<8xf32>
+  %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %c5120 step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) pipeline(%depth) unroll(%factor) schedule(recurrence) {
+    %lhs = vector.fragment.load<lhs> %w_view[%m_origin, %kk] shape [%m, %k] : view<17408x5120xf16> -> vector<16xf16>
+    %rhs0 = vector.fragment.load<rhs> %a_t_view[%kk, %c0] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs1 = vector.fragment.load<rhs> %a_t_view[%kk, %c16] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs2 = vector.fragment.load<rhs> %a_t_view[%kk, %c32] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs3 = vector.fragment.load<rhs> %a_t_view[%kk, %c48] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %n0 = vector.mma %lhs, %rhs0, %a0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %n1 = vector.mma %lhs, %rhs1, %a1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %n2 = vector.mma %lhs, %rhs2, %a2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %n3 = vector.mma %lhs, %rhs3, %a3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    scf.yield %n0, %n1, %n2, %n3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+  // In-place residual add: y[row][t] += acc[row][t]. The residual load uses the
+  // result fragment layout, the same one the accumulator carries.
+  %res0 = vector.fragment.load<result> %out_view[%m_origin, %c0] shape [%m, %n] : view<17408x64xf32, %out_layout> -> vector<8xf32>
+  %res1 = vector.fragment.load<result> %out_view[%m_origin, %c16] shape [%m, %n] : view<17408x64xf32, %out_layout> -> vector<8xf32>
+  %res2 = vector.fragment.load<result> %out_view[%m_origin, %c32] shape [%m, %n] : view<17408x64xf32, %out_layout> -> vector<8xf32>
+  %res3 = vector.fragment.load<result> %out_view[%m_origin, %c48] shape [%m, %n] : view<17408x64xf32, %out_layout> -> vector<8xf32>
+  %sum0 = vector.addf %res0, %acc0 : vector<8xf32>
+  %sum1 = vector.addf %res1, %acc1 : vector<8xf32>
+  %sum2 = vector.addf %res2, %acc2 : vector<8xf32>
+  %sum3 = vector.addf %res3, %acc3 : vector<8xf32>
+  vector.fragment.store<result> %sum0, %out_view[%m_origin, %c0] shape [%m, %n] : vector<8xf32>, view<17408x64xf32, %out_layout>
+  vector.fragment.store<result> %sum1, %out_view[%m_origin, %c16] shape [%m, %n] : vector<8xf32>, view<17408x64xf32, %out_layout>
+  vector.fragment.store<result> %sum2, %out_view[%m_origin, %c32] shape [%m, %n] : vector<8xf32>, view<17408x64xf32, %out_layout>
+  vector.fragment.store<result> %sum3, %out_view[%m_origin, %c48] shape [%m, %n] : vector<8xf32>, view<17408x64xf32, %out_layout>
+  kernel.return
+}
+
+check.case public @yah_ffn_gemm_residual_case {
+  // weight[row][k] = (row*5120 + k) mod 10240 = 5120*(row mod 2) + k, input
+  // uniform, so the accumulator is 13104640 on even rows and 39319040 on odd
+  // rows. The residual starts at 1000 on even flat indices and 3000 on odd, and
+  // HIP addresses it token-major, so the flat index parity is the row parity and
+  // the expected is a period-2 iota: 13105640 / 39322040. Adding instead of
+  // overwriting is what makes the result 1000 and 3000 larger than the store
+  // arm.
+  %weight = check.generate.iota offset(0.0) step(1.0) period(10240) : tensor<17408x5120xf16>
+  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
+  %output = check.generate.iota offset(1000.0) step(2000.0) period(2) : tensor<17408x64xf32>
+  %expected = check.generate.iota offset(13105640.0) step(26216400.0) period(2) : tensor<17408x64xf32>
+  kernel.launch @yah_ffn_gemm_residual(%weight, %input, %output) : (tensor<17408x5120xf16>, tensor<64x5120xf16>, tensor<17408x64xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<17408x64xf32>
+  check.return
+}
+
+check.benchmark<@yah_ffn_gemm_residual_case> @yah_ffn_gemm_residual_bench

@@ -1,0 +1,120 @@
+// YAH FFN GEMM SwiGLU epilogue, Loom port of HalfPrefillGemmKernel<kSwiGLU>.
+//
+// HIP source: prefill_fp16.hip. The same GEMM as yah_ffn_gemm_f16, but the
+// output is fp16 and the epilogue combines the projection with the separate f32
+// gate-projection buffer:
+//
+//   out[token*m + row] = round_f16(silu(gate[token*m + row]) * acc[row][token])
+//
+// acc is this GEMM accumulator and gate is the f32 gate projection forward.hip
+// computed with the earlier kernel (LaunchBatchedQuantGEMMSwiGLUFp16). This is
+// the fallback arm the FFN takes when the paired gate/up kernel is not used.
+//
+// round_f16 is HIP RoundActivation = __float2half_rn, round to nearest even. The
+// fragment store performs the same narrowing at its boundary, so the payload
+// stays f32 through the activation and narrows on the way out.
+//
+// Layout: gate and output are token-major, the same strided [1, 17408] view the
+// store arm uses.
+//
+// The correctness case is uniform (weight, input and gate all 1.0), so the
+// accumulator is 5120 and the output is round_f16(silu(1) * 5120) = 3744. The
+// uniform case isolates the epilogue; the fragment indexing and the output
+// layout are pinned by yah_ffn_gemm_f16 and yah_ffn_gemm_residual_f32.
+//
+// Required config: --config=yah_ffn_gemm_swiglu.m_tiles=1088
+amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+
+config.decl @yah_ffn_gemm_swiglu.m_tiles : %value: index where [range(%value, 1, 4096)]
+
+config.def @yah_ffn_gemm_swiglu.depth = 3 : index
+
+config.def @yah_ffn_gemm_swiglu.unroll = 2 : index
+
+kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_swiglu() {
+  %unit = index.constant 1 : index
+  %m_tiles = config.get @yah_ffn_gemm_swiglu.m_tiles : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%m_tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%weight: buffer, %input: buffer, %gate: buffer, %output: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c5120 = index.constant 5120 : index
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %k = index.constant 16 : index
+
+  // Activation viewed [k][t]: element (k,t) is A[t][k] = base + t*5120 + k.
+  %a_layout = encoding.layout.strided [1, 5120] : encoding<layout>
+  // HIP stores its result token-major, y[token*m + row], for coalesced
+  // stores. A default row-major view would write out[row][token] instead,
+  // which is a different layout from the HIP kernel. The strided layout
+  // gives element (row,token) the address token*17408 + row without a
+  // transposed register copy.
+  %out_layout = encoding.layout.strided [1, 17408] : encoding<layout>
+
+  %weight_noalias, %input_noalias, %gate_noalias, %output_noalias = buffer.assume.noalias %weight, %input, %gate, %output : buffer, buffer, buffer, buffer
+  %w_view = buffer.view %weight_noalias[%base] : buffer -> view<17408x5120xf16>
+  %a_t_view = buffer.view %input_noalias[%base] : buffer -> view<5120x64xf16, %a_layout>
+  %gate_view = buffer.view %gate_noalias[%base] : buffer -> view<17408x64xf32, %out_layout>
+  %out_view = buffer.view %output_noalias[%base] : buffer -> view<17408x64xf16, %out_layout>
+
+  %wg_x = kernel.workgroup.id<x> : index
+  %m_origin = index.mul %wg_x, %c16 : index
+
+  %depth = config.get @yah_ffn_gemm_swiglu.depth : index
+  %factor = config.get @yah_ffn_gemm_swiglu.unroll : index
+
+  %zeros = vector.constant 0.0 : vector<8xf32>
+  %init = vector.fragment<init> %zeros shape [%m, %n] : vector<8xf32>
+  %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %c5120 step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) pipeline(%depth) unroll(%factor) schedule(recurrence) {
+    %lhs = vector.fragment.load<lhs> %w_view[%m_origin, %kk] shape [%m, %k] : view<17408x5120xf16> -> vector<16xf16>
+    %rhs0 = vector.fragment.load<rhs> %a_t_view[%kk, %c0] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs1 = vector.fragment.load<rhs> %a_t_view[%kk, %c16] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs2 = vector.fragment.load<rhs> %a_t_view[%kk, %c32] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs3 = vector.fragment.load<rhs> %a_t_view[%kk, %c48] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %n0 = vector.mma %lhs, %rhs0, %a0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %n1 = vector.mma %lhs, %rhs1, %a1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %n2 = vector.mma %lhs, %rhs2, %a2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %n3 = vector.mma %lhs, %rhs3, %a3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    scf.yield %n0, %n1, %n2, %n3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+  // SwiGLU epilogue in registers: out = round_f16(silu(gate) * acc). The gate
+  // fragment carries the result layout, so it aligns with the accumulator.
+  %g0 = vector.fragment.load<result> %gate_view[%m_origin, %c0] shape [%m, %n] : view<17408x64xf32, %out_layout> -> vector<8xf32>
+  %g1 = vector.fragment.load<result> %gate_view[%m_origin, %c16] shape [%m, %n] : view<17408x64xf32, %out_layout> -> vector<8xf32>
+  %g2 = vector.fragment.load<result> %gate_view[%m_origin, %c32] shape [%m, %n] : view<17408x64xf32, %out_layout> -> vector<8xf32>
+  %g3 = vector.fragment.load<result> %gate_view[%m_origin, %c48] shape [%m, %n] : view<17408x64xf32, %out_layout> -> vector<8xf32>
+  %silu0 = vector.siluf %g0 : vector<8xf32>
+  %silu1 = vector.siluf %g1 : vector<8xf32>
+  %silu2 = vector.siluf %g2 : vector<8xf32>
+  %silu3 = vector.siluf %g3 : vector<8xf32>
+  %act0 = vector.mulf %silu0, %acc0 : vector<8xf32>
+  %act1 = vector.mulf %silu1, %acc1 : vector<8xf32>
+  %act2 = vector.mulf %silu2, %acc2 : vector<8xf32>
+  %act3 = vector.mulf %silu3, %acc3 : vector<8xf32>
+  vector.fragment.store<result> %act0, %out_view[%m_origin, %c0] shape [%m, %n] : vector<8xf32>, view<17408x64xf16, %out_layout>
+  vector.fragment.store<result> %act1, %out_view[%m_origin, %c16] shape [%m, %n] : vector<8xf32>, view<17408x64xf16, %out_layout>
+  vector.fragment.store<result> %act2, %out_view[%m_origin, %c32] shape [%m, %n] : vector<8xf32>, view<17408x64xf16, %out_layout>
+  vector.fragment.store<result> %act3, %out_view[%m_origin, %c48] shape [%m, %n] : vector<8xf32>, view<17408x64xf16, %out_layout>
+  kernel.return
+}
+
+check.case public @yah_ffn_gemm_swiglu_case {
+  // Uniform operands: acc = 5120, gate = 1, so silu(1) = 0.7310586 and
+  // round_f16(0.7310586 * 5120) = round_f16(3743.02) = 3744. The f16 ULP at
+  // 3744 is 2, hence the atol.
+  %weight = check.generate.fill value(1.0) : tensor<17408x5120xf16>
+  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
+  %gate = check.generate.fill value(1.0) : tensor<17408x64xf32>
+  %output = check.generate.fill value(0.0) : tensor<17408x64xf16>
+  %expected = check.generate.fill value(3744.0) : tensor<17408x64xf16>
+  kernel.launch @yah_ffn_gemm_swiglu(%weight, %input, %gate, %output) : (tensor<17408x5120xf16>, tensor<64x5120xf16>, tensor<17408x64xf32>, tensor<17408x64xf16>)
+  check.expect.close actual(%output) expected(%expected) atol(2.0) rtol(0.0) nan(same) : tensor<17408x64xf16>
+  check.return
+}
+
+check.benchmark<@yah_ffn_gemm_swiglu_case> @yah_ffn_gemm_swiglu_bench

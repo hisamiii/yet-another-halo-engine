@@ -22,7 +22,10 @@ explicitly deferred.
 
 | Loom file | HIP source | kernel | status |
 | --- | --- | --- | --- |
-| yah_ffn_gemm_f16.loom | prefill_fp16.hip | batched f16 FFN GEMM | ported, 1.83-1.90 ms token-major (1.819 ms before the layout fix), ~1.35x behind HIP; parity check pins the output layout |
+| yah_ffn_gemm_f16.loom | prefill_fp16.hip | batched f16 FFN GEMM (kStore) | ported, 1.83-1.90 ms token-major (1.819 ms before the layout fix), ~1.35x behind HIP; parity check pins the output layout |
+| yah_ffn_gemm_residual_f32.loom | prefill_fp16.hip | FFN GEMM residual epilogue (kResidual) | ported, 2.046 ms; in-place add via a result-layout residual fragment load; parity check |
+| yah_ffn_gemm_swiglu_f16.loom | prefill_fp16.hip | FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 1.863 ms; silu(gate) * acc narrowed to fp16 at the fragment store; uniform check |
+| yah_ffn_gemm_gateup_f16.loom | prefill_fp16.hip | paired gate/up GEMM with SwiGLU (kGateUp) | ported, 4.053 ms; two accumulator groups share one activation tile; uniform check |
 | yah_residual_add_f32.loom | prefill_residual.hip | batched residual add | ported, 0.0189 ms at 327680 elements |
 | yah_rmsnorm_f32.loom | prefill_norm.hip | batched RMSNorm | ported, 0.0821 ms at 64x5120 |
 | yah_perhead_rmsnorm_f32.loom | prefill_norm.hip | batched per-head RMSNorm | ported, 0.0154 ms at 8x4x128 |
@@ -121,10 +124,12 @@ explicitly deferred.
 
 The inventory below is a raw kernel count, not the work list. The active forward
 path is engine/model/forward.hip, and only kernels a live launcher can reach from
-there are worth porting. Every launch Prefill can make is covered by a Loom port
-except the two extra epilogue arms of HalfPrefillGemmKernel (SwiGLU and residual,
-plus the dual gate/up form). Those are the same kernel as yah_ffn_gemm_f16 with a
-different accumulator epilogue, not a separate kernel.
+there are worth porting. Every launch Prefill can make is now covered by a Loom
+port. HalfPrefillGemmKernel is the one HIP kernel that reaches the route through
+four epilogue arms, so it has four Loom ports: kStore (yah_ffn_gemm_f16),
+kResidual (yah_ffn_gemm_residual_f32), kSwiGLU (yah_ffn_gemm_swiglu_f16) and the
+paired kGateUp (yah_ffn_gemm_gateup_f16). With WmmaCausalAttention that closes
+the prefill route end to end.
 
 Reachability evidence for the entries that are not on that route:
 
@@ -464,3 +469,15 @@ Reachability evidence for the entries that are not on that route:
   address `token*17408 + row`, so a token-major output needs no transposed register
   copy. The store op annotation must repeat the layout (`view<17408x64xf32,
   %out_layout>`), exactly as the fragment-load annotations already do.
+
+- **`vector.fragment.load<result>` reads a buffer into the accumulator layout.**
+  The epilogues use it to pull the residual, the gate projection, or a previous
+  accumulator with the same fragment map the MMA produced, so the elementwise
+  combination stays in registers and needs no workgroup scratch or barrier.
+  `vector.fragment.store` narrows when the payload and the view element type
+  differ, which is exactly the `__float2half_rn` boundary HIP spells
+  `RoundActivation`; `vector.siluf` compiles with no fast-math modifier, so the
+  SwiGLU epilogue needs no manual `expf` recipe. `yah_ffn_gemm_residual_f32.loom`,
+  `yah_ffn_gemm_swiglu_f16.loom` and `yah_ffn_gemm_gateup_f16.loom` are the three
+  shapes. A paired kernel simply carries two accumulators through one K loop
+  (`scf.for` with eight results, which the parser accepts).
