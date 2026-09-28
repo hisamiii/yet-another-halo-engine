@@ -375,6 +375,44 @@ exceed the VGPR budget or the 1024-thread limit. With WMMA = WRS*WTS and LDS
 reads = WRS + WTS, an 8-accumulator tile needs 6 reads however it is split, so
 the current split is already the minimum for this shape.
 
+### This was already settled upstream
+
+Most of the section above re-derives a conclusion the reference engine's
+experiment log already records (gufo
+docs/models/qwen3.8-27b/EXPERIMENTS.md: the tile sweep, the double-buffering
+section and the wave64 section). Stated once here so it is not re-derived a
+third time:
+
+- **LDS is saturated in capacity, not in bandwidth.** 64 KiB per block is the
+  whole per-CU LDS, and that is what fixes one block per CU and 8 waves per SIMD.
+  The TA-busy counters read 26-45% of cycles, so the LDS *units* keep headroom
+  even though the allocation is full. Conflating those two is easy and wrong:
+  capacity saturation blocks double-buffering, unit headroom means extra reads
+  would not help.
+- **Occupancy is not what is binding.** The tile sweep, the BK sweep and the
+  wave arithmetic all agree.
+- **Double-buffering the staging is blocked by registers, not by LDS.** The
+  upstream variant table has the LDS arithmetic working and occupancy improving,
+  with the accumulator-and-operand VGPR pair running out.
+- **wave64 is not a lever.** wmma_f32_16x16x16_f16_w64 measures 48.50 TFLOPS
+  against w32's 48.35 -- the same 4096 MACs issued over two cycles, half the
+  accumulator registers and no throughput.
+- **The inner loop cannot be widened.** LDS reads per WMMA are
+  (WRS + WTS) / (WRS * WTS). For an 8-accumulator tile that is 0.75 per lane
+  fragment, 1.62 measured ds_read per WMMA, and it can only fall by adding
+  accumulators -- the same register wall.
+
+So the fp16 prefill efficiency question is closed at ~66% of a 48.3 TFLOPS
+ceiling, and it was closed before this page was written.
+
+What this page adds is the other half of the int4 decision. The upstream log
+calls int4 a quality decision without pricing it, and notes it is eligibility
+bound on these shards (Q4_K and Q3_K only, ~15.6% of the 3.84 bpw artifact).
+Priced above: four-bit activations alone cost +3.52% perplexity, and the IQ3/IQ4
+FFN tensors are non-uniform codebooks that would have to be requantized to
+uniform int4 on top. Both halves of the int4 trade are now measured, and it
+loses on this artifact.
+
 ### The int4 lever is priced, and it is expensive
 
 int4 WMMA is the only measured lever above 1.5x on this part -- 52.6 TMAC/s,
