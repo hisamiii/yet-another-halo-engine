@@ -47,7 +47,8 @@ explicitly deferred.
 | yah_dequant_q8k_bf16.loom | prefill_gemm.hip | Q8_K weight dequant to bf16 | ported, 0.0076 ms; exact periodic expectation |
 | yah_dequant_q8_0_bf16.loom | prefill_gemm.hip | Q8_0 weight dequant to bf16 | ported, 0.0081 ms; exact periodic expectation |
 | yah_dequant_q5k_bf16.loom | prefill_gemm.hip | Q5_K dequant to bf16 (packed 6-bit scales) | ported, 0.0078 ms; bit-exact via `check.tensor.view` |
-| - | prefill_gemm.hip | Q6_K dequant to bf16, generic sub-16 element decoder | todo |
+| yah_dequant_q6k_bf16.loom | prefill_gemm.hip | Q6_K dequant to bf16 | ported, 0.0638 ms; bit-exact via `check.tensor.view` |
+| - | prefill_gemm.hip | generic sub-16 element decoder to bf16 | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
@@ -63,7 +64,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 33 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 34 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -222,6 +223,12 @@ profile gives one, so the expensive paths move first rather than the convenient 
   then `check.expect.equal` against the fixture. This made the Q5_K port checkable
   exactly, and it also confirmed that `scalar.fptrunc f32 to bf16` and
   `hip_bfloat16(float)` round identically (round to nearest even).
+- **Split a power-of-two index division into loop levels instead of dividing.**
+  `index.div` by a constant lowers to `index.shrui`, which the AMDGPU register-unit
+  constraint rejects. The Q6_K decoder needs `segment & 1`, `segment >> 1` and
+  `lane / 16`; writing the element loop as nested passes over `seg_hi`, `seg_lo`,
+  `l16` and `lane16` supplies all three as loop variables and removes the division
+  entirely. The Q5_K decoder does the same for its `/64` and `/32`.
 - **Re-tile a tuned kernel freely for the first port; say so in the header.**
   `BatchedDeltaNetRowSplitKernel` is templated over four orthogonal tile choices
   with DPP reductions and LDS staging. The port picks the instantiation whose
