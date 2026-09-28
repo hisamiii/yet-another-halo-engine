@@ -74,6 +74,9 @@ explicitly deferred.
 | yah_ffn_gemm_iq3xxs_residual_f32.loom | prefill_fp16.hip | IQ3_XXS FFN GEMM residual epilogue (kResidual) | ported, 18.11 ms at m_tiles=1088 |
 | yah_ffn_gemm_iq4nl_residual_f32.loom | prefill_fp16.hip | IQ4_NL FFN GEMM residual epilogue (kResidual) | ported, 15.61 ms at m_tiles=1088 |
 | yah_ffn_gemm_iq4xs_gateup_f16.loom | prefill_fp16.hip | paired gate/up IQ4_XS GEMM with SwiGLU (kGateUp) | ported, 24.17 ms at m_tiles=1088; same-format paired arm, expectation at atol 0.005 |
+| yah_ffn_gemm_q5k_gateup_f16.loom | prefill_fp16.hip | paired gate/up Q5_K GEMM with SwiGLU (kGateUp) | ported, 29.30 ms at m_tiles=1088; same-format, 6 layers |
+| yah_ffn_gemm_q3k_gateup_f16.loom | prefill_fp16.hip | paired gate/up Q3_K GEMM with SwiGLU (kGateUp) | ported, 25.49 ms at m_tiles=1088; same-format, 3 layers |
+| yah_ffn_gemm_q6k_gateup_f16.loom | prefill_fp16.hip | paired gate/up Q6_K GEMM with SwiGLU (kGateUp) | ported, 29.80 ms at m_tiles=1088; same-format, 1 layer |
 | yah_ffn_gemm_iq2xs_f32.loom | prefill_fp16.hip | batched IQ2_XS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 19.85 ms at m_tiles=1088; grid passed as i32 word pairs of the 64-bit entries |
 | yah_ffn_gemm_iq2s_f32.loom | prefill_fp16.hip | batched IQ2_S FFN GEMM, in-kernel grid+qs-sign decode (kStore) | ported, 12.02 ms at m_tiles=1088; grid passed as i32 word pairs, signs from the qs bytes | 
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
@@ -199,9 +202,27 @@ format work is the epilogue combinations. Every format now has a kStore port,
 and the residual epilogue now has a format-faithful port for every down format
 (Q4_K, Q5_K, Q3_K, Q6_K, IQ4_XS, IQ3_S, IQ3_XXS, IQ4_NL). A residual/SwiGLU/paired
 arm is the same epilogue loop over a format decode arm, so the risky decode work
-is done. The same-format paired gate/up arm is ported for f16/Q4_K and now IQ4_XS;
-the prefill route still needs the mixed gate/up pairs and the standalone kSwiGLU
-arm.
+is done. The gate/up pairing bounds the paired-arm work. Grouping the 65 layers by their
+(ffn_gate type, ffn_up type) gives 38 same-format and 27 mixed layers:
+
+| gate + up | layers | | gate + up | layers |
+|---|---|---|---|---|
+| IQ4_XS + IQ4_XS | 26 | | IQ3_S + Q3_K | 1 |
+| IQ4_XS + Q4_K | 7 | | IQ3_S + Q4_K | 1 |
+| Q5_K + Q5_K | 6 | | IQ4_XS + IQ3_S | 1 |
+| Q4_K + IQ4_XS | 4 | | IQ3_XXS + IQ4_XS | 1 |
+| IQ3_S + IQ4_XS | 3 | | IQ3_XXS + IQ3_S | 1 |
+| Q3_K + Q3_K | 3 | | Q3_K + IQ3_XXS | 1 |
+| Q4_K + Q4_K | 2 | | IQ3_XXS + Q3_K | 1 |
+| Q3_K + IQ3_S | 2 | | IQ4_XS + IQ4_NL | 1 |
+| IQ2_XS + IQ2_S | 1 | | Q4_K + Q5_K | 1 |
+| Q6_K + Q6_K | 1 | | Q5_K + Q6_K | 1 |
+
+Same-format paired ports now exist for f16/Q4_K, IQ4_XS, Q5_K, Q3_K and Q6_K,
+covering 38 of the 65 layers. The 27 mixed layers spread over 15 one-off or
+small pairs, dominated by IQ4_XS+Q4_K (7) and Q4_K+IQ4_XS (4). A mixed port
+needs two per-operand block sizes (gate and up weight views, stages and decode
+constants all diverge), which is the same builder with per-operand constants.
 
 Reachability evidence for the entries that are not on that route:
 
