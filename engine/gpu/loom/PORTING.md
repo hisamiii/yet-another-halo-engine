@@ -44,8 +44,10 @@ explicitly deferred.
 | yah_pack_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV pack (fp16 + f32) | ported, 0.0073 ms; exact fixtures |
 | yah_sync_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV f32->fp16 prefix sync | ported, 0.0076 ms; exact fixtures |
 | yah_pack_attn_heads_f16.loom | attention_wmma.hip | pack K/V into WMMA head tiles (LDS V transpose) | ported, 0.0079 ms; fp16 fixture |
-| yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0111 ms; exact, no fixture |
-| yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0090 ms; exact, no fixture |
+| yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
+| yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
+| yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
+| yah_rope_ptr_f32.loom | rope.hip | RoPE from a device position pointer, identity at pos 0 | ported, 0.0064 ms; exact, no fixture |
 | - | prefill_attention*.hip, attention_wmma.hip, attention_decode*.hip | WMMA/tiled attention compute, decode-online, split-K, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
@@ -104,7 +106,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 74 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 76 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -124,7 +126,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
 | sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm). **todo**: linear/sorted sampling, the speculative segment set, the Partial/MapIndices argmax arms |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
-| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both). **todo**: RoPEPtr, EmbeddingLookupPtr, FastFusedSwiGLUGEMVBlockKernel |
+| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 arm). **todo**: FastFusedSwiGLUGEMVBlockKernel, the non-f32 lookup arms |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 
@@ -382,3 +384,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
   `element at index 16 (0) is not close to expected (1)`.
 - **`index.min`/`index.max` exist; there is no `index.minui`.** The index type is
   unsigned by default, so `index.min %a, %b : index` is the clamp.
+- **An index cast up from `i32` needs a lower clamp too.** `index.cast %i32 : i32 to
+  index` can carry a negative value, and the footprint verifier then fails
+  `SUBRANGE/023` on the origin. `index.max %v, %c0` before `index.min` bounds it
+  (`yah_embed_ptr_f32.loom` reads its token from a device `i32`).
