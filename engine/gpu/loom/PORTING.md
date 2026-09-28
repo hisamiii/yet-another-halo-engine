@@ -75,12 +75,14 @@ explicitly deferred.
 | yah_vision_patchify_bf16.loom | vision/encoder.hip | patch embedding (image to 16x16 patches) | ported, 0.0070 ms; bit-exact vs fixture |
 | yah_vision_inject_rows_f32.loom | vision/device_input.hip | embedding row injection (broadcast hc) | ported, 0.0065 ms; exact fixture |
 | yah_gemv_f32.loom | gemv.hip | decode GEMV, f32 weight path | ported, 0.0063 ms; exact, no fixture; bf16 path todo |
+| yah_rmsnorm_decode_f32.loom | norm.hip | decode RMSNorm (single row) | ported, 0.0065 ms; exact, no fixture |
+| yah_perhead_rmsnorm_decode_f32.loom | norm.hip | decode per-head RMSNorm | ported, 0.0070 ms; exact, no fixture |
 | - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | todo |
 
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 50 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 52 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -100,7 +102,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
 | sampling | sample.hip | 13 more kernels: batched argmax, sparse penalties, linear/sorted sampling, and the speculative segment set |
 | vision | vision/encoder.hip, vision/device_input.hip | **ported**: Finish, BiasResidual, LayerNorm, Softmax, AttentionRows, Patchify, InjectRows. **todo**: PatchPosition, QkvRope, Activate |
-| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip. **todo**: the Ptr and remaining decode-side variants, FastFusedSwiGLUGEMVBlockKernel |
+| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both). **todo**: RoPEPtr, EmbeddingLookupPtr, FastFusedSwiGLUGEMVBlockKernel |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 
