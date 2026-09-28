@@ -21,7 +21,7 @@ explicitly deferred.
 | yah_residual_add_f32.loom | prefill_residual.hip | batched residual add | ported, 0.0189 ms at 327680 elements |
 | yah_rmsnorm_f32.loom | prefill_norm.hip | batched RMSNorm | ported, 0.0821 ms at 64x5120 |
 | - | prefill_norm.hip | per-head RMSNorm | todo |
-| - | prefill_swiglu.hip | SwiGLU activation (packed and split) | todo |
+| yah_swiglu_f32.loom | prefill_swiglu.hip | SwiGLU activation (split form) | ported, 0.0126 ms at 327680 elements |
 | - | prefill_rope.hip | RoPE | todo |
 | - | prefill_embed.hip | embedding lookup | todo |
 | - | prefill_unpack.hip | QG unpack | todo |
