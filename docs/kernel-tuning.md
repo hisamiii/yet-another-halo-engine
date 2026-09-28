@@ -953,9 +953,37 @@ the driver either. The two costs simply match: the second staging region costs
 12.60 - 8.76 = **3.84 ms**. Staging through LDS and re-reading from global are the
 same price here, which is why the second region cannot be removed for free.
 
-It can be removed for *zero* net cost, though, which frees 32 KiB of the 64 KiB
-LDS budget -- enough to double BK for the weight tile alone. Whether that pays is
-untested.
+### Spending the freed LDS: tested, and it buys nothing
+
+Removing the activation staging frees 32 KiB of the 64 KiB budget, and the weight
+tile alone is BK * RS * 16 * 16 halves, so BK=8 is exactly the whole budget. That
+halves the stage count and with it the barriers and the per-stage commit
+overhead, at unchanged total byte traffic. It was measured twice:
+
+| arm | session A (mean) | session B (mean) |
+| --- | ---: | ---: |
+| full BK=4 (production) | 11.50 | 12.74 |
+| globalB BK=4 | 11.83 | 12.77 |
+| globalB BK=8 w4n8 | **11.11** (won 3 of 3 rounds) | 13.16 (won 1 of 4) |
+| globalB BK=8 w8n4 | 11.65 | -- |
+| noStoreB floor | 8.24 | 8.97 |
+
+Session A read as a 3.4% win over production and session B reverses it. The effect
+is smaller than the between-session drift, so **it is not established** and the
+apparent win in session A was noise. BK=8 on its own (w8n4) is neutral, so the
+depth is not paying for itself even where it fits.
+
+The same freed budget makes BK=4 genuinely double buffered for the first time (two
+32 KiB weight buffers), which is the configuration the original double-buffer
+attempt could never reach. It is a **2x regression**: 24.0 ms against 12.7 for the
+single-buffered control, in every round. Unrolling the stage loop by two to make
+the buffer index compile-time duplicates a BK=4 K loop twice over, and the result
+is instruction-bound rather than store-bound. Double buffering is now closed at
+BK=2, at BK=4 with a runtime index, and at BK=4 unrolled.
+
+**Net result:** the second staging region can be replaced at parity, and the LDS it
+frees has no configuration that reliably beats the current design. The activation
+staging stays.
 
 **Falsifier:** if a variant that keeps both staging arrays separate and spends the
 freed LDS on more K depth runs under the noStoreB floor (~8.5 ms at this shape),

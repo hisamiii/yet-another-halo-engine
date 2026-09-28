@@ -314,7 +314,12 @@ __launch_bounds__(WM * WN * 32) __global__
   constexpr bool UpRaw = UpType == gufo::core::GgmlType::kQ4_K ||
                          UpType == gufo::core::GgmlType::kQ5_K;
   constexpr int BK = BKDepth, WaveSize = 32;
-  static_assert(BK >= 1 && BK <= 4, "BKDepth out of range");
+  // BK > 4 only fits when the activation tile is not staged: at BM=BN=256 the
+  // weight tile alone is BK * RS * 16 * 16 halves, so BK=8 is the whole 64 KiB
+  // budget and the unused s_b is elided (ablation 1048576).
+  static_assert(BK >= 1 && BK <= 8, "BKDepth out of range");
+  static_assert((Ablate & 1048576) != 0 || BK <= 4,
+                "BK > 4 needs the activation tile to come from global");
   // A 256-weight Q5 block spans four K64 iterations. Keep its header in
   // registers for the Q5 and Q4/Q5 kernels that benefit from this reuse.
   constexpr bool CacheQ5Header = BM == 256 && BN == 256 &&
@@ -402,8 +407,8 @@ __launch_bounds__(WM * WN * 32) __global__
   const short* b_blocked = (Ablate & 1048576) != 0
                                ? static_cast<const short*>(up)
                                : nullptr;
-  static_assert(!(DblBuf && (Ablate & 1048576) != 0),
-                "GlobalB and DblBuf are separate experiments");
+  // GlobalB and DblBuf combine to the configuration that never fit before: with
+  // only the weight tile staged, BK=4 double buffering is 2 * 32 KiB = 64 KiB.
 
   v8f acc[WRS][WTS] = {};
 
@@ -692,7 +697,7 @@ __launch_bounds__(WM * WN * 32) __global__
     // pointers into s_a are not provably disjoint and the compiler still emits
     // `s_waitcnt lgkmcnt(0)` before the barrier, which is why the runtime-index
     // version of this measured no faster than the single buffer.
-    const auto kloop = [&]<int Buf>() {
+    const auto kloop = [&]<int Buf>(int ks0base) {
       constexpr int buf = Buf;
 #pragma unroll
       for (int ks = 0; ks < BK; ++ks) {
@@ -701,10 +706,18 @@ __launch_bounds__(WM * WN * 32) __global__
         for (int i = 0; i < WRS; ++i)
           a[i] =
               LoadSwizzled(&s_a[buf][ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
+        const short* bbase = nullptr;
+        if constexpr ((Ablate & 1048576) != 0)
+          bbase = b_blocked + (static_cast<std::size_t>(ks0base + ks) * batch +
+                               t_block + (sl ^ (ks & 3))) *
+                                  16;
 #pragma unroll
         for (int j = 0; j < WTS; ++j) {
-          const v16bf b =
-              LoadSwizzled(&s_b[buf][ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
+          v16bf b;
+          if constexpr ((Ablate & 1048576) != 0)
+            b = LoadBlockedBAt(bbase + (j * 256));
+          else
+            b = LoadSwizzled(&s_b[buf][ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
 #pragma unroll
           for (int i = 0; i < WRS; ++i) {
             if constexpr (Type == gufo::core::GgmlType::kIQ3_S)
@@ -723,19 +736,19 @@ __launch_bounds__(WM * WN * 32) __global__
         fetch(ks0 + BK);
         commit(1);
       }
-      kloop.template operator()<0>();
+      kloop.template operator()<0>(ks0);
       __syncthreads();
       if (ks0 + 2 * BK < ksteps) {
         fetch(ks0 + 2 * BK);
         commit(0);
       }
-      kloop.template operator()<1>();
+      kloop.template operator()<1>(ks0);
       __syncthreads();
       ks0 += 2 * BK;
     }
     // An odd stage count leaves the last stage in buffer 0, committed above.
     if (ks0 < ksteps) {
-      kloop.template operator()<0>();
+      kloop.template operator()<0>(ks0);
       __syncthreads();
     }
   } else {
