@@ -41,7 +41,9 @@ explicitly deferred.
 | yah_qdq_f16.loom | engine/kv/kv_quant.hip | fp16 quantize/dequantize over 32-element blocks | ported, 0.0434 ms at 10240 blocks (327680 f16) |
 | yah_kv_quant_q8_f16.loom | engine/kv/kv_quant.hip | KV cache pack to q8 blocks | ported, 0.0260 ms at 10240 blocks; byte-exact vs fixture |
 | yah_kv_dequant_q8_f16.loom | engine/kv/kv_quant.hip | KV cache unpack from q8 blocks | ported, 0.0275 ms at 10240 blocks; byte-exact vs fixture |
-| - | engine/kv/kv_quant.hip | q4 packed block format, quantize + dequantize | todo |
+| yah_kv_quant_q4_f16.loom | engine/kv/kv_quant.hip | KV cache pack to q4 blocks | ported, 0.0266 ms at 10240 blocks; byte-exact vs fixture |
+| yah_kv_dequant_q4_f16.loom | engine/kv/kv_quant.hip | KV cache unpack from q4 blocks | ported, 0.0239 ms at 10240 blocks; byte-exact vs fixture |
+| - | engine/kv/kv_quant.hip | in-place Hadamard over an fp16 KV block | todo (fp32 variant ported) |
 | - | vision/encoder.hip, device_input.hip | vision tower | todo |
 
 ## Notes carried over from the FFN GEMM port

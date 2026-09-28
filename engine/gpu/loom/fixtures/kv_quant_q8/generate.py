@@ -85,6 +85,45 @@ def unpack(d, q):
     return (scale[:, None] * value).astype(np.float16)
 
 
+Q4_LEVELS = np.float32(7.0)
+
+
+def pack_q4(x16):
+    """x16: (blocks, 32) float16 -> (packed bytes, scale f16, nibbles uint8 (blocks,16))."""
+    xf = x16.astype(np.float32)
+    amax = np.max(np.abs(xf), axis=1).astype(np.float32)
+    scale = np.where(amax > 0, (amax / Q4_LEVELS).astype(np.float32), np.float32(0))
+    divisor = np.where(scale > 0, scale, np.float32(1.0)).astype(np.float32)
+    inverse = np.where(scale > 0, (np.float32(1.0) / divisor).astype(np.float32),
+                       np.float32(0))
+    product = (xf * inverse[:, None]).astype(np.float32)
+    wide = product.astype(np.float64)
+    ties = int(np.count_nonzero(np.abs(np.abs(wide - np.trunc(wide)) - 0.5) < 1e-9))
+    if ties:
+        print('  %d q4 rounding tie(s); ties-away-from-zero is required' % ties)
+    q = np.where(wide >= 0, np.floor(wide + 0.5), np.ceil(wide - 0.5))
+    q = np.clip(q, -8, 7).astype(np.int32)
+    # KvQ4Block stores element 2k in the low nibble and 2k+1 in the high nibble,
+    # two's complement, so the low nibble of the byte holds the even element.
+    nibbles = (q & 0x0F).astype(np.uint8)
+    packed_nibbles = nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)
+    d = scale.astype(np.float16)
+    d_bytes = np.frombuffer(d.tobytes(), dtype=np.uint8).reshape(-1, 2)
+    packed = np.concatenate([d_bytes, packed_nibbles], axis=1).reshape(-1)
+    return packed.astype(np.int8), d, packed_nibbles
+
+
+def unpack_q4(d, packed_nibbles):
+    """Decodes the nibbles it is given, so a packing error is visible here too."""
+    low = (packed_nibbles & 0x0F).astype(np.int32)
+    high = (packed_nibbles >> 4).astype(np.int32)
+    signed = np.empty((packed_nibbles.shape[0], BLOCK), dtype=np.int32)
+    signed[:, 0::2] = np.where(low >= 8, low - 16, low)
+    signed[:, 1::2] = np.where(high >= 8, high - 16, high)
+    scale = d.astype(np.float32)
+    return (scale[:, None] * signed.astype(np.float32)).astype(np.float16)
+
+
 def main():
     varied_input = varied(4)
     packed, d, q = pack(varied_input)
@@ -102,6 +141,20 @@ def main():
     print('  uniform fill=%s scale=%s codes[0]=%s' % (float(fill), d[0], q[0][0]))
     print('  uniform round trip exact: %s'
           % bool(np.array_equal(unpack(d, q).reshape(-1), uniform_input.reshape(-1))))
+
+    packed4, d4, nib4 = pack_q4(varied_input)
+    save('q4_expected_varied.npy', packed4)
+    save('q4_dequant_varied_expected.npy', unpack_q4(d4, nib4).reshape(-1))
+    print('  q4 block 0 scale=%s nibbles=%s' % (d4[0], nib4[0][:4]))
+    print('  q4 block 2 scale=%s nibbles=%s' % (d4[2], nib4[2][:4]))
+
+    packed4, d4, nib4 = pack_q4(uniform_input)
+    save('q4_expected_uniform.npy', packed4)
+    save('q4_dequant_uniform_expected.npy', unpack_q4(d4, nib4).reshape(-1))
+    print('  q4 uniform scale=%s nibbles=%s' % (d4[0], nib4[0][:4]))
+    print('  q4 uniform round trip exact: %s'
+          % bool(np.array_equal(unpack_q4(d4, nib4).reshape(-1),
+                                uniform_input.reshape(-1))))
 
 
 if __name__ == '__main__':
