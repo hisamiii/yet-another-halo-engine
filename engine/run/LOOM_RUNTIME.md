@@ -65,6 +65,24 @@ and `LOOM PROBE PASS: out = 100 + 2*i for 8 elements`.
 
 ## 3. Tooling and runtime layer
 
+`engine/gpu/loom/emit_hal.py <file.loom> <outdir> <symbol=value> ...` is the
+production emission path. `iree-run-loom` has `--emit-only`/
+`--emit-hal-executable` but no `--config`; `iree-benchmark-loom` has `--config`
+but needs a matching `check.case` and dispatches. Neither emits a production
+shape whose case bindings are small. So `emit_hal.py` rewrites each
+`config.get @symbol` to a constant, drops the matching `config.decl`, and runs
+`iree-run-loom --emit-only`, which emits with no dispatch at all:
+
+```
+python3 engine/gpu/loom/emit_hal.py engine/gpu/loom/yah_gemv_q6k_f32.loom \
+  /tmp/emit_q6k_new yah_gemv_q6k.m_rows=17408 yah_gemv_q6k.k_blocks=20
+# -> /tmp/emit_q6k_new/yah_gemv_q6k_f32.hal
+```
+
+`engine/gpu/loom/emit_hal.sh` is the older case-backed variant (artifact bundle
+via the benchmark tool); it is only usable for configs the file already has a
+matching case for.
+
 - `engine/gpu/loom/emit_hal.sh <file.loom> <case> <bench> <outdir> [config=value ...]`
   wraps the benchmark artifact bundle and prints the `.hal` path.
 - `engine/model/loom_runtime.hpp` is the engine-facing HRX layer (no HIP):
