@@ -82,18 +82,45 @@ projections. `gemm_bench` measures components with synthetic weights, so the
 agreement is not a release measurement — but it removes the need for a free
 parameter to explain the aggregate.
 
-**The lever is the artifact, not the loop.** `gpu-tuning.md` already names the
-option: choose the quant family rather than accept a mixed shard. Converting
-the FFN tensors to Q4_K in place would be worth about 1.25x on FFN GEMM and so
-~1.16x on prefill for roughly 1 GiB more weights; a native all-Q4_K artifact
-gets the same rate without a second quantisation error but needs a download.
-Neither has been run.
+**Measured at the model level.** An existing pure-Q4_K artifact of the same
+model settles whether the component table composes
+(`/home/q/models/gufo-sweep/base_q4kpure.gguf`, 506 Q4_K tensors, 866 tensors,
+every shape identical). `--ids-file` 2048 tokens, `--chunk 2048`, `--repeat 1`,
+warm-up discarded, arm order alternated, a fixed 15 s gap and Tctl before every
+timed run:
 
-**Falsifier:** point the FFN weight table at synthetic Q4_K data of the same
-shapes and measure model prefill. Near 1.16x confirms the decoder attribution
-and the conversion route; near 1.0x means the aggregate is bound by something
-other than the weight decoder — most likely the non-FFN GEMMs or the clock —
-and the format lever is priced out.
+| rep | order | mixed IQ3/IQ4 (ms) | pure Q4_K (ms) | Q4_K |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | mix first | 3848.1 (55 °C) | 3554.1 (55 °C) | +8.3% |
+| 2 | Q4_K first | 3730.1 (53 °C) | 3490.2 (54 °C) | +6.9% |
+| 3 | mix first | 3662.6 (53 °C) | 3389.0 (53 °C) | +8.1% |
+| 4 | Q4_K first | 3729.8 (54 °C) | 3517.8 (53 °C) | +6.0% |
+
+Q4_K wins every rep in both orders: **+7.3% on the means**. The format is a real
+model-level lever, and the component table over-predicts it by about 2x.
+
+The two files differ in two ways and the second is ruled out: the pure file
+takes the dual gate/up kernel on **64/64** blocks against the mixed artifact's
+**9/64**, and raising the mixed one to 29/64 measures +1.5% with the sign
+flipping (section below). So the 7.3% is **decoder cost**.
+
+**That fixes the target, and it is not the artifact.** Requantizing the shard is
+out of scope by decision, so the only way to recover the 7.3% is the decoder:
+make the sub-8-bit paths in `HalfPrefillGemmKernel` decode as cheaply as
+Q4_K's. One structural difference is already visible and is the first thing to
+test — Q4_K/Q5_K/Q6_K/Q8_0 take the deferred-decode path (`DecodeStage == 2`,
+raw weight registers held across the pipeline), while every IQ3/IQ2 type takes
+`DecodeStage == 0` and decodes inline in the fetch stage
+(`prefill_fp16.hip` line 264). Flipping that for the IQ3 types is a one-line
+experiment, and the caveat is on record at line 262: deferring the decode
+changes the dot-product rounding, so it would need re-validating, not just
+re-measuring.
+
+**Falsifier:** set `DecodeStage = 2` for `IQ3_XXS`/`IQ3_S`/`IQ4_XS` and rerun
+the per-type sweep. If IQ3_XXS moves from 28.99 toward Q4_K's 38.05, the gap is
+decode *scheduling* and the 7.3% is available without touching the format. If it
+does not move, the gap is the decoder arithmetic itself and the work is a new
+decode routine.
 
 **This is clock, and the clock is a function of the kernel.** Efficiency per clock agrees to **0.3%** across the two harnesses that disagreed -- 0.0144 TF/MHz in both -- so there is no hidden code difference. The part has three SCLK levels (600 / 1408 / **2900 MHz**) and **never reaches the top one**: measured across power limits, 80 W gives 1799 MHz / 25.9 TF and 130 W gives 2016 MHz / 28.6 TF, work-per-clock is flat (0.0144, -1.5% between them), `gpu_busy` is ~85% at both, and the sampled maximum is 2221 MHz. The log's own line is that "what is broken is the conversion of watts into clock".
 
@@ -175,20 +202,24 @@ four mixed pairs took coverage to 29/64. The rest are `IQ3_S`-gated, which the
 paired epilogue excludes by `static_assert` because `IQ3_S` feeds the A
 operand instead of B.
 
-Order-alternated A/B at `--ids-file` 2048 tokens, `--chunk 2048`, f16 KV,
-`--repeat 2`, four reps:
+A first A/B of this used `--repeat 2` with no fixed gap, which is not the
+controlled protocol in [methodology.md](methodology.md): the arm that ran first
+won every rep and the sign tracked the order, so it could only say "no effect
+detected". Re-run under the protocol — every arm warmed and discarded, `-r 1`,
+arm order alternated, a fixed 15 s gap and Tctl before every timed run — on the
+same artifact, so the pairing is the only variable:
 
-| rep | order | paired 29 (ms) | paired 9 (ms) |
-| ---: | --- | ---: | ---: |
-| 1 | new first | 3822.9 | 4037.2 |
-| 2 | old first | 4162.7 | 4081.9 |
-| 3 | new first | 4165.0 | 4282.0 |
-| 4 | old first | 4135.6 | 3978.7 |
+| rep | order | paired 29 (ms) | paired 9 (ms) | new |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | new first | 3460.6 (50 °C) | 3481.3 (51 °C) | +0.6% |
+| 2 | old first | 3657.5 (53 °C) | 3479.9 (51 °C) | -4.9% |
+| 3 | new first | 3661.3 (53 °C) | 3799.8 (53 °C) | +3.6% |
+| 4 | old first | 3497.0 (53 °C) | 3752.8 (53 °C) | +6.8% |
 
-The arm that ran first won every rep (+5.3%, -2.0%, +2.7%, -3.9% for new), and
-the new-vs-old mean is **-0.5%**: the effect is run order, not code. The ~286 MB
-per layer of round-trip traffic is real but is ~2.7% of a chunk. The change was
-reverted. `YAH_PAIRED_STATS=1` was kept: it prints one character per block for
+The new-vs-old mean is **+1.5% with the sign flipping in both order arms**:
+nothing. The ~286 MB per layer of round-trip traffic is real but is ~2.7% of a
+chunk against a run-order effect of the same size. The change was reverted
+again. `YAH_PAIRED_STATS=1` was kept: it prints one character per block for
 the FFN gate/up projection, so coverage is confirmed rather than assumed — the
 same discipline that caught a split-K A/B that had silently run a stale binary.
 
