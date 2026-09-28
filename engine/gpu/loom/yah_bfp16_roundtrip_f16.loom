@@ -1,0 +1,112 @@
+// YAH bfp16 operand round trip, Loom port of Bfp16RoundTripFp16Kernel.
+//
+// HIP source: models/qwen/hip/kernels/prefill_fp16.hip. A diagnostic that measures
+// what the NPU path's shared-exponent operand encoder costs: every group of 8
+// consecutive fp16 activations is snapped in place to a grid with `bits` magnitude
+// bits,
+//
+//   amax     = max_i |f32(x[i])|
+//   exponent = frexp(amax) exponent      (amax = m * 2^exponent, m in [0.5, 1))
+//   step     = ldexp(1, exponent - bits) = 2^(exponent - bits)
+//   x[i]     = f16(rintf(f32(x[i]) / step) * step)
+//
+// and an all-zero group returns without touching the data.
+//
+// Neither `frexpf` nor `ldexpf` has an AMDGPU target contract, so both are rebuilt
+// from the fp32 exponent field: the exponent is (bits >> 23) & 0xFF minus the bias
+// adjustment 126, and the step is a normal fp32 with exponent field
+// (exponent - bits + 127) << 23. That assumes amax is a normal positive number and
+// that the step stays in normal range, which holds for activation magnitudes;
+// PORTING.md records the subnormal corners as uncovered.
+//
+// `rintf` rounds to nearest even in the default mode, which is `scalar.roundevenf`.
+//
+// Required config: --config=yah_bfp16.groups=2 --config=yah_bfp16.bits=3
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_bfp16.groups : %value: index where [range(%value, 1, 1048576)]
+config.decl @yah_bfp16.bits : %value: index where [range(%value, 1, 15)]
+
+kernel.def target(@yah_wave32) @yah_bfp16() {
+  %unit = index.constant 1 : index
+  %groups = config.get @yah_bfp16.groups : index
+  %workgroup_size = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %groups, %c255 : index
+  %tiles = index.div %biased, %workgroup_size : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%data: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c256 = index.constant 256 : index
+  %zero = scalar.constant 0.0 : f32
+  %zero_i = scalar.constant 0 : i32
+  %negzero_i = scalar.constant -0 : i32
+  %m23 = scalar.constant 23 : i32
+  %m255 = scalar.constant 255 : i32
+  %m126 = scalar.constant 126 : i32
+  %m127 = scalar.constant 127 : i32
+  %groups = config.get @yah_bfp16.groups : index
+  %bits_i0 = config.get @yah_bfp16.bits : index
+  %bits_i = index.cast %bits_i0 : index to i32
+  %count = index.mul %groups, %c8 : index
+  %data_view = buffer.view %data[%base] : buffer -> view<[%count]xf16>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %group = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %group, %groups : index
+  scf.if %in_range {
+    %eight = index.mul %group, %c8 : index
+    %amax = scf.for %i = [%c0 to %c8 step %c1](%a = %zero : f32) -> (f32) {
+      %off = index.add %eight, %i : index
+      %h = view.load %data_view[%off] : view<[%count]xf16> -> f16
+      %v = scalar.extf %h : f16 to f32
+      %av = scalar.absf %v : f32
+      %m = scalar.maxnumf %a, %av : f32
+      scf.yield %m : f32
+    }
+    %nonzero = scalar.cmpf ogt, %amax, %zero : f32
+    scf.if %nonzero {
+      %raw = scalar.bitcast %amax : f32 to i32
+      %shifted = scalar.shrui %raw, %m23 : i32
+      %field = scalar.andi %shifted, %m255 : i32
+      %exponent = scalar.subi %field, %m126 : i32
+      %exp_step = scalar.subi %exponent, %bits_i : i32
+      %biased_step = scalar.addi %exp_step, %m127 : i32
+      %step_bits = scalar.shli %biased_step, %m23 : i32
+      %step = scalar.bitcast %step_bits : i32 to f32
+      %sink = scf.for %j = [%c0 to %c8 step %c1](%mark = %zero_i : i32) -> (i32) {
+        %off2 = index.add %eight, %j : index
+        %h2 = view.load %data_view[%off2] : view<[%count]xf16> -> f16
+        %v2 = scalar.extf %h2 : f16 to f32
+        %q = scalar.divf %v2, %step : f32
+        %r = scalar.roundevenf %q : f32
+        %p = scalar.mulf %r, %step : f32
+        %out = scalar.fptrunc %p : f32 to f16
+        view.store %out, %data_view[%off2] : f16, view<[%count]xf16>
+        scf.yield %mark : i32
+      }
+    }
+  }
+  kernel.return
+}
+
+// Requires --config=yah_bfp16.groups=2 --config=yah_bfp16.bits=3.
+//
+// Two groups with different exponents (0.9 and 2.5) and values that are not
+// multiples of the step, so 13 of the 16 elements change and the step and rounding
+// are both observable. The expected array is the fixture read a second time, which
+// is legitimate here because the kernel edits in place: a separate expected tensor
+// is a distinct copy of the same bytes.
+check.case public @yah_bfp16_case {
+  %data = check.file.read.npy path("fixtures/bfp16_roundtrip/input_bfp16.npy") : tensor<16xf16>
+  %expected = check.file.read.npy path("fixtures/bfp16_roundtrip/expected_bfp16.npy") : tensor<16xf16>
+  kernel.launch @yah_bfp16(%data) : (tensor<16xf16>)
+  check.expect.close actual(%data) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<16xf16>
+  check.return
+}
+
+check.benchmark<@yah_bfp16_case> @yah_bfp16_bench
