@@ -1,0 +1,470 @@
+// YAH fused quantized QKV projection, Loom port of Wave32FusedQKVProjectionsKernel_1Row
+// for the Q4_K format (qkv.hip).
+//
+// One GEMV row per workgroup over a merged row space of q_dim + 2*kv_dim rows:
+// rows [0, q_dim) are the q projection, [q_dim, q_dim+kv_dim) the k projection and
+// the rest the v projection, each dotted against the same fp32 activation:
+//
+//   out[row] = sum_k q4k_decode(W, row, k) * x[k]
+//
+// HIP selects A and out_target once per row and then calls QuantWarpBlockDot. A
+// Loom kernel cannot select a buffer with one value, so each of the three row
+// bands gets its own scf.if branch with its own weight view, row index and output
+// view. The decoder is duplicated three times (_q, _k, _v); a decode fix has to be
+// applied to all three.
+//
+// Required config: --config=yah_qkv_q4k.q_dim=512
+//                  --config=yah_qkv_q4k.kv_dim=128
+//                  --config=yah_qkv_q4k.k_blocks=20
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_qkv_q4k.q_dim : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_qkv_q4k.kv_dim : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_qkv_q4k.k_blocks : %value: index where [range(%value, 1, 65536)]
+
+kernel.def target(@yah_wave32) @yah_qkv_q4k() {
+  %unit = index.constant 1 : index
+  %q_dim = config.get @yah_qkv_q4k.q_dim : index
+  %kv_dim = config.get @yah_qkv_q4k.kv_dim : index
+  %c32 = index.constant 32 : index
+  %c2 = index.constant 2 : index
+  %kv2 = index.mul %kv_dim, %c2 : index
+  %total = index.add %q_dim, %kv2 : index
+  kernel.launch.config workgroups(%total, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%q_w: buffer, %k_w: buffer, %v_w: buffer, %x: buffer, %q_out: buffer, %k_out: buffer, %v_out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c144 = index.constant 144 : index
+  %c256 = index.constant 256 : index
+  %c1440 = index.constant 1440 : index
+  %c2880 = index.constant 2880 : index
+  %c0i = scalar.constant 0 : i32
+  %c1i = scalar.constant 1 : i32
+  %c4i = scalar.constant 4 : i32
+  %c5i = scalar.constant 5 : i32
+  %c6i = scalar.constant 6 : i32
+  %c8i = scalar.constant 8 : i32
+  %c15i = scalar.constant 15 : i32
+  %c16i = scalar.constant 16 : i32
+  %c31i = scalar.constant 31 : i32
+  %c32i = scalar.constant 32 : i32
+  %c63i = scalar.constant 63 : i32
+  %c144i = scalar.constant 144 : i32
+  %c2880i = scalar.constant 2880 : i32
+  %zero = scalar.constant 0.0 : f32
+  %q_dim = config.get @yah_qkv_q4k.q_dim : index
+  %kv_dim = config.get @yah_qkv_q4k.kv_dim : index
+  %k_blocks = config.get @yah_qkv_q4k.k_blocks : index
+  %q_bytes = index.mul %q_dim, %c2880 : index
+  %q_halfs = index.mul %q_dim, %c1440 : index
+  %kv_bytes = index.mul %kv_dim, %c2880 : index
+  %kv_halfs = index.mul %kv_dim, %c1440 : index
+  %x_elems = index.mul %k_blocks, %c256 : index
+  %qw_last = index.sub %q_bytes, %c1 : index
+  %qw_half_last = index.sub %q_halfs, %c1 : index
+  %kw_last = index.sub %kv_bytes, %c1 : index
+  %kw_half_last = index.sub %kv_halfs, %c1 : index
+  %vw_last = index.sub %kv_bytes, %c1 : index
+  %vw_half_last = index.sub %kv_halfs, %c1 : index
+  %x_last = index.sub %x_elems, %c1 : index
+  %q_na, %k_na, %v_na, %x_na, %qo_na, %ko_na, %vo_na = buffer.assume.noalias %q_w, %k_w, %v_w, %x, %q_out, %k_out, %v_out : buffer, buffer, buffer, buffer, buffer, buffer, buffer
+  %qw_view = buffer.view %q_na[%base] : buffer -> view<[%q_bytes]xi8>
+  %qw_f16_view = buffer.view %q_na[%base] : buffer -> view<[%q_halfs]xf16>
+  %kw_view = buffer.view %k_na[%base] : buffer -> view<[%kv_bytes]xi8>
+  %kw_f16_view = buffer.view %k_na[%base] : buffer -> view<[%kv_halfs]xf16>
+  %vw_view = buffer.view %v_na[%base] : buffer -> view<[%kv_bytes]xi8>
+  %vw_f16_view = buffer.view %v_na[%base] : buffer -> view<[%kv_halfs]xf16>
+  %x_view = buffer.view %x_na[%base] : buffer -> view<[%x_elems]xf32>
+  %qo_view = buffer.view %qo_na[%base] : buffer -> view<[%q_dim]xf32>
+  %ko_view = buffer.view %ko_na[%base] : buffer -> view<[%kv_dim]xf32>
+  %vo_view = buffer.view %vo_na[%base] : buffer -> view<[%kv_dim]xf32>
+  %m = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %lane_i = index.cast %lane : index to i32
+  %qk = index.add %q_dim, %kv_dim : index
+  %is_q = index.cmp ult, %m, %q_dim : index
+  %is_k = index.cmp ult, %m, %qk : index
+  %row_k = index.sub %m, %q_dim : index
+  %row_v = index.sub %m, %qk : index
+  %q_sink = scf.if %is_q -> (f32) {
+    %acc_q = scf.for %kblk_q = [%c0 to %k_blocks step %c1](%a0_q = %zero : f32) -> (f32) {
+      %kblk_i_q = index.cast %kblk_q : index to i32
+      %row_q_i = index.cast %m : index to i32
+      %row_off_q = scalar.muli %row_q_i, %c2880i : i32
+      %blk_off0_q = scalar.muli %kblk_i_q, %c144i : i32
+      %blk_off_q = scalar.addi %row_off_q, %blk_off0_q : i32
+      %kblk256_q = scalar.shli %kblk_i_q, %c8i : i32
+      %acc1_q = scf.for %j_q = [%c0 to %c8 step %c1](%a1_q = %a0_q : f32) -> (f32) {
+        %j_i_q = index.cast %j_q : index to i32
+        %j32_q = scalar.shli %j_i_q, %c5i : i32
+        %i_i_q = scalar.addi %lane_i, %j32_q : i32
+        %gg_i_q = scalar.shrui %i_i_q, %c6i : i32
+        %wv_i_q = scalar.andi %i_i_q, %c63i : i32
+        %lane_dec_q = scalar.andi %wv_i_q, %c31i : i32
+        %wv_hi_q = scalar.shrui %wv_i_q, %c5i : i32
+        %is_low_q = scalar.cmpi slt, %wv_i_q, %c32i : i32
+        %qs0_q = scalar.addi %blk_off_q, %c16i : i32
+        %gg32_q = scalar.shli %gg_i_q, %c5i : i32
+        %qs1_q = scalar.addi %qs0_q, %gg32_q : i32
+        %qs2_q = scalar.addi %qs1_q, %lane_dec_q : i32
+        %qs_ix_q = index.cast %qs2_q : i32 to index
+        %qs_lo_q = index.max %qs_ix_q, %c0 : index
+        %qs_idx_q = index.min %qs_lo_q, %qw_last : index
+        %qb8_q = view.load %qw_view[%qs_idx_q] : view<[%q_bytes]xi8> -> i8
+        %qb_q = scalar.extui %qb8_q : i8 to i32
+        %qb_lo_q = scalar.andi %qb_q, %c15i : i32
+        %qb_hi_q = scalar.shrui %qb_q, %c4i : i32
+        %quant4_q = scf.if %is_low_q -> (i32) {
+          scf.yield %qb_lo_q : i32
+        } else {
+          scf.yield %qb_hi_q : i32
+        }
+        %gg2_q = scalar.shli %gg_i_q, %c1i : i32
+        %sis_q = scalar.addi %gg2_q, %wv_hi_q : i32
+        %sis_low_q = scalar.cmpi slt, %sis_q, %c4i : i32
+        %la0_q = scalar.addi %blk_off_q, %c4i : i32
+        %la_i_q = scalar.addi %la0_q, %sis_q : i32
+        %lb_i_q = scalar.addi %la_i_q, %c4i : i32
+        %lc_i_q = scalar.addi %blk_off_q, %sis_q : i32
+        %la_ix_q = index.cast %la_i_q : i32 to index
+        %la_lo_q = index.max %la_ix_q, %c0 : index
+        %la_idx_q = index.min %la_lo_q, %qw_last : index
+        %lb_ix_q = index.cast %lb_i_q : i32 to index
+        %lb_lo_q = index.max %lb_ix_q, %c0 : index
+        %lb_idx_q = index.min %lb_lo_q, %qw_last : index
+        %lc_ix_q = index.cast %lc_i_q : i32 to index
+        %lc_lo_q = index.max %lc_ix_q, %c0 : index
+        %lc_idx_q = index.min %lc_lo_q, %qw_last : index
+        %la8_q = view.load %qw_view[%la_idx_q] : view<[%q_bytes]xi8> -> i8
+        %lb8_q = view.load %qw_view[%lb_idx_q] : view<[%q_bytes]xi8> -> i8
+        %lc8_q = view.load %qw_view[%lc_idx_q] : view<[%q_bytes]xi8> -> i8
+        %la_q = scalar.extui %la8_q : i8 to i32
+        %lb_q = scalar.extui %lb8_q : i8 to i32
+        %lc_q = scalar.extui %lc8_q : i8 to i32
+        %sc_q, %smin_q = scf.if %sis_low_q -> (i32, i32) {
+          %s_q = scalar.andi %la_q, %c63i : i32
+          %mv_q = scalar.andi %lb_q, %c63i : i32
+          scf.yield %s_q, %mv_q : i32, i32
+        } else {
+          %lb_lo2_q = scalar.andi %lb_q, %c15i : i32
+          %lc_hi_q = scalar.shrui %lc_q, %c6i : i32
+          %lc_hi4_q = scalar.shli %lc_hi_q, %c4i : i32
+          %s2_q = scalar.ori %lb_lo2_q, %lc_hi4_q : i32
+          %lb_hi_q = scalar.shrui %lb_q, %c4i : i32
+          %la_hi_q = scalar.shrui %la_q, %c6i : i32
+          %la_hi4_q = scalar.shli %la_hi_q, %c4i : i32
+          %m2_q = scalar.ori %lb_hi_q, %la_hi4_q : i32
+          scf.yield %s2_q, %m2_q : i32, i32
+        }
+        %blk_half0_q = scalar.shrui %blk_off_q, %c1i : i32
+        %d_ix_q = index.cast %blk_half0_q : i32 to index
+        %d_lo_q = index.max %d_ix_q, %c0 : index
+        %d_idx_q = index.min %d_lo_q, %qw_half_last : index
+        %dmin0_q = scalar.addi %blk_half0_q, %c1i : i32
+        %dmin_ix_q = index.cast %dmin0_q : i32 to index
+        %dmin_lo_q = index.max %dmin_ix_q, %c0 : index
+        %dmin_idx_q = index.min %dmin_lo_q, %qw_half_last : index
+        %d_half_v_q = view.load %qw_f16_view[%d_idx_q] : view<[%q_halfs]xf16> -> f16
+        %dmin_half_v_q = view.load %qw_f16_view[%dmin_idx_q] : view<[%q_halfs]xf16> -> f16
+        %d_q = scalar.extf %d_half_v_q : f16 to f32
+        %dmin_q = scalar.extf %dmin_half_v_q : f16 to f32
+        %sc_f_q = scalar.sitofp %sc_q : i32 to f32
+        %m_f_q = scalar.sitofp %smin_q : i32 to f32
+        %q_f_q = scalar.sitofp %quant4_q : i32 to f32
+        %dsc_q = scalar.mulf %d_q, %sc_f_q : f32
+        %scaled_q = scalar.mulf %dsc_q, %q_f_q : f32
+        %dm_q = scalar.mulf %dmin_q, %m_f_q : f32
+        %value_q = scalar.subf %scaled_q, %dm_q : f32
+        %kidx_i_q = scalar.addi %kblk256_q, %i_i_q : i32
+        %kidx_ix_q = index.cast %kidx_i_q : i32 to index
+        %kidx_lo_q = index.max %kidx_ix_q, %c0 : index
+        %kidx_q = index.min %kidx_lo_q, %x_last : index
+        %xv_q = view.load %x_view[%kidx_q] : view<[%x_elems]xf32> -> f32
+        %prod_q = scalar.mulf %value_q, %xv_q : f32
+        %next_q = scalar.addf %a1_q, %prod_q : f32
+        scf.yield %next_q : f32
+      }
+      scf.yield %acc1_q : f32
+    }
+    %sum_q = kernel.subgroup.reduce<addf> %acc_q : f32
+    %is_zero_q = index.cmp eq, %lane, %c0 : index
+    %st_q = scf.if %is_zero_q -> (f32) {
+      view.store %sum_q, %qo_view[%m] : f32, view<[%q_dim]xf32>
+      scf.yield %zero : f32
+    } else {
+      scf.yield %zero : f32
+    }
+    scf.yield %zero : f32
+  } else {
+    %k_sink = scf.if %is_k -> (f32) {
+      %acc_k = scf.for %kblk_k = [%c0 to %k_blocks step %c1](%a0_k = %zero : f32) -> (f32) {
+        %kblk_i_k = index.cast %kblk_k : index to i32
+        %row_k_i = index.cast %row_k : index to i32
+        %row_off_k = scalar.muli %row_k_i, %c2880i : i32
+        %blk_off0_k = scalar.muli %kblk_i_k, %c144i : i32
+        %blk_off_k = scalar.addi %row_off_k, %blk_off0_k : i32
+        %kblk256_k = scalar.shli %kblk_i_k, %c8i : i32
+        %acc1_k = scf.for %j_k = [%c0 to %c8 step %c1](%a1_k = %a0_k : f32) -> (f32) {
+          %j_i_k = index.cast %j_k : index to i32
+          %j32_k = scalar.shli %j_i_k, %c5i : i32
+          %i_i_k = scalar.addi %lane_i, %j32_k : i32
+          %gg_i_k = scalar.shrui %i_i_k, %c6i : i32
+          %wv_i_k = scalar.andi %i_i_k, %c63i : i32
+          %lane_dec_k = scalar.andi %wv_i_k, %c31i : i32
+          %wv_hi_k = scalar.shrui %wv_i_k, %c5i : i32
+          %is_low_k = scalar.cmpi slt, %wv_i_k, %c32i : i32
+          %qs0_k = scalar.addi %blk_off_k, %c16i : i32
+          %gg32_k = scalar.shli %gg_i_k, %c5i : i32
+          %qs1_k = scalar.addi %qs0_k, %gg32_k : i32
+          %qs2_k = scalar.addi %qs1_k, %lane_dec_k : i32
+          %qs_ix_k = index.cast %qs2_k : i32 to index
+          %qs_lo_k = index.max %qs_ix_k, %c0 : index
+          %qs_idx_k = index.min %qs_lo_k, %kw_last : index
+          %qb8_k = view.load %kw_view[%qs_idx_k] : view<[%kv_bytes]xi8> -> i8
+          %qb_k = scalar.extui %qb8_k : i8 to i32
+          %qb_lo_k = scalar.andi %qb_k, %c15i : i32
+          %qb_hi_k = scalar.shrui %qb_k, %c4i : i32
+          %quant4_k = scf.if %is_low_k -> (i32) {
+            scf.yield %qb_lo_k : i32
+          } else {
+            scf.yield %qb_hi_k : i32
+          }
+          %gg2_k = scalar.shli %gg_i_k, %c1i : i32
+          %sis_k = scalar.addi %gg2_k, %wv_hi_k : i32
+          %sis_low_k = scalar.cmpi slt, %sis_k, %c4i : i32
+          %la0_k = scalar.addi %blk_off_k, %c4i : i32
+          %la_i_k = scalar.addi %la0_k, %sis_k : i32
+          %lb_i_k = scalar.addi %la_i_k, %c4i : i32
+          %lc_i_k = scalar.addi %blk_off_k, %sis_k : i32
+          %la_ix_k = index.cast %la_i_k : i32 to index
+          %la_lo_k = index.max %la_ix_k, %c0 : index
+          %la_idx_k = index.min %la_lo_k, %kw_last : index
+          %lb_ix_k = index.cast %lb_i_k : i32 to index
+          %lb_lo_k = index.max %lb_ix_k, %c0 : index
+          %lb_idx_k = index.min %lb_lo_k, %kw_last : index
+          %lc_ix_k = index.cast %lc_i_k : i32 to index
+          %lc_lo_k = index.max %lc_ix_k, %c0 : index
+          %lc_idx_k = index.min %lc_lo_k, %kw_last : index
+          %la8_k = view.load %kw_view[%la_idx_k] : view<[%kv_bytes]xi8> -> i8
+          %lb8_k = view.load %kw_view[%lb_idx_k] : view<[%kv_bytes]xi8> -> i8
+          %lc8_k = view.load %kw_view[%lc_idx_k] : view<[%kv_bytes]xi8> -> i8
+          %la_k = scalar.extui %la8_k : i8 to i32
+          %lb_k = scalar.extui %lb8_k : i8 to i32
+          %lc_k = scalar.extui %lc8_k : i8 to i32
+          %sc_k, %smin_k = scf.if %sis_low_k -> (i32, i32) {
+            %s_k = scalar.andi %la_k, %c63i : i32
+            %mv_k = scalar.andi %lb_k, %c63i : i32
+            scf.yield %s_k, %mv_k : i32, i32
+          } else {
+            %lb_lo2_k = scalar.andi %lb_k, %c15i : i32
+            %lc_hi_k = scalar.shrui %lc_k, %c6i : i32
+            %lc_hi4_k = scalar.shli %lc_hi_k, %c4i : i32
+            %s2_k = scalar.ori %lb_lo2_k, %lc_hi4_k : i32
+            %lb_hi_k = scalar.shrui %lb_k, %c4i : i32
+            %la_hi_k = scalar.shrui %la_k, %c6i : i32
+            %la_hi4_k = scalar.shli %la_hi_k, %c4i : i32
+            %m2_k = scalar.ori %lb_hi_k, %la_hi4_k : i32
+            scf.yield %s2_k, %m2_k : i32, i32
+          }
+          %blk_half0_k = scalar.shrui %blk_off_k, %c1i : i32
+          %d_ix_k = index.cast %blk_half0_k : i32 to index
+          %d_lo_k = index.max %d_ix_k, %c0 : index
+          %d_idx_k = index.min %d_lo_k, %kw_half_last : index
+          %dmin0_k = scalar.addi %blk_half0_k, %c1i : i32
+          %dmin_ix_k = index.cast %dmin0_k : i32 to index
+          %dmin_lo_k = index.max %dmin_ix_k, %c0 : index
+          %dmin_idx_k = index.min %dmin_lo_k, %kw_half_last : index
+          %d_half_v_k = view.load %kw_f16_view[%d_idx_k] : view<[%kv_halfs]xf16> -> f16
+          %dmin_half_v_k = view.load %kw_f16_view[%dmin_idx_k] : view<[%kv_halfs]xf16> -> f16
+          %d_k = scalar.extf %d_half_v_k : f16 to f32
+          %dmin_k = scalar.extf %dmin_half_v_k : f16 to f32
+          %sc_f_k = scalar.sitofp %sc_k : i32 to f32
+          %m_f_k = scalar.sitofp %smin_k : i32 to f32
+          %q_f_k = scalar.sitofp %quant4_k : i32 to f32
+          %dsc_k = scalar.mulf %d_k, %sc_f_k : f32
+          %scaled_k = scalar.mulf %dsc_k, %q_f_k : f32
+          %dm_k = scalar.mulf %dmin_k, %m_f_k : f32
+          %value_k = scalar.subf %scaled_k, %dm_k : f32
+          %kidx_i_k = scalar.addi %kblk256_k, %i_i_k : i32
+          %kidx_ix_k = index.cast %kidx_i_k : i32 to index
+          %kidx_lo_k = index.max %kidx_ix_k, %c0 : index
+          %kidx_k = index.min %kidx_lo_k, %x_last : index
+          %xv_k = view.load %x_view[%kidx_k] : view<[%x_elems]xf32> -> f32
+          %prod_k = scalar.mulf %value_k, %xv_k : f32
+          %next_k = scalar.addf %a1_k, %prod_k : f32
+          scf.yield %next_k : f32
+        }
+        scf.yield %acc1_k : f32
+      }
+      %sum_k = kernel.subgroup.reduce<addf> %acc_k : f32
+      %is_zero_k = index.cmp eq, %lane, %c0 : index
+      %st_k = scf.if %is_zero_k -> (f32) {
+        view.store %sum_k, %ko_view[%row_k] : f32, view<[%kv_dim]xf32>
+        scf.yield %zero : f32
+      } else {
+        scf.yield %zero : f32
+      }
+      scf.yield %zero : f32
+    } else {
+      %acc_v = scf.for %kblk_v = [%c0 to %k_blocks step %c1](%a0_v = %zero : f32) -> (f32) {
+        %kblk_i_v = index.cast %kblk_v : index to i32
+        %row_v_i = index.cast %row_v : index to i32
+        %row_off_v = scalar.muli %row_v_i, %c2880i : i32
+        %blk_off0_v = scalar.muli %kblk_i_v, %c144i : i32
+        %blk_off_v = scalar.addi %row_off_v, %blk_off0_v : i32
+        %kblk256_v = scalar.shli %kblk_i_v, %c8i : i32
+        %acc1_v = scf.for %j_v = [%c0 to %c8 step %c1](%a1_v = %a0_v : f32) -> (f32) {
+          %j_i_v = index.cast %j_v : index to i32
+          %j32_v = scalar.shli %j_i_v, %c5i : i32
+          %i_i_v = scalar.addi %lane_i, %j32_v : i32
+          %gg_i_v = scalar.shrui %i_i_v, %c6i : i32
+          %wv_i_v = scalar.andi %i_i_v, %c63i : i32
+          %lane_dec_v = scalar.andi %wv_i_v, %c31i : i32
+          %wv_hi_v = scalar.shrui %wv_i_v, %c5i : i32
+          %is_low_v = scalar.cmpi slt, %wv_i_v, %c32i : i32
+          %qs0_v = scalar.addi %blk_off_v, %c16i : i32
+          %gg32_v = scalar.shli %gg_i_v, %c5i : i32
+          %qs1_v = scalar.addi %qs0_v, %gg32_v : i32
+          %qs2_v = scalar.addi %qs1_v, %lane_dec_v : i32
+          %qs_ix_v = index.cast %qs2_v : i32 to index
+          %qs_lo_v = index.max %qs_ix_v, %c0 : index
+          %qs_idx_v = index.min %qs_lo_v, %vw_last : index
+          %qb8_v = view.load %vw_view[%qs_idx_v] : view<[%kv_bytes]xi8> -> i8
+          %qb_v = scalar.extui %qb8_v : i8 to i32
+          %qb_lo_v = scalar.andi %qb_v, %c15i : i32
+          %qb_hi_v = scalar.shrui %qb_v, %c4i : i32
+          %quant4_v = scf.if %is_low_v -> (i32) {
+            scf.yield %qb_lo_v : i32
+          } else {
+            scf.yield %qb_hi_v : i32
+          }
+          %gg2_v = scalar.shli %gg_i_v, %c1i : i32
+          %sis_v = scalar.addi %gg2_v, %wv_hi_v : i32
+          %sis_low_v = scalar.cmpi slt, %sis_v, %c4i : i32
+          %la0_v = scalar.addi %blk_off_v, %c4i : i32
+          %la_i_v = scalar.addi %la0_v, %sis_v : i32
+          %lb_i_v = scalar.addi %la_i_v, %c4i : i32
+          %lc_i_v = scalar.addi %blk_off_v, %sis_v : i32
+          %la_ix_v = index.cast %la_i_v : i32 to index
+          %la_lo_v = index.max %la_ix_v, %c0 : index
+          %la_idx_v = index.min %la_lo_v, %vw_last : index
+          %lb_ix_v = index.cast %lb_i_v : i32 to index
+          %lb_lo_v = index.max %lb_ix_v, %c0 : index
+          %lb_idx_v = index.min %lb_lo_v, %vw_last : index
+          %lc_ix_v = index.cast %lc_i_v : i32 to index
+          %lc_lo_v = index.max %lc_ix_v, %c0 : index
+          %lc_idx_v = index.min %lc_lo_v, %vw_last : index
+          %la8_v = view.load %vw_view[%la_idx_v] : view<[%kv_bytes]xi8> -> i8
+          %lb8_v = view.load %vw_view[%lb_idx_v] : view<[%kv_bytes]xi8> -> i8
+          %lc8_v = view.load %vw_view[%lc_idx_v] : view<[%kv_bytes]xi8> -> i8
+          %la_v = scalar.extui %la8_v : i8 to i32
+          %lb_v = scalar.extui %lb8_v : i8 to i32
+          %lc_v = scalar.extui %lc8_v : i8 to i32
+          %sc_v, %smin_v = scf.if %sis_low_v -> (i32, i32) {
+            %s_v = scalar.andi %la_v, %c63i : i32
+            %mv_v = scalar.andi %lb_v, %c63i : i32
+            scf.yield %s_v, %mv_v : i32, i32
+          } else {
+            %lb_lo2_v = scalar.andi %lb_v, %c15i : i32
+            %lc_hi_v = scalar.shrui %lc_v, %c6i : i32
+            %lc_hi4_v = scalar.shli %lc_hi_v, %c4i : i32
+            %s2_v = scalar.ori %lb_lo2_v, %lc_hi4_v : i32
+            %lb_hi_v = scalar.shrui %lb_v, %c4i : i32
+            %la_hi_v = scalar.shrui %la_v, %c6i : i32
+            %la_hi4_v = scalar.shli %la_hi_v, %c4i : i32
+            %m2_v = scalar.ori %lb_hi_v, %la_hi4_v : i32
+            scf.yield %s2_v, %m2_v : i32, i32
+          }
+          %blk_half0_v = scalar.shrui %blk_off_v, %c1i : i32
+          %d_ix_v = index.cast %blk_half0_v : i32 to index
+          %d_lo_v = index.max %d_ix_v, %c0 : index
+          %d_idx_v = index.min %d_lo_v, %vw_half_last : index
+          %dmin0_v = scalar.addi %blk_half0_v, %c1i : i32
+          %dmin_ix_v = index.cast %dmin0_v : i32 to index
+          %dmin_lo_v = index.max %dmin_ix_v, %c0 : index
+          %dmin_idx_v = index.min %dmin_lo_v, %vw_half_last : index
+          %d_half_v_v = view.load %vw_f16_view[%d_idx_v] : view<[%kv_halfs]xf16> -> f16
+          %dmin_half_v_v = view.load %vw_f16_view[%dmin_idx_v] : view<[%kv_halfs]xf16> -> f16
+          %d_v = scalar.extf %d_half_v_v : f16 to f32
+          %dmin_v = scalar.extf %dmin_half_v_v : f16 to f32
+          %sc_f_v = scalar.sitofp %sc_v : i32 to f32
+          %m_f_v = scalar.sitofp %smin_v : i32 to f32
+          %q_f_v = scalar.sitofp %quant4_v : i32 to f32
+          %dsc_v = scalar.mulf %d_v, %sc_f_v : f32
+          %scaled_v = scalar.mulf %dsc_v, %q_f_v : f32
+          %dm_v = scalar.mulf %dmin_v, %m_f_v : f32
+          %value_v = scalar.subf %scaled_v, %dm_v : f32
+          %kidx_i_v = scalar.addi %kblk256_v, %i_i_v : i32
+          %kidx_ix_v = index.cast %kidx_i_v : i32 to index
+          %kidx_lo_v = index.max %kidx_ix_v, %c0 : index
+          %kidx_v = index.min %kidx_lo_v, %x_last : index
+          %xv_v = view.load %x_view[%kidx_v] : view<[%x_elems]xf32> -> f32
+          %prod_v = scalar.mulf %value_v, %xv_v : f32
+          %next_v = scalar.addf %a1_v, %prod_v : f32
+          scf.yield %next_v : f32
+        }
+        scf.yield %acc1_v : f32
+      }
+      %sum_v = kernel.subgroup.reduce<addf> %acc_v : f32
+      %is_zero_v = index.cmp eq, %lane, %c0 : index
+      %st_v = scf.if %is_zero_v -> (f32) {
+        view.store %sum_v, %vo_view[%row_v] : f32, view<[%kv_dim]xf32>
+        scf.yield %zero : f32
+      } else {
+        scf.yield %zero : f32
+      }
+      scf.yield %zero : f32
+    }
+    scf.yield %k_sink : f32
+  }
+  kernel.return
+}
+
+// Requires the config block above with q_dim=16, kv_dim=16, k_blocks=20. q, k and
+// v all bind the 16-row Q4_K fixture, so each band outputs gemv_expected for the
+// sparse activation. The three output tensors are checked separately, so a row
+// dispatched into the wrong band is caught.
+check.case public @yah_qkv_q4k_case {
+  %q_w = check.file.read.npy path("fixtures/q4k_gemm/input_q4k_gemm.npy") : tensor<46080xi8>
+  %k_w = check.file.read.npy path("fixtures/q4k_gemm/input_q4k_gemm.npy") : tensor<46080xi8>
+  %v_w = check.file.read.npy path("fixtures/q4k_gemm/input_q4k_gemm.npy") : tensor<46080xi8>
+  %x = check.file.read.npy path("fixtures/q4k_gemm/gemv_x.npy") : tensor<5120xf32>
+  %expected = check.file.read.npy path("fixtures/q4k_gemm/gemv_expected.npy") : tensor<16xf32>
+  %q_out = check.generate.fill value(0.0) : tensor<16xf32>
+  %k_out = check.generate.fill value(0.0) : tensor<16xf32>
+  %v_out = check.generate.fill value(0.0) : tensor<16xf32>
+  kernel.launch @yah_qkv_q4k(%q_w, %k_w, %v_w, %x, %q_out, %k_out, %v_out) : (tensor<46080xi8>, tensor<46080xi8>, tensor<46080xi8>, tensor<5120xf32>, tensor<16xf32>, tensor<16xf32>, tensor<16xf32>)
+  check.expect.close actual(%q_out) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
+  check.expect.close actual(%k_out) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
+  check.expect.close actual(%v_out) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
+  check.return
+}
+
+check.benchmark<@yah_qkv_q4k_case> @yah_qkv_q4k_bench
+
+// Requires --config=yah_qkv_q4k.q_dim=6144 --config=yah_qkv_q4k.kv_dim=1024
+//          --config=yah_qkv_q4k.k_blocks=20 (the production decode shape).
+// All-zero weights decode to zero, so all three outputs must be exactly 0.
+check.case public @yah_qkv_q4k_full_case {
+  %q_w = check.generate.fill value(0) : tensor<17694720xi8>
+  %k_w = check.generate.fill value(0) : tensor<2949120xi8>
+  %v_w = check.generate.fill value(0) : tensor<2949120xi8>
+  %x = check.generate.fill value(1.0) : tensor<5120xf32>
+  %q_out = check.generate.fill value(0.0) : tensor<6144xf32>
+  %k_out = check.generate.fill value(0.0) : tensor<1024xf32>
+  %v_out = check.generate.fill value(0.0) : tensor<1024xf32>
+  %eq = check.generate.fill value(0.0) : tensor<6144xf32>
+  %ek = check.generate.fill value(0.0) : tensor<1024xf32>
+  %ev = check.generate.fill value(0.0) : tensor<1024xf32>
+  kernel.launch @yah_qkv_q4k(%q_w, %k_w, %v_w, %x, %q_out, %k_out, %v_out) : (tensor<17694720xi8>, tensor<2949120xi8>, tensor<2949120xi8>, tensor<5120xf32>, tensor<6144xf32>, tensor<1024xf32>, tensor<1024xf32>)
+  check.expect.close actual(%q_out) expected(%eq) atol(0.0) rtol(0.0) nan(same) : tensor<6144xf32>
+  check.expect.close actual(%k_out) expected(%ek) atol(0.0) rtol(0.0) nan(same) : tensor<1024xf32>
+  check.expect.close actual(%v_out) expected(%ev) atol(0.0) rtol(0.0) nan(same) : tensor<1024xf32>
+  check.return
+}
+
+check.benchmark<@yah_qkv_q4k_full_case> @yah_qkv_q4k_full_bench

@@ -57,6 +57,7 @@ explicitly deferred.
 | yah_decode_splitk_reduce_f32.loom | attention_decode.hip | decode split-K attention reduce | ported, 0.0080 ms; combines the Python expected scratch into the same output the online kernel produces |
 | yah_gemv_q4k_f32.loom | gemv_quant.hip | Q4_K block GEMV (Q8KBlockGEMVKernel, Q4_K arm) | ported, 1.33 ms at 17408 rows x 5120; sparse-activation fixture exact |
 | yah_fused_swiglu_q4k_f32.loom | swiglu.hip | fused quantized SwiGLU GEMV, Q4_K (Wave32FusedQuantSwiGLUGEMVKernel) | ported, 2.08 ms at 17408 rows x 5120; gate and up share the sparse fixture |
+| yah_qkv_q4k_f32.loom | qkv.hip | fused quantized QKV projection, Q4_K (Wave32FusedQKVProjectionsKernel_1Row) | ported, 0.447 ms at q=6144/kv=1024; three row bands each checked |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -186,7 +187,7 @@ Reachability evidence for the entries that are not on that route:
 | attention (2.1%) | attention_wmma.hip, attention_tile.hip | **ported**: PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel, WmmaCausalAttention. QwenTiledAttentionKernel is **dead** (no launcher call site); see the route audit |
 | attention | attention_batched.hip | BatchedAttentionKernel, CausalSoftmaxKernel, WriteBatchedKVCacheKernel, ApplyAttentionGateKernel |
 | attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | decode online fp16 and split-K fp16 partials+reduce **ported**; fp32 arms, the ShareKv split-K arm, graph/ptr and baseline variants are decode-only; QwenTiledAttentionKernel is dead |
-| QKV projection | qkv.hip | **ported**: Wave32FusedQKVProjectionsKernel_1Row<4> and FusedQKVProjectionsKernel, f32 arm only. **todo**: the BF16, Q8_0 and block-quantized arms (sub-16 table) |
+| QKV projection | qkv.hip | **ported**: Wave32FusedQKVProjectionsKernel_1Row<4> and FusedQKVProjectionsKernel, f32 arm; and the Q4_K arm of Wave32FusedQKVProjectionsKernel_1Row. **todo**: the BF16 and Q8_0 arms, and the other block-quantized formats |
 | fused RoPE | prefill_rope.hip | all **ported**: BatchedFusedQKNormRoPEKvWriteKernel and BatchedRoPEKernel (text path) |
 | fused.hip | fused.hip | **ported**: FusedQKNormRoPEKvWriteKernel (text path) |
 | dequant to bf16 | prefill_gemm.hip | HIP file has Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant plus FloatToBfloat16Kernel. **ported**: Q4_K, Q5_K, Q6_K, Q8_0, Q8_K to bf16. **todo**: Q8_1, the generic sub-16 element decoder |
