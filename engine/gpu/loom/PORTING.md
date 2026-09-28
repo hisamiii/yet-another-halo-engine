@@ -74,16 +74,19 @@ explicitly deferred.
 | yah_vision_attention_rows_bf16.loom | vision/encoder.hip | vision attention head->token transpose | ported, 0.0070 ms; bit-exact vs fixture |
 | yah_vision_patchify_bf16.loom | vision/encoder.hip | patch embedding (image to 16x16 patches) | ported, 0.0070 ms; bit-exact vs fixture |
 | yah_vision_inject_rows_f32.loom | vision/device_input.hip | embedding row injection (broadcast hc) | ported, 0.0065 ms; exact fixture |
+| yah_vision_patch_position_f32.loom | vision/encoder.hip | learned position embedding, bilinear | ported, 0.0080 ms; exact fixture |
+| yah_vision_activate_bf16.loom | vision/encoder.hip | GELU epilogue (tanh and erf) | ported, 0.0060/0.0064 ms; saturation exact, no fixture |
+| yah_vision_qkv_rope_bf16.loom | vision/encoder.hip | QKV projection + RoPE | ported, 0.0233 ms at count=4; identity exact + rotation bit fixture |
 | yah_gemv_f32.loom | gemv.hip | decode GEMV, f32 weight path | ported, 0.0063 ms; exact, no fixture; bf16 path todo |
 | yah_rmsnorm_decode_f32.loom | norm.hip | decode RMSNorm (single row) | ported, 0.0065 ms; exact, no fixture |
 | yah_perhead_rmsnorm_decode_f32.loom | norm.hip | decode per-head RMSNorm | ported, 0.0070 ms; exact, no fixture |
 | yah_sample_prepare_f32.loom | sample.hip | sampling prep (non-finite filter + token map) | ported, 0.0068/0.0073 ms; finite exact, non-finite fixture |
-| - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | todo |
+| - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | all eight **ported** |
 
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 53 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 56 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -102,7 +105,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16. **todo**: AtbEncodeA, AtbDecodeC, AtbDecodeSwiGLU, AtbRepack(+Slice) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
 | sampling | sample.hip | **ported**: PrepareSamplingKernel. **todo**: PrepareCandidateLogits, ApplySparsePenalties, batched argmax, linear/sorted sampling, the speculative segment set |
-| vision | vision/encoder.hip, vision/device_input.hip | **ported**: Finish, BiasResidual, LayerNorm, Softmax, AttentionRows, Patchify, InjectRows. **todo**: PatchPosition, QkvRope, Activate |
+| vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both). **todo**: RoPEPtr, EmbeddingLookupPtr, FastFusedSwiGLUGEMVBlockKernel |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
@@ -288,3 +291,25 @@ profile gives one, so the expensive paths move first rather than the convenient 
   `isfinite` substitution does. `scalar.isfinitef` has no target-low contract, so
   the source is `cmpf ole %|v|, 3.4028234663852886e+38`; a fill of the finite
   maximum passes that test, a fill of `3.5e38` does not.
+- **A derived index needs an explicit two-sided clamp before it reaches memory.**
+  The footprint analysis proves origins from the config ranges and the arithmetic
+  that produced them; it does not use an `scf.if` condition, a loop guard, or a
+  float-to-int conversion to narrow a range. Three separate cases in the vision
+  ports show the three forms: `(unsigned)fy` via `scalar.fptosi` gave an unbounded
+  lower bound (clamp with `scalar.maxsi %v, %c0i` *and* `scalar.minsi`), the taken
+  arm of `scf.if %lt -> (index)` for `pair = d < 36 ? d : d - 36` gave an unbounded
+  lower bound in the not-taken arm (compute the subtract in `i32` and clamp the
+  result), and the `d < 72` workgroup guard did not narrow `d = lane + pass*32` for
+  the analysis (it still saw `d <= 95`). The fix for the last one is a clamped copy
+  of the index used *only* for addressing: `dc = min(d, 71)` inside the guarded
+  branch is bit-identical to `d` on every live lane, but it gives the analysis the
+  provable bound the guard does not. Without these the compile fails `SUBRANGE/023`
+  (lower bound) or `SUBRANGE/024` (upper bound), or the declared envelope silently
+  grows past the case binding and `loom_preflight.py` refuses the run.
+- **A transcendental bit-fixture can be exact even though the op is approximate.**
+  `yah_vision_qkv_rope_bf16.loom` compares bf16 `cos`/`sin`/`powf` output against a
+  fixture computed with libm, and it is bit-identical: eight bf16 mantissa bits
+  absorb the afn approximation error (a few f32 ulps) for every element on this
+  case. That is a property of the case, not a guarantee -- an element sitting on a
+  bf16 rounding boundary would still differ -- but it is enough to pin the rotation
+  formula, the band switch and the angle, which is what the port owes.

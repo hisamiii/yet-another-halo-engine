@@ -1,0 +1,278 @@
+// YAH vision QKV projection with RoPE, Loom port of QkvRope.
+//
+// HIP source: models/qwen/vision/encoder.hip. One thread per (token, dim), where
+// dim = head*72 + d ranges over kHidden = 1152:
+//
+//   head = (i % 1152) / 72; d = i % 72; pair = d % 36
+//   merge = token / 4
+//   y = (merge / (grid_width/2))*2 + (token % 4)/2
+//   x = (merge % (grid_width/2))*2 + token % 2
+//   position = pair < 18 ? y : x
+//   angle    = position / powf(10000, (pair % 18) / 18)
+//   first    = head*72 + pair
+//   base     = token * 3 * 1152
+//   q0 = Round(input[base + first] + bias[first])
+//   q1 = Round(input[base + first + 36] + bias[first + 36])
+//   k0 = Round(input[base + 1152 + first] + bias[1152 + first])
+//   k1 = Round(input[base + 1152 + first + 36] + bias[1152 + first + 36])
+//   target = (head * count + token) * 72 + d
+//   q[target] = Bf16(d < 36 ? q0*cos - q1*sin : q1*cos + q0*sin)
+//   k[target] = Bf16(d < 36 ? k0*cos - k1*sin : k1*cos + k0*sin)
+//   v[target] = Bf16(input[base + 2304 + head*72 + d] + bias[2304 + head*72 + d])
+//
+// `Round` is again float(Bf16(x)). The port keeps the head index as a loop and the
+// 72-wide lane geometry as three 32-lane passes, so the `/72`, `%72` and`%36`
+// divisions disappear. `pair % 18` is the two-sided subtract `pair < 18 ? pair :
+// pair - 18`, and `pair < 18` also selects `position`, so no integer division or
+// remainder survives anywhere in the kernel.
+//
+// The angle is evaluated per element with the target math policy: `scalar.powf<afn>`,
+// `scalar.cosf<afn>` and `scalar.sinf<afn>`. Without the afn flag the amdgpu-math
+// policy rejects an exact transcendental on this target.
+//
+// Required config: --config=yah_vision_qkv_rope.count=1 --config=yah_vision_qkv_rope.grid_width=48
+//                  --config=yah_vision_qkv_rope.input_elems=3456 --config=yah_vision_qkv_rope.bias_elems=3456
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_vision_qkv_rope.count : %value: index where [range(%value, 1, 64)]
+
+config.decl @yah_vision_qkv_rope.grid_width : %value: index where [range(%value, 2, 64)]
+
+config.decl @yah_vision_qkv_rope.input_elems : %value: index where [range(%value, 1, 221184)]
+
+config.decl @yah_vision_qkv_rope.bias_elems : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_vision_qkv_rope() {
+  %unit = index.constant 1 : index
+  %count = config.get @yah_vision_qkv_rope.count : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%count, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%input: buffer, %bias: buffer, %q: buffer, %k: buffer, %v: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c16 = index.constant 16 : index
+  %c18 = index.constant 18 : index
+  %c32 = index.constant 32 : index
+  %c36 = index.constant 36 : index
+  %c72 = index.constant 72 : index
+  %c1152 = index.constant 1152 : index
+  %c2304 = index.constant 2304 : index
+  %c3456 = index.constant 3456 : index
+  %c1i = scalar.constant 1 : i32
+  %c2i = scalar.constant 2 : i32
+  %c3i = scalar.constant 3 : i32
+  %c0i = scalar.constant 0 : i32
+  %c18i = scalar.constant 18 : i32
+  %c36i = scalar.constant 36 : i32
+  %c71i = scalar.constant 71 : i32
+  %c10000f = scalar.constant 10000.0 : f32
+  %c18f = scalar.constant 18.0 : f32
+  %count = config.get @yah_vision_qkv_rope.count : index
+  %grid_width = config.get @yah_vision_qkv_rope.grid_width : index
+  %input_elems = config.get @yah_vision_qkv_rope.input_elems : index
+  %bias_elems = config.get @yah_vision_qkv_rope.bias_elems : index
+  %out_elems = index.mul %count, %c1152 : index
+  %input_na, %bias_na, %q_na, %k_na, %v_na = buffer.assume.noalias %input, %bias, %q, %k, %v : buffer, buffer, buffer, buffer, buffer
+  %input_view = buffer.view %input_na[%base] : buffer -> view<[%input_elems]xf32>
+  %bias_view = buffer.view %bias_na[%base] : buffer -> view<[%bias_elems]xf32>
+  %q_view = buffer.view %q_na[%base] : buffer -> view<[%out_elems]xbf16>
+  %k_view = buffer.view %k_na[%base] : buffer -> view<[%out_elems]xbf16>
+  %v_view = buffer.view %v_na[%base] : buffer -> view<[%out_elems]xbf16>
+  %token = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  // y and x for this token, from the merge decomposition.
+  %token_i = index.cast %token : index to i32
+  %t4 = scalar.andi %token_i, %c3i : i32
+  %merge_i = scalar.shrui %token_i, %c2i : i32
+  %merge = index.cast %merge_i : i32 to index
+  %gw_i = index.cast %grid_width : index to i32
+  %half_i = scalar.shrui %gw_i, %c1i : i32
+  %half = index.cast %half_i : i32 to index
+  %my = index.div %merge, %half : index
+  %mx = index.rem %merge, %half : index
+  %t4_hi_i = scalar.shrui %t4, %c1i : i32
+  %t4_hi = index.cast %t4_hi_i : i32 to index
+  %t4_lo_i = scalar.andi %t4, %c1i : i32
+  %t4_lo = index.cast %t4_lo_i : i32 to index
+  %my2 = index.mul %my, %c2 : index
+  %y = index.add %my2, %t4_hi : index
+  %mx2 = index.mul %mx, %c2 : index
+  %x = index.add %mx2, %t4_lo : index
+  %token_base = index.mul %token, %c3456 : index
+  %token_base_qk = index.add %token_base, %c1152 : index
+  %token_base_v = index.add %token_base, %c2304 : index
+  %sink = scf.for %head = [%c0 to %c16 step %c1](%m1 = %c0 : index) -> (index) {
+    %head72 = index.mul %head, %c72 : index
+    %inner = scf.for %pass = [%c0 to %c3 step %c1](%m2 = %c0 : index) -> (index) {
+      %pass32 = index.mul %pass, %c32 : index
+      %d = index.add %lane, %pass32 : index
+      %live = index.cmp ult, %d, %c72 : index
+      %step = scf.if %live -> (index) {
+        %d_i = index.cast %d : index to i32
+        // The guard is on the raw d, but every memory index inside uses the
+        // clamped d. That gives the footprint analysis a provable d <= 71 while
+        // leaving the live-lane behavior identical (dc == d whenever d < 72).
+        %dc_i = scalar.minsi %d_i, %c71i : i32
+        %dc = index.cast %dc_i : i32 to index
+        %lt36 = index.cmp ult, %dc, %c36 : index
+        %pair_raw = scf.if %lt36 -> (i32) {
+          scf.yield %dc_i : i32
+        } else {
+          %d36_i = scalar.subi %dc_i, %c36i : i32
+          scf.yield %d36_i : i32
+        }
+        %pair_clamp = scalar.maxsi %pair_raw, %c0i : i32
+        %pair = index.cast %pair_clamp : i32 to index
+        %lt18 = index.cmp ult, %pair, %c18 : index
+        %kk_raw = scf.if %lt18 -> (i32) {
+          scf.yield %pair_clamp : i32
+        } else {
+          %p18_i = scalar.subi %pair_clamp, %c18i : i32
+          scf.yield %p18_i : i32
+        }
+        %kk = scalar.maxsi %kk_raw, %c0i : i32
+        %position = scf.if %lt18 -> (index) {
+          scf.yield %y : index
+        } else {
+          scf.yield %x : index
+        }
+        %position_i = index.cast %position : index to i32
+        %kkf = scalar.sitofp %kk : i32 to f32
+        %positionf = scalar.sitofp %position_i : i32 to f32
+        %exponent = scalar.divf %kkf, %c18f : f32
+        %denominator = scalar.powf<afn> %c10000f, %exponent : f32
+        %angle = scalar.divf %positionf, %denominator : f32
+        %cosine = scalar.cosf<afn> %angle : f32
+        %sine = scalar.sinf<afn> %angle : f32
+        %first = index.add %head72, %pair : index
+        %first36 = index.add %first, %c36 : index
+        // q and k
+        %q_lo_i = index.add %token_base, %first : index
+        %q_hi_i = index.add %token_base, %first36 : index
+        %k_lo_i = index.add %token_base_qk, %first : index
+        %k_hi_i = index.add %token_base_qk, %first36 : index
+        %q0i = view.load %input_view[%q_lo_i] : view<[%input_elems]xf32> -> f32
+        %q0b = view.load %bias_view[%first] : view<[%bias_elems]xf32> -> f32
+        %q0s = scalar.addf %q0i, %q0b : f32
+        %q0n = scalar.fptrunc %q0s : f32 to bf16
+        %q0 = scalar.extf %q0n : bf16 to f32
+        %q1i = view.load %input_view[%q_hi_i] : view<[%input_elems]xf32> -> f32
+        %q1b = view.load %bias_view[%first36] : view<[%bias_elems]xf32> -> f32
+        %q1s = scalar.addf %q1i, %q1b : f32
+        %q1n = scalar.fptrunc %q1s : f32 to bf16
+        %q1 = scalar.extf %q1n : bf16 to f32
+        %k0i = view.load %input_view[%k_lo_i] : view<[%input_elems]xf32> -> f32
+        %k0b = view.load %bias_view[%first] : view<[%bias_elems]xf32> -> f32
+        %k0s = scalar.addf %k0i, %k0b : f32
+        %k0n = scalar.fptrunc %k0s : f32 to bf16
+        %k0 = scalar.extf %k0n : bf16 to f32
+        %k1i = view.load %input_view[%k_hi_i] : view<[%input_elems]xf32> -> f32
+        %k1b = view.load %bias_view[%first36] : view<[%bias_elems]xf32> -> f32
+        %k1s = scalar.addf %k1i, %k1b : f32
+        %k1n = scalar.fptrunc %k1s : f32 to bf16
+        %k1 = scalar.extf %k1n : bf16 to f32
+        %q0c = scalar.mulf %q0, %cosine : f32
+        %q0sn = scalar.mulf %q0, %sine : f32
+        %q1c = scalar.mulf %q1, %cosine : f32
+        %q1sn = scalar.mulf %q1, %sine : f32
+        %k0c = scalar.mulf %k0, %cosine : f32
+        %k0sn = scalar.mulf %k0, %sine : f32
+        %k1c = scalar.mulf %k1, %cosine : f32
+        %k1sn = scalar.mulf %k1, %sine : f32
+        %q_lo = scalar.subf %q0c, %q1sn : f32
+        %q_hi = scalar.addf %q1c, %q0sn : f32
+        %k_lo = scalar.subf %k0c, %k1sn : f32
+        %k_hi = scalar.addf %k1c, %k0sn : f32
+        %q_rot = scf.if %lt36 -> (f32) {
+          scf.yield %q_lo : f32
+        } else {
+          scf.yield %q_hi : f32
+        }
+        %k_rot = scf.if %lt36 -> (f32) {
+          scf.yield %k_lo : f32
+        } else {
+          scf.yield %k_hi : f32
+        }
+        // v is a plain bias add, no rotation.
+        %v_off = index.add %head72, %dc : index
+        %v_lo_i = index.add %token_base_v, %v_off : index
+        %v_b_off = index.add %c2304, %v_off : index
+        %vi = view.load %input_view[%v_lo_i] : view<[%input_elems]xf32> -> f32
+        %vb = view.load %bias_view[%v_b_off] : view<[%bias_elems]xf32> -> f32
+        %vs = scalar.addf %vi, %vb : f32
+        // target = (head*count + token)*72 + d
+        %hc = index.mul %head, %count : index
+        %hct = index.add %hc, %token : index
+        %hct72 = index.mul %hct, %c72 : index
+        %target = index.add %hct72, %dc : index
+        %q_n = scalar.fptrunc %q_rot : f32 to bf16
+        %k_n = scalar.fptrunc %k_rot : f32 to bf16
+        %v_n = scalar.fptrunc %vs : f32 to bf16
+        view.store %q_n, %q_view[%target] : bf16, view<[%out_elems]xbf16>
+        view.store %k_n, %k_view[%target] : bf16, view<[%out_elems]xbf16>
+        view.store %v_n, %v_view[%target] : bf16, view<[%out_elems]xbf16>
+        scf.yield %m2 : index
+      } else {
+        scf.yield %m2 : index
+      }
+      scf.yield %step : index
+    }
+    scf.yield %inner : index
+  }
+  kernel.return
+}
+
+// Requires --config=yah_vision_qkv_rope.count=1, .grid_width=48, .input_elems=3456,
+// .bias_elems=3456.
+//
+// Token 0 has y = x = 0, so position = 0 for every pair, angle = 0, cos = 1 and
+// sin = 0: the rotation is the identity and q[target] = Bf16(input[target] + 0).
+// The input is `i mod 16` in the q, k and v thirds, each of which is 1152 (= 0 mod
+// 16) long, so all three outputs are `e mod 16`. A wrong `first` index (say the
+// missing head*72 term) would read a different residue and fail.
+check.case public @yah_vision_qkv_rope_identity {
+  %input = check.generate.iota offset(0.0) step(1.0) period(16) : tensor<3456xf32>
+  %bias = check.generate.fill value(0.0) : tensor<3456xf32>
+  %q = check.generate.fill value(0.0) : tensor<1152xbf16>
+  %k = check.generate.fill value(0.0) : tensor<1152xbf16>
+  %v = check.generate.fill value(0.0) : tensor<1152xbf16>
+  %expected = check.generate.iota offset(0.0) step(1.0) period(16) : tensor<1152xbf16>
+  kernel.launch @yah_vision_qkv_rope(%input, %bias, %q, %k, %v) : (tensor<3456xf32>, tensor<3456xf32>, tensor<1152xbf16>, tensor<1152xbf16>, tensor<1152xbf16>)
+  check.expect.close actual(%q) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1152xbf16>
+  check.expect.close actual(%k) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1152xbf16>
+  check.expect.close actual(%v) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1152xbf16>
+  check.return
+}
+
+// Requires --config=yah_vision_qkv_rope.count=4, .grid_width=2, .input_elems=13824,
+// .bias_elems=3456.
+//
+// grid_width = 2 gives (y,x) = (0,0), (0,1), (1,0), (1,1) for tokens 0..3, so both
+// `position = y` and `position = x` are exercised, and the 18-wide cos/sin band
+// switch shows up. Input 1.0 and bias 0.0 make q0 = q1 = k0 = k1 = 1, so the output
+// is exactly the rotation matrix: cos - sin in the first band, sin + cos in the
+// second, and 1.0 for v. The expected bits are a fixture because the angle is
+// transcendental; bf16 has no numpy dtype, so they are stored as raw int16.
+check.case public @yah_vision_qkv_rope_rotate {
+  %input = check.generate.fill value(1.0) : tensor<13824xf32>
+  %bias = check.generate.fill value(0.0) : tensor<3456xf32>
+  %q = check.generate.fill value(0.0) : tensor<4608xbf16>
+  %k = check.generate.fill value(0.0) : tensor<4608xbf16>
+  %v = check.generate.fill value(0.0) : tensor<4608xbf16>
+  %expected = check.file.read.npy path("fixtures/vision_qkv_rope/expected_bits.npy") : tensor<4608xi16>
+  %expected_v = check.generate.fill value(1.0) : tensor<4608xbf16>
+  kernel.launch @yah_vision_qkv_rope(%input, %bias, %q, %k, %v) : (tensor<13824xf32>, tensor<3456xf32>, tensor<4608xbf16>, tensor<4608xbf16>, tensor<4608xbf16>)
+  %qb = check.tensor.view %q offset(0) : tensor<4608xbf16> -> tensor<4608xi16>
+  %kb = check.tensor.view %k offset(0) : tensor<4608xbf16> -> tensor<4608xi16>
+  check.expect.equal actual(%qb) expected(%expected) : tensor<4608xi16>
+  check.expect.equal actual(%kb) expected(%expected) : tensor<4608xi16>
+  check.expect.close actual(%v) expected(%expected_v) atol(0.0) rtol(0.0) nan(same) : tensor<4608xbf16>
+  check.return
+}
+
+check.benchmark<@yah_vision_qkv_rope_identity> @yah_vision_qkv_rope_identity_bench
+
+check.benchmark<@yah_vision_qkv_rope_rotate> @yah_vision_qkv_rope_rotate_bench

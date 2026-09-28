@@ -1,0 +1,209 @@
+// YAH vision learned position embedding, Loom port of PatchPosition.
+//
+// HIP source: models/qwen/vision/encoder.hip. Bilinearly samples a 48x48 learned
+// position table at each patch (y,x) and folds it into the hidden state:
+//
+//   patch = i / 1152; dim = i % 1152; merge = patch / 4
+//   y = (merge / (grid_width/2))*2 + (patch % 4)/2
+//   x = (merge % (grid_width/2))*2 + patch % 2
+//   fy = y * 47/(grid_height-1); fx = x * 47/(grid_width-1)
+//   y0 = min((unsigned)fy, 47); y1 = min(y0+1, 47); wy = fy - y0
+//   position = P[y0][x0][dim]*((1-wy)*(1-wx)) + P[y0][x1][dim]*((1-wy)*wx)
+//            + P[y1][x0][dim]*(wy*(1-wx)) + P[y1][x1][dim]*(wy*wx)
+//   hidden[i] = Round(Round(Round(hidden[i]) + bias[dim]) + Round(position))
+//
+// `Round` is `float(Bf16(x))`: every arithmetic result is pushed back onto the
+// bf16 grid. The port spells each round out as an f32->bf16->f32 pair.
+//
+// One workgroup per patch strides the 256 lanes over the 1152 hidden dims in
+// five passes (the last partially masked). That removes the `i / 1152` and
+// `i % 1152` divisions from the HIP source entirely: 1152 is not a power of two,
+// and a constant `index.div` by a non-power-of-two lowers to a multiply-high
+// sequence that the register-unit analysis rejects. The patch decomposition that
+// remains (`patch/4`, `patch%4`, `grid_width/2`) is all powers of two and is done
+// with scalar shifts and masks on i32.
+//
+// The two row clamps are `scalar.minsi`, which is what lets the footprint
+// analysis bound every position load by 48*48*1152 elements even though y0 comes
+// out of an f32. Without the explicit clamp a dynamic row index would leave the
+// declared footprint unbounded and loom_preflight.py would refuse the run.
+//
+// Required config: --config=yah_vision_patch_position.count=4
+//                  --config=yah_vision_patch_position.grid_height=48
+//                  --config=yah_vision_patch_position.grid_width=48
+//                  --config=yah_vision_patch_position.positions_elems=2654208
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_vision_patch_position.count : %value: index where [range(%value, 1, 4)]
+
+config.decl @yah_vision_patch_position.grid_height : %value: index where [range(%value, 2, 64)]
+
+config.decl @yah_vision_patch_position.grid_width : %value: index where [range(%value, 2, 64)]
+
+config.decl @yah_vision_patch_position.positions_elems : %value: index where [range(%value, 1, 2654208)]
+
+kernel.def target(@yah_wave32) @yah_vision_patch_position() {
+  %unit = index.constant 1 : index
+  %count = config.get @yah_vision_patch_position.count : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%count, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%hidden: buffer, %bias: buffer, %positions: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c5 = index.constant 5 : index
+  %c48 = index.constant 48 : index
+  %c256 = index.constant 256 : index
+  %c1152 = index.constant 1152 : index
+  %c0i = scalar.constant 0 : i32
+  %c1i = scalar.constant 1 : i32
+  %c2i = scalar.constant 2 : i32
+  %c3i = scalar.constant 3 : i32
+  %c47i = scalar.constant 47 : i32
+  %r47 = scalar.constant 47.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %count = config.get @yah_vision_patch_position.count : index
+  %grid_height = config.get @yah_vision_patch_position.grid_height : index
+  %grid_width = config.get @yah_vision_patch_position.grid_width : index
+  %positions_elems = config.get @yah_vision_patch_position.positions_elems : index
+  %hidden_elems = index.mul %count, %c1152 : index
+  %hidden_na, %bias_na, %positions_na = buffer.assume.noalias %hidden, %bias, %positions : buffer, buffer, buffer
+  %hidden_view = buffer.view %hidden_na[%base] : buffer -> view<[%hidden_elems]xf32>
+  %bias_view = buffer.view %bias_na[%base] : buffer -> view<[%c1152]xf32>
+  %positions_view = buffer.view %positions_na[%base] : buffer -> view<[%positions_elems]xf32>
+  %patch = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  // y and x, split into shifts and masks so no constant division is emitted.
+  %patch_i = index.cast %patch : index to i32
+  %p4 = scalar.andi %patch_i, %c3i : i32
+  %merge_i = scalar.shrui %patch_i, %c2i : i32
+  %merge = index.cast %merge_i : i32 to index
+  %gw_i = index.cast %grid_width : index to i32
+  %half_i = scalar.shrui %gw_i, %c1i : i32
+  %half = index.cast %half_i : i32 to index
+  %my = index.div %merge, %half : index
+  %mx = index.rem %merge, %half : index
+  %p4_hi_i = scalar.shrui %p4, %c1i : i32
+  %p4_hi = index.cast %p4_hi_i : i32 to index
+  %p4_lo_i = scalar.andi %p4, %c1i : i32
+  %p4_lo = index.cast %p4_lo_i : i32 to index
+  %my2 = index.mul %my, %c2 : index
+  %y = index.add %my2, %p4_hi : index
+  %mx2 = index.mul %mx, %c2 : index
+  %x = index.add %mx2, %p4_lo : index
+  // fy = y * 47/(grid_height-1), fx likewise. 2.0 <= grid_height <= 64.
+  %ghm1 = index.sub %grid_height, %c1 : index
+  %gwm1 = index.sub %grid_width, %c1 : index
+  %ghm1_i = index.cast %ghm1 : index to i32
+  %gwm1_i = index.cast %gwm1 : index to i32
+  %ghm1f = scalar.sitofp %ghm1_i : i32 to f32
+  %gwm1f = scalar.sitofp %gwm1_i : i32 to f32
+  %scale_y = scalar.divf %r47, %ghm1f : f32
+  %scale_x = scalar.divf %r47, %gwm1f : f32
+  %y_i = index.cast %y : index to i32
+  %x_i = index.cast %x : index to i32
+  %yf = scalar.sitofp %y_i : i32 to f32
+  %xf = scalar.sitofp %x_i : i32 to f32
+  %fy = scalar.mulf %yf, %scale_y : f32
+  %fx = scalar.mulf %xf, %scale_x : f32
+  // Truncate toward zero, then clamp into the 48-row plane.
+  %y0_raw = scalar.fptosi %fy : f32 to i32
+  %y0_lo = scalar.maxsi %y0_raw, %c0i : i32
+  %y0_i = scalar.minsi %y0_lo, %c47i : i32
+  %x0_raw = scalar.fptosi %fx : f32 to i32
+  %x0_lo = scalar.maxsi %x0_raw, %c0i : i32
+  %x0_i = scalar.minsi %x0_lo, %c47i : i32
+  %y1_pre = scalar.addi %y0_i, %c1i : i32
+  %y1_i = scalar.minsi %y1_pre, %c47i : i32
+  %x1_pre = scalar.addi %x0_i, %c1i : i32
+  %x1_i = scalar.minsi %x1_pre, %c47i : i32
+  %y0 = index.cast %y0_i : i32 to index
+  %y1 = index.cast %y1_i : i32 to index
+  %x0 = index.cast %x0_i : i32 to index
+  %x1 = index.cast %x1_i : i32 to index
+  %y0f = scalar.sitofp %y0_i : i32 to f32
+  %x0f = scalar.sitofp %x0_i : i32 to f32
+  %wy = scalar.subf %fy, %y0f : f32
+  %wx = scalar.subf %fx, %x0f : f32
+  %one_m_wy = scalar.subf %one, %wy : f32
+  %one_m_wx = scalar.subf %one, %wx : f32
+  %w00 = scalar.mulf %one_m_wy, %one_m_wx : f32
+  %w01 = scalar.mulf %one_m_wy, %wx : f32
+  %w10 = scalar.mulf %wy, %one_m_wx : f32
+  %w11 = scalar.mulf %wy, %wx : f32
+  // Row indices into the 48x48 plane, then flat table offsets.
+  %y0_48 = index.mul %y0, %c48 : index
+  %y1_48 = index.mul %y1, %c48 : index
+  %r00 = index.add %y0_48, %x0 : index
+  %r01 = index.add %y0_48, %x1 : index
+  %r10 = index.add %y1_48, %x0 : index
+  %r11 = index.add %y1_48, %x1 : index
+  %b00 = index.mul %r00, %c1152 : index
+  %b01 = index.mul %r01, %c1152 : index
+  %b10 = index.mul %r10, %c1152 : index
+  %b11 = index.mul %r11, %c1152 : index
+  %patch_base = index.mul %patch, %c1152 : index
+  %sink = scf.for %j = [%c0 to %c5 step %c1](%mark = %c0 : index) -> (index) {
+    %off = index.mul %j, %c256 : index
+    %dim = index.add %lane, %off : index
+    %live = index.cmp ult, %dim, %c1152 : index
+    %step = scf.if %live -> (index) {
+      %i00 = index.add %b00, %dim : index
+      %i01 = index.add %b01, %dim : index
+      %i10 = index.add %b10, %dim : index
+      %i11 = index.add %b11, %dim : index
+      %p00 = view.load %positions_view[%i00] : view<[%positions_elems]xf32> -> f32
+      %p01 = view.load %positions_view[%i01] : view<[%positions_elems]xf32> -> f32
+      %p10 = view.load %positions_view[%i10] : view<[%positions_elems]xf32> -> f32
+      %p11 = view.load %positions_view[%i11] : view<[%positions_elems]xf32> -> f32
+      %t00 = scalar.mulf %p00, %w00 : f32
+      %t01 = scalar.mulf %p01, %w01 : f32
+      %t10 = scalar.mulf %p10, %w10 : f32
+      %t11 = scalar.mulf %p11, %w11 : f32
+      %s0 = scalar.addf %t00, %t01 : f32
+      %s1 = scalar.addf %s0, %t10 : f32
+      %position = scalar.addf %s1, %t11 : f32
+      %pos_narrow = scalar.fptrunc %position : f32 to bf16
+      %pos_round = scalar.extf %pos_narrow : bf16 to f32
+      %idx = index.add %patch_base, %dim : index
+      %h = view.load %hidden_view[%idx] : view<[%hidden_elems]xf32> -> f32
+      %b = view.load %bias_view[%dim] : view<[%c1152]xf32> -> f32
+      %h_narrow = scalar.fptrunc %h : f32 to bf16
+      %h_round = scalar.extf %h_narrow : bf16 to f32
+      %sum = scalar.addf %h_round, %b : f32
+      %sum_narrow = scalar.fptrunc %sum : f32 to bf16
+      %sum_round = scalar.extf %sum_narrow : bf16 to f32
+      %total = scalar.addf %sum_round, %pos_round : f32
+      %total_narrow = scalar.fptrunc %total : f32 to bf16
+      %result = scalar.extf %total_narrow : bf16 to f32
+      view.store %result, %hidden_view[%idx] : f32, view<[%hidden_elems]xf32>
+      scf.yield %mark : index
+    } else {
+      scf.yield %mark : index
+    }
+    scf.yield %step : index
+  }
+  kernel.return
+}
+
+// Requires --config=yah_vision_patch_position.count=4, .grid_height=48,
+// .grid_width=48, .positions_elems=2654208.
+//
+// With grid 48x48 the two scales are exactly 1.0, so wy = wx = 0 and only the
+// (y0,x0) sample is weighted. The four patch decompositions give rows 0, 1, 48
+// and 49, so the four table rows a wrong (y,x) decomposition would pick a
+// different value at. Every tensor is `e mod 17`, which makes 1152 (= 13 mod 17)
+// and the row stride visible: the expected output is the small fixture below,
+// and every intermediate is a bf16-exact integer so the comparison is exact.
+check.case public @yah_vision_patch_position_case {
+  %hidden = check.generate.iota offset(0.0) step(1.0) period(17) : tensor<4608xf32>
+  %bias = check.generate.iota offset(0.0) step(1.0) period(17) : tensor<1152xf32>
+  %positions = check.generate.iota offset(0.0) step(1.0) period(17) : tensor<2654208xf32>
+  %expected = check.file.read.npy path("fixtures/vision_patch_position/expected.npy") : tensor<4608xf32>
+  kernel.launch @yah_vision_patch_position(%hidden, %bias, %positions) : (tensor<4608xf32>, tensor<1152xf32>, tensor<2654208xf32>)
+  check.expect.close actual(%hidden) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<4608xf32>
+  check.return
+}
+
+check.benchmark<@yah_vision_patch_position_case> @yah_vision_patch_position_bench
