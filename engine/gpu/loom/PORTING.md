@@ -58,6 +58,7 @@ explicitly deferred.
 | yah_gemv_q4k_f32.loom | gemv_quant.hip | Q4_K block GEMV (Q8KBlockGEMVKernel, Q4_K arm) | ported, 1.33 ms at 17408 rows x 5120; sparse-activation fixture exact |
 | yah_gemv_q6k_f32.loom | gemv_quant.hip | Q6_K block GEMV (Q8KBlockGEMVKernel, Q6_K arm) | ported, 1.04 ms at 17408 rows x 5120; the shard output-projection arm |
 | yah_gemv_q3k_f32.loom | gemv_quant.hip | Q3_K block GEMV (Q8KBlockGEMVKernel, Q3_K arm) | ported, 0.97 ms at 17408 rows x 5120; tied lm-head fallback |
+| yah_prefill_embed_q3k_f32.loom | prefill_embed.hip | batched embedding lookup with in-kernel Q3_K decode (BatchedEmbeddingLookupKernel) | ported, 0.0139 ms at batch 64 x hidden 5120; token_embd is Q3_K on this shard |
 | yah_fused_swiglu_q4k_f32.loom | swiglu.hip | fused quantized SwiGLU GEMV, Q4_K (Wave32FusedQuantSwiGLUGEMVKernel) | ported, 2.08 ms at 17408 rows x 5120; gate and up share the sparse fixture |
 | yah_qkv_q4k_f32.loom | qkv.hip | fused quantized QKV projection, Q4_K (Wave32FusedQKVProjectionsKernel_1Row) | ported, 0.447 ms at q=6144/kv=1024; three row bands each checked |
 | yah_ffn_gemm_q5k_f32.loom | prefill_fp16.hip | batched Q5_K FFN GEMM with in-kernel decode (kStore) | ported, 15.54 ms at m_tiles=1088; fixture exact at m_tiles=1 |

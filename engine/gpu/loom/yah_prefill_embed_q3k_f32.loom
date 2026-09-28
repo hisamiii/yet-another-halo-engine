@@ -1,0 +1,209 @@
+// YAH batched embedding lookup with in-kernel Q3_K decode, Loom port of
+// BatchedEmbeddingLookupKernel (prefill_embed.hip). For each (batch, hidden
+// block) the kernel reads the token id, computes the table row, decodes the
+// Q3_K block and writes 256 f32 elements:
+//
+//   out[b*hidden + hb*256 + i] = q3k_decode(table, token_ids[b], hb*256 + i)
+//
+// The HIP kernel decodes through QuantBlockElement, which is DecodeQuantSub16,
+// so the arithmetic matches yah_gemv_q3k. token_embd.weight is Q3_K on this
+// shard, so this arm runs at the head of every prefill.
+//
+// Measured: 0.0139 ms at batch 64 / hidden 5120. 0.0113 ms at the fixture
+// geometry (batch 2 / hidden 512).
+//// Required config: --config=yah_prefill_embed_q3k.batch=2
+//                  --config=yah_prefill_embed_q3k.blocks_per_row=2
+//                  --config=yah_prefill_embed_q3k.hidden=512
+//                  --config=yah_prefill_embed_q3k.vocab=4
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_prefill_embed_q3k.batch : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @yah_prefill_embed_q3k.blocks_per_row : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_prefill_embed_q3k.hidden : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @yah_prefill_embed_q3k.vocab : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_prefill_embed_q3k() {
+  %unit = index.constant 1 : index
+  %bpr = config.get @yah_prefill_embed_q3k.blocks_per_row : index
+  %batch = config.get @yah_prefill_embed_q3k.batch : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%bpr, %batch, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%table: buffer, %tokens: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c55 = index.constant 55 : index
+  %c110 = index.constant 110 : index
+  %c256 = index.constant 256 : index
+  %c0i = scalar.constant 0 : i32
+  %c1i = scalar.constant 1 : i32
+  %c2i = scalar.constant 2 : i32
+  %c3i = scalar.constant 3 : i32
+  %c4i = scalar.constant 4 : i32
+  %c5i = scalar.constant 5 : i32
+  %c6i = scalar.constant 6 : i32
+  %c7i = scalar.constant 7 : i32
+  %c8i = scalar.constant 8 : i32
+  %c15i = scalar.constant 15 : i32
+  %c16i = scalar.constant 16 : i32
+  %c32i = scalar.constant 32 : i32
+  %c54i = scalar.constant 54 : i32
+  %c96i = scalar.constant 96 : i32
+  %c110i = scalar.constant 110 : i32
+  %c256i = scalar.constant 256 : i32
+  %batch = config.get @yah_prefill_embed_q3k.batch : index
+  %bpr = config.get @yah_prefill_embed_q3k.blocks_per_row : index
+  %hidden = config.get @yah_prefill_embed_q3k.hidden : index
+  %vocab = config.get @yah_prefill_embed_q3k.vocab : index
+  %batch_i = index.cast %batch : index to i32
+  %bpr_i = index.cast %bpr : index to i32
+  %hidden_i = index.cast %hidden : index to i32
+  %row_bytes = index.mul %bpr, %c110 : index
+  %row_halfs = index.mul %bpr, %c55 : index
+  %table_bytes = index.mul %vocab, %row_bytes : index
+  %table_halfs = index.mul %vocab, %row_halfs : index
+  %out_elems = index.mul %batch, %hidden : index
+  %table_na, %tokens_na, %out_na = buffer.assume.noalias %table, %tokens, %out : buffer, buffer, buffer
+  %t_view = buffer.view %table_na[%base] : buffer -> view<[%table_bytes]xi8>
+  %t_f16_view = buffer.view %table_na[%base] : buffer -> view<[%table_halfs]xf16>
+  %tok_view = buffer.view %tokens_na[%base] : buffer -> view<[%batch]xi32>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%out_elems]xf32>
+  %t_last = index.sub %table_bytes, %c1 : index
+  %t_half_last = index.sub %table_halfs, %c1 : index
+  %tok_last = index.sub %batch, %c1 : index
+  %out_last = index.sub %out_elems, %c1 : index
+  %b = kernel.workgroup.id<y> : index
+  %hb = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %b_i = index.cast %b : index to i32
+  %hb_i = index.cast %hb : index to i32
+  %lane_i = index.cast %lane : index to i32
+  %b_lo = index.max %b, %c0 : index
+  %b_ix = index.min %b_lo, %tok_last : index
+  %tok = view.load %tok_view[%b_ix] : view<[%batch]xi32> -> i32
+  %row_blocks = scalar.muli %tok, %bpr_i : i32
+  %blk = scalar.addi %row_blocks, %hb_i : i32
+  %blk_off = scalar.muli %blk, %c110i : i32
+  %out_base = scalar.muli %b_i, %hidden_i : i32
+  %hb_off = scalar.muli %hb_i, %c256i : i32
+  %out_pre = scalar.addi %out_base, %hb_off : i32
+  %j_sink = scf.for %j = [%c0 to %c8 step %c1](%mk = %c0 : index) -> (index) {
+    %j_i = index.cast %j : index to i32
+    %j32 = scalar.shli %j_i, %c5i : i32
+    %i_i = scalar.addi %lane_i, %j32 : i32
+    %group = scalar.shrui %i_i, %c5i : i32
+    %half = scalar.shrui %group, %c2i : i32
+    %sp = scalar.andi %group, %c3i : i32
+    %h16b = scalar.andi %i_i, %c16i : i32
+    %h16 = scalar.shrui %h16b, %c4i : i32
+    %jj = scalar.andi %i_i, %c15i : i32
+    %lane_of = scalar.addi %h16b, %jj : i32
+    %half32 = scalar.shli %half, %c5i : i32
+    %qs0 = scalar.addi %blk_off, %c32i : i32
+    %qs1 = scalar.addi %qs0, %half32 : i32
+    %qs_i = scalar.addi %qs1, %lane_of : i32
+    %low_shift = scalar.shli %sp, %c1i : i32
+    %qs_ix = index.cast %qs_i : i32 to index
+    %qs_lo = index.max %qs_ix, %c0 : index
+    %qs_idx = index.min %qs_lo, %t_last : index
+    %qsb8 = view.load %t_view[%qs_idx] : view<[%table_bytes]xi8> -> i8
+    %qsb = scalar.extui %qsb8 : i8 to i32
+    %low0 = scalar.shrui %qsb, %low_shift : i32
+    %low = scalar.andi %low0, %c3i : i32
+    %hm_i = scalar.addi %blk_off, %lane_of : i32
+    %hm_ix = index.cast %hm_i : i32 to index
+    %hm_lo = index.max %hm_ix, %c0 : index
+    %hm_idx = index.min %hm_lo, %t_last : index
+    %hmb8 = view.load %t_view[%hm_idx] : view<[%table_bytes]xi8> -> i8
+    %hmb = scalar.extui %hmb8 : i8 to i32
+    %half4 = scalar.shli %half, %c2i : i32
+    %high_shift = scalar.addi %half4, %sp : i32
+    %bit0 = scalar.shrui %hmb, %high_shift : i32
+    %bit = scalar.andi %bit0, %c1i : i32
+    %bit4 = scalar.shli %bit, %c2i : i32
+    %lowbit = scalar.ori %low, %bit4 : i32
+    %quant = scalar.subi %lowbit, %c4i : i32
+    %quant_f = scalar.sitofp %quant : i32 to f32
+    %si0 = scalar.muli %half, %c8i : i32
+    %sp2 = scalar.shli %sp, %c1i : i32
+    %si1 = scalar.addi %si0, %sp2 : i32
+    %si_v = scalar.addi %si1, %h16 : i32
+    %si_lt8 = scalar.cmpi slt, %si_v, %c8i : i32
+    %si_lo3 = scalar.andi %si_v, %c7i : i32
+    %sc0 = scalar.addi %blk_off, %c96i : i32
+    %sc1 = scalar.addi %sc0, %si_lo3 : i32
+    %sc_ix = index.cast %sc1 : i32 to index
+    %sc_lo = index.max %sc_ix, %c0 : index
+    %sc_idx = index.min %sc_lo, %t_last : index
+    %scb8 = view.load %t_view[%sc_idx] : view<[%table_bytes]xi8> -> i8
+    %scb = scalar.extui %scb8 : i8 to i32
+    %scb_lo = scalar.andi %scb, %c15i : i32
+    %scb_hi = scalar.shrui %scb, %c4i : i32
+    %low4 = scf.if %si_lt8 -> (i32) {
+      scf.yield %scb_lo : i32
+    } else {
+      scf.yield %scb_hi : i32
+    }
+    %si_mod4 = scalar.andi %si_v, %c3i : i32
+    %hi_off8 = scalar.addi %sc0, %c8i : i32
+    %hi1 = scalar.addi %hi_off8, %si_mod4 : i32
+    %hi_ix = index.cast %hi1 : i32 to index
+    %hi_lo = index.max %hi_ix, %c0 : index
+    %hi_idx = index.min %hi_lo, %t_last : index
+    %hib8 = view.load %t_view[%hi_idx] : view<[%table_bytes]xi8> -> i8
+    %hib = scalar.extui %hib8 : i8 to i32
+    %si_div4 = scalar.shrui %si_v, %c2i : i32
+    %hi_shift2 = scalar.shli %si_div4, %c1i : i32
+    %high0 = scalar.shrui %hib, %hi_shift2 : i32
+    %high2 = scalar.andi %high0, %c3i : i32
+    %high4b = scalar.shli %high2, %c4i : i32
+    %scale6 = scalar.ori %low4, %high4b : i32
+    %scale_biased = scalar.subi %scale6, %c32i : i32
+    %scale_f = scalar.sitofp %scale_biased : i32 to f32
+    %blk_half0 = scalar.shrui %blk_off, %c1i : i32
+    %d_i = scalar.addi %blk_half0, %c54i : i32
+    %d_ix = index.cast %d_i : i32 to index
+    %d_lo = index.max %d_ix, %c0 : index
+    %d_idx = index.min %d_lo, %t_half_last : index
+    %d_half_v = view.load %t_f16_view[%d_idx] : view<[%table_halfs]xf16> -> f16
+    %d = scalar.extf %d_half_v : f16 to f32
+    %dsc = scalar.mulf %d, %scale_f : f32
+    %value = scalar.mulf %dsc, %quant_f : f32
+    %out_i = scalar.addi %out_pre, %i_i : i32
+    %out_ix2 = index.cast %out_i : i32 to index
+    %out_lo2 = index.max %out_ix2, %c0 : index
+    %out_idx = index.min %out_lo2, %out_last : index
+    view.store %value, %out_view[%out_idx] : f32, view<[%out_elems]xf32>
+    scf.yield %mk : index
+  }
+  kernel.return
+}
+// Requires batch=2, blocks_per_row=2, hidden=512, vocab=4.
+check.case public @yah_prefill_embed_q3k_case {
+  %table = check.file.read.npy path("fixtures/prefill_embed/input_table.npy") : tensor<880xi8>
+  %tokens = check.file.read.npy path("fixtures/prefill_embed/tokens.npy") : tensor<2xi32>
+  %out = check.generate.fill value(0.0) : tensor<1024xf32>
+  %expected = check.file.read.npy path("fixtures/prefill_embed/expected.npy") : tensor<1024xf32>
+  kernel.launch @yah_prefill_embed_q3k(%table, %tokens, %out) : (tensor<880xi8>, tensor<2xi32>, tensor<1024xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1024xf32>
+  check.return
+}
+
+check.benchmark<@yah_prefill_embed_q3k_case> @yah_prefill_embed_q3k_bench
+
+// Requires batch=64, blocks_per_row=20, hidden=5120, vocab=4.
+check.case public @yah_prefill_embed_q3k_full_case {
+  %table = check.file.read.npy path("fixtures/prefill_embed/input_table_full.npy") : tensor<8800xi8>
+  %tokens = check.file.read.npy path("fixtures/prefill_embed/tokens_full.npy") : tensor<64xi32>
+  %out = check.generate.fill value(0.0) : tensor<327680xf32>
+  %expected = check.file.read.npy path("fixtures/prefill_embed/expected_full.npy") : tensor<327680xf32>
+  kernel.launch @yah_prefill_embed_q3k(%table, %tokens, %out) : (tensor<8800xi8>, tensor<64xi32>, tensor<327680xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<327680xf32>
+  check.return
+}
+
+check.benchmark<@yah_prefill_embed_q3k_full_case> @yah_prefill_embed_q3k_full_bench
