@@ -473,6 +473,20 @@ class Forward {
       std::fprintf(stderr, "yah forward: dumped %s\n", path);
     };
 
+    const auto dump_bytes = [&](const char* tag, const void* ptr,
+                              std::size_t bytes) {
+      if (dump_dir == nullptr) return;
+      std::vector<std::uint8_t> host(bytes);
+      Check(hipMemcpy(host.data(), ptr, bytes, hipMemcpyDeviceToHost),
+            "dump bytes");
+      char path[512];
+      std::snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, tag);
+      FILE* file = std::fopen(path, "wb");
+      if (file == nullptr) return;
+      std::fwrite(host.data(), 1, bytes, file);
+      std::fclose(file);
+    };
+
     LaunchBatchedEmbeddingLookup(
         weights_.token_embd.data, Gt(weights_.token_embd.type), buffers_.tokens,
         buffers_.hidden, batch, hidden_, stream_);
@@ -574,6 +588,16 @@ class Forward {
                                    buffers_.beta, batch, ts_rank_, hidden_,
                                    stream_);
         stage("ssm_proj", l);
+        if (l == 0) {
+          dump_bytes("ssm_qkv", buffers_.ssm_qkv,
+                     static_cast<std::size_t>(batch) * ssm_qkv_ * 4);
+          dump_bytes("ssm_gate", buffers_.ssm_gate,
+                     static_cast<std::size_t>(batch) * ssm_inner_ * 4);
+          dump_bytes("ssm_alpha", buffers_.alpha,
+                     static_cast<std::size_t>(batch) * ts_rank_ * 4);
+          dump_bytes("ssm_beta", buffers_.beta,
+                     static_cast<std::size_t>(batch) * ts_rank_ * 4);
+        }
         // The row-split recurrence fuses the norm, gate, and FP16 conversion
         // and is the path the reference runs by default. The unfused variant
         // the SSM check verified directly stays available behind
@@ -609,9 +633,19 @@ class Forward {
                             static_cast<std::size_t>(batch) * ssm_inner_,
                             stream_);
         }
+        if (l == 0) {
+          dump_bytes("ssm_raw", buffers_.ssm_out,
+                     static_cast<std::size_t>(batch) * ssm_inner_ * 4);
+          dump_bytes("ssm_postnorm", buffers_.scratch_f16,
+                     static_cast<std::size_t>(batch) * ssm_inner_ * 2);
+        }
         LaunchBatchedQuantGEMMResidualFp16(
             Gt(layer.ssm_out.type), layer.ssm_out.data, buffers_.scratch_f16,
             buffers_.hidden, batch, hidden_, ssm_inner_, stream_);
+        if (l == 0) {
+          dump_bytes("hidden_mixer", buffers_.hidden,
+                     static_cast<std::size_t>(batch) * hidden_ * 4);
+        }
         stage("ssm", l);
       }
       stage("mixer", l);

@@ -177,6 +177,19 @@ source engine/hrx-env.sh
 /tmp/loom_head_probe <model.gguf> /tmp/emit_head/yah_rmsnorm_f32.hal /tmp/emit_head/yah_gemv_q4k_f32.hal /tmp/emit_head/yah_argmax_f32.hal /tmp/hipdump/layer_63.bin 5 /tmp/loom_logits.bin
 ```
 
+`engine/run/loom_ssm_layer_probe.cc` runs one Gated DeltaNet layer end to end on
+Loom through HRX: `yah_half_norm`, four Q4_K kStore projections (attn_qkv,
+attn_gate, ssm_alpha, ssm_beta), `yah_ssm_conv`, `yah_deltanet_prep_kq`,
+`yah_deltanet_prep_ab`, `yah_deltanet_rowsplit`, `yah_ssm_postnorm_fp16` and the
+Q4_K kResidual output projection. `YAH_DUMP_DIR` in the HIP engine now also
+writes the SSM stage buffers (`ssm_qkv`, `ssm_gate`, `ssm_alpha`, `ssm_beta`,
+`ssm_raw`, `ssm_postnorm`) and the post-mixer residual (`hidden_mixer`) for layer
+0, so the two paths are compared stage by stage. Results against
+`base_q4kpure.gguf`, prompt `760 6511 314 9338 369`: every SSM stage within
+0.008 of HIP, and the post-mixer residual matches to `max_abs 0.016`,
+`mean_abs 5.5e-05`. (The initial 5.05 gap was comparing against the
+post-FFN layer dump, not the mixer.)
+
 ## 5. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape
