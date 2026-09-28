@@ -1220,6 +1220,28 @@ LDS reads need ~3072 cycles of the ~26000-cycle stage at 128 B/clk (12%), DRAM
 traffic is ~20 GB/s of 187, issue is ~15% occupied, bank conflicts are 0, spills
 are 0, and the memory pipe reads 30.8% busy.
 
+
+### Not available on this part: vmem-to-LDS staging (global_load_lds)
+
+The obvious way to remove the staging VGPR round-trip -- every staged byte is
+currently written to a register and read back -- is the Ampere-style direct
+global-to-LDS copy. It is not available on gfx1151. Probe:
+
+| arch | \`__builtin_amdgcn_global_load_lds\` |
+| --- | --- |
+| gfx942 (CDNA3) | **selects**, \`global_load_lds\` in the ISA |
+| gfx90a | compiles, lowered to a regular load plus \`ds_write\` |
+| gfx1100 (RDNA3) | \`Cannot select\` |
+| **gfx1151** | \`Cannot select\`; assembler: "instruction not supported on this GPU" |
+
+The subtarget feature \`vmem-to-lds-load-insts\` *is* listed for gfx1151 and the
+builtin's feature gate passes under
+\`__attribute__((target("vmem-to-lds-load-insts")))\`, but none of the size
+encodings (1, 2, 4) select and no \`lds\`-modifier form of \`global_load\`
+assembles. The instruction is CDNA3-only in this toolchain, so the staging
+register round-trip is not removable on Strix Halo. That closes the last
+instruction-stream lever on the staging path.
+
 The design is at the **traffic-optimal point for the LDS budget**: staging cost
 per MAC is `(BM*WN + BN*WM) / (BM*BN*BK*16)`, and under the constraint
 `(BM+BN)*BK*32 <= 65536` the shipped 256x256 BK4 maximises the denominator for
