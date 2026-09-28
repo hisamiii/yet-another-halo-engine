@@ -77,6 +77,11 @@ explicitly deferred.
 | yah_ffn_gemm_q5k_gateup_f16.loom | prefill_fp16.hip | paired gate/up Q5_K GEMM with SwiGLU (kGateUp) | ported, 29.30 ms at m_tiles=1088; same-format, 6 layers |
 | yah_ffn_gemm_q3k_gateup_f16.loom | prefill_fp16.hip | paired gate/up Q3_K GEMM with SwiGLU (kGateUp) | ported, 25.49 ms at m_tiles=1088; same-format, 3 layers |
 | yah_ffn_gemm_q6k_gateup_f16.loom | prefill_fp16.hip | paired gate/up Q6_K GEMM with SwiGLU (kGateUp) | ported, 29.80 ms at m_tiles=1088; same-format, 1 layer |
+| yah_ffn_gemm_iq4xs_q4k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 30.96 ms at m_tiles=1088; mixed operand sizes |
+| yah_ffn_gemm_q4k_iq4xs_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 31.89 ms at m_tiles=1088; mixed operand sizes |
+| yah_ffn_gemm_iq4xs_iq4nl_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 26.55 ms at m_tiles=1088; mixed operand sizes |
+| yah_ffn_gemm_q4k_q5k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 40.59 ms at m_tiles=1088; mixed operand sizes |
+| yah_ffn_gemm_q5k_q6k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 30.42 ms at m_tiles=1088; mixed operand sizes |
 | yah_ffn_gemm_iq2xs_f32.loom | prefill_fp16.hip | batched IQ2_XS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 19.85 ms at m_tiles=1088; grid passed as i32 word pairs of the 64-bit entries |
 | yah_ffn_gemm_iq2s_f32.loom | prefill_fp16.hip | batched IQ2_S FFN GEMM, in-kernel grid+qs-sign decode (kStore) | ported, 12.02 ms at m_tiles=1088; grid passed as i32 word pairs, signs from the qs bytes | 
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
