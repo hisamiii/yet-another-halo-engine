@@ -51,8 +51,10 @@ def decode_block(block):
 def main():
     packed = bytearray()
     row_sums = []
+    decoded_rows = []
     for r in range(ROWS):
         total = np.float64(0.0)
+        row_dec = []
         for b in range(BLOCKS_PER_ROW):
             block = bytearray()
             block += np.float16(2.0 ** -13).tobytes()
@@ -61,8 +63,30 @@ def main():
             block += bytes(((r * 11 + b * 13 + k * 17) % 256) for k in range(128))
             assert len(block) == 136, len(block)
             packed += block
-            total += np.float64(sum(decode_block(block)))
+            dec = decode_block(block)
+            row_dec.extend(dec)
+            total += np.float64(sum(dec))
         row_sums.append(total)
+        decoded_rows.append(row_dec)
+    # Quantized GEMV: a sparse activation pins specific k positions across block,
+    # nibble and scale-pair boundaries, so the expected row dots are exact sums of
+    # a handful of decoded weights. Same pattern as the Q4_K GEMV fixture.
+    x = np.zeros(K, dtype=np.float32)
+    for pos, val in [(0, 1.0), (1, 0.5), (32, 2.0), (33, -1.0), (64, 0.25),
+                     (65, -0.5), (127, 1.5), (240, 0.75), (255, -2.0),
+                     (256, 1.0), (257, -0.25), (300, 0.5), (1023, -1.0),
+                     (4096, 0.125), (5119, 2.0)]:
+        x[pos] = np.float32(val)
+    gemv = np.zeros(ROWS, dtype=np.float32)
+    for r in range(ROWS):
+        acc = np.float64(0.0)
+        for k in range(K):
+            if x[k] != 0.0:
+                acc += decoded_rows[r][k] * np.float64(x[k])
+        gemv[r] = np.float32(acc)
+    np.save(os.path.join(OUT, "gemv_x.npy"), x)
+    np.save(os.path.join(OUT, "gemv_expected.npy"), gemv)
+    print("gemv_expected", gemv[:4])
     exp = np.zeros((TOKENS, ROWS), dtype=np.float32)
     for t in range(TOKENS):
         for r in range(ROWS):
