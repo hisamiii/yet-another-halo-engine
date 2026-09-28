@@ -278,3 +278,58 @@ HIP path matches ROCm, and its native path is a codegen question, not a runtime 
 **So tuning returns to the kernels.** The largest identified item is still the
 DeltaNet recurrence at ~12.6x worse FLOPs per unit time than the GEMM next to it,
 which is a shape problem (chunk the token axis), not a scheduling one.
+
+## Profiling: the amdgpu HAL has a real profiler, with one gap that matters here
+
+The HAL is not stubbed for profiling. It emits AQL profile packets around each
+dispatch and decodes them through AMD's aqlprofile, with separate counter,
+device-metric and ATT paths, plus dispatch/queue events, executable traces, and raw
+.irpf bundles. The relevant flags are `--profile-final-batch=true`,
+`--profile-data=<families>`, `--profile-counter=<NAME>`, and `--profile-artifacts-dir`.
+
+### What has to be true for counters to work
+
+- **aqlprofile must be loadable.** The HAL dlopens `libhsa-amd-aqlprofile64.so.1`.
+  None of our six ROCm 10.0 debs carry it, but TheRock 7.13 ships a working copy at
+  `/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0/lib`, and it loads
+  against ROCm 10.0 HSA. Put that directory first on `LD_LIBRARY_PATH`.
+- **`--profile-data` must include `counters` or `counter-ranges`**, and the counter
+  name must be mapped for the device's gfxip version.
+
+### gfx11.5.1 was rejected outright; one line fixes the family gate
+
+`iree_hal_amdgpu_profile_counter_select_family` accepted only gfx11 with
+`minor == 0 && stepping <= 2`, so gfx1151 (11.5.1) fell through to `UNSUPPORTED` and
+every named counter failed with `UNIMPLEMENTED ... is not mapped for gfx11.5.1`.
+Accepting `minor == 5` as the same family is enough, and the fix is in the local
+checkout but not yet upstreamed.
+
+After that, `SQ_WAVES` profiles successfully and returns **1088** for the FFN GEMM
+configured with `m_tiles=1088` -- one wave per workgroup, exactly as the kernel is
+written. That is an independent device-side confirmation of the launch geometry,
+which no amount of host-side timing gives you.
+
+### The catalog is the real limit, not the plumbing
+
+Only three counters are mapped for the gfx11 family: `SQ_WAVES`, `SQ_BUSY_CYCLES`,
+and `SQ_INSTS_VALU`. The memory-system counters that would settle whether the
+activation operand is served from L2 -- `TCC_EA0_RDREQ`, `TCC_EA0_RDREQ_DRAM`,
+`TCC_EA0_RDREQ_32B`, `TCC_EA0_WRREQ`, `TCP_TCC_READ_REQ`, `TCP_TOTAL_READ`, the
+`TA_*` block -- are all present in the table but explicitly `UNSUPPORTED` for gfx11.
+
+The header comment says arch-specific PMC program generation is deliberately
+centralized in aqlprofile so that factories such as gfx115x stay out of IREE. But
+event *id* resolution is not centralized: the table hardcodes numeric ids per family,
+and aqlprofile exposes `aqlprofile_iterate_event_ids` to ask a live agent for them --
+a symbol the HAL never loads. That is the actual gap for gfx115x memory counters, and
+it is a contained fix: query the ids for the agent instead of indexing a static table,
+falling back to the table where the query is unavailable.
+
+### Two practical notes
+
+- `--profile-data=device-metrics` executes and exits 0 but returns `row_count: 0` with
+  the warning `dispatch_distribution_unavailable`, so it is not useful on this device
+  as it stands.
+- `rocprofv3` is installed on this box (including a gfx1151 TheRock build) and carries
+  its own per-architecture counter definitions, so it is the faster route to the
+  TCC/TCP counters today. It attaches through HSA, which the benchmark already uses.
