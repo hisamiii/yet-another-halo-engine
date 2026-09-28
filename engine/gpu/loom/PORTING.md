@@ -38,7 +38,7 @@ explicitly deferred.
 | yah_deltanet_prep_ab_f32.loom | ssm_row_split.hip | DeltaNet alpha/beta prep + conv history advance | ported, 0.0087 ms; ab within 1e-5, history exact |
 | yah_ssm_postnorm_gate_f16.loom | ssm_row_split.hip | fp16 SSM post-norm + gate epilogue | ported, 0.0079 ms at 3 heads; fixture + 1e-6 tolerance |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
-| - | qkv.hip | QKV projection | todo |
+| yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
@@ -104,9 +104,10 @@ profile gives one, so the expensive paths move first rather than the convenient 
 - There is no `scalar.select`; use `scf.if` with results. `vector.select` exists.
 - **`index.cmp` returns i1, and `index.andi` does not accept i1.** Select a row band with
   one biased unsigned comparison instead: `(m - band_start) < band_size` is true exactly
-  inside the band and wraps out of range below it. There is also no equality
-  predicate (`index.cmp ueq` is not a predicate), so test `t == N` as
-  `(t - N) < 1` with the same biased subtraction.
+  inside the band and wraps out of range below it. Equality is spelled `eq`
+  (`index.cmp eq, %lane, %c0`), not `ueq` or `ieq`; an earlier note here claimed
+  there was no equality predicate at all, and that was wrong. The biased
+  `(t - N) < 1` form is still useful when a single `ult` has to carry the test.
 - Where a permuted or non-uniform expectation is needed, `check.generate.iota` cannot
   express it. Choose a shape where the expectation collapses to an arithmetic sequence
   (the QG unpack case uses head_dim=1 so the interleave is src = 2*idx), or accept a

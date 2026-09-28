@@ -1,0 +1,139 @@
+// YAH fused QKV projections (f32 weights), Loom port of the f32 path of
+// Wave32FusedQKVProjectionsKernel_1Row.
+//
+// HIP source: models/qwen/hip/kernels/qkv.hip. One warp per output row; the row
+// index selects one of three weight matrices, one of three output buffers, and
+// the row within that matrix:
+//
+//   m < q_dim              -> q_w[m],                   q_out[m]
+//   m < q_dim + kv_dim     -> k_w[m - q_dim],           k_out[m - q_dim]
+//   else                   -> v_w[m - q_dim - kv_dim],  v_out[m - q_dim - kv_dim]
+//
+// and the output is the dot of that weight row with x, reduced across the warp.
+//
+// The HIP kernel dispatches on the weight type and carries f32, bf16, Q8_0 and a
+// generic quantized path in one kernel. This port covers the f32 path; the other
+// three are separate branches of the same HIP kernel and are tracked in
+// PORTING.md. It also drops the float4 vectorization and the vector/tail split,
+// using one strided scalar loop and a single `kernel.subgroup.reduce<addf>`, which
+// is the same sum in a different order. Reordering is free here because the check
+// values are exact integers.
+//
+// The HIP kernel packs WavesPerBlock warps into one block and derives the row from
+// the warp id; this port gives each row its own one-warp workgroup. Same rows, same
+// arithmetic, different packing.
+//
+// Required config: --config=yah_qkv_proj.q_dim=3 --config=yah_qkv_proj.kv_dim=2
+//                  --config=yah_qkv_proj.hidden=5
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_qkv_proj.q_dim : %value: index where [range(%value, 1, 65536)]
+config.decl @yah_qkv_proj.kv_dim : %value: index where [range(%value, 1, 65536)]
+config.decl @yah_qkv_proj.hidden : %value: index where [range(%value, 1, 65536)]
+
+kernel.def target(@yah_wave32) @yah_qkv_proj() {
+  %unit = index.constant 1 : index
+  %q_dim = config.get @yah_qkv_proj.q_dim : index
+  %kv_dim = config.get @yah_qkv_proj.kv_dim : index
+  %c32 = index.constant 32 : index
+  %k_end = index.add %q_dim, %kv_dim : index
+  %total_rows = index.add %k_end, %kv_dim : index
+  kernel.launch.config workgroups(%total_rows, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%q_w: buffer, %k_w: buffer, %v_w: buffer, %x: buffer, %q_out: buffer, %k_out: buffer, %v_out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %zero = scalar.constant 0.0 : f32
+  %q_dim = config.get @yah_qkv_proj.q_dim : index
+  %kv_dim = config.get @yah_qkv_proj.kv_dim : index
+  %hidden = config.get @yah_qkv_proj.hidden : index
+  %k_end = index.add %q_dim, %kv_dim : index
+  %qw_na, %kw_na, %vw_na, %x_na = buffer.assume.noalias %q_w, %k_w, %v_w, %x : buffer, buffer, buffer, buffer
+  %qo_na, %ko_na, %vo_na = buffer.assume.noalias %q_out, %k_out, %v_out : buffer, buffer, buffer
+  %qw_view = buffer.view %qw_na[%base] : buffer -> view<[%q_dim]x[%hidden]xf32>
+  %kw_view = buffer.view %kw_na[%base] : buffer -> view<[%kv_dim]x[%hidden]xf32>
+  %vw_view = buffer.view %vw_na[%base] : buffer -> view<[%kv_dim]x[%hidden]xf32>
+  %x_view = buffer.view %x_na[%base] : buffer -> view<[%hidden]xf32>
+  %qo_view = buffer.view %qo_na[%base] : buffer -> view<[%q_dim]xf32>
+  %ko_view = buffer.view %ko_na[%base] : buffer -> view<[%kv_dim]xf32>
+  %vo_view = buffer.view %vo_na[%base] : buffer -> view<[%kv_dim]xf32>
+  %m = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %is_leader = index.cmp eq, %lane, %c0 : index
+  %in_q = index.cmp ult, %m, %q_dim : index
+  scf.if %in_q {
+    %acc = scf.for %k = [%lane to %hidden step %c32](%s = %zero : f32) -> (f32) {
+      %w = view.load %qw_view[%m, %k] : view<[%q_dim]x[%hidden]xf32> -> f32
+      %xv = view.load %x_view[%k] : view<[%hidden]xf32> -> f32
+      %p = scalar.mulf %w, %xv : f32
+      %n = scalar.addf %s, %p : f32
+      scf.yield %n : f32
+    }
+    %dot = kernel.subgroup.reduce<addf> %acc : f32
+    scf.if %is_leader {
+      view.store %dot, %qo_view[%m] : f32, view<[%q_dim]xf32>
+    }
+  }
+  %in_k = index.cmp ult, %m, %k_end : index
+  %is_k = index.cmp uge, %m, %q_dim : index
+  scf.if %in_k {
+    scf.if %is_k {
+      %row = index.sub %m, %q_dim : index
+      %acc2 = scf.for %k2 = [%lane to %hidden step %c32](%s2 = %zero : f32) -> (f32) {
+        %w2 = view.load %kw_view[%row, %k2] : view<[%kv_dim]x[%hidden]xf32> -> f32
+        %xv2 = view.load %x_view[%k2] : view<[%hidden]xf32> -> f32
+        %p2 = scalar.mulf %w2, %xv2 : f32
+        %n2 = scalar.addf %s2, %p2 : f32
+        scf.yield %n2 : f32
+      }
+      %dot2 = kernel.subgroup.reduce<addf> %acc2 : f32
+      scf.if %is_leader {
+        view.store %dot2, %ko_view[%row] : f32, view<[%kv_dim]xf32>
+      }
+    }
+  }
+  %is_v = index.cmp uge, %m, %k_end : index
+  scf.if %is_v {
+    %row3 = index.sub %m, %k_end : index
+    %acc3 = scf.for %k3 = [%lane to %hidden step %c32](%s3 = %zero : f32) -> (f32) {
+      %w3 = view.load %vw_view[%row3, %k3] : view<[%kv_dim]x[%hidden]xf32> -> f32
+      %xv3 = view.load %x_view[%k3] : view<[%hidden]xf32> -> f32
+      %p3 = scalar.mulf %w3, %xv3 : f32
+      %n3 = scalar.addf %s3, %p3 : f32
+      scf.yield %n3 : f32
+    }
+    %dot3 = kernel.subgroup.reduce<addf> %acc3 : f32
+    scf.if %is_leader {
+      view.store %dot3, %vo_view[%row3] : f32, view<[%kv_dim]xf32>
+    }
+  }
+  kernel.return
+}
+
+// Requires --config=yah_qkv_proj.q_dim=3 --config=yah_qkv_proj.kv_dim=2
+// --config=yah_qkv_proj.hidden=5.
+//
+// x is all ones and each weight matrix is an iota with its own offset, so every
+// output is the sum of its weight row: row r of a matrix with offset B summed over
+// hidden=5 is 5*B + 25*r + 10, an arithmetic sequence in r. The three offsets
+// differ, so routing a row to the wrong matrix or the wrong row produces a wrong
+// value instead of a coincidentally equal one.
+check.case public @yah_qkv_proj_case {
+  %q_w = check.generate.iota offset(0.0) step(1.0) : tensor<3x5xf32>
+  %k_w = check.generate.iota offset(100.0) step(1.0) : tensor<2x5xf32>
+  %v_w = check.generate.iota offset(200.0) step(1.0) : tensor<2x5xf32>
+  %x = check.generate.fill value(1.0) : tensor<5xf32>
+  %q_out = check.generate.fill value(0.0) : tensor<3xf32>
+  %k_out = check.generate.fill value(0.0) : tensor<2xf32>
+  %v_out = check.generate.fill value(0.0) : tensor<2xf32>
+  %expected_q = check.generate.iota offset(10.0) step(25.0) : tensor<3xf32>
+  %expected_k = check.generate.iota offset(510.0) step(25.0) : tensor<2xf32>
+  %expected_v = check.generate.iota offset(1010.0) step(25.0) : tensor<2xf32>
+  kernel.launch @yah_qkv_proj(%q_w, %k_w, %v_w, %x, %q_out, %k_out, %v_out) : (tensor<3x5xf32>, tensor<2x5xf32>, tensor<2x5xf32>, tensor<5xf32>, tensor<3xf32>, tensor<2xf32>, tensor<2xf32>)
+  check.expect.close actual(%q_out) expected(%expected_q) atol(0.0) rtol(0.0) nan(same) : tensor<3xf32>
+  check.expect.close actual(%k_out) expected(%expected_k) atol(0.0) rtol(0.0) nan(same) : tensor<2xf32>
+  check.expect.close actual(%v_out) expected(%expected_v) atol(0.0) rtol(0.0) nan(same) : tensor<2xf32>
+  check.return
+}
+
+check.benchmark<@yah_qkv_proj_case> @yah_qkv_proj_bench
