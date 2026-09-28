@@ -44,6 +44,7 @@ explicitly deferred.
 | yah_ssm_conv_f32.loom | ssm_recurrence.hip | causal SSM convolution + gate | ported, 0.0148 ms at 4x16; fixture + 1e-6 tolerance |
 | yah_ssm_postnorm_gate_f32.loom | batched_ssm.hip | SSM post-norm + gate epilogue | ported, 0.0173 ms at 2x2x128; fixture + 1e-6 tolerance |
 | yah_deltanet_prep_ab_f32.loom | ssm_row_split.hip | DeltaNet alpha/beta prep + conv history advance | ported, 0.0087 ms; ab within 1e-5, history exact |
+| yah_deltanet_decode_resident_f32.loom | deltanet_decode.hpp | resident fp32 decode recurrence (DeltaNetRecurrenceKernel<float, Resident=true, WriteOutput=true>) | ported, 0.208 ms at 32 heads / 16 key heads; fixture + numpy oracle 1e-5, analytic production case |
 | yah_ssm_postnorm_gate_f16.loom | ssm_row_split.hip | fp16 SSM post-norm + gate epilogue | ported, 0.0079 ms at 3 heads; fixture + 1e-6 tolerance |
 | yah_attn_gate_f32.loom | attention_batched.hip | attention output gate | ported, two exact sigmoid points, no fixture |
 | yah_attn_softmax_f32.loom | attention_batched.hip | causal softmax + causal zeroing | ported, exact at both mask ends |
@@ -326,9 +327,10 @@ already have a single-format port:
   **ported** (`yah_swiglu_decode_f32.loom`) for all ten FFN formats, including
   IQ2_XS (grid+ksigns) and IQ2_S (grid).
 - `DeltaNetRecurrenceKernel<float, Resident=true, WriteOutput=true>`
-  (deltanet_decode.hpp) is the resident fp32 decode recurrence. The prefill
-  row-split recurrence is ported (`yah_deltanet_rowsplit_f32`); this resident
-  variant is a distinct kernel.
+  (deltanet_decode.hpp) is **ported** (`yah_deltanet_decode_resident_f32.loom`),
+  the single-token decode recurrence reached from `LaunchSSMConvRecurrence`. A
+  numpy float64 oracle checks the full state walk and the production case is
+  analytic at 32 heads / 16 key heads.
 - `attention_decode.hip` **ShareKv split-K arm ported**
   (`yah_decode_splitk_sharekv_f16.loom`); it is on the default route because this
   shard is 24:4 = 6:1 and `split_k_decode_` defaults true, so once `pos+1 >= 512`
