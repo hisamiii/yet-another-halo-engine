@@ -196,3 +196,48 @@ So the HRX-specific lever is not in the HIP surface at all. It is the native
 dispatch/graph/semaphore API, and reaching it means producing HRX native
 executables through the Loom/MLIR/TileLang path -- a kernel re-authoring project
 rather than a runtime swap. Worth deciding deliberately rather than drifting into.
+
+## Switch validation: the engine runs on HRX at parity
+
+The decision to move to HRX was taken on the NPU trajectory, so the gate is not
+speed -- it is whether the engine works and whether anything regresses.
+
+**Correctness, all seven check binaries under HRX:**
+
+| check | result |
+| --- | --- |
+| `yah-gemm-check` | CHECK PASS |
+| `yah-ssm-check` | SSM CHECK PASS |
+| `yah-attention-check` | ATTENTION CHECK PASS |
+| `yah-rope-check` | ROPE+NORM CHECK PASS |
+| `yah-unpack-check` | UNPACK CHECK PASS |
+| `yah-ffn-check` | FFN CHECK PASS |
+| `kv-quant-check` | KV QUANT CHECK PASS |
+
+**End-to-end prefill**, `yah-run base_q4kpure.gguf --ids-file ids2048.txt`,
+2048 tokens, same model and ids on both runtimes:
+
+| runtime | prefill | argmax |
+| --- | ---: | ---: |
+| ROCm 7.2.4 | 3125.762 ms | 9338 |
+| HRX + ROCm 10.0.0 | 3130.434 ms, 3138.071 ms | 9338 |
+
+**Parity (+0.4%, inside run-to-run spread) with an identical argmax**, so the
+switch is numerically clean and costs nothing measurable. One pair read 5246 ms for
+HRX; that was a first-of-pair run started immediately after a killed job and did not
+reproduce (3130 / 3138 on either side of it). The earlier per-kernel numbers on the
+same two runtimes point the same way: `ssm_bench` 3.2485 ms under HRX against
+3.3206 ms under ROCm, `gemm_bench one:q4k` 8.86 ms against ~8.9-9.0 ms.
+
+**On "would the dispatches be better implemented directly for HRX".** No, and the
+arithmetic is short. The prefill is 1625 dispatches. At HRX's measured 3.081 us per
+launch that is **5.0 ms of a 3130 ms pass (0.16%)** in total. Implementing natively
+perfectly -- reaching ROCm's 2.397 us, i.e. erasing the entire 0.68 us compat-layer
+cost -- saves **1.1 ms, or 0.035%**. Graph capture saves 0.7 ms, or 0.02%. Dispatch
+is not a lever on this part at any implementation, and the ~4% GPU idle that looked
+like the target is ~40x the per-launch cost, so it is dependency stalls or kernel
+ramp rather than submission.
+
+What native HRX would actually change is codegen, and that needs kernels produced by
+the Loom/MLIR/TileLang path -- the same path the NPU work requires. That is the
+investment worth considering, and it is separable from the runtime switch.
