@@ -48,7 +48,10 @@ explicitly deferred.
 | yah_dequant_q8_0_bf16.loom | prefill_gemm.hip | Q8_0 weight dequant to bf16 | ported, 0.0081 ms; exact periodic expectation |
 | yah_dequant_q5k_bf16.loom | prefill_gemm.hip | Q5_K dequant to bf16 (packed 6-bit scales) | ported, 0.0078 ms; bit-exact via `check.tensor.view` |
 | yah_dequant_q6k_bf16.loom | prefill_gemm.hip | Q6_K dequant to bf16 | ported, 0.0638 ms; bit-exact via `check.tensor.view` |
-| - | prefill_gemm.hip | generic sub-16 element decoder to bf16 | todo |
+| - | prefill_gemm.hip | generic sub-16 element decoder to bf16 | deferred: a thin wrapper over the whole `QuantBlockElement` format table, not a single format |
+| yah_half_cast.loom | prefill_fp16.hip | fp32 to fp16 cast | ported, 0.0074 ms; exact, no fixture |
+| yah_atb_head_expand_f16.loom | prefill_fp16.hip | ATB packed-head expansion (fp16) | ported, 0.0074 ms; fixture for the untouched tail |
+| yah_atb_head_add_f32.loom | prefill_fp16.hip | ATB packed-head accumulate (fp32) | ported, 0.0074 ms; fixture for the untouched tail |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
@@ -64,7 +67,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 34 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 37 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -80,7 +83,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | fused.hip | fused.hip | FusedQKNormRoPEKvWriteKernel |
 | dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
 | W8A8 + fused quant | prefill_quant_gemm.hip | W8A8BlockedWmmaGEMMKernel, QuantizeActivationToQ8_1Kernel, RequantizeActivationInt4Kernel, and three fused RMSNorm/SwiGLU/SSM-norm quantize kernels, ZeroQ8ActTailKernel, BatchedQuantGEMVKernel |
-| f16 conversion set | prefill_fp16.hip | AtbEncodeA/DecodeC/SwiGLU, AtbRepack(+Slice), AtbAddHeadFp32, AtbExpandHeadFp16, HalfCast, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16 |
+| f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32. **todo**: AtbEncodeA, AtbDecodeC, AtbDecodeSwiGLU, AtbRepack(+Slice), HalfNorm, HalfNorm5120, Bfp16RoundTripFp16 |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | FastGEMVBlockKernel, and the quantized variant |
 | sampling | sample.hip | 13 more kernels: batched argmax, sparse penalties, linear/sorted sampling, and the speculative segment set |
 | vision | vision/encoder.hip, vision/device_input.hip | Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, BiasResidual, Activate, Finish, InjectRows |

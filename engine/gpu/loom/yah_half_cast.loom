@@ -1,0 +1,55 @@
+// YAH fp32 to fp16 cast, Loom port of HalfCast.
+//
+// HIP source: models/qwen/hip/kernels/prefill_fp16.hip. Elementwise:
+//
+//   y[i] = f16(x[i])
+//
+// A flat index domain, so only the stride can be wrong. The check is exact and
+// needs no fixture: every integer below 2048 is an fp16 value, and an iota of
+// small integers round-trips bit for bit.
+//
+// Required config: --config=yah_half_cast.num_elements=8
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_half_cast.num_elements : %value: index where [range(%value, 1, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_half_cast() {
+  %unit = index.constant 1 : index
+  %num_elements = config.get @yah_half_cast.num_elements : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %num_elements, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%x: buffer, %y: buffer) {
+  %base = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %num_elements = config.get @yah_half_cast.num_elements : index
+  %x_na, %y_na = buffer.assume.noalias %x, %y : buffer, buffer
+  %x_view = buffer.view %x_na[%base] : buffer -> view<[%num_elements]xf32>
+  %y_view = buffer.view %y_na[%base] : buffer -> view<[%num_elements]xf16>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %index = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %index, %num_elements : index
+  scf.if %in_range {
+    %value = view.load %x_view[%index] : view<[%num_elements]xf32> -> f32
+    %narrow = scalar.fptrunc %value : f32 to f16
+    view.store %narrow, %y_view[%index] : f16, view<[%num_elements]xf16>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_half_cast.num_elements=8.
+check.case public @yah_half_cast_case {
+  %x = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %y = check.generate.fill value(0.0) : tensor<8xf16>
+  %expected = check.generate.iota offset(0.0) step(1.0) : tensor<8xf16>
+  kernel.launch @yah_half_cast(%x, %y) : (tensor<8xf32>, tensor<8xf16>)
+  check.expect.close actual(%y) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<8xf16>
+  check.return
+}
+
+check.benchmark<@yah_half_cast_case> @yah_half_cast_bench
