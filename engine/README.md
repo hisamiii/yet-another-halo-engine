@@ -707,3 +707,39 @@ wrong for two rounds and produced a confidently-stated retraction of a correct
 claim. The native disassembly is what caught it. Compiler metadata and native
 evidence are not interchangeable, which is exactly why the Loom development guide
 keeps them as separate evidence classes.
+
+### LDS staging implemented: the mechanism worked and still lost
+
+engine/gpu/loom/yah_ffn_gemm_lds.loom stages operands through shared memory the way
+the HIP control does: a BK=64 block per fill, 32 lanes assigned four-per-row so one
+fill instruction covers 8 runs of 128 contiguous bytes, two barriers per 64-K block,
+and every MMA operand read from LDS. It compiles, verifies, executes, and passes the
+all-ones correctness case. Measured:
+
+| metric | v3 (no LDS) | v7 (LDS staged) |
+| --- | ---: | ---: |
+| device time | **1.819 ms** | 2.160 ms |
+| vector VGPR | 200 | **64** |
+| global loads per work-item | 3200 | **1600** |
+| LDS bytes per workgroup | 0 | 10240 |
+| fragment access max gap | 10224 B | **112 B** |
+| issued read bytes | 1.78 GB | 2.67 GB |
+| residency tier | 4 | **3** |
+
+So the intended mechanism did happen. Global fragment gathers halved, vector registers
+fell by two thirds, and operand access became local (the worst-case gap in a fragment
+access dropped from 10224 bytes to 112). It is still 19% slower, and the report says
+why: amdgpu.lds becomes the residency limiter. LDS is a pooled resource in an
+occupancy domain (pool 131072 B, granularity 512), so 10240 B per single-wave
+workgroup costs more residency than the 200 registers it saves, and the tier falls to
+3. Issued read bytes also rose by half, because the fill reads wider per lane than the
+gathers it replaced.
+
+That makes the next experiment a footprint question rather than a mechanism question:
+the mechanism is demonstrated, so shrink the staged tile (stage only the activation,
+or a smaller BK), and fold several waves into one LDS allocation so the 128-byte-run
+fetch is paid once and reused, rather than being charged to one wave alone.
+
+Tooling note: loom-check roundtrip reports this file as mismatched while loom-format
+--in-place reports it unchanged and verifies it. The two tools disagree on the
+canonical form for this file, so compilation and measurement were used as the gate.
