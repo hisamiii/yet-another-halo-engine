@@ -64,6 +64,28 @@ that it explains the aggregate -- it matched for the wrong reason. Any future
 per-type number from gemm_bench must come from a paired or rotated design, not
 from "... all".
 
+**Epilogues, and the harness noise floor.** gemm_bench originally timed only
+the kStore epilogue, but the model runs gate as kStore when the pair is not
+fused, up as kSwiGLU, down as kResidual and nine layers as the paired kGateUp.
+The bench now measures all four, which produced two things.
+
+The epilogue is not expensive. kSwiGLU and kResidual cost a few percent against
+kStore at most: measured adjacently, store/swiglu/residual reads
+31.62/29.02/28.13 for IQ3_XXS and 33.84/30.07/28.78 for Q4_K, and taking the
+same comparison in the reverse mode order narrows store's lead to 0-6%. And
+kGateUp is not available to IQ3_XXS or IQ3_S at all -- the dual launcher returns
+false for them, the same coverage gap as above.
+
+More useful, and worth stating plainly: **this harness cannot resolve
+differences below about 10%.** gemm_bench times three blocks per process and the
+first is a boosted one; parsing the peak instead of the settled block inflated
+the earlier table by several points and flipped signs (Q8_0 read -6.4% on the
+peak and +1.0% on the settled block, IQ3_S -5.7% and -12.0%). Reversing the arm
+order moves a per-mode delta by ~5 points. The paired table above should
+therefore be read as "within about a tenth of Q4_K", not to the digit, and no
+conclusion should rest on one cell. The whole-model A/Bs are unaffected: they
+run -r 1 after a discarded warm-up, so no block in them is a first block.
+
 **Measured at the model level.** An existing pure-Q4_K artifact of the same
 model settles whether the format matters end to end
 (/home/q/models/gufo-sweep/base_q4kpure.gguf, 506 Q4_K tensors, 866 tensors,
