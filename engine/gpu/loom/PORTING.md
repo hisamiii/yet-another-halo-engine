@@ -55,6 +55,7 @@ explicitly deferred.
 | yah_attn_wmma_f32.loom | attention_wmma.hip | WMMA causal attention, retiled to one query head and one token per workgroup | ported, 0.0072-0.0084 ms; three arms (canonical, head-major packed, lse) vs a double reference |
 | yah_decode_attn_f16.loom | attention_decode.hip | decode online attention over the fp16 cache (QwenDecodeOnlineAttentionHalfKernel) | ported, 0.0104 ms at head_dim 256 / 2 heads / seq 3; fixture + 1e-5 |
 | yah_decode_splitk_partials_f16.loom | attention_decode.hip | decode split-K attention partials (QwenDecodeSplitKAttentionHalfPartialsKernel, plain Lanes=32 arm) | ported, 0.0080 ms at 2 heads / 2 splits; scratch fixture + 1e-3 |
+| yah_decode_splitk_sharekv_f16.loom | attention_decode.hip | decode split-K attention partials, ShareKv arm (QwenDecodeSplitKAttentionHalfPartialsKernel<true,32>; 6 query heads share one KV head) | ported, 0.0643 ms at 24 heads / 4 KV heads / 1024 context / 8 splits; scratch fixture + 1e-3 |
 | yah_decode_splitk_reduce_f32.loom | attention_decode.hip | decode split-K attention reduce | ported, 0.0080 ms; combines the Python expected scratch into the same output the online kernel produces |
 | yah_gemv_q4k_f32.loom | gemv_quant.hip | Q4_K block GEMV (Q8KBlockGEMVKernel, Q4_K arm) | ported, 1.33 ms at 17408 rows x 5120; sparse-activation fixture exact |
 | yah_gemv_q6k_f32.loom | gemv_quant.hip | Q6_K block GEMV (Q8KBlockGEMVKernel, Q6_K arm) | ported, 1.04 ms at 17408 rows x 5120; the shard output-projection arm |
@@ -130,7 +131,7 @@ explicitly deferred.
 | yah_dflash_conv_f32.loom | dflash_kernels.hip | grouped dynamic convolution | ported, 0.0064 ms; exact fixture |
 | yah_dflash_silu_mul_f32.loom | dflash_kernels.hip | in-place SiLU multiply | ported, 0.0064 ms; exact, no fixture |
 | yah_dflash_topk_f32.loom | dflash_kernels.hip | dflash selector partial top-k | ported, 0.0108 ms; exact fixture; iterative selection instead of the register-list merge |
-| - | attention_decode*.hip, prefill_attention*.hip | **ported**: QwenDecodeOnlineAttentionHalfKernel, QwenDecodeSplitKAttentionHalfPartialsKernel (plain), QwenDecodeSplitKAttentionReduceKernel. **todo**: the fp32 cache arms, the ShareKv split-K arm, the graph/ptr variants, the baseline kernels | decode-only; see the route audit below |
+| - | attention_decode*.hip, prefill_attention*.hip | **ported**: QwenDecodeOnlineAttentionHalfKernel, QwenDecodeSplitKAttentionHalfPartialsKernel (plain and ShareKv arms), QwenDecodeSplitKAttentionReduceKernel. **todo**: the fp32 cache arms, the graph/ptr variants, the baseline kernels | decode-only; see the route audit below |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
 | yah_dequant_q8k_bf16.loom | prefill_gemm.hip | Q8_K weight dequant to bf16 | ported, 0.0076 ms; exact periodic expectation |
@@ -328,10 +329,12 @@ already have a single-format port:
   (deltanet_decode.hpp) is the resident fp32 decode recurrence. The prefill
   row-split recurrence is ported (`yah_deltanet_rowsplit_f32`); this resident
   variant is a distinct kernel.
-- `attention_decode.hip` fp32-cache arms, the ShareKv split-K arm, the
-  `attention_decode_graph.hip` pointer/graph variants and the baseline
-  `AttentionKernel`/`AttentionHalfKernel` are selected by the KV-storage and
-  split-K config, not by this shard s default fp16 online path.
+- `attention_decode.hip` **ShareKv split-K arm ported**
+  (`yah_decode_splitk_sharekv_f16.loom`); it is on the default route because this
+  shard is 24:4 = 6:1 and `split_k_decode_` defaults true, so once `pos+1 >= 512`
+  HIP selects it. The fp32-cache arms, the `attention_decode_graph.hip`
+  pointer/graph variants and the baseline `AttentionKernel`/`AttentionHalfKernel`
+  remain config-gated (KV storage must not be f16, or the shape must be unsupported).
 - `CaptureBatchedSsmReplayKernel` runs only when replay capture is enabled.
 
 ## Notes carried over from the FFN GEMM port

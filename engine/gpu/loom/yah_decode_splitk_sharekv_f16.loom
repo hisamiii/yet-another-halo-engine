@@ -1,0 +1,304 @@
+// YAH decode split-K attention partials over the fp16 KV cache (ShareKv arm),
+// Loom port of QwenDecodeSplitKAttentionHalfPartialsKernel<true, 32>
+// (attention_decode.hip).
+//
+// One workgroup per (query head, row, split), 32 lanes, same lane/dimension map
+// as yah_decode_attn_f16. Each workgroup runs the online softmax over its
+// partition of the visible prefix and writes two statistics plus the 256-wide
+// unnormalised context into the shared scratch buffer:
+//
+//   partition_length = ceil(seq_len / splits)
+//   partition        = [split*length, min((split+1)*length, seq_len))
+//   stats[pi]        = (max over the partition, sum of exp(score - max))
+//   partial[pi][d]   = sum_p exp(score[p] - max) * v[p][d]
+//
+// Scratch layout, per row: num_heads*max_splits*2 statistics floats followed by
+// num_heads*max_splits*head_dim partial floats, indexed by
+// pi = head*max_splits + split. yah_decode_splitk_reduce_f32 consumes it.
+//
+// One workgroup per (KV head, row, split) with 6 warps of 32 lanes; each warp is
+// one of the six query heads that share that KV head. HIP stages the KV tile in
+// LDS and shares it across the six heads; this port reads the cache directly.
+// That is the same per-head arithmetic (same order, same partials) and defers
+// only the LDS staging, which is a tuning item.
+//
+// Required config: --config=yah_decode_splitk_sharekv.layer_idx=0
+//                  --config=yah_decode_splitk_sharekv.start_pos=4
+//                  --config=yah_decode_splitk_sharekv.max_context=8
+//                  --config=yah_decode_splitk_sharekv.num_heads=2
+//                  --config=yah_decode_splitk_sharekv.num_kv_heads=1
+//                  --config=yah_decode_splitk_sharekv.head_dim=256
+//                  --config=yah_decode_splitk_sharekv.rows=1
+//                  --config=yah_decode_splitk_sharekv.splits=2
+//                  --config=yah_decode_splitk_sharekv.max_splits=2
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_decode_splitk_sharekv.layer_idx : %value: index where [range(%value, 0, 65536)]
+
+config.decl @yah_decode_splitk_sharekv.start_pos : %value: index where [range(%value, 0, 1073741824)]
+
+config.decl @yah_decode_splitk_sharekv.max_context : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @yah_decode_splitk_sharekv.num_heads : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_decode_splitk_sharekv.num_kv_heads : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_decode_splitk_sharekv.head_dim : %value: index where [range(%value, 1, 1024)]
+
+config.decl @yah_decode_splitk_sharekv.rows : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_decode_splitk_sharekv.splits : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_decode_splitk_sharekv.max_splits : %value: index where [range(%value, 1, 4096)]
+
+kernel.def target(@yah_wave32) @yah_decode_splitk_sharekv() {
+  %unit = index.constant 1 : index
+  %num_kv_heads = config.get @yah_decode_splitk_sharekv.num_kv_heads : index
+  %rows = config.get @yah_decode_splitk_sharekv.rows : index
+  %splits = config.get @yah_decode_splitk_sharekv.splits : index
+  %c192 = index.constant 192 : index
+  kernel.launch.config workgroups(%num_kv_heads, %rows, %splits) workgroup_size(%c192, %unit, %unit) : index
+} launch(%q: buffer, %k_cache: buffer, %v_cache: buffer, %scratch: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg_inf = scalar.constant -3.0000000000000001e+38 : f32
+  %scale = scalar.constant 0.0625 : f32
+  %c5i = scalar.constant 5 : i32
+  %c31i = scalar.constant 31 : i32
+  %c6 = index.constant 6 : index
+  %layer_idx = config.get @yah_decode_splitk_sharekv.layer_idx : index
+  %start_pos = config.get @yah_decode_splitk_sharekv.start_pos : index
+  %max_context = config.get @yah_decode_splitk_sharekv.max_context : index
+  %num_heads = config.get @yah_decode_splitk_sharekv.num_heads : index
+  %num_kv_heads = config.get @yah_decode_splitk_sharekv.num_kv_heads : index
+  %head_dim = config.get @yah_decode_splitk_sharekv.head_dim : index
+  %rows = config.get @yah_decode_splitk_sharekv.rows : index
+  %splits = config.get @yah_decode_splitk_sharekv.splits : index
+  %max_splits = config.get @yah_decode_splitk_sharekv.max_splits : index
+  %q_width = index.mul %num_heads, %head_dim : index
+  %q_total = index.mul %rows, %q_width : index
+  %kv_width = index.mul %num_kv_heads, %head_dim : index
+  %cache_elems = index.mul %max_context, %kv_width : index
+  %stats_elems = index.mul %num_heads, %max_splits : index
+  %stats_elems2 = index.mul %stats_elems, %c2 : index
+  %hd2 = index.add %head_dim, %c2 : index
+  %row_stride = index.mul %num_heads, %max_splits : index
+  %row_stride2 = index.mul %row_stride, %hd2 : index
+  %scratch_elems = index.mul %rows, %row_stride2 : index
+  %q_na, %k_na, %v_na, %s_na = buffer.assume.noalias %q, %k_cache, %v_cache, %scratch : buffer, buffer, buffer, buffer
+  %q_view = buffer.view %q_na[%base] : buffer -> view<[%q_total]xf32>
+  %k_view = buffer.view %k_na[%base] : buffer -> view<[%cache_elems]xf16>
+  %v_view = buffer.view %v_na[%base] : buffer -> view<[%cache_elems]xf16>
+  %s_view = buffer.view %s_na[%base] : buffer -> view<[%scratch_elems]xf32>
+  %wg_x = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %split = kernel.workgroup.id<z> : index
+  %tid = kernel.workitem.id<x> : index
+  %tid_i = index.cast %tid : index to i32
+  %lane_i = scalar.andi %tid_i, %c31i : i32
+  %warp_i = scalar.shrui %tid_i, %c5i : i32
+  %lane = index.cast %lane_i : i32 to index
+  %warp = index.cast %warp_i : i32 to index
+  %head0 = index.mul %wg_x, %c6 : index
+  %head = index.add %head0, %warp : index
+  %group_size = index.div %num_heads, %num_kv_heads : index
+  %kv_head = index.div %head, %group_size : index
+  %pos = index.add %start_pos, %row : index
+  %seq_len = index.add %pos, %c1 : index
+  %plen0 = index.add %seq_len, %splits : index
+  %plen1 = index.sub %plen0, %c1 : index
+  %plen = index.div %plen1, %splits : index
+  %pbegin = index.mul %split, %plen : index
+  %pend0 = index.add %pbegin, %plen : index
+  %pend = index.min %pend0, %seq_len : index
+  %row_off = index.mul %row, %q_width : index
+  %head_off = index.mul %head, %head_dim : index
+  %q_base = index.add %row_off, %head_off : index
+  %cache_head = index.mul %kv_head, %head_dim : index
+  %layer_off = index.mul %layer_idx, %cache_elems : index
+  %cache0 = index.add %layer_off, %cache_head : index
+  %lane4 = index.mul %lane, %c4 : index
+  %qa = index.add %q_base, %lane4 : index
+  %qb = index.add %qa, %c128 : index
+  %pi0 = index.mul %head, %max_splits : index
+  %pi = index.add %pi0, %split : index
+  %srow = index.mul %row, %row_stride2 : index
+  %pi2 = index.mul %pi, %c2 : index
+  %max_i = index.add %pi2, %c0 : index
+  %sum_i = index.add %max_i, %c1 : index
+  %max_off = index.add %srow, %max_i : index
+  %sum_off = index.add %srow, %sum_i : index
+  %part_base = index.add %srow, %stats_elems2 : index
+  %pi_hd = index.mul %pi, %head_dim : index
+  %part_off = index.add %part_base, %pi_hd : index
+  %pa = index.add %part_off, %lane4 : index
+  %pa_1 = index.add %pa, %c1 : index
+  %pa_2 = index.add %pa_1, %c1 : index
+  %pa_3 = index.add %pa_2, %c1 : index
+  %pb = index.add %pa, %c128 : index
+  %pb_1 = index.add %pb, %c1 : index
+  %pb_2 = index.add %pb_1, %c1 : index
+  %pb_3 = index.add %pb_2, %c1 : index
+  %q0 = view.load %q_view[%qa] : view<[%q_total]xf32> -> f32
+  %qa_1 = index.add %qa, %c1 : index
+  %q1 = view.load %q_view[%qa_1] : view<[%q_total]xf32> -> f32
+  %qa_2 = index.add %qa_1, %c1 : index
+  %q2 = view.load %q_view[%qa_2] : view<[%q_total]xf32> -> f32
+  %qa_3 = index.add %qa_2, %c1 : index
+  %q3 = view.load %q_view[%qa_3] : view<[%q_total]xf32> -> f32
+  %q4 = view.load %q_view[%qb] : view<[%q_total]xf32> -> f32
+  %qb_1 = index.add %qb, %c1 : index
+  %q5 = view.load %q_view[%qb_1] : view<[%q_total]xf32> -> f32
+  %qb_2 = index.add %qb_1, %c1 : index
+  %q6 = view.load %q_view[%qb_2] : view<[%q_total]xf32> -> f32
+  %qb_3 = index.add %qb_2, %c1 : index
+  %q7 = view.load %q_view[%qb_3] : view<[%q_total]xf32> -> f32
+  %running0, %running1, %o0, %o1, %o2, %o3, %o4, %o5, %o6, %o7 = scf.for %position = [%pbegin to %pend step %c1](%running_max = %neg_inf : f32, %running_sum = %zero : f32, %a0 = %zero : f32, %a1 = %zero : f32, %a2 = %zero : f32, %a3 = %zero : f32, %a4 = %zero : f32, %a5 = %zero : f32, %a6 = %zero : f32, %a7 = %zero : f32) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+    %pos_off = index.mul %position, %kv_width : index
+    %kb = index.add %cache0, %pos_off : index
+    %ka = index.add %kb, %lane4 : index
+    %kbm = index.add %ka, %c128 : index
+    %k0r = view.load %k_view[%ka] : view<[%cache_elems]xf16> -> f16
+    %k0 = scalar.extf %k0r : f16 to f32
+    %ka_1 = index.add %ka, %c1 : index
+    %k1r = view.load %k_view[%ka_1] : view<[%cache_elems]xf16> -> f16
+    %k1 = scalar.extf %k1r : f16 to f32
+    %ka_2 = index.add %ka_1, %c1 : index
+    %k2r = view.load %k_view[%ka_2] : view<[%cache_elems]xf16> -> f16
+    %k2 = scalar.extf %k2r : f16 to f32
+    %ka_3 = index.add %ka_2, %c1 : index
+    %k3r = view.load %k_view[%ka_3] : view<[%cache_elems]xf16> -> f16
+    %k3 = scalar.extf %k3r : f16 to f32
+    %k4r = view.load %k_view[%kbm] : view<[%cache_elems]xf16> -> f16
+    %k4 = scalar.extf %k4r : f16 to f32
+    %kbm_1 = index.add %kbm, %c1 : index
+    %k5r = view.load %k_view[%kbm_1] : view<[%cache_elems]xf16> -> f16
+    %k5 = scalar.extf %k5r : f16 to f32
+    %kbm_2 = index.add %kbm_1, %c1 : index
+    %k6r = view.load %k_view[%kbm_2] : view<[%cache_elems]xf16> -> f16
+    %k6 = scalar.extf %k6r : f16 to f32
+    %kbm_3 = index.add %kbm_2, %c1 : index
+    %k7r = view.load %k_view[%kbm_3] : view<[%cache_elems]xf16> -> f16
+    %k7 = scalar.extf %k7r : f16 to f32
+    %p0 = scalar.mulf %q0, %k0 : f32
+    %p1 = scalar.mulf %q1, %k1 : f32
+    %p2 = scalar.mulf %q2, %k2 : f32
+    %p3 = scalar.mulf %q3, %k3 : f32
+    %p4 = scalar.mulf %q4, %k4 : f32
+    %p5 = scalar.mulf %q5, %k5 : f32
+    %p6 = scalar.mulf %q6, %k6 : f32
+    %p7 = scalar.mulf %q7, %k7 : f32
+    %s1 = scalar.addf %p0, %p1 : f32
+    %s2 = scalar.addf %s1, %p2 : f32
+    %s3 = scalar.addf %s2, %p3 : f32
+    %s4 = scalar.addf %s3, %p4 : f32
+    %s5 = scalar.addf %s4, %p5 : f32
+    %s6 = scalar.addf %s5, %p6 : f32
+    %dot = scalar.addf %s6, %p7 : f32
+    %dotr = kernel.subgroup.reduce<addf> %dot : f32
+    %score = scalar.mulf %dotr, %scale : f32
+    %new_max = scalar.maxnumf %running_max, %score : f32
+    %d1 = scalar.subf %running_max, %new_max : f32
+    %prev = scalar.expf<afn> %d1 : f32
+    %d2 = scalar.subf %score, %new_max : f32
+    %vs = scalar.expf<afn> %d2 : f32
+    %t1 = scalar.mulf %running_sum, %prev : f32
+    %new_sum = scalar.addf %t1, %vs : f32
+    %v0r = view.load %v_view[%ka] : view<[%cache_elems]xf16> -> f16
+    %v0 = scalar.extf %v0r : f16 to f32
+    %v1r = view.load %v_view[%ka_1] : view<[%cache_elems]xf16> -> f16
+    %v1 = scalar.extf %v1r : f16 to f32
+    %v2r = view.load %v_view[%ka_2] : view<[%cache_elems]xf16> -> f16
+    %v2 = scalar.extf %v2r : f16 to f32
+    %v3r = view.load %v_view[%ka_3] : view<[%cache_elems]xf16> -> f16
+    %v3 = scalar.extf %v3r : f16 to f32
+    %v4r = view.load %v_view[%kbm] : view<[%cache_elems]xf16> -> f16
+    %v4 = scalar.extf %v4r : f16 to f32
+    %v5r = view.load %v_view[%kbm_1] : view<[%cache_elems]xf16> -> f16
+    %v5 = scalar.extf %v5r : f16 to f32
+    %v6r = view.load %v_view[%kbm_2] : view<[%cache_elems]xf16> -> f16
+    %v6 = scalar.extf %v6r : f16 to f32
+    %v7r = view.load %v_view[%kbm_3] : view<[%cache_elems]xf16> -> f16
+    %v7 = scalar.extf %v7r : f16 to f32
+    %vp0 = scalar.mulf %v0, %vs : f32
+    %op0 = scalar.mulf %a0, %prev : f32
+    %on0 = scalar.addf %op0, %vp0 : f32
+    %vp1 = scalar.mulf %v1, %vs : f32
+    %op1 = scalar.mulf %a1, %prev : f32
+    %on1 = scalar.addf %op1, %vp1 : f32
+    %vp2 = scalar.mulf %v2, %vs : f32
+    %op2 = scalar.mulf %a2, %prev : f32
+    %on2 = scalar.addf %op2, %vp2 : f32
+    %vp3 = scalar.mulf %v3, %vs : f32
+    %op3 = scalar.mulf %a3, %prev : f32
+    %on3 = scalar.addf %op3, %vp3 : f32
+    %vp4 = scalar.mulf %v4, %vs : f32
+    %op4 = scalar.mulf %a4, %prev : f32
+    %on4 = scalar.addf %op4, %vp4 : f32
+    %vp5 = scalar.mulf %v5, %vs : f32
+    %op5 = scalar.mulf %a5, %prev : f32
+    %on5 = scalar.addf %op5, %vp5 : f32
+    %vp6 = scalar.mulf %v6, %vs : f32
+    %op6 = scalar.mulf %a6, %prev : f32
+    %on6 = scalar.addf %op6, %vp6 : f32
+    %vp7 = scalar.mulf %v7, %vs : f32
+    %op7 = scalar.mulf %a7, %prev : f32
+    %on7 = scalar.addf %op7, %vp7 : f32
+    scf.yield %new_max, %new_sum, %on0, %on1, %on2, %on3, %on4, %on5, %on6, %on7 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+  }
+  %is_zero = index.cmp eq, %lane, %c0 : index
+  %st = scf.if %is_zero -> (f32) {
+    view.store %running0, %s_view[%max_off] : f32, view<[%scratch_elems]xf32>
+    view.store %running1, %s_view[%sum_off] : f32, view<[%scratch_elems]xf32>
+    scf.yield %zero : f32
+  } else {
+    scf.yield %zero : f32
+  }
+  view.store %o0, %s_view[%pa] : f32, view<[%scratch_elems]xf32>
+  view.store %o1, %s_view[%pa_1] : f32, view<[%scratch_elems]xf32>
+  view.store %o2, %s_view[%pa_2] : f32, view<[%scratch_elems]xf32>
+  view.store %o3, %s_view[%pa_3] : f32, view<[%scratch_elems]xf32>
+  view.store %o4, %s_view[%pb] : f32, view<[%scratch_elems]xf32>
+  view.store %o5, %s_view[%pb_1] : f32, view<[%scratch_elems]xf32>
+  view.store %o6, %s_view[%pb_2] : f32, view<[%scratch_elems]xf32>
+  view.store %o7, %s_view[%pb_3] : f32, view<[%scratch_elems]xf32>
+  kernel.return
+}
+
+// Requires num_heads=6, num_kv_heads=1, start_pos=4, max_context=8, rows=1,
+// splits=2, max_splits=2 (6:1 GQA).
+check.case public @yah_decode_splitk_sharekv_case {
+  %q = check.file.read.npy path("fixtures/decode_sharekv/input_q.npy") : tensor<1536xf32>
+  %k = check.file.read.npy path("fixtures/decode_sharekv/input_k.npy") : tensor<2048xf16>
+  %v = check.file.read.npy path("fixtures/decode_sharekv/input_v.npy") : tensor<2048xf16>
+  %expected = check.file.read.npy path("fixtures/decode_sharekv/scratch.npy") : tensor<3096xf32>
+  %scratch = check.generate.fill value(0.0) : tensor<3096xf32>
+  kernel.launch @yah_decode_splitk_sharekv(%q, %k, %v, %scratch) : (tensor<1536xf32>, tensor<2048xf16>, tensor<2048xf16>, tensor<3096xf32>)
+  check.expect.close actual(%scratch) expected(%expected) atol(0.001) rtol(0.0001) nan(same) : tensor<3096xf32>
+  check.return
+}
+
+check.benchmark<@yah_decode_splitk_sharekv_case> @yah_decode_splitk_sharekv_bench
+
+// Production shape: num_heads=24, num_kv_heads=4, max_context=1024, start_pos=1023,
+// splits=8, max_splits=8. All-zero q/k/v give stats (0, partition length) and zero
+// partials.
+check.case public @yah_decode_splitk_sharekv_full_case {
+  %q = check.generate.fill value(0.0) : tensor<6144xf32>
+  %k = check.generate.fill value(0.0) : tensor<1048576xf16>
+  %v = check.generate.fill value(0.0) : tensor<1048576xf16>
+  %expected = check.file.read.npy path("fixtures/decode_sharekv/full_scratch.npy") : tensor<49536xf32>
+  %scratch = check.generate.fill value(0.0) : tensor<49536xf32>
+  kernel.launch @yah_decode_splitk_sharekv(%q, %k, %v, %scratch) : (tensor<6144xf32>, tensor<1048576xf16>, tensor<1048576xf16>, tensor<49536xf32>)
+  check.expect.close actual(%scratch) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<49536xf32>
+  check.return
+}
+
+check.benchmark<@yah_decode_splitk_sharekv_full_case> @yah_decode_splitk_sharekv_full_bench
