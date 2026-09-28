@@ -1981,6 +1981,14 @@ void RunOne(std::size_t m, std::size_t k, std::size_t batch, unsigned iterations
     // own weight tile. Trading BM for BN therefore buys decode amortisation at
     // the cost of operand reuse (WRS=2, WTS=3 -> 0.83 loads/WMMA against 0.75).
     if (tile == 4) { LaunchOneT<Type, 128, 384, 4, 8, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
+    // tile 5: the shipped 256x256 tile at 512 threads instead of 1024. WRS and
+    // WTS both become 4, so LDS operand reads per WMMA fall 0.75 -> 0.50, and
+    // each thread carries 16 accumulator chains instead of 8. The tile search
+    // that shipped w8n4 excluded this split on the grounds that 16 accumulators
+    // "exceed the VGPR budget"; measured from the compiled object it is 250 VGPR
+    // against the 256 the 512-thread budget allows, with zero spills, so the
+    // exclusion was on a premise that is false and the arm was never timed.
+    if (tile == 5) { LaunchOneT<Type, 256, 256, 4, 4, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
     switch (ablate) {
       case 16: LaunchOne<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
       case 48: LaunchOne<Type, 48>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
@@ -1993,6 +2001,27 @@ void RunOne(std::size_t m, std::size_t k, std::size_t batch, unsigned iterations
       case 16432: LaunchOne<Type, 16432>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
       case 524304: LaunchOne<Type, 524304>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
       case 8388624: LaunchOne<Type, 8388624>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      // Scheduling placements, all of which move work between phases rather than
+      // changing its amount: 272 puts the global fetch inside the K loop, 528 puts
+      // the decode inside it, 1040 staggers the decode across warps.
+      case 272: LaunchOne<Type, 272>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      // 512/1024 assert the plain deferred-decode path, which Q5_K is not (it
+      // caches the block header), so the instantiation is gated by type instead
+      // of breaking the build for that one.
+      case 528:
+        if constexpr (Type == gufo::core::GgmlType::kQ4_K ||
+                      Type == gufo::core::GgmlType::kQ6_K ||
+                      Type == gufo::core::GgmlType::kQ8_0)
+          LaunchOne<Type, 528>(weights.data(), half_x.data(), y.data(), batch, m,
+                               k, nullptr);
+        break;
+      case 1040:
+        if constexpr (Type == gufo::core::GgmlType::kQ4_K ||
+                      Type == gufo::core::GgmlType::kQ6_K ||
+                      Type == gufo::core::GgmlType::kQ8_0)
+          LaunchOne<Type, 1040>(weights.data(), half_x.data(), y.data(), batch, m,
+                                k, nullptr);
+        break;
       default: std::fprintf(stderr, "one: unsupported ablate %d\n", ablate); break;
     }
   };

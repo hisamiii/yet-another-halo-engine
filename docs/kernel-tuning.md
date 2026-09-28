@@ -375,6 +375,15 @@ exceed the VGPR budget or the 1024-thread limit. With WMMA = WRS*WTS and LDS
 reads = WRS + WTS, an 8-accumulator tile needs 6 reads however it is split, so
 the current split is already the minimum for this shape.
 
+> **Corrected.** The w4n4 half of that sentence is false, and it was checkable
+> without running anything: 256x256 split 4x4 over 512 threads compiles to **242
+> VGPR with zero spills** (250 with the iglp hint off) against the 256 the
+> 512-thread budget allows, i.e. it fits with 14 registers to spare. It was
+> therefore never a budget exclusion, it was an unmeasured assumption. It has now
+> been timed, and it is a wash (-0.56%) rather than a loss, which still leaves the
+> shipped split in place but for a different reason -- see "The cost of
+> scheduling" below.
+
 ### The K loop is already near its own limit; the deficit is everything else
 
 The phase profile above shows the K loop taking 69% of the block and staging
