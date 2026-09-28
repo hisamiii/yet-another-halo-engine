@@ -88,6 +88,14 @@ def main():
     acc16 = exp / np.float32(16.0)
     swi = np.float16(silu * acc16)
     np.save(os.path.join(OUT, "expected_swiglu.npy"), swi.reshape(-1).astype(np.float16))
+    # Paired gate/up epilogue: both weights are this fixture, so the two
+    # accumulators are equal, and the activation 2^-13 keeps them near 38 so that
+    # silu(acc) = acc and the output fits f16. Expected = round_f16(silu(acc)*acc).
+    acc_gateup = exp * np.float64(2.0 ** -13)
+    silu_g = acc_gateup / (np.float64(1.0) + np.exp(-acc_gateup))
+    gu = np.float16(silu_g * acc_gateup)
+    np.save(os.path.join(OUT, "expected_gateup.npy"), gu.reshape(-1).astype(np.float16))
+    print("gateup row0 acc", float(acc_gateup[0][0]), "out", float(gu[0][0]))
     print("swiglu row0", float(silu), [float(v) for v in swi[0][:4]])
     print("wrote input_q4k_gemm.npy", inp.shape)
     print("wrote expected_out.npy", exp.reshape(-1).shape)
