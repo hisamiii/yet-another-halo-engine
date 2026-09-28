@@ -814,3 +814,48 @@ and it now sits 1.34x behind a hand-tuned HIP kernel whose own load path alone c
 less than this kernel load path by a margin no source-level change has been able to
 close. Further progress needs a change in the fragment-load lowering, not in the
 kernel.
+
+### The 192-register question, tested from both sides of the cliff
+
+The claim had been made that the residency-cliff suggestion was falsified without ever
+measuring 192 or 190. That was fair. What the depth/unroll grid actually contains:
+
+| d.u | VGPR | tier | | d.u | VGPR | tier |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| 2.1 | 120 | 8 | | 3.2 | 200 | 4 |
+| 2.2 | 168 | 5 | | 3.3 | 240 | 4 |
+| 2.3 | 161 | 5 | | 3.4 | 200 | 4 |
+| 3.1 | 160 | 6 | | 4.1 | 200 | 4 |
+
+There is no 192 or 190 cell: the grid jumps 168 to 200. And Loom offers no register
+cap to force one. The obvious route was tried -- the HIP controls sit at 192 and 190
+because they declare 1024-thread workgroups, whose per-thread ceiling is
+196608/1024 = 192 -- so a variant with the identical per-wave schedule packed into 32
+waves (`workgroup_size(1024)`, 34 workgroups of 512 rows) was compiled. It still
+allocates **200** VGPR at tier 4. Loom does not derive a register ceiling from the
+declared workgroup size, so HIP register number is a consequence of HIP own codegen
+and not a constraint Loom would reproduce by construction.
+
+The cliff has therefore been measured from both sides rather than at the exact number,
+and the result is unambiguous:
+
+| config | VGPR | tier | time |
+| --- | ---: | ---: | ---: |
+| d1 u1 | 80 | 12 | 2.895 ms |
+| d2 u2 | 168 | **5** | 2.388 ms |
+| d2 u3 | 161 | **5** | 2.398 ms |
+| d3 u1 | 160 | 6 | 2.347 ms |
+| **d3 u2 (v3)** | **200** | **4** | **1.819 ms** |
+| d3 u4 | 200 | 4 | 1.821 ms |
+| HIP fp16 control | 190 | 5 | **1.353 ms** |
+| HIP Q4_K control | 192 | 5 | 1.197 ms |
+
+Every config that reaches tier 5 or better is around 2.35 to 2.40 ms, roughly 30%
+slower than the tier-4 config. They reach the higher tier by giving up read-ahead --
+depth 2 or unroll 1 -- not by being more efficient at the same schedule. So crossing
+the cliff is not a win here, and the suggestion was correctly left alone, though for a
+better-supported reason than the one originally given.
+
+The sharper point is the last two rows. HIP reaches **tier 5 at 1.353 ms** while our
+tier-5 configs sit at 2.39 ms. The tier is not what makes HIP fast, and matching the
+register number without matching the code buys nothing.
