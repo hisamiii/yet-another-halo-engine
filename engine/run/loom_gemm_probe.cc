@@ -81,17 +81,19 @@ int main(int argc, char** argv) {
     }
     LoomBuffer a = gpu.Allocate(x.size() * sizeof(std::uint16_t));
     LoomBuffer wstage = gpu.Allocate(static_cast<size_t>(n) * k * sizeof(std::uint16_t));
-    LoomBuffer ostage = gpu.Allocate(static_cast<size_t>(n) * 64 * sizeof(float));
+    LoomBuffer ostage = gpu.Allocate(static_cast<size_t>(n) * padded * sizeof(float));
     LoomBuffer out = gpu.Allocate(static_cast<size_t>(n) * padded * sizeof(float));
     gpu.H2D(a, x.data(), x.size() * sizeof(std::uint16_t));
 
     LoomExecutable executable = gpu.Load(hal);
-    const uint32_t ordinal = executable.OrdinalOrZero("yah_ffn_gemm_q4k");
+    const char* export_env = std::getenv("LOOM_EXPORT");
+    const uint32_t ordinal =
+        export_env != nullptr ? executable.OrdinalOrZero(export_env) : 0;
     const hrx_buffer_ref_t bindings[5] = {
         {weight.handle, weight_offset, static_cast<size_t>(tensor->bytes)},
         {a.handle, 0, x.size() * sizeof(std::uint16_t)},
         {wstage.handle, 0, static_cast<size_t>(n) * k * sizeof(std::uint16_t)},
-        {ostage.handle, 0, static_cast<size_t>(n) * 64 * sizeof(float)},
+        {ostage.handle, 0, static_cast<size_t>(n) * padded * sizeof(float)},
         {out.handle, 0, static_cast<size_t>(n) * padded * sizeof(float)}};
     gpu.Dispatch(executable, ordinal,
                  LoomDevice::Config(static_cast<uint32_t>(m_tiles),

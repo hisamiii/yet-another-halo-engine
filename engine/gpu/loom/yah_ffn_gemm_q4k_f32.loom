@@ -114,7 +114,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_q4k() {
   %a_t_view = buffer.view %input_na[%base] : buffer -> view<[%ktot]x[%tokens]xf16, %a_layout>
   %out_view = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>
   %wstage_view = buffer.view %wstage_na[%base] : buffer -> view<[%stage_rows]x[%ktot]xf16>
-  %ostage_view = buffer.view %ostage_na[%base] : buffer -> view<[%stage_rows]x64xf32>
+  %ostage_view = buffer.view %ostage_na[%base] : buffer -> view<[%stage_rows]x[%tokens]xf32>
   %wg_x = kernel.workgroup.id<x> : index
   %m_origin = index.mul %wg_x, %c16 : index
   %lane = kernel.workitem.id<x> : index
@@ -242,10 +242,13 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_q4k() {
     %n3 = vector.mma %lhs, %rhs3, %a3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     scf.yield %n0, %n1, %n2, %n3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
   }
-  vector.fragment.store<result> %acc0, %ostage_view[%m_origin, %c0] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x64xf32>
-  vector.fragment.store<result> %acc1, %ostage_view[%m_origin, %c16] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x64xf32>
-  vector.fragment.store<result> %acc2, %ostage_view[%m_origin, %c32] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x64xf32>
-  vector.fragment.store<result> %acc3, %ostage_view[%m_origin, %c48] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x64xf32>
+  %o16 = index.add %token_base, %c16 : index
+  %o32 = index.add %token_base, %c32 : index
+  %o48 = index.add %token_base, %c48 : index
+  vector.fragment.store<result> %acc0, %ostage_view[%m_origin, %token_base] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x[%tokens]xf32>
+  vector.fragment.store<result> %acc1, %ostage_view[%m_origin, %o16] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x[%tokens]xf32>
+  vector.fragment.store<result> %acc2, %ostage_view[%m_origin, %o32] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x[%tokens]xf32>
+  vector.fragment.store<result> %acc3, %ostage_view[%m_origin, %o48] shape [%m, %n] : vector<8xf32>, view<[%stage_rows]x[%tokens]xf32>
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   %store_sink = scf.for %j2 = [%c0 to %c32 step %c1](%mk2 = %c0 : index) -> (index) {
     %j2_i = index.cast %j2 : index to i32
@@ -259,8 +262,8 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_q4k() {
     %tok = index.max %tok_ix, %c0 : index
     %gr2_ix = index.add %m_origin, %r2 : index
     %gr2 = index.min %gr2_ix, %stage_last : index
-    %val = view.load %ostage_view[%gr2, %tok] : view<[%stage_rows]x64xf32> -> f32
     %tok_g = index.add %token_base, %tok : index
+    %val = view.load %ostage_view[%gr2, %tok_g] : view<[%stage_rows]x[%tokens]xf32> -> f32
     %tok_off = index.mul %tok_g, %m_rows : index
     %gflat = index.add %tok_off, %gr2 : index
     view.store %val, %out_view[%gflat] : f32, view<[%out_total]xf32>
