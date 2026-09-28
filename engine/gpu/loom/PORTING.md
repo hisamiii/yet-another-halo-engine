@@ -402,6 +402,16 @@ non-default config, an explicit env var, or is dead on this shard.
 
 ## Shape genericity
 
+Beyond the kStore/kResidual family (8 formats), the kSwiGLU arm now takes the same
+`k_blocks`/`token_tiles` configs for IQ3_XXS, IQ3_S, IQ4_XS, Q3_K and Q4_K, and the
+kStore arm additionally covers Q8_0 (QK=32, so `k_blocks` is K/32) and IQ2_XS.
+These are the formats the IQ4_XS-3.84bpw target shard reaches: its FFN gate/up
+pairs are a kStore gate plus a kSwiGLU up, and its attention/SSM projections are
+Q3_K/IQ3_XXS/IQ3_S/IQ4_XS/Q4_K/Q5_K/Q6_K/Q8_0. Still missing on that shard:
+IQ2_XXS (3 FFN tensors) and Q2_K (1 ssm_beta), neither of which has a port yet.
+
+## Shape genericity (original Q4_K/IQ4_XS note)
+
 The first generation of prefill ports baked their production shape into the
 kernel body: `yah_ffn_gemm_q4k_f32` had K=5120 and a 64-token activation tile as
 constants. That cannot serve the real route, where K is hidden (5120) for the
