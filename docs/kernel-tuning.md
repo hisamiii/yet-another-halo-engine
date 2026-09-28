@@ -731,10 +731,10 @@ per arm, order rotated per round, settled arm = the tail rounds.
 
 | arm | ablate | what it adds | TFLOPS | share of ceiling | step cost |
 | --- | ---: | --- | ---: | ---: | ---: |
-| K loop alone, stale LDS | 6 | \`ds_load\` + WMMA only | 50.7-51.7 | ~105% | — |
+| K loop alone, stale LDS | 6 | `ds_load` + WMMA only | 50.7-51.7 | ~105% | — |
 | + global fetch | 2 | next stage's global loads | 51.0-51.9 | ~106% | **~0%** |
 | + decode, no LDS store | 36 | the Q4_K unpack + scale | 47.8-48.2 | ~99% | **-6%** |
-| + LDS store of raw | 68 | \`ds_store\` with no decode | 38.2-38.6 | ~79% | **-25%** |
+| + LDS store of raw | 68 | `ds_store` with no decode | 38.2-38.6 | ~79% | **-25%** |
 | + decode + LDS store | 4 | both (full commit) | 32.1-34.3 | ~68% | **-12%** |
 | + global fetch on top | 16 | production control | 29.4-31.9 | ~63% | **-7%** |
 
@@ -762,7 +762,7 @@ Splitting the commit by side, all with the global fetch present:
 | no commit at all | 18 | 7.14 | -42% |
 
 The commit writes two things per stage: the decoded weights (A) and a plain copy
-of the activations (B), 4 \`ds_store_b128\` per thread per stage. Removing either
+of the activations (B), 4 `ds_store_b128` per thread per stage. Removing either
 stream alone recovers ~85% of the total store saving, so the cost is **not**
 proportional to the bytes or the instruction count — it is a shared serialization
 that either stream is enough to trigger. B alone, which needs no decode at all,
@@ -777,10 +777,11 @@ and came back negative:
 | candidate | test | result |
 | --- | --- | --- |
 | LDS port throughput | counters | LDS busy 26-45%, never saturated |
-| bank conflicts | \`LDSBankConflict\` PMC | **0** across all 13 dispatches |
-| register spills | \`.vgpr_spill_count\` | **0** for Q4_K; only Q8_0 spills, 4 instrs |
-| the VGPR cap | \`.vgpr_count\` | control uses 192 of 256 available, so the compiler was not capped |
-| store->load \`s_waitcnt\` drain | double-buffer the LDS stage | -0% to -6%, i.e. no help |
+| bank conflicts | `LDSBankConflict` PMC | **0** across all 13 dispatches |
+| register spills | `.vgpr_spill_count` | **0** for Q4_K; only Q8_0 spills, 4 instrs |
+| the VGPR cap | `.vgpr_count` | control uses 192 of 256 available, so the compiler was not capped |
+| store->load `s_waitcnt` drain | double-buffer the LDS stage | -0% to -6%, i.e. no help |
+| the drain being conservative | double-buffer with the stage loop unrolled by two so the buffer index is compile-time and the two staging regions are provably disjoint | **17% worse** |
 | the barrier itself | ablate 17 (no barrier) | -5% only |
 | decode in the wrong place | ablate 512 (decode in the K loop) | parity; 1024 (staggered) is 8-18% *worse* |
 | B load-to-use distance of zero | ablate 4096 (batch all B loads ahead of the MMA block) | +0.5%, within noise |
@@ -790,8 +791,13 @@ and came back negative:
 The double-buffer result is the informative one. On the double-buffered build the
 stores *are* issued at the top of the stage and consumed a stage later, exactly
 as intended -- the ISA confirms it -- but the compiler still emits
-\`s_waitcnt lgkmcnt(0)\` before the barrier, so the drain is unchanged. Three full
-\`lgkmcnt(0)\` drains per stage appear in the control kernel's schedule.
+`s_waitcnt lgkmcnt(0)` before the barrier, so the drain is unchanged. Three full
+`lgkmcnt(0)` drains per stage appear in the control kernel's schedule. That
+looked like workaround-able compiler conservatism, so the stage loop was
+unrolled by two to make the buffer index a compile-time constant and the two
+staging regions provably disjoint. It came back 17% *worse* than the
+single-buffered BK=2 arm, which closes the drain explanation: even if the wait is
+what the schedule costs, removing it does not recover the time.
 
 **Conclusion:** the deficit is the LDS store stream, it is a whole-schedule
 effect rather than any single micro-mechanism, and the ablations show it is worth

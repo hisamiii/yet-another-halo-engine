@@ -596,10 +596,13 @@ __launch_bounds__(WM * WN * 32) __global__
   decode_ra();
   if constexpr (DblBuf) {
     // Stage i+1's commit is issued before stage i's K loop, so the LDS writes
-    // drain while the matrix pipe runs and the trailing barrier only has to
-    // order the compute. The decode for DecodeStage==2 types happens inside
-    // commit, and for the IQ types inside fetch, so both are covered.
-    const auto kloop = [&](int buf) {
+    // drain while the matrix pipe runs. The stage loop is unrolled by two so the
+    // buffer index is a compile-time constant: with a runtime `stage & 1` the
+    // pointers into s_a are not provably disjoint and the compiler still emits
+    // `s_waitcnt lgkmcnt(0)` before the barrier, which is why the runtime-index
+    // version of this measured no faster than the single buffer.
+    const auto kloop = [&]<int Buf>() {
+      constexpr int buf = Buf;
 #pragma unroll
       for (int ks = 0; ks < BK; ++ks) {
         v16bf a[WRS];
@@ -623,14 +626,25 @@ __launch_bounds__(WM * WN * 32) __global__
     };
     commit(0);
     __syncthreads();
-    int stage = 0;
-    for (int ks0 = 0; ks0 < ksteps; ks0 += BK, ++stage) {
-      const int buf = stage & 1;
+    int ks0 = 0;
+    while (ks0 + 2 * BK <= ksteps) {
       if (ks0 + BK < ksteps) {
         fetch(ks0 + BK);
-        commit(buf ^ 1);
+        commit(1);
       }
-      kloop(buf);
+      kloop.template operator()<0>();
+      __syncthreads();
+      if (ks0 + 2 * BK < ksteps) {
+        fetch(ks0 + 2 * BK);
+        commit(0);
+      }
+      kloop.template operator()<1>();
+      __syncthreads();
+      ks0 += 2 * BK;
+    }
+    // An odd stage count leaves the last stage in buffer 0, committed above.
+    if (ks0 < ksteps) {
+      kloop.template operator()<0>();
       __syncthreads();
     }
   } else {
