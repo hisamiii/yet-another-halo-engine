@@ -76,22 +76,37 @@ compile() {
 }
 
 target="${1:-yah-run}"
+standalone=0
 case "$target" in
   yah-run) main="$root/engine/run/yah_run.hip"; name="yah_run" ;;
   kv-quant-check) main="$root/engine/kv/kv_quant_check.hip"; name="kv_quant_check" ;;
+  # The bench translation units include the kernel headers directly, so their
+  # objects define symbols the kernel objects and libyah_core.a also define.
+  # Linking them the normal way is a duplicate-symbol error; they are their own
+  # program and need only their own object plus the quant dequantiser.
+  gemm_bench) main="$root/engine/gpu/gemm_bench.hip"; name="gemm_bench"; standalone=1 ;;
   *) main="$root/engine/gpu/$target.hip"; name="$target" ;;
 esac
 
-for k in "${kernels[@]}"; do
-  compile "$(source_for "$k")" "$k"
-done
+if [[ "$standalone" == 0 ]]; then
+  for k in "${kernels[@]}"; do
+    compile "$(source_for "$k")" "$k"
+  done
+fi
 compile "$ported/src/core/quant/ggml_dequant.cpp" "ggml_dequant"
 compile "$main" "$name"
 for pid in "${pids[@]}"; do wait "$pid"; done
 
-objs=()
-for k in "${kernels[@]}"; do objs+=("$objdir/$k.o"); done
-objs+=("$objdir/ggml_dequant.o" "$objdir/$name.o")
+if [[ "$standalone" == 1 ]]; then
+  printf 'build_gpu: linking %s (standalone)\n' "$target"
+  hipcc "$objdir/$name.o" "$objdir/ggml_dequant.o" -o "$out/$target" \
+    -lhipblas -licuuc -lpthread
+else
+  objs=()
+  for k in "${kernels[@]}"; do objs+=("$objdir/$k.o"); done
+  objs+=("$objdir/ggml_dequant.o" "$objdir/$name.o")
 
-printf 'build_gpu: linking %s (%d objects)\n' "$target" "${#objs[@]}"
-hipcc "${objs[@]}" "$out/libyah_core.a" -o "$out/$target" -lhipblas -lhipblaslt -licuuc -lpthread
+  printf 'build_gpu: linking %s (%d objects)\n' "$target" "${#objs[@]}"
+  hipcc "${objs[@]}" "$out/libyah_core.a" -o "$out/$target" \
+    -lhipblas -lhipblaslt -licuuc -lpthread
+fi

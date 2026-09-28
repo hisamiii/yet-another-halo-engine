@@ -98,33 +98,68 @@ const char* TypeName(GgmlType type) {
   }
 }
 
+// The prefill path does not run the plain store epilogue everywhere: gate is
+// kStore only when the pair is not fused, up is kSwiGLU, down is kResidual, and
+// the paired gate/up kernel is kGateUp. Each has its own buffer traffic and
+// its own output width (kSwiGLU and kGateUp write fp16), so a table measured
+// with kStore alone is not the model's kernel.
 void RunFp16(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
-             unsigned iterations, int pattern) {
+             unsigned iterations, int pattern, const char* epilogue) {
   using namespace gufo::hip;
   if (m == 0 || k == 0 || k % 256 != 0 || batch < 96 || iterations == 0)
     throw std::invalid_argument("require K % 256 == 0, batch >= 96");
+  const bool swiglu = std::strcmp(epilogue, "swiglu") == 0;
+  const bool residual = std::strcmp(epilogue, "residual") == 0;
+  const bool dual = std::strcmp(epilogue, "gateup") == 0;
+  const bool fp16_out = swiglu || dual;
   const std::size_t block_bytes =
       gufo::quant::QuantizedRowBytes(type, gufo::quant::QuantizedBlockElements(type));
   const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(type, k) * m;
   const auto [d_offset, dmin_offset] = WeightScaleOffsets(type);
   DeviceBuffer<unsigned char> weights(weight_bytes);
-  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<unsigned char> up_weights(dual ? weight_bytes : 1);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m), gate(batch * m);
   DeviceBuffer<short> half_x(batch * k);
   FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
                 256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
                         dmin_offset, pattern);
+  if (dual) {
+    FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                  256>>>(up_weights.data(), weight_bytes, block_bytes,
+                          d_offset, dmin_offset, pattern);
+  }
   FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
       fp32_x.data(), fp32_x.size());
   LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(), nullptr);
   const auto launch = [&] {
-    LaunchBatchedQuantGEMMFp16(type, weights.data(), half_x.data(), y.data(),
-                               batch, m, k, nullptr);
+    if (swiglu) {
+      LaunchBatchedQuantGEMMSwiGLUFp16(type, weights.data(), half_x.data(),
+                                       gate.data(), y.data(), batch, m, k,
+                                       nullptr);
+    } else if (residual) {
+      LaunchBatchedQuantGEMMResidualFp16(type, weights.data(), half_x.data(),
+                                         y.data(), batch, m, k, nullptr);
+    } else if (dual) {
+      TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
+          type, type, weights.data(), up_weights.data(), half_x.data(),
+          y.data(), batch, m, k, nullptr);
+    } else {
+      LaunchBatchedQuantGEMMFp16(type, weights.data(), half_x.data(), y.data(),
+                                 batch, m, k, nullptr);
+    }
   };
   launch();
   HIP_CHECK(hipDeviceSynchronize());
-  const auto host = y.CopyToHost();
   std::size_t nonfinite = 0;
-  for (const float value : host) nonfinite += !std::isfinite(value);
+  if (fp16_out) {
+    const auto host = y.CopyToHost();
+    const auto* halves = reinterpret_cast<const __half*>(host.data());
+    for (std::size_t i = 0; i < batch * m; ++i)
+      nonfinite += !std::isfinite(__half2float(halves[i]));
+  } else {
+    const auto host = y.CopyToHost();
+    for (const float value : host) nonfinite += !std::isfinite(value);
+  }
   const auto time = [&] {
     for (unsigned i = 0; i < 2; ++i) launch();
     HIP_CHECK(hipDeviceSynchronize());
@@ -135,14 +170,18 @@ void RunFp16(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
     return std::chrono::duration<double, std::milli>(stop - start).count() /
            iterations;
   };
+  // kGateUp computes both gate and up, so its FLOPs are twice a single
+  // projection's; the other three are one projection each.
+  const double flops =
+      2.0 * static_cast<double>(m) * k * batch * (dual ? 2.0 : 1.0);
   for (unsigned repeat = 0; repeat < 3; ++repeat) {
     const double ms = time();
-    const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
-                          (ms * 1e9);
+    const double tflops = flops / (ms * 1e9);
     std::printf(
-        "fp16 type=%s batch=%zu M=%zu K=%zu pattern=%d rep=%u ms=%.6f "
-        "tflops=%.2f nonfinite=%zu\n",
-        TypeName(type), batch, m, k, pattern, repeat, ms, tflops, nonfinite);
+        "fp16 type=%s batch=%zu M=%zu K=%zu epi=%s pattern=%d rep=%u "
+        "ms=%.6f tflops=%.2f nonfinite=%zu\n",
+        TypeName(type), batch, m, k, epilogue, pattern, repeat, ms, tflops,
+        nonfinite);
     std::fflush(stdout);
   }
 }
@@ -288,7 +327,7 @@ int main(int argc, char** argv) {
   if (argc < 4) {
     std::fprintf(stderr,
                  "usage: prefill_fp16_bench <type|all> M K [batch] "
-                 "[iterations] [pattern]\n");
+                 "[iterations] [pattern] [store|swiglu|residual|gateup]\n");
     return 1;
   }
   std::string name = argv[1];
@@ -299,10 +338,11 @@ int main(int argc, char** argv) {
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
   const unsigned iterations = argc > 5 ? std::stoul(argv[5]) : 12;
   const int pattern = argc > 6 ? std::stoi(argv[6]) : 0;
+  const char* epilogue = argc > 7 ? argv[7] : "store";
   try {
     if (name == "all") {
       for (const auto& entry : kTypes)
-        RunFp16(entry.type, m, k, batch, iterations, pattern);
+        RunFp16(entry.type, m, k, batch, iterations, pattern, epilogue);
       return 0;
     }
     for (const auto& entry : kTypes) {
@@ -310,7 +350,7 @@ int main(int argc, char** argv) {
         if (sweep)
           DispatchTiles(entry.type, m, k, batch, iterations, pattern);
         else
-          RunFp16(entry.type, m, k, batch, iterations, pattern);
+          RunFp16(entry.type, m, k, batch, iterations, pattern, epilogue);
         return 0;
       }
     }
