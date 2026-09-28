@@ -90,13 +90,19 @@ profile gives one, so the expensive paths move first rather than the convenient 
   loom-check and then fails with "target 'x' has no target-low contract for
   'scalar.isfinitef'". A bound comparison covers NaN and +inf instead. Check the
   contract for any op beyond arithmetic before building a kernel around it.
+  Transcendentals additionally need the fast-math flag under the amdgpu-math
+  policy: `scalar.expf` fails with "rejected scalar.expf for expf in scalar lanes
+  of f32 under math.exp.exact_f32" and is fixed by `scalar.expf<afn>`. The same
+  applies to `sinf`, `cosf` and `powf`.
 - **The formatter rewrites large float literals** (-3e38 becomes -3.0000000000000001e+38),
   so a later string replace against the original spelling silently fails. Re-read the
   file after formatting before patching it.
 - There is no `scalar.select`; use `scf.if` with results. `vector.select` exists.
 - **`index.cmp` returns i1, and `index.andi` does not accept i1.** Select a row band with
   one biased unsigned comparison instead: `(m - band_start) < band_size` is true exactly
-  inside the band and wraps out of range below it.
+  inside the band and wraps out of range below it. There is also no equality
+  predicate (`index.cmp ueq` is not a predicate), so test `t == N` as
+  `(t - N) < 1` with the same biased subtraction.
 - Where a permuted or non-uniform expectation is needed, `check.generate.iota` cannot
   express it. Choose a shape where the expectation collapses to an arithmetic sequence
   (the QG unpack case uses head_dim=1 so the interleave is src = 2*idx), or accept a
