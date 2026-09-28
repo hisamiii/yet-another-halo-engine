@@ -1,0 +1,71 @@
+// YAH vision bias + residual, Loom port of BiasResidual.
+//
+// HIP source: models/qwen/vision/encoder.hip:
+//
+//   hidden[i] = Round(hidden[i] + Round(projection[i] + bias[i % width]))
+//
+// Two bf16 round trips: the projection-plus-bias is rounded before it is added to
+// the residual, and the sum is rounded again. The port spells both out with
+// `scalar.fptrunc` / `scalar.extf` rather than collapsing them, because collapsing
+// would change where the intermediate rounds land.
+//
+// Required config: --config=yah_vision_bias_residual.size=8
+//                  --config=yah_vision_bias_residual.width=4
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_vision_bias_residual.size : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_vision_bias_residual.width : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_vision_bias_residual() {
+  %unit = index.constant 1 : index
+  %size = config.get @yah_vision_bias_residual.size : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %size, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%hidden: buffer, %projection: buffer, %bias: buffer) {
+  %base = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %size = config.get @yah_vision_bias_residual.size : index
+  %width = config.get @yah_vision_bias_residual.width : index
+  %hidden_na, %proj_na, %bias_na = buffer.assume.noalias %hidden, %projection, %bias : buffer, buffer, buffer
+  %hidden_view = buffer.view %hidden_na[%base] : buffer -> view<[%size]xf32>
+  %proj_view = buffer.view %proj_na[%base] : buffer -> view<[%size]xf32>
+  %bias_view = buffer.view %bias_na[%base] : buffer -> view<[%width]xf32>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %index = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %index, %size : index
+  scf.if %in_range {
+    %col = index.rem %index, %width : index
+    %proj = view.load %proj_view[%index] : view<[%size]xf32> -> f32
+    %bias_value = view.load %bias_view[%col] : view<[%width]xf32> -> f32
+    %shifted = scalar.addf %proj, %bias_value : f32
+    %narrow_shifted = scalar.fptrunc %shifted : f32 to bf16
+    %rounded_shifted = scalar.extf %narrow_shifted : bf16 to f32
+    %previous = view.load %hidden_view[%index] : view<[%size]xf32> -> f32
+    %sum = scalar.addf %previous, %rounded_shifted : f32
+    %narrow_sum = scalar.fptrunc %sum : f32 to bf16
+    %rounded_sum = scalar.extf %narrow_sum : bf16 to f32
+    view.store %rounded_sum, %hidden_view[%index] : f32, view<[%size]xf32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_vision_bias_residual.size=8
+// --config=yah_vision_bias_residual.width=4.
+check.case public @yah_vision_bias_residual_case {
+  %hidden = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %projection = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %bias = check.generate.iota offset(0.0) step(1.0) : tensor<4xf32>
+  %expected = check.file.read.npy path("fixtures/vision_epilogue/expected_bias_residual.npy") : tensor<8xf32>
+  kernel.launch @yah_vision_bias_residual(%hidden, %projection, %bias) : (tensor<8xf32>, tensor<8xf32>, tensor<4xf32>)
+  check.expect.close actual(%hidden) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.return
+}
+
+check.benchmark<@yah_vision_bias_residual_case> @yah_vision_bias_residual_bench

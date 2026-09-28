@@ -1,0 +1,66 @@
+// YAH vision encoder finish, Loom port of Finish.
+//
+// HIP source: models/qwen/vision/encoder.hip. The last epilogue of the encoder:
+//
+//   out[i] = Round(out[i] + bias[i % width])
+//
+// where `Round` is `float(Bf16(x))` -- a round trip through bf16 that the encoder
+// uses to keep every stage on the same grid. The port narrows to bf16 and widens
+// back with `scalar.fptrunc` and `scalar.extf`.
+//
+// The bias is indexed modulo `width`, which the check exercises by making width
+// smaller than size: with width == size the wraparound never happens and any index
+// expression would pass.
+//
+// Required config: --config=yah_vision_finish.size=8 --config=yah_vision_finish.width=4
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_vision_finish.size : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_vision_finish.width : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_vision_finish() {
+  %unit = index.constant 1 : index
+  %size = config.get @yah_vision_finish.size : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %size, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%output: buffer, %bias: buffer) {
+  %base = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %size = config.get @yah_vision_finish.size : index
+  %width = config.get @yah_vision_finish.width : index
+  %output_na, %bias_na = buffer.assume.noalias %output, %bias : buffer, buffer
+  %output_view = buffer.view %output_na[%base] : buffer -> view<[%size]xf32>
+  %bias_view = buffer.view %bias_na[%base] : buffer -> view<[%width]xf32>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %index = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %index, %size : index
+  scf.if %in_range {
+    %col = index.rem %index, %width : index
+    %previous = view.load %output_view[%index] : view<[%size]xf32> -> f32
+    %bias_value = view.load %bias_view[%col] : view<[%width]xf32> -> f32
+    %sum = scalar.addf %previous, %bias_value : f32
+    %narrow = scalar.fptrunc %sum : f32 to bf16
+    %rounded = scalar.extf %narrow : bf16 to f32
+    view.store %rounded, %output_view[%index] : f32, view<[%size]xf32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_vision_finish.size=8 --config=yah_vision_finish.width=4.
+check.case public @yah_vision_finish_case {
+  %output = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %bias = check.generate.iota offset(0.0) step(1.0) : tensor<4xf32>
+  %expected = check.file.read.npy path("fixtures/vision_epilogue/expected_finish.npy") : tensor<8xf32>
+  kernel.launch @yah_vision_finish(%output, %bias) : (tensor<8xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.return
+}
+
+check.benchmark<@yah_vision_finish_case> @yah_vision_finish_bench
