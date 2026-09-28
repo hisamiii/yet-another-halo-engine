@@ -361,6 +361,23 @@ that one buffer removed the per-dispatch imports.
 That alone took the prefill from 1206 ms to **963 ms** with identical output
 (argmax 11751, final residual vs HIP max_abs 0.081), and the per-dispatch GPU
 sum now matches the wall time, i.e. the host is no longer on the critical path.
+### IQ3_S decode: hoist the j-invariant block work
+
+The kStore/SwiGLU/Residual element loop maps lane `l` to `(row, col)` with
+`e = l + j*32`, so `col = e & 15 = l & 15` is constant across the 8 `j`
+iterations and `i = kbase + col` is loop-invariant. The port recomputed the
+whole `group/half/q/which/b/l/lw` decode per element anyway. Hoisting it (and
+pre-adding the per-block byte offsets, e.g. `qlo_off = 2 + g8 + lw`) out of the
+`j` loop, plus `unroll(2) schedule(interleaved)` on it, is worth ~6% across the
+three IQ3_S arms with identical output (argmax 11751, final residual 0.081 vs
+HIP). The five reused index clamps become `index.assume ... [le(...)]`, which
+the view-bound verifier accepts and which the backend already lowered to
+`v_cndmask`/`v_max`/`v_min`.
+
+`unroll(%N)` without `schedule(interleaved)` is *slower* (485 insns, VGPR spill);
+factor 2 interleaved beats 4 and 8. The arm is latency-bound, not op-count
+bound: the clamps and the branchless rewrite measured ~0, and the whole kernel
+is ~42% issue-efficient against the 240 G warp-insn/s peak.
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
