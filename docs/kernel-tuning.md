@@ -86,6 +86,30 @@ therefore be read as "within about a tenth of Q4_K", not to the digit, and no
 conclusion should rest on one cell. The whole-model A/Bs are unaffected: they
 run -r 1 after a discarded warm-up, so no block in them is a first block.
 
+**Instruction mix: the decoder's extra work is hidden.** rocprofv3 PMC on the
+production kernel (HalfPrefillGemmKernel<256,256,8,4,IQ3_XXS,kStore,...>: VGPR
+144, LDS 64 KiB, 1024 threads, grid 8192x68, GRBM_GUI_ACTIVE at 100% of
+GRBM_COUNT) gives the issue mix. The WMMA count is analytic (M*K*N/4096), so
+SQ_INSTS_VALU divided by it is instructions per matrix op:
+
+| type | VALU/WMMA | LDS/WMMA | non-WMMA VALU/WMMA |
+| --- | ---: | ---: | ---: |
+| Q4_K | 3.97 | 1.62 | 2.97 |
+| IQ4_XS | 4.64 | 1.62 | 3.64 |
+| IQ3_XXS | 5.36 | 1.62 | 4.36 |
+
+IQ3_XXS issues **47% more non-matrix VALU per WMMA** than Q4_K and measures only
+about 3% slower, so the kernel is **not issue-bound**: the decoder's extra
+instructions are largely hidden behind other latency. That rules out the obvious
+phase-two lever -- shaving the IQ3 decode -- without writing it.
+
+It also sharpens what is left. The ~35% between the achieved ~30 TFLOPS and the
+48.35 instruction ceiling is not the format (<=10% spread), not the epilogue (a
+few percent), and not issue pressure (a 47% instruction increase costs 3%). That
+leaves latency and the K loop's dependency structure, which is where the earlier
+ablations already pointed. This part exposes no SQ_WAIT_* stall counters through
+rocprofv3, so the next instrument is not a counter sweep.
+
 **Measured at the model level.** An existing pure-Q4_K artifact of the same
 model settles whether the format matters end to end
 (/home/q/models/gufo-sweep/base_q4kpure.gguf, 506 Q4_K tensors, 866 tensors,
