@@ -410,6 +410,157 @@ void DispatchBk(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
   }
 }
 
+// Operand-reuse grouping sweep. group_shift controls how many row tiles share a
+// token tile inside one grid group, i.e. which operand stays resident while the
+// other streams. It is hand-set per type in the kernel (5 for IQ4_XS, 5-or-3 for
+// Q5_K, 3 otherwise) and GShift is a template parameter, so it can be swept
+// without touching the production default.
+template<gufo::core::GgmlType Type, int GShift>
+void LaunchTileG(const void* w, const short* x, float* y, std::size_t batch,
+                 std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, 0, GShift>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type>
+void RunGShift(std::size_t m, std::size_t k, std::size_t batch,
+               unsigned iterations, int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const auto launch = [&](int g) {
+    switch (g) {
+      case 0: LaunchTileG<Type, 0>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 1: LaunchTileG<Type, 1>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 2: LaunchTileG<Type, 2>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 3: LaunchTileG<Type, 3>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 4: LaunchTileG<Type, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 5: LaunchTileG<Type, 5>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      default: LaunchTileG<Type, 6>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+    }
+  };
+  const auto timed = [&](int g) {
+    for (unsigned i = 0; i < 2; ++i) launch(g);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(g);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  // Rotated every round: running 0..6 in a fixed order hands the boosted first
+  // block to gshift=0 and reads back the session's decay as a preference.
+  for (int round = 0; round < 7; ++round) {
+    for (int i = 0; i < 7; ++i) {
+      const int g = (i + round) % 7;
+      const double ms = timed(g);
+      const double tflops =
+          (2.0 * static_cast<double>(m) * k * batch) / (ms * 1e9);
+      std::printf("gshift type=%s gshift=%d round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), g, round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchGShift(GgmlType type, std::size_t m, std::size_t k,
+                    std::size_t batch, unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunGShift<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ4_XS:
+      RunGShift<GgmlType::kIQ4_XS>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ3_XXS:
+      RunGShift<GgmlType::kIQ3_XXS>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "gshift sweep covers q4k, iq4xs, iq3xxs\n");
+      return;
+  }
+}
+
+#if defined(GUFO_FP16_PROTO_CLOCK)
+// Reads the kernel's own per-phase clock accumulators for block (0,0): how the
+// block's cycles split across commit (register -> LDS), barrier, fetch (global
+// -> register) and the K loop (LDS read + WMMA). This is the only per-phase
+// instrument available and it is the basis for deciding whether a structural
+// change is worth making.
+template<gufo::core::GgmlType Type>
+void RunProto(std::size_t m, std::size_t k, std::size_t batch) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, 0);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, 0>
+      <<<grid, 1024, 0, nullptr>>>(weights.data(), half_x.data(), y.data(),
+                                   batch, m, k, nullptr);
+  HIP_CHECK(hipDeviceSynchronize());
+  unsigned long long host[8] = {};
+  HIP_CHECK(hipMemcpyFromSymbol(host, HIP_SYMBOL(gufo::hip::g_proto_clock),
+                                sizeof(host)));
+  const double total = static_cast<double>(host[5] - host[4]);
+  std::printf(
+      "proto type=%-8s blocks=%ux%u total=%.0f cyc  commit=%5.1f%% "
+      "barrier=%5.1f%% fetch=%5.1f%% kloop=%5.1f%%  raw %llu/%llu/%llu/%llu\n",
+      TypeName(Type), grid.x, grid.y, total, 100.0 * host[0] / total,
+      100.0 * host[1] / total, 100.0 * host[2] / total, 100.0 * host[3] / total,
+      host[0], host[1], host[2], host[3]);
+  std::fflush(stdout);
+}
+
+void DispatchProto(GgmlType type, std::size_t m, std::size_t k,
+                   std::size_t batch) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunProto<GgmlType::kQ4_K>(m, k, batch);
+      return;
+    case GgmlType::kIQ4_XS:
+      RunProto<GgmlType::kIQ4_XS>(m, k, batch);
+      return;
+    case GgmlType::kIQ3_XXS:
+      RunProto<GgmlType::kIQ3_XXS>(m, k, batch);
+      return;
+    default:
+      std::fprintf(stderr, "proto covers q4k, iq4xs, iq3xxs\n");
+      return;
+  }
+}
+#endif
+
 const char* TileName(int variant) {
   switch (variant) {
     case 0: return "256x256 w8n4";
@@ -529,6 +680,10 @@ int main(int argc, char** argv) {
   if (ablate) name = name.substr(7);
   const bool bksweep = name.rfind("bk:", 0) == 0;
   if (bksweep) name = name.substr(3);
+  const bool proto = name.rfind("proto:", 0) == 0;
+  if (proto) name = name.substr(6);
+  const bool gsweep = name.rfind("gshift:", 0) == 0;
+  if (gsweep) name = name.substr(7);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -549,6 +704,12 @@ int main(int argc, char** argv) {
           DispatchAblate(entry.type, m, k, batch, iterations, pattern);
         else if (bksweep)
           DispatchBk(entry.type, m, k, batch, iterations, pattern);
+        else if (gsweep)
+          DispatchGShift(entry.type, m, k, batch, iterations, pattern);
+#ifdef GUFO_FP16_PROTO_CLOCK
+        else if (proto)
+          DispatchProto(entry.type, m, k, batch);
+#endif
         else
           RunFp16(entry.type, m, k, batch, iterations, pattern, epilogue);
         return 0;

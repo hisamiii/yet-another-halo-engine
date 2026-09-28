@@ -283,6 +283,49 @@ instructions. Work per clock is the quantity that survives a session change.
 
 int4 is the only measured lever above 1.5x: 52.6 TMAC/s, 2.1x int8 and 2.2x fp16. It requires four-bit activations, so it is a quality decision, and it is eligibility-bound (Q4_K/Q3_K, a low-double-digit percent of these shards).
 
+### Where the block's cycles actually go
+
+The kernel carries its own per-phase clock (gated by GUFO_FP16_PROTO_CLOCK)
+which accumulates, for block (0,0), the cycles spent in each phase. Enabled on
+the bench:
+
+| phase | share of block cycles |
+| --- | ---: |
+| K loop (LDS read + WMMA) | 68-70% |
+| commit (register -> LDS) | 7.1% |
+| barrier | 4.5-4.9% |
+| fetch (global -> register) | 4.2-4.9% |
+| prologue and epilogue | ~14% |
+
+Two of six runs came back wrapped (the end timestamp below the start), so the
+profiler's writes race and only the stable runs should be read; the split was
+consistent across those. The operational consequence is the part that matters:
+**staging plus barriers is ~16% of the block**, so a warp-specialised or
+double-buffered dataflow can win at most that much. The other 69% is inside the
+K loop, which is a dataflow question rather than a parameter.
+
+### The K loop's operand grouping is mis-set
+
+group_shift controls how many row tiles share a token tile inside one grid
+group, that is, which operand stays resident while the other streams. It is
+hand-set per type -- 5 for IQ4_XS, 5-or-3 for Q5_K, 3 otherwise -- and exposed
+as the GShift template parameter, so it can be swept without touching the
+default. Swept 0-6 with the order rotated every round, best TFLOPS:
+
+| type | 0 | 1 | 2 | 3 | 4 | 5 | 6 | production |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| IQ3_XXS | 32.16 | 32.25 | 31.36 | 31.37 | 30.88 | 30.45 | 30.46 | 3 |
+| IQ4_XS | 31.66 | 28.53 | 28.34 | 28.52 | 28.39 | 28.19 | 28.62 | 5 |
+
+Identity order (group_shift 0) is worth +2.5% on IQ3_XXS and +12% on IQ4_XS in
+the bench, in the opposite direction to the hand-set values. A first pass read
+it the other way round: gshift 0-6 were run in a fixed order, which hands the
+boosted first block to gshift 0 and reads the session's decay back as a
+preference. The rotated sweep is the one above.
+
+A bench result on one isolated GEMM is not a model result, so this is checked
+end to end before anything changes.
+
 ### The int4 lever is priced, and it is expensive
 
 int4 WMMA is the only measured lever above 1.5x on this part -- 52.6 TMAC/s,
