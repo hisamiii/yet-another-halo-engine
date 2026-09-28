@@ -1356,11 +1356,11 @@ records no events, so it does not confirm or deny throttling; there is no
 cannot parse this device's metrics version, so the SMU's own throttle bitmask is
 not readable without more work than it is worth.
 
-**The one experiment that would settle whether the envelope is thermal**: force the
-fans to maximum and re-measure the sustained-load clock. If it rises materially the
-envelope is thermal and cooling buys clock; if it does not, the ~1.7 GHz point is
-an SMU/power-management floor for this load and no cooling will move it. That needs
-root, so it is a user-side test, not a code change.
+**The thermal experiment has been run.** Maximum fan speed does not move the
+sustained operating point materially. Together with the 80 W -> 130 W sweep showing
+only +12% clock, that closes both cooling and the power cap as clock levers: the
+~1.7 GHz sustained point under heavy load is an SMU/power-management behaviour for
+this load, not something the enclosure can be made to give back.
 
 **The code lever is unchanged and is the only one available from here.** Work per
 clock is 0.01269 TF/MHz in the real prefill against a demonstrated 0.0144 plateau --
@@ -1395,6 +1395,50 @@ reading low for a 400-iteration bench or work per clock has moved. Settling it
 needs the bench bracketed the way `clockrun.py` brackets the engine -- SCLK and
 power sampled inside the timed window -- rather than over the whole process.
 
+
+## The ceiling itself was not measurable, and that invalidated the efficiency claims
+
+Every "X% of the fp16 WMMA ceiling" in this document rests on 24.17 TMAC/s
+(48.35 TFLOPS). That number was a **hardcoded printf in `dot_peak`**, carried from
+an earlier session -- the tool measured only `sdot4_i8`, `sdot8_i4`,
+`fdot2_f16` and `pk_fma_f16`, and had no WMMA kernel at all. So no claim of the
+form "the kernel is at N% of the ceiling" could be checked, and each was in fact a
+cross-session comparison.
+
+A `wmma_f16` peak kernel was added (eight independent accumulator chains, all
+eight read back, or the compiler deletes six and the rate reads ~4x high; MACs
+counted **per warp**, since one WMMA is a wave operation computing 4096 MACs in
+total, not per lane -- counting per thread reads 32x high). Measured in the same
+session as the kernels it is meant to bound:
+
+| | TMAC/s | TFLOPS |
+| --- | ---: | ---: |
+| `wmma_f16` blocks=40 | 27.73 | 55.46 |
+| `wmma_f16` blocks=160 | 26.39 | 52.78 |
+| `wmma_f16` blocks=640 | 26.94 | 53.87 |
+| hardcoded reference | 24.17 | 48.35 |
+
+**The ceiling is 10-13% higher than the recorded value.** That is the same
+magnitude as every effect this document has tried to resolve, so the drift was
+large enough to manufacture or hide results: the same kernel reads 74% against a
+current-session ceiling and 82% against the recorded one, and a "the ceiling is
+fixed at 48.35" assumption silently bakes in a session's operating point.
+
+Two consequences, both methodological:
+
+- **The ceiling must be measured in the same session as the kernel it bounds.**
+  `dot_peak` now measures it, so this is checkable rather than assumed.
+- **Clock-normalised comparisons across workloads are also unsafe.** The bench GEMM
+  at a sampled ~1.7 GHz appeared to deliver 82% of a ceiling measured at a higher
+  clock, i.e. to beat a clock-scaled bound, which is impossible. Either the
+  `freq1_input` sampler is not comparable across workloads or the clock at which
+  the reference was taken is unknown; either way, the quantity that is safe is the
+  **same-session ratio of measured rates**, not rate divided by a sampled clock.
+
+This is the concrete answer to "we need to profile what costs what better": the
+instrument that decided what costs what was reporting a number from a previous
+session.
+
 | lever | size | evidence |
 | --- | --- | --- |
 | work per clock 0.01269 -> 0.0144 TF/MHz | ~12%, plus whatever clock it buys back | bracketed prefill window |
@@ -1411,5 +1455,51 @@ traffic loss worse still, by the operand's reuse factor.
 kernel is at ~63% of the fp16 WMMA ceiling and none of the counters above, nor any
 of the ~25 interventions in this document, accounts for the other 37%. Answering
 that needs stall attribution, which gfx1151 does not expose, or a structural
+
+### Corrected efficiency, and why the tuning was inconclusive
+
+Measured correctly (both sides in TMAC/s, alternated within one session, peak taken
+from the sustained `blocks=640` kernel):
+
+| round | peak bursty | peak sustained | GEMM | efficiency |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 27.67 | 26.10 | 15.58 | 59.7% |
+| 1 | 27.65 | 25.12 | 14.63 | 58.2% |
+| 2 | 27.63 | 25.45 | 14.82 | 58.2% |
+| 3 | 27.63 | 25.29 | 14.89 | 58.9% |
+| 4 | 27.49 | 24.68 | 14.68 | 59.5% |
+
+**The production GEMM is at ~59% of the same-session sustained fp16 WMMA peak, so
+there is ~41% of headroom** -- roughly twice what the stale 48.35 TFLOPS reference
+implied. The stale reference was understating the gap, which is the opposite of
+what a wrong reference usually does.
+
+**The reason every intervention in this document was inconclusive is now visible.**
+The same GEMM measured 14.6 TMAC/s in the alternating runs and 19.6 TMAC/s ten
+minutes earlier in the same session -- a **34% spread between processes minutes
+apart**. The effects being hunted were a few percent. On this box, with this
+protocol, a few-percent effect is simply not resolvable, and the failure mode is
+that real small wins and real small losses both read as "no change". That is the
+most likely explanation for the entire run of null results in the middle of this
+document, and it is not fixable by more careful alternation alone: the drift is
+larger than the effect.
+
+Two things follow:
+
+- **Only large structural effects are measurable here.** On the same protocol the
+  int4 packed-dot class reads 28.99 TMAC/s against fp16 WMMA's 26.9 -- a 2.2x
+  advantage over the fp16 instruction is the kind of effect that survives this
+  noise, and a 3% instruction-count saving does not.
+- **A better protocol is required for anything smaller**: same-process, interleaved
+  A/B (not sequential blocks), many alternating pairs, and a reported
+  distribution rather than a mean. The `reg:`-style alternating sweeps used late in
+  this document are already the right shape; the earlier sequential ones were not.
+
+**What the 41% consists of** is the part this document could measure but not move:
+the K loop is 68-70% of block cycles at ~95% of its own limit, so the remaining
+~30% is the staging chain (fetch, decode, commit, barrier) outside the loop. 0.68 x
+0.95 = 0.65, which is the ~59-65% measured. Every attempt to shrink the ~30% moved
+something else at the same time, and none of it was resolvable above the noise.
+
 change that alters the instruction stream rather than its resources.
 
