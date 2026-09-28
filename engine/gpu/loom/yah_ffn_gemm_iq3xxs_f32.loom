@@ -68,6 +68,9 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3xxs() {
   kernel.launch.config workgroups(%m_tiles, %token_tiles, %unit) workgroup_size(%c32, %unit, %unit) : index
 } launch(%weight: buffer, %grid: buffer, %ksigns: buffer, %input: buffer, %wstage: buffer, %ostage: buffer, %output: buffer) {
   %base = index.constant 0 : offset
+  %lds_bytes = index.constant 512 : offset
+  %wstage_lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %wstage_lds_view = buffer.view %wstage_lds[%base] : buffer -> view<16x16xf16>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c4 = index.constant 4 : index
@@ -135,7 +138,6 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3xxs() {
   %out_view = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>
   %grid_view = buffer.view %grid_na[%base] : buffer -> view<256xi32>
   %ksigns_view = buffer.view %ksigns_na[%base] : buffer -> view<128xi8>
-  %wstage_view = buffer.view %wstage_na[%base] : buffer -> view<[%stage_rows]x[%c16]xf16>
   %ostage_view = buffer.view %ostage_na[%base] : buffer -> view<[%stage_rows]x[%tokens]xf32>
   %wg_x = kernel.workgroup.id<x> : index
   %m_origin = index.mul %wg_x, %c16 : index
@@ -261,14 +263,12 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3xxs() {
       %h = scalar.fptrunc %value : f32 to f16
       %c_ix = index.cast %c_i : i32 to index
       %c_idx = index.max %c_ix, %c0 : index
-      %row_ix = index.cast %row_i : i32 to index
-      %row_lo = index.max %row_ix, %c0 : index
-      %row = index.min %row_lo, %stage_last : index
-      view.store %h, %wstage_view[%row, %c_idx] : f16, view<[%stage_rows]x[%c16]xf16>
+      %row_local = index.cast %r_i : i32 to index
+      view.store %h, %wstage_lds_view[%row_local, %c_idx] : f16, view<16x16xf16>
       scf.yield %mk : index
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    %lhs = vector.fragment.load<lhs> %wstage_view[%m_origin, %c0] shape [%m, %k] : view<[%stage_rows]x[%c16]xf16> -> vector<16xf16>
+    %lhs = vector.fragment.load<lhs> %wstage_lds_view[%c0, %c0] shape [%m, %k] : view<16x16xf16> -> vector<16xf16>
     %t16 = index.add %token_base, %c16 : index
     %t32 = index.add %token_base, %c32 : index
     %t48 = index.add %token_base, %c48 : index
