@@ -459,6 +459,12 @@ class Forward {
             : std::min(config_.main_block_count(),
                        static_cast<std::uint32_t>(std::stoul(limit_env)));
     const bool sync_layers = std::getenv("YAH_SYNC_LAYERS") != nullptr;
+    // YAH_PAIRED_STATS prints one character per block for the FFN gate/up
+    // projection: '1' when the dual-weight kernel took it, '0' when it fell
+    // back to two launches. A coverage change that is silently rejected reads
+    // as "no effect" otherwise.
+    const bool paired_stats = std::getenv("YAH_PAIRED_STATS") != nullptr;
+    std::string paired_map;
     for (std::uint32_t l = 0; l < layer_limit; ++l) {
       const Qwen35Layer& layer = weights_.layers[l];
       const bool full = config_.IsFullAttention(l);
@@ -598,6 +604,7 @@ class Forward {
             buffers_.ffn_gate, buffers_.ffn_up, batch, ffn_, hidden_,
             stream_);
       }
+      if (paired_stats) paired_map.push_back(paired ? '1' : '0');
       stage("gate_up", l);
       LaunchBatchedQuantGEMMResidualFp16(
           Gt(layer.ffn_down.type), layer.ffn_down.data, buffers_.ffn_up,
@@ -607,6 +614,10 @@ class Forward {
         std::fprintf(stderr, "yah forward: layer %u (%s) ok\n", l,
                      full ? "attention" : "deltanet");
       }
+    }
+    if (paired_stats) {
+      std::fprintf(stderr, "yah forward: ffn gate/up paired map: %s\n",
+                   paired_map.c_str());
     }
 
     const float* final_hidden =

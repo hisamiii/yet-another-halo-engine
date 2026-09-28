@@ -98,6 +98,35 @@ The shipped shard's FFN is not one quant. A byte-weighted census gives seven typ
 
 **Falsifier on record:** a batch-2048 A/B of Q4_K against IQ3_XXS at m=17408 k=5120. Near +25% means the gap is the decoder and repacking/coverage is the lever; near +3% means the format hypothesis is dead too. A batch-512 run gave only +2.8%, but at that batch the shape is weight-bandwidth-bound and hides decode cost.
 
+**Falsified: the missing paired kernel for IQ3_XXS is not the gap.** The census
+above says this shard's FFN is not one quant, and the paired gate/up kernel had
+no `IQ3_XXS`, `Q3_K` or `IQ2_*` case, so those layers ran as two launches with
+the gate round-tripping through a 143 MB fp32 buffer — a reading that made
+coverage look like the lever. A tensor-type census of this artifact (§ above)
+puts the gate/up pairs at IQ3_XXS/IQ3_XXS 16, IQ3_S/IQ4_XS 14, IQ3_S/IQ3_S 12,
+IQ4_XS/IQ4_XS 9, Q3_K/IQ3_S 7, and seven singletons: **only 9 of 64 blocks hit
+the paired kernel**. Adding same-type `IQ3_XXS`/`Q3_K`/`IQ2_XXS`/`IQ2_XS` and
+four mixed pairs took coverage to 29/64. The rest are `IQ3_S`-gated, which the
+paired epilogue excludes by `static_assert` because `IQ3_S` feeds the A
+operand instead of B.
+
+Order-alternated A/B at `--ids-file` 2048 tokens, `--chunk 2048`, f16 KV,
+`--repeat 2`, four reps:
+
+| rep | order | paired 29 (ms) | paired 9 (ms) |
+| ---: | --- | ---: | ---: |
+| 1 | new first | 3822.9 | 4037.2 |
+| 2 | old first | 4162.7 | 4081.9 |
+| 3 | new first | 4165.0 | 4282.0 |
+| 4 | old first | 4135.6 | 3978.7 |
+
+The arm that ran first won every rep (+5.3%, -2.0%, +2.7%, -3.9% for new), and
+the new-vs-old mean is **-0.5%**: the effect is run order, not code. The ~286 MB
+per layer of round-trip traffic is real but is ~2.7% of a chunk. The change was
+reverted. `YAH_PAIRED_STATS=1` was kept: it prints one character per block for
+the FFN gate/up projection, so coverage is confirmed rather than assumed — the
+same discipline that caught a split-K A/B that had silently run a stale binary.
+
 ## The two matrix units are shaped on different axes
 
 The same datatype switch costs differently on the GPU and the NPU because the
