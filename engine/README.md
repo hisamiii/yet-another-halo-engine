@@ -567,8 +567,24 @@ The report for v3 is available and makes one high-confidence recommendation:
 ```
 
 v3 sits at 200 vector registers, so it misses the 192 threshold that would move it
-from 4 to 5 subgroups per SIMD by a margin of 8. 192 is also the budget our HIP
-kernels run at, because a 1024-thread workgroup gets 196608 / 1024 = 192.
+from 4 to 5 subgroups per SIMD by a margin of 8.
+
+192 is the budget our HIP prefill GEMM actually runs at, verified from the device
+object with `llvm-readobj --notes gemm_bench.0.hipv4-amdgcn-amd-amdhsa--gfx1151`:
+
+| tile | threads | type | VGPR | spills |
+| --- | ---: | --- | ---: | ---: |
+| 256x256 w8n4 | 1024 | Q4_K | **192** | 0 |
+| 256x256 w8n4 | 1024 | IQ4_XS | 192 | 0 |
+| 256x256 w8n4 | 1024 | Q8_0 | 187 | 0 |
+| 256x256 w8n4 | 1024 | Q5_K | 168 | 0 |
+| 256x256 w8n4 | 1024 | Q6_K | 163 | 0 |
+| 256x256 w4n4 | 512 | Q4_K | 250 | 0 |
+| 256x256 w4n2 | 256 | Q4_K | 221 | 0 |
+
+The 1024-thread arm is pinned at 196608 / 1024 = 192 with zero spills, so it is at its
+launch-bound ceiling rather than stopping short of it. The 512- and 256-thread arms
+exceed 192 because their per-thread ceilings are higher.
 
 **Correction: an earlier revision of this note claimed the suggestion was already
 falsified, and that was wrong.** The two variants it cited changed more than the
