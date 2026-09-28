@@ -33,6 +33,33 @@ A chunk is on the order of 3,600 dispatches. At a few microseconds each that is 
 
 The GPU stream is already ~96% busy in the column split, so there is no idle to reclaim on the GPU side. The token split wins because it *removes* GPU work, not because the GPU was idle. GPU tuning therefore raises efficiency (TFLOPS per shape) rather than occupancy, and its ceiling is the hardware peak that `tools/bench/gfx1151_peak.hip` measures.
 
+## What is closed on the GPU GEMM
+
+The prefill GEMM runs at a FLOP-weighted **30.4 TFLOPS** against a measured 48.35
+instruction ceiling, and that aggregate is accounted for shape by shape in
+[kernel-tuning.md](kernel-tuning.md). Each of the following has been measured and
+is **not** the residual:
+
+- **The weight format.** Per-type rates are within ~10% of one another, and
+  IQ3_XXS -- which dominates this artifact's FFN -- is at parity with Q4_K. Only
+  the 2-bit formats carry a real penalty.
+- **The epilogue.** kSwiGLU and kResidual cost a few percent against kStore; the
+  paired kGateUp is *unavailable* to the IQ3 types rather than slow for them.
+- **Issue pressure.** IQ3_XXS issues 47% more non-matrix VALU per WMMA than
+  Q4_K and runs about 3% slower, so the decoder's extra instructions are hidden.
+- **The K-loop scheduling hint.** iglp_opt 0/1/2 sit inside the noise on the
+  types that apply it.
+- **Occupancy through BK.** BK=4 is monotonically best of 1-4; halving LDS to
+  double the resident blocks loses, so occupancy is not the binding constraint.
+- **The tile space.** Swept and exhausted earlier: only the 256x256 family is
+  competitive, and the 64 KiB LDS and 1024-thread limits are both hit.
+
+What remains is the K loop's LDS-read and WMMA dependency chain. The measurement
+that bounds it is the staging ablation -- removing weight and activation staging
+reaches 34.9 TFLOPS (72%) -- so roughly 10-22% is staging and the rest is the
+loop's own dependency structure. Closing that is a dataflow change, not a
+parameter, and it is the honest next step rather than another sweep.
+
 ## Interaction with the split
 
 Tuning the GPU moves the split balance. Both engines currently sustain about the same ~19 TFLOPS on their FFN halves, which is why the optimum sits at 50/50. A faster GPU should take more of the split, so `M` has to be re-tuned after GPU tuning, not before. It also raises the GPU-only baseline, which shrinks the NPU's *relative* contribution even as the absolute chunk time falls -- both are worth having, but the two wins are not additive.
