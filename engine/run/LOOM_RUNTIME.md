@@ -232,6 +232,27 @@ norm-weight upload buffer was reused across layers, and the synchronous
 read it. Giving each norm its own weight buffer fixed it; the run is
 deterministic with no intervening syncs.
 
+### Target-shard driver (mixed formats)
+
+`engine/gpu/loom/tools/emit_prefill.py <model.gguf> <outdir>` walks the model
+tensor table and emits every HAL the prefill needs, named by a convention the C++
+driver reconstructs from each tensor's ggml type and shape:
+`gemm_{kstore,residual,swiglu}_<fmt>_<m_tiles>_<k_blocks>.hal`. It emitted 47
+GEMM HALs for `Qwen3.8-27B-IQ4_XS-3.84bpw.gguf`, plus 13 fixed HALs
+(norm/conv/prepkq/prepab/rowsplit/postnorm/unpack/rope/wmma/cast/gemv/rmsnorm/
+argmax) and the IQ3_S/IQ3_XXS grid/ksigns tables.
+
+`engine/run/loom_forward_target.cc` is the format-aware driver: it reads
+`Qwen35Config` for the layer schedule, picks the HAL per tensor from its type,
+host-dequantizes the embedding (Q4_K and IQ4_XS), and runs the same 64-layer
+prefill. It runs the IQ4_XS shard through every layer whose format is ported and
+stops at `blk.3.ffn_gate.weight`, whose type is IQ2_XXS.
+
+The two formats still missing a port are the only thing between this driver and a
+full IQ4_XS-shard run: **IQ2_XXS** (3 FFN gate/up tensors) and **Q2_K** (1
+ssm_beta). Neither has a Loom file yet. HIP reference for that shard:
+`argmax=11751`, `best_ms=393.2`.
+
 ## 5. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape
