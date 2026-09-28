@@ -44,6 +44,7 @@ explicitly deferred.
 | yah_pack_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV pack (fp16 + f32) | ported, 0.0073 ms; exact fixtures |
 | yah_sync_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV f32->fp16 prefix sync | ported, 0.0076 ms; exact fixtures |
 | yah_pack_attn_heads_f16.loom | attention_wmma.hip | pack K/V into WMMA head tiles (LDS V transpose) | ported, 0.0079 ms; fp16 fixture |
+| yah_attn_wmma_f32.loom | attention_wmma.hip | WMMA causal attention, retiled to one query head and one token per workgroup | ported, 0.0072-0.0084 ms; three arms (canonical, head-major packed, lse) vs a double reference |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -61,7 +62,7 @@ explicitly deferred.
 | yah_dflash_conv_f32.loom | dflash_kernels.hip | grouped dynamic convolution | ported, 0.0064 ms; exact fixture |
 | yah_dflash_silu_mul_f32.loom | dflash_kernels.hip | in-place SiLU multiply | ported, 0.0064 ms; exact, no fixture |
 | yah_dflash_topk_f32.loom | dflash_kernels.hip | dflash selector partial top-k | ported, 0.0108 ms; exact fixture; iterative selection instead of the register-list merge |
-| - | prefill_attention*.hip, attention_wmma.hip, attention_decode*.hip | WMMA/tiled attention compute, decode-online, split-K, bf16 output | todo |
+| - | attention_decode*.hip, prefill_attention*.hip | decode-online and split-K attention, bf16 output, prefill_attention variants | decode-only or unreferenced; see the route audit below |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
 | yah_dequant_q8k_bf16.loom | prefill_gemm.hip | Q8_K weight dequant to bf16 | ported, 0.0076 ms; exact periodic expectation |
@@ -116,31 +117,54 @@ explicitly deferred.
 | yah_atb_decode_swiglu_f16.loom | prefill_fp16.hip | ATB gate+up bfp16ebs8 -> fp16 SwiGLU | ported, 0.0103 ms; exact fixture |
 | - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | all eight **ported** |
 
-## Remaining inventory
+## Route audit
 
-From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 89 are ported. Ordered by share of prefill time where the model-level
-profile gives one, so the expensive paths move first rather than the convenient ones.
+The inventory below is a raw kernel count, not the work list. The active forward
+path is engine/model/forward.hip, and only kernels a live launcher can reach from
+there are worth porting. Every launch Prefill can make is covered by a Loom port
+except the two extra epilogue arms of HalfPrefillGemmKernel (SwiGLU and residual,
+plus the dual gate/up form). Those are the same kernel as yah_ffn_gemm_f16 with a
+different accumulator epilogue, not a separate kernel.
+
+Reachability evidence for the entries that are not on that route:
+
+- QwenTiledAttentionKernel (attention_tile.hip) is dead: LaunchQwenTiledAttention
+  has no declaration and no call site anywhere in the tree, and
+  DispatchPrefillAttention is a template nothing instantiates. forward.hip calls
+  LaunchQwenWmmaAttention and falls back to LaunchBatchedAttention.
+- W8A8BlockedWmmaGEMMKernel (prefill_quant_gemm.hip) is dead on the current model
+  route: LaunchBatchedQuantGEMMFp16 resolves through DirectGemm to
+  HalfPrefillGemmKernel, never to the W8A8 WMMA kernel. The same file small-batch
+  arms (BatchedQuantGEMVKernel, TiledBatchedQ8_0GEMMKernel,
+  SmallBatchQ8KFp32GEMMKernel) are decode arms.
+- The decode leftovers (attention_decode.hip, gemv*.hip, the decode arms of qkv.hip,
+  norm.hip, embed.hip and rope.hip, FastFusedSwiGLUGEMVBlockKernel) are reachable
+  only from Decode, which is off-target for the prefill goal.
+- The dflash draft kernels are parked by instruction.
+- gemv_quant.hip, the qkv.hip BF16/Q8_0 arms, the non-f32 lookup arms and AtbRepack
+  share one blocker: the sub-16 quant table decoder. One piece of work, not four.
+
+### Raw inventory (all kernels, before the reachability filter)
 
 | Area | File | Kernels |
 | --- | --- | --- |
 | DeltaNet / SSM (5.1%) | ssm_row_split.hip | all five kernels **ported** (row split, prep alpha/beta, prep K/Q, conv, post-norm gate fp32 + fp16). The 5.1% prefill block is now covered end to end. |
 | DeltaNet / SSM | ssm_recurrence.hip | BatchedDeltaNetRecurrenceKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel |
 | DeltaNet / SSM | batched_ssm.hip, ssm.hip, ssm_decode_recurrence.hip | BatchedSSMPostNormGateKernel, FusedSSMInputProjectionsKernel, SSMConvKernel, CaptureBatchedSsmReplayKernel |
-| attention (2.1%) | attention_wmma.hip, attention_tile.hip | **ported**: PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel. **todo**: QwenTiledAttentionKernel, WmmaCausalAttention |
+| attention (2.1%) | attention_wmma.hip, attention_tile.hip | **ported**: PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel, WmmaCausalAttention. QwenTiledAttentionKernel is **dead** (no launcher call site); see the route audit |
 | attention | attention_batched.hip | BatchedAttentionKernel, CausalSoftmaxKernel, WriteBatchedKVCacheKernel, ApplyAttentionGateKernel |
-| attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | tiled, decode-online, split-K, and KV-write variants |
+| attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | decode-online, split-K and KV-write variants are decode-only; QwenTiledAttentionKernel is dead |
 | QKV projection | qkv.hip | **ported**: Wave32FusedQKVProjectionsKernel_1Row<4> and FusedQKVProjectionsKernel, f32 arm only. **todo**: the BF16, Q8_0 and block-quantized arms (sub-16 table) |
 | fused RoPE | prefill_rope.hip | all **ported**: BatchedFusedQKNormRoPEKvWriteKernel and BatchedRoPEKernel (text path) |
 | fused.hip | fused.hip | **ported**: FusedQKNormRoPEKvWriteKernel (text path) |
 | dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
-| W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path), ZeroQ8ActTailKernel, BatchedFusedRMSNormQuantizeQ8_1Kernel, BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel (tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, the clip variant, BatchedQuantGEMVKernel |
+| W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path), ZeroQ8ActTailKernel, BatchedFusedRMSNormQuantizeQ8_1Kernel, BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel (tiled layout + sum sidecar). W8A8BlockedWmmaGEMMKernel, BatchedQuantGEMVKernel and the same-file small-batch arms are **dead** (see the route audit). **todo**: the clip variant |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16, AtbEncodeA, AtbDecodeC (write), AtbDecodeSwiGLU. **todo**: AtbRepack(+Slice, blocked on the sub-16 quant table) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
 | sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm), SpeculativeSegmentMaxKernel, SpeculativeSegmentWeightsKernel, SpeculativeSegmentResidualKernel, SpeculativeSegmentSelectKernel, LinearSamplingKernel, SortedSamplingKernel (f32 thresholds). **todo**: SortedSpeculativeSampling, LinearSpeculativeSampling, the Partial/MapIndices argmax arms |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 arm). **todo**: FastFusedSwiGLUGEMVBlockKernel, the non-f32 lookup arms |
-| dflash | dflash_kernels.hip | **ported**: grouped dynamic convolution, q8_0 quantization, silu_mul, selector partial top-k. **todo**: non-causal attention (2), selector finalize (+batch) |
+| dflash | dflash_kernels.hip | **ported**: grouped dynamic convolution, q8_0 quantization, silu_mul, selector partial top-k. **parked** by instruction: non-causal attention (2), selector finalize (+batch) |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 
 ## Notes carried over from the FFN GEMM port
@@ -414,3 +438,14 @@ profile gives one, so the expensive paths move first rather than the convenient 
   float compare `scalar.cmpf` uses `ogt`/`olt`/`ole`/`oge`; the integer one uses the
   signed/unsigned short forms, and `ogt` on `scalar.cmpi` fails with `unknown
   predicate value`.
+
+- **Combine config boolean flags as integers, not i1.** `index.cmp` yields i1 and
+  `index.andi` will not take it, so `has_gate AND NOT has_lse` is written as
+  `%not_lse = index.sub %c1, %has_lse : index`, `%on = index.mul %has_gate, %not_lse`
+  and one final `index.cmp eq, %on, %c1` (`yah_attn_wmma_f32.loom`).
+- **An `scf.if` may yield an `index`.** That selects the address base for a layout
+  flag without a data-dependent branch: the whole `index` computation is duplicated
+  per arm and the footprint analysis sees both, so both arms must stay in bounds
+  (`yah_attn_wmma_f32.loom` picks the canonical and head-major KV bases this way).
+  `scalar.logf<afn>` does carry a target contract and gives the natural-log
+  log-sum-exp for the `lse_out` epilogue.
