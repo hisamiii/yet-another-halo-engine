@@ -1,0 +1,129 @@
+// YAH decode SSM causal convolution + gate with state advance, Loom port of
+// SSMConvKernel (ssm_decode_recurrence.hip).
+//
+// Per (row, channel):
+//   old1, old2, old3 = state[c*4+1..3]
+//   new_state        = [old1, old2, old3, x]
+//   dot              = old1*w0 + old2*w1 + old3*w2 + x*w3
+//   conv_out[row][c] = dot * sigmoid(dot)
+//
+// This is the decode counterpart of yah_ssm_conv_f32; that prefill port reads a
+// read-only history ring, while this one advances the persistent 4-slot state in
+// place (the state is one layer, already offset by the caller). Replay capture is
+// a no-op on the decode path and is omitted.
+//
+// Required config (small): --config=yah_ssm_conv_decode.qkv_dim=8
+//                          --config=yah_ssm_conv_decode.rows=2
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_ssm_conv_decode.qkv_dim : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @yah_ssm_conv_decode.rows : %value: index where [range(%value, 1, 4096)]
+
+kernel.def target(@yah_wave32) @yah_ssm_conv_decode() {
+  %unit = index.constant 1 : index
+  %qkv_dim = config.get @yah_ssm_conv_decode.qkv_dim : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %bias = index.add %qkv_dim, %c255 : index
+  %tiles = index.div %bias, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%qkv: buffer, %w: buffer, %state: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c256 = index.constant 256 : index
+  %one = scalar.constant 1.0 : f32
+  %negone = scalar.constant -1.0 : f32
+  %zero = scalar.constant 0.0 : f32
+  %qkv_dim = config.get @yah_ssm_conv_decode.qkv_dim : index
+  %rows = config.get @yah_ssm_conv_decode.rows : index
+  %q_total = index.mul %rows, %qkv_dim : index
+  %w_total = index.mul %qkv_dim, %c4 : index
+  %q_last = index.sub %q_total, %c1 : index
+  %w_last = index.sub %w_total, %c1 : index
+  %qkv_na, %w_na, %s_na, %o_na = buffer.assume.noalias %qkv, %w, %state, %out : buffer, buffer, buffer, buffer
+  %q_view = buffer.view %qkv_na[%base] : buffer -> view<[%q_total]xf32>
+  %w_view = buffer.view %w_na[%base] : buffer -> view<[%w_total]xf32>
+  %s_view = buffer.view %s_na[%base] : buffer -> view<[%w_total]xf32>
+  %o_view = buffer.view %o_na[%base] : buffer -> view<[%q_total]xf32>
+  %wg = kernel.workgroup.id<x> : index
+  %tid = kernel.workitem.id<x> : index
+  %wg256 = index.mul %wg, %c256 : index
+  %c_idx = index.add %wg256, %tid : index
+  %in_range = index.cmp ult, %c_idx, %qkv_dim : index
+  scf.if %in_range {
+    %c4off = index.mul %c_idx, %c4 : index
+    %o0 = index.add %c4off, %c0 : index
+    %o1 = index.add %c4off, %c1 : index
+    %o2 = index.add %c4off, %c2 : index
+    %o3 = index.add %c4off, %c3 : index
+    %row_sink = scf.for %row = [%c0 to %rows step %c1](%mk = %c0 : index) -> (index) {
+      %row_off = index.mul %row, %qkv_dim : index
+      %in_i = index.add %row_off, %c_idx : index
+      %in_ix = index.max %in_i, %c0 : index
+      %in_idx = index.min %in_ix, %q_last : index
+      %x = view.load %q_view[%in_idx] : view<[%q_total]xf32> -> f32
+      %s1 = view.load %s_view[%o1] : view<[%w_total]xf32> -> f32
+      %s2 = view.load %s_view[%o2] : view<[%w_total]xf32> -> f32
+      %s3 = view.load %s_view[%o3] : view<[%w_total]xf32> -> f32
+      %w0 = view.load %w_view[%o0] : view<[%w_total]xf32> -> f32
+      %w1 = view.load %w_view[%o1] : view<[%w_total]xf32> -> f32
+      %w2 = view.load %w_view[%o2] : view<[%w_total]xf32> -> f32
+      %w3 = view.load %w_view[%o3] : view<[%w_total]xf32> -> f32
+      %t1 = scalar.mulf %s1, %w0 : f32
+      %t2 = scalar.mulf %s2, %w1 : f32
+      %t3 = scalar.mulf %s3, %w2 : f32
+      %t4 = scalar.mulf %x, %w3 : f32
+      %a1 = scalar.addf %t1, %t2 : f32
+      %a2 = scalar.addf %a1, %t3 : f32
+      %dot = scalar.addf %a2, %t4 : f32
+      %neg = scalar.mulf %dot, %negone : f32
+      %e = scalar.expf<afn> %neg : f32
+      %den = scalar.addf %one, %e : f32
+      %sig = scalar.divf %one, %den : f32
+      %val = scalar.mulf %dot, %sig : f32
+      view.store %val, %o_view[%in_idx] : f32, view<[%q_total]xf32>
+      view.store %s1, %s_view[%o0] : f32, view<[%w_total]xf32>
+      view.store %s2, %s_view[%o1] : f32, view<[%w_total]xf32>
+      view.store %s3, %s_view[%o2] : f32, view<[%w_total]xf32>
+      view.store %x, %s_view[%o3] : f32, view<[%w_total]xf32>
+      scf.yield %mk : index
+    }
+  }
+  kernel.return
+}
+
+// Requires qkv_dim=8, rows=2.
+check.case public @yah_ssm_conv_decode_case {
+  %qkv = check.file.read.npy path("fixtures/ssm_conv_decode/input_qkv.npy") : tensor<16xf32>
+  %w = check.file.read.npy path("fixtures/ssm_conv_decode/input_w.npy") : tensor<32xf32>
+  %state = check.file.read.npy path("fixtures/ssm_conv_decode/input_state.npy") : tensor<32xf32>
+  %expected_out = check.file.read.npy path("fixtures/ssm_conv_decode/expected_out.npy") : tensor<16xf32>
+  %expected_state = check.file.read.npy path("fixtures/ssm_conv_decode/expected_state.npy") : tensor<32xf32>
+  %out = check.generate.fill value(0.0) : tensor<16xf32>
+  kernel.launch @yah_ssm_conv_decode(%qkv, %w, %state, %out) : (tensor<16xf32>, tensor<32xf32>, tensor<32xf32>, tensor<16xf32>)
+  check.expect.close actual(%out) expected(%expected_out) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
+  check.expect.close actual(%state) expected(%expected_state) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<32xf32>
+  check.return
+}
+
+check.benchmark<@yah_ssm_conv_decode_case> @yah_ssm_conv_decode_bench
+
+// Production shape: qkv_dim=12288 (this shard s SSM qkv width), rows=1, all-zero
+// inputs so the output and the state stay zero.
+check.case public @yah_ssm_conv_decode_full_case {
+  %qkv = check.generate.fill value(0.0) : tensor<12288xf32>
+  %w = check.generate.fill value(0.0) : tensor<49152xf32>
+  %state = check.generate.fill value(0.0) : tensor<49152xf32>
+  %out = check.generate.fill value(0.0) : tensor<12288xf32>
+  %expected = check.generate.fill value(0.0) : tensor<12288xf32>
+  kernel.launch @yah_ssm_conv_decode(%qkv, %w, %state, %out) : (tensor<12288xf32>, tensor<49152xf32>, tensor<49152xf32>, tensor<12288xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<12288xf32>
+  check.return
+}
+
+check.benchmark<@yah_ssm_conv_decode_full_case> @yah_ssm_conv_decode_full_bench

@@ -42,6 +42,7 @@ explicitly deferred.
 | yah_deltanet_rowsplit_f32.loom | ssm_row_split.hip | DeltaNet row-split recurrence | ported, 19.22 ms at batch 512 / 8 heads (untilable port; tuning deferred) |
 | yah_deltanet_prep_kq_f32.loom | ssm_row_split.hip | DeltaNet K/Q-norm prologue | ported, 0.0076 ms at 3 tokens / 2 key heads |
 | yah_ssm_conv_f32.loom | ssm_recurrence.hip | causal SSM convolution + gate | ported, 0.0148 ms at 4x16; fixture + 1e-6 tolerance |
+| yah_ssm_conv_decode_f32.loom | ssm_decode_recurrence.hip | decode SSM convolution + gate with persistent state advance (SSMConvKernel) | ported, 0.0076 ms at 12288 channels; fixture checks conv_out and the advanced state, production zero case |
 | yah_ssm_postnorm_gate_f32.loom | batched_ssm.hip | SSM post-norm + gate epilogue | ported, 0.0173 ms at 2x2x128; fixture + 1e-6 tolerance |
 | yah_deltanet_prep_ab_f32.loom | ssm_row_split.hip | DeltaNet alpha/beta prep + conv history advance | ported, 0.0087 ms; ab within 1e-5, history exact |
 | yah_deltanet_decode_resident_f32.loom | deltanet_decode.hpp | resident fp32 decode recurrence (DeltaNetRecurrenceKernel<float, Resident=true, WriteOutput=true>) | ported, 0.208 ms at 32 heads / 16 key heads; fixture + numpy oracle 1e-5, analytic production case |
