@@ -144,3 +144,55 @@ exercised, `hip_stream_value_api_test` passed 25/25 while
 `hip_execution_resource_api_test` had **14 failures**, so acceptance is uneven and
 the engine's own checks (`yah-ssm-check`, `yah-gemm-check`,
 `kv-quant-check`) must be re-run against it before any cut-over.
+
+## HRX-specific optimizations: where they are, and a negative
+
+Everything above ran ROCm-shaped code through the HIP compatibility shim, which is
+the least interesting way to use HRX. What the native surface actually offers, and
+what it costs to reach:
+
+| native API | what it would buy us | reachable from HIP? |
+| --- | --- | --- |
+| `hrx_graph_*` with explicit `add_dependencies` | one submission for the 1625-dispatch prefill | **yes**, via `hipStreamBeginCapture` |
+| `hrx_stream_dispatch`, `hrx_queue_dispatch` | skip the compat layer | no -- takes `hrx_executable_t` |
+| `hrx_fence_insert/extend`, `hrx_semaphore_*` | submission batching, timeline deps | no -- native only |
+| `hrx_stream_wait_on`, `advance_timeline` | overlap independent work (SSM vs attention) | no -- native only |
+| `hrx_mem_pool_t`, `hrx_device_memory_info` | GTT budget, alloc churn | no -- native only |
+
+The blocker for all the "no" rows is one signature: `hrx_executable_load_data`
+takes a **native executable package** selected by `target_family` / `target_key`,
+not a hipcc HSACO. The native path is therefore not a re-link -- it needs kernels
+produced by HRX's own compile path (Loom, the MLIR/TileLang importers). That is
+re-authoring, not tuning, and it is the honest answer to "can we do HRX-specific
+optimizations": not on the HIP surface, only by moving the kernels.
+
+The part that *is* reachable -- HIP graph capture -- HRX implements properly
+(315 real HIP definitions against 116 stubs; `hipStreamBeginCapture`,
+`hipGraphInstantiate`, `hipGraphLaunch`, `hipGraphAddKernelNode`,
+`hipGraphAddDependencies` all implemented, and capture maps onto
+`iree_hal_streaming_capture_mode_t`, i.e. the native graph). Your engine already
+has `attention_decode_graph`, so the machinery exists. So it was worth measuring:
+
+```
+launch_bench 2000, empty kernel, 15 s gaps, 3 cycles
+                raw launch        graph launch     graph gain
+ROCm 7.2.4      2.397 us/launch   2.264 us/launch  1.06x
+HRX + ROCm 10   3.081 us/launch   2.653 us/launch  1.16x
+```
+
+Two conclusions, both negative:
+
+1. **HRX's dispatch is 28% more expensive per launch than ROCm's**, and its graph
+   path is still slower in absolute terms. HRX's "low latency" thesis does not show
+   up as cheaper submission on this part.
+2. **The ~4% GPU idle is not dispatch cost.** Graph-capturing the whole prefill
+   under HRX saves 1625 x 0.43 us = **0.7 ms of 4403 ms (0.016%)**. Meanwhile the
+   4% idle is ~176 ms, or **~108 us per dispatch gap -- some 40x the launch cost**.
+   Whatever the idle is (dependency stalls, kernel ramp, or a clock artefact of the
+   accounting), launch overhead and graph capture do not address it, and the
+   existing `attention_decode_graph` already captures the easy part.
+
+So the HRX-specific lever is not in the HIP surface at all. It is the native
+dispatch/graph/semaphore API, and reaching it means producing HRX native
+executables through the Loom/MLIR/TileLang path -- a kernel re-authoring project
+rather than a runtime swap. Worth deciding deliberately rather than drifting into.
