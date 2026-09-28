@@ -82,6 +82,16 @@ explicitly deferred.
 | yah_ffn_gemm_iq4xs_iq4nl_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 26.55 ms at m_tiles=1088; mixed operand sizes |
 | yah_ffn_gemm_q4k_q5k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 40.59 ms at m_tiles=1088; mixed operand sizes |
 | yah_ffn_gemm_q5k_q6k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 30.42 ms at m_tiles=1088; mixed operand sizes |
+| yah_ffn_gemm_iq3s_iq4xs_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 27.48 ms at m_tiles=1088 |
+| yah_ffn_gemm_q3k_iq3s_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 32.07 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq2xs_iq2s_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 27.84 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq3s_q3k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 28.92 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq3s_q4k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 28.20 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq4xs_iq3s_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 29.21 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq3xxs_iq4xs_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 28.53 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq3xxs_iq3s_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 33.84 ms at m_tiles=1088 |
+| yah_ffn_gemm_q3k_iq3xxs_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 35.34 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq3xxs_q3k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 31.12 ms at m_tiles=1088 |
 | yah_ffn_gemm_iq2xs_f32.loom | prefill_fp16.hip | batched IQ2_XS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 19.85 ms at m_tiles=1088; grid passed as i32 word pairs of the 64-bit entries |
 | yah_ffn_gemm_iq2s_f32.loom | prefill_fp16.hip | batched IQ2_S FFN GEMM, in-kernel grid+qs-sign decode (kStore) | ported, 12.02 ms at m_tiles=1088; grid passed as i32 word pairs, signs from the qs bytes | 
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
@@ -223,11 +233,11 @@ is done. The gate/up pairing bounds the paired-arm work. Grouping the 65 layers 
 | IQ2_XS + IQ2_S | 1 | | Q4_K + Q5_K | 1 |
 | Q6_K + Q6_K | 1 | | Q5_K + Q6_K | 1 |
 
-Same-format paired ports now exist for f16/Q4_K, IQ4_XS, Q5_K, Q3_K and Q6_K,
-covering 38 of the 65 layers. The 27 mixed layers spread over 15 one-off or
-small pairs, dominated by IQ4_XS+Q4_K (7) and Q4_K+IQ4_XS (4). A mixed port
-needs two per-operand block sizes (gate and up weight views, stages and decode
-constants all diverge), which is the same builder with per-operand constants.
+Every one of the 65 FFN layers now has a paired gate/up port. The 38 same-format
+layers use the five same-format ports; the 27 mixed layers use 15 mixed ports
+spanning all the pairs in the table. A mixed port carries two per-operand block
+sizes, two block shifts (IQ4_NL is QK=32, the rest QK=256) and, where a format
+needs them, per-operand grid/ksigns table operands.
 
 Reachability evidence for the entries that are not on that route:
 
