@@ -95,7 +95,16 @@ def main():
         gemv[r] = np.float32(acc)
     np.save(os.path.join(OUT, "gemv_x.npy"), x)
     np.save(os.path.join(OUT, "gemv_expected.npy"), gemv)
+    # Fused SwiGLU GEMV: gate and up are this same fixture, so both row dots are
+    # gemv_expected and the output is silu(dot) * dot.
+    fused = np.zeros(ROWS, dtype=np.float32)
+    for r in range(ROWS):
+        d = np.float64(gemv[r])
+        sig = np.float64(1.0) / (1.0 + np.exp(-d))
+        fused[r] = np.float32(d * sig * d)
+    np.save(os.path.join(OUT, "fused_swiglu_expected.npy"), fused)
     print("gemv_expected", gemv[:4])
+    print("fused_swiglu_expected", fused[:4])
     np.save(os.path.join(OUT, "expected_out.npy"), exp.reshape(-1).astype(np.float32))
     # Residual epilogue: the kernel adds the accumulator into the existing f32
     # rows, so the residual case initialises the output to 1000 and the expected

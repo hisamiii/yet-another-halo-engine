@@ -56,6 +56,7 @@ explicitly deferred.
 | yah_decode_splitk_partials_f16.loom | attention_decode.hip | decode split-K attention partials (QwenDecodeSplitKAttentionHalfPartialsKernel, plain Lanes=32 arm) | ported, 0.0080 ms at 2 heads / 2 splits; scratch fixture + 1e-3 |
 | yah_decode_splitk_reduce_f32.loom | attention_decode.hip | decode split-K attention reduce | ported, 0.0080 ms; combines the Python expected scratch into the same output the online kernel produces |
 | yah_gemv_q4k_f32.loom | gemv_quant.hip | Q4_K block GEMV (Q8KBlockGEMVKernel, Q4_K arm) | ported, 1.33 ms at 17408 rows x 5120; sparse-activation fixture exact |
+| yah_fused_swiglu_q4k_f32.loom | swiglu.hip | fused quantized SwiGLU GEMV, Q4_K (Wave32FusedQuantSwiGLUGEMVKernel) | ported, 2.08 ms at 17408 rows x 5120; gate and up share the sparse fixture |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -194,7 +195,7 @@ Reachability evidence for the entries that are not on that route:
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path, and the Q4_K arm of Q8KBlockGEMVKernel. **todo**: the bf16 GEMV path, the Q8_0/Q8_K fast arms and the other quant formats |
 | sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm), SpeculativeSegmentMaxKernel, SpeculativeSegmentWeightsKernel, SpeculativeSegmentResidualKernel, SpeculativeSegmentSelectKernel, LinearSamplingKernel, SortedSamplingKernel (f32 thresholds). **todo**: SortedSpeculativeSampling, LinearSpeculativeSampling, the Partial/MapIndices argmax arms |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
-| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 arm). **todo**: FastFusedSwiGLUGEMVBlockKernel, the non-f32 lookup arms |
+| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 arm), and the Q4_K fused SwiGLU GEMV (the production decode FFN). **todo**: FastFusedSwiGLUGEMVBlockKernel (the bf16/Q8 legacy fallback), the non-f32 lookup arms |
 | dflash | dflash_kernels.hip | **ported**: grouped dynamic convolution, q8_0 quantization, silu_mul, selector partial top-k. **parked** by instruction: non-causal attention (2), selector finalize (+batch) |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 
