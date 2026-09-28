@@ -62,6 +62,7 @@ explicitly deferred.
 | yah_ffn_gemm_iq4xs_f32.loom | prefill_fp16.hip | batched IQ4_XS FFN GEMM with in-kernel codebook decode (kStore) | ported, 14.64 ms at m_tiles=1088; fixture exact at m_tiles=1 |
 | yah_ffn_gemm_q8_0_f32.loom | prefill_fp16.hip | batched Q8_0 FFN GEMM with in-kernel decode (kStore) | ported, 13.38 ms at m_tiles=1088; fixture exact at m_tiles=1 |
 | yah_ffn_gemm_q6k_f32.loom | prefill_fp16.hip | batched Q6_K FFN GEMM with in-kernel split-plane decode (kStore) | ported, 17.47 ms at m_tiles=1088; decode bit-exact vs Q6KValue, case at atol/rtol 1e-5 |
+| yah_ffn_gemm_q3k_f32.loom | prefill_fp16.hip | batched Q3_K FFN GEMM with in-kernel hmask/qs decode (kStore) | ported, 18.01 ms at m_tiles=1088; decode bit-exact vs the HIP Q3_K arm, case at atol/rtol 1e-5 |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -161,8 +162,8 @@ erased, and the three FFN weights are the ones that reach the GEMM above. Their
 | ffn_down | 29     | 12   | 14   | 1    | 6     | 1    | 1       | 1      | 0      | 0     |
 | total    | 98     | 29   | 28   | 4    | 15    | 12   | 5       | 2      | 1      | 1     |
 
-So IQ4_XS, Q4_K, Q5_K and Q6_K cover 159 of 195 FFN blocks (82%); the other 36
-need IQ3_S, Q3_K, IQ3_XXS, IQ4_NL, IQ2_XS and IQ2_S ports. Q8_0 is on no FFN
+So IQ4_XS, Q4_K, Q5_K, Q6_K and Q3_K cover 171 of 195 FFN blocks (88%); the
+other 24 need IQ3_S, IQ3_XXS, IQ4_NL, IQ2_XS and IQ2_S ports. Q8_0 is on no FFN
 tensor in this shard (it owns only ssm_alpha/beta and a few attn_k/v), so the
 Q8_0 FFN GEMM is off the FFN route here even though prefill_fp16.hip instantiates
 it. The launcher switch at prefill_fp16.hip:1691-1722 does instantiate all six
@@ -180,8 +181,8 @@ three are tuning items, explicitly deferred. The residual and SwiGLU epilogues
 have the same Q4_K port (yah_ffn_gemm_q4k_residual_f32, yah_ffn_gemm_q4k_swiglu_f16,
 23.11/16.98 ms at production size), and yah_ffn_gemm_q4k_gateup_f16 (32.03 ms)
 shares one activation tile and one output between two decoders. The remaining
-format work is the remaining shard formats (IQ3_S, Q3_K, IQ4_NL, IQ3_XXS,
-IQ2_XS, IQ2_S) and the residual/SwiGLU/paired epilogues for the Q5_K, IQ4_XS and
+format work is the remaining shard formats (IQ3_S, IQ4_NL, IQ3_XXS, IQ2_XS,
+IQ2_S) and the residual/SwiGLU/paired epilogues for the Q5_K, IQ4_XS and
 Q8_0 store arms, which so far only have kStore.
 
 Reachability evidence for the entries that are not on that route:
