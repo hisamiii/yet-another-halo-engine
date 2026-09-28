@@ -5,13 +5,13 @@ The greenfield implementation. The layout maps to the workstreams in [../docs/sc
 | dir | contents | status |
 | --- | --- | --- |
 | `core/` | GGUF reader, mmap, tensor table, config, tokenizer | reader/config/**tokenizer done** |
-| `model/` | Qwen3.8 27B graph: Gated DeltaNet, attention, RoPE, norms, FFN, state | **full prefill and decode graph done, token-gated**; per-stage checks all pass |
-| `gpu/` | ported WMMA framework, per-type bench, fusions | **ported, benched, correctness-checked** |
+| `model/` | Qwen3.8 27B graph: Gated DeltaNet, attention, RoPE, norms, FFN, state | **HRX-native prefill and decode, token-gated** |
+| `gpu/` | Loom kernel ports, HRX HAL executables | **all shard formats ported; prefill argmax and 16-token decode match the reference** |
 | `npu/` | XRT executor, xclbin set, dma-buf operands, async launch | not started |
 | `sched/` | phase routing, token split, overlap, power budget | not started |
-| `kv/` | paged quantized KV cache | not started |
+| `kv/` | paged quantized KV cache | fp16 decode cache on the HRX path; paged quant not started |
 | `vision/` | mmproj projector, image preprocessing | not started |
-| `serve/` | CLI, HTTP, sampler | CLI done (`yah-run`); HTTP pending |
+| `serve/` | CLI, HTTP, sampler | CLI done (`yah-hrx`); HTTP pending |
 
 Milestone mapping: **M0** core + model + gpu + serve. **M1** npu + sched. **M2** npu (int8). **M2g** gpu. **M3** sched + model. **M4** kv. **M5** vision.
 
@@ -19,17 +19,16 @@ Rules: one binary, one architecture, hardcoded shapes. Port the framework, not t
 
 ## The M0 gate
 
-`tests/m0_gate.sh` and `tests/generate_gate.sh` are the milestone gate. The
-first requires the engine's greedy next token to equal the reference engine's on
-three fixed prompts; the second requires 20 greedy tokens to match the
-reference's, token for token. Both pass on the IQ4_XS artifact. Prefill is
-chunked and carries KV plus recurrent state across chunks; decode uses the GEMV
-and single-token kernels and runs at about 14 tok/s.
+`tests/m0_gate.sh` and `tests/generate_gate.sh` are the milestone gate, and both
+run on the HRX-native `yah-hrx` runner. The first requires the engine's greedy
+next token to equal the recorded reference on three fixed prompts; the second
+requires 20 greedy tokens to match, token for token. Both pass on the IQ4_XS
+artifact: `engine/build_hrx.sh <model>` then `engine/tests/*.sh <model>`. The
+runner processes one token at a time, so the prompt and the generated tokens
+share one path; the fp16 KV cache and the recurrent state persist across steps.
 
-Weights are a single registered mapping: the GGUF's own `mmap` is registered
-with HIP from its page-aligned base, so there is no second copy. Peak RSS on a
-5-token run is 12.4 GiB against 24.6 GiB when the tensor region is copied,
-which is the headroom a long context needs.
+Weights are the GGUF's own `mmap`, imported once as an HRX device-visible buffer
+from its page-aligned base, so there is no second copy.
 
 ## Runtime: HRX
 
@@ -47,11 +46,11 @@ requirements against a nightly produced a wrong "the GPU cannot work" conclusion
 so the rule is written down rather than remembered: full account in
 [../docs/hrx-evaluation.md](../docs/hrx-evaluation.md).
 
-Validated on this box: all seven check binaries pass under HRX
-(`yah-gemm-check`, `yah-ssm-check`, `yah-attention-check`, `yah-rope-check`,
-`yah-unpack-check`, `yah-ffn-check`, `kv-quant-check`), and a 2048-token prefill
-runs at parity with ROCm (3130 / 3138 ms against 3126 ms) with an identical greedy
-argmax.
+Validated on this box: the HRX-native engine reproduces the recorded reference
+sequence token for token (`11751 13 198 760 ... 14898 369`) and both gates pass.
+The old HIP GPU tools (`yah-*-check`, `yah-run`, the `gpu/ported` kernel tree and
+`build_gpu.sh`) were removed with HIP; correctness is now gated end to end by the
+HRX runner.
 
 ### Reaching the HRX-native API
 
@@ -73,7 +72,7 @@ assembly on AMD GPUs and AIE on XDNA" — and it targets both halves:
 `LOOM_TARGET_AMDGPU=ON` and `LOOM_TARGET_XDNA=ON` are both set in our CMake
 build. Loom is configured by our existing HRX build; the tools came in with it.
 
-Tools (no extra build needed, they land with `build_gpu.sh`/`cmake --build`):
+Tools (they land with the HRX build; `engine/build_hrx.sh` uses them):
 
 ```
 build/cmake/loom/src/loom/tools/{loom-compile,loom-check,loom-link}

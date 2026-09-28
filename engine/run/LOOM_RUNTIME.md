@@ -322,3 +322,34 @@ are now unblocked: `engine/gpu/loom/docs/fragment-layout.md` shows lane L holds
 logical row `L%16` and that a `buffer.alloca<workgroup>` LDS fragment load is
 correct (the port note claiming otherwise was wrong); the LDS form already saves
 ~10% on the iq4xs kStore.
+## 7. Decode and the HIP removal
+
+The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
+It processes one token at a time (prompt and generation share the path):
+
+- a host IQ4_XS embedding row lookup;
+- a persistent fp16 KV cache in `[layer][position][kv_head][dim]` layout,
+  written by `yah_fused_qk_rope` (position from a device i32) and read by
+  `yah_decode_attn`;
+- `yah_ssm_conv_decode` + `yah_deltanet_decode` for the recurrent state;
+- the `token_tiles=1` prefill GEMM HALs for every projection (only token 0 of the
+  64-token tile is used);
+- `yah_rmsnorm` + `yah_gemv_q6k` + `yah_argmax` for the head.
+
+`engine/gpu/loom/tools/emit_decode.py` emits the decode HAL set: it reuses
+`emit_prefill.py` for the GEMMs and adds the decode kernels, with one
+`yah_decode_attn` HAL per `start_pos`. On Qwen3.8-27B-IQ4_XS the runner
+reproduces the recorded HIP sequence exactly (`11751 13 198 760 6511 314 9564
+369 19241 13 198 760 6511 314 14898 369`), and `engine/tests/m0_gate.sh` and
+`generate_gate.sh` pass against it.
+
+HIP is gone from the engine: `engine/build_gpu.sh`, `model/forward.hip`,
+`run/yah_run.hip`, the `engine/gpu/ported` kernel tree, `engine/kv/*.hip` and the
+`engine/gpu/*.hip` checks are deleted. The engine builds with CMake (core tools)
+and `engine/build_hrx.sh` (the `yah-hrx` runner), both HIP-free.
+
+One subtle porting bug worth recording: `yah_unpack_qg` has `head_dim` as a
+`config.def` defaulting to 1. A decode HAL emitted without
+`yah_unpack_qg.head_dim=256` de-interleaves the Q/gate projection with the wrong
+stride, so the attention reads a permuted q and the whole model diverges while
+the projections still look plausible. `emit_decode.py` now sets it.
