@@ -190,6 +190,49 @@ dominant unexplained term is the within-type efficiency gap: the ~30 TFLOPS
 aggregate against the 48.35 measured instruction ceiling. That needs a profile,
 not another sweep, and it is the last item on this page.
 
+### The aggregate is accounted for, shape by shape
+
+Earlier text on this page left part of the ~30 TFLOPS aggregate unattributed. It
+is not unattributed. Parsing the artifact's GEMM inventory -- 866 tensors,
+grouped by role, type, k and m, excluding token_embd (an embedding lookup) and
+output (a GEMV on the last token in prefill) -- gives **49.55 GFLOP/token**.
+Measuring every distinct (type, shape) with gemm_bench in one session, with the
+FFN gate shape interleaved as a drift reference every five probes, and weighting
+the rates by FLOPs:
+
+| | |
+| --- | ---: |
+| real prefill GEMM FLOPs/token | 49.55 GFLOP |
+| **predicted aggregate** | **30.41 TFLOPS** |
+| measured aggregate | ~30 TFLOPS |
+| instruction ceiling | 48.35 TFLOPS |
+
+No free parameter, and it lands within 1.4%. There is therefore **no model-level
+loss beyond the kernels**: the aggregate is the FLOP-weighted average of
+per-shape rates, and every shape measured between 25 and 32 TFLOPS in that
+session, i.e. 52-66% of the instruction ceiling.
+
+Three details worth keeping. ssm_out at IQ3_S is the slowest real shape
+(~25 TFLOPS) and attn_qkv at Q4_K the fastest (~31). The 96 tiny
+ssm_alpha/ssm_beta projections (m=48) run at 11-14 TFLOPS, less than half of
+everything else -- but their FLOP share is 0.05 GFLOP, about 0.2% of prefill
+time, so they are not the problem the gufo investigation found them to be there.
+And FFN is 70% of prefill GEMM FLOPs, not 67%.
+
+Caveat on the correction: the interleaved reference drifted 36.5 -> 27.6 across
+the session (24%), which is large, and each measurement is rescaled linearly to
+the first reference. The aggregate is robust to that because numerator and
+denominator come from the same run, but no single cell should be read to better
+than a tenth.
+
+**So the remaining target is one kernel's efficiency, not the model's
+composition.** Every shape sits at 52-66% of 48.35 and the reason is uniform,
+which matches the earlier ablation: staging costs 10% on Q4_K and 22% on
+IQ3_XXS, and removing it reaches 34.9 TFLOPS (72%). What is left after that is
+the K loop's LDS-read and WMMA dependency chain -- and this page has now
+eliminated the weight format, the epilogue, issue pressure and the scheduling
+hint as explanations for it.
+
 **This is clock, and the clock is a function of the kernel.** Efficiency per clock agrees to **0.3%** across the two harnesses that disagreed -- 0.0144 TF/MHz in both -- so there is no hidden code difference. The part has three SCLK levels (600 / 1408 / **2900 MHz**) and **never reaches the top one**: measured across power limits, 80 W gives 1799 MHz / 25.9 TF and 130 W gives 2016 MHz / 28.6 TF, work-per-clock is flat (0.0144, -1.5% between them), `gpu_busy` is ~85% at both, and the sampled maximum is 2221 MHz. The log's own line is that "what is broken is the conversion of watts into clock".
 
 So the 26% is **not a fixed ceiling**: the clock is coupled to the kernel's power draw, and zeroed operands raise it ~20%. A kernel that toggles fewer bits and issues fewer instructions for the same FLOPs raises both the work per clock and the clock itself. At the 2900 MHz level the part never reaches, the peak is on the order of **60 TFLOPS**; at a realistic ~2200 MHz it is ~45, and the production ~30 is about two thirds of that. Treating ~31.5 as "the real rate, no headroom" was the wrong read. (The NPU's
