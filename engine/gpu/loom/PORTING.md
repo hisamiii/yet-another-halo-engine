@@ -57,6 +57,9 @@ explicitly deferred.
 | yah_spec_seg_residual_f32.loom | sample.hip | speculative residual stage 3: accept/reject + residual sums | ported, 0.0161/0.0162 ms; two exact arms |
 | yah_spec_seg_select_f32.loom | sample.hip | speculative residual stage 4: residual/target selection | ported, 0.0399 ms; exact, fixture |
 | yah_sorted_sampling_f32.loom | sample.hip | sorted top-k/top-p/min-p sampling | ported, 0.0445 ms; exact, no fixture |
+| yah_dflash_quant_q8_f32.loom | dflash_kernels.hip | draft-head bf16 -> q8_0 quantization | ported, 0.0161 ms; byte-exact fixture |
+| yah_dflash_conv_f32.loom | dflash_kernels.hip | grouped dynamic convolution | ported, 0.0064 ms; exact fixture |
+| yah_dflash_silu_mul_f32.loom | dflash_kernels.hip | in-place SiLU multiply | ported, 0.0064 ms; exact, no fixture |
 | - | prefill_attention*.hip, attention_wmma.hip, attention_decode*.hip | WMMA/tiled attention compute, decode-online, split-K, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
@@ -115,7 +118,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 85 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 88 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -136,7 +139,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm), SpeculativeSegmentMaxKernel, SpeculativeSegmentWeightsKernel, SpeculativeSegmentResidualKernel, SpeculativeSegmentSelectKernel, LinearSamplingKernel, SortedSamplingKernel (f32 thresholds). **todo**: SortedSpeculativeSampling, LinearSpeculativeSampling, the Partial/MapIndices argmax arms |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 arm). **todo**: FastFusedSwiGLUGEMVBlockKernel, the non-f32 lookup arms |
-| dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
+| dflash | dflash_kernels.hip | **ported**: grouped dynamic convolution, q8_0 quantization, silu_mul. **todo**: non-causal attention (2) and the four selector kernels |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 
 ## Notes carried over from the FFN GEMM port

@@ -1,0 +1,117 @@
+// YAH DFlash draft-head bf16 -> Q8_0 quantization, Loom port of
+// dflash_quantize_bf16_to_q8_0_kernel.
+//
+// HIP source: dflash_kernels.hip. One thread per 32-element block: find the absolute
+// maximum, scale it to 127, and write the packed `{half d; int8 qs[32]}` record:
+//
+//   scale = amax/127;  inverse = scale > 0 ? 1/scale : 0
+//   d = half(scale);  qs[i] = clamp(roundf(value[i]*inverse), -127, 127)
+//
+// The 34-byte record is packed, so the port views the destination as f16 for the
+// scale (`block*17`) and as i8 for the codes (`block*34 + 2 + i`). `roundf` is
+// `scalar.roundf` (ties away from zero) and the clamp is maxnumf/minnumf.
+//
+// Required config: --config=yah_dflash_quant_q8.blocks=2
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_dflash_quant_q8.blocks : %value: index where [range(%value, 1, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_dflash_quant_q8() {
+  %unit = index.constant 1 : index
+  %blocks = config.get @yah_dflash_quant_q8.blocks : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %blocks, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%source: buffer, %dest: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c17 = index.constant 17 : index
+  %c32 = index.constant 32 : index
+  %c34 = index.constant 34 : index
+  %c256 = index.constant 256 : index
+  %blocks = config.get @yah_dflash_quant_q8.blocks : index
+  %src_elems = index.mul %blocks, %c32 : index
+  %dst_bytes = index.mul %blocks, %c34 : index
+  %dst_words_i = index.cast %dst_bytes : index to i32
+  %c1i = scalar.constant 1 : i32
+  %dst_words_i2 = scalar.shrui %dst_words_i, %c1i : i32
+  %dst_words = index.cast %dst_words_i2 : i32 to index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %c127f = scalar.constant 127.0 : f32
+  %cneg127f = scalar.constant -127.0 : f32
+  %source_na, %dest_na = buffer.assume.noalias %source, %dest : buffer, buffer
+  %src_view = buffer.view %source_na[%base] : buffer -> view<[%src_elems]xbf16>
+  %dst_words_view = buffer.view %dest_na[%base] : buffer -> view<[%dst_words]xf16>
+  %dst_bytes_view = buffer.view %dest_na[%base] : buffer -> view<[%dst_bytes]xi8>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg256 = index.mul %wg, %c256 : index
+  %blk = index.add %wg256, %lane : index
+  %in_range = index.cmp ult, %blk, %blocks : index
+  %sink = scf.if %in_range -> (index) {
+    %blk32 = index.mul %blk, %c32 : index
+    %amax = scf.for %i = [%c0 to %c32 step %c1](%m = %zero : f32) -> (f32) {
+      %e = index.add %blk32, %i : index
+      %h = view.load %src_view[%e] : view<[%src_elems]xbf16> -> bf16
+      %v = scalar.extf %h : bf16 to f32
+      %mag = scalar.absf %v : f32
+      %bigger = scalar.cmpf ogt, %mag, %m : f32
+      %n = scf.if %bigger -> (f32) {
+        scf.yield %mag : f32
+      } else {
+        scf.yield %m : f32
+      }
+      scf.yield %n : f32
+    }
+    %scale = scalar.divf %amax, %c127f : f32
+    %scale_pos = scalar.cmpf ogt, %scale, %zero : f32
+    %inverse = scf.if %scale_pos -> (f32) {
+      %inv = scalar.divf %one, %scale : f32
+      scf.yield %inv : f32
+    } else {
+      scf.yield %zero : f32
+    }
+    %scale16 = scalar.fptrunc %scale : f32 to f16
+    %word = index.mul %blk, %c17 : index
+    view.store %scale16, %dst_words_view[%word] : f16, view<[%dst_words]xf16>
+    %codes = scf.for %j = [%c0 to %c32 step %c1](%mk = %c0 : index) -> (index) {
+      %ej = index.add %blk32, %j : index
+      %hj = view.load %src_view[%ej] : view<[%src_elems]xbf16> -> bf16
+      %vj = scalar.extf %hj : bf16 to f32
+      %prodc = scalar.mulf %vj, %inverse : f32
+      %roundedf = scalar.roundf %prodc : f32
+      %hi = scalar.minnumf %roundedf, %c127f : f32
+      %lo = scalar.maxnumf %hi, %cneg127f : f32
+      %q = scalar.fptosi %lo : f32 to i32
+      %q8 = scalar.trunci %q : i32 to i8
+      %byte_base = index.mul %blk, %c34 : index
+      %byte_off = index.add %byte_base, %c2 : index
+      %byte = index.add %byte_off, %j : index
+      view.store %q8, %dst_bytes_view[%byte] : i8, view<[%dst_bytes]xi8>
+      scf.yield %mk : index
+    }
+    scf.yield %c0 : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.return
+}
+
+// Requires --config=yah_dflash_quant_q8.blocks=2.
+// source = bf16 iota 0..63, so each 32-element block has a distinct scale and code
+// vector; the packed 34-byte records are compared against a byte fixture.
+check.case public @yah_dflash_quant_q8_case {
+  %source = check.generate.iota offset(0.0) step(1.0) : tensor<64xbf16>
+  %dest = check.generate.fill value(0) : tensor<68xi8>
+  %expected = check.file.read.npy path("fixtures/dflash_quant_q8/expected_bytes.npy") : tensor<68xi8>
+  kernel.launch @yah_dflash_quant_q8(%source, %dest) : (tensor<64xbf16>, tensor<68xi8>)
+  check.expect.equal actual(%dest) expected(%expected) : tensor<68xi8>
+  check.return
+}
+
+check.benchmark<@yah_dflash_quant_q8_case> @yah_dflash_quant_q8_bench
