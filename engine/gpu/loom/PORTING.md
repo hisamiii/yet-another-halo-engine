@@ -25,7 +25,8 @@ explicitly deferred.
 | yah_rope_f32.loom | rope.hip | RoPE (text path) | ported, 0.0091 ms at 384 pairs |
 | yah_embed_f32.loom | embed.hip | embedding lookup (f32 table) | ported, 0.0087 ms at hidden 5120 |
 | yah_unpack_qg_f32.loom | prefill_unpack.hip | batched QG unpack | ported, 0.0149 ms at 64x5120 |
-| - | prefill_ssm.hip, ssm_row_split.hip | DeltaNet recurrence | todo |
+| yah_ssm_proj_f32.loom | prefill_ssm.hip | fused SSM input projections (GEMV) | ported, 0.0102 ms |
+| - | prefill_ssm.hip, ssm_row_split.hip | DeltaNet conv/recurrence | todo |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
 | - | qkv.hip | QKV projection | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
@@ -54,6 +55,9 @@ explicitly deferred.
   so a later string replace against the original spelling silently fails. Re-read the
   file after formatting before patching it.
 - There is no `scalar.select`; use `scf.if` with results. `vector.select` exists.
+- **`index.cmp` returns i1, and `index.andi` does not accept i1.** Select a row band with
+  one biased unsigned comparison instead: `(m - band_start) < band_size` is true exactly
+  inside the band and wraps out of range below it.
 - Where a permuted or non-uniform expectation is needed, `check.generate.iota` cannot
   express it. Choose a shape where the expectation collapses to an arithmetic sequence
   (the QG unpack case uses head_dim=1 so the interleave is src = 2*idx), or accept a

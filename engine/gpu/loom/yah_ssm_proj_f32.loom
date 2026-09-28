@@ -1,0 +1,169 @@
+// YAH fused SSM input projections, Loom port of
+// BatchedFusedSSMInputProjectionsKernel.
+//
+// HIP source: prefill_ssm.hip. Row index m selects one of four weight matrices
+// and one of four output buffers:
+//
+//   m < qkv_size                        -> qkv_w[m],          qkv_out[b][m]
+//   m < qkv_size + inner_size           -> gate_w[m - qkv],   gate_out[b][...]
+//   m < qkv + inner + rank              -> alpha_w[m - ...],  alpha_out[b][...]
+//   else                                -> beta_w[...],       beta_out[b][...]
+//
+// and each output is the dot of that weight row with X[b]:
+//
+//   out = sum_k W[row][k] * X[b][k]
+//
+// The HIP kernel uses 128 threads with a shuffle plus shared-memory two-level
+// reduction. This port uses one subgroup per (row, batch) with
+// kernel.subgroup.reduce, which is the correctness-first shape; the two-level
+// form is a tuning question.
+//
+// The case uses hidden = 4 with X all ones and each weight an iota, so every
+// output is the sum of its weight row and therefore an arithmetic sequence. The
+// four matrices use different offsets, so mis-routing a row to the wrong buffer
+// or the wrong row produces a wrong value rather than a coincidentally equal one.
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_ssm_proj.batch : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_ssm_proj.hidden : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_ssm_proj.qkv_size : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_ssm_proj.inner_size : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_ssm_proj.rank : %value: index where [range(%value, 1, 4096)]
+
+kernel.def target(@yah_wave32) @yah_ssm_proj() {
+  %unit = index.constant 1 : index
+  %batch = config.get @yah_ssm_proj.batch : index
+  %qkv_size = config.get @yah_ssm_proj.qkv_size : index
+  %inner_size = config.get @yah_ssm_proj.inner_size : index
+  %rank = config.get @yah_ssm_proj.rank : index
+  %gate_end = index.add %qkv_size, %inner_size : index
+  %alpha_end = index.add %gate_end, %rank : index
+  %total_rows = index.add %alpha_end, %rank : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%total_rows, %batch, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%qkv_w: buffer, %gate_w: buffer, %alpha_w: buffer, %beta_w: buffer, %x: buffer, %qkv_out: buffer, %gate_out: buffer, %alpha_out: buffer, %beta_out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+
+  %batch = config.get @yah_ssm_proj.batch : index
+  %hidden = config.get @yah_ssm_proj.hidden : index
+  %qkv_size = config.get @yah_ssm_proj.qkv_size : index
+  %inner_size = config.get @yah_ssm_proj.inner_size : index
+  %rank = config.get @yah_ssm_proj.rank : index
+  %gate_end = index.add %qkv_size, %inner_size : index
+  %alpha_end = index.add %gate_end, %rank : index
+  %zero = scalar.constant 0.0 : f32
+
+  %qw_noalias, %gw_noalias, %aw_noalias, %bw_noalias = buffer.assume.noalias %qkv_w, %gate_w, %alpha_w, %beta_w : buffer, buffer, buffer, buffer
+  %x_noalias, %qo_noalias, %go_noalias, %ao_noalias, %bo_noalias = buffer.assume.noalias %x, %qkv_out, %gate_out, %alpha_out, %beta_out : buffer, buffer, buffer, buffer, buffer
+  %qw_view = buffer.view %qw_noalias[%base] : buffer -> view<[%qkv_size]x[%hidden]xf32>
+  %gw_view = buffer.view %gw_noalias[%base] : buffer -> view<[%inner_size]x[%hidden]xf32>
+  %aw_view = buffer.view %aw_noalias[%base] : buffer -> view<[%rank]x[%hidden]xf32>
+  %bw_view = buffer.view %bw_noalias[%base] : buffer -> view<[%rank]x[%hidden]xf32>
+  %x_view = buffer.view %x_noalias[%base] : buffer -> view<[%batch]x[%hidden]xf32>
+  %qo_view = buffer.view %qo_noalias[%base] : buffer -> view<[%batch]x[%qkv_size]xf32>
+  %go_view = buffer.view %go_noalias[%base] : buffer -> view<[%batch]x[%inner_size]xf32>
+  %ao_view = buffer.view %ao_noalias[%base] : buffer -> view<[%batch]x[%rank]xf32>
+  %bo_view = buffer.view %bo_noalias[%base] : buffer -> view<[%batch]x[%rank]xf32>
+
+  %m = kernel.workgroup.id<x> : index
+  %b = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %is_leader = index.cmp eq, %lane, %c0 : index
+
+  %in_qkv = index.cmp ult, %m, %qkv_size : index
+  scf.if %in_qkv {
+    %acc = scf.for %k = [%lane to %hidden step %c32](%s = %zero : f32) -> (f32) {
+      %w = view.load %qw_view[%m, %k] : view<[%qkv_size]x[%hidden]xf32> -> f32
+      %xv = view.load %x_view[%b, %k] : view<[%batch]x[%hidden]xf32> -> f32
+      %p = scalar.mulf %w, %xv : f32
+      %n = scalar.addf %s, %p : f32
+      scf.yield %n : f32
+    }
+    %sum = kernel.subgroup.reduce<addf> %acc : f32
+    scf.if %is_leader {
+      view.store %sum, %qo_view[%b, %m] : f32, view<[%batch]x[%qkv_size]xf32>
+    }
+  }
+
+  %mg = index.sub %m, %qkv_size : index
+  %in_gate = index.cmp ult, %mg, %inner_size : index
+  scf.if %in_gate {
+    %rg = index.sub %m, %qkv_size : index
+    %accg = scf.for %k2 = [%lane to %hidden step %c32](%s2 = %zero : f32) -> (f32) {
+      %w2 = view.load %gw_view[%rg, %k2] : view<[%inner_size]x[%hidden]xf32> -> f32
+      %xv2 = view.load %x_view[%b, %k2] : view<[%batch]x[%hidden]xf32> -> f32
+      %p2 = scalar.mulf %w2, %xv2 : f32
+      %n2 = scalar.addf %s2, %p2 : f32
+      scf.yield %n2 : f32
+    }
+    %sumg = kernel.subgroup.reduce<addf> %accg : f32
+    scf.if %is_leader {
+      view.store %sumg, %go_view[%b, %rg] : f32, view<[%batch]x[%inner_size]xf32>
+    }
+  }
+
+  %ma = index.sub %m, %gate_end : index
+  %in_alpha = index.cmp ult, %ma, %rank : index
+  scf.if %in_alpha {
+    %ra = index.sub %m, %gate_end : index
+    %acca = scf.for %k3 = [%lane to %hidden step %c32](%s3 = %zero : f32) -> (f32) {
+      %w3 = view.load %aw_view[%ra, %k3] : view<[%rank]x[%hidden]xf32> -> f32
+      %xv3 = view.load %x_view[%b, %k3] : view<[%batch]x[%hidden]xf32> -> f32
+      %p3 = scalar.mulf %w3, %xv3 : f32
+      %n3 = scalar.addf %s3, %p3 : f32
+      scf.yield %n3 : f32
+    }
+    %suma = kernel.subgroup.reduce<addf> %acca : f32
+    scf.if %is_leader {
+      view.store %suma, %ao_view[%b, %ra] : f32, view<[%batch]x[%rank]xf32>
+    }
+  }
+
+  %mb = index.sub %m, %alpha_end : index
+  %in_beta = index.cmp ult, %mb, %rank : index
+  scf.if %in_beta {
+    %rb = index.sub %m, %alpha_end : index
+    %accb = scf.for %k4 = [%lane to %hidden step %c32](%s4 = %zero : f32) -> (f32) {
+      %w4 = view.load %bw_view[%rb, %k4] : view<[%rank]x[%hidden]xf32> -> f32
+      %xv4 = view.load %x_view[%b, %k4] : view<[%batch]x[%hidden]xf32> -> f32
+      %p4 = scalar.mulf %w4, %xv4 : f32
+      %n4 = scalar.addf %s4, %p4 : f32
+      scf.yield %n4 : f32
+    }
+    %sumb = kernel.subgroup.reduce<addf> %accb : f32
+    scf.if %is_leader {
+      view.store %sumb, %bo_view[%b, %rb] : f32, view<[%batch]x[%rank]xf32>
+    }
+  }
+  kernel.return
+}
+
+check.case public @yah_ssm_proj_case {
+  %qkv_w = check.generate.iota offset(1.0) step(1.0) : tensor<3x4xf32>
+  %gate_w = check.generate.iota offset(100.0) step(1.0) : tensor<2x4xf32>
+  %alpha_w = check.generate.iota offset(1000.0) step(1.0) : tensor<1x4xf32>
+  %beta_w = check.generate.iota offset(2000.0) step(1.0) : tensor<1x4xf32>
+  %x = check.generate.fill value(1.0) : tensor<1x4xf32>
+  %qkv_out = check.generate.fill value(-1.0) : tensor<1x3xf32>
+  %gate_out = check.generate.fill value(-1.0) : tensor<1x2xf32>
+  %alpha_out = check.generate.fill value(-1.0) : tensor<1x1xf32>
+  %beta_out = check.generate.fill value(-1.0) : tensor<1x1xf32>
+  %qkv_exp = check.generate.iota offset(10.0) step(16.0) : tensor<1x3xf32>
+  %gate_exp = check.generate.iota offset(406.0) step(16.0) : tensor<1x2xf32>
+  %alpha_exp = check.generate.fill value(4006.0) : tensor<1x1xf32>
+  %beta_exp = check.generate.fill value(8006.0) : tensor<1x1xf32>
+  kernel.launch @yah_ssm_proj(%qkv_w, %gate_w, %alpha_w, %beta_w, %x, %qkv_out, %gate_out, %alpha_out, %beta_out) : (tensor<3x4xf32>, tensor<2x4xf32>, tensor<1x4xf32>, tensor<1x4xf32>, tensor<1x4xf32>, tensor<1x3xf32>, tensor<1x2xf32>, tensor<1x1xf32>, tensor<1x1xf32>)
+  check.expect.close actual(%qkv_out) expected(%qkv_exp) atol(0.0) rtol(0.0) nan(same) : tensor<1x3xf32>
+  check.expect.close actual(%gate_out) expected(%gate_exp) atol(0.0) rtol(0.0) nan(same) : tensor<1x2xf32>
+  check.expect.close actual(%alpha_out) expected(%alpha_exp) atol(0.0) rtol(0.0) nan(same) : tensor<1x1xf32>
+  check.expect.close actual(%beta_out) expected(%beta_exp) atol(0.0) rtol(0.0) nan(same) : tensor<1x1xf32>
+  check.return
+}
+
+check.benchmark<@yah_ssm_proj_case> @yah_ssm_proj_bench
