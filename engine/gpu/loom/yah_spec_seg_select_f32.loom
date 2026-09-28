@@ -1,0 +1,254 @@
+// YAH speculative residual stage 4, Loom port of SpeculativeSegmentSelectKernel.
+//
+// HIP source: sample.hip. When the draft was rejected, this picks the token from the
+// residual (or, if the residual is empty, the target) distribution: it prefix-sums the
+// per-segment sums, picks the segment containing `residual_uniform * total`, then that
+// segment walks its own weights to land on the token. The early `if (*out_accepted !=
+// 0) return` becomes a guard on the final store instead, so every barrier stays
+// unconditional.
+//
+// HIP stages the segment sums, prefix sums and the selected weights in shared memory;
+// the port keeps the LDS sums/prefix and computes the selected segment weight inline
+// in the walk. The `double` threshold is f32 (no f64 arithmetic).
+//
+// Required config: --config=yah_spec_seg_select.vocab_size=1024 --config=yah_spec_seg_select.segments=256
+//                  --config=yah_spec_seg_select.scratch_elems=769
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_spec_seg_select.vocab_size : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_spec_seg_select.segments : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_spec_seg_select.scratch_elems : %value: index where [range(%value, 2, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_spec_seg_select() {
+  %unit = index.constant 1 : index
+  %segments = config.get @yah_spec_seg_select.segments : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%weights: buffer, %draft_probabilities: buffer, %scratch: buffer, %out_token: buffer, %out_accepted: buffer, %params: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c255 = index.constant 255 : index
+  %c255i = scalar.constant 255 : i32
+  %c0i = scalar.constant 0 : i32
+  %c1i = scalar.constant 1 : i32
+  %limit = scalar.constant 3.4028234663852886e+38 : f32
+  %zero = scalar.constant 0.0 : f32
+  %vocab_size = config.get @yah_spec_seg_select.vocab_size : index
+  %segments = config.get @yah_spec_seg_select.segments : index
+  %scratch_elems = config.get @yah_spec_seg_select.scratch_elems : index
+  %two_s = index.mul %c2, %segments : index
+  %three_s = index.add %two_s, %segments : index
+  %segments_m1 = index.sub %segments, %c1 : index
+  %sums_bytes = index.constant 1024 : offset
+  %prefix_bytes = index.constant 1024 : offset
+  %slot_bytes = index.constant 4 : offset
+  %sums_buf = buffer.alloca<workgroup> align(16) %sums_bytes : buffer
+  %prefix_buf = buffer.alloca<workgroup> align(16) %prefix_bytes : buffer
+  %flag_buf = buffer.alloca<workgroup> align(4) %slot_bytes : buffer
+  %seg_buf = buffer.alloca<workgroup> align(4) %slot_bytes : buffer
+  %thr_buf = buffer.alloca<workgroup> align(4) %slot_bytes : buffer
+  %sums = buffer.view %sums_buf[%base] : buffer -> view<[%segments]xf32>
+  %prefix = buffer.view %prefix_buf[%base] : buffer -> view<[%segments]xf32>
+  %flag = buffer.view %flag_buf[%base] : buffer -> view<[%c1]xi32>
+  %seg = buffer.view %seg_buf[%base] : buffer -> view<[%c1]xi32>
+  %thrv = buffer.view %thr_buf[%base] : buffer -> view<[%c1]xf32>
+  %weights_na, %draft_na, %scratch_na, %tok_na, %acc_na, %params_na = buffer.assume.noalias %weights, %draft_probabilities, %scratch, %out_token, %out_accepted, %params : buffer, buffer, buffer, buffer, buffer, buffer
+  %weights_view = buffer.view %weights_na[%base] : buffer -> view<[%vocab_size]xf32>
+  %draft_view = buffer.view %draft_na[%base] : buffer -> view<[%vocab_size]xf32>
+  %scratch_view = buffer.view %scratch_na[%base] : buffer -> view<[%scratch_elems]xf32>
+  %tok_view = buffer.view %tok_na[%base] : buffer -> view<[%c1]xi32>
+  %acc_view = buffer.view %acc_na[%base] : buffer -> view<[%c1]xi32>
+  %params_view = buffer.view %params_na[%base] : buffer -> view<[%c1]xf32>
+  %tid = kernel.workitem.id<x> : index
+  // Phase 1: the residual sums decide whether the residual is used at all.
+  %r0_idx = index.add %two_s, %tid : index
+  %r0 = view.load %scratch_view[%r0_idx] : view<[%scratch_elems]xf32> -> f32
+  view.store %r0, %sums[%tid] : f32, view<[%segments]xf32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %is_leader = index.cmp eq, %tid, %c0 : index
+  %flag_work = scf.if %is_leader -> (index) {
+    %total = scf.for %s = [%c0 to %segments step %c1](%t = %zero : f32) -> (f32) {
+      %sv = view.load %sums[%s] : view<[%segments]xf32> -> f32
+      %tn = scalar.addf %t, %sv : f32
+      scf.yield %tn : f32
+    }
+    %tm = scalar.absf %total : f32
+    %finite = scalar.cmpf ole, %tm, %limit : f32
+    %positive = scalar.cmpf ogt, %total, %zero : f32
+    %use = scf.if %finite -> (i1) {
+      %u = scf.if %positive -> (i1) {
+        %tr = scalar.constant 1 : i1
+        scf.yield %tr : i1
+      } else {
+        %f = scalar.constant 0 : i1
+        scf.yield %f : i1
+      }
+      scf.yield %u : i1
+    } else {
+      %f2 = scalar.constant 0 : i1
+      scf.yield %f2 : i1
+    }
+    %use_i = scf.if %use -> (i32) {
+      scf.yield %c1i : i32
+    } else {
+      scf.yield %c0i : i32
+    }
+    view.store %use_i, %flag[%c0] : i32, view<[%c1]xi32>
+    scf.yield %c0 : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %use_flag = view.load %flag[%c0] : view<[%c1]xi32> -> i32
+  %use_one = scalar.cmpi eq, %use_flag, %c1i : i32
+  // Phase 2: choose the residual or the target sums and prefix-sum that array.
+  %sv2 = scf.if %use_one -> (f32) {
+    %rv = view.load %scratch_view[%r0_idx] : view<[%scratch_elems]xf32> -> f32
+    scf.yield %rv : f32
+  } else {
+    %ts_idx = index.add %segments, %tid : index
+    %tv = view.load %scratch_view[%ts_idx] : view<[%scratch_elems]xf32> -> f32
+    scf.yield %tv : f32
+  }
+  view.store %sv2, %sums[%tid] : f32, view<[%segments]xf32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %uniform = view.load %params_view[%c0] : view<[%c1]xf32> -> f32
+  %choice = scf.if %is_leader -> (index) {
+    %total2 = scf.for %s2 = [%c0 to %segments step %c1](%t2 = %zero : f32) -> (f32) {
+      %sv3 = view.load %sums[%s2] : view<[%segments]xf32> -> f32
+      view.store %t2, %prefix[%s2] : f32, view<[%segments]xf32>
+      %tn2 = scalar.addf %t2, %sv3 : f32
+      scf.yield %tn2 : f32
+    }
+    %threshold = scalar.mulf %uniform, %total2 : f32
+    %chosen_best, %chosen_found = scf.for %s4 = [%c0 to %segments step %c1](%best = %c255i : i32, %found = %c0i : i32) -> (i32, i32) {
+      %pv = view.load %prefix[%s4] : view<[%segments]xf32> -> f32
+      %sv4 = view.load %sums[%s4] : view<[%segments]xf32> -> f32
+      %bound = scalar.addf %pv, %sv4 : f32
+      %pos = scalar.cmpf ogt, %sv4, %zero : f32
+      %lt = scalar.cmpf olt, %threshold, %bound : f32
+      %found_ok = scalar.cmpi eq, %found, %c0i : i32
+      %s4_i = index.cast %s4 : index to i32
+      %best2 = scf.if %found_ok -> (i32) {
+        %b = scf.if %pos -> (i32) {
+          %b2 = scf.if %lt -> (i32) {
+            scf.yield %s4_i : i32
+          } else {
+            scf.yield %best : i32
+          }
+          scf.yield %b2 : i32
+        } else {
+          scf.yield %best : i32
+        }
+        scf.yield %b : i32
+      } else {
+        scf.yield %best : i32
+      }
+      %found2 = scf.if %found_ok -> (i32) {
+        %f = scf.if %pos -> (i32) {
+          %f2 = scf.if %lt -> (i32) {
+            scf.yield %c1i : i32
+          } else {
+            scf.yield %found : i32
+          }
+          scf.yield %f2 : i32
+        } else {
+          scf.yield %found : i32
+        }
+        scf.yield %f : i32
+      } else {
+        scf.yield %found : i32
+      }
+      scf.yield %best2, %found2 : i32, i32
+    }
+    view.store %chosen_best, %seg[%c0] : i32, view<[%c1]xi32>
+    %best_nn = scalar.maxsi %chosen_best, %c0i : i32
+    %best_c = scalar.minsi %best_nn, %c255i : i32
+    %best_idx = index.cast %best_c : i32 to index
+    %pv2 = view.load %prefix[%best_idx] : view<[%segments]xf32> -> f32
+    %sthr = scalar.subf %threshold, %pv2 : f32
+    view.store %sthr, %thrv[%c0] : f32, view<[%c1]xf32>
+    scf.yield %c0 : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %seg_i = view.load %seg[%c0] : view<[%c1]xi32> -> i32
+  %seg_nn = scalar.maxsi %seg_i, %c0i : i32
+  %seg_c = scalar.minsi %seg_nn, %c255i : i32
+  %seg_idx = index.cast %seg_c : i32 to index
+  %is_selected = index.cmp eq, %tid, %seg_idx : index
+  scf.if %is_selected {
+    %selected_threshold = view.load %thrv[%c0] : view<[%c1]xf32> -> f32
+    %target_total = view.load %scratch_view[%three_s] : view<[%scratch_elems]xf32> -> f32
+    %sbegin_pre = index.mul %vocab_size, %seg_idx : index
+    %sbegin = index.div %sbegin_pre, %segments : index
+    %segp1 = index.add %seg_idx, %c1 : index
+    %send_pre = index.mul %vocab_size, %segp1 : index
+    %send = index.div %send_pre, %segments : index
+    %send_m1 = index.sub %send, %c1 : index
+    %sel_final, %thr_final, %done_final = scf.for %i = [%sbegin to %send step %c1](%sel = %send_m1 : index, %thr2 = %selected_threshold : f32, %done = %c0i : i32) -> (index, f32, i32) {
+      %wraw = view.load %weights_view[%i] : view<[%vocab_size]xf32> -> f32
+      %draw = view.load %draft_view[%i] : view<[%vocab_size]xf32> -> f32
+      %dtw = scalar.mulf %draw, %target_total : f32
+      %diff = scalar.subf %wraw, %dtw : f32
+      %resid = scalar.maxnumf %diff, %zero : f32
+      %weight = scf.if %use_one -> (f32) {
+        scf.yield %resid : f32
+      } else {
+        scf.yield %wraw : f32
+      }
+      %done_zero = scalar.cmpi eq, %done, %c0i : i32
+      %sel3, %thr3, %done3 = scf.if %done_zero -> (index, f32, i32) {
+        %wpos = scalar.cmpf ogt, %weight, %zero : f32
+        %sel_a, %thr_a, %done_a = scf.if %wpos -> (index, f32, i32) {
+          %n3 = scalar.subf %thr2, %weight : f32
+          %neg = scalar.cmpf olt, %n3, %zero : f32
+          %d3 = scf.if %neg -> (i32) {
+            scf.yield %c1i : i32
+          } else {
+            scf.yield %done : i32
+          }
+          scf.yield %i, %n3, %d3 : index, f32, i32
+        } else {
+          scf.yield %sel, %thr2, %done : index, f32, i32
+        }
+        scf.yield %sel_a, %thr_a, %done_a : index, f32, i32
+      } else {
+        scf.yield %sel, %thr2, %done : index, f32, i32
+      }
+      scf.yield %sel3, %thr3, %done3 : index, f32, i32
+    }
+    %accepted = view.load %acc_view[%c0] : view<[%c1]xi32> -> i32
+    %not_accepted = scalar.cmpi eq, %accepted, %c0i : i32
+    scf.if %not_accepted {
+      %sel_i = index.cast %sel_final : index to i32
+      view.store %sel_i, %tok_view[%c0] : i32, view<[%c1]xi32>
+    }
+  }
+  kernel.return
+}
+
+// Requires --config=yah_spec_seg_select.vocab_size=1024, .segments=256, .scratch_elems=769.
+// residual_sums = 0 so the target sums are used; target_sums = 4 gives total 1024 and
+// residual_uniform = 0.5 a threshold of 512, which lands at element 512 of segment 128.
+// out_accepted = 0 so the store runs.
+check.case public @yah_spec_seg_select_case {
+  %weights = check.generate.fill value(1.0) : tensor<1024xf32>
+  %draft = check.generate.fill value(0.0) : tensor<1024xf32>
+  %scratch = check.file.read.npy path("fixtures/spec_seg_select/scratch.npy") : tensor<769xf32>
+  %out_token = check.generate.fill value(0) : tensor<1xi32>
+  %out_accepted = check.generate.fill value(0) : tensor<1xi32>
+  %params = check.file.read.npy path("fixtures/spec_seg_select/params.npy") : tensor<1xf32>
+  %expected = check.generate.fill value(512) : tensor<1xi32>
+  kernel.launch @yah_spec_seg_select(%weights, %draft, %scratch, %out_token, %out_accepted, %params) : (tensor<1024xf32>, tensor<1024xf32>, tensor<769xf32>, tensor<1xi32>, tensor<1xi32>, tensor<1xf32>)
+  check.expect.equal actual(%out_token) expected(%expected) : tensor<1xi32>
+  check.return
+}
+
+check.benchmark<@yah_spec_seg_select_case> @yah_spec_seg_select_bench

@@ -1,0 +1,218 @@
+// YAH speculative residual stage 3, Loom port of SpeculativeSegmentResidualKernel.
+//
+// HIP source: sample.hip. Folds the per-segment target sums into target_total, decides
+// whether the draft token is accepted, and when it is not writes the residual weights
+// `max(weight - draft_prob*target_total, 0)` and their segment sums:
+//
+//   target_total = sum(scratch.target_sums)
+//   if target_total is not finite or <= 0: accepted, out_accepted = 2
+//   else accepted = acceptance_uniform*draft_prob < weights[draft]/target_total
+//   if accepted: block 0 writes out_accepted and out_token = draft
+//   else: scratch.residual_sums[block] = sum of the segment residual
+//
+// HIP shares `accepted` and `target_total` through shared memory; the port does the
+// same with LDS. The `double` acceptance uniform is f32 (no f64 arithmetic on this
+// target). The check runs both arms with two param fixtures.
+//
+// Required config: --config=yah_spec_seg_residual.vocab_size=1024 --config=yah_spec_seg_residual.segments=256
+//                  --config=yah_spec_seg_residual.scratch_elems=769
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_spec_seg_residual.vocab_size : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_spec_seg_residual.segments : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_spec_seg_residual.scratch_elems : %value: index where [range(%value, 2, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_spec_seg_residual() {
+  %unit = index.constant 1 : index
+  %segments = config.get @yah_spec_seg_residual.segments : index
+  %c128 = index.constant 128 : index
+  kernel.launch.config workgroups(%segments, %unit, %unit) workgroup_size(%c128, %unit, %unit) : index
+} launch(%weights: buffer, %draft_probabilities: buffer, %scratch: buffer, %out_token: buffer, %out_accepted: buffer, %params: buffer, %draft_token_buf: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c128 = index.constant 128 : index
+  %c0i = scalar.constant 0 : i32
+  %c1i = scalar.constant 1 : i32
+  %c2i = scalar.constant 2 : i32
+  %limit = scalar.constant 3.4028234663852886e+38 : f32
+  %zero = scalar.constant 0.0 : f32
+  %invalid = scalar.constant -1 : i32
+  %vocab_size = config.get @yah_spec_seg_residual.vocab_size : index
+  %segments = config.get @yah_spec_seg_residual.segments : index
+  %scratch_elems = config.get @yah_spec_seg_residual.scratch_elems : index
+  %vocab_i = index.cast %vocab_size : index to i32
+  %vocab_m1_i = scalar.subi %vocab_i, %c1i : i32
+  %two_s = index.mul %c2, %segments : index
+  %three_s = index.add %two_s, %segments : index
+  %segments_m1 = index.sub %segments, %c1 : index
+  %sums_bytes = index.constant 1024 : offset
+  %slot_bytes = index.constant 4 : offset
+  %sums_buf = buffer.alloca<workgroup> align(16) %sums_bytes : buffer
+  %total_buf = buffer.alloca<workgroup> align(4) %slot_bytes : buffer
+  %acc_buf = buffer.alloca<workgroup> align(4) %slot_bytes : buffer
+  %sums = buffer.view %sums_buf[%base] : buffer -> view<[%segments]xf32>
+  %total_view = buffer.view %total_buf[%base] : buffer -> view<[%c1]xf32>
+  %acc_view = buffer.view %acc_buf[%base] : buffer -> view<[%c1]xi32>
+  %weights_na, %draft_na, %scratch_na, %tok_na, %acc_out_na, %params_na, %draft_tok_na = buffer.assume.noalias %weights, %draft_probabilities, %scratch, %out_token, %out_accepted, %params, %draft_token_buf : buffer, buffer, buffer, buffer, buffer, buffer, buffer
+  %weights_view = buffer.view %weights_na[%base] : buffer -> view<[%vocab_size]xf32>
+  %draft_view = buffer.view %draft_na[%base] : buffer -> view<[%vocab_size]xf32>
+  %scratch_view = buffer.view %scratch_na[%base] : buffer -> view<[%scratch_elems]xf32>
+  %tok_view = buffer.view %tok_na[%base] : buffer -> view<[%c1]xi32>
+  %acc_out_view = buffer.view %acc_out_na[%base] : buffer -> view<[%c1]xi32>
+  %params_view = buffer.view %params_na[%base] : buffer -> view<[%c2]xf32>
+  %draft_tok_view = buffer.view %draft_tok_na[%base] : buffer -> view<[%c1]xi32>
+  %block_raw = kernel.workgroup.id<x> : index
+  %block = index.min %block_raw, %segments_m1 : index
+  %tid = kernel.workitem.id<x> : index
+  %t0 = view.load %scratch_view[%tid] : view<[%scratch_elems]xf32> -> f32
+  view.store %t0, %sums[%tid] : f32, view<[%segments]xf32>
+  %t1_idx = index.add %tid, %c128 : index
+  %t1 = view.load %scratch_view[%t1_idx] : view<[%scratch_elems]xf32> -> f32
+  view.store %t1, %sums[%t1_idx] : f32, view<[%segments]xf32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %is_leader = index.cmp eq, %tid, %c0 : index
+  %leader = scf.if %is_leader -> (index) {
+    %total = scf.for %s = [%c0 to %segments step %c1](%t = %zero : f32) -> (f32) {
+      %sv = view.load %sums[%s] : view<[%segments]xf32> -> f32
+      %tn = scalar.addf %t, %sv : f32
+      scf.yield %tn : f32
+    }
+    view.store %total, %total_view[%c0] : f32, view<[%c1]xf32>
+    %tm = scalar.absf %total : f32
+    %finite = scalar.cmpf ole, %tm, %limit : f32
+    %positive = scalar.cmpf ogt, %total, %zero : f32
+    %bad = scf.if %finite -> (i1) {
+      %np = scf.if %positive -> (i1) {
+        %f = scalar.constant 0 : i1
+        scf.yield %f : i1
+      } else {
+        %tr = scalar.constant 1 : i1
+        scf.yield %tr : i1
+      }
+      scf.yield %np : i1
+    } else {
+      %tr2 = scalar.constant 1 : i1
+      scf.yield %tr2 : i1
+    }
+    %accepted_i = scf.if %bad -> (i32) {
+      scf.yield %c1i : i32
+    } else {
+      %au = view.load %params_view[%c0] : view<[%c2]xf32> -> f32
+      %dp = view.load %params_view[%c1] : view<[%c2]xf32> -> f32
+      %draft_tok_i = view.load %draft_tok_view[%c0] : view<[%c1]xi32> -> i32
+      %dnn = scalar.maxsi %draft_tok_i, %c0i : i32
+      %dc = scalar.minsi %dnn, %vocab_m1_i : i32
+      %dt = index.cast %dc : i32 to index
+      %dw = view.load %weights_view[%dt] : view<[%vocab_size]xf32> -> f32
+      %prod = scalar.mulf %au, %dp : f32
+      %ratio = scalar.divf %dw, %total : f32
+      %lt = scalar.cmpf olt, %prod, %ratio : f32
+      %a = scf.if %lt -> (i32) {
+        scf.yield %c1i : i32
+      } else {
+        scf.yield %c0i : i32
+      }
+      scf.yield %a : i32
+    }
+    view.store %accepted_i, %acc_view[%c0] : i32, view<[%c1]xi32>
+    %is_block0 = index.cmp eq, %block, %c0 : index
+    scf.if %is_block0 {
+      scf.if %bad {
+        view.store %invalid, %tok_view[%c0] : i32, view<[%c1]xi32>
+        view.store %c2i, %acc_out_view[%c0] : i32, view<[%c1]xi32>
+      } else {
+        %acc_one = scalar.cmpi eq, %accepted_i, %c1i : i32
+        %acc_c = scf.if %acc_one -> (i32) {
+          scf.yield %c1i : i32
+        } else {
+          scf.yield %c0i : i32
+        }
+        view.store %acc_c, %acc_out_view[%c0] : i32, view<[%c1]xi32>
+        view.store %total, %scratch_view[%three_s] : f32, view<[%scratch_elems]xf32>
+        scf.if %acc_one {
+          %dt2 = view.load %draft_tok_view[%c0] : view<[%c1]xi32> -> i32
+          view.store %dt2, %tok_view[%c0] : i32, view<[%c1]xi32>
+        }
+      }
+    }
+    scf.yield %c0 : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %accepted = view.load %acc_view[%c0] : view<[%c1]xi32> -> i32
+  %accepted_one = scalar.cmpi eq, %accepted, %c1i : i32
+  %target_total = view.load %total_view[%c0] : view<[%c1]xf32> -> f32
+  scf.if %accepted_one {
+    %skip = index.constant 0 : index
+  } else {
+    %vb = index.mul %vocab_size, %block : index
+    %begin = index.div %vb, %segments : index
+    %bp1 = index.add %block, %c1 : index
+    %vb1 = index.mul %vocab_size, %bp1 : index
+    %end = index.div %vb1, %segments : index
+    %start = index.add %begin, %tid : index
+    %res = scf.for %i = [%start to %end step %c128](%acc2 = %zero : f32) -> (f32) {
+      %wv = view.load %weights_view[%i] : view<[%vocab_size]xf32> -> f32
+      %dv = view.load %draft_view[%i] : view<[%vocab_size]xf32> -> f32
+      %dtw = scalar.mulf %dv, %target_total : f32
+      %diff = scalar.subf %wv, %dtw : f32
+      %r = scalar.maxnumf %diff, %zero : f32
+      %n = scalar.addf %acc2, %r : f32
+      scf.yield %n : f32
+    }
+    %rsum = kernel.workgroup.reduce<addf> %res : f32
+    %is_leader3 = index.cmp eq, %tid, %c0 : index
+    scf.if %is_leader3 {
+      %slot3 = index.add %two_s, %block : index
+      view.store %rsum, %scratch_view[%slot3] : f32, view<[%scratch_elems]xf32>
+    }
+  }
+  kernel.return
+}
+
+// Accepted arm: target_sums = 4 each (target_total 1024), weights = 1, so weights[5] = 1
+// and acceptance_uniform = 0 < 1/1024. out_accepted = 1, out_token = 5.
+check.case public @yah_spec_seg_residual_accept {
+  %weights = check.generate.fill value(1.0) : tensor<1024xf32>
+  %draft = check.generate.fill value(0.0) : tensor<1024xf32>
+  %scratch = check.generate.fill value(4.0) : tensor<769xf32>
+  %out_token = check.generate.fill value(0) : tensor<1xi32>
+  %out_accepted = check.generate.fill value(0) : tensor<1xi32>
+  %params = check.file.read.npy path("fixtures/spec_seg_residual/accept.npy") : tensor<2xf32>
+  %draft_tok = check.file.read.npy path("fixtures/spec_seg_residual/token.npy") : tensor<1xi32>
+  %e_acc = check.generate.fill value(1) : tensor<1xi32>
+  %e_tok = check.generate.fill value(5) : tensor<1xi32>
+  kernel.launch @yah_spec_seg_residual(%weights, %draft, %scratch, %out_token, %out_accepted, %params, %draft_tok) : (tensor<1024xf32>, tensor<1024xf32>, tensor<769xf32>, tensor<1xi32>, tensor<1xi32>, tensor<2xf32>, tensor<1xi32>)
+  check.expect.equal actual(%out_accepted) expected(%e_acc) : tensor<1xi32>
+  check.expect.equal actual(%out_token) expected(%e_tok) : tensor<1xi32>
+  check.return
+}
+
+// Rejected arm: acceptance_uniform = 1 is never below 1/1024, so the residual runs.
+// weights = 1, draft_prob = 0, target_total = 1024: every residual is 1 and each
+// 4-element segment sums to 4. out_accepted = 0.
+check.case public @yah_spec_seg_residual_reject {
+  %weights = check.generate.fill value(1.0) : tensor<1024xf32>
+  %draft = check.generate.fill value(0.0) : tensor<1024xf32>
+  %scratch = check.generate.fill value(4.0) : tensor<769xf32>
+  %out_token = check.generate.fill value(0) : tensor<1xi32>
+  %out_accepted = check.generate.fill value(0) : tensor<1xi32>
+  %params = check.file.read.npy path("fixtures/spec_seg_residual/reject.npy") : tensor<2xf32>
+  %draft_tok = check.file.read.npy path("fixtures/spec_seg_residual/token.npy") : tensor<1xi32>
+  %e_zero = check.generate.fill value(0) : tensor<1xi32>
+  %e_sums = check.generate.fill value(4.0) : tensor<256xf32>
+  kernel.launch @yah_spec_seg_residual(%weights, %draft, %scratch, %out_token, %out_accepted, %params, %draft_tok) : (tensor<1024xf32>, tensor<1024xf32>, tensor<769xf32>, tensor<1xi32>, tensor<1xi32>, tensor<2xf32>, tensor<1xi32>)
+  check.expect.equal actual(%out_accepted) expected(%e_zero) : tensor<1xi32>
+  %rs = check.tensor.view %scratch offset(2048) : tensor<769xf32> -> tensor<256xf32>
+  check.expect.close actual(%rs) expected(%e_sums) atol(0.0) rtol(0.0) nan(same) : tensor<256xf32>
+  check.return
+}
+
+check.benchmark<@yah_spec_seg_residual_accept> @yah_spec_seg_residual_accept_bench
+
+check.benchmark<@yah_spec_seg_residual_reject> @yah_spec_seg_residual_reject_bench
