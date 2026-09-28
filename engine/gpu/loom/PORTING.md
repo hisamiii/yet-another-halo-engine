@@ -73,6 +73,7 @@ explicitly deferred.
 | yah_ffn_gemm_iq3s_residual_f32.loom | prefill_fp16.hip | IQ3_S FFN GEMM residual epilogue (kResidual) | ported, 19.97 ms at m_tiles=1088 |
 | yah_ffn_gemm_iq3xxs_residual_f32.loom | prefill_fp16.hip | IQ3_XXS FFN GEMM residual epilogue (kResidual) | ported, 18.11 ms at m_tiles=1088 |
 | yah_ffn_gemm_iq4nl_residual_f32.loom | prefill_fp16.hip | IQ4_NL FFN GEMM residual epilogue (kResidual) | ported, 15.61 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq4xs_gateup_f16.loom | prefill_fp16.hip | paired gate/up IQ4_XS GEMM with SwiGLU (kGateUp) | ported, 24.17 ms at m_tiles=1088; same-format paired arm, expectation at atol 0.005 |
 | yah_ffn_gemm_iq2xs_f32.loom | prefill_fp16.hip | batched IQ2_XS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 19.85 ms at m_tiles=1088; grid passed as i32 word pairs of the 64-bit entries |
 | yah_ffn_gemm_iq2s_f32.loom | prefill_fp16.hip | batched IQ2_S FFN GEMM, in-kernel grid+qs-sign decode (kStore) | ported, 12.02 ms at m_tiles=1088; grid passed as i32 word pairs, signs from the qs bytes | 
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
@@ -198,8 +199,9 @@ format work is the epilogue combinations. Every format now has a kStore port,
 and the residual epilogue now has a format-faithful port for every down format
 (Q4_K, Q5_K, Q3_K, Q6_K, IQ4_XS, IQ3_S, IQ3_XXS, IQ4_NL). A residual/SwiGLU/paired
 arm is the same epilogue loop over a format decode arm, so the risky decode work
-is done. The prefill route still needs the paired gate/up arm for IQ4_XS and the
-mixed gate/up pairs.
+is done. The same-format paired gate/up arm is ported for f16/Q4_K and now IQ4_XS;
+the prefill route still needs the mixed gate/up pairs and the standalone kSwiGLU
+arm.
 
 Reachability evidence for the entries that are not on that route:
 
