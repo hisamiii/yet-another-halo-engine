@@ -1590,3 +1590,38 @@ into the accumulator would need a partial sum per 32-element block). The only
 question left is whether the same work can be done in fewer instructions, which is
 what the native-fp16 arm tests.
 
+
+### The decode is a closed question: 16%, and unreachable three ways
+
+With the native-fp16 arm fixed and the wide tile measured, all three routes to the
+decode's 16% are closed, each by a paired measurement:
+
+| intervention | what it changes | reps | median |
+| --- | --- | --- | ---: |
+| decode removed, value kept live by asm | the whole decode | -15.3 -16.6 -16.1 -16.0 | **-16.07%** |
+| materialised fp16 weights | decode -> bytes | +7.7 +5.7 +5.5 +2.3 | **+5.61%** |
+| native fp16 FMA decode | halves its instruction count | -0.4 -0.6 +0.2 -0.2 | **-0.28%** |
+| wide 128x384 tile | amortises it (total decode is 1/BN) | +14.9 +12.3 +13.2 +16.4 | **+14.08%** |
+
+Read together these say something sharper than "the decode is expensive":
+
+- **Removing it is worth 16%**, so it is genuinely the cost.
+- **Halving its instructions is worth nothing** (-0.28%, inside the noise over four
+  reps). So the 16% is not instruction count.
+- **Amortising it over a wider tile is worse by 14%**, even though the total decode
+  work really does fall by a third (it is proportional to 1/BN, and 128+384 = 512 is
+  exactly the LDS budget at BK=4). The tile's extra store and read traffic costs
+  more than the amortisation saves.
+- **Precomputing it is worse by 5.6%**, because fp16 is 3.5x the bytes of this
+  artifact's FFN formats.
+
+So the 16% is a **scheduling cost, not an instruction cost**: the decode's live
+ranges and its interleaving with the K loop are what the matrix pipe waits on, not
+the arithmetic. Since it cannot be made cheaper, amortised, or precomputed, that 16%
+is structurally locked in for a quantized weight format on this part.
+
+One measurement note: the fp16-decode pair's rep 0 read 17.98 ms against 8.9-9.0 for
+every other rep, a 2x outlier. The median is used rather than the mean, and the
+other three reps agree to 0.4%. A mean over the four would have reported -3.5% and
+been wrong.
+
