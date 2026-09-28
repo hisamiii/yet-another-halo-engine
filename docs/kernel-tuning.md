@@ -1834,3 +1834,108 @@ same trace.
 
 
 
+
+## Tuning the DeltaNet recurrence: the tile trades a load for an exchange
+
+The SSM block is now instrumented in isolation: \`engine/gpu/ssm_bench.hip\` runs
+one arm per process (so the paired harness can put the 15 s gap before every timed
+launch), with \`row\` = the prefill path, \`base\` = the unfused cross-check
+\`YAH_SSM_BASELINE\` selects, and \`cmp\` = both with an elementwise comparison.
+All nine register tiles below agree with the unfused reference at max_abs 0.4999 /
+rel_rms 2.1e-4, which is fp16 output rounding: the tile is a pure re-partition and
+carries no numerical change. That comparison also validates the row-split path in
+isolation for the first time -- the forward only cross-checks it behind an
+undocumented env var.
+
+### The falsifier was answered: the rate is flat in T
+
+| T | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TFLOP/s | 2.734 | 2.861 | 2.829 | 2.764 | 2.818 | 2.804 |
+| ns/token | 1726 | 1649 | 1668 | 1707 | 1675 | 1683 |
+
+Flat to +-2% over a 32x range of T, and the unfused \`base\` path is flat too at
+1.09 TFLOP/s. So the cost is a steady-state **rate**, with no ramp and no tail to
+amortise: this is a rate problem, not a scheduling or an occupancy problem, and no
+amount of chunking hygiene will move it. Chunking can still win, but only by
+changing what the inner loop *is* (matvec -> matmul), not by improving amortisation.
+
+### Cutting the load traffic makes it slower
+
+The tile family fixes redundant k/q traffic per MAC at \`5.333 * keys / rows\`
+bytes, spanning 8x across the family, so it isolates traffic as a variable.
+Measured at T = 2048, three cycles, 15 s gaps:
+
+| tile | grid width | blocks | bytes/MAC | med ms | vs (32,1) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| (32,1) shipped | 2 | 96 | 2.67 | 3.420 | -- |
+| **(16,2)** | 2 | 96 | 1.33 | 3.347 | **-2.13%** |
+| (8,4) | 2 | 96 | 0.67 | 3.928 | +14.86% |
+| (32,2) | 1 | 48 | 1.33 | 3.499 | +2.33% |
+| (16,4) | 1 | 48 | 0.67 | 3.846 | +12.48% |
+| (8,8) | 1 | 48 | 0.33 | 4.678 | +36.81% |
+
+Cutting loads 4x costs 15%. Traffic is not the constraint, and the L1-bandwidth
+model is falsified. The same family also falsifies the parallelism reading: adding
+blocks at *fixed* bytes/MAC makes it much worse, because every block re-reads the
+full k/q row each token, so the grid's total traffic rises with the block count.
+
+| tile | blocks | bytes/MAC | med ms | vs (32,1) |
+| --- | ---: | ---: | ---: | ---: |
+| (32,1) | 96 | 2.67 | 3.425 | -- |
+| (16,1) | 192 | 2.67 | 4.368 | +27.53% |
+| (8,2) | 192 | 1.33 | 4.132 | +20.65% |
+| (8,1) | 384 | 2.67 | 4.519 | +31.96% |
+
+The "48 -> 96 blocks was worth 2.6x" observation from \`base\` vs \`row\` is
+therefore not a block-count effect: those are two different kernels, and the
+row-split one is simply better.
+
+### What it actually is: VALU instructions, and the exchange is one of them
+
+The counter suite on the profiled launch (one counter per \`rocprofv3\` run, as
+established above) gives the instruction budget per warp per token, over 768 waves
+and 2048 tokens:
+
+| tile | VALU/warp/token | FLAT/warp/token | VALU ratio | time ratio |
+| --- | ---: | ---: | ---: | ---: |
+| (32,1) | 131 | 18 | 1.000 | 1.000 |
+| (16,2) | **117** | 12 | 0.893 | **0.970** |
+| (8,4) | 160 | 12 | 1.221 | **1.147** |
+
+The model closes exactly. A tile with fewer lanes per row makes the cross-lane
+reduction shorter but has to load more k/q per thread; a tile with more lanes per
+row loads less and pays longer \`RowReduce2\` butterflies. Those are the same
+currency -- one VALU slot each -- so \`(8,4)\` removing six global loads and adding
+28 exchange ops is a net +29 VALU instructions, and it is 15% slower for it.
+\`(16,2)\` removes six loads and adds eight exchanges, nets 14 fewer VALU, and is
+the optimum of the family.
+
+Three other counters say what the floor is:
+
+- **\`MemUnitBusy\` ~99%** and **\`L2CacheHit\` ~75%**: the memory unit is
+  saturated and a quarter of the k/q/v traffic reaches DRAM.
+- **\`SQ_INSTS_LDS\` = 0**: the kernel uses no LDS at all; every exchange is a
+  DPP op on the ALU path.
+- Issue slots are only ~22% utilised (2.34e8 instructions over 40 CU x 4 SIMD x
+  6.5e6 cycles), so ~77% of issue slots are stalled -- consistent with a reduction
+  sitting in the dependency path once per token with only \`kRowsPerLane\`
+  independent rows per thread to hide it behind.
+
+### Shipped and remaining
+
+The default tile below the batch crossover moved from \`(32,1)\` to \`(16,2)\`.
+It is bit-identical, never slower across T = 512..16384, and paired against
+\`(32,1)\` it is **-0.64% at T = 2048** (one of three reps positive, so neutral at
+the production chunk), **-3.79% at T = 4096** and **-5.59% at T = 8192** (all three
+reps negative, spread under 1%). Worth about 0.2% of the model at the current
+chunk size and more if the prefill chunk grows.
+
+That is the whole of the tile lever. The residual 12.6x against the GEMM is
+structural: the inner loop is a rank-128 matvec with a cross-lane reduction every
+token, 96 blocks wide and T deep, and no register tile changes that. The lever that
+does is the **chunked form**, which turns the same arithmetic into intra-chunk
+matmuls (reuse across the chunk, WMMA-able, LDS-worth staging) plus a short
+inter-chunk scan. The flat-in-T result above says the payoff is only in the inner
+loop's shape, so any chunked prototype has to be judged on TFLOP/s at fixed T, not
+on amortisation.

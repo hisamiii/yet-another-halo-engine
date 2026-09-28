@@ -11,7 +11,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 #include "src/models/qwen/hip/detail/recurrent_state.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -407,42 +409,72 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
   const auto kh_i = static_cast<int>(num_key_heads);
   const auto h_i = static_cast<int>(num_heads);
 
-  // Two register tiles cover the useful range. The 32-key / one-row tile keeps
-  // the shortest reduction and wins while the live k/q working set still fits
-  // the vector caches; past a few thousand tokens the blocks drift far enough
-  // apart in the token index that halving the k/q traffic with a second row
-  // matters more than the extra registers.
-  if (batch_size <= kRowSplitSmallBatch) {
-    const dim3 grid(val_dim / RowSplitRowsPerBlock<32, 1>(), num_heads);
-    if (state_storage == QwenRecurrentStateStorage::kBf16) {
-      BatchedDeltaNetRowSplitKernel<hip_bfloat16, 32, 1, false>
-          <<<grid, 256, 0, stream>>>(conv_out, kq_scales, alpha_beta,
-                                     static_cast<hip_bfloat16*>(deltanet_state),
-                                     out_buf, layer_idx, batch_i, qkv_i,
-                                     inner_i, kh_i, h_i);
-    } else {
-      BatchedDeltaNetRowSplitKernel<float, 32, 1, false>
-          <<<grid, 256, 0, stream>>>(conv_out, kq_scales, alpha_beta,
-                                     static_cast<float*>(deltanet_state),
-                                     out_buf, layer_idx, batch_i, qkv_i,
-                                     inner_i, kh_i, h_i);
-    }
-  } else {
-    const dim3 grid(val_dim / RowSplitRowsPerBlock<32, 2>(), num_heads);
-    if (state_storage == QwenRecurrentStateStorage::kBf16) {
-      BatchedDeltaNetRowSplitKernel<hip_bfloat16, 32, 2, true>
-          <<<grid, 256, 0, stream>>>(conv_out, kq_scales, alpha_beta,
-                                     static_cast<hip_bfloat16*>(deltanet_state),
-                                     out_buf, layer_idx, batch_i, qkv_i,
-                                     inner_i, kh_i, h_i);
-    } else {
-      BatchedDeltaNetRowSplitKernel<float, 32, 2, true>
-          <<<grid, 256, 0, stream>>>(conv_out, kq_scales, alpha_beta,
-                                     static_cast<float*>(deltanet_state),
-                                     out_buf, layer_idx, batch_i, qkv_i,
-                                     inner_i, kh_i, h_i);
-    }
+  // Register-tile selection. Each (kKeysPerLane, kRowsPerLane) pair fixes both
+  // the redundant k/q traffic per MAC -- 5.333 * keys / rows bytes, i.e. 2.67
+  // for the shipped (32,1) against the ~1.0 the L1 sustains at peak FMA -- and
+  // the resident wave count. The batch crossover is the shipped heuristic;
+  // YAH_SSM_TILE=<keys>x<rows> overrides it so the family can be measured
+  // without rebuilding.
+  int tile = 0;
+  if (const char* env = std::getenv("YAH_SSM_TILE")) {
+    const std::string t(env);
+    if (t == "32x1") tile = 1;
+    else if (t == "32x2") tile = 2;
+    else if (t == "16x2") tile = 3;
+    else if (t == "16x4") tile = 4;
+    else if (t == "8x4") tile = 5;
+    else if (t == "8x8") tile = 6;
+    else if (t == "16x1") tile = 7;
+    else if (t == "8x1") tile = 8;
+    else if (t == "8x2") tile = 9;
+    else throw std::invalid_argument("YAH_SSM_TILE: unknown tile " + t);
   }
+  // (16,2) is the default below the crossover: it is bit-identical to (32,1),
+  // is never slower in the measured range T = 512..16384, and is 3.8% / 5.6%
+  // faster at T = 4096 / 8192. At the production chunk of 2048 it is neutral
+  // (-0.64% paired median, one rep of three positive), which is why the default
+  // moved on the larger batches rather than on the production point.
+  if (tile == 0) tile = (batch_size <= kRowSplitSmallBatch) ? 3 : 2;
+
+#define YAH_SSM_TILE_CASE(N, KEYS, ROWS, PREFETCH)                              \
+  case N: {                                                                     \
+    const dim3 g(                                                               \
+        static_cast<unsigned int>(val_dim /                                     \
+                                  RowSplitRowsPerBlock<KEYS, ROWS>()),          \
+        num_heads);                                                             \
+    if (state_storage == QwenRecurrentStateStorage::kBf16) {                    \
+      BatchedDeltaNetRowSplitKernel<hip_bfloat16, KEYS, ROWS, PREFETCH>         \
+          <<<g, 256, 0, stream>>>(conv_out, kq_scales, alpha_beta,              \
+                                  static_cast<hip_bfloat16*>(deltanet_state),   \
+                                  out_buf, layer_idx, batch_i, qkv_i, inner_i,  \
+                                  kh_i, h_i);                                   \
+    } else {                                                                    \
+      BatchedDeltaNetRowSplitKernel<float, KEYS, ROWS, PREFETCH>                \
+          <<<g, 256, 0, stream>>>(conv_out, kq_scales, alpha_beta,              \
+                                  static_cast<float*>(deltanet_state), out_buf, \
+                                  layer_idx, batch_i, qkv_i, inner_i, kh_i,     \
+                                  h_i);                                         \
+    }                                                                           \
+  } break
+
+  switch (tile) {
+    YAH_SSM_TILE_CASE(1, 32, 1, false);
+    YAH_SSM_TILE_CASE(2, 32, 2, true);
+    YAH_SSM_TILE_CASE(3, 16, 2, false);
+    YAH_SSM_TILE_CASE(4, 16, 4, false);
+    YAH_SSM_TILE_CASE(5, 8, 4, false);
+    YAH_SSM_TILE_CASE(6, 8, 8, false);
+    // More blocks at the same bytes/MAC as the shipped tile: (16,1) is 4 blocks
+    // wide and (8,1) is 8, against 2 for (32,1), and the 48 -> 96 block step
+    // was worth 2.6x, so this is the parallelism axis rather than the traffic
+    // one. Registers per thread fall with kRowsPerLane, so all three fit.
+    YAH_SSM_TILE_CASE(7, 16, 1, false);
+    YAH_SSM_TILE_CASE(8, 8, 1, false);
+    YAH_SSM_TILE_CASE(9, 8, 2, false);
+    default:
+      throw std::invalid_argument("YAH_SSM_TILE: unreachable tile");
+  }
+#undef YAH_SSM_TILE_CASE
 
   // Emit the activation consumed by ssm_out directly. Other callers retain the
   // FP32 in-place epilogue.
