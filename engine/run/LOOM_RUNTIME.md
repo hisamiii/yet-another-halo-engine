@@ -208,6 +208,26 @@ clamps to `cache_elems - head_dim`, because the production-scale offset cannot b
 proven from the declared config ranges (the same reason other ports clamp their
 weight indices).
 
+`engine/run/loom_forward_probe.cc` runs the **whole 64-layer prefill stack** on
+Loom through HRX, no HIP: the embedding is Q4_K-dequantized on the host, each
+layer runs the Gated DeltaNet or full-attention mixer followed by the paired Q4_K
+gate/up and the Q4_K down residual, and the head is output RMSNorm + Q4_K GEMV +
+argmax. On `base_q4kpure.gguf` with prompt `760 6511 314 9338 369`:
+
+```
+argmax=11751        (identical to the HIP yah-run reference)
+final residual vs HIP layer_63: max_abs 0.095, mean 0.0023
+```
+
+Each layer individually matches HIP to ~0.05, so the 0.095 end-to-end is
+accumulated fp16-staging/reduction-order drift and does not move the argmax.
+
+A race showed up only when the per-layer debug syncs were removed: the small
+norm-weight upload buffer was reused across layers, and the synchronous
+`hrx_synchronous_h2d` overwrote it while the previous layer's dispatch still
+read it. Giving each norm its own weight buffer fixed it; the run is
+deterministic with no intervening syncs.
+
 ## 5. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape
