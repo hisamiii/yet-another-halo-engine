@@ -116,3 +116,45 @@ matvec with a per-token cross-lane reduction, and it needs to become chunked
 matmuls). Loom is a compiler whose stated purpose is beating tuned HIP, it can
 express that restructuring, and the same source path targets the NPU — so the
 kernel work and the NPU work stop being two projects.
+
+### First measurement: the corpus example is not yet competitive
+
+The cheapest test of Loom's mandate is to find a corpus example whose shape we can
+reproduce on our HIP side and run both. `ffn_gate_up_swiglu_q6q8.loom` is a q6_K
+weight x q8_0 activation gate+up SwiGLU, the same structure as our FFN kernel, so
+the shapes decode exactly:
+
+- `gate_weight = up_weight = 55,695,360 B` of q6_K at 210 B / 256 weights =
+  67,895,296 weights
+- output `31 x 18944` f32, so **N = 18944** and **K = 3584** (67,895,296 / 18944)
+- input `124,992 B` / 31 rows = 4032 B/row = 112 blocks x 36 B, i.e. q8 with fp32
+  scales
+- gate+up = 2 x 2 x 31 x 3584 x 18944 = **8.42 GFLOP**
+
+```
+same shape (31 x 3584 -> 18944, q6_K weights, gate+up SwiGLU)
+  Loom    ffn_gate_up_swiglu_q6q8_zero   3.938 ms   2.14 TFLOP/s   state ok, 1/1
+  our HIP one:q6k 18944 3584 31 ... gateup  0.883 ms   9.54 TFLOP/s
+```
+
+**Our HIP kernel is 4.5x faster at the same shape and the same weight format.**
+Three caveats keep this from being a verdict on Loom:
+
+1. This is an **authoring corpus sample**, not a tuned kernel. Its job is to
+   demonstrate the language -- template providers, `check.case`, `check.benchmark`
+   -- and Loom's mandate is about where its emitted programs end up, not where the
+   examples start.
+2. The Loom side is **one cold launch** (warmup 0, iterations 1, host_wall domain)
+   against our two warmups plus one timed launch, so it carries cold-start cost.
+3. The activation path differs: Loom uses q8_0 integer dots, the
+   `v_dot4_i32_i8` class that `dot_peak` measures at 14.2-14.5 TMAC/s (28.4
+   TFLOP/s), while ours is fp16 WMMA at 27.6 TMAC/s (55.2 TFLOP/s). Loom's
+   instruction class has **half** the ceiling, which explains a factor of two but
+   not 4.5x.
+
+What it does establish is the thing worth knowing before committing: **the switch
+is not a free win.** A Loom rewrite starts from a kernel 4.5x slower than what we
+have, on shapes where our HIP is already reasonable, so the authoring and tuning
+effort to reach parity is real and has to be budgeted. The place Loom is most
+likely to pay is still where HIP is structurally stuck -- the DeltaNet recurrence's
+chunked restructuring -- not where HIP is merely imperfect.
