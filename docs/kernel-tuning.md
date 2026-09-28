@@ -1684,14 +1684,20 @@ stage loop. The cost is monotone in spilled registers, 0 -> 16 -> 74 -> 230.
 
 ### Why 192 is a hard budget, and why it cannot be bought
 
-49152 VGPRs per SIMD / 256 threads per SIMD (a 1024-thread block is 8 waves per
-SIMD) = 192. At 512 threads the budget is 384, clamped to the 256 architectural
-maximum, and the 512-thread arm of the same tile then uses 242. This is the same
-constraint the occupancy section found from the other side -- "one block per CU
-set by 64 KiB of LDS, 8 waves per SIMD" -- read numerically: LDS and VGPR are
+The cap is a property of the workgroup size, not of an occupancy target, and that
+is testable without running anything. Setting the second `__launch_bounds__`
+argument explicitly to 1 leaves the baseline at **192 VGPR / 0 spills**; setting
+it to 2, which under a budget of RF/(threads x blocks) would force 96, leaves it
+at **192 / 0 spills** as well. The allocator is therefore not trading occupancy
+against registers here: a 1024-thread workgroup on this part is simply capped at
+192, i.e. 196608 VGPRs divided by 1024 threads. Halving the workgroup halves the
+demand and the cap lifts to the 256 architectural maximum, which is why the
+512-thread arm of the same tile uses 242 and the 256-thread arm 221. This is the
+same constraint the occupancy section found from the other side -- "one block per
+CU set by 64 KiB of LDS, 8 waves per SIMD" -- read numerically: LDS and VGPR are
 saturated by the **same** block, so neither can be relieved without the other, and
-there is no reordering of the staging pipeline that does not need more
-simultaneously-live values than the budget holds.
+no reordering of the staging pipeline exists that does not need more
+simultaneously-live values than 192.
 
 ### The two levers that follow are both dead
 
@@ -1740,6 +1746,20 @@ being worth only ~7% of block cycles in the phase clock, and halving its
 instruction count is worth -0.28% -- so its cost is not the arithmetic but the
 occupancy of the one pipeline stage the commit can run in, at a register budget
 that forbids overlapping it with the K loop.
+
+### Wave quantization is not part of the deficit either
+
+The real grid for this shape is 8 x 68 = 544 blocks, and if the machine ran a fixed
+number of blocks concurrently the 14th round would be 40% empty, which is where a
+~3% tail would live. It is not there. Holding the tile, K and batch fixed and
+varying only the block count -- 520, 528 and 560 blocks (m = 16640, 16896, 17920;
+five cycles, 15 s gaps) -- gives medians of 8.31, 8.52 and 8.92 ms, ratios of
+**1.000 : 1.025 : 1.074**. Scaling with block count predicts 1.000 : 1.015 : 1.077;
+a 40-block wave predicts 1.000 : **1.077** : 1.077; an 80-block wave predicts
+1.000 : 1.000 : 1.000. The 528-block point sits closer to the no-quantization value
+than to either quantized one, and its within-arm spread is 0.96%, so throughput is
+proportional to block count and the grid is not tail-limited. That removes the last
+scheduling term outside the kernel.
 
 **Falsifier:** a configuration that keeps this staging structure and beats 20.3
 TMAC/s moves the cost off the commit phase. Every arm that changes the staging
