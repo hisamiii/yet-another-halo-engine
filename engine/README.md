@@ -332,3 +332,43 @@ which times the tensor fills and the correctness compare as well as the kernel.
 Kernel time requires --measure=dispatch_complete; the two modes gave 38.6 ms and
 5.979 ms for the same v1 binary, so the mode must be stated with any Loom number
 quoted.
+
+### Loom GEMM progression, and three levers that were falsified
+
+All numbers: gfx1151, iree-benchmark-loom --measure=dispatch_complete, 2 warmups
+and 5 timed batches, run serially in one session, correctness passing in every
+arm. Our HIP kernel at the same fp16 precision is the control.
+
+| kernel | time | TFLOP/s | vs previous |
+| --- | ---: | ---: | --- |
+| Loom v1: 16x16 tile, n_tiles=4 | 5.979 ms | 1.909 | - |
+| Loom v2: 16x64 tile, weights read once | 3.000 ms | 3.805 | 2.00x |
+| Loom v3: + pipeline(depth 3, unroll 2) | **1.819 ms** | **6.271** | 1.65x |
+| our HIP, fp16 weights | 1.353 ms | 8.43 | 1.34x ahead of v3 |
+
+**Falsified: M32 x N64 tile.** Sharing one set of activation fragments across two
+weight fragments cuts loads per WMMA from 1.25 to 0.75 and halves total activation
+traffic, and it is 30% slower (2.370 ms). It compiles to 256 vector registers, the
+per-thread maximum, with zero spills -- halving resident warps, and the occupancy
+loss beats the reuse gain. Depth two on the same tile is worse still (3.159 ms).
+
+**Falsified: pipeline depth four.** 1.918 ms, 5% slower than depth three. The
+read-ahead queue costs vector registers (80 at depth one, 200 at depth three, 240
+at depth four) and therefore resident warps; past depth three the occupancy loss
+overtakes the overlap gained. Depth two is worse than depth three as well (2.501 ms).
+
+**Falsified: transposing the activation to [k][t].** The rhs operand dominates
+issued loads, and the compile report shows v3 reading it *gapped*: 512 bytes
+requested, 16 discontiguous regions, 10 KiB maximum gap. Handing the kernel the
+activation already transposed makes that access dense with one contiguous region
+and zero gaps, and drops vector registers from 200 to 152 -- every static signal
+improves, and the kernel is **3.13x slower** (5.701 ms). The token-major
+B-fragment path is evidently much cheaper to gather than the k-major one, so the
+strided view was never the bottleneck. A static access-geometry argument is not
+evidence about this kernel.
+
+So the remaining 1.34x against HIP is not the activation access pattern and not
+the tile shape. The untested lever with a mechanism behind it is the weight
+operand: v3 reads it row-major through the same gapped pattern (512 requested, 16
+regions), and our HIP kernel avoids that by repacking weights into the blocked
+layout the fragments want. That is the next experiment.
