@@ -92,6 +92,13 @@ explicitly deferred.
 | yah_ffn_gemm_iq3xxs_iq3s_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 33.84 ms at m_tiles=1088 |
 | yah_ffn_gemm_q3k_iq3xxs_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 35.34 ms at m_tiles=1088 |
 | yah_ffn_gemm_iq3xxs_q3k_gateup_f16.loom | prefill_fp16.hip | paired mixed-format gate/up GEMM with SwiGLU (kGateUp) | ported, 31.12 ms at m_tiles=1088 |
+| yah_ffn_gemm_iq4xs_swiglu_f16.loom | prefill_fp16.hip | IQ4_XS FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 14.82 ms at m_tiles=1088; fallback up-projection arm |
+| yah_ffn_gemm_iq3s_swiglu_f16.loom | prefill_fp16.hip | IQ3_S FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 17.47 ms at m_tiles=1088; fallback up-projection arm |
+| yah_ffn_gemm_iq2s_swiglu_f16.loom | prefill_fp16.hip | IQ2_S FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 16.58 ms at m_tiles=1088; fallback up-projection arm |
+| yah_ffn_gemm_q3k_swiglu_f16.loom | prefill_fp16.hip | Q3_K FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 16.33 ms at m_tiles=1088; fallback up-projection arm |
+| yah_ffn_gemm_iq3xxs_swiglu_f16.loom | prefill_fp16.hip | IQ3_XXS FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 16.02 ms at m_tiles=1088; fallback up-projection arm |
+| yah_ffn_gemm_iq4nl_swiglu_f16.loom | prefill_fp16.hip | IQ4_NL FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 14.89 ms at m_tiles=1088; fallback up-projection arm |
+| yah_ffn_gemm_q6k_swiglu_f16.loom | prefill_fp16.hip | Q6_K FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 15.86 ms at m_tiles=1088; fallback up-projection arm |
 | yah_ffn_gemm_iq2xs_f32.loom | prefill_fp16.hip | batched IQ2_XS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 19.85 ms at m_tiles=1088; grid passed as i32 word pairs of the 64-bit entries |
 | yah_ffn_gemm_iq2s_f32.loom | prefill_fp16.hip | batched IQ2_S FFN GEMM, in-kernel grid+qs-sign decode (kStore) | ported, 12.02 ms at m_tiles=1088; grid passed as i32 word pairs, signs from the qs bytes | 
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
@@ -238,6 +245,15 @@ layers use the five same-format ports; the 27 mixed layers use 15 mixed ports
 spanning all the pairs in the table. A mixed port carries two per-operand block
 sizes, two block shifts (IQ4_NL is QK=32, the rest QK=256) and, where a format
 needs them, per-operand grid/ksigns table operands.
+The launcher does not actually fuse every pair. TryLaunchBatchedDualQuantGEMM-
+SwiGLUFp16 instantiates only ten mixed pairs (prefill_fp16.hip:1785-1804) and the
+same-format switch only Q4_K/Q5_K/Q6_K/IQ4_XS, so 47 of the 65 layers take the
+fused arm and the other 18 fall back to two launches: a kStore GEMM plus the
+kSwiGLU up-projection arm. The kSwiGLU arm is now ported for every fallback up
+format (Q4_K plus IQ4_XS, IQ3_S, IQ2_S, Q3_K, IQ3_XXS, IQ4_NL and Q6_K), so both
+branches of the FFN gate/up path are covered. The mixed Loom ports for pairs the
+launcher never fuses are still faithful ports of the same template, just not on
+this shard route.
 
 Reachability evidence for the entries that are not on that route:
 
