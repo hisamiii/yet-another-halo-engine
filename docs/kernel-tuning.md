@@ -1771,4 +1771,66 @@ registers across the barrier, which needs the accumulator footprint to fall enou
 to pay for it; 192 - 64 (accumulators) = 128 registers is the space that makes it
 possible or not.
 
+## The non-GEMM 11.6%: the DeltaNet recurrence is 96 blocks wide and 2048 deep
+
+The model-level table ended by observing that the batched GEMM is 87% of prefill
+GPU time and concluding "there is no large unexamined kernel". That is true of the
+*share* and false of the *headroom*: the second-largest block is one kernel, and it
+is off the GEMM's efficiency by more than an order of magnitude.
+
+**Instantiation.** Prefill takes `LaunchBatchedSSMConvRecurrenceRowSplit`
+(`model/forward.hip:563`; `YAH_SSM_BASELINE` selects the unfused variant that
+`yah-ssm-check` verifies against). The recurrence itself is
+
+```
+BatchedDeltaNetRowSplitKernel<float, 32, 1, false><<<dim3(grid.x, num_heads), 256>>>
+grid.x = val_dim / RowSplitRowsPerBlock<32, 1>() = 128 / 64 = 2
+grid.y = num_heads = ssm_time_step_rank = 48
+```
+
+so **96 blocks of 256 threads — 24576 threads — for the whole 2048-token pass**,
+because `batch_size <= kRowSplitSmallBatch` (2048) selects the `<32,1>` register
+tile, whose `RowSplitRowsPerBlock` is `(32/(128/32))*1*8 = 64`. The model's
+`ssm_inner_size / ssm_time_step_rank = 6144/48 = 128` is what makes the 128x128
+assert hold.
+
+**Bounding model.** Inside the kernel the token loop is the *outer* loop and
+`s_reg` is the carried recurrence, so each block executes **2048 sequential token
+steps** with no token-level parallelism anywhere in the launch. Each step does three
+rank-128 operations per head -- `u = S^T k`, `p = S^T q`, `S += d k^T` -- i.e.
+3 x 128 x 128 = 49152 MACs = 98304 FLOP per head per token. Across 48 heads and 2048
+tokens that is **9.66 GFLOP per recurrent layer**, and with **48 recurrent layers**
+(65 blocks, `full_attn_every=4`, 16 full-attention) **464 GFLOP for the pass**.
+
+**The measurement.** Against the batched GEMM's 99.3 TFLOP, the recurrence is 0.47%
+of the FLOPs and 5.1% of the GPU time, so per unit time it delivers
+`(99.3/86.8) / (0.464/5.1) = 12.6x` fewer FLOPs than the GEMM. Clock cancels --
+both shares come from the same trace. The GEMM is at 74% of the same-session WMMA
+ceiling, so the recurrence is at roughly **6% of it**, with a
+`RowReduce2` cross-lane butterfly sitting in the dependency path once per row group
+per token and `kRowsPerLane = 1` leaving nothing in a thread to hide it behind.
+
+**The levers, enumerated.**
+
+1. **Chunk the token axis.** With C chunks of c tokens the intra-chunk part becomes
+   matrix-shaped and the launch widens from 96 blocks to 96 x C, while the
+   sequential depth falls 2048 -> C. This is the only lever that changes the
+   shape of the problem rather than its constants, and it is where the 12.6x is.
+2. **Widen the block.** `grid.x` is `val_dim/64 = 2`; subdividing the 64 rows per
+   block trades the `<32,1>` reduction length for blocks, which is the same
+   tradeoff the file already makes between `<32,1>` and `<32,2>`.
+3. **Dispatch count.** The category is 336 dispatches for 48 layers, i.e. ~7 per
+   recurrent layer (conv, prepKq, prepAlphaBeta, recurrence, postNormGate and the
+   fused input projections). Anything that merges them is worth having once the
+   recurrence is fast enough for launch gaps to show.
+
+**Falsifier.** If the cost is sequential token depth rather than the arithmetic,
+the achieved rate must be insensitive to T: measure the recurrence alone at
+T = 512, 1024, 2048 and 4096 with everything else fixed. A flat ~6%-of-ceiling at
+every T says depth is binding and chunking is the climb; a rate that rises with T
+says the cost is ramp-up and tail, and chunking buys nothing. The second reading
+also predicts the 12.6x gap shrinks at larger batch, which is testable from the
+same trace.
+
+
 
