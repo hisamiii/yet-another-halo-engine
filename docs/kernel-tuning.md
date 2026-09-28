@@ -1292,19 +1292,41 @@ recover; the 18% was the clock assumption.
 
 ### What that leaves
 
+**Correction, and it is the one already recorded above.** An earlier draft of
+this section read the 1979 MHz mean against the 2630 MHz max as a machine-level
+lever to be recovered with cooling or a power profile. That is the naive reading
+and it is wrong. The section "clock falls as load rises" earlier in this document
+has the mechanism: the clock mean sits below the max *because the workload draws
+power*, the DPM pulls the clock back, and it is not power-limited (93 W of 130 W)
+nor thermally tripped. So the clock deficit is not exogenous -- it is a
+consequence of the kernel's own load, and the honest efficiency measure is work
+per clock, which survives a session change.
+
+On that measure, from the bracketed prefill window:
+
+| measure | value |
+| --- | --- |
+| prefill, this session | 0.01269 TF/MHz (25.12 TF at ~1979 MHz) |
+| recorded plateau for this engine | 0.0144 TF/MHz |
+
+**The recoverable gap is ~12% in work per clock, not 25-40% in clock.** And it is
+rewarded twice: a kernel that toggles fewer bits and issues fewer instructions per
+FLOP raises work per clock *and* lets the DPM hold a higher clock, so the
+wall-clock gain is larger than the TF/MHz gain alone.
+
+One discrepancy is left open and is now the measurement to make: the bench GEMM at
+~9.2 ms implies ~2750 MHz if work per clock is still the recorded 0.0144, while
+the sampler read ~1930 MHz mean over the same process. Either the sampler is
+reading low for a 400-iteration bench or work per clock has moved. Settling it
+needs the bench bracketed the way `clockrun.py` brackets the engine -- SCLK and
+power sampled inside the timed window -- rather than over the whole process.
+
 | lever | size | evidence |
 | --- | --- | --- |
-| operating clock: 1979 MHz mean against 2630-2782 observed max | **25-40%** | measured in the same window |
-| GEMM efficiency 79% -> 100% of the clock-scaled ceiling | 21% of 87% = 18% | not reachable by any of ~25 interventions |
+| work per clock 0.01269 -> 0.0144 TF/MHz | ~12%, plus whatever clock it buys back | bracketed prefill window |
+| GEMM at 79% of the clock-scaled ceiling | 21% of 87% | not moved by any of ~25 interventions |
 | non-GEMM kernels (norms, SSM, attention, residual) | 11.6% | 396 ms, unexamined |
 | decode GEMV | 1.5% | off-target |
-
-The kernel work in this document has been chasing the 18% that no intervention
-moved, while **the 25-40% sitting in the operating clock is larger and is being
-left on the table in every measurement** -- power is 93 W against a 130 W cap, so
-it is not power-limited, and the clock dips to 1692 MHz mid-run. That is a
-machine-level lever (cooling, fan policy, power profile), not a code lever, and it
-dominates everything in this document.
 
 that numerator. Shrinking LDS to fit a second block necessarily lowers that ratio,
 which is why every occupancy win is a traffic loss and every traffic loss is
