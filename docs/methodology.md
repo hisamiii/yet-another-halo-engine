@@ -11,8 +11,41 @@ At fixed settings this box drifts 15–35% between sessions, and the absolute th
 1. Warm up **every** arm before the loop starts, and discard those runs.
 2. Run one repetition per arm per rep (`-r 1`), not an averaged run.
 3. Alternate which arm goes first each rep, so no arm always follows the idle gap.
-4. Put a fixed gap (15 s) before every timed run, and record the temperature with it.
-5. Parse exactly one number out of the output with a sed expression that has been shown to produce a value; an extraction bug returns silence, not an error.
+4. Put a fixed gap (15 s) before every timed run, and record **SCLK and package
+   power** with it, not just the temperature.
+5. Parse exactly one number out of the output with a sed expression that has
+   been shown to produce a value; an extraction bug returns silence, not an
+   error.
+6. Report work per clock (TF/MHz) next to the milliseconds. A wall-clock delta
+   cannot on its own distinguish a kernel that does less work from one that is
+   given more clock.
+
+### The clock is part of the result, not noise
+
+On this part the SMU chooses an operating point from how much work each clock
+does, so an efficient kernel is rewarded twice: it finishes sooner *and* it runs
+at a higher SCLK. A delta in milliseconds is therefore not attributable to
+instructions alone, and a number recorded without the clock it ran at is
+incomplete.
+
+Both quantities are readable unprivileged:
+`/sys/class/drm/card*/device/hwmon/hwmon*/freq1_input` (SCLK, Hz) and
+`power1_average` (W). The `clockrun.sh` sampler polls them at 10 Hz around a
+timed run and reports mean and maximum SCLK, mean power, Tctl, TFLOPS and
+TF/MHz.
+
+Work per clock is the invariant. A 2048-token prefill on this box measured
+**TF/MHz = 0.01406**, reproducing the **0.0144** recorded earlier by a different
+harness to 2.4%, while that same run's SCLK sampled up to **2694 MHz** against a
+2900 MHz top level and drew only **53.6 W mean against a 130 W cap**. So the cap
+was not binding and the part was not near its top level on average — the
+operating point was chosen, not clipped. That is what makes the 130 W and 80 W
+"power limit" sweeps in [kernel-tuning.md](kernel-tuning.md) hard to read as a
+ceiling: neither arm was at the cap.
+
+The DPM table is not fixed either: `pp_dpm_sclk` reported level 1 as 827 MHz and
+later as 1027 MHz for the same level, so the level's own frequency is
+renegotiated. Sample the instantaneous clock; do not read it once.
 
 `-r 1` is the least state-dependent number: within a multi-repetition run the first repetition is the boosted one, so an average mixes regimes. Pairing removes the drift; averaging does not.
 
