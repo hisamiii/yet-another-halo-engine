@@ -1054,3 +1054,39 @@ is mis-framed.
 
 
 
+
+### Materialised fp16 weights: tried, bit-exact, and a wash
+
+The `no decode` arm said the decode was worth 23%. The honest test of that is to
+remove the decode for real: keep the weights pre-dequantised as fp16 and read them
+directly, so the kernel never unpacks anything. Ablation 16777216 does this, and
+the fp16 tensor is built with the kernel's own `LoadRaw`/`DecodeRaw` and the same
+fp32 scale/offset math, so the two kernels must agree exactly. They do:
+
+```
+fp16w check: worst_abs=0 bit_mismatch=0/35651584 nonfinite=0     (all three formats)
+```
+
+Bit-identical output, identical LDS instruction counts (48 loads, 4 stores), same
+32 WMMA per stage, rotated paired rounds:
+
+| format | bpw | fp16/bpw | quantised | fp16 weights | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Q4_K | 4.50 | 3.6x | 10.30 | 10.29 | wash |
+| Q5_K | 5.50 | 2.9x | 10.70 | 13.66 | **-25%** |
+| Q6_K | 6.56 | 2.4x | 11.27 | 10.59 | **+6%** (4 of 4 rounds) |
+
+So the decode is not worth 23%: removing it outright on Q4_K returns nothing, and
+the ablate-80 figure does not reproduce when the decode actually leaves the kernel.
+What materialising does is trade the decode ALU for a wider weight read, and the
+exchange rate depends on the source format -- 3.6x the bytes is break-even on
+Q4_K, 2.9x loses badly on Q5_K, 2.4x wins modestly on Q6_K. It is a bit-width
+trade, not a decode trade.
+
+**Verdict: not worth it.** The prefill FFN on the primary target is the IQ family
+(IQ3_S, IQ3_XXS, IQ4_XS at 3.4-4.25 bpw), which is *wider* than 2 bytes per
+element in fp16 by more than Q4_K is -- so the exchange rate there is worse than
+the Q4_K wash. Against that, per-layer materialisation costs 510 MiB for the FFN
+and 731 MiB for a whole layer on a 24 GiB budget. Paying memory for a wash, or a
+loss, is the wrong trade.
+

@@ -433,6 +433,18 @@ __launch_bounds__(WM * WN * 32) __global__
                                : nullptr;
   // GlobalB and DblBuf combine to the configuration that never fit before: with
   // only the weight tile staged, BK=4 double buffering is 2 * 32 KiB = 64 KiB.
+  //
+  // Ablation 16777216 (Fp16W): the weights arrive already dequantised as fp16,
+  // row-major [m][k], also passed through `up`. The fetch loads 32 bytes per
+  // (row, K16) and the commit stores them to LDS unchanged, so the decode leaves
+  // the kernel entirely. Restricted to the plain kStore path.
+  static_assert((Ablate & 16777216) == 0 || (!Paired && !Mixed),
+                "Fp16W covers the plain kStore path");
+  static_assert(((Ablate & 16777216) == 0) || ((Ablate & 1048576) == 0),
+                "Fp16W and GlobalB both use the up argument");
+  const short* w16 = (Ablate & 16777216) != 0 ? static_cast<const short*>(up)
+                                              : nullptr;
+  const short* w16_row[PFA];
 
   v8f acc[WRS][WTS] = {};
 
@@ -448,9 +460,12 @@ __launch_bounds__(WM * WN * 32) __global__
         r_block +
         (Paired ? (physical_row / 32) * 16 + physical_row % 16 : physical_row);
     const void* source = Paired && physical_row % 32 >= 16 ? up : w;
+    const std::size_t row_sel =
+        static_cast<std::size_t>((Complete || r < m) ? r : (m - 1));
     w_row[p] = static_cast<const std::uint8_t*>(source) +
-               (static_cast<std::size_t>((Complete || r < m) ? r : (m - 1)) *
+               (row_sel *
                 (Mixed && physical_row % 32 >= 16 ? up_row_bytes : row_bytes));
+    w16_row[p] = w16 + (row_sel * k);
   }
   const short* x_row[PFB];
 #pragma unroll
@@ -518,7 +533,11 @@ __launch_bounds__(WM * WN * 32) __global__
     for (int p = 0; p < PFA; ++p) {
       const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
       if ((Ablate & 64) == 0 && idx < BM * BK && (Complete || kk < ksteps)) {
-        if (Mixed && (idx / BK) % 32 >= 16)
+        if constexpr ((Ablate & 16777216) != 0) {
+          const short* src = w16_row[p] + (static_cast<std::size_t>(kk) * 16);
+          ra[p][0] = *reinterpret_cast<const uint4*>(src);
+          ra[p][1] = *reinterpret_cast<const uint4*>(src + 8);
+        } else if (Mixed && (idx / BK) % 32 >= 16)
           fetch_up(p, kk);
         else if constexpr (CacheQ5Header &&
                            Type == gufo::core::GgmlType::kQ5_K) {
@@ -614,7 +633,8 @@ __launch_bounds__(WM * WN * 32) __global__
         short* dst = &s_a[buf][ks][placed / 16][placed % 16][0];
         if (Mixed && row % 32 >= 16) {
           commit_up(p, dst, row);
-        } else if constexpr (DecodeStage != 0 && (Ablate & (512 | 1024 | 64)) == 0) {
+        } else if constexpr (DecodeStage != 0 &&
+                             (Ablate & (512 | 1024 | 64 | 16777216)) == 0) {
           gufo::hip::QuantSub16 q = DecodeRaw<Type>(raw[p]);
           union {
             v16bf f;

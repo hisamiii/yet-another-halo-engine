@@ -1759,6 +1759,155 @@ void DispatchDec(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
   }
 }
 
+
+// Materialised fp16 weights. DequantWeightsToFp16 fills the fp16 tensor using the
+// kernel's own LoadRaw/DecodeRaw and the same fp32 scale/offset math the commit
+// uses, so the Fp16W kernel and the quantised kernel must produce bit-identical
+// output -- that is the correctness gate, not a tolerance. The 178 MiB tensor is
+// a per-layer buffer in practice, not a whole-model one.
+template<gufo::core::GgmlType Type>
+__global__ void DequantWeightsToFp16(const void* __restrict__ w,
+                                     short* __restrict__ out, int m, int k) {
+  const int nk = k / 16;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int kk = idx % nk, row = idx / nk;
+  if (row >= m) return;
+  const auto* rowp =
+      static_cast<const std::uint8_t*>(w) +
+      static_cast<std::size_t>(row) * gufo::hip::QuantRowBytes(Type, k);
+  gufo::hip::RawWeights<Type> raw = gufo::hip::LoadRaw<Type>(rowp, (unsigned)kk);
+  gufo::hip::QuantSub16 q = gufo::hip::DecodeRaw<Type>(raw);
+  union {
+    gufo::hip::v16bf f;
+    uint4 u[2];
+  } packed;
+#pragma unroll
+  for (int j = 0; j < 16; ++j)
+    packed.f[j] = static_cast<_Float16>(__fsub_rn(
+        __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+  uint4* dst = reinterpret_cast<uint4*>(
+      out + (static_cast<std::size_t>(row) * nk + kk) * 16);
+  dst[0] = packed.u[0];
+  dst[1] = packed.u[1];
+}
+
+template<gufo::core::GgmlType Type, int Ablate>
+void LaunchFp16W(const void* w, const short* x, float* y, std::size_t batch,
+                 std::size_t m, std::size_t k, hipStream_t stream,
+                 const short* w16) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr,
+                                  reinterpret_cast<const void*>(w16));
+}
+
+template<gufo::core::GgmlType Type>
+void RunFp16W(std::size_t m, std::size_t k, std::size_t batch,
+              unsigned iterations, int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k);
+  DeviceBuffer<short> half_x(batch * k);
+  DeviceBuffer<short> w16(m * k);
+  DeviceBuffer<float> y_a(batch * m), y_b(batch * m);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  {
+    const unsigned n = static_cast<unsigned>((m * (k / 16) + 255) / 256);
+    DequantWeightsToFp16<Type><<<n, 256>>>(weights.data(), w16.data(),
+                                           static_cast<int>(m),
+                                           static_cast<int>(k));
+    HIP_CHECK(hipDeviceSynchronize());
+  }
+  // Correctness: the same shape through both kernels, compared exactly.
+  LaunchFp16W<Type, 16>(weights.data(), half_x.data(), y_a.data(), batch, m, k,
+                        nullptr, nullptr);
+  LaunchFp16W<Type, 16 | 16777216>(weights.data(), half_x.data(), y_b.data(),
+                                   batch, m, k, nullptr, w16.data());
+  HIP_CHECK(hipDeviceSynchronize());
+  {
+    std::vector<float> ha(batch * m), hb(batch * m);
+    HIP_CHECK(hipMemcpy(ha.data(), y_a.data(), sizeof(float) * ha.size(),
+                        hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hb.data(), y_b.data(), sizeof(float) * hb.size(),
+                        hipMemcpyDeviceToHost));
+    double worst = 0.0;
+    std::size_t mismatch = 0, nonfinite = 0;
+    for (std::size_t i = 0; i < ha.size(); ++i) {
+      if (!std::isfinite(ha[i]) || !std::isfinite(hb[i])) { ++nonfinite; continue; }
+      const double d = std::fabs(double(ha[i]) - double(hb[i]));
+      if (d > worst) worst = d;
+      if (ha[i] != hb[i]) ++mismatch;
+    }
+    std::printf("fp16w check: worst_abs=%.6g bit_mismatch=%zu/%zu nonfinite=%zu\n",
+                worst, mismatch, ha.size(), nonfinite);
+    std::fflush(stdout);
+  }
+  const auto timed = [&](int v) {
+    for (unsigned i = 0; i < 2; ++i)
+      if (v == 0)
+        LaunchFp16W<Type, 16>(weights.data(), half_x.data(), y_a.data(), batch, m, k, nullptr, nullptr);
+      else
+        LaunchFp16W<Type, 16 | 16777216>(weights.data(), half_x.data(), y_b.data(), batch, m, k, nullptr, w16.data());
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i)
+      if (v == 0)
+        LaunchFp16W<Type, 16>(weights.data(), half_x.data(), y_a.data(), batch, m, k, nullptr, nullptr);
+      else
+        LaunchFp16W<Type, 16 | 16777216>(weights.data(), half_x.data(), y_b.data(), batch, m, k, nullptr, w16.data());
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  const char* names[2] = {"quantised", "fp16_weights"};
+  for (int round = 0; round < 5; ++round) {
+    for (int i = 0; i < 2; ++i) {
+      const int idx = (i + round) % 2;
+      const double ms = timed(idx);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("fp16w type=%s arm=%s round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchFp16W(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                   unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunFp16W<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ5_K:
+      RunFp16W<GgmlType::kQ5_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ6_K:
+      RunFp16W<GgmlType::kQ6_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ8_0:
+      RunFp16W<GgmlType::kQ8_0>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "fp16w sweep covers q4k, q5k, q6k, q8_0\n");
+      return;
+  }
+}
+
 void DispatchStore(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
                    unsigned iterations, int pattern) {
   using gufo::core::GgmlType;
@@ -2011,6 +2160,8 @@ int main(int argc, char** argv) {
   if (gbdb) name = name.substr(5);
   const bool decsweep = name.rfind("dec:", 0) == 0;
   if (decsweep) name = name.substr(4);
+  const bool fp16w = name.rfind("fp16w:", 0) == 0;
+  if (fp16w) name = name.substr(6);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -2061,6 +2212,8 @@ int main(int argc, char** argv) {
           DispatchGbDb(entry.type, m, k, batch, iterations, pattern);
         else if (decsweep)
           DispatchDec(entry.type, m, k, batch, iterations, pattern);
+        else if (fp16w)
+          DispatchFp16W(entry.type, m, k, batch, iterations, pattern);
 #ifdef GUFO_FP16_PROTO_CLOCK
         else if (proto)
           DispatchProto(entry.type, m, k, batch);
