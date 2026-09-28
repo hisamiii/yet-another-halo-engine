@@ -256,21 +256,30 @@ void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
   // every B fragment load ahead of the MMA block, which is the pipelining
   // question -- the shipped order consumes each B fragment back to back, with a
   // load-to-use distance of zero.
-  const int values[4] = {16, 256, 4096, 2048};
-  const char* names[4] = {"iglp0", "fetchmid", "batchB", "iglp1"};
+  // Phase pricing. 16 is the control. Bit 1 drops the K-loop barrier, 2 the
+  // register->LDS commit, 4 the global fetch, 8 the epilogue store. They
+  // produce wrong results on purpose; the point is to price each phase against
+  // the phase clock, which says staging plus barriers is 16% and the untimed
+  // prologue/epilogue another 14%.
+  const int values[5] = {16, 1, 2, 4, 8};
+  const char* names[5] = {"control", "noBarrier", "noCommit", "noFetch",
+                          "noStore"};
   const auto launch = [&](int variant) {
-    if (variant == 16)
+    if (variant == 1)
+      LaunchAblate<Type, 1>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                            nullptr);
+    else if (variant == 2)
+      LaunchAblate<Type, 2>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                            nullptr);
+    else if (variant == 4)
+      LaunchAblate<Type, 4>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                            nullptr);
+    else if (variant == 8)
+      LaunchAblate<Type, 8>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                            nullptr);
+    else
       LaunchAblate<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m,
                              k, nullptr);
-    else if (variant == 256)
-      LaunchAblate<Type, 256>(weights.data(), half_x.data(), y.data(), batch, m,
-                              k, nullptr);
-    else if (variant == 4096)
-      LaunchAblate<Type, 4096>(weights.data(), half_x.data(), y.data(), batch, m,
-                               k, nullptr);
-    else
-      LaunchAblate<Type, 2048>(weights.data(), half_x.data(), y.data(), batch, m,
-                               k, nullptr);
   };
   const auto timed = [&](int variant) {
     for (unsigned i = 0; i < 2; ++i) launch(variant);
@@ -282,9 +291,9 @@ void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
     return std::chrono::duration<double, std::milli>(stop - start).count() /
            iterations;
   };
-  for (int round = 0; round < 4; ++round) {
-    for (int i = 0; i < 4; ++i) {
-      const int idx = (i + round) % 4;
+  for (int round = 0; round < 5; ++round) {
+    for (int i = 0; i < 5; ++i) {
+      const int idx = (i + round) % 5;
       const double ms = timed(values[idx]);
       const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
                             (ms * 1e9);

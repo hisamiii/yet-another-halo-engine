@@ -408,6 +408,49 @@ thread -- a WMMA is a wave operation, and counting threads reports 35x the
 ceiling. And the fragment index needs an opaque barrier: (s*6+f)&63 has period
 32 steps, so without it the compiler folds the whole loop into a multiply.
 
+### The staging chain is the deficit, and it is stall-bound
+
+Disabling individual phases by ablation prices them, and the answer is not the
+K loop:
+
+| ablation | Q4_K | IQ3_XXS |
+| --- | ---: | ---: |
+| control | 40.66 | 33.60 |
+| no commit (register -> LDS) | **53.62** | **52.00** |
+| no fetch (global -> register) | 40.87 | 37.93 |
+| no barrier | 40.58 | 33.78 |
+| no store | 34.66 | 32.60 |
+
+Removing the commit is worth **+32% (Q4_K) and +55% (IQ3_XXS)**. That number must
+not be read as the LDS write cost, for two reasons, both checked.
+
+First, the replica: adding the commit's LDS writes to the synthetic loop leaves
+it at 94-96% of ceiling against 95-98% for reads alone, so LDS writes are
+essentially free here and the write-contention account is wrong.
+
+Second, and this is the trap: **with the commit gone, ra and rb have no
+consumer**, so the compiler deletes the global loads and the decode with it. The
+ablation prices the entire staging chain at once -- global load, decode and LDS
+store -- including the latency stalls in it. The phase clock cannot see this: it
+counts *issue* cycles per phase and reported fetch at 4.2% and commit at 7.1%,
+while removing the chain they belong to is worth 32-55%. Issue cycles are not
+stall cycles.
+
+So the corrected target is the staging chain, and it is **stall-bound rather than
+issue-bound**. That is why every inner-loop change measured neutral while the K
+loop already sits at 95%-plus of its own limit: the kernel is waiting on global
+weight loads and their decode, and the K loop is not the thing to optimise.
+
+The move that follows is to overlap the staging with the compute, which is what
+double-buffering would do -- and the upstream log records that as blocked by
+registers rather than LDS. That constraint deserves re-deriving in this engine
+rather than inheriting, since a different engine is free to spend registers
+differently.
+
+The noStore arm is invalid in the other direction: it stays *slower* than the
+control, because the store lambda keeps the accumulators live and compares them
+instead of discarding them.
+
 ### The alternative instruction classes are all slower
 
 Everything on this page is a tile GEMM on WMMA. The last open algorithmic
