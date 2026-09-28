@@ -375,6 +375,39 @@ exceed the VGPR budget or the 1024-thread limit. With WMMA = WRS*WTS and LDS
 reads = WRS + WTS, an 8-accumulator tile needs 6 reads however it is split, so
 the current split is already the minimum for this shape.
 
+### The K loop is already near its own limit; the deficit is everything else
+
+The phase profile above shows the K loop taking 69% of the block and staging
+plus barriers about 16%, which reads as "optimise the K loop". A synthetic
+replica of the K loop's own instruction pattern says otherwise. With the same
+mix -- twelve ds_read_b128 feeding eight WMMA per step, six fragments, eight
+accumulator chains -- but ideal conflict-free LDS and nothing else, at three grid
+sizes (engine/gpu/klook_replica.hip, built with build_gpu.sh klook_replica):
+
+| blocks | waves | TFLOPS | share of the 48.35 ceiling |
+| ---: | ---: | ---: | ---: |
+| 40 | 320 | 42.70 | 88% |
+| 160 | 1280 | 42.52 | 88% |
+| 640 | 5120 | 45.59 | 94% |
+
+So the K loop's instruction mix is not the limit: it reaches 88-94% of the
+ceiling by itself. And 94% of the 69% the K loop occupies is 65%, which is the
+66% the whole kernel measures. **The K loop is already running at 90%-plus of
+what it can do, and the deficit is the other 31% of the block**: commit 7.1%,
+barrier 4.5%, fetch 4.2%, prologue and epilogue about 14%.
+
+That inverts the target. The work is not the inner loop, it is the staging and
+the epilogue -- which is also why every inner-loop change above measured
+neutral. The epilogue is the largest single item at ~14%, and one part of it is
+concrete: the kStore path writes its output as **fp32**, 143 MB for one FFN gate
+GEMM, which at 187 GB/s is about 7.6% of that GEMM on its own. The kSwiGLU path
+already writes fp16 for the same shape.
+
+Two harness notes so this is reproducible. The MAC count is per **wave**, not per
+thread -- a WMMA is a wave operation, and counting threads reports 35x the
+ceiling. And the fragment index needs an opaque barrier: (s*6+f)&63 has period
+32 steps, so without it the compiler folds the whole loop into a multiply.
+
 ### The alternative instruction classes are all slower
 
 Everything on this page is a tile GEMM on WMMA. The last open algorithmic
