@@ -1908,6 +1908,116 @@ void DispatchFp16W(GgmlType type, std::size_t m, std::size_t k, std::size_t batc
   }
 }
 
+
+// Single-arm runner, so one configuration can be profiled per process. The
+// counter suite on this part only returns one PMC per run, and a multi-arm mode
+// would have to be untangled by dispatch order; one arm per process removes that.
+template<gufo::core::GgmlType Type, int Ablate>
+void LaunchOne(const void* w, const short* x, float* y, std::size_t batch,
+               std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type, int BM, int BN, int WM, int WN, int BKDepth>
+void LaunchOneT(const void* w, const short* x, float* y, std::size_t batch,
+                std::size_t m, std::size_t k, hipStream_t stream, int ablate) {
+  const dim3 grid(static_cast<unsigned>((batch + BN - 1) / BN),
+                  static_cast<unsigned>((m + BM - 1) / BM));
+  switch (ablate) {
+    case 16:
+      gufo::hip::HalfPrefillGemmKernel<BM, BN, WM, WN, Type,
+                                       gufo::hip::HalfEpilogue::kStore, false,
+                                       Type, BKDepth, 16>
+          <<<grid, WM * WN * 32, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+      break;
+    case 16432:
+      gufo::hip::HalfPrefillGemmKernel<BM, BN, WM, WN, Type,
+                                       gufo::hip::HalfEpilogue::kStore, false,
+                                       Type, BKDepth, 16432>
+          <<<grid, WM * WN * 32, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+      break;
+    default:
+      std::fprintf(stderr, "one: tile run supports ablate 16 / 16432 only\n");
+      break;
+  }
+}
+
+template<gufo::core::GgmlType Type>
+void RunOne(std::size_t m, std::size_t k, std::size_t batch, unsigned iterations,
+            int pattern, int ablate, int tile_sel) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const int tile = tile_sel;
+  const auto launch = [&] {
+    if (tile == 1) { LaunchOneT<Type, 256, 256, 8, 4, 2>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
+    if (tile == 2) { LaunchOneT<Type, 128, 128, 4, 4, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
+    if (tile == 3) { LaunchOneT<Type, 128, 128, 8, 4, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
+    switch (ablate) {
+      case 16: LaunchOne<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 48: LaunchOne<Type, 48>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 80: LaunchOne<Type, 80>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 1: LaunchOne<Type, 1>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 2: LaunchOne<Type, 2>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 4: LaunchOne<Type, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 32784: LaunchOne<Type, 32784>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 16400: LaunchOne<Type, 16400>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 16432: LaunchOne<Type, 16432>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 524304: LaunchOne<Type, 524304>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 8388624: LaunchOne<Type, 8388624>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      default: std::fprintf(stderr, "one: unsupported ablate %d\n", ablate); break;
+    }
+  };
+  for (unsigned i = 0; i < 2; ++i) launch();
+  HIP_CHECK(hipDeviceSynchronize());
+  const auto start = std::chrono::steady_clock::now();
+  for (unsigned i = 0; i < iterations; ++i) launch();
+  HIP_CHECK(hipDeviceSynchronize());
+  const auto stop = std::chrono::steady_clock::now();
+  const double ms =
+      std::chrono::duration<double, std::milli>(stop - start).count() / iterations;
+  std::printf("one type=%s ablate=%d ms=%.6f tflops=%.2f\n", TypeName(Type),
+              ablate, ms, (2.0 * m * k * batch) / (ms * 1e9));
+}
+
+void DispatchOne(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                 unsigned iterations, int pattern, int ablate, int tile_sel) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunOne<GgmlType::kQ4_K>(m, k, batch, iterations, pattern, ablate, tile_sel);
+      return;
+    case GgmlType::kQ5_K:
+      RunOne<GgmlType::kQ5_K>(m, k, batch, iterations, pattern, ablate, tile_sel);
+      return;
+    case GgmlType::kQ6_K:
+      RunOne<GgmlType::kQ6_K>(m, k, batch, iterations, pattern, ablate, tile_sel);
+      return;
+    case GgmlType::kQ8_0:
+      RunOne<GgmlType::kQ8_0>(m, k, batch, iterations, pattern, ablate, tile_sel);
+      return;
+    default:
+      std::fprintf(stderr, "one: covers q4k, q5k, q6k, q8_0\n");
+      return;
+  }
+}
+
 void DispatchStore(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
                    unsigned iterations, int pattern) {
   using gufo::core::GgmlType;
@@ -2162,6 +2272,8 @@ int main(int argc, char** argv) {
   if (decsweep) name = name.substr(4);
   const bool fp16w = name.rfind("fp16w:", 0) == 0;
   if (fp16w) name = name.substr(6);
+  const bool one = name.rfind("one:", 0) == 0;
+  if (one) name = name.substr(4);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -2214,6 +2326,10 @@ int main(int argc, char** argv) {
           DispatchDec(entry.type, m, k, batch, iterations, pattern);
         else if (fp16w)
           DispatchFp16W(entry.type, m, k, batch, iterations, pattern);
+        else if (one)
+          DispatchOne(entry.type, m, k, batch, iterations, pattern,
+                      argc > 8 ? std::stoi(argv[8]) : 16,
+                      argc > 9 ? std::stoi(argv[9]) : 0);
 #ifdef GUFO_FP16_PROTO_CLOCK
         else if (proto)
           DispatchProto(entry.type, m, k, batch);

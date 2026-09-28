@@ -1090,3 +1090,91 @@ the Q4_K wash. Against that, per-layer materialisation costs 510 MiB for the FFN
 and 731 MiB for a whole layer on a 24 GiB budget. Paying memory for a wash, or a
 loss, is the wrong trade.
 
+
+## Instrumentation: what actually works on gfx1151
+
+Two things were wrong with the profiling earlier in this document, and both cost
+real time.
+
+**PC sampling is unavailable.** `rocprofv3-avail list --pc-sampling` reports no
+agents on gfx1151, so per-instruction stall attribution is not possible. Every
+conclusion has to come from counters plus controlled experiments.
+
+**Only one PMC is collected per `rocprofv3` run.** Passing several `--pmc`
+flags does not collect several counters: all but one are silently dropped and the
+run still exits 0. My earlier multi-counter attempts returned a single counter and
+I read that as "the counter is unsupported". Run one counter per invocation. The
+suite that works:
+
+```
+SQ_INSTS_VALU  SQ_INSTS_SALU  SQ_INSTS_LDS  SQ_INSTS_SMEM  SQ_INSTS_FLAT
+SQ_INSTS_WAVE32_VALU  SQ_INSTS_WAVE32_LDS  VALUInsts  SALUInsts
+GRBM_COUNT  SQ_WAVE_CYCLES  SQ_WAVES  SQ_BUSY_CYCLES  GPUBusy
+MemUnitBusy  L2CacheHit  OccupancyPercent  MeanOccupancyPerCU
+TA_BUSY_avr  LDSBankConflict
+```
+
+Two caveats found the hard way. `MeanOccupancyPerCU` and `OccupancyPercent`
+return **0** when the kernel is short -- a 40-block launch at 0.65 ms reports
+nothing -- so they can only be read at production grid size. And the occupancy
+metric equals `SQ_WAVE_CYCLES / (GRBM_COUNT * cu_count)`, which is a
+wave-residency average, not a stall-weighted one.
+
+### The production kernel, measured
+
+Per dispatch, Q4_K 256x256 BK=4, M=17408 K=5120 batch=2048:
+
+| counter | value | reading |
+| --- | ---: | --- |
+| `GRBM_COUNT` | 23.67 M cyc | 8.45 ms, matches wall clock |
+| `MeanOccupancyPerCU` | **15.59 waves** | of 32 slots = 49% |
+| `SQ_WAVE_CYCLES` | 1.4846e10 | /(GRBM_COUNT x 40) = 15.68, confirms the metric |
+| `SQ_INSTS_VALU` | 195.4 M | 140 per warp per stage |
+| `SQ_INSTS_LDS` | 72.4 M | 48 per warp per stage |
+| `SQ_INSTS_SALU` | 10.7 M | |
+| `MemUnitBusy` | 30.8% | memory pipe not saturated |
+| `L2CacheHit` | 77.5% | |
+| `LDSBankConflict` | 0 | confirms the swizzle |
+
+VALU outnumbers LDS 2.7:1 and WMMA 4.4:1, so the issue stream is dominated by the
+decode and addressing, not the matrix work. Issue is only ~15% occupied, so the
+kernel is stall-bound.
+
+### Occupancy is gated by LDS -- and raising it does not pay
+
+`max_waves_per_simd` is 16 and a 1024-thread block is 32 waves, so one block
+fills half the wave slots; a second block would fill them. LDS is 64 KiB per CU
+and the staging arrays are the whole 64 KiB, so only one block is ever resident.
+Measured across tiles and staging sizes:
+
+| config | LDS | VGPR | waves/CU | occ% | ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 256x256 BK4 1024t (production) | 65536 | 192 | 15.69 | 48.6 | 9.209 |
+| 256x256 BK4 no staging | 0 | 104 | 15.66 | 48.8 | 7.331 |
+| 256x256 BK2 1024t | 32768 | 152 | 21.46 | 66.9 | 10.894 |
+| 256x256 BK2 no staging | 0 | 96 | 31.39 | 98.2 | 7.563 |
+| 128x128 BK4 512t | 32768 | 112 | 29.25 | 90.1 | 10.758 |
+| 128x128 BK4 512t no staging | 0 | 72 | 33.56 | 105.0 | 7.908 |
+
+Occupancy does track LDS: halving the staging takes it from 49% to 67-90%, and
+removing it takes it to 98-105%. **But every configuration with higher occupancy
+is slower.** BK=2 buys 18 points of occupancy and loses 18% of wall clock; the
+128x128 512-thread tile buys 41 points and loses 17%. Shrinking the staging to fit
+a second block also halves the arithmetic intensity, and the extra LDS traffic per
+MAC costs more than the latency hiding returns.
+
+That is also why the ablation lattice read as it did. At *equal* occupancy (48.6%
+vs 48.8%) removing the staging work is worth 20% (9.209 -> 7.331), so the cost is
+the work and not the occupancy. The arms that dropped the work and the arms that
+dropped the array are not separable by occupancy, and the ones that raised
+occupancy were never faster.
+
+**Conclusion.** The kernel sits at a real local optimum: 64 KiB of staging is what
+caps occupancy at ~50%, and 64 KiB of staging is also what buys the arithmetic
+intensity that makes the 256x256 tile efficient. Nothing measured so far moves
+either term without paying more on the other. Any further attempt has to break
+that coupling -- sustain 256x256 reuse at BK=4 while presenting less than 32 KiB
+of LDS per block -- which is what a warp-specialised or register-staged design
+would have to do, and the counters now make it possible to tell whether such a
+design actually works.
+
