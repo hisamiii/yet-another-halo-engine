@@ -241,3 +241,40 @@ ramp rather than submission.
 What native HRX would actually change is codegen, and that needs kernels produced by
 the Loom/MLIR/TileLang path -- the same path the NPU work requires. That is the
 investment worth considering, and it is separable from the runtime switch.
+
+## Dispatch and kernel boundaries are not levers, under either runtime
+
+The ~4% GPU idle looked like submission overhead, and if it were, a persistent
+kernel driven by grid syncs would recover it. Both halves of that are now measured
+and both are negative. `engine/gpu/gridsync_bench.hip` carries the probe.
+
+**One grid sync costs 0.71 us and works on both runtimes.** Cooperative launch
+succeeds under ROCm 7.2.4 and under HRX, the hand-rolled sense-reversing barrier
+verifies (`counter=OK`, no hang), and the barrier costs 0.709 us on ROCm and
+0.713 us on HRX against 0.073 us of per-iteration work. So the primitive itself is
+cheap -- ~150x cheaper than the 108 us per-dispatch gap that the idle figures
+implied.
+
+**But a kernel boundary costs nothing when the kernel has real work.** Running
+identical work as 200 dependent kernel launches or as one cooperative kernel with
+200 grid syncs, at 200 us of work per iteration:
+
+| runtime | chain | persist | boundary saved | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| ROCm 7.2.4 | 206.910 us/iter | 207.848 us/iter | **-0.938 us/iter** | 0.995x |
+| HRX + ROCm 10.0.0 | 208.959 us/iter | 208.559 us/iter | **+0.400 us/iter** | 1.002x |
+
+The next launch is submitted asynchronously while the current kernel runs, so the
+boundary is fully hidden at this work size. Persistent kernels therefore gain
+nothing, and the cooperative/persistent direction is closed.
+
+Together with `launch_bench` (2.4-3.1 us submission, 0.16% of a prefill) this
+closes submission as an explanation for the idle at **both** scales. What remains
+is clock accounting or genuine host-side gaps -- the dispatch trace's only two
+large timestamp deltas were the weight-upload buffers, which is the direction to
+look next. It also means the HRX-specific surface has nothing to offer here: its
+HIP path matches ROCm, and its native path is a codegen question, not a runtime one.
+
+**So tuning returns to the kernels.** The largest identified item is still the
+DeltaNet recurrence at ~12.6x worse FLOPs per unit time than the GEMM next to it,
+which is a shape problem (chunk the token axis), not a scheduling one.
