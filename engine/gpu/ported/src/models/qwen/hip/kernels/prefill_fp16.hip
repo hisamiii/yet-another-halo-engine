@@ -39,6 +39,56 @@ __device__ __forceinline__ void StoreSwizzled(short* p, uint4 lo, uint4 hi,
   reinterpret_cast<uint4*>(p)[shift ^ 1] = hi;
 }
 
+// Same 32 bytes and the same swizzle as StoreSwizzled, reached with a different
+// number of DS store instructions: 2 x ds_store_b128, 4 x ds_store_b64 or
+// 8 x ds_store_b32. Ablation 131072 selects b64 and 262144 selects b32, so the
+// store byte volume is held constant while the DS instruction count doubles and
+// then quadruples -- which separates "the store costs what it moves" from "the
+// store costs what it issues".
+template<int Width>
+__device__ __forceinline__ void StoreSwizzledWidth(short* p, uint4 lo, uint4 hi,
+                                                   unsigned row) {
+  const unsigned shift = (row ^ (row >> 2)) & 1;
+  if constexpr (Width == 128) {
+    reinterpret_cast<uint4*>(p)[shift] = lo;
+    reinterpret_cast<uint4*>(p)[shift ^ 1] = hi;
+  } else if constexpr (Width == 64) {
+    const uint2 lo2[2] = {make_uint2(lo.x, lo.y), make_uint2(lo.z, lo.w)};
+    const uint2 hi2[2] = {make_uint2(hi.x, hi.y), make_uint2(hi.z, hi.w)};
+    uint2* q = reinterpret_cast<uint2*>(p);
+    q[(2 * shift) + 0] = lo2[0];
+    q[(2 * shift) + 1] = lo2[1];
+    q[(2 * (shift ^ 1)) + 0] = hi2[0];
+    q[(2 * (shift ^ 1)) + 1] = hi2[1];
+  } else {
+    const unsigned lo4[4] = {lo.x, lo.y, lo.z, lo.w};
+    const unsigned hi4[4] = {hi.x, hi.y, hi.z, hi.w};
+    unsigned* q = reinterpret_cast<unsigned*>(p);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) q[(4 * shift) + i] = lo4[i];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) q[(4 * (shift ^ 1)) + i] = hi4[i];
+  }
+}
+
+template<int Ablate>
+__device__ __forceinline__ void StoreCommit(short* p, uint4 lo, uint4 hi,
+                                            unsigned row) {
+  // Ablation 524288: both staging regions and both store streams stay, but each
+  // writes only its low 16 bytes -> 32 B/thread/stage with the same regions
+  // touched. Together with bit 32 (one region, 32 B) this separates "the store
+  // costs what it moves" from "the store costs because both arrays are written".
+  if constexpr ((Ablate & 524288) != 0) {
+    const unsigned shift = (row ^ (row >> 2)) & 1;
+    reinterpret_cast<uint4*>(p)[shift] = lo;
+  } else if constexpr ((Ablate & 262144) != 0)
+    StoreSwizzledWidth<32>(p, lo, hi, row);
+  else if constexpr ((Ablate & 131072) != 0)
+    StoreSwizzledWidth<64>(p, lo, hi, row);
+  else
+    StoreSwizzled(p, lo, hi, row);
+}
+
 struct HalfWeights {
   uint4 low, high;
 };
@@ -485,13 +535,13 @@ __launch_bounds__(WM * WN * 32) __global__
         for (int j = 0; j < 16; ++j)
           packed.f[j] = static_cast<_Float16>(__fsub_rn(
               __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
-        StoreSwizzled(dst, packed.u[0], packed.u[1], row);
+        StoreCommit<Ablate>(dst, packed.u[0], packed.u[1], row);
       } else if constexpr (CacheIqHeader &&
                            UpType == gufo::core::GgmlType::kIQ4_XS) {
         const auto packed = DecodeIqRaw(raw_iq[p]);
-        StoreSwizzled(dst, packed.low, packed.high, row);
+        StoreCommit<Ablate>(dst, packed.low, packed.high, row);
       } else {
-        StoreSwizzled(dst, ra[p][0], ra[p][1], row);
+        StoreCommit<Ablate>(dst, ra[p][0], ra[p][1], row);
       }
     }
   };
@@ -523,14 +573,14 @@ __launch_bounds__(WM * WN * 32) __global__
                                 "+v"(packed.u[1].x), "+v"(packed.u[1].y),
                                 "+v"(packed.u[1].z), "+v"(packed.u[1].w));
           } else {
-            StoreSwizzled(dst, packed.u[0], packed.u[1], row);
+            StoreCommit<Ablate>(dst, packed.u[0], packed.u[1], row);
           }
         } else if constexpr (CacheIqHeader &&
                              Type == gufo::core::GgmlType::kIQ4_XS) {
           const auto packed = DecodeIqRaw(raw_iq[p]);
-          StoreSwizzled(dst, packed.low, packed.high, row);
+          StoreCommit<Ablate>(dst, packed.low, packed.high, row);
         } else
-          StoreSwizzled(dst, ra[p][0], ra[p][1], row);
+          StoreCommit<Ablate>(dst, ra[p][0], ra[p][1], row);
       }
     }
 #pragma unroll
@@ -543,7 +593,14 @@ __launch_bounds__(WM * WN * 32) __global__
         if (idx < BN * BK) {
           const int placed = (row ^ (ks & 3));
           short* dst = &s_b[buf][ks][placed / 16][placed % 16][0];
-          StoreSwizzled(dst, rb[p][0], rb[p][1], row);
+          // Ablation 32768: same 64 B and the same four store instructions, but
+          // re-based into s_a so only one staging array is ever written.
+          if constexpr ((Ablate & 32768) != 0)
+            dst = reinterpret_cast<short*>(
+                reinterpret_cast<char*>(&s_a[buf][0][0][0][0]) +
+                (reinterpret_cast<char*>(dst) -
+                 reinterpret_cast<char*>(&s_b[buf][0][0][0][0])));
+          StoreCommit<Ablate>(dst, rb[p][0], rb[p][1], row);
         }
       }
     }

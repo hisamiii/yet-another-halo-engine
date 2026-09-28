@@ -810,3 +810,59 @@ and still beats 31 TF is either not measuring the same thing or has moved the
 cost into the K loop; a change that removes the staging stores must come back
 near 50 TF (the K-loop-only arm) to be believed.
 
+
+### The store cost is triggered by writing two regions, not by traffic
+
+The obvious next cut is: does the penalty track DS store **bytes** or DS store
+**instruction count**? Holding the tile and shape fixed, the commit's 32 bytes per
+call can be reached with 2 x ds_store_b128, 4 x ds_store_b64 or 8 x ds_store_b32
+(the swizzle is identical), so bytes are constant while the instruction count
+doubles and then quadruples:
+
+| arm | DS stores/thread/stage | bytes | ms |
+| --- | ---: | ---: | ---: |
+| b128_64B | 4 | 64 | 12.3 |
+| b64_64B | 8 | 64 | 12.1 |
+| b32_64B | 16 | 64 | 11.9 |
+| b128_32B | 2 | 32 | 8.12 |
+| b64_32B | 4 | 32 | 8.10 |
+| b32_32B | 8 | 32 | 8.07 |
+
+Within a byte row the time is **flat across a 4x change in store instruction
+count**, so instruction issue is not the mechanism. Bytes do correlate -- but then
+the byte model fails immediately, because it is not the bytes either:
+
+| arm | arrays written | bytes | DS stores | ms |
+| --- | --- | ---: | ---: | ---: |
+| none | - | 0 | 0 | 8.48 |
+| halfA | s_b only | 32 | 2 | 8.74 |
+| sameRegion | s_a twice | **64** | **4** | **8.89** |
+| halfB | s_a only | 32 | 2 | 9.40 |
+| bothHalf | s_a + s_b | 32 | 2 | 12.10 |
+| full | s_a + s_b | 64 | 4 | 13.67 |
+
+\`sameRegion\` writes twice the bytes with twice the store instructions of
+\`halfA\` -- identical to \`full\`'s traffic -- and costs 8.89 ms, barely above no
+stores at all. \`bothHalf\` writes half of \`full\`'s bytes with half its store
+instructions and still costs 12.10 ms. Writing the same staging array twice is
+nearly free; writing the second array at all costs ~4 ms.
+
+That is not a footprint effect: the same absolute ~4.3 ms appears at BK=2, where
+both staging tiles are half the size and the whole working set is 32 KiB.
+
+| arm | stores | ms |
+| --- | --- | ---: |
+| bk4 none | off | 7.7 |
+| bk2 none | off | 7.8 |
+| bk4 full | on | 11.9 |
+| bk2 full | on | 12.5 |
+
+So the deficit is a **two-region** effect with an approximately fixed absolute
+cost, and it survives every one of: store width, store count, store bytes, LDS
+footprint size, bank conflicts, barriers and double buffering.
+
+**Falsifier:** any change that keeps both staging arrays separate and still runs
+under ~10 ms at this shape falsifies the two-region reading; the reduction must
+come from not writing a second distinct array, not from writing the two cheaper.
+
+

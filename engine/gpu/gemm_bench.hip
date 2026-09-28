@@ -929,6 +929,269 @@ void DispatchSched(GgmlType type, std::size_t m, std::size_t k, std::size_t batc
   }
 }
 
+
+// Store-instruction vs store-byte sweep. The commit's store byte volume is held
+// constant while the number of DS store instructions changes (2 x b128, 4 x b64,
+// 8 x b32 per call), and then the same ladder is repeated at half the bytes by
+// dropping the weight-store half. The grid is (instructions, bytes):
+//
+//   b128_64B  16       (4, 64)      b128_32B  48       (2, 32)
+//   b64_64B   131088   (8, 64)      b64_32B   131120   (4, 32)
+//   b32_64B   262160   (16, 64)     b32_32B   262192   (8, 32)
+//
+// If the penalty tracks bytes, each row is flat and the 32B row is far cheaper.
+// If it tracks DS instruction count, the cost rises left to right within a row.
+template<gufo::core::GgmlType Type, int Ablate>
+void LaunchSw(const void* w, const short* x, float* y, std::size_t batch,
+              std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type>
+void RunSw(std::size_t m, std::size_t k, std::size_t batch,
+           unsigned iterations, int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const int values[6] = {16, 131088, 262160, 48, 131120, 262192};
+  const char* names[6] = {"b128_64B", "b64_64B", "b32_64B",
+                          "b128_32B", "b64_32B", "b32_32B"};
+  const auto launch = [&](int v) {
+    switch (v) {
+      case 131088: LaunchSw<Type, 131088>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 262160: LaunchSw<Type, 262160>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 48: LaunchSw<Type, 48>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 131120: LaunchSw<Type, 131120>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 262192: LaunchSw<Type, 262192>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      default: LaunchSw<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+    }
+  };
+  const auto timed = [&](int v) {
+    for (unsigned i = 0; i < 2; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  for (int round = 0; round < 6; ++round) {
+    for (int i = 0; i < 6; ++i) {
+      const int idx = (i + round) % 6;
+      const double ms = timed(values[idx]);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("sw type=%s arm=%s ablate=%d round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], values[idx], round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchSw(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunSw<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ5_K:
+      RunSw<GgmlType::kQ5_K>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "sw sweep covers q4k, q5k\n");
+      return;
+  }
+}
+
+
+// Regions x bytes. All arms move 64 B, 32 B or 0 B per thread per stage with the
+// same tile, so the only thing that changes is how much data the commit writes
+// and whether it writes both staging arrays.
+//
+//   full        16              both arrays, 64 B, 4 x b128
+//   bothHalf    524304          both arrays, 32 B (16 B per call)
+//   halfA       48              s_b only,    32 B
+//   halfB       16400           s_a only,    32 B
+//   sameRegion  32784           s_a twice,   64 B, one array
+//   none        16432           no stores
+template<gufo::core::GgmlType Type, int Ablate>
+void LaunchReg(const void* w, const short* x, float* y, std::size_t batch,
+               std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type>
+void RunReg(std::size_t m, std::size_t k, std::size_t batch,
+            unsigned iterations, int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const int values[6] = {16, 524304, 48, 16400, 32784, 16432};
+  const char* names[6] = {"full", "bothHalf", "halfA", "halfB", "sameRegion",
+                          "none"};
+  const auto launch = [&](int v) {
+    switch (v) {
+      case 524304: LaunchReg<Type, 524304>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 48: LaunchReg<Type, 48>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 16400: LaunchReg<Type, 16400>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 32784: LaunchReg<Type, 32784>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 16432: LaunchReg<Type, 16432>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      default: LaunchReg<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+    }
+  };
+  const auto timed = [&](int v) {
+    for (unsigned i = 0; i < 2; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  for (int round = 0; round < 6; ++round) {
+    for (int i = 0; i < 6; ++i) {
+      const int idx = (i + round) % 6;
+      const double ms = timed(values[idx]);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("reg type=%s arm=%s ablate=%d round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], values[idx], round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchReg(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                 unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunReg<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ5_K:
+      RunReg<GgmlType::kQ5_K>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "reg sweep covers q4k, q5k\n");
+      return;
+  }
+}
+
+
+// Cross-check of the "the write stream costs because it spans both 32 KiB LDS
+// halves" law. At BK=4 the two staging tiles are 32 KiB each and the store
+// stream spans all 64 KiB; at BK=2 they are 16 KiB each and the whole working
+// set is one half. If the law holds, the full-vs-none gap must collapse at BK=2
+// and the BK=2 floor is then set by its own stage overhead (twice the stages,
+// twice the barriers), not by the stores.
+template<gufo::core::GgmlType Type, int BKDepth, int Ablate>
+void LaunchRegBk(const void* w, const short* x, float* y, std::size_t batch,
+                 std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   BKDepth, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type>
+void RunRegBk(std::size_t m, std::size_t k, std::size_t batch,
+              unsigned iterations, int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const char* names[4] = {"bk4_full", "bk4_none", "bk2_full", "bk2_none"};
+  const auto launch = [&](int v) {
+    switch (v) {
+      case 1: LaunchRegBk<Type, 4, 16432>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 2: LaunchRegBk<Type, 2, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      case 3: LaunchRegBk<Type, 2, 16432>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+      default: LaunchRegBk<Type, 4, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
+    }
+  };
+  const auto timed = [&](int v) {
+    for (unsigned i = 0; i < 2; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  for (int round = 0; round < 4; ++round) {
+    for (int i = 0; i < 4; ++i) {
+      const int idx = (i + round) % 4;
+      const double ms = timed(idx);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("regbk type=%s arm=%s round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchRegBk(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                   unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunRegBk<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "regbk sweep covers q4k\n");
+      return;
+  }
+}
+
 void DispatchStore(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
                    unsigned iterations, int pattern) {
   using gufo::core::GgmlType;
@@ -1163,6 +1426,12 @@ int main(int argc, char** argv) {
   if (storem) name = name.substr(6);
   const bool sched = name.rfind("sched:", 0) == 0;
   if (sched) name = name.substr(6);
+  const bool swsweep = name.rfind("sw:", 0) == 0;
+  if (swsweep) name = name.substr(3);
+  const bool regsweep = name.rfind("reg:", 0) == 0;
+  if (regsweep) name = name.substr(4);
+  const bool regbk = name.rfind("regbk:", 0) == 0;
+  if (regbk) name = name.substr(6);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -1195,6 +1464,12 @@ int main(int argc, char** argv) {
           DispatchStore(entry.type, m, k, batch, iterations, pattern);
         else if (sched)
           DispatchSched(entry.type, m, k, batch, iterations, pattern);
+        else if (swsweep)
+          DispatchSw(entry.type, m, k, batch, iterations, pattern);
+        else if (regsweep)
+          DispatchReg(entry.type, m, k, batch, iterations, pattern);
+        else if (regbk)
+          DispatchRegBk(entry.type, m, k, batch, iterations, pattern);
 #ifdef GUFO_FP16_PROTO_CLOCK
         else if (proto)
           DispatchProto(entry.type, m, k, batch);
