@@ -61,6 +61,7 @@ explicitly deferred.
 | yah_ffn_gemm_q5k_f32.loom | prefill_fp16.hip | batched Q5_K FFN GEMM with in-kernel decode (kStore) | ported, 15.54 ms at m_tiles=1088; fixture exact at m_tiles=1 |
 | yah_ffn_gemm_iq4xs_f32.loom | prefill_fp16.hip | batched IQ4_XS FFN GEMM with in-kernel codebook decode (kStore) | ported, 14.64 ms at m_tiles=1088; fixture exact at m_tiles=1 |
 | yah_ffn_gemm_q8_0_f32.loom | prefill_fp16.hip | batched Q8_0 FFN GEMM with in-kernel decode (kStore) | ported, 13.38 ms at m_tiles=1088; fixture exact at m_tiles=1 |
+| yah_ffn_gemm_q6k_f32.loom | prefill_fp16.hip | batched Q6_K FFN GEMM with in-kernel split-plane decode (kStore) | ported, 17.47 ms at m_tiles=1088; decode bit-exact vs Q6KValue, case at atol/rtol 1e-5 |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -150,8 +151,8 @@ shard on disk is not a Q4_K shard: of its 866 tensors, 172 are IQ4_XS (Q4_K is
 95, Q5_K 80, Q8_0 99, Q6_K 18, IQ3_S 15, Q3_K 13, IQ4_NL 7, IQ3_XXS 5, and one
 each IQ2_XS and IQ2_S), and the IQ4_XS set includes the SSM attention
 projections. Parse the header with a GGUF tensor-type histogram before assuming
-a format is on the route. Q4_K, Q5_K, IQ4_XS and now Q8_0 have a Loom GEMM; the
-other six shard formats do not.
+a format is on the route. Q4_K, Q5_K, IQ4_XS, Q8_0 and Q6_K have a Loom GEMM;
+the other five shard formats do not.
 HalfPrefillGemmKernel is templated on the packed weight format and decodes Q4_K,
 Q5_K, Q6_K and the rest in-kernel through DecodeQuantSub16; the four ports above
 load pre-decoded fp16 weights, which is the Fp16W ablation path and whose byte
@@ -165,7 +166,7 @@ three are tuning items, explicitly deferred. The residual and SwiGLU epilogues
 have the same Q4_K port (yah_ffn_gemm_q4k_residual_f32, yah_ffn_gemm_q4k_swiglu_f16,
 23.11/16.98 ms at production size), and yah_ffn_gemm_q4k_gateup_f16 (32.03 ms)
 shares one activation tile and one output between two decoders. The remaining
-format work is the remaining shard formats (Q6_K, IQ3_S, Q3_K, IQ4_NL, IQ3_XXS,
+format work is the remaining shard formats (IQ3_S, Q3_K, IQ4_NL, IQ3_XXS,
 IQ2_XS, IQ2_S) and the residual/SwiGLU/paired epilogues for the Q5_K, IQ4_XS and
 Q8_0 store arms, which so far only have kStore.
 
@@ -353,6 +354,20 @@ Reachability evidence for the entries that are not on that route:
   `lane / 16`; writing the element loop as nested passes over `seg_hi`, `seg_lo`,
   `l16` and `lane16` supplies all three as loop variables and removes the division
   entirely. The Q5_K decoder does the same for its `/64` and `/32`.
+- **`block_q6_K` stores `d` last, not first.** `Q6KBlock` is `{ql[128]; qh[64];
+  scales[16]; half d}`, so the fp16 d view index is `blk_off/2 + 104` and ql/qh/
+  scales start at offsets 0, 128 and 192. Q4_K is the opposite (`d` first), and
+  reusing its decoder skeleton without moving the field offsets silently decodes
+  with the wrong d. A per-element Python diff against the HIP `Q6KValue` is what
+  pins the mapping, not the case outcome.
+- **The f32 MMA accumulator rounds once per 16-wide K step.** With every Q6_K
+  decode product exact in f16 and every partial sum a multiple of `2^-9`, the
+  K=5120 case still differs from the float64 oracle by up to 1.9e-6 absolute
+  (3.2e-6 relative), with half the outputs exact. That is the hardware dot
+  product, not a decode error, so the Q6_K case carries `atol(1e-5) rtol(1e-5)`
+  like Q8_0 and IQ4_XS; the all-zero production case stays at `atol(0)`.
+  A `nan(x) == nan(x)` Python comparison is also not a mismatch: guard the
+  oracle diff with `math.isnan` before flagging.
 - **`RoundActivation` in `prefill_fp16.hip` is `scalar.fptrunc`.** It is an empty
   `asm volatile` barrier followed by `__float2half_rn`, so it pins which rounding
   boundary the source sees and emits no instruction. Ports of `HalfNorm`,
