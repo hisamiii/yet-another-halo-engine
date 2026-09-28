@@ -70,6 +70,7 @@ explicitly deferred.
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
 | yah_dequant_q8k_bf16.loom | prefill_gemm.hip | Q8_K weight dequant to bf16 | ported, 0.0076 ms; exact periodic expectation |
 | yah_dequant_q8_0_bf16.loom | prefill_gemm.hip | Q8_0 weight dequant to bf16 | ported, 0.0081 ms; exact periodic expectation |
+| yah_dequant_q4k_bf16.loom | prefill_gemm.hip | Q4_K dequant to bf16 (packed 6-bit scales, no high-bit plane) | ported, 0.0068 ms at 2 blocks; bit-exact via `check.tensor.view` |
 | yah_dequant_q5k_bf16.loom | prefill_gemm.hip | Q5_K dequant to bf16 (packed 6-bit scales) | ported, 0.0078 ms; bit-exact via `check.tensor.view` |
 | yah_dequant_q6k_bf16.loom | prefill_gemm.hip | Q6_K dequant to bf16 | ported, 0.0638 ms; bit-exact via `check.tensor.view` |
 | - | prefill_gemm.hip | generic sub-16 element decoder to bf16 | deferred: a thin wrapper over the whole `QuantBlockElement` format table, not a single format |
@@ -124,12 +125,25 @@ explicitly deferred.
 
 The inventory below is a raw kernel count, not the work list. The active forward
 path is engine/model/forward.hip, and only kernels a live launcher can reach from
-there are worth porting. Every launch Prefill can make is now covered by a Loom
-port. HalfPrefillGemmKernel is the one HIP kernel that reaches the route through
-four epilogue arms, so it has four Loom ports: kStore (yah_ffn_gemm_f16),
-kResidual (yah_ffn_gemm_residual_f32), kSwiGLU (yah_ffn_gemm_swiglu_f16) and the
-paired kGateUp (yah_ffn_gemm_gateup_f16). With WmmaCausalAttention that closes
-the prefill route end to end.
+there are worth porting.
+
+Every launch Prefill can make now has a Loom kernel, and HalfPrefillGemmKernel,
+the one HIP kernel the route reaches through four epilogue arms, has four: kStore
+(yah_ffn_gemm_f16), kResidual (yah_ffn_gemm_residual_f32), kSwiGLU
+(yah_ffn_gemm_swiglu_f16) and the paired kGateUp (yah_ffn_gemm_gateup_f16).
+
+One coverage gap remains inside that kernel and it is the dominant one.
+HalfPrefillGemmKernel is templated on the packed weight format and decodes Q4_K,
+Q5_K, Q6_K and the rest in-kernel through DecodeQuantSub16. The four Loom ports
+load pre-decoded fp16 weights instead, which is the Fp16W ablation path, not the
+production arm: DirectGemm only ever instantiates quantized types, and the f16
+view is a stand-in whose byte traffic is 3.5x the real kernel. The README says so
+in the format row of the Loom GEMM table. Closing it means embedding the quant
+decode in the Loom K loop. The Q4_K decoder now exists standalone as
+yah_dequant_q4k_bf16 (bit-exact, 0.0068 ms), cloned from the Q5_K port with the
+q5 high-bit plane removed, so the remaining work is to inline it into the GEMM K
+loop rather than to write a decoder. Until that lands the prefill route is
+structurally covered but not format-faithful.
 
 Reachability evidence for the entries that are not on that route:
 
@@ -162,7 +176,7 @@ Reachability evidence for the entries that are not on that route:
 | QKV projection | qkv.hip | **ported**: Wave32FusedQKVProjectionsKernel_1Row<4> and FusedQKVProjectionsKernel, f32 arm only. **todo**: the BF16, Q8_0 and block-quantized arms (sub-16 table) |
 | fused RoPE | prefill_rope.hip | all **ported**: BatchedFusedQKNormRoPEKvWriteKernel and BatchedRoPEKernel (text path) |
 | fused.hip | fused.hip | **ported**: FusedQKNormRoPEKvWriteKernel (text path) |
-| dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
+| dequant to bf16 | prefill_gemm.hip | HIP file has Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant plus FloatToBfloat16Kernel. **ported**: Q4_K, Q5_K, Q6_K, Q8_0, Q8_K to bf16. **todo**: Q8_1, the generic sub-16 element decoder |
 | W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path), ZeroQ8ActTailKernel, BatchedFusedRMSNormQuantizeQ8_1Kernel, BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel (tiled layout + sum sidecar). W8A8BlockedWmmaGEMMKernel, BatchedQuantGEMVKernel and the same-file small-batch arms are **dead** (see the route audit). **todo**: the clip variant |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16, AtbEncodeA, AtbDecodeC (write), AtbDecodeSwiGLU. **todo**: AtbRepack(+Slice, blocked on the sub-16 quant table) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
