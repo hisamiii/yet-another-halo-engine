@@ -149,10 +149,24 @@ the one HIP kernel the route reaches through four epilogue arms, has four: kStor
 The format gap inside that kernel is partly closed. The Qwen3.8-27B-UD-Q4_K_S
 shard on disk is not a Q4_K shard: of its 866 tensors, 172 are IQ4_XS (Q4_K is
 95, Q5_K 80, Q8_0 99, Q6_K 18, IQ3_S 15, Q3_K 13, IQ4_NL 7, IQ3_XXS 5, and one
-each IQ2_XS and IQ2_S), and the IQ4_XS set includes the SSM attention
-projections. Parse the header with a GGUF tensor-type histogram before assuming
-a format is on the route. Q4_K, Q5_K, IQ4_XS, Q8_0 and Q6_K have a Loom GEMM;
-the other five shard formats do not.
+each IQ2_XS and IQ2_S). The whole-model histogram is not the right scope, though:
+`tools/gguf_route_hist.py` groups the same tensors by name with the layer index
+erased, and the three FFN weights are the ones that reach the GEMM above. Their
+195 blocks split as:
+
+| tensor   | IQ4_XS | Q4_K | Q5_K | Q6_K | IQ3_S | Q3_K | IQ3_XXS | IQ4_NL | IQ2_XS | IQ2_S |
+|----------|--------|------|------|------|-------|------|---------|--------|--------|-------|
+| ffn_gate | 35     | 7    | 7    | 1    | 5     | 6    | 3       | 0      | 1      | 0     |
+| ffn_up   | 34     | 10   | 7    | 2    | 4     | 5    | 1       | 1      | 0      | 1     |
+| ffn_down | 29     | 12   | 14   | 1    | 6     | 1    | 1       | 1      | 0      | 0     |
+| total    | 98     | 29   | 28   | 4    | 15    | 12   | 5       | 2      | 1      | 1     |
+
+So IQ4_XS, Q4_K, Q5_K and Q6_K cover 159 of 195 FFN blocks (82%); the other 36
+need IQ3_S, Q3_K, IQ3_XXS, IQ4_NL, IQ2_XS and IQ2_S ports. Q8_0 is on no FFN
+tensor in this shard (it owns only ssm_alpha/beta and a few attn_k/v), so the
+Q8_0 FFN GEMM is off the FFN route here even though prefill_fp16.hip instantiates
+it. The launcher switch at prefill_fp16.hip:1691-1722 does instantiate all six
+remaining formats, so each is reachable in principle.
 HalfPrefillGemmKernel is templated on the packed weight format and decodes Q4_K,
 Q5_K, Q6_K and the rest in-kernel through DecodeQuantSub16; the four ports above
 load pre-decoded fp16 weights, which is the Fp16W ablation path and whose byte
