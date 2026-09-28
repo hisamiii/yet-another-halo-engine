@@ -100,6 +100,37 @@ reused a stale object and both arms executed the previous binary. The cache
 check now tracks real prerequisites with `-MMD` depfiles, and the dispatch
 telemetry line is the evidence that a chosen kernel actually ran.
 
+## Long context: what actually happens at 128k
+
+128k f16 was inferred from the GTT limit and the KV formula before it was run.
+It runs. One 131072-token prompt (the 32k id file repeated four times),
+`--chunk 2048 --max-context 133120 --gen 8`, f16 KV:
+
+| depth | prefill | decode (split-K) |
+| ---: | ---: | ---: |
+| 2048 | 3.69 s cold / 4.27 s warm | 12.82 tok/s |
+| 32768 | 77.5 s cold / 91 s warm | 10.9–11.0 tok/s |
+| 131072 | **487.3 s** (269 tok/s) | **7.42 tok/s** |
+
+The argmax is 9338 at every depth and the eight generated ids are the same
+sequence at 2048, 32768 and 131072: a repeated prompt drives the same greedy
+continuation at every depth, which is a weak but real long-context check.
+
+Two things this does **not** establish. f16 cannot go much past 128k — at
+`max_context = 262144` the KV alone is 16 GiB against a 24 GiB GTT that also
+holds 12.17 GiB of weights. A 4-token probe at `--max-context 262144` with q4
+KV allocates and completes a forward, but nothing has walked 262144 keys. And
+the 487 s prefill ran at ~95 °C Tctl, so it is a thermally limited single
+sample, not a best case.
+
+A short probe at a large `max_context` is not a long-context test: it
+exercises the allocation and the KV write but never enters the attention sweep
+at that depth, which is exactly where an index-width fault would live. At
+`max_context = 131072` the f16 K plane is exactly 2³¹ elements, so the V plane
+starts at signed-int32 index 2³¹; the offsets in `prefill_rope.hip` and the
+decode attention are `std::size_t`, and the 131072-key run above is what
+demonstrates that end to end.
+
 ## Provenance
 
 - Hardware: `RYZEN AI MAX+ 395`, gfx1151, XDNA2 NPU (`aie2p`, PCI `1022:17f0`).
