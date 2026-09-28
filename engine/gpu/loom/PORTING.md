@@ -31,6 +31,7 @@ explicitly deferred.
 | yah_embed_f32.loom | embed.hip | embedding lookup (f32 table) | ported, 0.0087 ms at hidden 5120 |
 | yah_unpack_qg_f32.loom | prefill_unpack.hip | batched QG unpack | ported, 0.0149 ms at 64x5120 |
 | yah_ssm_proj_f32.loom | prefill_ssm.hip | fused SSM input projections (GEMV) | ported, 0.0102 ms |
+| yah_deltanet_rowsplit_f32.loom | ssm_row_split.hip | DeltaNet row-split recurrence | ported, 19.22 ms at batch 512 / 8 heads (untilable port; tuning deferred) |
 | - | prefill_ssm.hip, ssm_row_split.hip | DeltaNet conv/recurrence | todo |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
 | - | qkv.hip | QKV projection | todo |
@@ -54,7 +55,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 
 | Area | File | Kernels |
 | --- | --- | --- |
-| DeltaNet / SSM (5.1%) | ssm_row_split.hip | BatchedDeltaNetRowSplitKernel, BatchedDeltaNetPrepAlphaBetaKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel, BatchedSSMPostNormGateFp16Kernel |
+| DeltaNet / SSM (5.1%) | ssm_row_split.hip | BatchedDeltaNetRowSplitKernel -- **ported**; BatchedDeltaNetPrepAlphaBetaKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel, BatchedSSMPostNormGateFp16Kernel |
 | DeltaNet / SSM | ssm_recurrence.hip | BatchedDeltaNetRecurrenceKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel |
 | DeltaNet / SSM | batched_ssm.hip, ssm.hip, ssm_decode_recurrence.hip | BatchedSSMPostNormGateKernel, FusedSSMInputProjectionsKernel, SSMConvKernel, CaptureBatchedSsmReplayKernel |
 | attention (2.1%) | attention_wmma.hip | PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel |
@@ -144,3 +145,16 @@ profile gives one, so the expensive paths move first rather than the convenient 
   fp16 cannot represent, so no single `check.generate.iota` describes it. Dividing
   `h` by 16 makes the sum `992 + 2*e`, exactly representable and still an iota. The
   transform itself is unchanged; only the fixture's magnitude moves.
+- **Re-tile a tuned kernel freely for the first port; say so in the header.**
+  `BatchedDeltaNetRowSplitKernel` is templated over four orthogonal tile choices
+  with DPP reductions and LDS staging. The port picks the instantiation whose
+  `kLanesPerRow` is 1, which drops every cross-lane reduction and every barrier,
+  and documents that choice. Coverage is what the port owes; the HIP file's own
+  comments own the tiling, and a re-tile that is 20x slower is still correct.
+- **Fold the token count held constant when a recurrence would diverge.** The
+  DeltaNet state walks `sigma' = 1 - 127*sigma`, which leaves exact f32 after three
+  tokens, so the analytic case stops at two. Repeating `(alpha, beta) = (0, 1)` via
+  `check.generate.iota ... period(2)` zeroes the state readout, which decouples the
+  trajectory from its history and keeps a production-shaped case exact for any
+  batch. Use the small case to prove the state dependence and the large one to prove
+  the port holds at scale.

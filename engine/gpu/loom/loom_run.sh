@@ -47,7 +47,9 @@ REPORT=$(mktemp /tmp/loom_preflight_report.XXXXXX.json)
 if ! "$COMPILE" "$SOURCE" --root="$ROOT" --target=amdgpu:gfx11-generic --format=amdgpu-hsaco \
     "${CONFIG_FLAGS[@]}" --output=/tmp/loom_run.hsaco \
     --compile-report=details --compile-report-output="$REPORT" >/tmp/loom_run_compile.log 2>&1; then
-  grep -E 'error' /tmp/loom_run_compile.log | head -5
+  # grep exits 1 on no match and pipefail would then kill the script before the
+  # message, so this path must not be allowed to fail.
+  { grep -E 'error' /tmp/loom_run_compile.log || true; } | head -5
   echo "compile failed, see /tmp/loom_run_compile.log"
   exit 1
 fi
