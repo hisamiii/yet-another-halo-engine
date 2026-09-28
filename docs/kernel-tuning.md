@@ -87,6 +87,32 @@ and gemm_bench measures neither -- it times the kStore epilogue, while the model
 runs gate as kStore, up as kSwiGLU, down as kResidual, and nine layers as the
 paired kGateUp. The next measurement has to cover those, not the decoder.
 
+**And the mechanism is work per clock, not clock.** Re-taken with SCLK and
+package power sampled inside the prefill window (tail of the "tokens=" to
+"run 0:" bracket, so the registration and Reset() memsets are excluded):
+
+| rep | arm | ms | SCLK mean | SCLK max | power | TFLOPS | TF/MHz |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | mix | 3768.2 | 2307 | 2844 | 95.7 W | 29.35 | 0.01272 |
+| 1 | Q4_K | 3552.9 | 2216 | 2664 | 91.0 W | 31.13 | 0.01404 |
+| 2 | Q4_K | 3471.7 | 2216 | 2533 | 96.7 W | 31.85 | 0.01438 |
+| 2 | mix | 3546.8 | 2399 | 2666 | 89.0 W | 31.18 | 0.01300 |
+| 3 | mix | 3531.7 | 2396 | 2664 | 90.0 W | 31.31 | 0.01307 |
+| 3 | Q4_K | 3495.2 | 2276 | 2759 | 98.4 W | 31.64 | 0.01390 |
+
+Q4_K wins all three reps again, but by 3.1% on the means rather than 7.3%, and
+the split is the result: **Q4_K does 9.1% more work per clock** (mean TF/MHz
+0.01411 against 0.01293, ahead in every rep) while **running 5.5% lower clock**
+(2236 MHz against 2367 MHz). The two partly cancel. The lower clock is
+consistent with the pure-Q4_K artifact being 18% larger in bytes (15.39 GiB
+against 13.08 GiB): it wins on instructions per weight and loses on power per
+weight, and the operating point follows the power.
+
+That is why a wall-clock-only comparison of this pair has read anywhere from +3%
+to +8% across sessions while the work-per-clock figure sits near +9%. It is the
+concrete case behind the methodology rule: an efficiency delta and a clock delta
+are separate results, and only TF/MHz survives a session change.
+
 **What that leaves.** With per-format decoder differences mostly under 6%, the
 dominant unexplained term is the within-type efficiency gap: the ~30 TFLOPS
 aggregate against the 48.35 measured instruction ceiling. That needs a profile,
