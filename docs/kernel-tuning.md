@@ -1245,6 +1245,67 @@ instruction-stream lever on the staging path.
 The design is at the **traffic-optimal point for the LDS budget**: staging cost
 per MAC is `(BM*WN + BN*WM) / (BM*BN*BK*16)`, and under the constraint
 `(BM+BN)*BK*32 <= 65536` the shipped 256x256 BK4 maximises the denominator for
+
+## The model-level view: the kernel is not the problem
+
+Everything above is one GEMM. To find the model-level gap, a real 2048-token
+prefill was traced per dispatch. `--kernel-trace` records no durations on this
+part (`Start_Timestamp == End_Timestamp` on all 1625 rows) and its timestamps are
+*enqueue* times, not execution times -- 1602 of 1625 consecutive deltas are under
+0.1 ms and the only two large ones are the weight-upload buffers -- so kernel time
+has to come from `--pmc GRBM_COUNT`, one counter per run, aggregated per
+dispatch.
+
+Per-kernel GPU cycles for one 2048-token prefill (1625 dispatches):
+
+| category | n | ms at 2.8 GHz | share |
+| --- | ---: | ---: | ---: |
+| batched GEMM (`HalfPrefillGemmKernel`) | 487 | 2603.5 | **86.8%** |
+| GEMV (the single decode step) | 194 | 45.9 | 1.5% |
+| SSM / DeltaNet | 336 | 153.4 | 5.1% |
+| norm | 338 | 98.5 | 3.3% |
+| attention / RoPE | 96 | 61.7 | 2.1% |
+| residual add | 128 | 28.3 | 0.9% |
+| setup / convert | 26 | 4.2 | 0.1% |
+
+So the batched GEMM is 87% of GPU time. The kernel this document has been tuning
+**is** the prefill; there is no large unexamined kernel.
+
+### The GEMM is already at 79% of its clock-scaled ceiling
+
+Analytic prefill work: 24.242 B linear parameters (embed is a lookup and
+`output.weight` applies to the last token only), so 2 x 2048 x 24.242e9 = **99.3
+TFLOP** for the 2048-token pass.
+
+**The clock assumption was wrong and it matters.** The GEMM's 2603.5 ms was
+converted at 2.8 GHz; the measured clock during a real prefill is **1979 MHz**
+(mean; max 2630, min 1692, 93.1 W, Tctl 94.2 C). At the real clock the GEMM takes
+3684 ms and delivers **26.9 TFLOPS**, against a clock-scaled ceiling of
+48.35 x 1979/2809 = 34.1 TFLOPS -- **79%, the same fraction the bench kernel
+reaches.** The kernel's efficiency is clock-invariant and it is already near its
+limit.
+
+The same correction removes an apparent finding: summed GPU cycles looked like
+3000 ms of a 3650 ms wall, i.e. 18% idle. At the measured 1979 MHz those cycles
+are 4245 ms against a 4403 ms wall -- **96% GPU-busy**. There is no idle to
+recover; the 18% was the clock assumption.
+
+### What that leaves
+
+| lever | size | evidence |
+| --- | --- | --- |
+| operating clock: 1979 MHz mean against 2630-2782 observed max | **25-40%** | measured in the same window |
+| GEMM efficiency 79% -> 100% of the clock-scaled ceiling | 21% of 87% = 18% | not reachable by any of ~25 interventions |
+| non-GEMM kernels (norms, SSM, attention, residual) | 11.6% | 396 ms, unexamined |
+| decode GEMV | 1.5% | off-target |
+
+The kernel work in this document has been chasing the 18% that no intervention
+moved, while **the 25-40% sitting in the operating clock is larger and is being
+left on the table in every measurement** -- power is 93 W against a 130 W cap, so
+it is not power-limited, and the clock dips to 1692 MHz mid-run. That is a
+machine-level lever (cooling, fan policy, power profile), not a code lever, and it
+dominates everything in this document.
+
 that numerator. Shrinking LDS to fit a second block necessarily lowers that ratio,
 which is why every occupancy win is a traffic loss and every traffic loss is
 bigger than the occupancy win. Moving an operand to global instead makes the
