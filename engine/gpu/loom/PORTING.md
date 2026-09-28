@@ -44,6 +44,8 @@ explicitly deferred.
 | yah_pack_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV pack (fp16 + f32) | ported, 0.0073 ms; exact fixtures |
 | yah_sync_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV f32->fp16 prefix sync | ported, 0.0076 ms; exact fixtures |
 | yah_pack_attn_heads_f16.loom | attention_wmma.hip | pack K/V into WMMA head tiles (LDS V transpose) | ported, 0.0079 ms; fp16 fixture |
+| yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0111 ms; exact, no fixture |
+| yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0090 ms; exact, no fixture |
 | - | prefill_attention*.hip, attention_wmma.hip, attention_decode*.hip | WMMA/tiled attention compute, decode-online, split-K, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
@@ -102,7 +104,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 72 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 74 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -113,7 +115,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | attention (2.1%) | attention_wmma.hip, attention_tile.hip | **ported**: PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel. **todo**: QwenTiledAttentionKernel, WmmaCausalAttention |
 | attention | attention_batched.hip | BatchedAttentionKernel, CausalSoftmaxKernel, WriteBatchedKVCacheKernel, ApplyAttentionGateKernel |
 | attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | tiled, decode-online, split-K, and KV-write variants |
-| QKV projection | qkv.hip | FusedQKVProjectionsKernel |
+| QKV projection | qkv.hip | **ported**: Wave32FusedQKVProjectionsKernel_1Row<4> and FusedQKVProjectionsKernel, f32 arm only. **todo**: the BF16, Q8_0 and block-quantized arms (sub-16 table) |
 | fused RoPE | prefill_rope.hip | BatchedFusedQKNormRoPEKvWriteKernel, BatchedRoPEKernel |
 | fused.hip | fused.hip | FusedQKNormRoPEKvWriteKernel |
 | dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
