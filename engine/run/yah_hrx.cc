@@ -72,21 +72,8 @@ bool FmtOf(std::uint32_t type, Fmt* out) {
   }
 }
 
-struct Imported { LoomBuffer buf; std::size_t offset; std::size_t bytes; };
+struct Imported { hrx_buffer_t handle; std::size_t offset; std::size_t bytes; };
 
-Imported ImportTensor(LoomDevice& gpu, const yah::core::Gguf& gguf,
-                      const yah::core::TensorInfo& t) {
-  const std::uint8_t* data = gguf.Data(t);
-  const std::uintptr_t page = 4096;
-  const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(data) & ~(page - 1);
-  const std::size_t window = static_cast<std::size_t>(t.bytes) +
-                             (reinterpret_cast<std::uintptr_t>(data) - start);
-  Imported out;
-  out.buf = gpu.Import(reinterpret_cast<void*>(start), window);
-  out.offset = reinterpret_cast<std::uintptr_t>(data) - start;
-  out.bytes = static_cast<std::size_t>(t.bytes);
-  return out;
-}
 
 void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
@@ -187,6 +174,22 @@ int main(int argc, char** argv) {
     const std::uint32_t first = static_cast<std::uint32_t>(prompt.size());
     std::fprintf(stderr, "tokens=%u\n", first);
     LoomDevice gpu;
+    // Import the whole GGUF tensor-data region once: every tensor is an offset
+    // into it, instead of one hrx_allocator_import_buffer per dispatch.
+    LoomBuffer weights;
+    std::size_t weights_delta = 0;
+    {
+      const std::uint8_t* wbase = gguf.tensor_data_base();
+      const std::uintptr_t page = 4096;
+      const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(wbase) & ~(page - 1);
+      weights_delta = reinterpret_cast<std::uintptr_t>(wbase) - start;
+      weights = gpu.Import(reinterpret_cast<void*>(start),
+                           gguf.tensor_data_size() + weights_delta);
+    }
+    auto ImportTensor = [&](const yah::core::TensorInfo& t) -> Imported {
+      return {weights.handle, weights_delta + static_cast<std::size_t>(t.offset),
+              static_cast<std::size_t>(t.bytes)};
+    };
     std::map<std::string, LoomExecutable> exes;
     auto load = [&](const std::string& path) -> LoomExecutable& {
       auto it = exes.find(path);
@@ -285,9 +288,9 @@ int main(int argc, char** argv) {
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) throw LoomError("no kStore port for type on " + wname);
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
-      const Imported w = ImportTensor(gpu, gguf, *tw);
+      const Imported w = ImportTensor(*tw);
       LoomExecutable& exe = load(dir + "/gemm_kstore_" + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal");
-      std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
+      std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       tables(f.name, &b);
       b.push_back({scratch.handle, 0, hb(scratch)});
       b.push_back({wstage.handle, 0, hb(wstage)});
@@ -301,9 +304,9 @@ int main(int argc, char** argv) {
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) throw LoomError("no swiglu port for type on " + wname);
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
-      const Imported w = ImportTensor(gpu, gguf, *tw);
+      const Imported w = ImportTensor(*tw);
       LoomExecutable& exe = load(dir + "/gemm_swiglu_" + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal");
-      std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
+      std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       tables(f.name, &b);
       b.push_back({scratch.handle, 0, hb(scratch)});
       b.push_back({gateffn.handle, 0, hb(gateffn)});
@@ -318,9 +321,9 @@ int main(int argc, char** argv) {
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) throw LoomError("no residual port for type on " + wname);
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
-      const Imported w = ImportTensor(gpu, gguf, *tw);
+      const Imported w = ImportTensor(*tw);
       LoomExecutable& exe = load(dir + "/gemm_residual_" + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal");
-      std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
+      std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       tables(f.name, &b);
       b.push_back({input.handle, 0, hb(input)});
       b.push_back({wstage.handle, 0, hb(wstage)});
@@ -343,7 +346,7 @@ int main(int argc, char** argv) {
     const auto* ow = find("output.weight");
     LoomBuffer wnorm = gpu.Allocate(std::size_t{kHidden} * 4);
     gpu.H2D(wnorm, gguf.Data(*onw), std::size_t{kHidden} * 4);
-    const Imported owt = ImportTensor(gpu, gguf, *ow);
+    const Imported owt = ImportTensor(*ow);
 
     std::vector<std::uint32_t> gen;
     for (std::uint32_t pos = 0; pos < first + gen_count - 1; ++pos) {
@@ -462,7 +465,7 @@ int main(int argc, char** argv) {
       }
       {
         std::vector<hrx_buffer_ref_t> b = {
-            {owt.buf.handle, owt.offset, owt.bytes}, {normed.handle, 0, hb(normed)},
+            {owt.handle, owt.offset, owt.bytes}, {normed.handle, 0, hb(normed)},
             {logits.handle, 0, hb(logits)}};
         Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
       }

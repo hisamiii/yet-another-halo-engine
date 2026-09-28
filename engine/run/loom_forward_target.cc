@@ -66,24 +66,11 @@ bool FmtOf(std::uint32_t type, Fmt* out) {
 bool HasGrid(const std::string& f) { return f == "iq3s" || f == "iq3xxs"; }
 bool HasKsigns(const std::string& f) { return f == "iq3xxs"; }
 
-struct Imported { LoomBuffer buf; std::size_t offset; std::size_t bytes; };
-
-Imported ImportTensor(LoomDevice& gpu, const yah::core::Gguf& gguf,
-                      const yah::core::TensorInfo& t) {
-  const std::uint8_t* data = gguf.Data(t);
-  const std::uintptr_t page = 4096;
-  const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(data) & ~(page - 1);
-  const std::size_t window = static_cast<std::size_t>(t.bytes) +
-                             (reinterpret_cast<std::uintptr_t>(data) - start);
-  Imported out;
-  out.buf = gpu.Import(reinterpret_cast<void*>(start), window);
-  out.offset = reinterpret_cast<std::uintptr_t>(data) - start;
-  out.bytes = static_cast<std::size_t>(t.bytes);
-  return out;
-}
+struct Imported { hrx_buffer_t handle; std::size_t offset; std::size_t bytes; };
 
 int g_time = 0;
 std::map<std::string, double> g_per_name;
+std::map<std::string, int> g_per_count;
 std::chrono::steady_clock::time_point g_mark = std::chrono::steady_clock::now();
 
 void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
@@ -91,6 +78,7 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
               const std::vector<hrx_buffer_ref_t>& b) {
   if (g_time >= 2) gpu.Synchronize();
+  g_mark = std::chrono::steady_clock::now();
   gpu.Dispatch(exe, exe.OrdinalOrZero(name),
                LoomDevice::Config(gx, gy, gz, sx, sy, sz), nullptr, 0, b.data(),
                b.size());
@@ -98,7 +86,7 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
     gpu.Synchronize();
     g_per_name[name] += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - g_mark).count();
-    g_mark = std::chrono::steady_clock::now();
+    g_per_count[name]++;
   }
 }
 
@@ -167,6 +155,22 @@ int main(int argc, char** argv) {
     auto gguf = yah::core::Gguf::Open(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
     LoomDevice gpu;
+    // Import the whole GGUF tensor-data region once: every tensor is an offset
+    // into it, instead of one hrx_allocator_import_buffer per dispatch.
+    LoomBuffer weights;
+    std::size_t weights_delta = 0;
+    {
+      const std::uint8_t* wbase = gguf.tensor_data_base();
+      const std::uintptr_t page = 4096;
+      const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(wbase) & ~(page - 1);
+      weights_delta = reinterpret_cast<std::uintptr_t>(wbase) - start;
+      weights = gpu.Import(reinterpret_cast<void*>(start),
+                           gguf.tensor_data_size() + weights_delta);
+    }
+    auto ImportTensor = [&](const yah::core::TensorInfo& t) -> Imported {
+      return {weights.handle, weights_delta + static_cast<std::size_t>(t.offset),
+              static_cast<std::size_t>(t.bytes)};
+    };
     std::map<std::string, LoomExecutable> exes;
     auto load = [&](const std::string& path) -> LoomExecutable& {
       auto it = exes.find(path);
@@ -279,10 +283,10 @@ int main(int argc, char** argv) {
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) throw LoomError("no kStore port for type on " + wname);
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
-      const Imported w = ImportTensor(gpu, gguf, *tw);
+      const Imported w = ImportTensor(*tw);
       LoomExecutable& exe = load(dir + "/gemm_kstore_" + f.name + "_" +
                                  std::to_string(mt) + "_" + std::to_string(kb) + ".hal");
-      std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
+      std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
       if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
@@ -301,10 +305,10 @@ int main(int argc, char** argv) {
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) throw LoomError("no swiglu port for type on " + wname);
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
-      const Imported w = ImportTensor(gpu, gguf, *tw);
+      const Imported w = ImportTensor(*tw);
       LoomExecutable& exe = load(dir + "/gemm_swiglu_" + f.name + "_" +
                                  std::to_string(mt) + "_" + std::to_string(kb) + ".hal");
-      std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
+      std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
       if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
@@ -324,10 +328,10 @@ int main(int argc, char** argv) {
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) throw LoomError("no residual port for type on " + wname);
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
-      const Imported w = ImportTensor(gpu, gguf, *tw);
+      const Imported w = ImportTensor(*tw);
       LoomExecutable& exe = load(dir + "/gemm_residual_" + f.name + "_" +
                                  std::to_string(mt) + "_" + std::to_string(kb) + ".hal");
-      std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
+      std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
       if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
@@ -498,9 +502,9 @@ int main(int argc, char** argv) {
       Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
     }
     {
-      const Imported w = ImportTensor(gpu, gguf, *ow);
+      const Imported w = ImportTensor(*ow);
       std::vector<hrx_buffer_ref_t> b = {
-          {w.buf.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
+          {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
           {logits.handle, 0, hb(logits)}};
       Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
     }
@@ -536,7 +540,7 @@ int main(int argc, char** argv) {
       std::sort(rows.rbegin(), rows.rend());
       std::fprintf(stderr, "== loom per-dispatch timing sum=%.1f ms ==\n", sum);
       for (auto& r : rows)
-        std::fprintf(stderr, "%9.1f  %s\n", r.first, r.second.c_str());
+        std::fprintf(stderr, "%9.1f  %5d  %7.3f  %s\n", r.first, g_per_count[r.second], r.first / g_per_count[r.second], r.second.c_str());
     }
     return 0;
   } catch (const std::exception& error) {
