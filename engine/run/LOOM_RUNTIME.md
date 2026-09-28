@@ -142,6 +142,23 @@ source engine/hrx-env.sh
 python3 engine/run/verify_loom_norm.py <model.gguf> 1621892000 /tmp/loom_hidden.bin /tmp/loom_normed.f16 5 5120 1e-6
 ```
 
+`engine/run/loom_gemm_probe.cc` runs the format-faithful Q4_K prefill GEMM
+(`yah_ffn_gemm_q4k`, kStore) over the real `blk.4.ffn_down.weight` (N=5120,
+K=17408) imported from the GGUF mmap, with the activation tile generated
+deterministically; `engine/run/verify_loom_gemm.py` decodes the Q4_K weight in
+float64 (rounding it to f16 exactly as the kernel stages it) and compares. The
+port is now shape-generic (`k_blocks`, `token_tiles`), so the same HAL serves any
+K and any multiple-of-64 token batch. Results: 5 tokens, one tile `max_abs
+1.76e-05`; 100 tokens, two tiles `max_abs 2.72e-05`; both PASS.
+
+```
+python3 engine/gpu/loom/emit_hal.py engine/gpu/loom/yah_ffn_gemm_q4k_f32.loom /tmp/emit_q4k_down yah_ffn_gemm_q4k.m_tiles=320 yah_ffn_gemm_q4k.k_blocks=68 yah_ffn_gemm_q4k.token_tiles=1
+g++ -std=c++20 -O2 -Iengine -I/home/q/hrx/libhrx/include engine/run/loom_gemm_probe.cc -o /tmp/loom_gemm_probe engine/build/libyah_core.a -L/home/q/hrx/build/cmake/libhrx/src/libhrx -lhrx -licuuc -lpthread
+source engine/hrx-env.sh
+/tmp/loom_gemm_probe <model.gguf> /tmp/emit_q4k_down/yah_ffn_gemm_q4k_f32.hal blk.4.ffn_down.weight 5 /tmp/loom_gemm_y.bin
+python3 engine/run/verify_loom_gemm.py <model.gguf> 2444240416 /tmp/loom_gemm_y.bin 5 5120 17408 0 1 2 3 100 3000 5119
+```
+
 ## 5. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape
