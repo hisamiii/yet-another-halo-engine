@@ -46,9 +46,37 @@ HRX's vendored HSA headers document \`hsa_amd_queue_create\` as HSA interface
 | \`/opt/rocm\` (ROCm 7.2.4) | 1.18.0 | no |
 | Lemonade's TheRock \`gfx1151-7.13.0\` | 1.21.0 | no |
 
-So the GPU driver needs an HSA runtime newer than anything on the box. Options when
-we want it: a ROCm/TheRock newer than 7.13, or an older HRX commit from before the
-driver adopted \`hsa_amd_queue_create\` (not tested).
+So the GPU driver needs an HSA runtime newer than anything on the box.
+
+**And grabbing the newest ROCm does not fix it.** The chain, checked end to end:
+
+| source | HSA interface | has \`hsa_amd_queue_create\` |
+| --- | --- | --- |
+| ROCm 7.2.4 (system \`/opt/rocm\`) | 1.18 | no |
+| TheRock 7.13.0 (Lemonade's cache) | 1.21 | no |
+| **ROCm 7.14 / TheRock 10.0-era, \`rocm_sdk_core-7.14.0.dev0\`** | **1.21** | **no** |
+| ROCR-Runtime \`amd-staging\` / \`develop\` | 1.12 / 1.19 | no (only the \`_flag_t\` enum) |
+| **HRX's vendored headers** | **1.31** | **yes, declared** |
+
+"ROCm Core SDK 10.0.0" is TheRock's *product* version; its component ROCm version is
+7.14.x, and its runtime is HSA 1.21. 7.14 does ship the \`hsa_amd_queue_create_flag_t\`
+enum but not the function. HRX takes its headers from a **headers-only** repo,
+\`iree-org/hsa-runtime-headers\` at commit \`42855131\`, which is at interface 1.31 --
+ahead of every published *implementation*. There is nothing to load.
+
+HRX also has no fallback: \`hsa_queue.c\` always builds an
+\`hsa_amd_queue_create_desc_t\` and calls \`hsa_amd_queue_create\`; it never falls back
+to the classic \`hsa_queue_create\`, which every version above does export. The
+comments even say the descriptor mask "is not honored by all ROCr implementations
+exposing hsa_amd_queue_create", so the code only supports ROCr that has it.
+
+**The practical route to GPU-on-HRX is therefore a patch, not a download**: add a
+fallback in \`hsa_queue.c\` to the classic \`hsa_queue_create\` when the descriptor
+function is absent, losing whatever the descriptor-only fields express (engine type,
+explicit queue sizing, priority). Whether that is faithful enough depends on whether
+descriptor creation also needs new **kernel** support: this box runs
+\`7.3.0-rc4-perfopt\` and \`kfd_ioctl.h\` still exposes only the classic
+\`AMDKFD_IOC_CREATE_QUEUE\`/\`DESTROY_QUEUE\`/\`UPDATE_QUEUE\`.
 
 ## Two build notes worth keeping
 
