@@ -1510,4 +1510,51 @@ run needs the sampler bracketed on the timed launch, not the process.
 of block cycles at ~95% of its own limit, and `0.68 x 0.95 = 0.65` was previously
 used to "explain" a 59-65% whole-kernel efficiency. With the whole kernel now
 measured at 78%, that arithmetic does not hold and the two decompositions have not
+
+## Why the parameter search returned null: the parameters were already at the family optimum
+
+This is a derivation, not a measurement, and it explains the run of null results
+better than "the instrument was noisy" does.
+
+Per warp per K step the kernel issues `WRS` A-fragment loads and `WTS`
+B-fragment loads (each a `ds_read_b128` pair) feeding `WRS*WTS` WMMAs. So
+
+```
+LDS operand loads per WMMA = 1/WRS + 1/WTS
+WRS*WTS = (BM*BN) / (256 * numWarps)   -- the accumulator fragments per warp
+```
+
+For BM=BN=256, 32 warps: `WRS*WTS = 8`. Minimising `1/WRS + 1/WTS` subject to
+that product gives WRS = WTS = 2.83; the integer optima are (2,4) and (4,2), both
+**0.75 loads per WMMA** against an ideal 0.707 -- a 6% gap. The shipped assignment
+(WM=8, WN=4 -> WRS=2, WTS=4) is already at that integer optimum.
+
+The tile cannot grow either. `(BM+BN)*BK*32 <= 64 KiB` caps `BM+BN <= 512`, and
+area is maximised at 256x256. Registers would allow 384x384 (144 VGPRs of
+accumulator) but its staging is 96 KiB and does not fit.
+
+So the reachable parameter space around this design has a **6% ceiling on the
+quantity most of the interventions were trying to move**. Twenty-five parameter
+changes returning null is not a measurement failure; it is what an exhausted local
+optimum looks like. Better measurement would not have found a win there.
+
+**The corollary is what to do instead.** A win now has to change the *family*, and
+the families are few:
+
+| family | operand loads per WMMA | ceiling | status |
+| --- | --- | --- | --- |
+| fp16 WMMA + LDS staging, 256x256 | 0.75 (integer optimum) | 26.0 TMAC/s | shipped, at the family bound |
+| same, 384x384 | 0.47 | -- | **does not fit** (96 KiB staging) |
+| int4 WMMA 16x16x32 | halves it (8192 MACs/instr) | 52.6 TMAC/s | blocked: needs 4-bit activations |
+| packed int4 dots (`v_dot8_i32_i4`) | per-lane, no wave staging | 28.99 TMAC/s | **untried**, no weight-format change |
+
+The packed-dot family is the only one that is neither already-shipped nor blocked
+by a quality decision, and `dot_peak`'s own header has flagged it since it was
+written: "Packed dots are a different execution class and may issue more MACs per
+cycle, in which case a GEMM built on them beats the current kernel without touching
+the weight format." On the paired protocol it measures 28.99 against fp16 WMMA's
+26.0 -- **11% above the current instruction class, in-session.** Whether a GEMM
+built on it keeps that advantage is the open question, because a per-lane dot has
+no wave-level operand sharing and the data movement is different in kind.
+
 been brought together.
