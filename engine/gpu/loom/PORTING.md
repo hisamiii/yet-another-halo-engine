@@ -83,13 +83,14 @@ explicitly deferred.
 | yah_sample_prepare_f32.loom | sample.hip | sampling prep (non-finite filter + token map) | ported, 0.0068/0.0073 ms; finite exact, non-finite fixture |
 | yah_quant_act_q8_f32.loom | prefill_quant_gemm.hip | Q8_1 activation quantizer, tiled ATB layout | ported, 0.0063 ms; byte-exact fixture |
 | yah_quant_act_swiglu_q8_f32.loom | prefill_quant_gemm.hip | SwiGLU epilogue + Q8_1 quantize | ported, 0.0054/0.0077 ms; byte-exact fixture |
-| yah_requant_int4_f32.loom | prefill_quant_gemm.hip | Q8_1 to int4 requantize in place | ported, 0.0158 ms; byte-exact in/out fixtures; env clip path skipped |
+| yah_requant_int4_f32.loom | prefill_quant_gemm.hip | Q8_1 to int4 requantize in place | ported, 0.0128 ms; byte-exact in/out fixtures; env clip path skipped |
+| yah_zero_q8_act_tail_i8.loom | prefill_quant_gemm.hip | zero the slack tokens of the last Q8_1 tile | ported, 0.0061 ms; byte-exact in/out fixtures |
 | - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | all eight **ported** |
 
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 59 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 60 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -104,7 +105,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | fused RoPE | prefill_rope.hip | BatchedFusedQKNormRoPEKvWriteKernel, BatchedRoPEKernel |
 | fused.hip | fused.hip | FusedQKNormRoPEKvWriteKernel |
 | dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
-| W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path; tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, the clip variant, the fused RMSNorm and SSM-norm quantize kernels, ZeroQ8ActTailKernel, BatchedQuantGEMVKernel |
+| W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path), ZeroQ8ActTailKernel (tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, the clip variant, the fused RMSNorm and SSM-norm quantize kernels, BatchedQuantGEMVKernel |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16. **todo**: AtbEncodeA, AtbDecodeC, AtbDecodeSwiGLU, AtbRepack(+Slice) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
 | sampling | sample.hip | **ported**: PrepareSamplingKernel. **todo**: PrepareCandidateLogits, ApplySparsePenalties, batched argmax, linear/sorted sampling, the speculative segment set |
@@ -325,3 +326,11 @@ profile gives one, so the expensive paths move first rather than the convenient 
   sum regions; `check.tensor.view %y offset(0) : tensor<704xi8> -> tensor<176xf32>`
   is legal (the op only requires the byte range to fit), so the whole mixed-layout
   output can still be compared as raw bytes against one fixture.
+- **A stale report file can turn a failed run into a pass.** `iree-benchmark-loom`
+  exits non-zero and writes no output when a `check.file.read.npy` target is missing,
+  so a runner that only checks the JSON *after* the run reads back the previous
+  case report and prints `state: ok`. This was a real false pass on
+  `yah_zero_q8_act_tail_i8.loom` before `loom_run.sh` was fixed. The runner now
+  writes each report to a fresh `mktemp` file and fails if it is empty. Any new
+  harness that runs a case must clear or recreate its report path first; a missing
+  fixture is otherwise indistinguishable from a passing one.

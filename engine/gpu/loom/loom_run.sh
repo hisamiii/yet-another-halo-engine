@@ -59,35 +59,50 @@ echo "== preflight $CASE"
 python3 "$HERE/tools/loom_preflight.py" "$SOURCE" "$CASE" "$REPORT"
 
 echo "== correctness $CASE"
+# A fresh file per run: the runner exits non-zero and writes nothing when a
+# check.file.read.npy target is missing or the case crashes, and a leftover file
+# from the previous case would then be read back as a pass.
+CHECK_JSON=$(mktemp /tmp/loom_run_check.XXXXXX.json)
 timeout 300 "$BENCH" "$SOURCE" --device=amdgpu --target=amdgpu:gfx11-generic \
   "${CONFIG_FLAGS[@]}" --case="$CASE" --measure=case_end_to_end \
   --iterations=1 --warmup-iterations=0 --batch-size=1 --min-time-ms=0 \
-  --max-batches=1 --input-ring-count=1 --output=/tmp/loom_run_check.json >/dev/null 2>&1 || true
-python3 - <<'PY'
-import json
-rows = json.load(open('/tmp/loom_run_check.json')).get('benchmarks', [])
+  --max-batches=1 --input-ring-count=1 --output="$CHECK_JSON" >/dev/null 2>&1 || true
+python3 - "$CHECK_JSON" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+if os.path.getsize(path) == 0:
+    raise SystemExit('correctness produced no report; the run failed before writing it')
+rows = json.load(open(path)).get('benchmarks', [])
 states = sorted({str(row.get('state')) for row in rows})
 print('   state:', ', '.join(states) or 'no benchmarks ran')
+if not rows:
+    raise SystemExit('correctness report has no benchmarks')
 if states != ['ok']:
     raise SystemExit('correctness did not pass')
 PY
+rm -f "$CHECK_JSON"
 
 if [ "$BENCH_NAME" != "-" ]; then
   echo "== timing $BENCH_NAME"
+  BENCH_JSON=$(mktemp /tmp/loom_run_bench.XXXXXX.json)
   timeout 300 "$BENCH" "$SOURCE" --device=amdgpu --target=amdgpu:gfx11-generic \
     "${CONFIG_FLAGS[@]}" --case="$CASE" --benchmark="$BENCH_NAME" \
     --measure=dispatch_complete --iterations=1 --warmup-iterations=2 \
     --batch-size=1 --min-time-ms=0 --max-batches=1 --input-ring-count=1 \
-    --output=/tmp/loom_run_bench.json >/dev/null 2>&1 || true
-  python3 - <<'PY'
-import json, re
-text = json.dumps(json.load(open('/tmp/loom_run_bench.json')))
+    --output="$BENCH_JSON" >/dev/null 2>&1 || true
+  python3 - "$BENCH_JSON" <<'PY'
+import json, os, re, sys
+path = sys.argv[1]
+if os.path.getsize(path) == 0:
+    raise SystemExit('timing produced no report; the run failed before writing it')
+text = json.dumps(json.load(open(path)))
 found = re.findall(r'mean_physical_dispatch_duration_ns[^0-9]*([0-9.]+)', text)
 if not found:
     raise SystemExit('no dispatch duration in the report')
 ns = float(found[0])
 print('   mean dispatch: %.0f ns  (%.6f ms)' % (ns, ns / 1e6))
 PY
+  rm -f "$BENCH_JSON"
 fi
 
 rm -f "$REPORT"

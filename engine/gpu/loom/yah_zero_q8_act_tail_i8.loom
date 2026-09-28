@@ -1,0 +1,153 @@
+// YAH prefill Q8_1 tail zeroing, Loom port of ZeroQ8ActTailKernel.
+//
+// HIP source: models/qwen/hip/kernels/prefill_quant_gemm.hip. When the batch is
+// not a multiple of the 16-token Q8_1 tile, the unused tail tokens of the last tile
+// still hold bytes from the previous layer. This zeroes, for every block, the
+// payload, the scale and both activation sums of the (16 - batch%16) slack tokens.
+//
+// The stores are all zeros, so the port addresses the buffer as int32 words: one
+// 16-byte payload group is four zero words at word (tile*144 + tl*4), the high half
+// is the same plus 64, the scale is the single word tile*144 + 128 + tl, and the
+// two sums are the two words at the sidecar slot.
+//
+// Required config: --config=yah_zero_q8_act_tail.batch=17 --config=yah_zero_q8_act_tail.num_blocks=1
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_zero_q8_act_tail.batch : %value: index where [range(%value, 1, 65536)]
+config.decl @yah_zero_q8_act_tail.num_blocks : %value: index where [range(%value, 1, 65536)]
+
+kernel.def target(@yah_wave32) @yah_zero_q8_act_tail() {
+  %unit = index.constant 1 : index
+  %batch = config.get @yah_zero_q8_act_tail.batch : index
+  %num_blocks = config.get @yah_zero_q8_act_tail.num_blocks : index
+  %batch_i = index.cast %batch : index to i32
+  %c15i = scalar.constant 15 : i32
+  %c4i = scalar.constant 4 : i32
+  %c8i = scalar.constant 8 : i32
+  %batch15_i = scalar.addi %batch_i, %c15i : i32
+  %tiles_i = scalar.shrui %batch15_i, %c4i : i32
+  %tiles = index.cast %tiles_i : i32 to index
+  %tiles_blocks = index.mul %tiles, %num_blocks : index
+  %c3 = index.constant 3 : index
+  %c16 = index.constant 16 : index
+  %units = index.mul %tiles_blocks, %c16 : index
+  %units_i = index.cast %units : index to i32
+  %c255i = scalar.constant 255 : i32
+  %units255_i = scalar.addi %units_i, %c255i : i32
+  %grid_i = scalar.shrui %units255_i, %c8i : i32
+  %grid = index.cast %grid_i : i32 to index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%grid, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%y: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c15 = index.constant 15 : index
+  %c3 = index.constant 3 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c144 = index.constant 144 : index
+  %c176 = index.constant 176 : index
+  %c256 = index.constant 256 : index
+  %c704 = index.constant 704 : index
+  %c4i = scalar.constant 4 : i32
+  %c15i = scalar.constant 15 : i32
+  %zero32 = scalar.constant 0 : i32
+  %batch = config.get @yah_zero_q8_act_tail.batch : index
+  %num_blocks = config.get @yah_zero_q8_act_tail.num_blocks : index
+  %batch_i = index.cast %batch : index to i32
+  %batch15_i = scalar.addi %batch_i, %c15i : i32
+  %tiles_i = scalar.shrui %batch15_i, %c4i : i32
+  %tiles = index.cast %tiles_i : i32 to index
+  %tiles_blocks = index.mul %tiles, %num_blocks : index
+  %tail_i = scalar.andi %batch_i, %c15i : i32
+  %c16i = scalar.constant 16 : i32
+  %lanes_i = scalar.subi %c16i, %tail_i : i32
+  %lanes = index.cast %lanes_i : i32 to index
+  %work = index.mul %num_blocks, %lanes : index
+  %total_bytes = index.mul %tiles_blocks, %c704 : index
+  %sum_base_words = index.mul %tiles_blocks, %c144 : index
+  %total_words = index.mul %tiles_blocks, %c176 : index
+  %y_na = buffer.assume.noalias %y : buffer
+  %y_i32 = buffer.view %y_na[%base] : buffer -> view<[%total_words]xi32>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg256 = index.mul %wg, %c256 : index
+  %idx = index.add %wg256, %lane : index
+  %in_range = index.cmp ult, %idx, %work : index
+  %tail = index.cast %tail_i : i32 to index
+  %has_tail = index.cmp uge, %tail, %c1 : index
+  %sink = scf.if %in_range -> (index) {
+    %tail_work = scf.if %has_tail -> (index) {
+      %kb = index.div %idx, %lanes : index
+      %tl_off = index.rem %idx, %lanes : index
+      %tt = index.sub %tiles, %c1 : index
+      %tt_nb = index.mul %tt, %num_blocks : index
+      %tile_raw = index.add %tt_nb, %kb : index
+      %tile_max = index.sub %tiles_blocks, %c1 : index
+      %tile_raw_i = index.cast %tile_raw : index to i32
+      %tile_max_i = index.cast %tile_max : index to i32
+      %tile_clamp_i = scalar.minsi %tile_raw_i, %tile_max_i : i32
+      %tile = index.cast %tile_clamp_i : i32 to index
+      %tl_raw = index.add %tail, %tl_off : index
+      %tl_raw_i = index.cast %tl_raw : index to i32
+      %tl_clamp_i = scalar.minsi %tl_raw_i, %c15i : i32
+      %tl = index.cast %tl_clamp_i : i32 to index
+      %tile_words = index.mul %tile, %c144 : index
+      %tl4 = index.mul %tl, %c4 : index
+      %lo0 = index.add %tile_words, %tl4 : index
+      %hi_base = index.add %tile_words, %c64 : index
+      %hi0 = index.add %hi_base, %tl4 : index
+      view.store %zero32, %y_i32[%lo0] : i32, view<[%total_words]xi32>
+      %lo1 = index.add %lo0, %c1 : index
+      view.store %zero32, %y_i32[%lo1] : i32, view<[%total_words]xi32>
+      %lo2 = index.add %lo0, %c2 : index
+      view.store %zero32, %y_i32[%lo2] : i32, view<[%total_words]xi32>
+      %lo3 = index.add %lo0, %c3 : index
+      view.store %zero32, %y_i32[%lo3] : i32, view<[%total_words]xi32>
+      view.store %zero32, %y_i32[%hi0] : i32, view<[%total_words]xi32>
+      %hi1 = index.add %hi0, %c1 : index
+      view.store %zero32, %y_i32[%hi1] : i32, view<[%total_words]xi32>
+      %hi2 = index.add %hi0, %c2 : index
+      view.store %zero32, %y_i32[%hi2] : i32, view<[%total_words]xi32>
+      %hi3 = index.add %hi0, %c3 : index
+      view.store %zero32, %y_i32[%hi3] : i32, view<[%total_words]xi32>
+      %scale_off = index.add %c128, %tl : index
+      %scale_word = index.add %tile_words, %scale_off : index
+      view.store %zero32, %y_i32[%scale_word] : i32, view<[%total_words]xi32>
+      %tile16 = index.mul %tile, %c16 : index
+      %tile16_tl = index.add %tile16, %tl : index
+      %slot_pair = index.mul %tile16_tl, %c2 : index
+      %slot = index.add %sum_base_words, %slot_pair : index
+      view.store %zero32, %y_i32[%slot] : i32, view<[%total_words]xi32>
+      %slot_next = index.add %slot, %c1 : index
+      view.store %zero32, %y_i32[%slot_next] : i32, view<[%total_words]xi32>
+      scf.yield %c0 : index
+    } else {
+      scf.yield %c0 : index
+    }
+    scf.yield %tail_work : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.return
+}
+
+// Requires --config=yah_zero_q8_act_tail.batch=17 --config=yah_zero_q8_act_tail.num_blocks=1.
+//
+// batch = 17 gives two tiles with tail = 1, so the second tile keeps token 0 and
+// zeroes tokens 1..15 of its payload, scale and sums. The input fixture is all
+// 0xFF, so any byte the kernel misses is a difference.
+check.case public @yah_zero_q8_act_tail_case {
+  %input = check.file.read.npy path("fixtures/q8_act_tail/input_bytes.npy") : tensor<1408xi8>
+  %expected = check.file.read.npy path("fixtures/q8_act_tail/expected_bytes.npy") : tensor<1408xi8>
+  kernel.launch @yah_zero_q8_act_tail(%input) : (tensor<1408xi8>)
+  check.expect.equal actual(%input) expected(%expected) : tensor<1408xi8>
+  check.return
+}
+
+check.benchmark<@yah_zero_q8_act_tail_case> @yah_zero_q8_act_tail_bench
