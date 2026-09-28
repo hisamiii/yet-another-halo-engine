@@ -28,8 +28,10 @@ OUT = os.path.dirname(os.path.abspath(__file__))
 def main():
     packed = bytearray()
     row_sums = []
+    decoded_rows = []
     for r in range(ROWS):
         total = np.float64(0.0)
+        row_dec = []
         for blk_i in range(BLOCKS_PER_ROW):
             qs = bytes(((r * 3 + blk_i * 5 + k * 7) % 256) for k in range(16))
             block = bytearray()
@@ -40,8 +42,28 @@ def main():
             for local in range(QK):
                 shift = 4 * (local // 16)
                 nib = (qs[local % 16] >> shift) & 0xF
-                total += np.float64(2.0 ** -4) * np.float64(KVAL[nib])
+                v = np.float64(2.0 ** -4) * np.float64(KVAL[nib])
+                row_dec.append(v)
+                total += v
         row_sums.append(total)
+        decoded_rows.append(row_dec)
+    # Quantized GEMV: the same sparse activation as the other GEMV fixtures.
+    x = np.zeros(K, dtype=np.float32)
+    for pos, val in [(0, 1.0), (1, 0.5), (32, 2.0), (33, -1.0), (64, 0.25),
+                     (65, -0.5), (127, 1.5), (240, 0.75), (255, -2.0),
+                     (256, 1.0), (257, -0.25), (300, 0.5), (1023, -1.0),
+                     (4096, 0.125), (5119, 2.0)]:
+        x[pos] = np.float32(val)
+    gemv = np.zeros(ROWS, dtype=np.float32)
+    for r in range(ROWS):
+        acc = np.float64(0.0)
+        for k in range(K):
+            if x[k] != 0.0:
+                acc += decoded_rows[r][k] * np.float64(x[k])
+        gemv[r] = np.float32(acc)
+    np.save(os.path.join(OUT, "gemv_x.npy"), x)
+    np.save(os.path.join(OUT, "gemv_expected.npy"), gemv)
+    print("gemv_expected", gemv[:4])
     exp = np.zeros((TOKENS, ROWS), dtype=np.float32)
     for t in range(TOKENS):
         for r in range(ROWS):
