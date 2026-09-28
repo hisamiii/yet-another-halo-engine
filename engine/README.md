@@ -567,21 +567,42 @@ The report for v3 is available and makes one high-confidence recommendation:
 ```
 
 v3 sits at 200 vector registers, so it misses the 192 threshold that would move it
-from 4 to 5 subgroups per SIMD by a margin of 8. That is a genuinely useful signal --
-and it is already falsified by our own measurements, twice:
+from 4 to 5 subgroups per SIMD by a margin of 8. 192 is also the budget our HIP
+kernels run at, because a 1024-thread workgroup gets 196608 / 1024 = 192.
 
-| variant | vector VGPR | modelled residency | measured |
-| --- | ---: | --- | ---: |
-| v3 (d3 u2) | 200 | 4 subgroups/SIMD | **1.819 ms** |
-| d3 u1 | 160 | crosses the cliff | 2.347 ms |
-| v5, contiguous activation | 152 | crosses the cliff | 5.701 ms |
+**Correction: an earlier revision of this note claimed the suggestion was already
+falsified, and that was wrong.** The two variants it cited changed more than the
+register count. d3 u1 changes the unroll factor, and therefore the schedule (19.96
+register moves per WMMA against 10.02). v5 changes the activation layout, so its
+addresses differ entirely. Neither isolates "200 -> 192 with everything else fixed",
+and neither is evidence about the cliff. The honest measurement set is:
 
-Both lower-register variants reach the better tier and are substantially slower. The
-method anticipates exactly this: "a higher modeled tier earns a benchmark experiment
-rather than proving a performance win", and its non-evidence table lists "the candidate
-uses fewer registers or has higher modeled occupancy" as an observation that cannot
-select a winner. The suggestion is a hypothesis, and for this kernel the experiment has
-been run.
+| variant | vector VGPR | subgroups/SIMD | occupancy | time |
+| --- | ---: | ---: | ---: | ---: |
+| d1 u1 | 80 | 12 | 75% | 2.895 ms |
+| d3 u1 | 160 | 6 | 37% | 2.347 ms |
+| **d3 u2 (v3)** | **200** | **4** | **25%** | **1.819 ms** |
+| d3 u4 | 200 | 4 | 25% | 1.821 ms |
+| d4 u2 | 240 | 4 | 25% | 1.918 ms |
+| v5, contiguous activation | 152 | 6 | 37% | 5.701 ms |
+
+Every row above 25% occupancy is slower -- but each reached that occupancy either by
+giving up read-ahead or by changing the addresses, so occupancy is confounded with
+something else in every one of them. The cell the suggestion actually names, tier 5 at
+depth 3 / unroll 2 with unchanged addresses, has never been measured.
+
+Reaching it is not a flag. The AMDGPU target attribute accepts only `subgroup_size`,
+the target configs are build tooling, and the residency model is derived from generated
+target tables in `planning/occupancy.c` rather than from author input. In this kernel
+register pressure *is* the pipeline depth: the queue holds 2 records x 5 values x 8
+registers = 80 registers, plus 32 for the four accumulators, so every source-level way
+to cut 8 registers also cuts read-ahead.
+
+That makes the LDS rewrite the natural test rather than a separate idea. Moving the
+operand queue out of registers and into shared memory lowers per-thread registers while
+*preserving* read-ahead, so it should land under 192 and exercise the cliff as a side
+effect. It is also what the load-only proxy independently demands, being the only change
+that alters the memory path itself. Its target remains 1.727 ms down to about 1.35 ms.
 
 So the compiler and the counters agree on what is *not* the limit (compute, DRAM
 traffic, issued bytes, register count as such), and the load-only proxy says what is
