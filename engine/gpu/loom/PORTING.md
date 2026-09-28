@@ -41,7 +41,10 @@ explicitly deferred.
 | yah_attn_softmax_f32.loom | attention_batched.hip | causal softmax + causal zeroing | ported, exact at both mask ends |
 | yah_kv_cache_write_f32.loom | attention_batched.hip | batched KV cache write, f32 + f16 layouts | ported, 0.0113 ms; exact fixture (the two layouts differ) |
 | yah_attn_batched_f32.loom | attention_batched.hip | batched attention core, f32 + f16 cache | ported, 0.0091/0.0120 ms; fixture + 1e-6 |
-| - | attention_batched.hip, prefill_attention*.hip, attention_wmma.hip | tiled/WMMA attention, KV prefix sync, head packing, bf16 output | todo |
+| yah_pack_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV pack (fp16 + f32) | ported, 0.0073 ms; exact fixtures |
+| yah_sync_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV f32->fp16 prefix sync | ported, 0.0076 ms; exact fixtures |
+| yah_pack_attn_heads_f16.loom | attention_wmma.hip | pack K/V into WMMA head tiles (LDS V transpose) | ported, 0.0079 ms; fp16 fixture |
+| - | prefill_attention*.hip, attention_wmma.hip, attention_decode*.hip | WMMA/tiled attention compute, decode-online, split-K, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
 | yah_dequant_q8k_bf16.loom | prefill_gemm.hip | Q8_K weight dequant to bf16 | ported, 0.0076 ms; exact periodic expectation |
@@ -99,7 +102,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 69 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 72 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -107,7 +110,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | DeltaNet / SSM (5.1%) | ssm_row_split.hip | all five kernels **ported** (row split, prep alpha/beta, prep K/Q, conv, post-norm gate fp32 + fp16). The 5.1% prefill block is now covered end to end. |
 | DeltaNet / SSM | ssm_recurrence.hip | BatchedDeltaNetRecurrenceKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel |
 | DeltaNet / SSM | batched_ssm.hip, ssm.hip, ssm_decode_recurrence.hip | BatchedSSMPostNormGateKernel, FusedSSMInputProjectionsKernel, SSMConvKernel, CaptureBatchedSsmReplayKernel |
-| attention (2.1%) | attention_wmma.hip | PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel |
+| attention (2.1%) | attention_wmma.hip, attention_tile.hip | **ported**: PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel. **todo**: QwenTiledAttentionKernel, WmmaCausalAttention |
 | attention | attention_batched.hip | BatchedAttentionKernel, CausalSoftmaxKernel, WriteBatchedKVCacheKernel, ApplyAttentionGateKernel |
 | attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | tiled, decode-online, split-K, and KV-write variants |
 | QKV projection | qkv.hip | FusedQKVProjectionsKernel |
@@ -369,3 +372,11 @@ profile gives one, so the expensive paths move first rather than the convenient 
   so scale and `ldexpf(1, exponent-7)` share one bit construction
   (`yah_atb_encode_a_f16.loom`, `yah_atb_decode_c_f32.loom`). `frexpf(amax)` itself
   only needs the exponent field: `field - 126`.
+- **Two clamps on the same logical index can need different bounds.** In
+  `yah_pack_attn_heads_f16.loom` Pass A the dimension index strides by 8 and reads an
+  8-element group, so it must be clamped to `head_dim - 8`; in Pass B the same index
+  selects a single LDS column and must be clamped to `head_dim - 1`. Sharing the
+  `- 8` bound silently dropped the second transposed column, and the check reported
+  `element at index 16 (0) is not close to expected (1)`.
+- **`index.min`/`index.max` exist; there is no `index.minui`.** The index type is
+  unsigned by default, so `index.min %a, %b : index` is the clamp.

@@ -1,0 +1,136 @@
+// YAH tiled-attention KV pack, Loom port of PackTiledAttentionKvKernel.
+//
+// HIP source: models/qwen/hip/kernels/attention_tile.hip. Writes this step tokens
+// into the fp16 WMMA cache and the f32 canonical cache at once:
+//
+//   token = blockIdx.y; index = blockIdx.x*blockDim.x + tid
+//   kv_width = num_kv_heads*head_dim; source = token*kv_width + index
+//   position = start_pos + token
+//   kv_head = index/head_dim; dimension = index%head_dim
+//   f16 = ((layer*max_context + position)*kv_width) + index
+//   f32 = ((layer*num_kv_heads + kv_head)*max_context + position)*head_dim + dimension
+//   k_cache_f16[f16] = fp16(k[source]);  k_cache[f32] = k[source]   (same for v)
+//
+// The HIP kernel treats the f32 caches as optional; the port takes them as
+// required operands, which is the path the engine uses. token and position are
+// clamped to their cached extents so the footprint analysis can bound the f16
+// cache; the guards make those clamps no-ops.
+//
+// Required config: --config=yah_pack_tiled_attn_kv.layer_idx=0 --config=yah_pack_tiled_attn_kv.start_pos=1
+//                  --config=yah_pack_tiled_attn_kv.batch=2 --config=yah_pack_tiled_attn_kv.max_context=4
+//                  --config=yah_pack_tiled_attn_kv.num_kv_heads=2 --config=yah_pack_tiled_attn_kv.head_dim=8
+//                  --config=yah_pack_tiled_attn_kv.k_elems=32 --config=yah_pack_tiled_attn_kv.k16_elems=64
+//                  --config=yah_pack_tiled_attn_kv.k32_elems=64
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_pack_tiled_attn_kv.layer_idx : %value: index where [range(%value, 0, 65536)]
+
+config.decl @yah_pack_tiled_attn_kv.start_pos : %value: index where [range(%value, 0, 1073741824)]
+
+config.decl @yah_pack_tiled_attn_kv.batch : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_pack_tiled_attn_kv.max_context : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_pack_tiled_attn_kv.num_kv_heads : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_pack_tiled_attn_kv.head_dim : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_pack_tiled_attn_kv.k_elems : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_pack_tiled_attn_kv.k16_elems : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_pack_tiled_attn_kv.k32_elems : %value: index where [range(%value, 1, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_pack_tiled_attn_kv() {
+  %unit = index.constant 1 : index
+  %num_kv_heads = config.get @yah_pack_tiled_attn_kv.num_kv_heads : index
+  %head_dim = config.get @yah_pack_tiled_attn_kv.head_dim : index
+  %batch = config.get @yah_pack_tiled_attn_kv.batch : index
+  %kv_width = index.mul %num_kv_heads, %head_dim : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %kv_width, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %batch, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%k: buffer, %v: buffer, %k_cache_f16: buffer, %v_cache_f16: buffer, %k_cache: buffer, %v_cache: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  %layer_idx = config.get @yah_pack_tiled_attn_kv.layer_idx : index
+  %start_pos = config.get @yah_pack_tiled_attn_kv.start_pos : index
+  %batch = config.get @yah_pack_tiled_attn_kv.batch : index
+  %max_context = config.get @yah_pack_tiled_attn_kv.max_context : index
+  %num_kv_heads = config.get @yah_pack_tiled_attn_kv.num_kv_heads : index
+  %head_dim = config.get @yah_pack_tiled_attn_kv.head_dim : index
+  %k_elems = config.get @yah_pack_tiled_attn_kv.k_elems : index
+  %k16_elems = config.get @yah_pack_tiled_attn_kv.k16_elems : index
+  %k32_elems = config.get @yah_pack_tiled_attn_kv.k32_elems : index
+  %kv_width = index.mul %num_kv_heads, %head_dim : index
+  %batch_m1 = index.sub %batch, %c1 : index
+  %kv_width_m1 = index.sub %kv_width, %c1 : index
+  %ctx_m1 = index.sub %max_context, %c1 : index
+  %k_na, %v_na, %k16_na, %v16_na, %k32_na, %v32_na = buffer.assume.noalias %k, %v, %k_cache_f16, %v_cache_f16, %k_cache, %v_cache : buffer, buffer, buffer, buffer, buffer, buffer
+  %k_view = buffer.view %k_na[%base] : buffer -> view<[%k_elems]xf32>
+  %v_view = buffer.view %v_na[%base] : buffer -> view<[%k_elems]xf32>
+  %k16_view = buffer.view %k16_na[%base] : buffer -> view<[%k16_elems]xf16>
+  %v16_view = buffer.view %v16_na[%base] : buffer -> view<[%k16_elems]xf16>
+  %k32_view = buffer.view %k32_na[%base] : buffer -> view<[%k32_elems]xf32>
+  %v32_view = buffer.view %v32_na[%base] : buffer -> view<[%k32_elems]xf32>
+  %token_raw = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg = kernel.workgroup.id<x> : index
+  %wg256 = index.mul %wg, %c256 : index
+  %index_raw = index.add %wg256, %lane : index
+  %token = index.min %token_raw, %batch_m1 : index
+  %index = index.min %index_raw, %kv_width_m1 : index
+  %token_kv = index.mul %token, %kv_width : index
+  %source = index.add %token_kv, %index : index
+  %position_raw = index.add %start_pos, %token : index
+  %position = index.min %position_raw, %ctx_m1 : index
+  %kv_head = index.div %index, %head_dim : index
+  %dimension = index.rem %index, %head_dim : index
+  %lm = index.mul %layer_idx, %max_context : index
+  %lm_p = index.add %lm, %position : index
+  %f16_pre = index.mul %lm_p, %kv_width : index
+  %f16_off = index.add %f16_pre, %index : index
+  %ln = index.mul %layer_idx, %num_kv_heads : index
+  %lnh = index.add %ln, %kv_head : index
+  %lnhm = index.mul %lnh, %max_context : index
+  %lnhm_p = index.add %lnhm, %position : index
+  %f32_pre = index.mul %lnhm_p, %head_dim : index
+  %f32_off = index.add %f32_pre, %dimension : index
+  %key = view.load %k_view[%source] : view<[%k_elems]xf32> -> f32
+  %value = view.load %v_view[%source] : view<[%k_elems]xf32> -> f32
+  %key16 = scalar.fptrunc %key : f32 to f16
+  %value16 = scalar.fptrunc %value : f32 to f16
+  view.store %key16, %k16_view[%f16_off] : f16, view<[%k16_elems]xf16>
+  view.store %value16, %v16_view[%f16_off] : f16, view<[%k16_elems]xf16>
+  view.store %key, %k32_view[%f32_off] : f32, view<[%k32_elems]xf32>
+  view.store %value, %v32_view[%f32_off] : f32, view<[%k32_elems]xf32>
+  kernel.return
+}
+
+// Requires the config above. Two tokens at start_pos 1 into a four-position cache,
+// two KV heads of 8 dims. k/v are iota 0..31; the four outputs are the head-major
+// f16 and f32 layouts, held as fixtures.
+check.case public @yah_pack_tiled_attn_kv_case {
+  %k = check.generate.iota offset(0.0) step(1.0) : tensor<32xf32>
+  %v = check.generate.iota offset(0.0) step(1.0) : tensor<32xf32>
+  %k16 = check.generate.fill value(0.0) : tensor<64xf16>
+  %v16 = check.generate.fill value(0.0) : tensor<64xf16>
+  %k32 = check.generate.fill value(0.0) : tensor<64xf32>
+  %v32 = check.generate.fill value(0.0) : tensor<64xf32>
+  %expected_k16 = check.file.read.npy path("fixtures/pack_tiled_attn_kv/k16.npy") : tensor<64xf16>
+  %expected_v16 = check.file.read.npy path("fixtures/pack_tiled_attn_kv/v16.npy") : tensor<64xf16>
+  %expected_k32 = check.file.read.npy path("fixtures/pack_tiled_attn_kv/k32.npy") : tensor<64xf32>
+  %expected_v32 = check.file.read.npy path("fixtures/pack_tiled_attn_kv/v32.npy") : tensor<64xf32>
+  kernel.launch @yah_pack_tiled_attn_kv(%k, %v, %k16, %v16, %k32, %v32) : (tensor<32xf32>, tensor<32xf32>, tensor<64xf16>, tensor<64xf16>, tensor<64xf32>, tensor<64xf32>)
+  check.expect.close actual(%k16) expected(%expected_k16) atol(0.0) rtol(0.0) nan(same) : tensor<64xf16>
+  check.expect.close actual(%v16) expected(%expected_v16) atol(0.0) rtol(0.0) nan(same) : tensor<64xf16>
+  check.expect.close actual(%k32) expected(%expected_k32) atol(0.0) rtol(0.0) nan(same) : tensor<64xf32>
+  check.expect.close actual(%v32) expected(%expected_v32) atol(0.0) rtol(0.0) nan(same) : tensor<64xf32>
+  check.return
+}
+
+check.benchmark<@yah_pack_tiled_attn_kv_case> @yah_pack_tiled_attn_kv_bench
