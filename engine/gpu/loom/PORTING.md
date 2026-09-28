@@ -39,7 +39,8 @@ explicitly deferred.
 | yah_ssm_postnorm_gate_f16.loom | ssm_row_split.hip | fp16 SSM post-norm + gate epilogue | ported, 0.0079 ms at 3 heads; fixture + 1e-6 tolerance |
 | yah_attn_gate_f32.loom | attention_batched.hip | attention output gate | ported, two exact sigmoid points, no fixture |
 | yah_attn_softmax_f32.loom | attention_batched.hip | causal softmax + causal zeroing | ported, exact at both mask ends |
-| - | attention_batched.hip, prefill_attention*.hip, attention_wmma.hip | batched attention core, KV cache write, tiled/WMMA attention | todo |
+| yah_kv_cache_write_f32.loom | attention_batched.hip | batched KV cache write, f32 + f16 layouts | ported, 0.0113 ms; exact fixture (the two layouts differ) |
+| - | attention_batched.hip, prefill_attention*.hip, attention_wmma.hip | batched attention core, tiled/WMMA attention, KV prefix sync | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
