@@ -514,3 +514,37 @@ binding constraint.
 That makes the load-only proxy the next step rather than another tile or schedule:
 nothing in the compiler evidence isolates the cause, and the probes are the part of
 the method designed for exactly that. It is also the cheapest remaining experiment.
+
+### Load-only proxy: the kernel is 95% memory path
+
+The Loom method prescribes a load-only proxy before further hill climbing, and it
+is decisive here. `engine/gpu/loom/yah_ffn_gemm_loadonly_probe.loom` is v3 with the
+four `vector.mma` operations replaced by four independent elementwise `vector.addf`
+accuracies -- that is, identical loads at identical offsets, identical K loop,
+identical pipeline depth and unroll, identical grid, and no matrix op at all.
+
+The mechanism-survival evidence is compiler-side, as the method requires:
+
+| | v3 real kernel | load-only probe |
+| --- | ---: | ---: |
+| `global_load_count` per work-item | 3200 | **3200** |
+| `wmma_count` | 1280 | **0** |
+| issued read bytes | 1,782,579,200 | **1,782,579,200** |
+| vector VGPR | 200 | 204 |
+| **device time** | **1.819 ms** | **1.727 ms** |
+
+Removing all 1,393,000 WMMA operations -- the entire matrix workload -- saves 5%.
+The kernel is therefore about 95% memory-path bound, and the corollary the method
+states directly applies: "if a load-only proxy is already near the candidate,
+compute rewrites cannot recover much." Any further tiling, scheduling or
+accumulator-chain work is bounded by 5% before it starts.
+
+This also reframes the remaining 1.34x against our HIP kernel (1.353 ms). HIP does
+the same loads *and* the matrix work in less time than our load path alone needs,
+while moving the same 178 MB of weight DRAM traffic. So the gap is not DRAM
+bandwidth, not compute, and not traffic volume: it is how well the memory path
+generates and coalesces outstanding requests. That is precisely what a multi-wave
+workgroup with LDS-staged operands changes -- wide coalesced global fills instead of
+16-byte-per-lane strided fragment gathers, and many more bytes in flight per issue
+slot -- and the probe gives it a hard target: the load path must go from 1.727 ms to
+about 1.35 ms.

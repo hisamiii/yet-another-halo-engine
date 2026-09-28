@@ -1,0 +1,109 @@
+// Load-only proxy for yah_ffn_gemm_f16, to bound the kernel's regime.
+//
+// The Loom development workflow ("Bound the performance regime before hill
+// climbing") prescribes a load-only proxy: the same addresses and publication
+// path with only enough observable arithmetic to keep the traffic live. It
+// answers whether the real kernel is limited by its memory path or by the
+// matrix/dependency structure, before any further tiling or scheduling work.
+//
+// This is v3 (16x64 tile, weights read once, pipeline depth 3 unroll 2) with the
+// four vector.mma operations replaced by four independent elementwise vector
+// adds. Everything that determines which bytes are read is unchanged: the same
+// lhs and rhs fragment loads at the same offsets, the same K loop bounds, the
+// same pipeline depth and unroll factor, the same workgroup grid. What is
+// removed is the matrix op and its accumulator dependency.
+//
+// The evidence that the mechanism survived is compiler-side, not numerical: the
+// emitted global_load_count must still be 3200 per work-item and wmma_count must
+// be zero. A proxy the compiler deletes establishes no bound.
+//
+// With all-ones operands each accumulated lane is exactly 320.0 and the reduce
+// over 16 lanes is exactly 5120.0, so the five stored values are exact. The
+// output is pre-filled with 5120.0 so untouched elements already hold the
+// expected value; this case is a lapse detector for the store, and the load
+// liveness claim rests on the compile report rather than on the check.
+amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+
+config.decl @yah_ffn_gemm_loadonly.m_tiles : %value: index where [range(%value, 1, 4096)]
+
+config.def @yah_ffn_gemm_loadonly.depth = 3 : index
+
+config.def @yah_ffn_gemm_loadonly.unroll = 2 : index
+
+kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_loadonly() {
+  %unit = index.constant 1 : index
+  %m_tiles = config.get @yah_ffn_gemm_loadonly.m_tiles : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%m_tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%weight: buffer, %input: buffer, %output: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c5120 = index.constant 5120 : index
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %k = index.constant 16 : index
+
+  %a_layout = encoding.layout.strided [1, 5120] : encoding<layout>
+
+  %weight_noalias, %input_noalias, %output_noalias = buffer.assume.noalias %weight, %input, %output : buffer, buffer, buffer
+  %w_view = buffer.view %weight_noalias[%base] : buffer -> view<17408x5120xf16>
+  %a_t_view = buffer.view %input_noalias[%base] : buffer -> view<5120x64xf16, %a_layout>
+  %out_view = buffer.view %output_noalias[%base] : buffer -> view<17408x64xf32>
+
+  %wg_x = kernel.workgroup.id<x> : index
+  %m_origin = index.mul %wg_x, %c16 : index
+
+  %depth = config.get @yah_ffn_gemm_loadonly.depth : index
+  %factor = config.get @yah_ffn_gemm_loadonly.unroll : index
+
+  %z16 = vector.constant 0.0 : vector<16xf16>
+  %seed = scalar.constant 0.0 : f16
+  %lacc, %r0acc, %r1acc, %r2acc, %r3acc = scf.for %kk = [%c0 to %c5120 step %c16](%la = %z16 : vector<16xf16>, %r0a = %z16 : vector<16xf16>, %r1a = %z16 : vector<16xf16>, %r2a = %z16 : vector<16xf16>, %r3a = %z16 : vector<16xf16>) -> (vector<16xf16>, vector<16xf16>, vector<16xf16>, vector<16xf16>, vector<16xf16>) pipeline(%depth) unroll(%factor) schedule(recurrence) {
+    %lhs = vector.fragment.load<lhs> %w_view[%m_origin, %kk] shape [%m, %k] : view<17408x5120xf16> -> vector<16xf16>
+    %rhs0 = vector.fragment.load<rhs> %a_t_view[%kk, %c0] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs1 = vector.fragment.load<rhs> %a_t_view[%kk, %c16] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs2 = vector.fragment.load<rhs> %a_t_view[%kk, %c32] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %rhs3 = vector.fragment.load<rhs> %a_t_view[%kk, %c48] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %nl = vector.addf %la, %lhs : vector<16xf16>
+    %nr0 = vector.addf %r0a, %rhs0 : vector<16xf16>
+    %nr1 = vector.addf %r1a, %rhs1 : vector<16xf16>
+    %nr2 = vector.addf %r2a, %rhs2 : vector<16xf16>
+    %nr3 = vector.addf %r3a, %rhs3 : vector<16xf16>
+    scf.yield %nl, %nr0, %nr1, %nr2, %nr3 : vector<16xf16>, vector<16xf16>, vector<16xf16>, vector<16xf16>, vector<16xf16>
+  }
+  %sl = vector.reduce<addf> %lacc, %seed : vector<16xf16>, f16
+  %s0 = vector.reduce<addf> %r0acc, %seed : vector<16xf16>, f16
+  %s1 = vector.reduce<addf> %r1acc, %seed : vector<16xf16>, f16
+  %s2 = vector.reduce<addf> %r2acc, %seed : vector<16xf16>, f16
+  %s3 = vector.reduce<addf> %r3acc, %seed : vector<16xf16>, f16
+  %fl = scalar.extf %sl : f16 to f32
+  %f0 = scalar.extf %s0 : f16 to f32
+  %f1 = scalar.extf %s1 : f16 to f32
+  %f2 = scalar.extf %s2 : f16 to f32
+  %f3 = scalar.extf %s3 : f16 to f32
+  view.store %fl, %out_view[%m_origin, %c0] : f32, view<17408x64xf32>
+  view.store %f0, %out_view[%m_origin, %c1] : f32, view<17408x64xf32>
+  view.store %f1, %out_view[%m_origin, %c2] : f32, view<17408x64xf32>
+  view.store %f2, %out_view[%m_origin, %c3] : f32, view<17408x64xf32>
+  view.store %f3, %out_view[%m_origin, %c4] : f32, view<17408x64xf32>
+  kernel.return
+}
+
+check.case public @yah_ffn_gemm_loadonly_case {
+  %weight = check.generate.fill value(1.0) : tensor<17408x5120xf16>
+  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
+  %output = check.generate.fill value(5120.0) : tensor<17408x64xf32>
+  %expected = check.generate.fill value(5120.0) : tensor<17408x64xf32>
+  kernel.launch @yah_ffn_gemm_loadonly(%weight, %input, %output) : (tensor<17408x5120xf16>, tensor<64x5120xf16>, tensor<17408x64xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<17408x64xf32>
+  check.return
+}
+
+check.benchmark<@yah_ffn_gemm_loadonly_case> @yah_ffn_gemm_loadonly_bench
