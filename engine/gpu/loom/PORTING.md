@@ -35,7 +35,8 @@ explicitly deferred.
 | yah_deltanet_prep_kq_f32.loom | ssm_row_split.hip | DeltaNet K/Q-norm prologue | ported, 0.0076 ms at 3 tokens / 2 key heads |
 | yah_ssm_conv_f32.loom | ssm_recurrence.hip | causal SSM convolution + gate | ported, 0.0148 ms at 4x16; fixture + 1e-6 tolerance |
 | yah_ssm_postnorm_gate_f32.loom | batched_ssm.hip | SSM post-norm + gate epilogue | ported, 0.0173 ms at 2x2x128; fixture + 1e-6 tolerance |
-| - | ssm_row_split.hip | BatchedDeltaNetPrepAlphaBetaKernel, BatchedSSMPostNormGateFp16Kernel | todo |
+| yah_deltanet_prep_ab_f32.loom | ssm_row_split.hip | DeltaNet alpha/beta prep + conv history advance | ported, 0.0087 ms; ab within 1e-5, history exact |
+| - | ssm_row_split.hip | BatchedSSMPostNormGateFp16Kernel | todo |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
 | - | qkv.hip | QKV projection | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
@@ -149,6 +150,20 @@ profile gives one, so the expensive paths move first rather than the convenient 
   `check.oracle.call` provider would be nicer, but the shipped tool registers only
   `reference.matmul` and `reference.tiled_matmul`; a scalar oracle is an embedding
   hook the CLI does not wire up.
+- **`index.assume` does not feed the memory-footprint analysis, and neither does
+  `index.rem`.** The footprint bounds come from `config.decl ... where [range(...)]`
+  and from branch conditions the analysis can correlate. A read indexed by an
+  expression the analysis cannot bound (here `state[c*4 + batch + j]` inside a
+  branch that guarantees `batch + j < 4`) makes it declare a footprint past the end
+  of the buffer. `loom_preflight.py` refuses to run that, correctly. The fix is to
+  make the memory indices static: load the four ring slots with constant indices
+  and select among the registers, rather than indexing memory with the runtime slot.
+  The same kernel went from REFUSING to OK with no change in behavior.
+- **`scalar.log1pf` has no AMDGPU target-low contract.** Use
+  `scalar.logf<afn>(1 + scalar.expf<afn>(x))`; the `logf` recipe carries the afn
+  requirement through. `scalar.softplusf` and `scalar.logisticf` exist but expand
+  to `exp2`/`log2` recipes that then need fast-math propagation the source op does
+  not give them, so the explicit form is the one that compiles today.
 - **`scalar.sitofp` rejects `index`.** Cast first:
   `%i = index.cast %n : index to i32` then `%f = scalar.sitofp %i : i32 to f32`.
   The failure is `TYPE/003: operand 'input' has type index, expected integer`.

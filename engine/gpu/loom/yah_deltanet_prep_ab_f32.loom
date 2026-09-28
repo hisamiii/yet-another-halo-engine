@@ -1,0 +1,184 @@
+// YAH DeltaNet alpha/beta prep, Loom port of BatchedDeltaNetPrepAlphaBetaKernel.
+//
+// HIP source: models/qwen/hip/kernels/ssm_row_split.hip. One launch does two
+// unrelated jobs, both gridded over their own extent:
+//
+//   channel c < qkv_size: advance the conv history ring (StoreSSMConvHistory),
+//     reading the four tail values before writing any of them, since the read
+//     index batch+j always exceeds the write index j for batch >= 1.
+//     tail[j] = (batch + j >= 4) ? qkv_in[(batch + j - 4)*qkv_size + c]
+//                                : conv_state[c*4 + batch + j]
+//   token-head i < count = batch*num_heads, h = i % num_heads:
+//     alpha_biased   = alpha_buf[i] + ssm_dt[h]
+//     alpha_softplus = alpha_biased > 20 ? alpha_biased : log1p(exp(alpha_biased))
+//     ab[2i]     = exp(alpha_softplus * ssm_a[h])
+//     ab[2i + 1] = 1 / (1 + exp(-beta_buf[i]))
+//
+// The 20.0 branch is a guard against exp overflow, not an approximation, so it is
+// kept. The port requires alpha_buf, beta_buf, ssm_a and ssm_dt to be present; the
+// HIP kernel folds null pointers to 0.0, -0.05 and 0.0, and those forms are not
+// covered here (PORTING.md records it).
+//
+// The grid covers max(count, qkv_size) by sizing for count + qkv_size, which
+// over-covers both and costs only idle lanes.
+//
+// Required config: --config=yah_deltanet_prep_ab.batch=2
+//                  --config=yah_deltanet_prep_ab.qkv_size=16
+//                  --config=yah_deltanet_prep_ab.num_heads=4
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_deltanet_prep_ab.batch : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @yah_deltanet_prep_ab.qkv_size : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @yah_deltanet_prep_ab.num_heads : %value: index where [range(%value, 1, 4096)]
+
+kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
+  %unit = index.constant 1 : index
+  %batch = config.get @yah_deltanet_prep_ab.batch : index
+  %num_heads = config.get @yah_deltanet_prep_ab.num_heads : index
+  %count = index.mul %batch, %num_heads : index
+  %qkv_size = config.get @yah_deltanet_prep_ab.qkv_size : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %span0 = index.add %count, %qkv_size : index
+  %span = index.add %span0, %c255 : index
+  %tiles = index.div %span, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%alpha: buffer, %beta: buffer, %ssm_a: buffer, %ssm_dt: buffer, %qkv: buffer, %state: buffer, %ab: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c256 = index.constant 256 : index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %negone = scalar.constant -1.0 : f32
+  %twenty = scalar.constant 20.0 : f32
+  %batch = config.get @yah_deltanet_prep_ab.batch : index
+  %qkv_size = config.get @yah_deltanet_prep_ab.qkv_size : index
+  %num_heads = config.get @yah_deltanet_prep_ab.num_heads : index
+  %count = index.mul %batch, %num_heads : index
+  %qkv_total = index.mul %batch, %qkv_size : index
+  %state_total = index.mul %qkv_size, %c4 : index
+  %ab_total = index.mul %count, %c2 : index
+  %alpha_na, %beta_na, %a_na, %dt_na, %qkv_na, %state_na, %ab_na = buffer.assume.noalias %alpha, %beta, %ssm_a, %ssm_dt, %qkv, %state, %ab : buffer, buffer, buffer, buffer, buffer, buffer, buffer
+  %alpha_view = buffer.view %alpha_na[%base] : buffer -> view<[%count]xf32>
+  %beta_view = buffer.view %beta_na[%base] : buffer -> view<[%count]xf32>
+  %a_view = buffer.view %a_na[%base] : buffer -> view<[%num_heads]xf32>
+  %dt_view = buffer.view %dt_na[%base] : buffer -> view<[%num_heads]xf32>
+  %qkv_view = buffer.view %qkv_na[%base] : buffer -> view<[%qkv_total]xf32>
+  %state_view = buffer.view %state_na[%base] : buffer -> view<[%state_total]xf32>
+  %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %i = index.add %wg_base, %lane : index
+  %in_channels = index.cmp ult, %i, %qkv_size : index
+  scf.if %in_channels {
+    // The whole 4-slot history ring, read once with constant indices.
+    %ring_slot = index.mul %i, %c4 : index
+    %ring0_off = index.add %ring_slot, %c0 : index
+    %ring1_off = index.add %ring_slot, %c1 : index
+    %ring2_off = index.add %ring_slot, %c2 : index
+    %ring3_off = index.add %ring_slot, %c3 : index
+    %ring0 = view.load %state_view[%ring0_off] : view<[%state_total]xf32> -> f32
+    %ring1 = view.load %state_view[%ring1_off] : view<[%state_total]xf32> -> f32
+    %ring2 = view.load %state_view[%ring2_off] : view<[%state_total]xf32> -> f32
+    %ring3 = view.load %state_view[%ring3_off] : view<[%state_total]xf32> -> f32
+    %channel_shift = scf.for %j = [%c0 to %c4 step %c1](%mark = %zero : f32) -> (f32) {
+      %bj = index.add %batch, %j : index
+      %d0 = index.sub %bj, %c0 : index
+      %d1 = index.sub %bj, %c1 : index
+      %d2 = index.sub %bj, %c2 : index
+      %is_slot0 = index.cmp ult, %d0, %c1 : index
+      %is_slot1 = index.cmp ult, %d1, %c1 : index
+      %is_slot2 = index.cmp ult, %d2, %c1 : index
+      %from_input = index.cmp uge, %bj, %c4 : index
+      %tail = scf.if %from_input -> (f32) {
+        %src_token = index.sub %bj, %c4 : index
+        %src_row = index.mul %src_token, %qkv_size : index
+        %src = index.add %src_row, %i : index
+        %v = view.load %qkv_view[%src] : view<[%qkv_total]xf32> -> f32
+        scf.yield %v : f32
+      } else {
+        // This branch runs only when batch + j < 4, so the ring slot is one of
+        // the four loaded above. Selecting among them as registers keeps every
+        // memory index static: indexing the state with batch + j instead makes the
+        // footprint analysis bound the index as c*4 + batch + j and declare a
+        // read past the end of the buffer, which loom_run.sh then refuses.
+        %ringed = scf.if %is_slot0 -> (f32) {
+          scf.yield %ring0 : f32
+        } else {
+          %not1 = scf.if %is_slot1 -> (f32) {
+            scf.yield %ring1 : f32
+          } else {
+            %not2 = scf.if %is_slot2 -> (f32) {
+              scf.yield %ring2 : f32
+            } else {
+              scf.yield %ring3 : f32
+            }
+            scf.yield %not2 : f32
+          }
+          scf.yield %not1 : f32
+        }
+        scf.yield %ringed : f32
+      }
+      %slot2 = index.mul %i, %c4 : index
+      %dst = index.add %slot2, %j : index
+      view.store %tail, %state_view[%dst] : f32, view<[%state_total]xf32>
+      scf.yield %mark : f32
+    }
+  }
+  %in_count = index.cmp ult, %i, %count : index
+  scf.if %in_count {
+    %h = index.rem %i, %num_heads : index
+    %dt = view.load %dt_view[%h] : view<[%num_heads]xf32> -> f32
+    %a_val = view.load %a_view[%h] : view<[%num_heads]xf32> -> f32
+    %alpha_in = view.load %alpha_view[%i] : view<[%count]xf32> -> f32
+    %beta_in = view.load %beta_view[%i] : view<[%count]xf32> -> f32
+    %biased = scalar.addf %alpha_in, %dt : f32
+    %over = scalar.cmpf ogt, %biased, %twenty : f32
+    %softplus = scf.if %over -> (f32) {
+      scf.yield %biased : f32
+    } else {
+      %exponential = scalar.expf<afn> %biased : f32
+      %one_plus = scalar.addf %one, %exponential : f32
+      %logarithm = scalar.logf<afn> %one_plus : f32
+      scf.yield %logarithm : f32
+    }
+    %scaled = scalar.mulf %softplus, %a_val : f32
+    %alpha_out = scalar.expf<afn> %scaled : f32
+    %negative_beta = scalar.mulf %beta_in, %negone : f32
+    %beta_exp = scalar.expf<afn> %negative_beta : f32
+    %denominator = scalar.addf %one, %beta_exp : f32
+    %beta_out = scalar.divf %one, %denominator : f32
+    %twice = index.mul %i, %c2 : index
+    %odd = index.add %twice, %c1 : index
+    view.store %alpha_out, %ab_view[%twice] : f32, view<[%ab_total]xf32>
+    view.store %beta_out, %ab_view[%odd] : f32, view<[%ab_total]xf32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_deltanet_prep_ab.batch=2, .qkv_size=16, .num_heads=4.
+check.case public @yah_deltanet_prep_ab_case {
+  %alpha = check.file.read.npy path("fixtures/deltanet_prep_ab/input_alpha.npy") : tensor<8xf32>
+  %beta = check.file.read.npy path("fixtures/deltanet_prep_ab/input_beta.npy") : tensor<8xf32>
+  %ssm_a = check.file.read.npy path("fixtures/deltanet_prep_ab/input_ssm_a.npy") : tensor<4xf32>
+  %ssm_dt = check.file.read.npy path("fixtures/deltanet_prep_ab/input_ssm_dt.npy") : tensor<4xf32>
+  %qkv = check.file.read.npy path("fixtures/deltanet_prep_ab/input_qkv.npy") : tensor<32xf32>
+  %state = check.file.read.npy path("fixtures/deltanet_prep_ab/input_state.npy") : tensor<64xf32>
+  %expected_ab = check.file.read.npy path("fixtures/deltanet_prep_ab/expected_ab.npy") : tensor<16xf32>
+  %expected_state = check.file.read.npy path("fixtures/deltanet_prep_ab/expected_state.npy") : tensor<64xf32>
+  %ab = check.generate.fill value(0.0) : tensor<16xf32>
+  kernel.launch @yah_deltanet_prep_ab(%alpha, %beta, %ssm_a, %ssm_dt, %qkv, %state, %ab) : (tensor<8xf32>, tensor<8xf32>, tensor<4xf32>, tensor<4xf32>, tensor<32xf32>, tensor<64xf32>, tensor<16xf32>)
+  check.expect.close actual(%ab) expected(%expected_ab) atol(9.9999999999999995e-07) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
+  check.expect.close actual(%state) expected(%expected_state) atol(0.0) rtol(0.0) nan(same) : tensor<64xf32>
+  check.return
+}
+
+check.benchmark<@yah_deltanet_prep_ab_case> @yah_deltanet_prep_ab_bench
