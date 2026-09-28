@@ -1,0 +1,4 @@
+# rocprof / rocprofv3 output: machine- and run-specific counter dumps.
+.rocprofv3/
+.rocprofv3-*/
+*.rocprof
