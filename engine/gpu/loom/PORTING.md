@@ -48,6 +48,8 @@ explicitly deferred.
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
 | yah_rope_ptr_f32.loom | rope.hip | RoPE from a device position pointer, identity at pos 0 | ported, 0.0064 ms; exact, no fixture |
+| yah_fused_qk_rope_f32.loom | fused.hip | fused QK RMSNorm + RoPE + KV write (decode) | ported, 0.0089 ms; exact, no fixture |
+| yah_fused_qk_rope_batched_f32.loom | prefill_rope.hip | fused QK RMSNorm + RoPE + KV write (batched) | ported, 0.0088 ms; exact, no fixture |
 | - | prefill_attention*.hip, attention_wmma.hip, attention_decode*.hip | WMMA/tiled attention compute, decode-online, split-K, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
@@ -106,7 +108,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 76 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 78 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -118,8 +120,8 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | attention | attention_batched.hip | BatchedAttentionKernel, CausalSoftmaxKernel, WriteBatchedKVCacheKernel, ApplyAttentionGateKernel |
 | attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | tiled, decode-online, split-K, and KV-write variants |
 | QKV projection | qkv.hip | **ported**: Wave32FusedQKVProjectionsKernel_1Row<4> and FusedQKVProjectionsKernel, f32 arm only. **todo**: the BF16, Q8_0 and block-quantized arms (sub-16 table) |
-| fused RoPE | prefill_rope.hip | BatchedFusedQKNormRoPEKvWriteKernel, BatchedRoPEKernel |
-| fused.hip | fused.hip | FusedQKNormRoPEKvWriteKernel |
+| fused RoPE | prefill_rope.hip | **ported**: BatchedFusedQKNormRoPEKvWriteKernel (text path). **todo**: BatchedRoPEKernel |
+| fused.hip | fused.hip | **ported**: FusedQKNormRoPEKvWriteKernel (text path) |
 | dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
 | W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path), ZeroQ8ActTailKernel, BatchedFusedRMSNormQuantizeQ8_1Kernel, BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel (tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, the clip variant, BatchedQuantGEMVKernel |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16, AtbEncodeA, AtbDecodeC (write), AtbDecodeSwiGLU. **todo**: AtbRepack(+Slice, blocked on the sub-16 quant table) |

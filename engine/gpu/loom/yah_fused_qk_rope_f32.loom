@@ -1,0 +1,294 @@
+// YAH fused QK RMSNorm + RoPE + KV write (decode), Loom port of
+// FusedQKNormRoPEKvWriteKernel (text/mRoPE-null path).
+//
+// HIP source: models/qwen/hip/kernels/fused.hip. One block per head: blocks
+// [0, num_heads) norm and rotate Q, blocks [num_heads, num_heads+num_kv_heads) do
+// the same for K and also write the canonical f32 and packed f16 KV caches plus V.
+// Per head:
+//
+//   inv_rms = rsqrt(sum_i x[i]^2 / head_dim + eps)
+//   normed[i] = (x[i] * inv_rms) * weight[i]
+//   angle(p) = pos * (1 / theta^(2p/rotary_dim));  cos/sin
+//   out[p]            = normed[p]*cos - normed[p+half_rot]*sin
+//   out[p+half_rot]   = normed[p]*sin + normed[p+half_rot]*cos
+//
+// The HIP kernel stages the normalized row in 256 floats of LDS and runs a shared
+// tree reduction. The port recomputes the normed value at its point of use and uses
+// one `kernel.workgroup.reduce<addf>`, so no LDS is needed. `RopePosition` returns
+// the physical position for the null mRoPE table, so this covers the text path; the
+// position comes from a device i32 and eps from a one-element buffer.
+//
+// Required config: --config=yah_fused_qk_rope.layer_idx=0 --config=yah_fused_qk_rope.max_context=4
+//                  --config=yah_fused_qk_rope.num_heads=1 --config=yah_fused_qk_rope.num_kv_heads=1
+//                  --config=yah_fused_qk_rope.head_dim=8 --config=yah_fused_qk_rope.rotary_dim=8
+//                  --config=yah_fused_qk_rope.q_elems=8 --config=yah_fused_qk_rope.kv_elems=8
+//                  --config=yah_fused_qk_rope.cache32_elems=32 --config=yah_fused_qk_rope.cache16_elems=32
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_fused_qk_rope.layer_idx : %value: index where [range(%value, 0, 65536)]
+
+config.decl @yah_fused_qk_rope.max_context : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_fused_qk_rope.num_heads : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_fused_qk_rope.num_kv_heads : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_fused_qk_rope.head_dim : %value: index where [range(%value, 8, 65536)]
+
+config.decl @yah_fused_qk_rope.rotary_dim : %value: index where [range(%value, 2, 65536)]
+
+config.decl @yah_fused_qk_rope.q_elems : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_fused_qk_rope.kv_elems : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_fused_qk_rope.cache32_elems : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_fused_qk_rope.cache16_elems : %value: index where [range(%value, 1, 1073741824)]
+
+config.def @yah_fused_qk_rope.theta = 10000000.0 : f32
+
+kernel.def target(@yah_wave32) @yah_fused_qk_rope() {
+  %unit = index.constant 1 : index
+  %num_heads = config.get @yah_fused_qk_rope.num_heads : index
+  %num_kv_heads = config.get @yah_fused_qk_rope.num_kv_heads : index
+  %c256 = index.constant 256 : index
+  %blocks = index.add %num_heads, %num_kv_heads : index
+  kernel.launch.config workgroups(%blocks, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%q: buffer, %k: buffer, %v: buffer, %q_weight: buffer, %k_weight: buffer, %q_out: buffer, %k_out: buffer, %k_cache: buffer, %v_cache: buffer, %k_cache_f16: buffer, %v_cache_f16: buffer, %d_pos: buffer, %eps_buf: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c256 = index.constant 256 : index
+  %two = scalar.constant 2.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %zero = scalar.constant 0.0 : f32
+  %layer_idx = config.get @yah_fused_qk_rope.layer_idx : index
+  %max_context = config.get @yah_fused_qk_rope.max_context : index
+  %num_heads = config.get @yah_fused_qk_rope.num_heads : index
+  %num_kv_heads = config.get @yah_fused_qk_rope.num_kv_heads : index
+  %head_dim = config.get @yah_fused_qk_rope.head_dim : index
+  %rotary_dim = config.get @yah_fused_qk_rope.rotary_dim : index
+  %q_elems = config.get @yah_fused_qk_rope.q_elems : index
+  %kv_elems = config.get @yah_fused_qk_rope.kv_elems : index
+  %cache32_elems = config.get @yah_fused_qk_rope.cache32_elems : index
+  %cache16_elems = config.get @yah_fused_qk_rope.cache16_elems : index
+  %theta = config.get @yah_fused_qk_rope.theta : f32
+  %head_dim_i = index.cast %head_dim : index to i32
+  %head_dimf = scalar.sitofp %head_dim_i : i32 to f32
+  %rotary_dim_i = index.cast %rotary_dim : index to i32
+  %rotary_dimf = scalar.sitofp %rotary_dim_i : i32 to f32
+  %c1i = scalar.constant 1 : i32
+  %half_rot_i = scalar.shrui %rotary_dim_i, %c1i : i32
+  %half_rot = index.cast %half_rot_i : i32 to index
+  %num_heads_m1 = index.sub %num_heads, %c1 : index
+  %kv_heads_m1 = index.sub %num_kv_heads, %c1 : index
+  %kv_width = index.mul %num_kv_heads, %head_dim : index
+  %q_na, %k_na, %v_na, %qw_na, %kw_na, %qo_na, %ko_na, %kc_na, %vc_na, %k16_na, %v16_na, %pos_na, %eps_na = buffer.assume.noalias %q, %k, %v, %q_weight, %k_weight, %q_out, %k_out, %k_cache, %v_cache, %k_cache_f16, %v_cache_f16, %d_pos, %eps_buf : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
+  %q_view = buffer.view %q_na[%base] : buffer -> view<[%q_elems]xf32>
+  %k_view = buffer.view %k_na[%base] : buffer -> view<[%kv_elems]xf32>
+  %v_view = buffer.view %v_na[%base] : buffer -> view<[%kv_elems]xf32>
+  %qw_view = buffer.view %qw_na[%base] : buffer -> view<[%head_dim]xf32>
+  %kw_view = buffer.view %kw_na[%base] : buffer -> view<[%head_dim]xf32>
+  %qo_view = buffer.view %qo_na[%base] : buffer -> view<[%q_elems]xf32>
+  %ko_view = buffer.view %ko_na[%base] : buffer -> view<[%kv_elems]xf32>
+  %kc_view = buffer.view %kc_na[%base] : buffer -> view<[%cache32_elems]xf32>
+  %vc_view = buffer.view %vc_na[%base] : buffer -> view<[%cache32_elems]xf32>
+  %k16_view = buffer.view %k16_na[%base] : buffer -> view<[%cache16_elems]xf16>
+  %v16_view = buffer.view %v16_na[%base] : buffer -> view<[%cache16_elems]xf16>
+  %pos_view = buffer.view %pos_na[%base] : buffer -> view<[%c1]xi32>
+  %eps_view = buffer.view %eps_na[%base] : buffer -> view<[%c1]xf32>
+  %block = kernel.workgroup.id<x> : index
+  %tid = kernel.workitem.id<x> : index
+  %pos_i = view.load %pos_view[%c0] : view<[%c1]xi32> -> i32
+  %posf = scalar.sitofp %pos_i : i32 to f32
+  %pos_idx = index.cast %pos_i : i32 to index
+  %ctx_m1 = index.sub %max_context, %c1 : index
+  %pos_nn = index.max %pos_idx, %c0 : index
+  %pos_b = index.min %pos_nn, %ctx_m1 : index
+  %eps = view.load %eps_view[%c0] : view<[%c1]xf32> -> f32
+  // ---- Q branch ----
+  %is_q = index.cmp ult, %block, %num_heads : index
+  scf.if %is_q {
+    %bq = index.min %block, %num_heads_m1 : index
+    %hb = index.mul %bq, %head_dim : index
+    %local_q = scf.for %i = [%tid to %head_dim step %c256](%acc = %zero : f32) -> (f32) {
+      %ei = index.add %hb, %i : index
+      %xv = view.load %q_view[%ei] : view<[%q_elems]xf32> -> f32
+      %sq = scalar.mulf %xv, %xv : f32
+      %nq = scalar.addf %acc, %sq : f32
+      scf.yield %nq : f32
+    }
+    %total_q = kernel.workgroup.reduce<addf> %local_q : f32
+    %mean_q = scalar.divf %total_q, %head_dimf : f32
+    %me_q = scalar.addf %mean_q, %eps : f32
+    %inv_q = scalar.rsqrtf %me_q : f32
+    %rope_q = scf.for %p = [%tid to %half_rot step %c256](%m1 = %c0 : index) -> (index) {
+      %p1 = index.add %p, %half_rot : index
+      %i0 = index.add %hb, %p : index
+      %i1 = index.add %hb, %p1 : index
+      %q0 = view.load %q_view[%i0] : view<[%q_elems]xf32> -> f32
+      %q1 = view.load %q_view[%i1] : view<[%q_elems]xf32> -> f32
+      %w0 = view.load %qw_view[%p] : view<[%head_dim]xf32> -> f32
+      %w1 = view.load %qw_view[%p1] : view<[%head_dim]xf32> -> f32
+      %n0 = scalar.mulf %q0, %inv_q : f32
+      %n0w = scalar.mulf %n0, %w0 : f32
+      %n1 = scalar.mulf %q1, %inv_q : f32
+      %n1w = scalar.mulf %n1, %w1 : f32
+      %pi = index.cast %p : index to i32
+      %pif = scalar.sitofp %pi : i32 to f32
+      %twop = scalar.mulf %two, %pif : f32
+      %expo = scalar.divf %twop, %rotary_dimf : f32
+      %invfreq = scalar.powf<afn> %theta, %expo : f32
+      %inv = scalar.divf %one, %invfreq : f32
+      %angle = scalar.mulf %posf, %inv : f32
+      %cv = scalar.cosf<afn> %angle : f32
+      %sv = scalar.sinf<afn> %angle : f32
+      %a0 = scalar.mulf %n0w, %cv : f32
+      %a1 = scalar.mulf %n1w, %sv : f32
+      %r0 = scalar.subf %a0, %a1 : f32
+      %b0 = scalar.mulf %n0w, %sv : f32
+      %b1 = scalar.mulf %n1w, %cv : f32
+      %r1 = scalar.addf %b0, %b1 : f32
+      view.store %r0, %qo_view[%i0] : f32, view<[%q_elems]xf32>
+      view.store %r1, %qo_view[%i1] : f32, view<[%q_elems]xf32>
+      scf.yield %m1 : index
+    }
+    %tail_start = index.add %rotary_dim, %tid : index
+    %tail_q = scf.for %i2 = [%tail_start to %head_dim step %c256](%m2 = %c0 : index) -> (index) {
+      %e2 = index.add %hb, %i2 : index
+      %x2 = view.load %q_view[%e2] : view<[%q_elems]xf32> -> f32
+      %w2 = view.load %qw_view[%i2] : view<[%head_dim]xf32> -> f32
+      %n2 = scalar.mulf %x2, %inv_q : f32
+      %n2w = scalar.mulf %n2, %w2 : f32
+      view.store %n2w, %qo_view[%e2] : f32, view<[%q_elems]xf32>
+      scf.yield %m2 : index
+    }
+  }
+  // ---- K branch ----
+  %kv_h_raw = index.sub %block, %num_heads : index
+  %is_k = index.cmp ult, %kv_h_raw, %num_kv_heads : index
+  scf.if %is_k {
+    %kv_h = index.min %kv_h_raw, %kv_heads_m1 : index
+    %hbk = index.mul %kv_h, %head_dim : index
+    %local_k = scf.for %j = [%tid to %head_dim step %c256](%acc2 = %zero : f32) -> (f32) {
+      %ej = index.add %hbk, %j : index
+      %xv2 = view.load %k_view[%ej] : view<[%kv_elems]xf32> -> f32
+      %sq2 = scalar.mulf %xv2, %xv2 : f32
+      %nk = scalar.addf %acc2, %sq2 : f32
+      scf.yield %nk : f32
+    }
+    %total_k = kernel.workgroup.reduce<addf> %local_k : f32
+    %mean_k = scalar.divf %total_k, %head_dimf : f32
+    %me_k = scalar.addf %mean_k, %eps : f32
+    %inv_k = scalar.rsqrtf %me_k : f32
+    %lkv = index.mul %layer_idx, %num_kv_heads : index
+    %lkvh = index.add %lkv, %kv_h : index
+    %lkvhm = index.mul %lkvh, %max_context : index
+    %lkvhmp = index.add %lkvhm, %pos_b : index
+    %kv_off = index.mul %lkvhmp, %head_dim : index
+    %lm = index.mul %layer_idx, %max_context : index
+    %lmp = index.add %lm, %pos_b : index
+    %f16_pre = index.mul %lmp, %kv_width : index
+    %f16_off = index.add %f16_pre, %hbk : index
+    %rope_k = scf.for %p3 = [%tid to %half_rot step %c256](%m3 = %c0 : index) -> (index) {
+      %p3b = index.add %p3, %half_rot : index
+      %j0 = index.add %hbk, %p3 : index
+      %j1 = index.add %hbk, %p3b : index
+      %kk0 = view.load %k_view[%j0] : view<[%kv_elems]xf32> -> f32
+      %kk1 = view.load %k_view[%j1] : view<[%kv_elems]xf32> -> f32
+      %kw0 = view.load %kw_view[%p3] : view<[%head_dim]xf32> -> f32
+      %kw1 = view.load %kw_view[%p3b] : view<[%head_dim]xf32> -> f32
+      %kn0 = scalar.mulf %kk0, %inv_k : f32
+      %kn0w = scalar.mulf %kn0, %kw0 : f32
+      %kn1 = scalar.mulf %kk1, %inv_k : f32
+      %kn1w = scalar.mulf %kn1, %kw1 : f32
+      %p3i = index.cast %p3 : index to i32
+      %p3if = scalar.sitofp %p3i : i32 to f32
+      %twop3 = scalar.mulf %two, %p3if : f32
+      %expo3 = scalar.divf %twop3, %rotary_dimf : f32
+      %invfreq3 = scalar.powf<afn> %theta, %expo3 : f32
+      %inv3 = scalar.divf %one, %invfreq3 : f32
+      %angle3 = scalar.mulf %posf, %inv3 : f32
+      %cv3 = scalar.cosf<afn> %angle3 : f32
+      %sv3 = scalar.sinf<afn> %angle3 : f32
+      %ka = scalar.mulf %kn0w, %cv3 : f32
+      %kb = scalar.mulf %kn1w, %sv3 : f32
+      %kr0 = scalar.subf %ka, %kb : f32
+      %kc2 = scalar.mulf %kn0w, %sv3 : f32
+      %kd = scalar.mulf %kn1w, %cv3 : f32
+      %kr1 = scalar.addf %kc2, %kd : f32
+      view.store %kr0, %ko_view[%j0] : f32, view<[%kv_elems]xf32>
+      view.store %kr1, %ko_view[%j1] : f32, view<[%kv_elems]xf32>
+      %kc_off0 = index.add %kv_off, %p3 : index
+      %kc_off1 = index.add %kv_off, %p3b : index
+      view.store %kr0, %kc_view[%kc_off0] : f32, view<[%cache32_elems]xf32>
+      view.store %kr1, %kc_view[%kc_off1] : f32, view<[%cache32_elems]xf32>
+      %k16_off0 = index.add %f16_off, %p3 : index
+      %k16_off1 = index.add %f16_off, %p3b : index
+      %kr0h = scalar.fptrunc %kr0 : f32 to f16
+      %kr1h = scalar.fptrunc %kr1 : f32 to f16
+      view.store %kr0h, %k16_view[%k16_off0] : f16, view<[%cache16_elems]xf16>
+      view.store %kr1h, %k16_view[%k16_off1] : f16, view<[%cache16_elems]xf16>
+      scf.yield %m3 : index
+    }
+    %tail_start_k = index.add %rotary_dim, %tid : index
+    %tail_k = scf.for %i3 = [%tail_start_k to %head_dim step %c256](%m4 = %c0 : index) -> (index) {
+      %e3 = index.add %hbk, %i3 : index
+      %x3 = view.load %k_view[%e3] : view<[%kv_elems]xf32> -> f32
+      %w3 = view.load %kw_view[%i3] : view<[%head_dim]xf32> -> f32
+      %n3 = scalar.mulf %x3, %inv_k : f32
+      %n3w = scalar.mulf %n3, %w3 : f32
+      view.store %n3w, %ko_view[%e3] : f32, view<[%kv_elems]xf32>
+      %kc_off3 = index.add %kv_off, %i3 : index
+      view.store %n3w, %kc_view[%kc_off3] : f32, view<[%cache32_elems]xf32>
+      %k16_off3 = index.add %f16_off, %i3 : index
+      %n3h = scalar.fptrunc %n3w : f32 to f16
+      view.store %n3h, %k16_view[%k16_off3] : f16, view<[%cache16_elems]xf16>
+      scf.yield %m4 : index
+    }
+    %v_loop = scf.for %i4 = [%tid to %head_dim step %c256](%m5 = %c0 : index) -> (index) {
+      %e4 = index.add %hbk, %i4 : index
+      %vv = view.load %v_view[%e4] : view<[%kv_elems]xf32> -> f32
+      %vc_off = index.add %kv_off, %i4 : index
+      view.store %vv, %vc_view[%vc_off] : f32, view<[%cache32_elems]xf32>
+      %v16_off = index.add %f16_off, %i4 : index
+      %vvh = scalar.fptrunc %vv : f32 to f16
+      view.store %vvh, %v16_view[%v16_off] : f16, view<[%cache16_elems]xf16>
+      scf.yield %m5 : index
+    }
+  }
+  kernel.return
+}
+
+// Requires the config above. One Q head, one KV head of 8 dims, eps = 0 and pos = 0.
+// q = k = v = 1, weights = 1: sum_sq = 8, mean = 1, inv_rms = 1, the rotation is the
+// identity, and every output is exactly 1 in f32 and f16.
+check.case public @yah_fused_qk_rope_case {
+  %q = check.generate.fill value(1.0) : tensor<8xf32>
+  %k = check.generate.fill value(1.0) : tensor<8xf32>
+  %v = check.generate.fill value(1.0) : tensor<8xf32>
+  %qw = check.generate.fill value(1.0) : tensor<8xf32>
+  %kw = check.generate.fill value(1.0) : tensor<8xf32>
+  %q_out = check.generate.fill value(0.0) : tensor<8xf32>
+  %k_out = check.generate.fill value(0.0) : tensor<8xf32>
+  %k_cache = check.generate.fill value(0.0) : tensor<8xf32>
+  %v_cache = check.generate.fill value(0.0) : tensor<8xf32>
+  %k16 = check.generate.fill value(0.0) : tensor<8xf16>
+  %v16 = check.generate.fill value(0.0) : tensor<8xf16>
+  %pos = check.generate.fill value(0) : tensor<1xi32>
+  %eps = check.generate.fill value(0.0) : tensor<1xf32>
+  %e8 = check.generate.fill value(1.0) : tensor<8xf32>
+  %e8c = check.generate.fill value(1.0) : tensor<8xf32>
+  %e16c = check.generate.fill value(1.0) : tensor<8xf16>
+  kernel.launch @yah_fused_qk_rope(%q, %k, %v, %qw, %kw, %q_out, %k_out, %k_cache, %v_cache, %k16, %v16, %pos, %eps) : (tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf16>, tensor<8xf16>, tensor<1xi32>, tensor<1xf32>)
+  check.expect.close actual(%q_out) expected(%e8) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.expect.close actual(%k_out) expected(%e8) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.expect.close actual(%k_cache) expected(%e8c) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.expect.close actual(%v_cache) expected(%e8c) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.expect.close actual(%k16) expected(%e16c) atol(0.0) rtol(0.0) nan(same) : tensor<8xf16>
+  check.expect.close actual(%v16) expected(%e16c) atol(0.0) rtol(0.0) nan(same) : tensor<8xf16>
+  check.return
+}
+
+check.benchmark<@yah_fused_qk_rope_case> @yah_fused_qk_rope_bench
