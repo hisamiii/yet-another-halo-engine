@@ -1,0 +1,62 @@
+// YAH embedding lookup, Loom port of EmbeddingLookupKernel (kF32 table path).
+//
+// HIP source: embed.hip. For the f32 table type:
+//
+//   out[idx] = table[token_id * hidden_size + idx]
+//
+// The HIP kernel also decodes kBF16, kQ8_0 and the block formats through
+// QuantBlockElement. Those are separate ports; this one covers the simple f32
+// row copy so the gather path and the row addressing are verified first.
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_embed.table_elements : %value: index where [range(%value, 1, 268435456)]
+
+config.def @yah_embed.hidden = 5120 : index
+
+config.def @yah_embed.token_id = 0 : index
+
+kernel.def target(@yah_wave32) @yah_embed() {
+  %unit = index.constant 1 : index
+  %hidden = config.get @yah_embed.hidden : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %hidden, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%table: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %hidden = config.get @yah_embed.hidden : index
+  %token_id = config.get @yah_embed.token_id : index
+  %table_elements = config.get @yah_embed.table_elements : index
+
+  %table_noalias, %out_noalias = buffer.assume.noalias %table, %out : buffer, buffer
+  %table_view = buffer.view %table_noalias[%base] : buffer -> view<[%table_elements]xf32>
+  %out_view = buffer.view %out_noalias[%base] : buffer -> view<[%hidden]xf32>
+
+  %lane = kernel.workitem.id<x> : index
+  %wg = kernel.workgroup.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %idx = index.add %wg_base, %lane : index
+
+  %in_range = index.cmp ult, %idx, %hidden : index
+  scf.if %in_range {
+    %row_base = index.mul %token_id, %hidden : index
+    %src = index.add %row_base, %idx : index
+    %v = view.load %table_view[%src] : view<[%table_elements]xf32> -> f32
+    view.store %v, %out_view[%idx] : f32, view<[%hidden]xf32>
+  }
+  kernel.return
+}
+
+check.case public @yah_embed_case {
+  %table = check.generate.iota offset(1.0) step(1.0) : tensor<20480xf32>
+  %out = check.generate.fill value(-1.0) : tensor<5120xf32>
+  %expected = check.generate.iota offset(5121.0) step(1.0) : tensor<5120xf32>
+  kernel.launch @yah_embed(%table, %out) : (tensor<20480xf32>, tensor<5120xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<5120xf32>
+  check.return
+}
+
+check.benchmark<@yah_embed_case> @yah_embed_bench

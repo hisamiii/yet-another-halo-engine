@@ -22,8 +22,8 @@ explicitly deferred.
 | yah_rmsnorm_f32.loom | prefill_norm.hip | batched RMSNorm | ported, 0.0821 ms at 64x5120 |
 | - | prefill_norm.hip | per-head RMSNorm | todo |
 | yah_swiglu_f32.loom | prefill_swiglu.hip | SwiGLU activation (split form) | ported, 0.0126 ms at 327680 elements |
-| - | prefill_rope.hip | RoPE | todo |
-| - | prefill_embed.hip | embedding lookup | todo |
+| yah_rope_f32.loom | rope.hip | RoPE (text path) | ported, 0.0091 ms at 384 pairs |
+| yah_embed_f32.loom | embed.hip | embedding lookup (f32 table) | ported, 0.0087 ms at hidden 5120 |
 | - | prefill_unpack.hip | QG unpack | todo |
 | - | prefill_ssm.hip, ssm_row_split.hip | DeltaNet recurrence | todo |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
