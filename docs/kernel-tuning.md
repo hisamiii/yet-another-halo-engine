@@ -94,7 +94,34 @@ not another sweep, and it is the last item on this page.
 
 **This is clock, and the clock is a function of the kernel.** Efficiency per clock agrees to **0.3%** across the two harnesses that disagreed -- 0.0144 TF/MHz in both -- so there is no hidden code difference. The part has three SCLK levels (600 / 1408 / **2900 MHz**) and **never reaches the top one**: measured across power limits, 80 W gives 1799 MHz / 25.9 TF and 130 W gives 2016 MHz / 28.6 TF, work-per-clock is flat (0.0144, -1.5% between them), `gpu_busy` is ~85% at both, and the sampled maximum is 2221 MHz. The log's own line is that "what is broken is the conversion of watts into clock".
 
-So the 26% is **not a fixed ceiling**: the clock is coupled to the kernel's power draw, and zeroed operands raise it ~20%. A kernel that toggles fewer bits and issues fewer instructions for the same FLOPs raises both the work per clock and the clock itself. At the 2900 MHz level the part never reaches, the peak is on the order of **60 TFLOPS**; at a realistic ~2200 MHz it is ~45, and the production ~30 is about two thirds of that. Treating ~31.5 as "the real rate, no headroom" was the wrong read. (The NPU's 32.4 TF, by contrast, is data-independent, so the two engines are at parity *at the current clock*.)
+So the 26% is **not a fixed ceiling**: the clock is coupled to the kernel's power draw, and zeroed operands raise it ~20%. A kernel that toggles fewer bits and issues fewer instructions for the same FLOPs raises both the work per clock and the clock itself. At the 2900 MHz level the part never reaches, the peak is on the order of **60 TFLOPS**; at a realistic ~2200 MHz it is ~45, and the production ~30 is about two thirds of that. Treating ~31.5 as "the real rate, no headroom" was the wrong read. (The NPU's
+32.4 TF, by contrast, is data-independent, so the two engines are at parity *at
+the current clock*.)
+
+**Correction: the clock does reach the top level, and it falls as load rises.**
+Re-measured with SCLK and package power sampled at 20 Hz *inside the timed
+prefill window* rather than over the whole process — the whole process is
+dominated by weight registration and by `Reset()`'s memsets, which are high
+clock and low information, see [methodology.md](methodology.md):
+
+| prefill, mixed artifact | |
+| --- | ---: |
+| SCLK mean / max | ~2300 MHz / **2809 MHz** |
+| package power mean | **~95 W** against a 130 W cap |
+| Tctl | ~94 °C |
+
+Two of the numbers above have to be read against that. "The 2900 MHz level the
+part never reaches" is a property of whatever was being sampled, not of the
+part: a plain prefill approaches it, and the DPM table is not even fixed — level
+1 read 827 MHz and later 1027 MHz. And at ~95 W mean the 130 W cap was not
+binding, so the 80 W / 130 W pair was not measuring a power ceiling either.
+
+The coupling runs opposite to the naive reading, and it matters for tuning:
+**clock falls as load rises.** A light region with few active CUs sits near
+2700 MHz; adding work draws more power and pulls it back to ~2300. So an
+efficient kernel is rewarded twice — more work per clock *and* a better
+operating point — and a wall-clock delta cannot on its own be attributed to
+instructions. Work per clock is the quantity that survives a session change.
 
 int4 is the only measured lever above 1.5x: 52.6 TMAC/s, 2.1x int8 and 2.2x fp16. It requires four-bit activations, so it is a quality decision, and it is eligibility-bound (Q4_K/Q3_K, a low-double-digit percent of these shards).
 
