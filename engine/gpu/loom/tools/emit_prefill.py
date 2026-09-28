@@ -18,6 +18,7 @@ FMT = {
     11: ("q3k", "q3k", 256), 23: ("iq4xs", "iq4xs", 256), 21: ("iq3s", "iq3s", 256),
     18: ("iq3xxs", "iq3xxs", 256), 20: ("iq4nl", "iq4nl", 32),
     17: ("iq2xs", "iq2xs", 256), 8: ("q8_0", "q8_0", 32),
+    16: ("iq2xxs", "iq2xxs", 256), 10: ("q2k", "q2k", 256),
 }
 KSTORE = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight",
           "ssm_beta.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",

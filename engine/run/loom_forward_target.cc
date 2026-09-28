@@ -52,6 +52,8 @@ bool FmtOf(std::uint32_t type, Fmt* out) {
     case 20: *out = {"iq4nl", 32}; return true;
     case 17: *out = {"iq2xs", 256}; return true;
     case 8: *out = {"q8_0", 32}; return true;
+    case 16: *out = {"iq2xxs", 256}; return true;
+    case 10: *out = {"q2k", 256}; return true;
     default: return false;
   }
 }
@@ -160,9 +162,15 @@ int main(int argc, char** argv) {
     LoomBuffer grid_iq3s = gpu.Allocate(std::size_t{512} * 4);
     LoomBuffer grid_iq3xxs = gpu.Allocate(std::size_t{256} * 4);
     LoomBuffer ksigns_iq3xxs = gpu.Allocate(std::size_t{128});
+    LoomBuffer grid_iq2xxs = gpu.Allocate(std::size_t{512} * 4);
+    LoomBuffer grid_iq2xs = gpu.Allocate(std::size_t{1024} * 4);
+    LoomBuffer ksigns_iq2xxs = gpu.Allocate(std::size_t{128});
     { std::vector<std::uint8_t> v(512 * 4); ReadFile((dir + "/grid_iq3s.bin").c_str(), v.data(), v.size()); gpu.H2D(grid_iq3s, v.data(), v.size()); }
     { std::vector<std::uint8_t> v(256 * 4); ReadFile((dir + "/grid_iq3xxs.bin").c_str(), v.data(), v.size()); gpu.H2D(grid_iq3xxs, v.data(), v.size()); }
     { std::vector<std::uint8_t> v(128); ReadFile((dir + "/ksigns_iq3xxs.bin").c_str(), v.data(), v.size()); gpu.H2D(ksigns_iq3xxs, v.data(), v.size()); }
+    { std::vector<std::uint8_t> v(512 * 4); ReadFile((dir + "/grid_iq2xxs.bin").c_str(), v.data(), v.size()); gpu.H2D(grid_iq2xxs, v.data(), v.size()); }
+    { std::vector<std::uint8_t> v(1024 * 4); ReadFile((dir + "/grid_iq2xs.bin").c_str(), v.data(), v.size()); gpu.H2D(grid_iq2xs, v.data(), v.size()); }
+    { std::vector<std::uint8_t> v(128); ReadFile((dir + "/ksigns_iq2xxs.bin").c_str(), v.data(), v.size()); gpu.H2D(ksigns_iq2xxs, v.data(), v.size()); }
 
     LoomBuffer hidden = gpu.Allocate(std::size_t{kP} * kHidden * 4);
     LoomBuffer reszero = gpu.Allocate(std::size_t{kB} * kHidden * 4);
@@ -253,7 +261,9 @@ int main(int argc, char** argv) {
       std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
-      if (f.name == std::string("iq3xxs")) b.push_back({ksigns_iq3xxs.handle, 0, hb(ksigns_iq3xxs)});
+      if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
+      if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
+      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
       b.push_back({scratch.handle, 0, hb(scratch)});
       b.push_back({wstage.handle, 0, hb(wstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
@@ -273,7 +283,9 @@ int main(int argc, char** argv) {
       std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
-      if (f.name == std::string("iq3xxs")) b.push_back({ksigns_iq3xxs.handle, 0, hb(ksigns_iq3xxs)});
+      if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
+      if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
+      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
       b.push_back({scratch.handle, 0, hb(scratch)});
       b.push_back({gateffn.handle, 0, hb(gateffn)});
       b.push_back({uwstage.handle, 0, hb(uwstage)});
@@ -294,7 +306,9 @@ int main(int argc, char** argv) {
       std::vector<hrx_buffer_ref_t> b = {{w.buf.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
-      if (f.name == std::string("iq3xxs")) b.push_back({ksigns_iq3xxs.handle, 0, hb(ksigns_iq3xxs)});
+      if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
+      if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
+      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
       b.push_back({input.handle, 0, hb(input)});
       b.push_back({wstage.handle, 0, hb(wstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
@@ -415,10 +429,6 @@ int main(int argc, char** argv) {
       run_kstore(pre + "ffn_gate.weight", gateffn);
       run_swiglu(pre + "ffn_up.weight");
       run_residual(pre + "ffn_down.weight", ffnup);
-      { gpu.Synchronize(); std::vector<float> h(std::size_t{kB} * kHidden);
-        gpu.D2H(hidden, h.data(), h.size() * 4, 0);
-        char pp[128]; std::snprintf(pp, sizeof(pp), "/tmp/loom_iq4xs_layers/layer_%u.bin", l);
-        FILE* ff = std::fopen(pp, "wb"); std::fwrite(h.data(), 4, h.size(), ff); std::fclose(ff); }
     }
     gpu.Synchronize();
     const double layer_ms = std::chrono::duration<double, std::milli>(
