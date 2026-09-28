@@ -305,6 +305,34 @@ Reachability evidence for the entries that are not on that route:
 | dflash | dflash_kernels.hip | **ported**: grouped dynamic convolution, q8_0 quantization, silu_mul, selector partial top-k. **parked** by instruction: non-causal attention (2), selector finalize (+batch) |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 
+### Remaining decode-only work (the prefill route is complete)
+
+Every launch Prefill can make is ported. The open items below are reached only
+from `Decode` (forward.hip:669) and are the mixed-format forms of kernels that
+already have a single-format port:
+
+- `Wave32FusedQKVProjectionsKernel_1Row` (qkv.hip) is ported for Q4_K on all three
+  bands. On this shard the (q,k,v) triples are all mixed (e.g. IQ4_XS/Q5_K/Q5_K),
+  so the useful completion is one kernel that dispatches the band format at run
+  time. Loom `func.def` can take dependent-extent views, so one decode function per
+  format plus a per-band `scf.if` chain covers it without duplicating the decoder.
+- `Wave32FusedSSMInputProjectionsKernel_1Row` (ssm.hip) is the same shape with four
+  bands (qkv, gate, alpha, beta); alpha and beta are Q8_0 on every layer here.
+- `Wave32FusedQuantSwiGLUGEMVKernel_2Rows` (swiglu.hip) is the production decode
+  FFN. HIP statically specializes same-format Q4_K/Q5_K/IQ4_XS and four mixed
+  pairs and otherwise falls back to a runtime `QuantWarpBlockDot` dispatch; the
+  Loom port is the Q4_K arm (`yah_fused_swiglu_q4k_f32`), so the runtime-gate/up
+  form is the open piece.
+- `DeltaNetRecurrenceKernel<float, Resident=true, WriteOutput=true>`
+  (deltanet_decode.hpp) is the resident fp32 decode recurrence. The prefill
+  row-split recurrence is ported (`yah_deltanet_rowsplit_f32`); this resident
+  variant is a distinct kernel.
+- `attention_decode.hip` fp32-cache arms, the ShareKv split-K arm, the
+  `attention_decode_graph.hip` pointer/graph variants and the baseline
+  `AttentionKernel`/`AttentionHalfKernel` are selected by the KV-storage and
+  split-K config, not by this shard s default fp16 online path.
+- `CaptureBatchedSsmReplayKernel` runs only when replay capture is enabled.
+
 ## Notes carried over from the FFN GEMM port
 
 - `--measure=auto` selects `case_end_to_end` for a `check.case`. Kernel time needs
