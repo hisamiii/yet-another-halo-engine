@@ -781,3 +781,36 @@ The standing result is therefore v3 at 1.819 ms against the HIP fp16 control at
 1.353 ms, a 1.34x gap. Its own load path alone measures 1.727 ms, so the compute is
 5% and the entire remaining question is memory-path efficiency that none of the
 twelve variants or three probes has been able to move in the right direction.
+
+### Loop schedule choice: recurrence is the best of the four
+
+Only schedule(recurrence) had been used. The other accepted forms were swept at depth
+3 / unroll 2 with everything else fixed:
+
+| schedule | vector VGPR | spills | time |
+| --- | ---: | ---: | ---: |
+| **recurrence** | 200 | 0 | **1.819 ms** |
+| interleaved | 200 | 0 | 1.9895 ms |
+| linear | 200 | 0 | 1.9895 ms |
+| locked | - | - | rejected: not valid on scf.for |
+
+interleaved and linear produce byte-identical timings (same mean, min, max and p50),
+so they lower to the same program here. recurrence is 9% faster than either. The
+schedule knob is therefore closed as well.
+
+### What is left is below the source language
+
+With tile, schedule, depth, unroll, operand layout, workgroup packing and LDS staging
+all swept, the remaining 1.34x lives in how Loom lowers a global fragment load. The
+report records a null strategy on those packets and the fragment-memory machinery sits
+in target/arch/amdgpu/lower/fragment_memory/, with no author-selectable strategy:
+mixed_fragment_memory_strategy is a diagnostic reason key, not a knob. The compile
+report offers only two suggestions for this kernel, scf.compare_pipeline_depth and
+amdgpu.residency_cliff, and both have been run to a result.
+
+So the honest summary of the Loom GPU experiment: the authoring path works, the
+correctness case holds, the kernel went from 5.979 ms to 1.819 ms over twelve variants,
+and it now sits 1.34x behind a hand-tuned HIP kernel whose own load path alone costs
+less than this kernel load path by a margin no source-level change has been able to
+close. Further progress needs a change in the fragment-load lowering, not in the
+kernel.
