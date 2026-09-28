@@ -293,7 +293,7 @@ Reachability evidence for the entries that are not on that route:
 | Area | File | Kernels |
 | --- | --- | --- |
 | DeltaNet / SSM (5.1%) | ssm_row_split.hip | all five kernels **ported** (row split, prep alpha/beta, prep K/Q, conv, post-norm gate fp32 + fp16). The 5.1% prefill block is now covered end to end. |
-| DeltaNet / SSM | ssm_recurrence.hip | BatchedDeltaNetRecurrenceKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel |
+| DeltaNet / SSM | ssm_recurrence.hip | BatchedSSMConvKernel **ported** (`yah_ssm_conv_f32`), BatchedSSMPostNormGateKernel **ported** (`yah_ssm_postnorm_gate_f32`); BatchedDeltaNetRecurrenceKernel is the `YAH_SSM_BASELINE` cross-check only |
 | DeltaNet / SSM | batched_ssm.hip, ssm.hip, ssm_decode_recurrence.hip | BatchedSSMPostNormGateKernel, FusedSSMInputProjectionsKernel, SSMConvKernel, CaptureBatchedSsmReplayKernel |
 | attention (2.1%) | attention_wmma.hip, attention_tile.hip | **ported**: PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel, WmmaCausalAttention. QwenTiledAttentionKernel is **dead** (no launcher call site); see the route audit |
 | attention | attention_batched.hip | BatchedAttentionKernel, CausalSoftmaxKernel, WriteBatchedKVCacheKernel, ApplyAttentionGateKernel |
@@ -307,38 +307,49 @@ Reachability evidence for the entries that are not on that route:
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path, and the Q4_K, Q6_K, Q3_K, IQ4_XS, Q5_K, IQ4_NL, IQ3_S and IQ3_XXS arms of Q8KBlockGEMVKernel — the output projection of this shard is Q6_K, so that arm is on the prefill route. **todo**: the bf16 GEMV path and the Q8_0/Q8_K fast arms (Q8_0 owns ssm_alpha/beta and two attn_k/v blocks) |
 | sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm), SpeculativeSegmentMaxKernel, SpeculativeSegmentWeightsKernel, SpeculativeSegmentResidualKernel, SpeculativeSegmentSelectKernel, LinearSamplingKernel, SortedSamplingKernel (f32 thresholds). **todo**: SortedSpeculativeSampling, LinearSpeculativeSampling, the Partial/MapIndices argmax arms |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
-| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 and Q3_K arms; token_embd is Q3_K here), and the Q4_K fused SwiGLU GEMV (the production decode FFN). **todo**: FastFusedSwiGLUGEMVBlockKernel (the bf16/Q8 legacy fallback), the BF16/Q8_0 lookup arms |
+| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 and Q3_K arms; token_embd is Q3_K here), and the Q4_K fused SwiGLU GEMV (the production decode FFN). **off-route**: FastFusedSwiGLUGEMVBlockKernel (needs a F32 gate/up), the BF16/Q8_0 lookup arms (no such table format) |
 | dflash | dflash_kernels.hip | **ported**: grouped dynamic convolution, q8_0 quantization, silu_mul, selector partial top-k. **parked** by instruction: non-causal attention (2), selector finalize (+batch) |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 
-### Remaining decode-only work (the prefill route is complete)
+### Route coverage
 
-Every launch Prefill can make is ported. The open items below are reached only
-from `Decode` (forward.hip:669) and are the mixed-format forms of kernels that
-already have a single-format port:
+Every launch on the active (default) prefill and decode routes now has a Loom
+port. Prefill uses the row-split SSM branch (forward.hip:562) and no
+mixed-format kernels; decode adds the mixed-format projections, the resident
+recurrence, the state-advancing decode convolution and the ShareKv split-K arm:
 
-- `Wave32FusedQKVProjectionsKernel_1Row` (qkv.hip) is **ported** for the mixed
-  per-band formats (`yah_qkv_decode_f32.loom`). One `func.def` per format plus a
-  per-band `scf.if` chain; the band weight buffer is read through one i8/f16 view
-  sized to the band maximum, so its contract is a max-sized weight buffer.
-- `Wave32FusedSSMInputProjectionsKernel_1Row` (ssm.hip) is **ported**
-  (`yah_ssm_proj_decode_f32.loom`): four bands (qkv, gate, alpha, beta), alpha
-  and beta Q8_0, one max-stride view per band.
-- `Wave32FusedQuantSwiGLUGEMVKernel_2Rows` (swiglu.hip) runtime-gate/up form is
-  **ported** (`yah_swiglu_decode_f32.loom`) for all ten FFN formats, including
-  IQ2_XS (grid+ksigns) and IQ2_S (grid).
+- `Wave32FusedQKVProjectionsKernel_1Row` (qkv.hip) mixed per-band formats:
+  `yah_qkv_decode_f32.loom`.
+- `Wave32FusedSSMInputProjectionsKernel_1Row` (ssm.hip):
+  `yah_ssm_proj_decode_f32.loom`.
+- `Wave32FusedQuantSwiGLUGEMVKernel_2Rows` (swiglu.hip) runtime gate/up, all ten
+  FFN formats: `yah_swiglu_decode_f32.loom`.
 - `DeltaNetRecurrenceKernel<float, Resident=true, WriteOutput=true>`
-  (deltanet_decode.hpp) is **ported** (`yah_deltanet_decode_resident_f32.loom`),
-  the single-token decode recurrence reached from `LaunchSSMConvRecurrence`. A
-  numpy float64 oracle checks the full state walk and the production case is
-  analytic at 32 heads / 16 key heads.
-- `attention_decode.hip` **ShareKv split-K arm ported**
-  (`yah_decode_splitk_sharekv_f16.loom`); it is on the default route because this
-  shard is 24:4 = 6:1 and `split_k_decode_` defaults true, so once `pos+1 >= 512`
-  HIP selects it. The fp32-cache arms, the `attention_decode_graph.hip`
-  pointer/graph variants and the baseline `AttentionKernel`/`AttentionHalfKernel`
-  remain config-gated (KV storage must not be f16, or the shape must be unsupported).
-- `CaptureBatchedSsmReplayKernel` runs only when replay capture is enabled.
+  (deltanet_decode.hpp): `yah_deltanet_decode_resident_f32.loom`.
+- `SSMConvKernel` (ssm_decode_recurrence.hip), the state-advancing decode
+  convolution: `yah_ssm_conv_decode_f32.loom`.
+- `QwenDecodeSplitKAttentionHalfPartialsKernel<true, 32>` ShareKv arm:
+  `yah_decode_splitk_sharekv_f16.loom`.
+
+The kernels below have no Loom port. None is on the default route: each needs a
+non-default config, an explicit env var, or is dead on this shard.
+
+- `BatchedDeltaNetRecurrenceKernel` (ssm_recurrence.hip) is the prefill SSM
+  cross-check behind `YAH_SSM_BASELINE` (forward.hip:562); the default branch is
+  `LaunchBatchedSSMConvRecurrenceRowSplit`, whose kernels are all ported.
+- `QwenDecodeOnlineAttentionKernel`, `QwenDecodeSplitKAttentionPartialsKernel`
+  (fp32-cache arms) and the baseline `AttentionKernel`/`AttentionHalfKernel`:
+  `Decode` always passes `k_cache = v_cache = nullptr` (forward.hip:694), so only
+  the fp16 arms run; the baselines also need `head_dim != 256` or a non-divisible
+  head ratio.
+- `attention_decode_graph.hip` variants: not called from `forward.hip`.
+- Q8_0/bf16 `Q8KBlockGEMVKernel` arms and `FastFusedSwiGLUGEMVBlockKernel`: no
+  Q8_0 down-projection, bf16, or F32/bf16 gate/up tensor exists on this shard.
+- `CaptureBatchedSsmReplayKernel`: runs only when replay capture is enabled.
+- W8A8BlockedWmmaGEMMKernel, BatchedQuantGEMVKernel, TiledBatchedQ8_0GEMMKernel,
+  SmallBatchQ8KFp32GEMMKernel, the clip-variant quantizer, the generic sub-16
+  decoder / Q8_1 dequantizer and AtbRepack(+Slice): dead on the current route.
+- dflash draft kernels: parked by instruction.
 
 ## Notes carried over from the FFN GEMM port
 
