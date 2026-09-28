@@ -165,6 +165,28 @@ __global__ void QuantizeDequantizeFp32Kernel(float* __restrict__ x,
   }
 }
 
+__global__ void QuantizeDequantizeFp16Kernel(__half* __restrict__ x,
+                                              std::size_t blocks,
+                                              std::size_t row_blocks,
+                                              int levels) {
+  const std::size_t block = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (block >= blocks) return;
+  const std::size_t row = block / row_blocks;
+  const std::size_t col = block % row_blocks;
+  __half* in = x + (((row * row_blocks) + col) * kKvBlock);
+  float amax = 0.0F;
+  for (std::size_t i = 0; i < kKvBlock; ++i) {
+    amax = fmaxf(amax, fabsf(__half2float(in[i])));
+  }
+  const float scale = amax > 0.0F ? amax / static_cast<float>(levels) : 0.0F;
+  if (scale == 0.0F) return;
+  const long hi = static_cast<long>(levels);
+  for (std::size_t i = 0; i < kKvBlock; ++i) {
+    const long q = lroundf(__half2float(in[i]) / scale);
+    in[i] = __float2half_rn(static_cast<float>(max(-hi, min(hi, q))) * scale);
+  }
+}
+
 void CheckLaunch(hipError_t status, const char* what) {
   if (status != hipSuccess) {
     throw std::runtime_error(std::string("kv quant: ") + what + ": " +
@@ -191,6 +213,25 @@ inline void LaunchQuantizeDequantizeFp32(float* x, std::size_t rows,
   QuantizeDequantizeFp32Kernel<<<grid, block_size, 0, stream>>>(
       x, blocks, row_blocks, levels);
   CheckLaunch(hipGetLastError(), "qdq fp32 launch");
+}
+
+// FP16 twin of the above, for the FFN activations. An int4 WMMA takes four-bit
+// operands on *both* sides -- there is no w4a16 int4 instruction -- so pricing
+// the w4a4 route means pricing a 4-bit activation first. This applies the same
+// per-32 block scale the weight quantizer uses, with the same clamp, so the
+// only error it introduces is the activation quantization the MMA would have.
+inline void LaunchQuantizeDequantizeFp16(__half* x, std::size_t rows,
+                                         std::size_t row_elements, int levels,
+                                         hipStream_t stream = nullptr) {
+  if (rows == 0 || levels <= 0) return;
+  const std::size_t row_blocks = row_elements / kKvBlock;
+  const std::size_t blocks = rows * row_blocks;
+  const unsigned int block_size = 128;
+  const unsigned int grid =
+      static_cast<unsigned int>((blocks + block_size - 1) / block_size);
+  QuantizeDequantizeFp16Kernel<<<grid, block_size, 0, stream>>>(
+      x, blocks, row_blocks, levels);
+  CheckLaunch(hipGetLastError(), "qdq fp16 launch");
 }
 
 // Applies the orthonormal Hadamard rotation to each row of a [rows, dim]

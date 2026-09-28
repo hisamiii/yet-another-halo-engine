@@ -283,6 +283,36 @@ instructions. Work per clock is the quantity that survives a session change.
 
 int4 is the only measured lever above 1.5x: 52.6 TMAC/s, 2.1x int8 and 2.2x fp16. It requires four-bit activations, so it is a quality decision, and it is eligibility-bound (Q4_K/Q3_K, a low-double-digit percent of these shards).
 
+### The int4 lever is priced, and it is expensive
+
+int4 WMMA is the only measured lever above 1.5x on this part -- 52.6 TMAC/s,
+2.1x int8 and 2.2x fp16. It is not a scheduling or format choice, it is an
+accuracy choice, and the instruction takes four-bit operands on **both** sides:
+there is no w4a16 int4 path, so a w4a4 operand error has to be accepted.
+
+That error is measurable before the kernel exists. YAH_QFFN=4 rounds the FFN
+activations in place with the same per-32 block scale and clamp the cache
+quantizer uses, which is the operand error the MMA would introduce; the
+accumulation is fp32 either way. Next-token KLD against the f16 reference over
+512 tokens of repo prose, all arms on f16 KV so the activation rounding is the
+only variable:
+
+| config | KLD mean | KLD p99 | top-1 same | implied perplexity |
+| --- | ---: | ---: | ---: | ---: |
+| FFN activations 4-bit | 0.034560 | 0.219102 | 90.62% | **+3.52%** |
+| FFN activations 3-bit | 0.127120 | 0.762251 | 83.98% | +13.56% |
+| FFN activations 2-bit | 1.433313 | 6.846752 | 51.76% | +319% |
+| q4 KV, for scale | 0.005012 | 0.028196 | 97.85% | +0.50% |
+
+Four-bit activations alone cost seven times what a q4 KV cache costs, and 3-bit
+is worse than anything else measured here. That is *before* the weight side: the
+instruction needs uniform 4-bit weights, and this artifact's FFN is IQ3/IQ4,
+which are non-uniform codebooks, so those tensors would have to be requantized
+to uniform int4 as well -- a second loss on top, and a requantization the
+project has ruled out. The standard mitigation is an offline Hadamard rotation
+absorbed into the weights (W_rot = W @ H), which costs nothing at run time but
+requires storing transformed weights; it is not tested here.
+
 **So "autotune the GPU" is not an open tile search.** The tile space is closed and the structural limits (LDS, workgroup size) are hit. What remains is the unexplained K-loop residual and format-level choices, not parameter sweeps.
 
 ## NPU: the stock 15% capture is a tiling artifact

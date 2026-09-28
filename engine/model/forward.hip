@@ -56,6 +56,7 @@ using yah::kv::LaunchDequantizeKvRows;
 using yah::kv::LaunchHadamardInPlace;
 using yah::kv::LaunchQuantizeDequantizeFp32;
 using yah::kv::LaunchHadamardInPlaceHalf;
+using yah::kv::LaunchQuantizeDequantizeFp16;
 using yah::kv::LaunchQuantizeKvRows;
 
 [[nodiscard]] inline gufo::core::GgmlType Gt(core::GgmlType type) {
@@ -235,6 +236,16 @@ class Forward {
     // six query heads. YAH_SPLITK=0 restores the reference path.
     split_k_decode_ = std::getenv("YAH_SPLITK") == nullptr ||
                       std::atoi(std::getenv("YAH_SPLITK")) != 0;
+    // Diagnostic: rounds the FFN activations (both the gate/up input and the
+    // down input) to the same per-32 block grid a w4a4 operand would use, so
+    // the quality cost of four-bit activations can be priced before the int4
+    // WMMA path exists. 7 for 4 bits, 3 for 3, 1 for 2; 0 disables.
+    if (const char* qffn = std::getenv("YAH_QFFN")) {
+      qffn_levels_ = static_cast<int>(std::atoi(qffn)) == 4
+                         ? 7
+                         : (static_cast<int>(std::atoi(qffn)) == 3 ? 3 : 1);
+      if (std::atoi(qffn) <= 0) qffn_levels_ = 0;
+    }
     if (const char* qattn = std::getenv("YAH_QATTN")) {
       switch (std::atoi(qattn)) {
         case 4: qattn_levels_ = 7; break;
@@ -591,6 +602,11 @@ class Forward {
           reinterpret_cast<const float*>(layer.post_attention_norm.data),
           /*sum_out=*/nullptr, buffers_.scratch_f16, batch, hidden_,
           config_.rms_eps, stream_);
+      if (qffn_levels_ > 0) {
+        LaunchQuantizeDequantizeFp16(
+            reinterpret_cast<__half*>(buffers_.scratch_f16), batch, hidden_,
+            qffn_levels_, stream_);
+      }
       const bool paired = TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
           Gt(layer.ffn_gate.type), Gt(layer.ffn_up.type), layer.ffn_gate.data,
           layer.ffn_up.data, buffers_.scratch_f16, buffers_.ffn_up, batch,
@@ -606,6 +622,11 @@ class Forward {
       }
       if (paired_stats) paired_map.push_back(paired ? '1' : '0');
       stage("gate_up", l);
+      if (qffn_levels_ > 0) {
+        LaunchQuantizeDequantizeFp16(
+            reinterpret_cast<__half*>(buffers_.ffn_up), batch, ffn_,
+            qffn_levels_, stream_);
+      }
       LaunchBatchedQuantGEMMResidualFp16(
           Gt(layer.ffn_down.type), layer.ffn_down.data, buffers_.ffn_up,
           buffers_.hidden, batch, hidden_, ffn_, stream_);
@@ -922,6 +943,8 @@ class Forward {
   // Diagnostic: levels Q is rounded to before attention, reproducing a w4a4
   // QK^T's operand error. 7 for 4 bits, 3 for 3, 1 for 2; 0 disables.
   int qattn_levels_{0};
+  // Diagnostic: levels the FFN activations are rounded to; 0 disables.
+  int qffn_levels_{0};
   hipStream_t stream_{nullptr};
   Buffers buffers_;
 };
