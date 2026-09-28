@@ -158,3 +158,20 @@ have, on shapes where our HIP is already reasonable, so the authoring and tuning
 effort to reach parity is real and has to be budgeted. The place Loom is most
 likely to pay is still where HIP is structurally stuck -- the DeltaNet recurrence's
 chunked restructuring -- not where HIP is merely imperfect.
+
+**There is no tuned Loom GEMM to compare against.** `loom/binding/c/benchmark/kernels/`
+looks like the right corpus -- it holds `routed_gate_up_swiglu_q4k_q8_amdgpu.loom`
+(real Q4_K decode, 144 B blocks) and `attention/prefill_f16_wmma_amdgpu.loom` -- but
+its own README says it is "a smoke suite, not a benchmark corpus or model zoo",
+and the drivers beside it (`compile_throughput_benchmark`, `link_throughput_benchmark`,
+`workload_compile_benchmark`) measure **compiler** throughput, not device runtime.
+They exist to prove the production compilation path is exercised, and the Q4_K one is
+a routed MoE shape anyway (128 experts, 8 routes, N=768, 16 tokens), not our dense
+FFN. So the authoring sample above is the only device number Loom currently offers,
+and a fair tuned comparison requires authoring one ourselves.
+
+That is the decision to make deliberately: authoring a Loom kernel at our production
+shape (Q4_K, 2048 x 5120 -> 17408) and comparing against our HIP's 41 TFLOP/s is a
+bounded experiment that either validates the direction or settles it cheaply. If Loom
+lands near parity with modest effort, the DeltaNet restructuring is worth doing there;
+if it is multiples off after real work, the HIP path stays.
