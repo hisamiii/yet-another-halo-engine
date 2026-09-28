@@ -190,6 +190,24 @@ writes the SSM stage buffers (`ssm_qkv`, `ssm_gate`, `ssm_alpha`, `ssm_beta`,
 `mean_abs 5.5e-05`. (The initial 5.05 gap was comparing against the
 post-FFN layer dump, not the mixer.)
 
+`engine/run/loom_attn_layer_probe.cc` runs one full-attention layer end to end
+on Loom: `yah_half_norm`, the Q/K/V Q4_K kStore projections, `yah_unpack_qg`,
+`yah_fused_qk_rope_batched` (QK norm + RoPE + f16 KV cache write), the WMMA
+attention core, the fp32->fp16 cast, and the Q4_K kResidual output projection.
+`YAH_DUMP_LAYER=3` makes the HIP engine dump the attention stages (`attn_q`,
+`attn_k`, `attn_gate`, `attn_out`, `attn_cast`) and `hidden_mixer` for layer 3.
+Results on `base_q4kpure.gguf`: every pre-attention stage within 5e-4,
+`attn_out max_abs 1.9e-04`, and the post-mixer residual `max_abs 5.6e-04`,
+`mean_abs 4.1e-06`.
+
+Two port fixes were needed to get there. The RoPE cache offset added
+`bi*kv_width` on top of `cur = start_pos + bi`, double-counting the token index
+for every batch > 1 (the in-tree case is batch 1, so it passed); the f16 cache
+offset now uses only `kv_h*head_dim`. And the cache stores need `index.min`
+clamps to `cache_elems - head_dim`, because the production-scale offset cannot be
+proven from the declared config ranges (the same reason other ports clamp their
+weight indices).
+
 ## 5. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape

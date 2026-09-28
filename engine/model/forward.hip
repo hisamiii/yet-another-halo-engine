@@ -458,6 +458,10 @@ class Forward {
     // Debug staging: YAH_DUMP_DIR writes the fp32 residual stream after embed
     // and after every layer, so a Loom port can be compared stage by stage.
     const char* dump_dir = std::getenv("YAH_DUMP_DIR");
+    const int dump_layer =
+        std::getenv("YAH_DUMP_LAYER") != nullptr
+            ? std::atoi(std::getenv("YAH_DUMP_LAYER"))
+            : 0;
     const auto dump_hidden = [&](const char* tag, std::uint32_t l) {
       if (dump_dir == nullptr) return;
       char path[512];
@@ -537,6 +541,14 @@ class Forward {
         LaunchBatchedUnpackQG(buffers_.ssm_qkv, buffers_.q,
                               buffers_.ssm_gate, batch, config_.head_count,
                               config_.key_length, stream_);
+        if (static_cast<int>(l) == dump_layer) {
+          dump_bytes("attn_q", buffers_.q,
+                     static_cast<std::size_t>(batch) * attn_ * 4);
+          dump_bytes("attn_k", buffers_.k,
+                     static_cast<std::size_t>(batch) * kv_ * 4);
+          dump_bytes("attn_gate", buffers_.ssm_gate,
+                     static_cast<std::size_t>(batch) * attn_ * 4);
+        }
         const KvView kv_view = WriteKvCache(layer, attn_idx, batch, start_pos);
         const std::size_t ws_bytes =
             static_cast<std::size_t>(config_.head_count_kv) * max_context_ *
@@ -562,9 +574,17 @@ class Forward {
               config_.head_count, config_.head_count_kv, config_.key_length,
               stream_, /*skip_kv_write=*/true);
         }
+        if (static_cast<int>(l) == dump_layer) {
+          dump_bytes("attn_out", buffers_.ssm_out,
+                     static_cast<std::size_t>(batch) * attn_ * 4);
+        }
         LaunchFloatToFp16(buffers_.ssm_out, buffers_.scratch_f16,
                           static_cast<std::size_t>(batch) * attn_,
                           stream_);
+        if (static_cast<int>(l) == dump_layer) {
+          dump_bytes("attn_cast", buffers_.scratch_f16,
+                     static_cast<std::size_t>(batch) * attn_ * 2);
+        }
         LaunchBatchedQuantGEMMResidualFp16(
             Gt(layer.attn_output.type), layer.attn_output.data,
             buffers_.scratch_f16, buffers_.hidden, batch, hidden_, attn_,
@@ -588,7 +608,7 @@ class Forward {
                                    buffers_.beta, batch, ts_rank_, hidden_,
                                    stream_);
         stage("ssm_proj", l);
-        if (l == 0) {
+        if (static_cast<int>(l) == dump_layer) {
           dump_bytes("ssm_qkv", buffers_.ssm_qkv,
                      static_cast<std::size_t>(batch) * ssm_qkv_ * 4);
           dump_bytes("ssm_gate", buffers_.ssm_gate,
@@ -633,7 +653,7 @@ class Forward {
                             static_cast<std::size_t>(batch) * ssm_inner_,
                             stream_);
         }
-        if (l == 0) {
+        if (static_cast<int>(l) == dump_layer) {
           dump_bytes("ssm_raw", buffers_.ssm_out,
                      static_cast<std::size_t>(batch) * ssm_inner_ * 4);
           dump_bytes("ssm_postnorm", buffers_.scratch_f16,
@@ -642,11 +662,15 @@ class Forward {
         LaunchBatchedQuantGEMMResidualFp16(
             Gt(layer.ssm_out.type), layer.ssm_out.data, buffers_.scratch_f16,
             buffers_.hidden, batch, hidden_, ssm_inner_, stream_);
-        if (l == 0) {
+        if (static_cast<int>(l) == dump_layer) {
           dump_bytes("hidden_mixer", buffers_.hidden,
                      static_cast<std::size_t>(batch) * hidden_ * 4);
         }
         stage("ssm", l);
+      }
+      if (static_cast<int>(l) == dump_layer) {
+        dump_bytes("hidden_mixer", buffers_.hidden,
+                   static_cast<std::size_t>(batch) * hidden_ * 4);
       }
       stage("mixer", l);
 
