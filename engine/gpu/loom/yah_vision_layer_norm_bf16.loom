@@ -1,0 +1,109 @@
+// YAH vision layer normalization, Loom port of LayerNorm (vision/encoder.hip).
+//
+// HIP source: models/qwen/vision/encoder.hip. One workgroup per row:
+//
+//   mean  = sum_j x[j] / width
+//   var   = sum_j (x[j] - mean)^2 / width
+//   scale = 1 / sqrt(var + 1e-6)
+//   out[j] = bf16((x[j] - mean) * scale * weight[j] + bias[j])
+//
+// The HIP kernel uses 256 threads and two shared-memory reduction trees. This port
+// uses one subgroup per row with lane-strided passes and `kernel.subgroup.reduce`.
+// The two sums are separate passes in both, so the centered values are recomputed.
+//
+// The check is exact, and worth being precise about what it covers. With a uniform
+// row the centered value is exactly zero, so the output is exactly the bias row and
+// the scale and weight are multiplied by zero. That verifies the mean pass, the
+// centered subtraction, the affine add, and the row indexing -- and it is the
+// fixture-free exact point. The variance-and-scale path is NOT independently
+// verified by it. The reason is the bf16 output: numpy has no bf16 dtype, so an
+// expected array can only be stored as bits and compared exactly, and this kernel's
+// 1e-6 epsilon makes the scale inexact even for integer inputs. A tolerance-based
+// bf16 comparison would need a bf16 expectation the toolchain cannot express.
+//
+// The expectation is a periodic iota: every row produces the same bias row, so the
+// flat output repeats with period `width`.
+//
+// Required config: --config=yah_vision_layer_norm.rows=2
+//                  --config=yah_vision_layer_norm.width=8
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_vision_layer_norm.rows : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_vision_layer_norm.width : %value: index where [range(%value, 1, 65536)]
+
+kernel.def target(@yah_wave32) @yah_vision_layer_norm() {
+  %unit = index.constant 1 : index
+  %rows = config.get @yah_vision_layer_norm.rows : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %epsilon = scalar.constant 9.9999999999999995e-07 : f32
+  %rows = config.get @yah_vision_layer_norm.rows : index
+  %width = config.get @yah_vision_layer_norm.width : index
+  %total = index.mul %rows, %width : index
+  %in_na, %w_na, %b_na, %out_na = buffer.assume.noalias %input, %weight, %bias, %output : buffer, buffer, buffer, buffer
+  %in_view = buffer.view %in_na[%base] : buffer -> view<[%rows]x[%width]xf32>
+  %w_view = buffer.view %w_na[%base] : buffer -> view<[%width]xf32>
+  %b_view = buffer.view %b_na[%base] : buffer -> view<[%width]xf32>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%rows]x[%width]xbf16>
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row_sum = scf.for %j = [%lane to %width step %c32](%s = %zero : f32) -> (f32) {
+    %v = view.load %in_view[%row, %j] : view<[%rows]x[%width]xf32> -> f32
+    %next = scalar.addf %s, %v : f32
+    scf.yield %next : f32
+  }
+  %sum_all = kernel.subgroup.reduce<addf> %row_sum : f32
+  %width_i = index.cast %width : index to i32
+  %width_f = scalar.sitofp %width_i : i32 to f32
+  %mean = scalar.divf %sum_all, %width_f : f32
+  %row_var = scf.for %k = [%lane to %width step %c32](%s2 = %zero : f32) -> (f32) {
+    %v2 = view.load %in_view[%row, %k] : view<[%rows]x[%width]xf32> -> f32
+    %centered = scalar.subf %v2, %mean : f32
+    %sq = scalar.mulf %centered, %centered : f32
+    %next2 = scalar.addf %s2, %sq : f32
+    scf.yield %next2 : f32
+  }
+  %var_all = kernel.subgroup.reduce<addf> %row_var : f32
+  %var = scalar.divf %var_all, %width_f : f32
+  %shifted = scalar.addf %var, %epsilon : f32
+  %root = scalar.sqrtf %shifted : f32
+  %scale = scalar.divf %one, %root : f32
+  %sink = scf.for %p = [%lane to %width step %c32](%mark = %zero : f32) -> (f32) {
+    %v3 = view.load %in_view[%row, %p] : view<[%rows]x[%width]xf32> -> f32
+    %w = view.load %w_view[%p] : view<[%width]xf32> -> f32
+    %b = view.load %b_view[%p] : view<[%width]xf32> -> f32
+    %centered3 = scalar.subf %v3, %mean : f32
+    %scaled = scalar.mulf %centered3, %scale : f32
+    %weighted = scalar.mulf %scaled, %w : f32
+    %shifted3 = scalar.addf %weighted, %b : f32
+    %narrow = scalar.fptrunc %shifted3 : f32 to bf16
+    view.store %narrow, %out_view[%row, %p] : bf16, view<[%rows]x[%width]xbf16>
+    scf.yield %mark : f32
+  }
+  kernel.return
+}
+
+// Requires --config=yah_vision_layer_norm.rows=2 --config=yah_vision_layer_norm.width=8.
+//
+// A uniform row makes the centered value exactly zero, so the output is exactly the
+// bias row -- here an iota, so the flat output is a periodic iota at period width.
+// See the header note for what this does and does not cover.
+check.case public @yah_vision_layer_norm_case {
+  %input = check.generate.fill value(1.0) : tensor<2x8xf32>
+  %weight = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %bias = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %output = check.generate.fill value(0.0) : tensor<2x8xbf16>
+  %expected = check.generate.iota offset(0.0) step(1.0) period(8) : tensor<2x8xbf16>
+  kernel.launch @yah_vision_layer_norm(%input, %weight, %bias, %output) : (tensor<2x8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<2x8xbf16>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<2x8xbf16>
+  check.return
+}
+
+check.benchmark<@yah_vision_layer_norm_case> @yah_vision_layer_norm_bench
