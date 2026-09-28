@@ -1,0 +1,230 @@
+// YAH IQ3_S block GEMV, Loom port of Q8KBlockGEMVKernel for the IQ3_S format
+// (gemv_quant.hip). Decode each weight element with the IQ3_S block decoder and
+// dot it against the fp32 activation row:
+//
+//   y[m] = sum_k iq3s_decode(W, m, k) * x[k]
+//
+// One workgroup per output row, 32 lanes, eight elements per 256-wide group and
+// a subgroup add. On this shard IQ3_S owns six FFN-down blocks, so this arm is on
+// the decode route.
+//
+// block_iq3_s is 110 bytes and holds 256 weights ({half d; uint8 qs[64];
+// uint8 qh[8]; uint8 signs[32]; uint8 scales[4]}); the row stride is 20 blocks *
+// 110 = 2200 bytes. Like the kStore port, the 512-word grid is an extra
+// read-only buffer operand (2048 bytes) because Loom has no constant-array
+// literal; qs/qh/signs/scales start at 2/66/74/106.
+//
+// Required config: --config=yah_gemv_iq3s.m_rows=16
+//                  --config=yah_gemv_iq3s.k_blocks=20
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_gemv_iq3s.m_rows : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_gemv_iq3s.k_blocks : %value: index where [range(%value, 1, 65536)]
+
+kernel.def target(@yah_wave32) @yah_gemv_iq3s() {
+  %unit = index.constant 1 : index
+  %m_rows = config.get @yah_gemv_iq3s.m_rows : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%m_rows, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%weight: buffer, %grid: buffer, %x: buffer, %y: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c110 = index.constant 110 : index
+  %c256 = index.constant 256 : index
+  %c511 = index.constant 511 : index
+  %c1100 = index.constant 1100 : index
+  %c2200 = index.constant 2200 : index
+  %c0i = scalar.constant 0 : i32
+  %c1i = scalar.constant 1 : i32
+  %c2i = scalar.constant 2 : i32
+  %c3i = scalar.constant 3 : i32
+  %c4i = scalar.constant 4 : i32
+  %c5i = scalar.constant 5 : i32
+  %c8i = scalar.constant 8 : i32
+  %c15i = scalar.constant 15 : i32
+  %c16i = scalar.constant 16 : i32
+  %c31i = scalar.constant 31 : i32
+  %c66i = scalar.constant 66 : i32
+  %c74i = scalar.constant 74 : i32
+  %c106i = scalar.constant 106 : i32
+  %c110i = scalar.constant 110 : i32
+  %c255i = scalar.constant 255 : i32
+  %c2200i = scalar.constant 2200 : i32
+  %zero = scalar.constant 0.0 : f32
+  %m_rows = config.get @yah_gemv_iq3s.m_rows : index
+  %k_blocks = config.get @yah_gemv_iq3s.k_blocks : index
+  %w_bytes = index.mul %m_rows, %c2200 : index
+  %w_halfs = index.mul %m_rows, %c1100 : index
+  %x_elems = index.mul %k_blocks, %c256 : index
+  %weight_na, %grid_na, %x_na, %y_na = buffer.assume.noalias %weight, %grid, %x, %y : buffer, buffer, buffer, buffer
+  %w_view = buffer.view %weight_na[%base] : buffer -> view<[%w_bytes]xi8>
+  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>
+  %grid_view = buffer.view %grid_na[%base] : buffer -> view<512xi32>
+  %x_view = buffer.view %x_na[%base] : buffer -> view<[%x_elems]xf32>
+  %y_view = buffer.view %y_na[%base] : buffer -> view<[%m_rows]xf32>
+  %m = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %m_i = index.cast %m : index to i32
+  %lane_i = index.cast %lane : index to i32
+  %w_last = index.sub %w_bytes, %c1 : index
+  %w_half_last = index.sub %w_halfs, %c1 : index
+  %x_last = index.sub %x_elems, %c1 : index
+  %acc0 = scf.for %kblk = [%c0 to %k_blocks step %c1](%a0 = %zero : f32) -> (f32) {
+    %kblk_i = index.cast %kblk : index to i32
+    %row_off = scalar.muli %m_i, %c2200i : i32
+    %blk_off0 = scalar.muli %kblk_i, %c110i : i32
+    %blk_off = scalar.addi %row_off, %blk_off0 : i32
+    %kblk256 = scalar.shli %kblk_i, %c8i : i32
+    %acc1 = scf.for %j = [%c0 to %c8 step %c1](%a1 = %a0 : f32) -> (f32) {
+      %j_i = index.cast %j : index to i32
+      %j32 = scalar.shli %j_i, %c5i : i32
+      %i_i = scalar.addi %lane_i, %j32 : i32
+      %group = scalar.shrui %i_i, %c5i : i32
+      %half0 = scalar.shrui %i_i, %c4i : i32
+      %half = scalar.andi %half0, %c1i : i32
+      %jj = scalar.andi %i_i, %c15i : i32
+      %q = scalar.shrui %jj, %c3i : i32
+      %which0 = scalar.shrui %jj, %c2i : i32
+      %which = scalar.andi %which0, %c1i : i32
+      %b = scalar.andi %jj, %c3i : i32
+      %l2 = scalar.shli %half, %c1i : i32
+      %l = scalar.addi %l2, %q : i32
+      %g8 = scalar.shli %group, %c3i : i32
+      %qso = scalar.addi %blk_off, %c2i : i32
+      %g8a = scalar.addi %qso, %g8 : i32
+      %l2x = scalar.shli %l, %c1i : i32
+      %lw = scalar.addi %l2x, %which : i32
+      %qlo_i = scalar.addi %g8a, %lw : i32
+      %qlo_ix = index.cast %qlo_i : i32 to index
+      %qlo_lo = index.max %qlo_ix, %c0 : index
+      %qlo_idx = index.min %qlo_lo, %w_last : index
+      %qlob8 = view.load %w_view[%qlo_idx] : view<[%w_bytes]xi8> -> i8
+      %grid_lo = scalar.extui %qlob8 : i8 to i32
+      %qho = scalar.addi %blk_off, %c66i : i32
+      %qh_i = scalar.addi %qho, %group : i32
+      %qh_ix = index.cast %qh_i : i32 to index
+      %qh_lo = index.max %qh_ix, %c0 : index
+      %qh_idx = index.min %qh_lo, %w_last : index
+      %qhb8 = view.load %w_view[%qh_idx] : view<[%w_bytes]xi8> -> i8
+      %qhb = scalar.extui %qhb8 : i8 to i32
+      %hbit0 = scalar.shrui %qhb, %lw : i32
+      %hbit = scalar.andi %hbit0, %c1i : i32
+      %hbit8 = scalar.shli %hbit, %c8i : i32
+      %gidx_i = scalar.ori %grid_lo, %hbit8 : i32
+      %gidx_ix = index.cast %gidx_i : i32 to index
+      %gidx_lo = index.max %gidx_ix, %c0 : index
+      %gidx = index.min %gidx_lo, %c511 : index
+      %gword = view.load %grid_view[%gidx] : view<512xi32> -> i32
+      %g_shift = scalar.shli %b, %c3i : i32
+      %gb0 = scalar.shrui %gword, %g_shift : i32
+      %g_byte = scalar.andi %gb0, %c255i : i32
+      %sg4 = scalar.shli %group, %c2i : i32
+      %sgo = scalar.addi %blk_off, %c74i : i32
+      %sg1 = scalar.addi %sgo, %sg4 : i32
+      %sg_i = scalar.addi %sg1, %l : i32
+      %sg_ix = index.cast %sg_i : i32 to index
+      %sg_lo = index.max %sg_ix, %c0 : index
+      %sg_idx = index.min %sg_lo, %w_last : index
+      %sgb8 = view.load %w_view[%sg_idx] : view<[%w_bytes]xi8> -> i8
+      %sgb = scalar.extui %sgb8 : i8 to i32
+      %is_g1 = scalar.cmpi eq, %which, %c0i : i32
+      %sign_nib = scf.if %is_g1 -> (i32) {
+        %sn_lo = scalar.andi %sgb, %c15i : i32
+        scf.yield %sn_lo : i32
+      } else {
+        %sn_hi = scalar.shrui %sgb, %c4i : i32
+        scf.yield %sn_hi : i32
+      }
+      %sbit0 = scalar.shrui %sign_nib, %b : i32
+      %sign_bit = scalar.andi %sbit0, %c1i : i32
+      %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
+      %neg_g = scalar.subi %c0i, %g_byte : i32
+      %mag = scf.if %is_neg -> (i32) {
+        scf.yield %neg_g : i32
+      } else {
+        scf.yield %g_byte : i32
+      }
+      %sco = scalar.addi %blk_off, %c106i : i32
+      %gdiv2 = scalar.shrui %group, %c1i : i32
+      %sc_i = scalar.addi %sco, %gdiv2 : i32
+      %sc_ix = index.cast %sc_i : i32 to index
+      %sc_lo = index.max %sc_ix, %c0 : index
+      %sc_idx = index.min %sc_lo, %w_last : index
+      %scb8 = view.load %w_view[%sc_idx] : view<[%w_bytes]xi8> -> i8
+      %scb = scalar.extui %scb8 : i8 to i32
+      %odd = scalar.andi %group, %c1i : i32
+      %is_even = scalar.cmpi eq, %odd, %c0i : i32
+      %nib = scf.if %is_even -> (i32) {
+        %ni_lo = scalar.andi %scb, %c15i : i32
+        scf.yield %ni_lo : i32
+      } else {
+        %ni_hi = scalar.shrui %scb, %c4i : i32
+        scf.yield %ni_hi : i32
+      }
+      %nib2 = scalar.shli %nib, %c1i : i32
+      %one_plus = scalar.addi %nib2, %c1i : i32
+      %scale_f = scalar.sitofp %one_plus : i32 to f32
+      %mag_f = scalar.sitofp %mag : i32 to f32
+      %blk_half0 = scalar.shrui %blk_off, %c1i : i32
+      %d_ix = index.cast %blk_half0 : i32 to index
+      %d_lo = index.max %d_ix, %c0 : index
+      %d_idx = index.min %d_lo, %w_half_last : index
+      %d_half_v = view.load %w_f16_view[%d_idx] : view<[%w_halfs]xf16> -> f16
+      %d = scalar.extf %d_half_v : f16 to f32
+      %dsc = scalar.mulf %d, %scale_f : f32
+      %value = scalar.mulf %dsc, %mag_f : f32
+      %kidx_i = scalar.addi %kblk256, %i_i : i32
+      %kidx_ix = index.cast %kidx_i : i32 to index
+      %kidx_lo = index.max %kidx_ix, %c0 : index
+      %kidx = index.min %kidx_lo, %x_last : index
+      %xv = view.load %x_view[%kidx] : view<[%x_elems]xf32> -> f32
+      %prod = scalar.mulf %value, %xv : f32
+      %next = scalar.addf %a1, %prod : f32
+      scf.yield %next : f32
+    }
+    scf.yield %acc1 : f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %acc0 : f32
+  %is_zero = index.cmp eq, %lane, %c0 : index
+  %st = scf.if %is_zero -> (f32) {
+    view.store %sum, %y_view[%m] : f32, view<[%m_rows]xf32>
+    scf.yield %zero : f32
+  } else {
+    scf.yield %zero : f32
+  }
+  kernel.return
+}
+// Requires the config block above with m_rows=16, k_blocks=20.
+check.case public @yah_gemv_iq3s_case {
+  %weight = check.file.read.npy path("fixtures/iq3s_gemm/input_iq3s_gemm.npy") : tensor<35200xi8>
+  %grid = check.file.read.npy path("fixtures/iq3s_gemm/grid.npy") : tensor<512xi32>
+  %x = check.file.read.npy path("fixtures/iq3s_gemm/gemv_x.npy") : tensor<5120xf32>
+  %expected = check.file.read.npy path("fixtures/iq3s_gemm/gemv_expected.npy") : tensor<16xf32>
+  %y = check.generate.fill value(0.0) : tensor<16xf32>
+  kernel.launch @yah_gemv_iq3s(%weight, %grid, %x, %y) : (tensor<35200xi8>, tensor<512xi32>, tensor<5120xf32>, tensor<16xf32>)
+  check.expect.close actual(%y) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
+  check.return
+}
+
+check.benchmark<@yah_gemv_iq3s_case> @yah_gemv_iq3s_bench
+
+// Requires --config=yah_gemv_iq3s.m_rows=17408 --config=yah_gemv_iq3s.k_blocks=20.
+// An all-zero IQ3_S weight decodes to zero, so every output row must be exactly 0.
+check.case public @yah_gemv_iq3s_full_case {
+  %weight = check.generate.fill value(0) : tensor<38297600xi8>
+  %grid = check.generate.fill value(0) : tensor<512xi32>
+  %x = check.generate.fill value(1.0) : tensor<5120xf32>
+  %y = check.generate.fill value(0.0) : tensor<17408xf32>
+  %expected = check.generate.fill value(0.0) : tensor<17408xf32>
+  kernel.launch @yah_gemv_iq3s(%weight, %grid, %x, %y) : (tensor<38297600xi8>, tensor<512xi32>, tensor<5120xf32>, tensor<17408xf32>)
+  check.expect.close actual(%y) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<17408xf32>
+  check.return
+}
+
+check.benchmark<@yah_gemv_iq3s_full_case> @yah_gemv_iq3s_full_bench
