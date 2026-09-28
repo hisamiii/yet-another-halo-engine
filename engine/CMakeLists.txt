@@ -28,3 +28,15 @@ target_link_libraries(yah-tokenize PRIVATE yah_core)
 # yah-weights: resolve and validate the typed weight table the layer loop needs.
 add_executable(yah-weights model/yah_weights.cpp)
 target_link_libraries(yah-weights PRIVATE yah_core)
+
+# yah-hrx: the HRX-native prefill+decode runner. All GPU execution goes through
+# the HRX native runtime; there is no HIP dependency. Built only when the HRX
+# runtime library is present.
+set(YAH_HRX_BUILD "/home/q/hrx/build/cmake" CACHE PATH "HRX build tree")
+find_library(HRX_LIBRARY hrx HINTS "${YAH_HRX_BUILD}/libhrx/src/libhrx")
+find_path(HRX_INCLUDE_DIR hrx_runtime.h HINTS "/home/q/hrx/libhrx/include")
+if(HRX_LIBRARY AND HRX_INCLUDE_DIR)
+  add_executable(yah-hrx run/yah_hrx.cc)
+  target_include_directories(yah-hrx PRIVATE "${HRX_INCLUDE_DIR}")
+  target_link_libraries(yah-hrx PRIVATE yah_core "${HRX_LIBRARY}" pthread)
+endif()
