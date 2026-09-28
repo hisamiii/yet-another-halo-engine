@@ -72,12 +72,13 @@ explicitly deferred.
 | yah_vision_layer_norm_bf16.loom | vision/encoder.hip | vision layer norm (bf16 output) | ported, 0.0085 ms; exact on the affine path, scale path unverified |
 | yah_vision_softmax_bf16.loom | vision/encoder.hip | vision attention softmax (bf16 output) | ported, 0.0070 ms; exact at uniform scores |
 | yah_vision_attention_rows_bf16.loom | vision/encoder.hip | vision attention head->token transpose | ported, 0.0070 ms; bit-exact vs fixture |
+| yah_vision_patchify_bf16.loom | vision/encoder.hip | patch embedding (image to 16x16 patches) | ported, 0.0070 ms; bit-exact vs fixture |
 | - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | todo |
 
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 47 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 48 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -96,7 +97,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16. **todo**: AtbEncodeA, AtbDecodeC, AtbDecodeSwiGLU, AtbRepack(+Slice) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | FastGEMVBlockKernel, and the quantized variant |
 | sampling | sample.hip | 13 more kernels: batched argmax, sparse penalties, linear/sorted sampling, and the speculative segment set |
-| vision | vision/encoder.hip, vision/device_input.hip | **ported**: Finish, BiasResidual, LayerNorm, Softmax, AttentionRows. **todo**: Patchify, PatchPosition, QkvRope, Activate, InjectRows |
+| vision | vision/encoder.hip, vision/device_input.hip | **ported**: Finish, BiasResidual, LayerNorm, Softmax, AttentionRows, Patchify. **todo**: PatchPosition, QkvRope, Activate, InjectRows |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip. **todo**: the Ptr and remaining decode-side variants, FastFusedSwiGLUGEMVBlockKernel |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
@@ -110,7 +111,9 @@ profile gives one, so the expensive paths move first rather than the convenient 
 - `index.ceildiv` does not exist; compute ceilings with add and div.
 - A loop with a declared result must bind a name even when the result is unused.
 - `check.generate.iota` takes float literals for a float tensor; integer literals
-  fail verification ("attribute step has kind 1, expected 2").
+  fail verification ("attribute step has kind 1, expected 2"). The converse also
+  holds: an integer tensor (`tensor<4608xi8>`) wants integer literals, and float
+  literals fail with "attribute 'step' has kind 2, expected 1".
 - **`config.get` must be repeated inside the launch body.** The launch-config region
   is a separate scope, so a value fetched only there is undefined in the body.
 - **Not every scalar op has a target contract.** `scalar.isfinitef` compiles under
