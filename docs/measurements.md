@@ -70,6 +70,36 @@ A standalone driver against the same xclbins, no engine in the loop:
 
 In the engine the same gate/up pair costs ~14.5 ms per layer rather than the ~11.3 ms the standalone floor implies, i.e. roughly 25 TFLOPS and ~14 GB/s of operand traffic. The standalone floor is not reached once the operands are shared with the GPU through dma-buf. This gap is not explained and is a target for the custom engine.
 
+## Decode attention at depth: the scalar walk dominated until it was split
+
+The engine's `Decode()` called `LaunchAttention` with `split_k_scratch =
+nullptr`, so every decode step ran `QwenDecodeOnlineAttentionHalfKernel`: one
+32-thread warp per query head walking the visible cache one key per two
+iterations, with each of the six query heads in a GQA group re-reading the same
+K/V rows. The split-K kernel that fixes both — 32 partitions, each KV tile
+staged once for its six heads — was already in the tree and is what the
+reference engine's own decode selects; only the caller's scratch was missing.
+It costs 0.79 MB.
+
+Measured with `yah-run` (32768-token prompt, `--chunk 2048`,
+`--max-context 32900`, `--gen 32`, f16 KV), arms alternated 0/1/1/0:
+
+| context | online (tok/s) | split-K (tok/s) | delta |
+| ---: | ---: | ---: | ---: |
+| 2048 | 11.47 | 12.82 | +12% |
+| 32768 | 3.61 / 3.58 | 10.88 / 11.04 | **3.05x** |
+
+Generated ids are identical across the toggle (32/32) at 32k, and
+`GUFO_DISPATCH_TELEMETRY=1` shows the selected backend switching between
+`decode_online_fp16` and `decode_split_k_fp16`.
+
+**A run is only real if the binary changed.** The first two A/Bs of this change
+reported *no effect*, twice: `build_gpu.sh` compared each object only against
+its own `.hip`, so editing an included header (`model/forward.hip`) silently
+reused a stale object and both arms executed the previous binary. The cache
+check now tracks real prerequisites with `-MMD` depfiles, and the dispatch
+telemetry line is the evidence that a chosen kernel actually ran.
+
 ## Provenance
 
 - Hardware: `RYZEN AI MAX+ 395`, gfx1151, XDNA2 NPU (`aie2p`, PCI `1022:17f0`).

@@ -32,6 +32,7 @@
 
 #include "core/config.hpp"
 #include "model/weights.hpp"
+#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
@@ -96,6 +97,9 @@ struct Buffers {
   std::uint16_t* scratch_v{nullptr};
   float* hadamard{nullptr};
   std::uint8_t* attn_workspace{nullptr};
+  // Split-K decode attention partials: statistics and partial outputs for
+  // every query head and every split. Small enough to keep resident.
+  float* decode_scratch{nullptr};
   bool kv_dumped{false};
   std::uint32_t* tokens{nullptr};
   std::uint32_t* argmax{nullptr};
@@ -225,6 +229,12 @@ class Forward {
     // either way. It is kept as an opt-in for the larger-block experiment.
     kv_rotate_ = kv_storage_ != KvStorage::kF16 &&
                  std::getenv("YAH_KV_ROT") != nullptr;
+    // On by default. The scalar online kernel launches one warp per query head
+    // and walks the whole cache at one key per two iterations; split-K turns
+    // that serial walk into 32 partitions and shares each KV tile across its
+    // six query heads. YAH_SPLITK=0 restores the reference path.
+    split_k_decode_ = std::getenv("YAH_SPLITK") == nullptr ||
+                      std::atoi(std::getenv("YAH_SPLITK")) != 0;
     if (const char* qattn = std::getenv("YAH_QATTN")) {
       switch (std::atoi(qattn)) {
         case 4: qattn_levels_ = 7; break;
@@ -652,7 +662,8 @@ class Forward {
             /*k_cache=*/nullptr, /*v_cache=*/nullptr, kv_view.k, kv_view.v,
             buffers_.ssm_out, kv_view.layer, pos, max_context_,
             config_.head_count, config_.head_count_kv, config_.key_length,
-            stream_, /*split_k_scratch=*/nullptr, /*skip_kv_write=*/true);
+            stream_, split_k_decode_ ? buffers_.decode_scratch : nullptr,
+            /*skip_kv_write=*/true);
         LaunchGEMV(layer.attn_output.data, Gt(layer.attn_output.type),
                    buffers_.ssm_out, buffers_.normed, hidden_, attn_, stream_);
       } else {
@@ -821,6 +832,13 @@ class Forward {
           2 * config_.head_count_kv * max_context_ * config_.key_length *
               sizeof(std::uint16_t),
           "attn_workspace");
+    // Per-head, per-split partial statistics and outputs for split-K decode
+    // attention. The layout is owned by the attention policy header.
+    alloc(reinterpret_cast<void**>(&buffers_.decode_scratch),
+          static_cast<std::size_t>(config_.head_count) *
+              detail::kSplitKDecodeAttentionMaxSplits *
+              (config_.key_length + 2) * sizeof(float),
+          "decode_scratch");
     alloc(reinterpret_cast<void**>(&buffers_.tokens),
           batch * sizeof(std::uint32_t), "tokens");
     alloc(reinterpret_cast<void**>(&buffers_.argmax), sizeof(std::uint32_t),
@@ -858,6 +876,7 @@ class Forward {
     hipFree(buffers_.kv_f16);
     hipFree(buffers_.packed_kv);
     hipFree(buffers_.attn_workspace);
+    hipFree(buffers_.decode_scratch);
     hipFree(buffers_.scratch_k);
     hipFree(buffers_.scratch_v);
     hipFree(buffers_.hadamard);
@@ -888,6 +907,7 @@ class Forward {
   std::uint32_t vocab_{0};
   KvStorage kv_storage_{KvStorage::kF16};
   bool kv_rotate_{false};
+  bool split_k_decode_{true};
   // Diagnostic: levels Q is rounded to before attention, reproducing a w4a4
   // QK^T's operand error. 7 for 4 bits, 3 for 3, 1 for 2; 0 disables.
   int qattn_levels_{0};
