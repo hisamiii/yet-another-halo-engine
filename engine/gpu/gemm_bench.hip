@@ -313,6 +313,103 @@ void DispatchAblate(GgmlType type, std::size_t m, std::size_t k,
   }
 }
 
+// BK (BKDepth) sweep. The production path fixes BK at 4, which fills the 64 KiB
+// LDS budget and allows one block per CU. BK also sets how many 16-wide K steps
+// one iteration covers, so lowering it halves LDS per stage and doubles the
+// resident blocks, at the cost of more loop iterations and barriers. That
+// tradeoff is the K loop's latency question and has never been swept.
+template<gufo::core::GgmlType Type, int BK>
+void LaunchTileBk(const void* w, const short* x, float* y, std::size_t batch,
+                  std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   BK>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type>
+void RunBk(std::size_t m, std::size_t k, std::size_t batch, unsigned iterations,
+           int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const auto launch = [&](int bk) {
+    switch (bk) {
+      case 1:
+        LaunchTileBk<Type, 1>(weights.data(), half_x.data(), y.data(), batch, m,
+                              k, nullptr);
+        break;
+      case 2:
+        LaunchTileBk<Type, 2>(weights.data(), half_x.data(), y.data(), batch, m,
+                              k, nullptr);
+        break;
+      case 3:
+        LaunchTileBk<Type, 3>(weights.data(), half_x.data(), y.data(), batch, m,
+                              k, nullptr);
+        break;
+      default:
+        LaunchTileBk<Type, 4>(weights.data(), half_x.data(), y.data(), batch, m,
+                              k, nullptr);
+        break;
+    }
+  };
+  const auto timed = [&](int bk) {
+    for (unsigned i = 0; i < 2; ++i) launch(bk);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(bk);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  for (int round = 0; round < 4; ++round) {
+    for (int i = 0; i < 4; ++i) {
+      const int bk = 1 + ((i + round) % 4);
+      const double ms = timed(bk);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("bk type=%s bk=%d round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), bk, round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchBk(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunBk<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ4_XS:
+      RunBk<GgmlType::kIQ4_XS>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ3_XXS:
+      RunBk<GgmlType::kIQ3_XXS>(m, k, batch, iterations, pattern);
+      return;
+    // IQ3_S is absent: its LDS-transpose epilogue asserts
+    // Slots >= WM*WN, and Slots = 8*BK, so BK must be 4 for that type.
+    default:
+      std::fprintf(stderr, "bk sweep covers q4k, iq4xs, iq3xxs\n");
+      return;
+  }
+}
+
 const char* TileName(int variant) {
   switch (variant) {
     case 0: return "256x256 w8n4";
@@ -430,6 +527,8 @@ int main(int argc, char** argv) {
   if (sweep) name = name.substr(6);
   const bool ablate = name.rfind("ablate:", 0) == 0;
   if (ablate) name = name.substr(7);
+  const bool bksweep = name.rfind("bk:", 0) == 0;
+  if (bksweep) name = name.substr(3);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -448,6 +547,8 @@ int main(int argc, char** argv) {
           DispatchTiles(entry.type, m, k, batch, iterations, pattern);
         else if (ablate)
           DispatchAblate(entry.type, m, k, batch, iterations, pattern);
+        else if (bksweep)
+          DispatchBk(entry.type, m, k, batch, iterations, pattern);
         else
           RunFp16(entry.type, m, k, batch, iterations, pattern, epilogue);
         return 0;

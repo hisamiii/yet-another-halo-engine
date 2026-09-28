@@ -233,6 +233,23 @@ the K loop's LDS-read and WMMA dependency chain -- and this page has now
 eliminated the weight format, the epilogue, issue pressure and the scheduling
 hint as explanations for it.
 
+**BK is confirmed at 4, not merely fixed at 4.** The tile space was swept but
+BKDepth never was, and it is the parameter that sets LDS per stage: BK=4 fills
+the 64 KiB budget and allows one block per CU, while BK=2 halves LDS and would
+allow two. Swept with the order rotated per round, best TFLOPS per BK:
+
+| type | BK=1 | BK=2 | BK=3 | BK=4 |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K | 21.63 | 29.36 | 29.42 | **31.72** |
+| IQ4_XS | 27.58 | 28.66 | 28.58 | **30.39** |
+| IQ3_XXS | 21.40 | 26.01 | 27.68 | **27.77** |
+
+Monotone in every type. The extra loop iterations and barriers at lower BK cost
+more than the second resident block returns, so occupancy is not the binding
+constraint here and the one-block-per-CU design is not an oversight. IQ3_S cannot
+take BK<4 at all: its LDS-transpose epilogue asserts Slots >= WM*WN with
+Slots = 8*BK.
+
 **This is clock, and the clock is a function of the kernel.** Efficiency per clock agrees to **0.3%** across the two harnesses that disagreed -- 0.0144 TF/MHz in both -- so there is no hidden code difference. The part has three SCLK levels (600 / 1408 / **2900 MHz**) and **never reaches the top one**: measured across power limits, 80 W gives 1799 MHz / 25.9 TF and 130 W gives 2016 MHz / 28.6 TF, work-per-clock is flat (0.0144, -1.5% between them), `gpu_busy` is ~85% at both, and the sampled maximum is 2221 MHz. The log's own line is that "what is broken is the conversion of watts into clock".
 
 So the 26% is **not a fixed ceiling**: the clock is coupled to the kernel's power draw, and zeroed operands raise it ~20%. A kernel that toggles fewer bits and issues fewer instructions for the same FLOPs raises both the work per clock and the clock itself. At the 2900 MHz level the part never reaches, the peak is on the order of **60 TFLOPS**; at a realistic ~2200 MHz it is ~45, and the production ~30 is about two thirds of that. Treating ~31.5 as "the real rate, no headroom" was the wrong read. (The NPU's
