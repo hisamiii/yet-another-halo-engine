@@ -901,4 +901,48 @@ the box's operating point drifts. Only within-session comparisons are valid here
 under ~10 ms at this shape falsifies the two-region reading; the reduction must
 come from not writing a second distinct array, not from writing the two cheaper.
 
+### Working on the second region: reading the activations from global
+
+The constructive reading of the two-region result is to stop staging the
+activation tile at all. That is more reachable than it looks, because the commit
+already lays B into LDS as `[K16][token][16 halves]`, which is a plain blocked
+layout. So a pre-blocked global buffer `[k/16][batch][16]` lets each lane fetch
+its whole WMMA fragment as one contiguous 32-byte load, with the warp's sixteen
+distinct lanes spanning 512 contiguous bytes. Lane `sl` needs token
+`((wt*WTS)+j)*16 + (sl^(ks&3))`, and one j step is sixteen tokens, i.e. 256
+halves, so the address is one 64-bit computation per K step plus a 32-bit add per
+fragment. Ablation 1048576 does this and drops the LDS store and fetch for B; the
+buffer rides in through the kernel's unused `up` argument.
+
+| arm | ms |
+| --- | ---: |
+| noStoreB (B staged and read from LDS, but never written) | 8.27 |
+| full (B staged) | 10.29 |
+| globalB, address recomputed per load | 13.25 |
+| globalB, address hoisted per K step | 12.0 |
+
+The repack costs **0.20 ms** for the whole 20 MiB activation matrix, which is
+negligible next to the ~2 ms the second staging region costs. The per-load 64-bit
+address was worth 1.25 ms of pure overhead, so the first globalB row was partly
+addressing.
+
+What the hoisted version shows is that the global path reaches **parity** with the
+LDS staging (11.5 vs 12.0, full ahead in three of four paired rounds) but does not
+pass it, and it stays far above the noStoreB floor. The reason is the reuse
+factor: staging collapses the activation reads to one fetch per block, so the
+K loop's eight M-warps read LDS; without staging each of those warps issues its
+own global loads and the read volume goes up 8x. That 8x is the price of not
+staging, and it is about exactly what the staging costs.
+
+So the activation staging is not waste and the second region cannot be removed
+for free. It can be removed for *zero* net cost, though, which frees 32 KiB of
+the 64 KiB LDS budget -- enough to double BK for the weight tile alone. Whether
+that pays is untested.
+
+**Falsifier:** if a variant that keeps both staging arrays separate and spends the
+freed LDS on more K depth runs under the noStoreB floor (~8.5 ms at this shape),
+the two-region cost is depth-limited rather than store-limited and this whole line
+is mis-framed.
+
+
 

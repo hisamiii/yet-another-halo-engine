@@ -39,6 +39,28 @@ __device__ __forceinline__ void StoreSwizzled(short* p, uint4 lo, uint4 hi,
   reinterpret_cast<uint4*>(p)[shift ^ 1] = hi;
 }
 
+// Ablation 1048576: one activation fragment straight out of the pre-blocked
+// global buffer, layout [k/16][batch][16 halves]. Lane `sl` holds the sixteen K
+// values of token (((wt*WTS)+j)*16) + (sl ^ (ks&3)), which is 32 contiguous
+// bytes, so the warp's sixteen distinct lanes span 512 contiguous bytes and the
+// upper sixteen lanes broadcast. No LDS staging array is involved.
+// One 64-bit address computation per K step gives a lane-local base; advancing j
+// is then a 32-bit add, because one j step is sixteen tokens, i.e. 16*16 halves.
+// Recomputing the full 64-bit address per load cost more than the load itself.
+__device__ __forceinline__ v16bf LoadBlockedBAt(const short* src) {
+  union {
+    v16bf f;
+    uint4 q[2];
+  } bits;
+  // LoadSwizzled reads the low and high sixteen-byte halves in a lane-dependent
+  // order, so the global path has to reproduce that shift to build the same
+  // fragment. Both offsets stay inside the same 512-byte window.
+  const unsigned row = threadIdx.x & 15, shift = (row ^ (row >> 2)) & 1;
+  bits.q[0] = *reinterpret_cast<const uint4*>(src + 8 * shift);
+  bits.q[1] = *reinterpret_cast<const uint4*>(src + 8 * (shift ^ 1));
+  return bits.f;
+}
+
 // Same 32 bytes and the same swizzle as StoreSwizzled, reached with a different
 // number of DS store instructions: 2 x ds_store_b128, 4 x ds_store_b64 or
 // 8 x ds_store_b32. Ablation 131072 selects b64 and 262144 selects b32, so the
@@ -371,6 +393,17 @@ __launch_bounds__(WM * WN * 32) __global__
   const int r_block = row_tile * (Paired ? BM / 2 : BM),
             t_block = token_tile * BN;
   const int ksteps = k / 16;
+  // Ablation 1048576 (GlobalB): the activation operand is read straight from a
+  // pre-blocked global buffer instead of through the second LDS staging array,
+  // so only the weight tile is staged. The buffer is passed through `up`, which
+  // is unused on the kStore path; it holds k/16 blocks of [batch][16 halves] in
+  // that order, which is exactly the LDS layout the commit builds, so a lane's
+  // fragment is one contiguous 32-byte load.
+  const short* b_blocked = (Ablate & 1048576) != 0
+                               ? static_cast<const short*>(up)
+                               : nullptr;
+  static_assert(!(DblBuf && (Ablate & 1048576) != 0),
+                "GlobalB and DblBuf are separate experiments");
 
   v8f acc[WRS][WTS] = {};
 
@@ -510,7 +543,8 @@ __launch_bounds__(WM * WN * 32) __global__
       // skipping the loop: skipping leaves raw/rb undefined and lets the
       // compiler fold the dependent decode and delete s_b, which measures
       // something other than the fetch.
-      if ((Ablate & 32) == 0 && idx < BN * BK && (Complete || kk < ksteps)) {
+      if ((Ablate & 32) == 0 && (Ablate & 1048576) == 0 &&
+          idx < BN * BK && (Complete || kk < ksteps)) {
         const short* src =
             (Ablate & 128) != 0
                 ? x_row[p] + static_cast<std::size_t>(kk & 3) * 16
@@ -588,7 +622,7 @@ __launch_bounds__(WM * WN * 32) __global__
       // Ablation 16384 drops the activation-side staging store. The commit
       // writes two things per stage -- the decoded weights and a plain copy of
       // the activations -- and this prices them separately.
-      if constexpr ((Ablate & 16384) == 0) {
+      if constexpr ((Ablate & 16384) == 0 && (Ablate & 1048576) == 0) {
         const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
         if (idx < BN * BK) {
           const int placed = (row ^ (ks & 3));
@@ -748,10 +782,18 @@ __launch_bounds__(WM * WN * 32) __global__
           }
         }
       } else {
+        const short* bbase = nullptr;
+        if constexpr ((Ablate & 1048576) != 0)
+          bbase = b_blocked + (static_cast<std::size_t>(ks0 + ks) * batch +
+                               t_block + (sl ^ (ks & 3))) *
+                                  16;
 #pragma unroll
         for (int j = 0; j < WTS; ++j) {
-          const v16bf b =
-              LoadSwizzled(&s_b[0][ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
+          v16bf b;
+          if constexpr ((Ablate & 1048576) != 0)
+            b = LoadBlockedBAt(bbase + (j * 256));
+          else
+            b = LoadSwizzled(&s_b[0][ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
 #pragma unroll
           for (int i = 0; i < WRS; ++i) {
             if constexpr (Type == gufo::core::GgmlType::kIQ3_S)

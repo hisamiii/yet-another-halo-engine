@@ -1279,6 +1279,129 @@ void DispatchTt(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
   }
 }
 
+
+// GlobalB: read the activation operand straight from a pre-blocked global buffer
+// instead of staging it through a second LDS array, so only the weight tile is
+// staged and there is no second region to write. The buffer is [k/16][batch][16]
+// halves -- exactly the layout the commit builds in LDS -- and is passed through
+// the kernel's unused \`up\` argument. The repack from row-major [batch][k] is
+// timed separately, because it is real extra traffic and has to be paid for.
+__global__ void RepackBlockedB(const short* __restrict__ src,
+                               short* __restrict__ dst, int batch, int k) {
+  // Token-major walk: consecutive threads take consecutive K16 blocks of one
+  // token, so the gather from row-major src is coalesced and the scatter into
+  // the blocked buffer is strided. A tiled transpose would fix the scatter; this
+  // is the pessimistic bound on the repack cost.
+  const int kg = (blockIdx.x * blockDim.x + threadIdx.x) % (k / 16);
+  const int tok = (blockIdx.x * blockDim.x + threadIdx.x) / (k / 16);
+  if (tok >= batch) return;
+  const short* s = src + (static_cast<std::size_t>(tok) * k) + kg * 16;
+  short* d = dst + (static_cast<std::size_t>(kg) * batch + tok) * 16;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) d[i] = s[i];
+}
+
+template<gufo::core::GgmlType Type, int Ablate>
+void LaunchGb(const void* w, const short* x, float* y, std::size_t batch,
+              std::size_t m, std::size_t k, hipStream_t stream,
+              const short* blocked) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr, blocked);
+}
+
+template<gufo::core::GgmlType Type>
+void RunGb(std::size_t m, std::size_t k, std::size_t batch, unsigned iterations,
+           int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  DeviceBuffer<short> blocked((k / 16) * batch * 16);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  // Price the repack: the whole activation matrix read and rewritten once.
+  const unsigned repack_blocks =
+      static_cast<unsigned>(((k / 16) * batch + 255) / 256);
+  for (int i = 0; i < 2; ++i)
+    RepackBlockedB<<<repack_blocks, 256>>>(half_x.data(), blocked.data(),
+                                           static_cast<int>(batch),
+                                           static_cast<int>(k));
+  HIP_CHECK(hipDeviceSynchronize());
+  const auto rs = std::chrono::steady_clock::now();
+  for (int i = 0; i < 5; ++i)
+    RepackBlockedB<<<repack_blocks, 256>>>(half_x.data(), blocked.data(),
+                                           static_cast<int>(batch),
+                                           static_cast<int>(k));
+  HIP_CHECK(hipDeviceSynchronize());
+  const auto re = std::chrono::steady_clock::now();
+  const double repack_ms =
+      std::chrono::duration<double, std::milli>(re - rs).count() / 5.0;
+  const int values[3] = {16, 16 | 1048576, 16400};
+  const char* names[3] = {"full", "globalB", "noStoreB"};
+  const auto launch = [&](int v) {
+    if (v == (16 | 1048576))
+      LaunchGb<Type, 16 | 1048576>(weights.data(), half_x.data(), y.data(), batch,
+                                   m, k, nullptr, blocked.data());
+    else if (v == 16400)
+      LaunchGb<Type, 16400>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                            nullptr, nullptr);
+    else
+      LaunchGb<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                         nullptr, nullptr);
+  };
+  const auto timed = [&](int v) {
+    for (unsigned i = 0; i < 2; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(v);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  std::printf("gb repack_ms=%.4f\n", repack_ms);
+  std::fflush(stdout);
+  for (int round = 0; round < 4; ++round) {
+    for (int i = 0; i < 3; ++i) {
+      const int idx = (i + round) % 3;
+      const double ms = timed(values[idx]);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("gb type=%s arm=%s ablate=%d round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], values[idx], round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchGb(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
+                unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunGb<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ5_K:
+      RunGb<GgmlType::kQ5_K>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "gb sweep covers q4k, q5k\n");
+      return;
+  }
+}
+
 void DispatchStore(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
                    unsigned iterations, int pattern) {
   using gufo::core::GgmlType;
@@ -1521,6 +1644,8 @@ int main(int argc, char** argv) {
   if (regbk) name = name.substr(6);
   const bool tt = name.rfind("tt:", 0) == 0;
   if (tt) name = name.substr(3);
+  const bool gb = name.rfind("gb:", 0) == 0;
+  if (gb) name = name.substr(3);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -1561,6 +1686,8 @@ int main(int argc, char** argv) {
           DispatchRegBk(entry.type, m, k, batch, iterations, pattern);
         else if (tt)
           DispatchTt(entry.type, m, k, batch, iterations, pattern);
+        else if (gb)
+          DispatchGb(entry.type, m, k, batch, iterations, pattern);
 #ifdef GUFO_FP16_PROTO_CLOCK
         else if (proto)
           DispatchProto(entry.type, m, k, batch);
