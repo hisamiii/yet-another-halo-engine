@@ -720,3 +720,87 @@ byte width, not the MAC width, is the lever.
 - A reduced microbenchmark can be slower than the real kernel. It is not a reference.
 - All-ones operands cannot detect a layout bug: any permutation of A or B is invisible, and a plumbing failure reads as near-zero output rather than misplaced data.
 - GPU-busy versus span is the idle measure, but it is a different quantity from per-cycle stall; a kernel can be resident and stalled at the same time.
+
+## Where the prefill deficit actually is: a component flow
+
+The kernel is ~59% of the fp16 instruction ceiling at the production shape, and
+the deficit had been attributed to "staging" without splitting it. Adding one
+ablate bit per feeder and weaving them makes the arms cumulative, so the deltas
+are additive and read as a flow. Q4_K, 17408x5120, batch 2048, BK=4, one process
+per arm, order rotated per round, settled arm = the tail rounds.
+
+| arm | ablate | what it adds | TFLOPS | share of ceiling | step cost |
+| --- | ---: | --- | ---: | ---: | ---: |
+| K loop alone, stale LDS | 6 | \`ds_load\` + WMMA only | 50.7-51.7 | ~105% | — |
+| + global fetch | 2 | next stage's global loads | 51.0-51.9 | ~106% | **~0%** |
+| + decode, no LDS store | 36 | the Q4_K unpack + scale | 47.8-48.2 | ~99% | **-6%** |
+| + LDS store of raw | 68 | \`ds_store\` with no decode | 38.2-38.6 | ~79% | **-25%** |
+| + decode + LDS store | 4 | both (full commit) | 32.1-34.3 | ~68% | **-12%** |
+| + global fetch on top | 16 | production control | 29.4-31.9 | ~63% | **-7%** |
+
+The K loop on its own is *at* the ceiling, so there is no headroom inside it and
+every point of the deficit is feeder work. Two things are not obvious from the
+aggregate:
+
+- **the global fetch is free on its own.** It is already one stage ahead, so its
+  latency is covered; it only costs ~7% once the commit exists, i.e. it competes
+  for something the commit is already using.
+- **the two costs are super-additive.** Decode is -6% alone and the store is
+  -25% alone, but together they are -37%.
+
+### The store is the locus, and it is not throughput
+
+Splitting the commit by side, all with the global fetch present:
+
+| arm | ablate | ms | vs full |
+| --- | ---: | ---: | ---: |
+| full | 16 | 12.41 | — |
+| no decode (keep both stores) | 80 | 9.56 | -23% |
+| no A store (keep decode) | 48 | 8.30 | -33% |
+| no B store | 16400 | 8.57 | -31% |
+| no A or B store | 16432 | 7.81 | -37% |
+| no commit at all | 18 | 7.14 | -42% |
+
+The commit writes two things per stage: the decoded weights (A) and a plain copy
+of the activations (B), 4 \`ds_store_b128\` per thread per stage. Removing either
+stream alone recovers ~85% of the total store saving, so the cost is **not**
+proportional to the bytes or the instruction count — it is a shared serialization
+that either stream is enough to trigger. B alone, which needs no decode at all,
+is worth -31%: the activation staging copy costs as much as the entire weight
+pipeline.
+
+### Mechanisms tested and falsified
+
+Every mechanism that would explain a per-stage store cost this large was tested
+and came back negative:
+
+| candidate | test | result |
+| --- | --- | --- |
+| LDS port throughput | counters | LDS busy 26-45%, never saturated |
+| bank conflicts | \`LDSBankConflict\` PMC | **0** across all 13 dispatches |
+| register spills | \`.vgpr_spill_count\` | **0** for Q4_K; only Q8_0 spills, 4 instrs |
+| the VGPR cap | \`.vgpr_count\` | control uses 192 of 256 available, so the compiler was not capped |
+| store->load \`s_waitcnt\` drain | double-buffer the LDS stage | -0% to -6%, i.e. no help |
+| the barrier itself | ablate 17 (no barrier) | -5% only |
+| decode in the wrong place | ablate 512 (decode in the K loop) | parity; 1024 (staggered) is 8-18% *worse* |
+| B load-to-use distance of zero | ablate 4096 (batch all B loads ahead of the MMA block) | +0.5%, within noise |
+| interleaving the fetch | ablate 256 (fetchmid) | **22% worse** |
+| iglp_opt(1)/(2) | ablate 2048/8192 | 5% worse |
+
+The double-buffer result is the informative one. On the double-buffered build the
+stores *are* issued at the top of the stage and consumed a stage later, exactly
+as intended -- the ISA confirms it -- but the compiler still emits
+\`s_waitcnt lgkmcnt(0)\` before the barrier, so the drain is unchanged. Three full
+\`lgkmcnt(0)\` drains per stage appear in the control kernel's schedule.
+
+**Conclusion:** the deficit is the LDS store stream, it is a whole-schedule
+effect rather than any single micro-mechanism, and the ablations show it is worth
+~40% of the kernel -- more than every other feeder combined. Any fix has to make
+the staging stores disappear or make them overlap, not make them cheaper per
+store.
+
+**Falsifier for the next attempt:** a change that keeps the A/B staging stores
+and still beats 31 TF is either not measuring the same thing or has moved the
+cost into the K loop; a change that removes the staging stores must come back
+near 50 TF (the K-loop-only arm) to be believed.
+

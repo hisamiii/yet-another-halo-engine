@@ -230,7 +230,7 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          HalfEpilogue Epilogue, bool Complete = false,
          gufo::core::GgmlType UpType = Type, int BKDepth = 4, int Ablate = 0,
-         int GShift = -1>
+         int GShift = -1, bool DblBuf = false>
 __launch_bounds__(WM * WN * 32) __global__
     void HalfPrefillGemmKernel(const void* __restrict__ w,
                                const short* __restrict__ x,
@@ -279,8 +279,14 @@ __launch_bounds__(WM * WN * 32) __global__
   constexpr int PFA = (BM * BK + kThreads - 1) / kThreads;
   constexpr int PFB = (BN * BK + kThreads - 1) / kThreads;
 
-  __shared__ short s_a[BK][RS][16][KS];
-  __shared__ short s_b[BK][TS][16][KS];
+  // DblBuf holds two LDS stages so the commit for stage i+1 can be issued
+  // before stage i's K loop, letting its LDS writes drain while the matrix pipe
+  // runs; the trailing barrier then only orders the compute instead of waiting
+  // on a commit nothing overlaps. At BK=4 two stages are 128 KiB and do not
+  // fit; at BK=2 they are exactly the 64 KiB the single-buffered BK=4 uses.
+  constexpr int kBufs = DblBuf ? 2 : 1;
+  __shared__ short s_a[kBufs][BK][RS][16][KS];
+  __shared__ short s_b[kBufs][BK][TS][16][KS];
 
   const int tid = static_cast<int>(threadIdx.x);
   const int wave = tid / WaveSize;
@@ -489,16 +495,16 @@ __launch_bounds__(WM * WN * 32) __global__
       }
     }
   };
-  const auto commit = [&]() {
+  const auto commit = [&](int buf) {
 #pragma unroll
     for (int p = 0; p < PFA; ++p) {
       const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
       if (idx < BM * BK) {
         const int placed = (row ^ (ks & 3));
-        short* dst = &s_a[ks][placed / 16][placed % 16][0];
+        short* dst = &s_a[buf][ks][placed / 16][placed % 16][0];
         if (Mixed && row % 32 >= 16) {
           commit_up(p, dst, row);
-        } else if constexpr (DecodeStage != 0 && (Ablate & (512 | 1024)) == 0) {
+        } else if constexpr (DecodeStage != 0 && (Ablate & (512 | 1024 | 64)) == 0) {
           gufo::hip::QuantSub16 q = DecodeRaw<Type>(raw[p]);
           union {
             v16bf f;
@@ -508,7 +514,17 @@ __launch_bounds__(WM * WN * 32) __global__
           for (int j = 0; j < 16; ++j)
             packed.f[j] = static_cast<_Float16>(__fsub_rn(
                 __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
-          StoreSwizzled(dst, packed.u[0], packed.u[1], row);
+          if constexpr ((Ablate & 32) != 0) {
+            // All eight words are readonly-in practice but the asm claims
+            // read-write, so the decode above cannot be deleted while no LDS
+            // store happens. No arithmetic is added.
+            asm volatile("" : "+v"(packed.u[0].x), "+v"(packed.u[0].y),
+                                "+v"(packed.u[0].z), "+v"(packed.u[0].w),
+                                "+v"(packed.u[1].x), "+v"(packed.u[1].y),
+                                "+v"(packed.u[1].z), "+v"(packed.u[1].w));
+          } else {
+            StoreSwizzled(dst, packed.u[0], packed.u[1], row);
+          }
         } else if constexpr (CacheIqHeader &&
                              Type == gufo::core::GgmlType::kIQ4_XS) {
           const auto packed = DecodeIqRaw(raw_iq[p]);
@@ -519,14 +535,27 @@ __launch_bounds__(WM * WN * 32) __global__
     }
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
-      const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
-      if (idx < BN * BK) {
-        const int placed = (row ^ (ks & 3));
-        short* dst = &s_b[ks][placed / 16][placed % 16][0];
-        StoreSwizzled(dst, rb[p][0], rb[p][1], row);
+      // Ablation 16384 drops the activation-side staging store. The commit
+      // writes two things per stage -- the decoded weights and a plain copy of
+      // the activations -- and this prices them separately.
+      if constexpr ((Ablate & 16384) == 0) {
+        const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
+        if (idx < BN * BK) {
+          const int placed = (row ^ (ks & 3));
+          short* dst = &s_b[buf][ks][placed / 16][placed % 16][0];
+          StoreSwizzled(dst, rb[p][0], rb[p][1], row);
+        }
       }
     }
   };
+  // Ablation 64: keep the register->LDS store but skip the decode, to price the
+  // decode ALU against the store. Ablation 2 removes both; if 64 recovers the
+  // whole of 2's win then the decode arithmetic is the deficit, and if it
+  // recovers none then the LDS store (or the store->load turnaround) is.
+  // Ablation 32 is the other half of that 2x2: pay the decode but skip the
+  // store. The decoded value has to stay live or the compiler deletes the
+  // arithmetic, so it is folded into an opaque register the asm marks
+  // read-write; that costs one VALU and keeps the decode unconditional.
   // Ablation 512: decode the loaded weights inside the previous K loop instead
   // of in the commit, so the ~90 VALU of Q4_K decode overlap live matrix work
   // rather than running in the post-barrier bubble with the matrix pipe idle.
@@ -565,10 +594,50 @@ __launch_bounds__(WM * WN * 32) __global__
 #endif
   fetch(0);
   decode_ra();
+  if constexpr (DblBuf) {
+    // Stage i+1's commit is issued before stage i's K loop, so the LDS writes
+    // drain while the matrix pipe runs and the trailing barrier only has to
+    // order the compute. The decode for DecodeStage==2 types happens inside
+    // commit, and for the IQ types inside fetch, so both are covered.
+    const auto kloop = [&](int buf) {
+#pragma unroll
+      for (int ks = 0; ks < BK; ++ks) {
+        v16bf a[WRS];
+#pragma unroll
+        for (int i = 0; i < WRS; ++i)
+          a[i] =
+              LoadSwizzled(&s_a[buf][ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
+#pragma unroll
+        for (int j = 0; j < WTS; ++j) {
+          const v16bf b =
+              LoadSwizzled(&s_b[buf][ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
+#pragma unroll
+          for (int i = 0; i < WRS; ++i) {
+            if constexpr (Type == gufo::core::GgmlType::kIQ3_S)
+              acc[i][j] = WmmaHalf(a[i], b, acc[i][j]);
+            else
+              acc[i][j] = WmmaHalf(b, a[i], acc[i][j]);
+          }
+        }
+      }
+    };
+    commit(0);
+    __syncthreads();
+    int stage = 0;
+    for (int ks0 = 0; ks0 < ksteps; ks0 += BK, ++stage) {
+      const int buf = stage & 1;
+      if (ks0 + BK < ksteps) {
+        fetch(ks0 + BK);
+        commit(buf ^ 1);
+      }
+      kloop(buf);
+      __syncthreads();
+    }
+  } else {
   for (int ks0 = 0; ks0 < ksteps; ks0 += BK) {
     PC_START();
     if constexpr ((Ablate & 2) == 0)
-      commit();
+      commit(0);
     PC_END(pc_commit);
     PC_START();
     if constexpr ((Ablate & 1) == 0)
@@ -586,7 +655,7 @@ __launch_bounds__(WM * WN * 32) __global__
       v16bf a[WRS];
 #pragma unroll
       for (int i = 0; i < WRS; ++i) {
-        a[i] = LoadSwizzled(&s_a[ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
+        a[i] = LoadSwizzled(&s_a[0][ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
       }
       // Ablation 4096: batch every B fragment load ahead of the MMA block. In
       // the shipped order each B fragment is loaded and consumed back to back,
@@ -596,7 +665,7 @@ __launch_bounds__(WM * WN * 32) __global__
         v16bf bb[WTS];
 #pragma unroll
         for (int j = 0; j < WTS; ++j)
-          bb[j] = LoadSwizzled(&s_b[ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
+          bb[j] = LoadSwizzled(&s_b[0][ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
 #pragma unroll
         for (int j = 0; j < WTS; ++j) {
 #pragma unroll
@@ -611,7 +680,7 @@ __launch_bounds__(WM * WN * 32) __global__
 #pragma unroll
         for (int j = 0; j < WTS; ++j) {
           const v16bf b =
-              LoadSwizzled(&s_b[ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
+              LoadSwizzled(&s_b[0][ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
 #pragma unroll
           for (int i = 0; i < WRS; ++i) {
             if constexpr (Type == gufo::core::GgmlType::kIQ3_S)
@@ -667,6 +736,7 @@ __launch_bounds__(WM * WN * 32) __global__
     if constexpr ((Ablate & 1) == 0)
       __syncthreads();
     PC_END(pc_barrier);
+  }
   }
 #if defined(GUFO_FP16_PROTO_CLOCK)
   if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
