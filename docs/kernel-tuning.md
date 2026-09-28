@@ -30,6 +30,71 @@ Ablations on the real kernel: weight and activation staging costs ~10% on Q4_K a
 
 `40.6` is one kernel on one shape. Across the whole prefill kernel set the GPU delivers **~30 TFLOPS aggregate**, about **62% of the 48.35 instruction ceiling**, against the best kernel's 84%. The recorded model-level gap versus the plain-store bench is **27.7%**: part of it is the IQ3_XXS decode (a third of the FFN on the 3.84 bpw target and the most expensive decoder measured, +26% loop instructions over Q4_K), part is the non-FFN GEMMs, and part is shape and `Complete` choices. The batch-2048 Q4_K against IQ3_XXS A/B that would separate the format from the rest was never run.
 
+### The per-format table, and why the aggregate is ~30
+
+The section above attributes the aggregate gap partly to the IQ3_XXS decoder,
+partly to the non-FFN GEMMs and partly to shape and `Complete` choices without
+splitting the terms. `engine/gpu/gemm_bench.hip` splits the first one: it runs
+the kernel the prefill path runs, one weight format at a time, at the two real
+FFN shapes, batch 2048, best of three.
+
+| type | gate/up M=17408 K=5120 | down M=5120 K=17408 |
+| --- | ---: | ---: |
+| **Q4_K** | **38.05** | **37.60** |
+| IQ4_XS | 31.30 | 33.18 |
+| Q5_K | 32.60 | 32.10 |
+| Q8_0 | 30.89 | 31.83 |
+| Q2_K | 29.78 | 31.79 |
+| Q3_K | 30.83 | 29.96 |
+| IQ4_NL | 31.24 | 30.33 |
+| IQ3_S | 30.09 | 30.67 |
+| IQ3_XXS | 28.99 | 29.79 |
+| IQ2_XS | 28.94 | 29.41 |
+| IQ2_XXS | 28.85 | 28.85 |
+| Q6_K | 30.24 | 30.50 |
+| IQ2_S | 28.86 | 28.43 |
+
+Two things stand out. **Q4_K is in a class of its own** — every other format
+loses 15-25% to it at the same tile. And the IQ3 decoders are *not* an outlier:
+IQ3_XXS at 28.99 is 1.2% below IQ3_S and 7% below IQ4_XS, so "IQ3_XXS is the
+most expensive decoder" costs tens of percent of loop instructions but only a
+few percent of wall time. What Q4_K has that the rest do not is the cheapest
+decoder plus, uniquely in this list, the tail-free `Complete` variant (worth
+4% on Q4_K by the ablation above, and gated to Q4_K/Q5_K at line 1412).
+
+At `m >= 4096` every type takes the same 256x256 tile, so the table is
+tile-matched and the spread is decoder cost. Weighting the measured rates by the
+tensor types of the actual artifact, taking the harmonic mean per layer because
+gate, up and down have identical FLOPs:
+
+| | TFLOPS |
+| --- | ---: |
+| census-weighted FFN prediction, 64/64 layers | **30.43** |
+| measured model aggregate (section above) | ~30 |
+| if those layers were all Q4_K | 37.90 |
+
+The prediction lands within a few percent of the aggregate with no free
+parameter, so the model-level gap against the 48.35 ceiling is **the weight
+format mix**, not an unexplained K-loop residual. The artifact is a mixed
+IQ3/IQ4 shard despite the `IQ4_XS` in its filename: IQ3_XXS and IQ3_S are 207 of
+its 866 tensors and dominate the FFN, while the Q4_K present is in the
+projections. `gemm_bench` measures components with synthetic weights, so the
+agreement is not a release measurement — but it removes the need for a free
+parameter to explain the aggregate.
+
+**The lever is the artifact, not the loop.** `gpu-tuning.md` already names the
+option: choose the quant family rather than accept a mixed shard. Converting
+the FFN tensors to Q4_K in place would be worth about 1.25x on FFN GEMM and so
+~1.16x on prefill for roughly 1 GiB more weights; a native all-Q4_K artifact
+gets the same rate without a second quantisation error but needs a download.
+Neither has been run.
+
+**Falsifier:** point the FFN weight table at synthetic Q4_K data of the same
+shapes and measure model prefill. Near 1.16x confirms the decoder attribution
+and the conversion route; near 1.0x means the aggregate is bound by something
+other than the weight decoder — most likely the non-FFN GEMMs or the clock —
+and the format lever is priced out.
+
 **This is clock, and the clock is a function of the kernel.** Efficiency per clock agrees to **0.3%** across the two harnesses that disagreed -- 0.0144 TF/MHz in both -- so there is no hidden code difference. The part has three SCLK levels (600 / 1408 / **2900 MHz**) and **never reaches the top one**: measured across power limits, 80 W gives 1799 MHz / 25.9 TF and 130 W gives 2016 MHz / 28.6 TF, work-per-clock is flat (0.0144, -1.5% between them), `gpu_busy` is ~85% at both, and the sampled maximum is 2221 MHz. The log's own line is that "what is broken is the conversion of watts into clock".
 
 So the 26% is **not a fixed ceiling**: the clock is coupled to the kernel's power draw, and zeroed operands raise it ~20%. A kernel that toggles fewer bits and issues fewer instructions for the same FLOPs raises both the work per clock and the clock itself. At the 2900 MHz level the part never reaches, the peak is on the order of **60 TFLOPS**; at a realistic ~2200 MHz it is ~45, and the production ~30 is about two thirds of that. Treating ~31.5 as "the real rate, no headroom" was the wrong read. (The NPU's 32.4 TF, by contrast, is data-independent, so the two engines are at parity *at the current clock*.)
