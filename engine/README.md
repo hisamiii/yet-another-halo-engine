@@ -372,3 +372,45 @@ the tile shape. The untested lever with a mechanism behind it is the weight
 operand: v3 reads it row-major through the same gapped pattern (512 requested, 16
 regions), and our HIP kernel avoids that by repacking weights into the blocked
 layout the fragments want. That is the next experiment.
+
+### The tile is at a local optimum, and the reason is DRAM bytes vs L2 bytes
+
+v6 tested the one remaining tiling lever suggested by the compile report. With four
+accumulator fragments per thread the tile area is fixed at 16x16x4 = 1024 and total
+issued traffic goes as 1/BM + 1/BN, so 32x32 (1/32 + 1/32) issues 20% fewer bytes
+than 16x64 (1/16 + 1/64) and needs fewer loads per WMMA (4/4 instead of 5/4). The
+report confirms it exactly: 168 vector registers instead of 200, and total issued
+read 1.426 GB instead of 1.783 GB. It is **2.04x slower** (3.713 ms against 1.819).
+
+The resolution is which operand the bytes belong to. The weight tensor is
+17408 * 5120 * 2 = 178,257,920 bytes, and the report's issued-byte figure carries a
+constant 2x lane-accounting factor (the access geometry shows `requested=512`
+against `unique=256` for a single packet), so issued/2 is the number of times the
+tensor is read:
+
+| kernel | weight issued | / tensor size | weight reads | activation issued |
+| --- | ---: | ---: | ---: | ---: |
+| v3 16x64 | 356,515,840 | 2.00x | **1** | 1426 MB |
+| v6 32x32 | 713,031,680 | 4.00x | **2** | 713 MB |
+
+v3 reads the weights exactly once and its activation operand is only 655 KiB, which
+is L2-resident and therefore nearly free no matter how many of the 1088 workgroups
+re-read it. v6 trades 713 MB of that cheap L2-resident activation traffic for a
+second, expensive pass over 178 MB of DRAM-streamed weights. Fewer issued bytes,
+much worse bytes. Minimising issued bytes is the wrong objective; minimising DRAM
+traffic is right, and v3 is already at the floor for these operand sizes -- one read
+of the weights, and the activation read once from DRAM and then from L2.
+
+This one mechanism explains every falsification in this section. The M32 16x64 tile
+lost to occupancy. Depth four lost to occupancy. The transposed activation lost
+because the token-major B-fragment gather is cheaper than the k-major one. And
+32x32 lost because it converted cheap L2 bytes into expensive DRAM bytes. v3 sits at
+a local optimum on tile shape, and the remaining 1.34x against our HIP kernel is
+memory-system efficiency on the same 178 MB (v3 moves it at 98 GB/s, HIP at 132
+GB/s), not tile geometry.
+
+Going further needs one of two different things, neither of which is a tile tweak:
+either a multi-wave workgroup with LDS staging to raise achieved bandwidth, or the
+production w4a16 format, where the weights shrink about 3.5x and the whole balance
+changes. The f16 kernel has served its purpose, which was to establish that Loom can
+express this kernel and to find where the time actually goes.
