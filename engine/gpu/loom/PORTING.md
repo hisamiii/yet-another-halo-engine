@@ -64,6 +64,7 @@ explicitly deferred.
 | yah_ffn_gemm_q6k_f32.loom | prefill_fp16.hip | batched Q6_K FFN GEMM with in-kernel split-plane decode (kStore) | ported, 17.47 ms at m_tiles=1088; decode bit-exact vs Q6KValue, case at atol/rtol 1e-5 |
 | yah_ffn_gemm_q3k_f32.loom | prefill_fp16.hip | batched Q3_K FFN GEMM with in-kernel hmask/qs decode (kStore) | ported, 18.01 ms at m_tiles=1088; decode bit-exact vs the HIP Q3_K arm, case at atol/rtol 1e-5 |
 | yah_ffn_gemm_iq3s_f32.loom | prefill_fp16.hip | batched IQ3_S FFN GEMM, in-kernel grid+sign decode (kStore) | ported, 19.27 ms at m_tiles=1088; first port with an extra table operand (the 512-word grid); decode bit-exact vs the HIP IQ3_S arm, case at atol/rtol 1e-5 |
+| yah_ffn_gemm_iq3xxs_f32.loom | prefill_fp16.hip | batched IQ3_XXS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 15.62 ms at m_tiles=1088; two table operands (256-word grid, 128-byte ksigns); decode bit-exact vs the HIP IQ3_XXS arm, case at atol/rtol 1e-5 |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -163,8 +164,8 @@ erased, and the three FFN weights are the ones that reach the GEMM above. Their
 | ffn_down | 29     | 12   | 14   | 1    | 6     | 1    | 1       | 1      | 0      | 0     |
 | total    | 98     | 29   | 28   | 4    | 15    | 12   | 5       | 2      | 1      | 1     |
 
-So IQ4_XS, Q4_K, Q5_K, Q6_K, Q3_K and IQ3_S cover 186 of 195 FFN blocks (95%);
-the other 9 need IQ3_XXS, IQ4_NL, IQ2_XS and IQ2_S ports. Q8_0 is on no FFN
+So IQ4_XS, Q4_K, Q5_K, Q6_K, Q3_K, IQ3_S and IQ3_XXS cover 191 of 195 FFN
+blocks (98%); the other 4 need IQ4_NL, IQ2_XS and IQ2_S ports. Q8_0 is on no FFN
 tensor in this shard (it owns only ssm_alpha/beta and a few attn_k/v), so the
 Q8_0 FFN GEMM is off the FFN route here even though prefill_fp16.hip instantiates
 it. The launcher switch at prefill_fp16.hip:1691-1722 does instantiate all six
@@ -182,8 +183,8 @@ three are tuning items, explicitly deferred. The residual and SwiGLU epilogues
 have the same Q4_K port (yah_ffn_gemm_q4k_residual_f32, yah_ffn_gemm_q4k_swiglu_f16,
 23.11/16.98 ms at production size), and yah_ffn_gemm_q4k_gateup_f16 (32.03 ms)
 shares one activation tile and one output between two decoders. The remaining
-format work is the remaining shard formats (IQ4_NL, IQ3_XXS, IQ2_XS,
-IQ2_S) and the residual/SwiGLU/paired epilogues for the Q5_K, IQ4_XS and
+format work is the remaining shard formats (IQ4_NL, IQ2_XS, IQ2_S) and the
+residual/SwiGLU/paired epilogues for the Q5_K, IQ4_XS and
 Q8_0 store arms, which so far only have kStore.
 
 Reachability evidence for the entries that are not on that route:
@@ -398,6 +399,14 @@ Reachability evidence for the entries that are not on that route:
   `group*8 + 2*l + which` and the qh high bit is `2*l + which`. Using `2*half`
   instead silently reads the wrong grid entry for half the elements and is only
   caught by the per-element diff, not by a compile or preflight.
+- **A grid-format port needs the qs byte load, not just the byte offset.** In
+  IQ3_S the value loaded from the weight is already the 9-bit grid index, so the
+  same expression feeds `view.load grid`. In IQ3_XXS the qs byte is a plain
+  0..255 index into a different table: the byte offset must be loaded with
+  `view.load %w_view` before indexing the grid. Clamping that offset to 255
+  (inherited from the IQ3_S version, where 255 was a grid bound) truncates most
+  blocks to the first one, which shows up as grid magnitudes from the wrong
+  table entry rather than an out-of-range fault.
 - **`RoundActivation` in `prefill_fp16.hip` is `scalar.fptrunc`.** It is an empty
   `asm volatile` barrier followed by `__float2half_rn`, so it pins which rounding
   boundary the source sees and emits no instruction. Ports of `HalfNorm`,
