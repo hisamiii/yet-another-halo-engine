@@ -1,0 +1,109 @@
+// YAH fp16 output normalization with residual pre-add, Loom port of HalfNorm.
+//
+// HIP source: models/qwen/hip/kernels/prefill_fp16.hip. Per row of dim elements:
+//
+//   v      = x[i] + residual[i]            (the residual add, when supplied)
+//   sum_sq = sum_i v^2
+//   inv    = 1 / sqrt(sum_sq/dim + eps)
+//   sum_out[i] = v                         (the pre-normalization sum, when asked)
+//   out[i]     = f16((v * inv) * weight[i])
+//
+// Two optional pointers select the residual add and the sum_out write. This port
+// requires both to be present, because a buffer argument is always bound here;
+// PORTING.md records that the skipped forms are not covered.
+//
+// The HIP kernel uses 256 threads with a shared-memory reduction tree. This port
+// uses one subgroup per row with lane-strided loops and `kernel.subgroup.reduce`,
+// which is the same sum without LDS or barriers.
+//
+// The check is exact. With x and residual both 0.5 the pre-normalization value is
+// exactly 1, so the mean square is exactly 1 with eps zero, inv is exactly 1, the
+// sum_out buffer must come back as ones, and the output must be exactly the weight
+// row -- which the case makes an iota so a wrong weight index or output stride
+// changes the answer.
+//
+// Required config: --config=yah_half_norm.rows=1 --config=yah_half_norm.dim=512
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_half_norm.rows : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_half_norm.dim : %value: index where [range(%value, 32, 65536)]
+
+config.def @yah_half_norm.eps = 0.0 : f32
+
+kernel.def target(@yah_wave32) @yah_half_norm() {
+  %unit = index.constant 1 : index
+  %rows = config.get @yah_half_norm.rows : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%x: buffer, %residual: buffer, %weight: buffer, %sum_out: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %dim = config.get @yah_half_norm.dim : index
+  %eps = config.get @yah_half_norm.eps : f32
+  %rows = config.get @yah_half_norm.rows : index
+  %total_elems = index.mul %rows, %dim : index
+  %x_na, %res_na, %weight_na, %sum_na, %out_na = buffer.assume.noalias %x, %residual, %weight, %sum_out, %out : buffer, buffer, buffer, buffer, buffer
+  %x_view = buffer.view %x_na[%base] : buffer -> view<[%total_elems]xf32>
+  %res_view = buffer.view %res_na[%base] : buffer -> view<[%total_elems]xf32>
+  %weight_view = buffer.view %weight_na[%base] : buffer -> view<[%dim]xf32>
+  %sum_view = buffer.view %sum_na[%base] : buffer -> view<[%total_elems]xf32>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%total_elems]xf16>
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row_base = index.mul %row, %dim : index
+  %partial = scf.for %i = [%lane to %dim step %c32](%s = %zero : f32) -> (f32) {
+    %off = index.add %row_base, %i : index
+    %xv = view.load %x_view[%off] : view<[%total_elems]xf32> -> f32
+    %rv = view.load %res_view[%off] : view<[%total_elems]xf32> -> f32
+    %v = scalar.addf %xv, %rv : f32
+    %sq = scalar.mulf %v, %v : f32
+    %next = scalar.addf %s, %sq : f32
+    scf.yield %next : f32
+  }
+  %sum_sq = kernel.subgroup.reduce<addf> %partial : f32
+  %dim_i = index.cast %dim : index to i32
+  %dim_f = scalar.sitofp %dim_i : i32 to f32
+  %mean = scalar.divf %sum_sq, %dim_f : f32
+  %shifted = scalar.addf %mean, %eps : f32
+  %root = scalar.sqrtf %shifted : f32
+  %inv = scalar.divf %one, %root : f32
+  %sink = scf.for %j = [%lane to %dim step %c32](%mark = %zero : f32) -> (f32) {
+    %off2 = index.add %row_base, %j : index
+    %xv2 = view.load %x_view[%off2] : view<[%total_elems]xf32> -> f32
+    %rv2 = view.load %res_view[%off2] : view<[%total_elems]xf32> -> f32
+    %v2 = scalar.addf %xv2, %rv2 : f32
+    %w = view.load %weight_view[%j] : view<[%dim]xf32> -> f32
+    view.store %v2, %sum_view[%off2] : f32, view<[%total_elems]xf32>
+    %normed = scalar.mulf %v2, %inv : f32
+    %weighted = scalar.mulf %normed, %w : f32
+    %half = scalar.fptrunc %weighted : f32 to f16
+    view.store %half, %out_view[%off2] : f16, view<[%total_elems]xf16>
+    scf.yield %mark : f32
+  }
+  kernel.return
+}
+
+// Requires --config=yah_half_norm.rows=1 --config=yah_half_norm.dim=512.
+//
+// x and residual are both 0.5, so the pre-normalization value is exactly 1, the mean
+// square is exactly 1, and inv is exactly 1 with eps zero. The output is therefore
+// exactly the weight row (an iota) and the sum_out buffer is exactly all ones.
+check.case public @yah_half_norm_case {
+  %x = check.generate.fill value(0.5) : tensor<512xf32>
+  %residual = check.generate.fill value(0.5) : tensor<512xf32>
+  %weight = check.generate.iota offset(0.0) step(1.0) : tensor<512xf32>
+  %sum_out = check.generate.fill value(0.0) : tensor<512xf32>
+  %out = check.generate.fill value(0.0) : tensor<512xf16>
+  %expected_out = check.generate.iota offset(0.0) step(1.0) : tensor<512xf16>
+  %expected_sum = check.generate.fill value(1.0) : tensor<512xf32>
+  kernel.launch @yah_half_norm(%x, %residual, %weight, %sum_out, %out) : (tensor<512xf32>, tensor<512xf32>, tensor<512xf32>, tensor<512xf32>, tensor<512xf16>)
+  check.expect.close actual(%out) expected(%expected_out) atol(0.0) rtol(0.0) nan(same) : tensor<512xf16>
+  check.expect.close actual(%sum_out) expected(%expected_sum) atol(0.0) rtol(0.0) nan(same) : tensor<512xf32>
+  check.return
+}
+
+check.benchmark<@yah_half_norm_case> @yah_half_norm_bench
