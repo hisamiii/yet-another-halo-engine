@@ -74,12 +74,13 @@ explicitly deferred.
 | yah_vision_attention_rows_bf16.loom | vision/encoder.hip | vision attention head->token transpose | ported, 0.0070 ms; bit-exact vs fixture |
 | yah_vision_patchify_bf16.loom | vision/encoder.hip | patch embedding (image to 16x16 patches) | ported, 0.0070 ms; bit-exact vs fixture |
 | yah_vision_inject_rows_f32.loom | vision/device_input.hip | embedding row injection (broadcast hc) | ported, 0.0065 ms; exact fixture |
+| yah_gemv_f32.loom | gemv.hip | decode GEMV, f32 weight path | ported, 0.0063 ms; exact, no fixture; bf16 path todo |
 | - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | todo |
 
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 49 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 50 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -96,7 +97,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
 | W8A8 + fused quant | prefill_quant_gemm.hip | W8A8BlockedWmmaGEMMKernel, QuantizeActivationToQ8_1Kernel, RequantizeActivationInt4Kernel, and three fused RMSNorm/SwiGLU/SSM-norm quantize kernels, ZeroQ8ActTailKernel, BatchedQuantGEMVKernel |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16. **todo**: AtbEncodeA, AtbDecodeC, AtbDecodeSwiGLU, AtbRepack(+Slice) |
-| GEMV (1.5%) | gemv.hip, gemv_quant.hip | FastGEMVBlockKernel, and the quantized variant |
+| GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
 | sampling | sample.hip | 13 more kernels: batched argmax, sparse penalties, linear/sorted sampling, and the speculative segment set |
 | vision | vision/encoder.hip, vision/device_input.hip | **ported**: Finish, BiasResidual, LayerNorm, Softmax, AttentionRows, Patchify, InjectRows. **todo**: PatchPosition, QkvRope, Activate |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip. **todo**: the Ptr and remaining decode-side variants, FastFusedSwiGLUGEMVBlockKernel |
