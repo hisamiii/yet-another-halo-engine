@@ -219,6 +219,10 @@ argmax=11751        (identical to the HIP yah-run reference)
 final residual vs HIP layer_63: max_abs 0.095, mean 0.0023
 ```
 
+Timing (untuned, correctness-first ports; two runs): `layers_ms=4461.8` and
+`4401.8`, against the HIP `best_ms` of ~347-363 ms. The ~12x gap is the deferred
+tuning target, not a correctness issue; the objective records it now.
+
 Each layer individually matches HIP to ~0.05, so the 0.095 end-to-end is
 accumulated fp16-staging/reduction-order drift and does not move the argmax.
 

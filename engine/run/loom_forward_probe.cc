@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -235,6 +236,8 @@ int main(int argc, char** argv) {
       Dispatch(gpu, exe, "yah_ffn_gemm_q4k_residual", 320, 1, 1, 32, 1, 1, b, 5);
     };
 
+    gpu.Synchronize();
+    const auto t0 = std::chrono::steady_clock::now();
     for (std::uint32_t l = 0; l < kMainBlocks; ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       const bool full = ((l + 1) % kInterval) == 0;
@@ -376,6 +379,11 @@ int main(int argc, char** argv) {
       run_residual(e_res_down, pre + "ffn_down.weight", ffnup);
     }
 
+    gpu.Synchronize();
+    const double layers_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+    std::printf("layers_ms=%.1f\n", layers_ms);
     // Head: output RMSNorm on the last position, Q4_K GEMV, argmax.
     const auto* onw = find("output_norm.weight");
     const auto* ow = find("output.weight");
