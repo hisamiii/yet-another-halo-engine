@@ -208,6 +208,11 @@ profile gives one, so the expensive paths move first rather than the convenient 
   `check.generate.iota offset(...) step(...) period(block_elems)` states it exactly,
   and only the packed input needs a fixture. Choosing the scale so the products stay
   exact in bf16 (multiples of 0.5 below 128) keeps the comparison at `atol=0`.
+- **`bf16` is a first-class check type.** `check.generate.fill`, `check.generate.iota`
+  and `check.expect.close` all accept `tensor<...xbf16>`, and `scalar.fptrunc %v : f32
+  to bf16` is a direct narrowing with no separate lowering recipe. Eight explicit
+  mantissa bits means every integer up to 256 round-trips exactly, which is what
+  lets a bf16 conversion be checked with `atol=0` and no fixture.
 - **Re-tile a tuned kernel freely for the first port; say so in the header.**
   `BatchedDeltaNetRowSplitKernel` is templated over four orthogonal tile choices
   with DPP reductions and LDS staging. The port picks the instantiation whose
