@@ -237,34 +237,38 @@ deterministic with no intervening syncs.
 `engine/gpu/loom/tools/emit_prefill.py <model.gguf> <outdir>` walks the model
 tensor table and emits every HAL the prefill needs, named by a convention the C++
 driver reconstructs from each tensor's ggml type and shape:
-`gemm_{kstore,residual,swiglu}_<fmt>_<m_tiles>_<k_blocks>.hal`. It emitted 47
-GEMM HALs for `Qwen3.8-27B-IQ4_XS-3.84bpw.gguf`, plus 13 fixed HALs
-(norm/conv/prepkq/prepab/rowsplit/postnorm/unpack/rope/wmma/cast/gemv/rmsnorm/
-argmax) and the IQ3_S/IQ3_XXS grid/ksigns tables.
+`gemm_{kstore,residual,swiglu}_<fmt>_<m_tiles>_<k_blocks>.hal`. It emits every
+GEMM HAL `Qwen3.8-27B-IQ4_XS-3.84bpw.gguf` reaches (50 for this shard), plus the
+fixed HALs (norm/conv/prepkq/prepab/rowsplit/postnorm/unpack/rope/wmma/cast/gemv/
+rmsnorm/argmax) and the IQ3_S/IQ3_XXS/IQ2_XXS/IQ2_XS grid/ksigns tables.
 
 `engine/run/loom_forward_target.cc` is the format-aware driver: it reads
 `Qwen35Config` for the layer schedule, picks the HAL per tensor from its type,
-host-dequantizes the embedding (Q4_K and IQ4_XS), and runs the same 64-layer
-prefill. It runs the IQ4_XS shard through every layer whose format is ported and
-stops at `blk.3.ffn_gate.weight`, whose type is IQ2_XXS. Its layers 0-2 match
-the HIP shard dumps to max_abs ~0.026-0.029, mean ~1e-04, so the mixed-format
-GEMM/swiglu selection is correct on real data.
+host-dequantizes the embedding, and runs the same 64-layer prefill. Every layer
+now matches the HIP shard dumps (all 64 finite; worst max_abs 0.067, mean ~1e-03
+at the last layer), and the full run reaches **argmax 11751**, the HIP reference.
+`layers_ms=4447` against the HIP `best_ms=393.2`: the port is correct and
+untuned, which is the intended stopping point here.
 
-The two formats still missing a port are the only thing between this driver and a
-full IQ4_XS-shard run: **IQ2_XXS** (3 FFN gate/up tensors) and **Q2_K** (1
-ssm_beta). Neither has a Loom file yet. HIP reference for that shard:
-`argmax=11751`, `best_ms=393.2`.
+The last two formats on the shard were **IQ2_XXS** (FFN gate/up) and **Q2_K**
+(one ssm_beta), now both ported. Q2_K initially produced all-NaN `beta` because
+its decoder read d/dmin at the block base (the block_q4_K layout) instead of
+bytes 80/82; the in-tree case reported `skipped` and hid it, and localizing the
+first non-finite layer on the real shard found it. Emitting every HAL from the
+cleaned source and re-running reproduces argmax 11751.
 
 ## 5. Remaining work
 
-1. Emit HAL executables for every ported kernel at its production shape
-   (a build step; `iree-benchmark-loom` needs a case+benchmark per compile).
-2. An HRX-native tensor/weights layer: register the GGUF mmap as an imported
-   HRX buffer (or allocate and copy), device buffers for activations and the
-   recurrent/KV state.
-3. Replace the HIP `Forward` layer (`engine/model/forward.hip`) and the
-   `Launch*` calls with HRX dispatches of the Loom kernels; the dispatch
-   constants/bindings layout comes from each kernel export metadata.
-4. Validate prefill and decode against the recorded HIP argmax and timings,
-   then remove the HIP build (`engine/build_gpu.sh`, hipcc) and the HIP
-   sources from the engine.
+1. ~~Emit HAL executables for every ported kernel at its production shape~~ done:
+   `emit_prefill.py` emits every GEMM HAL the shard reaches plus the fixed HALs.
+2. ~~An HRX-native tensor/weights layer~~ done for prefill: the GGUF mmap is
+   imported as an HRX buffer and activations plus recurrent/KV state are device
+   buffers (`engine/model/loom_runtime.hpp`).
+3. ~~Replace the HIP `Forward` layer~~ done for prefill in
+   `engine/run/loom_forward_target.cc`; it dispatches the Loom kernels directly
+   through the HRX native API with no HIP.
+4. Prefill is **validated** (argmax 11751, worst layer max_abs 0.067). Decode is
+   the next target: GEMV, decode attention, resident DeltaNet and the
+   state-advancing decode convolution, then remove the HIP build
+   (`engine/build_gpu.sh`, hipcc) and the HIP sources. Tuning stays deferred
+   until the Loom decode path also matches HIP.

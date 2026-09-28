@@ -115,6 +115,9 @@ explicitly deferred.
 | yah_ffn_gemm_q6k_swiglu_f16.loom | prefill_fp16.hip | Q6_K FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 15.86 ms at m_tiles=1088; fallback up-projection arm |
 | yah_ffn_gemm_iq2xs_f32.loom | prefill_fp16.hip | batched IQ2_XS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 19.85 ms at m_tiles=1088; grid passed as i32 word pairs of the 64-bit entries |
 | yah_ffn_gemm_iq2s_f32.loom | prefill_fp16.hip | batched IQ2_S FFN GEMM, in-kernel grid+qs-sign decode (kStore) | ported, 12.02 ms at m_tiles=1088; grid passed as i32 word pairs, signs from the qs bytes | 
+| yah_ffn_gemm_iq2xxs_f32.loom | prefill_fp16.hip | batched IQ2_XXS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported; 512-word grid + 128-byte ksigns operands; case exact at m_tiles=1; **shape-generic** |
+| yah_ffn_gemm_iq2xxs_swiglu_f16.loom | prefill_fp16.hip | IQ2_XXS FFN GEMM SwiGLU epilogue (kSwiGLU) | ported; grid+ksigns; the fallback up-projection arm; **shape-generic** |
+| yah_ffn_gemm_q2k_f32.loom | prefill_fp16.hip | batched Q2_K FFN GEMM with in-kernel decode (kStore) | ported; block_q2_K is 84 bytes and stores d/dmin at bytes 80/82, not at the block base; case passes at m_tiles=1 and the real blk.22.ssm_beta matches a float64 oracle to 1.2e-07; **shape-generic** |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -402,13 +405,21 @@ non-default config, an explicit env var, or is dead on this shard.
 
 ## Shape genericity
 
-Beyond the kStore/kResidual family (8 formats), the kSwiGLU arm now takes the same
-`k_blocks`/`token_tiles` configs for IQ3_XXS, IQ3_S, IQ4_XS, Q3_K and Q4_K, and the
-kStore arm additionally covers Q8_0 (QK=32, so `k_blocks` is K/32) and IQ2_XS.
-These are the formats the IQ4_XS-3.84bpw target shard reaches: its FFN gate/up
-pairs are a kStore gate plus a kSwiGLU up, and its attention/SSM projections are
-Q3_K/IQ3_XXS/IQ3_S/IQ4_XS/Q4_K/Q5_K/Q6_K/Q8_0. Still missing on that shard:
-IQ2_XXS (3 FFN tensors) and Q2_K (1 ssm_beta), neither of which has a port yet.
+Beyond the kStore/kResidual family (8 formats), the kSwiGLU arm takes the same
+`k_blocks`/`token_tiles` configs for IQ3_XXS, IQ3_S, IQ4_XS, Q3_K, Q4_K and
+IQ2_XXS, and the kStore arm additionally covers Q8_0 (QK=32, so `k_blocks` is
+K/32), IQ2_XS, IQ2_XXS and Q2_K. Together these cover every format the
+IQ4_XS-3.84bpw target shard reaches: its FFN gate/up pairs are a kStore gate plus
+a kSwiGLU up, and its attention/SSM projections are
+Q3_K/IQ3_XXS/IQ3_S/IQ4_XS/Q4_K/Q5_K/Q6_K/Q8_0.
+
+Q2_K was the last gap and shipped with a decoder bug: it read d/dmin at the block
+base (bytes 0/2, the block_q4_K layout) instead of bytes 80/82, so the leading
+scale bytes were reinterpreted as fp16 and the output was NaN. The in-tree case
+reported `skipped` rather than failing, which hid it; running the real
+`blk.22.ssm_beta` (the only Q2_K tensor on the shard) through HRX is what caught
+it. The real-tensor oracle (`verify_loom_gemm_q2k.py`, max_abs 1.2e-07) and the
+in-tree case both pass now.
 
 ## Shape genericity (original Q4_K/IQ4_XS note)
 
