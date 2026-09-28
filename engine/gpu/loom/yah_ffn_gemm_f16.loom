@@ -1,0 +1,72 @@
+// YAH FFN GEMM in Loom: out[m][t] = sum_k W[m][k] * A[t][k].
+//
+// First authored version. One workgroup computes a 16x16 output tile with one
+// wave, using f16 WMMA with an f32 accumulator. The activation buffer is
+// token-major ([t][k]), so the rhs operand is a *strided view* of it as [k][t]
+// rather than a transposed copy: stride [1, K].
+//
+// Deliberately minimal, to validate the authoring path end to end before tuning.
+// The tuning levers this shape exposes are known and not applied here: the N
+// tile is 16 tokens, so each weight tile is re-read batch/16 = 4 times at
+// batch 64 and 128 times at batch 2048; a real kernel wants a 16x128 or larger
+// N tile with the weight tile staged once per K block.
+//
+// Correctness case uses all-ones operands, so every output must equal K = 5120
+// exactly in f32: with f16 inputs of 1.0 the products are exactly 1.0 and the
+// f32 accumulation of 5120 of them is exact. That checks the K reduction and
+// the operand indexing rather than just checking for NaNs.
+amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+
+config.decl @yah_ffn_gemm_f16.m_tiles : %value: index where [range(%value, 1, 4096)]
+
+kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_f16() {
+  %unit = index.constant 1 : index
+  %m_tiles = config.get @yah_ffn_gemm_f16.m_tiles : index
+  %n_tiles = index.constant 4 : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%m_tiles, %n_tiles, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%weight: buffer, %input: buffer, %output: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c16 = index.constant 16 : index
+  %c5120 = index.constant 5120 : index
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %k = index.constant 16 : index
+
+  // Activation viewed [k][t]: element (k,t) is A[t][k] = base + t*5120 + k.
+  %a_layout = encoding.layout.strided [1, 5120] : encoding<layout>
+
+  %weight_noalias, %input_noalias, %output_noalias = buffer.assume.noalias %weight, %input, %output : buffer, buffer, buffer
+  %w_view = buffer.view %weight_noalias[%base] : buffer -> view<17408x5120xf16>
+  %a_t_view = buffer.view %input_noalias[%base] : buffer -> view<5120x64xf16, %a_layout>
+  %out_view = buffer.view %output_noalias[%base] : buffer -> view<17408x64xf32>
+
+  %wg_x = kernel.workgroup.id<x> : index
+  %wg_y = kernel.workgroup.id<y> : index
+  %m_origin = index.mul %wg_x, %c16 : index
+  %n_origin = index.mul %wg_y, %c16 : index
+
+  %zeros = vector.constant 0.0 : vector<8xf32>
+  %init = vector.fragment<init> %zeros shape [%m, %n] : vector<8xf32>
+  %acc0 = scf.for %kk = [%c0 to %c5120 step %c16](%a = %init : vector<8xf32>) -> (vector<8xf32>) unroll schedule(recurrence) {
+    %lhs = vector.fragment.load<lhs> %w_view[%m_origin, %kk] shape [%m, %k] : view<17408x5120xf16> -> vector<16xf16>
+    %rhs = vector.fragment.load<rhs> %a_t_view[%kk, %n_origin] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
+    %next = vector.mma %lhs, %rhs, %a : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    scf.yield %next : vector<8xf32>
+  }
+  vector.fragment.store<result> %acc0, %out_view[%m_origin, %n_origin] shape [%m, %n] : vector<8xf32>, view<17408x64xf32>
+  kernel.return
+}
+
+check.case public @yah_ffn_gemm_f16_case {
+  %weight = check.generate.fill value(1.0) : tensor<17408x5120xf16>
+  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
+  %output = check.generate.fill value(0.0) : tensor<17408x64xf32>
+  %expected = check.generate.fill value(5120.0) : tensor<17408x64xf32>
+  kernel.launch @yah_ffn_gemm_f16(%weight, %input, %output) : (tensor<17408x5120xf16>, tensor<64x5120xf16>, tensor<17408x64xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<17408x64xf32>
+  check.return
+}
+
+check.benchmark<@yah_ffn_gemm_f16_case> @yah_ffn_gemm_f16_bench

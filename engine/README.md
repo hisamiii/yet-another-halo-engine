@@ -261,3 +261,40 @@ a working runtime behind it, and the GPU half has no asset at all today.** If th
 point of adopting Loom is the NPU -- and that is where the evidence is -- the NPU
 path is the cheaper thing to prove end to end, and it simultaneously teaches the
 language and the toolchain that the GPU GEMM would need anyway.
+
+### Authored: our first Loom GEMM, working and measured
+
+`engine/gpu/loom/yah_ffn_gemm_f16.loom` is a f16 WMMA GEMM doing
+`out[m][t] = sum_k W[m][k] * A[t][k]` at the production FFN shape (M=17408,
+K=5120), one 16x16 tile per workgroup, one wave, f32 accumulator. The activation
+buffer is token-major, so the rhs operand is a *strided view* of it as [k][t]
+(`encoding.layout.strided [1, 5120]`) rather than a transposed copy.
+
+It compiles for gfx1151, dispatches through HRX, and passes its correctness case.
+The case uses all-ones operands, so every output must equal exactly 5120 in f32 --
+which checks the K reduction and the operand indexing, not just the absence of NaNs.
+1956 instructions emitted.
+
+| | weight format | time | TFLOP/s |
+| --- | --- | ---: | ---: |
+| our HIP, tuned (`one:q4k 17408 5120 64`) | Q4_K, 4.5 bits | **1.197 ms** | **9.53** |
+| our authored Loom GEMM | f16, 16 bits | **6.109 ms** | **1.87** |
+
+So the first authored version is 5.1x behind -- and the gap decomposes into two
+parts that are both understood rather than mysterious:
+
+1. **Format.** Ours reads 3.5x fewer weight bytes (0.5625 vs 2 B/weight), and this
+   shape is weight-traffic sensitive. A Q4_K Loom kernel starts ~3.5x closer
+   before any tiling work.
+2. **Tile shape, deliberately not tuned.** 16x16 with a single wave runs at ~3.4%
+   of peak. The levers are known and unwritten: a 16x128 or larger N tile so the
+   weight tile is reused across more tokens (at batch 64 the current tile re-reads
+   each weight tile 4 times, at batch 2048 it would be 128 times), LDS staging of
+   the weight tile via `buffer.alloca<workgroup>` + `kernel.barrier<workgroup>`,
+   multi-wave workgroups, and vectorized fragment loads.
+
+The point of this artifact is that it moves "can Loom do this at all" from unknown
+to **yes, verified on the device** -- and it turns the tuning argument into a list
+of specific, independently testable changes rather than a hope. Both halves are now
+on the same footing: the NPU path has an exact target profile and a working runtime,
+and the GPU path has a working kernel we authored and can iterate on.
