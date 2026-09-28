@@ -73,8 +73,25 @@ def main():
     inp = np.frombuffer(bytes(packed), dtype=np.int8)
     np.save(os.path.join(OUT, "input_q4k_gemm.npy"), inp)
     np.save(os.path.join(OUT, "expected_out.npy"), exp.reshape(-1).astype(np.float32))
+    # Residual epilogue: the kernel adds the accumulator into the existing f32
+    # rows, so the residual case initialises the output to 1000 and the expected
+    # is 1000 + the row sum. Both are exact in f32.
+    residual_init = np.float32(1000.0)
+    np.save(os.path.join(OUT, "expected_residual.npy"),
+            (exp + residual_init).reshape(-1).astype(np.float32))
+    # SwiGLU epilogue: activation is scaled to 1/16 so the accumulator stays
+    # inside the f16 range, gate is 1, and the output is
+    # round_f16(g * sigmoid(g) * acc) with g = 1.
+    g = np.float32(1.0)
+    sig = np.float32(1.0) / (np.float32(1.0) + np.float32(np.exp(np.float32(-g))))
+    silu = np.float32(g * sig)
+    acc16 = exp / np.float32(16.0)
+    swi = np.float16(silu * acc16)
+    np.save(os.path.join(OUT, "expected_swiglu.npy"), swi.reshape(-1).astype(np.float16))
+    print("swiglu row0", float(silu), [float(v) for v in swi[0][:4]])
     print("wrote input_q4k_gemm.npy", inp.shape)
     print("wrote expected_out.npy", exp.reshape(-1).shape)
+    print("wrote expected_residual.npy", exp.reshape(-1).shape)
     print("row sums", [round(float(s), 3) for s in row_sums])
 
 

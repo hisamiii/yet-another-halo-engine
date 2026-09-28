@@ -24,6 +24,8 @@ explicitly deferred.
 | --- | --- | --- | --- |
 | yah_ffn_gemm_f16.loom | prefill_fp16.hip | batched f16 FFN GEMM (kStore) | ported, 1.83-1.90 ms token-major (1.819 ms before the layout fix), ~1.35x behind HIP; parity check pins the output layout |
 | yah_ffn_gemm_q4k_f32.loom | prefill_fp16.hip | batched Q4_K FFN GEMM with in-kernel decode (kStore) | ported, 23.31 ms at m_tiles=1088; bit-exact fixture at m_tiles=1; untuned |
+| yah_ffn_gemm_q4k_residual_f32.loom | prefill_fp16.hip | Q4_K FFN GEMM residual epilogue (kResidual) | ported, 23.11 ms at m_tiles=1088; fixture with residual init 1000 |
+| yah_ffn_gemm_q4k_swiglu_f16.loom | prefill_fp16.hip | Q4_K FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 16.98 ms at m_tiles=1088; scaled-activation fixture |
 | yah_ffn_gemm_residual_f32.loom | prefill_fp16.hip | FFN GEMM residual epilogue (kResidual) | ported, 2.046 ms; in-place add via a result-layout residual fragment load; parity check |
 | yah_ffn_gemm_swiglu_f16.loom | prefill_fp16.hip | FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 1.863 ms; silu(gate) * acc narrowed to fp16 at the fragment store; uniform check |
 | yah_ffn_gemm_gateup_f16.loom | prefill_fp16.hip | paired gate/up GEMM with SwiGLU (kGateUp) | ported, 4.053 ms; two accumulator groups share one activation tile; uniform check |
@@ -143,9 +145,10 @@ and its fixture case passes bit-exactly at m_tiles=1 while the production row
 count passes at m_tiles=1088. It is slow (23.31 ms vs 1.197 ms for the HIP Q4_K
 kernel) because it decodes only the 16 values a K step needs, re-reads the scale
 bytes every step, and stages both fragment operands through global memory. All
-three are tuning items, explicitly deferred. The other quant formats (Q5_K, Q6_K,
-IQ*) and the SwiGLU/residual epilogues in the quantized form are the remaining
-format work.
+three are tuning items, explicitly deferred. The residual and SwiGLU epilogues
+have the same Q4_K port (yah_ffn_gemm_q4k_residual_f32, yah_ffn_gemm_q4k_swiglu_f16,
+23.11/16.98 ms at production size). The remaining format work is the paired
+gate/up arm in quantized form and the other quant formats (Q5_K, Q6_K, IQ*).
 
 Reachability evidence for the entries that are not on that route:
 
