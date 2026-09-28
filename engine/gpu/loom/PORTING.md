@@ -24,12 +24,12 @@ explicitly deferred.
 | yah_swiglu_f32.loom | prefill_swiglu.hip | SwiGLU activation (split form) | ported, 0.0126 ms at 327680 elements |
 | yah_rope_f32.loom | rope.hip | RoPE (text path) | ported, 0.0091 ms at 384 pairs |
 | yah_embed_f32.loom | embed.hip | embedding lookup (f32 table) | ported, 0.0087 ms at hidden 5120 |
-| - | prefill_unpack.hip | QG unpack | todo |
+| yah_unpack_qg_f32.loom | prefill_unpack.hip | batched QG unpack | ported, 0.0149 ms at 64x5120 |
 | - | prefill_ssm.hip, ssm_row_split.hip | DeltaNet recurrence | todo |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
 | - | qkv.hip | QKV projection | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
-| - | sample.hip | argmax / sampling | todo |
+| yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | - | engine/kv/kv_quant.hip | KV quantization | todo |
 | - | vision/encoder.hip, device_input.hip | vision tower | todo |
 
@@ -45,6 +45,18 @@ explicitly deferred.
   fail verification ("attribute step has kind 1, expected 2").
 - **`config.get` must be repeated inside the launch body.** The launch-config region
   is a separate scope, so a value fetched only there is undefined in the body.
+- **Not every scalar op has a target contract.** `scalar.isfinitef` compiles under
+  loom-check and then fails with "target 'x' has no target-low contract for
+  'scalar.isfinitef'". A bound comparison covers NaN and +inf instead. Check the
+  contract for any op beyond arithmetic before building a kernel around it.
+- **The formatter rewrites large float literals** (-3e38 becomes -3.0000000000000001e+38),
+  so a later string replace against the original spelling silently fails. Re-read the
+  file after formatting before patching it.
+- There is no `scalar.select`; use `scf.if` with results. `vector.select` exists.
+- Where a permuted or non-uniform expectation is needed, `check.generate.iota` cannot
+  express it. Choose a shape where the expectation collapses to an arithmetic sequence
+  (the QG unpack case uses head_dim=1 so the interleave is src = 2*idx), or accept a
+  captured fixture.
 - Float literals in expectations are canonicalised by the formatter (1.0e-4 -> 0.0001).
 - Fragment loads from global memory are what this compiler is good at; LDS staging
   measured slower in all three variants tried.

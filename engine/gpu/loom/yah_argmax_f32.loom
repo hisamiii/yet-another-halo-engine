@@ -1,0 +1,122 @@
+// YAH argmax over logits, Loom port of ArgmaxKernel.
+//
+// HIP source: sample.hip. The HIP kernel scans with 256 threads into a shared
+// (value, index) pair and tree-reduces, ignoring non-finite values and keeping the
+// lowest index on ties because the comparison is strict.
+//
+// This port reaches the same answer in two passes, which avoids needing a
+// scalar select (the scalar dialect has cmpf, isfinitef and maxnumf, but no
+// scalar.select):
+//
+//   pass 1  each lane takes the max over its stride-32 slice, mapping non-finite
+//           entries to -3e38, then kernel.subgroup.reduce<maxnumf> gives the row max
+//   pass 2  each lane records the lowest index in its slice equal to that max
+//   combine lane 0 scans the 32 per-lane candidates from workgroup memory and
+//           keeps the minimum, which is the lowest index on ties
+//
+// Two passes read the logits twice. That is a correctness-first choice; the HIP
+// kernel reads once.
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_argmax.vocab : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_argmax() {
+  %unit = index.constant 1 : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%logits: buffer, %out_token: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %vocab = config.get @yah_argmax.vocab : index
+  %neg_big = scalar.constant -3.0000000000000001e+38 : f32
+  %pos_limit = scalar.constant 3.0000000000000001e+38 : f32
+
+  %logits_noalias, %out_noalias = buffer.assume.noalias %logits, %out_token : buffer, buffer
+  %logits_view = buffer.view %logits_noalias[%base] : buffer -> view<[%vocab]xf32>
+  %out_view = buffer.view %out_noalias[%base] : buffer -> view<1xi32>
+
+  %lane_bytes = index.constant 128 : offset
+  %scratch = buffer.alloca<workgroup> align(16) %lane_bytes : buffer
+  %scratch_view = buffer.view %scratch[%base] : buffer -> view<32xi32>
+
+  %cand_bytes = index.constant 4 : offset
+  %out_scratch = buffer.alloca<workgroup> align(4) %cand_bytes : buffer
+  %out_scratch_view = buffer.view %out_scratch[%base] : buffer -> view<1xi32>
+
+  %lane = kernel.workitem.id<x> : index
+
+  %slice_max = scf.for %i = [%lane to %vocab step %c32](%acc = %neg_big : f32) -> (f32) {
+    %v = view.load %logits_view[%i] : view<[%vocab]xf32> -> f32
+    // The AMDGPU target has no contract for scalar.isfinitef. A single upper
+    // bound test excludes both NaN (every comparison with NaN is false) and
+    // +inf, which are the values that can corrupt a maximum. -inf still passes
+    // through but cannot win a maximum over any finite value.
+    %finite = scalar.cmpf ole, %v, %pos_limit : f32
+    %fv = scf.if %finite -> (f32) {
+      scf.yield %v : f32
+    } else {
+      scf.yield %neg_big : f32
+    }
+    %next = scalar.maxnumf %acc, %fv : f32
+    scf.yield %next : f32
+  }
+  %row_max = kernel.subgroup.reduce<maxnumf> %slice_max : f32
+
+  %vocab_i32 = index.cast %vocab : index to i32
+  %cand = scf.for %i2 = [%lane to %vocab step %c32](%acc2 = %vocab_i32 : i32) -> (i32) {
+    %v2 = view.load %logits_view[%i2] : view<[%vocab]xf32> -> f32
+    %eq = scalar.cmpf oeq, %v2, %row_max : f32
+    %ni = scf.if %eq -> (i32) {
+      %ii = index.cast %i2 : index to i32
+      %better = scalar.cmpi slt, %ii, %acc2 : i32
+      %r = scf.if %better -> (i32) {
+        scf.yield %ii : i32
+      } else {
+        scf.yield %acc2 : i32
+      }
+      scf.yield %r : i32
+    } else {
+      scf.yield %acc2 : i32
+    }
+    scf.yield %ni : i32
+  }
+  view.store %cand, %scratch_view[%lane] : i32, view<32xi32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  %is_leader = index.cmp eq, %lane, %c0 : index
+  scf.if %is_leader {
+    %best = scf.for %k = [%c0 to %c32 step %c1](%b = %vocab_i32 : i32) -> (i32) {
+      %cv = view.load %scratch_view[%k] : view<32xi32> -> i32
+      %lt = scalar.cmpi slt, %cv, %b : i32
+      %nb = scf.if %lt -> (i32) {
+        scf.yield %cv : i32
+      } else {
+        scf.yield %b : i32
+      }
+      scf.yield %nb : i32
+    }
+    view.store %best, %out_view[%c0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+check.case public @yah_argmax_case {
+  // Monotonic logits put the maximum at the last index, so this checks that the
+  // index is tracked rather than just the value found.
+  %logits = check.generate.iota offset(0.0) step(1.0) : tensor<1024xf32>
+  %out_token = check.generate.fill value(-1) : tensor<1xi32>
+  %expected = check.generate.fill value(1023) : tensor<1xi32>
+  kernel.launch @yah_argmax(%logits, %out_token) : (tensor<1024xf32>, tensor<1xi32>)
+  check.expect.equal actual(%out_token) expected(%expected) : tensor<1xi32>
+  // Uniform logits make every index a tie, so the lowest index must win.
+  %flat = check.generate.fill value(0.5) : tensor<1024xf32>
+  %out_tie = check.generate.fill value(-1) : tensor<1xi32>
+  %expected_tie = check.generate.fill value(0) : tensor<1xi32>
+  kernel.launch @yah_argmax(%flat, %out_tie) : (tensor<1024xf32>, tensor<1xi32>)
+  check.expect.equal actual(%out_tie) expected(%expected_tie) : tensor<1xi32>
+  check.return
+}
+
+check.benchmark<@yah_argmax_case> @yah_argmax_bench

@@ -1,0 +1,91 @@
+// YAH batched QG unpack, Loom port of BatchedUnpackQGKernel.
+//
+// HIP source: prefill_unpack.hip. The source holds, for every row and head,
+// head_dim q values followed by head_dim gate values:
+//
+//   head_idx = idx / head_dim, dim_idx = idx % head_dim
+//   src      = head_idx * 2 * head_dim + dim_idx
+//   q_out[b][idx]    = qg[b][src]
+//   gate_out[b][idx] = qg[b][src + head_dim]
+//
+// head_dim defaults to 1 here. That is deliberate: with head_dim = 1 the source
+// index is exactly 2 * idx, so the interleaving is an arithmetic sequence and the
+// expectation is expressible with check.generate.iota -- even-indexed elements
+// become q and odd-indexed elements become gate. At head_dim = 128 a permuted
+// source cannot be written as an iota and a uniform fill would not catch the
+// interleaving at all, because any permutation of uniform data is uniform.
+// Production passes head_dim=128 through the configuration.
+//
+// The element counts are the same either way: head_dim 128 with 40 heads and
+// head_dim 1 with 5120 heads both give total_h = 5120, so the measured shape is
+// the production size even though the stride differs.
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_unpack_qg.batch : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_unpack_qg.num_heads : %value: index where [range(%value, 1, 65536)]
+
+config.def @yah_unpack_qg.head_dim = 1 : index
+
+kernel.def target(@yah_wave32) @yah_unpack_qg() {
+  %unit = index.constant 1 : index
+  %batch = config.get @yah_unpack_qg.batch : index
+  %num_heads = config.get @yah_unpack_qg.num_heads : index
+  %head_dim = config.get @yah_unpack_qg.head_dim : index
+  %total_h = index.mul %num_heads, %head_dim : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %total_h, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %batch, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%qg: buffer, %q_out: buffer, %gate_out: buffer) {
+  %base = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %c2 = index.constant 2 : index
+  %batch = config.get @yah_unpack_qg.batch : index
+  %num_heads = config.get @yah_unpack_qg.num_heads : index
+  %head_dim = config.get @yah_unpack_qg.head_dim : index
+  %total_h = index.mul %num_heads, %head_dim : index
+  %two_total = index.mul %total_h, %c2 : index
+
+  %qg_noalias, %q_noalias, %gate_noalias = buffer.assume.noalias %qg, %q_out, %gate_out : buffer, buffer, buffer
+  %qg_view = buffer.view %qg_noalias[%base] : buffer -> view<[%batch]x[%two_total]xf32>
+  %q_view = buffer.view %q_noalias[%base] : buffer -> view<[%batch]x[%total_h]xf32>
+  %gate_view = buffer.view %gate_noalias[%base] : buffer -> view<[%batch]x[%total_h]xf32>
+
+  %lane = kernel.workitem.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %wg = kernel.workgroup.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %idx = index.add %wg_base, %lane : index
+
+  %in_range = index.cmp ult, %idx, %total_h : index
+  scf.if %in_range {
+    %head_idx = index.div %idx, %head_dim : index
+    %dim_idx = index.rem %idx, %head_dim : index
+    %head_off = index.mul %head_idx, %c2 : index
+    %head_off2 = index.mul %head_off, %head_dim : index
+    %src = index.add %head_off2, %dim_idx : index
+    %src1 = index.add %src, %head_dim : index
+    %qv = view.load %qg_view[%row, %src] : view<[%batch]x[%two_total]xf32> -> f32
+    %gv = view.load %qg_view[%row, %src1] : view<[%batch]x[%two_total]xf32> -> f32
+    view.store %qv, %q_view[%row, %idx] : f32, view<[%batch]x[%total_h]xf32>
+    view.store %gv, %gate_view[%row, %idx] : f32, view<[%batch]x[%total_h]xf32>
+  }
+  kernel.return
+}
+
+check.case public @yah_unpack_qg_case {
+  %qg = check.generate.iota offset(0.0) step(1.0) : tensor<64x10240xf32>
+  %q_out = check.generate.fill value(-1.0) : tensor<64x5120xf32>
+  %gate_out = check.generate.fill value(-1.0) : tensor<64x5120xf32>
+  %q_expected = check.generate.iota offset(0.0) step(2.0) : tensor<64x5120xf32>
+  %gate_expected = check.generate.iota offset(1.0) step(2.0) : tensor<64x5120xf32>
+  kernel.launch @yah_unpack_qg(%qg, %q_out, %gate_out) : (tensor<64x10240xf32>, tensor<64x5120xf32>, tensor<64x5120xf32>)
+  check.expect.close actual(%q_out) expected(%q_expected) atol(0.0) rtol(0.0) nan(same) : tensor<64x5120xf32>
+  check.expect.close actual(%gate_out) expected(%gate_expected) atol(0.0) rtol(0.0) nan(same) : tensor<64x5120xf32>
+  check.return
+}
+
+check.benchmark<@yah_unpack_qg_case> @yah_unpack_qg_bench
