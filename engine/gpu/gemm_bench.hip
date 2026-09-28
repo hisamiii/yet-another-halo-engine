@@ -218,6 +218,101 @@ void LaunchTile(const void* w, const short* x, float* y, std::size_t batch,
       <<<grid, WM * WN * 32, 0, stream>>>(w, x, y, batch, m, k, nullptr);
 }
 
+// Ablation sweep for the K-loop scheduling hint. Ablate bit 16 is iglp_opt(0),
+// which is also what the default path applies to the IQ types, 2048 is
+// iglp_opt(1) and 8192 is iglp_opt(2). All three are timed in one process with
+// the order rotated per round, because the first timed block in a process is a
+// boosted one and a fixed order would hand it to one variant.
+template<gufo::core::GgmlType Type, int Ablate>
+void LaunchAblate(const void* w, const short* x, float* y, std::size_t batch,
+                  std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type>
+void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
+               unsigned iterations, int pattern) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  const int values[3] = {16, 2048, 8192};
+  const char* names[3] = {"iglp0", "iglp1", "iglp2"};
+  const auto launch = [&](int variant) {
+    if (variant == 16)
+      LaunchAblate<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m,
+                             k, nullptr);
+    else if (variant == 2048)
+      LaunchAblate<Type, 2048>(weights.data(), half_x.data(), y.data(), batch, m,
+                               k, nullptr);
+    else
+      LaunchAblate<Type, 8192>(weights.data(), half_x.data(), y.data(), batch, m,
+                               k, nullptr);
+  };
+  const auto timed = [&](int variant) {
+    for (unsigned i = 0; i < 2; ++i) launch(variant);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch(variant);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  for (int round = 0; round < 3; ++round) {
+    for (int i = 0; i < 3; ++i) {
+      const int idx = (i + round) % 3;
+      const double ms = timed(values[idx]);
+      const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
+                            (ms * 1e9);
+      std::printf("ablate type=%s variant=%s round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], round, ms, tflops);
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchAblate(GgmlType type, std::size_t m, std::size_t k,
+                    std::size_t batch, unsigned iterations, int pattern) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunAblate<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ5_K:
+      RunAblate<GgmlType::kQ5_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ4_XS:
+      RunAblate<GgmlType::kIQ4_XS>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ3_XXS:
+      RunAblate<GgmlType::kIQ3_XXS>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ3_S:
+      RunAblate<GgmlType::kIQ3_S>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr,
+                   "ablate sweep covers q4k, q5k, iq4xs, iq3xxs, iq3s\n");
+      return;
+  }
+}
+
 const char* TileName(int variant) {
   switch (variant) {
     case 0: return "256x256 w8n4";
@@ -333,6 +428,8 @@ int main(int argc, char** argv) {
   std::string name = argv[1];
   const bool sweep = name.rfind("tiles:", 0) == 0;
   if (sweep) name = name.substr(6);
+  const bool ablate = name.rfind("ablate:", 0) == 0;
+  if (ablate) name = name.substr(7);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -349,6 +446,8 @@ int main(int argc, char** argv) {
       if (name == entry.name) {
         if (sweep)
           DispatchTiles(entry.type, m, k, batch, iterations, pattern);
+        else if (ablate)
+          DispatchAblate(entry.type, m, k, batch, iterations, pattern);
         else
           RunFp16(entry.type, m, k, batch, iterations, pattern, epilogue);
         return 0;

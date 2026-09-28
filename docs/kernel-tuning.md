@@ -110,6 +110,32 @@ leaves latency and the K loop's dependency structure, which is where the earlier
 ablations already pointed. This part exposes no SQ_WAIT_* stall counters through
 rocprofv3, so the next instrument is not a counter sweep.
 
+**The K-loop scheduling hint is not it either.** The kernel applies
+__builtin_amdgcn_iglp_opt conditionally per type: iglp_opt(0) to the IQ and
+Q3/Q2 types, nothing to Q4_K/Q5_K/Q6_K/Q8_0. The bench's ablation bits 16 / 2048
+/ 8192 select 0 / 1 / 2, and the sweep times all three in one process with the
+order rotated per round. Minimum over rounds, in TFLOPS:
+
+| type | iglp0 | iglp1 | iglp2 |
+| --- | ---: | ---: | ---: |
+| IQ3_XXS | 31.78 | 31.32 | 31.70 |
+| IQ3_S | 30.05 | 30.11 | 29.93 |
+| Q4_K | 33.29 | 32.42 | 31.03 |
+
+On the IQ types the three are inside the noise and the sign of every adjacent
+delta tracks which variant ran first (iglp0 reads +4.3% over iglp1 when it runs
+first and -3.5% when it runs last). Only Q4_K shows a repeatable order,
+iglp_opt(1) over iglp_opt(2) by 4-8% in all three rounds including the round
+where iglp2 ran first -- and the production gating never applies iglp2 to
+anything, so that is a property of the ablation, not a lever in the build.
+
+Four explanations are now eliminated for the gap between the achieved ~30
+TFLOPS and the 48.35 instruction ceiling: the weight format (<=10% spread and
+IQ3_XXS at parity), the epilogue (a few percent), issue pressure (47% more
+non-matrix VALU per WMMA costs 3%), and the K-loop scheduling hint (inside the
+noise on the types that use it). What is left is the loop's dependency and
+latency structure, and this part exposes no SQ_WAIT_* counters to measure it.
+
 **Measured at the model level.** An existing pure-Q4_K artifact of the same
 model settles whether the format matters end to end
 (/home/q/models/gufo-sweep/base_q4kpure.gguf, 506 Q4_K tensors, 866 tensors,
