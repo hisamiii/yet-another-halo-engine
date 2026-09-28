@@ -56,6 +56,7 @@ explicitly deferred.
 | yah_linear_sampling_f32.loom | sample.hip | linear inverse-CDF sampling (f32 threshold) | ported, 0.0347 ms; exact, no fixture |
 | yah_spec_seg_residual_f32.loom | sample.hip | speculative residual stage 3: accept/reject + residual sums | ported, 0.0161/0.0162 ms; two exact arms |
 | yah_spec_seg_select_f32.loom | sample.hip | speculative residual stage 4: residual/target selection | ported, 0.0399 ms; exact, fixture |
+| yah_sorted_sampling_f32.loom | sample.hip | sorted top-k/top-p/min-p sampling | ported, 0.0445 ms; exact, no fixture |
 | - | prefill_attention*.hip, attention_wmma.hip, attention_decode*.hip | WMMA/tiled attention compute, decode-online, split-K, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
@@ -114,7 +115,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 84 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 85 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -132,7 +133,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path), ZeroQ8ActTailKernel, BatchedFusedRMSNormQuantizeQ8_1Kernel, BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel (tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, the clip variant, BatchedQuantGEMVKernel |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16, AtbEncodeA, AtbDecodeC (write), AtbDecodeSwiGLU. **todo**: AtbRepack(+Slice, blocked on the sub-16 quant table) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
-| sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm), SpeculativeSegmentMaxKernel, SpeculativeSegmentWeightsKernel, SpeculativeSegmentResidualKernel, SpeculativeSegmentSelectKernel, LinearSamplingKernel (f32 threshold). **todo**: sorted and sorted-speculative sampling, the Partial/MapIndices argmax arms |
+| sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm), SpeculativeSegmentMaxKernel, SpeculativeSegmentWeightsKernel, SpeculativeSegmentResidualKernel, SpeculativeSegmentSelectKernel, LinearSamplingKernel, SortedSamplingKernel (f32 thresholds). **todo**: SortedSpeculativeSampling, LinearSpeculativeSampling, the Partial/MapIndices argmax arms |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 arm). **todo**: FastFusedSwiGLUGEMVBlockKernel, the non-f32 lookup arms |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
@@ -401,3 +402,11 @@ profile gives one, so the expensive paths move first rather than the convenient 
   kernel that carries a `double` (the sampling thresholds) has to fall back to f32;
   the port says so in its header. An f64 *view* alone is still useful for moving
   bytes.
+- **An `scf.if` or `scf.for` with N results binds N names.** `%x = scf.for ... ->
+  (i32, i32)` is `STRUCTURE/009`/`PARSE/009`; write `%a, %b = scf.for ...`. The
+  multi-result shorthand `%x#0` is not accepted by the parser on the binding side.
+  This is the most common compile error in the sampling ports.
+- **`scalar.cmpi` predicates are `sgt`/`slt`/`sge`/`sle`, not `ogt`/`olt`.** The
+  float compare `scalar.cmpf` uses `ogt`/`olt`/`ole`/`oge`; the integer one uses the
+  signed/unsigned short forms, and `ogt` on `scalar.cmpi` fails with `unknown
+  predicate value`.

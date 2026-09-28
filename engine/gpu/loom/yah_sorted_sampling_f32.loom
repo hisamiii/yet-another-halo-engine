@@ -1,0 +1,452 @@
+// YAH sorted (top-k/top-p/min-p) sampling, Loom port of SortedSamplingKernel.
+//
+// HIP source: sample.hip. Operates on logits already sorted descending with their
+// token ids. It first forms the top-p nucleus over `initial_count = top_k>0 ?
+// min(vocab, max(top_k, max(min_keep,1))) : vocab` elements, then narrows with the
+// min-p threshold (binary search on the sorted array), then samples inside the
+// surviving prefix by the same inverse-CDF walk as the linear sampler.
+//
+// HIP stages segment sums/prefixes in shared memory and does the prefix, the segment
+// choice, the binary search and the walks in thread 0 / the selected thread. The port
+// keeps that structure with LDS. The `double` threshold is f32 (no f64 arithmetic).
+// The min-p binary search is a fixed 32-step loop, which is exact for a 32-bit index
+// range and avoids needing `scf.while`.
+//
+// Required config: --config=yah_sorted_sampling.vocab_size=1024
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_sorted_sampling.vocab_size : %value: index where [range(%value, 1, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_sorted_sampling() {
+  %unit = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%sorted_logits: buffer, %sorted_token_ids: buffer, %out_token: buffer, %params_f: buffer, %params_i: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c31 = index.constant 31 : index
+  %c32 = index.constant 32 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %c255i = scalar.constant 255 : i32
+  %c0i = scalar.constant 0 : i32
+  %c1i = scalar.constant 1 : i32
+  %limit = scalar.constant 3.4028234663852886e+38 : f32
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %flt_min = scalar.constant 1.1754943508222875e-38 : f32
+  %vocab_size = config.get @yah_sorted_sampling.vocab_size : index
+  %vocab_m1 = index.sub %vocab_size, %c1 : index
+  %vocab_i = index.cast %vocab_size : index to i32
+  %vocab_m1_i = scalar.subi %vocab_i, %c1i : i32
+  %sums_bytes = index.constant 1024 : offset
+  %slot_bytes = index.constant 4 : offset
+  %sums_buf = buffer.alloca<workgroup> align(16) %sums_bytes : buffer
+  %prefix_buf = buffer.alloca<workgroup> align(16) %sums_bytes : buffer
+  %keep_buf = buffer.alloca<workgroup> align(4) %slot_bytes : buffer
+  %seg_buf = buffer.alloca<workgroup> align(4) %slot_bytes : buffer
+  %thr_buf = buffer.alloca<workgroup> align(4) %slot_bytes : buffer
+  %sums = buffer.view %sums_buf[%base] : buffer -> view<[%c256]xf32>
+  %prefix = buffer.view %prefix_buf[%base] : buffer -> view<[%c256]xf32>
+  %keep_view = buffer.view %keep_buf[%base] : buffer -> view<[%c1]xi32>
+  %seg_view = buffer.view %seg_buf[%base] : buffer -> view<[%c1]xi32>
+  %thr_view = buffer.view %thr_buf[%base] : buffer -> view<[%c1]xf32>
+  %sl_na, %ids_na, %out_na, %pf_na, %pi_na = buffer.assume.noalias %sorted_logits, %sorted_token_ids, %out_token, %params_f, %params_i : buffer, buffer, buffer, buffer, buffer
+  %sl_view = buffer.view %sl_na[%base] : buffer -> view<[%vocab_size]xf32>
+  %ids_view = buffer.view %ids_na[%base] : buffer -> view<[%vocab_size]xi32>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%c1]xi32>
+  %pf_view = buffer.view %pf_na[%base] : buffer -> view<[%c4]xf32>
+  %pi_view = buffer.view %pi_na[%base] : buffer -> view<[%c2]xi32>
+  %tid = kernel.workitem.id<x> : index
+  %temperature = view.load %pf_view[%c0] : view<[%c4]xf32> -> f32
+  %top_p = view.load %pf_view[%c1] : view<[%c4]xf32> -> f32
+  %min_p = view.load %pf_view[%c2] : view<[%c4]xf32> -> f32
+  %uniform = view.load %pf_view[%c3] : view<[%c4]xf32> -> f32
+  %top_k_i = view.load %pi_view[%c0] : view<[%c2]xi32> -> i32
+  %min_keep_i = view.load %pi_view[%c1] : view<[%c2]xi32> -> i32
+  %min_keep_nn = scalar.maxsi %min_keep_i, %c0i : i32
+  %min_keep_idx = index.cast %min_keep_nn : i32 to index
+  %min_keep1 = index.max %min_keep_idx, %c1 : index
+  %minimum = index.min %vocab_size, %min_keep1 : index
+  %top_k_pos = scalar.cmpi sgt, %top_k_i, %c0i : i32
+  %top_k_nn = scalar.maxsi %top_k_i, %c0i : i32
+  %top_k_idx = index.cast %top_k_nn : i32 to index
+  %top_k_keep = index.max %top_k_idx, %minimum : index
+  %top_k_capped = index.min %vocab_size, %top_k_keep : index
+  %initial_count = scf.if %top_k_pos -> (index) {
+    scf.yield %top_k_capped : index
+  } else {
+    scf.yield %vocab_size : index
+  }
+  %inverse_temperature_pre = scalar.maxnumf %temperature, %flt_min : f32
+  %inverse_temperature = scalar.divf %one, %inverse_temperature_pre : f32
+  %maximum = view.load %sl_view[%c0] : view<[%vocab_size]xf32> -> f32
+  // ---- top-p phase over initial_count ----
+  %ic_vb = index.mul %initial_count, %tid : index
+  %tp_begin = index.div %ic_vb, %c256 : index
+  %tidp1 = index.add %tid, %c1 : index
+  %ic_vb1 = index.mul %initial_count, %tidp1 : index
+  %tp_end = index.div %ic_vb1, %c256 : index
+  %tp_sum = scf.for %i = [%tp_begin to %tp_end step %c1](%acc = %zero : f32) -> (f32) {
+    %v = view.load %sl_view[%i] : view<[%vocab_size]xf32> -> f32
+    %diff = scalar.subf %v, %maximum : f32
+    %scaled = scalar.mulf %diff, %inverse_temperature : f32
+    %e = scalar.expf<afn> %scaled : f32
+    %n = scalar.addf %acc, %e : f32
+    scf.yield %n : f32
+  }
+  view.store %tp_sum, %sums[%tid] : f32, view<[%c256]xf32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %is_leader = index.cmp eq, %tid, %c0 : index
+  %leader_tp = scf.if %is_leader -> (index) {
+    %total = scf.for %s = [%c0 to %c256 step %c1](%t = %zero : f32) -> (f32) {
+      %sv = view.load %sums[%s] : view<[%c256]xf32> -> f32
+      view.store %t, %prefix[%s] : f32, view<[%c256]xf32>
+      %tn = scalar.addf %t, %sv : f32
+      scf.yield %tn : f32
+    }
+    %tp_lt1 = scalar.cmpf olt, %top_p, %one : f32
+    scf.if %tp_lt1 {
+      %target = scalar.mulf %top_p, %total : f32
+      %best_f, %found_f = scf.for %s2 = [%c0 to %c256 step %c1](%best = %c255i : i32, %found = %c0i : i32) -> (i32, i32) {
+        %pv = view.load %prefix[%s2] : view<[%c256]xf32> -> f32
+        %sv2 = view.load %sums[%s2] : view<[%c256]xf32> -> f32
+        %bound = scalar.addf %pv, %sv2 : f32
+        %lt = scalar.cmpf olt, %target, %bound : f32
+        %found_ok = scalar.cmpi eq, %found, %c0i : i32
+        %s2_i = index.cast %s2 : index to i32
+        %best2 = scf.if %found_ok -> (i32) {
+          %b = scf.if %lt -> (i32) {
+            scf.yield %s2_i : i32
+          } else {
+            scf.yield %best : i32
+          }
+          scf.yield %b : i32
+        } else {
+          scf.yield %best : i32
+        }
+        %found2 = scf.if %found_ok -> (i32) {
+          %f = scf.if %lt -> (i32) {
+            scf.yield %c1i : i32
+          } else {
+            scf.yield %found : i32
+          }
+          scf.yield %f : i32
+        } else {
+          scf.yield %found : i32
+        }
+        scf.yield %best2, %found2 : i32, i32
+      }
+      view.store %best_f, %seg_view[%c0] : i32, view<[%c1]xi32>
+      view.store %c0i, %keep_view[%c0] : i32, view<[%c1]xi32>
+      %bnn = scalar.maxsi %best_f, %c0i : i32
+      %bc = scalar.minsi %bnn, %c255i : i32
+      %bidx = index.cast %bc : i32 to index
+      %bpv = view.load %prefix[%bidx] : view<[%c256]xf32> -> f32
+      %sthr = scalar.subf %target, %bpv : f32
+      view.store %sthr, %thr_view[%c0] : f32, view<[%c1]xf32>
+    } else {
+      %ic_i = index.cast %initial_count : index to i32
+      view.store %ic_i, %keep_view[%c0] : i32, view<[%c1]xi32>
+    }
+    scf.yield %c0 : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %tp_lt1b = scalar.cmpf olt, %top_p, %one : f32
+  %seg_i = view.load %seg_view[%c0] : view<[%c1]xi32> -> i32
+  %seg_nn = scalar.maxsi %seg_i, %c0i : i32
+  %seg_c = scalar.minsi %seg_nn, %c255i : i32
+  %seg_idx = index.cast %seg_c : i32 to index
+  %is_seg = index.cmp eq, %tid, %seg_idx : index
+  %seg_sel = scf.if %is_seg -> (index) {
+    %do = scf.if %tp_lt1b -> (index) {
+      %selected_threshold = view.load %thr_view[%c0] : view<[%c1]xf32> -> f32
+      %sb_pre = index.mul %initial_count, %seg_idx : index
+      %sb = index.div %sb_pre, %c256 : index
+      %segp1 = index.add %seg_idx, %c1 : index
+      %se_pre = index.mul %initial_count, %segp1 : index
+      %se = index.div %se_pre, %c256 : index
+      %se_m1 = index.sub %se, %c1 : index
+      %keep_f, %thr_f, %dummy = scf.for %i2 = [%sb to %se step %c1](%keep = %se : index, %thr2 = %selected_threshold : f32, %d = %c0i : i32) -> (index, f32, i32) {
+        %v2 = view.load %sl_view[%i2] : view<[%vocab_size]xf32> -> f32
+        %diff2 = scalar.subf %v2, %maximum : f32
+        %scaled2 = scalar.mulf %diff2, %inverse_temperature : f32
+        %e2 = scalar.expf<afn> %scaled2 : f32
+        %n2 = scalar.subf %thr2, %e2 : f32
+        %i2p1 = index.add %i2, %c1 : index
+        %neg = scalar.cmpf ole, %n2, %zero : f32
+        %done_zero = scalar.cmpi eq, %d, %c0i : i32
+        %keep2, %thr3, %d2 = scf.if %done_zero -> (index, f32, i32) {
+          %k = scf.if %neg -> (index) {
+            scf.yield %i2p1 : index
+          } else {
+            scf.yield %keep : index
+          }
+          %t = scf.if %neg -> (f32) {
+            scf.yield %n2 : f32
+          } else {
+            scf.yield %thr2 : f32
+          }
+          %dd = scf.if %neg -> (i32) {
+            scf.yield %c1i : i32
+          } else {
+            scf.yield %d : i32
+          }
+          scf.yield %k, %t, %dd : index, f32, i32
+        } else {
+          scf.yield %keep, %thr2, %d : index, f32, i32
+        }
+        scf.yield %keep2, %thr3, %d2 : index, f32, i32
+      }
+      %keep_max = index.max %keep_f, %minimum : index
+      %keep_i = index.cast %keep_max : index to i32
+      view.store %keep_i, %keep_view[%c0] : i32, view<[%c1]xi32>
+      scf.yield %c0 : index
+    } else {
+      scf.yield %c0 : index
+    }
+    scf.yield %do : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  // ---- min-p narrowing + final_keep ----
+  %final_keep = scf.if %is_leader -> (index) {
+    %keep_raw = view.load %keep_view[%c0] : view<[%c1]xi32> -> i32
+    %keep_nn = scalar.maxsi %keep_raw, %c0i : i32
+    %keep_idx = index.cast %keep_nn : i32 to index
+    %keep_c = index.min %keep_idx, %vocab_size : index
+    %mp_on = scalar.cmpf ogt, %min_p, %zero : f32
+    %gt1 = index.cmp ugt, %keep_c, %c1 : index
+    %truei1 = scalar.constant 1 : i1
+    %falsei1 = scalar.constant 0 : i1
+    %do_mp = scf.if %mp_on -> (i1) {
+      %g = scf.if %gt1 -> (i1) {
+        scf.yield %truei1 : i1
+      } else {
+        scf.yield %falsei1 : i1
+      }
+      scf.yield %g : i1
+    } else {
+      scf.yield %falsei1 : i1
+    }
+    %mp_thr = scf.if %mp_on -> (f32) {
+      %lmp = scalar.logf<afn> %min_p : f32
+      %tls = scalar.mulf %temperature, %lmp : f32
+      %thr = scalar.addf %maximum, %tls : f32
+      scf.yield %thr : f32
+    } else {
+      scf.yield %zero : f32
+    }
+    %low_f, %high_f = scf.for %step = [%c0 to %c32 step %c1](%low = %c0 : index, %high = %keep_c : index) -> (index, index) {
+      %active = index.cmp ult, %low, %high : index
+      %low3, %high3 = scf.if %active -> (index, index) {
+        %diff_h2 = index.sub %high, %low : index
+        %diff_h2_i = index.cast %diff_h2 : index to i32
+        %half2_i = scalar.shrui %diff_h2_i, %c1i : i32
+        %half2 = index.cast %half2_i : i32 to index
+        %mid2 = index.add %low, %half2 : index
+        %mid2_i = index.cast %mid2 : index to i32
+        %mid2_nn_i = scalar.maxsi %mid2_i, %c0i : i32
+        %mid2_c_i = scalar.minsi %mid2_nn_i, %vocab_m1_i : i32
+        %mid2c = index.cast %mid2_c_i : i32 to index
+        %mv2 = view.load %sl_view[%mid2c] : view<[%vocab_size]xf32> -> f32
+        %ge2 = scalar.cmpf oge, %mv2, %mp_thr : f32
+        %l2, %h2 = scf.if %ge2 -> (index, index) {
+          %mp12 = index.add %mid2, %c1 : index
+          scf.yield %mp12, %high : index, index
+        } else {
+          scf.yield %low, %mid2 : index, index
+        }
+        scf.yield %l2, %h2 : index, index
+      } else {
+        scf.yield %low, %high : index, index
+      }
+      scf.yield %low3, %high3 : index, index
+    }
+    %low_min = index.max %low_f, %minimum : index
+    %narrowed = scf.if %do_mp -> (index) {
+      scf.yield %low_min : index
+    } else {
+      scf.yield %keep_c : index
+    }
+    %final_min = index.min %keep_c, %narrowed : index
+    %final = scf.if %do_mp -> (index) {
+      scf.yield %final_min : index
+    } else {
+      scf.yield %keep_c : index
+    }
+    %fk_i = index.cast %final : index to i32
+    view.store %fk_i, %keep_view[%c0] : i32, view<[%c1]xi32>
+    %temp_zero = scalar.cmpf ole, %temperature, %zero : f32
+    %fk_one = index.cmp ule, %final, %c1 : index
+    %single = scf.if %temp_zero -> (i1) {
+      scf.yield %truei1 : i1
+    } else {
+      %s = scf.if %fk_one -> (i1) {
+        scf.yield %truei1 : i1
+      } else {
+        scf.yield %falsei1 : i1
+      }
+      scf.yield %s : i1
+    }
+    scf.if %single {
+      %t0 = view.load %ids_view[%c0] : view<[%vocab_size]xi32> -> i32
+      view.store %t0, %out_view[%c0] : i32, view<[%c1]xi32>
+    }
+    scf.yield %final : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %final_keep_b = view.load %keep_view[%c0] : view<[%c1]xi32> -> i32
+  %final_nn = scalar.maxsi %final_keep_b, %c0i : i32
+  %final_idx = index.cast %final_nn : i32 to index
+  %final_c = index.min %final_idx, %vocab_size : index
+  %temp_zero_b = scalar.cmpf ole, %temperature, %zero : f32
+  %final_one = index.cmp ule, %final_c, %c1 : index
+  %skip = scf.if %temp_zero_b -> (index) {
+    scf.yield %c1 : index
+  } else {
+    %s2 = scf.if %final_one -> (index) {
+      scf.yield %c1 : index
+    } else {
+      scf.yield %c0 : index
+    }
+    scf.yield %s2 : index
+  }
+  %do_sample = index.cmp eq, %skip, %c0 : index
+  scf.if %do_sample {
+    %fb = index.mul %final_c, %tid : index
+    %sb = index.div %fb, %c256 : index
+    %fp1 = index.add %tid, %c1 : index
+    %fb1 = index.mul %final_c, %fp1 : index
+    %se = index.div %fb1, %c256 : index
+    %s_sum = scf.for %i3 = [%sb to %se step %c1](%acc3 = %zero : f32) -> (f32) {
+      %v3 = view.load %sl_view[%i3] : view<[%vocab_size]xf32> -> f32
+      %d3 = scalar.subf %v3, %maximum : f32
+      %sc3 = scalar.mulf %d3, %inverse_temperature : f32
+      %e3 = scalar.expf<afn> %sc3 : f32
+      %n3 = scalar.addf %acc3, %e3 : f32
+      scf.yield %n3 : f32
+    }
+    view.store %s_sum, %sums[%tid] : f32, view<[%c256]xf32>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %leader_s = scf.if %is_leader -> (index) {
+      %total2 = scf.for %s3 = [%c0 to %c256 step %c1](%t3 = %zero : f32) -> (f32) {
+        %sv3 = view.load %sums[%s3] : view<[%c256]xf32> -> f32
+        view.store %t3, %prefix[%s3] : f32, view<[%c256]xf32>
+        %tn3 = scalar.addf %t3, %sv3 : f32
+        scf.yield %tn3 : f32
+      }
+      %target2 = scalar.mulf %uniform, %total2 : f32
+      %best_s, %found_s = scf.for %s5 = [%c0 to %c256 step %c1](%best2 = %c255i : i32, %found2 = %c0i : i32) -> (i32, i32) {
+        %pv2 = view.load %prefix[%s5] : view<[%c256]xf32> -> f32
+        %sv5 = view.load %sums[%s5] : view<[%c256]xf32> -> f32
+        %bound2 = scalar.addf %pv2, %sv5 : f32
+        %lt2 = scalar.cmpf olt, %target2, %bound2 : f32
+        %fok = scalar.cmpi eq, %found2, %c0i : i32
+        %s5_i = index.cast %s5 : index to i32
+        %b2 = scf.if %fok -> (i32) {
+          %bb = scf.if %lt2 -> (i32) {
+            scf.yield %s5_i : i32
+          } else {
+            scf.yield %best2 : i32
+          }
+          scf.yield %bb : i32
+        } else {
+          scf.yield %best2 : i32
+        }
+        %f2 = scf.if %fok -> (i32) {
+          %ff = scf.if %lt2 -> (i32) {
+            scf.yield %c1i : i32
+          } else {
+            scf.yield %found2 : i32
+          }
+          scf.yield %ff : i32
+        } else {
+          scf.yield %found2 : i32
+        }
+        scf.yield %b2, %f2 : i32, i32
+      }
+      view.store %best_s, %seg_view[%c0] : i32, view<[%c1]xi32>
+      %bnn2 = scalar.maxsi %best_s, %c0i : i32
+      %bc2 = scalar.minsi %bnn2, %c255i : i32
+      %bidx2 = index.cast %bc2 : i32 to index
+      %bpv2 = view.load %prefix[%bidx2] : view<[%c256]xf32> -> f32
+      %sthr2 = scalar.subf %target2, %bpv2 : f32
+      view.store %sthr2, %thr_view[%c0] : f32, view<[%c1]xf32>
+      scf.yield %c0 : index
+    } else {
+      scf.yield %c0 : index
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %seg_i2 = view.load %seg_view[%c0] : view<[%c1]xi32> -> i32
+    %snn2 = scalar.maxsi %seg_i2, %c0i : i32
+    %sc2 = scalar.minsi %snn2, %c255i : i32
+    %seg_idx2 = index.cast %sc2 : i32 to index
+    %is_seg2 = index.cmp eq, %tid, %seg_idx2 : index
+    scf.if %is_seg2 {
+      %selected_threshold2 = view.load %thr_view[%c0] : view<[%c1]xf32> -> f32
+      %sb2_pre = index.mul %final_c, %seg_idx2 : index
+      %sb2 = index.div %sb2_pre, %c256 : index
+      %segp12 = index.add %seg_idx2, %c1 : index
+      %se2_pre = index.mul %final_c, %segp12 : index
+      %se2 = index.div %se2_pre, %c256 : index
+      %se2_m1 = index.sub %se2, %c1 : index
+      %se2_m1n = index.max %se2_m1, %c0 : index
+      %se2_m1c = index.min %se2_m1n, %vocab_m1 : index
+      %last_tok = view.load %ids_view[%se2_m1c] : view<[%vocab_size]xi32> -> i32
+      %sel_final, %thr_final, %done_final = scf.for %i4 = [%sb2 to %se2 step %c1](%sel = %last_tok : i32, %thr4 = %selected_threshold2 : f32, %d4 = %c0i : i32) -> (i32, f32, i32) {
+        %i4n = index.max %i4, %c0 : index
+        %i4c = index.min %i4n, %vocab_m1 : index
+        %v4 = view.load %sl_view[%i4c] : view<[%vocab_size]xf32> -> f32
+        %d5 = scalar.subf %v4, %maximum : f32
+        %sc4 = scalar.mulf %d5, %inverse_temperature : f32
+        %e4 = scalar.expf<afn> %sc4 : f32
+        %n4 = scalar.subf %thr4, %e4 : f32
+        %tok4 = view.load %ids_view[%i4c] : view<[%vocab_size]xi32> -> i32
+        %neg4 = scalar.cmpf olt, %n4, %zero : f32
+        %d4_zero = scalar.cmpi eq, %d4, %c0i : i32
+        %sel4, %thr5, %d5n = scf.if %d4_zero -> (i32, f32, i32) {
+          %s4 = scf.if %neg4 -> (i32) {
+            scf.yield %c1i : i32
+          } else {
+            scf.yield %d4 : i32
+          }
+          scf.yield %tok4, %n4, %s4 : i32, f32, i32
+        } else {
+          scf.yield %sel, %thr4, %d4 : i32, f32, i32
+        }
+        scf.yield %sel4, %thr5, %d5n : i32, f32, i32
+      }
+      view.store %sel_final, %out_view[%c0] : i32, view<[%c1]xi32>
+    }
+  }
+  kernel.return
+}
+
+// Requires --config=yah_sorted_sampling.vocab_size=1024.
+//
+// All logits equal 0 and ids are iota, temperature 1, top_k 0, top_p 1, min_p 0,
+// min_keep 1, uniform 0.5. The top-p phase keeps all 1024, the min-p narrowing is
+// skipped, and the sampling threshold 512 lands at token 512 of segment 128.
+check.case public @yah_sorted_sampling_case {
+  %sorted_logits = check.generate.fill value(0.0) : tensor<1024xf32>
+  %ids = check.generate.iota offset(0) step(1) : tensor<1024xi32>
+  %out = check.generate.fill value(0) : tensor<1xi32>
+  %pf = check.file.read.npy path("fixtures/sorted_sampling/params_f.npy") : tensor<4xf32>
+  %pi = check.file.read.npy path("fixtures/sorted_sampling/params_i.npy") : tensor<2xi32>
+  %expected = check.generate.fill value(512) : tensor<1xi32>
+  kernel.launch @yah_sorted_sampling(%sorted_logits, %ids, %out, %pf, %pi) : (tensor<1024xf32>, tensor<1024xi32>, tensor<1xi32>, tensor<4xf32>, tensor<2xi32>)
+  check.expect.equal actual(%out) expected(%expected) : tensor<1xi32>
+  check.return
+}
+
+check.benchmark<@yah_sorted_sampling_case> @yah_sorted_sampling_bench
