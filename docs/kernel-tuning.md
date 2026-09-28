@@ -1178,3 +1178,59 @@ of LDS per block -- which is what a warp-specialised or register-staged design
 would have to do, and the counters now make it possible to tell whether such a
 design actually works.
 
+
+### Testing the occupancy axis directly, and killing it
+
+The tile table above changes two things at once (occupancy *and* tile
+efficiency), so it cannot separate them. Ablation 33554432 (GlobalA) does: it
+reads the weight operand straight from a pre-blocked fp16 buffer,
+`[k/16][m][16]`, so the weight tile is never staged and the LDS allocation drops
+to the activation tile alone. Same tile, same BK, same 1024 threads, same VGPR
+count -- only the LDS footprint and the operand's source change.
+
+The fp16 tensor is built with the kernel's own decode, so this is checkable, and
+it caught two real bugs before any timing was believed:
+
+| attempt | check | LDS | occ% | ms |
+| --- | --- | ---: | ---: | ---: |
+| XOR applied to the row index | `bit_mismatch=17825791/35651584` | | | 16.3 |
+| XOR removed (row is `16a+sl`) | `bit_mismatch=17825791/35651584` | | | 16.3 |
+| plus canonical half order | `worst_abs=0 bit_mismatch=0` | 32768 | **72.6** | **12.32** |
+| quantised reference | -- | 65536 | -- | 9.28 |
+
+Two lessons are in that table. The fragment's tile-local row is `((wr*WRS)+i)*16
++ sl`: the `sl^(ks&3)` in the load is the *fourth* index (which K16 slot holds
+the row), not part of the row. And `LoadSwizzled`'s lane-dependent half swap is
+**cancelled** by the matching `StoreSwizzled` swap, so a global reader must read
+canonically -- replicating only the load half reverses the two eight-half groups
+for every `shift==1` lane, which is exactly half of them. That was the observed
+half mismatch. It also moved the timing 16.3 -> 12.3 ms, so the wrong half order
+was skewing the address pattern too: a wrong-but-plausible kernel measured 33%
+off, which is the size of the effects this document is trying to resolve.
+
+With it correct: **GlobalA halves LDS, raises occupancy from 48.6% to 72.6%, and
+is 20-33% slower.** The occupancy lever works exactly as predicted and does not
+pay. Every higher-occupancy configuration measured -- BK=2, 128x128, GlobalA --
+is slower than the one it displaces.
+
+### So what is actually binding
+
+Not occupancy (just falsified directly), and not any individual pipe:
+LDS reads need ~3072 cycles of the ~26000-cycle stage at 128 B/clk (12%), DRAM
+traffic is ~20 GB/s of 187, issue is ~15% occupied, bank conflicts are 0, spills
+are 0, and the memory pipe reads 30.8% busy.
+
+The design is at the **traffic-optimal point for the LDS budget**: staging cost
+per MAC is `(BM*WN + BN*WM) / (BM*BN*BK*16)`, and under the constraint
+`(BM+BN)*BK*32 <= 65536` the shipped 256x256 BK4 maximises the denominator for
+that numerator. Shrinking LDS to fit a second block necessarily lowers that ratio,
+which is why every occupancy win is a traffic loss and every traffic loss is
+bigger than the occupancy win. Moving an operand to global instead makes the
+traffic loss worse still, by the operand's reuse factor.
+
+**What remains unexplained is the gap between traffic-optimal and ceiling**: the
+kernel is at ~63% of the fp16 WMMA ceiling and none of the counters above, nor any
+of the ~25 interventions in this document, accounts for the other 37%. Answering
+that needs stall attribution, which gfx1151 does not expose, or a structural
+change that alters the instruction stream rather than its resources.
+

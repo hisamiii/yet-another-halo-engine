@@ -1996,6 +1996,156 @@ void RunOne(std::size_t m, std::size_t k, std::size_t batch, unsigned iterations
               ablate, ms, (2.0 * m * k * batch) / (ms * 1e9));
 }
 
+
+// GlobalA: stage only the activations in LDS and read the weights straight from a
+// pre-blocked fp16 buffer, layout [k/16][m][16]. Halves the LDS allocation to
+// 32 KiB, which is what lets a second block be resident, without changing the
+// tile or BK. Positions are the mirror of GlobalB: weights are shared by WN
+// warps and activations by WM, so the cheaper-to-duplicate operand goes to
+// global.
+template<gufo::core::GgmlType Type>
+__global__ void DequantWeightsToFp16Blocked(const void* __restrict__ w,
+                                            short* __restrict__ out, int m, int k) {
+  const int nk = k / 16;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int kk = idx % nk, row = idx / nk;
+  if (row >= m) return;
+  const auto* rowp =
+      static_cast<const std::uint8_t*>(w) +
+      static_cast<std::size_t>(row) * gufo::hip::QuantRowBytes(Type, k);
+  gufo::hip::RawWeights<Type> raw = gufo::hip::LoadRaw<Type>(rowp, (unsigned)kk);
+  gufo::hip::QuantSub16 q = gufo::hip::DecodeRaw<Type>(raw);
+  union {
+    gufo::hip::v16bf f;
+    uint4 u[2];
+  } packed;
+#pragma unroll
+  for (int j = 0; j < 16; ++j)
+    packed.f[j] = static_cast<_Float16>(__fsub_rn(
+        __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+  uint4* dst = reinterpret_cast<uint4*>(
+      out + (static_cast<std::size_t>(kk) * m + row) * 16);
+  dst[0] = packed.u[0];
+  dst[1] = packed.u[1];
+}
+
+template<gufo::core::GgmlType Type, int Ablate>
+void LaunchGlobalA(const void* w, const short* x, float* y, std::size_t batch,
+                   std::size_t m, std::size_t k, hipStream_t stream,
+                   const short* wblk) {
+  const dim3 grid(static_cast<unsigned>((batch + 255) / 256),
+                  static_cast<unsigned>((m + 255) / 256));
+  gufo::hip::HalfPrefillGemmKernel<256, 256, 8, 4, Type,
+                                   gufo::hip::HalfEpilogue::kStore, false, Type,
+                                   4, Ablate>
+      <<<grid, 1024, 0, stream>>>(w, x, y, batch, m, k, nullptr,
+                                  reinterpret_cast<const void*>(wblk));
+}
+
+template<gufo::core::GgmlType Type>
+void RunGlobalA(std::size_t m, std::size_t k, std::size_t batch,
+                unsigned iterations, int pattern, int only_arm) {
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k);
+  DeviceBuffer<short> half_x(batch * k);
+  DeviceBuffer<short> wblk((k / 16) * m * 16);
+  DeviceBuffer<float> y_a(batch * m), y_b(batch * m);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
+                               nullptr);
+  {
+    const unsigned n = static_cast<unsigned>((m * (k / 16) + 255) / 256);
+    DequantWeightsToFp16Blocked<Type><<<n, 256>>>(weights.data(), wblk.data(),
+                                                  static_cast<int>(m),
+                                                  static_cast<int>(k));
+    HIP_CHECK(hipDeviceSynchronize());
+  }
+  const auto run = [&](int arm, float* dst) {
+    if (arm == 0)
+      LaunchGlobalA<Type, 16>(weights.data(), half_x.data(), dst, batch, m, k,
+                              nullptr, nullptr);
+    else
+      LaunchGlobalA<Type, 16 | 33554432>(weights.data(), half_x.data(), dst,
+                                         batch, m, k, nullptr, wblk.data());
+  };
+  if (only_arm < 0) {
+    run(0, y_a.data());
+    run(1, y_b.data());
+    HIP_CHECK(hipDeviceSynchronize());
+    std::vector<float> ha(batch * m), hb(batch * m);
+    HIP_CHECK(hipMemcpy(ha.data(), y_a.data(), sizeof(float) * ha.size(),
+                        hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hb.data(), y_b.data(), sizeof(float) * hb.size(),
+                        hipMemcpyDeviceToHost));
+    double worst = 0.0; std::size_t mismatch = 0, nonfinite = 0;
+    for (std::size_t i = 0; i < ha.size(); ++i) {
+      if (!std::isfinite(ha[i]) || !std::isfinite(hb[i])) { ++nonfinite; continue; }
+      const double d = std::fabs(double(ha[i]) - double(hb[i]));
+      if (d > worst) worst = d;
+      if (ha[i] != hb[i]) ++mismatch;
+    }
+    std::printf("globalA check: worst_abs=%.6g bit_mismatch=%zu/%zu nonfinite=%zu\n",
+                worst, mismatch, ha.size(), nonfinite);
+    std::fflush(stdout);
+  }
+  const auto timed = [&](int arm) {
+    for (unsigned i = 0; i < 2; ++i) run(arm, y_a.data());
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) run(arm, y_a.data());
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count() /
+           iterations;
+  };
+  if (only_arm >= 0) {
+    const double ms = timed(only_arm);
+    std::printf("globalA type=%s arm=%s ms=%.6f tflops=%.2f\n", TypeName(Type),
+                only_arm == 0 ? "quantised" : "globalA", ms,
+                (2.0 * m * k * batch) / (ms * 1e9));
+    return;
+  }
+  const char* names[2] = {"quantised", "globalA"};
+  for (int round = 0; round < 5; ++round) {
+    for (int i = 0; i < 2; ++i) {
+      const int idx = (i + round) % 2;
+      const double ms = timed(idx);
+      std::printf("globalA type=%s arm=%s round=%d ms=%.6f tflops=%.2f\n",
+                  TypeName(Type), names[idx], round, ms,
+                  (2.0 * m * k * batch) / (ms * 1e9));
+      std::fflush(stdout);
+    }
+  }
+}
+
+void DispatchGlobalA(GgmlType type, std::size_t m, std::size_t k,
+                     std::size_t batch, unsigned iterations, int pattern,
+                     int only_arm) {
+  using gufo::core::GgmlType;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunGlobalA<GgmlType::kQ4_K>(m, k, batch, iterations, pattern, only_arm);
+      return;
+    case GgmlType::kQ5_K:
+      RunGlobalA<GgmlType::kQ5_K>(m, k, batch, iterations, pattern, only_arm);
+      return;
+    case GgmlType::kQ6_K:
+      RunGlobalA<GgmlType::kQ6_K>(m, k, batch, iterations, pattern, only_arm);
+      return;
+    default:
+      std::fprintf(stderr, "globalA sweep covers q4k, q5k, q6k\n");
+      return;
+  }
+}
+
 void DispatchOne(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
                  unsigned iterations, int pattern, int ablate, int tile_sel) {
   using gufo::core::GgmlType;
@@ -2274,6 +2424,8 @@ int main(int argc, char** argv) {
   if (fp16w) name = name.substr(6);
   const bool one = name.rfind("one:", 0) == 0;
   if (one) name = name.substr(4);
+  const bool globalA = name.rfind("globalA:", 0) == 0;
+  if (globalA) name = name.substr(8);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -2330,6 +2482,9 @@ int main(int argc, char** argv) {
           DispatchOne(entry.type, m, k, batch, iterations, pattern,
                       argc > 8 ? std::stoi(argv[8]) : 16,
                       argc > 9 ? std::stoi(argv[9]) : 0);
+        else if (globalA)
+          DispatchGlobalA(entry.type, m, k, batch, iterations, pattern,
+                          argc > 8 ? std::stoi(argv[8]) : -1);
 #ifdef GUFO_FP16_PROTO_CLOCK
         else if (proto)
           DispatchProto(entry.type, m, k, batch);

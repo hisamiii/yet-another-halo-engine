@@ -76,12 +76,14 @@ __device__ __forceinline__ v16bf LoadBlockedBAt(const short* src) {
     v16bf f;
     uint4 q[2];
   } bits;
-  // LoadSwizzled reads the low and high sixteen-byte halves in a lane-dependent
-  // order, so the global path has to reproduce that shift to build the same
-  // fragment. Both offsets stay inside the same 512-byte window.
-  const unsigned row = threadIdx.x & 15, shift = (row ^ (row >> 2)) & 1;
-  bits.q[0] = *reinterpret_cast<const uint4*>(src + 8 * shift);
-  bits.q[1] = *reinterpret_cast<const uint4*>(src + 8 * (shift ^ 1));
+  // Canonical order, deliberately. LoadSwizzled's lane-dependent half swap is
+  // cancelled by the matching StoreSwizzled swap: the store put lo at
+  // 16*shift and hi at 16*(shift^1), so reading back at LoadSwizzled's own shift
+  // returns lo then hi. Replicating only the load half of that pair reverses the
+  // two eight-half groups for every lane with shift==1, which is exactly half of
+  // them -- the observed bit_mismatch of half the outputs.
+  bits.q[0] = *reinterpret_cast<const uint4*>(src);
+  bits.q[1] = *reinterpret_cast<const uint4*>(src + 8);
   return bits.f;
 }
 
@@ -445,6 +447,21 @@ __launch_bounds__(WM * WN * 32) __global__
   const short* w16 = (Ablate & 16777216) != 0 ? static_cast<const short*>(up)
                                               : nullptr;
   const short* w16_row[PFA];
+  // Ablation 33554432 (GlobalA): the weight operand is read straight from a
+  // pre-blocked fp16 buffer, layout [k/16][m][16], so the weight tile is never
+  // staged in LDS and the allocation drops to the activation tile alone -- 32 KiB
+  // at BK=4, which is what lets a second block be resident. Also rides in on
+  // `up`. This is the mirror of GlobalB: the operand with the *lower* reuse
+  // factor (weights are shared by WN warps, activations by WM) is the one to
+  // read from global.
+  static_assert(((Ablate & 33554432) == 0) || ((Ablate & 1048576) == 0),
+                "GlobalA and GlobalB both use the up argument");
+  static_assert(((Ablate & 33554432) == 0) || ((Ablate & 16777216) == 0),
+                "GlobalA and Fp16W both use the up argument");
+  static_assert(((Ablate & 33554432) == 0) || !DblBuf,
+                "GlobalA has no weight tile to double buffer");
+  const short* w16a = (Ablate & 33554432) != 0 ? static_cast<const short*>(up)
+                                               : nullptr;
 
   v8f acc[WRS][WTS] = {};
 
@@ -532,7 +549,8 @@ __launch_bounds__(WM * WN * 32) __global__
 #pragma unroll
     for (int p = 0; p < PFA; ++p) {
       const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
-      if ((Ablate & 64) == 0 && idx < BM * BK && (Complete || kk < ksteps)) {
+      if ((Ablate & 64) == 0 && (Ablate & 33554432) == 0 && idx < BM * BK &&
+          (Complete || kk < ksteps)) {
         if constexpr ((Ablate & 16777216) != 0) {
           const short* src = w16_row[p] + (static_cast<std::size_t>(kk) * 16);
           ra[p][0] = *reinterpret_cast<const uint4*>(src);
@@ -631,7 +649,9 @@ __launch_bounds__(WM * WN * 32) __global__
       if (idx < BM * BK) {
         const int placed = (row ^ (ks & 3));
         short* dst = &s_a[buf][ks][placed / 16][placed % 16][0];
-        if (Mixed && row % 32 >= 16) {
+        if constexpr ((Ablate & 33554432) != 0) {
+          // GlobalA: the weight tile is never staged, so s_a is elided entirely.
+        } else if (Mixed && row % 32 >= 16) {
           commit_up(p, dst, row);
         } else if constexpr (DecodeStage != 0 &&
                              (Ablate & (512 | 1024 | 64 | 16777216)) == 0) {
@@ -743,9 +763,8 @@ __launch_bounds__(WM * WN * 32) __global__
               LoadSwizzled(&s_a[buf][ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
         const short* bbase = nullptr;
         if constexpr ((Ablate & 1048576) != 0)
-          bbase = b_blocked + (static_cast<std::size_t>(ks0base + ks) * batch +
-                               t_block + (sl ^ (ks & 3))) *
-                                  16;
+          bbase = b_blocked +
+                  (static_cast<std::size_t>(ks0base + ks) * batch + t_block + sl) * 16;
 #pragma unroll
         for (int j = 0; j < WTS; ++j) {
           v16bf b;
@@ -806,9 +825,16 @@ __launch_bounds__(WM * WN * 32) __global__
 #pragma unroll
     for (int ks = 0; ks < BK; ++ks) {
       v16bf a[WRS];
+      const short* abase = nullptr;
+      if constexpr ((Ablate & 33554432) != 0)
+        abase = w16a +
+                (static_cast<std::size_t>(ks0 + ks) * m + r_block + sl) * 16;
 #pragma unroll
       for (int i = 0; i < WRS; ++i) {
-        a[i] = LoadSwizzled(&s_a[0][ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
+        if constexpr ((Ablate & 33554432) != 0)
+          a[i] = LoadBlockedBAt(abase + ((wr * WRS + i) * 256));
+        else
+          a[i] = LoadSwizzled(&s_a[0][ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
       }
       // Ablation 4096: batch every B fragment load ahead of the MMA block. In
       // the shipped order each B fragment is loaded and consumed back to back,
@@ -832,9 +858,8 @@ __launch_bounds__(WM * WN * 32) __global__
       } else {
         const short* bbase = nullptr;
         if constexpr ((Ablate & 1048576) != 0)
-          bbase = b_blocked + (static_cast<std::size_t>(ks0 + ks) * batch +
-                               t_block + (sl ^ (ks & 3))) *
-                                  16;
+          bbase = b_blocked +
+                  (static_cast<std::size_t>(ks0 + ks) * batch + t_block + sl) * 16;
 #pragma unroll
         for (int j = 0; j < WTS; ++j) {
           v16bf b;
