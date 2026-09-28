@@ -46,13 +46,31 @@ source_for() {
   esac
 }
 
+# Rebuild when any prerequisite is newer than the object, not just the
+# translation unit. Comparing against the .hip alone silently reused a stale
+# object after an included header changed: an A/B whose whole point was a new
+# code path in model/forward.hip ran the previous binary twice and read as
+# "the change has no effect". -MMD records the real prerequisite list.
+stale() {
+  local obj="$1" dep="$2" prereq
+  [[ -f "$obj" ]] || return 0
+  [[ -f "$dep" ]] || return 0
+  while read -r prereq; do
+    if [[ -n "$prereq" && -e "$prereq" && "$prereq" -nt "$obj" ]]; then
+      return 0
+    fi
+  done < <(tr ' ' '\n' < "$dep" | tr -d '\\' | grep -v ':' | grep -v '^$')
+  return 1
+}
+
 compile() {
   local src="$1" name="$2"
-  local obj="$objdir/$name.o"
-  if [[ -f "$obj" && "$obj" -nt "$src" ]]; then return 0; fi
+  local obj="$objdir/$name.o" dep="$objdir/$name.d"
+  if ! stale "$obj" "$dep"; then return 0; fi
   local flags; flags="$(extra_flags "$name")"
+  rm -f "$obj"
   # shellcheck disable=SC2086
-  hipcc -c "${base[@]}" $flags "$src" -o "$obj" &
+  hipcc -c "${base[@]}" $flags -MMD -MF "$dep" -MT "$obj" "$src" -o "$obj" &
   pids+=("$!")
   if (( ${#pids[@]} >= 8 )); then wait_one; fi
 }
