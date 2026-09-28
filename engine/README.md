@@ -298,3 +298,37 @@ to **yes, verified on the device** -- and it turns the tuning argument into a li
 of specific, independently testable changes rather than a hope. Both halves are now
 on the same footing: the NPU path has an exact target profile and a working runtime,
 and the GPU path has a working kernel we authored and can iterate on.
+
+### Second Loom GEMM version: the N tile was worth 2x, and the model was only half right
+
+The first authored kernel tiled the token axis across four workgroups, so each of
+the 1088 M tiles read its 16x5120 weight tile four times. Collapsing the token
+axis into one workgroup (M16 x N64, four accumulators sharing one weight fragment
+load per K step) makes the weight tensor read exactly once.
+
+| kernel | tile | weight traffic | time | TFLOP/s |
+| --- | --- | ---: | ---: | ---: |
+| Loom v1 | 16x16, n_tiles=4 | 713 MB | 5.979 ms | 1.909 |
+| Loom v2 | 16x64, n_tiles=1 | **178 MB** | **3.000 ms** | **3.805** |
+| our HIP, fp16 weights | 256x256 | 178 MB | 1.353 ms | 8.43 |
+
+Both Loom numbers are iree-benchmark-loom with --measure=dispatch_complete
+--warmup-iterations=2 --iterations=5 --max-batches=5, run serially in one session,
+with the correctness case passing in both.
+
+**The traffic model predicted 1.5 ms and the kernel took 3.0 ms, so it was only
+half right.** v1 moved 713 MB in 5.979 ms (119 GB/s), but v2 moves 178 MB in
+3.000 ms (59 GB/s) -- v2 is not weight-bandwidth bound at all. Every WMMA operand
+comes straight from global memory with no pipelining across K steps, so each of
+the 320 iterations exposes a full memory latency; across 40 CUs that is about one
+WMMA per 121 cycles, which is latency-bound, not issue-bound. Against our tuned
+HIP kernel at the same 16-bit precision the gap is now 2.22x, and the remaining
+levers are identified rather than speculative: more independent accumulator chains
+per workgroup (a larger M tile, which also raises the WMMA-per-load ratio) and LDS
+staging of the operands.
+
+Measurement note: --measure=auto silently selects case_end_to_end for a check.case,
+which times the tensor fills and the correctness compare as well as the kernel.
+Kernel time requires --measure=dispatch_complete; the two modes gave 38.6 ms and
+5.979 ms for the same v1 binary, so the mode must be stated with any Loom number
+quoted.
