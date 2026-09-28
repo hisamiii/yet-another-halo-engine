@@ -37,7 +37,9 @@ explicitly deferred.
 | yah_ssm_postnorm_gate_f32.loom | batched_ssm.hip | SSM post-norm + gate epilogue | ported, 0.0173 ms at 2x2x128; fixture + 1e-6 tolerance |
 | yah_deltanet_prep_ab_f32.loom | ssm_row_split.hip | DeltaNet alpha/beta prep + conv history advance | ported, 0.0087 ms; ab within 1e-5, history exact |
 | yah_ssm_postnorm_gate_f16.loom | ssm_row_split.hip | fp16 SSM post-norm + gate epilogue | ported, 0.0079 ms at 3 heads; fixture + 1e-6 tolerance |
-| - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
+| yah_attn_gate_f32.loom | attention_batched.hip | attention output gate | ported, two exact sigmoid points, no fixture |
+| yah_attn_softmax_f32.loom | attention_batched.hip | causal softmax + causal zeroing | ported, exact at both mask ends |
+| - | attention_batched.hip, prefill_attention*.hip, attention_wmma.hip | batched attention core, KV cache write, tiled/WMMA attention | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
@@ -169,6 +171,13 @@ profile gives one, so the expensive paths move first rather than the convenient 
   parse (`unexpected token ':'`); it is `index.assume %v [range(%v, 0, 3)] : index`.
   Prefer removing the need for the assume over writing one, since the footprint
   analysis does not consume it anyway.
+- **A softmax at uniform scores has an exact expectation.** The max subtracts out
+  exactly, `exp(0)` is exactly 1, and the sum is the visible count, so no
+  transcendental is ever evaluated away from zero. That makes a causal softmax
+  checkable without a tolerance: a fully visible row is exactly
+  `1/sequence_length`, and a one-key row is exactly `1` followed by zeros. The
+  kernel's own `+1e-9` guard is harmless in fp32 because `1 + 1e-9` and `4 + 1e-9`
+  both round back to their integer.
 - **`scalar.sitofp` rejects `index`.** Cast first:
   `%i = index.cast %n : index to i32` then `%f = scalar.sitofp %i : i32 to f32`.
   The failure is `TYPE/003: operand 'input' has type index, expected integer`.

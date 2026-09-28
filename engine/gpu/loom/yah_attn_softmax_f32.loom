@@ -1,0 +1,132 @@
+// YAH causal attention softmax, Loom port of CausalSoftmaxKernel.
+//
+// HIP source: models/qwen/hip/kernels/attention_batched.hip. One row per
+// (matrix, query) pair, softmaxed over the causally visible prefix and zeroed
+// after it:
+//
+//   visible = start_pos + query + 1
+//   m       = max(column[0..visible))
+//   column[k] = exp(column[k] - m) for k < visible
+//   s       = sum(column[0..visible))
+//   column[k] /= s + 1e-9 for k < visible
+//   column[k] = 0 for visible <= k < sequence_length
+//
+// The HIP kernel uses 256 threads with a shared-memory max tree and sum tree. This
+// port uses one subgroup with lanes striding by 32 and two
+// `kernel.subgroup.reduce` calls, which is the same maximum and the same sum with
+// no LDS and no barrier. Reduction order across a max and a sum of non-negative
+// terms does not change the result here.
+//
+// The two cases pin both ends of the causal mask with exact values. With uniform
+// scores the max subtracts out exactly and exp(0) is exactly 1, so a fully visible
+// row is exactly 1/sequence_length and a row with one visible key is exactly 1.0
+// followed by zeros. 1 + 1e-9 and 4 + 1e-9 both round back to 1 and 4 in fp32, so
+// the 1e-9 guard does not perturb either expectation.
+//
+// Required config: --config=yah_attn_softmax.batch_size=1
+//                  --config=yah_attn_softmax.sequence_length=4
+//                  --config=yah_attn_softmax.matrix_stride=4
+//                  --config=yah_attn_softmax.num_matrices=1
+//                  --config=yah_attn_softmax.start_pos={3 for full, 0 for masked}
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_attn_softmax.start_pos : %value: index where [range(%value, 0, 1073741824)]
+
+config.decl @yah_attn_softmax.batch_size : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_attn_softmax.sequence_length : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_attn_softmax.matrix_stride : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_attn_softmax.num_matrices : %value: index where [range(%value, 1, 65536)]
+
+kernel.def target(@yah_wave32) @yah_attn_softmax() {
+  %unit = index.constant 1 : index
+  %batch_size = config.get @yah_attn_softmax.batch_size : index
+  %num_matrices = config.get @yah_attn_softmax.num_matrices : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%batch_size, %num_matrices, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%scores: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c9 = index.constant 9 : index
+  %c32 = index.constant 32 : index
+  %neg_infinite = scalar.constant -3.0000000000000001e+38 : f32
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %guard = scalar.constant 1.0000000000000001e-09 : f32
+  %start_pos = config.get @yah_attn_softmax.start_pos : index
+  %batch_size = config.get @yah_attn_softmax.batch_size : index
+  %sequence_length = config.get @yah_attn_softmax.sequence_length : index
+  %matrix_stride = config.get @yah_attn_softmax.matrix_stride : index
+  %num_matrices = config.get @yah_attn_softmax.num_matrices : index
+  %total = index.mul %num_matrices, %matrix_stride : index
+  %scores_na = buffer.assume.noalias %scores : buffer
+  %scores_view = buffer.view %scores_na[%base] : buffer -> view<[%total]xf32>
+  %query = kernel.workgroup.id<x> : index
+  %matrix = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %matrix_base = index.mul %matrix, %matrix_stride : index
+  %query_row = index.mul %query, %sequence_length : index
+  %row = index.add %matrix_base, %query_row : index
+  %visible = index.add %start_pos, %query : index
+  %visible1 = index.add %visible, %c1 : index
+  %local_max = scf.for %k = [%lane to %visible1 step %c32](%m = %neg_infinite : f32) -> (f32) {
+    %off = index.add %row, %k : index
+    %v = view.load %scores_view[%off] : view<[%total]xf32> -> f32
+    %bigger = scalar.maxnumf %m, %v : f32
+    scf.yield %bigger : f32
+  }
+  %max_score = kernel.subgroup.reduce<maxnumf> %local_max : f32
+  %local_sum = scf.for %j = [%lane to %visible1 step %c32](%s = %zero : f32) -> (f32) {
+    %off2 = index.add %row, %j : index
+    %v2 = view.load %scores_view[%off2] : view<[%total]xf32> -> f32
+    %shifted = scalar.subf %v2, %max_score : f32
+    %exponential = scalar.expf<afn> %shifted : f32
+    view.store %exponential, %scores_view[%off2] : f32, view<[%total]xf32>
+    %sum = scalar.addf %s, %exponential : f32
+    scf.yield %sum : f32
+  }
+  %sum_all = kernel.subgroup.reduce<addf> %local_sum : f32
+  %guarded = scalar.addf %sum_all, %guard : f32
+  %inv = scalar.divf %one, %guarded : f32
+  %sink = scf.for %p = [%lane to %visible1 step %c32](%mark = %zero : f32) -> (f32) {
+    %off3 = index.add %row, %p : index
+    %v3 = view.load %scores_view[%off3] : view<[%total]xf32> -> f32
+    %scaled = scalar.mulf %v3, %inv : f32
+    view.store %scaled, %scores_view[%off3] : f32, view<[%total]xf32>
+    scf.yield %mark : f32
+  }
+  %tail_start = index.add %visible1, %lane : index
+  %sink2 = scf.for %q = [%tail_start to %sequence_length step %c32](%mark2 = %zero : f32) -> (f32) {
+    %off4 = index.add %row, %q : index
+    view.store %zero, %scores_view[%off4] : f32, view<[%total]xf32>
+    scf.yield %mark2 : f32
+  }
+  kernel.return
+}
+
+// Requires --config=yah_attn_softmax.start_pos=3 with the other configs above.
+// A fully visible row: uniform scores make the softmax exactly 1/4 everywhere.
+check.case public @yah_attn_softmax_full {
+  %scores = check.generate.fill value(0.0) : tensor<4xf32>
+  %expected = check.generate.fill value(0.25) : tensor<4xf32>
+  kernel.launch @yah_attn_softmax(%scores) : (tensor<4xf32>)
+  check.expect.close actual(%scores) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.benchmark<@yah_attn_softmax_full> @yah_attn_softmax_full_bench
+
+// Requires --config=yah_attn_softmax.start_pos=0 with the other configs above.
+// One visible key: the row must be exactly 1 followed by the causal zeros.
+check.case public @yah_attn_softmax_masked {
+  %scores = check.generate.fill value(0.0) : tensor<4xf32>
+  %expected = check.file.read.npy path("fixtures/attn_softmax/expected_masked.npy") : tensor<4xf32>
+  kernel.launch @yah_attn_softmax(%scores) : (tensor<4xf32>)
+  check.expect.close actual(%scores) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.benchmark<@yah_attn_softmax_masked> @yah_attn_softmax_masked_bench
