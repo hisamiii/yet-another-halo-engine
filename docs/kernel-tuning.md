@@ -1939,3 +1939,38 @@ matmuls (reuse across the chunk, WMMA-able, LDS-worth staging) plus a short
 inter-chunk scan. The flat-in-T result above says the payoff is only in the inner
 loop's shape, so any chunked prototype has to be judged on TFLOP/s at fixed T, not
 on amortisation.
+
+### Staging k/q through LDS is a 2.4x loss, and that is a design constraint
+
+The counters said MemUnitBusy ~99%, and the arithmetic behind that reading is
+striking: 18 FLAT per warp per token x 768 waves x 2048 tokens x 512 B per
+wavefront is **14.5 GB of L1 wavefront traffic to consume 151 MB of distinct
+k/q/v** -- a 96x amplification, because all eight row groups in a block re-issue
+wavefronts for the same 64 B of k and q. Staging the row once per token into
+1 KiB of LDS and reading it back with \`ds_read\` removes essentially all of it,
+and it is much slower:
+
+| tile | k/q source | med ms | vs unstaged | spread |
+| --- | --- | ---: | ---: | ---: |
+| (32,1) | global wavefronts | 3.421 | -- | 2.80% |
+| (32,1) | **LDS staged** | **8.159** | **+138.5%** | 0.65% |
+| (16,2) | global wavefronts | 3.341 | -- | 1.32% |
+| (16,2) | **LDS staged** | **5.100** | **+52.6%** | 1.35% |
+
+Both staged tiles are bit-identical to the reference, so this is pure cost. The
+two extra \`__syncthreads()\` per token are what does it: the kernel currently has
+**zero synchronisation** and its eight waves per block run independently, so a
+per-token block-wide barrier serialises them and removing 96x of L1 traffic does
+not pay for it. Two conclusions:
+
+- Any rewrite of this kernel -- including a chunked one -- has to keep the token
+  loop barrier-free. A per-token barrier costs 2.4x before it does anything else.
+- \`MemUnitBusy\` ~99% is occupancy of the pipe, not a saturating throughput: it
+  stays ~99% whether the loads are redundant global wavefronts or broadcast
+  \`ds_read\`s, so it was the wrong signal to read as evidence of an L1 bound.
+
+What is left as the mechanism is the reduction chain: a \`RowReduce2\` butterfly
+sits in the dependency path once per row group per token, and the only thing that
+hides it is independent work per thread. That is exactly the axis \`(16,2)\` moves
+-- two rows per lane at the same block count as the shipped tile -- and exactly
+why the deeper tiles that trade block count for rows lose.

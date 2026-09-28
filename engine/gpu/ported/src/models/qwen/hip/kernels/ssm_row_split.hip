@@ -154,7 +154,7 @@ __device__ __forceinline__ void RowReduce2(float& u, float& p) {
 // lane-dependent index is loop-invariant, which keeps the token loop free of
 // 64-bit address arithmetic.
 template<detail::QwenRecurrentStateElement StateT, int kKeysPerLane,
-         int kRowsPerLane, bool kPrefetch>
+         int kRowsPerLane, bool kPrefetch, bool kStageKq = false>
 __launch_bounds__(256) __global__ void BatchedDeltaNetRowSplitKernel(
     const float* __restrict__ conv_out, const float* __restrict__ kq_scales,
     const float* __restrict__ ab, StateT* __restrict__ deltanet_state,
@@ -178,6 +178,14 @@ __launch_bounds__(256) __global__ void BatchedDeltaNetRowSplitKernel(
                    (wave * kRowsPerWave) + grp;
   const int kh = h % num_key_heads;
   const int kq_idx = seg * kVec;
+  // kStageKq: the block needs only kRowSplitDim k values and kRowSplitDim q
+  // values per token -- 1 KiB -- but every wave issues its own global wavefronts
+  // for them, and every lane's 128-bit load serves only kLanesPerRow distinct
+  // addresses. Staging the row once per token replaces 8 redundant global
+  // wavefront streams with one cooperative fetch plus broadcast ds_reads. The
+  // array is 16 B when the flag is off so the flag costs nothing when unused.
+  constexpr int kKqQuads = kRowSplitDim / 4;
+  __shared__ float4 s_kq[kStageKq ? (2 * kKqQuads) : 1];
 
   StateT* s_head = deltanet_state +
                    ((((static_cast<std::size_t>(layer_idx) * num_heads) + h)) *
@@ -219,7 +227,21 @@ __launch_bounds__(256) __global__ void BatchedDeltaNetRowSplitKernel(
   for (int t = 0; t < batch_size; ++t) {
     float4 kv[kVec];
     float4 qv[kVec];
-    if (kPrefetch) {
+    if (kStageKq) {
+      const auto* kp = reinterpret_cast<const float4*>(k_base);
+      const auto* qp = reinterpret_cast<const float4*>(q_base);
+      if (tid < kKqQuads) {
+        s_kq[tid] = kp[tid];
+      } else if (tid < 2 * kKqQuads) {
+        s_kq[tid] = qp[tid - kKqQuads];
+      }
+      __syncthreads();
+#pragma unroll
+      for (int vi = 0; vi < kVec; ++vi) {
+        kv[vi] = s_kq[kq_idx + vi];
+        qv[vi] = s_kq[kKqQuads + kq_idx + vi];
+      }
+    } else if (kPrefetch) {
 #pragma unroll
       for (int vi = 0; vi < kVec; ++vi) {
         kv[vi] = k_next[vi];
@@ -286,6 +308,7 @@ __launch_bounds__(256) __global__ void BatchedDeltaNetRowSplitKernel(
       }
     }
 
+    if (kStageKq) __syncthreads();
     q_base += qkv_size;
     k_base += qkv_size;
     v_base += qkv_size;
@@ -427,6 +450,8 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     else if (t == "16x1") tile = 7;
     else if (t == "8x1") tile = 8;
     else if (t == "8x2") tile = 9;
+    else if (t == "32x1s") tile = 10;
+    else if (t == "16x2s") tile = 11;
     else throw std::invalid_argument("YAH_SSM_TILE: unknown tile " + t);
   }
   // (16,2) is the default below the crossover: it is bit-identical to (32,1),
@@ -436,20 +461,20 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
   // moved on the larger batches rather than on the production point.
   if (tile == 0) tile = (batch_size <= kRowSplitSmallBatch) ? 3 : 2;
 
-#define YAH_SSM_TILE_CASE(N, KEYS, ROWS, PREFETCH)                              \
+#define YAH_SSM_TILE_CASE(N, KEYS, ROWS, PREFETCH, STAGE)                              \
   case N: {                                                                     \
     const dim3 g(                                                               \
         static_cast<unsigned int>(val_dim /                                     \
                                   RowSplitRowsPerBlock<KEYS, ROWS>()),          \
         num_heads);                                                             \
     if (state_storage == QwenRecurrentStateStorage::kBf16) {                    \
-      BatchedDeltaNetRowSplitKernel<hip_bfloat16, KEYS, ROWS, PREFETCH>         \
+      BatchedDeltaNetRowSplitKernel<hip_bfloat16, KEYS, ROWS, PREFETCH, STAGE>         \
           <<<g, 256, 0, stream>>>(conv_out, kq_scales, alpha_beta,              \
                                   static_cast<hip_bfloat16*>(deltanet_state),   \
                                   out_buf, layer_idx, batch_i, qkv_i, inner_i,  \
                                   kh_i, h_i);                                   \
     } else {                                                                    \
-      BatchedDeltaNetRowSplitKernel<float, KEYS, ROWS, PREFETCH>                \
+      BatchedDeltaNetRowSplitKernel<float, KEYS, ROWS, PREFETCH, STAGE>                \
           <<<g, 256, 0, stream>>>(conv_out, kq_scales, alpha_beta,              \
                                   static_cast<float*>(deltanet_state), out_buf, \
                                   layer_idx, batch_i, qkv_i, inner_i, kh_i,     \
@@ -458,19 +483,24 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
   } break
 
   switch (tile) {
-    YAH_SSM_TILE_CASE(1, 32, 1, false);
-    YAH_SSM_TILE_CASE(2, 32, 2, true);
-    YAH_SSM_TILE_CASE(3, 16, 2, false);
-    YAH_SSM_TILE_CASE(4, 16, 4, false);
-    YAH_SSM_TILE_CASE(5, 8, 4, false);
-    YAH_SSM_TILE_CASE(6, 8, 8, false);
+    YAH_SSM_TILE_CASE(1, 32, 1, false, false);
+    YAH_SSM_TILE_CASE(2, 32, 2, true, false);
+    YAH_SSM_TILE_CASE(3, 16, 2, false, false);
+    YAH_SSM_TILE_CASE(4, 16, 4, false, false);
+    YAH_SSM_TILE_CASE(5, 8, 4, false, false);
+    YAH_SSM_TILE_CASE(6, 8, 8, false, false);
     // More blocks at the same bytes/MAC as the shipped tile: (16,1) is 4 blocks
     // wide and (8,1) is 8, against 2 for (32,1), and the 48 -> 96 block step
     // was worth 2.6x, so this is the parallelism axis rather than the traffic
     // one. Registers per thread fall with kRowsPerLane, so all three fit.
-    YAH_SSM_TILE_CASE(7, 16, 1, false);
-    YAH_SSM_TILE_CASE(8, 8, 1, false);
-    YAH_SSM_TILE_CASE(9, 8, 2, false);
+    YAH_SSM_TILE_CASE(7, 16, 1, false, false);
+    YAH_SSM_TILE_CASE(8, 8, 1, false, false);
+    YAH_SSM_TILE_CASE(9, 8, 2, false, false);
+    // Staged k/q: identical arithmetic, 1 KiB of LDS per block, two barriers per
+    // token. If the 14.5 GB of L1 wavefront traffic is what MemUnitBusy ~99% is
+    // reporting, this is where it goes away.
+    YAH_SSM_TILE_CASE(10, 32, 1, false, true);
+    YAH_SSM_TILE_CASE(11, 16, 2, false, true);
     default:
       throw std::invalid_argument("YAH_SSM_TILE: unreachable tile");
   }
