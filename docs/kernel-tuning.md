@@ -1545,7 +1545,7 @@ the families are few:
 | --- | --- | --- | --- |
 | fp16 WMMA + LDS staging, 256x256 | 0.75 (integer optimum) | 26.0 TMAC/s | shipped, at the family bound |
 | same, 384x384 | 0.47 | -- | **does not fit** (96 KiB staging) |
-| int4 WMMA 16x16x32 | halves it (8192 MACs/instr) | 52.6 TMAC/s | blocked: needs 4-bit activations |
+| int4 WMMA 16x16x32 | halves it (8192 MACs/instr) | 52.6 TMAC/s recorded | **not on this part**: the wide shape is gfx12-only; gfx1151 has only 16x16x16 iu4, the same 4096 MACs as fp16 |
 | packed int4 dots (`v_dot8_i32_i4`) | per-lane, no wave staging | 28.99 TMAC/s | **untried**, no weight-format change |
 
 The packed-dot family is the only one that is neither already-shipped nor blocked

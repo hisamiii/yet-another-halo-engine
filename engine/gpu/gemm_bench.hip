@@ -1806,7 +1806,7 @@ void LaunchFp16W(const void* w, const short* x, float* y, std::size_t batch,
 
 template<gufo::core::GgmlType Type>
 void RunFp16W(std::size_t m, std::size_t k, std::size_t batch,
-              unsigned iterations, int pattern) {
+              unsigned iterations, int pattern, int only_arm) {
   const std::size_t block_bytes =
       gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
   const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
@@ -1873,6 +1873,13 @@ void RunFp16W(std::size_t m, std::size_t k, std::size_t batch,
            iterations;
   };
   const char* names[2] = {"quantised", "fp16_weights"};
+  if (only_arm >= 0) {
+    // -r 1 single arm for the paired protocol: warm inside, one timed run.
+    const double ms = timed(only_arm);
+    std::printf("fp16w arm=%s ms=%.6f tflops=%.2f\n", names[only_arm], ms,
+                (2.0 * m * k * batch) / (ms * 1e9));
+    return;
+  }
   for (int round = 0; round < 5; ++round) {
     for (int i = 0; i < 2; ++i) {
       const int idx = (i + round) % 2;
@@ -1887,20 +1894,20 @@ void RunFp16W(std::size_t m, std::size_t k, std::size_t batch,
 }
 
 void DispatchFp16W(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
-                   unsigned iterations, int pattern) {
+                   unsigned iterations, int pattern, int only_arm) {
   using gufo::core::GgmlType;
   switch (type) {
     case GgmlType::kQ4_K:
-      RunFp16W<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      RunFp16W<GgmlType::kQ4_K>(m, k, batch, iterations, pattern, only_arm);
       return;
     case GgmlType::kQ5_K:
-      RunFp16W<GgmlType::kQ5_K>(m, k, batch, iterations, pattern);
+      RunFp16W<GgmlType::kQ5_K>(m, k, batch, iterations, pattern, only_arm);
       return;
     case GgmlType::kQ6_K:
-      RunFp16W<GgmlType::kQ6_K>(m, k, batch, iterations, pattern);
+      RunFp16W<GgmlType::kQ6_K>(m, k, batch, iterations, pattern, only_arm);
       return;
     case GgmlType::kQ8_0:
-      RunFp16W<GgmlType::kQ8_0>(m, k, batch, iterations, pattern);
+      RunFp16W<GgmlType::kQ8_0>(m, k, batch, iterations, pattern, only_arm);
       return;
     default:
       std::fprintf(stderr, "fp16w sweep covers q4k, q5k, q6k, q8_0\n");
@@ -2477,7 +2484,8 @@ int main(int argc, char** argv) {
         else if (decsweep)
           DispatchDec(entry.type, m, k, batch, iterations, pattern);
         else if (fp16w)
-          DispatchFp16W(entry.type, m, k, batch, iterations, pattern);
+          DispatchFp16W(entry.type, m, k, batch, iterations, pattern,
+                        argc > 8 ? std::stoi(argv[8]) : -1);
         else if (one)
           DispatchOne(entry.type, m, k, batch, iterations, pattern,
                       argc > 8 ? std::stoi(argv[8]) : 16,
