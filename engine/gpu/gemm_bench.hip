@@ -1976,6 +1976,11 @@ void RunOne(std::size_t m, std::size_t k, std::size_t batch, unsigned iterations
     if (tile == 1) { LaunchOneT<Type, 256, 256, 8, 4, 2>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
     if (tile == 2) { LaunchOneT<Type, 128, 128, 4, 4, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
     if (tile == 3) { LaunchOneT<Type, 128, 128, 8, 4, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
+    // Wide token tile: 128+384 = 512 is exactly the LDS budget at BK=4, and the
+    // total decode work is proportional to 1/BN because every block decodes its
+    // own weight tile. Trading BM for BN therefore buys decode amortisation at
+    // the cost of operand reuse (WRS=2, WTS=3 -> 0.83 loads/WMMA against 0.75).
+    if (tile == 4) { LaunchOneT<Type, 128, 384, 4, 8, 4>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr, ablate); return; }
     switch (ablate) {
       case 16: LaunchOne<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;
       case 48: LaunchOne<Type, 48>(weights.data(), half_x.data(), y.data(), batch, m, k, nullptr); break;

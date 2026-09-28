@@ -55,14 +55,15 @@ template<int Ablate>
 __device__ __forceinline__ void DecodeToHalves(const gufo::hip::QuantSub16& q,
                                                v16bf& out) {
   if constexpr ((Ablate & 8388608) != 0) {
+    // Native fp16, left to contract into v_fma_f16 / v_pk_fma_f16. The first
+    // version routed through __builtin_fmaf on floats, which is an fp32 FMA with
+    // two extra converts; it measured 4.5% *slower* than the fp32 chain it was
+    // meant to beat, which is a bug in this arm rather than a result.
     const _Float16 hs = static_cast<_Float16>(q.scale);
     const _Float16 ho = static_cast<_Float16>(q.offset);
 #pragma unroll
     for (int j = 0; j < 16; ++j)
-      out[j] = static_cast<_Float16>(
-          __builtin_fmaf(static_cast<float>(hs),
-                         static_cast<float>(static_cast<_Float16>(q.q[j])),
-                         -static_cast<float>(ho)));
+      out[j] = static_cast<_Float16>(hs * static_cast<_Float16>(q.q[j]) - ho);
   } else {
 #pragma unroll
     for (int j = 0; j < 16; ++j)

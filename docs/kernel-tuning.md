@@ -1558,3 +1558,35 @@ built on it keeps that advantage is the open question, because a per-lane dot ha
 no wave-level operand sharing and the data movement is different in kind.
 
 been brought together.
+
+### Under the protocol: the decode is 16%, and materialising it is a loss
+
+Re-measured with warm-up, `-r 1`, a 15 s gap before every timed run and
+alternating order:
+
+| pair | reps | median |
+| --- | --- | ---: |
+| full (16) -> decode removed, value kept live by asm (80) | -15.3, -16.6, -16.1, -16.0 | **-16.07%** |
+| quantised -> materialised fp16 weights | +7.7, +5.7, +5.5, +2.3 | **+5.61%** |
+| fp32 decode -> fp16 FMA decode (first attempt) | +4.54 | +4.54% |
+
+Three things follow.
+
+- **The decode is worth 16%, reproducibly.** The earlier 23% came from the
+  averaged-regime protocol and was inflated; 16% is the paired number, and its
+  spread across four reps is 1.3 points.
+- **Materialising the weights is a loss, and this is now settled rather than
+  marginal.** It removes the 16% decode and adds ~22% in weight bytes (fp16 is
+  2 B/element against 0.5625 for this artifact's IQ4_XS-class FFN), for a net
+  **+5.6%**. The earlier "wash" was the averaged protocol hiding a real regression.
+- **The first fp16-decode arm was my bug, not a result.** It routed through
+  `__builtin_fmaf` on floats, which is an fp32 FMA plus two extra converts, and it
+  measured *slower* than the fp32 chain it was supposed to beat. It is rewritten as
+  native `_Float16` arithmetic left to contract, and re-measured below.
+
+So the useful finding is narrow and precise: **the decode's 16% is real and
+irreducible per element** (`A*q - B` has to be applied per element, and folding it
+into the accumulator would need a partial sum per 32-element block). The only
+question left is whether the same work can be done in fewer instructions, which is
+what the native-fp16 arm tests.
+
