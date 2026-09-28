@@ -109,6 +109,7 @@ explicitly deferred.
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
+| yah_embed_ptr_q3k_f32.loom | embed.hip | embedding lookup from a device token pointer, Q3_K table | ported, 0.0142 ms at hidden 5120; bit-exact vs the verified prefill_embed Q3_K row |
 | yah_rope_ptr_f32.loom | rope.hip | RoPE from a device position pointer, identity at pos 0 | ported, 0.0064 ms; exact, no fixture |
 | yah_fused_qk_rope_f32.loom | fused.hip | fused QK RMSNorm + RoPE + KV write (decode) | ported, 0.0089 ms; exact, no fixture |
 | yah_fused_qk_rope_batched_f32.loom | prefill_rope.hip | fused QK RMSNorm + RoPE + KV write (batched) | ported, 0.0088 ms; exact, no fixture |
@@ -297,7 +298,7 @@ Reachability evidence for the entries that are not on that route:
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path, and the Q4_K, Q6_K, Q3_K, IQ4_XS and Q5_K arms of Q8KBlockGEMVKernel — the output projection of this shard is Q6_K, so that arm is on the prefill route. **todo**: the bf16 GEMV path and the Q8_0/Q8_K fast arms |
 | sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm), SpeculativeSegmentMaxKernel, SpeculativeSegmentWeightsKernel, SpeculativeSegmentResidualKernel, SpeculativeSegmentSelectKernel, LinearSamplingKernel, SortedSamplingKernel (f32 thresholds). **todo**: SortedSpeculativeSampling, LinearSpeculativeSampling, the Partial/MapIndices argmax arms |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
-| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 arm), and the Q4_K fused SwiGLU GEMV (the production decode FFN). **todo**: FastFusedSwiGLUGEMVBlockKernel (the bf16/Q8 legacy fallback), the non-f32 lookup arms |
+| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 and Q3_K arms; token_embd is Q3_K here), and the Q4_K fused SwiGLU GEMV (the production decode FFN). **todo**: FastFusedSwiGLUGEMVBlockKernel (the bf16/Q8 legacy fallback), the BF16/Q8_0 lookup arms |
 | dflash | dflash_kernels.hip | **ported**: grouped dynamic convolution, q8_0 quantization, silu_mul, selector partial top-k. **parked** by instruction: non-causal attention (2), selector finalize (+batch) |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 
