@@ -625,3 +625,39 @@ traffic, issued bytes, register count as such), and the load-only proxy says wha
 (the memory path, at 95%). The one untested mechanism that changes the memory path
 itself -- transaction shape, via LDS staging with wide coalesced fills -- remains the
 next experiment, with the probe as its hard target: 1.727 ms down to about 1.35 ms.
+
+### Correction: the fp16 control uses no LDS, so LDS staging is not the differentiator
+
+Reading the exact kernels rather than the tile family changes the plan. After forcing a
+device rebuild, the code object was extracted from build/obj/gemm_bench.o with
+llvm-objcopy --dump-section .hip_fatbin followed by clang-offload-bundler --unbundle,
+and the notes were read for all 374 kernels in the current build:
+
+| kernel | VGPR | SGPR | LDS | spills | threads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| one:q4k control (ablate 16) | **192** | 42 | 64 KiB | 0 | 1024 |
+| fp16w:q4k control (ablate 16777232) | **190** | 42 | **0** | 0 | 1024 |
+
+Two things follow. First, the Q4_K kernel we benchmark against sits at exactly 192
+VGPR, which is also its launch-bound ceiling (196608 / 1024), so 192 is a real
+operating point rather than a synthetic target and is worth testing the Loom kernel
+at. Second, and more importantly, the fp16 arm we compare Loom against uses no shared
+memory at all: it reads its operands directly from global memory, exactly as the Loom
+kernel does.
+
+That retracts the mechanism proposed in the previous section. LDS staging with wide
+coalesced fills cannot be what HIP does differently in the comparison that matters,
+because in that comparison it does not stage anything. What remains different is
+narrower:
+
+- **workgroup shape**: 1024 threads across 32 waves, against 32 threads in one wave,
+  at essentially the same per-thread budget (190 against 200 VGPR);
+- **tile**: 256x256 against 16x64, so 8 accumulator fragments per warp against 4;
+- **per-warp operand traffic**: every Loom warp issues 5 fragment loads per K step,
+  each a 16-byte-per-lane gather, where the HIP warp covers a 32x64 sub-tile.
+
+The next experiment is therefore the workgroup shape rather than LDS: more waves per
+workgroup, each keeping the same per-warp schedule, so that many more independent
+requests are in flight at the same per-thread register budget. That also makes the
+residency boundary load-bearing rather than incidental, since the whole point is to
+add waves without crossing roughly 192 registers.
