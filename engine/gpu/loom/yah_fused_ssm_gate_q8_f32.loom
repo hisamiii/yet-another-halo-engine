@@ -1,0 +1,248 @@
+// YAH prefill SSM post-norm gate + Q8_1 quantization, Loom port of
+// BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel.
+//
+// HIP source: models/qwen/hip/kernels/prefill_quant_gemm.hip. One workgroup per
+// (head, token). The head value vector is RMS-normalized, scaled by the SSM norm
+// weight, optionally gated by SiLU, then quantized with the same tiled Q8_1 layout
+// as yah_quant_act_q8_f32.loom:
+//
+//   in  = raw[t][h*val_dim + i]
+//   inv = rsqrt(sum_i in^2 / val_dim + eps)
+//   v   = (in * inv) * ssm_norm[i]
+//   v  *= gate * sigmoid(gate)              (only when the gate is present)
+//   d   = max_32lane |v| / 127;  q = roundf(v / d)
+//
+// HIP reduces each warp in registers and then sums four warp partials in shared
+// memory; the port replaces both with one `kernel.workgroup.reduce<addf>`. The
+// per-block maximum stays a `kernel.subgroup.reduce<maxnumf>`, because a wave owns
+// exactly one 32-element block when val_dim is a multiple of 32. The present-gate
+// branch is a config so the ungated path can be checked exactly.
+//
+// eps is a one-element buffer rather than a config so the check can pass 0.0 and
+// get inv_rms = rsqrt(1) = 1 exactly.
+//
+// Required config: --config=yah_fused_ssm_gate_q8.num_heads=1 --config=yah_fused_ssm_gate_q8.batch=1
+//                  --config=yah_fused_ssm_gate_q8.inner_size=32 --config=yah_fused_ssm_gate_q8.val_dim=32
+//                  --config=yah_fused_ssm_gate_q8.has_gate=0
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_fused_ssm_gate_q8.num_heads : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_fused_ssm_gate_q8.batch : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_fused_ssm_gate_q8.inner_size : %value: index where [range(%value, 32, 65536)]
+
+config.decl @yah_fused_ssm_gate_q8.val_dim : %value: index where [range(%value, 32, 65536)]
+
+config.decl @yah_fused_ssm_gate_q8.has_gate : %value: index where [range(%value, 0, 1)]
+
+kernel.def target(@yah_wave32) @yah_fused_ssm_gate_q8() {
+  %unit = index.constant 1 : index
+  %num_heads = config.get @yah_fused_ssm_gate_q8.num_heads : index
+  %batch = config.get @yah_fused_ssm_gate_q8.batch : index
+  %c128 = index.constant 128 : index
+  kernel.launch.config workgroups(%num_heads, %batch, %unit) workgroup_size(%c128, %unit, %unit) : index
+} launch(%raw: buffer, %ssm_norm: buffer, %gate: buffer, %eps_buf: buffer, %y: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c5i = scalar.constant 5 : i32
+  %c4i = scalar.constant 4 : i32
+  %c15i = scalar.constant 15 : i32
+  %c31 = index.constant 31 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %c144 = index.constant 144 : index
+  %c176 = index.constant 176 : index
+  %c256 = index.constant 256 : index
+  %c576 = index.constant 576 : index
+  %c704 = index.constant 704 : index
+  %c127f = scalar.constant 127.0 : f32
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %num_heads = config.get @yah_fused_ssm_gate_q8.num_heads : index
+  %batch = config.get @yah_fused_ssm_gate_q8.batch : index
+  %inner_size = config.get @yah_fused_ssm_gate_q8.inner_size : index
+  %val_dim = config.get @yah_fused_ssm_gate_q8.val_dim : index
+  %has_gate = config.get @yah_fused_ssm_gate_q8.has_gate : index
+  %inner_i = index.cast %inner_size : index to i32
+  %num_blocks_i = scalar.shrui %inner_i, %c5i : i32
+  %num_blocks = index.cast %num_blocks_i : i32 to index
+  %batch_i = index.cast %batch : index to i32
+  %batch15_i = scalar.addi %batch_i, %c15i : i32
+  %tiles_i = scalar.shrui %batch15_i, %c4i : i32
+  %tiles = index.cast %tiles_i : i32 to index
+  %tiles_blocks = index.mul %tiles, %num_blocks : index
+  %val_dim_i = index.cast %val_dim : index to i32
+  %val_dimf = scalar.sitofp %val_dim_i : i32 to f32
+  %total_bytes = index.mul %tiles_blocks, %c704 : index
+  %sum_base_words = index.mul %tiles_blocks, %c144 : index
+  %total_words = index.mul %tiles_blocks, %c176 : index
+  %raw_na, %norm_na, %gate_na, %eps_na, %y_na = buffer.assume.noalias %raw, %ssm_norm, %gate, %eps_buf, %y : buffer, buffer, buffer, buffer, buffer
+  %raw_view = buffer.view %raw_na[%base] : buffer -> view<[%inner_size]xf32>
+  %norm_view = buffer.view %norm_na[%base] : buffer -> view<[%val_dim]xf32>
+  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%inner_size]xf32>
+  %eps_view = buffer.view %eps_na[%base] : buffer -> view<[%c1]xf32>
+  %y_i8 = buffer.view %y_na[%base] : buffer -> view<[%total_bytes]xi8>
+  %y_f32 = buffer.view %y_na[%base] : buffer -> view<[%total_words]xf32>
+  %h = kernel.workgroup.id<x> : index
+  %t = kernel.workgroup.id<y> : index
+  %tid = kernel.workitem.id<x> : index
+  %eps = view.load %eps_view[%c0] : view<[%c1]xf32> -> f32
+  %t_inner = index.mul %t, %inner_size : index
+  %h_val = index.mul %h, %val_dim : index
+  %row_base = index.add %t_inner, %h_val : index
+  %in_range = index.cmp ult, %tid, %val_dim : index
+  %in_val = scf.if %in_range -> (f32) {
+    %e = index.add %row_base, %tid : index
+    %v = view.load %raw_view[%e] : view<[%inner_size]xf32> -> f32
+    scf.yield %v : f32
+  } else {
+    scf.yield %zero : f32
+  }
+  %o_sq = scalar.mulf %in_val, %in_val : f32
+  %total = kernel.workgroup.reduce<addf> %o_sq : f32
+  %mean = scalar.divf %total, %val_dimf : f32
+  %mean_eps = scalar.addf %mean, %eps : f32
+  %inv = scalar.rsqrtf %mean_eps : f32
+  %sink = scf.if %in_range -> (index) {
+    %e2 = index.add %row_base, %tid : index
+    %w = view.load %norm_view[%tid] : view<[%val_dim]xf32> -> f32
+    %scaled = scalar.mulf %in_val, %inv : f32
+    %val0 = scalar.mulf %scaled, %w : f32
+    %use_gate = index.cmp eq, %has_gate, %c1 : index
+    %val = scf.if %use_gate -> (f32) {
+      %g = view.load %gate_view[%e2] : view<[%inner_size]xf32> -> f32
+      %gneg = scalar.subf %zero, %g : f32
+      %gexp = scalar.expf<afn> %gneg : f32
+      %gden = scalar.addf %one, %gexp : f32
+      %sig = scalar.divf %one, %gden : f32
+      %gsig = scalar.mulf %g, %sig : f32
+      %gated = scalar.mulf %val0, %gsig : f32
+      scf.yield %gated : f32
+    } else {
+      scf.yield %val0 : f32
+    }
+    %abs = scalar.absf %val : f32
+    %max_abs = kernel.subgroup.reduce<maxnumf> %abs : f32
+    %d = scalar.divf %max_abs, %c127f : f32
+    %nonzero = scalar.cmpf one, %d, %zero : f32
+    %id = scf.if %nonzero -> (f32) {
+      %inv2 = scalar.divf %one, %d : f32
+      scf.yield %inv2 : f32
+    } else {
+      scf.yield %zero : f32
+    }
+    %prod = scalar.mulf %val, %id : f32
+    %rounded = scalar.roundf %prod : f32
+    %q_i32 = scalar.fptosi %rounded : f32 to i32
+    %q_i8 = scalar.trunci %q_i32 : i32 to i8
+    %lane = index.andi %tid, %c31 : index
+    %hv_tid = index.add %h_val, %tid : index
+    %hv_tid_i = index.cast %hv_tid : index to i32
+    %blk_i = scalar.shrui %hv_tid_i, %c5i : i32
+    %blk = index.cast %blk_i : i32 to index
+    %t_i = index.cast %t : index to i32
+    %tt_i = scalar.shrui %t_i, %c4i : i32
+    %tl_i = scalar.andi %t_i, %c15i : i32
+    %tt = index.cast %tt_i : i32 to index
+    %tl_c_i = scalar.minsi %tl_i, %c15i : i32
+    %tl = index.cast %tl_c_i : i32 to index
+    %tt_nb = index.mul %tt, %num_blocks : index
+    %tile_raw = index.add %tt_nb, %blk : index
+    %tile_max = index.sub %tiles_blocks, %c1 : index
+    %tile_raw_i = index.cast %tile_raw : index to i32
+    %tile_max_i = index.cast %tile_max : index to i32
+    %tile_clamp_i = scalar.minsi %tile_raw_i, %tile_max_i : i32
+    %tile = index.cast %tile_clamp_i : i32 to index
+    %tile_bytes = index.mul %tile, %c576 : index
+    %lane_i = index.cast %lane : index to i32
+    %half_i = scalar.shrui %lane_i, %c4i : i32
+    %pos_i = scalar.andi %lane_i, %c15i : i32
+    %half = index.cast %half_i : i32 to index
+    %pos = index.cast %pos_i : i32 to index
+    %half256 = index.mul %half, %c256 : index
+    %tl16 = index.mul %tl, %c16 : index
+    %tl16_pos = index.add %tl16, %pos : index
+    %within = index.add %half256, %tl16_pos : index
+    %byte = index.add %tile_bytes, %within : index
+    view.store %q_i8, %y_i8[%byte] : i8, view<[%total_bytes]xi8>
+    %qf = scalar.sitofp %q_i32 : i32 to f32
+    %lt16 = index.cmp ult, %lane, %c16 : index
+    %low_contrib = scf.if %lt16 -> (f32) {
+      scf.yield %qf : f32
+    } else {
+      scf.yield %zero : f32
+    }
+    %high_contrib = scf.if %lt16 -> (f32) {
+      scf.yield %zero : f32
+    } else {
+      scf.yield %qf : f32
+    }
+    %low = kernel.subgroup.reduce<addf> %low_contrib : f32
+    %high = kernel.subgroup.reduce<addf> %high_contrib : f32
+    %is_leader = index.cmp eq, %lane, %c0 : index
+    scf.if %is_leader {
+      %tile_words = index.mul %tile, %c144 : index
+      %scale_off = index.add %c128, %tl : index
+      %scale_idx = index.add %tile_words, %scale_off : index
+      view.store %d, %y_f32[%scale_idx] : f32, view<[%total_words]xf32>
+      %tile16 = index.mul %tile, %c16 : index
+      %tile16_tl = index.add %tile16, %tl : index
+      %slot_pair = index.mul %tile16_tl, %c2 : index
+      %slot = index.add %sum_base_words, %slot_pair : index
+      %total_sum = scalar.addf %low, %high : f32
+      %slot0 = scalar.mulf %d, %total_sum : f32
+      %slot1 = scalar.mulf %d, %low : f32
+      view.store %slot0, %y_f32[%slot] : f32, view<[%total_words]xf32>
+      %slot_next = index.add %slot, %c1 : index
+      view.store %slot1, %y_f32[%slot_next] : f32, view<[%total_words]xf32>
+    }
+    scf.yield %c0 : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.return
+}
+
+// Requires --config=yah_fused_ssm_gate_q8.num_heads=1, .batch=1, .inner_size=32,
+// .val_dim=32, .has_gate=0.
+//
+// raw = 1, ssm_norm = 1, eps = 0, gate off: sum_sq = 32, mean = 1, inv = 1, so every
+// value is exactly 1. One block quantizes to q = 127 and d = 1/127 in the tiled
+// layout, so the 704-byte fixture is the single-block version of the base case.
+check.case public @yah_fused_ssm_gate_q8_case {
+  %raw = check.generate.fill value(1.0) : tensor<32xf32>
+  %ssm_norm = check.generate.fill value(1.0) : tensor<32xf32>
+  %gate = check.generate.fill value(0.0) : tensor<32xf32>
+  %eps = check.generate.fill value(0.0) : tensor<1xf32>
+  %y = check.generate.fill value(0) : tensor<704xi8>
+  %expected = check.file.read.npy path("fixtures/fused_ssm_gate_q8/expected_bytes.npy") : tensor<704xi8>
+  kernel.launch @yah_fused_ssm_gate_q8(%raw, %ssm_norm, %gate, %eps, %y) : (tensor<32xf32>, tensor<32xf32>, tensor<32xf32>, tensor<1xf32>, tensor<704xi8>)
+  check.expect.equal actual(%y) expected(%expected) : tensor<704xi8>
+  check.return
+}
+
+// Requires the same config with .has_gate=1 and gate = 100.
+//
+// exp(-100) rounds to zero in f32, so sigmoid(100) is exactly 1 and the gate factor
+// g*sigmoid(g) is exactly 100. Every value is 100, so the block still quantizes to
+// q = 127 with d = 100/127, which the fixture holds as raw bytes.
+check.case public @yah_fused_ssm_gate_q8_gated {
+  %raw = check.generate.fill value(1.0) : tensor<32xf32>
+  %ssm_norm = check.generate.fill value(1.0) : tensor<32xf32>
+  %gate = check.generate.fill value(100.0) : tensor<32xf32>
+  %eps = check.generate.fill value(0.0) : tensor<1xf32>
+  %y = check.generate.fill value(0) : tensor<704xi8>
+  %expected = check.file.read.npy path("fixtures/fused_ssm_gate_q8/expected_bytes_gated.npy") : tensor<704xi8>
+  kernel.launch @yah_fused_ssm_gate_q8(%raw, %ssm_norm, %gate, %eps, %y) : (tensor<32xf32>, tensor<32xf32>, tensor<32xf32>, tensor<1xf32>, tensor<704xi8>)
+  check.expect.equal actual(%y) expected(%expected) : tensor<704xi8>
+  check.return
+}
+
+check.benchmark<@yah_fused_ssm_gate_q8_case> @yah_fused_ssm_gate_q8_bench
+
+check.benchmark<@yah_fused_ssm_gate_q8_gated> @yah_fused_ssm_gate_q8_gated_bench
