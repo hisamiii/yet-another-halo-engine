@@ -520,7 +520,7 @@ the method designed for exactly that. It is also the cheapest remaining experime
 The Loom method prescribes a load-only proxy before further hill climbing, and it
 is decisive here. `engine/gpu/loom/yah_ffn_gemm_loadonly_probe.loom` is v3 with the
 four `vector.mma` operations replaced by four independent elementwise `vector.addf`
-accuracies -- that is, identical loads at identical offsets, identical K loop,
+accumulations -- that is, identical loads at identical offsets, identical K loop,
 identical pipeline depth and unroll, identical grid, and no matrix op at all.
 
 The mechanism-survival evidence is compiler-side, as the method requires:
@@ -548,3 +548,43 @@ workgroup with LDS-staged operands changes -- wide coalesced global fills instea
 16-byte-per-lane strided fragment gathers, and many more bytes in flight per issue
 slot -- and the probe gives it a hard target: the load path must go from 1.727 ms to
 about 1.35 ms.
+
+### `loom-compile-report` works here, and its headline suggestion is already falsified
+
+It is not a C++ tool in `src/loom/tools/` -- it is Python, at
+`loom/py/loom/tools/compile_report.py`, and it runs under the system Python 3.14.7:
+
+```shell
+cd /home/q/hrx/loom/py && python3 -m loom.tools.compile_report suggest report.json
+```
+
+The report for v3 is available and makes one high-confidence recommendation:
+
+```
+[amdgpu.residency_cliff]  occupancy_percent: 25
+  Reduce amdgpu.vgpr by at least 8 registers/subgroup (to at most 192).
+  Recompile and benchmark the modeled transition 4 -> 5 subgroups/SIMD.
+```
+
+v3 sits at 200 vector registers, so it misses the 192 threshold that would move it
+from 4 to 5 subgroups per SIMD by a margin of 8. That is a genuinely useful signal --
+and it is already falsified by our own measurements, twice:
+
+| variant | vector VGPR | modelled residency | measured |
+| --- | ---: | --- | ---: |
+| v3 (d3 u2) | 200 | 4 subgroups/SIMD | **1.819 ms** |
+| d3 u1 | 160 | crosses the cliff | 2.347 ms |
+| v5, contiguous activation | 152 | crosses the cliff | 5.701 ms |
+
+Both lower-register variants reach the better tier and are substantially slower. The
+method anticipates exactly this: "a higher modeled tier earns a benchmark experiment
+rather than proving a performance win", and its non-evidence table lists "the candidate
+uses fewer registers or has higher modeled occupancy" as an observation that cannot
+select a winner. The suggestion is a hypothesis, and for this kernel the experiment has
+been run.
+
+So the compiler and the counters agree on what is *not* the limit (compute, DRAM
+traffic, issued bytes, register count as such), and the load-only proxy says what is
+(the memory path, at 95%). The one untested mechanism that changes the memory path
+itself -- transaction shape, via LDS staging with wide coalesced fills -- remains the
+next experiment, with the probe as its hard target: 1.727 ms down to about 1.35 ms.
