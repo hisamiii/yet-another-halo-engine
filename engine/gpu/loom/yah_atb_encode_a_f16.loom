@@ -1,0 +1,174 @@
+// YAH ATB A-operand encoder, Loom port of AtbEncodeAKernel.
+//
+// HIP source: models/qwen/hip/kernels/prefill_fp16.hip. Packs fp16 activations
+// [rows, k] into the bfp16 A L1 layout the NPU reads: L1 tiles of (128, 64) with the
+// k tile varying fastest, shuffled into 2x1 vertically stacked 8x8 row-major
+// super-blocks, and one shared exponent per 8 consecutive elements:
+//
+//   g = group index; tile = g/1024; gt = g%1024
+//   l1r = tile/l1_cols; l1c = tile%l1_cols
+//   rib = gt%8; t1 = gt/8; bis = t1%2; t2 = t1/2; sbc = t2%8; si = t2/8
+//   r = (2*si+bis)*8 + rib; row = l1r*128 + r
+//   value[0..8) = fp16 a[row*k + l1c*64 + sbc*8 .. +8]
+//   exponent = frexpf(amax); dst[0] = exponent + 126
+//   step = ldexpf(1, exponent-7)
+//   dst[1+i] = int8(floor(value[i]/step + 0.5))
+//
+// Every division in the index math is a power of two and is done with i32 shifts
+// and masks; only the l1_cols remainder and the row*k product stay real index ops.
+// frexpf and ldexpf have no target-low contract, so the port derives both from the
+// fp32 bits: the frexp exponent is `field - 126`, and `2^(exponent-7)` has exponent
+// field `field - 6`. dst[0] is therefore just the fp32 exponent field of amax.
+//
+// Required config: --config=yah_atb_encode_a.k=64 --config=yah_atb_encode_a.l1_cols=1
+//                  --config=yah_atb_encode_a.groups=1024 --config=yah_atb_encode_a.a_elems=8192
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_atb_encode_a.k : %value: index where [range(%value, 16, 65536)]
+
+config.decl @yah_atb_encode_a.l1_cols : %value: index where [range(%value, 1, 65536)]
+
+config.decl @yah_atb_encode_a.groups : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_atb_encode_a.a_elems : %value: index where [range(%value, 1, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_atb_encode_a() {
+  %unit = index.constant 1 : index
+  %groups = config.get @yah_atb_encode_a.groups : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %groups, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index
+} launch(%a: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c9 = index.constant 9 : index
+  %c256 = index.constant 256 : index
+  %c0i = scalar.constant 0 : i32
+  %c0i8 = scalar.constant 0 : i8
+  %c1i = scalar.constant 1 : i32
+  %c3i = scalar.constant 3 : i32
+  %c6i = scalar.constant 6 : i32
+  %c7i = scalar.constant 7 : i32
+  %c10i = scalar.constant 10 : i32
+  %c1023i = scalar.constant 1023 : i32
+  %c23i = scalar.constant 23 : i32
+  %c255i = scalar.constant 255 : i32
+  %cone28i = scalar.constant 128 : i32
+  %c64i = scalar.constant 64 : i32
+  %zero = scalar.constant 0.0 : f32
+  %half = scalar.constant 0.5 : f32
+  %k = config.get @yah_atb_encode_a.k : index
+  %l1_cols = config.get @yah_atb_encode_a.l1_cols : index
+  %groups = config.get @yah_atb_encode_a.groups : index
+  %a_elems = config.get @yah_atb_encode_a.a_elems : index
+  %out_bytes = index.mul %groups, %c9 : index
+  %k_i = index.cast %k : index to i32
+  %l1_cols_i = index.cast %l1_cols : index to i32
+  %a_na, %out_na = buffer.assume.noalias %a, %out : buffer, buffer
+  %a_view = buffer.view %a_na[%base] : buffer -> view<[%a_elems]xf16>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%out_bytes]xi8>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %g = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %g, %groups : index
+  %sink = scf.if %in_range -> (index) {
+    %g_i = index.cast %g : index to i32
+    %tile_i = scalar.shrui %g_i, %c10i : i32
+    %gt_i = scalar.andi %g_i, %c1023i : i32
+    %l1c_i = scalar.remsi %tile_i, %l1_cols_i : i32
+    %l1r_i = scalar.divsi %tile_i, %l1_cols_i : i32
+    %rib_i = scalar.andi %gt_i, %c7i : i32
+    %t1_i = scalar.shrui %gt_i, %c3i : i32
+    %bis_i = scalar.andi %t1_i, %c1i : i32
+    %t2_i = scalar.shrui %t1_i, %c1i : i32
+    %sbc_i = scalar.andi %t2_i, %c7i : i32
+    %si_i = scalar.shrui %t2_i, %c3i : i32
+    %si2_i = scalar.shli %si_i, %c1i : i32
+    %sibis_i = scalar.addi %si2_i, %bis_i : i32
+    %sibis8_i = scalar.shli %sibis_i, %c3i : i32
+    %r_i = scalar.addi %sibis8_i, %rib_i : i32
+    %l1r128_i = scalar.shli %l1r_i, %c7i : i32
+    %row_i = scalar.addi %l1r128_i, %r_i : i32
+    %rowk_i = scalar.muli %row_i, %k_i : i32
+    %l1c64_i = scalar.muli %l1c_i, %c64i : i32
+    %sbc8_i = scalar.shli %sbc_i, %c3i : i32
+    %l1c_sbc_i = scalar.addi %l1c64_i, %sbc8_i : i32
+    %src_i = scalar.addi %rowk_i, %l1c_sbc_i : i32
+    %src = index.cast %src_i : i32 to index
+    // First pass: max |value| over the 8 elements.
+    %amax = scf.for %i = [%c0 to %c8 step %c1](%m = %zero : f32) -> (f32) {
+      %e = index.add %src, %i : index
+      %h = view.load %a_view[%e] : view<[%a_elems]xf16> -> f16
+      %v = scalar.extf %h : f16 to f32
+      %mag = scalar.absf %v : f32
+      %bigger = scalar.cmpf ogt, %mag, %m : f32
+      %next = scf.if %bigger -> (f32) {
+        scf.yield %mag : f32
+      } else {
+        scf.yield %m : f32
+      }
+      scf.yield %next : f32
+    }
+    %g9 = index.mul %g, %c9 : index
+    %is_zero = scalar.cmpf oeq, %amax, %zero : f32
+    %result = scf.if %is_zero -> (index) {
+      %zero_loop = scf.for %z = [%c0 to %c9 step %c1](%mark = %c0 : index) -> (index) {
+        %zi = index.add %g9, %z : index
+        view.store %c0i8, %out_view[%zi] : i8, view<[%out_bytes]xi8>
+        scf.yield %mark : index
+      }
+      scf.yield %zero_loop : index
+    } else {
+      %bits = scalar.bitcast %amax : f32 to i32
+      %shifted = scalar.shrui %bits, %c23i : i32
+      %field = scalar.andi %shifted, %c255i : i32
+      %field8 = scalar.trunci %field : i32 to i8
+      view.store %field8, %out_view[%g9] : i8, view<[%out_bytes]xi8>
+      %step_field = scalar.subi %field, %c6i : i32
+      %step_bits = scalar.shli %step_field, %c23i : i32
+      %step = scalar.bitcast %step_bits : i32 to f32
+      %write_loop = scf.for %j = [%c0 to %c8 step %c1](%mark2 = %c0 : index) -> (index) {
+        %ej = index.add %src, %j : index
+        %hj = view.load %a_view[%ej] : view<[%a_elems]xf16> -> f16
+        %vj = scalar.extf %hj : f16 to f32
+        %ratio = scalar.divf %vj, %step : f32
+        %biased_v = scalar.addf %ratio, %half : f32
+        %floored = scalar.floorf %biased_v : f32
+        %iv = scalar.fptosi %floored : f32 to i32
+        %iv8 = scalar.trunci %iv : i32 to i8
+        %jp1 = index.add %j, %c1 : index
+        %dst = index.add %g9, %jp1 : index
+        view.store %iv8, %out_view[%dst] : i8, view<[%out_bytes]xi8>
+        scf.yield %mark2 : index
+      }
+      scf.yield %write_loop : index
+    }
+    scf.yield %result : index
+  } else {
+    scf.yield %c0 : index
+  }
+  kernel.return
+}
+
+// Requires --config=yah_atb_encode_a.k=64, .l1_cols=1, .groups=1024, .a_elems=8192.
+//
+// One L1 tile: 128 rows of 64 fp16 activations, values 0..8191 as fp16, split into
+// 1024 9-byte groups. The group values differ, so the exponent and the eight codes
+// exercise the row/r/column gather, not just the output stride. Both the fp16 input
+// and the byte output are fixtures; the input is a fixture because the f16 rounding
+// of 2048..8191 has to match numpy exactly.
+check.case public @yah_atb_encode_a_case {
+  %a = check.file.read.npy path("fixtures/atb_encode_a/a.npy") : tensor<8192xf16>
+  %out = check.generate.fill value(0) : tensor<9216xi8>
+  %expected = check.file.read.npy path("fixtures/atb_encode_a/expected_bytes.npy") : tensor<9216xi8>
+  kernel.launch @yah_atb_encode_a(%a, %out) : (tensor<8192xf16>, tensor<9216xi8>)
+  check.expect.equal actual(%out) expected(%expected) : tensor<9216xi8>
+  check.return
+}
+
+check.benchmark<@yah_atb_encode_a_case> @yah_atb_encode_a_bench
