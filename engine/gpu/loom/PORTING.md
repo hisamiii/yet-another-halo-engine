@@ -36,7 +36,7 @@ explicitly deferred.
 | yah_ssm_conv_f32.loom | ssm_recurrence.hip | causal SSM convolution + gate | ported, 0.0148 ms at 4x16; fixture + 1e-6 tolerance |
 | yah_ssm_postnorm_gate_f32.loom | batched_ssm.hip | SSM post-norm + gate epilogue | ported, 0.0173 ms at 2x2x128; fixture + 1e-6 tolerance |
 | yah_deltanet_prep_ab_f32.loom | ssm_row_split.hip | DeltaNet alpha/beta prep + conv history advance | ported, 0.0087 ms; ab within 1e-5, history exact |
-| - | ssm_row_split.hip | BatchedSSMPostNormGateFp16Kernel | todo |
+| yah_ssm_postnorm_gate_f16.loom | ssm_row_split.hip | fp16 SSM post-norm + gate epilogue | ported, 0.0079 ms at 3 heads; fixture + 1e-6 tolerance |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
 | - | qkv.hip | QKV projection | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
@@ -54,12 +54,12 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 18 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 24 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
 | --- | --- | --- |
-| DeltaNet / SSM (5.1%) | ssm_row_split.hip | BatchedDeltaNetRowSplitKernel -- **ported**; BatchedDeltaNetPrepAlphaBetaKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel, BatchedSSMPostNormGateFp16Kernel |
+| DeltaNet / SSM (5.1%) | ssm_row_split.hip | all five kernels **ported** (row split, prep alpha/beta, prep K/Q, conv, post-norm gate fp32 + fp16). The 5.1% prefill block is now covered end to end. |
 | DeltaNet / SSM | ssm_recurrence.hip | BatchedDeltaNetRecurrenceKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel |
 | DeltaNet / SSM | batched_ssm.hip, ssm.hip, ssm_decode_recurrence.hip | BatchedSSMPostNormGateKernel, FusedSSMInputProjectionsKernel, SSMConvKernel, CaptureBatchedSsmReplayKernel |
 | attention (2.1%) | attention_wmma.hip | PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel |
@@ -164,6 +164,10 @@ profile gives one, so the expensive paths move first rather than the convenient 
   requirement through. `scalar.softplusf` and `scalar.logisticf` exist but expand
   to `exp2`/`log2` recipes that then need fast-math propagation the source op does
   not give them, so the explicit form is the one that compiles today.
+- **`index.assume` needs a predicate list.** `index.assume %v : index` fails to
+  parse (`unexpected token ':'`); it is `index.assume %v [range(%v, 0, 3)] : index`.
+  Prefer removing the need for the assume over writing one, since the footprint
+  analysis does not consume it anyway.
 - **`scalar.sitofp` rejects `index`.** Cast first:
   `%i = index.cast %n : index to i32` then `%f = scalar.sitofp %i : i32 to f32`.
   The failure is `TYPE/003: operand 'input' has type index, expected integer`.

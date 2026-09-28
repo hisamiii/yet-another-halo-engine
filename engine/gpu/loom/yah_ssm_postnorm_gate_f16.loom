@@ -1,0 +1,122 @@
+// YAH fp16 SSM post-normalization + gate epilogue,
+// Loom port of BatchedSSMPostNormGateFp16Kernel.
+//
+// HIP source: models/qwen/hip/kernels/ssm_row_split.hip. Same arithmetic as the
+// fp32 epilogue but the heads are flat (token * num_heads + head) and the result is
+// written directly as fp16, which is what the SSM output consumer wants:
+//
+//   sum = sum_i raw[head*128 + i]^2
+//   inv = 1 / sqrt(sum/128 + 1e-6)
+//   out[head*128 + i] = f16((raw[i] * inv) * weight[i] * (g * sigmoid(g)))
+//
+// One subgroup per head, eight heads per workgroup, exactly the HIP geometry. Each
+// lane carries four values at stride 32; the four squared magnitudes are summed
+// into one partial and reduced once with `kernel.subgroup.reduce<addf>`, which is
+// the same total as the HIP kernel's four separate butterflies followed by a sum.
+//
+// The HIP kernel ends with an empty asm barrier that forces the f32 result to be
+// materialized before the fp16 conversion. That barrier only pins the floating-point
+// rounding at the source level and has no arithmetic effect, so the port stores the
+// same f32 value without it.
+//
+// The output is transcendental and rounds to fp16, so the expectation is the
+// generated fixture compared with a tolerance.
+//
+// Required config: --config=yah_ssm_postnorm_fp16.head_count=3
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_ssm_postnorm_fp16.head_count : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_ssm_postnorm_fp16() {
+  %unit = index.constant 1 : index
+  %head_count = config.get @yah_ssm_postnorm_fp16.head_count : index
+  %heads_per_workgroup = index.constant 8 : index
+  %workgroup_size = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased0 = index.add %head_count, %c255 : index
+  %tiles0 = index.div %biased0, %workgroup_size : index
+  %c7 = index.constant 7 : index
+  %biased1 = index.add %head_count, %c7 : index
+  %tiles = index.div %biased1, %heads_per_workgroup : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%raw: buffer, %weight: buffer, %gate: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %negone = scalar.constant -1.0 : f32
+  %epsilon = scalar.constant 0.000001 : f32
+  %inv_dim = scalar.constant 0.0078125 : f32
+  %head_count = config.get @yah_ssm_postnorm_fp16.head_count : index
+  %io_total = index.mul %head_count, %c128 : index
+  %raw_na, %weight_na, %gate_na, %out_na = buffer.assume.noalias %raw, %weight, %gate, %out : buffer, buffer, buffer, buffer
+  %raw_view = buffer.view %raw_na[%base] : buffer -> view<[%io_total]xf32>
+  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%io_total]xf32>
+  %weight_view = buffer.view %weight_na[%base] : buffer -> view<[%c128]xf32>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%io_total]xf16>
+  %tid = kernel.workitem.id<x> : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = index.rem %tid, %c32 : index
+  %subgroup = index.div %tid, %c32 : index
+  %wg_heads = index.mul %wg, %c4 : index
+  %double_heads = index.add %wg_heads, %wg_heads : index
+  %head0 = index.add %double_heads, %subgroup : index
+  %head = index.add %head0, %c0 : index
+  %in_range = index.cmp ult, %head, %head_count : index
+  scf.if %in_range {
+    %head_base = index.mul %head, %c128 : index
+    %partial = scf.for %j = [%c0 to %c4 step %c1](%acc = %zero : f32) -> (f32) {
+      %stride = index.mul %j, %c32 : index
+      %column0 = index.add %lane, %stride : index
+      %off = index.add %head_base, %column0 : index
+      %v = view.load %raw_view[%off] : view<[%io_total]xf32> -> f32
+      %sq = scalar.mulf %v, %v : f32
+      %sum = scalar.addf %acc, %sq : f32
+      scf.yield %sum : f32
+    }
+    %total = kernel.subgroup.reduce<addf> %partial : f32
+    %scaled = scalar.mulf %total, %inv_dim : f32
+    %shifted = scalar.addf %scaled, %epsilon : f32
+    %root = scalar.sqrtf %shifted : f32
+    %inv = scalar.divf %one, %root : f32
+    %sink = scf.for %k = [%c0 to %c4 step %c1](%mark = %zero : f32) -> (f32) {
+      %stride2 = index.mul %k, %c32 : index
+      %column = index.add %lane, %stride2 : index
+      %off2 = index.add %head_base, %column : index
+      %v2 = view.load %raw_view[%off2] : view<[%io_total]xf32> -> f32
+      %w = view.load %weight_view[%column] : view<[%c128]xf32> -> f32
+      %normed = scalar.mulf %v2, %inv : f32
+      %weighted = scalar.mulf %normed, %w : f32
+      %g = view.load %gate_view[%off2] : view<[%io_total]xf32> -> f32
+      %negative = scalar.mulf %g, %negone : f32
+      %exponential = scalar.expf<afn> %negative : f32
+      %denominator = scalar.addf %one, %exponential : f32
+      %sigmoid = scalar.divf %one, %denominator : f32
+      %gated = scalar.mulf %g, %sigmoid : f32
+      %result = scalar.mulf %weighted, %gated : f32
+      %half = scalar.fptrunc %result : f32 to f16
+      view.store %half, %out_view[%off2] : f16, view<[%io_total]xf16>
+      scf.yield %mark : f32
+    }
+  }
+  kernel.return
+}
+
+// Requires --config=yah_ssm_postnorm_fp16.head_count=3.
+check.case public @yah_ssm_postnorm_fp16_case {
+  %raw = check.file.read.npy path("fixtures/ssm_postnorm_fp16/input_raw.npy") : tensor<384xf32>
+  %weight = check.file.read.npy path("fixtures/ssm_postnorm_fp16/input_weight.npy") : tensor<128xf32>
+  %gate = check.file.read.npy path("fixtures/ssm_postnorm_fp16/input_gate.npy") : tensor<384xf32>
+  %expected = check.file.read.npy path("fixtures/ssm_postnorm_fp16/expected_out.npy") : tensor<384xf16>
+  %out = check.generate.fill value(0.0) : tensor<384xf16>
+  kernel.launch @yah_ssm_postnorm_fp16(%raw, %weight, %gate, %out) : (tensor<384xf32>, tensor<128xf32>, tensor<384xf32>, tensor<384xf16>)
+  check.expect.close actual(%out) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<384xf16>
+  check.return
+}
+
+check.benchmark<@yah_ssm_postnorm_fp16_case> @yah_ssm_postnorm_fp16_bench
