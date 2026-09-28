@@ -216,3 +216,48 @@ kernel at our production shape and see whether retuning closes the gap. The user
 read that it "just needs retuning" is the right shape of hypothesis -- the sample
 is a language demo, not a tuned kernel -- but the deficit to close is 4.5x, and
 both sides already ran on the same runtime.
+
+### The GPU experiment requires authoring the kernel: Loom has no dense prefill GEMM
+
+Searching every Loom corpus, the runnable kernels are all small or non-dense, and
+the prefill-class ones cannot be executed:
+
+| corpus | contents | runnable |
+| --- | --- | --- |
+| `authoring/` | mlp **GEMV** (one input row, K=18944), ffn q6q8 **31 tokens**, routed **MoE** | yes |
+| `authoring/hip/` | **GEMM primitives**: shared-memory tiles, q8 load widths, packed fields, cluster multicast | yes |
+| `checked_benchmarks/` | paged attention, online softmax, MoE routing | yes |
+| `binding/c/benchmark/kernels/` | Q4_K MoE + `prefill_f16_wmma_amdgpu` | **compile-only fixtures** |
+
+`prefill_f16_wmma_amdgpu.loom` is a genuine tiled causal attention prefill kernel
+(WMMA, four-wave workgroups, LDS staging, online softmax) but carries **zero
+`check.benchmark` rows** -- it exists to time the compiler, and its own header says
+the execution corpus lives in a separate module. The dense GEMM we would want to
+compare against does not exist in the tree at all.
+
+The runnable GEMM primitives do work on the device, but they are microbenchmarks,
+not throughput evidence:
+
+```
+shared_memory_vector_tile roundtrip   0.0064 ms   correctness pass
+q8_load_width                         0.0066 ms   correctness pass
+template_math_legalization            0.0084 ms   correctness pass
+cluster_b128_multicast                FAILED: "selected amdgpu HAL device has no
+                                      Loom-supported native target"
+```
+
+That last one is a real capability gap worth knowing: RDNA has no clusters, so
+Loom's cluster/multicast path does not apply to gfx1151.
+
+**So the experiment cannot be run by configuration.** Comparing a Loom GEMM at our
+production shape (Q4_K, 2048 x 5120 -> 17408) against our 41 TFLOP/s means
+authoring that GEMM in Loom first -- the comparable artifacts in the tree are
+300-450 lines of dense Loom IR (`routed_gate_up_swiglu_q4k_q8_amdgpu.loom` at 303,
+`prefill_f16_wmma_amdgpu.loom` at 448), so it is a multi-day authoring task on an
+early-stage compiler, not a benchmark run.
+
+Given that, the ordering argument is: **the NPU half has an exact device profile and
+a working runtime behind it, and the GPU half has no asset at all today.** If the
+point of adopting Loom is the NPU -- and that is where the evidence is -- the NPU
+path is the cheaper thing to prove end to end, and it simultaneously teaches the
+language and the toolchain that the GPU GEMM would need anyway.
