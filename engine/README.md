@@ -63,3 +63,56 @@ batching, and memory pools. Reaching it is **not** a re-link —
 by the Loom/MLIR/TileLang path, which is the same path the NPU work requires. HIP
 graph capture *is* implemented by HRX and maps onto its native graph, but it is
 worth ~0.02% of prefill: dispatch is not a lever on this part.
+
+## Kernel authoring: Loom
+
+Loom is the compile path that HRX's native API consumes, and it is functional on
+this box for the AMDGPU target. Its mandate is the thing we are short of — "the
+performance of its emitted programs: outperform tuned HIP and hand-authored
+assembly on AMD GPUs and AIE on XDNA" — and it targets both halves:
+`LOOM_TARGET_AMDGPU=ON` and `LOOM_TARGET_XDNA=ON` are both set in our CMake
+build. Loom is configured by our existing HRX build; the tools came in with it.
+
+Tools (no extra build needed, they land with `build_gpu.sh`/`cmake --build`):
+
+```
+build/cmake/loom/src/loom/tools/{loom-compile,loom-check,loom-link}
+build/cmake/loom/src/loom/tools/iree-benchmark-loom/iree-benchmark-loom
+build/cmake/loom/src/loom/tools/iree-run-loom/iree-run-loom
+```
+
+Authoring corpus, which already contains shapes close to ours
+(`mlp_down_projection_residual_bf16.loom`, `ffn_gate_up_swiglu_q6q8.loom`):
+
+```
+cd /home/q/hrx && source engine/hrx-env.sh
+
+# plan only, no GPU needed
+iree-benchmark-loom loom/src/loom/test/corpus/authoring/mlp_down_projection_residual_bf16.loom \
+  --dry-run --config=mlp_down_projection_residual_bf16.row_capacity=3584
+
+# compile to AMDGPU and dispatch through HRX's amdgpu HAL
+iree-benchmark-loom loom/src/loom/test/corpus/authoring/mlp_down_projection_residual_bf16.loom \
+  --config=mlp_down_projection_residual_bf16.row_capacity=3584 --device=amdgpu \
+  --measure=dispatch_complete --iterations=1 --warmup-iterations=0 --batch-size=1 \
+  --min-time-ms=0 --max-batches=1 --input-ring-count=1
+```
+
+Verified on gfx1151: the dry run plans 1 case / 3 benchmarks; the GPU run lowers to
+`amdgpu-rdna3-5` / snapshot `amdgpu-rdna3-5-low` / config `amdgpu.rdna3_5.core` at
+subgroup 32, selects real packets (`global_load_b128_saddr`, `global_store_b32_saddr`,
+`v_mul_f32`, `s_lshl_b32`, `workgroup_reduce.publication.lds`), dispatches, and
+reports all 4 benchmarks `state: ok` with exit 0. It also emits a full report —
+static and dynamic instruction mix, memory roots with byte envelopes, and per-source-op
+lowering selections — which is the "keep source facts, target facts and performance
+evidence in one system" claim, and is more visibility than the HIP path gives us.
+
+### Why this is the right next move
+
+The HIP surface is exhausted: dispatch, graphs, cooperative launch and persistent
+kernels all measured to ~0, and the remaining kernel deficits are shape problems
+that our hand-written HIP cannot express (the DeltaNet recurrence is a rank-128
+matvec with a per-token cross-lane reduction, and it needs to become chunked
+matmuls). Loom is a compiler whose stated purpose is beating tuned HIP, it can
+express that restructuring, and the same source path targets the NPU — so the
+kernel work and the NPU work stop being two projects.
