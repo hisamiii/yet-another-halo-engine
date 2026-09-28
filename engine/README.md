@@ -414,3 +414,42 @@ either a multi-wave workgroup with LDS staging to raise achieved bandwidth, or t
 production w4a16 format, where the weights shrink about 3.5x and the whole balance
 changes. The f16 kernel has served its purpose, which was to establish that Loom can
 express this kernel and to find where the time actually goes.
+
+### Instruction count is not the limit, and the schedule space is exhausted
+
+The v3 compile report shows a suspicious instruction mix per work-item: 12,823
+register moves against 1,280 WMMA, i.e. ten moves per matrix op, making moves 45%
+of all instructions. The Loom loop-schedule guide predicts exactly this shape and
+prescribes the fix -- `unroll(%factor) schedule(recurrence)` should give allocation a
+larger repeating body with a copy-free steady backedge, and its gfx1151 example finds
+depth three / factor four. v3 had only been swept at unroll two.
+
+| schedule | vector VGPR | register moves | moves/WMMA | time |
+| --- | ---: | ---: | ---: | ---: |
+| d3 u1 | 160 | 25,543 | 19.96 | 2.347 ms |
+| d3 u2 | 200 | 12,823 | 10.02 | **1.819 ms** |
+| d3 u4 | 200 | 271 | **0.21** | 1.821 ms |
+| d2 u4 | 200 | 191 | 0.15 | 1.922 ms |
+
+Depth three / factor four does exactly what was predicted -- register moves fall by
+98%, to a near-copy-free backedge -- and the kernel is **no faster**: 1.821 ms against
+1.819 ms. So the register moves are a symptom of register pressure, not a cost, and
+the kernel is not issue-bound at all. That is consistent with the issue budget:
+roughly 28k instructions per warp across 1088 warps is about 7% of what four SIMD
+units per CU could retire in 1.82 ms.
+
+With that, three directions are closed on this kernel and only one is left open:
+
+- **DRAM traffic** is at its floor. Counters (see docs/hrx-evaluation.md) put DRAM
+  reads at 157.7 MB against a 178.3 MB weight tensor, so the weights stream once and
+  the activation re-reads are entirely L2-served.
+- **Issue / instruction count** is not the limit, as the table above shows directly.
+- **Tile shape** is exhausted, and every reshape that raises reuse raises DRAM weight
+  traffic in exchange for L2 traffic that is already free.
+- **Open: operand delivery.** The kernel stalls on memory latency with a register-
+  limited residency, and pipeline depth saturates at three. Raising in-flight bytes
+  further requires moving the operand queue out of registers and into shared memory
+  in a multi-wave workgroup -- wide coalesced global loads into LDS, MMAs reading
+  LDS, with several warps sharing one staged activation tile. That is the one
+  structural change left, it is a rewrite rather than a tweak, and the v4/v6 results
+  are a warning that the register/occupancy tradeoff around here is tight.
