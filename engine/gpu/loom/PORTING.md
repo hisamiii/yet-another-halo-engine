@@ -46,6 +46,33 @@ explicitly deferred.
 | yah_hadamard_f16.loom | engine/kv/kv_quant.hip | in-place Hadamard over an fp16 KV block | ported, 0.0222 ms at rows=1 |
 | - | vision/encoder.hip, device_input.hip | vision tower | todo |
 
+## Remaining inventory
+
+From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
+100 kernels; 18 are ported. Ordered by share of prefill time where the model-level
+profile gives one, so the expensive paths move first rather than the convenient ones.
+
+| Area | File | Kernels |
+| --- | --- | --- |
+| DeltaNet / SSM (5.1%) | ssm_row_split.hip | BatchedDeltaNetRowSplitKernel, BatchedDeltaNetPrepAlphaBetaKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel, BatchedSSMPostNormGateFp16Kernel |
+| DeltaNet / SSM | ssm_recurrence.hip | BatchedDeltaNetRecurrenceKernel, BatchedSSMConvKernel, BatchedSSMPostNormGateKernel |
+| DeltaNet / SSM | batched_ssm.hip, ssm.hip, ssm_decode_recurrence.hip | BatchedSSMPostNormGateKernel, FusedSSMInputProjectionsKernel, SSMConvKernel, CaptureBatchedSsmReplayKernel |
+| attention (2.1%) | attention_wmma.hip | PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel |
+| attention | attention_batched.hip | BatchedAttentionKernel, CausalSoftmaxKernel, WriteBatchedKVCacheKernel, ApplyAttentionGateKernel |
+| attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | tiled, decode-online, split-K, and KV-write variants |
+| QKV projection | qkv.hip | FusedQKVProjectionsKernel |
+| fused RoPE | prefill_rope.hip | BatchedFusedQKNormRoPEKvWriteKernel, BatchedRoPEKernel |
+| fused.hip | fused.hip | FusedQKNormRoPEKvWriteKernel |
+| dequant to bf16 | prefill_gemm.hip | Q4_K/Q5_K/Q6_K/Q8_0/Q8_1 and elementwise dequant, FloatToBfloat16Kernel |
+| W8A8 + fused quant | prefill_quant_gemm.hip | W8A8BlockedWmmaGEMMKernel, QuantizeActivationToQ8_1Kernel, RequantizeActivationInt4Kernel, and three fused RMSNorm/SwiGLU/SSM-norm quantize kernels, ZeroQ8ActTailKernel, BatchedQuantGEMVKernel |
+| f16 conversion set | prefill_fp16.hip | AtbEncodeA/DecodeC/SwiGLU, AtbRepack(+Slice), AtbAddHeadFp32, AtbExpandHeadFp16, HalfCast, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16 |
+| GEMV (1.5%) | gemv.hip, gemv_quant.hip | FastGEMVBlockKernel, and the quantized variant |
+| sampling | sample.hip | 13 more kernels: batched argmax, sparse penalties, linear/sorted sampling, and the speculative segment set |
+| vision | vision/encoder.hip, vision/device_input.hip | Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, BiasResidual, Activate, Finish, InjectRows |
+| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | the Ptr and decode-side variants |
+| dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
+| benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
+
 ## Notes carried over from the FFN GEMM port
 
 - `--measure=auto` selects `case_end_to_end` for a `check.case`. Kernel time needs
