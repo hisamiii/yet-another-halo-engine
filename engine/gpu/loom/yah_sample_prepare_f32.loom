@@ -1,0 +1,95 @@
+// YAH sampling preparation, Loom port of PrepareSamplingKernel.
+//
+// HIP source: models/qwen/hip/kernels/sample.hip. A flat elementwise pass that
+// replaces every non-finite logit with -infinity and fills an identity token map:
+//
+//   adjusted[i]  = isfinite(logits[i]) ? logits[i] : -INFINITY
+//   token_ids[i] = i
+//
+// `scalar.isfinitef` has no AMDGPU target-low contract, so finiteness is a single
+// magnitude comparison against FLT_MAX, which is the substitution PORTING.md
+// already records for this operation.
+//
+// Two cases, because one is not enough to test what the kernel is for. An iota input
+// is entirely finite, so the output is the same iota and the ids are the index --
+// exact, no fixture. A fill of 3.5e38 overflows fp32 to +infinity, so every output
+// must be -infinity; that is checked against a fixture with `check.expect.equal`, not
+// `close`, because the tolerance formula is undefined at infinities. A port that
+// ignored the finiteness test would pass the first case and fail the second.
+//
+// Required config: --config=yah_sample_prepare.vocab=8
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_sample_prepare.vocab : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_sample_prepare() {
+  %unit = index.constant 1 : index
+  %vocab = config.get @yah_sample_prepare.vocab : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %vocab, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%logits: buffer, %adjusted: buffer, %token_ids: buffer) {
+  %base = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %vocab = config.get @yah_sample_prepare.vocab : index
+  %limit = scalar.constant 3.4028234663852886e+38 : f32
+  %neg_infinite = scalar.constant -4.0e+38 : f32
+  %logits_na, %adjusted_na, %ids_na = buffer.assume.noalias %logits, %adjusted, %token_ids : buffer, buffer, buffer
+  %logits_view = buffer.view %logits_na[%base] : buffer -> view<[%vocab]xf32>
+  %adjusted_view = buffer.view %adjusted_na[%base] : buffer -> view<[%vocab]xf32>
+  %ids_view = buffer.view %ids_na[%base] : buffer -> view<[%vocab]xi32>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %index = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %index, %vocab : index
+  scf.if %in_range {
+    %value = view.load %logits_view[%index] : view<[%vocab]xf32> -> f32
+    %magnitude = scalar.absf %value : f32
+    %finite = scalar.cmpf ole, %magnitude, %limit : f32
+    %result = scf.if %finite -> (f32) {
+      scf.yield %value : f32
+    } else {
+      scf.yield %neg_infinite : f32
+    }
+    %id = index.cast %index : index to i32
+    view.store %result, %adjusted_view[%index] : f32, view<[%vocab]xf32>
+    view.store %id, %ids_view[%index] : i32, view<[%vocab]xi32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_sample_prepare.vocab=8.
+//
+// Finite path: an iota comes back unchanged and the ids are the index.
+check.case public @yah_sample_prepare_finite {
+  %logits = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %adjusted = check.generate.fill value(0.0) : tensor<8xf32>
+  %ids = check.generate.fill value(0) : tensor<8xi32>
+  %expected_adjusted = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %expected_ids = check.generate.iota offset(0) step(1) : tensor<8xi32>
+  kernel.launch @yah_sample_prepare(%logits, %adjusted, %ids) : (tensor<8xf32>, tensor<8xf32>, tensor<8xi32>)
+  check.expect.close actual(%adjusted) expected(%expected_adjusted) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.expect.equal actual(%ids) expected(%expected_ids) : tensor<8xi32>
+  check.return
+}
+
+check.benchmark<@yah_sample_prepare_finite> @yah_sample_prepare_finite_bench
+
+// Requires --config=yah_sample_prepare.vocab=8.
+//
+// Non-finite path: 3.5e38 overflows fp32 to +infinity, so every output is -infinity.
+check.case public @yah_sample_prepare_infinite {
+  %logits = check.generate.fill value(3.5e+38) : tensor<8xf32>
+  %adjusted = check.generate.fill value(0.0) : tensor<8xf32>
+  %ids = check.generate.fill value(0) : tensor<8xi32>
+  %expected_adjusted = check.file.read.npy path("fixtures/sample_prepare/expected_neg_inf.npy") : tensor<8xf32>
+  kernel.launch @yah_sample_prepare(%logits, %adjusted, %ids) : (tensor<8xf32>, tensor<8xf32>, tensor<8xi32>)
+  check.expect.equal actual(%adjusted) expected(%expected_adjusted) : tensor<8xf32>
+  check.return
+}
+
+check.benchmark<@yah_sample_prepare_infinite> @yah_sample_prepare_infinite_bench

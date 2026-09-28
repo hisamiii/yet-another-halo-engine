@@ -77,12 +77,13 @@ explicitly deferred.
 | yah_gemv_f32.loom | gemv.hip | decode GEMV, f32 weight path | ported, 0.0063 ms; exact, no fixture; bf16 path todo |
 | yah_rmsnorm_decode_f32.loom | norm.hip | decode RMSNorm (single row) | ported, 0.0065 ms; exact, no fixture |
 | yah_perhead_rmsnorm_decode_f32.loom | norm.hip | decode per-head RMSNorm | ported, 0.0070 ms; exact, no fixture |
+| yah_sample_prepare_f32.loom | sample.hip | sampling prep (non-finite filter + token map) | ported, 0.0068/0.0073 ms; finite exact, non-finite fixture |
 | - | vision/encoder.hip, device_input.hip | vision tower: Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, InjectRows | todo |
 
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 52 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 53 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -100,7 +101,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | W8A8 + fused quant | prefill_quant_gemm.hip | W8A8BlockedWmmaGEMMKernel, QuantizeActivationToQ8_1Kernel, RequantizeActivationInt4Kernel, and three fused RMSNorm/SwiGLU/SSM-norm quantize kernels, ZeroQ8ActTailKernel, BatchedQuantGEMVKernel |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16. **todo**: AtbEncodeA, AtbDecodeC, AtbDecodeSwiGLU, AtbRepack(+Slice) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
-| sampling | sample.hip | 13 more kernels: batched argmax, sparse penalties, linear/sorted sampling, and the speculative segment set |
+| sampling | sample.hip | **ported**: PrepareSamplingKernel. **todo**: PrepareCandidateLogits, ApplySparsePenalties, batched argmax, linear/sorted sampling, the speculative segment set |
 | vision | vision/encoder.hip, vision/device_input.hip | **ported**: Finish, BiasResidual, LayerNorm, Softmax, AttentionRows, Patchify, InjectRows. **todo**: PatchPosition, QkvRope, Activate |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both). **todo**: RoPEPtr, EmbeddingLookupPtr, FastFusedSwiGLUGEMVBlockKernel |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
@@ -279,3 +280,11 @@ profile gives one, so the expensive paths move first rather than the convenient 
   trajectory from its history and keeps a production-shaped case exact for any
   batch. Use the small case to prove the state dependence and the large one to prove
   the port holds at scale.
+- **Infinity comes from an *overflowing* literal, not from the largest finite one.**
+  `scalar.constant 3.4028234663852886e+38 : f32` is FLT_MAX and stays finite;
+  `4.0e+38` overflows to +infinity and `-4.0e+38` to -infinity. The constant folder
+  turns the overflowing spelling into the infinity, and the check only catches the
+  mistake when it distinguishes finite from infinite, which is exactly what an
+  `isfinite` substitution does. `scalar.isfinitef` has no target-low contract, so
+  the source is `cmpf ole %|v|, 3.4028234663852886e+38`; a fill of the finite
+  maximum passes that test, a fill of `3.5e38` does not.
