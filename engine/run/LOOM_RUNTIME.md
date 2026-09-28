@@ -159,6 +159,24 @@ source engine/hrx-env.sh
 python3 engine/run/verify_loom_gemm.py <model.gguf> 2444240416 /tmp/loom_gemm_y.bin 5 5120 17408 0 1 2 3 100 3000 5119
 ```
 
+`engine/run/loom_head_probe.cc` runs the graph tail entirely on Loom through
+HRX: the output RMSNorm (`yah_rmsnorm`, eps 1e-6) on the final residual row, the
+Q4_K output GEMV (`yah_gemv_q4k`, K=5120, vocab 248320) on the real
+`output.weight`, and `yah_argmax`. The input is the final residual state dumped
+by the HIP engine via `YAH_DUMP_DIR` on the all-Q4_K `base_q4kpure.gguf` for the
+prompt `760 6511 314 9338 369`. Result: `argmax=11751`, identical to the HIP
+`yah-run` reference. This proves the Q4_K output projection, the norm and the
+argmax on real weights, plus multi-HAL load and chained dispatch through HRX.
+
+```
+python3 engine/gpu/loom/emit_hal.py engine/gpu/loom/yah_rmsnorm_f32.loom /tmp/emit_head yah_rmsnorm.rows=1 yah_rmsnorm.eps=1e-6
+python3 engine/gpu/loom/emit_hal.py engine/gpu/loom/yah_gemv_q4k_f32.loom /tmp/emit_head yah_gemv_q4k.m_rows=248320 yah_gemv_q4k.k_blocks=20
+python3 engine/gpu/loom/emit_hal.py engine/gpu/loom/yah_argmax_f32.loom /tmp/emit_head yah_argmax.vocab=248320
+g++ -std=c++20 -O2 -Iengine -I/home/q/hrx/libhrx/include engine/run/loom_head_probe.cc -o /tmp/loom_head_probe engine/build/libyah_core.a -L/home/q/hrx/build/cmake/libhrx/src/libhrx -lhrx -licuuc -lpthread
+source engine/hrx-env.sh
+/tmp/loom_head_probe <model.gguf> /tmp/emit_head/yah_rmsnorm_f32.hal /tmp/emit_head/yah_gemv_q4k_f32.hal /tmp/emit_head/yah_argmax_f32.hal /tmp/hipdump/layer_63.bin 5 /tmp/loom_logits.bin
+```
+
 ## 5. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape
