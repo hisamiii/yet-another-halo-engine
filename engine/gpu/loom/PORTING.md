@@ -30,7 +30,8 @@ explicitly deferred.
 | - | qkv.hip | QKV projection | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
-| - | engine/kv/kv_quant.hip | KV quantization | todo |
+| yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
+| - | engine/kv/kv_quant.hip | quantize/dequantize fp32 + fp16, q8/q4 blocks | todo |
 | - | vision/encoder.hip, device_input.hip | vision tower | todo |
 
 ## Notes carried over from the FFN GEMM port
