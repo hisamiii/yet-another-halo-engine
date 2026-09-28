@@ -73,7 +73,34 @@ and `LOOM PROBE PASS: out = 100 + 2*i for 8 elements`.
   metadata), `LoomBuffer`, and `LoomDevice::Config(...)`.
   `engine/run/loom_probe.cc` is now written against it and still passes.
 
-## 4. Remaining work
+## 4. Real-weight verification (GGUF mmap -> HRX -> Loom)
+
+`LoomDevice::Import` wraps `hrx_allocator_import_buffer`; the GGUF tensor-data
+mapping is imported once and each tensor is a `(offset, length)` binding into
+it, exactly like the HIP path rebases by a pointer delta. `LoomBuffer` usage
+must be `HRX_BUFFER_USAGE_DEFAULT` (the dispatch binding validation rejects a
+STORAGE_READ-only import).
+
+`engine/run/loom_gemv_probe.cc` opens the shard, imports a page-aligned window
+around `blk.64.ffn_gate.weight` (17408x5120, Q6_K), dispatches
+`yah_gemv_q6k` (m_rows=17408, k_blocks=20) through HRX with no HIP, and dumps
+`y`; `engine/run/verify_loom_gemv.py` decodes the same tensor in float64 and
+compares. Result: `max_abs 2.2e-07, max_rel 1.8e-06, PASS`.
+
+```
+engine/gpu/loom/emit_hal.sh yah_gemv_q6k_f32.loom yah_gemv_q6k_full_case \
+  yah_gemv_q6k_full_bench /tmp/emit_q6k yah_gemv_q6k.m_rows=17408 \
+  yah_gemv_q6k.k_blocks=20
+g++ -std=c++20 -O2 -Iengine -I/home/q/hrx/libhrx/include \
+  engine/run/loom_gemv_probe.cc -o /tmp/loom_gemv_probe \
+  engine/build/libyah_core.a -L/home/q/hrx/build/cmake/libhrx/src/libhrx \
+  -lhrx -licuuc -lpthread
+/tmp/loom_gemv_probe <model.gguf> <hal> blk.64.ffn_gate.weight /tmp/loom_y.bin
+python3 engine/run/verify_loom_gemv.py <model.gguf> blk.64.ffn_gate.weight \
+  15168895904 /tmp/loom_y.bin 16
+```
+
+## 5. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape
    (a build step; `iree-benchmark-loom` needs a case+benchmark per compile).

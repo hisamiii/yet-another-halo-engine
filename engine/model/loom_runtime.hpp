@@ -166,6 +166,23 @@ class LoomDevice {
     return buffer;
   }
 
+  // Import an external host pointer (e.g. a GGUF mmap window) as an HRX
+  // buffer. The caller must keep the mapping alive while the buffer is used.
+  [[nodiscard]] LoomBuffer Import(void* host_ptr, size_t bytes) {
+    LoomBuffer buffer;
+    buffer.size = bytes;
+    hrx_buffer_params_t params = {};
+    params.type = HRX_MEMORY_TYPE_DEVICE_VISIBLE;
+    params.access = HRX_MEMORY_ACCESS_READ;
+    params.usage = HRX_BUFFER_USAGE_DEFAULT;
+    params.queue_affinity = 0;
+    LoomCheck(hrx_allocator_import_buffer(hrx_device_allocator(device_),
+                                          params, host_ptr, bytes,
+                                          &buffer.handle),
+              "hrx_allocator_import_buffer");
+    return buffer;
+  }
+
   void H2D(const LoomBuffer& buffer, const void* host, size_t bytes,
            size_t offset = 0) {
     LoomCheck(hrx_synchronous_h2d(device_, host, buffer.handle, offset, bytes),
