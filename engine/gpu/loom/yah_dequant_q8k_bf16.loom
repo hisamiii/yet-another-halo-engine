@@ -1,0 +1,77 @@
+// YAH Q8_K weight dequantization to bf16, Loom port of DequantizeQ8KToBf16Kernel.
+//
+// HIP source: models/qwen/hip/kernels/prefill_gemm.hip. hipBLAS cannot consume
+// block_q8_K weights, so the prefill path dequantizes the weight region into a
+// bf16 scratch and runs the GEMM on that. Per 256-wide block:
+//
+//   block_q8_K = { float d; int8 qs[256]; int16 bsums[16]; }   (292 bytes)
+//   out[b*256 + j] = bf16(d * float(qs[b][j]))
+//
+// Only d and qs are read; the block sums are not touched. The HIP kernel packs 8
+// warps per block and gives one warp per 256-wide block with eight unrolled
+// rounds; this port gives each block its own one-warp workgroup and strides over
+// the 256 codes. Same values, different packing.
+//
+// The input is read through two views of the same buffer -- a f32 view for the
+// scale and an i8 view for the codes -- so neither is marked noalias. The layout
+// constants (256 elements, 292 bytes per block) are spelled out here and checked
+// against the static assertion in quant_ops.hpp.
+//
+// Required config: --config=yah_dequant_q8k.blocks=2
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_dequant_q8k.blocks : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_dequant_q8k() {
+  %unit = index.constant 1 : index
+  %blocks = config.get @yah_dequant_q8k.blocks : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%blocks, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%w: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c73 = index.constant 73 : index
+  %c256 = index.constant 256 : index
+  %c292 = index.constant 292 : index
+  %blocks = config.get @yah_dequant_q8k.blocks : index
+  %total = index.mul %blocks, %c256 : index
+  %bytes = index.mul %blocks, %c292 : index
+  %out_na = buffer.assume.noalias %out : buffer
+  %w_f32 = buffer.view %w[%base] : buffer -> view<[%blocks]x[%c73]xf32>
+  %w_i8 = buffer.view %w[%base] : buffer -> view<[%blocks]x[%c292]xi8>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%total]xbf16>
+  %block = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %d = view.load %w_f32[%block, %c0] : view<[%blocks]x[%c73]xf32> -> f32
+  %block_base = index.mul %block, %c256 : index
+  %code_base = index.add %c4, %c0 : index
+  %sink = scf.for %j = [%lane to %c256 step %c32](%mark = %c0 : index) -> (index) {
+    %code_col = index.add %code_base, %j : index
+    %code = view.load %w_i8[%block, %code_col] : view<[%blocks]x[%c292]xi8> -> i8
+    %code_f = scalar.sitofp %code : i8 to f32
+    %scaled = scalar.mulf %d, %code_f : f32
+    %narrow = scalar.fptrunc %scaled : f32 to bf16
+    %dst = index.add %block_base, %j : index
+    view.store %narrow, %out_view[%dst] : bf16, view<[%total]xbf16>
+    scf.yield %mark : index
+  }
+  kernel.return
+}
+
+// Requires --config=yah_dequant_q8k.blocks=2.
+//
+// Every block is scale 0.5 times the ramp -128..127, so the flat output is the
+// periodic ramp -64, -63.5, ... at period 256. The product is a multiple of 0.5
+// below 128 in magnitude, which bf16 holds exactly, so the comparison is exact.
+check.case public @yah_dequant_q8k_case {
+  %w = check.file.read.npy path("fixtures/dequant_q8k/input_q8k.npy") : tensor<584xi8>
+  %out = check.generate.fill value(0.0) : tensor<512xbf16>
+  %expected = check.generate.iota offset(-64.0) step(0.5) period(256) : tensor<512xbf16>
+  kernel.launch @yah_dequant_q8k(%w, %out) : (tensor<584xi8>, tensor<512xbf16>)
+  check.expect.close actual(%out) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<512xbf16>
+  check.return
+}
+
+check.benchmark<@yah_dequant_q8k_case> @yah_dequant_q8k_bench

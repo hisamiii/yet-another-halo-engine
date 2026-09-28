@@ -43,6 +43,10 @@ explicitly deferred.
 | yah_attn_batched_f32.loom | attention_batched.hip | batched attention core, f32 + f16 cache | ported, 0.0091/0.0120 ms; fixture + 1e-6 |
 | - | attention_batched.hip, prefill_attention*.hip, attention_wmma.hip | tiled/WMMA attention, KV prefix sync, head packing, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
+| yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
+| yah_dequant_q8k_bf16.loom | prefill_gemm.hip | Q8_K weight dequant to bf16 | ported, 0.0076 ms; exact periodic expectation |
+| yah_dequant_q8_0_bf16.loom | prefill_gemm.hip | Q8_0 weight dequant to bf16 | ported, 0.0081 ms; exact periodic expectation |
+| - | prefill_gemm.hip | Q5_K and Q6_K dequant to bf16, generic sub-16 element decoder | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
@@ -58,7 +62,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 27 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 32 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -198,6 +202,12 @@ profile gives one, so the expensive paths move first rather than the convenient 
   fp16 cannot represent, so no single `check.generate.iota` describes it. Dividing
   `h` by 16 makes the sum `992 + 2*e`, exactly representable and still an iota. The
   transform itself is unchanged; only the fixture's magnitude moves.
+- **A per-block kernel whose every block is identical has a periodic expectation.**
+  The dequant kernels multiply one scale by a per-block code ramp, so if every block
+  carries the same scale and the same codes, the flat output is that ramp repeated.
+  `check.generate.iota offset(...) step(...) period(block_elems)` states it exactly,
+  and only the packed input needs a fixture. Choosing the scale so the products stay
+  exact in bf16 (multiples of 0.5 below 128) keeps the comparison at `atol=0`.
 - **Re-tile a tuned kernel freely for the first port; say so in the header.**
   `BatchedDeltaNetRowSplitKernel` is templated over four orthogonal tile choices
   with DPP reductions and LDS staging. The port picks the instantiation whose
