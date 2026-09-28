@@ -33,7 +33,9 @@ explicitly deferred.
 | yah_ssm_proj_f32.loom | prefill_ssm.hip | fused SSM input projections (GEMV) | ported, 0.0102 ms |
 | yah_deltanet_rowsplit_f32.loom | ssm_row_split.hip | DeltaNet row-split recurrence | ported, 19.22 ms at batch 512 / 8 heads (untilable port; tuning deferred) |
 | yah_deltanet_prep_kq_f32.loom | ssm_row_split.hip | DeltaNet K/Q-norm prologue | ported, 0.0076 ms at 3 tokens / 2 key heads |
-| - | ssm_row_split.hip, ssm_recurrence.hip | DeltaNet alpha/beta prep, SSM conv, post-norm gate | todo |
+| yah_ssm_conv_f32.loom | ssm_recurrence.hip | causal SSM convolution + gate | ported, 0.0148 ms at 4x16; fixture + 1e-6 tolerance |
+| yah_ssm_postnorm_gate_f32.loom | batched_ssm.hip | SSM post-norm + gate epilogue | ported, 0.0173 ms at 2x2x128; fixture + 1e-6 tolerance |
+| - | ssm_row_split.hip | BatchedDeltaNetPrepAlphaBetaKernel, BatchedSSMPostNormGateFp16Kernel | todo |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
 | - | qkv.hip | QKV projection | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
