@@ -317,5 +317,8 @@ family: HIP's Q4_K kernel was measured at 1.197 ms at m_tiles=1088, so the 2.48
 ms iq4xs arm is close for that one, and the residual/SwiGLU arms and the
 SSM/attention GEMMs are the next target. The port notes on
 `yah_ffn_gemm_q4k_f32.loom` list the deeper levers (decode a whole 256-wide block
-once and reuse its scale bytes across 16 K steps; move the tile into LDS), for
-which the lane/register fragment layout is the prerequisite.
+once and reuse its scale bytes across 16 K steps; move the tile into LDS). Those
+are now unblocked: `engine/gpu/loom/docs/fragment-layout.md` shows lane L holds
+logical row `L%16` and that a `buffer.alloca<workgroup>` LDS fragment load is
+correct (the port note claiming otherwise was wrong); the LDS form already saves
+~10% on the iq4xs kStore.
