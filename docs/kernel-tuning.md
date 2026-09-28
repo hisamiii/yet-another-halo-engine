@@ -934,10 +934,28 @@ K loop's eight M-warps read LDS; without staging each of those warps issues its
 own global loads and the read volume goes up 8x. That 8x is the price of not
 staging, and it is about exactly what the staging costs.
 
-So the activation staging is not waste and the second region cannot be removed
-for free. It can be removed for *zero* net cost, though, which frees 32 KiB of
-the 64 KiB LDS budget -- enough to double BK for the weight tile alone. Whether
-that pays is untested.
+The reuse factor was the obvious suspect, so it was swept. With B in global the
+B reuse factor is exactly WM (each M-warp re-reads the same activations), so a
+low-WM/high-WN aspect should cut the redundant reads, at the cost of more A reads
+from LDS which are cheap:
+
+| arm | mean ms |
+| --- | ---: |
+| full w8n4 (LDS staging) | 12.46 |
+| globalB w8n4 | 12.60 |
+| globalB w4n8 | 12.64 |
+| globalB w2n16 | 12.96 |
+| noStoreB floor | 8.76 |
+
+Cutting the redundancy 4x changes nothing, so the redundant global reads are not
+the driver either. The two costs simply match: the second staging region costs
+12.46 - 8.76 = **3.70 ms** and the global-load path that replaces it costs
+12.60 - 8.76 = **3.84 ms**. Staging through LDS and re-reading from global are the
+same price here, which is why the second region cannot be removed for free.
+
+It can be removed for *zero* net cost, though, which frees 32 KiB of the 64 KiB
+LDS budget -- enough to double BK for the weight tile alone. Whether that pays is
+untested.
 
 **Falsifier:** if a variant that keeps both staging arrays separate and spends the
 freed LDS on more K depth runs under the noStoreB floor (~8.5 ms at this shape),
