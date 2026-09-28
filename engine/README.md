@@ -859,3 +859,35 @@ better-supported reason than the one originally given.
 The sharper point is the last two rows. HIP reaches **tier 5 at 1.353 ms** while our
 tier-5 configs sit at 2.39 ms. The tier is not what makes HIP fast, and matching the
 register number without matching the code buys nothing.
+
+### Resolution: the suggestion was actionable, and it was taken
+
+The open question was why the compiler would name a specific register reduction if
+there were no way to perform it. Re-reading the suggestion text answers it:
+
+> Reduce amdgpu.vgpr by at least 8 registers/subgroup (to at most 192). Recompile and
+> benchmark the modeled transition 4 -> 5 subgroups/SIMD; higher modeled residency is
+> not a throughput guarantee.
+
+It reports a resource delta against the residency model and explicitly disclaims a
+throughput guarantee. It never claimed a source transformation for one fixed schedule.
+
+The reduction is reachable, and the model even names the right size. The pipeline queue
+holds 2 records x 5 values (one lhs plus four rhs fragment loads), and each value is a
+vector<16xf16> occupying 8 registers, so dropping a single value per record is exactly
+the 8 registers the suggestion asks for. Configurations that cross the tier boundary at
+depth 3 were not available, but they are at other points in the grid and were measured:
+d2 u3 at 161 VGPR and d2 u2 at 168 VGPR both reach tier 5. So the suggestion was
+actionable, the transition was performed, and the result was 2.39 ms against 1.819 ms.
+
+Attempts to reach it without moving depth or unroll, which would have isolated the
+residency variable, all left the allocation at 200: bounding the row origin with
+index.assume, declaring 16-byte alignment on the buffers, and reordering the five loads
+so the lhs is issued last. The queue is what sets the number, and the queue length is
+the read-ahead depth.
+
+So the correct statement is not that the suggestion was unfounded. It is that the
+suggestion was right about the resource, the transition it names costs about 30% of
+throughput on this kernel, and the tool says as much in its own action text. The
+earlier framing of this section treated an unisolatable variable as a bogus suggestion,
+and that was the mistake.
