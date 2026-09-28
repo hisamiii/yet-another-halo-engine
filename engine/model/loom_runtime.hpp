@@ -65,6 +65,29 @@ struct LoomBuffer {
   }
 };
 
+struct LoomEvent {
+  hrx_event_t handle = nullptr;
+  LoomEvent() = default;
+  LoomEvent(LoomEvent&& other) noexcept : handle(other.handle) {
+    other.handle = nullptr;
+  }
+  LoomEvent& operator=(LoomEvent&& other) noexcept {
+    if (this != &other) {
+      reset();
+      handle = other.handle;
+      other.handle = nullptr;
+    }
+    return *this;
+  }
+  LoomEvent(const LoomEvent&) = delete;
+  LoomEvent& operator=(const LoomEvent&) = delete;
+  ~LoomEvent() { reset(); }
+  void reset() {
+    if (handle) hrx_event_release(handle);
+    handle = nullptr;
+  }
+};
+
 struct LoomExecutable {
   hrx_executable_t handle = nullptr;
   std::vector<std::string> names;
@@ -205,6 +228,22 @@ class LoomDevice {
   }
 
   void Synchronize() { LoomCheck(hrx_stream_synchronize(stream_), "sync"); }
+
+  [[nodiscard]] LoomEvent NewEvent() {
+    LoomEvent event;
+    LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_NONE, &event.handle),
+              "hrx_event_create");
+    return event;
+  }
+  void Record(LoomEvent& event) {
+    LoomCheck(hrx_event_record(event.handle, stream_), "hrx_event_record");
+  }
+  float Elapsed(LoomEvent& start, LoomEvent& stop) {
+    float ms = 0.0f;
+    LoomCheck(hrx_event_elapsed_time(start.handle, stop.handle, &ms),
+              "hrx_event_elapsed_time");
+    return ms;
+  }
 
   static hrx_dispatch_config_t Config(uint32_t gx, uint32_t gy, uint32_t gz,
                                       uint32_t sx, uint32_t sy, uint32_t sz,

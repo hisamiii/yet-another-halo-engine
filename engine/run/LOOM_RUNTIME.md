@@ -270,5 +270,33 @@ cleaned source and re-running reproduces argmax 11751.
 4. Prefill is **validated** (argmax 11751, worst layer max_abs 0.067). Decode is
    the next target: GEMV, decode attention, resident DeltaNet and the
    state-advancing decode convolution, then remove the HIP build
-   (`engine/build_gpu.sh`, hipcc) and the HIP sources. Tuning stays deferred
-   until the Loom decode path also matches HIP.
+   (`engine/build_gpu.sh`, hipcc) and the HIP sources.
+5. Prefill tuning is now unblocked (correctness matches HIP): the quantized GEMM
+   staging is the target, see section 6.
+## 6. Prefill performance
+
+The prefill is correct but untuned. `YAH_LOOM_TIME=1` makes
+`loom_forward_target` synchronize at category boundaries and print a breakdown
+of the 64-layer loop. On the IQ4_XS shard (`layers_ms` 4407 ms):
+
+| category | ms | share | what it covers |
+| --- | ---: | ---: | --- |
+| norm | 18.0 | 0.4% | the two `yah_half_norm` dispatches per layer |
+| mixer | 1490.5 | 33.8% | attention QKV/rope/wmma/output, or SSM proj/conv/recurrence |
+| ffn | 2898.1 | 65.8% | `ffn_gate` kStore + `ffn_up` kSwiGLU + `ffn_down` kResidual |
+
+So the quantized GEMM family (`yah_ffn_gemm_*_kstore/_swiglu/_residual`) is
+~99% of the time and the tuning target. The HIP reference is 390 ms (5 tokens)
+and 415 ms (64 tokens): HIP prefill is almost independent of token count, so it
+pads to a 64-token tile too, and the ~11x Loom gap is per-kernel inefficiency,
+not extra token work.
+
+The port notes on `yah_ffn_gemm_q4k_f32.loom` already enumerate the levers:
+decode a whole 256-wide block once per workgroup and reuse its scale bytes
+across 16 K steps (HIP reads them once, the port once per step), keep the decoded
+tile in LDS rather than global staging, and drop the full-width 178 MB staging
+buffer. The blocker is the fragment path: a fragment load from a
+`buffer.alloca<workgroup>` view compiles but does not produce the tile the target
+reads, so the port stages the decoded 16x16 weight tile through a global
+`wstage` and loads it back. Pinning down that lane/register layout is the
+prerequisite for the large win.

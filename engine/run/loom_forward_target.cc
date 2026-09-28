@@ -76,6 +76,8 @@ Imported ImportTensor(LoomDevice& gpu, const yah::core::Gguf& gguf,
   return out;
 }
 
+bool g_time = false;
+
 void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
               std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
@@ -144,6 +146,7 @@ int main(int argc, char** argv) {
   const char* model = argv[1];
   const std::string dir = argv[2];
   const char* out_path = argv[3];
+  g_time = std::getenv("YAH_LOOM_TIME") != nullptr;
   try {
     auto gguf = yah::core::Gguf::Open(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
@@ -317,12 +320,23 @@ int main(int argc, char** argv) {
                mt, 1, 1, 32, 1, 1, b);
     };
 
+    double t_norm = 0.0, t_mixer = 0.0, t_ffn = 0.0;
+    std::chrono::steady_clock::time_point mark = std::chrono::steady_clock::now();
+    const auto tick = [&]() {
+      if (!g_time) return 0.0;
+      gpu.Synchronize();
+      const double d = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - mark).count();
+      mark = std::chrono::steady_clock::now();
+      return d;
+    };
     gpu.Synchronize();
     const auto t0 = std::chrono::steady_clock::now();
     for (std::uint32_t l = 0; l < cfg.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       const bool full = cfg.IsFullAttention(l);
       run_norm(pre + "attn_norm.weight");
+      t_norm += tick();
       if (full) {
         const std::uint32_t ai = l / cfg.full_attention_interval;
         run_kstore(pre + "attn_q.weight", qkv);
@@ -425,10 +439,12 @@ int main(int argc, char** argv) {
         }
         run_residual(pre + "ssm_out.weight", scratch);
       }
+      t_mixer += tick();
       run_norm(pre + "post_attention_norm.weight");
       run_kstore(pre + "ffn_gate.weight", gateffn);
       run_swiglu(pre + "ffn_up.weight");
       run_residual(pre + "ffn_down.weight", ffnup);
+      t_ffn += tick();
     }
     gpu.Synchronize();
     const double layer_ms = std::chrono::duration<double, std::milli>(
@@ -466,6 +482,12 @@ int main(int argc, char** argv) {
     std::fwrite(out.data(), 4, out.size(), fo);
     std::fclose(fo);
     std::printf("argmax=%u\n", tok);
+    if (g_time) {
+      std::fprintf(stderr,
+                   "== loom category timing: norm=%.1f mixer=%.1f ffn=%.1f "
+                   "sum=%.1f ms ==\n",
+                   t_norm, t_mixer, t_ffn, t_norm + t_mixer + t_ffn);
+    }
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "loom_forward_target: %s\n", error.what());
