@@ -118,6 +118,30 @@ python3 engine/run/verify_loom_gemv.py <model.gguf> blk.64.ffn_gate.weight \
   15168895904 /tmp/loom_y.bin 16
 ```
 
+`engine/run/loom_embed_probe.cc` runs the prefill embedding over the real Q3_K
+`token_embd.weight` (248320x5120, row_bytes 2200) for a prompt, importing the
+table and dispatching `yah_prefill_embed_q3k`; `engine/run/verify_loom_embed.py`
+decodes the selected rows in float64 and compares. Result for prompt
+`760 6511 314 9338 369`: `max_abs 0.0` on every token (bit-exact), PASS.
+
+`engine/run/loom_norm_probe.cc` runs the fused RMSNorm+residual prefill kernel
+(`yah_half_norm`, fp16 out) over the real F32 `blk.0.attn_norm.weight`
+(dim 5120, file_offset 1621892000) using the hidden states emitted by the
+embedding probe; `engine/run/verify_loom_norm.py` rounds a float32 oracle to
+fp16 before comparing because the kernel output is fp16. Because an fp16
+result can legitimately land one ulp away when the reduction order crosses a
+rounding boundary, the verifier requires every element within one fp16 ulp of
+the rounded oracle. Result: `f16 mismatches 0`, `elements beyond one f16 ulp 0`,
+`max_abs 0.0` (bit-exact), PASS.
+
+```
+python3 engine/gpu/loom/emit_hal.py engine/gpu/loom/yah_half_norm_f16.loom /tmp/emit_norm
+g++ -std=c++20 -O2 -Iengine -I/home/q/hrx/libhrx/include engine/run/loom_norm_probe.cc -o /tmp/loom_norm_probe engine/build/libyah_core.a -L/home/q/hrx/build/cmake/libhrx/src/libhrx -lhrx -licuuc -lpthread
+source engine/hrx-env.sh
+/tmp/loom_norm_probe <model.gguf> /tmp/emit_norm/yah_half_norm_f16.hal /tmp/loom_hidden.bin /tmp/loom_normed.f16 blk.0.attn_norm.weight 5
+python3 engine/run/verify_loom_norm.py <model.gguf> 1621892000 /tmp/loom_hidden.bin /tmp/loom_normed.f16 5 5120 1e-6
+```
+
 ## 5. Remaining work
 
 1. Emit HAL executables for every ported kernel at its production shape
