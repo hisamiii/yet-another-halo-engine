@@ -51,6 +51,8 @@ explicitly deferred.
 | yah_fused_qk_rope_f32.loom | fused.hip | fused QK RMSNorm + RoPE + KV write (decode) | ported, 0.0089 ms; exact, no fixture |
 | yah_fused_qk_rope_batched_f32.loom | prefill_rope.hip | fused QK RMSNorm + RoPE + KV write (batched) | ported, 0.0088 ms; exact, no fixture |
 | yah_batched_rope_f32.loom | prefill_rope.hip | batched in-place RoPE with start_pos | ported, 0.0089 ms; exact, no fixture |
+| yah_spec_seg_max_f32.loom | sample.hip | speculative residual stage 1: per-segment max | ported, 0.0220 ms; exact, no fixture |
+| yah_spec_seg_weights_f32.loom | sample.hip | speculative residual stage 2: weights + segment sums | ported, 0.0093 ms; exact, no fixture |
 | - | prefill_attention*.hip, attention_wmma.hip, attention_decode*.hip | WMMA/tiled attention compute, decode-online, split-K, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
@@ -109,7 +111,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 79 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 81 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -127,7 +129,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | W8A8 + fused quant | prefill_quant_gemm.hip | **ported**: QuantizeActivationToQ8_1Kernel, BatchedFusedSwiGLUQuantizeQ8_1Kernel, RequantizeActivationInt4Kernel (no-clip path), ZeroQ8ActTailKernel, BatchedFusedRMSNormQuantizeQ8_1Kernel, BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel (tiled layout + sum sidecar). **todo**: W8A8BlockedWmmaGEMMKernel, the clip variant, BatchedQuantGEMVKernel |
 | f16 conversion set | prefill_fp16.hip | **ported**: HalfCast, AtbExpandHeadFp16, AtbAddHeadFp32, HalfNorm, HalfNorm5120, Bfp16RoundTripFp16, AtbEncodeA, AtbDecodeC (write), AtbDecodeSwiGLU. **todo**: AtbRepack(+Slice, blocked on the sub-16 quant table) |
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | **ported**: FastGEMVBlockKernel f32 path. **todo**: its bf16 path, and all of gemv_quant.hip |
-| sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm). **todo**: linear/sorted sampling, the speculative segment set, the Partial/MapIndices argmax arms |
+| sampling | sample.hip | **ported**: PrepareSamplingKernel, ApplySparsePenaltiesKernel, PrepareCandidateLogitsKernel, ScatterDraftProbabilitiesKernel, BatchedArgmaxKernel (plain full-row arm), SpeculativeSegmentMaxKernel, SpeculativeSegmentWeightsKernel. **todo**: linear/sorted sampling, SpeculativeSegmentResidual/Select, SortedSpeculativeSampling, the Partial/MapIndices argmax arms |
 | vision | vision/encoder.hip, vision/device_input.hip | all eight kernels **ported** (Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, Activate, BiasResidual, Finish, InjectRows) |
 | decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip, norm.hip (both), RoPEPtrKernel, EmbeddingLookupPtrKernel (f32 arm). **todo**: FastFusedSwiGLUGEMVBlockKernel, the non-f32 lookup arms |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |

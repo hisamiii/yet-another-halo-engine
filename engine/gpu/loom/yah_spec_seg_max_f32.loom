@@ -1,0 +1,79 @@
+// YAH speculative segment max, Loom port of SpeculativeSegmentMaxKernel.
+//
+// HIP source: sample.hip. One block per vocab segment; each block reduces the finite
+// logits in its segment to a maximum and writes it to `scratch.maxima[segment]`. This
+// is the first stage of the speculative residual sampler.
+//
+// The shared-memory tree becomes one `kernel.workgroup.reduce<maxnumf>`.
+//
+// Required config: --config=yah_spec_seg_max.vocab_size=1024 --config=yah_spec_seg_max.segments=256
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_spec_seg_max.vocab_size : %value: index where [range(%value, 1, 1073741824)]
+
+config.decl @yah_spec_seg_max.segments : %value: index where [range(%value, 1, 65536)]
+
+kernel.def target(@yah_wave32) @yah_spec_seg_max() {
+  %unit = index.constant 1 : index
+  %segments = config.get @yah_spec_seg_max.segments : index
+  %c128 = index.constant 128 : index
+  kernel.launch.config workgroups(%segments, %unit, %unit) workgroup_size(%c128, %unit, %unit) : index
+} launch(%logits: buffer, %scratch: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c128 = index.constant 128 : index
+  %limit = scalar.constant 3.4028234663852886e+38 : f32
+  %neg_infinite = scalar.constant -3.9999999999999999e+38 : f32
+  %vocab_size = config.get @yah_spec_seg_max.vocab_size : index
+  %segments = config.get @yah_spec_seg_max.segments : index
+  %segments_m1 = index.sub %segments, %c1 : index
+  %logits_na, %scratch_na = buffer.assume.noalias %logits, %scratch : buffer, buffer
+  %logits_view = buffer.view %logits_na[%base] : buffer -> view<[%vocab_size]xf32>
+  %scratch_view = buffer.view %scratch_na[%base] : buffer -> view<[%segments]xf32>
+  %block_raw = kernel.workgroup.id<x> : index
+  %block = index.min %block_raw, %segments_m1 : index
+  %tid = kernel.workitem.id<x> : index
+  %vb = index.mul %vocab_size, %block : index
+  %begin = index.div %vb, %segments : index
+  %bp1 = index.add %block, %c1 : index
+  %vb1 = index.mul %vocab_size, %bp1 : index
+  %end = index.div %vb1, %segments : index
+  %start = index.add %begin, %tid : index
+  %local = scf.for %i = [%start to %end step %c128](%acc = %neg_infinite : f32) -> (f32) {
+    %v = view.load %logits_view[%i] : view<[%vocab_size]xf32> -> f32
+    %mag = scalar.absf %v : f32
+    %finite = scalar.cmpf ole, %mag, %limit : f32
+    %bigger = scalar.cmpf ogt, %v, %acc : f32
+    %next = scf.if %finite -> (f32) {
+      %b = scf.if %bigger -> (f32) {
+        scf.yield %v : f32
+      } else {
+        scf.yield %acc : f32
+      }
+      scf.yield %b : f32
+    } else {
+      scf.yield %acc : f32
+    }
+    scf.yield %next : f32
+  }
+  %maximum = kernel.workgroup.reduce<maxnumf> %local : f32
+  %leader = index.cmp eq, %tid, %c0 : index
+  scf.if %leader {
+    view.store %maximum, %scratch_view[%block] : f32, view<[%segments]xf32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_spec_seg_max.vocab_size=1024 --config=yah_spec_seg_max.segments=256.
+// logits = iota 0..1023, 4 per segment: scratch[b] = 4b+3, which is an iota.
+check.case public @yah_spec_seg_max_case {
+  %logits = check.generate.iota offset(0.0) step(1.0) : tensor<1024xf32>
+  %scratch = check.generate.fill value(0.0) : tensor<256xf32>
+  %expected = check.generate.iota offset(3.0) step(4.0) : tensor<256xf32>
+  kernel.launch @yah_spec_seg_max(%logits, %scratch) : (tensor<1024xf32>, tensor<256xf32>)
+  check.expect.close actual(%scratch) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<256xf32>
+  check.return
+}
+
+check.benchmark<@yah_spec_seg_max_case> @yah_spec_seg_max_bench
