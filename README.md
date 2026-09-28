@@ -6,3 +6,5 @@ Goals:
 - Heavily tuned GEMM kernels for ROCm HRX
 - Improve prefill speeds by 1.5x over other tuned inference backends
 - Minimal scope in models, quantization formats, etc. to keep development fast
+
+WIP
