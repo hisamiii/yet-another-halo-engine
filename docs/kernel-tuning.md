@@ -346,6 +346,35 @@ the VALU-per-WMMA counts, the BK ordering all agreed with the model -- but not
 its memory-system behaviour. Grouping, residency and reuse must be measured end
 to end.
 
+### The K loop is stalled, not bandwidth-bound
+
+The natural structural fix for the K loop is to stop storing decoded fp16
+weights in LDS and keep them packed 4-bit, cutting the A operand's LDS traffic
+and capacity fourfold. Measured, that premise is false. rocprofv3 PM counters
+on the production kernel, per dispatch:
+
+| | Q4_K | IQ3_XXS |
+| --- | ---: | ---: |
+| LDS/TA busy against GRBM cycles | **25.9%** | **38.4%** |
+| SQ issue slots busy (of 160) | 12.8% | 12.2% |
+| LDS reads per WMMA | 1.62 | 1.62 |
+| total instructions per WMMA | 5.61 | 6.99 |
+
+LDS is at a quarter to a third of capacity, so packing the weights would
+optimise a resource with 60% headroom. The issue slots are at 12-13%, so the
+kernel is **stalled roughly 87% of the time** -- which is consistent with the
+K loop's own LDS-read-to-WMMA dependency chain, and inconsistent with any
+bandwidth account. The design was not built.
+
+What would help a stalled kernel is more independent work in flight, and the
+configuration is already at the limits that provide it: one block per CU set by
+64 KiB of LDS, 8 waves per SIMD, and 8 independent accumulator chains
+(WRS=2 x WTS=4). The tile/thread combinations that would add either more waves
+or more chains -- w4n4 at 16 accumulators, w8n8 at 2048 threads, w16n4 at 2048 --
+exceed the VGPR budget or the 1024-thread limit. With WMMA = WRS*WTS and LDS
+reads = WRS + WTS, an 8-accumulator tile needs 6 reads however it is split, so
+the current split is already the minimum for this shape.
+
 ### The int4 lever is priced, and it is expensive
 
 int4 WMMA is the only measured lever above 1.5x on this part -- 52.6 TMAC/s,
