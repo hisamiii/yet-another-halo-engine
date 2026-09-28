@@ -23,6 +23,7 @@ explicitly deferred.
 | Loom file | HIP source | kernel | status |
 | --- | --- | --- | --- |
 | yah_ffn_gemm_f16.loom | prefill_fp16.hip | batched f16 FFN GEMM (kStore) | ported, 1.83-1.90 ms token-major (1.819 ms before the layout fix), ~1.35x behind HIP; parity check pins the output layout |
+| yah_ffn_gemm_q4k_f32.loom | prefill_fp16.hip | batched Q4_K FFN GEMM with in-kernel decode (kStore) | ported, 23.31 ms at m_tiles=1088; bit-exact fixture at m_tiles=1; untuned |
 | yah_ffn_gemm_residual_f32.loom | prefill_fp16.hip | FFN GEMM residual epilogue (kResidual) | ported, 2.046 ms; in-place add via a result-layout residual fragment load; parity check |
 | yah_ffn_gemm_swiglu_f16.loom | prefill_fp16.hip | FFN GEMM SwiGLU epilogue (kSwiGLU) | ported, 1.863 ms; silu(gate) * acc narrowed to fp16 at the fragment store; uniform check |
 | yah_ffn_gemm_gateup_f16.loom | prefill_fp16.hip | paired gate/up GEMM with SwiGLU (kGateUp) | ported, 4.053 ms; two accumulator groups share one activation tile; uniform check |
@@ -132,18 +133,19 @@ the one HIP kernel the route reaches through four epilogue arms, has four: kStor
 (yah_ffn_gemm_f16), kResidual (yah_ffn_gemm_residual_f32), kSwiGLU
 (yah_ffn_gemm_swiglu_f16) and the paired kGateUp (yah_ffn_gemm_gateup_f16).
 
-One coverage gap remains inside that kernel and it is the dominant one.
+The format gap inside that kernel is now closed for Q4_K.
 HalfPrefillGemmKernel is templated on the packed weight format and decodes Q4_K,
-Q5_K, Q6_K and the rest in-kernel through DecodeQuantSub16. The four Loom ports
-load pre-decoded fp16 weights instead, which is the Fp16W ablation path, not the
-production arm: DirectGemm only ever instantiates quantized types, and the f16
-view is a stand-in whose byte traffic is 3.5x the real kernel. The README says so
-in the format row of the Loom GEMM table. Closing it means embedding the quant
-decode in the Loom K loop. The Q4_K decoder now exists standalone as
-yah_dequant_q4k_bf16 (bit-exact, 0.0068 ms), cloned from the Q5_K port with the
-q5 high-bit plane removed, so the remaining work is to inline it into the GEMM K
-loop rather than to write a decoder. Until that lands the prefill route is
-structurally covered but not format-faithful.
+Q5_K, Q6_K and the rest in-kernel through DecodeQuantSub16; the four ports above
+load pre-decoded fp16 weights, which is the Fp16W ablation path and whose byte
+traffic is 3.5x the real kernel. yah_ffn_gemm_q4k_f32.loom is the format-faithful
+counterpart: it keeps the weight packed and inlines the decoder in the K loop,
+and its fixture case passes bit-exactly at m_tiles=1 while the production row
+count passes at m_tiles=1088. It is slow (23.31 ms vs 1.197 ms for the HIP Q4_K
+kernel) because it decodes only the 16 values a K step needs, re-reads the scale
+bytes every step, and stages both fragment operands through global memory. All
+three are tuning items, explicitly deferred. The other quant formats (Q5_K, Q6_K,
+IQ*) and the SwiGLU/residual epilogues in the quantized form are the remaining
+format work.
 
 Reachability evidence for the entries that are not on that route:
 
@@ -495,3 +497,20 @@ Reachability evidence for the entries that are not on that route:
   `yah_ffn_gemm_swiglu_f16.loom` and `yah_ffn_gemm_gateup_f16.loom` are the three
   shapes. A paired kernel simply carries two accumulators through one K loop
   (`scf.for` with eight results, which the parser accepts).
+
+- **Fragment operations do not work against a workgroup-buffer view yet.**
+  `vector.fragment.load<lhs>` and `vector.fragment.store<result>` compile and
+  preflight-pass with a `buffer.alloca<workgroup>` view as the source or
+  destination, but the tile the MMA reads and the tile the stores write are not
+  the row-major tile the scalar `view.store`s produced. The first
+  `yah_ffn_gemm_q4k_f32.loom` used LDS staging and every row sum was wrong with a
+  correctly decoded staging buffer; switching both to global scratch fixed it.
+  Stage decoded tiles in global memory until the LDS fragment path is understood.
+- **Q4_K scale-pair selection is `sis < 4`, not `wv < 32`.** The nibble selector
+  (`wv < 32` picks the low or high four bits of the quant byte) and the
+  scale/min pair index (`sis = 2*gg + (wv < 32 ? 0 : 1)`, and the packed 6-bit
+  pair has two encodings split at 4) look like the same condition for `gg == 0`
+  and for `sis >= 4`, but they diverge for K steps 32..63, where `wv >= 32` while
+  `sis` is still 1. Sharing one predicate made every K step with `wv >= 32` and
+  `sis < 4` read the wrong scale pair: single-step and two-step cases passed and
+  the third one did not, which is the failure signature to remember.
