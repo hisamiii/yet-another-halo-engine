@@ -39,7 +39,9 @@ explicitly deferred.
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
 | yah_qdq_f32.loom | engine/kv/kv_quant.hip | quantize/dequantize over 32-element blocks | ported, 0.0546 ms at 10240 blocks (327680 f32) |
 | yah_qdq_f16.loom | engine/kv/kv_quant.hip | fp16 quantize/dequantize over 32-element blocks | ported, 0.0434 ms at 10240 blocks (327680 f16) |
-| - | engine/kv/kv_quant.hip | q8/q4 packed block formats, quantize + dequantize | todo |
+| yah_kv_quant_q8_f16.loom | engine/kv/kv_quant.hip | KV cache pack to q8 blocks | ported, 0.0260 ms at 10240 blocks; byte-exact vs fixture |
+| yah_kv_dequant_q8_f16.loom | engine/kv/kv_quant.hip | KV cache unpack from q8 blocks | ported, 0.0275 ms at 10240 blocks; byte-exact vs fixture |
+| - | engine/kv/kv_quant.hip | q4 packed block format, quantize + dequantize | todo |
 | - | vision/encoder.hip, device_input.hip | vision tower | todo |
 
 ## Notes carried over from the FFN GEMM port
@@ -95,4 +97,16 @@ explicitly deferred.
   different operation and would silently round the wrong way.
 - `scalar.roundf` rounds ties away from zero, which is what `lroundf` and
   `__float2half_rn`-adjacent code expect; pair it with `scalar.fptosi`, whose own
-  conversion rounds toward zero.
+  conversion rounds toward zero. The q8 pack fixture deliberately keeps two products
+  that land exactly on a `.5` tie, which is what pins `scalar.roundf` to
+  ties-away-from-zero and therefore to `lroundf`.
+- **Packed byte layouts are checked against a committed generator, not a blob.**
+  `check.file.read.npy` resolves relative to the module, so fixtures live beside the
+  `.loom` file. `fixtures/kv_quant_q8/generate.py` replicates the HIP kernel in the
+  same widths and writes both the input and the expected bytes; regenerate with
+  `python3 fixtures/kv_quant_q8/generate.py`. This is the pattern for any kernel
+  whose output is a layout rather than a value: a written-down reference is the
+  oracle and the check compares bytes exactly. A generic elementwise
+  `check.oracle.call` provider would be nicer, but the shipped tool registers only
+  `reference.matmul` and `reference.tiled_matmul`; a scalar oracle is an embedding
+  hook the CLI does not wire up.

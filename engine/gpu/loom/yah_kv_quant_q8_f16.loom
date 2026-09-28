@@ -1,0 +1,147 @@
+// YAH KV cache pack to q8, Loom port of QuantizeQ8Kernel.
+//
+// HIP source: engine/kv/kv_quant.hip. One work-item owns one 32-element block of
+// f16 input and writes one 34-byte KvQ8Block (engine/kv/kv_cache.hpp):
+//
+//   amax    = max_i |f32(x[i])|
+//   scale   = amax > 0 ? amax / 127 : 0            (f32)
+//   inverse = scale > 0 ? 1 / scale : 0            (f32)
+//   d       = f16(scale)                           little endian u16
+//   qs[i]   = i8(clamp(lroundf(f32(x[i]) * inverse), -127, 127))
+//
+// There is no early exit: d must be written even when the block is all zeros, so
+// a zero-magnitude block stores d = 0 and 32 zero codes. The row/col split in the
+// HIP source only feeds the linear element pointer, so the block index alone
+// addresses the data and this port carries the block index alone.
+//
+// This is the first port checked against a generated fixture rather than an
+// analytic expectation, because the output is a packed byte layout whose every
+// byte the fixture can pin down. fixtures/kv_quant_q8/generate.py is the
+// reference: it replicates the kernel operation for operation in the same widths
+// and is committed, so the fixture is reproducible rather than a blob.
+//
+// Required configs, one per case:
+//
+//   @yah_kvq8_varied   blocks=4     (4 x 32 f16 in, 4 x 34 i8 out)
+//   @yah_kvq8_uniform  blocks=10240 (327680 f16 in, 348160 i8 out)
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_kvq8.blocks : %value: index where [range(%value, 1, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_kvq8() {
+  %unit = index.constant 1 : index
+  %blocks = config.get @yah_kvq8.blocks : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %blocks, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%src: buffer, %dst: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %c32 = index.constant 32 : index
+  %c34 = index.constant 34 : index
+  %c256 = index.constant 256 : index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %c127 = scalar.constant 127.0 : f32
+  %blocks = config.get @yah_kvq8.blocks : index
+  %total = index.mul %blocks, %c32 : index
+  %dst_bytes = index.mul %blocks, %c34 : index
+  %c127i = scalar.constant 127 : i32
+  %cneg127i = scalar.constant -127 : i32
+  %c8i16 = scalar.constant 8 : i16
+  %src_noalias = buffer.assume.noalias %src : buffer
+  %dst_noalias = buffer.assume.noalias %dst : buffer
+  %src_view = buffer.view %src_noalias[%base] : buffer -> view<[%total]xf16>
+  %dst_view = buffer.view %dst_noalias[%base] : buffer -> view<[%dst_bytes]xi8>
+  %lane = kernel.workitem.id<x> : index
+  %wg = kernel.workgroup.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %blk = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %blk, %blocks : index
+  scf.if %in_range {
+    %src_base = index.mul %blk, %c32 : index
+    %dst_base = index.mul %blk, %c34 : index
+    %amax = scf.for %i = [%c0 to %c32 step %c1](%a = %zero : f32) -> (f32) {
+      %off = index.add %src_base, %i : index
+      %v = view.load %src_view[%off] : view<[%total]xf16> -> f16
+      %vf = scalar.extf %v : f16 to f32
+      %av = scalar.absf %vf : f32
+      %m = scalar.maxnumf %a, %av : f32
+      scf.yield %m : f32
+    }
+    %positive = scalar.cmpf ogt, %amax, %zero : f32
+    %scale0 = scalar.divf %amax, %c127 : f32
+    %scale = scf.if %positive -> (f32) {
+      scf.yield %scale0 : f32
+    } else {
+      scf.yield %zero : f32
+    }
+    %scale_positive = scalar.cmpf ogt, %scale, %zero : f32
+    %inverse = scf.if %scale_positive -> (f32) {
+      %inv = scalar.divf %one, %scale : f32
+      scf.yield %inv : f32
+    } else {
+      scf.yield %zero : f32
+    }
+    // d: f16 scale, stored little endian at bytes 0 and 1 of the block.
+    %scale_half = scalar.fptrunc %scale : f32 to f16
+    %scale_bits = scalar.bitcast %scale_half : f16 to i16
+    %d_lo = scalar.trunci %scale_bits : i16 to i8
+    %d_hi_shifted = scalar.shrui %scale_bits, %c8i16 : i16
+    %d_hi = scalar.trunci %d_hi_shifted : i16 to i8
+    %dst_lo = index.add %dst_base, %c0 : index
+    %dst_hi = index.add %dst_base, %c1 : index
+    view.store %d_lo, %dst_view[%dst_lo] : i8, view<[%dst_bytes]xi8>
+    view.store %d_hi, %dst_view[%dst_hi] : i8, view<[%dst_bytes]xi8>
+    %c2i = index.constant 2 : index
+    %codes_base = index.add %dst_base, %c2i : index
+    %sink = scf.for %j = [%c0 to %c32 step %c1](%t = %zero : f32) -> (f32) {
+      %off2 = index.add %src_base, %j : index
+      %v2 = view.load %src_view[%off2] : view<[%total]xf16> -> f16
+      %v2f = scalar.extf %v2 : f16 to f32
+      %product = scalar.mulf %v2f, %inverse : f32
+      %r = scalar.roundf %product : f32
+      %q = scalar.fptosi %r : f32 to i32
+      %hi = scalar.minsi %q, %c127i : i32
+      %lo = scalar.maxsi %hi, %cneg127i : i32
+      %code = scalar.trunci %lo : i32 to i8
+      %code_off = index.add %codes_base, %j : index
+      view.store %code, %dst_view[%code_off] : i8, view<[%dst_bytes]xi8>
+      scf.yield %t : f32
+    }
+  }
+  kernel.return
+}
+
+// Requires --config=yah_kvq8.blocks=4. Varied block values: rounding across the
+// range, an all-zero block (d = 0, codes = 0), and a block at each clamp. Two
+// products land exactly on a rounding tie, which pins lroundf's ties-away-from-zero.
+check.case public @yah_kvq8_varied {
+  %src = check.file.read.npy path("fixtures/kv_quant_q8/input_varied.npy") : tensor<128xf16>
+  %expected = check.file.read.npy path("fixtures/kv_quant_q8/expected_varied.npy") : tensor<136xi8>
+  %dst = check.generate.fill value(0) : tensor<136xi8>
+  kernel.launch @yah_kvq8(%src, %dst) : (tensor<128xf16>, tensor<136xi8>)
+  check.expect.equal actual(%dst) expected(%expected) : tensor<136xi8>
+  check.return
+}
+
+check.benchmark<@yah_kvq8_varied> @yah_kvq8_varied_bench
+
+// Requires --config=yah_kvq8.blocks=10240. The real shape: 64 x 5120 f16 packed
+// into 10240 blocks. Uniform input, so the expected bytes repeat every 34.
+check.case public @yah_kvq8_uniform {
+  %src = check.generate.fill value(3.0) : tensor<327680xf16>
+  %expected = check.file.read.npy path("fixtures/kv_quant_q8/expected_uniform.npy") : tensor<348160xi8>
+  %dst = check.generate.fill value(0) : tensor<348160xi8>
+  kernel.launch @yah_kvq8(%src, %dst) : (tensor<327680xf16>, tensor<348160xi8>)
+  check.expect.equal actual(%dst) expected(%expected) : tensor<348160xi8>
+  check.return
+}
+
+check.benchmark<@yah_kvq8_uniform> @yah_kvq8_uniform_bench
