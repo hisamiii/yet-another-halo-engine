@@ -743,3 +743,41 @@ fetch is paid once and reused, rather than being charged to one wave alone.
 Tooling note: loom-check roundtrip reports this file as mismatched while loom-format
 --in-place reports it unchanged and verifies it. The two tools disagree on the
 canonical form for this file, so compilation and measurement were used as the gate.
+
+### The LDS line is closed: staging loses in all three variants
+
+Following the disassembly finding (HIP serves 48 operand reads per body from LDS while
+Loom serves none), three staged kernels were built and measured. All are correct and
+all lose to the plain global-gather kernel:
+
+| kernel | staging | VGPR | global loads/wi | LDS B | LDS/MMA | tier | time |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| v3 | none | 200 | 3200 | 0 | 0 | 4 | **1.819 ms** |
+| v7 | BK=64, 1 wave | 64 | 1600 | 10240 | 3.75 | 3 | 2.160 ms |
+| v8 | BK=64, shared by 4 waves | 64 | 480 | 10240 | 5.50 | 12 | 3.100 ms |
+| v9 | v8 with the row padded to 66 | 64 | 480 | 10560 | 5.50 | 12 | 3.872 ms |
+
+Each variant fixed the previous objection and lost anyway:
+
+- v7 demonstrated the mechanism -- the worst-case fragment gap fell from 10224 bytes to
+  112, global loads halved, registers fell by two thirds -- but 10240 B of staging
+  charged to a single wave made amdgpu.lds the residency limiter at tier 3.
+- v8 amortised the same 10240 B across four waves, which fixed residency outright:
+  tier 12, 75% occupancy, global loads down 6.7x. It is 42% slower than v7. So
+  neither occupancy nor global-load count is the limiter, and 5.5 LDS operations per
+  MMA is a cost the global path does not pay.
+- v9 padded the shared tile row from 64 to 66 halves to break what looked like a
+  16-way bank conflict (a 128-byte row stride is exactly the bank width, so lanes
+  stepping one row apart would all land on bank 0). It is slower again, which says the
+  padded access did not pay for the extra footprint.
+
+Conclusion: on this hardware with this compiler, routing operands through workgroup
+memory costs more than reading them as global fragment gathers, in every shape tried.
+The HIP kernel LDS result is real but it is not transferable by construction -- its
+advantage comes from a hand-tuned 256x256 tile at 1024 threads with BK=4 sub-blocks,
+not from the mere presence of shared memory.
+
+The standing result is therefore v3 at 1.819 ms against the HIP fp16 control at
+1.353 ms, a 1.34x gap. Its own load path alone measures 1.727 ms, so the compute is
+5% and the entire remaining question is memory-path efficiency that none of the
+twelve variants or three probes has been able to move in the right direction.
