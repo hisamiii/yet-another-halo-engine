@@ -275,28 +275,39 @@ cleaned source and re-running reproduces argmax 11751.
    staging is the target, see section 6.
 ## 6. Prefill performance
 
-The prefill is correct but untuned. `YAH_LOOM_TIME=1` makes
-`loom_forward_target` synchronize at category boundaries and print a breakdown
-of the 64-layer loop. On the IQ4_XS shard (`layers_ms` 4407 ms):
+`YAH_LOOM_TIME=1` makes `loom_forward_target` synchronize at category boundaries
+and print a breakdown of the 64-layer loop. On the IQ4_XS shard:
 
-| category | ms | share | what it covers |
-| --- | ---: | ---: | --- |
-| norm | 18.0 | 0.4% | the two `yah_half_norm` dispatches per layer |
-| mixer | 1490.5 | 33.8% | attention QKV/rope/wmma/output, or SSM proj/conv/recurrence |
-| ffn | 2898.1 | 65.8% | `ffn_gate` kStore + `ffn_up` kSwiGLU + `ffn_down` kResidual |
+| category | before (ms) | after (ms) | share (after) | covers |
+| --- | ---: | ---: | ---: | --- |
+| norm | 18.0 | 13.4 | 0.9% | the two `yah_half_norm` dispatches per layer |
+| mixer | 1490.5 | 595.7 | 38.2% | attention QKV/rope/wmma/output, or SSM proj/conv/recurrence |
+| ffn | 2898.1 | 948.8 | 60.9% | `ffn_gate` kStore + `ffn_up` kSwiGLU + `ffn_down` kResidual |
+| total | 4406.7 | 1558.0 | | |
 
-So the quantized GEMM family (`yah_ffn_gemm_*_kstore/_swiglu/_residual`) is
-~99% of the time and the tuning target. The HIP reference is 390 ms (5 tokens)
-and 415 ms (64 tokens): HIP prefill is almost independent of token count, so it
-pads to a 64-token tile too, and the ~11x Loom gap is per-kernel inefficiency,
-not extra token work.
+argmax is 11751 in both runs and the final residual matches the HIP dump to
+max_abs 0.062, mean 0.002.
 
-The port notes on `yah_ffn_gemm_q4k_f32.loom` already enumerate the levers:
-decode a whole 256-wide block once per workgroup and reuse its scale bytes
-across 16 K steps (HIP reads them once, the port once per step), keep the decoded
-tile in LDS rather than global staging, and drop the full-width 178 MB staging
-buffer. The blocker is the fragment path: a fragment load from a
-`buffer.alloca<workgroup>` view compiles but does not produce the tile the target
-reads, so the port stages the decoded 16x16 weight tile through a global
-`wstage` and loads it back. Pinning down that lane/register layout is the
-prerequisite for the large win.
+The quantized GEMM family (`yah_ffn_gemm_*_kstore/_swiglu/_residual`) is ~99% of
+the time. The port staged the decoded weights through a **full-width** global
+buffer (`view<[stage_rows]x[ktot]xf16>`, up to 178 MB at production shape): each
+K step of 16 wrote a 16x16 tile into a 10 KB-strided row and the fragment load
+read it back, so every 32-byte row access touched its own cache line and the
+tile was re-fetched across the K loop.
+
+The fix is a **dense per-workgroup staging tile**: the view is
+`view<[stage_rows]x[16]xf16>` (512 bytes per workgroup), the decode stores at
+`[row, c]` and the fragment load reads at `[m_origin, 0]`, so writes and reads
+are contiguous within the tile. Measured on the `iq4xs` kStore at production
+shape (m_tiles=1088, k_blocks=20): **14.64 ms -> 2.48 ms (5.9x)**, in-tree case
+still passing. Rolled out to the 25 kStore/kSwiGLU/kResidual files, re-emitted,
+and the driver's staging allocations dropped from `kFfn*kHidden*2` (178 MB) to
+`kFfn*16*2` (557 KB).
+
+The remaining ~4x gap to HIP (390 ms for 5 tokens, 415 ms for 64) is the same
+family: HIP's Q4_K kernel was measured at 1.197 ms at m_tiles=1088, so the 2.48
+ms iq4xs arm is close for that one, and the residual/SwiGLU arms and the
+SSM/attention GEMMs are the next target. The port notes on
+`yah_ffn_gemm_q4k_f32.loom` list the deeper levers (decode a whole 256-wide block
+once and reuse its scale bytes across 16 K steps; move the tile into LDS), for
+which the lane/register fragment layout is the prerequisite.

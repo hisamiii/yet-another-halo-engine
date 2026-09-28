@@ -115,7 +115,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs() {
   %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>
   %a_t_view = buffer.view %input_na[%base] : buffer -> view<[%ktot]x[%tokens]xf16, %a_layout>
   %out_view = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>
-  %wstage_view = buffer.view %wstage_na[%base] : buffer -> view<[%stage_rows]x[%ktot]xf16>
+  %wstage_view = buffer.view %wstage_na[%base] : buffer -> view<[%stage_rows]x[%c16]xf16>
   %ostage_view = buffer.view %ostage_na[%base] : buffer -> view<[%stage_rows]x[%tokens]xf32>
   %wg_x = kernel.workgroup.id<x> : index
   %m_origin = index.mul %wg_x, %c16 : index
@@ -124,6 +124,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs() {
   %m_origin_i = index.cast %m_origin : index to i32
   %k_blocks_i = index.cast %k_blocks : index to i32
   %bpr_i = scalar.muli %k_blocks_i, %c144i : i32
+  %u8 = index.constant 8 : index
   %zeros = vector.constant 0.0 : vector<8xf32>
   %init = vector.fragment<init> %zeros shape [%m, %n] : vector<8xf32>
   %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %ktot step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
@@ -131,7 +132,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs() {
     %kk_i = index.cast %kk : index to i32
     %kbase = scalar.andi %kk_i, %c255i : i32
     %kblk = scalar.shrui %kk_i, %c8i : i32
-    %j_sink = scf.for %j = [%c0 to %c8 step %c1](%mk = %c0 : index) -> (index) {
+    %j_sink = scf.for %j = [%c0 to %c8 step %c1](%mk = %c0 : index) -> (index) unroll(%u8) {
       %j_i = index.cast %j : index to i32
       %j32 = scalar.shli %j_i, %c5i : i32
       %e_i = scalar.addi %lane_i, %j32 : i32
@@ -293,15 +294,14 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs() {
       %h = scalar.fptrunc %value : f32 to f16
       %c_ix = index.cast %c_i : i32 to index
       %c_idx = index.max %c_ix, %c0 : index
-      %kx = index.add %kk, %c_idx : index
       %row_ix = index.cast %row_i : i32 to index
       %row_lo = index.max %row_ix, %c0 : index
       %row = index.min %row_lo, %stage_last : index
-      view.store %h, %wstage_view[%row, %kx] : f16, view<[%stage_rows]x[%ktot]xf16>
+      view.store %h, %wstage_view[%row, %c_idx] : f16, view<[%stage_rows]x[%c16]xf16>
       scf.yield %mk : index
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    %lhs = vector.fragment.load<lhs> %wstage_view[%m_origin, %kk] shape [%m, %k] : view<[%stage_rows]x[%ktot]xf16> -> vector<16xf16>
+    %lhs = vector.fragment.load<lhs> %wstage_view[%m_origin, %c0] shape [%m, %k] : view<[%stage_rows]x[%c16]xf16> -> vector<16xf16>
     %t16 = index.add %token_base, %c16 : index
     %t32 = index.add %token_base, %c32 : index
     %t48 = index.add %token_base, %c48 : index

@@ -200,11 +200,13 @@ int main(int argc, char** argv) {
     LoomBuffer eps = gpu.Allocate(4);
     LoomBuffer ffnup = gpu.Allocate(std::size_t{kP} * kFfn * 2);
     LoomBuffer gateffn = gpu.Allocate(std::size_t{kP} * kFfn * 4);
-    LoomBuffer gwstage = gpu.Allocate(std::size_t{kFfn} * kHidden * 2);
-    LoomBuffer uwstage = gpu.Allocate(std::size_t{kFfn} * kHidden * 2);
+    // Dense per-workgroup staging: the kernels stage a 16x16 weight tile per
+    // K step, not the full 16xK row. kFfn*16 is the largest tile count.
+    LoomBuffer gwstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
+    LoomBuffer uwstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
     LoomBuffer ogate = gpu.Allocate(std::size_t{kFfn} * kP * 4);
     LoomBuffer oup = gpu.Allocate(std::size_t{kFfn} * kP * 4);
-    LoomBuffer wstage = gpu.Allocate(std::size_t{kFfn} * kHidden * 2);
+    LoomBuffer wstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
     LoomBuffer ostage = gpu.Allocate(std::size_t{kFfn} * kP * 4);
     LoomBuffer normed = gpu.Allocate(std::size_t{kHidden} * 4);
     LoomBuffer logits = gpu.Allocate(std::size_t{kVocab} * 4);
