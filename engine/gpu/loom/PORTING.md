@@ -22,7 +22,7 @@ explicitly deferred.
 
 | Loom file | HIP source | kernel | status |
 | --- | --- | --- | --- |
-| yah_ffn_gemm_f16.loom | prefill_fp16.hip | batched f16 FFN GEMM | ported, 1.819 ms, 1.34x behind HIP |
+| yah_ffn_gemm_f16.loom | prefill_fp16.hip | batched f16 FFN GEMM | ported, 1.83-1.90 ms token-major (1.819 ms before the layout fix), ~1.35x behind HIP; parity check pins the output layout |
 | yah_residual_add_f32.loom | prefill_residual.hip | batched residual add | ported, 0.0189 ms at 327680 elements |
 | yah_rmsnorm_f32.loom | prefill_norm.hip | batched RMSNorm | ported, 0.0821 ms at 64x5120 |
 | yah_perhead_rmsnorm_f32.loom | prefill_norm.hip | batched per-head RMSNorm | ported, 0.0154 ms at 8x4x128 |
@@ -449,3 +449,18 @@ Reachability evidence for the entries that are not on that route:
   (`yah_attn_wmma_f32.loom` picks the canonical and head-major KV bases this way).
   `scalar.logf<afn>` does carry a target contract and gives the natural-log
   log-sum-exp for the `lse_out` epilogue.
+
+- **A uniform correctness case cannot see a transposed output.** A fill of any
+  constant is its own transpose, so `yah_ffn_gemm_f16` passed for several versions
+  while writing `out[row][token]` through a default row-major view where HIP writes
+  `y[token*m + row]`. Pin the layout with an expectation that varies along the
+  axis being transposed: make the weight depend on row parity and read the result
+  as an iota of `period(2)`. `check.generate.iota` computes
+  `offset + step*(flat_index mod period)`, so the two row-parity sums become the
+  iota offset and step. Verify the check fails on the old layout with a probe copy
+  before trusting it.
+- **A strided view works as a fragment-store destination.** `view<17408x64xf32,
+  %layout>` with `encoding.layout.strided [1, 17408]` stores the [m, n] fragment at
+  address `token*17408 + row`, so a token-major output needs no transposed register
+  copy. The store op annotation must repeat the layout (`view<17408x64xf32,
+  %out_layout>`), exactly as the fragment-load annotations already do.

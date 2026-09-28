@@ -265,15 +265,22 @@ language and the toolchain that the GPU GEMM would need anyway.
 ### Authored: our first Loom GEMM, working and measured
 
 `engine/gpu/loom/yah_ffn_gemm_f16.loom` is a f16 WMMA GEMM doing
-`out[m][t] = sum_k W[m][k] * A[t][k]` at the production FFN shape (M=17408,
-K=5120), one 16x16 tile per workgroup, one wave, f32 accumulator. The activation
-buffer is token-major, so the rhs operand is a *strided view* of it as [k][t]
-(`encoding.layout.strided [1, 5120]`) rather than a transposed copy.
+`out[t][m] = sum_k W[m][k] * A[t][k]` at the production FFN shape (M=17408,
+K=5120), one 16x16 tile per workgroup, one wave, f32 accumulator. Both the
+activation and the result are token-major, matching HIP `y[token*m + row]`. The
+activation is therefore a *strided view* as [k][t] (`encoding.layout.strided
+[1, 5120]`) and the result is a strided view as `[1, 17408]`, rather than a
+transposed copy in either direction.
 
 It compiles for gfx1151, dispatches through HRX, and passes its correctness case.
-The case uses all-ones operands, so every output must equal exactly 5120 in f32 --
-which checks the K reduction and the operand indexing, not just the absence of NaNs.
-1956 instructions emitted.
+The original case used all-ones operands, so every output equalled 5120 in f32.
+That checked the K reduction but not the output layout, because a constant is its
+own transpose: the result was in fact written `out[row][token]` through a default
+row-major view, a different buffer layout from HIP. The case is now
+layout-sensitive -- the weight varies with row parity, so even rows sum to
+13104640 and odd rows to 39319040, and the expected value is an iota of period 2
+over the flat token-major index. Reverting the result view to row-major fails the
+case.
 
 | | weight format | time | TFLOP/s |
 | --- | --- | ---: | ---: |
