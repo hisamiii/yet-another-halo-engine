@@ -455,10 +455,29 @@ class Forward {
       std::fflush(stderr);
     };
 
+    // Debug staging: YAH_DUMP_DIR writes the fp32 residual stream after embed
+    // and after every layer, so a Loom port can be compared stage by stage.
+    const char* dump_dir = std::getenv("YAH_DUMP_DIR");
+    const auto dump_hidden = [&](const char* tag, std::uint32_t l) {
+      if (dump_dir == nullptr) return;
+      char path[512];
+      std::snprintf(path, sizeof(path), "%s/%s_%u.bin", dump_dir, tag, l);
+      FILE* file = std::fopen(path, "wb");
+      if (file == nullptr) { std::fprintf(stderr, "dump: cannot open %s\n", path); return; }
+      std::vector<float> host(static_cast<std::size_t>(batch) * hidden_);
+      Check(hipMemcpy(host.data(), buffers_.hidden,
+                      host.size() * sizeof(float), hipMemcpyDeviceToHost),
+            "dump copy");
+      std::fwrite(host.data(), sizeof(float), host.size(), file);
+      std::fclose(file);
+      std::fprintf(stderr, "yah forward: dumped %s\n", path);
+    };
+
     LaunchBatchedEmbeddingLookup(
         weights_.token_embd.data, Gt(weights_.token_embd.type), buffers_.tokens,
         buffers_.hidden, batch, hidden_, stream_);
     stage("embed", 0);
+    dump_hidden("embed", 0);
 
     // Debug staging: YAH_LAYER_LIMIT bounds the stack and YAH_SYNC_LAYERS
     // synchronizes after every block, so a fault localizes to one layer type
@@ -630,6 +649,7 @@ class Forward {
       LaunchBatchedQuantGEMMResidualFp16(
           Gt(layer.ffn_down.type), layer.ffn_down.data, buffers_.ffn_up,
           buffers_.hidden, batch, hidden_, ffn_, stream_);
+      dump_hidden("layer", l);
       if (sync_layers) {
         Check(hipStreamSynchronize(stream_), "layer sync");
         std::fprintf(stderr, "yah forward: layer %u (%s) ok\n", l,
