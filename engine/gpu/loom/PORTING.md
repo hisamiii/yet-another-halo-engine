@@ -66,6 +66,7 @@ explicitly deferred.
 | yah_ffn_gemm_iq3s_f32.loom | prefill_fp16.hip | batched IQ3_S FFN GEMM, in-kernel grid+sign decode (kStore) | ported, 19.27 ms at m_tiles=1088; first port with an extra table operand (the 512-word grid); decode bit-exact vs the HIP IQ3_S arm, case at atol/rtol 1e-5 |
 | yah_ffn_gemm_iq3xxs_f32.loom | prefill_fp16.hip | batched IQ3_XXS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 15.62 ms at m_tiles=1088; two table operands (256-word grid, 128-byte ksigns); decode bit-exact vs the HIP IQ3_XXS arm, case at atol/rtol 1e-5 |
 | yah_ffn_gemm_iq4nl_f32.loom | prefill_fp16.hip | batched IQ4_NL FFN GEMM, in-kernel 16-entry codebook decode (kStore) | ported, 13.86 ms at m_tiles=1088; QK=32, codebook select shared with the IQ4_XS port |
+| yah_ffn_gemm_iq4xs_residual_f32.loom | prefill_fp16.hip | IQ4_XS FFN GEMM residual epilogue (kResidual) | ported, 15.36 ms at m_tiles=1088; highest-count residual arm after f16/Q4_K (29 down blocks) |
 | yah_ffn_gemm_iq2xs_f32.loom | prefill_fp16.hip | batched IQ2_XS FFN GEMM, in-kernel grid+ksigns decode (kStore) | ported, 19.85 ms at m_tiles=1088; grid passed as i32 word pairs of the 64-bit entries |
 | yah_ffn_gemm_iq2s_f32.loom | prefill_fp16.hip | batched IQ2_S FFN GEMM, in-kernel grid+qs-sign decode (kStore) | ported, 12.02 ms at m_tiles=1088; grid passed as i32 word pairs, signs from the qs bytes | 
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
@@ -187,8 +188,12 @@ three are tuning items, explicitly deferred. The residual and SwiGLU epilogues
 have the same Q4_K port (yah_ffn_gemm_q4k_residual_f32, yah_ffn_gemm_q4k_swiglu_f16,
 23.11/16.98 ms at production size), and yah_ffn_gemm_q4k_gateup_f16 (32.03 ms)
 shares one activation tile and one output between two decoders. The remaining
-format work is the residual/SwiGLU/paired epilogues for the Q5_K, IQ4_XS and
-Q8_0 store arms, which so far only have kStore.
+format work is the epilogue combinations. Every format now has a kStore port,
+and the residual epilogue has a format-faithful port for Q4_K and IQ4_XS, the two
+highest-count down formats; a residual/SwiGLU/paired arm for another format is
+the same epilogue loop over that format decode arm, so the risky decode work is
+done. The prefill route needs kResidual for the six remaining down formats and
+the paired gate/up arm for the IQ4_XS and mixed pairs.
 
 Reachability evidence for the entries that are not on that route:
 
