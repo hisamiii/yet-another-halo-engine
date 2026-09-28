@@ -328,3 +328,19 @@ check.case public @yah_decode_attn_case {
 }
 
 check.benchmark<@yah_decode_attn_case> @yah_decode_attn_bench
+
+// Requires the config block above with has_gate=0. The same q/k/v, without the
+// sigmoid gate; out must equal the softmax context directly.
+check.case public @yah_decode_attn_nogate_case {
+  %q = check.file.read.npy path("fixtures/decode_attn/input_q.npy") : tensor<512xf32>
+  %k = check.file.read.npy path("fixtures/decode_attn/input_k.npy") : tensor<1024xf16>
+  %v = check.file.read.npy path("fixtures/decode_attn/input_v.npy") : tensor<1024xf16>
+  %gate = check.file.read.npy path("fixtures/decode_attn/input_gate.npy") : tensor<512xf32>
+  %expected = check.file.read.npy path("fixtures/decode_attn/expected_nogate.npy") : tensor<512xf32>
+  %out = check.generate.fill value(0.0) : tensor<512xf32>
+  kernel.launch @yah_decode_attn(%q, %k, %v, %gate, %out) : (tensor<512xf32>, tensor<1024xf16>, tensor<1024xf16>, tensor<512xf32>, tensor<512xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<512xf32>
+  check.return
+}
+
+check.benchmark<@yah_decode_attn_nogate_case> @yah_decode_attn_nogate_bench

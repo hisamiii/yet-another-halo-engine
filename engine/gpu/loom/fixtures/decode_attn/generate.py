@@ -43,6 +43,7 @@ def main():
             v[p, d] = np.float32(((d % 5) - 2) * 0.25)
 
     expected = np.zeros((HEADS, HEAD_DIM), dtype=np.float32)
+    nogate = np.zeros((HEADS, HEAD_DIM), dtype=np.float32)
     scale = 1.0 / 16.0
     seq_len = START + 1
     for h in range(HEADS):
@@ -61,12 +62,14 @@ def main():
                 ctx += (ex[p] / total) * np.float64(v[p, d])
             sig = np.float64(1.0) / (1.0 + np.exp(-np.float64(gate[h, d])))
             expected[h, d] = np.float32(ctx * sig)
+            nogate[h, d] = np.float32(ctx)
 
     np.save(os.path.join(OUT, "input_q.npy"), q.reshape(-1).astype(np.float32))
     np.save(os.path.join(OUT, "input_k.npy"), k.reshape(-1).astype(np.float16))
     np.save(os.path.join(OUT, "input_v.npy"), v.reshape(-1).astype(np.float16))
     np.save(os.path.join(OUT, "input_gate.npy"), gate.reshape(-1).astype(np.float32))
     np.save(os.path.join(OUT, "expected.npy"), expected.reshape(-1).astype(np.float32))
+    np.save(os.path.join(OUT, "expected_nogate.npy"), nogate.reshape(-1).astype(np.float32))
     print("seq_len", seq_len, "expected[0][:4]", expected[0][:4])
 
 
