@@ -251,17 +251,25 @@ void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
       fp32_x.data(), fp32_x.size());
   gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
                                nullptr);
-  const int values[3] = {16, 2048, 8192};
-  const char* names[3] = {"iglp0", "iglp1", "iglp2"};
+  // 16 is the control (iglp_opt(0), which the IQ types get by default).
+  // 256 interleaves the next stage's global fetch into the K loop; 4096 batches
+  // every B fragment load ahead of the MMA block, which is the pipelining
+  // question -- the shipped order consumes each B fragment back to back, with a
+  // load-to-use distance of zero.
+  const int values[4] = {16, 256, 4096, 2048};
+  const char* names[4] = {"iglp0", "fetchmid", "batchB", "iglp1"};
   const auto launch = [&](int variant) {
     if (variant == 16)
       LaunchAblate<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m,
                              k, nullptr);
-    else if (variant == 2048)
-      LaunchAblate<Type, 2048>(weights.data(), half_x.data(), y.data(), batch, m,
+    else if (variant == 256)
+      LaunchAblate<Type, 256>(weights.data(), half_x.data(), y.data(), batch, m,
+                              k, nullptr);
+    else if (variant == 4096)
+      LaunchAblate<Type, 4096>(weights.data(), half_x.data(), y.data(), batch, m,
                                k, nullptr);
     else
-      LaunchAblate<Type, 8192>(weights.data(), half_x.data(), y.data(), batch, m,
+      LaunchAblate<Type, 2048>(weights.data(), half_x.data(), y.data(), batch, m,
                                k, nullptr);
   };
   const auto timed = [&](int variant) {
@@ -274,9 +282,9 @@ void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
     return std::chrono::duration<double, std::milli>(stop - start).count() /
            iterations;
   };
-  for (int round = 0; round < 3; ++round) {
-    for (int i = 0; i < 3; ++i) {
-      const int idx = (i + round) % 3;
+  for (int round = 0; round < 4; ++round) {
+    for (int i = 0; i < 4; ++i) {
+      const int idx = (i + round) % 4;
       const double ms = timed(values[idx]);
       const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
                             (ms * 1e9);

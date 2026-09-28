@@ -375,6 +375,45 @@ exceed the VGPR budget or the 1024-thread limit. With WMMA = WRS*WTS and LDS
 reads = WRS + WTS, an 8-accumulator tile needs 6 reads however it is split, so
 the current split is already the minimum for this shape.
 
+### The pipelining alternatives are all worse
+
+The shipped K loop consumes each B fragment immediately after loading it -- a
+load-to-use distance of zero -- and does not interleave the next stage's global
+fetch into the K loop. Both alternatives exist behind ablation bits and had never
+been swept. Best TFLOPS over four rotated rounds:
+
+| variant | IQ3_XXS | Q4_K |
+| --- | ---: | ---: |
+| shipped (control) | **36.60** | **36.61** |
+| batch every B load before the MMA block (4096) | 33.90 | 31.89 |
+| interleave the next global fetch (256) | 25.33 | 26.36 |
+| iglp_opt(1) instead of (0) (2048) | 33.01 | 33.81 |
+
+Both lose, the fetch interleave badly. Zero load-to-use distance is not a defect
+here: the scoreboard covers it, and batching the loads raises register pressure
+enough to cost more than the latency it hides. The ordering held in every round,
+so it is not position.
+
+### Independent confirmation of the upstream closure
+
+Between this section, the BK sweep, the tile sweep, the grouping test, the phase
+profile and the counters, the fp16 prefill inner loop has now been probed from
+the parameter, scheduling, memory and occupancy directions *in this engine*, and
+the shipped structure wins on all of them:
+
+- parameters: tile family closed, BK=4 monotone best, epilogues a few percent;
+- scheduling: iglp values inside noise, B-load batching and fetch interleaving
+  both worse;
+- memory: LDS capacity full but units at 26-45%, grouping changes do not
+  transfer from the bench;
+- occupancy: one block per CU by LDS capacity, and doubling it via BK=2 loses.
+
+That reproduces gufo's conclusion -- 66% of a 48.3 TFLOPS ceiling -- from an
+independent engine and a different codebase. Worth having: it means the closure
+is a property of the hardware and this problem shape, not of gufo's ABI or its
+compatibility constraints. The one lever that is not structural is int4, and it
+is closed on quality above.
+
 ### This was already settled upstream
 
 Most of the section above re-derives a conclusion the reference engine's
