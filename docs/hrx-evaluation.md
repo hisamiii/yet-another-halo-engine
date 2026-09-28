@@ -309,27 +309,72 @@ configured with `m_tiles=1088` -- one wave per workgroup, exactly as the kernel 
 written. That is an independent device-side confirmation of the launch geometry,
 which no amount of host-side timing gives you.
 
-### The catalog is the real limit, not the plumbing
+### TCC and TCP do not exist on gfx11; the L2 and DRAM counters live in GL2C
 
-Only three counters are mapped for the gfx11 family: `SQ_WAVES`, `SQ_BUSY_CYCLES`,
-and `SQ_INSTS_VALU`. The memory-system counters that would settle whether the
-activation operand is served from L2 -- `TCC_EA0_RDREQ`, `TCC_EA0_RDREQ_DRAM`,
-`TCC_EA0_RDREQ_32B`, `TCC_EA0_WRREQ`, `TCP_TCC_READ_REQ`, `TCP_TOTAL_READ`, the
-`TA_*` block -- are all present in the table but explicitly `UNSUPPORTED` for gfx11.
+The table marks the `TCC_EA0_*`, `TCP_TCC_*` and `TA_*` counters `UNSUPPORTED` for
+gfx11, and that is **correct**: those are CDNA block names. RDNA3/RDNA3.5 expose L2
+and memory-controller traffic through `GL2C`, and ROCm's own counter definitions
+(`share/rocprofiler-sdk/counter_defs.yaml`) list only 31 counters for gfx1151 at all,
+with no TCC or TCP entry among them.
 
-The header comment says arch-specific PMC program generation is deliberately
-centralized in aqlprofile so that factories such as gfx115x stay out of IREE. But
-event *id* resolution is not centralized: the table hardcodes numeric ids per family,
-and aqlprofile exposes `aqlprofile_iterate_event_ids` to ask a live agent for them --
-a symbol the HAL never loads. That is the actual gap for gfx115x memory counters, and
-it is a contained fix: query the ids for the agent instead of indexing a static table,
-falling back to the table where the query is unavailable.
+An earlier revision of this note claimed `aqlprofile_iterate_event_ids` could supply
+the missing ids. **That was wrong**, and it is retracted here: that function
+enumerates event *coordinate dimensions* (SE, CU, instance), not counters.
 
-### Two practical notes
+The real gap was narrower but real: the HAL's table mapped only 3 of those 31
+counters (`SQ_WAVES`, `SQ_BUSY_CYCLES`, `SQ_INSTS_VALU`). The GL2C counters exist,
+the vendor header names the block (`HSA_VEN_AMD_AQLPROFILE_BLOCK_NAME_GL2C = 29`),
+and their event ids are identical across the whole gfx11 family, so they belong in
+the existing GFX11 family. Two local changes make them work:
 
-- `--profile-data=device-metrics` executes and exits 0 but returns `row_count: 0` with
-  the warning `dispatch_distribution_unavailable`, so it is not useful on this device
-  as it stands.
-- `rocprofv3` is installed on this box (including a gfx1151 TheRock build) and carries
-  its own per-architecture counter definitions, so it is the faster route to the
-  TCC/TCP counters today. It attaches through HSA, which the benchmark already uses.
+- `profile_counters.c`: accept gfx11 minor 5 in `..._select_family`.
+- `util/libaqlprofile.h` and `profile_counters.c`: add the GL2C block name, plus
+  descriptors for `GL2C_MC_RDREQ`, `GL2C_MC_WRREQ`, `GL2C_HIT`, `GL2C_MISS` and
+  `GL2C_EA_RDREQ_128B` with events 96 / 83 / 42 / 43 / 102.
+
+Counter sets are PMC-limited: five counters at once make
+`aqlprofile_pmc_create_packets` fail with `hsa_status=0x1000`, while one or two per
+run works.
+
+### What the counters say about the FFN GEMM
+
+Profiling `yah_ffn_gemm_f16` (16x64 tile, weights read once, depth 3 unroll 2) on
+gfx1151, one dispatch:
+
+| counter | value |
+| --- | ---: |
+| `SQ_WAVES` | 1088 |
+| `GL2C_HIT` | 718,576 |
+| `GL2C_MISS` | 280,755 |
+| `GL2C_MC_RDREQ` | 273,834 |
+| `GL2C_MC_WRREQ` | 7,736 |
+
+`SQ_WAVES = 1088` matches `m_tiles=1088`: one wave per workgroup, exactly as written.
+
+The write counter calibrates absolute scale, because the output size is known
+exactly: 17408 x 64 x 4 = 4,456,448 bytes, or 139,264 32-byte sectors, or 69,632
+64-byte sectors. Against `GL2C_MC_WRREQ = 7,736` that is exactly 18.00 instances at
+32-byte granularity, or 9.00 at 64-byte. Both give the same 576 bytes per counted
+unit, so the absolute traffic is unambiguous:
+
+- **DRAM reads: 273,834 x 576 = 157.7 MB.**
+- DRAM requests are 27.4% of L2 accesses against a 28.1% miss rate, so each miss
+  becomes one DRAM request with no prefetch amplification.
+- **L2 hit rate: 71.9%.**
+
+The weight tensor is 17408 x 5120 x 2 = 178.3 MB, so DRAM read traffic is *at or
+below* the size of the weight tensor. Essentially every DRAM byte is that tensor
+streaming once, and the activation operand's 1.43 GB of issued re-reads contribute no
+DRAM traffic at all -- they are served from L2. This is the hardware confirmation of
+an inference the falsification section previously had to make from issued-byte
+accounting alone, and it is why the 32x32 tile lost: that tile doubled DRAM weight
+traffic in order to save L2 traffic that was already free.
+
+### Remaining notes
+
+- `--profile-data=device-metrics` executes and exits 0 but returns `row_count: 0`
+  with the warning `dispatch_distribution_unavailable`, so it is not useful here.
+- The two counter fixes are **local to this HRX checkout and deliberately not
+  upstreamed**; they will be lost if that checkout is cleaned or reset.
+- `rocprofv3` is also installed (including a gfx1151 TheRock build) for any counter
+  the HAL's table does not map.
