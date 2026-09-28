@@ -323,8 +323,28 @@ it the other way round: gshift 0-6 were run in a fixed order, which hands the
 boosted first block to gshift 0 and reads the session's decay back as a
 preference. The rotated sweep is the one above.
 
-A bench result on one isolated GEMM is not a model result, so this is checked
-end to end before anything changes.
+A bench result on one isolated GEMM is not a model result, and this one does
+not transfer. Setting group_shift to 0 and measuring the model (warm-up
+discarded, -r 1, order alternated, fixed 15 s gap before every timed run):
+
+| rep | order | identity order (ms) | production 3/5 (ms) |
+| ---: | --- | ---: | ---: |
+| 1 | identity first | 3937.3 | 3795.5 |
+| 2 | production first | 3939.7 | 3843.3 |
+| 3 | identity first | 3988.8 | 3917.5 |
+| 4 | production first | 3951.1 | 3841.7 |
+
+Production wins every rep, by 2.7% on the means, including the reps where the
+variant ran first. So the hand-set grouping is right and the bench is measuring
+something the model does not see: in the model the same L2 is shared with the
+attention, SSM and paired-kernel traffic, so an isolated GEMM's operand
+residency is not the model's. The change was reverted.
+
+The general lesson is worth more than the result. This bench reproduces the
+*kernel's* instruction and phase behaviour well -- the per-phase clock above,
+the VALU-per-WMMA counts, the BK ordering all agreed with the model -- but not
+its memory-system behaviour. Grouping, residency and reuse must be measured end
+to end.
 
 ### The int4 lever is priced, and it is expensive
 
