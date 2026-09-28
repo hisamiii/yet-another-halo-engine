@@ -43,7 +43,7 @@ explicitly deferred.
 | yah_kv_dequant_q8_f16.loom | engine/kv/kv_quant.hip | KV cache unpack from q8 blocks | ported, 0.0275 ms at 10240 blocks; byte-exact vs fixture |
 | yah_kv_quant_q4_f16.loom | engine/kv/kv_quant.hip | KV cache pack to q4 blocks | ported, 0.0266 ms at 10240 blocks; byte-exact vs fixture |
 | yah_kv_dequant_q4_f16.loom | engine/kv/kv_quant.hip | KV cache unpack from q4 blocks | ported, 0.0239 ms at 10240 blocks; byte-exact vs fixture |
-| - | engine/kv/kv_quant.hip | in-place Hadamard over an fp16 KV block | todo (fp32 variant ported) |
+| yah_hadamard_f16.loom | engine/kv/kv_quant.hip | in-place Hadamard over an fp16 KV block | ported, 0.0222 ms at rows=1 |
 | - | vision/encoder.hip, device_input.hip | vision tower | todo |
 
 ## Notes carried over from the FFN GEMM port
@@ -112,3 +112,8 @@ explicitly deferred.
   `check.oracle.call` provider would be nicer, but the shipped tool registers only
   `reference.matmul` and `reference.tiled_matmul`; a scalar oracle is an embedding
   hook the CLI does not wire up.
+- **When an fp16 result would round, rescale the input so the expectation stays an
+  arithmetic sequence.** The unscaled f16 Hadamard sums to `15872 + 32*e`, which
+  fp16 cannot represent, so no single `check.generate.iota` describes it. Dividing
+  `h` by 16 makes the sum `992 + 2*e`, exactly representable and still an iota. The
+  transform itself is unchanged; only the fixture's magnitude moves.
