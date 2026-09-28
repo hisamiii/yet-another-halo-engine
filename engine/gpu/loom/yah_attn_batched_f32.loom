@@ -1,0 +1,246 @@
+// YAH batched attention, Loom port of BatchedAttentionKernel.
+//
+// HIP source: models/qwen/hip/kernels/attention_batched.hip. One workgroup per
+// (head, token):
+//
+//   kv_h      = head / heads_per_kv         (HIP: num_heads / num_kv_heads)
+//   cur_pos   = start_pos + token
+//   seq_len   = cur_pos + 1                 causal: keys up to and including self
+//   scale     = 1 / sqrt(head_dim)
+//   scores[p] = dot(q, k[p]) * scale        p < seq_len
+//   s         = softmax(scores[0..seq_len))
+//   ctx[d]    = sum_p s[p] * v[p][d]
+//   out[d]    = ctx[d] * sigmoid(gate[d])
+//
+// The two caches use the same layouts as the KV write kernel:
+//   f32: ((layer*num_kv_heads + kv_h)*max_context + p)*head_dim + d
+//   f16: ((layer*max_context + p)*num_kv_heads*head_dim) + kv_h*head_dim + d
+// and this port selects between them with a config flag where HIP tests the f32
+// cache pointer for null.
+//
+// Re-tiling: HIP distributes the head_dim dot across the warp when seq_len >= 64
+// and gives each thread a whole position below that. This port always uses the
+// second shape -- each lane owns a position and walks head_dim serially -- so the
+// arithmetic is the small-sequence path's, which computes the same dot. The
+// softmax is one subgroup with `kernel.subgroup.reduce` for the max and the sum,
+// instead of the HIP kernel's 256-thread shared-memory trees, and the scores live
+// in a workgroup scratch buffer sized by a config because Loom needs the extent at
+// compile time.
+//
+// Not covered: the bf16 output arm (HIP writes out_context_bf16 when asked) and the
+// gated-off form (this port always requires a gate buffer). PORTING.md records it.
+//
+// Required config: --config=yah_attn_batched.layer_idx=0
+//                  --config=yah_attn_batched.start_pos=1
+//                  --config=yah_attn_batched.batch_size=1
+//                  --config=yah_attn_batched.max_context=2
+//                  --config=yah_attn_batched.num_heads=1
+//                  --config=yah_attn_batched.num_kv_heads=1
+//                  --config=yah_attn_batched.head_dim=4
+//                  --config=yah_attn_batched.heads_per_kv=1
+//                  --config=yah_attn_batched.score_capacity=2
+//                  --config=yah_attn_batched.use_f16=0|1
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_attn_batched.layer_idx : %value: index where [range(%value, 0, 65536)]
+config.decl @yah_attn_batched.start_pos : %value: index where [range(%value, 0, 1073741824)]
+config.decl @yah_attn_batched.batch_size : %value: index where [range(%value, 1, 65536)]
+config.decl @yah_attn_batched.max_context : %value: index where [range(%value, 1, 1048576)]
+config.decl @yah_attn_batched.num_heads : %value: index where [range(%value, 1, 4096)]
+config.decl @yah_attn_batched.num_kv_heads : %value: index where [range(%value, 1, 4096)]
+config.decl @yah_attn_batched.head_dim : %value: index where [range(%value, 1, 1024)]
+config.decl @yah_attn_batched.heads_per_kv : %value: index where [range(%value, 1, 4096)]
+config.decl @yah_attn_batched.score_capacity : %value: index where [range(%value, 1, 1048576)]
+config.decl @yah_attn_batched.use_f16 : %value: index where [range(%value, 0, 1)]
+
+kernel.def target(@yah_wave32) @yah_attn_batched() {
+  %unit = index.constant 1 : index
+  %num_heads = config.get @yah_attn_batched.num_heads : index
+  %batch_size = config.get @yah_attn_batched.batch_size : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%num_heads, %batch_size, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%q: buffer, %gate: buffer, %k_cache: buffer, %v_cache: buffer, %k_cache_f16: buffer, %v_cache_f16: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %negone = scalar.constant -1.0 : f32
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %guard = scalar.constant 0.000000001 : f32
+  %neg_infinite = scalar.constant -300000000000000000000000000000000000000.0 : f32
+  %layer_idx = config.get @yah_attn_batched.layer_idx : index
+  %start_pos = config.get @yah_attn_batched.start_pos : index
+  %batch_size = config.get @yah_attn_batched.batch_size : index
+  %max_context = config.get @yah_attn_batched.max_context : index
+  %num_heads = config.get @yah_attn_batched.num_heads : index
+  %num_kv_heads = config.get @yah_attn_batched.num_kv_heads : index
+  %head_dim = config.get @yah_attn_batched.head_dim : index
+  %heads_per_kv = config.get @yah_attn_batched.heads_per_kv : index
+  %score_capacity = config.get @yah_attn_batched.score_capacity : index
+  %use_f16_flag = config.get @yah_attn_batched.use_f16 : index
+  %use_f16 = index.cmp eq, %use_f16_flag, %c1 : index
+  %q_width = index.mul %num_heads, %head_dim : index
+  %q_total = index.mul %batch_size, %q_width : index
+  %kv_width = index.mul %num_kv_heads, %head_dim : index
+  %cache_total = index.mul %num_kv_heads, %max_context : index
+  %cache_elems = index.mul %cache_total, %head_dim : index
+  %scratch_len = index.mul %score_capacity, %c4 : index
+  %scratch_bytes = index.cast %scratch_len : index to offset
+  %scratch = buffer.alloca<workgroup> align(16) %scratch_bytes : buffer
+  %scores = buffer.view %scratch[%base] : buffer -> view<[%score_capacity]xf32>
+  %q_na, %gate_na, %out_na = buffer.assume.noalias %q, %gate, %out : buffer, buffer, buffer
+  %q_view = buffer.view %q_na[%base] : buffer -> view<[%q_total]xf32>
+  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%q_total]xf32>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%q_total]xf32>
+  %kc_view = buffer.view %k_cache[%base] : buffer -> view<[%cache_elems]xf32>
+  %vc_view = buffer.view %v_cache[%base] : buffer -> view<[%cache_elems]xf32>
+  %kh_view = buffer.view %k_cache_f16[%base] : buffer -> view<[%cache_elems]xf16>
+  %vh_view = buffer.view %v_cache_f16[%base] : buffer -> view<[%cache_elems]xf16>
+  %h = kernel.workgroup.id<x> : index
+  %t = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %kv_h = index.div %h, %heads_per_kv : index
+  %cur_pos = index.add %start_pos, %t : index
+  %seq_len = index.add %cur_pos, %c1 : index
+  %t_row = index.mul %t, %q_width : index
+  %h_row = index.mul %h, %head_dim : index
+  %q_base = index.add %t_row, %h_row : index
+  %layer_heads = index.mul %layer_idx, %num_kv_heads : index
+  %cache_head = index.add %layer_heads, %kv_h : index
+  %layer_ctx = index.mul %layer_idx, %max_context : index
+  %scale_denom_i = index.cast %head_dim : index to i32
+  %scale_denom = scalar.sitofp %scale_denom_i : i32 to f32
+  %scale_root = scalar.sqrtf %scale_denom : f32
+  %scale = scalar.divf %one, %scale_root : f32
+  // Step 1: scores[p] = dot(q, k[p]) * scale, one lane per position.
+  %phase1 = scf.for %p = [%lane to %seq_len step %c32](%m1 = %zero : f32) -> (f32) {
+    %f32_rowp = index.mul %cache_head, %max_context : index
+    %f32_pos = index.add %f32_rowp, %p : index
+    %f32_off0 = index.mul %f32_pos, %head_dim : index
+    %f16_pos = index.add %layer_ctx, %p : index
+    %f16_row = index.mul %f16_pos, %kv_width : index
+    %f16_head = index.mul %kv_h, %head_dim : index
+    %f16_off0 = index.add %f16_row, %f16_head : index
+    %dot = scf.for %d = [%c0 to %head_dim step %c1](%acc = %zero : f32) -> (f32) {
+      %q_off = index.add %q_base, %d : index
+      %q_val = view.load %q_view[%q_off] : view<[%q_total]xf32> -> f32
+      %f32_off = index.add %f32_off0, %d : index
+      %f16_off = index.add %f16_off0, %d : index
+      %k_val = scf.if %use_f16 -> (f32) {
+        %kh = view.load %kh_view[%f16_off] : view<[%cache_elems]xf16> -> f16
+        %khf = scalar.extf %kh : f16 to f32
+        scf.yield %khf : f32
+      } else {
+        %kf = view.load %kc_view[%f32_off] : view<[%cache_elems]xf32> -> f32
+        scf.yield %kf : f32
+      }
+      %prod = scalar.mulf %q_val, %k_val : f32
+      %next = scalar.addf %acc, %prod : f32
+      scf.yield %next : f32
+    }
+    %scaled = scalar.mulf %dot, %scale : f32
+    view.store %scaled, %scores[%p] : f32, view<[%score_capacity]xf32>
+    scf.yield %m1 : f32
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  // Step 2a: max over the visible prefix.
+  %local_max = scf.for %p2 = [%lane to %seq_len step %c32](%m2 = %neg_infinite : f32) -> (f32) {
+    %s2 = view.load %scores[%p2] : view<[%score_capacity]xf32> -> f32
+    %bigger = scalar.maxnumf %m2, %s2 : f32
+    scf.yield %bigger : f32
+  }
+  %max_score = kernel.subgroup.reduce<maxnumf> %local_max : f32
+  // Step 2b: exp and sum.
+  %local_sum = scf.for %p3 = [%lane to %seq_len step %c32](%m3 = %zero : f32) -> (f32) {
+    %s3 = view.load %scores[%p3] : view<[%score_capacity]xf32> -> f32
+    %shifted = scalar.subf %s3, %max_score : f32
+    %e3 = scalar.expf<afn> %shifted : f32
+    view.store %e3, %scores[%p3] : f32, view<[%score_capacity]xf32>
+    %sum3 = scalar.addf %m3, %e3 : f32
+    scf.yield %sum3 : f32
+  }
+  %sum_all = kernel.subgroup.reduce<addf> %local_sum : f32
+  %guarded = scalar.addf %sum_all, %guard : f32
+  %inv_sum = scalar.divf %one, %guarded : f32
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %phase2 = scf.for %p4 = [%lane to %seq_len step %c32](%m4 = %zero : f32) -> (f32) {
+    %s4 = view.load %scores[%p4] : view<[%score_capacity]xf32> -> f32
+    %n4 = scalar.mulf %s4, %inv_sum : f32
+    view.store %n4, %scores[%p4] : f32, view<[%score_capacity]xf32>
+    scf.yield %m4 : f32
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  // Step 3: weighted sum of v, one lane per output dimension.
+  %phase3 = scf.for %d3 = [%lane to %head_dim step %c32](%m5 = %zero : f32) -> (f32) {
+    %ctx = scf.for %p5 = [%c0 to %seq_len step %c1](%c5 = %zero : f32) -> (f32) {
+      %s5 = view.load %scores[%p5] : view<[%score_capacity]xf32> -> f32
+      %f32_row5 = index.mul %cache_head, %max_context : index
+      %f32_p5 = index.add %f32_row5, %p5 : index
+      %f32_base5 = index.mul %f32_p5, %head_dim : index
+      %f32_off5 = index.add %f32_base5, %d3 : index
+      %f16_p5 = index.add %layer_ctx, %p5 : index
+      %f16_row5 = index.mul %f16_p5, %kv_width : index
+      %f16_head5 = index.mul %kv_h, %head_dim : index
+      %f16_base5 = index.add %f16_row5, %f16_head5 : index
+      %f16_off5 = index.add %f16_base5, %d3 : index
+      %v5 = scf.if %use_f16 -> (f32) {
+        %vh = view.load %vh_view[%f16_off5] : view<[%cache_elems]xf16> -> f16
+        %vhf = scalar.extf %vh : f16 to f32
+        scf.yield %vhf : f32
+      } else {
+        %vf = view.load %vc_view[%f32_off5] : view<[%cache_elems]xf32> -> f32
+        scf.yield %vf : f32
+      }
+      %prod5 = scalar.mulf %s5, %v5 : f32
+      %next5 = scalar.addf %c5, %prod5 : f32
+      scf.yield %next5 : f32
+    }
+    %g_off = index.add %q_base, %d3 : index
+    %g = view.load %gate_view[%g_off] : view<[%q_total]xf32> -> f32
+    %neg_g = scalar.mulf %g, %negone : f32
+    %e_g = scalar.expf<afn> %neg_g : f32
+    %denom = scalar.addf %one, %e_g : f32
+    %sig = scalar.divf %one, %denom : f32
+    %result = scalar.mulf %ctx, %sig : f32
+    view.store %result, %out_view[%g_off] : f32, view<[%q_total]xf32>
+    scf.yield %m5 : f32
+  }
+  kernel.return
+}
+
+// Requires the config block above with use_f16=0.
+check.case public @yah_attn_batched_f32case {
+  %q = check.file.read.npy path("fixtures/batched_attention/input_q.npy") : tensor<4xf32>
+  %gate = check.file.read.npy path("fixtures/batched_attention/input_gate.npy") : tensor<4xf32>
+  %k = check.file.read.npy path("fixtures/batched_attention/input_k.npy") : tensor<8xf32>
+  %v = check.file.read.npy path("fixtures/batched_attention/input_v.npy") : tensor<8xf32>
+  %expected = check.file.read.npy path("fixtures/batched_attention/expected_out.npy") : tensor<4xf32>
+  %k16 = check.generate.fill value(0.0) : tensor<8xf16>
+  %v16 = check.generate.fill value(0.0) : tensor<8xf16>
+  %out = check.generate.fill value(0.0) : tensor<4xf32>
+  kernel.launch @yah_attn_batched(%q, %gate, %k, %v, %k16, %v16, %out) : (tensor<4xf32>, tensor<4xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf16>, tensor<8xf16>, tensor<4xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.benchmark<@yah_attn_batched_f32case> @yah_attn_batched_f32_bench
+
+// Requires the config block above with use_f16=1. Same k and v values in the f16
+// cache, which is the layout the engine's tiled path uses.
+check.case public @yah_attn_batched_f16case {
+  %q = check.file.read.npy path("fixtures/batched_attention/input_q.npy") : tensor<4xf32>
+  %gate = check.file.read.npy path("fixtures/batched_attention/input_gate.npy") : tensor<4xf32>
+  %k = check.file.read.npy path("fixtures/batched_attention/input_k.npy") : tensor<8xf32>
+  %v = check.file.read.npy path("fixtures/batched_attention/input_v.npy") : tensor<8xf32>
+  %expected = check.file.read.npy path("fixtures/batched_attention/expected_out.npy") : tensor<4xf32>
+  %k16 = check.file.read.npy path("fixtures/batched_attention/input_k_f16.npy") : tensor<8xf16>
+  %v16 = check.file.read.npy path("fixtures/batched_attention/input_v_f16.npy") : tensor<8xf16>
+  %out = check.generate.fill value(0.0) : tensor<4xf32>
+  kernel.launch @yah_attn_batched(%q, %gate, %k, %v, %k16, %v16, %out) : (tensor<4xf32>, tensor<4xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf16>, tensor<8xf16>, tensor<4xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.benchmark<@yah_attn_batched_f16case> @yah_attn_batched_f16_bench

@@ -40,7 +40,8 @@ explicitly deferred.
 | yah_attn_gate_f32.loom | attention_batched.hip | attention output gate | ported, two exact sigmoid points, no fixture |
 | yah_attn_softmax_f32.loom | attention_batched.hip | causal softmax + causal zeroing | ported, exact at both mask ends |
 | yah_kv_cache_write_f32.loom | attention_batched.hip | batched KV cache write, f32 + f16 layouts | ported, 0.0113 ms; exact fixture (the two layouts differ) |
-| - | attention_batched.hip, prefill_attention*.hip, attention_wmma.hip | batched attention core, tiled/WMMA attention, KV prefix sync | todo |
+| yah_attn_batched_f32.loom | attention_batched.hip | batched attention core, f32 + f16 cache | ported, 0.0091/0.0120 ms; fixture + 1e-6 |
+| - | attention_batched.hip, prefill_attention*.hip, attention_wmma.hip | tiled/WMMA attention, KV prefix sync, head packing, bf16 output | todo |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
@@ -179,6 +180,12 @@ profile gives one, so the expensive paths move first rather than the convenient 
   `1/sequence_length`, and a one-key row is exactly `1` followed by zeros. The
   kernel's own `+1e-9` guard is harmless in fp32 because `1 + 1e-9` and `4 + 1e-9`
   both round back to their integer.
+- **`buffer.alloca<workgroup>` takes an `offset` byte length, not an `index`.**
+  Build the size as an index and cast:
+  `%bytes = index.cast %len : index to offset`. Passing an index is
+  `TYPE/003: operand 'byte_length' has type index, expected offset`. A runtime
+  size is accepted, so a workgroup scratch can be sized by a `config` instead of
+  being a fixed constant.
 - **`scalar.sitofp` rejects `index`.** Cast first:
   `%i = index.cast %n : index to i32` then `%f = scalar.sitofp %i : i32 to f32`.
   The failure is `TYPE/003: operand 'input' has type index, expected integer`.
