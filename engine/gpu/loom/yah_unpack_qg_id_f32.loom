@@ -1,0 +1,78 @@
+// YAH decode QG unpack, Loom port of UnpackQGKernel.
+//
+// HIP source: models/qwen/hip/kernels/unpack.hip. De-interleaves a buffer holding
+// two head_dim vectors per head, Q then gate, into two flat outputs:
+//
+//   q[tid]    = qg[head*2*head_dim + d]
+//   gate[tid] = qg[head*2*head_dim + head_dim + d]     tid = head*head_dim + d
+//
+// The HIP kernel derives head and d from tid with a division and a modulo by
+// head_dim. This port uses two-dimensional views and a two-dimensional grid, so the
+// head and the column are grid coordinates and no index division appears.
+//
+// The check uses two heads of three: the flat Q output jumps at the head boundary,
+// so it is a fixture rather than an iota, and a wrong head stride would break it.
+//
+// Required config: --config=yah_unpack_qg_id.num_heads=2
+//                  --config=yah_unpack_qg_id.head_dim=3
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_unpack_qg_id.num_heads : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_unpack_qg_id.head_dim : %value: index where [range(%value, 1, 4096)]
+
+kernel.def target(@yah_wave32) @yah_unpack_qg_id() {
+  %unit = index.constant 1 : index
+  %num_heads = config.get @yah_unpack_qg_id.num_heads : index
+  %head_dim = config.get @yah_unpack_qg_id.head_dim : index
+  %head_width = index.mul %head_dim, %head_dim : index
+  %two = index.constant 2 : index
+  %interleaved_cols = index.mul %head_dim, %two : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %head_dim, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %num_heads, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%qg: buffer, %q_out: buffer, %gate_out: buffer) {
+  %base = index.constant 0 : offset
+  %num_heads = config.get @yah_unpack_qg_id.num_heads : index
+  %head_dim = config.get @yah_unpack_qg_id.head_dim : index
+  %two = index.constant 2 : index
+  %interleaved_cols = index.mul %head_dim, %two : index
+  %total = index.mul %num_heads, %head_dim : index
+  %qg_na, %q_na, %gate_na = buffer.assume.noalias %qg, %q_out, %gate_out : buffer, buffer, buffer
+  %qg_view = buffer.view %qg_na[%base] : buffer -> view<[%num_heads]x[%interleaved_cols]xf32>
+  %q_view = buffer.view %q_na[%base] : buffer -> view<[%num_heads]x[%head_dim]xf32>
+  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%num_heads]x[%head_dim]xf32>
+  %h = kernel.workgroup.id<y> : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %c256b = index.constant 256 : index
+  %wg_base = index.mul %wg, %c256b : index
+  %d = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %d, %head_dim : index
+  scf.if %in_range {
+    %qv = view.load %qg_view[%h, %d] : view<[%num_heads]x[%interleaved_cols]xf32> -> f32
+    %gate_col = index.add %head_dim, %d : index
+    %gv = view.load %qg_view[%h, %gate_col] : view<[%num_heads]x[%interleaved_cols]xf32> -> f32
+    view.store %qv, %q_view[%h, %d] : f32, view<[%num_heads]x[%head_dim]xf32>
+    view.store %gv, %gate_view[%h, %d] : f32, view<[%num_heads]x[%head_dim]xf32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_unpack_qg_id.num_heads=2 --config=yah_unpack_qg_id.head_dim=3.
+check.case public @yah_unpack_qg_id_case {
+  %qg = check.generate.iota offset(0.0) step(1.0) : tensor<2x6xf32>
+  %q_out = check.generate.fill value(0.0) : tensor<2x3xf32>
+  %gate_out = check.generate.fill value(0.0) : tensor<2x3xf32>
+  %expected_q = check.file.read.npy path("fixtures/unpack_qg_decode/expected_q.npy") : tensor<2x3xf32>
+  %expected_gate = check.file.read.npy path("fixtures/unpack_qg_decode/expected_gate.npy") : tensor<2x3xf32>
+  kernel.launch @yah_unpack_qg_id(%qg, %q_out, %gate_out) : (tensor<2x6xf32>, tensor<2x3xf32>, tensor<2x3xf32>)
+  check.expect.close actual(%q_out) expected(%expected_q) atol(0.0) rtol(0.0) nan(same) : tensor<2x3xf32>
+  check.expect.close actual(%gate_out) expected(%expected_gate) atol(0.0) rtol(0.0) nan(same) : tensor<2x3xf32>
+  check.return
+}
+
+check.benchmark<@yah_unpack_qg_id_case> @yah_unpack_qg_id_bench

@@ -55,6 +55,8 @@ explicitly deferred.
 | yah_half_norm_f16.loom | prefill_fp16.hip | fp16-output norm with residual and sum_out | ported, 0.0224 ms at dim 512; exact both buffers |
 | yah_half_norm5120_f16.loom | prefill_fp16.hip | fp16-output norm, width-specialized | ported, 0.0235/0.0788 ms at dim 512/5120 |
 | yah_bfp16_roundtrip_f16.loom | prefill_fp16.hip | bfp16 shared-exponent round trip (diagnostic) | ported, 0.0072 ms; bit-exact vs fixture |
+| yah_residual_add_1d_f32.loom | residual.hip | 1-D residual add (decode) | ported, 0.0075 ms; exact, no fixture |
+| yah_unpack_qg_id_f32.loom | unpack.hip | decode QG de-interleave | ported, 0.0075 ms; exact fixture |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
 | yah_argmax_f32.loom | sample.hip | argmax over logits | ported, 0.0145 ms at vocab 1024; sampling variants todo |
 | yah_hadamard_f32.loom | engine/kv/kv_quant.hip | in-place Hadamard over a KV block | ported, 0.0139 ms at rows=1 |
@@ -70,7 +72,7 @@ explicitly deferred.
 ## Remaining inventory
 
 From `grep -c '__global__ void'` over `engine/gpu/ported/src/models/qwen`. Roughly
-100 kernels; 40 are ported. Ordered by share of prefill time where the model-level
+100 kernels; 42 are ported. Ordered by share of prefill time where the model-level
 profile gives one, so the expensive paths move first rather than the convenient ones.
 
 | Area | File | Kernels |
@@ -90,7 +92,7 @@ profile gives one, so the expensive paths move first rather than the convenient 
 | GEMV (1.5%) | gemv.hip, gemv_quant.hip | FastGEMVBlockKernel, and the quantized variant |
 | sampling | sample.hip | 13 more kernels: batched argmax, sparse penalties, linear/sorted sampling, and the speculative segment set |
 | vision | vision/encoder.hip, vision/device_input.hip | Patchify, PatchPosition, QkvRope, AttentionRows, Softmax, LayerNorm, BiasResidual, Activate, Finish, InjectRows |
-| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | the Ptr and decode-side variants |
+| decode leftovers | embed.hip, rope.hip, norm.hip, residual.hip, unpack.hip, swiglu.hip | **ported**: residual.hip, unpack.hip. **todo**: the Ptr and remaining decode-side variants, FastFusedSwiGLUGEMVBlockKernel |
 | dflash | dflash_kernels.hip | grouped convolution, non-causal attention (2), q8_0 quantize, silu_mul, and four selector kernels |
 | benchmark scaffolding | core/hip/allocation_benchmark.hip | not part of the engine kernel set |
 

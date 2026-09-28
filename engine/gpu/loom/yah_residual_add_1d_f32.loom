@@ -1,0 +1,59 @@
+// YAH 1-D residual add, Loom port of ResidualAddKernel.
+//
+// HIP source: models/qwen/hip/kernels/residual.hip. The decode-side twin of the
+// batched prefill residual add:
+//
+//   out[idx] = a[idx] + b[idx]
+//
+// A flat index domain with no routing, so only the stride can be wrong. The check
+// needs no fixture: a is an iota and b an iota with a different offset, so the sum
+// is the arithmetic sequence 100 + 2*idx.
+//
+// Required config: --config=yah_residual_1d.dim=8
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_residual_1d.dim : %value: index where [range(%value, 1, 1073741824)]
+
+kernel.def target(@yah_wave32) @yah_residual_1d() {
+  %unit = index.constant 1 : index
+  %dim = config.get @yah_residual_1d.dim : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %dim, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%a: buffer, %b: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %dim = config.get @yah_residual_1d.dim : index
+  %a_na, %b_na, %out_na = buffer.assume.noalias %a, %b, %out : buffer, buffer, buffer
+  %a_view = buffer.view %a_na[%base] : buffer -> view<[%dim]xf32>
+  %b_view = buffer.view %b_na[%base] : buffer -> view<[%dim]xf32>
+  %out_view = buffer.view %out_na[%base] : buffer -> view<[%dim]xf32>
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %wg_base = index.mul %wg, %c256 : index
+  %idx = index.add %wg_base, %lane : index
+  %in_range = index.cmp ult, %idx, %dim : index
+  scf.if %in_range {
+    %av = view.load %a_view[%idx] : view<[%dim]xf32> -> f32
+    %bv = view.load %b_view[%idx] : view<[%dim]xf32> -> f32
+    %sum = scalar.addf %av, %bv : f32
+    view.store %sum, %out_view[%idx] : f32, view<[%dim]xf32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_residual_1d.dim=8.
+check.case public @yah_residual_1d_case {
+  %a = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
+  %b = check.generate.iota offset(100.0) step(1.0) : tensor<8xf32>
+  %out = check.generate.fill value(0.0) : tensor<8xf32>
+  %expected = check.generate.iota offset(100.0) step(2.0) : tensor<8xf32>
+  kernel.launch @yah_residual_1d(%a, %b, %out) : (tensor<8xf32>, tensor<8xf32>, tensor<8xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
+  check.return
+}
+
+check.benchmark<@yah_residual_1d_case> @yah_residual_1d_bench
