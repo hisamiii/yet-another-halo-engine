@@ -60,6 +60,7 @@ explicitly deferred.
 | yah_qkv_q4k_f32.loom | qkv.hip | fused quantized QKV projection, Q4_K (Wave32FusedQKVProjectionsKernel_1Row) | ported, 0.447 ms at q=6144/kv=1024; three row bands each checked |
 | yah_ffn_gemm_q5k_f32.loom | prefill_fp16.hip | batched Q5_K FFN GEMM with in-kernel decode (kStore) | ported, 15.54 ms at m_tiles=1088; fixture exact at m_tiles=1 |
 | yah_ffn_gemm_iq4xs_f32.loom | prefill_fp16.hip | batched IQ4_XS FFN GEMM with in-kernel codebook decode (kStore) | ported, 14.64 ms at m_tiles=1088; fixture exact at m_tiles=1 |
+| yah_ffn_gemm_q8_0_f32.loom | prefill_fp16.hip | batched Q8_0 FFN GEMM with in-kernel decode (kStore) | ported, 13.38 ms at m_tiles=1088; fixture exact at m_tiles=1 |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -149,8 +150,8 @@ shard on disk is not a Q4_K shard: of its 866 tensors, 172 are IQ4_XS (Q4_K is
 95, Q5_K 80, Q8_0 99, Q6_K 18, IQ3_S 15, Q3_K 13, IQ4_NL 7, IQ3_XXS 5, and one
 each IQ2_XS and IQ2_S), and the IQ4_XS set includes the SSM attention
 projections. Parse the header with a GGUF tensor-type histogram before assuming
-a format is on the route. Q4_K, Q5_K and now IQ4_XS have a Loom GEMM; the other
-seven formats do not.
+a format is on the route. Q4_K, Q5_K, IQ4_XS and now Q8_0 have a Loom GEMM; the
+other six shard formats do not.
 HalfPrefillGemmKernel is templated on the packed weight format and decodes Q4_K,
 Q5_K, Q6_K and the rest in-kernel through DecodeQuantSub16; the four ports above
 load pre-decoded fp16 weights, which is the Fp16W ablation path and whose byte
@@ -164,9 +165,9 @@ three are tuning items, explicitly deferred. The residual and SwiGLU epilogues
 have the same Q4_K port (yah_ffn_gemm_q4k_residual_f32, yah_ffn_gemm_q4k_swiglu_f16,
 23.11/16.98 ms at production size), and yah_ffn_gemm_q4k_gateup_f16 (32.03 ms)
 shares one activation tile and one output between two decoders. The remaining
-format work is the remaining shard formats (Q8_0, Q6_K, IQ3_S, Q3_K, IQ4_NL,
-IQ3_XXS, IQ2_XS, IQ2_S) and the residual/SwiGLU/paired epilogues for the Q5_K and
-IQ4_XS store arms, which so far only have kStore.
+format work is the remaining shard formats (Q6_K, IQ3_S, Q3_K, IQ4_NL, IQ3_XXS,
+IQ2_XS, IQ2_S) and the residual/SwiGLU/paired epilogues for the Q5_K, IQ4_XS and
+Q8_0 store arms, which so far only have kStore.
 
 Reachability evidence for the entries that are not on that route:
 
