@@ -2,3 +2,4 @@
 .rocprofv3/
 .rocprofv3-*/
 *.rocprof
+__pycache__/
