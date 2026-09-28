@@ -1,31 +1,36 @@
 // YAH FFN GEMM in Loom: out[m][t] = sum_k W[m][k] * A[t][k].
 //
-// v2. v1 tiled the token axis into four workgroups (a 16-token N tile, n_tiles=4),
-// which made every one of the 1088 M tiles read its 16x5120 weight tile four
-// times: 713 MB of weight traffic for a 178 MB weight tensor. v1 measured
-// 6.109 ms, i.e. 117 GB/s -- the same effective bandwidth as our tuned HIP
-// kernel, so the 4.5x gap was never a compiler deficiency but the redundant
-// traffic itself.
+// v3. v2 collapsed the token axis into one workgroup (M16 x N64) so the weight
+// tensor is read exactly once, taking v1's 5.979 ms to 3.000 ms (2.00x,
+// correctness passing in both). v2's remaining problem was that every WMMA
+// operand came straight from global memory with nothing pipelined across K
+// steps: 320 sequential iterations each exposed a whole memory latency, which
+// works out to about one WMMA per 121 cycles per CU. At 178 MB of weight
+// traffic over 3.000 ms v2 ran at 59 GB/s, so it was latency-bound and not
+// bandwidth-bound.
 //
-// This version puts the whole token axis in one workgroup: M tile 16, N tile 64,
-// four independent f16 WMMA accumulators sharing a single lhs (weight) fragment
-// load per K step, so the weight tile is read from memory exactly once and DRAM
-// weight traffic is 17408 * 5120 * 2 = 178 MB for the whole kernel.
+// This version keeps the arithmetic and tile identical and changes only the loop
+// schedule. pipeline(%depth) is ordinary read-ahead: it moves the global operand
+// loads ahead of the ordered consumer while the MMAs against the carried
+// accumulator stay in source order. The schedule is config-driven so the sweep
+// needs no source edit, as the Loom loop schedule workflow describes.
 //
-// Measured against v1 with iree-benchmark-loom --measure=dispatch_complete and
-// otherwise identical flags: 5.979 ms -> 3.000 ms, a 2.00x improvement (1.909 ->
-// 3.805 TFLOP/s), correctness passing in both. The traffic model predicted
-// 1.5 ms, so traffic is only half the story: v1 moved 713 MB in 5.979 ms
-// (119 GB/s) but v2 moves 178 MB in 3.000 ms (59 GB/s), so v2 is no longer
-// weight-bandwidth bound.
+// Measured on gfx1151, iree-benchmark-loom --measure=dispatch_complete, 5 timed
+// batches after 2 warmups, serially in one session, correctness passing in all
+// four arms:
 //
-// What it is bound by: every WMMA operand still comes straight from global
-// memory, and nothing pipelines one K step against the next, so each of the 320
-// iterations exposes a whole memory latency before its MMAs can retire. Across
-// 40 CUs that lands at roughly one WMMA per 121 cycles -- latency, not issue,
-// throughput. The next levers are therefore more independent accumulator chains
-// per workgroup (a larger M tile, which also raises the WMMA-per-load ratio) and
-// staging operands in LDS instead of reading them from global per step.
+//   depth.unroll  vector VGPR   time      TFLOP/s
+//   1.1 (v2)          80        2.895 ms    3.940    matched serial control
+//   2.2               -         2.501 ms    4.562
+//   3.2              200        1.819 ms    6.271    shipped default
+//   4.2              240        1.918 ms    5.949
+//
+// So read-ahead is worth 1.59x over the serial control, and depth four regresses:
+// the queue costs vector registers (80 -> 200 -> 240), which directly costs
+// resident warps, and past depth three the occupancy loss overtakes the overlap
+// gained. Zero spills at every depth. Against our tuned HIP kernel at the same
+// fp16 precision (1.353 ms, 8.43 TFLOP/s) this leaves a 1.34x gap, down from
+// 4.4x for v1.
 //
 // The activation operand is token-major ([t][k]), so the rhs operand is a
 // *strided view* of it as [k][t] (encoding.layout.strided [1, 5120]) rather than
@@ -33,13 +38,16 @@
 //
 // Correctness case uses all-ones operands, so every output must equal K = 5120
 // exactly in f32: with f16 inputs of 1.0 the products are exactly 1.0 and the
-// f32 accumulation of 5120 of them is exact. That checks the K reduction and the
-// operand indexing rather than just checking for NaNs. The four N sub-tiles share
-// the lhs fragment load and the K loop, so an indexing error in any one of them
-// cannot cancel against the others.
+// f32 accumulation of 5120 of them is exact. The four N sub-tiles share the lhs
+// fragment load and the K loop, so an indexing error in any one of them cannot
+// cancel against the others.
 amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_f16.m_tiles : %value: index where [range(%value, 1, 4096)]
+
+config.def @yah_ffn_gemm_f16.depth = 3 : index
+
+config.def @yah_ffn_gemm_f16.unroll = 2 : index
 
 kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_f16() {
   %unit = index.constant 1 : index
@@ -68,9 +76,12 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_f16() {
   %wg_x = kernel.workgroup.id<x> : index
   %m_origin = index.mul %wg_x, %c16 : index
 
+  %depth = config.get @yah_ffn_gemm_f16.depth : index
+  %factor = config.get @yah_ffn_gemm_f16.unroll : index
+
   %zeros = vector.constant 0.0 : vector<8xf32>
   %init = vector.fragment<init> %zeros shape [%m, %n] : vector<8xf32>
-  %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %c5120 step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll schedule(recurrence) {
+  %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %c5120 step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) pipeline(%depth) unroll(%factor) schedule(recurrence) {
     %lhs = vector.fragment.load<lhs> %w_view[%m_origin, %kk] shape [%m, %k] : view<17408x5120xf16> -> vector<16xf16>
     %rhs0 = vector.fragment.load<rhs> %a_t_view[%kk, %c0] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
     %rhs1 = vector.fragment.load<rhs> %a_t_view[%kk, %c16] shape [%k, %n] : view<5120x64xf16, %a_layout> -> vector<16xf16>
