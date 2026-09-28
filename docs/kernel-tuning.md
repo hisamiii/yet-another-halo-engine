@@ -1456,50 +1456,56 @@ kernel is at ~63% of the fp16 WMMA ceiling and none of the counters above, nor a
 of the ~25 interventions in this document, accounts for the other 37%. Answering
 that needs stall attribution, which gfx1151 does not expose, or a structural
 
-### Corrected efficiency, and why the tuning was inconclusive
+### Efficiency, measured by the protocol that already existed
 
-Measured correctly (both sides in TMAC/s, alternated within one session, peak taken
-from the sustained `blocks=640` kernel):
+The numbers in this section were first taken wrongly, and the error is worth
+recording because it produced a false conclusion about the whole line of work.
 
-| round | peak bursty | peak sustained | GEMM | efficiency |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 27.67 | 26.10 | 15.58 | 59.7% |
-| 1 | 27.65 | 25.12 | 14.63 | 58.2% |
-| 2 | 27.63 | 25.45 | 14.82 | 58.2% |
-| 3 | 27.63 | 25.29 | 14.89 | 58.9% |
-| 4 | 27.49 | 24.68 | 14.68 | 59.5% |
+`methodology.md` already specifies the controlled protocol: warm **every** arm,
+take **one** repetition per rep (`-r 1`), alternate which arm runs first, put a
+fixed **15 s gap before every timed run**, record SCLK and package power, and
+report work per clock. Its point is explicit: "within a multi-repetition run the
+first repetition is the boosted one, so an average mixes regimes. Pairing removes
+the drift; averaging does not."
 
-**The production GEMM is at ~59% of the same-session sustained fp16 WMMA peak, so
-there is ~41% of headroom** -- roughly twice what the stale 48.35 TFLOPS reference
-implied. The stale reference was understating the gap, which is the opposite of
-what a wrong reference usually does.
+The first attempt at this section violated it -- `one:q4k ... 30` averaged thirty
+launches back to back with no gap, and the peak kernel averaged five. Both mixed
+the boosted regime with the settled one. Re-run under the protocol, pair by pair,
+the same two arms are stable to well under a percent:
 
-**The reason every intervention in this document was inconclusive is now visible.**
-The same GEMM measured 14.6 TMAC/s in the alternating runs and 19.6 TMAC/s ten
-minutes earlier in the same session -- a **34% spread between processes minutes
-apart**. The effects being hunted were a few percent. On this box, with this
-protocol, a few-percent effect is simply not resolvable, and the failure mode is
-that real small wins and real small losses both read as "no change". That is the
-most likely explanation for the entire run of null results in the middle of this
-document, and it is not fixable by more careful alternation alone: the drift is
-larger than the effect.
+| rep | order | peak TMAC/s | GEMM TMAC/s | efficiency |
+| ---: | --- | ---: | ---: | ---: |
+| 0 | peak > gemm | 26.06 | 19.89 | 76.3% |
+| 1 | gemm > peak | 26.03 | 20.20 | 77.6% |
+| 2 | peak > gemm | 26.00 | 20.32 | 78.2% |
+| 3 | gemm > peak | 25.99 | 20.31 | 78.1% |
 
-Two things follow:
+**Peak spreads 0.13%, GEMM spreads 1.1%, and the efficiency is 77.9%** -- against
+the ~10% the same pair showed when averaged. So the "34% spread between processes"
+recorded earlier in this section, and the conclusion drawn from it that only large
+structural effects are measurable on this box, were **artifacts of the protocol
+violation, not properties of the machine.** A 1-2% effect is resolvable here; the
+instrument was being used wrong.
 
-- **Only large structural effects are measurable here.** On the same protocol the
-  int4 packed-dot class reads 28.99 TMAC/s against fp16 WMMA's 26.9 -- a 2.2x
-  advantage over the fp16 instruction is the kind of effect that survives this
-  noise, and a 3% instruction-count saving does not.
-- **A better protocol is required for anything smaller**: same-process, interleaved
-  A/B (not sequential blocks), many alternating pairs, and a reported
-  distribution rather than a mean. The `reg:`-style alternating sweeps used late in
-  this document are already the right shape; the earlier sequential ones were not.
+Two corrections follow from the same measurement:
 
-**What the 41% consists of** is the part this document could measure but not move:
-the K loop is 68-70% of block cycles at ~95% of its own limit, so the remaining
-~30% is the staging chain (fetch, decode, commit, barrier) outside the loop. 0.68 x
-0.95 = 0.65, which is the ~59-65% measured. Every attempt to shrink the ~30% moved
-something else at the same time, and none of it was resolvable above the noise.
+- **The GEMM is at ~78% of the same-session fp16 WMMA peak, not 59%.** That agrees
+  with the ~80% recorded for the best kernel in earlier sessions, so the original
+  efficiency reading was right and the 59% was wrong.
+- **The stale ceiling is real but small.** The in-session peak is 25.99-26.06
+  TMAC/s against the hardcoded 24.17 -- about 8% high, not the 10-13% estimated
+  from averaged runs. It is still worth measuring in-session, but it was not the
+  source of a large error.
 
-change that alters the instruction stream rather than its resources.
+One caveat on the SCLK column, which this harness does not yet report usefully: the
+sampler spans the whole process, and a `-r 1` GEMM run is ~9 ms of kernel inside a
+process dominated by the 89 MB weight fill, so the recorded clock is the fill's, not
+the kernel's (the runs above show 810-1419 MHz and 15-19 W for the GEMM against
+1755-1800 MHz and 37-43 W for the peak). Reporting work per clock for a short timed
+run needs the sampler bracketed on the timed launch, not the process.
 
+**The decomposition is left unreconciled.** The phase clock puts the K loop at 68-70%
+of block cycles at ~95% of its own limit, and `0.68 x 0.95 = 0.65` was previously
+used to "explain" a 59-65% whole-kernel efficiency. With the whole kernel now
+measured at 78%, that arithmetic does not hold and the two decompositions have not
+been brought together.

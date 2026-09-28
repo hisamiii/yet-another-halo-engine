@@ -143,15 +143,18 @@ int main() {
   const int iters = 20000;
   std::printf("WMMA reference (previous session, not re-measured): fp16 24.17, "
               "iu8 25.15, iu4 52.6 TMAC/s\n\n");
+  // -r 1: two warm-up launches, then ONE timed launch. Averaging several
+  // launches mixes the boosted first repetition with the settled ones, which
+  // methodology.md forbids; the drift between regimes is larger than the effects
+  // being measured, so a single warmed repetition is the number to pair.
   for (int blocks : {40, 160, 640}) {
     for (int i = 0; i < 2; ++i) WmmaF16Kernel<<<blocks, 256>>>(fout, iters);
     hipDeviceSynchronize();
     const auto w0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < 5; ++i) WmmaF16Kernel<<<blocks, 256>>>(fout, iters);
+    WmmaF16Kernel<<<blocks, 256>>>(fout, iters);
     hipDeviceSynchronize();
     const auto w1 = std::chrono::steady_clock::now();
-    const double ms =
-        std::chrono::duration<double, std::milli>(w1 - w0).count() / 5.0;
+    const double ms = std::chrono::duration<double, std::milli>(w1 - w0).count();
     const double macs =
         double(blocks) * (256.0 / 32.0) * iters * CHAINS * 4096.0;
     const double tmacs = macs / (ms * 1e9);
