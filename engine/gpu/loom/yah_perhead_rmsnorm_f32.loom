@@ -1,0 +1,78 @@
+// YAH batched per-head RMSNorm, Loom port of BatchedPerHeadRMSNormKernel.
+//
+// HIP source: prefill_norm.hip. Grid is (heads, rows); each block normalises one
+// head_dim slice of one row with a per-element weight indexed inside the head:
+//
+//   mean_sq = sum(x^2 over head_dim) / head_dim
+//   inv_rms = rsqrt(mean_sq + eps)
+//   out[i]  = (x[i] * inv_rms) * weight[i]
+//
+// One subgroup per (row, head) so kernel.subgroup.reduce covers the slice. The HIP
+// kernel uses 256 threads and a shared-memory tree; that is a tuning question.
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_perhead_rmsnorm.rows : %value: index where [range(%value, 1, 4096)]
+
+config.decl @yah_perhead_rmsnorm.heads : %value: index where [range(%value, 1, 1024)]
+
+config.def @yah_perhead_rmsnorm.head_dim = 128 : index
+
+config.def @yah_perhead_rmsnorm.eps = 0.0 : f32
+
+kernel.def target(@yah_wave32) @yah_perhead_rmsnorm() {
+  %unit = index.constant 1 : index
+  %rows = config.get @yah_perhead_rmsnorm.rows : index
+  %heads = config.get @yah_perhead_rmsnorm.heads : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%heads, %rows, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%x: buffer, %weight: buffer, %out: buffer) {
+  %base = index.constant 0 : offset
+  %c32 = index.constant 32 : index
+  %rows = config.get @yah_perhead_rmsnorm.rows : index
+  %heads = config.get @yah_perhead_rmsnorm.heads : index
+  %head_dim = config.get @yah_perhead_rmsnorm.head_dim : index
+  %head_dimf = scalar.constant 128.0 : f32
+  %eps = config.get @yah_perhead_rmsnorm.eps : f32
+  %zero = scalar.constant 0.0 : f32
+
+  %lane = kernel.workitem.id<x> : index
+  %head = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+
+  %x_noalias, %weight_noalias, %out_noalias = buffer.assume.noalias %x, %weight, %out : buffer, buffer, buffer
+  %x_view = buffer.view %x_noalias[%base] : buffer -> view<[%rows]x[%heads]x[%head_dim]xf32>
+  %w_view = buffer.view %weight_noalias[%base] : buffer -> view<[%head_dim]xf32>
+  %out_view = buffer.view %out_noalias[%base] : buffer -> view<[%rows]x[%heads]x[%head_dim]xf32>
+
+  %sq = scf.for %i = [%lane to %head_dim step %c32](%acc = %zero : f32) -> (f32) {
+    %v = view.load %x_view[%row, %head, %i] : view<[%rows]x[%heads]x[%head_dim]xf32> -> f32
+    %p = scalar.mulf %v, %v : f32
+    %next = scalar.addf %acc, %p : f32
+    scf.yield %next : f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %sq : f32
+  %mean = scalar.divf %sum, %head_dimf : f32
+  %shifted = scalar.addf %mean, %eps : f32
+  %inv = scalar.rsqrtf %shifted : f32
+  %sink = scf.for %i = [%lane to %head_dim step %c32](%tick = %zero : f32) -> (f32) {
+    %v2 = view.load %x_view[%row, %head, %i] : view<[%rows]x[%heads]x[%head_dim]xf32> -> f32
+    %w = view.load %w_view[%i] : view<[%head_dim]xf32> -> f32
+    %n0 = scalar.mulf %v2, %inv : f32
+    %n1 = scalar.mulf %n0, %w : f32
+    view.store %n1, %out_view[%row, %head, %i] : f32, view<[%rows]x[%heads]x[%head_dim]xf32>
+    scf.yield %tick : f32
+  }
+  kernel.return
+}
+
+check.case public @yah_perhead_rmsnorm_case {
+  %x = check.generate.fill value(2.0) : tensor<8x4x128xf32>
+  %weight = check.generate.fill value(3.0) : tensor<128xf32>
+  %out = check.generate.fill value(-1.0) : tensor<8x4x128xf32>
+  %expected = check.generate.fill value(3.0) : tensor<8x4x128xf32>
+  kernel.launch @yah_perhead_rmsnorm(%x, %weight, %out) : (tensor<8x4x128xf32>, tensor<128xf32>, tensor<8x4x128xf32>)
+  check.expect.close actual(%out) expected(%expected) atol(1.0000000000000001e-05) rtol(0.0) nan(same) : tensor<8x4x128xf32>
+  check.return
+}
+
+check.benchmark<@yah_perhead_rmsnorm_case> @yah_perhead_rmsnorm_bench
