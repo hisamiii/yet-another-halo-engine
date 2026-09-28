@@ -453,3 +453,64 @@ With that, three directions are closed on this kernel and only one is left open:
   LDS, with several warps sharing one staged activation tile. That is the one
   structural change left, it is a rewrite rather than a tweak, and the v4/v6 results
   are a warning that the register/occupancy tradeoff around here is tight.
+
+### Loom development practice: the methodology we should be following
+
+Loom ships a real method, not just syntax docs. The centrepiece is
+`loom/docs/src/workflows/agent-driven-kernel-development.md`, with
+`tune-loop-schedules.md`, `search-loop-schedules.md`, `benchmark.md`,
+`compile-reports.md` and `format-and-verify.md` owning the focused contracts. The
+parts that matter most here:
+
+1. **Keep three evidence classes independent.** Numerical (does it implement the
+   operation), compiler (what did lowering emit), physical (what did the device do).
+   "A green check does not make a kernel fast. Fewer VGPRs do not make a kernel
+   faster. A short timestamp does not make a kernel correct."
+2. **Bound the regime with mechanism probes before hill climbing.** The named probes
+   are a load-only proxy (same addresses and publication path, minimal arithmetic),
+   a cache-resident proxy (same compute and schedule, operands from an intended cache
+   level), and a dispatch-only proxy. Their decision rule: "If the candidate is below
+   the known oracle and far from every relevant roofline, it is probably missing a
+   structural schedule rather than a locally better integer tile."
+3. **Two coupled optimization phases.** Create headroom (shorter live ranges, fewer
+   VGPR/LDS, no spills or barriers, less traffic), then fill it (independent work,
+   accumulator chains, coalesced requests, staged prefetch, overlap). The first phase
+   "can make a report look cleaner while making the kernel slower".
+4. **Reject attractive non-evidence.** The table names our exact traps: fewer
+   registers or higher modelled occupancy, and a shorter native listing, are not
+   wins. A losing candidate is still valuable when it falsifies a mechanism.
+5. **One causal hypothesis per edit, stated before compiling**, in a candidate record
+   (production boundary, independent variable, hypothesis, expected compiler
+   consequence, correctness gates, discriminator, predeclared stop threshold).
+6. **Ask the compiler before the GPU**: `show`, `suggest`, strict `diff`, and only then
+   IR or ISA. An empty suggestion list is not a win.
+7. **Correctness cases need distinct values.** Identity, all-ones and all-zero
+   patterns can let a swapped or transposed binding pass.
+8. **Compare with interleaved A/B** (`--compare=@base,@cand --interleave=ABABA`)
+   rather than serial runs, and keep the time domain in the result identity.
+
+Where this kernel stands against it:
+
+| practice | status |
+| --- | --- |
+| independent numerical / compiler / physical evidence | followed; v4, v5, v6 and d3u4 were each rejected on physical evidence |
+| reject attractive non-evidence | followed; fewer registers (v6) and fewer instructions (d3u4) were both rejected as non-wins |
+| regime probes before hill climbing | **not done** -- no load-only or cache-resident proxy has been run |
+| ask the compiler first | **partly** -- `loom-compile-report` is not built here, so `suggest` and `diff` are unavailable and the raw report JSON had to be read directly |
+| distinct correctness values | **not done** -- the case uses all-ones on both operands, so an operand indexing transposition would still pass |
+| interleaved A/B comparison | **not done** -- arms were run serially with a 15 s gap |
+| `loom-format --check` | followed; passes |
+
+The compiler evidence is more interesting than expected. `wait_plan` reports 4 full
+drains with `max_full_drain_outstanding_before = 32`, which is the pathology the guide
+warns about ("a full wait before such a copy can finish future loads earlier than the
+arithmetic needs them"). The peak live value in `allocation_high_water_rows` is the
+`rhs2` fragment, origin `concat`: the strided `[k][t]` activation view lowers each rhs
+fragment load to a concatenation of register pieces, which is exactly where the 12,823
+register moves come from (8 per fragment). Unroll four removes those moves and the
+full drains change count (6 vs 4) -- and the runtime does not move, so neither is the
+binding constraint.
+
+That makes the load-only proxy the next step rather than another tile or schedule:
+nothing in the compiler evidence isolates the cause, and the probes are the part of
+the method designed for exactly that. It is also the cheapest remaining experiment.
