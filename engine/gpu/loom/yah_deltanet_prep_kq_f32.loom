@@ -1,0 +1,114 @@
+// YAH DeltaNet K/Q norm prologue, Loom port of BatchedDeltaNetPrepKqKernel.
+//
+// HIP source: models/qwen/hip/kernels/ssm_row_split.hip. One subgroup per
+// (token, key head). Each lane takes four consecutive keys, the three partial sums
+// are reduced across the subgroup, and lane 0 writes three scale factors:
+//
+//   q[i] = conv_out[t][kh][i]                       q comes first in the layout
+//   k[i] = conv_out[t][num_key_heads + kh][i]
+//   k_sq = sum_i k[i]^2   q_sq = sum_i q[i]^2   kq = sum_i k[i]*q[i]
+//   out[0] = 1 / sqrt(k_sq + 1e-6)
+//   out[1] = (1 / sqrt(128)) * (1 / sqrt(q_sq + 1e-6))
+//   out[2] = kq
+//
+// The three reductions are three `kernel.subgroup.reduce<addf>` butterflies, which
+// is what the HIP kernel's __shfl_xor loop is. The last element is written only when
+// `lane < 1`, matching the upstream `if (lane == 0)`.
+//
+// Required config: --config=yah_deltanet_prep_kq.batch=3
+//                  --config=yah_deltanet_prep_kq.num_key_heads=2
+//                  --config=yah_deltanet_prep_kq.qkv_size=512
+amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_deltanet_prep_kq.batch : %value: index where [range(%value, 1, 1048576)]
+config.decl @yah_deltanet_prep_kq.num_key_heads : %value: index where [range(%value, 1, 4096)]
+config.decl @yah_deltanet_prep_kq.qkv_size : %value: index where [range(%value, 128, 1048576)]
+
+kernel.def target(@yah_wave32) @yah_deltanet_prep_kq() {
+  %unit = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %num_key_heads = config.get @yah_deltanet_prep_kq.num_key_heads : index
+  %batch = config.get @yah_deltanet_prep_kq.batch : index
+  kernel.launch.config workgroups(%num_key_heads, %batch, %unit) workgroup_size(%c32, %unit, %unit) : index
+} launch(%conv: buffer, %scales: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c128 = index.constant 128 : index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %epsilon = scalar.constant 0.000001 : f32
+  %batch = config.get @yah_deltanet_prep_kq.batch : index
+  %num_key_heads = config.get @yah_deltanet_prep_kq.num_key_heads : index
+  %qkv_size = config.get @yah_deltanet_prep_kq.qkv_size : index
+  %conv_total = index.mul %batch, %qkv_size : index
+  %scale_total = index.mul %conv_total, %c3 : index
+  %conv_noalias, %scales_noalias = buffer.assume.noalias %conv, %scales : buffer, buffer
+  %conv_view = buffer.view %conv_noalias[%base] : buffer -> view<[%conv_total]xf32>
+  %scales_view = buffer.view %scales_noalias[%base] : buffer -> view<[%scale_total]xf32>
+  %kh = kernel.workgroup.id<x> : index
+  %t = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %t_row = index.mul %t, %qkv_size : index
+  %q_row = index.mul %kh, %c128 : index
+  %q_base = index.add %t_row, %q_row : index
+  %k_head = index.add %num_key_heads, %kh : index
+  %k_row = index.mul %k_head, %c128 : index
+  %k_base = index.add %t_row, %k_row : index
+  %lane_quad = index.mul %lane, %c4 : index
+  %k_sq, %q_sq, %kq = scf.for %j = [%c0 to %c4 step %c1](%ka = %zero : f32, %qa = %zero : f32, %da = %zero : f32) -> (f32, f32, f32) {
+    %elem = index.add %lane_quad, %j : index
+    %k_idx = index.add %k_base, %elem : index
+    %q_idx = index.add %q_base, %elem : index
+    %kv = view.load %conv_view[%k_idx] : view<[%conv_total]xf32> -> f32
+    %qv = view.load %conv_view[%q_idx] : view<[%conv_total]xf32> -> f32
+    %kk = scalar.mulf %kv, %kv : f32
+    %qq = scalar.mulf %qv, %qv : f32
+    %dq = scalar.mulf %kv, %qv : f32
+    %k2 = scalar.addf %ka, %kk : f32
+    %q2 = scalar.addf %qa, %qq : f32
+    %d2 = scalar.addf %da, %dq : f32
+    scf.yield %k2, %q2, %d2 : f32, f32, f32
+  }
+  %k_sq_all = kernel.subgroup.reduce<addf> %k_sq : f32
+  %q_sq_all = kernel.subgroup.reduce<addf> %q_sq : f32
+  %kq_all = kernel.subgroup.reduce<addf> %kq : f32
+  %is_lane0 = index.cmp ult, %lane, %c1 : index
+  scf.if %is_lane0 {
+    %k_sq_eps = scalar.addf %k_sq_all, %epsilon : f32
+    %k_root = scalar.sqrtf %k_sq_eps : f32
+    %inv_k = scalar.divf %one, %k_root : f32
+    %q_sq_eps = scalar.addf %q_sq_all, %epsilon : f32
+    %q_root = scalar.sqrtf %q_sq_eps : f32
+    %inv_q = scalar.divf %one, %q_root : f32
+    %dim_i = index.cast %c128 : index to i32
+    %dim_f = scalar.sitofp %dim_i : i32 to f32
+    %dim_root = scalar.sqrtf %dim_f : f32
+    %inv_dim = scalar.divf %one, %dim_root : f32
+    %q_scaled = scalar.mulf %inv_q, %inv_dim : f32
+    %scale_row = index.mul %t, %num_key_heads : index
+    %scale_head = index.add %scale_row, %kh : index
+    %scale_base = index.mul %scale_head, %c3 : index
+    %o1 = index.add %scale_base, %c1 : index
+    %c2i = index.constant 2 : index
+    %o2 = index.add %scale_base, %c2i : index
+    view.store %inv_k, %scales_view[%scale_base] : f32, view<[%scale_total]xf32>
+    view.store %q_scaled, %scales_view[%o1] : f32, view<[%scale_total]xf32>
+    view.store %kq_all, %scales_view[%o2] : f32, view<[%scale_total]xf32>
+  }
+  kernel.return
+}
+
+// Requires --config=yah_deltanet_prep_kq.batch=3, .num_key_heads=2, .qkv_size=512.
+check.case public @yah_deltanet_prep_kq_case {
+  %conv = check.file.read.npy path("fixtures/deltanet_prep_kq/input_conv.npy") : tensor<1536xf32>
+  %expected = check.file.read.npy path("fixtures/deltanet_prep_kq/expected_scales.npy") : tensor<18xf32>
+  %scales = check.generate.fill value(0.0) : tensor<18xf32>
+  kernel.launch @yah_deltanet_prep_kq(%conv, %scales) : (tensor<1536xf32>, tensor<18xf32>)
+  check.expect.close actual(%scales) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<18xf32>
+  check.return
+}
+
+check.benchmark<@yah_deltanet_prep_kq_case> @yah_deltanet_prep_kq_bench

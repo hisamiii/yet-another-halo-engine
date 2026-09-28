@@ -32,7 +32,8 @@ explicitly deferred.
 | yah_unpack_qg_f32.loom | prefill_unpack.hip | batched QG unpack | ported, 0.0149 ms at 64x5120 |
 | yah_ssm_proj_f32.loom | prefill_ssm.hip | fused SSM input projections (GEMV) | ported, 0.0102 ms |
 | yah_deltanet_rowsplit_f32.loom | ssm_row_split.hip | DeltaNet row-split recurrence | ported, 19.22 ms at batch 512 / 8 heads (untilable port; tuning deferred) |
-| - | prefill_ssm.hip, ssm_row_split.hip | DeltaNet conv/recurrence | todo |
+| yah_deltanet_prep_kq_f32.loom | ssm_row_split.hip | DeltaNet K/Q-norm prologue | ported, 0.0076 ms at 3 tokens / 2 key heads |
+| - | ssm_row_split.hip, ssm_recurrence.hip | DeltaNet alpha/beta prep, SSM conv, post-norm gate | todo |
 | - | prefill_attention*.hip, attention_wmma.hip | batched attention | todo |
 | - | qkv.hip | QKV projection | todo |
 | - | gemv.hip, gemv_quant.hip | decode GEMV | todo |
@@ -146,6 +147,13 @@ profile gives one, so the expensive paths move first rather than the convenient 
   `check.oracle.call` provider would be nicer, but the shipped tool registers only
   `reference.matmul` and `reference.tiled_matmul`; a scalar oracle is an embedding
   hook the CLI does not wire up.
+- **`scalar.sitofp` rejects `index`.** Cast first:
+  `%i = index.cast %n : index to i32` then `%f = scalar.sitofp %i : i32 to f32`.
+  The failure is `TYPE/003: operand 'input' has type index, expected integer`.
+- **`kernel.subgroup.reduce<addf>` returns the reduction in every lane**, not just
+  lane 0, so a port can keep the HIP `if (lane == 0)` guard verbatim and have it
+  write the same value the butterflies produced. The three reductions in the K/Q
+  prologue share one guard.
 - **When an fp16 result would round, rescale the input so the expectation stays an
   arithmetic sequence.** The unscaled f16 Hadamard sums to `15872 + 32*e`, which
   fp16 cannot represent, so no single `check.generate.iota` describes it. Dividing
