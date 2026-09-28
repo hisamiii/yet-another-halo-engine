@@ -175,3 +175,44 @@ shape (Q4_K, 2048 x 5120 -> 17408) and comparing against our HIP's 41 TFLOP/s is
 bounded experiment that either validates the direction or settles it cheaply. If Loom
 lands near parity with modest effort, the DeltaNet restructuring is worth doing there;
 if it is multiples off after real work, the HIP path stays.
+
+### The NPU case is the compelling one, and it is exact
+
+The strategic argument for Loom does not rest on the GPU sample above. It rests on
+`loom/src/loom/target/arch/amd/xdna`, which is real: 44 C files, ~20k lines, with
+`aie2p` arch support (AIE2P **is** the XDNA2 core in Strix Halo), legalization
+tables, descriptors, emission and low verification.
+
+From the target's own README:
+
+- Loom "compiles tile programs and their array transport into a native `.xdna`
+  executable. The product contains AIE2P instructions, initialized data, array
+  configuration, explicit storage and binding requirements, and native invocation
+  ranges. It executes through **libamdf**; compilation does not invoke the AIE SDK,
+  LLVM, Python, or an external linker."
+- **Exact device profiles**, and ours is listed:
+
+  | device | compiler profile | PCI |
+  | --- | --- | --- |
+  | Strix NPU4 | `amd.xdna.strix.17f0_10` | `17f0:10` |
+  | **Strix Halo NPU5** | **`amd.xdna.strix_halo.17f0_11`** | **`17f0:11`** |
+
+  The NPU on this box reports as "Strix Halo Neural Processing Unit (rev 11)", i.e.
+  `17f0:11` -- an exact profile match, not a family approximation.
+- `libamdf` is the execution path, and it is already verified working here (XDNA
+  memory benchmark runs, 13/13 XDNA CTS pass).
+- The same source compiles for both halves: the comparable-workload fixture
+  `BM_FfnGateUpQuadraticBF16` "compiles the same one-output gate/up operation on
+  AMDGPU and XDNA at K=512, 1,024, and 4,096".
+
+That is the NPU argument in one line: Loom is a compiler with an exact profile for
+this NPU, a native image format, and a working runtime underneath it, which is
+precisely what the NPU work needs and what hand-written HIP cannot provide at all.
+
+So the two halves should be judged separately. **For the NPU, adopt Loom** -- the
+evidence is strong and the alternative is nothing. **For the GPU, the sample is
+4.5x behind and unproven**, so that half stays a bounded experiment: author one
+kernel at our production shape and see whether retuning closes the gap. The user's
+read that it "just needs retuning" is the right shape of hypothesis -- the sample
+is a language demo, not a tuned kernel -- but the deficit to close is 4.5x, and
+both sides already ran on the same runtime.
