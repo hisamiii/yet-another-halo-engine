@@ -84,7 +84,8 @@ case "$target" in
   # objects define symbols the kernel objects and libyah_core.a also define.
   # Linking them the normal way is a duplicate-symbol error; they are their own
   # program and need only their own object plus the quant dequantiser.
-  gemm_bench) main="$root/engine/gpu/gemm_bench.hip"; name="gemm_bench"; standalone=1 ;;
+  gemm_bench|dot_peak)
+    main="$root/engine/gpu/$target.hip"; name="$target"; standalone=1 ;;
   *) main="$root/engine/gpu/$target.hip"; name="$target" ;;
 esac
 

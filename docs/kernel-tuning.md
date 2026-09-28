@@ -375,6 +375,36 @@ exceed the VGPR budget or the 1024-thread limit. With WMMA = WRS*WTS and LDS
 reads = WRS + WTS, an 8-accumulator tile needs 6 reads however it is split, so
 the current split is already the minimum for this shape.
 
+### The alternative instruction classes are all slower
+
+Everything on this page is a tile GEMM on WMMA. The last open algorithmic
+question is whether a different execution class does more MACs per cycle, since
+that would change the algorithm rather than its parameters. Measured with eight
+live chains at three grid sizes (engine/gpu/dot_peak.hip, built with
+build_gpu.sh dot_peak):
+
+| instruction | TMAC/s | vs fp16 WMMA |
+| --- | ---: | ---: |
+| v_dot8_i32_i4 | 28.99 | 1.20x |
+| v_dot4_i32_i8 | 14.48 | 0.60x |
+| v_dot2_f32_f16 | 11.67 | 0.48x |
+| v_pk_fma_f16 | 12.04 | 0.50x |
+| WMMA fp16 (reference) | 24.17 | 1.00x |
+| WMMA iu8 (reference) | 25.15 | 1.04x |
+| WMMA iu4 (reference) | 52.6 | 2.18x |
+
+Three things follow. **WMMA is the right execution class**: no dot instruction
+beats it, and the vector classes are half its rate, so replacing WMMA with plain
+packed FMA is a 2x loss rather than a freedom. **v_dot4_i32_i8 is slower than
+fp16 WMMA** at 0.60x, which kills the w8a8 route on rate alone -- that route
+would otherwise have side-stepped the 4-bit activation quality cost, since int8
+activations would be 16x finer. And **v_dot8_i32_i4 reaches only 1.20x where int4
+WMMA reaches 2.18x**, so even accepting 4-bit activations the dot path is the
+worse way to spend them.
+
+That closes the instruction-class axis: the only lever above WMMA is the int4
+WMMA, and it is closed on quality above.
+
 ### The pipelining alternatives are all worse
 
 The shipped K loop consumes each B fragment immediately after loading it -- a
