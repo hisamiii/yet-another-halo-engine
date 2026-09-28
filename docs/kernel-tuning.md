@@ -28,106 +28,69 @@ Ablations on the real kernel: weight and activation staging costs ~10% on Q4_K a
 
 ### The aggregate is ~30 TFLOPS, not 40.6
 
-`40.6` is one kernel on one shape. Across the whole prefill kernel set the GPU delivers **~30 TFLOPS aggregate**, about **62% of the 48.35 instruction ceiling**, against the best kernel's 84%. The recorded model-level gap versus the plain-store bench is **27.7%**: part of it is the IQ3_XXS decode (a third of the FFN on the 3.84 bpw target and the most expensive decoder measured, +26% loop instructions over Q4_K), part is the non-FFN GEMMs, and part is shape and `Complete` choices. The batch-2048 Q4_K against IQ3_XXS A/B that would separate the format from the rest was never run.
+`40.6` is one kernel on one shape. Across the whole prefill kernel set the GPU delivers **~30 TFLOPS aggregate**, about **62% of the 48.35 instruction ceiling**, against the best kernel's 84%. The recorded model-level gap versus the plain-store bench is **27.7%**. It used to be attributed partly to the IQ3_XXS decode -- "a third of the FFN on the 3.84 bpw target and the most expensive decoder measured, +26% loop instructions over Q4_K" -- and that attribution is now **withdrawn**: measured wall-clock, IQ3_XXS is at parity with Q4_K (paired table below). The section that replaced it with a per-format explanation is withdrawn too. The format term is small; the gap against the instruction ceiling is not, and it is still unexplained.
 
-### The per-format table, and why the aggregate is ~30
+### Per-format deltas, paired against Q4_K
 
 The section above attributes the aggregate gap partly to the IQ3_XXS decoder,
-partly to the non-FFN GEMMs and partly to shape and `Complete` choices without
-splitting the terms. `engine/gpu/gemm_bench.hip` splits the first one: it runs
-the kernel the prefill path runs, one weight format at a time, at the two real
-FFN shapes, batch 2048, best of three.
+partly to the non-FFN GEMMs and partly to shape and Complete choices without
+splitting the terms. engine/gpu/gemm_bench.hip runs the kernel the prefill path
+runs, one weight format at a time, at the real FFN shape, batch 2048.
 
-| type | gate/up M=17408 K=5120 | down M=5120 K=17408 |
-| --- | ---: | ---: |
-| **Q4_K** | **38.05** | **37.60** |
-| IQ4_XS | 31.30 | 33.18 |
-| Q5_K | 32.60 | 32.10 |
-| Q8_0 | 30.89 | 31.83 |
-| Q2_K | 29.78 | 31.79 |
-| Q3_K | 30.83 | 29.96 |
-| IQ4_NL | 31.24 | 30.33 |
-| IQ3_S | 30.09 | 30.67 |
-| IQ3_XXS | 28.99 | 29.79 |
-| IQ2_XS | 28.94 | 29.41 |
-| IQ2_XXS | 28.85 | 28.85 |
-| Q6_K | 30.24 | 30.50 |
-| IQ2_S | 28.86 | 28.43 |
+**The measurement has to be paired, not a sweep.** The first attempt ran every
+type inside one process (gemm_bench all) and reported Q4_K at 38.05 against
+28.9-32.6 for everything else. That was not the format: the session decays more
+than 25% across a three-minute sweep, so the type that runs *first* takes the
+boosted runs and every later type is measured on a hotter part. Re-measuring
+each type in its own process, immediately before or after Q4_K with the order
+reversed on the second pair so the decay cancels inside each pair:
 
-Two things stand out. **Q4_K is in a class of its own** — every other format
-loses 15-25% to it at the same tile. And the IQ3 decoders are *not* an outlier:
-IQ3_XXS at 28.99 is 1.2% below IQ3_S and 7% below IQ4_XS, so "IQ3_XXS is the
-most expensive decoder" costs tens of percent of loop instructions but only a
-few percent of wall time. What Q4_K has that the rest do not is the cheapest
-decoder plus, uniquely in this list, the tail-free `Complete` variant (worth
-4% on Q4_K by the ablation above, and gated to Q4_K/Q5_K at line 1412).
+| type | vs Q4_K | type | vs Q4_K |
+| --- | ---: | --- | ---: |
+| Q5_K | **+4.0%** | Q8_0 | -6.4% |
+| IQ3_XXS | **-0.8%** | Q3_K | -6.9% |
+| Q2_K | -1.2% | IQ2_S | -8.4% |
+| IQ4_NL | -2.5% | IQ2_XS | -11.2% |
+| IQ4_XS | -3.3% | IQ2_XXS | -11.6% |
+| IQ3_S | -5.7% | | |
 
-At `m >= 4096` every type takes the same 256x256 tile, so the table is
-tile-matched and the spread is decoder cost. Weighting the measured rates by the
-tensor types of the actual artifact, taking the harmonic mean per layer because
-gate, up and down have identical FLOPs:
-
-| | TFLOPS |
-| --- | ---: |
-| census-weighted FFN prediction, 64/64 layers | **30.43** |
-| measured model aggregate (section above) | ~30 |
-| if those layers were all Q4_K | 37.90 |
-
-The prediction lands within a few percent of the aggregate with no free
-parameter, so the model-level gap against the 48.35 ceiling is **the weight
-format mix**, not an unexplained K-loop residual. The artifact is a mixed
-IQ3/IQ4 shard despite the `IQ4_XS` in its filename: IQ3_XXS and IQ3_S are 207 of
-its 866 tensors and dominate the FFN, while the Q4_K present is in the
-projections. `gemm_bench` measures components with synthetic weights, so the
-agreement is not a release measurement — but it removes the need for a free
-parameter to explain the aggregate.
+The corrected picture is the opposite of the sweep's. **Q4_K is not special** --
+Q5_K measures 4% faster -- and **IQ3_XXS, which dominates this shard's FFN, is at
+parity (-0.8%)**. Only the 2-bit formats carry a real penalty, at -8 to -12%. The
+per-type decoder rewrite that was planned against the sweep's -24% is moot:
+there is no gap to recover. The census-weighted FFN prediction built on the
+contaminated table (30.43 TFLOPS) is withdrawn with it, along with the claim
+that it explains the aggregate -- it matched for the wrong reason. Any future
+per-type number from gemm_bench must come from a paired or rotated design, not
+from "... all".
 
 **Measured at the model level.** An existing pure-Q4_K artifact of the same
-model settles whether the component table composes
-(`/home/q/models/gufo-sweep/base_q4kpure.gguf`, 506 Q4_K tensors, 866 tensors,
-every shape identical). `--ids-file` 2048 tokens, `--chunk 2048`, `--repeat 1`,
+model settles whether the format matters end to end
+(/home/q/models/gufo-sweep/base_q4kpure.gguf, 506 Q4_K tensors, 866 tensors,
+every shape identical). --ids-file 2048 tokens, --chunk 2048, --repeat 1,
 warm-up discarded, arm order alternated, a fixed 15 s gap and Tctl before every
 timed run:
 
 | rep | order | mixed IQ3/IQ4 (ms) | pure Q4_K (ms) | Q4_K |
 | ---: | --- | ---: | ---: | ---: |
-| 1 | mix first | 3848.1 (55 °C) | 3554.1 (55 °C) | +8.3% |
-| 2 | Q4_K first | 3730.1 (53 °C) | 3490.2 (54 °C) | +6.9% |
-| 3 | mix first | 3662.6 (53 °C) | 3389.0 (53 °C) | +8.1% |
-| 4 | Q4_K first | 3729.8 (54 °C) | 3517.8 (53 °C) | +6.0% |
+| 1 | mix first | 3848.1 (55 C) | 3554.1 (55 C) | +8.3% |
+| 2 | Q4_K first | 3730.1 (53 C) | 3490.2 (54 C) | +6.9% |
+| 3 | mix first | 3662.6 (53 C) | 3389.0 (53 C) | +8.1% |
+| 4 | Q4_K first | 3729.8 (54 C) | 3517.8 (53 C) | +6.0% |
 
-Q4_K wins every rep in both orders: **+7.3% on the means**. The format is a real
-model-level lever, and the component table over-predicts it by about 2x.
+Q4_K wins every rep in both orders: **+7.3% on the means**. That part stands.
+The *attribution* does not: with the per-type decoders at parity, "the mixed
+file decodes more slowly" cannot be the explanation, and the paired-coverage
+difference is separately measured at ~0. The 7.3% is therefore
+**unattributed**. The candidates left are the epilogues and the non-FFN GEMMs,
+and gemm_bench measures neither -- it times the kStore epilogue, while the model
+runs gate as kStore, up as kSwiGLU, down as kResidual, and nine layers as the
+paired kGateUp. The next measurement has to cover those, not the decoder.
 
-The two files differ in two ways and the second is ruled out: the pure file
-takes the dual gate/up kernel on **64/64** blocks against the mixed artifact's
-**9/64**, and raising the mixed one to 29/64 measures +1.5% with the sign
-flipping (section below). So the 7.3% is **decoder cost**.
-
-**That fixes the target, and it is not the artifact.** Requantizing the shard is
-out of scope by decision, so the only way to recover the 7.3% is the decoder.
-
-**The obvious explanation is already refuted by the table above.** Q4_K differs
-from the IQ types in that it takes the deferred-decode path (`DecodeStage == 2`,
-raw weight registers held across the pipeline: `prefill_fp16.hip` line 264),
-while `IQ3_XXS`/`IQ3_S` take `DecodeStage == 0` and decode inline in the fetch
-stage. But `Q5_K`, `Q6_K` and `Q8_0` *also* take `DecodeStage == 2` and measure
-32.60, 30.24 and 30.89 against Q4_K's 38.05 — decode scheduling does not carry
-the advantage. The one-line version of the experiment is not available anyway:
-`RawWeights<Type>` is `static_assert`-gated to those four types, and the IQ raw
-helper covers only `IQ4_XS`/`IQ4_NL`, so a deferred IQ3 decode would be new
-code, not a switch.
-
-What is left is the per-weight decode arithmetic: Q4_K's four-bit unpack with
-precomputed scale words is measurably cheaper than the IQ3 grid lookup on this
-part. A raw form for `IQ3_XXS`/`IQ3_S` — grouped grid index, sign byte and
-block scale held in registers and expanded by table lookup the way
-`DecodeIqRaw` does for `IQ4_NL` — is the only route to it. That is a real
-kernel change with a numerics re-validation (deferring a decode changes the
-dot-product rounding) against a model-level ceiling of 7.3%, only part of which
-is IQ3 (the mixed file has non-FFN IQ3 tensors too). Not obviously the next
-place to spend the machine now that decode at depth is 3x faster and the format
-question is answered.
+**What that leaves.** With per-format decoder differences mostly under 6%, the
+dominant unexplained term is the within-type efficiency gap: the ~30 TFLOPS
+aggregate against the 48.35 measured instruction ceiling. That needs a profile,
+not another sweep, and it is the last item on this page.
 
 **This is clock, and the clock is a function of the kernel.** Efficiency per clock agrees to **0.3%** across the two harnesses that disagreed -- 0.0144 TF/MHz in both -- so there is no hidden code difference. The part has three SCLK levels (600 / 1408 / **2900 MHz**) and **never reaches the top one**: measured across power limits, 80 W gives 1799 MHz / 25.9 TF and 130 W gives 2016 MHz / 28.6 TF, work-per-clock is flat (0.0144, -1.5% between them), `gpu_busy` is ~85% at both, and the sampled maximum is 2221 MHz. The log's own line is that "what is broken is the conversion of watts into clock".
 
