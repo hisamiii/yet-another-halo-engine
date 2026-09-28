@@ -52,6 +52,7 @@ explicitly deferred.
 | yah_sync_tiled_attn_kv_f32.loom | attention_tile.hip | tiled-attention KV f32->fp16 prefix sync | ported, 0.0076 ms; exact fixtures |
 | yah_pack_attn_heads_f16.loom | attention_wmma.hip | pack K/V into WMMA head tiles (LDS V transpose) | ported, 0.0079 ms; fp16 fixture |
 | yah_attn_wmma_f32.loom | attention_wmma.hip | WMMA causal attention, retiled to one query head and one token per workgroup | ported, 0.0072-0.0084 ms; three arms (canonical, head-major packed, lse) vs a double reference |
+| yah_decode_attn_f16.loom | attention_decode.hip | decode online attention over the fp16 cache (QwenDecodeOnlineAttentionHalfKernel) | ported, 0.0104 ms at head_dim 256 / 2 heads / seq 3; fixture + 1e-5 |
 | yah_qkv_proj_wave32_f32.loom | qkv.hip | fused QKV projections, warp-per-row, f32 weights | ported, 0.0055 ms; exact, no fixture |
 | yah_qkv_proj_block_f32.loom | qkv.hip | fused QKV projections, block-per-row fallback, f32 | ported, 0.0072 ms; exact, no fixture |
 | yah_embed_ptr_f32.loom | embed.hip | embedding lookup from a device token pointer, f32 | ported, 0.0060 ms; exact, no fixture |
@@ -69,7 +70,7 @@ explicitly deferred.
 | yah_dflash_conv_f32.loom | dflash_kernels.hip | grouped dynamic convolution | ported, 0.0064 ms; exact fixture |
 | yah_dflash_silu_mul_f32.loom | dflash_kernels.hip | in-place SiLU multiply | ported, 0.0064 ms; exact, no fixture |
 | yah_dflash_topk_f32.loom | dflash_kernels.hip | dflash selector partial top-k | ported, 0.0108 ms; exact fixture; iterative selection instead of the register-list merge |
-| - | attention_decode*.hip, prefill_attention*.hip | decode-online and split-K attention, bf16 output, prefill_attention variants | decode-only or unreferenced; see the route audit below |
+| - | attention_decode*.hip, prefill_attention*.hip | **ported**: QwenDecodeOnlineAttentionHalfKernel (fp16 cache). **todo**: the fp32 online arm, the split-K partials and reduce, the graph/ptr variants, the baseline kernels | decode-only; see the route audit below |
 | yah_qkv_proj_f32.loom | qkv.hip | fused QKV projection, f32 weight path | ported, 0.0060 ms at 3+2+2 rows; bf16/q8_0/quant paths todo |
 | yah_cast_f32_to_bf16.loom | prefill_gemm.hip | f32 to bf16 cast | ported, 0.0068 ms; exact, no fixture |
 | yah_dequant_q8k_bf16.loom | prefill_gemm.hip | Q8_K weight dequant to bf16 | ported, 0.0076 ms; exact periodic expectation |
@@ -180,7 +181,7 @@ Reachability evidence for the entries that are not on that route:
 | DeltaNet / SSM | batched_ssm.hip, ssm.hip, ssm_decode_recurrence.hip | BatchedSSMPostNormGateKernel, FusedSSMInputProjectionsKernel, SSMConvKernel, CaptureBatchedSsmReplayKernel |
 | attention (2.1%) | attention_wmma.hip, attention_tile.hip | **ported**: PackAttentionHeads, PackTiledAttentionKvKernel, SyncTiledAttentionKvPrefixKernel, WmmaCausalAttention. QwenTiledAttentionKernel is **dead** (no launcher call site); see the route audit |
 | attention | attention_batched.hip | BatchedAttentionKernel, CausalSoftmaxKernel, WriteBatchedKVCacheKernel, ApplyAttentionGateKernel |
-| attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | decode-online, split-K and KV-write variants are decode-only; QwenTiledAttentionKernel is dead |
+| attention | attention_tile.hip, attention_decode_graph.hip, attention_decode.hip | decode-online fp16 arm **ported**; the fp32 arm, split-K, graph/ptr and baseline variants are decode-only; QwenTiledAttentionKernel is dead |
 | QKV projection | qkv.hip | **ported**: Wave32FusedQKVProjectionsKernel_1Row<4> and FusedQKVProjectionsKernel, f32 arm only. **todo**: the BF16, Q8_0 and block-quantized arms (sub-16 table) |
 | fused RoPE | prefill_rope.hip | all **ported**: BatchedFusedQKNormRoPEKvWriteKernel and BatchedRoPEKernel (text path) |
 | fused.hip | fused.hip | **ported**: FusedQKNormRoPEKvWriteKernel (text path) |
