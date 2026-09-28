@@ -1295,6 +1295,80 @@ recover; the 18% was the clock assumption.
 **Correction, and it is the one already recorded above.** An earlier draft of
 this section read the 1979 MHz mean against the 2630 MHz max as a machine-level
 lever to be recovered with cooling or a power profile. That is the naive reading
+
+## How clock management actually behaves on this part
+
+Measured rather than inferred, because the earlier "the sampler says 1979 MHz
+mean" reading conflated gated and loaded time.
+
+**The DPM level's frequency is continuously recomputed, and the top level is unused
+under load.** `pp_dpm_sclk` exposes three levels and the middle one carries the
+live operating point:
+
+```
+idle:    0: 600Mhz   1: 966Mhz *   2: 2900Mhz
+loaded:  0: 600Mhz   1: 1755Mhz *  2: 2900Mhz
+```
+
+Level 1 read 774, 966, 1727, 1744 and 1755 MHz in different samples -- it is not a
+table entry but an SMU-computed operating point. **Level 2 at 2900 MHz is never
+selected under sustained load.**
+
+**Under sustained dense load the clock is ~1.7 GHz, tightly distributed.** A
+3000-iteration GEMM with SCLK sampled at 100 Hz and filtered by
+`gpu_busy_percent`:
+
+| | |
+| --- | ---: |
+| `gpu_busy_percent` mean | 94.9 |
+| SCLK mean / max / min | **1691 / 1865 / 1593 MHz** |
+| samples above 95% busy | 1706 of 1978, mean 1693 MHz |
+| `power1_average` (PPT) | 85.9 W |
+| `temp1_input` (edge) | 94.2 C |
+| chassis fans | 6600 / 6800 RPM, `pwm1_enable` = 2 (auto) |
+
+The histogram is a single tight mode at 1600-1800 MHz; there is not one sample
+anywhere near 2600-2900. So the 2.2-2.8 GHz readings seen in mixed workloads come
+from *lighter* phases, and the sustained heavy operating point is ~1.7 GHz.
+
+**What that means for the two competing readings.** Both are true and they
+reconcile:
+
+- *Clock falls as load rises* -- confirmed directly. A sustained dense GEMM sits
+  at 1.7 GHz; a mixed prefill averages 2.0-2.2; light phases reach 2.8.
+- The load is pressing against an **envelope of roughly (86 W PPT, 94 C edge)**,
+  with the enclosure fans already at 6.6-6.8k RPM in automatic mode. That is why
+  raising the peak power cap from 80 W to 130 W bought only +12% clock (recorded
+  above): the peak cap was never the binding term.
+
+**The knobs, and who owns them:**
+
+| knob | path | access | status |
+| --- | --- | --- | --- |
+| SCLK overdrive, range 600-2900 MHz | `pp_od_clk_voltage` | root only | not tested |
+| DPM performance level (`auto`/`high`) | `power_dpm_force_performance_level` | root only | not tested |
+| fan curve | chassis EC hwmon8, `pwm1_enable=2` | root only | auto, 6.6-6.8k RPM |
+| work per clock in the kernel | code | this document | 0.01269 vs 0.0144 plateau |
+
+`thermal_throttling_logging` reports "enabled, with interval 60 seconds" and
+records no events, so it does not confirm or deny throttling; there is no
+`power1_cap` or `freq1_max` exposed in hwmon, and `rocm-smi --showmetrics`
+cannot parse this device's metrics version, so the SMU's own throttle bitmask is
+not readable without more work than it is worth.
+
+**The one experiment that would settle whether the envelope is thermal**: force the
+fans to maximum and re-measure the sustained-load clock. If it rises materially the
+envelope is thermal and cooling buys clock; if it does not, the ~1.7 GHz point is
+an SMU/power-management floor for this load and no cooling will move it. That needs
+root, so it is a user-side test, not a code change.
+
+**The code lever is unchanged and is the only one available from here.** Work per
+clock is 0.01269 TF/MHz in the real prefill against a demonstrated 0.0144 plateau --
+about 12% of avoidable work per clock. Because clock is a function of load, that
+gain is paid twice: the same work in fewer instructions and fewer toggled bits
+raises the work per clock *and* lowers the power draw that is holding the clock at
+1.7 GHz.
+
 and it is wrong. The section "clock falls as load rises" earlier in this document
 has the mechanism: the clock mean sits below the max *because the workload draws
 power*, the DPM pulls the clock back, and it is not power-limited (93 W of 130 W)
