@@ -566,7 +566,13 @@ def emit(loomfile, configs, outname, outdir, widen=0, chain=False, chain_level=N
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(LOOM, loomfile)
-    if os.environ.get("YAH_DELTANET_LDS") == "1" and "yah_deltanet_rowsplit" in loomfile:
+    # DEFAULT ON. The shipped HAL set was emitted with this rewrite and it is worth
+    # 1.53x END-TO-END at B=2048: interleaved, 15 s gaps, sets differing in nothing
+    # but rowsplit.hal -- LDS 21862.2/22773.3 ms vs non-LDS 33314.6/35351.8 ms,
+    # argmax 11751 on all four runs. But the gate defaulted OFF, so a plain re-emit
+    # (the env documented for reproducing the shipped set) silently produced the
+    # SLOW variant and lost 11.5 s. YAH_DELTANET_LDS=0 restores that old default.
+    if os.environ.get("YAH_DELTANET_LDS", "1") != "0" and "yah_deltanet_rowsplit" in loomfile:
         text = open(src).read()
         src_tmp = os.path.join(tmp, os.path.basename(loomfile))
         with open(src_tmp, "w") as fh:
