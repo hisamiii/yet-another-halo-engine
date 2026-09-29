@@ -660,7 +660,15 @@ int main(int argc, char** argv) {
               {kv16.handle, koff, kKvCache * 2},
               {kv16.handle, voff, kKvCache * 2},
               {aout.handle, 0, hb(aout)}, {lse.handle, 0, hb(lse)}};
-          Dispatch(gpu, e_wmma, "yah_attn_wmma", (B + 15) / 16, kHeads, 1, 256, 1, 1, b);
+          // YAH_ATTN_GRID_OLD restores the pre-WMMA attention launch geometry so the
+          // two attention kernels can be A/Bd from ONE binary, interleaved, without a
+          // rebuild between runs (a failed rebuild leaves a stale binary and a mismatched
+          // grid silently produces garbage).
+          const bool attn_old_grid = std::getenv("YAH_ATTN_GRID_OLD") != nullptr;
+          Dispatch(gpu, e_wmma, "yah_attn_wmma",
+                   attn_old_grid ? kHeads : (B + 15) / 16,
+                   attn_old_grid ? B : kHeads, 1,
+                   attn_old_grid ? 32 : 256, 1, 1, b);
         }
         {
           std::vector<hrx_buffer_ref_t> b = {
