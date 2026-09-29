@@ -463,6 +463,24 @@ def _chain(text, tile, n_row, loomfile='', level=None):
     lvl = level or CHAIN_LEVEL
     if lvl == 'rows' and '%r8 = scalar.shli %j_i, %c3i : i32' in text:
         raise SystemExit('rows level: the word-1col (iq3s) decode needs the full chain')
+    # q6k is EXCLUDED from the rows level. Bisected format-by-format at B=2048
+    # against argmax 11751: iq3xxs, iq4xs, iq4nl, q2k, q3k, q4k, q8_0, iq2xs and
+    # iq2xxs all transform correctly on their own; q6k alone gives 1829. It is
+    # fine at the w64 level, so the fault is specific to the row-group/LDS path
+    # and is not yet understood. Fail loudly rather than emit a wrong kernel.
+    if lvl == 'rows':
+        # Formats the row-group/LDS path is known to get wrong. Bisected two ways
+        # at B=2048: by argmax, and by BIT-IDENTITY of the hidden state against
+        # the shipped set's f837e614ff55d1d1bcbf3ed6d5ff38e2. The second gate is
+        # the one that matters -- iq4xs, q8_0 and iq2xxs all return the right
+        # argmax 11751 while producing different values, which argmax alone cannot
+        # see. q6k fails visibly (argmax 1829). None of the five causes is
+        # understood yet; all fail loudly rather than emit a wrong kernel.
+        # Bit-identical and therefore allowed: iq3xxs, iq4nl, q2k, q3k, q4k, iq2xs.
+        _base = os.path.basename(loomfile)
+        for k in ('q5k', 'q6k', 'iq4xs', 'q8_0', 'iq2xxs'):
+            if k in _base:
+                raise SystemExit('rows level: %s is known-wrong; excluded' % k)
     # BOTH reduced levels take the wave64 port first. For 'rows' that is about
     # REGISTER PRESSURE, not correctness: n_row*n accumulators of vector<8xf32> is
     # 4*8*8 = 256 f32 per lane at wave32 -- exactly the VGPR budget -- so the
@@ -497,22 +515,23 @@ def _chain(text, tile, n_row, loomfile='', level=None):
     text = wr.widen_rows(text, n_row)
     if (level or CHAIN_LEVEL) == 'rows':
         # LDS staging completes the chain for the one-column-per-lane family: the
-        # row-group form's scattered GLOBAL block-byte gathers only prove
-        # non-negative under an LDS staging step, and staging is what removes the
-        # decode's latency. The stager's anchors are iq3xxs-specific for now, so
-        # any other format fails its asserts loudly and falls back to the shipping
-        # geometry -- which is what chain_applies() is for.
+        # row-group form's scattered GLOBAL block-byte gathers are what make it a
+        # loss on its own, and staging the block in LDS is what removes that. The
+        # stager is format-generic (it reads the block size out of the source), so
+        # it covers every format whose decode has the uniform %blk_off + const
+        # shape; anything else fails its asserts loudly and falls back to the
+        # shipping geometry -- which is what chain_applies() is for.
         import subprocess
         import tempfile
         tool = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            'lds_stage_iq3xxs.py')
+                            'lds_stage_rows.py')
         with tempfile.NamedTemporaryFile('w', suffix='.loom', delete=False) as fh:
             fh.write(text)
             tmp = fh.name
         r = subprocess.run([sys.executable, tool, tmp], capture_output=True, text=True)
         os.unlink(tmp)
         if r.returncode != 0:
-            raise SystemExit('lds_stage_iq3xxs failed: ' + r.stderr.strip()[-200:])
+            raise SystemExit('lds_stage_rows failed: ' + r.stderr.strip()[-200:])
         return r.stdout
     if False:
         # TRANSFORM COMPLETE. widen_rows supports
