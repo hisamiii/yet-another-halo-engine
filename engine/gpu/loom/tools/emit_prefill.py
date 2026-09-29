@@ -496,6 +496,25 @@ def _chain(text, tile, n_row, loomfile='', level=None):
         raise SystemExit('rows level: the word-1col (iq3s) decode needs the full chain')
     text = wr.widen_rows(text, n_row)
     if (level or CHAIN_LEVEL) == 'rows':
+        # LDS staging completes the chain for the one-column-per-lane family: the
+        # row-group form's scattered GLOBAL block-byte gathers only prove
+        # non-negative under an LDS staging step, and staging is what removes the
+        # decode's latency. The stager's anchors are iq3xxs-specific for now, so
+        # any other format fails its asserts loudly and falls back to the shipping
+        # geometry -- which is what chain_applies() is for.
+        import subprocess
+        import tempfile
+        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'lds_stage_iq3xxs.py')
+        with tempfile.NamedTemporaryFile('w', suffix='.loom', delete=False) as fh:
+            fh.write(text)
+            tmp = fh.name
+        r = subprocess.run([sys.executable, tool, tmp], capture_output=True, text=True)
+        os.unlink(tmp)
+        if r.returncode != 0:
+            raise SystemExit('lds_stage_iq3xxs failed: ' + r.stderr.strip()[-200:])
+        return r.stdout
+    if False:
         # TRANSFORM COMPLETE. widen_rows supports
         # the one-column-per-lane map (row = (lane>>4) + 2j over j in [0,32)), so
         # this produces the right row-group form for iq3xxs/iq4xs/q4k/q3k/q6k.
