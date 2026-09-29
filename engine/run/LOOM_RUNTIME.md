@@ -403,9 +403,9 @@ run-to-run noise, so it is not kept. The arm is latency-bound: clamps and
 branchless rewrites measured ~0, and the kernel is ~42% issue-efficient against
 the 240 G warp-insn/s peak.
 
-Current prefill: **~640 ms** against the HIP `best_ms` of 389.8-415 ms, i.e.
-~1.6x, down from 4407 ms for the first correctness-first port. The remaining
-time is the weight decode (~53% of an arm before the 16-wide tile, higher now)
+Current prefill: **661.3 ms** against the HIP `best_ms` of 389.8-415 ms, i.e.
+~1.65x, down from 4407 ms for the first correctness-first port. The remaining
+time is the weight decode (still ~46% of the IQ3_S kStore at `m_tiles=1088`)
 and the structural rhs/MMA/epilogue.
 ### Narrowing the token tile to 16
 
@@ -450,9 +450,67 @@ The cause is structural. HIP's `DecodeQuantSub16` decodes **16 elements per call
 with packed 32-bit integer ops** - four elements per instruction - and hands the
 MMA a packed `q[16]`. Our ports decode one element per lane per instruction
 sequence: nibble extraction, sign, grid lookup and the `d`/`scale` multiply are
-all per element, now with the loop-invariant part hoisted out. The next step is
-to restructure the element loop to decode a 32-bit word (four elements) per op,
-mirroring HIP's formulation.
+all per element, now with the loop-invariant part hoisted out.
+### The word decode, and where it landed
+
+The restructure landed as a **word-per-lane** mapping: one lane owns the four
+consecutive columns `cb..cb+3` (`cb = 4*(lane&3)`), which share `group`,
+`half`, `l` and `lw` and therefore share the qs byte, the qh byte, the grid
+word, the signs byte, the scales nibble and `d`. They differ only in the byte
+selector `b = column&3`, applied inside a 4-trip inner loop, and the packed sign
+negate `(g_byte ^ (0 - sign_bit)) + sign_bit` replaces the per-element branch.
+Two words per lane cover the 16x16 tile: `row = lane>>2` and `(lane>>2)+8`, and
+because `kbase` is a multiple of 16 those two words share the whole offset chain,
+so only the row offset is recomputed. The old mapping gave each lane one column
+and redid all six loads and the offset chain four times: the modeled per-
+workgroup weight reads drop 491520 -> 122880 bytes, and the weight loads per
+k-step drop from 256 to 64.
+
+One non-obvious requirement: the envelope analysis bounds the group index
+loosely, so the scales load wanted `group = 8`, `sc_off = 110`, one byte past
+the 35200-byte weight. `%group = scalar.andi %group_raw, %c7i` states the true
+bound (`i_i = kbase + cb <= 252`, so `group <= 7`) and is a semantic no-op.
+`loom_preflight.py` caught it; without the mask the case is refused.
+
+`engine/run/hal_bench.cc`, isolated, `k_blocks=20`, 30 iters, old -> new:
+
+| m_tiles | old | new | speedup |
+| ---: | ---: | ---: | ---: |
+| 1088 | 1.6660 | 1.5265 | 1.09x |
+| 768 | 1.2622 | 0.8254 | 1.53x |
+| 640 | 1.2095 | 0.5620 | 2.15x |
+| 384 | 0.8235 | 0.3488 | 2.36x |
+| 3 | 0.4480 | 0.1769 | 2.53x |
+
+Correctness: the `m_tiles=1` fixture case (`fixtures/iq3s_gemm/expected_out.npy`,
+captured from HIP) passes, the all-zero production case still returns exactly 0,
+and the full 64-layer prefill output is **bit-identical** to the pre-word build
+(argmax 11751).
+
+**The isolated numbers do not carry to the pipeline at `m_tiles=1088`.** Three
+interleaved full runs each:
+
+| HAL set | layers_ms | mixer | ffn gate |
+| --- | ---: | ---: | ---: |
+| previous | 675.5 | 294.5 | 120.2 |
+| word decode everywhere | 668.9 | 275.1 | 132.1 |
+| word decode at 3/384/640/768, previous at 1088 | **661.3** | 276.8 | 121.4 |
+
+The mixer (kStore at 384/640/768) gains 17.7 ms and the FFN gate (kStore at 1088)
+loses 11.9 ms, so the deployed set keeps the previous 1088 kernel. The loss is
+not explained: the new 1088 kernel needs *fewer* registers (80 vs 88 VGPR), is
+faster in isolation, and an rhs-traffic ablation (pinning the fragment loads to
+`k=0` so they stay cache-resident) moves nothing, so neither occupancy nor
+activation traffic accounts for it. Falsifier for the "this is a pure decode win"
+reading: an in-situ paired A/B that does not reproduce the isolated ordering.
+Deployed: `/home/q/yah-hal-hybrid` (the third row).
+
+Remaining split at `m_tiles=1088` for the new kernel: full 1.584 ms, decode
+replaced by `d` 0.861 ms, so the decode is still ~46% and the structural
+rhs/MMA/epilogue ~54%. The rhs fragment loads themselves are ~0-6%: this kernel
+is not activation-bandwidth-bound in isolation. The 2.4x HIP dequant gap quoted
+above is therefore closed on paper at 384/640/768 and remains at 1088.
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
@@ -486,7 +544,7 @@ Live baselines on Qwen3.8-27B-IQ4_XS, same prompt, both engines:
 | | prefill | decode |
 | --- | ---: | ---: |
 | HIP (`yah-run`) | 386.5 ms | 14.02 tok/s (71.3 ms/token) |
-| HRX (`yah-hrx` / `loom_forward_target`) | ~640 ms | 1.33 tok/s (752 ms/token) |
+| HRX (`yah-hrx` / `loom_forward_target`) | ~661 ms | 1.33 tok/s (752 ms/token) |
 
 Prefill is 1.66x; decode is 10.5x. Both reproduce argmax 11751 and the same
 16-token sequence. The decode gap is structural: the HRX decode drives the
