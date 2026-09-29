@@ -1109,6 +1109,36 @@ So neither lever touches what ships today. The row-widening result is real and
 large, but it belongs to a 2048-token path the engine does not have yet, and the
 current 5-token prefill is unchanged by everything in this section.
 
+### pp2048: the DeltaNet recurrence was 25% of the prefill, now register-resident
+
+`YAH_LOOM_TIME=2` at B=2048 on the ar3 set (9.77 s layers_ms) put `yah_deltanet`
+at 2453 ms over 48 dispatches, 51 ms each, against 3.4 ms per layer for HIP's
+`BatchedDeltaNetRowSplitKernel` (docs/kernel-tuning.md) -- 15x, and the largest
+single item in the profile. The quant GEMMs are ~6.8 s of the rest (~15 TF/s
+against HIP's ~27-31).
+
+The rowsplit kernel is one lane per state row, 48 workgroups of 128 lanes (about
+one wave per SIMD), and every token walks the lane's 128-key row twice through
+memory (LDS after `deltanet_lds_rewrite`). With nothing to hide latency behind,
+that is ~200 cycles per inner step. `yah_deltanet_regtile_f32.loom`, generated
+by `tools/gen_deltanet_regtile.py`, keeps the same lane-per-row geometry and the
+same f32 operation order but carries the row through the token loop as
+`vector<8xf32>` values: loaded once, stored once, with only k/q (wave-uniform,
+so they lower to scalar loads) and the per-token scalars touching memory per
+token. Two compile constraints shaped it: keeping the readout's `s*alpha` and `k`
+live into the update overflows VGPRs (they are recomputed/reloaded, as rowsplit
+does), and 16-wide chunks overflow SGPRs at B=512 (peak 157 of 106), so the
+chunk is 8 wide.
+
+| arm | scaled case (B=512) | pp2048 layers_ms | hidden md5 |
+| --- | ---: | ---: | --- |
+| rowsplit + LDS rewrite | 5.92 / 5.93 ms | 9844.0 / 9917.4 | f837e614ff55d1d1 |
+| regtile | 1.10 / 1.09 ms | **7722.7 / 7747.2** | f837e614ff55d1d1 |
+
+Interleaved, 15 s gaps, sets differing only in `rowsplit.hal`. Bit-identical,
+1.28x on the prefill. The emitters now build `rowsplit.hal` from regtile;
+`YAH_DELTANET=lds` restores the LDS form.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both

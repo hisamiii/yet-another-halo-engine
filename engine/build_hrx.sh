@@ -24,6 +24,11 @@ g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/yah_hrx.cc" \
 g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
     -o "$root/engine/build/hal_bench" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
+# The pp2048 prefill driver, for the same reason: a hand-built copy outside the
+# tree is how a stale binary ends up measured against a new HAL set.
+g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/loom_forward_pp.cc" \
+    -o "$root/engine/build/loom_forward_pp" "$root/engine/build/libyah_core.a" \
+    -L"$libhrx" -lhrx -licuuc -lpthread
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"

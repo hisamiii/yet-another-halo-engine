@@ -635,7 +635,17 @@ def emit(loomfile, configs, outname, outdir, widen=0, chain=False, chain_level=N
     # argmax 11751 on all four runs. But the gate defaulted OFF, so a plain re-emit
     # (the env documented for reproducing the shipped set) silently produced the
     # SLOW variant and lost 11.5 s. YAH_DELTANET_LDS=0 restores that old default.
-    if os.environ.get("YAH_DELTANET_LDS", "1") != "0" and "yah_deltanet_rowsplit" in loomfile:
+    #
+    # Superseded by DEFAULT: rowsplit.hal is built from yah_deltanet_regtile_f32.loom
+    # (tools/gen_deltanet_regtile.py), which carries each lane's state row in
+    # registers across the token loop instead of round-tripping it through LDS.
+    # Same ABI, grid and f32 operation order: at B=2048, interleaved, 15 s gaps,
+    # sets differing only in rowsplit.hal, LDS 9844.0/9917.4 ms vs regtile
+    # 7722.7/7747.2 ms, argmax 11751 and hidden f837e614ff55d1d1 on all four.
+    # YAH_DELTANET=lds selects the LDS form below instead.
+    if "yah_deltanet_rowsplit" in loomfile and os.environ.get("YAH_DELTANET", "regtile") == "regtile":
+        src = os.path.join(LOOM, "yah_deltanet_regtile_f32.loom")
+    elif os.environ.get("YAH_DELTANET_LDS", "1") != "0" and "yah_deltanet_rowsplit" in loomfile:
         text = open(src).read()
         src_tmp = os.path.join(tmp, os.path.basename(loomfile))
         with open(src_tmp, "w") as fh:
