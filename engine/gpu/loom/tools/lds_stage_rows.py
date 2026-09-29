@@ -48,7 +48,18 @@ def subn(pat, new, n):
 
 m = re.search(r'%bpr_i = scalar\.muli %k_blocks_i, %c(\d+)i : i32', src)
 assert m, 'no %bpr_i block-constant anchor'
-BS = int(m.group(1))
+NAME = m.group(1)
+# The IDENTIFIER IS NOT THE VALUE. The emitter keeps the author's name for these
+# constants while substituting the format's real block size, so the digits in the
+# name are a decoy: "%c144 = index.constant 136" for IQ4_XS, "%c144i =
+# scalar.constant 34" for Q8_0, "%c74i = scalar.constant 66" for IQ2_XXS. Taking
+# the name on faith staged 144 bytes for a 136-byte block, which does two things:
+# the fill's vector loop covers the whole (wrong) size so no scalar tail is ever
+# emitted, and every global block read runs 8 bytes into the next block. Read the
+# declared value instead, and keep the name only to locate the declaration.
+vm = re.search(r'%c' + NAME + r'i = scalar\.constant (\d+) : i32', src)
+assert vm, 'the %c%si block constant is never declared as a scalar.constant' % NAME
+BS = int(vm.group(1))
 assert 16 <= BS <= 256 and BS % 2 == 0, 'implausible block size %d' % BS
 VEC = BS - (BS % 16)        # whole 16-byte vectors
 TAIL = BS % 16              # scalar tail bytes (2 for 98, 0 for 144)

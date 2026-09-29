@@ -477,10 +477,35 @@ def _chain(text, tile, n_row, loomfile='', level=None):
         # see. q6k fails visibly (argmax 1829). None of the five causes is
         # understood yet; all fail loudly rather than emit a wrong kernel.
         # Bit-identical and therefore allowed: iq3xxs, iq4nl, q2k, q3k, q4k, iq2xs.
+        # The cause IS now understood for the block-size family: the LDS stager
+        # took the block size from the constant's NAME (%c144i) rather than its
+        # declared VALUE, and the emitter keeps the author's name while
+        # substituting the format's real size -- 136 for IQ4_XS, 34 for Q8_0, 66
+        # for IQ2_XXS, 176 for Q5_K. A name larger than the value makes the fill's
+        # vector loop swallow the whole row so no scalar tail is ever emitted and
+        # every block read runs past its end; a name smaller than the value leaves
+        # payload unstaged. See YAH_ROWS_ALLOW, which is the ONLY way past this
+        # gate and exists to re-verify a stager fix against the hidden-state md5.
         _base = os.path.basename(loomfile)
-        for k in ('q5k', 'q6k', 'iq4xs', 'q8_0', 'iq2xxs'):
-            if k in _base:
-                raise SystemExit('rows level: %s is known-wrong; excluded' % k)
+        _allow = {x for x in os.environ.get('YAH_ROWS_ALLOW', '').split(',') if x}
+        # Still WRONG at this level, whatever the stager does. q5k already fails
+        # at the wave64 port (B=128 argmax 88), so its fault is upstream of the
+        # LDS stage; q6k's block constant was never mis-named (c210i = 210, VEC
+        # 208 + TAIL 2 is exact) yet it still decodes to argmax 1829, so its cause
+        # is something else again; q8_0 stayed wrong after the stager fix
+        # (hidden md5 93c53c72... at B=2048), so it is a third, unrelated fault.
+        for k in ('q5k', 'q6k', 'q8_0'):
+            if k in _base and k not in _allow:
+                raise SystemExit('rows level: %s is known-wrong; excluded'
+                                 ' (YAH_ROWS_ALLOW=%s to re-verify)' % (k, k))
+        # CORRECT but measured no faster, so it keeps the shipping geometry.
+        # iq2xxs became bit-identical once the stager read the block size from the
+        # constant's VALUE (c74i = 66) instead of its name; chained it reproduced
+        # the shipped hidden state but ran 10342 ms against 10177 ms for the same
+        # set without it -- inside this contended box's noise, so not a win.
+        if 'iq2xxs' in _base and 'iq2xxs' not in _allow:
+            raise SystemExit('rows level: iq2xxs is correct but not faster; '
+                             'not chained')
     # BOTH reduced levels take the wave64 port first. For 'rows' that is about
     # REGISTER PRESSURE, not correctness: n_row*n accumulators of vector<8xf32> is
     # 4*8*8 = 256 f32 per lane at wave32 -- exactly the VGPR budget -- so the
