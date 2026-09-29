@@ -706,8 +706,33 @@ serialization, no fragment packet expansion -- which also means the LDS store
 pattern of the word decode is not a bank-conflict problem. The instruction counts
 show the widening doing its job (WMMA 1 -> 4 -> 16 while scalar ALU stays at 99 and
 vector ALU goes 213 -> 228) and show where the registers went: **register moves
-25 -> 65 -> 149**. Cutting those is the concrete path to the next residency tier on
-a wide tile, and it is the one experiment the compiler asks for.
+25 -> 65 -> 149**. Cutting those is the path the compiler points at; the note below records that the
+obvious way to cut them does not work.
+
+#### The residency suggestion, tested
+
+The compiler asks for 16 fewer VGPRs per tile width. The move table points at a
+single `branch_edge` copy whose size tracks the accumulator count (13 / 37 / 69 /
+129 units for 1 / 4 / 8 / 16 fragments), and the only branch carrying the
+accumulators is the `word_decode` `scf.if` inside the k-loop. So the obvious move
+is to delete that branch and let the emitter choose the decode body textually.
+
+Tested, and **it changes nothing**:
+
+| variant | register moves | peak live | `branch_edge` units |
+| --- | ---: | ---: | ---: |
+| narrowed, config-gated word decode | 25 | 32 | 13 |
+| narrowed, branch-free word decode | 25 | 32 | 13 |
+| narrowed, branch-free one-element decode | 24 | 31 | 14 |
+
+The `scf.if` folds away completely, as a compile-time condition should, and the
+`branch_edge` cause is the k-loop's own backedge carrying the accumulators, which
+is a property of the tile width and not of the config knob. The tool is right that
+a wider tile pays in residency; there is no cheap 16-VGPR recovery, and splitting
+the N sub-tiles across two sequential K loops to halve the live accumulators just
+reproduces the 128-token tile, which measured 52.4 ms against 48.0 ms for the
+256-token one. The generator for these variants is `tools/widen_tokens.py`; the
+branch-removal experiment needed no committed source change.
 
 ### Benchmarking took the box down twice
 
