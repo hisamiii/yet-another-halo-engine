@@ -28,6 +28,12 @@ page fault for the driver to report -- gfx times out, MES stops answering
 msg=RESET, and the box resets. That cost three reboots on 2026-09-29.
 
 --check-only stops after the verification and dispatches nothing.
+
+SAFE_BENCH_WRAP (env, optional) is a whitespace-separated command prefix placed
+in front of the hal_bench argv, e.g. "rocprofv3 --pmc SQ_INSTS_VALU --". It exists
+so a profiler can be pointed at the SAME argv this tool derived: the wrap never
+changes an operand, so the safety argument above is untouched. It is for
+profiling only -- the timings it produces are not comparable.
 """
 import json, os, re, subprocess, sys
 
@@ -65,7 +71,7 @@ def main():
     gx, gy, gz = (int(args[i]) for i in range(8, 11))
     bindings = args[11:]
 
-    iters, wfile, check_only = 50, "", False
+    iters, wfile, check_only, token_first = 50, "", False, False
     for f in flags:
         if f.startswith("--iters="):
             iters = int(f.split("=", 1)[1])
@@ -73,6 +79,12 @@ def main():
             wfile = f.split("=", 1)[1]
         elif f == "--check-only":
             check_only = True
+        elif f == "--token-first":
+            # The kernel dispatches workgroups(token_tiles, m_groups, 1) instead of
+            # (m_groups, token_tiles, 1), so consecutive workgroups are the token
+            # tiles of one row-group and share its weight slice in L2. Only the two
+            # grid-role sanity checks change; the overrun/envelope checks do not.
+            token_first = True
 
     tokens = tokens_per_wg * token_tiles
     # The formulas the kernels themselves use.
@@ -121,11 +133,19 @@ def main():
         print("  %-8s %12d %12d%s" % (name[i], want, have, mark))
 
     grid_bad = []
-    if gx * 16 > m_rows:
-        grid_bad.append("gx=%d covers %d rows but m_rows=%d (K splits go on gz)"
-                        % (gx, gx * 16, m_rows))
-    if gy != token_tiles:
-        grid_bad.append("gy=%d must equal token_tiles=%d" % (gy, token_tiles))
+    if token_first:
+        if gx != token_tiles:
+            grid_bad.append("--token-first: gx=%d must equal token_tiles=%d"
+                            % (gx, token_tiles))
+        if gy * 16 > m_rows:
+            grid_bad.append("--token-first: gy=%d covers %d rows but m_rows=%d"
+                            % (gy, gy * 16, m_rows))
+    else:
+        if gx * 16 > m_rows:
+            grid_bad.append("gx=%d covers %d rows but m_rows=%d (K splits go on gz)"
+                            % (gx, gx * 16, m_rows))
+        if gy != token_tiles:
+            grid_bad.append("gy=%d must equal token_tiles=%d" % (gy, token_tiles))
     if gz < 1 or gz > k_split:
         grid_bad.append("gz=%d must be in 1..%d" % (gz, k_split))
     if k_split % gz:
@@ -145,7 +165,8 @@ def main():
                               m_rows, k_blocks, tokens, iters)]
     if wfile:
         extra.append(wfile)
-    return subprocess.call(["/home/q/yah-bin/hal_bench", hal] + extra)
+    wrap = os.environ.get("SAFE_BENCH_WRAP", "").split()
+    return subprocess.call(wrap + ["/home/q/yah-bin/hal_bench", hal] + extra)
 
 
 if __name__ == "__main__":

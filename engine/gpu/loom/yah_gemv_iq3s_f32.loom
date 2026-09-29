@@ -134,22 +134,18 @@ kernel.def target(@yah_wave32) @yah_gemv_iq3s() {
       %sgb8 = view.load %w_view[%sg_idx] : view<[%w_bytes]xi8> -> i8
       %sgb = scalar.extui %sgb8 : i8 to i32
       %is_g1 = scalar.cmpi eq, %which, %c0i : i32
-      %sign_nib = scf.if %is_g1 -> (i32) {
-        %sn_lo = scalar.andi %sgb, %c15i : i32
-        scf.yield %sn_lo : i32
-      } else {
-        %sn_hi = scalar.shrui %sgb, %c4i : i32
-        scf.yield %sn_hi : i32
-      }
+      // branch-free nibble select: shift = 4*which
+      %sn_sh = scalar.shli %which, %c2i : i32
+      %sn_t = scalar.shrui %sgb, %sn_sh : i32
+      %sign_nib = scalar.andi %sn_t, %c15i : i32
       %sbit0 = scalar.shrui %sign_nib, %b : i32
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      %mag = scf.if %is_neg -> (i32) {
-        scf.yield %neg_g : i32
-      } else {
-        scf.yield %g_byte : i32
-      }
+      // conditional negate without a branch: (x ^ -s) + s
+      %neg_one = scalar.subi %c0i, %sign_bit : i32
+      %mag0 = scalar.xori %g_byte, %neg_one : i32
+      %mag = scalar.addi %mag0, %sign_bit : i32
       %sco = scalar.addi %blk_off, %c106i : i32
       %gdiv2 = scalar.shrui %group, %c1i : i32
       %sc_i = scalar.addi %sco, %gdiv2 : i32
@@ -160,13 +156,10 @@ kernel.def target(@yah_wave32) @yah_gemv_iq3s() {
       %scb = scalar.extui %scb8 : i8 to i32
       %odd = scalar.andi %group, %c1i : i32
       %is_even = scalar.cmpi eq, %odd, %c0i : i32
-      %nib = scf.if %is_even -> (i32) {
-        %ni_lo = scalar.andi %scb, %c15i : i32
-        scf.yield %ni_lo : i32
-      } else {
-        %ni_hi = scalar.shrui %scb, %c4i : i32
-        scf.yield %ni_hi : i32
-      }
+      // branch-free nibble select: shift = 4*odd
+      %nb_sh = scalar.shli %odd, %c2i : i32
+      %nb_t = scalar.shrui %scb, %nb_sh : i32
+      %nib = scalar.andi %nb_t, %c15i : i32
       %nib2 = scalar.shli %nib, %c1i : i32
       %one_plus = scalar.addi %nib2, %c1i : i32
       %scale_f = scalar.sitofp %one_plus : i32 to f32

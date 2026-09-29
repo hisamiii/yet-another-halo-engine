@@ -33,7 +33,7 @@ def ensure_scalar_const(lines, val, ty='i32'):
             return lines
     raise SystemExit('no scalar constant anchor')
 
-def widen(text, n_sub, order='batch'):
+def widen(text, n_sub, order='batch', m_origin='%m_origin', stage_dims='[%stage_rows]'):
     """Duplicate the N sub-tiles of the IQ3_S kStore from 4 (64 tokens) to n_sub*16."""
     n = n_sub
     tok = n * 16
@@ -100,12 +100,25 @@ def widen(text, n_sub, order='batch'):
             break
 
     # --- epilogue: n result stores ---
+    # Use the row operand the SOURCE stores with, not the m_origin argument.
+    # The residual's stores address %m_origin_s (= %m_origin + %split_rows, its
+    # k-split row base); rebuilding them from m_origin silently dropped the split
+    # offset, so all four k-splits wrote the same rows and the reduction summed
+    # one partial four times. This is the same defect widen_rows had, and it only
+    # shows on a source that has a split origin -- which is why the swiglu, which
+    # has none, gated clean while the residual did not.
+    row_op = m_origin
+    for l in lines:
+        m = re.search(r'vector\.fragment\.store<result> %acc\d+, %ostage_view\[(%[^,\]]+),', l)
+        if m:
+            row_op = m.group(1)
+            break
     ep = []
     for i in range(1, n):
         ep.append('  %%o%d = index.add %%token_base, %%c%d : index' % (16 * i, 16 * i))
     for i in range(n):
         off = '%token_base' if i == 0 else '%%o%d' % (16 * i)
-        ep.append('  vector.fragment.store<result> %%acc%d, %%ostage_view[%%m_origin, %s] shape [%%m, %%n] : vector<8xf32>, view<[%%stage_rows]x[%%tokens]xf32>' % (i, off))
+        ep.append('  vector.fragment.store<result> %%acc%d, %%ostage_view[%s, %s] shape [%%m, %%n] : vector<8xf32>, view<%sx[%%tokens]xf32>' % (i, row_op, off, stage_dims))
     start = None
     for i, l in enumerate(lines):
         if l.strip().startswith('%o16 = index.add'):
@@ -128,6 +141,11 @@ def widen(text, n_sub, order='batch'):
     lines = ensure_index_const(lines, tok)      # the tile width itself
     lines = ensure_index_const(lines, iters)
     lines = ensure_scalar_const(lines, mask)
+    # The row/token decode shifts by log2(tok). r1 64 (the shipping tile) uses
+    # %c6i, which a source only defines if something else already needed it --
+    # iq3s does (the word decode), iq4xs/iq3xxs and the residual/swiglu siblings
+    # do not. Without this the widened source references an undefined %c7i.
+    lines = ensure_scalar_const(lines, shift)
     return '\n'.join(lines)
 
 

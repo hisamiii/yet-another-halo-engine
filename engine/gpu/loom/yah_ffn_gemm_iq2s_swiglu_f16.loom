@@ -175,11 +175,10 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq2s_swiglu() {
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      %mag = scf.if %is_neg -> (i32) {
-        scf.yield %neg_g : i32
-      } else {
-        scf.yield %g_byte : i32
-      }
+      // conditional negate without a branch: (x ^ -s) + s
+      %neg_one = scalar.subi %c0i, %sign_bit : i32
+      %mag0 = scalar.xori %g_byte, %neg_one : i32
+      %mag = scalar.addi %mag0, %sign_bit : i32
       %sco = scalar.addi %blk_off, %c74i : i32
       %sc_i = scalar.addi %sco, %group : i32
       %sc_ix = index.cast %sc_i : i32 to index

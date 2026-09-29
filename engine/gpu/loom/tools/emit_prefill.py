@@ -108,14 +108,443 @@ def ablate_decode(text):
     return chr(10).join(keep)
 
 
-def emit(loomfile, configs, outname, outdir):
+def direct_residual_epilogue(text):
+    """Store the result fragments straight into the token-major output.
+
+    The residual arm staged every 16x16 result fragment through a global ostage
+    buffer and then read it back with a scalar transposed copy. That round trip is
+    (a) pure overhead -- the lds3 arm showed 1.25x on the kStore -- and (b) the
+    only cross-workgroup shared memory in the kernel, which is what makes the arm
+    nondeterministic once the grid has more than one token tile (see project
+    memory: two runs at 128 tokens differ in exactly this buffer).
+
+    The replacement addresses the output through a strided token-major view:
+    view<[m_rows]x[k_split*tokens]> with layout strided [1, m_rows], i.e. element
+    (row, col) at row + col*m_rows. The split is folded into the column index, so
+    (split, token, row) lands at m_origin + (split*tokens + token_base)*m_rows --
+    the same address the readback loop computed. accum=1 is preserved by loading
+    the existing tile into the accumulator instead of adding it after the fact.
+    """
+    lines = text.split(chr(10))
+    if not any("%ostage_view = buffer.view" in l for l in lines):
+        return text
+
+    view_ty = "view<[%stage_rows_split]x[%tokens]xf32>"
+    new_ty = "view<[%m_rows]x[%out_cols]xf32, %out_layout>"
+    prologue = [
+        "  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>",
+        "  %out_cols = index.mul %k_split, %tokens : index",
+        "  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%out_cols]xf32, %out_layout>",
+        "  %split_tok = index.mul %split, %tokens : index",
+        "  %kcol0 = index.add %split_tok, %token_base : index",
+        "  %kcol1 = index.add %kcol0, %c16 : index",
+        "  %kcol2 = index.add %kcol0, %c32 : index",
+        "  %kcol3 = index.add %kcol0, %c48 : index",
+    ]
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        l = lines[i]
+        if "%ostage_view = buffer.view" in l:
+            out.append(l)
+            out.extend(prologue)
+            i += 1
+            continue
+        if l.strip().startswith("vector.fragment.store<result> %acc0, %ostage_view["):
+            # the four sub-tile stores, in order
+            for k in range(4):
+                src = lines[i + k]
+                assert "%ostage_view[" in src and ("%%acc%d" % k) in src, src
+                out.append("  vector.fragment.store<result> %%acc%d, %%out_t_view[%%m_origin, %%kcol%d] "
+                           "shape [%%m, %%n] : vector<8xf32>, %s" % (k, k, new_ty))
+            # the barrier and the readback loop that followed
+            j = i + 4
+            while lines[j].strip() != "kernel.return":
+                j += 1
+            i = j
+            continue
+        if l.strip().startswith("%acc0, %acc1, %acc2, %acc3 = scf.for"):
+            out.append("  %is_acc = index.cmp eq, %accum, %c1 : index")
+            for k in range(4):
+                out.append("  %%init%d = scf.if %%is_acc -> (vector<8xf32>) {" % k)
+                out.append("    %%il%d = vector.fragment.load<result> %%out_t_view[%%m_origin, "
+                           "%%kcol%d] shape [%%m, %%n] : %s -> vector<8xf32>" % (k, k, new_ty))
+                out.append("    scf.yield %%il%d : vector<8xf32>" % k)
+                out.append("  } else {")
+                out.append("    scf.yield %init : vector<8xf32>")
+                out.append("  }")
+            repl = l
+            for k in range(4):
+                repl = repl.replace("%%a%d = %%init" % k, "%%a%d = %%init%d" % (k, k))
+            out.append(repl)
+            i += 1
+            continue
+        out.append(l)
+        i += 1
+    return chr(10).join(out)
+
+
+def direct_kstore_epilogue(text):
+    """The same direct token-major store for the f32 kStore arm.
+
+    Same defect and same fix as the residual (see direct_residual_epilogue): the
+    result fragments went through a global ostage buffer whose row stride is
+    %tokens, then came back through a scalar transposed copy. The kStore has no
+    k_split and no accum flag, so the output columns are just token_base + {0,16,32,48}.
+    """
+    import re
+    lines = text.split(chr(10))
+    if not any("%ostage_view = buffer.view" in l for l in lines):
+        return text
+    if any("%k_split" in l for l in lines):
+        return text
+    store_re = re.compile(r"vector\.fragment\.store<result> %acc(\d), %ostage_view\[([^,]+), ([^\]]+)\]")
+    new_ty = "view<[%m_rows]x[%tokens]xf32, %out_layout>"
+    prologue = [
+        "  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>",
+        "  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>",
+        "  %epc16 = index.constant 16 : index",
+        "  %epc32 = index.constant 32 : index",
+        "  %epc48 = index.constant 48 : index",
+        "  %tk1 = index.add %token_base, %epc16 : index",
+        "  %tk2 = index.add %token_base, %epc32 : index",
+        "  %tk3 = index.add %token_base, %epc48 : index",
+    ]
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        l = lines[i]
+        if "%ostage_view = buffer.view" in l:
+            out.append(l)
+            out.extend(prologue)
+            i += 1
+            continue
+        if l.strip().startswith("vector.fragment.store<result> %acc0, %ostage_view["):
+            # Do NOT reuse the source's column operands. Two conventions exist in
+            # this tree: the newer ports stage a [stage_rows]x[%tokens] view at
+            # column %token_base, and the older ones (q5k, q3k, q2k, q6k, q8_0,
+            # iq2xs...) stage a tile-local [stage_rows]x64 view at columns
+            # 0/16/32/48. A tile-local column is wrong for the token-major output
+            # as soon as there is more than one token tile -- both tiles write the
+            # same 64 columns -- which is bit-identical at token_tiles=1 and racy
+            # and wrong above it. Always rebuild the columns from %token_base.
+            cols = ["%token_base", "%tk1", "%tk2", "%tk3"]
+            for k in range(4):
+                m = store_re.search(lines[i + k])
+                assert m and int(m.group(1)) == k, lines[i + k]
+                out.append("  vector.fragment.store<result> %%acc%d, %%out_t_view[%s, %s] "
+                           "shape [%%m, %%n] : vector<8xf32>, %s" % (k, m.group(2), cols[k], new_ty))
+            j = i + 4
+            while lines[j].strip() != "kernel.return":
+                j += 1
+            i = j
+            continue
+        out.append(l)
+        i += 1
+    return chr(10).join(out)
+
+
+def local_ostage_epilogue(text):
+    """Stage the swiglu epilogue in a tile-local ostage tile.
+
+    The swiglu arm cannot store its fragments straight to the output: the epilogue
+    applies silu(gate)*x elementwise, so it needs the tile back in a scalar form.
+    What it does NOT need is a staging view whose row stride is %tokens -- the tile
+    a workgroup stages is always 16 rows by 64 columns, so the view is
+    [stage_rows]x[%c64] and the columns are the tile-local 0/16/32/48. The readback
+    then reads column %tok (the local token) while the output index still uses the
+    global token. Side effect: the staging footprint stops growing with the prompt
+    (stage_rows*64*4 instead of stage_rows*tokens*4).
+    """
+    import re
+    lines = text.split(chr(10))
+    if not any("%ostage_view = buffer.view" in l for l in lines):
+        return text
+    cols = ["%c0", "%c16", "%c32", "%c48"]
+    store_re = re.compile(r"(vector\\.fragment\\.store<result> %acc(\\d), %ostage_view\\[)([^,]+), ([^\\]]+)(\\].*)view<\\[%stage_rows\\]x\\[%tokens\\]xf32>")
+    out = []
+    for l in lines:
+        if "%ostage_view = buffer.view" in l:
+            out.append(l.replace("view<[%stage_rows]x[%tokens]xf32>", "view<[%stage_rows]x[%c64]xf32>"))
+            continue
+        if l.strip().startswith("vector.fragment.store<result> %acc") and "%ostage_view[" in l:
+            k = int(l.split("%acc", 1)[1][0])
+            head, rest = l.split("%ostage_view[", 1)
+            row, rest2 = rest.split(",", 1)
+            tail = rest2.split("]", 1)[1].replace("view<[%stage_rows]x[%tokens]xf32>", "view<[%stage_rows]x[%c64]xf32>")
+            out.append(head + "%ostage_view[" + row + ", " + cols[k] + "]" + tail)
+            continue
+        if "%val = view.load %ostage_view[" in l and ", %tok_g]" in l:
+            out.append(l.replace(", %tok_g]", ", %tok]")
+                        .replace("view<[%stage_rows]x[%tokens]xf32>", "view<[%stage_rows]x[%c64]xf32>"))
+            continue
+        out.append(l)
+    return chr(10).join(out)
+
+
+def deltanet_lds_rewrite(text):
+    """Stage the DeltaNet state in LDS instead of re-reading it from global.
+
+    Measured on the scaled case with the source's own exact expectations as the
+    gate: the per-token state store in the update loop is 81% of the kernel
+    (19.30 -> 3.57 ms when the store alone is removed), the state load a further
+    33% (-> 12.85 ms), the readout 17%. Unrolling 2/4/8 is neutral-to-worse and
+    transposing the layout so a wave's accesses coalesce is worth 13%, so the cost
+    is the per-iteration global round trip, not issue, bandwidth or line count.
+
+    The register-resident form (one state row per lane in 128 registers, which is
+    what the HIP reference does) does not compile on this target: 128 named values
+    each need their own address value and amdgpu.sgpr runs out (budget 106, peak
+    401, 'spill-traffic-register-exhausted').
+
+    THE LAUNCH SHAPE MUST NOT CHANGE. The obvious way to fit the 128x128 f32 block
+    (65536 B, the gfx11 per-workgroup LDS limit) is two 64-lane workgroups per
+    head, which is what this kernel's own launch config declares and what
+    iree-benchmark-loom honours. engine/run/loom_forward_pp.cc does NOT: it passes
+    the grid explicitly as Dispatch(..., kTs, 1, 1, 128, 1, 1, b) and takes only
+    the workgroup SIZE from the HAL metadata, so a 2x grid silently never launches
+    and only the first half of the 48 heads is computed -- a wrong-but-deterministic
+    forward, which is exactly how this was found. So: grid = num_heads, 128 lanes,
+    one lane per state row, exactly as the original.
+
+    The block is held COLUMN-major (sl[i*128 + row]) so that a wave's 32 lanes
+    always touch 32 consecutive floats -- conflict-free in the staging loop, the
+    two token-loop reads and the write-back without any padding. Same f32
+    operations in the same order, so the results are bit-identical: the B=64
+    single-workgroup-per-row-group output is byte-identical with and without this
+    pass.
+
+    19.166 -> 5.916 ms on the scaled case (3.24x), gate exact both ways.
+    """
+    subs = [
+        ("  %state_row = index.add %state_base0, %row_k : index",
+         "  %state_row = index.add %state_base0, %row_k : index\n"
+         "  %dl16384 = index.constant 16384 : index\n"
+         "  %dlbytes = index.constant 65536 : offset\n"
+         "  %dll = buffer.alloca<workgroup> align(16) %dlbytes : buffer\n"
+         "  %dls = buffer.view %dll[%base] : buffer -> view<[%dl16384]xf32>\n"
+         "  %dlstage = scf.for %si = [%c0 to %c128 step %c1](%sm = %zero : f32) -> (f32) {\n"
+         "    %dlg = index.add %state_row, %si : index\n"
+         "    %dlsi = index.mul %si, %c128 : index\n"
+         "    %dllidx = index.add %dlsi, %row : index\n"
+         "    %dlv = view.load %state_view[%dlg] : view<[%state_total]xf32> -> f32\n"
+         "    view.store %dlv, %dls[%dllidx] : f32, view<[%dl16384]xf32>\n"
+         "    scf.yield %sm : f32\n"
+         "  }"),
+        ("      %s_idx = index.add %state_row, %i : index\n"
+         "      %k_idx = index.add %k_off, %i : index\n"
+         "      %q_idx = index.add %q_off, %i : index\n"
+         "      %s = view.load %state_view[%s_idx] : view<[%state_total]xf32> -> f32",
+         "      %dli128 = index.mul %i, %c128 : index\n"
+         "      %s_idx = index.add %dli128, %row : index\n"
+         "      %k_idx = index.add %k_off, %i : index\n"
+         "      %q_idx = index.add %q_off, %i : index\n"
+         "      %s = view.load %dls[%s_idx] : view<[%dl16384]xf32> -> f32"),
+        ("      %js_idx = index.add %state_row, %j : index\n"
+         "      %jk_idx = index.add %k_off, %j : index\n"
+         "      %sj = view.load %state_view[%js_idx] : view<[%state_total]xf32> -> f32",
+         "      %dlj128 = index.mul %j, %c128 : index\n"
+         "      %js_idx = index.add %dlj128, %row : index\n"
+         "      %jk_idx = index.add %k_off, %j : index\n"
+         "      %sj = view.load %dls[%js_idx] : view<[%dl16384]xf32> -> f32"),
+        ("      view.store %sj_new, %state_view[%js_idx] : f32, view<[%state_total]xf32>",
+         "      view.store %sj_new, %dls[%js_idx] : f32, view<[%dl16384]xf32>"),
+        ("  kernel.return",
+         "  %dlunstage = scf.for %ui = [%c0 to %c128 step %c1](%um = %zero : f32) -> (f32) {\n"
+         "    %dlug = index.add %state_row, %ui : index\n"
+         "    %dlui = index.mul %ui, %c128 : index\n"
+         "    %dlulidx = index.add %dlui, %row : index\n"
+         "    %dluv = view.load %dls[%dlulidx] : view<[%dl16384]xf32> -> f32\n"
+         "    view.store %dluv, %state_view[%dlug] : f32, view<[%state_total]xf32>\n"
+         "    scf.yield %um : f32\n"
+         "  }\n"
+         "  kernel.return"),
+    ]
+    for old, new in subs:
+        if text.count(old) != 1:
+            raise SystemExit("deltanet_lds_rewrite: anchor %d times: %s"
+                             % (text.count(old), old.strip()[:60]))
+        text = text.replace(old, new)
+    return text
+
+def _chain(text, tile, n_row, loomfile=''):
+    """The measured-best kStore rebuild: branchfree -> wave64 -> n_row row groups.
+
+    Every step fails loudly on a structural anchor it cannot find, so a caller
+    can probe it. See emit(..., chain=True) for why the launch geometry this
+    produces has to travel with the HAL.
+    """
+    import branchfree_decode as bf
+    import wave64_tokens as w64
+    import widen_rows as wr
+    # The residual and swiglu siblings decode IQ3_S with the old one-column-per-
+    # lane mapping, which widen_rows cannot address. Transplanting the kStore's
+    # word body into them is a frame-preserving region swap (see
+    # port_word_decode), and the arithmetic is identical, so their outputs stay
+    # bit-identical.
+    # Opt-in: the swiglu's two-operand silu(gate)*up accumulator set does not match
+    # widen_rows' single %acc0..%acc{n-1} rewrite yet (it compiles to an undefined
+    # %acc8), and the residual's ostage view still fails the LDS anchor. Until both
+    # are handled the port stays out of the default path.
+    # Both siblings compile with the transplant (round 8). The earlier "undefined
+    # %acc8" was not a two-accumulator problem: it was a duplicate SSA name from
+    # the transplant, which aborts the parse of the enclosing loop and makes every
+    # one of that loop's results read as undefined.
+    # OFF by default: the transplant COMPILES (round 8, after port_word_decode was
+    # taught to absorb the target's colliding definitions -- the "undefined %acc8"
+    # was one duplicate SSA name aborting the parse of the enclosing loop, not a
+    # two-accumulator problem), but it is NUMERICALLY WRONG: with it enabled the
+    # B=128 forward argmax is 279 instead of 11751. The word body's row/column
+    # decode does not land in the same LDS cells the siblings' lhs fragment reads,
+    # so this needs a semantic port, not a region swap. Re-enable only with a
+    # bit-identity gate on each source.
+    _base = os.path.basename(loomfile)
+    _want = os.environ.get("YAH_WORD_PORT", "")
+    _is_rs = _base.startswith('yah_ffn_gemm_iq3s_residual')
+    _is_sw = _base.startswith('yah_ffn_gemm_iq3s_swiglu')
+    # The SWIGLU transplant is default-on and verified: B=128 hidden byte-identical
+    # to the pre-transplant build, B=2048 deterministic across runs, argmax 11751 ==
+    # HIP and logits-vs-HIP identical to the baseline (corr 0.999996809, max|d|
+    # 0.0403244) -- the word decode is the same arithmetic in a different lane order.
+    # The RESIDUAL is still wrong (combined argmax 279) and stays behind
+    # YAH_WORD_PORT=residual until its own gate passes.
+    # YAH_WORD_PORT=off emits the pre-transplant geometry, which is what a paired
+    # A/B against the current build needs.
+    # The source test must come FIRST. Written the other way round, _want == "1"
+    # was true for every source, so the port was applied to the whole GEMM family
+    # and injected the IQ3_S word body into e.g. q3k (undefined %c66i) -- which is
+    # also why the probe results looked env-dependent.
+    # Default (no env) ports the swiglu only: that is the verified shipped state.
+    # Every branch is scoped to a sibling -- an unscoped _want == "1" applied the
+    # port to the whole GEMM family (it injected the IQ3_S word body into q3k,
+    # giving undefined %c66i, which also made the probes look env-dependent).
+    # HARD GATE (round 16): porting the IQ3_S word body into the RESIDUAL is
+    # numerically wrong and is now unreachable in every selector form. Proven
+    # this round: the residual's copy loop, %tokens/%m_tiles/%m_rows/%stage_rows/
+    # %token_base, its o16/o32/o48 column offsets and its copy-loop lane map
+    # (tok = e2 & 15, r2 = e2 >> 4) are ALL byte-identical to the verified kStore,
+    # and k_split defaults to 1 (config.def) so split = wg.z = 0, k_off = 0,
+    # k_end = k_blocks -- the split path is inert. The only residual-unique feature
+    # left is the accum branch. With the port ON, B=128 forward argmax is 279
+    # instead of 11751; with it OFF (the shipped geometry, which still gets
+    # wave64 + widen_rows + LDS staging) the build is byte-identical. So the
+    # defect is confined to the port's row/column decode: it does not land in the
+    # same LDS cells the residual's lhs fragment reads. A frame-preserving region
+    # swap is not a semantic port. This must stay unreachable until someone writes
+    # a real semantic port gated by the residual's own value oracle -- there is no
+    # check.case runner in-tree (safe_bench.py is a footprint gate, not an oracle),
+    # so that gate does not exist yet.
+    #
+    # RuntimeError, NOT SystemExit: chain_applies() catches SystemExit and would
+    # silently fall back to emitting an UNCHAINED residual instead of refusing.
+    if _is_rs and _want in ("1", "residual"):
+        raise RuntimeError(
+            "YAH_WORD_PORT=%r would port the IQ3_S word body into %s, which is "
+            "known-wrong (B=128 argmax 279 vs 11751) and disabled by the round-16 "
+            "gate in emit_prefill._chain. Leave YAH_WORD_PORT unset (swiglu only) "
+            "or use YAH_WORD_PORT=off." % (_want, _base))
+    _sel = (((_want == "1") and _is_sw)
+            or ((_want in ("", "swiglu")) and _is_sw))
+    if _want != "off" and _sel:
+        import port_word_decode as pwd
+        text = pwd.port(text, tile)
+    if 'scf.if %wd_old' in text:
+        text = bf.drop_branch(text, 'word')
+    text = w64.wave64(text, tile)
+    text = wr.widen_rows(text, n_row)
+    # Last, and only for the shape the steps above produce: stage the IQ3_S
+    # weight block in LDS. That transform is format-specific (110-byte block) and
+    # lives in its own generator, which is run as a filter so its proven
+    # substitution list stays verbatim. It is also what lets emit_hal.py accept
+    # the kernel at all -- with the configs inlined as constants the scattered
+    # global byte-gather indices lose their non-negativity proof.
+    import subprocess
+    import tempfile
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lds_stage_iq3s.py")
+    with tempfile.NamedTemporaryFile("w", suffix=".loom", delete=False) as fh:
+        fh.write(text)
+        tmp = fh.name
+    r = subprocess.run([sys.executable, tool, tmp], capture_output=True, text=True)
+    os.unlink(tmp)
+    if r.returncode != 0:
+        raise SystemExit("lds_stage_iq3s failed: " + r.stderr.strip()[-160:])
+    return r.stdout
+
+    hal = r.stdout.strip().splitlines()[-1]
+    dst = os.path.join(outdir, outname)
+    subprocess.run(["cp", hal, dst], check=True)
+    return dst
+
+
+def chain_applies(loomfile, tile=None, n_row=None):
+    """Can the wave64/row-group chain rebuild this source?
+
+    Only the kStore family that carries the packed word decode has the lane map
+    widen_rows assumes; the other GEMM sources use a decode whose row pass it
+    cannot address, so they stay on the shipping geometry. Probing the real
+    transform is what makes that distinction safe: it raises on any anchor it
+    does not recognise.
+    """
+    if not os.path.basename(loomfile).startswith("yah_ffn_gemm_"):
+        return False
+    tile = tile or TOKEN_TILE
+    n_row = n_row or int(os.environ.get("YAH_ROWGRP", "4"))
+    # The probe must see the SAME text emit() will transform: emit() widens the
+    # token tile before calling _chain, and probing the raw source instead gave
+    # the residual a false negative for two rounds.
+    text = open(os.path.join(LOOM, loomfile)).read()
+    if tile and tile != 64:
+        import widen_tokens as W
+        origin = "%m_origin_s" if "%m_origin_s" in text else "%m_origin"
+        dims = "[%stage_rows_split]" if "%stage_rows_split" in text else "[%stage_rows]"
+        text = W.widen(text, tile // 16, m_origin=origin, stage_dims=dims)
+    try:
+        _chain(text, tile, n_row, loomfile)
+        return True
+    except SystemExit:
+        return False
+
+
+def emit(loomfile, configs, outname, outdir, widen=0, chain=False):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(LOOM, loomfile)
+    if os.environ.get("YAH_DELTANET_LDS") == "1" and "yah_deltanet_rowsplit" in loomfile:
+        text = open(src).read()
+        src_tmp = os.path.join(tmp, os.path.basename(loomfile))
+        with open(src_tmp, "w") as fh:
+            fh.write(deltanet_lds_rewrite(text))
+        src = src_tmp
     if os.path.basename(loomfile).startswith("yah_ffn_gemm_"):
         text = open(src).read()
         if TOKEN_TILE == 16:
             text = narrow_tokens(text)
+        # Full-prompt emission wants the source's own (or a wider) token tile
+        # instead of the 5-token narrowing, so widen_tokens.py is the inverse
+        # step here. The two are mutually exclusive.
+        if widen and widen != 64 and TOKEN_TILE != 16:
+            import widen_tokens as W
+            origin = "%m_origin_s" if "%m_origin_s" in text else "%m_origin"
+            dims = "[%stage_rows_split]" if "%stage_rows_split" in text else "[%stage_rows]"
+            text = W.widen(text, widen // 16, m_origin=origin, stage_dims=dims)
+        # chain=True rebuilds the source as the measured-best arm: branchfree ->
+        # wave64 -> n_row row groups per workgroup -> IQ3_S block staging in LDS.
+        # The launch geometry changes with the row group count, so the resolved
+        # geometry travels with the HAL (emit_prefill_pp writes dispatch.txt).
+        if chain:
+            text = _chain(text, widen, int(os.environ.get("YAH_ROWGRP", "4")), loomfile)
+        # YAH_SIMPLE_FILL=1 drops the unroll/schedule annotation from the LDS fill.
+        if os.environ.get("YAH_SIMPLE_FILL") == "1":
+            text = text.replace("unroll(%c2) schedule(interleaved)", "")
+        # YAH_DIRECT_EPI=1 removes the residual's global ostage round trip. The
+        # chain rebuilds the epilogue itself, so the two are per-source alternatives.
+        if os.environ.get("YAH_DIRECT_EPI") == "1" and not chain:
+            if "_residual_" in loomfile:
+                text = direct_residual_epilogue(text)
+            elif loomfile.endswith("_f32.loom"):
+                text = direct_kstore_epilogue(text)
         if ABLATE_DECODE:
             text = ablate_decode(text)
         src_tmp = os.path.join(tmp, os.path.basename(loomfile))
@@ -125,7 +554,19 @@ def emit(loomfile, configs, outname, outdir):
     r = subprocess.run([sys.executable, EMIT, src, tmp] + configs,
                        capture_output=True, text=True)
     if r.returncode != 0:
-        raise SystemExit("emit failed for " + loomfile + ": " + r.stdout + r.stderr)
+        # Surface the ORDERED HEAD of the failure: assembling the message as
+        # stdout+stderr pushes the primary diagnostic out of view (the emit helper
+        # writes progress without a trailing newline, so the old message began
+        # mid-token) and three rounds were lost reading the repeated tail symptom.
+        # stderr carries the compiler diagnostics, so it comes first.
+        log = os.path.join("/tmp", "emit_fail_" + os.path.basename(outname) + ".log")
+        with open(log, "w") as fh:
+            fh.write("cmd: %s" % " ".join([sys.executable, EMIT, src, tmp] + list(configs)))
+            fh.write(chr(10) + "--- stderr ---" + chr(10) + r.stderr
+                     + chr(10) + "--- stdout ---" + chr(10) + r.stdout)
+        head = (r.stderr.strip() + chr(10) + r.stdout.strip()).strip().splitlines()[:24]
+        raise SystemExit("emit failed for " + loomfile + " (full log: " + log + "):"
+                         + (chr(10) + "  ").join(head))
     hal = r.stdout.strip().splitlines()[-1]
     dst = os.path.join(outdir, outname)
     subprocess.run(["cp", hal, dst], check=True)

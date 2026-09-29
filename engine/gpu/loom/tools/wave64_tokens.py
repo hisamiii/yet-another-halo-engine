@@ -2,8 +2,8 @@ import re, sys
 sys.path.insert(0, '/home/q/yet-another-halo-engine/engine/gpu/loom/tools')
 import widen_tokens as wt
 import emit_prefill as ep
-sys.path.insert(0, '/home/q/yah-scratch')
-from branchfree import drop_branch
+# Vendored next to this file: the chain must not depend on a scratch directory.
+from branchfree_decode import drop_branch
 
 def _ensure_index(lines, val):
     name = '%%c%d' % val
@@ -77,20 +77,27 @@ def wave64(text, tok):
 
     # a wave64 workgroup is a full wave, and %c64 is not in the kernel.def scope
     t = '\n'.join(lines)
-    old = ('  %c32 = index.constant 32 : index\n'
-           '  kernel.launch.config workgroups(%m_tiles, %token_tiles, %unit) '
-           'workgroup_size(%c32, %unit, %unit) : index')
-    new = ('  %c64 = index.constant 64 : index\n'
-           '  kernel.launch.config workgroups(%m_tiles, %token_tiles, %unit) '
-           'workgroup_size(%c64, %unit, %unit) : index')
-    if old not in t:
-        raise SystemExit('kernel.def launch anchor not found')
-    return t.replace(old, new)
+    # The z slot is %unit for the kStore family and %k_split for the residual
+    # family that slices K across workgroups.
+    makes = lambda z: ('  %c64 = index.constant 64 : index\n'
+                       '  kernel.launch.config workgroups(%m_tiles, %token_tiles, ' + z + ') '
+                       'workgroup_size(%c64, %unit, %unit) : index')
+    for z in ('%unit', '%k_split'):
+        old = ('  %c32 = index.constant 32 : index\n'
+               '  kernel.launch.config workgroups(%m_tiles, %token_tiles, ' + z + ') '
+               'workgroup_size(%c32, %unit, %unit) : index')
+        if old in t:
+            return t.replace(old, makes(z))
+    raise SystemExit('kernel.def launch anchor not found')
 
-src = open('/home/q/yet-another-halo-engine/engine/gpu/loom/yah_ffn_gemm_iq3s_f32.loom').read()
-for tok in (64, 128, 256, 384, 512):
-    v = wt.widen(src, tok // 16, order='batch')
-    v = wave64(drop_branch(v, 'word'), tok)
-    open('/home/q/yah-scratch/kw64_%dt.loom' % tok, 'w').write(v)
-    open('/home/q/yah-scratch/kw64_%dt_abl.loom' % tok, 'w').write(ep.ablate_decode(v))
-    print('wrote kw64_%dt.loom (wave64, %d tok/tile)' % (tok, tok))
+if __name__ == '__main__':
+    # Generator entry point: writes the wave64 sweep into the scratch dir. It is
+    # behind a guard because importing this module (emit_prefill does, for the
+    # YAH_GEMM_W64 chain) must not rewrite files.
+    src = open('/home/q/yet-another-halo-engine/engine/gpu/loom/yah_ffn_gemm_iq3s_f32.loom').read()
+    for tok in (64, 128, 256, 384, 512):
+        v = wt.widen(src, tok // 16, order='batch')
+        v = wave64(drop_branch(v, 'word'), tok)
+        open('/home/q/yah-scratch/kw64_%dt.loom' % tok, 'w').write(v)
+        open('/home/q/yah-scratch/kw64_%dt_abl.loom' % tok, 'w').write(ep.ablate_decode(v))
+        print('wrote kw64_%dt.loom (wave64, %d tok/tile)' % (tok, tok))

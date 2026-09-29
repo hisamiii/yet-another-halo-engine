@@ -204,22 +204,17 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3xxs_swiglu() {
       %sid_ix = index.cast %sid7 : i32 to index
       %ks = view.load %ksigns_view[%sid_ix] : view<128xi8> -> i8
       %signs = scalar.extui %ks : i8 to i32
-      %sign_nib = scf.if %is_g1 -> (i32) {
-        %sn_lo = scalar.andi %signs, %c15i : i32
-        scf.yield %sn_lo : i32
-      } else {
-        %sn_hi = scalar.shrui %signs, %c4i : i32
-        scf.yield %sn_hi : i32
-      }
+      %nbsh0 = scalar.shli %which, %c2i : i32
+      %nbt0 = scalar.shrui %signs, %nbsh0 : i32
+      %sign_nib = scalar.andi %nbt0, %c15i : i32
       %sbit0 = scalar.shrui %sign_nib, %b : i32
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      %mag = scf.if %is_neg -> (i32) {
-        scf.yield %neg_g : i32
-      } else {
-        scf.yield %g_byte : i32
-      }
+      // conditional negate without a branch: (x ^ -s) + s
+      %neg_one = scalar.subi %c0i, %sign_bit : i32
+      %mag0 = scalar.xori %g_byte, %neg_one : i32
+      %mag = scalar.addi %mag0, %sign_bit : i32
       %n4 = scalar.shrui %aux32, %c28i : i32
       %n4_f = scalar.sitofp %n4 : i32 to f32
       %hp = scalar.addf %n4_f, %fhalf : f32

@@ -73,15 +73,22 @@ def widen_rows(text, n_row=2):
     passes = rows // rpp          # decode passes over the weight tile
 
     # --- workgroup geometry: x grid divides by n_row, each group covers n_row tiles
+    # The z slot is %unit for the kStore family and %k_split for the residual
+    # family that slices K across workgroups; both divide only on x.
     old = ('  kernel.launch.config workgroups(%m_tiles, %token_tiles, %unit) '
            'workgroup_size(%c' + str(wave) + ', %unit, %unit) : index')
+    old_split = ('  kernel.launch.config workgroups(%m_tiles, %token_tiles, %k_split) '
+                 'workgroup_size(%c' + str(wave) + ', %unit, %unit) : index')
     new = ('  %rowgrp = index.constant ' + str(n_row) + ' : index\n'
            '  %m_groups = index.div %m_tiles, %rowgrp : index\n'
-           '  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) '
+           '  kernel.launch.config workgroups(%m_groups, %token_tiles, %zslot) '
            'workgroup_size(%c' + str(wave) + ', %unit, %unit) : index')
-    if old not in text:
+    if old in text:
+        text = text.replace(old, new.replace('%zslot', '%unit'))
+    elif old_split in text:
+        text = text.replace(old_split, new.replace('%zslot', '%k_split'))
+    else:
         raise SystemExit('kernel.def launch anchor not found')
-    text = text.replace(old, new)
 
     text = _one(text, r'%lds_bytes = index\.constant \d+ : offset',
                 '%%lds_bytes = index.constant %d : offset' % (512 * n_row))
@@ -121,14 +128,18 @@ def widen_rows(text, n_row=2):
     accs = [a.strip() for a in line.split('=', 1)[0].split(',')]
     if len(accs) != n:
         raise SystemExit('accumulator count %d does not match tile %d' % (len(accs), tok))
-    body = re.search(r'\[%c0 to %ktot step %c16\]\((.*)\) -> \((.*)\) \{', line)
+    # The residual family splits K across workgroups and starts at %k_off, so the
+    # bounds are captured rather than rebuilt as the kStore family's %c0..%ktot.
+    body = re.search(r'\[(.*?) to (.*?) step (%c\d+)\]\((.*)\) -> \((.*)\) \{', line)
     if not body:
         raise SystemExit('cannot parse the k loop header')
-    vec = re.search(r': (vector<\d+xf32>)', body.group(1)).group(1)
+    k_lo, k_hi, k_step = body.group(1), body.group(2), body.group(3)
+    vec = re.search(r': (vector<\d+xf32>)', body.group(4)).group(1)
     total = n_row * n
     names = ['%%acc%d' % i for i in range(total)]
     inits = ['%%a%d = %%init : %s' % (i, vec) for i in range(total)]
-    lines[hdr] = ('  ' + ', '.join(names) + ' = scf.for %kk = [%c0 to %ktot step %c16]('
+    lines[hdr] = ('  ' + ', '.join(names) + ' = scf.for %kk = [' + k_lo + ' to ' + k_hi
+                  + ' step ' + k_step + ']('
                   + ', '.join(inits) + ') -> (' + ', '.join([vec] * total) + ') {')
 
     mm0 = [i for i, l in enumerate(lines) if re.match(r'\s*%n\d+ = vector\.mma %lhs,', l)]
@@ -146,18 +157,26 @@ def widen_rows(text, n_row=2):
     lines[yl] = ('    scf.yield ' + ', '.join('%%n%d' % i for i in range(total))
                  + ' : ' + ', '.join([vec] * total))
 
-    # --- epilogue: every row tile stores through the same ostage
-    st = [i for i, l in enumerate(lines) if re.match(r'\s*vector\.fragment\.store<result> %acc\d+, %ostage_view\[%m_origin,', l)]
+    # --- epilogue: every row tile stores through the same staging view
+    # The view name and the row-origin operand are not fixed: the kStore and
+    # swiglu store through %ostage_view[%m_origin, ...] while the residual writes
+    # its k-split partial through its own view and origin, so both are captured
+    # rather than assumed.
+    store_re = re.compile(r'(\s*vector\.fragment\.store<result> %acc(\d+), )(%\w+)\[(%[^,\]]+),')
+    st = [i for i, l in enumerate(lines) if store_re.match(l)]
     if len(st) != n:
         raise SystemExit('found %d result stores, wanted %d' % (len(st), n))
+    row_var = store_re.match(lines[st[0]]).group(4)
     ep = []
     for r in range(1, n_row):
-        ep.append('  %%mo%d = index.add %%m_origin, %%c%d : index' % (16 * r, 16 * r))
+        ep.append('  %%mo%d = index.add %s, %%c%d : index' % (16 * r, row_var, 16 * r))
     for r in range(n_row):
-        off = '%m_origin' if r == 0 else '%%mo%d' % (16 * r)
+        off = row_var if r == 0 else '%%mo%d' % (16 * r)
         for i in range(n):
+            m = store_re.match(lines[st[i]])
             l = lines[st[i]]
-            ep.append(l.replace('%acc' + str(i) + ',', '%acc' + str(r * n + i) + ',').replace('%m_origin,', off + ','))
+            ep.append(l.replace('%acc' + m.group(2) + ',', '%acc' + str(r * n + int(m.group(2))) + ',')
+                       .replace('%s,' % row_var, off + ','))
     lines[st[0]:st[-1] + 1] = ep
 
     # The ostage copy walks rows*tok elements with one element per lane per trip,
@@ -220,7 +239,7 @@ if __name__ == '__main__':
     import widen_tokens as wt
     import wave64_tokens as w64
     import emit_prefill as ep
-    from branchfree import drop_branch
+    from branchfree_decode import drop_branch
     for n_row in (1, 2, 4, 8):
         for tok in (16, 32, 64, 128, 256):
             if tok % 16:

@@ -89,7 +89,11 @@ def main():
            "--emit-target-artifact=" + target]
     result = subprocess.run(cmd, env=env(), capture_output=True, text=True)
     if result.returncode != 0 or not os.path.exists(hal_path):
-        sys.stderr.write(result.stderr[-4000:])
+        # Write the WHOLE diagnostic, head first. This used to write
+        # result.stderr[-4000:], which for a 40+ error compile drops the primary
+        # diagnostic and leaves a mid-token fragment -- four rounds were spent
+        # reading the tail symptom (%acc8 undefined) instead of the first error.
+        sys.stderr.write(result.stderr)
         return 1
     print(hal_path)
     return 0

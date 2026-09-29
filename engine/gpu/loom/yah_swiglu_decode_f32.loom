@@ -966,22 +966,16 @@ func.def @iq3s_step(%wn: index, %whn: index, %xn: index, %wv: view<[%wn]xi8>, %w
       %sgb8 = view.load %wv[%sg_idx] : view<[%wn]xi8> -> i8
       %sgb = scalar.extui %sgb8 : i8 to i32
       %is_g1 = scalar.cmpi eq, %which, %c0i : i32
-      %sign_nib = scf.if %is_g1 -> (i32) {
-        %sn_lo = scalar.andi %sgb, %c15i : i32
-        scf.yield %sn_lo : i32
-      } else {
-        %sn_hi = scalar.shrui %sgb, %c4i : i32
-        scf.yield %sn_hi : i32
-      }
+      %nbsh0 = scalar.shli %which, %c2i : i32
+      %nbt0 = scalar.shrui %sgb, %nbsh0 : i32
+      %sign_nib = scalar.andi %nbt0, %c15i : i32
       %sbit0 = scalar.shrui %sign_nib, %b : i32
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      %mag = scf.if %is_neg -> (i32) {
-        scf.yield %neg_g : i32
-      } else {
-        scf.yield %g_byte : i32
-      }
+      %nbn0 = scalar.subi %c0i, %sign_bit : i32
+      %nbm0 = scalar.xori %g_byte, %nbn0 : i32
+      %mag = scalar.addi %nbm0, %sign_bit : i32
       %sco = scalar.addi %blk_off, %c106i : i32
       %gdiv2 = scalar.shrui %group, %c1i : i32
       %sc_i = scalar.addi %sco, %gdiv2 : i32
@@ -992,13 +986,9 @@ func.def @iq3s_step(%wn: index, %whn: index, %xn: index, %wv: view<[%wn]xi8>, %w
       %scb = scalar.extui %scb8 : i8 to i32
       %odd = scalar.andi %group, %c1i : i32
       %is_even = scalar.cmpi eq, %odd, %c0i : i32
-      %nib = scf.if %is_even -> (i32) {
-        %ni_lo = scalar.andi %scb, %c15i : i32
-        scf.yield %ni_lo : i32
-      } else {
-        %ni_hi = scalar.shrui %scb, %c4i : i32
-        scf.yield %ni_hi : i32
-      }
+      %nbsh1 = scalar.shli %odd, %c2i : i32
+      %nbt1 = scalar.shrui %scb, %nbsh1 : i32
+      %nib = scalar.andi %nbt1, %c15i : i32
       %nib2 = scalar.shli %nib, %c1i : i32
       %one_plus = scalar.addi %nib2, %c1i : i32
       %scale_f = scalar.sitofp %one_plus : i32 to f32
@@ -1127,22 +1117,16 @@ func.def @iq3xxs_step(%wn: index, %whn: index, %xn: index, %wv: view<[%wn]xi8>, 
       %ksb8 = view.load %ksv[%sid_ix] : view<128xi8> -> i8
       %signs = scalar.extui %ksb8 : i8 to i32
       %is_g1 = scalar.cmpi eq, %which, %c0i : i32
-      %sign_nib = scf.if %is_g1 -> (i32) {
-        %sn_lo = scalar.andi %signs, %c15i : i32
-        scf.yield %sn_lo : i32
-      } else {
-        %sn_hi = scalar.shrui %signs, %c4i : i32
-        scf.yield %sn_hi : i32
-      }
+      %nbsh2 = scalar.shli %which, %c2i : i32
+      %nbt2 = scalar.shrui %signs, %nbsh2 : i32
+      %sign_nib = scalar.andi %nbt2, %c15i : i32
       %sbit0 = scalar.shrui %sign_nib, %b : i32
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      %mag = scf.if %is_neg -> (i32) {
-        scf.yield %neg_g : i32
-      } else {
-        scf.yield %g_byte : i32
-      }
+      %nbn1 = scalar.subi %c0i, %sign_bit : i32
+      %nbm1 = scalar.xori %g_byte, %nbn1 : i32
+      %mag = scalar.addi %nbm1, %sign_bit : i32
       %n4 = scalar.shrui %ao3, %c28i : i32
       %n4_f = scalar.sitofp %n4 : i32 to f32
       %hp = scalar.addf %n4_f, %fhalf : f32
@@ -1262,11 +1246,9 @@ func.def @iq2xs_step(%wn: index, %whn: index, %xn: index, %wv: view<[%wn]xi8>, %
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      %mag = scf.if %is_neg -> (i32) {
-        scf.yield %neg_g : i32
-      } else {
-        scf.yield %g_byte : i32
-      }
+      %nbn2 = scalar.subi %c0i, %sign_bit : i32
+      %nbm2 = scalar.xori %g_byte, %nbn2 : i32
+      %mag = scalar.addi %nbm2, %sign_bit : i32
       %sco = scalar.addi %blk_off, %c66i : i32
       %sc_i = scalar.addi %sco, %group : i32
       %sc_ix = index.cast %sc_i : i32 to index
@@ -1407,11 +1389,9 @@ func.def @iq2s_step(%wn: index, %whn: index, %xn: index, %wv: view<[%wn]xi8>, %w
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      %mag = scf.if %is_neg -> (i32) {
-        scf.yield %neg_g : i32
-      } else {
-        scf.yield %g_byte : i32
-      }
+      %nbn3 = scalar.subi %c0i, %sign_bit : i32
+      %nbm3 = scalar.xori %g_byte, %nbn3 : i32
+      %mag = scalar.addi %nbm3, %sign_bit : i32
       %sco = scalar.addi %blk_off, %c74i : i32
       %sc_i = scalar.addi %sco, %group : i32
       %sc_ix = index.cast %sc_i : i32 to index
