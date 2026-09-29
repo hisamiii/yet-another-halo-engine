@@ -275,10 +275,8 @@ cleaned source and re-running reproduces argmax 11751.
 3. ~~Replace the HIP `Forward` layer~~ done for prefill in
    `engine/run/loom_forward_target.cc`; it dispatches the Loom kernels directly
    through the HRX native API with no HIP.
-4. Prefill is **validated** (argmax 11751, worst layer max_abs 0.067). Decode is
-   the next target: GEMV, decode attention, resident DeltaNet and the
-   state-advancing decode convolution, then remove the HIP build
-   (`engine/build_gpu.sh`, hipcc) and the HIP sources.
+4. Prefill is **validated** (argmax 11751, worst layer max_abs 0.067). Decode
+   runs but is 10.5x off HIP; removing the HIP build waits until tuning is done.
 5. Prefill tuning is unblocked (correctness matches HIP): the quantized GEMM
    staging was the first lever, split-K the second, see section 6.
 ## 6. Prefill performance
@@ -451,10 +449,24 @@ reproduces the recorded HIP sequence exactly (`11751 13 198 760 6511 314 9564
 369 19241 13 198 760 6511 314 14898 369`), and `engine/tests/m0_gate.sh` and
 `generate_gate.sh` pass against it.
 
-HIP is gone from the engine: `engine/build_gpu.sh`, `model/forward.hip`,
-`run/yah_run.hip`, the `engine/gpu/ported` kernel tree, `engine/kv/*.hip` and the
-`engine/gpu/*.hip` checks are deleted. The engine builds with CMake (core tools)
-and `engine/build_hrx.sh` (the `yah-hrx` runner), both HIP-free.
+HIP runs **alongside** HRX again. It was removed in `01279d6` before tuning was
+finished; `9f8b142` restores the 141 deleted files (a pure deletion, so the
+restore is conflict-free), and the pre-removal state is tagged `hip-pre-removal`
+and branched `hip-reference`. `engine/build_gpu.sh` still builds
+`engine/build/yah-run`, and the HRX path is untouched (`build_hrx.sh` plus the
+CMake core tools).
+
+Live baselines on Qwen3.8-27B-IQ4_XS, same prompt, both engines:
+
+| | prefill | decode |
+| --- | ---: | ---: |
+| HIP (`yah-run`) | 386.5 ms | 14.02 tok/s (71.3 ms/token) |
+| HRX (`yah-hrx` / `loom_forward_target`) | ~640 ms | 1.33 tok/s (752 ms/token) |
+
+Prefill is 1.66x; decode is 10.5x. Both reproduce argmax 11751 and the same
+16-token sequence. The decode gap is structural: the HRX decode drives the
+prefill GEMM HALs, computing a 64-wide token tile per generated token and
+discarding 63, while HIP does a single-token GEMV.
 
 One subtle porting bug worth recording: `yah_unpack_qg` has `head_dim` as a
 `config.def` defaulting to 1. A decode HAL emitted without
