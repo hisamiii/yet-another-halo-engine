@@ -428,6 +428,31 @@ Measured splits for the IQ3_S kStore at `m_tiles=1088, k_blocks=20`, via
 barriers removed 1.92 ms (free); the whole decode replaced by `d` 0.90 ms, so
 the decode is ~53% and the structural rhs/MMA/epilogue ~47%; the 16-wide tile
 1.67 ms.
+### Where the gap is: the weight dequant
+
+Both engines can be built with the dequant replaced by a constant, so the bit
+math and its weight reads vanish and only the MMA path is left: HIP by patching
+`DecodeQuantSub16` (`quant_ops.hpp`), HRX by `YAH_ABLATE_DECODE=1` on
+`emit_prefill.py`. Interleaved on the same prompt:
+
+| | full | dequant removed | dequant |
+| --- | ---: | ---: | ---: |
+| HIP (`yah-run`) | 405.7 ms | 333.0 ms | 72.7 ms (18%) |
+| HRX (`loom_forward_target`) | 678.8 ms | 139.1 ms | 539.7 ms (79%) |
+
+The HRX **non-dequant path is 2.4x faster than HIP's** (139 vs 333 ms). The
+whole gap, and then some, is the weight dequant: 540 ms against 73 ms, roughly
+**7x slower per element** (~44 G weight-elements/s against ~330 G/s). Fixing
+only the dequant to HIP's rate would put the prefill near 210 ms, about 2x
+*faster* than HIP.
+
+The cause is structural. HIP's `DecodeQuantSub16` decodes **16 elements per call
+with packed 32-bit integer ops** - four elements per instruction - and hands the
+MMA a packed `q[16]`. Our ports decode one element per lane per instruction
+sequence: nibble extraction, sign, grid lookup and the `d`/`scale` multiply are
+all per element, now with the loop-invariant part hoisted out. The next step is
+to restructure the element loop to decode a 32-bit word (four elements) per op,
+mirroring HIP's formulation.
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.

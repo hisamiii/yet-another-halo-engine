@@ -12,6 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Token-tile width for the emitted GEMM family. Prefill narrows to 16 (only kB
 # real tokens are read); the decode path keeps the original 64.
 TOKEN_TILE = int(os.environ.get("YAH_TOKEN_TILE", "16"))
+# Diagnostic ablation: replace the decoded weight with a constant so the dequant
+# and its weight reads vanish, leaving the MMA path.
+ABLATE_DECODE = os.environ.get("YAH_ABLATE_DECODE", "0") == "1"
 LOOM = os.path.abspath(os.path.join(HERE, ".."))
 EMIT = os.path.join(LOOM, "emit_hal.py")
 
@@ -94,14 +97,30 @@ def narrow_tokens(text):
             keep.append(line)
     return chr(10).join(keep)
 
+def ablate_decode(text):
+    keep = []
+    for line in text.split(chr(10)):
+        m = re.match(r"^(\s*)(%\w+) = scalar\.fptrunc %\w+ : f32 to f16$", line)
+        if m:
+            keep.append("%s%s = scalar.constant 1.0 : f16" % (m.group(1), m.group(2)))
+        else:
+            keep.append(line)
+    return chr(10).join(keep)
+
+
 def emit(loomfile, configs, outname, outdir):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(LOOM, loomfile)
-    if os.path.basename(loomfile).startswith("yah_ffn_gemm_") and TOKEN_TILE == 16:
+    if os.path.basename(loomfile).startswith("yah_ffn_gemm_"):
+        text = open(src).read()
+        if TOKEN_TILE == 16:
+            text = narrow_tokens(text)
+        if ABLATE_DECODE:
+            text = ablate_decode(text)
         src_tmp = os.path.join(tmp, os.path.basename(loomfile))
         with open(src_tmp, "w") as fh:
-            fh.write(narrow_tokens(open(src).read()))
+            fh.write(text)
         src = src_tmp
     r = subprocess.run([sys.executable, EMIT, src, tmp] + configs,
                        capture_output=True, text=True)
