@@ -665,6 +665,50 @@ And the prefill driver still cannot run 2048 tokens at all -- `kB` is 5 with
 hardcoded ids, and the attention path has to become causal over 2048 keys before
 an end-to-end number exists.
 
+### What the compiler's own analysis says
+
+`loom-compile-report` (a Python tool under `loom/py/loom/tools/compile_report.py`,
+run as `PYTHONPATH=/home/q/hrx/loom/py python3 -m loom.tools.compile_report`) turns
+a `--compile-report=details` JSON into bounded views. Its `suggest` subcommand runs
+the target provider's experiments -- on AMDGPU: residency cliffs, spill traffic,
+private memory, LDS bank service, wait serialization, pipeline copy waits, wave
+size, fragment packet expansion. It is the right first stop for a kernel question,
+and it is what the residency numbers in the section above came from.
+
+Run on the shipping kernel (narrowed 16-token tile, m_tiles=1088), it reports **no
+findings**, and the report view says why:
+
+| fact | value |
+| --- | --- |
+| final vector registers | 40 |
+| scheduled vector pressure | 32 |
+| resident subgroups per SIMD | 16 (max) |
+| modeled occupancy | 100%, limit `max_waves` |
+| private memory / spills | 0 B / none |
+| instructions | 438 (207 vector ALU, 99 scalar ALU, 1 WMMA) |
+
+So the kernel that actually runs prefill is not occupancy-limited and does not
+spill. Whatever explains the 1088 in-situ ordering, the compiler does not attribute
+it to residency. The static mix also quantifies the decode share that the ablations
+measure: one matrix instruction per k-step against 306 scalar/vector ALU.
+
+The widened variants are where it has something to say, and it is one thing -- a
+high-confidence `amdgpu.residency_cliff`:
+
+| tile | VGPRs | subgroups/SIMD | next tier | to reach it |
+| ---: | ---: | ---: | ---: | --- |
+| 64 | 80 | 12 | 16 | -16 VGPRs (<=64) |
+| 128 | 128 | 8 | 9 | -16 (<=112) |
+| 256 | 208 | 4 | 5 | -16 (<=192) |
+
+Nothing else is flagged -- no LDS bank service, no spill traffic, no wait
+serialization, no fragment packet expansion -- which also means the LDS store
+pattern of the word decode is not a bank-conflict problem. The instruction counts
+show the widening doing its job (WMMA 1 -> 4 -> 16 while scalar ALU stays at 99 and
+vector ALU goes 213 -> 228) and show where the registers went: **register moves
+25 -> 65 -> 149**. Cutting those is the concrete path to the next residency tier on
+a wide tile, and it is the one experiment the compiler asks for.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
