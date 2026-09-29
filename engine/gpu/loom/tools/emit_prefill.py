@@ -152,8 +152,17 @@ def main():
     for kind, fmt, port, mt, kb in sorted(combos):
         if kind == "kstore":
             f = f"yah_ffn_gemm_{port}_f32.loom"; sym = sym_of(f)
-            emit(f, [f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}", f"{sym}.token_tiles=1"],
-                 f"gemm_kstore_{fmt}_{mt}_{kb}.hal", outdir); n += 1
+            cfg = [f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}", f"{sym}.token_tiles=1"]
+            if port == "iq3s":
+                # The four-elements-per-lane word decode is a clear in-situ win at
+                # the attention geometries (m_tiles 384/640/768) and an in-situ loss
+                # at m_tiles=1088, measured against a paired full-pipeline control
+                # with bit-identical output. The isolated hal_bench numbers invert
+                # the ordering, so the selection is per geometry, not global; the
+                # kernel folds the config away, so each HAL is one of the two exact
+                # machine codes. See engine/run/LOOM_RUNTIME.md.
+                cfg.append(f"{sym}.word_decode={0 if mt == 1088 else 1}")
+            emit(f, cfg, f"gemm_kstore_{fmt}_{mt}_{kb}.hal", outdir); n += 1
         elif kind == "residual":
             f = f"yah_ffn_gemm_{port}_residual_f32.loom"; sym = sym_of(f)
             # Every residual arm has m_tiles=320 (the projection writes hidden),

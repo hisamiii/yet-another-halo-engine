@@ -64,6 +64,7 @@ amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
 config.decl @yah_ffn_gemm_iq3s.m_tiles : %value: index where [range(%value, 1, 4096)]
 config.decl @yah_ffn_gemm_iq3s.k_blocks : %value: index where [range(%value, 1, 4096)]
 config.decl @yah_ffn_gemm_iq3s.token_tiles : %value: index where [range(%value, 1, 4096)]
+config.decl @yah_ffn_gemm_iq3s.word_decode : %value: index where [range(%value, 0, 2)]
 
 kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
   %unit = index.constant 1 : index
@@ -154,122 +155,242 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
     %kk_i = index.cast %kk : index to i32
     %kbase = scalar.andi %kk_i, %c255i : i32
     %kblk = scalar.shrui %kk_i, %c8i : i32
-    // One lane owns a 4-column word: columns cb..cb+3, cb = 4*(lane&3). The four
-    // elements of a word share group/half/l/lw and therefore share the qs byte,
-    // the qh byte, the grid word, the signs byte, the scales nibble and d; they
-    // differ only in the byte selector b = column&3. The old mapping gave each
-    // lane one column, so those six loads and the whole offset chain were redone
-    // four times. Two words per lane cover the 16x16 tile: row = lane>>2 and
-    // (lane>>2)+8, which for a 16-step kbase leaves q/which/l/lw unchanged
-    // between the two words, so only the row offset differs.
-    %cg = scalar.andi %lane_i, %c3i : i32
-    %row0 = scalar.shrui %lane_i, %c2i : i32
-    %cb = scalar.shli %cg, %c2i : i32
-    %q = scalar.shrui %cg, %c1i : i32
-    %which = scalar.andi %cg, %c1i : i32
-    %blk_off0 = scalar.muli %kblk, %c110i : i32
-    %i_i = scalar.addi %kbase, %cb : i32
-    %group_raw = scalar.shrui %i_i, %c5i : i32
-    // kbase is a multiple of 16 and cb <= 12, so i_i <= 252 and group <= 7; the
-    // mask both states that bound for the envelope analysis and is a no-op.
-    %group = scalar.andi %group_raw, %c7i : i32
-    %half0 = scalar.shrui %i_i, %c4i : i32
-    %half = scalar.andi %half0, %c1i : i32
-    %l2 = scalar.shli %half, %c1i : i32
-    %l = scalar.addi %l2, %q : i32
-    %g8 = scalar.shli %group, %c3i : i32
-    %l2x = scalar.shli %l, %c1i : i32
-    %lw = scalar.addi %l2x, %which : i32
-    %qlo_off = scalar.addi %g8, %c2i : i32
-    %qlo_off2 = scalar.addi %qlo_off, %lw : i32
-    %qh_off = scalar.addi %group, %c66i : i32
-    %sg4 = scalar.shli %group, %c2i : i32
-    %sg_off = scalar.addi %sg4, %c74i : i32
-    %sg_off2 = scalar.addi %sg_off, %l : i32
-    %gdiv2 = scalar.shrui %group, %c1i : i32
-    %sc_off = scalar.addi %gdiv2, %c106i : i32
-    %is_g1 = scalar.cmpi eq, %which, %c0i : i32
-    %odd = scalar.andi %group, %c1i : i32
-    %is_even = scalar.cmpi eq, %odd, %c0i : i32
-    %j_sink = scf.for %j = [%c0 to %c2 step %c1](%mk = %c0 : index) -> (index) unroll(%c2) schedule(interleaved) {
-      %j_i = index.cast %j : index to i32
-      %r8 = scalar.shli %j_i, %c3i : i32
-      %r_i = scalar.addi %row0, %r8 : i32
-      %row_i = scalar.addi %m_origin_i, %r_i : i32
-      %row_off = scalar.muli %row_i, %bpr_i : i32
-      %blk_off = scalar.addi %row_off, %blk_off0 : i32
-      %qlo_i = scalar.addi %blk_off, %qlo_off2 : i32
-      %qlo_ix = index.cast %qlo_i : i32 to index
-      %qlo_idx = index.assume %qlo_ix [le(%qlo_ix, %w_last)] : index
-      %qlob8 = view.load %w_view[%qlo_idx] : view<[%w_bytes]xi8> -> i8
-      %grid_lo = scalar.extui %qlob8 : i8 to i32
-      %qh_i = scalar.addi %blk_off, %qh_off : i32
-      %qh_ix = index.cast %qh_i : i32 to index
-      %qh_idx = index.assume %qh_ix [le(%qh_ix, %w_last)] : index
-      %qhb8 = view.load %w_view[%qh_idx] : view<[%w_bytes]xi8> -> i8
-      %qhb = scalar.extui %qhb8 : i8 to i32
-      %hbit0 = scalar.shrui %qhb, %lw : i32
-      %hbit = scalar.andi %hbit0, %c1i : i32
-      %hbit8 = scalar.shli %hbit, %c8i : i32
-      %gidx_i = scalar.ori %grid_lo, %hbit8 : i32
-      %gidx_ix = index.cast %gidx_i : i32 to index
-      %gidx_lo = index.max %gidx_ix, %c0 : index
-      %gidx = index.min %gidx_lo, %c511 : index
-      %gword = view.load %grid_view[%gidx] : view<512xi32> -> i32
-      %sg_i = scalar.addi %blk_off, %sg_off2 : i32
-      %sg_ix = index.cast %sg_i : i32 to index
-      %sg_idx = index.assume %sg_ix [le(%sg_ix, %w_last)] : index
-      %sgb8 = view.load %w_view[%sg_idx] : view<[%w_bytes]xi8> -> i8
-      %sgb = scalar.extui %sgb8 : i8 to i32
-      %sign_nib = scf.if %is_g1 -> (i32) {
-        %sn_lo = scalar.andi %sgb, %c15i : i32
-        scf.yield %sn_lo : i32
-      } else {
-        %sn_hi = scalar.shrui %sgb, %c4i : i32
-        scf.yield %sn_hi : i32
-      }
-      %sc_i = scalar.addi %blk_off, %sc_off : i32
-      %sc_ix = index.cast %sc_i : i32 to index
-      %sc_idx = index.assume %sc_ix [le(%sc_ix, %w_last)] : index
-      %scb8 = view.load %w_view[%sc_idx] : view<[%w_bytes]xi8> -> i8
-      %scb = scalar.extui %scb8 : i8 to i32
-      %nib = scf.if %is_even -> (i32) {
-        %ni_lo = scalar.andi %scb, %c15i : i32
-        scf.yield %ni_lo : i32
-      } else {
-        %ni_hi = scalar.shrui %scb, %c4i : i32
-        scf.yield %ni_hi : i32
-      }
-      %nib2 = scalar.shli %nib, %c1i : i32
-      %one_plus = scalar.addi %nib2, %c1i : i32
-      %scale_f = scalar.sitofp %one_plus : i32 to f32
-      %blk_half0 = scalar.shrui %blk_off, %c1i : i32
-      %d_ix = index.cast %blk_half0 : i32 to index
-      %d_idx = index.assume %d_ix [le(%d_ix, %w_half_last)] : index
-      %d_half_v = view.load %w_f16_view[%d_idx] : view<[%w_halfs]xf16> -> f16
-      %d = scalar.extf %d_half_v : f16 to f32
-      %dsc = scalar.mulf %d, %scale_f : f32
-      %row_local = index.cast %r_i : i32 to index
-      %e_sink = scf.for %bb = [%c0 to %c4 step %c1](%mk2 = %c0 : index) -> (index) unroll(%c4) schedule(interleaved) {
-        %bb_i = index.cast %bb : index to i32
-        %g_shift = scalar.shli %bb_i, %c3i : i32
+    // Two decode mappings, selected by config so the choice is reproducible from
+    // this source rather than from a hand-assembled HAL directory: 0 is the
+    // original one-element-per-lane mapping, 1 is the word mapping that gives one
+    // lane four consecutive columns off a single block read. Both produce the same
+    // 16x16 tile. The condition is a compile-time constant, so one branch folds.
+    %word_decode = config.get @yah_ffn_gemm_iq3s.word_decode : index
+    %wd_i = index.cast %word_decode : index to i32
+    %wd_old = scalar.cmpi eq, %wd_i, %c0i : i32
+    scf.if %wd_old {
+      // Hoist the j-invariant part of the block decode out of the element loop: the
+      // column index is lane&15 (j*32 is a multiple of 16), so only the row varies.
+      %c_i = scalar.andi %lane_i, %c15i : i32
+      %i_i = scalar.addi %kbase, %c_i : i32
+      %blk_off0 = scalar.muli %kblk, %c110i : i32
+      %group = scalar.shrui %i_i, %c5i : i32
+      %half0 = scalar.shrui %i_i, %c4i : i32
+      %half = scalar.andi %half0, %c1i : i32
+      %jj = scalar.andi %i_i, %c15i : i32
+      %q = scalar.shrui %jj, %c3i : i32
+      %which0 = scalar.shrui %jj, %c2i : i32
+      %which = scalar.andi %which0, %c1i : i32
+      %b = scalar.andi %jj, %c3i : i32
+      %l2 = scalar.shli %half, %c1i : i32
+      %l = scalar.addi %l2, %q : i32
+      %g8 = scalar.shli %group, %c3i : i32
+      %l2x = scalar.shli %l, %c1i : i32
+      %lw = scalar.addi %l2x, %which : i32
+      %qlo_off = scalar.addi %g8, %c2i : i32
+      %qlo_off2 = scalar.addi %qlo_off, %lw : i32
+      %qh_off = scalar.addi %group, %c66i : i32
+      %sg4 = scalar.shli %group, %c2i : i32
+      %sg_off = scalar.addi %sg4, %c74i : i32
+      %sg_off2 = scalar.addi %sg_off, %l : i32
+      %gdiv2 = scalar.shrui %group, %c1i : i32
+      %sc_off = scalar.addi %gdiv2, %c106i : i32
+      %g_shift = scalar.shli %b, %c3i : i32
+      %is_g1 = scalar.cmpi eq, %which, %c0i : i32
+      %odd = scalar.andi %group, %c1i : i32
+      %is_even = scalar.cmpi eq, %odd, %c0i : i32
+      %j_sink = scf.for %j = [%c0 to %c8 step %c1](%mk = %c0 : index) -> (index) unroll(%c2) schedule(interleaved) {
+        %j_i = index.cast %j : index to i32
+        %j32 = scalar.shli %j_i, %c5i : i32
+        %e_i = scalar.addi %lane_i, %j32 : i32
+        %r_i = scalar.shrui %e_i, %c4i : i32
+        %row_i = scalar.addi %m_origin_i, %r_i : i32
+        %row_off = scalar.muli %row_i, %bpr_i : i32
+        %blk_off = scalar.addi %row_off, %blk_off0 : i32
+        %qlo_i = scalar.addi %blk_off, %qlo_off2 : i32
+        %qlo_ix = index.cast %qlo_i : i32 to index
+        %qlo_idx = index.assume %qlo_ix [le(%qlo_ix, %w_last)] : index
+        %qlob8 = view.load %w_view[%qlo_idx] : view<[%w_bytes]xi8> -> i8
+        %grid_lo = scalar.extui %qlob8 : i8 to i32
+        %qh_i = scalar.addi %blk_off, %qh_off : i32
+        %qh_ix = index.cast %qh_i : i32 to index
+        %qh_idx = index.assume %qh_ix [le(%qh_ix, %w_last)] : index
+        %qhb8 = view.load %w_view[%qh_idx] : view<[%w_bytes]xi8> -> i8
+        %qhb = scalar.extui %qhb8 : i8 to i32
+        %hbit0 = scalar.shrui %qhb, %lw : i32
+        %hbit = scalar.andi %hbit0, %c1i : i32
+        %hbit8 = scalar.shli %hbit, %c8i : i32
+        %gidx_i = scalar.ori %grid_lo, %hbit8 : i32
+        %gidx_ix = index.cast %gidx_i : i32 to index
+        %gidx_lo = index.max %gidx_ix, %c0 : index
+        %gidx = index.min %gidx_lo, %c511 : index
+        %gword = view.load %grid_view[%gidx] : view<512xi32> -> i32
         %gb0 = scalar.shrui %gword, %g_shift : i32
         %g_byte = scalar.andi %gb0, %c255i : i32
-        %sbit0 = scalar.shrui %sign_nib, %bb_i : i32
+        %sg_i = scalar.addi %blk_off, %sg_off2 : i32
+        %sg_ix = index.cast %sg_i : i32 to index
+        %sg_idx = index.assume %sg_ix [le(%sg_ix, %w_last)] : index
+        %sgb8 = view.load %w_view[%sg_idx] : view<[%w_bytes]xi8> -> i8
+        %sgb = scalar.extui %sgb8 : i8 to i32
+        %sign_nib = scf.if %is_g1 -> (i32) {
+          %sn_lo = scalar.andi %sgb, %c15i : i32
+          scf.yield %sn_lo : i32
+        } else {
+          %sn_hi = scalar.shrui %sgb, %c4i : i32
+          scf.yield %sn_hi : i32
+        }
+        %sbit0 = scalar.shrui %sign_nib, %b : i32
         %sign_bit = scalar.andi %sbit0, %c1i : i32
-        %neg_one = scalar.subi %c0i, %sign_bit : i32
-        %mag0 = scalar.xori %g_byte, %neg_one : i32
-        %mag = scalar.addi %mag0, %sign_bit : i32
+        %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
+        %neg_g = scalar.subi %c0i, %g_byte : i32
+        %mag = scf.if %is_neg -> (i32) {
+          scf.yield %neg_g : i32
+        } else {
+          scf.yield %g_byte : i32
+        }
+        %sc_i = scalar.addi %blk_off, %sc_off : i32
+        %sc_ix = index.cast %sc_i : i32 to index
+        %sc_idx = index.assume %sc_ix [le(%sc_ix, %w_last)] : index
+        %scb8 = view.load %w_view[%sc_idx] : view<[%w_bytes]xi8> -> i8
+        %scb = scalar.extui %scb8 : i8 to i32
+        %nib = scf.if %is_even -> (i32) {
+          %ni_lo = scalar.andi %scb, %c15i : i32
+          scf.yield %ni_lo : i32
+        } else {
+          %ni_hi = scalar.shrui %scb, %c4i : i32
+          scf.yield %ni_hi : i32
+        }
+        %nib2 = scalar.shli %nib, %c1i : i32
+        %one_plus = scalar.addi %nib2, %c1i : i32
+        %scale_f = scalar.sitofp %one_plus : i32 to f32
         %mag_f = scalar.sitofp %mag : i32 to f32
+        %blk_half0 = scalar.shrui %blk_off, %c1i : i32
+        %d_ix = index.cast %blk_half0 : i32 to index
+        %d_idx = index.assume %d_ix [le(%d_ix, %w_half_last)] : index
+        %d_half_v = view.load %w_f16_view[%d_idx] : view<[%w_halfs]xf16> -> f16
+        %d = scalar.extf %d_half_v : f16 to f32
+        %dsc = scalar.mulf %d, %scale_f : f32
         %value = scalar.mulf %dsc, %mag_f : f32
         %h = scalar.fptrunc %value : f32 to f16
-        %col_i = scalar.addi %cb, %bb_i : i32
-        %col_ix = index.cast %col_i : i32 to index
-        %col_idx = index.max %col_ix, %c0 : index
-        view.store %h, %wstage_lds_view[%row_local, %col_idx] : f16, view<16x16xf16>
-        scf.yield %mk2 : index
+        %c_ix = index.cast %c_i : i32 to index
+        %c_idx = index.max %c_ix, %c0 : index
+        %row_local = index.cast %r_i : i32 to index
+        view.store %h, %wstage_lds_view[%row_local, %c_idx] : f16, view<16x16xf16>
+        scf.yield %mk : index
       }
-      scf.yield %mk : index
+    } else {
+      // One lane owns a 4-column word: columns cb..cb+3, cb = 4*(lane&3). The four
+      // elements of a word share group/half/l/lw and therefore share the qs byte,
+      // the qh byte, the grid word, the signs byte, the scales nibble and d; they
+      // differ only in the byte selector b = column&3. The old mapping gave each
+      // lane one column, so those six loads and the whole offset chain were redone
+      // four times. Two words per lane cover the 16x16 tile: row = lane>>2 and
+      // (lane>>2)+8, which for a 16-step kbase leaves q/which/l/lw unchanged
+      // between the two words, so only the row offset differs.
+      %cg = scalar.andi %lane_i, %c3i : i32
+      %row0 = scalar.shrui %lane_i, %c2i : i32
+      %cb = scalar.shli %cg, %c2i : i32
+      %q = scalar.shrui %cg, %c1i : i32
+      %which = scalar.andi %cg, %c1i : i32
+      %blk_off0 = scalar.muli %kblk, %c110i : i32
+      %i_i = scalar.addi %kbase, %cb : i32
+      %group_raw = scalar.shrui %i_i, %c5i : i32
+      // kbase is a multiple of 16 and cb <= 12, so i_i <= 252 and group <= 7; the
+      // mask both states that bound for the envelope analysis and is a no-op.
+      %group = scalar.andi %group_raw, %c7i : i32
+      %half0 = scalar.shrui %i_i, %c4i : i32
+      %half = scalar.andi %half0, %c1i : i32
+      %l2 = scalar.shli %half, %c1i : i32
+      %l = scalar.addi %l2, %q : i32
+      %g8 = scalar.shli %group, %c3i : i32
+      %l2x = scalar.shli %l, %c1i : i32
+      %lw = scalar.addi %l2x, %which : i32
+      %qlo_off = scalar.addi %g8, %c2i : i32
+      %qlo_off2 = scalar.addi %qlo_off, %lw : i32
+      %qh_off = scalar.addi %group, %c66i : i32
+      %sg4 = scalar.shli %group, %c2i : i32
+      %sg_off = scalar.addi %sg4, %c74i : i32
+      %sg_off2 = scalar.addi %sg_off, %l : i32
+      %gdiv2 = scalar.shrui %group, %c1i : i32
+      %sc_off = scalar.addi %gdiv2, %c106i : i32
+      %is_g1 = scalar.cmpi eq, %which, %c0i : i32
+      %odd = scalar.andi %group, %c1i : i32
+      %is_even = scalar.cmpi eq, %odd, %c0i : i32
+      %j_sink = scf.for %j = [%c0 to %c2 step %c1](%mk = %c0 : index) -> (index) unroll(%c2) schedule(interleaved) {
+        %j_i = index.cast %j : index to i32
+        %r8 = scalar.shli %j_i, %c3i : i32
+        %r_i = scalar.addi %row0, %r8 : i32
+        %row_i = scalar.addi %m_origin_i, %r_i : i32
+        %row_off = scalar.muli %row_i, %bpr_i : i32
+        %blk_off = scalar.addi %row_off, %blk_off0 : i32
+        %qlo_i = scalar.addi %blk_off, %qlo_off2 : i32
+        %qlo_ix = index.cast %qlo_i : i32 to index
+        %qlo_idx = index.assume %qlo_ix [le(%qlo_ix, %w_last)] : index
+        %qlob8 = view.load %w_view[%qlo_idx] : view<[%w_bytes]xi8> -> i8
+        %grid_lo = scalar.extui %qlob8 : i8 to i32
+        %qh_i = scalar.addi %blk_off, %qh_off : i32
+        %qh_ix = index.cast %qh_i : i32 to index
+        %qh_idx = index.assume %qh_ix [le(%qh_ix, %w_last)] : index
+        %qhb8 = view.load %w_view[%qh_idx] : view<[%w_bytes]xi8> -> i8
+        %qhb = scalar.extui %qhb8 : i8 to i32
+        %hbit0 = scalar.shrui %qhb, %lw : i32
+        %hbit = scalar.andi %hbit0, %c1i : i32
+        %hbit8 = scalar.shli %hbit, %c8i : i32
+        %gidx_i = scalar.ori %grid_lo, %hbit8 : i32
+        %gidx_ix = index.cast %gidx_i : i32 to index
+        %gidx_lo = index.max %gidx_ix, %c0 : index
+        %gidx = index.min %gidx_lo, %c511 : index
+        %gword = view.load %grid_view[%gidx] : view<512xi32> -> i32
+        %sg_i = scalar.addi %blk_off, %sg_off2 : i32
+        %sg_ix = index.cast %sg_i : i32 to index
+        %sg_idx = index.assume %sg_ix [le(%sg_ix, %w_last)] : index
+        %sgb8 = view.load %w_view[%sg_idx] : view<[%w_bytes]xi8> -> i8
+        %sgb = scalar.extui %sgb8 : i8 to i32
+        %sign_nib = scf.if %is_g1 -> (i32) {
+          %sn_lo = scalar.andi %sgb, %c15i : i32
+          scf.yield %sn_lo : i32
+        } else {
+          %sn_hi = scalar.shrui %sgb, %c4i : i32
+          scf.yield %sn_hi : i32
+        }
+        %sc_i = scalar.addi %blk_off, %sc_off : i32
+        %sc_ix = index.cast %sc_i : i32 to index
+        %sc_idx = index.assume %sc_ix [le(%sc_ix, %w_last)] : index
+        %scb8 = view.load %w_view[%sc_idx] : view<[%w_bytes]xi8> -> i8
+        %scb = scalar.extui %scb8 : i8 to i32
+        %nib = scf.if %is_even -> (i32) {
+          %ni_lo = scalar.andi %scb, %c15i : i32
+          scf.yield %ni_lo : i32
+        } else {
+          %ni_hi = scalar.shrui %scb, %c4i : i32
+          scf.yield %ni_hi : i32
+        }
+        %nib2 = scalar.shli %nib, %c1i : i32
+        %one_plus = scalar.addi %nib2, %c1i : i32
+        %scale_f = scalar.sitofp %one_plus : i32 to f32
+        %blk_half0 = scalar.shrui %blk_off, %c1i : i32
+        %d_ix = index.cast %blk_half0 : i32 to index
+        %d_idx = index.assume %d_ix [le(%d_ix, %w_half_last)] : index
+        %d_half_v = view.load %w_f16_view[%d_idx] : view<[%w_halfs]xf16> -> f16
+        %d = scalar.extf %d_half_v : f16 to f32
+        %dsc = scalar.mulf %d, %scale_f : f32
+        %row_local = index.cast %r_i : i32 to index
+        %e_sink = scf.for %bb = [%c0 to %c4 step %c1](%mk2 = %c0 : index) -> (index) unroll(%c4) schedule(interleaved) {
+          %bb_i = index.cast %bb : index to i32
+          %g_shift = scalar.shli %bb_i, %c3i : i32
+          %gb0 = scalar.shrui %gword, %g_shift : i32
+          %g_byte = scalar.andi %gb0, %c255i : i32
+          %sbit0 = scalar.shrui %sign_nib, %bb_i : i32
+          %sign_bit = scalar.andi %sbit0, %c1i : i32
+          %neg_one = scalar.subi %c0i, %sign_bit : i32
+          %mag0 = scalar.xori %g_byte, %neg_one : i32
+          %mag = scalar.addi %mag0, %sign_bit : i32
+          %mag_f = scalar.sitofp %mag : i32 to f32
+          %value = scalar.mulf %dsc, %mag_f : f32
+          %h = scalar.fptrunc %value : f32 to f16
+          %col_i = scalar.addi %cb, %bb_i : i32
+          %col_ix = index.cast %col_i : i32 to index
+          %col_idx = index.max %col_ix, %c0 : index
+          view.store %h, %wstage_lds_view[%row_local, %col_idx] : f16, view<16x16xf16>
+          scf.yield %mk2 : index
+        }
+        scf.yield %mk : index
+      }
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
     %lhs = vector.fragment.load<lhs> %wstage_lds_view[%c0, %c0] shape [%m, %k] : view<16x16xf16> -> vector<16xf16>

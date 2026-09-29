@@ -403,7 +403,7 @@ run-to-run noise, so it is not kept. The arm is latency-bound: clamps and
 branchless rewrites measured ~0, and the kernel is ~42% issue-efficient against
 the 240 G warp-insn/s peak.
 
-Current prefill: **661.3 ms** against the HIP `best_ms` of 389.8-415 ms, i.e.
+Current prefill: **~663 ms** against the HIP `best_ms` of 389.8-415 ms, i.e.
 ~1.65x, down from 4407 ms for the first correctness-first port. The remaining
 time is the weight decode (still ~46% of the IQ3_S kStore at `m_tiles=1088`)
 and the structural rhs/MMA/epilogue.
@@ -487,29 +487,56 @@ captured from HIP) passes, the all-zero production case still returns exactly 0,
 and the full 64-layer prefill output is **bit-identical** to the pre-word build
 (argmax 11751).
 
-**The isolated numbers do not carry to the pipeline at `m_tiles=1088`.** Three
-interleaved full runs each:
+**The isolated numbers do not carry to the pipeline, in either direction.** A
+five-way interleaved A/B, medians of three runs each, every arm bit-identical
+(argmax 11751):
 
-| HAL set | layers_ms | mixer | ffn gate |
-| --- | ---: | ---: | ---: |
-| previous | 675.5 | 294.5 | 120.2 |
-| word decode everywhere | 668.9 | 275.1 | 132.1 |
-| word decode at 3/384/640/768, previous at 1088 | **661.3** | 276.8 | 121.4 |
+| HAL set | layers_ms | mixer | ffn gate | ffn down |
+| --- | ---: | ---: | ---: | ---: |
+| previous | 670.8 | 290.2 | 120.4 | 115.2 |
+| word decode everywhere | 671.1 | 275.3 | 132.5 | 117.0 |
+| word decode on kStore at 384/640/768 only | **660.0** | 276.8 | 121.0 | 116.0 |
 
-The mixer (kStore at 384/640/768) gains 17.7 ms and the FFN gate (kStore at 1088)
-loses 11.9 ms, so the deployed set keeps the previous 1088 kernel. The loss is
-not explained: the new 1088 kernel needs *fewer* registers (80 vs 88 VGPR), is
-faster in isolation, and an rhs-traffic ablation (pinning the fragment loads to
-`k=0` so they stay cache-resident) moves nothing, so neither occupancy nor
-activation traffic accounts for it. Falsifier for the "this is a pure decode win"
-reading: an in-situ paired A/B that does not reproduce the isolated ordering.
-Deployed: `/home/q/yah-hal-hybrid` (the third row).
+The kStore word decode is worth ~15 ms in the mixer and costs ~12 ms in the FFN
+gate, so the net is near zero unless the choice is made per geometry; repeated
+paired runs put the selected set 11-15 ms ahead (the machine drifts ~5 ms between
+batches, so only the paired difference is meaningful).
 
-Remaining split at `m_tiles=1088` for the new kernel: full 1.584 ms, decode
-replaced by `d` 0.861 ms, so the decode is still ~46% and the structural
-rhs/MMA/epilogue ~54%. The rhs fragment loads themselves are ~0-6%: this kernel
-is not activation-bandwidth-bound in isolation. The 2.4x HIP dequant gap quoted
-above is therefore closed on paper at 384/640/768 and remains at 1088.
+The same transform applied to the two **reusing** arms is a straight loss even
+though it is a 2.35x isolated win:
+
+| kernel | m_tiles | k_blocks | old | new | in-situ arm |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| residual | 320 | 68 | 0.5705 | 0.2430 | down 115.2 -> 136.6 (**+21 ms**) |
+| residual | 320 | 24 | 0.2094 | 0.0934 | (same arm as above) |
+| swiglu | 1088 | 20 | - | - | up 127.6 -> 135.7 (**+8 ms**) |
+
+Both were reverted. This is the sharpest form of the pattern: a 2.35x isolated
+speedup becomes a 15% in-situ regression on the same kernel, same config, same
+data and bit-identical output. `hal_bench` runs the kernel back to back on an
+idle GPU with degenerate weights (every byte `0x01`, so `d` is a subnormal and
+the grid indices collapse to a handful of entries) and a never-initialised
+activation buffer. A number from it is a hypothesis, not a result; only the
+paired full-pipeline A/B is a result. Earlier "measured" entries in
+`docs/reference/README.md` came from this harness and should be re-checked
+before they are relied on.
+
+The selection is now a config, so the good set is reproducible from source:
+`yah_ffn_gemm_iq3s.word_decode` (0 = one element per lane, 1 = word) wraps the
+two decode bodies in an `scf.if` on a compile-time constant, and
+`emit_prefill.py` binds `0` at `m_tiles=1088` and `1` elsewhere. The fold is
+exact: `word_decode=0` emits byte-for-byte the previous kernel's HSACO and
+`word_decode=1` the new one, so every emitted HAL is one of those two machine
+codes and there is no third variant. The re-emitted directory is byte-identical
+to the hand-assembled hybrid, and reproduces 662.9 ms against 675.8 ms for the
+previous source in a later paired run.
+
+Remaining split at `m_tiles=1088`: 1.729 ms with the word decode and 1.947 ms
+without, and 0.861 ms with the decode replaced by `d`, so the decode is ~46% of
+the kernel and the structural rhs/MMA/epilogue ~54%. The rhs fragment loads
+themselves are ~0-6%: this kernel is not activation-bandwidth-bound in isolation.
+The 2.4x HIP dequant gap quoted above is therefore closed on paper at 384/640/768
+and open at 1088.
 
 ## 7. Decode and the HIP removal
 
@@ -544,7 +571,7 @@ Live baselines on Qwen3.8-27B-IQ4_XS, same prompt, both engines:
 | | prefill | decode |
 | --- | ---: | ---: |
 | HIP (`yah-run`) | 386.5 ms | 14.02 tok/s (71.3 ms/token) |
-| HRX (`yah-hrx` / `loom_forward_target`) | ~661 ms | 1.33 tok/s (752 ms/token) |
+| HRX (`yah-hrx` / `loom_forward_target`) | ~663 ms | 1.33 tok/s (752 ms/token) |
 
 Prefill is 1.66x; decode is 10.5x. Both reproduce argmax 11751 and the same
 16-token sequence. The decode gap is structural: the HRX decode drives the
