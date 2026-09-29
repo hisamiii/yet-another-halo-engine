@@ -483,6 +483,7 @@ int main(int argc, char** argv) {
       const std::string hal = std::string("gemm_kstore_") + f.name + "_" +
                               std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
+      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
@@ -507,6 +508,7 @@ int main(int argc, char** argv) {
       const std::string hal = std::string("gemm_swiglu_") + f.name + "_" +
                               std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
+      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
@@ -542,6 +544,7 @@ int main(int argc, char** argv) {
                               f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
 
       LoomExecutable& exe = load(dir + "/" + hal);
+      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
