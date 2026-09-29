@@ -38,6 +38,33 @@ def widen_source(loomfile, text, tile):
     return W.widen(text, tile // 16, m_origin=origin)
 
 
+def shared_kstore(fmt, mt, kb, B, out, outdir):
+    """Emit the shared-decode kStore (tools/gen_gemm_shared.py) for this shape if
+    it covers the format, and return its dispatch.txt geometry, else None.
+
+    It replaces the chained kStore: same ABI and output, bit-identical, with the
+    decoded weight tile shared by NW waves, a prefetched branch-free decode and a
+    direct token-major epilogue. YAH_SHARED_GEMM=0 keeps the chained kernel.
+    """
+    import gen_gemm_shared as G
+    if os.environ.get("YAH_SHARED_GEMM", "1") == "0" or fmt not in G.FMTS or mt % 4:
+        return None
+    tile = 128 * G.NW
+    if B % tile:
+        return None
+    tmp = os.path.join(outdir, ".emit_tmp")
+    os.makedirs(tmp, exist_ok=True)
+    # Not named yah_ffn_gemm_*: E.emit applies the chain/widen/epilogue rewrites
+    # to that prefix, and this source is already in its final form.
+    src = os.path.join(tmp, "yah_sgemm_%s_f32.loom" % fmt)
+    with open(src, "w") as fh:
+        fh.write(G.gen(fmt))
+    sym = "yah_ffn_gemm_%s" % fmt
+    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
+                 "%s.token_tiles=%d" % (sym, B // tile)], out, outdir)
+    return (out, tile, 4, B // tile)
+
+
 def main():
     model, outdir = sys.argv[1], sys.argv[2]
     B = int(sys.argv[3]) if len(sys.argv) > 3 else int(os.environ.get("YAH_PP_TOKENS", "2048"))
@@ -138,6 +165,11 @@ def main():
         rowgrp = ROWGRP if chain_level in ("full", "rows") else 1
         sym = E.sym_of(f)
         if kind == "kstore":
+            sg = shared_kstore(fmt, mt, kb, B, "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb), outdir)
+            if sg:
+                geom.append(sg)
+                n += 1
+                continue
             cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
                    "%s.token_tiles=%d" % (sym, tt)]
             # The chain drops the runtime word_decode switch outright (it keeps
@@ -183,9 +215,13 @@ def main():
             if port == "iq3s" and not kuse:
                 kcfg.append("%s.word_decode=%d" % (ksym, 1))
             kout = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
-            E.emit(kf, kcfg, kout, outdir, widen=ktile, chain=kuse,
-                   chain_level=(kchain_level or "full"))
-            geom.append((kout, ktile, krowgrp, ktt))
+            sg = shared_kstore(fmt, mt, kb, B, kout, outdir)
+            if sg:
+                geom.append(sg)
+            else:
+                E.emit(kf, kcfg, kout, outdir, widen=ktile, chain=kuse,
+                       chain_level=(kchain_level or "full"))
+                geom.append((kout, ktile, krowgrp, ktt))
         n += 1
 
     # Record the resolved launch geometry with the prepared executables.

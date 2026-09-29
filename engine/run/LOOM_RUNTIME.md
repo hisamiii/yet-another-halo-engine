@@ -1139,6 +1139,51 @@ Interleaved, 15 s gaps, sets differing only in `rowsplit.hal`. Bit-identical,
 1.28x on the prefill. The emitters now build `rowsplit.hal` from regtile;
 `YAH_DELTANET=lds` restores the LDS form.
 
+### Shared-decode kStore: decode once per workgroup, prefetch it, store direct
+
+After the DeltaNet fix the quant GEMMs are ~6.4 of ~7.6 s. The chained kStore
+(one wave64 per workgroup, 64 rows x 128 tokens) re-stages and re-decodes a 64x16
+weight slice every 16-wide K step behind three barriers, one element per lane
+per step; for IQ4_XS the codebook is a 4-level `scf.if` tree and each element
+issues five LDS byte loads. `tools/gen_gemm_shared.py` generates a replacement
+with the same ABI, output and f32 op order (so the hidden md5 is the gate):
+
+- NW wave64 waves share one decoded 64-row tile, each wave the same 64x128
+  accumulator tile as before;
+- the tile is decoded once per KSUB-wide phase, row-per-lane: scales once per
+  32-element group, the qs bytes as one vector load, the codebook through
+  `vector.table.lookup`;
+- the next phase's raw bytes are loaded before this phase's MMAs and carried by
+  the loop (prefetch);
+- the result fragments are stored straight into the token-major output through
+  a strided view, instead of an ostage round trip (3x the output bytes).
+
+IQ4_XS kStore, per-dispatch mean over its 67 dispatches at pp2048 (`YAH_LOOM_TIME=2`),
+every arm bit-identical (hidden f837e614ff55d1d1):
+
+| arm | ms |
+| --- | ---: |
+| chained (shipped) | 13.98 |
+| shared NW=4 KSUB=256 | 16.52 |
+| shared NW=4 KSUB=128 | 15.95 |
+| shared NW=2 KSUB=64, no prefetch | 14.71 |
+| + prefetch | 13.43 |
+| NW=2 KSUB=128 + prefetch | 12.55 |
+| **+ direct epilogue** | **9.71** |
+
+The first two rows are the lesson: sharing the decode alone lost, because a 34 KB
+tile halves residency and each phase waited out its own DRAM loads. Probes on the
+prefetch-less NW=2 kernel (decode removed: 9.74 ms; MMAs removed: 9.71 ms, of 13.49)
+showed decode and MMA serialised with ~6 ms left over, which is what pointed at
+the epilogue. Weighted over the ~13.9 TFLOP those dispatches do, 14.9 -> 21.4 TF/s.
+
+End to end, interleaved, 15 s gaps: 7917.2 / 7807.4 ms -> 7681.0 / 7601.0 ms,
+argmax 11751 and f837e614ff55d1d1 on all four. `emit_prefill_pp.py` builds the
+IQ4_XS kStore HALs from the generator (`YAH_SHARED_GEMM=0` keeps the chained
+kernel), and a full emit with `YAH_DIRECT_EPI=1 YAH_GEMM_W64=1 YAH_TOKEN_TILE=128
+YAH_ROWGRP=4 YAH_CHAIN_LEVEL=rows` reproduces the measured set file for file.
+Other formats need their own row-per-lane decoder in the generator.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
