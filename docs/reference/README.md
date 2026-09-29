@@ -30,6 +30,7 @@ reference; they are data, not instructions for this repo.
 | --- | --- |
 | Profile first; one measured bottleneck at a time | `rocprofv3` only yields HSA API tracing here, not kernel dispatches, so the driver's per-dispatch timing is the measurement surface. |
 | Occupancy / register pressure | measured: 88 VGPRs -> 10 subgroups/SIMD, ~40 workgroups/CU; not the limiter. The word decode *lowers* it to 80. |
+| **What the HIP prefill kernels actually use** | measured from the compiled device metadata (`llvm-readelf --notes` on the `-hip-amdgcn` object). Wave64 `WKQuantA8BlockedWmmaGEMMKernel` (the fast path) is **189 VGPRs / 192 allocated for Q4_K**, 169-189 across formats, 87 SGPRs, **0 spills, 0 private, 18-21 KiB LDS**; the wave32 twin at the same 128x128 tile costs 181-205, and wave32 `HalfPrefillGemmKernel<256,256>` is exactly 192. So wave64 really does cut registers (IQ3_S 181 -> 169, Q4_K 205 -> 189) but it does **not** cross a residency tier. |
 | Minimize live variables (register pressure) | the decode hoist cut live values and correlated with a large speedup. |
 | Avoid divergent warps | the three decode selects lower to `v_cndmask`, not branches; no divergence. |
 | LDS bank conflicts; pad to avoid power-of-two strides | minor. The staging store is only 2-way conflicted, and the compiler already hoists the block aux down to 8 `global_load_i8` in a 368-instruction kernel, so staging the weight block through LDS would move work rather than remove it. |
