@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Emit every HAL the Loom single-token decode forward needs for a shard.
 
-usage: emit_decode.py <model.gguf> <outdir> [tables_dir]
+usage: emit_decode.py <model.gguf> <outdir>
 
 Reuses emit_prefill.py for the kStore/kSwiGLU/kResidual GEMMs and emit_hal.py
 for the fixed decode kernels. The decode attention kernel bakes start_pos, so
 one HAL is emitted per position up to --positions (default 32). The IQ grid/
-ksigns tables are copied from tables_dir (default /tmp/hal_iq4xs).
+ksigns tables are emitted by emit_prefill.py from loom/tables/.
 """
 import os, shutil, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +36,6 @@ def emit(loomfile, outdir, outname, configs):
 
 def main():
     model, outdir = sys.argv[1], sys.argv[2]
-    tables = sys.argv[3] if len(sys.argv) > 3 else "/tmp/hal_iq4xs"
     os.makedirs(outdir, exist_ok=True)
     subprocess.run([sys.executable, PREFILL, model, outdir], check=True)
     emit("yah_half_norm_f16.loom", outdir, "norm.hal",
@@ -78,9 +77,7 @@ def main():
             "yah_decode_attn.rows=1",
             "yah_decode_attn.has_gate=1",
         ])
-    for tab in ["grid_iq3s.bin", "grid_iq3xxs.bin", "ksigns_iq3xxs.bin",
-                "grid_iq2xxs.bin", "grid_iq2xs.bin", "ksigns_iq2xxs.bin"]:
-        shutil.copy(os.path.join(tables, tab), os.path.join(outdir, tab))
+    # emit_prefill.py already wrote the IQ grid/sign tables into outdir.
     print("emitted decode HALs to", outdir)
 
 

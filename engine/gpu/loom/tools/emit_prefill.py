@@ -6,7 +6,7 @@ Naming convention so the C++ driver needs no manifest:
   <outdir>/<fixed>.hal   for the non-GEMM kernels
 where kind is kstore|residual|swiglu.
 """
-import os, re, struct, subprocess, sys
+import os, re, shutil, struct, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOOM = os.path.abspath(os.path.join(HERE, ".."))
@@ -107,7 +107,67 @@ def main():
     # The residual reduction: hidden += sum_s partial[s], dim = hidden * 64 tokens.
     emit("yah_residual_add_1d_f32.loom", ["yah_residual_1d.dim=327680"],
          "accum.hal", outdir); n += 1
-    print("emitted", n, "GEMM HALs")
+    # The fixed prefill kernels at the shard's shapes.
+    fixed = [
+        ("yah_half_norm_f16.loom", "norm.hal",
+         ["yah_half_norm.rows=5", "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06"]),
+        ("yah_ssm_conv_f32.loom", "conv.hal",
+         ["yah_ssm_conv.batch=5", "yah_ssm_conv.qkv_dim=10240"]),
+        ("yah_deltanet_prep_kq_f32.loom", "prepkq.hal",
+         ["yah_deltanet_prep_kq.batch=5", "yah_deltanet_prep_kq.num_key_heads=16",
+          "yah_deltanet_prep_kq.qkv_size=10240"]),
+        ("yah_deltanet_prep_ab_f32.loom", "prepab.hal",
+         ["yah_deltanet_prep_ab.batch=5", "yah_deltanet_prep_ab.qkv_size=10240",
+          "yah_deltanet_prep_ab.num_heads=48"]),
+        ("yah_deltanet_rowsplit_f32.loom", "rowsplit.hal",
+         ["yah_deltanet.batch=5", "yah_deltanet.qkv_size=10240",
+          "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
+          "yah_deltanet.num_heads=48"]),
+        ("yah_ssm_postnorm_gate_f16.loom", "postnorm.hal",
+         ["yah_ssm_postnorm_fp16.head_count=240"]),
+        ("yah_unpack_qg_f32.loom", "unpack.hal",
+         ["yah_unpack_qg.batch=5", "yah_unpack_qg.num_heads=24",
+          "yah_unpack_qg.head_dim=256"]),
+        ("yah_fused_qk_rope_batched_f32.loom", "rope.hal", [
+            "yah_fused_qk_rope_batched.start_pos=0",
+            "yah_fused_qk_rope_batched.batch=5",
+            "yah_fused_qk_rope_batched.layer_idx=0",
+            "yah_fused_qk_rope_batched.max_context=8",
+            "yah_fused_qk_rope_batched.num_heads=24",
+            "yah_fused_qk_rope_batched.num_kv_heads=4",
+            "yah_fused_qk_rope_batched.head_dim=256",
+            "yah_fused_qk_rope_batched.rotary_dim=64",
+            "yah_fused_qk_rope_batched.q_elems=30720",
+            "yah_fused_qk_rope_batched.kv_elems=5120",
+            "yah_fused_qk_rope_batched.cache32_elems=8192",
+            "yah_fused_qk_rope_batched.cache16_elems=8192"]),
+        ("yah_attn_wmma_f32.loom", "wmma.hal", [
+            "yah_attn_wmma.layer_idx=0", "yah_attn_wmma.start_pos=0",
+            "yah_attn_wmma.batch_size=5", "yah_attn_wmma.max_context=8",
+            "yah_attn_wmma.num_heads=24", "yah_attn_wmma.num_kv_heads=4",
+            "yah_attn_wmma.head_dim=256", "yah_attn_wmma.gqa=6",
+            "yah_attn_wmma.score_capacity=8", "yah_attn_wmma.kv_padded=8",
+            "yah_attn_wmma.has_gate=1", "yah_attn_wmma.has_lse=0",
+            "yah_attn_wmma.head_major=0"]),
+        ("yah_half_cast.loom", "cast.hal", ["yah_half_cast.num_elements=30720"]),
+        ("yah_rmsnorm_f32.loom", "rmsnorm.hal",
+         ["yah_rmsnorm.rows=1", "yah_rmsnorm.eps=1e-06"]),
+        ("yah_gemv_q6k_f32.loom", "gemv.hal",
+         ["yah_gemv_q6k.m_rows=248320", "yah_gemv_q6k.k_blocks=20"]),
+        ("yah_argmax_f32.loom", "argmax.hal", ["yah_argmax.vocab=248320"]),
+    ]
+    for loom, outname, configs in fixed:
+        emit(loom, configs, outname, outdir); n += 1
+    # The IQ grid and sign tables, committed under loom/tables/.
+    tables = os.path.join(LOOM, "tables")
+    for src, dst in [("grid_iq3s.bin", "grid_iq3s.bin"),
+                     ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
+                     ("grid_iq2xxs.bin", "grid_iq2xxs.bin"),
+                     ("grid_iq2xs.bin", "grid_iq2xs.bin"),
+                     ("ksigns_iq2xs.bin", "ksigns_iq3xxs.bin"),
+                     ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")]:
+        shutil.copy(os.path.join(tables, src), os.path.join(outdir, dst))
+    print("emitted", n, "GEMM + fixed prefill HALs")
 
 
 if __name__ == "__main__":
