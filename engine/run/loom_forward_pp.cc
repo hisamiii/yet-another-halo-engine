@@ -456,22 +456,32 @@ int main(int argc, char** argv) {
     // The norm writes the f16 activation into scratch at row stride dim, so
     // every GEMM reading scratch has ktot == dim: 5120 for the FFN, 6144 for the
     // attention output. That is why scratch is kFfn wide.
+    // The small per-layer weights (norms, conv1d, ssm_a/dt/norm) are bound as
+    // views into the single imported tensor region instead of being copied into
+    // freshly allocated device buffers.
+    //
+    // The old per-call allocation was deliberate, and the hazard it avoided is
+    // real: a SHARED buffer refilled here while the previous layer's dispatch is
+    // still queued corrupts the weight that dispatch bound, because
+    // hrx_synchronous_h2d is synchronous for the copy but not for the stream
+    // (sharing measured a wrong forward, argmax 14). Binding a view avoids that
+    // hazard entirely rather than reintroducing it: nothing is ever rewritten,
+    // because every tensor already owns a distinct immutable region of the one
+    // import -- exactly how run_kstore/run_swiglu and output.weight bind theirs.
+    //
+    // What the copy cost: ~8 allocations plus H2D transfers per layer. Each
+    // allocation runs the HSA map path, which waits by POLLING
+    // AMDKFD_IOC_WAIT_EVENTS (~1.1M polls per forward, 99.6% of all syscall
+    // time), and mapping memory while dispatches are in flight drains the queue
+    // every layer -- the ramp-then-decay in GPU utilisation.
     auto run_norm = [&](const std::string& wname) {
       const auto* tw = find(wname);
-      // A FRESH buffer per call, deliberately. Refilling one shared buffer here
-      // while the previous layer's dispatch is still queued corrupts the weight
-      // that dispatch has bound: hrx_synchronous_h2d is synchronous for the copy,
-      // not for the stream. Sharing w_norm/wconv/... across layers measured a
-      // wrong 64-token forward (argmax 14 instead of 11751, mean|d| ~6) where the
-      // stock per-call allocation is bit-reproducible.
-      LoomBuffer w = gpu.Allocate(std::size_t{kHidden} * 4);
-      gpu.H2D(w, gguf.Data(*tw), std::size_t{kHidden} * 4);
+      const Imported w = ImportTensor(*tw);
       std::vector<hrx_buffer_ref_t> b = {
           {hidden.handle, 0, hb(hidden)}, {reszero.handle, 0, hb(reszero)},
-          {w.handle, 0, hb(w)}, {sumout.handle, 0, hb(sumout)},
+          {w.handle, w.offset, w.bytes}, {sumout.handle, 0, hb(sumout)},
           {scratch.handle, 0, hb(scratch)}};
       Dispatch(gpu, e_norm, "yah_half_norm", B, 1, 1, 32, 1, 1, b);
-      keep.push_back(std::move(w));
     };
     auto run_kstore = [&](const std::string& wname, const LoomBuffer& out) {
       const auto* tw = find(wname);
@@ -637,26 +647,23 @@ int main(int argc, char** argv) {
         }
         const auto* qn = find(pre + "attn_q_norm.weight");
         const auto* kn = find(pre + "attn_k_norm.weight");
-        LoomBuffer w_qn = gpu.Allocate(std::size_t{kHeadDim} * 4);
-        LoomBuffer w_kn = gpu.Allocate(std::size_t{kHeadDim} * 4);
-        gpu.H2D(w_qn, gguf.Data(*qn), std::size_t{kHeadDim} * 4);
-        gpu.H2D(w_kn, gguf.Data(*kn), std::size_t{kHeadDim} * 4);
+        const Imported w_qn = ImportTensor(*qn);
+        const Imported w_kn = ImportTensor(*kn);
         if (ai >= kFull) throw LoomError("full-attention layer index past the KV slot count");
         const std::size_t koff = std::size_t{ai} * kKvCache * 2;
         const std::size_t voff = std::size_t{kFull} * kKvCache * 2 + koff;
         {
           std::vector<hrx_buffer_ref_t> b = {
               {q.handle, 0, hb(q)}, {kbuf.handle, 0, hb(kbuf)},
-              {vbuf.handle, 0, hb(vbuf)}, {w_qn.handle, 0, hb(w_qn)},
-              {w_kn.handle, 0, hb(w_kn)}, {q.handle, 0, hb(q)},
+              {vbuf.handle, 0, hb(vbuf)}, {w_qn.handle, w_qn.offset, w_qn.bytes},
+              {w_kn.handle, w_kn.offset, w_kn.bytes}, {q.handle, 0, hb(q)},
               {kbuf.handle, 0, hb(kbuf)}, {kc32.handle, 0, hb(kc32)},
               {vc32.handle, 0, hb(vc32)}, {kv16.handle, koff, kKvCache * 2},
               {kv16.handle, voff, kKvCache * 2},
               {eps.handle, 0, 4}};
           Dispatch(gpu, e_rope, "yah_fused_qk_rope_batched", 28, B, 1, 256, 1, 1, b);
         }
-        keep.push_back(std::move(w_qn));
-        keep.push_back(std::move(w_kn));
+        // w_qn/w_kn are views into the import; nothing to keep alive.
         {
           std::vector<hrx_buffer_ref_t> b = {
               {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)},
@@ -693,30 +700,26 @@ int main(int argc, char** argv) {
           dump_buf(beta, static_cast<std::size_t>(B) * kTs * 4, ".beta");
         }
         const auto* convw = find(pre + "ssm_conv1d.weight");
-        LoomBuffer w_conv = gpu.Allocate(std::size_t{4} * kQkv * 4);
-        gpu.H2D(w_conv, gguf.Data(*convw), std::size_t{4} * kQkv * 4);
+        const Imported w_conv = ImportTensor(*convw);
         const auto* ta = find(pre + "ssm_a");
         const auto* tdt = find(pre + "ssm_dt.bias");
         const auto* tsn = find(pre + "ssm_norm.weight");
-        LoomBuffer w_a = gpu.Allocate(std::size_t{kTs} * 4);
-        LoomBuffer w_dt = gpu.Allocate(std::size_t{kTs} * 4);
-        LoomBuffer w_sn = gpu.Allocate(std::size_t{kState} * 4);
-        gpu.H2D(w_a, gguf.Data(*ta), std::size_t{kTs} * 4);
-        gpu.H2D(w_dt, gguf.Data(*tdt), std::size_t{kTs} * 4);
-        gpu.H2D(w_sn, gguf.Data(*tsn), std::size_t{kState} * 4);
+        const Imported w_a = ImportTensor(*ta);
+        const Imported w_dt = ImportTensor(*tdt);
+        const Imported w_sn = ImportTensor(*tsn);
         const std::size_t cs_off = std::size_t{si} * kQkv * 4 * 4;
         const std::size_t st_off = std::size_t{si} * kTs * kState * kState * 4;
         {
           std::vector<hrx_buffer_ref_t> b = {
               {qkv.handle, 0, hb(qkv)},
-              {w_conv.handle, 0, hb(w_conv)},
+              {w_conv.handle, w_conv.offset, w_conv.bytes},
               {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
               {conv_out.handle, 0, hb(conv_out)}};
           Dispatch(gpu, e_conv, "yah_ssm_conv", 40, B, 1, 256, 1, 1, b);
         }
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(conv_out, static_cast<std::size_t>(B) * kQkv * 4, ".conv");
-        keep.push_back(std::move(w_conv));
+        // w_conv is a view into the import; nothing to keep alive.
         {
           std::vector<hrx_buffer_ref_t> b = {
               {conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)}};
@@ -727,7 +730,7 @@ int main(int argc, char** argv) {
         {
           std::vector<hrx_buffer_ref_t> b = {
               {alpha.handle, 0, hb(alpha)}, {beta.handle, 0, hb(beta)},
-              {w_a.handle, 0, hb(w_a)}, {w_dt.handle, 0, hb(w_dt)},
+              {w_a.handle, w_a.offset, w_a.bytes}, {w_dt.handle, w_dt.offset, w_dt.bytes},
               {qkv.handle, 0, hb(qkv)},
               {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
               {ab.handle, 0, hb(ab)}};
@@ -742,8 +745,7 @@ int main(int argc, char** argv) {
         }
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(ab, static_cast<std::size_t>(B) * kTs * 2 * 4, ".ab");
-        keep.push_back(std::move(w_a));
-        keep.push_back(std::move(w_dt));
+        // w_a/w_dt are views into the import; nothing to keep alive.
         {
           std::vector<hrx_buffer_ref_t> b = {
               {conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)},
@@ -756,14 +758,14 @@ int main(int argc, char** argv) {
           dump_buf(raw, static_cast<std::size_t>(B) * kInner * 4, ".raw");
         {
           std::vector<hrx_buffer_ref_t> b = {
-              {raw.handle, 0, hb(raw)}, {w_sn.handle, 0, hb(w_sn)},
+              {raw.handle, 0, hb(raw)}, {w_sn.handle, w_sn.offset, w_sn.bytes},
               {gate.handle, 0, static_cast<std::size_t>(B) * kInner * 4},
               {scratch.handle, 0, hb(scratch)}};
           Dispatch(gpu, e_postnorm, "yah_ssm_postnorm_fp16", 6 * B, 1, 1, 256, 1, 1, b);
         }
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(scratch, static_cast<std::size_t>(B) * kInner * 2, ".ssm");
-        keep.push_back(std::move(w_sn));
+        // w_sn is a view into the import; nothing to keep alive.
         run_residual(pre + "ssm_out.weight", scratch);
         t_ssm += tick();
       }
@@ -803,12 +805,11 @@ int main(int argc, char** argv) {
     if (!skip_head) {
       const auto* onw = find("output_norm.weight");
       const auto* ow = find("output.weight");
-      LoomBuffer wnorm = gpu.Allocate(std::size_t{kHidden} * 4);
-      gpu.H2D(wnorm, gguf.Data(*onw), std::size_t{kHidden} * 4);
+      const Imported wnorm = ImportTensor(*onw);
       {
         std::vector<hrx_buffer_ref_t> b = {
             {hidden.handle, std::size_t{B - 1} * kHidden * 4, std::size_t{kHidden} * 4},
-            {wnorm.handle, 0, hb(wnorm)}, {normed.handle, 0, hb(normed)}};
+            {wnorm.handle, wnorm.offset, wnorm.bytes}, {normed.handle, 0, hb(normed)}};
         Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
       }
       {
