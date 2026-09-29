@@ -77,6 +77,9 @@ PACK = os.environ.get("YAH_SD_PACK", "1") == "1"
 # (IQ3_S 13.81 vs 12.57 ms at KSUB=64): the scheduler interleaves anyway and the
 # extra stores add spill reloads. Off.
 STORE4 = os.environ.get("YAH_SD_STORE4", "0") == "1"
+GRID_FIRST = os.environ.get("YAH_SD_GRID_FIRST", "0") == "1"
+# Inner MMA loop policy, e.g. "pipeline(%c2)" or "unroll(%c2) schedule(recurrence)".
+KPOL = os.environ.get("YAH_SD_KPOL", "")
 
 
 def _i8n(ty):
@@ -320,8 +323,9 @@ def iq3s_compute(v, gb):
         e(f"    %dsc{u} = scalar.mulf %d, %scf{u} : f32")
         e(f"    %qhb{u} = scalar.extui {qh} : i8 to i32")
         hs = []
-        for lw in range(8):
-            l, which = lw // 2, lw % 2
+        for lw in (range(8) if GRID_FIRST else ()):
+            # all eight lookups first, so they can be in flight together instead
+            # of each one being drained before its element math
             t = f"{u}_{lw}"
             e(f"    %qlo8_{t} = vector.extract {qs}[{lw}] : vector<8xi8> -> i8")
             e(f"    %qlo_{t} = scalar.extui %qlo8_{t} : i8 to i32")
@@ -333,6 +337,23 @@ def iq3s_compute(v, gb):
             e(f"    %gil_{t} = index.max %gix_{t}, %c0 : index")
             e(f"    %gid_{t} = index.min %gil_{t}, %c511 : index")
             e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<512xi32> -> i32")
+        for lw in range(8):
+            l, which = lw // 2, lw % 2
+            t = f"{u}_{lw}"
+            if GRID_FIRST:
+                pass
+            else:
+                e(f"    %qlo8_{t} = vector.extract {qs}[{lw}] : vector<8xi8> -> i8")
+            if not GRID_FIRST:
+                e(f"    %qlo_{t} = scalar.extui %qlo8_{t} : i8 to i32")
+                e(f"    %hb0_{t} = scalar.shrui %qhb{u}, %c{lw}i : i32")
+                e(f"    %hb_{t} = scalar.andi %hb0_{t}, %c1i : i32")
+                e(f"    %hb8_{t} = scalar.shli %hb_{t}, %c8i : i32")
+                e(f"    %gi_{t} = scalar.ori %qlo_{t}, %hb8_{t} : i32")
+                e(f"    %gix_{t} = index.cast %gi_{t} : i32 to index")
+                e(f"    %gil_{t} = index.max %gix_{t}, %c0 : index")
+                e(f"    %gid_{t} = index.min %gil_{t}, %c511 : index")
+                e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<512xi32> -> i32")
             if which == 0:
                 e(f"    %sgb8_{u}_{l} = vector.extract {sg}[{l}] : vector<4xi8> -> i8")
                 e(f"    %sgb_{u}_{l} = scalar.extui %sgb8_{u}_{l} : i8 to i32")
@@ -414,12 +435,16 @@ FMTS = {
 }
 
 
-def gen(fmt):
+def gen(fmt, kind="kstore"):
+    """kind: "kstore" (f32 token-major output) or "swiglu" (the ffn_up arm:
+    f16 output = round_f16(silu(gate) * acc), gate the f32 gate projection in
+    the same token-major layout -- yah_ffn_gemm_<fmt>_swiglu_f16.loom's epilogue)."""
     F = FMTS[fmt]
     configure(fmt)
     bb, decode = F["bb"], F["decode"]
-    bufs = ["weight"] + F["extra"] + ["input", "wstage", "ostage", "output"]
-    sym = f"yah_ffn_gemm_{fmt}"
+    sw = kind == "swiglu"
+    bufs = ["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + ["wstage", "ostage", "output"]
+    sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "")
     wgs = 64 * NW
     wtok = TOK * NW
     L = []
@@ -444,7 +469,7 @@ def gen(fmt):
     e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
     e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 256, 512):
+    for v in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512):
         e(f"  %c{v} = index.constant {v} : index")
     for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 24, 32, 66, 74, 106, 255):
         e(f"  %c{v}i = scalar.constant {v} : i32")
@@ -484,9 +509,14 @@ def gen(fmt):
     e("  %w_view = buffer.view %weight_na[%base] : buffer -> view<[%w_bytes]xi8>")
     e("  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>")
     e("  %a_t_view = buffer.view %input_na[%base] : buffer -> view<[%ktot]x[%tokens]xf16, %a_layout>")
-    e("  %out_view = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+    if not sw:
+        # the swiglu output is f16: an f32 view of it would declare twice its size
+        e("  %out_view = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
     e("  %ostage_view = buffer.view %ostage_na[%base] : buffer -> view<[%stage_rows]x[%tokens]xf32>")
-    e(f"  %wl_bytes = index.constant {64 * ROWP * 2} : offset")
+    wl_bytes = 64 * ROWP * 2
+    if sw:
+        wl_bytes = max(wl_bytes, NW * 16 * TOK * 4)   # the epilogue's f32 slabs
+    e(f"  %wl_bytes = index.constant {wl_bytes} : offset")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<64x{ROWP}xf16>")
     e("  %wg_x = kernel.workgroup.id<x> : index")
@@ -575,7 +605,7 @@ def gen(fmt):
         L.extend(Ln)
         nxt = pack_vals(e, nxt, "n")
     cb = ", ".join(f"%b{i} = %a{i} : {V4}" for i in range(NA))
-    e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {{")
+    e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL}{{")
     e("      %kk = index.add %kb_k, %ks : index")
     for i in range(4):
         e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%c{16 * i}, %ks] shape [%m, %k] : view<64x{ROWP}xf16> -> vector<16xf16>")
@@ -603,7 +633,60 @@ def gen(fmt):
     e("  %mo32 = index.add %m_origin, %c32 : index")
     e("  %mo48 = index.add %m_origin, %c48 : index")
     rows = ["%m_origin", "%mo16", "%mo32", "%mo48"]
-    if EPI == "direct":
+    if sw:
+        # SwiGLU epilogue: out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), with
+        # the chained kernel's scalar ops in its order (bit-identity).
+        # It cannot store an f16 result fragment: that store ignores the strided
+        # token-major layout and writes the tile row-major (probe: (t=16, r=17)
+        # received (t=17, r=16); pipeline hidden cosine ~0.6). A fully unrolled
+        # per-element form ran out of SGPRs (peak 215 of 106). So, per 16-row slab:
+        # the f32 fragments go to a per-wave LDS tile through a row-fastest strided
+        # view (f32 result stores honour layouts), then a real loop walks it with
+        # lane-contiguous rows, so the gate loads and f16 stores coalesce into 64 B
+        # runs. The weight tile's LDS is reused; it is sized for this in gen().
+        e(f"  %ep_lay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
+        e(f"  %ep_wbytes = index.constant {16 * TOK * 4} : index")
+        e("  %ep_off_i = index.mul %wave, %ep_wbytes : index")
+        e("  %ep_off = index.cast %ep_off_i : index to offset")
+        e(f"  %ep_view = buffer.view %wl[%ep_off] : buffer -> view<16x{TOK}xf32, %ep_lay>")
+        e(f"  %ep_flat = buffer.view %wl[%ep_off] : buffer -> view<{16 * TOK}xf32>")
+        e("  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%out_total]xf32>")
+        e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
+        e("  %negone = scalar.constant -1.0 : f32")
+        e("  %one = scalar.constant 1.0 : f32")
+        e("  %out_last = index.sub %out_total, %c1 : index")
+        e(f"  %ep_n = index.constant {16 * TOK // 64} : index")
+        e(f"  %ep_last = index.constant {16 * TOK - 1} : index")
+        tl = ["%c0"] + [f"%c{16 * j}" for j in range(1, NT)]
+        for i in range(4):
+            e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            for j in range(NT):
+                e(f"  vector.fragment.store<result> %acc{i * NT + j}, %ep_view[%c0, {tl[j]}] shape [%m, %n] : {V4}, view<16x{TOK}xf32, %ep_lay>")
+            e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            e(f"  %eps{i} = scf.for %ee{i} = [%c0 to %ep_n step %c1](%em{i} = %c0 : index) -> (index) {{")
+            e(f"    %e64_{i} = index.mul %ee{i}, %c64 : index")
+            e(f"    %ef0_{i} = index.add %e64_{i}, %l64 : index")
+            e(f"    %ef_{i} = index.min %ef0_{i}, %ep_last : index")
+            e(f"    %er_{i} = index.rem %ef_{i}, %c16 : index")
+            e(f"    %et_{i} = index.div %ef_{i}, %c16 : index")
+            e(f"    %v_{i} = view.load %ep_flat[%ef_{i}] : view<{16 * TOK}xf32> -> f32")
+            e(f"    %grow_{i} = index.add {rows[i]}, %er_{i} : index")
+            e(f"    %gtok_{i} = index.add %token_base, %et_{i} : index")
+            e(f"    %gto_{i} = index.mul %gtok_{i}, %m_rows : index")
+            e(f"    %gix0_{i} = index.add %gto_{i}, %grow_{i} : index")
+            e(f"    %gix_{i} = index.min %gix0_{i}, %out_last : index")
+            e(f"    %g_{i} = view.load %gate_view[%gix_{i}] : view<[%out_total]xf32> -> f32")
+            e(f"    %ng_{i} = scalar.mulf %g_{i}, %negone : f32")
+            e(f"    %ex_{i} = scalar.expf<afn> %ng_{i} : f32")
+            e(f"    %dn_{i} = scalar.addf %one, %ex_{i} : f32")
+            e(f"    %iv_{i} = scalar.divf %one, %dn_{i} : f32")
+            e(f"    %sg_{i} = scalar.mulf %g_{i}, %iv_{i} : f32")
+            e(f"    %ac_{i} = scalar.mulf %sg_{i}, %v_{i} : f32")
+            e(f"    %h_{i} = scalar.fptrunc %ac_{i} : f32 to f16")
+            e(f"    view.store %h_{i}, %out_h[%gix_{i}] : f16, view<[%out_total]xf16>")
+            e(f"    scf.yield %em{i} : index")
+            e("  }")
+    elif EPI == "direct":
         # Result fragments go straight to the token-major output through a
         # strided [m_rows]x[tokens] view (element (row, t) at t*m_rows + row),
         # as emit_prefill.direct_kstore_epilogue does for the unchained kernels.
@@ -648,10 +731,11 @@ def gen(fmt):
 
 def main():
     fmt = sys.argv[1]
+    kind = os.environ.get("YAH_SD_KIND", "kstore")
     out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         f"yah_ffn_gemm_{fmt}_shared_f32.loom")
-    open(out, "w").write(gen(fmt))
+    open(out, "w").write(gen(fmt, kind))
     print(out)
 
 

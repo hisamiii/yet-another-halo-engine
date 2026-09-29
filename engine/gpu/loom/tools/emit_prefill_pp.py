@@ -38,7 +38,7 @@ def widen_source(loomfile, text, tile):
     return W.widen(text, tile // 16, m_origin=origin)
 
 
-def shared_kstore(fmt, mt, kb, B, out, outdir):
+def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
     """Emit the shared-decode kStore (tools/gen_gemm_shared.py) for this shape if
     it covers the format, and return its dispatch.txt geometry, else None.
 
@@ -56,10 +56,10 @@ def shared_kstore(fmt, mt, kb, B, out, outdir):
     os.makedirs(tmp, exist_ok=True)
     # Not named yah_ffn_gemm_*: E.emit applies the chain/widen/epilogue rewrites
     # to that prefix, and this source is already in its final form.
-    src = os.path.join(tmp, "yah_sgemm_%s_f32.loom" % fmt)
+    src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     with open(src, "w") as fh:
-        fh.write(G.gen(fmt))
-    sym = "yah_ffn_gemm_%s" % fmt
+        fh.write(G.gen(fmt, kind))
+    sym = "yah_ffn_gemm_%s%s" % (fmt, "_swiglu" if kind == "swiglu" else "")
     E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
                  "%s.token_tiles=%d" % (sym, B // tile)], out, outdir)
     return (out, tile, 4, B // tile)
@@ -184,9 +184,14 @@ def main():
                    "%s.k_split=%d" % (sym, KSPLIT), "%s.accum=0" % sym]
             out = "gemm_residual_%s_%d_%d.hal" % (fmt, mt, kb)
         else:
+            out = "gemm_swiglu_%s_%d_%d.hal" % (fmt, mt, kb)
+            sg = shared_kstore(fmt, mt, kb, B, out, outdir, kind="swiglu")
+            if sg:
+                geom.append(sg)
+                n += 1
+                continue
             cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
                    "%s.token_tiles=%d" % (sym, tt)]
-            out = "gemm_swiglu_%s_%d_%d.hal" % (fmt, mt, kb)
         E.emit(f, cfg, out, outdir, widen=tile, chain=use,
                chain_level=(chain_level or "full"))
         geom.append((out, tile, rowgrp, tt))
