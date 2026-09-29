@@ -82,22 +82,34 @@ def widen_rows(text, n_row=2, style=None):
             style = 'word-1col'
         elif '%j32 = scalar.shli %j_i, %c5i : i32' in text:
             style = '1col-32j'
+        elif '%j32 = scalar.shli %j_i, %c6i : i32' in text:
+            style = '1col-64j'
         else:
             raise SystemExit('widen_rows: unrecognised decode lane map')
-    if style == '1col-32j':
+    # Rows covered by one pass of the one-column-per-lane map: 2 at wave32
+    # (e = lane + 32j over j in [0,8)) and 4 at wave64 (e = lane + 64j over
+    # [0,4), since lane>>4 then spans 0..3). So a 64-row tile takes 32 or 16
+    # passes respectively. Both are the SAME re-association,
+    #     (lane + SW*j) >> 4  ==  (lane >> 4) + (SW/16)*j
+    # which is exact because lane = 16a + b with b < 16, so b cannot carry into
+    # the shifted row, and the column is lane&15 either way, independent of j.
+    STEP = {'1col-32j': 2, '1col-64j': 4}
+    if style in STEP:
+        step = STEP[style]
         text, nremap = re.subn(
-            r'( *)%j32 = scalar\.shli %j_i, %c5i : i32\n'
+            r'( *)%j32 = scalar\.shli %j_i, %c(5|6)i : i32\n'
             r' *%e_i = scalar\.addi %lane_i, %j32 : i32\n'
             r' *%r_i = scalar\.shrui %e_i, %c4i : i32',
             r'\1%row0 = scalar.shrui %lane_i, %c4i : i32\n'
-            r'\1%r8 = scalar.shli %j_i, %c1i : i32\n'
+            r'\1%r8 = scalar.shli %j_i, %c' + str({2: 1, 4: 2}[step]) + r'i : i32\n'
             r'\1%r_i = scalar.addi %row0, %r8 : i32',
             text)
         if nremap != 1:
-            raise SystemExit('1col-32j row map matched %d times' % nremap)
-        text = '\n'.join(_ensure_scalar(text.split('\n'), 1))
+            raise SystemExit('%s row map matched %d times' % (style, nremap))
+        lines = _ensure_scalar(text.split('\n'), {2: 1, 4: 2}[step])
+        text = '\n'.join(lines)
 
-    rpp = ROWS_PER_PASS[wave] if style == 'word-1col' else 2
+    rpp = ROWS_PER_PASS[wave] if style == 'word-1col' else STEP[style]
     m = re.search(r'%tokens = index\.mul %token_tiles, %c(\d+)', text)
     if not m:
         raise SystemExit('no token width')

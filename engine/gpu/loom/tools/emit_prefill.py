@@ -455,12 +455,26 @@ def _chain(text, tile, n_row, loomfile='', level=None):
         text = pwd.port(text, tile)
     if 'scf.if %wd_old' in text:
         text = bf.drop_branch(text, 'word')
-    # 'rows' stops short of the wave64 port: the row-group rewrite below works on
-    # the wave32 one-column-per-lane map directly (j in [0,32) puts row =
-    # (lane>>4) + 2j across all 64 rows of a 4-row-group tile), and wave64 measured
-    # SLOWER at B=2048, so bundling it in would hide the row-group result.
-    if (level or CHAIN_LEVEL) != 'rows':
-        text = w64.wave64(text, tile)
+    # The 'rows' level is for the one-column-per-lane map ONLY: the iq3s word
+    # decode needs the full chain (its pre-drop_branch gathers only prove
+    # non-negative under the LDS staging step). Refuse by style, before doing any
+    # work, so the probe failure is cheap. chain_applies() catches this, so such a
+    # source is reported unchained and keeps today's geometry (the mt=3 iq3s case).
+    lvl = level or CHAIN_LEVEL
+    if lvl == 'rows' and '%r8 = scalar.shli %j_i, %c3i : i32' in text:
+        raise SystemExit('rows level: the word-1col (iq3s) decode needs the full chain')
+    # BOTH reduced levels take the wave64 port first. For 'rows' that is about
+    # REGISTER PRESSURE, not correctness: n_row*n accumulators of vector<8xf32> is
+    # 4*8*8 = 256 f32 per lane at wave32 -- exactly the VGPR budget -- so the
+    # row-group form spills, and wave64 halves it to 128. The 1col-64j style then
+    # covers a 64-row tile in 16 passes of 4 rows, because lane>>4 spans 0..3 over
+    # 64 lanes. Measured: with the wave32 32-pass form the row-group set was 3.75x
+    # SLOWER at B=2048 than the shipped set; the baseline also does scattered
+    # gathers, so the gathers cannot be what cost that.
+    if lvl in ('rows', 'w64') and 'q5k' in os.path.basename(loomfile):
+        raise SystemExit(
+            'wave64: q5k is known-wrong (B=128 argmax 88 vs 11751); excluded')
+    text = w64.wave64(text, tile)
     # YAH_CHAIN_LEVEL=w64 stops here, after the wave64 port. The row-group and LDS
     # staging steps assume the iq3s decode's lane map (lane>>2 spans ROWS_PER_PASS
     # rows, one row per lane over a 64-row tile); the one-column-per-lane formats
@@ -469,18 +483,7 @@ def _chain(text, tile, n_row, loomfile='', level=None):
     # is worth shipping on its own while the rest of the port is built.
     # The level is per-source, not global: a caller must keep the FULL chain on the
     # sources that support it, or the emit silently drops their row groups.
-    if (level or CHAIN_LEVEL) == 'w64':
-        # q5k is EXCLUDED: wave64 produces a numerically wrong kernel for it.
-        # Bisected format-by-format at B=128 against argmax 11751 -- iq2xs,
-        # iq2xxs, iq3s, iq3xxs, iq4xs, q2k, q3k, q4k, q6k and q8_0 all transform
-        # correctly; q5k alone gives 88. Its decode lane map is textually
-        # identical to q4k's (same [0,8) loop, same shli-by-5, same
-        # lane&15 / e>>4 mapping), and q5k is correct under token widening alone,
-        # so the fault is specific to the wave64 step and is not yet understood.
-        # Fail loudly rather than emit a silently wrong q5k.
-        if 'q5k' in os.path.basename(loomfile):
-            raise SystemExit(
-                'wave64: q5k is known-wrong (B=128 argmax 88 vs 11751); excluded')
+    if lvl == 'w64':
         return text
     # The 'rows' level is for the one-column-per-lane map ONLY. The iq3s word
     # decode must keep the FULL chain: its old (pre-drop_branch) decode path has
