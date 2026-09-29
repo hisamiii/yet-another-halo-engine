@@ -482,9 +482,18 @@ def _chain(text, tile, n_row, loomfile='', level=None):
             raise SystemExit(
                 'wave64: q5k is known-wrong (B=128 argmax 88 vs 11751); excluded')
         return text
+    # The 'rows' level is for the one-column-per-lane map ONLY. The iq3s word
+    # decode must keep the FULL chain: its old (pre-drop_branch) decode path has
+    # unclamped %w_view gathers that stop proving non-negative without the LDS
+    # staging step, so a 'rows' emit of it aborts with SUBRANGE/023. Refuse by
+    # style rather than by filename, and do it before widen_rows so the failure is
+    # cheap. chain_applies() catches this, so such a source is reported unchained
+    # and keeps today's geometry (this is the mt=3 iq3s case).
+    if (level or CHAIN_LEVEL) == 'rows' and '%r8 = scalar.shli %j_i, %c3i : i32' in text:
+        raise SystemExit('rows level: the word-1col (iq3s) decode needs the full chain')
     text = wr.widen_rows(text, n_row)
     if (level or CHAIN_LEVEL) == 'rows':
-        # TRANSFORM COMPLETE, KERNEL DOES NOT YET COMPILE. widen_rows now supports
+        # TRANSFORM COMPLETE. widen_rows supports
         # the one-column-per-lane map (row = (lane>>4) + 2j over j in [0,32)), so
         # this produces the right row-group form for iq3xxs/iq4xs/q4k/q3k/q6k.
         # But emit_hal.py inlines configs as constants, and the resulting

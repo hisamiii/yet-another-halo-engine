@@ -121,6 +121,13 @@ def main():
         alt_level = LEVEL if LEVEL in ("rows", "w64") else None
         alt = (E.chain_applies(f, tile=TILE, level=alt_level)
                if (CHAIN and alt_level) else False)
+        # 'rows' applies widen_rows, so it divides the x grid by rowgrp exactly
+        # like the full chain and needs the same divisibility guard. Without it
+        # mt=3 (m_tiles=3) becomes m_groups = 3/4 = 0 and the ostage fragment
+        # store cannot prove its bound: "vector_extent is 16, view_bound is 48,
+        # and the maximum legal origin is 32".
+        if alt_level == "rows":
+            alt = alt and mt % ROWGRP == 0
         chain_level = "full" if full else (alt_level if alt else None)
         use = chain_level is not None
         # widenable: every source widen_tokens can widen, chained or not. The row
@@ -163,6 +170,8 @@ def main():
             kfull = E.chain_applies(kf, tile=TILE, level="full") and mt % ROWGRP == 0
             kalt = (E.chain_applies(kf, tile=TILE, level=alt_level)
                     if alt_level else False)
+            if alt_level == "rows":
+                kalt = kalt and mt % ROWGRP == 0
             kchain_level = "full" if kfull else (alt_level if kalt else None)
             kuse = kchain_level is not None
             ktile = TILE if (kuse or WIDEN_ALL) else 64
