@@ -937,6 +937,116 @@ gpu/ported/src/models/qwen/hip/kernels/prefill_quant_wave64.hip` (drop the flag 
 use `prefill_quant_gemm.hip` for the wave32 twins), then `llvm-readelf --notes` on the
 emitted device object.
 
+#### Widening rows, not tokens: the rhs fragment is the shared operand
+
+Every widening tried so far grew the token tile. That widens the *lhs*, the
+decoded weight fragment read from LDS: one lhs feeds n MMAs and the rhs fragment,
+the activation read from global, is re-loaded for each. Row widening does the
+opposite, and the two are not interchangeable. For a workgroup tile of n_row*16
+rows and tok tokens, per K step of 16:
+
+| quantity | count |
+| --- | --- |
+| MMAs | n_row * tok/16 |
+| lhs fragment loads (LDS) | n_row |
+| rhs fragment loads (global) | tok/16 |
+| 16x16 weight decode tiles | n_row |
+
+so operand fragment loads per MMA are `1/(tok/16) + 1/n_row`: the lhs term is the
+token width's lever and the rhs term is the row width's. Weight decode per output
+is `16/tok` and does not move with n_row at all -- which is why the two levers
+bend different costs.
+
+`tools/widen_rows.py` implements the transform on top of `widen_tokens.py` and
+`wave64_tokens.py`, for either wave size: the decode row map is `lane>>2`, so a
+pass covers 16 rows at wave64 and 8 at wave32, and the ostage copy's trip count
+divides rows*tok by the wave size. The grid's x dimension divides by n_row while
+`m_tiles` keeps its meaning, so `m_rows`, `stage_rows` and every buffer size the
+harness derives are unchanged. The correctness gate is new: the fixture generator
+under `fixtures/iq3s_gemm_wide/` emits 16/32/64/128 *distinct* rows, because a
+duplicated fixture would make a wrong row origin self-consistent. All 22 shapes
+in the grid below pass it (`state: ok`).
+
+##### The sweep, at 2048 tokens (17408 rows, k_blocks=20)
+
+Interleaved, two repeats, `safe_bench --iters=10`; the samples agree to 1-3%:
+
+| tile | wave | VGPR | tier | lanes/SIMD | full ms | ablated | decode share |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16x16 (r1) | 64 | 32 | cap | 512 | 34.94 / 35.15 | 17.81 | 49% |
+| 32x16 (r2) | 64 | 40 | cap | 512 | 32.53 / 32.88 | | |
+| 64x16 (r4) | 64 | 48 | cap | 384 | 31.92 / 32.27 | | |
+| 32x64 (r2) | 64 | 80 | 6 | 384 | 17.60 / 18.09 | 10.56 | 40% |
+| 64x64 (r4) | 64 | 128 | 4 | 256 | 17.66 / 18.46 | 8.14 | 54% |
+| 16x128 (r1) | 64 | 80 | 6 | 384 | 34.16 / 33.97 | | |
+| 32x128 (r2) | 64 | 152 | 3 | 192 | 18.05 / 18.13 | | |
+| **64x128 (r4)** | **64** | **224** | **2** | **128** | **14.51 / 14.53** | 8.35 | 42% |
+
+and the whole grid, one sample each (ms):
+
+| rows \ tok | 16 | 32 | 64 | 128 | 256 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 35.94 | **23.79** | 25.01 | 34.32 | 37.83 |
+| 32 | 31.64 | 19.63 | **17.40** | 18.26 | 17.55 |
+| 64 | 31.42 | 19.69 | 17.61 | **14.37** | 228.6 |
+| 128 | 39.51 | 23.61 | 20.92 | 156.9 | (will not allocate) |
+
+Three things fall out.
+
+First, the model's prediction holds exactly at n_row=2 and fails at n_row=4 for a
+stated reason. At 128 tokens the rhs term goes 1 -> 0.5, predicted ratio
+`(1/8+1)/(1/8+1/2) = 0.53`, measured `18.05/34.16 = 0.53`. At n_row=4 the model
+predicts 0.29 and the measurement is 0.42, and the ablated column says why: the
+decode is 42% of the time and row widening does not touch it.
+
+Second, the optimum token width climbs with the row count -- r1 peaks at 32
+tokens, r2 at 64, r4 at 128. That is the same statement from the other side: once
+the rhs is shared, the decode is what is left to amortise, and only the token
+width amortises it.
+
+Third, the register wall is sharp and bracketed from both sides. 64 rows x 256
+tokens spends all 256 VGPRs plus 1984 B of private memory and lands at 228.6 ms,
+16x worse than its neighbours. 128 rows x 128 tokens costs 240 VGPRs and 1760 B of
+private and lands at 156.9 ms. 128 rows x 256 tokens does not allocate at all
+(`parallel-move-no-scratch-unit`). The useful region is 64 rows x 128 tokens at
+224 VGPRs, tier 2, 128 lanes.
+
+##### The production shape is the opposite case
+
+The engine's prefill is `constexpr std::uint32_t kB = 5`
+(`engine/run/loom_forward_target.cc`) padded to a 16-token tile, and
+`emit_prefill.py` binds `token_tiles=1`: there is one token tile, so each weight
+tile is decoded exactly once and there is no re-decode for row widening to remove.
+It only divides the parallelism (1088 -> 272 workgroups):
+
+| tile | wave | ms |
+| --- | ---: | ---: |
+| 16x16 (r1) | 32 | 0.4199 / 0.4398 |
+| 32x16 (r2) | 32 | 0.4845 / 0.4897 |
+| 64x16 (r4) | 32 | 0.7436 / 0.7447 |
+| **16x16 (r1)** | **64** | **0.2663 / 0.2671** |
+| 64x16 (r4) | 64 | 0.4046 / 0.4033 |
+
+What does move the production shape is the *wave size alone*: the wave64 port of
+the existing 16x16 tile is 1.6x faster than the shipping kernel, 0.266 against
+0.425 ms, with no widening. The wave32 row of that table is the shipping binary
+itself -- `narrow_tokens()` of `yah_ffn_gemm_iq3s_f32.loom` at `word_decode=1`, and
+the `widen_rows(_, 1)` chain, compile to the same SHA-256 hsaco at 40 VGPRs, 32
+SGPRs, 0 private memory and 512 B LDS.
+
+So the two levers are complementary but they apply to different shapes. For a long
+prompt, widen rows. For the 5-token prefill that ships today, do not widen rows;
+port to wave64.
+
+##### What this does not establish
+
+`hal_bench` is still one kernel on a quiet GPU, and the 128-token wave64 figure
+moved 40.9 -> 34.3 ms between sessions on an unchanged kernel, so the absolute
+column drifts by more than some of the gaps in the grid above. The ordering is
+from one interleaved session with the arms alternating. The paired full-pipeline
+A/B is still owed for both claims: the wave64 port at the production shape, and
+the 64x128 tile if a long-prompt path is added.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
