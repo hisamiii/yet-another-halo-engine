@@ -49,15 +49,17 @@ def wave64(text, tok):
     #   word-1col  the iq3s word decode: %r8 = shli %j_i, %c3i (8 rows/pass at
     #              wave32 via lane>>2), loop [0,2), collapsing to [0,1) at wave64
     #              because lane>>2 then spans 0..15 over 64 lanes.
-    # WARNING: the 1col-32j branch below is MEASURED PATHOLOGICAL. It compiles,
-    # chain_applies() accepts it for every FFN format, and a HAL set built from it
-    # at YAH_CHAIN_LEVEL=w64 did not finish a single B=2048 forward in 9.5 minutes
-    # (control on the shipped set: 27 s), with the process pinned at 100% CPU in
-    # system time and gpu_busy decaying to 10-20%. The cause is very likely the
-    # host-path cost discovered the same round (743,658 ioctl calls per forward,
-    # ~700-1000 per dispatch), which a changed launch geometry amplifies -- not the
-    # decode arithmetic, which is exact. Do NOT enable YAH_CHAIN_LEVEL=w64 until the
-    # host path is fixed, and re-verify with an argmax gate if you do.
+    # STATUS: CORRECT and ~1.18x on the layer loop for 10 of the 11 FFN formats.
+    # Bisected format-by-format at B=128 against argmax 11751 (baseline
+    # layers_ms 2033/2039): iq2xs, iq2xxs, iq3s, iq3xxs, iq4xs, q2k, q3k, q4k,
+    # q6k and q8_0 all produce 11751 at layers_ms 1722/1725. q5k alone is wrong
+    # (88) and is excluded by _chain, which fails loudly for it.
+    #
+    # An earlier note here called this transform MEASURED PATHOLOGICAL because a
+    # w64 set did not finish one B=2048 forward in 9.5 minutes. That was wrong:
+    # it was measured BEFORE the driver fix that stopped re-allocating and
+    # re-copying weights every layer, and the host path -- not this arithmetic --
+    # was the cause. Post-fix the same set runs normally.
     #   1col-32j   iq3xxs/iq4xs: e = lane + 32j walked over j in [0,8), one column
     #              per lane. At wave64 this must become e = lane + 64j over [0,4):
     #              the same 256 elements with the same addresses, only re-assigned

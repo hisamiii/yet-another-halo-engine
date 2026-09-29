@@ -465,6 +465,17 @@ def _chain(text, tile, n_row, loomfile='', level=None):
     # The level is per-source, not global: a caller must keep the FULL chain on the
     # sources that support it, or the emit silently drops their row groups.
     if (level or CHAIN_LEVEL) == 'w64':
+        # q5k is EXCLUDED: wave64 produces a numerically wrong kernel for it.
+        # Bisected format-by-format at B=128 against argmax 11751 -- iq2xs,
+        # iq2xxs, iq3s, iq3xxs, iq4xs, q2k, q3k, q4k, q6k and q8_0 all transform
+        # correctly; q5k alone gives 88. Its decode lane map is textually
+        # identical to q4k's (same [0,8) loop, same shli-by-5, same
+        # lane&15 / e>>4 mapping), and q5k is correct under token widening alone,
+        # so the fault is specific to the wave64 step and is not yet understood.
+        # Fail loudly rather than emit a silently wrong q5k.
+        if 'q5k' in os.path.basename(loomfile):
+            raise SystemExit(
+                'wave64: q5k is known-wrong (B=128 argmax 88 vs 11751); excluded')
         return text
     text = wr.widen_rows(text, n_row)
     # Last, and only for the shape the steps above produce: stage the IQ3_S
