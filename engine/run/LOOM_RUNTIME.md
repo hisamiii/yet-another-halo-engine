@@ -891,6 +891,52 @@ So 136 is what this tile allocates, and the 128-256 range is a plateau in time
 anyway (40.81 against 41.22 ms at a 2048-token total), which puts a bound of a few
 percent on winning one more tier.
 
+#### What the HIP kernels actually use
+
+The 192 figure is real, but it came from the ported tree rather than from a
+measurement here. Reading it out of the compiled device objects settles it. The
+backend writes the allocated count into the AMDGPU metadata (repeated as
+`.amdhsa_next_free_vgpr` in the ISA), so `llvm-readelf --notes` on the
+`-hip-amdgcn-amd-amdhsa-gfx1151.o` device object is authoritative:
+
+| kernel | wave | tile | VGPRs | allocated | SGPR | spill | private | LDS/wg |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `WKQuantA8BlockedWmmaGEMMKernel` Q4_K | 64 | 128x128 | **189** | **192** | 87 | 0 | 0 B | 20608 |
+| ... Q5_K | 64 | 128x128 | 188 | 192 | 87 | 0 | 0 B | 19456 |
+| ... Q8_0 | 64 | 128x128 | 176 | 176 | 26 | 0 | 0 B | 18432 |
+| ... IQ4_XS | 64 | 128x128 | 176 | 176 | 28 | 0 | 0 B | 18432 |
+| ... Q6_K | 64 | 128x128 | 175 | 176 | 87 | 0 | 0 B | 18432 |
+| ... IQ3_S | 64 | 128x128 | 169 | 176 | 87 | 0 | 0 B | 18432 |
+| ... IQ3_XXS | 64 | 128x128 | 169 | 176 | 87 | 0 | 0 B | 18432 |
+| ... Q4_K, wave32 twin | 32 | 128x128 | 205 | 208 | 30 | 0 | 0 B | 30720 |
+| ... IQ3_S, wave32 twin | 32 | 128x128 | 181 | 184 | 28 | 0 | 0 B | 27648 |
+| ... Q2_K, wave32 twin | 32 | 128x128 | 256 | 256 | 30 | **5** | 24 B | 35840 |
+| `HalfPrefillGemmKernel` Q4_K | 32 | 256x256 | **192** | 192 | 42 | 0 | 0 B | 24576 |
+| ... IQ3_XXS | 32 | 64x128 | 223 | 224 | 22 | 0 | 0 B | 12288 |
+
+The wave64 `WKQuantA8BlockedWmmaGEMMKernel` is the fast prefill path -- the one
+`TryLaunchQuantPrefillWave64` selects for `batch >= 96, m >= 1024` and the one behind
+the 3.18 ms/layer reference. It carries **169-189** VGPRs, Q4_K at 189, with 87 SGPRs
+and, notably, **zero spills and zero private memory on every arm**. So "HIP prefill
+uses 192" is literally correct for Q4_K: 189 used, 192 allocated, the granule being
+the only reason the round number appears.
+
+Two consequences that bound the sweep above.
+
+Wave64 does cut the bill at equal tile: the 128x128 IQ3_S arm is 181 VGPRs at wave32
+and 169 at wave64, Q4_K 205 -> 189. Halving the accumulator per lane is a real saving.
+It just is not a tier: `floor(32768 / (189 * 64)) = 2`, i.e. 128 resident lanes -- the
+*same* tier as the 384-token Loom tile at 176 that this section called past the knee.
+HIP spends those registers on in-wave ILP and accepts 128 lanes; the speedup lives
+inside a wave, not in more resident waves. Register count therefore does not separate
+the two implementations, and matching 192 is not itself a goal.
+
+Reproduce with `hipcc --save-temps -std=c++20 -O3 -DENGINE_ENABLE_HIP=1
+--offload-arch=gfx1151 -I gpu/ported -I engine -mwavefrontsize64 -c
+gpu/ported/src/models/qwen/hip/kernels/prefill_quant_wave64.hip` (drop the flag and
+use `prefill_quant_gemm.hip` for the wave32 twins), then `llvm-readelf --notes` on the
+emitted device object.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
