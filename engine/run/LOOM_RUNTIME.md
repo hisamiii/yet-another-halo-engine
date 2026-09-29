@@ -386,6 +386,27 @@ the view-bound verifier accepts and which the backend already lowered to
 factor 2 interleaved beats 4 and 8. The arm is latency-bound, not op-count
 bound: the clamps and the branchless rewrite measured ~0, and the whole kernel
 is ~42% issue-efficient against the 240 G warp-insn/s peak.
+### Hoisting the block decode (all formats)
+
+The kStore/SwiGLU/Residual element loop maps lane `l` to `(row, col)` with
+`e = l + j*32`, so `col = e & 15 = l & 15` is constant across the 8 `j`
+iterations and `i = kbase + col` is loop-invariant. Every port recomputed the
+whole `group/half/q/which/l/lw` decode per element anyway. A small dataflow
+pass (rewrite `c_i` to `lane & 15`, hoist every statement whose defs no longer
+depend on `j`, add `unroll(2) schedule(interleaved)` to the element loop) was
+applied to all 27 GEMM files. It is **bit-identical** (final residual max_abs
+0.0, argmax 11751) and takes the prefill from ~1206 ms to **~765 ms**, with the
+IQ3_S kStore alone 172 -> 117 ms.
+
+`unroll(%N)` without `schedule(interleaved)` is *slower* (485 insns, VGPR spill);
+factor 2 interleaved beats 4 and 8. Re-associating the per-block byte offsets
+(`blk_off + 2 + g8 + lw` -> `blk_off + (2+g8+lw)`) on top measured ~0.6%, within
+run-to-run noise, so it is not kept. The arm is latency-bound: clamps and
+branchless rewrites measured ~0, and the kernel is ~42% issue-efficient against
+the 240 G warp-insn/s peak.
+
+Current prefill: **~765 ms** against the HIP `best_ms` of 389.8-415 ms, i.e.
+~1.9x, down from 4407 ms for the first correctness-first port.
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
