@@ -857,6 +857,40 @@ tile width (trip count tok/4, stride 64, row/token decode shifting by log2(tok) 
 masking tok-1) and the fixture still passes, but a widened check case remains owed
 before any wide-tile number is treated as final.
 
+#### Trying exactly 192 VGPRs
+
+The 384-token tile lands at 176 VGPRs, which is essentially the 192 figure often
+quoted as this architecture's sweet spot. It is also the slowest of the widths
+measured, and the arithmetic says why: for wave64 the residency tier is
+`floor(32768 / (VGPRs * 64))`, so tier 2 spans roughly 171-256 VGPRs and 176 and 192
+are the **same tier**. Adding 16 registers to reach 192 buys no occupancy at all.
+
+The numbers worth aiming at are the tier boundaries, and the nearest one is 8
+registers below the 256-token tile:
+
+| tile | VGPRs | tier | lanes | to next tier |
+| ---: | ---: | ---: | ---: | --- |
+| 128 | 80 | 6 | 384 | 7 -> tier 7 (448) |
+| 256 | 136 | 3 | 192 | 8 -> tier 4 (256) |
+| 384 | 176 | 2 | 128 | 6 -> tier 3 (192) |
+| 512 | 216 | 2 | 128 | 46 |
+
+Two attempts to find those 8 registers, both CPU-only:
+
+- reordering rhs loads against their MMAs: **136 VGPRs, 75 moves and a 67-unit
+  `branch_edge` either way.** The backend schedules to its own preference and the
+  source order does not survive, as it did not on wave32.
+- folding the per-sub-tile address registers into immediate offsets: **not
+  possible.** The activation layout is strided with k fastest, so consecutive
+  16-token sub-tiles are `16 * ktot * 2` = 163840 bytes apart, far beyond the
+  4096-byte immediate offset field. Each sub-tile needs its own 32-bit address
+  register; the disassembly shows 16 distinct ones, each feeding a 128-bit load
+  plus an `offset:16` for the second half.
+
+So 136 is what this tile allocates, and the 128-256 range is a plateau in time
+anyway (40.81 against 41.22 ms at a 2048-token total), which puts a bound of a few
+percent on winning one more tier.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
