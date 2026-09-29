@@ -455,7 +455,12 @@ def _chain(text, tile, n_row, loomfile='', level=None):
         text = pwd.port(text, tile)
     if 'scf.if %wd_old' in text:
         text = bf.drop_branch(text, 'word')
-    text = w64.wave64(text, tile)
+    # 'rows' stops short of the wave64 port: the row-group rewrite below works on
+    # the wave32 one-column-per-lane map directly (j in [0,32) puts row =
+    # (lane>>4) + 2j across all 64 rows of a 4-row-group tile), and wave64 measured
+    # SLOWER at B=2048, so bundling it in would hide the row-group result.
+    if (level or CHAIN_LEVEL) != 'rows':
+        text = w64.wave64(text, tile)
     # YAH_CHAIN_LEVEL=w64 stops here, after the wave64 port. The row-group and LDS
     # staging steps assume the iq3s decode's lane map (lane>>2 spans ROWS_PER_PASS
     # rows, one row per lane over a 64-row tile); the one-column-per-lane formats
@@ -478,6 +483,20 @@ def _chain(text, tile, n_row, loomfile='', level=None):
                 'wave64: q5k is known-wrong (B=128 argmax 88 vs 11751); excluded')
         return text
     text = wr.widen_rows(text, n_row)
+    if (level or CHAIN_LEVEL) == 'rows':
+        # TRANSFORM COMPLETE, KERNEL DOES NOT YET COMPILE. widen_rows now supports
+        # the one-column-per-lane map (row = (lane>>4) + 2j over j in [0,32)), so
+        # this produces the right row-group form for iq3xxs/iq4xs/q4k/q3k/q6k.
+        # But emit_hal.py inlines configs as constants, and the resulting
+        # scattered GLOBAL byte gathers fail the non-negativity proof:
+        #   error [SUBRANGE/023]: view.load footprint origin lower bound is not
+        #   proven on view axis 0 (the %qlo/%qh/%sg/%sc %w_view loads)
+        # The LDS staging step (lds_stage_iq3s) is what makes those loads provable,
+        # which is why the chain has always bundled it. Porting that step to the
+        # 98-byte IQ3_XXS block is the remaining work: without it this level
+        # cannot emit. Failure is loud (the emit aborts); it is not a silent
+        # wrong kernel.
+        return text
     # Last, and only for the shape the steps above produce: stage the IQ3_S
     # weight block in LDS. That transform is format-specific (110-byte block) and
     # lives in its own generator, which is run as a filter so its proven

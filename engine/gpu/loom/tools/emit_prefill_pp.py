@@ -115,14 +115,20 @@ def main():
         # emit silently regresses the already-chained iq3s HALs.
         full = ((E.chain_applies(f, tile=TILE, level="full") if CHAIN else False)
                 and mt % ROWGRP == 0)
-        w64 = (E.chain_applies(f, tile=TILE, level="w64")
-               if (CHAIN and LEVEL == "w64") else False)
-        use = full or w64
+        # The reduced levels are a FALLBACK for sources that cannot take the full
+        # chain: a source that can must keep it, or the emit silently drops the
+        # row groups it already had.
+        alt_level = LEVEL if LEVEL in ("rows", "w64") else None
+        alt = (E.chain_applies(f, tile=TILE, level=alt_level)
+               if (CHAIN and alt_level) else False)
+        chain_level = "full" if full else (alt_level if alt else None)
+        use = chain_level is not None
         # widenable: every source widen_tokens can widen, chained or not. The row
         # group still requires the chain (widen_rows), so rowgrp stays 1 without it.
         tile = TILE if (use or WIDEN_ALL) else 64
         tt = B // tile
-        rowgrp = ROWGRP if full else 1
+        # 'rows' applies widen_rows, so it keeps the row-group grid; 'w64' does not.
+        rowgrp = ROWGRP if chain_level in ("full", "rows") else 1
         sym = E.sym_of(f)
         if kind == "kstore":
             cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
@@ -143,7 +149,7 @@ def main():
                    "%s.token_tiles=%d" % (sym, tt)]
             out = "gemm_swiglu_%s_%d_%d.hal" % (fmt, mt, kb)
         E.emit(f, cfg, out, outdir, widen=tile, chain=use,
-               chain_level=("full" if full else "w64"))
+               chain_level=(chain_level or "full"))
         geom.append((out, tile, rowgrp, tt))
         # YAH_KSTORE_RESIDUAL=1 additionally emits the CHAINED kStore HAL for
         # every residual shape, so a driver can run those projections on the fast
@@ -155,12 +161,13 @@ def main():
         if kind == "residual" and os.environ.get("YAH_KSTORE_RESIDUAL") != "off":
             kf = "yah_ffn_gemm_%s_f32.loom" % port
             kfull = E.chain_applies(kf, tile=TILE, level="full") and mt % ROWGRP == 0
-            kw64 = (E.chain_applies(kf, tile=TILE, level="w64")
-                    if LEVEL == "w64" else False)
-            kuse = kfull or kw64
+            kalt = (E.chain_applies(kf, tile=TILE, level=alt_level)
+                    if alt_level else False)
+            kchain_level = "full" if kfull else (alt_level if kalt else None)
+            kuse = kchain_level is not None
             ktile = TILE if (kuse or WIDEN_ALL) else 64
             ktt = B // ktile
-            krowgrp = ROWGRP if kfull else 1
+            krowgrp = ROWGRP if kchain_level in ("full", "rows") else 1
             ksym = E.sym_of(kf)
             kcfg = ["%s.m_tiles=%d" % (ksym, mt), "%s.k_blocks=%d" % (ksym, kb),
                     "%s.token_tiles=%d" % (ksym, ktt)]
@@ -168,7 +175,7 @@ def main():
                 kcfg.append("%s.word_decode=%d" % (ksym, 1))
             kout = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
             E.emit(kf, kcfg, kout, outdir, widen=ktile, chain=kuse,
-                   chain_level=("full" if kfull else "w64"))
+                   chain_level=(kchain_level or "full"))
             geom.append((kout, ktile, krowgrp, ktt))
         n += 1
 

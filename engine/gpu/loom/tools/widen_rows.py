@@ -56,14 +56,48 @@ def _one(text, pat, rep, count=1, flags=0):
     return new
 
 
-def widen_rows(text, n_row=2):
+def widen_rows(text, n_row=2, style=None):
     m = re.search(r'subgroup_size = (\d+)', text)
     if not m:
         raise SystemExit('no subgroup_size')
     wave = int(m.group(1))
     if wave not in ROWS_PER_PASS:
         raise SystemExit('unsupported wave size %d' % wave)
-    rpp = ROWS_PER_PASS[wave]
+
+    # The decode's lane map decides how many rows one pass covers, and therefore
+    # how many passes a 16*n_row-row tile needs.
+    #   word-1col  only the iq3s word decode: %r8 = shli %j_i, %c3i already, with
+    #              row = (lane>>2) + 8j, so a pass covers ROWS_PER_PASS[wave] rows.
+    #   1col-32j   iq3xxs/iq4xs/q4k/q3k/...: e = lane + 32j walked over j in [0,8)
+    #              with row = e>>4, so a pass covers only TWO rows and a 64-row
+    #              tile needs 32 passes. Rewrite it into the separable form the
+    #              rest of this transform expects: row = (lane>>4) + 2j. That is
+    #              exact, not an approximation -- lane = 16a + b with a = lane>>4
+    #              and b < 16, so (lane + 32j)>>4 = a + 2j + (b>>4) = a + 2j, and
+    #              the column is lane&15 either way, independent of j. The same
+    #              256 elements are decoded, just re-associated, so this stays
+    #              bit-identical.
+    if style is None:
+        if '%r8 = scalar.shli %j_i, %c3i : i32' in text:
+            style = 'word-1col'
+        elif '%j32 = scalar.shli %j_i, %c5i : i32' in text:
+            style = '1col-32j'
+        else:
+            raise SystemExit('widen_rows: unrecognised decode lane map')
+    if style == '1col-32j':
+        text, nremap = re.subn(
+            r'( *)%j32 = scalar\.shli %j_i, %c5i : i32\n'
+            r' *%e_i = scalar\.addi %lane_i, %j32 : i32\n'
+            r' *%r_i = scalar\.shrui %e_i, %c4i : i32',
+            r'\1%row0 = scalar.shrui %lane_i, %c4i : i32\n'
+            r'\1%r8 = scalar.shli %j_i, %c1i : i32\n'
+            r'\1%r_i = scalar.addi %row0, %r8 : i32',
+            text)
+        if nremap != 1:
+            raise SystemExit('1col-32j row map matched %d times' % nremap)
+        text = '\n'.join(_ensure_scalar(text.split('\n'), 1))
+
+    rpp = ROWS_PER_PASS[wave] if style == 'word-1col' else 2
     m = re.search(r'%tokens = index\.mul %token_tiles, %c(\d+)', text)
     if not m:
         raise SystemExit('no token width')
@@ -99,14 +133,19 @@ def widen_rows(text, n_row=2):
 
     # --- one decode pass per ROWS_PER_PASS rows; the row shift is the lane map's
     # wave32 starts at two passes and wave64 at one; both become 16*n_row/ROWS_PER_PASS
+    # A 32-pass decode must not be fully unrolled: the body is the heavy IQ
+    # quantiser, and unrolling it 32x is all code and no scheduling win.
+    unroll_n = passes if style == 'word-1col' else min(passes, 4)
     newloop = ('scf.for %j = [%c0 to %c' + str(passes) + ' step %c1](%mk = %c0 : index) -> (index) '
-               'unroll(%c' + str(passes) + ') schedule(interleaved) {')
+               'unroll(%c' + str(unroll_n) + ') schedule(interleaved) {')
     text, nloop = re.subn(
         r'scf\.for %j = \[%c0 to %c\d+ step %c1\]\(%mk = %c0 : index\) -> \(index\) unroll\(%c\d+\) schedule\(interleaved\) \{',
         lambda m: newloop, text)
     if nloop != 1:
         raise SystemExit('word-decode row loop matched %d times' % nloop)
-    text = _one(text, r'%r8 = scalar\.shli %j_i, %c3i : i32',
+    # The row step is now style-dependent: 8 or 16 rows per pass for the word
+    # decode, 2 for the one-column-per-lane map remapped above.
+    text = _one(text, r'%r8 = scalar\.shli %j_i, %c\d+i : i32',
                 '%%r8 = scalar.shli %%j_i, %%c%di : i32' % (rpp.bit_length() - 1))
 
     # --- one lhs fragment per row tile, all out of the one LDS tile
