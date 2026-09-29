@@ -416,6 +416,114 @@ def iq3s_setup():
     return L
 
 
+def iq3xxs_loads(p, blk, gb):
+    """block_iq3_xxs (98 B): d f16 @0, qs[64] @2 (grid indices), aux[32] @66
+    (one LE32 word per 32-element group). Group g reads qs[8g..8g+7] and aux
+    bytes 66+4g..69+4g."""
+    L = []
+    e = L.append
+    vals = []
+    _ldd(e, p, blk)
+    vals.append((f"%{p}dh", "f16"))
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}g8_{u} = scalar.shli %{p}g{u}, %c3i : i32")
+        e(f"    %{p}qo{u} = scalar.addi {blk}, %{p}g8_{u} : i32")
+        e(f"    %{p}qo2_{u} = scalar.addi %{p}qo{u}, %c2i : i32")
+        _ldv(e, p, f"qs{u}", f"%{p}qo2_{u}", 8)
+        vals.append((f"%{p}qs{u}", "vector<8xi8>"))
+        e(f"    %{p}g4_{u} = scalar.shli %{p}g{u}, %c2i : i32")
+        e(f"    %{p}ao{u} = scalar.addi {blk}, %{p}g4_{u} : i32")
+        e(f"    %{p}ao2_{u} = scalar.addi %{p}ao{u}, %c66i : i32")
+        _ldv(e, p, f"ax{u}", f"%{p}ao2_{u}", 4)
+        vals.append((f"%{p}ax{u}", "vector<4xi8>"))
+    return L, vals
+
+
+def iq3xxs_compute(v, gb):
+    """The chained kernel's IQ3_XXS element decode, one row per lane. Element
+    lw*4 + b of group g (lw = 2*l + which):
+      gword = grid[qs[8g+lw]],  aux = LE32(aux bytes of g)
+      sign_nib = (ksigns[(aux >> 7l) & 127] >> 4*which) & 15, s = (sign_nib >> b) & 1
+      mag = ((gword >> 8b) & 255 ^ -s) + s
+      value = (d * ((f32(aux >> 28) + 0.5) * 0.5)) * f32(mag)"""
+    L = []
+    e = L.append
+    it = iter(v)
+    dh = next(it)
+    e(f"    %d = scalar.extf {dh} : f16 to f32")
+    for u in range(GPL):
+        qs = next(it); ax = next(it)
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %axw{u} = vector.bitcast {ax} : vector<4xi8> to vector<1xi32>")
+        e(f"    %aux{u} = vector.extract %axw{u}[0] : vector<1xi32> -> i32")
+        e(f"    %n4_{u} = scalar.shrui %aux{u}, %c28i : i32")
+        e(f"    %n4f_{u} = scalar.sitofp %n4_{u} : i32 to f32")
+        e(f"    %hp_{u} = scalar.addf %n4f_{u}, %fhalf : f32")
+        e(f"    %hp2_{u} = scalar.mulf %hp_{u}, %fhalf : f32")
+        e(f"    %dsc{u} = scalar.mulf %d, %hp2_{u} : f32")
+        hs = []
+        for lw in range(8):
+            l, which = lw // 2, lw % 2
+            t = f"{u}_{lw}"
+            e(f"    %qlo8_{t} = vector.extract {qs}[{lw}] : vector<8xi8> -> i8")
+            e(f"    %qlo_{t} = scalar.extui %qlo8_{t} : i8 to i32")
+            e(f"    %gix_{t} = index.cast %qlo_{t} : i32 to index")
+            e(f"    %gil_{t} = index.max %gix_{t}, %c0 : index")
+            e(f"    %gid_{t} = index.min %gil_{t}, %c255 : index")
+            e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<256xi32> -> i32")
+            if which == 0:
+                e(f"    %sid0_{u}_{l} = scalar.shrui %aux{u}, %c{7 * l}i : i32")
+                e(f"    %sid_{u}_{l} = scalar.andi %sid0_{u}_{l}, %c127i : i32")
+                e(f"    %sidx_{u}_{l} = index.cast %sid_{u}_{l} : i32 to index")
+                e(f"    %sidl_{u}_{l} = index.max %sidx_{u}_{l}, %c0 : index")
+                e(f"    %sidc_{u}_{l} = index.min %sidl_{u}_{l}, %c127 : index")
+                e(f"    %ks8_{u}_{l} = view.load %ksigns_view[%sidc_{u}_{l}] : view<128xi8> -> i8")
+                e(f"    %sgb_{u}_{l} = scalar.extui %ks8_{u}_{l} : i8 to i32")
+            e(f"    %snt_{t} = scalar.shrui %sgb_{u}_{l}, %c{4 * which}i : i32")
+            e(f"    %sn_{t} = scalar.andi %snt_{t}, %c15i : i32")
+            for b in range(4):
+                x = f"{t}_{b}"
+                e(f"    %gb0_{x} = scalar.shrui %gw_{t}, %c{8 * b}i : i32")
+                e(f"    %gby_{x} = scalar.andi %gb0_{x}, %c255i : i32")
+                e(f"    %sb0_{x} = scalar.shrui %sn_{t}, %c{b}i : i32")
+                e(f"    %sb_{x} = scalar.andi %sb0_{x}, %c1i : i32")
+                e(f"    %ng_{x} = scalar.subi %c0i, %sb_{x} : i32")
+                e(f"    %mg0_{x} = scalar.xori %gby_{x}, %ng_{x} : i32")
+                e(f"    %mg_{x} = scalar.addi %mg0_{x}, %sb_{x} : i32")
+                e(f"    %mf_{x} = scalar.sitofp %mg_{x} : i32 to f32")
+                e(f"    %vv_{x} = scalar.mulf %dsc{u}, %mf_{x} : f32")
+                e(f"    %hv_{x} = scalar.fptrunc %vv_{x} : f32 to f16")
+                hs.append(f"%hv_{x}")
+        _store_group(e, u, hs)
+    return L
+
+
+def _stage_table(name, src, n, ty, bytes_per):
+    """Copy an n-entry read-only table into workgroup memory once; the first K
+    phase's leading barrier publishes it."""
+    return [f"  %{name}_g = buffer.view {src}[%base] : buffer -> view<{n}x{ty}>",
+            f"  %{name}_bytes = index.constant {n * bytes_per} : offset",
+            f"  %{name}_l = buffer.alloca<workgroup> align(16) %{name}_bytes : buffer",
+            f"  %{name}_view = buffer.view %{name}_l[%base] : buffer -> view<{n}x{ty}>",
+            f"  %{name}_n1 = index.constant {n - 1} : index",
+            f"  %{name}_step = index.constant {64 * NW} : index",
+            f"  %{name}_cnt = index.constant {n} : index",
+            f"  %{name}_sink = scf.for %{name}_i = [%c0 to %{name}_cnt step %{name}_step](%{name}_m = %c0 : index) -> (index) {{",
+            f"    %{name}_x0 = index.add %{name}_i, %tid : index",
+            f"    %{name}_x = index.min %{name}_x0, %{name}_n1 : index",
+            f"    %{name}_v = view.load %{name}_g[%{name}_x] : view<{n}x{ty}> -> {ty}",
+            f"    view.store %{name}_v, %{name}_view[%{name}_x] : {ty}, view<{n}x{ty}>",
+            f"    scf.yield %{name}_m : index",
+            "  }"]
+
+
+def iq3xxs_setup():
+    return (["  %fhalf = scalar.constant 0.5 : f32"]
+            + _stage_table("grid", "%grid_na", 256, "i32", 4)
+            + _stage_table("ksigns", "%ksigns_na", 128, "i8", 1))
+
+
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
     L.append("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
@@ -432,6 +540,7 @@ FMTS = {
     #          pushes 8 accumulators into scratch (3151 private ops/work-item)
     "iq4xs": dict(bb=136, ksub=128, decode=(iq4xs_loads, iq4xs_compute), extra=[], setup=iq4xs_setup),
     "iq3s": dict(bb=110, ksub=64, decode=(iq3s_loads, iq3s_compute), extra=["grid"], setup=iq3s_setup),
+    "iq3xxs": dict(bb=98, ksub=64, decode=(iq3xxs_loads, iq3xxs_compute), extra=["grid", "ksigns"], setup=iq3xxs_setup),
 }
 
 
@@ -471,7 +580,7 @@ def gen(fmt, kind="kstore"):
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512):
         e(f"  %c{v} = index.constant {v} : index")
-    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 24, 32, 66, 74, 106, 255):
+    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 21, 24, 28, 32, 66, 74, 106, 127, 255):
         e(f"  %c{v}i = scalar.constant {v} : i32")
     e(f"  %cbb = index.constant {bb} : index")
     e(f"  %cbbh = index.constant {bb // 2} : index")
@@ -709,7 +818,6 @@ def gen(fmt, kind="kstore"):
         e("    %j32b = scalar.shli %j2_i, %c6i : i32")
         e("    %e2_i = scalar.addi %l64_i, %j32b : i32")
         e("    %r2_i = scalar.shrui %e2_i, %c7i : i32")
-        e("    %c127i = scalar.constant 127 : i32")
         e("    %tok_i = scalar.andi %e2_i, %c127i : i32")
         e("    %r2_ix = index.cast %r2_i : i32 to index")
         e("    %r2 = index.max %r2_ix, %c0 : index")
