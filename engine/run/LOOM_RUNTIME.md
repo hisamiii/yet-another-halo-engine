@@ -622,6 +622,49 @@ ablations above) and decode *count* (4x more: 32 re-decodes per element against
 8). The "at long prompts the MMA dominates" intuition does not hold for either
 engine; only a wider tile moves the share.
 
+### The tile width is the decode lever, not the prompt length
+
+Why not just use a 64- or 256-token tile? It is a register budget, and it works.
+
+One accumulator fragment per 16 tokens costs 8 f32 per lane (a 16x16 WMMA output
+tile spread over 32 lanes), so the tile a workgroup can hold is set by how many
+fragments fit. IQ3_S kStore, m_tiles=1088, k_blocks=20, 2048 tokens, decode
+ablated by `emit_prefill.ablate_decode`:
+
+| tile | fragments | VGPRs | full | decode removed | decode | share |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 (narrowed) | 1 | 40 | 197.2 | 28.3 | 168.9 | 85.6% |
+| 64 | 4 | 80 | 82.7 | 33.5 | 49.2 | 59.5% |
+| 128 | 8 | 128 | 52.4 | 34.8 | 17.6 | 33.6% |
+| 256 | 16 | 208 | **48.0** | 37.8 | 10.3 | **21.4%** |
+
+The widened sources come from `tools/widen_tokens.py` (the inverse of
+`narrow_tokens`: it duplicates the independent N sub-tiles), and every shape was
+gated by `safe_bench.py --check-only` before anything was dispatched.
+
+Three things fall out:
+
+- The decode count falls as predicted -- 4x fewer re-decodes at 256 than at 64 --
+  and the share falls with it, to 21.4% against HIP end-to-end 21.7%. **At a
+  matched tile width the decode share gap is closed.**
+- The ceiling is registers. 208 VGPRs is near the architectural 256, and the
+  structural part of the kernel gets *slower* as the tile widens (33.5 -> 37.8 ms)
+  because occupancy falls about 2.4x. That is why 256 is 1.7x better than 64 and
+  not 4x.
+- What remains after the tile fix is not the decode. At 256 tokens per workgroup
+  the kernel does 365 GFLOP in 48.0 ms, 7.6 TFLOPS, against the 40.6 TFLOPS the
+  HIP kernel reaches at the same shape. The shares match; the remaining ~5x is
+  GEMM efficiency -- occupancy at 208 VGPRs, no software pipelining, single-
+  buffered LDS staging.
+
+Caveats, because these are feasibility numbers and not a shipped kernel. The
+widened variants are verified structurally only: they compile, their declared
+footprints fit, and they run, but no numerical reference exists for a 128- or
+256-token tile, so a widened `check.case` is owed before any of it is trusted.
+And the prefill driver still cannot run 2048 tokens at all -- `kB` is 5 with
+hardcoded ids, and the attention path has to become causal over 2048 keys before
+an end-to-end number exists.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
