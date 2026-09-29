@@ -18,6 +18,12 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/yah_hrx.cc" \
     -o "$root/engine/build/yah-hrx" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
+# Single-kernel timing harness. Built here so it cannot drift from the tree; it
+# is not covered by the CMake target and it is the tool whose missing z dimension
+# wedged the GPU ring (see engine/run/hal_bench.cc).
+g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
+    -o "$root/engine/build/hal_bench" "$root/engine/build/libyah_core.a" \
+    -L"$libhrx" -lhrx -licuuc -lpthread
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"

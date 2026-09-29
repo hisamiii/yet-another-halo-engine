@@ -487,59 +487,92 @@ captured from HIP) passes, the all-zero production case still returns exactly 0,
 and the full 64-layer prefill output is **bit-identical** to the pre-word build
 (argmax 11751).
 
-**The isolated numbers do not carry to the pipeline, in either direction.** A
-five-way interleaved A/B, medians of three runs each, every arm bit-identical
+**Timing has to be taken at the right grid.** The first conclusion drawn here
+was that isolated timing inverts the pipeline ordering. That was wrong, and the
+cause is worth recording: the residual arm splits K onto the grid's z dimension
+(`workgroups(m_tiles, token_tiles, k_split)`) and the bench harness only had an x
+dimension, so the residual was measured at one K-split of four. A quarter grid is
+occupancy-starved, where the word decode's shorter instruction stream wins; at
+the full grid the ordering matches the pipeline:
+
+| kernel | m_tiles | k_blocks | grid | old | new |
+| --- | ---: | ---: | --- | ---: | ---: |
+| residual | 320 | 68 | 320x1x4 full | 1.8831 | 2.0629 (**9.6% slower**) |
+| residual | 320 | 68 | 320x1x1 quarter | 0.5705 | 0.2430 (2.35x faster -- artifact) |
+| kStore raw | 1088 | 20 | 1088x1x1 | 1.9628 | 1.7369 (1.13x faster) |
+| kStore narrowed | 1088 | 20 | 1088x1x1 | 1.6746 | 1.5449 (1.08x faster) |
+| kStore raw | 384 | 20 | 384x1x1 | 0.9755 | 0.4741 (2.06x faster) |
+| kStore raw | 3 | 20 | 3x1x1 | 0.4929 | 0.2078 (2.37x faster) |
+
+The residual and swiglu word decode were reverted: at the full grid they are
+slower in isolation *and* in the pipeline, so that decision now rests on both
+surfaces rather than one. Note also that the pipeline runs the
+`narrow_tokens`-rewritten kernel (16-wide tokens), which is a different kernel
+from the raw source; both are listed above.
+
+Paired pipeline A/B, medians of three interleaved runs, every arm bit-identical
 (argmax 11751):
 
-| HAL set | layers_ms | mixer | ffn gate | ffn down |
-| --- | ---: | ---: | ---: | ---: |
-| previous | 670.8 | 290.2 | 120.4 | 115.2 |
-| word decode everywhere | 671.1 | 275.3 | 132.5 | 117.0 |
-| word decode on kStore at 384/640/768 only | **660.0** | 276.8 | 121.0 | 116.0 |
+| HAL set | layers_ms | mixer | ffn gate |
+| --- | ---: | ---: | ---: |
+| previous | 643.4 | 292.7 | 109.3 |
+| per-geometry selection | **626.5** | 274.2 | 108.9 |
+| word decode everywhere | 644.5 | 273.7 | 126.0 |
 
-The kStore word decode is worth ~15 ms in the mixer and costs ~12 ms in the FFN
-gate, so the net is near zero unless the choice is made per geometry; repeated
-paired runs put the selected set 11-15 ms ahead (the machine drifts ~5 ms between
-batches, so only the paired difference is meaningful).
+The kStore word decode is worth ~18 ms in the mixer. It costs ~17 ms in the FFN
+gate, which is the one arm still out of step: at `m_tiles=1088` the pipeline says
+the word decode loses 16.7 ms while the isolated narrowed kernel at the correct
+grid with pattern data says it wins 1.08x. Unresolved; the per-geometry selection
+sidesteps it rather than explaining it.
 
-The same transform applied to the two **reusing** arms is a straight loss even
-though it is a 2.35x isolated win:
-
-| kernel | m_tiles | k_blocks | old | new | in-situ arm |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| residual | 320 | 68 | 0.5705 | 0.2430 | down 115.2 -> 136.6 (**+21 ms**) |
-| residual | 320 | 24 | 0.2094 | 0.0934 | (same arm as above) |
-| swiglu | 1088 | 20 | - | - | up 127.6 -> 135.7 (**+8 ms**) |
-
-Both were reverted. This is the sharpest form of the pattern: a 2.35x isolated
-speedup becomes a 15% in-situ regression on the same kernel, same config, same
-data and bit-identical output. `hal_bench` runs the kernel back to back on an
-idle GPU with degenerate weights (every byte `0x01`, so `d` is a subnormal and
-the grid indices collapse to a handful of entries) and a never-initialised
-activation buffer. A number from it is a hypothesis, not a result; only the
-paired full-pipeline A/B is a result. Earlier "measured" entries in
-`docs/reference/README.md` came from this harness and should be re-checked
-before they are relied on.
-
-The selection is now a config, so the good set is reproducible from source:
+The selection is a config, so the good set is reproducible from source:
 `yah_ffn_gemm_iq3s.word_decode` (0 = one element per lane, 1 = word) wraps the
 two decode bodies in an `scf.if` on a compile-time constant, and
 `emit_prefill.py` binds `0` at `m_tiles=1088` and `1` elsewhere. The fold is
 exact: `word_decode=0` emits byte-for-byte the previous kernel's HSACO and
 `word_decode=1` the new one, so every emitted HAL is one of those two machine
-codes and there is no third variant. The re-emitted directory is byte-identical
-to the hand-assembled hybrid, and reproduces 662.9 ms against 675.8 ms for the
-previous source in a later paired run. The emitted set is kept at `/home/q/yah-hal-t16-wd` (the machine drift
-baseline for it is `/home/q/yah-hal-t16`). The decode set is emitted from the
-same source (`emit_decode.py` reuses `emit_prefill.py`), and `engine/tests/generate_gate.sh`
-still passes the 20-token reference with the new selection.
+codes. The emitted set is kept at `/home/q/yah-hal-t16-wd` with
+`/home/q/yah-hal-t16` as its drift baseline. The decode set comes from the same
+source and `engine/tests/generate_gate.sh` still passes the 20-token reference.
 
 Remaining split at `m_tiles=1088`: 1.729 ms with the word decode and 1.947 ms
 without, and 0.861 ms with the decode replaced by `d`, so the decode is ~46% of
-the kernel and the structural rhs/MMA/epilogue ~54%. The rhs fragment loads
-themselves are ~0-6%: this kernel is not activation-bandwidth-bound in isolation.
-The 2.4x HIP dequant gap quoted above is therefore closed on paper at 384/640/768
-and open at 1088.
+the kernel and the structural rhs/MMA/epilogue ~54%. The 2.4x HIP dequant gap
+quoted above is closed on paper at 384/640/768 and open at 1088.
+
+### Benchmarking took the box down twice
+
+Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
+were operand extents that the arithmetic said were fine and were not: an input
+sized for `k_blocks=20` (655360 B) reused at `k_blocks=68`, and an output of
+`m_rows*tokens*4` when a `k_split=4` residual writes `m_rows*k_split*tokens*4`.
+An extent past the end of an allocation on this target does not fault -- the
+shader reads unmapped VA, never returns, and hangs with no page fault for the
+driver to report, so `gfx_0.1.0` times out, MES stops answering `msg=RESET` and
+the machine resets.
+
+Three things now stand between that and another reboot:
+
+- `tools/safe_bench.py` compiles the source under the same config, reads the
+  footprint the compiler recorded
+  (`source_low.memory.roots[].interval_envelope.byte_count`, the surface
+  `loom_preflight.py` already uses) and refuses unless every operand fits the
+  buffer it will be handed. It is what found the `k_split` output term, with no
+  dispatch and no GPU.
+- `engine/run/hal_bench.cc` computes no size of its own any more: sizes are
+  parameters and the grid is checked against the shape (`gx*16 <= m_rows`,
+  `gz <= k_blocks`) before anything is submitted. K splits live on gz, so folding
+  one into gx walks the m origin off the end of the weight.
+- `engine/run/gpu_run.sh` snapshots `dmesg` before and after a command and tails
+  it into a log for the duration, because a bad dispatch kills the process without
+  printing anything. After a reboot the previous boot's log survives in the
+  journal: `doas journalctl -k -b -1 --no-pager | grep -iE 'amdgpu|MES|reset'`.
+  Logs from both incidents are in `/home/q/yah-scratch/gpu-*.dmesg.log`.
+
+`hal_bench` is a hypothesis generator regardless of how it is sized: one kernel,
+on a quiet GPU, with no other dispatch in flight. Only the paired full-pipeline
+A/B is a result, and the machine drifts enough between batches (up to ~30 ms on
+the same HAL set) that only interleaved paired differences should be read.
 
 ## 7. Decode and the HIP removal
 
