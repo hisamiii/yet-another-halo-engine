@@ -88,6 +88,7 @@ kernel.def target(@yah_wave32) @yah_attn_wmma() {
   %c4 = index.constant 4 : index
   %c32 = index.constant 32 : index
   %zero = scalar.constant 0.0 : f32
+  %zerov4 = vector.constant 0.0 : vector<4xf32>
   %one = scalar.constant 1.0 : f32
   %negone = scalar.constant -1.0 : f32
   %guard = scalar.constant 1.0000000000000001e-09 : f32
@@ -150,16 +151,27 @@ kernel.def target(@yah_wave32) @yah_attn_wmma() {
     } else {
       scf.yield %can_off : index
     }
-    %dot = scf.for %d = [%c0 to %head_dim step %c1](%acc = %zero : f32) -> (f32) {
+    // Four channels per load. Scalar f16 loads of this row cost one L1
+    // transaction per (lane, channel) -- 32 lanes reading 2 B each from 32
+    // different 64 B lines -- and phase 1 measured 3977 ms of the 8579 ms
+    // attention at B=2048 against PV's 2217 ms for the same MAC count. A
+    // vector<4xf16> load takes four channels per instruction from one line, so
+    // the transaction count per key row falls by 4x. head_dim must be a multiple
+    // of 4 for the row to be covered exactly (256 and the 4-channel fixture both
+    // are); the four per-channel partial sums are combined by vector.reduce at
+    // the end, so the sum is reassociated and the check cases' 1e-5 gate is what
+    // holds the arithmetic, not bit-identity.
+    %dotv = scf.for %d = [%c0 to %head_dim step %c4](%acc4 = %zerov4 : vector<4xf32>) -> (vector<4xf32>) {
       %q_off = index.add %q_base, %d : index
-      %q_val = view.load %q_view[%q_off] : view<[%q_total]xf32> -> f32
+      %q4 = vector.load %q_view[%q_off] : view<[%q_total]xf32> -> vector<4xf32>
       %k_off = index.add %off_k, %d : index
-      %k16v = view.load %k_view[%k_off] : view<[%cache_elems]xf16> -> f16
-      %k_val = scalar.extf %k16v : f16 to f32
-      %prod = scalar.mulf %q_val, %k_val : f32
-      %next = scalar.addf %acc, %prod : f32
-      scf.yield %next : f32
+      %k4 = vector.load %k_view[%k_off] : view<[%cache_elems]xf16> -> vector<4xf16>
+      %k4f = vector.extf %k4 : vector<4xf16> to vector<4xf32>
+      %prod4 = vector.mulf %q4, %k4f : vector<4xf32>
+      %next4 = vector.addf %acc4, %prod4 : vector<4xf32>
+      scf.yield %next4 : vector<4xf32>
     }
+    %dot = vector.reduce<addf> %dotv, %zero : vector<4xf32>, f32
     %scaled = scalar.mulf %dot, %scale : f32
     view.store %scaled, %scores[%p] : f32, view<[%score_capacity]xf32>
     scf.yield %m1 : f32
@@ -191,41 +203,63 @@ kernel.def target(@yah_wave32) @yah_attn_wmma() {
     scf.yield %m4 : f32
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-  // Step 3: ctx[d] = sum_p s[p] * v[p][d], one lane per output dimension.
-  %phase3 = scf.for %d3 = [%lane to %head_dim step %c32](%m5 = %zero : f32) -> (f32) {
-    %ctx = scf.for %p5 = [%c0 to %seq_len step %c1](%c5 = %zero : f32) -> (f32) {
-      %can_row5 = index.add %layer_pos, %p5 : index
-      %can_row5b = index.mul %can_row5, %num_kv_heads : index
-      %can_head5 = index.add %can_row5b, %kv_h : index
-      %can_off5 = index.mul %can_head5, %head_dim : index
-      %hm_row5 = index.add %hm_head, %p5 : index
-      %hm_off5 = index.mul %hm_row5, %head_dim : index
-      %off_v = scf.if %head_major -> (index) {
-        scf.yield %hm_off5 : index
-      } else {
-        scf.yield %can_off5 : index
+  // Step 3: ctx[d] = sum_p s[p] * v[p][d], four channels per lane per pass.
+  // Lanes own contiguous four-channel groups, so each key costs one vector<4xf16>
+  // load and the result is one vector<4xf32> store; both were scalar before, and
+  // PV measured 2217 ms of the 8579 ms attention at B=2048. The accumulation
+  // order over p within each channel is unchanged, so the result is
+  // bit-identical. The d3 guard and its index.assume exist for the small fixture
+  // (head_dim=4, only lane 0 active): the verifier needs d3 < head_dim in scope
+  // to bound a four-wide access, and the guard alone does not propagate that to
+  // the memory op. On the production shape (head_dim=256) both fold away.
+  %c127 = index.constant 127 : index
+  %c128 = index.constant 128 : index
+  %ones4 = vector.constant 1.0 : vector<4xf32>
+  %negone4 = vector.constant -1.0 : vector<4xf32>
+  %hd_pad = index.add %head_dim, %c127 : index
+  %phase3_passes = index.div %hd_pad, %c128 : index
+  %phase3 = scf.for %dpass = [%c0 to %phase3_passes step %c1](%m5 = %zero : f32) -> (f32) {
+    %dchunk = index.mul %dpass, %c128 : index
+    %dlane4 = index.mul %lane, %c4 : index
+    %d3 = index.add %dchunk, %dlane4 : index
+    %d3_on = index.cmp ult, %d3, %head_dim : index
+    scf.if %d3_on {
+      %d3a = index.assume %d3 [lt(%d3, %head_dim)] : index
+      %acc3 = scf.for %p5 = [%c0 to %seq_len step %c1](%c5 = %zerov4 : vector<4xf32>) -> (vector<4xf32>) {
+        %can_row5 = index.add %layer_pos, %p5 : index
+        %can_row5b = index.mul %can_row5, %num_kv_heads : index
+        %can_head5 = index.add %can_row5b, %kv_h : index
+        %can_off5 = index.mul %can_head5, %head_dim : index
+        %hm_row5 = index.add %hm_head, %p5 : index
+        %hm_off5 = index.mul %hm_row5, %head_dim : index
+        %off_v = scf.if %head_major -> (index) {
+          scf.yield %hm_off5 : index
+        } else {
+          scf.yield %can_off5 : index
+        }
+        %v_off = index.add %off_v, %d3a : index
+        %s5 = view.load %scores[%p5] : view<[%score_capacity]xf32> -> f32
+        %splat5 = vector.splat %s5 : vector<4xf32>
+        %v4 = vector.load %v_view[%v_off] : view<[%cache_elems]xf16> -> vector<4xf16>
+        %v4f = vector.extf %v4 : vector<4xf16> to vector<4xf32>
+        %prod5 = vector.mulf %splat5, %v4f : vector<4xf32>
+        %next5 = vector.addf %c5, %prod5 : vector<4xf32>
+        scf.yield %next5 : vector<4xf32>
       }
-      %v_off = index.add %off_v, %d3 : index
-      %s5 = view.load %scores[%p5] : view<[%score_capacity]xf32> -> f32
-      %v16v = view.load %v_view[%v_off] : view<[%cache_elems]xf16> -> f16
-      %v5 = scalar.extf %v16v : f16 to f32
-      %prod5 = scalar.mulf %s5, %v5 : f32
-      %next5 = scalar.addf %c5, %prod5 : f32
-      scf.yield %next5 : f32
+      %g_off = index.add %q_base, %d3a : index
+      %g4 = vector.load %gate_view[%g_off] : view<[%q_total]xf32> -> vector<4xf32>
+      %gneg4 = vector.mulf %g4, %negone4 : vector<4xf32>
+      %eg4 = vector.expf<afn> %gneg4 : vector<4xf32>
+      %den4 = vector.addf %ones4, %eg4 : vector<4xf32>
+      %sig4 = vector.divf %ones4, %den4 : vector<4xf32>
+      %gated4 = vector.mulf %acc3, %sig4 : vector<4xf32>
+      %res4 = scf.if %gate_on -> (vector<4xf32>) {
+        scf.yield %gated4 : vector<4xf32>
+      } else {
+        scf.yield %acc3 : vector<4xf32>
+      }
+      vector.store %res4, %out_view[%g_off] : vector<4xf32>, view<[%q_total]xf32>
     }
-    %g_off = index.add %q_base, %d3 : index
-    %g = view.load %gate_view[%g_off] : view<[%q_total]xf32> -> f32
-    %neg_g = scalar.mulf %g, %negone : f32
-    %e_g = scalar.expf<afn> %neg_g : f32
-    %denom = scalar.addf %one, %e_g : f32
-    %sig = scalar.divf %one, %denom : f32
-    %gated = scalar.mulf %ctx, %sig : f32
-    %result = scf.if %gate_on -> (f32) {
-      scf.yield %gated : f32
-    } else {
-      scf.yield %ctx : f32
-    }
-    view.store %result, %out_view[%g_off] : f32, view<[%q_total]xf32>
     scf.yield %m5 : f32
   }
   // The lse output is the natural-log log-sum-exp, written by lane 0.
