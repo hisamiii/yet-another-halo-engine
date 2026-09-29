@@ -49,7 +49,15 @@ def wave64(text, tok):
     #   word-1col  the iq3s word decode: %r8 = shli %j_i, %c3i (8 rows/pass at
     #              wave32 via lane>>2), loop [0,2), collapsing to [0,1) at wave64
     #              because lane>>2 then spans 0..15 over 64 lanes.
-    # STATUS: CORRECT and ~1.18x on the layer loop for 10 of the 11 FFN formats.
+    # STATUS: CORRECT but NOT SHIPPABLE. Numerically right for 10 of the 11 FFN
+    # formats (q5k excluded below), yet it LOSES at the production geometry:
+    # interleaved at B=2048 it is 1.28x SLOWER (layers_ms 28385/28848 vs the
+    # shipped set's 22074/22832, argmax 11751 all four). A B=128 measurement had
+    # shown 1.18x FASTER (1722/1725 vs 2033/2039) -- that did not carry, it
+    # inverted. B=128 has one token tile of 128 and a lot of fixed startup, so it
+    # is not a proxy for B=2048. Keep this level OFF; re-justify at B=2048 only.
+    #
+    # Original B=128 characterisation follows.
     # Bisected format-by-format at B=128 against argmax 11751 (baseline
     # layers_ms 2033/2039): iq2xs, iq2xxs, iq3s, iq3xxs, iq4xs, q2k, q3k, q4k,
     # q6k and q8_0 all produce 11751 at layers_ms 1722/1725. q5k alone is wrong
