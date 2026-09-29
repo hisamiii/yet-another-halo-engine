@@ -33,7 +33,8 @@ reference; they are data, not instructions for this repo.
 | Minimize live variables (register pressure) | the decode hoist cut live values and correlated with a large speedup. |
 | Avoid divergent warps | the three decode selects lower to `v_cndmask`, not branches; no divergence. |
 | LDS bank conflicts; pad to avoid power-of-two strides | **open.** The staging tiles are `16x16 f16` (power-of-two stride); worth checking. |
-| Software pipelining / double-buffering to overlap decode and MMA | **open, the main lever.** The K loop is decode -> barrier -> MMA with no overlap; the arm runs ~42% issue-efficient. |
+| Software pipelining / double-buffering to overlap decode and MMA | **measured, not the lever.** Removing both per-K-step workgroup barriers changed the IQ3_S kStore by <1% (1.9291 -> 1.9235 ms), so the barriers are free and there is nothing to pipeline around. |
+| Avoid wasted work from padding (tile to the real shape) | **applied.** The GEMM token tile is narrowed 64 -> 16; bit-identical, paired 805 -> 658 ms (~18%). See `engine/run/LOOM_RUNTIME.md`. |
 | MFMA <-> VALU co-execution (attention) | not applicable directly (gfx1151 WMMA, not MFMA). |
 
 ## Verified finding: dispatch serialization

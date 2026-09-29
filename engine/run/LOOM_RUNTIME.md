@@ -405,8 +405,10 @@ run-to-run noise, so it is not kept. The arm is latency-bound: clamps and
 branchless rewrites measured ~0, and the kernel is ~42% issue-efficient against
 the 240 G warp-insn/s peak.
 
-Current prefill: **~765 ms** against the HIP `best_ms` of 389.8-415 ms, i.e.
-~1.9x, down from 4407 ms for the first correctness-first port.
+Current prefill: **~640 ms** against the HIP `best_ms` of 389.8-415 ms, i.e.
+~1.6x, down from 4407 ms for the first correctness-first port. The remaining
+time is the weight decode (~53% of an arm before the 16-wide tile, higher now)
+and the structural rhs/MMA/epilogue.
 ### Narrowing the token tile to 16
 
 The prefill pads `kB` real tokens to a 64-wide tile, so 3/4 of the rhs loads,
