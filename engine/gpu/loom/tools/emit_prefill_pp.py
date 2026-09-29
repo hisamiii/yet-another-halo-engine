@@ -46,6 +46,21 @@ def main():
     # group chain can address as the measured-best arm; the rest keep the
     # shipping wave32 geometry. dispatch.txt records which is which.
     CHAIN = os.environ.get("YAH_GEMM_W64") == "1"
+    # YAH_WIDEN_ALL=1 decouples the token-tile widening from the chain. MEASURED
+    # BROKEN -- do not ship, and do not assume the coupling below is incidental.
+    # widen_tokens itself is fine: it completes on every FFN source (iq3xxs/iq4xs/
+    # q5k included) and its output IR is textually complete (tokens 64->128, 8
+    # accumulators, 8 rhs loads, the copy-out rescaled to >>7 / &127), and all 64
+    # widened HALs compile. But the forward is WRONG: B=2048 argmax is 220 with
+    # every family widened, and still 220 when ONLY gemm_swiglu_iq3xxs_1088_20 is
+    # widened (1 file), 220 for kstore-only, 220 for residual-only, 198 for the
+    # non-FFN formats -- against argmax 11751 for the untouched shipped set, run
+    # interleaved on the same binary. So the coupling is load-bearing: the widened
+    # UNCHAINED kernels are not usable, and the root cause is not yet established
+    # (it is NOT a missing rewrite in widen_tokens; register pressure at wave32
+    # with 8 live accumulators, or a layout the chain's later steps normally fix,
+    # both remain open). Default OFF: unset, the emitted set is byte-identical.
+    WIDEN_ALL = os.environ.get("YAH_WIDEN_ALL") == "1"
     ROWGRP = int(os.environ.get("YAH_ROWGRP", "4"))
     KSPLIT = int(os.environ.get("YAH_KSPLIT", "4"))
     if B % TILE:
@@ -89,7 +104,9 @@ def main():
         # mt % rowgrp == 0 or the row-grouped grid truncates: the iq3s family
         # contains a 48-row weight (m_tiles=3), where grid x would become 0.
         use = (E.chain_applies(f, tile=TILE) if CHAIN else False) and mt % ROWGRP == 0
-        tile = TILE if use else 64
+        # widenable: every source widen_tokens can widen, chained or not. The row
+        # group still requires the chain (widen_rows), so rowgrp stays 1 without it.
+        tile = TILE if (use or WIDEN_ALL) else 64
         tt = B // tile
         rowgrp = ROWGRP if use else 1
         sym = E.sym_of(f)
@@ -123,7 +140,7 @@ def main():
         if kind == "residual" and os.environ.get("YAH_KSTORE_RESIDUAL") != "off":
             kf = "yah_ffn_gemm_%s_f32.loom" % port
             kuse = E.chain_applies(kf, tile=TILE) and mt % ROWGRP == 0
-            ktile = TILE if kuse else 64
+            ktile = TILE if (kuse or WIDEN_ALL) else 64
             ktt = B // ktile
             krowgrp = ROWGRP if kuse else 1
             ksym = E.sym_of(kf)
