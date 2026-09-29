@@ -42,19 +42,77 @@ PAD = int(os.environ.get("YAH_SD_PAD", "0"))
 # and made the kernel slower than the chained one (13.98 -> 16.5 ms/dispatch at
 # pp2048, bit-identical). A narrower phase shrinks the tile at the cost of two
 # barriers per phase.
-KSUB = int(os.environ.get("YAH_SD_KSUB", "128"))
-ROWP = KSUB + PAD           # f16 per LDS row
-TOK = 128                   # tokens per wave
-PH = 256 // KSUB            # phases per 256-wide block
-GPP = KSUB // 32            # 32-element groups per row per phase
-GPL = GPP // NW             # groups decoded per lane per phase
+KSUB = PH = GPP = GPL = ROWP = None
+
+
+def configure(fmt):
+    """Set the per-format phase geometry. YAH_SD_KSUB overrides the format's
+    measured default (FMTS[fmt]["ksub"])."""
+    global KSUB, ROWP, PH, GPP, GPL
+    KSUB = int(os.environ.get("YAH_SD_KSUB", FMTS[fmt]["ksub"]))
+    ROWP = KSUB + PAD           # f16 per LDS row
+    PH = 256 // KSUB            # phases per 256-wide block
+    GPP = KSUB // 32            # 32-element groups per row per phase
+    GPL = GPP // NW             # groups decoded per lane per phase
+    assert 256 % KSUB == 0 and GPP % NW == 0 and GPL >= 1
+
+
+# Tokens per wave. 128 gives 32 vector<4xf32> accumulators (128 VGPRs). 64 halves
+# the accumulators and removes the scratch spills, and is slower anyway (IQ3_S
+# 19.77 vs 15.86 ms, IQ4_XS 15.52 vs 9.71 at NW=4): the 64x128 per-wave tile's
+# operand reuse is worth more than the residency and the spill traffic.
+TOK = int(os.environ.get("YAH_SD_TOK", "128"))
+NT = TOK // 16              # 16-token sub-tiles per wave
+NA = 4 * NT                 # accumulators per wave
 # Mechanism probes (numerically meaningless, timing only): decode = skip the
 # weight decode, rhs = feed the MMAs the LDS lhs fragments instead of loading
 # the activation from global, mma = drop the MMAs (accumulators pass through).
 ABLATE = os.environ.get("YAH_SD_ABLATE", "")
 PREFETCH = os.environ.get("YAH_SD_PREFETCH", "1") == "1"
 EPI = os.environ.get("YAH_SD_EPI", "direct")
-assert 256 % KSUB == 0 and GPP % NW == 0 and GPL >= 1
+# Carry prefetched byte vectors as packed i32 words. A vector<Nxi8> is lowered
+# one byte per VGPR, so a carried qs[8] costs 8 registers across the MMA loop.
+PACK = os.environ.get("YAH_SD_PACK", "1") == "1"
+# Store each grid word's 4 elements as soon as they are decoded. Measured slower
+# (IQ3_S 13.81 vs 12.57 ms at KSUB=64): the scheduler interleaves anyway and the
+# extra stores add spill reloads. Off.
+STORE4 = os.environ.get("YAH_SD_STORE4", "0") == "1"
+
+
+def _i8n(ty):
+    import re as _re
+    m = _re.fullmatch(r"vector<(\d+)xi8>", ty)
+    return int(m.group(1)) if m and int(m.group(1)) % 4 == 0 else 0
+
+
+def pack_vals(e, vals, tag):
+    """Bitcast carried vector<Nxi8> values to vector<N/4xi32>; returns new vals."""
+    if not PACK:
+        return vals
+    out = []
+    for nm, ty in vals:
+        n = _i8n(ty)
+        if n:
+            pk = f"{nm}_{tag}pk"
+            e(f"    {pk} = vector.bitcast {nm} : {ty} to vector<{n // 4}xi32>")
+            out.append((pk, f"vector<{n // 4}xi32>"))
+        else:
+            out.append((nm, ty))
+    return out
+
+
+def unpack_vals(e, cur, orig):
+    """Inverse of pack_vals for loop-carried names cur with original types orig."""
+    names = []
+    for (nm, ty), (_, oty) in zip(cur, orig):
+        n = _i8n(oty)
+        if PACK and n:
+            e(f"    {nm}_u = vector.bitcast {nm} : {ty} to {oty}")
+            names.append(f"{nm}_u")
+        else:
+            names.append(nm)
+    return names
+
 
 IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10,
                1, 13, 25, 38, 53, 69, 89, 113]
@@ -159,14 +217,208 @@ def iq4xs_compute(v, gb):
     return L
 
 
+def _ld8(e, p, name, off):
+    """Load one weight byte at i32 SSA offset `off` into %{p}{name} (i8)."""
+    e(f"    %{p}{name}_ix = index.cast {off} : i32 to index")
+    e(f"    %{p}{name}_lo = index.max %{p}{name}_ix, %c0 : index")
+    e(f"    %{p}{name}_idx = index.min %{p}{name}_lo, %w_last : index")
+    e(f"    %{p}{name} = view.load %w_view[%{p}{name}_idx] : view<[%w_bytes]xi8> -> i8")
+
+
+def _ldv(e, p, name, off, n):
+    """Load n consecutive weight bytes at i32 SSA offset `off` as vector<nxi8>.
+
+    The clamp must be w_bytes - n for THIS width. Clamping every width to
+    w_bytes - 16 moved the last row's final sign bytes (IQ3_S +74+4g, within the
+    last 16 bytes of the tensor) to the wrong address: one wrong row per
+    tensor, argmax 29779 at pp2048, caught by the r64t256 fixture at row 63."""
+    e(f"    %{p}{name}_ix = index.cast {off} : i32 to index")
+    e(f"    %{p}{name}_lo = index.max %{p}{name}_ix, %c0 : index")
+    e(f"    %{p}{name}_idx = index.min %{p}{name}_lo, %w_lim{n} : index")
+    e(f"    %{p}{name} = view.load %w_view[%{p}{name}_idx] : view<[%w_bytes]xi8> -> vector<{n}xi8>".replace("view.load", "vector.load"))
+
+
+def _ldd(e, p, blk):
+    """Load the block's f16 d (offset 0) into %{p}dh."""
+    e(f"    %{p}d_h_i = scalar.shrui {blk}, %c1i : i32")
+    e(f"    %{p}d_ix = index.cast %{p}d_h_i : i32 to index")
+    e(f"    %{p}d_lo = index.max %{p}d_ix, %c0 : index")
+    e(f"    %{p}d_idx = index.min %{p}d_lo, %w_half_last : index")
+    e(f"    %{p}dh = view.load %w_f16_view[%{p}d_idx] : view<[%w_halfs]xf16> -> f16")
+
+
+def _store_group(e, u, hs):
+    """Store the 32 f16 SSA values hs of group u (local column %gl{u}*32)."""
+    e(f"    %hlo{u} = vector.from_elements " + ", ".join(hs[:16]) + " : vector<16xf16>")
+    e(f"    %hhi{u} = vector.from_elements " + ", ".join(hs[16:]) + " : vector<16xf16>")
+    e(f"    %col_i{u} = scalar.shli %gl{u}, %c5i : i32")
+    e(f"    %col_x{u} = index.cast %col_i{u} : i32 to index")
+    e(f"    %col_l{u} = index.max %col_x{u}, %c0 : index")
+    e(f"    %col{u} = index.min %col_l{u}, %ccolmax : index")
+    e(f"    %colh{u} = index.add %col{u}, %c16 : index")
+    e(f"    vector.store %hlo{u}, %wl_view[%drow, %col{u}] : vector<16xf16>, view<64x{ROWP}xf16>")
+    e(f"    vector.store %hhi{u}, %wl_view[%drow, %colh{u}] : vector<16xf16>, view<64x{ROWP}xf16>")
+
+
+def iq3s_loads(p, blk, gb):
+    """block_iq3_s (110 B): d f16 @0, qs[64] @2, qh[8] @66, signs[32] @74,
+    scales[4] @106. Group g reads qs[8g..8g+7], qh[g], signs[4g..4g+3] and the
+    scale byte g/2."""
+    L = []
+    e = L.append
+    vals = []
+    _ldd(e, p, blk)
+    vals.append((f"%{p}dh", "f16"))
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}g8_{u} = scalar.shli %{p}g{u}, %c3i : i32")
+        e(f"    %{p}qo{u} = scalar.addi {blk}, %{p}g8_{u} : i32")
+        e(f"    %{p}qo2_{u} = scalar.addi %{p}qo{u}, %c2i : i32")
+        _ldv(e, p, f"qs{u}", f"%{p}qo2_{u}", 8)
+        vals.append((f"%{p}qs{u}", "vector<8xi8>"))
+        e(f"    %{p}ho{u} = scalar.addi {blk}, %{p}g{u} : i32")
+        e(f"    %{p}ho2_{u} = scalar.addi %{p}ho{u}, %c66i : i32")
+        _ld8(e, p, f"qh{u}", f"%{p}ho2_{u}")
+        vals.append((f"%{p}qh{u}", "i8"))
+        e(f"    %{p}g4_{u} = scalar.shli %{p}g{u}, %c2i : i32")
+        e(f"    %{p}so{u} = scalar.addi {blk}, %{p}g4_{u} : i32")
+        e(f"    %{p}so2_{u} = scalar.addi %{p}so{u}, %c74i : i32")
+        _ldv(e, p, f"sg{u}", f"%{p}so2_{u}", 4)
+        vals.append((f"%{p}sg{u}", "vector<4xi8>"))
+        e(f"    %{p}gd{u} = scalar.shrui %{p}g{u}, %c1i : i32")
+        e(f"    %{p}co{u} = scalar.addi {blk}, %{p}gd{u} : i32")
+        e(f"    %{p}co2_{u} = scalar.addi %{p}co{u}, %c106i : i32")
+        _ld8(e, p, f"sc{u}", f"%{p}co2_{u}")
+        vals.append((f"%{p}sc{u}", "i8"))
+    return L, vals
+
+
+def iq3s_compute(v, gb):
+    """The chained kernel's IQ3_S element decode, one row per lane. Element
+    lw*4 + b of group g (lw = 2*l + which):
+      gidx = qs[8g+lw] | ((qh[g] >> lw) & 1) << 8,  gword = grid[gidx]
+      sign_nib = (signs[4g+l] >> 4*which) & 15,     s = (sign_nib >> b) & 1
+      mag = ((gword >> 8b) & 255 ^ -s) + s
+      value = (d * f32(1 + 2*((scales[g/2] >> 4*(g%2)) & 15))) * f32(mag)"""
+    L = []
+    e = L.append
+    it = iter(v)
+    dh = next(it)
+    e(f"    %d = scalar.extf {dh} : f16 to f32")
+    for u in range(GPL):
+        qs = next(it); qh = next(it); sg = next(it); sc = next(it)
+        e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %odd{u} = scalar.andi %g{u}, %c1i : i32")
+        e(f"    %nb_sh{u} = scalar.shli %odd{u}, %c2i : i32")
+        e(f"    %scb{u} = scalar.extui {sc} : i8 to i32")
+        e(f"    %nb_t{u} = scalar.shrui %scb{u}, %nb_sh{u} : i32")
+        e(f"    %nib{u} = scalar.andi %nb_t{u}, %c15i : i32")
+        e(f"    %nib2_{u} = scalar.shli %nib{u}, %c1i : i32")
+        e(f"    %onep{u} = scalar.addi %nib2_{u}, %c1i : i32")
+        e(f"    %scf{u} = scalar.sitofp %onep{u} : i32 to f32")
+        e(f"    %dsc{u} = scalar.mulf %d, %scf{u} : f32")
+        e(f"    %qhb{u} = scalar.extui {qh} : i8 to i32")
+        hs = []
+        for lw in range(8):
+            l, which = lw // 2, lw % 2
+            t = f"{u}_{lw}"
+            e(f"    %qlo8_{t} = vector.extract {qs}[{lw}] : vector<8xi8> -> i8")
+            e(f"    %qlo_{t} = scalar.extui %qlo8_{t} : i8 to i32")
+            e(f"    %hb0_{t} = scalar.shrui %qhb{u}, %c{lw}i : i32")
+            e(f"    %hb_{t} = scalar.andi %hb0_{t}, %c1i : i32")
+            e(f"    %hb8_{t} = scalar.shli %hb_{t}, %c8i : i32")
+            e(f"    %gi_{t} = scalar.ori %qlo_{t}, %hb8_{t} : i32")
+            e(f"    %gix_{t} = index.cast %gi_{t} : i32 to index")
+            e(f"    %gil_{t} = index.max %gix_{t}, %c0 : index")
+            e(f"    %gid_{t} = index.min %gil_{t}, %c511 : index")
+            e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<512xi32> -> i32")
+            if which == 0:
+                e(f"    %sgb8_{u}_{l} = vector.extract {sg}[{l}] : vector<4xi8> -> i8")
+                e(f"    %sgb_{u}_{l} = scalar.extui %sgb8_{u}_{l} : i8 to i32")
+            e(f"    %snt_{t} = scalar.shrui %sgb_{u}_{l}, %c{4 * which}i : i32")
+            e(f"    %sn_{t} = scalar.andi %snt_{t}, %c15i : i32")
+            for b in range(4):
+                x = f"{t}_{b}"
+                e(f"    %gb0_{x} = scalar.shrui %gw_{t}, %c{8 * b}i : i32")
+                e(f"    %gby_{x} = scalar.andi %gb0_{x}, %c255i : i32")
+                e(f"    %sb0_{x} = scalar.shrui %sn_{t}, %c{b}i : i32")
+                e(f"    %sb_{x} = scalar.andi %sb0_{x}, %c1i : i32")
+                e(f"    %ng_{x} = scalar.subi %c0i, %sb_{x} : i32")
+                e(f"    %mg0_{x} = scalar.xori %gby_{x}, %ng_{x} : i32")
+                e(f"    %mg_{x} = scalar.addi %mg0_{x}, %sb_{x} : i32")
+                e(f"    %mf_{x} = scalar.sitofp %mg_{x} : i32 to f32")
+                e(f"    %vv_{x} = scalar.mulf %dsc{u}, %mf_{x} : f32")
+                e(f"    %hv_{x} = scalar.fptrunc %vv_{x} : f32 to f16")
+                hs.append(f"%hv_{x}")
+            if STORE4:
+                # store this grid word's 4 elements now: collecting all 32 for two
+                # 16-wide stores kept them live across the whole group decode and
+                # pushed the accumulators into scratch
+                if lw == 0:
+                    e(f"    %col_i{u} = scalar.shli %gl{u}, %c5i : i32")
+                    e(f"    %col_x{u} = index.cast %col_i{u} : i32 to index")
+                    e(f"    %col_l{u} = index.max %col_x{u}, %c0 : index")
+                    e(f"    %col{u} = index.min %col_l{u}, %ccolmax : index")
+                e(f"    %h4_{t} = vector.from_elements " + ", ".join(hs[-4:]) + " : vector<4xf16>")
+                e(f"    %c4w_{t} = index.constant {4 * lw} : index")
+                e(f"    %col4_{t} = index.add %col{u}, %c4w_{t} : index")
+                e(f"    vector.store %h4_{t}, %wl_view[%drow, %col4_{t}] : vector<4xf16>, view<64x{ROWP}xf16>")
+        if not STORE4:
+            _store_group(e, u, hs)
+    return L
+
+
+GRID_LDS = os.environ.get("YAH_SD_GRID_LDS", "1") == "1"
+
+
+def iq3s_setup():
+    """The 512-word grid as %grid_view. With GRID_LDS (default) it is copied into
+    2 KiB of workgroup memory once, so the eight lookups per 32-element group are
+    ds_reads instead of dependent global gathers in front of every phase barrier.
+    The first K phase starts with a barrier, which publishes the copy."""
+    L = ["  %grid_g = buffer.view %grid_na[%base] : buffer -> view<512xi32>",
+         "  %c511 = index.constant 511 : index"]
+    if not GRID_LDS:
+        return L + ["  %grid_view = buffer.view %grid_na[%base] : buffer -> view<512xi32>"]
+    L += ["  %grid_bytes = index.constant 2048 : offset",
+          "  %grid_l = buffer.alloca<workgroup> align(16) %grid_bytes : buffer",
+          "  %grid_view = buffer.view %grid_l[%base] : buffer -> view<512xi32>",
+          f"  %cgstep = index.constant {64 * NW} : index",
+          "  %gsink = scf.for %gi = [%c0 to %c512 step %cgstep](%gm = %c0 : index) -> (index) {",
+          "    %gidx0 = index.add %gi, %tid : index",
+          "    %gidx = index.min %gidx0, %c511 : index",
+          "    %gv = view.load %grid_g[%gidx] : view<512xi32> -> i32",
+          "    view.store %gv, %grid_view[%gidx] : i32, view<512xi32>",
+          "    scf.yield %gm : index",
+          "  }"]
+    return L
+
+
+def iq4xs_setup():
+    L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
+    L.append("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
+    L += ["  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8",
+          "  %m15v = vector.splat %c15b : vector<16xi8>", "  %s4v = vector.splat %c4b : vector<16xi8>"]
+    return L
+
+
 FMTS = {
-    # fmt: (block bytes, decode emitter, extra setup lines)
-    "iq4xs": (136, (iq4xs_loads, iq4xs_compute)),
+    # fmt: block bytes, (loads, compute), extra buffer bindings after %weight, setup
+    # ksub: measured best phase width at pp2048 (mean ms per dispatch, NW=2):
+    #   iq4xs 128 -> 9.71 (64: 12.08, 256: 12.53)
+    #   iq3s   64 -> 12.57 (128: 15.47) -- at 128 the 64-element decode per lane
+    #          pushes 8 accumulators into scratch (3151 private ops/work-item)
+    "iq4xs": dict(bb=136, ksub=128, decode=(iq4xs_loads, iq4xs_compute), extra=[], setup=iq4xs_setup),
+    "iq3s": dict(bb=110, ksub=64, decode=(iq3s_loads, iq3s_compute), extra=["grid"], setup=iq3s_setup),
 }
 
 
 def gen(fmt):
-    bb, decode = FMTS[fmt]
+    F = FMTS[fmt]
+    configure(fmt)
+    bb, decode = F["bb"], F["decode"]
+    bufs = ["weight"] + F["extra"] + ["input", "wstage", "ostage", "output"]
     sym = f"yah_ffn_gemm_{fmt}"
     wgs = 64 * NW
     wtok = TOK * NW
@@ -190,11 +442,11 @@ def gen(fmt):
     e("  %rowgrp = index.constant 4 : index")
     e("  %m_groups = index.div %m_tiles, %rowgrp : index")
     e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
-    e("} launch(%weight: buffer, %input: buffer, %wstage: buffer, %ostage: buffer, %output: buffer) {")
+    e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
     e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 256):
+    for v in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 256, 512):
         e(f"  %c{v} = index.constant {v} : index")
-    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 32):
+    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 24, 32, 66, 74, 106, 255):
         e(f"  %c{v}i = scalar.constant {v} : i32")
     e(f"  %cbb = index.constant {bb} : index")
     e(f"  %cbbh = index.constant {bb // 2} : index")
@@ -219,12 +471,16 @@ def gen(fmt):
     e("  %w_halfs = index.mul %m_rows, %hpr : index")
     e("  %w_last = index.sub %w_bytes, %c1 : index")
     e("  %w_lim = index.sub %w_bytes, %c16 : index")
+    for n in (4, 8, 16):
+        e(f"  %cw{n} = index.constant {n} : index")
+        e(f"  %w_lim{n} = index.sub %w_bytes, %cw{n} : index")
     e("  %w_half_last = index.sub %w_halfs, %c1 : index")
     e("  %out_total = index.mul %m_rows, %tokens : index")
     e("  %stage_rows = index.mul %m_tiles, %c16 : index")
     e("  %stage_last = index.sub %stage_rows, %c1 : index")
     e("  %a_layout = encoding.layout.strided [%c1, %ktot] : encoding<layout>")
-    e("  %weight_na, %input_na, %wstage_na, %ostage_na, %output_na = buffer.assume.noalias %weight, %input, %wstage, %ostage, %output : buffer, buffer, buffer, buffer, buffer")
+    e("  " + ", ".join(f"%{b}_na" for b in bufs) + " = buffer.assume.noalias "
+      + ", ".join(f"%{b}" for b in bufs) + " : " + ", ".join(["buffer"] * len(bufs)))
     e("  %w_view = buffer.view %weight_na[%base] : buffer -> view<[%w_bytes]xi8>")
     e("  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>")
     e("  %a_t_view = buffer.view %input_na[%base] : buffer -> view<[%ktot]x[%tokens]xf16, %a_layout>")
@@ -240,7 +496,8 @@ def gen(fmt):
     e("  %wave = index.div %tid, %c64 : index")
     e("  %l64 = index.rem %tid, %c64 : index")
     e("  %wtb = index.mul %wg_y, %cwtok : index")
-    e("  %wave_tok = index.mul %wave, %c128 : index")
+    e(f"  %ctok = index.constant {TOK} : index")
+    e("  %wave_tok = index.mul %wave, %ctok : index")
     e("  %token_base = index.add %wtb, %wave_tok : index")
     # decode lane map: lane l64 owns row l64; wave w owns groups [w*GPL, w*GPL+GPL)
     e("  %drow = index.min %l64, %c63 : index")
@@ -254,23 +511,16 @@ def gen(fmt):
     e(f"  %cgpl = scalar.constant {GPL} : i32")
     e("  %gl_i = scalar.muli %wave_i, %cgpl : i32")
     e("  %kphases = index.mul %k_blocks, %cph : index")
-    if fmt.startswith("iq4"):
-        for i, v in enumerate(IQ4_KVALUES):
-            e(f"  %kv{i} = scalar.constant {v} : i8")
-        e("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
-        e("  %c15b = scalar.constant 15 : i8")
-        e("  %c4b = scalar.constant 4 : i8")
-        e("  %m15v = vector.splat %c15b : vector<16xi8>")
-        e("  %s4v = vector.splat %c4b : vector<16xi8>")
+    L.extend(F["setup"]())
     e("  %zeros = vector.constant 0.0 : vector<4xf32>")
     e("  %init = vector.fragment<init> %zeros shape [%m, %n] : vector<4xf32>")
-    for j in range(1, 8):
+    for j in range(1, NT):
         e(f"  %t{16 * j} = index.add %token_base, %c{16 * j} : index")
-    toks = ["%token_base"] + [f"%t{16 * j}" for j in range(1, 8)]
+    toks = ["%token_base"] + [f"%t{16 * j}" for j in range(1, NT)]
     V4 = "vector<4xf32>"
-    types = ", ".join([V4] * 32)
+    types = ", ".join([V4] * NA)
     loads, compute = decode
-    ca = ", ".join(f"%a{i} = %init : {V4}" for i in range(32))
+    ca = ", ".join(f"%a{i} = %init : {V4}" for i in range(NA))
     carried_t = types
     if PREFETCH:
         # Phase 0's raw bytes are loaded before the loop; each iteration decodes
@@ -278,9 +528,11 @@ def gen(fmt):
         # latency runs under this phase's MMAs instead of in front of the decode.
         L0, vals0 = loads("pf_", "%row_off_i", "%gl_i")
         L.extend(L0)
+        orig0 = vals0
+        vals0 = pack_vals(e, vals0, "0")
         ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(vals0))
         carried_t = types + ", " + ", ".join(ty for _, ty in vals0)
-    res = ", ".join(f"%acc{i}" for i in range(32))
+    res = ", ".join(f"%acc{i}" for i in range(NA))
     if PREFETCH:
         res += ", " + ", ".join(f"%cvout{x}" for x in range(len(vals0)))
     e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t}) {{")
@@ -297,11 +549,13 @@ def gen(fmt):
     e("    %blk_i = scalar.addi %row_off_i, %blk_off0 : i32")
     if PREFETCH:
         cur = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(vals0)]
+        cur_names = unpack_vals(e, cur, orig0)
     else:
         Lc, cur = loads("cu_", "%blk_i", "%gb_i")
         L.extend(Lc)
+        cur_names = [nm for nm, _ in cur]
     if ABLATE != "decode":
-        L.extend(compute([nm for nm, _ in cur], "%gb_i"))
+        L.extend(compute(cur_names, "%gb_i"))
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     if PREFETCH:
         # next phase, clamped to the last one (its loads are then redundant but
@@ -319,27 +573,28 @@ def gen(fmt):
         e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
         Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
         L.extend(Ln)
-    cb = ", ".join(f"%b{i} = %a{i} : {V4}" for i in range(32))
-    e("    " + ", ".join(f"%r{i}" for i in range(32)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {{")
+        nxt = pack_vals(e, nxt, "n")
+    cb = ", ".join(f"%b{i} = %a{i} : {V4}" for i in range(NA))
+    e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {{")
     e("      %kk = index.add %kb_k, %ks : index")
     for i in range(4):
         e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%c{16 * i}, %ks] shape [%m, %k] : view<64x{ROWP}xf16> -> vector<16xf16>")
-    for j in range(8):
+    for j in range(NT):
         if ABLATE == "rhs":
             e(f"      %rhs{j} = vector.fragment.load<rhs> %wl_view[%c{16 * (j % 4)}, %ks] shape [%k, %n] : view<64x{ROWP}xf16> -> vector<16xf16>")
             continue
         e(f"      %rhs{j} = vector.fragment.load<rhs> %a_t_view[%kk, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
     for i in range(4):
-        for j in range(8):
-            n = i * 8 + j
+        for j in range(NT):
+            n = i * NT + j
             if ABLATE == "mma":
                 e(f"      %n{n} = vector.fragment<init> %zeros shape [%m, %n] : {V4}") if False else None
                 e(f"      %n{n} = vector.addf %b{n}, %b{n} : {V4}")
                 continue
             e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
-    e("      scf.yield " + ", ".join(f"%n{i}" for i in range(32)) + f" : {types}")
+    e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
     e("    }")
-    yv = ", ".join(f"%r{i}" for i in range(32))
+    yv = ", ".join(f"%r{i}" for i in range(NA))
     if PREFETCH:
         yv += ", " + ", ".join(nm for nm, _ in nxt)
     e("    scf.yield " + yv + f" : {carried_t}")
@@ -357,12 +612,13 @@ def gen(fmt):
         e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
         e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
         for i in range(4):
-            for j in range(8):
-                e(f"  vector.fragment.store<result> %acc{i * 8 + j}, %out_t_view[{rows[i]}, {toks[j]}] shape [%m, %n] : {V4}, view<[%m_rows]x[%tokens]xf32, %out_layout>")
+            for j in range(NT):
+                e(f"  vector.fragment.store<result> %acc{i * NT + j}, %out_t_view[{rows[i]}, {toks[j]}] shape [%m, %n] : {V4}, view<[%m_rows]x[%tokens]xf32, %out_layout>")
     else:
+        assert TOK == 128, "the staged epilogue's copy loop assumes 128 tokens per wave"
         for i in range(4):
-            for j in range(8):
-                e(f"  vector.fragment.store<result> %acc{i * 8 + j}, %ostage_view[{rows[i]}, {toks[j]}] shape [%m, %n] : {V4}, view<[%stage_rows]x[%tokens]xf32>")
+            for j in range(NT):
+                e(f"  vector.fragment.store<result> %acc{i * NT + j}, %ostage_view[{rows[i]}, {toks[j]}] shape [%m, %n] : {V4}, view<[%stage_rows]x[%tokens]xf32>")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e("  %l64_i = index.cast %l64 : index to i32")
         e("  %store_sink = scf.for %j2 = [%c0 to %c128 step %c1](%mk2 = %c0 : index) -> (index) {")
