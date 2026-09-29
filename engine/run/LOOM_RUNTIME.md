@@ -775,6 +775,42 @@ with the same all-ones input must produce `expected_out.npy` repeated twice, whi
 verifies the sub-tile indexing directly. Build that case first; a register win on an
 unverified tile is not a win.
 
+#### wave64: under 192, and faster
+
+The wave32 256-token tile costs 208 VGPRs, over the 192 that HIP production
+kernels use. Loom does support wave64 for this shape -- `types.h` carries
+`RDNA3_WMMAR3_F32_16X16X16_F16_W64` and a per-contract wave-size bitset -- and the
+port is four mechanical changes (`tools/wave64_tokens.py`):
+
+- `subgroup_size = 32 -> 64`, with `workgroup_size(64)` and `%c64` declared in the
+  `kernel.def` scope, since a wave64 workgroup must be a full wave;
+- accumulators halve, `vector<8xf32> -> vector<4xf32>`. The `16xf16` operand
+  fragments deliberately do **not** change: each lane still supplies the full
+  operand, replicated across the two 32-lane halves. Getting this wrong is what
+  makes the compiler answer `matrix constraint payload_shape is not satisfied`
+  instead of `wave_size`;
+- the word decode covers the whole 16x16 tile in one pass, because `lane>>2` spans
+  0..15 over 64 lanes rather than 0..7, so the decode j loop collapses from two
+  iterations to one;
+- the ostage->output copy uses 64 lanes per trip, so its trip count halves and it
+  strides by 64.
+
+At the 2048-token shape (m_tiles=1088, k_blocks=20):
+
+| | VGPRs | SGPR | moves | subgroups/SIMD | resident lanes | full | decode | share |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| wave32 256-tok | 208 | 37 | 149 | 4 | 128 | 48.05 | 10.27 | 21.4% |
+| **wave64 256-tok** | **136** | 28 | 75 | 3 | **192** | **42.18** | 5.99 | **14.2%** |
+
+136 VGPRs is inside the 192 budget, residency rises from 128 to 192 lanes per SIMD,
+and the kernel is 12% faster. The decode share falls *below* HIP 21.7% because a
+latency-bound decode chain hides better with half again as many lanes resident.
+
+Verified: the 64-token wave64 kernel passes the captured HIP fixture
+(`@yah_ffn_gemm_iq3s_case`, `state: ok`), which is the case that pins the decode
+arithmetic. The 256-token tile still has no numerical reference of its own -- the
+widening is orthogonal to the wave-size port, but a widened case is still owed.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
