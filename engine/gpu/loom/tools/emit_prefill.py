@@ -188,6 +188,37 @@ def direct_residual_epilogue(text):
     return chr(10).join(out)
 
 
+def direct_chain_epilogue(text):
+    """Direct token-major store for a CHAINED kStore (the chain's own epilogue).
+
+    The chain ends by storing its 32 result fragments into the global ostage
+    buffer, barriering, and copying them back out transposed -- three passes over
+    the output (426 MB for a 17408x2048 f32 gate). The fragments are already at
+    (row, token) = (m_origin + 16i, token_base + 16j), so they can be stored
+    straight into the output through a strided [m_rows]x[tokens] view, element
+    (row, t) at t*m_rows + row, exactly as direct_kstore_epilogue does for the
+    unchained sources. Same values, same cells: bit-identical. Worth 12.62 ->
+    9.71 ms on the shared-decode IQ4_XS kStore (gen_gemm_shared.py).
+    """
+    import re
+    old_ty = "view<[%stage_rows]x[%tokens]xf32>"
+    new_ty = "view<[%m_rows]x[%tokens]xf32, %out_layout>"
+    store = re.compile(r"^(\s*vector\.fragment\.store<result> %acc\d+, )%ostage_view(\[[^\]]+\] shape \[%m, %n\] : vector<4xf32>, )"
+                       + re.escape(old_ty) + r"$")
+    lines = text.split(chr(10))
+    idx = [i for i, l in enumerate(lines) if store.match(l)]
+    if len(idx) != 32 or idx != list(range(idx[0], idx[0] + 32)):
+        raise SystemExit("direct_chain_epilogue: expected 32 consecutive ostage stores, found %d" % len(idx))
+    tail = idx[-1] + 1
+    if "kernel.barrier" not in lines[tail] or "%store_sink = scf.for" not in lines[tail + 1]:
+        raise SystemExit("direct_chain_epilogue: no barrier + copy loop after the stores")
+    ret = next(i for i in range(tail, len(lines)) if lines[i].strip() == "kernel.return")
+    body = [store.sub(lambda m: m.group(1) + "%out_t_view" + m.group(2) + new_ty, lines[i]) for i in idx]
+    pro = ["  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>",
+           "  %out_t_view = buffer.view %output_na[%base] : buffer -> " + new_ty]
+    return chr(10).join(lines[:idx[0]] + pro + body + lines[ret:])
+
+
 def direct_kstore_epilogue(text):
     """The same direct token-major store for the f32 kStore arm.
 
@@ -670,6 +701,12 @@ def emit(loomfile, configs, outname, outdir, widen=0, chain=False, chain_level=N
         if chain:
             text = _chain(text, widen, int(os.environ.get("YAH_ROWGRP", "4")), loomfile,
                           chain_level)
+            # The plain kStore's staged epilogue -> direct token-major store.
+            # YAH_CHAIN_DIRECT=0 keeps the staged form.
+            if (os.environ.get("YAH_CHAIN_DIRECT", "1") != "0"
+                    and re.fullmatch(r"yah_ffn_gemm_[a-z0-9_]+?_f32\.loom", os.path.basename(loomfile))
+                    and "_residual_" not in loomfile):
+                text = direct_chain_epilogue(text)
         # YAH_SIMPLE_FILL=1 drops the unroll/schedule annotation from the LDS fill.
         if os.environ.get("YAH_SIMPLE_FILL") == "1":
             text = text.replace("unroll(%c2) schedule(interleaved)", "")
