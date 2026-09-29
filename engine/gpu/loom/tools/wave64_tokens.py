@@ -43,13 +43,44 @@ def wave64(text, tok):
     count is tok/4 and its row/token decode shifts by log2(tok) and masks tok-1.
     Getting this wrong silently truncates the copy.
     """
+    # The decode's row loop is per-format and MUST be re-derived, never silently
+    # skipped: a bare .replace that misses leaves the wave32 lane map in a 64-lane
+    # kernel, which compiles and computes the wrong rows. Two forms exist.
+    #   word-1col  the iq3s word decode: %r8 = shli %j_i, %c3i (8 rows/pass at
+    #              wave32 via lane>>2), loop [0,2), collapsing to [0,1) at wave64
+    #              because lane>>2 then spans 0..15 over 64 lanes.
+    # WARNING: the 1col-32j branch below is MEASURED PATHOLOGICAL. It compiles,
+    # chain_applies() accepts it for every FFN format, and a HAL set built from it
+    # at YAH_CHAIN_LEVEL=w64 did not finish a single B=2048 forward in 9.5 minutes
+    # (control on the shipped set: 27 s), with the process pinned at 100% CPU in
+    # system time and gpu_busy decaying to 10-20%. The cause is very likely the
+    # host-path cost discovered the same round (743,658 ioctl calls per forward,
+    # ~700-1000 per dispatch), which a changed launch geometry amplifies -- not the
+    # decode arithmetic, which is exact. Do NOT enable YAH_CHAIN_LEVEL=w64 until the
+    # host path is fixed, and re-verify with an argmax gate if you do.
+    #   1col-32j   iq3xxs/iq4xs: e = lane + 32j walked over j in [0,8), one column
+    #              per lane. At wave64 this must become e = lane + 64j over [0,4):
+    #              the same 256 elements with the same addresses, only re-assigned
+    #              to 64 lanes, so it is bit-identical arithmetic.
+    style = None
+    if 'scf.for %j = [%c0 to %c2 step %c1]' in text:
+        style = 'word-1col'
+    elif ('%j32 = scalar.shli %j_i, %c5i' in text
+          and 'scf.for %j = [%c0 to %c8 step %c1]' in text):
+        style = '1col-32j'
+    if style is None:
+        raise SystemExit('wave64: no recognised decode row loop to re-derive')
     L = text.split('\n')
     out = []
     for l in L:
         l = l.replace('subgroup_size = 32', 'subgroup_size = 64')
         l = l.replace('vector<8xf32>', 'vector<4xf32>')
-        l = l.replace('scf.for %j = [%c0 to %c2 step %c1]', 'scf.for %j = [%c0 to %c1 step %c1]')
-        l = l.replace('unroll(%c2) schedule(interleaved) {', 'unroll(%c1) schedule(interleaved) {')
+        if style == 'word-1col':
+            l = l.replace('scf.for %j = [%c0 to %c2 step %c1]', 'scf.for %j = [%c0 to %c1 step %c1]')
+            l = l.replace('unroll(%c2) schedule(interleaved) {', 'unroll(%c1) schedule(interleaved) {')
+        else:
+            l = l.replace('scf.for %j = [%c0 to %c8 step %c1]', 'scf.for %j = [%c0 to %c4 step %c1]')
+            l = l.replace('%j32 = scalar.shli %j_i, %c5i', '%j32 = scalar.shli %j_i, %c6i')
         out.append(l)
     t = '\n'.join(out)
 
@@ -74,6 +105,10 @@ def wave64(text, tok):
         lines = _ensure_index(lines, v)
     for v in (mask, shift):
         lines = _ensure_scalar(lines, v)
+    if style == '1col-32j':
+        # the re-derived loop bound and shift amount
+        lines = _ensure_index(lines, 4)
+        lines = _ensure_scalar(lines, 6)
 
     # a wave64 workgroup is a full wave, and %c64 is not in the kernel.def scope
     t = '\n'.join(lines)

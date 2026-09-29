@@ -61,6 +61,7 @@ def main():
     # with 8 live accumulators, or a layout the chain's later steps normally fix,
     # both remain open). Default OFF: unset, the emitted set is byte-identical.
     WIDEN_ALL = os.environ.get("YAH_WIDEN_ALL") == "1"
+    LEVEL = os.environ.get("YAH_CHAIN_LEVEL", "full")
     ROWGRP = int(os.environ.get("YAH_ROWGRP", "4"))
     KSPLIT = int(os.environ.get("YAH_KSPLIT", "4"))
     if B % TILE:
@@ -103,12 +104,25 @@ def main():
         # drift apart by accident.
         # mt % rowgrp == 0 or the row-grouped grid truncates: the iq3s family
         # contains a 48-row weight (m_tiles=3), where grid x would become 0.
-        use = (E.chain_applies(f, tile=TILE) if CHAIN else False) and mt % ROWGRP == 0
+        # YAH_CHAIN_LEVEL=w64 emits each source through the wave64 port only. The
+        # row group needs widen_rows, which needs the iq3s lane map, so rowgrp stays
+        # 1 at that level; the tile still widens because widen_tokens is
+        # format-agnostic. chain_applies() probes the level actually selected,
+        # because _chain() is what it runs and _chain() honours the same env var.
+        # full chain where it applies, wave64-only for the rest at level=w64.
+        # The two probes must stay separate: a source that supports the full chain
+        # has to KEEP its row groups even when the level asks for wave64, or the
+        # emit silently regresses the already-chained iq3s HALs.
+        full = ((E.chain_applies(f, tile=TILE, level="full") if CHAIN else False)
+                and mt % ROWGRP == 0)
+        w64 = (E.chain_applies(f, tile=TILE, level="w64")
+               if (CHAIN and LEVEL == "w64") else False)
+        use = full or w64
         # widenable: every source widen_tokens can widen, chained or not. The row
         # group still requires the chain (widen_rows), so rowgrp stays 1 without it.
         tile = TILE if (use or WIDEN_ALL) else 64
         tt = B // tile
-        rowgrp = ROWGRP if use else 1
+        rowgrp = ROWGRP if full else 1
         sym = E.sym_of(f)
         if kind == "kstore":
             cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
@@ -128,7 +142,8 @@ def main():
             cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
                    "%s.token_tiles=%d" % (sym, tt)]
             out = "gemm_swiglu_%s_%d_%d.hal" % (fmt, mt, kb)
-        E.emit(f, cfg, out, outdir, widen=tile, chain=use)
+        E.emit(f, cfg, out, outdir, widen=tile, chain=use,
+               chain_level=("full" if full else "w64"))
         geom.append((out, tile, rowgrp, tt))
         # YAH_KSTORE_RESIDUAL=1 additionally emits the CHAINED kStore HAL for
         # every residual shape, so a driver can run those projections on the fast
@@ -139,17 +154,21 @@ def main():
         # is taught to ask for the kStore variant.
         if kind == "residual" and os.environ.get("YAH_KSTORE_RESIDUAL") != "off":
             kf = "yah_ffn_gemm_%s_f32.loom" % port
-            kuse = E.chain_applies(kf, tile=TILE) and mt % ROWGRP == 0
+            kfull = E.chain_applies(kf, tile=TILE, level="full") and mt % ROWGRP == 0
+            kw64 = (E.chain_applies(kf, tile=TILE, level="w64")
+                    if LEVEL == "w64" else False)
+            kuse = kfull or kw64
             ktile = TILE if (kuse or WIDEN_ALL) else 64
             ktt = B // ktile
-            krowgrp = ROWGRP if kuse else 1
+            krowgrp = ROWGRP if kfull else 1
             ksym = E.sym_of(kf)
             kcfg = ["%s.m_tiles=%d" % (ksym, mt), "%s.k_blocks=%d" % (ksym, kb),
                     "%s.token_tiles=%d" % (ksym, ktt)]
             if port == "iq3s" and not kuse:
                 kcfg.append("%s.word_decode=%d" % (ksym, 1))
             kout = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
-            E.emit(kf, kcfg, kout, outdir, widen=ktile, chain=kuse)
+            E.emit(kf, kcfg, kout, outdir, widen=ktile, chain=kuse,
+                   chain_level=("full" if kfull else "w64"))
             geom.append((kout, ktile, krowgrp, ktt))
         n += 1
 

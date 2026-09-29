@@ -15,6 +15,9 @@ TOKEN_TILE = int(os.environ.get("YAH_TOKEN_TILE", "16"))
 # Diagnostic ablation: replace the decoded weight with a constant so the dequant
 # and its weight reads vanish, leaving the MMA path.
 ABLATE_DECODE = os.environ.get("YAH_ABLATE_DECODE", "0") == "1"
+# "full" (default) = branchfree -> wave64 -> row groups -> LDS staging.
+# "w64" = stop after the wave64 port. See _chain.
+CHAIN_LEVEL = os.environ.get("YAH_CHAIN_LEVEL", "full")
 LOOM = os.path.abspath(os.path.join(HERE, ".."))
 EMIT = os.path.join(LOOM, "emit_hal.py")
 
@@ -369,7 +372,7 @@ def deltanet_lds_rewrite(text):
         text = text.replace(old, new)
     return text
 
-def _chain(text, tile, n_row, loomfile=''):
+def _chain(text, tile, n_row, loomfile='', level=None):
     """The measured-best kStore rebuild: branchfree -> wave64 -> n_row row groups.
 
     Every step fails loudly on a structural anchor it cannot find, so a caller
@@ -453,6 +456,16 @@ def _chain(text, tile, n_row, loomfile=''):
     if 'scf.if %wd_old' in text:
         text = bf.drop_branch(text, 'word')
     text = w64.wave64(text, tile)
+    # YAH_CHAIN_LEVEL=w64 stops here, after the wave64 port. The row-group and LDS
+    # staging steps assume the iq3s decode's lane map (lane>>2 spans ROWS_PER_PASS
+    # rows, one row per lane over a 64-row tile); the one-column-per-lane formats
+    # (iq3xxs/iq4xs) need a decode rewrite before either of them can apply. wave64
+    # alone is exact for them -- same elements, same addresses, 64 lanes -- so it
+    # is worth shipping on its own while the rest of the port is built.
+    # The level is per-source, not global: a caller must keep the FULL chain on the
+    # sources that support it, or the emit silently drops their row groups.
+    if (level or CHAIN_LEVEL) == 'w64':
+        return text
     text = wr.widen_rows(text, n_row)
     # Last, and only for the shape the steps above produce: stage the IQ3_S
     # weight block in LDS. That transform is format-specific (110-byte block) and
@@ -478,7 +491,7 @@ def _chain(text, tile, n_row, loomfile=''):
     return dst
 
 
-def chain_applies(loomfile, tile=None, n_row=None):
+def chain_applies(loomfile, tile=None, n_row=None, level=None):
     """Can the wave64/row-group chain rebuild this source?
 
     Only the kStore family that carries the packed word decode has the lane map
@@ -501,13 +514,13 @@ def chain_applies(loomfile, tile=None, n_row=None):
         dims = "[%stage_rows_split]" if "%stage_rows_split" in text else "[%stage_rows]"
         text = W.widen(text, tile // 16, m_origin=origin, stage_dims=dims)
     try:
-        _chain(text, tile, n_row, loomfile)
+        _chain(text, tile, n_row, loomfile, level)
         return True
     except SystemExit:
         return False
 
 
-def emit(loomfile, configs, outname, outdir, widen=0, chain=False):
+def emit(loomfile, configs, outname, outdir, widen=0, chain=False, chain_level=None):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(LOOM, loomfile)
@@ -534,7 +547,8 @@ def emit(loomfile, configs, outname, outdir, widen=0, chain=False):
         # The launch geometry changes with the row group count, so the resolved
         # geometry travels with the HAL (emit_prefill_pp writes dispatch.txt).
         if chain:
-            text = _chain(text, widen, int(os.environ.get("YAH_ROWGRP", "4")), loomfile)
+            text = _chain(text, widen, int(os.environ.get("YAH_ROWGRP", "4")), loomfile,
+                          chain_level)
         # YAH_SIMPLE_FILL=1 drops the unroll/schedule annotation from the LDS fill.
         if os.environ.get("YAH_SIMPLE_FILL") == "1":
             text = text.replace("unroll(%c2) schedule(interleaved)", "")
