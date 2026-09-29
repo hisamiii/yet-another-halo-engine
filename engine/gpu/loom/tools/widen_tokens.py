@@ -37,7 +37,7 @@ def widen(text, n_sub, order='batch'):
     """Duplicate the N sub-tiles of the IQ3_S kStore from 4 (64 tokens) to n_sub*16."""
     n = n_sub
     tok = n * 16
-    shift = {64: 6, 128: 7, 256: 8}[tok]
+    shift = tok.bit_length() - 1        # rows decode as e2 >> shift, tok as e2 & mask
     mask = tok - 1
     iters = tok // 2                      # 32 lanes x iters = 16 rows x tok
     lines = text.split('\n')
@@ -128,15 +128,16 @@ def widen(text, n_sub, order='batch'):
     lines = ensure_index_const(lines, tok)      # the tile width itself
     lines = ensure_index_const(lines, iters)
     lines = ensure_scalar_const(lines, mask)
-    if shift not in (6, 7, 8):
-        raise SystemExit('unexpected shift')
     return '\n'.join(lines)
 
-src = open('/home/q/yet-another-halo-engine/engine/gpu/loom/yah_ffn_gemm_iq3s_f32.loom').read()
-sys.path.insert(0, '/home/q/yet-another-halo-engine/engine/gpu/loom/tools')
-import emit_prefill as ep
-for n_sub, tag in ((8, 'w128'), (16, 'w256')):
-    w = widen(src, n_sub)
-    open('/home/q/yah-scratch/k%s.loom' % tag, 'w').write(w)
-    open('/home/q/yah-scratch/k%s_abl.loom' % tag, 'w').write(ep.ablate_decode(w))
-    print('wrote k%s.loom (%d tokens/tile) and its ablated twin' % (tag, n_sub * 16))
+
+if __name__ == '__main__':
+    src = open('/home/q/yet-another-halo-engine/engine/gpu/loom/yah_ffn_gemm_iq3s_f32.loom').read()
+    sys.path.insert(0, '/home/q/yet-another-halo-engine/engine/gpu/loom/tools')
+    import emit_prefill as ep
+    for n_sub, tag in ((8, 'w128'), (16, 'w256')):
+        w = widen(src, n_sub)
+        open('/home/q/yah-scratch/k%s.loom' % tag, 'w').write(w)
+        open('/home/q/yah-scratch/k%s_abl.loom' % tag, 'w').write(ep.ablate_decode(w))
+        print('wrote k%s.loom (%d tokens/tile) and its ablated twin' % (tag, n_sub * 16))
+

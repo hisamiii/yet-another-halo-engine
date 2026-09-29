@@ -811,6 +811,52 @@ Verified: the 64-token wave64 kernel passes the captured HIP fixture
 arithmetic. The 256-token tile still has no numerical reference of its own -- the
 widening is orthogonal to the wave-size port, but a widened case is still owed.
 
+#### The width sweep: 192 VGPRs is past the knee
+
+The wave64 port leaves the tile width free, so it was swept at a fixed 2304-token
+total (m_tiles=1088, k_blocks=20, decode ablated for the share):
+
+| tile | VGPRs | tier | resident lanes | re-decodes/token | full | decode | share |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 80 | 6 | 384 | 18 | 46.80 | 9.34 | 20.0% |
+| 256 | 136 | 3 | 192 | 9 | **46.40** | 5.99 | 12.9% |
+| 384 | 176 | 2 | 128 | 6 | 50.94 | 3.51 | 6.9% |
+
+and at a 2048-token total:
+
+| tile | VGPRs | resident lanes | full | decode | share |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 80 | 384 | 40.81 | 7.85 | 19.2% |
+| 256 | 136 | 192 | 41.22 | 6.65 | 16.1% |
+| 512 | 216 | 128 | 53.71 | 20.63 | 38.4% |
+
+The decode share falls monotonically with width, because there are fewer
+re-decodes, but the total does not: 128 and 256 are a plateau and 384/512 are
+10-30% worse. The 384-token tile sits at 176 VGPRs -- essentially the 192 figure
+often quoted as this architecture sweet spot -- and it is the slowest of the three.
+The reason is in the last column of the fixed-total table: at 128 resident lanes the
+decode's dependent loads stop being hidden, so its cost triples even as its count
+halves.
+
+So the quantity to maximize is neither VGPRs consumed nor waves resident on their
+own, but tokens per resident lane at enough lanes to hide the decode. On this kernel
+that is 128-256 tokens per workgroup at 80-136 VGPRs.
+
+#### The widened tiles hid a real bug
+
+The sweep is also what caught a generator bug worth recording. `widen_tokens`
+derives the ostage->output epilogue for 32 lanes (trip count tok/2, stride 32), and
+the wave64 port only rewrote the *64-token* case, by literal string match. Every
+wider wave64 tile was therefore copying a fraction of its output: wrong results,
+plausible timings. The 64-token fixture passed throughout because that one case was
+correct.
+
+That is exactly the risk flagged when the widened tiles were first measured -- no
+numerical reference -- and it materialised. The epilogue is now derived from the
+tile width (trip count tok/4, stride 64, row/token decode shifting by log2(tok) and
+masking tok-1) and the fixture still passes, but a widened check case remains owed
+before any wide-tile number is treated as final.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both
