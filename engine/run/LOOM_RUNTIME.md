@@ -576,6 +576,52 @@ of the pattern moved the 1088 numbers by under 1% (1.5456 against 1.5463), so da
 content is not what drives the disagreement either; cache and dispatch context are
 the remaining candidates.
 
+### What the decode share does with prompt length
+
+The 5-token question -- how much of prefill is the weight dequant -- has a
+non-obvious answer at length, and it is the same for both engines: the share does
+not move, because both re-decode the weight once per token tile.
+
+HIP, end-to-end, `yah-run` with and without `DecodeQuantSub16`:
+
+| prompt | full | dequant removed | dequant | share |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 831.3 | 678.2 | 153.1 | 18.4% |
+| 2048 | 3432.1 | 2688.2 | 743.9 | 21.7% |
+| 2048, second run | 3715.8 | 2842.0 | 873.8 | 23.5% |
+
+HIP is compute-bound from ~512 tokens on (1.6-1.8 ms/token at both), and its
+256-token output tile amortizes one weight decode over 256 tokens.
+
+HRX cannot run a 2048-token prefill yet -- `loom_forward_target` is a fixed
+5-token batch with hardcoded ids -- but the IQ3_S kStore can be measured at the
+2048-token shape. `safe_bench.py --check-only` gates the shape first, then the
+same shape runs with the decode ablated (`emit_prefill.ablate_decode`, which
+removes the bit math *and* the weight reads it consumed; the ablated build
+declares weight 0):
+
+| kStore, m_tiles=1088 | full | decode removed | decode | share |
+| --- | ---: | ---: | ---: | ---: |
+| 16 tokens, 16-wide tile | 1.541 | 0.193 | 1.348 | 87.5% |
+| 2048 tokens, 16-wide tile (narrowed -- what prefill emits today) | 197.2 | 28.3 | 168.9 | 85.6% |
+| 2048 tokens, 64-wide tile (the 4-N-subtile kernel) | 82.7 | 33.5 | 49.2 | **59.5%** |
+
+Two things fall out. The share is flat in token count (87.5% -> 85.6%), and that
+is the re-decode: HRX decodes a 16x16 weight tile once per workgroup, so with
+`n` tokens it decodes every weight element `n/16` times, while the MMA work
+scales with `n` in exactly the same way. And the tile width is worth 2.4x on its
+own: the narrowed 16-wide tile -- right for a 5-token prefill, where 11 of 16
+lanes would be padding -- decodes each weight element 128 times at 2048 tokens,
+where the 64-wide tile decodes it 32 times, 82.7 ms against 197.2 ms for the same
+work.
+
+So at a realistic prompt length HRX's decode share is 59.5% against HIP's 21.7%,
+and the residual gap splits roughly evenly between decode *rate* (about 58 G
+weight-elements/s here against about 256 G/s for HIP, both derived from the
+ablations above) and decode *count* (4x more: 32 re-decodes per element against
+8). The "at long prompts the MMA dominates" intuition does not hold for either
+engine; only a wider tile moves the share.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both

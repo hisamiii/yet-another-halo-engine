@@ -1,6 +1,6 @@
 // hal_bench: time one GEMM-shaped HAL repeatedly, isolated from the driver.
 //
-// usage: hal_bench <hal> <W> <IN> <OUT> <gx> <gy> <gz> [m_rows] [k_blocks] [tokens] [iters] [wfile]
+// usage: hal_bench <hal> <W> <IN> <OUT> <WST> <OST> <gx> <gy> <gz> [m_rows] [k_blocks] [tokens] [iters] [wfile]
 //
 // The caller supplies the operand sizes. Do NOT compute them by hand: run this
 // through tools/safe_bench.py, which derives them from the shape AND checks them
@@ -44,31 +44,36 @@ static void FillPattern(std::vector<uint8_t>& v) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 8) {
+  if (argc < 10) {
     std::fprintf(stderr,
-                 "usage: hal_bench <hal> <W> <IN> <OUT> <gx> <gy> <gz> "
-                 "[m_rows] [k_blocks] [tokens] [iters]\n");
+                 "usage: hal_bench <hal> <W> <IN> <OUT> <WST> <OST> <gx> <gy> "
+                 "<gz> [m_rows] [k_blocks] [tokens] [iters] [wfile]\n");
     return 2;
   }
   const std::string hal = argv[1];
   const size_t W = strtoull(argv[2], nullptr, 10);
   const size_t IN = strtoull(argv[3], nullptr, 10);
   const size_t OUT = strtoull(argv[4], nullptr, 10);
-  const uint32_t GX = static_cast<uint32_t>(atoi(argv[5]));
-  const uint32_t GY = static_cast<uint32_t>(atoi(argv[6]));
-  const uint32_t GZ = static_cast<uint32_t>(atoi(argv[7]));
-  const size_t MROWS = argc > 8 ? strtoull(argv[8], nullptr, 10) : 0;
-  const size_t KBLK = argc > 9 ? strtoull(argv[9], nullptr, 10) : 0;
-  const size_t TOK = argc > 10 ? strtoull(argv[10], nullptr, 10) : 0;
-  const int iters = argc > 11 ? atoi(argv[11]) : 50;
+  const size_t WST = strtoull(argv[5], nullptr, 10);
+  const size_t OST = strtoull(argv[6], nullptr, 10);
+  const uint32_t GX = static_cast<uint32_t>(atoi(argv[7]));
+  const uint32_t GY = static_cast<uint32_t>(atoi(argv[8]));
+  const uint32_t GZ = static_cast<uint32_t>(atoi(argv[9]));
+  const size_t MROWS = argc > 10 ? strtoull(argv[10], nullptr, 10) : 0;
+  const size_t KBLK = argc > 11 ? strtoull(argv[11], nullptr, 10) : 0;
+  const size_t TOK = argc > 12 ? strtoull(argv[12], nullptr, 10) : 0;
+  const int iters = argc > 13 ? atoi(argv[13]) : 50;
   // Optional real weight blob. The IQ grid index the decode looks up is a function
   // of the stored bytes, so a synthetic pattern drives a different, flatter access
   // distribution than the real tensor does -- and the 1088 geometry is sensitive to
   // exactly that. Feed a real tensor when the question is about the production case.
-  const char* WFILE = argc > 12 ? argv[12] : "";
+  const char* WFILE = argc > 14 ? argv[14] : "";
 
   int bad = 0;
-  if (!W || !IN || !OUT) { std::fprintf(stderr, "W, IN and OUT must be non-zero\n"); bad = 1; }
+  if (!W || !IN || !OUT || !WST || !OST) {
+    std::fprintf(stderr, "W, IN, OUT, WST and OST must be non-zero\n");
+    bad = 1;
+  }
   if (!GX || (MROWS && static_cast<size_t>(GX) * 16 > MROWS)) {
     std::fprintf(stderr, "gx=%u covers %zu rows but m_rows=%zu (K splits go on gz)\n",
                  GX, static_cast<size_t>(GX) * 16, MROWS);
@@ -91,7 +96,7 @@ int main(int argc, char** argv) {
     return 3;
   }
 
-  const size_t GRID = 2048, WST = 64u << 20, OST = 64u << 20;
+  const size_t GRID = 2048;  // the IQ grid table is exactly 512 x i32
   std::fprintf(stderr,
                "hal_bench: grid=%ux%ux%u weight=%zu input=%zu output=%zu iters=%d\n",
                GX, GY, GZ, W, IN, OUT, iters);
