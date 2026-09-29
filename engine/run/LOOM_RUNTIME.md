@@ -734,6 +734,47 @@ reproduces the 128-token tile, which measured 52.4 ms against 48.0 ms for the
 256-token one. The generator for these variants is `tools/widen_tokens.py`; the
 branch-removal experiment needed no committed source change.
 
+#### Getting under 192 VGPRs is a structural change, not a tweak
+
+HIP production kernels sit at 192 VGPRs, so the 256-token tile at 208 is over
+budget. Two cheap explanations were tested and both are refuted:
+
+| hypothesis | test | result |
+| --- | --- | --- |
+| the `word_decode` `scf.if` forces the edge copies | generate a branch-free variant (CPU only) | 25 moves / 13 `branch_edge` units with and without; 24 / 14 for the branch-free one-element decode. The `scf.if` folds, and `branch_edge` is the loop backedge carrying the accumulators |
+| source ordering of rhs loads vs MMAs drives pressure | generate `batch` (16 loads then 16 MMAs) and `interleave` (load/MMA pairs) | identical: 149 moves, peak 189, tier 4 |
+
+So the pressure is the accumulator set itself. At a 16x256 tile one wave of 32
+lanes holds 16 fragments x 8 f32 = 128 VGPRs (`branch_edge` is 129 units, i.e.
+those 128 carried across the backedge plus one), and no reordering changes that.
+Getting under 192 means fewer accumulator registers *per lane*, and there are two
+ways:
+
+- **wave64.** Loom has the schema but nothing uses it -- all 172 kernels in
+  `engine/gpu/loom` declare `subgroup_size = 32`, and `tools/widen_tokens.py`
+  output flipped to 64 is rejected: `matrix constraint 'wave_size' is not
+  satisfied (source_bits=0, target_bits=256)`. The fragment types have to become
+  `vector<8xf16>` and `vector<4xf32>`, which changes the layout the LDS staging
+  must produce. HIP gets 40.6 TFLOPS from `prefill_quant_wave64`, and the tuning
+  notes measure wave64 at 48.50 against 48.35 TFLOPS for the pure WMMA loop, so
+  the half-accumulator win is real -- but it is a from-scratch port with no
+  in-tree example.
+- **Two wave32 subgroups per workgroup, split on N.** Keep `subgroup_size = 32`
+  and the proven fragment layout, launch 64 lanes, and let each subgroup own 128
+  of the 256 tokens: `wave = lane >> 5`, `lane32 = lane & 31`, the decode's j loop
+  becomes one `j` per wave (`r8 = wave * 8`), and each subgroup loads its own rhs
+  and stores its own half in the epilogue while reading the same decoded 16x16
+  weight tile from LDS. Accumulators per lane halve to 64 VGPRs, the decode is
+  still amortized over 256 tokens, and nothing about the fragment schema changes.
+  This is the rewrite to attempt.
+
+Prerequisite before trusting any of it: the 128- and 256-token variants have no
+numerical reference. The existing fixture input is `check.generate.fill value(1.0)`
+over 64 tokens, which makes the widened case cheap to check -- a 128-token case
+with the same all-ones input must produce `expected_out.npy` repeated twice, which
+verifies the sub-tile indexing directly. Build that case first; a register win on an
+unverified tile is not a win.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both

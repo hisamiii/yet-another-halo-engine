@@ -33,7 +33,7 @@ def ensure_scalar_const(lines, val, ty='i32'):
             return lines
     raise SystemExit('no scalar constant anchor')
 
-def widen(text, n_sub):
+def widen(text, n_sub, order='batch'):
     """Duplicate the N sub-tiles of the IQ3_S kStore from 4 (64 tokens) to n_sub*16."""
     n = n_sub
     tok = n * 16
@@ -65,15 +65,31 @@ def widen(text, n_sub):
          % (accs, inits, tys))
 
     # --- rhs loads, MMAs, yield ---
+    # Two orders for the same arithmetic. 'batch' emits every rhs load and then
+    # every MMA, which lets all n rhs fragments be live at once; each
+    # vector<16xf16> is 8 VGPRs, so that is 128 VGPRs on top of 128 accumulator
+    # VGPRs at a 256-token tile. 'interleave' emits load/MMA pairs so a fragment
+    # dies as soon as it is consumed.
     body = []
     body.append('    %lhs = vector.fragment.load<lhs> %wstage_lds_view[%c0, %c0] shape [%m, %k] : view<16x16xf16> -> vector<16xf16>')
     for i in range(1, n):
         body.append('    %%t%d = index.add %%token_base, %%c%d : index' % (16 * i, 16 * i))
-    for i in range(n):
+    def _rhs(i):
         off = '%token_base' if i == 0 else '%%t%d' % (16 * i)
-        body.append('    %%rhs%d = vector.fragment.load<rhs> %%a_t_view[%%kk, %s] shape [%%k, %%n] : view<[%%ktot]x[%%tokens]xf16, %%a_layout> -> vector<16xf16>' % (i, off))
-    for i in range(n):
-        body.append('    %%n%d = vector.mma %%lhs, %%rhs%d, %%a%d : vector<16xf16>, vector<16xf16>, vector<8xf32>' % (i, i, i))
+        return ('    %%rhs%d = vector.fragment.load<rhs> %%a_t_view[%%kk, %s] shape '
+                '[%%k, %%n] : view<[%%ktot]x[%%tokens]xf16, %%a_layout> -> vector<16xf16>') % (i, off)
+    def _mma(i):
+        return ('    %%n%d = vector.mma %%lhs, %%rhs%d, %%a%d : vector<16xf16>, '
+                'vector<16xf16>, vector<8xf32>') % (i, i, i)
+    if order == 'interleave':
+        for i in range(n):
+            body.append(_rhs(i))
+            body.append(_mma(i))
+    else:
+        for i in range(n):
+            body.append(_rhs(i))
+        for i in range(n):
+            body.append(_mma(i))
     body.append('    scf.yield %s : %s' % (', '.join('%%n%d' % i for i in range(n)), tys))
     old_start = None
     for i, l in enumerate(lines):
