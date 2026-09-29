@@ -91,6 +91,14 @@ matching case for.
   metadata), `LoomBuffer`, and `LoomDevice::Config(...)`.
   `engine/run/loom_probe.cc` is now written against it and still passes.
 
+`emit_prefill.py <model.gguf> <outdir>` now emits the **complete** prefill HAL
+set: every GEMM HAL plus the fixed kernels (`norm`, `conv`, `prepkq`, `prepab`,
+`rowsplit`, `postnorm`, `unpack`, `rope`, `wmma`, `cast`, `rmsnorm`, `gemv`,
+`argmax`) at the shard's shapes, and the IQ grid/sign tables copied from
+`engine/gpu/loom/tables/` (extracted once from the ggml format tables and
+committed). `emit_decode.py` reuses it and overwrites the fixed kernels with the
+decode variants, so one command each reproduces both HAL sets with no `/tmp`
+bootstrap. A whole-engine run is therefore reproducible from the checkout.
 ## 4. Real-weight verification (GGUF mmap -> HRX -> Loom)
 
 `LoomDevice::Import` wraps `hrx_allocator_import_buffer`; the GGUF tensor-data

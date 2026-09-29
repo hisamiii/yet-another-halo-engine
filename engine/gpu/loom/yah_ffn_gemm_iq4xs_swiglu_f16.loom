@@ -41,6 +41,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs_swiglu() {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c4 = index.constant 4 : index
+  %c2 = index.constant 2 : index
   %c8 = index.constant 8 : index
   %c16 = index.constant 16 : index
   %c32 = index.constant 32 : index
@@ -129,22 +130,29 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs_swiglu() {
     %kk_i = index.cast %kk : index to i32
     %kbase = scalar.andi %kk_i, %c255i : i32
     %kblk = scalar.shrui %kk_i, %c8i : i32
-    %j_sink = scf.for %j = [%c0 to %c8 step %c1](%mk = %c0 : index) -> (index) {
+    %c_i = scalar.andi %lane_i, %c15i : i32
+    %i_i = scalar.addi %kbase, %c_i : i32
+    %group = scalar.shrui %i_i, %c5i : i32
+    %within = scalar.andi %i_i, %c31i : i32
+    %l_i = scalar.andi %within, %c15i : i32
+    %high = scalar.shrui %within, %c4i : i32
+    %blk_off0 = scalar.muli %kblk, %c144i : i32
+    %g16 = scalar.shli %group, %c4i : i32
+    %is_hi = scalar.cmpi eq, %high, %c1i : i32
+    %gpar = scalar.andi %group, %c1i : i32
+    %sh4 = scalar.shli %gpar, %c2i : i32
+    %gh = scalar.shrui %group, %c1i : i32
+    %sh2 = scalar.shli %group, %c1i : i32
+    %c_ix = index.cast %c_i : i32 to index
+    %c_idx = index.max %c_ix, %c0 : index
+    %j_sink = scf.for %j = [%c0 to %c8 step %c1](%mk = %c0 : index) -> (index) unroll(%c2) schedule(interleaved) {
       %j_i = index.cast %j : index to i32
       %j32 = scalar.shli %j_i, %c5i : i32
       %e_i = scalar.addi %lane_i, %j32 : i32
       %r_i = scalar.shrui %e_i, %c4i : i32
-      %c_i = scalar.andi %e_i, %c15i : i32
-      %i_i = scalar.addi %kbase, %c_i : i32
-      %group = scalar.shrui %i_i, %c5i : i32
-      %within = scalar.andi %i_i, %c31i : i32
-      %l_i = scalar.andi %within, %c15i : i32
-      %high = scalar.shrui %within, %c4i : i32
       %row_i = scalar.addi %m_origin_i, %r_i : i32
       %row_off = scalar.muli %row_i, %bpr_i : i32
-      %blk_off0 = scalar.muli %kblk, %c144i : i32
       %blk_off = scalar.addi %row_off, %blk_off0 : i32
-      %g16 = scalar.shli %group, %c4i : i32
       %qs0 = scalar.addi %blk_off, %c8i : i32
       %qs1 = scalar.addi %qs0, %g16 : i32
       %qs2 = scalar.addi %qs1, %l_i : i32
@@ -155,7 +163,6 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs_swiglu() {
       %qb = scalar.extui %qb8 : i8 to i32
       %nib_lo = scalar.andi %qb, %c15i : i32
       %nib_hi = scalar.shrui %qb, %c4i : i32
-      %is_hi = scalar.cmpi eq, %high, %c1i : i32
       %nib = scf.if %is_hi -> (i32) {
         scf.yield %nib_hi : i32
       } else {
@@ -247,9 +254,6 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs_swiglu() {
         }
         scf.yield %cb0_8 : f32
       }
-      %gpar = scalar.andi %group, %c1i : i32
-      %sh4 = scalar.shli %gpar, %c2i : i32
-      %gh = scalar.shrui %group, %c1i : i32
       %sl0 = scalar.addi %blk_off, %c4i : i32
       %sl1 = scalar.addi %sl0, %gh : i32
       %sl_ix = index.cast %sl1 : i32 to index
@@ -273,7 +277,6 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs_swiglu() {
       %shv1 = scalar.extui %shb1 : i8 to i32
       %shv1s = scalar.shli %shv1, %c8i : i32
       %shv = scalar.ori %shv0, %shv1s : i32
-      %sh2 = scalar.shli %group, %c1i : i32
       %sc_hi_all = scalar.shrui %shv, %sh2 : i32
       %sc_hi = scalar.andi %sc_hi_all, %c3i : i32
       %sc_hi4 = scalar.shli %sc_hi, %c4i : i32
@@ -289,8 +292,6 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs_swiglu() {
       %dsc = scalar.mulf %d, %sc_f : f32
       %value = scalar.mulf %dsc, %code : f32
       %h = scalar.fptrunc %value : f32 to f16
-      %c_ix = index.cast %c_i : i32 to index
-      %c_idx = index.max %c_ix, %c0 : index
       %row_local = index.cast %r_i : i32 to index
       view.store %h, %wstage_lds_view[%row_local, %c_idx] : f16, view<16x16xf16>
       scf.yield %mk : index
