@@ -9,6 +9,9 @@ where kind is kstore|residual|swiglu.
 import os, re, shutil, struct, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Token-tile width for the emitted GEMM family. Prefill narrows to 16 (only kB
+# real tokens are read); the decode path keeps the original 64.
+TOKEN_TILE = int(os.environ.get("YAH_TOKEN_TILE", "16"))
 LOOM = os.path.abspath(os.path.join(HERE, ".."))
 EMIT = os.path.join(LOOM, "emit_hal.py")
 
@@ -58,10 +61,49 @@ def sym_of(loomfile):
     return re.search(r"config\.decl @([A-Za-z0-9_]+)\.m_tiles", text).group(1)
 
 
+def narrow_tokens(text):
+    """Rewrite a GEMM kernel to a 16-wide token tile.
+
+    The prefill pads kB real tokens to a 64-wide tile, so 3/4 of the rhs loads,
+    MMAs and epilogue stores are waste. The element loop maps lane l to column
+    l&15, and the epilogue decodes (row, token) with a shift/mask pair, so the
+    same source narrows structurally: only n-group 0 survives and the token
+    decode becomes 16 wide. Only tokens 0..kB-1 are ever read, so the driver and
+    every other kernel are unchanged."""
+    keep = []
+    for line in text.split(chr(10)):
+        if "%tokens = index.mul %token_tiles, %c64" in line or \
+           "%token_base = index.mul %wg_y, %c64" in line:
+            keep.append(line.replace("%c64", "%c16"))
+        elif re.search(r"%rhs[123] = vector\.fragment\.load<rhs>", line):
+            continue
+        elif re.search(r"%n[123] = vector\.mma", line):
+            continue
+        elif line.strip().startswith("scf.yield %n0, %n1, %n2, %n3"):
+            keep.append(line.replace("scf.yield %n0, %n1, %n2, %n3",
+                                     "scf.yield %n0, %a1, %a2, %a3"))
+        elif re.search(r"vector\.fragment\.store<result> %acc[123],", line):
+            continue
+        elif "scf.for %j2 = [%c0 to %c32 step %c1]" in line:
+            keep.append(line.replace("%c32", "%c8"))
+        elif "%r2_i = scalar.shrui %e2_i, %c6i" in line:
+            keep.append(line.replace("%c6i", "%c4i"))
+        elif "%tok_i = scalar.andi %e2_i, %c63i" in line:
+            keep.append(line.replace("%c63i", "%c15i"))
+        else:
+            keep.append(line)
+    return chr(10).join(keep)
+
 def emit(loomfile, configs, outname, outdir):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
-    r = subprocess.run([sys.executable, EMIT, os.path.join(LOOM, loomfile), tmp] + configs,
+    src = os.path.join(LOOM, loomfile)
+    if os.path.basename(loomfile).startswith("yah_ffn_gemm_") and TOKEN_TILE == 16:
+        src_tmp = os.path.join(tmp, os.path.basename(loomfile))
+        with open(src_tmp, "w") as fh:
+            fh.write(narrow_tokens(open(src).read()))
+        src = src_tmp
+    r = subprocess.run([sys.executable, EMIT, src, tmp] + configs,
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit("emit failed for " + loomfile + ": " + r.stdout + r.stderr)
@@ -105,7 +147,7 @@ def main():
             emit(f, [f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}", f"{sym}.token_tiles=1"],
                  f"gemm_swiglu_{fmt}_{mt}_{kb}.hal", outdir); n += 1
     # The residual reduction: hidden += sum_s partial[s], dim = hidden * 64 tokens.
-    emit("yah_residual_add_1d_f32.loom", ["yah_residual_1d.dim=327680"],
+    emit("yah_residual_add_1d_f32.loom", ["yah_residual_1d.dim=%d" % (5120 * TOKEN_TILE)],
          "accum.hal", outdir); n += 1
     # The fixed prefill kernels at the shard's shapes.
     fixed = [

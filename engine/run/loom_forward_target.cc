@@ -37,7 +37,12 @@ constexpr std::uint32_t kCtx = 8;
 constexpr std::uint32_t kCache = kCtx * kKvHeads * kHeadDim;
 constexpr std::uint32_t kVocab = 248320;
 // hidden elements per dispatch: 5120 rows x the 64-token tile.
-constexpr std::uint32_t kOutTotal = kHidden * 64;
+#ifndef YAH_TOKEN_TILE
+#define YAH_TOKEN_TILE 16
+#endif
+// K-split reduction extent: the GEMM token tile is YAH_TOKEN_TILE wide, so the
+// residual partials cover that many tokens of hidden.
+constexpr std::uint32_t kOutTotal = kHidden * YAH_TOKEN_TILE;
 // K-split factor for the residual projections (even: the reduction ping-pongs).
 constexpr std::uint32_t kSplit = 4;
 static_assert(kSplit % 2 == 0, "kSplit must be even");

@@ -36,6 +36,7 @@ def emit(loomfile, outdir, outname, configs):
 
 def main():
     model, outdir = sys.argv[1], sys.argv[2]
+    os.environ["YAH_TOKEN_TILE"] = "64"  # decode keeps the 64-wide tile
     os.makedirs(outdir, exist_ok=True)
     subprocess.run([sys.executable, PREFILL, model, outdir], check=True)
     emit("yah_half_norm_f16.loom", outdir, "norm.hal",

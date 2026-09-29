@@ -407,6 +407,27 @@ the 240 G warp-insn/s peak.
 
 Current prefill: **~765 ms** against the HIP `best_ms` of 389.8-415 ms, i.e.
 ~1.9x, down from 4407 ms for the first correctness-first port.
+### Narrowing the token tile to 16
+
+The prefill pads `kB` real tokens to a 64-wide tile, so 3/4 of the rhs loads,
+MMAs and epilogue stores are waste. The element loop maps lane `l` to column
+`l&15`, and the epilogue decodes `(row, token)` with a shift/mask pair, so the
+same source narrows structurally: drop n-groups 1..3, re-yield the untouched
+accumulators, and make the token decode 16 wide. `emit_prefill.py` does this
+(`narrow_tokens`) for every `yah_ffn_gemm_*` source; `TOKEN_TILE` (env
+`YAH_TOKEN_TILE`) selects 16 or 64 and the residual reduction extent follows
+(`kOutTotal = kHidden * YAH_TOKEN_TILE` in the prefill driver).
+
+Result: **bit-identical** output (final residual max_abs 0.0 against the 64-wide
+build) and a paired 805 -> 658 ms on the same run, ~18%. The decode path opts
+out (`YAH_TOKEN_TILE=64`) because it uses a different geometry, and only tokens
+0..kB-1 are ever read, so no other driver change is needed.
+
+Measured splits for the IQ3_S kStore at `m_tiles=1088, k_blocks=20`, via
+`engine/run/hal_bench.cc`: baseline 1.93 ms; the two per-K-step workgroup
+barriers removed 1.92 ms (free); the whole decode replaced by `d` 0.90 ms, so
+the decode is ~53% and the structural rhs/MMA/epilogue ~47%; the 16-wide tile
+1.67 ms.
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.

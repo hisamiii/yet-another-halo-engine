@@ -36,6 +36,7 @@ constexpr std::uint32_t kKvHeads = 4;
 constexpr std::uint32_t kHeadDim = 256;
 constexpr std::uint32_t kVocab = 248320;
 // hidden elements per dispatch: 5120 rows x the 64-token tile.
+// K-split reduction extent: the decode GEMMs keep the 64-wide token tile.
 constexpr std::uint32_t kOutTotal = kHidden * 64;
 constexpr std::uint32_t kSplit = 4;
 static_assert(kSplit % 2 == 0, "kSplit must be even");
