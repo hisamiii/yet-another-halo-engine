@@ -984,11 +984,12 @@ Two hardcoded workgroup sizes were wrong, and they invalidated the first pass at
 this sweep.
 
 * `hal_bench` was stale relative to its own source and reported numbers ~3.5x
-  faster than that source produces. Rebuilt, the shipping wave32 IQ3_S kStore at
-  `m_tiles=1088` with one 16-token tile takes **1.54 ms**, against the pipeline's
-  own per-dispatch ffn gate of `110.6 ms / 64 layers = 1.73 ms`; the stale binary
-  said 0.42 ms. The harness now prints `wg=` so the launch geometry is in the
-  transcript.
+  faster than that source produces. The stale binary said 0.42 ms for the shipping
+  wave32 IQ3_S kStore at `m_tiles=1088` with one 16-token tile. Rebuilt, the same
+  call gives **1.54 ms**, and the pipeline's own per-dispatch breakdown
+  (`YAH_LOOM_TIME=2`) puts `yah_ffn_gemm_iq3s` at `78.2 ms / 62 dispatches =
+  1.26 ms` -- agreement to 22%, against the stale binary's 3.7x. The harness now
+  prints `wg=` so the launch geometry is in the transcript.
 * `loom_forward_target.cc` passed `sx=32` at every GEMM site, so substituting a
   wave64 HAL launched half a workgroup: plausible timing, garbage output, and
   nondeterministic across runs (argmax 11751 -> 248320 and 1076).
@@ -1050,6 +1051,33 @@ superseded section above concluded.
 Fourth, the register wall is bracketed from both sides: 64 x 256 spends all 256
 VGPRs plus 1984 B of private memory and lands at 232 ms; 128 x 128 spends 240
 VGPRs plus 1760 B and lands at 159.5 ms; 128 x 256 does not allocate at all.
+
+##### Where the prefill time actually is
+
+`YAH_LOOM_TIME=2` on the shipping HAL set (5-token prefill, 64 layers, ~636 ms
+total) by kernel name, top ten:
+
+| kernel | ms | dispatches | ms each |
+| --- | ---: | ---: | ---: |
+| yah_ffn_gemm_iq3s | 78.2 | 62 | 1.26 |
+| yah_ffn_gemm_q4k | 60.2 | 70 | 0.86 |
+| yah_ffn_gemm_iq3s_residual | 60.1 | 41 | 1.47 |
+| yah_ffn_gemm_iq4xs | 55.8 | 40 | 1.40 |
+| yah_ffn_gemm_iq3xxs_residual | 47.2 | 40 | 1.18 |
+| yah_ffn_gemm_iq4xs_swiglu | 38.7 | 23 | 1.68 |
+| yah_ffn_gemm_iq3s_swiglu | 37.7 | 20 | 1.89 |
+| yah_ffn_gemm_iq3xxs_swiglu | 30.1 | 19 | 1.58 |
+| yah_ffn_gemm_iq3xxs | 29.9 | 21 | 1.43 |
+| yah_ffn_gemm_q5k | 21.0 | 42 | 0.50 |
+
+The single-kernel harness reproduces the iq3s kStore to 22% (1.54 against 1.26),
+so the two surfaces now agree. Note the shape of this: the GEMM family is ~500 of
+the 636 ms and every dispatch is 0.3-1.9 ms, so the prefill is a long sequence of
+small, latency-bound dispatches, not a few large ones. With 1088 workgroups and 64
+resident waves per CU the production GEMM is also *under-occupied*: the same
+kernel in a 128-token-tile grid (139k workgroups) reaches 0.47 ms per
+1088-workgroup equivalent, 3.3x better, which is the throughput regime the
+corrected sweep below measures.
 
 ##### The production shape, and why wave64 does not ship
 
