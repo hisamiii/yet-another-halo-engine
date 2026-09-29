@@ -529,7 +529,8 @@ exact: `word_decode=0` emits byte-for-byte the previous kernel's HSACO and
 `word_decode=1` the new one, so every emitted HAL is one of those two machine
 codes and there is no third variant. The re-emitted directory is byte-identical
 to the hand-assembled hybrid, and reproduces 662.9 ms against 675.8 ms for the
-previous source in a later paired run. The decode set is emitted from the
+previous source in a later paired run. The emitted set is kept at `/home/q/yah-hal-t16-wd` (the machine drift
+baseline for it is `/home/q/yah-hal-t16`). The decode set is emitted from the
 same source (`emit_decode.py` reuses `emit_prefill.py`), and `engine/tests/generate_gate.sh`
 still passes the 20-token reference with the new selection.
 
