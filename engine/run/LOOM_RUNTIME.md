@@ -529,7 +529,9 @@ exact: `word_decode=0` emits byte-for-byte the previous kernel's HSACO and
 `word_decode=1` the new one, so every emitted HAL is one of those two machine
 codes and there is no third variant. The re-emitted directory is byte-identical
 to the hand-assembled hybrid, and reproduces 662.9 ms against 675.8 ms for the
-previous source in a later paired run.
+previous source in a later paired run. The decode set is emitted from the
+same source (`emit_decode.py` reuses `emit_prefill.py`), and `engine/tests/generate_gate.sh`
+still passes the 20-token reference with the new selection.
 
 Remaining split at `m_tiles=1088`: 1.729 ms with the word decode and 1.947 ms
 without, and 0.861 ms with the decode replaced by `d`, so the decode is ~46% of
