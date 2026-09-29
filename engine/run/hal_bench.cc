@@ -1,6 +1,6 @@
 // hal_bench: time one GEMM-shaped HAL repeatedly, isolated from the driver.
 //
-// usage: hal_bench <hal> <W> <IN> <OUT> <gx> <gy> <gz> [m_rows] [k_blocks] [tokens] [iters]
+// usage: hal_bench <hal> <W> <IN> <OUT> <gx> <gy> <gz> [m_rows] [k_blocks] [tokens] [iters] [wfile]
 //
 // The caller supplies the operand sizes. Do NOT compute them by hand: run this
 // through tools/safe_bench.py, which derives them from the shape AND checks them
@@ -61,6 +61,11 @@ int main(int argc, char** argv) {
   const size_t KBLK = argc > 9 ? strtoull(argv[9], nullptr, 10) : 0;
   const size_t TOK = argc > 10 ? strtoull(argv[10], nullptr, 10) : 0;
   const int iters = argc > 11 ? atoi(argv[11]) : 50;
+  // Optional real weight blob. The IQ grid index the decode looks up is a function
+  // of the stored bytes, so a synthetic pattern drives a different, flatter access
+  // distribution than the real tensor does -- and the 1088 geometry is sensitive to
+  // exactly that. Feed a real tensor when the question is about the production case.
+  const char* WFILE = argc > 12 ? argv[12] : "";
 
   int bad = 0;
   if (!W || !IN || !OUT) { std::fprintf(stderr, "W, IN and OUT must be non-zero\n"); bad = 1; }
@@ -99,6 +104,16 @@ int main(int argc, char** argv) {
   std::vector<uint8_t> hw(W), hg(GRID);
   FillPattern(hw);
   FillPattern(hg);
+  if (WFILE[0]) {
+    FILE* wf = std::fopen(WFILE, "rb");
+    if (!wf) { std::fprintf(stderr, "hal_bench: cannot open %s\n", WFILE); return 2; }
+    const size_t got = std::fread(hw.data(), 1, W, wf);
+    std::fclose(wf);
+    if (got != W) {
+      std::fprintf(stderr, "hal_bench: %s has %zu bytes, need %zu\n", WFILE, got, W);
+      return 2;
+    }
+  }
   std::vector<uint8_t> hin(IN);
   for (size_t i = 0; i + 1 < IN; i += 2) {  // f16 0.5, little endian
     hin[i] = 0x00;

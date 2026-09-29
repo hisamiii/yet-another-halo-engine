@@ -540,6 +540,42 @@ without, and 0.861 ms with the decode replaced by `d`, so the decode is ~46% of
 the kernel and the structural rhs/MMA/epilogue ~54%. The 2.4x HIP dequant gap
 quoted above is closed on paper at 384/640/768 and open at 1088.
 
+### The 1088 geometry, and why the grid table is not the answer
+
+The decode's critical path is two dependent global loads: the qs byte selects a
+grid word, and the grid word selects the magnitudes. Staging the 512-word grid
+into 2 KB of LDS removes the second one, and in isolation that is worth 6.3% at
+`m_tiles=1088` on the word decode (1.5456 -> 1.4451 ms). It does not survive the
+pipeline. All four combinations of {global, LDS grid} x {word, one-element}
+decode, three interleaved runs each, every arm issuing identical output:
+
+| 1088 kStore | isolation | per-dispatch in situ | gate arm | layers_ms |
+| --- | ---: | ---: | ---: | ---: |
+| global grid, one element per lane | 1.6925 | 78.7 | **110.2** | **627.8** |
+| LDS grid, word decode | 1.4451 | 85.3 | 115.9 | 633.6 |
+| global grid, word decode | 1.5456 | 96.7 | 127.0 | 645.9 |
+| LDS grid, one element per lane | 2.2992 | 100.4 | 131.7 | 652.7 |
+
+The surfaces agree about the LDS axis -- staging the grid helps the word decode
+and wrecks the one-element decode, in both -- and disagree about old versus word
+under the global grid, which is exactly the comparison the deployed selection
+rests on. The per-dispatch column is an independent measurement
+(`YAH_LOOM_TIME=2` synchronizes around every dispatch, so no category boundary can
+move work between arms) and it reproduces the gate-arm ordering. The LDS grid was
+therefore rejected, and the selection already in place -- word decode at
+384/640/768, the original at 1088 -- is the best of the four.
+
+Calibration worth keeping: at 384/640/768 the isolated harness predicts the
+pipeline to within 2% (word decode predicted -0.50 ms per dispatch, measured
+-0.51 over 35 dispatches). At 1088 it does not, in either direction. Screen with
+it at the mixer geometries; confirm at 1088 in situ.
+
+The harness also takes a real weight blob now (`--wfile`), because the grid index
+is a function of the stored bytes. Feeding a real `blk.*.ffn_gate.weight` in place
+of the pattern moved the 1088 numbers by under 1% (1.5456 against 1.5463), so data
+content is not what drives the disagreement either; cache and dispatch context are
+the remaining candidates.
+
 ### Benchmarking took the box down twice
 
 Two reboots on 2026-09-29 came from this harness, not from a kernel bug. Both

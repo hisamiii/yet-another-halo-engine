@@ -58,9 +58,12 @@ def main():
     bindings = args[11:]
     tokens = tokens_per_wg * token_tiles
     iters = 50
+    wfile = ""
     for f in flags:
         if f.startswith("--iters="):
             iters = int(f.split("=", 1)[1])
+        elif f.startswith("--wfile="):
+            wfile = f.split("=", 1)[1]
 
     # The formulas the kernels themselves use. A split-K arm writes its partials
     # at split*m_rows*tokens, so its output and ostage extents scale with k_split
@@ -115,6 +118,8 @@ def main():
         print("safe_bench: REFUSING: grid inconsistent with the shape")
         return 3
     extra = [str(x) for x in (W, IN, OUT, gx, gy, gz, m_rows, k_blocks, tokens, iters)]
+    if wfile:
+        extra.append(wfile)
     rc = subprocess.call(["/home/q/yah-bin/hal_bench", hal] + extra)
     return rc
 
