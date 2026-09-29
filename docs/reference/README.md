@@ -32,7 +32,8 @@ reference; they are data, not instructions for this repo.
 | Occupancy / register pressure | measured: 88 VGPRs -> 10 subgroups/SIMD, ~40 workgroups/CU; not the limiter. |
 | Minimize live variables (register pressure) | the decode hoist cut live values and correlated with a large speedup. |
 | Avoid divergent warps | the three decode selects lower to `v_cndmask`, not branches; no divergence. |
-| LDS bank conflicts; pad to avoid power-of-two strides | **open.** The staging tiles are `16x16 f16` (power-of-two stride); worth checking. |
+| LDS bank conflicts; pad to avoid power-of-two strides | minor. The staging store is only 2-way conflicted, and the compiler already hoists the block aux down to 8 `global_load_i8` in a 368-instruction kernel, so staging the weight block through LDS would move work rather than remove it. |
+| Reduce arithmetic, not loads | the arm is ALU/stall-bound: 84 vector-integer ops, 32 scalar adds, 41 `s_delay_alu`, 25 moves, 8 loads. |
 | Software pipelining / double-buffering to overlap decode and MMA | **measured, not the lever.** Removing both per-K-step workgroup barriers changed the IQ3_S kStore by <1% (1.9291 -> 1.9235 ms), so the barriers are free and there is nothing to pipeline around. |
 | Avoid wasted work from padding (tile to the real shape) | **applied.** The GEMM token tile is narrowed 64 -> 16; bit-identical, paired 805 -> 658 ms (~18%). See `engine/run/LOOM_RUNTIME.md`. |
 | MFMA <-> VALU co-execution (attention) | not applicable directly (gfx1151 WMMA, not MFMA). |
