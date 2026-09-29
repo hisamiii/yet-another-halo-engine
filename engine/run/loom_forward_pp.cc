@@ -269,7 +269,8 @@ int main(int argc, char** argv) {
   // kStore variant is the chained one. The accumulate is unchanged -- the kStore
   // writes the same token-major [B][m_rows] layout into 'partial' split 0, and
   // the reduction below adds that into the residual exactly as before.
-  const char* ks_residual = std::getenv("YAH_KSTORE_RESIDUAL");
+  const char* ks_env = std::getenv("YAH_KSTORE_RESIDUAL");
+  const std::string ks_residual = ks_env ? std::string(ks_env) : std::string();
   try {
     auto gguf = yah::core::Gguf::Open(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
@@ -525,7 +526,12 @@ int main(int argc, char** argv) {
       // Narrow the kStore swap to ffn_down until its output layout is proven
       // against the residual's partial. Routing all three residual projections at
       // once made one bad path corrupt the whole residual stream.
-      const bool kres = ks_residual != nullptr && wname.find(ks_residual) != std::string::npos;
+      // Default ON: route every residual projection through the chained kStore.
+      // YAH_KSTORE_RESIDUAL=off restores the residual source; any other value
+      // selects only the projections whose weight name contains it.
+      const bool kres = ks_residual.empty()
+                            ? true
+                            : (ks_residual != "off" && wname.find(ks_residual) != std::string::npos);
       const auto* tw = find(wname);
       Fmt f{};
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) throw LoomError("no residual port for type on " + wname);

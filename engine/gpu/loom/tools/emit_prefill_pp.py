@@ -120,7 +120,7 @@ def main():
         # byte-identical to before. The residual HAL is still emitted either way,
         # and the driver loads by exact name, so nothing changes until the driver
         # is taught to ask for the kStore variant.
-        if kind == "residual" and os.environ.get("YAH_KSTORE_RESIDUAL") == "1":
+        if kind == "residual" and os.environ.get("YAH_KSTORE_RESIDUAL") != "off":
             kf = "yah_ffn_gemm_%s_f32.loom" % port
             kuse = E.chain_applies(kf, tile=TILE) and mt % ROWGRP == 0
             ktile = TILE if kuse else 64
