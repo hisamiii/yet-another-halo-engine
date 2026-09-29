@@ -82,11 +82,16 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
               std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
               const std::vector<hrx_buffer_ref_t>& b) {
+  // The executable's own workgroup size is authoritative; sx is only the
+  // fallback for metadata that does not carry one. Every GEMM site passes 32,
+  // so a wave64 kernel used to launch half a wavegroup here (wrong output,
+  // nondeterministic across runs, and a bogus speedup).
+  const std::uint32_t ordinal = exe.OrdinalOrZero(name);
+  const std::uint32_t ws = exe.WorkgroupSize(ordinal);
   if (g_time >= 2) gpu.Synchronize();
   g_mark = std::chrono::steady_clock::now();
-  gpu.Dispatch(exe, exe.OrdinalOrZero(name),
-               LoomDevice::Config(gx, gy, gz, sx, sy, sz), nullptr, 0, b.data(),
-               b.size());
+  gpu.Dispatch(exe, ordinal, LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz),
+               nullptr, 0, b.data(), b.size());
   if (g_time >= 2) {
     gpu.Synchronize();
     g_per_name[name] += std::chrono::duration<double, std::milli>(

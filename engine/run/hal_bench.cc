@@ -128,24 +128,30 @@ int main(int argc, char** argv) {
   gpu.H2D(grid, hg.data(), GRID);
   gpu.H2D(input, hin.data(), IN);
 
-  auto cfg = LoomDevice::Config(GX, GY, GZ, 32, 1, 1);
+  const char* name = e.names.empty() ? "?" : e.names[0].c_str();
+  const uint32_t ordinal = e.OrdinalOrZero(name);
+  // The executable's own workgroup size, not a hardcoded 32. A wave64 kernel
+  // launched with 32 threads runs half a wavegroup: it reads as a large
+  // speedup because half the output tile is never computed.
+  const uint32_t ws = e.WorkgroupSize(ordinal);
+  auto cfg = LoomDevice::Config(GX, GY, GZ, ws ? ws : 32, 1, 1);
   std::vector<hrx_buffer_ref_t> b = {{weight.handle,0,W},{grid.handle,0,GRID},
       {input.handle,0,IN},{wstage.handle,0,WST},{ostage.handle,0,OST},
       {output.handle,0,OUT}};
-  const char* name = e.names.empty() ? "?" : e.names[0].c_str();
   // One dispatch at a time up front: if the first hangs it shows up here rather
   // than more dispatches deep into an already wedged ring.
   for (int i = 0; i < 3; ++i) {
-    gpu.Dispatch(e, e.OrdinalOrZero(name), cfg, nullptr, 0, b.data(), b.size());
+    gpu.Dispatch(e, ordinal, cfg, nullptr, 0, b.data(), b.size());
     gpu.Synchronize();
   }
   auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < iters; ++i)
-    gpu.Dispatch(e, e.OrdinalOrZero(name), cfg, nullptr, 0, b.data(), b.size());
+    gpu.Dispatch(e, ordinal, cfg, nullptr, 0, b.data(), b.size());
   gpu.Synchronize();
   const double ms =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
           .count() / iters;
-  std::printf("%-28s gx=%-5u gy=%-3u gz=%-3u %.4f ms\n", name, GX, GY, GZ, ms);
+  std::printf("%-28s gx=%-5u gy=%-3u gz=%-3u wg=%-3u %.4f ms\n", name, GX, GY,
+              GZ, ws ? ws : 32, ms);
   return 0;
 }

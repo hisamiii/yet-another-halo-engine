@@ -133,6 +133,17 @@ struct LoomExecutable {
     }
     return 0;
   }
+  // The workgroup size this export was compiled with, or 0 when the metadata
+  // does not carry it. Callers used to hardcode this (32 at every GEMM site),
+  // which is wrong for any kernel declared with a different workgroup size: a
+  // wave64 kernel launched with 32 threads runs half a wavegroup, so it both
+  // computes the wrong tile and looks fast.
+  [[nodiscard]] uint32_t WorkgroupSize(uint32_t ordinal) const {
+    if (ordinal < infos.size() && infos[ordinal].workgroup_size[0] != 0) {
+      return infos[ordinal].workgroup_size[0];
+    }
+    return 0;
+  }
 };
 
 class LoomDevice {
