@@ -4,6 +4,8 @@
 // generated ones) using the dedicated decode kernels for attention and the
 // recurrent state, and the token_tiles=1 prefill GEMM HALs for the projections
 // (only token 0 of each 64-token tile is used, which is correct but wasteful).
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -76,13 +78,28 @@ bool FmtOf(std::uint32_t type, Fmt* out) {
 struct Imported { hrx_buffer_t handle; std::size_t offset; std::size_t bytes; };
 
 
+// YAH_LOOM_TIME=2: synchronize around every dispatch and total the wall time
+// per kernel name. It serializes the stream, so it attributes time rather than
+// measuring throughput; read decode_ms from an untimed run.
+int g_time = 0;
+std::map<std::string, double> g_per_name;
+std::map<std::string, int> g_per_count;
+
 void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
               std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
               const std::vector<hrx_buffer_ref_t>& b) {
+  if (g_time >= 2) gpu.Synchronize();
+  const auto mark = std::chrono::steady_clock::now();
   gpu.Dispatch(exe, exe.OrdinalOrZero(name),
                LoomDevice::Config(gx, gy, gz, sx, sy, sz), nullptr, 0, b.data(),
                b.size());
+  if (g_time >= 2) {
+    gpu.Synchronize();
+    g_per_name[name] += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - mark).count();
+    g_per_count[name]++;
+  }
 }
 
 void ReadFile(const char* path, void* dst, std::size_t bytes) {
@@ -156,6 +173,7 @@ int main(int argc, char** argv) {
     else { std::fprintf(stderr, "yah-hrx: unknown argument %s\n", a.c_str()); return 2; }
   }
   if (dir.empty()) { std::fprintf(stderr, "yah-hrx: --hal DIR is required\n"); return 2; }
+  { const char* t = std::getenv("YAH_LOOM_TIME"); g_time = t ? std::atoi(t) : 0; }
   try {
     auto gguf = yah::core::Gguf::Open(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
@@ -267,12 +285,12 @@ int main(int argc, char** argv) {
     LoomExecutable& e_accum = load(dir + "/accum.hal");
 
     auto run_norm = [&](const std::string& wname) {
-      const auto* tw = find(wname);
-      LoomBuffer w = gpu.Allocate(std::size_t{kHidden} * 4);
-      gpu.H2D(w, gguf.Data(*tw), std::size_t{kHidden} * 4);
+      // Bound as a view into the GGUF import: a per-layer Allocate + H2D here
+      // cost a blocking copy and an allocator round trip per norm per token.
+      const Imported w = ImportTensor(*find(wname));
       std::vector<hrx_buffer_ref_t> b = {
           {hidden.handle, 0, hb(hidden)}, {reszero.handle, 0, hb(reszero)},
-          {w.handle, 0, hb(w)}, {sumout.handle, 0, hb(sumout)},
+          {w.handle, w.offset, w.bytes}, {sumout.handle, 0, hb(sumout)},
           {scratch.handle, 0, hb(scratch)}};
       Dispatch(gpu, e_norm, "yah_half_norm", 1, 1, 1, 32, 1, 1, b);
     };
@@ -350,7 +368,9 @@ int main(int argc, char** argv) {
     const Imported owt = ImportTensor(*ow);
 
     std::vector<std::uint32_t> gen;
+    std::vector<double> step_ms;
     for (std::uint32_t pos = 0; pos < first + gen_count - 1; ++pos) {
+      const auto step_start = std::chrono::steady_clock::now();
       const std::uint32_t tok = (pos < first) ? prompt[pos] : gen[pos - first];
       if (static_cast<std::uint32_t>(emb->type) == 23) DequantIq4XsRow(gguf.Data(*emb), tok, host_hidden.data());
       else DequantQ4KRow(gguf.Data(*emb), tok, host_hidden.data());
@@ -375,17 +395,15 @@ int main(int argc, char** argv) {
           }
           const auto* qn = find(pre + "attn_q_norm.weight");
           const auto* kn = find(pre + "attn_k_norm.weight");
-          LoomBuffer wqn = gpu.Allocate(std::size_t{kHeadDim} * 4);
-          LoomBuffer wkn = gpu.Allocate(std::size_t{kHeadDim} * 4);
-          gpu.H2D(wqn, gguf.Data(*qn), std::size_t{kHeadDim} * 4);
-          gpu.H2D(wkn, gguf.Data(*kn), std::size_t{kHeadDim} * 4);
+          const Imported wqn = ImportTensor(*qn);
+          const Imported wkn = ImportTensor(*kn);
           const std::size_t ksl = std::size_t{ai} * kCacheLayer;
           const std::size_t vsl = (std::size_t{16} + ai) * kCacheLayer;
           {
             std::vector<hrx_buffer_ref_t> b = {
                 {q.handle, 0, hb(q)}, {kbuf.handle, 0, hb(kbuf)},
-                {vbuf.handle, 0, hb(vbuf)}, {wqn.handle, 0, hb(wqn)},
-                {wkn.handle, 0, hb(wkn)}, {q.handle, 0, hb(q)},
+                {vbuf.handle, 0, hb(vbuf)}, {wqn.handle, wqn.offset, wqn.bytes},
+                {wkn.handle, wkn.offset, wkn.bytes}, {q.handle, 0, hb(q)},
                 {kbuf.handle, 0, hb(kbuf)}, {cache32.handle, 0, hb(cache32)},
                 {cache32.handle, 0, hb(cache32)},
                 {kv16.handle, ksl * 2, std::size_t{kCacheLayer} * 2},
@@ -415,22 +433,18 @@ int main(int argc, char** argv) {
           run_kstore(pre + "ssm_alpha.weight", alpha);
           run_kstore(pre + "ssm_beta.weight", beta);
           const auto* convw = find(pre + "ssm_conv1d.weight");
-          LoomBuffer wconv = gpu.Allocate(std::size_t{4} * kQkv * 4);
-          gpu.H2D(wconv, gguf.Data(*convw), std::size_t{4} * kQkv * 4);
+          const Imported wconv = ImportTensor(*convw);
           const auto* ta = find(pre + "ssm_a");
           const auto* tdt = find(pre + "ssm_dt.bias");
           const auto* tsn = find(pre + "ssm_norm.weight");
-          LoomBuffer wa = gpu.Allocate(std::size_t{kTs} * 4);
-          LoomBuffer wdt = gpu.Allocate(std::size_t{kTs} * 4);
-          LoomBuffer wsn = gpu.Allocate(std::size_t{kState} * 4);
-          gpu.H2D(wa, gguf.Data(*ta), std::size_t{kTs} * 4);
-          gpu.H2D(wdt, gguf.Data(*tdt), std::size_t{kTs} * 4);
-          gpu.H2D(wsn, gguf.Data(*tsn), std::size_t{kState} * 4);
+          const Imported wa = ImportTensor(*ta);
+          const Imported wdt = ImportTensor(*tdt);
+          const Imported wsn = ImportTensor(*tsn);
           const std::size_t cso = std::size_t{si} * kConvState * 4;
           const std::size_t sto = std::size_t{si} * kStateElems * 4;
           {
             std::vector<hrx_buffer_ref_t> b = {
-                {qkv.handle, 0, std::size_t{kQkv} * 4}, {wconv.handle, 0, hb(wconv)},
+                {qkv.handle, 0, std::size_t{kQkv} * 4}, {wconv.handle, wconv.offset, wconv.bytes},
                 {convstate.handle, cso, std::size_t{kConvState} * 4},
                 {convout.handle, 0, hb(convout)}};
             Dispatch(gpu, e_ssmconv, "yah_ssm_conv_decode", (kQkv + 255) / 256, 1, 1, 256, 1, 1, b);
@@ -440,8 +454,8 @@ int main(int argc, char** argv) {
                 {convout.handle, 0, hb(convout)},
                 {dstates.handle, sto, std::size_t{kStateElems} * 4},
                 {alpha.handle, 0, hb(alpha)}, {beta.handle, 0, hb(beta)},
-                {wa.handle, 0, hb(wa)}, {wdt.handle, 0, hb(wdt)},
-                {wsn.handle, 0, hb(wsn)}, {gate.handle, 0, hb(gate)},
+                {wa.handle, wa.offset, wa.bytes}, {wdt.handle, wdt.offset, wdt.bytes},
+                {wsn.handle, wsn.offset, wsn.bytes}, {gate.handle, 0, hb(gate)},
                 {ssmout.handle, 0, hb(ssmout)}};
             Dispatch(gpu, e_dn, "yah_deltanet_decode", kHeadsV, 1, 1, 32, 1, 1, b);
           }
@@ -479,6 +493,32 @@ int main(int argc, char** argv) {
       std::uint32_t out = 0;
       gpu.D2H(token, &out, 4, 0);
       if (pos + 1 >= first) gen.push_back(out);
+      step_ms.push_back(std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - step_start)
+                            .count());
+    }
+    // Per-step wall time on stderr, so the gates' stdout parsing is untouched.
+    // decode_ms is the mean over the generated steps (the prompt steps share the
+    // path but include the first step's lazy executable loads).
+    {
+      double decode = 0.0;
+      std::uint32_t n = 0;
+      for (std::size_t i = first; i < step_ms.size(); ++i) { decode += step_ms[i]; ++n; }
+      std::fprintf(stderr, "step_ms=");
+      for (std::size_t i = 0; i < step_ms.size(); ++i)
+        std::fprintf(stderr, "%.1f%s", step_ms[i], i + 1 == step_ms.size() ? "\n" : " ");
+      if (n) std::fprintf(stderr, "decode_ms=%.2f decode_tok_s=%.2f\n", decode / n, 1000.0 * n / decode);
+    }
+    if (g_time >= 2) {
+      std::vector<std::pair<double, std::string>> rows;
+      double sum = 0.0;
+      for (auto& kv : g_per_name) { rows.push_back({kv.second, kv.first}); sum += kv.second; }
+      std::sort(rows.rbegin(), rows.rend());
+      const double steps = static_cast<double>(step_ms.size());
+      std::fprintf(stderr, "== per-dispatch timing, ms per step (sum=%.1f) ==\n", sum / steps);
+      for (auto& r : rows)
+        std::fprintf(stderr, "%9.2f  %5.0f  %7.3f  %s\n", r.first / steps,
+                     g_per_count[r.second] / steps, r.first / g_per_count[r.second], r.second.c_str());
     }
     std::printf("generated_ids=");
     for (std::size_t i = 0; i < gen.size(); ++i)
