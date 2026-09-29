@@ -540,7 +540,7 @@ int main(int argc, char** argv) {
       const Imported w = ImportTensor(*tw);
       const std::string hal = std::string(kres ? "gemm_kstore_" : "gemm_residual_") +
                               f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
-      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[gemm] %s -> %s", wname.c_str(), hal.c_str());
+
       LoomExecutable& exe = load(dir + "/" + hal);
       const Geom gm = GeomOf(hal, B);
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
