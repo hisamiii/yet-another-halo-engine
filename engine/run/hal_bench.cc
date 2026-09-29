@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
   if (argc < 10) {
     std::fprintf(stderr,
                  "usage: hal_bench <hal> <W> <IN> <OUT> <WST> <OST> <gx> <gy> "
-                 "<gz> [m_rows] [k_blocks] [tokens] [iters] [wfile]\n");
+                 "<gz> [m_rows] [k_blocks] [tokens] [iters] [wfile] [outfile]\n");
     return 2;
   }
   const std::string hal = argv[1];
@@ -68,6 +68,13 @@ int main(int argc, char** argv) {
   // distribution than the real tensor does -- and the 1088 geometry is sensitive to
   // exactly that. Feed a real tensor when the question is about the production case.
   const char* WFILE = argc > 14 ? argv[14] : "";
+  // Optional output dump. With it this stops being only a timing harness: two
+  // HALs that claim to compute the same tile can be dispatched on identical
+  // inputs and their raw outputs compared elementwise, which localises a
+  // wrong-but-plausible kernel to specific (row, token) cells instead of paying
+  // a full 2048-token forward per hypothesis. The output is column-major:
+  // out[token * m_rows + row]. See tools/hal_oracle.py.
+  const char* OUTFILE = argc > 15 ? argv[15] : "";
 
   int bad = 0;
   if (!W || !IN || !OUT || !WST || !OST) {
@@ -97,6 +104,7 @@ int main(int argc, char** argv) {
   }
 
   const size_t GRID = 2048;  // the IQ grid table is exactly 512 x i32
+  const size_t KSIGNS = 128; // the ksigns table, one byte per sign slot
   std::fprintf(stderr,
                "hal_bench: grid=%ux%ux%u weight=%zu input=%zu output=%zu iters=%d\n",
                GX, GY, GZ, W, IN, OUT, iters);
@@ -104,11 +112,13 @@ int main(int argc, char** argv) {
   LoomDevice gpu;
   LoomExecutable e = gpu.Load(hal);
   LoomBuffer weight = gpu.Allocate(W), grid = gpu.Allocate(GRID),
+             ksigns = gpu.Allocate(KSIGNS),
              input = gpu.Allocate(IN), wstage = gpu.Allocate(WST),
              ostage = gpu.Allocate(OST), output = gpu.Allocate(OUT);
-  std::vector<uint8_t> hw(W), hg(GRID);
+  std::vector<uint8_t> hw(W), hg(GRID), hk(KSIGNS);
   FillPattern(hw);
   FillPattern(hg);
+  FillPattern(hk);
   if (WFILE[0]) {
     FILE* wf = std::fopen(WFILE, "rb");
     if (!wf) { std::fprintf(stderr, "hal_bench: cannot open %s\n", WFILE); return 2; }
@@ -126,7 +136,26 @@ int main(int argc, char** argv) {
   }
   gpu.H2D(weight, hw.data(), W);
   gpu.H2D(grid, hg.data(), GRID);
+  gpu.H2D(ksigns, hk.data(), KSIGNS);
   gpu.H2D(input, hin.data(), IN);
+  // Opt-in: pre-fill the output with zeros so a cell the kernel never writes is
+  // distinguishable from one it computed. A freshly allocated device buffer is
+  // not zeroed, so without this an UNWRITTEN cell reads as whatever the previous
+  // allocation left there -- often a NaN pattern, which compares "different"
+  // against everything (NaN != NaN) and makes an oracle report 100% disagreement
+  // between two bit-identical kernels. Set this before reading anything into a
+  // comparison.
+  if (std::getenv("YAH_BENCH_ZERO_OUT")) {
+    size_t scratch = (WST > OST) ? WST : OST;
+    std::vector<uint8_t> zeros(scratch, 0);
+    gpu.H2D(output, zeros.data(), OUT);
+    // wstage and ostage are scratch the kernel reads back, so an unwritten cell
+    // there is read as garbage -- and the shader never returns an error for it,
+    // it computes a NaN that then lands in the output. Zeroing them separates
+    // "the kernel computed this" from "the kernel read something never written".
+    gpu.H2D(wstage, zeros.data(), WST);
+    gpu.H2D(ostage, zeros.data(), OST);
+  }
 
   const char* name = e.names.empty() ? "?" : e.names[0].c_str();
   const uint32_t ordinal = e.OrdinalOrZero(name);
@@ -135,14 +164,44 @@ int main(int argc, char** argv) {
   // speedup because half the output tile is never computed.
   const uint32_t ws = e.WorkgroupSize(ordinal);
   auto cfg = LoomDevice::Config(GX, GY, GZ, ws ? ws : 32, 1, 1);
-  std::vector<hrx_buffer_ref_t> b = {{weight.handle,0,W},{grid.handle,0,GRID},
-      {input.handle,0,IN},{wstage.handle,0,WST},{ostage.handle,0,OST},
-      {output.handle,0,OUT}};
+  // The binding list is the export's, not a fixed six. The IQ grid/signs
+  // formats carry extra leading operands (iq3xxs/iq2xxs/iq2xs: weight, grid,
+  // ksigns = 7) and every other format carries none (weight, input, wstage,
+  // ostage, out = 5), while the driver builds exactly the matching list
+  // (engine/run/loom_forward_pp.cc run_kstore). Hardcoding six rejected the
+  // entire non-grid family with "expected 5 but got 6".
+  const uint32_t nb = e.BindingCount(ordinal);
+  if (nb < 5 || nb > 7) {
+    std::fprintf(stderr, "hal_bench: export binds %u buffers; expected 5..7\n", nb);
+    return 3;
+  }
+  std::vector<hrx_buffer_ref_t> b = {{weight.handle, 0, W}};
+  if (nb >= 6) b.push_back({grid.handle, 0, GRID});
+  if (nb == 7) b.push_back({ksigns.handle, 0, KSIGNS});
+  b.push_back({input.handle, 0, IN});
+  b.push_back({wstage.handle, 0, WST});
+  b.push_back({ostage.handle, 0, OST});
+  b.push_back({output.handle, 0, OUT});
   // One dispatch at a time up front: if the first hangs it shows up here rather
   // than more dispatches deep into an already wedged ring.
   for (int i = 0; i < 3; ++i) {
     gpu.Dispatch(e, ordinal, cfg, nullptr, 0, b.data(), b.size());
     gpu.Synchronize();
+  }
+  if (OUTFILE[0]) {
+    std::vector<uint8_t> ho(OUT);
+    gpu.D2H(output, ho.data(), OUT);
+    FILE* of = std::fopen(OUTFILE, "wb");
+    if (!of) {
+      std::fprintf(stderr, "hal_bench: cannot write %s\n", OUTFILE);
+      return 2;
+    }
+    if (std::fwrite(ho.data(), 1, OUT, of) != OUT) {
+      std::fprintf(stderr, "hal_bench: short write to %s\n", OUTFILE);
+      std::fclose(of);
+      return 2;
+    }
+    std::fclose(of);
   }
   auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < iters; ++i)

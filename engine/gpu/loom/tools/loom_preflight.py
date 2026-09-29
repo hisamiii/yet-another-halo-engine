@@ -67,7 +67,18 @@ def case_bindings(text, case_symbol):
     return bindings
 
 
-def declared_envelopes(report_path):
+def declared_envelopes(report_path, with_names=False):
+    """argument index -> declared envelope bytes (and optionally its root name).
+
+    with_names=True additionally returns {argument: source_root}, the name the
+    compiler recorded for that argument ('weight', 'input', 'wstage', 'ostage',
+    'output', ...). Callers that do NOT know the kernel's parameter order -- e.g.
+    safe_bench, which has to hand hal_bench a role-keyed argv -- must map by that
+    name: the argument order is not uniform across the GEMM family (the IQ
+    grid/signs formats interleave 'grid' and 'ksigns' before 'input'), so keying
+    a derived size table by a fixed driver slot silently swaps input and output
+    for every 5-argument format.
+    """
     document = json.load(open(report_path))
     found = []
 
@@ -87,13 +98,16 @@ def declared_envelopes(report_path):
     if not found:
         return None
     rows = {}
+    names = {}
     for root in found[0]:
         argument = root.get('source_root_argument_index')
         byte_count = (root.get('interval_envelope') or {}).get('byte_count')
         if argument is None or byte_count is None:
             continue
         rows[argument] = max(rows.get(argument, 0), byte_count)
-    return rows
+        if root.get('source_root'):
+            names[argument] = root['source_root']
+    return (rows, names) if with_names else rows
 
 
 def main():
