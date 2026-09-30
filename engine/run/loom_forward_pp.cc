@@ -117,6 +117,7 @@ std::uint32_t g_tt = 0;  // GEMM token tiles = g_b / g_gtile
 // must not mirror the arithmetic in C."
 std::uint32_t g_gtile = kTile;  // fallback GEMM tile when dispatch.txt says nothing
 int g_time = 0;
+std::string g_key;  // YAH_LOOM_TIME=3: timing key for the next dispatch
 std::map<std::string, double> g_per_name;
 std::map<std::string, int> g_per_count;
 std::chrono::steady_clock::time_point g_mark = std::chrono::steady_clock::now();
@@ -135,10 +136,14 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
                nullptr, 0, b.data(), b.size());
   if (g_time >= 2) {
     gpu.Synchronize();
-    g_per_name[name] += std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - g_mark).count();
-    g_per_count[name]++;
+    // YAH_LOOM_TIME=3 keys the GEMMs by their HAL (format and shape) instead of
+    // the kernel name, so per-shape efficiency is visible.
+    const std::string key = (g_time >= 3 && !g_key.empty()) ? g_key : std::string(name);
+    g_per_name[key] += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - g_mark).count();
+    g_per_count[key]++;
   }
+  g_key.clear();
 }
 
 // The launch geometry each GEMM HAL was compiled for, read from
@@ -254,7 +259,7 @@ int main(int argc, char** argv) {
   const std::uint32_t want = argc > 4 ? std::strtoul(argv[4], nullptr, 10) : 2048;
   const char* ids_path = argc > 5 ? argv[5] : "/home/q/yah-scratch/ids2048.txt";
   { const char* t = std::getenv("YAH_LOOM_TIME");
-    g_time = t ? (std::atoi(t) >= 2 ? 2 : 1) : 0; }
+    g_time = t ? std::min(std::atoi(t), 3) : 0; }
   // YAH_DUMP_LAYER=<l> writes three checkpoints from layer l: the mixer input
   // (the f16 normed activation), hidden after the mixer, and hidden after the
   // FFN. It exists to locate a stage that disagrees between two token counts.
@@ -496,6 +501,7 @@ int main(int argc, char** argv) {
       LoomExecutable& exe = load(dir + "/" + hal);
       if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
+      g_key = hal;
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
@@ -521,6 +527,7 @@ int main(int argc, char** argv) {
       LoomExecutable& exe = load(dir + "/" + hal);
       if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
+      g_key = hal;
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
@@ -557,6 +564,7 @@ int main(int argc, char** argv) {
       LoomExecutable& exe = load(dir + "/" + hal);
       if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
+      g_key = hal;
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
