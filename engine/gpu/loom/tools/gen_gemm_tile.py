@@ -150,7 +150,8 @@ def gen(fmt, kind="kstore"):
     e("  %base = index.constant 0 : offset")
     for v in sorted({0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN - 1}):
         e(f"  %c{v} = index.constant {v} : index")
-    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 21, 24, 28, 32, 48, 63, 64, 66, 74, 104, 106, 127, 128, 192, 255):
+    # the same i32 constants gen_gemm_shared defines (q8_0 needs 18 and 34)
+    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 18, 21, 24, 28, 32, 34, 48, 63, 64, 66, 74, 104, 106, 127, 128, 192, 255):
         e(f"  %c{v}i = scalar.constant {v} : i32")
     e(f"  %cbb = index.constant {bb} : index")
     e(f"  %cbbh = index.constant {bb // 2} : index")
@@ -164,7 +165,16 @@ def gen(fmt, kind="kstore"):
     e("  %n = index.constant 16 : index")
     e("  %k = index.constant 16 : index")
     e(f"  %m_tiles = config.get @{sym}.m_tiles : index")
-    e(f"  %k_blocks = config.get @{sym}.k_blocks : index")
+    # q8_0's k_blocks counts 32-wide blocks; the decode works in 256-wide ones
+    # (bb=272 = 8 x 34), as gen_gemm_shared does it. A missed division here walks
+    # 8x past the weights -- the ring hang of 2026-09-29.
+    kdiv = F.get("kdiv", 1)
+    if kdiv == 1:
+        e(f"  %k_blocks = config.get @{sym}.k_blocks : index")
+    else:
+        e(f"  %k_blocks_cfg = config.get @{sym}.k_blocks : index")
+        e(f"  %ckdiv = index.constant {kdiv} : index")
+        e("  %k_blocks = index.div %k_blocks_cfg, %ckdiv : index")
     e(f"  %token_tiles = config.get @{sym}.token_tiles : index")
     e("  %ktot = index.mul %k_blocks, %c256 : index")
     e("  %tokens = index.mul %token_tiles, %cwtok : index")
