@@ -42,6 +42,7 @@
 #include <iterator>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/config.hpp"
@@ -599,13 +600,12 @@ int main(int argc, char** argv) {
         land = &dst;
       }
       if (land != &hidden) {
-        // An odd split count leaves the running sum in hidden2; one more pass
-        // through the all-zero reszero buffer moves it back to hidden without
-        // changing the value.
-        std::vector<hrx_buffer_ref_t> r = {
-            {reszero.handle, 0, hb(reszero)}, {hidden2.handle, 0, out_bytes},
-            {hidden.handle, 0, hb(hidden)}};
-        Dispatch(gpu, e_accum, "yah_residual_1d", static_cast<std::uint32_t>(kOutTotal / 256), 1, 1, 256, 1, 1, r);
+        // An odd split count (always, on the kStore-residual path) leaves the
+        // running sum in hidden2. Swap the two handles instead of copying it
+        // back through a zero-add pass: that pass was half of every residual's
+        // dispatches (128 of 256 per forward) and moved 126 MB each. Every
+        // consumer names the variable, so it follows the swap.
+        std::swap(hidden, hidden2);
       }
     };
     double t_norm = 0.0, t_mixer = 0.0, t_attn = 0.0, t_ssm = 0.0;
