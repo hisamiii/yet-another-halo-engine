@@ -99,6 +99,8 @@ SWZ = int(os.environ.get("YAH_TG_SWZ", "0"))
 EPI_LDS = os.environ.get("YAH_TG_EPI_LDS", "1") == "1"
 # inner K-step loop policy, e.g. "unroll(%c2) schedule(recurrence)"
 KPOL = os.environ.get("YAH_TG_KPOL", "")
+# policy of the K-phase loop (e.g. "unroll(%c2) schedule(recurrence)")
+PPOL = os.environ.get("YAH_TG_PPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
 # q4k/q5k decode one group per lane (run-time nibble choice): twice the
 # decoding lanes of the even/odd pairing. YAH_TG_Q4GPL=2 restores the pairing.
@@ -389,7 +391,7 @@ def gen(fmt, kind="kstore"):
     ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(carried))
     carried_t = types + ", " + ", ".join(ty for _, ty in carried)
     res = ", ".join(f"%acc{i}" for i in range(NA)) + ", " + ", ".join(f"%cvo{x}" for x in range(len(carried)))
-    e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t}) {{")
+    e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t}) {PPOL} {{")
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("    %kb = index.div %kp, %cph : index")
     e("    %ph = index.rem %kp, %cph : index")

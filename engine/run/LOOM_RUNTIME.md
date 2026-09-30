@@ -1595,6 +1595,12 @@ regenerated IQ4_XS/Q4_K/Q5_K/Q6_K HALs.
   eight lookups per group are a dependent chain (bytes -> index -> table ->
   element), and a global L0 hit is slower than a ds_read, with too few waves to
   hide it.
+- K-phase loop `unroll(%c2) schedule(recurrence)` (`YAH_TG_PPOL`, the move fix
+  that worked for DeltaNet): IQ4_XS 9.60 -> 10.14, Q4_K 5.97 -> 6.48 ms. Moves
+  per phase do fall (56 -> 36), but the trace shows two new `s_waitcnt
+  vmcnt(0)` sites inside the MMA loops (12.8% + 6.8% of wave time): in the
+  unrolled body the prefetched global loads are drained before the multiplies
+  instead of at the next phase's LDS stores.
 - wave64 tile GEMM (`YAH_TG_W64=1`: accumulators `vector<4xf32>`, operand
   fragments unchanged, direct epilogue), IQ4_XS 17408x5120 with decode-ahead,
   all bit-identical, against 9.71 ms wave32: 8 waves of 32x128 (152 VGPRs)
