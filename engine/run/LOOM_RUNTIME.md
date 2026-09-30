@@ -1269,6 +1269,65 @@ The GEMM ratio runs from 1.28 (iq3s/iq3xxs attn/ssm out) to 1.9 (iq4xs
 ffn_down, q4k 10240-row qkv); Loom is already ahead on iq3s 6144x5120 (0.55) and
 q4k ffn_down (0.88).
 
+### The tile GEMM: HIP's structure, and the bank conflict that hid it
+
+ATT traces of the same GEMM on both sides (IQ3_S 17408x5120 kStore; HIP via
+`rocprofv3 --att --att-library-path <therock lib>`, Loom via the benchmark
+tool's executable traces) showed where the shared kernel's time went. 80% of its
+wave time was `s_waitcnt`, mostly vmcnt on the activation loads each wave issues
+from global memory a few instructions before the WMMA that consumes them, with
+~2 wave64 waves per SIMD to cover it. HIP's `HalfPrefillGemmKernel<256, 256, 8,
+4>` stalls about as much per wave (42% waitcnt, 26% barrier), but it has 32
+wave32 waves per workgroup, 8 per SIMD. Per K-tile its threads store the
+previous tile's decoded weights and activations to LDS, pass a barrier, issue
+the next tile's loads and decode into registers, then run 32 WMMAs per wave out
+of LDS. Per WMMA the shared kernel actually issued less VALU (3.9 vs 4.7) and
+far less LDS (0.34 vs 1.65) work.
+
+`tools/gen_gemm_tile.py` already had that structure (both operands in LDS, next
+phase in registers) and had measured slower, 19.9 ms against the shared
+kernel's 14.9. Its trace put 62% of wave time in lgkmcnt waits, with the
+`ds_load_b128`s themselves stalling at issue. The cause was bank conflicts: an
+unpadded decoded weight row is 64 f16 = 128 B, so the 16 rows of an lhs
+fragment load fall on two bank groups. Padding each weight row by 8 f16
+(`YAH_TG_WPAD`) and each activation row by 8 (`YAH_TG_APAD`, already there)
+gives:
+
+| IQ3_S 17408x5120 kStore, standalone | ms |
+|---|---:|
+| shared (64x256, 2 wave64) | 14.9 |
+| tile 64x256, 8 waves, unpadded weights | 19.9 |
+| tile 64x256, 8 waves, WPAD=8 | 11.1 |
+| tile 128x256, 16 waves (4x4), WPAD=8 | 10.5 |
+| same, WPAD=4 / APAD=0 | 19.6 / 28.2 |
+| tile 256x128, 16 waves (8x2) | 14.4 |
+| HIP 256x256, in the pipeline | ~11.3 |
+
+256x256 does not fit: 64 KB of tiles plus the 2 KB IQ grid table the decode
+stages in LDS exceeds gfx11's 64 KB per workgroup (HIP reads its grid from
+global). The generator gained a SwiGLU epilogue (per-wave f32 slabs through LDS,
+half the wave's tokens at a time so all 16 waves fit) and parameterized
+geometry; `emit_prefill_pp.py` uses it for every shape whose m_tiles is a
+multiple of 8 in the formats in `TILE_FMTS` (all shared-decode formats but
+q8_0, which needs kdiv). Everything else keeps the shared kernel.
+`YAH_TILE_GEMM=0` restores it everywhere.
+
+Bit-identical (argmax 11751, hidden f837e614ff55d1d1): each format x kind was
+rolled in one at a time behind the gate. Device time at pp2048 (sd12 -> tile set,
+same recipe):
+
+| | HIP | shared | tile |
+|---|---:|---:|---:|
+| GEMMs (M > 64) | 3164 | 4663 | 3938 |
+| whole prefill | 3479 | 5263 | 4574 |
+
+Per shape, the grid formats (IQ3_S, IQ3_XXS, IQ2_XXS) are now within ~1.1-1.2x of
+HIP, and the IQ3_S 6144-row z projection and q4k ffn_down are ahead of it. IQ4_XS and
+Q4_K are still 1.6-1.75x. Their decode runs on fewer lanes: at KSUB=64 a phase
+has 2 groups of 32 per row, so with 128 rows half of the 512 lanes decode
+IQ4_XS, and a quarter decode Q4_K, whose groups pair up. HIP spreads each tile's
+decode over all 1024 threads.
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.

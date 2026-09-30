@@ -1,37 +1,36 @@
 #!/usr/bin/env python3
 """Generate the tile GEMM: wave32, many waves, both operands staged in LDS.
 
-usage: gen_gemm_tile.py <fmt> [out.loom]     env: YAH_TG_KIND=kstore|kres
+usage: gen_gemm_tile.py <fmt> [out.loom]     env: YAH_TG_KIND=kstore|swiglu|kres
                                                   YAH_TG_KSUB (default per format)
+                                                  YAH_TG_BM/BN/WM/WN, YAH_TG_APAD/WPAD
 
-Same ABI, launch footprint (64 rows x 256 tokens per workgroup, dispatch.txt
-"256 4 <B/256>") and output as gen_gemm_shared.py's kernels, and the same
-decode arithmetic and per-accumulator MMA sequence, so the output is meant to be
-bit-identical to them. What changes is the latency structure.
+Same ABI and output as gen_gemm_shared.py's kernels, and the same decode
+arithmetic and per-accumulator MMA order, so the output is bit-identical to
+them (hidden f837e614ff55d1d1 at pp2048). What changes is the latency structure,
+modelled on HIP's HalfPrefillGemmKernel<256, 256, 8, 4>:
 
-An ATT trace of the shared kStore put 70% of wave time in s_waitcnt: each wave
-owns a 64x128 tile (32 wave64 accumulators, ~220 VGPRs), so only ~2 waves fit
-per SIMD, and its MMA loop waits on its own activation loads from global memory
-every K step. Here, as in HIP's HalfPrefillGemmKernel:
+  * BM x BN per workgroup (default 128 rows x 256 tokens) over WM x WN wave32
+    waves (default 4 x 4), each owning a 32-row x 64-token tile: 8 accumulators;
+  * per K phase the decoded weight tile (BM x KSUB) AND the activation tile
+    (BN tokens x KSUB) sit in LDS, so the MMA loop reads only LDS;
+  * the next phase's weight bytes and activation rows are loaded from global
+    into registers while this phase computes, and stored to LDS after it.
 
-  * 8 wave32 waves per workgroup (2 along rows x 4 along tokens), each owning a
-    32-row x 64-token tile: 8 wave32 accumulators;
-  * per K phase the decoded weight tile (64 x KSUB) AND the activation tile
-    (256 tokens x KSUB) sit in LDS, so the MMA loop reads only LDS;
-  * the activation tile is loaded from global one phase ahead into registers
-    (one 128-byte token row per lane), like the weight bytes, and stored to LDS
-    at the start of the next phase.
+Why the shared kernel lost to HIP (ATT, IQ3_S 17408x5120 kStore): 80% of its
+wave time was s_waitcnt, mostly vmcnt on activation loads issued a few
+instructions before the WMMA that consumed them, with ~2 wave64 waves per SIMD
+to cover it. HIP's kernel waits just as much per wave but runs 8 waves per SIMD.
 
-MEASURED, NOT WIRED IN. Bit-identical (hidden f837e614ff55d1d1), 149 VGPRs, no
-spills, 4 wave32 waves/SIMD by registers -- and slower than the shared kernel:
-IQ4_XS kStore, 40 dispatches at pp2048, 366 ms shared vs 488 ms tile (1088-row
-gate 15.7 -> 21.3 ms/dispatch; only the 1024-row shape improved, 2.5 -> 1.6).
-With unroll(%c2) schedule(recurrence) on the K step: 457 ms. Its ATT trace moved
-the stall from global to LDS: 62% of wave time in lgkmcnt waits right after the
-fragment ds_load_b128s (12 per K step for 8 WMMAs, wave32 fragments carrying
-duplicated half-waves), 15% at barriers. The skeleton is kept for the next
-attempt: larger per-wave tiles, fewer duplicate LDS reads, or LDS-resident
-weights with register-direct activations at wave32.
+Why the first version of this kernel (64 x 256, 8 waves) lost too (19.9 ms vs
+the shared kernel's 14.9): LDS bank conflicts. Unpadded, a decoded weight row is
+KSUB*2 = 128 B, so the 16 rows of an lhs fragment load hit 2 bank groups and
+every ds_load_b128 stalled at issue (62% of wave time in lgkmcnt waits). Padding
+each weight row by 8 f16 (WPAD) and each activation row by 8 f16 (APAD) takes
+it to 11.1 ms; 128 x 256 over 16 waves to 10.5 ms (HIP: ~11.3 ms in the
+pipeline). WPAD=4 is 19.6 ms, APAD=0 28 ms; 256 x 128 over 16 waves 14.4 ms;
+unroll(2|4) on the K step no better. 256 x 256 does not fit: 64 KB of tiles
+plus the IQ grid table staged in LDS is over the 64 KB workgroup limit.
 """
 import os
 import sys
@@ -40,33 +39,53 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gen_gemm_shared as G  # noqa: E402
 
-BN = 256          # tokens per workgroup
-BM = 64           # rows per workgroup
-WM, WN = 2, 4     # waves along rows x tokens
-TM, TN = BM // WM, BN // WN   # per-wave tile: 32 rows x 64 tokens
-FM, FN = TM // 16, TN // 16   # fragments per wave: 2 x 4
+# Workgroup geometry (env; defaults = the measured best, 128 x 256 over 4 x 4
+# waves). HIP's HalfPrefillGemmKernel<256, 256, 8, 4> is BM=BN=256, WM=8, WN=4,
+# which does not fit here: 64 KB of tiles plus the IQ grid table staged in LDS
+# is over gfx11's 64 KB per workgroup.
+BN = int(os.environ.get("YAH_TG_BN", "256"))   # tokens per workgroup
+BM = int(os.environ.get("YAH_TG_BM", "128"))   # rows per workgroup
+WM = int(os.environ.get("YAH_TG_WM", "4"))     # waves along rows
+WN = int(os.environ.get("YAH_TG_WN", "4"))     # waves along tokens
+TM, TN = BM // WM, BN // WN   # per-wave tile
+FM, FN = TM // 16, TN // 16   # fragments per wave
 NWAVE = WM * WN
 LANES = 32 * NWAVE
+assert BM % (16 * WM) == 0 and BN % (16 * WN) == 0 and LANES >= BM and LANES % BN == 0
+ROWGRP = BM // 16             # m_tiles per workgroup
+APL = LANES // BN             # lanes staging one token row of the activation tile
 APAD = int(os.environ.get("YAH_TG_APAD", "8"))
+# f16 of padding per decoded weight row: unpadded rows are 128 B apart at
+# KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
+WPAD = int(os.environ.get("YAH_TG_WPAD", "8"))
 # inner K-step loop policy, e.g. "unroll(%c2) schedule(recurrence)"
 KPOL = os.environ.get("YAH_TG_KPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
 GPL_OF = {"q4k": 2, "q5k": 2}
-KSUB_OF = {"q4k": 128, "q5k": 128}
+# KSUB=64 everywhere: at 128 the 128 x 256 tiles need ~104 KB of LDS. q4k/q5k
+# keep their even group count per lane (GPL=2) with one decoding slot.
+KSUB_OF = {}
 
 
 def configure(fmt):
     ksub = int(os.environ.get("YAH_TG_KSUB", KSUB_OF.get(fmt, 64)))
     G.KSUB = ksub
-    G.PAD = 0
-    G.ROWP = ksub
+    G.PAD = WPAD
+    G.ROWP = ksub + WPAD
     G.PH = 256 // ksub
     G.GPP = ksub // 32
     G.GPL = GPL_OF.get(fmt, 1)
     G.LR = BM
     G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
     assert G.GPP % G.GPL == 0
+    assert (G.GPP // G.GPL) * BM <= LANES, "not enough lanes to decode a phase in one pass"
+    assert (ksub // 8) % APL == 0, "activation row does not split evenly over its lanes"
     return ksub
+
+
+def geometry():
+    """(tokens per workgroup, m_tiles per workgroup) for dispatch.txt."""
+    return BN, ROWGRP
 
 
 def gen(fmt, kind="kstore"):
@@ -74,18 +93,21 @@ def gen(fmt, kind="kstore"):
     ksub = configure(fmt)
     bb, (loads, compute) = F["bb"], F["decode"]
     kr = kind == "kres"
-    bufs = ["weight"] + F["extra"] + ["input"] + (["resid"] if kr else []) + ["wstage", "ostage", "output"]
-    sym = f"yah_ffn_gemm_{fmt}" + ("_kres" if kr else "")
+    sw = kind == "swiglu"
+    bufs = (["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
+            + ["wstage", "ostage", "output"])
+    sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "")
     slots = G.GPP // G.GPL          # decoding lane groups of 64 per phase
     arow = ksub + APAD              # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
+    aspl = aseg // APL              # of which one staging lane loads
     V8 = "vector<8xf32>"
     VF = "vector<16xf16>"
     L = []
     e = L.append
     e(f"// GENERATED by tools/gen_gemm_tile.py {fmt} {kind} (KSUB={ksub}) -- edit the generator.")
     e("//")
-    e(f"// Tile GEMM for {fmt}: 8 wave32 waves over a 64 x 256 tile, 32 x 64 per wave,")
+    e(f"// Tile GEMM for {fmt}: {NWAVE} wave32 waves over a {BM} x {BN} tile, {TM} x {TN} per wave,")
     e("// decoded weights and staged activations both in LDS. See the generator.")
     e("amdgpu.target<gfx11-generic> @yah_tile_w32 {subgroup_size = 32}")
     e("")
@@ -97,12 +119,12 @@ def gen(fmt, kind="kstore"):
     e(f"  %m_tiles = config.get @{sym}.m_tiles : index")
     e(f"  %token_tiles = config.get @{sym}.token_tiles : index")
     e(f"  %wgs = index.constant {LANES} : index")
-    e("  %rowgrp = index.constant 4 : index")
+    e(f"  %rowgrp = index.constant {ROWGRP} : index")
     e("  %m_groups = index.div %m_tiles, %rowgrp : index")
     e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
     e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512):
+    for v in sorted({0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN - 1}):
         e(f"  %c{v} = index.constant {v} : index")
     for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 21, 24, 28, 32, 48, 63, 64, 66, 74, 104, 106, 127, 128, 192, 255):
         e(f"  %c{v}i = scalar.constant {v} : i32")
@@ -143,9 +165,9 @@ def gen(fmt, kind="kstore"):
     e("  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>")
     e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
     # LDS: decoded weight tile and staged activation tile
-    e(f"  %wl_bytes = index.constant {BM * ksub * 2} : offset")
+    e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2} : offset")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
-    e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{ksub}xf16>")
+    e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
     e(f"  %al_bytes = index.constant {BN * arow * 2} : offset")
     e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
     e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
@@ -160,7 +182,7 @@ def gen(fmt, kind="kstore"):
     e(f"  %cwn = index.constant {WN} : index")
     e("  %wr = index.div %wave, %cwn : index")
     e("  %wt = index.rem %wave, %cwn : index")
-    e("  %wg_row = index.mul %wg_x, %c64 : index")
+    e(f"  %wg_row = index.mul %wg_x, %c{BM} : index")
     e(f"  %ctm = index.constant {TM} : index")
     e(f"  %ctn = index.constant {TN} : index")
     e("  %wr_off = index.mul %wr, %ctm : index")
@@ -168,11 +190,11 @@ def gen(fmt, kind="kstore"):
     e("  %m_origin = index.add %wg_row, %wr_off : index")
     e("  %wtb = index.mul %wg_y, %cwtok : index")
     e("  %token_base = index.add %wtb, %wt_off : index")
-    # decode lane map: lane tid -> weight row tid % 64, slot tid / 64 decodes
+    # decode lane map: lane tid -> weight row tid % BM, slot tid / BM decodes
     # groups [slot*GPL, slot*GPL+GPL) of the phase; slots >= GPP/GPL idle.
-    e("  %l64 = index.rem %tid, %c64 : index")
-    e("  %slot = index.div %tid, %c64 : index")
-    e("  %drow = index.min %l64, %c63 : index")
+    e(f"  %l64 = index.rem %tid, %c{BM} : index")
+    e(f"  %slot = index.div %tid, %c{BM} : index")
+    e(f"  %drow = index.min %l64, %c{BM - 1} : index")
     e("  %drow_i = index.cast %drow : index to i32")
     e("  %wg_row_i = index.cast %wg_row : index to i32")
     e("  %grow_i = scalar.addi %wg_row_i, %drow_i : i32")
@@ -186,8 +208,12 @@ def gen(fmt, kind="kstore"):
     e(f"  %cgpl = scalar.constant {G.GPL} : i32")
     e("  %gl_i = scalar.muli %slot_i, %cgpl : i32")
     e("  %kphases = index.mul %k_blocks, %cph : index")
-    # activation staging map: lane tid owns token row tid of the tile
-    e(f"  %atok = index.min %tid, %c{BN - 1} : index")
+    # activation staging map: lane tid stages segments [aseg0, aseg0+aspl) of
+    # token row tid % BN of the tile
+    e(f"  %atok = index.rem %tid, %c{BN} : index")
+    e(f"  %apart = index.div %tid, %c{BN} : index")
+    e(f"  %caspl8 = index.constant {8 * aspl} : index")
+    e("  %aseg0 = index.mul %apart, %caspl8 : index")
     e("  %atok_g = index.add %wtb, %atok : index")
     e("  %arow_g = index.mul %atok_g, %ktot : index")
     L.extend(F["setup"]())
@@ -202,10 +228,11 @@ def gen(fmt, kind="kstore"):
         """This lane's token row of the next phase's activation tile, as aseg
         16-byte vectors (clamped: the extra iteration's loads are in bounds)."""
         vals = []
-        for sg in range(aseg):
-            e(f"    %{p}ao{sg} = index.add %arow_g, {kbase} : index")
+        e(f"    %{p}ab = index.add %arow_g, {kbase} : index")
+        e(f"    %{p}ao = index.add %{p}ab, %aseg0 : index")
+        for sg in range(aspl):
             e(f"    %{p}ac{sg}0 = index.constant {8 * sg} : index")
-            e(f"    %{p}aq{sg} = index.add %{p}ao{sg}, %{p}ac{sg}0 : index")
+            e(f"    %{p}aq{sg} = index.add %{p}ao, %{p}ac{sg}0 : index")
             e(f"    %{p}aqc{sg} = index.min %{p}aq{sg}, %a_last8 : index")
             e(f"    %{p}av{sg} = vector.load %a_flat[%{p}aqc{sg}] : view<[%a_total]xf16> -> vector<8xf16>")
             vals.append((f"%{p}av{sg}", "vector<8xf16>"))
@@ -239,7 +266,8 @@ def gen(fmt, kind="kstore"):
     e("    }")
     # stage the activation row into the LDS activation tile
     for sg, nm in enumerate(cur_a):
-        e(f"    %as{sg} = index.constant {8 * sg} : index")
+        e(f"    %as{sg}c = index.constant {8 * sg} : index")
+        e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
         e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
     # next phase's loads
     e("    %kp_n0 = index.add %kp, %c1 : index")
@@ -263,7 +291,7 @@ def gen(fmt, kind="kstore"):
     e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
     for i in range(FM):
         e(f"      %lr{i} = index.add %wr_off, %c{16 * i} : index")
-        e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{ksub}xf16> -> {VF}")
+        e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
     for j in range(FN):
         e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
         e(f"      %rhs{j} = vector.fragment.load<rhs> %al_t[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
@@ -276,6 +304,11 @@ def gen(fmt, kind="kstore"):
     e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
       + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
     e("  }")
+    if sw:
+        swiglu_epilogue(e, arow)
+        e("  kernel.return")
+        e("}")
+        return "\n".join(L) + "\n"
     e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
     e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
     if kr:
@@ -296,6 +329,67 @@ def gen(fmt, kind="kstore"):
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def swiglu_epilogue(e, arow):
+    """out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the chained kernel's
+    scalar ops in its order (bit-identity), as in gen_gemm_shared: an f16 result
+    fragment store ignores the token-major strided layout, so each 16-row x
+    ES-token slab goes through a per-wave f32 LDS tile (f32 result stores honour
+    layouts) and a real loop walks it with lane-contiguous rows. The slab is half
+    the wave's tokens so all waves' tiles fit in the activation tile's LDS."""
+    ES = 32 if TN >= 32 else TN
+    assert TN % ES == 0 and NWAVE * 16 * ES * 4 <= BN * arow * 2
+    V8 = "vector<8xf32>"
+    e("  %ep_lay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
+    e(f"  %ep_wbytes = index.constant {16 * ES * 4} : index")
+    e("  %ep_off_i = index.mul %wave, %ep_wbytes : index")
+    e("  %ep_off = index.cast %ep_off_i : index to offset")
+    e(f"  %ep_view = buffer.view %al[%ep_off] : buffer -> view<16x{ES}xf32, %ep_lay>")
+    e(f"  %ep_flat = buffer.view %al[%ep_off] : buffer -> view<{16 * ES}xf32>")
+    e("  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%out_total]xf32>")
+    e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
+    e("  %negone = scalar.constant -1.0 : f32")
+    e("  %one = scalar.constant 1.0 : f32")
+    e("  %out_last = index.sub %out_total, %c1 : index")
+    e("  %lane = index.rem %tid, %c32 : index")
+    e(f"  %ep_n = index.constant {16 * ES // 32} : index")
+    e(f"  %ep_last = index.constant {16 * ES - 1} : index")
+    for i in range(FM):
+        e(f"  %sr{i} = index.add %m_origin, %c{16 * i} : index")
+        for h in range(TN // ES):
+            q = f"{i}_{h}"
+            e(f"  %st{q}c = index.constant {h * ES} : index")
+            e(f"  %st{q} = index.add %token_base, %st{q}c : index")
+            e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            for jj in range(ES // 16):
+                j = h * ES // 16 + jj
+                e(f"  %sc{q}_{jj} = index.constant {16 * jj} : index")
+                e(f"  vector.fragment.store<result> %acc{i * FN + j}, %ep_view[%c0, %sc{q}_{jj}] shape [%m, %n] : {V8}, view<16x{ES}xf32, %ep_lay>")
+            e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            e(f"  %eps{q} = scf.for %ee{q} = [%c0 to %ep_n step %c1](%em{q} = %c0 : index) -> (index) {{")
+            e(f"    %e32_{q} = index.mul %ee{q}, %c32 : index")
+            e(f"    %ef0_{q} = index.add %e32_{q}, %lane : index")
+            e(f"    %ef_{q} = index.min %ef0_{q}, %ep_last : index")
+            e(f"    %er_{q} = index.rem %ef_{q}, %c16 : index")
+            e(f"    %et_{q} = index.div %ef_{q}, %c16 : index")
+            e(f"    %v_{q} = view.load %ep_flat[%ef_{q}] : view<{16 * ES}xf32> -> f32")
+            e(f"    %grow_{q} = index.add %sr{i}, %er_{q} : index")
+            e(f"    %gtok_{q} = index.add %st{q}, %et_{q} : index")
+            e(f"    %gto_{q} = index.mul %gtok_{q}, %m_rows : index")
+            e(f"    %gix0_{q} = index.add %gto_{q}, %grow_{q} : index")
+            e(f"    %gix_{q} = index.min %gix0_{q}, %out_last : index")
+            e(f"    %g_{q} = view.load %gate_view[%gix_{q}] : view<[%out_total]xf32> -> f32")
+            e(f"    %ng_{q} = scalar.mulf %g_{q}, %negone : f32")
+            e(f"    %ex_{q} = scalar.expf<afn> %ng_{q} : f32")
+            e(f"    %dn_{q} = scalar.addf %one, %ex_{q} : f32")
+            e(f"    %iv_{q} = scalar.divf %one, %dn_{q} : f32")
+            e(f"    %sg_{q} = scalar.mulf %g_{q}, %iv_{q} : f32")
+            e(f"    %ac_{q} = scalar.mulf %sg_{q}, %v_{q} : f32")
+            e(f"    %h_{q} = scalar.fptrunc %ac_{q} : f32 to f16")
+            e(f"    view.store %h_{q}, %out_h[%gix_{q}] : f16, view<[%out_total]xf16>")
+            e(f"    scf.yield %em{q} : index")
+            e("  }")
 
 
 def main():

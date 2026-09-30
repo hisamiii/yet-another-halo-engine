@@ -49,6 +49,9 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
     import gen_gemm_shared as G
     if os.environ.get("YAH_SHARED_GEMM", "1") == "0" or fmt not in G.FMTS:
         return None
+    r = tile_kstore(fmt, mt, kb, B, out, outdir, kind)
+    if r:
+        return r
     if mt % 4 and mt > 4:
         return None
     # Matrices under 64 rows (the 48-row ssm_alpha/ssm_beta, m_tiles=3) get
@@ -63,8 +66,40 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
             G.set_geometry(*prev)
 
 
+# Formats the tile GEMM (tools/gen_gemm_tile.py) has been verified bit-identical
+# on in the pp2048 pipeline. q8_0 is not among them: its k_blocks count 32-wide
+# blocks and the tile kernel has no kdiv.
+TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs")
+
+
+def tile_kstore(fmt, mt, kb, B, out, outdir, kind):
+    """Emit the tile GEMM (tools/gen_gemm_tile.py: 16 wave32 waves over a
+    128-row x 256-token workgroup, both operands in padded LDS tiles) for this
+    shape if it covers it, and return its dispatch.txt geometry, else None.
+    YAH_TILE_GEMM=0 keeps the shared-decode kernel."""
+    import gen_gemm_tile as TG
+    if os.environ.get("YAH_TILE_GEMM", "1") == "0" or fmt not in TILE_FMTS:
+        return None
+    tile, rowgrp = TG.geometry()
+    if mt % rowgrp or B % tile:
+        return None
+    # TG.configure() rewrites gen_gemm_shared's module globals (NW, LR, KSUB...)
+    # to drive the shared decode helpers; put them back for the kernels the
+    # shared generator still emits in this process.
+    G = TG.G
+    keep = {k: getattr(G, k) for k in ("KSUB", "PAD", "ROWP", "PH", "GPP", "GPL", "LR", "NW")}
+    try:
+        return _emit_gen(lambda f, k: TG.gen(f, k), tile, fmt, mt, kb, B, out, outdir, kind, rowgrp)
+    finally:
+        for k, v in keep.items():
+            setattr(G, k, v)
+
+
 def _emit_shared(G, fmt, mt, kb, B, out, outdir, kind, rowgrp):
-    tile = G.TOK * G.NW
+    return _emit_gen(G.gen, G.TOK * G.NW, fmt, mt, kb, B, out, outdir, kind, rowgrp)
+
+
+def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp):
     if B % tile:
         return None
     tmp = os.path.join(outdir, ".emit_tmp")
@@ -73,7 +108,7 @@ def _emit_shared(G, fmt, mt, kb, B, out, outdir, kind, rowgrp):
     # to that prefix, and this source is already in its final form.
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     with open(src, "w") as fh:
-        fh.write(G.gen(fmt, kind))
+        fh.write(gen(fmt, kind))
     sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres"}.get(kind, ""))
     # Refuse before emitting if any declared operand footprint exceeds the buffer
     # the driver binds (tools/footprint_gate.py): a silent overrun hangs the ring.
