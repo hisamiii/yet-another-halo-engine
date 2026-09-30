@@ -1562,6 +1562,11 @@ regenerated IQ4_XS/Q4_K/Q5_K/Q6_K HALs.
   ms). The int8 codebook with the fused multiply (HIP's rounding, not
   bit-identical to ours) cuts static VALU 426 -> 387 and times 10.08 vs 10.10:
   instruction count is not the limit. Both knobs stay, off.
+- wave64 tile GEMM (`YAH_TG_W64=1`: accumulators `vector<4xf32>`, operand
+  fragments unchanged, direct epilogue), IQ4_XS 17408x5120 with decode-ahead,
+  all bit-identical, against 9.71 ms wave32: 8 waves of 32x128 (152 VGPRs)
+  10.97, 8 waves of 64x64 (160) 11.02, 16 waves of 32x64 in a 1024-lane
+  workgroup (96 VGPRs) 13.28.
 - Load cache hints (`{cache_scope = cu, cache_temporal =
   non_temporal_high_temporal}`, TH_LOAD_NT_HT on gfx12): Loom's gfx11 encoding
   (`gfx11_glc_slc_dlc`) accepts only device/regular and drops anything else
