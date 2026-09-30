@@ -654,7 +654,11 @@ def iq3xxs_compute(v, gb):
 
 def _stage_table(name, src, n, ty, bytes_per):
     """Copy an n-entry read-only table into workgroup memory once; the first K
-    phase's leading barrier publishes it."""
+    phase's leading barrier publishes it. YAH_SD_GRID_LDS=0 reads the table
+    from global memory instead (HIP's __device__ tables; no LDS traffic next to
+    the MMA fragment loads)."""
+    if not GRID_LDS:
+        return [f"  %{name}_view = buffer.view {src}[%base] : buffer -> view<{n}x{ty}>"]
     return [f"  %{name}_g = buffer.view {src}[%base] : buffer -> view<{n}x{ty}>",
             f"  %{name}_bytes = index.constant {n * bytes_per} : offset",
             f"  %{name}_l = buffer.alloca<workgroup> align(16) %{name}_bytes : buffer",

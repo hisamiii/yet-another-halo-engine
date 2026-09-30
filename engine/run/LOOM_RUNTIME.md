@@ -1562,6 +1562,17 @@ regenerated IQ4_XS/Q4_K/Q5_K/Q6_K HALs.
   ms). The int8 codebook with the fused multiply (HIP's rounding, not
   bit-identical to ours) cuts static VALU 426 -> 387 and times 10.08 vs 10.10:
   instruction count is not the limit. Both knobs stay, off.
+- swiglu epilogue on the LDS epilogue's structure (`YAH_TG_SWEPI=1`: one
+  barrier, wave-private slabs, 4-row vector gate loads and f16 stores, the same
+  scalar silu per element; md5 unchanged): standalone IQ4_XS 10.22 -> 10.03,
+  IQ3_S 10.99 -> 10.64 ms, but neutral in the pipeline (gate+up rows -2.8 /
+  +2.6 / -2.5 ms in an order-swapped pair) and it costs VGPRs (IQ3_S 136 ->
+  190) and code (6.5 -> 16 KB). Off. The first pair had shown +24 ms: the
+  second of two back-to-back pp2048 profiles runs ~30-40 ms slower whichever
+  set it is, so pairs are now run in both orders.
+- The IQ3 grid tables read from global memory instead of LDS (`YAH_SD_GRID_LDS=0`,
+  as HIP's `__device__` tables): IQ3_S 10.10 -> 11.74, IQ3_XXS 10.07 -> 11.73 ms
+  standalone; with decode-ahead 12.08 / 11.51. Cause not yet traced.
 - wave64 tile GEMM (`YAH_TG_W64=1`: accumulators `vector<4xf32>`, operand
   fragments unchanged, direct epilogue), IQ4_XS 17408x5120 with decode-ahead,
   all bit-identical, against 9.71 ms wave32: 8 waves of 32x128 (152 VGPRs)

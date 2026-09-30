@@ -68,6 +68,10 @@ AGPAD = int(os.environ.get("YAH_TG_AGPAD", "0"))
 # Default on for the formats whose decode reads no LDS table (the IQ3 grids
 # contend with the MMA's fragment loads: IQ3_S 10.10 -> 10.96 ms standalone).
 DECAHEAD_FMTS = ("iq4xs", "q4k", "q5k", "q6k")
+# SWEPI=1: the swiglu epilogue on lds_epilogue's structure (one barrier,
+# wave-private slabs, 4-row vector loads/stores) instead of scalar slab walks
+# behind two workgroup barriers each.
+SWEPI = os.environ.get("YAH_TG_SWEPI", "0") == "1"
 DECAHEAD_ENV = os.environ.get("YAH_TG_DECAHEAD")
 DECAHEAD = DECAHEAD_ENV == "1"
 
@@ -503,6 +507,11 @@ def gen(fmt, kind="kstore"):
     e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
       + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
     e("  }")
+    if sw and SWEPI and EPI_LDS and WS == 32 and TM == 32:
+        lds_epilogue(e, kr, V8, sw=True)
+        e("  kernel.return")
+        e("}")
+        return "\n".join(L) + "\n"
     if sw:
         swiglu_epilogue(e, arow)
         e("  kernel.return")
@@ -561,7 +570,7 @@ def frag_stores(lines, ksub):
     return out
 
 
-def lds_epilogue(e, kr, V8):
+def lds_epilogue(e, kr, V8, sw=False):
     """out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column
     of fragments at a time: fragments -> LDS slab (element (r, t) at t*TM + r)
     -> each lane reads 16 contiguous rows of one token -> 4 b128 stores. Two
@@ -575,7 +584,15 @@ def lds_epilogue(e, kr, V8):
     e("  %es_off = index.cast %es_off_i : index to offset")
     e(f"  %es_view = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
     e(f"  %es_flat = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{TM * 16}xf32>")
-    e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+    if sw:
+        # swiglu: out f16 = f16(silu(gate) * acc), the scalar ops of
+        # swiglu_epilogue per element (bit-identity), 4 rows per load/store
+        e("  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%out_total]xf32>")
+        e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
+        e("  %negone = scalar.constant -1.0 : f32")
+        e("  %one = scalar.constant 1.0 : f32")
+    else:
+        e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
     e("  %es_lane = index.rem %tid, %c32 : index")
@@ -604,7 +621,25 @@ def lds_epilogue(e, kr, V8):
                 e(f"  %es_rf{j}_{q} = vector.load %res_flat[%es_oi{j}_{q}] : view<[%out_total]xf32> -> vector<4xf32>")
                 e(f"  %es_rs{j}_{q} = vector.addf %es_rf{j}_{q}, %es_v{j}_{q} : vector<4xf32>")
                 val = f"%es_rs{j}_{q}"
-            e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
+            if sw:
+                e(f"  %es_g{j}_{q} = vector.load %gate_view[%es_oi{j}_{q}] : view<[%out_total]xf32> -> vector<4xf32>")
+                hs = []
+                for x in range(4):
+                    y = f"{j}_{q}_{x}"
+                    e(f"  %g_{y} = vector.extract %es_g{j}_{q}[{x}] : vector<4xf32> -> f32")
+                    e(f"  %v_{y} = vector.extract %es_v{j}_{q}[{x}] : vector<4xf32> -> f32")
+                    e(f"  %ng_{y} = scalar.mulf %g_{y}, %negone : f32")
+                    e(f"  %ex_{y} = scalar.expf<afn> %ng_{y} : f32")
+                    e(f"  %dn_{y} = scalar.addf %one, %ex_{y} : f32")
+                    e(f"  %iv_{y} = scalar.divf %one, %dn_{y} : f32")
+                    e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
+                    e(f"  %ac_{y} = scalar.mulf %sg_{y}, %v_{y} : f32")
+                    e(f"  %h_{y} = scalar.fptrunc %ac_{y} : f32 to f16")
+                    hs.append(f"%h_{y}")
+                e(f"  %hv{j}_{q} = vector.from_elements {', '.join(hs)} : vector<4xf16>")
+                e(f"  vector.store %hv{j}_{q}, %out_h[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
+            else:
+                e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
 
 
 def swiglu_epilogue(e, arow):
