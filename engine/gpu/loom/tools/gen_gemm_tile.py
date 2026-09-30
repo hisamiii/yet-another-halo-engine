@@ -58,6 +58,12 @@ APAD = int(os.environ.get("YAH_TG_APAD", "8"))
 # f16 of padding per decoded weight row: unpadded rows are 128 B apart at
 # KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
 WPAD = int(os.environ.get("YAH_TG_WPAD", "8"))
+# FRAG=1: both LDS tiles fragment-major, as HIP's kernel lays them out: every
+# 16 x 16 block is 512 contiguous bytes, so each lane of a fragment load reads
+# its own contiguous 32 B and the loads are conflict-free with no padding
+# (APAD/WPAD are ignored). That is what lets 256 x 256 fit in 64 KB.
+FRAG = os.environ.get("YAH_TG_FRAG", "0") == "1"
+FENCE = os.environ.get("YAH_TG_FENCE", "1") == "1"
 # inner K-step loop policy, e.g. "unroll(%c2) schedule(recurrence)"
 KPOL = os.environ.get("YAH_TG_KPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
@@ -70,8 +76,8 @@ KSUB_OF = {}
 def configure(fmt):
     ksub = int(os.environ.get("YAH_TG_KSUB", KSUB_OF.get(fmt, 64)))
     G.KSUB = ksub
-    G.PAD = WPAD
-    G.ROWP = ksub + WPAD
+    G.PAD = 0 if FRAG else WPAD
+    G.ROWP = ksub + G.PAD
     G.PH = 256 // ksub
     G.GPP = ksub // 32
     G.GPL = GPL_OF.get(fmt, 1)
@@ -98,7 +104,7 @@ def gen(fmt, kind="kstore"):
             + ["wstage", "ostage", "output"])
     sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "")
     slots = G.GPP // G.GPL          # decoding lane groups of 64 per phase
-    arow = ksub + APAD              # f16 per LDS activation row
+    arow = ksub + (0 if FRAG else APAD)   # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
     aspl = aseg // APL              # of which one staging lane loads
     V8 = "vector<8xf32>"
@@ -175,6 +181,12 @@ def gen(fmt, kind="kstore"):
     e(f"  %cksubi = index.constant {ksub} : index")
     e("  %al_layout = encoding.layout.strided [%c1, %carow] : encoding<layout>")
     e(f"  %al_t = buffer.view %al[%base] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
+    if FRAG:
+        # fragment-major views: row r of block b is row b*16 + r of a 16-wide view
+        e(f"  %wl_fm = buffer.view %wl[%base] : buffer -> view<{BM * ksub // 16}x16xf16>")
+        e(f"  %al_fm = buffer.view %al[%base] : buffer -> view<{BN * ksub // 16}x16xf16>")
+        e("  %fm_lay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
+        e(f"  %al_fmt = buffer.view %al[%base] : buffer -> view<16x{BN * ksub // 16}xf16, %fm_lay>")
     e("  %wg_x = kernel.workgroup.id<x> : index")
     e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
@@ -195,6 +207,12 @@ def gen(fmt, kind="kstore"):
     e(f"  %l64 = index.rem %tid, %c{BM} : index")
     e(f"  %slot = index.div %tid, %c{BM} : index")
     e(f"  %drow = index.min %l64, %c{BM - 1} : index")
+    if FRAG:
+        e(f"  %cksub_fm = index.constant {ksub} : index")
+        e("  %drow_b = index.div %drow, %c16 : index")
+        e("  %drow_bk = index.mul %drow_b, %cksub_fm : index")
+        e("  %drow_r = index.rem %drow, %c16 : index")
+        e("  %drow_fm = index.add %drow_bk, %drow_r : index")
     e("  %drow_i = index.cast %drow : index to i32")
     e("  %wg_row_i = index.cast %wg_row : index to i32")
     e("  %grow_i = scalar.addi %wg_row_i, %drow_i : i32")
@@ -211,6 +229,12 @@ def gen(fmt, kind="kstore"):
     # activation staging map: lane tid stages segments [aseg0, aseg0+aspl) of
     # token row tid % BN of the tile
     e(f"  %atok = index.rem %tid, %c{BN} : index")
+    if FRAG:
+        e(f"  %cksub_a = index.constant {ksub} : index")
+        e("  %atok_b = index.div %atok, %c16 : index")
+        e("  %atok_bk = index.mul %atok_b, %cksub_a : index")
+        e("  %atok_r = index.rem %atok, %c16 : index")
+        e("  %atok_fm = index.add %atok_bk, %atok_r : index")
     e(f"  %apart = index.div %tid, %c{BN} : index")
     e(f"  %caspl8 = index.constant {8 * aspl} : index")
     e("  %aseg0 = index.mul %apart, %caspl8 : index")
@@ -262,14 +286,30 @@ def gen(fmt, kind="kstore"):
     # decode (only the decoding slots) into the weight tile
     e("    scf.if %decoder {")
     names = G.unpack_vals(e, cur_w, orig0)
-    L.extend(compute(names, "%gb_i"))
+    if FRAG:
+        L.extend(frag_stores(compute(names, "%gb_i"), ksub))
+    else:
+        L.extend(compute(names, "%gb_i"))
     e("    }")
     # stage the activation row into the LDS activation tile
     for sg, nm in enumerate(cur_a):
         e(f"    %as{sg}c = index.constant {8 * sg} : index")
         e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
-        e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
-    # next phase's loads
+        if FRAG:
+            # token t, k = %as: block (t/16, k/16), row t%16, column k%16
+            e(f"    %afq{sg} = index.div %as{sg}, %c16 : index")
+            e(f"    %afr{sg} = index.mul %afq{sg}, %c16 : index")
+            e(f"    %afrow{sg} = index.add %atok_fm, %afr{sg} : index")
+            e(f"    %afc{sg} = index.rem %as{sg}, %c16 : index")
+            e(f"    vector.store {nm}, %al_fm[%afrow{sg}, %afc{sg}] : vector<8xf16>, view<{BN * ksub // 16}x16xf16>")
+        else:
+            e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+    # next phase's loads. FENCE=1 keeps them below this phase's LDS stores: the
+    # scheduler otherwise hoists them above the stores and then has to wait
+    # vmcnt(0) -- for the loads it just issued -- before the first store (31%
+    # of IQ4_XS wave time in the ATT trace).
+    if FENCE:
+        e("    scf.schedule.fence")
     e("    %kp_n0 = index.add %kp, %c1 : index")
     e("    %kp_last = index.sub %kphases, %c1 : index")
     e("    %kp_n = index.min %kp_n0, %kp_last : index")
@@ -291,10 +331,23 @@ def gen(fmt, kind="kstore"):
     e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
     for i in range(FM):
         e(f"      %lr{i} = index.add %wr_off, %c{16 * i} : index")
-        e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
+        if FRAG:
+            # block (lr/16, ks/16) starts at row (lr/16)*KSUB + ks
+            e(f"      %lrb{i} = index.div %lr{i}, %c16 : index")
+            e(f"      %lrk{i} = index.mul %lrb{i}, %cksub : index")
+            e(f"      %lrow{i} = index.add %lrk{i}, %ks : index")
+            e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_fm[%lrow{i}, %c0] shape [%m, %k] : view<{BM * ksub // 16}x16xf16> -> {VF}")
+        else:
+            e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
     for j in range(FN):
         e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
-        e(f"      %rhs{j} = vector.fragment.load<rhs> %al_t[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
+        if FRAG:
+            e(f"      %tcb{j} = index.div %tc{j}, %c16 : index")
+            e(f"      %tck{j} = index.mul %tcb{j}, %cksub : index")
+            e(f"      %tcol{j} = index.add %tck{j}, %ks : index")
+            e(f"      %rhs{j} = vector.fragment.load<rhs> %al_fmt[%c0, %tcol{j}] shape [%k, %n] : view<16x{BN * ksub // 16}xf16, %fm_lay> -> {VF}")
+        else:
+            e(f"      %rhs{j} = vector.fragment.load<rhs> %al_t[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
     for i in range(FM):
         for j in range(FN):
             n = i * FN + j
@@ -331,6 +384,32 @@ def gen(fmt, kind="kstore"):
     return "\n".join(L) + "\n"
 
 
+def frag_stores(lines, ksub):
+    """Rewrite the shared decode helpers' weight-tile stores
+    (vector.store V, %wl_view[%drow, COL] : vector<Nxf16>, view<..>) into the
+    fragment-major tile: element (r, c) is row (r/16)*KSUB + (c/16)*16 + r%16,
+    column c%16 of %wl_fm. A store never crosses a 16-column block."""
+    import re
+    pat = re.compile(r"^(\s*)vector\.store (\S+), %wl_view\[%drow, (\S+)\] : (vector<\d+xf16>), view<[^>]*>$")
+    out, n = [], 0
+    for l in lines:
+        m = pat.match(l)
+        if not m:
+            assert "%wl_view" not in l, l
+            out.append(l)
+            continue
+        ind, val, col, vt = m.groups()
+        t = f"fs{n}"
+        n += 1
+        out += [f"{ind}%{t}q = index.div {col}, %c16 : index",
+                f"{ind}%{t}o = index.mul %{t}q, %c16 : index",
+                f"{ind}%{t}r = index.add %drow_fm, %{t}o : index",
+                f"{ind}%{t}c = index.rem {col}, %c16 : index",
+                f"{ind}vector.store {val}, %wl_fm[%{t}r, %{t}c] : {vt}, view<{BM * ksub // 16}x16xf16>"]
+    assert n > 0, "no weight-tile stores found to rewrite"
+    return out
+
+
 def swiglu_epilogue(e, arow):
     """out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the chained kernel's
     scalar ops in its order (bit-identity), as in gen_gemm_shared: an f16 result
@@ -338,8 +417,8 @@ def swiglu_epilogue(e, arow):
     ES-token slab goes through a per-wave f32 LDS tile (f32 result stores honour
     layouts) and a real loop walks it with lane-contiguous rows. The slab is half
     the wave's tokens so all waves' tiles fit in the activation tile's LDS."""
-    ES = 32 if TN >= 32 else TN
-    assert TN % ES == 0 and NWAVE * 16 * ES * 4 <= BN * arow * 2
+    ES = next(x for x in (32, 16) if x <= TN and NWAVE * 16 * x * 4 <= BN * arow * 2)
+    assert TN % ES == 0
     V8 = "vector<8xf32>"
     e("  %ep_lay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
     e(f"  %ep_wbytes = index.constant {16 * ES * 4} : index")

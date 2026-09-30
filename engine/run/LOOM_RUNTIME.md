@@ -1328,6 +1328,33 @@ has 2 groups of 32 per row, so with 128 rows half of the 512 lanes decode
 IQ4_XS, and a quarter decode Q4_K, whose groups pair up. HIP spreads each tile's
 decode over all 1024 threads.
 
+#### Why not 256 x 256 like HIP, and the fence that mattered more
+
+HIP's 256 x 256 tile fits in 64 KB because it needs no padding: its LDS tiles are
+fragment-major (each 16 x 16 block 512 contiguous bytes), split into two 256 B
+halves (k 0-7, k 8-15) so that each ds_load_b128 of 16 lanes reads 256
+contiguous bytes. `YAH_TG_FRAG=1` builds the fragment-major layout Loom can
+express (16 x 16 row-major blocks, a plain 16-wide view); its per-lane 32 B rows
+leave lanes i and i+8 on the same banks, and the half split is not expressible
+as a strided fragment view. Measured (IQ4_XS 17408x5120 kStore, standalone):
+
+| variant | ms |
+|---|---:|
+| padded 128 x 256, KSUB=64 (shipping) | 12.1 |
+| fragment-major 128 x 256 | 14.3 |
+| fragment-major 256 x 256, 32 waves | 13.8 |
+| padded 256 x 256 at KSUB=32 (fits, 80 B rows) | 14.1 |
+| padded 128 x 256, KSUB=64, `YAH_TG_FENCE=1` | 10.3 |
+
+The tile size was not the limit. The trace of the IQ4_XS kernel had 31% of wave
+time on one `s_waitcnt vmcnt(0)` at the phase boundary: the scheduler hoisted the
+next phase's weight loads above the stores of this phase's activations to LDS,
+then waited for every outstanding load, the fresh ones included, before the
+first store. A `scf.schedule.fence` between the stores and the next loads
+(now the default) takes IQ4_XS 12.1 -> 10.3, Q4_K 12.2 -> 11.6 and IQ3_S 10.6 ->
+10.3 ms standalone; in the pipeline, interleaved, GEMM device time 3675/3762 ->
+3516/3558 ms (HIP 3164), bit-identical.
+
 ### half_norm: the same loop, unrolled
 
 `yah_half_norm` (fused=0) was 1.85x HIP's `HalfNorm5120` (68.7 vs 37.1 ms over
