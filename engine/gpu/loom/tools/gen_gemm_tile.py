@@ -106,6 +106,17 @@ SWZ = int(os.environ.get("YAH_TG_SWZ", "0"))
 EPI_LDS = os.environ.get("YAH_TG_EPI_LDS", "1") == "1"
 # inner K-step loop policy, e.g. "unroll(%c2) schedule(recurrence)"
 KPOL = os.environ.get("YAH_TG_KPOL", "")
+# ONEBAR=1 (decode-ahead only): double-buffer the activation tile too, staged
+# one phase ahead like the weights, so each phase needs one barrier, not two
+# (ATT, real layer-4 data: 48% of IQ4_XS wave time at the two barriers)
+ONEBAR = os.environ.get("YAH_TG_ONEBAR", "0") == "1"
+# XBAR=1 (decode-ahead kstore/kres): HIP's placement of the barrier. Each phase
+# loads all its fragments, then crosses the one barrier with the last k step's
+# MMAs still to issue, so the matrix pipe has queued work while the waves
+# regroup; after the barrier the tile just read is free and phase kp+2 is staged
+# and decoded into it. ATT (real layer-4 data): HIP's IQ4_XS MMAs wait on the
+# busy pipe (24% stall) while ours found it idle (3%) after every barrier.
+XBAR = os.environ.get("YAH_TG_XBAR", "0") == "1"
 # policy of the K-phase loop (e.g. "unroll(%c2) schedule(recurrence)")
 PPOL = os.environ.get("YAH_TG_PPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
@@ -187,7 +198,7 @@ def gen(fmt, kind="kstore"):
     e("//")
     e(f"// Tile GEMM for {fmt}: {NWAVE} wave32 waves over a {BM} x {BN} tile, {TM} x {TN} per wave,")
     e("// decoded weights and staged activations both in LDS. See the generator.")
-    e(f"amdgpu.target<gfx11-generic> @yah_tile_w32 {{subgroup_size = {WS}}}")
+    e(f"amdgpu.target<gfx1151> @yah_tile_w32 {{subgroup_size = {WS}}}")
     e("")
     for c in ("m_tiles", "k_blocks", "token_tiles"):
         e(f"config.decl @{sym}.{c} : %value: index where [range(%value, 1, 4096)]")
@@ -279,6 +290,10 @@ def gen(fmt, kind="kstore"):
             G.EPI_TILE = "%wl" if wl_total >= al_bytes else "%al"
         else:
             al_bytes = slabs
+    if DECAHEAD and (ONEBAR or XBAR):
+        al_bytes = max(al_bytes, 2 * BN * arow * 2)
+    if DECAHEAD and (ONEBAR or XBAR):
+        e(f"  %al_tb = index.constant {BN * arow * 2} : index")
     e(f"  %al_bytes = index.constant {al_bytes} : offset")
     e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
     e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
@@ -407,188 +422,337 @@ def gen(fmt, kind="kstore"):
             vals.append((f"%{p}av{sg}", "vector<8xf16>"))
         return vals
 
-    if DECAHEAD:
-        assert not FRAG
-        # phase 0 decoded into weight tile 0 now; phase 1's bytes carried
-        L0, w00 = loads("pf_", "%row_off_i", "%gl_i")
+    if XBAR:
+        assert DECAHEAD and not FRAG and not DECW and not sw, "XBAR: decode-ahead kstore/kres"
+        nsteps = ksub // 16
+        e("  %wl_off1 = index.cast %wl_tb : index to offset")
+        e(f"  %wl_t1 = buffer.view %wl[%wl_off1] : buffer -> view<{BM}x{G.ROWP}xf16>")
+        e("  %al_off1 = index.cast %al_tb : index to offset")
+        e(f"  %al_rows1 = buffer.view %al[%al_off1] : buffer -> view<{BN}x{arow}xf16>")
+        e("  %kp_last = index.sub %kphases, %c1 : index")
+
+        def phase_blk(p, kpv):
+            """i32 block byte offset and group index of phase kpv (index SSA)."""
+            e(f"    %{p}kb = index.div {kpv}, %cph : index")
+            e(f"    %{p}ph = index.rem {kpv}, %cph : index")
+            e(f"    %{p}kbi = index.cast %{p}kb : index to i32")
+            e(f"    %{p}phi = index.cast %{p}ph : index to i32")
+            e(f"    %{p}bo = scalar.muli %{p}kbi, %cbbi : i32")
+            e(f"    %{p}blk = scalar.addi %row_off_i, %{p}bo : i32")
+            e(f"    %{p}gg = scalar.muli %{p}phi, %cgppi : i32")
+            e(f"    %{p}gb = scalar.addi %{p}gg, %gl_i : i32")
+            return f"%{p}blk", f"%{p}gb"
+
+        # phases 0 and 1 into tiles 0 and 1 now; phase 2's bytes and row carried
+        L0, w0 = loads("x0_", "%row_off_i", "%gl_i")
         L.extend(L0)
         e("  scf.if %decoder {")
-        L.extend(compute([nm for nm, _ in w00], "%gl_i"))
+        L.extend(compute([nm for nm, _ in w0], "%gl_i"))
         e("  }")
-        e("  %kp1_l = index.sub %kphases, %c1 : index")
-        e("  %kp1 = index.min %c1, %kp1_l : index")
-        e("  %kb1 = index.div %kp1, %cph : index")
-        e("  %ph1 = index.rem %kp1, %cph : index")
-        e("  %kb1_i = index.cast %kb1 : index to i32")
-        e("  %ph1_i = index.cast %ph1 : index to i32")
-        e("  %blk1o = scalar.muli %kb1_i, %cbbi : i32")
-        e("  %blk1 = scalar.addi %row_off_i, %blk1o : i32")
-        e("  %gb1g = scalar.muli %ph1_i, %cgppi : i32")
-        e("  %gb1 = scalar.addi %gb1g, %gl_i : i32")
-        L1, wv0 = loads("p1_", "%blk1", "%gb1")
+        e("  %xk1 = index.min %c1, %kp_last : index")
+        b1, g1 = phase_blk("x1_", "%xk1")
+        L1, w1 = loads("x1l_", b1, g1)
         L.extend(L1)
-    else:
-        # prefetch phase 0: weight bytes and activation row
-        L0, wv0 = loads("pf_", "%row_off_i", "%gl_i")
-        L.extend(L0)
-    orig0 = wv0
-    wv0 = G.pack_vals(e, wv0, "0")
-    av0 = a_loads("pa_", "%c0")
-    carried = wv0 + av0
-    ca = ", ".join(f"%a{i} = %init : {V8}" for i in range(NA))
-    ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(carried))
-    carried_t = types + ", " + ", ".join(ty for _, ty in carried)
-    res = ", ".join(f"%acc{i}" for i in range(NA)) + ", " + ", ".join(f"%cvo{x}" for x in range(len(carried)))
-    e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t}) {PPOL} {{")
-    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    e("    %kb = index.div %kp, %cph : index")
-    e("    %ph = index.rem %kp, %cph : index")
-    e("    %ph_i = index.cast %ph : index to i32")
-    e("    %phg_i = scalar.muli %ph_i, %cgppi : i32")
-    e("    %gb_i = scalar.addi %phg_i, %gl_i : i32")
-    e("    %kb_k = index.mul %kp, %cksub : index")
-    cur_w = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(wv0)]
-    cur_a = [f"%cv{len(wv0) + x}" for x in range(len(av0))]
-    # decode (only the decoding slots) into the weight tile
-    if not DECAHEAD:
-        e("    scf.if %decoder {")
-        names = G.unpack_vals(e, cur_w, orig0)
-        if FRAG:
-            L.extend(frag_stores(compute(names, "%gb_i"), ksub))
-        else:
-            L.extend(compute(names, "%gb_i"))
-        e("    }")
-    # stage the activation row into the LDS activation tile
-    for sg, nm in enumerate(cur_a):
-        e(f"    %as{sg}c = index.constant {8 * sg} : index")
-        e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
-        if FRAG:
-            # token t, k = %as: block (t/16, k/16), row t%16, column k%16
-            e(f"    %afq{sg} = index.div %as{sg}, %c16 : index")
-            e(f"    %afr{sg} = index.mul %afq{sg}, %c16 : index")
-            e(f"    %afrow{sg} = index.add %atok_fm, %afr{sg} : index")
-            e(f"    %afc{sg} = index.rem %as{sg}, %c16 : index")
-            e(f"    vector.store {nm}, %al_fm[%afrow{sg}, %afc{sg}] : vector<8xf16>, view<{BN * ksub // 16}x16xf16>")
-        elif DECAHEAD and DECW:
-            e("    scf.if %mma_wave {")
-            e(f"      vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
-            e("    }")
-        else:
-            e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
-    # next phase's loads. FENCE=1 keeps them below this phase's LDS stores: the
-    # scheduler otherwise hoists them above the stores and then has to wait
-    # vmcnt(0) -- for the loads it just issued -- before the first store (31%
-    # of IQ4_XS wave time in the ATT trace).
-    if FENCE:
-        e("    scf.schedule.fence")
-    e(f"    %kp_n0 = index.add %kp, %c{2 if DECAHEAD else 1} : index")
-    e("    %kp_last = index.sub %kphases, %c1 : index")
-    e("    %kp_n = index.min %kp_n0, %kp_last : index")
-    e("    %kb_n = index.div %kp_n, %cph : index")
-    e("    %ph_n = index.rem %kp_n, %cph : index")
-    e("    %kb_ni = index.cast %kb_n : index to i32")
-    e("    %ph_ni = index.cast %ph_n : index to i32")
-    e("    %blk_off0n = scalar.muli %kb_ni, %cbbi : i32")
-    e("    %blk_n = scalar.addi %row_off_i, %blk_off0n : i32")
-    e("    %phg_n = scalar.muli %ph_ni, %cgppi : i32")
-    e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
-    Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
-    L.extend(Ln)
-    nxt = G.pack_vals(e, nxt, "n")
-    if DECAHEAD:
-        e("    %kp_a0 = index.add %kp, %c1 : index")
-        e("    %kp_a = index.min %kp_a0, %kp_last : index")
-        e("    %kk_n = index.mul %kp_a, %cksub : index")
-    else:
-        e("    %kk_n = index.mul %kp_n, %cksub : index")
-    anx = a_loads("na_", "%kk_n")
-    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    if DECAHEAD:
-        # phase kp+1 into tile (kp+1)%2 while every wave multiplies tile kp%2
-        e("    %kp_d0 = index.add %kp, %c1 : index")
-        e("    %kp_d = index.min %kp_d0, %kp_last : index")
-        e("    %ph_d = index.rem %kp_d, %cph : index")
-        e("    %ph_di = index.cast %ph_d : index to i32")
-        e("    %phg_d = scalar.muli %ph_di, %cgppi : i32")
-        e("    %gb_d = scalar.addi %phg_d, %gl_i : i32")
-        e("    %buf_d = index.rem %kp_d0, %c2 : index")
-        e("    %off_d0 = index.mul %buf_d, %wl_tb : index")
-        e("    %off_d = index.cast %off_d0 : index to offset")
-        e(f"    %wl_dec = buffer.view %wl[%off_d] : buffer -> view<{BM}x{G.ROWP}xf16>")
-        e("    %buf_m = index.rem %kp, %c2 : index")
-        e("    %off_m0 = index.mul %buf_m, %wl_tb : index")
-        e("    %off_m = index.cast %off_m0 : index to offset")
-        e(f"    %wl_mma = buffer.view %wl[%off_m] : buffer -> view<{BM}x{G.ROWP}xf16>")
-        # decoding lanes are whole waves (tid < slots*BM): branch on the wave
-        # id so the branch is uniform -- a divergent one right before the MMA
-        # loop is rejected (divergent_loop_single_entry)
-        assert (slots * BM) % WS == 0
+        e("  scf.if %decoder {")
+        L.extend(l.replace("%wl_view[", "%wl_t1[") for l in compute([nm for nm, _ in w1], g1))
+        e("  }")
+        for t, (kv, view) in enumerate((("%c0", "%al_rows"), ("%xk1", "%al_rows1"))):
+            e(f"  %xa{t}k = index.mul {kv}, %cksub : index")
+            for sg, (nm, _) in enumerate(a_loads(f"xa{t}_", f"%xa{t}k")):
+                e(f"  %xa{t}s{sg}c = index.constant {8 * sg} : index")
+                e(f"  %xa{t}s{sg} = index.add %aseg0, %xa{t}s{sg}c : index")
+                e(f"  vector.store {nm}, {view}[%atok, %xa{t}s{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+        e("  %xk2 = index.min %c2, %kp_last : index")
+        b2, g2 = phase_blk("x2_", "%xk2")
+        L2, w2 = loads("x2l_", b2, g2)
+        L.extend(L2)
+        orig0 = w2
+        wv0 = G.pack_vals(e, w2, "0")
+        e("  %xa2k = index.mul %xk2, %cksub : index")
+        av0 = a_loads("xa2_", "%xa2k")
+        carried = wv0 + av0
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        ca = ", ".join(f"%a{i} = %init : {V8}" for i in range(NA))
+        ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(carried))
+        carried_t = types + ", " + ", ".join(ty for _, ty in carried)
+        res = ", ".join(f"%acc{i}" for i in range(NA)) + ", " + ", ".join(f"%cvo{x}" for x in range(len(carried)))
+        e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t}) {PPOL} {{")
+        cur_w = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(wv0)]
+        cur_a = [f"%cv{len(wv0) + x}" for x in range(len(av0))]
+        e("    %xbuf = index.rem %kp, %c2 : index")
+        e("    %xwo0 = index.mul %xbuf, %wl_tb : index")
+        e("    %xwo = index.cast %xwo0 : index to offset")
+        e(f"    %xwl = buffer.view %wl[%xwo] : buffer -> view<{BM}x{G.ROWP}xf16>")
+        e("    %xao0 = index.mul %xbuf, %al_tb : index")
+        e("    %xao = index.cast %xao0 : index to offset")
+        e(f"    %xal = buffer.view %al[%xao] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
+        e(f"    %xar = buffer.view %al[%xao] : buffer -> view<{BN}x{arow}xf16>")
+
+        def frag_loads(st):
+            e(f"    %xks{st} = index.constant {16 * st} : index")
+            for i in range(FM):
+                e(f"    %xlr{st}_{i} = index.add %wr_off, %c{16 * i} : index")
+                e(f"    %xlhs{st}_{i} = vector.fragment.load<lhs> %xwl[%xlr{st}_{i}, %xks{st}] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
+            for j in range(FN):
+                e(f"    %xtc{st}_{j} = index.add %wt_off, %c{16 * j} : index")
+                e(f"    %xrhs{st}_{j} = vector.fragment.load<rhs> %xal[%xks{st}, %xtc{st}_{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
+
+        def mmas(st, acc):
+            for i in range(FM):
+                for j in range(FN):
+                    n = i * FN + j
+                    e(f"    %xn{st}_{n} = vector.mma %xlhs{st}_{i}, %xrhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
+            return [f"%xn{st}_{n}" for n in range(NA)]
+
+        acc = [f"%a{i}" for i in range(NA)]
+        for st in range(nsteps - 1):
+            frag_loads(st)
+            acc = mmas(st, acc)
+        frag_loads(nsteps - 1)
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        acc = mmas(nsteps - 1, acc)
+        # every wave has read tile %xbuf: phase kp+2 goes into it
+        for sg, nm in enumerate(cur_a):
+            e(f"    %xs{sg}c = index.constant {8 * sg} : index")
+            e(f"    %xs{sg} = index.add %aseg0, %xs{sg}c : index")
+            e(f"    vector.store {nm}, %xar[%atok, %xs{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+        e("    %xkd0 = index.add %kp, %c2 : index")
+        e("    %xkd = index.min %xkd0, %kp_last : index")
+        e("    %xphd = index.rem %xkd, %cph : index")
+        e("    %xphdi = index.cast %xphd : index to i32")
+        e("    %xgd0 = scalar.muli %xphdi, %cgppi : i32")
+        e("    %xgd = scalar.addi %xgd0, %gl_i : i32")
         e("    %sg_id = kernel.subgroup.id : index")
-        if DECW:
-            e(f"    %cdecw = index.constant {NWAVE} : index")
-            e("    %dec_wave = index.cmp uge, %sg_id, %cdecw : index")
-        else:
-            e(f"    %cdecw = index.constant {slots * BM // WS} : index")
-            e("    %dec_wave = index.cmp ult, %sg_id, %cdecw : index")
+        e(f"    %cdecw = index.constant {slots * BM // WS} : index")
+        e("    %dec_wave = index.cmp ult, %sg_id, %cdecw : index")
         e("    scf.if %dec_wave {")
         names = G.unpack_vals(e, cur_w, orig0)
-        L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
+        L.extend(l.replace("%wl_view[", "%xwl[") for l in compute(names, "%xgd"))
         e("    }")
-    wlv = "%wl_mma" if DECAHEAD else "%wl_view"
-    cb = ", ".join(f"%b{i} = %a{i} : {V8}" for i in range(NA))
-    if DECAHEAD and DECW:
-        e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.if %mma_wave -> ({types}) {{")
-        e("    " + ", ".join(f"%rr{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
+        if FENCE:
+            e("    scf.schedule.fence")
+        e("    %xc3 = index.constant 3 : index")
+        e("    %xkn0 = index.add %kp, %xc3 : index")
+        e("    %xkn = index.min %xkn0, %kp_last : index")
+        bn_, gn_ = phase_blk("xn3_", "%xkn")
+        Ln, nxt = loads("xn_", bn_, gn_)
+        L.extend(Ln)
+        nxt = G.pack_vals(e, nxt, "n")
+        e("    %xkkn = index.mul %xkn, %cksub : index")
+        anx = a_loads("xna_", "%xkkn")
+        e("    scf.yield " + ", ".join(acc) + ", " + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
+        e("  }")
     else:
-        e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
-    for i in range(FM):
-        e(f"      %lr{i} = index.add %wr_off, %c{16 * i} : index")
-        if FRAG:
-            # block (lr/16, ks/16) starts at row (lr/16)*KSUB + ks
-            e(f"      %lrb{i} = index.div %lr{i}, %c16 : index")
-            e(f"      %lrk{i} = index.mul %lrb{i}, %cksub : index")
-            e(f"      %lrow{i} = index.add %lrk{i}, %ks : index")
-            e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_fm[%lrow{i}, %c0] shape [%m, %k] : view<{BM * ksub // 16}x16xf16> -> {VF}")
+        if DECAHEAD:
+            assert not FRAG
+            # phase 0 decoded into weight tile 0 now; phase 1's bytes carried
+            L0, w00 = loads("pf_", "%row_off_i", "%gl_i")
+            L.extend(L0)
+            e("  scf.if %decoder {")
+            L.extend(compute([nm for nm, _ in w00], "%gl_i"))
+            e("  }")
+            e("  %kp1_l = index.sub %kphases, %c1 : index")
+            e("  %kp1 = index.min %c1, %kp1_l : index")
+            e("  %kb1 = index.div %kp1, %cph : index")
+            e("  %ph1 = index.rem %kp1, %cph : index")
+            e("  %kb1_i = index.cast %kb1 : index to i32")
+            e("  %ph1_i = index.cast %ph1 : index to i32")
+            e("  %blk1o = scalar.muli %kb1_i, %cbbi : i32")
+            e("  %blk1 = scalar.addi %row_off_i, %blk1o : i32")
+            e("  %gb1g = scalar.muli %ph1_i, %cgppi : i32")
+            e("  %gb1 = scalar.addi %gb1g, %gl_i : i32")
+            L1, wv0 = loads("p1_", "%blk1", "%gb1")
+            L.extend(L1)
         else:
-            e(f"      %lhs{i} = vector.fragment.load<lhs> {wlv}[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
-    def rhs_load(j):
-        e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
-        if FRAG:
-            e(f"      %tcb{j} = index.div %tc{j}, %c16 : index")
-            e(f"      %tck{j} = index.mul %tcb{j}, %cksub : index")
-            e(f"      %tcol{j} = index.add %tck{j}, %ks : index")
-            e(f"      %rhs{j} = vector.fragment.load<rhs> %al_fmt[%c0, %tcol{j}] shape [%k, %n] : view<16x{BN * ksub // 16}xf16, %fm_lay> -> {VF}")
+            # prefetch phase 0: weight bytes and activation row
+            L0, wv0 = loads("pf_", "%row_off_i", "%gl_i")
+            L.extend(L0)
+        orig0 = wv0
+        wv0 = G.pack_vals(e, wv0, "0")
+        if DECAHEAD and ONEBAR:
+            # phase 0's activations into tile 0 now; phase 1's row carried
+            a00 = a_loads("pz_", "%c0")
+            for sg, (nm, _) in enumerate(a00):
+                e(f"  %zs{sg}c = index.constant {8 * sg} : index")
+                e(f"  %zs{sg} = index.add %aseg0, %zs{sg}c : index")
+                e(f"  vector.store {nm}, %al_rows[%atok, %zs{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+            e("  %ka1 = index.mul %kp1, %cksub : index")
+            av0 = a_loads("pa_", "%ka1")
         else:
-            e(f"      %rhs{j} = vector.fragment.load<rhs> %al_t[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
-    if RHS_OUTER:
-        # rhs-outer: each rhs fragment dies after its FM MMAs, so only the lhs
-        # fragments and one or two rhs are live (compile-report suggest: the
-        # IQ4_XS peak held all 6 fragments, 144 VGPRs, one short of tier 8).
-        # Every accumulator still takes one MMA per k step: same values.
-        for j in range(FN):
-            rhs_load(j)
-            for i in range(FM):
-                n = i * FN + j
-                e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
-            if RHS_FENCE and j + 1 < FN and (j + 1) % RHS_FENCE == 0:
-                e("      scf.schedule.fence")
-    else:
-        for j in range(FN):
-            rhs_load(j)
+            av0 = a_loads("pa_", "%c0")
+        carried = wv0 + av0
+        ca = ", ".join(f"%a{i} = %init : {V8}" for i in range(NA))
+        ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(carried))
+        carried_t = types + ", " + ", ".join(ty for _, ty in carried)
+        res = ", ".join(f"%acc{i}" for i in range(NA)) + ", " + ", ".join(f"%cvo{x}" for x in range(len(carried)))
+        e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t}) {PPOL} {{")
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("    %kb = index.div %kp, %cph : index")
+        e("    %ph = index.rem %kp, %cph : index")
+        e("    %ph_i = index.cast %ph : index to i32")
+        e("    %phg_i = scalar.muli %ph_i, %cgppi : i32")
+        e("    %gb_i = scalar.addi %phg_i, %gl_i : i32")
+        e("    %kb_k = index.mul %kp, %cksub : index")
+        cur_w = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(wv0)]
+        cur_a = [f"%cv{len(wv0) + x}" for x in range(len(av0))]
+        # decode (only the decoding slots) into the weight tile
+        if not DECAHEAD:
+            e("    scf.if %decoder {")
+            names = G.unpack_vals(e, cur_w, orig0)
+            if FRAG:
+                L.extend(frag_stores(compute(names, "%gb_i"), ksub))
+            else:
+                L.extend(compute(names, "%gb_i"))
+            e("    }")
+        # stage the activation row into the LDS activation tile
+        for sg, nm in enumerate(cur_a):
+            e(f"    %as{sg}c = index.constant {8 * sg} : index")
+            e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
+            if FRAG:
+                # token t, k = %as: block (t/16, k/16), row t%16, column k%16
+                e(f"    %afq{sg} = index.div %as{sg}, %c16 : index")
+                e(f"    %afr{sg} = index.mul %afq{sg}, %c16 : index")
+                e(f"    %afrow{sg} = index.add %atok_fm, %afr{sg} : index")
+                e(f"    %afc{sg} = index.rem %as{sg}, %c16 : index")
+                e(f"    vector.store {nm}, %al_fm[%afrow{sg}, %afc{sg}] : vector<8xf16>, view<{BN * ksub // 16}x16xf16>")
+            elif DECAHEAD and DECW:
+                e("    scf.if %mma_wave {")
+                e(f"      vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+                e("    }")
+            elif DECAHEAD and ONEBAR:
+                if sg == 0:
+                    e("    %abuf_s0 = index.add %kp, %c1 : index")
+                    e("    %abuf_s = index.rem %abuf_s0, %c2 : index")
+                    e("    %aoff_s0 = index.mul %abuf_s, %al_tb : index")
+                    e("    %aoff_s = index.cast %aoff_s0 : index to offset")
+                    e(f"    %al_st = buffer.view %al[%aoff_s] : buffer -> view<{BN}x{arow}xf16>")
+                e(f"    vector.store {nm}, %al_st[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+            else:
+                e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+        # next phase's loads. FENCE=1 keeps them below this phase's LDS stores: the
+        # scheduler otherwise hoists them above the stores and then has to wait
+        # vmcnt(0) -- for the loads it just issued -- before the first store (31%
+        # of IQ4_XS wave time in the ATT trace).
+        if FENCE:
+            e("    scf.schedule.fence")
+        e(f"    %kp_n0 = index.add %kp, %c{2 if DECAHEAD else 1} : index")
+        e("    %kp_last = index.sub %kphases, %c1 : index")
+        e("    %kp_n = index.min %kp_n0, %kp_last : index")
+        e("    %kb_n = index.div %kp_n, %cph : index")
+        e("    %ph_n = index.rem %kp_n, %cph : index")
+        e("    %kb_ni = index.cast %kb_n : index to i32")
+        e("    %ph_ni = index.cast %ph_n : index to i32")
+        e("    %blk_off0n = scalar.muli %kb_ni, %cbbi : i32")
+        e("    %blk_n = scalar.addi %row_off_i, %blk_off0n : i32")
+        e("    %phg_n = scalar.muli %ph_ni, %cgppi : i32")
+        e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
+        Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
+        L.extend(Ln)
+        nxt = G.pack_vals(e, nxt, "n")
+        if DECAHEAD and ONEBAR:
+            e("    %kk_n = index.mul %kp_n, %cksub : index")
+        elif DECAHEAD:
+            e("    %kp_a0 = index.add %kp, %c1 : index")
+            e("    %kp_a = index.min %kp_a0, %kp_last : index")
+            e("    %kk_n = index.mul %kp_a, %cksub : index")
+        else:
+            e("    %kk_n = index.mul %kp_n, %cksub : index")
+        anx = a_loads("na_", "%kk_n")
+        if not (DECAHEAD and ONEBAR):
+            e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if DECAHEAD:
+            # phase kp+1 into tile (kp+1)%2 while every wave multiplies tile kp%2
+            e("    %kp_d0 = index.add %kp, %c1 : index")
+            e("    %kp_d = index.min %kp_d0, %kp_last : index")
+            e("    %ph_d = index.rem %kp_d, %cph : index")
+            e("    %ph_di = index.cast %ph_d : index to i32")
+            e("    %phg_d = scalar.muli %ph_di, %cgppi : i32")
+            e("    %gb_d = scalar.addi %phg_d, %gl_i : i32")
+            e("    %buf_d = index.rem %kp_d0, %c2 : index")
+            e("    %off_d0 = index.mul %buf_d, %wl_tb : index")
+            e("    %off_d = index.cast %off_d0 : index to offset")
+            e(f"    %wl_dec = buffer.view %wl[%off_d] : buffer -> view<{BM}x{G.ROWP}xf16>")
+            e("    %buf_m = index.rem %kp, %c2 : index")
+            e("    %off_m0 = index.mul %buf_m, %wl_tb : index")
+            e("    %off_m = index.cast %off_m0 : index to offset")
+            e(f"    %wl_mma = buffer.view %wl[%off_m] : buffer -> view<{BM}x{G.ROWP}xf16>")
+            # decoding lanes are whole waves (tid < slots*BM): branch on the wave
+            # id so the branch is uniform -- a divergent one right before the MMA
+            # loop is rejected (divergent_loop_single_entry)
+            assert (slots * BM) % WS == 0
+            e("    %sg_id = kernel.subgroup.id : index")
+            if DECW:
+                e(f"    %cdecw = index.constant {NWAVE} : index")
+                e("    %dec_wave = index.cmp uge, %sg_id, %cdecw : index")
+            else:
+                e(f"    %cdecw = index.constant {slots * BM // WS} : index")
+                e("    %dec_wave = index.cmp ult, %sg_id, %cdecw : index")
+            e("    scf.if %dec_wave {")
+            names = G.unpack_vals(e, cur_w, orig0)
+            L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
+            e("    }")
+        wlv = "%wl_mma" if DECAHEAD else "%wl_view"
+        alv = "%al_t"
+        if DECAHEAD and ONEBAR:
+            e("    %abuf_m = index.rem %kp, %c2 : index")
+            e("    %aoff_m0 = index.mul %abuf_m, %al_tb : index")
+            e("    %aoff_m = index.cast %aoff_m0 : index to offset")
+            e(f"    %al_mma = buffer.view %al[%aoff_m] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
+            alv = "%al_mma"
+        cb = ", ".join(f"%b{i} = %a{i} : {V8}" for i in range(NA))
+        if DECAHEAD and DECW:
+            e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.if %mma_wave -> ({types}) {{")
+            e("    " + ", ".join(f"%rr{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
+        else:
+            e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
         for i in range(FM):
+            e(f"      %lr{i} = index.add %wr_off, %c{16 * i} : index")
+            if FRAG:
+                # block (lr/16, ks/16) starts at row (lr/16)*KSUB + ks
+                e(f"      %lrb{i} = index.div %lr{i}, %c16 : index")
+                e(f"      %lrk{i} = index.mul %lrb{i}, %cksub : index")
+                e(f"      %lrow{i} = index.add %lrk{i}, %ks : index")
+                e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_fm[%lrow{i}, %c0] shape [%m, %k] : view<{BM * ksub // 16}x16xf16> -> {VF}")
+            else:
+                e(f"      %lhs{i} = vector.fragment.load<lhs> {wlv}[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
+        def rhs_load(j):
+            e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
+            if FRAG:
+                e(f"      %tcb{j} = index.div %tc{j}, %c16 : index")
+                e(f"      %tck{j} = index.mul %tcb{j}, %cksub : index")
+                e(f"      %tcol{j} = index.add %tck{j}, %ks : index")
+                e(f"      %rhs{j} = vector.fragment.load<rhs> %al_fmt[%c0, %tcol{j}] shape [%k, %n] : view<16x{BN * ksub // 16}xf16, %fm_lay> -> {VF}")
+            else:
+                e(f"      %rhs{j} = vector.fragment.load<rhs> {alv}[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
+        if RHS_OUTER:
+            # rhs-outer: each rhs fragment dies after its FM MMAs, so only the lhs
+            # fragments and one or two rhs are live (compile-report suggest: the
+            # IQ4_XS peak held all 6 fragments, 144 VGPRs, one short of tier 8).
+            # Every accumulator still takes one MMA per k step: same values.
             for j in range(FN):
-                n = i * FN + j
-                e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
-    e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
-    e("    }")
-    if DECAHEAD and DECW:
-        e("    scf.yield " + ", ".join(f"%rr{i}" for i in range(NA)) + f" : {types}")
-        e("    } else {")
-        e("    scf.yield " + ", ".join(f"%a{i}" for i in range(NA)) + f" : {types}")
+                rhs_load(j)
+                for i in range(FM):
+                    n = i * FN + j
+                    e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
+                if RHS_FENCE and j + 1 < FN and (j + 1) % RHS_FENCE == 0:
+                    e("      scf.schedule.fence")
+        else:
+            for j in range(FN):
+                rhs_load(j)
+            for i in range(FM):
+                for j in range(FN):
+                    n = i * FN + j
+                    e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
+        e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
         e("    }")
-    e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
-      + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
-    e("  }")
+        if DECAHEAD and DECW:
+            e("    scf.yield " + ", ".join(f"%rr{i}" for i in range(NA)) + f" : {types}")
+            e("    } else {")
+            e("    scf.yield " + ", ".join(f"%a{i}" for i in range(NA)) + f" : {types}")
+            e("    }")
+        e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
+          + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
+        e("  }")
     if sw and SWEPI and EPI_LDS and WS == 32 and TM == 32:
         lds_epilogue(e, kr, V8, sw=True)
         e("  kernel.return")
@@ -643,11 +807,20 @@ def frag_stores(lines, ksub):
         ind, val, col, vt = m.groups()
         t = f"fs{n}"
         n += 1
+        # a 16-wide store fills a whole 16-column block: its column is 0, and
+        # saying so lets the store stay 2 x b128 (with col % 16 the compiler
+        # could not prove the alignment and split it into 8 x ds_store_b32)
+        full = vt == "vector<16xf16>"
         out += [f"{ind}%{t}q = index.div {col}, %c16 : index",
                 f"{ind}%{t}o = index.mul %{t}q, %c16 : index",
                 f"{ind}%{t}r = index.add %drow_fm, %{t}o : index",
-                f"{ind}%{t}c = index.rem {col}, %c16 : index",
-                f"{ind}vector.store {val}, %wl_fm[%{t}r, %{t}c] : {vt}, view<{BM * ksub // 16}x16xf16>"]
+                # 8-wide pieces start at column 0 or 8: built as (col/8 % 2) * 8
+                # so the compiler sees the 16-byte alignment
+                *([] if full else ([f"{ind}%{t}e = index.div {col}, %c8 : index",
+                                    f"{ind}%{t}h = index.rem %{t}e, %c2 : index",
+                                    f"{ind}%{t}c = index.mul %{t}h, %c8 : index"] if vt == "vector<8xf16>"
+                                   else [f"{ind}%{t}c = index.rem {col}, %c16 : index"])),
+                f"{ind}vector.store {val}, %wl_fm[%{t}r, {'%c0' if full else f'%{t}c'}] : {vt}, view<{BM * ksub // 16}x16xf16>"]
     assert n > 0, "no weight-tile stores found to rewrite"
     return out
 

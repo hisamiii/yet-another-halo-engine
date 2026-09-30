@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -98,6 +99,27 @@ const char* TypeName(GgmlType type) {
   }
 }
 
+// Real-data override: YAH_BENCH_W / YAH_BENCH_UP (raw GGUF weight bytes) and
+// YAH_BENCH_A (raw fp16 activations, batch x K) replace the synthetic fills, so
+// this bench and the Loom case can run the same bytes. Clocks depend on the
+// data (real weights run the same cycle count ~25% slower than a constant fill
+// on gfx1151), so only same-data comparisons mean anything.
+bool LoadOverride(const char* env, void* device, std::size_t bytes) {
+  const char* path = std::getenv(env);
+  if (path == nullptr) return false;
+  FILE* f = std::fopen(path, "rb");
+  if (f == nullptr) throw std::runtime_error(std::string("cannot open ") + path);
+  std::vector<unsigned char> host(bytes);
+  const std::size_t got = std::fread(host.data(), 1, bytes, f);
+  std::fclose(f);
+  if (got != bytes)
+    throw std::runtime_error(std::string(path) + ": short read (" +
+                             std::to_string(got) + " of " + std::to_string(bytes) + ")");
+  HIP_CHECK(hipMemcpy(device, host.data(), bytes, hipMemcpyHostToDevice));
+  std::fprintf(stderr, "%s: %s (%zu bytes)\n", env, path, bytes);
+  return true;
+}
+
 // The prefill path does not run the plain store epilogue everywhere: gate is
 // kStore only when the pair is not fused, up is kSwiGLU, down is kResidual, and
 // the paired gate/up kernel is kGateUp. Each has its own buffer traffic and
@@ -131,6 +153,10 @@ void RunFp16(GgmlType type, std::size_t m, std::size_t k, std::size_t batch,
   FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
       fp32_x.data(), fp32_x.size());
   LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(), nullptr);
+  HIP_CHECK(hipDeviceSynchronize());
+  LoadOverride("YAH_BENCH_W", weights.data(), weight_bytes);
+  if (dual) LoadOverride("YAH_BENCH_UP", up_weights.data(), weight_bytes);
+  LoadOverride("YAH_BENCH_A", half_x.data(), batch * k * sizeof(short));
   const auto launch = [&] {
     if (swiglu) {
       LaunchBatchedQuantGEMMSwiGLUFp16(type, weights.data(), half_x.data(),

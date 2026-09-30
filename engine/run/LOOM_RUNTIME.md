@@ -49,8 +49,9 @@ hrx_gpu_shutdown();
 ```
 
 The device advertises two AMDGPU executable targets: `gfx1151` (exact, kind 0)
-and `gfx11-generic` (kind 1). Pass the key the artifact was built for; the
-benchmark bundle is compiled for the device, i.e. `gfx1151`.
+and `gfx11-generic` (kind 1). Pass the key the artifact was built for. Every
+Loom source, generator and script now targets `gfx1151` (2026-09-30);
+`YAH_LOOM_TARGET` in `emit_hal.py` overrides it.
 
 Build (no HIP, no hipcc):
 
@@ -1708,6 +1709,61 @@ lane issues its 160 loads up front and keeps the values in registers for the
 output pass. Interleaved, device time: loop 68.7, `unroll(8)` 61.9, fully
 unrolled 42.3 ms (1.14x HIP), bit-identical. The emitter uses it unless
 `YAH_NORM_UNROLLED=0`.
+
+### IQ4_XS, measured instead of inferred (2026-09-30)
+
+**Target.** Everything compiles for `gfx1151` now. `gfx11-generic`'s residency
+model is the 1024-VGPR RDNA3 parts (granule 16, so 144 VGPRs read as tier 7:
+one 16-wave workgroup per WGP); gfx1151 has the full 1536-VGPR file (granule
+24). The hardware ran two workgroups either way (ATT: 7.9 resident waves per
+SIMD), and the whole pp2048 set measured the same on both targets (ABBA
+3606.8 vs 3622.8 ms, md5 unchanged); the new default costs nothing.
+
+**Real data.** Standalone cases used constant fills. The kernel runs the same
+cycle count on any data (26.7 M cycles for 17408x5120x2048), but real weights
+and activations drop the clock from ~2.56 to ~1.93 GHz. So ms against HIP on
+synthetic data compared clocks, not kernels. Real layer-4 bytes now come from
+`YAH_DUMP_LAYER=4` (`.fn`) plus the GGUF tensor; `gemm_bench` takes
+`YAH_BENCH_W/UP/A` files. Same bytes, 20 launches: HIP 9.00 ms, Loom 10.40.
+
+**Profiling Loom code with rocprofv3.** rocprofv3 cannot see HRX dispatches,
+and HRX's counter backend has no occupancy or LDS counters. `engine/gpu/loomhip.hip`
+(`build_gpu.sh loomhip`) launches a Loom hsaco through HIP, which gives the
+full rocprofv3 set: PMC, derived occupancy, per-wave ATT timelines. Its output
+for the IQ4_XS kstore is bit-identical to the pipeline's layer-4 gate.
+
+**Diagnosis (per-wave ATT, same tool on both kernels).** Same occupancy (8.0
+waves/SIMD) and the same WMMA count per wave (2560). Loom needs 37.3 time
+units per WMMA per SIMD against HIP's 30.3. HIP's waves queue on a busy
+matrix pipe (27 units/WMMA stalled on WMMA issue); ours find it idle and wait
+at barriers instead (86.5 vs 23.0 units/WMMA). Per barrier interval the four
+decoding waves run 771 units of VALU and the twelve MMA-only waves wait 835
+at the barrier. The end-of-phase barrier's last arriver spends 61% of its
+last 40 instructions in `s_waitcnt`, mostly `lgkmcnt(1)` right after the 7
+fragment loads each k-step issues: after every barrier all ~32 waves on a WGP
+load their fragments at once, and the matrix pipe idles for that queue.
+HIP pays one barrier per 16 WMMAs per wave, we pay one per 8.
+
+**Tried against that diagnosis, all bit-identical, one round each, real data:**
+- decode spread over all 16 waves (`YAH_TG_SPLIT=4`, decode-ahead kept):
+  10.83 vs 10.57 ms. Every wave decodes evenly (483 units VALU) but still
+  waits 676 at each barrier, so the imbalance explained who waits, not why
+  the phase is long.
+- Loom read-ahead on the fragment loop (`YAH_TG_KPOL='pipeline(%c2)'`):
+  interleaves step 1's loads under step 0's WMMAs, 160 VGPRs, 10.58 vs 10.37.
+  The burst after the barrier stays.
+- one barrier per phase with a double-buffered activation tile
+  (`YAH_TG_ONEBAR=1`): no change. MMAs queued across the barrier HIP's way
+  (`YAH_TG_XBAR=1`): 160 VGPRs, +18%.
+- HIP's shape (256x256, 32 waves of 32x64, K=64 per stage, all 1024 lanes
+  decode 16 weights, fragment-major LDS tiles, fully unrolled K loop):
+  12.49 ms. Its K loop now interleaves loads and WMMAs much like HIP's, but
+  `s_waitcnt` costs 80.4 units per WMMA against HIP's 14.1, spread over every
+  `lgkmcnt` in the loop. HIP keeps loads several WMMAs ahead at 192 VGPRs;
+  Loom's `pipeline(%c2)` on this shape went to 208 VGPRs (too many for a
+  32-wave workgroup) and still waited `lgkmcnt(0)` before its WMMAs.
+  (Fixed on the way: fragment-major 8- and 16-wide stores now prove their
+  alignment and stay b128.)
 
 ## 7. Decode and the HIP removal
 
