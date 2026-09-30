@@ -16,7 +16,7 @@
 // Required config: --config=yah_embed_ptr_q3k.rows=4
 //                  --config=yah_embed_ptr_q3k.blocks_per_row=2
 //                  --config=yah_embed_ptr_q3k.hidden=512
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_embed_ptr_q3k.rows : %value: index where [range(%value, 1, 1073741824)]
 

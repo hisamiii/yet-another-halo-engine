@@ -25,7 +25,7 @@
 // Required config: --config=yah_vision_activate.size=8
 //                  --config=yah_vision_activate.width=8
 //                  --config=yah_vision_activate.approximate=1   (and =0)
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_vision_activate.size : %value: index where [range(%value, 1, 1073741824)]
 

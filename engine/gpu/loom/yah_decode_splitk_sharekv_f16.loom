@@ -31,7 +31,7 @@
 //                  --config=yah_decode_splitk_sharekv.rows=1
 //                  --config=yah_decode_splitk_sharekv.splits=2
 //                  --config=yah_decode_splitk_sharekv.max_splits=2
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_decode_splitk_sharekv.layer_idx : %value: index where [range(%value, 0, 65536)]
 

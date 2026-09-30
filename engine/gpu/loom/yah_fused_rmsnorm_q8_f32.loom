@@ -21,7 +21,7 @@
 // where every reduction order is exact, so the whole output is byte-exact.
 //
 // Required config: --config=yah_fused_rmsnorm_q8.batch=1 --config=yah_fused_rmsnorm_q8.dim=64
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_fused_rmsnorm_q8.batch : %value: index where [range(%value, 1, 65536)]
 

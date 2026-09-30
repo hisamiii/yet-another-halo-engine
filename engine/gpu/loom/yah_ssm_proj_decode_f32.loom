@@ -42,7 +42,7 @@
 //                  --config=yah_ssm_proj_decode.qkv_size=<rows>
 //                  --config=yah_ssm_proj_decode.inner_size=<rows>
 //                  --config=yah_ssm_proj_decode.rank=<rows>
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_ssm_proj_decode.hidden : %value: index where [range(%value, 1, 65536)]
 

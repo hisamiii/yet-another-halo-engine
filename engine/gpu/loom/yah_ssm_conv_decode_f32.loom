@@ -14,7 +14,7 @@
 //
 // Required config (small): --config=yah_ssm_conv_decode.qkv_dim=8
 //                          --config=yah_ssm_conv_decode.rows=2
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_ssm_conv_decode.qkv_dim : %value: index where [range(%value, 1, 1048576)]
 

@@ -28,7 +28,7 @@
 //                  --config=yah_attn_softmax.matrix_stride=4
 //                  --config=yah_attn_softmax.num_matrices=1
 //                  --config=yah_attn_softmax.start_pos={3 for full, 0 for masked}
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_attn_softmax.start_pos : %value: index where [range(%value, 0, 1073741824)]
 

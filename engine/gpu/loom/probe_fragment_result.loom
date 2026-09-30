@@ -4,7 +4,7 @@
 // vector.fragment.store<result> writes it to a 16x16xf32 tensor. The output
 // cell value (lane*8+e) identifies which lane-local register element landed
 // where.
-amdgpu.target<gfx11-generic> @probe_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @probe_wave32 {subgroup_size = 32}
 
 kernel.def target(@probe_wave32) @probe_fragment_result_global() {
   %unit = index.constant 1 : index

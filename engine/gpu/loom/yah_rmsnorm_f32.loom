@@ -10,7 +10,7 @@
 //
 // First port: correctness and coverage, one subgroup per row. The HIP kernel uses
 // 256 threads per row with a shared-memory tree; that is a tuning question.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_rmsnorm.rows : %value: index where [range(%value, 1, 4096)]
 

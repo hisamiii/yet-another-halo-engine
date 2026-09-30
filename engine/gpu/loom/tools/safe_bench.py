@@ -181,7 +181,7 @@ def main():
     root = m.group(1)
 
     report = "/tmp/safe_bench_report.json"
-    cmd = [COMPILE, source, "--root=" + root, "--target=amdgpu:gfx11-generic",
+    cmd = [COMPILE, source, "--root=" + root, "--target=amdgpu:gfx1151",
            "--format=amdgpu-hsaco", "--output=/tmp/safe_bench.hsaco",
            "--compile-report=details", "--compile-report-output=" + report]
     cmd += ["--config=" + b for b in bindings]

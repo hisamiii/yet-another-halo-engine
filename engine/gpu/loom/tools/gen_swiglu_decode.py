@@ -209,7 +209,7 @@ def main():
     out.append("//")
     out.append("// Required config: --config=yah_swiglu_decode.m_rows=16")
     out.append("//                  --config=yah_swiglu_decode.k_groups=20")
-    out.append("amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}")
+    out.append("amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}")
     out.append("")
     for f in ALL:
         out += (kstore_func(f) if f in KSTORE else fmt_func(f))

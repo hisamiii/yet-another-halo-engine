@@ -22,7 +22,7 @@
 // so the expectation would no longer be a single iota. A transposition of d and e
 // changes the sequence. At rows > 1 the pattern repeats per row and no single iota
 // describes the tensor; that path needs a captured fixture.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_hadamard16.rows : %value: index where [range(%value, 1, 65536)]
 

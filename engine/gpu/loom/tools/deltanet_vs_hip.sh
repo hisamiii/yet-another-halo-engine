@@ -51,7 +51,7 @@ mkcheck ref_state.npy pos.loom; mkcheck state.npy neg.loom
 set +u; set --; source "$root/engine/hrx-env.sh" >/dev/null; set -u
 H=/home/q/hrx
 for t in pos neg; do
-  timeout 600 $H/build/cmake/loom/src/loom/tools/iree-benchmark-loom/iree-benchmark-loom $t.loom --device=amdgpu --target=amdgpu:gfx11-generic \
+  timeout 600 $H/build/cmake/loom/src/loom/tools/iree-benchmark-loom/iree-benchmark-loom $t.loom --device=amdgpu --target=amdgpu:gfx1151 \
     --config=yah_deltanet.batch=$B --config=yah_deltanet.qkv_size=10240 --config=yah_deltanet.inner_size=6144 \
     --config=yah_deltanet.num_key_heads=16 --config=yah_deltanet.num_heads=48 --benchmark=@vs_hip_bench \
     --measure=dispatch_complete --batch-size=1 --iterations=1 --max-batches=1 --output=$t.json >/dev/null 2>&1 || true

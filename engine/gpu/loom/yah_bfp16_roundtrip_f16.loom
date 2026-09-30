@@ -22,7 +22,7 @@
 // `rintf` rounds to nearest even in the default mode, which is `scalar.roundevenf`.
 //
 // Required config: --config=yah_bfp16.groups=2 --config=yah_bfp16.bits=3
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_bfp16.groups : %value: index where [range(%value, 1, 1048576)]
 config.decl @yah_bfp16.bits : %value: index where [range(%value, 1, 15)]

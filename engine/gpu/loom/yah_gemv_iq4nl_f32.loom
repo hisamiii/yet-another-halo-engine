@@ -15,7 +15,7 @@
 //
 // Required config: --config=yah_gemv_iq4nl.m_rows=16
 //                  --config=yah_gemv_iq4nl.k_blocks=20
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_gemv_iq4nl.m_rows : %value: index where [range(%value, 1, 65536)]
 

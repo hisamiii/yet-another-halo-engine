@@ -17,7 +17,7 @@
 //
 // Required config: --config=yah_atb_expand.rows=2 --config=yah_atb_expand.head_cols=3
 //                  --config=yah_atb_expand.full_cols=5
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_atb_expand.rows : %value: index where [range(%value, 1, 65536)]
 

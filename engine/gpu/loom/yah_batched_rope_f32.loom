@@ -16,7 +16,7 @@
 //
 // Required config: --config=yah_batched_rope.batch=1 --config=yah_batched_rope.start_pos=0
 //                  --config=yah_batched_rope.num_heads=4 --config=yah_batched_rope.num_kv_heads=2
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_batched_rope.batch : %value: index where [range(%value, 1, 65536)]
 

@@ -9,7 +9,7 @@
 // break out of a kernel on this target.
 //
 // Required config: --config=yah_scatter_draft.count=4 --config=yah_scatter_draft.vocab=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_scatter_draft.count : %value: index where [range(%value, 1, 1048576)]
 

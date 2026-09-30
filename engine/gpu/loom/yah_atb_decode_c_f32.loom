@@ -22,7 +22,7 @@
 // Required config: --config=yah_atb_decode_c.groups=2 --config=yah_atb_decode_c.l1_cols=1
 //                  --config=yah_atb_decode_c.n_full=256 --config=yah_atb_decode_c.n_offset=0
 //                  --config=yah_atb_decode_c.out_rows=2 --config=yah_atb_decode_c.packed_bytes=18
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_atb_decode_c.groups : %value: index where [range(%value, 1, 1073741824)]
 

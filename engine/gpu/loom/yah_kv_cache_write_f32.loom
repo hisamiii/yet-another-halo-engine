@@ -24,7 +24,7 @@
 //                  --config=yah_kv_write.max_context=3
 //                  --config=yah_kv_write.num_kv_heads=2
 //                  --config=yah_kv_write.head_dim=4
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_kv_write.layer_idx : %value: index where [range(%value, 0, 65536)]
 

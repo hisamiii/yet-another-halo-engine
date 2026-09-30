@@ -25,7 +25,7 @@
 // Required config: --config=yah_deltanet_prep_ab.batch=2
 //                  --config=yah_deltanet_prep_ab.qkv_size=16
 //                  --config=yah_deltanet_prep_ab.num_heads=4
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_deltanet_prep_ab.batch : %value: index where [range(%value, 1, 1048576)]
 

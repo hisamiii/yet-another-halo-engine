@@ -23,7 +23,7 @@
 // generated fixture compared with a tolerance.
 //
 // Required config: --config=yah_ssm_postnorm_fp16.head_count=3
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_ssm_postnorm_fp16.head_count : %value: index where [range(%value, 1, 1048576)]
 

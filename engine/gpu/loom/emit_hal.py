@@ -78,13 +78,20 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(source))[0]
     rewritten = os.path.join(tempfile.gettempdir(), stem + "_emit.loom")
+    # YAH_LOOM_TARGET selects the compile target: default gfx1151, the Strix Halo
+    # GPU itself (full 1536-VGPR file, granule 24). gfx11-generic models the
+    # 1024-VGPR RDNA3 parts; end to end the two measured the same (2026-09-30).
+    tgt = os.environ.get("YAH_LOOM_TARGET", "gfx1151")
+    text = "\n".join(out) + "\n"
+    if tgt != "gfx1151":
+        text = text.replace("amdgpu.target<gfx1151>", "amdgpu.target<%s>" % tgt)
     with open(rewritten, "w") as f:
-        f.write("\n".join(out) + "\n")
+        f.write(text)
 
     hal_path = os.path.join(outdir, stem + ".hal")
     target = os.path.join(outdir, stem + ".hsaco")
     cmd = [H + "/build/cmake/loom/src/loom/tools/iree-run-loom/iree-run-loom",
-           rewritten, "--device=amdgpu", "--target=amdgpu:gfx11-generic",
+           rewritten, "--device=amdgpu", "--target=amdgpu:" + tgt,
            "--emit-only", "--emit-hal-executable=" + hal_path,
            "--emit-target-artifact=" + target]
     result = subprocess.run(cmd, env=env(), capture_output=True, text=True)

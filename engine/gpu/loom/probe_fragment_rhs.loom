@@ -1,6 +1,6 @@
 // Probe: physical per-lane layout of vector.fragment.load<rhs> for a 16x16 f16
 // fragment on gfx11/wave32. Same store technique as probe_fragment_layout.loom.
-amdgpu.target<gfx11-generic> @probe_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @probe_wave32 {subgroup_size = 32}
 
 kernel.def target(@probe_wave32) @probe_fragment_rhs_global() {
   %unit = index.constant 1 : index

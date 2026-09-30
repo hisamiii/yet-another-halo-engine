@@ -41,7 +41,7 @@
 // exactly, so the output must equal the input. Quantization *error*, and
 // under-coverage of the tail, need a non-uniform fixture plus a
 // check.oracle.call reference implementation; PORTING.md tracks that work.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 // Declared capacity in 32-element blocks. 1048576 blocks = 128 MiB of f32, about
 // 100x the largest KV operand this engine produces.

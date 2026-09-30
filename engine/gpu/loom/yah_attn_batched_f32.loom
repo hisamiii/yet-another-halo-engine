@@ -40,7 +40,7 @@
 //                  --config=yah_attn_batched.heads_per_kv=1
 //                  --config=yah_attn_batched.score_capacity=2
 //                  --config=yah_attn_batched.use_f16=0|1
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_attn_batched.layer_idx : %value: index where [range(%value, 0, 65536)]
 config.decl @yah_attn_batched.start_pos : %value: index where [range(%value, 0, 1073741824)]

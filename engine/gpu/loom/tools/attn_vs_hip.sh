@@ -51,7 +51,7 @@ mkcheck %vt pos.loom; mkcheck %v16 neg.loom
 set +u; set --; source "$root/engine/hrx-env.sh" >/dev/null; set -u
 H=/home/q/hrx
 for t in pos neg; do
-  timeout 900 $H/build/cmake/loom/src/loom/tools/iree-benchmark-loom/iree-benchmark-loom $t.loom --device=amdgpu --target=amdgpu:gfx11-generic \
+  timeout 900 $H/build/cmake/loom/src/loom/tools/iree-benchmark-loom/iree-benchmark-loom $t.loom --device=amdgpu --target=amdgpu:gfx1151 \
     --config=attention_prefill.cache_capacity=$B --config=attention_prefill.token_count=$B --config=attention_prefill.start_pos=0 \
     --config=attention_prefill.num_heads=24 --config=attention_prefill.num_kv_heads=4 --config=attention_prefill.head_dim=256 \
     --config=attention_prefill.gqa=6 --config=yah_vtrans.token_count=$B --config=yah_vtrans.cache_capacity=$B \

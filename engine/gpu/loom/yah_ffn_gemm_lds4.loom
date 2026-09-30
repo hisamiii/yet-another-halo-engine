@@ -19,7 +19,7 @@
 //
 // The fill is still wide: 32 lanes assigned four-per-row means one instruction
 // covers 8 runs of 128 contiguous bytes. Two barriers per 64-K block.
-amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_lds4.m_tiles : %value: index where [range(%value, 1, 4096)]
 

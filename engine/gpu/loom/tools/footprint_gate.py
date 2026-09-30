@@ -40,7 +40,7 @@ e["LD_LIBRARY_PATH"] = ":".join(["/var/lib/lemonade/.cache/lemonade/bin/therock/
 rep = "/tmp/footprint_gate_report.json"
 root = "@" + sym
 cmd = [H + "/build/cmake/loom/src/loom/tools/loom-compile/loom-compile", src, "--root=" + root,
-       "--target=amdgpu:gfx11-generic", "--format=amdgpu-hsaco", "--output=/tmp/footprint_gate.hsaco",
+       "--target=amdgpu:gfx1151", "--format=amdgpu-hsaco", "--output=/tmp/footprint_gate.hsaco",
        "--compile-report=details", "--compile-report-output=" + rep,
        f"--config={sym}.m_tiles={mt}", f"--config={sym}.k_blocks={kb}", f"--config={sym}.token_tiles={tt}"]
 r = subprocess.run(cmd, env=e, capture_output=True, text=True)

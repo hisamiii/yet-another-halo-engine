@@ -20,7 +20,7 @@
 // row and no single iota describes the tensor, so the multi-row path is not
 // covered in-source; that needs a captured fixture. The row index itself is still
 // exercised because the staging read and the store both use it.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_hadamard.rows : %value: index where [range(%value, 1, 65536)]
 

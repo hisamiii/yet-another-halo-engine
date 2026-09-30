@@ -44,7 +44,7 @@ if [ -z "$ROOT" ]; then echo "could not find a kernel.def symbol in $SOURCE"; ex
 
 echo "== compile $SOURCE root=$ROOT ${CONFIG_FLAGS[*]:-}"
 REPORT=$(mktemp /tmp/loom_preflight_report.XXXXXX.json)
-if ! "$COMPILE" "$SOURCE" --root="$ROOT" --target=amdgpu:gfx11-generic --format=amdgpu-hsaco \
+if ! "$COMPILE" "$SOURCE" --root="$ROOT" --target=amdgpu:gfx1151 --format=amdgpu-hsaco \
     "${CONFIG_FLAGS[@]}" --output=/tmp/loom_run.hsaco \
     --compile-report=details --compile-report-output="$REPORT" >/tmp/loom_run_compile.log 2>&1; then
   # grep exits 1 on no match and pipefail would then kill the script before the
@@ -63,7 +63,7 @@ echo "== correctness $CASE"
 # check.file.read.npy target is missing or the case crashes, and a leftover file
 # from the previous case would then be read back as a pass.
 CHECK_JSON=$(mktemp /tmp/loom_run_check.XXXXXX.json)
-timeout 300 "$BENCH" "$SOURCE" --device=amdgpu --target=amdgpu:gfx11-generic \
+timeout 300 "$BENCH" "$SOURCE" --device=amdgpu --target=amdgpu:gfx1151 \
   "${CONFIG_FLAGS[@]}" --case="$CASE" --measure=case_end_to_end \
   --iterations=1 --warmup-iterations=0 --batch-size=1 --min-time-ms=0 \
   --max-batches=1 --input-ring-count=1 --output="$CHECK_JSON" >/dev/null 2>&1 || true
@@ -85,7 +85,7 @@ rm -f "$CHECK_JSON"
 if [ "$BENCH_NAME" != "-" ]; then
   echo "== timing $BENCH_NAME"
   BENCH_JSON=$(mktemp /tmp/loom_run_bench.XXXXXX.json)
-  timeout 300 "$BENCH" "$SOURCE" --device=amdgpu --target=amdgpu:gfx11-generic \
+  timeout 300 "$BENCH" "$SOURCE" --device=amdgpu --target=amdgpu:gfx1151 \
     "${CONFIG_FLAGS[@]}" --case="$CASE" --benchmark="$BENCH_NAME" \
     --measure=dispatch_complete --iterations=1 --warmup-iterations=2 \
     --batch-size=1 --min-time-ms=0 --max-batches=1 --input-ring-count=1 \

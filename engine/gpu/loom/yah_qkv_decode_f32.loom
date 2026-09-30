@@ -9,7 +9,7 @@
 // Required config: --config=yah_qkv_decode.q_dim=16
 //                  --config=yah_qkv_decode.kv_dim=16
 //                  --config=yah_qkv_decode.k_groups=20
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 func.def @q4k_step(%wn: index, %whn: index, %xn: index, %wv: view<[%wn]xi8>, %wh: view<[%whn]xf16>, %xs: view<[%xn]xf32>, %row_i: i32, %kblk_i: i32, %i_i: i32) -> (f32) {
   %unit = index.constant 1 : index

@@ -31,7 +31,7 @@
 // The state buffer is one layer's worth, [num_heads][128][128]; the HIP kernel
 // takes a layer index and offsets internally, which a caller reproduces by
 // offsetting the pointer.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_deltanet.batch : %value: index where [range(%value, 1, 1048576)]
 config.decl @yah_deltanet.qkv_size : %value: index where [range(%value, 128, 1048576)]

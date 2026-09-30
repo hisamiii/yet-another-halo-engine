@@ -14,7 +14,7 @@
 //                  --config=yah_fused_qk_rope_batched.head_dim=8 --config=yah_fused_qk_rope_batched.rotary_dim=8
 //                  --config=yah_fused_qk_rope_batched.q_elems=8 --config=yah_fused_qk_rope_batched.kv_elems=8
 //                  --config=yah_fused_qk_rope_batched.cache32_elems=8 --config=yah_fused_qk_rope_batched.cache16_elems=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_fused_qk_rope_batched.start_pos : %value: index where [range(%value, 0, 1073741824)]
 

@@ -21,7 +21,7 @@
 //                  --config=yah_pack_tiled_attn_kv.num_kv_heads=2 --config=yah_pack_tiled_attn_kv.head_dim=8
 //                  --config=yah_pack_tiled_attn_kv.k_elems=32 --config=yah_pack_tiled_attn_kv.k16_elems=64
 //                  --config=yah_pack_tiled_attn_kv.k32_elems=64
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_pack_tiled_attn_kv.layer_idx : %value: index where [range(%value, 0, 65536)]
 

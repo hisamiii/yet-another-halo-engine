@@ -18,7 +18,7 @@
 //
 //   @yah_kvq4_varied   blocks=4     (4 x 32 f16 in, 4 x 18 i8 out)
 //   @yah_kvq4_uniform  blocks=10240 (327680 f16 in, 184320 i8 out)
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_kvq4.blocks : %value: index where [range(%value, 1, 1048576)]
 

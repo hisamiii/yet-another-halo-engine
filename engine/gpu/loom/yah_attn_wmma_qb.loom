@@ -9,7 +9,7 @@
 // Compiler timing covers the rooted production kernel. The AMDGPU execution
 // corpus links this same source with numerical checks in a separate module.
 
-amdgpu.target<gfx11-generic> @attention_prefill_gfx11_wave64 {subgroup_size = 64}
+amdgpu.target<gfx1151> @attention_prefill_gfx11_wave64 {subgroup_size = 64}
 
 config.def @attention_prefill.cache_capacity = 2048 : index
 config.decl @attention_prefill.token_count : %value: index where [range(%value, 1, 2048)]

@@ -22,7 +22,7 @@
 // contract: both sides compute an expf, and their last ulp need not agree.
 //
 // Required config: --config=yah_ssm_conv.batch=4 --config=yah_ssm_conv.qkv_dim=16
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_ssm_conv.batch : %value: index where [range(%value, 1, 1048576)]
 config.decl @yah_ssm_conv.qkv_dim : %value: index where [range(%value, 1, 1048576)]

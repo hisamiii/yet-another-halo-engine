@@ -27,7 +27,7 @@
 // `check.tensor.view`, because numpy has no bf16 dtype.
 //
 // Required config: --config=yah_dequant_q6k.blocks=2
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_dequant_q6k.blocks : %value: index where [range(%value, 1, 1048576)]
 

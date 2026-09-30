@@ -22,7 +22,7 @@
 // output is the sum of its weight row and therefore an arithmetic sequence. The
 // four matrices use different offsets, so mis-routing a row to the wrong buffer
 // or the wrong row produces a wrong value rather than a coincidentally equal one.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_ssm_proj.batch : %value: index where [range(%value, 1, 4096)]
 

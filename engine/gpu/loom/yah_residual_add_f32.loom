@@ -2,7 +2,7 @@
 //
 // HIP source: prefill_residual.hip. out[i] = a[i] + b[i] over the flat element
 // count, one element per work-item, 256 work-items per workgroup.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_residual_add.total : %value: index where [range(%value, 1, 67108864)]
 

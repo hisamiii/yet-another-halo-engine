@@ -29,7 +29,7 @@
 // `check.tensor.view` before comparing.
 //
 // Required config: --config=yah_dequant_q4k.blocks=2
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_dequant_q4k.blocks : %value: index where [range(%value, 1, 1048576)]
 

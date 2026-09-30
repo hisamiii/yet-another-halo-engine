@@ -18,7 +18,7 @@
 // ignored the finiteness test would pass the first case and fail the second.
 //
 // Required config: --config=yah_sample_prepare.vocab=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_sample_prepare.vocab : %value: index where [range(%value, 1, 1048576)]
 

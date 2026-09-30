@@ -32,7 +32,7 @@
 //                  --config=yah_vision_patch_position.grid_height=48
 //                  --config=yah_vision_patch_position.grid_width=48
 //                  --config=yah_vision_patch_position.positions_elems=2654208
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_vision_patch_position.count : %value: index where [range(%value, 1, 4)]
 

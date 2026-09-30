@@ -11,7 +11,7 @@
 // not ported; this is the plain full-row arm.
 //
 // Required config: --config=yah_batched_argmax.rows=2 --config=yah_batched_argmax.vocab=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_batched_argmax.rows : %value: index where [range(%value, 1, 1048576)]
 

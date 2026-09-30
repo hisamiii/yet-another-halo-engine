@@ -17,7 +17,7 @@
 // unique, so the in-place update has no race and no ordering requirement.
 //
 // Required config: --config=yah_sparse_penalties.penalty_count=3 --config=yah_sparse_penalties.vocab_size=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_sparse_penalties.penalty_count : %value: index where [range(%value, 1, 1048576)]
 

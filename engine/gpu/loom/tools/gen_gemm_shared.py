@@ -1637,7 +1637,7 @@ def gen(fmt, kind="kstore"):
     e(f"// Shared-decode kStore GEMM for {fmt}: {NW} wave64 waves share one decoded 64x256")
     e("// weight tile per K block; each wave accumulates 64 rows x 128 tokens. Same ABI,")
     e("// output layout and arithmetic order as the chained kernel; see the generator.")
-    e("amdgpu.target<gfx11-generic> @yah_gemm_w64 {subgroup_size = 64}")
+    e("amdgpu.target<gfx1151> @yah_gemm_w64 {subgroup_size = 64}")
     e("")
     for c in ("m_tiles", "k_blocks", "token_tiles"):
         e(f"config.decl @{sym}.{c} : %value: index where [range(%value, 1, 4096)]")

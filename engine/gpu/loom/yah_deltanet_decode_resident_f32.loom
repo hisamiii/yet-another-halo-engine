@@ -62,7 +62,7 @@
 //                               --config=yah_deltanet_decode.num_key_heads=2
 // Required config (production): --config=yah_deltanet_decode.num_heads=32
 //                               --config=yah_deltanet_decode.num_key_heads=16
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_deltanet_decode.num_heads : %value: index where [range(%value, 1, 4096)]
 

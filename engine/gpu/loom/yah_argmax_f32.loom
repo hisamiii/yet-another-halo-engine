@@ -16,7 +16,7 @@
 //
 // Two passes read the logits twice. That is a correctness-first choice; the HIP
 // kernel reads once.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_argmax.vocab : %value: index where [range(%value, 1, 1048576)]
 

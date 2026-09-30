@@ -13,7 +13,7 @@
 // changes the values.
 //
 // Required config: --config=yah_bf16_cast.num_elements=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_bf16_cast.num_elements : %value: index where [range(%value, 1, 1073741824)]
 

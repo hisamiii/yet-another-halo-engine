@@ -13,7 +13,7 @@
 // is a separate port. `__float2int_rn` is `scalar.roundevenf`, which is rintf.
 //
 // Required config: --config=yah_requant_int4.batch=16 --config=yah_requant_int4.num_blocks=1
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_requant_int4.batch : %value: index where [range(%value, 1, 65536)]
 

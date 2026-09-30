@@ -22,7 +22,7 @@
 //
 // Weight traffic is unchanged at one pass over 178 MB; only the transaction shape
 // and the operand-delivery level change.
-amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_lds.m_tiles : %value: index where [range(%value, 1, 4096)]
 

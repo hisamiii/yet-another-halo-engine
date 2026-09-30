@@ -241,7 +241,7 @@ def main():
     out.append("// Required config: --config=yah_qkv_decode.q_dim=16")
     out.append("//                  --config=yah_qkv_decode.kv_dim=16")
     out.append("//                  --config=yah_qkv_decode.k_groups=20")
-    out.append("amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}")
+    out.append("amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}")
     out.append("")
     for f in FMTS:
         out += fmt_func(f)

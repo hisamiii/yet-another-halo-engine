@@ -23,7 +23,7 @@
 //                  --config=yah_fused_qk_rope.head_dim=8 --config=yah_fused_qk_rope.rotary_dim=8
 //                  --config=yah_fused_qk_rope.q_elems=8 --config=yah_fused_qk_rope.kv_elems=8
 //                  --config=yah_fused_qk_rope.cache32_elems=32 --config=yah_fused_qk_rope.cache16_elems=32
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_fused_qk_rope.layer_idx : %value: index where [range(%value, 0, 65536)]
 

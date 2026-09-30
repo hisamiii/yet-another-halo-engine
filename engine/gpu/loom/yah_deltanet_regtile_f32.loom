@@ -11,7 +11,7 @@
 // exactly as the rowsplit kernel's sequential loop does; the elementwise
 // products and the state update are vector ops, which round per element exactly
 // as the scalar ops do.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_deltanet.batch : %value: index where [range(%value, 1, 1048576)]
 config.decl @yah_deltanet.qkv_size : %value: index where [range(%value, 128, 1048576)]

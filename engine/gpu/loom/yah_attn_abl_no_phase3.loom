@@ -47,7 +47,7 @@
 //   --config=yah_attn_wmma.has_gate=1
 //   --config=yah_attn_wmma.has_lse=0
 //   --config=yah_attn_wmma.head_major=0
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_attn_wmma.layer_idx : %value: index where [range(%value, 0, 65536)]
 

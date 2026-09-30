@@ -30,7 +30,7 @@
 //                  --config=yah_vision_patchify.width=32
 //                  --config=yah_vision_patchify.grid_width=2
 //                  --config=yah_vision_patchify.pixel_bytes=4608
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_vision_patchify.count : %value: index where [range(%value, 1, 4)]
 config.decl @yah_vision_patchify.width : %value: index where [range(%value, 1, 64)]

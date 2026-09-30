@@ -22,7 +22,7 @@
 // output is pre-filled with 5120.0 so untouched elements already hold the
 // expected value; this case is a lapse detector for the store, and the load
 // liveness claim rests on the compile report rather than on the check.
-amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_loadonly.m_tiles : %value: index where [range(%value, 1, 4096)]
 

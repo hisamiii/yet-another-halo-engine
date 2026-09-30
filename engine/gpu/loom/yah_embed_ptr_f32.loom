@@ -11,7 +11,7 @@
 // analysis can bound the table view.
 //
 // Required config: --config=yah_embed_ptr.rows=4 --config=yah_embed_ptr.hidden=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_embed_ptr.rows : %value: index where [range(%value, 1, 1073741824)]
 

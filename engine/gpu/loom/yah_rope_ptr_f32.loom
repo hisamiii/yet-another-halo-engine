@@ -17,7 +17,7 @@
 //
 // Required config: --config=yah_rope_ptr.total_pairs=256 --config=yah_rope_ptr.q_heads=4
 //                  --config=yah_rope_ptr.k_heads=2
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_rope_ptr.total_pairs : %value: index where [range(%value, 1, 1048576)]
 

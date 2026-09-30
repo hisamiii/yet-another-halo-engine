@@ -12,7 +12,7 @@
 //
 // Run: bash engine/gpu/loom/loom_run.sh engine/gpu/loom/probe_fragment_layout.loom \
 //        @probe_fragment_lhs_global_case -
-amdgpu.target<gfx11-generic> @probe_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @probe_wave32 {subgroup_size = 32}
 
 kernel.def target(@probe_wave32) @probe_fragment_lhs_global() {
   %unit = index.constant 1 : index

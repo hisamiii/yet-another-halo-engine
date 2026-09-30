@@ -52,7 +52,7 @@
 // the case, which was checked with a probe copy. The original all-ones case could
 // not see that transposition, because a constant is its own transpose; it pinned
 // the K reduction and the operand indexing but never the output layout.
-amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_f16.m_tiles : %value: index where [range(%value, 1, 4096)]
 

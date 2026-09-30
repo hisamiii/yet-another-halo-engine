@@ -15,7 +15,7 @@
 // expectation and would need a fixture; PORTING.md records that gap.
 //
 // Required config: --config=yah_attn_gate.num_elements=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_attn_gate.num_elements : %value: index where [range(%value, 1, 1073741824)]
 

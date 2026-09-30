@@ -12,7 +12,7 @@
 //
 // Required config: --config=yah_dflash_topk.vocab_size=8 --config=yah_dflash_topk.batch=1
 //                  --config=yah_dflash_topk.tokens_per_block=2048 --config=yah_dflash_topk.top_k=4
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_dflash_topk.vocab_size : %value: index where [range(%value, 1, 1073741824)]
 

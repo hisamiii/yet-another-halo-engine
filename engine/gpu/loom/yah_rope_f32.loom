@@ -25,7 +25,7 @@
 // The trig ops carry <afn>: the AMDGPU math policy rejects exact f32 sinf/cosf
 // under math.trig.exact_f32. loom-check accepts the exact form, so only a real
 // target compilation catches this.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_rope.total_pairs : %value: index where [range(%value, 1, 1048576)]
 

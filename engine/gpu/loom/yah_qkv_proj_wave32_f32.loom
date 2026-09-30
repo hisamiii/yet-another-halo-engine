@@ -20,7 +20,7 @@
 //
 // Required config: --config=yah_qkv_proj_wave32.q_dim=1 --config=yah_qkv_proj_wave32.kv_dim=1
 //                  --config=yah_qkv_proj_wave32.hidden=8
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_qkv_proj_wave32.q_dim : %value: index where [range(%value, 1, 65536)]
 

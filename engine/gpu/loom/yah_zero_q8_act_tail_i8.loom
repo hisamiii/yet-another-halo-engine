@@ -11,7 +11,7 @@
 // two sums are the two words at the sidecar slot.
 //
 // Required config: --config=yah_zero_q8_act_tail.batch=17 --config=yah_zero_q8_act_tail.num_blocks=1
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_zero_q8_act_tail.batch : %value: index where [range(%value, 1, 65536)]
 config.decl @yah_zero_q8_act_tail.num_blocks : %value: index where [range(%value, 1, 65536)]

@@ -15,7 +15,7 @@
 //
 // Required config: --config=yah_spec_seg_weights.vocab_size=1024 --config=yah_spec_seg_weights.segments=256
 //                  --config=yah_spec_seg_weights.scratch_elems=769
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_spec_seg_weights.vocab_size : %value: index where [range(%value, 1, 1073741824)]
 

@@ -8,7 +8,7 @@
 //
 // Required config: --config=yah_swiglu_decode.m_rows=16
 //                  --config=yah_swiglu_decode.k_groups=20
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 func.def @q4k_step(%wn: index, %whn: index, %xn: index, %wv: view<[%wn]xi8>, %wh: view<[%whn]xf16>, %xs: view<[%xn]xf32>, %gs: view<512xi32>, %gx: view<256xi32>, %gq: view<1024xi32>, %gp: view<2048xi32>, %ksv: view<128xi8>, %row_i: i32, %kblk_i: i32, %i_i: i32) -> (f32) {
   %unit = index.constant 1 : index

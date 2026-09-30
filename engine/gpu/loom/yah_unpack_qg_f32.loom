@@ -19,7 +19,7 @@
 // The element counts are the same either way: head_dim 128 with 40 heads and
 // head_dim 1 with 5120 heads both give total_h = 5120, so the measured shape is
 // the production size even though the stride differs.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_unpack_qg.batch : %value: index where [range(%value, 1, 4096)]
 

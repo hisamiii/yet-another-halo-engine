@@ -19,7 +19,7 @@
 //                  --config=yah_vision_attention_rows.head_dim=3
 //                  --config=yah_vision_attention_rows.rows=2
 //                  --config=yah_vision_attention_rows.begin=0
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_vision_attention_rows.heads : %value: index where [range(%value, 1, 4096)]
 

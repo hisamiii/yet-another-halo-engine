@@ -62,7 +62,7 @@ def gen(H):
     e(f"// Causal prefill attention, {H} query head(s) of one GQA group per workgroup,")
     e("// same per-row arithmetic as yah_attn_wmma_qb.loom. See the generator.")
     e("")
-    e("amdgpu.target<gfx11-generic> @attention_prefill_gfx11_wave64 {subgroup_size = 64}")
+    e("amdgpu.target<gfx1151> @attention_prefill_gfx11_wave64 {subgroup_size = 64}")
     e("")
     e("config.def @attention_prefill.cache_capacity = 2048 : index")
     e("config.decl @attention_prefill.token_count : %value: index where [range(%value, 1, 2048)]")

@@ -17,7 +17,7 @@
 // A wrong row stride or a wrong reduction changes it.
 //
 // Required config: --config=yah_gemv.rows=3 --config=yah_gemv.k=4
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_gemv.rows : %value: index where [range(%value, 1, 65536)]
 

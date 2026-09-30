@@ -27,7 +27,7 @@
 // Required config: --config=yah_pack_attn_heads.head_dim=8 --config=yah_pack_attn_heads.kv_heads=1
 //                  --config=yah_pack_attn_heads.length=16 --config=yah_pack_attn_heads.keys_elems=128
 //                  --config=yah_pack_attn_heads.packed_k_elems=128 --config=yah_pack_attn_heads.packed_v_elems=128
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_pack_attn_heads.head_dim : %value: index where [range(%value, 8, 65536)]
 

@@ -18,7 +18,7 @@
 // sums are exactly representable, which the all-equal check case guarantees.
 //
 // Required config: --config=yah_linear_sampling.vocab_size=1024
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_linear_sampling.vocab_size : %value: index where [range(%value, 1, 1073741824)]
 

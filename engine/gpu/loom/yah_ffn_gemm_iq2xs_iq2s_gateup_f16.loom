@@ -23,7 +23,7 @@
 //
 // Required config (correctness): --config=yah_ffn_gemm_iq2xs_iq2s_gateup.m_tiles=1
 // Required config (benchmark):   --config=yah_ffn_gemm_iq2xs_iq2s_gateup.m_tiles=1088
-amdgpu.target<gfx11-generic> @yah_gemm_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_iq2xs_iq2s_gateup.m_tiles : %value: index where [range(%value, 1, 4096)]
 

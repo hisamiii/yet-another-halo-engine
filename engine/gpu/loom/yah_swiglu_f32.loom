@@ -8,7 +8,7 @@
 // form (LaunchPackedSwiGLUActivation) reads both halves of one [batch][2*dim]
 // row; splitting it into two tensors here keeps a binding swap detectable, which
 // a single uniform packed tensor cannot do.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_swiglu.total : %value: index where [range(%value, 1, 67108864)]
 

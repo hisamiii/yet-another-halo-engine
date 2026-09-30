@@ -7,7 +7,7 @@
 // The HIP kernel also decodes kBF16, kQ8_0 and the block formats through
 // QuantBlockElement. Those are separate ports; this one covers the simple f32
 // row copy so the gather path and the row addressing are verified first.
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_embed.table_elements : %value: index where [range(%value, 1, 268435456)]
 

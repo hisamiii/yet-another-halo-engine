@@ -22,7 +22,7 @@
 // range, so that case uses a uniform weight and checks the full-size loop instead.
 //
 // Required config: --config=yah_half_norm5120.rows=1 --config=yah_half_norm5120.dim=512
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_half_norm5120.rows : %value: index where [range(%value, 1, 65536)]
 

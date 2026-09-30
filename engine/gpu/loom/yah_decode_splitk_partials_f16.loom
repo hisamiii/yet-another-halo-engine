@@ -29,7 +29,7 @@
 //                  --config=yah_decode_splitk_partials.rows=1
 //                  --config=yah_decode_splitk_partials.splits=2
 //                  --config=yah_decode_splitk_partials.max_splits=2
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_decode_splitk_partials.layer_idx : %value: index where [range(%value, 0, 65536)]
 

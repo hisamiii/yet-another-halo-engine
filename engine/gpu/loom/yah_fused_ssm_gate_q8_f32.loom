@@ -24,7 +24,7 @@
 // Required config: --config=yah_fused_ssm_gate_q8.num_heads=1 --config=yah_fused_ssm_gate_q8.batch=1
 //                  --config=yah_fused_ssm_gate_q8.inner_size=32 --config=yah_fused_ssm_gate_q8.val_dim=32
 //                  --config=yah_fused_ssm_gate_q8.has_gate=0
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_fused_ssm_gate_q8.num_heads : %value: index where [range(%value, 1, 4096)]
 

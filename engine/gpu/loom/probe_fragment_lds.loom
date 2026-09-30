@@ -3,7 +3,7 @@
 // by 32 lanes (8 each), a workgroup barrier is issued, then the fragment load
 // reads LDS and the per-lane carrier is stored to global exactly as in
 // probe_fragment_layout.loom.
-amdgpu.target<gfx11-generic> @probe_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @probe_wave32 {subgroup_size = 32}
 
 kernel.def target(@probe_wave32) @probe_fragment_lhs_lds() {
   %unit = index.constant 1 : index

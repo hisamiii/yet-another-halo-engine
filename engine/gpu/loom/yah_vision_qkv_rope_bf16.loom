@@ -32,7 +32,7 @@
 //
 // Required config: --config=yah_vision_qkv_rope.count=1 --config=yah_vision_qkv_rope.grid_width=48
 //                  --config=yah_vision_qkv_rope.input_elems=3456 --config=yah_vision_qkv_rope.bias_elems=3456
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_vision_qkv_rope.count : %value: index where [range(%value, 1, 64)]
 

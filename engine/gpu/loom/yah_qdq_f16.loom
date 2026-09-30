@@ -25,7 +25,7 @@
 //
 //   @yah_qdq16_small  blocks=32    (32 x 32 = 1024 f16 = 2048 B)
 //   @yah_qdq16_full   blocks=10240 (10240 x 32 = 327680 f16 = 655360 B)
-amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_qdq16.blocks : %value: index where [range(%value, 1, 1048576)]
 
