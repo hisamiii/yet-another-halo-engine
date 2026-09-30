@@ -31,6 +31,13 @@ config.decl @yah_half_norm.dim : %value: index where [range(%value, 32, 65536)]
 
 config.def @yah_half_norm.eps = 0.0 : f32
 
+// fused = 1 (default): the residual add and the sum_out write, as above.
+// fused = 0: out = f16(x * inv * weight) only -- neither residual nor sum_out is
+// touched. Every engine caller binds an all-zero residual and never reads
+// sum_out, so the fused form moved 126 of its ~231 MB per 2048-row call for
+// nothing (1.54 ms against a ~0.5 ms bandwidth floor).
+config.def @yah_half_norm.fused = 1 : index
+
 kernel.def target(@yah_wave32) @yah_half_norm() {
   %unit = index.constant 1 : index
   %rows = config.get @yah_half_norm.rows : index
@@ -45,6 +52,9 @@ kernel.def target(@yah_wave32) @yah_half_norm() {
   %dim = config.get @yah_half_norm.dim : index
   %eps = config.get @yah_half_norm.eps : f32
   %rows = config.get @yah_half_norm.rows : index
+  %fused_n = config.get @yah_half_norm.fused : index
+  %c0f = index.constant 0 : index
+  %fused = index.cmp ne, %fused_n, %c0f : index
   %total_elems = index.mul %rows, %dim : index
   %x_na, %res_na, %weight_na, %sum_na, %out_na = buffer.assume.noalias %x, %residual, %weight, %sum_out, %out : buffer, buffer, buffer, buffer, buffer
   %x_view = buffer.view %x_na[%base] : buffer -> view<[%total_elems]xf32>
@@ -58,8 +68,13 @@ kernel.def target(@yah_wave32) @yah_half_norm() {
   %partial = scf.for %i = [%lane to %dim step %c32](%s = %zero : f32) -> (f32) {
     %off = index.add %row_base, %i : index
     %xv = view.load %x_view[%off] : view<[%total_elems]xf32> -> f32
-    %rv = view.load %res_view[%off] : view<[%total_elems]xf32> -> f32
-    %v = scalar.addf %xv, %rv : f32
+    %v = scf.if %fused -> (f32) {
+      %rv = view.load %res_view[%off] : view<[%total_elems]xf32> -> f32
+      %va = scalar.addf %xv, %rv : f32
+      scf.yield %va : f32
+    } else {
+      scf.yield %xv : f32
+    }
     %sq = scalar.mulf %v, %v : f32
     %next = scalar.addf %s, %sq : f32
     scf.yield %next : f32
@@ -74,10 +89,15 @@ kernel.def target(@yah_wave32) @yah_half_norm() {
   %sink = scf.for %j = [%lane to %dim step %c32](%mark = %zero : f32) -> (f32) {
     %off2 = index.add %row_base, %j : index
     %xv2 = view.load %x_view[%off2] : view<[%total_elems]xf32> -> f32
-    %rv2 = view.load %res_view[%off2] : view<[%total_elems]xf32> -> f32
-    %v2 = scalar.addf %xv2, %rv2 : f32
+    %v2 = scf.if %fused -> (f32) {
+      %rv2 = view.load %res_view[%off2] : view<[%total_elems]xf32> -> f32
+      %vb = scalar.addf %xv2, %rv2 : f32
+      view.store %vb, %sum_view[%off2] : f32, view<[%total_elems]xf32>
+      scf.yield %vb : f32
+    } else {
+      scf.yield %xv2 : f32
+    }
     %w = view.load %weight_view[%j] : view<[%dim]xf32> -> f32
-    view.store %v2, %sum_view[%off2] : f32, view<[%total_elems]xf32>
     %normed = scalar.mulf %v2, %inv : f32
     %weighted = scalar.mulf %normed, %w : f32
     %half = scalar.fptrunc %weighted : f32 to f16

@@ -242,7 +242,7 @@ def main():
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
         ("yah_half_norm_f16.loom", "norm.hal",
          ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
-          "yah_half_norm.eps=1e-06"]),
+          "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"]),
         ("yah_ssm_conv_f32.loom", "conv.hal",
          ["yah_ssm_conv.batch=%d" % B, "yah_ssm_conv.qkv_dim=10240"]),
         ("yah_deltanet_prep_kq_f32.loom", "prepkq.hal",
