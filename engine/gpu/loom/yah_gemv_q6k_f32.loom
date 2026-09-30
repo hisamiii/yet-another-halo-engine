@@ -15,7 +15,7 @@
 //                  --config=yah_gemv_q6k.k_blocks=20
 amdgpu.target<gfx11-generic> @yah_wave32 {subgroup_size = 32}
 
-config.decl @yah_gemv_q6k.m_rows : %value: index where [range(%value, 1, 65536)]
+config.decl @yah_gemv_q6k.m_rows : %value: index where [range(%value, 1, 1048576)]
 
 config.decl @yah_gemv_q6k.k_blocks : %value: index where [range(%value, 1, 65536)]
 
@@ -73,13 +73,16 @@ kernel.def target(@yah_wave32) @yah_gemv_q6k() {
   %w_last = index.sub %w_bytes, %c1 : index
   %w_half_last = index.sub %w_halfs, %c1 : index
   %x_last = index.sub %x_elems, %c1 : index
-  %acc0 = scf.for %kblk = [%c0 to %k_blocks step %c1](%a0 = %zero : f32) -> (f32) {
+  // Both loops unrolled: the same per-lane order of the products and adds, but
+  // the loads issue ahead instead of one dependent byte load per iteration.
+  // pp2048 lm head (248320 rows): 14.37 -> 5.86 ms standalone (HIP 4.46).
+  %acc0 = scf.for %kblk = [%c0 to %k_blocks step %c1](%a0 = %zero : f32) -> (f32) unroll {
     %kblk_i = index.cast %kblk : index to i32
     %row_off = scalar.muli %m_i, %c4200i : i32
     %blk_off0 = scalar.muli %kblk_i, %c210i : i32
     %blk_off = scalar.addi %row_off, %blk_off0 : i32
     %kblk256 = scalar.shli %kblk_i, %c8i : i32
-    %acc1 = scf.for %j = [%c0 to %c8 step %c1](%a1 = %a0 : f32) -> (f32) {
+    %acc1 = scf.for %j = [%c0 to %c8 step %c1](%a1 = %a0 : f32) -> (f32) unroll {
       %j_i = index.cast %j : index to i32
       %j32 = scalar.shli %j_i, %c5i : i32
       %i_i = scalar.addi %lane_i, %j32 : i32
