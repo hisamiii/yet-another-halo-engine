@@ -800,6 +800,101 @@ def iq2xxs_setup():
             + _stage_table("ksigns", "%ksigns_na", 128, "i8", 1))
 
 
+def q6k_loads(p, blk, gb):
+    """block_q6_K (210 B): ql[128] @0, qh[64] @128, int8 scales[16] @192, d @208.
+    Group g = 4*half + seg reads 32 ql bytes at 64*half + 32*(seg&1), 32 qh bytes
+    at 128 + 32*half, and the two scales 192 + 8*half + 2*seg (+1)."""
+    L = []
+    e = L.append
+    vals = []
+    e(f"    %{p}d_h0 = scalar.shrui {blk}, %c1i : i32")
+    e(f"    %{p}d_h_i = scalar.addi %{p}d_h0, %c104i : i32")
+    e(f"    %{p}d_ix = index.cast %{p}d_h_i : i32 to index")
+    e(f"    %{p}d_lo = index.max %{p}d_ix, %c0 : index")
+    e(f"    %{p}d_idx = index.min %{p}d_lo, %w_half_last : index")
+    e(f"    %{p}dh = view.load %w_f16_view[%{p}d_idx] : view<[%w_halfs]xf16> -> f16")
+    vals.append((f"%{p}dh", "f16"))
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}hf{u} = scalar.shrui %{p}g{u}, %c2i : i32")
+        e(f"    %{p}sg{u} = scalar.andi %{p}g{u}, %c3i : i32")
+        e(f"    %{p}so{u} = scalar.andi %{p}sg{u}, %c1i : i32")
+        e(f"    %{p}h64_{u} = scalar.shli %{p}hf{u}, %c6i : i32")
+        e(f"    %{p}s32_{u} = scalar.shli %{p}so{u}, %c5i : i32")
+        e(f"    %{p}qlo{u} = scalar.addi %{p}h64_{u}, %{p}s32_{u} : i32")
+        e(f"    %{p}qla{u} = scalar.addi {blk}, %{p}qlo{u} : i32")
+        e(f"    %{p}qlb{u} = scalar.addi %{p}qla{u}, %c16i : i32")
+        _ldv(e, p, f"qla_v{u}", f"%{p}qla{u}", 16)
+        _ldv(e, p, f"qlb_v{u}", f"%{p}qlb{u}", 16)
+        e(f"    %{p}h32_{u} = scalar.shli %{p}hf{u}, %c5i : i32")
+        e(f"    %{p}qh0_{u} = scalar.addi {blk}, %{p}h32_{u} : i32")
+        e(f"    %{p}qha{u} = scalar.addi %{p}qh0_{u}, %c128i : i32")
+        e(f"    %{p}qhb{u} = scalar.addi %{p}qha{u}, %c16i : i32")
+        _ldv(e, p, f"qha_v{u}", f"%{p}qha{u}", 16)
+        _ldv(e, p, f"qhb_v{u}", f"%{p}qhb{u}", 16)
+        e(f"    %{p}h8_{u} = scalar.shli %{p}hf{u}, %c3i : i32")
+        e(f"    %{p}s2_{u} = scalar.shli %{p}sg{u}, %c1i : i32")
+        e(f"    %{p}sc0_{u} = scalar.addi %{p}h8_{u}, %{p}s2_{u} : i32")
+        e(f"    %{p}sca{u} = scalar.addi {blk}, %{p}sc0_{u} : i32")
+        e(f"    %{p}sca2_{u} = scalar.addi %{p}sca{u}, %c192i : i32")
+        e(f"    %{p}scb2_{u} = scalar.addi %{p}sca2_{u}, %c1i : i32")
+        _ld8(e, p, f"sa{u}", f"%{p}sca2_{u}")
+        _ld8(e, p, f"sb{u}", f"%{p}scb2_{u}")
+        vals += [(f"%{p}qla_v{u}", "vector<16xi8>"), (f"%{p}qlb_v{u}", "vector<16xi8>"),
+                 (f"%{p}qha_v{u}", "vector<16xi8>"), (f"%{p}qhb_v{u}", "vector<16xi8>"),
+                 (f"%{p}sa{u}", "i8"), (f"%{p}sb{u}", "i8")]
+    return L, vals
+
+
+def q6k_compute(v, gb):
+    """The chained kernel's Q6_K element decode, one row per lane:
+      code = low4 | ((qh >> 2*seg) & 3) << 4
+      value = (d * f32(int8 scale)) * f32(code - 32)"""
+    L = []
+    e = L.append
+    it = iter(v)
+    dh = next(it)
+    e(f"    %d = scalar.extf {dh} : f16 to f32")
+    for u in range(GPL):
+        qla = next(it); qlb = next(it); qha = next(it); qhb = next(it); sa = next(it); sb = next(it)
+        e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %sg{u} = scalar.andi %g{u}, %c3i : i32")
+        e(f"    %hi{u} = scalar.shrui %sg{u}, %c1i : i32")
+        e(f"    %qls{u} = scalar.shli %hi{u}, %c2i : i32")
+        e(f"    %qhs{u} = scalar.shli %sg{u}, %c1i : i32")
+        e(f"    %qls8_{u} = scalar.trunci %qls{u} : i32 to i8")
+        e(f"    %qhs8_{u} = scalar.trunci %qhs{u} : i32 to i8")
+        e(f"    %qlsv{u} = vector.splat %qls8_{u} : vector<16xi8>")
+        e(f"    %qhsv{u} = vector.splat %qhs8_{u} : vector<16xi8>")
+        _col_of(e, u)
+        e(f"    %colh{u} = index.add %col{u}, %c16 : index")
+        for half, ql, qh, sc, col in (("lo", qla, qha, sa, f"%col{u}"), ("hi", qlb, qhb, sb, f"%colh{u}")):
+            t = f"{half}{u}"
+            e(f"    %scf_{t} = scalar.sitofp {sc} : i8 to f32")
+            e(f"    %dsc_{t} = scalar.mulf %d, %scf_{t} : f32")
+            e(f"    %dsv_{t} = vector.splat %dsc_{t} : vector<16xf32>")
+            e(f"    %l0_{t} = vector.shrui {ql}, %qlsv{u} : vector<16xi8>")
+            e(f"    %l_{t} = vector.andi %l0_{t}, %m15v : vector<16xi8>")
+            e(f"    %h0_{t} = vector.shrui {qh}, %qhsv{u} : vector<16xi8>")
+            e(f"    %h1_{t} = vector.andi %h0_{t}, %m3v : vector<16xi8>")
+            e(f"    %h4_{t} = vector.shli %h1_{t}, %s4v : vector<16xi8>")
+            e(f"    %cd_{t} = vector.ori %l_{t}, %h4_{t} : vector<16xi8>")
+            e(f"    %bs_{t} = vector.subi %cd_{t}, %m32v : vector<16xi8>")
+            e(f"    %bf_{t} = vector.sitofp %bs_{t} : vector<16xi8> to vector<16xf32>")
+            e(f"    %vv_{t} = vector.mulf %dsv_{t}, %bf_{t} : vector<16xf32>")
+            e(f"    %hv_{t} = vector.fptrunc %vv_{t} : vector<16xf32> to vector<16xf16>")
+            e(f"    vector.store %hv_{t}, %wl_view[%drow, {col}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+    return L
+
+
+def q6k_setup():
+    return ["  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8",
+            "  %c3b = scalar.constant 3 : i8", "  %c32b = scalar.constant 32 : i8",
+            "  %m15v = vector.splat %c15b : vector<16xi8>", "  %s4v = vector.splat %c4b : vector<16xi8>",
+            "  %m3v = vector.splat %c3b : vector<16xi8>", "  %m32v = vector.splat %c32b : vector<16xi8>"]
+
+
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
     L.append("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
@@ -821,6 +916,7 @@ FMTS = {
     "q5k": dict(bb=176, ksub=128, decode=(lambda p, b, g: q4k_loads(p, b, g, q5=True),
                                           lambda v, g: q4k_compute(v, g, q5=True)),
                 extra=[], setup=q4k_setup),
+    "q6k": dict(bb=210, ksub=64, decode=(q6k_loads, q6k_compute), extra=[], setup=q6k_setup),
     "iq2xxs": dict(bb=66, ksub=64, decode=(iq2xxs_loads, iq2xxs_compute), extra=["grid", "ksigns"], setup=iq2xxs_setup),
     "iq3xxs": dict(bb=98, ksub=64, decode=(iq3xxs_loads, iq3xxs_compute), extra=["grid", "ksigns"], setup=iq3xxs_setup),
 }
@@ -862,7 +958,7 @@ def gen(fmt, kind="kstore"):
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512):
         e(f"  %c{v} = index.constant {v} : index")
-    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 21, 24, 28, 32, 48, 63, 64, 66, 74, 106, 127, 255):
+    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 21, 24, 28, 32, 48, 63, 64, 66, 74, 104, 106, 127, 128, 192, 255):
         e(f"  %c{v}i = scalar.constant {v} : i32")
     e(f"  %cbb = index.constant {bb} : index")
     e(f"  %cbbh = index.constant {bb // 2} : index")
