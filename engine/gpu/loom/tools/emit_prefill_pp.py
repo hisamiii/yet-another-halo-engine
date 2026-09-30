@@ -47,9 +47,24 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
     direct token-major epilogue. YAH_SHARED_GEMM=0 keeps the chained kernel.
     """
     import gen_gemm_shared as G
-    if os.environ.get("YAH_SHARED_GEMM", "1") == "0" or fmt not in G.FMTS or mt % 4:
+    if os.environ.get("YAH_SHARED_GEMM", "1") == "0" or fmt not in G.FMTS:
         return None
-    tile = 128 * G.NW
+    if mt % 4 and mt > 4:
+        return None
+    # Matrices under 64 rows (the 48-row ssm_alpha/ssm_beta, m_tiles=3) get
+    # m_tiles row tiles per wave and 16-token waves, so the grid is 64 workgroups
+    # instead of 8: 0.70-0.92 -> 0.47 ms per dispatch, bit-identical.
+    small = mt < 4
+    prev = G.set_geometry(mt=mt, tok=16) if small else None
+    try:
+        return _emit_shared(G, fmt, mt, kb, B, out, outdir, kind, rowgrp=mt if small else 4)
+    finally:
+        if prev:
+            G.set_geometry(*prev)
+
+
+def _emit_shared(G, fmt, mt, kb, B, out, outdir, kind, rowgrp):
+    tile = G.TOK * G.NW
     if B % tile:
         return None
     tmp = os.path.join(outdir, ".emit_tmp")
@@ -60,9 +75,17 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
     with open(src, "w") as fh:
         fh.write(G.gen(fmt, kind))
     sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres"}.get(kind, ""))
+    # Refuse before emitting if any declared operand footprint exceeds the buffer
+    # the driver binds (tools/footprint_gate.py): a silent overrun hangs the ring.
+    import subprocess
+    gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
+                           kind, str(mt), str(kb), str(B // tile), str(B)],
+                          capture_output=True, text=True)
+    if gate.returncode != 0:
+        raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
     E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
                  "%s.token_tiles=%d" % (sym, B // tile)], out, outdir)
-    return (out, tile, 4, B // tile)
+    return (out, tile, rowgrp, B // tile)
 
 
 def main():

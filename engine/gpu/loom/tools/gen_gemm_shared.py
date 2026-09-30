@@ -40,7 +40,10 @@ NW = int(os.environ.get("YAH_SD_NW", "2"))
 # different row groups but the same token slice load identical activation
 # fragments in the same barrier-aligned phase.
 NR = int(os.environ.get("YAH_SD_NR", "1"))
-LR = 64 * NR
+# 16-row tiles per wave (4 = 64 rows). Fewer serve matrices whose row count is
+# not a multiple of 64, e.g. the 48-row ssm_alpha/ssm_beta (m_tiles=3).
+MT = int(os.environ.get("YAH_SD_MT", "4"))
+LR = 16 * MT * NR
 PAD = int(os.environ.get("YAH_SD_PAD", "0"))
 # K columns decoded per phase. A whole 256-wide block (KSUB=256) is a 64x256 f16
 # tile, ~34 KB of LDS per workgroup, which dropped residency to ~1.5 waves/SIMD
@@ -48,6 +51,24 @@ PAD = int(os.environ.get("YAH_SD_PAD", "0"))
 # pp2048, bit-identical). A narrower phase shrinks the tile at the cost of two
 # barriers per phase.
 KSUB = PH = GPP = GPL = ROWP = None
+
+
+def set_geometry(mt=None, tok=None, nw=None):
+    """Override the per-wave geometry (16-row tiles, tokens, waves) for the next
+    gen() calls and return the previous values, so an emitter can switch shape
+    per HAL: (MT, TOK, NW)."""
+    global MT, TOK, NW, NT, NA, LR
+    prev = (MT, TOK, NW)
+    if mt is not None:
+        MT = mt
+    if tok is not None:
+        TOK = tok
+    if nw is not None:
+        NW = nw
+    NT = TOK // 16
+    NA = MT * NT
+    LR = 16 * MT * NR
+    return prev
 
 
 def configure(fmt):
@@ -68,7 +89,7 @@ def configure(fmt):
 # operand reuse is worth more than the residency and the spill traffic.
 TOK = int(os.environ.get("YAH_SD_TOK", "128"))
 NT = TOK // 16              # 16-token sub-tiles per wave
-NA = 4 * NT                 # accumulators per wave
+NA = MT * NT                # accumulators per wave
 # Mechanism probes (numerically meaningless, timing only): decode = skip the
 # weight decode, rhs = feed the MMAs the LDS lhs fragments instead of loading
 # the activation from global, mma = drop the MMAs (accumulators pass through),
@@ -903,6 +924,50 @@ def q6k_setup():
             "  %m3v = vector.splat %c3b : vector<16xi8>", "  %m32v = vector.splat %c32b : vector<16xi8>"]
 
 
+def q8_0_loads(p, blk, gb):
+    """Q8_0 in 256-element super-blocks of 8 blocks (272 B): group g is block g,
+    d f16 at 34g, qs int8[32] at 34g + 2."""
+    L = []
+    e = L.append
+    vals = []
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}g34_{u} = scalar.muli %{p}g{u}, %c34i : i32")
+        e(f"    %{p}bo{u} = scalar.addi {blk}, %{p}g34_{u} : i32")
+        e(f"    %{p}dh_i{u} = scalar.shrui %{p}bo{u}, %c1i : i32")
+        e(f"    %{p}dx{u} = index.cast %{p}dh_i{u} : i32 to index")
+        e(f"    %{p}dl{u} = index.max %{p}dx{u}, %c0 : index")
+        e(f"    %{p}dc{u} = index.min %{p}dl{u}, %w_half_last : index")
+        e(f"    %{p}dh{u} = view.load %w_f16_view[%{p}dc{u}] : view<[%w_halfs]xf16> -> f16")
+        e(f"    %{p}qa{u} = scalar.addi %{p}bo{u}, %c2i : i32")
+        e(f"    %{p}qb{u} = scalar.addi %{p}bo{u}, %c18i : i32")
+        _ldv(e, p, f"qa_v{u}", f"%{p}qa{u}", 16)
+        _ldv(e, p, f"qb_v{u}", f"%{p}qb{u}", 16)
+        vals += [(f"%{p}dh{u}", "f16"), (f"%{p}qa_v{u}", "vector<16xi8>"), (f"%{p}qb_v{u}", "vector<16xi8>")]
+    return L, vals
+
+
+def q8_0_compute(v, gb):
+    """The chained kernel's Q8_0 decode: value = d * f32(q)."""
+    L = []
+    e = L.append
+    it = iter(v)
+    for u in range(GPL):
+        dh = next(it); qa = next(it); qb = next(it)
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %d{u} = scalar.extf {dh} : f16 to f32")
+        e(f"    %dv{u} = vector.splat %d{u} : vector<16xf32>")
+        _col_of(e, u)
+        e(f"    %colh{u} = index.add %col{u}, %c16 : index")
+        for half, q, col in (("lo", qa, f"%col{u}"), ("hi", qb, f"%colh{u}")):
+            t = f"{half}{u}"
+            e(f"    %qf_{t} = vector.sitofp {q} : vector<16xi8> to vector<16xf32>")
+            e(f"    %vv_{t} = vector.mulf %dv{u}, %qf_{t} : vector<16xf32>")
+            e(f"    %hv_{t} = vector.fptrunc %vv_{t} : vector<16xf32> to vector<16xf16>")
+            e(f"    vector.store %hv_{t}, %wl_view[%drow, {col}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+    return L
+
+
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
     L.append("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
@@ -924,6 +989,7 @@ FMTS = {
     "q5k": dict(bb=176, ksub=128, decode=(lambda p, b, g: q4k_loads(p, b, g, q5=True),
                                           lambda v, g: q4k_compute(v, g, q5=True)),
                 extra=[], setup=q4k_setup),
+    "q8_0": dict(bb=272, kdiv=8, ksub=64, decode=(q8_0_loads, q8_0_compute), extra=[], setup=lambda: []),
     "q6k": dict(bb=210, ksub=64, decode=(q6k_loads, q6k_compute), extra=[], setup=q6k_setup),
     "iq2xxs": dict(bb=66, ksub=64, decode=(iq2xxs_loads, iq2xxs_compute), extra=["grid", "ksigns"], setup=iq2xxs_setup),
     "iq3xxs": dict(bb=98, ksub=64, decode=(iq3xxs_loads, iq3xxs_compute), extra=["grid", "ksigns"], setup=iq3xxs_setup),
@@ -999,13 +1065,13 @@ def emit_db_loop(e, L, loads, compute, toks, types, V4):
     cb = ", ".join(f"%b{i} = %a{i} : {V4}" for i in range(NA))
     e("      " + ", ".join(f"%q{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL}{{")
     e("        %kk = index.add %kb_k, %ks : index")
-    for i in range(4):
+    for i in range(MT):
         e(f"        %lr0_{i} = index.add %rg64, %c{16 * i} : index")
         e(f"        %lr{i} = index.add %lr0_{i}, %moff : index")
         e(f"        %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : {vt_new} -> vector<16xf16>")
     for j in range(NT):
         e(f"        %rhs{j} = vector.fragment.load<rhs> %a_t_view[%kk, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
-    for i in range(4):
+    for i in range(MT):
         for j in range(NT):
             n = i * NT + j
             e(f"        %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
@@ -1051,14 +1117,14 @@ def gen(fmt, kind="kstore"):
     e(f"  %m_tiles = config.get @{sym}.m_tiles : index")
     e(f"  %token_tiles = config.get @{sym}.token_tiles : index")
     e(f"  %wgs = index.constant {wgs} : index")
-    e(f"  %rowgrp = index.constant {4 * NR} : index")
+    e(f"  %rowgrp = index.constant {MT * NR} : index")
     e("  %m_groups = index.div %m_tiles, %rowgrp : index")
     e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512):
         e(f"  %c{v} = index.constant {v} : index")
-    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 21, 24, 28, 32, 48, 63, 64, 66, 74, 104, 106, 127, 128, 192, 255):
+    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 18, 21, 24, 28, 32, 34, 48, 63, 64, 66, 74, 104, 106, 127, 128, 192, 255):
         e(f"  %c{v}i = scalar.constant {v} : i32")
     e(f"  %cbb = index.constant {bb} : index")
     e(f"  %cbbh = index.constant {bb // 2} : index")
@@ -1072,7 +1138,16 @@ def gen(fmt, kind="kstore"):
     e("  %n = index.constant 16 : index")
     e("  %k = index.constant 16 : index")
     e(f"  %m_tiles = config.get @{sym}.m_tiles : index")
-    e(f"  %k_blocks = config.get @{sym}.k_blocks : index")
+    kdiv = F.get("kdiv", 1)
+    if kdiv == 1:
+        e(f"  %k_blocks = config.get @{sym}.k_blocks : index")
+    else:
+        # the config counts the format's own blocks (32 elements for Q8_0); the
+        # kernel works in 256-element super-blocks of kdiv of them. Without this
+        # the Q8_0 kernel walked 8x past its weights and hung the gfx ring.
+        e(f"  %k_blocks_cfg = config.get @{sym}.k_blocks : index")
+        e(f"  %ckdiv = index.constant {kdiv} : index")
+        e("  %k_blocks = index.div %k_blocks_cfg, %ckdiv : index")
     e(f"  %token_tiles = config.get @{sym}.token_tiles : index")
     e("  %ktot = index.mul %k_blocks, %c256 : index")
     e("  %tokens = index.mul %token_tiles, %cwtok : index")
@@ -1112,7 +1187,8 @@ def gen(fmt, kind="kstore"):
     e("  %wave = index.div %tid, %c64 : index")
     e("  %l64 = index.rem %tid, %c64 : index")
     if NR == 1:
-        e("  %m_origin = index.mul %wg_x, %c64 : index")
+        e(f"  %clr0 = index.constant {LR} : index")
+        e("  %m_origin = index.mul %wg_x, %clr0 : index")
         e("  %wv = index.add %wave, %c0 : index")
         e("  %rg64 = index.add %c0, %c0 : index")
     else:
@@ -1135,8 +1211,13 @@ def gen(fmt, kind="kstore"):
     e("  %drow = index.min %drow0, %clr1 : index")
     e("  %drow_i = index.cast %drow : index to i32")
     e("  %m_origin_i = index.cast %m_origin : index to i32")
-    e("  %l64_d = index.cast %l64 : index to i32")
-    e("  %grow_i = scalar.addi %m_origin_i, %l64_d : i32")
+    if NR == 1:
+        # the decode row is clamped to the tile, so lanes past a short tile (MT < 4)
+        # re-decode its last row instead of reading past the matrix
+        e("  %grow_i = scalar.addi %m_origin_i, %drow_i : i32")
+    else:
+        e("  %l64_d = index.cast %l64 : index to i32")
+        e("  %grow_i = scalar.addi %m_origin_i, %l64_d : i32")
     e("  %k_blocks_i = index.cast %k_blocks : index to i32")
     e("  %bpr_i = scalar.muli %k_blocks_i, %cbbi : i32")
     e("  %row_off_i = scalar.muli %grow_i, %bpr_i : i32")
@@ -1234,7 +1315,7 @@ def gen(fmt, kind="kstore"):
         else:
             e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL}{{")
         e("      %kk = index.add %kb_k, %ks : index")
-        for i in range(4):
+        for i in range(MT):
             e(f"      %lr{i} = index.add %rg64, %c{16 * i} : index")
             e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : view<{LR}x{ROWP}xf16> -> vector<16xf16>")
         for j in range(NT):
@@ -1263,11 +1344,11 @@ def gen(fmt, kind="kstore"):
             for j in range(NT):
                 if j + 1 < NT:
                     e(rhs_lines[j + 1])
-                for i in range(4):
+                for i in range(MT):
                     n = i * NT + j
                     e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
                 e("      scf.schedule.fence")
-        for i in (range(4) if not (KORDER == "fence" and ABLATE == "") else ()):
+        for i in (range(MT) if not (KORDER == "fence" and ABLATE == "") else ()):
             for j in range(NT):
                 n = i * NT + j
                 if ABLATE == "mma":
@@ -1314,7 +1395,7 @@ def gen(fmt, kind="kstore"):
         e(f"  %ep_n = index.constant {16 * TOK // 64} : index")
         e(f"  %ep_last = index.constant {16 * TOK - 1} : index")
         tl = ["%c0"] + [f"%c{16 * j}" for j in range(1, NT)]
-        for i in range(4):
+        for i in range(MT):
             e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
             for j in range(NT):
                 e(f"  vector.fragment.store<result> %acc{i * NT + j}, %ep_view[%c0, {tl[j]}] shape [%m, %n] : {V4}, view<16x{TOK}xf32, %ep_lay>")
@@ -1352,7 +1433,7 @@ def gen(fmt, kind="kstore"):
         e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
         e("  %res_t_view = buffer.view %resid_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
         e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
-        for i in range(4):
+        for i in range(MT):
             for j in range(NT):
                 a = i * NT + j
                 e(f"  %rf{a} = vector.fragment.load<result> %res_t_view[{rows[i]}, {toks[j]}] shape [%m, %n] : view<[%m_rows]x[%tokens]xf32, %out_layout> -> {V4}")
@@ -1366,12 +1447,12 @@ def gen(fmt, kind="kstore"):
         # again transposed: 3x the output bytes (426 MB for a 17408x2048 gate).
         e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
         e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
-        for i in range(4):
+        for i in range(MT):
             for j in range(NT):
                 e(f"  vector.fragment.store<result> %acc{i * NT + j}, %out_t_view[{rows[i]}, {toks[j]}] shape [%m, %n] : {V4}, view<[%m_rows]x[%tokens]xf32, %out_layout>")
     else:
         assert TOK == 128, "the staged epilogue's copy loop assumes 128 tokens per wave"
-        for i in range(4):
+        for i in range(MT):
             for j in range(NT):
                 e(f"  vector.fragment.store<result> %acc{i * NT + j}, %ostage_view[{rows[i]}, {toks[j]}] shape [%m, %n] : {V4}, view<[%stage_rows]x[%tokens]xf32>")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
