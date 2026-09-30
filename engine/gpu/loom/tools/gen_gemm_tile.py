@@ -67,7 +67,9 @@ FENCE = os.environ.get("YAH_TG_FENCE", "1") == "1"
 # inner K-step loop policy, e.g. "unroll(%c2) schedule(recurrence)"
 KPOL = os.environ.get("YAH_TG_KPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
-GPL_OF = {"q4k": 2, "q5k": 2}
+# q4k/q5k decode one group per lane (run-time nibble choice): twice the
+# decoding lanes of the even/odd pairing. YAH_TG_Q4GPL=2 restores the pairing.
+GPL_OF = {"q4k": int(os.environ.get("YAH_TG_Q4GPL", "1")), "q5k": int(os.environ.get("YAH_TG_Q4GPL", "1"))}
 # KSUB=64 everywhere: at 128 the 128 x 256 tiles need ~104 KB of LDS. q4k/q5k
 # keep their even group count per lane (GPL=2) with one decoding slot.
 KSUB_OF = {}

@@ -642,7 +642,8 @@ def q4k_loads(p, blk, gb, q5=False):
     # The nibble half is chosen by u's parity, which is g's parity only when a
     # lane's first group is even, i.e. GPL even. At KSUB=64 (GPL=1) odd groups
     # took the low nibbles: argmax 13 at pp2048.
-    assert GPL % 2 == 0, "q4k decode needs an even number of groups per lane (KSUB=128 at NW=2)"
+    # GPL=1 is fine here (g>>1 picks the qs pair at run time); q4k_compute then
+    # picks the nibble at run time too.
     L = []
     e = L.append
     vals = []
@@ -729,12 +730,25 @@ def q4k_compute(v, gb, q5=False):
         e(f"    %dm_v{u} = vector.splat %dm{u} : vector<16xf32>")
         op = "vector.andi" if u % 2 == 0 else "vector.shrui"
         k = "%m15v" if u % 2 == 0 else "%s4v"
+        rt = GPL % 2 == 1
+        if rt:
+            # one group per lane: its parity is only known at run time, so the
+            # nibble is (q >> 4*(g & 1)) & 15 -- the same value as the even
+            # (q & 15) and odd (q >> 4) forms, so bit-identical
+            e(f"    %gpar{u} = scalar.andi %g{u}, %c1i : i32")
+            e(f"    %gsh{u} = scalar.shli %gpar{u}, %c2i : i32")
+            e(f"    %gsh8_{u} = scalar.trunci %gsh{u} : i32 to i8")
+            e(f"    %gshv{u} = vector.splat %gsh8_{u} : vector<16xi8>")
         if q5:
             # fifth bit: quant = nibble + ((qh[lane] >> g) & 1) * 16
             e(f"    %g8_{u} = scalar.trunci %g{u} : i32 to i8")
             e(f"    %g8v_{u} = vector.splat %g8_{u} : vector<16xi8>")
         for half, q, qh in (("lo", qa, qha if q5 else None), ("hi", qb, qhb if q5 else None)):
-            e(f"    %nq{half}{u} = {op} {q}, {k} : vector<16xi8>")
+            if rt:
+                e(f"    %nqs{half}{u} = vector.shrui {q}, %gshv{u} : vector<16xi8>")
+                e(f"    %nq{half}{u} = vector.andi %nqs{half}{u}, %m15v : vector<16xi8>")
+            else:
+                e(f"    %nq{half}{u} = {op} {q}, {k} : vector<16xi8>")
             src = f"%nq{half}{u}"
             if q5:
                 e(f"    %hs{half}{u} = vector.shrui {qh}, %g8v_{u} : vector<16xi8>")
