@@ -72,10 +72,23 @@ def gen(dim=5120):
     e("  %shifted = scalar.addf %mean, %eps : f32")
     e("  %root = scalar.sqrtf %shifted : f32")
     e("  %inv = scalar.divf %one, %root : f32")
+    # hold the first `keep` row values across the reduction and reload the
+    # rest for the output pass (compile-report suggest: 230 VGPRs). Standalone
+    # 2048x5120: all held 0.357 ms, keep 64 0.333, 56 0.328, 48 0.334 (192
+    # VGPRs, the next tier), 32 0.340; a fence before the reloads 0.37-0.38.
+    keep = int(__import__("os").environ.get("YAH_NORM_KEEP", "56" if dim == 5120 else str(n)))
+    if keep < n and __import__("os").environ.get("YAH_NORM_FENCE", "0") == "1":
+        e("  scf.schedule.fence")  # keep the reloads below the reduction
     for k in range(n):
         e(f"  %wi{k} = index.add %lane, %o{k} : index")
         e(f"  %w{k} = view.load %weight_view[%wi{k}] : view<[%dim]xf32> -> f32")
-        e(f"  %nm{k} = scalar.mulf %x{k}, %inv : f32")
+        xk = f"%x{k}"
+        if k >= keep:
+            # reloaded instead of held across the reduction (fewer VGPRs, one
+            # more wave per SIMD: compile-report suggest); same value
+            e(f"  %xr{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
+            xk = f"%xr{k}"
+        e(f"  %nm{k} = scalar.mulf {xk}, %inv : f32")
         e(f"  %wt{k} = scalar.mulf %nm{k}, %w{k} : f32")
         e(f"  %h{k} = scalar.fptrunc %wt{k} : f32 to f16")
         e(f"  view.store %h{k}, %out_view[%a{k}] : f16, view<[%total_elems]xf16>")
