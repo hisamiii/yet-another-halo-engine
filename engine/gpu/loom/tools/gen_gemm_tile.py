@@ -71,6 +71,12 @@ FENCE = os.environ.get("YAH_TG_FENCE", "1") == "1"
 # MEASURED, OFF: G=4 is 10.25 -> 10.12 ms standalone (IQ4_XS 17408x5120) but
 # +83/+90 ms on the pp2048 GEMM total, interleaved (YAH_TILE_SWZ=4 to emit it).
 SWZ = int(os.environ.get("YAH_TG_SWZ", "0"))
+# EPI_LDS=1: kstore/kres epilogue through a wave-private LDS slab (TM rows x 16
+# tokens, token-major) so each lane stores 16 contiguous rows of one token with
+# b128 stores. The direct fragment store writes each lane's 8 values at an
+# 8-byte row stride: 64 global_store_b32 per wave, ~10% of IQ4_XS wave time.
+# IQ4_XS 17408x5120 10.26 -> 10.03 ms standalone; pp2048 GEMMs 3449 -> 3438 ms.
+EPI_LDS = os.environ.get("YAH_TG_EPI_LDS", "1") == "1"
 # inner K-step loop policy, e.g. "unroll(%c2) schedule(recurrence)"
 KPOL = os.environ.get("YAH_TG_KPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
@@ -412,6 +418,11 @@ def gen(fmt, kind="kstore"):
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
+    if EPI_LDS and TM == 32:
+        lds_epilogue(e, kr, V8)
+        e("  kernel.return")
+        e("}")
+        return "\n".join(L) + "\n"
     e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
     e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
     if kr:
@@ -458,6 +469,52 @@ def frag_stores(lines, ksub):
                 f"{ind}vector.store {val}, %wl_fm[%{t}r, %{t}c] : {vt}, view<{BM * ksub // 16}x16xf16>"]
     assert n > 0, "no weight-tile stores found to rewrite"
     return out
+
+
+def lds_epilogue(e, kr, V8):
+    """out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column
+    of fragments at a time: fragments -> LDS slab (element (r, t) at t*TM + r)
+    -> each lane reads 16 contiguous rows of one token -> 4 b128 stores. Two
+    lanes cover a token's TM=32 rows (128 contiguous bytes). Same values, and
+    for kres the same resid + acc add, so bit-identical."""
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    e(f"  %es_ctm = index.constant {TM} : index")
+    e("  %es_lay = encoding.layout.strided [%c1, %es_ctm] : encoding<layout>")
+    e(f"  %es_wb = index.constant {TM * 16 * 4} : index")
+    e("  %es_off_i = index.mul %wave, %es_wb : index")
+    e("  %es_off = index.cast %es_off_i : index to offset")
+    e(f"  %es_view = buffer.view %al[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
+    e(f"  %es_flat = buffer.view %al[%es_off] : buffer -> view<{TM * 16}xf32>")
+    e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+    if kr:
+        e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
+    e("  %es_lane = index.rem %tid, %c32 : index")
+    e("  %es_t = index.div %es_lane, %c2 : index")
+    e("  %es_h0 = index.rem %es_lane, %c2 : index")
+    e("  %es_h = index.mul %es_h0, %c16 : index")
+    e(f"  %es_tt = index.mul %es_t, %es_ctm : index")
+    e("  %es_rd = index.add %es_tt, %es_h : index")
+    e("  %es_row = index.add %m_origin, %es_h : index")
+    for j in range(FN):
+        for i in range(FM):
+            e(f"  %es_r{i}_{j} = index.constant {16 * i} : index")
+            e(f"  vector.fragment.store<result> %acc{i * FN + j}, %es_view[%es_r{i}_{j}, %c0] shape [%m, %n] : {V8}, view<{TM}x16xf32, %es_lay>")
+        e(f"  %es_tc{j} = index.constant {16 * j} : index")
+        e(f"  %es_tk{j}0 = index.add %token_base, %es_tc{j} : index")
+        e(f"  %es_tk{j} = index.add %es_tk{j}0, %es_t : index")
+        e(f"  %es_tm{j} = index.mul %es_tk{j}, %m_rows : index")
+        e(f"  %es_ob{j} = index.add %es_tm{j}, %es_row : index")
+        for q in range(4):
+            e(f"  %es_q{j}_{q}c = index.constant {4 * q} : index")
+            e(f"  %es_ri{j}_{q} = index.add %es_rd, %es_q{j}_{q}c : index")
+            e(f"  %es_v{j}_{q} = vector.load %es_flat[%es_ri{j}_{q}] : view<{TM * 16}xf32> -> vector<4xf32>")
+            e(f"  %es_oi{j}_{q} = index.add %es_ob{j}, %es_q{j}_{q}c : index")
+            val = f"%es_v{j}_{q}"
+            if kr:
+                e(f"  %es_rf{j}_{q} = vector.load %res_flat[%es_oi{j}_{q}] : view<[%out_total]xf32> -> vector<4xf32>")
+                e(f"  %es_rs{j}_{q} = vector.addf %es_rf{j}_{q}, %es_v{j}_{q} : vector<4xf32>")
+                val = f"%es_rs{j}_{q}"
+            e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
 
 
 def swiglu_epilogue(e, arow):
