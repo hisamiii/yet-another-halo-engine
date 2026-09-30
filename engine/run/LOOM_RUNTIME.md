@@ -1448,6 +1448,15 @@ HIP's kernel at 256 and 203 tokens. pp2048 pipeline 120 -> 104 ms (HIP 94). The
 FMAs are still three-operand `v_fma_f32` (no in-place `v_fmac`, so no dual-issue
 pairs); that and the remaining `low_slice` moves are the rest of the gap.
 
+`loom-compile-report suggest` then named the next step
+(`vector.compare_componentwise_bank_state`): the loop-carried k/q prefetch
+vectors had static component reads plus one whole-vector consumer, the state
+update `vector.fmaf(dk, k, s*alpha)`, so their boundary projection was
+rejected. Written per element (the same four scalar fmas), the projection is
+taken: 1.799 -> 1.716 ms; with `unroll(%c8)` (128 VGPRs, clearing suggest's
+next finding, a residency cliff at 132) 1.663 ms. Bit-identical to HIP's kernel.
+pp2048 DeltaNet 108 -> 98-100 ms in paired profiles (HIP 94).
+
 ### Attention in HIP's arithmetic order -- bit-identical to HIP's kernel
 
 `tools/gen_attn_hip.py` ports HIP's `WmmaCausalAttention<32, 16, true>`: 32
@@ -1625,6 +1634,12 @@ are `read_result_reuse` on other loads.
   ms). The int8 codebook with the fused multiply (HIP's rounding, not
   bit-identical to ours) cuts static VALU 426 -> 387 and times 10.08 vs 10.10:
   instruction count is not the limit. Both knobs stay, off.
+- 32 waves of 32x32 wave tiles (WM=4, WN=8; 8 waves per SIMD from one
+  workgroup, what the residency tier would buy): IQ4_XS 9.47 -> 12.56, Q4_K
+  5.49 -> 6.53 ms -- one fragment load per WMMA instead of 0.75, and 4 of 32
+  waves decoding. The GEMMs' own residency cliff (144 VGPRs, 128 for tier 8)
+  is allocation, not pressure: the scheduled peak is 126-135 but 8-register
+  fragments pack to a 144 high-water; rhs-outer MMA order with fences gets 136.
 - swiglu epilogue on the LDS epilogue's structure (`YAH_TG_SWEPI=1`: one
   barrier, wave-private slabs, 4-row vector gate loads and f16 stores, the same
   scalar silu per element; md5 unchanged): standalone IQ4_XS 10.22 -> 10.03,
@@ -1632,7 +1647,9 @@ are `read_result_reuse` on other loads.
   +2.6 / -2.5 ms in an order-swapped pair) and it costs VGPRs (IQ3_S 136 ->
   190) and code (6.5 -> 16 KB). Off. The first pair had shown +24 ms: the
   second of two back-to-back pp2048 profiles runs ~30-40 ms slower whichever
-  set it is, so pairs are now run in both orders.
+  set it is, so pairs are now run in both orders. Retested on the
+  decode-ahead kernels: gate+up rows +1.7..+2.2% against +0.3% drift on the
+  other rows -- a real pipeline regression, standalone gains notwithstanding.
 - The IQ3 grid tables read from global memory instead of LDS (`YAH_SD_GRID_LDS=0`,
   as HIP's `__device__` tables): IQ3_S 10.10 -> 11.74, IQ3_XXS 10.07 -> 11.73 ms
   standalone; with decode-ahead 12.08 / 11.51. Traced: s_waitcnt 16.5% -> 27.2%

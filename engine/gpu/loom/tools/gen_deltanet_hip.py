@@ -143,7 +143,7 @@ def gen():
     # report move_causes branch_edge, 60 v_mov per token against HIP's none);
     # unrolled, the iterations alternate registers. 2.058 -> 1.829 ms
     # standalone, bit-identical (tools/deltanet_vs_hip.sh). YAH_DN_POL overrides.
-    pol = __import__("os").environ.get("YAH_DN_POL", "unroll(%c4) schedule(recurrence)")
+    pol = __import__("os").environ.get("YAH_DN_POL", "unroll(%c8) schedule(recurrence)")
     e(f"  {res} = scf.for %t = [%c0 to %batch step %c1]({carried}) -> ({ltypes}) {pol} {{")
     # next token's loads go out first; this token computes on the carried values
     e("    %t_n0 = index.add %t, %c1 : index")
@@ -212,7 +212,18 @@ def gen():
         e(f"    %dk{r} = scalar.mulf %inv_k, %d{r} : f32")
         e(f"    %dkv{r} = vector.splat %dk{r} : {V4}")
         for g in range(4):
-            e(f"    %sn{r}{g} = vector.fmaf %dkv{r}, %k{g}, %sa_{r}{g} : {V4}")
+            if __import__("os").environ.get("YAH_DN_COMPW", "1") == "1":
+                # componentwise, as the dot products already read k: then no
+                # consumer needs the whole k bank and the loop-carried k/q
+                # banks project to registers (compile-report suggest:
+                # vector.compare_componentwise_bank_state). Same fmas.
+                cs = []
+                for i in range(4):
+                    e(f"    %snc{r}{g}{i} = scalar.fmaf %dk{r}, %ke{g}{i}, %se{r}{g}{i} : f32")
+                    cs.append(f"%snc{r}{g}{i}")
+                e(f"    %sn{r}{g} = vector.from_elements {', '.join(cs)} : {V4}")
+            else:
+                e(f"    %sn{r}{g} = vector.fmaf %dkv{r}, %k{g}, %sa_{r}{g} : {V4}")
             ys.append(f"%sn{r}{g}")
     e(f"    scf.yield {', '.join(ys + nxt)} : {ltypes}")
     e("  }")

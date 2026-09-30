@@ -78,6 +78,9 @@ DECAHEAD = DECAHEAD_ENV == "1"
 # waves then never decode, so a phase costs max(decode, MMA), not the sum on
 # the decoding waves.
 DECW = int(os.environ.get("YAH_TG_DECW", "0"))
+RHS_OUTER = os.environ.get("YAH_TG_RHSO", "0") == "1"
+# fence after every RHS_FENCE rhs groups so the loads cannot all be hoisted
+RHS_FENCE = int(os.environ.get("YAH_TG_RHSF", "0"))
 
 # f16 of padding per decoded weight row: unpadded rows are 128 B apart at
 # KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
@@ -261,11 +264,21 @@ def gen(fmt, kind="kstore"):
     # else the activation tile grows
     al_bytes = BN * arow * 2
     G.EPI_TILE = "%al"
-    if EPI_LDS and WS == 32 and TM == 32 and NWAVE * TM * 16 * 4 > al_bytes:
-        if BM * G.ROWP * 2 >= NWAVE * TM * 16 * 4:
+    G.EPI_ROUNDS = 1
+    slabs = NWAVE * TM * 16 * 4
+    wl_total = BM * G.ROWP * 2 * (2 if DECAHEAD else 1)
+    if EPI_LDS and WS == 32 and TM == 32 and slabs > al_bytes:
+        if wl_total >= slabs:
             G.EPI_TILE = "%wl"
+        elif wl_total + slabs <= 65536:
+            # growing the activation tile still fits: one round (production)
+            al_bytes = slabs
+        elif any(NWAVE % r == 0 and max(al_bytes, wl_total) * r >= slabs for r in (2, 4, 8)):
+            # a fraction of the waves at a time (32-wave tiles)
+            G.EPI_ROUNDS = next(r for r in (2, 4, 8) if NWAVE % r == 0 and max(al_bytes, wl_total) * r >= slabs)
+            G.EPI_TILE = "%wl" if wl_total >= al_bytes else "%al"
         else:
-            al_bytes = NWAVE * TM * 16 * 4
+            al_bytes = slabs
     e(f"  %al_bytes = index.constant {al_bytes} : offset")
     e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
     e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
@@ -538,7 +551,7 @@ def gen(fmt, kind="kstore"):
             e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_fm[%lrow{i}, %c0] shape [%m, %k] : view<{BM * ksub // 16}x16xf16> -> {VF}")
         else:
             e(f"      %lhs{i} = vector.fragment.load<lhs> {wlv}[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
-    for j in range(FN):
+    def rhs_load(j):
         e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
         if FRAG:
             e(f"      %tcb{j} = index.div %tc{j}, %c16 : index")
@@ -547,10 +560,25 @@ def gen(fmt, kind="kstore"):
             e(f"      %rhs{j} = vector.fragment.load<rhs> %al_fmt[%c0, %tcol{j}] shape [%k, %n] : view<16x{BN * ksub // 16}xf16, %fm_lay> -> {VF}")
         else:
             e(f"      %rhs{j} = vector.fragment.load<rhs> %al_t[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
-    for i in range(FM):
+    if RHS_OUTER:
+        # rhs-outer: each rhs fragment dies after its FM MMAs, so only the lhs
+        # fragments and one or two rhs are live (compile-report suggest: the
+        # IQ4_XS peak held all 6 fragments, 144 VGPRs, one short of tier 8).
+        # Every accumulator still takes one MMA per k step: same values.
         for j in range(FN):
-            n = i * FN + j
-            e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
+            rhs_load(j)
+            for i in range(FM):
+                n = i * FN + j
+                e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
+            if RHS_FENCE and j + 1 < FN and (j + 1) % RHS_FENCE == 0:
+                e("      scf.schedule.fence")
+    else:
+        for j in range(FN):
+            rhs_load(j)
+        for i in range(FM):
+            for j in range(FN):
+                n = i * FN + j
+                e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
     e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
     e("    }")
     if DECAHEAD and DECW:
@@ -637,7 +665,21 @@ def lds_epilogue(e, kr, V8, sw=False):
     e(f"  %es_ctm = index.constant {TM} : index")
     e("  %es_lay = encoding.layout.strided [%c1, %es_ctm] : encoding<layout>")
     e(f"  %es_wb = index.constant {TM * 16 * 4} : index")
-    e("  %es_off_i = index.mul %wave, %es_wb : index")
+    R = G.EPI_ROUNDS
+    if R > 1:
+        # round r: waves r*NWAVE/R .. use slabs 0 .. NWAVE/R-1; the round loop
+        # is workgroup-uniform so every wave reaches its barriers
+        e(f"  %es_per = index.constant {NWAVE // R} : index")
+        e("  %es_slot = index.rem %wave, %es_per : index")
+        e("  %es_sg = kernel.subgroup.id : index")
+        e("  %es_myr = index.div %es_sg, %es_per : index")
+        e(f"  %es_nr = index.constant {R} : index")
+        e("  scf.for %es_r = [%c0 to %es_nr step %c1] {")
+        e("  %es_mine = index.cmp eq, %es_myr, %es_r : index")
+        e("  scf.if %es_mine {")
+        e("  %es_off_i = index.mul %es_slot, %es_wb : index")
+    else:
+        e("  %es_off_i = index.mul %wave, %es_wb : index")
     e("  %es_off = index.cast %es_off_i : index to offset")
     e(f"  %es_view = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
     e(f"  %es_flat = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{TM * 16}xf32>")
@@ -697,9 +739,12 @@ def lds_epilogue(e, kr, V8, sw=False):
                 e(f"  vector.store %hv{j}_{q}, %out_h[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
             else:
                 e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
+    if G.EPI_ROUNDS > 1:
+        e("  }")
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  }")
     if DECAHEAD and DECW:
         e("  }")
-
 
 
 def swiglu_epilogue(e, arow):
