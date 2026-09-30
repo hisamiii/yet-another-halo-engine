@@ -89,6 +89,12 @@ KPOL = os.environ.get("YAH_SD_KPOL", "")
 # MMA order in the K step: "" = all loads then lhs-major MMAs; "fence" =
 # rhs-major with schedule fences (see the MMA loop).
 KORDER = os.environ.get("YAH_SD_KORDER", "")
+# Double-buffered weight tile, one barrier per phase (emit_db_loop). Measured
+# slower everywhere (IQ4_XS 9.12 -> 11.51 ms at KSUB=128, 12.31 at 64; IQ3_S
+# 12.02 -> 13.15): the decode is issue-bound -- WMMA and the decode share the
+# VALU -- not latency-bound, so overlapping them buys nothing and the doubled
+# tile costs residency. Off.
+DB = os.environ.get("YAH_SD_DB", "0") == "1"
 # IQ3_S / IQ3_XXS: decode each sign byte's 8 elements with i8/f32 vector ops.
 VDEC = os.environ.get("YAH_SD_VDEC", "1") == "1"
 
@@ -922,6 +928,96 @@ FMTS = {
 }
 
 
+def emit_db_loop(e, L, loads, compute, toks, types, V4):
+    """Double-buffered K loop: one barrier per phase, decode overlapping MMAs.
+
+    The weight tile is two LR-row halves. Iteration kp (0..kphases) decodes phase
+    min(kp, last) into half kp&1 from bytes loaded one iteration earlier, issues
+    the loads for phase kp+1, then -- for kp >= 1 -- runs phase kp-1's MMAs from
+    the other half, then barriers. The barrier at the end of kp-1 is what makes
+    both the half being decoded (last read in kp-1) and the half being read
+    (written in kp-1) safe. Each accumulator sees the same MMA sequence as the
+    single-buffered loop, so the result is bit-identical to it."""
+    ca = ", ".join(f"%a{i} = %init : {V4}" for i in range(NA))
+    L0, vals0 = loads("pf_", "%row_off_i", "%gl_i")
+    L.extend(L0)
+    orig0 = vals0
+    vals0 = pack_vals(e, vals0, "0")
+    ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(vals0))
+    carried_t = types + ", " + ", ".join(ty for _, ty in vals0)
+    res = ", ".join(f"%acc{i}" for i in range(NA)) + ", " + ", ".join(f"%cvout{x}" for x in range(len(vals0)))
+    # publish workgroup tables staged by the format setup (IQ grids/ksigns): the
+    # single-buffered loop's leading barrier did this, but here the first decode
+    # runs before the first barrier (IQ3_S read an unpublished grid: md5 b6dc21d0)
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    e("  %kph1 = index.add %kphases, %c1 : index")
+    e(f"  %clr_db = index.constant {LR} : index")
+    e("  " + res + f" = scf.for %kp = [%c0 to %kph1 step %c1]({ca}) -> ({carried_t}) {{")
+    e("    %kp_last = index.sub %kphases, %c1 : index")
+    e("    %kpd = index.min %kp, %kp_last : index")
+    e("    %kb = index.div %kpd, %cph : index")
+    e("    %ph = index.rem %kpd, %cph : index")
+    e("    %kb_i = index.cast %kb : index to i32")
+    e("    %ph_i = index.cast %ph : index to i32")
+    e("    %blk_off0 = scalar.muli %kb_i, %cbbi : i32")
+    e("    %phg_i = scalar.muli %ph_i, %cgppi : i32")
+    e("    %gb_i = scalar.addi %phg_i, %gl_i : i32")
+    e("    %blk_i = scalar.addi %row_off_i, %blk_off0 : i32")
+    e("    %bsel = index.rem %kp, %c2 : index")
+    e("    %boff = index.mul %bsel, %clr_db : index")
+    e("    %drowb = index.add %drow, %boff : index")
+    cur = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(vals0)]
+    cur_names = unpack_vals(e, cur, orig0)
+    dec = compute(cur_names, "%gb_i")
+    vt_old, vt_new = f"view<{LR}x{ROWP}xf16>", f"view<{2 * LR}x{ROWP}xf16>"
+    L.extend(l.replace("%wl_view[%drow,", "%wl_view[%drowb,").replace(vt_old, vt_new) for l in dec)
+    # loads for the next phase (clamped: the extra iterations' loads are in bounds)
+    e("    %kp_n0 = index.add %kp, %c1 : index")
+    e("    %kp_n = index.min %kp_n0, %kp_last : index")
+    e("    %kb_n = index.div %kp_n, %cph : index")
+    e("    %ph_n = index.rem %kp_n, %cph : index")
+    e("    %kb_ni = index.cast %kb_n : index to i32")
+    e("    %ph_ni = index.cast %ph_n : index to i32")
+    e("    %blk_off0n = scalar.muli %kb_ni, %cbbi : i32")
+    e("    %blk_n = scalar.addi %row_off_i, %blk_off0n : i32")
+    e("    %phg_n = scalar.muli %ph_ni, %cgppi : i32")
+    e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
+    Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
+    L.extend(Ln)
+    nxt = pack_vals(e, nxt, "n")
+    # MMAs of phase kp-1 from the other half
+    e("    %has_mma = index.cmp ne, %kp, %c0 : index")
+    e("    %kp1 = index.max %kp, %c1 : index")
+    e("    %kpm = index.sub %kp1, %c1 : index")
+    e("    %kb_k = index.mul %kpm, %cksub : index")
+    e("    %bm = index.sub %c1, %bsel : index")
+    e("    %moff = index.mul %bm, %clr_db : index")
+    res2 = ", ".join(f"%r{i}" for i in range(NA))
+    e(f"    {res2} = scf.if %has_mma -> ({types}) {{")
+    cb = ", ".join(f"%b{i} = %a{i} : {V4}" for i in range(NA))
+    e("      " + ", ".join(f"%q{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL}{{")
+    e("        %kk = index.add %kb_k, %ks : index")
+    for i in range(4):
+        e(f"        %lr0_{i} = index.add %rg64, %c{16 * i} : index")
+        e(f"        %lr{i} = index.add %lr0_{i}, %moff : index")
+        e(f"        %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : {vt_new} -> vector<16xf16>")
+    for j in range(NT):
+        e(f"        %rhs{j} = vector.fragment.load<rhs> %a_t_view[%kk, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
+    for i in range(4):
+        for j in range(NT):
+            n = i * NT + j
+            e(f"        %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
+    e("        scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
+    e("      }")
+    e("      scf.yield " + ", ".join(f"%q{i}" for i in range(NA)) + f" : {types}")
+    e("    } else {")
+    e("      scf.yield " + ", ".join(f"%a{i}" for i in range(NA)) + f" : {types}")
+    e("    }")
+    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    e("    scf.yield " + res2 + ", " + ", ".join(nm for nm, _ in nxt) + f" : {carried_t}")
+    e("  }")
+
+
 def gen(fmt, kind="kstore"):
     """kind: "kstore" (f32 token-major output) or "swiglu" (the ffn_up arm:
     f16 output = round_f16(silu(gate) * acc), gate the f32 gate projection in
@@ -1000,12 +1096,12 @@ def gen(fmt, kind="kstore"):
         # the swiglu output is f16: an f32 view of it would declare twice its size
         e("  %out_view = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
     e("  %ostage_view = buffer.view %ostage_na[%base] : buffer -> view<[%stage_rows]x[%tokens]xf32>")
-    wl_bytes = LR * ROWP * 2
+    wl_bytes = LR * ROWP * 2 * (2 if DB else 1)
     if sw:
         wl_bytes = max(wl_bytes, NW * NR * 16 * TOK * 4)   # the epilogue's f32 slabs
     e(f"  %wl_bytes = index.constant {wl_bytes} : offset")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
-    e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{LR}x{ROWP}xf16>")
+    e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{LR * (2 if DB else 1)}x{ROWP}xf16>")
     e("  %wg_x = kernel.workgroup.id<x> : index")
     e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
@@ -1055,108 +1151,112 @@ def gen(fmt, kind="kstore"):
     V4 = "vector<4xf32>"
     types = ", ".join([V4] * NA)
     loads, compute = decode
-    ca = ", ".join(f"%a{i} = %init : {V4}" for i in range(NA))
-    carried_t = types
-    if PREFETCH:
-        # Phase 0's raw bytes are loaded before the loop; each iteration decodes
-        # the carried bytes and then issues the NEXT phase's loads, so their DRAM
-        # latency runs under this phase's MMAs instead of in front of the decode.
-        L0, vals0 = loads("pf_", "%row_off_i", "%gl_i")
-        L.extend(L0)
-        orig0 = vals0
-        vals0 = pack_vals(e, vals0, "0")
-        ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(vals0))
-        carried_t = types + ", " + ", ".join(ty for _, ty in vals0)
-    res = ", ".join(f"%acc{i}" for i in range(NA))
-    if PREFETCH:
-        res += ", " + ", ".join(f"%cvout{x}" for x in range(len(vals0)))
-    e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t}) {{")
-    e("    // every wave has finished reading the previous phase's tile")
-    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    e("    %kb = index.div %kp, %cph : index")
-    e("    %ph = index.rem %kp, %cph : index")
-    e("    %kb_i = index.cast %kb : index to i32")
-    e("    %ph_i = index.cast %ph : index to i32")
-    e("    %blk_off0 = scalar.muli %kb_i, %cbbi : i32")
-    e("    %phg_i = scalar.muli %ph_i, %cgppi : i32")
-    e("    %gb_i = scalar.addi %phg_i, %gl_i : i32")
-    e("    %kb_k = index.mul %kp, %cksub : index")
-    e("    %blk_i = scalar.addi %row_off_i, %blk_off0 : i32")
-    if PREFETCH:
-        cur = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(vals0)]
-        cur_names = unpack_vals(e, cur, orig0)
+    if DB:
+        assert PREFETCH and ABLATE == "" and KORDER == ""
+        emit_db_loop(e, L, loads, compute, toks, types, V4)
     else:
-        Lc, cur = loads("cu_", "%blk_i", "%gb_i")
-        L.extend(Lc)
-        cur_names = [nm for nm, _ in cur]
-    if ABLATE != "decode":
-        L.extend(compute(cur_names, "%gb_i"))
-    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    if PREFETCH:
-        # next phase, clamped to the last one (its loads are then redundant but
-        # in bounds, and the carried values are never decoded)
-        e("    %kp_n0 = index.add %kp, %c1 : index")
-        e("    %kp_last = index.sub %kphases, %c1 : index")
-        e("    %kp_n = index.min %kp_n0, %kp_last : index")
-        e("    %kb_n = index.div %kp_n, %cph : index")
-        e("    %ph_n = index.rem %kp_n, %cph : index")
-        e("    %kb_ni = index.cast %kb_n : index to i32")
-        e("    %ph_ni = index.cast %ph_n : index to i32")
-        e("    %blk_off0n = scalar.muli %kb_ni, %cbbi : i32")
-        e("    %blk_n = scalar.addi %row_off_i, %blk_off0n : i32")
-        e("    %phg_n = scalar.muli %ph_ni, %cgppi : i32")
-        e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
-        Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
-        L.extend(Ln)
-        nxt = pack_vals(e, nxt, "n")
-    cb = ", ".join(f"%b{i} = %a{i} : {V4}" for i in range(NA))
-    e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL}{{")
-    e("      %kk = index.add %kb_k, %ks : index")
-    for i in range(4):
-        e(f"      %lr{i} = index.add %rg64, %c{16 * i} : index")
-        e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : view<{LR}x{ROWP}xf16> -> vector<16xf16>")
-    for j in range(NT):
-        if ABLATE == "rhs":
-            e(f"      %rhs{j} = vector.fragment.load<rhs> %wl_view[%c{16 * (j % 4)}, %ks] shape [%k, %n] : view<{LR}x{ROWP}xf16> -> vector<16xf16>")
-            continue
-        if ABLATE == "rhsfix":
-            # probe: same rhs addresses every K step (always cache-resident)
-            e(f"      %rhs{j} = vector.fragment.load<rhs> %a_t_view[%c0, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
-            continue
-        e(f"      %rhs{j} = vector.fragment.load<rhs> %a_t_view[%kk, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
-    if KORDER == "fence" and ABLATE == "":
-        # rhs-major with fences: rhs_{j+1} is issued, then rhs_j's four MMAs,
-        # then a fence, so at most two activation fragments (plus the four lhs)
-        # are live instead of all eight. Each accumulator still sees exactly one
-        # MMA per K step, in K order.
-        rhs_lines = {}
-        body = L[-NT:]
-        del L[-NT:]
-        for j, line in enumerate(body):
-            rhs_lines[j] = line
-        e(rhs_lines[0])
+        ca = ", ".join(f"%a{i} = %init : {V4}" for i in range(NA))
+        carried_t = types
+        if PREFETCH:
+            # Phase 0's raw bytes are loaded before the loop; each iteration decodes
+            # the carried bytes and then issues the NEXT phase's loads, so their DRAM
+            # latency runs under this phase's MMAs instead of in front of the decode.
+            L0, vals0 = loads("pf_", "%row_off_i", "%gl_i")
+            L.extend(L0)
+            orig0 = vals0
+            vals0 = pack_vals(e, vals0, "0")
+            ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(vals0))
+            carried_t = types + ", " + ", ".join(ty for _, ty in vals0)
+        res = ", ".join(f"%acc{i}" for i in range(NA))
+        if PREFETCH:
+            res += ", " + ", ".join(f"%cvout{x}" for x in range(len(vals0)))
+        e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t}) {{")
+        e("    // every wave has finished reading the previous phase's tile")
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("    %kb = index.div %kp, %cph : index")
+        e("    %ph = index.rem %kp, %cph : index")
+        e("    %kb_i = index.cast %kb : index to i32")
+        e("    %ph_i = index.cast %ph : index to i32")
+        e("    %blk_off0 = scalar.muli %kb_i, %cbbi : i32")
+        e("    %phg_i = scalar.muli %ph_i, %cgppi : i32")
+        e("    %gb_i = scalar.addi %phg_i, %gl_i : i32")
+        e("    %kb_k = index.mul %kp, %cksub : index")
+        e("    %blk_i = scalar.addi %row_off_i, %blk_off0 : i32")
+        if PREFETCH:
+            cur = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(vals0)]
+            cur_names = unpack_vals(e, cur, orig0)
+        else:
+            Lc, cur = loads("cu_", "%blk_i", "%gb_i")
+            L.extend(Lc)
+            cur_names = [nm for nm, _ in cur]
+        if ABLATE != "decode":
+            L.extend(compute(cur_names, "%gb_i"))
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if PREFETCH:
+            # next phase, clamped to the last one (its loads are then redundant but
+            # in bounds, and the carried values are never decoded)
+            e("    %kp_n0 = index.add %kp, %c1 : index")
+            e("    %kp_last = index.sub %kphases, %c1 : index")
+            e("    %kp_n = index.min %kp_n0, %kp_last : index")
+            e("    %kb_n = index.div %kp_n, %cph : index")
+            e("    %ph_n = index.rem %kp_n, %cph : index")
+            e("    %kb_ni = index.cast %kb_n : index to i32")
+            e("    %ph_ni = index.cast %ph_n : index to i32")
+            e("    %blk_off0n = scalar.muli %kb_ni, %cbbi : i32")
+            e("    %blk_n = scalar.addi %row_off_i, %blk_off0n : i32")
+            e("    %phg_n = scalar.muli %ph_ni, %cgppi : i32")
+            e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
+            Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
+            L.extend(Ln)
+            nxt = pack_vals(e, nxt, "n")
+        cb = ", ".join(f"%b{i} = %a{i} : {V4}" for i in range(NA))
+        e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL}{{")
+        e("      %kk = index.add %kb_k, %ks : index")
+        for i in range(4):
+            e(f"      %lr{i} = index.add %rg64, %c{16 * i} : index")
+            e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : view<{LR}x{ROWP}xf16> -> vector<16xf16>")
         for j in range(NT):
-            if j + 1 < NT:
-                e(rhs_lines[j + 1])
-            for i in range(4):
-                n = i * NT + j
-                e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
-            e("      scf.schedule.fence")
-    for i in (range(4) if not (KORDER == "fence" and ABLATE == "") else ()):
-        for j in range(NT):
-            n = i * NT + j
-            if ABLATE == "mma":
-                e(f"      %n{n} = vector.fragment<init> %zeros shape [%m, %n] : {V4}") if False else None
-                e(f"      %n{n} = vector.addf %b{n}, %b{n} : {V4}")
+            if ABLATE == "rhs":
+                e(f"      %rhs{j} = vector.fragment.load<rhs> %wl_view[%c{16 * (j % 4)}, %ks] shape [%k, %n] : view<{LR}x{ROWP}xf16> -> vector<16xf16>")
                 continue
-            e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
-    e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
-    e("    }")
-    yv = ", ".join(f"%r{i}" for i in range(NA))
-    if PREFETCH:
-        yv += ", " + ", ".join(nm for nm, _ in nxt)
-    e("    scf.yield " + yv + f" : {carried_t}")
-    e("  }")
+            if ABLATE == "rhsfix":
+                # probe: same rhs addresses every K step (always cache-resident)
+                e(f"      %rhs{j} = vector.fragment.load<rhs> %a_t_view[%c0, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
+                continue
+            e(f"      %rhs{j} = vector.fragment.load<rhs> %a_t_view[%kk, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
+        if KORDER == "fence" and ABLATE == "":
+            # rhs-major with fences: rhs_{j+1} is issued, then rhs_j's four MMAs,
+            # then a fence, so at most two activation fragments (plus the four lhs)
+            # are live instead of all eight. Each accumulator still sees exactly one
+            # MMA per K step, in K order.
+            rhs_lines = {}
+            body = L[-NT:]
+            del L[-NT:]
+            for j, line in enumerate(body):
+                rhs_lines[j] = line
+            e(rhs_lines[0])
+            for j in range(NT):
+                if j + 1 < NT:
+                    e(rhs_lines[j + 1])
+                for i in range(4):
+                    n = i * NT + j
+                    e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
+                e("      scf.schedule.fence")
+        for i in (range(4) if not (KORDER == "fence" and ABLATE == "") else ()):
+            for j in range(NT):
+                n = i * NT + j
+                if ABLATE == "mma":
+                    e(f"      %n{n} = vector.fragment<init> %zeros shape [%m, %n] : {V4}") if False else None
+                    e(f"      %n{n} = vector.addf %b{n}, %b{n} : {V4}")
+                    continue
+                e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
+        e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
+        e("    }")
+        yv = ", ".join(f"%r{i}" for i in range(NA))
+        if PREFETCH:
+            yv += ", " + ", ".join(nm for nm, _ in nxt)
+        e("    scf.yield " + yv + f" : {carried_t}")
+        e("  }")
     e("  %mo16 = index.add %m_origin, %c16 : index")
     e("  %mo32 = index.add %m_origin, %c32 : index")
     e("  %mo48 = index.add %m_origin, %c48 : index")

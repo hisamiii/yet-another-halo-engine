@@ -37,6 +37,10 @@ SRC = os.path.join(os.path.dirname(HERE), "yah_deltanet_rowsplit_f32.loom")
 # and at W=16 that exhausted the 106-SGPR budget (peak 157) at B=512.
 W = int(os.environ.get("YAH_DN_W", "8"))
 CH = 128 // W
+# Chunks per scalar-load group (0 = load each chunk right before its use).
+# G=2: 43 -> 27 full lgkmcnt drains per token, 6.85 -> 5.58 ms per layer at
+# pp2048, bit-identical; G=4 and up spill.
+G = int(os.environ.get("YAH_DN_G", "2"))
 VT = f"vector<{W}xf32>"
 
 HEADER = """\
@@ -147,14 +151,19 @@ def gen():
     L.extend(body.split("\n"))
     # readout: products as vectors, sums as scalars in key order
     u, p = "%zero", "%zero"
-    for c in range(CH):
+
+    def rd_load(c):
         e(f"    %ko{c} = index.add %k_off, %co{c} : index")
         e(f"    %qo{c} = index.add %q_off, %co{c} : index")
         e(f"    %k{c} = vector.load %conv_view[%ko{c}] : view<[%conv_total]xf32> -> {VT}")
         e(f"    %q{c} = vector.load %conv_view[%qo{c}] : view<[%conv_total]xf32> -> {VT}")
+
+    def rd_prod(c):
         e(f"    %sa_{c} = vector.mulf %s{c}, %alpha_v : {VT}")
         e(f"    %uk{c} = vector.mulf %sa_{c}, %k{c} : {VT}")
         e(f"    %pq{c} = vector.mulf %sa_{c}, %q{c} : {VT}")
+
+    def rd_sum(c, u, p):
         for i in range(W):
             n = c * W + i
             e(f"    %ue{n} = vector.extract %uk{c}[{i}] : {VT} -> f32")
@@ -162,6 +171,36 @@ def gen():
             e(f"    %u{n} = scalar.addf {u}, %ue{n} : f32")
             e(f"    %p{n} = scalar.addf {p}, %pe{n} : f32")
             u, p = f"%u{n}", f"%p{n}"
+        return u, p
+
+    if G == 0:
+        for c in range(CH):
+            rd_load(c)
+            rd_prod(c)
+            u, p = rd_sum(c, u, p)
+    else:
+        # k/q are wave-uniform, so they are scalar (SMEM) loads, and SMEM results
+        # return out of order: a use waits for ALL outstanding scalar loads
+        # (lgkmcnt(0)). Loaded chunk by chunk that was 39 full drains per token,
+        # and issuing the next group before consuming this one only merged the
+        # waits. So per group: the vector products touch the group's k/q (one
+        # drain, only this group outstanding), THEN the next group's loads go
+        # out, and the long dependent add chain runs while they are in flight.
+        # Same ops, same order of the sums: bit-identical.
+        groups = [list(range(c, min(c + G, CH))) for c in range(0, CH, G)]
+        for c in groups[0]:
+            rd_load(c)
+        for gi, grp in enumerate(groups):
+            e("    scf.schedule.fence")
+            for c in grp:
+                rd_prod(c)
+            e("    scf.schedule.fence")
+            if gi + 1 < len(groups):
+                for c in groups[gi + 1]:
+                    rd_load(c)
+            e("    scf.schedule.fence")
+            for c in grp:
+                u, p = rd_sum(c, u, p)
     tail = f"""\
     %u_inv = scalar.mulf {u}, %inv_k : f32
     %v_minus = scalar.subf %v, %u_inv : f32
@@ -177,15 +216,41 @@ def gen():
     %dk = scalar.mulf %d, %inv_k : f32
     %dk_v = vector.splat %dk : {VT}"""
     L.extend(tail.split("\n"))
-    for c in range(CH):
+    def up_load(c):
+        e(f"    %kr{c} = vector.load %conv_view[%ko{c}] : view<[%conv_total]xf32> -> {VT}")
+
+    def up_math(c):
         # s' = (s*alpha) + (dk*k). k is reloaded and s*alpha recomputed, as the
         # rowsplit update loop does: keeping the readout's copies live across the
         # scalar sums costs 256 extra VGPRs on top of the 128-register state and
         # the allocator gives up (spill-materialization-iteration-limit).
-        e(f"    %kr{c} = vector.load %conv_view[%ko{c}] : view<[%conv_total]xf32> -> {VT}")
         e(f"    %sja{c} = vector.mulf %s{c}, %alpha_v : {VT}")
         e(f"    %kdk{c} = vector.mulf %dk_v, %kr{c} : {VT}")
         e(f"    %sn{c} = vector.addf %sja{c}, %kdk{c} : {VT}")
+
+    if G == 0:
+        for c in range(CH):
+            up_load(c)
+            up_math(c)
+    else:
+        # same discipline for the update: consume a group's k (one drain), then
+        # issue the next group's loads before the rest of the arithmetic
+        GU = max(G, 4)
+        groups = [list(range(c, min(c + GU, CH))) for c in range(0, CH, GU)]
+        for c in groups[0]:
+            up_load(c)
+        for gi, grp in enumerate(groups):
+            e("    scf.schedule.fence")
+            for c in grp:
+                e(f"    %kdk{c} = vector.mulf %dk_v, %kr{c} : {VT}")
+            e("    scf.schedule.fence")
+            if gi + 1 < len(groups):
+                for c in groups[gi + 1]:
+                    up_load(c)
+            e("    scf.schedule.fence")
+            for c in grp:
+                e(f"    %sja{c} = vector.mulf %s{c}, %alpha_v : {VT}")
+                e(f"    %sn{c} = vector.addf %sja{c}, %kdk{c} : {VT}")
     e(f"    scf.yield {', '.join(f'%sn{c}' for c in range(CH))} : {types}")
     e("  }")
     for c in range(CH):
