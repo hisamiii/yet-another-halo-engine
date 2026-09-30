@@ -22,37 +22,39 @@ config.decl @yah_argmax.vocab : %value: index where [range(%value, 1, 1048576)]
 
 kernel.def target(@yah_wave32) @yah_argmax() {
   %unit = index.constant 1 : index
-  %workgroup_size = index.constant 32 : index
+  %workgroup_size = index.constant 1024 : index
   kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
 } launch(%logits: buffer, %out_token: buffer) {
+  // One 1024-lane workgroup: each lane scans a stride-1024 slice (unrolled so
+  // loads overlap), waves reduce with subgroup maxima, and 32 per-wave values
+  // meet in LDS. The lowest matching index is found as the maximum of -index
+  // in f32 (exact below 2^24). Max and lowest-index are order-independent, so
+  // the result is the one-wave kernel's exactly. 248320 logits: 1.9 ms before.
   %base = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
   %c32 = index.constant 32 : index
+  %c1024 = index.constant 1024 : index
   %vocab = config.get @yah_argmax.vocab : index
   %neg_big = scalar.constant -3.0000000000000001e+38 : f32
   %pos_limit = scalar.constant 3.0000000000000001e+38 : f32
-
   %logits_noalias, %out_noalias = buffer.assume.noalias %logits, %out_token : buffer, buffer
   %logits_view = buffer.view %logits_noalias[%base] : buffer -> view<[%vocab]xf32>
   %out_view = buffer.view %out_noalias[%base] : buffer -> view<1xi32>
+  %wbytes = index.constant 128 : offset
+  %wmax = buffer.alloca<workgroup> align(16) %wbytes : buffer
+  %wmax_view = buffer.view %wmax[%base] : buffer -> view<32xf32>
+  %widx = buffer.alloca<workgroup> align(16) %wbytes : buffer
+  %widx_view = buffer.view %widx[%base] : buffer -> view<32xf32>
+  %tid = kernel.workitem.id<x> : index
+  %wave = index.div %tid, %c32 : index
+  %lane = index.rem %tid, %c32 : index
+  %is_lane0 = index.cmp eq, %lane, %c0 : index
 
-  %lane_bytes = index.constant 128 : offset
-  %scratch = buffer.alloca<workgroup> align(16) %lane_bytes : buffer
-  %scratch_view = buffer.view %scratch[%base] : buffer -> view<32xi32>
-
-  %cand_bytes = index.constant 4 : offset
-  %out_scratch = buffer.alloca<workgroup> align(4) %cand_bytes : buffer
-  %out_scratch_view = buffer.view %out_scratch[%base] : buffer -> view<1xi32>
-
-  %lane = kernel.workitem.id<x> : index
-
-  %slice_max = scf.for %i = [%lane to %vocab step %c32](%acc = %neg_big : f32) -> (f32) {
+  %slice_max = scf.for %i = [%tid to %vocab step %c1024](%acc = %neg_big : f32) -> (f32) unroll(%c8) {
     %v = view.load %logits_view[%i] : view<[%vocab]xf32> -> f32
-    // The AMDGPU target has no contract for scalar.isfinitef. A single upper
-    // bound test excludes both NaN (every comparison with NaN is false) and
-    // +inf, which are the values that can corrupt a maximum. -inf still passes
-    // through but cannot win a maximum over any finite value.
+    // NaN and +inf fail this bound and are dropped (see the one-wave version).
     %finite = scalar.cmpf ole, %v, %pos_limit : f32
     %fv = scf.if %finite -> (f32) {
       scf.yield %v : f32
@@ -62,42 +64,49 @@ kernel.def target(@yah_wave32) @yah_argmax() {
     %next = scalar.maxnumf %acc, %fv : f32
     scf.yield %next : f32
   }
-  %row_max = kernel.subgroup.reduce<maxnumf> %slice_max : f32
+  %wave_max = kernel.subgroup.reduce<maxnumf> %slice_max : f32
+  scf.if %is_lane0 {
+    view.store %wave_max, %wmax_view[%wave] : f32, view<32xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %row_max = scf.for %k = [%c0 to %c32 step %c1](%m = %neg_big : f32) -> (f32) {
+    %wm = view.load %wmax_view[%k] : view<32xf32> -> f32
+    %nm = scalar.maxnumf %m, %wm : f32
+    scf.yield %nm : f32
+  }
 
   %vocab_i32 = index.cast %vocab : index to i32
-  %cand = scf.for %i2 = [%lane to %vocab step %c32](%acc2 = %vocab_i32 : i32) -> (i32) {
+  %vocab_f = scalar.sitofp %vocab_i32 : i32 to f32
+  %neg_vocab = scalar.negf %vocab_f : f32
+  %cand = scf.for %i2 = [%tid to %vocab step %c1024](%acc2 = %neg_vocab : f32) -> (f32) unroll(%c8) {
     %v2 = view.load %logits_view[%i2] : view<[%vocab]xf32> -> f32
     %eq = scalar.cmpf oeq, %v2, %row_max : f32
-    %ni = scf.if %eq -> (i32) {
-      %ii = index.cast %i2 : index to i32
-      %better = scalar.cmpi slt, %ii, %acc2 : i32
-      %r = scf.if %better -> (i32) {
-        scf.yield %ii : i32
-      } else {
-        scf.yield %acc2 : i32
-      }
-      scf.yield %r : i32
+    %ii = index.cast %i2 : index to i32
+    %fi = scalar.sitofp %ii : i32 to f32
+    %nfi = scalar.negf %fi : f32
+    %c = scf.if %eq -> (f32) {
+      scf.yield %nfi : f32
     } else {
-      scf.yield %acc2 : i32
+      scf.yield %neg_vocab : f32
     }
-    scf.yield %ni : i32
+    %n2 = scalar.maxnumf %acc2, %c : f32
+    scf.yield %n2 : f32
   }
-  view.store %cand, %scratch_view[%lane] : i32, view<32xi32>
+  %wave_cand = kernel.subgroup.reduce<maxnumf> %cand : f32
+  scf.if %is_lane0 {
+    view.store %wave_cand, %widx_view[%wave] : f32, view<32xf32>
+  }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-
-  %is_leader = index.cmp eq, %lane, %c0 : index
+  %is_leader = index.cmp eq, %tid, %c0 : index
   scf.if %is_leader {
-    %best = scf.for %k = [%c0 to %c32 step %c1](%b = %vocab_i32 : i32) -> (i32) {
-      %cv = view.load %scratch_view[%k] : view<32xi32> -> i32
-      %lt = scalar.cmpi slt, %cv, %b : i32
-      %nb = scf.if %lt -> (i32) {
-        scf.yield %cv : i32
-      } else {
-        scf.yield %b : i32
-      }
-      scf.yield %nb : i32
+    %best = scf.for %k2 = [%c0 to %c32 step %c1](%b = %neg_vocab : f32) -> (f32) {
+      %cv = view.load %widx_view[%k2] : view<32xf32> -> f32
+      %nb = scalar.maxnumf %b, %cv : f32
+      scf.yield %nb : f32
     }
-    view.store %best, %out_view[%c0] : i32, view<1xi32>
+    %best_pos = scalar.negf %best : f32
+    %best_i = scalar.fptosi %best_pos : f32 to i32
+    view.store %best_i, %out_view[%c0] : i32, view<1xi32>
   }
   kernel.return
 }
