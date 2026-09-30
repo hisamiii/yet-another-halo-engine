@@ -807,7 +807,15 @@ int main(int argc, char** argv) {
               {ab.handle, 0, hb(ab)},
               {state.handle, st_off, std::size_t{kTs} * kState * kState * 4},
               {raw.handle, 0, hb(raw)}};
-          Dispatch(gpu, e_rowsplit, "yah_deltanet", kTs, 1, 1, 128, 1, 1, b);
+          // tools/gen_deltanet_hip.py (HIP's row-split order) runs (2, heads)
+          // workgroups of 256; dispatch.txt says so with a "rowsplit.hal" row whose
+          // row-group field is the blocks per head. Without it: the regtile
+          // kernel's (heads) x 128.
+          const auto dn_geom = g_geom.find("rowsplit.hal");
+          if (dn_geom != g_geom.end() && dn_geom->second.rowgrp)
+            Dispatch(gpu, e_rowsplit, "yah_deltanet", dn_geom->second.rowgrp, kTs, 1, 256, 1, 1, b);
+          else
+            Dispatch(gpu, e_rowsplit, "yah_deltanet", kTs, 1, 1, 128, 1, 1, b);
         }
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(raw, static_cast<std::size_t>(B) * kInner * 4, ".raw");

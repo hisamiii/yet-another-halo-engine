@@ -1408,6 +1408,33 @@ Pipeline, bit-identical: 109 -> 70 ms (HIP 46). H=3 is the largest that fits
 64 KB of LDS (the tail stage aliases the V tile). `YAH_ATTN_HEADS=0` restores
 the hand-written kernel; dispatch.txt carries H as `wmma.hal 16 <H> <tiles>`.
 
+### DeltaNet in HIP's arithmetic order -- bit-identical to HIP's kernel
+
+The regtile kernel gives each lane a whole 128-key state row and sums it as a
+128-step sequential chain; within that order it was stuck at ~2x HIP. HIP's
+`BatchedDeltaNetRowSplitKernel<float, 16, 2, false, false>` (the tile it runs
+at pp2048) splits each row over 8 lanes of 16 keys and adds the partials with a
+DPP butterfly. `tools/gen_deltanet_hip.py` ports it op for op, taken from its
+compiled ISA (hipcc -O3, default FP contraction), because the fused
+multiply-adds decide the rounding:
+
+    s <- s*alpha;  t_g = fma(s.w,k.w, fma(s.z,k.z, fma(s.x,k.x, s.y*k.y)))
+    u = (((0 + t0) + t1) + t2) + t3;  u += xor-1, xor-2, xor-4 partners
+    d = beta * fma(-inv_k, u, v);  out = fma(q_scale, p, d * kq_dot)
+    kq_dot = (inv_k*q_scale)*kq;  s <- fma(inv_k*d, k, s)
+
+`tools/deltanet_vs_hip.sh` builds HIP's kernel into a harness
+(`engine/tests/deltanet_hip_ref.hip`), runs both on the same random inputs and
+compares output and final state with atol 0, plus a negative control that must
+fail: bit-identical. k/q/v of token t+1 are loaded while token t computes.
+Standalone 3.32 (regtile) -> 2.07 ms per layer (HIP 1.96 in its pipeline).
+
+This changes the model's numerics (the whole-model reference md5 is now
+1ae50a0e9a5a37a1; the kernel gate is the bit-exact comparison above). Against
+HIP's last-token logits at pp2048: KL(HIP||Loom) 1.88e-8 -> 1.46e-8, max
+|dlogit| 0.106 -> 0.082, argmax 11751 and the top-10 unchanged -- Loom moved
+toward HIP. `YAH_DELTANET_HIP=0` restores the regtile kernel.
+
 ### Q3_K joins the tile GEMM
 
 Q3_K was the last FFN format on the chained kStore (1.5x HIP). `q3k_loads` /

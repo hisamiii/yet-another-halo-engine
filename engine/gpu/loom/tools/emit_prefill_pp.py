@@ -321,6 +321,20 @@ def main():
             fh.write(gen_attn_heads.gen(attn_heads))
         geom.append(("wmma.hal", 16, attn_heads, (B + 15) // 16))
 
+    # DeltaNet: tools/gen_deltanet_hip.py, bit-identical to HIP's
+    # BatchedDeltaNetRowSplitKernel<float,16,2> (tools/deltanet_vs_hip.sh), grid
+    # (2, heads) recorded as the rowsplit.hal row group. YAH_DELTANET_HIP=0 keeps
+    # the regtile kernel (Loom's own sequential-sum order).
+    dn_src = "yah_deltanet_rowsplit_f32.loom"
+    if os.environ.get("YAH_DELTANET_HIP", "1") != "0":
+        import gen_deltanet_hip
+        tmp = os.path.join(outdir, ".emit_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
+        with open(dn_src, "w") as fh:
+            fh.write(gen_deltanet_hip.gen())
+        geom.append(("rowsplit.hal", 0, 2, 0))
+
     # Record the resolved launch geometry with the prepared executables.
     # loom_forward_pp reads this instead of recomputing the grid, so the dispatch
     # site and the compiled kernel cannot disagree (see tools/emit_prefill.py,
@@ -356,7 +370,7 @@ def main():
          ["yah_deltanet_prep_ab.batch=%d" % B,
           "yah_deltanet_prep_ab.qkv_size=10240",
           "yah_deltanet_prep_ab.num_heads=48"]),
-        ("yah_deltanet_rowsplit_f32.loom", "rowsplit.hal",
+        (dn_src, "rowsplit.hal",
          ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
           "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
           "yah_deltanet.num_heads=48"]),
