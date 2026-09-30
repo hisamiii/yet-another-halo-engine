@@ -96,6 +96,22 @@ def geometry():
     return BN, ROWGRP
 
 
+def set_geometry(bm=None, bn=None, wm=None, wn=None):
+    """Switch the workgroup geometry for the next gen() (the emitter uses a
+    16-row tile for the 48-row matrices); returns the previous (BM, BN, WM, WN)."""
+    global BM, BN, WM, WN, TM, TN, FM, FN, NWAVE, LANES, ROWGRP, APL
+    prev = (BM, BN, WM, WN)
+    BM, BN, WM, WN = bm or BM, bn or BN, wm or WM, wn or WN
+    TM, TN = BM // WM, BN // WN
+    FM, FN = TM // 16, TN // 16
+    NWAVE = WM * WN
+    LANES = 32 * NWAVE
+    assert BM % (16 * WM) == 0 and BN % (16 * WN) == 0 and LANES >= BM and LANES % BN == 0
+    ROWGRP = BM // 16
+    APL = LANES // BN
+    return prev
+
+
 def gen(fmt, kind="kstore"):
     F = G.FMTS[fmt]
     ksub = configure(fmt)

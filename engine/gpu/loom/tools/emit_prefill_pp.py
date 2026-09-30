@@ -52,6 +52,12 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
     r = tile_kstore(fmt, mt, kb, B, out, outdir, kind)
     if r:
         return r
+    if mt < 4:
+        # the 48-row ssm_alpha/ssm_beta: one 16-row tile per workgroup, 64 tokens
+        # over 2 waves, (3, B/64) workgroups: 0.40 -> 0.11 ms standalone (Q5_K)
+        r = tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=(16, 64, 1, 2))
+        if r:
+            return r
     if mt % 4 and mt > 4:
         return None
     # Matrices under 64 rows (the 48-row ssm_alpha/ssm_beta, m_tiles=3) get
@@ -72,7 +78,7 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
 TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "q3k")
 
 
-def tile_kstore(fmt, mt, kb, B, out, outdir, kind):
+def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     """Emit the tile GEMM (tools/gen_gemm_tile.py: 16 wave32 waves over a
     128-row x 256-token workgroup, both operands in padded LDS tiles) for this
     shape if it covers it, and return its dispatch.txt geometry, else None.
@@ -80,6 +86,15 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind):
     import gen_gemm_tile as TG
     if os.environ.get("YAH_TILE_GEMM", "1") == "0" or fmt not in TILE_FMTS:
         return None
+    prev_geom = TG.set_geometry(*geom) if geom else None
+    try:
+        return _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind)
+    finally:
+        if prev_geom:
+            TG.set_geometry(*prev_geom)
+
+
+def _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind):
     tile, rowgrp = TG.geometry()
     if mt % rowgrp or B % tile:
         return None
