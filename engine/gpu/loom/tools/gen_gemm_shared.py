@@ -33,6 +33,7 @@ form. The workgroup covers 128*NW tokens, so the HAL's dispatch.txt tile is
 128*NW; the grid is (m_tiles/4, B/(128*NW)).
 """
 import os
+import struct
 import sys
 
 NW = int(os.environ.get("YAH_SD_NW", "2"))
@@ -50,6 +51,14 @@ PAD = int(os.environ.get("YAH_SD_PAD", "0"))
 # and made the kernel slower than the chained one (13.98 -> 16.5 ms/dispatch at
 # pp2048, bit-identical). A narrower phase shrinks the tile at the cost of two
 # barriers per phase.
+# YAH_TG_IQ4F16=1: IQ4_XS codebook looked up as f16 (bit-identical: extf of an
+# exact f16 integer equals sitofp of the int8). YAH_TG_IQ4MULF=<flags> adds
+# fast-math flags to the scale multiply, e.g. "<contract|nnan|nsz>" lets the
+# multiply and the f16 rounding fuse into v_fma_mix (one rounding, as HIP's
+# ISA does -- a numerics change).
+IQ4_F16 = os.environ.get("YAH_TG_IQ4F16", "0") == "1"
+IQ4_MULF = os.environ.get("YAH_TG_IQ4MULF", "")
+
 KSUB = PH = GPP = GPL = ROWP = None
 
 
@@ -242,14 +251,45 @@ def iq4xs_compute(v, gb):
         e(f"    %dsc_v{u} = vector.splat %dsc{u} : vector<16xf32>")
         e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
         e(f"    %nhi{u} = vector.shrui {q}, %s4v : vector<16xi8>")
-        e(f"    %clo{u} = vector.table.lookup %kvt[%nlo{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
-        e(f"    %chi{u} = vector.table.lookup %kvt[%nhi{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
-        e(f"    %flo{u} = vector.sitofp %clo{u} : vector<16xi8> to vector<16xf32>")
-        e(f"    %fhi{u} = vector.sitofp %chi{u} : vector<16xi8> to vector<16xf32>")
-        e(f"    %vlo{u} = vector.mulf %dsc_v{u}, %flo{u} : vector<16xf32>")
-        e(f"    %vhi{u} = vector.mulf %dsc_v{u}, %fhi{u} : vector<16xf32>")
-        e(f"    %hlo{u} = vector.fptrunc %vlo{u} : vector<16xf32> to vector<16xf16>")
-        e(f"    %hhi{u} = vector.fptrunc %vhi{u} : vector<16xf32> to vector<16xf16>")
+        if IQ4_F16:
+            # the codebook as f16 (every entry is an exact small integer), as
+            # HIP's DecodeIqRaw looks it up: extf gives the same f32 as sitofp
+            # low and high bytes of the f16 bit patterns looked up separately
+            # (byte tables lower to v_perm), interleaved into f16 values
+            for part, nib in (("lo", f"%nlo{u}"), ("hi", f"%nhi{u}")):
+                e(f"    %cb{part}{u}l = vector.table.lookup %kvtl[{nib}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+                e(f"    %cb{part}{u}h = vector.table.lookup %kvth[{nib}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+                e(f"    %cb{part}{u}lw = vector.extui %cb{part}{u}l : vector<16xi8> to vector<16xi16>")
+                e(f"    %cb{part}{u}hw = vector.extui %cb{part}{u}h : vector<16xi8> to vector<16xi16>")
+                e(f"    %cb{part}{u}hs = vector.shli %cb{part}{u}hw, %s8w : vector<16xi16>")
+                e(f"    %cb{part}{u}i = vector.ori %cb{part}{u}lw, %cb{part}{u}hs : vector<16xi16>")
+                e(f"    %c{part}{u} = vector.bitcast %cb{part}{u}i : vector<16xi16> to vector<16xf16>")
+                e(f"    %f{part}{u} = vector.extf %c{part}{u} : vector<16xf16> to vector<16xf32>")
+        else:
+            e(f"    %clo{u} = vector.table.lookup %kvt[%nlo{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+            e(f"    %chi{u} = vector.table.lookup %kvt[%nhi{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+            e(f"    %flo{u} = vector.sitofp %clo{u} : vector<16xi8> to vector<16xf32>")
+            e(f"    %fhi{u} = vector.sitofp %chi{u} : vector<16xi8> to vector<16xf32>")
+        if IQ4_MULF:
+            # scalar form: fptrunc(mulf<contract>) pairs feeding from_elements
+            # are what AMDGPU source-to-low selects as v_fma_mix{lo,hi}_f16
+            for part in ("lo", "hi"):
+                hs = []
+                for j in range(16):
+                    if IQ4_F16:
+                        e(f"    %x{part}{u}_{j} = vector.extract %c{part}{u}[{j}] : vector<16xf16> -> f16")
+                        e(f"    %y{part}{u}_{j} = scalar.extf %x{part}{u}_{j} : f16 to f32")
+                    else:
+                        e(f"    %y{part}{u}_{j} = vector.extract %f{part}{u}[{j}] : vector<16xf32> -> f32")
+                    e(f"    %m{part}{u}_{j} = scalar.mulf{IQ4_MULF} %dsc{u}, %y{part}{u}_{j} : f32")
+                    e(f"    %t{part}{u}_{j} = scalar.fptrunc %m{part}{u}_{j} : f32 to f16")
+                    hs.append(f"%t{part}{u}_{j}")
+                e(f"    %h{part}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
+        else:
+            e(f"    %vlo{u} = vector.mulf{IQ4_MULF} %dsc_v{u}, %flo{u} : vector<16xf32>")
+            e(f"    %vhi{u} = vector.mulf{IQ4_MULF} %dsc_v{u}, %fhi{u} : vector<16xf32>")
+            e(f"    %hlo{u} = vector.fptrunc %vlo{u} : vector<16xf32> to vector<16xf16>")
+            e(f"    %hhi{u} = vector.fptrunc %vhi{u} : vector<16xf32> to vector<16xf16>")
         e(f"    %col_i{u} = scalar.shli %gl{u}, %c5i : i32")
         e(f"    %col_x{u} = index.cast %col_i{u} : i32 to index")
         e(f"    %col_l{u} = index.max %col_x{u}, %c0 : index")
@@ -985,6 +1025,12 @@ def q8_0_compute(v, gb):
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
     L.append("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
+    if IQ4_F16:
+        bits = [struct.unpack("<H", struct.pack("<e", float(v)))[0] for v in IQ4_KVALUES]
+        for nm, part in (("l", [b & 255 for b in bits]), ("h", [b >> 8 for b in bits])):
+            L += [f"  %kvb{nm}{i} = scalar.constant {x - 256 if x > 127 else x} : i8" for i, x in enumerate(part)]
+            L.append(f"  %kvt{nm} = vector.from_elements " + ", ".join(f"%kvb{nm}{i}" for i in range(16)) + " : vector<16xi8>")
+        L += ["  %c8w = scalar.constant 8 : i16", "  %s8w = vector.splat %c8w : vector<16xi16>"]
     L += ["  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8",
           "  %m15v = vector.splat %c15b : vector<16xi8>", "  %s4v = vector.splat %c4b : vector<16xi8>"]
     return L

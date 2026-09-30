@@ -1508,6 +1508,25 @@ interleaved: 175/185 -> 142/151 ms (HIP 122 ms for the same dispatches).
   K=5120 9.96 -> 10.18/10.29 ms (pad 32/64), at K=17408 9.97 -> 9.92/9.58/9.52/
   9.91 (pad 16/32/48/64). ~4% on the down projection only, and every producer
   would have to write the padded pitch; the knob stays, off.
+- The barrier before the MMA loop is 26% of IQ4_XS wave time (ATT): at KSUB=64
+  a phase has 128 rows x 2 groups = 256 decode jobs for 512 lanes, so waves
+  0-7 decode while 8-15 wait. Spreading it: 256 x 128 tiles (WM=8, WN=2, all
+  512 lanes decode, 128 VGPRs, bit-identical) 9.97 -> 10.31 ms -- halving BN
+  doubles the decode per MMA (VALU 31% -> 48% of wave time). KSUB=32 (128 VGPRs,
+  tier 8) 10.61. Inner k-loop `unroll(%c4)` 10.48, with `schedule(interleaved)`
+  11.68. Waves sit round-robin on the SIMDs, so every SIMD has decoding waves;
+  and on RDNA3 WMMA issues through the VALU pipe, so decode and MMA compete for
+  the same issue slots either way.
+- HIP's IQ4_XS decode is 3.6-3.9 VALU per WMMA to our 6.6: an f16 codebook
+  assembled with six `v_perm`s per 8 values, then one `v_fma_mix{lo,hi}_f16`
+  per element (one rounding). Loom selects `v_fma_mix` for scalar
+  `fptrunc(mulf<contract|nnan|nsz>)` feeding `vector.from_elements`
+  (`YAH_TG_IQ4MULF`), but not for the vector form; an f16 `vector.table.lookup`
+  scalarizes (1520 static VALU), i8 `vector.interleave` is rejected on gfx11,
+  and zext/shift/or assembly costs more than it saves (`YAH_TG_IQ4F16`: 10.21
+  ms). The int8 codebook with the fused multiply (HIP's rounding, not
+  bit-identical to ours) cuts static VALU 426 -> 387 and times 10.08 vs 10.10:
+  instruction count is not the limit. Both knobs stay, off.
 - Load cache hints (`{cache_scope = cu, cache_temporal =
   non_temporal_high_temporal}`, TH_LOAD_NT_HT on gfx12): Loom's gfx11 encoding
   (`gfx11_glc_slc_dlc`) accepts only device/regular and drops anything else

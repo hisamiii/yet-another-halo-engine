@@ -221,7 +221,17 @@ def gen(fmt, kind="kstore"):
     e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2} : offset")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
-    e(f"  %al_bytes = index.constant {BN * arow * 2} : offset")
+    # the LDS epilogue reuses one of the tiles for wave-private TM x 16 f32
+    # slabs: the activation tile if it is big enough, else the weight tile,
+    # else the activation tile grows
+    al_bytes = BN * arow * 2
+    G.EPI_TILE = "%al"
+    if EPI_LDS and TM == 32 and NWAVE * TM * 16 * 4 > al_bytes:
+        if BM * G.ROWP * 2 >= NWAVE * TM * 16 * 4:
+            G.EPI_TILE = "%wl"
+        else:
+            al_bytes = NWAVE * TM * 16 * 4
+    e(f"  %al_bytes = index.constant {al_bytes} : offset")
     e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
     e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
     e(f"  %carow = index.constant {arow} : index")
@@ -489,8 +499,8 @@ def lds_epilogue(e, kr, V8):
     e(f"  %es_wb = index.constant {TM * 16 * 4} : index")
     e("  %es_off_i = index.mul %wave, %es_wb : index")
     e("  %es_off = index.cast %es_off_i : index to offset")
-    e(f"  %es_view = buffer.view %al[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
-    e(f"  %es_flat = buffer.view %al[%es_off] : buffer -> view<{TM * 16}xf32>")
+    e(f"  %es_view = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
+    e(f"  %es_flat = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{TM * 16}xf32>")
     e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
