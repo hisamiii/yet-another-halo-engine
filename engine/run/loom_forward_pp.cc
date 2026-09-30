@@ -122,6 +122,12 @@ bool g_fused_residual = true;  // YAH_FUSED_RESIDUAL=0 disables the gemm_kres pa
 std::map<std::string, double> g_per_name;
 std::map<std::string, int> g_per_count;
 std::chrono::steady_clock::time_point g_mark = std::chrono::steady_clock::now();
+// YAH_LOOM_SEQ=<path>: every dispatch's key (HAL or kernel name) and grid in
+// submission order, written at exit. No synchronization, so it pairs with an
+// HRX_PROFILE_FILE=... HRX_PROFILE_MODE=dispatch capture of the same run: the
+// profile has device durations per dispatch but only anonymous executable ids.
+std::FILE* g_seq = nullptr;
+std::size_t g_seq_n = 0;
 
 void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
@@ -131,6 +137,9 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
   // fallback for metadata that does not carry one.
   const std::uint32_t ordinal = exe.OrdinalOrZero(name);
   const std::uint32_t ws = exe.WorkgroupSize(ordinal);
+  if (g_seq)
+    std::fprintf(g_seq, "%zu,%s,%u,%u,%u\n", g_seq_n++,
+                 g_key.empty() ? name : g_key.c_str(), gx, gy, gz);
   if (g_time >= 2) gpu.Synchronize();
   g_mark = std::chrono::steady_clock::now();
   gpu.Dispatch(exe, ordinal, LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz),
@@ -261,6 +270,10 @@ int main(int argc, char** argv) {
   const char* ids_path = argc > 5 ? argv[5] : "/home/q/yah-scratch/ids2048.txt";
   { const char* t = std::getenv("YAH_LOOM_TIME");
     g_time = t ? std::min(std::atoi(t), 3) : 0; }
+  if (const char* q = std::getenv("YAH_LOOM_SEQ")) {
+    g_seq = std::fopen(q, "w");
+    if (g_seq) std::fprintf(g_seq, "seq,key,gx,gy,gz\n");
+  }
   // YAH_DUMP_LAYER=<l> writes three checkpoints from layer l: the mixer input
   // (the f16 normed activation), hidden after the mixer, and hidden after the
   // FFN. It exists to locate a stage that disagrees between two token counts.
@@ -889,6 +902,7 @@ int main(int argc, char** argv) {
       for (auto& r : rows)
         std::fprintf(stderr, "%9.1f  %5d  %7.3f  %s\n", r.first, g_per_count[r.second], r.first / g_per_count[r.second], r.second.c_str());
     }
+    if (g_seq) std::fclose(g_seq);
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "loom_forward_pp: %s\n", error.what());

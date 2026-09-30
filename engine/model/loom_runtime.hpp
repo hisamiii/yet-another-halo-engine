@@ -171,7 +171,11 @@ class LoomDevice {
   LoomDevice& operator=(const LoomDevice&) = delete;
   ~LoomDevice() {
     if (stream_) hrx_stream_release(stream_);
-    if (device_) hrx_device_release(device_);
+    // device_ is borrowed: hrx_gpu_device_get does not retain it, so releasing
+    // it here drops the runtime's own reference and clears the device before
+    // hrx_gpu_shutdown runs. That silently skipped the device profiling end:
+    // with HRX_PROFILE_FILE set, the profile had a session_begin and nothing
+    // else (no dispatch events, no session_end). hrx_gpu_shutdown releases it.
     if (initialized_) hrx_gpu_shutdown();
   }
 

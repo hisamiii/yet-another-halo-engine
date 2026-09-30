@@ -1218,6 +1218,57 @@ on a quiet GPU, with no other dispatch in flight. Only the paired full-pipeline
 A/B is a result, and the machine drifts enough between batches (up to ~30 ms on
 the same HAL set) that only interleaved paired differences should be read.
 
+### Per-kernel parity against HIP, from device timestamps
+
+The target is every Loom kernel at or above its HIP counterpart, so both sides
+are measured per dispatch on the device, not by host-synchronized wallclock
+(`YAH_LOOM_TIME=2/3` adds a sync and launch latency to every kernel):
+
+```sh
+# HIP: rocprofv3 sees the HIP runtime's HSA queue
+rocprofv3 --kernel-trace --output-format csv -d hiptrace -o run -- \
+  engine/build/yah-run <gguf> --ids-file ids2048.txt
+# Loom: HRX's own profiler (rocprofv3 does not see HRX dispatches) plus the
+# driver's dispatch order, which names the HAL behind each anonymous executable
+YAH_LOOM_SEQ=seq.csv HRX_PROFILE_FILE=p.irpf HRX_PROFILE_MODE=dispatch \
+  engine/build/loom_forward_pp <gguf> <hal dir> <out> 2048
+iree-profile dispatch --dispatch_events --format=jsonl p.irpf > loom.jsonl
+python3 engine/run/kernel_parity.py hiptrace/run_kernel_trace.csv loom.jsonl seq.csv
+```
+
+The script keys GEMMs by (epilogue, format, M, K) on both sides: it splits both
+streams at the half_norms (two per layer) and pairs each HIP GEMM with the Loom
+one of the same format and M in that segment, and it folds HIP's fused gate+up
+together with Loom's gate kStore + SwiGLU pair so they are compared as one step.
+
+Two things had to change before the Loom side produced anything. `LoomDevice`
+released the device it got from `hrx_gpu_device_get`, which does not retain it,
+so by the time `hrx_gpu_shutdown` ended the profiling session the device had no
+HAL handle and the file held a session_begin and nothing else. And HRX's native
+stream created its command buffers without `RETAIN_PROFILE_METADATA`, so they
+got no profile id and the AMDGPU driver skipped every dispatch in them (the HRX
+graph executor already sets the flag when profiling is active; the stream in the
+local HRX checkout now does the same).
+
+First table, sd12 HAL set against yah-run, IQ4_XS shard, pp2048 (ms summed over
+the run, device time):
+
+| category | HIP | Loom | Loom/HIP |
+|---|---:|---:|---:|
+| GEMMs (M > 64) | 3164 | 4663 | 1.47 |
+| DeltaNet | 94 | 259 | 2.76 |
+| attention | 46 | 109 | 2.38 |
+| half_norm | 37 | 68 | 1.83 |
+| small GEMMs (M = 48) | 16 | 42 | 2.67 |
+| head GEMV | 4.5 | 15.3 | 3.42 |
+| ssm_conv, ssm_postnorm, unpack_qg, prep_kq, half_cast | 94 | 93 | ~1.0 |
+| fused QK-norm/RoPE | 17.8 | 11.0 | 0.62 |
+| total | 3479 | 5263 | 1.51 |
+
+The GEMM ratio runs from 1.28 (iq3s/iq3xxs attn/ssm out) to 1.9 (iq4xs
+ffn_down, q4k 10240-row qkv); Loom is already ahead on iq3s 6144x5120 (0.55) and
+q4k ffn_down (0.88).
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
