@@ -1510,7 +1510,12 @@ with the epilogue slab). Same registers, same MMA order: bit-identical.
 Standalone (17408x5120, 10240x5120 for Q4_K), ms: IQ4_XS 9.97 -> 9.71, Q4_K
 6.18 -> 5.96 (with word nibbles; 6.33 without), Q5_K 11.85 -> 10.94, Q6_K 11.89
 -> 11.55, Q3_K 11.41 -> 11.41, IQ3_S 10.10 -> 10.96, IQ3_XXS 10.07 -> 10.79 (their
-grid tables are LDS reads that now contend with the fragment loads). Default on
+IQ3 decode is the long pole: the ATT trace of IQ3_S with decode-ahead has LDS
+stalls *down* (6.0% -> 1.3% of wave time, so not table contention) and one
+barrier at 46%: at KSUB=32 a phase has one 32-element group per row, so only 4
+waves decode (8 at KSUB=64) while each phase's MMA work halves, and IQ3_S's
+decode, ~11 VALU per WMMA, no longer fits in the MMA shadow. Spreading a group
+over two lanes would be the fix). Default on
 for IQ4_XS, Q4_K, Q5_K, Q6_K (`DECAHEAD_FMTS`), not for the 16-row tiles (16
 decoding lanes are not a wave), and not for IQ4_XS kres at K=6144, which lost in
 two paired profiles (`DECAHEAD_SKIP`, emit_prefill_pp.py). The Q4_K/Q5_K word
@@ -1572,7 +1577,11 @@ regenerated IQ4_XS/Q4_K/Q5_K/Q6_K HALs.
   set it is, so pairs are now run in both orders.
 - The IQ3 grid tables read from global memory instead of LDS (`YAH_SD_GRID_LDS=0`,
   as HIP's `__device__` tables): IQ3_S 10.10 -> 11.74, IQ3_XXS 10.07 -> 11.73 ms
-  standalone; with decode-ahead 12.08 / 11.51. Cause not yet traced.
+  standalone; with decode-ahead 12.08 / 11.51. Traced: s_waitcnt 16.5% -> 27.2%
+  of wave time, the new stall a `vmcnt(2)` in the decoding waves only -- the
+  eight lookups per group are a dependent chain (bytes -> index -> table ->
+  element), and a global L0 hit is slower than a ds_read, with too few waves to
+  hide it.
 - wave64 tile GEMM (`YAH_TG_W64=1`: accumulators `vector<4xf32>`, operand
   fragments unchanged, direct epilogue), IQ4_XS 17408x5120 with decode-ahead,
   all bit-identical, against 9.71 ms wave32: 8 waves of 32x128 (152 VGPRs)
