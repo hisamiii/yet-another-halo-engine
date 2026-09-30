@@ -1408,6 +1408,16 @@ Pipeline, bit-identical: 109 -> 70 ms (HIP 46). H=3 is the largest that fits
 64 KB of LDS (the tail stage aliases the V tile). `YAH_ATTN_HEADS=0` restores
 the hand-written kernel; dispatch.txt carries H as `wmma.hal 16 <H> <tiles>`.
 
+### Q3_K joins the tile GEMM
+
+Q3_K was the last FFN format on the chained kStore (1.5x HIP). `q3k_loads` /
+`q3k_compute` in `tools/gen_gemm_shared.py` decode a 32-element group per lane
+with 16-wide vector integer ops -- low bits `(qs >> 2*(g%4)) & 3`, high bit
+`(hmask >> g) & 1`, scales `2g` and `2g+1` from the packed 12-byte array -- and
+keep the chained kernel's f32 order, `(f32(d) * f32(scale)) * f32(quant)`, so
+the tile and shared kernels are bit-identical to it. Q3_K device time at pp2048,
+interleaved: 175/185 -> 142/151 ms (HIP 122 ms for the same dispatches).
+
 ### half_norm: the same loop, unrolled
 
 `yah_half_norm` (fused=0) was 1.85x HIP's `HalfNorm5120` (68.7 vs 37.1 ms over

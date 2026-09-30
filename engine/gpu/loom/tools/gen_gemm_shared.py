@@ -990,6 +990,123 @@ def iq4xs_setup():
     return L
 
 
+def q3k_loads(p, blk, gb):
+    """block_q3_K (110 B): hmask[32] @0, qs[64] @32, scales[12] @96, d f16 @108.
+    Group g (32 elements) of the block: half = g/4, sp = g%4; element h16*16 + j
+    reads qs[32*half + 16*h16 + j] (bits 2sp..2sp+1) and hmask[16*h16 + j] (bit
+    g); its two 16-element halves use scales si = 2g and 2g+1."""
+    L = []
+    e = L.append
+    vals = []
+    e(f"    %{p}dq_h = scalar.shrui {blk}, %c1i : i32")
+    e(f"    %{p}dq_i = scalar.addi %{p}dq_h, %q3c54i : i32")
+    e(f"    %{p}dq_ix = index.cast %{p}dq_i : i32 to index")
+    e(f"    %{p}dq_lo = index.max %{p}dq_ix, %c0 : index")
+    e(f"    %{p}dq_idx = index.min %{p}dq_lo, %w_half_last : index")
+    e(f"    %{p}dh = view.load %w_f16_view[%{p}dq_idx] : view<[%w_halfs]xf16> -> f16")
+    vals.append((f"%{p}dh", "f16"))
+    e(f"    %{p}hm_b = scalar.addi {blk}, %c16i : i32")
+    _ldv(e, p, "hma", blk, 16)
+    _ldv(e, p, "hmb", f"%{p}hm_b", 16)
+    vals += [(f"%{p}hma", "vector<16xi8>"), (f"%{p}hmb", "vector<16xi8>")]
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}hf{u} = scalar.shrui %{p}g{u}, %c2i : i32")
+        e(f"    %{p}hf32_{u} = scalar.shli %{p}hf{u}, %c5i : i32")
+        e(f"    %{p}qo{u} = scalar.addi {blk}, %{p}hf32_{u} : i32")
+        e(f"    %{p}qa_o{u} = scalar.addi %{p}qo{u}, %c32i : i32")
+        e(f"    %{p}qb_o{u} = scalar.addi %{p}qo{u}, %c48i : i32")
+        _ldv(e, p, f"qa{u}", f"%{p}qa_o{u}", 16)
+        _ldv(e, p, f"qb{u}", f"%{p}qb_o{u}", 16)
+        vals += [(f"%{p}qa{u}", "vector<16xi8>"), (f"%{p}qb{u}", "vector<16xi8>")]
+        # low-nibble scale bytes scales[2*(g&3)] and +1, high bytes scales[8+2*(g&1)] and +1
+        e(f"    %{p}g3_{u} = scalar.andi %{p}g{u}, %c3i : i32")
+        e(f"    %{p}g3x2_{u} = scalar.shli %{p}g3_{u}, %c1i : i32")
+        e(f"    %{p}sl0_{u} = scalar.addi {blk}, %q3c96i : i32")
+        e(f"    %{p}sla_o{u} = scalar.addi %{p}sl0_{u}, %{p}g3x2_{u} : i32")
+        e(f"    %{p}slb_o{u} = scalar.addi %{p}sla_o{u}, %c1i : i32")
+        e(f"    %{p}g1_{u} = scalar.andi %{p}g{u}, %c1i : i32")
+        e(f"    %{p}g1x2_{u} = scalar.shli %{p}g1_{u}, %c1i : i32")
+        e(f"    %{p}sh0_{u} = scalar.addi {blk}, %c104i : i32")
+        e(f"    %{p}sha_o{u} = scalar.addi %{p}sh0_{u}, %{p}g1x2_{u} : i32")
+        e(f"    %{p}shb_o{u} = scalar.addi %{p}sha_o{u}, %c1i : i32")
+        _ld8(e, p, f"la{u}", f"%{p}sla_o{u}")
+        _ld8(e, p, f"lb{u}", f"%{p}slb_o{u}")
+        _ld8(e, p, f"ha{u}", f"%{p}sha_o{u}")
+        _ld8(e, p, f"hb{u}", f"%{p}shb_o{u}")
+        vals += [(f"%{p}la{u}", "i8"), (f"%{p}lb{u}", "i8"), (f"%{p}ha{u}", "i8"), (f"%{p}hb{u}", "i8")]
+    return L, vals
+
+
+def q3k_compute(v, gb):
+    """The chained kernel's Q3_K element decode (yah_ffn_gemm_q3k_f32.loom):
+      low = (qs >> 2sp) & 3, bit = (hmask >> g) & 1, quant = (low | bit<<2) - 4
+      low4 = (scales[si&7] >> 4*(si>>3)) & 15, high2 = (scales[8+si%4] >> 2*(si>>2)) & 3
+      scale = (low4 | high2<<4) - 32, value = (f32(d) * f32(scale)) * f32(quant)
+    The integer steps are exact, so doing them 16 lanes of a vector at a time
+    gives the chained kernel's values; the f32 products keep its order."""
+    L = []
+    e = L.append
+    it = iter(v)
+    dh = next(it); hma = next(it); hmb = next(it)
+    e(f"    %d = scalar.extf {dh} : f16 to f32")
+    for u in range(GPL):
+        qa = next(it); qb = next(it)
+        la = next(it); lb = next(it); ha = next(it); hb = next(it)
+        e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %q3sp{u} = scalar.andi %g{u}, %c3i : i32")
+        e(f"    %q3ls{u} = scalar.shli %q3sp{u}, %c1i : i32")
+        e(f"    %q3ls8_{u} = scalar.trunci %q3ls{u} : i32 to i8")
+        e(f"    %q3lsv{u} = vector.splat %q3ls8_{u} : vector<16xi8>")
+        e(f"    %q3bs8_{u} = scalar.trunci %g{u} : i32 to i8")
+        e(f"    %q3bsv{u} = vector.splat %q3bs8_{u} : vector<16xi8>")
+        e(f"    %q3hf{u} = scalar.shrui %g{u}, %c2i : i32")
+        e(f"    %q3s4{u} = scalar.shli %q3hf{u}, %c2i : i32")
+        e(f"    %q3g2{u} = scalar.shrui %g{u}, %c1i : i32")
+        e(f"    %q3s2{u} = scalar.shli %q3g2{u}, %c1i : i32")
+        e(f"    %col_i{u} = scalar.shli %gl{u}, %c5i : i32")
+        e(f"    %col_x{u} = index.cast %col_i{u} : i32 to index")
+        e(f"    %col_l{u} = index.max %col_x{u}, %c0 : index")
+        e(f"    %col{u} = index.min %col_l{u}, %ccolmax : index")
+        e(f"    %colh{u} = index.add %col{u}, %c16 : index")
+        for hn, q, hm, lo8, hi8, col in (("lo", qa, hma, la, ha, f"%col{u}"), ("hi", qb, hmb, lb, hb, f"%colh{u}")):
+            t = f"{hn}{u}"
+            e(f"    %q3lw{t} = vector.shrui {q}, %q3lsv{u} : vector<16xi8>")
+            e(f"    %q3low{t} = vector.andi %q3lw{t}, %q3m3v : vector<16xi8>")
+            e(f"    %q3bw{t} = vector.shrui {hm}, %q3bsv{u} : vector<16xi8>")
+            e(f"    %q3bit{t} = vector.andi %q3bw{t}, %q3m1v : vector<16xi8>")
+            e(f"    %q3b2{t} = vector.shli %q3bit{t}, %q3s2v : vector<16xi8>")
+            e(f"    %q3lb{t} = vector.ori %q3low{t}, %q3b2{t} : vector<16xi8>")
+            e(f"    %q3qn{t} = vector.subi %q3lb{t}, %q3f4v : vector<16xi8>")
+            e(f"    %q3qf{t} = vector.sitofp %q3qn{t} : vector<16xi8> to vector<16xf32>")
+            e(f"    %q3l8{t} = scalar.extui {lo8} : i8 to i32")
+            e(f"    %q3l4s{t} = scalar.shrui %q3l8{t}, %q3s4{u} : i32")
+            e(f"    %q3l4{t} = scalar.andi %q3l4s{t}, %c15i : i32")
+            e(f"    %q3h8{t} = scalar.extui {hi8} : i8 to i32")
+            e(f"    %q3h2s{t} = scalar.shrui %q3h8{t}, %q3s2{u} : i32")
+            e(f"    %q3h2{t} = scalar.andi %q3h2s{t}, %c3i : i32")
+            e(f"    %q3h4{t} = scalar.shli %q3h2{t}, %c4i : i32")
+            e(f"    %q3s6{t} = scalar.ori %q3l4{t}, %q3h4{t} : i32")
+            e(f"    %q3sc{t} = scalar.subi %q3s6{t}, %c32i : i32")
+            e(f"    %q3scf{t} = scalar.sitofp %q3sc{t} : i32 to f32")
+            e(f"    %q3dsc{t} = scalar.mulf %d, %q3scf{t} : f32")
+            e(f"    %q3dv{t} = vector.splat %q3dsc{t} : vector<16xf32>")
+            e(f"    %q3v{t} = vector.mulf %q3dv{t}, %q3qf{t} : vector<16xf32>")
+            e(f"    %h{hn}{u} = vector.fptrunc %q3v{t} : vector<16xf32> to vector<16xf16>")
+        e(f"    vector.store %hlo{u}, %wl_view[%drow, %col{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+        e(f"    vector.store %hhi{u}, %wl_view[%drow, %colh{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+    return L
+
+
+def q3k_setup():
+    return ["  %q3c54i = scalar.constant 54 : i32", "  %q3c96i = scalar.constant 96 : i32",
+            "  %q3c3b = scalar.constant 3 : i8", "  %q3c1b = scalar.constant 1 : i8",
+            "  %q3c2b = scalar.constant 2 : i8", "  %q3c4b = scalar.constant 4 : i8",
+            "  %q3m3v = vector.splat %q3c3b : vector<16xi8>", "  %q3m1v = vector.splat %q3c1b : vector<16xi8>",
+            "  %q3s2v = vector.splat %q3c2b : vector<16xi8>", "  %q3f4v = vector.splat %q3c4b : vector<16xi8>"]
+
+
 FMTS = {
     # fmt: block bytes, (loads, compute), extra buffer bindings after %weight, setup
     # ksub: measured best phase width at pp2048 (mean ms per dispatch, NW=2):
@@ -1005,6 +1122,7 @@ FMTS = {
                 extra=[], setup=q4k_setup),
     "q8_0": dict(bb=272, kdiv=8, ksub=64, decode=(q8_0_loads, q8_0_compute), extra=[], setup=lambda: []),
     "q6k": dict(bb=210, ksub=64, decode=(q6k_loads, q6k_compute), extra=[], setup=q6k_setup),
+    "q3k": dict(bb=110, ksub=64, decode=(q3k_loads, q3k_compute), extra=[], setup=q3k_setup),
     "iq2xxs": dict(bb=66, ksub=64, decode=(iq2xxs_loads, iq2xxs_compute), extra=["grid", "ksigns"], setup=iq2xxs_setup),
     "iq3xxs": dict(bb=98, ksub=64, decode=(iq3xxs_loads, iq3xxs_compute), extra=["grid", "ksigns"], setup=iq3xxs_setup),
 }
