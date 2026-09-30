@@ -60,7 +60,7 @@ if [ "$(id -u)" = "0" ]; then DMESG="dmesg"; else DMESG="doas dmesg"; fi
 $DMESG >> "$LOG" 2>&1
 
 # Follower: its writes are visible in the file as they happen.
-$DMESG -w > "$LOGDIR/.dmesg-w-${STAMP}.log" 2>&1 &
+$DMESG -W > "$LOGDIR/.dmesg-w-${STAMP}.log" 2>&1 &  # -W: new messages only (-w replays the buffer)
 FOLLOWER=$!
 
 sync
@@ -80,9 +80,12 @@ $DMESG >> "$LOG" 2>&1
 rm -f "$LOGDIR/.dmesg-w-${STAMP}.log"
 
 echo "gpu_run: exit=$RC log=$LOG"
-FAULT="$(grep -icE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' "$LOG" 2>/dev/null || true)"
+# only lines logged during the run (the follower section): the before/after
+# snapshots repeat the whole boot's history, old warnings included
+DURING="$(sed -n '/^### --- dmesg follower ---/,/^### --- dmesg after ---/p' "$LOG")"
+FAULT="$(grep -icE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' <<<"$DURING" || true)"
 if [ "$FAULT" != "0" ]; then
-  echo "gpu_run: *** $FAULT GPU fault line(s) in the log ***"
-  grep -iE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' "$LOG" | tail -10
+  echo "gpu_run: *** $FAULT GPU fault line(s) logged during the run ***"
+  grep -iE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' <<<"$DURING" | tail -10
 fi
 exit $RC

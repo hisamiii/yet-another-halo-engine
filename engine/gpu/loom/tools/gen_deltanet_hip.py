@@ -138,7 +138,13 @@ def gen():
     types = ", ".join([V4] * 8)
     ltypes = types + ", " + ", ".join(ptypes)
     res = ", ".join(f"%sf{r}{g}" for r in range(2) for g in range(4)) + ", " + ", ".join(f"%pf_{i}" for i in range(10))
-    e(f"  {res} = scf.for %t = [%c0 to %batch step %c1]({carried}) -> ({ltypes}) {{")
+    # unroll(4) schedule(recurrence): the rolled loop copied the carried state
+    # and the prefetched k/q/v back into place on every backedge (compile
+    # report move_causes branch_edge, 60 v_mov per token against HIP's none);
+    # unrolled, the iterations alternate registers. 2.058 -> 1.829 ms
+    # standalone, bit-identical (tools/deltanet_vs_hip.sh). YAH_DN_POL overrides.
+    pol = __import__("os").environ.get("YAH_DN_POL", "unroll(%c4) schedule(recurrence)")
+    e(f"  {res} = scf.for %t = [%c0 to %batch step %c1]({carried}) -> ({ltypes}) {pol} {{")
     # next token's loads go out first; this token computes on the carried values
     e("    %t_n0 = index.add %t, %c1 : index")
     e("    %t_n = index.min %t_n0, %last_t : index")

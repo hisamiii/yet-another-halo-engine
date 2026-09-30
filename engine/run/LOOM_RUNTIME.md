@@ -1435,6 +1435,19 @@ HIP's last-token logits at pp2048: KL(HIP||Loom) 1.88e-8 -> 1.46e-8, max
 |dlogit| 0.106 -> 0.082, argmax 11751 and the top-10 unchanged -- Loom moved
 toward HIP. `YAH_DELTANET_HIP=0` restores the regtile kernel.
 
+**Unrolled token loop.** Side by side, the ATT traces of the two kernels (same
+arithmetic) differ in issue count, not in math: HIP is 71% vmcnt waits and 117
+VALU per token-iteration per wave, Loom 75% VALU and 233. Per iteration Loom had
+84 `v_fma_f32` and 60 `v_mov_b32` where HIP has 29 `v_dual_fmac` + 20 `v_fmac`
+and no moves; the compile report's `move_causes` put 33 units on `branch_edge`:
+the loop yields the new state and the prefetched k/q/v in fresh registers and
+copies them back on every backedge. `unroll(%c4) schedule(recurrence)` on the
+token loop lets the iterations alternate registers: static moves per token 81 ->
+44, 2.058 -> 1.829 ms standalone (`unroll(%c2)` 1.857), still bit-identical to
+HIP's kernel at 256 and 203 tokens. pp2048 pipeline 120 -> 104 ms (HIP 94). The
+FMAs are still three-operand `v_fma_f32` (no in-place `v_fmac`, so no dual-issue
+pairs); that and the remaining `low_slice` moves are the rest of the gap.
+
 ### Attention in HIP's arithmetic order -- bit-identical to HIP's kernel
 
 `tools/gen_attn_hip.py` ports HIP's `WmmaCausalAttention<32, 16, true>`: 32
