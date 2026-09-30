@@ -1374,6 +1374,40 @@ buffers. Same arithmetic, same order: bit-identical. Standalone 5.13 -> 3.32 ms
 per layer; pipeline, interleaved, 265/272 -> 185/190 ms (HIP 94). Chunk grouping
 G=2 stays best (G=0 4.1 ms; G=4 and G=8 spill, 9.1 and 67 ms).
 
+### Attention: three heads per workgroup, V and P staged for contiguous fragments
+
+`yah_attn_wmma` was 2.4x HIP (109 vs 46 ms). ATT at pp2048: 80% of wave time
+in vmcnt waits and 9 global loads per WMMA -- the P*V value operand came from
+the row-major V cache, and a B fragment needs 16 keys of one channel per lane,
+so every fragment was 16 two-byte gathers. Staging each 64-key x 64-channel V
+tile transposed in LDS (vt[channel][key], packed key pairs so a wave's stores
+cover 64 banks) halved the per-wave time but only moved the kernel 6.8 -> 6.4
+ms: with one query head per workgroup, every 16-row workgroup streamed its
+whole causal K/V range, ~3.2 GB per call from MALL. HIP shares each K/V tile
+across 64 rows.
+
+`tools/gen_attn_heads.py H` regenerates the kernel with H query heads of one
+GQA group per workgroup: each K fragment feeds H QK chains and each staged V
+tile H P*V chains. Every head keeps its own 16-token tile, the same WMMA
+chains, the same wave64 softmax over 64-key blocks and the same full/tail
+split, so it is bit-identical (more tokens per workgroup would have moved the
+full-block/tail boundary, and with it the softmax numerics). Two more fixes
+from the traces: probabilities are staged row-major (the key-major pitch-18
+layout made every P fragment 16 ds_load_u16, 32% of wave time), and V tile
+t+1 is loaded while tile t computes (tile 0 before QK).
+
+| standalone, ms/call | |
+|---|---:|
+| source kernel | 6.78 |
+| + V staged transposed | 6.43 |
+| H=3 | 4.91 |
+| + row-major P | 4.24 |
+| + V prefetch | 3.84 |
+
+Pipeline, bit-identical: 109 -> 70 ms (HIP 46). H=3 is the largest that fits
+64 KB of LDS (the tail stage aliases the V tile). `YAH_ATTN_HEADS=0` restores
+the hand-written kernel; dispatch.txt carries H as `wmma.hal 16 <H> <tiles>`.
+
 ### half_norm: the same loop, unrolled
 
 `yah_half_norm` (fused=0) was 1.85x HIP's `HalfNorm5120` (68.7 vs 37.1 ms over

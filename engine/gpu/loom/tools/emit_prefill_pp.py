@@ -292,6 +292,21 @@ def main():
                 geom.append((kout, ktile, krowgrp, ktt))
         n += 1
 
+    # Attention: tools/gen_attn_heads.py with H query heads of one GQA group per
+    # workgroup sharing each K/V tile (bit-identical to yah_attn_wmma_qb.loom).
+    # The driver reads H from this row's row-group field. YAH_ATTN_HEADS=0 keeps
+    # the hand-written kernel (one head per workgroup).
+    attn_heads = int(os.environ.get("YAH_ATTN_HEADS", "3"))
+    attn_src = "yah_attn_wmma_qb.loom"
+    if attn_heads:
+        import gen_attn_heads
+        tmp = os.path.join(outdir, ".emit_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        attn_src = os.path.join(tmp, "yah_attn_wmma_h%d.loom" % attn_heads)
+        with open(attn_src, "w") as fh:
+            fh.write(gen_attn_heads.gen(attn_heads))
+        geom.append(("wmma.hal", 16, attn_heads, (B + 15) // 16))
+
     # Record the resolved launch geometry with the prepared executables.
     # loom_forward_pp reads this instead of recomputing the grid, so the dispatch
     # site and the compiled kernel cannot disagree (see tools/emit_prefill.py,
@@ -349,7 +364,7 @@ def main():
             "yah_fused_qk_rope_batched.kv_elems=%d" % (1024 * B),
             "yah_fused_qk_rope_batched.cache32_elems=%d" % KC,
             "yah_fused_qk_rope_batched.cache16_elems=%d" % KC]),
-        ("yah_attn_wmma_qb.loom", "wmma.hal", [
+        (attn_src, "wmma.hal", [
             "attention_prefill.cache_capacity=%d" % B,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=0",

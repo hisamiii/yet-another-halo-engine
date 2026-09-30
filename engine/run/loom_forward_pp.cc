@@ -724,9 +724,15 @@ int main(int argc, char** argv) {
           // rebuild between runs (a failed rebuild leaves a stale binary and a mismatched
           // grid silently produces garbage).
           const bool attn_old_grid = std::getenv("YAH_ATTN_GRID_OLD") != nullptr;
+          // tools/gen_attn_heads.py runs H query heads of one GQA group per
+          // workgroup; dispatch.txt records H as the "wmma.hal" row group.
+          const auto attn_geom = g_geom.find("wmma.hal");
+          const std::uint32_t attn_hpw =
+              attn_geom != g_geom.end() && attn_geom->second.rowgrp ? attn_geom->second.rowgrp : 1;
+          if (kHeads % attn_hpw) throw LoomError("wmma.hal heads per workgroup does not divide the heads");
           Dispatch(gpu, e_wmma, "yah_attn_wmma",
                    attn_old_grid ? kHeads : (B + 15) / 16,
-                   attn_old_grid ? B : kHeads, 1,
+                   attn_old_grid ? B : kHeads / attn_hpw, 1,
                    attn_old_grid ? 32 : 256, 1, 1, b);
         }
         {
