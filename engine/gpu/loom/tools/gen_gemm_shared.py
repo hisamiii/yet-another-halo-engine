@@ -75,6 +75,7 @@ Q4_HDR_ENV = os.environ.get("YAH_TG_Q4HDR")
 Q4_HDR = Q4_HDR_ENV == "1"
 # Q3_W: Q3_K header in one load and the 2+1-bit quant assembly on 32-bit words
 Q3_W = os.environ.get("YAH_TG_Q3W", "1") == "1"
+IQ4_W = os.environ.get("YAH_TG_IQ4W", "0") == "1"
 
 KSUB = PH = GPP = GPL = ROWP = None
 
@@ -146,6 +147,7 @@ DB = os.environ.get("YAH_SD_DB", "0") == "1"
 RPF = os.environ.get("YAH_SD_RPF", "0") == "1"
 # IQ3_S / IQ3_XXS: decode each sign byte's 8 elements with i8/f32 vector ops.
 VDEC = os.environ.get("YAH_SD_VDEC", "1") == "1"
+VDEC_W = os.environ.get("YAH_SD_VDECW", "0") == "1"
 
 
 def _i8n(ty):
@@ -329,8 +331,19 @@ def iq4xs_compute(v, gb):
             e(f"    vector.store %hhi{u}, %wl_view[%drow, %colsh{u}] : vector<{n}xf16>, view<{LR}x{ROWP}xf16>")
             continue
         e(f"    %dsc_v{u} = vector.splat %dsc{u} : vector<16xf32>")
-        e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
-        e(f"    %nhi{u} = vector.shrui {q}, %s4v : vector<16xi8>")
+        if IQ4_W:
+            # nibbles on 32-bit words (i8-vector shifts/masks lower per element)
+            # only the shift moves to words: the final i8 `& 15` stays, since the
+            # table lookup lowers to v_perm only with that index-range fact
+            # (through a bitcast it became 960 v_cndmask: 9.44 -> 13.21 ms)
+            e(f"    %qw{u} = vector.bitcast {q} : vector<16xi8> to vector<4xi32>")
+            e(f"    %nhs{u} = vector.shrui %qw{u}, %s4w_iq : vector<4xi32>")
+            e(f"    %nhb{u} = vector.bitcast %nhs{u} : vector<4xi32> to vector<16xi8>")
+            e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
+            e(f"    %nhi{u} = vector.andi %nhb{u}, %m15v : vector<16xi8>")
+        else:
+            e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
+            e(f"    %nhi{u} = vector.shrui {q}, %s4v : vector<16xi8>")
         if IQ4_F16:
             # the codebook as f16 (every entry is an exact small integer), as
             # HIP's DecodeIqRaw looks it up: extf gives the same f32 as sitofp
@@ -428,13 +441,33 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p):
     2p+1): mags = bytes of [gw0, gw1], s = bits of the sign byte (LSB first,
     matching element lw*4 + b), mag = (g ^ -s) + s in i8 -- exact because grid
     magnitudes are < 128 -- then one sitofp, mulf and fptrunc for all eight."""
-    e(f"    %vg_{t} = vector.from_elements {gw0}, {gw1} : vector<2xi32>")
-    e(f"    %vb_{t} = vector.bitcast %vg_{t} : vector<2xi32> to vector<8xi8>")
-    e(f"    %vs1_{t} = vector.from_elements {sgb8} : vector<1xi8>")
-    e(f"    %vs_{t} = vector.bitunpacku<1> %vs1_{t} : vector<1xi8> -> vector<8xi8>")
-    e(f"    %vn_{t} = vector.subi %z8v, %vs_{t} : vector<8xi8>")
-    e(f"    %vx_{t} = vector.xori %vb_{t}, %vn_{t} : vector<8xi8>")
-    e(f"    %vm_{t} = vector.addi %vx_{t}, %vs_{t} : vector<8xi8>")
+    if VDEC_W:
+        # on the two grid words: s1 = sign bit i in byte i (the nibble times
+        # 0x00204081 puts bit i at bit 8i), m = s1 * 255, mag = (g ^ m) + s1 --
+        # per byte 256 - g for a set bit, never a carry since every grid
+        # magnitude is > 0. (The i8-vector form lowers element by element.)
+        e(f"    %wsb_{t} = scalar.extui {sgb8} : i8 to i32")
+        for h, gw in ((0, gw0), (1, gw1)):
+            if h:
+                e(f"    %wsn{h}_{t}0 = scalar.shrui %wsb_{t}, %c4i : i32")
+            else:
+                e(f"    %wsn{h}_{t}0 = scalar.addi %wsb_{t}, %c0i : i32")
+            e(f"    %wsn{h}_{t} = scalar.andi %wsn{h}_{t}0, %c15i : i32")
+            e(f"    %wsp{h}_{t} = scalar.muli %wsn{h}_{t}, %vdw_spread : i32")
+            e(f"    %ws1{h}_{t} = scalar.andi %wsp{h}_{t}, %vdw_ones : i32")
+            e(f"    %wsm{h}_{t} = scalar.muli %ws1{h}_{t}, %vdw_ff : i32")
+            e(f"    %wx{h}_{t} = scalar.xori {gw}, %wsm{h}_{t} : i32")
+            e(f"    %wm{h}_{t} = scalar.addi %wx{h}_{t}, %ws1{h}_{t} : i32")
+        e(f"    %vmw_{t} = vector.from_elements %wm0_{t}, %wm1_{t} : vector<2xi32>")
+        e(f"    %vm_{t} = vector.bitcast %vmw_{t} : vector<2xi32> to vector<8xi8>")
+    else:
+        e(f"    %vg_{t} = vector.from_elements {gw0}, {gw1} : vector<2xi32>")
+        e(f"    %vb_{t} = vector.bitcast %vg_{t} : vector<2xi32> to vector<8xi8>")
+        e(f"    %vs1_{t} = vector.from_elements {sgb8} : vector<1xi8>")
+        e(f"    %vs_{t} = vector.bitunpacku<1> %vs1_{t} : vector<1xi8> -> vector<8xi8>")
+        e(f"    %vn_{t} = vector.subi %z8v, %vs_{t} : vector<8xi8>")
+        e(f"    %vx_{t} = vector.xori %vb_{t}, %vn_{t} : vector<8xi8>")
+        e(f"    %vm_{t} = vector.addi %vx_{t}, %vs_{t} : vector<8xi8>")
     e(f"    %vf_{t} = vector.sitofp %vm_{t} : vector<8xi8> to vector<8xf32>")
     e(f"    %vv_{t} = vector.mulf {dsc_v8}, %vf_{t} : vector<8xf32>")
     e(f"    %vh_{t} = vector.fptrunc %vv_{t} : vector<8xf32> to vector<8xf16>")
@@ -607,7 +640,9 @@ def iq3s_setup():
     ds_reads instead of dependent global gathers in front of every phase barrier.
     The first K phase starts with a barrier, which publishes the copy."""
     L = ["  %grid_g = buffer.view %grid_na[%base] : buffer -> view<512xi32>",
-         "  %c511 = index.constant 511 : index"]
+         "  %c511 = index.constant 511 : index",
+         "  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32",
+         "  %vdw_ff = scalar.constant 255 : i32"]
     if not GRID_LDS:
         return L + ["  %grid_view = buffer.view %grid_na[%base] : buffer -> view<512xi32>"]
     L += ["  %grid_bytes = index.constant 2048 : offset",
@@ -753,7 +788,7 @@ def _stage_table(name, src, n, ty, bytes_per):
 
 
 def iq3xxs_setup():
-    return (["  %fhalf = scalar.constant 0.5 : f32"]
+    return ["  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32", "  %vdw_ff = scalar.constant 255 : i32"] + ((["  %fhalf = scalar.constant 0.5 : f32"])
             + _stage_table("grid", "%grid_na", 256, "i32", 4)
             + _stage_table("ksigns", "%ksigns_na", 128, "i8", 1))
 
@@ -1028,6 +1063,92 @@ def iq2xxs_compute(v, gb):
     return L
 
 
+def iq2xs_loads(p, blk, gb):
+    """block_iq2_xs (74 B): d f16 @0, qs[32] u16 @2, scales[8] @66. Group g
+    (32 elements) reads the four codes qs[4g..4g+3] (bytes 2 + 8g) and scale
+    byte 66 + g."""
+    L = []
+    e = L.append
+    vals = []
+    _ldd(e, p, blk)
+    vals.append((f"%{p}dh", "f16"))
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}g8_{u} = scalar.shli %{p}g{u}, %c3i : i32")
+        e(f"    %{p}qo{u} = scalar.addi {blk}, %{p}g8_{u} : i32")
+        e(f"    %{p}qo2_{u} = scalar.addi %{p}qo{u}, %c2i : i32")
+        _ldv(e, p, f"qs{u}", f"%{p}qo2_{u}", 8)
+        vals.append((f"%{p}qs{u}", "vector<8xi8>"))
+        e(f"    %{p}so{u} = scalar.addi {blk}, %{p}g{u} : i32")
+        e(f"    %{p}so2_{u} = scalar.addi %{p}so{u}, %c66i : i32")
+        _ld8(e, p, f"sc{u}", f"%{p}so2_{u}")
+        vals.append((f"%{p}sc{u}", "i8"))
+    return L, vals
+
+
+def iq2xs_compute(v, gb):
+    """The chained kernel's IQ2_XS decode (yah_ffn_gemm_iq2xs_f32.loom), 8
+    elements per code l (elements 8l..8l+7 of the group):
+      gw = grid words (2*(code & 511), +1), s = bits of ksigns[code >> 9],
+      mag = (g ^ -s) + s, nib = scales[g] low nibble for l < 2, high for l >= 2,
+      value = (d * ((f32(nib) + 0.5) * 0.25)) * f32(mag)"""
+    L = []
+    e = L.append
+    it = iter(v)
+    dh = next(it)
+    e(f"    %d = scalar.extf {dh} : f16 to f32")
+    for u in range(GPL):
+        qs = next(it); sc = next(it)
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %qw{u} = vector.bitcast {qs} : vector<8xi8> to vector<2xi32>")
+        e(f"    %scb{u} = scalar.extui {sc} : i8 to i32")
+        for hv in (0, 1):
+            if hv:
+                e(f"    %nb{hv}_{u}0 = scalar.shrui %scb{u}, %c4i : i32")
+            else:
+                e(f"    %nb{hv}_{u}0 = scalar.andi %scb{u}, %c15i : i32")
+            e(f"    %nbf{hv}_{u} = scalar.sitofp %nb{hv}_{u}0 : i32 to f32")
+            e(f"    %hp{hv}_{u} = scalar.addf %nbf{hv}_{u}, %fhalf : f32")
+            e(f"    %hq{hv}_{u} = scalar.mulf %hp{hv}_{u}, %fquarter : f32")
+            e(f"    %dsc{hv}_{u} = scalar.mulf %d, %hq{hv}_{u} : f32")
+            e(f"    %dsc_v8_{hv}_{u} = vector.splat %dsc{hv}_{u} : vector<8xf32>")
+        _col_of(e, u)
+        for l in range(4):
+            t = f"{u}_{l}"
+            e(f"    %cw_{t} = vector.extract %qw{u}[{l // 2}] : vector<2xi32> -> i32")
+            if l % 2:
+                e(f"    %cd_{t} = scalar.shrui %cw_{t}, %c16i_2 : i32")
+            else:
+                e(f"    %cd_{t} = scalar.andi %cw_{t}, %c65535i_2 : i32")
+            e(f"    %gi_{t} = scalar.andi %cd_{t}, %c511i_2 : i32")
+            e(f"    %w0_{t} = scalar.shli %gi_{t}, %c1i : i32")
+            e(f"    %w1_{t} = scalar.addi %w0_{t}, %c1i : i32")
+            for w in (0, 1):
+                e(f"    %wx{w}_{t} = index.cast %w{w}_{t} : i32 to index")
+                e(f"    %wl{w}_{t} = index.max %wx{w}_{t}, %c0 : index")
+                e(f"    %wc{w}_{t} = index.min %wl{w}_{t}, %c1023 : index")
+                e(f"    %gw{w}_{t} = view.load %grid_view[%wc{w}_{t}] : view<1024xi32> -> i32")
+            e(f"    %sid0_{t} = scalar.shrui %cd_{t}, %c9i_2 : i32")
+            e(f"    %sid_{t} = scalar.andi %sid0_{t}, %c127i : i32")
+            e(f"    %sidx_{t} = index.cast %sid_{t} : i32 to index")
+            e(f"    %sidl_{t} = index.max %sidx_{t}, %c0 : index")
+            e(f"    %sidc_{t} = index.min %sidl_{t}, %c127 : index")
+            e(f"    %ks8_{t} = view.load %ksigns_view[%sidc_{t}] : view<128xi8> -> i8")
+            _vdec_pair(e, t, f"%gw0_{t}", f"%gw1_{t}", f"%ks8_{t}", f"%dsc_v8_{l // 2}_{u}", f"%col{u}", u, l)
+    return L
+
+
+def iq2xs_setup():
+    return (["  %fhalf = scalar.constant 0.5 : f32", "  %fquarter = scalar.constant 0.25 : f32",
+             "  %c1023 = index.constant 1023 : index",
+             "  %c16i_2 = scalar.constant 16 : i32", "  %c65535i_2 = scalar.constant 65535 : i32",
+             "  %c511i_2 = scalar.constant 511 : i32", "  %c9i_2 = scalar.constant 9 : i32",
+             "  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32",
+             "  %vdw_ff = scalar.constant 255 : i32"]
+            + _stage_table("grid", "%grid_na", 1024, "i32", 4)
+            + _stage_table("ksigns", "%ksigns_na", 128, "i8", 1))
+
+
 def iq2xxs_setup():
     return (["  %fhalf = scalar.constant 0.5 : f32", "  %fquarter = scalar.constant 0.25 : f32",
              "  %c511 = index.constant 511 : index"]
@@ -1177,7 +1298,9 @@ def q8_0_compute(v, gb):
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
     L += ["  %c15b_iq = scalar.constant 15 : i8", "  %c4b_iq = scalar.constant 4 : i8",
-          "  %c16i_h = scalar.constant 16 : i32", "  %c255i_h = scalar.constant 255 : i32"]
+          "  %c16i_h = scalar.constant 16 : i32", "  %c255i_h = scalar.constant 255 : i32",
+          "  %c0f4_iq = scalar.constant 252645135 : i32", "  %m0f4_iq = vector.splat %c0f4_iq : vector<4xi32>",
+          "  %c4w_iq = scalar.constant 4 : i32", "  %s4w_iq = vector.splat %c4w_iq : vector<4xi32>"]
     L.append("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
     if IQ4_F16:
         bits = [struct.unpack("<H", struct.pack("<e", float(v)))[0] for v in IQ4_KVALUES]
@@ -1398,6 +1521,7 @@ FMTS = {
     "q6k": dict(bb=210, ksub=64, decode=(q6k_loads, q6k_compute), extra=[], setup=q6k_setup),
     "q3k": dict(bb=110, ksub=64, decode=(q3k_loads, q3k_compute), extra=[], setup=q3k_setup),
     "iq2xxs": dict(bb=66, ksub=64, decode=(iq2xxs_loads, iq2xxs_compute), extra=["grid", "ksigns"], setup=iq2xxs_setup),
+    "iq2xs": dict(bb=74, ksub=64, decode=(iq2xs_loads, iq2xs_compute), extra=["grid", "ksigns"], setup=iq2xs_setup),
     "iq3xxs": dict(bb=98, ksub=64, decode=(iq3xxs_loads, iq3xxs_compute), extra=["grid", "ksigns"], setup=iq3xxs_setup),
 }
 

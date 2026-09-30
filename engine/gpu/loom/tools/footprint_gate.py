@@ -25,7 +25,10 @@ B = int(sys.argv[8]) if len(sys.argv) > 8 else 2048
 qk, bpb = QB[fmt]
 M, K = mt * 16, kb * qk
 bound = {"weight": M * kb * bpb, "input": B * K * 2, "resid": B * M * 4, "gate": B * M * 4,
-         "output": B * M * (2 if kind == "swiglu" else 4), "grid": 2048, "ksigns": 128,
+         "output": B * M * (2 if kind == "swiglu" else 4),
+         # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
+         "grid": {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(fmt, 0),
+         "ksigns": 128,
          "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4}
 H = "/home/q/hrx"
 e = dict(os.environ)

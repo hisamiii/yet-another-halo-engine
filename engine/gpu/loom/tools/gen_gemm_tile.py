@@ -128,6 +128,8 @@ def configure(fmt):
     # wait, so spreading a group over SPLIT lanes shortens the critical path
     G.SPLIT = int(os.environ.get("YAH_TG_SPLIT", "1")) if fmt == "iq4xs" else 1
     G.Q4_HDR = G.Q4_HDR_ENV == "1" if G.Q4_HDR_ENV is not None else fmt in ("q4k", "q5k")
+    # word-level grid sign application: IQ3_XXS 9.97 -> 9.82 ms; IQ3_S neutral
+    G.VDEC_W = os.environ.get("YAH_SD_VDECW", "1" if fmt == "iq3xxs" else "0") == "1"
     G.LR = BM
     G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
     assert G.GPP % G.GPL == 0

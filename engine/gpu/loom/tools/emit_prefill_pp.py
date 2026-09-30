@@ -74,7 +74,7 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
 
 # Formats the tile GEMM (tools/gen_gemm_tile.py) has been verified bit-identical
 # on in the pp2048 pipeline (q8_0 through the same kdiv as gen_gemm_shared).
-TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "q3k", "q8_0")
+TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "q3k", "q8_0")
 
 
 def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):

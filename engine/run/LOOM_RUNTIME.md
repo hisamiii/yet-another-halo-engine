@@ -1568,6 +1568,21 @@ header load, neutral before (the per-byte bit path was the limit), takes it to
 9.78. pp2048 paired: the Q3_K/Q5_K rows -18.9 ms while every other row drifted
 +30.6 (the second-run bias), hidden md5 unchanged.
 
+IQ2_XS joins the tile GEMM (`iq2xs_loads`/`iq2xs_compute`: four 16-bit codes
+per group, 9-bit grid index into 64-bit grid entries, 7-bit ksigns index,
+nibble scale per 16 elements, the chained kernel's f32 order): its one pp2048
+gate+up dispatch 20.0 -> 11.5 ms (HIP 10.8), hidden md5 unchanged. The
+emitter's footprint gate now bounds the grid binding per format as the driver
+allocates it (IQ2_XS 4096 B; the flat 2048 refused it).
+
+IQ3 sign application on grid words (`YAH_SD_VDECW`: s1 = the sign nibble times
+0x00204081 masked to one bit per byte, mag = (g ^ 255*s1) + s1 -- exact since
+every grid magnitude is > 0): static VALU -22% for both IQ3 formats but IQ3_XXS
+9.97 -> 9.82, IQ3_S 10.16 -> 10.23 ms -- not decode-VALU-bound; on for IQ3_XXS.
+IQ4_XS nibbles on words changed nothing (the constant shift was already
+packed), and masking them on i32 hid the index-range fact the codebook lookup
+needs for `v_perm`: 960 `v_cndmask`, 9.44 -> 13.21 ms. Off.
+
 Also measured with it: spreading an IQ4_XS group over 2 or 4 lanes
 (`YAH_TG_SPLIT`) removes the decode imbalance (the top barrier falls from 49%
 to 20% of wave time at 4) but makes the SIMDs VALU-issue-bound (VALU stall
