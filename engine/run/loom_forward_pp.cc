@@ -118,6 +118,7 @@ std::uint32_t g_tt = 0;  // GEMM token tiles = g_b / g_gtile
 std::uint32_t g_gtile = kTile;  // fallback GEMM tile when dispatch.txt says nothing
 int g_time = 0;
 std::string g_key;  // YAH_LOOM_TIME=3: timing key for the next dispatch
+bool g_fused_residual = true;  // YAH_FUSED_RESIDUAL=0 disables the gemm_kres path
 std::map<std::string, double> g_per_name;
 std::map<std::string, int> g_per_count;
 std::chrono::steady_clock::time_point g_mark = std::chrono::steady_clock::now();
@@ -268,6 +269,7 @@ int main(int argc, char** argv) {
     if (t) { g_ksplit = std::atoi(t); }
     if (g_ksplit < 1 || g_ksplit > 8) throw LoomError("YAH_KSPLIT must be 1..8"); }
   const bool skip_head = std::getenv("YAH_SKIP_HEAD") != nullptr;
+  { const char* t = std::getenv("YAH_FUSED_RESIDUAL"); if (t && std::string(t) == "0") g_fused_residual = false; }
   // YAH_KSTORE_RESIDUAL=1 runs the gemm_residual projections (ffn_down,
   // attn_output, ssm_out) on the CHAINED kStore HAL instead of the residual
   // source. The residual source still uses the old one-column-per-lane decode
@@ -558,6 +560,32 @@ int main(int argc, char** argv) {
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
       const Imported w = ImportTensor(*tw);
+      // Fused residual (gen_gemm_shared kind "kres"): the GEMM reads hidden and
+      // writes hidden + acc into hidden2 itself, so neither the partial buffer nor
+      // the yah_residual_1d pass is needed; the handles are swapped after.
+      // Taken whenever the HAL set carries one; YAH_FUSED_RESIDUAL=0 disables it.
+      const std::string fused_hal = std::string("gemm_kres_") + f.name + "_" +
+                                    std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
+      if (kres && g_fused_residual && g_geom.count(fused_hal)) {
+        LoomExecutable& fx = load(dir + "/" + fused_hal);
+        const Geom fg = GeomOf(fused_hal, B);
+        g_key = fused_hal;
+        std::vector<hrx_buffer_ref_t> fb = {{w.handle, w.offset, w.bytes}};
+        if (f.name == std::string("iq3s")) fb.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
+        if (f.name == std::string("iq3xxs")) fb.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
+        if (f.name == std::string("iq2xxs")) fb.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
+        if (f.name == std::string("iq2xs")) fb.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
+        if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) fb.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
+        fb.push_back({input.handle, 0, hb(input)});
+        fb.push_back({hidden.handle, 0, hb(hidden)});
+        fb.push_back({wstage.handle, 0, hb(wstage)});
+        fb.push_back({ostage.handle, 0, hb(ostage)});
+        fb.push_back({hidden2.handle, 0, hb(hidden2)});
+        Dispatch(gpu, fx, (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(),
+                 mt / fg.rowgrp, B / fg.tokens, 1, 32, 1, 1, fb);
+        std::swap(hidden, hidden2);
+        return;
+      }
       const std::string hal = std::string(kres ? "gemm_kstore_" : "gemm_residual_") +
                               f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
 

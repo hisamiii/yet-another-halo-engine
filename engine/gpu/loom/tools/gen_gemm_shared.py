@@ -95,6 +95,8 @@ KORDER = os.environ.get("YAH_SD_KORDER", "")
 # VALU -- not latency-bound, so overlapping them buys nothing and the doubled
 # tile costs residency. Off.
 DB = os.environ.get("YAH_SD_DB", "0") == "1"
+# rhs (activation) fragments software-pipelined one K step ahead.
+RPF = os.environ.get("YAH_SD_RPF", "0") == "1"
 # IQ3_S / IQ3_XXS: decode each sign byte's 8 elements with i8/f32 vector ops.
 VDEC = os.environ.get("YAH_SD_VDEC", "1") == "1"
 
@@ -1026,8 +1028,10 @@ def gen(fmt, kind="kstore"):
     configure(fmt)
     bb, decode = F["bb"], F["decode"]
     sw = kind == "swiglu"
-    bufs = ["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + ["wstage", "ostage", "output"]
-    sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "")
+    kr = kind == "kres"
+    bufs = (["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
+            + ["wstage", "ostage", "output"])
+    sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "")
     wgs = 64 * NW * NR
     wtok = TOK * NW
     L = []
@@ -1210,7 +1214,25 @@ def gen(fmt, kind="kstore"):
             L.extend(Ln)
             nxt = pack_vals(e, nxt, "n")
         cb = ", ".join(f"%b{i} = %a{i} : {V4}" for i in range(NA))
-        e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL}{{")
+        if RPF:
+            # rhs software pipeline: this step's activation fragments were loaded
+            # one K step earlier and are carried in; the next step's are issued
+            # before this step's MMAs (clamped on the last step: a redundant,
+            # in-bounds load). The ATT trace put 56% of the kernel in this loop,
+            # nearly all of it waiting on the step's own rhs global loads.
+            VF = "vector<16xf16>"
+            for j in range(NT):
+                e(f"    %rp0_{j} = vector.fragment.load<rhs> %a_t_view[%kb_k, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> {VF}")
+            cb += ", " + ", ".join(f"%rc{j} = %rp0_{j} : {VF}" for j in range(NT))
+            rtypes = types + ", " + ", ".join([VF] * NT)
+            e("    %ks_last = index.sub %cksub, %c16 : index")
+            e("    " + ", ".join(f"%r{i}" for i in range(NA)) + ", " + ", ".join(f"%rco{j}" for j in range(NT))
+              + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({rtypes}) {KPOL}{{")
+            e("      %ks_n0 = index.add %ks, %c16 : index")
+            e("      %ks_n = index.min %ks_n0, %ks_last : index")
+            e("      %kk_n = index.add %kb_k, %ks_n : index")
+        else:
+            e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL}{{")
         e("      %kk = index.add %kb_k, %ks : index")
         for i in range(4):
             e(f"      %lr{i} = index.add %rg64, %c{16 * i} : index")
@@ -1222,6 +1244,9 @@ def gen(fmt, kind="kstore"):
             if ABLATE == "rhsfix":
                 # probe: same rhs addresses every K step (always cache-resident)
                 e(f"      %rhs{j} = vector.fragment.load<rhs> %a_t_view[%c0, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
+                continue
+            if RPF:
+                e(f"      %rhs{j} = vector.fragment.load<rhs> %a_t_view[%kk_n, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
                 continue
             e(f"      %rhs{j} = vector.fragment.load<rhs> %a_t_view[%kk, {toks[j]}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> vector<16xf16>")
         if KORDER == "fence" and ABLATE == "":
@@ -1249,8 +1274,11 @@ def gen(fmt, kind="kstore"):
                     e(f"      %n{n} = vector.fragment<init> %zeros shape [%m, %n] : {V4}") if False else None
                     e(f"      %n{n} = vector.addf %b{n}, %b{n} : {V4}")
                     continue
-                e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
-        e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
+                e(f"      %n{n} = vector.mma %lhs{i}, {'%rc' if RPF else '%rhs'}{j}, %b{n} : vector<16xf16>, vector<16xf16>, {V4}")
+        if RPF:
+            e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + ", " + ", ".join(f"%rhs{j}" for j in range(NT)) + f" : {rtypes}")
+        else:
+            e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
         e("    }")
         yv = ", ".join(f"%r{i}" for i in range(NA))
         if PREFETCH:
@@ -1314,6 +1342,22 @@ def gen(fmt, kind="kstore"):
             e(f"    view.store %h_{i}, %out_h[%gix_{i}] : f16, view<[%out_total]xf16>")
             e(f"    scf.yield %em{i} : index")
             e("  }")
+    elif kr:
+        # Fused residual: out = resid + acc, element for element. resid is read as
+        # an f32 result fragment through the same token-major strided view (f32
+        # result loads honour the layout), so it arrives in the accumulator's
+        # register layout. Same f32 add, same operand order as yah_residual_1d
+        # (a + b with a the running hidden state), so bit-identical to the
+        # kStore-into-partial + residual pass it replaces.
+        e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
+        e("  %res_t_view = buffer.view %resid_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
+        e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
+        for i in range(4):
+            for j in range(NT):
+                a = i * NT + j
+                e(f"  %rf{a} = vector.fragment.load<result> %res_t_view[{rows[i]}, {toks[j]}] shape [%m, %n] : view<[%m_rows]x[%tokens]xf32, %out_layout> -> {V4}")
+                e(f"  %rs{a} = vector.addf %rf{a}, %acc{a} : {V4}")
+                e(f"  vector.fragment.store<result> %rs{a}, %out_t_view[{rows[i]}, {toks[j]}] shape [%m, %n] : {V4}, view<[%m_rows]x[%tokens]xf32, %out_layout>")
     elif EPI == "direct":
         # Result fragments go straight to the token-major output through a
         # strided [m_rows]x[tokens] view (element (row, t) at t*m_rows + row),

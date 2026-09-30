@@ -59,7 +59,7 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     with open(src, "w") as fh:
         fh.write(G.gen(fmt, kind))
-    sym = "yah_ffn_gemm_%s%s" % (fmt, "_swiglu" if kind == "swiglu" else "")
+    sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres"}.get(kind, ""))
     E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
                  "%s.token_tiles=%d" % (sym, B // tile)], out, outdir)
     return (out, tile, 4, B // tile)
@@ -223,6 +223,11 @@ def main():
             sg = shared_kstore(fmt, mt, kb, B, kout, outdir)
             if sg:
                 geom.append(sg)
+                # the fused-residual variant (loom_forward_pp prefers it when present)
+                kr = shared_kstore(fmt, mt, kb, B, "gemm_kres_%s_%d_%d.hal" % (fmt, mt, kb),
+                                   outdir, kind="kres")
+                if kr:
+                    geom.append(kr)
             else:
                 E.emit(kf, kcfg, kout, outdir, widen=ktile, chain=kuse,
                        chain_level=(kchain_level or "full"))
