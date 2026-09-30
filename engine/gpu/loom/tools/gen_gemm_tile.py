@@ -127,7 +127,7 @@ def configure(fmt):
     # lanes per decoded group: with decode-ahead the non-decoding waves only
     # wait, so spreading a group over SPLIT lanes shortens the critical path
     G.SPLIT = int(os.environ.get("YAH_TG_SPLIT", "1")) if fmt == "iq4xs" else 1
-    G.Q4_HDR = G.Q4_HDR_ENV == "1" if G.Q4_HDR_ENV is not None else fmt == "q4k"
+    G.Q4_HDR = G.Q4_HDR_ENV == "1" if G.Q4_HDR_ENV is not None else fmt in ("q4k", "q5k")
     G.LR = BM
     G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
     assert G.GPP % G.GPL == 0

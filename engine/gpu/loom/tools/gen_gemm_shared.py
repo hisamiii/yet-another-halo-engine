@@ -73,6 +73,8 @@ IQ4_HDR = os.environ.get("YAH_TG_IQ4HDR", "1") == "1"
 # generator turns it on for Q4_K only unless YAH_TG_Q4HDR is set.
 Q4_HDR_ENV = os.environ.get("YAH_TG_Q4HDR")
 Q4_HDR = Q4_HDR_ENV == "1"
+# Q3_W: Q3_K header in one load and the 2+1-bit quant assembly on 32-bit words
+Q3_W = os.environ.get("YAH_TG_Q3W", "1") == "1"
 
 KSUB = PH = GPP = GPL = ROWP = None
 
@@ -923,10 +925,21 @@ def q4k_compute(v, gb, q5=False):
                 e(f"    %nq{half}{u} = {op} {q}, {k} : vector<16xi8>")
             src = f"%nq{half}{u}"
             if q5:
-                e(f"    %hs{half}{u} = vector.shrui {qh}, %g8v_{u} : vector<16xi8>")
-                e(f"    %hb{half}{u} = vector.andi %hs{half}{u}, %one8v : vector<16xi8>")
-                e(f"    %h16{half}{u} = vector.shli %hb{half}{u}, %s4v : vector<16xi8>")
-                e(f"    %n5{half}{u} = vector.addi %nq{half}{u}, %h16{half}{u} : vector<16xi8>")
+                if Q4_UITOFP:
+                    # the fifth bit on words too: ((qh >> g) & 0x01010101) << 4,
+                    # OR the nibbles (the bits do not overlap, so it is the add)
+                    e(f"    %hw{half}{u} = vector.bitcast {qh} : vector<16xi8> to vector<4xi32>")
+                    e(f"    %hgw{half}{u} = vector.splat %g{u} : vector<4xi32>")
+                    e(f"    %hs{half}{u} = vector.shrui %hw{half}{u}, %hgw{half}{u} : vector<4xi32>")
+                    e(f"    %hb{half}{u} = vector.andi %hs{half}{u}, %m014 : vector<4xi32>")
+                    e(f"    %h16{half}{u} = vector.shli %hb{half}{u}, %s44 : vector<4xi32>")
+                    e(f"    %n5w{half}{u} = vector.ori %qwm{half}{u}, %h16{half}{u} : vector<4xi32>")
+                    e(f"    %n5{half}{u} = vector.bitcast %n5w{half}{u} : vector<4xi32> to vector<16xi8>")
+                else:
+                    e(f"    %hs{half}{u} = vector.shrui {qh}, %g8v_{u} : vector<16xi8>")
+                    e(f"    %hb{half}{u} = vector.andi %hs{half}{u}, %one8v : vector<16xi8>")
+                    e(f"    %h16{half}{u} = vector.shli %hb{half}{u}, %s4v : vector<16xi8>")
+                    e(f"    %n5{half}{u} = vector.addi %nq{half}{u}, %h16{half}{u} : vector<16xi8>")
                 src = f"%n5{half}{u}"
             # nibbles are 0..15 (0..31 with q5's high bit): uitofp is the same
             # value and can select v_cvt_f32_ubyteN (no sign-extend)
@@ -950,7 +963,9 @@ def q4k_setup():
             "  %one8v = vector.splat %c1b : vector<16xi8>",
             "  %c0f4 = scalar.constant 252645135 : i32", "  %m0f4 = vector.splat %c0f4 : vector<4xi32>",
             "  %q4sh0 = scalar.constant 0 : i32", "  %q4sh4 = scalar.constant 4 : i32",
-            "  %c16i_q = scalar.constant 16 : i32", "  %c255i_q = scalar.constant 255 : i32"]
+            "  %c16i_q = scalar.constant 16 : i32", "  %c255i_q = scalar.constant 255 : i32",
+            "  %c014 = scalar.constant 16843009 : i32", "  %m014 = vector.splat %c014 : vector<4xi32>",
+            "  %s44 = vector.splat %q4sh4 : vector<4xi32>"]
 
 
 def iq2xxs_loads(p, blk, gb):
@@ -1188,8 +1203,14 @@ def q3k_loads(p, blk, gb):
     e(f"    %{p}dq_ix = index.cast %{p}dq_i : i32 to index")
     e(f"    %{p}dq_lo = index.max %{p}dq_ix, %c0 : index")
     e(f"    %{p}dq_idx = index.min %{p}dq_lo, %w_half_last : index")
-    e(f"    %{p}dh = view.load %w_f16_view[%{p}dq_idx] : view<[%w_halfs]xf16> -> f16")
-    vals.append((f"%{p}dh", "f16"))
+    if Q3_W:
+        # scales[12] @96 and d @108 as one 16-byte load at @94 (inside the block)
+        e(f"    %{p}q3h_o = scalar.addi {blk}, %q3c94i : i32")
+        _ldv(e, p, "q3hdr", f"%{p}q3h_o", 16)
+        vals.append((f"%{p}q3hdr", "vector<16xi8>"))
+    else:
+        e(f"    %{p}dh = view.load %w_f16_view[%{p}dq_idx] : view<[%w_halfs]xf16> -> f16")
+        vals.append((f"%{p}dh", "f16"))
     e(f"    %{p}hm_b = scalar.addi {blk}, %c16i : i32")
     _ldv(e, p, "hma", blk, 16)
     _ldv(e, p, "hmb", f"%{p}hm_b", 16)
@@ -1215,11 +1236,13 @@ def q3k_loads(p, blk, gb):
         e(f"    %{p}sh0_{u} = scalar.addi {blk}, %c104i : i32")
         e(f"    %{p}sha_o{u} = scalar.addi %{p}sh0_{u}, %{p}g1x2_{u} : i32")
         e(f"    %{p}shb_o{u} = scalar.addi %{p}sha_o{u}, %c1i : i32")
-        _ld8(e, p, f"la{u}", f"%{p}sla_o{u}")
-        _ld8(e, p, f"lb{u}", f"%{p}slb_o{u}")
-        _ld8(e, p, f"ha{u}", f"%{p}sha_o{u}")
-        _ld8(e, p, f"hb{u}", f"%{p}shb_o{u}")
-        vals += [(f"%{p}la{u}", "i8"), (f"%{p}lb{u}", "i8"), (f"%{p}ha{u}", "i8"), (f"%{p}hb{u}", "i8")]
+        if not Q3_W:
+            _ld8(e, p, f"la{u}", f"%{p}sla_o{u}")
+            _ld8(e, p, f"lb{u}", f"%{p}slb_o{u}")
+            _ld8(e, p, f"ha{u}", f"%{p}sha_o{u}")
+            _ld8(e, p, f"hb{u}", f"%{p}shb_o{u}")
+        if not Q3_W:
+            vals += [(f"%{p}la{u}", "i8"), (f"%{p}lb{u}", "i8"), (f"%{p}ha{u}", "i8"), (f"%{p}hb{u}", "i8")]
     return L, vals
 
 
@@ -1233,12 +1256,46 @@ def q3k_compute(v, gb):
     L = []
     e = L.append
     it = iter(v)
-    dh = next(it); hma = next(it); hmb = next(it)
-    e(f"    %d = scalar.extf {dh} : f16 to f32")
+    if Q3_W:
+        hdr = next(it); hma = next(it); hmb = next(it)
+        # window bytes 94..109: word i = bytes 94+4i..97+4i; d = word 3 >> 16
+        e(f"    %q3w = vector.bitcast {hdr} : vector<16xi8> to vector<4xi32>")
+        for w in range(4):
+            e(f"    %q3w{w} = vector.extract %q3w[{w}] : vector<4xi32> -> i32")
+        e("    %q3dw = scalar.shrui %q3w3, %q3c16i : i32")
+        e("    %q3d16 = scalar.trunci %q3dw : i32 to i16")
+        e("    %q3dh = scalar.bitcast %q3d16 : i16 to f16")
+        e("    %d = scalar.extf %q3dh : f16 to f32")
+    else:
+        dh = next(it); hma = next(it); hmb = next(it)
+        e(f"    %d = scalar.extf {dh} : f16 to f32")
     for u in range(GPL):
         qa = next(it); qb = next(it)
-        la = next(it); lb = next(it); ha = next(it); hb = next(it)
+        if not Q3_W:
+            la = next(it); lb = next(it); ha = next(it); hb = next(it)
         e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
+        if Q3_W:
+            # scales[2*(g&3)], +1 at window bytes 2+2*(g&3); scales[8+2*(g&1)],
+            # +1 at 10+2*(g&1): 16-bit pairs from words 0..3
+            e(f"    %q3g3_{u} = scalar.andi %g{u}, %c3i : i32")
+            e(f"    %q3g1_{u} = scalar.andi %g{u}, %c1i : i32")
+            e(f"    %q3z_{u} = scalar.cmpi eq, %q3g3_{u}, %c0i : i32")
+            e(f"    %q3t_{u} = scalar.cmpi eq, %q3g3_{u}, %c3i : i32")
+            e(f"    %q3wa0_{u} = scf.select %q3t_{u}, %q3w2, %q3w1 : i32")
+            e(f"    %q3wa_{u} = scf.select %q3z_{u}, %q3w0, %q3wa0_{u} : i32")
+            e(f"    %q3odd_{u} = scalar.cmpi eq, %q3g1_{u}, %c1i : i32")
+            e(f"    %q3wah_{u} = scalar.shrui %q3wa_{u}, %q3c16i : i32")
+            e(f"    %q3pa_{u} = scf.select %q3odd_{u}, %q3wa_{u}, %q3wah_{u} : i32")
+            e(f"    %q3wb_{u} = scf.select %q3odd_{u}, %q3w3, %q3w2 : i32")
+            e(f"    %q3wbh_{u} = scalar.shrui %q3wb_{u}, %q3c16i : i32")
+            e(f"    %q3pb_{u} = scf.select %q3odd_{u}, %q3wb_{u}, %q3wbh_{u} : i32")
+            e(f"    %q3la_{u} = scalar.andi %q3pa_{u}, %c255i_3 : i32")
+            e(f"    %q3lb0_{u} = scalar.shrui %q3pa_{u}, %c8i : i32")
+            e(f"    %q3lb_{u} = scalar.andi %q3lb0_{u}, %c255i_3 : i32")
+            e(f"    %q3ha_{u} = scalar.andi %q3pb_{u}, %c255i_3 : i32")
+            e(f"    %q3hb0_{u} = scalar.shrui %q3pb_{u}, %c8i : i32")
+            e(f"    %q3hb_{u} = scalar.andi %q3hb0_{u}, %c255i_3 : i32")
+            la, lb, ha, hb = f"%q3la_{u}", f"%q3lb_{u}", f"%q3ha_{u}", f"%q3hb_{u}"
         e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
         e(f"    %q3sp{u} = scalar.andi %g{u}, %c3i : i32")
         e(f"    %q3ls{u} = scalar.shli %q3sp{u}, %c1i : i32")
@@ -1246,6 +1303,9 @@ def q3k_compute(v, gb):
         e(f"    %q3lsv{u} = vector.splat %q3ls8_{u} : vector<16xi8>")
         e(f"    %q3bs8_{u} = scalar.trunci %g{u} : i32 to i8")
         e(f"    %q3bsv{u} = vector.splat %q3bs8_{u} : vector<16xi8>")
+        if Q3_W:
+            e(f"    %q3lsw{u} = vector.splat %q3ls{u} : vector<4xi32>")
+            e(f"    %q3bsw{u} = vector.splat %g{u} : vector<4xi32>")
         e(f"    %q3hf{u} = scalar.shrui %g{u}, %c2i : i32")
         e(f"    %q3s4{u} = scalar.shli %q3hf{u}, %c2i : i32")
         e(f"    %q3g2{u} = scalar.shrui %g{u}, %c1i : i32")
@@ -1257,18 +1317,40 @@ def q3k_compute(v, gb):
         e(f"    %colh{u} = index.add %col{u}, %c16 : index")
         for hn, q, hm, lo8, hi8, col in (("lo", qa, hma, la, ha, f"%col{u}"), ("hi", qb, hmb, lb, hb, f"%colh{u}")):
             t = f"{hn}{u}"
-            e(f"    %q3lw{t} = vector.shrui {q}, %q3lsv{u} : vector<16xi8>")
-            e(f"    %q3low{t} = vector.andi %q3lw{t}, %q3m3v : vector<16xi8>")
-            e(f"    %q3bw{t} = vector.shrui {hm}, %q3bsv{u} : vector<16xi8>")
-            e(f"    %q3bit{t} = vector.andi %q3bw{t}, %q3m1v : vector<16xi8>")
-            e(f"    %q3b2{t} = vector.shli %q3bit{t}, %q3s2v : vector<16xi8>")
-            e(f"    %q3lb{t} = vector.ori %q3low{t}, %q3b2{t} : vector<16xi8>")
-            e(f"    %q3qn{t} = vector.subi %q3lb{t}, %q3f4v : vector<16xi8>")
+            if Q3_W:
+                # on 32-bit words: per byte (q >> 2sp) & 3 | ((hm >> g) & 1) << 2,
+                # minus 4 as (x | 0x80) - 4 ^ 0x80 (no borrow leaves a byte)
+                e(f"    %q3qw{t} = vector.bitcast {q} : vector<16xi8> to vector<4xi32>")
+                e(f"    %q3hw{t} = vector.bitcast {hm} : vector<16xi8> to vector<4xi32>")
+                e(f"    %q3lw{t} = vector.shrui %q3qw{t}, %q3lsw{u} : vector<4xi32>")
+                e(f"    %q3low{t} = vector.andi %q3lw{t}, %q3m3w : vector<4xi32>")
+                e(f"    %q3bw{t} = vector.shrui %q3hw{t}, %q3bsw{u} : vector<4xi32>")
+                e(f"    %q3bit{t} = vector.andi %q3bw{t}, %q3m1w : vector<4xi32>")
+                e(f"    %q3b2{t} = vector.shli %q3bit{t}, %q3s2w : vector<4xi32>")
+                e(f"    %q3lb{t} = vector.ori %q3low{t}, %q3b2{t} : vector<4xi32>")
+                e(f"    %q3o8{t} = vector.ori %q3lb{t}, %q3m80w : vector<4xi32>")
+                e(f"    %q3s4w{t} = vector.subi %q3o8{t}, %q3m4w : vector<4xi32>")
+                e(f"    %q3x8{t} = vector.xori %q3s4w{t}, %q3m80w : vector<4xi32>")
+                e(f"    %q3qn{t} = vector.bitcast %q3x8{t} : vector<4xi32> to vector<16xi8>")
+            else:
+                e(f"    %q3lw{t} = vector.shrui {q}, %q3lsv{u} : vector<16xi8>")
+                e(f"    %q3low{t} = vector.andi %q3lw{t}, %q3m3v : vector<16xi8>")
+                e(f"    %q3bw{t} = vector.shrui {hm}, %q3bsv{u} : vector<16xi8>")
+                e(f"    %q3bit{t} = vector.andi %q3bw{t}, %q3m1v : vector<16xi8>")
+                e(f"    %q3b2{t} = vector.shli %q3bit{t}, %q3s2v : vector<16xi8>")
+                e(f"    %q3lb{t} = vector.ori %q3low{t}, %q3b2{t} : vector<16xi8>")
+                e(f"    %q3qn{t} = vector.subi %q3lb{t}, %q3f4v : vector<16xi8>")
             e(f"    %q3qf{t} = vector.sitofp %q3qn{t} : vector<16xi8> to vector<16xf32>")
-            e(f"    %q3l8{t} = scalar.extui {lo8} : i8 to i32")
+            if Q3_W:
+                e(f"    %q3l8{t} = scalar.addi {lo8}, %c0i : i32")
+            else:
+                e(f"    %q3l8{t} = scalar.extui {lo8} : i8 to i32")
             e(f"    %q3l4s{t} = scalar.shrui %q3l8{t}, %q3s4{u} : i32")
             e(f"    %q3l4{t} = scalar.andi %q3l4s{t}, %c15i : i32")
-            e(f"    %q3h8{t} = scalar.extui {hi8} : i8 to i32")
+            if Q3_W:
+                e(f"    %q3h8{t} = scalar.addi {hi8}, %c0i : i32")
+            else:
+                e(f"    %q3h8{t} = scalar.extui {hi8} : i8 to i32")
             e(f"    %q3h2s{t} = scalar.shrui %q3h8{t}, %q3s2{u} : i32")
             e(f"    %q3h2{t} = scalar.andi %q3h2s{t}, %c3i : i32")
             e(f"    %q3h4{t} = scalar.shli %q3h2{t}, %c4i : i32")
@@ -1289,7 +1371,14 @@ def q3k_setup():
             "  %q3c3b = scalar.constant 3 : i8", "  %q3c1b = scalar.constant 1 : i8",
             "  %q3c2b = scalar.constant 2 : i8", "  %q3c4b = scalar.constant 4 : i8",
             "  %q3m3v = vector.splat %q3c3b : vector<16xi8>", "  %q3m1v = vector.splat %q3c1b : vector<16xi8>",
-            "  %q3s2v = vector.splat %q3c2b : vector<16xi8>", "  %q3f4v = vector.splat %q3c4b : vector<16xi8>"]
+            "  %q3s2v = vector.splat %q3c2b : vector<16xi8>", "  %q3f4v = vector.splat %q3c4b : vector<16xi8>",
+            "  %q3c94i = scalar.constant 94 : i32", "  %q3c16i = scalar.constant 16 : i32",
+            "  %c255i_3 = scalar.constant 255 : i32",
+            "  %q3k3 = scalar.constant 50529027 : i32", "  %q3m3w = vector.splat %q3k3 : vector<4xi32>",
+            "  %q3k1 = scalar.constant 16843009 : i32", "  %q3m1w = vector.splat %q3k1 : vector<4xi32>",
+            "  %q3k2 = scalar.constant 2 : i32", "  %q3s2w = vector.splat %q3k2 : vector<4xi32>",
+            "  %q3k80 = scalar.constant -2139062144 : i32", "  %q3m80w = vector.splat %q3k80 : vector<4xi32>",
+            "  %q3k4 = scalar.constant 67372036 : i32", "  %q3m4w = vector.splat %q3k4 : vector<4xi32>"]
 
 
 FMTS = {

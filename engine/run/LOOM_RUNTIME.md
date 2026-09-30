@@ -1557,6 +1557,17 @@ standalone Q4_K 5.93 -> 5.47, IQ4_XS 9.60 -> 9.45 ms. Q5_K is neutral (10.76 ->
 10.86, 160 -> 144 VGPRs) and keeps its loads. pp2048 paired (candidate second):
 3598 -> 3578 ms, hidden md5 unchanged.
 
+The same two fixes for Q3_K and Q5_K. Q3_K (`YAH_TG_Q3W`): scales[12] and d
+from one 16-byte load at block offset 94, and the 2+1-bit quant assembled on
+32-bit words -- `(w >> 2sp) & 0x03030303`, `((hm >> g) & 0x01010101) << 2`, and
+the -4 as `(x | 0x80808080) - 0x04040404 ^ 0x80808080` so no borrow crosses a
+byte -- where the i8-vector form lowered per element: 11.49 -> 10.32 ms
+standalone (decode-ahead on top: 10.61, so it stays off for Q3_K). Q5_K: its
+fifth bit on words (`((qh >> g) & 0x01010101) << 4`) 10.76 -> 10.19, and then the
+header load, neutral before (the per-byte bit path was the limit), takes it to
+9.78. pp2048 paired: the Q3_K/Q5_K rows -18.9 ms while every other row drifted
++30.6 (the second-run bias), hidden md5 unchanged.
+
 Also measured with it: spreading an IQ4_XS group over 2 or 4 lanes
 (`YAH_TG_SPLIT`) removes the decode imbalance (the top barrier falls from 49%
 to 20% of wave time at 4) but makes the SIMDs VALU-issue-bound (VALU stall
