@@ -117,6 +117,11 @@ ONEBAR = os.environ.get("YAH_TG_ONEBAR", "0") == "1"
 # and decoded into it. ATT (real layer-4 data): HIP's IQ4_XS MMAs wait on the
 # busy pipe (24% stall) while ours found it idle (3%) after every barrier.
 XBAR = os.environ.get("YAH_TG_XBAR", "0") == "1"
+# ABL: phase-pricing ablations, the same bits as HIP's gemm_bench RunAblate --
+# 1 drops the phase loop's barriers, 2 the register->LDS commit (decoded
+# weight and activation stores), 4 the global fetch (the carried prefetch is
+# re-used), 8 the epilogue store. Wrong results on purpose; timing only.
+ABL = int(os.environ.get("YAH_TG_ABL", "0"))
 # policy of the K-phase loop (e.g. "unroll(%c2) schedule(recurrence)")
 PPOL = os.environ.get("YAH_TG_PPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
@@ -647,8 +652,11 @@ def gen(fmt, kind="kstore"):
         e("    %phg_n = scalar.muli %ph_ni, %cgppi : i32")
         e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
         Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
-        L.extend(Ln)
-        nxt = G.pack_vals(e, nxt, "n")
+        if ABL & 4:
+            nxt = cur_w
+        else:
+            L.extend(Ln)
+            nxt = G.pack_vals(e, nxt, "n")
         if DECAHEAD and ONEBAR:
             e("    %kk_n = index.mul %kp_n, %cksub : index")
         elif DECAHEAD:
@@ -657,7 +665,10 @@ def gen(fmt, kind="kstore"):
             e("    %kk_n = index.mul %kp_a, %cksub : index")
         else:
             e("    %kk_n = index.mul %kp_n, %cksub : index")
-        anx = a_loads("na_", "%kk_n")
+        if ABL & 4:
+            anx = [(nm, "vector<8xf16>") for nm in cur_a]
+        else:
+            anx = a_loads("na_", "%kk_n")
         if not (DECAHEAD and ONEBAR):
             e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         if DECAHEAD:
@@ -981,11 +992,45 @@ def swiglu_epilogue(e, arow):
             e("  }")
 
 
+def ablate(text):
+    """YAH_TG_ABL bits 1/2/8 on the generated kernel: inside the phase loop drop
+    barriers (1) and the weight/activation LDS stores (2); drop the output stores
+    after the loop (8)."""
+    if not ABL:
+        return text
+    import re
+    lines = text.split("\n")
+    start = next(i for i, l in enumerate(lines) if re.search(r"= scf\.for %kp = ", l))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "  }")
+    drop = set()
+    if ABL & 2:
+        # the decode block goes whole: emptying only its stores leaves a masked
+        # region the backend rejects (masked_region_merge_vgpr_values)
+        for i in range(0, end):
+            if re.match(r"\s*scf\.if %(dec_wave|decoder) \{", lines[i]) and i not in drop:
+                ind = len(lines[i]) - len(lines[i].lstrip())
+                j = next(j for j in range(i + 1, end) if lines[j] == " " * ind + "}")
+                drop.update(range(i, j + 1))
+    out = []
+    for i, l in enumerate(lines):
+        if i in drop:
+            continue
+        inloop = start < i < end
+        if inloop and ABL & 1 and "kernel.barrier" in l:
+            continue
+        if inloop and ABL & 2 and re.match(r"\s*vector\.store .*%(al_rows|al_st|wl_view|wl_dec|wl_fm|al_fm|xwd|xar)\[", l):
+            continue
+        if i > end and ABL & 8 and re.match(r"\s*(vector\.store|vector\.fragment\.store<result>) .*%(out_flat|out_t_view)\[", l):
+            continue
+        out.append(l)
+    return "\n".join(out)
+
+
 def main():
     fmt = sys.argv[1]
     kind = os.environ.get("YAH_TG_KIND", "kstore")
     out = sys.argv[2] if len(sys.argv) > 2 else f"yah_tile_{fmt}_{kind}.loom"
-    open(out, "w").write(gen(fmt, kind))
+    open(out, "w").write(ablate(gen(fmt, kind)))
     print(out)
 
 

@@ -1765,6 +1765,34 @@ HIP pays one barrier per 16 WMMAs per wave, we pay one per 8.
   (Fixed on the way: fragment-major 8- and 16-wide stores now prove their
   alignment and stay b128.)
 
+**Attribution in GPU cycles (phase-pricing ablations, 2026-09-30).** The same
+ablations on both kernels, real layer-4 bytes, `GRBM_GUI_ACTIVE` per dispatch
+(rocprofv3 --pmc; Loom through `loomhip`; HIP via `gemm_bench ablate:iq4xs`,
+Loom via `YAH_TG_ABL`, same bits). WMMA floor 17.83 M cycles:
+
+| variant | HIP M cycles | Loom M cycles | Loom/HIP |
+|---|---:|---:|---:|
+| control | 23.80 | 27.46 | 1.154 |
+| noBarrier (1) | 22.11 | 30.06 | 1.360 |
+| noCommit (2): no decode, no LDS stores | 19.43 | 23.21 | 1.194 |
+| noFetch (4) | 21.23 | 26.16 | 1.233 |
+| noStore (8): no epilogue store | 23.61 | 26.70 | 1.131 |
+
+Decode + commit costs the same on both sides (4.37 vs 4.25 M cycles): **the
+decoder is not the gap.** The whole 3.66 M-cycle gap sits in the skeleton
+(fragment loads from LDS, WMMA, barriers, fetch, epilogue). Our epilogue costs
+3.8x HIP's (0.76 vs 0.19 M). Removing the barriers slows us down (+9.5%)
+while it speeds HIP up (-7.1%). The stacked variants (6/14/15, both sides)
+read 0 cycles in the first capture: unverified.
+
+Per-wave ATT views of the same kernels (scratch tools `critpath.py`,
+`simdtl.py`): on the traced SIMD HIP's matrix pipe is busy 52.9% of the time
+and ours 43.0%; we lose it mostly to fully idle time (36.7% vs 30.4%: more
+barrier waiting, plus the decoders' dependent VALU chains stalling). The
+barrier-interval critical path is 31% decode VALU for us, where HIP's is
+mostly WMMA. Next: price the skeleton pieces separately (LDS fragment reads
+vs barriers vs epilogue), starting with the 3.8x epilogue.
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.

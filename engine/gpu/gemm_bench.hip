@@ -277,6 +277,9 @@ void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
       fp32_x.data(), fp32_x.size());
   gufo::hip::LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(),
                                nullptr);
+  HIP_CHECK(hipDeviceSynchronize());
+  LoadOverride("YAH_BENCH_W", weights.data(), weight_bytes);
+  LoadOverride("YAH_BENCH_A", half_x.data(), batch * k * sizeof(short));
   // 16 is the control (iglp_opt(0), which the IQ types get by default).
   // 256 interleaves the next stage's global fetch into the K loop; 4096 batches
   // every B fragment load ahead of the MMA block, which is the pipelining
@@ -287,9 +290,13 @@ void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
   // produce wrong results on purpose; the point is to price each phase against
   // the phase clock, which says staging plus barriers is 16% and the untimed
   // prologue/epilogue another 14%.
-  const int values[5] = {16, 1, 2, 4, 8};
-  const char* names[5] = {"control", "noBarrier", "noCommit", "noFetch",
-                          "noStore"};
+  // 6/14/15 stack the ablations (noCommit+noFetch, +noStore, +noBarrier) to
+  // price the bare LDS->MMA skeleton against another kernel's.
+  constexpr int kVariants = 8;
+  const int values[kVariants] = {16, 1, 2, 4, 8, 6, 14, 15};
+  const char* names[kVariants] = {"control", "noBarrier", "noCommit", "noFetch",
+                                  "noStore", "noCommitFetch", "noCommitFetchStore",
+                                  "noAll"};
   const auto launch = [&](int variant) {
     if (variant == 1)
       LaunchAblate<Type, 1>(weights.data(), half_x.data(), y.data(), batch, m, k,
@@ -303,6 +310,15 @@ void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
     else if (variant == 8)
       LaunchAblate<Type, 8>(weights.data(), half_x.data(), y.data(), batch, m, k,
                             nullptr);
+    else if (variant == 6)
+      LaunchAblate<Type, 6>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                            nullptr);
+    else if (variant == 14)
+      LaunchAblate<Type, 14>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                             nullptr);
+    else if (variant == 15)
+      LaunchAblate<Type, 15>(weights.data(), half_x.data(), y.data(), batch, m, k,
+                             nullptr);
     else
       LaunchAblate<Type, 16>(weights.data(), half_x.data(), y.data(), batch, m,
                              k, nullptr);
@@ -318,8 +334,8 @@ void RunAblate(std::size_t m, std::size_t k, std::size_t batch,
            iterations;
   };
   for (int round = 0; round < 5; ++round) {
-    for (int i = 0; i < 5; ++i) {
-      const int idx = (i + round) % 5;
+    for (int i = 0; i < kVariants; ++i) {
+      const int idx = (i + round) % kVariants;
       const double ms = timed(values[idx]);
       const double tflops = (2.0 * static_cast<double>(m) * k * batch) /
                             (ms * 1e9);
