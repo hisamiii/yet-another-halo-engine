@@ -61,6 +61,18 @@ IQ4_MULF = os.environ.get("YAH_TG_IQ4MULF", "")
 # Q4_K/Q5_K nibbles on 32-bit words (bit-identical; with the tile GEMM's
 # decode-ahead Q4_K 6.18 -> 5.96 ms standalone). YAH_TG_Q4UITOFP=0 restores.
 Q4_UITOFP = os.environ.get("YAH_TG_Q4UITOFP", "1") == "1"
+# SPLIT: lanes per decoded 32-element group (IQ4_XS). The tile generator sets
+# it; each lane then decodes 32/SPLIT elements (%sub_i: its part). 1 = a lane
+# decodes the whole group.
+SPLIT = 1
+# IQ4_HDR: load the IQ4_XS block header as one 8-byte vector (bit-identical)
+IQ4_HDR = os.environ.get("YAH_TG_IQ4HDR", "1") == "1"
+# Q4_HDR: the Q4_K/Q5_K header (d, dmin, scales[12]) as one 16-byte load.
+# Each byte load carried its own address clamp: Q4_K VALU per WMMA 10.4 -> 6.6,
+# 5.93 -> 5.47 ms standalone. Q5_K is neutral (10.76 -> 10.86), so the tile
+# generator turns it on for Q4_K only unless YAH_TG_Q4HDR is set.
+Q4_HDR_ENV = os.environ.get("YAH_TG_Q4HDR")
+Q4_HDR = Q4_HDR_ENV == "1"
 
 KSUB = PH = GPP = GPL = ROWP = None
 
@@ -185,13 +197,22 @@ def iq4xs_loads(p, blk, gb):
     L = []
     e = L.append
     vals = []
+    if IQ4_HDR:
+        # the 8-byte header (d, scales_h, scales_l[4]) as one load, as HIP's
+        # CacheIqHeader does: one VMEM op instead of four byte/half loads
+        e(f"    %{p}hd_ix = index.cast {blk} : i32 to index")
+        e(f"    %{p}hd_lo = index.max %{p}hd_ix, %c0 : index")
+        e(f"    %{p}hd_idx = index.min %{p}hd_lo, %w_lim8 : index")
+        e(f"    %{p}hdr = vector.load %w_view[%{p}hd_idx] : view<[%w_bytes]xi8> -> vector<8xi8>")
+        vals.append((f"%{p}hdr", "vector<8xi8>"))
     e(f"    %{p}d_h_i = scalar.shrui {blk}, %c1i : i32")
     e(f"    %{p}d_ix = index.cast %{p}d_h_i : i32 to index")
     e(f"    %{p}d_lo = index.max %{p}d_ix, %c0 : index")
     e(f"    %{p}d_idx = index.min %{p}d_lo, %w_half_last : index")
-    e(f"    %{p}dh = view.load %w_f16_view[%{p}d_idx] : view<[%w_halfs]xf16> -> f16")
-    vals.append((f"%{p}dh", "f16"))
-    for o in (2, 3):
+    if not IQ4_HDR:
+        e(f"    %{p}dh = view.load %w_f16_view[%{p}d_idx] : view<[%w_halfs]xf16> -> f16")
+        vals.append((f"%{p}dh", "f16"))
+    for o in (() if IQ4_HDR else (2, 3)):
         e(f"    %{p}sh{o}_i = scalar.addi {blk}, %c{o}i : i32")
         e(f"    %{p}sh{o}_ix = index.cast %{p}sh{o}_i : i32 to index")
         e(f"    %{p}sh{o}_lo = index.max %{p}sh{o}_ix, %c0 : index")
@@ -206,13 +227,26 @@ def iq4xs_loads(p, blk, gb):
         e(f"    %{p}sl_ix{u} = index.cast %{p}sl_j{u} : i32 to index")
         e(f"    %{p}sl_lo{u} = index.max %{p}sl_ix{u}, %c0 : index")
         e(f"    %{p}sl_idx{u} = index.min %{p}sl_lo{u}, %w_last : index")
-        e(f"    %{p}sl{u} = view.load %w_view[%{p}sl_idx{u}] : view<[%w_bytes]xi8> -> i8")
-        vals.append((f"%{p}sl{u}", "i8"))
+        if not IQ4_HDR:
+            e(f"    %{p}sl{u} = view.load %w_view[%{p}sl_idx{u}] : view<[%w_bytes]xi8> -> i8")
+            vals.append((f"%{p}sl{u}", "i8"))
         e(f"    %{p}g16_{u} = scalar.shli %{p}g{u}, %c4i : i32")
         e(f"    %{p}qs_a{u} = scalar.addi {blk}, %c8i : i32")
         e(f"    %{p}qs_b{u} = scalar.addi %{p}qs_a{u}, %{p}g16_{u} : i32")
         e(f"    %{p}qs_ix{u} = index.cast %{p}qs_b{u} : i32 to index")
         e(f"    %{p}qs_lo{u} = index.max %{p}qs_ix{u}, %c0 : index")
+        if SPLIT > 1:
+            # this lane's 16/SPLIT qs bytes: low nibbles are elements
+            # sub*n.., high nibbles 16 + sub*n..
+            n = 16 // SPLIT
+            e(f"    %{p}qs_s{u} = scalar.muli %sub_i, %c{n}i : i32")
+            e(f"    %{p}qs_c{u} = scalar.addi %{p}qs_b{u}, %{p}qs_s{u} : i32")
+            e(f"    %{p}qs_cx{u} = index.cast %{p}qs_c{u} : i32 to index")
+            e(f"    %{p}qs_cl{u} = index.max %{p}qs_cx{u}, %c0 : index")
+            e(f"    %{p}qs_ci{u} = index.min %{p}qs_cl{u}, %w_lim{n} : index")
+            e(f"    %{p}q{u} = vector.load %w_view[%{p}qs_ci{u}] : view<[%w_bytes]xi8> -> vector<{n}xi8>")
+            vals.append((f"%{p}q{u}", f"vector<{n}xi8>"))
+            continue
         e(f"    %{p}qs_idx{u} = index.min %{p}qs_lo{u}, %w_lim : index")
         e(f"    %{p}q{u} = vector.load %w_view[%{p}qs_idx{u}] : view<[%w_bytes]xi8> -> vector<16xi8>")
         vals.append((f"%{p}q{u}", "vector<16xi8>"))
@@ -228,20 +262,40 @@ def iq4xs_compute(v, gb):
     L = []
     e = L.append
     it = iter(v)
-    dh = next(it); s2 = next(it); s3 = next(it)
-    e(f"    %d = scalar.extf {dh} : f16 to f32")
-    e(f"    %sh2_v = scalar.extui {s2} : i8 to i32")
-    e(f"    %sh3_v = scalar.extui {s3} : i8 to i32")
-    e("    %sh3_s = scalar.shli %sh3_v, %c8i : i32")
-    e("    %shv = scalar.ori %sh2_v, %sh3_s : i32")
+    if IQ4_HDR:
+        hdr = next(it)
+        e(f"    %hdw = vector.bitcast {hdr} : vector<8xi8> to vector<2xi32>")
+        e("    %hdw0 = vector.extract %hdw[0] : vector<2xi32> -> i32")
+        e("    %hdw1 = vector.extract %hdw[1] : vector<2xi32> -> i32")
+        e("    %hd16 = scalar.trunci %hdw0 : i32 to i16")
+        e("    %hdf = scalar.bitcast %hd16 : i16 to f16")
+        e("    %d = scalar.extf %hdf : f16 to f32")
+        e("    %shv = scalar.shrui %hdw0, %c16i_h : i32")
+    else:
+        dh = next(it); s2 = next(it); s3 = next(it)
+        e(f"    %d = scalar.extf {dh} : f16 to f32")
+        e(f"    %sh2_v = scalar.extui {s2} : i8 to i32")
+        e(f"    %sh3_v = scalar.extui {s3} : i8 to i32")
+        e("    %sh3_s = scalar.shli %sh3_v, %c8i : i32")
+        e("    %shv = scalar.ori %sh2_v, %sh3_s : i32")
     for u in range(GPL):
-        sl = next(it); q = next(it)
+        if IQ4_HDR:
+            q = next(it)
+        else:
+            sl = next(it); q = next(it)
         e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
         e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
         e(f"    %gp{u} = scalar.andi %g{u}, %c1i : i32")
         e(f"    %sh4_{u} = scalar.shli %gp{u}, %c2i : i32")
         e(f"    %sh2_{u} = scalar.shli %g{u}, %c1i : i32")
-        e(f"    %slb{u} = scalar.extui {sl} : i8 to i32")
+        if IQ4_HDR:
+            # scales_l[g/2] is byte g/2 of the header's second word
+            e(f"    %slg{u} = scalar.shrui %g{u}, %c1i : i32")
+            e(f"    %sls{u} = scalar.shli %slg{u}, %c3i : i32")
+            e(f"    %slw{u} = scalar.shrui %hdw1, %sls{u} : i32")
+            e(f"    %slb{u} = scalar.andi %slw{u}, %c255i_h : i32")
+        else:
+            e(f"    %slb{u} = scalar.extui {sl} : i8 to i32")
         e(f"    %sc_sh{u} = scalar.shrui %slb{u}, %sh4_{u} : i32")
         e(f"    %sc_l{u} = scalar.andi %sc_sh{u}, %c15i : i32")
         e(f"    %sc_ha{u} = scalar.shrui %shv, %sh2_{u} : i32")
@@ -251,6 +305,27 @@ def iq4xs_compute(v, gb):
         e(f"    %sc{u} = scalar.subi %sc6_{u}, %c32i : i32")
         e(f"    %sc_f{u} = scalar.sitofp %sc{u} : i32 to f32")
         e(f"    %dsc{u} = scalar.mulf %d, %sc_f{u} : f32")
+        if SPLIT > 1:
+            assert not IQ4_F16 and not IQ4_MULF
+            n = 16 // SPLIT
+            e(f"    %dsc_vs{u} = vector.splat %dsc{u} : vector<{n}xf32>")
+            e(f"    %m15s{u} = vector.splat %c15b_iq : vector<{n}xi8>")
+            e(f"    %s4s{u} = vector.splat %c4b_iq : vector<{n}xi8>")
+            e(f"    %nlo{u} = vector.andi {q}, %m15s{u} : vector<{n}xi8>")
+            e(f"    %nhi{u} = vector.shrui {q}, %s4s{u} : vector<{n}xi8>")
+            for half, nib in (("lo", f"%nlo{u}"), ("hi", f"%nhi{u}")):
+                e(f"    %c{half}{u} = vector.table.lookup %kvt[{nib}] : vector<16xi8>, vector<{n}xi8> -> vector<{n}xi8>")
+                e(f"    %f{half}{u} = vector.sitofp %c{half}{u} : vector<{n}xi8> to vector<{n}xf32>")
+                e(f"    %v{half}{u} = vector.mulf %dsc_vs{u}, %f{half}{u} : vector<{n}xf32>")
+                e(f"    %h{half}{u} = vector.fptrunc %v{half}{u} : vector<{n}xf32> to vector<{n}xf16>")
+            _col_of(e, u)
+            e(f"    %subn{u}_i = scalar.muli %sub_i, %c{n}i : i32")
+            e(f"    %subn{u} = index.cast %subn{u}_i : i32 to index")
+            e(f"    %cols{u} = index.add %col{u}, %subn{u} : index")
+            e(f"    %colsh{u} = index.add %cols{u}, %c16 : index")
+            e(f"    vector.store %hlo{u}, %wl_view[%drow, %cols{u}] : vector<{n}xf16>, view<{LR}x{ROWP}xf16>")
+            e(f"    vector.store %hhi{u}, %wl_view[%drow, %colsh{u}] : vector<{n}xf16>, view<{LR}x{ROWP}xf16>")
+            continue
         e(f"    %dsc_v{u} = vector.splat %dsc{u} : vector<16xf32>")
         e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
         e(f"    %nhi{u} = vector.shrui {q}, %s4v : vector<16xi8>")
@@ -694,14 +769,25 @@ def q4k_loads(p, blk, gb, q5=False):
     L = []
     e = L.append
     vals = []
-    _ldd(e, p, blk)
-    vals.append((f"%{p}dh", "f16"))
-    e(f"    %{p}dm_h_i = scalar.addi %{p}d_h_i, %c1i : i32")
-    e(f"    %{p}dm_ix = index.cast %{p}dm_h_i : i32 to index")
-    e(f"    %{p}dm_lo = index.max %{p}dm_ix, %c0 : index")
-    e(f"    %{p}dm_idx = index.min %{p}dm_lo, %w_half_last : index")
-    e(f"    %{p}dmh = view.load %w_f16_view[%{p}dm_idx] : view<[%w_halfs]xf16> -> f16")
-    vals.append((f"%{p}dmh", "f16"))
+    if Q4_HDR:
+        # d, dmin and scales[12] as one 16-byte load (blocks are 16-aligned)
+        e(f"    %{p}hd_ix = index.cast {blk} : i32 to index")
+        e(f"    %{p}hd_lo = index.max %{p}hd_ix, %c0 : index")
+        e(f"    %{p}hd_idx = index.min %{p}hd_lo, %w_lim16 : index")
+        e(f"    %{p}hdr = vector.load %w_view[%{p}hd_idx] : view<[%w_bytes]xi8> -> vector<16xi8>")
+        vals.append((f"%{p}hdr", "vector<16xi8>"))
+    else:
+        _ldd(e, p, blk)
+        vals.append((f"%{p}dh", "f16"))
+    if not Q4_HDR:
+        e(f"    %{p}dm_h_i = scalar.addi %{p}d_h_i, %c1i : i32")
+    if not Q4_HDR:
+        e(f"    %{p}dm_ix = index.cast %{p}dm_h_i : i32 to index")
+        e(f"    %{p}dm_lo = index.max %{p}dm_ix, %c0 : index")
+        e(f"    %{p}dm_idx = index.min %{p}dm_lo, %w_half_last : index")
+    if not Q4_HDR:
+        e(f"    %{p}dmh = view.load %w_f16_view[%{p}dm_idx] : view<[%w_halfs]xf16> -> f16")
+        vals.append((f"%{p}dmh", "f16"))
     if q5:
         # the 32-byte qh plane (offset 16) is shared by every group of the block
         e(f"    %{p}qh_a = scalar.addi {blk}, %c16i : i32")
@@ -723,6 +809,8 @@ def q4k_loads(p, blk, gb, q5=False):
             _ldv(e, p, f"qb_v{u}", f"%{p}qb{u}", 16)
             vals.append((f"%{p}qa_v{u}", "vector<16xi8>"))
             vals.append((f"%{p}qb_v{u}", "vector<16xi8>"))
+        if Q4_HDR:
+            continue
         e(f"    %{p}ga{u} = scalar.addi {blk}, %{p}g{u} : i32")
         e(f"    %{p}la_o{u} = scalar.addi %{p}ga{u}, %c4i : i32")
         e(f"    %{p}lb_o{u} = scalar.addi %{p}ga{u}, %c8i : i32")
@@ -739,7 +827,19 @@ def q4k_compute(v, gb, q5=False):
     L = []
     e = L.append
     it = iter(v)
-    dh = next(it); dmh = next(it)
+    if Q4_HDR:
+        hdr = next(it)
+        e(f"    %hdw = vector.bitcast {hdr} : vector<16xi8> to vector<4xi32>")
+        for w in range(4):
+            e(f"    %hdw{w} = vector.extract %hdw[{w}] : vector<4xi32> -> i32")
+        e("    %hdd16 = scalar.trunci %hdw0 : i32 to i16")
+        e("    %hdm0 = scalar.shrui %hdw0, %c16i_q : i32")
+        e("    %hdm16 = scalar.trunci %hdm0 : i32 to i16")
+        e("    %hddf = scalar.bitcast %hdd16 : i16 to f16")
+        e("    %hdmf = scalar.bitcast %hdm16 : i16 to f16")
+        dh, dmh = "%hddf", "%hdmf"
+    else:
+        dh = next(it); dmh = next(it)
     if q5:
         qha = next(it); qhb = next(it)
     e(f"    %d = scalar.extf {dh} : f16 to f32")
@@ -747,12 +847,25 @@ def q4k_compute(v, gb, q5=False):
     for u in range(GPL):
         if u % 2 == 0:
             qa = next(it); qb = next(it)
-        la = next(it); lb = next(it); lc = next(it)
+        if not Q4_HDR:
+            la = next(it); lb = next(it); lc = next(it)
         e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
         e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
-        e(f"    %la_{u} = scalar.extui {la} : i8 to i32")
-        e(f"    %lb_{u} = scalar.extui {lb} : i8 to i32")
-        e(f"    %lc_{u} = scalar.extui {lc} : i8 to i32")
+        if Q4_HDR:
+            # header byte k = 4 + g (la), 8 + g (lb), g (lc): word k/4, byte k%4;
+            # g < 8, so each picks between two adjacent words on g/4
+            e(f"    %hq{u} = scalar.shrui %g{u}, %c2i : i32")
+            e(f"    %hq1_{u} = scalar.cmpi eq, %hq{u}, %c1i : i32")
+            e(f"    %hr{u} = scalar.andi %g{u}, %c3i : i32")
+            e(f"    %hs{u} = scalar.shli %hr{u}, %c3i : i32")
+            for nm, w0 in (("la", 1), ("lb", 2), ("lc", 0)):
+                e(f"    %{nm}w{u} = scf.select %hq1_{u}, %hdw{w0 + 1}, %hdw{w0} : i32")
+                e(f"    %{nm}s{u} = scalar.shrui %{nm}w{u}, %hs{u} : i32")
+                e(f"    %{nm}_{u} = scalar.andi %{nm}s{u}, %c255i_q : i32")
+        else:
+            e(f"    %la_{u} = scalar.extui {la} : i8 to i32")
+            e(f"    %lb_{u} = scalar.extui {lb} : i8 to i32")
+            e(f"    %lc_{u} = scalar.extui {lc} : i8 to i32")
         e(f"    %slo{u} = scalar.cmpi slt, %g{u}, %c4i : i32")
         e(f"    %sc{u}, %mn{u} = scf.if %slo{u} -> (i32, i32) {{")
         e(f"      %s_a{u} = scalar.andi %la_{u}, %c63i : i32")
@@ -836,7 +949,8 @@ def q4k_setup():
             "  %m15v = vector.splat %c15b : vector<16xi8>", "  %s4v = vector.splat %c4b : vector<16xi8>",
             "  %one8v = vector.splat %c1b : vector<16xi8>",
             "  %c0f4 = scalar.constant 252645135 : i32", "  %m0f4 = vector.splat %c0f4 : vector<4xi32>",
-            "  %q4sh0 = scalar.constant 0 : i32", "  %q4sh4 = scalar.constant 4 : i32"]
+            "  %q4sh0 = scalar.constant 0 : i32", "  %q4sh4 = scalar.constant 4 : i32",
+            "  %c16i_q = scalar.constant 16 : i32", "  %c255i_q = scalar.constant 255 : i32"]
 
 
 def iq2xxs_loads(p, blk, gb):
@@ -1047,6 +1161,8 @@ def q8_0_compute(v, gb):
 
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
+    L += ["  %c15b_iq = scalar.constant 15 : i8", "  %c4b_iq = scalar.constant 4 : i8",
+          "  %c16i_h = scalar.constant 16 : i32", "  %c255i_h = scalar.constant 255 : i32"]
     L.append("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
     if IQ4_F16:
         bits = [struct.unpack("<H", struct.pack("<e", float(v)))[0] for v in IQ4_KVALUES]

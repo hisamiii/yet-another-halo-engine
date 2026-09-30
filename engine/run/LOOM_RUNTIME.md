@@ -1545,6 +1545,25 @@ variants from earlier env-driven builds, and the clean IQ2_XS gate+up is 43 ms
 slower. The decode-ahead set was assembled from the shipping set plus the
 regenerated IQ4_XS/Q4_K/Q5_K/Q6_K HALs.
 
+#### One header load per block
+
+The decoders fetched a block's header fields one by one -- IQ4_XS `d`,
+`scales_h`, `scales_l[g/2]`; Q4_K `d`, `dmin` and three scale bytes per group --
+each a 1-2 byte load with its own index arithmetic and clamp. One vector load of
+the header (8 bytes for IQ4_XS, 16 for Q4_K, both aligned in their blocks) plus
+shifts and masks gives the same values (`YAH_TG_IQ4HDR`, `YAH_TG_Q4HDR`).
+Q4_K's trace: VALU per WMMA 10.4 -> 6.6, VMEM ops per WMMA 0.57 -> 0.32;
+standalone Q4_K 5.93 -> 5.47, IQ4_XS 9.60 -> 9.45 ms. Q5_K is neutral (10.76 ->
+10.86, 160 -> 144 VGPRs) and keeps its loads. pp2048 paired (candidate second):
+3598 -> 3578 ms, hidden md5 unchanged.
+
+Also measured with it: spreading an IQ4_XS group over 2 or 4 lanes
+(`YAH_TG_SPLIT`) removes the decode imbalance (the top barrier falls from 49%
+to 20% of wave time at 4) but makes the SIMDs VALU-issue-bound (VALU stall
+45%): 9.55 / 9.84 ms alone, 9.65 / 9.96 with the header load. The phase-loop
+unroll still loses with the header load (10.14): its remaining full drains
+are `read_result_reuse` on other loads.
+
 #### Tile GEMM ideas measured and dropped
 
 - Grouped launch order (runs of 4 row groups x all token tiles): 10.25 -> 10.12

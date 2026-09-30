@@ -124,10 +124,14 @@ def configure(fmt):
     G.PH = 256 // ksub
     G.GPP = ksub // 32
     G.GPL = GPL_OF.get(fmt, 1)
+    # lanes per decoded group: with decode-ahead the non-decoding waves only
+    # wait, so spreading a group over SPLIT lanes shortens the critical path
+    G.SPLIT = int(os.environ.get("YAH_TG_SPLIT", "1")) if fmt == "iq4xs" else 1
+    G.Q4_HDR = G.Q4_HDR_ENV == "1" if G.Q4_HDR_ENV is not None else fmt == "q4k"
     G.LR = BM
     G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
     assert G.GPP % G.GPL == 0
-    assert (G.GPP // G.GPL) * BM <= LANES, "not enough lanes to decode a phase in one pass"
+    assert (G.GPP // G.GPL) * G.SPLIT * BM <= LANES, "not enough lanes to decode a phase in one pass"
     assert (ksub // 8) % APL == 0, "activation row does not split evenly over its lanes"
     return ksub
 
@@ -162,7 +166,7 @@ def gen(fmt, kind="kstore"):
     bufs = (["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
             + ["wstage", "ostage", "output"])
     sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "")
-    slots = G.GPP // G.GPL          # decoding lane groups of 64 per phase
+    slots = G.GPP // G.GPL * G.SPLIT   # decoding lane groups of BM per phase
     arow = ksub + (0 if FRAG else APAD)   # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
     aspl = aseg // APL              # of which one staging lane loads
@@ -319,7 +323,10 @@ def gen(fmt, kind="kstore"):
     e(f"  %cslots = index.constant {slots} : index")
     e("  %slot_c = index.min %slot, %cslots : index")
     e("  %decoder = index.cmp ult, %slot, %cslots : index")
-    e("  %slot_i = index.cast %slot_c : index to i32")
+    e("  %slot_i0 = index.cast %slot_c : index to i32")
+    e(f"  %csplit = scalar.constant {G.SPLIT} : i32")
+    e("  %slot_i = scalar.divui %slot_i0, %csplit : i32")
+    e("  %sub_i = scalar.remui %slot_i0, %csplit : i32")
     e(f"  %cgpl = scalar.constant {G.GPL} : i32")
     e("  %gl_i = scalar.muli %slot_i, %cgpl : i32")
     e("  %kphases = index.mul %k_blocks, %cph : index")
