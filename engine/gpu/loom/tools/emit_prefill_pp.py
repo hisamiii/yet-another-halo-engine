@@ -99,12 +99,19 @@ def _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind):
         return None
     # grouped launch order (gen_gemm_tile SWZ) where the row groups divide by it
     swz = int(os.environ.get("YAH_TILE_SWZ", "0"))
-    prev_swz = TG.SWZ
+    prev_swz, prev_da = TG.SWZ, TG.DECAHEAD_ENV
     TG.SWZ = swz if swz and (mt // rowgrp) % swz == 0 else 0
+    # decode-ahead lost on this one shape in two paired pp2048 profiles
+    # (IQ4_XS kres 5120 x 6144: 88.5 -> 93.7 / 95.5 ms); it keeps KSUB=64
+    if (fmt, kind, kb) in DECAHEAD_SKIP and prev_da is None:
+        TG.DECAHEAD_ENV = "0"
     try:
         return _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp)
     finally:
-        TG.SWZ = prev_swz
+        TG.SWZ, TG.DECAHEAD_ENV = prev_swz, prev_da
+
+
+DECAHEAD_SKIP = {("iq4xs", "kres", 24)}
 
 
 def _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp):

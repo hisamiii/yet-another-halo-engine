@@ -1492,6 +1492,41 @@ keep the chained kernel's f32 order, `(f32(d) * f32(scale)) * f32(quant)`, so
 the tile and shared kernels are bit-identical to it. Q3_K device time at pp2048,
 interleaved: 175/185 -> 142/151 ms (HIP 122 ms for the same dispatches).
 
+#### Decode one phase ahead, into a second weight tile
+
+Cutting decode VALU did nothing on its own (IQ4_XS fused multiply 426 -> 387
+static VALU, Q4_K word nibbles 622 -> 393: both within 1%), because the decode
+sat between two barriers: the decoding waves (half of them) ran a
+latency-bound chain while every wave's MMAs waited. HIP decodes the next tile
+after its barrier, overlapped with the MMAs. `YAH_TG_DECAHEAD` does the same
+inside the tile GEMM's schedule: phase p stores its activations, issues the
+loads for p+2 (weights) and p+1 (activations), passes the barrier, and then the
+decoding waves -- a wave-uniform branch on `kernel.subgroup.id`, since a
+divergent `scf.if` right before the MMA loop is rejected
+(`divergent_loop_single_entry`) -- decode phase p+1 into weight tile (p+1)%2
+while every wave multiplies tile p%2. Two weight tiles fit at KSUB=32 (53 KB
+with the epilogue slab). Same registers, same MMA order: bit-identical.
+
+Standalone (17408x5120, 10240x5120 for Q4_K), ms: IQ4_XS 9.97 -> 9.71, Q4_K
+6.18 -> 5.96 (with word nibbles; 6.33 without), Q5_K 11.85 -> 10.94, Q6_K 11.89
+-> 11.55, Q3_K 11.41 -> 11.41, IQ3_S 10.10 -> 10.96, IQ3_XXS 10.07 -> 10.79 (their
+grid tables are LDS reads that now contend with the fragment loads). Default on
+for IQ4_XS, Q4_K, Q5_K, Q6_K (`DECAHEAD_FMTS`), not for the 16-row tiles (16
+decoding lanes are not a wave), and not for IQ4_XS kres at K=6144, which lost in
+two paired profiles (`DECAHEAD_SKIP`, emit_prefill_pp.py). The Q4_K/Q5_K word
+nibbles (`(w >> s) & 0x0f0f0f0f` on i32, `vector.uitofp` -> `v_cvt_f32_ubyteN`)
+are now the default too.
+
+pp2048 device time, paired: TOTAL 3702 -> 3659 ms (HIP 3479, 1.064x -> 1.052x),
+hidden md5 unchanged. IQ4_XS gate+up -12, Q4_K resid -8/-5, Q4_K stores -6/-4/-3,
+IQ4_XS resid (K=17408) -6.
+
+Note: a clean emit differs from the shipping set in 11 GEMM HALs (IQ2_XS and
+Q2_K kStores, the unfused `gemm_residual_*`): the shipping set carries tuned
+variants from earlier env-driven builds, and the clean IQ2_XS gate+up is 43 ms
+slower. The decode-ahead set was assembled from the shipping set plus the
+regenerated IQ4_XS/Q4_K/Q5_K/Q6_K HALs.
+
 #### Tile GEMM ideas measured and dropped
 
 - Grouped launch order (runs of 4 row groups x all token tiles): 10.25 -> 10.12

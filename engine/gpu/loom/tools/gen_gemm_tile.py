@@ -50,7 +50,10 @@ WN = int(os.environ.get("YAH_TG_WN", "4"))     # waves along tokens
 TM, TN = BM // WM, BN // WN   # per-wave tile
 FM, FN = TM // 16, TN // 16   # fragments per wave
 NWAVE = WM * WN
-LANES = 32 * NWAVE
+# YAH_TG_W64=1: wave64 (accumulators vector<4xf32>, operand fragments still
+# vector<16xf16>; see LOOM_RUNTIME "wave64: under 192"). Direct epilogue.
+WS = 64 if os.environ.get("YAH_TG_W64", "0") == "1" else 32
+LANES = WS * NWAVE
 assert BM % (16 * WM) == 0 and BN % (16 * WN) == 0 and LANES >= BM and LANES % BN == 0
 ROWGRP = BM // 16             # m_tiles per workgroup
 APL = LANES // BN             # lanes staging one token row of the activation tile
@@ -58,6 +61,15 @@ APAD = int(os.environ.get("YAH_TG_APAD", "8"))
 # Global activation row pitch pad (f16). K*2-byte rows are multiples of 1024 B at
 # every model K, which aliases the token rows of one tile in the cache.
 AGPAD = int(os.environ.get("YAH_TG_AGPAD", "0"))
+# DECAHEAD=1: decode one phase ahead into a second weight tile, after the
+# barrier, so the decoding waves' VALU overlaps every wave's MMAs of the
+# current phase (HIP decodes the next tile after its barrier too). Needs two
+# weight tiles in LDS: KSUB=32 at 128 x 256.
+# Default on for the formats whose decode reads no LDS table (the IQ3 grids
+# contend with the MMA's fragment loads: IQ3_S 10.10 -> 10.96 ms standalone).
+DECAHEAD_FMTS = ("iq4xs", "q4k", "q5k", "q6k")
+DECAHEAD_ENV = os.environ.get("YAH_TG_DECAHEAD")
+DECAHEAD = DECAHEAD_ENV == "1"
 
 # f16 of padding per decoded weight row: unpadded rows are 128 B apart at
 # KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
@@ -93,7 +105,13 @@ KSUB_OF = {}
 
 
 def configure(fmt):
-    ksub = int(os.environ.get("YAH_TG_KSUB", KSUB_OF.get(fmt, 64)))
+    global DECAHEAD
+    DECAHEAD = DECAHEAD_ENV == "1" if DECAHEAD_ENV is not None else fmt in DECAHEAD_FMTS
+    # the decoding lanes must be whole waves (a wave-uniform branch): not so
+    # for the 16-row tiles, which keep the plain schedule
+    if DECAHEAD and ((32 // 32) // GPL_OF.get(fmt, 1) * BM) % WS:
+        DECAHEAD = False
+    ksub = int(os.environ.get("YAH_TG_KSUB", 32 if DECAHEAD else KSUB_OF.get(fmt, 64)))
     G.KSUB = ksub
     G.PAD = 0 if FRAG else WPAD
     G.ROWP = ksub + G.PAD
@@ -122,7 +140,7 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
     TM, TN = BM // WM, BN // WN
     FM, FN = TM // 16, TN // 16
     NWAVE = WM * WN
-    LANES = 32 * NWAVE
+    LANES = WS * NWAVE
     assert BM % (16 * WM) == 0 and BN % (16 * WN) == 0 and LANES >= BM and LANES % BN == 0
     ROWGRP = BM // 16
     APL = LANES // BN
@@ -142,7 +160,7 @@ def gen(fmt, kind="kstore"):
     arow = ksub + (0 if FRAG else APAD)   # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
     aspl = aseg // APL              # of which one staging lane loads
-    V8 = "vector<8xf32>"
+    V8 = "vector<8xf32>" if WS == 32 else "vector<4xf32>"
     VF = "vector<16xf16>"
     L = []
     e = L.append
@@ -150,7 +168,7 @@ def gen(fmt, kind="kstore"):
     e("//")
     e(f"// Tile GEMM for {fmt}: {NWAVE} wave32 waves over a {BM} x {BN} tile, {TM} x {TN} per wave,")
     e("// decoded weights and staged activations both in LDS. See the generator.")
-    e("amdgpu.target<gfx11-generic> @yah_tile_w32 {subgroup_size = 32}")
+    e(f"amdgpu.target<gfx11-generic> @yah_tile_w32 {{subgroup_size = {WS}}}")
     e("")
     for c in ("m_tiles", "k_blocks", "token_tiles"):
         e(f"config.decl @{sym}.{c} : %value: index where [range(%value, 1, 4096)]")
@@ -218,7 +236,8 @@ def gen(fmt, kind="kstore"):
     e("  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>")
     e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
     # LDS: decoded weight tile and staged activation tile
-    e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2} : offset")
+    e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2 * (2 if DECAHEAD else 1)} : offset")
+    e(f"  %wl_tb = index.constant {BM * G.ROWP * 2} : index")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
     # the LDS epilogue reuses one of the tiles for wave-private TM x 16 f32
@@ -226,7 +245,7 @@ def gen(fmt, kind="kstore"):
     # else the activation tile grows
     al_bytes = BN * arow * 2
     G.EPI_TILE = "%al"
-    if EPI_LDS and TM == 32 and NWAVE * TM * 16 * 4 > al_bytes:
+    if EPI_LDS and WS == 32 and TM == 32 and NWAVE * TM * 16 * 4 > al_bytes:
         if BM * G.ROWP * 2 >= NWAVE * TM * 16 * 4:
             G.EPI_TILE = "%wl"
         else:
@@ -262,7 +281,7 @@ def gen(fmt, kind="kstore"):
         e("  %wg_x = kernel.workgroup.id<x> : index")
         e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
-    e("  %wave = index.div %tid, %c32 : index")
+    e(f"  %wave = index.div %tid, %c{WS} : index")
     e(f"  %cwn = index.constant {WN} : index")
     e("  %wr = index.div %wave, %cwn : index")
     e("  %wt = index.rem %wave, %cwn : index")
@@ -315,7 +334,7 @@ def gen(fmt, kind="kstore"):
     L.extend(F["setup"]())
     e("  %z8s = scalar.constant 0 : i8")
     e("  %z8v = vector.splat %z8s : vector<8xi8>")
-    e("  %zeros = vector.constant 0.0 : vector<8xf32>")
+    e(f"  %zeros = vector.constant 0.0 : {V8}")
     e(f"  %init = vector.fragment<init> %zeros shape [%m, %n] : {V8}")
     NA = FM * FN
     types = ", ".join([V8] * NA)
@@ -334,9 +353,30 @@ def gen(fmt, kind="kstore"):
             vals.append((f"%{p}av{sg}", "vector<8xf16>"))
         return vals
 
-    # prefetch phase 0: weight bytes and activation row
-    L0, wv0 = loads("pf_", "%row_off_i", "%gl_i")
-    L.extend(L0)
+    if DECAHEAD:
+        assert not FRAG
+        # phase 0 decoded into weight tile 0 now; phase 1's bytes carried
+        L0, w00 = loads("pf_", "%row_off_i", "%gl_i")
+        L.extend(L0)
+        e("  scf.if %decoder {")
+        L.extend(compute([nm for nm, _ in w00], "%gl_i"))
+        e("  }")
+        e("  %kp1_l = index.sub %kphases, %c1 : index")
+        e("  %kp1 = index.min %c1, %kp1_l : index")
+        e("  %kb1 = index.div %kp1, %cph : index")
+        e("  %ph1 = index.rem %kp1, %cph : index")
+        e("  %kb1_i = index.cast %kb1 : index to i32")
+        e("  %ph1_i = index.cast %ph1 : index to i32")
+        e("  %blk1o = scalar.muli %kb1_i, %cbbi : i32")
+        e("  %blk1 = scalar.addi %row_off_i, %blk1o : i32")
+        e("  %gb1g = scalar.muli %ph1_i, %cgppi : i32")
+        e("  %gb1 = scalar.addi %gb1g, %gl_i : i32")
+        L1, wv0 = loads("p1_", "%blk1", "%gb1")
+        L.extend(L1)
+    else:
+        # prefetch phase 0: weight bytes and activation row
+        L0, wv0 = loads("pf_", "%row_off_i", "%gl_i")
+        L.extend(L0)
     orig0 = wv0
     wv0 = G.pack_vals(e, wv0, "0")
     av0 = a_loads("pa_", "%c0")
@@ -356,13 +396,14 @@ def gen(fmt, kind="kstore"):
     cur_w = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(wv0)]
     cur_a = [f"%cv{len(wv0) + x}" for x in range(len(av0))]
     # decode (only the decoding slots) into the weight tile
-    e("    scf.if %decoder {")
-    names = G.unpack_vals(e, cur_w, orig0)
-    if FRAG:
-        L.extend(frag_stores(compute(names, "%gb_i"), ksub))
-    else:
-        L.extend(compute(names, "%gb_i"))
-    e("    }")
+    if not DECAHEAD:
+        e("    scf.if %decoder {")
+        names = G.unpack_vals(e, cur_w, orig0)
+        if FRAG:
+            L.extend(frag_stores(compute(names, "%gb_i"), ksub))
+        else:
+            L.extend(compute(names, "%gb_i"))
+        e("    }")
     # stage the activation row into the LDS activation tile
     for sg, nm in enumerate(cur_a):
         e(f"    %as{sg}c = index.constant {8 * sg} : index")
@@ -382,7 +423,7 @@ def gen(fmt, kind="kstore"):
     # of IQ4_XS wave time in the ATT trace).
     if FENCE:
         e("    scf.schedule.fence")
-    e("    %kp_n0 = index.add %kp, %c1 : index")
+    e(f"    %kp_n0 = index.add %kp, %c{2 if DECAHEAD else 1} : index")
     e("    %kp_last = index.sub %kphases, %c1 : index")
     e("    %kp_n = index.min %kp_n0, %kp_last : index")
     e("    %kb_n = index.div %kp_n, %cph : index")
@@ -396,9 +437,42 @@ def gen(fmt, kind="kstore"):
     Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
     L.extend(Ln)
     nxt = G.pack_vals(e, nxt, "n")
-    e("    %kk_n = index.mul %kp_n, %cksub : index")
+    if DECAHEAD:
+        e("    %kp_a0 = index.add %kp, %c1 : index")
+        e("    %kp_a = index.min %kp_a0, %kp_last : index")
+        e("    %kk_n = index.mul %kp_a, %cksub : index")
+    else:
+        e("    %kk_n = index.mul %kp_n, %cksub : index")
     anx = a_loads("na_", "%kk_n")
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    if DECAHEAD:
+        # phase kp+1 into tile (kp+1)%2 while every wave multiplies tile kp%2
+        e("    %kp_d0 = index.add %kp, %c1 : index")
+        e("    %kp_d = index.min %kp_d0, %kp_last : index")
+        e("    %ph_d = index.rem %kp_d, %cph : index")
+        e("    %ph_di = index.cast %ph_d : index to i32")
+        e("    %phg_d = scalar.muli %ph_di, %cgppi : i32")
+        e("    %gb_d = scalar.addi %phg_d, %gl_i : i32")
+        e("    %buf_d = index.rem %kp_d0, %c2 : index")
+        e("    %off_d0 = index.mul %buf_d, %wl_tb : index")
+        e("    %off_d = index.cast %off_d0 : index to offset")
+        e(f"    %wl_dec = buffer.view %wl[%off_d] : buffer -> view<{BM}x{G.ROWP}xf16>")
+        e("    %buf_m = index.rem %kp, %c2 : index")
+        e("    %off_m0 = index.mul %buf_m, %wl_tb : index")
+        e("    %off_m = index.cast %off_m0 : index to offset")
+        e(f"    %wl_mma = buffer.view %wl[%off_m] : buffer -> view<{BM}x{G.ROWP}xf16>")
+        # decoding lanes are whole waves (tid < slots*BM): branch on the wave
+        # id so the branch is uniform -- a divergent one right before the MMA
+        # loop is rejected (divergent_loop_single_entry)
+        assert (slots * BM) % WS == 0
+        e("    %sg_id = kernel.subgroup.id : index")
+        e(f"    %cdecw = index.constant {slots * BM // WS} : index")
+        e("    %dec_wave = index.cmp ult, %sg_id, %cdecw : index")
+        e("    scf.if %dec_wave {")
+        names = G.unpack_vals(e, cur_w, orig0)
+        L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
+        e("    }")
+    wlv = "%wl_mma" if DECAHEAD else "%wl_view"
     cb = ", ".join(f"%b{i} = %a{i} : {V8}" for i in range(NA))
     e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
     for i in range(FM):
@@ -410,7 +484,7 @@ def gen(fmt, kind="kstore"):
             e(f"      %lrow{i} = index.add %lrk{i}, %ks : index")
             e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_fm[%lrow{i}, %c0] shape [%m, %k] : view<{BM * ksub // 16}x16xf16> -> {VF}")
         else:
-            e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_view[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
+            e(f"      %lhs{i} = vector.fragment.load<lhs> {wlv}[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
     for j in range(FN):
         e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
         if FRAG:
@@ -434,7 +508,7 @@ def gen(fmt, kind="kstore"):
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
-    if EPI_LDS and TM == 32:
+    if EPI_LDS and WS == 32 and TM == 32:
         lds_epilogue(e, kr, V8)
         e("  kernel.return")
         e("}")

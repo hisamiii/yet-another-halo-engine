@@ -58,6 +58,9 @@ PAD = int(os.environ.get("YAH_SD_PAD", "0"))
 # ISA does -- a numerics change).
 IQ4_F16 = os.environ.get("YAH_TG_IQ4F16", "0") == "1"
 IQ4_MULF = os.environ.get("YAH_TG_IQ4MULF", "")
+# Q4_K/Q5_K nibbles on 32-bit words (bit-identical; with the tile GEMM's
+# decode-ahead Q4_K 6.18 -> 5.96 ms standalone). YAH_TG_Q4UITOFP=0 restores.
+Q4_UITOFP = os.environ.get("YAH_TG_Q4UITOFP", "1") == "1"
 
 KSUB = PH = GPP = GPL = ROWP = None
 
@@ -783,8 +786,20 @@ def q4k_compute(v, gb, q5=False):
             # fifth bit: quant = nibble + ((qh[lane] >> g) & 1) * 16
             e(f"    %g8_{u} = scalar.trunci %g{u} : i32 to i8")
             e(f"    %g8v_{u} = vector.splat %g8_{u} : vector<16xi8>")
-        for half, q, qh in (("lo", qa, qha if q5 else None), ("hi", qb, qhb if q5 else None)):
+        if Q4_UITOFP:
+            # nibbles on whole 32-bit words, (w >> s) & 0x0f0f0f0f, as HIP
+            # does: per-byte i8 shifts and masks lower element by element
             if rt:
+                e(f"    %gshw{u} = vector.splat %gsh{u} : vector<4xi32>")
+            else:
+                e(f"    %gshw{u} = vector.splat %q4sh{0 if u % 2 == 0 else 4} : vector<4xi32>")
+        for half, q, qh in (("lo", qa, qha if q5 else None), ("hi", qb, qhb if q5 else None)):
+            if Q4_UITOFP:
+                e(f"    %qw{half}{u} = vector.bitcast {q} : vector<16xi8> to vector<4xi32>")
+                e(f"    %qws{half}{u} = vector.shrui %qw{half}{u}, %gshw{u} : vector<4xi32>")
+                e(f"    %qwm{half}{u} = vector.andi %qws{half}{u}, %m0f4 : vector<4xi32>")
+                e(f"    %nq{half}{u} = vector.bitcast %qwm{half}{u} : vector<4xi32> to vector<16xi8>")
+            elif rt:
                 e(f"    %nqs{half}{u} = vector.shrui {q}, %gshv{u} : vector<16xi8>")
                 e(f"    %nq{half}{u} = vector.andi %nqs{half}{u}, %m15v : vector<16xi8>")
             else:
@@ -796,7 +811,9 @@ def q4k_compute(v, gb, q5=False):
                 e(f"    %h16{half}{u} = vector.shli %hb{half}{u}, %s4v : vector<16xi8>")
                 e(f"    %n5{half}{u} = vector.addi %nq{half}{u}, %h16{half}{u} : vector<16xi8>")
                 src = f"%n5{half}{u}"
-            e(f"    %fq{half}{u} = vector.sitofp {src} : vector<16xi8> to vector<16xf32>")
+            # nibbles are 0..15 (0..31 with q5's high bit): uitofp is the same
+            # value and can select v_cvt_f32_ubyteN (no sign-extend)
+            e(f"    %fq{half}{u} = vector.{'uitofp' if Q4_UITOFP else 'sitofp'} {src} : vector<16xi8> to vector<16xf32>")
             e(f"    %sq{half}{u} = vector.mulf %dsc_v{u}, %fq{half}{u} : vector<16xf32>")
             e(f"    %vq{half}{u} = vector.subf %sq{half}{u}, %dm_v{u} : vector<16xf32>")
             e(f"    %h{half}{u} = vector.fptrunc %vq{half}{u} : vector<16xf32> to vector<16xf16>")
@@ -813,7 +830,9 @@ def q4k_compute(v, gb, q5=False):
 def q4k_setup():
     return ["  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8", "  %c1b = scalar.constant 1 : i8",
             "  %m15v = vector.splat %c15b : vector<16xi8>", "  %s4v = vector.splat %c4b : vector<16xi8>",
-            "  %one8v = vector.splat %c1b : vector<16xi8>"]
+            "  %one8v = vector.splat %c1b : vector<16xi8>",
+            "  %c0f4 = scalar.constant 252645135 : i32", "  %m0f4 = vector.splat %c0f4 : vector<4xi32>",
+            "  %q4sh0 = scalar.constant 0 : i32", "  %q4sh4 = scalar.constant 4 : i32"]
 
 
 def iq2xxs_loads(p, blk, gb):
