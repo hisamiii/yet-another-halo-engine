@@ -1646,6 +1646,29 @@ are `read_result_reuse` on other loads.
   vmcnt(0)` sites inside the MMA loops (12.8% + 6.8% of wave time): in the
   unrolled body the prefetched global loads are drained before the multiplies
   instead of at the next phase's LDS stores.
+- IQ4_XS structure probes (with decode-ahead and the header load, 9.47 ms
+  standalone), each traced:
+  - dedicated decode waves (`YAH_TG_DECW=4`: 16 MMA waves + 4 decode-only, 640
+    threads; the MMA waves never decode) 9.73: the barrier falls 47% -> 33% of
+    wave time but VALU stall rises to 33% -- the SIMDs are issue-bound, so what
+    counts is total VALU per WMMA, not which wave issues it;
+  - the 2-step inner loop unrolled (`YAH_TG_KPOL=unroll(%c2)`) 9.85 (Q4_K 5.49 ->
+    6.02): VALU per WMMA 7.40 -> 6.15 (the per-step address math halves), but a
+    new full `vmcnt(0)` takes 27% of wave time -- the compile report's extra
+    `amdgpu.ssa_use` wait has a register copy of a carried prefetch value as
+    consumer: the copy into the loop-carried register now sits before the MMAs
+    and drains the prefetch. Same mechanism as the phase-loop unroll;
+  - grouped launch order, in the pipeline this time (`YAH_TILE_SWZ=8` on the
+    IQ4_XS HALs): IQ4_XS rows +4.0% against +0.4% drift on the others. Our tiles
+    reuse the activation tile across all 136 row groups in plain order;
+  - weights copied into a device-local buffer instead of importing the GGUF
+    mapping (`YAH_LOOM_WEIGHTS_DEVICE=1`): pp2048 3590 -> 3706 ms, slower.
+  Standalone kernels run ~20% faster than the same HAL in the pp2048 pipeline
+  (IQ4_XS 6144x5120: 3.5 vs 4.2 ms; DeltaNet 1.80 vs 2.17). Not cold weights (4
+  rotating 16.7 MB weight buffers: 3.52 ms), and clocks explain only part: the
+  pipeline settles at ~2.2 GHz / ~125 W, a sustained standalone run at p50 2.26
+  GHz (peaks 2.46) under 110 W. HIP's kernels pay the same, so pipeline rows are
+  the only fair comparison.
 - wave64 tile GEMM (`YAH_TG_W64=1`: accumulators `vector<4xf32>`, operand
   fragments unchanged, direct epilogue), IQ4_XS 17408x5120 with decode-ahead,
   all bit-identical, against 9.71 ms wave32: 8 waves of 32x128 (152 VGPRs)

@@ -74,6 +74,10 @@ DECAHEAD_FMTS = ("iq4xs", "q4k", "q5k", "q6k")
 SWEPI = os.environ.get("YAH_TG_SWEPI", "0") == "1"
 DECAHEAD_ENV = os.environ.get("YAH_TG_DECAHEAD")
 DECAHEAD = DECAHEAD_ENV == "1"
+# DECW=n: n extra waves that only decode (decode-ahead only); the NWAVE MMA
+# waves then never decode, so a phase costs max(decode, MMA), not the sum on
+# the decoding waves.
+DECW = int(os.environ.get("YAH_TG_DECW", "0"))
 
 # f16 of padding per decoded weight row: unpadded rows are 128 B apart at
 # KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
@@ -189,7 +193,7 @@ def gen(fmt, kind="kstore"):
     e("  %unit = index.constant 1 : index")
     e(f"  %m_tiles = config.get @{sym}.m_tiles : index")
     e(f"  %token_tiles = config.get @{sym}.token_tiles : index")
-    e(f"  %wgs = index.constant {LANES} : index")
+    e(f"  %wgs = index.constant {LANES + (DECW * WS if DECAHEAD else 0)} : index")
     e(f"  %rowgrp = index.constant {ROWGRP} : index")
     e("  %m_groups = index.div %m_tiles, %rowgrp : index")
     e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
@@ -293,7 +297,14 @@ def gen(fmt, kind="kstore"):
         e("  %wg_x = kernel.workgroup.id<x> : index")
         e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
-    e(f"  %wave = index.div %tid, %c{WS} : index")
+    if DECAHEAD and DECW:
+        # decode-only waves (>= NWAVE) never touch the MMA tile or the epilogue
+        # slabs; clamp so the addresses are provably in bounds
+        e(f"  %wave0 = index.div %tid, %c{WS} : index")
+        e(f"  %cnw1 = index.constant {NWAVE - 1} : index")
+        e("  %wave = index.min %wave0, %cnw1 : index")
+    else:
+        e(f"  %wave = index.div %tid, %c{WS} : index")
     e(f"  %cwn = index.constant {WN} : index")
     e("  %wr = index.div %wave, %cwn : index")
     e("  %wt = index.rem %wave, %cwn : index")
@@ -307,8 +318,23 @@ def gen(fmt, kind="kstore"):
     e("  %token_base = index.add %wtb, %wt_off : index")
     # decode lane map: lane tid -> weight row tid % BM, slot tid / BM decodes
     # groups [slot*GPL, slot*GPL+GPL) of the phase; slots >= GPP/GPL idle.
-    e(f"  %l64 = index.rem %tid, %c{BM} : index")
-    e(f"  %slot = index.div %tid, %c{BM} : index")
+    dw = DECW if DECAHEAD else 0
+    if dw:
+        assert slots * BM == dw * WS and not sw, "DECW needs slots*BM == DECW*WS lanes"
+        e(f"  %cl_lanes = index.constant {LANES} : index")
+        e("  %dtid0 = index.max %tid, %cl_lanes : index")
+        e("  %dtid = index.sub %dtid0, %cl_lanes : index")
+        e(f"  %l64 = index.rem %dtid, %c{BM} : index")
+        e(f"  %slot0 = index.div %dtid, %c{BM} : index")
+        e("  %is_dlane = index.cmp uge, %tid, %cl_lanes : index")
+        e(f"  %cslots_x = index.constant {slots} : index")
+        e("  %slot = scf.select %is_dlane, %slot0, %cslots_x : index")
+        e("  %sg_top = kernel.subgroup.id : index")
+        e(f"  %cnwave = index.constant {NWAVE} : index")
+        e("  %mma_wave = index.cmp ult, %sg_top, %cnwave : index")
+    else:
+        e(f"  %l64 = index.rem %tid, %c{BM} : index")
+        e(f"  %slot = index.div %tid, %c{BM} : index")
     e(f"  %drow = index.min %l64, %c{BM - 1} : index")
     if FRAG:
         e(f"  %cksub_fm = index.constant {ksub} : index")
@@ -430,6 +456,10 @@ def gen(fmt, kind="kstore"):
             e(f"    %afrow{sg} = index.add %atok_fm, %afr{sg} : index")
             e(f"    %afc{sg} = index.rem %as{sg}, %c16 : index")
             e(f"    vector.store {nm}, %al_fm[%afrow{sg}, %afc{sg}] : vector<8xf16>, view<{BN * ksub // 16}x16xf16>")
+        elif DECAHEAD and DECW:
+            e("    scf.if %mma_wave {")
+            e(f"      vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+            e("    }")
         else:
             e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
     # next phase's loads. FENCE=1 keeps them below this phase's LDS stores: the
@@ -481,15 +511,23 @@ def gen(fmt, kind="kstore"):
         # loop is rejected (divergent_loop_single_entry)
         assert (slots * BM) % WS == 0
         e("    %sg_id = kernel.subgroup.id : index")
-        e(f"    %cdecw = index.constant {slots * BM // WS} : index")
-        e("    %dec_wave = index.cmp ult, %sg_id, %cdecw : index")
+        if DECW:
+            e(f"    %cdecw = index.constant {NWAVE} : index")
+            e("    %dec_wave = index.cmp uge, %sg_id, %cdecw : index")
+        else:
+            e(f"    %cdecw = index.constant {slots * BM // WS} : index")
+            e("    %dec_wave = index.cmp ult, %sg_id, %cdecw : index")
         e("    scf.if %dec_wave {")
         names = G.unpack_vals(e, cur_w, orig0)
         L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
         e("    }")
     wlv = "%wl_mma" if DECAHEAD else "%wl_view"
     cb = ", ".join(f"%b{i} = %a{i} : {V8}" for i in range(NA))
-    e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
+    if DECAHEAD and DECW:
+        e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.if %mma_wave -> ({types}) {{")
+        e("    " + ", ".join(f"%rr{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
+    else:
+        e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
     for i in range(FM):
         e(f"      %lr{i} = index.add %wr_off, %c{16 * i} : index")
         if FRAG:
@@ -515,6 +553,11 @@ def gen(fmt, kind="kstore"):
             e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
     e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
     e("    }")
+    if DECAHEAD and DECW:
+        e("    scf.yield " + ", ".join(f"%rr{i}" for i in range(NA)) + f" : {types}")
+        e("    } else {")
+        e("    scf.yield " + ", ".join(f"%a{i}" for i in range(NA)) + f" : {types}")
+        e("    }")
     e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
       + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
     e("  }")
@@ -588,6 +631,9 @@ def lds_epilogue(e, kr, V8, sw=False):
     lanes cover a token's TM=32 rows (128 contiguous bytes). Same values, and
     for kres the same resid + acc add, so bit-identical."""
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    if DECAHEAD and DECW:
+        # the decode-only waves have no tile to store
+        e("  scf.if %mma_wave {")
     e(f"  %es_ctm = index.constant {TM} : index")
     e("  %es_lay = encoding.layout.strided [%c1, %es_ctm] : encoding<layout>")
     e(f"  %es_wb = index.constant {TM * 16 * 4} : index")
@@ -651,6 +697,9 @@ def lds_epilogue(e, kr, V8, sw=False):
                 e(f"  vector.store %hv{j}_{q}, %out_h[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
             else:
                 e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
+    if DECAHEAD and DECW:
+        e("  }")
+
 
 
 def swiglu_epilogue(e, arow):

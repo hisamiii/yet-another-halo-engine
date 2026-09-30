@@ -333,8 +333,17 @@ int main(int argc, char** argv) {
       const std::uintptr_t page = 4096;
       const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(wbase) & ~(page - 1);
       weights_delta = reinterpret_cast<std::uintptr_t>(wbase) - start;
-      weights = gpu.Import(reinterpret_cast<void*>(start),
-                           gguf.tensor_data_size() + weights_delta);
+      const std::size_t wbytes = gguf.tensor_data_size() + weights_delta;
+      if (std::getenv("YAH_LOOM_WEIGHTS_DEVICE")) {
+        // A device-local copy instead of the imported mmap (HIP's layout).
+        weights = gpu.Allocate(wbytes);
+        const std::size_t chunk = std::size_t{256} << 20;
+        for (std::size_t off = 0; off < wbytes; off += chunk)
+          gpu.H2D(weights, reinterpret_cast<const void*>(start + off),
+                  std::min(chunk, wbytes - off), off);
+      } else {
+        weights = gpu.Import(reinterpret_cast<void*>(start), wbytes);
+      }
     }
     auto ImportTensor = [&](const yah::core::TensorInfo& t) -> Imported {
       return {weights.handle, weights_delta + static_cast<std::size_t>(t.offset),
