@@ -64,6 +64,13 @@ WPAD = int(os.environ.get("YAH_TG_WPAD", "8"))
 # (APAD/WPAD are ignored). That is what lets 256 x 256 fit in 64 KB.
 FRAG = os.environ.get("YAH_TG_FRAG", "0") == "1"
 FENCE = os.environ.get("YAH_TG_FENCE", "1") == "1"
+# SWZ=G: grouped launch order -- consecutive workgroups cover G row groups x all
+# token tiles, so a weight tile is reused by the 8 token tiles while it is still
+# cached and only G weight tiles and the token tiles' activations are live.
+# Needs m_groups % G == 0 (the emitter passes it only then). 0 = plain order.
+# MEASURED, OFF: G=4 is 10.25 -> 10.12 ms standalone (IQ4_XS 17408x5120) but
+# +83/+90 ms on the pp2048 GEMM total, interleaved (YAH_TILE_SWZ=4 to emit it).
+SWZ = int(os.environ.get("YAH_TG_SWZ", "0"))
 # inner K-step loop policy, e.g. "unroll(%c2) schedule(recurrence)"
 KPOL = os.environ.get("YAH_TG_KPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
@@ -215,8 +222,23 @@ def gen(fmt, kind="kstore"):
         e(f"  %al_fm = buffer.view %al[%base] : buffer -> view<{BN * ksub // 16}x16xf16>")
         e("  %fm_lay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
         e(f"  %al_fmt = buffer.view %al[%base] : buffer -> view<16x{BN * ksub // 16}xf16, %fm_lay>")
-    e("  %wg_x = kernel.workgroup.id<x> : index")
-    e("  %wg_y = kernel.workgroup.id<y> : index")
+    if SWZ:
+        e("  %wg_x0 = kernel.workgroup.id<x> : index")
+        e("  %wg_y0 = kernel.workgroup.id<y> : index")
+        e("  %sw_mg = index.div %m_tiles, %c" + str(ROWGRP) + " : index")
+        e("  %sw_ly = index.mul %wg_y0, %sw_mg : index")
+        e("  %sw_lin = index.add %sw_ly, %wg_x0 : index")
+        e(f"  %sw_g = index.constant {SWZ} : index")
+        e("  %sw_gt = index.mul %sw_g, %token_tiles : index")
+        e("  %sw_grp = index.div %sw_lin, %sw_gt : index")
+        e("  %sw_in = index.rem %sw_lin, %sw_gt : index")
+        e("  %sw_rg0 = index.mul %sw_grp, %sw_g : index")
+        e("  %sw_rgi = index.rem %sw_in, %sw_g : index")
+        e("  %wg_x = index.add %sw_rg0, %sw_rgi : index")
+        e("  %wg_y = index.div %sw_in, %sw_g : index")
+    else:
+        e("  %wg_x = kernel.workgroup.id<x> : index")
+        e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
     e("  %wave = index.div %tid, %c32 : index")
     e(f"  %cwn = index.constant {WN} : index")

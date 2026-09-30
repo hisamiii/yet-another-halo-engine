@@ -97,6 +97,17 @@ def _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind):
     tile, rowgrp = TG.geometry()
     if mt % rowgrp or B % tile:
         return None
+    # grouped launch order (gen_gemm_tile SWZ) where the row groups divide by it
+    swz = int(os.environ.get("YAH_TILE_SWZ", "0"))
+    prev_swz = TG.SWZ
+    TG.SWZ = swz if swz and (mt // rowgrp) % swz == 0 else 0
+    try:
+        return _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp)
+    finally:
+        TG.SWZ = prev_swz
+
+
+def _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp):
     # TG.configure() rewrites gen_gemm_shared's module globals (NW, LR, KSUB...)
     # to drive the shared decode helpers; put them back for the kernels the
     # shared generator still emits in this process.
