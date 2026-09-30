@@ -45,6 +45,10 @@ V16H = "vector<16xf16>"
 PROW = os.environ.get("YAH_ATTN_PROW", "1") == "1"
 # VPRE=1: V tile t+1 is loaded while tile t computes (tile 0 before QK)
 VPRE = os.environ.get("YAH_ATTN_VPRE", "1") == "1"
+# KPRE: K fragments of the next block's QK chain loaded during this block's P*V
+# and carried (the first one's latency was exposed at every block start).
+# Measured at H=3, interleaved: 0 3.86/3.88, 1 3.85/3.87, 2 3.96/3.96 ms -- off.
+KPRE = int(os.environ.get("YAH_ATTN_KPRE", "0"))
 PVIEW = "view<16x72xf16>" if PROW else "view<16x64xf16, %probability_transposed_layout>"
 
 
@@ -276,7 +280,18 @@ def gen(H):
     for i in R:
         init += [f"%current_max_{i} = %negative_f32x4 : {V4F}", f"%current_sum_{i} = %c0_f32x4 : {V4F}"]
         init += [f"%current_output{r}_{i} = %output_zero{r} : {V4H}" for r in range(4)]
-    e(f"  {heads(state_names('full_'))} = scf.for %key_origin = [%c0 to %full_context_count step %c64]({heads(init)}) -> ({state_types()}) {{")
+    full_types = state_types()
+    full_results = state_names('full_')
+    if KPRE:
+        e("  %kpre_last = index.sub %cache_capacity, %c16 : index")
+        e("  %kpre_origin0 = index.min %subgroup_score_column, %kpre_last : index")
+        for t in range(KPRE):
+            e(f"  %kpre_ch0_{t} = index.add %key_value_head_base, %c{16 * t} : index")
+            e(f"  %kpre_init_{t} = vector.fragment.load<lhs> %key_view[%kpre_origin0, %kpre_ch0_{t}] shape [%m, %k] : view<[%cache_capacity]x1024xf16> -> {V16H}")
+        init += [f"%kcur_{t} = %kpre_init_{t} : {V16H}" for t in range(KPRE)]
+        full_types += ", " + ", ".join([V16H] * KPRE)
+        full_results += [f"%kpre_final_{t}" for t in range(KPRE)]
+    e(f"  {heads(full_results)} = scf.for %key_origin = [%c0 to %full_context_count step %c64]({heads(init)}) -> ({full_types}) {{")
     e("    %vt_token_a = index.add %key_origin, %vt_key0 : index")
     e("    %vt_token_b = index.add %vt_token_a, %c1 : index")
     # V tile 0 of this block goes out before QK and softmax, which cover it;
@@ -289,16 +304,35 @@ def gen(H):
     e(f"    %score_init_values = vector.constant 0.0 : {V4F}")
     e(f"    %score_init = vector.fragment<init> %score_init_values shape [%m, %n] : {V4F}")
     accs = ", ".join(f"%score_accumulator_{i} = %score_init : {V4F}" for i in R)
-    e(f"    {heads(f'%score_fragment_{i}' for i in R)} = scf.for %head_tile = [%c0 to %c256 step %c16]({accs}) -> ({', '.join([V4F] * H)}) unroll schedule(recurrence) {{")
-    e("      %key_channel = index.add %key_value_head_base, %head_tile : index")
-    e(f"      %key_fragment = vector.fragment.load<lhs> %key_view[%score_key_origin, %key_channel] shape [%m, %k] : view<[%cache_capacity]x1024xf16> -> {V16H}")
+    if KPRE:
+        # the same 16-step WMMA chain per head, spelled out so its first KPRE
+        # key fragments can come from the previous block's prefetch
+        acc = {i: "%score_init" for i in R}
+        for t in range(16):
+            e(f"    %qk_ht_{t} = index.constant {16 * t} : index")
+            if t < KPRE:
+                kf = f"%kcur_{t}"
+            else:
+                e(f"    %qk_kch_{t} = index.add %key_value_head_base, %qk_ht_{t} : index")
+                e(f"    %qk_kf_{t} = vector.fragment.load<lhs> %key_view[%score_key_origin, %qk_kch_{t}] shape [%m, %k] : view<[%cache_capacity]x1024xf16> -> {V16H}")
+                kf = f"%qk_kf_{t}"
+            for i in R:
+                e(f"    %qk_qf_{t}_{i} = vector.fragment.load<rhs> %query_transposed_view_{i}[%qk_ht_{t}, %c0] shape [%k, %n] : view<256x16xf16, %query_transposed_layout> -> {V16H}")
+                e(f"    %qk_acc_{t}_{i} = vector.mma {kf}, %qk_qf_{t}_{i}, {acc[i]} : {V16H}, {V16H}, {V4F}")
+                acc[i] = f"%qk_acc_{t}_{i}"
+        score_frag = {i: acc[i] for i in R}
+    else:
+        e(f"    {heads(f'%score_fragment_{i}' for i in R)} = scf.for %head_tile = [%c0 to %c256 step %c16]({accs}) -> ({', '.join([V4F] * H)}) unroll schedule(recurrence) {{")
+        e("      %key_channel = index.add %key_value_head_base, %head_tile : index")
+        e(f"      %key_fragment = vector.fragment.load<lhs> %key_view[%score_key_origin, %key_channel] shape [%m, %k] : view<[%cache_capacity]x1024xf16> -> {V16H}")
+        for i in R:
+            e(f"      %query_fragment_{i} = vector.fragment.load<rhs> %query_transposed_view_{i}[%head_tile, %c0] shape [%k, %n] : view<256x16xf16, %query_transposed_layout> -> {V16H}")
+            e(f"      %next_score_accumulator_{i} = vector.mma %key_fragment, %query_fragment_{i}, %score_accumulator_{i} : {V16H}, {V16H}, {V4F}")
+        e(f"      scf.yield {heads(f'%next_score_accumulator_{i}' for i in R)} : {', '.join([V4F] * H)}")
+        e("    }")
+        score_frag = {i: f"%score_fragment_{i}" for i in R}
     for i in R:
-        e(f"      %query_fragment_{i} = vector.fragment.load<rhs> %query_transposed_view_{i}[%head_tile, %c0] shape [%k, %n] : view<256x16xf16, %query_transposed_layout> -> {V16H}")
-        e(f"      %next_score_accumulator_{i} = vector.mma %key_fragment, %query_fragment_{i}, %score_accumulator_{i} : {V16H}, {V16H}, {V4F}")
-    e(f"      scf.yield {heads(f'%next_score_accumulator_{i}' for i in R)} : {', '.join([V4F] * H)}")
-    e("    }")
-    for i in R:
-        e(f"    vector.fragment.store<result> %score_fragment_{i}, %score_stage_view_{i}[%subgroup_score_column, %c0] shape [%m, %n] : {V4F}, view<64x17xf32>")
+        e(f"    vector.fragment.store<result> {score_frag[i]}, %score_stage_view_{i}[%subgroup_score_column, %c0] shape [%m, %n] : {V4F}, view<64x17xf32>")
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("    %key_token = index.add %key_origin, %lane : index")
     for r in range(4):
@@ -309,6 +343,12 @@ def gen(H):
     for i in R:
         softmax(i, f"%score_stage_view_{i}", "%valid", "")
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    if KPRE:
+        e("    %kn_origin0 = index.add %score_key_origin0, %c64 : index")
+        e("    %kn_origin = index.min %kn_origin0, %kpre_last : index")
+        for t in range(KPRE):
+            e(f"    %kn_ch_{t} = index.add %key_value_head_base, %c{16 * t} : index")
+            e(f"    %knext_{t} = vector.fragment.load<lhs> %key_view[%kn_origin, %kn_ch_{t}] shape [%m, %k] : view<[%cache_capacity]x1024xf16> -> {V16H}")
     for i in R:
         rescale(i, "")
     tinit = heads(f"%tile_output{r}_{i} = %scaled_current_output{r}_{i} : {V4H}" for i in R for r in range(4))
@@ -357,7 +397,8 @@ def gen(H):
     ys = []
     for i in R:
         ys += [f"%next_max_{i}", f"%next_sum_{i}"] + [f"%next_output{r}_{i}" for r in range(4)]
-    e(f"    scf.yield {heads(ys)} : {state_types()}")
+    ys += [f"%knext_{t}" for t in range(KPRE)]
+    e(f"    scf.yield {heads(ys)} : {full_types}")
     e("  }")
     e("")
     # ---- 16-key tail
