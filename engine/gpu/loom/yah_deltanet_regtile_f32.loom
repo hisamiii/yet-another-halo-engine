@@ -105,44 +105,105 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
   %s_init14 = vector.load %state_view[%sa14] : view<[%state_total]xf32> -> vector<8xf32>
   %sa15 = index.add %state_row, %co15 : index
   %s_init15 = vector.load %state_view[%sa15] : view<[%state_total]xf32> -> vector<8xf32>
+  %stg_bytes = index.constant 2112 : offset
+  %stg = buffer.alloca<workgroup> align(16) %stg_bytes : buffer
+  %stg_view = buffer.view %stg[%base] : buffer -> view<528xf32>
+  %csb = index.constant 264 : index
+  %c256 = index.constant 256 : index
+  %c4 = index.constant 4 : index
+  %st_e = index.mul %row, %c2 : index
+  %st_sel = index.div %st_e, %c128 : index
+  %st_nsel = index.sub %c1, %st_sel : index
+  %st_s128 = index.mul %st_sel, %c128 : index
+  %st_el = index.sub %st_e, %st_s128 : index
+  %st_kh = index.add %num_key_heads, %kh : index
+  %st_kbase = index.mul %st_kh, %c128 : index
+  %st_qbase = index.mul %kh, %c128 : index
+  %st_kpart = index.mul %st_kbase, %st_nsel : index
+  %st_qpart = index.mul %st_qbase, %st_sel : index
+  %st_r0 = index.add %st_el, %st_kpart : index
+  %st_rel = index.add %st_r0, %st_qpart : index
+  %st_absel = index.rem %row, %c2 : index
+  %st_abslot = index.add %c256, %st_absel : index
+  %st_r4 = index.rem %row, %c4 : index
+  %st_kqsel = index.min %st_r4, %c2 : index
+  %c258 = index.constant 258 : index
+  %st_kqslot = index.add %c258, %st_kqsel : index
+  %last_t = index.sub %batch, %c1 : index
+    %s0_ct = index.mul %c0, %qkv_size : index
+    %s0_src = index.add %s0_ct, %st_rel : index
+    %s0_kq2 = vector.load %conv_view[%s0_src] : view<[%conv_total]xf32> -> vector<2xf32>
+    %s0_abt = index.mul %c0, %num_heads : index
+    %s0_abh = index.add %s0_abt, %h : index
+    %s0_ab2 = index.mul %s0_abh, %c2 : index
+    %s0_abo = index.add %s0_ab2, %st_absel : index
+    %s0_abv = view.load %ab_view[%s0_abo] : view<[%ab_total2]xf32> -> f32
+    %s0_kqt = index.mul %c0, %num_key_heads : index
+    %s0_kqb = index.add %s0_kqt, %kh : index
+    %s0_kq3o = index.mul %s0_kqb, %c3 : index
+    %s0_kqo = index.add %s0_kq3o, %st_kqsel : index
+    %s0_kqv = view.load %kq_view[%s0_kqo] : view<[%kq_total3]xf32> -> f32
+    %s0_dk = index.add %c0, %st_e : index
+    vector.store %s0_kq2, %stg_view[%s0_dk] : vector<2xf32>, view<528xf32>
+    %s0_da = index.add %c0, %st_abslot : index
+    view.store %s0_abv, %stg_view[%s0_da] : f32, view<528xf32>
+    %s0_dq = index.add %c0, %st_kqslot : index
+    view.store %s0_kqv, %stg_view[%s0_dq] : f32, view<528xf32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   %f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7, %f8, %f9, %f10, %f11, %f12, %f13, %f14, %f15 = scf.for %t = [%c0 to %batch step %c1](%s0 = %s_init0 : vector<8xf32>, %s1 = %s_init1 : vector<8xf32>, %s2 = %s_init2 : vector<8xf32>, %s3 = %s_init3 : vector<8xf32>, %s4 = %s_init4 : vector<8xf32>, %s5 = %s_init5 : vector<8xf32>, %s6 = %s_init6 : vector<8xf32>, %s7 = %s_init7 : vector<8xf32>, %s8 = %s_init8 : vector<8xf32>, %s9 = %s_init9 : vector<8xf32>, %s10 = %s_init10 : vector<8xf32>, %s11 = %s_init11 : vector<8xf32>, %s12 = %s_init12 : vector<8xf32>, %s13 = %s_init13 : vector<8xf32>, %s14 = %s_init14 : vector<8xf32>, %s15 = %s_init15 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+    %t_n0 = index.add %t, %c1 : index
+    %t_n = index.min %t_n0, %last_t : index
+    %nx_ct = index.mul %t_n, %qkv_size : index
+    %nx_src = index.add %nx_ct, %st_rel : index
+    %nx_kq2 = vector.load %conv_view[%nx_src] : view<[%conv_total]xf32> -> vector<2xf32>
+    %nx_abt = index.mul %t_n, %num_heads : index
+    %nx_abh = index.add %nx_abt, %h : index
+    %nx_ab2 = index.mul %nx_abh, %c2 : index
+    %nx_abo = index.add %nx_ab2, %st_absel : index
+    %nx_abv = view.load %ab_view[%nx_abo] : view<[%ab_total2]xf32> -> f32
+    %nx_kqt = index.mul %t_n, %num_key_heads : index
+    %nx_kqb = index.add %nx_kqt, %kh : index
+    %nx_kq3o = index.mul %nx_kqb, %c3 : index
+    %nx_kqo = index.add %nx_kq3o, %st_kqsel : index
+    %nx_kqv = view.load %kq_view[%nx_kqo] : view<[%kq_total3]xf32> -> f32
+    %t_par = index.rem %t, %c2 : index
+    %bo = index.mul %t_par, %csb : index
+    %bo_q = index.add %bo, %c128 : index
+    %t_npar = index.rem %t_n0, %c2 : index
+    %bo_n = index.mul %t_npar, %csb : index
+    %sco_alpha = index.constant 256 : index
+    %scx_alpha = index.add %bo, %sco_alpha : index
+    %alpha = view.load %stg_view[%scx_alpha] : view<528xf32> -> f32
+    %sco_beta = index.constant 257 : index
+    %scx_beta = index.add %bo, %sco_beta : index
+    %beta = view.load %stg_view[%scx_beta] : view<528xf32> -> f32
+    %sco_inv_k = index.constant 258 : index
+    %scx_inv_k = index.add %bo, %sco_inv_k : index
+    %inv_k = view.load %stg_view[%scx_inv_k] : view<528xf32> -> f32
+    %sco_q_scale = index.constant 259 : index
+    %scx_q_scale = index.add %bo, %sco_q_scale : index
+    %q_scale = view.load %stg_view[%scx_q_scale] : view<528xf32> -> f32
+    %sco_kq3 = index.constant 260 : index
+    %scx_kq3 = index.add %bo, %sco_kq3 : index
+    %kq3 = view.load %stg_view[%scx_kq3] : view<528xf32> -> f32
     %conv_t = index.mul %t, %qkv_size : index
-    %q_row = index.mul %kh, %c128 : index
-    %q_off = index.add %conv_t, %q_row : index
-    %k_head = index.add %num_key_heads, %kh : index
-    %k_row = index.mul %k_head, %c128 : index
-    %k_off = index.add %conv_t, %k_row : index
     %v_heads = index.mul %num_key_heads, %c2 : index
     %v_head = index.add %v_heads, %h : index
     %v_row0 = index.mul %v_head, %c128 : index
     %v_off = index.add %conv_t, %v_row0 : index
     %v_off_row = index.add %v_off, %row : index
-    %ab_t = index.mul %t, %num_heads : index
-    %ab_h = index.add %ab_t, %h : index
-    %ab_off = index.mul %ab_h, %c2 : index
-    %ab_off1 = index.add %ab_off, %c1 : index
-    %alpha = view.load %ab_view[%ab_off] : view<[%ab_total2]xf32> -> f32
-    %beta = view.load %ab_view[%ab_off1] : view<[%ab_total2]xf32> -> f32
-    %kq_t = index.mul %t, %num_key_heads : index
-    %kq_base = index.add %kq_t, %kh : index
-    %kq_off = index.mul %kq_base, %c3 : index
-    %kq_off1 = index.add %kq_off, %c1 : index
-    %kq_off2 = index.add %kq_off, %c2 : index
-    %inv_k = view.load %kq_view[%kq_off] : view<[%kq_total3]xf32> -> f32
-    %q_scale = view.load %kq_view[%kq_off1] : view<[%kq_total3]xf32> -> f32
-    %kq3 = view.load %kq_view[%kq_off2] : view<[%kq_total3]xf32> -> f32
     %kq_dot = scalar.mulf %inv_k, %q_scale : f32
     %kq_dot2 = scalar.mulf %kq_dot, %kq3 : f32
     %v = view.load %conv_view[%v_off_row] : view<[%conv_total]xf32> -> f32
     %alpha_v = vector.splat %alpha : vector<8xf32>
-    %ko0 = index.add %k_off, %co0 : index
-    %qo0 = index.add %q_off, %co0 : index
-    %k0 = vector.load %conv_view[%ko0] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q0 = vector.load %conv_view[%qo0] : view<[%conv_total]xf32> -> vector<8xf32>
-    %ko1 = index.add %k_off, %co1 : index
-    %qo1 = index.add %q_off, %co1 : index
-    %k1 = vector.load %conv_view[%ko1] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q1 = vector.load %conv_view[%qo1] : view<[%conv_total]xf32> -> vector<8xf32>
+    %ko0 = index.add %bo, %co0 : index
+    %qo0 = index.add %bo_q, %co0 : index
+    %k0 = vector.load %stg_view[%ko0] : view<528xf32> -> vector<8xf32>
+    %q0 = vector.load %stg_view[%qo0] : view<528xf32> -> vector<8xf32>
+    %ko1 = index.add %bo, %co1 : index
+    %qo1 = index.add %bo_q, %co1 : index
+    %k1 = vector.load %stg_view[%ko1] : view<528xf32> -> vector<8xf32>
+    %q1 = vector.load %stg_view[%qo1] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %sa_0 = vector.mulf %s0, %alpha_v : vector<8xf32>
     %uk0 = vector.mulf %sa_0, %k0 : vector<8xf32>
@@ -151,14 +212,14 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %uk1 = vector.mulf %sa_1, %k1 : vector<8xf32>
     %pq1 = vector.mulf %sa_1, %q1 : vector<8xf32>
     scf.schedule.fence
-    %ko2 = index.add %k_off, %co2 : index
-    %qo2 = index.add %q_off, %co2 : index
-    %k2 = vector.load %conv_view[%ko2] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q2 = vector.load %conv_view[%qo2] : view<[%conv_total]xf32> -> vector<8xf32>
-    %ko3 = index.add %k_off, %co3 : index
-    %qo3 = index.add %q_off, %co3 : index
-    %k3 = vector.load %conv_view[%ko3] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q3 = vector.load %conv_view[%qo3] : view<[%conv_total]xf32> -> vector<8xf32>
+    %ko2 = index.add %bo, %co2 : index
+    %qo2 = index.add %bo_q, %co2 : index
+    %k2 = vector.load %stg_view[%ko2] : view<528xf32> -> vector<8xf32>
+    %q2 = vector.load %stg_view[%qo2] : view<528xf32> -> vector<8xf32>
+    %ko3 = index.add %bo, %co3 : index
+    %qo3 = index.add %bo_q, %co3 : index
+    %k3 = vector.load %stg_view[%ko3] : view<528xf32> -> vector<8xf32>
+    %q3 = vector.load %stg_view[%qo3] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %ue0 = vector.extract %uk0[0] : vector<8xf32> -> f32
     %pe0 = vector.extract %pq0[0] : vector<8xf32> -> f32
@@ -232,14 +293,14 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %uk3 = vector.mulf %sa_3, %k3 : vector<8xf32>
     %pq3 = vector.mulf %sa_3, %q3 : vector<8xf32>
     scf.schedule.fence
-    %ko4 = index.add %k_off, %co4 : index
-    %qo4 = index.add %q_off, %co4 : index
-    %k4 = vector.load %conv_view[%ko4] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q4 = vector.load %conv_view[%qo4] : view<[%conv_total]xf32> -> vector<8xf32>
-    %ko5 = index.add %k_off, %co5 : index
-    %qo5 = index.add %q_off, %co5 : index
-    %k5 = vector.load %conv_view[%ko5] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q5 = vector.load %conv_view[%qo5] : view<[%conv_total]xf32> -> vector<8xf32>
+    %ko4 = index.add %bo, %co4 : index
+    %qo4 = index.add %bo_q, %co4 : index
+    %k4 = vector.load %stg_view[%ko4] : view<528xf32> -> vector<8xf32>
+    %q4 = vector.load %stg_view[%qo4] : view<528xf32> -> vector<8xf32>
+    %ko5 = index.add %bo, %co5 : index
+    %qo5 = index.add %bo_q, %co5 : index
+    %k5 = vector.load %stg_view[%ko5] : view<528xf32> -> vector<8xf32>
+    %q5 = vector.load %stg_view[%qo5] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %ue16 = vector.extract %uk2[0] : vector<8xf32> -> f32
     %pe16 = vector.extract %pq2[0] : vector<8xf32> -> f32
@@ -313,14 +374,14 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %uk5 = vector.mulf %sa_5, %k5 : vector<8xf32>
     %pq5 = vector.mulf %sa_5, %q5 : vector<8xf32>
     scf.schedule.fence
-    %ko6 = index.add %k_off, %co6 : index
-    %qo6 = index.add %q_off, %co6 : index
-    %k6 = vector.load %conv_view[%ko6] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q6 = vector.load %conv_view[%qo6] : view<[%conv_total]xf32> -> vector<8xf32>
-    %ko7 = index.add %k_off, %co7 : index
-    %qo7 = index.add %q_off, %co7 : index
-    %k7 = vector.load %conv_view[%ko7] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q7 = vector.load %conv_view[%qo7] : view<[%conv_total]xf32> -> vector<8xf32>
+    %ko6 = index.add %bo, %co6 : index
+    %qo6 = index.add %bo_q, %co6 : index
+    %k6 = vector.load %stg_view[%ko6] : view<528xf32> -> vector<8xf32>
+    %q6 = vector.load %stg_view[%qo6] : view<528xf32> -> vector<8xf32>
+    %ko7 = index.add %bo, %co7 : index
+    %qo7 = index.add %bo_q, %co7 : index
+    %k7 = vector.load %stg_view[%ko7] : view<528xf32> -> vector<8xf32>
+    %q7 = vector.load %stg_view[%qo7] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %ue32 = vector.extract %uk4[0] : vector<8xf32> -> f32
     %pe32 = vector.extract %pq4[0] : vector<8xf32> -> f32
@@ -394,14 +455,14 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %uk7 = vector.mulf %sa_7, %k7 : vector<8xf32>
     %pq7 = vector.mulf %sa_7, %q7 : vector<8xf32>
     scf.schedule.fence
-    %ko8 = index.add %k_off, %co8 : index
-    %qo8 = index.add %q_off, %co8 : index
-    %k8 = vector.load %conv_view[%ko8] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q8 = vector.load %conv_view[%qo8] : view<[%conv_total]xf32> -> vector<8xf32>
-    %ko9 = index.add %k_off, %co9 : index
-    %qo9 = index.add %q_off, %co9 : index
-    %k9 = vector.load %conv_view[%ko9] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q9 = vector.load %conv_view[%qo9] : view<[%conv_total]xf32> -> vector<8xf32>
+    %ko8 = index.add %bo, %co8 : index
+    %qo8 = index.add %bo_q, %co8 : index
+    %k8 = vector.load %stg_view[%ko8] : view<528xf32> -> vector<8xf32>
+    %q8 = vector.load %stg_view[%qo8] : view<528xf32> -> vector<8xf32>
+    %ko9 = index.add %bo, %co9 : index
+    %qo9 = index.add %bo_q, %co9 : index
+    %k9 = vector.load %stg_view[%ko9] : view<528xf32> -> vector<8xf32>
+    %q9 = vector.load %stg_view[%qo9] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %ue48 = vector.extract %uk6[0] : vector<8xf32> -> f32
     %pe48 = vector.extract %pq6[0] : vector<8xf32> -> f32
@@ -475,14 +536,14 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %uk9 = vector.mulf %sa_9, %k9 : vector<8xf32>
     %pq9 = vector.mulf %sa_9, %q9 : vector<8xf32>
     scf.schedule.fence
-    %ko10 = index.add %k_off, %co10 : index
-    %qo10 = index.add %q_off, %co10 : index
-    %k10 = vector.load %conv_view[%ko10] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q10 = vector.load %conv_view[%qo10] : view<[%conv_total]xf32> -> vector<8xf32>
-    %ko11 = index.add %k_off, %co11 : index
-    %qo11 = index.add %q_off, %co11 : index
-    %k11 = vector.load %conv_view[%ko11] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q11 = vector.load %conv_view[%qo11] : view<[%conv_total]xf32> -> vector<8xf32>
+    %ko10 = index.add %bo, %co10 : index
+    %qo10 = index.add %bo_q, %co10 : index
+    %k10 = vector.load %stg_view[%ko10] : view<528xf32> -> vector<8xf32>
+    %q10 = vector.load %stg_view[%qo10] : view<528xf32> -> vector<8xf32>
+    %ko11 = index.add %bo, %co11 : index
+    %qo11 = index.add %bo_q, %co11 : index
+    %k11 = vector.load %stg_view[%ko11] : view<528xf32> -> vector<8xf32>
+    %q11 = vector.load %stg_view[%qo11] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %ue64 = vector.extract %uk8[0] : vector<8xf32> -> f32
     %pe64 = vector.extract %pq8[0] : vector<8xf32> -> f32
@@ -556,14 +617,14 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %uk11 = vector.mulf %sa_11, %k11 : vector<8xf32>
     %pq11 = vector.mulf %sa_11, %q11 : vector<8xf32>
     scf.schedule.fence
-    %ko12 = index.add %k_off, %co12 : index
-    %qo12 = index.add %q_off, %co12 : index
-    %k12 = vector.load %conv_view[%ko12] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q12 = vector.load %conv_view[%qo12] : view<[%conv_total]xf32> -> vector<8xf32>
-    %ko13 = index.add %k_off, %co13 : index
-    %qo13 = index.add %q_off, %co13 : index
-    %k13 = vector.load %conv_view[%ko13] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q13 = vector.load %conv_view[%qo13] : view<[%conv_total]xf32> -> vector<8xf32>
+    %ko12 = index.add %bo, %co12 : index
+    %qo12 = index.add %bo_q, %co12 : index
+    %k12 = vector.load %stg_view[%ko12] : view<528xf32> -> vector<8xf32>
+    %q12 = vector.load %stg_view[%qo12] : view<528xf32> -> vector<8xf32>
+    %ko13 = index.add %bo, %co13 : index
+    %qo13 = index.add %bo_q, %co13 : index
+    %k13 = vector.load %stg_view[%ko13] : view<528xf32> -> vector<8xf32>
+    %q13 = vector.load %stg_view[%qo13] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %ue80 = vector.extract %uk10[0] : vector<8xf32> -> f32
     %pe80 = vector.extract %pq10[0] : vector<8xf32> -> f32
@@ -637,14 +698,14 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %uk13 = vector.mulf %sa_13, %k13 : vector<8xf32>
     %pq13 = vector.mulf %sa_13, %q13 : vector<8xf32>
     scf.schedule.fence
-    %ko14 = index.add %k_off, %co14 : index
-    %qo14 = index.add %q_off, %co14 : index
-    %k14 = vector.load %conv_view[%ko14] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q14 = vector.load %conv_view[%qo14] : view<[%conv_total]xf32> -> vector<8xf32>
-    %ko15 = index.add %k_off, %co15 : index
-    %qo15 = index.add %q_off, %co15 : index
-    %k15 = vector.load %conv_view[%ko15] : view<[%conv_total]xf32> -> vector<8xf32>
-    %q15 = vector.load %conv_view[%qo15] : view<[%conv_total]xf32> -> vector<8xf32>
+    %ko14 = index.add %bo, %co14 : index
+    %qo14 = index.add %bo_q, %co14 : index
+    %k14 = vector.load %stg_view[%ko14] : view<528xf32> -> vector<8xf32>
+    %q14 = vector.load %stg_view[%qo14] : view<528xf32> -> vector<8xf32>
+    %ko15 = index.add %bo, %co15 : index
+    %qo15 = index.add %bo_q, %co15 : index
+    %k15 = vector.load %stg_view[%ko15] : view<528xf32> -> vector<8xf32>
+    %q15 = vector.load %stg_view[%qo15] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %ue96 = vector.extract %uk12[0] : vector<8xf32> -> f32
     %pe96 = vector.extract %pq12[0] : vector<8xf32> -> f32
@@ -796,20 +857,20 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     view.store %o, %out_view[%out_idx] : f32, view<[%out_total]xf32>
     %dk = scalar.mulf %d, %inv_k : f32
     %dk_v = vector.splat %dk : vector<8xf32>
-    %kr0 = vector.load %conv_view[%ko0] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr1 = vector.load %conv_view[%ko1] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr2 = vector.load %conv_view[%ko2] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr3 = vector.load %conv_view[%ko3] : view<[%conv_total]xf32> -> vector<8xf32>
+    %kr0 = vector.load %stg_view[%ko0] : view<528xf32> -> vector<8xf32>
+    %kr1 = vector.load %stg_view[%ko1] : view<528xf32> -> vector<8xf32>
+    %kr2 = vector.load %stg_view[%ko2] : view<528xf32> -> vector<8xf32>
+    %kr3 = vector.load %stg_view[%ko3] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %kdk0 = vector.mulf %dk_v, %kr0 : vector<8xf32>
     %kdk1 = vector.mulf %dk_v, %kr1 : vector<8xf32>
     %kdk2 = vector.mulf %dk_v, %kr2 : vector<8xf32>
     %kdk3 = vector.mulf %dk_v, %kr3 : vector<8xf32>
     scf.schedule.fence
-    %kr4 = vector.load %conv_view[%ko4] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr5 = vector.load %conv_view[%ko5] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr6 = vector.load %conv_view[%ko6] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr7 = vector.load %conv_view[%ko7] : view<[%conv_total]xf32> -> vector<8xf32>
+    %kr4 = vector.load %stg_view[%ko4] : view<528xf32> -> vector<8xf32>
+    %kr5 = vector.load %stg_view[%ko5] : view<528xf32> -> vector<8xf32>
+    %kr6 = vector.load %stg_view[%ko6] : view<528xf32> -> vector<8xf32>
+    %kr7 = vector.load %stg_view[%ko7] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %sja0 = vector.mulf %s0, %alpha_v : vector<8xf32>
     %sn0 = vector.addf %sja0, %kdk0 : vector<8xf32>
@@ -825,10 +886,10 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %kdk6 = vector.mulf %dk_v, %kr6 : vector<8xf32>
     %kdk7 = vector.mulf %dk_v, %kr7 : vector<8xf32>
     scf.schedule.fence
-    %kr8 = vector.load %conv_view[%ko8] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr9 = vector.load %conv_view[%ko9] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr10 = vector.load %conv_view[%ko10] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr11 = vector.load %conv_view[%ko11] : view<[%conv_total]xf32> -> vector<8xf32>
+    %kr8 = vector.load %stg_view[%ko8] : view<528xf32> -> vector<8xf32>
+    %kr9 = vector.load %stg_view[%ko9] : view<528xf32> -> vector<8xf32>
+    %kr10 = vector.load %stg_view[%ko10] : view<528xf32> -> vector<8xf32>
+    %kr11 = vector.load %stg_view[%ko11] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %sja4 = vector.mulf %s4, %alpha_v : vector<8xf32>
     %sn4 = vector.addf %sja4, %kdk4 : vector<8xf32>
@@ -844,10 +905,10 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %kdk10 = vector.mulf %dk_v, %kr10 : vector<8xf32>
     %kdk11 = vector.mulf %dk_v, %kr11 : vector<8xf32>
     scf.schedule.fence
-    %kr12 = vector.load %conv_view[%ko12] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr13 = vector.load %conv_view[%ko13] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr14 = vector.load %conv_view[%ko14] : view<[%conv_total]xf32> -> vector<8xf32>
-    %kr15 = vector.load %conv_view[%ko15] : view<[%conv_total]xf32> -> vector<8xf32>
+    %kr12 = vector.load %stg_view[%ko12] : view<528xf32> -> vector<8xf32>
+    %kr13 = vector.load %stg_view[%ko13] : view<528xf32> -> vector<8xf32>
+    %kr14 = vector.load %stg_view[%ko14] : view<528xf32> -> vector<8xf32>
+    %kr15 = vector.load %stg_view[%ko15] : view<528xf32> -> vector<8xf32>
     scf.schedule.fence
     %sja8 = vector.mulf %s8, %alpha_v : vector<8xf32>
     %sn8 = vector.addf %sja8, %kdk8 : vector<8xf32>
@@ -872,6 +933,13 @@ kernel.def target(@yah_wave32) @yah_deltanet() {
     %sn14 = vector.addf %sja14, %kdk14 : vector<8xf32>
     %sja15 = vector.mulf %s15, %alpha_v : vector<8xf32>
     %sn15 = vector.addf %sja15, %kdk15 : vector<8xf32>
+    %nx_dk = index.add %bo_n, %st_e : index
+    vector.store %nx_kq2, %stg_view[%nx_dk] : vector<2xf32>, view<528xf32>
+    %nx_da = index.add %bo_n, %st_abslot : index
+    view.store %nx_abv, %stg_view[%nx_da] : f32, view<528xf32>
+    %nx_dq = index.add %bo_n, %st_kqslot : index
+    view.store %nx_kqv, %stg_view[%nx_dq] : f32, view<528xf32>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
     scf.yield %sn0, %sn1, %sn2, %sn3, %sn4, %sn5, %sn6, %sn7, %sn8, %sn9, %sn10, %sn11, %sn12, %sn13, %sn14, %sn15 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
   }
   vector.store %f0, %state_view[%sa0] : vector<8xf32>, view<[%state_total]xf32>

@@ -1355,6 +1355,25 @@ first store. A `scf.schedule.fence` between the stores and the next loads
 10.3 ms standalone; in the pipeline, interleaved, GEMM device time 3675/3762 ->
 3516/3558 ms (HIP 3164), bit-identical.
 
+### DeltaNet: k/q through LDS instead of SMEM
+
+ATT of the regtile recurrence: 58% of wave time in `s_waitcnt lgkmcnt(0)`. Every
+lane owns a whole 128-key state row, so the token's k and q are wave-uniform and
+lower to scalar loads; SMEM returns out of order, so each use drains every
+outstanding scalar load -- ~6 memory round trips per token, ~7250 cycles per
+token against ~1100 of VALU. (HIP's `BatchedDeltaNetRowSplitKernel<float, 16,
+2>` splits a row over 8 lanes, so its k/q are ordinary vector loads prefetched a
+token ahead; it also sums in a different order, which this port cannot adopt
+without giving up bit-identity.)
+
+`YAH_DN_STAGE=lds` (default): during token t the workgroup's 128 lanes fetch
+token t+1's k, q and five scalars with lane-dependent (VMEM) loads and write
+them to an LDS double buffer; token t reads its values back as broadcast
+ds_loads, which return in order, and one barrier per token separates the
+buffers. Same arithmetic, same order: bit-identical. Standalone 5.13 -> 3.32 ms
+per layer; pipeline, interleaved, 265/272 -> 185/190 ms (HIP 94). Chunk grouping
+G=2 stays best (G=0 4.1 ms; G=4 and G=8 spill, 9.1 and 67 ms).
+
 ### half_norm: the same loop, unrolled
 
 `yah_half_norm` (fused=0) was 1.85x HIP's `HalfNorm5120` (68.7 vs 37.1 ms over

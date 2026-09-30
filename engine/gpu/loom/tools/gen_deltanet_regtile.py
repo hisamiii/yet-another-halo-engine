@@ -41,6 +41,14 @@ CH = 128 // W
 # G=2: 43 -> 27 full lgkmcnt drains per token, 6.85 -> 5.58 ms per layer at
 # pp2048, bit-identical; G=4 and up spill.
 G = int(os.environ.get("YAH_DN_G", "2"))
+# STAGE=lds: k, q and the five per-token scalars of token t+1 are fetched by the
+# workgroup's 128 lanes with lane-dependent (VMEM) loads during token t and put
+# in an LDS double buffer; token t reads them back as broadcast ds_loads. SMEM
+# (the wave-uniform loads of the default form) returns out of order, so every
+# use of it drained lgkmcnt(0): 58% of wave time in the ATT trace. LDS reads
+# return in order and can be waited on partially. Same arithmetic, same order.
+STAGE = os.environ.get("YAH_DN_STAGE", "lds")
+SB = 264  # f32 per staging buffer: k[0:128], q[128:256], alpha, beta, inv_k, q_scale, kq3
 VT = f"vector<{W}xf32>"
 
 HEADER = """\
@@ -114,6 +122,8 @@ def gen():
     for c in range(CH):
         e(f"  %sa{c} = index.add %state_row, %co{c} : index")
         e(f"  %s_init{c} = vector.load %state_view[%sa{c}] : view<[%state_total]xf32> -> {VT}")
+    if STAGE == "lds":
+        stage_setup(e)
     carried = ", ".join(f"%s{c} = %s_init{c} : {VT}" for c in range(CH))
     results = ", ".join(f"%f{c}" for c in range(CH))
     types = ", ".join([VT] * CH)
@@ -148,11 +158,19 @@ def gen():
     %kq_dot2 = scalar.mulf %kq_dot, %kq3 : f32
     %v = view.load %conv_view[%v_off_row] : view<[%conv_total]xf32> -> f32
     %alpha_v = vector.splat %alpha : {VT}"""
+    if STAGE == "lds":
+        body = staged_body()
     L.extend(body.split("\n"))
     # readout: products as vectors, sums as scalars in key order
     u, p = "%zero", "%zero"
 
     def rd_load(c):
+        if STAGE == "lds":
+            e(f"    %ko{c} = index.add %bo, %co{c} : index")
+            e(f"    %qo{c} = index.add %bo_q, %co{c} : index")
+            e(f"    %k{c} = vector.load %stg_view[%ko{c}] : view<{2 * SB}xf32> -> {VT}")
+            e(f"    %q{c} = vector.load %stg_view[%qo{c}] : view<{2 * SB}xf32> -> {VT}")
+            return
         e(f"    %ko{c} = index.add %k_off, %co{c} : index")
         e(f"    %qo{c} = index.add %q_off, %co{c} : index")
         e(f"    %k{c} = vector.load %conv_view[%ko{c}] : view<[%conv_total]xf32> -> {VT}")
@@ -217,6 +235,9 @@ def gen():
     %dk_v = vector.splat %dk : {VT}"""
     L.extend(tail.split("\n"))
     def up_load(c):
+        if STAGE == "lds":
+            e(f"    %kr{c} = vector.load %stg_view[%ko{c}] : view<{2 * SB}xf32> -> {VT}")
+            return
         e(f"    %kr{c} = vector.load %conv_view[%ko{c}] : view<[%conv_total]xf32> -> {VT}")
 
     def up_math(c):
@@ -251,6 +272,8 @@ def gen():
             for c in grp:
                 e(f"    %sja{c} = vector.mulf %s{c}, %alpha_v : {VT}")
                 e(f"    %sn{c} = vector.addf %sja{c}, %kdk{c} : {VT}")
+    if STAGE == "lds":
+        stage_commit(e)
     e(f"    scf.yield {', '.join(f'%sn{c}' for c in range(CH))} : {types}")
     e("  }")
     for c in range(CH):
@@ -258,6 +281,110 @@ def gen():
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def stage_fetch(e, tok, p):
+    """Lane-dependent loads of token tok's staged values: lane r fetches k/q
+    elements 2r, 2r+1 (k for r < 64, q after), lane r alpha/beta element r%2 and
+    inv_k/q_scale/kq3 element min(r%4, 2). The addresses depend on the lane, so these are VMEM."""
+    e(f"    %{p}ct = index.mul {tok}, %qkv_size : index")
+    e(f"    %{p}src = index.add %{p}ct, %st_rel : index")
+    e(f"    %{p}kq2 = vector.load %conv_view[%{p}src] : view<[%conv_total]xf32> -> vector<2xf32>")
+    e(f"    %{p}abt = index.mul {tok}, %num_heads : index")
+    e(f"    %{p}abh = index.add %{p}abt, %h : index")
+    e(f"    %{p}ab2 = index.mul %{p}abh, %c2 : index")
+    e(f"    %{p}abo = index.add %{p}ab2, %st_absel : index")
+    e(f"    %{p}abv = view.load %ab_view[%{p}abo] : view<[%ab_total2]xf32> -> f32")
+    e(f"    %{p}kqt = index.mul {tok}, %num_key_heads : index")
+    e(f"    %{p}kqb = index.add %{p}kqt, %kh : index")
+    e(f"    %{p}kq3o = index.mul %{p}kqb, %c3 : index")
+    e(f"    %{p}kqo = index.add %{p}kq3o, %st_kqsel : index")
+    e(f"    %{p}kqv = view.load %kq_view[%{p}kqo] : view<[%kq_total3]xf32> -> f32")
+
+
+def stage_store(e, buf, p):
+    """Write a fetch (stage_fetch prefix p) into staging buffer offset buf."""
+    e(f"    %{p}dk = index.add {buf}, %st_e : index")
+    e(f"    vector.store %{p}kq2, %stg_view[%{p}dk] : vector<2xf32>, view<{2 * SB}xf32>")
+    # Every lane stores its scalar: lanes sharing a slot fetched the same
+    # element, so the duplicate writes agree (a lane-predicated scf.if inside
+    # the token loop is rejected: masked_region_exits_by_cfg).
+    e(f"    %{p}da = index.add {buf}, %st_abslot : index")
+    e(f"    view.store %{p}abv, %stg_view[%{p}da] : f32, view<{2 * SB}xf32>")
+    e(f"    %{p}dq = index.add {buf}, %st_kqslot : index")
+    e(f"    view.store %{p}kqv, %stg_view[%{p}dq] : f32, view<{2 * SB}xf32>")
+
+
+def stage_setup(e):
+    """LDS double buffer, the lane's staging map, and token 0 staged in buffer 0."""
+    e(f"  %stg_bytes = index.constant {2 * SB * 4} : offset")
+    e("  %stg = buffer.alloca<workgroup> align(16) %stg_bytes : buffer")
+    e(f"  %stg_view = buffer.view %stg[%base] : buffer -> view<{2 * SB}xf32>")
+    e(f"  %csb = index.constant {SB} : index")
+    e("  %c256 = index.constant 256 : index")
+    e("  %c4 = index.constant 4 : index")
+    # element e = 2*row of the k|q block; k for e < 128, q for e >= 128:
+    # rel = (e - 128*sel) + kbase*(1 - sel) + qbase*sel, every term >= 0
+    e("  %st_e = index.mul %row, %c2 : index")
+    e("  %st_sel = index.div %st_e, %c128 : index")
+    e("  %st_nsel = index.sub %c1, %st_sel : index")
+    e("  %st_s128 = index.mul %st_sel, %c128 : index")
+    e("  %st_el = index.sub %st_e, %st_s128 : index")
+    e("  %st_kh = index.add %num_key_heads, %kh : index")
+    e("  %st_kbase = index.mul %st_kh, %c128 : index")
+    e("  %st_qbase = index.mul %kh, %c128 : index")
+    e("  %st_kpart = index.mul %st_kbase, %st_nsel : index")
+    e("  %st_qpart = index.mul %st_qbase, %st_sel : index")
+    e("  %st_r0 = index.add %st_el, %st_kpart : index")
+    e("  %st_rel = index.add %st_r0, %st_qpart : index")
+    # scalars: lane 0/1 alpha/beta -> slots 256/257; lanes 0..2 kq -> 258..260
+    e("  %st_absel = index.rem %row, %c2 : index")
+    e("  %st_abslot = index.add %c256, %st_absel : index")
+    e("  %st_r4 = index.rem %row, %c4 : index")
+    e("  %st_kqsel = index.min %st_r4, %c2 : index")
+    e("  %c258 = index.constant 258 : index")
+    e("  %st_kqslot = index.add %c258, %st_kqsel : index")
+    e("  %last_t = index.sub %batch, %c1 : index")
+    stage_fetch(e, "%c0", "s0_")
+    stage_store(e, "%c0", "s0_")
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+
+
+def staged_body():
+    """Loop head for STAGE=lds: fetch token t+1 (clamped), read token t's
+    scalars from its buffer; k/q chunks come from rd_load/up_load."""
+    L = []
+    e = L.append
+    e("    %t_n0 = index.add %t, %c1 : index")
+    e("    %t_n = index.min %t_n0, %last_t : index")
+    stage_fetch(e, "%t_n", "nx_")
+    e("    %t_par = index.rem %t, %c2 : index")
+    e("    %bo = index.mul %t_par, %csb : index")
+    e("    %bo_q = index.add %bo, %c128 : index")
+    e("    %t_npar = index.rem %t_n0, %c2 : index")
+    e("    %bo_n = index.mul %t_npar, %csb : index")
+    for i, nm in enumerate(("alpha", "beta", "inv_k", "q_scale", "kq3")):
+        e(f"    %sco_{nm} = index.constant {256 + i} : index")
+        e(f"    %scx_{nm} = index.add %bo, %sco_{nm} : index")
+        e(f"    %{nm} = view.load %stg_view[%scx_{nm}] : view<{2 * SB}xf32> -> f32")
+    e("    %conv_t = index.mul %t, %qkv_size : index")
+    e("    %v_heads = index.mul %num_key_heads, %c2 : index")
+    e("    %v_head = index.add %v_heads, %h : index")
+    e("    %v_row0 = index.mul %v_head, %c128 : index")
+    e("    %v_off = index.add %conv_t, %v_row0 : index")
+    e("    %v_off_row = index.add %v_off, %row : index")
+    e("    %kq_dot = scalar.mulf %inv_k, %q_scale : f32")
+    e("    %kq_dot2 = scalar.mulf %kq_dot, %kq3 : f32")
+    e("    %v = view.load %conv_view[%v_off_row] : view<[%conv_total]xf32> -> f32")
+    e(f"    %alpha_v = vector.splat %alpha : {VT}")
+    return "\n".join(L)
+
+
+def stage_commit(e):
+    """Token t+1's fetched values into the other buffer, then one barrier: every
+    wave is past its reads of this buffer before it is rewritten at t+1."""
+    stage_store(e, "%bo_n", "nx_")
+    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
 
 
 def cases():
