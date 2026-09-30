@@ -1328,6 +1328,19 @@ has 2 groups of 32 per row, so with 128 rows half of the 512 lanes decode
 IQ4_XS, and a quarter decode Q4_K, whose groups pair up. HIP spreads each tile's
 decode over all 1024 threads.
 
+### half_norm: the same loop, unrolled
+
+`yah_half_norm` (fused=0) was 1.85x HIP's `HalfNorm5120` (68.7 vs 37.1 ms over
+128 calls). HIP moves 63 MB per 2048-row call at ~217 GB/s, near the DRAM
+bandwidth; the Loom kernel, one wave32 per row, loaded, squared and added one
+element per lane per loop iteration and then walked the row a second time.
+`tools/gen_half_norm.py` emits the same kernel fully unrolled: the same ops in
+the same order (mulf then addf per lane, then the subgroup reduce), but every
+lane issues its 160 loads up front and keeps the values in registers for the
+output pass. Interleaved, device time: loop 68.7, `unroll(8)` 61.9, fully
+unrolled 42.3 ms (1.14x HIP), bit-identical. The emitter uses it unless
+`YAH_NORM_UNROLLED=0`.
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.

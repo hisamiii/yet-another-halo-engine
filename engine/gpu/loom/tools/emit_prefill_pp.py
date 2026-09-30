@@ -300,10 +300,21 @@ def main():
         for hal, tk, rg, tt in geom:
             fh.write("%s %d %d %d\n" % (hal, tk, rg, tt))
 
+    # The output norm is the fully unrolled fused=0 form (tools/gen_half_norm.py):
+    # same arithmetic in the same order, all loads issued up front; 0.54 -> 0.33
+    # ms per 2048-row call, bit-identical. YAH_NORM_UNROLLED=0 keeps the loop form.
+    norm_src = "yah_half_norm_f16.loom"
+    if os.environ.get("YAH_NORM_UNROLLED", "1") != "0":
+        import gen_half_norm
+        tmp = os.path.join(outdir, ".emit_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        norm_src = os.path.join(tmp, "yah_half_norm_unrolled.loom")
+        with open(norm_src, "w") as fh:
+            fh.write(gen_half_norm.gen(5120))
     fixed = [
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
-        ("yah_half_norm_f16.loom", "norm.hal",
+        (norm_src, "norm.hal",
          ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
           "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"]),
         ("yah_ssm_conv_f32.loom", "conv.hal",
