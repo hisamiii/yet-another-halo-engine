@@ -323,7 +323,24 @@ def main():
     # the hand-written kernel (one head per workgroup).
     attn_heads = int(os.environ.get("YAH_ATTN_HEADS", "3"))
     attn_src = "yah_attn_wmma_qb.loom"
-    if attn_heads:
+    # YAH_ATTN_HIP=1: tools/gen_attn_hip.py, bit-identical to HIP's
+    # WmmaCausalAttention<32, 16, true> (32 tokens x 2 heads per workgroup),
+    # reading V^T written per layer by yah_transpose_v16 (vtrans.hal row).
+    attn_hip = os.environ.get("YAH_ATTN_HIP", "1") == "1"
+    vtrans_src = None
+    if attn_hip:
+        import gen_attn_hip
+        tmp = os.path.join(outdir, ".emit_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        attn_src = os.path.join(tmp, "yah_attn_hip.loom")
+        with open(attn_src, "w") as fh:
+            fh.write(gen_attn_hip.gen())
+        vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
+        with open(vtrans_src, "w") as fh:
+            fh.write(gen_attn_hip.gen_vtrans())
+        geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
+        geom.append(("vtrans.hal", 0, 0, 0))
+    elif attn_heads:
         import gen_attn_heads
         tmp = os.path.join(outdir, ".emit_tmp")
         os.makedirs(tmp, exist_ok=True)
@@ -409,6 +426,9 @@ def main():
             "attention_prefill.start_pos=0",
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]),
+        *([(vtrans_src, "vtrans.hal",
+            ["yah_vtrans.token_count=%d" % B, "yah_vtrans.cache_capacity=%d" % B])]
+          if vtrans_src else []),
         ("yah_half_cast.loom", "cast.hal",
          ["yah_half_cast.num_elements=%d" % (6144 * B)]),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",

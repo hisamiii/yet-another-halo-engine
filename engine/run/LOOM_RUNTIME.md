@@ -1435,6 +1435,53 @@ HIP's last-token logits at pp2048: KL(HIP||Loom) 1.88e-8 -> 1.46e-8, max
 |dlogit| 0.106 -> 0.082, argmax 11751 and the top-10 unchanged -- Loom moved
 toward HIP. `YAH_DELTANET_HIP=0` restores the regtile kernel.
 
+### Attention in HIP's arithmetic order -- bit-identical to HIP's kernel
+
+`tools/gen_attn_hip.py` ports HIP's `WmmaCausalAttention<32, 16, true>`: 32
+query tokens x 2 heads of one GQA group per workgroup, 16-key tiles, S as two
+8-step WMMA chains added in the softmax, the running max/sum and `__expf` as
+hipcc compiles them, and HIP's scalar `fmaf` chain on the causal boundary
+tiles. `tools/attn_vs_hip.sh [tokens]` builds HIP's kernels into a harness
+(`engine/tests/attn_hip_ref.hip`) and compares every output element with atol
+0, plus a negative control (token-major V bound where V^T is expected) that
+must fail: exact at 200 (ragged) and 2048 tokens.
+
+HIP reads V from a transposed copy (`PackAttentionHeads`); Loom does the same.
+`yah_transpose_v16` (also in the generator, `vtrans.hal`) writes the layer's
+V as [kv head][16-key tile][dim][16] f16 after the rope kernel, so a tile's
+V^T is one contiguous 8 KB block. Plain [dim][token] rows at a 4 KB pitch were
+slower than transposing in the kernel (3.38 vs 2.95 ms): 256 rows per tile at
+a cache-aliasing stride.
+
+Standalone, per layer at pp2048: first working port 4.54 ms; boundary chain
+only for partly visible row blocks, P/V rows as 16-byte loads 3.32; epilogue
+gate loads issued together 3.04; next tile's K/V carried in registers 2.95; V^T
+2.67 + 0.01 transpose (HIP 2.86 in its pipeline, `gen_attn_heads.py` H=3 3.84).
+In the pipeline (`YAH_LOOM_TIME=2`, 16 layers): attention 72.9 -> 49.0 ms plus
+1.0 ms of transpose, HIP 46.0.
+
+Numerics: hidden md5 a2145e371ceefd4d; against HIP's last-token logits
+KL(HIP||Loom) 1.46e-8 -> 3.46e-9, max |dlogit| 0.082 -> 0.066, argmax 11751.
+`YAH_ATTN_HIP=0` restores `gen_attn_heads.py`.
+
+Two Loom pitfalls on the way: a lane-divergent `scf.if` holding LDS loads
+inside the key loop lost lanes (0.3% of outputs written); predicate values
+instead. The fully unrolled boundary chains (8 fragments x 8 rows x 16 keys)
+exhausted the SGPRs; the rows are an `scf.for`.
+
+**The reset this cost.** The driver's attention grid now comes from dispatch.txt
+(32 tokens per workgroup). The driver edit was "built" with `cmake --build`,
+which does not build `loom_forward_pp` (`engine/build_hrx.sh` does) and printed
+nothing, so the 18:06 binary ran the new HAL set: 128 workgroups along x where
+the kernel's launch contract declares 64. Loom proves bounds from that contract
+and drops clamps it can show are redundant (`min(token, B-1)` on q, gate and
+the output), so workgroups 64..127 read ~48 MiB past q/gate: unmapped VA, no
+fault, gfx ring timeout, reset. Every declared footprint
+(`loom_preflight.declared_envelopes`) fitted the bindings; the grid did not.
+`gpu_run.sh` now refuses a `loom_forward_pp`/`hal_bench` binary older than its
+source, and the driver refuses an attention grid that disagrees with the token
+tiles the emitter recorded.
+
 ### Q3_K joins the tile GEMM
 
 Q3_K was the last FFN format on the chained kStore (1.5x HIP). `q3k_loads` /
@@ -1456,6 +1503,15 @@ interleaved: 175/185 -> 142/151 ms (HIP 122 ms for the same dispatches).
 - Double-buffered LDS at KSUB=32 (the only size that fits 64 KB at 128x256):
   IQ4_XS 10.24 -> 9.92, Q4_K 6.40 -> 6.36 standalone, but +160 ms in the
   pipeline and not bit-identical there; not pursued.
+- Activation row pitch padding (`YAH_TG_AGPAD`, f16; h3-hrx found 1024-byte
+  multiple pitches alias in cache, and ours are 10240 / 34816 B): IQ4_XS at
+  K=5120 9.96 -> 10.18/10.29 ms (pad 32/64), at K=17408 9.97 -> 9.92/9.58/9.52/
+  9.91 (pad 16/32/48/64). ~4% on the down projection only, and every producer
+  would have to write the padded pitch; the knob stays, off.
+- Load cache hints (`{cache_scope = cu, cache_temporal =
+  non_temporal_high_temporal}`, TH_LOAD_NT_HT on gfx12): Loom's gfx11 encoding
+  (`gfx11_glc_slc_dlc`) accepts only device/regular and drops anything else
+  silently -- the ISA is byte-identical. Nothing to measure on gfx1151.
 
 ### half_norm: the same loop, unrolled
 

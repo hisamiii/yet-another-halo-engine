@@ -25,6 +25,26 @@ if [ "$#" -lt 3 ] || [ "$2" != "--" ]; then
   exit 2
 fi
 TAG="$1"; shift 2
+
+# Refuse a driver binary older than its source. On 2026-09-30 an edit to
+# loom_forward_pp.cc was "built" with cmake --build, which does not build this
+# target (engine/build_hrx.sh does), and printed nothing. The 18:06 binary then
+# launched a new attention HAL on the old 16-token grid: twice the workgroups the
+# kernel's launch contract declares. Loom had used that contract to drop its
+# token clamps, so the extra workgroups read ~48 MiB past q/gate, and the ring hung.
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+for pair in "loom_forward_pp:engine/run/loom_forward_pp.cc" "hal_bench:engine/run/hal_bench.cc"; do
+  bin="${pair%%:*}"; src="$ROOT/${pair#*:}"
+  for arg in "$@"; do
+    case "$arg" in
+      */"$bin")
+        if [ -f "$arg" ] && [ -f "$src" ] && [ "$src" -nt "$arg" ]; then
+          echo "gpu_run: $arg is older than $src -- rebuild with engine/build_hrx.sh" >&2
+          exit 3
+        fi ;;
+    esac
+  done
+done
 mkdir -p "$LOGDIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG="$LOGDIR/gpu-${TAG}-${STAMP}.dmesg.log"

@@ -468,6 +468,11 @@ int main(int argc, char** argv) {
     LoomExecutable& e_unpack = load(dir + "/unpack.hal");
     LoomExecutable& e_rope = load(dir + "/rope.hal");
     LoomExecutable& e_wmma = load(dir + "/wmma.hal");
+    // tools/gen_attn_hip.py: a vtrans.hal row means the attention reads V as
+    // [kv head][16-key tile][dim][16] f16, written per layer by yah_transpose_v16.
+    LoomExecutable* e_vtrans = g_geom.count("vtrans.hal") ? &load(dir + "/vtrans.hal") : nullptr;
+    const std::size_t kVtBytes = std::size_t{(B + 15) / 16 * 16} * kKvRow * 2;
+    LoomBuffer vt16 = gpu.Allocate(e_vtrans ? kVtBytes : 4);
     LoomExecutable& e_cast = load(dir + "/cast.hal");
     LoomExecutable& e_gemv = load(dir + "/gemv.hal");
     LoomExecutable& e_rms = load(dir + "/rmsnorm.hal");
@@ -713,11 +718,17 @@ int main(int argc, char** argv) {
           Dispatch(gpu, e_rope, "yah_fused_qk_rope_batched", 28, B, 1, 256, 1, 1, b);
         }
         // w_qn/w_kn are views into the import; nothing to keep alive.
+        if (e_vtrans) {
+          std::vector<hrx_buffer_ref_t> b = {
+              {kv16.handle, voff, kKvCache * 2}, {vt16.handle, 0, kVtBytes}};
+          Dispatch(gpu, *e_vtrans, "yah_transpose_v16", 32, (B + 31) / 32, 1, 256, 1, 1, b);
+        }
         {
           std::vector<hrx_buffer_ref_t> b = {
               {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)},
               {kv16.handle, koff, kKvCache * 2},
-              {kv16.handle, voff, kKvCache * 2},
+              e_vtrans ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
+                       : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
               {aout.handle, 0, hb(aout)}, {lse.handle, 0, hb(lse)}};
           // YAH_ATTN_GRID_OLD restores the pre-WMMA attention launch geometry so the
           // two attention kernels can be A/Bd from ONE binary, interleaved, without a
@@ -730,8 +741,17 @@ int main(int argc, char** argv) {
           const std::uint32_t attn_hpw =
               attn_geom != g_geom.end() && attn_geom->second.rowgrp ? attn_geom->second.rowgrp : 1;
           if (kHeads % attn_hpw) throw LoomError("wmma.hal heads per workgroup does not divide the heads");
+          // query tokens per workgroup: 16 (gen_attn_heads) or 32 (gen_attn_hip)
+          const std::uint32_t attn_tpw =
+              attn_geom != g_geom.end() && attn_geom->second.tokens ? attn_geom->second.tokens : 16;
+          // The kernel's launch contract fixes its grid, and Loom drops bounds
+          // clamps it proves from it: extra workgroups read unmapped VA and hang
+          // the ring. Refuse a grid the emitter did not record.
+          if (!attn_old_grid && attn_geom != g_geom.end() && attn_geom->second.tt &&
+              (B + attn_tpw - 1) / attn_tpw != attn_geom->second.tt)
+            throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
           Dispatch(gpu, e_wmma, "yah_attn_wmma",
-                   attn_old_grid ? kHeads : (B + 15) / 16,
+                   attn_old_grid ? kHeads : (B + attn_tpw - 1) / attn_tpw,
                    attn_old_grid ? B : kHeads / attn_hpw, 1,
                    attn_old_grid ? 32 : 256, 1, 1, b);
         }

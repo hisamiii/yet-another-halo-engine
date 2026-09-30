@@ -55,6 +55,10 @@ assert BM % (16 * WM) == 0 and BN % (16 * WN) == 0 and LANES >= BM and LANES % B
 ROWGRP = BM // 16             # m_tiles per workgroup
 APL = LANES // BN             # lanes staging one token row of the activation tile
 APAD = int(os.environ.get("YAH_TG_APAD", "8"))
+# Global activation row pitch pad (f16). K*2-byte rows are multiples of 1024 B at
+# every model K, which aliases the token rows of one tile in the cache.
+AGPAD = int(os.environ.get("YAH_TG_AGPAD", "0"))
+
 # f16 of padding per decoded weight row: unpadded rows are 128 B apart at
 # KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
 WPAD = int(os.environ.get("YAH_TG_WPAD", "8"))
@@ -203,7 +207,9 @@ def gen(fmt, kind="kstore"):
         e(f"  %w_lim{nb} = index.sub %w_bytes, %cw{nb} : index")
     e("  %w_half_last = index.sub %w_halfs, %c1 : index")
     e("  %out_total = index.mul %m_rows, %tokens : index")
-    e("  %a_total = index.mul %tokens, %ktot : index")
+    e(f"  %cagpad = index.constant {AGPAD} : index")
+    e("  %apitch = index.add %ktot, %cagpad : index")
+    e("  %a_total = index.mul %tokens, %apitch : index")
     e("  %a_last8 = index.sub %a_total, %c8 : index")
     e("  %a_layout = encoding.layout.strided [%c1, %ktot] : encoding<layout>")
     e("  " + ", ".join(f"%{b}_na" for b in bufs) + " = buffer.assume.noalias "
@@ -295,7 +301,7 @@ def gen(fmt, kind="kstore"):
     e(f"  %caspl8 = index.constant {8 * aspl} : index")
     e("  %aseg0 = index.mul %apart, %caspl8 : index")
     e("  %atok_g = index.add %wtb, %atok : index")
-    e("  %arow_g = index.mul %atok_g, %ktot : index")
+    e("  %arow_g = index.mul %atok_g, %apitch : index")
     L.extend(F["setup"]())
     e("  %z8s = scalar.constant 0 : i8")
     e("  %z8v = vector.splat %z8s : vector<8xi8>")
