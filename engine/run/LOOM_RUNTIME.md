@@ -1445,6 +1445,18 @@ keep the chained kernel's f32 order, `(f32(d) * f32(scale)) * f32(quant)`, so
 the tile and shared kernels are bit-identical to it. Q3_K device time at pp2048,
 interleaved: 175/185 -> 142/151 ms (HIP 122 ms for the same dispatches).
 
+#### Tile GEMM ideas measured and dropped
+
+- Grouped launch order (runs of 4 row groups x all token tiles): 10.25 -> 10.12
+  ms standalone, +83/+90 ms on the pp2048 GEMM total. Kept as `YAH_TILE_SWZ`, off.
+- Token-major grid: 10.3 -> 11.2 ms standalone (the activation tile stops being
+  shared by consecutive workgroups).
+- Half-group decode (two lanes per IQ4_XS group, all lanes decoding): 10.27 ->
+  10.95 ms -- each lane repeats the group's loads and scale math.
+- Double-buffered LDS at KSUB=32 (the only size that fits 64 KB at 128x256):
+  IQ4_XS 10.24 -> 9.92, Q4_K 6.40 -> 6.36 standalone, but +160 ms in the
+  pipeline and not bit-identical there; not pursued.
+
 ### half_norm: the same loop, unrolled
 
 `yah_half_norm` (fused=0) was 1.85x HIP's `HalfNorm5120` (68.7 vs 37.1 ms over
