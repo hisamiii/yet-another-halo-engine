@@ -122,6 +122,10 @@ XBAR = os.environ.get("YAH_TG_XBAR", "0") == "1"
 # weight and activation stores), 4 the global fetch (the carried prefetch is
 # re-used), 8 the epilogue store. Wrong results on purpose; timing only.
 ABL = int(os.environ.get("YAH_TG_ABL", "0"))
+# EPAD: pad of the LDS epilogue slab's token pitch (f32). With pitch TM the 16
+# lanes storing a fragment row are 128 B apart -- one or two banks -- and the
+# slab carried every LDS bank conflict of the kernel (rocprofv3, via loomhip).
+EPAD = int(os.environ.get("YAH_TG_EPAD", "4"))
 # policy of the K-phase loop (e.g. "unroll(%c2) schedule(recurrence)")
 PPOL = os.environ.get("YAH_TG_PPOL", "")
 # groups decoded per decoding lane (q4k's even/odd pairing needs 2)
@@ -281,7 +285,7 @@ def gen(fmt, kind="kstore"):
     al_bytes = BN * arow * 2
     G.EPI_TILE = "%al"
     G.EPI_ROUNDS = 1
-    slabs = NWAVE * TM * 16 * 4
+    slabs = NWAVE * (TM + EPAD) * 16 * 4
     wl_total = BM * G.ROWP * 2 * (2 if DECAHEAD else 1)
     if EPI_LDS and WS == 32 and TM == 32 and slabs > al_bytes:
         if wl_total >= slabs:
@@ -846,9 +850,9 @@ def lds_epilogue(e, kr, V8, sw=False):
     if DECAHEAD and DECW:
         # the decode-only waves have no tile to store
         e("  scf.if %mma_wave {")
-    e(f"  %es_ctm = index.constant {TM} : index")
+    e(f"  %es_ctm = index.constant {TM + EPAD} : index")
     e("  %es_lay = encoding.layout.strided [%c1, %es_ctm] : encoding<layout>")
-    e(f"  %es_wb = index.constant {TM * 16 * 4} : index")
+    e(f"  %es_wb = index.constant {(TM + EPAD) * 16 * 4} : index")
     R = G.EPI_ROUNDS
     if R > 1:
         # round r: waves r*NWAVE/R .. use slabs 0 .. NWAVE/R-1; the round loop
@@ -866,7 +870,7 @@ def lds_epilogue(e, kr, V8, sw=False):
         e("  %es_off_i = index.mul %wave, %es_wb : index")
     e("  %es_off = index.cast %es_off_i : index to offset")
     e(f"  %es_view = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
-    e(f"  %es_flat = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{TM * 16}xf32>")
+    e(f"  %es_flat = buffer.view {G.EPI_TILE}[%es_off] : buffer -> view<{(TM + EPAD) * 16}xf32>")
     if sw:
         # swiglu: out f16 = f16(silu(gate) * acc), the scalar ops of
         # swiglu_epilogue per element (bit-identity), 4 rows per load/store
@@ -897,7 +901,7 @@ def lds_epilogue(e, kr, V8, sw=False):
         for q in range(4):
             e(f"  %es_q{j}_{q}c = index.constant {4 * q} : index")
             e(f"  %es_ri{j}_{q} = index.add %es_rd, %es_q{j}_{q}c : index")
-            e(f"  %es_v{j}_{q} = vector.load %es_flat[%es_ri{j}_{q}] : view<{TM * 16}xf32> -> vector<4xf32>")
+            e(f"  %es_v{j}_{q} = vector.load %es_flat[%es_ri{j}_{q}] : view<{(TM + EPAD) * 16}xf32> -> vector<4xf32>")
             e(f"  %es_oi{j}_{q} = index.add %es_ob{j}, %es_q{j}_{q}c : index")
             val = f"%es_v{j}_{q}"
             if kr:

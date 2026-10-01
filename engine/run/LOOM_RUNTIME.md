@@ -1793,6 +1793,21 @@ barrier-interval critical path is 31% decode VALU for us, where HIP's is
 mostly WMMA. Next: price the skeleton pieces separately (LDS fragment reads
 vs barriers vs epilogue), starting with the 3.8x epilogue.
 
+**The epilogue slab held every LDS bank conflict (2026-10-01).** Stacked
+ablations in robust cycles (`SQ_BUSY_CYCLES` per SQ; `GRBM_GUI_ACTIVE` reads 0
+in some captures and `SQ_WAVES` is unreliable): with commit, fetch, store and
+barriers all removed, HIP's K loop runs at 99% of the WMMA floor and ours at
+84% (87% with `pipeline(%c2)` or a full unroll). rocprofv3's LDS counters,
+which HRX cannot read, then showed ~20 M bank-conflict cycles per dispatch
+for us against HIP's 0. Without the LDS epilogue: 0, and the bare skeleton
+at 91%. The slab stored element (r, t) at `t*TM + r`, so the 16 lanes writing a
+fragment row were 128 B apart. A token pitch of TM+4 floats (`YAH_TG_EPAD`,
+default 4; keeps the b128 read-back aligned, LDS 52 -> 56 KiB) cuts the
+conflicts 94% and IQ4_XS to 26.39 M cycles (from 26.77). Bit-identical. pp2048,
+every tile GEMM re-emitted, one round each: 3598.7 -> 3537.1 ms; GEMM rows
+-58.8 ms against -2.5 on the rest (IQ3_S gate+up -15.6, IQ3_S residual -10.0,
+Q3_K -5.7, IQ4_XS -4.5). IQ3_XXS did not move.
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
