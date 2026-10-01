@@ -46,3 +46,28 @@ again).
 
 Script: engine/run/research/fa/ (att.sh / attq.sh capture,
 `--att-simd-select 0 --att-buffer-size 25165824` for a small window).
+
+## MCP server setup on this machine (2026-10-01)
+
+- **Build:** full app from /home/q/yah-scratch/ext/ROCprofGUI with
+  `npm ci && npx tauri build --no-bundle`. System webkit2gtk-4.1 / gtk3 /
+  libsoup3 are present, and the repo ships decoder-python.zip.
+  - The build carries the local x50 caps (import.rs, hidden.rs) so full
+    attention traces load.
+- **Install:** `~/.local/bin/rocprof-studio`, run by the systemd user service
+  `~/.config/systemd/user/rocprof-studio.service`:
+  - `--headless --mcp-port 8765`
+  - ROCPROFGUI_HOME=~/.rocprofgui
+  - enabled, Restart=on-failure
+- **Endpoint:** http://127.0.0.1:8765/mcp (Streamable HTTP, loopback only).
+  Bearer token in ~/.rocprofgui/mcp/token (0600); requests without it get
+  401.
+- **Claude Code:** registered at user scope as `rocprof-studio` (31 tools:
+  capture_open / capture_analyze / wave_analyze / hidden_latency /
+  profile_run / ...).
+- **Our kernels:** pass `profiler` =
+  /var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0/bin/rocprofv3
+  to profile_run (the default is /opt/rocm/bin/rocprofv3). Import ATT that
+  rocprofv3 already decoded. Raw-ATT decoding wants rocprof-trace-decoder
+  0.2.2; TheRock ships 0.1.7.
+- **Manage:** `systemctl --user {status,restart,stop} rocprof-studio`.
