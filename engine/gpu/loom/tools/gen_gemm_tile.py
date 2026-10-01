@@ -130,9 +130,15 @@ PF = os.environ.get("YAH_TG_PF", "0") == "1"
 # unlike PF): the fragment loads' lane/base address math, recomputed on every
 # step of the rolled loop (13 VALU per 8 WMMAs, two quarter-rate v_mul_lo),
 # is shared by low CSE. KSL_FENCE keeps step s+1's loads after step s's MMAs.
-# Default on for IQ4_XS (kstore 17408x5120, real bytes, with DECLOAD: 25.96 ->
-# 24.50 M cycles, bit-identical); the other formats are unmeasured.
-KSL_FMTS = ("iq4xs",)
+# Default on where measured, M cycles on real bytes: IQ4_XS 25.96 -> 24.50
+# (with DECLOAD), Q4_K 15.49 -> 15.21 (with DECLOAD; 15.83 without: the latch
+# copies' vmcnt(0) lands between the steps), IQ3_S 28.07 -> 27.06, IQ3_XXS
+# 26.99 -> 25.99, Q3_K 29.31 -> 28.62 (no decode-ahead, DECLOAD is a no-op).
+# Q5_K loses (19.34 -> 19.59 alone, 19.60 with DECLOAD): alone the latch copies'
+# vmcnt(0) sits between the steps; with DECLOAD the allocator, at the 144-VGPR
+# cap, interleaves ~48 moves between the MMA pairs. Q6_K, Q2_K, Q8, IQ2_*:
+# unmeasured.
+KSL_FMTS = ("iq4xs", "q4k", "iq3s", "iq3xxs", "q3k")
 KSL_ENV = os.environ.get("YAH_TG_KSL")
 KSL = KSL_ENV == "1"
 KSL_FENCE = os.environ.get("YAH_TG_KSL_FENCE", "1") == "1"

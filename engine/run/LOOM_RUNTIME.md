@@ -1940,6 +1940,29 @@ Results:
 - The same rolled address math is in every tile GEMM. The other formats keep
   the old loop until measured (`KSL_FMTS`).
 
+**KSL on the other formats.** Standalone, M cycles on real bytes, one round:
+
+| format (real tensor) | baseline | KSL | KSL + DECLOAD |
+|---|---:|---:|---:|
+| Q4_K (`attn_qkv`) | 15.49 | 15.83 | 15.21 |
+| IQ3_S (gate) | 28.07 | 27.06 | (no decode-ahead) |
+| IQ3_XXS (gate) | 26.99 | 25.99 | (no decode-ahead) |
+| Q3_K (`blk.54.ffn_gate`) | 29.31 | 28.62 | (no decode-ahead) |
+| Q5_K (`blk.27.attn_q`) | 19.34 | 19.59 | 19.60 |
+
+- Q5_K stays off:
+  - KSL alone puts the latch copies' `vmcnt(0)` between the steps.
+  - With DECLOAD, the allocator, at the 144-VGPR cap, interleaves ~48 moves
+    between the MMA pairs.
+- IQ3_S kres does not gain (real `ffn_down` 28.74 -> 28.69, `ssm_out`
+  14.29 -> 14.40). The kres harness (`krfmt.sh`) uses the layer-4 swiglu
+  output as input.
+- The md5 gate passed on every kind.
+- pp2048 p44 -> p45, one round each: Q4_K/IQ3_S/IQ3_XXS/Q3_K rows
+  2447.5 -> 2418.1 ms (-1.20%) against +1.22% drift on the others.
+  - The IQ3_S kres row read +11.6 ms. Standalone does not reproduce it
+    (see above).
+
 **Kernel parity in cycles, same real bytes (2026-10-01).** Per-kernel ratios
 against the old HIP trace (2026-09-30) were stale; HIP's plain pp2048 swings
 3289-3538 ms between sessions. Measured kernel against kernel instead
