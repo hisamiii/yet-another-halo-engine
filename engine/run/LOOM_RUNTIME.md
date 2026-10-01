@@ -2708,3 +2708,13 @@ DeltaNet and the SSM z-projection GEMM overlap fully. md5 unchanged; the pair
 goes 270.6 -> 251.9 ms over 48 layers (~0.6% of pp2048). Driver hook:
 `LoomDevice::NoBarrierNext()`; it must stay off against stock HRX, which
 rejects unknown flags.
+
+**Attention writes f16 for the o projection (2026-10-01).**
+- `gen_attn_hip` `F16OUT` (default; off under `YAH_ATTN_DBG` and in
+  `attn_vs_hip.sh`, which compares f32): the epilogue stores
+  fptrunc(o/sum * sigmoid(gate)) into the f16 GEMM input. That is the same
+  rounding `yah_half_cast` applied in a separate pass.
+- The emitter marks the set (`dispatch.txt` row `attn_f16out`); the driver
+  then binds `scratch` and skips the cast. Older sets keep the old path.
+- p60 = full emit: md5 a2145e371ceefd4d, 931 -> 915 dispatches, half_cast
+  12.8 M cycles gone, attention 93.9 -> 93.8 M (~0.2% of pp2048).

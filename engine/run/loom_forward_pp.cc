@@ -603,6 +603,9 @@ int main(int argc, char** argv) {
     // (gemm_kqg_*: rows = heads x [256 q | 256 gate] stored straight into q and
     // gate, as yah_unpack_qg did). False if the set has no such HAL or
     // YAH_KQG=0; the caller then runs kstore + unpack.
+    // The set's attention HAL stores f16 straight into the o-projection input
+    // (emitter marker "attn_f16out"): no yah_half_cast pass.
+    const bool attn_f16 = g_geom.count("attn_f16out") != 0;
     auto run_kqg = [&](const std::string& wname) -> bool {
       { const char* e = std::getenv("YAH_KQG"); if (e && std::string(e) == "0") return false; }
       const auto* tw = find(wname);
@@ -850,7 +853,7 @@ int main(int argc, char** argv) {
               {kv16.handle, koff, kKvCache * 2},
               e_vtrans ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
                        : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
-              {aout.handle, 0, hb(aout)}, {lse.handle, 0, hb(lse)}};
+              {attn_f16 ? scratch.handle : aout.handle, 0, attn_f16 ? hb(scratch) : hb(aout)}, {lse.handle, 0, hb(lse)}};
           // YAH_ATTN_GRID_OLD restores the pre-WMMA attention launch geometry so the
           // two attention kernels can be A/Bd from ONE binary, interleaved, without a
           // rebuild between runs (a failed rebuild leaves a stale binary and a mismatched
@@ -876,9 +879,9 @@ int main(int argc, char** argv) {
                    attn_old_grid ? B : kHeads / attn_hpw, 1,
                    attn_old_grid ? 32 : 256, 1, 1, b);
         }
-        if (g_dump_layer == static_cast<int>(l))
+        if (g_dump_layer == static_cast<int>(l) && !attn_f16)
           dump_buf(aout, static_cast<std::size_t>(B) * 6144 * 4, ".aout");
-        {
+        if (!attn_f16) {
           std::vector<hrx_buffer_ref_t> b = {
               {aout.handle, 0, hb(aout)}, {scratch.handle, 0, hb(scratch)}};
           Dispatch(gpu, e_cast, "yah_half_cast", 24 * B, 1, 1, 256, 1, 1, b);

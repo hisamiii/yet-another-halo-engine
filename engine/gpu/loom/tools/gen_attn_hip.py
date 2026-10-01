@@ -111,6 +111,9 @@ assert 64 * Q_PITCH * 2 <= POOL and POOL <= 65536
 MAX_TOKENS = int(os.environ.get("YAH_ATTN_MAX_TOKENS", "2048"))
 
 
+F16OUT = __import__('os').environ.get('YAH_ATTN_F16OUT', '1') == '1' and not __import__('os').environ.get('YAH_ATTN_DBG')
+
+
 def gen():
     L = []
     e = L.append
@@ -169,7 +172,14 @@ def gen():
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
     e("  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf32>")
     e("  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
-    e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf32>")
+    # F16OUT (default on): the epilogue stores fptrunc(out) as f16, the input
+    # the o-projection GEMM reads, which yah_half_cast produced in a separate
+    # pass: same rounding of the same f32, bit-identical. The emitter marks the
+    # set (dispatch.txt "attn_f16out") so the driver binds the f16 buffer.
+    if F16OUT:
+        e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
+    else:
+        e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf32>")
     e("  %k_flat = buffer.view %k_na[%base] : buffer -> view<[%kvtot]xf16>")
     if VT:
         e("  %cap15 = index.add %cache_capacity, %c15 : index")
@@ -682,7 +692,11 @@ def gen():
                     e(f"  %edbg{b} = view.load %rs_view[%ersr{b}, %sub] : view<64x16xf32> -> f32")
                 dbg = {"sum": f"%eden{b}", "o": f"%eov{b}", "rsc": f"%edbg{b}", "tid": "%dbg_tf"}.get(__import__("os").environ.get("YAH_ATTN_DBG", ""), f"%eout{b}")
                 e(f"  scf.if %elive{b} {{")
-                e(f"    view.store {dbg}, %o_flat[%eoff{b}] : f32, view<[%qtot]xf32>")
+                if F16OUT:
+                    e(f"    %eoh{b} = scalar.fptrunc {dbg} : f32 to f16")
+                    e(f"    view.store %eoh{b}, %o_flat[%eoff{b}] : f16, view<[%qtot]xf16>")
+                else:
+                    e(f"    view.store {dbg}, %o_flat[%eoff{b}] : f32, view<[%qtot]xf32>")
                 e("  }")
     e("  kernel.return")
     e("}")

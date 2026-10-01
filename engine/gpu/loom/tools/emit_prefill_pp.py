@@ -355,6 +355,9 @@ def main():
         with open(vtrans_src, "w") as fh:
             fh.write(gen_attn_hip.gen_vtrans())
         geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
+        if gen_attn_hip.F16OUT:
+            # marker: the attention HAL stores its output as f16 (no half_cast)
+            geom.append(("attn_f16out", 0, 0, 0))
         geom.append(("vtrans.hal", 0, 0, 0))
     elif attn_heads:
         import gen_attn_heads

@@ -6,6 +6,7 @@
 # the kernel expects V^T and must FAIL, so a vacuous pass cannot hide.
 # usage: attn_vs_hip.sh [tokens=200] [workdir]   (200: ragged, not a multiple of 16 or 32)
 set -euo pipefail
+export YAH_ATTN_F16OUT=0  # the harness compares f32 outputs
 B=${1:-200}
 root="$(cd "$(dirname "$0")/../../../.." && pwd)"
 W=${2:-$(mktemp -d)}
