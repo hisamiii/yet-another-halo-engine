@@ -1909,6 +1909,37 @@ What the model says now:
   pair's 30 moves (a zero `v_mov` before each tied `mixlo`, plus copies into
   the `ds_store_b128` tuple).
 
+**Straight-line k steps (`YAH_TG_KSL`, with `YAH_TG_DECLOAD`), default for
+IQ4_XS (2026-10-01).**
+
+The cause:
+
+- The rolled 2-step k loop recomputed the fragment loads' lane and base
+  addresses on every step: `(lane&15)*80`, `wr*2560 + base` and `wt*5120`.
+  That is 13 VALU per 8 WMMAs, two of them quarter-rate `v_mul_lo_u32`.
+- `fragment.load` lowers its address math at the load site, in source-to-low,
+  and the pipeline has no loop-invariant motion.
+
+The fix:
+
+- `KSL` writes the steps straight-line in program order, with a schedule
+  fence between them (unlike PF, there is no read-ahead and VGPRs stay at
+  144). Both steps then share one block, low CSE merges the math to 8 VALU
+  per 16 WMMAs, and the k offset becomes an immediate.
+- Alone it put the prefetch's latch copies between the two steps, behind a
+  `vmcnt(0)`: kstore 25.96 -> 25.00 M cycles.
+- `DECLOAD` (only decoding waves issue the weight loads) moves the copies and
+  their wait to after the last MMA: 24.50 M (HIP 23.15).
+- `DECLATE` instead put the wait before step 0.
+
+Results:
+
+- Bit-identical; md5 a2145e371ceefd4d.
+- pp2048, one round each: IQ4_XS rows 712.6 -> 675.2 ms (-5.25%) against
+  -0.73% drift on the others (p43 -> p44).
+- The same rolled address math is in every tile GEMM. The other formats keep
+  the old loop until measured (`KSL_FMTS`).
+
 **Kernel parity in cycles, same real bytes (2026-10-01).** Per-kernel ratios
 against the old HIP trace (2026-09-30) were stale; HIP's plain pp2048 swings
 3289-3538 ms between sessions. Measured kernel against kernel instead

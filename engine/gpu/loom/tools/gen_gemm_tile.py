@@ -126,10 +126,23 @@ ABL = int(os.environ.get("YAH_TG_ABL", "0"))
 # fenced) before step s's MMAs, as HIP's K loop keeps its loads ahead; Loom's
 # own schedule waits on each step's loads right before its MMAs.
 PF = os.environ.get("YAH_TG_PF", "0") == "1"
+# KSL: the k steps of a phase straight-line in program order (no read-ahead,
+# unlike PF): the fragment loads' lane/base address math, recomputed on every
+# step of the rolled loop (13 VALU per 8 WMMAs, two quarter-rate v_mul_lo),
+# is shared by low CSE. KSL_FENCE keeps step s+1's loads after step s's MMAs.
+# Default on for IQ4_XS (kstore 17408x5120, real bytes, with DECLOAD: 25.96 ->
+# 24.50 M cycles, bit-identical); the other formats are unmeasured.
+KSL_FMTS = ("iq4xs",)
+KSL_ENV = os.environ.get("YAH_TG_KSL")
+KSL = KSL_ENV == "1"
+KSL_FENCE = os.environ.get("YAH_TG_KSL_FENCE", "1") == "1"
 # DECLOAD: under decode-ahead only the decoding waves issue the phase's weight
 # loads. Every wave used to load them (the non-decoders clamped to another
 # group): rocprofv3 counters had 4x HIP's L2 hits and 3x its TA busy.
-DECLOAD = os.environ.get("YAH_TG_DECLOAD", "0") == "1"
+# With KSL it also moves the prefetch's latch copies (and their vmcnt(0)) from
+# between the k steps to after the last MMA. Default on where KSL is.
+DECLOAD_ENV = os.environ.get("YAH_TG_DECLOAD")
+DECLOAD = DECLOAD_ENV == "1"
 # DECLATE: the decoding waves issue the next phase's weight loads AFTER their
 # decode has consumed the carried bytes, inside the decode branch. Issued
 # before it (the default), the old and new prefetch were live together, so the
@@ -152,7 +165,9 @@ KSUB_OF = {}
 
 
 def configure(fmt):
-    global DECAHEAD
+    global DECAHEAD, KSL, DECLOAD
+    KSL = KSL_ENV == "1" if KSL_ENV is not None else fmt in KSL_FMTS
+    DECLOAD = DECLOAD_ENV == "1" if DECLOAD_ENV is not None else fmt in KSL_FMTS
     DECAHEAD = DECAHEAD_ENV == "1" if DECAHEAD_ENV is not None else fmt in DECAHEAD_FMTS
     # the decoding lanes must be whole waves (a wave-uniform branch): not so
     # for the 16-row tiles, which keep the plain schedule
@@ -791,6 +806,32 @@ def gen(fmt, kind="kstore"):
                         name = f"%r{n}" if st == nst - 1 else f"%pn{st}_{n}"
                         e(f"      {name} = vector.mma %plhs{st}_{i}, %prhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
                 acc = [f"%pn{st}_{n}" for n in range(NA)]
+            e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
+              + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
+            e("  }")
+        elif KSL:
+            # the k steps straight-line in program order (no read-ahead): one
+            # block, so low CSE shares the fragment loads' lane/base address
+            # math across steps and the step offset becomes an immediate
+            assert not (DECAHEAD and DECW) and not FRAG and not RHS_OUTER, "KSL: plain k loop only"
+            nst = ksub // 16
+            acc = [f"%a{i}" for i in range(NA)]
+            for st in range(nst):
+                if st and KSL_FENCE:
+                    e("    scf.schedule.fence")
+                e(f"    %sks{st} = index.constant {16 * st} : index")
+                for i in range(FM):
+                    e(f"    %slr{st}_{i} = index.add %wr_off, %c{16 * i} : index")
+                    e(f"    %slhs{st}_{i} = vector.fragment.load<lhs> {wlv}[%slr{st}_{i}, %sks{st}] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
+                for j in range(FN):
+                    e(f"    %stc{st}_{j} = index.add %wt_off, %c{16 * j} : index")
+                    e(f"    %srhs{st}_{j} = vector.fragment.load<rhs> {alv}[%sks{st}, %stc{st}_{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
+                for i in range(FM):
+                    for j in range(FN):
+                        n = i * FN + j
+                        name = f"%r{n}" if st == nst - 1 else f"%sn{st}_{n}"
+                        e(f"    {name} = vector.mma %slhs{st}_{i}, %srhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
+                acc = [f"%sn{st}_{n}" for n in range(NA)]
             e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
               + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
             e("  }")
