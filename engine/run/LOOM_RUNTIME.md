@@ -2203,3 +2203,17 @@ chain is exposed between barriers.
   unchanged. pp2048 IQ4_XS rows 680.7 -> 654.7 ms (-3.8%) against +0.9%
   drift.
 
+4 x 2 waves on other formats (standalone kstore, real bytes, bit-identical):
+
+| format | 4 x 4 | 4 x 2 | |
+|---|---:|---:|---|
+| IQ3_XXS | 25.41 | 24.23 | win |
+| Q3_K | 28.62 | 25.12 | win |
+| IQ3_S | 27.06 | 52.78 | spills (256 VGPRs, 58 scratch instructions) |
+| Q4_K | 15.21 | 44.05 | spills (240 VGPRs, 65 scratch instructions) |
+
+- IQ3_XXS swiglu loses at 4 x 2 (27.39 -> 27.76; pp2048 row +8.6 ms), so the
+  default is per kind.
+- p52 = p50 + IQ3_XXS kstore/kres and Q3_K at 4 x 2: md5 unchanged. pp2048
+  rows 861.9 -> 819.7 ms (-4.9%) against +1.1% drift.
+

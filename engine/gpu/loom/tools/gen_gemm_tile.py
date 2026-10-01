@@ -234,13 +234,19 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
 # (32 x 128 per wave, 8 waves): fragment loads per WMMA 1.5 -> 1.25, kstore
 # 24.50 -> 23.12 M cycles (HIP 23.15), bit-identical; 2 x 4 (64 x 64) has fewer
 # instructions still but drops off the issue bound (25.88: exposed latency).
-WAVE_FMTS = {"iq4xs": (4, 2)}
+# IQ3_XXS 25.41 -> 24.23, Q3_K 28.62 -> 25.12 M cycles (bit-identical). IQ3_S
+# and Q4_K spill at 4 x 2 (256 / 240 VGPRs, 58 / 65 scratch instructions:
+# 52.78 / 44.05 M) and stay 4 x 4.
+# IQ3_XXS swiglu loses at 4 x 2 (27.39 -> 27.76 standalone; pp2048 row +8.6 ms):
+# kstore/kres only. Values: ((WM, WN), kinds or None for all).
+WAVE_FMTS = {"iq4xs": ((4, 2), None), "iq3xxs": ((4, 2), ("kstore", "kres")), "q3k": ((4, 2), None)}
 
 
 def gen(fmt, kind="kstore"):
     if (fmt in WAVE_FMTS and os.environ.get("YAH_TG_WM") is None and os.environ.get("YAH_TG_WN") is None
-            and (BM, BN, WM, WN) == (128, 256, 4, 4)):
-        prev = set_geometry(wm=WAVE_FMTS[fmt][0], wn=WAVE_FMTS[fmt][1])
+            and (BM, BN, WM, WN) == (128, 256, 4, 4)
+            and (WAVE_FMTS[fmt][1] is None or kind in WAVE_FMTS[fmt][1])):
+        prev = set_geometry(wm=WAVE_FMTS[fmt][0][0], wn=WAVE_FMTS[fmt][0][1])
         try:
             return _gen(fmt, kind)
         finally:
