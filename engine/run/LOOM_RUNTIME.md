@@ -2400,3 +2400,20 @@ Real bytes, M cycles, bit-identical (1 s gaps for single kernels from here):
 - Any decode that narrows with `v_cvt_f16_f32` inside a loop holding 128 VGPRs
   of accumulators will hit the same window (Q5_K shares this decode; Q6_K,
   Q2_K, IQ2_* unchecked).
+
+**Speed-of-light table in cycles, p56 pp2048 (2026-10-01).**
+`research/sol2k.py` pairs per-dispatch SQ_BUSY_CYCLES (HRX counters,
+`iree-profile counter --counter_samples`) with the `YAH_LOOM_SEQ` shapes. GEMM
+floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
+
+- Total 7465 M cycles: WMMA kernels 6876 M (92%) at 76% of their floor;
+  non-WMMA 589 M (8%).
+- Big 17408-row / K=17408 GEMMs sit at 75-83% of floor. Q4_K plain is at
+  81-83%, IQ4_XS plain 80-82%.
+- Weak shapes:
+  - K=6144 residual GEMMs at 60-72%: IQ4_XS 60%, Q4_K 64%, IQ3_XXS 70%,
+    IQ3_S 72%. Short K leaves the prologue/epilogue less amortized.
+  - Q5_K 1024-row at 46%.
+  - Attention at 46%.
+- Non-WMMA: DeltaNet 226 M (3.0%), half_norm 99, ssm_conv 85,
+  ssm_postnorm 64, unpack_qg 31.
