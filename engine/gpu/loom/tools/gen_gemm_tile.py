@@ -122,6 +122,14 @@ XBAR = os.environ.get("YAH_TG_XBAR", "0") == "1"
 # weight and activation stores), 4 the global fetch (the carried prefetch is
 # re-used), 8 the epilogue store. Wrong results on purpose; timing only.
 ABL = int(os.environ.get("YAH_TG_ABL", "0"))
+# PF: the k steps straight-line with step s+1's fragment loads issued (and
+# fenced) before step s's MMAs, as HIP's K loop keeps its loads ahead; Loom's
+# own schedule waits on each step's loads right before its MMAs.
+PF = os.environ.get("YAH_TG_PF", "0") == "1"
+# DECLOAD: under decode-ahead only the decoding waves issue the phase's weight
+# loads. Every wave used to load them (the non-decoders clamped to another
+# group): rocprofv3 counters had 4x HIP's L2 hits and 3x its TA busy.
+DECLOAD = os.environ.get("YAH_TG_DECLOAD", "0") == "1"
 # EPAD: pad of the LDS epilogue slab's token pitch (f32). With pitch TM the 16
 # lanes storing a fragment row are 128 B apart -- one or two banks -- and the
 # slab carried every LDS bank conflict of the kernel (rocprofv3, via loomhip).
@@ -663,6 +671,20 @@ def gen(fmt, kind="kstore"):
         Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
         if ABL & 4:
             nxt = cur_w
+        elif DECAHEAD and DECLOAD and not DECW:
+            # wave-uniform: the decoding lanes are whole waves
+            wt = ", ".join(ty for _, ty in cur_w)
+            e("    %sg_ld = kernel.subgroup.id : index")
+            e(f"    %cdl = index.constant {slots * BM // WS} : index")
+            e("    %ld_wave = index.cmp ult, %sg_ld, %cdl : index")
+            e("    " + ", ".join(f"%nxw{x}" for x in range(len(cur_w))) + f" = scf.if %ld_wave -> ({wt}) {{")
+            L.extend(Ln)
+            packed = G.pack_vals(e, nxt, "n")
+            e("      scf.yield " + ", ".join(nm for nm, _ in packed) + f" : {wt}")
+            e("    } else {")
+            e("      scf.yield " + ", ".join(nm for nm, _ in cur_w) + f" : {wt}")
+            e("    }")
+            nxt = [(f"%nxw{x}", ty) for x, (_, ty) in enumerate(cur_w)]
         else:
             L.extend(Ln)
             nxt = G.pack_vals(e, nxt, "n")
@@ -720,59 +742,87 @@ def gen(fmt, kind="kstore"):
             e(f"    %al_mma = buffer.view %al[%aoff_m] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
             alv = "%al_mma"
         cb = ", ".join(f"%b{i} = %a{i} : {V8}" for i in range(NA))
-        if DECAHEAD and DECW:
-            e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.if %mma_wave -> ({types}) {{")
-            e("    " + ", ".join(f"%rr{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
-        else:
-            e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
-        for i in range(FM):
-            e(f"      %lr{i} = index.add %wr_off, %c{16 * i} : index")
-            if FRAG:
-                # block (lr/16, ks/16) starts at row (lr/16)*KSUB + ks
-                e(f"      %lrb{i} = index.div %lr{i}, %c16 : index")
-                e(f"      %lrk{i} = index.mul %lrb{i}, %cksub : index")
-                e(f"      %lrow{i} = index.add %lrk{i}, %ks : index")
-                e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_fm[%lrow{i}, %c0] shape [%m, %k] : view<{BM * ksub // 16}x16xf16> -> {VF}")
-            else:
-                e(f"      %lhs{i} = vector.fragment.load<lhs> {wlv}[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
-        def rhs_load(j):
-            e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
-            if FRAG:
-                e(f"      %tcb{j} = index.div %tc{j}, %c16 : index")
-                e(f"      %tck{j} = index.mul %tcb{j}, %cksub : index")
-                e(f"      %tcol{j} = index.add %tck{j}, %ks : index")
-                e(f"      %rhs{j} = vector.fragment.load<rhs> %al_fmt[%c0, %tcol{j}] shape [%k, %n] : view<16x{BN * ksub // 16}xf16, %fm_lay> -> {VF}")
-            else:
-                e(f"      %rhs{j} = vector.fragment.load<rhs> {alv}[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
-        if RHS_OUTER:
-            # rhs-outer: each rhs fragment dies after its FM MMAs, so only the lhs
-            # fragments and one or two rhs are live (compile-report suggest: the
-            # IQ4_XS peak held all 6 fragments, 144 VGPRs, one short of tier 8).
-            # Every accumulator still takes one MMA per k step: same values.
-            for j in range(FN):
-                rhs_load(j)
+        if PF and not (DECAHEAD and DECW) and not FRAG and not RHS_OUTER:
+            nst = ksub // 16
+
+            def pf_loads(st):
+                e(f"      %pks{st} = index.constant {16 * st} : index")
                 for i in range(FM):
-                    n = i * FN + j
-                    e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
-                if RHS_FENCE and j + 1 < FN and (j + 1) % RHS_FENCE == 0:
-                    e("      scf.schedule.fence")
-        else:
-            for j in range(FN):
-                rhs_load(j)
-            for i in range(FM):
+                    e(f"      %plr{st}_{i} = index.add %wr_off, %c{16 * i} : index")
+                    e(f"      %plhs{st}_{i} = vector.fragment.load<lhs> {wlv}[%plr{st}_{i}, %pks{st}] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
                 for j in range(FN):
-                    n = i * FN + j
-                    e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
-        e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
-        e("    }")
-        if DECAHEAD and DECW:
-            e("    scf.yield " + ", ".join(f"%rr{i}" for i in range(NA)) + f" : {types}")
-            e("    } else {")
-            e("    scf.yield " + ", ".join(f"%a{i}" for i in range(NA)) + f" : {types}")
+                    e(f"      %ptc{st}_{j} = index.add %wt_off, %c{16 * j} : index")
+                    e(f"      %prhs{st}_{j} = vector.fragment.load<rhs> {alv}[%pks{st}, %ptc{st}_{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
+
+            acc = [f"%a{i}" for i in range(NA)]
+            pf_loads(0)
+            for st in range(nst):
+                if st + 1 < nst:
+                    pf_loads(st + 1)
+                    e("      scf.schedule.fence")
+                for i in range(FM):
+                    for j in range(FN):
+                        n = i * FN + j
+                        name = f"%r{n}" if st == nst - 1 else f"%pn{st}_{n}"
+                        e(f"      {name} = vector.mma %plhs{st}_{i}, %prhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
+                acc = [f"%pn{st}_{n}" for n in range(NA)]
+            e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
+              + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
+            e("  }")
+        else:
+            if DECAHEAD and DECW:
+                e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.if %mma_wave -> ({types}) {{")
+                e("    " + ", ".join(f"%rr{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
+            else:
+                e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types}) {KPOL} {{")
+            for i in range(FM):
+                e(f"      %lr{i} = index.add %wr_off, %c{16 * i} : index")
+                if FRAG:
+                    # block (lr/16, ks/16) starts at row (lr/16)*KSUB + ks
+                    e(f"      %lrb{i} = index.div %lr{i}, %c16 : index")
+                    e(f"      %lrk{i} = index.mul %lrb{i}, %cksub : index")
+                    e(f"      %lrow{i} = index.add %lrk{i}, %ks : index")
+                    e(f"      %lhs{i} = vector.fragment.load<lhs> %wl_fm[%lrow{i}, %c0] shape [%m, %k] : view<{BM * ksub // 16}x16xf16> -> {VF}")
+                else:
+                    e(f"      %lhs{i} = vector.fragment.load<lhs> {wlv}[%lr{i}, %ks] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
+            def rhs_load(j):
+                e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
+                if FRAG:
+                    e(f"      %tcb{j} = index.div %tc{j}, %c16 : index")
+                    e(f"      %tck{j} = index.mul %tcb{j}, %cksub : index")
+                    e(f"      %tcol{j} = index.add %tck{j}, %ks : index")
+                    e(f"      %rhs{j} = vector.fragment.load<rhs> %al_fmt[%c0, %tcol{j}] shape [%k, %n] : view<16x{BN * ksub // 16}xf16, %fm_lay> -> {VF}")
+                else:
+                    e(f"      %rhs{j} = vector.fragment.load<rhs> {alv}[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
+            if RHS_OUTER:
+                # rhs-outer: each rhs fragment dies after its FM MMAs, so only the lhs
+                # fragments and one or two rhs are live (compile-report suggest: the
+                # IQ4_XS peak held all 6 fragments, 144 VGPRs, one short of tier 8).
+                # Every accumulator still takes one MMA per k step: same values.
+                for j in range(FN):
+                    rhs_load(j)
+                    for i in range(FM):
+                        n = i * FN + j
+                        e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
+                    if RHS_FENCE and j + 1 < FN and (j + 1) % RHS_FENCE == 0:
+                        e("      scf.schedule.fence")
+            else:
+                for j in range(FN):
+                    rhs_load(j)
+                for i in range(FM):
+                    for j in range(FN):
+                        n = i * FN + j
+                        e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
+            e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
             e("    }")
-        e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
-          + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
-        e("  }")
+            if DECAHEAD and DECW:
+                e("    scf.yield " + ", ".join(f"%rr{i}" for i in range(NA)) + f" : {types}")
+                e("    } else {")
+                e("    scf.yield " + ", ".join(f"%a{i}" for i in range(NA)) + f" : {types}")
+                e("    }")
+            e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
+              + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
+            e("  }")
     if sw and SWEPI and EPI_LDS and WS == 32 and TM == 32:
         lds_epilogue(e, kr, V8, sw=True)
         e("  kernel.return")

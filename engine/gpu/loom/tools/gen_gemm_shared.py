@@ -56,7 +56,7 @@ PAD = int(os.environ.get("YAH_SD_PAD", "0"))
 # fast-math flags to the scale multiply, e.g. "<contract|nnan|nsz>" lets the
 # multiply and the f16 rounding fuse into v_fma_mix (one rounding, as HIP's
 # ISA does -- a numerics change).
-IQ4_F16 = os.environ.get("YAH_TG_IQ4F16", "0") == "1"
+IQ4_F16 = os.environ.get("YAH_TG_IQ4F16", "0") == "1" or os.environ.get("YAH_TG_IQ4PK", "0") == "1"
 IQ4_MULF = os.environ.get("YAH_TG_IQ4MULF", "")
 # Q4_K/Q5_K nibbles on 32-bit words (bit-identical; with the tile GEMM's
 # decode-ahead Q4_K 6.18 -> 5.96 ms standalone). YAH_TG_Q4UITOFP=0 restores.
@@ -80,6 +80,10 @@ IQ4_W = os.environ.get("YAH_TG_IQ4W", "0") == "1"
 # the same exact f32 value (small integers), so bit-identical; uitofp of a
 # byte lowers to v_cvt_f32_ubyteN where sitofp needs v_bfe_i32 + v_cvt_f32_i32
 IQ4_U8 = os.environ.get("YAH_TG_IQ4U8", "0") == "1"
+# IQ4_PK (implies the f16 codebook tables of IQ4_F16): the group scale rounded
+# to f16 once and the multiply done in f16 (v_pk_mul_f16, two weights per op).
+# NOT bit-identical (~1 f16 ulp per weight): judged by engine/run/accgate.py.
+IQ4_PK = os.environ.get("YAH_TG_IQ4PK", "0") == "1"
 
 KSUB = PH = GPP = GPL = ROWP = None
 
@@ -372,7 +376,12 @@ def iq4xs_compute(v, gb):
             e(f"    %chi{u} = vector.table.lookup %kvt[%nhi{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
             e(f"    %flo{u} = vector.sitofp %clo{u} : vector<16xi8> to vector<16xf32>")
             e(f"    %fhi{u} = vector.sitofp %chi{u} : vector<16xi8> to vector<16xf32>")
-        if IQ4_MULF:
+        if IQ4_PK:
+            e(f"    %dsch{u} = scalar.fptrunc %dsc{u} : f32 to f16")
+            e(f"    %dschv{u} = vector.splat %dsch{u} : vector<16xf16>")
+            e(f"    %hlo{u} = vector.mulf %dschv{u}, %clo{u} : vector<16xf16>")
+            e(f"    %hhi{u} = vector.mulf %dschv{u}, %chi{u} : vector<16xf16>")
+        elif IQ4_MULF:
             # scalar form: fptrunc(mulf<contract>) pairs feeding from_elements
             # are what AMDGPU source-to-low selects as v_fma_mix{lo,hi}_f16
             for part in ("lo", "hi"):

@@ -1827,6 +1827,29 @@ the pipeline went 385.0 -> 394.1 ms (one round each, other rows +0.9%). A
 the row group, so a group size that does not divide the row groups gives wrong
 results instead of out-of-bounds stores.
 
+**A tolerance gate for arithmetic-changing work (2026-10-01).** The hidden md5
+stays the gate for changes that claim to keep the arithmetic. Changes that
+alter it go through `engine/run/accgate.py`: a frozen golden output (the md5-
+verified production run: last-token logits + the 2048 x 5120 final hidden
+state) and thresholds calibrated on HIP. HIP vs golden: last-token KL 3.4e-9,
+logits relative RMS 1.24e-3, same top-10 and argmax. A candidate must stay
+within 0.25 of that (KL <= 8.6e-10, logits rel RMS <= 3.1e-4); the hidden-state
+limits reuse the logits scale and are provisional, since HIP writes no hidden
+state. `accgate.py calibrate <golden> <hip.logits>`, `accgate.py check <golden>
+<candidate>`.
+
+First uses:
+- The fused `fma_mix` IQ4 decode (`YAH_TG_IQ4MULF='<contract>'`) is bit-identical.
+  The IQ4_XS scale is an f16 times a 6-bit integer (<= 17 significant bits),
+  times a 7-bit codebook value: the f32 product is exact, so one rounding and
+  two give the same f16. The md5 gate never blocked it.
+- Packed f16 decode (`YAH_TG_IQ4PK`: scale rounded to f16 per group, the
+  codebook looked up as f16, `v_pk_mul_f16`) fails: last-token KL 3.9e-9 (HIP's
+  own distance), hidden rel RMS 1.7e-2, 259 of 2048 tokens off by > 1% and
+  some by ~30%. One rounded scale per 32-weight group is a shared bias that
+  compounds through 64 layers. It is also slower (26.98 vs 26.38 M cycles): the
+  byte-table join lowers per element where HIP's uses one `v_perm` per pair.
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
