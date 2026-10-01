@@ -68,7 +68,11 @@ AGPAD = int(os.environ.get("YAH_TG_AGPAD", "0"))
 # weight tiles in LDS: KSUB=32 at 128 x 256.
 # Default on for the formats whose decode reads no LDS table (the IQ3 grids
 # contend with the MMA's fragment loads: IQ3_S 10.10 -> 10.96 ms standalone).
-DECAHEAD_FMTS = ("iq4xs", "q4k", "q5k", "q6k")
+# Q5_K dropped (2026-10-01, ATT + counters): in its kernels the read-ahead loads
+# meet s_waitcnt vmcnt(0) full drains inside the K loop, which serialize the
+# prefetch again. Real bytes, M cycles, on -> off, bit-identical: kstore 768
+# 18.43 -> 17.23, kres K=6144 11.82 -> 9.65.
+DECAHEAD_FMTS = ("iq4xs", "q4k", "q6k")
 # SWEPI=1: the swiglu epilogue on lds_epilogue's structure (one barrier,
 # wave-private slabs, 4-row vector loads/stores) instead of scalar slab walks
 # behind two workgroup barriers each.

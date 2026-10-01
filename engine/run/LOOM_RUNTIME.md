@@ -2731,3 +2731,31 @@ it when the set has `convkq.hal`; `YAH_CONVKQ=0` restores conv + prep_kq.
 
 Skipped: wave64 for `yah_fused_qk_rope_batched`. It moves ~140 MB per call in
 0.77 ms (~180 GB/s, ~86% of DRAM bandwidth), so it is memory-bound.
+
+**Advanced profiling: decode-ahead serializes on short K (2026-10-01).**
+Extended counters (`ROCPROFILER_METRICS_PATH`, gfx1151-valid subset; no WMMA
+pipe-busy counter on this chip), `tools/advpmc.sh`:
+
+| | IQ3_S kstore (79% SOL) | Q4_K kres K=6144 (64%) |
+|---|---:|---:|
+| LDS busy (IDX_ACTIVE) | 58% | 37% |
+| LDS bank-conflict cycles / LDS-active | 5.0% | 0.4% |
+| wave time in s_waitcnt (counters) | 8.8% | 38.7% |
+| ifetch wait / I-cache miss rate | 0.08% / 0.5% | 0.49% / 0% |
+
+- ATT stall attribution on the Q4_K kres: 45% of all wave time is
+  `s_waitcnt vmcnt(0)` inside the K loop (plus 12% `lgkmcnt(0)`). These full
+  drains wait for the read-ahead loads just issued, serializing the
+  decode-ahead prefetch.
+- Decode-ahead on -> off, real bytes, M cycles, bit-identical:
+  - Gains when off: Q4_K kres K=6144 11.34 -> 9.51; Q5_K kres K=6144
+    11.82 -> 9.65; Q5_K kstore 768 18.43 -> 17.23.
+  - Keeps decode-ahead: IQ4_XS swiglu 24.27 -> 25.29 and Q4_K swiglu 24.13
+    -> 24.99 (both worse off).
+  - Wash: IQ4_XS kstore/kres68 and Q4_K kstore/kres68.
+- Q5_K left `DECAHEAD_FMTS`; `(q4k, kres, 24)` joined the emitter's
+  `DECAHEAD_SKIP`.
+- p62 = full emit: md5 a2145e371ceefd4d.
+  - Rows: Q4_K kres K=6144 134.8 -> 119.0, Q5_K kres K=6144 33.6 -> 28.5,
+    Q5_K 1024-row 33.6 -> 23.5 M.
+  - Other Q5_K shapes +0.3..0.6 M. Net ~-30 M cycles (~0.4%).

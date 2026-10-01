@@ -111,7 +111,10 @@ def _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind):
         TG.SWZ, TG.DECAHEAD_ENV = prev_swz, prev_da
 
 
-DECAHEAD_SKIP = {("iq4xs", "kres", 24)}
+# Short-K residual GEMMs: with decode-ahead, 45% of wave time is s_waitcnt
+# vmcnt(0) in the K loop (ATT, Q4_K kres K=6144), full drains that serialize
+# the read-ahead. Q4_K kres K=6144 11.34 -> 9.51 M cycles off (bit-identical).
+DECAHEAD_SKIP = {("iq4xs", "kres", 24), ("q4k", "kres", 24)}
 
 
 def _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp):
