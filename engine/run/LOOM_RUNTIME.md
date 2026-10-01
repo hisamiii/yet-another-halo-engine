@@ -2929,3 +2929,25 @@ Work, standalone pp8192 layer 3 (research/fa/work.sh):
   tokens, positions FROM_L=7680.., SET8K = an 8192 set).
 - The driver dispatches 384-thread attention when the emitter records
   `attn_wg384` (GQA packing).
+
+**GQA packing + int8 (2026-10-01).** Bit-identical to the non-GQA int8 kernel;
+the 384-thread dispatch path (`attn_wg384`) is validated in the pipeline
+(hidden md5 equal at pp8192). Two fixes on the way:
+- **Occupancy cliff:** 12-wave workgroups need <= 170 VGPRs for 3 per WGP.
+  int8 K+V sat at 176: all 8 fragments' gate loads were issued before the
+  per-fragment epilogue (56 VGPRs, found with --compile-report=details
+  pressure_origin_rows). VQ8 now issues them per fenced fragment: 160 VGPRs,
+  GQA and non-GQA.
+- The V unpack runs outside the wave guard. An scf.if reading loaded
+  registers drained vmcnt(0) at its entry, which also waited on the K loads.
+  The unpack is scalar ops with literal masks.
+
+| standalone pp8192 M cycles | non-GQA | GQA |
+|---|---:|---:|
+| int8 K | 62.1 | 61.9 |
+| int8 K+V | 63.7 | 63.2 |
+
+Pipeline pp8192 attention: fp16 1024.8, int8 998.3, int8+GQA 1006.5 M
+(+0.8%, noise level). GQA trims VALU/WMMA 5% (V unpack once per 6 heads) but
+gives up phase diversity (2 x 12 waves). Kept as an option for configs with
+heavier per-KV work.

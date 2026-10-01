@@ -130,6 +130,7 @@ KQ8 = os.environ.get("YAH_ATTN_FA_KQ8", "0") == "1"
 # (yah_vstat / yah_vq8: u = rne((v - c) / s) + 128); staging converts u - 128
 # to f16 exactly (P.V stays f16) and the epilogue applies o / l * s + c.
 VQ8 = os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1"
+VQFENCE = os.environ.get("YAH_ATTN_FA_VQFENCE", "1") == "1"
 if KQ8:
     assert KT == 16 and VSB and SKIP and not QH and not S8 and not MSKIF and not PVZ
     K_OFF = 0
@@ -558,7 +559,6 @@ def gen():
             e(f"  %kr{nn} = index.add %kr{nn}a, %kk{nn}s16 : index")
 
     if KQ8:
-        assert NT == 256
         # int8 K: thread = (key tid/16, 16-byte chunk tid%16): one b128 per
         # thread; LDS row 2*(key%8) + key/8 as for f16. Scales: thread tid%32
         # -> (key tid%16, half (tid/16)%2); wave 0 stores them.
@@ -583,7 +583,8 @@ def gen():
     if NT > 256:
         # wave-uniform guards from the subgroup id (tid-based compares lower as
         # lane-masked regions, which the branch lowering rejects here)
-        e("  %sgid = kernel.subgroup.id : index")
+        if not KQ8:
+            e("  %sgid = kernel.subgroup.id : index")
         e(f"  %vsg0 = index.constant {(NT - 256) // 32} : index")
         e("  %kstg = index.cmp ult, %sgid, %c8 : index")
         e("  %vstg = index.cmp uge, %sgid, %vsg0 : index")
@@ -623,6 +624,13 @@ def gen():
         guard0("%kstg", ind, lambda: stage_k_(ks, cur, p, ind))
 
     def stage_v(cur, vb, p, ind):
+        if VQ8 and NT > 256:
+            # unpack outside the guard: an scf.if drains vmcnt(0) at entry when
+            # it reads loaded registers, which also waited for the K loads
+            # issued with V (needed only in phase B): GQA int8 62.8 -> 68.2 M
+            cur = vq8_unpack(cur, p, ind)
+            guard0("%vstg", ind, lambda: stage_v_(cur, vb, p, ind, unpacked=True))
+            return
         guard0("%vstg", ind, lambda: stage_v_(cur, vb, p, ind))
 
     def load_k_(ks, p, ind):
@@ -695,26 +703,32 @@ def gen():
             e(f"{ind}%{p}sv{nn} = scf.select %{p}sl{nn}, {cur[nn]}, %zh8 : {V8H}")
             e(f"{ind}vector.store %{p}sv{nn}, %k_view[%kr{nn}, %kd{nn}] : {V8H}, view<{KT}x{KT_PITCH}xf16>")
 
-    def stage_v_(cur, vb, p, ind):
-        e(f"{ind}%{p}vr = index.add {vb}, %vrow : index")
-        if VQ8:   # f16 1024 + u, exact: (w & 0x00ff00ff) | 0x64006400 per key pair
-            # (yah_vq8 stores each dword's tokens as t0, t2, t1, t3)
-            e(f"{ind}%{p}vAm = vector.andi {cur[0]}, %vmsk4 : vector<4xi32>")
-            e(f"{ind}%{p}vA = vector.ori %{p}vAm, %vmag4 : vector<4xi32>")
-            e(f"{ind}%{p}vBs = vector.shrui {cur[0]}, %v8s4 : vector<4xi32>")
-            e(f"{ind}%{p}vBm = vector.andi %{p}vBs, %vmsk4 : vector<4xi32>")
-            e(f"{ind}%{p}vB = vector.ori %{p}vBm, %vmag4 : vector<4xi32>")
+    def vq8_unpack(cur, p, ind):
+        # f16 1024 + u, exact: (w & 0x00ff00ff) | 0x64006400 per key pair
+        # (yah_vq8 stores each dword's tokens as t0, t2, t1, t3)
+        if True:
+            # scalar ops with literal masks: vector splats of the constants
+            # stayed live across the loop (GQA int8 at 176 VGPRs, past the
+            # 170 that 3 x 12-wave workgroups per WGP need)
+            for d in range(4):
+                e(f"{ind}%{p}vw{d}x = vector.extract {cur[0]}[{d}] : vector<4xi32> -> i32")
+                e(f"{ind}%{p}vA{d}m = scalar.andi %{p}vw{d}x, %vmsk : i32")
+                e(f"{ind}%{p}vA{d} = scalar.ori %{p}vA{d}m, %vmag : i32")
+                e(f"{ind}%{p}vB{d}s = scalar.shrui %{p}vw{d}x, %v8s : i32")
+                e(f"{ind}%{p}vB{d}m = scalar.andi %{p}vB{d}s, %vmsk : i32")
+                e(f"{ind}%{p}vB{d} = scalar.ori %{p}vB{d}m, %vmag : i32")
             hv = []
             for j in range(2):
-                ws = []
-                for d in (2 * j, 2 * j + 1):
-                    for ab in ("A", "B"):
-                        e(f"{ind}%{p}v{ab}{d} = vector.extract %{p}v{ab}[{d}] : vector<4xi32> -> i32")
-                        ws.append(f"%{p}v{ab}{d}")
+                ws = [f"%{p}v{ab}{d}" for d in (2 * j, 2 * j + 1) for ab in ("A", "B")]
                 e(f"{ind}%{p}vw{j} = vector.from_elements {', '.join(ws)} : vector<4xi32>")
                 e(f"{ind}%{p}vh{j} = vector.bitcast %{p}vw{j} : vector<4xi32> to {V8H}")
                 hv.append(f"%{p}vh{j}")
-            cur = hv
+        return hv
+
+    def stage_v_(cur, vb, p, ind, unpacked=False):
+        e(f"{ind}%{p}vr = index.add {vb}, %vrow : index")
+        if VQ8 and not unpacked:
+            cur = vq8_unpack(cur, p, ind)
         for j, v in enumerate(cur):
             e(f"{ind}vector.store {v}, %v_view[%{p}vr, %c{8 * j}] : {V8H}, view<{256 * VBUFS}x{VT_PITCH}xf16>")
 
@@ -788,6 +802,10 @@ def gen():
             e(f"    vector.store %sst0, %s_view[%tid, %c0] : {V4}, view<{2 * NT}x4xf32>")
             e(f"    vector.store %sst1, %s_view[%tid2, %c0] : {V4}, view<{2 * NT}x4xf32>")
         if VSB:   # V(ks): the previous tile's P.V finished at the last barrier
+            if VQ8 and VQFENCE:
+                # keep the uint8 unpack after QK: hoisted between the QK MMAs it
+                # waited for the V load ~4 MMAs after issue (GQA int8 68.0 M)
+                e("    scf.schedule.fence")
             stage_v(nv, "%c0", "stv", "    ")
         e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         # ---- B: K(ks+16) (QK of this tile is done) and V(ks+16) to LDS
@@ -1131,13 +1149,18 @@ def gen():
         e("  %vsc1 = index.add %vsc0, %hd128 : index")
         e("  %vsch = index.add %vsc1, %eh8 : index")
         e(f"  %c1152v = vector.splat %c1152 : {V8}")
-    for f in range(8):
+    def gate_loads(f):
         e(f"  %eo{f}c = index.constant {16 * f} : index")
         e(f"  %eo{f} = index.add %eoff, %eo{f}c : index")
         e(f"  %eo{f}b = index.add %eo{f}, %c4 : index")
         e(f"  %eg{f}a = vector.load %g_flat[%eo{f}] : view<[%qtot]xf32> -> {V4}")
         e(f"  %eg{f}b = vector.load %g_flat[%eo{f}b] : view<[%qtot]xf32> -> {V4}")
+    if not VQ8:   # all gate loads together (latency); VQ8: per fragment (VGPRs)
+        for f in range(8):
+            gate_loads(f)
     for f in range(8):
+        if VQ8:
+            gate_loads(f)
         e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
         e(f"  %egn{f} = vector.negf %eg{f} : {V8}")
         e(f"  %egm{f} = vector.mulf %egn{f}, %nlog2e8 : {V8}")
