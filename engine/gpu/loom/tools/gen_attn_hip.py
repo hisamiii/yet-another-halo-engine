@@ -71,6 +71,28 @@ P_OFF, P_PITCH = 29440, 24         # P: 64 rows x 16 keys (+8) f16
 RS_OFF = 32512                     # per-row scale / final sum, 64 x 16 f32 (replicated)
 TL_OFF = 36608                     # boundary-tile scratch: 8 waves x 2 x 16x16 f32
 POOL = TL_OFF + 8 * 2 * 1024
+# RS2: the per-tile row scales also kept compact, 64 f32 indexed [rb][half][i]
+# = scale of row rb*16 + 2i + half, so a lane reads its result fragment's 8
+# row scales with one vector<8xf32> load (two ds_load_b128) instead of 8
+# ds_load_b32 from the replicated table. Same values: bit-identical.
+RS2 = os.environ.get("YAH_ATTN_RS2", "1") == "1"
+RS2_OFF = POOL
+if RS2:
+    POOL += 64 * 4
+# LDS2: V^T first, then K next to the scores, so the boundary-tile scratch
+# aliases K + S: both are dead during P.V (QK and the softmax finished before
+# the barrier ahead of P.V; the next tile's K store and QK follow the loop-top
+# barrier). 52992 -> 36608 B (+256 with RS2): three workgroups per WGP instead
+# of two (HIP's 20992 B gets three as well, VGPR-bound).
+LDS2 = os.environ.get("YAH_ATTN_LDS2", "1") == "1"
+if LDS2:
+    VT_OFF = 0
+    KT_OFF = VT_OFF + 256 * VT_PITCH * 2          # 12288
+    assert KT_OFF + 16 * KT_PITCH * 2 == S_OFF    # K tile ends where the scores start
+    TL_OFF = KT_OFF                               # 16 KB over K (8448) + S (8704)
+    assert TL_OFF + 8 * 2 * 1024 <= P_OFF
+    RS2_OFF = RS_OFF + 64 * 16 * 4                # 36608
+    POOL = RS2_OFF + (64 * 4 if RS2 else 0)
 Q_PITCH = 264                      # Q stage: 64 rows x 256 dims (+8 pad)
 assert 64 * Q_PITCH * 2 <= POOL and POOL <= 65536
 
@@ -169,6 +191,9 @@ def gen():
     e(f"  %p_view = buffer.view %pool[%p_o] : buffer -> view<64x{P_PITCH}xf16>")
     e(f"  %rs_o = index.constant {RS_OFF} : offset")
     e("  %rs_view = buffer.view %pool[%rs_o] : buffer -> view<64x16xf32>")
+    if RS2:
+        e(f"  %rs2_o = index.constant {RS2_OFF} : offset")
+        e("  %rs2_view = buffer.view %pool[%rs2_o] : buffer -> view<64xf32>")
     for kh in range(2):
         for rb in range(4):
             off = S_OFF + (kh * 4 + rb) * 16 * 17 * 4
@@ -260,6 +285,13 @@ def gen():
     e("  %seg = index.rem %tid, %c4 : index")
     e("  %rrb = index.div %rg, %c16 : index")
     e("  %rrow = index.rem %rg, %c16 : index")
+    if RS2:
+        e("  %rr2 = index.rem %rrow, %c2 : index")
+        e("  %rrh = index.div %rrow, %c2 : index")
+        e("  %rrb16 = index.mul %rrb, %c16 : index")
+        e("  %rr28 = index.mul %rr2, %c8 : index")
+        e("  %rs2a = index.add %rrb16, %rr28 : index")
+        e("  %rs2i = index.add %rs2a, %rrh : index")
     e("  %rq0 = index.div %rrb, %c2 : index")
     e("  %rq1 = index.mul %rq0, %c16 : index")
     e("  %rq2 = index.add %qs, %rq1 : index")
@@ -442,14 +474,22 @@ def gen():
             e(f"    %psr{mk} = scalar.addf {acc}, %psf{mk} : f32")
             acc = f"%psr{mk}"
         e(f"    %nsum = scalar.fmaf %rsum, %prior, {acc} : f32")
-        for mm in range(4):
-            e(f"    view.store %prior, %rs_view[%rg, %col{mm}] : f32, view<64x16xf32>")
+        if RS2:
+            e("    view.store %prior, %rs2_view[%rs2i] : f32, view<64xf32>")
+        else:
+            for mm in range(4):
+                e(f"    view.store %prior, %rs_view[%rg, %col{mm}] : f32, view<64x16xf32>")
         e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         # P.V
         outs = []
         for rb in range(4):
             e(f"    %rb{rb}r = index.constant {16 * rb} : index")
-            e(f"    %sc{rb} = vector.fragment.load<result> %rs_view[%rb{rb}r, %c0] shape [%m, %n] : view<64x16xf32> -> {V8}")
+            if RS2:
+                e(f"    %sc{rb}h = index.mul %half, %c8 : index")
+                e(f"    %sc{rb}i = index.add %rb{rb}r, %sc{rb}h : index")
+                e(f"    %sc{rb} = vector.load %rs2_view[%sc{rb}i] : view<64xf32> -> {V8}")
+            else:
+                e(f"    %sc{rb} = vector.fragment.load<result> %rs_view[%rb{rb}r, %c0] shape [%m, %n] : view<64x16xf32> -> {V8}")
             e(f"    %pf{rb} = vector.fragment.load<lhs> %p_view[%rb{rb}r, %c0] shape [%m, %k] : view<64x{P_PITCH}xf16> -> {V16H}")
             for t in range(2):
                 a = f"{rb}{t}"

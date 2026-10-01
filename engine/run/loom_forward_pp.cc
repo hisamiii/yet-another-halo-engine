@@ -437,6 +437,16 @@ int main(int argc, char** argv) {
       std::fwrite(v.data(), 1, bytes, f);
       std::fclose(f);
     };
+    // dump_buf for a byte range (e.g. one layer's slot of the KV cache)
+    const auto dump_range = [&](const LoomBuffer& src, std::size_t offset, std::size_t bytes,
+                                const std::string& tag) {
+      gpu.Synchronize();
+      std::vector<std::uint8_t> v(bytes);
+      gpu.D2H(src, v.data(), bytes, offset);
+      FILE* f = std::fopen((prefix + tag).c_str(), "wb");
+      std::fwrite(v.data(), 1, bytes, f);
+      std::fclose(f);
+    };
     const float epsv = 1.0e-6f; gpu.H2D(eps, &epsv, 4);
     { std::vector<std::uint8_t> z(std::size_t{48} * kQkv * 4 * 4, 0); gpu.H2D(conv_state, z.data(), z.size()); }
     { std::vector<std::uint8_t> z(std::size_t{48} * kTs * kState * kState * 4, 0); gpu.H2D(state, z.data(), z.size()); }
@@ -727,6 +737,13 @@ int main(int argc, char** argv) {
           Dispatch(gpu, e_rope, "yah_fused_qk_rope_batched", 28, B, 1, 256, 1, 1, b);
         }
         // w_qn/w_kn are views into the import; nothing to keep alive.
+        if (g_dump_layer == static_cast<int>(l)) {
+          // the attention kernel's inputs: roped q, gate, this layer's f16 K and V
+          dump_buf(q, static_cast<std::size_t>(B) * 6144 * 4, ".aq");
+          dump_buf(gate, static_cast<std::size_t>(B) * 6144 * 4, ".agate");
+          dump_range(kv16, koff, kKvCache * 2, ".ak16");
+          dump_range(kv16, voff, kKvCache * 2, ".av16");
+        }
         if (e_vtrans) {
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, voff, kKvCache * 2}, {vt16.handle, 0, kVtBytes}};
@@ -764,6 +781,8 @@ int main(int argc, char** argv) {
                    attn_old_grid ? B : kHeads / attn_hpw, 1,
                    attn_old_grid ? 32 : 256, 1, 1, b);
         }
+        if (g_dump_layer == static_cast<int>(l))
+          dump_buf(aout, static_cast<std::size_t>(B) * 6144 * 4, ".aout");
         {
           std::vector<hrx_buffer_ref_t> b = {
               {aout.handle, 0, hb(aout)}, {scratch.handle, 0, hb(scratch)}};

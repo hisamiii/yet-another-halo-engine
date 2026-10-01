@@ -2030,3 +2030,61 @@ One subtle porting bug worth recording: `yah_unpack_qg` has `head_dim` as a
 `yah_unpack_qg.head_dim=256` de-interleaves the Q/gate projection with the wrong
 stride, so the attention reads a permuted q and the whole model diverges while
 the projections still look plausible. `emit_decode.py` now sets it.
+
+**Attention at long context: row scales and LDS footprint (2026-10-01).**
+
+pp8192 per-kernel parity put attention at 1.33x HIP (748 vs 562 ms), the
+largest ratio and growing with context.
+
+The setup:
+
+- `YAH_DUMP_LAYER=3` now also dumps the attention inputs (roped q, gate, the
+  layer's f16 K/V slots) and its output.
+- Real layer-3 pp8192 inputs went through Loom (loomhip, `attnpmc.sh`) and
+  HIP's kernel (`engine/tests/attn_hip_ref.hip`). The outputs are
+  bit-identical, so all the extra work is overhead.
+
+Counters, one dispatch:
+
+| | Loom | HIP |
+|---|---:|---:|
+| cycles | 106.6 M | 79.4 M |
+| VALU | 1.825 G | 1.119 G |
+| LDS instructions | 575 M | 369 M |
+| LDS bank-conflict cycles | 205 M | 113 M |
+| resident waves (SQ_WAVE_CYCLES/SQ_BUSY_CYCLES) | 16.0 | 23.2 |
+
+ATT showed where it goes. The hottest region (36% of latency) is the
+per-tile O rescale before P.V:
+
+- 32 `ds_load_b32` per tile from a 16x-replicated 64x16 row-scale table,
+  each group behind a 30-45 cycle `lgkmcnt` wait.
+- 48 latch `v_mov` copies of accumulators rescaled out of place.
+
+Also:
+
+- No VOPD pairing.
+- LDS 52,992 B per workgroup (HIP 20,992) means two workgroups per WGP,
+  so 4 waves/SIMD against HIP's 6.
+
+Fixes, both bit-identical and now the defaults:
+
+- `YAH_ATTN_RS2`: a compact 64-float row-scale table `[rb][half][i]` = row
+  rb*16 + 2i + half. A lane reads its fragment's 8 scales with one
+  vector<8xf32> load. 106.6 -> 100.3 M cycles, VALU -16%, LDS -30%, and the
+  8-byte scratch spill is gone.
+- `YAH_ATTN_LDS2`: V^T first, K next to the scores, and the 16 KB
+  boundary-tile scratch aliasing K + S, which are dead during P.V. LDS
+  36,864 B gives three workgroups per WGP. 100.3 -> 86.5 M cycles; resident
+  waves 16.0 -> 23.6.
+
+Results:
+
+- pp2048: md5 a2145e371ceefd4d unchanged; the attention row 51.7 -> 43.5 ms
+  (-15.9%) against +1.25% drift on the rest. That is under HIP's 48.6.
+- The rest of the gap at 8192 is the 33 latch copies per tile (accumulators
+  not coalesced across the back edge) and unpaired VALU.
+
+The pp8192 emit needed the attention token-count facts to follow B
+(`YAH_ATTN_MAX_TOKENS`, 09ed5c4).
+
