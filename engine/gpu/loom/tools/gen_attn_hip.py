@@ -75,6 +75,11 @@ Q_PITCH = 264                      # Q stage: 64 rows x 256 dims (+8 pad)
 assert 64 * Q_PITCH * 2 <= POOL and POOL <= 65536
 
 
+# Largest prompt the token-count facts admit (range assumptions the uniformity
+# and bounds proofs build on). emit_prefill_pp.py sets it to B when B > 2048.
+MAX_TOKENS = int(os.environ.get("YAH_ATTN_MAX_TOKENS", "2048"))
+
+
 def gen():
     L = []
     e = L.append
@@ -83,7 +88,7 @@ def gen():
     e("amdgpu.target<gfx1151> @attn_hip_w32 {subgroup_size = 32}")
     e("")
     e("config.def @attention_prefill.cache_capacity = 2048 : index")
-    e("config.decl @attention_prefill.token_count : %value: index where [range(%value, 1, 2048)]")
+    e(f"config.decl @attention_prefill.token_count : %value: index where [range(%value, 1, {MAX_TOKENS})]")
     e("config.decl @attention_prefill.num_heads : %value: index where [range(%value, 1, 4096)]")
     e("config.decl @attention_prefill.num_kv_heads : %value: index where [range(%value, 1, 4096)]")
     e("config.decl @attention_prefill.gqa : %value: index where [range(%value, 1, 4096)]")
@@ -108,7 +113,7 @@ def gen():
         e(f"  %c{v} = index.constant {v} : index")
     e("  %cache_capacity = config.get @attention_prefill.cache_capacity : index")
     e("  %token_count0 = config.get @attention_prefill.token_count : index")
-    e("  %B = index.assume %token_count0 [range(%token_count0, 1, 2048)] : index")
+    e(f"  %B = index.assume %token_count0 [range(%token_count0, 1, {MAX_TOKENS})] : index")
     e("  %start_pos = config.get @attention_prefill.start_pos : index")
     e("  %zero = scalar.constant 0.0 : f32")
     e("  %one = scalar.constant 1.0 : f32")

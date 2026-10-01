@@ -336,6 +336,7 @@ def main():
     attn_hip = os.environ.get("YAH_ATTN_HIP", "1") == "1"
     vtrans_src = None
     if attn_hip:
+        os.environ.setdefault("YAH_ATTN_MAX_TOKENS", str(max(B, 2048)))
         import gen_attn_hip
         tmp = os.path.join(outdir, ".emit_tmp")
         os.makedirs(tmp, exist_ok=True)
