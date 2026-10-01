@@ -2569,3 +2569,28 @@ floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
   - IQ4_XS kres K=6144 -21% (decode-ahead fix + stagger), Q4_K kres K=6144
     -6.2%, swiglus -1.7..-3.5%.
 - p57-8192 emitted with the same generator.
+
+**DeltaNet: dual-issue FMAs via `vector.dotf` (2026-10-01, lost).**
+- SOL counters (p57 kernel, B=2048 harness): VALU busy 75% of SIMD cycles,
+  waves waiting to issue 59%, ~9.2 waves/SIMD: VALU-throughput bound with
+  some exposed latency. `suggest`: only a residency cliff (128 -> 120
+  VGPRs), but all 768 waves are already resident.
+- The token loop (unroll 8) has 672 three-operand `v_fma_f32`, which VOPD
+  cannot pair; HIP's ISA uses `v_dual_fmac`.
+  - Loom lowers `scalar.fmaf` to `v_fma_f32` always.
+  - `vector.dotf` lowers to `v_fma` + `v_fmac` chain in strict element order.
+- `YAH_DN_DOTF=1` writes each u/p dot group as `vector.dotf` over (1, 0, 2, 3)
+  from -0.0, i.e. HIP's fma(s3,x3, fma(s2,x2, fma(s0,x0, s1*x1))).
+  `fma(a,b,-0)` is a*b including the sign of zero. Bit-identical to HIP's
+  kernel at 256 and 203 tokens (`deltanet_vs_hip.sh`, negative control fails).
+- Loop: 81 `v_dual_fmac` + 220 `v_fmac`, `v_fma_f32` 672 -> 416, but 43 fewer
+  `v_dual_mul`; VALU issues 1432 -> 1382.
+- Result: 4.754 -> 4.863 M cycles (dncyc), 4.732 -> 4.809 (SOL run).
+  - VALU instructions -3.5% and VALU busy cycles -3.3% (75% -> 72% of SIMD
+    time), yet total cycles +1.6..2.3%.
+  - Cause: a VOPD pair issues only when both halves are ready. Pairing FMAs
+    from different dot chains stretches the latency-sensitive per-token path
+    more than the issue slots saved. Off.
+- The state update (fma with s*alpha as addend) has no source-level fmac
+  form. Further DeltaNet gains need the chunked algorithm, which changes
+  numerics.

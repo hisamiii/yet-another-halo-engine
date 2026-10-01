@@ -29,7 +29,11 @@ problem. This replaces the regtile kernel's arithmetic (one lane per row, a
 gate for this kernel is bit-identity with HIP's kernel on the same inputs
 (tools/deltanet_vs_hip.sh), and argmax + KLD for the whole model.
 """
+import os
 import sys
+
+# YAH_DN_DOTF=1: the u/p dot groups as vector.dotf (see dot() below)
+DOTF = os.environ.get("YAH_DN_DOTF", "0") == "1"
 
 V4 = "vector<4xf32>"
 
@@ -58,6 +62,7 @@ def gen():
     for v in (0, 1, 2, 3, 4, 8, 16, 32, 64, 128, 16384):
         e(f"  %c{v} = index.constant {v} : index")
     e("  %zero = scalar.constant 0.0 : f32")
+    e("  %negzero = scalar.constant -0.0 : f32")
     for v in (1, 2, 4, 32):
         e(f"  %x{v} = scalar.constant {v} : i32")
     e("  %batch = config.get @yah_deltanet.batch : index")
@@ -188,10 +193,20 @@ def gen():
                 s = [f"%se{r}{g}{i}" for i in range(4)]
                 x = [f"%{v}e{g}{i}" for i in range(4)]
                 n = f"{tag}{r}{g}"
-                e(f"    %{n}m = scalar.mulf {s[1]}, {x[1]} : f32")
-                e(f"    %{n}a = scalar.fmaf {s[0]}, {x[0]}, %{n}m : f32")
-                e(f"    %{n}b = scalar.fmaf {s[2]}, {x[2]}, %{n}a : f32")
-                e(f"    %{n}c = scalar.fmaf {s[3]}, {x[3]}, %{n}b : f32")
+                if DOTF:
+                    # HIP's chain fma(s3,x3, fma(s2,x2, fma(s0,x0, s1*x1))) as one
+                    # vector.dotf over (1, 0, 2, 3) from -0.0: fma(a, b, -0) is
+                    # a*b to the sign of zero, and dotf lowers to v_fma + 3
+                    # v_fmac in element order, which VOPD can pair (v_fma_f32
+                    # cannot). Same roundings.
+                    e(f"    %{n}vs = vector.from_elements {s[1]}, {s[0]}, {s[2]}, {s[3]} : {V4}")
+                    e(f"    %{n}vx = vector.from_elements {x[1]}, {x[0]}, {x[2]}, {x[3]} : {V4}")
+                    e(f"    %{n}c = vector.dotf %{n}vs, %{n}vx, %negzero : {V4}, {V4}, f32")
+                else:
+                    e(f"    %{n}m = scalar.mulf {s[1]}, {x[1]} : f32")
+                    e(f"    %{n}a = scalar.fmaf {s[0]}, {x[0]}, %{n}m : f32")
+                    e(f"    %{n}b = scalar.fmaf {s[2]}, {x[2]}, %{n}a : f32")
+                    e(f"    %{n}c = scalar.fmaf {s[3]}, {x[3]}, %{n}b : f32")
                 e(f"    %{n}s = scalar.addf {acc}, %{n}c : f32")
                 acc = f"%{n}s"
             for m in (1, 2, 4):
