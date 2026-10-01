@@ -130,6 +130,12 @@ PF = os.environ.get("YAH_TG_PF", "0") == "1"
 # loads. Every wave used to load them (the non-decoders clamped to another
 # group): rocprofv3 counters had 4x HIP's L2 hits and 3x its TA busy.
 DECLOAD = os.environ.get("YAH_TG_DECLOAD", "0") == "1"
+# DECLATE: the decoding waves issue the next phase's weight loads AFTER their
+# decode has consumed the carried bytes, inside the decode branch. Issued
+# before it (the default), the old and new prefetch were live together, so the
+# back edge copied the new registers and waited vmcnt(0) for the loads just
+# issued (ATT: 31% of wave time in XBAR, 10% of the last arriver's in production).
+DECLATE = os.environ.get("YAH_TG_DECLATE", "0") == "1"
 # EPAD: pad of the LDS epilogue slab's token pitch (f32). With pitch TM the 16
 # lanes storing a fragment row are 128 B apart -- one or two banks -- and the
 # slab carried every LDS bank conflict of the kernel (rocprofv3, via loomhip).
@@ -669,8 +675,12 @@ def gen(fmt, kind="kstore"):
         e("    %phg_n = scalar.muli %ph_ni, %cgppi : i32")
         e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
         Ln, nxt = loads("nx_", "%blk_n", "%gb_n")
+        late = None
         if ABL & 4:
             nxt = cur_w
+        elif DECAHEAD and DECLATE and not DECW:
+            late = (Ln, nxt)   # emitted inside the decode branch, after the decode
+            nxt = None
         elif DECAHEAD and DECLOAD and not DECW:
             # wave-uniform: the decoding lanes are whole waves
             wt = ", ".join(ty for _, ty in cur_w)
@@ -729,10 +739,24 @@ def gen(fmt, kind="kstore"):
             else:
                 e(f"    %cdecw = index.constant {slots * BM // WS} : index")
                 e("    %dec_wave = index.cmp ult, %sg_id, %cdecw : index")
-            e("    scf.if %dec_wave {")
-            names = G.unpack_vals(e, cur_w, orig0)
-            L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
-            e("    }")
+            if late is not None:
+                wt = ", ".join(ty for _, ty in cur_w)
+                e("    " + ", ".join(f"%nxl{x}" for x in range(len(cur_w))) + f" = scf.if %dec_wave -> ({wt}) {{")
+                names = G.unpack_vals(e, cur_w, orig0)
+                L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
+                Ln_late, nxt_late = late
+                L.extend(Ln_late)
+                packed = G.pack_vals(e, nxt_late, "n")
+                e("      scf.yield " + ", ".join(nm for nm, _ in packed) + f" : {wt}")
+                e("    } else {")
+                e("      scf.yield " + ", ".join(nm for nm, _ in cur_w) + f" : {wt}")
+                e("    }")
+                nxt = [(f"%nxl{x}", ty) for x, (_, ty) in enumerate(cur_w)]
+            else:
+                e("    scf.if %dec_wave {")
+                names = G.unpack_vals(e, cur_w, orig0)
+                L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
+                e("    }")
         wlv = "%wl_mma" if DECAHEAD else "%wl_view"
         alv = "%al_t"
         if DECAHEAD and ONEBAR:

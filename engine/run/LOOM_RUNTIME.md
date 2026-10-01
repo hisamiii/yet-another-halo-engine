@@ -1850,6 +1850,28 @@ First uses:
   compounds through 64 layers. It is also slower (26.98 vs 26.38 M cycles): the
   byte-table join lowers per element where HIP's uses one `v_perm` per pair.
 
+**Kernel parity in cycles, same real bytes (2026-10-01).** Per-kernel ratios
+against the old HIP trace (2026-09-30) were stale; HIP's plain pp2048 swings
+3289-3538 ms between sessions. Measured kernel against kernel instead
+(rocprofv3, Loom through loomhip):
+
+| kernel | Loom M cycles (% WMMA floor) | HIP M cycles (% floor) | Loom/HIP |
+|---|---:|---:|---:|
+| IQ4_XS 17408x5120 | 26.45 (67%) | 23.15 (77%) | 1.14 |
+| Q4_K 10240x5120 | 15.50 (68%) | 13.71 (77%) | 1.13 |
+| IQ3_S 17408x5120 | 27.96 (64%) | 25.91 (69%) | 1.08 |
+| IQ3_XXS 17408x5120 | 26.99 (66%) | 25.80 (69%) | 1.05 |
+| DeltaNet B=2048 | 4.756 | 4.762 | 1.00 |
+
+Ours sit at 64-68% of the floor for every format. HIP sits at 69% except on
+the two formats where it defers the decode (raw bytes held in registers,
+decoded by all waves after the barrier while queued WMMAs drain): 77%.
+DeltaNet is at parity, so the HIP-order constraint costs nothing there.
+`YAH_TG_DECLATE` (off) moves the decoders' next weight loads after their
+decode so the old and new prefetch are never live together: bit-identical,
+the back-edge `vmcnt(0)` (0.9% of wave time) goes, a `vmcnt(1)` (2.8%) comes
+(the late loads queue behind the activation loads), 26.43 M cycles: flat.
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
