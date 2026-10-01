@@ -2880,3 +2880,52 @@ Pipeline pp8192 (one round, idle start), production default config vs p62:
 - Hidden md5 = p62fa (bit-identical to the gated FA build).
 - The total (-0.5%) is clock-confounded: this run clocked higher (12988 vs
   13505 ms), which adds cycles to the memory-bound rows.
+
+**Quantized KV, int8 config (2026-10-01).** User configs: fp16, int8, kv4a8,
+kv4a4. Measured rates (research/hw-measured.md): iu8 WMMA = f16 (34
+cycles/SIMD), iu4 = 2x. Loom lowers both; signedness comes from an operand
+schema (`element_format=i8|u8`, payload vector<4xi32>).
+
+Pieces (gen_kvq.py + gen_attn_fa.py; emitter YAH_ATTN_FA_KQ8 / _VQ8, markers
+attn_kq8 / attn_vq8):
+- **K:** `yah_kmean` (deterministic per-channel prompt mean, no atomics) +
+  `yah_kq8`: int8 of K - mean, one scale per (token, kv head, 128-dim half).
+  - Subtracting a per-channel constant shifts each query row's scores
+    uniformly, so softmax is unchanged (exact).
+  - Recon rel RMS 5.7e-3 (7.7e-3 without centring).
+- **Q:** quantized in-kernel per (row, half) while staging.
+- **QK^T:** iu8 WMMA, then S = i32 * s_q * s_k.
+- **V:** `yah_vstat` (per-channel min/max) + `yah_vq8`: uint8 V^T around the
+  midrange, per-channel scale, recon rel RMS 4.4e-3.
+  - Staging builds f16 1024 + u by integer ops (`(w & 0x00ff00ff) |
+    0x64006400`, dword token order t0, t2, t1, t3), so P.V stays f16.
+  - The epilogue applies o / l * s + (c - 1152 s).
+- **Epilogue fences:** VGPRs 240 -> 176. The scheduler had hoisted every
+  fragment's gate + scale loads.
+
+Gate (golden3 = p63 fp16 on 16 windows + the 8192 window L0, T2):
+- int8 K: kl_mean 3.6e-5, 0 flips, PPL 5.5723 vs 5.5718; L0 KL 1.4e-5,
+  0 flips.
+- int8 K+V: kl_mean 5.0e-5, 0 flips, PPL 5.5730; L0 KL 1.9e-5, 0 flips,
+  PPL 6.0855 vs 6.0879. **PASS.**
+
+Work, standalone pp8192 layer 3 (research/fa/work.sh):
+
+| | fp16 | int8 K | int8 K+V |
+|---|---:|---:|---:|
+| M cycles | 64.2 | 61.9 | 62.8 |
+| DRAM GB | 4.17 | 4.73 | 2.42 |
+| L2 requests M | 93.1 | 75.4 | 51.1 |
+| LDS instr/WMMA | 2.89 | 2.45 | 2.45 |
+| LDS busy | 86% | 75% | 74% |
+| VALU/WMMA | 10.50 | 11.13 | 12.42 |
+| VGPR (waves/SIMD) | 192 (6) | 160 (8) | 176 (8) |
+
+- Pipeline pp8192: attention 1024.8 -> 998.3 M (-2.6%); with KV prep -2.5%
+  (quantizers 8.4 M vs the f16 transpose 7.7 M).
+- The kernel is issue-bound, so the scale/unpack VALU eats most of the
+  memory/LDS savings.
+- Gate tooling: accgate2.py / gate_run.sh accept long windows `L<n>` (8192
+  tokens, positions FROM_L=7680.., SET8K = an 8192 set).
+- The driver dispatches 384-thread attention when the emitter records
+  `attn_wg384` (GQA packing).

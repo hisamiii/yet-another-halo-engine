@@ -32,13 +32,21 @@ FROM = int(os.environ.get("FROM", "1536"))
 TIE = float(os.environ.get("TIE", "0.1"))
 CORPUS = os.environ.get("CORPUS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate", "corpus"))
 CHUNK = 32
+# Long windows "L<n>": corpus/ids8192_w<n>.txt, scored from FROM_L (default
+# 7680, 512 positions like the 2048 windows), run on an 8192-token HAL set.
+FROM_L = int(os.environ.get("FROM_L", "7680"))
+
+
+def ids_file(w):
+    return f"ids8192_w{w[1:]}.txt" if w.startswith("L") else f"ids2048_w{w}.txt"
 
 
 def window_stats(gdir, cdir, w):
     g = np.memmap(os.path.join(gdir, f"w{w}.all_logits"), dtype=np.float32, mode="r").reshape(-1, V)
     c = np.memmap(os.path.join(cdir, f"w{w}.all_logits"), dtype=np.float32, mode="r").reshape(-1, V)
     assert g.shape == c.shape, (g.shape, c.shape)
-    ids = np.array(open(os.path.join(CORPUS, f"ids2048_w{w}.txt")).read().split(), dtype=np.int64)
+    ids = np.array(open(os.path.join(CORPUS, ids_file(w))).read().split(), dtype=np.int64)
+    base = FROM_L if w.startswith("L") else FROM
     rows = g.shape[0]
     kl = np.empty(rows); rrms = np.empty(rows); flip = np.zeros(rows, bool); tie = np.zeros(rows, bool)
     nll_g = []; nll_c = []; nonfinite = 0
@@ -56,7 +64,7 @@ def window_stats(gdir, cdir, w):
         am, bm = a.argmax(1), b.argmax(1)
         tie[s:s + len(a)] = gap <= TIE
         flip[s:s + len(a)] = (am != bm) & (gap > TIE)
-        pos = FROM + s + np.arange(len(a))          # position p predicts token p+1
+        pos = base + s + np.arange(len(a))          # position p predicts token p+1
         ok = pos + 1 < len(ids)
         t = ids[pos[ok] + 1]
         nll_g += list(-la[ok][np.arange(ok.sum()), t]); nll_c += list(-lb[ok][np.arange(ok.sum()), t])

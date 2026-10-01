@@ -346,6 +346,8 @@ def main():
     # reading V^T written per layer by yah_transpose_v16 (vtrans.hal row).
     attn_hip = os.environ.get("YAH_ATTN_HIP", "1") == "1"
     vtrans_src = None
+    kq8_on = False
+    vq8_on = False
     if attn_hip:
         os.environ.setdefault("YAH_ATTN_MAX_TOKENS", str(max(B, 2048)))
         import gen_attn_hip
@@ -365,7 +367,36 @@ def main():
         vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
         with open(vtrans_src, "w") as fh:
             fh.write(gen_attn_hip.gen_vtrans())
-        geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
+        fa_gqa = (os.environ.get("YAH_ATTN_FA", "1") == "1"
+                  and os.environ.get("YAH_ATTN_FA_GQA", "0") == "1")
+        if fa_gqa:
+            # GQA-packed FA: 6 heads x 16 tokens, 384-thread workgroups
+            geom.append(("wmma.hal", 16, 6, (B + 15) // 16))
+            geom.append(("attn_wg384", 0, 0, 0))
+        else:
+            geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
+        # YAH_ATTN_FA_KQ8=1 (int8 config, K half): int8 K cache written by
+        # yah_kmean + yah_kq8 (tools/gen_kvq.py), read by the FA kernel
+        kq8_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
+                  and os.environ.get("YAH_ATTN_FA_KQ8", "0") == "1")
+        if kq8_on:
+            import gen_kvq
+            kmean_src = os.path.join(tmp, "yah_kmean.loom")
+            kq8_src = os.path.join(tmp, "yah_kq8.loom")
+            open(kmean_src, "w").write(gen_kvq.gen_kmean())
+            open(kq8_src, "w").write(gen_kvq.gen_kq8())
+            geom.append(("attn_kq8", 0, 0, 0))
+        # YAH_ATTN_FA_VQ8=1 (int8 config, V half): uint8 V^T by yah_vstat +
+        # yah_vq8 instead of the f16 transpose
+        vq8_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
+                  and os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1")
+        if vq8_on:
+            import gen_kvq
+            vstat_src = os.path.join(tmp, "yah_vstat.loom")
+            vq8_src = os.path.join(tmp, "yah_vq8.loom")
+            open(vstat_src, "w").write(gen_kvq.gen_vstat())
+            open(vq8_src, "w").write(gen_kvq.gen_vq8())
+            geom.append(("attn_vq8", 0, 0, 0))
         if gen_attn_hip.F16OUT:
             # marker: the attention HAL stores its output as f16 (no half_cast)
             geom.append(("attn_f16out", 0, 0, 0))
@@ -463,6 +494,12 @@ def main():
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % B, "yah_vtrans.cache_capacity=%d" % B])]
           if vtrans_src else []),
+        *([(kmean_src, "kmean.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B]),
+           (kq8_src, "kq8.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
+          if kq8_on else []),
+        *([(vstat_src, "vstat.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B]),
+           (vq8_src, "vq8.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
+          if vq8_on else []),
         ("yah_half_cast.loom", "cast.hal",
          ["yah_half_cast.num_elements=%d" % (6144 * B)]),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",

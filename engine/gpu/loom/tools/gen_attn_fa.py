@@ -121,10 +121,27 @@ NSUB = KT // 16
 if KT == 32:
     assert VSB and SKIP and HIPNUM and not S8 and not MSKIF and not PVZ
     VT_PITCH = 40                        # 32 keys (+8): 80-B rows, conflict-free
+# KQ8 (int8 config, first half): K cache int8 (yah_kq8: K minus its per-channel
+# prompt mean, one scale per token / kv head / 128-dim half), Q quantized to
+# int8 per row and half while staging, S = iu8 WMMA * s_q * s_k. LDS K tile
+# 16 x 272 B (conflict-free), per-key scales next to it; V stays f16.
+KQ8 = os.environ.get("YAH_ATTN_FA_KQ8", "0") == "1"
+# VQ8 (int8 config, V half): V^T stored as uint8 around a per-channel centre
+# (yah_vstat / yah_vq8: u = rne((v - c) / s) + 128); staging converts u - 128
+# to f16 exactly (P.V stays f16) and the epilogue applies o / l * s + c.
+VQ8 = os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1"
+if KQ8:
+    assert KT == 16 and VSB and SKIP and not QH and not S8 and not MSKIF and not PVZ
+    K_OFF = 0
+    SK_OFF = 16 * 272                    # 2 halves x 16 keys f32
+    V_OFF = SK_OFF + 128
 S_OFF = V_OFF + VBUFS * 256 * VT_PITCH * 2   # S partials: 2*NSUB planes x NT x 4 f32
 Q_PITCH = 136 if QH else 264
 Q_DIMS = 128 if QH else 256
 Q_END = NQB * 16 * Q_PITCH * 2           # Q stage (prologue only)
+if KQ8:
+    SQ_OFF = NQB * 16 * 272              # int8 Q stage, then per-row scales
+    Q_END = SQ_OFF + NQB * 16 * 8
 # Q-drain dummy store: past the Q stage, or in the S slots when they are past it
 DRAIN_OFF = S_OFF if S_OFF >= Q_END else Q_END
 POOL = max(S_OFF + NT * 32 * NSUB, DRAIN_OFF + NT * 16)
@@ -163,7 +180,8 @@ def gen():
     e("  %tp = index.add %token_count, %cqt1 : index")
     e("  %qblocks = index.div %tp, %cqt : index")
     e("  kernel.launch.config workgroups(%qblocks, %pairs, %c1) workgroup_size(%cnt, %c1, %c1) : index")
-    e("} launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer) {")
+    e("} launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer"
+      + (", %kscale: buffer" if KQ8 else "") + (", %vstat: buffer" if VQ8 else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
         e(f"  %c{v} = index.constant {v} : index")
@@ -198,20 +216,51 @@ def gen():
     e("  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
     oty = "f16" if F16OUT else "f32"
     e(f"  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]x{oty}>")
-    e("  %k_flat = buffer.view %k_na[%base] : buffer -> view<[%kvtot]xf16>")
+    if KQ8:   # int8 K as dwords: [token][1024 B] = 256 dwords
+        e("  %kq32tot = index.mul %cache_capacity, %c256 : index")
+        e("  %kstot = index.mul %cache_capacity, %c8 : index")
+        e("  %k_flat = buffer.view %k_na[%base] : buffer -> view<[%kq32tot]xi32>")
+        e("  %ks_na = buffer.assume.noalias %kscale : buffer")
+        e("  %ks_flat = buffer.view %ks_na[%base] : buffer -> view<[%kstot]xf32>")
+    else:
+        e("  %k_flat = buffer.view %k_na[%base] : buffer -> view<[%kvtot]xf16>")
     e("  %cap15 = index.add %cache_capacity, %c15 : index")
     e("  %vtiles = index.div %cap15, %c16 : index")
     e("  %vpitch = index.mul %vtiles, %c16 : index")
     e("  %vtot = index.mul %vpitch, %c1024 : index")
     e("  %vlast = index.sub %vpitch, %c16 : index")
-    e("  %v_flat = buffer.view %v_na[%base] : buffer -> view<[%vtot]xf16>")
+    if VQ8:   # uint8 V^T as dwords: [kvh][tile][256 dims][16 B] = 4 dwords per dim
+        assert KT == 16
+        e("  %vq32tot = index.mul %vpitch, %c256 : index")
+        e("  %v_flat = buffer.view %v_na[%base] : buffer -> view<[%vq32tot]xi32>")
+        e("  %vs_na = buffer.assume.noalias %vstat : buffer")
+        e("  %vs_flat = buffer.view %vs_na[%base] : buffer -> view<2048xf32>")
+        e("  %vmsk = scalar.constant 16711935 : i32")      # 0x00ff00ff
+        e("  %vmag = scalar.constant 1677747200 : i32")    # 0x64006400
+        e("  %v8s = scalar.constant 8 : i32")
+        e("  %vmsk4 = vector.splat %vmsk : vector<4xi32>")
+        e("  %vmag4 = vector.splat %vmag : vector<4xi32>")
+        e("  %v8s4 = vector.splat %v8s : vector<4xi32>")
+        e("  %c1152 = scalar.constant -1152.0 : f32")
+    else:
+        e("  %v_flat = buffer.view %v_na[%base] : buffer -> view<[%vtot]xf16>")
     e(f"  %pool_bytes = index.constant {POOL} : offset")
     e("  %pool = buffer.alloca<workgroup> align(16) %pool_bytes : buffer")
     e(f"  %qs_view = buffer.view %pool[%base] : buffer -> view<{NQB * 16}x{Q_PITCH}xf16>")
     e(f"  %q_lay = encoding.layout.strided [1, {Q_PITCH}] : encoding<layout>")
     e(f"  %q_fr = buffer.view %pool[%base] : buffer -> view<{Q_DIMS}x{NQB * 16}xf16, %q_lay>")
     e(f"  %k_o = index.constant {K_OFF} : offset")
-    e(f"  %k_view = buffer.view %pool[%k_o] : buffer -> view<{KT}x{KT_PITCH}xf16>")
+    if KQ8:
+        e("  %k_view = buffer.view %pool[%k_o] : buffer -> view<16x68xi32>")
+        e(f"  %sk_o = index.constant {SK_OFF} : offset")
+        e("  %sk_view = buffer.view %pool[%sk_o] : buffer -> view<2x16xf32>")
+        e(f"  %qs8_view = buffer.view %pool[%base] : buffer -> view<{NQB * 16}x68xi32>")
+        e(f"  %sq_o = index.constant {SQ_OFF} : offset")
+        e(f"  %sq_view = buffer.view %pool[%sq_o] : buffer -> view<{NQB * 16}x2xf32>")
+        e("  %i8sch = encoding.define #encoding.operand<element_format=i8, payload_elements=16, payload_registers=4> : encoding<schema>")
+        e("  %zi8 = vector.constant 0 : vector<8xi32>")
+    else:
+        e(f"  %k_view = buffer.view %pool[%k_o] : buffer -> view<{KT}x{KT_PITCH}xf16>")
     e(f"  %v_o = index.constant {V_OFF} : offset")
     e(f"  %v_view = buffer.view %pool[%v_o] : buffer -> view<{256 * VBUFS}x{VT_PITCH}xf16>")
     e(f"  %s_o = index.constant {S_OFF} : offset")
@@ -290,6 +339,8 @@ def gen():
         e("  %vt = index.add %tid, %c0 : index")
     e("  %vlane = index.mul %vt, %c16 : index")
     e("  %vhl = index.add %vhb, %vlane : index")
+    if VQ8:
+        e("  %vhl4 = index.div %vhl, %c4 : index")
     e("  %ctx_end = index.add %start_pos, %B : index")
     e("  %qs32 = index.add %qs, %cqt : index")
     e("  %vis0 = index.add %start_pos, %qs32 : index")
@@ -321,87 +372,160 @@ def gen():
     e("  %qrow0 = index.mul %qlqc, %c6144 : index")
     e("  %qhb = index.mul %qrh, %c256 : index")
     e("  %qrow = index.add %qrow0, %qhb : index")
-    e("  %qsc_v = vector.splat %qscale : " + V4)
-    if QH:
-        e("  %sgq = kernel.subgroup.id : index")
-        e("  %hdu = index.rem %sgq, %c2 : index")       # = hd, provably wave-uniform
-    rounds = 2 if QH else 1
-    nchunk = 4 if QH else 8                             # 8-dim chunks per thread
-    prev = None
-    for r in range(rounds):
-        e(f"  %qdb{r}a = index.mul %qpart, %c{8 * nchunk} : index")
-        for c in range(nchunk):
-            t = f"{r}_{c}"
-            e(f"  %qdc{t} = index.constant {8 * c} : index")
-            e(f"  %qd{t} = index.add %qdb{r}a, %qdc{t} : index")         # dim within the stage
-            e(f"  %qdg{t}c = index.constant {128 * r} : index")
-            e(f"  %qdg{t} = index.add %qd{t}, %qdg{t}c : index")       # global dim
-            e(f"  %qa{t} = index.add %qrow, %qdg{t} : index")
-            e(f"  %qa{t}b = index.add %qa{t}, %c4 : index")
-            e(f"  %qv{t}a = vector.load %q_flat[%qa{t}] : view<[%qtot]xf32> -> {V4}")
-            e(f"  %qv{t}b = vector.load %q_flat[%qa{t}b] : view<[%qtot]xf32> -> {V4}")
-            e(f"  %qm{t}a = vector.mulf %qv{t}a, %qsc_v : {V4}")
-            e(f"  %qm{t}b = vector.mulf %qv{t}b, %qsc_v : {V4}")
-            e(f"  %qh{t}a = vector.fptrunc %qm{t}a : {V4} to vector<4xf16>")
-            e(f"  %qh{t}b = vector.fptrunc %qm{t}b : {V4} to vector<4xf16>")
-            e(f"  %qh{t} = vector.concat<0> %qh{t}a, %qh{t}b : vector<4xf16>, vector<4xf16> -> {V8H}")
-            e(f"  %qz{t} = scf.select %qlive, %qh{t}, %zh8 : {V8H}")
-            e(f"  vector.store %qz{t}, %qs_view[%qr, %qd{t}] : {V8H}, view<{NQB * 16}x{Q_PITCH}xf16>")
+    if KQ8:
+        # int8 Q: thread (row qr, dims qpart*64..+63); one scale per (row, half)
+        # from the amax of the thread pair (qpart, qpart ^ 1): xor-1 shuffle
+        e("  %qsc_v = vector.splat %qscale : " + V4)
+        e(f"  %z4f = vector.constant 0.0 : {V4}")
+        e("  %qdb = index.mul %qpart, %c64 : index")
+        e("  %zero_q = scalar.constant 0.0 : f32")
+        cur = "%zero_q"
+        for c in range(16):
+            e(f"  %qdc{c} = index.constant {4 * c} : index")
+            e(f"  %qd{c} = index.add %qdb, %qdc{c} : index")
+            e(f"  %qa{c} = index.add %qrow, %qd{c} : index")
+            e(f"  %qv{c} = vector.load %q_flat[%qa{c}] : view<[%qtot]xf32> -> {V4}")
+            e(f"  %qm{c} = vector.mulf %qv{c}, %qsc_v : {V4}")
+            e(f"  %qz{c} = scf.select %qlive, %qm{c}, %z4f : {V4}")
+            e(f"  %qab{c} = vector.absf %qz{c} : {V4}")
+            e(f"  %qam{c} = vector.reduce<maxnumf> %qab{c}, {cur} : {V4}, f32")
+            cur = f"%qam{c}"
+        e("  %x1q = scalar.constant 1 : i32")
+        e(f"  %qamb = scalar.bitcast {cur} : f32 to i32")
+        e("  %qams, %qamv = kernel.subgroup.shuffle<xor> %qamb, %x1q, %x32 : i32, i32, i32")
+        e("  %qamf = scalar.bitcast %qams : i32 to f32")
+        e(f"  %qamx = scalar.maxnumf {cur}, %qamf : f32")
+        e("  %r127q = scalar.constant 127.0 : f32")
+        e("  %qs0 = scalar.divf %qamx, %r127q : f32")
+        e("  %qspos = scalar.cmpf ogt, %qs0, %zero_q : f32")
+        e("  %qsc = scf.select %qspos, %qs0, %one : f32")
+        e("  %qinv = scalar.divf %one, %qsc : f32")
+        e(f"  %qinv4 = vector.splat %qinv : {V4}")
+        words = []
+        for c in range(16):
+            e(f"  %qq{c} = vector.mulf %qz{c}, %qinv4 : {V4}")
+            e(f"  %qr{c} = vector.roundevenf %qq{c} : {V4}")
+            e(f"  %qi{c} = vector.fptosi %qr{c} : {V4} to vector<4xi8>")
+            e(f"  %qw{c}v = vector.bitcast %qi{c} : vector<4xi8> to vector<1xi32>")
+            e(f"  %qw{c} = vector.extract %qw{c}v[0] : vector<1xi32> -> i32")
+            words.append(f"%qw{c}")
+        e("  %qdw = index.mul %qpart, %c16 : index")
+        for j in range(4):
+            e(f"  %qst{j} = vector.from_elements {', '.join(words[4 * j:4 * j + 4])} : vector<4xi32>")
+            e(f"  %qsw{j}c = index.constant {4 * j} : index")
+            e(f"  %qsw{j} = index.add %qdw, %qsw{j}c : index")
+            e(f"  vector.store %qst{j}, %qs8_view[%qr, %qsw{j}] : vector<4xi32>, view<{NQB * 16}x68xi32>")
+        e("  %qhalf = index.div %qpart, %c2 : index")       # partners store the same scale
+        e(f"  view.store %qsc, %sq_view[%qr, %qhalf] : f32, view<{NQB * 16}x2xf32>")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        # Q^T fragments (B: [dim, query]) of this wave's 128 dims, in registers
-        if r == 0:
-            e("  %wq16 = index.mul %wqb, %c16 : index")
-        names = [f"%qf{c}" if not QH else f"%qr{r}f{c}" for c in range(8)]
-
-        def qload():
-            for c in range(8):
-                e(f"  %qfd{r}{c}c = index.constant {16 * c} : index")
-                if QH:
-                    e(f"  %qfd{r}{c} = index.add %qfd{r}{c}c, %c0 : index")
-                else:
-                    e(f"  %qfd{r}{c} = index.add %hd128, %qfd{r}{c}c : index")
-                e(f"  %ql{r}f{c} = vector.fragment.load<rhs> %q_fr[%qfd{r}{c}, %wq16] shape [%k, %n] : view<{Q_DIMS}x{NQB * 16}xf16, %q_lay> -> {V16H}")
-            return [f"%ql{r}f{c}" for c in range(8)]
-        if QH:
-            ty = ", ".join([V16H] * 8)
-            e(f"  %qsel{r} = index.cmp eq, %hdu, %c{r} : index")
-            e(f"  {', '.join(names)} = scf.if %qsel{r} -> ({ty}) {{")
-            got = qload()
-            e(f"    scf.yield {', '.join(got)} : {ty}")
-            e("  } else {")
-            other = prev if prev else ["%zq16"] * 8
-            e(f"    scf.yield {', '.join(other)} : {ty}")
-            e("  }")
-            prev = names
-        else:
-            got = qload()
-            names = got
-        # Loom does not drain these LDS loads before the barrier below (no
-        # lgkmcnt(0) ahead of s_barrier), and the prologue then stages K/V (or
-        # the next Q half) over the Q stage: a fast wave overwrote Q rows a
-        # slow wave was still reading (a few corrupted query lanes per run,
-        # varying). An LDS store of a value built from both halves of every
-        # fragment forces the drain first.
-        acc = None
+        e("  %wq16 = index.mul %wqb, %c16 : index")
+        e("  %qrowl = index.add %wq16, %sub : index")
+        e("  %hd32 = index.mul %hd, %c32 : index")
         for c in range(8):
-            for j in (0, 8):
-                e(f"  %qx{r}{c}_{j} = vector.extract {names[c]}[{j}] : {V16H} -> f16")
-                if acc is None:
-                    acc = f"%qx{r}{c}_{j}"
+            e(f"  %qfc{c}c = index.constant {4 * c} : index")
+            e(f"  %qfc{c} = index.add %hd32, %qfc{c}c : index")
+            e(f"  %qraw{c} = vector.load %qs8_view[%qrowl, %qfc{c}] : view<{NQB * 16}x68xi32> -> vector<4xi32>")
+            e(f"  %qf{c} = vector.fragment<rhs> %qraw{c} shape [%k, %n] using {{schema = %i8sch : encoding<schema>}} : vector<4xi32>")
+        e(f"  %sql = view.load %sq_view[%qrowl, %hd] : view<{NQB * 16}x2xf32> -> f32")
+        # drain the Q loads before the barrier (Loom does not; see the f16 path)
+        cur = None
+        for c in range(8):
+            for j in (0, 3):
+                e(f"  %qx{c}_{j} = vector.extract %qraw{c}[{j}] : vector<4xi32> -> i32")
+                if cur is None:
+                    cur = f"%qx{c}_{j}"
                 else:
-                    e(f"  %qy{r}{c}_{j} = scalar.addf {acc}, %qx{r}{c}_{j} : f16")
-                    acc = f"%qy{r}{c}_{j}"
-        e(f"  %qdrain{r} = vector.splat {acc} : {V8H}")
-        e(f"  %qdr{r}_o = index.constant {DRAIN_OFF} : offset")
-        e(f"  %qdr{r}_v = buffer.view %pool[%qdr{r}_o] : buffer -> view<{NT}x8xf16>")
-        e(f"  vector.store %qdrain{r}, %qdr{r}_v[%tid, %c0] : {V8H}, view<{NT}x8xf16>")
+                    e(f"  %qy{c}_{j} = scalar.addi {cur}, %qx{c}_{j} : i32")
+                    cur = f"%qy{c}_{j}"
+        e(f"  %qsb = scalar.bitcast %sql : f32 to i32")
+        e(f"  %qyz = scalar.addi {cur}, %qsb : i32")
+        e("  %qdrain = vector.splat %qyz : vector<4xi32>")
+        e(f"  %qdr_o = index.constant {DRAIN_OFF} : offset")
+        e(f"  %qdr_v = buffer.view %pool[%qdr_o] : buffer -> view<{NT}x4xi32>")
+        e(f"  vector.store %qdrain, %qdr_v[%tid, %c0] : vector<4xi32>, view<{NT}x4xi32>")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    if QH:
-        for c in range(8):
-            e(f"  %qf{c} = vector.fragment<rhs> {prev[c]} shape [%k, %n] : {V16H}")
     else:
-        for c in range(8):
-            e(f"  %qf{c} = vector.fragment<rhs> %ql0f{c} shape [%k, %n] : {V16H}")
+        e("  %qsc_v = vector.splat %qscale : " + V4)
+        if QH:
+            e("  %sgq = kernel.subgroup.id : index")
+            e("  %hdu = index.rem %sgq, %c2 : index")       # = hd, provably wave-uniform
+        rounds = 2 if QH else 1
+        nchunk = 4 if QH else 8                             # 8-dim chunks per thread
+        prev = None
+        for r in range(rounds):
+            e(f"  %qdb{r}a = index.mul %qpart, %c{8 * nchunk} : index")
+            for c in range(nchunk):
+                t = f"{r}_{c}"
+                e(f"  %qdc{t} = index.constant {8 * c} : index")
+                e(f"  %qd{t} = index.add %qdb{r}a, %qdc{t} : index")         # dim within the stage
+                e(f"  %qdg{t}c = index.constant {128 * r} : index")
+                e(f"  %qdg{t} = index.add %qd{t}, %qdg{t}c : index")       # global dim
+                e(f"  %qa{t} = index.add %qrow, %qdg{t} : index")
+                e(f"  %qa{t}b = index.add %qa{t}, %c4 : index")
+                e(f"  %qv{t}a = vector.load %q_flat[%qa{t}] : view<[%qtot]xf32> -> {V4}")
+                e(f"  %qv{t}b = vector.load %q_flat[%qa{t}b] : view<[%qtot]xf32> -> {V4}")
+                e(f"  %qm{t}a = vector.mulf %qv{t}a, %qsc_v : {V4}")
+                e(f"  %qm{t}b = vector.mulf %qv{t}b, %qsc_v : {V4}")
+                e(f"  %qh{t}a = vector.fptrunc %qm{t}a : {V4} to vector<4xf16>")
+                e(f"  %qh{t}b = vector.fptrunc %qm{t}b : {V4} to vector<4xf16>")
+                e(f"  %qh{t} = vector.concat<0> %qh{t}a, %qh{t}b : vector<4xf16>, vector<4xf16> -> {V8H}")
+                e(f"  %qz{t} = scf.select %qlive, %qh{t}, %zh8 : {V8H}")
+                e(f"  vector.store %qz{t}, %qs_view[%qr, %qd{t}] : {V8H}, view<{NQB * 16}x{Q_PITCH}xf16>")
+            e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            # Q^T fragments (B: [dim, query]) of this wave's 128 dims, in registers
+            if r == 0:
+                e("  %wq16 = index.mul %wqb, %c16 : index")
+            names = [f"%qf{c}" if not QH else f"%qr{r}f{c}" for c in range(8)]
+
+            def qload():
+                for c in range(8):
+                    e(f"  %qfd{r}{c}c = index.constant {16 * c} : index")
+                    if QH:
+                        e(f"  %qfd{r}{c} = index.add %qfd{r}{c}c, %c0 : index")
+                    else:
+                        e(f"  %qfd{r}{c} = index.add %hd128, %qfd{r}{c}c : index")
+                    e(f"  %ql{r}f{c} = vector.fragment.load<rhs> %q_fr[%qfd{r}{c}, %wq16] shape [%k, %n] : view<{Q_DIMS}x{NQB * 16}xf16, %q_lay> -> {V16H}")
+                return [f"%ql{r}f{c}" for c in range(8)]
+            if QH:
+                ty = ", ".join([V16H] * 8)
+                e(f"  %qsel{r} = index.cmp eq, %hdu, %c{r} : index")
+                e(f"  {', '.join(names)} = scf.if %qsel{r} -> ({ty}) {{")
+                got = qload()
+                e(f"    scf.yield {', '.join(got)} : {ty}")
+                e("  } else {")
+                other = prev if prev else ["%zq16"] * 8
+                e(f"    scf.yield {', '.join(other)} : {ty}")
+                e("  }")
+                prev = names
+            else:
+                got = qload()
+                names = got
+            # Loom does not drain these LDS loads before the barrier below (no
+            # lgkmcnt(0) ahead of s_barrier), and the prologue then stages K/V (or
+            # the next Q half) over the Q stage: a fast wave overwrote Q rows a
+            # slow wave was still reading (a few corrupted query lanes per run,
+            # varying). An LDS store of a value built from both halves of every
+            # fragment forces the drain first.
+            acc = None
+            for c in range(8):
+                for j in (0, 8):
+                    e(f"  %qx{r}{c}_{j} = vector.extract {names[c]}[{j}] : {V16H} -> f16")
+                    if acc is None:
+                        acc = f"%qx{r}{c}_{j}"
+                    else:
+                        e(f"  %qy{r}{c}_{j} = scalar.addf {acc}, %qx{r}{c}_{j} : f16")
+                        acc = f"%qy{r}{c}_{j}"
+            e(f"  %qdrain{r} = vector.splat {acc} : {V8H}")
+            e(f"  %qdr{r}_o = index.constant {DRAIN_OFF} : offset")
+            e(f"  %qdr{r}_v = buffer.view %pool[%qdr{r}_o] : buffer -> view<{NT}x8xf16>")
+            e(f"  vector.store %qdrain{r}, %qdr{r}_v[%tid, %c0] : {V8H}, view<{NT}x8xf16>")
+            e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if QH:
+            for c in range(8):
+                e(f"  %qf{c} = vector.fragment<rhs> {prev[c]} shape [%k, %n] : {V16H}")
+        else:
+            for c in range(8):
+                e(f"  %qf{c} = vector.fragment<rhs> %ql0f{c} shape [%k, %n] : {V16H}")
 
     # staging maps. K: item j = tid + 256nn, key = j/32, d8 = (j%32)*8 (one key
     # row per wave: coalesced global, contiguous LDS); LDS row 2*(key%8) +
@@ -433,6 +557,29 @@ def gen():
             e(f"  %kr{nn}a = index.add %kk{nn}r0, %kk{nn}h2 : index")
             e(f"  %kr{nn} = index.add %kr{nn}a, %kk{nn}s16 : index")
 
+    if KQ8:
+        assert NT == 256
+        # int8 K: thread = (key tid/16, 16-byte chunk tid%16): one b128 per
+        # thread; LDS row 2*(key%8) + key/8 as for f16. Scales: thread tid%32
+        # -> (key tid%16, half (tid/16)%2); wave 0 stores them.
+        e("  %q8k = index.div %tid, %c16 : index")
+        e("  %q8c = index.rem %tid, %c16 : index")
+        e("  %q8c4 = index.mul %q8c, %c4 : index")
+        e("  %q8kl = index.rem %q8k, %c8 : index")
+        e("  %q8kh = index.div %q8k, %c8 : index")
+        e("  %q8kr0 = index.mul %q8kl, %c2 : index")
+        e("  %q8kr = index.add %q8kr0, %q8kh : index")
+        e("  %kvh64 = index.mul %kvh, %c64 : index")
+        e("  %q8ga = index.add %kvh64, %q8c4 : index")
+        e("  %sct = index.rem %tid, %c32 : index")
+        e("  %sckey = index.rem %sct, %c16 : index")
+        e("  %schalf = index.div %sct, %c16 : index")
+        e("  %kvh2 = index.mul %kvh, %c2 : index")
+        e("  %scoff = index.add %kvh2, %schalf : index")
+        e("  %sgid = kernel.subgroup.id : index")
+        e("  %scw0 = index.cmp eq, %sgid, %c0 : index")
+        e("  %zero_s = scalar.constant 0.0 : f32")
+        e("  %zq4 = vector.constant 0 : vector<4xi32>")
     if NT > 256:
         # wave-uniform guards from the subgroup id (tid-based compares lower as
         # lane-masked regions, which the branch lowering rejects here)
@@ -479,6 +626,18 @@ def gen():
         guard0("%vstg", ind, lambda: stage_v_(cur, vb, p, ind))
 
     def load_k_(ks, p, ind):
+        if KQ8:
+            e(f"{ind}%{p}kp = index.add {ks}, %q8k : index")
+            e(f"{ind}%{p}kpc = index.min %{p}kp, %cap_1 : index")
+            e(f"{ind}%{p}kr = index.mul %{p}kpc, %c256 : index")
+            e(f"{ind}%{p}ka = index.add %{p}kr, %q8ga : index")
+            e(f"{ind}%{p}kv = vector.load %k_flat[%{p}ka] : view<[%kq32tot]xi32> -> vector<4xi32>")
+            e(f"{ind}%{p}sp = index.add {ks}, %sckey : index")
+            e(f"{ind}%{p}spc = index.min %{p}sp, %cap_1 : index")
+            e(f"{ind}%{p}sr = index.mul %{p}spc, %c8 : index")
+            e(f"{ind}%{p}sa = index.add %{p}sr, %scoff : index")
+            e(f"{ind}%{p}sv = view.load %ks_flat[%{p}sa] : view<[%kstot]xf32> -> f32")
+            return [f"%{p}kv", f"%{p}sv"]
         names = []
         for nn in range(KT // 8):
             e(f"{ind}%{p}kp{nn} = index.add {ks}, %kk{nn} : index")
@@ -491,6 +650,12 @@ def gen():
         return names
 
     def load_v_(ks, p, ind):
+        if VQ8:   # dword (vhl / 4) + tile * 1024: the lane's 16 keys
+            e(f"{ind}%{p}vks = index.min {ks}, %vlast : index")
+            e(f"{ind}%{p}vtb = index.mul %{p}vks, %c64 : index")
+            e(f"{ind}%{p}va = index.add %vhl4, %{p}vtb : index")
+            e(f"{ind}%{p}vq = vector.load %v_flat[%{p}va] : view<[%vq32tot]xi32> -> vector<4xi32>")
+            return [f"%{p}vq"]
         if KT == 16:
             e(f"{ind}%{p}vks = index.min {ks}, %vlast : index")
             e(f"{ind}%{p}vtb = index.mul %{p}vks, %c256 : index")
@@ -512,6 +677,18 @@ def gen():
 
     def stage_k_(ks, cur, p, ind):
         """K tile at key ks (rows permuted, zero past ctx_end) to LDS."""
+        if KQ8:
+            e(f"{ind}%{p}qk = index.add {ks}, %q8k : index")
+            e(f"{ind}%{p}ql = index.cmp ult, %{p}qk, %ctx_end : index")
+            e(f"{ind}%{p}qv = scf.select %{p}ql, {cur[0]}, %zq4 : vector<4xi32>")
+            e(f"{ind}vector.store %{p}qv, %k_view[%q8kr, %q8c4] : vector<4xi32>, view<16x68xi32>")
+            e(f"{ind}%{p}sk = index.add {ks}, %sckey : index")
+            e(f"{ind}%{p}skl = index.cmp ult, %{p}sk, %ctx_end : index")
+            e(f"{ind}%{p}skv = scf.select %{p}skl, {cur[1]}, %zero_s : f32")
+            e(f"{ind}scf.if %scw0 {{")
+            e(f"{ind}  view.store %{p}skv, %sk_view[%schalf, %sckey] : f32, view<2x16xf32>")
+            e(f"{ind}}}")
+            return
         for nn in range(KT // 8):
             e(f"{ind}%{p}sp{nn} = index.add {ks}, %kk{nn} : index")
             e(f"{ind}%{p}sl{nn} = index.cmp ult, %{p}sp{nn}, %ctx_end : index")
@@ -520,6 +697,24 @@ def gen():
 
     def stage_v_(cur, vb, p, ind):
         e(f"{ind}%{p}vr = index.add {vb}, %vrow : index")
+        if VQ8:   # f16 1024 + u, exact: (w & 0x00ff00ff) | 0x64006400 per key pair
+            # (yah_vq8 stores each dword's tokens as t0, t2, t1, t3)
+            e(f"{ind}%{p}vAm = vector.andi {cur[0]}, %vmsk4 : vector<4xi32>")
+            e(f"{ind}%{p}vA = vector.ori %{p}vAm, %vmag4 : vector<4xi32>")
+            e(f"{ind}%{p}vBs = vector.shrui {cur[0]}, %v8s4 : vector<4xi32>")
+            e(f"{ind}%{p}vBm = vector.andi %{p}vBs, %vmsk4 : vector<4xi32>")
+            e(f"{ind}%{p}vB = vector.ori %{p}vBm, %vmag4 : vector<4xi32>")
+            hv = []
+            for j in range(2):
+                ws = []
+                for d in (2 * j, 2 * j + 1):
+                    for ab in ("A", "B"):
+                        e(f"{ind}%{p}v{ab}{d} = vector.extract %{p}v{ab}[{d}] : vector<4xi32> -> i32")
+                        ws.append(f"%{p}v{ab}{d}")
+                e(f"{ind}%{p}vw{j} = vector.from_elements {', '.join(ws)} : vector<4xi32>")
+                e(f"{ind}%{p}vh{j} = vector.bitcast %{p}vw{j} : vector<4xi32> to {V8H}")
+                hv.append(f"%{p}vh{j}")
+            cur = hv
         for j, v in enumerate(cur):
             e(f"{ind}vector.store {v}, %v_view[%{p}vr, %c{8 * j}] : {V8H}, view<{256 * VBUFS}x{VT_PITCH}xf16>")
 
@@ -552,7 +747,26 @@ def gen():
         # an 8-deep dependent WMMA chain waits on each MMA's latency
         e(f"    %zeros8s = vector.fragment<init> %zeros8 shape [%m, %n] : {V8}")
         accs = ["%zeros8s", "%zeros8s"]
-        for c in range(8):
+        if KQ8:
+            e("    %zi8s = vector.fragment<init> %zi8 shape [%m, %n] : vector<8xi32>")
+            acc = "%zi8s"
+            for c in range(8):
+                e(f"    %kfc{c}c = index.constant {4 * c} : index")
+                e(f"    %kfc{c} = index.add %hd32, %kfc{c}c : index")
+                e(f"    %kraw{c} = vector.load %k_view[%sub, %kfc{c}] : view<16x68xi32> -> vector<4xi32>")
+                e(f"    %kf{c} = vector.fragment<lhs> %kraw{c} shape [%m, %k] using {{schema = %i8sch : encoding<schema>}} : vector<4xi32>")
+                e(f"    %sa{c} = vector.mma %kf{c}, %qf{c}, {acc} : vector<4xi32>, vector<4xi32>, vector<8xi32>")
+                acc = f"%sa{c}"
+                if QKF and c + 1 < 8 and (c + 1) % QKF == 0:
+                    e("    scf.schedule.fence")
+            e(f"    %saf = vector.sitofp {acc} : vector<8xi32> to {V8}")
+            e("    %h8k = index.mul %half, %c8 : index")
+            e(f"    %sk8 = vector.load %sk_view[%hd, %h8k] : view<2x16xf32> -> {V8}")
+            e(f"    %sq8 = vector.splat %sql : {V8}")
+            e(f"    %skq = vector.mulf %sk8, %sq8 : {V8}")
+            e(f"    %sacf = vector.mulf %saf, %skq : {V8}")
+            accs = ["%sacf"]
+        for c in range(8 if not KQ8 else 0):
             e(f"    %kfc{c}c = index.constant {16 * c} : index")
             e(f"    %kfc{c} = index.add %hd128, %kfc{c}c : index")
             e(f"    %kf{c} = vector.fragment.load<lhs> %k_view[%c0, %kfc{c}] shape [%m, %k] : view<{KT}x{KT_PITCH}xf16> -> {V16H}")
@@ -912,6 +1126,11 @@ def gen():
     e("  %eh8 = index.mul %half, %c8 : index")
     e("  %eoff2 = index.add %eoff1, %hd128 : index")
     e("  %eoff = index.add %eoff2, %eh8 : index")
+    if VQ8:   # channel kvh * 256 + hd * 128 + 8h (+ 16 f)
+        e("  %vsc0 = index.mul %kvh, %c256 : index")
+        e("  %vsc1 = index.add %vsc0, %hd128 : index")
+        e("  %vsch = index.add %vsc1, %eh8 : index")
+        e(f"  %c1152v = vector.splat %c1152 : {V8}")
     for f in range(8):
         e(f"  %eo{f}c = index.constant {16 * f} : index")
         e(f"  %eo{f} = index.add %eoff, %eo{f}c : index")
@@ -927,7 +1146,18 @@ def gen():
         e(f"  %egr{f} = vector.divf %ones8, %egd{f} : {V8}")
         if HIPNUM:
             e(f"  %eod{f} = vector.divf %og{f}, %lsum8 : {V8}")
-            e(f"  %eov{f} = scf.select %lpos, %eod{f}, %zeros8 : {V8}")
+            if VQ8:   # V = (u - 128) * s + c per channel: o / l * s + c
+                e(f"  %evc{f}c = index.constant {16 * f} : index")
+                e(f"  %evc{f} = index.add %vsch, %evc{f}c : index")
+                e(f"  %evs{f}i = index.add %evc{f}, %c1024 : index")
+                e(f"  %evcn{f} = vector.load %vs_flat[%evc{f}] : view<2048xf32> -> {V8}")
+                e(f"  %evsc{f} = vector.load %vs_flat[%evs{f}i] : view<2048xf32> -> {V8}")
+                # staged values are 1152 + (u - 128): centre c - 1152 s
+                e(f"  %evcc{f} = vector.fmaf %evsc{f}, %c1152v, %evcn{f} : {V8}")
+                e(f"  %eod{f}v = vector.fmaf %eod{f}, %evsc{f}, %evcc{f} : {V8}")
+                e(f"  %eov{f} = scf.select %lpos, %eod{f}v, %zeros8 : {V8}")
+            else:
+                e(f"  %eov{f} = scf.select %lpos, %eod{f}, %zeros8 : {V8}")
         else:
             e(f"  %eov{f} = vector.mulf %og{f}, %linv8 : {V8}")
         e(f"  %eout{f} = vector.mulf %eov{f}, %egr{f} : {V8}")
@@ -938,6 +1168,10 @@ def gen():
         else:
             e(f"    vector.store %eout{f}, %o_flat[%eo{f}] : {V8}, view<[%qtot]xf32>")
         e("  }")
+        if VQ8 and f < 7:
+            # the scheduler hoisted every fragment's gate + scale/centre loads
+            # (192 VGPRs) to the epilogue top: 160 -> 240 VGPRs kernel-wide
+            e("  scf.schedule.fence")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

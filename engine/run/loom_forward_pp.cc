@@ -546,6 +546,22 @@ int main(int argc, char** argv) {
     LoomExecutable* e_vtrans = g_geom.count("vtrans.hal") ? &load(dir + "/vtrans.hal") : nullptr;
     const std::size_t kVtBytes = std::size_t{(B + 15) / 16 * 16} * kKvRow * 2;
     LoomBuffer vt16 = gpu.Allocate(e_vtrans ? kVtBytes : 4);
+    // int8 K cache (tools/gen_kvq.py; "attn_kq8" row): per attention layer
+    // int8 K [B][1024], scales [B][8] f32, and the per-layer channel mean
+    const bool attn_kq8 = g_geom.count("attn_kq8") != 0;
+    LoomExecutable* e_kmean = attn_kq8 ? &load(dir + "/kmean.hal") : nullptr;
+    LoomExecutable* e_kq8 = attn_kq8 ? &load(dir + "/kq8.hal") : nullptr;
+    const std::size_t kKsBytes = static_cast<std::size_t>(B) * 8 * 4;
+    LoomBuffer kq8buf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKvCache : 4);
+    LoomBuffer ksbuf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKsBytes : 4);
+    LoomBuffer kmbuf = gpu.Allocate(attn_kq8 ? 4096 : 4);
+    // uint8 V^T cache ("attn_vq8"): per layer [4][tiles][256][16] B + stats [2048] f32
+    const bool attn_vq8 = g_geom.count("attn_vq8") != 0;
+    LoomExecutable* e_vstat = attn_vq8 ? &load(dir + "/vstat.hal") : nullptr;
+    LoomExecutable* e_vq8 = attn_vq8 ? &load(dir + "/vq8.hal") : nullptr;
+    const std::size_t kVq8Bytes = kVtBytes / 2;
+    LoomBuffer vq8buf = gpu.Allocate(attn_vq8 ? std::size_t{kFull} * kVq8Bytes : 4);
+    LoomBuffer vsbuf = gpu.Allocate(attn_vq8 ? std::size_t{kFull} * 8192 : 4);
     LoomExecutable& e_cast = load(dir + "/cast.hal");
     LoomExecutable& e_gemv = load(dir + "/gemv.hal");
     LoomExecutable& e_rms = load(dir + "/rmsnorm.hal");
@@ -851,7 +867,29 @@ int main(int argc, char** argv) {
           dump_range(kv16, koff, kKvCache * 2, ".ak16");
           dump_range(kv16, voff, kKvCache * 2, ".av16");
         }
-        if (e_vtrans) {
+        const std::size_t q8off = std::size_t{ai} * kKvCache;
+        const std::size_t ksoff = std::size_t{ai} * kKsBytes;
+        if (attn_kq8) {
+          {
+            std::vector<hrx_buffer_ref_t> b = {{kv16.handle, koff, kKvCache * 2}, {kmbuf.handle, 0, 4096}};
+            Dispatch(gpu, *e_kmean, "yah_kmean", 4, 1, 1, 256, 1, 1, b);
+          }
+          std::vector<hrx_buffer_ref_t> b = {
+              {kv16.handle, koff, kKvCache * 2}, {kmbuf.handle, 0, 4096},
+              {kq8buf.handle, q8off, kKvCache}, {ksbuf.handle, ksoff, kKsBytes}};
+          Dispatch(gpu, *e_kq8, "yah_kq8", (B + 1) / 2, 1, 1, 256, 1, 1, b);
+        }
+        const std::size_t vq8off = std::size_t{ai} * kVq8Bytes;
+        const std::size_t vsoff = std::size_t{ai} * 8192;
+        if (attn_vq8) {
+          {
+            std::vector<hrx_buffer_ref_t> b = {{kv16.handle, voff, kKvCache * 2}, {vsbuf.handle, vsoff, 8192}};
+            Dispatch(gpu, *e_vstat, "yah_vstat", 4, 1, 1, 256, 1, 1, b);
+          }
+          std::vector<hrx_buffer_ref_t> b = {
+              {kv16.handle, voff, kKvCache * 2}, {vsbuf.handle, vsoff, 8192}, {vq8buf.handle, vq8off, kVq8Bytes}};
+          Dispatch(gpu, *e_vq8, "yah_vq8", 32, (B + 31) / 32, 1, 256, 1, 1, b);
+        } else if (e_vtrans) {
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, voff, kKvCache * 2}, {vt16.handle, 0, kVtBytes}};
           Dispatch(gpu, *e_vtrans, "yah_transpose_v16", 32, (B + 31) / 32, 1, 256, 1, 1, b);
@@ -859,10 +897,14 @@ int main(int argc, char** argv) {
         {
           std::vector<hrx_buffer_ref_t> b = {
               {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)},
-              {kv16.handle, koff, kKvCache * 2},
-              e_vtrans ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
-                       : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
+              attn_kq8 ? hrx_buffer_ref_t{kq8buf.handle, q8off, kKvCache}
+                       : hrx_buffer_ref_t{kv16.handle, koff, kKvCache * 2},
+              attn_vq8 ? hrx_buffer_ref_t{vq8buf.handle, vq8off, kVq8Bytes}
+              : e_vtrans ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
+                         : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
               {attn_f16 ? scratch.handle : aout.handle, 0, attn_f16 ? hb(scratch) : hb(aout)}, {lse.handle, 0, hb(lse)}};
+          if (attn_kq8) b.push_back({ksbuf.handle, ksoff, kKsBytes});
+          if (attn_vq8) b.push_back({vsbuf.handle, vsoff, 8192});
           // YAH_ATTN_GRID_OLD restores the pre-WMMA attention launch geometry so the
           // two attention kernels can be A/Bd from ONE binary, interleaved, without a
           // rebuild between runs (a failed rebuild leaves a stale binary and a mismatched
@@ -883,10 +925,12 @@ int main(int argc, char** argv) {
           if (!attn_old_grid && attn_geom != g_geom.end() && attn_geom->second.tt &&
               (B + attn_tpw - 1) / attn_tpw != attn_geom->second.tt)
             throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
+          // gen_attn_fa with GQA packing runs 12-wave workgroups ("attn_wg384")
+          const std::uint32_t attn_wg = g_geom.count("attn_wg384") ? 384 : 256;
           Dispatch(gpu, e_wmma, "yah_attn_wmma",
                    attn_old_grid ? kHeads : (B + attn_tpw - 1) / attn_tpw,
                    attn_old_grid ? B : kHeads / attn_hpw, 1,
-                   attn_old_grid ? 32 : 256, 1, 1, b);
+                   attn_old_grid ? 32 : attn_wg, 1, 1, b);
         }
         if (g_dump_layer == static_cast<int>(l) && !attn_f16)
           dump_buf(aout, static_cast<std::size_t>(B) * 6144 * 4, ".aout");
