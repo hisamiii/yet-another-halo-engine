@@ -2686,3 +2686,17 @@ instructions run on both ALU halves.
   cycles (-16.5%), total 7339 -> 7315 M.
 - Rule of thumb: wave64 pays where cost is per lane and FP32 (pure VALU
   kernels). It loses where cost hangs off WMMAs (GEMMs, see above).
+
+**Fused FFN gate+up: sized, not built (2026-10-01).**
+- gate/up formats per layer: same in 36 of 64 (IQ3_XXS 15, IQ3_S 12, IQ4_XS
+  9). Mixed in 28 (IQ3_S/IQ4_XS 14, Q3_K/IQ3_S 7, 7 others), which would need
+  two decoders in one kernel.
+- ATT, IQ3_XXS 1088x20 (stagger on), per wave:
+  - gate kstore: prologue 2.4%, epilogue 2.2%.
+  - swiglu: prologue 2.4%, epilogue 7.2% (reads the f32 gate).
+  - SIMD time with no wave in its K loop: 0.3% / 0.4%. Prologues and
+    epilogues already overlap other waves' K loops; the 142 MB gate round
+    trip overlaps compute-bound kernels.
+- A fused kernel would remove one prologue, the gate epilogue and the gate
+  read: upper bound ~4-5% of FFN time if none were hidden, realistically
+  ~1-2% (~0.5% of the prefill). Not worth two-decoder kernels now.
