@@ -2700,3 +2700,11 @@ instructions run on both ALU halves.
 - A fused kernel would remove one prologue, the gate epilogue and the gate
   read: upper bound ~4-5% of FFN time if none were hidden, realistically
   ~1-2% (~0.5% of the prefill). Not worth two-decoder kernels now.
+
+**Concurrent dispatch prototype (2026-10-01).** See
+`research/upstream-candidates.md` item 1. With a local libhrx patch (dispatch
+flag bit 2 skips the stream's trailing ordering barrier) and `YAH_CONCUR=1`,
+DeltaNet and the SSM z-projection GEMM overlap fully. md5 unchanged; the pair
+goes 270.6 -> 251.9 ms over 48 layers (~0.6% of pp2048). Driver hook:
+`LoomDevice::NoBarrierNext()`; it must stay off against stock HRX, which
+rejects unknown flags.

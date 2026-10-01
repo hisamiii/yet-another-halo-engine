@@ -890,7 +890,12 @@ int main(int argc, char** argv) {
         run_kstore(pre + "attn_qkv.weight", qkv);
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(qkv, static_cast<std::size_t>(B) * kQkv * 4, ".qkv");
-        run_kstore(pre + "attn_gate.weight", gate);
+        // YAH_CONCUR=1 (needs the local HRX no-barrier prototype): the z
+        // projection runs after DeltaNet with no barrier between them, so the
+        // WMMA-bound GEMM overlaps the VALU-bound scan; postnorm (the first
+        // consumer of both) keeps its barrier.
+        static const bool concur = std::getenv("YAH_CONCUR") != nullptr;
+        if (!concur) run_kstore(pre + "attn_gate.weight", gate);
         run_kstore(pre + "ssm_alpha.weight", alpha);
         run_kstore(pre + "ssm_beta.weight", beta);
         if (g_dump_layer == static_cast<int>(l)) {
@@ -955,11 +960,13 @@ int main(int argc, char** argv) {
           // row-group field is the blocks per head. Without it: the regtile
           // kernel's (heads) x 128.
           const auto dn_geom = g_geom.find("rowsplit.hal");
+          if (concur) gpu.NoBarrierNext();
           if (dn_geom != g_geom.end() && dn_geom->second.rowgrp)
             Dispatch(gpu, e_rowsplit, "yah_deltanet", dn_geom->second.rowgrp, kTs, 1, 256, 1, 1, b);
           else
             Dispatch(gpu, e_rowsplit, "yah_deltanet", kTs, 1, 1, 128, 1, 1, b);
         }
+        if (concur) run_kstore(pre + "attn_gate.weight", gate);
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(raw, static_cast<std::size_t>(B) * kInner * 4, ".raw");
         {

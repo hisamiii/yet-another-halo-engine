@@ -43,8 +43,24 @@ existing callers.
 cross-stream ordering through `hrx_stream_wait_event` (semaphores). This gives
 general dependency graphs, but it is a larger runtime change.
 
-**Next step.** Local prototype of the flag; measure the SSM reordering on
-pp2048 cycles.
+**Prototype result (2026-10-01).** Local libhrx patch (`stream.c` skips the
+trailing ordering barrier for flag bit 2; never committed upstream).
+`loom_forward_pp` with `YAH_CONCUR=1` dispatches DeltaNet flagged, then the z
+GEMM, then postnorm.
+- md5 unchanged.
+- Device timestamps: the z GEMM starts ~1 us after DeltaNet and overlaps all
+  of it in all 48 SSM layers. Each slows while sharing (DeltaNet ~+50%, GEMM
+  ~+20-30%).
+- DeltaNet + z GEMM over 48 layers: 270.6 ms serial -> 251.9 ms concurrent
+  (-6.9%, -18.6 ms, ~0.6% of pp2048). Below the ~1.4% first estimate: the
+  GEMM is near its issue bound, so DeltaNet's VALU steals its issue slots.
+- Untraced wall time (single runs, idle start): +2.3% / -1.5% in two pairs,
+  i.e. inside the ~±2.5% run-to-run noise. The clock was unchanged (2218 vs
+  2209 MHz), so no thermal penalty.
+- Verdict: real and exact, but modest for this pairing. Further pairs (the
+  48-row alpha/beta GEMMs, attention-side prep, kernel fill/drain tails) are
+  each smaller. Worth proposing upstream as a general capability, not on this
+  number alone.
 
 ## 2. Loom: loop-invariant code motion after view linearization
 

@@ -262,9 +262,11 @@ class LoomDevice {
                 size_t binding_count) {
     static const bool time_dispatch = std::getenv("YAH_LOOM_DISPATCH_TIMING") != nullptr;
     const auto t0 = time_dispatch ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const uint32_t flags = next_flags_;
+    next_flags_ = 0;
     LoomCheck(hrx_stream_dispatch(stream_, executable.handle, ordinal, &config,
                                   constants, constants_size, bindings,
-                                  binding_count, HRX_DISPATCH_FLAG_NONE),
+                                  binding_count, flags),
               "hrx_stream_dispatch");
     if (time_dispatch) {
       const auto t1 = std::chrono::steady_clock::now();
@@ -309,6 +311,10 @@ class LoomDevice {
   // driver that queues a long run before one wait (the prefill) opts in with
   // SetSleepSync(); YAH_LOOM_SLEEP_SYNC_US=N overrides it (0 = runtime wait).
   // Off by default: probes time single short waits, where N us of slack shows.
+  // Experimental (needs the local HRX prototype flag, bit 2: skip the
+  // trailing ordering barrier): the next Dispatch may overlap the one after
+  // it. Never set against stock HRX, which rejects unknown flags.
+  void NoBarrierNext() { next_flags_ = 1u << 2; }
   void SetSleepSync(long us) {
     if (!std::getenv("YAH_LOOM_SLEEP_SYNC_US")) sleep_us_ = us;
   }
@@ -366,6 +372,7 @@ class LoomDevice {
   long paced_ = 0;
   long dispatch_n_ = 0;
   long sync_sleeps_ = 0;
+  uint32_t next_flags_ = 0;
   long sleep_us_ = [] {
     const char* v = std::getenv("YAH_LOOM_SLEEP_SYNC_US");
     return v ? std::atol(v) : 0L;
