@@ -2648,3 +2648,24 @@ from the f16 halves. The product is exact in f32, so it is bit-identical.
 - Lesson: the per-instruction VALU price (hw-measured.md: ~1.1 next to WMMA)
   overstates decode cost in the full kernels. More decode trimming has low
   payoff; what remains over the floor is mostly LDS and synchronization.
+
+**Wave64 tile GEMM revisited (2026-10-01, falsified).** Loom's wave64 WMMA
+keeps the full 16-half operand per lane (replicated across both 32-lane
+halves); only the accumulator halves (4 VGPRs per fragment).
+- IQ3_S kstore, compile (`YAH_TG_W64=1`):
+  - wave64 4 x 2: 184 VGPRs (wave32 224), ds_load/WMMA 1.38 (same),
+    VALU/WMMA 5.33 (4.52).
+  - wave64 2 x 2 (64 x 128 per wave): ds_load/WMMA 0.81, VALU/WMMA 3.72, but
+    256 VGPRs with 22 spill stores.
+  - 4 x 1 and 2 x 1 hit generator gaps.
+- `research/wm64.hip`: WMMA is 34.0 cycles per 16x16x16 per SIMD in both
+  wave sizes.
+- Wave64 4 x 2: bit-identical, 23.93 -> 31.27 M cycles. SOL per instruction:
+  - VALU 1.03 -> 1.76 cycles, LDS 1.49 -> 2.53.
+  - Barrier wait 5 -> 17%, waiting to issue 10 -> 51%.
+- A wave64 instruction costs ~1.7x a wave32 one (0.88x per lane). Our
+  overhead is counted per WMMA, and a wave64 WMMA does the same work, so it
+  all grows ~1.7x.
+- Even the 2 x tile only breaks even on LDS (0.81 x 2.53 vs 1.38 x 1.49) and
+  loses ~1.8 cycles/WMMA on VALU. The earlier 12% wave64 gain ("wave64: under
+  192") was against a far weaker wave32 kernel.
