@@ -2270,3 +2270,24 @@ chain is exposed between barriers.
     the GEMMs are issue-bound and reuse each weight tile across 2048 tokens.
   - What remains is driver cost (ROCr init, KFD userptr registration). It is
     not reachable from our code with the stock runtime.
+
+**IQ3_S at 4 x 2 with the word-path decode (2026-10-01).** 4 x 2 spilled with
+IQ3_S's element decode (256 VGPRs), and the word-path U8F/FR decode lost at
+4 x 4 (exposed latency). Together they fit (224-248 VGPRs, no scratch), and
+the decode block drops from 467 VALU per 32 WMMA to 353 per 64. Standalone,
+real bytes, M cycles, one round each, bit-identical:
+
+| kind | p52 | p53 |
+|---|---:|---:|
+| kstore 17408x5120 | 27.08 | 24.15 (HIP 25.91) |
+| swiglu | 28.52 | 27.76 |
+| kres K=17408 | 28.90 | 24.18 |
+| kres K=6144 | 14.16 | 9.86 |
+
+- p53 = p52 + IQ3_S kstore/swiglu/kres (`WAVE_FMTS`; `configure()` turns the
+  word path on for IQ3_S at 4 x 2). md5 a2145e371ceefd4d on every kind.
+- Clean pp2048, one round each, 15 s gaps: p52 3431.1 ms, p53 3347.6 ms
+  (-2.4%). HIP 3463.3 ms in a separate round.
+  - HIP's first round in that sequence read 16686 ms. No GPU messages in
+    dmesg; it did not reproduce (3463, then 3436 with `YAH_WEIGHTS_COPY`).
+    Cause unverified; possibly outside GPU use.

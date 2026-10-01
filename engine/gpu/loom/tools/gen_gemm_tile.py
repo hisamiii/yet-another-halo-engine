@@ -191,15 +191,18 @@ def configure(fmt):
     G.SPLIT = int(os.environ.get("YAH_TG_SPLIT", "1")) if fmt == "iq4xs" else 1
     G.Q4_HDR = G.Q4_HDR_ENV == "1" if G.Q4_HDR_ENV is not None else fmt in ("q4k", "q5k")
     # word-level grid sign application: IQ3_XXS 9.97 -> 9.82 ms; IQ3_S neutral
-    G.VDEC_W = os.environ.get("YAH_SD_VDECW", "1" if fmt == "iq3xxs" else "0") == "1"
+    # at 4 x 4. IQ3_S at 4 x 2 takes it with U8F/FR below (WAVE_FMTS).
+    w3 = fmt == "iq3xxs" or (fmt == "iq3s" and (WM, WN) == (4, 2))
+    G.VDEC_W = os.environ.get("YAH_SD_VDECW", "1" if w3 else "0") == "1"
     # unsigned-byte + fused-multiply decode and the multiply-free sign spread
     # (gen_gemm_shared IQ3_U8F / VDECW_FR), bit-identical. IQ3_XXS kstore on
     # real bytes 25.99 -> 25.41 M cycles. IQ3_S loses (26.79 -> 27.23 with the
     # word path): VALU/WMMA falls 7.64 -> 6.58 but the issue bound drops from
     # 98% to 94% of measured -- the longer dependent chain is exposed between
-    # barriers, where every wave decodes in the same phase.
-    G.IQ3_U8F = os.environ.get("YAH_SD_IQ3U8F", "1" if fmt == "iq3xxs" else "0") == "1"
-    G.VDECW_FR = os.environ.get("YAH_SD_VDECW_FR", "1" if fmt == "iq3xxs" else "0") == "1"
+    # barriers, where every wave decodes in the same phase. At 4 x 2 it wins
+    # (each decode feeds twice the WMMAs; see WAVE_FMTS).
+    G.IQ3_U8F = os.environ.get("YAH_SD_IQ3U8F", "1" if w3 else "0") == "1"
+    G.VDECW_FR = os.environ.get("YAH_SD_VDECW_FR", "1" if w3 else "0") == "1"
     G.LR = BM
     G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
     assert G.GPP % G.GPL == 0
@@ -234,12 +237,17 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
 # (32 x 128 per wave, 8 waves): fragment loads per WMMA 1.5 -> 1.25, kstore
 # 24.50 -> 23.12 M cycles (HIP 23.15), bit-identical; 2 x 4 (64 x 64) has fewer
 # instructions still but drops off the issue bound (25.88: exposed latency).
-# IQ3_XXS 25.41 -> 24.23, Q3_K 28.62 -> 25.12 M cycles (bit-identical). IQ3_S
-# and Q4_K spill at 4 x 2 (256 / 240 VGPRs, 58 / 65 scratch instructions:
-# 52.78 / 44.05 M) and stay 4 x 4.
+# IQ3_XXS 25.41 -> 24.23, Q3_K 28.62 -> 25.12 M cycles (bit-identical). Q4_K
+# spills at 4 x 2 (240 VGPRs, 65 scratch instructions: 44.05 M) and stays 4 x 4.
+# IQ3_S spills at 4 x 2 with its element decode (256 VGPRs: 52.78 M) but fits
+# with the word-path U8F/FR decode (224-248 VGPRs, no scratch; configure()),
+# which cuts its decode block 467 VALU / 32 WMMA -> 353 / 64. Real bytes, M
+# cycles, bit-identical: kstore 27.08 -> 24.15 (HIP 25.91), swiglu 28.52 ->
+# 27.76, kres K=17408 28.90 -> 24.18, K=6144 14.16 -> 9.86.
 # IQ3_XXS swiglu loses at 4 x 2 (27.39 -> 27.76 standalone; pp2048 row +8.6 ms):
 # kstore/kres only. Values: ((WM, WN), kinds or None for all).
-WAVE_FMTS = {"iq4xs": ((4, 2), None), "iq3xxs": ((4, 2), ("kstore", "kres")), "q3k": ((4, 2), None)}
+WAVE_FMTS = {"iq4xs": ((4, 2), None), "iq3xxs": ((4, 2), ("kstore", "kres")), "q3k": ((4, 2), None),
+             "iq3s": ((4, 2), None)}
 
 
 def gen(fmt, kind="kstore"):
