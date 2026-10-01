@@ -2164,3 +2164,29 @@ Hoisting the remaining loop-invariant address math would bring VALU to HIP's
 count (1.126 vs 1.119 G), but needs compiler changes (see p47). Production
 stays stock-buildable.
 
+**Issue-bound view and the IQ3 decode (2026-10-01, after the research pass).**
+
+Every production kernel runs at 98-102% of its issue bound:
+34·WMMA + VALU cycles + ~3·LDS per SIMD (`research/sol.py` with the extended
+counters; research/hw-measured.md). Barrier waits are absorbed by other waves,
+so only instructions per WMMA move cycles. Two cautions:
+
+- Dependent VALU chains cost 2-3x when every wave decodes in the same phase.
+- A decode-free f16 GEMM is falsified: HIP's f16-weight Q4_K kernel is 8%
+  slower than its quantized one.
+
+`YAH_SD_IQ3U8F` + `YAH_SD_VDECW_FR`, default for IQ3_XXS:
+
+- What it does: the signed magnitude bytes XOR 0x80 are read with
+  `v_cvt_f32_ubyteN`, and the -128 rides the fused multiply's f32 addend
+  (`fptrunc(fma(dsc, u, -128*dsc))`; the product is exact in f32).
+- The sign spread drops its quarter-rate `v_mul_lo_u32`: n*0x204081 becomes
+  two shift-ORs, and *255 becomes a shift-subtract.
+- Bit-identical. IQ3_XXS kstore on real bytes 25.99 -> 25.41 M cycles.
+- p49 = p48 + the IQ3_XXS HALs: md5 a2145e371ceefd4d unchanged. pp2048
+  IQ3_XXS rows 766.9 -> 750.8 ms (-2.1%) against +1.6% drift.
+
+IQ3_S with the same path loses (26.79 -> 27.23). VALU/WMMA falls 7.64 -> 6.58,
+but the issue bound drops from 98% to 94% of measured: the longer dependent
+chain is exposed between barriers.
+

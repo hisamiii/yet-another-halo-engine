@@ -192,6 +192,14 @@ def configure(fmt):
     G.Q4_HDR = G.Q4_HDR_ENV == "1" if G.Q4_HDR_ENV is not None else fmt in ("q4k", "q5k")
     # word-level grid sign application: IQ3_XXS 9.97 -> 9.82 ms; IQ3_S neutral
     G.VDEC_W = os.environ.get("YAH_SD_VDECW", "1" if fmt == "iq3xxs" else "0") == "1"
+    # unsigned-byte + fused-multiply decode and the multiply-free sign spread
+    # (gen_gemm_shared IQ3_U8F / VDECW_FR), bit-identical. IQ3_XXS kstore on
+    # real bytes 25.99 -> 25.41 M cycles. IQ3_S loses (26.79 -> 27.23 with the
+    # word path): VALU/WMMA falls 7.64 -> 6.58 but the issue bound drops from
+    # 98% to 94% of measured -- the longer dependent chain is exposed between
+    # barriers, where every wave decodes in the same phase.
+    G.IQ3_U8F = os.environ.get("YAH_SD_IQ3U8F", "1" if fmt == "iq3xxs" else "0") == "1"
+    G.VDECW_FR = os.environ.get("YAH_SD_VDECW_FR", "1" if fmt == "iq3xxs" else "0") == "1"
     G.LR = BM
     G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
     assert G.GPP % G.GPL == 0

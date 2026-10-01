@@ -164,6 +164,18 @@ RPF = os.environ.get("YAH_SD_RPF", "0") == "1"
 # IQ3_S / IQ3_XXS: decode each sign byte's 8 elements with i8/f32 vector ops.
 VDEC = os.environ.get("YAH_SD_VDEC", "1") == "1"
 VDEC_W = os.environ.get("YAH_SD_VDECW", "0") == "1"
+# IQ3_U8F (IQ3_S / IQ3_XXS, word path): the signed magnitude bytes XOR 0x80 are
+# u = mag + 128 as unsigned bytes; v_cvt_f32_ubyteN reads each one directly and
+# the -128 rides the fused multiply's f32 addend: fptrunc(fma(dsc, u, -128*dsc)).
+# (u-128)*dsc has <= 24 significant bits (|mag| <= 127, dsc = d * odd <= 5 bits),
+# so it is exact in f32 and the single rounding equals today's: bit-identical.
+# Replaces sign-extend + sitofp + mulf + fptrunc per element.
+IQ3_U8F = os.environ.get("YAH_SD_IQ3U8F", "0") == "1"
+# VDECW_FR: the word path's sign spread without quarter-rate v_mul_lo_u32:
+# nibble * 0x00204081 as an index multiply (both fit 24 bits: v_mul_u32_u24,
+# full rate) and s1 * 255 as (s1 << 8) - s1 (each set byte becomes 0xFF; the top
+# byte wraps mod 2^32). Same integers: bit-identical.
+VDECW_FR = os.environ.get("YAH_SD_VDECW_FR", "0") == "1"
 
 
 def _i8n(ty):
@@ -471,7 +483,7 @@ def _store_group(e, u, hs):
     e(f"    vector.store %hhi{u}, %wl_view[%drow, %colh{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
 
 
-def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p):
+def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None):
     """Vector decode of the 8 elements one sign byte covers (grid words lw=2p and
     2p+1): mags = bytes of [gw0, gw1], s = bits of the sign byte (LSB first,
     matching element lw*4 + b), mag = (g ^ -s) + s in i8 -- exact because grid
@@ -488,9 +500,21 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p):
             else:
                 e(f"    %wsn{h}_{t}0 = scalar.addi %wsb_{t}, %c0i : i32")
             e(f"    %wsn{h}_{t} = scalar.andi %wsn{h}_{t}0, %c15i : i32")
-            e(f"    %wsp{h}_{t} = scalar.muli %wsn{h}_{t}, %vdw_spread : i32")
+            if VDECW_FR:
+                # n * 0x00204081 & 0x01010101 == (t | t << 14) & 0x01010101 with
+                # t = n | n << 7 (n <= 15: bit i lands at 8i, OR cannot carry)
+                e(f"    %wst7{h}_{t} = scalar.shli %wsn{h}_{t}, %c7i : i32")
+                e(f"    %wst{h}_{t} = scalar.ori %wsn{h}_{t}, %wst7{h}_{t} : i32")
+                e(f"    %wst14{h}_{t} = scalar.shli %wst{h}_{t}, %c14i_vdw : i32")
+                e(f"    %wsp{h}_{t} = scalar.ori %wst{h}_{t}, %wst14{h}_{t} : i32")
+            else:
+                e(f"    %wsp{h}_{t} = scalar.muli %wsn{h}_{t}, %vdw_spread : i32")
             e(f"    %ws1{h}_{t} = scalar.andi %wsp{h}_{t}, %vdw_ones : i32")
-            e(f"    %wsm{h}_{t} = scalar.muli %ws1{h}_{t}, %vdw_ff : i32")
+            if VDECW_FR:
+                e(f"    %wsm8{h}_{t} = scalar.shli %ws1{h}_{t}, %c8i : i32")
+                e(f"    %wsm{h}_{t} = scalar.subi %wsm8{h}_{t}, %ws1{h}_{t} : i32")
+            else:
+                e(f"    %wsm{h}_{t} = scalar.muli %ws1{h}_{t}, %vdw_ff : i32")
             e(f"    %wx{h}_{t} = scalar.xori {gw}, %wsm{h}_{t} : i32")
             e(f"    %wm{h}_{t} = scalar.addi %wx{h}_{t}, %ws1{h}_{t} : i32")
         e(f"    %vmw_{t} = vector.from_elements %wm0_{t}, %wm1_{t} : vector<2xi32>")
@@ -503,9 +527,24 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p):
         e(f"    %vn_{t} = vector.subi %z8v, %vs_{t} : vector<8xi8>")
         e(f"    %vx_{t} = vector.xori %vb_{t}, %vn_{t} : vector<8xi8>")
         e(f"    %vm_{t} = vector.addi %vx_{t}, %vs_{t} : vector<8xi8>")
-    e(f"    %vf_{t} = vector.sitofp %vm_{t} : vector<8xi8> to vector<8xf32>")
-    e(f"    %vv_{t} = vector.mulf {dsc_v8}, %vf_{t} : vector<8xf32>")
-    e(f"    %vh_{t} = vector.fptrunc %vv_{t} : vector<8xf32> to vector<8xf16>")
+    if IQ3_U8F and VDEC_W and dsc_s is not None:
+        e(f"    %wu0_{t} = scalar.xori %wm0_{t}, %c80x4_iq3 : i32")
+        e(f"    %wu1_{t} = scalar.xori %wm1_{t}, %c80x4_iq3 : i32")
+        e(f"    %vuw_{t} = vector.from_elements %wu0_{t}, %wu1_{t} : vector<2xi32>")
+        e(f"    %vub_{t} = vector.bitcast %vuw_{t} : vector<2xi32> to vector<8xi8>")
+        e(f"    %vuf_{t} = vector.uitofp %vub_{t} : vector<8xi8> to vector<8xf32>")
+        e(f"    %unb_{t} = scalar.mulf {dsc_s}, %cm128f_iq3 : f32")
+        hs = []
+        for j in range(8):
+            e(f"    %uy_{t}_{j} = vector.extract %vuf_{t}[{j}] : vector<8xf32> -> f32")
+            e(f"    %um_{t}_{j} = scalar.fmaf {dsc_s}, %uy_{t}_{j}, %unb_{t} : f32")
+            e(f"    %uh_{t}_{j} = scalar.fptrunc %um_{t}_{j} : f32 to f16")
+            hs.append(f"%uh_{t}_{j}")
+        e(f"    %vh_{t} = vector.from_elements {', '.join(hs)} : vector<8xf16>")
+    else:
+        e(f"    %vf_{t} = vector.sitofp %vm_{t} : vector<8xi8> to vector<8xf32>")
+        e(f"    %vv_{t} = vector.mulf {dsc_v8}, %vf_{t} : vector<8xf32>")
+        e(f"    %vh_{t} = vector.fptrunc %vv_{t} : vector<8xf32> to vector<8xf16>")
     e(f"    %vc_{t} = index.constant {8 * p} : index")
     e(f"    %vco_{t} = index.add {col}, %vc_{t} : index")
     e(f"    vector.store %vh_{t}, %wl_view[%drow, %vco_{t}] : vector<8xf16>, view<{LR}x{ROWP}xf16>")
@@ -596,7 +635,7 @@ def iq3s_compute(v, gb):
                 gws.append(f"%gw_{t}")
             for pp in range(4):
                 e(f"    %sgb8_{u}_{pp} = vector.extract {sg}[{pp}] : vector<4xi8> -> i8")
-                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%sgb8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp)
+                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%sgb8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}")
             continue
         hs = []
         for lw in (range(8) if GRID_FIRST else ()):
@@ -677,7 +716,9 @@ def iq3s_setup():
     L = ["  %grid_g = buffer.view %grid_na[%base] : buffer -> view<512xi32>",
          "  %c511 = index.constant 511 : index",
          "  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32",
-         "  %vdw_ff = scalar.constant 255 : i32"]
+         "  %vdw_ff = scalar.constant 255 : i32",
+         "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
+         "  %c14i_vdw = scalar.constant 14 : i32"]
     if not GRID_LDS:
         return L + ["  %grid_view = buffer.view %grid_na[%base] : buffer -> view<512xi32>"]
     L += ["  %grid_bytes = index.constant 2048 : offset",
@@ -760,7 +801,7 @@ def iq3xxs_compute(v, gb):
                 e(f"    %sidl_{u}_{pp} = index.max %sidx_{u}_{pp}, %c0 : index")
                 e(f"    %sidc_{u}_{pp} = index.min %sidl_{u}_{pp}, %c127 : index")
                 e(f"    %ks8_{u}_{pp} = view.load %ksigns_view[%sidc_{u}_{pp}] : view<128xi8> -> i8")
-                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%ks8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp)
+                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%ks8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}")
             continue
         hs = []
         for lw in range(8):
@@ -823,7 +864,9 @@ def _stage_table(name, src, n, ty, bytes_per):
 
 
 def iq3xxs_setup():
-    return ["  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32", "  %vdw_ff = scalar.constant 255 : i32"] + ((["  %fhalf = scalar.constant 0.5 : f32"])
+    return ["  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32", "  %vdw_ff = scalar.constant 255 : i32",
+            "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
+            "  %c14i_vdw = scalar.constant 14 : i32"] + ((["  %fhalf = scalar.constant 0.5 : f32"])
             + _stage_table("grid", "%grid_na", 256, "i32", 4)
             + _stage_table("ksigns", "%ksigns_na", 128, "i8", 1))
 
