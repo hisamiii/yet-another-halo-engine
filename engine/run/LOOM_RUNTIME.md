@@ -2669,3 +2669,20 @@ halves); only the accumulator halves (4 VGPRs per fragment).
 - Even the 2 x tile only breaks even on LDS (0.81 x 2.53 vs 1.38 x 1.49) and
   loses ~1.8 cycles/WMMA on VALU. The earlier 12% wave64 gain ("wave64: under
   192") was against a far weaker wave32 kernel.
+
+**Wave64 where it fits: DeltaNet (2026-10-01).** Pure FP32 FMA probe
+(`research/valu64.hip`, 8 independent chains): wave32 reaches 56.6
+lane-FMAs/cycle/SIMD only because the compiler pairs 32 of 40 FMAs into
+`v_dual_fmaak`. Wave64 reaches 60.0 with no pairing: single FP32
+instructions run on both ALU halves.
+- DeltaNet's 672 three-operand `v_fma_f32` per 8 tokens cannot pair in wave32
+  (and forcing pairs via `vector.dotf` hurt latency).
+- `YAH_DN_W64` (default on): each 64-lane wave takes 16 rows (second row 8
+  below). Every row's arithmetic, including the 8-lane xor butterfly, is
+  unchanged. Bit-identical to HIP's kernel at 256 and 203 tokens.
+- 124 VGPRs, 5 waves/SIMD. B=2048 harness 4.752 -> 4.184 M cycles. Unroll
+  2/4/8/16: 4.59 / 4.31 / 4.18 / 4.12 (8 kept).
+- p59 = full emit: md5 a2145e371ceefd4d. Pipeline DeltaNet 226.7 -> 189.2 M
+  cycles (-16.5%), total 7339 -> 7315 M.
+- Rule of thumb: wave64 pays where cost is per lane and FP32 (pure VALU
+  kernels). It loses where cost hangs off WMMAs (GEMMs, see above).
