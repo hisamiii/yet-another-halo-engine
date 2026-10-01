@@ -614,7 +614,11 @@ def gen():
         init = ", ".join(f"{n} = {v} : {V8}" for n, v in zip(names, init_o))
         init += f", %rmax = {init_m} : f32, %rsum = {init_s} : f32, "
         init += ", ".join(f"{n} = {v} : {V8H}" for n, v in zip(kvn, init_kv))
-        e(f"  {', '.join(res)} = scf.for %ks_ = [{lo} to {hi} step %c16]({init}) -> ({types}) {{")
+        # YAH_ATTN_POL: loop policy on the key-tile loop (e.g. "unroll(%c2)
+        # schedule(recurrence)": iterations alternate registers instead of
+        # copying the carried O / max / sum / K-V prefetch back on the edge)
+        pol = __import__("os").environ.get("YAH_ATTN_POL", "")
+        e(f"  {', '.join(res)} = scf.for %ks_ = [{lo} to {hi} step %c16]({init}) -> ({types}) {pol} {{")
         outs, nm, ns, nxt = body(tail)
         e(f"    scf.yield {', '.join(outs)}, {nm}, {ns}, {', '.join(nxt)} : {types}")
         e("  }")

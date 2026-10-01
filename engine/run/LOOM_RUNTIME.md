@@ -2775,3 +2775,24 @@ pipe-busy counter on this chip), `tools/advpmc.sh`:
   MMA phases, LDS latency). The way past it would be producer/consumer wave
   specialization (decode waves feeding MMA waves through LDS without
   workgroup barriers), a larger redesign.
+
+**Attention profile at pp8192 (2026-10-01).** Production `gen_attn_hip`
+kernel, real layer-3 inputs:
+- 80.26 M cycles per layer against a 42.87 M WMMA floor (53% SOL). The issue
+  model explains 98%.
+- Per WMMA: VALU 15.1 instr (16.6 cycles), LDS 4.0, transcendental 0.36,
+  SALU 1.8.
+- LDS 81% busy, bank conflicts 9.9% of LDS-active cycles. I-cache misses 5.9%
+  (fetch waits 0.8%).
+- ATT instruction time: `s_waitcnt lgkmcnt(0)` 37.2% (full LDS drains),
+  `s_barrier` 16.2%, `v_mov_b32` 9.1% (back-edge copies). In the timeline the
+  WMMA pipe is idle ~42%; at idle instants waves wait on lgkm 28%, VALU issue
+  14%, barrier 11%.
+- `YAH_ATTN_POL` (key-loop policy) added, bit-identical:
+  - `unroll(%c2) schedule(recurrence)` 80.59 -> 79.03 M with 31 spill stores;
+  - `unroll(%c2)` 82.63 M.
+  Not adopted.
+- Levers: cut LDS traffic (P round trip, more query rows per K/V fragment),
+  bank-conflict padding of the K/V/P pitches, partial instead of full LDS
+  waits, skip the O rescale when no row max changed (exact), dual-issue of the
+  softmax FP32.
