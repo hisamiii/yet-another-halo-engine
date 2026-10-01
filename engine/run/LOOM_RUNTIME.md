@@ -2456,3 +2456,12 @@ floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
   - `ryzenadj --tctl-temp`: needs root plus `ryzen_smu` (DKMS built only for
     6.18) or `iomem=relaxed`
   - GFX undervolt: `--set-cogfx` reportedly does not work on Strix Halo
+- `doas ryzenadj --tctl-temp=105` (user's request) is accepted through the SMU
+  mailbox. The PM table is unreadable (no `ryzen_smu` for 7.3, `/dev/mem`
+  blocked), so the old value is unknown; it resets on reboot. The firmware
+  holds Tgfx at ~99.6 C instead of 94.8, i.e. it clamps near Tjmax (100 C).
+  - GEMM probe: 2276 -> 2425 MHz (+6.5%), 10.79 -> 10.25 ms/launch.
+  - VALU: 2067 -> 2188 MHz.
+  - Socket power 111 -> 124 W.
+  - pp2048 p56: 3186.2 ms (md5 unchanged), HIP 3388.4 (one round each,
+    15 s gaps). Earlier same session: p55 3262.8, HIP ~3463.
