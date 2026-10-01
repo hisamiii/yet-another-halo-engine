@@ -107,7 +107,7 @@ RHS_OUTER = RHS_OUTER_ENV == "1"
 RHS_FENCE_ENV = os.environ.get("YAH_TG_RHSF")
 RHS_FENCE = int(RHS_FENCE_ENV or "0")
 # per-format rhs-outer default (fence every n): Q4_K at 4 x 2 13.77 -> 13.54 M
-RHSO_FMTS = {"q4k": 1}
+RHSO_FMTS = {"q4k": 1, "q5k": 1}
 
 # f16 of padding per decoded weight row: unpadded rows are 128 B apart at
 # KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
@@ -233,7 +233,7 @@ def configure(fmt):
     G.IQ3_U8F = os.environ.get("YAH_SD_IQ3U8F", "1" if w3 else "0") == "1"
     # Q4_K: subtract-and-narrow through v_fma_mix (gen_gemm_shared Q4FMIX);
     # what lets Q4_K run at 4 x 2 without spills
-    G.Q4FMIX = os.environ.get("YAH_SD_Q4FMIX", "1" if fmt == "q4k" else "0") == "1"
+    G.Q4FMIX = os.environ.get("YAH_SD_Q4FMIX", "1" if fmt in ("q4k", "q5k") else "0") == "1"
     G.VDECW_FR = os.environ.get("YAH_SD_VDECW_FR", "1" if w3 else "0") == "1"
     G.LR = BM
     G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
@@ -276,7 +276,8 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
 # exactly that window, so the allocator evicted accumulators to scratch for each
 # conversion. Through v_fma_mix (Q4FMIX) it fits (200-248 VGPRs, no scratch).
 # Real bytes, M cycles, bit-identical: kstore 15.21 -> 13.54 (HIP 13.64-13.71),
-# swiglu 27.52 -> 24.85, kres K=17408 25.75 -> 23.71, K=6144 ~neutral.
+# swiglu 27.52 -> 24.85, kres K=17408 25.75 -> 23.71, K=6144 ~neutral. Q5_K
+# (same decode): kstore 19.35 -> 17.09, kres K=6144 12.33 -> 10.81.
 # IQ3_S spills at 4 x 2 with its element decode (256 VGPRs: 52.78 M) but fits
 # with the word-path U8F/FR decode (224-248 VGPRs, no scratch; configure()),
 # which cuts its decode block 467 VALU / 32 WMMA -> 353 / 64. Real bytes, M
@@ -286,7 +287,8 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
 # standalone; pp2048 row +8.6 ms); with the LDS epilogue (SWEPI) it wins
 # (27.27 -> 25.13). Values: ((WM, WN), kinds or None for all).
 WAVE_FMTS = {"iq4xs": ((4, 2), None), "iq3xxs": ((4, 2), None), "q3k": ((4, 2), None),
-             "iq3s": ((4, 2), None), "q4k": ((4, 2), None)}
+             "iq3s": ((4, 2), None), "q4k": ((4, 2), None),
+             "q5k": ((4, 2), None)}
 
 
 def gen(fmt, kind="kstore"):
