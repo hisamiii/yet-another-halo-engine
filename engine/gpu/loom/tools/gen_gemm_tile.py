@@ -101,6 +101,21 @@ DECAHEAD = DECAHEAD_ENV == "1"
 # waves then never decode, so a phase costs max(decode, MMA), not the sum on
 # the decoding waves.
 DECW = int(os.environ.get("YAH_TG_DECW", "0"))
+# STAGGER=N (diagnostic): selected workgroups of the first grid row run N
+# workgroup barriers before starting, so co-resident workgroups drift out of
+# lockstep (short-K kres: every resident workgroup hit its residual epilogue
+# at once, 14.5% of SIMD time with no wave in its K loop). Results unchanged.
+# STG_SEL: odd (odd wg_x) or hi (wg_x >= gx/2).
+# Default 8000 barriers (~380k cycles of offset, past the ~150-200k residual
+# epilogue burst), only on grids of >= STG_MINWG workgroups (8 rounds at 2
+# per WGP): the delay is a one-time cost. Real bytes, M cycles,
+# bit-identical: IQ4_XS kres K=6144 10.27 -> 9.51, IQ3_S kres K=6144 9.71 ->
+# 9.57, IQ3_S kstore 24.14 -> 23.83, IQ4_XS swiglu 24.62 -> 24.25. ATT: time
+# with no wave in its K loop 14.5% -> 0.7% on IQ4_XS kres K=6144.
+STAGGER = int(os.environ.get("YAH_TG_STAGGER", "8000"))
+STG_MINWG = int(os.environ.get("YAH_TG_STG_MINWG", "320"))
+STG_SEL = os.environ.get("YAH_TG_STG_SEL", "pair")
+STG_NWGP = int(os.environ.get("YAH_TG_STG_NWGP", "20"))
 RHS_OUTER_ENV = os.environ.get("YAH_TG_RHSO")
 RHS_OUTER = RHS_OUTER_ENV == "1"
 # fence after every RHS_FENCE rhs groups so the loads cannot all be hoisted
@@ -467,7 +482,47 @@ def _gen(fmt, kind="kstore"):
     e(f"  %cwn = index.constant {WN} : index")
     e("  %wr = index.div %wave, %cwn : index")
     e("  %wt = index.rem %wave, %cwn : index")
-    e(f"  %wg_row = index.mul %wg_x, %c{BM} : index")
+    if STAGGER:
+        e("  %stg_row0 = index.cmp eq, %wg_y, %c0 : index")
+        if STG_SEL == "pair":
+            # the second workgroup on each WGP in the first round: linear
+            # dispatch ids [NWGP, 2*NWGP) (gfx1151: 20 WGPs; the ATT trace of
+            # the hi variant shows co-resident pairs (i, i + 20))
+            e("  %stg_gx = kernel.workgroup.count<x> : index")
+            e("  %stg_rx = kernel.workgroup.id<x> : index")
+            e("  %stg_ry = kernel.workgroup.id<y> : index")
+            e("  %stg_l0 = index.mul %stg_ry, %stg_gx : index")
+            e("  %stg_lin = index.add %stg_l0, %stg_rx : index")
+            e("  %stg_gy = kernel.workgroup.count<y> : index")
+            e("  %stg_tot = index.mul %stg_gx, %stg_gy : index")
+            e(f"  %stg_minwg = index.constant {STG_MINWG} : index")
+            e("  %stg_big = index.cmp uge, %stg_tot, %stg_minwg : index")
+            e(f"  %stg_w = index.constant {STG_NWGP} : index")
+            e(f"  %stg_w2 = index.constant {2 * STG_NWGP} : index")
+            e("  %stg_ge = index.cmp uge, %stg_lin, %stg_w : index")
+            e("  %stg_lt = index.cmp ult, %stg_lin, %stg_w2 : index")
+            e(f"  %stg_n = index.constant {STAGGER} : index")
+            e("  %stg_n1 = scf.select %stg_ge, %stg_n, %c0 : index")
+            e("  %stg_n2 = scf.select %stg_lt, %stg_n1, %c0 : index")
+            e("  %stg_iters = scf.select %stg_big, %stg_n2, %c0 : index")
+        elif STG_SEL == "hi":
+            e("  %stg_hgx = kernel.workgroup.count<x> : index")
+            e("  %stg_h2 = index.div %stg_hgx, %c2 : index")
+            e("  %stg_sel = index.cmp uge, %wg_x, %stg_h2 : index")
+        else:
+            e("  %stg_par = index.rem %wg_x, %c2 : index")
+            e("  %stg_sel = index.cmp eq, %stg_par, %c1 : index")
+        if STG_SEL != "pair":
+            e(f"  %stg_n = index.constant {STAGGER} : index")
+            e("  %stg_n1 = scf.select %stg_sel, %stg_n, %c0 : index")
+            e("  %stg_iters = scf.select %stg_row0, %stg_n1, %c0 : index")
+        # workgroup-uniform trip count: every wave of the workgroup takes it
+        e("  scf.for %stg_i = [%c0 to %stg_iters step %c1] {")
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  }")
+        e(f"  %wg_row = index.mul %wg_x, %c{BM} : index")
+    else:
+        e(f"  %wg_row = index.mul %wg_x, %c{BM} : index")
     e(f"  %ctm = index.constant {TM} : index")
     e(f"  %ctn = index.constant {TN} : index")
     e("  %wr_off = index.mul %wr, %ctm : index")

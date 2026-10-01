@@ -2533,3 +2533,39 @@ floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
   - The big rail [13]/[203] also draws ~60 W under the CPU-only load, so it
     is not GPU-only (possibly a shared IOD/fabric VDD); identity unconfirmed.
   - IQ3_S GEMM: ~99 of 118 W on [203], CPU cores 5 W, SoC side ~7 W.
+
+**Short-K residual GEMMs: lockstep epilogue bursts, workgroup stagger
+(2026-10-01).**
+
+- SOL counters: kres at K=17408 runs at 100-102% of its issue bound, at
+  K=6144 IQ4_XS 81% and IQ3_S 89%.
+- ATT (`tools/wavephase.py`) on IQ4_XS kres K=6144: the 32 waves of the traced
+  SIMD run in 8 lockstep rounds (2 workgroups per WGP start and end
+  together). 14.5% of SIMD time has no wave in its K loop. 80% of the
+  epilogue is the 32 residual `global_load` per wave stalling at issue: every
+  resident workgroup reads its 128 KB residual tile at once.
+- `YAH_TG_STAGGER=N` (default 8000; `STG_SEL=pair`): the second workgroup on
+  each WGP in the first round (linear ids [20, 40)) runs N workgroup barriers
+  before starting. That gives ~380k cycles of offset, past the ~150-200k
+  epilogue burst. It applies only on grids of >= 320 workgroups (runtime
+  check), since it is a one-time cost. Bit-identical.
+  - ATT: time with no wave in its K loop 14.5% -> 0.7%, summed epilogue
+    4.73 -> 2.91 M units.
+  - Standalone M cycles (none -> 8000): IQ4_XS kres K=6144 10.27 -> 9.51,
+    IQ3_S kres K=6144 9.71 -> 9.57, IQ3_S kstore 24.14 -> 23.83, IQ4_XS
+    swiglu 24.62 -> 24.25, IQ3_S kres K=17408 neutral.
+- Production-set pitfall: `tools/try.sh` (and `rollout.sh`) compiles one
+  generated kernel for every shape of a format/kind, ignoring the emitter's
+  per-shape choices.
+  - p50-p56 therefore ran IQ4_XS kres K=6144 with decode-ahead, which
+    `DECAHEAD_SKIP` excludes (12.79 vs 10.88 M cycles).
+  - The 48-row `kstore_*_3_20` kernels also differ from the emitter's.
+  - A full re-emit with the stagger off reproduces p56 on all other 77 HALs.
+  - Production sets are now built by a full `emit_prefill_pp.py` emit.
+- p57 = full emit (stagger on): md5 a2145e371ceefd4d. pp2048 3153.9 ->
+  3142.7 ms (one round each).
+  - Cycles (counters, one capture each): total 7505 -> 7366 M (-1.84%),
+    GEMMs -1.94%.
+  - IQ4_XS kres K=6144 -21% (decode-ahead fix + stagger), Q4_K kres K=6144
+    -6.2%, swiglus -1.7..-3.5%.
+- p57-8192 emitted with the same generator.
