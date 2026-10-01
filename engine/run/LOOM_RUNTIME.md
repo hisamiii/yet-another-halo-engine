@@ -2417,3 +2417,42 @@ floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
   - Attention at 46%.
 - Non-WMMA: DeltaNet 226 M (3.0%), half_norm 99, ssm_conv 85,
   ssm_postnorm 64, unpack_qg 31.
+
+**What limits the GPU clock (2026-10-01).** Measured with
+`research/clockprobe.hip` (5 s of one instruction mix) and `research/clocklog.py`
+(gpu_metrics v3 + hwmon at 20 ms), 30 s gaps. Steady state:
+
+| load | clock MHz | SMU cap | Tgfx C | socket W | throttle |
+|---|---:|---:|---:|---:|---|
+| WMMA only | 2622 | 2640 | 94.8 | 113 | thm_gfx |
+| VALU FMA only | 2067 | 2092 | 94.8 | 101 | thm_gfx |
+| LDS only | 2634 | 2665 | 94.8 | 98 | thm_gfx |
+| memory stream | 2841 | 2900 | 67.1 | 62 | none |
+| IQ3_S GEMM (ours) | 2276 | 2330 | 94.8 | 111 | thm_gfx |
+
+- The limiter is the SMU's GFX thermal controller holding Tgfx at ~95 C.
+  - Tgfx is a fast local junction sensor: 47 -> 87 C within ~30 ms of load,
+    97 C by ~90 ms. `current_gfx_maxfreq` (the enforced ceiling) drops exactly
+    then; thm_gfx residency counts ~1000/s (once per metrics update).
+  - The cap never drops before the temperature does, so a current limit
+    (EDC/TDC: present in firmware, not exported) is not the sustained limiter.
+  - Fast PPT acts only in the first ~160 ms (the 2.9 -> 2.66 step).
+  - STAPM/SPL, slow PPT and PROCHOT stay at 0.
+- The sustained clock is set by heat per cycle. VALU FMA is the hottest
+  (2.07 GHz), WMMA 2.62, our GEMM (WMMA + decode VALU + LDS) 2.28. Fewer
+  instructions per WMMA raise the clock as well as cutting cycles.
+- Not a sampling artifact: `time_filter_alphavalue` = 1 s smooths every
+  `average_*` field, but the cycle-based clock (SQ_BUSY_CYCLES / device ticks)
+  and the cap agree. hwmon vddgfx is hard-coded 0; `pp_power_profile_mode`
+  and `power1_cap` are not implemented for SMU 14.0.x; amd-smi throttle fields
+  are N/A.
+- Cooling helps only through the base temperature. Our runs rise ~45-50 C
+  locally on top of a 41-49 C base. Pre-run Tgfx vs ceiling correlates
+  r = -0.54 (40 C -> 2478 MHz, 49.5 C -> 2322 MHz). A custom fan curve reportedly
+  holds 78 C / 2820 MHz on Strix Halo (nathanmarlor/strix-halo-fan-control),
+  likely on lighter loads.
+- Levers not tried (system changes, the user's call):
+  - fan curve
+  - `ryzenadj --tctl-temp`: needs root plus `ryzen_smu` (DKMS built only for
+    6.18) or `iomem=relaxed`
+  - GFX undervolt: `--set-cogfx` reportedly does not work on Strix Halo
