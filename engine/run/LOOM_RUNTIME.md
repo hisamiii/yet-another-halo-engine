@@ -2291,3 +2291,20 @@ real bytes, M cycles, one round each, bit-identical:
   - HIP's first round in that sequence read 16686 ms. No GPU messages in
     dmesg; it did not reproduce (3463, then 3436 with `YAH_WEIGHTS_COPY`).
     Cause unverified; possibly outside GPU use.
+
+**pp8192 with the p53 kernels (2026-10-01).** Re-emitted at B=8192 with the
+current generator (`/home/q/yah-hal-p53-8192`); hidden md5 e94924b79ae21e57,
+equal to clean8192c's.
+
+- Untraced ms, one round each, 15 s gaps, in order: clean8192c 14877.0,
+  p53-8192 16246.6, HIP 16532.0. Under HRX counters: p53-8192 15378.7, then
+  clean8192c 15677.7. The ms ordering follows run order, not set.
+- Cycles (SQ_BUSY_CYCLES summed per kernel, both sets under counters):
+  32704.5 -> 30621.9 M (-6.37%).
+  - IQ3_S rows -9 to -29%.
+  - IQ3_XXS kstore/kres, IQ4_XS and Q3_K rows -4 to -12% (the p50/p52 4 x 2
+    layouts, also new to the 8192 set).
+  - Attention, DeltaNet and Q4_K unchanged (±0.3%).
+- Why ms lies at 8192: a run is ~15 s at full load, so a 15 s gap does not
+  return the GPU to the same thermal state. The second run of a pair starts
+  hotter (the GPU is hotspot-thermal-limited, see above).
