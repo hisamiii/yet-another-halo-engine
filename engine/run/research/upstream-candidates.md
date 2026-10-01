@@ -1,0 +1,179 @@
+# Loom / HRX patches worth proposing upstream
+
+Every item comes from a limitation we hit while tuning the prefill and either
+worked around or left on the table. Production stays on stock HRX/Loom: these
+are candidates to propose upstream (never pushed without the user's OK). Local
+prototypes are diagnosis only, like the `HRX_PROFILE_MODE=counters` patch.
+
+Ranked by expected value for this engine.
+
+## 1. HRX: per-dispatch "no trailing ordering barrier" flag (concurrency)
+
+**Limitation.** Kernels never overlap.
+- `hrx_stream_dispatch` records an execution barrier after every dispatch
+  (`libhrx/src/libhrx/stream.c`, `hrx_stream_record_ordering_barrier`).
+- In the AMDGPU AQL command buffer, a dispatch packet gets the barrier bit
+  exactly when an execution barrier is pending
+  (`runtime/.../amdgpu/aql_program_builder.c:556-563`).
+- The driver also provisions a single hardware queue per GPU
+  (`IREE_HAL_AMDGPU_DEFAULT_GPU_AGENT_QUEUE_COUNT = 1`), and `hrx_queue_dispatch`
+  sets the barrier bit on every packet (`host_queue_dispatch.c:879-888`).
+
+**Patch.** A flag such as `HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER` on
+`hrx_stream_dispatch` that skips the trailing ordering barrier. The next
+dispatch's packet is then emitted without the barrier bit and may start while
+this one runs. The caller keeps ordering with explicit
+`hrx_stream_execution_barrier`. It is small and opt-in; nothing changes for
+existing callers.
+
+**Use here.**
+- SSM block: dispatch DeltaNet flagged, then the z-projection GEMM (6144 rows,
+  ~9 M cycles, WMMA-bound) behind it with no barrier, then `postnorm`
+  (barrier). DeltaNet (~4.2 M cycles, VALU-bound) and the z GEMM use
+  different units. Up to ~4 M cycles per SSM layer if fully overlapped: ~2.6%
+  of the pp2048 prefill, realistically about half.
+- Also: the two 48-row alpha/beta projections (~0.8 M cycles per layer,
+  latency-bound) beside a big GEMM, attention k/v projections beside the q
+  projection, and every kernel's fill/drain tail.
+- A barrier-bit packet waits for all earlier packets, so overlap pairs must
+  be arranged by dispatch order. Real cross-dependencies would need
+  barrier-AND packets or multiple hardware queues (item 1b).
+
+**1b (bigger).** Provision 2+ hardware queues and let streams pick one, with
+cross-stream ordering through `hrx_stream_wait_event` (semaphores). This gives
+general dependency graphs, but it is a larger runtime change.
+
+**Next step.** Local prototype of the flag; measure the SSM reordering on
+pp2048 cycles.
+
+## 2. Loom: loop-invariant code motion after view linearization
+
+**Limitation.** Address math recomputed inside K loops.
+- Attention: hoisting the loop-invariant address math would bring VALU to
+  HIP's count (1.126 vs 1.119 G, LOOM_RUNTIME "Attention ... bit-identical").
+- GEMMs: the worktree LICM build (`/home/q/hrx-wt`, `LOOM_EXP_LICM=1`, p47)
+  gave IQ4_XS kstore 23.66 M cycles and pp2048 IQ4_XS rows -2%. It was
+  withdrawn because it was not a stock compiler.
+- LSE carries the same idea as a two-line pipeline patch
+  (`mac-amdgpu/patches/hrx/loop-invariant-motion.patch`: run the existing
+  `licm` pass after `linearize-view-accesses` in
+  `loom/src/loom/target/pipeline.c`).
+
+**Patch.** That pass-order change, with the register-pressure guard the p47
+experiment needed (hoisted values stay live across the loop; attention spilled
+when hoisting was unbounded).
+
+**Value.** About 1-2% on GEMMs, and the main known lever for long-context
+attention.
+
+## 3. HRX: `hrx_stream_query` correctness + a non-spinning wait
+
+**Bug.** `hrx_stream_query` reports complete when `stream->timepoint == 0`,
+even with recorded-but-unflushed work (`stream.c` ~205-214; dispatches stay in
+`pending_cb` and do not advance the timepoint). We hit it when a sleep-poll of
+`hrx_stream_query` returned at once.
+
+**Limitation.** `hrx_stream_synchronize` -> semaphore wait busy-polls the KFD
+(~400-460k `AMDKFD_IOC_WAIT_EVENTS` per prefill, one host core at 104%). We
+work around it with an event-tail sleep-poll in `LoomDevice::SetSleepSync`.
+
+**Patch.**
+- Query honours `has_pending_work` (flush first, or report incomplete).
+- Add a blocking or interrupt-driven wait mode (or a sleep-poll option) for
+  long waits.
+
+**Value.** Correctness; ~8 W less host power during long waits. The GPU clock
+was not power-limited, so no speed change.
+
+## 4. Loom: back-edge copy coalescing for loop-carried values
+
+**Limitation.**
+- Q4_K's K loop copies its carried prefetch every phase (24 `v_mov` per phase
+  at 4 x 4).
+- Attention has 33 latch copies per tile (accumulators not coalesced across
+  the back edge).
+- `allocation/edge_alias.c` / `loop_edge_relocation.c` refuse the relocation
+  in these cases.
+
+**Patch.** Allow coalescing of yielded values into their block-argument
+registers when the live ranges permit (or a cheaper parallel-copy plan).
+
+**Value.** Mostly attention; small on GEMMs now that Q4_K runs 4 x 2.
+
+## 5. Loom: low-window-aware allocation / selection
+
+**Limitation.** `v_cvt_f16_f32` results may only use v0..v127
+(`descriptors/alu.py` operand window, applied in
+`allocation/target_constraints.c` `apply_operand_window`). With 128 VGPRs of
+accumulators live, the linear scan fills the low window first, then evicts
+accumulators to scratch for every conversion result. Q4_K at 4 x 2 ran 3x
+slower until worked around.
+
+**Workaround in use.** `fptrunc(fma(x, opaque_one, y))` selects `v_fma_mix`
+(any VGPR). The 1.0 must be opaque because the canonicalizer folds
+`fma(x, 1, y)` back to `addf` (`ops/scalar/canonicalize.c` ~1322-1350).
+
+**Patch (any one).**
+- Allocate wide long-lived tuples (accumulators) from the high window when
+  low-window-constrained results exist in the loop.
+- Select `v_fma_mix*` for `fptrunc` when the low window is under pressure.
+- Do not fold `fma(x, 1, y)` when its operands come from a mixed-precision
+  narrowing.
+
+**Value.** Robustness; removes a hack and a trap for every future kernel with
+128 accumulator VGPRs.
+
+## 6. Loom: two-address FMA (`v_fmac`) formation
+
+**Limitation.** `scalar.fmaf` always lowers to three-operand `v_fma_f32`, which
+VOPD cannot pair. Only `vector.dotf` / `vector.reduce` lowerings emit
+`v_fmac`.
+- DeltaNet's 672 FMAs per 8 tokens could not dual-issue in wave32; forcing
+  pairs through `dotf` hurt latency.
+- We took the gain with wave64 instead (-16.5%).
+
+**Patch.** Convert `v_fma_f32` to `v_fmac_f32` when the addend dies (as LLVM's
+two-address pass does), and let the VOPD planner pair with a latency-aware cost.
+
+**Value.** Small for us now (DeltaNet is wave64); general for wave32 VALU code.
+
+## 7. Loom: scheduler register-pressure awareness for fragment loads
+
+**Limitation.** The scheduler hoists fragment loads early.
+- Attention held 5 of 8 K fragments live at the VGPR peak.
+- Q4_K's KSL step held all 10 fragments of a step.
+- We place `scf.schedule.fence` by hand (QKFENCE, KSL fence, RHSO/RHSF).
+
+**Patch.** A pressure-aware limit on how far loads hoist ahead of their
+consumers.
+
+**Value.** Removes hand-placed fences; small direct speedup.
+
+## 8. HRX profiling: counters mode + gfx1151 counter map
+
+**Limitations.**
+- `HRX_PROFILE_MODE=counters` exists only as our local patch to
+  `libhrx/src/libhrx/runtime.c`.
+- `TCC_EA0_*` (DRAM traffic) are not mapped for gfx11.5.1
+  (`profile_counters.c:752 UNIMPLEMENTED`).
+
+**Patch.** Upstream the counters mode; map the TCC_EA counters for gfx1151.
+
+**Value.** Tooling. Measured bytes for memory-bound kernels instead of
+computed ones.
+
+## 9. Loom: small missing ops / friction
+
+- **A sleep op (`s_sleep`).** The workgroup stagger uses a loop of 8000
+  workgroup barriers as a delay.
+- **A shader cycle-counter read (`s_memtime` / `s_getreg SHADER_CYCLES`).** For
+  in-kernel phase instrumentation; we use ATT traces instead.
+- **`scalar.select`** (only `scf.select` on index today).
+- **Bound proofs through div/rem index remaps.** The kqg epilogue needed a
+  redundant `index.min` clamp to pass SUBRANGE/010.
+
+## Not candidates (measured, no gain)
+
+- Wave64 tile GEMMs: wave64 VALU/LDS instructions cost ~1.7x.
+- More residency via smaller K steps.
+- Decode-free f16 GEMMs.
