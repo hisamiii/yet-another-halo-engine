@@ -353,9 +353,11 @@ def main():
         os.makedirs(tmp, exist_ok=True)
         attn_src = os.path.join(tmp, "yah_attn_hip.loom")
         with open(attn_src, "w") as fh:
-            # YAH_ATTN_FA=1: tools/gen_attn_fa.py (register softmax, not HIP's
-            # arithmetic order: T1 gate), same grid, bindings and f16 output
-            if os.environ.get("YAH_ATTN_FA", "0") == "1":
+            # tools/gen_attn_fa.py by default (register softmax, not HIP's
+            # arithmetic order; accepted 2026-10-01 on kl_p999 / flips / PPL,
+            # see gate/README.md), same grid, bindings and f16 output.
+            # YAH_ATTN_FA=0: the HIP-order kernel (bit-identical to HIP).
+            if os.environ.get("YAH_ATTN_FA", "1") == "1":
                 import gen_attn_fa
                 fh.write(gen_attn_fa.gen())
             else:
