@@ -18,7 +18,9 @@ import subprocess
 import sys
 import tempfile
 
-H = "/home/q/hrx"
+# YAH_LOOM_HOME selects the HRX/Loom tree whose build compiles the HALs (default
+# /home/q/hrx); an experimental compiler worktree is used by pointing it there.
+H = os.environ.get("YAH_LOOM_HOME", "/home/q/hrx")
 TR = "/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0"
 R = "/home/q/rocm10/x_runtime/opt/rocm/core-10.0/lib"
 LLVM_LIB = "/home/q/rocm10/x_llvm/opt/rocm/core-10.0/lib/llvm/lib"

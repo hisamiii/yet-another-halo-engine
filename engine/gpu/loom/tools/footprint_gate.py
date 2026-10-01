@@ -30,7 +30,9 @@ bound = {"weight": M * kb * bpb, "input": B * K * 2, "resid": B * M * 4, "gate":
          "grid": {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(fmt, 0),
          "ksigns": 128,
          "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4}
-H = "/home/q/hrx"
+# YAH_LOOM_HOME selects the HRX/Loom tree whose build compiles the HALs (default
+# /home/q/hrx); an experimental compiler worktree is used by pointing it there.
+H = os.environ.get("YAH_LOOM_HOME", "/home/q/hrx")
 e = dict(os.environ)
 e["IREE_HAL_AMDGPU_LIBHSA_PATH"] = "/home/q/rocm10/x_runtime/opt/rocm/core-10.0/lib"
 e["LD_LIBRARY_PATH"] = ":".join(["/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0/lib",

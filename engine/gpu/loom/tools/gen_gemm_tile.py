@@ -783,7 +783,8 @@ def gen(fmt, kind="kstore"):
             for st in range(nst):
                 if st + 1 < nst:
                     pf_loads(st + 1)
-                    e("      scf.schedule.fence")
+                    if os.environ.get("YAH_TG_PF_FENCE", "1") == "1":
+                        e("      scf.schedule.fence")
                 for i in range(FM):
                     for j in range(FN):
                         n = i * FN + j
