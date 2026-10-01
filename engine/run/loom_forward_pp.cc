@@ -38,12 +38,16 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <string>
 #include <utility>
 #include <vector>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "core/config.hpp"
 #include "core/gguf.hpp"
@@ -340,6 +344,20 @@ int main(int argc, char** argv) {
       ids_all.swap(grown);
     }
     LoadDispatch(dir);
+    // Chunked prefill (emit_prefill_pp.py YAH_CTX=T): dispatch.txt row "ctx"
+    // records the chunk size (tokens column) and the context T (tt column). The
+    // command-line token count is T; every kernel runs at the chunk size, the
+    // KV cache holds T, and the T / chunk passes carry the DeltaNet and conv state.
+    std::uint32_t T_ctx = g_b;
+    if (const auto it = g_geom.find("ctx"); it != g_geom.end()) {
+      T_ctx = it->second.tt;
+      if (g_b != T_ctx) {
+        std::fprintf(stderr, "chunked set: tokens=%u must equal the emitted context %u\n", g_b, T_ctx);
+        return 2;
+      }
+      g_b = it->second.tokens;
+    }
+    const std::uint32_t n_chunks = T_ctx / g_b;
     if (g_b % g_gtile) {
       std::fprintf(stderr, "tokens=%u must be a multiple of the token tile=%u\n", g_b, g_gtile);
       return 2;
@@ -421,7 +439,7 @@ int main(int argc, char** argv) {
     // equal to the K extent of the GEMM that reads it (k_blocks*256). The KV
     // cache is one slot per prompt token; the per-layer state buffers keep the
     // 5-token layout because they are indexed by the layer, not by the prompt.
-    const std::size_t kKvCache = static_cast<std::size_t>(B) * kKvRow;
+    const std::size_t kKvCache = static_cast<std::size_t>(T_ctx) * kKvRow;
     LoomBuffer hidden = gpu.Allocate(static_cast<std::size_t>(B) * kHidden * 4);
     LoomBuffer reszero = gpu.Allocate(static_cast<std::size_t>(B) * kHidden * 4);
     LoomBuffer sumout = gpu.Allocate(static_cast<std::size_t>(B) * kHidden * 4);
@@ -517,11 +535,15 @@ int main(int argc, char** argv) {
     const auto* emb = find("token_embd.weight");
     std::vector<float> host_hidden(static_cast<std::size_t>(B) * kHidden);
     const std::uint8_t* emb_data = gguf.Data(*emb);
-    for (std::uint32_t t = 0; t < B; ++t) {
-      if (static_cast<std::uint32_t>(emb->type) == 23) DequantIq4XsRow(emb_data, ids_all[t], host_hidden.data() + std::size_t{t} * kHidden);
-      else DequantQ4KRow(emb_data, ids_all[t], host_hidden.data() + std::size_t{t} * kHidden);
-    }
-    gpu.H2D(hidden, host_hidden.data(), host_hidden.size() * 4);
+    const auto embed = [&](std::uint32_t chunk, LoomBuffer& dst) {
+      for (std::uint32_t t = 0; t < B; ++t) {
+        const std::uint32_t id = ids_all[std::size_t{chunk} * B + t];
+        if (static_cast<std::uint32_t>(emb->type) == 23) DequantIq4XsRow(emb_data, id, host_hidden.data() + std::size_t{t} * kHidden);
+        else DequantQ4KRow(emb_data, id, host_hidden.data() + std::size_t{t} * kHidden);
+      }
+      gpu.H2D(dst, host_hidden.data(), host_hidden.size() * 4);
+    };
+    embed(0, hidden);
 
     LoomExecutable& e_norm = load(dir + "/norm.hal");
     LoomExecutable& e_conv = load(dir + "/conv.hal");
@@ -539,12 +561,16 @@ int main(int argc, char** argv) {
     LoomExecutable& e_rowsplit = load(dir + "/rowsplit.hal");
     LoomExecutable& e_postnorm = load(dir + "/postnorm.hal");
     LoomExecutable& e_unpack = load(dir + "/unpack.hal");
-    LoomExecutable& e_rope = load(dir + "/rope.hal");
-    LoomExecutable& e_wmma = load(dir + "/wmma.hal");
+    std::vector<LoomExecutable*> e_ropes, e_wmmas;
+    for (std::uint32_t c = 0; c < n_chunks; ++c) {
+      e_ropes.push_back(&load(dir + (c ? "/rope_c" + std::to_string(c) + ".hal" : std::string("/rope.hal"))));
+      e_wmmas.push_back(&load(dir + (c ? "/wmma_c" + std::to_string(c) + ".hal" : std::string("/wmma.hal"))));
+    }
+    LoomExecutable* e_convstate = n_chunks > 1 ? &load(dir + "/convstate.hal") : nullptr;
     // tools/gen_attn_hip.py: a vtrans.hal row means the attention reads V as
     // [kv head][16-key tile][dim][16] f16, written per layer by yah_transpose_v16.
     LoomExecutable* e_vtrans = g_geom.count("vtrans.hal") ? &load(dir + "/vtrans.hal") : nullptr;
-    const std::size_t kVtBytes = std::size_t{(B + 15) / 16 * 16} * kKvRow * 2;
+    const std::size_t kVtBytes = std::size_t{(T_ctx + 15) / 16 * 16} * kKvRow * 2;
     LoomBuffer vt16 = gpu.Allocate(e_vtrans ? kVtBytes : 4);
     // int8 K cache (tools/gen_kvq.py; "attn_kq8" row): per attention layer
     // int8 K [B][1024], scales [B][8] f32, and the per-layer channel mean
@@ -831,6 +857,118 @@ int main(int argc, char** argv) {
     // k-split GEMM was localised.
     const char* lv = std::getenv("YAH_LAYERS");
     const std::uint32_t n_layers = lv ? std::min<std::uint32_t>(std::atoi(lv), cfg.main_block_count()) : cfg.main_block_count();
+    // YAH_LOGITS_FROM=P: f32 logits of every absolute position P..T-1 into
+    // <prefix>.all_logits ((T-P) x vocab, row-major) for the correctness gate
+    // (engine/run/accgate2.py), gathered after each chunk's layers.
+    std::uint32_t logits_from = T_ctx;
+    if (const char* lf = std::getenv("YAH_LOGITS_FROM")) {
+      logits_from = static_cast<std::uint32_t>(std::atoi(lf));
+      if (logits_from >= T_ctx) throw LoomError("YAH_LOGITS_FROM must be below the token count");
+    }
+    const auto* head_onw = find("output_norm.weight");
+    const auto* head_ow = find("output.weight");
+    LoomBuffer every = gpu.Allocate(std::size_t{T_ctx - logits_from + (logits_from == T_ctx)} * kVocab * 4);
+    // YAH_ROWSTATS=<file>: compact per-position statistics for the quality gate
+    // (engine/run/kvq/gate2.py) instead of full logit rows. Positions: those
+    // >= YAH_ROWSTATS_FROM (default 1024) that are multiples of
+    // YAH_ROWSTATS_STRIDE (default 8), or the list in YAH_ROWSTATS_POS (one
+    // position per line). Record per position (little endian): int32 pos,
+    // int32 next-token id (-1 at the end), f32 logsumexp, f32 logit of the next
+    // token, int32 argmax, f32 top1, f32 top2, then 64 x (int32 id, f32 logit),
+    // highest first.
+    std::FILE* rowstats = nullptr;
+    std::vector<char> rs_want(T_ctx, 0);
+    if (const char* rf = std::getenv("YAH_ROWSTATS")) {
+      rowstats = std::fopen(rf, "wb");
+      if (const char* pf = std::getenv("YAH_ROWSTATS_POS")) {
+        std::ifstream pfs(pf);
+        std::uint32_t pp;
+        while (pfs >> pp) if (pp < T_ctx) rs_want[pp] = 1;
+      } else {
+        const std::uint32_t rs_from = std::getenv("YAH_ROWSTATS_FROM") ? std::atoi(std::getenv("YAH_ROWSTATS_FROM")) : 1024;
+        const std::uint32_t rs_stride = std::getenv("YAH_ROWSTATS_STRIDE") ? std::atoi(std::getenv("YAH_ROWSTATS_STRIDE")) : 8;
+        for (std::uint32_t pp = rs_from; pp < T_ctx; pp += rs_stride) rs_want[pp] = 1;
+      }
+    }
+    std::uint32_t rs_max = 0;
+    for (std::uint32_t c = 0; c < n_chunks; ++c) {
+      std::uint32_t n = 0;
+      for (std::uint32_t r = 0; r < B; ++r) n += rs_want[std::size_t{c} * B + r];
+      rs_max = std::max(rs_max, n);
+    }
+    LoomBuffer rsbuf = gpu.Allocate(std::size_t{std::max<std::uint32_t>(rs_max, 1)} * kVocab * 4);
+    // YAH_KV_HOOK="<cmd>": a persistent child (sh -c cmd) that sees every
+    // chunk's freshly written f16 K and V rows of every attention layer and
+    // returns them (e.g. quantized-dequantized by a KV codec under study,
+    // engine/run/kvq/kvcodec.py). Protocol per (layer, chunk), little endian:
+    //   -> int32 magic 0x4b56484b, attn layer, chunk, first row, rows, cols (1024),
+    //      q_rows, then K rows x cols f16, V rows x cols f16, then q_rows x
+    //      (int32 abs position + 6144 f32 roped Q) (YAH_KV_HOOK_QSTRIDE=n sends
+    //      the rows whose position is a multiple of n; 0 = none)
+    //   <- K rows x cols f16, V rows x cols f16 (written back into the cache)
+    // A final header with rows = 0 tells the child to finish.
+    FILE* hook_in = nullptr;
+    FILE* hook_out = nullptr;
+    pid_t hook_pid = -1;
+    const std::uint32_t hook_qstride =
+        std::getenv("YAH_KV_HOOK_QSTRIDE") ? std::atoi(std::getenv("YAH_KV_HOOK_QSTRIDE")) : 0;
+    if (const char* hc = std::getenv("YAH_KV_HOOK")) {
+      int to_child[2], from_child[2];
+      if (pipe(to_child) || pipe(from_child)) throw LoomError("YAH_KV_HOOK: pipe failed");
+      hook_pid = fork();
+      if (hook_pid == 0) {
+        dup2(to_child[0], 0);
+        dup2(from_child[1], 1);
+        close(to_child[1]);
+        close(from_child[0]);
+        execl("/bin/sh", "sh", "-c", hc, static_cast<char*>(nullptr));
+        _exit(127);
+      }
+      close(to_child[0]);
+      close(from_child[1]);
+      hook_in = fdopen(to_child[1], "wb");
+      hook_out = fdopen(from_child[0], "rb");
+    }
+    const auto kv_hook = [&](std::uint32_t ai, std::uint32_t ci, std::size_t koff, std::size_t voff) {
+      if (!hook_in) return;
+      gpu.Synchronize();
+      const std::size_t first = std::size_t{ci} * B, cols = kKvRow;
+      const std::size_t bytes = std::size_t{B} * cols * 2;
+      std::vector<std::uint8_t> kk(bytes), vv(bytes);
+      gpu.D2H(kv16, kk.data(), bytes, koff + first * cols * 2);
+      gpu.D2H(kv16, vv.data(), bytes, voff + first * cols * 2);
+      std::vector<std::uint32_t> qpos;
+      if (hook_qstride)
+        for (std::uint32_t r = 0; r < B; ++r)
+          if ((first + r) % hook_qstride == 0) qpos.push_back(r);
+      const std::int32_t hdr[7] = {0x4b56484b, static_cast<std::int32_t>(ai), static_cast<std::int32_t>(ci),
+                                   static_cast<std::int32_t>(first), static_cast<std::int32_t>(B),
+                                   static_cast<std::int32_t>(cols), static_cast<std::int32_t>(qpos.size())};
+      std::fwrite(hdr, 4, 7, hook_in);
+      std::fwrite(kk.data(), 1, bytes, hook_in);
+      std::fwrite(vv.data(), 1, bytes, hook_in);
+      if (!qpos.empty()) {
+        std::vector<float> qrow(kAttn);
+        for (std::uint32_t r : qpos) {
+          gpu.D2H(q, qrow.data(), std::size_t{kAttn} * 4, std::size_t{r} * kAttn * 4);
+          const std::int32_t ap = static_cast<std::int32_t>(first + r);
+          std::fwrite(&ap, 4, 1, hook_in);
+          std::fwrite(qrow.data(), 4, kAttn, hook_in);
+        }
+      }
+      std::fflush(hook_in);
+      if (std::fread(kk.data(), 1, bytes, hook_out) != bytes || std::fread(vv.data(), 1, bytes, hook_out) != bytes)
+        throw LoomError("YAH_KV_HOOK: short reply from the hook process");
+      gpu.H2D(kv16, kk.data(), bytes, koff + first * cols * 2);
+      gpu.H2D(kv16, vv.data(), bytes, voff + first * cols * 2);
+    };
+    for (std::uint32_t ci = 0; ci < n_chunks; ++ci) {
+    if (ci) {
+      gpu.Synchronize();   // host_hidden is reused by the next embed
+      embed(ci, hidden);
+    }
+    LoomExecutable& e_rope = *e_ropes[ci];
+    LoomExecutable& e_wmma = *e_wmmas[ci];
     for (std::uint32_t l = 0; l < n_layers; ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       g_layer_now = static_cast<int>(l);
@@ -869,6 +1007,7 @@ int main(int argc, char** argv) {
               {eps.handle, 0, 4}};
           Dispatch(gpu, e_rope, "yah_fused_qk_rope_batched", 28, B, 1, 256, 1, 1, b);
         }
+        kv_hook(ai, ci, koff, voff);
         // w_qn/w_kn are views into the import; nothing to keep alive.
         if (g_dump_layer == static_cast<int>(l)) {
           // the attention kernel's inputs: roped q, gate, this layer's f16 K and V
@@ -907,7 +1046,7 @@ int main(int argc, char** argv) {
         } else if (e_vtrans) {
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, voff, kKvCache * 2}, {vt16.handle, 0, kVtBytes}};
-          Dispatch(gpu, *e_vtrans, "yah_transpose_v16", 32, (B + 31) / 32, 1, 256, 1, 1, b);
+          Dispatch(gpu, *e_vtrans, "yah_transpose_v16", 32, (T_ctx + 31) / 32, 1, 256, 1, 1, b);
         }
         {
           std::vector<hrx_buffer_ref_t> b = {
@@ -998,6 +1137,11 @@ int main(int argc, char** argv) {
             Dispatch(gpu, e_conv, "yah_ssm_conv", 40, B, 1, 256, 1, 1, b);
           }
         }
+        if (e_convstate) {   // the next chunk's conv reads this chunk's last 3 inputs
+          std::vector<hrx_buffer_ref_t> b = {
+              {qkv.handle, 0, hb(qkv)}, {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4}};
+          Dispatch(gpu, *e_convstate, "yah_conv_state", (kQkv + 255) / 256, 1, 1, 256, 1, 1, b);
+        }
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(conv_out, static_cast<std::size_t>(B) * kQkv * 4, ".conv");
         // w_conv is a view into the import; nothing to keep alive.
@@ -1080,7 +1224,82 @@ int main(int argc, char** argv) {
       if (g_dump_layer == static_cast<int>(l))
         dump_buf(hidden, static_cast<std::size_t>(B) * kHidden * 4, ".ffn");
     }
+    if (!skip_head && logits_from < T_ctx && std::size_t{ci + 1} * B > logits_from) {
+      const Imported wnorm = ImportTensor(*head_onw);
+      const Imported w = ImportTensor(*head_ow);
+      const std::uint32_t lo = std::max<std::uint32_t>(logits_from, ci * B);
+      for (std::uint32_t ra = lo; ra < (ci + 1) * B; ++ra) {
+        const std::uint32_t r = ra - ci * B;
+        {
+          std::vector<hrx_buffer_ref_t> b = {
+              {hidden.handle, std::size_t{r} * kHidden * 4, std::size_t{kHidden} * 4},
+              {wnorm.handle, wnorm.offset, wnorm.bytes}, {normed.handle, 0, hb(normed)}};
+          Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
+        }
+        std::vector<hrx_buffer_ref_t> b = {
+            {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
+            {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4}};
+        Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
+      }
+    }
+    if (rowstats && !skip_head) {
+      std::vector<std::uint32_t> rows;
+      for (std::uint32_t r = 0; r < B; ++r)
+        if (rs_want[std::size_t{ci} * B + r]) rows.push_back(r);
+      if (!rows.empty()) {
+        const Imported wnorm = ImportTensor(*head_onw);
+        const Imported w = ImportTensor(*head_ow);
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+          {
+            std::vector<hrx_buffer_ref_t> b = {
+                {hidden.handle, std::size_t{rows[i]} * kHidden * 4, std::size_t{kHidden} * 4},
+                {wnorm.handle, wnorm.offset, wnorm.bytes}, {normed.handle, 0, hb(normed)}};
+            Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
+          }
+          std::vector<hrx_buffer_ref_t> b = {
+              {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
+              {rsbuf.handle, i * kVocab * 4, std::size_t{kVocab} * 4}};
+          Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
+        }
+        gpu.Synchronize();
+        std::vector<float> host(rows.size() * kVocab);
+        gpu.D2H(rsbuf, host.data(), host.size() * 4, 0);
+        std::vector<std::uint32_t> idx(kVocab);
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+          const float* lg = host.data() + i * kVocab;
+          const std::uint32_t pos = ci * B + rows[i];
+          const std::int32_t nxt = pos + 1 < T_ctx ? static_cast<std::int32_t>(ids_all[pos + 1]) : -1;
+          double mx = lg[0];
+          for (std::uint32_t v = 1; v < kVocab; ++v) mx = std::max<double>(mx, lg[v]);
+          double se = 0.0;
+          for (std::uint32_t v = 0; v < kVocab; ++v) se += std::exp(static_cast<double>(lg[v]) - mx);
+          const float lse = static_cast<float>(mx + std::log(se));
+          for (std::uint32_t v = 0; v < kVocab; ++v) idx[v] = v;
+          std::partial_sort(idx.begin(), idx.begin() + 64, idx.end(),
+                            [&](std::uint32_t a, std::uint32_t b2) { return lg[a] > lg[b2] || (lg[a] == lg[b2] && a < b2); });
+          const std::int32_t ipos = static_cast<std::int32_t>(pos), am = static_cast<std::int32_t>(idx[0]);
+          const float lt = nxt >= 0 ? lg[nxt] : 0.0f, t1 = lg[idx[0]], t2 = lg[idx[1]];
+          std::fwrite(&ipos, 4, 1, rowstats); std::fwrite(&nxt, 4, 1, rowstats);
+          std::fwrite(&lse, 4, 1, rowstats); std::fwrite(&lt, 4, 1, rowstats);
+          std::fwrite(&am, 4, 1, rowstats); std::fwrite(&t1, 4, 1, rowstats); std::fwrite(&t2, 4, 1, rowstats);
+          for (int k = 0; k < 64; ++k) {
+            const std::int32_t id = static_cast<std::int32_t>(idx[k]);
+            std::fwrite(&id, 4, 1, rowstats); std::fwrite(&lg[idx[k]], 4, 1, rowstats);
+          }
+        }
+      }
+    }
+    }   // chunks
     gpu.Synchronize();
+    if (rowstats) std::fclose(rowstats);
+    if (hook_in) {
+      const std::int32_t fin[7] = {0x4b56484b, -1, -1, 0, 0, 0, 0};
+      std::fwrite(fin, 4, 7, hook_in);
+      std::fclose(hook_in);
+      std::fclose(hook_out);
+      int status = 0;
+      waitpid(hook_pid, &status, 0);
+    }
     const double layer_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
@@ -1129,31 +1348,15 @@ int main(int argc, char** argv) {
       // <prefix>.all_logits ((B-P) x vocab, row-major) for the tiered
       // correctness gate (engine/run/accgate2.py). The same head kernels as the
       // last-token path, one row at a time into one device buffer.
-      if (const char* lf = std::getenv("YAH_LOGITS_FROM")) {
-        const std::uint32_t from = static_cast<std::uint32_t>(std::atoi(lf));
-        if (from >= B) throw LoomError("YAH_LOGITS_FROM must be below the token count");
-        const std::size_t rows = B - from;
-        LoomBuffer every = gpu.Allocate(rows * kVocab * 4);
-        const Imported w = ImportTensor(*ow);
-        for (std::uint32_t r = from; r < B; ++r) {
-          {
-            std::vector<hrx_buffer_ref_t> b = {
-                {hidden.handle, std::size_t{r} * kHidden * 4, std::size_t{kHidden} * 4},
-                {wnorm.handle, wnorm.offset, wnorm.bytes}, {normed.handle, 0, hb(normed)}};
-            Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
-          }
-          std::vector<hrx_buffer_ref_t> b = {
-              {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
-              {every.handle, std::size_t{r - from} * kVocab * 4, std::size_t{kVocab} * 4}};
-          Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
-        }
+      if (logits_from < T_ctx) {
+        const std::size_t rows = T_ctx - logits_from;
         gpu.Synchronize();
         std::vector<float> host(rows * kVocab);
         gpu.D2H(every, host.data(), host.size() * 4, 0);
         FILE* fa = std::fopen((prefix + ".all_logits").c_str(), "wb");
         std::fwrite(host.data(), 4, host.size(), fa);
         std::fclose(fa);
-        std::printf("all_logits rows=%zu from=%u\n", rows, from);
+        std::printf("all_logits rows=%zu from=%u\n", rows, logits_from);
       }
     }
     if (g_time) {

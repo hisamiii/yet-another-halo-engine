@@ -189,7 +189,17 @@ def main():
     E.TOKEN_TILE = TILE
     E.WIDEN_TILE = TILE
     TT = B // TILE
-    KC = B * 4 * 256          # kv heads x head dim, i.e. max_context rows
+    # Chunked prefill: YAH_CTX=T (> B) emits every kernel at the chunk size B,
+    # the KV cache (rope's max_context, attention's cache_capacity, the V^T
+    # transpose) at T, and one rope / attention HAL per chunk i (start_pos = i B):
+    # rope_c<i>.hal / wmma_c<i>.hal (rope.hal / wmma.hal are chunk 0). The
+    # driver runs the T tokens in T / B passes over the 64 layers, carrying the
+    # DeltaNet and conv states. dispatch.txt row "ctx" records T.
+    T = int(os.environ.get("YAH_CTX", str(B)))
+    if T % B:
+        raise SystemExit("YAH_CTX must be a multiple of the chunk size")
+    NCH = T // B
+    KC = T * 4 * 256          # kv heads x head dim, i.e. max_context rows
     os.makedirs(outdir, exist_ok=True)
     rows = E.parse(model)
     combos = set()
@@ -440,6 +450,10 @@ def main():
     # loom_forward_pp reads this instead of recomputing the grid, so the dispatch
     # site and the compiled kernel cannot disagree (see tools/emit_prefill.py,
     # chain=). A mismatch is silent and wrong, not a crash.
+    if NCH > 1:
+        if kq8_on or vq8_on or vq4_on:
+            raise SystemExit("chunked prefill (YAH_CTX) supports the f16 KV cache only for now")
+        geom.append(("ctx", B, 0, T))     # chunk size, total context
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
             fh.write("%s %d %d %d\n" % (hal, tk, rg, tt))
@@ -484,11 +498,11 @@ def main():
         ("yah_unpack_qg_f32.loom", "unpack.hal",
          ["yah_unpack_qg.batch=%d" % B, "yah_unpack_qg.num_heads=24",
           "yah_unpack_qg.head_dim=256"]),
-        ("yah_fused_qk_rope_batched_f32.loom", "rope.hal", [
-            "yah_fused_qk_rope_batched.start_pos=0",
+        *[("yah_fused_qk_rope_batched_f32.loom", "rope.hal" if c == 0 else "rope_c%d.hal" % c, [
+            "yah_fused_qk_rope_batched.start_pos=%d" % (c * B),
             "yah_fused_qk_rope_batched.batch=%d" % B,
             "yah_fused_qk_rope_batched.layer_idx=0",
-            "yah_fused_qk_rope_batched.max_context=%d" % B,
+            "yah_fused_qk_rope_batched.max_context=%d" % T,
             "yah_fused_qk_rope_batched.num_heads=24",
             "yah_fused_qk_rope_batched.num_kv_heads=4",
             "yah_fused_qk_rope_batched.head_dim=256",
@@ -496,15 +510,15 @@ def main():
             "yah_fused_qk_rope_batched.q_elems=%d" % (6144 * B),
             "yah_fused_qk_rope_batched.kv_elems=%d" % (1024 * B),
             "yah_fused_qk_rope_batched.cache32_elems=%d" % KC,
-            "yah_fused_qk_rope_batched.cache16_elems=%d" % KC]),
-        (attn_src, "wmma.hal", [
-            "attention_prefill.cache_capacity=%d" % B,
+            "yah_fused_qk_rope_batched.cache16_elems=%d" % KC]) for c in range(NCH)],
+        *[(attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
+            "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
-            "attention_prefill.start_pos=0",
+            "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
-            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]),
+            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH)],
         *([(vtrans_src, "vtrans.hal",
-            ["yah_vtrans.token_count=%d" % B, "yah_vtrans.cache_capacity=%d" % B])]
+            ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
           if vtrans_src else []),
         *([(kmean_src, "kmean.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B]),
            (kq8_src, "kq8.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
@@ -514,6 +528,8 @@ def main():
           if vq8_on else []),
         *([(vq4_src, "vq4.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
           if vq4_on else []),
+        *([("yah_conv_state_f32.loom", "convstate.hal",
+            ["yah_conv_state.batch=%d" % B, "yah_conv_state.channels=10240"])] if NCH > 1 else []),
         ("yah_half_cast.loom", "cast.hal",
          ["yah_half_cast.num_elements=%d" % (6144 * B)]),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",
