@@ -2854,3 +2854,29 @@ Loom miscompiles hit on the way (all worked around; see upstream-candidates):
   across the loop-to-loop hand-off (NaN in ~30% of dims from query block 1
   on). The kernel now uses one masked loop.
 - SKIP alone: NaN everywhere; correct when combined with S8 and MSKIF.
+
+**FA attention, round 2: the FA1-4 leftovers (2026-10-01).** Standalone
+pp8192 M cycles, real layer-3 inputs; previous best 69.8 (HIPNUM):
+
+| change | M cycles | verdict / measured cause |
+|---|---:|---|
+| FA4 conditional rescale, exact (SKIP, THR=0; yields alpha, 1.0 when skipped) | **67.1** | default. VALU/WMMA 14.1 -> 11.1; same bits as always rescaling. Without the unroll policy the branch also removed the 57 back-edge O copies. Under unroll(2) the skip path of the second copy copied O (73 v_mov) and lost (70.6), so POL now defaults off. |
+| threshold THR=8 / 4 (FA4) | 69.2 / - | no gain over exact; numerics change; off |
+| single V buffer (VSB: V(i) loaded top of phase A, staged at its end) | **64.6** | default, same bits. Drops the buffer parity (VALU 11.1 -> 10.6). Same 3 workgroups per WGP. |
+| + Q staged in halves (QH) | 66.1 | VGPRs 192 -> 200: the 4th workgroup still does not fit; prologue overhead. Off. |
+| 32-key tiles (KT=32, two sub-tiles per barrier pair) | 72.5 | LDS 53.8 KB -> 2 workgroups per WGP (4 waves/SIMD instead of 6), despite VALU/WMMA 10.1. K, V and the score slots are live in the same phase, so 3 workgroups cannot fit. Off; also not HIP-order (rel 7e-6). |
+| GQA packing (GQA=1: 6 heads x 16 tokens, 12 waves) | 66.8 | same bits. DRAM 2.8 -> 0.74 GB/layer, L2 requests 83 -> 32 M. 2.8% behind 2 heads: 2 x 12 waves per WGP give less phase diversity than 3 x 8. Kept as an option; it pays once per-KV work grows (e.g. int8 KV dequant once per 6 heads). |
+
+GQA notes:
+- With the staging loads inside wave-uniform scf.if guards, the compiler
+  drained vmcnt(0) at the region exit, right after issue (69.8). Loads are now
+  unconditional and only the LDS stores are guarded.
+- Guards use the subgroup id: tid compares lowered as lane-masked regions,
+  which branch lowering rejected.
+- Query block fastest (SWZ=0) beats KV head fastest for the packed kernel.
+
+Pipeline pp8192 (one round, idle start), production default config vs p62:
+- Attention row 1264.0 -> 1024.8 M cycles (-18.9%).
+- Hidden md5 = p62fa (bit-identical to the gated FA build).
+- The total (-0.5%) is clock-confounded: this run clocked higher (12988 vs
+  13505 ms), which adds cycles to the memory-bound rows.
