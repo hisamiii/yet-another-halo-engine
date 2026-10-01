@@ -2523,3 +2523,13 @@ floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
   activity model, not a measurement.
 - [13] reaches 113.8 against its limit of 120 on VALU FMA. The thermal limit
   binds first in all our runs (thm_gfx counters).
+- PM table rail decomposition (added a 5 s all-core CPU load, `openssl speed
+  -multi 32`): socket = 1.01 x [203] + 0.56 x sum(per-core [740..755]) +
+  2.0 x [17] + 2.8 W, rms 1.5 W over all seven runs.
+  - Per-core fields: power [740..755], voltage [756..771], temperature
+    [772..787], clock [788..803] (4.86 / 4.55 GHz by CCD), C-state
+    residency [820..867].
+  - CPU rail [15] (limit [14] = 80): CPU load 71, GEMM 4.3.
+  - The big rail [13]/[203] also draws ~60 W under the CPU-only load, so it
+    is not GPU-only (possibly a shared IOD/fabric VDD); identity unconfirmed.
+  - IQ3_S GEMM: ~99 of 118 W on [203], CPU cores 5 W, SoC side ~7 W.
