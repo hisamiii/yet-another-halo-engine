@@ -1123,6 +1123,58 @@ def swiglu_epilogue(e, arow):
             e("  }")
 
 
+# P2: the K-phase loop unrolled 2x by rewriting the generated text: phase kp
+# (body A, the original) and kp+1 (body B: every SSA name defined in the body
+# suffixed, %kp -> %kp + 1, the loop-carried inputs replaced by body A's
+# yields). The prefetch body A loads is consumed by body B as a plain SSA value,
+# and body B's prefetch (the loop-carried one) is loaded after body A consumed
+# the previous one, so the two need not be live together: the rolled loop's
+# back edge copied the carried prefetch every phase (Q4_K: 24 v_mov per phase,
+# old and new prefetch live together; edge_alias refused the relocation).
+# Phase counts are multiples of 8 (PH per K block), so the step of 2 is exact.
+P2 = os.environ.get("YAH_TG_P2", "0") == "1"
+
+
+def unroll_phases2(text):
+    import re
+    lines = text.split("\n")
+    fi = next(i for i, l in enumerate(lines) if "= scf.for %kp = [%c0 to %kphases step %c1](" in l)
+    head = lines[fi]
+    end = next(i for i in range(fi + 1, len(lines)) if lines[i] == "  }")
+    body = lines[fi + 1:end]
+    yi = max(i for i, l in enumerate(body) if l.startswith("    scf.yield "))
+    yld = body[yi]
+    body_a = body[:yi]
+    m = re.match(r"^(\s*.*= scf\.for %kp = \[%c0 to %kphases step )%c1\]\((.*)\) -> \((.*)\)(.*)$", head)
+    assert m, head
+    iter_args = [a.split("=")[0].strip() for a in re.split(r",\s*(?=%[\w$.]+ = )", m[2])]
+    ym = re.match(r"^\s*scf\.yield (.*) : (.*)$", yld)
+    yvals = [v.strip() for v in ym[1].split(",")]
+    assert len(yvals) == len(iter_args), (len(yvals), len(iter_args))
+    # names defined in the body: results of ops, region/iter args, loop ivs
+    defined = set()
+    for l in body_a:
+        mm = re.match(r"^\s*((?:%[\w$.]+\s*,\s*)*%[\w$.]+)\s*=\s*[\w.]+", l)
+        if mm:
+            defined.update(re.findall(r"%[\w$.]+", mm[1]))
+        for it in re.findall(r"(%[\w$.]+) = %[\w$.]+ : ", l):
+            defined.add(it)
+        for iv in re.findall(r"scf\.for (%[\w$.]+) = ", l):
+            defined.add(iv)
+    ren = {n: n + "_p2" for n in defined}
+    ren["%kp"] = "%kp_p2"
+    for a, v in zip(iter_args, yvals):
+        ren[a] = v
+    tok = re.compile(r"%[\w$.]+")
+    def sub(l):
+        return tok.sub(lambda t: ren.get(t.group(0), t.group(0)), l)
+    body_b = ["    %kp_p2 = index.add %kp, %c1 : index"] + [sub(l) for l in body_a]
+    yld_b = sub(yld)
+    new_head = m[1] + "%c2](" + m[2] + ") -> (" + m[3] + ")" + m[4]
+    out = lines[:fi] + [new_head] + body_a + body_b + [yld_b] + lines[end:]
+    return "\n".join(out)
+
+
 def ablate(text):
     """YAH_TG_ABL bits 1/2/8 on the generated kernel: inside the phase loop drop
     barriers (1) and the weight/activation LDS stores (2); drop the output stores
@@ -1161,7 +1213,10 @@ def main():
     fmt = sys.argv[1]
     kind = os.environ.get("YAH_TG_KIND", "kstore")
     out = sys.argv[2] if len(sys.argv) > 2 else f"yah_tile_{fmt}_{kind}.loom"
-    open(out, "w").write(ablate(gen(fmt, kind)))
+    text = gen(fmt, kind)
+    if P2:
+        text = unroll_phases2(text)
+    open(out, "w").write(ablate(text))
     print(out)
 
 

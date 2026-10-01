@@ -85,6 +85,9 @@ if RS2:
 # barrier). 52992 -> 36608 B (+256 with RS2): three workgroups per WGP instead
 # of two (HIP's 20992 B gets three as well, VGPR-bound).
 LDS2 = os.environ.get("YAH_ATTN_LDS2", "1") == "1"
+# PVFENCE: a schedule fence after each P.V MMA, so each accumulator's rescale
+# stays next to its own MMA (probe for the back-edge accumulator copies)
+PVFENCE = os.environ.get("YAH_ATTN_PVFENCE", "0") == "1"
 if LDS2:
     VT_OFF = 0
     KT_OFF = VT_OFF + 256 * VT_PITCH * 2          # 12288
@@ -499,6 +502,8 @@ def gen():
                 e(f"    %vf{a} = vector.fragment.load<rhs> %vt_fr[%c0, %dc{a}] shape [%k, %n] : view<16x256xf16, %vt_lay> -> {V16H}")
                 e(f"    %os{a} = vector.mulf %o{a}, %sc{rb} : {V8}")
                 e(f"    %nx{a} = vector.mma %pf{rb}, %vf{a}, %os{a} : {V16H}, {V16H}, {V8}")
+                if PVFENCE:
+                    e("    scf.schedule.fence")
                 if not tail:
                     outs.append(f"%nx{a}")
                     continue

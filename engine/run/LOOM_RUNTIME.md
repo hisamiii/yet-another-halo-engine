@@ -2088,3 +2088,50 @@ Results:
 The pp8192 emit needed the attention token-count facts to follow B
 (`YAH_ATTN_MAX_TOKENS`, 09ed5c4).
 
+**Q4_K and the remaining copies; loop-invariant hoisting (2026-10-01).**
+
+Q4_K kstore on real `attn_qkv` bytes (M=10240): Loom 15.38 M cycles against
+HIP 13.64 (1.128x). Occupancy and LDS traffic are equal. Per WMMA:
+
+| | Loom | HIP |
+|---|---:|---:|
+| VALU | 7.08 | 4.37 |
+| SALU | 2.26 | 0.24 |
+| `v_mov` (ATT) | 1.64 | 0.05 |
+| barrier share of latency | 50% | 22% |
+
+The copies are the carried weight prefetch bouncing between two register sets
+every phase: 12 + 12 moves per 16 WMMAs. Old and new prefetch are live
+together, so the allocator's edge-alias check refuses the relocation
+(traced with LOOM_EXP_RELOC_DEBUG in the worktree).
+
+Measured, all bit-identical:
+
+- `DECLATE` (loads after the decode): 15.91. The decoder waves wait
+  `vmcnt(0)` right after issuing.
+- `YAH_TG_P2` (the phase loop unrolled 2x in the generated text, off):
+  removes the back-edge ping-pong, but loses.
+  - Without DECLOAD: 16.82. Body B's prefetch is copied into the carried
+    registers behind a `vmcnt(0)` between its k-steps. The relocation pass
+    meets a permutation chain (12->18, ..., 30->14) blocked at v20/v21 and
+    refuses the whole group.
+  - With DECLOAD: 18.01. The merge copies sit behind a wait after body A.
+
+The fix needs the allocator to relocate a chain jointly. That is not done
+yet.
+
+Hoisting (worktree compiler, `low-licm`, LOOM_EXP_LICM=1, local commit
+9ab6a00):
+
+- What it does: moves pure, effect-free VALU/SALU ops (no state writes, exec
+  unchanged in the loop) whose operands are loop-invariant into the
+  preheader.
+- IQ4_XS kstore: 24.50 -> 23.66 M cycles (HIP 23.15). The k-loop goes from
+  13 to 8 VALU, the quarter-rate `v_mul_lo` leave, and VGPRs 144 -> 160
+  (LDS-bound occupancy, so free).
+- Neutral or worse elsewhere: IQ3_S 27.06 -> 27.03, IQ3_XXS 25.99 -> 25.88,
+  Q4_K 15.21 -> 15.26, Q3_K 28.62 -> 29.20.
+- Attention (45 of 204 VALU per tile are invariant) spills at any setting
+  that hoists VALU, because it sits at its 232-VGPR ceiling. It needs
+  registers freed first.
+
