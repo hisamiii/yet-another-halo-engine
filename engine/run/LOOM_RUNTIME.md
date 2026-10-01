@@ -2465,3 +2465,27 @@ floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
   - Socket power 111 -> 124 W.
   - pp2048 p56: 3186.2 ms (md5 unchanged), HIP 3388.4 (one round each,
     15 s gaps). Earlier same session: p55 3262.8, HIP ~3463.
+- **tctl 105 trips PROCHOT on sustained load; use 99.**
+  - Fan curve set (user): 35:0, 44:46, 55:112, 64:139, 72:167, 79:196, 85:255,
+    95:255 (old: ..., 86:219, 95:248). The EC ramps the fans 5300 -> 8700 rpm
+    over ~18 s, too slow to matter for a 3 s prefill.
+  - At tctl 105, after ~4-6 s with Tgfx at ~100 C, PROCHOT (external, likely
+    the EC at APU ~99 C) fires every ~6 s for ~1 s and pins GFX at 600 MHz.
+    20 s GEMM: mean cap 2021 MHz, PROCHOT 3660.
+  - At tctl 99: hold ~99 C, no PROCHOT in 20 s, mean cap 2173 MHz.
+  - pp2048 p56 at tctl 99, starting from APU 54 C: 3255.6 ms (HIP 3616.9,
+    run second). Right after sustained probes (APU 80 C): 3408.2. Start
+    temperature moves pp2048 by several percent, so compare only from a
+    matched idle temperature.
+- Power breakdown (`research/powerlog.py`, gpu_metrics, medians after 2 s):
+  - Socket: idle 13.8 W, WMMA 106, VALU 110, LDS 105, memory stream 69,
+    IQ3_S GEMM 116.
+  - The sub-domains (gfx / all_core / sys) do not add up to socket (the
+    remainder runs -26..+58 W) and gfx swings 27 W (WMMA) .. 93 W (LDS) at
+    similar socket power. They look like SMU model estimates; only socket
+    power is trustworthy.
+  - DRAM read/write counters read 37+36 for a 208 GB/s stream (unknown units).
+  - Under load fclk ~2.0 GHz, uclk 1.0 GHz, socclk 1.45 GHz; Tsoc ~74 C while
+    Tgfx sits at 100.
+  - Real per-rail power needs the PM table (ryzenadj; blocked by /dev/mem on
+    this kernel without `iomem=relaxed` or a `ryzen_smu` build for 7.3).
