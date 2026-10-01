@@ -2612,3 +2612,19 @@ proof only. `loom_forward_pp` prefers it (`run_kqg`) and skips
   (-0.45%), 947 -> 931 dispatches.
 - The 16 unpack dispatches (32.9 M) are gone, and the kqg GEMMs cost what the
   kstore ones did (263.6 vs 263.3 M).
+
+**GEMM residency via KSUB=32 (2026-10-01, lost).** `suggest` flags the IQ3
+4 x 2 kernels as LDS-limited (57 KB -> 4 waves/SIMD). `YAH_TG_KSUB=32` raises
+residency to 5-7 but loses on real bytes (M cycles):
+- IQ3_S kstore 23.84 -> 27.34, IQ3_S kres K=6144 9.66 -> 11.97, IQ3_XXS
+  kstore 23.81 -> 25.06.
+- SOL (IQ3_S kstore): VALU/WMMA 4.74 -> 5.80, SALU 1.15 -> 1.70, barrier
+  wait 5% -> 27%, issue bound 100% -> 91%. Twice the phases bring twice the
+  per-phase overhead and barriers. The kernels were already at their issue
+  bound, so more waves have nothing to hide.
+
+Not pursued, with reasons:
+- Stagger delay per kind: flat 2000-8000 except IQ4_XS kres K=6144.
+- Fragment-order activations (LSE): a 16x16 f16 fragment is 32 B/lane = 2
+  `ds_load_b128`, the minimum, and the 4 x 2 kernels issue exactly that (1.25
+  fragment loads/WMMA + decode stores / grid reads = 1.59 measured).
