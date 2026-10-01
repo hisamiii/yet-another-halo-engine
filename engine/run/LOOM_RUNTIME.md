@@ -2146,3 +2146,21 @@ That compiler is HRX branch loom-wait-sched, local commit 9ab6a00; the HALs
 run on the stock runtime. md5 a2145e371ceefd4d unchanged. pp2048, one round
 each: IQ4_XS rows 673.2 -> 659.7 ms (-2.0%) against +0.8% drift.
 
+**Attention QK^T fence (`YAH_ATTN_QKFENCE`, default 1), stock compiler.**
+
+The cause: at the VGPR peak, 5 of the 8 K fragments of the QK^T chain were
+live, because the scheduler issued their loads early (40 VGPRs).
+
+The fix: a schedule fence after each (K fragment load, MMA) pair.
+
+- VGPRs 232 -> 216.
+- pp8192 real layer-3 inputs: 86.52 -> 80.23 M cycles (HIP 79.4, so 1.01x).
+  A fence every 2 pairs gives 80.76, every 4 gives 81.94.
+- Bit-identical to HIP's kernel.
+- p48 = p46 + this wmma.hal: md5 a2145e371ceefd4d unchanged, attention row
+  44.4 -> 41.3 ms (-7.0%) against +0.75% drift.
+
+Hoisting the remaining loop-invariant address math would bring VALU to HIP's
+count (1.126 vs 1.119 G), but needs compiler changes (see p47). Production
+stays stock-buildable.
+

@@ -88,6 +88,12 @@ LDS2 = os.environ.get("YAH_ATTN_LDS2", "1") == "1"
 # PVFENCE: a schedule fence after each P.V MMA, so each accumulator's rescale
 # stays next to its own MMA (probe for the back-edge accumulator copies)
 PVFENCE = os.environ.get("YAH_ATTN_PVFENCE", "0") == "1"
+# QKFENCE=n: a schedule fence after every n of the 8 QK^T (K fragment load,
+# MMA) pairs, capping the K fragments in flight (5 of 8 were live at the VGPR
+# peak, 40 VGPRs). Default 1: VGPRs 232 -> 216 and, at pp8192 on real layer-3
+# inputs, 86.52 -> 80.23 M cycles (HIP 79.4), bit-identical to HIP's kernel;
+# n=2 80.76, n=4 81.94.
+QKFENCE = int(os.environ.get("YAH_ATTN_QKFENCE", "1"))
 if LDS2:
     VT_OFF = 0
     KT_OFF = VT_OFF + 256 * VT_PITCH * 2          # 12288
@@ -401,6 +407,8 @@ def gen():
             e(f"    %kf{ks} = vector.fragment.load<rhs> %kt_fr[%qk{ks}d, %c0] shape [%k, %n] : view<256x16xf16, %kt_lay> -> {V16H}")
             e(f"    %sa{ks} = vector.mma %qf{ks}, %kf{ks}, {acc} : {V16H}, {V16H}, {V8}")
             acc = f"%sa{ks}"
+            if QKFENCE and ks + 1 < 8 and (ks + 1) % QKFENCE == 0:
+                e("    scf.schedule.fence")
         # store to s[s_kh][s_rb]: offset S_OFF + (s_kh*4 + s_rb)*272 floats
         e("    %st0 = index.mul %s_kh, %c4 : index")
         e("    %st1 = index.add %st0, %s_rb : index")
