@@ -183,6 +183,13 @@ VDECW_FR = os.environ.get("YAH_SD_VDECW_FR", "0") == "1"
 # evicted accumulators to scratch for every conversion result. The 1.0 is built
 # from gb & ~gb so the canonicalizer cannot fold the fma back into a subf.
 Q4FMIX = os.environ.get("YAH_SD_Q4FMIX", "0") == "1"
+# IQ3F16 (IQ3_S, word path): decode through two workgroup tables built at
+# setup: the grid as f16 (4 KiB, 2 dwords per entry) and, per sign byte, the
+# f16 sign bits of its 8 elements as four XOR masks (4 KiB). Per 8 elements:
+# one 16-byte sign load, two 8-byte grid loads, four xors, eight
+# fptrunc(fma(extf(mag), dsc, -0)). The product dsc*mag is exact in f32, so
+# the single rounding equals the current fptrunc(f32 product): bit-identical.
+IQ3F16 = os.environ.get("YAH_SD_IQ3F16", "0") == "1"
 
 
 def _i8n(ty):
@@ -557,6 +564,89 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None):
     e(f"    vector.store %vh_{t}, %wl_view[%drow, %vco_{t}] : vector<8xf16>, view<{LR}x{ROWP}xf16>")
 
 
+def _vdec16_pair(e, t, gid0, gid1, sgb8, dsc, col, p):
+    """IQ3F16 decode of the 8 elements one sign byte covers (grid words 2p,
+    2p+1): sign masks from %sgn16 (4 dwords per sign byte, dword j = elements
+    2j, 2j+1 as f16 sign bits), magnitudes from %g16 (2 dwords per grid entry,
+    4 f16), value = fptrunc(fma(extf(+-mag), dsc, -0))."""
+    e(f"    %fsb_{t} = scalar.extui {sgb8} : i8 to i32")
+    e(f"    %fsx_{t} = index.cast %fsb_{t} : i32 to index")
+    e(f"    %fsm_{t} = index.min %fsx_{t}, %c255_f16 : index")
+    e(f"    %fso_{t} = index.mul %fsm_{t}, %c4 : index")
+    e(f"    %fsv_{t} = vector.load %sgn16[%fso_{t}] : view<1024xi32> -> vector<4xi32>")
+    hs = []
+    for h, gid in ((0, gid0), (1, gid1)):
+        e(f"    %fgo{h}_{t} = index.mul {gid}, %c2 : index")
+        e(f"    %fgv{h}_{t} = vector.load %g16[%fgo{h}_{t}] : view<1024xi32> -> vector<2xi32>")
+        e(f"    %fm0{h}_{t} = vector.extract %fsv_{t}[{2 * h}] : vector<4xi32> -> i32")
+        e(f"    %fm1{h}_{t} = vector.extract %fsv_{t}[{2 * h + 1}] : vector<4xi32> -> i32")
+        e(f"    %fmv{h}_{t} = vector.from_elements %fm0{h}_{t}, %fm1{h}_{t} : vector<2xi32>")
+        e(f"    %fxv{h}_{t} = vector.xori %fgv{h}_{t}, %fmv{h}_{t} : vector<2xi32>")
+        e(f"    %fhv{h}_{t} = vector.bitcast %fxv{h}_{t} : vector<2xi32> to vector<4xf16>")
+        for b in range(4):
+            x = f"{h}{b}_{t}"
+            e(f"    %fe{x} = vector.extract %fhv{h}_{t}[{b}] : vector<4xf16> -> f16")
+            e(f"    %ff{x} = scalar.extf %fe{x} : f16 to f32")
+            e(f"    %fq{x} = scalar.fmaf %ff{x}, {dsc}, %negzero_f16 : f32")
+            e(f"    %fo{x} = scalar.fptrunc %fq{x} : f32 to f16")
+            hs.append(f"%fo{x}")
+    e(f"    %vh_{t} = vector.from_elements {', '.join(hs)} : vector<8xf16>")
+    e(f"    %vc_{t} = index.constant {8 * p} : index")
+    e(f"    %vco_{t} = index.add {col}, %vc_{t} : index")
+    e(f"    vector.store %vh_{t}, %wl_view[%drow, %vco_{t}] : vector<8xf16>, view<{LR}x{ROWP}xf16>")
+
+
+def _iq3f16_tables():
+    """Build %g16 (f16 grid) from %grid_g and %sgn16 (sign masks) in
+    workgroup memory; the first K phase's barrier publishes them."""
+    L = ["  %g16_bytes = index.constant 4096 : offset",
+         "  %g16_l = buffer.alloca<workgroup> align(16) %g16_bytes : buffer",
+         "  %g16 = buffer.view %g16_l[%base] : buffer -> view<1024xi32>",
+         "  %sgn16_l = buffer.alloca<workgroup> align(16) %g16_bytes : buffer",
+         "  %sgn16 = buffer.view %sgn16_l[%base] : buffer -> view<1024xi32>",
+         "  %c255_f16 = index.constant 255 : index",
+         "  %negzero_f16 = scalar.constant -0.0 : f32",
+         "  %f16_c255 = scalar.constant 255 : i32", "  %f16_c16 = scalar.constant 16 : i32",
+         "  %f16_c1 = scalar.constant 1 : i32", "  %f16_c15 = scalar.constant 15 : i32",
+         "  %f16_c31 = scalar.constant 31 : i32",
+         f"  %f16_step = index.constant {64 * NW} : index",
+         "  %f16_s1 = scf.for %fi = [%c0 to %c512 step %f16_step](%fm = %c0 : index) -> (index) {",
+         "    %fe0 = index.add %fi, %tid : index",
+         "    %fe = index.min %fe0, %c511 : index",
+         "    %fw = view.load %grid_g[%fe] : view<512xi32> -> i32"]
+    hs = []
+    for b in range(4):
+        L += [f"    %fsh{b} = scalar.constant {8 * b} : i32",
+              f"    %fb0{b} = scalar.shrui %fw, %fsh{b} : i32",
+              f"    %fb{b} = scalar.andi %fb0{b}, %f16_c255 : i32",
+              f"    %fbf{b} = scalar.uitofp %fb{b} : i32 to f32",
+              f"    %fbh{b} = scalar.fptrunc %fbf{b} : f32 to f16",
+              f"    %fbi{b} = scalar.bitcast %fbh{b} : f16 to i16",
+              f"    %fbz{b} = scalar.extui %fbi{b} : i16 to i32"]
+    L += ["    %fhi1 = scalar.shli %fbz1, %f16_c16 : i32", "    %fd0 = scalar.ori %fbz0, %fhi1 : i32",
+          "    %fhi3 = scalar.shli %fbz3, %f16_c16 : i32", "    %fd1 = scalar.ori %fbz2, %fhi3 : i32",
+          "    %fo0 = index.mul %fe, %c2 : index", "    %fo1 = index.add %fo0, %c1 : index",
+          "    view.store %fd0, %g16[%fo0] : i32, view<1024xi32>",
+          "    view.store %fd1, %g16[%fo1] : i32, view<1024xi32>",
+          "    scf.yield %fm : index", "  }",
+          "  %f16_s2 = scf.for %si = [%c0 to %c256 step %f16_step](%sm = %c0 : index) -> (index) {",
+          "    %se0 = index.add %si, %tid : index",
+          "    %se = index.min %se0, %c255_f16 : index",
+          "    %sei = index.cast %se : index to i32"]
+    for j in range(4):
+        L += [f"    %sl{j}c = scalar.constant {2 * j} : i32",
+              f"    %sh{j}c = scalar.constant {2 * j + 1} : i32",
+              f"    %sl{j}a = scalar.shrui %sei, %sl{j}c : i32", f"    %sl{j} = scalar.andi %sl{j}a, %f16_c1 : i32",
+              f"    %sh{j}a = scalar.shrui %sei, %sh{j}c : i32", f"    %sh{j} = scalar.andi %sh{j}a, %f16_c1 : i32",
+              f"    %sl{j}s = scalar.shli %sl{j}, %f16_c15 : i32", f"    %sh{j}s = scalar.shli %sh{j}, %f16_c31 : i32",
+              f"    %sm{j} = scalar.ori %sl{j}s, %sh{j}s : i32",
+              f"    %so{j}b = index.mul %se, %c4 : index", f"    %so{j}c = index.constant {j} : index",
+              f"    %so{j} = index.add %so{j}b, %so{j}c : index",
+              f"    view.store %sm{j}, %sgn16[%so{j}] : i32, view<1024xi32>"]
+    L += ["    scf.yield %sm : index", "  }"]
+    return L
+
+
 def _col_of(e, u):
     e(f"    %col_i{u} = scalar.shli %gl{u}, %c5i : i32")
     e(f"    %col_x{u} = index.cast %col_i{u} : i32 to index")
@@ -638,11 +728,17 @@ def iq3s_compute(v, gb):
                 e(f"    %gix_{t} = index.cast %gi_{t} : i32 to index")
                 e(f"    %gil_{t} = index.max %gix_{t}, %c0 : index")
                 e(f"    %gid_{t} = index.min %gil_{t}, %c511 : index")
+                if IQ3F16:
+                    gws.append(f"%gid_{t}")
+                    continue
                 e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<512xi32> -> i32")
                 gws.append(f"%gw_{t}")
             for pp in range(4):
                 e(f"    %sgb8_{u}_{pp} = vector.extract {sg}[{pp}] : vector<4xi8> -> i8")
-                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%sgb8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}")
+                if IQ3F16:
+                    _vdec16_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%sgb8_{u}_{pp}", f"%dsc{u}", f"%col{u}", pp)
+                else:
+                    _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%sgb8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}")
             continue
         hs = []
         for lw in (range(8) if GRID_FIRST else ()):
@@ -726,6 +822,8 @@ def iq3s_setup():
          "  %vdw_ff = scalar.constant 255 : i32",
          "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
          "  %c14i_vdw = scalar.constant 14 : i32"]
+    if IQ3F16:
+        return L + _iq3f16_tables()
     if not GRID_LDS:
         return L + ["  %grid_view = buffer.view %grid_na[%base] : buffer -> view<512xi32>"]
     L += ["  %grid_bytes = index.constant 2048 : offset",

@@ -2628,3 +2628,23 @@ Not pursued, with reasons:
 - Fragment-order activations (LSE): a 16x16 f16 fragment is 32 B/lane = 2
   `ds_load_b128`, the minimum, and the 4 x 2 kernels issue exactly that (1.25
   fragment loads/WMMA + decode stores / grid reads = 1.59 measured).
+
+**IQ3_S f16-table decode (2026-10-01, kept off: tiny).**
+`YAH_SD_IQ3F16=1` decodes through two workgroup tables built at setup:
+- the grid as f16 (4 KiB, 2 dwords per entry);
+- per sign byte, the f16 sign bits of its 8 elements as 4 XOR masks (4 KiB).
+
+Per 8 elements: one 16-byte sign load, two 8-byte grid loads, 4 xors, 8
+`fptrunc(fma(extf(+-mag), dsc, -0))`, which select `v_fma_mixlo/hi` straight
+from the f16 halves. The product is exact in f32, so it is bit-identical.
+- K block non-WMMA VALU 289 -> 193 per 64 WMMA; VALU/WMMA 4.74 -> 3.25 (SOL).
+- LDS 57 -> 63.5 KB, still 4 waves/SIMD.
+- Real bytes, M cycles, bit-identical on all four kinds: kstore 24.13 ->
+  23.96, swiglu 24.35 -> 24.32, kres K=17408 24.02 -> 23.69, K=6144 9.63 ->
+  9.67.
+- The issue model predicted -3%. Measured, each removed decode VALU saved
+  ~0.23 cycles, not ~1.1: most decode VALU already overlaps other waves'
+  34-cycle WMMAs. The kernel went from 100% to 98% of the model.
+- Lesson: the per-instruction VALU price (hw-measured.md: ~1.1 next to WMMA)
+  overstates decode cost in the full kernels. More decode trimming has low
+  payoff; what remains over the floor is mostly LDS and synchronization.
