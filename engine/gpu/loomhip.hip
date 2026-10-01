@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -40,6 +41,33 @@ static std::vector<char> ReadFile(const std::string& path) {
   return v;
 }
 
+// The kernel descriptor's kernarg_size (amd_kernel_code_t-style .kd symbol:
+// group_segment u32 @0, private_segment u32 @4, kernarg_size u32 @8), read
+// straight from the ELF. Returns -1 if the symbol is missing.
+static long KernargSize(const std::vector<char>& elf, const std::string& kernel) {
+  auto u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, elf.data() + o, 2); return v; };
+  auto u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, elf.data() + o, 4); return v; };
+  auto u64 = [&](size_t o) { uint64_t v; std::memcpy(&v, elf.data() + o, 8); return v; };
+  if (elf.size() < 64 || std::memcmp(elf.data(), "\x7f" "ELF", 4) != 0) return -1;
+  const uint64_t shoff = u64(40);
+  const unsigned shentsize = u16(58), shnum = u16(60);
+  auto sh = [&](unsigned i) { return shoff + static_cast<uint64_t>(i) * shentsize; };
+  const std::string want = kernel + ".kd";
+  for (unsigned i = 0; i < shnum; ++i) {
+    if (u32(sh(i) + 4) != 2) continue;  // SHT_SYMTAB
+    const uint64_t sym_off = u64(sh(i) + 24), sym_size = u64(sh(i) + 32);
+    const uint64_t str_off = u64(sh(u32(sh(i) + 40)) + 24);
+    for (uint64_t o = sym_off; o + 24 <= sym_off + sym_size; o += 24) {
+      if (std::strcmp(elf.data() + str_off + u32(o), want.c_str()) != 0) continue;
+      const unsigned shndx = u16(o + 6);
+      const uint64_t value = u64(o + 8);
+      const uint64_t file = u64(sh(shndx) + 24) + (value - u64(sh(shndx) + 16));
+      return u32(file + 8);
+    }
+  }
+  return -1;
+}
+
 int main(int argc, char** argv) {
   if (argc < 8) {
     std::fprintf(stderr, "usage: loomhip <hsaco> <kernel> <gx> <gy> <block_x> <iters> <buf>...\n");
@@ -48,6 +76,23 @@ int main(int argc, char** argv) {
   const std::string hsaco = argv[1], kernel = argv[2];
   const unsigned gx = std::atoi(argv[3]), gy = std::atoi(argv[4]), bx = std::atoi(argv[5]);
   const int iters = std::atoi(argv[6]);
+
+  // Refuse a launch whose buffer count does not match the kernel's argument
+  // block. On 2026-10-01 an IQ3_S kernel (6 bindings, kernarg_size 48) was
+  // launched with 5 buffers: it read its sixth pointer past the 40 given bytes,
+  // stored through it, and hung the GPU (ring timeouts, GPU reset) -- on this
+  // target a wild access hangs instead of faulting.
+  const long kas = KernargSize(ReadFile(hsaco), kernel);
+  const long given = static_cast<long>(argc - 7) * 8;
+  if (kas < 0) {
+    std::fprintf(stderr, "loomhip: no %s.kd in %s; refusing to launch\n", kernel.c_str(), hsaco.c_str());
+    return 2;
+  }
+  if (kas != given) {
+    std::fprintf(stderr, "loomhip: %s takes %ld bytes of kernel arguments (%ld buffers), %d given; refusing to launch\n",
+                 kernel.c_str(), kas, kas / 8, argc - 7);
+    return 2;
+  }
 
   hipModule_t mod;
   CHECK(hipModuleLoad(&mod, hsaco.c_str()));
