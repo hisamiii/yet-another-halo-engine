@@ -229,7 +229,26 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
     return prev
 
 
+# Per-format wave layout where measured better than 4 x 4 (applied only when the
+# geometry is the 128 x 256 default and YAH_TG_WM/WN are unset). IQ4_XS 4 x 2
+# (32 x 128 per wave, 8 waves): fragment loads per WMMA 1.5 -> 1.25, kstore
+# 24.50 -> 23.12 M cycles (HIP 23.15), bit-identical; 2 x 4 (64 x 64) has fewer
+# instructions still but drops off the issue bound (25.88: exposed latency).
+WAVE_FMTS = {"iq4xs": (4, 2)}
+
+
 def gen(fmt, kind="kstore"):
+    if (fmt in WAVE_FMTS and os.environ.get("YAH_TG_WM") is None and os.environ.get("YAH_TG_WN") is None
+            and (BM, BN, WM, WN) == (128, 256, 4, 4)):
+        prev = set_geometry(wm=WAVE_FMTS[fmt][0], wn=WAVE_FMTS[fmt][1])
+        try:
+            return _gen(fmt, kind)
+        finally:
+            set_geometry(*prev)
+    return _gen(fmt, kind)
+
+
+def _gen(fmt, kind="kstore"):
     F = G.FMTS[fmt]
     ksub = configure(fmt)
     bb, (loads, compute) = F["bb"], F["decode"]

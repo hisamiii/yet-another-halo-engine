@@ -2190,3 +2190,16 @@ IQ3_S with the same path loses (26.79 -> 27.23). VALU/WMMA falls 7.64 -> 6.58,
 but the issue bound drops from 98% to 94% of measured: the longer dependent
 chain is exposed between barriers.
 
+**Wave layout 4 x 2 for IQ4_XS (32 x 128 per wave, 8 waves; `WAVE_FMTS`).**
+
+- The cause: LDS instructions cost ~3 cycles each next to WMMA, and fragment
+  loads are 2·(FM+FN) per FM·FN WMMAs per k step.
+- The 4 x 2 layout cuts LDS per WMMA 1.72 -> 1.47 and VALU 5.52 -> 4.82 (less
+  address math per WMMA).
+- Kstore 24.50 -> 23.12 M cycles (HIP 23.15), bit-identical.
+- 2 x 4 (64 x 64) has fewer instructions still (LDS 1.19) but falls to 93% of
+  its issue bound, so latency is exposed: 25.88.
+- p50 = p49 + IQ4_XS kstore/swiglu/kres at 4 x 2: md5 a2145e371ceefd4d
+  unchanged. pp2048 IQ4_XS rows 680.7 -> 654.7 ms (-3.8%) against +0.9%
+  drift.
+
