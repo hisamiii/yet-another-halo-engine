@@ -864,10 +864,11 @@ def _gen(fmt, kind="kstore"):
               + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
             e("  }")
         elif KSL:
+            rhs_outer = RHS_OUTER
             # the k steps straight-line in program order (no read-ahead): one
             # block, so low CSE shares the fragment loads' lane/base address
             # math across steps and the step offset becomes an immediate
-            assert not (DECAHEAD and DECW) and not FRAG and not RHS_OUTER, "KSL: plain k loop only"
+            assert not (DECAHEAD and DECW) and not FRAG, "KSL: plain k loop only"
             nst = ksub // 16
             acc = [f"%a{i}" for i in range(NA)]
             for st in range(nst):
@@ -877,14 +878,31 @@ def _gen(fmt, kind="kstore"):
                 for i in range(FM):
                     e(f"    %slr{st}_{i} = index.add %wr_off, %c{16 * i} : index")
                     e(f"    %slhs{st}_{i} = vector.fragment.load<lhs> {wlv}[%slr{st}_{i}, %sks{st}] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
-                for j in range(FN):
+
+                def srhs(j):
                     e(f"    %stc{st}_{j} = index.add %wt_off, %c{16 * j} : index")
                     e(f"    %srhs{st}_{j} = vector.fragment.load<rhs> {alv}[%sks{st}, %stc{st}_{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
-                for i in range(FM):
+
+                def smma(i, j):
+                    n = i * FN + j
+                    name = f"%r{n}" if st == nst - 1 else f"%sn{st}_{n}"
+                    e(f"    {name} = vector.mma %slhs{st}_{i}, %srhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
+                if rhs_outer:
+                    # rhs-outer: each activation fragment dies after its FM MMAs,
+                    # so a step holds FM + ~RHS_FENCE fragments instead of FM + FN
+                    # (Q4_K at 4 x 2: all 10 of a step were live at the VGPR peak)
                     for j in range(FN):
-                        n = i * FN + j
-                        name = f"%r{n}" if st == nst - 1 else f"%sn{st}_{n}"
-                        e(f"    {name} = vector.mma %slhs{st}_{i}, %srhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
+                        srhs(j)
+                        for i in range(FM):
+                            smma(i, j)
+                        if RHS_FENCE and j + 1 < FN and (j + 1) % RHS_FENCE == 0:
+                            e("    scf.schedule.fence")
+                else:
+                    for j in range(FN):
+                        srhs(j)
+                    for i in range(FM):
+                        for j in range(FN):
+                            smma(i, j)
                 acc = [f"%sn{st}_{n}" for n in range(NA)]
             e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
               + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")

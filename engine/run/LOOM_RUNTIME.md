@@ -2334,3 +2334,24 @@ measured neutral in ms back at p40) re-measured in cycles, bit-identical:
   30454.3 M (-1.05%; swiglu rows -9.2 / -7.5%). Untraced ms at 30 s gaps read
   13900.5 (p53, first run after an idle emit) vs 15584.7: at 8192 the first
   run after idle is far cooler than any later one, so ms needs cycles beside it.
+
+**Q4_K at 4 x 2: blocked by back-edge allocation, not pressure (2026-10-01).**
+Every 4 x 2 / 2 x 4 variant spills (compile-only, `--compile-report=text-details`
+spill rows), even at 171-208 VGPRs with peak live 171-190:
+
+- What spills: carried K-loop values. These are 2-4 accumulator tuples, the
+  carried global prefetch (`nxw*` from the DECLOAD `scf.if`, or `cv4-10`
+  without decode-ahead), plus a few loop invariants. Each is stored twice and
+  reloaded once or twice: the allocator cannot place the yielded values in the
+  loop-argument registers. This is the same back-edge problem that costs Q4_K
+  24 `v_mov` per phase at 4 x 4. 11 repair iterations vs 0 for IQ4_XS at 4 x 2.
+- Not the cause: KSL, DECLOAD, decode-ahead, the 16-byte header (each off:
+  still spills), P2 phase unroll (spills), 2 x 4 (spills).
+- Found on the way: in KSL the whole step's fragments (2 weight + 8 activation,
+  80 units) were live at the peak. `YAH_TG_RHSO=1` now works in the KSL path
+  (each activation fragment loaded right before its MMAs; `YAH_TG_RHSF=n`
+  fences every n): peak 190 -> 171, VGPRs 208 -> 184, spills unchanged. Off by
+  default; defaults emit identical text.
+- A fix needs either allocator work (excluded: stock compiler) or a K loop
+  whose global prefetch is not loop-carried. Upside is ~0.5% of the prefill
+  (Q4_K ~9.5% of cycles; 4 x 2 gave IQ4_XS -5.6%, Q3_K -12%). Parked.
