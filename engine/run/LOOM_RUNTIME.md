@@ -1815,6 +1815,18 @@ every tile GEMM re-emitted, one round each: 3598.7 -> 3537.1 ms; GEMM rows
 -58.8 ms against -2.5 on the rest (IQ3_S gate+up -15.6, IQ3_S residual -10.0,
 Q3_K -5.7, IQ4_XS -4.5). IQ3_XXS did not move.
 
+**IQ3_S vs IQ4_XS, and the raster order (2026-10-01).** Same activations,
+real weights, cycles: IQ3_S Loom 27.96 M (64% of the WMMA floor) vs HIP
+25.91 M (69%), 1.079x; IQ4_XS Loom 26.45 M (67%) vs HIP 23.15 M (77%),
+1.143x. Our two kernels are about equally efficient; HIP's IQ4_XS kernel is
+the outlier. Its IQ4_XS-specific grouped raster (`group_shift=5`, credited
++12% there) does not transfer: `YAH_TG_SWZ` 17/34/68 (divisors of the 136 row
+groups) costs +1-2% in cycles, and SWZ=34 on the IQ4_XS 17408-row kernels in
+the pipeline went 385.0 -> 394.1 ms (one round each, other rows +0.9%). A
+3-launch ms reading that looked faster was clock noise. The swizzle now clamps
+the row group, so a group size that does not divide the row groups gives wrong
+results instead of out-of-bounds stores.
+
 ## 7. Decode and the HIP removal
 
 The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.

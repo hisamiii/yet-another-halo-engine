@@ -76,6 +76,10 @@ Q4_HDR = Q4_HDR_ENV == "1"
 # Q3_W: Q3_K header in one load and the 2+1-bit quant assembly on 32-bit words
 Q3_W = os.environ.get("YAH_TG_Q3W", "1") == "1"
 IQ4_W = os.environ.get("YAH_TG_IQ4W", "0") == "1"
+# IQ4_U8: the codebook offset by +128 (unsigned bytes), uitofp, then -128.0:
+# the same exact f32 value (small integers), so bit-identical; uitofp of a
+# byte lowers to v_cvt_f32_ubyteN where sitofp needs v_bfe_i32 + v_cvt_f32_i32
+IQ4_U8 = os.environ.get("YAH_TG_IQ4U8", "0") == "1"
 
 KSUB = PH = GPP = GPL = ROWP = None
 
@@ -358,6 +362,11 @@ def iq4xs_compute(v, gb):
                 e(f"    %cb{part}{u}i = vector.ori %cb{part}{u}lw, %cb{part}{u}hs : vector<16xi16>")
                 e(f"    %c{part}{u} = vector.bitcast %cb{part}{u}i : vector<16xi16> to vector<16xf16>")
                 e(f"    %f{part}{u} = vector.extf %c{part}{u} : vector<16xf16> to vector<16xf32>")
+        elif IQ4_U8:
+            for part in ("lo", "hi"):
+                e(f"    %cu{part}{u} = vector.table.lookup %kvtu[%n{part}{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+                e(f"    %fu{part}{u} = vector.uitofp %cu{part}{u} : vector<16xi8> to vector<16xf32>")
+                e(f"    %f{part}{u} = vector.subf %fu{part}{u}, %c128v_iq : vector<16xf32>")
         else:
             e(f"    %clo{u} = vector.table.lookup %kvt[%nlo{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
             e(f"    %chi{u} = vector.table.lookup %kvt[%nhi{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
@@ -1302,6 +1311,10 @@ def iq4xs_setup():
           "  %c0f4_iq = scalar.constant 252645135 : i32", "  %m0f4_iq = vector.splat %c0f4_iq : vector<4xi32>",
           "  %c4w_iq = scalar.constant 4 : i32", "  %s4w_iq = vector.splat %c4w_iq : vector<4xi32>"]
     L.append("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
+    if IQ4_U8:
+        L += [f"  %kvu{i} = scalar.constant {(v + 128) - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)]
+        L.append("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
+        L += ["  %c128f_iq = scalar.constant 128.0 : f32", "  %c128v_iq = vector.splat %c128f_iq : vector<16xf32>"]
     if IQ4_F16:
         bits = [struct.unpack("<H", struct.pack("<e", float(v)))[0] for v in IQ4_KVALUES]
         for nm, part in (("l", [b & 255 for b in bits]), ("h", [b >> 8 for b in bits])):

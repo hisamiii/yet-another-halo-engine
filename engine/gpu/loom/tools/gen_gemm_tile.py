@@ -328,7 +328,12 @@ def gen(fmt, kind="kstore"):
         e("  %sw_in = index.rem %sw_lin, %sw_gt : index")
         e("  %sw_rg0 = index.mul %sw_grp, %sw_g : index")
         e("  %sw_rgi = index.rem %sw_in, %sw_g : index")
-        e("  %wg_x = index.add %sw_rg0, %sw_rgi : index")
+        # clamped: a group size that does not divide the row groups leaves a
+        # partial last group whose row tiles would run past the matrix (wrong
+        # results instead of out-of-bounds stores, which hang this GPU)
+        e("  %wg_x_s = index.add %sw_rg0, %sw_rgi : index")
+        e("  %sw_mg1 = index.sub %sw_mg, %c1 : index")
+        e("  %wg_x = index.min %wg_x_s, %sw_mg1 : index")
         e("  %wg_y = index.div %sw_in, %sw_g : index")
     else:
         e("  %wg_x = kernel.workgroup.id<x> : index")
