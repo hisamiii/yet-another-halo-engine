@@ -2308,3 +2308,6 @@ equal to clean8192c's.
 - Why ms lies at 8192: a run is ~15 s at full load, so a 15 s gap does not
   return the GPU to the same thermal state. The second run of a pair starts
   hotter (the GPU is hotspot-thermal-limited, see above).
+- With 30 s gaps (one round each, same order): clean8192c 15169.5,
+  p53-8192 14260.2 (-6.0%, in line with cycles), HIP 15709.3. pp8192 timing
+  uses 30 s gaps from here.
