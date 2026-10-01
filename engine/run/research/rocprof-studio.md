@@ -71,3 +71,34 @@ Script: engine/run/research/fa/ (att.sh / attq.sh capture,
   rocprofv3 already decoded. Raw-ATT decoding wants rocprof-trace-decoder
   0.2.2; TheRock ships 0.1.7.
 - **Manage:** `systemctl --user {status,restart,stop} rocprof-studio`.
+
+## Feature audit for this engine (2026-10-01)
+
+**Usable (on loomhip captures):**
+- **hidden_latency:** exposed vs hidden stall per instruction. The main new
+  capability.
+- **hotspots / wave_analyze:** latency, stall and hit counts per instruction
+  and per wave.
+- **Occupancy over time:** wave residency time series from the ATT capture
+  (tails, ramp, LPT).
+- **Counters as tensors:** scalar/tensor expressions over named axes for
+  per-SE/CU breakdowns.
+- **reference_query:** offline ISA catalogue for RDNA3.5 with encodings and
+  matrix-type compatibility (e.g. iu4 operand layout for kv4a4).
+- **Timeline HTML export.**
+- **profile_run** with `profiler` = TheRock rocprofv3 drives loomhip runs
+  end to end (counters + ATT + decode).
+
+**Not available here (checked):**
+- **PC sampling:** rocprofv3 reports "configuration is not supported on any
+  of the agents" on gfx1151 (host_trap).
+- **SPM:** not exposed by rocprofv3 on this platform.
+- **Source flamegraph:** Loom code objects carry no .debug_* sections and
+  loom-compile has no line-info option.
+- **Kerncap tuning and live gated profiling** (profile_start/trigger) of the
+  real pipeline: rocprofv3 sees no dispatches from loom_forward_pp, because
+  HRX drives the GPU without ROCr/HIP. A `--kernel-trace` run wrote nothing.
+  - These only reach kernels run through the HIP harness (loomhip), where we
+    already control the inputs.
+  - Kernel tuning is also documented as qualified on gfx1151 but unqualified
+    for WMMA-heavy kernels, and it compiles HIP variants.
