@@ -33,6 +33,7 @@ unroll(2|4) on the K step no better. 256 x 256 does not fit: 64 KB of tiles
 plus the IQ grid table staged in LDS is over the 64 KB workgroup limit.
 """
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -79,14 +80,34 @@ DECAHEAD_FMTS = ("iq4xs", "q4k", "q5k", "q6k")
 SWEPI_ENV = os.environ.get("YAH_TG_SWEPI")
 SWEPI_FMTS = ("iq3s", "iq3xxs")
 DECAHEAD_ENV = os.environ.get("YAH_TG_DECAHEAD")
+# NOCARRY=1 (decode-ahead + KSL): a K loop that carries only the accumulators.
+# Phase kp issues phase kp+1's raw weight loads (decoding waves) and activation
+# row at its top, multiplies tile kp, then decodes kp+1 into the other weight
+# tile and, after the second barrier, stores the row. The default loop carries
+# the raw bytes and the row across the back edge, which the allocator cannot
+# always place (Q4_K at 4 x 2 spills accumulators and prefetch at any pressure).
+NOCARRY = os.environ.get("YAH_TG_NOCARRY", "0") == "1"
+NC_FENCE = os.environ.get("YAH_TG_NC_FENCE", "1") == "1"
+# NC_DEC=s: the decode goes after k step s's MMAs (0 = before all of them,
+# default = after the last). After the last, the yielded accumulators are live
+# across the decode's temporaries (Q4_K 4 x 2: 3 of them spilled there).
+NC_DEC = os.environ.get("YAH_TG_NC_DEC")
+# NC_ALATE=1: the activation row loads after the MMAs (right before the second
+# barrier) instead of at the top: 16 fewer VGPRs live across the MMAs; the
+# load latency is left to the other resident workgroups.
+NC_ALATE = os.environ.get("YAH_TG_NC_ALATE", "0") == "1"
 DECAHEAD = DECAHEAD_ENV == "1"
 # DECW=n: n extra waves that only decode (decode-ahead only); the NWAVE MMA
 # waves then never decode, so a phase costs max(decode, MMA), not the sum on
 # the decoding waves.
 DECW = int(os.environ.get("YAH_TG_DECW", "0"))
-RHS_OUTER = os.environ.get("YAH_TG_RHSO", "0") == "1"
+RHS_OUTER_ENV = os.environ.get("YAH_TG_RHSO")
+RHS_OUTER = RHS_OUTER_ENV == "1"
 # fence after every RHS_FENCE rhs groups so the loads cannot all be hoisted
-RHS_FENCE = int(os.environ.get("YAH_TG_RHSF", "0"))
+RHS_FENCE_ENV = os.environ.get("YAH_TG_RHSF")
+RHS_FENCE = int(RHS_FENCE_ENV or "0")
+# per-format rhs-outer default (fence every n): Q4_K at 4 x 2 13.77 -> 13.54 M
+RHSO_FMTS = {"q4k": 1}
 
 # f16 of padding per decoded weight row: unpadded rows are 128 B apart at
 # KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
@@ -177,7 +198,9 @@ KSUB_OF = {}
 
 
 def configure(fmt):
-    global DECAHEAD, KSL, DECLOAD
+    global DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE
+    RHS_OUTER = RHS_OUTER_ENV == "1" if RHS_OUTER_ENV is not None else fmt in RHSO_FMTS
+    RHS_FENCE = int(RHS_FENCE_ENV) if RHS_FENCE_ENV is not None else RHSO_FMTS.get(fmt, 0)
     KSL = KSL_ENV == "1" if KSL_ENV is not None else fmt in KSL_FMTS
     DECLOAD = DECLOAD_ENV == "1" if DECLOAD_ENV is not None else fmt in KSL_FMTS
     DECAHEAD = DECAHEAD_ENV == "1" if DECAHEAD_ENV is not None else fmt in DECAHEAD_FMTS
@@ -208,6 +231,9 @@ def configure(fmt):
     # barriers, where every wave decodes in the same phase. At 4 x 2 it wins
     # (each decode feeds twice the WMMAs; see WAVE_FMTS).
     G.IQ3_U8F = os.environ.get("YAH_SD_IQ3U8F", "1" if w3 else "0") == "1"
+    # Q4_K: subtract-and-narrow through v_fma_mix (gen_gemm_shared Q4FMIX);
+    # what lets Q4_K run at 4 x 2 without spills
+    G.Q4FMIX = os.environ.get("YAH_SD_Q4FMIX", "1" if fmt == "q4k" else "0") == "1"
     G.VDECW_FR = os.environ.get("YAH_SD_VDECW_FR", "1" if w3 else "0") == "1"
     G.LR = BM
     G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
@@ -245,6 +271,12 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
 # instructions still but drops off the issue bound (25.88: exposed latency).
 # IQ3_XXS 25.41 -> 24.23, Q3_K 28.62 -> 25.12 M cycles (bit-identical). Q4_K
 # spills at 4 x 2 (240 VGPRs, 65 scratch instructions: 44.05 M) and stays 4 x 4.
+# Q4_K's spills at 4 x 2 were not pressure: its decode narrowed with
+# v_cvt_f16_f32, whose result can only be v0..v127, and the 16 accumulators fill
+# exactly that window, so the allocator evicted accumulators to scratch for each
+# conversion. Through v_fma_mix (Q4FMIX) it fits (200-248 VGPRs, no scratch).
+# Real bytes, M cycles, bit-identical: kstore 15.21 -> 13.54 (HIP 13.64-13.71),
+# swiglu 27.52 -> 24.85, kres K=17408 25.75 -> 23.71, K=6144 ~neutral.
 # IQ3_S spills at 4 x 2 with its element decode (256 VGPRs: 52.78 M) but fits
 # with the word-path U8F/FR decode (224-248 VGPRs, no scratch; configure()),
 # which cuts its decode block 467 VALU / 32 WMMA -> 353 / 64. Real bytes, M
@@ -254,7 +286,7 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
 # standalone; pp2048 row +8.6 ms); with the LDS epilogue (SWEPI) it wins
 # (27.27 -> 25.13). Values: ((WM, WN), kinds or None for all).
 WAVE_FMTS = {"iq4xs": ((4, 2), None), "iq3xxs": ((4, 2), None), "q3k": ((4, 2), None),
-             "iq3s": ((4, 2), None)}
+             "iq3s": ((4, 2), None), "q4k": ((4, 2), None)}
 
 
 def gen(fmt, kind="kstore"):
@@ -638,6 +670,132 @@ def _gen(fmt, kind="kstore"):
         e("    %xkkn = index.mul %xkn, %cksub : index")
         anx = a_loads("xna_", "%xkkn")
         e("    scf.yield " + ", ".join(acc) + ", " + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
+        e("  }")
+    elif NOCARRY:
+        assert DECAHEAD and KSL and not (FRAG or DECW or ONEBAR or PF or ABL or DECLATE), "NOCARRY: decode-ahead KSL loop"
+        nst = ksub // 16
+        # phase 0: decoded into weight tile 0 and its activation row staged now
+        L0, w00 = loads("pf_", "%row_off_i", "%gl_i")
+        L.extend(L0)
+        e("  scf.if %decoder {")
+        L.extend(compute([nm for nm, _ in w00], "%gl_i"))
+        e("  }")
+        for sg, (nm, _) in enumerate(a_loads("pz_", "%c0")):
+            e(f"  %zs{sg}c = index.constant {8 * sg} : index")
+            e(f"  %zs{sg} = index.add %aseg0, %zs{sg}c : index")
+            e(f"  vector.store {nm}, %al_rows[%atok, %zs{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+        e("  %kp_last = index.sub %kphases, %c1 : index")
+        e("  %sg_id = kernel.subgroup.id : index")
+        assert (slots * BM) % WS == 0
+        e(f"  %cdecw = index.constant {slots * BM // WS} : index")
+        e("  %dec_wave = index.cmp ult, %sg_id, %cdecw : index")
+        ca = ", ".join(f"%a{i} = %init : {V8}" for i in range(NA))
+        e("  " + ", ".join(f"%acc{i}" for i in range(NA)) + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({types}) {PPOL} {{")
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        # phase kp+1 (clamped: the last iteration's loads are in bounds, unused)
+        e("    %kp_d0 = index.add %kp, %c1 : index")
+        e("    %kp_d = index.min %kp_d0, %kp_last : index")
+        e("    %kb_d = index.div %kp_d, %cph : index")
+        e("    %ph_d = index.rem %kp_d, %cph : index")
+        e("    %kb_di = index.cast %kb_d : index to i32")
+        e("    %ph_di = index.cast %ph_d : index to i32")
+        e("    %blk_do = scalar.muli %kb_di, %cbbi : i32")
+        e("    %blk_d = scalar.addi %row_off_i, %blk_do : i32")
+        e("    %phg_d = scalar.muli %ph_di, %cgppi : i32")
+        e("    %gb_d = scalar.addi %phg_d, %gl_i : i32")
+        Ln, raw = loads("nx_", "%blk_d", "%gb_d")
+        if DECLOAD:
+            # only the decoding waves fetch weight bytes; the others yield zeros
+            packed_t = []
+            e("    %nxr_t = scf.if %dec_wave -> (PLACEHOLDER) {")
+            mark = len(L) - 1
+            L.extend(Ln)
+            packed = G.pack_vals(e, raw, "n")
+            packed_t = [ty for _, ty in packed]
+            e("      scf.yield " + ", ".join(nm for nm, _ in packed) + " : " + ", ".join(packed_t))
+            e("    } else {")
+            zs = []
+            for x, ty in enumerate(packed_t):
+                m = re.match(r"vector<(\d+)x(\w+)>", ty)
+                et = m[2] if m else ty
+                zc = f"%nz{x}s"
+                e(f"      {zc} = scalar.constant {'0.0' if et.startswith('f') else '0'} : {et}")
+                if m:
+                    e(f"      %nz{x} = vector.splat {zc} : {ty}")
+                    zs.append(f"%nz{x}")
+                else:
+                    zs.append(zc)
+            e("      scf.yield " + ", ".join(zs) + " : " + ", ".join(packed_t))
+            e("    }")
+            names_r = [f"%nxr{x}" for x in range(len(packed_t))]
+            L[mark] = "    " + ", ".join(names_r) + " = scf.if %dec_wave -> (" + ", ".join(packed_t) + ") {"
+            raw_names = G.unpack_vals(e, list(zip(names_r, packed_t)), raw)
+        else:
+            L.extend(Ln)
+            raw_names = [nm for nm, _ in raw]
+        e("    %kk_d = index.mul %kp_d, %cksub : index")
+        anx = None if NC_ALATE else a_loads("na_", "%kk_d")
+        if NC_FENCE:
+            # issue the loads before the MMAs: their latency hides behind them
+            e("    scf.schedule.fence")
+        e("    %buf_d = index.rem %kp_d0, %c2 : index")
+        e("    %off_d0 = index.mul %buf_d, %wl_tb : index")
+        e("    %off_d = index.cast %off_d0 : index to offset")
+        e(f"    %wl_dec = buffer.view %wl[%off_d] : buffer -> view<{BM}x{G.ROWP}xf16>")
+        e("    %buf_m = index.rem %kp, %c2 : index")
+        e("    %off_m0 = index.mul %buf_m, %wl_tb : index")
+        e("    %off_m = index.cast %off_m0 : index to offset")
+        e(f"    %wl_mma = buffer.view %wl[%off_m] : buffer -> view<{BM}x{G.ROWP}xf16>")
+        acc = [f"%a{i}" for i in range(NA)]
+        nc_dec = int(NC_DEC) if NC_DEC is not None else nst
+
+        def nc_decode():
+            # phase kp+1 decoded into the other tile (the MMAs read tile kp)
+            e("    scf.if %dec_wave {")
+            L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(raw_names, "%gb_d"))
+            e("    }")
+        for st in range(nst):
+            if st == nc_dec:
+                nc_decode()
+            if st and KSL_FENCE:
+                e("    scf.schedule.fence")
+            e(f"    %sks{st} = index.constant {16 * st} : index")
+            for i in range(FM):
+                e(f"    %slr{st}_{i} = index.add %wr_off, %c{16 * i} : index")
+                e(f"    %slhs{st}_{i} = vector.fragment.load<lhs> %wl_mma[%slr{st}_{i}, %sks{st}] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
+
+            def srhs(j):
+                e(f"    %stc{st}_{j} = index.add %wt_off, %c{16 * j} : index")
+                e(f"    %srhs{st}_{j} = vector.fragment.load<rhs> %al_t[%sks{st}, %stc{st}_{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
+
+            def smma(i, j):
+                n = i * FN + j
+                e(f"    %sn{st}_{n} = vector.mma %slhs{st}_{i}, %srhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
+            if RHS_OUTER:
+                for j in range(FN):
+                    srhs(j)
+                    for i in range(FM):
+                        smma(i, j)
+                    if RHS_FENCE and j + 1 < FN and (j + 1) % RHS_FENCE == 0:
+                        e("    scf.schedule.fence")
+            else:
+                for j in range(FN):
+                    srhs(j)
+                for i in range(FM):
+                    for j in range(FN):
+                        smma(i, j)
+            acc = [f"%sn{st}_{n}" for n in range(NA)]
+        if nc_dec >= nst:
+            nc_decode()
+        if anx is None:
+            anx = a_loads("na_", "%kk_d")
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        # every wave is done reading the activation tile: phase kp+1's row
+        for sg, (nm, _) in enumerate(anx):
+            e(f"    %as{sg}c = index.constant {8 * sg} : index")
+            e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
+            e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+        e("    scf.yield " + ", ".join(acc) + f" : {types}")
         e("  }")
     else:
         if DECAHEAD:

@@ -176,6 +176,13 @@ IQ3_U8F = os.environ.get("YAH_SD_IQ3U8F", "0") == "1"
 # full rate) and s1 * 255 as (s1 << 8) - s1 (each set byte becomes 0xFF; the top
 # byte wraps mod 2^32). Same integers: bit-identical.
 VDECW_FR = os.environ.get("YAH_SD_VDECW_FR", "0") == "1"
+# Q4FMIX (Q4_K/Q5_K): the decode's subtract-and-narrow as fptrunc(fma(e, 1, -dm))
+# per element instead of fptrunc(e - dm). The product by 1 is exact, so it is
+# bit-identical, and it selects v_fma_mix{lo,hi}: v_cvt_f16_f32 writes only
+# v0..v127, and with 128 VGPRs of accumulators live (4 x 2 waves) the allocator
+# evicted accumulators to scratch for every conversion result. The 1.0 is built
+# from gb & ~gb so the canonicalizer cannot fold the fma back into a subf.
+Q4FMIX = os.environ.get("YAH_SD_Q4FMIX", "0") == "1"
 
 
 def _i8n(ty):
@@ -942,6 +949,12 @@ def q4k_compute(v, gb, q5=False):
     L = []
     e = L.append
     it = iter(v)
+    if Q4FMIX:
+        # an opaque 1.0 (see Q4FMIX): gb & ~gb is 0, unprovable to the folder
+        e(f"    %q4nb = scalar.xori {gb}, %q4m1 : i32")
+        e(f"    %q4z = scalar.andi {gb}, %q4nb : i32")
+        e("    %q4ob = scalar.ori %q4z, %q4one_b : i32")
+        e("    %q4one = scalar.bitcast %q4ob : i32 to f32")
     if Q4_HDR:
         hdr = next(it)
         e(f"    %hdw = vector.bitcast {hdr} : vector<16xi8> to vector<4xi32>")
@@ -1058,8 +1071,20 @@ def q4k_compute(v, gb, q5=False):
             # value and can select v_cvt_f32_ubyteN (no sign-extend)
             e(f"    %fq{half}{u} = vector.{'uitofp' if Q4_UITOFP else 'sitofp'} {src} : vector<16xi8> to vector<16xf32>")
             e(f"    %sq{half}{u} = vector.mulf %dsc_v{u}, %fq{half}{u} : vector<16xf32>")
-            e(f"    %vq{half}{u} = vector.subf %sq{half}{u}, %dm_v{u} : vector<16xf32>")
-            e(f"    %h{half}{u} = vector.fptrunc %vq{half}{u} : vector<16xf32> to vector<16xf16>")
+            if Q4FMIX:
+                if half == "lo":
+                    e(f"    %ndm{u} = scalar.negf %dm{u} : f32")
+                hs = []
+                for j in range(16):
+                    t = f"{half}{u}_{j}"
+                    e(f"    %qe{t} = vector.extract %sq{half}{u}[{j}] : vector<16xf32> -> f32")
+                    e(f"    %qm{t} = scalar.fmaf %qe{t}, %q4one, %ndm{u} : f32")
+                    e(f"    %qt{t} = scalar.fptrunc %qm{t} : f32 to f16")
+                    hs.append(f"%qt{t}")
+                e(f"    %h{half}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
+            else:
+                e(f"    %vq{half}{u} = vector.subf %sq{half}{u}, %dm_v{u} : vector<16xf32>")
+                e(f"    %h{half}{u} = vector.fptrunc %vq{half}{u} : vector<16xf32> to vector<16xf16>")
         e(f"    %col_i{u} = scalar.shli %gl{u}, %c5i : i32")
         e(f"    %col_x{u} = index.cast %col_i{u} : i32 to index")
         e(f"    %col_l{u} = index.max %col_x{u}, %c0 : index")
@@ -1078,7 +1103,8 @@ def q4k_setup():
             "  %q4sh0 = scalar.constant 0 : i32", "  %q4sh4 = scalar.constant 4 : i32",
             "  %c16i_q = scalar.constant 16 : i32", "  %c255i_q = scalar.constant 255 : i32",
             "  %c014 = scalar.constant 16843009 : i32", "  %m014 = vector.splat %c014 : vector<4xi32>",
-            "  %s44 = vector.splat %q4sh4 : vector<4xi32>"]
+            "  %s44 = vector.splat %q4sh4 : vector<4xi32>",
+            "  %q4m1 = scalar.constant -1 : i32", "  %q4one_b = scalar.constant 1065353216 : i32"]
 
 
 def iq2xxs_loads(p, blk, gb):

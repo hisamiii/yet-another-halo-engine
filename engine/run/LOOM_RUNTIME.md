@@ -2355,3 +2355,48 @@ spill rows), even at 171-208 VGPRs with peak live 171-190:
 - A fix needs either allocator work (excluded: stock compiler) or a K loop
   whose global prefetch is not loop-carried. Upside is ~0.5% of the prefill
   (Q4_K ~9.5% of cycles; 4 x 2 gave IQ4_XS -5.6%, Q3_K -12%). Parked.
+
+**Q4_K at 4 x 2: the v0..v127 conversion window (2026-10-01).** The 4 x 2
+spills above were not back-edge allocation. Found by reading the stock
+allocator (diagnosis only):
+
+- Q4_K's decode narrows with `vector.subf` + `vector.fptrunc`, which lowers to
+  `v_cvt_f16_f32`. That instruction's result can only be v0..v127
+  (`descriptors/alu.py` operand window; `allocation/target_constraints.c`
+  `apply_operand_window` caps the interval at 128).
+- At 4 x 2 the 16 accumulators are exactly 128 VGPRs, live across the decode,
+  and the linear scan fills low registers first. So every conversion result
+  evicts an accumulator (`interval_assignment.c` `find_free_location` fails ->
+  victim search), and the evictions become scratch spill storage (`frame.c`).
+- The register budget is 256; the final count (176-208) was not a cap.
+- IQ4_XS never hit it: its decode narrows through `v_fma_mix{lo,hi}`, which can
+  address all 256 VGPRs.
+- Fix (`YAH_SD_Q4FMIX`, default for Q4_K): per element
+  `fptrunc(fma(e, one, -dm))`. The product by 1 is exact, so it is
+  bit-identical. `one` is built as `bitcast((gb & ~gb) | 0x3f800000)` because
+  a provable 1.0 is folded back to `subf` by the canonicalizer.
+- With it, the default (carrying) K loop fits at 4 x 2 (200-248 VGPRs, no
+  scratch). The no-carry loop (`YAH_TG_NOCARRY`, kept, off) was not needed and
+  loses on its own: IQ4_XS 23.26 -> 24.76, Q4_K 4 x 4 15.26 -> 15.56. Its
+  loads issued at the phase top are less hidden, and `suggest` shows 17/27 LDS
+  waits fully draining.
+
+Real bytes, M cycles, bit-identical (1 s gaps for single kernels from here):
+
+| Q4_K | p54 | p55 |
+|---|---:|---:|
+| kstore 10240x5120 | 15.21 | 13.54 (HIP 13.64-13.71) |
+| swiglu | 27.52 | 24.85 |
+| kres K=17408 | 25.75 | 23.71 |
+| kres K=6144 | 12.06-12.13 | 11.95-12.35 (neutral) |
+
+- 4 x 2 + `RHSO`/`RHSF=1` (`RHSO_FMTS`): 13.77 -> 13.54.
+- p55 = p54 + Q4_K kstore/swiglu/kres: md5 a2145e371ceefd4d. pp2048 3290.8 ->
+  3262.8 ms (-0.85%).
+- pp8192 (p55-8192, md5 e94924b79ae21e57): cycles 30381.1 -> 30081.4 M
+  (-0.99%). Q4_K rows -7.7..-12%. Unchanged kernels moved up to ±5% between
+  captures (IQ3_S swiglu 1864.5 vs 1961.8 M on the same HAL), so per-row
+  cycle noise is ~5%.
+- Any decode that narrows with `v_cvt_f16_f32` inside a loop holding 128 VGPRs
+  of accumulators will hit the same window (Q5_K shares this decode; Q6_K,
+  Q2_K, IQ2_* unchecked).
