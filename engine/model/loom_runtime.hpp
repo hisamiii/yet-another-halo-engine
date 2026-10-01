@@ -303,21 +303,28 @@ class LoomDevice {
     }
   }
 
-  // YAH_LOOM_SLEEP_SYNC_US=N: poll the stream and sleep N us between checks
-  // instead of the runtime's blocking wait, which spins a host core for the
-  // whole prefill (ROCr's wait busy-polls) -- power the APU shares with the GPU.
+  // Sleep-poll synchronize: with N > 0 the wait polls an event recorded at
+  // the stream tail and sleeps N us between checks, instead of the runtime's
+  // blocking wait, which busy-polls a host core for the whole wait (ROCr). A
+  // driver that queues a long run before one wait (the prefill) opts in with
+  // SetSleepSync(); YAH_LOOM_SLEEP_SYNC_US=N overrides it (0 = runtime wait).
+  // Off by default: probes time single short waits, where N us of slack shows.
+  void SetSleepSync(long us) {
+    if (!std::getenv("YAH_LOOM_SLEEP_SYNC_US")) sleep_us_ = us;
+  }
   void Synchronize() {
-    static const long sleep_us = [] {
-      const char* v = std::getenv("YAH_LOOM_SLEEP_SYNC_US");
-      return v ? std::atol(v) : 0L;
-    }();
-    if (sleep_us > 0) {
+    if (sleep_us_ > 0) {
+      // hrx_stream_query reports complete while the stream timepoint is 0, which
+      // it is for plain dispatches: poll an event recorded at the tail instead.
+      LoomEvent tail;
+      LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_NONE, &tail.handle), "hrx_event_create");
+      LoomCheck(hrx_event_record(tail.handle, stream_), "hrx_event_record");
       bool complete = false;
       for (;;) {
-        LoomCheck(hrx_stream_query(stream_, &complete), "hrx_stream_query");
+        LoomCheck(hrx_event_query(tail.handle, &complete), "hrx_event_query");
         if (complete) break;
         ++sync_sleeps_;
-        std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+        std::this_thread::sleep_for(std::chrono::microseconds(sleep_us_));
       }
     }
     LoomCheck(hrx_stream_synchronize(stream_), "sync");
@@ -359,6 +366,10 @@ class LoomDevice {
   long paced_ = 0;
   long dispatch_n_ = 0;
   long sync_sleeps_ = 0;
+  long sleep_us_ = [] {
+    const char* v = std::getenv("YAH_LOOM_SLEEP_SYNC_US");
+    return v ? std::atol(v) : 0L;
+  }();
   std::chrono::steady_clock::time_point first_dispatch_, last_dispatch_;
   double dispatch_us_ = 0, dispatch_max_us_ = 0;
   std::deque<LoomEvent> pace_events_;

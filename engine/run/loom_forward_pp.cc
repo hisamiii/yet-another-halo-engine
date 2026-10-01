@@ -122,6 +122,14 @@ bool g_fused_residual = true;  // YAH_FUSED_RESIDUAL=0 disables the gemm_kres pa
 std::map<std::string, double> g_per_name;
 std::map<std::string, int> g_per_count;
 std::chrono::steady_clock::time_point g_mark = std::chrono::steady_clock::now();
+// YAH_TRACE_LOAD: wall time since process start at each setup/teardown phase.
+const std::chrono::steady_clock::time_point g_start = std::chrono::steady_clock::now();
+void Phase(const char* what) {
+  static const bool on = std::getenv("YAH_TRACE_LOAD") != nullptr;
+  if (on)
+    std::fprintf(stderr, "[phase] %8.1f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_start).count(), what);
+}
 // YAH_LOOM_SEQ=<path>: every dispatch's key (HAL or kernel name) and grid in
 // submission order, written at exit. No synchronization, so it pairs with an
 // HRX_PROFILE_FILE=... HRX_PROFILE_MODE=dispatch capture of the same run: the
@@ -137,13 +145,25 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
   static double in_us = 0, between_us = 0, meta_us = 0; static long n = 0;
   static std::chrono::steady_clock::time_point last_return;
   const auto t_in = std::chrono::steady_clock::now();
-  if (dt && n) between_us += std::chrono::duration<double, std::micro>(t_in - last_return).count();
+  static std::map<std::string, std::pair<double, long>> gap_by_next;
+  if (dt && n) {
+    const double g = std::chrono::duration<double, std::micro>(t_in - last_return).count();
+    between_us += g;
+    auto& e = gap_by_next[name]; e.first += g; ++e.second;
+  }
   // The executable's own workgroup size is authoritative; sx is only the
   // fallback for metadata that does not carry one.
   const std::uint32_t ordinal = exe.OrdinalOrZero(name);
   const std::uint32_t ws = exe.WorkgroupSize(ordinal);
   if (dt) meta_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_in).count();
-  struct Report { ~Report() { if (dt && n) std::fprintf(stderr, "Dispatch(): %ld calls, inside %.1f ms (metadata %.1f ms), between calls %.1f ms\n", n, in_us / 1000, meta_us / 1000, between_us / 1000); } };
+  struct Report { ~Report() {
+    if (!(dt && n)) return;
+    std::fprintf(stderr, "Dispatch(): %ld calls, inside %.1f ms (metadata %.1f ms), between calls %.1f ms\n", n, in_us / 1000, meta_us / 1000, between_us / 1000);
+    std::vector<std::pair<double, std::string>> v;
+    for (auto& kv : gap_by_next) v.push_back({kv.second.first, kv.first + " (" + std::to_string(kv.second.second) + ")"});
+    std::sort(v.rbegin(), v.rend());
+    for (std::size_t i = 0; i < v.size() && i < 8; ++i) std::fprintf(stderr, "  host gap before %-40s %8.1f ms\n", v[i].second.c_str(), v[i].first / 1000);
+  } };
   static Report report;
   if (g_seq)
     std::fprintf(g_seq, "%zu,%s,%u,%u,%u\n", g_seq_n++,
@@ -308,6 +328,7 @@ int main(int argc, char** argv) {
   try {
     auto gguf = yah::core::Gguf::Open(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
+    Phase("gguf open");
     std::vector<std::uint32_t> ids_all = ParseIds(ids_path);
     g_b = want ? want : static_cast<std::uint32_t>(ids_all.size());
     if (ids_all.size() < g_b) {
@@ -333,7 +354,13 @@ int main(int argc, char** argv) {
     std::uint32_t kFull = 0;
     for (std::uint32_t l = 0; l < cfg.main_block_count(); ++l)
       if (cfg.IsFullAttention(l)) ++kFull;
+    Phase("dispatch table");
     LoomDevice gpu;
+    // The layers queue ~950 dispatches and wait once at the end; the runtime
+    // wait would busy-poll a core for the whole prefill (LOOM_RUNTIME.md).
+    // YAH_LOOM_TIME waits after every stage, so it keeps the runtime wait.
+    if (!g_time) gpu.SetSleepSync(200);
+    Phase("device");
     std::fprintf(stderr,
                  "loom_forward_pp: tokens=%u tile=%u token_tiles=%u layers=%u geometry=%zu hal(s)\n",
                  B, g_gtile, g_tt, cfg.main_block_count(), g_geom.size());
@@ -358,6 +385,7 @@ int main(int argc, char** argv) {
         weights = gpu.Import(reinterpret_cast<void*>(start), wbytes);
       }
     }
+    Phase("weights import");
     auto ImportTensor = [&](const yah::core::TensorInfo& t) -> Imported {
       return {weights.handle, weights_delta + static_cast<std::size_t>(t.offset),
               static_cast<std::size_t>(t.bytes)};
@@ -485,6 +513,7 @@ int main(int argc, char** argv) {
       }
     }
 
+    Phase("buffers");
     const auto* emb = find("token_embd.weight");
     std::vector<float> host_hidden(static_cast<std::size_t>(B) * kHidden);
     const std::uint8_t* emb_data = gguf.Data(*emb);
@@ -722,6 +751,7 @@ int main(int argc, char** argv) {
       }
     }
     gpu.Synchronize();
+    Phase("embed + first HALs");
     if (std::getenv("YAH_TRACE_LOAD")) std::fprintf(stderr, "[load] ---- timed region starts ----\n");
     const auto t0 = std::chrono::steady_clock::now();
     // YAH_LAYERS=N stops after N layers. It exists to bisect a stage that
@@ -934,6 +964,7 @@ int main(int argc, char** argv) {
     const double layer_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
+    Phase("layers");
 
     {
       std::vector<float> out(static_cast<std::size_t>(B) * kHidden);
@@ -1026,6 +1057,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%9.1f  %5d  %7.3f  %s\n", r.first, g_per_count[r.second], r.first / g_per_count[r.second], r.second.c_str());
     }
     if (g_seq) std::fclose(g_seq);
+    Phase("head + outputs");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "loom_forward_pp: %s\n", error.what());

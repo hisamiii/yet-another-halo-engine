@@ -2217,7 +2217,7 @@ chain is exposed between barriers.
 - p52 = p50 + IQ3_XXS kstore/kres and Q3_K at 4 x 2: md5 unchanged. pp2048
   rows 861.9 -> 819.7 ms (-4.9%) against +1.1% drift.
 
-**Pipeline tax and host CPU (2026-10-01, in progress; paused).**
+**Pipeline tax and host CPU (2026-10-01).**
 
 - **No cycle tax.** With HRX counters in the real pipeline
   (`HRX_PROFILE_MODE=counters`, a local profiling-only libhrx addition), the
@@ -2225,22 +2225,48 @@ chain is exposed between barriers.
   IQ3_S 27.01 vs 27.06, IQ3_XXS 24.21 vs 24.23, Q4_K 15.26 vs 15.21.
 - **The ms tax is clock.** gpu_metrics during pp2048: gfx clock median
   ~2270 MHz (min 1630; allowed max pulled to ~2480 of 2900), GPU 95-98 C,
-  thermal-throttle residency rising, socket ~115 W, of which the GPU is
-  ~38 W.
+  socket ~115 W, of which the GPU is ~38 W.
 - **The host keeps the GPU fed.** GPU idle 0.5% of the prefill; dispatch
   gaps have a median of 9 us. Launch overhead is negligible.
-- **One host core is busy for the whole prefill** in both engines (HIP too):
-  ~104% CPU, ~400-460k `AMDKFD_IOC_WAIT_EVENTS` ioctls (ROCr signal wait
-  polling) on the main thread.
-  - `hrx_stream_dispatch` takes only 0.6 ms in total, and the final
-    synchronize finds the stream already complete.
-  - 3.46 s is spent *between* `Dispatch()` calls in the layer loop: some
-    call in the loop waits on the GPU.
-  - Not lazy HAL loading: `YAH_LOOM_PRELOAD=1` loads all 83 HALs before the
-    timed region and the spin persists.
-  - Not dispatch pacing (`YAH_LOOM_PACE`) and not the final synchronize
-    (`YAH_LOOM_SLEEP_SYNC_US`).
-  - Open: find the blocking call (diagnostics `YAH_LOOM_DISPATCH_TIMING`,
-    `YAH_TRACE_LOAD`).
-  - If removable in our code, the core's power could go to the GPU clock.
-
+- **The host spin was the final wait, now fixed.** One core ran at ~104% for
+  the whole prefill (HIP too): ~400-460k `AMDKFD_IOC_WAIT_EVENTS` ioctls.
+  - Where: `YAH_LOOM_DISPATCH_TIMING` attributes host gaps to the next
+    dispatch. All 947 dispatches enqueue in ~1 ms each; 3356 of the 3368 ms
+    of gaps sit before the head's `yah_rmsnorm`, i.e. in the post-layer
+    `gpu.Synchronize()`, where ROCr's wait busy-polls. (An earlier note
+    placed it inside the layer loop; that was wrong.)
+  - Why the first sleep-poll did nothing: `hrx_stream_query` reports
+    complete while `stream->timepoint == 0`, which it is for plain
+    dispatches, so it fell straight through to the spinning wait.
+  - Fix: `LoomDevice::SetSleepSync(us)` records an event at the stream tail
+    and sleep-polls `hrx_event_query`. `loom_forward_pp` turns it on at
+    200 us (not under `YAH_LOOM_TIME`); `YAH_LOOM_SLEEP_SYNC_US=N`
+    overrides it (0 = runtime wait). Probes keep the runtime wait.
+  - Result (one round each, 15 s gap): host CPU 104% -> 3-4%, process CPU
+    3.97 s -> 0.56 s, socket 111 -> 102-107 W. md5 a2145e371ceefd4d.
+- **Freeing that power does not raise the GPU clock.** The GPU is
+  hotspot-thermal-limited, not power-limited. `thr_thm_gfx` climbs at a
+  constant rate from the first 50 ms sample, and Tgfx is pinned at 93-98 C
+  from t=0 (the hotspot saturates within milliseconds). The PPT limits never
+  fire (fppt +7 in a spin run, 0 with sleep-sync). Clock and layers_ms move
+  within run-to-run noise (2094-2311 MHz, 3457-3526 ms). Clock comes only
+  from less GPU energy per unit of work.
+- **Load time (warm page cache):** device 180 ms, weights import 250-450
+  ms, buffers 55 ms, embed + first HALs 20 ms, exit ~110 ms (`YAH_TRACE_LOAD`
+  prints `[phase]` lines). The import is the kernel faulting 3.2M 4 KB PTEs
+  and registering them with amdgpu.
+  - **Folio size of the page cache sets the import cost.** Same 3.2M faults:
+    245-450 ms after a normal mmap cold load, 830 ms after warming the cache
+    with `cat` (small read() folios).
+  - **Lost: prefault on a thread overlapping device init**
+    (`MADV_POPULATE_READ`). Device init went 180 -> 437 ms; the populate
+    holds `mmap_lock`, which ROCr's init mmaps wait on.
+  - **Lost: `MADV_HUGEPAGE` on the GGUF mapping.** Warm: import -80 ms.
+    Cold: +0.6 s, more major faults.
+  - **Lost: `MADV_POPULATE_READ` before the import.** -30 ms.
+  - **Lost: weights as a 2 MB-page THP copy** (`YAH_WEIGHTS_COPY`-style) or
+    a device-local copy (`YAH_LOOM_WEIGHTS_DEVICE`). layers_ms 3505 / 3522
+    vs 3527 (noise); load +5 s / +43 s. Weight TLB reach is not a factor:
+    the GEMMs are issue-bound and reuse each weight tile across 2048 tokens.
+  - What remains is driver cost (ROCr init, KFD userptr registration). It is
+    not reachable from our code with the stock runtime.
