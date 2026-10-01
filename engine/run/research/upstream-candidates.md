@@ -208,6 +208,15 @@ Reproducers: `engine/run/research/fa/` and the `gen_attn_fa.py` knobs.
   registers are carried across it. That drains the prefetch: 15% of wave time
   in the attention, and the same mechanism hit the GEMM decode-ahead.
 
+- **CSE + tied in-place op.** Two `vector.fmaf` on vector<8xf16> with the
+  same addend (a splat) were CSE'd to one value and both `v_pk_fmac_f16`
+  results were tied to it without a copy, so the second read the first's
+  output. Silent miscompile; repro research/fa/unpk.loom. In another shape the
+  same tie hit `coalescing.c:1637 low tied result cannot share the operand
+  location`.
+- f16 vector arithmetic other than fmaf (subf, uitofp) is rejected by the
+  `amdgpu.arithmetic.vector_f32` constraint.
+
 ## Not candidates (measured, no gain)
 
 - Wave64 tile GEMMs: wave64 VALU/LDS instructions cost ~1.7x.

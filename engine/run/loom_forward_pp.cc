@@ -548,11 +548,15 @@ int main(int argc, char** argv) {
     LoomBuffer vt16 = gpu.Allocate(e_vtrans ? kVtBytes : 4);
     // int8 K cache (tools/gen_kvq.py; "attn_kq8" row): per attention layer
     // int8 K [B][1024], scales [B][8] f32, and the per-layer channel mean
-    const bool attn_kq8 = g_geom.count("attn_kq8") != 0;
+    // "attn_kq4" (kv4 configs): the same kernels/buffers with int4 K
+    // (yah_kq4 in kq8.hal, 512 B per token instead of 1024)
+    const bool attn_kq4 = g_geom.count("attn_kq4") != 0;
+    const bool attn_kq8 = g_geom.count("attn_kq8") != 0 || attn_kq4;
     LoomExecutable* e_kmean = attn_kq8 ? &load(dir + "/kmean.hal") : nullptr;
     LoomExecutable* e_kq8 = attn_kq8 ? &load(dir + "/kq8.hal") : nullptr;
     const std::size_t kKsBytes = static_cast<std::size_t>(B) * 8 * 4;
-    LoomBuffer kq8buf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKvCache : 4);
+    const std::size_t kKqBytes = attn_kq4 ? kKvCache / 2 : kKvCache;
+    LoomBuffer kq8buf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKqBytes : 4);
     LoomBuffer ksbuf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKsBytes : 4);
     LoomBuffer kmbuf = gpu.Allocate(attn_kq8 ? 4096 : 4);
     // uint8 V^T cache ("attn_vq8"): per layer [4][tiles][256][16] B + stats [2048] f32
@@ -562,6 +566,12 @@ int main(int argc, char** argv) {
     const std::size_t kVq8Bytes = kVtBytes / 2;
     LoomBuffer vq8buf = gpu.Allocate(attn_vq8 ? std::size_t{kFull} * kVq8Bytes : 4);
     LoomBuffer vsbuf = gpu.Allocate(attn_vq8 ? std::size_t{kFull} * 8192 : 4);
+    // nibble V^T cache ("attn_vq4"): per layer [4][tiles][256] x 8 B + (S, C') x 4 B
+    const bool attn_vq4 = g_geom.count("attn_vq4") != 0;
+    LoomExecutable* e_vq4 = attn_vq4 ? &load(dir + "/vq4.hal") : nullptr;
+    const std::size_t kVq4Bytes = kVtBytes / 4, kVq4sBytes = kVtBytes / 8;
+    LoomBuffer vq4buf = gpu.Allocate(attn_vq4 ? std::size_t{kFull} * kVq4Bytes : 4);
+    LoomBuffer vq4sbuf = gpu.Allocate(attn_vq4 ? std::size_t{kFull} * kVq4sBytes : 4);
     LoomExecutable& e_cast = load(dir + "/cast.hal");
     LoomExecutable& e_gemv = load(dir + "/gemv.hal");
     LoomExecutable& e_rms = load(dir + "/rmsnorm.hal");
@@ -867,7 +877,7 @@ int main(int argc, char** argv) {
           dump_range(kv16, koff, kKvCache * 2, ".ak16");
           dump_range(kv16, voff, kKvCache * 2, ".av16");
         }
-        const std::size_t q8off = std::size_t{ai} * kKvCache;
+        const std::size_t q8off = std::size_t{ai} * kKqBytes;
         const std::size_t ksoff = std::size_t{ai} * kKsBytes;
         if (attn_kq8) {
           {
@@ -876,12 +886,17 @@ int main(int argc, char** argv) {
           }
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, koff, kKvCache * 2}, {kmbuf.handle, 0, 4096},
-              {kq8buf.handle, q8off, kKvCache}, {ksbuf.handle, ksoff, kKsBytes}};
-          Dispatch(gpu, *e_kq8, "yah_kq8", (B + 1) / 2, 1, 1, 256, 1, 1, b);
+              {kq8buf.handle, q8off, kKqBytes}, {ksbuf.handle, ksoff, kKsBytes}};
+          Dispatch(gpu, *e_kq8, attn_kq4 ? "yah_kq4" : "yah_kq8", (B + 1) / 2, 1, 1, 256, 1, 1, b);
         }
         const std::size_t vq8off = std::size_t{ai} * kVq8Bytes;
         const std::size_t vsoff = std::size_t{ai} * 8192;
-        if (attn_vq8) {
+        const std::size_t vq4off = std::size_t{ai} * kVq4Bytes, vq4soff = std::size_t{ai} * kVq4sBytes;
+        if (attn_vq4) {
+          std::vector<hrx_buffer_ref_t> b = {
+              {kv16.handle, voff, kKvCache * 2}, {vq4buf.handle, vq4off, kVq4Bytes}, {vq4sbuf.handle, vq4soff, kVq4sBytes}};
+          Dispatch(gpu, *e_vq4, "yah_vq4", 4, (B + 15) / 16, 1, 256, 1, 1, b);
+        } else if (attn_vq8) {
           {
             std::vector<hrx_buffer_ref_t> b = {{kv16.handle, voff, kKvCache * 2}, {vsbuf.handle, vsoff, 8192}};
             Dispatch(gpu, *e_vstat, "yah_vstat", 4, 1, 1, 256, 1, 1, b);
@@ -897,14 +912,16 @@ int main(int argc, char** argv) {
         {
           std::vector<hrx_buffer_ref_t> b = {
               {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)},
-              attn_kq8 ? hrx_buffer_ref_t{kq8buf.handle, q8off, kKvCache}
+              attn_kq8 ? hrx_buffer_ref_t{kq8buf.handle, q8off, kKqBytes}
                        : hrx_buffer_ref_t{kv16.handle, koff, kKvCache * 2},
-              attn_vq8 ? hrx_buffer_ref_t{vq8buf.handle, vq8off, kVq8Bytes}
+              attn_vq4 ? hrx_buffer_ref_t{vq4buf.handle, vq4off, kVq4Bytes}
+              : attn_vq8 ? hrx_buffer_ref_t{vq8buf.handle, vq8off, kVq8Bytes}
               : e_vtrans ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
                          : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
               {attn_f16 ? scratch.handle : aout.handle, 0, attn_f16 ? hb(scratch) : hb(aout)}, {lse.handle, 0, hb(lse)}};
           if (attn_kq8) b.push_back({ksbuf.handle, ksoff, kKsBytes});
           if (attn_vq8) b.push_back({vsbuf.handle, vsoff, 8192});
+          if (attn_vq4) b.push_back({vq4sbuf.handle, vq4soff, kVq4sBytes});
           // YAH_ATTN_GRID_OLD restores the pre-WMMA attention launch geometry so the
           // two attention kernels can be A/Bd from ONE binary, interleaved, without a
           // rebuild between runs (a failed rebuild leaves a stale binary and a mismatched

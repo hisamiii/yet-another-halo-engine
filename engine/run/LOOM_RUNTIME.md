@@ -2951,3 +2951,59 @@ Pipeline pp8192 attention: fp16 1024.8, int8 998.3, int8+GQA 1006.5 M
 (+0.8%, noise level). GQA trims VALU/WMMA 5% (V unpack once per 6 heads) but
 gives up phase diversity (2 x 12 waves). Kept as an option for configs with
 heavier per-KV work.
+
+**Quantized KV, kv4a8 and kv4a4 (basic) (2026-10-01).** The user asked for
+basic implementations first; rotation and other compression work comes later.
+
+Numerics prototype (research/fa/proto*.py): layer-3 attention-output error vs
+exact, float64.
+
+| change | rel RMS |
+|---|---:|
+| int8 config | 3.3e-3 |
+| + uint8 P | 5.1e-2 (16x worse: weights under 1/510 of the row max round to 0) |
+
+So P stays f16 in every config. Int4 options:
+- K4: per token-half 3.2e-2; with H128 rotation 2.1e-2; H256 asym 32-group
+  1.25e-2; H128 + 64 sink tokens in fp16 1.5e-2.
+- V4: per-channel per 16-token tile 2.1e-2; per-channel over the prompt
+  3.5e-2; per-token 5.8e-2.
+- Q8 vs Q f16: no difference.
+
+Kernels (gen_kvq.py yah_kq4 / yah_vq4, gen_attn_fa.py KQ4 / VQ4 / KA4 / KROT):
+- **K int4:** centred, one scale per (token, half), signed nibbles. Byte j of
+  each 8-dim dword holds dims j | j+4 << 4.
+  - kv4a8: `(w << 4) & 0xf0f0f0f0` / `w & 0xf0f0f0f0` give signed bytes 16 k
+    with no zero point; the 1/16 folds into s_q. iu8 QK^T.
+  - kv4a4: the nibbles as stored, Q int4 packed in the same order, iu4 WMMA.
+- **V int4:** 15 levels per channel per 16-key tile, f16 (S, C') = (16 s,
+  c - 23 s). Staging builds f16 `1 + u/16` = `0x3c00 | u << 6` by masks, then
+  one 16-wide packed fma. P.V stays f16.
+- **KROT=1:** Hadamard H128 per half on K (quantizer) and Q (staging).
+  Default off (basic).
+
+Results (layer 3 standalone, pp8192 pipeline, gate vs golden3 = fp16):
+
+| config | attn rel RMS | pipeline attention (vs fp16 1024.8 M) | mean KL | PPL | flips / 8192 | L0 (8192 ctx) |
+|---|---:|---:|---:|---:|---:|---|
+| int8 | 2.7e-3 | 998.3 M | 5.0e-5 | +0.02% | 0 | KL 1.9e-5 |
+| kv4a8 basic | 3.0e-2 | 1050.3 M | 4.6e-3 | +0.37% | 65 | KL 2.6e-3, PPL +0.21% |
+| kv4a8 + KROT | 2.6e-2 | ~1050 M | 3.0e-3 | +0.27% | 45 | KL 1.1e-3 |
+| **kv4a4 basic** | 5.0e-2 | **876.6 M (-14.5%)** | 7.9e-3 | +0.52% | 139 | KL 5.0e-3, PPL -0.15% |
+| K8 + V4 (mix) | | | 3.0e-4 | +0.05% | 1 | T2 PASS |
+| K4 + V8 (mix) | | | 1.8e-3 | +0.24% | 39 | |
+
+- K error costs ~6x the KL of V error at equal attention-output error (it
+  moves softmax weights). The int4 quality lever is K.
+- kv4a8 is VALU-issue-bound: +40 VALU/tile over int8, ~33 of it the V nibble
+  decode (rocprof studio profile_run + wave capture diff).
+- kv4a4's iu4 QK^T halves the QK matrix cycles.
+
+Loom miscompiles on the way (upstream-candidates #10):
+- Two 8-wide f16 `vector.fmaf` with identical addend splats: CSE merged the
+  splats and both in-place `v_pk_fmac_f16` were tied to one register. The
+  second fma read the first's result (silent wrong output; micro-test
+  research/fa/unpk.loom). A shared-addend variant failed allocation instead
+  (coalescing.c:1637). Workaround: one 16-wide fma.
+- f16 `vector.subf` / `uitofp` are rejected (vector_f32 constraint);
+  `vector.fmaf` on f16 works (v_pk_fmac_f16).

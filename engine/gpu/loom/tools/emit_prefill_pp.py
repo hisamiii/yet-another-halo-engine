@@ -348,6 +348,7 @@ def main():
     vtrans_src = None
     kq8_on = False
     vq8_on = False
+    vq4_on = False
     if attn_hip:
         os.environ.setdefault("YAH_ATTN_MAX_TOKENS", str(max(B, 2048)))
         import gen_attn_hip
@@ -377,17 +378,28 @@ def main():
             geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
         # YAH_ATTN_FA_KQ8=1 (int8 config, K half): int8 K cache written by
         # yah_kmean + yah_kq8 (tools/gen_kvq.py), read by the FA kernel
+        # YAH_ATTN_FA_KQ4=1 (kv4 configs): int4 K of H128 (k - m) by yah_kq4
+        kq4_mode = (os.environ.get("YAH_ATTN_FA_KQ4", "0") == "1"
+                    or os.environ.get("YAH_ATTN_FA_KA4", "0") == "1")   # kv4a4: same caches
         kq8_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
-                  and os.environ.get("YAH_ATTN_FA_KQ8", "0") == "1")
+                  and (os.environ.get("YAH_ATTN_FA_KQ8", "0") == "1" or kq4_mode))
         if kq8_on:
             import gen_kvq
             kmean_src = os.path.join(tmp, "yah_kmean.loom")
             kq8_src = os.path.join(tmp, "yah_kq8.loom")
             open(kmean_src, "w").write(gen_kvq.gen_kmean())
-            open(kq8_src, "w").write(gen_kvq.gen_kq8())
-            geom.append(("attn_kq8", 0, 0, 0))
+            open(kq8_src, "w").write(gen_kvq.gen_kq4() if kq4_mode else gen_kvq.gen_kq8())
+            geom.append(("attn_kq4" if kq4_mode else "attn_kq8", 0, 0, 0))
         # YAH_ATTN_FA_VQ8=1 (int8 config, V half): uint8 V^T by yah_vstat +
         # yah_vq8 instead of the f16 transpose
+        # YAH_ATTN_FA_VQ4=1 (kv4 configs): nibble V^T + (S, C') by yah_vq4
+        vq4_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
+                  and os.environ.get("YAH_ATTN_FA_VQ4", "0") == "1")
+        if vq4_on:
+            import gen_kvq
+            vq4_src = os.path.join(tmp, "yah_vq4.loom")
+            open(vq4_src, "w").write(gen_kvq.gen_vq4())
+            geom.append(("attn_vq4", 0, 0, 0))
         vq8_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
                   and os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1")
         if vq8_on:
@@ -500,6 +512,8 @@ def main():
         *([(vstat_src, "vstat.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B]),
            (vq8_src, "vq8.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
           if vq8_on else []),
+        *([(vq4_src, "vq4.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
+          if vq4_on else []),
         ("yah_half_cast.loom", "cast.hal",
          ["yah_half_cast.num_elements=%d" % (6144 * B)]),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",

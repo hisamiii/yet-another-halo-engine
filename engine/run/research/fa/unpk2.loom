@@ -1,0 +1,68 @@
+amdgpu.target<gfx1151> @t_w32 {subgroup_size = 32}
+kernel.def target(@t_w32) @unpk() {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%a: buffer, %s: buffer, %o: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c16 = index.constant 16 : index
+  %c8 = index.constant 8 : index
+  %av = buffer.view %a[%base] : buffer -> view<64xi32>
+  %sv = buffer.view %s[%base] : buffer -> view<32xi32>
+  %ov = buffer.view %o[%base] : buffer -> view<512xf16>
+  %tid = kernel.workitem.id<x> : index
+  %ai = index.mul %tid, %c2 : index
+  %w = vector.load %av[%ai] : view<64xi32> -> vector<2xi32>
+  %st = view.load %sv[%tid] : view<32xi32> -> i32
+  %v4m = scalar.constant 62915520 : i32
+  %v4g = scalar.constant 1006648320 : i32
+  %s1 = vector.from_elements %st : vector<1xi32>
+  %s2 = vector.bitcast %s1 : vector<1xi32> to vector<2xf16>
+  %ss = vector.extract %s2[0] : vector<2xf16> -> f16
+  %sc = vector.extract %s2[1] : vector<2xf16> -> f16
+  %ss8 = vector.splat %ss : vector<8xf16>
+  %w0 = vector.extract %w[0] : vector<2xi32> -> i32
+  %c00 = scalar.constant 6 : i32
+  %x00 = scalar.shli %w0, %c00 : i32
+  %m00 = scalar.andi %x00, %v4m : i32
+  %g00 = scalar.ori %m00, %v4g : i32
+  %c01 = scalar.constant 2 : i32
+  %x01 = scalar.shli %w0, %c01 : i32
+  %m01 = scalar.andi %x01, %v4m : i32
+  %g01 = scalar.ori %m01, %v4g : i32
+  %c02 = scalar.constant 2 : i32
+  %x02 = scalar.shrui %w0, %c02 : i32
+  %m02 = scalar.andi %x02, %v4m : i32
+  %g02 = scalar.ori %m02, %v4g : i32
+  %c03 = scalar.constant 6 : i32
+  %x03 = scalar.shrui %w0, %c03 : i32
+  %m03 = scalar.andi %x03, %v4m : i32
+  %g03 = scalar.ori %m03, %v4g : i32
+  %w1 = vector.extract %w[1] : vector<2xi32> -> i32
+  %c10 = scalar.constant 6 : i32
+  %x10 = scalar.shli %w1, %c10 : i32
+  %m10 = scalar.andi %x10, %v4m : i32
+  %g10 = scalar.ori %m10, %v4g : i32
+  %c11 = scalar.constant 2 : i32
+  %x11 = scalar.shli %w1, %c11 : i32
+  %m11 = scalar.andi %x11, %v4m : i32
+  %g11 = scalar.ori %m11, %v4g : i32
+  %c12 = scalar.constant 2 : i32
+  %x12 = scalar.shrui %w1, %c12 : i32
+  %m12 = scalar.andi %x12, %v4m : i32
+  %g12 = scalar.ori %m12, %v4g : i32
+  %c13 = scalar.constant 6 : i32
+  %x13 = scalar.shrui %w1, %c13 : i32
+  %m13 = scalar.andi %x13, %v4m : i32
+  %g13 = scalar.ori %m13, %v4g : i32
+  %p = vector.from_elements %g00, %g01, %g02, %g03, %g10, %g11, %g12, %g13 : vector<8xi32>
+  %f = vector.bitcast %p : vector<8xi32> to vector<16xf16>
+  %ss16 = vector.splat %ss : vector<16xf16>
+  %sc16 = vector.splat %sc : vector<16xf16>
+  %r = vector.fmaf %f, %ss16, %sc16 : vector<16xf16>
+  %oi = index.mul %tid, %c16 : index
+  vector.store %r, %ov[%oi] : vector<16xf16>, view<512xf16>
+  kernel.return
+}
