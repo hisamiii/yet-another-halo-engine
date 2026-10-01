@@ -71,7 +71,13 @@ DECAHEAD_FMTS = ("iq4xs", "q4k", "q5k", "q6k")
 # SWEPI=1: the swiglu epilogue on lds_epilogue's structure (one barrier,
 # wave-private slabs, 4-row vector loads/stores) instead of scalar slab walks
 # behind two workgroup barriers each.
-SWEPI = os.environ.get("YAH_TG_SWEPI", "0") == "1"
+# Default for the IQ3 formats (SWEPI_FMTS). The old scalar walk issues one
+# dependent global gate load per element in a rolled loop; with one workgroup
+# per WGP nothing hides it (IQ3_S swiglu at 90% of its issue bound). Real bytes,
+# M cycles, bit-identical: IQ3_S 27.56 -> 24.85, IQ3_XXS 27.27 -> 25.13 (with
+# 4 x 2), IQ4_XS 24.81 -> 24.71 (left off: neutral, 2x code).
+SWEPI_ENV = os.environ.get("YAH_TG_SWEPI")
+SWEPI_FMTS = ("iq3s", "iq3xxs")
 DECAHEAD_ENV = os.environ.get("YAH_TG_DECAHEAD")
 DECAHEAD = DECAHEAD_ENV == "1"
 # DECW=n: n extra waves that only decode (decode-ahead only); the NWAVE MMA
@@ -244,9 +250,10 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
 # which cuts its decode block 467 VALU / 32 WMMA -> 353 / 64. Real bytes, M
 # cycles, bit-identical: kstore 27.08 -> 24.15 (HIP 25.91), swiglu 28.52 ->
 # 27.76, kres K=17408 28.90 -> 24.18, K=6144 14.16 -> 9.86.
-# IQ3_XXS swiglu loses at 4 x 2 (27.39 -> 27.76 standalone; pp2048 row +8.6 ms):
-# kstore/kres only. Values: ((WM, WN), kinds or None for all).
-WAVE_FMTS = {"iq4xs": ((4, 2), None), "iq3xxs": ((4, 2), ("kstore", "kres")), "q3k": ((4, 2), None),
+# IQ3_XXS swiglu lost at 4 x 2 with the scalar swiglu epilogue (27.39 -> 27.76
+# standalone; pp2048 row +8.6 ms); with the LDS epilogue (SWEPI) it wins
+# (27.27 -> 25.13). Values: ((WM, WN), kinds or None for all).
+WAVE_FMTS = {"iq4xs": ((4, 2), None), "iq3xxs": ((4, 2), None), "q3k": ((4, 2), None),
              "iq3s": ((4, 2), None)}
 
 
@@ -936,7 +943,8 @@ def _gen(fmt, kind="kstore"):
             e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
               + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
             e("  }")
-    if sw and SWEPI and EPI_LDS and WS == 32 and TM == 32:
+    swepi = SWEPI_ENV == "1" if SWEPI_ENV is not None else fmt in SWEPI_FMTS
+    if sw and swepi and EPI_LDS and WS == 32 and TM == 32:
         lds_epilogue(e, kr, V8, sw=True)
         e("  kernel.return")
         e("}")

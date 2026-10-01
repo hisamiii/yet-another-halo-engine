@@ -2311,3 +2311,26 @@ equal to clean8192c's.
 - With 30 s gaps (one round each, same order): clean8192c 15169.5,
   p53-8192 14260.2 (-6.0%, in line with cycles), HIP 15709.3. pp8192 timing
   uses 30 s gaps from here.
+
+**Swiglu: the LDS epilogue for IQ3 (2026-10-01).** SOL counters, real bytes:
+IQ3_S swiglu ran at 90% of its issue bound (kstore 100%), +3.3 M cycles over
+kstore of which only ~0.5 M is extra instructions. The cause is the scalar
+epilogue (`swiglu_epilogue`): one dependent global gate load per element in a
+rolled loop, behind two barriers per slab. With one workgroup per WGP nothing
+overlaps it. `YAH_TG_SWEPI` (vector gate loads through the LDS epilogue,
+measured neutral in ms back at p40) re-measured in cycles, bit-identical:
+
+| swiglu | scalar epilogue | LDS epilogue |
+|---|---:|---:|
+| IQ3_S (4 x 2) | 27.56 | 24.85 |
+| IQ3_XXS 4 x 4 | 27.27 | 27.04 |
+| IQ3_XXS 4 x 2 | (lost before) | 25.13 |
+| IQ4_XS (4 x 2) | 24.81 | 24.71 (left off) |
+
+- Default for IQ3_S/IQ3_XXS (`SWEPI_FMTS`); IQ3_XXS swiglu moves to 4 x 2.
+- p54 = p53 + those two swiglu HALs: md5 a2145e371ceefd4d. pp2048 3316.4 ->
+  3285.8 ms (one round each, 15 s gaps).
+- pp8192 (p54-8192, md5 e94924b79ae21e57 unchanged): cycles 30776.3 ->
+  30454.3 M (-1.05%; swiglu rows -9.2 / -7.5%). Untraced ms at 30 s gaps read
+  13900.5 (p53, first run after an idle emit) vs 15584.7: at 8192 the first
+  run after idle is far cooler than any later one, so ms needs cycles beside it.
