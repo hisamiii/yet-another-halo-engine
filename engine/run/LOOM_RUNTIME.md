@@ -1778,12 +1778,18 @@ Loom via `YAH_TG_ABL`, same bits). WMMA floor 17.83 M cycles:
 | noFetch (4) | 21.23 | 26.16 | 1.233 |
 | noStore (8): no epilogue store | 23.61 | 26.70 | 1.131 |
 
-Decode + commit costs the same on both sides (4.37 vs 4.25 M cycles): **the
-decoder is not the gap.** The whole 3.66 M-cycle gap sits in the skeleton
-(fragment loads from LDS, WMMA, barriers, fetch, epilogue). Our epilogue costs
-3.8x HIP's (0.76 vs 0.19 M). Removing the barriers slows us down (+9.5%)
-while it speeds HIP up (-7.1%). The stacked variants (6/14/15, both sides)
-read 0 cycles in the first capture: unverified.
+**Correction (2026-10-01):** HIP's `noCommit` row is not comparable. With
+nothing written to LDS the compiler deleted HIP's fragment loads and then the
+fetch that fed them (its ablated kernel has 0 `ds_load` and 0 `global_load`;
+both operands of every WMMA are `v[0:7]`), so it measures bare WMMA
+throughput, while ours still loads fragments. The same holds for the stacked
+variants. HIP's `noBarrier`, `noFetch` and `noStore` kernels keep all their
+work (48 `ds_load`, the decode's `v_perm`s, the fetch) and do compare: there
+we are 1.37x, 1.25x and 1.14x. Removing the fetch saves HIP 2.5 M cycles and
+us 0.9 M. Removing the barriers saves HIP 1.7 M and costs us 2.7 M. How the
+gap splits between decode and the rest is still open; a fair split needs a
+no-decode variant that keeps the LDS traffic on both sides (HIP's `Fp16W`
+ablation does that on its side).
 
 Per-wave ATT views of the same kernels (scratch tools `critpath.py`,
 `simdtl.py`): on the traced SIMD HIP's matrix pipe is busy 52.9% of the time
@@ -1799,8 +1805,9 @@ in some captures and `SQ_WAVES` is unreliable): with commit, fetch, store and
 barriers all removed, HIP's K loop runs at 99% of the WMMA floor and ours at
 84% (87% with `pipeline(%c2)` or a full unroll). rocprofv3's LDS counters,
 which HRX cannot read, then showed ~20 M bank-conflict cycles per dispatch
-for us against HIP's 0. Without the LDS epilogue: 0, and the bare skeleton
-at 91%. The slab stored element (r, t) at `t*TM + r`, so the 16 lanes writing a
+for us against HIP's 0. Without the LDS epilogue: 0, and our bare skeleton
+at 91%. (HIP's 99% "bare loop" turned out to have no fragment loads left, see
+the correction above, so 91% vs 99% is not a like-for-like comparison.) The slab stored element (r, t) at `t*TM + r`, so the 16 lanes writing a
 fragment row were 128 B apart. A token pitch of TM+4 floats (`YAH_TG_EPAD`,
 default 4; keeps the b128 read-back aligned, LDS 52 -> 56 KiB) cuts the
 conflicts 94% and IQ4_XS to 26.39 M cycles (from 26.77). Bit-identical. pp2048,
