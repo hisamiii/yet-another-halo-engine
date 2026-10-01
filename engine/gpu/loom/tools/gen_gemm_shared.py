@@ -57,7 +57,7 @@ PAD = int(os.environ.get("YAH_SD_PAD", "0"))
 # multiply and the f16 rounding fuse into v_fma_mix (one rounding, as HIP's
 # ISA does -- a numerics change).
 IQ4_F16 = os.environ.get("YAH_TG_IQ4F16", "0") == "1" or os.environ.get("YAH_TG_IQ4PK", "0") == "1"
-IQ4_MULF = os.environ.get("YAH_TG_IQ4MULF", "")
+IQ4_MULF = os.environ.get("YAH_TG_IQ4MULF", "<contract|nnan|nsz>")
 # Q4_K/Q5_K nibbles on 32-bit words (bit-identical; with the tile GEMM's
 # decode-ahead Q4_K 6.18 -> 5.96 ms standalone). YAH_TG_Q4UITOFP=0 restores.
 Q4_UITOFP = os.environ.get("YAH_TG_Q4UITOFP", "1") == "1"
@@ -80,6 +80,14 @@ IQ4_W = os.environ.get("YAH_TG_IQ4W", "0") == "1"
 # the same exact f32 value (small integers), so bit-identical; uitofp of a
 # byte lowers to v_cvt_f32_ubyteN where sitofp needs v_bfe_i32 + v_cvt_f32_i32
 IQ4_U8 = os.environ.get("YAH_TG_IQ4U8", "0") == "1"
+# IQ4_U8F (implies IQ4_U8, needs IQ4_MULF): the -128 folded into the fused
+# multiply: fptrunc(fma(s, u, -128*s)) = fptrunc((u-128)*s), whose exact value
+# fits f32 (<= 24 significant bits), so bit-identical; uitofp of the byte is one
+# v_cvt_f32_ubyteN and the bias rides v_fma_mix's f32 addend (no literal).
+# Default on with the fused multiply (IQ4_XS kstore 17408x5120, real bytes:
+# 26.40 -> 25.96 M cycles, decode block 254 -> 182 VALU, VALU/WMMA 8.39 -> 7.26).
+IQ4_U8F = os.environ.get("YAH_TG_IQ4U8F", "1") == "1" and bool(IQ4_MULF)
+IQ4_U8 = IQ4_U8 or IQ4_U8F
 # IQ4_PK (implies the f16 codebook tables of IQ4_F16): the group scale rounded
 # to f16 once and the multiply done in f16 (v_pk_mul_f16, two weights per op).
 # NOT bit-identical (~1 f16 ulp per weight): judged by engine/run/accgate.py.
@@ -370,7 +378,11 @@ def iq4xs_compute(v, gb):
             for part in ("lo", "hi"):
                 e(f"    %cu{part}{u} = vector.table.lookup %kvtu[%n{part}{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
                 e(f"    %fu{part}{u} = vector.uitofp %cu{part}{u} : vector<16xi8> to vector<16xf32>")
-                e(f"    %f{part}{u} = vector.subf %fu{part}{u}, %c128v_iq : vector<16xf32>")
+                if not IQ4_U8F:
+                    e(f"    %f{part}{u} = vector.subf %fu{part}{u}, %c128v_iq : vector<16xf32>")
+            if IQ4_U8F:
+                assert IQ4_MULF, "IQ4_U8F folds the bias into the fused multiply (YAH_TG_IQ4MULF)"
+                e(f"    %nb{u} = scalar.mulf %dsc{u}, %cm128f_iq : f32")
         else:
             e(f"    %clo{u} = vector.table.lookup %kvt[%nlo{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
             e(f"    %chi{u} = vector.table.lookup %kvt[%nhi{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
@@ -390,9 +402,14 @@ def iq4xs_compute(v, gb):
                     if IQ4_F16:
                         e(f"    %x{part}{u}_{j} = vector.extract %c{part}{u}[{j}] : vector<16xf16> -> f16")
                         e(f"    %y{part}{u}_{j} = scalar.extf %x{part}{u}_{j} : f16 to f32")
+                    elif IQ4_U8F:
+                        e(f"    %y{part}{u}_{j} = vector.extract %fu{part}{u}[{j}] : vector<16xf32> -> f32")
                     else:
                         e(f"    %y{part}{u}_{j} = vector.extract %f{part}{u}[{j}] : vector<16xf32> -> f32")
-                    e(f"    %m{part}{u}_{j} = scalar.mulf{IQ4_MULF} %dsc{u}, %y{part}{u}_{j} : f32")
+                    if IQ4_U8F:
+                        e(f"    %m{part}{u}_{j} = scalar.fmaf %dsc{u}, %y{part}{u}_{j}, %nb{u} : f32")
+                    else:
+                        e(f"    %m{part}{u}_{j} = scalar.mulf{IQ4_MULF} %dsc{u}, %y{part}{u}_{j} : f32")
                     e(f"    %t{part}{u}_{j} = scalar.fptrunc %m{part}{u}_{j} : f32 to f16")
                     hs.append(f"%t{part}{u}_{j}")
                 e(f"    %h{part}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
@@ -1323,7 +1340,8 @@ def iq4xs_setup():
     if IQ4_U8:
         L += [f"  %kvu{i} = scalar.constant {(v + 128) - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)]
         L.append("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
-        L += ["  %c128f_iq = scalar.constant 128.0 : f32", "  %c128v_iq = vector.splat %c128f_iq : vector<16xf32>"]
+        L += ["  %c128f_iq = scalar.constant 128.0 : f32", "  %c128v_iq = vector.splat %c128f_iq : vector<16xf32>",
+              "  %cm128f_iq = scalar.constant -128.0 : f32"]
     if IQ4_F16:
         bits = [struct.unpack("<H", struct.pack("<e", float(v)))[0] for v in IQ4_KVALUES]
         for nm, part in (("l", [b & 255 for b in bits]), ("h", [b >> 8 for b in bits])):

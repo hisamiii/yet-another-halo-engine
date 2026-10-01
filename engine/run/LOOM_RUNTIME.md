@@ -1850,6 +1850,65 @@ First uses:
   compounds through 64 layers. It is also slower (26.98 vs 26.38 M cycles): the
   byte-table join lowers per element where HIP's uses one `v_perm` per pair.
 
+**Causal accounting, and the fused IQ4_XS decode (2026-10-01).** Instead of
+trying variants, every instruction and every unit of wave time was attributed
+to a role:
+
+- Instructions per role come from the final low IR, weighted by block trip
+  counts (`causal_loom.py`), or from ATT hit counts by source line for HIP
+  (`causal_hip.py`). Both close against SQ_INSTS_* to within the post-RA
+  copies.
+- Time is attributed along the critical path: for each barrier interval, the
+  last wave to arrive, split by role (`critrole.py`).
+
+The decoding wave was the straggler: its decode VALU was 29% of Loom's
+critical path against 13.5% for HIP. HIP looks up the f16 bit patterns of the
+codebook and needs one `v_fma_mix` per weight. Loom's in-loop decode block
+took 254 VALU per 32 weights: sign-extend, `v_cvt_f32_i32`, mul,
+`v_cvt_f16_f32`.
+
+Two exact rewrites, now the default:
+
+- `YAH_TG_IQ4MULF=<contract|nnan|nsz>` fuses the multiply and the rounding
+  into `v_fma_mix{lo,hi}` (215 VALU). Plain `<contract>` does not fuse.
+- `YAH_TG_IQ4U8F=1` looks up the codebook +128 as unsigned bytes and folds the
+  -128 into the fma's f32 addend: `fptrunc(fma(s, u, -128*s))`.
+  `v_cvt_f32_ubyteN` reads the byte directly, giving 182 VALU with no bfe,
+  ashr or i32 converts. (u-128)*s has at most 24 significant bits, so it is
+  exact in f32 and the f16 rounding is the same.
+
+Results:
+
+- Bit-identical on real bytes. The pp2048 hidden md5 is unchanged and
+  argmax stays 11751.
+- SQ_INSTS_VALU per WMMA 8.39 -> 7.26.
+- kstore 17408x5120: 26.40 -> 25.96 M cycles (mf alone 26.02).
+- kres down projection on real layer-33 `ffn_down` (input = layer-4 swiglu
+  output, `chain.sh`/`krcyc.sh`): 26.34 -> 25.94.
+- kres K=6144 on real `ssm_out`: 13.24 -> 13.26, neutral.
+- pp2048, one round each: IQ4_XS rows -0.70% against +0.64% drift on the
+  others. Production set p43 = p42 + these 12 HALs.
+
+What the model says now:
+
+- ATT slows this kernel ~1.5x. The WMMA spacing is 16 units = 32 cycles, so
+  simdtl's 37% "idle" is mostly tracing overhead. Use ATT for relative
+  attribution only.
+- Untraced, the SIMD is close to issue-bound: cycles are about
+  (32 per WMMA + ~1 per other VALU) / utilization. Predicted and measured
+  savings:
+  - mf: -0.34 M predicted, -0.38 M measured.
+  - u8f: -0.63 M predicted, -0.44 M measured.
+- Every non-WMMA VALU costs SIMD time whichever wave issues it, which is why
+  SPLIT=4 and DECW=4 (placement only) lost. The remaining gap to HIP (25.78
+  vs 23.17 M under PMC) is about 56% VALU (6.26 vs 3.63 non-WMMA VALU per
+  WMMA) and 44% utilization.
+- The largest VALU line left is the K-step address math: 13 VALU per 8
+  WMMAs, two of them quarter-rate `v_mul_lo_u32`. It is recomputed from
+  loop-invariant lane and buffer terms on every step. Next: the fma_mix
+  pair's 30 moves (a zero `v_mov` before each tied `mixlo`, plus copies into
+  the `ds_store_b128` tuple).
+
 **Kernel parity in cycles, same real bytes (2026-10-01).** Per-kernel ratios
 against the old HIP trace (2026-09-30) were stale; HIP's plain pp2048 swings
 3289-3538 ms between sessions. Measured kernel against kernel instead
