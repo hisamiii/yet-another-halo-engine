@@ -2759,3 +2759,19 @@ pipe-busy counter on this chip), `tools/advpmc.sh`:
   - Rows: Q4_K kres K=6144 134.8 -> 119.0, Q5_K kres K=6144 33.6 -> 28.5,
     Q5_K 1024-row 33.6 -> 23.5 M.
   - Other Q5_K shapes +0.3..0.6 M. Net ~-30 M cycles (~0.4%).
+- IQ3_S kstore, ATT (`simdtl.py`): window 51.8% WMMA pipe, 13.5% VALU-only,
+  29.7% idle. At idle instants the waves wait on lgkm 13%, barrier 11%, VALU
+  issue 6%.
+- By instruction time: `s_waitcnt lgkmcnt(1)` 19% (fragment loads just
+  issued) and `s_barrier` 19% (two barriers per phase, decode and MMA strictly
+  separated inside a workgroup). No-K-loop time 2.5%; bank conflicts 5% of
+  LDS-active cycles.
+- Hiding the LDS latency needs registers 4 x 2 does not have:
+  - `KSL_FENCE=0` 23.84 -> 23.79 (no change);
+  - `PF=1` 256 VGPRs, 28 spills, 150.96;
+  - `PF=1 PF_FENCE=0` 248 VGPRs, 24.45.
+  Decode-ahead for IQ3 needs a second weight tile (+17 KB on 57 KB LDS).
+  What is left over the floor here is structural (barrier-separated decode /
+  MMA phases, LDS latency). The way past it would be producer/consumer wave
+  specialization (decode waves feeding MMA waves through LDS without
+  workgroup barriers), a larger redesign.
