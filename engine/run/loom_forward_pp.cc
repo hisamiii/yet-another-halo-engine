@@ -599,6 +599,40 @@ int main(int argc, char** argv) {
       Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name)).c_str(),
                mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1, b);
     };
+    // The attention q projection with the q/gate unpack fused into its epilogue
+    // (gemm_kqg_*: rows = heads x [256 q | 256 gate] stored straight into q and
+    // gate, as yah_unpack_qg did). False if the set has no such HAL or
+    // YAH_KQG=0; the caller then runs kstore + unpack.
+    auto run_kqg = [&](const std::string& wname) -> bool {
+      { const char* e = std::getenv("YAH_KQG"); if (e && std::string(e) == "0") return false; }
+      const auto* tw = find(wname);
+      Fmt f{};
+      if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) return false;
+      const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
+      const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
+      const std::string hal = std::string("gemm_kqg_") + f.name + "_" +
+                              std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
+      if (g_geom.find(hal) == g_geom.end()) return false;
+      const Imported w = ImportTensor(*tw);
+      LoomExecutable& exe = load(dir + "/" + hal);
+      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
+      const Geom gm = GeomOf(hal, B);
+      g_key = hal;
+      std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
+      if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
+      if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
+      if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
+      if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
+      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
+      b.push_back({scratch.handle, 0, hb(scratch)});
+      b.push_back({wstage.handle, 0, hb(wstage)});
+      b.push_back({ostage.handle, 0, hb(ostage)});
+      b.push_back({q.handle, 0, hb(q)});
+      b.push_back({gate.handle, 0, hb(gate)});
+      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_kqg").c_str(),
+               mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1, b);
+      return true;
+    };
     auto run_swiglu = [&](const std::string& wname) {
       const auto* tw = find(wname);
       Fmt f{};
@@ -769,10 +803,11 @@ int main(int argc, char** argv) {
       t_norm += tick();
       if (full) {
         const std::uint32_t ai = l / cfg.full_attention_interval;
-        run_kstore(pre + "attn_q.weight", qkv);
+        const bool qg_fused = run_kqg(pre + "attn_q.weight");
+        if (!qg_fused) run_kstore(pre + "attn_q.weight", qkv);
         run_kstore(pre + "attn_k.weight", kbuf);
         run_kstore(pre + "attn_v.weight", vbuf);
-        {
+        if (!qg_fused) {
           std::vector<hrx_buffer_ref_t> b = {
               {qkv.handle, 0, hb(qkv)},
               {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)}};

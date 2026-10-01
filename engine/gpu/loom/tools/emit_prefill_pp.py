@@ -141,7 +141,7 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp):
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     with open(src, "w") as fh:
         fh.write(gen(fmt, kind))
-    sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres"}.get(kind, ""))
+    sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg"}.get(kind, ""))
     # Refuse before emitting if any declared operand footprint exceeds the buffer
     # the driver binds (tools/footprint_gate.py): a silent overrun hangs the ring.
     import subprocess
@@ -258,6 +258,14 @@ def main():
             sg = shared_kstore(fmt, mt, kb, B, "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb), outdir)
             if sg:
                 geom.append(sg)
+                # the attention q projection (12288 rows = 24 heads x [q|gate]):
+                # also the variant that stores q and gate unpacked
+                # (loom_forward_pp prefers it and skips yah_unpack_qg)
+                if mt == 768 and os.environ.get("YAH_KQG", "1") == "1":
+                    qgv = shared_kstore(fmt, mt, kb, B, "gemm_kqg_%s_%d_%d.hal" % (fmt, mt, kb),
+                                        outdir, kind="kqg")
+                    if qgv:
+                        geom.append(qgv)
                 n += 1
                 continue
             cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),

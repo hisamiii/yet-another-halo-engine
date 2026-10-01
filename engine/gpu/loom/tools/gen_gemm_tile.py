@@ -324,9 +324,13 @@ def _gen(fmt, kind="kstore"):
     bb, (loads, compute) = F["bb"], F["decode"]
     kr = kind == "kres"
     sw = kind == "swiglu"
+    # kqg: the attention q projection (rows = heads x [256 q | 256 gate]) storing
+    # q and gate straight into their own [tokens][heads*256] buffers, as
+    # yah_unpack_qg did in a separate pass. Same values, so bit-identical.
+    qg = kind == "kqg"
     bufs = (["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
-            + ["wstage", "ostage", "output"])
-    sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "")
+            + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []))
+    sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
     slots = G.GPP // G.GPL * G.SPLIT   # decoding lane groups of BM per phase
     arow = ksub + (0 if FRAG else APAD)   # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
@@ -1188,7 +1192,7 @@ def _gen(fmt, kind="kstore"):
         e("}")
         return "\n".join(L) + "\n"
     if EPI_LDS and WS == 32 and TM == 32:
-        lds_epilogue(e, kr, V8)
+        lds_epilogue(e, kr, V8, qg=qg)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
@@ -1249,7 +1253,7 @@ def frag_stores(lines, ksub):
     return out
 
 
-def lds_epilogue(e, kr, V8, sw=False):
+def lds_epilogue(e, kr, V8, sw=False, qg=False):
     """out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column
     of fragments at a time: fragments -> LDS slab (element (r, t) at t*TM + r)
     -> each lane reads 16 contiguous rows of one token -> 4 b128 stores. Two
@@ -1287,6 +1291,16 @@ def lds_epilogue(e, kr, V8, sw=False):
         e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
         e("  %negone = scalar.constant -1.0 : f32")
         e("  %one = scalar.constant 1.0 : f32")
+    elif qg:
+        # q and gate halves: row r = head*512 + half*256 + d goes to
+        # (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
+        e("  %qg_tot = index.div %out_total, %c2 : index")
+        e("  %qg_rows = index.div %m_rows, %c2 : index")
+        e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
+        e("  %qg_c512 = index.constant 512 : index")
+        e("  %qg_c256 = index.constant 256 : index")
     else:
         e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
     if kr:
@@ -1298,6 +1312,14 @@ def lds_epilogue(e, kr, V8, sw=False):
     e(f"  %es_tt = index.mul %es_t, %es_ctm : index")
     e("  %es_rd = index.add %es_tt, %es_h : index")
     e("  %es_row = index.add %m_origin, %es_h : index")
+    if qg:
+        e("  %qg_head = index.div %es_row, %qg_c512 : index")
+        e("  %qg_w = index.rem %es_row, %qg_c512 : index")
+        e("  %qg_half = index.div %qg_w, %qg_c256 : index")
+        e("  %qg_d = index.rem %qg_w, %qg_c256 : index")
+        e("  %qg_hb = index.mul %qg_head, %qg_c256 : index")
+        e("  %qg_col = index.add %qg_hb, %qg_d : index")
+        e("  %qg_isq = index.cmp eq, %qg_half, %c0 : index")
     for j in range(FN):
         for i in range(FM):
             e(f"  %es_r{i}_{j} = index.constant {16 * i} : index")
@@ -1307,6 +1329,9 @@ def lds_epilogue(e, kr, V8, sw=False):
         e(f"  %es_tk{j} = index.add %es_tk{j}0, %es_t : index")
         e(f"  %es_tm{j} = index.mul %es_tk{j}, %m_rows : index")
         e(f"  %es_ob{j} = index.add %es_tm{j}, %es_row : index")
+        if qg:
+            e(f"  %qg_tm{j} = index.mul %es_tk{j}, %qg_rows : index")
+            e(f"  %qg_ob{j} = index.add %qg_tm{j}, %qg_col : index")
         for q in range(4):
             e(f"  %es_q{j}_{q}c = index.constant {4 * q} : index")
             e(f"  %es_ri{j}_{q} = index.add %es_rd, %es_q{j}_{q}c : index")
@@ -1334,6 +1359,15 @@ def lds_epilogue(e, kr, V8, sw=False):
                     hs.append(f"%h_{y}")
                 e(f"  %hv{j}_{q} = vector.from_elements {', '.join(hs)} : vector<4xf16>")
                 e(f"  vector.store %hv{j}_{q}, %out_h[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
+            elif qg:
+                # always in range; the clamp states it for the bound proof
+                e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
+                e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
+                e(f"  scf.if %qg_isq {{")
+                e(f"    vector.store {val}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e("  } else {")
+                e(f"    vector.store {val}, %g_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e("  }")
             else:
                 e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
     if G.EPI_ROUNDS > 1:

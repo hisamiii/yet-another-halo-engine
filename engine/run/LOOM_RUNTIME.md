@@ -2594,3 +2594,21 @@ floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
 - The state update (fma with s*alpha as addend) has no source-level fmac
   form. Further DeltaNet gains need the chunked algorithm, which changes
   numerics.
+
+**Non-matrix kernels are at DRAM bandwidth; q/gate unpack fused (2026-10-01).**
+Bytes from the bindings over measured time (HRX does not map `TCC_EA0_*` on
+gfx1151, `profile_counters.c:752`) against ~210 GB/s streaming:
+- ssm_conv ~213 GB/s, ssm_postnorm ~208, unpack_qg ~230, half_norm ~180 (63
+  MB/call; it never touches its `reszero` / `sumout` bindings).
+- Only fewer bytes helps these, i.e. fusion.
+
+`kqg` GEMM kind (`gen_gemm_tile`, emitted beside every 768-tile kstore, i.e.
+the attention q projections): the LDS epilogue writes row r = head*512 +
+half*256 + d straight to (q|gate)[t][head*256 + d]. A wave's 32 rows sit in
+one half, so the q/gate branch is uniform; the clamped index is for the bound
+proof only. `loom_forward_pp` prefers it (`run_kqg`) and skips
+`yah_unpack_qg`; `YAH_KQG=0` restores the two-pass path.
+- p58 = full emit: md5 a2145e371ceefd4d. pp2048 cycles 7372 -> 7339 M
+  (-0.45%), 947 -> 931 dispatches.
+- The 16 unpack dispatches (32.9 M) are gone, and the kqg GEMMs cost what the
+  kstore ones did (263.6 vs 263.3 M).
