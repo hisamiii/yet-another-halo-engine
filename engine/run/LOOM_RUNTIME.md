@@ -2217,3 +2217,30 @@ chain is exposed between barriers.
 - p52 = p50 + IQ3_XXS kstore/kres and Q3_K at 4 x 2: md5 unchanged. pp2048
   rows 861.9 -> 819.7 ms (-4.9%) against +1.1% drift.
 
+**Pipeline tax and host CPU (2026-10-01, in progress; paused).**
+
+- **No cycle tax.** With HRX counters in the real pipeline
+  (`HRX_PROFILE_MODE=counters`, a local profiling-only libhrx addition), the
+  kernels run the same cycles as standalone: IQ4_XS kstore 23.05 vs 23.12 M,
+  IQ3_S 27.01 vs 27.06, IQ3_XXS 24.21 vs 24.23, Q4_K 15.26 vs 15.21.
+- **The ms tax is clock.** gpu_metrics during pp2048: gfx clock median
+  ~2270 MHz (min 1630; allowed max pulled to ~2480 of 2900), GPU 95-98 C,
+  thermal-throttle residency rising, socket ~115 W, of which the GPU is
+  ~38 W.
+- **The host keeps the GPU fed.** GPU idle 0.5% of the prefill; dispatch
+  gaps have a median of 9 us. Launch overhead is negligible.
+- **One host core is busy for the whole prefill** in both engines (HIP too):
+  ~104% CPU, ~400-460k `AMDKFD_IOC_WAIT_EVENTS` ioctls (ROCr signal wait
+  polling) on the main thread.
+  - `hrx_stream_dispatch` takes only 0.6 ms in total, and the final
+    synchronize finds the stream already complete.
+  - 3.46 s is spent *between* `Dispatch()` calls in the layer loop: some
+    call in the loop waits on the GPU.
+  - Not lazy HAL loading: `YAH_LOOM_PRELOAD=1` loads all 83 HALs before the
+    timed region and the spin persists.
+  - Not dispatch pacing (`YAH_LOOM_PACE`) and not the final synchronize
+    (`YAH_LOOM_SLEEP_SYNC_US`).
+  - Open: find the blocking call (diagnostics `YAH_LOOM_DISPATCH_TIMING`,
+    `YAH_TRACE_LOAD`).
+  - If removable in our code, the core's power could go to the GPU clock.
+

@@ -133,10 +133,18 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
               std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
               const std::vector<hrx_buffer_ref_t>& b) {
+  static const bool dt = std::getenv("YAH_LOOM_DISPATCH_TIMING") != nullptr;
+  static double in_us = 0, between_us = 0, meta_us = 0; static long n = 0;
+  static std::chrono::steady_clock::time_point last_return;
+  const auto t_in = std::chrono::steady_clock::now();
+  if (dt && n) between_us += std::chrono::duration<double, std::micro>(t_in - last_return).count();
   // The executable's own workgroup size is authoritative; sx is only the
   // fallback for metadata that does not carry one.
   const std::uint32_t ordinal = exe.OrdinalOrZero(name);
   const std::uint32_t ws = exe.WorkgroupSize(ordinal);
+  if (dt) meta_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_in).count();
+  struct Report { ~Report() { if (dt && n) std::fprintf(stderr, "Dispatch(): %ld calls, inside %.1f ms (metadata %.1f ms), between calls %.1f ms\n", n, in_us / 1000, meta_us / 1000, between_us / 1000); } };
+  static Report report;
   if (g_seq)
     std::fprintf(g_seq, "%zu,%s,%u,%u,%u\n", g_seq_n++,
                  g_key.empty() ? name : g_key.c_str(), gx, gy, gz);
@@ -154,6 +162,11 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
     g_per_count[key]++;
   }
   g_key.clear();
+  if (dt) {
+    last_return = std::chrono::steady_clock::now();
+    in_us += std::chrono::duration<double, std::micro>(last_return - t_in).count();
+    ++n;
+  }
 }
 
 // The launch geometry each GEMM HAL was compiled for, read from
@@ -352,7 +365,10 @@ int main(int argc, char** argv) {
     std::map<std::string, LoomExecutable> exes;
     auto load = [&](const std::string& path) -> LoomExecutable& {
       auto it = exes.find(path);
-      if (it == exes.end()) it = exes.emplace(path, gpu.Load(path)).first;
+      if (it == exes.end()) {
+        if (std::getenv("YAH_TRACE_LOAD")) std::fprintf(stderr, "[load] %s\n", path.c_str());
+        it = exes.emplace(path, gpu.Load(path)).first;
+      }
       return it->second;
     };
     auto find = [&](const std::string& name) {
@@ -692,7 +708,21 @@ int main(int argc, char** argv) {
       mark = std::chrono::steady_clock::now();
       return d;
     };
+    // YAH_LOOM_PRELOAD=1: load every GEMM HAL of the set before the timed
+    // region instead of lazily at first use (diagnostic for the host-side
+    // polling investigation; measured neutral, so off by default to keep
+    // layers_ms comparable with earlier runs).
+    if (std::getenv("YAH_LOOM_PRELOAD")) {
+      for (const auto& kv : g_geom) {
+        const std::string path = dir + "/" + kv.first;
+        if (FILE* f = std::fopen(path.c_str(), "rb")) {
+          std::fclose(f);
+          load(path);
+        }
+      }
+    }
     gpu.Synchronize();
+    if (std::getenv("YAH_TRACE_LOAD")) std::fprintf(stderr, "[load] ---- timed region starts ----\n");
     const auto t0 = std::chrono::steady_clock::now();
     // YAH_LAYERS=N stops after N layers. It exists to bisect a stage that
     // disagrees between runs, which is how the residual-geometry race in the
