@@ -684,7 +684,12 @@ def gen():
                 e(f"  %ersr{b} = index.add %ersr{b}c, %erow{b} : index")
                 e(f"  %eden{b} = view.load %rs_view[%ersr{b}, %c0] : view<64x16xf32> -> f32")
                 e(f"  %epos{b} = scalar.cmpf ogt, %eden{b}, %zero : f32")
-                e(f"  %edv{b} = scalar.divf %eov{b}, %eden{b} : f32")
+                if os.environ.get("YAH_ATTN_DBG_RCP") == "1":
+                    # gate control only: o * (1 / sum), one rounding-level change
+                    e(f"  %erc{b} = scalar.divf %one, %eden{b} : f32")
+                    e(f"  %edv{b} = scalar.mulf %eov{b}, %erc{b} : f32")
+                else:
+                    e(f"  %edv{b} = scalar.divf %eov{b}, %eden{b} : f32")
                 e(f"  %eval{b} = scf.select %epos{b}, %edv{b}, %zero : f32")
                 e(f"  %egn{b} = scalar.negf %egv{b} : f32")
                 e(f"  %egm{b} = scalar.mulf %egn{b}, %log2e : f32")

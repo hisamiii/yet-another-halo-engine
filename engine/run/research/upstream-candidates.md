@@ -188,6 +188,26 @@ computed ones.
 - **Bound proofs through div/rem index remaps.** The kqg epilogue needed a
   redundant `index.min` clamp to pass SUBRANGE/010.
 
+## 10. Loom: miscompiles found writing the FA attention (2026-10-01)
+
+Correctness bugs, so ahead of the performance items when proposing.
+Reproducers: `engine/run/research/fa/` and the `gen_attn_fa.py` knobs.
+
+- **Barrier release does not drain outstanding LDS loads.** `kernel.barrier
+  <workgroup> ordering(acq_rel)` emitted `s_barrier` with fragment
+  `ds_load`s still in flight (no `s_waitcnt lgkmcnt(0)` first). Waves that
+  pass the barrier and overwrite that LDS race with the loads (WAR). Release
+  semantics must cover prior reads as well as writes.
+- **Values carried between two sequential `scf.for` loops.** Without a loop
+  policy the WMMA accumulators came out corrupted at the hand-off into the
+  second loop. Fine with `unroll(%c2) schedule(recurrence)` or with one loop.
+- **A multi-result `scf.if` (8 x vector<8xf32> + 2 f32) on a
+  `subgroup.vote.any` condition** produced NaN everywhere in one
+  configuration; the same code is correct in another.
+- **Perf: `s_waitcnt vmcnt(0)` at the loop back edge** whenever loaded
+  registers are carried across it. That drains the prefetch: 15% of wave time
+  in the attention, and the same mechanism hit the GEMM decode-ahead.
+
 ## Not candidates (measured, no gain)
 
 - Wave64 tile GEMMs: wave64 VALU/LDS instructions cost ~1.7x.

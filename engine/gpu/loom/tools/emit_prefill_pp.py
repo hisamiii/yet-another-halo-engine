@@ -353,7 +353,13 @@ def main():
         os.makedirs(tmp, exist_ok=True)
         attn_src = os.path.join(tmp, "yah_attn_hip.loom")
         with open(attn_src, "w") as fh:
-            fh.write(gen_attn_hip.gen())
+            # YAH_ATTN_FA=1: tools/gen_attn_fa.py (register softmax, not HIP's
+            # arithmetic order: T1 gate), same grid, bindings and f16 output
+            if os.environ.get("YAH_ATTN_FA", "0") == "1":
+                import gen_attn_fa
+                fh.write(gen_attn_fa.gen())
+            else:
+                fh.write(gen_attn_hip.gen())
         vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
         with open(vtrans_src, "w") as fh:
             fh.write(gen_attn_hip.gen_vtrans())

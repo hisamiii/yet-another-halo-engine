@@ -2796,3 +2796,61 @@ kernel, real layer-3 inputs:
   bank-conflict padding of the K/V/P pitches, partial instead of full LDS
   waits, skip the O rescale when no row max changed (exact), dual-issue of the
   softmax FP32.
+
+**FlashAttention-style attention, `gen_attn_fa.py` (2026-10-01).** Opt-in with
+`YAH_ATTN_FA=1` in the emitter. Same grid, bindings and f16 output as
+`gen_attn_hip`.
+
+Layout:
+- 8 waves per workgroup, as wave pairs: each pair owns 16 queries and each
+  wave one half of the head dim. Q^T lives in registers (64 VGPRs).
+- S^T = K Q^T, so a lane owns one query column. The pair adds its partial
+  scores through a private LDS slot.
+- The softmax runs in registers.
+- P^T becomes the B operand through one xor-16 swizzle. K rows are permuted
+  at staging so a lane holds keys 8h..8h+7.
+- V^T rows are permuted so each lane writes 8 contiguous output dims.
+- K/V tiles are loaded at the top of phase A and staged in phase B of the
+  same tile. V is double-buffered, LDS 41 KB, 3 workgroups per WGP.
+
+Steps, M cycles (pp8192, real layer-3 inputs, production 80.1):
+
+| step | M cycles | cause, measured |
+|---|---:|---|
+| first build | 178.6 | v_cvt_f16_f32 low-window evictions of Q^T to scratch; scratch vmcnt(0) drained the prefetch |
+| v_fma_mix narrowing of P | 81.9 | 0 spills |
+| V rows padded to 48 B, single K/V buffers | 76.8 | LDS 104% busy, 39% bank conflicts -> 4.8% |
+| unroll(2) recurrence | 73.8 | |
+| loads used in the same tile (no vmcnt(0) back-edge drain, 15% of wave time) | 73.9 | correct after the Q-drain fix below |
+| head-pair-fastest + LPT order | **70.3** | L2 hits 35% -> 73%, DRAM 8.2 -> 2.8 GB/layer (it was at ~250 GB/s, bandwidth-bound) |
+| HIPNUM (HIP's exp / sum / division rounding) | 69.8 | 13x closer to HIP (rel 9e-8, 59% of elements bit-identical) |
+
+Pipeline (SQ_BUSY_CYCLES, one round each):
+- pp8192: attention 1264.0 -> 1111.6 M (-12.1%), total -0.57%.
+- pp2048: attention -2.1%.
+
+Lost or neutral, single rounds: fences (QKF/PVF), two QK chains, PVZ, S8,
+MSKIF, exact rescale skip (SKIP; it also miscompiled alone). The kernel sits
+at 103% of the issue bound: ~13 VALU per WMMA, of which ~46 v_mov per tile
+are O back-edge rotation (allocator, upstream #4) and ~35 address ops (no
+LICM, upstream #2).
+
+Numerics (T1 gate, golden2):
+- FA: kl_mean 3.64e-7 against a limit of 1.32e-7 -> FAIL. Passes kl_p999,
+  0 flips, PPL 6.6946 vs 6.6947.
+- **Control: production HIP-order attention with one change, o * (1/sum)
+  instead of o / sum: kl_mean 4.24e-7 (FAIL), 0 flips.** kl_mean barely moves
+  with the size of the attention error (FA rel 1.2e-6 -> 9e-8 gave 3.70e-7 ->
+  3.64e-7). Any non-bit-exact attention change saturates at ~4e-7 through the
+  64 layers, so T1's kl_mean limit amounts to bit-exactness for attention.
+
+Loom miscompiles hit on the way (all worked around; see upstream-candidates):
+- **`kernel.barrier` does not drain earlier LDS loads.** There was no
+  lgkmcnt(0) ahead of the s_barrier that followed the Q^T fragment loads. Other
+  waves then staged K/V over the aliased Q stage while the loads were still in
+  flight: a few corrupted query lanes per run, varying. Fixed by an LDS store
+  of a value built from every fragment before the barrier.
+- Two sequential loops without the unroll policy: O accumulators corrupted
+  across the loop-to-loop hand-off (NaN in ~30% of dims from query block 1
+  on). The kernel now uses one masked loop.
+- SKIP alone: NaN everywhere; correct when combined with S8 and MSKIF.
