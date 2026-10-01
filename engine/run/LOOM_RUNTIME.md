@@ -2489,3 +2489,37 @@ floor = (M/16)(B/16)(K/16) WMMAs x 34 / 80 SIMDs. This view is clock-free.
     Tgfx sits at 100.
   - Real per-rail power needs the PM table (ryzenadj; blocked by /dev/mem on
     this kernel without `iomem=relaxed` or a `ryzen_smu` build for 7.3).
+
+**Where the power goes: ryzen_smu PM table (2026-10-01).** ryzen_smu
+(187.0bb95d9) built for 7.3.0-rc4-perfopt:
+- Built against a clean copy of the tree with the running kernel's
+  `/proc/config.gz` (clang ThinLTO) and `Module.symvers`, at
+  `~/.cache/kbuild-perfopt`. One-line fix: `<asm/cpuid/api.h>` on >= 6.15.
+- Signed with the kernel build key; installed to `extra/` with
+  `modules-load.d`. Source in `~/yah-scratch/ryzen_smu-7.3`.
+
+`research/pmlog.py` samples the raw table (float32[916], table 0x64020c) at
+50 ms through idle and the five probe loads. Fields matched by behaviour
+(ryzenadj maps only limits/temperatures for this version):
+
+| idx | idle | WMMA | VALU | LDS | mem | GEMM | reading |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 1/3/5 | 8 | 112 | 110 | 109 | 61 | 118 | STAPM / fast / slow PPT value (W) |
+| 13 (lim 12 = 120) | 4.6 | 99.7 | 113.8 | 93.1 | 34.8 | 111.6 | main compute rail (TDC-style limit 120) |
+| 203 | 2.6 | 97.9 | 95.0 | 93.5 | 35.2 | 98.2 | smoothed twin of 13 |
+| 17 (lim 16 = 40) | 1.2 | 3.8 | 3.8 | 3.8 | 9.6 | 6.6 | SoC/memory rail (rises with DRAM traffic) |
+| 33 | 0.83 | 1.08 | 0.95 | 1.10 | 1.05 | 0.99 | voltage-like (V) |
+| 22/23, 340 | 95/36 | 95/95 | 95/95 | 95/95 | 95/62 | 95/95 | GFX temperature limit / value |
+| 342/343 | 688 | 2730 | 2324 | 2792 | 2900 | 2452 | GFX target / effective clock (MHz) |
+| 348-351 | | 2000 | 1000 | 2000 | 8000 | | fclk, uclk, -, memory MT/s |
+| 53 | 1.4 | 32 | 112 | 112 | 29 | 53 | the gpu_metrics-style GFX power estimate |
+
+- Socket power = 1.06 x [203] + 9.4 W over every sample of all six runs
+  (rms 5.6 W). The compute rail carries nearly all the variable power: about
+  98 of 117 W in the IQ3_S GEMM, on a ~9 W base (SoC, fabric, memory, idle
+  CPU).
+- The memory stream instead loads the SoC side ([17] and friends).
+- [53] (and gpu_metrics' gfx power) fits with a 30 W offset and 31 W rms: an
+  activity model, not a measurement.
+- [13] reaches 113.8 against its limit of 120 on VALU FMA. The thermal limit
+  binds first in all our runs (thm_gfx counters).
