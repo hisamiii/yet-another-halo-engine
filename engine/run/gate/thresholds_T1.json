@@ -1,0 +1,32 @@
+{
+ "tier": "T1",
+ "windows": [
+  "00",
+  "01",
+  "02",
+  "03"
+ ],
+ "from": 1536,
+ "tie": 0.1,
+ "reference": "gatehip",
+ "golden": "golden2",
+ "reference_distance": {
+  "positions": 2048,
+  "kl_mean": 5.296599359403711e-07,
+  "kl_p99": 4.255010701224757e-06,
+  "kl_p999": 1.7834263987614147e-05,
+  "kl_max": 2.1070159831552602e-05,
+  "flips": 0,
+  "ties": 104,
+  "ln_ppl_ratio": 2.9218766495420212e-05,
+  "ppl_golden": 6.694672638879682,
+  "ppl_cand": 6.694868251814051,
+  "logits_rrms_mean": 0.0005801461736014047,
+  "logits_rrms_max": 0.013631651801614072,
+  "nonfinite": 0
+ },
+ "kl_mean_max": 1.3241498398509278e-07,
+ "kl_p999_max": 1.7834263987614147e-05,
+ "flips_max": 0,
+ "abs_ln_ppl_ratio_max": 0.0001
+}

@@ -943,6 +943,37 @@ int main(int argc, char** argv) {
       std::fwrite(logit_host.data(), 4, logit_host.size(), fl);
       std::fclose(fl);
       std::printf("argmax=%u\n", tok);
+
+      // YAH_LOGITS_FROM=P: f32 logits of every position P..B-1 into
+      // <prefix>.all_logits ((B-P) x vocab, row-major) for the tiered
+      // correctness gate (engine/run/accgate2.py). The same head kernels as the
+      // last-token path, one row at a time into one device buffer.
+      if (const char* lf = std::getenv("YAH_LOGITS_FROM")) {
+        const std::uint32_t from = static_cast<std::uint32_t>(std::atoi(lf));
+        if (from >= B) throw LoomError("YAH_LOGITS_FROM must be below the token count");
+        const std::size_t rows = B - from;
+        LoomBuffer every = gpu.Allocate(rows * kVocab * 4);
+        const Imported w = ImportTensor(*ow);
+        for (std::uint32_t r = from; r < B; ++r) {
+          {
+            std::vector<hrx_buffer_ref_t> b = {
+                {hidden.handle, std::size_t{r} * kHidden * 4, std::size_t{kHidden} * 4},
+                {wnorm.handle, wnorm.offset, wnorm.bytes}, {normed.handle, 0, hb(normed)}};
+            Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
+          }
+          std::vector<hrx_buffer_ref_t> b = {
+              {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
+              {every.handle, std::size_t{r - from} * kVocab * 4, std::size_t{kVocab} * 4}};
+          Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
+        }
+        gpu.Synchronize();
+        std::vector<float> host(rows * kVocab);
+        gpu.D2H(every, host.data(), host.size() * 4, 0);
+        FILE* fa = std::fopen((prefix + ".all_logits").c_str(), "wb");
+        std::fwrite(host.data(), 4, host.size(), fa);
+        std::fclose(fa);
+        std::printf("all_logits rows=%zu from=%u\n", rows, from);
+      }
     }
     if (g_time) {
       const double ffn = t_ffn_norm + t_ffn_gate + t_ffn_up + t_ffn_down;

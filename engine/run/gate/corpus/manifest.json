@@ -1,0 +1,20 @@
+{
+ "ids2048_w00.txt": "b99d6bffeea6b68d3988c40ad7fd5977",
+ "ids2048_w01.txt": "8a5ad851b3f4c7cb8ea14222b4d56e18",
+ "ids2048_w02.txt": "c07da0fd6d2e305b7c0ebbccc6525836",
+ "ids2048_w03.txt": "23aa38327559a90f10bf932628c008b6",
+ "ids2048_w04.txt": "3250c635abf6202d80a91456b3567f45",
+ "ids2048_w05.txt": "8729063704fcbbdf1ab11647b1b4b4dc",
+ "ids2048_w06.txt": "f2acee8671b36a71ef44567fa05511b5",
+ "ids2048_w07.txt": "58224799011654192a5a27ada37885f8",
+ "ids2048_w08.txt": "b97be36b0fffa09fe73055d5addfd3f5",
+ "ids2048_w09.txt": "c1e9d9549f8064210d91925be668cd27",
+ "ids2048_w10.txt": "8c85560efaf4cb1c041a54777605a3e0",
+ "ids2048_w11.txt": "b2c4cf151af28e1b7cdf8376ba8913a9",
+ "ids2048_w12.txt": "6c63f1d9cb5c1eb072d4059314ffa5a7",
+ "ids2048_w13.txt": "54701dae4ff73ab463088c1ad96e3efe",
+ "ids2048_w14.txt": "a19716d2d0152f8c34618b61b7a18b13",
+ "ids2048_w15.txt": "7f05bcfca1194a830cfd77adc70b2797",
+ "ids8192_w0.txt": "3dcf8c086692b74ebbe8510cf9a3b58f",
+ "source": "hipfire wikitext2-1024s-2048ctx.txt first 1500000 bytes, llama-tokenize --ids --no-bos (Qwen3.8 vocab); windows at token offsets i*20000 (i=0..15), 8192 at 320000"
+}

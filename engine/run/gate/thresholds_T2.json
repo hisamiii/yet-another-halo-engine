@@ -1,0 +1,28 @@
+{
+ "tier": "T2",
+ "note": "provisional (RESEARCH_PREFILL.md s3, research/correctness.md): quantization-level changes; recalibrate after the first int8/f16-accumulation measurement. Use 16 windows (00..15) + ids8192_w0.",
+ "windows": [
+  "00",
+  "01",
+  "02",
+  "03",
+  "04",
+  "05",
+  "06",
+  "07",
+  "08",
+  "09",
+  "10",
+  "11",
+  "12",
+  "13",
+  "14",
+  "15"
+ ],
+ "from": 1536,
+ "tie": 0.1,
+ "kl_mean_max": 0.001,
+ "kl_p999_max": 0.05,
+ "flips_max": 164,
+ "abs_ln_ppl_ratio_max": 0.002
+}
