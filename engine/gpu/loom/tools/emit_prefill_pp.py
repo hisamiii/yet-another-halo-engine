@@ -409,6 +409,10 @@ def main():
           "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"]),
         ("yah_ssm_conv_f32.loom", "conv.hal",
          ["yah_ssm_conv.batch=%d" % B, "yah_ssm_conv.qkv_dim=10240"]),
+        # conv with yah_deltanet_prep_kq fused in (the driver prefers it)
+        ("yah_ssm_conv_kq_f32.loom", "convkq.hal",
+         ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
+          "yah_ssm_conv_kq.num_key_heads=16"]),
         ("yah_deltanet_prep_kq_f32.loom", "prepkq.hal",
          ["yah_deltanet_prep_kq.batch=%d" % B,
           "yah_deltanet_prep_kq.num_key_heads=16",

@@ -526,6 +526,15 @@ int main(int argc, char** argv) {
     LoomExecutable& e_norm = load(dir + "/norm.hal");
     LoomExecutable& e_conv = load(dir + "/conv.hal");
     LoomExecutable& e_prepkq = load(dir + "/prepkq.hal");
+    // yah_ssm_conv_kq: the conv with prep_kq fused in, when the set has it
+    LoomExecutable* e_convkq = nullptr;
+    {
+      const char* off = std::getenv("YAH_CONVKQ");
+      const std::string path = dir + "/convkq.hal";
+      if (!(off && std::string(off) == "0")) {
+        if (FILE* f = std::fopen(path.c_str(), "rb")) { std::fclose(f); e_convkq = &load(path); }
+      }
+    }
     LoomExecutable& e_prepab = load(dir + "/prepab.hal");
     LoomExecutable& e_rowsplit = load(dir + "/rowsplit.hal");
     LoomExecutable& e_postnorm = load(dir + "/postnorm.hal");
@@ -921,7 +930,12 @@ int main(int argc, char** argv) {
               {w_conv.handle, w_conv.offset, w_conv.bytes},
               {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
               {conv_out.handle, 0, hb(conv_out)}};
-          Dispatch(gpu, e_conv, "yah_ssm_conv", 40, B, 1, 256, 1, 1, b);
+          if (e_convkq) {
+            b.push_back({kqbuf.handle, 0, hb(kqbuf)});
+            Dispatch(gpu, *e_convkq, "yah_ssm_conv_kq", 40, B, 1, 256, 1, 1, b);
+          } else {
+            Dispatch(gpu, e_conv, "yah_ssm_conv", 40, B, 1, 256, 1, 1, b);
+          }
         }
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(conv_out, static_cast<std::size_t>(B) * kQkv * 4, ".conv");
@@ -929,7 +943,7 @@ int main(int argc, char** argv) {
         {
           std::vector<hrx_buffer_ref_t> b = {
               {conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)}};
-          Dispatch(gpu, e_prepkq, "yah_deltanet_prep_kq", kKh, B, 1, 32, 1, 1, b);
+          if (!e_convkq) Dispatch(gpu, e_prepkq, "yah_deltanet_prep_kq", kKh, B, 1, 32, 1, 1, b);
         }
         if (g_dump_layer == static_cast<int>(l))
           dump_buf(kqbuf, static_cast<std::size_t>(B) * kKh * 3 * 4, ".kq");

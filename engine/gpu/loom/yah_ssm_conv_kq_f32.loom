@@ -1,0 +1,238 @@
+// yah_ssm_conv_kq: yah_ssm_conv with yah_deltanet_prep_kq fused in (bit-identical;
+// see the channel map below). Derived from yah_ssm_conv_f32.loom.
+// YAH causal SSM convolution + gate, Loom port of BatchedSSMConvKernel.
+//
+// HIP source: models/qwen/hip/kernels/ssm_recurrence.hip. One work-item owns one
+// (token, channel) pair of a 4-tap causal convolution over the qkv stream:
+//
+//   w0..w3 = conv_weights[c*4 + 0..3]                (0, 0, 0, 1 when absent)
+//   s3 = x[t][c]
+//   s2 = t >= 1 ? x[t-1][c] : state[c*4 + 3]
+//   s1 = t >= 2 ? x[t-2][c] : (t == 1 ? state[c*4 + 3] : state[c*4 + 2])
+//   s0 = t >= 3 ? x[t-3][c] : (t == 2 ? state[c*4 + 3]
+//                                 : (t == 1 ? state[c*4 + 2] : state[c*4 + 1]))
+//   dot = s0*w0 + s1*w1 + s2*w2 + s3*w3
+//   conv_out[t][c] = dot * sigmoid(dot)
+//
+// The history ring is read-only here; BatchedDeltaNetPrepAlphaBetaKernel advances
+// it. Slot 0 of each channel's four is never read, which is the upstream layout and
+// is preserved. The fallback ladder only differs over the first three tokens, so the
+// fixture is built to make those tokens carry different values.
+//
+// The output is a transcendental, so the expectation is the generated fixture
+// compared with a tolerance rather than byte-exactly. That tolerance is the numeric
+// contract: both sides compute an expf, and their last ulp need not agree.
+//
+// Required config: --config=yah_ssm_conv.batch=4 --config=yah_ssm_conv.qkv_dim=16
+amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
+
+config.decl @yah_ssm_conv_kq.batch : %value: index where [range(%value, 1, 1048576)]
+config.decl @yah_ssm_conv_kq.qkv_dim : %value: index where [range(%value, 1, 1048576)]
+config.decl @yah_ssm_conv_kq.num_key_heads : %value: index where [range(%value, 1, 4096)]
+
+kernel.def target(@yah_wave32) @yah_ssm_conv_kq() {
+  %unit = index.constant 1 : index
+  %qkv_dim = config.get @yah_ssm_conv_kq.qkv_dim : index
+  %batch = config.get @yah_ssm_conv_kq.batch : index
+  %workgroup_size = index.constant 256 : index
+  %c256 = index.constant 256 : index
+  %c255 = index.constant 255 : index
+  %biased = index.add %qkv_dim, %c255 : index
+  %tiles = index.div %biased, %c256 : index
+  kernel.launch.config workgroups(%tiles, %batch, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%x: buffer, %weights: buffer, %state: buffer, %out: buffer, %scales: buffer) {
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c256 = index.constant 256 : index
+  %negone = scalar.constant -1.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %batch = config.get @yah_ssm_conv_kq.batch : index
+  %qkv_dim = config.get @yah_ssm_conv_kq.qkv_dim : index
+  %x_total = index.mul %batch, %qkv_dim : index
+  %w_total = index.mul %qkv_dim, %c4 : index
+  %x_noalias, %weights_noalias, %state_noalias, %out_noalias, %scales_noalias = buffer.assume.noalias %x, %weights, %state, %out, %scales : buffer, buffer, buffer, buffer, buffer
+  %x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf32>
+  %w_view = buffer.view %weights_noalias[%base] : buffer -> view<[%w_total]xf32>
+  %state_view = buffer.view %state_noalias[%base] : buffer -> view<[%w_total]xf32>
+  %out_view = buffer.view %out_noalias[%base] : buffer -> view<[%x_total]xf32>
+  %t = kernel.workgroup.id<y> : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  // Channel map: workgroup w < num_key_heads takes key head w's q channels
+  // (lanes 0..127: w*128 + l) and k channels (lanes 128..255: nkh*128 + w*128
+  // + l - 128), so the norms prep_kq computed can be taken here; the rest take
+  // the v channels 256 at a time. Each channel's conv is unchanged.
+  %nkh = config.get @yah_ssm_conv_kq.num_key_heads : index
+  %c128 = index.constant 128 : index
+  %is_qk = index.cmp ult, %wg, %nkh : index
+  %lane_hi = index.cmp uge, %lane, %c128 : index
+  %lane_lo = index.rem %lane, %c128 : index
+  %qh_base = index.mul %wg, %c128 : index
+  %k_off = index.mul %nkh, %c128 : index
+  %kh_base = index.add %k_off, %qh_base : index
+  %qk_base = scf.select %lane_hi, %kh_base, %qh_base : index
+  %qk_c = index.add %qk_base, %lane_lo : index
+  %v_off = index.mul %k_off, %c2 : index
+  %wg_v0 = index.max %wg, %nkh : index
+  %wg_v = index.sub %wg_v0, %nkh : index
+  %v_wb = index.mul %wg_v, %c256 : index
+  %v_b = index.add %v_off, %v_wb : index
+  %v_c = index.add %v_b, %lane : index
+  %c = scf.select %is_qk, %qk_c, %v_c : index
+  %kq_bytes = index.constant 1024 : offset
+  %kq_l = buffer.alloca<workgroup> align(16) %kq_bytes : buffer
+  %kq_lds = buffer.view %kq_l[%base] : buffer -> view<256xf32>
+  %in_range = index.cmp ult, %c, %qkv_dim : index
+  scf.if %in_range {
+    %c4i = index.mul %c, %c4 : index
+    %w0_off = index.add %c4i, %c0 : index
+    %w1_off = index.add %c4i, %c1 : index
+    %w2_off = index.add %c4i, %c2 : index
+    %w3_off = index.add %c4i, %c3 : index
+    %w0 = view.load %w_view[%w0_off] : view<[%w_total]xf32> -> f32
+    %w1 = view.load %w_view[%w1_off] : view<[%w_total]xf32> -> f32
+    %w2 = view.load %w_view[%w2_off] : view<[%w_total]xf32> -> f32
+    %w3 = view.load %w_view[%w3_off] : view<[%w_total]xf32> -> f32
+    %t_row = index.mul %t, %qkv_dim : index
+    %s3_off = index.add %t_row, %c : index
+    %s3 = view.load %x_view[%s3_off] : view<[%x_total]xf32> -> f32
+    %ge1 = index.cmp uge, %t, %c1 : index
+    %s2 = scf.if %ge1 -> (f32) {
+      %tp = index.sub %t, %c1 : index
+      %tp_row = index.mul %tp, %qkv_dim : index
+      %off = index.add %tp_row, %c : index
+      %v = view.load %x_view[%off] : view<[%x_total]xf32> -> f32
+      scf.yield %v : f32
+    } else {
+      %s2_off = index.add %c4i, %c3 : index
+      %v = view.load %state_view[%s2_off] : view<[%w_total]xf32> -> f32
+      scf.yield %v : f32
+    }
+    %ge2 = index.cmp uge, %t, %c2 : index
+    %s1 = scf.if %ge2 -> (f32) {
+      %tp = index.sub %t, %c2 : index
+      %tp_row = index.mul %tp, %qkv_dim : index
+      %off = index.add %tp_row, %c : index
+      %v = view.load %x_view[%off] : view<[%x_total]xf32> -> f32
+      scf.yield %v : f32
+    } else {
+      %d1 = index.sub %t, %c1 : index
+      %eq1 = index.cmp ult, %d1, %c1 : index
+      %inner = scf.if %eq1 -> (f32) {
+        %off = index.add %c4i, %c3 : index
+        %v = view.load %state_view[%off] : view<[%w_total]xf32> -> f32
+        scf.yield %v : f32
+      } else {
+        %off = index.add %c4i, %c2 : index
+        %v = view.load %state_view[%off] : view<[%w_total]xf32> -> f32
+        scf.yield %v : f32
+      }
+      scf.yield %inner : f32
+    }
+    %ge3 = index.cmp uge, %t, %c3 : index
+    %s0 = scf.if %ge3 -> (f32) {
+      %tp = index.sub %t, %c3 : index
+      %tp_row = index.mul %tp, %qkv_dim : index
+      %off = index.add %tp_row, %c : index
+      %v = view.load %x_view[%off] : view<[%x_total]xf32> -> f32
+      scf.yield %v : f32
+    } else {
+      %d2 = index.sub %t, %c2 : index
+      %eq2 = index.cmp ult, %d2, %c1 : index
+      %inner = scf.if %eq2 -> (f32) {
+        %off = index.add %c4i, %c3 : index
+        %v = view.load %state_view[%off] : view<[%w_total]xf32> -> f32
+        scf.yield %v : f32
+      } else {
+        %d1b = index.sub %t, %c1 : index
+        %eq1b = index.cmp ult, %d1b, %c1 : index
+        %deep = scf.if %eq1b -> (f32) {
+          %off = index.add %c4i, %c2 : index
+          %v = view.load %state_view[%off] : view<[%w_total]xf32> -> f32
+          scf.yield %v : f32
+        } else {
+          %off = index.add %c4i, %c1 : index
+          %v = view.load %state_view[%off] : view<[%w_total]xf32> -> f32
+          scf.yield %v : f32
+        }
+        scf.yield %deep : f32
+      }
+      scf.yield %inner : f32
+    }
+    %d0 = scalar.mulf %s0, %w0 : f32
+    %d1 = scalar.mulf %s1, %w1 : f32
+    %d2 = scalar.mulf %s2, %w2 : f32
+    %d3 = scalar.mulf %s3, %w3 : f32
+    %sum_a = scalar.addf %d0, %d1 : f32
+    %sum_b = scalar.addf %d2, %d3 : f32
+    %dot = scalar.addf %sum_a, %sum_b : f32
+    %negative = scalar.mulf %dot, %negone : f32
+    %exponential = scalar.expf<afn> %negative : f32
+    %denominator = scalar.addf %one, %exponential : f32
+    %sigmoid = scalar.divf %one, %denominator : f32
+    %result = scalar.mulf %dot, %sigmoid : f32
+    view.store %result, %out_view[%s3_off] : f32, view<[%x_total]xf32>
+    view.store %result, %kq_lds[%lane] : f32, view<256xf32>
+  }
+  // yah_deltanet_prep_kq for key head w, token t, op for op on the same f32
+  // values: lane l of wave 0 sums elements 4l..4l+3 in order, then
+  // subgroup.reduce; lane 0 writes inv_k, q_scale, k.q.
+  scf.if %is_qk {
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %c32 = index.constant 32 : index
+    %is_w0 = index.cmp ult, %lane, %c32 : index
+    scf.if %is_w0 {
+      %zero = scalar.constant 0.0 : f32
+      %epsilon = scalar.constant 0.000001 : f32
+      %scale_cnt = index.mul %batch, %nkh : index
+      %scale_total = index.mul %scale_cnt, %c3 : index
+      %scales_view = buffer.view %scales_noalias[%base] : buffer -> view<[%scale_total]xf32>
+      %lane_quad = index.mul %lane, %c4 : index
+      %k_sq, %q_sq, %kq = scf.for %j = [%c0 to %c4 step %c1](%ka = %zero : f32, %qa = %zero : f32, %da = %zero : f32) -> (f32, f32, f32) {
+        %elem = index.add %lane_quad, %j : index
+        %k_idx = index.add %c128, %elem : index
+        %kv = view.load %kq_lds[%k_idx] : view<256xf32> -> f32
+        %qv = view.load %kq_lds[%elem] : view<256xf32> -> f32
+        %kk = scalar.mulf %kv, %kv : f32
+        %qq = scalar.mulf %qv, %qv : f32
+        %dq = scalar.mulf %kv, %qv : f32
+        %k2 = scalar.addf %ka, %kk : f32
+        %q2 = scalar.addf %qa, %qq : f32
+        %d2 = scalar.addf %da, %dq : f32
+        scf.yield %k2, %q2, %d2 : f32, f32, f32
+      }
+      %k_sq_all = kernel.subgroup.reduce<addf> %k_sq : f32
+      %q_sq_all = kernel.subgroup.reduce<addf> %q_sq : f32
+      %kq_all = kernel.subgroup.reduce<addf> %kq : f32
+      %is_lane0 = index.cmp ult, %lane, %c1 : index
+      scf.if %is_lane0 {
+        %k_sq_eps = scalar.addf %k_sq_all, %epsilon : f32
+        %k_root = scalar.sqrtf %k_sq_eps : f32
+        %inv_k = scalar.divf %one, %k_root : f32
+        %q_sq_eps = scalar.addf %q_sq_all, %epsilon : f32
+        %q_root = scalar.sqrtf %q_sq_eps : f32
+        %inv_q = scalar.divf %one, %q_root : f32
+        %dim_i = index.cast %c128 : index to i32
+        %dim_f = scalar.sitofp %dim_i : i32 to f32
+        %dim_root = scalar.sqrtf %dim_f : f32
+        %inv_dim = scalar.divf %one, %dim_root : f32
+        %q_scaled = scalar.mulf %inv_q, %inv_dim : f32
+        %scale_row = index.mul %t, %nkh : index
+        %scale_head = index.add %scale_row, %wg : index
+        %scale_base = index.mul %scale_head, %c3 : index
+        %o1 = index.add %scale_base, %c1 : index
+        %o2 = index.add %scale_base, %c2 : index
+        view.store %inv_k, %scales_view[%scale_base] : f32, view<[%scale_total]xf32>
+        view.store %q_scaled, %scales_view[%o1] : f32, view<[%scale_total]xf32>
+        view.store %kq_all, %scales_view[%o2] : f32, view<[%scale_total]xf32>
+      }
+    }
+  }
+  kernel.return
+}
+
+// Requires --config=yah_ssm_conv.batch=4 --config=yah_ssm_conv.qkv_dim=16.

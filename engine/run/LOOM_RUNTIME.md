@@ -2718,3 +2718,16 @@ rejects unknown flags.
   then binds `scratch` and skips the cast. Older sets keep the old path.
 - p60 = full emit: md5 a2145e371ceefd4d, 931 -> 915 dispatches, half_cast
   12.8 M cycles gone, attention 93.9 -> 93.8 M (~0.2% of pp2048).
+
+**prep_kq fused into the SSM conv (2026-10-01).** `yah_ssm_conv_kq_f32.loom`
+remaps channels: workgroup w < num_key_heads takes key head w's q (lanes
+0..127) and k (lanes 128..255) channels, the rest take v 256 at a time; each
+channel's conv is unchanged. The q/k workgroups put their results in LDS, and
+wave 0 runs `yah_deltanet_prep_kq` op for op (per-lane sequential sums of 4,
+three `subgroup.reduce`, lane 0 stores inv_k / q_scale / k.q). The driver uses
+it when the set has `convkq.hal`; `YAH_CONVKQ=0` restores conv + prep_kq.
+- p61 = full emit: md5 a2145e371ceefd4d, 915 -> 867 dispatches.
+- Rows: conv 83.5 + prep_kq 23.5 -> conv_kq 84.2 M cycles (-22.8 M, ~0.3%).
+
+Skipped: wave64 for `yah_fused_qk_rope_batched`. It moves ~140 MB per call in
+0.77 ms (~180 GB/s, ~86% of DRAM bandwidth), so it is memory-bound.
