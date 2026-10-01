@@ -2135,8 +2135,10 @@ Hoisting (worktree compiler, `low-licm`, LOOM_EXP_LICM=1, local commit
   that hoists VALU, because it sits at its 232-VGPR ceiling. It needs
   registers freed first.
 
-Production p47 = p46 + the IQ4_XS kstore/swiglu/kres HALs built with the
-worktree compiler and hoisting on:
+**Superseded, not production:** production artifacts must build with stock
+HRX, and p47 needed the experimental compiler. For the record, p47 = p46 +
+the IQ4_XS kstore/swiglu/kres HALs built with the worktree compiler and
+hoisting on:
 
     YAH_LOOM_HOME=/home/q/hrx-wt LOOM_EXP_LICM=1 rollout.sh <base> iq4xs
 
