@@ -177,3 +177,16 @@ computed ones.
 - Wave64 tile GEMMs: wave64 VALU/LDS instructions cost ~1.7x.
 - More residency via smaller K steps.
 - Decode-free f16 GEMMs.
+
+## Appendix: dual-issue audit (p59 kernels, 2026-10-01)
+
+Busiest VALU block per production kernel (`llvm-objdump`):
+- Dual-issue (`v_dual_*`) is 0-9% of VALU everywhere.
+- Attention (`yah_attn_hip`): 1935 VALU, 0% dual, 89% single-issue FP32 (the
+  softmax). It runs at half the FP32 VALU rate RDNA3 offers; the main
+  dual-issue lever left. It is also WMMA-heavy, so plain wave64 is not
+  automatically a win.
+- GEMM K loops: 2-9% dual, but mostly integer decode (shifts/and/bfe), which is
+  largely hidden behind WMMA (~0.23 cycles per removed VALU, measured).
+- half_norm / conv / postnorm / rope: single-issue FP32, but memory-bound.
+- DeltaNet: wave64, so single instructions already use both ALU halves.
