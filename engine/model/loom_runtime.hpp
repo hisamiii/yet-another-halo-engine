@@ -245,17 +245,22 @@ class LoomDevice {
                 const hrx_dispatch_config_t& config, const void* constants,
                 size_t constants_size, const hrx_buffer_ref_t* bindings,
                 size_t binding_count) {
-    const uint32_t flags = next_flags_;
+    const uint32_t flags = no_barrier_ok_ ? next_flags_ : 0;
     next_flags_ = 0;
-    LoomCheck(hrx_stream_dispatch(stream_, executable.handle, ordinal, &config,
-                                  constants, constants_size, bindings,
-                                  binding_count, flags),
-              "hrx_stream_dispatch");
+    hrx_status_t status = hrx_stream_dispatch(stream_, executable.handle, ordinal, &config, constants,
+                                              constants_size, bindings, binding_count, flags);
+    // Stock HRX rejects the no-barrier flag up front (nothing recorded): retry with ordered dispatch from now on.
+    if (flags && hrx_status_code(status) == HRX_STATUS_INVALID_ARGUMENT) {
+      hrx_status_ignore(status);
+      no_barrier_ok_ = false;
+      status = hrx_stream_dispatch(stream_, executable.handle, ordinal, &config, constants, constants_size,
+                                   bindings, binding_count, 0);
+    }
+    LoomCheck(status, "hrx_stream_dispatch");
   }
 
-  // Experimental (needs the local HRX prototype flag, bit 2: skip the
-  // trailing ordering barrier): the next Dispatch may overlap the one after
-  // it. Never set against stock HRX, which rejects unknown flags.
+  // The next Dispatch may overlap the one after it (no trailing ordering barrier). Needs the local libhrx flag
+  // HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER (bit 2, not upstream); on stock HRX dispatches stay ordered.
   void NoBarrierNext() { next_flags_ = 1u << 2; }
   // Sleep-poll synchronize: with N > 0 the wait polls an event recorded at
   // the stream tail and sleeps N us between checks, instead of the runtime's
@@ -314,6 +319,7 @@ class LoomDevice {
   hrx_device_t device_ = nullptr;
   hrx_stream_t stream_ = nullptr;
   uint32_t next_flags_ = 0;
+  bool no_barrier_ok_ = true;
   long sleep_us_ = 0;
   bool initialized_ = false;
 };
