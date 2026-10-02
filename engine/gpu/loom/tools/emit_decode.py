@@ -13,7 +13,7 @@ usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, m
   dattn_{kvappend,part,reduce}   tools/gen_decode_attn.py: attention over the paged
                                  fp16 KV pools (the prefill's YAH_KV_PAGED layout)
   dattn_{kappend,vappend,part}_q with the prefill's quantized-KV switches
-                                 (YAH_ATTN_FA_K8 / _K4 with YAH_ATTN_FA_VQ8 / _VQ4):
+                                 (YAH_KV=kv8 | kv4 | k8v4 | k4v8, as the prefill set):
                                  the kv8a16 / kv4a16 pools; decode.txt "kv q KB VB"
   rmsnorm, deltanet_conv         tools/gen_decode_misc.py (the ports' math, 512 lanes;
                                  deltanet_conv also runs the decode conv)
@@ -36,6 +36,7 @@ import emit_prefill as EP  # noqa: E402  (GGUF tensor table)
 import gen_decode_attn as DA  # noqa: E402
 import gen_decode_misc as DM  # noqa: E402
 import gen_gemv as GV  # noqa: E402
+import gen_kvq  # noqa: E402
 
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
 # rows per wave R and waves per workgroup W per GEMV kind, recorded in decode.txt ("rw kind R W")
@@ -60,13 +61,11 @@ def emit_file(path, name, outdir, configs):
 
 
 def kv_bits():
-    """(K bits, V bits) from the prefill's switches (emit_prefill_pp.py): (16, 16) fp16,
-    else both quantized (the decode attention has no mixed fp16 / quantized form)."""
-    on = lambda v: os.environ.get(v, "0") == "1"
-    kb = 4 if on("YAH_ATTN_FA_K4") else 8 if on("YAH_ATTN_FA_K8") else 16
-    vb = 4 if on("YAH_ATTN_FA_VQ4") else 8 if on("YAH_ATTN_FA_VQ8") else 16
+    """(K bits, V bits) of YAH_KV, as the prefill set was emitted with. The decode attention has no mixed
+    fp16 / quantized form, so K and V are both quantized or both fp16."""
+    kb, vb = gen_kvq.kv_bits()
     if (kb == 16) != (vb == 16):
-        raise SystemExit("decode: quantize both K and V (YAH_ATTN_FA_K8|K4 with YAH_ATTN_FA_VQ8|VQ4) or neither")
+        raise SystemExit("decode: YAH_KV must quantize both K and V (kv8, kv4, k8v4, k4v8) or neither")
     return kb, vb
 
 

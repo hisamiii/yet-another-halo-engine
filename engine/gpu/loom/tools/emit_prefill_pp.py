@@ -300,26 +300,25 @@ def main():
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
     geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
-    # Quantized K (engine/run/kvq/README.md): YAH_ATTN_FA_K8=1 (kv8a16) int8 K
-    # by yah_kmean + yah_kq8; YAH_ATTN_FA_K4=1 (kv4a16) H256 + asymmetric
-    # int4 K by yah_kmean + yah_kq4. The attention decodes either to f16.
-    kq4_mode = os.environ.get("YAH_ATTN_FA_K4", "0") == "1"
-    kq8_on = os.environ.get("YAH_ATTN_FA_K8", "0") == "1" or kq4_mode
+    # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md). K: int8 (yah_kq8) or H256 + asymmetric
+    # int4 (yah_kq4) after yah_kmean centres it; the attention decodes it to f16.
+    kv_k, kv_v = gen_kvq.kv_bits()
+    kq4_mode = kv_k == 4
+    kq8_on = kv_k != 16
     if kq8_on:
         kmean_src = os.path.join(tmp, "yah_kmean.loom")
         kq8_src = os.path.join(tmp, "yah_kq8.loom")
         open(kmean_src, "w").write(gen_kvq.gen_kmean())
         open(kq8_src, "w").write(gen_kvq.gen_kq4() if kq4_mode else gen_kvq.gen_kq8())
         geom.append(("attn_kq4" if kq4_mode else "attn_kq8", 0, 0, 0))
-    # YAH_ATTN_FA_VQ8=1 (kv8a16) / YAH_ATTN_FA_VQ4=1 (kv4a16): V^T as bytes /
-    # nibbles per channel per 16-key tile + (S, C') by yah_vq8 / yah_vq4
-    # instead of the f16 transpose (one HAL per chunk: start_pos)
-    vq4_on = os.environ.get("YAH_ATTN_FA_VQ4", "0") == "1"
+    # V^T as bytes / nibbles per channel per 16-key tile + (S, C') by yah_vq8 / yah_vq4 instead of the f16
+    # transpose (one HAL per chunk: start_pos).
+    vq4_on = kv_v == 4
     if vq4_on:
         vq4_src = os.path.join(tmp, "yah_vq4.loom")
         open(vq4_src, "w").write(gen_kvq.gen_vq4())
         geom.append(("attn_vq4", 0, 0, 0))
-    vq8_on = os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1"
+    vq8_on = kv_v == 8
     if vq8_on:
         vq8_src = os.path.join(tmp, "yah_vq8.loom")
         open(vq8_src, "w").write(gen_kvq.gen_vq8())

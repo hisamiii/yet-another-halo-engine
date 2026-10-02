@@ -25,6 +25,9 @@ softmax, P.V).
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gen_kvq  # noqa: E402
+
 V4 = "vector<4xf32>"
 V8 = "vector<8xf32>"
 V8H = "vector<8xf16>"
@@ -62,21 +65,21 @@ KT = 16                              # keys per tile
 # with f16 (S, C') = (256 s, c - 384 s) (yah_vq8); staging builds f16
 # 1 + u/256 (0x3c00 | u << 2) by masks and one packed fma f * S + C', like VQ4.
 # Per-tile ranges stream with chunked prefill (no prompt-wide statistics).
-VQ8 = os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1"
+VQ8 = gen_kvq.kv_bits()[1] == 8
 # VQ4 (kv4 configs, V half): V^T 15-level nibbles per channel per 16-key tile
 # with f16 (S, C') = (16 s, c - 23 s) (yah_vq4); staging builds f16 1 + u/16
 # (0x3c00 | u << 6) by masks and one packed fma f * S + C'. P.V stays f16.
-VQ4 = os.environ.get("YAH_ATTN_FA_VQ4", "0") == "1"
+VQ4 = gen_kvq.kv_bits()[1] == 4
 # Quantized K (engine/run/kvq/README.md): the K cache is centred by its
 # per-channel prompt mean (yah_kmean) and decoded to f16 while staging; QK^T
 # runs the f16 path with an f16 (unquantized) Q.
-#   K4 (kv4a16, YAH_ATTN_FA_K4=1): H256 (k - m) as asymmetric int4 per 32-dim
+#   K4 (kv4a16): H256 (k - m) as asymmetric int4 per 32-dim
 #     group (yah_kq4), decoded as (1 + u/16) * 16 s + lo - 16 s, one packed fma
 #     per pair; Q is rotated by the same H256 while staging.
-#   K8 (kv8a16, YAH_ATTN_FA_K8=1): int8 per token half (yah_kq8), decoded as
+#   K8 (kv8a16): int8 per token half (yah_kq8), decoded as
 #     (1 + u/256) * 256 s - 384 s.
-K4 = os.environ.get("YAH_ATTN_FA_K4", "0") == "1"
-K8 = os.environ.get("YAH_ATTN_FA_K8", "0") == "1"
+K4 = gen_kvq.kv_bits()[0] == 4
+K8 = gen_kvq.kv_bits()[0] == 8
 KDEC = K4 or K8                       # K decoded to f16 at staging
 # PAGED: the K / V caches are paged in 256-token pages. A page
 # table ptab[logical page] -> physical page renumbers K rows (and K scales):

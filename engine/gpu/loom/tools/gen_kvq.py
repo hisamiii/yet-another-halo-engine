@@ -19,6 +19,8 @@ yah_kq8: int8 K with one scale per (token, kv head, 128-dim half), the split
   shuffles. grid (ceil(cap / 2), 1, 1) x 256 (two tokens per workgroup);
   tokens >= token_count are written as zeros.
 """
+import os
+import re
 import sys
 
 # PAGED: the caches are paged (256-token pages, gen_attn_fa PAGED).
@@ -27,6 +29,17 @@ import sys
 # pool of pool_rows rows (V^T tiles: ptab[tile / 16] * 16 + tile % 16).
 # emit_prefill_pp.py clears it when the context is not a multiple of 256.
 PAGED = True
+
+
+def kv_bits():
+    """(K bits, V bits) of the KV cache from YAH_KV: unset or "fp16" -> (16, 16); "kv8" / "kv4" -> both
+    quantized; or explicit parts, e.g. "k8v4", "k4", "v8" (an absent part stays fp16)."""
+    v = os.environ.get("YAH_KV", "fp16")
+    v = {"fp16": "", "kv8": "k8v8", "kv4": "k4v4"}.get(v, v)
+    m = re.fullmatch(r"(?:k([48]))?(?:v([48]))?", v)
+    if not m:
+        raise SystemExit("YAH_KV: expected fp16, kv8, kv4 or k[48]v[48], got " + repr(v))
+    return int(m.group(1) or 16), int(m.group(2) or 16)
 V8 = "vector<8xf32>"
 
 
