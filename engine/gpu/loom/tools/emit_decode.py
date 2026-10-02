@@ -17,6 +17,7 @@ usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, m
   grid_*.bin, ksigns_iq2xs.bin   the IQ tables (loom/tables)
   decode.txt                     "ctx <max_context>", GEMV geometry and grids
 """
+import json
 import os
 import shutil
 import subprocess
@@ -35,6 +36,10 @@ import gen_kvq  # noqa: E402
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
 # rows per wave R and waves per workgroup W per GEMV kind; recorded in decode.txt ("rw kind R W")
 RW = {k: (2, 4) for k in ("plain", "resid", "swiglu", "bands")}
+# YAH_TILES=<file.json> (the tuner's table, as for emit_prefill_pp.py) may override them: {"rw": {"bands": [4, 4], ...}}.
+# Every row is still reduced over the 32 lanes of one wave, so R and W change no result bits.
+if os.environ.get("YAH_TILES"):
+    RW.update({k: tuple(v) for k, v in json.load(open(os.environ["YAH_TILES"])).get("rw", {}).items()})
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):

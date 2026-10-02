@@ -149,6 +149,7 @@ Prefill GEMMs:
 - Wave64 tile GEMM: IQ3_S kstore 23.93 -> 31.27 M cycles; wave64 VALU / LDS instructions cost ~1.7x and operand fragments do not shrink.
 - KSUB = 32 for more residency: IQ3_S ffn_gate +6.8% cycles in pp2048; twice the phases, twice the barriers, and the kernel was already at its issue bound.
 - Token tiles of 160 / 192 / 224 / 320 / 384 (any multiple of 16 now emits, masked when it does not divide the chunk, bit-identical): IQ3_S ffn_gate +13.8 / +14.3 / +16.5 / +38 / +23.5% cycles vs 256. Part is the general activation-staging map (+6.5% on the same 256 tile, +2% at 128), the rest is smaller per-wave tiles (more fragment loads per WMMA), KSUB 32 above ~300 tokens, and padding (224: 9.4% of the tokens).
+- Stagger on the short-K residual GEMMs (0 / 4000 / 16000 barriers vs 8000): within 0.3%; the lockstep it fixed no longer shows.
 - Q4_K MMA order and fences (rhs-outer fence 0 / 2 / 4, lhs-outer): within 0.3% of the default; without decode-ahead +2.7%. The compiler report's 43 full LDS drains per phase are hidden by the other waves.
 - 128-token tiles (8 waves of 32 x 64, KSUB 64, 128 VGPRs, 6 waves per SIMD instead of 4): IQ3_S ffn_gate +10.5% cycles, VALU +64%, bit-identical. The kernel is issue-bound (~80% WMMA), so more resident waves hide nothing, while decode per WMMA doubles and fragment loads go 0.625 -> 0.75 per WMMA. With the 512-token result, 256 is the sweet spot at full chunks; narrow tiles only for short token counts.
 - 512-token tiles (16 waves, 4 x 4 of 32 x 128, KSUB 32 so LDS fits): IQ3_S ffn_gate +16.7% cycles in pp2048, bit-identical. Decode per WMMA halves (VALU -13%) but is mostly hidden already; KSUB 32 costs ~7% and each phase waits for the slowest of 16 waves (~9% at equal KSUB). With decode-ahead (63.5 KB LDS): +23.7%, its LDS grid lookups contend with the fragment loads. The LDS-staged design cannot amortize decode over more tokens.
@@ -207,6 +208,7 @@ Decode:
 - Persistent GEMVs (workgroups loop over row groups): 61.67 vs 60.48 ms; ragged last round (SwiGLU +3.7%).
 - Persistent megakernel: grid barrier 0.26-0.49 us would save at most ~1.3 ms per token, but persistent GEMVs lose and the register count is the max over all phases; not built.
 - HRX graph replay: 3.32 vs 3.57 us per dependent dispatch; only fewer dependent dispatches help.
+- Band and plain GEMV geometry (rows / waves per workgroup 1 x 4, 2 x 8, 4 x 4, 4 x 2; `YAH_TILES` "rw"): 60.6-62.6 vs 60.27 ms for the default 2 x 4; every step's logits identical.
 - SwiGLU geometry (rows / waves per workgroup 1 x 4 .. 2 x 8): all within 0.2 ms; residual GEMV 2 x 4 beats 1 x 4, 2 x 8, 1 x 8, 4 x 4 by 1-1.5 ms.
 - LDS sign-mask table instead of `v_mul_lo_u32`: neutral; after word decode the GEMVs are not VALU-bound.
 - `index.assume` instead of load clamps: -4% VALU, neutral.
