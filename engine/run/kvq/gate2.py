@@ -95,7 +95,10 @@ def main():
         x = np.concatenate([blocks[i] for i in rng.integers(0, len(blocks), len(blocks))])
         for q in bs:
             bs[q].append(np.percentile(x, q))
-    print("   KL tail: " + "   ".join(f"p{q}: {np.percentile(kl, q):.2e} [{np.percentile(bs[q], 2.5):.2e}, {np.percentile(bs[q], 97.5):.2e}]" for q in bs)
+    def tail(q):
+        v, lo, hi = np.percentile(kl, q), np.percentile(bs[q], 2.5), np.percentile(bs[q], 97.5)
+        return f"p{q}: {v:.4f} [{lo:.4f}, {hi:.4f}] ({100 * (lo / v - 1):+.0f}% / {100 * (hi / v - 1):+.0f}%)"
+    print("   KL tail: " + "   ".join(tail(q) for q in bs)
           + f"   max {kl.max():.2e} (n={len(kl)}, ~{len(kl) / 1000:.0f} positions above p99.9)")
 
 
