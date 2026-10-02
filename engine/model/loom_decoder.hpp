@@ -1,6 +1,7 @@
 // LoomDecoder: the single-token decode step on Loom through HRX, GEMV-based.
 //
-// HAL set: tools/emit_decode.py (decode.txt "ctx T": the paged KV pools hold T rows).
+// HAL set: tools/emit_decode.py (decode.txt "ctx T": the paged KV pools hold T rows;
+// "kv q KB VB": quantized KV in the prefill's kv8a16 / kv4a16 formats, gen_kvq.py).
 // Per layer, as HIP's Forward::Decode:
 //   rmsnorm -> full attention: attn_q / attn_k / attn_v GEMV, unpack q|gate, QK norm
 //              + RoPE, append K / V to the paged pools, split-K attention + reduce
@@ -15,7 +16,9 @@
 // The recurrent state and the KV pools are external (LoomDecoderState): either the
 // decoder's own (OwnState, for a prompt fed through decode) or the prefill's
 // (loom_forward_pp with YAH_GEN: its paged pools, page table, conv and DeltaNet state,
-// which use the same layouts).
+// which use the same layouts). With quantized KV the decoder keeps each layer's open
+// 16-key V tile in f16 and quantizes it when its 16th key arrives, so a bound state
+// must start on a tile boundary (the prefill's runs are whole chunks).
 #ifndef YAH_MODEL_LOOM_DECODER_HPP_
 #define YAH_MODEL_LOOM_DECODER_HPP_
 
@@ -40,6 +43,10 @@ namespace yah::model {
 
 struct LoomDecoderState {
   std::vector<hrx_buffer_ref_t> kpool, vtpool;   // per full-attention layer, T * 1024 f16 each
+  // quantized KV (decode.txt "kv q KB VB"), per full-attention layer: K codes and
+  // scales, the channel means subtracted before quantizing (zeros: own state), V^T
+  // codes and stats; the f16 pools are then unused
+  std::vector<hrx_buffer_ref_t> kq, ks, km, vq, vs;
   hrx_buffer_ref_t ptab{};                        // T / 256 i32 (logical page -> physical page)
   hrx_buffer_t convstate = nullptr;               // per recurrent layer si: si * 10240 * 4 f32
   hrx_buffer_t dstate = nullptr;                  // per recurrent layer si: si * 48 * 128 * 128 f32
@@ -69,7 +76,10 @@ class LoomDecoder {
         if (k == "rw") rw_[kind] = {r, w};
         if (k == "persist") persist_ = r;   // gv kernels (not resid_norm) launch min(r, row groups)
         if (k == "grid") grid_[kind] = r;   // the exact grid each GEMV kernel was compiled for
+        if (k == "kv") { kbits_ = r; vbits_ = w; }   // "kv q KB VB"
       }
+      const auto ok = [](std::uint32_t b) { return b == 4 || b == 8; };
+      if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
     }
     const std::uint32_t npg = T_ / 256;
     if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != 23)
@@ -89,6 +99,8 @@ class LoomDecoder {
     toks_ = &Alloc((std::size_t{T_} + 1) * 4); posarr_ = &Alloc(std::size_t{T_} * 4); eps_ = &Alloc(4);
     c32a_ = &Alloc(kKv * 4); c32b_ = &Alloc(kKv * 4); c16a_ = &Alloc(kKv * 2); c16b_ = &Alloc(kKv * 2);
     acc_ = &Alloc(std::size_t{npg} * kHeads * 256 * 4); ml_ = &Alloc(std::size_t{npg} * kHeads * 2 * 4);
+    if (quant())
+      for (std::uint32_t i = 0; i < full_layers(); ++i) vopen_.push_back(Ref(Alloc(std::size_t{kKv} * 16 * 2)));
     const float e = 1.0e-6f;
     gpu_.H2D(*eps_, &e, 4);
     std::vector<std::int32_t> pv(T_);
@@ -106,6 +118,14 @@ class LoomDecoder {
   }
 
   [[nodiscard]] std::uint32_t context() const { return T_; }
+  // KV bits of this set: (16, 16) fp16, else (8 | 4, 8 | 4)
+  [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> kv_bits() const { return {kbits_, vbits_}; }
+  [[nodiscard]] bool quant() const { return kbits_ != 16; }
+  // quantized pool bytes per layer (gen_kvq.py layouts)
+  std::size_t KqBytes() const { return std::size_t{T_} * (kbits_ == 4 ? 512 : 1024); }
+  std::size_t KsBytes() const { return std::size_t{T_} * (kbits_ == 4 ? 128 : 32); }
+  std::size_t VqBytes() const { return std::size_t{T_} * (vbits_ == 4 ? 512 : 1024); }
+  std::size_t VsBytes() const { return std::size_t{T_} * 256; }
   std::uint32_t full_layers() const { return cfg_.main_block_count() / cfg_.full_attention_interval; }
   std::uint32_t recurrent_layers() const { return cfg_.main_block_count() - full_layers(); }
 
@@ -115,8 +135,16 @@ class LoomDecoder {
     const std::uint32_t npg = T_ / 256;
     const std::size_t poolb = std::size_t{T_} * kKv * 2;
     for (std::uint32_t i = 0; i < full_layers(); ++i) {
-      st.kpool.push_back(Ref(Alloc(poolb)));
-      st.vtpool.push_back(Ref(Alloc(poolb)));
+      if (quant()) {
+        st.kq.push_back(Ref(Alloc(KqBytes())));
+        st.ks.push_back(Ref(Alloc(KsBytes())));
+        st.km.push_back(Ref(Alloc(4096)));
+        st.vq.push_back(Ref(Alloc(VqBytes())));
+        st.vs.push_back(Ref(Alloc(VsBytes())));
+      } else {
+        st.kpool.push_back(Ref(Alloc(poolb)));
+        st.vtpool.push_back(Ref(Alloc(poolb)));
+      }
     }
     LoomBuffer& pt = Alloc(std::size_t{npg} * 4);
     std::vector<std::int32_t> pages(npg);
@@ -131,13 +159,24 @@ class LoomDecoder {
   // External state: sizes are checked against this set's context.
   void Bind(const LoomDecoderState& st) {
     const std::size_t poolb = std::size_t{T_} * kKv * 2;
-    if (st.kpool.size() != full_layers() || st.vtpool.size() != full_layers())
-      throw LoomError("decoder: one K and one V^T pool per full-attention layer expected");
-    for (std::uint32_t i = 0; i < full_layers(); ++i)
-      if (st.kpool[i].length < poolb || st.vtpool[i].length < poolb)
-        throw LoomError("decoder: KV pool smaller than the decode set's context " + std::to_string(T_));
+    const std::uint32_t nf = full_layers();
+    if (quant()) {
+      if (st.kq.size() != nf || st.ks.size() != nf || st.km.size() != nf || st.vq.size() != nf || st.vs.size() != nf)
+        throw LoomError("decoder: quantized K / V pools per full-attention layer expected");
+      for (std::uint32_t i = 0; i < nf; ++i)
+        if (st.kq[i].length < KqBytes() || st.ks[i].length < KsBytes() || st.km[i].length < 4096 ||
+            st.vq[i].length < VqBytes() || st.vs[i].length < VsBytes())
+          throw LoomError("decoder: quantized KV pool smaller than the decode set's context " + std::to_string(T_));
+    } else {
+      if (st.kpool.size() != nf || st.vtpool.size() != nf)
+        throw LoomError("decoder: one K and one V^T pool per full-attention layer expected");
+      for (std::uint32_t i = 0; i < nf; ++i)
+        if (st.kpool[i].length < poolb || st.vtpool[i].length < poolb)
+          throw LoomError("decoder: KV pool smaller than the decode set's context " + std::to_string(T_));
+    }
     if (st.ptab.length < std::size_t{T_ / 256} * 4) throw LoomError("decoder: page table too small");
     st_ = st;
+    next_pos_ = kAnyTile;
     cs_[0] = st.convstate;
     if (fuseconv_ && !cs_[1]) cs_[1] = Alloc(std::size_t{recurrent_layers()} * kConvState * 4).handle;
     cs_cur_ = 0;
@@ -161,7 +200,11 @@ class LoomDecoder {
   // when pos + 1 >= keep_from (generated positions), else to a sink (prompt positions).
   void Step(std::uint32_t pos, std::uint32_t keep_from) {
     if (pos >= T_) throw LoomError("decoder: position past the set's context");
-    if (st_.kpool.empty()) throw LoomError("decoder: no state bound");
+    if (st_.kpool.empty() && st_.kq.empty()) throw LoomError("decoder: no state bound");
+    // the open V tile holds this tile's earlier keys only if the steps were contiguous
+    if (quant() && pos % 16 && pos != next_pos_)
+      throw LoomError("decoder: quantized KV steps must be contiguous from a 16-key tile boundary");
+    next_pos_ = pos + 1;
     cur_pos_ = pos;
     const hrx_buffer_ref_t dposr{posarr_->handle, std::size_t{pos} * 4, 4};
     Dispatch(Load("embed"), 1, 1, kHidden / 16,
@@ -183,10 +226,20 @@ class LoomDecoder {
         Dispatch(Load("rope"), kHeads + kKvHeads, 1, 256,
                  {Ref(*q_), Ref(*kb_), Ref(*vb_), TRef(pre + "attn_q_norm.weight"), TRef(pre + "attn_k_norm.weight"),
                   Ref(*q_), Ref(*kb_), Ref(*c32a_), Ref(*c32b_), Ref(*c16a_), Ref(*c16b_), dposr, Ref(*eps_)});
-        Dispatch(Load("dattn_kvappend"), kKvHeads, 1, 256,
-                 {Ref(*kb_), Ref(*vb_), st_.kpool[ai], st_.vtpool[ai], st_.ptab, dposr});
-        Dispatch(Load("dattn_part"), kKvHeads, pos / 256 + 1, 256,
-                 {Ref(*q_), st_.kpool[ai], st_.vtpool[ai], st_.ptab, dposr, Ref(*acc_), Ref(*ml_)});
+        if (quant()) {
+          Dispatch(Load("dattn_kappend_q"), 1, 1, 128, {Ref(*kb_), st_.km[ai], st_.kq[ai], st_.ks[ai], st_.ptab, dposr});
+          if (overlap_) gpu_.NoBarrierNext();   // independent of the K append
+          Dispatch(Load("dattn_vappend_q"), kKvHeads, 1, 256,
+                   {Ref(*vb_), vopen_[ai], st_.vq[ai], st_.vs[ai], st_.ptab, dposr});
+          Dispatch(Load("dattn_part_q"), kKvHeads, pos / 256 + 1, 256,
+                   {Ref(*q_), st_.kq[ai], st_.ks[ai], st_.vq[ai], st_.vs[ai], vopen_[ai], st_.ptab, dposr,
+                    Ref(*acc_), Ref(*ml_)});
+        } else {
+          Dispatch(Load("dattn_kvappend"), kKvHeads, 1, 256,
+                   {Ref(*kb_), Ref(*vb_), st_.kpool[ai], st_.vtpool[ai], st_.ptab, dposr});
+          Dispatch(Load("dattn_part"), kKvHeads, pos / 256 + 1, 256,
+                   {Ref(*q_), st_.kpool[ai], st_.vtpool[ai], st_.ptab, dposr, Ref(*acc_), Ref(*ml_)});
+        }
         Dispatch(Load("dattn_reduce"), kHeads, 1, 256, {Ref(*acc_), Ref(*ml_), Ref(*gate_), dposr, Ref(*aout_)});
         Tr("attn", l, *aout_, kAttn);
         Resid(pre + "attn_output.weight", *aout_, pre + "post_attention_norm.weight");
@@ -406,7 +459,9 @@ class LoomDecoder {
   std::string dir_;
   hrx_buffer_t weights_;
   std::size_t delta_;
-  std::uint32_t T_ = 0, cur_pos_ = 0;
+  static constexpr std::uint32_t kAnyTile = 0xffffffffu;
+  std::uint32_t T_ = 0, cur_pos_ = 0, kbits_ = 16, vbits_ = 16, next_pos_ = kAnyTile;
+  std::vector<hrx_buffer_ref_t> vopen_;   // quantized V: each layer's open tile, [1024][16] f16
   bool trace_ = false, overlap_ = true, bands_ = true, resnorm_ = false, fuseconv_ = true;
   hrx_buffer_t cs_[2] = {nullptr, nullptr};   // conv state ping-pong (fused conv)
   int cs_cur_ = 0;

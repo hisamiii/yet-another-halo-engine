@@ -2105,6 +2105,54 @@ What mattered, in order (each measured on the full decode):
 The previous decode runner (`yah-hrx`, removed) drove the prefill GEMM HALs with a
 64-token tile per generated token (1.46 tok/s).
 
+### Quantized KV in decode (2026-10-02): kv8a16 / kv4a16
+
+The decode attention reads the prefill's quantized pools directly
+(`emit_decode.py` with the prefill's switches, `YAH_ATTN_FA_K8|K4` together with
+`YAH_ATTN_FA_VQ8|VQ4`; `decode.txt` "kv q KB VB"; the prefill handoff refuses a
+decode set whose KV format differs). Formats are gen_kvq.py's, unchanged.
+
+- `dattn_kappend_q` (1 x 128 lanes): the new token's K quantized with yah_kq8 /
+  yah_kq4's arithmetic taken verbatim (f16-rounded, minus the layer's channel
+  means; kv4 H256-rotated), written at the paged row. Bit-exact vs a numpy model.
+- `dattn_vappend_q`: V goes into the layer's open 16-key tile (f16,
+  decoder-owned); the 16th key quantizes the tile per channel (yah_vq8 / vq4
+  arithmetic) into the paged V^T pools. Bit-exact. Prefill runs end on whole
+  chunks, so the handoff always starts on a tile boundary; the decoder refuses
+  non-contiguous steps that start mid-tile.
+- `dattn_part_q`: same grid / outputs as `dattn_part` (the reduce is shared).
+  q goes to LDS in the codes' storage order (kv4: rotated in place by an 8-stage
+  LDS butterfly, plus per-half-group sums for the asymmetric offset term); each
+  key thread dequantizes its own row; the quantized V tiles are dequantized
+  against p in storage order and the open tile is added once after the tile loop.
+  The per-channel mean is never added back: q.m is constant over keys and cancels
+  in the softmax. Agrees with a dequantized float64 model to ~2e-7
+  (`tools/dattn_q_check.py`, scrambled page table; pos 0 / tile start / page
+  end / last slot; mixed K4/V8 and K8/V4 also pass).
+- Two bugs found by the checker: the K4 load clamp assumed 4-dword loads (last
+  row of the last kv head read 2 dwords early), and the first V loop computed
+  both the quantized and the open-tile FMA per head and selected: 1.9 KB of
+  spills per thread, 14.4 ms per dispatch (vs 0.65 fp16). Moving the open tile
+  out of the loop: no spills.
+- part kernel at 30.7K, standalone: fp16 651.5 us, kv8 362, kv4 347. In the
+  pipeline at 8K (dispatch timestamps, per token): attention fp16 3.55 ms, kv8
+  2.25, kv4 2.44.
+- Prefill -> decode, 64 tokens, one round each (c32k sets, B = 2048):
+
+  | context | fp16 | kv8a16 | kv4a16 |
+  |---|---|---|---|
+  | 8192 | 65.17 ms | 63.90 | 66.86 (profiled run: 65.56) |
+  | 30720 | 74.10 | 70.56 | 70.79 |
+
+  Tokens: 64/64 identical to fp16 at 8K for both; at 30K both diverge at token
+  40 to the same alternative (a near-tie; identical before it). kv4's 8K round
+  is above fp16, but its attention kernels are 1.1 ms/token cheaper (profile):
+  run-to-run variation, not a kernel cost.
+- kv4 part is no faster than kv8 despite 40% fewer bytes (~91 vs ~144 GB/s): the
+  per-workgroup q rotation / barriers / group sums and the denser dequant make it
+  latency-bound. The lead for more: kv4 part bandwidth-bound would be ~160 us at
+  30K (-3 ms/token).
+
 ### History
 
 HIP runs **alongside** HRX again. It was removed in `01279d6` before tuning was

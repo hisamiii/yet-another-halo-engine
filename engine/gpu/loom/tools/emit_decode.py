@@ -12,6 +12,9 @@ usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, m
                                  ffn_gate + ffn_up
   dattn_{kvappend,part,reduce}   tools/gen_decode_attn.py: attention over the paged
                                  fp16 KV pools (the prefill's YAH_KV_PAGED layout)
+  dattn_{kappend,vappend,part}_q with the prefill's quantized-KV switches
+                                 (YAH_ATTN_FA_K8 / _K4 with YAH_ATTN_FA_VQ8 / _VQ4):
+                                 the kv8a16 / kv4a16 pools; decode.txt "kv q KB VB"
   rmsnorm, deltanet[_conv]       tools/gen_decode_misc.py (the ports' math, 512 lanes;
                                  deltanet_conv also runs the decode conv, the default)
   unpack, rope, ssmconv, argmax: the ported HIP decode kernels.
@@ -58,6 +61,17 @@ def emit_file(path, name, outdir, configs):
     if r.returncode != 0:
         raise SystemExit("emit failed for %s:\n%s%s" % (path, r.stdout[-3000:], r.stderr[-3000:]))
     shutil.copy(r.stdout.strip().splitlines()[0], os.path.join(outdir, name + ".hal"))
+
+
+def kv_bits():
+    """(K bits, V bits) from the prefill's switches (emit_prefill_pp.py): (16, 16) fp16,
+    else both quantized (the decode attention has no mixed fp16 / quantized form)."""
+    on = lambda v: os.environ.get(v, "0") == "1"
+    kb = 4 if on("YAH_ATTN_FA_K4") else 8 if on("YAH_ATTN_FA_K8") else 16
+    vb = 4 if on("YAH_ATTN_FA_VQ4") else 8 if on("YAH_ATTN_FA_VQ8") else 16
+    if (kb == 16) != (vb == 16):
+        raise SystemExit("decode: quantize both K and V (YAH_ATTN_FA_K8|K4 with YAH_ATTN_FA_VQ8|VQ4) or neither")
+    return kb, vb
 
 
 def gemv_name(kind, fmts, M, K):
@@ -141,6 +155,11 @@ def main():
         grids[name] = sum(Ms) // GV.rows_per_wg(*RW["bands"])
     for which in ("kvappend", "part", "reduce"):
         emit_src(DA.gen(which, T), "dattn_" + which, outdir)
+    kb, vb = kv_bits()
+    if kb != 16:
+        emit_src(DA.gen_kappend_q(T, kb), "dattn_kappend_q", outdir)
+        emit_src(DA.gen_vappend_q(T, vb), "dattn_vappend_q", outdir)
+        emit_src(DA.gen_part_q(T, kb, vb), "dattn_part_q", outdir)
     L = lambda f: os.path.join(LOOM, f)
     emit_src(DM.gen_rmsnorm(), "rmsnorm", outdir)          # 512 lanes (the port: one 32-lane subgroup)
     emit_file(L("yah_unpack_qg_f32.loom"), "unpack", outdir,
@@ -161,7 +180,7 @@ def main():
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + "".join("rw %s %d %d\n" % (k, r * (2 if GV.LPR == 16 else 1), w) for k, (r, w) in sorted(RW.items())) +
+        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + "".join("rw %s %d %d\n" % (k, r * (2 if GV.LPR == 16 else 1), w) for k, (r, w) in sorted(RW.items())) +
         ("persist gv %d 0\n" % GV.PERSIST if GV.PERSIST else "") +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)

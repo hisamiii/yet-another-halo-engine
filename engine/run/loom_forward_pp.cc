@@ -1423,16 +1423,30 @@ int main(int argc, char** argv) {
         const std::uint32_t ngen = static_cast<std::uint32_t>(std::atoi(gv));
         const char* ddir = std::getenv("YAH_DECODE_HAL");
         if (!ddir) throw LoomError("YAH_GEN needs YAH_DECODE_HAL (tools/emit_decode.py set)");
-        if (!(kv_paged && paged_f16k && paged_f16v)) throw LoomError("YAH_GEN needs paged fp16 K / V (the default set)");
+        if (!kv_paged) throw LoomError("YAH_GEN needs the paged KV layout (the default set)");
         if (T_run + ngen - 1 > T_ctx) throw LoomError("YAH_GEN: prompt + gen exceeds the emitted context");
         LoomDecoder dec(gpu, gguf, cfg, ddir, weights.handle, weights_delta);
         if (dec.context() != kPages * 256)
           throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) +
                           " != prefill pool rows " + std::to_string(kPages * 256));
+        // the decode set's KV format must be this prefill's (fp16, or kv8a16 / kv4a16)
+        const std::uint32_t kbits = attn_kq4 ? 4 : attn_kq8 ? 8 : 16, vbits = attn_vq4 ? 4 : attn_vq8 ? 8 : 16;
+        if (dec.kv_bits() != std::make_pair(kbits, vbits))
+          throw LoomError("YAH_GEN: decode set KV bits " + std::to_string(dec.kv_bits().first) + "/" +
+                          std::to_string(dec.kv_bits().second) + " != prefill " + std::to_string(kbits) + "/" +
+                          std::to_string(vbits) + " (emit_decode.py with the same YAH_ATTN_FA_* switches)");
         LoomDecoderState st;
         for (std::uint32_t ai = 0; ai < kFull; ++ai) {
-          st.kpool.push_back({kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes});
-          st.vtpool.push_back({vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes});
+          if (dec.quant()) {
+            st.kq.push_back({kq8buf.handle, std::size_t{ai} * kKqBytes, kKqBytes});
+            st.ks.push_back({ksbuf.handle, std::size_t{ai} * kKsBytes, kKsBytes});
+            st.km.push_back({kmbuf.handle, std::size_t{ai} * 4096, 4096});
+            st.vq.push_back({vqbuf.handle, std::size_t{ai} * kVqBytes, kVqBytes});
+            st.vs.push_back({vqsbuf.handle, std::size_t{ai} * kVqsBytes, kVqsBytes});
+          } else {
+            st.kpool.push_back({kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes});
+            st.vtpool.push_back({vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes});
+          }
         }
         st.ptab = ptab_ref;
         st.convstate = conv_state.handle;
