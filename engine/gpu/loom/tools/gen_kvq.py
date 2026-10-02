@@ -22,11 +22,11 @@ yah_kq8: int8 K with one scale per (token, kv head, 128-dim half), the split
 import os
 import sys
 
-# YAH_KV_PAGED=1: the caches are paged (256-token pages, gen_attn_fa PAGED).
+# YAH_KV_PAGED (default 1; 0 = contiguous): the caches are paged (256-token pages, gen_attn_fa PAGED).
 # Writers read the chunk's token_count rows of the f16 scratch and write
 # physical row ptab[t / 256] * 256 + t % 256 (t = start_pos + local) of a
 # pool of pool_rows rows (V^T tiles: ptab[tile / 16] * 16 + tile % 16).
-PAGED = os.environ.get("YAH_KV_PAGED", "0") == "1"
+PAGED = os.environ.get("YAH_KV_PAGED", "1") == "1"   # default on (p71); 0 = contiguous cache
 V8 = "vector<8xf32>"
 
 

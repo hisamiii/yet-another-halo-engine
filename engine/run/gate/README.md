@@ -58,3 +58,13 @@ default (emitter YAH_DN_CHUNK=1; 0 restores the HIP-order recurrent kernel).
 - Speed (SQ_BUSY_CYCLES, one round each): DeltaNet -10.5% at pp2048
   (188.0 -> 168.4 M), -12.9% at pp8192 (749.4 -> 652.5 M), i.e. 0.27% / 0.33%
   of total cycles.
+
+
+Decision, 2026-10-02: paged KV caches (256-token pages) are the default (p71;
+emitter YAH_KV_PAGED, 0 restores the contiguous cache and reproduces p70 byte
+for byte). Exact change: none. p71 gives p70's ac36332b6b5092a4 /
+963b7396625e2333, and the 32K chunked set's arXiv row stats are identical to
+p70, also with a scrambled page table.
+- Cost (SQ_BUSY_CYCLES, one round): -0.25% (pp2048) / -0.48% (pp8192), noise.
+- Clean untraced runs (APU <= 55 C start, 15 s / 30 s gaps, tctl 95):
+  pp2048 Loom 3132.2 ms vs HIP 3381.7; pp8192 Loom 13154.0 vs HIP 14254.3.

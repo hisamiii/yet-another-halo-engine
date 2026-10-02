@@ -405,6 +405,22 @@ def main():
     # WmmaCausalAttention<32, 16, true> (32 tokens x 2 heads per workgroup),
     # reading V^T written per layer by yah_transpose_v16 (vtrans.hal row).
     attn_hip = os.environ.get("YAH_ATTN_HIP", "1") == "1"
+    # KV paging (256-token pages) is the default since 2026-10-02 (p71): bit-
+    # identical and cycle-neutral. It needs the FA kernel and a context that is a
+    # multiple of 256; otherwise the default falls back to the contiguous cache
+    # and an explicit YAH_KV_PAGED=1 is an error. The decision is pinned in the
+    # env here, before gen_attn_fa / gen_kvq are imported (they read it).
+    kv_paged_env = os.environ.get("YAH_KV_PAGED")
+    kv_paged = kv_paged_env != "0"
+    if kv_paged:
+        why = ("the context to be a multiple of 256" if T % 256 else
+               "the FA attention kernel" if not (os.environ.get("YAH_ATTN_FA", "1") == "1" and attn_hip) else None)
+        if why and kv_paged_env == "1":
+            raise SystemExit("YAH_KV_PAGED needs " + why)
+        if why:
+            print("KV paging off: needs " + why)
+            kv_paged = False
+    os.environ["YAH_KV_PAGED"] = "1" if kv_paged else "0"
     vtrans_src = None
     kq8_on = False
     vq8_on = False
@@ -507,16 +523,11 @@ def main():
     # Quantized K and V: attention never reads the f16 KV cache, so it becomes
     # a one-layer, one-chunk scratch (RoPE writes row cur - cache_start; the
     # quantizers read it right after): the driver sizes kv16 by this marker.
-    # YAH_KV_PAGED=1: paged K / V caches (256-token pages, page table bound to
-    # attention and every cache writer; gen_attn_fa / gen_kvq read the same env).
-    # The f16 KV cache is then always a scratch; fp16 K / V go to paged pools
-    # through the paged RoPE K store / yah_vtpage (per chunk) instead of the V^T re-transpose.
-    kv_paged = os.environ.get("YAH_KV_PAGED", "0") == "1"
+    # Paged K / V caches (kv_paged, decided above; page table bound to attention
+    # and every cache writer). The f16 KV cache is then always a scratch; fp16
+    # K / V go to paged pools through the paged RoPE K store / yah_vtpage (per
+    # chunk) instead of the V^T re-transpose.
     if kv_paged:
-        if T % 256:
-            raise SystemExit("YAH_KV_PAGED needs the context to be a multiple of 256")
-        if not (os.environ.get("YAH_ATTN_FA", "1") == "1" and attn_hip):
-            raise SystemExit("YAH_KV_PAGED needs the FA attention kernel")
         geom.append(("kv_paged", 0, 0, 0))
     kv16_scratch = kv_paged or (kq8_on and (vq4_on or vq8_on))
     if kv16_scratch:

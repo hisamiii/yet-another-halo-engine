@@ -3008,7 +3008,12 @@ Loom miscompiles on the way (upstream-candidates #10):
 - f16 `vector.subf` / `uitofp` are rejected (vector_f32 constraint);
   `vector.fmaf` on f16 works (v_pk_fmac_f16).
 
-### Paged KV (2026-10-02): YAH_KV_PAGED=1 (opt-in)
+### Paged KV (2026-10-02): default (p71); YAH_KV_PAGED=0 for the contiguous cache
+
+- **Default:** the emitter pages unless YAH_KV_PAGED=0, and falls back to the
+  contiguous cache (with a note) when the context is not a multiple of 256 or
+  attention is not the FA kernel; an explicit YAH_KV_PAGED=1 then errors. The
+  decision is pinned in the env before gen_attn_fa / gen_kvq are imported.
 
 - **Layout:** 256-token pages. One page table per sequence (logical -> physical
   page, shared by all layers) renumbers K rows (and K scales) and V^T tiles

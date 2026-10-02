@@ -144,12 +144,12 @@ VQ4 = os.environ.get("YAH_ATTN_FA_VQ4", "0") == "1"
 K4 = os.environ.get("YAH_ATTN_FA_K4", "0") == "1"
 K8 = os.environ.get("YAH_ATTN_FA_K8", "0") == "1"
 KDEC = K4 or K8                       # K decoded to f16 at staging
-# PAGED (YAH_KV_PAGED=1): the K / V caches are paged in 256-token pages. A page
+# PAGED (YAH_KV_PAGED, default 1; 0 = contiguous): the K / V caches are paged in 256-token pages. A page
 # table ptab[logical page] -> physical page renumbers K rows (and K scales):
 # row' = ptab[row / 256] * 256 + row % 256, and V^T tiles (and V stats):
 # tile' = ptab[tile / 16] * 16 + tile % 16 (layouts unchanged). Every 16-key
 # tile lies in one page: one uniform table load per K tile and per V tile.
-PAGED = os.environ.get("YAH_KV_PAGED", "0") == "1"
+PAGED = os.environ.get("YAH_KV_PAGED", "1") == "1"   # default on (p71); 0 = contiguous cache
 # PAGED page lookups are scalar (SMEM) loads of the global table. Tried and
 # reverted (2026-10-02): a prologue copy of the table into LDS, to avoid the
 # lgkmcnt(0) that every SMEM use implies. Standalone pp8192 layer 3: non-paged
