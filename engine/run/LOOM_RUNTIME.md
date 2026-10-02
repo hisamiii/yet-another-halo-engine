@@ -2070,6 +2070,11 @@ What mattered, in order (each measured on the full decode):
   0.2 ms: geometry is not the limit), an LDS sign-mask table in place of the
   quarter-rate v_mul_lo_u32 (67 -> 7 per kernel, neutral: not VALU-bound after
   word decode), index.assume in place of load clamps (-4% VALU, neutral).
+- **32-element groups per lane** (`YAH_GV_G2`, header loads shared by both
+  sub-blocks): 11-31% fewer VALU and 14-43% fewer loads per unit of work, but
+  60-75 -> 103-114 VGPRs; slower (61.77 vs 60.48 ms), the occupancy loss
+  outweighs the saved issue. Residual GEMV geometry (R x W): the default 2 x 4
+  wins by 1-1.5 ms over 1 x 4, 2 x 8, 1 x 8, 4 x 4.
 - Profiling: `HRX_PROFILE_MODE=dispatch` (timestamps only) costs ~1%;
   counters mode inflates dispatch gaps ~4x. A kernel right after a no-barrier
   group shows the group's tail in its own duration.
