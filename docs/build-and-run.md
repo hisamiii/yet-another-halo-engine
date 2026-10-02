@@ -1,0 +1,158 @@
+# Build, run, verify, profile
+
+How to build the drivers, emit HAL sets, run prefill and decode, check correctness, profile, and measure without hanging the GPU or fooling yourself. Read the GPU safety section before you write or launch a new kernel.
+
+## Prerequisites
+
+- HRX built from source at `/home/q/hrx` (cmake tree `/home/q/hrx/build/cmake`, `YAH_HRX_BUILD` overrides). Loom tools (`loom-compile`, `iree-run-loom`, `iree-benchmark-loom`) come with that build.
+- The official ROCm Core SDK 10.0.0 runtime packages, extracted (no system install) by `engine/hrx-env.sh --fetch` into `/home/q/rocm10`. Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
+- `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`; `/opt/rocm` stays usable.
+- The model: `~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf`.
+- Python 3 with numpy for the emitters. The checkers also need llama.cpp's `gguf-py` on `PYTHONPATH`; use an OpenBLAS numpy (`/home/q/yah-scratch/venv/bin/python`), the system numpy is ~100x slower for the gate tools.
+
+### Local HRX patches
+
+The `/home/q/hrx` checkout carries uncommitted local patches. Everything builds and runs on stock HRX; the patches only add speed or profiling:
+
+| patch | effect | on stock HRX |
+|---|---|---|
+| `HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER` (`libhrx` stream.c, hrx_runtime.h) | decode overlaps independent dispatches (`LoomDevice::NoBarrierNext`) | the flag is rejected; `LoomDevice::Dispatch` retries without it and keeps dispatches ordered (same results, slower decode) |
+| profile metadata for stream dispatches (stream.c) | `HRX_PROFILE_MODE=dispatch` records stream dispatches | no dispatch events in the profile |
+| `HRX_PROFILE_MODE=counters` (runtime.c) and the gfx1151 counter map (profile_counters.c) | per-dispatch PMC such as `SQ_BUSY_CYCLES` | not available |
+
+These are upstream candidates; do not push them to HRX without the owner's agreement.
+
+## Build
+
+```
+engine/build_hrx.sh
+```
+
+It builds `libyah_core`, the core tools (`yah-tokenize`, `yah-dump`, `yah-weights`) and the drivers `loom_forward_pp`, `loom_decode`, `hal_run`, `hal_bench` into `engine/build/`. Always use this script: `cmake --build engine/build` does not build the drivers and prints nothing, and a stale driver with a new HAL set launches the wrong grid. `gpu_run.sh` refuses a driver binary older than its source.
+
+`engine/build_loomhip.sh` builds `engine/build/loomhip` (needs hipcc), which runs one Loom hsaco through HIP for rocprofv3.
+
+## Emit HAL sets
+
+Emitters run on the CPU and take a few minutes. Paths below are relative to `engine/gpu/loom`.
+
+| set | command |
+|---|---|
+| prefill, one pass of B tokens | `python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (B must be a multiple of 256) |
+| prefill, chunked, context T | `YAH_CTX=32768 python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (chunk 2048, pools for 32768 tokens; T a multiple of B) |
+| prefill with kv8a16 / kv4a16 | add `YAH_KV=kv8` or `YAH_KV=kv4` (or mixed `k8v4`, `k4v8`; `k8` / `v4` alone quantize one side, prefill only) |
+| decode | `python3 tools/emit_decode.py <gguf> <dir> <max_context>` (multiple of 256, default 4096) |
+| decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
+
+`engine/build_hrx.sh <gguf> [dir]` also emits a decode set (default `engine/hal`), which the end-to-end gates use.
+
+Big sets belong in `~/yah-scratch` or `/home/q/yah-hal-*`, not in the repo.
+
+## Run
+
+Every GPU job goes through `engine/run/gpu_run.sh <tag> -- <command>` (see GPU safety). Source `engine/hrx-env.sh` first.
+
+Prefill:
+
+```
+engine/run/gpu_run.sh pp -- engine/build/loom_forward_pp <gguf> <set> <out-prefix> 2048 <ids-file>
+```
+
+- `<ids-file>`: whitespace-separated token ids. A short file is repeated to the token count. Make one with `engine/build/yah-tokenize <gguf> --stdin`.
+- The token count must equal the set's B, or for a chunked set be a multiple of the chunk up to T.
+- Prints `layers_ms=` (the 64-layer loop, wall clock) and `argmax=`. Writes `<prefix>.logits` (last token, f32) and `<prefix>.hidden` (final hidden, f32, token-major).
+
+Prefill then decode:
+
+```
+YAH_GEN=64 YAH_DECODE_HAL=<decode set> engine/run/gpu_run.sh gen -- engine/build/loom_forward_pp <gguf> <chunked set> <out-prefix> 8192 <ids-file>
+```
+
+- The prefill set must be paged (the default) and leave room: prompt + generated tokens <= T.
+- Prints `generated_ids=` and `decode_ms=` / `decode_tok_s=` (mean over the generated steps).
+
+Standalone decode (the prompt goes through the decode path one token at a time):
+
+```
+engine/run/gpu_run.sh dec -- engine/build/loom_decode <gguf> <decode set> --ids "760 6511 314 9338 369" --gen 64
+```
+
+`--logits FILE` appends every step's logits (f32) for an external KL check.
+
+## Correctness
+
+| tool | what it checks | when |
+|---|---|---|
+| hidden md5 of `<prefix>.hidden` | bit identity of the whole forward. References (default set, `ids2048` / `ids8192` prompts): pp2048 `ac36332b6b5092a4`, pp8192 `963b7396625e2333` | every exact rewrite |
+| `cmp` of every emitted HAL | byte identity of an emit | every refactor or cleanup of a generator |
+| `tools/gemv_check.py <gguf> <work> [kind ...]` | every decode GEMV (format, K) against a float64 gguf-py oracle through `hal_run` | GEMV changes |
+| `tools/dattn_check.py <gguf> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
+| `tools/dattn_q_check.py <gguf> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
+| `engine/run/gate/` (`gate_run.sh`, `accgate2.py`) | tiered accuracy gate on wikitext windows, all-position logits (`YAH_LOGITS_FROM`): T1 rounding level, T2 quantization level. See `engine/run/gate/README.md` | any numerics change |
+| `engine/run/kvq/` (`run_codec.sh`, `gate2.py`, `needle_score.py`, `tierA.py`) | KV codec quality at 32K: per-layer attention error, long-document KL / dPPL with bootstrap CIs, multi-key retrieval. `YAH_KV_HOOK` runs a codec as fake quantization. See `engine/run/kvq/README.md` | KV format work |
+| `engine/tests/m0_gate.sh <gguf> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
+| `engine/tests/generate_gate.sh <gguf> [set]` | 20 greedy tokens equal the reference | after any change, cheap |
+
+`hal_run` (`engine/build/hal_run`) dispatches one HAL once with bindings from GGUF tensors or files and writes outputs to files. It refuses any binding smaller than the size you declare. The checkers use it; use it for any new kernel oracle.
+
+Gate notes:
+
+- T1's `kl_mean` saturates at ~4e-7 for any attention change that is not bit-exact (a single rounding change gives the same). Judge such changes on `kl_p999`, flips and PPL.
+- The `ids2048` / `ids8192` timing prompts repeat one sentence (10 distinct tokens). They are fine for md5 and timing, useless for accuracy.
+- Run a standalone kernel check on inputs from several layers and documents, not only layer 0: an alpha underflow in DeltaNet showed up only at 8K / 32K deep in the model.
+
+## Profiling
+
+| question | tool |
+|---|---|
+| device time per dispatch in the real pipeline | `HRX_PROFILE_FILE=p.irpf HRX_PROFILE_MODE=dispatch <driver ...>`, then `/home/q/hrx/build/cmake/runtime/src/iree/tools/iree-profile/iree-profile dispatch --dispatch_events --format=jsonl p.irpf`. Costs ~1%. |
+| cycles per dispatch (clock-free) | `HRX_PROFILE_MODE=counters HRX_PROFILE_COUNTERS=SQ_BUSY_CYCLES`, then `iree-profile counter --format=jsonl --counter_samples`. Needs TheRock's `libhsa-amd-aqlprofile64` (`/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0/lib`) first on `LD_LIBRARY_PATH`. Inflates dispatch gaps ~4x. |
+| registers, spills, residency, schedule | `loom-compile k.loom --root=@k --target=amdgpu:gfx1151 --format=amdgpu-hsaco --output=k.hsaco --compile-report=details --compile-report-output=k.json`, then `PYTHONPATH=/home/q/hrx/loom/py python3 -m loom.tools.compile_report show\|suggest\|diff k.json`. Run `suggest --include-experimental` before hand-tuning. `allocation.materialized_spill_*` shows real spills even when `spill_count` is 0. |
+| instruction counts | `llvm-objdump -d --mcpu=gfx1151` on the hsaco (a `.hal` embeds the ELF from the first `\x7fELF`). Run it with `env -u LD_LIBRARY_PATH`. |
+| PMC, occupancy, per-wave ATT | rocprofv3 cannot see HRX dispatches. Run the kernel through `engine/build/loomhip <hsaco> <kernel> <gx> <gy> <block_x> <iters> <buf>...` under `rocprofv3 --pmc "A B C"` (one space-separated list) or `--att --att-library-path <TheRock lib>`. ~400 gfx1151 counters (`SQ_INST_CYCLES_VALU`, `SQ_WAIT_BARRIER`, `SPI_RA_*`) need `ROCPROFILER_METRICS_PATH` pointed at a copy of rocprof-compute's `sdk_config.yaml` renamed `config.yaml`. |
+| clocks, temperature, throttling | gpu_metrics v3 (`/sys/class/drm/card1/device/gpu_metrics`), the ryzen_smu PM table, `z13ctl status` for the APU temperature. See hardware.md. |
+
+- loomhip buffer lists must match the kernel's launch signature in order and count; loomhip refuses a count that disagrees with the kernel argument size, but cannot check order. Run it through `gpu_run.sh`.
+- ATT stretches the tile GEMM ~1.5x. Use it for shares and attribution, never for absolute idle time; check resource claims with PMC.
+- After an ablation, check that the ablated kernel's ISA still contains the work: the compiler deletes loads whose data is never used.
+- PC sampling and RGP for compute do not work on this box.
+
+## GPU safety
+
+A bad dispatch on this box does not fault. A read past an allocation reaches unmapped VA, the shader hangs with no page fault, the gfx ring times out, MES fails to reset, and the machine reboots.
+
+Rules:
+
+1. Launch exactly the grid the kernel was compiled for. Loom assumes `workgroup.id` < the launch-config grid and drops index clamps it proves redundant, so a larger grid reads out of bounds. The drivers take grids from `dispatch.txt` / `decode.txt` and refuse others; `gen_gemv.rows_per_wg()` is the single source for GEMV grids. Never compute a grid by hand in a harness.
+2. LDS data written by other threads needs a workgroup barrier before the first read, prologues included. (A page table in LDS read before its barrier hung the GPU.)
+3. Clamp or validate every index read from memory before it addresses a buffer. The host validates page tables; cache writers clamp page indices into the pool.
+4. Clamp a vector load by its own width: `min(addr, N - width)`. A clamp copied from a 4-wide load onto a 2-wide load shifts the last element.
+5. Never bind a buffer smaller than the kernel's declared footprint. The prefill emitter runs `tools/footprint_gate.py`; `hal_run` checks declared sizes; `tools/safe_bench.py` and `tools/loom_preflight.py` check the compile report's footprint against the bindings.
+6. Rebuild drivers with `engine/build_hrx.sh` after every source change, and do not edit `engine/run/*.cc` during a measuring round (`gpu_run.sh` will then refuse the remaining runs).
+7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
+
+After a hang and reboot, read the previous boot's kernel log:
+
+```
+doas journalctl -k -b -1 --no-pager | grep -iE 'amdgpu|ring .*timeout|reset|MES'
+```
+
+`/tmp` is wiped by the reboot; keep logs elsewhere.
+
+## Measuring
+
+- One round per candidate. No interleaving, no ABBA, no repeats, no clock pinning.
+- Before each timed run, cool the APU to <= 55 C (`z13ctl status`), then wait 1 s (single kernels), 15 s (pp2048) or 30 s (pp8192 and longer).
+- For pp8192 and longer, report `SQ_BUSY_CYCLES` next to ms. A run can take a mid-run clock step worth ~7% of wall time; the first pp8192 run after an idle period reads fast. Cycles per dispatch and per device tick show both.
+- Compare per-kernel rows, not only totals: run-to-run noise on a single kernel row is up to ~5% in cycles.
+- Use real weights and real activations for standalone kernels: constant fills run the same cycles at a higher clock.
+- Benchmark long-context decode attention at 32K: smaller standalone cases fit in the 32 MB MALL and read flattered bandwidth.
+- A kernel change must be bit-identical (hidden md5) or pass its oracle check before it is timed. A refactor must keep every emitted HAL byte-identical.
+- Before an A/B, `cmp` the two variants' HALs: a script that loses its env overrides measures the same kernel twice.
+- The tctl limit set with `ryzenadj` resets on reboot. Re-apply it before timing and compare only runs with the same setting.
+- When an optimization loses, find out why before dropping it, and record one line in results.md.
+
+## Further reading
+
+- HRX demos: [DEVELOPMENT.md](https://github.com/ROCm/hrx-demos/blob/main/DEVELOPMENT.md), [AGENTS.md](https://github.com/ROCm/hrx-demos/blob/main/AGENTS.md); Loom docs in `/home/q/hrx/loom/docs/`.
+- [gfx950 Gluon tutorials](https://github.com/ROCm/gfx950-gluon-tutorials), [HIP performance guidelines](https://rocmdocs.amd.com/projects/HIP/en/develop/how-to/performance_guidelines.html).

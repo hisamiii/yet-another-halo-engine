@@ -56,7 +56,7 @@ Docs are for a human reader who knows GPUs but not this repo. They hold what mat
 - No session diaries, no dated "today we..." sections, no step-by-step history. Git history is the history.
 - Update the doc in the same commit as the code it describes. Delete text that is no longer true.
 
-Docs live in `docs/`: `architecture.md`, `build-and-run.md`, `results.md` (results, baselines, lost experiments), `hardware.md` (measured facts about the box).
+Docs live in `docs/`: `architecture.md`, `build-and-run.md`, `results.md` (results, baselines, lost experiments), `hardware.md` (measured facts about the box), `roadmap.md` (next leads and plans).
 
 ### Local scratchpads
 

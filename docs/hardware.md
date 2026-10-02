@@ -1,0 +1,131 @@
+# Hardware
+
+Measured facts about the box that decide kernel design and how to measure. Everything here was measured on this machine; the date is when it was last measured. Rates in cycles come from `SQ_BUSY_CYCLES`, which does not depend on the clock.
+
+## The box
+
+| item | value |
+|---|---|
+| APU | AMD Ryzen AI MAX+ 395 (Strix Halo), Radeon 8060S |
+| GPU | gfx1151 (RDNA 3.5), 40 CUs = 20 WGPs = 80 SIMDs, wave32 and wave64 |
+| memory | 32 GB LPDDR5X-8000, 256-bit (256 GB/s theoretical), shared with the CPU |
+| GPU memory | GTT 24 GiB, VRAM carve-out 512 MiB, `iommu=pt`, THP always |
+| MALL (last-level cache) | 32 MB |
+| GPU clock levels | 600 / SMU-chosen / 2900 MHz (`pp_dpm_sclk`); the middle level is a live operating point, not a table entry |
+| LDS | 64 KB per workgroup |
+| VGPRs | 1536 per SIMD (allocation granule 24 on the gfx1151 target), at most 256 per wave |
+
+## Memory bandwidth (2026-10-02)
+
+Loom streaming kernels through HRX (`hal_run`), 1 GiB buffers, 16-byte accesses, grid-stride.
+
+| kernel | launch | GB/s |
+|---|---|---:|
+| read | 16384 x 256, 1 access per iteration | 240.5 |
+| read | 2048 x 256, unroll 4 | 230.1 |
+| copy (read + write counted) | 2048 x 256, unroll 4 | 193.9 |
+| write | 2048 x 256, unroll 4 | 170.5 |
+
+- Read saturates near 240 GB/s (94% of theoretical) once a few thousand workgroups are in flight.
+- Working sets under 32 MB stay in the MALL and read faster than DRAM. Long-context decode attention moves 128 MB per call at 32K; benchmark it there, not at 8K.
+- The non-matrix prefill kernels (norms, conv, postnorm, unpack, RoPE) already run at 180-230 GB/s. Only fewer bytes (fusion) helps them.
+
+## Matrix and vector rates (2026-10-01)
+
+Microbenchmark `wmmarate.hip` under PMC, 16 waves per SIMD, 8 independent accumulator chains.
+
+| instruction | cycles per instruction per SIMD |
+|---|---:|
+| `v_wmma_f32_16x16x16_f16` / `_bf16` | 34.0 |
+| `v_wmma_i32_16x16x16_iu8` | 34.0 |
+| `v_wmma_i32_16x16x16_iu4` | 17.0 |
+| WMMA, dependent chain, 1 wave per SIMD | 34.07 (no extra latency) |
+
+Issue costs next to WMMA (extra cycles of the WMMA pipe per added instruction):
+
+| added per WMMA | extra cycles each |
+|---|---:|
+| independent VALU (`v_fma_f32`, `v_perm_b32`, `v_bfe_u32`, `v_cvt_*`) | 1.03-1.18 |
+| VOPD pair (`v_dual_fmac`) | ~1.9 (no saving over two VALUs) |
+| dependent VALU chain (`v_perm_b32`) | 2.8 |
+| `v_mul_lo_u32`, dependent | 4.2 |
+| `ds_load_b128`, conflict-free, 1 per WMMA | 2.4-2.8 |
+| `ds_load_b128`, 4 per WMMA | 7.7 (LDS-bandwidth-bound, ~128 B/clk per WGP) |
+| `ds_load_b128` with 64 B lane stride (bank conflicts) | ~4x the conflict-free cost |
+| `ds_load_b32` / `_b64`, 4 per WMMA | 6.1 (LDS cost is per instruction, not per byte) |
+| `global_load_b128`, L1-resident | 2.5 (not cheaper than LDS) |
+
+Consequences:
+
+- A WMMA kernel's cycles are close to `34 x WMMA + VALU issue + ~3 x LDS instructions` per SIMD. All production prefill kernels run at 98-102% of this bound: barrier waits are absorbed by other waves, only instructions per WMMA move cycles.
+- In full GEMMs, a removed decode VALU saved only ~0.23 cycles, not ~1.1: most decode VALU already hides under other waves' WMMAs.
+- iu8 WMMA runs at the f16 rate, so int8 buys no arithmetic, only bytes. iu4 is 2x but needs 4-bit activations.
+- fp16 WMMA measured with a wall-clock harness: 48.35 TFLOPS (HIP, 2026-08; clock not recorded).
+
+## Wave32 vs wave64 (2026-10-01)
+
+| | wave32 | wave64 |
+|---|---:|---:|
+| WMMA per 16x16x16, cycles per SIMD | 34.0 | 34.0 |
+| VALU instruction, cycles | 1.03 | 1.76 |
+| LDS instruction, cycles | 1.49 | 2.53 |
+| pure FP32 FMA, lane-FMAs per cycle per SIMD | 56.6 (needs VOPD pairing) | 60.0 (no pairing needed) |
+
+- Wave64 WMMA keeps the full operand fragment per lane; only the accumulators halve. So per-WMMA overhead grows ~1.7x: wave64 tile GEMMs lose (IQ3_S +31%).
+- Wave64 wins for pure FP32 VALU kernels (the recurrent DeltaNet: -16.5%).
+
+## Register and LDS limits
+
+| fact | consequence |
+|---|---|
+| `v_cvt_f16_f32` (and other low-half writes) can only target v0..v127 | with 128 VGPRs of accumulators live, every conversion evicts an accumulator to scratch. Narrow with `fptrunc(fma(x, 1.0, y))`, which selects `v_fma_mix` (any VGPR). |
+| 64 KB LDS per workgroup | a 256 x 256 GEMM tile plus the IQ grid table does not fit; the tile GEMM is 128 x 256 |
+| no `global_load_lds` (vmem-to-LDS) on gfx1151 | staging always goes through registers; Loom rejects async global-to-LDS copies on gfx11 |
+| Loom's gfx11 encoding drops load cache hints other than device / regular | there is nothing to tune with cache hints |
+| SMEM loads return out of order | every use of a scalar load drains all outstanding scalar loads; stage wave-uniform data through LDS instead |
+
+## Dispatch and synchronization (2026-10-02)
+
+| measure | value |
+|---|---:|
+| dependent dispatch on an HRX stream (decode, gap per boundary) | ~3.5-4 us |
+| the same, replayed from an HRX graph | 3.32 us (stream 3.57 us) |
+| grid barrier inside a resident Loom kernel, 20-40 / 80 / 160 workgroups | 0.26 / 0.37 / 0.49 us |
+| prefill: GPU idle during pp2048 | 0.5% |
+| prefill: dispatch gaps, median | 9 us (hidden: the host enqueues ahead) |
+
+- Stock HRX records a full ordering barrier after every `hrx_stream_dispatch`, so independent dispatches never overlap (a local patch lifts this for decode; see build-and-run.md).
+- Launch overhead does not matter for prefill. For decode (~560 dependent dispatches per token) it is ~3 ms per token; only fewer dependent dispatches reduce it.
+
+## Clocks, heat and power (2026-10-01)
+
+The GPU clock is limited by the SMU's GFX thermal controller, not by power. The GFX hotspot (Tgfx) goes from 47 to 87 C within ~30 ms of load and the SMU holds it at the tctl limit by lowering the clock ceiling. PPT, STAPM and PROCHOT do not fire at the default limit.
+
+Steady state per instruction mix (5 s probe, default tctl):
+
+| load | clock MHz | Tgfx C | socket W |
+|---|---:|---:|---:|
+| WMMA only | 2622 | 94.8 | 113 |
+| VALU FMA only | 2067 | 94.8 | 101 |
+| LDS only | 2634 | 94.8 | 98 |
+| memory stream | 2841 | 67.1 | 62 |
+| IQ3_S prefill GEMM | 2276 | 94.8 | 111 |
+| pp2048 prefill (median) | ~2270 | 95-98 | ~115 |
+
+- The sustained clock is set by heat per cycle: FP32 VALU is the hottest work. Fewer instructions per WMMA raise the clock as well as cutting cycles.
+- tctl (`doas ryzenadj --tctl-temp=N`, resets on reboot): 105 lets Tgfx reach ~100 C (GEMM 2276 -> 2425 MHz) but trips PROCHOT every ~6 s under sustained load (600 MHz for ~1 s). 99 holds ~99 C without PROCHOT. The clean results in results.md were measured at tctl 95.
+- Start temperature matters: pre-run Tgfx 40 C gave 2478 MHz, 49.5 C gave 2322 MHz. Cool the APU to <= 55 C before every timed run.
+- Real weights draw more power than constant fills: the IQ4_XS GEMM ran 1.93 GHz on real bytes vs 2.56 GHz on fills, with the same cycle count.
+- Standalone kernels run ~15-20% faster in ms than inside the pipeline, at the same cycle count: the difference is clock.
+- Power: socket idle 13.8 W; WMMA 106 W, VALU 110 W, LDS 105 W, memory stream 69 W, IQ3_S GEMM 116 W. The PM table (ryzen_smu) gives socket = 1.06 x field[203] + 9.4 W; the compute rail carries ~98 of 117 W in the GEMM (limit 120). gpu_metrics' GFX power is a model estimate, not a measurement.
+
+## Host side (2026-10-01)
+
+| measure | value |
+|---|---:|
+| HRX device init | 180 ms |
+| import of the 12 GiB GGUF mmap into HRX (warm page cache) | 250-450 ms (3.2 M 4 KB PTEs) |
+| the same after warming the cache with `cat` | 830 ms (small page-cache folios) |
+| host CPU during prefill, sleep-polled final wait | 3-4% of a core (busy-poll: 104%) |
+
+HRX counters, rocprofv3, ATT and what does not work (PC sampling, RGP) are listed in build-and-run.md, Profiling.
