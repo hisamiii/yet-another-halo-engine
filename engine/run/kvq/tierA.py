@@ -28,58 +28,75 @@ QSUB = int(os.environ.get("KVQ_QSUB", "4"))     # use every QSUB-th dumped query
 BINS = [0, 2048, 8192, 16384, 32768, 65536]
 
 
-def apply(codec_name, layer, x):
+def apply(codec_name, layer, x, qp=None, qs=None):
+    """stream x through the codec chunk by chunk, with the chunk's dumped Q rows
+    (unscaled, as the engine sends them) for codecs that calibrate on Q"""
     c = Codec(codec_name)
-    return np.concatenate([c(layer, x[s:s + CHUNK]) for s in range(0, len(x), CHUNK)])
+    out = []
+    for s in range(0, len(x), CHUNK):
+        q = None
+        if qp is not None:
+            m = (qp >= s) & (qp < s + CHUNK)
+            q = (qp[m], qs[m] / 0.0625)
+        out.append(c(layer, x[s:s + CHUNK], q))
+    return np.concatenate(out)
 
 
-def attn(q, k, v, p):
-    """q [24, 256] f32 (already scaled), k/v [T, 4, 256]; keys 0..p"""
-    kk, vv = k[:p + 1], v[:p + 1]
-    out = np.empty((24, 256), np.float32); w = []
-    for h in range(24):
-        s = kk[:, h // 6] @ q[h]
-        s -= s.max(); e = np.exp(s); e /= e.sum()
-        out[h] = e @ vv[:, h // 6]; w.append(e)
-    return out, w
+def probs(q, k, pos):
+    """q [n, 6, 256] (one GQA group), k [T, 256], pos [n]: causal softmax [n*6, T]"""
+    s = q.reshape(-1, q.shape[-1]) @ k.T
+    p6 = np.repeat(pos, q.shape[1])
+    s[np.arange(k.shape[0])[None, :] > p6[:, None]] = -np.inf
+    s -= s.max(1, keepdims=True)
+    np.exp(s, out=s)
+    s /= s.sum(1, keepdims=True)
+    return s
+
+
+def rel(a, b):
+    return np.linalg.norm(a - b, axis=1) / np.linalg.norm(b, axis=1)
 
 
 def run(dump, specs, layers):
+    data = {}
+    for layer in layers:
+        k = np.load(f"{dump}/k_l{layer:02d}.npy").astype(np.float32)
+        v = np.load(f"{dump}/v_l{layer:02d}.npy").astype(np.float32)
+        qpa = np.load(f"{dump}/qpos_l{layer:02d}.npy")
+        qsa = np.load(f"{dump}/q_l{layer:02d}.npy").astype(np.float32) * 0.0625
+        data[layer] = (k, v, qpa[::QSUB], qsa[::QSUB], qpa, qsa)
     for spec in specs:
         kn, vn = spec.split(":")
-        rows = []
+        E, EK, EV, KL, POS, LAY = [], [], [], [], [], []
         for layer in layers:
-            k = np.load(f"{dump}/k_l{layer:02d}.npy").astype(np.float32)
-            v = np.load(f"{dump}/v_l{layer:02d}.npy").astype(np.float32)
-            qp = np.load(f"{dump}/qpos_l{layer:02d}.npy"); qs = np.load(f"{dump}/q_l{layer:02d}.npy").astype(np.float32) * 0.0625
-            qp, qs = qp[::QSUB], qs[::QSUB]
-            kq = apply(kn, layer, k) if kn != "fp16" else k
-            vq = apply(vn, layer, v) if vn != "fp16" else v
-            for i, p in enumerate(qp):
-                o_r, w_r = attn(qs[i], k, v, p)
-                o_c, w_c = attn(qs[i], kq, vq, p)
-                o_k, _ = attn(qs[i], kq, v, p)          # K only
-                o_v, _ = attn(qs[i], k, vq, p)          # V only
-                nr = np.linalg.norm(o_r, axis=1)
-                kl = np.mean([np.sum(a * (np.log(a + 1e-30) - np.log(b + 1e-30))) for a, b in zip(w_r, w_c)])
-                rows.append((layer, p, np.linalg.norm(o_c - o_r, axis=1) / nr, np.linalg.norm(o_k - o_r, axis=1) / nr,
-                             np.linalg.norm(o_v - o_r, axis=1) / nr, kl))
-        e = np.concatenate([r[2] for r in rows]); ek = np.concatenate([r[3] for r in rows]); ev = np.concatenate([r[4] for r in rows])
-        kl = np.array([r[5] for r in rows])
+            k, v, qp, qs, qpa, qsa = data[layer]      # scored subsample / all dumped Q (codec calibration)
+            kq = apply(kn, layer, k, qpa, qsa) if kn != "fp16" else k
+            vq = apply(vn, layer, v, qpa, qsa) if vn != "fp16" else v
+            for h in range(4):
+                qg = qs[:, 6 * h:6 * h + 6]
+                pr = probs(qg, k[:, h], qp)
+                pc = probs(qg, kq[:, h], qp) if kn != "fp16" else pr
+                o_r = pr @ v[:, h]
+                o_k = pc @ v[:, h]
+                o_v = pr @ vq[:, h]
+                o_c = pc @ vq[:, h]
+                E.append(rel(o_c, o_r)); EK.append(rel(o_k, o_r)); EV.append(rel(o_v, o_r))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    t = np.where(pr > 0, pr * (np.log(pr) - np.log(np.maximum(pc, 1e-38))), 0)
+                KL.append(t.sum(1))
+                POS.append(np.repeat(qp, 6)); LAY.append(np.full(len(qp) * 6, layer))
+        e, ek, ev, kl = (np.concatenate(x) for x in (E, EK, EV, KL))
+        pos, lay = np.concatenate(POS), np.concatenate(LAY)
         print(f"== {spec:22s} out_err median {np.median(e):.2e} p90 {np.percentile(e, 90):.2e} p99 {np.percentile(e, 99):.2e}"
-              f" | K-only median {np.median(ek):.2e} | V-only median {np.median(ev):.2e} | KL mean {kl.mean():.2e}")
-        pos = np.array([r[1] for r in rows])
+              f" | K-only median {np.median(ek):.2e} | V-only median {np.median(ev):.2e} | softmax KL mean {kl.mean():.2e}")
         line = []
         for lo, hi in zip(BINS[:-1], BINS[1:]):
             m = (pos >= lo) & (pos < hi)
             if m.any():
-                line.append(f"[{lo // 1024}K,{hi // 1024}K) {np.mean(np.concatenate([r[2] for r, mm in zip(rows, m) if mm])):.2e}")
-        lay = []
-        for layer in layers:
-            m = [r for r in rows if r[0] == layer]
-            lay.append(f"L{layer}:{np.median(np.concatenate([r[2] for r in m])):.1e}")
-        print("   by position: " + "  ".join(line))
-        print("   by layer (median): " + " ".join(lay))
+                line.append(f"[{lo // 1024}K,{hi // 1024}K) {np.median(e[m]):.2e}")
+        print("   median by position: " + "  ".join(line))
+        print("   K-only by layer: " + " ".join(f"L{l}:{np.median(ek[lay == l]):.1e}" for l in layers))
+        print("   V-only by layer: " + " ".join(f"L{l}:{np.median(ev[lay == l]):.1e}" for l in layers), flush=True)
 
 
 def main():

@@ -133,3 +133,41 @@ Offline layer 3 (8K), K-only attention error:
   refit doesn't.
 - Open: does a static (cross-document) WUSH calibration hold? (wush_calib.py +
   KVQ_WUSH_FILE). How much of the remaining error is kv4v V (tierA.py K/V split)?
+
+## Round 2 (2026-10-02)
+
+Numpy note: the system numpy uses reference CBLAS (6 GFLOP/s). Run the
+analysis tools with /home/q/yah-scratch/venv/bin/python (pip numpy, OpenBLAS,
+686 GFLOP/s). Tier A on 16 layers x 8 codecs then takes 7 min.
+
+Tier B, 32K, pg1023 + pg145:
+
+| K / V | KL mean | KL p99.9 [95% CI] | flips/1k | dPPL |
+|---|---|---|---|---|
+| wushs / kv4v (per-prompt calib) | 1.63e-3 | 3.9e-2 [3.1, 5.8]e-2 | 3.8 | +0.05% (n.s.) |
+| wushs-static / kv4v (calibrated on pg1399) | 1.76e-3 | 4.3e-2 [3.6, 5.9]e-2 | 4.2 | +0.16% [+0.01, +0.32] |
+| kv4 basic | 3.7e-3 | 8.0e-2 [6.0, 9.2]e-2 | 8.8 | +0.42% |
+
+So a static calibration holds across books.
+
+Tier A, pg1399 32K, all 16 attention layers. Median attention-output error:
+
+| K / V | total | K only | V only |
+|---|---|---|---|
+| int8 | 3.7e-3 | 3.4e-3 | 1.1e-3 |
+| kv4 | 6.8e-2 | 6.3e-2 | 1.9e-2 |
+| h128 | 5.3e-2 | 4.6e-2 | |
+| h256g32 | 4.0e-2 | 3.1e-2 | |
+| wush (asym) | 4.4e-2 | 3.6e-2 | |
+| wushs | 4.9e-2 | 4.2e-2 | |
+| uq / uqv | 1.1e-1 | 6.8e-2 | 7.5e-2 |
+| bad3 | 1.75e-1 | 1.7e-1 | |
+
+- UltraQuant's per-token MXFP4 V is 4x worse than our per-channel tile V; that
+  is where it loses.
+- Layer sensitivity: the middle attention layers (L6-L13) are 3-10x more
+  sensitive than L0, L14, L15.
+
+Tier C v2 (256 keys, 8 reassigned, 3 x 32K, 72 queries): still saturated for
+every 4-bit codec (d log p within +-0.03, CIs span 0). bad3 loses at early
+depth (-0.66 nats for depths < 0.33, worst -9.3), exact match 86% vs 93%.

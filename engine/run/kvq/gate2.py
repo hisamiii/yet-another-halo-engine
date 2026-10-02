@@ -69,7 +69,7 @@ def main():
     rng = np.random.default_rng(0)
     docs = [per_pos(load(a), load(b)) for a, b in zip(refs, cands)]
     print(f"== {name}  ({len(docs)} docs, {sum(len(d['pos']) for d in docs)} positions)")
-    print(f"{'bin':>13s} {'n':>6s} {'dNLL mean [95% CI] (nats)':>36s} {'KL mean':>10s} {'KL p99':>9s} {'flips/1k':>9s}")
+    print(f"{'bin':>13s} {'n':>6s} {'dNLL mean [95% CI] (nats)':>36s} {'KL mean':>10s} {'KL p99':>9s} {'KL p99.9':>9s} {'flips/1k':>9s}")
     allb = []
     for lo, hi in zip(BINS[:-1], BINS[1:]):
         sel = [(d, (d["pos"] >= lo) & (d["pos"] < hi) & d["ok"]) for d in docs]
@@ -79,14 +79,24 @@ def main():
         m, a, b = boot_ci([d["dnll"][s] for d, s in sel], rng)
         kl = np.concatenate([d["kl"][s] for d, s in sel])
         fl = np.concatenate([d["flip"][s] for d, s in sel])
-        print(f"{lo // 1024:5d}K-{hi // 1024:3d}K {n:6d} {m:+11.5f} [{a:+.5f}, {b:+.5f}] {kl.mean():10.2e} {np.percentile(kl, 99):9.2e} {1000 * fl.mean():9.2f}")
+        print(f"{lo // 1024:5d}K-{hi // 1024:3d}K {n:6d} {m:+11.5f} [{a:+.5f}, {b:+.5f}] {kl.mean():10.2e} {np.percentile(kl, 99):9.2e} {np.percentile(kl, 99.9):9.2e} {1000 * fl.mean():9.2f}")
         allb.append((lo, m, a, b))
     sel = [(d, d["ok"]) for d in docs]
     m, a, b = boot_ci([d["dnll"][s] for d, s in sel], rng)
     kl = np.concatenate([d["kl"][s] for d, s in sel]); fl = np.concatenate([d["flip"][s] for d, s in sel])
     ppl_r = np.exp(np.concatenate([d["nll_r"][s] for d, s in sel]).mean())
-    print(f"{'all':>13s} {sum(int(s.sum()) for _, s in sel):6d} {m:+11.5f} [{a:+.5f}, {b:+.5f}] {kl.mean():10.2e} {np.percentile(kl, 99):9.2e} {1000 * fl.mean():9.2f}"
+    print(f"{'all':>13s} {sum(int(s.sum()) for _, s in sel):6d} {m:+11.5f} [{a:+.5f}, {b:+.5f}] {kl.mean():10.2e} {np.percentile(kl, 99):9.2e} {np.percentile(kl, 99.9):9.2e} {1000 * fl.mean():9.2f}"
           f"   (ref PPL {ppl_r:.3f}, cand {ppl_r * np.exp(m):.3f}, {100 * (np.exp(m) - 1):+.2f}%)")
+    # tail KL with a block-bootstrap CI (bins hold too few positions for a p99.9 of their own)
+    kls = [d["kl"][s] for d, s in sel]
+    blocks = [g[i:i + BLOCK] for g in kls for i in range(0, len(g), BLOCK)]
+    bs = {q: [] for q in (99, 99.9)}
+    for _ in range(1000):
+        x = np.concatenate([blocks[i] for i in rng.integers(0, len(blocks), len(blocks))])
+        for q in bs:
+            bs[q].append(np.percentile(x, q))
+    print("   KL tail: " + "   ".join(f"p{q}: {np.percentile(kl, q):.2e} [{np.percentile(bs[q], 2.5):.2e}, {np.percentile(bs[q], 97.5):.2e}]" for q in bs)
+          + f"   max {kl.max():.2e} (n={len(kl)}, ~{len(kl) / 1000:.0f} positions above p99.9)")
 
 
 if __name__ == "__main__":
