@@ -1,0 +1,15 @@
+Qualify the f16 WMMA (v_wmma_f32_16x16x16_f16, wave32, gfx1151) for matrix-operand register placement (#1160), which
+upstream enables for bf16 only: spreads each WMMA's operands over the register banks. Prefill GEMM cycles -2.6%, bit-identical.
+
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py b/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
+index 4b407e67b..e17ed34bd 100644
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
+@@ -23,6 +23,7 @@ from .common import *
+ MATRIX_OPERAND_PLACEMENT_QUALIFICATIONS = (
+     ("gfx1100", 32, "amdgpu.v_wmma_f32_16x16x16_bf16"),
+     ("gfx1151", 32, "amdgpu.v_wmma_f32_16x16x16_bf16"),
++    ("gfx1151", 32, "amdgpu.v_wmma_f32_16x16x16_f16"),
+ )
+ 
+ _WMMA_GFX11_WAVE64_ACCUMULATOR_SIZE_REASON = "gfx11-wave64-wmma-half-width-accumulator"

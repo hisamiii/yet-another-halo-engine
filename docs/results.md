@@ -4,17 +4,19 @@ Qwen3.8-27B IQ4_XS on Strix Halo (gfx1151), Loom kernels through HRX. One round 
 
 ## Current results
 
-Prefill, default set (p71: FA attention, chunked DeltaNet, paged KV), `layers_ms`:
+Prefill, default set (FA attention, chunked DeltaNet, paged KV; HRX pin a02a5ab94 with engine/hrx/patches), `layers_ms`:
 
 | prompt | set | Loom | HIP (hip-final) | measured |
 |---|---|---:|---:|---|
-| 2048 | one pass, B = 2048 | 3132.2 ms (654 tok/s) | 3381.7 ms | 2026-10-02 |
-| 8192 | one pass, B = 8192 | 13154.0 ms (623 tok/s) | 14254.3 ms | 2026-10-02 |
+| 2048 | one pass, B = 2048 | 3000.5 ms (683 tok/s) | 3381.7 ms | 2026-10-02, f16 operand placement |
+| 8192 | one pass, B = 8192 | 12877-13556 ms (604-636 tok/s) | 14254.3 ms | 2026-10-02, f16 operand placement; see below |
 | 8192 | chunked (2048), 32K pools, fp16 KV | 13085.3 ms | 14431.7 ms | 2026-10-02, run before decode |
 | 30720 | chunked (2048), 32K pools, fp16 KV | 59004.2 ms (521 tok/s) | 62596.1 ms | 2026-10-02, run before decode |
 | 8192 / 30720 | same, kv8a16 | 13270.9 / 60182.6 ms | - | 2026-10-02 |
 | 8192 / 30720 | same, kv4a16 | 14111.8 / 60315.3 ms | - | 2026-10-02 |
 | 65536 | chunked (2048), fp16 / kv8a16 / kv4a16 | 232.8 / 242.1 / 234.7 s | - | 2026-10-02 |
+
+pp8192 rounds from the same <= 55 C start vary by up to ~5% in wall time with the GPU clock (2.0-2.1 GHz) while their counter cycles match to 0.03%, so compare pp8192 on cycles.
 
 The quantized-KV prefill rows are within run-to-run noise of fp16: their attention kernels cost +12-15% (int-to-f16 decode at staging), and attention is ~3.5% of pp8192.
 
@@ -101,6 +103,7 @@ One line each: what, the measured effect, when the set was current. Prefill numb
 
 Prefill:
 
+- HRX pin moved to a02a5ab94 plus the f16 WMMA operand placement (patch 0005; upstream enables #1160 for bf16 only): GEMM cycles -3.2%, prefill cycles -2.8%, pp2048 3047 -> 3000.5 ms; bit-identical. Decode 61.1 -> 60.8 ms (noise).
 - Prefill as one HRX graph per chunk, independent kernels overlapping (stock HRX): pp2048 ~3090 -> 3032 ms, a 500-token prompt 970 -> 926 ms; bit-identical.
 - Tile GEMM (128 x 256 per workgroup, 16 wave32 waves, both operands in padded LDS) replacing the shared-decode GEMM: pp2048 device time 5263 -> 4574 ms.
 - LDS row padding (+8 f16 per weight row): IQ3_S kstore 19.9 -> 11.1 ms standalone (bank conflicts gone).
