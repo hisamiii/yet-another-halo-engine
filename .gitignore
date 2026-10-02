@@ -3,3 +3,8 @@
 .rocprofv3-*/
 *.rocprof
 __pycache__/
+# Local scratchpads (lab notebooks, TODOs, logs): never pushed. See AGENTS.md.
+notes/
+# Build output and emitted HAL sets.
+engine/build/
+engine/hal/
