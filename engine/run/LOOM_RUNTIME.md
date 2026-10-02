@@ -2085,6 +2085,19 @@ What mattered, in order (each measured on the full decode):
   ragged last round), 61.67 vs 60.48 ms overall; one-group-per-workgroup
   kernels unchanged. With that loss and the megakernel's register count being
   the maximum over all its phases, the expected net is ~0; not pursued.
+- **What limits the low-bit GEMVs (~190-215 GB/s), falsified so far:** x traffic
+  (`YAH_GV_ABL=nox`, no x loads at all: -0.45 ms), VALU (sign-mask table,
+  neutral), occupancy / geometry (R x W sweeps), row length via 16 lanes per
+  row (`YAH_GV_LPR=16`: 63.49 vs 60.19 ms, worse). What holds: bandwidth falls
+  with bytes per weight and with shorter rows (K = 6144 < K = 17408 per
+  format).
+- **Launch grids are part of the kernel contract.** Loom takes workgroup.id <
+  the launch-config grid and may drop explicit clamps it proves redundant; a
+  larger launched grid reads out of bounds. A harness bug did this (an LPR=16
+  kernel launched with the 8-rows-per-workgroup grid) and hung the GPU on the
+  tensor that ends the GGUF mapping. `decode.txt` now records every GEMV
+  kernel's grid and `LoomDecoder` refuses any other; `gen_gemv.rows_per_wg()`
+  is the single source.
 - Profiling: `HRX_PROFILE_MODE=dispatch` (timestamps only) costs ~1%;
   counters mode inflates dispatch gaps ~4x. A kernel right after a no-barrier
   group shows the group's tail in its own duration.
