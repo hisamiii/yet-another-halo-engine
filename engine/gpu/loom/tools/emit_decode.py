@@ -112,7 +112,8 @@ def gemv_set(model):
         for n in ("attn_output", "ssm_out", "ffn_down"):
             if p + n + ".weight" in t:
                 add("resid", [p + n + ".weight"])
-                add("resid_norm", [p + n + ".weight"])
+                if GV.LPR == 32:
+                    add("resid_norm", [p + n + ".weight"])
         add("swiglu", [p + "ffn_gate.weight", p + "ffn_up.weight"])
     add("plain", ["output.weight"])
     return out
@@ -125,14 +126,19 @@ def main():
         raise SystemExit("max_context must be a multiple of 256")
     os.makedirs(outdir, exist_ok=True)
     gs = gemv_set(model)
+    grids = {}   # exact launch grid of every GEMV kernel: the decoder refuses any other
     for name, (kind, fmts, M, K) in sorted(gs.items()):
         R, W = RW[kind]
         if M % (R * W):   # small outputs (48 rows) keep the default geometry
             R, W = 2, 4
         emit_src(GV.gen(kind, fmts, M, K, R, W), name, outdir)
+        grids[name] = M // GV.rows_per_wg(R, W)
+        if GV.PERSIST and kind != "resid_norm":
+            grids[name] = min(grids[name], GV.PERSIST)
     bs = bands_set(model)
     for name, (fmts, Ms, K) in sorted(bs.items()):
         emit_src(GV.gen_bands(fmts, Ms, K, *RW["bands"]), name, outdir)
+        grids[name] = sum(Ms) // GV.rows_per_wg(*RW["bands"])
     for which in ("kvappend", "part", "reduce"):
         emit_src(DA.gen(which, T), "dattn_" + which, outdir)
     L = lambda f: os.path.join(LOOM, f)
@@ -155,8 +161,9 @@ def main():
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
-        ("persist gv %d 0\n" % GV.PERSIST if GV.PERSIST else ""))
+        "ctx %d\n" % T + "".join("rw %s %d %d\n" % (k, r * (2 if GV.LPR == 16 else 1), w) for k, (r, w) in sorted(RW.items())) +
+        ("persist gv %d 0\n" % GV.PERSIST if GV.PERSIST else "") +
+        "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + 10 decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))
 

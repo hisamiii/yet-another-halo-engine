@@ -68,6 +68,7 @@ class LoomDecoder {
       while (in >> k >> kind >> r >> w) {
         if (k == "rw") rw_[kind] = {r, w};
         if (k == "persist") persist_ = r;   // gv kernels (not resid_norm) launch min(r, row groups)
+        if (k == "grid") grid_[kind] = r;   // the exact grid each GEMV kernel was compiled for
       }
     }
     const std::uint32_t npg = T_ / 256;
@@ -317,6 +318,7 @@ class LoomDecoder {
     auto [R, W] = Rw(kind, M);
     std::uint32_t gx = M / (R * W);
     if (persist_ && std::string(kind) != "resid_norm") gx = std::min(gx, persist_);
+    CheckGrid(name, gx);
     Dispatch(exe, gx, 1, 32 * W, b);
   }
   // A layer's input projections of normed_: one band-fused GEMV (gen_gemv gen_bands), or
@@ -353,7 +355,9 @@ class LoomDecoder {
       b.push_back({ys[i]->handle, 0, static_cast<std::size_t>(t->dims[1]) * 4});
     }
     auto [R, W] = Rw("bands", 0);
-    Dispatch(Load("gb" + fn + mn + "_" + std::to_string(K)), rows / (R * W), 1, 32 * W, b);
+    const std::string bn = "gb" + fn + mn + "_" + std::to_string(K);
+    CheckGrid(bn, rows / (R * W));
+    Dispatch(Load(bn), rows / (R * W), 1, 32 * W, b);
   }
   // hidden += W x; with resnorm_ the same dispatch also writes normed_ = rmsnorm(hidden) * nw
   void Resid(const std::string& w, const LoomBuffer& x, const std::string& nw) {
@@ -369,6 +373,14 @@ class LoomDecoder {
     std::pair<std::uint32_t, std::uint32_t> rw = it == rw_.end() ? std::make_pair(kR, kW) : it->second;
     if (M && M % (rw.first * rw.second)) rw = {kR, kW};
     return rw;
+  }
+  // A grid larger than the compiled one reads out of bounds (Loom drops clamps it proves
+  // redundant from the launch config); the set records every GEMV kernel's grid.
+  void CheckGrid(const std::string& name, std::uint32_t gx) const {
+    auto it = grid_.find(name);
+    if (it == grid_.end()) throw LoomError("decode set has no grid record for " + name + " (re-emit)");
+    if (it->second != gx)
+      throw LoomError("grid mismatch for " + name + ": " + std::to_string(gx) + " vs compiled " + std::to_string(it->second));
   }
   void Rmsnorm(const LoomBuffer& x, const std::string& w, const LoomBuffer& out) {
     Dispatch(Load("rmsnorm"), 1, 1, 512, {Ref(x), TRef(w), Ref(out)});
@@ -402,6 +414,7 @@ class LoomDecoder {
   std::map<std::string, LoomExecutable> exes_;
   std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> rw_;
   std::uint32_t persist_ = 0;
+  std::map<std::string, std::uint32_t> grid_;
   std::vector<hrx_buffer_ref_t> tabs_;
   LoomDecoderState st_;
   LoomBuffer *hidden_, *normed_, *qg_, *q_, *gate_, *kb_, *vb_, *aout_, *qkv_, *alpha_, *beta_, *convout_, *ssmout_,

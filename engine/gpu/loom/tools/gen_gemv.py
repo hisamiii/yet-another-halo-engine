@@ -52,6 +52,7 @@ IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 
 # YAH_GV_GRID_LDS=1: each workgroup copies its IQ tables to LDS before the loop.
 GRID_LDS = os.environ.get("YAH_GV_GRID_LDS", "0") == "1"
 # YAH_GV_ABL=nogrid: ablation (wrong results) -- grid/ksigns loads replaced by their index.
+# YAH_GV_ABL=nox: ablation (wrong results) -- x loads replaced by a constant.
 ABL = os.environ.get("YAH_GV_ABL", "")
 # YAH_GV_PIPE=d / YAH_GV_UNROLL=u: Loom read-ahead / unroll on the sub-block loop.
 # Full decode, one round each (2026-10-02, word decode): no pipeline 68.2 ms/token,
@@ -81,6 +82,10 @@ G2 = os.environ.get("YAH_GV_G2", "0") == "1"
 # kernels with one row group per workgroup are unchanged, SwiGLU (3.4 groups each at
 # G = 640) +3.7%: static round-robin leaves a ragged last round. Off by default.
 PERSIST = int(os.environ.get("YAH_GV_PERSIST", "0"))
+# YAH_GV_LPR=16: 16 lanes per row instead of 32 -- each half-wave walks its own rows block by
+# block (twice the iterations per lane, one block per 16 lanes per step), 4-step reduction.
+# A wave then covers 2 R rows (the caller's grid: M / (2 R W)).
+LPR = int(os.environ.get("YAH_GV_LPR", "32"))
 def _s32(v):
     return v - (1 << 32) if v >= (1 << 31) else v
 UNROLL = int(os.environ.get("YAH_GV_UNROLL", "0"))
@@ -92,6 +97,14 @@ WORD = os.environ.get("YAH_GV_WORD", "1") == "1"
 # 1040 vs 1051 on swiglu iq3s/iq3xxs: the compiler already contracts mul + reduce)
 GGML = {8: "q8_0", 10: "q2k", 11: "q3k", 12: "q4k", 13: "q5k", 14: "q6k", 16: "iq2xxs", 17: "iq2xs",
         18: "iq3xxs", 21: "iq3s", 23: "iq4xs"}
+
+
+def rows_per_wg(R=2, W=4):
+    """output rows per workgroup of a gen() / gen_bands() kernel: launch M / rows_per_wg
+    workgroups exactly. Loom takes workgroup.id < grid from the launch config, so its
+    range analysis may drop the row clamps: a larger grid reads out of bounds (a GPU
+    hang when the tensor ends the GGUF mapping, 2026-10-02)."""
+    return R * W * (2 if LPR == 16 else 1)
 
 
 def tables_for(fmts):
@@ -154,7 +167,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             b(f"  %{p}hlf = index.rem %lane, {e.ci(2)} : index")
             b(f"  %{p}qo0 = index.mul %{p}hlf, {e.ci(16)} : index")
             b(f"  %{p}qo = index.add %{p}qo0, {e.ci(2)} : index")
-            S["tstep"] = 16 * bb
+            S["tstep"] = (16 if LPR == 32 else 8) * bb
             return S
         # 256-element blocks: block = lane / 16 + 2 t, sb32 = (lane / 2) % 8, hlf = lane % 2
         b(f"  %{p}lb = index.div %lane, {e.ci(16)} : index")
@@ -165,7 +178,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         b(f"  %{p}s32i = index.cast %{p}s32 : index to i32")
         b(f"  %{p}hlfi = index.cast %{p}hlf : index to i32")
         b(f"  %{p}l16 = index.mul %{p}hlf, {e.ci(16)} : index")       # lane0 = hlf * 16
-        S["tstep"] = 2 * bb
+        S["tstep"] = (2 if LPR == 32 else 1) * bb
 
         def sh8(name, expr_i32):
             """splat an i32 shift amount (0..7) to vector<16xi8>"""
@@ -1225,9 +1238,22 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     wnb = [row_bytes(f, K) * M for f in fmts]
     b("  %tid = kernel.workitem.id<x> : index")
     b("  %wg = kernel.workgroup.id<x> : index")
-    b(f"  %lane = index.rem %tid, {e.ci(32)} : index")
-    b(f"  %wave = index.div %tid, {e.ci(32)} : index")
-    b(f"  %wgw = index.mul %wg, {e.ci(W)} : index")
+    if LPR == 16:
+        assert not G2
+        rows_wg = 2 * R * W
+        assert M % rows_wg == 0, (M, rows_wg)
+        NT = K // 256
+        b(f"  %lanef = index.rem %tid, {e.ci(32)} : index")
+        b(f"  %lane = index.rem %lanef, {e.ci(16)} : index")
+        b(f"  %hsel = index.div %lanef, {e.ci(16)} : index")
+        b(f"  %wave0 = index.div %tid, {e.ci(32)} : index")
+        b(f"  %wave1 = index.mul %wave0, {e.ci(2)} : index")
+        b("  %wave = index.add %wave1, %hsel : index")              # virtual wave = half-wave
+        b(f"  %wgw = index.mul %wg, {e.ci(2 * W)} : index")
+    else:
+        b(f"  %lane = index.rem %tid, {e.ci(32)} : index")
+        b(f"  %wave = index.div %tid, {e.ci(32)} : index")
+        b(f"  %wgw = index.mul %wg, {e.ci(W)} : index")
     b("  %wid = index.add %wgw, %wave : index")
     b(f"  %row0 = index.mul %wid, {e.ci(R)} : index")
     if G2:
@@ -1249,9 +1275,13 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     res = [f"%res{j}" for j in range(len(accs))]
     sched = (f" pipeline({e.ci(PIPE)})" if PIPE > 1 else "") + (f" unroll({e.ci(UNROLL)})" if UNROLL > 1 else "")
     b(f"  {', '.join(res)} = scf.for %t = [{e.ci(0)} to {e.ci(NT)} step {e.ci(1)}]({inits}) -> ({', '.join(['f32'] * len(accs))}){sched} {{")
-    b(f"    %xo0 = index.mul %t, {e.ci(1024 if G2 else 512)} : index")
+    b(f"    %xo0 = index.mul %t, {e.ci(1024 if G2 else (512 if LPR == 32 else 256))} : index")
     b("    %xo = index.add %xo0, %xl16 : index")
-    xv = ld("%xv", K, "%xo", "", "xa", 16, "f32")      # (not "xv": that would shadow the view)
+    if ABL == "nox":      # ablation (wrong results): no x traffic
+        b(f"    %xa = vector.splat {e.cs(0.5, 'f32')} : vector<16xf32>")
+        xv = "%xa"
+    else:
+        xv = ld("%xv", K, "%xo", "", "xa", 16, "f32")      # (not "xv": that would shadow the view)
     if anyoff:
         b(f"    %xsum = vector.reduce<addf> {xv}, %zf : vector<16xf32>, f32")
     nxt = []
@@ -1302,7 +1332,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     tot = []
     for j in range(len(accs)):
         cur = f"%res{j}"
-        for m in (16, 8, 4, 2, 1):
+        for m in ((16, 8, 4, 2, 1) if LPR == 32 else (8, 4, 2, 1)):
             tg = f"%rd{j}_{m}"
             b(f"  {tg}i = scalar.bitcast {cur} : f32 to i32")
             b(f"  {tg}x, {tg}v = kernel.subgroup.shuffle<xor> {tg}i, {e.cs(m)}, {e.cs(32)} : i32, i32, i32")
@@ -1336,6 +1366,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         _parts.update(body=body, wnb=wnb, tabs=tabs)
         return None
     if kind == "resid_norm":
+        assert LPR == 32, "resid_norm assumes 32-lane rows (wave partials)"
         # The last workgroup to finish (device-scope counter, acq_rel) computes the next
         # RMSNorm of the updated vector: nout = (y * rsqrt(mean(y^2) + eps)) * nw, and
         # resets the counter. Every thread does its own device-scope acquire before reading
@@ -1400,7 +1431,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     o("")
     o(f"kernel.def target(@gv32) @{name}() {{")
     o("  %u1 = index.constant 1 : index")
-    o(f"  %nwg = index.constant {min(PERSIST, M // rows_wg) if PERSIST else M // rows_wg} : index")
+    o(f"  %nwg = index.constant {min(PERSIST, M // rows_wg) if PERSIST else M // rows_wg} : index")   # rows_wg: 2 R W when LPR == 16
     o(f"  %wgs = index.constant {32 * W} : index")
     o("  kernel.launch.config workgroups(%nwg, %u1, %u1) workgroup_size(%wgs, %u1, %u1) : index")
     params = [f"%w{i}: buffer" for i in range(nw)] + [f"%{t}: buffer" for t in tabs] + ["%x: buffer", "%y: buffer"]
@@ -1504,7 +1535,7 @@ def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv"):
     """Several plain GEMVs over one input in one dispatch: band b is fmts[b] with Ms[b]
     rows, written to its own output; workgroup ranges map to bands. Bindings: the
     weights, the IQ tables of all bands (TABLE_ORDER), x, then the outputs."""
-    rows_wg = R * W
+    rows_wg = R * W * (2 if LPR == 16 else 1)
     e = E()
     bodies, wnbs, starts = [], [], []
     start = 0

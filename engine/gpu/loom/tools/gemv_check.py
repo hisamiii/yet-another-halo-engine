@@ -53,7 +53,7 @@ def run_kernel(model, work, tag, kind, fmts, M, K, tensors, x, y0=None, R=2, W=4
     else:
         binds.append(f"o:{M * 4}:{yo}")
     mins = ",".join(str(v) for v in G.footprint(kind, fmts, M, K))
-    cmd = [GPURUN, "gemv-check", "--", HALRUN, model, hal, str(M // (R * W)), str(32 * W), mins] + binds
+    cmd = [GPURUN, "gemv-check", "--", HALRUN, model, hal, str(M // G.rows_per_wg(R, W)), str(32 * W), mins] + binds
     env = dict(os.environ)
     if BENCH:
         env["HAL_RUN_ITERS"] = str(BENCH)
@@ -99,7 +99,7 @@ def check_bands(model, work, rd, dequantize, rng, layers):
         env = dict(os.environ)
         if BENCH:
             env["HAL_RUN_ITERS"] = str(BENCH); time.sleep(1)
-        r = subprocess.run([GPURUN, "gemv-check", "--", HALRUN, model, hal, str(sum(Ms) // 8), "128", mins] + binds,
+        r = subprocess.run([GPURUN, "gemv-check", "--", HALRUN, model, hal, str(sum(Ms) // G.rows_per_wg()), "128", mins] + binds,
                            capture_output=True, text=True, timeout=120, env=env)
         if "hal_run: ok" not in r.stdout:
             raise SystemExit(f"{tag}: hal_run failed\n{r.stdout[-1500:]}{r.stderr[-1500:]}")
@@ -152,7 +152,7 @@ def check_resid_norm(model, work, rd, dequantize, rng, pick):
             binds = [f"t:{t.name}"] + [f"f:{os.path.join(TABLE_DIR, TABLE_FILE[q])}" for q in G.tables_for([fmt])]
             binds += [f"f:{fs['x']}", f"io:{fs['y0']}:{fs['y0']}.out", f"f:{fs['nw']}", f"o:{M * 4}:{fs['nw']}.out", f"io:{fs['cnt']}:{fs['cnt']}.out"]
             mins = ",".join(str(v) for v in G.footprint("resid_norm", [fmt], M, K))
-            r = subprocess.run([GPURUN, "gemv-check", "--", HALRUN, model, hal, str(M // 8), "128", mins] + binds,
+            r = subprocess.run([GPURUN, "gemv-check", "--", HALRUN, model, hal, str(M // G.rows_per_wg()), "128", mins] + binds,
                                capture_output=True, text=True, timeout=120, env=env)
             if "hal_run: ok" not in r.stdout:
                 raise SystemExit(f"{tag}: hal_run failed\n{r.stdout[-1500:]}{r.stderr[-1500:]}")
