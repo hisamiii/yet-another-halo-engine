@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048]
+"""footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked]
 
 Compile the source under the exact config and read each root's declared byte envelope from the compile report.
 Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for that root.
@@ -16,6 +16,7 @@ QB = {"q4k": (256, 144), "q5k": (256, 176), "q6k": (256, 210), "q3k": (256, 110)
 src, sym, fmt, kind, mt, kb, tt = sys.argv[1:8]
 mt, kb, tt = int(mt), int(kb), int(tt)
 B = int(sys.argv[8]) if len(sys.argv) > 8 else 2048
+# masked: the kernel declares its token count (config "tokens") and the last token tile is partial
 qk, bpb = QB[fmt]
 M, K = mt * 16, kb * qk
 bound = {"weight": M * kb * bpb, "input": B * K * 2, "resid": B * M * 4, "gate": B * M * 4,
@@ -39,6 +40,8 @@ cmd = [H + "/build/cmake/loom/src/loom/tools/loom-compile/loom-compile", src, "-
        "--target=amdgpu:gfx1151", "--format=amdgpu-hsaco", "--output=/tmp/footprint_gate.hsaco",
        "--compile-report=details", "--compile-report-output=" + rep,
        f"--config={sym}.m_tiles={mt}", f"--config={sym}.k_blocks={kb}", f"--config={sym}.token_tiles={tt}"]
+if "masked" in sys.argv[9:]:
+    cmd.append(f"--config={sym}.tokens={B}")
 r = subprocess.run(cmd, env=e, capture_output=True, text=True)
 if r.returncode:
     print("GATE: compile failed", r.stderr[-800:]); sys.exit(2)

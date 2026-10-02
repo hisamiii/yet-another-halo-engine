@@ -162,15 +162,19 @@ def configure(fmt, t):
     G.NW = t.nwave // 2        # table-staging stride 64*NW = LANES
 
 
-def gen(fmt, kind="kstore", tile=None):
-    """Return the kernel text for fmt; kind as gen_gemm_decode.gen() plus "kqg". tile defaults to default_tile()."""
+def gen(fmt, kind="kstore", tile=None, masked=False):
+    """Return the kernel text for fmt; kind as gen_gemm_decode.gen() plus "kqg". tile defaults to default_tile().
+    masked: the token count (config "tokens") need not be a multiple of BN. The last token tile clamps its activation loads
+    and skips every per-token load and store past it, so the valid tokens are computed exactly as unmasked."""
     t = tile or default_tile(fmt, kind, 0)
     check(t)
+    if masked and t.tm != 32:
+        raise ValueError(f"{t}: a masked token tile needs the LDS epilogue (32 rows per wave)")
     configure(fmt, t)
-    return _gen(fmt, kind, t)
+    return _gen(fmt, kind, t, masked)
 
 
-def _gen(fmt, kind, t):
+def _gen(fmt, kind, t, masked):
     BM, BN, WM, WN, TM, TN = t.bm, t.bn, t.wm, t.wn, t.tm, t.tn
     FM, FN, NWAVE, LANES, ROWGRP, APL = TM // 16, TN // 16, t.nwave, t.lanes, t.rowgrp, t.apl
     DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE = t.decahead, t.ksl, t.decload, t.rhs_outer, t.rhs_fence
@@ -199,7 +203,7 @@ def _gen(fmt, kind, t):
     e("// decoded weights and staged activations both in LDS. See the generator.")
     e(f"amdgpu.target<gfx1151> @yah_tile_w32 {{subgroup_size = {WS}}}")
     e("")
-    for c in ("m_tiles", "k_blocks", "token_tiles"):
+    for c in ("m_tiles", "k_blocks", "token_tiles") + (("tokens",) if masked else ()):
         e(f"config.decl @{sym}.{c} : %value: index where [range(%value, 1, 4096)]")
     e("")
     e(f"kernel.def target(@yah_tile_w32) @{sym}() {{")
@@ -240,7 +244,10 @@ def _gen(fmt, kind, t):
         e("  %k_blocks = index.div %k_blocks_cfg, %ckdiv : index")
     e(f"  %token_tiles = config.get @{sym}.token_tiles : index")
     e("  %ktot = index.mul %k_blocks, %c256 : index")
-    e("  %tokens = index.mul %token_tiles, %cwtok : index")
+    if masked:
+        e(f"  %tokens = config.get @{sym}.tokens : index")
+    else:
+        e("  %tokens = index.mul %token_tiles, %cwtok : index")
     e("  %m_rows = index.mul %m_tiles, %c16 : index")
     e("  %bpr = index.mul %k_blocks, %cbb : index")
     e("  %hpr = index.mul %k_blocks, %cbbh : index")
@@ -558,17 +565,17 @@ def _gen(fmt, kind, t):
           + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
         e("  }")
     if t.swepi:
-        lds_epilogue(e, t, kr, V8, sw=True)
+        lds_epilogue(e, t, kr, V8, sw=True, masked=masked)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
     if sw:
-        swiglu_epilogue(e, t, arow)
+        swiglu_epilogue(e, t, arow, masked)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
     if TM == 32:
-        lds_epilogue(e, t, kr, V8, qg=qg)
+        lds_epilogue(e, t, kr, V8, qg=qg, masked=masked)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
@@ -594,7 +601,7 @@ def _gen(fmt, kind, t):
     return "\n".join(L) + "\n"
 
 
-def lds_epilogue(e, t, kr, V8, sw=False, qg=False):
+def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
     """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
     A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical."""
@@ -653,6 +660,10 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False):
         if qg:
             e(f"  %qg_tm{j} = index.mul %es_tk{j}, %qg_rows : index")
             e(f"  %qg_ob{j} = index.add %qg_tm{j}, %qg_col : index")
+        if masked:
+            # this lane's token past the last valid one: no residual / gate load, no store
+            e(f"  %es_ok{j} = index.cmp ult, %es_tk{j}, %tokens : index")
+            e(f"  scf.if %es_ok{j} {{")
         for q in range(4):
             e(f"  %es_q{j}_{q}c = index.constant {4 * q} : index")
             e(f"  %es_ri{j}_{q} = index.add %es_rd, %es_q{j}_{q}c : index")
@@ -691,9 +702,11 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False):
                 e("  }")
             else:
                 e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
+        if masked:
+            e("  }")
 
 
-def swiglu_epilogue(e, t, arow):
+def swiglu_epilogue(e, t, arow, masked=False):
     """out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the .loom kernel's scalar ops in order (bit-identical).
     As in gen_gemm_decode, each 16-row x ES-token slab goes through a per-wave f32 LDS tile; a loop walks it lane-contiguous.
     ES is the larger of 32, 16 for which all waves' slabs fit in the activation tile's LDS."""
@@ -739,6 +752,9 @@ def swiglu_epilogue(e, t, arow):
             e(f"    %gto_{q} = index.mul %gtok_{q}, %m_rows : index")
             e(f"    %gix0_{q} = index.add %gto_{q}, %grow_{q} : index")
             e(f"    %gix_{q} = index.min %gix0_{q}, %out_last : index")
+            if masked:
+                e(f"    %gok_{q} = index.cmp ult, %gtok_{q}, %tokens : index")
+                e(f"    scf.if %gok_{q} {{")
             e(f"    %g_{q} = view.load %gate_view[%gix_{q}] : view<[%out_total]xf32> -> f32")
             e(f"    %ng_{q} = scalar.mulf %g_{q}, %negone : f32")
             e(f"    %ex_{q} = scalar.expf<afn> %ng_{q} : f32")
@@ -748,5 +764,7 @@ def swiglu_epilogue(e, t, arow):
             e(f"    %ac_{q} = scalar.mulf %sg_{q}, %v_{q} : f32")
             e(f"    %h_{q} = scalar.fptrunc %ac_{q} : f32 to f16")
             e(f"    view.store %h_{q}, %out_h[%gix_{q}] : f16, view<[%out_total]xf16>")
+            if masked:
+                e("    }")
             e(f"    scf.yield %em{q} : index")
             e("  }")

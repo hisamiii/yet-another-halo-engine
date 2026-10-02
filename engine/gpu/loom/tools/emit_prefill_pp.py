@@ -105,12 +105,15 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
         t = dataclasses.replace(t, **tiles()[out[:-4]])
     if mt % t.rowgrp:
         return None
-    return _emit_gen(lambda f, k: TG.gen(f, k, t), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp)
+    # a token tile that does not divide the chunk: the last tile is masked (gen_gemm_tile.gen masked=)
+    masked = B % t.bn != 0
+    return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
-def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp):
-    if B % tile:
+def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False):
+    if B % tile and not masked:
         return None
+    tt = -(-B // tile)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
@@ -120,13 +123,13 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp):
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     import subprocess
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
-                           kind, str(mt), str(kb), str(B // tile), str(B)],
+                           kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []),
                           capture_output=True, text=True)
     if gate.returncode != 0:
         raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
-    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
-                 "%s.token_tiles=%d" % (sym, B // tile)], out, outdir)
-    return (out, tile, rowgrp, B // tile)
+    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)]
+           + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir)
+    return (out, tile, rowgrp, tt)
 
 
 def main():
