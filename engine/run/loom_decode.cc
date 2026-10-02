@@ -206,7 +206,10 @@ int main(int argc, char** argv) {
       gpu.Dispatch(e, 0, LoomDevice::Config(gx, gy, 1, wg, 1, 1), nullptr, 0, b.data(), b.size());
     };
     // GEMV: names and footprints as tools/gen_gemv.py; checked once per tensor
-    auto gemv = [&](const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y) {
+    // overlap = true: no ordering barrier against the previous dispatch (independent
+    // projections of one input); the next barriered dispatch still waits for all of them
+    auto gemv = [&](const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y,
+                    bool overlap = false) {
       std::string name = std::string("gv_") + kind;
       std::uint32_t tbits = 0, M = 0, K = 0;
       std::vector<hrx_buffer_ref_t> b;
@@ -227,7 +230,9 @@ int main(int argc, char** argv) {
       if (x.size < std::size_t{K} * 4 || y.size < std::size_t{M} * 4) throw LoomError("GEMV operand too small: " + name);
       b.push_back({x.handle, 0, std::size_t{K} * 4});
       b.push_back({y.handle, 0, std::size_t{M} * 4});
-      dispatch(load(name), M / (kR * kW), 1, 32 * kW, b);
+      LoomExecutable& exe = load(name);
+      if (overlap && !std::getenv("YAH_DEC_NO_OVERLAP")) gpu.NoBarrierNext();
+      dispatch(exe, M / (kR * kW), 1, 32 * kW, b);
     };
     auto rmsnorm = [&](const LoomBuffer& x, const std::string& w, const LoomBuffer& out) {
       dispatch(load("rmsnorm"), 1, 1, 512, {ref(x), tref(w), ref(out)});
@@ -270,8 +275,8 @@ int main(int argc, char** argv) {
         if (cfg.IsFullAttention(l)) {
           const std::uint32_t ai = l / cfg.full_attention_interval;
           gemv("plain", {pre + "attn_q.weight"}, normed, qg);
-          gemv("plain", {pre + "attn_k.weight"}, normed, kb);
-          gemv("plain", {pre + "attn_v.weight"}, normed, vb);
+          gemv("plain", {pre + "attn_k.weight"}, normed, kb, true);
+          gemv("plain", {pre + "attn_v.weight"}, normed, vb, true);
           tr("qg", l, qg, kQProj); tr("k", l, kb, kKv); tr("v", l, vb, kKv);
           dispatch(load("unpack"), kHeads, 1, 256, {ref(qg), ref(q), ref(gate)});
           dispatch(load("rope"), kHeads + kKvHeads, 1, 256,
@@ -288,9 +293,9 @@ int main(int argc, char** argv) {
         } else {
           const std::uint32_t si = l - l / cfg.full_attention_interval;
           gemv("plain", {pre + "attn_qkv.weight"}, normed, qkv);
-          gemv("plain", {pre + "attn_gate.weight"}, normed, gate);
-          gemv("plain", {pre + "ssm_alpha.weight"}, normed, alpha);
-          gemv("plain", {pre + "ssm_beta.weight"}, normed, beta);
+          gemv("plain", {pre + "attn_gate.weight"}, normed, gate, true);
+          gemv("plain", {pre + "ssm_alpha.weight"}, normed, alpha, true);
+          gemv("plain", {pre + "ssm_beta.weight"}, normed, beta, true);
           tr("qkv", l, qkv, kQkv); tr("z", l, gate, kInner); tr("alpha", l, alpha, kTs); tr("beta", l, beta, kTs);
           dispatch(load("ssmconv"), (kQkv + 255) / 256, 1, 256,
                    {{qkv.handle, 0, std::size_t{kQkv} * 4}, tref(pre + "ssm_conv1d.weight"),
