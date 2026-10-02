@@ -40,8 +40,7 @@ std::string ByteToGpt2Utf8(std::uint8_t b) {
     for (int i = 174; i <= 255; ++i) map[i] = Utf8FromCodepoint(i);
     int n = 0;
     for (int i = 0; i < 256; ++i) {
-      if ((i < '!' || i > '~') && (i < 161 || i > 172) &&
-          (i < 174 || i > 255)) {
+      if ((i < '!' || i > '~') && (i < 161 || i > 172) && (i < 174 || i > 255)) {
         map[i] = Utf8FromCodepoint(256 + n);
         ++n;
       }
@@ -60,12 +59,10 @@ std::string UnescapeGpt2Bytes(std::string_view text) {
     char32_t cp = b0;
     std::size_t len = 1;
     if ((b0 & 0xE0) == 0xC0 && i + 1 < text.size()) {
-      cp = ((b0 & 0x1F) << 6) |
-           (static_cast<unsigned char>(text[i + 1]) & 0x3F);
+      cp = ((b0 & 0x1F) << 6) | (static_cast<unsigned char>(text[i + 1]) & 0x3F);
       len = 2;
     } else if ((b0 & 0xF0) == 0xE0 && i + 2 < text.size()) {
-      cp = ((b0 & 0x0F) << 12) |
-           ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
+      cp = ((b0 & 0x0F) << 12) | ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
            (static_cast<unsigned char>(text[i + 2]) & 0x3F);
       len = 3;
     }
@@ -73,8 +70,7 @@ std::string UnescapeGpt2Bytes(std::string_view text) {
       // Reverse of the b2u gap list: 0x100 + n maps back to the nth gap byte.
       int n = static_cast<int>(cp - 0x100);
       for (int b = 0; b < 256; ++b) {
-        if ((b < '!' || b > '~') && (b < 161 || b > 172) &&
-            (b < 174 || b > 255)) {
+        if ((b < '!' || b > '~') && (b < 161 || b > 172) && (b < 174 || b > 255)) {
           if (n == 0) {
             result.push_back(static_cast<char>(b));
             break;
@@ -82,8 +78,7 @@ std::string UnescapeGpt2Bytes(std::string_view text) {
           --n;
         }
       }
-    } else if (cp < 0x80 || (cp >= 161 && cp <= 172) ||
-               (cp >= 174 && cp <= 255)) {
+    } else if (cp < 0x80 || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255)) {
       result.push_back(static_cast<char>(cp));
     } else {
       result.append(text.substr(i, len));
@@ -132,19 +127,18 @@ bool IsUnicodeLetterOrMark(UChar32 value) noexcept {
 }
 bool IsUnicodeNumber(UChar32 value) noexcept {
   const auto category = static_cast<UCharCategory>(u_charType(value));
-  return category == U_DECIMAL_DIGIT_NUMBER || category == U_LETTER_NUMBER ||
-         category == U_OTHER_NUMBER;
+  return category == U_DECIMAL_DIGIT_NUMBER || category == U_LETTER_NUMBER || category == U_OTHER_NUMBER;
 }
 bool IsUnicodeWhitespace(UChar32 value) noexcept {
   return u_isUWhiteSpace(value) != 0;
 }
-bool IsNewline(UChar32 value) noexcept { return value == '\r' || value == '\n'; }
+bool IsNewline(UChar32 value) noexcept {
+  return value == '\r' || value == '\n';
+}
 
-std::size_t Qwen35ContractionEnd(std::string_view text,
-                                 std::size_t offset) noexcept {
+std::size_t Qwen35ContractionEnd(std::string_view text, std::size_t offset) noexcept {
   if (text[offset] != '\'') return offset;
-  constexpr std::array<std::string_view, 7> kSuffixes = {"s",  "t", "re", "ve",
-                                                          "m", "ll", "d"};
+  constexpr std::array<std::string_view, 7> kSuffixes = {"s", "t", "re", "ve", "m", "ll", "d"};
   for (const std::string_view suffix : kSuffixes) {
     std::size_t end = offset + 1;
     bool matches = true;
@@ -166,8 +160,7 @@ std::size_t Qwen35ContractionEnd(std::string_view text,
 }
 
 std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
-  if (const std::size_t contraction = Qwen35ContractionEnd(text, offset);
-      contraction != offset) {
+  if (const std::size_t contraction = Qwen35ContractionEnd(text, offset); contraction != offset) {
     return contraction;
   }
   const Utf8CodePoint first = DecodeUtf8(text, offset);
@@ -180,8 +173,8 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
     }
     return end;
   }
-  if (!IsNewline(first.value) && !IsUnicodeLetter(first.value) &&
-      !IsUnicodeNumber(first.value) && offset + first.length < text.size()) {
+  if (!IsNewline(first.value) && !IsUnicodeLetter(first.value) && !IsUnicodeNumber(first.value) &&
+      offset + first.length < text.size()) {
     const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
     if (IsUnicodeLetterOrMark(next.value)) {
       std::size_t end = offset + first.length + next.length;
@@ -198,20 +191,17 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
   std::size_t punctuation_start = offset;
   if (first.value == ' ' && offset + first.length < text.size()) {
     const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
-    if (!IsUnicodeWhitespace(next.value) && !IsUnicodeLetterOrMark(next.value) &&
-        !IsUnicodeNumber(next.value)) {
+    if (!IsUnicodeWhitespace(next.value) && !IsUnicodeLetterOrMark(next.value) && !IsUnicodeNumber(next.value)) {
       punctuation_start += first.length;
     }
   }
   const Utf8CodePoint punctuation = DecodeUtf8(text, punctuation_start);
-  if (!IsUnicodeWhitespace(punctuation.value) &&
-      !IsUnicodeLetterOrMark(punctuation.value) &&
+  if (!IsUnicodeWhitespace(punctuation.value) && !IsUnicodeLetterOrMark(punctuation.value) &&
       !IsUnicodeNumber(punctuation.value)) {
     std::size_t end = punctuation_start;
     while (end < text.size()) {
       const Utf8CodePoint next = DecodeUtf8(text, end);
-      if (IsUnicodeWhitespace(next.value) || IsUnicodeLetterOrMark(next.value) ||
-          IsUnicodeNumber(next.value)) {
+      if (IsUnicodeWhitespace(next.value) || IsUnicodeLetterOrMark(next.value) || IsUnicodeNumber(next.value)) {
         break;
       }
       end += next.length;
@@ -271,15 +261,12 @@ Tokenizer Tokenizer::FromGguf(const Gguf& gguf, const TokenizerConfig& config) {
       const std::string part2 = merge.substr(space + 1);
       const auto it1 = tokenizer.token_to_id_.find(part1);
       const auto it2 = tokenizer.token_to_id_.find(part2);
-      if (it1 == tokenizer.token_to_id_.end() ||
-          it2 == tokenizer.token_to_id_.end()) {
+      if (it1 == tokenizer.token_to_id_.end() || it2 == tokenizer.token_to_id_.end()) {
         continue;
       }
       const auto merged = tokenizer.token_to_id_.find(part1 + part2);
       tokenizer.merge_ranks_[MergeKey(it1->second, it2->second)] = {
-          static_cast<std::uint32_t>(rank),
-          merged != tokenizer.token_to_id_.end() ? merged->second
-                                                 : kInvalidTokenId};
+          static_cast<std::uint32_t>(rank), merged != tokenizer.token_to_id_.end() ? merged->second : kInvalidTokenId};
     }
   }
 
@@ -288,8 +275,7 @@ Tokenizer Tokenizer::FromGguf(const Gguf& gguf, const TokenizerConfig& config) {
   // them even if a shard marks them differently.
   if (config.token_types != nullptr) {
     const auto& types = *config.token_types;
-    for (std::size_t i = 0; i < types.size() && i < tokenizer.id_to_token_.size();
-         ++i) {
+    for (std::size_t i = 0; i < types.size() && i < tokenizer.id_to_token_.size(); ++i) {
       if (types[i].kind != MetadataValue::Kind::kInt) continue;
       if (types[i].i == 3 || types[i].i == 4) {
         tokenizer.is_special_.insert(static_cast<TokenId>(i));
@@ -309,8 +295,7 @@ Tokenizer Tokenizer::FromGguf(const Gguf& gguf, const TokenizerConfig& config) {
   for (int b = 0; b < 256; ++b) {
     const std::string key = ByteToGpt2Utf8(static_cast<std::uint8_t>(b));
     const auto it = tokenizer.token_to_id_.find(key);
-    tokenizer.byte_tokens_[b] =
-        it != tokenizer.token_to_id_.end() ? it->second : kInvalidTokenId;
+    tokenizer.byte_tokens_[b] = it != tokenizer.token_to_id_.end() ? it->second : kInvalidTokenId;
   }
 
   tokenizer.qwen35_ = config.pre == "qwen35";
@@ -330,8 +315,7 @@ void Tokenizer::InitializeDecodedTokens() {
       const int high = HexCharToInt(token[3]);
       const int low = HexCharToInt(token[4]);
       if (high >= 0 && low >= 0) {
-        id_to_decoded_token_[i] = std::string(
-            1, static_cast<char>(static_cast<std::uint8_t>((high << 4) | low)));
+        id_to_decoded_token_[i] = std::string(1, static_cast<char>(static_cast<std::uint8_t>((high << 4) | low)));
         continue;
       }
     }
@@ -367,15 +351,12 @@ std::vector<TokenId> Tokenizer::BpeMergeChunk(std::string_view chunk) const {
   const auto later = [](const Candidate& a, const Candidate& b) {
     return a.rank != b.rank ? a.rank > b.rank : a.index > b.index;
   };
-  std::priority_queue<Candidate, std::vector<Candidate>, decltype(later)>
-      candidates(later);
+  std::priority_queue<Candidate, std::vector<Candidate>, decltype(later)> candidates(later);
 
   const auto offer = [&](std::size_t index, std::size_t right) {
-    const auto it =
-        merge_ranks_.find(MergeKey(word_tokens[index], word_tokens[right]));
+    const auto it = merge_ranks_.find(MergeKey(word_tokens[index], word_tokens[right]));
     if (it != merge_ranks_.end()) {
-      candidates.push({it->second.rank, index, word_tokens[index],
-                       word_tokens[right]});
+      candidates.push({it->second.rank, index, word_tokens[index], word_tokens[right]});
     }
   };
   for (std::size_t i = 0; i + 1 < count; ++i) offer(i, i + 1);
@@ -384,8 +365,7 @@ std::vector<TokenId> Tokenizer::BpeMergeChunk(std::string_view chunk) const {
     const Candidate best = candidates.top();
     candidates.pop();
     const std::size_t right = following[best.index];
-    if (word_tokens[best.index] != best.left || right == kNoSymbol ||
-        word_tokens[right] != best.right) {
+    if (word_tokens[best.index] != best.left || right == kNoSymbol || word_tokens[right] != best.right) {
       continue;
     }
     const auto it = merge_ranks_.find(MergeKey(best.left, best.right));
@@ -411,18 +391,14 @@ std::vector<TokenId> Tokenizer::BpeEncodeText(std::string_view text) const {
   if (!qwen35_) return BpeMergeChunk(text);
 
   std::string normalized;
-  if (std::any_of(text.begin(), text.end(),
-                  [](unsigned char byte) { return byte >= 0x80; })) {
+  if (std::any_of(text.begin(), text.end(), [](unsigned char byte) { return byte >= 0x80; })) {
     UErrorCode status = U_ZERO_ERROR;
     const auto* nfc = icu::Normalizer2::getNFCInstance(status);
     if (U_FAILURE(status)) {
       throw std::runtime_error("tokenizer: NFC instance unavailable");
     }
     icu::StringByteSink<std::string> sink(&normalized);
-    nfc->normalizeUTF8(0,
-                       icu::StringPiece(text.data(),
-                                        static_cast<int32_t>(text.size())),
-                       sink, nullptr, status);
+    nfc->normalizeUTF8(0, icu::StringPiece(text.data(), static_cast<int32_t>(text.size())), sink, nullptr, status);
     if (U_FAILURE(status)) {
       throw std::runtime_error("tokenizer: NFC normalization failed");
     }
@@ -440,8 +416,7 @@ std::vector<TokenId> Tokenizer::BpeEncodeText(std::string_view text) const {
   return tokens;
 }
 
-std::vector<TokenId> Tokenizer::Encode(std::string_view text,
-                                       const TokenizerOptions& options) const {
+std::vector<TokenId> Tokenizer::Encode(std::string_view text, const TokenizerOptions& options) const {
   std::vector<TokenId> tokens;
   if (options.add_bos && bos_id_ != kInvalidTokenId) tokens.push_back(bos_id_);
   if (text.empty()) {

@@ -22,16 +22,12 @@ struct TypeTraits {
 
 // Indexed by GgmlType. Indices 4 and 5 are the removed Q4_2/Q4_3 slots.
 const TypeTraits kTraits[] = {
-    {"F32", 1, 4},        {"F16", 1, 2},        {"Q4_0", 32, 18},
-    {"Q4_1", 32, 20},     {"unused4", 1, 1},    {"unused5", 1, 1},
-    {"Q5_0", 32, 22},     {"Q5_1", 32, 24},     {"Q8_0", 32, 34},
-    {"Q8_1", 32, 36},     {"Q2_K", 256, 84},    {"Q3_K", 256, 110},
-    {"Q4_K", 256, 144},   {"Q5_K", 256, 176},   {"Q6_K", 256, 210},
-    {"Q8_K", 256, 292},   {"IQ2_XXS", 256, 66}, {"IQ2_XS", 256, 74},
-    {"IQ3_XXS", 256, 98}, {"IQ1_S", 256, 50},   {"IQ4_NL", 32, 18},
-    {"IQ3_S", 256, 110},  {"IQ2_S", 256, 82},   {"IQ4_XS", 256, 136},
-    {"I8", 1, 1},         {"I16", 1, 2},        {"I32", 1, 4},
-    {"I64", 1, 8},        {"F64", 1, 8},        {"IQ1_M", 256, 56},
+    {"F32", 1, 4},      {"F16", 1, 2},        {"Q4_0", 32, 18},    {"Q4_1", 32, 20},     {"unused4", 1, 1},
+    {"unused5", 1, 1},  {"Q5_0", 32, 22},     {"Q5_1", 32, 24},    {"Q8_0", 32, 34},     {"Q8_1", 32, 36},
+    {"Q2_K", 256, 84},  {"Q3_K", 256, 110},   {"Q4_K", 256, 144},  {"Q5_K", 256, 176},   {"Q6_K", 256, 210},
+    {"Q8_K", 256, 292}, {"IQ2_XXS", 256, 66}, {"IQ2_XS", 256, 74}, {"IQ3_XXS", 256, 98}, {"IQ1_S", 256, 50},
+    {"IQ4_NL", 32, 18}, {"IQ3_S", 256, 110},  {"IQ2_S", 256, 82},  {"IQ4_XS", 256, 136}, {"I8", 1, 1},
+    {"I16", 1, 2},      {"I32", 1, 4},        {"I64", 1, 8},       {"F64", 1, 8},        {"IQ1_M", 256, 56},
     {"BF16", 1, 2},
 };
 constexpr std::size_t kTypeCount = sizeof(kTraits) / sizeof(kTraits[0]);
@@ -40,9 +36,7 @@ struct Cursor {
   const std::uint8_t* p;
   const std::uint8_t* end;
 
-  [[nodiscard]] std::size_t left() const {
-    return static_cast<std::size_t>(end - p);
-  }
+  [[nodiscard]] std::size_t left() const { return static_cast<std::size_t>(end - p); }
   void Need(std::size_t n) const {
     if (left() < n) throw std::runtime_error("gguf: truncated file");
   }
@@ -57,8 +51,7 @@ struct Cursor {
   std::string ReadString() {
     const auto n = Read<std::uint64_t>();
     Need(static_cast<std::size_t>(n));
-    std::string s(reinterpret_cast<const char*>(p),
-                  static_cast<std::size_t>(n));
+    std::string s(reinterpret_cast<const char*>(p), static_cast<std::size_t>(n));
     p += n;
     return s;
   }
@@ -146,7 +139,9 @@ std::uint32_t BlockBytes(GgmlType type) {
   return kTraits[static_cast<std::size_t>(type)].bytes;
 }
 
-Gguf::Gguf(Gguf&& other) noexcept { *this = std::move(other); }
+Gguf::Gguf(Gguf&& other) noexcept {
+  *this = std::move(other);
+}
 
 Gguf& Gguf::operator=(Gguf&& other) noexcept {
   if (this != &other) {
@@ -165,7 +160,9 @@ Gguf& Gguf::operator=(Gguf&& other) noexcept {
   return *this;
 }
 
-Gguf::~Gguf() { Close(); }
+Gguf::~Gguf() {
+  Close();
+}
 
 void Gguf::Close() {
   if (base_ != nullptr) {
@@ -183,7 +180,7 @@ Gguf Gguf::Open(const std::string& path) {
   Gguf g;
   g.fd_ = ::open(path.c_str(), O_RDONLY);
   if (g.fd_ < 0) throw std::runtime_error("gguf: cannot open " + path);
-  struct stat st {};
+  struct stat st{};
   if (::fstat(g.fd_, &st) != 0) {
     g.Close();
     throw std::runtime_error("gguf: fstat failed");

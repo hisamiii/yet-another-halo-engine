@@ -26,12 +26,13 @@
 // the activation is a run of f16 0.5. Even so this measures one kernel on a quiet
 // GPU: it is a hypothesis generator, not a result. Confirm with a paired
 // full-pipeline A/B (engine/run/LOOM_RUNTIME.md section 6).
-#include <cstdio>
-#include <cstdint>
-#include <cstdlib>
 #include <chrono>
-#include <vector>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
+#include <vector>
+
 #include "model/loom_runtime.hpp"
 using namespace yah::model;
 
@@ -82,8 +83,8 @@ int main(int argc, char** argv) {
     bad = 1;
   }
   if (!GX || (MROWS && static_cast<size_t>(GX) * 16 > MROWS)) {
-    std::fprintf(stderr, "gx=%u covers %zu rows but m_rows=%zu (K splits go on gz)\n",
-                 GX, static_cast<size_t>(GX) * 16, MROWS);
+    std::fprintf(stderr, "gx=%u covers %zu rows but m_rows=%zu (K splits go on gz)\n", GX, static_cast<size_t>(GX) * 16,
+                 MROWS);
     bad = 1;
   }
   if (!GZ || (KBLK && GZ > KBLK)) {
@@ -97,31 +98,35 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "gy=%u is out of range for tokens=%zu\n", GY, TOK);
     bad = 1;
   }
-  if (iters < 1 || iters > 100000) { std::fprintf(stderr, "iters out of range\n"); bad = 1; }
+  if (iters < 1 || iters > 100000) {
+    std::fprintf(stderr, "iters out of range\n");
+    bad = 1;
+  }
   if (bad) {
     std::fprintf(stderr, "hal_bench: REFUSING to dispatch; nothing was submitted.\n");
     return 3;
   }
 
-  const size_t GRID = 2048;  // the IQ grid table is exactly 512 x i32
-  const size_t KSIGNS = 128; // the ksigns table, one byte per sign slot
-  std::fprintf(stderr,
-               "hal_bench: grid=%ux%ux%u weight=%zu input=%zu output=%zu iters=%d\n",
-               GX, GY, GZ, W, IN, OUT, iters);
+  const size_t GRID = 2048;   // the IQ grid table is exactly 512 x i32
+  const size_t KSIGNS = 128;  // the ksigns table, one byte per sign slot
+  std::fprintf(stderr, "hal_bench: grid=%ux%ux%u weight=%zu input=%zu output=%zu iters=%d\n", GX, GY, GZ, W, IN, OUT,
+               iters);
 
   LoomDevice gpu;
   LoomExecutable e = gpu.Load(hal);
-  LoomBuffer weight = gpu.Allocate(W), grid = gpu.Allocate(GRID),
-             ksigns = gpu.Allocate(KSIGNS),
-             input = gpu.Allocate(IN), wstage = gpu.Allocate(WST),
-             ostage = gpu.Allocate(OST), output = gpu.Allocate(OUT);
+  LoomBuffer weight = gpu.Allocate(W), grid = gpu.Allocate(GRID), ksigns = gpu.Allocate(KSIGNS),
+             input = gpu.Allocate(IN), wstage = gpu.Allocate(WST), ostage = gpu.Allocate(OST),
+             output = gpu.Allocate(OUT);
   std::vector<uint8_t> hw(W), hg(GRID), hk(KSIGNS);
   FillPattern(hw);
   FillPattern(hg);
   FillPattern(hk);
   if (WFILE[0]) {
     FILE* wf = std::fopen(WFILE, "rb");
-    if (!wf) { std::fprintf(stderr, "hal_bench: cannot open %s\n", WFILE); return 2; }
+    if (!wf) {
+      std::fprintf(stderr, "hal_bench: cannot open %s\n", WFILE);
+      return 2;
+    }
     const size_t got = std::fread(hw.data(), 1, W, wf);
     std::fclose(wf);
     if (got != W) {
@@ -186,13 +191,9 @@ int main(int argc, char** argv) {
     std::fclose(of);
   }
   auto t0 = std::chrono::steady_clock::now();
-  for (int i = 0; i < iters; ++i)
-    gpu.Dispatch(e, ordinal, cfg, nullptr, 0, b.data(), b.size());
+  for (int i = 0; i < iters; ++i) gpu.Dispatch(e, ordinal, cfg, nullptr, 0, b.data(), b.size());
   gpu.Synchronize();
-  const double ms =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-          .count() / iters;
-  std::printf("%-28s gx=%-5u gy=%-3u gz=%-3u wg=%-3u %.4f ms\n", name, GX, GY,
-              GZ, ws ? ws : 32, ms);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / iters;
+  std::printf("%-28s gx=%-5u gy=%-3u gz=%-3u wg=%-3u %.4f ms\n", name, GX, GY, GZ, ws ? ws : 32, ms);
   return 0;
 }

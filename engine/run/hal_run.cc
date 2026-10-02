@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
   try {
     auto gguf = yah::core::Gguf::Open(argv[1]);
     const std::string hal = argv[2];
-    const uint32_t gx = static_cast<uint32_t>(std::atoi(argv[3]));     // "gx" or "gx,gy"
+    const uint32_t gx = static_cast<uint32_t>(std::atoi(argv[3]));  // "gx" or "gx,gy"
     const char* comma = std::strchr(argv[3], ',');
     const uint32_t gy = comma ? static_cast<uint32_t>(std::atoi(comma + 1)) : 1;
     const uint32_t wg = static_cast<uint32_t>(std::atoi(argv[4]));
@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
     std::vector<LoomBuffer> owned;
     owned.reserve(nb);
     std::vector<hrx_buffer_ref_t> refs;
-    std::vector<std::pair<size_t, std::string>> outs;   // (ref index, file)
+    std::vector<std::pair<size_t, std::string>> outs;  // (ref index, file)
     for (int i = 0; i < nb; ++i) {
       const std::string spec = argv[6 + i];
       size_t size = 0;
@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
         gpu.H2D(owned.back(), data.data(), size);
         refs.push_back({owned.back().handle, 0, size});
         if (io) outs.emplace_back(refs.size() - 1, out);
-      } else if (spec.rfind("z:", 0) == 0) {          // scratch: allocated, not initialized or read back
+      } else if (spec.rfind("z:", 0) == 0) {  // scratch: allocated, not initialized or read back
         size = std::strtoull(spec.substr(2).c_str(), nullptr, 10);
         owned.push_back(gpu.Allocate(size));
         refs.push_back({owned.back().handle, 0, size});
@@ -110,8 +110,8 @@ int main(int argc, char** argv) {
         throw LoomError("bad binding " + spec);
       }
       if (size < mins[i]) {
-        std::fprintf(stderr, "hal_run: binding %d (%s) is %zu bytes, kernel footprint %zu: refusing\n",
-                     i, spec.c_str(), size, mins[i]);
+        std::fprintf(stderr, "hal_run: binding %d (%s) is %zu bytes, kernel footprint %zu: refusing\n", i, spec.c_str(),
+                     size, mins[i]);
         return 3;
       }
     }
@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
     const auto t_first = std::chrono::steady_clock::now();
     gpu.Dispatch(exe, 0, cfg, nullptr, 0, refs.data(), refs.size());
     gpu.Synchronize();
-    if (std::getenv("HAL_RUN_TIME1"))   // the first dispatch alone (stateful kernels)
+    if (std::getenv("HAL_RUN_TIME1"))  // the first dispatch alone (stateful kernels)
       std::printf("hal_run: first dispatch %.4f ms\n",
                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_first).count());
     // HAL_RUN_ITERS=N: then time N back-to-back dispatches (outputs are from the

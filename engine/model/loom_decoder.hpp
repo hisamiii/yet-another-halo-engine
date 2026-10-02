@@ -42,14 +42,14 @@
 namespace yah::model {
 
 struct LoomDecoderState {
-  std::vector<hrx_buffer_ref_t> kpool, vtpool;   // per full-attention layer, T * 1024 f16 each
+  std::vector<hrx_buffer_ref_t> kpool, vtpool;  // per full-attention layer, T * 1024 f16 each
   // quantized KV (decode.txt "kv q KB VB"), per full-attention layer: K codes and
   // scales, the channel means subtracted before quantizing (zeros: own state), V^T
   // codes and stats; the f16 pools are then unused
   std::vector<hrx_buffer_ref_t> kq, ks, km, vq, vs;
-  hrx_buffer_ref_t ptab{};                        // T / 256 i32 (logical page -> physical page)
-  hrx_buffer_t convstate = nullptr;               // per recurrent layer si: si * 10240 * 4 f32
-  hrx_buffer_t dstate = nullptr;                  // per recurrent layer si: si * 48 * 128 * 128 f32
+  hrx_buffer_ref_t ptab{};           // T / 256 i32 (logical page -> physical page)
+  hrx_buffer_t convstate = nullptr;  // per recurrent layer si: si * 10240 * 4 f32
+  hrx_buffer_t dstate = nullptr;     // per recurrent layer si: si * 48 * 128 * 128 f32
 };
 
 class LoomDecoder {
@@ -58,7 +58,7 @@ class LoomDecoder {
   static constexpr std::uint32_t kInner = 6144, kQkv = 10240, kHeadsV = 48, kTs = 48, kState = 128;
   static constexpr std::uint32_t kHeads = 24, kKvHeads = 4, kVocab = 248320;
   static constexpr std::uint32_t kConvState = kQkv * 4, kStateElems = kHeadsV * kState * kState;
-  static constexpr std::uint32_t kR = 2, kW = 4;   // gen_gemv defaults: rows per wave, waves per workgroup
+  static constexpr std::uint32_t kR = 2, kW = 4;  // gen_gemv defaults: rows per wave, waves per workgroup
 
   LoomDecoder(LoomDevice& gpu, const core::Gguf& gguf, const core::Qwen35Config& cfg, std::string dir,
               hrx_buffer_t weights, std::size_t delta)
@@ -74,8 +74,11 @@ class LoomDecoder {
       std::uint32_t r = 0, w = 0;
       while (in >> k >> kind >> r >> w) {
         if (k == "rw") rw_[kind] = {r, w};
-        if (k == "grid") grid_[kind] = r;   // the exact grid each GEMV kernel was compiled for
-        if (k == "kv") { kbits_ = r; vbits_ = w; }   // "kv q KB VB"
+        if (k == "grid") grid_[kind] = r;  // the exact grid each GEMV kernel was compiled for
+        if (k == "kv") {
+          kbits_ = r;
+          vbits_ = w;
+        }  // "kv q KB VB"
       }
       const auto ok = [](std::uint32_t b) { return b == 4 || b == 8; };
       if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
@@ -83,21 +86,38 @@ class LoomDecoder {
     const std::uint32_t npg = T_ / 256;
     if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != 23)
       throw LoomError("token_embd: only IQ4_XS is wired");
-    const char* tnames[5] = {"grid_iq3s.bin", "grid_iq3xxs.bin", "grid_iq2xxs.bin", "grid_iq2xs.bin", "ksigns_iq2xs.bin"};
+    const char* tnames[5] = {"grid_iq3s.bin", "grid_iq3xxs.bin", "grid_iq2xxs.bin", "grid_iq2xs.bin",
+                             "ksigns_iq2xs.bin"};
     for (const char* tn : tnames) {
       const auto data = ReadAll(dir_ + "/" + tn);
       LoomBuffer& b = Alloc(data.size());
       gpu_.H2D(b, data.data(), data.size());
       tabs_.push_back({b.handle, 0, data.size()});
     }
-    hidden_ = &Alloc(kHidden * 4); normed_ = &Alloc(kHidden * 4); qg_ = &Alloc(kQProj * 4);
-    q_ = &Alloc(kAttn * 4); gate_ = &Alloc(kAttn * 4); kb_ = &Alloc(kKv * 4); vb_ = &Alloc(kKv * 4);
-    aout_ = &Alloc(kAttn * 4); qkv_ = &Alloc(kQkv * 4); alpha_ = &Alloc(kTs * 4); beta_ = &Alloc(kTs * 4);
-    ssmout_ = &Alloc(kInner * 4); ffnact_ = &Alloc(kFfn * 4);
-    logits_ = &Alloc(std::size_t{kVocab} * 4); sink_ = &Alloc(4);
-    toks_ = &Alloc((std::size_t{T_} + 1) * 4); posarr_ = &Alloc(std::size_t{T_} * 4); eps_ = &Alloc(4);
-    c32a_ = &Alloc(kKv * 4); c32b_ = &Alloc(kKv * 4); c16a_ = &Alloc(kKv * 2); c16b_ = &Alloc(kKv * 2);
-    acc_ = &Alloc(std::size_t{npg} * kHeads * 256 * 4); ml_ = &Alloc(std::size_t{npg} * kHeads * 2 * 4);
+    hidden_ = &Alloc(kHidden * 4);
+    normed_ = &Alloc(kHidden * 4);
+    qg_ = &Alloc(kQProj * 4);
+    q_ = &Alloc(kAttn * 4);
+    gate_ = &Alloc(kAttn * 4);
+    kb_ = &Alloc(kKv * 4);
+    vb_ = &Alloc(kKv * 4);
+    aout_ = &Alloc(kAttn * 4);
+    qkv_ = &Alloc(kQkv * 4);
+    alpha_ = &Alloc(kTs * 4);
+    beta_ = &Alloc(kTs * 4);
+    ssmout_ = &Alloc(kInner * 4);
+    ffnact_ = &Alloc(kFfn * 4);
+    logits_ = &Alloc(std::size_t{kVocab} * 4);
+    sink_ = &Alloc(4);
+    toks_ = &Alloc((std::size_t{T_} + 1) * 4);
+    posarr_ = &Alloc(std::size_t{T_} * 4);
+    eps_ = &Alloc(4);
+    c32a_ = &Alloc(kKv * 4);
+    c32b_ = &Alloc(kKv * 4);
+    c16a_ = &Alloc(kKv * 2);
+    c16b_ = &Alloc(kKv * 2);
+    acc_ = &Alloc(std::size_t{npg} * kHeads * 256 * 4);
+    ml_ = &Alloc(std::size_t{npg} * kHeads * 2 * 4);
     if (quant())
       for (std::uint32_t i = 0; i < full_layers(); ++i) vopen_.push_back(Ref(Alloc(std::size_t{kKv} * 16 * 2)));
     const float e = 1.0e-6f;
@@ -213,13 +233,14 @@ class LoomDecoder {
                  {Ref(*q_), Ref(*kb_), Ref(*vb_), TRef(pre + "attn_q_norm.weight"), TRef(pre + "attn_k_norm.weight"),
                   Ref(*q_), Ref(*kb_), Ref(*c32a_), Ref(*c32b_), Ref(*c16a_), Ref(*c16b_), dposr, Ref(*eps_)});
         if (quant()) {
-          Dispatch(Load("dattn_kappend_q"), 1, 1, 128, {Ref(*kb_), st_.km[ai], st_.kq[ai], st_.ks[ai], st_.ptab, dposr});
-          gpu_.NoBarrierNext();   // independent of the K append
+          Dispatch(Load("dattn_kappend_q"), 1, 1, 128,
+                   {Ref(*kb_), st_.km[ai], st_.kq[ai], st_.ks[ai], st_.ptab, dposr});
+          gpu_.NoBarrierNext();  // independent of the K append
           Dispatch(Load("dattn_vappend_q"), kKvHeads, 1, 256,
                    {Ref(*vb_), vopen_[ai], st_.vq[ai], st_.vs[ai], st_.ptab, dposr});
           Dispatch(Load("dattn_part_q"), kKvHeads, pos / 256 + 1, 256,
-                   {Ref(*q_), st_.kq[ai], st_.ks[ai], st_.vq[ai], st_.vs[ai], vopen_[ai], st_.ptab, dposr,
-                    Ref(*acc_), Ref(*ml_)});
+                   {Ref(*q_), st_.kq[ai], st_.ks[ai], st_.vq[ai], st_.vs[ai], vopen_[ai], st_.ptab, dposr, Ref(*acc_),
+                    Ref(*ml_)});
         } else {
           Dispatch(Load("dattn_kvappend"), kKvHeads, 1, 256,
                    {Ref(*kb_), Ref(*vb_), st_.kpool[ai], st_.vtpool[ai], st_.ptab, dposr});
@@ -237,9 +258,17 @@ class LoomDecoder {
         // conv state ping-pong: this step reads cs_[cs_cur_] and writes the other one
         const std::size_t co = std::size_t{si} * kConvState * 4, cb = std::size_t{kConvState} * 4;
         Dispatch(Load("deltanet_conv"), kHeadsV, 1, 512,
-                 {{qkv_->handle, 0, std::size_t{kQkv} * 4}, TRef(pre + "ssm_conv1d.weight"),
-                  {cs_[cs_cur_], co, cb}, {cs_[1 - cs_cur_], co, cb}, dst, Ref(*alpha_), Ref(*beta_),
-                  TRef(pre + "ssm_a"), TRef(pre + "ssm_dt.bias"), TRef(pre + "ssm_norm.weight"), Ref(*gate_),
+                 {{qkv_->handle, 0, std::size_t{kQkv} * 4},
+                  TRef(pre + "ssm_conv1d.weight"),
+                  {cs_[cs_cur_], co, cb},
+                  {cs_[1 - cs_cur_], co, cb},
+                  dst,
+                  Ref(*alpha_),
+                  Ref(*beta_),
+                  TRef(pre + "ssm_a"),
+                  TRef(pre + "ssm_dt.bias"),
+                  TRef(pre + "ssm_norm.weight"),
+                  Ref(*gate_),
                   Ref(*ssmout_)});
         Tr("ssm", l, *ssmout_, kInner);
         Gemv("resid", {pre + "ssm_out.weight"}, *ssmout_, *hidden_);
@@ -254,27 +283,53 @@ class LoomDecoder {
     Tr("logits", 99, *logits_, kVocab);
     cs_cur_ = 1 - cs_cur_;
     Dispatch(Load("argmax"), 1, 1, 1024,
-             {Ref(*logits_), pos + 1 >= keep_from ? hrx_buffer_ref_t{toks_->handle, std::size_t{pos + 1} * 4, 4}
-                                                  : Ref(*sink_)});
+             {Ref(*logits_),
+              pos + 1 >= keep_from ? hrx_buffer_ref_t{toks_->handle, std::size_t{pos + 1} * 4, 4} : Ref(*sink_)});
   }
 
  private:
-  struct Fmt { const char* name; std::uint32_t qk, bb, tables; };
+  struct Fmt {
+    const char* name;
+    std::uint32_t qk, bb, tables;
+  };
   // table bits, in gen_gemv.TABLE_ORDER: grid_iq3s, grid_iq3xxs, grid_iq2xxs, grid_iq2xs, ksigns
   static bool FmtOf(std::uint32_t type, Fmt* f) {
     switch (type) {
-      case 8: *f = {"q8_0", 32, 34, 0}; return true;
-      case 10: *f = {"q2k", 256, 84, 0}; return true;
-      case 11: *f = {"q3k", 256, 110, 0}; return true;
-      case 12: *f = {"q4k", 256, 144, 0}; return true;
-      case 13: *f = {"q5k", 256, 176, 0}; return true;
-      case 14: *f = {"q6k", 256, 210, 0}; return true;
-      case 16: *f = {"iq2xxs", 256, 66, 4 | 16}; return true;
-      case 17: *f = {"iq2xs", 256, 74, 8 | 16}; return true;
-      case 18: *f = {"iq3xxs", 256, 98, 2 | 16}; return true;
-      case 21: *f = {"iq3s", 256, 110, 1}; return true;
-      case 23: *f = {"iq4xs", 256, 136, 0}; return true;
-      default: return false;
+      case 8:
+        *f = {"q8_0", 32, 34, 0};
+        return true;
+      case 10:
+        *f = {"q2k", 256, 84, 0};
+        return true;
+      case 11:
+        *f = {"q3k", 256, 110, 0};
+        return true;
+      case 12:
+        *f = {"q4k", 256, 144, 0};
+        return true;
+      case 13:
+        *f = {"q5k", 256, 176, 0};
+        return true;
+      case 14:
+        *f = {"q6k", 256, 210, 0};
+        return true;
+      case 16:
+        *f = {"iq2xxs", 256, 66, 4 | 16};
+        return true;
+      case 17:
+        *f = {"iq2xs", 256, 74, 8 | 16};
+        return true;
+      case 18:
+        *f = {"iq3xxs", 256, 98, 2 | 16};
+        return true;
+      case 21:
+        *f = {"iq3s", 256, 110, 1};
+        return true;
+      case 23:
+        *f = {"iq4xs", 256, 136, 0};
+        return true;
+      default:
+        return false;
     }
   }
   static std::vector<char> ReadAll(const std::string& path) {
@@ -386,7 +441,8 @@ class LoomDecoder {
     auto it = grid_.find(name);
     if (it == grid_.end()) throw LoomError("decode set has no grid record for " + name + " (re-emit)");
     if (it->second != gx)
-      throw LoomError("grid mismatch for " + name + ": " + std::to_string(gx) + " vs compiled " + std::to_string(it->second));
+      throw LoomError("grid mismatch for " + name + ": " + std::to_string(gx) + " vs compiled " +
+                      std::to_string(it->second));
   }
   void Rmsnorm(const LoomBuffer& x, const std::string& w, const LoomBuffer& out) {
     Dispatch(Load("rmsnorm"), 1, 1, 512, {Ref(x), TRef(w), Ref(out)});
@@ -400,8 +456,10 @@ class LoomDecoder {
     double mx = 0;
     std::size_t nan = 0;
     for (float v : h) {
-      if (v != v) ++nan;
-      else mx = std::max(mx, static_cast<double>(std::fabs(v)));
+      if (v != v)
+        ++nan;
+      else
+        mx = std::max(mx, static_cast<double>(std::fabs(v)));
     }
     std::fprintf(stderr, "trace l%-2u %-10s max %.4g nan %zu\n", l, what, mx, nan);
   }
@@ -414,11 +472,11 @@ class LoomDecoder {
   std::size_t delta_;
   static constexpr std::uint32_t kAnyTile = 0xffffffffu;
   std::uint32_t T_ = 0, cur_pos_ = 0, kbits_ = 16, vbits_ = 16, next_pos_ = kAnyTile;
-  std::vector<hrx_buffer_ref_t> vopen_;   // quantized V: each layer's open tile, [1024][16] f16
+  std::vector<hrx_buffer_ref_t> vopen_;  // quantized V: each layer's open tile, [1024][16] f16
   bool trace_ = false;
-  hrx_buffer_t cs_[2] = {nullptr, nullptr};   // conv state ping-pong
+  hrx_buffer_t cs_[2] = {nullptr, nullptr};  // conv state ping-pong
   int cs_cur_ = 0;
-  std::deque<LoomBuffer> keep_;   // stable addresses
+  std::deque<LoomBuffer> keep_;  // stable addresses
   std::map<std::string, LoomExecutable> exes_;
   std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> rw_;
   std::map<std::string, std::uint32_t> grid_;

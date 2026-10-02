@@ -25,8 +25,7 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--stdin") {
-        text.assign(std::istreambuf_iterator<char>(std::cin),
-                    std::istreambuf_iterator<char>());
+        text.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
       } else if (arg == "--no-special") {
         options.parse_special_tokens = false;
       } else if (arg == "--add-bos") {

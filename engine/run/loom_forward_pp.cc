@@ -27,22 +27,23 @@
 //
 // outputs: <out-prefix>.logits (vocab f32, last token) and <out-prefix>.hidden
 //          (B x 5120 f32, token major)
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <algorithm>
-#include <chrono>
-#include <cmath>
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <string>
 #include <utility>
 #include <vector>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include "core/config.hpp"
 #include "core/gguf.hpp"
@@ -75,29 +76,60 @@ constexpr std::uint32_t kVocab = 248320;
 // One KV slot per prompt token per layer.
 constexpr std::uint32_t kKvRow = kKvHeads * kHeadDim;  // 1024
 
-const float kKvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
-                            1, 13, 25, 38, 53, 69, 89, 113};
+const float kKvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
-struct Fmt { const char* name; std::uint32_t qk; };
+struct Fmt {
+  const char* name;
+  std::uint32_t qk;
+};
 bool FmtOf(std::uint32_t type, Fmt* out) {
   switch (type) {
-    case 12: *out = {"q4k", 256}; return true;
-    case 13: *out = {"q5k", 256}; return true;
-    case 14: *out = {"q6k", 256}; return true;
-    case 11: *out = {"q3k", 256}; return true;
-    case 23: *out = {"iq4xs", 256}; return true;
-    case 21: *out = {"iq3s", 256}; return true;
-    case 18: *out = {"iq3xxs", 256}; return true;
-    case 20: *out = {"iq4nl", 32}; return true;
-    case 17: *out = {"iq2xs", 256}; return true;
-    case 8: *out = {"q8_0", 32}; return true;
-    case 16: *out = {"iq2xxs", 256}; return true;
-    case 10: *out = {"q2k", 256}; return true;
-    default: return false;
+    case 12:
+      *out = {"q4k", 256};
+      return true;
+    case 13:
+      *out = {"q5k", 256};
+      return true;
+    case 14:
+      *out = {"q6k", 256};
+      return true;
+    case 11:
+      *out = {"q3k", 256};
+      return true;
+    case 23:
+      *out = {"iq4xs", 256};
+      return true;
+    case 21:
+      *out = {"iq3s", 256};
+      return true;
+    case 18:
+      *out = {"iq3xxs", 256};
+      return true;
+    case 20:
+      *out = {"iq4nl", 32};
+      return true;
+    case 17:
+      *out = {"iq2xs", 256};
+      return true;
+    case 8:
+      *out = {"q8_0", 32};
+      return true;
+    case 16:
+      *out = {"iq2xxs", 256};
+      return true;
+    case 10:
+      *out = {"q2k", 256};
+      return true;
+    default:
+      return false;
   }
 }
 
-struct Imported { hrx_buffer_t handle; std::size_t offset; std::size_t bytes; };
+struct Imported {
+  hrx_buffer_t handle;
+  std::size_t offset;
+  std::size_t bytes;
+};
 
 std::uint32_t g_b = 0;   // prompt tokens in this run
 std::uint32_t g_tt = 0;  // GEMM token tiles = g_b / g_gtile
@@ -111,16 +143,14 @@ std::uint32_t g_tt = 0;  // GEMM token tiles = g_b / g_gtile
 // must not mirror the arithmetic in C."
 std::uint32_t g_gtile = kTile;  // fallback GEMM tile when dispatch.txt says nothing
 
-void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
-              std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
-              std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
+void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name, std::uint32_t gx, std::uint32_t gy,
+              std::uint32_t gz, std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
               const std::vector<hrx_buffer_ref_t>& b) {
   // The executable's own workgroup size is authoritative; sx is only the
   // fallback for metadata that does not carry one.
   const std::uint32_t ordinal = exe.OrdinalOrZero(name);
   const std::uint32_t ws = exe.WorkgroupSize(ordinal);
-  gpu.Dispatch(exe, ordinal, LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz),
-               nullptr, 0, b.data(), b.size());
+  gpu.Dispatch(exe, ordinal, LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz), nullptr, 0, b.data(), b.size());
 }
 
 // The launch geometry each GEMM HAL was compiled for, read from
@@ -133,9 +163,9 @@ void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
 // "Launch geometry is not public stage configuration ... stage authoring code
 // must not mirror the arithmetic in C."
 struct Geom {
-  std::uint32_t tokens;   // tokens per workgroup = grid y divisor
-  std::uint32_t rowgrp;   // 16-row tiles per workgroup = grid x divisor
-  std::uint32_t tt;       // token_tiles the emitter bound into this HAL
+  std::uint32_t tokens;  // tokens per workgroup = grid y divisor
+  std::uint32_t rowgrp;  // 16-row tiles per workgroup = grid x divisor
+  std::uint32_t tt;      // token_tiles the emitter bound into this HAL
 };
 std::map<std::string, Geom> g_geom;
 
@@ -151,13 +181,11 @@ void LoadDispatch(const std::string& dir) {
 // for a different token count would otherwise compute a silent subset.
 Geom GeomOf(const std::string& hal, std::uint32_t B) {
   const auto it = g_geom.find(hal);
-  if (it == g_geom.end())
-    return Geom{kTile, 1, static_cast<std::uint32_t>(B / kTile)};
+  if (it == g_geom.end()) return Geom{kTile, 1, static_cast<std::uint32_t>(B / kTile)};
   const Geom g = it->second;
   if (g.tokens == 0 || g.rowgrp == 0 || B % g.tokens != 0 || B / g.tokens != g.tt) {
-    std::fprintf(stderr,
-                 "%s: emitted for tile=%u rowgrp=%u token_tiles=%u, but B=%u gives %u tiles\n",
-                 hal.c_str(), g.tokens, g.rowgrp, g.tt, B, B / g.tokens);
+    std::fprintf(stderr, "%s: emitted for tile=%u rowgrp=%u token_tiles=%u, but B=%u gives %u tiles\n", hal.c_str(),
+                 g.tokens, g.rowgrp, g.tt, B, B / g.tokens);
     std::exit(3);
   }
   return g;
@@ -165,11 +193,20 @@ Geom GeomOf(const std::string& hal, std::uint32_t B) {
 
 void ReadFile(const char* path, void* dst, std::size_t bytes) {
   FILE* f = std::fopen(path, "rb");
-  if (!f) { std::fprintf(stderr, "cannot open %s\n", path); std::exit(1); }
-  if (std::fread(dst, 1, bytes, f) != bytes) { std::exit(1); }
+  if (!f) {
+    std::fprintf(stderr, "cannot open %s\n", path);
+    std::exit(1);
+  }
+  if (std::fread(dst, 1, bytes, f) != bytes) {
+    std::exit(1);
+  }
   std::fclose(f);
 }
-float Half(const std::uint8_t* p) { _Float16 h; std::memcpy(&h, p, 2); return (float)h; }
+float Half(const std::uint8_t* p) {
+  _Float16 h;
+  std::memcpy(&h, p, 2);
+  return (float)h;
+}
 
 void DequantQ4KRow(const std::uint8_t* base, std::uint64_t row, float* out) {
   const std::uint32_t nb = kHidden / 256;
@@ -177,7 +214,8 @@ void DequantQ4KRow(const std::uint8_t* base, std::uint64_t row, float* out) {
   for (std::uint32_t b = 0; b < nb; ++b) {
     const std::uint8_t* blk = p + b * 144;
     const float d = Half(blk), dmin = Half(blk + 2);
-    const std::uint8_t* sc = blk + 4; const std::uint8_t* qs = blk + 16;
+    const std::uint8_t* sc = blk + 4;
+    const std::uint8_t* qs = blk + 16;
     for (std::uint32_t i = 0; i < 256; ++i) {
       const std::uint32_t gg = i / 64, wv = i % 64, lane = wv % 32;
       const bool low = wv < 32;
@@ -185,9 +223,13 @@ void DequantQ4KRow(const std::uint8_t* base, std::uint64_t row, float* out) {
       const std::uint32_t quant = low ? (qb & 15) : (qb >> 4);
       const std::uint32_t j = 2 * gg + (low ? 0 : 1);
       std::uint32_t s, m;
-      if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
-      else { s = (sc[j + 4] & 15) | ((sc[j - 4] >> 6) << 4);
-             m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
+      if (j < 4) {
+        s = sc[j] & 63;
+        m = sc[j + 4] & 63;
+      } else {
+        s = (sc[j + 4] & 15) | ((sc[j - 4] >> 6) << 4);
+        m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+      }
       out[b * 256 + i] = d * (float)s * (float)quant - dmin * (float)m;
     }
   }
@@ -200,7 +242,8 @@ void DequantIq4XsRow(const std::uint8_t* base, std::uint64_t row, float* out) {
     const std::uint8_t* blk = p + b * 136;
     const float d = Half(blk);
     const std::uint32_t sh = blk[2] | (blk[3] << 8);
-    const std::uint8_t* sl = blk + 4; const std::uint8_t* qs = blk + 8;
+    const std::uint8_t* sl = blk + 4;
+    const std::uint8_t* qs = blk + 8;
     for (std::uint32_t g = 0; g < 8; ++g) {
       const std::uint32_t sc = ((sl[g / 2] >> (4 * (g % 2))) & 15) | (((sh >> (2 * g)) & 3) << 4);
       const float dl = d * (float)((int)sc - 32);
@@ -261,7 +304,8 @@ int main(int argc, char** argv) {
     if (const auto it = g_geom.find("ctx"); it != g_geom.end()) {
       T_ctx = it->second.tt;
       if (T_run > T_ctx || T_run % it->second.tokens) {
-        std::fprintf(stderr, "chunked set: tokens=%u must be a multiple of the chunk %u and at most the emitted context %u\n",
+        std::fprintf(stderr,
+                     "chunked set: tokens=%u must be a multiple of the chunk %u and at most the emitted context %u\n",
                      T_run, it->second.tokens, T_ctx);
         return 2;
       }
@@ -286,9 +330,8 @@ int main(int argc, char** argv) {
     // The layers queue ~950 dispatches and wait once at the end; the runtime
     // wait would busy-poll a core for the whole prefill (LOOM_RUNTIME.md).
     gpu.SetSleepSync(200);
-    std::fprintf(stderr,
-                 "loom_forward_pp: tokens=%u tile=%u token_tiles=%u layers=%u geometry=%zu hal(s)\n",
-                 B, g_gtile, g_tt, cfg.main_block_count(), g_geom.size());
+    std::fprintf(stderr, "loom_forward_pp: tokens=%u tile=%u token_tiles=%u layers=%u geometry=%zu hal(s)\n", B,
+                 g_gtile, g_tt, cfg.main_block_count(), g_geom.size());
     // Import the whole GGUF tensor-data region once: every tensor is an offset
     // into it, instead of one hrx_allocator_import_buffer per dispatch.
     LoomBuffer weights;
@@ -302,8 +345,7 @@ int main(int argc, char** argv) {
       weights = gpu.Import(reinterpret_cast<void*>(start), wbytes);
     }
     auto ImportTensor = [&](const yah::core::TensorInfo& t) -> Imported {
-      return {weights.handle, weights_delta + static_cast<std::size_t>(t.offset),
-              static_cast<std::size_t>(t.bytes)};
+      return {weights.handle, weights_delta + static_cast<std::size_t>(t.offset), static_cast<std::size_t>(t.bytes)};
     };
     std::map<std::string, LoomExecutable> exes;
     auto load = [&](const std::string& path) -> LoomExecutable& {
@@ -322,12 +364,36 @@ int main(int argc, char** argv) {
     LoomBuffer grid_iq2xxs = gpu.Allocate(std::size_t{512} * 4);
     LoomBuffer grid_iq2xs = gpu.Allocate(std::size_t{1024} * 4);
     LoomBuffer ksigns_iq2xxs = gpu.Allocate(std::size_t{128});
-    { std::vector<std::uint8_t> v(512 * 4); ReadFile((dir + "/grid_iq3s.bin").c_str(), v.data(), v.size()); gpu.H2D(grid_iq3s, v.data(), v.size()); }
-    { std::vector<std::uint8_t> v(256 * 4); ReadFile((dir + "/grid_iq3xxs.bin").c_str(), v.data(), v.size()); gpu.H2D(grid_iq3xxs, v.data(), v.size()); }
-    { std::vector<std::uint8_t> v(128); ReadFile((dir + "/ksigns_iq3xxs.bin").c_str(), v.data(), v.size()); gpu.H2D(ksigns_iq3xxs, v.data(), v.size()); }
-    { std::vector<std::uint8_t> v(512 * 4); ReadFile((dir + "/grid_iq2xxs.bin").c_str(), v.data(), v.size()); gpu.H2D(grid_iq2xxs, v.data(), v.size()); }
-    { std::vector<std::uint8_t> v(1024 * 4); ReadFile((dir + "/grid_iq2xs.bin").c_str(), v.data(), v.size()); gpu.H2D(grid_iq2xs, v.data(), v.size()); }
-    { std::vector<std::uint8_t> v(128); ReadFile((dir + "/ksigns_iq2xxs.bin").c_str(), v.data(), v.size()); gpu.H2D(ksigns_iq2xxs, v.data(), v.size()); }
+    {
+      std::vector<std::uint8_t> v(512 * 4);
+      ReadFile((dir + "/grid_iq3s.bin").c_str(), v.data(), v.size());
+      gpu.H2D(grid_iq3s, v.data(), v.size());
+    }
+    {
+      std::vector<std::uint8_t> v(256 * 4);
+      ReadFile((dir + "/grid_iq3xxs.bin").c_str(), v.data(), v.size());
+      gpu.H2D(grid_iq3xxs, v.data(), v.size());
+    }
+    {
+      std::vector<std::uint8_t> v(128);
+      ReadFile((dir + "/ksigns_iq3xxs.bin").c_str(), v.data(), v.size());
+      gpu.H2D(ksigns_iq3xxs, v.data(), v.size());
+    }
+    {
+      std::vector<std::uint8_t> v(512 * 4);
+      ReadFile((dir + "/grid_iq2xxs.bin").c_str(), v.data(), v.size());
+      gpu.H2D(grid_iq2xxs, v.data(), v.size());
+    }
+    {
+      std::vector<std::uint8_t> v(1024 * 4);
+      ReadFile((dir + "/grid_iq2xs.bin").c_str(), v.data(), v.size());
+      gpu.H2D(grid_iq2xs, v.data(), v.size());
+    }
+    {
+      std::vector<std::uint8_t> v(128);
+      ReadFile((dir + "/ksigns_iq2xxs.bin").c_str(), v.data(), v.size());
+      gpu.H2D(ksigns_iq2xxs, v.data(), v.size());
+    }
 
     // Every activation buffer is token major: [token][row], with the row stride
     // equal to the K extent of the GEMM that reads it (k_blocks*256). The KV
@@ -379,19 +445,34 @@ int main(int argc, char** argv) {
     LoomBuffer token = gpu.Allocate(4);
 
     const auto hb = [](const LoomBuffer& b) { return b.size; };
-    const float epsv = 1.0e-6f; gpu.H2D(eps, &epsv, 4);
-    { std::vector<std::uint8_t> z(std::size_t{48} * kQkv * 4 * 4, 0); gpu.H2D(conv_state, z.data(), z.size()); }
-    { std::vector<std::uint8_t> z(std::size_t{48} * kTs * kState * kState * 4, 0); gpu.H2D(state, z.data(), z.size()); }
-    { std::vector<std::uint8_t> z(kv16_scratch ? 2 * kKv16Layer : std::size_t{2} * kFull * kKvCache * 2, 0); gpu.H2D(kv16, z.data(), z.size()); }
-    { std::vector<std::uint8_t> z(static_cast<std::size_t>(B) * kHidden * 4, 0); gpu.H2D(reszero, z.data(), z.size()); }
+    const float epsv = 1.0e-6f;
+    gpu.H2D(eps, &epsv, 4);
+    {
+      std::vector<std::uint8_t> z(std::size_t{48} * kQkv * 4 * 4, 0);
+      gpu.H2D(conv_state, z.data(), z.size());
+    }
+    {
+      std::vector<std::uint8_t> z(std::size_t{48} * kTs * kState * kState * 4, 0);
+      gpu.H2D(state, z.data(), z.size());
+    }
+    {
+      std::vector<std::uint8_t> z(kv16_scratch ? 2 * kKv16Layer : std::size_t{2} * kFull * kKvCache * 2, 0);
+      gpu.H2D(kv16, z.data(), z.size());
+    }
+    {
+      std::vector<std::uint8_t> z(static_cast<std::size_t>(B) * kHidden * 4, 0);
+      gpu.H2D(reszero, z.data(), z.size());
+    }
     const auto* emb = find("token_embd.weight");
     std::vector<float> host_hidden(static_cast<std::size_t>(B) * kHidden);
     const std::uint8_t* emb_data = gguf.Data(*emb);
     const auto embed = [&](std::uint32_t chunk, LoomBuffer& dst) {
       for (std::uint32_t t = 0; t < B; ++t) {
         const std::uint32_t id = ids_all[std::size_t{chunk} * B + t];
-        if (static_cast<std::uint32_t>(emb->type) == 23) DequantIq4XsRow(emb_data, id, host_hidden.data() + std::size_t{t} * kHidden);
-        else DequantQ4KRow(emb_data, id, host_hidden.data() + std::size_t{t} * kHidden);
+        if (static_cast<std::uint32_t>(emb->type) == 23)
+          DequantIq4XsRow(emb_data, id, host_hidden.data() + std::size_t{t} * kHidden);
+        else
+          DequantQ4KRow(emb_data, id, host_hidden.data() + std::size_t{t} * kHidden);
       }
       gpu.H2D(dst, host_hidden.data(), host_hidden.size() * 4);
     };
@@ -404,7 +485,10 @@ int main(int argc, char** argv) {
     LoomExecutable* e_convkq = nullptr;
     {
       const std::string path = dir + "/convkq.hal";
-      if (FILE* f = std::fopen(path.c_str(), "rb")) { std::fclose(f); e_convkq = &load(path); }
+      if (FILE* f = std::fopen(path.c_str(), "rb")) {
+        std::fclose(f);
+        e_convkq = &load(path);
+      }
     }
     LoomExecutable& e_prepab = load(dir + "/prepab.hal");
     LoomExecutable& e_rowsplit = load(dir + "/rowsplit.hal");
@@ -512,10 +596,11 @@ int main(int argc, char** argv) {
     auto run_norm = [&](const std::string& wname) {
       const auto* tw = find(wname);
       const Imported w = ImportTensor(*tw);
-      std::vector<hrx_buffer_ref_t> b = {
-          {hidden.handle, 0, hb(hidden)}, {reszero.handle, 0, hb(reszero)},
-          {w.handle, w.offset, w.bytes}, {sumout.handle, 0, hb(sumout)},
-          {scratch.handle, 0, hb(scratch)}};
+      std::vector<hrx_buffer_ref_t> b = {{hidden.handle, 0, hb(hidden)},
+                                         {reszero.handle, 0, hb(reszero)},
+                                         {w.handle, w.offset, w.bytes},
+                                         {sumout.handle, 0, hb(sumout)},
+                                         {scratch.handle, 0, hb(scratch)}};
       Dispatch(gpu, e_norm, "yah_half_norm", B, 1, 1, 32, 1, 1, b);
     };
     auto run_kstore = [&](const std::string& wname, const LoomBuffer& out) {
@@ -525,8 +610,8 @@ int main(int argc, char** argv) {
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
       const Imported w = ImportTensor(*tw);
-      const std::string hal = std::string("gemm_kstore_") + f.name + "_" +
-                              std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
+      const std::string hal =
+          std::string("gemm_kstore_") + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
       const Geom gm = GeomOf(hal, B);
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
@@ -534,13 +619,14 @@ int main(int argc, char** argv) {
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
       if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
       if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
-      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
+      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs"))
+        b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
       b.push_back({scratch.handle, 0, hb(scratch)});
       b.push_back({wstage.handle, 0, hb(wstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
       b.push_back({out.handle, 0, hb(out)});
-      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name)).c_str(),
-               mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1, b);
+      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name)).c_str(), mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1,
+               b);
     };
     // The attention q projection with the q/gate unpack fused into its epilogue
     // (gemm_kqg_*: rows = heads x [256 q | 256 gate] stored straight into q and
@@ -555,8 +641,8 @@ int main(int argc, char** argv) {
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) return false;
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
-      const std::string hal = std::string("gemm_kqg_") + f.name + "_" +
-                              std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
+      const std::string hal =
+          std::string("gemm_kqg_") + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       if (g_geom.find(hal) == g_geom.end()) return false;
       const Imported w = ImportTensor(*tw);
       LoomExecutable& exe = load(dir + "/" + hal);
@@ -566,14 +652,15 @@ int main(int argc, char** argv) {
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
       if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
       if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
-      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
+      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs"))
+        b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
       b.push_back({scratch.handle, 0, hb(scratch)});
       b.push_back({wstage.handle, 0, hb(wstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
       b.push_back({q.handle, 0, hb(q)});
       b.push_back({gate.handle, 0, hb(gate)});
-      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_kqg").c_str(),
-               mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1, b);
+      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_kqg").c_str(), mt / gm.rowgrp, B / gm.tokens, 1, 32,
+               1, 1, b);
       return true;
     };
     auto run_swiglu = [&](const std::string& wname) {
@@ -583,8 +670,8 @@ int main(int argc, char** argv) {
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
       const Imported w = ImportTensor(*tw);
-      const std::string hal = std::string("gemm_swiglu_") + f.name + "_" +
-                              std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
+      const std::string hal =
+          std::string("gemm_swiglu_") + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
       const Geom gm = GeomOf(hal, B);
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
@@ -592,14 +679,15 @@ int main(int argc, char** argv) {
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
       if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
       if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
-      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
+      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs"))
+        b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
       b.push_back({scratch.handle, 0, hb(scratch)});
       b.push_back({gateffn.handle, 0, hb(gateffn)});
       b.push_back({uwstage.handle, 0, hb(uwstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
       b.push_back({ffnup.handle, 0, hb(ffnup)});
-      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(),
-               mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1, b);
+      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(), mt / gm.rowgrp, B / gm.tokens, 1,
+               32, 1, 1, b);
     };
     auto run_residual = [&](const std::string& wname, const LoomBuffer& input) {
       const auto* tw = find(wname);
@@ -612,8 +700,8 @@ int main(int argc, char** argv) {
       // writes hidden + acc into hidden2 itself, so neither the partial buffer nor
       // the yah_residual_1d pass is needed; the handles are swapped after.
       // Taken whenever the HAL set carries one.
-      const std::string fused_hal = std::string("gemm_kres_") + f.name + "_" +
-                                    std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
+      const std::string fused_hal =
+          std::string("gemm_kres_") + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       if (g_geom.count(fused_hal)) {
         LoomExecutable& fx = load(dir + "/" + fused_hal);
         const Geom fg = GeomOf(fused_hal, B);
@@ -622,21 +710,22 @@ int main(int argc, char** argv) {
         if (f.name == std::string("iq3xxs")) fb.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
         if (f.name == std::string("iq2xxs")) fb.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
         if (f.name == std::string("iq2xs")) fb.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
-        if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) fb.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
+        if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs"))
+          fb.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
         fb.push_back({input.handle, 0, hb(input)});
         fb.push_back({hidden.handle, 0, hb(hidden)});
         fb.push_back({wstage.handle, 0, hb(wstage)});
         fb.push_back({ostage.handle, 0, hb(ostage)});
         fb.push_back({hidden2.handle, 0, hb(hidden2)});
-        Dispatch(gpu, fx, (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(),
-                 mt / fg.rowgrp, B / fg.tokens, 1, 32, 1, 1, fb);
+        Dispatch(gpu, fx, (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(), mt / fg.rowgrp, B / fg.tokens, 1,
+                 32, 1, 1, fb);
         std::swap(hidden, hidden2);
         return;
       }
       // Otherwise the chained kStore writes the token-major [B][m_rows] product
       // into partial and yah_residual_1d adds it into the residual.
-      const std::string hal = std::string("gemm_kstore_") + f.name + "_" + std::to_string(mt) + "_" +
-                              std::to_string(kb) + ".hal";
+      const std::string hal =
+          std::string("gemm_kstore_") + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
       const Geom gm = GeomOf(hal, B);
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
@@ -644,7 +733,8 @@ int main(int argc, char** argv) {
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
       if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
       if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
-      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
+      if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs"))
+        b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
       // The activation is the caller's input (ffnup for ffn_down, scratch for attn_output / ssm_out), not scratch as in run_kstore.
       b.push_back({input.handle, 0, hb(input)});
       b.push_back({wstage.handle, 0, hb(wstage)});
@@ -687,10 +777,13 @@ int main(int argc, char** argv) {
       if (const char* pf = std::getenv("YAH_ROWSTATS_POS")) {
         std::ifstream pfs(pf);
         std::uint32_t pp;
-        while (pfs >> pp) if (pp < T_ctx) rs_want[pp] = 1;
+        while (pfs >> pp)
+          if (pp < T_ctx) rs_want[pp] = 1;
       } else {
-        const std::uint32_t rs_from = std::getenv("YAH_ROWSTATS_FROM") ? std::atoi(std::getenv("YAH_ROWSTATS_FROM")) : 1024;
-        const std::uint32_t rs_stride = std::getenv("YAH_ROWSTATS_STRIDE") ? std::atoi(std::getenv("YAH_ROWSTATS_STRIDE")) : 8;
+        const std::uint32_t rs_from =
+            std::getenv("YAH_ROWSTATS_FROM") ? std::atoi(std::getenv("YAH_ROWSTATS_FROM")) : 1024;
+        const std::uint32_t rs_stride =
+            std::getenv("YAH_ROWSTATS_STRIDE") ? std::atoi(std::getenv("YAH_ROWSTATS_STRIDE")) : 8;
         for (std::uint32_t pp = rs_from; pp < T_ctx; pp += rs_stride) rs_want[pp] = 1;
       }
     }
@@ -746,9 +839,13 @@ int main(int argc, char** argv) {
       if (hook_qstride)
         for (std::uint32_t r = 0; r < B; ++r)
           if ((first + r) % hook_qstride == 0) qpos.push_back(r);
-      const std::int32_t hdr[7] = {0x4b56484b, static_cast<std::int32_t>(ai), static_cast<std::int32_t>(ci),
-                                   static_cast<std::int32_t>(first), static_cast<std::int32_t>(B),
-                                   static_cast<std::int32_t>(cols), static_cast<std::int32_t>(qpos.size())};
+      const std::int32_t hdr[7] = {0x4b56484b,
+                                   static_cast<std::int32_t>(ai),
+                                   static_cast<std::int32_t>(ci),
+                                   static_cast<std::int32_t>(first),
+                                   static_cast<std::int32_t>(B),
+                                   static_cast<std::int32_t>(cols),
+                                   static_cast<std::int32_t>(qpos.size())};
       std::fwrite(hdr, 4, 7, hook_in);
       std::fwrite(kk.data(), 1, bytes, hook_in);
       std::fwrite(vv.data(), 1, bytes, hook_in);
@@ -768,283 +865,295 @@ int main(int argc, char** argv) {
       gpu.H2D(kv16, vv.data(), bytes, voff + first * cols * 2);
     };
     for (std::uint32_t ci = 0; ci < n_chunks; ++ci) {
-    if (ci) {
-      gpu.Synchronize();   // host_hidden is reused by the next embed
-      embed(ci, hidden);
-    }
-    LoomExecutable& e_rope = *e_ropes[ci];
-    LoomExecutable& e_wmma = *e_wmmas[ci];
-    for (std::uint32_t l = 0; l < cfg.main_block_count(); ++l) {
-      const std::string pre = "blk." + std::to_string(l) + ".";
-      const bool full = cfg.IsFullAttention(l);
-      run_norm(pre + "attn_norm.weight");
-      if (full) {
-        const std::uint32_t ai = l / cfg.full_attention_interval;
-        const bool qg_fused = run_kqg(pre + "attn_q.weight");
-        if (!qg_fused) run_kstore(pre + "attn_q.weight", qkv);
-        run_kstore(pre + "attn_k.weight", kbuf);
-        run_kstore(pre + "attn_v.weight", vbuf);
-        if (!qg_fused) {
-          std::vector<hrx_buffer_ref_t> b = {
-              {qkv.handle, 0, hb(qkv)},
-              {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)}};
-          Dispatch(gpu, e_unpack, "yah_unpack_qg", 24, B, 1, 256, 1, 1, b);
-        }
-        const auto* qn = find(pre + "attn_q_norm.weight");
-        const auto* kn = find(pre + "attn_k_norm.weight");
-        const Imported w_qn = ImportTensor(*qn);
-        const Imported w_kn = ImportTensor(*kn);
-        if (ai >= kFull) throw LoomError("full-attention layer index past the KV slot count");
-        const std::size_t koff = kv16_scratch ? 0 : std::size_t{ai} * kKvCache * 2;
-        const std::size_t voff = kv16_scratch ? kKv16Layer : std::size_t{kFull} * kKvCache * 2 + koff;
-        {
-          std::vector<hrx_buffer_ref_t> b = {
-              {q.handle, 0, hb(q)}, {kbuf.handle, 0, hb(kbuf)},
-              {vbuf.handle, 0, hb(vbuf)}, {w_qn.handle, w_qn.offset, w_qn.bytes},
-              {w_kn.handle, w_kn.offset, w_kn.bytes}, {q.handle, 0, hb(q)},
-              {kbuf.handle, 0, hb(kbuf)}, {kc32.handle, 0, hb(kc32)},
-              {vc32.handle, 0, hb(vc32)},
-              rope_kpaged ? hrx_buffer_ref_t{kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
-                          : hrx_buffer_ref_t{kv16.handle, koff, kKv16Layer},
-              {kv16.handle, voff, kKv16Layer},
-              {eps.handle, 0, 4}};
-          if (rope_kpaged) b.push_back(ptab_ref);
-          Dispatch(gpu, e_rope, "yah_fused_qk_rope_batched", 28, B, 1, 256, 1, 1, b);
-        }
-        kv_hook(ai, ci, koff, voff);
-        // w_qn/w_kn are views into the import; nothing to keep alive.
-        const std::size_t q8off = std::size_t{ai} * kKqBytes;
-        const std::size_t ksoff = std::size_t{ai} * kKsBytes;
-        const std::size_t kmoff = std::size_t{ai} * 4096;
-        const std::size_t first = std::size_t{ci} * B;          // this chunk's first cache row
-        const std::size_t f16rows = std::size_t{B} * kKvRow * 2;  // the chunk's f16 K or V rows
-        const std::size_t f16first = kv16_scratch ? 0 : first * kKvRow * 2;
-        if (attn_kq8) {
-          const std::size_t qrow = kKqBytes / T_ctx, srow = kKsBytes / T_ctx;
-          if (ci == 0) {   // channel mean of the first chunk, kept for the later ones
-            std::vector<hrx_buffer_ref_t> b = {{kv16.handle, koff, f16rows}, {kmbuf.handle, kmoff, 4096}};
-            Dispatch(gpu, *e_kmean, "yah_kmean", 4, 1, 1, 256, 1, 1, b);
-          }
-          std::vector<hrx_buffer_ref_t> b = {
-              {kv16.handle, koff + f16first, f16rows}, {kmbuf.handle, kmoff, 4096},
-              {kq8buf.handle, q8off + first * qrow, B * qrow}, {ksbuf.handle, ksoff + first * srow, B * srow}};
-          if (kv_paged) {   // whole-layer pools, rows placed through the page table
-            b[2] = {kq8buf.handle, q8off, kKqBytes};
-            b[3] = {ksbuf.handle, ksoff, kKsBytes};
-            b.push_back(ptab_ref);
-          }
-          Dispatch(gpu, kv_paged ? *e_kq8s[ci] : *e_kq8, attn_kq4 ? "yah_kq4" : "yah_kq8", (B + 1) / 2, 1, 1, 256, 1, 1, b);
-        }
-        const std::size_t vqoff = std::size_t{ai} * kVqBytes, vqsoff = std::size_t{ai} * kVqsBytes;
-        if (attn_vqt) {
-          std::vector<hrx_buffer_ref_t> b = {
-              {kv16.handle, voff + f16first, f16rows}, {vqbuf.handle, vqoff, kVqBytes},
-              {vqsbuf.handle, vqsoff, kVqsBytes}};
-          if (kv_paged) b.push_back(ptab_ref);
-          Dispatch(gpu, *e_vqs[ci], attn_vq8 ? "yah_vq8" : "yah_vq4", 4, (B + 15) / 16, 1, 256, 1, 1, b);
-        } else if (paged_f16v) {
-          std::vector<hrx_buffer_ref_t> b = {
-              {kv16.handle, voff, f16rows}, {vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}, ptab_ref};
-          Dispatch(gpu, *e_vtpages[ci], "yah_vtpage", 32, (B + 31) / 32, 1, 256, 1, 1, b);
-        } else if (e_vtrans) {
-          std::vector<hrx_buffer_ref_t> b = {
-              {kv16.handle, voff, kKvCache * 2}, {vt16.handle, 0, kVtBytes}};
-          Dispatch(gpu, *e_vtrans, "yah_transpose_v16", 32, (T_ctx + 31) / 32, 1, 256, 1, 1, b);
-        }
-        {
-          std::vector<hrx_buffer_ref_t> b = {
-              {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)},
-              attn_kq8 ? hrx_buffer_ref_t{kq8buf.handle, q8off, kKqBytes}
-              : paged_f16k ? hrx_buffer_ref_t{kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
-                           : hrx_buffer_ref_t{kv16.handle, koff, kKvCache * 2},
-              attn_vqt ? hrx_buffer_ref_t{vqbuf.handle, vqoff, kVqBytes}
-              : paged_f16v ? hrx_buffer_ref_t{vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
-              : e_vtrans ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
-                         : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
-              {attn_f16 ? scratch.handle : aout.handle, 0, attn_f16 ? hb(scratch) : hb(aout)}, {lse.handle, 0, hb(lse)}};
-          if (attn_kq8) b.push_back({ksbuf.handle, ksoff, kKsBytes});
-          if (attn_vqt) b.push_back({vqsbuf.handle, vqsoff, kVqsBytes});
-          if (kv_paged) b.push_back(ptab_ref);
-          // tools/gen_attn_heads.py runs H query heads of one GQA group per
-          // workgroup; dispatch.txt records H as the "wmma.hal" row group.
-          const auto attn_geom = g_geom.find("wmma.hal");
-          const std::uint32_t attn_hpw =
-              attn_geom != g_geom.end() && attn_geom->second.rowgrp ? attn_geom->second.rowgrp : 1;
-          if (kHeads % attn_hpw) throw LoomError("wmma.hal heads per workgroup does not divide the heads");
-          // query tokens per workgroup: 16 (gen_attn_heads) or 32 (gen_attn_hip)
-          const std::uint32_t attn_tpw =
-              attn_geom != g_geom.end() && attn_geom->second.tokens ? attn_geom->second.tokens : 16;
-          // The kernel's launch contract fixes its grid, and Loom drops bounds
-          // clamps it proves from it: extra workgroups read unmapped VA and hang
-          // the ring. Refuse a grid the emitter did not record.
-          if (attn_geom != g_geom.end() && attn_geom->second.tt &&
-              (B + attn_tpw - 1) / attn_tpw != attn_geom->second.tt)
-            throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
-          // gen_attn_fa with GQA packing runs 12-wave workgroups ("attn_wg384")
-          const std::uint32_t attn_wg = g_geom.count("attn_wg384") ? 384 : 256;
-          Dispatch(gpu, e_wmma, "yah_attn_wmma", (B + attn_tpw - 1) / attn_tpw, kHeads / attn_hpw, 1, attn_wg, 1, 1,
-                   b);
-        }
-        if (!attn_f16) {
-          std::vector<hrx_buffer_ref_t> b = {
-              {aout.handle, 0, hb(aout)}, {scratch.handle, 0, hb(scratch)}};
-          Dispatch(gpu, e_cast, "yah_half_cast", 24 * B, 1, 1, 256, 1, 1, b);
-        }
-        run_residual(pre + "attn_output.weight", scratch);
-      } else {
-        const std::uint32_t si = l - l / cfg.full_attention_interval;
-        run_kstore(pre + "attn_qkv.weight", qkv);
-        run_kstore(pre + "attn_gate.weight", gate);
-        run_kstore(pre + "ssm_alpha.weight", alpha);
-        run_kstore(pre + "ssm_beta.weight", beta);
-        const auto* convw = find(pre + "ssm_conv1d.weight");
-        const Imported w_conv = ImportTensor(*convw);
-        const auto* ta = find(pre + "ssm_a");
-        const auto* tdt = find(pre + "ssm_dt.bias");
-        const auto* tsn = find(pre + "ssm_norm.weight");
-        const Imported w_a = ImportTensor(*ta);
-        const Imported w_dt = ImportTensor(*tdt);
-        const Imported w_sn = ImportTensor(*tsn);
-        const std::size_t cs_off = std::size_t{si} * kQkv * 4 * 4;
-        const std::size_t st_off = std::size_t{si} * kTs * kState * kState * 4;
-        {
-          std::vector<hrx_buffer_ref_t> b = {
-              {qkv.handle, 0, hb(qkv)},
-              {w_conv.handle, w_conv.offset, w_conv.bytes},
-              {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
-              {conv_out.handle, 0, hb(conv_out)}};
-          if (e_convkq) {
-            b.push_back({kqbuf.handle, 0, hb(kqbuf)});
-            Dispatch(gpu, *e_convkq, "yah_ssm_conv_kq", 40, B, 1, 256, 1, 1, b);
-          } else {
-            Dispatch(gpu, e_conv, "yah_ssm_conv", 40, B, 1, 256, 1, 1, b);
-          }
-        }
-        if (e_convstate) {   // the next chunk's conv reads this chunk's last 3 inputs
-          std::vector<hrx_buffer_ref_t> b = {
-              {qkv.handle, 0, hb(qkv)}, {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4}};
-          Dispatch(gpu, *e_convstate, "yah_conv_state", (kQkv + 255) / 256, 1, 1, 256, 1, 1, b);
-        }
-        // w_conv is a view into the import; nothing to keep alive.
-        {
-          std::vector<hrx_buffer_ref_t> b = {
-              {conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)}};
-          if (!e_convkq) Dispatch(gpu, e_prepkq, "yah_deltanet_prep_kq", kKh, B, 1, 32, 1, 1, b);
-        }
-        {
-          std::vector<hrx_buffer_ref_t> b = {
-              {alpha.handle, 0, hb(alpha)}, {beta.handle, 0, hb(beta)},
-              {w_a.handle, w_a.offset, w_a.bytes}, {w_dt.handle, w_dt.offset, w_dt.bytes},
-              {qkv.handle, 0, hb(qkv)},
-              {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
-              {ab.handle, 0, hb(ab)}};
-          // The kernel's own grid is ceil((batch*num_heads + qkv_size)/256); it
-          // does two jobs over the same lane index -- the conv-history ring for
-          // i < qkv_size and alpha/beta for i < count -- so max() of the two is
-          // enough. The 5-token driver hardcoded 41, which silently covers only
-          // 10496 lanes: correct at 5..218 tokens, and at 2048 it would compute
-          // alpha/beta for 10496 of 98304 channels.
-          const std::uint32_t prebab_tiles = (std::max<std::uint32_t>(B * kTs, kQkv) + 255u) / 256u;
-          Dispatch(gpu, e_prepab, "yah_deltanet_prep_ab", prebab_tiles, 1, 1, 256, 1, 1, b);
-        }
-        // w_a/w_dt are views into the import; nothing to keep alive.
-        {
-          std::vector<hrx_buffer_ref_t> b = {
-              {conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)},
-              {ab.handle, 0, hb(ab)},
-              {state.handle, st_off, std::size_t{kTs} * kState * kState * 4},
-              {raw.handle, 0, hb(raw)}};
-          // tools/gen_deltanet_hip.py (HIP's row-split order) runs (2, heads)
-          // workgroups of 256; dispatch.txt says so with a "rowsplit.hal" row whose
-          // row-group field is the blocks per head. Without it: the regtile
-          // kernel's (heads) x 128.
-          const auto dn_geom = g_geom.find("rowsplit.hal");
-          if (dn_geom != g_geom.end() && dn_geom->second.rowgrp)
-            Dispatch(gpu, e_rowsplit, "yah_deltanet", dn_geom->second.rowgrp, kTs, 1, 256, 1, 1, b);
-          else
-            Dispatch(gpu, e_rowsplit, "yah_deltanet", kTs, 1, 1, 128, 1, 1, b);
-        }
-        {
-          std::vector<hrx_buffer_ref_t> b = {
-              {raw.handle, 0, hb(raw)}, {w_sn.handle, w_sn.offset, w_sn.bytes},
-              {gate.handle, 0, static_cast<std::size_t>(B) * kInner * 4},
-              {scratch.handle, 0, hb(scratch)}};
-          Dispatch(gpu, e_postnorm, "yah_ssm_postnorm_fp16", 6 * B, 1, 1, 256, 1, 1, b);
-        }
-        // w_sn is a view into the import; nothing to keep alive.
-        run_residual(pre + "ssm_out.weight", scratch);
+      if (ci) {
+        gpu.Synchronize();  // host_hidden is reused by the next embed
+        embed(ci, hidden);
       }
-      run_norm(pre + "post_attention_norm.weight");
-      run_kstore(pre + "ffn_gate.weight", gateffn);
-      run_swiglu(pre + "ffn_up.weight");
-      run_residual(pre + "ffn_down.weight", ffnup);
-    }
-    if (logits_from < T_run && std::size_t{ci + 1} * B > logits_from) {
-      const Imported wnorm = ImportTensor(*head_onw);
-      const Imported w = ImportTensor(*head_ow);
-      const std::uint32_t lo = std::max<std::uint32_t>(logits_from, ci * B);
-      for (std::uint32_t ra = lo; ra < (ci + 1) * B; ++ra) {
-        const std::uint32_t r = ra - ci * B;
-        {
-          std::vector<hrx_buffer_ref_t> b = {
-              {hidden.handle, std::size_t{r} * kHidden * 4, std::size_t{kHidden} * 4},
-              {wnorm.handle, wnorm.offset, wnorm.bytes}, {normed.handle, 0, hb(normed)}};
-          Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
-        }
-        std::vector<hrx_buffer_ref_t> b = {
-            {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
-            {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4}};
-        Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
-      }
-    }
-    if (rowstats) {
-      std::vector<std::uint32_t> rows;
-      for (std::uint32_t r = 0; r < B; ++r)
-        if (rs_want[std::size_t{ci} * B + r]) rows.push_back(r);
-      if (!rows.empty()) {
-        const Imported wnorm = ImportTensor(*head_onw);
-        const Imported w = ImportTensor(*head_ow);
-        for (std::size_t i = 0; i < rows.size(); ++i) {
+      LoomExecutable& e_rope = *e_ropes[ci];
+      LoomExecutable& e_wmma = *e_wmmas[ci];
+      for (std::uint32_t l = 0; l < cfg.main_block_count(); ++l) {
+        const std::string pre = "blk." + std::to_string(l) + ".";
+        const bool full = cfg.IsFullAttention(l);
+        run_norm(pre + "attn_norm.weight");
+        if (full) {
+          const std::uint32_t ai = l / cfg.full_attention_interval;
+          const bool qg_fused = run_kqg(pre + "attn_q.weight");
+          if (!qg_fused) run_kstore(pre + "attn_q.weight", qkv);
+          run_kstore(pre + "attn_k.weight", kbuf);
+          run_kstore(pre + "attn_v.weight", vbuf);
+          if (!qg_fused) {
+            std::vector<hrx_buffer_ref_t> b = {
+                {qkv.handle, 0, hb(qkv)}, {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)}};
+            Dispatch(gpu, e_unpack, "yah_unpack_qg", 24, B, 1, 256, 1, 1, b);
+          }
+          const auto* qn = find(pre + "attn_q_norm.weight");
+          const auto* kn = find(pre + "attn_k_norm.weight");
+          const Imported w_qn = ImportTensor(*qn);
+          const Imported w_kn = ImportTensor(*kn);
+          if (ai >= kFull) throw LoomError("full-attention layer index past the KV slot count");
+          const std::size_t koff = kv16_scratch ? 0 : std::size_t{ai} * kKvCache * 2;
+          const std::size_t voff = kv16_scratch ? kKv16Layer : std::size_t{kFull} * kKvCache * 2 + koff;
           {
             std::vector<hrx_buffer_ref_t> b = {
-                {hidden.handle, std::size_t{rows[i]} * kHidden * 4, std::size_t{kHidden} * 4},
-                {wnorm.handle, wnorm.offset, wnorm.bytes}, {normed.handle, 0, hb(normed)}};
+                {q.handle, 0, hb(q)},
+                {kbuf.handle, 0, hb(kbuf)},
+                {vbuf.handle, 0, hb(vbuf)},
+                {w_qn.handle, w_qn.offset, w_qn.bytes},
+                {w_kn.handle, w_kn.offset, w_kn.bytes},
+                {q.handle, 0, hb(q)},
+                {kbuf.handle, 0, hb(kbuf)},
+                {kc32.handle, 0, hb(kc32)},
+                {vc32.handle, 0, hb(vc32)},
+                rope_kpaged ? hrx_buffer_ref_t{kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
+                            : hrx_buffer_ref_t{kv16.handle, koff, kKv16Layer},
+                {kv16.handle, voff, kKv16Layer},
+                {eps.handle, 0, 4}};
+            if (rope_kpaged) b.push_back(ptab_ref);
+            Dispatch(gpu, e_rope, "yah_fused_qk_rope_batched", 28, B, 1, 256, 1, 1, b);
+          }
+          kv_hook(ai, ci, koff, voff);
+          // w_qn/w_kn are views into the import; nothing to keep alive.
+          const std::size_t q8off = std::size_t{ai} * kKqBytes;
+          const std::size_t ksoff = std::size_t{ai} * kKsBytes;
+          const std::size_t kmoff = std::size_t{ai} * 4096;
+          const std::size_t first = std::size_t{ci} * B;            // this chunk's first cache row
+          const std::size_t f16rows = std::size_t{B} * kKvRow * 2;  // the chunk's f16 K or V rows
+          const std::size_t f16first = kv16_scratch ? 0 : first * kKvRow * 2;
+          if (attn_kq8) {
+            const std::size_t qrow = kKqBytes / T_ctx, srow = kKsBytes / T_ctx;
+            if (ci == 0) {  // channel mean of the first chunk, kept for the later ones
+              std::vector<hrx_buffer_ref_t> b = {{kv16.handle, koff, f16rows}, {kmbuf.handle, kmoff, 4096}};
+              Dispatch(gpu, *e_kmean, "yah_kmean", 4, 1, 1, 256, 1, 1, b);
+            }
+            std::vector<hrx_buffer_ref_t> b = {{kv16.handle, koff + f16first, f16rows},
+                                               {kmbuf.handle, kmoff, 4096},
+                                               {kq8buf.handle, q8off + first * qrow, B * qrow},
+                                               {ksbuf.handle, ksoff + first * srow, B * srow}};
+            if (kv_paged) {  // whole-layer pools, rows placed through the page table
+              b[2] = {kq8buf.handle, q8off, kKqBytes};
+              b[3] = {ksbuf.handle, ksoff, kKsBytes};
+              b.push_back(ptab_ref);
+            }
+            Dispatch(gpu, kv_paged ? *e_kq8s[ci] : *e_kq8, attn_kq4 ? "yah_kq4" : "yah_kq8", (B + 1) / 2, 1, 1, 256, 1,
+                     1, b);
+          }
+          const std::size_t vqoff = std::size_t{ai} * kVqBytes, vqsoff = std::size_t{ai} * kVqsBytes;
+          if (attn_vqt) {
+            std::vector<hrx_buffer_ref_t> b = {{kv16.handle, voff + f16first, f16rows},
+                                               {vqbuf.handle, vqoff, kVqBytes},
+                                               {vqsbuf.handle, vqsoff, kVqsBytes}};
+            if (kv_paged) b.push_back(ptab_ref);
+            Dispatch(gpu, *e_vqs[ci], attn_vq8 ? "yah_vq8" : "yah_vq4", 4, (B + 15) / 16, 1, 256, 1, 1, b);
+          } else if (paged_f16v) {
+            std::vector<hrx_buffer_ref_t> b = {
+                {kv16.handle, voff, f16rows}, {vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}, ptab_ref};
+            Dispatch(gpu, *e_vtpages[ci], "yah_vtpage", 32, (B + 31) / 32, 1, 256, 1, 1, b);
+          } else if (e_vtrans) {
+            std::vector<hrx_buffer_ref_t> b = {{kv16.handle, voff, kKvCache * 2}, {vt16.handle, 0, kVtBytes}};
+            Dispatch(gpu, *e_vtrans, "yah_transpose_v16", 32, (T_ctx + 31) / 32, 1, 256, 1, 1, b);
+          }
+          {
+            std::vector<hrx_buffer_ref_t> b = {
+                {q.handle, 0, hb(q)},
+                {gate.handle, 0, hb(gate)},
+                attn_kq8     ? hrx_buffer_ref_t{kq8buf.handle, q8off, kKqBytes}
+                : paged_f16k ? hrx_buffer_ref_t{kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
+                             : hrx_buffer_ref_t{kv16.handle, koff, kKvCache * 2},
+                attn_vqt     ? hrx_buffer_ref_t{vqbuf.handle, vqoff, kVqBytes}
+                : paged_f16v ? hrx_buffer_ref_t{vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
+                : e_vtrans   ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
+                             : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
+                {attn_f16 ? scratch.handle : aout.handle, 0, attn_f16 ? hb(scratch) : hb(aout)},
+                {lse.handle, 0, hb(lse)}};
+            if (attn_kq8) b.push_back({ksbuf.handle, ksoff, kKsBytes});
+            if (attn_vqt) b.push_back({vqsbuf.handle, vqsoff, kVqsBytes});
+            if (kv_paged) b.push_back(ptab_ref);
+            // tools/gen_attn_heads.py runs H query heads of one GQA group per
+            // workgroup; dispatch.txt records H as the "wmma.hal" row group.
+            const auto attn_geom = g_geom.find("wmma.hal");
+            const std::uint32_t attn_hpw =
+                attn_geom != g_geom.end() && attn_geom->second.rowgrp ? attn_geom->second.rowgrp : 1;
+            if (kHeads % attn_hpw) throw LoomError("wmma.hal heads per workgroup does not divide the heads");
+            // query tokens per workgroup: 16 (gen_attn_heads) or 32 (gen_attn_hip)
+            const std::uint32_t attn_tpw =
+                attn_geom != g_geom.end() && attn_geom->second.tokens ? attn_geom->second.tokens : 16;
+            // The kernel's launch contract fixes its grid, and Loom drops bounds
+            // clamps it proves from it: extra workgroups read unmapped VA and hang
+            // the ring. Refuse a grid the emitter did not record.
+            if (attn_geom != g_geom.end() && attn_geom->second.tt &&
+                (B + attn_tpw - 1) / attn_tpw != attn_geom->second.tt)
+              throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
+            // gen_attn_fa with GQA packing runs 12-wave workgroups ("attn_wg384")
+            const std::uint32_t attn_wg = g_geom.count("attn_wg384") ? 384 : 256;
+            Dispatch(gpu, e_wmma, "yah_attn_wmma", (B + attn_tpw - 1) / attn_tpw, kHeads / attn_hpw, 1, attn_wg, 1, 1,
+                     b);
+          }
+          if (!attn_f16) {
+            std::vector<hrx_buffer_ref_t> b = {{aout.handle, 0, hb(aout)}, {scratch.handle, 0, hb(scratch)}};
+            Dispatch(gpu, e_cast, "yah_half_cast", 24 * B, 1, 1, 256, 1, 1, b);
+          }
+          run_residual(pre + "attn_output.weight", scratch);
+        } else {
+          const std::uint32_t si = l - l / cfg.full_attention_interval;
+          run_kstore(pre + "attn_qkv.weight", qkv);
+          run_kstore(pre + "attn_gate.weight", gate);
+          run_kstore(pre + "ssm_alpha.weight", alpha);
+          run_kstore(pre + "ssm_beta.weight", beta);
+          const auto* convw = find(pre + "ssm_conv1d.weight");
+          const Imported w_conv = ImportTensor(*convw);
+          const auto* ta = find(pre + "ssm_a");
+          const auto* tdt = find(pre + "ssm_dt.bias");
+          const auto* tsn = find(pre + "ssm_norm.weight");
+          const Imported w_a = ImportTensor(*ta);
+          const Imported w_dt = ImportTensor(*tdt);
+          const Imported w_sn = ImportTensor(*tsn);
+          const std::size_t cs_off = std::size_t{si} * kQkv * 4 * 4;
+          const std::size_t st_off = std::size_t{si} * kTs * kState * kState * 4;
+          {
+            std::vector<hrx_buffer_ref_t> b = {{qkv.handle, 0, hb(qkv)},
+                                               {w_conv.handle, w_conv.offset, w_conv.bytes},
+                                               {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
+                                               {conv_out.handle, 0, hb(conv_out)}};
+            if (e_convkq) {
+              b.push_back({kqbuf.handle, 0, hb(kqbuf)});
+              Dispatch(gpu, *e_convkq, "yah_ssm_conv_kq", 40, B, 1, 256, 1, 1, b);
+            } else {
+              Dispatch(gpu, e_conv, "yah_ssm_conv", 40, B, 1, 256, 1, 1, b);
+            }
+          }
+          if (e_convstate) {  // the next chunk's conv reads this chunk's last 3 inputs
+            std::vector<hrx_buffer_ref_t> b = {{qkv.handle, 0, hb(qkv)},
+                                               {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4}};
+            Dispatch(gpu, *e_convstate, "yah_conv_state", (kQkv + 255) / 256, 1, 1, 256, 1, 1, b);
+          }
+          // w_conv is a view into the import; nothing to keep alive.
+          {
+            std::vector<hrx_buffer_ref_t> b = {{conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)}};
+            if (!e_convkq) Dispatch(gpu, e_prepkq, "yah_deltanet_prep_kq", kKh, B, 1, 32, 1, 1, b);
+          }
+          {
+            std::vector<hrx_buffer_ref_t> b = {{alpha.handle, 0, hb(alpha)},
+                                               {beta.handle, 0, hb(beta)},
+                                               {w_a.handle, w_a.offset, w_a.bytes},
+                                               {w_dt.handle, w_dt.offset, w_dt.bytes},
+                                               {qkv.handle, 0, hb(qkv)},
+                                               {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
+                                               {ab.handle, 0, hb(ab)}};
+            // The kernel's own grid is ceil((batch*num_heads + qkv_size)/256); it
+            // does two jobs over the same lane index -- the conv-history ring for
+            // i < qkv_size and alpha/beta for i < count -- so max() of the two is
+            // enough. The 5-token driver hardcoded 41, which silently covers only
+            // 10496 lanes: correct at 5..218 tokens, and at 2048 it would compute
+            // alpha/beta for 10496 of 98304 channels.
+            const std::uint32_t prebab_tiles = (std::max<std::uint32_t>(B * kTs, kQkv) + 255u) / 256u;
+            Dispatch(gpu, e_prepab, "yah_deltanet_prep_ab", prebab_tiles, 1, 1, 256, 1, 1, b);
+          }
+          // w_a/w_dt are views into the import; nothing to keep alive.
+          {
+            std::vector<hrx_buffer_ref_t> b = {{conv_out.handle, 0, hb(conv_out)},
+                                               {kqbuf.handle, 0, hb(kqbuf)},
+                                               {ab.handle, 0, hb(ab)},
+                                               {state.handle, st_off, std::size_t{kTs} * kState * kState * 4},
+                                               {raw.handle, 0, hb(raw)}};
+            // tools/gen_deltanet_hip.py (HIP's row-split order) runs (2, heads)
+            // workgroups of 256; dispatch.txt says so with a "rowsplit.hal" row whose
+            // row-group field is the blocks per head. Without it: the regtile
+            // kernel's (heads) x 128.
+            const auto dn_geom = g_geom.find("rowsplit.hal");
+            if (dn_geom != g_geom.end() && dn_geom->second.rowgrp)
+              Dispatch(gpu, e_rowsplit, "yah_deltanet", dn_geom->second.rowgrp, kTs, 1, 256, 1, 1, b);
+            else
+              Dispatch(gpu, e_rowsplit, "yah_deltanet", kTs, 1, 1, 128, 1, 1, b);
+          }
+          {
+            std::vector<hrx_buffer_ref_t> b = {{raw.handle, 0, hb(raw)},
+                                               {w_sn.handle, w_sn.offset, w_sn.bytes},
+                                               {gate.handle, 0, static_cast<std::size_t>(B) * kInner * 4},
+                                               {scratch.handle, 0, hb(scratch)}};
+            Dispatch(gpu, e_postnorm, "yah_ssm_postnorm_fp16", 6 * B, 1, 1, 256, 1, 1, b);
+          }
+          // w_sn is a view into the import; nothing to keep alive.
+          run_residual(pre + "ssm_out.weight", scratch);
+        }
+        run_norm(pre + "post_attention_norm.weight");
+        run_kstore(pre + "ffn_gate.weight", gateffn);
+        run_swiglu(pre + "ffn_up.weight");
+        run_residual(pre + "ffn_down.weight", ffnup);
+      }
+      if (logits_from < T_run && std::size_t{ci + 1} * B > logits_from) {
+        const Imported wnorm = ImportTensor(*head_onw);
+        const Imported w = ImportTensor(*head_ow);
+        const std::uint32_t lo = std::max<std::uint32_t>(logits_from, ci * B);
+        for (std::uint32_t ra = lo; ra < (ci + 1) * B; ++ra) {
+          const std::uint32_t r = ra - ci * B;
+          {
+            std::vector<hrx_buffer_ref_t> b = {{hidden.handle, std::size_t{r} * kHidden * 4, std::size_t{kHidden} * 4},
+                                               {wnorm.handle, wnorm.offset, wnorm.bytes},
+                                               {normed.handle, 0, hb(normed)}};
             Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
           }
           std::vector<hrx_buffer_ref_t> b = {
-              {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
-              {rsbuf.handle, i * kVocab * 4, std::size_t{kVocab} * 4}};
+              {w.handle, w.offset, w.bytes},
+              {normed.handle, 0, hb(normed)},
+              {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4}};
           Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
         }
-        gpu.Synchronize();
-        std::vector<float> host(rows.size() * kVocab);
-        gpu.D2H(rsbuf, host.data(), host.size() * 4, 0);
-        std::vector<std::uint32_t> idx(kVocab);
-        for (std::size_t i = 0; i < rows.size(); ++i) {
-          const float* lg = host.data() + i * kVocab;
-          const std::uint32_t pos = ci * B + rows[i];
-          const std::int32_t nxt = pos + 1 < T_run ? static_cast<std::int32_t>(ids_all[pos + 1]) : -1;
-          double mx = lg[0];
-          for (std::uint32_t v = 1; v < kVocab; ++v) mx = std::max<double>(mx, lg[v]);
-          double se = 0.0;
-          for (std::uint32_t v = 0; v < kVocab; ++v) se += std::exp(static_cast<double>(lg[v]) - mx);
-          const float lse = static_cast<float>(mx + std::log(se));
-          for (std::uint32_t v = 0; v < kVocab; ++v) idx[v] = v;
-          std::partial_sort(idx.begin(), idx.begin() + 64, idx.end(),
-                            [&](std::uint32_t a, std::uint32_t b2) { return lg[a] > lg[b2] || (lg[a] == lg[b2] && a < b2); });
-          const std::int32_t ipos = static_cast<std::int32_t>(pos), am = static_cast<std::int32_t>(idx[0]);
-          const float lt = nxt >= 0 ? lg[nxt] : 0.0f, t1 = lg[idx[0]], t2 = lg[idx[1]];
-          std::fwrite(&ipos, 4, 1, rowstats); std::fwrite(&nxt, 4, 1, rowstats);
-          std::fwrite(&lse, 4, 1, rowstats); std::fwrite(&lt, 4, 1, rowstats);
-          std::fwrite(&am, 4, 1, rowstats); std::fwrite(&t1, 4, 1, rowstats); std::fwrite(&t2, 4, 1, rowstats);
-          for (int k = 0; k < 64; ++k) {
-            const std::int32_t id = static_cast<std::int32_t>(idx[k]);
-            std::fwrite(&id, 4, 1, rowstats); std::fwrite(&lg[idx[k]], 4, 1, rowstats);
+      }
+      if (rowstats) {
+        std::vector<std::uint32_t> rows;
+        for (std::uint32_t r = 0; r < B; ++r)
+          if (rs_want[std::size_t{ci} * B + r]) rows.push_back(r);
+        if (!rows.empty()) {
+          const Imported wnorm = ImportTensor(*head_onw);
+          const Imported w = ImportTensor(*head_ow);
+          for (std::size_t i = 0; i < rows.size(); ++i) {
+            {
+              std::vector<hrx_buffer_ref_t> b = {
+                  {hidden.handle, std::size_t{rows[i]} * kHidden * 4, std::size_t{kHidden} * 4},
+                  {wnorm.handle, wnorm.offset, wnorm.bytes},
+                  {normed.handle, 0, hb(normed)}};
+              Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
+            }
+            std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes},
+                                               {normed.handle, 0, hb(normed)},
+                                               {rsbuf.handle, i * kVocab * 4, std::size_t{kVocab} * 4}};
+            Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
+          }
+          gpu.Synchronize();
+          std::vector<float> host(rows.size() * kVocab);
+          gpu.D2H(rsbuf, host.data(), host.size() * 4, 0);
+          std::vector<std::uint32_t> idx(kVocab);
+          for (std::size_t i = 0; i < rows.size(); ++i) {
+            const float* lg = host.data() + i * kVocab;
+            const std::uint32_t pos = ci * B + rows[i];
+            const std::int32_t nxt = pos + 1 < T_run ? static_cast<std::int32_t>(ids_all[pos + 1]) : -1;
+            double mx = lg[0];
+            for (std::uint32_t v = 1; v < kVocab; ++v) mx = std::max<double>(mx, lg[v]);
+            double se = 0.0;
+            for (std::uint32_t v = 0; v < kVocab; ++v) se += std::exp(static_cast<double>(lg[v]) - mx);
+            const float lse = static_cast<float>(mx + std::log(se));
+            for (std::uint32_t v = 0; v < kVocab; ++v) idx[v] = v;
+            std::partial_sort(idx.begin(), idx.begin() + 64, idx.end(), [&](std::uint32_t a, std::uint32_t b2) {
+              return lg[a] > lg[b2] || (lg[a] == lg[b2] && a < b2);
+            });
+            const std::int32_t ipos = static_cast<std::int32_t>(pos), am = static_cast<std::int32_t>(idx[0]);
+            const float lt = nxt >= 0 ? lg[nxt] : 0.0f, t1 = lg[idx[0]], t2 = lg[idx[1]];
+            std::fwrite(&ipos, 4, 1, rowstats);
+            std::fwrite(&nxt, 4, 1, rowstats);
+            std::fwrite(&lse, 4, 1, rowstats);
+            std::fwrite(&lt, 4, 1, rowstats);
+            std::fwrite(&am, 4, 1, rowstats);
+            std::fwrite(&t1, 4, 1, rowstats);
+            std::fwrite(&t2, 4, 1, rowstats);
+            for (int k = 0; k < 64; ++k) {
+              const std::int32_t id = static_cast<std::int32_t>(idx[k]);
+              std::fwrite(&id, 4, 1, rowstats);
+              std::fwrite(&lg[idx[k]], 4, 1, rowstats);
+            }
           }
         }
       }
-    }
-    }   // chunks
+    }  // chunks
     gpu.Synchronize();
     if (rowstats) std::fclose(rowstats);
     if (hook_in) {
@@ -1055,8 +1164,7 @@ int main(int argc, char** argv) {
       int status = 0;
       waitpid(hook_pid, &status, 0);
     }
-    const double layer_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t0).count();
+    const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
 
     {
@@ -1072,21 +1180,19 @@ int main(int argc, char** argv) {
       const auto* ow = find("output.weight");
       const Imported wnorm = ImportTensor(*onw);
       {
-        std::vector<hrx_buffer_ref_t> b = {
-            {hidden.handle, std::size_t{B - 1} * kHidden * 4, std::size_t{kHidden} * 4},
-            {wnorm.handle, wnorm.offset, wnorm.bytes}, {normed.handle, 0, hb(normed)}};
+        std::vector<hrx_buffer_ref_t> b = {{hidden.handle, std::size_t{B - 1} * kHidden * 4, std::size_t{kHidden} * 4},
+                                           {wnorm.handle, wnorm.offset, wnorm.bytes},
+                                           {normed.handle, 0, hb(normed)}};
         Dispatch(gpu, e_rms, "yah_rmsnorm", 1, 1, 1, 32, 1, 1, b);
       }
       {
         const Imported w = ImportTensor(*ow);
         std::vector<hrx_buffer_ref_t> b = {
-            {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)},
-            {logits.handle, 0, hb(logits)}};
+            {w.handle, w.offset, w.bytes}, {normed.handle, 0, hb(normed)}, {logits.handle, 0, hb(logits)}};
         Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
       }
       {
-        std::vector<hrx_buffer_ref_t> b = {
-            {logits.handle, 0, hb(logits)}, {token.handle, 0, 4}};
+        std::vector<hrx_buffer_ref_t> b = {{logits.handle, 0, hb(logits)}, {token.handle, 0, 4}};
         Dispatch(gpu, e_argmax, "yah_argmax", 1, 1, 1, 32, 1, 1, b);
       }
       gpu.Synchronize();
@@ -1109,8 +1215,8 @@ int main(int argc, char** argv) {
         if (T_run + ngen - 1 > T_ctx) throw LoomError("YAH_GEN: prompt + gen exceeds the emitted context");
         LoomDecoder dec(gpu, gguf, cfg, ddir, weights.handle, weights_delta);
         if (dec.context() != kPages * 256)
-          throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) +
-                          " != prefill pool rows " + std::to_string(kPages * 256));
+          throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) + " != prefill pool rows " +
+                          std::to_string(kPages * 256));
         // the decode set's KV format must be this prefill's (fp16, or kv8a16 / kv4a16)
         const std::uint32_t kbits = attn_kq4 ? 4 : attn_kq8 ? 8 : 16, vbits = attn_vq4 ? 4 : attn_vq8 ? 8 : 16;
         if (dec.kv_bits() != std::make_pair(kbits, vbits))
@@ -1144,7 +1250,9 @@ int main(int argc, char** argv) {
         std::printf("generated_ids=");
         for (std::size_t i = 0; i < gen.size(); ++i) std::printf("%u%s", gen[i], i + 1 == gen.size() ? "" : " ");
         std::printf("\n");
-        if (ngen > 1) std::printf("decode_ms=%.2f decode_tok_s=%.2f (context %u)\n", gms / (ngen - 1), 1000.0 * (ngen - 1) / gms, T_run);
+        if (ngen > 1)
+          std::printf("decode_ms=%.2f decode_tok_s=%.2f (context %u)\n", gms / (ngen - 1), 1000.0 * (ngen - 1) / gms,
+                      T_run);
       }
 
       // YAH_LOGITS_FROM=P: f32 logits of every position P..B-1 into

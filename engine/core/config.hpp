@@ -35,39 +35,26 @@ struct Qwen35Config {
   // Layer types alternate on a fixed interval: one full-attention layer every
   // full_attention_interval, Gated DeltaNet otherwise. layer is 0-based.
   [[nodiscard]] bool IsFullAttention(std::uint32_t layer) const {
-    return full_attention_interval != 0 &&
-           (layer + 1) % full_attention_interval == 0;
+    return full_attention_interval != 0 && (layer + 1) % full_attention_interval == 0;
   }
   // The MTP head is one of the block_count and is not part of the main stack.
-  [[nodiscard]] std::uint32_t main_block_count() const {
-    return block_count - nextn_predict_layers;
-  }
+  [[nodiscard]] std::uint32_t main_block_count() const { return block_count - nextn_predict_layers; }
   [[nodiscard]] std::uint32_t AttentionLayers() const {
-    return full_attention_interval == 0
-               ? 0
-               : main_block_count() / full_attention_interval;
+    return full_attention_interval == 0 ? 0 : main_block_count() / full_attention_interval;
   }
-  [[nodiscard]] std::uint32_t RecurrentLayers() const {
-    return main_block_count() - AttentionLayers();
-  }
+  [[nodiscard]] std::uint32_t RecurrentLayers() const { return main_block_count() - AttentionLayers(); }
   // Dense index of a Gated DeltaNet layer among the recurrent layers, which is
   // the slot its convolution and recurrent states live in.
   [[nodiscard]] std::uint32_t SsmLayerIndex(std::uint32_t layer) const {
-    return full_attention_interval == 0
-               ? layer
-               : layer - layer / full_attention_interval;
+    return full_attention_interval == 0 ? layer : layer - layer / full_attention_interval;
   }
   // Width of one DeltaNet value head group, ssm_inner_size / time_step_rank.
   [[nodiscard]] std::uint32_t SsmValueSize() const {
     return ssm_time_step_rank == 0 ? 0 : ssm_inner_size / ssm_time_step_rank;
   }
   // Attention width (q for each token), and the fused qkv width.
-  [[nodiscard]] std::uint32_t attention_q_dim() const {
-    return head_count * key_length;
-  }
-  [[nodiscard]] std::uint32_t attention_kv_dim() const {
-    return head_count_kv * key_length;
-  }
+  [[nodiscard]] std::uint32_t attention_q_dim() const { return head_count * key_length; }
+  [[nodiscard]] std::uint32_t attention_kv_dim() const { return head_count_kv * key_length; }
 
   static Qwen35Config FromGguf(const Gguf& gguf);
 };

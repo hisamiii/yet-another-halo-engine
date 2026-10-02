@@ -56,8 +56,7 @@ struct Qwen35Weights {
   // config (row lengths, counts, and which tensors each layer type must have).
   // Throws on anything missing or inconsistent rather than returning a partial
   // table.
-  static Qwen35Weights FromGguf(const core::Gguf& gguf,
-                                const core::Qwen35Config& config);
+  static Qwen35Weights FromGguf(const core::Gguf& gguf, const core::Qwen35Config& config);
 
   // Shifts every resolved tensor pointer by `delta` bytes. Used to repoint the
   // table from the file mapping onto the HIP-registered copy the device reads.

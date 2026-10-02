@@ -33,15 +33,11 @@ class Tokenizer {
  public:
   static Tokenizer FromGguf(const Gguf& gguf, const TokenizerConfig& config);
 
-  [[nodiscard]] std::vector<TokenId> Encode(
-      std::string_view text, const TokenizerOptions& options = {}) const;
+  [[nodiscard]] std::vector<TokenId> Encode(std::string_view text, const TokenizerOptions& options = {}) const;
   [[nodiscard]] std::string Decode(const std::vector<TokenId>& tokens) const;
   [[nodiscard]] std::string DecodeToken(TokenId id) const;
-  [[nodiscard]] bool IsSpecial(TokenId id) const {
-    return is_special_.contains(id);
-  }
-  [[nodiscard]] std::optional<TokenId> FindSpecial(
-      std::string_view text) const;
+  [[nodiscard]] bool IsSpecial(TokenId id) const { return is_special_.contains(id); }
+  [[nodiscard]] std::optional<TokenId> FindSpecial(std::string_view text) const;
   [[nodiscard]] std::size_t vocab_size() const { return id_to_token_.size(); }
   [[nodiscard]] TokenId bos_id() const { return bos_id_; }
   [[nodiscard]] TokenId eos_id() const { return eos_id_; }
@@ -52,8 +48,7 @@ class Tokenizer {
     TokenId token{kInvalidTokenId};
   };
 
-  [[nodiscard]] std::vector<TokenId> BpeMergeChunk(
-      std::string_view chunk) const;
+  [[nodiscard]] std::vector<TokenId> BpeMergeChunk(std::string_view chunk) const;
   [[nodiscard]] std::vector<TokenId> BpeEncodeText(std::string_view text) const;
   void InitializeDecodedTokens();
 

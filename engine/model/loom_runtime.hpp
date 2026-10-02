@@ -4,11 +4,11 @@
 
 #include <chrono>
 #include <cstddef>
-#include <utility>
-#include <thread>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "hrx_runtime.h"
@@ -25,8 +25,7 @@ inline void LoomCheck(hrx_status_t status, const char* what) {
   std::string text = what;
   char* message = nullptr;
   size_t length = 0;
-  if (hrx_status_is_ok(hrx_status_to_string(status, &message, &length)) &&
-      message) {
+  if (hrx_status_is_ok(hrx_status_to_string(status, &message, &length)) && message) {
     text += ": ";
     text.append(message, length);
     hrx_status_free_message(message);
@@ -39,8 +38,7 @@ struct LoomBuffer {
   size_t size = 0;
 
   LoomBuffer() = default;
-  LoomBuffer(LoomBuffer&& other) noexcept
-      : handle(other.handle), size(other.size) {
+  LoomBuffer(LoomBuffer&& other) noexcept : handle(other.handle), size(other.size) {
     other.handle = nullptr;
     other.size = 0;
   }
@@ -67,9 +65,7 @@ struct LoomBuffer {
 struct LoomEvent {
   hrx_event_t handle = nullptr;
   LoomEvent() = default;
-  LoomEvent(LoomEvent&& other) noexcept : handle(other.handle) {
-    other.handle = nullptr;
-  }
+  LoomEvent(LoomEvent&& other) noexcept : handle(other.handle) { other.handle = nullptr; }
   LoomEvent& operator=(LoomEvent&& other) noexcept {
     if (this != &other) {
       reset();
@@ -94,9 +90,7 @@ struct LoomExecutable {
 
   LoomExecutable() = default;
   LoomExecutable(LoomExecutable&& other) noexcept
-      : handle(other.handle),
-        names(std::move(other.names)),
-        infos(std::move(other.infos)) {
+      : handle(other.handle), names(std::move(other.names)), infos(std::move(other.infos)) {
     other.handle = nullptr;
     other.infos.clear();
   }
@@ -181,25 +175,18 @@ class LoomDevice {
   [[nodiscard]] hrx_device_t device() const { return device_; }
   [[nodiscard]] hrx_stream_t stream() const { return stream_; }
 
-  [[nodiscard]] LoomExecutable Load(const std::string& path,
-                                    const char* target_key = "gfx1151") {
+  [[nodiscard]] LoomExecutable Load(const std::string& path, const char* target_key = "gfx1151") {
     LoomExecutable executable;
-    LoomCheck(hrx_executable_load_file(device_, path.c_str(), "amdgpu",
-                                       target_key, &executable.handle),
+    LoomCheck(hrx_executable_load_file(device_, path.c_str(), "amdgpu", target_key, &executable.handle),
               "hrx_executable_load_file");
     size_t count = 0;
-    LoomCheck(hrx_executable_export_count(executable.handle, &count),
-              "hrx_executable_export_count");
+    LoomCheck(hrx_executable_export_count(executable.handle, &count), "hrx_executable_export_count");
     executable.names.reserve(count);
     executable.infos.resize(count);
     for (size_t i = 0; i < count; ++i) {
-      LoomCheck(hrx_executable_export_info(executable.handle,
-                                           static_cast<uint32_t>(i),
-                                           &executable.infos[i]),
+      LoomCheck(hrx_executable_export_info(executable.handle, static_cast<uint32_t>(i), &executable.infos[i]),
                 "hrx_executable_export_info");
-      executable.names.emplace_back(executable.infos[i].name
-                                        ? executable.infos[i].name
-                                        : "");
+      executable.names.emplace_back(executable.infos[i].name ? executable.infos[i].name : "");
     }
     return executable;
   }
@@ -207,9 +194,9 @@ class LoomDevice {
   [[nodiscard]] LoomBuffer Allocate(size_t bytes) {
     LoomBuffer buffer;
     buffer.size = bytes;
-    LoomCheck(hrx_buffer_allocate(stream_, bytes, HRX_MEMORY_TYPE_DEVICE_LOCAL,
-                                  HRX_BUFFER_USAGE_DEFAULT, &buffer.handle),
-              "hrx_buffer_allocate");
+    LoomCheck(
+        hrx_buffer_allocate(stream_, bytes, HRX_MEMORY_TYPE_DEVICE_LOCAL, HRX_BUFFER_USAGE_DEFAULT, &buffer.handle),
+        "hrx_buffer_allocate");
     return buffer;
   }
 
@@ -223,38 +210,30 @@ class LoomDevice {
     params.access = HRX_MEMORY_ACCESS_READ;
     params.usage = HRX_BUFFER_USAGE_DEFAULT;
     params.queue_affinity = 0;
-    LoomCheck(hrx_allocator_import_buffer(hrx_device_allocator(device_),
-                                          params, host_ptr, bytes,
-                                          &buffer.handle),
+    LoomCheck(hrx_allocator_import_buffer(hrx_device_allocator(device_), params, host_ptr, bytes, &buffer.handle),
               "hrx_allocator_import_buffer");
     return buffer;
   }
 
-  void H2D(const LoomBuffer& buffer, const void* host, size_t bytes,
-           size_t offset = 0) {
-    LoomCheck(hrx_synchronous_h2d(device_, host, buffer.handle, offset, bytes),
-              "hrx_synchronous_h2d");
+  void H2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
+    LoomCheck(hrx_synchronous_h2d(device_, host, buffer.handle, offset, bytes), "hrx_synchronous_h2d");
   }
-  void D2H(const LoomBuffer& buffer, void* host, size_t bytes,
-           size_t offset = 0) {
-    LoomCheck(hrx_synchronous_d2h(device_, buffer.handle, offset, host, bytes),
-              "hrx_synchronous_d2h");
+  void D2H(const LoomBuffer& buffer, void* host, size_t bytes, size_t offset = 0) {
+    LoomCheck(hrx_synchronous_d2h(device_, buffer.handle, offset, host, bytes), "hrx_synchronous_d2h");
   }
 
-  void Dispatch(const LoomExecutable& executable, uint32_t ordinal,
-                const hrx_dispatch_config_t& config, const void* constants,
-                size_t constants_size, const hrx_buffer_ref_t* bindings,
-                size_t binding_count) {
+  void Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
+                const void* constants, size_t constants_size, const hrx_buffer_ref_t* bindings, size_t binding_count) {
     const uint32_t flags = no_barrier_ok_ ? next_flags_ : 0;
     next_flags_ = 0;
-    hrx_status_t status = hrx_stream_dispatch(stream_, executable.handle, ordinal, &config, constants,
-                                              constants_size, bindings, binding_count, flags);
+    hrx_status_t status = hrx_stream_dispatch(stream_, executable.handle, ordinal, &config, constants, constants_size,
+                                              bindings, binding_count, flags);
     // Stock HRX rejects the no-barrier flag up front (nothing recorded): retry with ordered dispatch from now on.
     if (flags && hrx_status_code(status) == HRX_STATUS_INVALID_ARGUMENT) {
       hrx_status_ignore(status);
       no_barrier_ok_ = false;
-      status = hrx_stream_dispatch(stream_, executable.handle, ordinal, &config, constants, constants_size,
-                                   bindings, binding_count, 0);
+      status = hrx_stream_dispatch(stream_, executable.handle, ordinal, &config, constants, constants_size, bindings,
+                                   binding_count, 0);
     }
     LoomCheck(status, "hrx_stream_dispatch");
   }
@@ -287,22 +266,17 @@ class LoomDevice {
 
   [[nodiscard]] LoomEvent NewEvent() {
     LoomEvent event;
-    LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_NONE, &event.handle),
-              "hrx_event_create");
+    LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_NONE, &event.handle), "hrx_event_create");
     return event;
   }
-  void Record(LoomEvent& event) {
-    LoomCheck(hrx_event_record(event.handle, stream_), "hrx_event_record");
-  }
+  void Record(LoomEvent& event) { LoomCheck(hrx_event_record(event.handle, stream_), "hrx_event_record"); }
   float Elapsed(LoomEvent& start, LoomEvent& stop) {
     float ms = 0.0f;
-    LoomCheck(hrx_event_elapsed_time(start.handle, stop.handle, &ms),
-              "hrx_event_elapsed_time");
+    LoomCheck(hrx_event_elapsed_time(start.handle, stop.handle, &ms), "hrx_event_elapsed_time");
     return ms;
   }
 
-  static hrx_dispatch_config_t Config(uint32_t gx, uint32_t gy, uint32_t gz,
-                                      uint32_t sx, uint32_t sy, uint32_t sz,
+  static hrx_dispatch_config_t Config(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t sx, uint32_t sy, uint32_t sz,
                                       uint32_t subgroup = 32) {
     hrx_dispatch_config_t config = {};
     config.workgroup_count[0] = gx;

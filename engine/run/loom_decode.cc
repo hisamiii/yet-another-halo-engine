@@ -35,10 +35,16 @@ int main(int argc, char** argv) {
   std::uint32_t gen_count = 16;
   for (int i = 3; i < argc; ++i) {
     const std::string a = argv[i];
-    if (a == "--ids" && i + 1 < argc) ids_arg = argv[++i];
-    else if (a == "--gen" && i + 1 < argc) gen_count = static_cast<std::uint32_t>(std::atoi(argv[++i]));
-    else if (a == "--logits" && i + 1 < argc) logits_path = argv[++i];
-    else { std::fprintf(stderr, "loom_decode: unknown argument %s\n", a.c_str()); return 2; }
+    if (a == "--ids" && i + 1 < argc)
+      ids_arg = argv[++i];
+    else if (a == "--gen" && i + 1 < argc)
+      gen_count = static_cast<std::uint32_t>(std::atoi(argv[++i]));
+    else if (a == "--logits" && i + 1 < argc)
+      logits_path = argv[++i];
+    else {
+      std::fprintf(stderr, "loom_decode: unknown argument %s\n", a.c_str());
+      return 2;
+    }
   }
   try {
     auto gguf = yah::core::Gguf::Open(model);
@@ -46,7 +52,11 @@ int main(int argc, char** argv) {
     const auto tconfig = yah::core::TokenizerConfig::FromGguf(gguf);
     const auto tokenizer = yah::core::Tokenizer::FromGguf(gguf, tconfig);
     std::vector<std::uint32_t> prompt;
-    { std::istringstream in(ids_arg); std::uint32_t v; while (in >> v) prompt.push_back(v); }
+    {
+      std::istringstream in(ids_arg);
+      std::uint32_t v;
+      while (in >> v) prompt.push_back(v);
+    }
     if (prompt.empty() || gen_count == 0) throw LoomError("--ids and --gen >= 1 are required");
 
     LoomDevice gpu;
@@ -92,7 +102,8 @@ int main(int argc, char** argv) {
     const std::vector<std::uint32_t> gen = dec.Tokens(n, steps + 1);
     if (!step_ms.empty()) {
       std::fprintf(stderr, "step_ms=");
-      for (std::size_t i = 0; i < step_ms.size(); ++i) std::fprintf(stderr, "%.1f%s", step_ms[i], i + 1 == step_ms.size() ? "\n" : " ");
+      for (std::size_t i = 0; i < step_ms.size(); ++i)
+        std::fprintf(stderr, "%.1f%s", step_ms[i], i + 1 == step_ms.size() ? "\n" : " ");
     }
     // decode rate over the generation steps (positions n .. steps - 1)
     const std::uint32_t dn = steps - n;

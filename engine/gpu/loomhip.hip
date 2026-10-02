@@ -12,26 +12,28 @@
 #include <hip/hip_runtime.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
 
-#define CHECK(x)                                                              \
-  do {                                                                        \
-    hipError_t e_ = (x);                                                      \
-    if (e_ != hipSuccess) {                                                   \
-      std::fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x,          \
-                   hipGetErrorString(e_));                                    \
-      std::exit(1);                                                           \
-    }                                                                         \
+#define CHECK(x)                                                                             \
+  do {                                                                                       \
+    hipError_t e_ = (x);                                                                     \
+    if (e_ != hipSuccess) {                                                                  \
+      std::fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, hipGetErrorString(e_)); \
+      std::exit(1);                                                                          \
+    }                                                                                        \
   } while (0)
 
 static std::vector<char> ReadFile(const std::string& path) {
   FILE* f = std::fopen(path.c_str(), "rb");
-  if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); std::exit(1); }
+  if (!f) {
+    std::fprintf(stderr, "cannot open %s\n", path.c_str());
+    std::exit(1);
+  }
   std::fseek(f, 0, SEEK_END);
   long n = std::ftell(f);
   std::fseek(f, 0, SEEK_SET);
@@ -45,10 +47,26 @@ static std::vector<char> ReadFile(const std::string& path) {
 // group_segment u32 @0, private_segment u32 @4, kernarg_size u32 @8), read
 // straight from the ELF. Returns -1 if the symbol is missing.
 static long KernargSize(const std::vector<char>& elf, const std::string& kernel) {
-  auto u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, elf.data() + o, 2); return v; };
-  auto u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, elf.data() + o, 4); return v; };
-  auto u64 = [&](size_t o) { uint64_t v; std::memcpy(&v, elf.data() + o, 8); return v; };
-  if (elf.size() < 64 || std::memcmp(elf.data(), "\x7f" "ELF", 4) != 0) return -1;
+  auto u16 = [&](size_t o) {
+    uint16_t v;
+    std::memcpy(&v, elf.data() + o, 2);
+    return v;
+  };
+  auto u32 = [&](size_t o) {
+    uint32_t v;
+    std::memcpy(&v, elf.data() + o, 4);
+    return v;
+  };
+  auto u64 = [&](size_t o) {
+    uint64_t v;
+    std::memcpy(&v, elf.data() + o, 8);
+    return v;
+  };
+  if (elf.size() < 64 || std::memcmp(elf.data(),
+                                     "\x7f"
+                                     "ELF",
+                                     4) != 0)
+    return -1;
   const uint64_t shoff = u64(40);
   const unsigned shentsize = u16(58), shnum = u16(60);
   auto sh = [&](unsigned i) { return shoff + static_cast<uint64_t>(i) * shentsize; };
@@ -89,7 +107,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (kas != given) {
-    std::fprintf(stderr, "loomhip: %s takes %ld bytes of kernel arguments (%ld buffers), %d given; refusing to launch\n",
+    std::fprintf(stderr,
+                 "loomhip: %s takes %ld bytes of kernel arguments (%ld buffers), %d given; refusing to launch\n",
                  kernel.c_str(), kas, kas / 8, argc - 7);
     return 2;
   }
@@ -128,11 +147,9 @@ int main(int argc, char** argv) {
   std::vector<char> kernarg(ptrs.size() * sizeof(void*));
   std::memcpy(kernarg.data(), ptrs.data(), kernarg.size());
   size_t kbytes = kernarg.size();
-  void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, kernarg.data(),
-                    HIP_LAUNCH_PARAM_BUFFER_SIZE, &kbytes, HIP_LAUNCH_PARAM_END};
-  auto launch = [&] {
-    CHECK(hipModuleLaunchKernel(fn, gx, gy, 1, bx, 1, 1, 0, nullptr, nullptr, config));
-  };
+  void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, kernarg.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &kbytes,
+                    HIP_LAUNCH_PARAM_END};
+  auto launch = [&] { CHECK(hipModuleLaunchKernel(fn, gx, gy, 1, bx, 1, 1, 0, nullptr, nullptr, config)); };
   launch();
   CHECK(hipDeviceSynchronize());
   for (auto& [idx, path] : dumps) {
