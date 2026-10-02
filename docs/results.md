@@ -8,7 +8,7 @@ Prefill, default set (FA attention, chunked DeltaNet, paged KV; HRX pin a02a5ab9
 
 | prompt | set | Loom | HIP (hip-final) | measured |
 |---|---|---:|---:|---|
-| 2048 | one pass, B = 2048 | 3000.5 ms (683 tok/s) | 3381.7 ms | 2026-10-02, f16 operand placement |
+| 2048 | one pass, B = 2048 | 2952.1 ms (694 tok/s) | 3381.7 ms | 2026-10-03, + half_norm 4 rows per workgroup (~4 ms of the 48 ms gain; the round started at 42 C) |
 | 8192 | one pass, B = 8192 | 12877-13556 ms (604-636 tok/s) | 14254.3 ms | 2026-10-02, f16 operand placement; see below |
 | 8192 | chunked (2048), 32K pools, fp16 KV | 13085.3 ms | 14431.7 ms | 2026-10-02, run before decode |
 | 30720 | chunked (2048), 32K pools, fp16 KV | 59004.2 ms (521 tok/s) | 62596.1 ms | 2026-10-02, run before decode |
