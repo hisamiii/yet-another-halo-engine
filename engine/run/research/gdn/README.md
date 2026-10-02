@@ -33,3 +33,38 @@ read by both dot products and the update coefficient to f16 (state kept f32).
 8K gate on 4 docs: mean KLD 0.000003, 99% precision 99.98%, same top 99.97%.
 That is 7x below kv8a16, so a plain f16-WMMA chunked kernel is safe;
 compensated (hi+lo) inputs are not needed.
+
+## Kernel: tools/gen_gdn_chunk.py (opt-in, not wired into the emitter)
+
+C = 32, workgroup = (64 value rows, one head), 8 waves (wave32), state in f32
+WMMA accumulators. Standalone pp2048 layer 0 (cyc.sh, SQ_BUSY_CYCLES):
+
+| version | M cycles | output rel vs recurrent | change |
+|---|---|---|---|
+| recurrent yah_deltanet (production) | 4.116 | - | - |
+| v1 | 5.270 | 2.1e-4 | first correct version |
+| v1, solve ablated (T = I) | 4.045 | (wrong) | the solve was 23% |
+| v3 | 4.694 | 2.1e-4 | right-looking solve (independent fmas), O1 = Q S^T overlapping the solve, state f16 copy moved into phase 1 |
+| v4 | 3.717 | 2.1e-4 | prefetch of the next chunk's inputs (loop-carried) and the decay scan via kernel.subgroup.scan in one barrier |
+| v4, solve ablated | 3.542 | (wrong) | the solve is now ~5% |
+| v5 | 3.702 | 2.1e-4 | Vn^T into the dead T1/T2 region, one barrier fewer |
+| v6 (reverted) | 3.744 | 2.1e-4 | packed (lane ^ 1 shuffle) f16 pair stores for the state copy: VALU 34 -> 43.5 M for LDS 15.2 -> 14.4 M; the scalar stores queue behind LDS traffic rather than limiting by count |
+
+Final state vs the exact recurrence: 2-6e-4.
+
+v4 ATT: s_barrier 55%, ds_store_b16 10.6%, lgkmcnt waits ~12%. Eight
+barrier-separated phases per 32 tokens at 2 workgroups per WGP (LDS ~63 KB),
+so waves idle behind the slowest one in every phase.
+
+Bugs found on the way:
+- the RDNA3 wave32 WMMA accumulator holds rows 2 i + lane / 16 (interleaved,
+  not contiguous): debug mode GDN_DBG=1 dumps LDS after each phase, compared
+  in dbgcmp.py;
+- log2f needs <afn>;
+- index arithmetic must stay provably non-negative (u32 address math).
+
+Next structural step (not done): FLA's 3-kernel split.
+1. A, T, W, U for all chunks in parallel (no sequential dependency).
+2. A lean sequential state kernel: per chunk Vn = U - W S^T and the update.
+3. Outputs O = Q S_c^T + P Vn in parallel over chunks, from per-chunk state
+   snapshots (f16: 128 x 128 x 2 B per head per chunk).
