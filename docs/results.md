@@ -192,7 +192,7 @@ Decode:
 - No x loads at all (ablation): -0.45 ms; x traffic does not limit the low-bit GEMVs.
 - kv4a16 decode attention vs kv8a16: no faster (347 vs 362 us at 30.7K) despite 40% fewer bytes; per-workgroup q rotation, barriers and group sums make it latency-bound.
 
-KV codecs (fake-quantized through `YAH_KV_HOOK`, 32K):
+KV codecs (fake-quantized through a KV hook since removed, 32K):
 
 - UltraQuant MXFP4 K and V: mean KL 1.0e-2, dPPL +0.47%; per-token MXFP4 V is 4x worse than per-channel tile V.
 - WUSH calibrated transform for int4 K: only ~7% better than a fixed H256 Hadamard; the rotation does the work.

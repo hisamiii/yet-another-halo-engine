@@ -146,7 +146,7 @@ PYTHONPATH=/home/q/llama.cpp/gguf-py /home/q/yah-scratch/venv/bin/python engine/
 | `tools/dattn_check.py <gguf> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
 | `tools/dattn_q_check.py <gguf> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
 | `engine/run/gate/` (`gate_run.sh`, `accgate2.py`) | tiered accuracy gate on wikitext windows, all-position logits (`YAH_LOGITS_FROM`): T1 rounding level, T2 quantization level. See `engine/run/gate/README.md` | any numerics change |
-| `engine/run/kvq/` (`run_codec.sh`, `gate2.py`, `needle_score.py`, `tierA.py`) | KV codec quality at 32K: per-layer attention error, long-document KL / dPPL with bootstrap CIs, multi-key retrieval. `YAH_KV_HOOK` runs a codec as fake quantization. See `engine/run/kvq/README.md` | KV format work |
+| `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `YAH_ROWSTATS` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |
 | `engine/tests/m0_gate.sh <gguf> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
 | `engine/tests/generate_gate.sh <gguf> [set]` | 20 greedy tokens equal the reference | after any change, cheap |
 
