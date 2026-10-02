@@ -97,7 +97,9 @@ def main():
             bs[q].append(np.percentile(x, q))
     def tail(q):
         v, lo, hi = np.percentile(kl, q), np.percentile(bs[q], 2.5), np.percentile(bs[q], 97.5)
-        return f"p{q}: {v:.4f} [{lo:.4f}, {hi:.4f}] ({100 * (lo / v - 1):+.0f}% / {100 * (hi / v - 1):+.0f}%)"
+        # precision = 100 exp(-KL)
+        return (f"p{q}: {v:.4f} [{lo:.4f}, {hi:.4f}] = precision {100 * np.exp(-v):.2f}%"
+                f" [{100 * np.exp(-hi):.2f}, {100 * np.exp(-lo):.2f}]")
     print("   KL tail: " + "   ".join(tail(q) for q in bs)
           + f"   max {kl.max():.2e} (n={len(kl)}, ~{len(kl) / 1000:.0f} positions above p99.9)")
 
