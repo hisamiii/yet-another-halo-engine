@@ -25,7 +25,7 @@ The weights are the GGUF's own mmap, imported once into HRX as one device-visibl
 
 ## Prefill
 
-`engine/run/loom_forward_pp.cc` runs a prompt through all 64 layers as one batch of B tokens (B = 2048 by default). Every kernel has the token count in its grid, so there is no per-tile loop. All activations are token-major (`[token][row]`). The residual stream is f32; GEMM inputs are f16.
+`engine/model/loom_prefill.hpp` (`LoomPrefill`) runs a prompt through all 64 layers as one batch of B tokens (B = 2048 by default); `loom_forward_pp` is its command-line driver. Every kernel has the token count in its grid, so there is no per-tile loop. All activations are token-major (`[token][row]`). The residual stream is f32; GEMM inputs are f16.
 
 ### Kernels per layer, in order
 
@@ -44,11 +44,10 @@ Gated DeltaNet layer:
 
 1. `gemm_kstore` attn_qkv (10240 rows), attn_gate (z, 6144), ssm_alpha and ssm_beta (48 rows each).
 2. `yah_ssm_conv_kq`: the causal conv over the 10240 channels with the q / k L2 normalization (`prep_kq`) fused in.
-3. `yah_conv_state` (chunked sets only): saves the last conv inputs for the next chunk.
-4. `yah_deltanet_prep_ab`: decay alpha and beta per token and head.
-5. `yah_deltanet`: chunked WY Gated DeltaNet (see below).
-6. `yah_ssm_postnorm_fp16`: gated RMSNorm per head with z, f16 out.
-7. `gemm_kres` ssm_out (5120 x 6144).
+3. `yah_deltanet_prep_ab`: decay alpha and beta per token and head, and the conv ring (the last 4 inputs) for the next chunk or the decoder.
+4. `yah_deltanet`: chunked WY Gated DeltaNet (see below).
+5. `yah_ssm_postnorm_fp16`: gated RMSNorm per head with z, f16 out.
+6. `gemm_kres` ssm_out (5120 x 6144).
 
 Then the FFN, for every layer:
 
@@ -93,7 +92,13 @@ It is not bit-identical to the HIP-order kernel; the tiered accuracy gate accept
 
 ### Chunked prefill (long context)
 
-A set emitted with `YAH_CTX=T` runs every kernel at the chunk size B but sizes the KV pools for T tokens. The driver runs the prompt in T_run / B passes over the 64 layers and carries the conv state and the DeltaNet state between chunks. T_run may be any multiple of B up to T, which leaves room in the pools for decode. One-pass and chunked runs are bit-identical at 8K.
+A set emitted with `YAH_CTX=T` runs every kernel at the chunk size B but sizes the KV pools for T tokens. The prompt runs in passes of B tokens over the 64 layers, carrying the conv ring and the DeltaNet state between chunks. One-pass and chunked runs are bit-identical at 8K.
+
+A prompt that ends inside a chunk runs a padded last chunk. `yah_deltanet_prep_ab` reads the real token count from a device scalar: padding tokens get decay 1 and update 0, so they leave the DeltaNet state unchanged, and the conv ring advances only past the real tokens. Attention is causal, so the real tokens never see the padding, and decode overwrites the padding's KV rows before reading them. With quantized V, `yah_vseed` copies the real V rows of the last, partial 16-key tile into the decoder's open tile.
+
+## Engine
+
+`engine/model/engine.hpp` (`Engine`) loads the model, a chunked prefill set and a decode set once and serves `Generate(prompt, params, on_token)` calls one at a time (the `TextGenerator` interface in `engine/model/generator.hpp`; the server in `engine/serve/` talks only to that). Per request: reset the recurrent state, prefill the whole chunks, finish the tail with a padded chunk or with decode steps (whichever its measured costs say is cheaper), then decode. Greedy picks the argmax on the GPU; temperature / top_p sample on the host from the logits.
 
 ## Decode
 

@@ -81,12 +81,24 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <gguf> <decode set> --ids 
 
 ## Serving
 
-`engine/build/yah_server` serves the model over the OpenAI Responses API. It runs one generation at a time; other requests wait.
+`engine/build/yah_server` serves the model over the OpenAI Responses API. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and `YAH_KV`. The default is 32K context with kv8a16 KV:
 
 ```
+cd engine/gpu/loom
+YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <gguf> /home/q/yah-hal-serve 2048
+YAH_KV=kv8 python3 tools/emit_decode.py <gguf> /home/q/yah-hal-serve-dec 32768
+cd -
 source engine/hrx-env.sh
-engine/run/gpu_run.sh serve -- engine/build/yah_server --model <gguf> --prefill <set> --decode <set> [--host 127.0.0.1] [--port 8080]
+engine/run/gpu_run.sh serve -- engine/build/yah_server --model <gguf> --prefill /home/q/yah-hal-serve --decode /home/q/yah-hal-serve-dec [--host 127.0.0.1] [--port 8080]
 engine/build/yah_server --model <gguf> --fake    # canned replies, CPU only: for clients and API tests
+```
+
+A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is padded (the padding leaves the recurrent state unchanged) unless decode steps are cheaper for that tail (short prompts: about 62 ms per token against about 3.1 s per chunk).
+
+For quick tests, `engine/serve/chat.py` is a terminal chat client (standard library only): it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply.
+
+```
+python3 engine/serve/chat.py --url http://127.0.0.1:8080 [--effort none|low|medium|high] [--temperature T] [--max N]
 ```
 
 It logs one line per request to stderr: id, prompt and output tokens, prefill ms, decode tok/s, finish reason (`cancelled` when the client left).
@@ -117,7 +129,7 @@ for event in client.responses.create(model="qwen", input="Hi", stream=True):
 
 All system and developer messages merge into one system message at the start. The chat template is a C++ port of the GGUF's Jinja template for this subset.
 
-Tests (no GPU):
+Tests (no GPU; source `engine/hrx-env.sh` first, the binary links libhrx):
 
 ```
 PYTHONPATH=/home/q/llama.cpp/gguf-py /home/q/yah-scratch/venv/bin/python engine/serve/test_chat_template.py   # C++ template vs jinja2, byte for byte

@@ -9,15 +9,11 @@
 #include <vector>
 
 #include "httplib/httplib.h"
+#include "model/engine.hpp"
 #include "model/generator.hpp"
 #include "serve/chat_template.hpp"
 #include "serve/fake_generator.hpp"
 #include "serve/responses.hpp"
-
-#if __has_include("model/engine.hpp")
-#include "model/engine.hpp"
-#define YAH_SERVE_HAVE_ENGINE 1
-#endif
 
 namespace {
 
@@ -210,16 +206,11 @@ int main(int argc, char** argv) {
     if (fake) {
       generator = std::make_unique<FakeGenerator>(model);
     } else {
-#ifdef YAH_SERVE_HAVE_ENGINE
       yah::model::Engine::Options options;
       options.model = model;
       options.prefill_hal = prefill;
       options.decode_hal = decode;
       generator = std::make_unique<yah::model::Engine>(options);
-#else
-      std::fprintf(stderr, "yah_server: built without model/engine.hpp; only --fake works\n");
-      return 2;
-#endif
     }
     Server server(*generator);
     httplib::Server http;
