@@ -160,6 +160,34 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     return (out, tile, rowgrp, tt)
 
 
+def gemm_combos(rows):
+    """{(kind, fmt, port, m_tiles, k_blocks): [tensor names]} of the model's GEMM tensors; kind is kstore, residual or
+    swiglu. rows: emit_prefill.parse(model)."""
+    combos = {}
+    for nm, dims, ty in rows:
+        suffix = nm.split(".", 2)[2] if nm.startswith("blk.") else nm
+        info = E.FMT.get(ty)
+        if not info:
+            continue
+        fmt, port, qk = info
+        if suffix in E.KSTORE:
+            kind = "kstore"
+        elif suffix in E.RESIDUAL:
+            kind = "residual"
+        elif suffix in E.SWIGLU:
+            kind = "swiglu"
+        else:
+            continue
+        combos.setdefault((kind, fmt, port, dims[1] // 16, dims[0] // qk), []).append(nm)
+    return combos
+
+
+def gemm_kinds(kind, mt):
+    """HAL kinds emitted for a combo, in order; the driver runs the last one (kres over kstore, kqg over kstore)."""
+    return {"kstore": ["kstore"] + (["kqg"] if mt == 768 else []), "residual": ["kstore", "kres"],
+            "swiglu": ["swiglu"]}[kind]
+
+
 def main():
     model, outdir = sys.argv[1], sys.argv[2]
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -178,22 +206,7 @@ def main():
     KC = T * 4 * 256          # KV cache elements: T rows x 4 kv heads x 256
     os.makedirs(outdir, exist_ok=True)
     rows = E.parse(model)
-    combos = set()
-    for nm, dims, ty in rows:
-        suffix = nm.split(".", 2)[2] if nm.startswith("blk.") else nm
-        info = E.FMT.get(ty)
-        if not info:
-            continue
-        fmt, port, qk = info
-        if suffix in E.KSTORE:
-            kind = "kstore"
-        elif suffix in E.RESIDUAL:
-            kind = "residual"
-        elif suffix in E.SWIGLU:
-            kind = "swiglu"
-        else:
-            continue
-        combos.add((kind, fmt, port, dims[1] // 16, dims[0] // qk))
+    combos = gemm_combos(rows)
 
     n = 0
     geom = []  # (<hal>, <tokens per workgroup>, <row groups>, <token_tiles>)
@@ -201,8 +214,7 @@ def main():
         name = lambda k: "gemm_%s_%s_%d_%d.hal" % (k, fmt, mt, kb)
         # A residual projection gets a kstore and the fused-residual kres; the attention q projection (12288 rows =
         # 24 heads x [q | gate]) also gets kqg, which stores q and gate unpacked. The driver prefers kres and kqg.
-        kinds = {"kstore": ["kstore"] + (["kqg"] if mt == 768 else []), "residual": ["kstore", "kres"],
-                 "swiglu": ["swiglu"]}[kind]
+        kinds = gemm_kinds(kind, mt)
         for k in kinds:
             r = gemm(fmt, mt, kb, B, name(k), outdir, kind=k)
             if r:

@@ -9,6 +9,7 @@ The kernel is built for exactly the given config. Prints the .hal path.
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,7 +61,9 @@ def main():
 
     os.makedirs(outdir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(source))[0]
-    rewritten = os.path.join(tempfile.gettempdir(), stem + "_emit.loom")
+    # a per-call directory: emits may run in parallel (engine/tune)
+    tmpdir = tempfile.mkdtemp(prefix="emit_hal_")
+    rewritten = os.path.join(tmpdir, stem + "_emit.loom")
     # YAH_LOOM_TARGET selects the compile target: default gfx1151 (1536-VGPR file, granule 24).
     # gfx11-generic models the 1024-VGPR RDNA3 parts.
     tgt = os.environ.get("YAH_LOOM_TARGET", "gfx1151")
@@ -77,6 +80,7 @@ def main():
            "--emit-only", "--emit-hal-executable=" + hal_path,
            "--emit-target-artifact=" + target]
     result = subprocess.run(cmd, env=hrx_paths.env(), capture_output=True, text=True)
+    shutil.rmtree(tmpdir, ignore_errors=True)
     if result.returncode != 0 or not os.path.exists(hal_path):
         # write the whole diagnostic: the first error is at the head, and a tail cut drops it
         sys.stderr.write(result.stderr)

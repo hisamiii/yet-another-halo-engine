@@ -6,7 +6,7 @@ Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for 
 An envelope past its buffer does not fault on this GPU: the shader reads unmapped VA and the gfx ring times out.
 emit_prefill_pp runs this on every generated GEMM before it emits the HAL.
 """
-import os, subprocess, sys
+import atexit, os, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import loom_preflight as lp
@@ -29,10 +29,13 @@ bound = {"weight": M * kb * bpb, "input": B * K * 2, "resid": B * M * 4, "gate":
 sys.path.insert(0, os.path.dirname(HERE))
 import hrx_paths  # noqa: E402
 e = hrx_paths.env()
-rep = "/tmp/footprint_gate_report.json"
+# per-call temporaries: emits may run in parallel (engine/tune)
+tmp = tempfile.mkdtemp(prefix="footprint_gate_")
+atexit.register(shutil.rmtree, tmp, True)
+rep = os.path.join(tmp, "report.json")
 root = "@" + sym
 cmd = [hrx_paths.LOOM_COMPILE, src, "--root=" + root,
-       "--target=amdgpu:gfx1151", "--format=amdgpu-hsaco", "--output=/tmp/footprint_gate.hsaco",
+       "--target=amdgpu:gfx1151", "--format=amdgpu-hsaco", "--output=" + os.path.join(tmp, "k.hsaco"),
        "--compile-report=details", "--compile-report-output=" + rep,
        f"--config={sym}.m_tiles={mt}", f"--config={sym}.k_blocks={kb}", f"--config={sym}.token_tiles={tt}"]
 if "masked" in sys.argv[9:]:
