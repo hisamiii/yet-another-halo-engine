@@ -213,3 +213,39 @@ Anna Karenina. 99% / 99.9% precision = 100 exp(-KLD at that percentile).
 - The novel-calibrated WUSH transfers to code and paper.
 - 99.9% columns rest on ~4 positions per document: use mean and 99% for
   decisions.
+
+## Round 4 (2026-10-02): what fits the int4 K kernel
+
+Tier A, K-only (V exact), 16 layers, 32K:
+
+| K codec | per-group cost in kv4a4 | K-only error | softmax KL |
+|---|---|---|---|
+| kv4 | - | 0.0628 | 0.0431 |
+| ksink (KVarN Sinkhorn tiles, no rotation) | per-tile column scales (kv4a8 only) | 0.0449 | 0.0220 |
+| h256e1/e2 (pow2 exponent per 32) | ~4 VALU/WMMA | 0.0454 | 0.0243 |
+| h256s (sym per token-half) | none | 0.0440 | 0.0229 |
+| h256a (asym per token-half) | ~1 VALU/WMMA (rank-1 zero-point term) | 0.0388 | 0.0178 |
+| h256a96 (+ range .96) | ~1 VALU/WMMA | 0.0377 | 0.0167 |
+| h256sink (H256 + Sinkhorn) | kv4a8 only | 0.0384 | 0.0169 |
+| h256sg32 (sym per 32) | ~12 VALU/WMMA | 0.0379 | 0.0168 |
+| h256ag64 | ~6 VALU/WMMA | 0.0350 | 0.0144 |
+| h256g32 (asym per 32) | ~12+ VALU/WMMA; ~free in kv4a8 | 0.0306 | 0.0110 |
+
+- After H256 the 32-dim groups' ranges sit within 2x of each other, so
+  power-of-two group exponents are almost always 0.
+- KVarN's Sinkhorn is about as good as a rotation alone and redundant with
+  one.
+
+End to end, h256a96 vs h256s (mean KLD; 99% precision):
+- books: 0.00148 vs 0.00189; 98.52% vs 98.16%
+- code: 0.00127 vs 0.00170; 97.98% vs 97.31%
+- arxiv: 0.00482 vs 0.00464; 95.18% vs 94.96%
+- arxiv without the clip (h256a): mean 0.00432, 99% 94.83%
+
+The arXiv 99.9% KLD (h256a96 0.69, h256a 0.34, h256s 0.25) is decided by 3-4
+two-way-fork tokens (reference p 0.73/0.27 etc.) that every codec tips,
+including h256g32. Not a codec defect; use mean and 99% for decisions. The clip
+is a wash: it helps tier A and the 99% column and hurts the arXiv mean.
+
+Pick for kv4a4: H256 + asymmetric int4 per token-half (zero point as a rank-1
+correction). For kv4a8: asymmetric per 32-dim group, applied at staging decode.

@@ -130,6 +130,25 @@ def q_mxfp4(x, group=32, c=0.156):
     return (np.sign(g) * E2M1[idx] * sc).reshape(s)
 
 
+def sinkhorn_tile_q(x, bits=4, tile=128, iters=8):
+    """KVarN (arXiv 2606.03458): per tile of `tile` tokens x 128 dims, Sinkhorn-balance
+    rows (tokens) and columns (channels) to equal RMS, quantize the balanced tile
+    asymmetrically per row, and rescale by the stored row and column scales.
+    x [rows, H, D], rows a multiple of `tile`."""
+    r, h, d = x.shape
+    t = x.reshape(r // tile, tile, h, d // 128, 128).transpose(0, 2, 3, 1, 4)   # [nt, H, halves, tok, 128]
+    sr = np.ones(t.shape[:-1] + (1,))
+    sc = np.ones(t.shape[:-2] + (1, 128))
+    for _ in range(iters):
+        b = t / (sr * sc)
+        sr *= np.sqrt((b ** 2).mean(-1, keepdims=True)) + 1e-30
+        b = t / (sr * sc)
+        sc *= np.sqrt((b ** 2).mean(-2, keepdims=True)) + 1e-30
+    b = t / (sr * sc)
+    bq = q_asym(b, bits, 128) * sr * sc
+    return bq.transpose(0, 3, 1, 2, 4).reshape(r, h, d)
+
+
 # ---------------------------------------------------------------- codecs
 class Codec:
     """per attention layer: encode-decode one chunk [rows, H, D] (f32)"""
@@ -161,6 +180,34 @@ class Codec:
             return q_asym(y, 4, 32) @ H256.T + m
         if n == "h256s":                # centred, fixed H256, symmetric +-7 per token-half, range .96
             return q_sym_clip((x - m) @ H256, 128, 0.96) @ H256.T + m   # (the int4 K kernel's storage format)
+        if n.startswith("h256a"):       # centred, H256, asymmetric int4 (0..15 + zero point) per group;
+            # h256a: per token-half (128, kernel-friendly: zero point = rank-1 correction z * sum(q half)),
+            # h256a96: same with the range shrunk by .96; h256ag64: per 64 dims
+            y = (x - m) @ H256
+            grp = 64 if n == "h256ag64" else 128
+            yq = q_asym_clip(y, 4, grp, 0.96) if n == "h256a96" else q_asym(y, 4, grp)
+            return yq @ H256.T + m
+        if n == "ksink":                # KVarN Sinkhorn tiles, centred, no rotation
+            return sinkhorn_tile_q(x - m) + m
+        if n == "h256sink":             # H256 rotation, then KVarN Sinkhorn tiles
+            return sinkhorn_tile_q((x - m) @ H256) @ H256.T + m
+        if n == "h256sg32":             # centred, H256, symmetric +-7 per 32 dims, free f16 scale per group
+            return q_sym((x - m) @ H256, 4, 32) @ H256.T + m
+        if n.startswith("h256e"):       # centred, H256, symmetric +-7: one scale per token-half (128) and a
+            # power-of-two exponent per 32-dim group, scale_g = s_half / 2^e, e in 0..2^bits-1
+            # (the largest e whose range still covers the group). h256e2: 2-bit, h256e1: 1-bit.
+            nb = int(n[5:])
+            y = (x - m) @ H256
+            sh = y.shape
+            g = y.reshape(*sh[:-1], 2, 4, 32)                      # [.., half, group, 32]
+            gmax = np.abs(g).max(-1, keepdims=True)
+            s_half = gmax.max(-2, keepdims=True) / 7
+            s_half[s_half == 0] = 1
+            e = np.floor(np.log2(np.maximum(s_half * 7, 1e-30) / np.maximum(gmax, 1e-30)))
+            e = np.clip(e, 0, 2 ** nb - 1)
+            sc = s_half / 2.0 ** e
+            yq = np.clip(np.round(g / sc), -7, 7) * sc
+            return yq.reshape(sh) @ H256.T + m
         if n == "h128":                 # centred, H128 per half, per token-half (our KROT)
             y = np.concatenate([(x - m)[..., :128] @ H128, (x - m)[..., 128:] @ H128], -1)
             yq = q_sym(y, 4, 128)
