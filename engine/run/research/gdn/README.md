@@ -89,3 +89,14 @@ Next structural step (not done): FLA's 3-kernel split.
   fragments shared by X and O1 are loaded twice in v5), C = 64 to halve the
   per-token state-copy cost (but 1 WG per WGP), or a different row/key split.
   Each is worth single-digit percent of DeltaNet.
+
+## Shipped (2026-10-02): p70 = p63 + chunked GDN (v5 + O1LATE + alpha clamp)
+
+- Standalone pp2048: 3.566 M cycles vs 4.116 M recurrent.
+- In the pipeline: DeltaNet -10.5% (pp2048) / -12.9% (pp8192).
+- Bug found by gate v2 at 8K/32K (not by the layer-0 harness): alpha
+  underflows to 0 for some tokens deep in the model. log2 -> -inf and the decay
+  differences -inf - -inf give NaN, which then stays in the state (arXiv went
+  non-finite from position 4800). Fix: clamp log2 alpha at -100.
+- Lesson: the standalone harness needs inputs from several layers / documents,
+  not only layer 0 of one window.

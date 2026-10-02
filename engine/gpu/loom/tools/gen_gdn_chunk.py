@@ -38,7 +38,10 @@ import sys
 # out[slot * 16384 dwords] after phases 1, 2, 3, 4, 5 (slots 0..4)
 DBG = os.environ.get("GDN_DBG", "0") == "1"
 # GDN_ABL (ablation, wrong results): "solve" = T = I (no forward substitution)
-ABL = os.environ.get("GDN_ABL", "")   # also "prep": no KK/QK, no solve (+ their barriers)
+ABL = os.environ.get("GDN_ABL", "")
+# GDN_O1LATE=1: compute O1 = Q S^T next to X = W S^T, sharing the S fragment
+# loads (default: O1 early, overlapping wave 0's solve)
+O1LATE = os.environ.get("GDN_O1LATE", "1") == "1"   # default: 3.676 -> 3.566 M (shared S loads)   # also "prep": no KK/QK, no solve (+ their barriers)
 
 C, R, D = 32, 64, 128
 V8 = "vector<8xf32>"
@@ -322,7 +325,11 @@ def gen():
             e(f"{I}view.store %seh{j}{i}, %s_w[%ser{j}{i}, %sek{j}{i}] : f16, view<64x136xf16>")
     # decay: wave 0, lane = token: G2 = inclusive scan of log2 alpha (one barrier)
     e(f"{I}scf.if %isw0 {{")
-    e(f"{I}  %lg = scalar.log2f<afn> %alpha : f32")
+    # alpha can underflow to 0 (exp of a large negative): log2 -> -inf, and
+    # -inf - -inf = NaN in the decay differences. Clamp at 2^-100 (= no carry-over).
+    e(f"{I}  %lg0 = scalar.log2f<afn> %alpha : f32")
+    e(f"{I}  %lgmin = scalar.constant -100.0 : f32")
+    e(f"{I}  %lg = scalar.maxnumf %lg0, %lgmin : f32")
     e(f"{I}  %g2 = kernel.subgroup.scan<addf> %lg {{mode = inclusive, direction = forward}} : f32")
     e(f"{I}  %c31i = scalar.constant 31 : i32")
     e(f"{I}  %gtot = kernel.subgroup.broadcast %g2 from %c31i : f32, i32")
@@ -401,6 +408,8 @@ def gen():
     if ABL == "prep":
         e(f"{I}%zs = vector.fragment<init> %zeros8 shape [%m, %n] : {V8}")
     # ---- O1 = Q S^T (every wave; waves 1-7 run it while wave 0 solves)
+    if O1LATE:
+        e = lambda *_: None
     e(f"{I}%oq0 = index.add %ut0, %c32 : index")
     oa = "%zs"
     for c in range(8):
@@ -409,6 +418,7 @@ def gen():
         e(f"{I}%oa{c} = vector.fragment.load<lhs> %kq_l[%oq0, %xk{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
         e(f"{I}%oc{c} = vector.mma %oa{c}, %xb{c}, {oa} : {V16H}, {V16H}, {V8}")
         oa = f"%oc{c}"
+    e = L.append
     if ABL == "prep":
         e = lambda *_: None
     # ---- phase 3: T = (I + A)^-1 by forward substitution, wave 0, lane = column
@@ -483,11 +493,20 @@ def gen():
     dbg(3)
     # ---- phase 5: X = W S^T, O1 = Q S^T (tile tokens ut0, rows ur0)
     xa = "%zs"
+    if O1LATE:
+        e(f"{I}%oq0 = index.add %ut0, %c32 : index")
+        oa = "%zs"
     for c in range(8):
+        if O1LATE:
+            e(f"{I}%xk{c} = index.constant {16 * c} : index")
         e(f"{I}%xb2{c} = vector.fragment.load<rhs> %s_r[%xk{c}, %ur0] shape [%k, %n] : view<128x64xf16, %ss_lay> -> {V16H}")
         e(f"{I}%xa{c} = vector.fragment.load<lhs> %kq_l[%ut0, %xk{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
         e(f"{I}%xc{c} = vector.mma %xa{c}, %xb2{c}, {xa} : {V16H}, {V16H}, {V8}")
         xa = f"%xc{c}"
+        if O1LATE:
+            e(f"{I}%oa{c} = vector.fragment.load<lhs> %kq_l[%oq0, %xk{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
+            e(f"{I}%oc{c} = vector.mma %oa{c}, %xb2{c}, {oa} : {V16H}, {V16H}, {V8}")
+            oa = f"%oc{c}"
     e(f"{I}%vn8 = vector.subf {uacc}, {xa} : {V8}")
     gts, gcs = [], []
     for i in range(8):

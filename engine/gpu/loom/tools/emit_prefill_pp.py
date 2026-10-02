@@ -439,8 +439,15 @@ def main():
         tmp = os.path.join(outdir, ".emit_tmp")
         os.makedirs(tmp, exist_ok=True)
         dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
+        # YAH_DN_CHUNK=1 (default): chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py,
+        # engine/run/research/gdn): same ABI and (2, heads) grid, f16 WMMA inputs
+        # (output rel 2.1e-4 vs this kernel, end-to-end KLD ~3e-6), standalone
+        # pp2048 3.57 vs 4.12 M cycles. Needs B % 32 == 0 (else the recurrent kernel).
+        chunk_dn = os.environ.get("YAH_DN_CHUNK", "1") == "1" and B % 32 == 0
+        if chunk_dn:
+            import gen_gdn_chunk
         with open(dn_src, "w") as fh:
-            fh.write(gen_deltanet_hip.gen())
+            fh.write(gen_gdn_chunk.gen() if chunk_dn else gen_deltanet_hip.gen())
         geom.append(("rowsplit.hal", 0, 2, 0))
 
     # Record the resolved launch geometry with the prepared executables.

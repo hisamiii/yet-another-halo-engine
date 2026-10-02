@@ -45,3 +45,16 @@ Decision, 2026-10-01: FA attention accepted as the default.
 - Treat kl_mean ~4e-7 as the "one rounding change in attention" floor. New
   exact-change references are p63, hidden md5 f0dbf625bfe0f892 (pp2048) and
   4517ea645cd7dcfe (pp8192), replacing a2145e371ceefd4d / e94924b79ae21e57.
+
+Decision, 2026-10-02: chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py) is the
+default (emitter YAH_DN_CHUNK=1; 0 restores the HIP-order recurrent kernel).
+- New exact-change references are p70: hidden md5 ac36332b6b5092a4 (pp2048)
+  and 963b7396625e2333 (pp8192).
+- p70 with YAH_DN_CHUNK=0 reproduces p63's f0dbf625bfe0f892 / 4517ea645cd7dcfe
+  exactly: the only difference is DeltaNet.
+- Gate v2 on the hardest document (arXiv 2608.13365), vs the p63 fp16 references:
+  - 8K: mean KLD 0.000008, 99% precision 99.98%, same top 99.89%;
+  - 32K chunked: mean KLD 0.000004, 99.98%, same top 99.95%.
+- Speed (SQ_BUSY_CYCLES, one round each): DeltaNet -10.5% at pp2048
+  (188.0 -> 168.4 M), -12.9% at pp8192 (749.4 -> 652.5 M), i.e. 0.27% / 0.33%
+  of total cycles.
