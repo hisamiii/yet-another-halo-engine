@@ -1,8 +1,4 @@
-// HRX-native runtime layer for the Loom engine path. No HIP.
-//
-// Thin RAII wrappers over the HRX native API: device, stream, executable,
-// buffer, and a dispatch helper. This is the layer that will replace the HIP
-// Launch* calls in model/forward.hip.
+// Thin RAII wrappers over the HRX native API: device, stream, executable, buffer, and a dispatch helper.
 #ifndef YAH_MODEL_LOOM_RUNTIME_HPP_
 #define YAH_MODEL_LOOM_RUNTIME_HPP_
 

@@ -4,8 +4,7 @@ engine/run/RESEARCH_PREFILL.md section 3).
 
 Inputs are directories holding per-window f32 logits of the scored positions,
 `wNN.all_logits` (rows = positions FROM..2047, vocab-major rows), as written by
-loom_forward_pp with YAH_LOGITS_FROM=FROM (tools: gate_run.sh) or cut from
-yah-run --dump-all-logits (gate_hip.sh). The token ids of each window
+loom_forward_pp with YAH_LOGITS_FROM=FROM (gate_run.sh). The token ids of each window
 (corpus/ids2048_wNN.txt) give the next-token targets for NLL.
 
   accgate2.py stats     <golden_dir> <cand_dir> [--windows 00,01,...]
