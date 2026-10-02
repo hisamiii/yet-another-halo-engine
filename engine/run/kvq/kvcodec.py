@@ -159,6 +159,8 @@ class Codec:
         if n == "h256g32":              # centred, H256, asym int4 per 32 dims
             y = (x - m) @ H256
             return q_asym(y, 4, 32) @ H256.T + m
+        if n == "h256s":                # centred, fixed H256, symmetric +-7 per token-half, range .96
+            return q_sym_clip((x - m) @ H256, 128, 0.96) @ H256.T + m   # (the int4 K kernel's storage format)
         if n == "h128":                 # centred, H128 per half, per token-half (our KROT)
             y = np.concatenate([(x - m)[..., :128] @ H128, (x - m)[..., 128:] @ H128], -1)
             yq = q_sym(y, 4, 128)

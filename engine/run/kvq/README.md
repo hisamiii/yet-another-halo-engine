@@ -171,3 +171,12 @@ Tier A, pg1399 32K, all 16 attention layers. Median attention-output error:
 Tier C v2 (256 keys, 8 reassigned, 3 x 32K, 72 queries): still saturated for
 every 4-bit codec (d log p within +-0.03, CIs span 0). bad3 loses at early
 depth (-0.66 nats for depths < 0.33, worst -9.3), exact match 86% vs 93%.
+
+h256s (centred, fixed H256, symmetric +-7 per token-half, range .96: the int4
+K kernel's format with no calibration):
+- tier A K-only 4.4e-2 (wushs 4.2e-2);
+- tier B KL 1.89e-3 (wushs-static 1.76e-3), p99.9 5.4e-2 [4.2, 7.6]e-2,
+  dPPL +0.01% (n.s.).
+
+WUSH's calibration adds only ~7% over a fixed Hadamard in this format; the
+rotation does nearly all of the work.
