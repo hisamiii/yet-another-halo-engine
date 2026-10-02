@@ -4,6 +4,9 @@ What is next, and what is planned but not built. Numbers behind the leads are in
 
 ## Next leads
 
+- Prefill autotuner: per-kernel `Tile` (BN, wave layout, KSUB, decode-ahead, ...) per token-count bucket, written as a `YAH_TILES` table. In: the knob refactor, `YAH_TILES`, masked last tiles, runtime token counts, the calibrated cost model (scratch). Next: the BN = 128 test (6 resident waves per SIMD vs 4), an occupancy sweep to calibrate the model's latency term, a persistent bench harness, the search driver.
+- Prefill, partial chunks: only the GEMMs shrink to the real tokens; the norms and other small kernels still run the whole chunk (~250 ms). Shrinking them too changed the last token's logits by ~1e-4 when it sat alone in its 16-token group (likely the 32-token DeltaNet chunk); find that first.
+- Kernel overlap: in an HRX graph a barrier drains all earlier work on the one GPU queue, so only kernels between the same barriers overlap. Targeted waits or a second queue (upstream HRX) would let the DeltaNet and attention overlap GEMMs and make cross-chunk pipelining pay (about 1-2% at 2048-token chunks, ~4% at 512).
 - Decode, kv4a16 attention: `part_q` with kv4 is latency-bound (~91 GB/s, 347 us per call at 30.7K). Bandwidth-bound it would be ~160 us, about -3 ms per token at 30K. The per-workgroup q rotation, barriers and group sums are the suspects.
 - Decode, dispatch overlap: re-measure the no-barrier overlap (-1.4 ms when it was added). A single uncooled round after the cleanup showed no gain.
 - Speculative decoding (drafting): planned.

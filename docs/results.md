@@ -174,6 +174,7 @@ Prefill GEMMs:
 
 Prefill attention, DeltaNet and pipeline:
 
+- DeltaNet gate projection recorded beside the DeltaNet in the prefill graph: neutral (3036.8 vs 3032.0 ms). A graph barrier drains all earlier work, and the GEMM's workgroups only start once the DeltaNet's 96 are all placed (1.2 ms in).
 - HIP-order attention, key-loop unroll(2): 80.59 -> 79.03 M cycles with 31 spill stores; not adopted.
 - FA attention, 32-key tiles: 64.6 -> 72.5 M cycles; LDS 53.8 KB allows only 2 workgroups per WGP.
 - FA attention, GQA packing (6 heads x 16 tokens, 12 waves): 64.6 -> 66.8 M cycles; 4x less DRAM, but less phase diversity with 2 x 12 waves.
