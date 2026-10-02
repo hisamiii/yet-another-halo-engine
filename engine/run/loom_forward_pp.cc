@@ -231,7 +231,7 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
     for (std::uint32_t ci = 0; ci < n_chunks; ++ci) {
-      pf.Embed(ids.data() + std::size_t{ci} * B);
+      pf.Embed(ids.data() + std::size_t{ci} * B, B);
       pf.RunLayers(ci, hook ? layer_hook : LoomPrefill::KvHook{});
       for (std::uint32_t ra = std::max(logits_from, ci * B); logits_from < T_run && ra < (ci + 1) * B; ++ra)
         pf.Head(ra - ci * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});

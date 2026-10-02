@@ -1,0 +1,5 @@
+-std=c++20
+-xc++
+-Iengine
+-Iengine/third_party
+-I/home/q/hrx/libhrx/include

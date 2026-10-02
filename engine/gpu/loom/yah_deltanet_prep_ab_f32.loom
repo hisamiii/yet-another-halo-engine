@@ -1,10 +1,12 @@
 // DeltaNet prep: one launch does two unrelated jobs, each over its own range of the lane index i.
-//   i < qkv_size: advance the conv history ring of channel c = i.
-//     tail[j] = (batch + j >= 4) ? qkv_in[(batch + j - 4)*qkv_size + c] : conv_state[c*4 + batch + j], j = 0..3
+// valid (runtime, 1..batch): the chunk's real tokens; tokens t >= valid are padding.
+//   i < qkv_size: advance the conv history ring of channel c = i past the real tokens.
+//     tail[j] = (valid + j >= 4) ? qkv_in[(valid + j - 4)*qkv_size + c] : conv_state[c*4 + valid + j], j = 0..3
 //     All four ring values are read before any is written: the read slot batch+j is always past the write slot j.
 //   i < count = batch*num_heads, h = i % num_heads: the per-token-head gate (alpha) and beta.
 //     alpha_softplus = (alpha_buf[i] + ssm_dt[h] > 20) ? alpha_buf[i] + ssm_dt[h] : log1p(exp(alpha_buf[i] + ssm_dt[h]))
 //     ab[2i] = exp(alpha_softplus * ssm_a[h]), ab[2i + 1] = 1 / (1 + exp(-beta_buf[i]))
+//     Padding tokens get ab = (1, 0): decay 1 and no update, so they leave the DeltaNet state unchanged.
 // The > 20 branch prevents exp overflow; it is not an approximation.
 // Grid: ceil((count + qkv_size) / 256) x 256 lanes; this covers max(count, qkv_size), the extra lanes are idle.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
@@ -28,7 +30,7 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
   %span = index.add %span0, %c255 : index
   %tiles = index.div %span, %c256 : index
   kernel.launch.config workgroups(%tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
-} launch(%alpha: buffer, %beta: buffer, %ssm_a: buffer, %ssm_dt: buffer, %qkv: buffer, %state: buffer, %ab: buffer) {
+} launch(%alpha: buffer, %beta: buffer, %ssm_a: buffer, %ssm_dt: buffer, %qkv: buffer, %state: buffer, %ab: buffer, %valid: buffer) {
   %base = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -55,6 +57,11 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
   %qkv_view = buffer.view %qkv_na[%base] : buffer -> view<[%qkv_total]xf32>
   %state_view = buffer.view %state_na[%base] : buffer -> view<[%state_total]xf32>
   %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>
+  %valid_view = buffer.view %valid[%base] : buffer -> view<1xi32>
+  %valid_raw = view.load %valid_view[%c0] : view<1xi32> -> i32
+  %valid_idx = index.cast %valid_raw : i32 to index
+  %valid_lo = index.max %valid_idx, %c1 : index
+  %vld = index.min %valid_lo, %batch : index
   %wg = kernel.workgroup.id<x> : index
   %lane = kernel.workitem.id<x> : index
   %wg_base = index.mul %wg, %c256 : index
@@ -72,7 +79,7 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
     %ring2 = view.load %state_view[%ring2_off] : view<[%state_total]xf32> -> f32
     %ring3 = view.load %state_view[%ring3_off] : view<[%state_total]xf32> -> f32
     %channel_shift = scf.for %j = [%c0 to %c4 step %c1](%mark = %zero : f32) -> (f32) {
-      %bj = index.add %batch, %j : index
+      %bj = index.add %vld, %j : index
       %d0 = index.sub %bj, %c0 : index
       %d1 = index.sub %bj, %c1 : index
       %d2 = index.sub %bj, %c2 : index
@@ -135,10 +142,14 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
     %beta_exp = scalar.expf<afn> %negative_beta : f32
     %denominator = scalar.addf %one, %beta_exp : f32
     %beta_out = scalar.divf %one, %denominator : f32
+    %token = index.div %i, %num_heads : index
+    %real = index.cmp ult, %token, %vld : index
+    %alpha_st = scf.select %real, %alpha_out, %one : f32
+    %beta_st = scf.select %real, %beta_out, %zero : f32
     %twice = index.mul %i, %c2 : index
     %odd = index.add %twice, %c1 : index
-    view.store %alpha_out, %ab_view[%twice] : f32, view<[%ab_total]xf32>
-    view.store %beta_out, %ab_view[%odd] : f32, view<[%ab_total]xf32>
+    view.store %alpha_st, %ab_view[%twice] : f32, view<[%ab_total]xf32>
+    view.store %beta_st, %ab_view[%odd] : f32, view<[%ab_total]xf32>
   }
   kernel.return
 }

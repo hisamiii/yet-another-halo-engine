@@ -1,0 +1,214 @@
+// Engine: the GPU text generator. Loads the model, a chunked prefill HAL set and a decode HAL set once, then serves
+// Generate() calls one at a time: prefill the prompt in chunks, then decode.
+// A prompt that ends inside a chunk finishes either with a padded (masked) chunk or with decode steps, whichever the
+// measured costs say is faster for its tail.
+#ifndef YAH_MODEL_ENGINE_HPP_
+#define YAH_MODEL_ENGINE_HPP_
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <random>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "core/config.hpp"
+#include "core/gguf.hpp"
+#include "core/tokenizer.hpp"
+#include "model/generator.hpp"
+#include "model/loom_decoder.hpp"
+#include "model/loom_prefill.hpp"
+#include "model/loom_runtime.hpp"
+
+namespace yah::model {
+
+class Engine : public TextGenerator {
+ public:
+  struct Options {
+    std::string model;        // GGUF path
+    std::string prefill_hal;  // emit_prefill_pp.py set (chunked, paged)
+    std::string decode_hal;   // emit_decode.py set with the prefill's context and YAH_KV
+  };
+  // How the tokens after the last whole chunk are run.
+  enum class Tail { kAuto, kChunk, kDecode };
+  void set_tail(Tail t) { tail_ = t; }
+
+  explicit Engine(const Options& o)
+      : gguf_(core::Gguf::Open(o.model)),
+        cfg_(core::Qwen35Config::FromGguf(gguf_)),
+        tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
+        weights_(gpu_, gguf_.tensor_data_base(), gguf_.tensor_data_size()),
+        prefill_(gpu_, gguf_, cfg_, o.prefill_hal, weights_.handle(), weights_.delta()),
+        decoder_(gpu_, gguf_, cfg_, o.decode_hal, weights_.handle(), weights_.delta()) {
+    if (decoder_.context() != prefill_.pool_rows())
+      throw LoomError("engine: decode set context " + std::to_string(decoder_.context()) + " != prefill pool rows " +
+                      std::to_string(prefill_.pool_rows()));
+    if (decoder_.kv_bits() != prefill_.kv_bits())
+      throw LoomError("engine: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
+    gpu_.SetSleepSync(200);
+    logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
+    token_ = gpu_.Allocate(4);
+    seed_ = gpu_.Allocate(8);
+    host_logits_.resize(LoomPrefill::kVocab);
+    const core::MetadataValue* name = gguf_.Meta("general.name");
+    name_ = name && !name->s.empty() ? name->s : "qwen3.8-27b";
+  }
+
+  [[nodiscard]] const core::Tokenizer& tokenizer() const override { return tokenizer_; }
+  [[nodiscard]] std::uint32_t context() const override { return prefill_.context(); }
+  [[nodiscard]] std::string model_name() const override { return name_; }
+
+  GenerateResult Generate(const std::vector<core::TokenId>& prompt, const GenerateParams& params,
+                          const std::function<bool(core::TokenId)>& on_token) override {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint32_t n = static_cast<std::uint32_t>(prompt.size());
+    if (n == 0) throw LoomError("engine: empty prompt");
+    for (core::TokenId id : prompt)
+      if (id >= LoomPrefill::kVocab) throw LoomError("engine: token id outside the vocabulary");
+    if (std::uint64_t{n} + params.max_tokens > context()) throw LoomError("engine: prompt + max_tokens exceeds context");
+    GenerateResult r;
+    r.prompt_tokens = n;
+    std::mt19937_64 rng(params.sampling.seed ? params.sampling.seed
+                                             : static_cast<std::uint64_t>(t0.time_since_epoch().count()));
+    const bool greedy = params.sampling.temperature <= 0.0f;
+
+    // Prompt: whole chunks through the prefill; the tail as one more (padded) chunk or through decode steps.
+    prefill_.Reset();
+    decoder_.Bind(prefill_.DecoderState());
+    const std::uint32_t B = prefill_.chunk(), full = n / B * B, tail = n - full;
+    const bool tail_chunk =
+        tail && (tail_ == Tail::kChunk || (tail_ == Tail::kAuto && tail * step_ms_ > chunk_ms_));
+    const std::uint32_t chunks = full / B + (tail_chunk ? 1 : 0);
+    for (std::uint32_t c = 0; c < chunks; ++c) {
+      const auto tc = std::chrono::steady_clock::now();
+      const std::uint32_t valid = std::min(B, n - c * B);
+      prefill_.Embed(prompt.data() + std::size_t{c} * B, valid);
+      LoomPrefill::KvHook hook;
+      if (valid % 16 && decoder_.kv_bits().second != 16) {
+        // Quantized V and the prompt ends mid-tile: seed the decoder's open tile with that tile's real V rows.
+        const std::int32_t rc[2] = {static_cast<std::int32_t>(valid - valid % 16), static_cast<std::int32_t>(valid % 16)};
+        gpu_.H2D(seed_, rc, 8);
+        hook = [&](std::uint32_t ai, std::uint32_t, std::size_t, std::size_t voff) {
+          prefill_.SeedOpenTile(voff, Ref(seed_), decoder_.OpenTile(ai));
+        };
+      }
+      prefill_.RunLayers(c, hook);
+      if (c + 1 == chunks && (tail_chunk || tail == 0)) prefill_.Head(valid - 1, Ref(logits_));
+      if (c + 1 == chunks) gpu_.Synchronize();
+      Track(chunk_ms_, std::chrono::steady_clock::now() - tc, c + 1 == chunks);
+    }
+    core::TokenId tok;
+    if (tail == 0 || tail_chunk) {
+      decoder_.ResumeAt(n);
+      tok = Pick(greedy, params.sampling, rng, /*from_decoder=*/false);
+    } else {
+      decoder_.SetTokens(prompt.data() + full, tail, full);
+      const auto ts = std::chrono::steady_clock::now();
+      for (std::uint32_t pos = full; pos < n; ++pos) decoder_.Step(pos, n);
+      tok = Pick(greedy, params.sampling, rng, /*from_decoder=*/true, n);
+      Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    r.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // Decode: report each token, then run the step that consumes it.
+    r.finish_reason = "length";
+    for (std::uint32_t pos = n;; ++pos) {
+      if (std::find(params.stop_ids.begin(), params.stop_ids.end(), tok) != params.stop_ids.end()) {
+        r.finish_reason = "stop";
+        break;
+      }
+      ++r.generated_tokens;
+      if (!on_token(tok)) {
+        r.finish_reason = "stop";
+        break;
+      }
+      if (r.generated_tokens >= params.max_tokens) break;
+      decoder_.SetTokens(&tok, 1, pos);
+      decoder_.Step(pos, pos);
+      tok = Pick(greedy, params.sampling, rng, /*from_decoder=*/true, pos + 1);
+    }
+    r.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    if (r.generated_tokens > 1) step_ms_ = 0.8 * step_ms_ + 0.2 * r.decode_ms / (r.generated_tokens - 1);
+    return r;
+  }
+
+ private:
+  static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
+  // Running estimate of a cost in ms; only timings that include the GPU work (synced) count.
+  template <class D>
+  static void Track(double& est, D elapsed, bool synced) {
+    if (synced) est = 0.8 * est + 0.2 * std::chrono::duration<double, std::milli>(elapsed).count();
+  }
+
+  // The next token: argmax on the GPU when greedy, else sampled on the host from the logits.
+  // from_decoder: the decoder's last step produced the logits (and wrote its argmax to token position at).
+  core::TokenId Pick(bool greedy, const SamplingParams& s, std::mt19937_64& rng, bool from_decoder,
+                     std::uint32_t at = 0) {
+    if (greedy) {
+      if (from_decoder) {
+        gpu_.Synchronize();
+        return decoder_.Tokens(at, at + 1)[0];
+      }
+      prefill_.Argmax(Ref(logits_), Ref(token_));
+      gpu_.Synchronize();
+      core::TokenId t = 0;
+      gpu_.D2H(token_, &t, 4);
+      return t;
+    }
+    gpu_.Synchronize();
+    if (from_decoder)
+      decoder_.CopyLogits(host_logits_.data());
+    else
+      gpu_.D2H(logits_, host_logits_.data(), host_logits_.size() * 4);
+    return Sample(host_logits_, s, rng);
+  }
+
+  // Temperature + nucleus (top_p) sampling over the full vocabulary.
+  static core::TokenId Sample(const std::vector<float>& logits, const SamplingParams& s, std::mt19937_64& rng) {
+    const float inv_t = 1.0f / s.temperature;
+    const float mx = *std::max_element(logits.begin(), logits.end());
+    // Tokens below 1e-9 of the top probability cannot matter for any top_p; skip them to keep the sort small.
+    const float cut = mx - std::log(1e9f) * s.temperature;
+    std::vector<std::pair<float, core::TokenId>> c;
+    for (core::TokenId i = 0; i < logits.size(); ++i)
+      if (logits[i] >= cut) c.push_back({std::exp((logits[i] - mx) * inv_t), i});
+    std::sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    double total = 0.0;
+    for (const auto& p : c) total += p.first;
+    if (s.top_p < 1.0f) {
+      double keep = 0.0;
+      std::size_t k = 0;
+      while (k < c.size() && keep < s.top_p * total) keep += c[k++].first;
+      c.resize(std::max<std::size_t>(k, 1));
+      total = keep;
+    }
+    double u = std::uniform_real_distribution<double>(0.0, total)(rng);
+    for (const auto& p : c) {
+      u -= p.first;
+      if (u <= 0.0) return p.second;
+    }
+    return c.back().second;
+  }
+
+  core::Gguf gguf_;
+  core::Qwen35Config cfg_;
+  core::Tokenizer tokenizer_;
+  LoomDevice gpu_;
+  LoomWeights weights_;
+  LoomPrefill prefill_;
+  LoomDecoder decoder_;
+  LoomBuffer logits_, token_, seed_;
+  Tail tail_ = Tail::kAuto;
+  double chunk_ms_ = 3100.0, step_ms_ = 62.0;  // prefill chunk and decode step costs (pp2048, short context)
+  std::vector<float> host_logits_;
+  std::string name_;
+};
+
+}  // namespace yah::model
+
+#endif  // YAH_MODEL_ENGINE_HPP_

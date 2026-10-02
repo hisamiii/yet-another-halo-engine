@@ -282,6 +282,10 @@ def main():
         geom.append(("attn_kq4" if kq4_mode else "attn_kq8", 0, 0, 0))
     # V^T as bytes / nibbles per channel per 16-key tile + (S, C') by yah_vq8 / yah_vq4 instead of the f16 transpose.
     vq4_on = kv_v == 4
+    # Quantized V: the decoder's open 16-key tile is seeded from the last chunk's f16 V rows (prefill ending mid-tile).
+    vseed_src = os.path.join(tmp, "yah_vseed.loom")
+    if kv_v != 16:
+        open(vseed_src, "w").write(gen_kvq.gen_vseed())
     if vq4_on:
         vq4_src = os.path.join(tmp, "yah_vq4.loom")
         open(vq4_src, "w").write(gen_kvq.gen_vq4())
@@ -397,8 +401,7 @@ def main():
             ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % T, "yah_kvq.start_pos=%d" % (c * B)])
            for c in range(NCH)]
           if vq4_on else []),
-        *([("yah_conv_state_f32.loom", "convstate.hal",
-            ["yah_conv_state.batch=%d" % B, "yah_conv_state.channels=10240"])] if NCH > 1 else []),
+        *([(vseed_src, "vseed.hal", ["yah_kvq.token_count=%d" % B])] if (vq8_on or vq4_on) else []),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",
          ["yah_rmsnorm.rows=1", "yah_rmsnorm.eps=1e-06"]),
         ("yah_gemv_q6k_f32.loom", "gemv.hal",

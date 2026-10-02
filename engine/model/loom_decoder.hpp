@@ -128,6 +128,10 @@ class LoomDecoder {
   // KV bits of this set: (16, 16) for fp16, else (8 | 4, 8 | 4).
   [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> kv_bits() const { return {kbits_, vbits_}; }
   [[nodiscard]] bool quant() const { return kbits_ != 16; }
+  // Quantized V: layer ai's open 16-key tile ([1024 dims][16 keys] f16), for seeding after a prefill that ends mid-tile.
+  [[nodiscard]] hrx_buffer_ref_t OpenTile(std::uint32_t ai) const { return vopen_.at(ai); }
+  // The next Step may start at pos even inside a tile: the open tiles hold that tile's earlier keys (seeded).
+  void ResumeAt(std::uint32_t pos) { next_pos_ = pos; }
   // Quantized pool bytes per layer (gen_kvq.py layouts).
   std::size_t KqBytes() const { return std::size_t{T_} * (kbits_ == 4 ? 512 : 1024); }
   std::size_t KsBytes() const { return std::size_t{T_} * (kbits_ == 4 ? 128 : 32); }

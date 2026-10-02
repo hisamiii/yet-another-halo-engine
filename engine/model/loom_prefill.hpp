@@ -79,19 +79,25 @@ class LoomPrefill {
     Zero(*state_);
   }
 
-  // Host-dequantize the token_embd rows of ids[0..B) into hidden(). Waits for queued work that reads hidden().
-  void Embed(const std::uint32_t* ids) {
+  // Host-dequantize the token_embd rows of ids[0..n) into hidden() for the next RunLayers. n < B pads the chunk with
+  // the last token: padding tokens leave the recurrent state unchanged, and attention is causal, so the real tokens'
+  // results and the state carried forward are exact. Waits for queued work that reads hidden().
+  void Embed(const std::uint32_t* ids, std::uint32_t n) {
+    if (n == 0 || n > B_) throw LoomError("prefill: chunk token count out of range");
     gpu_.Synchronize();
     const auto* emb = Find("token_embd.weight");
     const std::uint8_t* data = gguf_.Data(*emb);
     for (std::uint32_t t = 0; t < B_; ++t) {
-      if (ids[t] >= kVocab) throw LoomError("token id " + std::to_string(ids[t]) + " is outside the vocabulary");
+      const std::uint32_t id = ids[std::min(t, n - 1)];
+      if (id >= kVocab) throw LoomError("token id " + std::to_string(id) + " is outside the vocabulary");
       if (static_cast<std::uint32_t>(emb->type) == 23)
-        DequantIq4XsRow(data, ids[t], host_hidden_.data() + std::size_t{t} * kHidden);
+        DequantIq4XsRow(data, id, host_hidden_.data() + std::size_t{t} * kHidden);
       else
-        DequantQ4KRow(data, ids[t], host_hidden_.data() + std::size_t{t} * kHidden);
+        DequantQ4KRow(data, id, host_hidden_.data() + std::size_t{t} * kHidden);
     }
     gpu_.H2D(*hidden_, host_hidden_.data(), host_hidden_.size() * 4);
+    const std::int32_t valid = static_cast<std::int32_t>(n);
+    gpu_.H2D(*valid_, &valid, 4);
   }
 
   // Enqueue the 64 layers for chunk ci (absolute positions ci * B ..), on the hidden() rows from Embed().
@@ -122,6 +128,13 @@ class LoomPrefill {
   // Argmax of kVocab f32 logits into dst (one u32).
   void Argmax(const hrx_buffer_ref_t& logits, const hrx_buffer_ref_t& dst) {
     Dispatch(Exe("argmax.hal"), "yah_argmax", 1, 1, 1, 32, 1, 1, {logits, dst});
+  }
+
+  // Quantized V, from a KvHook of the last chunk: copy rows r0..r0+cnt of the layer's f16 V (voff in kv16()) into a
+  // decoder's open tile dst. params: device i32 (r0, cnt).
+  void SeedOpenTile(std::size_t voff, const hrx_buffer_ref_t& params, const hrx_buffer_ref_t& dst) {
+    Dispatch(Exe("vseed.hal"), "yah_vseed", 4, 1, 1, 256, 1, 1,
+             {{kv16_->handle, voff, std::size_t{B_} * kKvRow * 2}, params, dst});
   }
 
   // The KV pools, page table and recurrent state, for a LoomDecoder with the same context and KV format.
@@ -344,6 +357,7 @@ class LoomPrefill {
     partial_ = &Alloc(B * kHidden * 4);
     hidden2_ = &Alloc(B * kHidden * 4);
     normed_ = &Alloc(std::size_t{kHidden} * 4);
+    valid_ = &Alloc(4);
     host_hidden_.resize(B * kHidden);
     const float epsv = 1.0e-6f;
     gpu_.H2D(*eps_, &epsv, 4);
@@ -416,8 +430,6 @@ class LoomPrefill {
     for (const char* hal : {"norm.hal", "convkq.hal", "prepab.hal", "rowsplit.hal", "postnorm.hal", "unpack.hal",
                             "gemv.hal", "rmsnorm.hal", "argmax.hal", "accum.hal"})
       Exe(hal);
-    chunked_ = T_ > B_;
-    if (chunked_) Exe("convstate.hal");
   }
 
   // Bindings shared by every GEMM: weights, then the IQ grid / sign tables the format needs.
@@ -610,14 +622,12 @@ class LoomPrefill {
     // The conv with the q / k L2 norm (prep_kq) fused in.
     Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_, 1, 256, 1, 1,
              {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
-    // Chunked sets: the next chunk's conv (or the decoder) reads this chunk's last 3 inputs.
-    if (chunked_) Dispatch(Exe("convstate.hal"), "yah_conv_state", (kQkv + 255) / 256, 1, 1, 256, 1, 1, {Ref(*qkv_), cs});
-    // One lane index does two jobs: the conv-history ring for i < qkv_size and alpha/beta for i < B * heads.
-    // So the grid covers max() of the two; a fixed grid silently skips alpha/beta channels at large B.
+    // One lane index does two jobs: advance the conv ring past the real tokens (i < qkv_size; the next chunk and the
+    // decoder read it) and alpha / beta (i < B * heads). So the grid covers max() of the two.
     const std::uint32_t prepab_tiles = (std::max<std::uint32_t>(B_ * kTs, kQkv) + 255u) / 256u;
     Dispatch(Exe("prepab.hal"), "yah_deltanet_prep_ab", prepab_tiles, 1, 1, 256, 1, 1,
              {Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")), TRef(*Find(pre + "ssm_dt.bias")), Ref(*qkv_), cs,
-              Ref(*ab_)});
+              Ref(*ab_), Ref(*valid_)});
     // DeltaNet grid: (blocks per head, heads) x 256, blocks per head from the "rowsplit.hal" row group.
     Dispatch(Exe("rowsplit.hal"), "yah_deltanet", dn_rowgrp_, kTs, 1, 256, 1, 1,
              {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
@@ -637,7 +647,7 @@ class LoomPrefill {
   std::map<std::string, LoomExecutable> exes_;
   std::deque<LoomBuffer> keep_;  // stable addresses
   std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, attn_hpw_ = 0, attn_tpw_ = 0;
-  bool chunked_ = false, kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
+  bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool attn_kq4_ = false, attn_kq8_ = false, attn_vq4_ = false, attn_vq8_ = false, attn_vqt_ = false;
   bool paged_f16k_ = false, paged_f16v_ = false;
   std::size_t kv_cache_ = 0, kv16_layer_ = 0, vt_bytes_ = 0, ks_bytes_ = 0, kq_bytes_ = 0, vq_bytes_ = 0,
@@ -653,7 +663,7 @@ class LoomPrefill {
              *lse_ = nullptr, *eps_ = nullptr, *ffnup_ = nullptr, *gateffn_ = nullptr, *uwstage_ = nullptr,
              *wstage_ = nullptr, *ostage_ = nullptr, *partial_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
-             *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr;
+             *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr;
 };
 
 }  // namespace yah::model
