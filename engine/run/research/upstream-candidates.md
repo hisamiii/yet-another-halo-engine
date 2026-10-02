@@ -235,3 +235,24 @@ Busiest VALU block per production kernel (`llvm-objdump`):
   largely hidden behind WMMA (~0.23 cycles per removed VALU, measured).
 - half_norm / conv / postnorm / rope: single-issue FP32, but memory-bound.
 - DeltaNet: wave64, so single instructions already use both ALU halves.
+
+## 11. Integer KV-cache decode lowering (2026-10-02, kv8a16 / kv4a16 attention)
+
+Decoding int8/int4 K/V tiles to f16 while staging costs ~3 VALU per WMMA per
+cache (standalone layer 3 at pp8192: fp16 64.49 M cycles; K8 only 69.16, V8
+only 68.17, both 72.86; K4 68.96, V4 68.55, both 72.44). Cycles track the extra
+VALU at ~1.4 M per +1 VALU/WMMA. Per output f16 pair the stock compiler emits
+shift + v_and + v_or + a register copy + v_pk_fmac_f16 (5 ops):
+- v_pk_fmac_f16 (tied accumulator) is chosen even when the addend is a splat
+  reused by 8 FMAs. Each needs a v_mov/v_or copy of the addend (8 extra ops
+  per 16 values). The untied VOP3P v_pk_fma_f16 avoids them.
+- (x & M) | G is not fused into v_and_or_b32 / v_bfi_b32. Byte gathers
+  ((w >> 8k) & 0x00ff00ff) are not selected as v_perm_b32: the fp8/fp4
+  encoding lowerings already have perm/bfi descriptors.
+- vector.decode has no AMDGPU lowering for i8/u8/u4 payloads ("no target-low
+  contract"), and its auxiliary operands accept only 'scale': no zero point /
+  min, although encoding.matches documents affine = scale_plus_min. With
+  i8 x scale (symmetric K8) or u4/u8 scale_plus_min (V, asymmetric K4), the
+  decode would be ~2 ops per pair (perm/bfi + one fma).
+Expected gain if fixed: about half of the a16 overhead (+12-15% attention ->
+~+6%).
