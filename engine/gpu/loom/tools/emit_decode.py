@@ -109,7 +109,8 @@ def main():
         "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
     emit_file(L("yah_ssm_conv_decode_f32.loom"), "ssmconv", outdir,
               ["yah_ssm_conv_decode.qkv_dim=10240", "yah_ssm_conv_decode.rows=1"])
-    emit_src(DM.gen_deltanet(), "deltanet", outdir)        # 512 lanes per head (the port: one wave)
+    emit_src(DM.gen_deltanet(), "deltanet", outdir)
+    emit_src(DM.gen_embed_iq4xs(), "embed", outdir)      # token_embd row from the device token stream        # 512 lanes per head (the port: one wave)
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))

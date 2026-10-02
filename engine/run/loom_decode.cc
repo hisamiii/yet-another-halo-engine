@@ -11,8 +11,9 @@
 //           -> recurrent:      attn_qkv / attn_gate / ssm_alpha / ssm_beta GEMV, conv,
 //              DeltaNet (gated norm inside), ssm_out GEMV += hidden
 //   rmsnorm -> ffn_gate|ffn_up SwiGLU GEMV -> ffn_down GEMV += hidden
-// head: rmsnorm -> output GEMV -> argmax. The embedding row is dequantized on the
-// host (IQ4_XS / Q4_K token_embd).
+// head: rmsnorm -> output GEMV -> argmax, written into a device token stream that the
+// next step's embedding kernel (IQ4_XS token_embd) reads: steps are enqueued back to
+// back with no host round trip (the host waits after the prompt and at the end).
 // --logits FILE appends every step's 248320 logits (f32) for an external KL gate.
 #include <algorithm>
 #include <chrono>
@@ -59,29 +60,6 @@ bool FmtOf(std::uint32_t type, Fmt* f) {
     case 21: *f = {"iq3s", 256, 110, 1}; return true;
     case 23: *f = {"iq4xs", 256, 136, 0}; return true;
     default: return false;
-  }
-}
-
-const float kKvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-float Half(const std::uint8_t* p) { _Float16 h; std::memcpy(&h, p, 2); return static_cast<float>(h); }
-
-void DequantIq4XsRow(const std::uint8_t* base, std::uint64_t row, float* out) {
-  const std::uint32_t nb = kHidden / 256;
-  const std::uint8_t* p = base + row * static_cast<std::uint64_t>(nb) * 136;
-  for (std::uint32_t b = 0; b < nb; ++b) {
-    const std::uint8_t* blk = p + b * 136;
-    const float d = Half(blk);
-    const std::uint32_t sh = blk[2] | (blk[3] << 8);
-    const std::uint8_t* sl = blk + 4;
-    const std::uint8_t* qs = blk + 8;
-    for (std::uint32_t g = 0; g < 8; ++g) {
-      const std::uint32_t sc = ((sl[g / 2] >> (4 * (g % 2))) & 15) | (((sh >> (2 * g)) & 3) << 4);
-      const float dl = d * static_cast<float>(static_cast<int>(sc) - 32);
-      for (std::uint32_t w = 0; w < 32; ++w) {
-        const std::uint32_t q = qs[g * 16 + (w & 15)];
-        out[b * 256 + g * 32 + w] = dl * kKvalues[(w >= 16) ? (q >> 4) : (q & 15)];
-      }
-    }
   }
 }
 
@@ -184,8 +162,11 @@ int main(int argc, char** argv) {
     LoomBuffer& ssmout = alloc(kInner * 4);
     LoomBuffer& ffnact = alloc(kFfn * 4);
     LoomBuffer& logits = alloc(std::size_t{kVocab} * 4);
-    LoomBuffer& token = alloc(4);
-    LoomBuffer& dpos = alloc(4);
+    LoomBuffer& token = alloc(4);                       // argmax sink for prompt positions
+    // device token stream (prompt preloaded; argmax writes position pos + 1) and
+    // position array (step pos binds element pos): no host round trip per token
+    LoomBuffer& toks = alloc((std::size_t{T} + 1) * 4);
+    LoomBuffer& posarr = alloc(std::size_t{T} * 4);
     LoomBuffer& eps = alloc(4);
     LoomBuffer& c32a = alloc(kKv * 4);
     LoomBuffer& c32b = alloc(kKv * 4);
@@ -200,6 +181,10 @@ int main(int argc, char** argv) {
       gpu.H2D(ptab, pages.data(), pages.size() * 4);
       const float e = 1.0e-6f;
       gpu.H2D(eps, &e, 4);
+      std::vector<std::int32_t> pv(T);
+      for (std::uint32_t i = 0; i < T; ++i) pv[i] = static_cast<std::int32_t>(i);
+      gpu.H2D(posarr, pv.data(), pv.size() * 4);
+      gpu.H2D(toks, prompt.data(), prompt.size() * 4);
     }
     const std::uint32_t nfull = cfg.main_block_count() / cfg.full_attention_interval;
     const std::uint32_t nssm = cfg.main_block_count() - nfull;
@@ -260,24 +245,23 @@ int main(int argc, char** argv) {
       for (float v : h) { if (v != v) ++nan; else mx = std::max(mx, static_cast<double>(std::fabs(v))); }
       std::fprintf(stderr, "trace l%-2u %-10s max %.4g nan %zu\n", l, what, mx, nan);
     };
-    std::vector<float> hrow(kHidden);
     const auto* emb = find("token_embd.weight");
     if (static_cast<std::uint32_t>(emb->type) != 23) throw LoomError("token_embd: only IQ4_XS is wired");
     std::FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
     std::vector<float> host_logits(logits_path.empty() ? 0 : kVocab);
 
-    std::vector<std::uint32_t> gen;
+    // steps are enqueued back to back; the host waits only after the prompt (to time
+    // generation alone) and at the end, unless --logits / YAH_DEC_TRACE / YAH_DEC_SYNC
+    const bool sync_steps = lf || trace || std::getenv("YAH_DEC_SYNC");
     std::vector<double> step_ms;
-    std::uint32_t next = 0;
+    const std::uint32_t n = static_cast<std::uint32_t>(prompt.size());
+    auto tgen = std::chrono::steady_clock::now();
     for (std::uint32_t pos = 0; pos < steps; ++pos) {
       const auto t0 = std::chrono::steady_clock::now();
       cur_pos = pos;
-      const std::uint32_t tok = pos < prompt.size() ? prompt[pos] : next;
-      if (tok >= kVocab) throw LoomError("token id out of range: " + std::to_string(tok));
-      DequantIq4XsRow(gguf.Data(*emb), tok, hrow.data());
-      gpu.H2D(hidden, hrow.data(), kHidden * 4);
-      const std::int32_t p32 = static_cast<std::int32_t>(pos);
-      gpu.H2D(dpos, &p32, 4);
+      const hrx_buffer_ref_t dposr{posarr.handle, std::size_t{pos} * 4, 4};
+      dispatch(load("embed"), 1, 1, kHidden / 16,
+               {tref("token_embd.weight"), {toks.handle, std::size_t{pos} * 4, 4}, ref(hidden)});
       for (std::uint32_t l = 0; l < cfg.main_block_count(); ++l) {
         const std::string pre = "blk." + std::to_string(l) + ".";
         rmsnorm(hidden, pre + "attn_norm.weight", normed);
@@ -292,13 +276,13 @@ int main(int argc, char** argv) {
           dispatch(load("unpack"), kHeads, 1, 256, {ref(qg), ref(q), ref(gate)});
           dispatch(load("rope"), kHeads + kKvHeads, 1, 256,
                    {ref(q), ref(kb), ref(vb), tref(pre + "attn_q_norm.weight"), tref(pre + "attn_k_norm.weight"),
-                    ref(q), ref(kb), ref(c32a), ref(c32b), ref(c16a), ref(c16b), ref(dpos), ref(eps)});
+                    ref(q), ref(kb), ref(c32a), ref(c32b), ref(c16a), ref(c16b), dposr, ref(eps)});
           dispatch(load("dattn_kvappend"), kKvHeads, 1, 256,
-                   {ref(kb), ref(vb), ref(*kpool[ai]), ref(*vtpool[ai]), ref(ptab), ref(dpos)});
+                   {ref(kb), ref(vb), ref(*kpool[ai]), ref(*vtpool[ai]), ref(ptab), dposr});
           dispatch(load("dattn_part"), pos / 256 + 1, kKvHeads, 256,
-                   {ref(q), ref(*kpool[ai]), ref(*vtpool[ai]), ref(ptab), ref(dpos), ref(acc), ref(ml)});
+                   {ref(q), ref(*kpool[ai]), ref(*vtpool[ai]), ref(ptab), dposr, ref(acc), ref(ml)});
           tr("q_rope", l, q, kAttn); tr("k_rope", l, kb, kKv);
-          dispatch(load("dattn_reduce"), kHeads, 1, 256, {ref(acc), ref(ml), ref(gate), ref(dpos), ref(aout)});
+          dispatch(load("dattn_reduce"), kHeads, 1, 256, {ref(acc), ref(ml), ref(gate), dposr, ref(aout)});
           tr("attn", l, aout, kAttn);
           gemv("resid", {pre + "attn_output.weight"}, aout, hidden);
         } else {
@@ -328,24 +312,36 @@ int main(int argc, char** argv) {
       tr("head_in", 99, normed, kHidden);
       gemv("plain", {"output.weight"}, normed, logits);
       tr("logits", 99, logits, kVocab);
-      dispatch(load("argmax"), 1, 1, 1024, {ref(logits), ref(token)});
-      gpu.Synchronize();
-      gpu.D2H(token, &next, 4);
-      if (lf) {
-        gpu.D2H(logits, host_logits.data(), host_logits.size() * 4);
-        std::fwrite(host_logits.data(), 4, host_logits.size(), lf);
+      dispatch(load("argmax"), 1, 1, 1024,
+               {ref(logits), pos + 1 >= n ? hrx_buffer_ref_t{toks.handle, std::size_t{pos + 1} * 4, 4} : ref(token)});
+      if (sync_steps) {
+        gpu.Synchronize();
+        if (lf) {
+          gpu.D2H(logits, host_logits.data(), host_logits.size() * 4);
+          std::fwrite(host_logits.data(), 4, host_logits.size(), lf);
+        }
+        step_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
       }
-      if (pos + 1 >= prompt.size()) gen.push_back(next);
-      step_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      if (pos + 1 == n) {
+        gpu.Synchronize();
+        tgen = std::chrono::steady_clock::now();
+      }
     }
+    gpu.Synchronize();
+    const double gen_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tgen).count();
     if (lf) std::fclose(lf);
-    // decode rate over the generation steps (positions past the prompt)
-    double dsum = 0;
-    std::uint32_t dn = 0;
-    for (std::size_t i = prompt.size(); i < step_ms.size(); ++i) { dsum += step_ms[i]; ++dn; }
-    std::fprintf(stderr, "step_ms=");
-    for (std::size_t i = 0; i < step_ms.size(); ++i) std::fprintf(stderr, "%.1f%s", step_ms[i], i + 1 == step_ms.size() ? "\n" : " ");
-    if (dn) std::fprintf(stderr, "decode_ms=%.2f decode_tok_s=%.2f\n", dsum / dn, 1000.0 * dn / dsum);
+    std::vector<std::int32_t> stream(steps + 1);
+    gpu.D2H(toks, stream.data(), stream.size() * 4);
+    std::vector<std::uint32_t> gen(stream.begin() + n, stream.end());
+    for (auto g : gen)
+      if (g >= kVocab) throw LoomError("token id out of range: " + std::to_string(g));
+    if (!step_ms.empty()) {
+      std::fprintf(stderr, "step_ms=");
+      for (std::size_t i = 0; i < step_ms.size(); ++i) std::fprintf(stderr, "%.1f%s", step_ms[i], i + 1 == step_ms.size() ? "\n" : " ");
+    }
+    // decode rate over the generation steps (positions n .. steps - 1), enqueued back to back
+    const std::uint32_t dn = steps - n;
+    if (dn) std::fprintf(stderr, "decode_ms=%.2f decode_tok_s=%.2f\n", gen_ms / dn, 1000.0 * dn / gen_ms);
     std::printf("generated_ids=");
     for (std::size_t i = 0; i < gen.size(); ++i) std::printf("%u%s", gen[i], i + 1 == gen.size() ? "" : " ");
     std::printf("\ngenerated_text=%s\n", tokenizer.Decode(gen).c_str());
