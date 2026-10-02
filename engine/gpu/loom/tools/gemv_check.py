@@ -12,6 +12,7 @@ Needs PYTHONPATH with llama.cpp's gguf-py and a numpy with BLAS.
 """
 import collections
 import os
+import re
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 EMIT = os.path.join(HERE, "..", "emit_hal.py")
 HALRUN = os.path.join(ROOT, "engine", "build", "hal_run")
 GPURUN = os.path.join(ROOT, "engine", "run", "gpu_run.sh")
+ONLY = os.environ.get("GEMV_ONLY", "")             # regex on the case tag
 BENCH = int(os.environ.get("GEMV_BENCH", "0"))   # N: also time N dispatches per kernel
 TABLE_DIR = os.environ.get("YAH_TABLE_DIR", "/home/q/yah-hal-p71")
 TABLE_FILE = {"grid_iq3s": "grid_iq3s.bin", "grid_iq3xxs": "grid_iq3xxs.bin", "grid_iq2xxs": "grid_iq2xxs.bin",
@@ -116,7 +118,10 @@ def main():
                 g, u = dots
                 ref = g / (1.0 + np.exp(-g)) * u
             tag = f"{kind}_{'_'.join(fmts)}_{K}"
-            y, ms = run_kernel(model, work, tag, kind, fmts, M, K, [z.name for z in ts], x, y0)
+            if ONLY and not re.search(ONLY, tag):
+                continue
+            y, ms = run_kernel(model, work, tag, kind, fmts, M, K, [z.name for z in ts], x, y0,
+                               int(os.environ.get("GEMV_R", "2")), int(os.environ.get("GEMV_W", "4")))
             err = float(np.max(np.abs(y - ref)) / max(np.max(np.abs(ref)), 1e-30))
             worst = max(worst, err)
             perf = ""

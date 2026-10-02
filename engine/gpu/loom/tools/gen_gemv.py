@@ -48,6 +48,19 @@ TABLES = {"grid_iq3s": ("i32", 512), "grid_iq3xxs": ("i32", 256), "grid_iq2xxs":
 TABLE_ORDER = ["grid_iq3s", "grid_iq3xxs", "grid_iq2xxs", "grid_iq2xs", "ksigns"]
 OFFSET_FMTS = ("q4k", "q5k", "q2k")       # formats with an explicit minimum
 IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+# YAH_GV_GRID_LDS=1: each workgroup copies its IQ tables to LDS before the loop.
+GRID_LDS = os.environ.get("YAH_GV_GRID_LDS", "0") == "1"
+# YAH_GV_ABL=nogrid: ablation (wrong results) -- grid/ksigns loads replaced by their index.
+ABL = os.environ.get("YAH_GV_ABL", "")
+# YAH_GV_PIPE=d / YAH_GV_UNROLL=u: Loom read-ahead / unroll on the sub-block loop.
+# Full decode, one round each (2026-10-02, word decode): no pipeline 68.2 ms/token,
+# depth 2 63.1, depth 3 66.1, depth 4 67.8, depth 2 + unroll 2 63.5, unroll 2 70.2.
+PIPE = int(os.environ.get("YAH_GV_PIPE", "2"))
+UNROLL = int(os.environ.get("YAH_GV_UNROLL", "0"))
+# YAH_GV_WORD=1: decode on 32-bit words (vector<4xi32>) to unsigned byte codes plus a
+# bias folded into the offset, converted with uitofp. The byte-vector form
+# (vector<16xi8> shifts / masks) lowers per byte: ~200-240 VALU per sub-block.
+WORD = os.environ.get("YAH_GV_WORD", "1") == "1"
 GGML = {8: "q8_0", 10: "q2k", 11: "q3k", 12: "q4k", 13: "q5k", 14: "q6k", 16: "iq2xxs", 17: "iq2xs",
         18: "iq3xxs", 21: "iq3s", 23: "iq4xs"}
 
@@ -129,6 +142,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
             """splat an i32 shift amount (0..7) to vector<16xi8>"""
             b(f"  %{p}{name}b = scalar.trunci {expr_i32} : i32 to i8")
             b(f"  %{p}{name} = vector.splat %{p}{name}b : vector<16xi8>")
+            b(f"  %{p}{name}w = vector.splat {expr_i32} : vector<4xi32>")
             return f"%{p}{name}"
 
         if f in ("q4k", "q5k"):
@@ -279,6 +293,15 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
     def ld(view, nbytes, off, p, nm, n=1, ty="i8"):
         """load n x ty at byte (or element) offset off from view, clamped."""
         lim = e.ci(nbytes - n)
+        if ABL == "nogrid" and view.startswith("%t_"):
+            b(f"    %{p}{nm}x = index.cast {off} : index to i32")
+            if ty == "i8":
+                b(f"    %{p}{nm} = scalar.trunci %{p}{nm}x : i32 to i8")
+            elif n == 1:
+                b(f"    %{p}{nm} = scalar.addi %{p}{nm}x, {e.cs(0)} : i32")
+            else:
+                b(f"    %{p}{nm} = vector.from_elements " + ", ".join([f"%{p}{nm}x"] * n) + f" : vector<{n}xi32>")
+            return f"%{p}{nm}"
         b(f"    %{p}{nm}z = index.max {off}, {e.ci(0)} : index")
         b(f"    %{p}{nm}c = index.min %{p}{nm}z, {lim} : index")
         if n == 1:
@@ -320,7 +343,197 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
         b(f"    %{p}q = vector.subi %{p}gx, {neg} : vector<16xi8>")
         return f"%{p}q"
 
-    def decode(f, S, p, wv, hv, nb, boff, lp):
+
+    def wspl(v):
+        nm = f"%ws{v}"
+        c = e.cs(v)
+        e.consts[nm] = f"  {nm} = vector.splat {c} : vector<4xi32>"
+        return nm
+
+    def tow(p, v16, nm):
+        b(f"    %{p}{nm} = vector.bitcast {v16} : vector<16xi8> to vector<4xi32>")
+        return f"%{p}{nm}"
+
+    def wop(p, nm, op, a, c):
+        b(f"    %{p}{nm} = vector.{op} {a}, {c} : vector<4xi32>")
+        return f"%{p}{nm}"
+
+    def tob(p, w4, nm):
+        b(f"    %{p}{nm} = vector.bitcast {w4} : vector<4xi32> to vector<16xi8>")
+        return f"%{p}{nm}"
+
+    def spread(p, nm, nib):
+        """i32 nibble (4 sign bits) -> byte mask word (0x00 / 0xFF per byte)"""
+        b(f"    %{p}{nm}a = scalar.muli {nib}, {e.cs(2113665)} : i32")          # 0x00204081
+        b(f"    %{p}{nm}b = scalar.andi %{p}{nm}a, {e.cs(16843009)} : i32")      # 0x01010101
+        b(f"    %{p}{nm} = scalar.muli %{p}{nm}b, {e.cs(255)} : i32")
+        return f"%{p}{nm}"
+
+    def signed_grid(p, gw, s0, s1):
+        """grid words gw (vector<4xi32>, unsigned magnitudes <= 62) with sign bytes s0 (words 0, 1)
+        and s1 (words 2, 3) -> 64 + sign * g per byte (borrow-free: 64 - g >= 2)"""
+        ms = []
+        for k, (sb, sh) in enumerate(((s0, 0), (s0, 4), (s1, 0), (s1, 4))):
+            if sh:
+                b(f"    %{p}nb{k}s = scalar.shrui {sb}, {e.cs(4)} : i32")
+                b(f"    %{p}nb{k} = scalar.andi %{p}nb{k}s, {e.cs(15)} : i32")
+            else:
+                b(f"    %{p}nb{k} = scalar.andi {sb}, {e.cs(15)} : i32")
+            ms.append(spread(p, f"mk{k}", f"%{p}nb{k}"))
+        b(f"    %{p}mask = vector.from_elements {', '.join(ms)} : vector<4xi32>")
+        g2 = wop(p, "gsh2", "shli", gw, wspl(1))
+        neg = wop(p, "gn", "andi", g2, f"%{p}mask")
+        t = wop(p, "gt", "addi", gw, wspl(0x40404040))
+        u = wop(p, "gu", "subi", t, neg)
+        return tob(p, u, "q")
+
+    def decode_w(f, S, p, wv, hv, nb, boff, lp):
+        """Word-level decode: (unsigned byte codes vector<16xi8>, scale, total offset) with
+        w = scale * code - offset (biases folded into offset)."""
+        nh = nb // 2
+        bias = 0
+        offs = None
+        if f == "q8_0":
+            b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
+            raw = tow(p, ld(wv, nb, f"%{p}qa", p, "q", 16), "qw")
+            q = tob(p, wop(p, "qx", "xori", raw, wspl(-2139062144)), "qu")      # ^ 0x80808080: + 128
+            scale = ld_d(hv, nh, boff, 0, p, "d")
+            bias = 128
+        elif f in ("q4k", "q5k", "q2k"):
+            b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
+            raw = tow(p, ld(wv, nb, f"%{p}qa", p, "qr", 16), "qw")
+            sh = wop(p, "qs", "shrui", raw, S["sh"] + "w")
+            lo = wop(p, "ql", "andi", sh, wspl(0x0F0F0F0F if f != "q2k" else 0x03030303))
+            if f == "q5k":
+                b(f"    %{p}ha = index.add {boff}, %{lp}ho : index")
+                hr = tow(p, ld(wv, nb, f"%{p}ha", p, "hr", 16), "hw")
+                hs = wop(p, "hs", "shrui", hr, S["hsh"] + "w")
+                hb = wop(p, "hb", "andi", hs, wspl(0x01010101))
+                h4 = wop(p, "h4", "shli", hb, wspl(4))
+                lo = wop(p, "q5", "ori", lo, h4)
+            q = tob(p, lo, "qu")
+            if f == "q2k":
+                b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
+                sc = ld_u8(wv, nb, f"%{p}sa", p, "scb")
+                b(f"    %{p}sl = scalar.andi {sc}, {e.cs(15)} : i32")
+                b(f"    %{p}sh2 = scalar.shrui {sc}, {e.cs(4)} : i32")
+                b(f"    %{p}slf = scalar.sitofp %{p}sl : i32 to f32")
+                b(f"    %{p}shf = scalar.sitofp %{p}sh2 : i32 to f32")
+                d = ld_d(hv, nh, boff, 80, p, "d")
+                dm = ld_d(hv, nh, boff, 82, p, "dm")
+                b(f"    %{p}scale = scalar.mulf {d}, %{p}slf : f32")
+                b(f"    %{p}offs = scalar.mulf {dm}, %{p}shf : f32")
+                return q, f"%{p}scale", f"%{p}offs"
+            vals = []
+            for k in range(3):
+                b(f"    %{p}sa{k} = index.add {boff}, %{lp}so{k} : index")
+                vals.append(ld_u8(wv, nb, f"%{p}sa{k}", p, f"sb{k}"))
+            low, mid, high = vals
+            b(f"    %{p}lsc = scalar.andi {low}, {e.cs(63)} : i32")
+            b(f"    %{p}usc0 = scalar.andi {high}, {e.cs(15)} : i32")
+            b(f"    %{p}usc1 = scalar.shrui {low}, {e.cs(6)} : i32")
+            b(f"    %{p}usc2 = scalar.shli %{p}usc1, {e.cs(4)} : i32")
+            b(f"    %{p}usc = scalar.ori %{p}usc0, %{p}usc2 : i32")
+            b(f"    %{p}lmn = scalar.andi {mid}, {e.cs(63)} : i32")
+            b(f"    %{p}umn0 = scalar.shrui {high}, {e.cs(4)} : i32")
+            b(f"    %{p}umn1 = scalar.shrui {mid}, {e.cs(6)} : i32")
+            b(f"    %{p}umn2 = scalar.shli %{p}umn1, {e.cs(4)} : i32")
+            b(f"    %{p}umn = scalar.ori %{p}umn0, %{p}umn2 : i32")
+            for nm, lo_, hi_ in (("sc", "lsc", "usc"), ("mn", "lmn", "umn")):
+                b(f"    %{p}{nm}x = scalar.xori %{p}{lo_}, %{p}{hi_} : i32")
+                b(f"    %{p}{nm}m = scalar.andi %{p}{nm}x, %{lp}up : i32")
+                b(f"    %{p}{nm} = scalar.xori %{p}{lo_}, %{p}{nm}m : i32")
+            d = ld_d(hv, nh, boff, 0, p, "d")
+            dm = ld_d(hv, nh, boff, 2, p, "dm")
+            b(f"    %{p}scf = scalar.sitofp %{p}sc : i32 to f32")
+            b(f"    %{p}mnf = scalar.sitofp %{p}mn : i32 to f32")
+            b(f"    %{p}scale = scalar.mulf {d}, %{p}scf : f32")
+            b(f"    %{p}offs = scalar.mulf {dm}, %{p}mnf : f32")
+            return q, f"%{p}scale", f"%{p}offs"
+        elif f in ("q6k", "q3k"):
+            b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
+            lr = tow(p, ld(wv, nb, f"%{p}qa", p, "lr", 16), "lw")
+            b(f"    %{p}ha = index.add {boff}, %{lp}ho : index")
+            hr = tow(p, ld(wv, nb, f"%{p}ha", p, "hr", 16), "hw")
+            ls = wop(p, "ls", "shrui", lr, S["sh"] + "w")
+            hs = wop(p, "hs", "shrui", hr, S["hsh"] + "w")
+            if f == "q6k":
+                lo = wop(p, "lo", "andi", ls, wspl(0x0F0F0F0F))
+                hb = wop(p, "hb", "andi", hs, wspl(0x03030303))
+                h4 = wop(p, "h4", "shli", hb, wspl(4))
+                q = tob(p, wop(p, "u", "ori", lo, h4), "qu")
+                bias = 32
+                b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
+                s8 = ld(wv, nb, f"%{p}sa", p, "s8")
+                b(f"    %{p}si = scalar.extsi {s8} : i8 to i32")
+                b(f"    %{p}sf = scalar.sitofp %{p}si : i32 to f32")
+                d = ld_d(hv, nh, boff, 208, p, "d")
+                b(f"    %{p}scale0 = scalar.mulf {d}, %{p}sf : f32")
+            else:
+                lo = wop(p, "lo", "andi", ls, wspl(0x03030303))
+                hb = wop(p, "hb", "andi", hs, wspl(0x01010101))
+                h4 = wop(p, "h4", "shli", hb, wspl(2))
+                q = tob(p, wop(p, "u", "ori", lo, h4), "qu")
+                bias = 4
+                b(f"    %{p}sla = index.add {boff}, %{lp}slo : index")
+                lb = ld_u8(wv, nb, f"%{p}sla", p, "slb")
+                b(f"    %{p}sha = index.add {boff}, %{lp}sho : index")
+                hb2 = ld_u8(wv, nb, f"%{p}sha", p, "shb")
+                b(f"    %{p}lw4 = scalar.shrui {lb}, %{lp}sls : i32")
+                b(f"    %{p}l4 = scalar.andi %{p}lw4, {e.cs(15)} : i32")
+                b(f"    %{p}hw2 = scalar.shrui {hb2}, %{lp}shs : i32")
+                b(f"    %{p}h2 = scalar.andi %{p}hw2, {e.cs(3)} : i32")
+                b(f"    %{p}h2s = scalar.shli %{p}h2, {e.cs(4)} : i32")
+                b(f"    %{p}s6 = scalar.ori %{p}l4, %{p}h2s : i32")
+                b(f"    %{p}sc = scalar.subi %{p}s6, {e.cs(32)} : i32")
+                b(f"    %{p}scf = scalar.sitofp %{p}sc : i32 to f32")
+                d = ld_d(hv, nh, boff, 108, p, "d")
+                b(f"    %{p}scale0 = scalar.mulf {d}, %{p}scf : f32")
+            scale = f"%{p}scale0"
+        elif f == "iq4xs":
+            b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
+            raw = tow(p, ld(wv, nb, f"%{p}qa", p, "qr", 16), "qw")
+            sh = wop(p, "qs", "shrui", raw, S["sh"] + "w")
+            nibw = wop(p, "nw", "andi", sh, wspl(0x0F0F0F0F))
+            nib0 = tob(p, nibw, "nb0")
+            b(f"    %{p}nb = vector.andi {nib0}, {e.splat8(15)} : vector<16xi8>")   # index range for the lookup
+            b(f"    %{p}q = vector.table.lookup %kvtu[%{p}nb] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+            q = f"%{p}q"
+            bias = 128
+            b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
+            sl = ld_u8(wv, nb, f"%{p}sa", p, "slb")
+            b(f"    %{p}h0a = index.add {boff}, {e.ci(2)} : index")
+            h0 = ld_u8(wv, nb, f"%{p}h0a", p, "h0")
+            b(f"    %{p}h1a = index.add {boff}, {e.ci(3)} : index")
+            h1 = ld_u8(wv, nb, f"%{p}h1a", p, "h1")
+            b(f"    %{p}h1s = scalar.shli {h1}, {e.cs(8)} : i32")
+            b(f"    %{p}shw = scalar.ori {h0}, %{p}h1s : i32")
+            b(f"    %{p}lw = scalar.shrui {sl}, %{lp}sls : i32")
+            b(f"    %{p}l4 = scalar.andi %{p}lw, {e.cs(15)} : i32")
+            b(f"    %{p}hw = scalar.shrui %{p}shw, %{lp}shs : i32")
+            b(f"    %{p}h2 = scalar.andi %{p}hw, {e.cs(3)} : i32")
+            b(f"    %{p}h2s = scalar.shli %{p}h2, {e.cs(4)} : i32")
+            b(f"    %{p}s6 = scalar.ori %{p}l4, %{p}h2s : i32")
+            b(f"    %{p}sc = scalar.subi %{p}s6, {e.cs(32)} : i32")
+            b(f"    %{p}scf = scalar.sitofp %{p}sc : i32 to f32")
+            d = ld_d(hv, nh, boff, 0, p, "d")
+            b(f"    %{p}scale0 = scalar.mulf {d}, %{p}scf : f32")
+            scale = f"%{p}scale0"
+        elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs"):
+            # reuse the byte-path grid gathers / sign bytes / scale, then word sign application
+            q_old, scale, _ = decode_grid_parts(f, S, p, wv, hv, nb, boff, lp)
+            gw, s0, s1 = q_old
+            q = signed_grid(p, gw, s0, s1)
+            bias = 64
+        else:
+            raise SystemExit("decode_w " + f)
+        b(f"    %{p}bo_ = scalar.mulf {scale}, {e.cs(float(bias), 'f32')} : f32")
+        return q, scale, f"%{p}bo_"
+
+    def decode_grid_parts(f, S, p, wv, hv, nb, boff, lp):
+        return decode(f, S, p, wv, hv, nb, boff, lp, parts=True)
+
+    def decode(f, S, p, wv, hv, nb, boff, lp, parts=False):
         """Emit one sub-block decode; return (q vector<16xi8>, scale f32, offset f32 or None)."""
         nh = nb // 2
         if f == "q8_0":
@@ -477,8 +690,11 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
                 b(f"    %{p}sga{qq} = index.add {boff}, %{lp}sgo : index")
                 b(f"    %{p}sgb{qq} = index.add %{p}sga{qq}, {e.ci(qq)} : index")
                 sg.append(ld_u8(wv, nb, f"%{p}sgb{qq}", p, f"sgn{qq}"))
-            neg = signs16(p, sg[0], sg[1])
-            q = apply_signs(p, f"%{p}g", neg)
+            if parts:
+                q = (f"%{p}gw", sg[0], sg[1])
+            else:
+                neg = signs16(p, sg[0], sg[1])
+                q = apply_signs(p, f"%{p}g", neg)
             b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
             sb_ = ld_u8(wv, nb, f"%{p}sa", p, "scb")
             b(f"    %{p}nw = scalar.shrui {sb_}, %{lp}sls : i32")
@@ -517,8 +733,11 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
                 b(f"    %{p}ksi{li} = scalar.andi %{p}ksh{li}, {e.cs(127)} : i32")
                 b(f"    %{p}ksx{li} = index.cast %{p}ksi{li} : i32 to index")
                 sg.append(ld_u8("%t_ksigns", 128, f"%{p}ksx{li}", p, f"ks{li}"))
-            neg = signs16(p, sg[0], sg[1])
-            q = apply_signs(p, f"%{p}g", neg)
+            if parts:
+                q = (f"%{p}gw", sg[0], sg[1])
+            else:
+                neg = signs16(p, sg[0], sg[1])
+                q = apply_signs(p, f"%{p}g", neg)
             b(f"    %{p}a28 = scalar.shrui {aux}, {e.cs(28)} : i32")
             b(f"    %{p}a28f = scalar.uitofp %{p}a28 : i32 to f32")
             b(f"    %{p}ah = scalar.addf %{p}a28f, {e.cs(0.5, 'f32')} : f32")
@@ -549,8 +768,11 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
                 sg.append(ld_u8("%t_ksigns", 128, f"%{p}ksx{li}", p, f"ks{li}"))
             b(f"    %{p}gw = vector.from_elements " + ", ".join(words) + " : vector<4xi32>")
             b(f"    %{p}g = vector.bitcast %{p}gw : vector<4xi32> to vector<16xi8>")
-            neg = signs16(p, sg[0], sg[1])
-            q = apply_signs(p, f"%{p}g", neg)
+            if parts:
+                q = (f"%{p}gw", sg[0], sg[1])
+            else:
+                neg = signs16(p, sg[0], sg[1])
+                q = apply_signs(p, f"%{p}g", neg)
             b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
             sb_ = ld_u8(wv, nb, f"%{p}sa", p, "scb")
             b(f"    %{p}nw = scalar.shrui {sb_}, %{lp}sls : i32")
@@ -583,11 +805,12 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
             b(f"  %f{i}base{r} = index.add %f{i}rb{r}, %f{i}lboff : index")
     b(f"  %xl16 = index.mul %lane, {e.ci(16)} : index")
     accs = [f"%a{i}_{r}" for i in range(nw) for r in range(R)]
-    anyoff = any(f in OFFSET_FMTS for f in fmts)
+    anyoff = WORD or any(f in OFFSET_FMTS for f in fmts)
     b("  %zf = scalar.constant 0.0 : f32")
     inits = ", ".join(f"{a} = %zf : f32" for a in accs)
     res = [f"%res{j}" for j in range(len(accs))]
-    b(f"  {', '.join(res)} = scf.for %t = [{e.ci(0)} to {e.ci(NT)} step {e.ci(1)}]({inits}) -> ({', '.join(['f32'] * len(accs))}) {{")
+    sched = (f" pipeline({e.ci(PIPE)})" if PIPE > 1 else "") + (f" unroll({e.ci(UNROLL)})" if UNROLL > 1 else "")
+    b(f"  {', '.join(res)} = scf.for %t = [{e.ci(0)} to {e.ci(NT)} step {e.ci(1)}]({inits}) -> ({', '.join(['f32'] * len(accs))}){sched} {{")
     b(f"    %xo0 = index.mul %t, {e.ci(512)} : index")
     b("    %xo = index.add %xo0, %xl16 : index")
     xv = ld("%xv", K, "%xo", "", "xv", 16, "f32")
@@ -599,8 +822,10 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
             p = f"d{i}_{r}"
             b(f"    %{p}to = index.mul %t, {e.ci(S[i]['tstep'])} : index")
             b(f"    %{p}bo = index.add %f{i}base{r}, %{p}to : index")
-            q, scale, offs = decode(f, S[i], p, f"%wv{i}", f"%wh{i}", wnb[i], f"%{p}bo", f"f{i}")
-            b(f"    %{p}qf = vector.sitofp {q} : vector<16xi8> to vector<16xf32>")
+            dec = decode_w if WORD else decode
+            q, scale, offs = dec(f, S[i], p, f"%wv{i}", f"%wh{i}", wnb[i], f"%{p}bo", f"f{i}")
+            cvt = "uitofp" if WORD else "sitofp"
+            b(f"    %{p}qf = vector.{cvt} {q} : vector<16xi8> to vector<16xf32>")
             b(f"    %{p}pr = vector.mulf %{p}qf, {xv} : vector<16xf32>")
             b(f"    %{p}dot = vector.reduce<addf> %{p}pr, %zf : vector<16xf32>, f32")
             b(f"    %{p}sd = scalar.mulf {scale}, %{p}dot : f32")
@@ -671,17 +896,36 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv"):
         o(f"  %wh{i} = buffer.view %w{i}_na[%base] : buffer -> view<{wnb[i] // 2}xf16>")
     for t in tabs:
         ty, n = TABLES[t]
-        o(f"  %t_{t} = buffer.view %{t}_na[%base] : buffer -> view<{n}x{ty}>")
+        if not GRID_LDS:
+            o(f"  %t_{t} = buffer.view %{t}_na[%base] : buffer -> view<{n}x{ty}>")
+            continue
+        eb = 4 if ty == "i32" else 1
+        o(f"  %g_{t} = buffer.view %{t}_na[%base] : buffer -> view<{n}x{ty}>")
+        o(f"  %lb_{t} = index.constant {n * eb} : offset")
+        o(f"  %lp_{t} = buffer.alloca<workgroup> align(16) %lb_{t} : buffer")
+        o(f"  %t_{t} = buffer.view %lp_{t}[%base] : buffer -> view<{n}x{ty}>")
+        o(f"  %ctid_{t} = kernel.workitem.id<x> : index")
+        for k in range((n + 32 * W - 1) // (32 * W)):
+            o(f"  %cpo_{t}{k} = index.constant {k * 32 * W} : index")
+            o(f"  %cpi_{t}{k}a = index.add %ctid_{t}, %cpo_{t}{k} : index")
+            o(f"  %cpm_{t}{k} = index.constant {n - 1} : index")
+            o(f"  %cpi_{t}{k} = index.min %cpi_{t}{k}a, %cpm_{t}{k} : index")
+            o(f"  %cpv_{t}{k} = view.load %g_{t}[%cpi_{t}{k}] : view<{n}x{ty}> -> {ty}")
+            o(f"  view.store %cpv_{t}{k}, %t_{t}[%cpi_{t}{k}] : {ty}, view<{n}x{ty}>")
+    if GRID_LDS and tabs:
+        o("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     o(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{K}xf32>")
     o(f"  %yv = buffer.view %y_na[%base] : buffer -> view<{M}xf32>")
     if "iq4xs" in fmts:
         o("\n".join(f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)))
         o("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
+        o("\n".join(f"  %kvu{i} = scalar.constant {v + 128 - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)))
+        o("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
     for k in sorted(e.consts, key=lambda n: (not n.startswith("%c"), n)):
-        if not k.startswith("%sv") and k != "%sgnsh":
+        if not k.startswith("%sv") and k != "%sgnsh" and not k.startswith("%ws"):
             o(e.consts[k])
     for k in sorted(e.consts):
-        if k.startswith("%sv") or k == "%sgnsh":
+        if k.startswith("%sv") or k == "%sgnsh" or k.startswith("%ws"):
             o(e.consts[k])
     out += body
     o("}")

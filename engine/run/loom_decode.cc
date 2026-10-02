@@ -146,7 +146,10 @@ int main(int argc, char** argv) {
     std::map<std::string, LoomExecutable> exes;
     auto load = [&](const std::string& name) -> LoomExecutable& {
       auto it = exes.find(name);
-      if (it == exes.end()) it = exes.emplace(name, gpu.Load(dir + "/" + name + ".hal")).first;
+      if (it == exes.end()) {
+        it = exes.emplace(name, gpu.Load(dir + "/" + name + ".hal")).first;
+        if (std::getenv("YAH_DEC_LIST")) std::fprintf(stderr, "loaded %zu %s\n", exes.size(), name.c_str());
+      }
       return it->second;
     };
     std::deque<LoomBuffer> keep;   // stable references (a vector would move them)
