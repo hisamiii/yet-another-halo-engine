@@ -41,6 +41,11 @@ DOTF = os.environ.get("YAH_DN_DOTF", "0") == "1"
 # lane-FMAs/cycle/SIMD), and this kernel's v_fma_f32 cannot pair in wave32.
 # Default: B=2048 harness 4.752 -> 4.184 M cycles, bit-identical to HIP (deltanet_vs_hip.sh).
 W64 = os.environ.get("YAH_DN_W64", "1") == "1"
+# YAH_DN_F16SIM=1 (experiment only): round k, q, v, the state read by the
+# dot products and the update coefficient to f16 (state kept f32), the
+# precision a chunked WY kernel with f16 WMMA inputs would have
+# (engine/run/research/gdn). Default off.
+F16SIM = os.environ.get("YAH_DN_F16SIM", "0") == "1"
 WSZ = 64 if W64 else 32
 
 V4 = "vector<4xf32>"
@@ -184,10 +189,27 @@ def gen():
     e("    %ot0 = index.mul %t, %inner_size : index")
     e("    %ot = index.add %ot0, %o_rel0 : index")
     # extract k, q elements once
+    rounded = set()
+
+    def r16(n):
+        if not F16SIM:
+            return n
+        if n not in rounded:   # once per value (both dot products read the state)
+            rounded.add(n)
+            e(f"    {n}_h = scalar.fptrunc {n} : f32 to f16")
+            e(f"    {n}_r = scalar.extf {n}_h : f16 to f32")
+        return f"{n}_r"
     for g in range(4):
         for i in range(4):
-            e(f"    %ke{g}{i} = vector.extract %k{g}[{i}] : {V4} -> f32")
-            e(f"    %qe{g}{i} = vector.extract %q{g}[{i}] : {V4} -> f32")
+            if not F16SIM:
+                e(f"    %ke{g}{i} = vector.extract %k{g}[{i}] : {V4} -> f32")
+                e(f"    %qe{g}{i} = vector.extract %q{g}[{i}] : {V4} -> f32")
+                continue
+            e(f"    %ke{g}{i}0 = vector.extract %k{g}[{i}] : {V4} -> f32")
+            e(f"    %qe{g}{i}0 = vector.extract %q{g}[{i}] : {V4} -> f32")
+            for nm in ("ke", "qe"):
+                rr = r16(f"%{nm}{g}{i}0")
+                e(f"    %{nm}{g}{i} = scalar.addf {rr}, %negzero : f32")
     ys = []
     for r in range(2):
         for g in range(4):
@@ -198,7 +220,7 @@ def gen():
         def dot(tag, v):
             acc = "%zero"
             for g in range(4):
-                s = [f"%se{r}{g}{i}" for i in range(4)]
+                s = [r16(f"%se{r}{g}{i}") for i in range(4)]
                 x = [f"%{v}e{g}{i}" for i in range(4)]
                 n = f"{tag}{r}{g}"
                 if DOTF:
@@ -226,13 +248,18 @@ def gen():
             return acc
         u = dot("u", "k")
         p = dot("p", "q")
-        e(f"    %vm{r} = scalar.fmaf %neg_inv_k, {u}, %v{r} : f32")
+        vv = r16(f"%v{r}")
+        e(f"    %vm{r} = scalar.fmaf %neg_inv_k, {u}, {vv} : f32")
         e(f"    %d{r} = scalar.mulf %beta, %vm{r} : f32")
         e(f"    %dkq{r} = scalar.mulf %d{r}, %kq_dot : f32")
         e(f"    %o{r} = scalar.fmaf %q_scale, {p}, %dkq{r} : f32")
         e(f"    %oi{r} = index.add %ot, %row{r} : index")
         e(f"    view.store %o{r}, %out_view[%oi{r}] : f32, view<[%out_total]xf32>")
-        e(f"    %dk{r} = scalar.mulf %inv_k, %d{r} : f32")
+        if F16SIM:
+            e(f"    %dk{r}0 = scalar.mulf %inv_k, %d{r} : f32")
+            e(f"    %dk{r} = scalar.addf {r16(f'%dk{r}0')}, %negzero : f32")
+        else:
+            e(f"    %dk{r} = scalar.mulf %inv_k, %d{r} : f32")
         e(f"    %dkv{r} = vector.splat %dk{r} : {V4}")
         for g in range(4):
             if __import__("os").environ.get("YAH_DN_COMPW", "1") == "1":
