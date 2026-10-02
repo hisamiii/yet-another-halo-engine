@@ -7,16 +7,16 @@
 set -euo pipefail
 model="${1:?usage: m0_gate.sh <model.gguf> [hal-dir]}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-bin="$root/engine/build/yah-hrx"
+bin="$root/engine/build/loom_decode"
 hal="${2:-${YAH_HAL:-$root/engine/hal}}"
-[[ -x "$bin" ]] || { echo "m0_gate: build yah-hrx first (engine/build_hrx.sh)" >&2; exit 2; }
-[[ -f "$hal/norm.hal" ]] || { echo "m0_gate: no HALs in $hal; run engine/build_hrx.sh <model> $hal" >&2; exit 2; }
+[[ -x "$bin" ]] || { echo "m0_gate: build loom_decode first (engine/build_hrx.sh)" >&2; exit 2; }
+[[ -f "$hal/decode.txt" ]] || { echo "m0_gate: no decode HALs in $hal; run engine/build_hrx.sh <model> $hal" >&2; exit 2; }
 
 fail=0
 check() {
   local text="$1" ids="$2" want="$3"
   local got
-  got="$("$bin" "$model" --hal "$hal" --ids "$ids" --gen 1 2>/dev/null \
+  got="$("$bin" "$model" "$hal" --ids "$ids" --gen 1 2>/dev/null \
     | sed -n 's/^generated_ids=//p' | awk '{print $1}')"
   if [[ "$got" == "$want" ]]; then
     printf 'ok   %-28s -> %s\n' "$text" "$got"

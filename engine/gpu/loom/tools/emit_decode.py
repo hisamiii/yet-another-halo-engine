@@ -1,85 +1,121 @@
 #!/usr/bin/env python3
 """Emit every HAL the Loom single-token decode forward needs for a shard.
 
-usage: emit_decode.py <model.gguf> <outdir>
+usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, multiple of 256)
 
-Reuses emit_prefill.py for the kStore/kSwiGLU/kResidual GEMMs and emit_hal.py
-for the fixed decode kernels. The decode attention kernel bakes start_pos, so
-one HAL is emitted per position up to --positions (default 32). The IQ grid/
-ksigns tables are emitted by emit_prefill.py from loom/tables/.
+  gv_<kind>_<fmts>_<M>_<K>.hal   tools/gen_gemv.py, one per distinct (kind, formats,
+                                 shape) on the shard: plain for the input projections
+                                 and the head, resid for attn_output / ssm_out /
+                                 ffn_down (the residual add fused), swiglu for
+                                 ffn_gate + ffn_up
+  dattn_{kvappend,part,reduce}   tools/gen_decode_attn.py: attention over the paged
+                                 fp16 KV pools (the prefill's YAH_KV_PAGED layout)
+  rmsnorm, deltanet              tools/gen_decode_misc.py (the ports' math, 512 lanes)
+  unpack, rope, ssmconv, argmax: the ported HIP decode kernels.
+                                 rope's own cache write goes to a one-row dummy
+                                 (max_context=1); dattn_kvappend writes the pools.
+  grid_*.bin, ksigns_iq2xs.bin   the IQ tables (loom/tables)
+  decode.txt                     "ctx <max_context>"
 """
-import os, shutil, subprocess, sys
+import os
+import shutil
+import subprocess
+import sys
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOOM = os.path.abspath(os.path.join(HERE, ".."))
 EMIT = os.path.join(LOOM, "emit_hal.py")
-PREFILL = os.path.join(LOOM, "tools", "emit_prefill.py")
+sys.path.insert(0, HERE)
+import emit_prefill as EP  # noqa: E402  (GGUF tensor table)
+import gen_decode_attn as DA  # noqa: E402
+import gen_decode_misc as DM  # noqa: E402
+import gen_gemv as GV  # noqa: E402
 
-MAX_CONTEXT = 64
-NUM_HEADS = 24
-NUM_KV = 4
-HEAD_DIM = 256
-ROTARY = 64
-CACHE = MAX_CONTEXT * NUM_KV * HEAD_DIM
-POSITIONS = 32
+NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
 
 
-def emit(loomfile, outdir, outname, configs):
+def emit_src(text, name, outdir, configs=("nop=0",)):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
-    r = subprocess.run([sys.executable, EMIT, os.path.join(LOOM, loomfile), tmp] + configs,
-                       capture_output=True, text=True)
+    src = os.path.join(tmp, name + ".loom")
+    open(src, "w").write(text)
+    emit_file(src, name, outdir, configs)
+
+
+def emit_file(path, name, outdir, configs):
+    tmp = os.path.join(outdir, ".emit_tmp")
+    os.makedirs(tmp, exist_ok=True)
+    r = subprocess.run([sys.executable, EMIT, path, tmp] + list(configs), capture_output=True, text=True)
     if r.returncode != 0:
-        raise SystemExit("emit failed for %s:\n%s%s" % (loomfile, r.stdout, r.stderr))
-    hal = r.stdout.strip().splitlines()[-1]
-    shutil.copy(hal, os.path.join(outdir, outname))
+        raise SystemExit("emit failed for %s:\n%s%s" % (path, r.stdout[-3000:], r.stderr[-3000:]))
+    shutil.copy(r.stdout.strip().splitlines()[0], os.path.join(outdir, name + ".hal"))
+
+
+def gemv_name(kind, fmts, M, K):
+    return "gv_%s_%s_%d_%d" % (kind, "_".join(fmts), M, K)
+
+
+def gemv_set(model):
+    """{name: (kind, fmts, M, K)} for every decode projection on the shard."""
+    t = {}
+    for nm, dims, ty in EP.parse(model):
+        t[nm] = (GV.GGML.get(ty), int(dims[0]), int(dims[1]) if len(dims) > 1 else 1)
+    out = {}
+
+    def add(kind, names):
+        fmts = [t[n][0] for n in names]
+        if None in fmts:
+            raise SystemExit("no GEMV decoder for " + ", ".join(names))
+        K, M = t[names[0]][1], t[names[0]][2]
+        out[gemv_name(kind, fmts, M, K)] = (kind, fmts, M, K)
+
+    layers = sorted({int(n.split(".")[1]) for n in t if n.startswith("blk.") and n.split(".")[1].isdigit()})
+    for l in layers:
+        p = "blk.%d." % l
+        if p + "ffn_gate.weight" not in t:
+            continue
+        for n in ("attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta"):
+            if p + n + ".weight" in t:
+                add("plain", [p + n + ".weight"])
+        for n in ("attn_output", "ssm_out", "ffn_down"):
+            if p + n + ".weight" in t:
+                add("resid", [p + n + ".weight"])
+        add("swiglu", [p + "ffn_gate.weight", p + "ffn_up.weight"])
+    add("plain", ["output.weight"])
+    return out
 
 
 def main():
     model, outdir = sys.argv[1], sys.argv[2]
-    os.environ["YAH_TOKEN_TILE"] = "64"  # decode keeps the 64-wide tile
+    T = int(sys.argv[3]) if len(sys.argv) > 3 else 4096
+    if T % 256:
+        raise SystemExit("max_context must be a multiple of 256")
     os.makedirs(outdir, exist_ok=True)
-    subprocess.run([sys.executable, PREFILL, model, outdir], check=True)
-    emit("yah_half_norm_f16.loom", outdir, "norm.hal",
-         ["yah_half_norm.rows=1", "yah_half_norm.dim=5120",
-          "yah_half_norm.eps=1e-6"])
-    emit("yah_unpack_qg_f32.loom", outdir, "unpack.hal",
-         ["yah_unpack_qg.batch=1", "yah_unpack_qg.num_heads=%d" % NUM_HEADS,
-          "yah_unpack_qg.head_dim=%d" % HEAD_DIM])
-    emit("yah_half_cast.loom", outdir, "cast.hal", ["yah_half_cast.num_elements=6144"])
-    emit("yah_rmsnorm_f32.loom", outdir, "rmsnorm.hal",
-         ["yah_rmsnorm.rows=1", "yah_rmsnorm.eps=1e-6"])
-    emit("yah_gemv_q6k_f32.loom", outdir, "gemv.hal",
-         ["yah_gemv_q6k.m_rows=248320", "yah_gemv_q6k.k_blocks=20"])
-    emit("yah_argmax_f32.loom", outdir, "argmax.hal", ["yah_argmax.vocab=248320"])
-    emit("yah_ssm_conv_decode_f32.loom", outdir, "ssmconv.hal",
-         ["yah_ssm_conv_decode.qkv_dim=10240", "yah_ssm_conv_decode.rows=1"])
-    emit("yah_deltanet_decode_resident_f32.loom", outdir, "deltanet.hal",
-         ["yah_deltanet_decode.num_heads=48", "yah_deltanet_decode.num_key_heads=16"])
-    emit("yah_fused_qk_rope_f32.loom", outdir, "rope.hal", [
-        "yah_fused_qk_rope.layer_idx=0",
-        "yah_fused_qk_rope.max_context=%d" % MAX_CONTEXT,
-        "yah_fused_qk_rope.num_heads=%d" % NUM_HEADS,
-        "yah_fused_qk_rope.num_kv_heads=%d" % NUM_KV,
-        "yah_fused_qk_rope.head_dim=%d" % HEAD_DIM,
-        "yah_fused_qk_rope.rotary_dim=%d" % ROTARY,
-        "yah_fused_qk_rope.q_elems=%d" % (NUM_HEADS * HEAD_DIM),
-        "yah_fused_qk_rope.kv_elems=%d" % (NUM_KV * HEAD_DIM),
-        "yah_fused_qk_rope.cache32_elems=%d" % CACHE,
-        "yah_fused_qk_rope.cache16_elems=%d" % CACHE,
-    ])
-    for pos in range(POSITIONS):
-        emit("yah_decode_attn_f16.loom", outdir, "attn_%d.hal" % pos, [
-            "yah_decode_attn.layer_idx=0",
-            "yah_decode_attn.start_pos=%d" % pos,
-            "yah_decode_attn.max_context=%d" % MAX_CONTEXT,
-            "yah_decode_attn.num_heads=%d" % NUM_HEADS,
-            "yah_decode_attn.num_kv_heads=%d" % NUM_KV,
-            "yah_decode_attn.head_dim=%d" % HEAD_DIM,
-            "yah_decode_attn.rows=1",
-            "yah_decode_attn.has_gate=1",
-        ])
-    # emit_prefill.py already wrote the IQ grid/sign tables into outdir.
-    print("emitted decode HALs to", outdir)
+    gs = gemv_set(model)
+    for name, (kind, fmts, M, K) in sorted(gs.items()):
+        emit_src(GV.gen(kind, fmts, M, K), name, outdir)
+    for which in ("kvappend", "part", "reduce"):
+        emit_src(DA.gen(which, T), "dattn_" + which, outdir)
+    L = lambda f: os.path.join(LOOM, f)
+    emit_src(DM.gen_rmsnorm(), "rmsnorm", outdir)          # 512 lanes (the port: one 32-lane subgroup)
+    emit_file(L("yah_unpack_qg_f32.loom"), "unpack", outdir,
+              ["yah_unpack_qg.batch=1", "yah_unpack_qg.num_heads=%d" % NUM_HEADS, "yah_unpack_qg.head_dim=%d" % HEAD_DIM])
+    emit_file(L("yah_fused_qk_rope_f32.loom"), "rope", outdir, [
+        "yah_fused_qk_rope.layer_idx=0", "yah_fused_qk_rope.max_context=1",
+        "yah_fused_qk_rope.num_heads=%d" % NUM_HEADS, "yah_fused_qk_rope.num_kv_heads=%d" % NUM_KV,
+        "yah_fused_qk_rope.head_dim=%d" % HEAD_DIM, "yah_fused_qk_rope.rotary_dim=%d" % ROTARY,
+        "yah_fused_qk_rope.q_elems=%d" % (NUM_HEADS * HEAD_DIM), "yah_fused_qk_rope.kv_elems=%d" % (NUM_KV * HEAD_DIM),
+        "yah_fused_qk_rope.cache32_elems=%d" % (NUM_KV * HEAD_DIM),
+        "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
+    emit_file(L("yah_ssm_conv_decode_f32.loom"), "ssmconv", outdir,
+              ["yah_ssm_conv_decode.qkv_dim=10240", "yah_ssm_conv_decode.rows=1"])
+    emit_src(DM.gen_deltanet(), "deltanet", outdir)        # 512 lanes per head (the port: one wave)
+    emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
+    for f in os.listdir(os.path.join(LOOM, "tables")):
+        shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
+    open(os.path.join(outdir, "decode.txt"), "w").write("ctx %d\n" % T)
+    shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
+    print("emitted %d GEMV + 9 decode HALs (max context %d) to %s" % (len(gs), T, outdir))
 
 
 if __name__ == "__main__":

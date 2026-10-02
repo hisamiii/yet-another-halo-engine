@@ -11,7 +11,7 @@ The greenfield implementation. The layout maps to the workstreams in [../docs/sc
 | `sched/` | phase routing, token split, overlap, power budget | not started |
 | `kv/` | paged quantized KV cache | fp16 decode cache on the HRX path; paged quant not started |
 | `vision/` | mmproj projector, image preprocessing | not started |
-| `serve/` | CLI, HTTP, sampler | CLI done (`yah-hrx`); HTTP pending |
+| `serve/` | CLI, HTTP, sampler | CLI done (`loom_decode`); HTTP pending |
 
 Milestone mapping: **M0** core + model + gpu + serve. **M1** npu + sched. **M2** npu (int8). **M2g** gpu. **M3** sched + model. **M4** kv. **M5** vision.
 
@@ -20,7 +20,7 @@ Rules: one binary, one architecture, hardcoded shapes. Port the framework, not t
 ## The M0 gate
 
 `tests/m0_gate.sh` and `tests/generate_gate.sh` are the milestone gate, and both
-run on the HRX-native `yah-hrx` runner. The first requires the engine's greedy
+run on the HRX-native `loom_decode` runner. The first requires the engine's greedy
 next token to equal the recorded reference on three fixed prompts; the second
 requires 20 greedy tokens to match, token for token. Both pass on the IQ4_XS
 artifact: `engine/build_hrx.sh <model>` then `engine/tests/*.sh <model>`. The
