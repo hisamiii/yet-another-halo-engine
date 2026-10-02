@@ -102,6 +102,7 @@ Prefill:
 - LDS swiglu epilogue for IQ3_S / IQ3_XXS: 3316.4 -> 3285.8 ms.
 - Q4_K narrowing via `v_fma_mix` (avoids the v0..v127 `v_cvt` window), enabling 4 x 2: 3290.8 -> 3262.8 ms.
 - Workgroup stagger on large grids plus the K = 6144 decode-ahead exclusion: cycles -1.84% (3153.9 -> 3142.7 ms).
+- IQ3 grid indices from 32-bit words with `index.assume` ranges (one `v_bfe_u32`, no sign-extend / mask / clamp): IQ3 GEMM cycles -0.64%, pp2048 cycles -0.43%.
 - Fused residual (`kres`) and hidden / hidden2 swap: removed 128 zero-add passes of 126 MB each per pass.
 - q / gate unpack fused into the q-projection epilogue (`kqg`): cycles -0.45%, 16 dispatches fewer.
 - Attention writes f16 for the o projection: half_cast gone, 16 dispatches fewer (~0.2%).
@@ -155,6 +156,7 @@ Prefill GEMMs:
 - Widening the token tile of unchained GEMMs: wrong forward (argmax 220 vs 11751); cause not found.
 - int4 (iu4) GEMMs: need 4-bit activations (4-11% error without rotation) and cannot hold the IQ4_XS codebook. int8: per-32 scales cost ~4 VALU per WMMA, break-even at best.
 - Load cache hints: Loom's gfx11 encoding drops them; the ISA is byte-identical.
+- Hoisting the LDS fragment row offset out of the K loop (per-wave views): no change. The 4 `v_mul_lo_u32` per phase are the fragment loads' per-lane addresses (lane row x 144-byte padded row), generated inside the compiler: no LICM, and quarter-rate `v_mul_lo_u32` instead of a 24-bit multiply. Compiler-side, like the zero-init `v_mov` before each `v_fma_mix` pair (~0.5 per WMMA) and the carried-register copies (Q3_K / Q5_K / Q4_K latches, IQ4_XS decode-ahead operands); together <= 3-4% of GEMM cycles.
 
 Prefill attention, DeltaNet and pipeline:
 
