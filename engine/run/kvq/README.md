@@ -282,3 +282,20 @@ pp8192 attention cycles (SQ_BUSY_CYCLES, one round each, APU <= 55 C + 30 s):
 - Prefill totals vary +-200 M between runs (non-attention kernels): compare
   the attention rows.
 - Quantized KV is not yet supported in chunked prefill (YAH_CTX > B).
+
+## Configs after 2026-10-02 (integer-compute attention dropped)
+
+The user dropped kv4a4 (iu4; ~0.4% of pp8192 for 96% 99%-precision), kv4a8
+(int4 -> int8, iu8) and the iu8 int8 config. The generator now has only
+f16-compute attention with optional quantized caches:
+
+| config | emit env | K | V |
+|---|---|---|---|
+| fp16 | (default) | f16 | f16 |
+| kv8a16 | YAH_ATTN_FA_K8=1 YAH_ATTN_FA_VQ8=1 | int8 per token half, f16 decode at staging | uint8, global per-channel stats (VQ8) |
+| kv4a16 | YAH_ATTN_FA_K4=1 YAH_ATTN_FA_VQ4=1 | H256 + asym int4 per 32 dims, f16 decode | 15-level per channel per 16-key tile |
+
+The removal was verified byte-identical: every remaining configuration
+(fp16, GQA, KT=32, B=2048, kv4a16, kv8a16) and the kmean / kq8 / kq4 / vq4
+quantizers regenerate the same source as before. The old env names
+(KQ8, KQ4, KA4, KASYM, K8F16, KROT) are gone.
