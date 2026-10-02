@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the HRX-native runners (loom_forward_pp, loom_decode, hal_bench, hal_run) without HIP or hipcc.
 #
-#   engine/build_hrx.sh                 build libyah_core, the core tools, the runners and yah_server
+#   engine/build_hrx.sh                 build libyah_core, the core tools, the runners and the serving binaries
 #   engine/build_hrx.sh <model.gguf>    also emit the decode HAL set into engine/hal
 #   engine/build_hrx.sh <model> <dir>   emit into <dir>
 #
@@ -49,8 +49,12 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # Terminal chat client for yah_server.
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_chat.cc" \
     "$root/engine/third_party/httplib/httplib.cpp" -o "$root/engine/build/yah_chat" -lpthread
+# Serving tests: the chat template golden and yah_server --fake over HTTP. No GPU, no libhrx.
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_serve_test.cc" \
+    "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
+    "$root/engine/third_party/httplib/httplib.cpp" -o "$root/engine/build/yah_serve_test" -lpthread
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"
 fi
-echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_bench,hal_run,yah_server,yah_chat}"
+echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_bench,hal_run,yah_server,yah_chat,yah_serve_test}"

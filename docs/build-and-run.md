@@ -129,12 +129,13 @@ for event in client.responses.create(model="qwen", input="Hi", stream=True):
 
 All system and developer messages merge into one system message at the start. The chat template is a C++ port of the GGUF's Jinja template for this subset.
 
-Tests (no GPU; source `engine/hrx-env.sh` first, the binary links libhrx):
+Tests (no GPU; source `engine/hrx-env.sh` first, `yah_server` links libhrx):
 
 ```
-PYTHONPATH=/home/q/llama.cpp/gguf-py /home/q/yah-scratch/venv/bin/python engine/serve/test_chat_template.py   # C++ template vs jinja2, byte for byte
-/home/q/yah-scratch/venv/bin/python engine/serve/test_responses.py   # yah_server --fake through the openai SDK
+engine/build/yah_serve_test <gguf> [yah_server]   # chat template golden, then yah_server --fake over HTTP
 ```
+
+It checks the C++ chat template byte for byte against `engine/serve/testdata/chat_template_cases.json`, then starts `yah_server --fake` on a free port and checks the response object and stream event shapes (the required fields of the openai SDK models), event order, deltas, `max_output_tokens`, the 400 error objects and client disconnect. The fixture was frozen from jinja2 on 2026-10-02 against the GGUF's template; regenerating it is not supported in-tree.
 
 ## Correctness
 

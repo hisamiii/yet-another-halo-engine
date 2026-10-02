@@ -2,7 +2,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,34 +26,8 @@ int Usage() {
   std::fprintf(stderr,
                "usage: yah_server --model <gguf> --prefill <hal set> --decode <hal set> [--host 127.0.0.1] "
                "[--port 8080]\n"
-               "       yah_server --model <gguf> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
-               "       yah_server --render-chat < cases.json                      chat template test mode\n");
+               "       yah_server --model <gguf> --fake [--host ...] [--port ...]   canned replies, no GPU\n");
   return 2;
-}
-
-// Test mode for test_chat_template.py: a JSON array of {messages, effort, add_generation_prompt} on stdin,
-// a JSON array of rendered prompts (or {error}) on stdout.
-int RenderChatCases() {
-  const Json cases = Json::parse(std::cin);
-  Json out = Json::array();
-  for (const Json& c : cases) {
-    try {
-      std::vector<ChatMessage> messages;
-      for (const Json& m : c.at("messages")) {
-        messages.push_back({m.at("role").get<std::string>(),
-                            ContentText(m.contains("content") ? m["content"] : Json(nullptr), "content"),
-                            m.value("reasoning_content", std::string())});
-      }
-      ChatOptions options;
-      options.effort = ParseEffort(c.value("effort", std::string("high")));
-      options.add_generation_prompt = c.value("add_generation_prompt", true);
-      out.push_back(RenderChat(messages, options));
-    } catch (const std::exception& error) {
-      out.push_back({{"error", error.what()}});
-    }
-  }
-  std::cout << Dump(out) << "\n";
-  return 0;
 }
 
 class Server {
@@ -176,13 +149,11 @@ class Server {
 int main(int argc, char** argv) {
   std::string model, prefill, decode, host = "127.0.0.1";
   int port = 8080;
-  bool fake = false, render_chat = false;
+  bool fake = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const bool has_value = i + 1 < argc;
-    if (arg == "--render-chat") {
-      render_chat = true;
-    } else if (arg == "--fake") {
+    if (arg == "--fake") {
       fake = true;
     } else if (arg == "--model" && has_value) {
       model = argv[++i];
@@ -198,10 +169,9 @@ int main(int argc, char** argv) {
       return Usage();
     }
   }
-  if (!render_chat && (model.empty() || (!fake && (prefill.empty() || decode.empty())))) return Usage();
+  if (model.empty() || (!fake && (prefill.empty() || decode.empty()))) return Usage();
 
   try {
-    if (render_chat) return RenderChatCases();
     std::unique_ptr<TextGenerator> generator;
     if (fake) {
       generator = std::make_unique<FakeGenerator>(model);
