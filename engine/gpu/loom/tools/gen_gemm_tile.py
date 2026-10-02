@@ -82,6 +82,7 @@ class Tile:
     q4fmix: bool = False       # Q4_K/Q5_K subtract-and-narrow through v_fma_mix (gen_gemm_decode Q4FMIX)
     swepi: bool = False        # swiglu through lds_epilogue
     stagger: int = STAGGER     # barriers the second workgroup per WGP waits in the first round
+    gstage: bool = False       # stage activations through the general segment map even where the row map fits
 
     @property
     def tm(self):
@@ -135,10 +136,9 @@ def check(t):
     """Raise ValueError if t cannot be emitted (shape rules only; the compiler rejects LDS or VGPR overflow)."""
     rules = [
         (t.bm % (16 * t.wm) == 0 and t.bn % (16 * t.wn) == 0, "per-wave tile is not whole 16 x 16 fragments"),
-        (t.lanes >= t.bm and t.lanes % t.bn == 0, "lanes do not cover the weight rows and token rows"),
+        (t.lanes >= t.bm, "lanes do not cover the weight rows"),
         (t.ksub in (32, 64, 128) and (not t.decahead or t.bm % WS == 0), "KSUB or decode-ahead geometry"),
         (t.ksub // 32 * t.bm <= t.lanes, "not enough lanes to decode a phase in one pass"),
-        ((t.ksub // 8) % t.apl == 0, "activation row does not split evenly over its lanes"),
         (not t.swepi or t.tm == 32, "the LDS swiglu epilogue needs 32 rows per wave"),
     ]
     for ok, why in rules:
@@ -192,7 +192,12 @@ def _gen(fmt, kind, t, masked):
     slots = G.GPP                   # decoding lane groups of BM per phase
     arow = ksub + APAD              # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
-    aspl = aseg // APL              # of which one staging lane loads
+    # Activation staging. Legacy map (every shipped tile): each lane loads aspl segments of one token row.
+    # General map (any other BN): lanes walk the tile's BN * aseg segments in order, nsl per lane, so neighbouring lanes
+    # read neighbouring 16-byte segments of a row; lanes past the end repeat the last segment (identical stores).
+    legacy = LANES % BN == 0 and aseg % (LANES // BN) == 0 and not t.gstage
+    aspl = aseg // APL if legacy else 0      # segments one lane loads (legacy map)
+    nsl = aspl if legacy else -(-BN * aseg // LANES)
     V8 = "vector<8xf32>"
     VF = "vector<16xf16>"
     L = []
@@ -345,13 +350,28 @@ def _gen(fmt, kind, t, masked):
     e("  %cgpl = scalar.constant 1 : i32")
     e("  %gl_i = scalar.muli %slot_i, %cgpl : i32")
     e("  %kphases = index.mul %k_blocks, %cph : index")
-    # activation staging map: lane tid stages segments [aseg0, aseg0+aspl) of token row tid % BN of the tile
-    e(f"  %atok = index.rem %tid, %c{BN} : index")
-    e(f"  %apart = index.div %tid, %c{BN} : index")
-    e(f"  %caspl8 = index.constant {8 * aspl} : index")
-    e("  %aseg0 = index.mul %apart, %caspl8 : index")
-    e("  %atok_g = index.add %wtb, %atok : index")
-    e("  %arow_g = index.mul %atok_g, %apitch : index")
+    if legacy:
+        # activation staging map: lane tid stages segments [aseg0, aseg0+aspl) of token row tid % BN of the tile
+        e(f"  %atok = index.rem %tid, %c{BN} : index")
+        e(f"  %apart = index.div %tid, %c{BN} : index")
+        e(f"  %caspl8 = index.constant {8 * aspl} : index")
+        e("  %aseg0 = index.mul %apart, %caspl8 : index")
+        e("  %atok_g = index.add %wtb, %atok : index")
+        e("  %arow_g = index.mul %atok_g, %apitch : index")
+    else:
+        # segment s = tid + i * LANES (clamped): token row s / aseg, f16 column 8 * (s % aseg)
+        e(f"  %gs_last = index.constant {BN * aseg - 1} : index")
+        e(f"  %gs_aseg = index.constant {aseg} : index")
+        for i in range(nsl):
+            e(f"  %gs{i}c = index.constant {i * LANES} : index")
+            e(f"  %gs{i}0 = index.add %tid, %gs{i}c : index")
+            e(f"  %gs{i} = index.min %gs{i}0, %gs_last : index")
+            e(f"  %gr{i} = index.div %gs{i}, %gs_aseg : index")
+            e(f"  %gq{i} = index.rem %gs{i}, %gs_aseg : index")
+            e(f"  %gc{i} = index.mul %gq{i}, %c8 : index")
+            e(f"  %grt{i} = index.add %wtb, %gr{i} : index")
+            e(f"  %grp{i} = index.mul %grt{i}, %apitch : index")
+            e(f"  %gro{i} = index.add %grp{i}, %gc{i} : index")
     L.extend(F["setup"]())
     e("  %z8s = scalar.constant 0 : i8")
     e("  %z8v = vector.splat %z8s : vector<8xi8>")
@@ -364,6 +384,13 @@ def _gen(fmt, kind, t, masked):
         """Load this lane's part of its token row of a phase's activation tile as 16-byte vectors.
         Clamped, so the extra iteration's loads stay in bounds."""
         vals = []
+        if not legacy:
+            for i in range(nsl):
+                e(f"    %{p}gq{i} = index.add %gro{i}, {kbase} : index")
+                e(f"    %{p}gqc{i} = index.min %{p}gq{i}, %a_last8 : index")
+                e(f"    %{p}av{i} = vector.load %a_flat[%{p}gqc{i}] : view<[%a_total]xf16> -> vector<8xf16>")
+                vals.append((f"%{p}av{i}", "vector<8xf16>"))
+            return vals
         e(f"    %{p}ab = index.add %arow_g, {kbase} : index")
         e(f"    %{p}ao = index.add %{p}ab, %aseg0 : index")
         for sg in range(aspl):
@@ -423,6 +450,9 @@ def _gen(fmt, kind, t, masked):
         e("    }")
     # stage the activation row into the LDS activation tile
     for sg, nm in enumerate(cur_a):
+        if not legacy:
+            e(f"    vector.store {nm}, %al_rows[%gr{sg}, %gc{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+            continue
         e(f"    %as{sg}c = index.constant {8 * sg} : index")
         e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
         e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
@@ -633,6 +663,8 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
         e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
+    if masked:
+        e("  %es_tok_last = index.sub %tokens, %c1 : index")
     e("  %es_lane = index.rem %tid, %c32 : index")
     e("  %es_t = index.div %es_lane, %c2 : index")
     e("  %es_h0 = index.rem %es_lane, %c2 : index")
@@ -655,10 +687,15 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
         e(f"  %es_tc{j} = index.constant {16 * j} : index")
         e(f"  %es_tk{j}0 = index.add %token_base, %es_tc{j} : index")
         e(f"  %es_tk{j} = index.add %es_tk{j}0, %es_t : index")
-        e(f"  %es_tm{j} = index.mul %es_tk{j}, %m_rows : index")
+        es_tka = f"%es_tk{j}"
+        if masked:
+            # the guard below skips tokens past the last; the clamp lets the compiler prove the addresses in bounds
+            e(f"  %es_tkc{j} = index.min %es_tk{j}, %es_tok_last : index")
+            es_tka = f"%es_tkc{j}"
+        e(f"  %es_tm{j} = index.mul {es_tka}, %m_rows : index")
         e(f"  %es_ob{j} = index.add %es_tm{j}, %es_row : index")
         if qg:
-            e(f"  %qg_tm{j} = index.mul %es_tk{j}, %qg_rows : index")
+            e(f"  %qg_tm{j} = index.mul {es_tka}, %qg_rows : index")
             e(f"  %qg_ob{j} = index.add %qg_tm{j}, %qg_col : index")
         if masked:
             # this lane's token past the last valid one: no residual / gate load, no store
