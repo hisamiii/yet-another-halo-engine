@@ -3014,11 +3014,13 @@ Loom miscompiles on the way (upstream-candidates #10):
   page, shared by all layers) renumbers K rows (and K scales) and V^T tiles
   (and V stats); the layouts are otherwise unchanged. Every 16-key attention
   tile lies in one page, so attention does one uniform page-table load per K
-  tile and per V tile.
+  tile and per V tile. The host validates every table entry (< npages) before
+  upload; attention assumes the bound, the cache writers also clamp to it.
 - **Writers:** the f16 KV cache is always a one-layer, one-chunk scratch (RoPE
   cache_start). Per chunk:
-  - fp16: yah_kpage (K rows) and yah_vtpage (V^T tiles), instead of the
-    whole-cache yah_transpose_v16 per layer;
+  - fp16: RoPE stores K rows straight into their page (emitter transform
+    rope_kpaged, geometry marker "rope_kpaged") and yah_vtpage writes V^T
+    tiles, instead of the whole-cache yah_transpose_v16 per layer;
   - quantized: yah_kq8 / yah_kq4 / yah_vq8 / yah_vq4 in paged form.
   The driver fills the table (identity; YAH_PAGE_SCRAMBLE=<seed> shuffles it
   for testing). The context must be a multiple of 256; FA attention only.
@@ -3026,7 +3028,18 @@ Loom miscompiles on the way (upstream-candidates #10):
   - fp16 pp2048 md5 ac36332b6b5092a4 and pp8192 963b7396625e2333;
   - kv8a16 / kv4a16 one-pass 8K and chunked 8K;
   - fp16 32K chunked (arXiv row stats).
-- **Cost (one round each, SQ_BUSY_CYCLES):** total +0.14% (pp2048) / +0.28%
-  (pp8192). Attention +1.7% / +2.2% from the page loads; the K copy is new
-  work (1.7 / 6.0 M); vtpage ~ vtrans. In chunked long-context runs paging
+- **Cost (one round each, SQ_BUSY_CYCLES):** first version (separate yah_kpage
+  copy) +0.14% (pp2048) / +0.28% (pp8192). With RoPE writing K into its page:
+  -0.25% / -0.48%, i.e. within run-to-run noise (GEMMs alone moved 0.4%);
+  attention still +2% from the page lookups, RoPE +5% (27.9 M at pp2048), the
+  K copy is gone and vtpage ~ vtrans. In chunked long-context runs paging
   saves the per-chunk whole-cache V^T re-transpose (~16x redundant at 32K).
+  - Wall time is not the metric here: pp8192 paged ran +7% wall in the same
+    round, with identical idle (0.5%) and 7% fewer SQ cycles per device tick
+    across every kernel, from a mid-run clock step (octile 4). The previous
+    round had the same step on the non-paged run instead.
+  - Tried and reverted: the page table in LDS (attention +1.1% over SMEM; the
+    paging cost is the index math, not the scalar load, see gen_attn_fa.py),
+    and one shared page lookup per K tile (no gain). The LDS version hung the
+    GPU (ring gfx timeout, MODE2 reset) while the prologue read the table
+    before the barrier that publishes it.

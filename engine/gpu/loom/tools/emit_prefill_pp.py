@@ -22,7 +22,7 @@ env:
                   Anything but 64 goes through tools/widen_tokens.widen().
   YAH_PP_TOKENS   default token count when argv[3] is absent.
 """
-import os, sys, shutil
+import os, re, sys, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -36,6 +36,56 @@ def widen_source(loomfile, text, tile):
     import widen_tokens as W
     origin = "%m_origin_s" if "%m_origin_s" in text else "%m_origin"
     return W.widen(text, tile // 16, m_origin=origin)
+
+
+def rope_kpaged(text):
+    """yah_fused_qk_rope_batched -> paged-K variant: K rows go straight to the
+    paged K pool (row ptab[cur / 256] * 256 + cur % 256, k16_elems elements,
+    page index clamped into the pool); V keeps writing the one-chunk scratch for
+    yah_vtpage (KV paging, YAH_KV_PAGED)."""
+    def r(a, b):
+        nonlocal text
+        assert text.count(a) == 1, a[:60]
+        text = text.replace(a, b)
+    r("config.decl @yah_fused_qk_rope_batched.cache16_elems : %value: index where [range(%value, 1, 1073741824)]",
+      "config.decl @yah_fused_qk_rope_batched.cache16_elems : %value: index where [range(%value, 1, 1073741824)]\n"
+      "config.decl @yah_fused_qk_rope_batched.k16_elems : %value: index where [range(%value, 1, 1073741824)]")
+    r("%k_cache_f16: buffer, %v_cache_f16: buffer, %eps_buf: buffer) {",
+      "%k_cache_f16: buffer, %v_cache_f16: buffer, %eps_buf: buffer, %ptab: buffer) {")
+    r("  %cache16_elems = config.get @yah_fused_qk_rope_batched.cache16_elems : index\n",
+      "  %cache16_elems = config.get @yah_fused_qk_rope_batched.cache16_elems : index\n"
+      "  %k16_elems = config.get @yah_fused_qk_rope_batched.k16_elems : index\n")
+    r("  %k16_view = buffer.view %k16_na[%base] : buffer -> view<[%cache16_elems]xf16>",
+      "  %k16_view = buffer.view %k16_na[%base] : buffer -> view<[%k16_elems]xf16>")
+    r("  %cur = index.min %cur_nn, %ctx_m1 : index\n",
+      "  %cur = index.min %cur_nn, %ctx_m1 : index\n"
+      "  %pg256 = index.constant 256 : index\n"
+      "  %pg255 = index.constant 255 : index\n"
+      "  %pgrows = index.div %k16_elems, %kv_width : index\n"
+      "  %pgn0 = index.add %pgrows, %pg255 : index\n"
+      "  %pgnp = index.div %pgn0, %pg256 : index\n"
+      "  %pt_view = buffer.view %ptab[%base] : buffer -> view<[%pgnp]xi32>\n"
+      "  %pglp = index.div %cur, %pg256 : index\n"
+      "  %pglp1 = index.sub %pgnp, %c1 : index\n"
+      "  %pglpc = index.min %pglp, %pglp1 : index\n"
+      "  %pgv = view.load %pt_view[%pglpc] : view<[%pgnp]xi32> -> i32\n"
+      "  %pgu = index.cast %pgv : i32 to index\n"
+      "  %pgz = index.max %pgu, %c0 : index\n"
+      "  %pg = index.min %pgz, %pglp1 : index\n"           # clamp into the pool (both sides)
+      "  %pgb = index.mul %pg, %pg256 : index\n"
+      "  %pgo = index.rem %cur, %pg256 : index\n"
+      "  %krow = index.add %pgb, %pgo : index\n")
+    r("    %f16_off = index.min %f16_off_raw, %cache16_max : index\n",
+      "    %f16_off = index.min %f16_off_raw, %cache16_max : index\n"
+      "    %k16_pre = index.mul %krow, %kv_width : index\n"
+      "    %k16_raw = index.add %k16_pre, %hbkq : index\n"
+      "    %k16_max = index.sub %k16_elems, %head_dim : index\n"
+      "    %k16_base = index.min %k16_raw, %k16_max : index\n")
+    for a in ("%k16_off0 = index.add %f16_off, %p3 :", "%k16_off1 = index.add %f16_off, %p3b :", "%k16_off3 = index.add %f16_off, %i3 :"):
+        r(a, a.replace("%f16_off", "%k16_base"))
+    text, n = re.subn(r"(%k16_view\[[^\]]*\] : f16, )view<\[%cache16_elems\]xf16>", r"\1view<[%k16_elems]xf16>", text)
+    assert n == 3, n
+    return text
 
 
 def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
@@ -460,7 +510,7 @@ def main():
     # YAH_KV_PAGED=1: paged K / V caches (256-token pages, page table bound to
     # attention and every cache writer; gen_attn_fa / gen_kvq read the same env).
     # The f16 KV cache is then always a scratch; fp16 K / V go to paged pools
-    # through yah_kpage / yah_vtpage (per chunk) instead of the V^T re-transpose.
+    # through the paged RoPE K store / yah_vtpage (per chunk) instead of the V^T re-transpose.
     kv_paged = os.environ.get("YAH_KV_PAGED", "0") == "1"
     if kv_paged:
         if T % 256:
@@ -475,9 +525,11 @@ def main():
     paged_f16v = kv_paged and not (vq4_on or vq8_on)
     if paged_f16k or paged_f16v:
         import gen_kvq
-    if paged_f16k:
-        kpage_src = os.path.join(tmp, "yah_kpage.loom")
-        open(kpage_src, "w").write(gen_kvq.gen_kpage())
+    rope_src = "yah_fused_qk_rope_batched_f32.loom"
+    if paged_f16k:   # RoPE writes K rows straight into the paged pool
+        rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_kpaged.loom")
+        open(rope_src, "w").write(rope_kpaged(open(os.path.join(E.LOOM, "yah_fused_qk_rope_batched_f32.loom")).read()))
+        geom.append(("rope_kpaged", 0, 0, 0))
     if paged_f16v:
         vtpage_src = os.path.join(tmp, "yah_vtpage.loom")
         open(vtpage_src, "w").write(gen_kvq.gen_vtpage())
@@ -530,7 +582,7 @@ def main():
         ("yah_unpack_qg_f32.loom", "unpack.hal",
          ["yah_unpack_qg.batch=%d" % B, "yah_unpack_qg.num_heads=24",
           "yah_unpack_qg.head_dim=256"]),
-        *[("yah_fused_qk_rope_batched_f32.loom", "rope.hal" if c == 0 else "rope_c%d.hal" % c, [
+        *[(rope_src, "rope.hal" if c == 0 else "rope_c%d.hal" % c, [
             "yah_fused_qk_rope_batched.start_pos=%d" % (c * B),
             "yah_fused_qk_rope_batched.batch=%d" % B,
             "yah_fused_qk_rope_batched.layer_idx=0",
@@ -543,7 +595,8 @@ def main():
             "yah_fused_qk_rope_batched.kv_elems=%d" % (1024 * B),
             "yah_fused_qk_rope_batched.cache32_elems=%d" % KC,
             "yah_fused_qk_rope_batched.cache16_elems=%d" % (1024 * B if kv16_scratch else KC),
-            *(["yah_fused_qk_rope_batched.cache_start=%d" % (c * B)] if kv16_scratch else [])]) for c in range(NCH)],
+            *(["yah_fused_qk_rope_batched.cache_start=%d" % (c * B)] if kv16_scratch else []),
+            *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)],
         *[(attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
@@ -561,9 +614,6 @@ def main():
             ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B,
              "yah_kvq.start_pos=%d" % (c * B), "yah_kvq.pool_rows=%d" % T]) for c in range(NCH)]
           if kq8_on and kv_paged else []),
-        *([(kpage_src, "kpage.hal" if c == 0 else "kpage_c%d.hal" % c,
-            ["yah_kvq.token_count=%d" % B, "yah_kvq.start_pos=%d" % (c * B), "yah_kvq.pool_rows=%d" % T])
-           for c in range(NCH)] if paged_f16k else []),
         *([(vtpage_src, "vtpage.hal" if c == 0 else "vtpage_c%d.hal" % c,
             ["yah_kvq.token_count=%d" % B, "yah_kvq.start_pos=%d" % (c * B), "yah_kvq.pool_rows=%d" % T])
            for c in range(NCH)] if paged_f16v else []),

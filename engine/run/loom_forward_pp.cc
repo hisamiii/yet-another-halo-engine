@@ -578,7 +578,7 @@ int main(int argc, char** argv) {
     // Paged K / V caches ("kv_paged"): 256-token pages; one page table per
     // sequence (logical page -> physical page, shared by all layers) bound to
     // attention and every cache writer. fp16 K / V go to paged pools through
-    // yah_kpage / yah_vtpage per chunk (no V^T re-transpose of the whole cache).
+    // RoPE (paged K store) / yah_vtpage per chunk (no V^T re-transpose of the whole cache).
     // YAH_PAGE_SCRAMBLE=<seed>: a shuffled page assignment (testing).
     const bool kv_paged = g_geom.count("kv_paged") != 0;
     const std::uint32_t kPages = (T_ctx + 255) / 256;
@@ -590,6 +590,9 @@ int main(int argc, char** argv) {
         std::mt19937 rng(static_cast<std::uint32_t>(std::atoi(sc)));
         std::shuffle(pages.begin(), pages.end(), rng);
       }
+      // attention trusts the table (bounds assumed, not clamped): validate it here
+      for (std::int32_t pg : pages)
+        if (pg < 0 || pg >= static_cast<std::int32_t>(kPages)) throw LoomError("page table entry out of range");
       gpu.H2D(ptab, pages.data(), pages.size() * 4);
     }
     LoomExecutable* e_vtrans = (!kv_paged && g_geom.count("vtrans.hal")) ? &load(dir + "/vtrans.hal") : nullptr;
@@ -626,13 +629,15 @@ int main(int argc, char** argv) {
     // paged fp16 pools (per layer: K rows / V^T tiles of the whole context) and
     // the per-chunk paged writers
     const bool paged_f16k = kv_paged && !attn_kq8, paged_f16v = kv_paged && !attn_vqt;
+    // "rope_kpaged": RoPE writes the fp16 K rows straight into the paged pool
+    const bool rope_kpaged = g_geom.count("rope_kpaged") != 0;
+    if (paged_f16k && !rope_kpaged) throw LoomError("paged fp16 K needs a rope_kpaged HAL set (re-emit)");
     const std::size_t kPoolBytes = std::size_t{kPages} * 256 * kKvRow * 2;
     LoomBuffer kpool = gpu.Allocate(paged_f16k ? std::size_t{kFull} * kPoolBytes : 4);
     LoomBuffer vtpool = gpu.Allocate(paged_f16v ? std::size_t{kFull} * kPoolBytes : 4);
-    std::vector<LoomExecutable*> e_kpages, e_vtpages, e_kq8s;
+    std::vector<LoomExecutable*> e_vtpages, e_kq8s;
     for (std::uint32_t c = 0; kv_paged && c < n_chunks; ++c) {
       const std::string sfx = c ? "_c" + std::to_string(c) : std::string();
-      if (paged_f16k) e_kpages.push_back(&load(dir + "/kpage" + sfx + ".hal"));
       if (paged_f16v) e_vtpages.push_back(&load(dir + "/vtpage" + sfx + ".hal"));
       if (attn_kq8) e_kq8s.push_back(&load(dir + "/kq8" + sfx + ".hal"));
     }
@@ -1042,9 +1047,12 @@ int main(int argc, char** argv) {
               {vbuf.handle, 0, hb(vbuf)}, {w_qn.handle, w_qn.offset, w_qn.bytes},
               {w_kn.handle, w_kn.offset, w_kn.bytes}, {q.handle, 0, hb(q)},
               {kbuf.handle, 0, hb(kbuf)}, {kc32.handle, 0, hb(kc32)},
-              {vc32.handle, 0, hb(vc32)}, {kv16.handle, koff, kKv16Layer},
+              {vc32.handle, 0, hb(vc32)},
+              rope_kpaged ? hrx_buffer_ref_t{kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
+                          : hrx_buffer_ref_t{kv16.handle, koff, kKv16Layer},
               {kv16.handle, voff, kKv16Layer},
               {eps.handle, 0, 4}};
+          if (rope_kpaged) b.push_back(ptab_ref);
           Dispatch(gpu, e_rope, "yah_fused_qk_rope_batched", 28, B, 1, 256, 1, 1, b);
         }
         kv_hook(ai, ci, koff, voff);
@@ -1102,11 +1110,6 @@ int main(int argc, char** argv) {
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, voff, kKvCache * 2}, {vt16.handle, 0, kVtBytes}};
           Dispatch(gpu, *e_vtrans, "yah_transpose_v16", 32, (T_ctx + 31) / 32, 1, 256, 1, 1, b);
-        }
-        if (paged_f16k) {
-          std::vector<hrx_buffer_ref_t> b = {
-              {kv16.handle, koff, f16rows}, {kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}, ptab_ref};
-          Dispatch(gpu, *e_kpages[ci], "yah_kpage", (B + 1) / 2, 1, 1, 256, 1, 1, b);
         }
         {
           std::vector<hrx_buffer_ref_t> b = {

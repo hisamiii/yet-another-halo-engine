@@ -150,6 +150,17 @@ KDEC = K4 or K8                       # K decoded to f16 at staging
 # tile' = ptab[tile / 16] * 16 + tile % 16 (layouts unchanged). Every 16-key
 # tile lies in one page: one uniform table load per K tile and per V tile.
 PAGED = os.environ.get("YAH_KV_PAGED", "0") == "1"
+# PAGED page lookups are scalar (SMEM) loads of the global table. Tried and
+# reverted (2026-10-02): a prologue copy of the table into LDS, to avoid the
+# lgkmcnt(0) that every SMEM use implies. Standalone pp8192 layer 3: non-paged
+# 64.26-64.74 M (run to run), SMEM 65.49 M, SMEM shared per tile 65.84 M,
+# LDS table 66.20 M (+0.12 LDS ops per WMMA on an LDS-heavy kernel, only
+# 11.44 -> 11.25 VALU per WMMA): the paging cost is the
+# per-tile index math, not the load. The LDS variant also hung the GPU (ring
+# timeout) when the prologue read the table before the barrier that publishes
+# it. The host validates every table entry (< npages) before upload, and the
+# cache writers clamp page indices into their pools; an in-kernel clamp here
+# cost +1% attention.
 if PAGED:
     assert KT == 16
 if KDEC:
