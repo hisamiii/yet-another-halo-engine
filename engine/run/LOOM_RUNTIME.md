@@ -2045,6 +2045,17 @@ What mattered, in order (each measured on the full decode):
   row together: 128 MB of K / V per call at 32K went 2955 -> 689 us
   (43 -> 195 GB/s). Standalone timings below ~32 MB are flattered by the
   32 MB MALL; benchmark attention at 32K.
+- **Band-fused input projections** (`gen_gemv.gen_bands`, one dispatch per
+  layer for qkv / gate / alpha / beta or q / k / v): 234-237 GB/s, 176 fewer
+  dispatches per token, wall time neutral (61.17 vs 61.20 ms): the separate
+  no-barrier dispatches were already ~92% efficient.
+- Where the rest goes (61.1 ms, short context): GEMVs 54.9 ms (50.9 at
+  240 GB/s; SwiGLU ~2.2 ms and the residual GEMVs ~0.9 ms of the excess),
+  dependent-dispatch gaps 3.2 ms (563 x ~4 us), DeltaNet 1.9 ms (~1.3 floor).
+  HRX graphs do not shorten the gaps: 3.32 us per dependent node replayed vs
+  3.57 us on the stream (yah-scratch/decode/probe/graph_probe.cc); only fewer
+  dependent dispatches do. An explicit fma chain for the 16-element dot gave
+  the same VALU count (the compiler already contracts mul + reduce).
 - Profiling: `HRX_PROFILE_MODE=dispatch` (timestamps only) costs ~1%;
   counters mode inflates dispatch gaps ~4x. A kernel right after a no-barrier
   group shows the group's tail in its own duration.

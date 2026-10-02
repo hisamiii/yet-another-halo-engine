@@ -88,6 +88,7 @@ class LoomDecoder {
     gpu_.H2D(*posarr_, pv.data(), pv.size() * 4);
     trace_ = std::getenv("YAH_DEC_TRACE") != nullptr;
     overlap_ = std::getenv("YAH_DEC_NO_OVERLAP") == nullptr;
+    { const char* v = std::getenv("YAH_DEC_BANDS"); bands_ = !(v && std::string(v) == "0"); }
   }
 
   [[nodiscard]] std::uint32_t context() const { return T_; }
@@ -154,9 +155,7 @@ class LoomDecoder {
       Tr("in", l, *hidden_, kHidden);
       if (cfg_.IsFullAttention(l)) {
         const std::uint32_t ai = l / cfg_.full_attention_interval;
-        Gemv("plain", {pre + "attn_q.weight"}, *normed_, *qg_);
-        Gemv("plain", {pre + "attn_k.weight"}, *normed_, *kb_, true);
-        Gemv("plain", {pre + "attn_v.weight"}, *normed_, *vb_, true);
+        Project({pre + "attn_q.weight", pre + "attn_k.weight", pre + "attn_v.weight"}, {qg_, kb_, vb_});
         Dispatch(Load("unpack"), kHeads, 1, 256, {Ref(*qg_), Ref(*q_), Ref(*gate_)});
         Dispatch(Load("rope"), kHeads + kKvHeads, 1, 256,
                  {Ref(*q_), Ref(*kb_), Ref(*vb_), TRef(pre + "attn_q_norm.weight"), TRef(pre + "attn_k_norm.weight"),
@@ -170,10 +169,8 @@ class LoomDecoder {
         Gemv("resid", {pre + "attn_output.weight"}, *aout_, *hidden_);
       } else {
         const std::uint32_t si = l - l / cfg_.full_attention_interval;
-        Gemv("plain", {pre + "attn_qkv.weight"}, *normed_, *qkv_);
-        Gemv("plain", {pre + "attn_gate.weight"}, *normed_, *gate_, true);
-        Gemv("plain", {pre + "ssm_alpha.weight"}, *normed_, *alpha_, true);
-        Gemv("plain", {pre + "ssm_beta.weight"}, *normed_, *beta_, true);
+        Project({pre + "attn_qkv.weight", pre + "attn_gate.weight", pre + "ssm_alpha.weight", pre + "ssm_beta.weight"},
+                {qkv_, gate_, alpha_, beta_});
         Dispatch(Load("ssmconv"), (kQkv + 255) / 256, 1, 256,
                  {{qkv_->handle, 0, std::size_t{kQkv} * 4}, TRef(pre + "ssm_conv1d.weight"),
                   {st_.convstate, std::size_t{si} * kConvState * 4, std::size_t{kConvState} * 4}, Ref(*convout_)});
@@ -285,6 +282,40 @@ class LoomDecoder {
     if (overlap && overlap_) gpu_.NoBarrierNext();
     Dispatch(exe, M / (kR * kW), 1, 32 * kW, b);
   }
+  // A layer's input projections of normed_: one band-fused GEMV (gen_gemv gen_bands), or
+  // with YAH_DEC_BANDS=0 one GEMV each, the later ones without an ordering barrier.
+  void Project(const std::vector<std::string>& ws, const std::vector<LoomBuffer*>& ys) {
+    if (!bands_) {
+      for (std::size_t i = 0; i < ws.size(); ++i) Gemv("plain", {ws[i]}, *normed_, *ys[i], i > 0);
+      return;
+    }
+    std::string fn, mn;
+    std::uint32_t tbits = 0, K = 0, rows = 0;
+    std::vector<hrx_buffer_ref_t> b;
+    for (std::size_t i = 0; i < ws.size(); ++i) {
+      const auto* t = Find(ws[i]);
+      Fmt f{};
+      if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) throw LoomError("no GEMV format for " + ws[i]);
+      const std::uint32_t k = static_cast<std::uint32_t>(t->dims[0]), M = static_cast<std::uint32_t>(t->dims[1]);
+      if (i && k != K) throw LoomError("bands need one K");
+      K = k;
+      if (t->bytes != std::uint64_t{K} / f.qk * f.bb * M) throw LoomError("footprint mismatch on " + ws[i]);
+      if (M % (kR * kW) || ys[i]->size < std::size_t{M} * 4) throw LoomError("band output: " + ws[i]);
+      fn += std::string("_") + f.name;
+      mn += "_" + std::to_string(M);
+      tbits |= f.tables;
+      rows += M;
+      b.push_back(TRef(ws[i]));
+    }
+    for (int i = 0; i < 5; ++i)
+      if (tbits & (1u << i)) b.push_back(tabs_[i]);
+    b.push_back({normed_->handle, 0, std::size_t{K} * 4});
+    for (std::size_t i = 0; i < ws.size(); ++i) {
+      const auto* t = Find(ws[i]);
+      b.push_back({ys[i]->handle, 0, static_cast<std::size_t>(t->dims[1]) * 4});
+    }
+    Dispatch(Load("gb" + fn + mn + "_" + std::to_string(K)), rows / (kR * kW), 1, 32 * kW, b);
+  }
   void Rmsnorm(const LoomBuffer& x, const std::string& w, const LoomBuffer& out) {
     Dispatch(Load("rmsnorm"), 1, 1, 512, {Ref(x), TRef(w), Ref(out)});
   }
@@ -310,7 +341,7 @@ class LoomDecoder {
   hrx_buffer_t weights_;
   std::size_t delta_;
   std::uint32_t T_ = 0, cur_pos_ = 0;
-  bool trace_ = false, overlap_ = true;
+  bool trace_ = false, overlap_ = true, bands_ = true;
   std::deque<LoomBuffer> keep_;   // stable addresses
   std::map<std::string, LoomExecutable> exes_;
   std::vector<hrx_buffer_ref_t> tabs_;

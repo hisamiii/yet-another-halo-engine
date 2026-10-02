@@ -71,6 +71,56 @@ def run_kernel(model, work, tag, kind, fmts, M, K, tensors, x, y0=None, R=2, W=4
     return y, ms
 
 
+def check_bands(model, work, rd, dequantize, rng, layers):
+    """band-fused input projections of real layers vs the oracle"""
+    worst = 0.0
+    t = {x.name: x for x in rd.tensors}
+    for l in layers:
+        pre = f"blk.{l}."
+        names = [pre + n + ".weight" for n in ("attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta")]
+        if names[0] not in t:
+            names = [pre + n + ".weight" for n in ("attn_q", "attn_k", "attn_v")]
+        ts = [t[n] for n in names]
+        fmts = [G.GGML[int(x.tensor_type)] for x in ts]
+        K = int(ts[0].shape[0]); Ms = [int(x.shape[1]) for x in ts]
+        x = rng.standard_normal(K).astype(np.float32)
+        tag = f"bands_l{l}"
+        src = os.path.join(work, tag + ".loom")
+        open(src, "w").write(G.gen_bands(fmts, Ms, K))
+        r = subprocess.run([sys.executable, EMIT, src, os.path.join(work, tag), "nop=0"], capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit(f"{tag}: emit failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+        hal = r.stdout.strip().splitlines()[0]
+        xf = os.path.join(work, tag + ".x"); x.tofile(xf)
+        outs = [os.path.join(work, f"{tag}.y{i}") for i in range(len(ts))]
+        binds = [f"t:{n}" for n in names] + [f"f:{os.path.join(TABLE_DIR, TABLE_FILE[q])}" for q in G.tables_for(fmts)] + [f"f:{xf}"]
+        binds += [f"o:{M * 4}:{o}" for M, o in zip(Ms, outs)]
+        mins = ",".join(str(v) for v in G.footprint_bands(fmts, Ms, K))
+        env = dict(os.environ)
+        if BENCH:
+            env["HAL_RUN_ITERS"] = str(BENCH); time.sleep(1)
+        r = subprocess.run([GPURUN, "gemv-check", "--", HALRUN, model, hal, str(sum(Ms) // 8), "128", mins] + binds,
+                           capture_output=True, text=True, timeout=120, env=env)
+        if "hal_run: ok" not in r.stdout:
+            raise SystemExit(f"{tag}: hal_run failed\n{r.stdout[-1500:]}{r.stderr[-1500:]}")
+        perf = ""
+        for line in r.stdout.splitlines():
+            if "ms per dispatch" in line:
+                ms = float(line.split()[1]); wb = sum(G.row_bytes(f, K) * M for f, M in zip(fmts, Ms))
+                perf = f"   {ms * 1000:7.1f} us  {wb / ms / 1e6:6.1f} GB/s"
+        errs = []
+        for z, o in zip(ts, outs):
+            ref = dequantize(z.data, z.tensor_type).astype(np.float64) @ x.astype(np.float64)
+            y = np.fromfile(o, np.float32)
+            errs.append(float(np.max(np.abs(y - ref)) / max(np.max(np.abs(ref)), 1e-30)))
+            os.remove(o)
+        os.remove(xf); os.remove(src)
+        worst = max(worst, max(errs))
+        print(f"{tag:12s} {'/'.join(fmts):28s} M={'/'.join(map(str, Ms)):22s} max err {max(errs):.2e}"
+              f"{'   <-- FAIL' if max(errs) > 1e-4 else ''}{perf}", flush=True)
+    return worst
+
+
 def main():
     model, work = sys.argv[1], sys.argv[2]
     kinds = sys.argv[3:] or ["plain"]
@@ -89,6 +139,9 @@ def main():
         pick.setdefault((fmt, K), t)
     rng = np.random.default_rng(1)
     worst = 0.0
+    if "bands" in kinds:
+        kinds = [k for k in kinds if k != "bands"]
+        worst = max(worst, check_bands(model, work, rd, dequantize, rng, [0, 1, 2, 3, 5, 14, 22, 63]))
     for kind in kinds:
         cases = list(pick.items())
         if kind == "swiglu":   # gate/up pairs from the same layer, formats as found

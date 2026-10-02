@@ -3,6 +3,8 @@
 
 usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, multiple of 256)
 
+  gb_<fmts>_<Ms>_<K>.hal         tools/gen_gemv.py gen_bands: a layer's input projections
+                                 in one dispatch (the decoder's default)
   gv_<kind>_<fmts>_<M>_<K>.hal   tools/gen_gemv.py, one per distinct (kind, formats,
                                  shape) on the shard: plain for the input projections
                                  and the head, resid for attn_output / ssm_out /
@@ -55,6 +57,29 @@ def gemv_name(kind, fmts, M, K):
     return "gv_%s_%s_%d_%d" % (kind, "_".join(fmts), M, K)
 
 
+def bands_name(fmts, Ms, K):
+    return "gb_%s_%s_%d" % ("_".join(fmts), "_".join(map(str, Ms)), K)
+
+
+def bands_set(model):
+    """{name: (fmts, Ms, K)}: the input projections of each layer as one band-fused GEMV
+    (attn_qkv / attn_gate / ssm_alpha / ssm_beta, or attn_q / attn_k / attn_v)."""
+    t = {}
+    for nm, dims, ty in EP.parse(model):
+        t[nm] = (GV.GGML.get(ty), int(dims[0]), int(dims[1]) if len(dims) > 1 else 1)
+    out = {}
+    layers = sorted({int(n.split(".")[1]) for n in t if n.startswith("blk.") and n.split(".")[1].isdigit()})
+    for l in layers:
+        p = "blk.%d." % l
+        if p + "ffn_gate.weight" not in t:
+            continue
+        group = ("attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta") if p + "attn_qkv.weight" in t else ("attn_q", "attn_k", "attn_v")
+        ns = [p + n + ".weight" for n in group]
+        fmts, K, Ms = [t[n][0] for n in ns], t[ns[0]][1], [t[n][2] for n in ns]
+        out[bands_name(fmts, Ms, K)] = (fmts, Ms, K)
+    return out
+
+
 def gemv_set(model):
     """{name: (kind, fmts, M, K)} for every decode projection on the shard."""
     t = {}
@@ -94,6 +119,9 @@ def main():
     gs = gemv_set(model)
     for name, (kind, fmts, M, K) in sorted(gs.items()):
         emit_src(GV.gen(kind, fmts, M, K), name, outdir)
+    bs = bands_set(model)
+    for name, (fmts, Ms, K) in sorted(bs.items()):
+        emit_src(GV.gen_bands(fmts, Ms, K), name, outdir)
     for which in ("kvappend", "part", "reduce"):
         emit_src(DA.gen(which, T), "dattn_" + which, outdir)
     L = lambda f: os.path.join(LOOM, f)
@@ -116,7 +144,7 @@ def main():
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write("ctx %d\n" % T)
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
-    print("emitted %d GEMV + 9 decode HALs (max context %d) to %s" % (len(gs), T, outdir))
+    print("emitted %d GEMV + %d band GEMV + 10 decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))
 
 
 if __name__ == "__main__":
