@@ -299,3 +299,35 @@ The removal was verified byte-identical: every remaining configuration
 (fp16, GQA, KT=32, B=2048, kv4a16, kv8a16) and the kmean / kq8 / kq4 / vq4
 quantizers regenerate the same source as before. The old env names
 (KQ8, KQ4, KA4, KASYM, K8F16, KROT) are gone.
+
+## Chunked quantized KV (2026-10-02, af82244)
+
+- K quantizers run per chunk on cache slices; the channel mean comes from
+  chunk 0 and is kept per layer.
+- V quantizers are per 16-key tile and take start_pos.
+- With K and V quantized, the f16 KV cache is a one-layer, one-chunk scratch.
+
+32K chunked, real kernels vs fp16:
+
+| doc | config | dPPL | mean KLD | 99% KLD | 99.9% KLD | 99% prec | 99.9% prec | same top |
+|---|---|---|---|---|---|---|---|---|
+| books | kv8a16 | -0.00% | 0.000010 | 0.0009 | 0.0020 | 99.91% | 99.80% | 99.80% |
+| books | kv4a16 | -0.01% | 0.000994 | 0.0114 | 0.0297 | 98.87% | 97.08% | 98.36% |
+| code | kv8a16 | -0.01% | 0.000034 | 0.0008 | 0.0038 | 99.92% | 99.62% | 99.90% |
+| code | kv4a16 | -0.05% | 0.001040 | 0.0168 | 0.0669 | 98.34% | 93.53% | 99.52% |
+| arxiv | kv8a16 | -0.02% | 0.000073 | 0.0012 | 0.0081 | 99.88% | 99.19% | 99.80% |
+| arxiv | kv4a16 | +0.21% | 0.003154 | 0.0401 | 0.2402 | 96.07% | 78.65% | 97.51% |
+
+kv4a16 matches the codec-hook study (books mean KLD 0.000994 for both).
+
+GTT peak above idle (pg1023):
+
+| config | 32K | 64K | 64K layers_ms |
+|---|---|---|---|
+| fp16 | +4133 MiB | +6504 MiB | 232.8 s |
+| kv8a16 | +3269 MiB | +4752 MiB | 242.1 s |
+| kv4a16 | +2816 MiB | +3827 MiB | 234.7 s |
+
+Scratch vs non-scratch: bit-identical (one-pass 8K and 32K chunked).
+Per-tile 8-bit V vs the old global-stats V (8K, 4 docs): mean KLD 0.000045
+-> 0.000022.
