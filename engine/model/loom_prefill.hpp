@@ -489,7 +489,12 @@ class LoomPrefill {
   std::uint32_t MTiles(const core::TensorInfo& t) const { return static_cast<std::uint32_t>(t.dims[1] / 16); }
 
   void RunNorm(const std::string& wname) {
-    Dispatch(Exe("norm.hal"), "yah_half_norm", B_, 1, 1, 32, 1, 1,
+    // One wave per row; a workgroup of w waves takes w rows.
+    const LoomExecutable& exe = Exe("norm.hal");
+    const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
+    const std::uint32_t rows_per_wg = ws ? ws / 32 : 1;
+    if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
+    Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1,
              {Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_), Ref(*scratch_)});
   }
   void RunKstore(const std::string& wname, const LoomBuffer& out) {

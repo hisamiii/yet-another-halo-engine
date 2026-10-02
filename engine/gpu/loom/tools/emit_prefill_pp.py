@@ -269,7 +269,9 @@ def main():
 
     # The output norm (tools/gen_half_norm.py): fully unrolled, all loads issued up front.
     norm_src = os.path.join(tmp, "yah_half_norm_unrolled.loom")
-    open(norm_src, "w").write(gen_half_norm.gen(5120))
+    # 4 rows (waves) per workgroup: 46.1 -> 41.9 ms per pp2048 vs one row per workgroup. The tuner's table may set it
+    # ({"norm": {"wpr": 2}}); the driver derives the grid from the kernel's workgroup size.
+    open(norm_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4)))
     fixed = [
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),

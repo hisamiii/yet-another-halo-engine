@@ -103,6 +103,7 @@ One line each: what, the measured effect, when the set was current. Prefill numb
 
 Prefill:
 
+- `yah_half_norm` with 4 rows (waves) per workgroup instead of 1: 46.1 -> 41.9 ms per pp2048 (-3.5% of its cycles); bit-identical.
 - HRX pin moved to a02a5ab94 plus the f16 WMMA operand placement (patch 0005; upstream enables #1160 for bf16 only): GEMM cycles -3.2%, prefill cycles -2.8%, pp2048 3047 -> 3000.5 ms; bit-identical. Decode 61.1 -> 60.8 ms (noise).
 - Prefill as one HRX graph per chunk, independent kernels overlapping (stock HRX): pp2048 ~3090 -> 3032 ms, a 500-token prompt 970 -> 926 ms; bit-identical.
 - Tile GEMM (128 x 256 per workgroup, 16 wave32 waves, both operands in padded LDS) replacing the shared-decode GEMM: pp2048 device time 5263 -> 4574 ms.

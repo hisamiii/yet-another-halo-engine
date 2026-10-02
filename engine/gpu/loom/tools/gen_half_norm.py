@@ -14,7 +14,7 @@ so the second pass reads mostly the weight (a loop form makes ~160 dependent rou
 import sys
 
 
-def gen(dim=5120):
+def gen(dim=5120, wpr=1):
     assert dim % 32 == 0
     n = dim // 32
     L = []
@@ -32,7 +32,14 @@ def gen(dim=5120):
     e("  %unit = index.constant 1 : index")
     e("  %rows = config.get @yah_half_norm.rows : index")
     e("  %c32 = index.constant 32 : index")
-    e("  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index")
+    if wpr == 1:
+        e("  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%c32, %unit, %unit) : index")
+    else:
+        # wpr rows per workgroup, one wave each; the driver launches rows / wpr workgroups
+        e(f"  %cwpr = index.constant {wpr} : index")
+        e(f"  %cwgs = index.constant {32 * wpr} : index")
+        e("  %wgs = index.div %rows, %cwpr : index")
+        e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%cwgs, %unit, %unit) : index")
     e("} launch(%x: buffer, %residual: buffer, %weight: buffer, %sum_out: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
     e("  %zero = scalar.constant 0.0 : f32")
@@ -45,8 +52,18 @@ def gen(dim=5120):
     e("  %x_view = buffer.view %x_na[%base] : buffer -> view<[%total_elems]xf32>")
     e("  %weight_view = buffer.view %weight_na[%base] : buffer -> view<[%dim]xf32>")
     e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%total_elems]xf16>")
-    e("  %row = kernel.workgroup.id<x> : index")
-    e("  %lane = kernel.workitem.id<x> : index")
+    if wpr == 1:
+        e("  %row = kernel.workgroup.id<x> : index")
+        e("  %lane = kernel.workitem.id<x> : index")
+    else:
+        e("  %wg = kernel.workgroup.id<x> : index")
+        e("  %tid = kernel.workitem.id<x> : index")
+        e("  %c32w = index.constant 32 : index")
+        e(f"  %cwpr2 = index.constant {wpr} : index")
+        e("  %wave = index.div %tid, %c32w : index")
+        e("  %lane = index.rem %tid, %c32w : index")
+        e("  %wgrow = index.mul %wg, %cwpr2 : index")
+        e("  %row = index.add %wgrow, %wave : index")
     e("  %row_base = index.mul %row, %dim : index")
     e("  %lane_base = index.add %row_base, %lane : index")
     for k in range(n):
