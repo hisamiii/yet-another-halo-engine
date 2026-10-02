@@ -22,7 +22,63 @@ yah_kq8: int8 K with one scale per (token, kv head, 128-dim half), the split
 import os
 import sys
 
+# YAH_KV_PAGED=1: the caches are paged (256-token pages, gen_attn_fa PAGED).
+# Writers read the chunk's token_count rows of the f16 scratch and write
+# physical row ptab[t / 256] * 256 + t % 256 (t = start_pos + local) of a
+# pool of pool_rows rows (V^T tiles: ptab[tile / 16] * 16 + tile % 16).
+PAGED = os.environ.get("YAH_KV_PAGED", "0") == "1"
 V8 = "vector<8xf32>"
+
+
+PAGE_DECLS = ("config.decl @yah_kvq.start_pos : %value: index where [range(%value, 0, 1048576)]\n"
+              "config.decl @yah_kvq.pool_rows : %value: index where [range(%value, 256, 1048576)]")
+
+
+def page_setup(e):
+    e("  %start0 = config.get @yah_kvq.start_pos : index")
+    e("  %start = index.assume %start0 [mul(%start0, 256)] : index")   # chunks start on a page
+    e("  %prows = config.get @yah_kvq.pool_rows : index")
+    e("  %c255g = index.constant 255 : index")
+    e("  %c256g = index.constant 256 : index")
+    e("  %npg0 = index.add %prows, %c255g : index")
+    e("  %npages = index.div %npg0, %c256g : index")
+    e("  %pt_flat = buffer.view %ptab[%base] : buffer -> view<[%npages]xi32>")
+    e("  %prow_cap = index.mul %npages, %c256g : index")    # pool rows in whole pages
+
+
+def page_row(e, tok, out):
+    """physical pool row of chunk-local token `tok` (needs page_setup)"""
+    e(f"  %{out}l = index.add %start, {tok} : index")
+    e(f"  %{out}lp = index.div %{out}l, %c256g : index")
+    e(f"  %{out}g0 = view.load %pt_flat[%{out}lp] : view<[%npages]xi32> -> i32")
+    e(f"  %{out}gr = index.cast %{out}g0 : i32 to index")
+    e(f"  %{out}g = index.assume %{out}gr [range(%{out}gr, 0, 65535), lt(%{out}gr, %npages)] : index")
+    e(f"  %{out}b = index.mul %{out}g, %c256g : index")
+    e(f"  %{out}o = index.rem %{out}l, %c256g : index")
+    e(f"  %{out} = index.add %{out}b, %{out}o : index")
+
+
+def paged_quantizer(text, rows_per_tok, scales_per_tok):
+    """yah_kq8 / yah_kq4 -> paged form: destination rows remapped, pool-sized views"""
+    t = text.replace("config.decl @yah_kvq.cache_capacity", PAGE_DECLS + "\nconfig.decl @yah_kvq.cache_capacity", 1)
+    t = t.replace("launch(%src: buffer, %mean: buffer, %dst: buffer, %scale: buffer) {",
+                  "launch(%src: buffer, %mean: buffer, %dst: buffer, %scale: buffer, %ptab: buffer) {", 1)
+    out = []
+    for l in t.split("\n"):
+        out.append(l)
+        if l.strip().startswith("%ntok = index.min %ntok0, %cap"):
+            page_setup(out.append)
+        if l.strip().startswith("%tokc = index.min %tok, %cap1"):
+            page_row(out.append, "%tokc", "prow")
+    t = "\n".join(out)
+    for a, b in ((f"%dtot = index.mul %cap, %c{rows_per_tok} :", f"%dtot = index.mul %prow_cap, %c{rows_per_tok} :"),
+                 (f"%d32tot = index.mul %cap, %c{rows_per_tok} :", f"%d32tot = index.mul %prow_cap, %c{rows_per_tok} :"),
+                 (f"%sctot = index.mul %cap, %c{scales_per_tok} :", f"%sctot = index.mul %prow_cap, %c{scales_per_tok} :"),
+                 (f"%bda0 = index.mul %tokc, %c{rows_per_tok} :", f"%bda0 = index.mul %prow, %c{rows_per_tok} :"),
+                 (f"%da0 = index.mul %tokc, %c{rows_per_tok} :", f"%da0 = index.mul %prow, %c{rows_per_tok} :"),
+                 (f"%sa0 = index.mul %tokc, %c{scales_per_tok} :", f"%sa0 = index.mul %prow, %c{scales_per_tok} :")):
+        t = t.replace(a, b)
+    return t
 V8H = "vector<8xf16>"
 V8I = "vector<8xi8>"
 
@@ -444,7 +500,7 @@ def gen_vqt(bits):
     e("  %t0 = index.add %ntk, %c15 : index")
     e("  %tiles = index.div %t0, %c16 : index")
     e("  kernel.launch.config workgroups(%c4, %tiles, %c1) workgroup_size(%c256, %c1, %c1) : index")
-    e("} launch(%src: buffer, %dst: buffer, %stat: buffer) {")
+    e("} launch(%src: buffer, %dst: buffer, %stat: buffer" + (", %ptab: buffer" if PAGED else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 4, 15, 16, 256, 1024):
         e(f"  %c{v} = index.constant {v} : index")
@@ -464,7 +520,21 @@ def gen_vqt(bits):
     e("  %ltile = kernel.workgroup.id<y> : index")
     e("  %d = kernel.workitem.id<x> : index")
     e("  %st16 = index.div %start, %c16 : index")
-    e("  %tile = index.add %st16, %ltile : index")
+    if PAGED:   # physical tile = ptab[tile / 16] * 16 + tile % 16
+        e("  %c255g = index.constant 255 : index")
+        e("  %npg0 = index.add %cap, %c255g : index")
+        e("  %npages = index.div %npg0, %c256 : index")
+        e("  %pt_flat = buffer.view %ptab[%base] : buffer -> view<[%npages]xi32>")
+        e("  %ltl = index.add %st16, %ltile : index")
+        e("  %ltp = index.div %ltl, %c16 : index")
+        e("  %ltg0 = view.load %pt_flat[%ltp] : view<[%npages]xi32> -> i32")
+        e("  %ltgr = index.cast %ltg0 : i32 to index")
+        e("  %ltg = index.assume %ltgr [range(%ltgr, 0, 65535), lt(%ltgr, %npages)] : index")
+        e("  %ltb = index.mul %ltg, %c16 : index")
+        e("  %lto = index.rem %ltl, %c16 : index")
+        e("  %tile = index.add %ltb, %lto : index")
+    else:
+        e("  %tile = index.add %st16, %ltile : index")
     e("  %hb = index.mul %head, %c256 : index")
     e("  %col = index.add %hb, %d : index")
     e("  %t16 = index.mul %ltile, %c16 : index")
@@ -556,12 +626,174 @@ def gen_vqt(bits):
     return "\n".join(L) + "\n"
 
 
+_gen_kq8, _gen_kq4 = gen_kq8, gen_kq4
+
+
+def gen_kq8():
+    t = _gen_kq8()
+    return paged_quantizer(t, 256, 8) if PAGED else t
+
+
+def gen_kq4():
+    t = _gen_kq4()
+    return paged_quantizer(t, 128, 32) if PAGED else t
+
+
 def main():
     which = sys.argv[1]
     out = sys.argv[2] if len(sys.argv) > 2 else f"yah_{which}.loom"
     open(out, "w").write({"kmean": gen_kmean, "kq8": gen_kq8, "vq8": gen_vq8,
-                          "kq4": gen_kq4, "vq4": gen_vq4}[which]())
+                          "kq4": gen_kq4, "vq4": gen_vq4, "kpage": gen_kpage, "vtpage": gen_vtpage}[which]())
     print(out)
+
+
+def gen_kpage():
+    """yah_kpage (paged fp16 K): the chunk's token_count f16 K rows (scratch)
+    -> physical rows of the paged K pool. 128 threads per row (8 f16 each),
+    two rows per workgroup: grid (ceil(token_count / 2)) x 256."""
+    L = []
+    e = L.append
+    e("// GENERATED by tools/gen_kvq.py (kpage) -- edit the generator.")
+    e("amdgpu.target<gfx1151> @kvq_w32 {subgroup_size = 32}")
+    e("config.decl @yah_kvq.token_count : %value: index where [range(%value, 1, 1048576)]")
+    e(PAGE_DECLS)
+    e("")
+    e("kernel.def target(@kvq_w32) @yah_kpage() {")
+    e("  %ntk = config.get @yah_kvq.token_count : index")
+    e("  %c1 = index.constant 1 : index")
+    e("  %c2 = index.constant 2 : index")
+    e("  %c256 = index.constant 256 : index")
+    e("  %t0 = index.add %ntk, %c1 : index")
+    e("  %wgs = index.div %t0, %c2 : index")
+    e("  kernel.launch.config workgroups(%wgs, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index")
+    e("} launch(%src: buffer, %dst: buffer, %ptab: buffer) {")
+    e("  %base = index.constant 0 : offset")
+    for v in (0, 1, 2, 8, 128, 256, 1024):
+        e(f"  %c{v} = index.constant {v} : index")
+    e("  %ntok = config.get @yah_kvq.token_count : index")
+    page_setup(e)
+    e("  %stot = index.mul %ntok, %c1024 : index")
+    e("  %dtot = index.mul %prow_cap, %c1024 : index")
+    e("  %s_na, %d_na = buffer.assume.noalias %src, %dst : buffer, buffer")
+    e("  %s_flat = buffer.view %s_na[%base] : buffer -> view<[%stot]xf16>")
+    e("  %d_flat = buffer.view %d_na[%base] : buffer -> view<[%dtot]xf16>")
+    e("  %wg = kernel.workgroup.id<x> : index")
+    e("  %tid = kernel.workitem.id<x> : index")
+    e("  %tsub = index.div %tid, %c128 : index")
+    e("  %t2 = index.mul %wg, %c2 : index")
+    e("  %tok = index.add %t2, %tsub : index")
+    e("  %ntok1 = index.sub %ntok, %c1 : index")
+    e("  %tokc = index.min %tok, %ntok1 : index")
+    e("  %live = index.cmp ult, %tok, %ntok : index")
+    e("  %col0 = index.rem %tid, %c128 : index")
+    e("  %col = index.mul %col0, %c8 : index")
+    e("  %sa0 = index.mul %tokc, %c1024 : index")
+    e("  %sa = index.add %sa0, %col : index")
+    e("  %x = vector.load %s_flat[%sa] : view<[%stot]xf16> -> vector<8xf16>")
+    page_row(e, "%tokc", "prow")
+    e("  %da0 = index.mul %prow, %c1024 : index")
+    e("  %da = index.add %da0, %col : index")
+    e("  scf.if %live {")
+    e("    vector.store %x, %d_flat[%da] : vector<8xf16>, view<[%dtot]xf16>")
+    e("  }")
+    e("  kernel.return")
+    e("}")
+    return "\n".join(L) + "\n"
+
+
+def gen_vtpage():
+    """yah_vtpage (paged fp16 V^T): the chunk's token_count f16 V rows (scratch)
+    -> V^T tiles [kv head][pool tiles][256 dims][16 keys] of the paged pool
+    (pool tiles = pool_rows / 16), physical tile ptab[tile / 16] * 16 + tile % 16
+    for logical tile (start_pos + local) / 16. 32 x 32 tiles through LDS (as
+    yah_transpose_v16); grid (1024 / 32, ceil(token_count / 32))."""
+    L = []
+    e = L.append
+    e("// GENERATED by tools/gen_kvq.py (vtpage) -- edit the generator.")
+    e("amdgpu.target<gfx1151> @kvq_w32 {subgroup_size = 32}")
+    e("config.decl @yah_kvq.token_count : %value: index where [range(%value, 1, 1048576)]")
+    e(PAGE_DECLS)
+    e("")
+    e("kernel.def target(@kvq_w32) @yah_vtpage() {")
+    e("  %ntk = config.get @yah_kvq.token_count : index")
+    e("  %c1 = index.constant 1 : index")
+    e("  %c31 = index.constant 31 : index")
+    e("  %c32 = index.constant 32 : index")
+    e("  %c256 = index.constant 256 : index")
+    e("  %t0 = index.add %ntk, %c31 : index")
+    e("  %tiles = index.div %t0, %c32 : index")
+    e("  kernel.launch.config workgroups(%c32, %tiles, %c1) workgroup_size(%c256, %c1, %c1) : index")
+    e("} launch(%src: buffer, %dst: buffer, %ptab: buffer) {")
+    e("  %base = index.constant 0 : offset")
+    for v in (0, 1, 4, 8, 15, 16, 32, 256, 1024, 4096):
+        e(f"  %c{v} = index.constant {v} : index")
+    e("  %ntok = config.get @yah_kvq.token_count : index")
+    page_setup(e)
+    e("  %ptiles = index.mul %npages, %c16 : index")          # tiles per kv head in the pool
+    e("  %stot = index.mul %ntok, %c1024 : index")
+    e("  %dtot = index.mul %prow_cap, %c1024 : index")
+    e("  %s_na, %d_na = buffer.assume.noalias %src, %dst : buffer, buffer")
+    e("  %s_flat = buffer.view %s_na[%base] : buffer -> view<[%stot]xf16>")
+    e("  %d_flat = buffer.view %d_na[%base] : buffer -> view<[%dtot]xf16>")
+    e("  %tb = index.constant 2304 : offset")
+    e("  %tile = buffer.alloca<workgroup> align(16) %tb : buffer")
+    e("  %tv = buffer.view %tile[%base] : buffer -> view<32x36xf16>")
+    e("  %cb = kernel.workgroup.id<x> : index")
+    e("  %tbk = kernel.workgroup.id<y> : index")
+    e("  %tid = kernel.workitem.id<x> : index")
+    e("  %col0 = index.mul %cb, %c32 : index")
+    e("  %tok0 = index.mul %tbk, %c32 : index")
+    e("  %r = index.div %tid, %c8 : index")
+    e("  %sg0 = index.rem %tid, %c8 : index")
+    e("  %sg = index.mul %sg0, %c4 : index")
+    e("  %zh4 = vector.constant 0.0 : vector<4xf16>")
+    e("  %tok = index.add %tok0, %r : index")
+    e("  %live = index.cmp ult, %tok, %ntok : index")
+    e("  %ntok1 = index.sub %ntok, %c1 : index")
+    e("  %tokc = index.min %tok, %ntok1 : index")
+    e("  %sa0 = index.mul %tokc, %c1024 : index")
+    e("  %sa1 = index.add %sa0, %col0 : index")
+    e("  %sa = index.add %sa1, %sg : index")
+    e("  %raw = vector.load %s_flat[%sa] : view<[%stot]xf16> -> vector<4xf16>")
+    e("  %val = scf.select %live, %raw, %zh4 : vector<4xf16>")
+    e("  vector.store %val, %tv[%r, %sg] : vector<4xf16>, view<32x36xf16>")
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    els = []
+    for j in range(4):
+        e(f"  %tj{j}c = index.constant {j} : index")
+        e(f"  %tj{j} = index.add %sg, %tj{j}c : index")
+        e(f"  %x{j} = view.load %tv[%tj{j}, %r] : view<32x36xf16> -> f16")
+        els.append(f"%x{j}")
+    e(f"  %ov = vector.from_elements {', '.join(els)} : vector<4xf16>")
+    e("  %col = index.add %col0, %r : index")
+    e("  %dtl0 = index.add %tok0, %sg : index")                # chunk-local token of this group of 4
+    e("  %dlive = index.cmp ult, %dtl0, %ntok : index")
+    e("  %kvh = index.div %col, %c256 : index")
+    e("  %dd = index.rem %col, %c256 : index")
+    e("  %dt = index.add %start, %dtl0 : index")               # logical token
+    e("  %ltile = index.div %dt, %c16 : index")
+    # start is page-aligned and tok0 a multiple of 32: dt % 16 = (sg0 % 4) * 4
+    e("  %sg4 = index.rem %sg0, %c4 : index")
+    e("  %dj = index.mul %sg4, %c4 : index")
+    e("  %ltp = index.div %ltile, %c16 : index")
+    e("  %ltg0 = view.load %pt_flat[%ltp] : view<[%npages]xi32> -> i32")
+    e("  %ltgr = index.cast %ltg0 : i32 to index")
+    e("  %ltg = index.assume %ltgr [range(%ltgr, 0, 65535), lt(%ltgr, %npages)] : index")
+    e("  %ltb = index.mul %ltg, %c16 : index")
+    e("  %lto = index.rem %ltile, %c16 : index")
+    e("  %ptile = index.add %ltb, %lto : index")
+    e("  %da0 = index.mul %kvh, %ptiles : index")
+    e("  %da1 = index.add %da0, %ptile : index")
+    e("  %da2 = index.mul %da1, %c4096 : index")
+    e("  %da3 = index.mul %dd, %c16 : index")
+    e("  %da4 = index.add %da2, %da3 : index")
+    e("  %da = index.add %da4, %dj : index")
+    e("  scf.if %dlive {")
+    e("    vector.store %ov, %d_flat[%da] : vector<4xf16>, view<[%dtot]xf16>")
+    e("  }")
+    e("  kernel.return")
+    e("}")
+    return "\n".join(L) + "\n"
 
 
 if __name__ == "__main__":

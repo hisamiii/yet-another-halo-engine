@@ -44,6 +44,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <random>
 #include <vector>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -574,7 +575,24 @@ int main(int argc, char** argv) {
     LoomExecutable* e_convstate = n_chunks > 1 ? &load(dir + "/convstate.hal") : nullptr;
     // tools/gen_attn_hip.py: a vtrans.hal row means the attention reads V as
     // [kv head][16-key tile][dim][16] f16, written per layer by yah_transpose_v16.
-    LoomExecutable* e_vtrans = g_geom.count("vtrans.hal") ? &load(dir + "/vtrans.hal") : nullptr;
+    // Paged K / V caches ("kv_paged"): 256-token pages; one page table per
+    // sequence (logical page -> physical page, shared by all layers) bound to
+    // attention and every cache writer. fp16 K / V go to paged pools through
+    // yah_kpage / yah_vtpage per chunk (no V^T re-transpose of the whole cache).
+    // YAH_PAGE_SCRAMBLE=<seed>: a shuffled page assignment (testing).
+    const bool kv_paged = g_geom.count("kv_paged") != 0;
+    const std::uint32_t kPages = (T_ctx + 255) / 256;
+    LoomBuffer ptab = gpu.Allocate(std::size_t{kv_paged ? kPages : 1} * 4);
+    if (kv_paged) {
+      std::vector<std::int32_t> pages(kPages);
+      for (std::uint32_t i = 0; i < kPages; ++i) pages[i] = static_cast<std::int32_t>(i);
+      if (const char* sc = std::getenv("YAH_PAGE_SCRAMBLE")) {
+        std::mt19937 rng(static_cast<std::uint32_t>(std::atoi(sc)));
+        std::shuffle(pages.begin(), pages.end(), rng);
+      }
+      gpu.H2D(ptab, pages.data(), pages.size() * 4);
+    }
+    LoomExecutable* e_vtrans = (!kv_paged && g_geom.count("vtrans.hal")) ? &load(dir + "/vtrans.hal") : nullptr;
     const std::size_t kVtBytes = std::size_t{(T_ctx + 15) / 16 * 16} * kKvRow * 2;
     LoomBuffer vt16 = gpu.Allocate(e_vtrans ? kVtBytes : 4);
     // Quantized K (tools/gen_kvq.py, engine/run/kvq/README.md): "attn_kq8"
@@ -605,6 +623,20 @@ int main(int argc, char** argv) {
     const std::size_t kVqBytes = attn_vq8 ? kVtBytes / 2 : kVtBytes / 4, kVqsBytes = kVtBytes / 8;
     LoomBuffer vqbuf = gpu.Allocate(attn_vqt ? std::size_t{kFull} * kVqBytes : 4);
     LoomBuffer vqsbuf = gpu.Allocate(attn_vqt ? std::size_t{kFull} * kVqsBytes : 4);
+    // paged fp16 pools (per layer: K rows / V^T tiles of the whole context) and
+    // the per-chunk paged writers
+    const bool paged_f16k = kv_paged && !attn_kq8, paged_f16v = kv_paged && !attn_vqt;
+    const std::size_t kPoolBytes = std::size_t{kPages} * 256 * kKvRow * 2;
+    LoomBuffer kpool = gpu.Allocate(paged_f16k ? std::size_t{kFull} * kPoolBytes : 4);
+    LoomBuffer vtpool = gpu.Allocate(paged_f16v ? std::size_t{kFull} * kPoolBytes : 4);
+    std::vector<LoomExecutable*> e_kpages, e_vtpages, e_kq8s;
+    for (std::uint32_t c = 0; kv_paged && c < n_chunks; ++c) {
+      const std::string sfx = c ? "_c" + std::to_string(c) : std::string();
+      if (paged_f16k) e_kpages.push_back(&load(dir + "/kpage" + sfx + ".hal"));
+      if (paged_f16v) e_vtpages.push_back(&load(dir + "/vtpage" + sfx + ".hal"));
+      if (attn_kq8) e_kq8s.push_back(&load(dir + "/kq8" + sfx + ".hal"));
+    }
+    const hrx_buffer_ref_t ptab_ref{ptab.handle, 0, std::size_t{kv_paged ? kPages : 1} * 4};
     LoomExecutable& e_cast = load(dir + "/cast.hal");
     LoomExecutable& e_gemv = load(dir + "/gemv.hal");
     LoomExecutable& e_rms = load(dir + "/rmsnorm.hal");
@@ -1039,7 +1071,12 @@ int main(int argc, char** argv) {
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, koff + f16first, f16rows}, {kmbuf.handle, kmoff, 4096},
               {kq8buf.handle, q8off + first * qrow, B * qrow}, {ksbuf.handle, ksoff + first * srow, B * srow}};
-          Dispatch(gpu, *e_kq8, attn_kq4 ? "yah_kq4" : "yah_kq8", (B + 1) / 2, 1, 1, 256, 1, 1, b);
+          if (kv_paged) {   // whole-layer pools, rows placed through the page table
+            b[2] = {kq8buf.handle, q8off, kKqBytes};
+            b[3] = {ksbuf.handle, ksoff, kKsBytes};
+            b.push_back(ptab_ref);
+          }
+          Dispatch(gpu, kv_paged ? *e_kq8s[ci] : *e_kq8, attn_kq4 ? "yah_kq4" : "yah_kq8", (B + 1) / 2, 1, 1, 256, 1, 1, b);
           if (g_dump_layer == static_cast<int>(l)) {   // quantized K, its scales, the channel mean
             dump_range(kq8buf, q8off, kKqBytes, ".akq");
             dump_range(ksbuf, ksoff, kKsBytes, ".aks");
@@ -1051,23 +1088,40 @@ int main(int argc, char** argv) {
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, voff + f16first, f16rows}, {vqbuf.handle, vqoff, kVqBytes},
               {vqsbuf.handle, vqsoff, kVqsBytes}};
+          if (kv_paged) b.push_back(ptab_ref);
           Dispatch(gpu, *e_vqs[ci], attn_vq8 ? "yah_vq8" : "yah_vq4", 4, (B + 15) / 16, 1, 256, 1, 1, b);
+          if (g_dump_layer == static_cast<int>(l)) {   // quantized V^T and its (S, C') stats
+            dump_range(vqbuf, vqoff, kVqBytes, ".avq");
+            dump_range(vqsbuf, vqsoff, kVqsBytes, ".avs");
+          }
+        } else if (paged_f16v) {
+          std::vector<hrx_buffer_ref_t> b = {
+              {kv16.handle, voff, f16rows}, {vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}, ptab_ref};
+          Dispatch(gpu, *e_vtpages[ci], "yah_vtpage", 32, (B + 31) / 32, 1, 256, 1, 1, b);
         } else if (e_vtrans) {
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, voff, kKvCache * 2}, {vt16.handle, 0, kVtBytes}};
           Dispatch(gpu, *e_vtrans, "yah_transpose_v16", 32, (T_ctx + 31) / 32, 1, 256, 1, 1, b);
         }
+        if (paged_f16k) {
+          std::vector<hrx_buffer_ref_t> b = {
+              {kv16.handle, koff, f16rows}, {kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}, ptab_ref};
+          Dispatch(gpu, *e_kpages[ci], "yah_kpage", (B + 1) / 2, 1, 1, 256, 1, 1, b);
+        }
         {
           std::vector<hrx_buffer_ref_t> b = {
               {q.handle, 0, hb(q)}, {gate.handle, 0, hb(gate)},
               attn_kq8 ? hrx_buffer_ref_t{kq8buf.handle, q8off, kKqBytes}
-                       : hrx_buffer_ref_t{kv16.handle, koff, kKvCache * 2},
+              : paged_f16k ? hrx_buffer_ref_t{kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
+                           : hrx_buffer_ref_t{kv16.handle, koff, kKvCache * 2},
               attn_vqt ? hrx_buffer_ref_t{vqbuf.handle, vqoff, kVqBytes}
+              : paged_f16v ? hrx_buffer_ref_t{vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
               : e_vtrans ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
                          : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
               {attn_f16 ? scratch.handle : aout.handle, 0, attn_f16 ? hb(scratch) : hb(aout)}, {lse.handle, 0, hb(lse)}};
           if (attn_kq8) b.push_back({ksbuf.handle, ksoff, kKsBytes});
           if (attn_vqt) b.push_back({vqsbuf.handle, vqsoff, kVqsBytes});
+          if (kv_paged) b.push_back(ptab_ref);
           // YAH_ATTN_GRID_OLD restores the pre-WMMA attention launch geometry so the
           // two attention kernels can be A/Bd from ONE binary, interleaved, without a
           // rebuild between runs (a failed rebuild leaves a stale binary and a mismatched

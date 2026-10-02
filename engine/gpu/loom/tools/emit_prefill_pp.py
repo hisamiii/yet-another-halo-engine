@@ -457,9 +457,31 @@ def main():
     # Quantized K and V: attention never reads the f16 KV cache, so it becomes
     # a one-layer, one-chunk scratch (RoPE writes row cur - cache_start; the
     # quantizers read it right after): the driver sizes kv16 by this marker.
-    kv16_scratch = kq8_on and (vq4_on or vq8_on)
+    # YAH_KV_PAGED=1: paged K / V caches (256-token pages, page table bound to
+    # attention and every cache writer; gen_attn_fa / gen_kvq read the same env).
+    # The f16 KV cache is then always a scratch; fp16 K / V go to paged pools
+    # through yah_kpage / yah_vtpage (per chunk) instead of the V^T re-transpose.
+    kv_paged = os.environ.get("YAH_KV_PAGED", "0") == "1"
+    if kv_paged:
+        if T % 256:
+            raise SystemExit("YAH_KV_PAGED needs the context to be a multiple of 256")
+        if not (os.environ.get("YAH_ATTN_FA", "1") == "1" and attn_hip):
+            raise SystemExit("YAH_KV_PAGED needs the FA attention kernel")
+        geom.append(("kv_paged", 0, 0, 0))
+    kv16_scratch = kv_paged or (kq8_on and (vq4_on or vq8_on))
     if kv16_scratch:
         geom.append(("kv16_scratch", 0, 0, 0))
+    paged_f16k = kv_paged and not kq8_on
+    paged_f16v = kv_paged and not (vq4_on or vq8_on)
+    if paged_f16k or paged_f16v:
+        import gen_kvq
+    if paged_f16k:
+        kpage_src = os.path.join(tmp, "yah_kpage.loom")
+        open(kpage_src, "w").write(gen_kvq.gen_kpage())
+    if paged_f16v:
+        vtpage_src = os.path.join(tmp, "yah_vtpage.loom")
+        open(vtpage_src, "w").write(gen_kvq.gen_vtpage())
+        vtrans_src = None    # replaced by the paged per-chunk transpose
     if NCH > 1:
         # quantized KV: K quantizers run per chunk on cache slices (kmean on
         # chunk 0 only), V quantizers per chunk with start_pos (vq*_c<i>.hal)
@@ -531,9 +553,20 @@ def main():
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
           if vtrans_src else []),
-        *([(kmean_src, "kmean.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B]),
-           (kq8_src, "kq8.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
+        *([(kmean_src, "kmean.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
           if kq8_on else []),
+        *([(kq8_src, "kq8.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
+          if kq8_on and not kv_paged else []),
+        *([(kq8_src, "kq8.hal" if c == 0 else "kq8_c%d.hal" % c,
+            ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B,
+             "yah_kvq.start_pos=%d" % (c * B), "yah_kvq.pool_rows=%d" % T]) for c in range(NCH)]
+          if kq8_on and kv_paged else []),
+        *([(kpage_src, "kpage.hal" if c == 0 else "kpage_c%d.hal" % c,
+            ["yah_kvq.token_count=%d" % B, "yah_kvq.start_pos=%d" % (c * B), "yah_kvq.pool_rows=%d" % T])
+           for c in range(NCH)] if paged_f16k else []),
+        *([(vtpage_src, "vtpage.hal" if c == 0 else "vtpage_c%d.hal" % c,
+            ["yah_kvq.token_count=%d" % B, "yah_kvq.start_pos=%d" % (c * B), "yah_kvq.pool_rows=%d" % T])
+           for c in range(NCH)] if paged_f16v else []),
         *([(vq8_src, "vq8.hal" if c == 0 else "vq8_c%d.hal" % c,
             ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % T, "yah_kvq.start_pos=%d" % (c * B)])
            for c in range(NCH)] if vq8_on else []),

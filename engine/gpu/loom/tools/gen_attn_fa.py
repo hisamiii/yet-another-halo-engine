@@ -144,6 +144,14 @@ VQ4 = os.environ.get("YAH_ATTN_FA_VQ4", "0") == "1"
 K4 = os.environ.get("YAH_ATTN_FA_K4", "0") == "1"
 K8 = os.environ.get("YAH_ATTN_FA_K8", "0") == "1"
 KDEC = K4 or K8                       # K decoded to f16 at staging
+# PAGED (YAH_KV_PAGED=1): the K / V caches are paged in 256-token pages. A page
+# table ptab[logical page] -> physical page renumbers K rows (and K scales):
+# row' = ptab[row / 256] * 256 + row % 256, and V^T tiles (and V stats):
+# tile' = ptab[tile / 16] * 16 + tile % 16 (layouts unchanged). Every 16-key
+# tile lies in one page: one uniform table load per K tile and per V tile.
+PAGED = os.environ.get("YAH_KV_PAGED", "0") == "1"
+if PAGED:
+    assert KT == 16
 if KDEC:
     assert KT == 16 and VSB and not GQAP and not QH and not (K4 and K8)
 S_OFF = V_OFF + VBUFS * 256 * VT_PITCH * 2   # S partials: 2*NSUB planes x NT x 4 f32
@@ -238,7 +246,7 @@ def gen():
     e("  kernel.launch.config workgroups(%qblocks, %pairs, %c1) workgroup_size(%cnt, %c1, %c1) : index")
     e("} launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer"
       + (", %kscale: buffer" if KDEC else "")
-      + (", %vstat4: buffer" if VQ4 or VQ8 else "") + ") {")
+      + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
         e(f"  %c{v} = index.constant {v} : index")
@@ -267,7 +275,14 @@ def gen():
     e("  %x16 = scalar.constant 16 : i32")
     e("  %x32 = scalar.constant 32 : i32")
     e("  %qtot = index.mul %B, %c6144 : index")
-    e("  %kvtot = index.mul %cache_capacity, %c1024 : index")
+    CAPV = "%cache_capacity"
+    if PAGED:
+        e("  %c255p = index.constant 255 : index")
+        e("  %npg0 = index.add %cache_capacity, %c255p : index")
+        e("  %npages = index.div %npg0, %c256 : index")
+        e("  %pcap = index.mul %npages, %c256 : index")       # pool rows: whole pages
+        CAPV = "%pcap"
+    e(f"  %kvtot = index.mul {CAPV}, %c1024 : index")
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
     e("  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf32>")
     e("  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
@@ -275,14 +290,17 @@ def gen():
     e(f"  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]x{oty}>")
     if KDEC:   # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
         # kv8a16: int8 K [token][256 dwords], f16x2 (256 s, -384 s) [token][8]
-        e(f"  %kq32tot = index.mul %cache_capacity, %c{128 if K4 else 256} : index")
-        e(f"  %kstot = index.mul %cache_capacity, %c{32 if K4 else 8} : index")
+        e(f"  %kq32tot = index.mul {CAPV}, %c{128 if K4 else 256} : index")
+        e(f"  %kstot = index.mul {CAPV}, %c{32 if K4 else 8} : index")
         e("  %k_flat = buffer.view %k_na[%base] : buffer -> view<[%kq32tot]xi32>")
         e("  %ks_na = buffer.assume.noalias %kscale : buffer")
         e("  %ks_flat = buffer.view %ks_na[%base] : buffer -> view<[%kstot]xi32>")
     else:
         e("  %k_flat = buffer.view %k_na[%base] : buffer -> view<[%kvtot]xf16>")
-    e("  %cap15 = index.add %cache_capacity, %c15 : index")
+    if PAGED:
+        e("  %pt_na = buffer.assume.noalias %ptab : buffer")
+        e("  %pt_flat = buffer.view %pt_na[%base] : buffer -> view<[%npages]xi32>")
+    e(f"  %cap15 = index.add {CAPV}, %c15 : index")
     e("  %vtiles = index.div %cap15, %c16 : index")
     e("  %vpitch = index.mul %vtiles, %c16 : index")
     e("  %vtot = index.mul %vpitch, %c1024 : index")
@@ -634,11 +652,48 @@ def gen():
             return
         guard0("%vstg", ind, lambda: stage_v_(cur, vb, p, ind))
 
+    def page_of(start, p, ind, tag):
+        """physical page of the (uniform) tile start; start already clamped"""
+        e(f"{ind}%{p}{tag}lp = index.div {start}, %c256 : index")
+        e(f"{ind}%{p}{tag}pg0 = view.load %pt_flat[%{p}{tag}lp] : view<[%npages]xi32> -> i32")
+        e(f"{ind}%{p}{tag}pgr = index.cast %{p}{tag}pg0 : i32 to index")
+        e(f"{ind}%{p}{tag}pg = index.assume %{p}{tag}pgr [range(%{p}{tag}pgr, 0, 65535), lt(%{p}{tag}pgr, %npages)] : index")
+        return f"%{p}{tag}pg"
+
+    def phys_row(kc, ks, p, ind, tag):
+        """row kc (clamped, same page as ks's clamp) -> physical row"""
+        if not PAGED:
+            return kc
+        e(f"{ind}%{p}{tag}ksc = index.min {ks}, %cap_1 : index")
+        pg = page_of(f"%{p}{tag}ksc", p, ind, tag)
+        e(f"{ind}%{p}{tag}pb = index.mul {pg}, %c256 : index")
+        e(f"{ind}%{p}{tag}po = index.rem {kc}, %c256 : index")
+        e(f"{ind}%{p}{tag}pr = index.add %{p}{tag}pb, %{p}{tag}po : index")
+        return f"%{p}{tag}pr"
+
+    def phys_tilestart(vks, p, ind, tag):
+        """V^T tile start vks (multiple of 16) -> physical tile start (keys)"""
+        if not PAGED:
+            return vks
+        pg = page_of(vks, p, ind, tag)
+        # physical tile = page * 16 + (tile % 16): bounded by npages * 16 = vtiles
+        e(f"{ind}%{p}{tag}pb = index.mul {pg}, %c16 : index")
+        e(f"{ind}%{p}{tag}t16 = index.div {vks}, %c16 : index")
+        e(f"{ind}%{p}{tag}po = index.rem %{p}{tag}t16, %c16 : index")
+        e(f"{ind}%{p}{tag}pt = index.add %{p}{tag}pb, %{p}{tag}po : index")
+        e(f"{ind}%{p}{tag}pr = index.mul %{p}{tag}pt, %c16 : index")
+        return f"%{p}{tag}pr"
+
     def load_k_(ks, p, ind):
         if KDEC:
             nw = 2 if K4 else 4
             e(f"{ind}%{p}kp = index.add {ks}, %kdk : index")
-            e(f"{ind}%{p}kpc = index.min %{p}kp, %cap_1 : index")
+            if PAGED:
+                e(f"{ind}%{p}kpc0 = index.min %{p}kp, %cap_1 : index")
+                kpc = phys_row(f"%{p}kpc0", ks, p, ind, "kq")
+                e(f"{ind}%{p}kpc = index.add {kpc}, %c0 : index")
+            else:
+                e(f"{ind}%{p}kpc = index.min %{p}kp, %cap_1 : index")
             e(f"{ind}%{p}kr = index.mul %{p}kpc, %c{128 if K4 else 256} : index")
             e(f"{ind}%{p}ka = index.add %{p}kr, %kdga : index")
             e(f"{ind}%{p}kv = vector.load %k_flat[%{p}ka] : view<[%kq32tot]xi32> -> vector<{nw}xi32>")
@@ -649,7 +704,12 @@ def gen():
         names = []
         for nn in range(KT // 8):
             e(f"{ind}%{p}kp{nn} = index.add {ks}, %kk{nn} : index")
-            e(f"{ind}%{p}kpc{nn} = index.min %{p}kp{nn}, %cap_1 : index")
+            if PAGED:
+                e(f"{ind}%{p}kpc{nn}0 = index.min %{p}kp{nn}, %cap_1 : index")
+                kpc = phys_row(f"%{p}kpc{nn}0", ks, p, ind, f"k{nn}")
+                e(f"{ind}%{p}kpc{nn} = index.add {kpc}, %c0 : index")
+            else:
+                e(f"{ind}%{p}kpc{nn} = index.min %{p}kp{nn}, %cap_1 : index")
             e(f"{ind}%{p}kr{nn} = index.mul %{p}kpc{nn}, %c1024 : index")
             e(f"{ind}%{p}kr{nn}b = index.add %{p}kr{nn}, %kvbase : index")
             e(f"{ind}%{p}ka{nn} = index.add %{p}kr{nn}b, %kd{nn} : index")
@@ -660,7 +720,12 @@ def gen():
     def load_v_(ks, p, ind):
         if VQ4 or VQ8:   # [kvh][tile][dim]: data 2 (VQ4) or 4 (VQ8) dwords, stats 1 dword
             nw = 2 if VQ4 else 4
-            e(f"{ind}%{p}vks = index.min {ks}, %vlast : index")
+            if PAGED:
+                e(f"{ind}%{p}vks0 = index.min {ks}, %vlast : index")
+                vks = phys_tilestart(f"%{p}vks0", p, ind, "vq")
+                e(f"{ind}%{p}vks = index.add {vks}, %c0 : index")
+            else:
+                e(f"{ind}%{p}vks = index.min {ks}, %vlast : index")
             e(f"{ind}%{p}vt16 = index.div %{p}vks, %c16 : index")
             e(f"{ind}%{p}vti0 = index.add %vhb4, %{p}vt16 : index")
             e(f"{ind}%{p}vti1 = index.mul %{p}vti0, %c256 : index")
@@ -670,7 +735,12 @@ def gen():
             e(f"{ind}%{p}vst = view.load %vs4_flat[%{p}vti] : view<[%vq4tot0]xi32> -> i32")
             return [f"%{p}vq", f"%{p}vst"]
         if KT == 16:
-            e(f"{ind}%{p}vks = index.min {ks}, %vlast : index")
+            if PAGED:
+                e(f"{ind}%{p}vks0 = index.min {ks}, %vlast : index")
+                vks = phys_tilestart(f"%{p}vks0", p, ind, "v")
+                e(f"{ind}%{p}vks = index.add {vks}, %c0 : index")
+            else:
+                e(f"{ind}%{p}vks = index.min {ks}, %vlast : index")
             e(f"{ind}%{p}vtb = index.mul %{p}vks, %c256 : index")
             e(f"{ind}%{p}va0 = index.add %vhl, %{p}vtb : index")
             e(f"{ind}%{p}va1 = index.add %{p}va0, %c8 : index")

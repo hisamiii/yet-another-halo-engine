@@ -3007,3 +3007,26 @@ Loom miscompiles on the way (upstream-candidates #10):
   (coalescing.c:1637). Workaround: one 16-wide fma.
 - f16 `vector.subf` / `uitofp` are rejected (vector_f32 constraint);
   `vector.fmaf` on f16 works (v_pk_fmac_f16).
+
+### Paged KV (2026-10-02): YAH_KV_PAGED=1 (opt-in)
+
+- **Layout:** 256-token pages. One page table per sequence (logical -> physical
+  page, shared by all layers) renumbers K rows (and K scales) and V^T tiles
+  (and V stats); the layouts are otherwise unchanged. Every 16-key attention
+  tile lies in one page, so attention does one uniform page-table load per K
+  tile and per V tile.
+- **Writers:** the f16 KV cache is always a one-layer, one-chunk scratch (RoPE
+  cache_start). Per chunk:
+  - fp16: yah_kpage (K rows) and yah_vtpage (V^T tiles), instead of the
+    whole-cache yah_transpose_v16 per layer;
+  - quantized: yah_kq8 / yah_kq4 / yah_vq8 / yah_vq4 in paged form.
+  The driver fills the table (identity; YAH_PAGE_SCRAMBLE=<seed> shuffles it
+  for testing). The context must be a multiple of 256; FA attention only.
+- **Bit-identical to non-paged**, including scrambled page maps:
+  - fp16 pp2048 md5 ac36332b6b5092a4 and pp8192 963b7396625e2333;
+  - kv8a16 / kv4a16 one-pass 8K and chunked 8K;
+  - fp16 32K chunked (arXiv row stats).
+- **Cost (one round each, SQ_BUSY_CYCLES):** total +0.14% (pp2048) / +0.28%
+  (pp8192). Attention +1.7% / +2.2% from the page loads; the K copy is new
+  work (1.7 / 6.0 M); vtpage ~ vtrans. In chunked long-context runs paging
+  saves the per-chunk whole-cache V^T re-transpose (~16x redundant at 32K).
