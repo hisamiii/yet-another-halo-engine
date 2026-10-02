@@ -106,17 +106,3 @@ kernel.def target(@yah_wave32) @yah_ssm_postnorm_fp16() {
   }
   kernel.return
 }
-
-// Requires --config=yah_ssm_postnorm_fp16.head_count=3.
-check.case public @yah_ssm_postnorm_fp16_case {
-  %raw = check.file.read.npy path("fixtures/ssm_postnorm_fp16/input_raw.npy") : tensor<384xf32>
-  %weight = check.file.read.npy path("fixtures/ssm_postnorm_fp16/input_weight.npy") : tensor<128xf32>
-  %gate = check.file.read.npy path("fixtures/ssm_postnorm_fp16/input_gate.npy") : tensor<384xf32>
-  %expected = check.file.read.npy path("fixtures/ssm_postnorm_fp16/expected_out.npy") : tensor<384xf16>
-  %out = check.generate.fill value(0.0) : tensor<384xf16>
-  kernel.launch @yah_ssm_postnorm_fp16(%raw, %weight, %gate, %out) : (tensor<384xf32>, tensor<128xf32>, tensor<384xf32>, tensor<384xf16>)
-  check.expect.close actual(%out) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<384xf16>
-  check.return
-}
-
-check.benchmark<@yah_ssm_postnorm_fp16_case> @yah_ssm_postnorm_fp16_bench

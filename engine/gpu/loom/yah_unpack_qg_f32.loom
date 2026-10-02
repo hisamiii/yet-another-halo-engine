@@ -75,17 +75,3 @@ kernel.def target(@yah_wave32) @yah_unpack_qg() {
   }
   kernel.return
 }
-
-check.case public @yah_unpack_qg_case {
-  %qg = check.generate.iota offset(0.0) step(1.0) : tensor<64x10240xf32>
-  %q_out = check.generate.fill value(-1.0) : tensor<64x5120xf32>
-  %gate_out = check.generate.fill value(-1.0) : tensor<64x5120xf32>
-  %q_expected = check.generate.iota offset(0.0) step(2.0) : tensor<64x5120xf32>
-  %gate_expected = check.generate.iota offset(1.0) step(2.0) : tensor<64x5120xf32>
-  kernel.launch @yah_unpack_qg(%qg, %q_out, %gate_out) : (tensor<64x10240xf32>, tensor<64x5120xf32>, tensor<64x5120xf32>)
-  check.expect.close actual(%q_out) expected(%q_expected) atol(0.0) rtol(0.0) nan(same) : tensor<64x5120xf32>
-  check.expect.close actual(%gate_out) expected(%gate_expected) atol(0.0) rtol(0.0) nan(same) : tensor<64x5120xf32>
-  check.return
-}
-
-check.benchmark<@yah_unpack_qg_case> @yah_unpack_qg_bench

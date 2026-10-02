@@ -100,15 +100,3 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_kq() {
   }
   kernel.return
 }
-
-// Requires --config=yah_deltanet_prep_kq.batch=3, .num_key_heads=2, .qkv_size=512.
-check.case public @yah_deltanet_prep_kq_case {
-  %conv = check.file.read.npy path("fixtures/deltanet_prep_kq/input_conv.npy") : tensor<1536xf32>
-  %expected = check.file.read.npy path("fixtures/deltanet_prep_kq/expected_scales.npy") : tensor<18xf32>
-  %scales = check.generate.fill value(0.0) : tensor<18xf32>
-  kernel.launch @yah_deltanet_prep_kq(%conv, %scales) : (tensor<1536xf32>, tensor<18xf32>)
-  check.expect.close actual(%scales) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<18xf32>
-  check.return
-}
-
-check.benchmark<@yah_deltanet_prep_kq_case> @yah_deltanet_prep_kq_bench

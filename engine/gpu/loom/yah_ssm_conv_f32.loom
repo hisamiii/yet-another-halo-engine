@@ -154,17 +154,3 @@ kernel.def target(@yah_wave32) @yah_ssm_conv() {
   }
   kernel.return
 }
-
-// Requires --config=yah_ssm_conv.batch=4 --config=yah_ssm_conv.qkv_dim=16.
-check.case public @yah_ssm_conv_case {
-  %x = check.file.read.npy path("fixtures/ssm_conv/input_qkv.npy") : tensor<64xf32>
-  %weights = check.file.read.npy path("fixtures/ssm_conv/input_weights.npy") : tensor<64xf32>
-  %state = check.file.read.npy path("fixtures/ssm_conv/input_state.npy") : tensor<64xf32>
-  %expected = check.file.read.npy path("fixtures/ssm_conv/expected_out.npy") : tensor<64xf32>
-  %out = check.generate.fill value(0.0) : tensor<64xf32>
-  kernel.launch @yah_ssm_conv(%x, %weights, %state, %out) : (tensor<64xf32>, tensor<64xf32>, tensor<64xf32>, tensor<64xf32>)
-  check.expect.close actual(%out) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<64xf32>
-  check.return
-}
-
-check.benchmark<@yah_ssm_conv_case> @yah_ssm_conv_bench

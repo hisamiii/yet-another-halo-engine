@@ -90,7 +90,7 @@ IQ4_U8F = os.environ.get("YAH_TG_IQ4U8F", "1") == "1" and bool(IQ4_MULF)
 IQ4_U8 = IQ4_U8 or IQ4_U8F
 # IQ4_PK (implies the f16 codebook tables of IQ4_F16): the group scale rounded
 # to f16 once and the multiply done in f16 (v_pk_mul_f16, two weights per op).
-# NOT bit-identical (~1 f16 ulp per weight): judged by engine/run/accgate.py.
+# NOT bit-identical (~1 f16 ulp per weight): judged by engine/run/accgate2.py.
 IQ4_PK = os.environ.get("YAH_TG_IQ4PK", "0") == "1"
 
 KSUB = PH = GPP = GPL = ROWP = None

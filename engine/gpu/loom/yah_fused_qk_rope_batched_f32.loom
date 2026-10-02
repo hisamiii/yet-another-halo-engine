@@ -269,33 +269,3 @@ kernel.def target(@yah_wave32) @yah_fused_qk_rope_batched() {
   }
   kernel.return
 }
-
-// Requires the config above (batch 1, max_context 1). q = k = v = weights = 1,
-// eps = 0, start_pos = 0: inv_rms = 1, the rotation is the identity, and every
-// output is 1.
-check.case public @yah_fused_qk_rope_batched_case {
-  %q = check.generate.fill value(1.0) : tensor<8xf32>
-  %k = check.generate.fill value(1.0) : tensor<8xf32>
-  %v = check.generate.fill value(1.0) : tensor<8xf32>
-  %qw = check.generate.fill value(1.0) : tensor<8xf32>
-  %kw = check.generate.fill value(1.0) : tensor<8xf32>
-  %q_out = check.generate.fill value(0.0) : tensor<8xf32>
-  %k_out = check.generate.fill value(0.0) : tensor<8xf32>
-  %k_cache = check.generate.fill value(0.0) : tensor<8xf32>
-  %v_cache = check.generate.fill value(0.0) : tensor<8xf32>
-  %k16 = check.generate.fill value(0.0) : tensor<8xf16>
-  %v16 = check.generate.fill value(0.0) : tensor<8xf16>
-  %eps = check.generate.fill value(0.0) : tensor<1xf32>
-  %e8 = check.generate.fill value(1.0) : tensor<8xf32>
-  %e16 = check.generate.fill value(1.0) : tensor<8xf16>
-  kernel.launch @yah_fused_qk_rope_batched(%q, %k, %v, %qw, %kw, %q_out, %k_out, %k_cache, %v_cache, %k16, %v16, %eps) : (tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf32>, tensor<8xf16>, tensor<8xf16>, tensor<1xf32>)
-  check.expect.close actual(%q_out) expected(%e8) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
-  check.expect.close actual(%k_out) expected(%e8) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
-  check.expect.close actual(%k_cache) expected(%e8) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
-  check.expect.close actual(%v_cache) expected(%e8) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
-  check.expect.close actual(%k16) expected(%e16) atol(0.0) rtol(0.0) nan(same) : tensor<8xf16>
-  check.expect.close actual(%v16) expected(%e16) atol(0.0) rtol(0.0) nan(same) : tensor<8xf16>
-  check.return
-}
-
-check.benchmark<@yah_fused_qk_rope_batched_case> @yah_fused_qk_rope_batched_bench

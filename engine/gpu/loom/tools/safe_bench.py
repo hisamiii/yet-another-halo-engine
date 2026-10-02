@@ -58,7 +58,7 @@ so a profiler can be pointed at the SAME argv this tool derived: the wrap never
 changes an operand, so the safety argument above is untouched. It is for
 profiling only -- the timings it produces are not comparable.
 SAFE_BENCH_BIN (env, optional) overrides the harness binary (default
-/home/q/yah-bin/hal_bench).
+engine/build/hal_bench).
 """
 import json, os, re, subprocess, sys
 
@@ -73,7 +73,7 @@ LLVM_LIB = "/home/q/rocm10/x_llvm/opt/rocm/core-10.0/lib/llvm/lib"
 SYSDEPS = "/home/q/rocm10/x_sysdeps/opt/rocm/core-10.0/lib/rocm_sysdeps/lib"
 COMPILE = H + "/build/cmake/loom/src/loom/tools/loom-compile/loom-compile"
 SCRATCH_MIN = 64 << 20
-HAL_BENCH = os.environ.get("SAFE_BENCH_BIN", "/home/q/yah-bin/hal_bench")
+HAL_BENCH = os.environ.get("SAFE_BENCH_BIN", os.path.join(HERE, "..", "..", "..", "build", "hal_bench"))
 # The argument order each variant of the GEMM family uses, so a root name can be
 # turned back into its argument index and the count can be validated.
 ROLE_ORDERS = {

@@ -9,8 +9,7 @@ reading key head h mod 16,
 
     S_t = a_t S_{t-1} + b_t (v_t - a_t S_{t-1} k_hat_t) k_hat_t^T,  o_t = S_t q_hat_t
 
-computed per chunk of C = 32 tokens in the WY / UT form
-(engine/run/research/gdn: gdn_ref.py checks it against the recurrence to 1e-15):
+computed per chunk of C = 32 tokens in the WY / UT form (checked against the recurrence to 1e-15):
 
     G_i = sum_{j<=i} log2 a_j          (log-space decay: every factor <= 1)
     A   = tril(b_i (k_i . k_j) 2^(G_i - G_j), -1)      P = tril(q_i . k_j 2^(G_i - G_j))

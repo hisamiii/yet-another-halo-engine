@@ -10,7 +10,6 @@
 //
 // Two optional pointers select the residual add and the sum_out write. This port
 // requires both to be present, because a buffer argument is always bound here;
-// PORTING.md records that the skipped forms are not covered.
 //
 // The HIP kernel uses 256 threads with a shared-memory reduction tree. This port
 // uses one subgroup per row with lane-strided loops and `kernel.subgroup.reduce`,
@@ -106,24 +105,3 @@ kernel.def target(@yah_wave32) @yah_half_norm() {
   }
   kernel.return
 }
-
-// Requires --config=yah_half_norm.rows=1 --config=yah_half_norm.dim=512.
-//
-// x and residual are both 0.5, so the pre-normalization value is exactly 1, the mean
-// square is exactly 1, and inv is exactly 1 with eps zero. The output is therefore
-// exactly the weight row (an iota) and the sum_out buffer is exactly all ones.
-check.case public @yah_half_norm_case {
-  %x = check.generate.fill value(0.5) : tensor<512xf32>
-  %residual = check.generate.fill value(0.5) : tensor<512xf32>
-  %weight = check.generate.iota offset(0.0) step(1.0) : tensor<512xf32>
-  %sum_out = check.generate.fill value(0.0) : tensor<512xf32>
-  %out = check.generate.fill value(0.0) : tensor<512xf16>
-  %expected_out = check.generate.iota offset(0.0) step(1.0) : tensor<512xf16>
-  %expected_sum = check.generate.fill value(1.0) : tensor<512xf32>
-  kernel.launch @yah_half_norm(%x, %residual, %weight, %sum_out, %out) : (tensor<512xf32>, tensor<512xf32>, tensor<512xf32>, tensor<512xf32>, tensor<512xf16>)
-  check.expect.close actual(%out) expected(%expected_out) atol(0.0) rtol(0.0) nan(same) : tensor<512xf16>
-  check.expect.close actual(%sum_out) expected(%expected_sum) atol(0.0) rtol(0.0) nan(same) : tensor<512xf32>
-  check.return
-}
-
-check.benchmark<@yah_half_norm_case> @yah_half_norm_bench

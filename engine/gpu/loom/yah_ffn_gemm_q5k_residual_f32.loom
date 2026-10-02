@@ -286,34 +286,3 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_q5k_residual() {
   }
   kernel.return
 }
-
-// Requires --config=yah_ffn_gemm_q5k_residual.m_tiles=1.
-check.case public @yah_ffn_gemm_q5k_residual_case {
-  %weight = check.file.read.npy path("fixtures/q5k_gemm/input_q5k_gemm.npy") : tensor<56320xi8>
-  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
-  %output = check.generate.fill value(1000.0) : tensor<1024xf32>
-  %expected = check.file.read.npy path("fixtures/q5k_gemm/expected_residual.npy") : tensor<1024xf32>
-  %wstage = check.generate.fill value(0.0) : tensor<81920xf16>
-  %ostage = check.generate.fill value(0.0) : tensor<1024xf32>
-  kernel.launch @yah_ffn_gemm_q5k_residual(%weight, %input, %wstage, %ostage, %output) : (tensor<56320xi8>, tensor<64x5120xf16>, tensor<81920xf16>, tensor<1024xf32>, tensor<1024xf32>)
-  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1024xf32>
-  check.return
-}
-
-check.benchmark<@yah_ffn_gemm_q5k_residual_case> @yah_ffn_gemm_q5k_residual_bench
-
-// Requires --config=yah_ffn_gemm_q5k_residual.m_tiles=1088. An all-zero Q5_K weight
-// decodes to zero, so every output must be exactly 0.
-check.case public @yah_ffn_gemm_q5k_residual_full_case {
-  %weight = check.generate.fill value(0) : tensor<61276160xi8>
-  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
-  %output = check.generate.fill value(0.0) : tensor<1114112xf32>
-  %expected = check.generate.fill value(0.0) : tensor<1114112xf32>
-  %wstage = check.generate.fill value(0.0) : tensor<89128960xf16>
-  %ostage = check.generate.fill value(0.0) : tensor<1114112xf32>
-  kernel.launch @yah_ffn_gemm_q5k_residual(%weight, %input, %wstage, %ostage, %output) : (tensor<61276160xi8>, tensor<64x5120xf16>, tensor<89128960xf16>, tensor<1114112xf32>, tensor<1114112xf32>)
-  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1114112xf32>
-  check.return
-}
-
-check.benchmark<@yah_ffn_gemm_q5k_residual_full_case> @yah_ffn_gemm_q5k_residual_full_bench

@@ -496,7 +496,7 @@ def main():
         geom.append(("wmma.hal", 16, attn_heads, (B + 15) // 16))
 
     # DeltaNet: tools/gen_deltanet_hip.py, bit-identical to HIP's
-    # BatchedDeltaNetRowSplitKernel<float,16,2> (tools/deltanet_vs_hip.sh), grid
+    # BatchedDeltaNetRowSplitKernel<float,16,2>, grid
     # (2, heads) recorded as the rowsplit.hal row group. YAH_DELTANET_HIP=0 keeps
     # the regtile kernel (Loom's own sequential-sum order).
     dn_src = "yah_deltanet_rowsplit_f32.loom"
@@ -505,8 +505,8 @@ def main():
         tmp = os.path.join(outdir, ".emit_tmp")
         os.makedirs(tmp, exist_ok=True)
         dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
-        # YAH_DN_CHUNK=1 (default): chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py,
-        # engine/run/research/gdn): same ABI and (2, heads) grid, f16 WMMA inputs
+        # YAH_DN_CHUNK=1 (default): chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py):
+        # same ABI and (2, heads) grid, f16 WMMA inputs
         # (output rel 2.1e-4 vs this kernel, end-to-end KLD ~3e-6), standalone
         # pp2048 3.57 vs 4.12 M cycles. Needs B % 32 == 0 (else the recurrent kernel).
         chunk_dn = os.environ.get("YAH_DN_CHUNK", "1") == "1" and B % 32 == 0

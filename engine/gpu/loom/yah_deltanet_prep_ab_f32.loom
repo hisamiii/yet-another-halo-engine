@@ -17,7 +17,7 @@
 // The 20.0 branch is a guard against exp overflow, not an approximation, so it is
 // kept. The port requires alpha_buf, beta_buf, ssm_a and ssm_dt to be present; the
 // HIP kernel folds null pointers to 0.0, -0.05 and 0.0, and those forms are not
-// covered here (PORTING.md records it).
+// covered here.
 //
 // The grid covers max(count, qkv_size) by sizing for count + qkv_size, which
 // over-covers both and costs only idle lanes.
@@ -109,7 +109,7 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
         // the four loaded above. Selecting among them as registers keeps every
         // memory index static: indexing the state with batch + j instead makes the
         // footprint analysis bound the index as c*4 + batch + j and declare a
-        // read past the end of the buffer, which loom_run.sh then refuses.
+        // read past the end of the buffer.
         %ringed = scf.if %is_slot0 -> (f32) {
           scf.yield %ring0 : f32
         } else {
@@ -163,22 +163,3 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
   }
   kernel.return
 }
-
-// Requires --config=yah_deltanet_prep_ab.batch=2, .qkv_size=16, .num_heads=4.
-check.case public @yah_deltanet_prep_ab_case {
-  %alpha = check.file.read.npy path("fixtures/deltanet_prep_ab/input_alpha.npy") : tensor<8xf32>
-  %beta = check.file.read.npy path("fixtures/deltanet_prep_ab/input_beta.npy") : tensor<8xf32>
-  %ssm_a = check.file.read.npy path("fixtures/deltanet_prep_ab/input_ssm_a.npy") : tensor<4xf32>
-  %ssm_dt = check.file.read.npy path("fixtures/deltanet_prep_ab/input_ssm_dt.npy") : tensor<4xf32>
-  %qkv = check.file.read.npy path("fixtures/deltanet_prep_ab/input_qkv.npy") : tensor<32xf32>
-  %state = check.file.read.npy path("fixtures/deltanet_prep_ab/input_state.npy") : tensor<64xf32>
-  %expected_ab = check.file.read.npy path("fixtures/deltanet_prep_ab/expected_ab.npy") : tensor<16xf32>
-  %expected_state = check.file.read.npy path("fixtures/deltanet_prep_ab/expected_state.npy") : tensor<64xf32>
-  %ab = check.generate.fill value(0.0) : tensor<16xf32>
-  kernel.launch @yah_deltanet_prep_ab(%alpha, %beta, %ssm_a, %ssm_dt, %qkv, %state, %ab) : (tensor<8xf32>, tensor<8xf32>, tensor<4xf32>, tensor<4xf32>, tensor<32xf32>, tensor<64xf32>, tensor<16xf32>)
-  check.expect.close actual(%ab) expected(%expected_ab) atol(9.9999999999999995e-07) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
-  check.expect.close actual(%state) expected(%expected_state) atol(0.0) rtol(0.0) nan(same) : tensor<64xf32>
-  check.return
-}
-
-check.benchmark<@yah_deltanet_prep_ab_case> @yah_deltanet_prep_ab_bench

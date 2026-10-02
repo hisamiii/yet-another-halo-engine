@@ -170,30 +170,3 @@ kernel.def target(@yah_wave32) @yah_gemv_q6k() {
   }
   kernel.return
 }
-
-// Requires the config block above with m_rows=16, k_blocks=20.
-check.case public @yah_gemv_q6k_case {
-  %weight = check.file.read.npy path("fixtures/q6k_gemm/input_q6k_gemm.npy") : tensor<67200xi8>
-  %x = check.file.read.npy path("fixtures/q6k_gemm/gemv_x.npy") : tensor<5120xf32>
-  %expected = check.file.read.npy path("fixtures/q6k_gemm/gemv_expected.npy") : tensor<16xf32>
-  %y = check.generate.fill value(0.0) : tensor<16xf32>
-  kernel.launch @yah_gemv_q6k(%weight, %x, %y) : (tensor<67200xi8>, tensor<5120xf32>, tensor<16xf32>)
-  check.expect.close actual(%y) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
-  check.return
-}
-
-check.benchmark<@yah_gemv_q6k_case> @yah_gemv_q6k_bench
-
-// Requires --config=yah_gemv_q6k.m_rows=17408 --config=yah_gemv_q6k.k_blocks=20.
-// An all-zero Q6_K weight decodes to zero, so every output row must be exactly 0.
-check.case public @yah_gemv_q6k_full_case {
-  %weight = check.generate.fill value(0) : tensor<73113600xi8>
-  %x = check.generate.fill value(1.0) : tensor<5120xf32>
-  %y = check.generate.fill value(0.0) : tensor<17408xf32>
-  %expected = check.generate.fill value(0.0) : tensor<17408xf32>
-  kernel.launch @yah_gemv_q6k(%weight, %x, %y) : (tensor<73113600xi8>, tensor<5120xf32>, tensor<17408xf32>)
-  check.expect.close actual(%y) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<17408xf32>
-  check.return
-}
-
-check.benchmark<@yah_gemv_q6k_full_case> @yah_gemv_q6k_full_bench

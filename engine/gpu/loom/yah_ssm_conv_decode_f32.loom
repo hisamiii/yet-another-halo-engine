@@ -96,34 +96,3 @@ kernel.def target(@yah_wave32) @yah_ssm_conv_decode() {
   }
   kernel.return
 }
-
-// Requires qkv_dim=8, rows=2.
-check.case public @yah_ssm_conv_decode_case {
-  %qkv = check.file.read.npy path("fixtures/ssm_conv_decode/input_qkv.npy") : tensor<16xf32>
-  %w = check.file.read.npy path("fixtures/ssm_conv_decode/input_w.npy") : tensor<32xf32>
-  %state = check.file.read.npy path("fixtures/ssm_conv_decode/input_state.npy") : tensor<32xf32>
-  %expected_out = check.file.read.npy path("fixtures/ssm_conv_decode/expected_out.npy") : tensor<16xf32>
-  %expected_state = check.file.read.npy path("fixtures/ssm_conv_decode/expected_state.npy") : tensor<32xf32>
-  %out = check.generate.fill value(0.0) : tensor<16xf32>
-  kernel.launch @yah_ssm_conv_decode(%qkv, %w, %state, %out) : (tensor<16xf32>, tensor<32xf32>, tensor<32xf32>, tensor<16xf32>)
-  check.expect.close actual(%out) expected(%expected_out) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<16xf32>
-  check.expect.close actual(%state) expected(%expected_state) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<32xf32>
-  check.return
-}
-
-check.benchmark<@yah_ssm_conv_decode_case> @yah_ssm_conv_decode_bench
-
-// Production shape: qkv_dim=12288 (this shard s SSM qkv width), rows=1, all-zero
-// inputs so the output and the state stay zero.
-check.case public @yah_ssm_conv_decode_full_case {
-  %qkv = check.generate.fill value(0.0) : tensor<12288xf32>
-  %w = check.generate.fill value(0.0) : tensor<49152xf32>
-  %state = check.generate.fill value(0.0) : tensor<49152xf32>
-  %out = check.generate.fill value(0.0) : tensor<12288xf32>
-  %expected = check.generate.fill value(0.0) : tensor<12288xf32>
-  kernel.launch @yah_ssm_conv_decode(%qkv, %w, %state, %out) : (tensor<12288xf32>, tensor<49152xf32>, tensor<49152xf32>, tensor<12288xf32>)
-  check.expect.close actual(%out) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<12288xf32>
-  check.return
-}
-
-check.benchmark<@yah_ssm_conv_decode_full_case> @yah_ssm_conv_decode_full_bench

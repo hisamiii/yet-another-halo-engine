@@ -5,7 +5,7 @@ usage: gen_attn_hip.py [out.loom]
 
 A port of WmmaCausalAttention<32, 16, true> (attention_wmma.hip), the kernel
 the HIP engine runs at pp2048, meant to be bit-identical to it given the same
-q, gate and f16 K/V: tools/attn_vs_hip.sh runs both and compares with atol 0.
+q, gate and f16 K/V (checked at atol 0 before the HIP engine was removed).
 The op sequence is taken from its compiled ISA (hipcc -O3):
 
   block = 32 query tokens x 2 query heads of one GQA group = 64 rows, 256 wave32

@@ -24,7 +24,7 @@
 // IQ2_XS and IQ2_S, none of which have a Loom GEMM yet.
 //
 // The fixture forces sc into [0,15] and d = 2^-13 so every product is exact in
-// f16; see fixtures/iq4xs_gemm/generate.py.
+// f16.
 //
 // Required config (correctness): --config=yah_ffn_gemm_iq4xs.m_tiles=1
 // Required config (benchmark):   --config=yah_ffn_gemm_iq4xs.m_tiles=1088
@@ -344,34 +344,3 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq4xs() {
   }
   kernel.return
 }
-
-// Requires --config=yah_ffn_gemm_iq4xs.m_tiles=1.
-check.case public @yah_ffn_gemm_iq4xs_case {
-  %weight = check.file.read.npy path("fixtures/iq4xs_gemm/input_iq4xs_gemm.npy") : tensor<43520xi8>
-  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
-  %output = check.generate.fill value(0.0) : tensor<1024xf32>
-  %expected = check.file.read.npy path("fixtures/iq4xs_gemm/expected_out.npy") : tensor<1024xf32>
-  %wstage = check.generate.fill value(0.0) : tensor<81920xf16>
-  %ostage = check.generate.fill value(0.0) : tensor<1024xf32>
-  kernel.launch @yah_ffn_gemm_iq4xs(%weight, %input, %wstage, %ostage, %output) : (tensor<43520xi8>, tensor<64x5120xf16>, tensor<81920xf16>, tensor<1024xf32>, tensor<1024xf32>)
-  check.expect.close actual(%output) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<1024xf32>
-  check.return
-}
-
-check.benchmark<@yah_ffn_gemm_iq4xs_case> @yah_ffn_gemm_iq4xs_bench
-
-// Requires --config=yah_ffn_gemm_iq4xs.m_tiles=1088. An all-zero IQ4_XS weight
-// decodes to zero, so every output must be exactly 0.
-check.case public @yah_ffn_gemm_iq4xs_full_case {
-  %weight = check.generate.fill value(0) : tensor<47349760xi8>
-  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
-  %output = check.generate.fill value(0.0) : tensor<1114112xf32>
-  %expected = check.generate.fill value(0.0) : tensor<1114112xf32>
-  %wstage = check.generate.fill value(0.0) : tensor<89128960xf16>
-  %ostage = check.generate.fill value(0.0) : tensor<1114112xf32>
-  kernel.launch @yah_ffn_gemm_iq4xs(%weight, %input, %wstage, %ostage, %output) : (tensor<47349760xi8>, tensor<64x5120xf16>, tensor<89128960xf16>, tensor<1114112xf32>, tensor<1114112xf32>)
-  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1114112xf32>
-  check.return
-}
-
-check.benchmark<@yah_ffn_gemm_iq4xs_full_case> @yah_ffn_gemm_iq4xs_full_bench

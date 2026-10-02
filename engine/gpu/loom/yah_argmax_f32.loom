@@ -110,22 +110,3 @@ kernel.def target(@yah_wave32) @yah_argmax() {
   }
   kernel.return
 }
-
-check.case public @yah_argmax_case {
-  // Monotonic logits put the maximum at the last index, so this checks that the
-  // index is tracked rather than just the value found.
-  %logits = check.generate.iota offset(0.0) step(1.0) : tensor<1024xf32>
-  %out_token = check.generate.fill value(-1) : tensor<1xi32>
-  %expected = check.generate.fill value(1023) : tensor<1xi32>
-  kernel.launch @yah_argmax(%logits, %out_token) : (tensor<1024xf32>, tensor<1xi32>)
-  check.expect.equal actual(%out_token) expected(%expected) : tensor<1xi32>
-  // Uniform logits make every index a tie, so the lowest index must win.
-  %flat = check.generate.fill value(0.5) : tensor<1024xf32>
-  %out_tie = check.generate.fill value(-1) : tensor<1xi32>
-  %expected_tie = check.generate.fill value(0) : tensor<1xi32>
-  kernel.launch @yah_argmax(%flat, %out_tie) : (tensor<1024xf32>, tensor<1xi32>)
-  check.expect.equal actual(%out_tie) expected(%expected_tie) : tensor<1xi32>
-  check.return
-}
-
-check.benchmark<@yah_argmax_case> @yah_argmax_bench

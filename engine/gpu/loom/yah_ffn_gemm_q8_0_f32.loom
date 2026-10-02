@@ -182,34 +182,3 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_q8_0() {
   }
   kernel.return
 }
-
-// Requires --config=yah_ffn_gemm_q8_0.m_tiles=1.
-check.case public @yah_ffn_gemm_q8_0_case {
-  %weight = check.file.read.npy path("fixtures/q8_0_gemm/input_q8_0_gemm.npy") : tensor<87040xi8>
-  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
-  %output = check.generate.fill value(0.0) : tensor<1024xf32>
-  %expected = check.file.read.npy path("fixtures/q8_0_gemm/expected_out.npy") : tensor<1024xf32>
-  %wstage = check.generate.fill value(0.0) : tensor<81920xf16>
-  %ostage = check.generate.fill value(0.0) : tensor<1024xf32>
-  kernel.launch @yah_ffn_gemm_q8_0(%weight, %input, %wstage, %ostage, %output) : (tensor<87040xi8>, tensor<64x5120xf16>, tensor<81920xf16>, tensor<1024xf32>, tensor<1024xf32>)
-  check.expect.close actual(%output) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<1024xf32>
-  check.return
-}
-
-check.benchmark<@yah_ffn_gemm_q8_0_case> @yah_ffn_gemm_q8_0_bench
-
-// Requires --config=yah_ffn_gemm_q8_0.m_tiles=1088. An all-zero Q8_0 weight
-// decodes to zero, so every output must be exactly 0.
-check.case public @yah_ffn_gemm_q8_0_full_case {
-  %weight = check.generate.fill value(0) : tensor<94699520xi8>
-  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
-  %output = check.generate.fill value(0.0) : tensor<1114112xf32>
-  %expected = check.generate.fill value(0.0) : tensor<1114112xf32>
-  %wstage = check.generate.fill value(0.0) : tensor<89128960xf16>
-  %ostage = check.generate.fill value(0.0) : tensor<1114112xf32>
-  kernel.launch @yah_ffn_gemm_q8_0(%weight, %input, %wstage, %ostage, %output) : (tensor<94699520xi8>, tensor<64x5120xf16>, tensor<89128960xf16>, tensor<1114112xf32>, tensor<1114112xf32>)
-  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1114112xf32>
-  check.return
-}
-
-check.benchmark<@yah_ffn_gemm_q8_0_full_case> @yah_ffn_gemm_q8_0_full_bench

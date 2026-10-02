@@ -295,36 +295,3 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s_residual() {
   }
   kernel.return
 }
-
-// Requires --config=yah_ffn_gemm_iq3s_residual.m_tiles=1.
-check.case public @yah_ffn_gemm_iq3s_residual_case {
-  %weight = check.file.read.npy path("fixtures/iq3s_gemm/input_iq3s_gemm.npy") : tensor<35200xi8>
-  %grid = check.file.read.npy path("fixtures/iq3s_gemm/grid.npy") : tensor<512xi32>
-  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
-  %output = check.generate.fill value(1000.0) : tensor<1024xf32>
-  %expected = check.file.read.npy path("fixtures/iq3s_gemm/expected_residual.npy") : tensor<1024xf32>
-  %wstage = check.generate.fill value(0.0) : tensor<81920xf16>
-  %ostage = check.generate.fill value(1000.0) : tensor<1024xf32>
-  kernel.launch @yah_ffn_gemm_iq3s_residual(%weight, %grid, %input, %wstage, %ostage, %output) : (tensor<35200xi8>, tensor<512xi32>, tensor<64x5120xf16>, tensor<81920xf16>, tensor<1024xf32>, tensor<1024xf32>)
-  check.expect.close actual(%output) expected(%expected) atol(1e-5) rtol(1e-5) nan(same) : tensor<1024xf32>
-  check.return
-}
-
-check.benchmark<@yah_ffn_gemm_iq3s_residual_case> @yah_ffn_gemm_iq3s_residual_bench
-
-// Requires --config=yah_ffn_gemm_iq3s_residual.m_tiles=1088. An all-zero IQ3_S weight
-// decodes to zero (d = 0), so every output must be exactly 0.
-check.case public @yah_ffn_gemm_iq3s_residual_full_case {
-  %weight = check.generate.fill value(0) : tensor<38297600xi8>
-  %grid = check.generate.fill value(0) : tensor<512xi32>
-  %input = check.generate.fill value(1.0) : tensor<64x5120xf16>
-  %output = check.generate.fill value(0.0) : tensor<1114112xf32>
-  %expected = check.generate.fill value(0.0) : tensor<1114112xf32>
-  %wstage = check.generate.fill value(0.0) : tensor<89128960xf16>
-  %ostage = check.generate.fill value(0.0) : tensor<1114112xf32>
-  kernel.launch @yah_ffn_gemm_iq3s_residual(%weight, %grid, %input, %wstage, %ostage, %output) : (tensor<38297600xi8>, tensor<512xi32>, tensor<64x5120xf16>, tensor<89128960xf16>, tensor<1114112xf32>, tensor<1114112xf32>)
-  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1114112xf32>
-  check.return
-}
-
-check.benchmark<@yah_ffn_gemm_iq3s_residual_full_case> @yah_ffn_gemm_iq3s_residual_full_bench

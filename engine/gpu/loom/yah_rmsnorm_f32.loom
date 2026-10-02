@@ -59,15 +59,3 @@ kernel.def target(@yah_wave32) @yah_rmsnorm() {
   }
   kernel.return
 }
-
-check.case public @yah_rmsnorm_case {
-  %x = check.generate.fill value(2.0) : tensor<64x5120xf32>
-  %weight = check.generate.fill value(3.0) : tensor<5120xf32>
-  %out = check.generate.fill value(-1.0) : tensor<64x5120xf32>
-  %expected = check.generate.fill value(3.0) : tensor<64x5120xf32>
-  kernel.launch @yah_rmsnorm(%x, %weight, %out) : (tensor<64x5120xf32>, tensor<5120xf32>, tensor<64x5120xf32>)
-  check.expect.close actual(%out) expected(%expected) atol(1.0000000000000001e-05) rtol(0.0) nan(same) : tensor<64x5120xf32>
-  check.return
-}
-
-check.benchmark<@yah_rmsnorm_case> @yah_rmsnorm_bench

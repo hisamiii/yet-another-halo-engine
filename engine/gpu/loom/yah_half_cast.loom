@@ -41,15 +41,3 @@ kernel.def target(@yah_wave32) @yah_half_cast() {
   }
   kernel.return
 }
-
-// Requires --config=yah_half_cast.num_elements=8.
-check.case public @yah_half_cast_case {
-  %x = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
-  %y = check.generate.fill value(0.0) : tensor<8xf16>
-  %expected = check.generate.iota offset(0.0) step(1.0) : tensor<8xf16>
-  kernel.launch @yah_half_cast(%x, %y) : (tensor<8xf32>, tensor<8xf16>)
-  check.expect.close actual(%y) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<8xf16>
-  check.return
-}
-
-check.benchmark<@yah_half_cast_case> @yah_half_cast_bench

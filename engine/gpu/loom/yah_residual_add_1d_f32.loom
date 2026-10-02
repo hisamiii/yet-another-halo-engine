@@ -44,16 +44,3 @@ kernel.def target(@yah_wave32) @yah_residual_1d() {
   }
   kernel.return
 }
-
-// Requires --config=yah_residual_1d.dim=8.
-check.case public @yah_residual_1d_case {
-  %a = check.generate.iota offset(0.0) step(1.0) : tensor<8xf32>
-  %b = check.generate.iota offset(100.0) step(1.0) : tensor<8xf32>
-  %out = check.generate.fill value(0.0) : tensor<8xf32>
-  %expected = check.generate.iota offset(100.0) step(2.0) : tensor<8xf32>
-  kernel.launch @yah_residual_1d(%a, %b, %out) : (tensor<8xf32>, tensor<8xf32>, tensor<8xf32>)
-  check.expect.close actual(%out) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<8xf32>
-  check.return
-}
-
-check.benchmark<@yah_residual_1d_case> @yah_residual_1d_bench

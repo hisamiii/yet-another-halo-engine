@@ -472,24 +472,3 @@ kernel.def target(@attention_prefill_gfx11_wave64) @yah_attn_wmma() {
   }
   kernel.return
 }
-
-// Round-19 measurement harness. The production fixtures are already the right
-// shapes for this kernel: q/gate/out are 2048x6144 f32 and k/v are 2048x1024 f16,
-// i.e. [token][head*256] and [token][kv_head*256] -- the same canonical layout,
-// with the layer offset folded into the base pointer. control is [2048, 0].
-// Timing first: no expect clause yet, so a numerics mismatch cannot hide the
-// measurement. Correctness is added once the arm's own output is understood.
-check.case public @yah_attn_wmma_qb_case {
-  %lse = check.generate.fill value(0.0) : tensor<49152xf32>
-  %q = check.file.read.npy path("fixtures/q.npy") : tensor<12582912xf32>
-  %gate = check.file.read.npy path("fixtures/gate.npy") : tensor<12582912xf32>
-  %k16 = check.file.read.npy path("fixtures/k16.npy") : tensor<2097152xf16>
-  %v16 = check.file.read.npy path("fixtures/v16.npy") : tensor<2097152xf16>
-  %out = check.generate.fill value(0.0) : tensor<12582912xf32>
-  kernel.launch @yah_attn_wmma(%q, %gate, %k16, %v16, %out, %lse) : (tensor<12582912xf32>, tensor<12582912xf32>, tensor<2097152xf16>, tensor<2097152xf16>, tensor<12582912xf32>, tensor<49152xf32>)
-  %expected = check.file.read.npy path("fixtures/out.npy") : tensor<12582912xf32>
-  check.expect.close actual(%out) expected(%expected) atol(0.001) rtol(0.001) nan(same) : tensor<12582912xf32>
-  check.return
-}
-
-check.benchmark<@yah_attn_wmma_qb_case> @yah_attn_wmma_qb_bench

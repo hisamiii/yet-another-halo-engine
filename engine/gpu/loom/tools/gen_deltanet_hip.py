@@ -27,7 +27,7 @@ on the lane, so they are vector loads -- no SMEM drains, the regtile kernel's
 problem. This replaces the regtile kernel's arithmetic (one lane per row, a
 128-long sequential sum), so its output differs from that kernel's: the pp2048
 gate for this kernel is bit-identity with HIP's kernel on the same inputs
-(tools/deltanet_vs_hip.sh), and argmax + KLD for the whole model.
+and argmax + KLD for the whole model.
 """
 import os
 import sys
@@ -39,12 +39,11 @@ DOTF = os.environ.get("YAH_DN_DOTF", "0") == "1"
 # xor-1/2/4 butterfly inside its 8 lanes, is unchanged. Wave64 runs FP32 VALU
 # on both ALU halves without VOPD pairing (pure FMA probe: 60.0 vs 56.6
 # lane-FMAs/cycle/SIMD), and this kernel's v_fma_f32 cannot pair in wave32.
-# Default: B=2048 harness 4.752 -> 4.184 M cycles, bit-identical to HIP (deltanet_vs_hip.sh).
+# Default: B=2048 harness 4.752 -> 4.184 M cycles, bit-identical to HIP.
 W64 = os.environ.get("YAH_DN_W64", "1") == "1"
 # YAH_DN_F16SIM=1 (experiment only): round k, q, v, the state read by the
 # dot products and the update coefficient to f16 (state kept f32), the
-# precision a chunked WY kernel with f16 WMMA inputs would have
-# (engine/run/research/gdn). Default off.
+# precision a chunked WY kernel with f16 WMMA inputs would have Default off.
 F16SIM = os.environ.get("YAH_DN_F16SIM", "0") == "1"
 WSZ = 64 if W64 else 32
 
@@ -160,7 +159,7 @@ def gen():
     # and the prefetched k/q/v back into place on every backedge (compile
     # report move_causes branch_edge, 60 v_mov per token against HIP's none);
     # unrolled, the iterations alternate registers. 2.058 -> 1.829 ms
-    # standalone, bit-identical (tools/deltanet_vs_hip.sh). YAH_DN_POL overrides.
+    # standalone, bit-identical. YAH_DN_POL overrides.
     pol = __import__("os").environ.get("YAH_DN_POL", "unroll(%c8) schedule(recurrence)")
     e(f"  {res} = scf.for %t = [%c0 to %batch step %c1]({carried}) -> ({ltypes}) {pol} {{")
     # next token's loads go out first; this token computes on the carried values
