@@ -10,9 +10,8 @@
 
 namespace yah::model {
 
-// A view of one tensor in the mapping. ne0 is the GGUF row length (the
-// reduction dimension) and ne1 the row count (the output dimension), matching
-// the order the writer stored them in.
+// A view of one tensor in the mapping, in GGUF order.
+// ne0 is the row length (the reduction dimension), ne1 the row count (the output dimension).
 struct TensorRef {
   const std::uint8_t* data{nullptr};
   core::GgmlType type{core::GgmlType::kF32};
@@ -29,8 +28,7 @@ struct Qwen35Layer {
   TensorRef attn_norm;
   TensorRef post_attention_norm;
 
-  // Full-attention layers only. attn_q carries the query and the output gate
-  // fused, so its ne1 is twice the attention width.
+  // Full-attention layers only. attn_q holds the query and the output gate fused: ne1 is twice the attention width.
   TensorRef attn_q, attn_k, attn_v, attn_output, attn_q_norm, attn_k_norm;
 
   // Gated DeltaNet layers only.
@@ -48,18 +46,14 @@ struct Qwen35Weights {
   TensorRef output;
   std::vector<Qwen35Layer> layers;
 
-  // The MTP head's tensors, present only on block_count - 1. Left unresolved
-  // for the M0 text path.
+  // The MTP head's tensors, present only on block_count - 1. Not resolved for the text path.
   TensorRef nextn_eh_proj, nextn_enorm, nextn_hnorm, nextn_shared_head_norm;
 
-  // Resolves every tensor the layer loop needs and validates it against the
-  // config (row lengths, counts, and which tensors each layer type must have).
-  // Throws on anything missing or inconsistent rather than returning a partial
-  // table.
+  // Resolves every tensor the layer loop needs and checks it against the config (row lengths, counts, layer types).
+  // Throws on anything missing or inconsistent; never returns a partial table.
   static Qwen35Weights FromGguf(const core::Gguf& gguf, const core::Qwen35Config& config);
 
-  // Shifts every resolved tensor pointer by `delta` bytes. Used to repoint the
-  // table from the file mapping onto the HIP-registered copy the device reads.
+  // Shifts every resolved tensor pointer by `delta` bytes, e.g. from the file mapping onto the device copy.
   void Rebase(std::ptrdiff_t delta);
 
   [[nodiscard]] std::uint64_t bytes() const;

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# run_codec.sh <hal set> <tokens> <ids file> <out .rs> <kcodec> <vcodec> [extra env...]:
-# one engine run with the KV codec hook (fp16/fp16 = reference) writing compact row stats
+# run_codec.sh <hal set> <tokens> <ids file> <out .rs> <kcodec> <vcodec> [extra env...]
+# One engine run with the KV codec hook (fp16/fp16 = reference) that writes compact row stats.
 set_dir=$1; T=$2; ids=$3; out=$4; kc=$5; vc=$6; shift 6
-# resumable: a run whose log already reports layers_ms is done
+# Resumable: a run whose log already reports layers_ms is done.
 if grep -q layers_ms ${out%.rs}.log 2>/dev/null; then echo "$(basename $out): done earlier, skipped"; exit 0; fi
 extra=("$@")   # hrx-env.sh is sourced with empty args below
 E=/home/q/yet-another-halo-engine

@@ -1,10 +1,7 @@
 #!/bin/bash
-# Run a command while sampling the iGPU SCLK, then report the clock
-# distribution next to the command's own output.
-#
-# The clock is coupled to the kernel's power draw (the part has three SCLK
-# levels and sustained work does not reach the top one), so a throughput number
-# means nothing without the clock it was taken at.
+# Usage: bench_with_clock.sh <command...>
+# Runs a command, samples the iGPU SCLK during the run, and prints the clock range after the command output.
+# SCLK follows the kernel's power draw (three levels; sustained work does not reach the top), so a rate needs its clock.
 set -u
 SCLK=/sys/class/drm/card1/device/pp_dpm_sclk
 if [ ! -r "$SCLK" ]; then

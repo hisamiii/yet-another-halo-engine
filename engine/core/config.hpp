@@ -9,8 +9,7 @@
 
 namespace yah::core {
 
-// Qwen3.8 27B, which stores its architecture as "qwen35". Every field is read
-// from the file's own metadata; nothing is hard-coded except the key names.
+// Qwen3.8 27B (GGUF architecture "qwen35"). Every field comes from the file metadata; only the key names are fixed.
 struct Qwen35Config {
   std::string architecture;
   std::uint32_t block_count{0};
@@ -32,8 +31,7 @@ struct Qwen35Config {
   std::uint32_t ssm_time_step_rank{0};
   std::uint32_t ssm_inner_size{0};
 
-  // Layer types alternate on a fixed interval: one full-attention layer every
-  // full_attention_interval, Gated DeltaNet otherwise. layer is 0-based.
+  // One full-attention layer every full_attention_interval, Gated DeltaNet otherwise. layer is 0-based.
   [[nodiscard]] bool IsFullAttention(std::uint32_t layer) const {
     return full_attention_interval != 0 && (layer + 1) % full_attention_interval == 0;
   }
@@ -43,8 +41,7 @@ struct Qwen35Config {
     return full_attention_interval == 0 ? 0 : main_block_count() / full_attention_interval;
   }
   [[nodiscard]] std::uint32_t RecurrentLayers() const { return main_block_count() - AttentionLayers(); }
-  // Dense index of a Gated DeltaNet layer among the recurrent layers, which is
-  // the slot its convolution and recurrent states live in.
+  // Dense index of a Gated DeltaNet layer among the recurrent layers: the slot of its conv and recurrent states.
   [[nodiscard]] std::uint32_t SsmLayerIndex(std::uint32_t layer) const {
     return full_attention_interval == 0 ? layer : layer - layer / full_attention_interval;
   }
@@ -59,8 +56,8 @@ struct Qwen35Config {
   static Qwen35Config FromGguf(const Gguf& gguf);
 };
 
-// Tokenizer pieces, left as pointers into the metadata map so the 248k strings
-// are neither copied nor re-allocated. The map owns them for the Gguf's life.
+// Tokenizer pieces point into the metadata map, so the 248k strings are not copied.
+// The map owns them for the life of the Gguf.
 struct TokenizerConfig {
   std::string model;
   std::string pre;

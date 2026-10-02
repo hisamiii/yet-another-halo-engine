@@ -5,17 +5,11 @@
 #   engine/hrx-env.sh --check     verify the install and print what resolves
 #   engine/hrx-env.sh --fetch     download and extract the pinned packages
 #
-# HRX ships an alternative HIP runtime (libhrx.so plus a compatibility
-# libamdhip64.so) and an XDNA/NPU HAL driver, from a single source. It is the
-# target runtime for both the GPU and the NPU paths, so selecting it is one
-# environment change rather than a build change: nothing in /opt/rocm is touched
-# and ROCm stays usable in another shell.
+# HRX is an alternative HIP runtime (libhrx.so plus a compatible libamdhip64.so) with an XDNA/NPU HAL driver.
+# Selecting it is an environment change only: /opt/rocm is not touched and ROCm stays usable in another shell.
 #
-# PINNED: the official AMD **ROCm Core SDK 10.0.0** release, component version
-# ROCm 7.14.x. Do NOT substitute TheRock nightlies. HRX's AMDGPU driver calls
-# hsa_amd_queue_create, and neither the 7.13 install nor the 7.14.0.dev0 nightly
-# wheel exports it -- only the 10.0.0 release does. Judging HRX against a nightly
-# produced a full wrong conclusion once; see docs/hrx-evaluation.md.
+# PINNED: the AMD ROCm Core SDK 10.0.0 release (ROCm 7.14.x). Do not use TheRock nightlies.
+# HRX calls hsa_amd_queue_create; only the 10.0.0 release exports it (see docs/build-and-run.md).
 #
 # Three packages, ~174 MB, extracted under $YAH_HRX_ROOT (no system install):
 #   amdrocm-runtime10.0   HSA runtime; carries hsa_amd_queue_create@@ROCR_1
@@ -49,8 +43,7 @@ yah_hrx_fetch() {
     esac
     [ -d "$d" ] && continue
     echo "hrx-env: extracting $p -> $d"
-    # dpkg-deb is not present on every host. The deb is an ar archive holding
-    # control.tar.* and data.tar.*; python is the portable fallback.
+    # dpkg-deb is not on every host. A deb is an ar archive with control.tar.* and data.tar.*; unpack it in python.
     python3 - "$p" "$d" <<'PY'
 import io, os, sys, tarfile
 def read_ar(path):

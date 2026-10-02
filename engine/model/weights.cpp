@@ -57,8 +57,7 @@ Qwen35Weights Qwen35Weights::FromGguf(const core::Gguf& gguf, const core::Qwen35
   weights.layers.resize(config.block_count);
   for (std::uint32_t i = 0; i < config.block_count; ++i) {
     Qwen35Layer& layer = weights.layers[i];
-    // The main stack alternates on the interval; the trailing MTP block is a
-    // separate full-attention layer and must not be classified by the pattern.
+    // The trailing MTP block is a separate full-attention layer: do not classify it by the interval pattern.
     layer.is_full_attention = i >= config.main_block_count() || config.IsFullAttention(i);
 
     layer.attn_norm = Resolve(gguf, LayerName(i, "attn_norm.weight"));

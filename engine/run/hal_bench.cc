@@ -1,31 +1,19 @@
-// hal_bench: time one GEMM-shaped HAL repeatedly, isolated from the driver.
+// hal_bench: times one GEMM-shaped HAL repeatedly, isolated from the driver.
 //
-// usage: hal_bench <hal> <W> <IN> <OUT> <WST> <OST> <gx> <gy> <gz> [m_rows] [k_blocks] [tokens] [iters] [wfile]
+// usage: hal_bench <hal> <W> <IN> <OUT> <WST> <OST> <gx> <gy> <gz>
+//                  [m_rows] [k_blocks] [tokens] [iters] [wfile] [outfile]
 //
-// The caller supplies the operand sizes. Do NOT compute them by hand: run this
-// through tools/safe_bench.py, which derives them from the shape AND checks them
-// against the compiled kernel's own declared footprint before anything is
-// dispatched here.
+// Do not compute the operand sizes by hand: run this through tools/safe_bench.py.
+// It derives them from the shape and checks them against the compiled kernel's declared footprint.
+// On this target an access past an allocation does not fault: the shader hangs, MES stops answering and the box resets.
+// Hand formulas look right and are not: e.g. a K-split residual writes m_rows * k_split * tokens * 4 bytes.
 //
-// Why: on this target an extent past the end of an allocation does not fault. The
-// shader reads unmapped VA, never returns, and hangs with no page fault for the
-// driver to report: gfx times out, MES stops answering msg=RESET, and the box
-// resets. Three sizing mistakes on 2026-09-29 cost two reboots. Two of them were
-// formulas that looked right and were not -- an input sized for k_blocks=20
-// (655360 B) reused at k_blocks=68, and an output of m_rows*tokens*4 when a
-// k_split=4 residual writes m_rows*k_split*tokens*4. The compiler knew both; the
-// arithmetic did not. Verify first, dispatch second.
+// With the shape given, the grid is checked before any submit (exit 3): gx*16 <= m_rows, gz <= k_blocks, gy <= tokens.
+// K splits live on gz (workgroups(m_tiles, token_tiles, k_split)); a split folded into gx runs past the weight.
 //
-// The grid is checked before anything is submitted (exit 3) when the shape is
-// given: gx*16 <= m_rows, gz <= k_blocks, gy <= tokens. K splits live on gz
-// (workgroups(m_tiles, token_tiles, k_split)), so folding a split into gx walks
-// the m origin off the end of the weight.
-//
-// Data is deterministic but not degenerate: the weight and grid carry a byte
-// pattern (all-0x01 weights make d a subnormal and collapse the grid lookup) and
-// the activation is a run of f16 0.5. Even so this measures one kernel on a quiet
-// GPU: it is a hypothesis generator, not a result. Confirm with a paired
-// full-pipeline A/B (engine/run/LOOM_RUNTIME.md section 6).
+// Data is deterministic but not degenerate: weight and grid get a byte pattern, the activation is f16 0.5.
+// All-0x01 weights make d a subnormal and collapse the grid lookup.
+// One kernel on a quiet GPU gives a hypothesis, not a result: confirm with a full-pipeline A/B.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -64,17 +52,11 @@ int main(int argc, char** argv) {
   const size_t KBLK = argc > 11 ? strtoull(argv[11], nullptr, 10) : 0;
   const size_t TOK = argc > 12 ? strtoull(argv[12], nullptr, 10) : 0;
   const int iters = argc > 13 ? atoi(argv[13]) : 50;
-  // Optional real weight blob. The IQ grid index the decode looks up is a function
-  // of the stored bytes, so a synthetic pattern drives a different, flatter access
-  // distribution than the real tensor does -- and the 1088 geometry is sensitive to
-  // exactly that. Feed a real tensor when the question is about the production case.
+  // Optional real weight blob. The IQ grid lookups depend on the stored bytes, and a synthetic pattern gives a flatter
+  // access distribution than the real tensor. Use a real tensor to time the production case.
   const char* WFILE = argc > 14 ? argv[14] : "";
-  // Optional output dump. With it this stops being only a timing harness: two
-  // HALs that claim to compute the same tile can be dispatched on identical
-  // inputs and their raw outputs compared elementwise, which localises a
-  // wrong-but-plausible kernel to specific (row, token) cells instead of paying
-  // a full 2048-token forward per hypothesis. The output is column-major:
-  // out[token * m_rows + row]. See tools/hal_oracle.py.
+  // Optional output dump: run two HALs for the same tile on identical inputs and compare the outputs elementwise.
+  // This finds the wrong (row, token) cells without a full forward. Layout: out[token * m_rows + row].
   const char* OUTFILE = argc > 15 ? argv[15] : "";
 
   int bad = 0;
@@ -91,9 +73,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "gz=%u must be in 1..%zu\n", GZ, KBLK);
     bad = 1;
   }
-  // The per-workgroup token tile is 64 in the raw source and 16 once the emitter
-  // narrows it, so this can only check the weak invariant; safe_bench knows which
-  // source it is looking at and enforces gy == token_tiles exactly.
+  // This does not know the kernel's token tile, so it checks only gy <= tokens; safe_bench enforces gy == token_tiles.
   if (!GY || (TOK && GY > TOK)) {
     std::fprintf(stderr, "gy=%u is out of range for tokens=%zu\n", GY, TOK);
     bad = 1;
@@ -146,17 +126,11 @@ int main(int argc, char** argv) {
 
   const char* name = e.names.empty() ? "?" : e.names[0].c_str();
   const uint32_t ordinal = e.OrdinalOrZero(name);
-  // The executable's own workgroup size, not a hardcoded 32. A wave64 kernel
-  // launched with 32 threads runs half a wavegroup: it reads as a large
-  // speedup because half the output tile is never computed.
+  // Use the export's workgroup size: a wave64 kernel launched with 32 threads skips half the tile and looks fast.
   const uint32_t ws = e.WorkgroupSize(ordinal);
   auto cfg = LoomDevice::Config(GX, GY, GZ, ws ? ws : 32, 1, 1);
-  // The binding list is the export's, not a fixed six. The IQ grid/signs
-  // formats carry extra leading operands (iq3xxs/iq2xxs/iq2xs: weight, grid,
-  // ksigns = 7) and every other format carries none (weight, input, wstage,
-  // ostage, out = 5), while the driver builds exactly the matching list
-  // (engine/run/loom_forward_pp.cc run_kstore). Hardcoding six rejected the
-  // entire non-grid family with "expected 5 but got 6".
+  // Build the binding list from the export's count, as loom_forward_pp.cc run_kstore does.
+  // 5: weight, input, wstage, ostage, out. 6 (iq3s): + grid. 7 (iq3xxs/iq2xxs/iq2xs): + grid, ksigns.
   const uint32_t nb = e.BindingCount(ordinal);
   if (nb < 5 || nb > 7) {
     std::fprintf(stderr, "hal_bench: export binds %u buffers; expected 5..7\n", nb);
@@ -169,8 +143,7 @@ int main(int argc, char** argv) {
   b.push_back({wstage.handle, 0, WST});
   b.push_back({ostage.handle, 0, OST});
   b.push_back({output.handle, 0, OUT});
-  // One dispatch at a time up front: if the first hangs it shows up here rather
-  // than more dispatches deep into an already wedged ring.
+  // One dispatch at a time first: a hang then shows here, not several dispatches deep into a wedged ring.
   for (int i = 0; i < 3; ++i) {
     gpu.Dispatch(e, ordinal, cfg, nullptr, 0, b.data(), b.size());
     gpu.Synchronize();

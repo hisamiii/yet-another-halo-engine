@@ -1,24 +1,21 @@
-// LoomDecoder: the single-token decode step on Loom through HRX, GEMV-based.
+// LoomDecoder: the GEMV-based single-token decode step on Loom through HRX.
 //
-// HAL set: tools/emit_decode.py (decode.txt "ctx T": the paged KV pools hold T rows;
-// "kv q KB VB": quantized KV in the prefill's kv8a16 / kv4a16 formats, gen_kvq.py).
-// Per layer, as HIP's Forward::Decode:
-//   rmsnorm -> full attention: attn_q / attn_k / attn_v GEMV, unpack q|gate, QK norm
-//              + RoPE, append K / V to the paged pools, split-K attention + reduce
-//              (gate), attn_output GEMV += hidden
-//           -> recurrent:      attn_qkv / attn_gate / ssm_alpha / ssm_beta GEMV, conv +
-//              DeltaNet in one kernel (gated norm inside), ssm_out GEMV += hidden
+// HAL set: tools/emit_decode.py. decode.txt "ctx T": the paged KV pools hold T rows.
+// decode.txt "kv q KB VB": quantized KV in the prefill's kv8a16 / kv4a16 formats (gen_kvq.py).
+// Per layer:
+//   rmsnorm -> full attention: attn_q / attn_k / attn_v GEMV, unpack q|gate, QK norm + RoPE,
+//                              append K / V to the paged pools, split-K attention + reduce (gate),
+//                              attn_output GEMV += hidden
+//           -> recurrent:      attn_qkv / attn_gate / ssm_alpha / ssm_beta GEMV,
+//                              conv + DeltaNet in one kernel (gated norm inside), ssm_out GEMV += hidden
 //   rmsnorm -> ffn_gate|ffn_up SwiGLU GEMV -> ffn_down GEMV += hidden
-// head: rmsnorm -> output GEMV -> argmax into a device token stream that the next
-// step's embedding kernel (IQ4_XS token_embd) reads, so steps are enqueued back to
-// back with no host round trip.
+// Head: rmsnorm -> output GEMV -> argmax into a device token stream.
+// The next step's embedding kernel (IQ4_XS token_embd) reads that stream: steps queue back to back, no host round trip.
 //
-// The recurrent state and the KV pools are external (LoomDecoderState): either the
-// decoder's own (OwnState, for a prompt fed through decode) or the prefill's
-// (loom_forward_pp with YAH_GEN: its paged pools, page table, conv and DeltaNet state,
-// which use the same layouts). With quantized KV the decoder keeps each layer's open
-// 16-key V tile in f16 and quantizes it when its 16th key arrives, so a bound state
-// must start on a tile boundary (the prefill's runs are whole chunks).
+// The recurrent state and the KV pools are external (LoomDecoderState) and use the prefill's layouts.
+// Use OwnState() for a prompt fed through decode, or bind the prefill's state (loom_forward_pp with YAH_GEN).
+// Quantized KV: each layer's open 16-key V tile stays f16 until its 16th key arrives.
+// So a bound state must start on a 16-key tile boundary (prefill runs are whole chunks).
 #ifndef YAH_MODEL_LOOM_DECODER_HPP_
 #define YAH_MODEL_LOOM_DECODER_HPP_
 
@@ -43,9 +40,8 @@ namespace yah::model {
 
 struct LoomDecoderState {
   std::vector<hrx_buffer_ref_t> kpool, vtpool;  // per full-attention layer, T * 1024 f16 each
-  // quantized KV (decode.txt "kv q KB VB"), per full-attention layer: K codes and
-  // scales, the channel means subtracted before quantizing (zeros: own state), V^T
-  // codes and stats; the f16 pools are then unused
+  // Quantized KV (decode.txt "kv q KB VB"), per full-attention layer; the f16 pools are then unused.
+  // K codes, K scales, K channel means subtracted before quantizing (zeros in OwnState), V^T codes, V^T stats.
   std::vector<hrx_buffer_ref_t> kq, ks, km, vq, vs;
   hrx_buffer_ref_t ptab{};           // T / 256 i32 (logical page -> physical page)
   hrx_buffer_t convstate = nullptr;  // per recurrent layer si: si * 10240 * 4 f32
@@ -69,7 +65,7 @@ class LoomDecoder {
       std::string k;
       in >> k >> T_;
       if (k != "ctx" || T_ == 0 || T_ % 256) throw LoomError("bad decode.txt in " + dir_);
-      // "rw <kind> R W": the GEMV launch geometry of each kind in this set
+      // "rw <kind> R W": the GEMV launch geometry of each kind in this set.
       std::string kind;
       std::uint32_t r = 0, w = 0;
       while (in >> k >> kind >> r >> w) {
@@ -129,10 +125,10 @@ class LoomDecoder {
   }
 
   [[nodiscard]] std::uint32_t context() const { return T_; }
-  // KV bits of this set: (16, 16) fp16, else (8 | 4, 8 | 4)
+  // KV bits of this set: (16, 16) for fp16, else (8 | 4, 8 | 4).
   [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> kv_bits() const { return {kbits_, vbits_}; }
   [[nodiscard]] bool quant() const { return kbits_ != 16; }
-  // quantized pool bytes per layer (gen_kvq.py layouts)
+  // Quantized pool bytes per layer (gen_kvq.py layouts).
   std::size_t KqBytes() const { return std::size_t{T_} * (kbits_ == 4 ? 512 : 1024); }
   std::size_t KsBytes() const { return std::size_t{T_} * (kbits_ == 4 ? 128 : 32); }
   std::size_t VqBytes() const { return std::size_t{T_} * (vbits_ == 4 ? 512 : 1024); }
@@ -207,12 +203,12 @@ class LoomDecoder {
   }
   void CopyLogits(float* host) { gpu_.D2H(*logits_, host, std::size_t{kVocab} * 4); }
 
-  // Enqueue the step at position pos: reads toks[pos]; its argmax goes to toks[pos + 1]
-  // when pos + 1 >= keep_from (generated positions), else to a sink (prompt positions).
+  // Queues the step at position pos. It reads toks[pos]; its argmax goes to toks[pos + 1] if pos + 1 >= keep_from.
+  // Prompt positions (pos + 1 < keep_from) write the argmax to a sink.
   void Step(std::uint32_t pos, std::uint32_t keep_from) {
     if (pos >= T_) throw LoomError("decoder: position past the set's context");
     if (st_.kpool.empty() && st_.kq.empty()) throw LoomError("decoder: no state bound");
-    // the open V tile holds this tile's earlier keys only if the steps were contiguous
+    // The open V tile holds this tile's earlier keys only if the steps were contiguous.
     if (quant() && pos % 16 && pos != next_pos_)
       throw LoomError("decoder: quantized KV steps must be contiguous from a 16-key tile boundary");
     next_pos_ = pos + 1;
@@ -255,7 +251,7 @@ class LoomDecoder {
         Project({pre + "attn_qkv.weight", pre + "attn_gate.weight", pre + "ssm_alpha.weight", pre + "ssm_beta.weight"},
                 {qkv_, gate_, alpha_, beta_});
         const hrx_buffer_ref_t dst{st_.dstate, std::size_t{si} * kStateElems * 4, std::size_t{kStateElems} * 4};
-        // conv state ping-pong: this step reads cs_[cs_cur_] and writes the other one
+        // Conv state ping-pong: this step reads cs_[cs_cur_] and writes the other one.
         const std::size_t co = std::size_t{si} * kConvState * 4, cb = std::size_t{kConvState} * 4;
         Dispatch(Load("deltanet_conv"), kHeadsV, 1, 512,
                  {{qkv_->handle, 0, std::size_t{kQkv} * 4},
@@ -292,7 +288,8 @@ class LoomDecoder {
     const char* name;
     std::uint32_t qk, bb, tables;
   };
-  // table bits, in gen_gemv.TABLE_ORDER: grid_iq3s, grid_iq3xxs, grid_iq2xxs, grid_iq2xs, ksigns
+  // GGML type -> GEMV name, block elements, block bytes, table bits.
+  // Table bits follow gen_gemv.TABLE_ORDER: grid_iq3s, grid_iq3xxs, grid_iq2xxs, grid_iq2xs, ksigns.
   static bool FmtOf(std::uint32_t type, Fmt* f) {
     switch (type) {
       case 8:
@@ -358,9 +355,8 @@ class LoomDecoder {
     if (it == exes_.end()) it = exes_.emplace(name, gpu_.Load(dir_ + "/" + name + ".hal")).first;
     return it->second;
   }
-  // workgroup size and binding count come from the compiled export and must agree with
-  // the call site (argmax is a 1024-lane kernel: launched with 32 lanes its per-wave LDS
-  // slots stay unwritten and it returns garbage)
+  // Workgroup size and binding count must match the compiled export.
+  // Example: argmax is a 1024-lane kernel; with 32 lanes its per-wave LDS slots stay unwritten and it returns garbage.
   void Dispatch(LoomExecutable& e, std::uint32_t gx, std::uint32_t gy, std::uint32_t wg,
                 const std::vector<hrx_buffer_ref_t>& b) {
     const std::uint32_t cw = e.WorkgroupSize(0), cb = e.BindingCount(0);
@@ -369,7 +365,7 @@ class LoomDecoder {
                       ", bindings " + std::to_string(b.size()) + " vs " + std::to_string(cb));
     gpu_.Dispatch(e, 0, LoomDevice::Config(gx, gy, 1, wg, 1, 1), nullptr, 0, b.data(), b.size());
   }
-  // GEMV: names and footprints as tools/gen_gemv.py.
+  // GEMV kernel names and weight footprints follow tools/gen_gemv.py.
   void Gemv(const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y) {
     std::string name = std::string("gv_") + kind;
     std::uint32_t tbits = 0, M = 0, K = 0;
@@ -430,13 +426,12 @@ class LoomDecoder {
     CheckGrid(bn, rows / (R * W));
     Dispatch(Load(bn), rows / (R * W), 1, 32 * W, b);
   }
-  // (R, W) of a GEMV kind in this set (decode.txt)
+  // (R, W) of a GEMV kind in this set (decode.txt).
   std::pair<std::uint32_t, std::uint32_t> Rw(const std::string& kind) const {
     auto it = rw_.find(kind);
     return it == rw_.end() ? std::make_pair(kR, kW) : it->second;
   }
-  // A grid larger than the compiled one reads out of bounds (Loom drops clamps it proves
-  // redundant from the launch config); the set records every GEMV kernel's grid.
+  // Loom drops clamps it proves redundant from the launch grid: launch exactly the grid recorded in decode.txt.
   void CheckGrid(const std::string& name, std::uint32_t gx) const {
     auto it = grid_.find(name);
     if (it == grid_.end()) throw LoomError("decode set has no grid record for " + name + " (re-emit)");
@@ -447,7 +442,7 @@ class LoomDecoder {
   void Rmsnorm(const LoomBuffer& x, const std::string& w, const LoomBuffer& out) {
     Dispatch(Load("rmsnorm"), 1, 1, 512, {Ref(x), TRef(w), Ref(out)});
   }
-  // YAH_DEC_TRACE=1: at step 0, sync after every stage and print max |x| / NaNs
+  // YAH_DEC_TRACE=1: at step 0, sync after every stage and print max |x| and the NaN count.
   void Tr(const char* what, std::uint32_t l, const LoomBuffer& b, std::size_t n) {
     if (!trace_ || cur_pos_ != 0) return;
     gpu_.Synchronize();
@@ -476,7 +471,7 @@ class LoomDecoder {
   bool trace_ = false;
   hrx_buffer_t cs_[2] = {nullptr, nullptr};  // conv state ping-pong
   int cs_cur_ = 0;
-  std::deque<LoomBuffer> keep_;  // stable addresses
+  std::deque<LoomBuffer> keep_;  // deque: Alloc hands out references that must stay valid
   std::map<std::string, LoomExecutable> exes_;
   std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> rw_;
   std::map<std::string, std::uint32_t> grid_;

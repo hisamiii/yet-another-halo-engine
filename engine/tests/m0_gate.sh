@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# M0 gate: the engine's full 64-block text path must emit the same greedy next
-# token as the recorded reference on a fixed prompt set. Runs on the HRX-native
-# runner (no HIP).
+# M0 gate: the full 64-block text path must emit the recorded greedy next token for each prompt of a fixed set.
 #
 # Usage: m0_gate.sh <model.gguf> [hal-dir]
 set -euo pipefail

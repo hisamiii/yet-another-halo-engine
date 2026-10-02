@@ -1,32 +1,15 @@
-// loom_forward_pp: the whole prompt through the 64-layer Loom prefill in ONE
-// pass, so the Loom prefill can be compared against the HIP prefill at the same
-// token count.
-//
-// loom_forward_target.cc is the 5-token path: kB is a compile-time constant, the
-// HAL set is emitted with batch=5, and emit_prefill.narrow_tokens narrows every
-// GEMM to a 16-wide token tile because 11 of 16 lanes would be padding. A real
-// prompt wants the token dimension carried by the grid instead, so this driver
-// takes the token count B from the command line and every kernel is dispatched
-// with its token axes multiplied out:
-//
-//   GEMM family    grid (m_tiles, token_tiles, 1), token_tiles = B/TILE
-//   norm/conv/...  grid (tiles, B) or (B, 1, 1)
-//   attention      grid (heads, B), one workgroup per (head, token), keys
-//                  0..token causal, KV cache max_context = B deep
-//
-// One pass means start_pos is 0 everywhere and the recurrent state (the ssm conv
-// ring, the DeltaNet state) starts zeroed, so the recurrence is unchanged: this
-// is exactly the first-chunk case the 5-token path already validates. No
-// token-tile loop, and therefore no per-tile launch overhead.
-//
-// The HAL set must come from emit_prefill_pp.py at the SAME B and the same
-// YAH_TOKEN_TILE; the printed banner states both, because a mismatch is a wrong
-// grid and that is not a caught error.
+// loom_forward_pp: the Loom prefill on HRX. Runs the prompt through the 64 layers, one chunk of B tokens at a time.
 //
 // usage: loom_forward_pp <model.gguf> <haldir> <out-prefix> [tokens] [ids-file]
+// outputs: <out-prefix>.logits (vocab f32, last token) and <out-prefix>.hidden (B x 5120 f32, token major)
+// env: YAH_LOGITS_FROM, YAH_ROWSTATS*, YAH_KV_HOOK*, YAH_GEN + YAH_DECODE_HAL (see below)
 //
-// outputs: <out-prefix>.logits (vocab f32, last token) and <out-prefix>.hidden
-//          (B x 5120 f32, token major)
+// The HAL set comes from tools/emit_prefill_pp.py; <haldir>/dispatch.txt gives the launch geometry of each HAL.
+// Every kernel carries the token dimension in its grid:
+//   GEMM family    grid (m_tiles / rowgrp, token_tiles, 1)
+//   norm/conv/...  grid (tiles, B) or (B, 1, 1)
+//   attention      grid (query-token tiles, head groups), causal over keys 0..token
+// Chunk 0 starts with zeroed recurrent state (ssm conv ring, DeltaNet state); later chunks carry it forward.
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -53,8 +36,7 @@
 using namespace yah::model;  // NOLINT(google-build-using-namespace)
 
 namespace {
-// GEMM tokens per workgroup: the tile the HAL set was emitted with. 64 is the
-// shipping source's own tile; 128/256 come from tools/widen_tokens.py.
+// GEMM tokens per workgroup for a HAL that dispatch.txt does not list.
 #ifndef YAH_TOKEN_TILE
 #define YAH_TOKEN_TILE 64
 #endif
@@ -73,7 +55,7 @@ constexpr std::uint32_t kHeads = 24;
 constexpr std::uint32_t kKvHeads = 4;
 constexpr std::uint32_t kHeadDim = 256;
 constexpr std::uint32_t kVocab = 248320;
-// One KV slot per prompt token per layer.
+// One KV cache row: all KV heads of one token.
 constexpr std::uint32_t kKvRow = kKvHeads * kHeadDim;  // 1024
 
 const float kKvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
@@ -133,35 +115,21 @@ struct Imported {
 
 std::uint32_t g_b = 0;   // prompt tokens in this run
 std::uint32_t g_tt = 0;  // GEMM token tiles = g_b / g_gtile
-// The GEMM launch geometry the HAL set was emitted with, read from
-// <haldir>/dispatch.json. The emitter writes it, so the grid this driver passes
-// cannot disagree with the geometry the kernel was compiled for. Mirroring that
-// arithmetic in C here is what produced a wrong-but-deterministic forward on
-// 2026-09-29: the HAL declared twice the workgroups, the driver launched the old
-// count, and half the rows were never computed. docs/reference/hrx-agents.md:
-// "Launch geometry is not public stage configuration ... stage authoring code
-// must not mirror the arithmetic in C."
 std::uint32_t g_gtile = kTile;  // fallback GEMM tile when dispatch.txt says nothing
 
 void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name, std::uint32_t gx, std::uint32_t gy,
               std::uint32_t gz, std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
               const std::vector<hrx_buffer_ref_t>& b) {
-  // The executable's own workgroup size is authoritative; sx is only the
-  // fallback for metadata that does not carry one.
+  // The export's own workgroup size wins; sx is only the fallback for metadata without one.
   const std::uint32_t ordinal = exe.OrdinalOrZero(name);
   const std::uint32_t ws = exe.WorkgroupSize(ordinal);
   gpu.Dispatch(exe, ordinal, LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz), nullptr, 0, b.data(), b.size());
 }
 
-// The launch geometry each GEMM HAL was compiled for, read from
-// <haldir>/dispatch.txt: one line per HAL, "<basename> <tokens> <rowgrp>
-// <token_tiles>". The emitter writes it beside the HAL, so the grid this driver
-// passes cannot disagree with the geometry the kernel was built for. Mirroring
-// that arithmetic in C here is what produced a wrong-but-deterministic forward on
-// 2026-09-29: the HAL declared twice the workgroups, the driver launched the old
-// count, and half the rows were never computed. docs/reference/hrx-agents.md:
-// "Launch geometry is not public stage configuration ... stage authoring code
-// must not mirror the arithmetic in C."
+// The launch geometry each HAL was compiled for, from <haldir>/dispatch.txt.
+// One line per HAL: "<basename> <tokens> <rowgrp> <token_tiles>".
+// Marker rows (e.g. "kv_paged 0 0 0") flag features of the set.
+// Read the grid from here; never mirror the emitter's arithmetic: a wrong grid silently skips rows.
 struct Geom {
   std::uint32_t tokens;  // tokens per workgroup = grid y divisor
   std::uint32_t rowgrp;  // 16-row tiles per workgroup = grid x divisor
@@ -177,8 +145,7 @@ void LoadDispatch(const std::string& dir) {
   while (f >> name >> g.tokens >> g.rowgrp >> g.tt) g_geom[name] = g;
 }
 
-// Geometry for one HAL, with the check that makes a mismatch loud: a HAL emitted
-// for a different token count would otherwise compute a silent subset.
+// Geometry of one HAL. Exits if the HAL was emitted for another token count: it would compute a silent subset.
 Geom GeomOf(const std::string& hal, std::uint32_t B) {
   const auto it = g_geom.find(hal);
   if (it == g_geom.end()) return Geom{kTile, 1, static_cast<std::uint32_t>(B / kTile)};
@@ -284,21 +251,15 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> ids_all = ParseIds(ids_path);
     g_b = want ? want : static_cast<std::uint32_t>(ids_all.size());
     if (ids_all.size() < g_b) {
-      // Pad a short id file by repeating it: the numbers only have to be a valid
-      // token stream of the right length for a timing run, and a caller that
-      // wants exact ids passes a long enough file.
+      // Pad a short id file by repeating it: a timing run needs only a valid token stream of the right length.
       std::vector<std::uint32_t> grown;
       while (grown.size() < g_b) grown.insert(grown.end(), ids_all.begin(), ids_all.end());
       ids_all.swap(grown);
     }
     LoadDispatch(dir);
-    // Chunked prefill (emit_prefill_pp.py YAH_CTX=T): dispatch.txt row "ctx"
-    // records the chunk size (tokens column) and the context T (tt column). The
-    // command-line token count is T; every kernel runs at the chunk size, the
-    // KV cache holds T, and the T / chunk passes carry the DeltaNet and conv state.
-    // T_ctx is the context the set was emitted for (KV pool capacity); T_run, the
-    // tokens processed, may be any multiple of the chunk up to T_ctx (room left for
-    // decode after the prompt, YAH_GEN).
+    // Chunked prefill: dispatch.txt row "ctx" holds the chunk size (tokens) and the emitted context T_ctx (tt).
+    // Every kernel runs at the chunk size, the KV cache holds T_ctx, and the chunks carry the DeltaNet and conv state.
+    // T_run (the token count argument) is any multiple of the chunk up to T_ctx; the rest is room for YAH_GEN.
     std::uint32_t T_ctx = g_b;
     const std::uint32_t T_run = g_b;
     if (const auto it = g_geom.find("ctx"); it != g_geom.end()) {
@@ -319,21 +280,16 @@ int main(int argc, char** argv) {
     g_tt = g_b / g_gtile;
     const std::uint32_t B = g_b;
     const std::size_t kOutTotal = static_cast<std::size_t>(kHidden) * B;
-    // Only the full-attention layers own a KV slot, and the cache holds two runs
-    // of kFull slots -- k then v -- so slot i of layer ai is reached by indexing
-    // the run. The 5-token driver hardcoded 8 here and its kv16 had 32 slots by
-    // accident; at 16 full-attention layers a slot count of 8 is out of range.
+    // One KV slot per full-attention layer. The f16 cache holds kFull K slots, then kFull V slots.
     std::uint32_t kFull = 0;
     for (std::uint32_t l = 0; l < cfg.main_block_count(); ++l)
       if (cfg.IsFullAttention(l)) ++kFull;
     LoomDevice gpu;
-    // The layers queue ~950 dispatches and wait once at the end; the runtime
-    // wait would busy-poll a core for the whole prefill (LOOM_RUNTIME.md).
+    // The layers queue ~950 dispatches and wait once: the runtime wait would busy-poll a host core the whole time.
     gpu.SetSleepSync(200);
     std::fprintf(stderr, "loom_forward_pp: tokens=%u tile=%u token_tiles=%u layers=%u geometry=%zu hal(s)\n", B,
                  g_gtile, g_tt, cfg.main_block_count(), g_geom.size());
-    // Import the whole GGUF tensor-data region once: every tensor is an offset
-    // into it, instead of one hrx_allocator_import_buffer per dispatch.
+    // Import the whole GGUF tensor-data region once; every tensor is an offset into it.
     LoomBuffer weights;
     std::size_t weights_delta = 0;
     {
@@ -395,10 +351,8 @@ int main(int argc, char** argv) {
       gpu.H2D(ksigns_iq2xxs, v.data(), v.size());
     }
 
-    // Every activation buffer is token major: [token][row], with the row stride
-    // equal to the K extent of the GEMM that reads it (k_blocks*256). The KV
-    // cache is one slot per prompt token; the per-layer state buffers keep the
-    // 5-token layout because they are indexed by the layer, not by the prompt.
+    // Activations are token major, [token][row], with row stride = the K extent of the GEMM that reads them.
+    // The KV cache has one row per context token; the recurrent state buffers are per layer, not per token.
     const std::size_t kKvCache = static_cast<std::size_t>(T_ctx) * kKvRow;
     LoomBuffer hidden = gpu.Allocate(static_cast<std::size_t>(B) * kHidden * 4);
     LoomBuffer reszero = gpu.Allocate(static_cast<std::size_t>(B) * kHidden * 4);
@@ -418,9 +372,9 @@ int main(int argc, char** argv) {
     LoomBuffer ab = gpu.Allocate(static_cast<std::size_t>(B) * kTs * 2 * 4);
     LoomBuffer conv_state = gpu.Allocate(std::size_t{48} * kQkv * 4 * 4);
     LoomBuffer state = gpu.Allocate(std::size_t{48} * kTs * kState * kState * 4);
-    // f16 K/V cache: [K | V] x attention layers x context, or with a quantized
-    // KV cache ("kv16_scratch") one layer's current chunk, which RoPE writes
-    // (row cur - cache_start) and the quantizers read before the next layer.
+    // f16 K/V cache: [K | V] x attention layers x context.
+    // With "kv16_scratch" (paged or quantized KV) it holds one layer's current chunk only:
+    // RoPE writes it (row cur - cache_start) and the paged writers or quantizers read it before the next layer.
     const bool kv16_scratch = g_geom.count("kv16_scratch") != 0;
     const std::size_t kKv16Layer = kv16_scratch ? std::size_t{B} * kKvRow * 2 : kKvCache * 2;
     LoomBuffer kv16 = gpu.Allocate(kv16_scratch ? 2 * kKv16Layer : std::size_t{2} * kFull * kKvCache * 2);
@@ -430,13 +384,11 @@ int main(int argc, char** argv) {
     LoomBuffer eps = gpu.Allocate(4);
     LoomBuffer ffnup = gpu.Allocate(static_cast<std::size_t>(B) * kFfn * 2);
     LoomBuffer gateffn = gpu.Allocate(static_cast<std::size_t>(B) * kFfn * 4);
-    // Dense per-workgroup staging: the kernels stage a 16x16 weight tile per K
-    // step, not the full 16xK row.
+    // Per-workgroup weight staging: the kernels stage a 16x16 weight tile per K step, not the full 16xK row.
     LoomBuffer gwstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
     LoomBuffer uwstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
     LoomBuffer wstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
-    // ostage is the epilogue scratch. The compiler declares it over the whole
-    // [m_rows][tokens] tile, so it must cover the widest GEMM (17408 rows) at this token count.
+    // Epilogue scratch. The compiler declares it over the whole [m_rows][tokens] tile: size it for the widest GEMM.
     LoomBuffer ostage = gpu.Allocate(std::size_t{kFfn} * B * 4);
     LoomBuffer partial = gpu.Allocate(kOutTotal * 4);
     LoomBuffer hidden2 = gpu.Allocate(kOutTotal * 4);
@@ -481,7 +433,7 @@ int main(int argc, char** argv) {
     LoomExecutable& e_norm = load(dir + "/norm.hal");
     LoomExecutable& e_conv = load(dir + "/conv.hal");
     LoomExecutable& e_prepkq = load(dir + "/prepkq.hal");
-    // yah_ssm_conv_kq: the conv with prep_kq fused in, when the set has it
+    // Optional convkq.hal: the conv with yah_deltanet_prep_kq fused in.
     LoomExecutable* e_convkq = nullptr;
     {
       const std::string path = dir + "/convkq.hal";
@@ -499,22 +451,19 @@ int main(int argc, char** argv) {
       e_ropes.push_back(&load(dir + (c ? "/rope_c" + std::to_string(c) + ".hal" : std::string("/rope.hal"))));
       e_wmmas.push_back(&load(dir + (c ? "/wmma_c" + std::to_string(c) + ".hal" : std::string("/wmma.hal"))));
     }
-    // emitted for chunked sets; runs after every processed chunk, so the last one
-    // also leaves its final conv state (the decode handoff reads it)
+    // Chunked sets only. Runs after every chunk, so the last one leaves the final conv state for the decode handoff.
     LoomExecutable* e_convstate = T_ctx > g_b ? &load(dir + "/convstate.hal") : nullptr;
-    // tools/gen_attn_hip.py: a vtrans.hal row means the attention reads V as
-    // [kv head][16-key tile][dim][16] f16, written per layer by yah_transpose_v16.
-    // Paged K / V caches ("kv_paged"): 256-token pages; one page table per
-    // sequence (logical page -> physical page, shared by all layers) bound to
-    // attention and every cache writer. fp16 K / V go to paged pools through
-    // RoPE (paged K store) / yah_vtpage per chunk (no V^T re-transpose of the whole cache).
+    // Unpaged set with a "vtrans.hal" row: attention reads V as [kv head][16-key tile][dim][16] f16.
+    // yah_transpose_v16 writes that layout per layer.
+    // "kv_paged": 256-token pages, one page table per sequence (logical -> physical page, shared by all layers).
+    // The table is bound to attention and every cache writer. Per chunk, RoPE stores fp16 K and yah_vtpage fp16 V^T.
     const bool kv_paged = g_geom.count("kv_paged") != 0;
     const std::uint32_t kPages = (T_ctx + 255) / 256;
     LoomBuffer ptab = gpu.Allocate(std::size_t{kv_paged ? kPages : 1} * 4);
     if (kv_paged) {
       std::vector<std::int32_t> pages(kPages);
       for (std::uint32_t i = 0; i < kPages; ++i) pages[i] = static_cast<std::int32_t>(i);
-      // attention trusts the table (bounds assumed, not clamped): validate it here
+      // Attention does not clamp page table entries: validate them here.
       for (std::int32_t pg : pages)
         if (pg < 0 || pg >= static_cast<std::int32_t>(kPages)) throw LoomError("page table entry out of range");
       gpu.H2D(ptab, pages.data(), pages.size() * 4);
@@ -522,10 +471,9 @@ int main(int argc, char** argv) {
     LoomExecutable* e_vtrans = (!kv_paged && g_geom.count("vtrans.hal")) ? &load(dir + "/vtrans.hal") : nullptr;
     const std::size_t kVtBytes = std::size_t{(T_ctx + 15) / 16 * 16} * kKvRow * 2;
     LoomBuffer vt16 = gpu.Allocate(e_vtrans ? kVtBytes : 4);
-    // Quantized K (tools/gen_kvq.py, engine/run/kvq/README.md): "attn_kq8"
-    // int8 (kv8a16), "attn_kq4" H256 + asymmetric int4 (kv4a16, yah_kq4 in
-    // kq8.hal). Per attention layer: codes [T][1024 or 512 B], scales [T][8 or
-    // 32] dwords, and the channel mean of the first chunk (kept per layer).
+    // Quantized K (tools/gen_kvq.py, engine/run/kvq/README.md): "attn_kq8" int8 (kv8a16).
+    // "attn_kq4": H256 + asymmetric int4 (kv4a16); its kernel yah_kq4 is in kq8.hal.
+    // Per attention layer: codes [T][1024 or 512 B], scales [T][8 or 32] dwords, the channel mean of the first chunk.
     // The quantizers run per chunk on cache slices.
     const bool attn_kq4 = g_geom.count("attn_kq4") != 0;
     const bool attn_kq8 = g_geom.count("attn_kq8") != 0 || attn_kq4;
@@ -536,9 +484,8 @@ int main(int argc, char** argv) {
     LoomBuffer kq8buf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKqBytes : 4);
     LoomBuffer ksbuf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKsBytes : 4);
     LoomBuffer kmbuf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * 4096 : 4);
-    // Quantized V^T ("attn_vq8" bytes / "attn_vq4" nibbles per channel per
-    // 16-key tile): per layer [4][tiles][256] x 16 / 8 B + (S, C') x 4 B; one
-    // HAL per chunk (start_pos: vq8_c<i>.hal / vq4_c<i>.hal).
+    // Quantized V^T: "attn_vq8" bytes / "attn_vq4" nibbles per channel per 16-key tile.
+    // Per layer: [4][tiles][256] x 16 / 8 B of codes plus (S, C') x 4 B. One HAL per chunk (start_pos): vq8_c<i>.hal.
     const bool attn_vq4 = g_geom.count("attn_vq4") != 0;
     const bool attn_vq8 = g_geom.count("attn_vq8") != 0;
     const bool attn_vqt = attn_vq4 || attn_vq8;
@@ -550,10 +497,9 @@ int main(int argc, char** argv) {
     const std::size_t kVqBytes = attn_vq8 ? kVtBytes / 2 : kVtBytes / 4, kVqsBytes = kVtBytes / 8;
     LoomBuffer vqbuf = gpu.Allocate(attn_vqt ? std::size_t{kFull} * kVqBytes : 4);
     LoomBuffer vqsbuf = gpu.Allocate(attn_vqt ? std::size_t{kFull} * kVqsBytes : 4);
-    // paged fp16 pools (per layer: K rows / V^T tiles of the whole context) and
-    // the per-chunk paged writers
+    // Paged fp16 pools (per layer: K rows / V^T tiles of the whole context) and the per-chunk paged writers.
     const bool paged_f16k = kv_paged && !attn_kq8, paged_f16v = kv_paged && !attn_vqt;
-    // "rope_kpaged": RoPE writes the fp16 K rows straight into the paged pool
+    // "rope_kpaged": RoPE writes the fp16 K rows straight into the paged pool.
     const bool rope_kpaged = g_geom.count("rope_kpaged") != 0;
     if (paged_f16k && !rope_kpaged) throw LoomError("paged fp16 K needs a rope_kpaged HAL set (re-emit)");
     const std::size_t kPoolBytes = std::size_t{kPages} * 256 * kKvRow * 2;
@@ -572,27 +518,10 @@ int main(int argc, char** argv) {
     LoomExecutable& e_argmax = load(dir + "/argmax.hal");
     LoomExecutable& e_accum = load(dir + "/accum.hal");
 
-    // The norm writes the f16 activation into scratch at row stride dim, so
-    // every GEMM reading scratch has ktot == dim: 5120 for the FFN, 6144 for the
-    // attention output. That is why scratch is kFfn wide.
-    // The small per-layer weights (norms, conv1d, ssm_a/dt/norm) are bound as
-    // views into the single imported tensor region instead of being copied into
-    // freshly allocated device buffers.
-    //
-    // The old per-call allocation was deliberate, and the hazard it avoided is
-    // real: a SHARED buffer refilled here while the previous layer's dispatch is
-    // still queued corrupts the weight that dispatch bound, because
-    // hrx_synchronous_h2d is synchronous for the copy but not for the stream
-    // (sharing measured a wrong forward, argmax 14). Binding a view avoids that
-    // hazard entirely rather than reintroducing it: nothing is ever rewritten,
-    // because every tensor already owns a distinct immutable region of the one
-    // import -- exactly how run_kstore/run_swiglu and output.weight bind theirs.
-    //
-    // What the copy cost: ~8 allocations plus H2D transfers per layer. Each
-    // allocation runs the HSA map path, which waits by POLLING
-    // AMDKFD_IOC_WAIT_EVENTS (~1.1M polls per forward, 99.6% of all syscall
-    // time), and mapping memory while dispatches are in flight drains the queue
-    // every layer -- the ramp-then-decay in GPU utilisation.
+    // The norm writes the f16 activation into scratch at row stride dim: every GEMM that reads scratch has ktot == dim.
+    // Small per-layer weights (norms, conv1d, ssm_a/dt/norm) are views into the one weight import, never copies.
+    // Do not refill a shared device buffer here: hrx_synchronous_h2d does not wait for queued dispatches that bind it.
+    // Do not allocate per call either: each allocation polls AMDKFD_IOC_WAIT_EVENTS and drains the queue every layer.
     auto run_norm = [&](const std::string& wname) {
       const auto* tw = find(wname);
       const Imported w = ImportTensor(*tw);
@@ -628,13 +557,10 @@ int main(int argc, char** argv) {
       Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name)).c_str(), mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1,
                b);
     };
-    // The attention q projection with the q/gate unpack fused into its epilogue
-    // (gemm_kqg_*: rows = heads x [256 q | 256 gate] stored straight into q and
-    // gate, as yah_unpack_qg did). False if the set has no such HAL; the
-    // caller then runs kstore + unpack.
-    // The set's attention HAL stores f16 straight into the o-projection input
-    // (emitter marker "attn_f16out"): no yah_half_cast pass.
+    // "attn_f16out": the attention HAL stores f16 straight into the o-projection input, so no yah_half_cast pass.
     const bool attn_f16 = g_geom.count("attn_f16out") != 0;
+    // gemm_kqg_*: the attention q projection with the q/gate unpack fused in (rows = heads x [256 q | 256 gate]).
+    // Returns false if the set has no such HAL; the caller then runs kstore + yah_unpack_qg.
     auto run_kqg = [&](const std::string& wname) -> bool {
       const auto* tw = find(wname);
       Fmt f{};
@@ -696,10 +622,8 @@ int main(int argc, char** argv) {
       const std::uint32_t mt = static_cast<std::uint32_t>(tw->dims[1] / 16);
       const std::uint32_t kb = static_cast<std::uint32_t>(tw->dims[0] / f.qk);
       const Imported w = ImportTensor(*tw);
-      // Fused residual (gen_gemm_shared kind "kres"): the GEMM reads hidden and
-      // writes hidden + acc into hidden2 itself, so neither the partial buffer nor
-      // the yah_residual_1d pass is needed; the handles are swapped after.
-      // Taken whenever the HAL set carries one.
+      // Fused residual (gen_gemm_shared kind "kres"), if the set has it: the GEMM writes hidden + acc into hidden2.
+      // No partial buffer and no yah_residual_1d pass; the handles are swapped after.
       const std::string fused_hal =
           std::string("gemm_kres_") + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       if (g_geom.count(fused_hal)) {
@@ -722,8 +646,7 @@ int main(int argc, char** argv) {
         std::swap(hidden, hidden2);
         return;
       }
-      // Otherwise the chained kStore writes the token-major [B][m_rows] product
-      // into partial and yah_residual_1d adds it into the residual.
+      // Otherwise kStore writes the token-major [B][m_rows] product into partial and yah_residual_1d adds it.
       const std::string hal =
           std::string("gemm_kstore_") + f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
@@ -735,15 +658,14 @@ int main(int argc, char** argv) {
       if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
       if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs"))
         b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
-      // The activation is the caller's input (ffnup for ffn_down, scratch for attn_output / ssm_out), not scratch as in run_kstore.
+      // The activation is the caller's input: ffnup for ffn_down, scratch for attn_output / ssm_out.
       b.push_back({input.handle, 0, hb(input)});
       b.push_back({wstage.handle, 0, hb(wstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
       b.push_back({partial.handle, 0, hb(partial)});
       Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name)).c_str(), mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1,
                b);
-      // The sum lands in hidden2; swap the two handles instead of copying it back.
-      // Every consumer names the variable, so it follows the swap.
+      // The sum lands in hidden2: swap the handles instead of copying it back. Every consumer names the variable.
       std::vector<hrx_buffer_ref_t> r = {
           {hidden.handle, 0, hb(hidden)}, {partial.handle, 0, kOutTotal * 4}, {hidden2.handle, 0, hb(hidden2)}};
       Dispatch(gpu, e_accum, "yah_residual_1d", static_cast<std::uint32_t>(kOutTotal / 256), 1, 1, 256, 1, 1, r);
@@ -751,9 +673,8 @@ int main(int argc, char** argv) {
     };
     gpu.Synchronize();
     const auto t0 = std::chrono::steady_clock::now();
-    // YAH_LOGITS_FROM=P: f32 logits of every absolute position P..T-1 into
-    // <prefix>.all_logits ((T-P) x vocab, row-major) for the correctness gate
-    // (engine/run/accgate2.py), gathered after each chunk's layers.
+    // YAH_LOGITS_FROM=P: f32 logits of absolute positions P..T-1 into <prefix>.all_logits ((T-P) x vocab, row-major).
+    // For the correctness gate (engine/run/accgate2.py); gathered after each chunk's layers.
     std::uint32_t logits_from = T_run;
     if (const char* lf = std::getenv("YAH_LOGITS_FROM")) {
       logits_from = static_cast<std::uint32_t>(std::atoi(lf));
@@ -762,14 +683,11 @@ int main(int argc, char** argv) {
     const auto* head_onw = find("output_norm.weight");
     const auto* head_ow = find("output.weight");
     LoomBuffer every = gpu.Allocate(std::size_t{T_run - logits_from + (logits_from == T_run)} * kVocab * 4);
-    // YAH_ROWSTATS=<file>: compact per-position statistics for the quality gate
-    // (engine/run/kvq/gate2.py) instead of full logit rows. Positions: those
-    // >= YAH_ROWSTATS_FROM (default 1024) that are multiples of
-    // YAH_ROWSTATS_STRIDE (default 8), or the list in YAH_ROWSTATS_POS (one
-    // position per line). Record per position (little endian): int32 pos,
-    // int32 next-token id (-1 at the end), f32 logsumexp, f32 logit of the next
-    // token, int32 argmax, f32 top1, f32 top2, then 64 x (int32 id, f32 logit),
-    // highest first.
+    // YAH_ROWSTATS=<file>: compact per-position statistics for the quality gate (engine/run/kvq/gate2.py).
+    // Positions: YAH_ROWSTATS_FROM (default 1024) and every YAH_ROWSTATS_STRIDE-th (default 8) after it,
+    // or the list in YAH_ROWSTATS_POS (one position per line).
+    // Record per position (little endian): int32 pos, int32 next-token id (-1 at the end), f32 logsumexp,
+    // f32 logit of the next token, int32 argmax, f32 top1, f32 top2, then 64 x (int32 id, f32 logit), highest first.
     std::FILE* rowstats = nullptr;
     std::vector<char> rs_want(T_ctx, 0);
     if (const char* rf = std::getenv("YAH_ROWSTATS")) {
@@ -794,15 +712,13 @@ int main(int argc, char** argv) {
       rs_max = std::max(rs_max, n);
     }
     LoomBuffer rsbuf = gpu.Allocate(std::size_t{std::max<std::uint32_t>(rs_max, 1)} * kVocab * 4);
-    // YAH_KV_HOOK="<cmd>": a persistent child (sh -c cmd) that sees every
-    // chunk's freshly written f16 K and V rows of every attention layer and
-    // returns them (e.g. quantized-dequantized by a KV codec under study,
-    // engine/run/kvq/kvcodec.py). Protocol per (layer, chunk), little endian:
-    //   -> int32 magic 0x4b56484b, attn layer, chunk, first row, rows, cols (1024),
-    //      q_rows, then K rows x cols f16, V rows x cols f16, then q_rows x
-    //      (int32 abs position + 6144 f32 roped Q) (YAH_KV_HOOK_QSTRIDE=n sends
-    //      the rows whose position is a multiple of n; 0 = none)
+    // YAH_KV_HOOK="<cmd>": a persistent child (sh -c cmd) gets each chunk's new f16 K and V rows, per attention layer.
+    // It returns them, e.g. quantized-dequantized by a KV codec under study (engine/run/kvq/kvcodec.py).
+    // Protocol per (layer, chunk), little endian:
+    //   -> int32 magic 0x4b56484b, attn layer, chunk, first row, rows, cols (1024), q_rows,
+    //      then K rows x cols f16, V rows x cols f16, then q_rows x (int32 abs position + 6144 f32 roped Q)
     //   <- K rows x cols f16, V rows x cols f16 (written back into the cache)
+    // YAH_KV_HOOK_QSTRIDE=n sends the Q rows whose position is a multiple of n (0 = none).
     // A final header with rows = 0 tells the child to finish.
     FILE* hook_in = nullptr;
     FILE* hook_out = nullptr;
@@ -912,7 +828,6 @@ int main(int argc, char** argv) {
             Dispatch(gpu, e_rope, "yah_fused_qk_rope_batched", 28, B, 1, 256, 1, 1, b);
           }
           kv_hook(ai, ci, koff, voff);
-          // w_qn/w_kn are views into the import; nothing to keep alive.
           const std::size_t q8off = std::size_t{ai} * kKqBytes;
           const std::size_t ksoff = std::size_t{ai} * kKsBytes;
           const std::size_t kmoff = std::size_t{ai} * 4096;
@@ -968,22 +883,20 @@ int main(int argc, char** argv) {
             if (attn_kq8) b.push_back({ksbuf.handle, ksoff, kKsBytes});
             if (attn_vqt) b.push_back({vqsbuf.handle, vqsoff, kVqsBytes});
             if (kv_paged) b.push_back(ptab_ref);
-            // tools/gen_attn_heads.py runs H query heads of one GQA group per
-            // workgroup; dispatch.txt records H as the "wmma.hal" row group.
+            // dispatch.txt "wmma.hal" row: rowgrp = query heads of one GQA group per workgroup,
+            // tokens = query tokens per workgroup, tt = query-token tiles.
             const auto attn_geom = g_geom.find("wmma.hal");
             const std::uint32_t attn_hpw =
                 attn_geom != g_geom.end() && attn_geom->second.rowgrp ? attn_geom->second.rowgrp : 1;
             if (kHeads % attn_hpw) throw LoomError("wmma.hal heads per workgroup does not divide the heads");
-            // query tokens per workgroup: 16 (gen_attn_heads) or 32 (gen_attn_hip)
             const std::uint32_t attn_tpw =
                 attn_geom != g_geom.end() && attn_geom->second.tokens ? attn_geom->second.tokens : 16;
-            // The kernel's launch contract fixes its grid, and Loom drops bounds
-            // clamps it proves from it: extra workgroups read unmapped VA and hang
-            // the ring. Refuse a grid the emitter did not record.
+            // Loom drops bounds clamps it proves from the launch contract: extra workgroups read unmapped VA and hang.
+            // Refuse a grid the emitter did not record.
             if (attn_geom != g_geom.end() && attn_geom->second.tt &&
                 (B + attn_tpw - 1) / attn_tpw != attn_geom->second.tt)
               throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
-            // gen_attn_fa with GQA packing runs 12-wave workgroups ("attn_wg384")
+            // "attn_wg384": 12-wave workgroups (GQA packing).
             const std::uint32_t attn_wg = g_geom.count("attn_wg384") ? 384 : 256;
             Dispatch(gpu, e_wmma, "yah_attn_wmma", (B + attn_tpw - 1) / attn_tpw, kHeads / attn_hpw, 1, attn_wg, 1, 1,
                      b);
@@ -1026,7 +939,6 @@ int main(int argc, char** argv) {
                                                {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4}};
             Dispatch(gpu, *e_convstate, "yah_conv_state", (kQkv + 255) / 256, 1, 1, 256, 1, 1, b);
           }
-          // w_conv is a view into the import; nothing to keep alive.
           {
             std::vector<hrx_buffer_ref_t> b = {{conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)}};
             if (!e_convkq) Dispatch(gpu, e_prepkq, "yah_deltanet_prep_kq", kKh, B, 1, 32, 1, 1, b);
@@ -1039,26 +951,19 @@ int main(int argc, char** argv) {
                                                {qkv.handle, 0, hb(qkv)},
                                                {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
                                                {ab.handle, 0, hb(ab)}};
-            // The kernel's own grid is ceil((batch*num_heads + qkv_size)/256); it
-            // does two jobs over the same lane index -- the conv-history ring for
-            // i < qkv_size and alpha/beta for i < count -- so max() of the two is
-            // enough. The 5-token driver hardcoded 41, which silently covers only
-            // 10496 lanes: correct at 5..218 tokens, and at 2048 it would compute
-            // alpha/beta for 10496 of 98304 channels.
+            // One lane index does two jobs: the conv-history ring for i < qkv_size and alpha/beta for i < B * heads.
+            // So the grid covers max() of the two; a fixed grid silently skips alpha/beta channels at large B.
             const std::uint32_t prebab_tiles = (std::max<std::uint32_t>(B * kTs, kQkv) + 255u) / 256u;
             Dispatch(gpu, e_prepab, "yah_deltanet_prep_ab", prebab_tiles, 1, 1, 256, 1, 1, b);
           }
-          // w_a/w_dt are views into the import; nothing to keep alive.
           {
             std::vector<hrx_buffer_ref_t> b = {{conv_out.handle, 0, hb(conv_out)},
                                                {kqbuf.handle, 0, hb(kqbuf)},
                                                {ab.handle, 0, hb(ab)},
                                                {state.handle, st_off, std::size_t{kTs} * kState * kState * 4},
                                                {raw.handle, 0, hb(raw)}};
-            // tools/gen_deltanet_hip.py (HIP's row-split order) runs (2, heads)
-            // workgroups of 256; dispatch.txt says so with a "rowsplit.hal" row whose
-            // row-group field is the blocks per head. Without it: the regtile
-            // kernel's (heads) x 128.
+            // DeltaNet grid: (blocks per head, heads) x 256, blocks per head from the "rowsplit.hal" row group.
+            // Without that row: (heads) x 128.
             const auto dn_geom = g_geom.find("rowsplit.hal");
             if (dn_geom != g_geom.end() && dn_geom->second.rowgrp)
               Dispatch(gpu, e_rowsplit, "yah_deltanet", dn_geom->second.rowgrp, kTs, 1, 256, 1, 1, b);
@@ -1072,7 +977,6 @@ int main(int argc, char** argv) {
                                                {scratch.handle, 0, hb(scratch)}};
             Dispatch(gpu, e_postnorm, "yah_ssm_postnorm_fp16", 6 * B, 1, 1, 256, 1, 1, b);
           }
-          // w_sn is a view into the import; nothing to keep alive.
           run_residual(pre + "ssm_out.weight", scratch);
         }
         run_norm(pre + "post_attention_norm.weight");
@@ -1204,9 +1108,8 @@ int main(int argc, char** argv) {
       std::fclose(fl);
       std::printf("argmax=%u\n", tok);
 
-      // YAH_GEN=N with YAH_DECODE_HAL=<emit_decode set, ctx = this set's context>:
-      // N greedy tokens (the prefill's argmax first) by the GEMV decoder on this
-      // prefill's paged KV pools, page table, conv and DeltaNet state.
+      // YAH_GEN=N, YAH_DECODE_HAL=<emit_decode.py set, same context>: N greedy tokens, the prefill's argmax first.
+      // The GEMV decoder runs on this prefill's paged KV pools, page table, conv and DeltaNet state.
       if (const char* gv = std::getenv("YAH_GEN"); gv && std::atoi(gv) > 0) {
         const std::uint32_t ngen = static_cast<std::uint32_t>(std::atoi(gv));
         const char* ddir = std::getenv("YAH_DECODE_HAL");
@@ -1217,7 +1120,7 @@ int main(int argc, char** argv) {
         if (dec.context() != kPages * 256)
           throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) + " != prefill pool rows " +
                           std::to_string(kPages * 256));
-        // the decode set's KV format must be this prefill's (fp16, or kv8a16 / kv4a16)
+        // The decode set's KV format must be this prefill's (fp16, kv8a16 or kv4a16).
         const std::uint32_t kbits = attn_kq4 ? 4 : attn_kq8 ? 8 : 16, vbits = attn_vq4 ? 4 : attn_vq8 ? 8 : 16;
         if (dec.kv_bits() != std::make_pair(kbits, vbits))
           throw LoomError("YAH_GEN: decode set KV bits " + std::to_string(dec.kv_bits().first) + "/" +
@@ -1255,10 +1158,7 @@ int main(int argc, char** argv) {
                       T_run);
       }
 
-      // YAH_LOGITS_FROM=P: f32 logits of every position P..B-1 into
-      // <prefix>.all_logits ((B-P) x vocab, row-major) for the tiered
-      // correctness gate (engine/run/accgate2.py). The same head kernels as the
-      // last-token path, one row at a time into one device buffer.
+      // Write the YAH_LOGITS_FROM rows gathered after each chunk.
       if (logits_from < T_run) {
         const std::size_t rows = T_run - logits_from;
         gpu.Synchronize();

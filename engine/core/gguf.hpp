@@ -66,8 +66,7 @@ struct MetadataValue {
   std::vector<MetadataValue> array;
 };
 
-// A read-only, mmapped GGUF file. The weight bytes are never copied: Data()
-// returns a pointer straight into the mapping.
+// A read-only, mmapped GGUF file. Weight bytes are not copied: Data() points into the mapping.
 class Gguf {
  public:
   static Gguf Open(const std::string& path);
@@ -83,9 +82,8 @@ class Gguf {
   [[nodiscard]] const MetadataValue* Meta(const std::string& key) const;
   [[nodiscard]] std::size_t file_size() const { return size_; }
   [[nodiscard]] std::size_t tensor_data_offset() const { return data_offset_; }
-  // The contiguous tensor-data region the whole tensor table addresses. A
-  // device backend registers a copy of exactly this region and rebases every
-  // TensorRef by the pointer delta.
+  // The contiguous tensor-data region that the whole tensor table addresses.
+  // A device backend copies exactly this region and rebases every TensorRef by the pointer delta.
   [[nodiscard]] const std::uint8_t* tensor_data_base() const { return base_ + data_offset_; }
   [[nodiscard]] std::size_t tensor_data_size() const { return size_ - data_offset_; }
   [[nodiscard]] std::size_t metadata_count() const { return meta_.size(); }

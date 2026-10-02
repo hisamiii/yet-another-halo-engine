@@ -20,9 +20,7 @@ int HexCharToInt(char c) noexcept {
   return -1;
 }
 
-// GPT-2 byte-level alphabet: every byte maps to a printable codepoint so the
-// vocabulary can be stored as text. Bytes outside the printable ranges become
-// U+0100 + n in order.
+// GPT-2 byte-level alphabet: every byte maps to a printable codepoint, so the vocabulary can be stored as text.
 std::string Utf8FromCodepoint(int cp) {
   std::string out;
   out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
@@ -34,8 +32,7 @@ std::string ByteToGpt2Utf8(std::uint8_t b) {
   static const auto table = []() {
     std::array<std::string, 256> map;
     for (int i = '!'; i <= '~'; ++i) map[i] = std::string(1, static_cast<char>(i));
-    // The three printable ranges map to their own codepoint; every other byte
-    // maps to U+0100 + its index within the gap list, in order.
+    // The three printable ranges map to themselves; every other byte maps to U+0100 + its index in the gap list.
     for (int i = 161; i <= 172; ++i) map[i] = Utf8FromCodepoint(i);
     for (int i = 174; i <= 255; ++i) map[i] = Utf8FromCodepoint(i);
     int n = 0;
@@ -270,9 +267,8 @@ Tokenizer Tokenizer::FromGguf(const Gguf& gguf, const TokenizerConfig& config) {
     }
   }
 
-  // Special tokens are the CONTROL (3) and USER_DEFINED (4) entries of the
-  // GGUF token type array. bos/eos are added regardless so the scanner can emit
-  // them even if a shard marks them differently.
+  // Special tokens are the CONTROL (3) and USER_DEFINED (4) entries of the GGUF token type array.
+  // bos/eos are always added, so the scanner can emit them even if a shard marks them differently.
   if (config.token_types != nullptr) {
     const auto& types = *config.token_types;
     for (std::size_t i = 0; i < types.size() && i < tokenizer.id_to_token_.size(); ++i) {

@@ -1,17 +1,15 @@
-// hal_run: dispatch one HAL once with bindings built from GGUF tensors and files,
-// then write the output bindings to files. A correctness harness for generated
-// kernels (gen_gemv.py's decode GEMVs first) against an external numpy oracle.
+// hal_run: dispatches one HAL once with bindings from GGUF tensors and files, then writes the output bindings to files.
+// A correctness harness for generated kernels (e.g. gen_gemv.py decode GEMVs) against an external numpy oracle.
 //
 // usage: hal_run <model.gguf> <hal> <gx[,gy]> <wg_size> <min_sizes> <binding>...
-//   min_sizes  comma-separated byte sizes, one per binding: the kernel's declared
-//              footprint (gen_gemv.footprint). Every binding must be at least
-//              this large or nothing is dispatched (exit 3): on this target a
-//              read past an allocation does not fault, it hangs the GPU.
+//   min_sizes  comma-separated byte sizes, one per binding: the kernel's declared footprint (gen_gemv.footprint).
+//              A smaller binding stops the run before dispatch (exit 3): a read past an allocation hangs this GPU.
 //   binding    t:<tensor>          a GGUF tensor, bound in place (exact bytes)
 //              f:<file>            a device buffer initialized from the file
-//              o:<bytes>:<file>    a zeroed device buffer, written to <file> after
-//              io:<in>:<out>       initialized from <in>, written to <out> after
+//              o:<bytes>:<file>    a zeroed device buffer, written to <file> after the run
+//              io:<in>:<out>       initialized from <in>, written to <out> after the run
 //              z:<bytes>           an uninitialized device buffer, not read back
+//   env        HAL_RUN_TIME1=1 times the first dispatch; HAL_RUN_ITERS=N times N more dispatches.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -120,15 +118,14 @@ int main(int argc, char** argv) {
     const auto t_first = std::chrono::steady_clock::now();
     gpu.Dispatch(exe, 0, cfg, nullptr, 0, refs.data(), refs.size());
     gpu.Synchronize();
-    if (std::getenv("HAL_RUN_TIME1"))  // the first dispatch alone (stateful kernels)
+    if (std::getenv("HAL_RUN_TIME1"))  // the first dispatch alone, for stateful kernels
       std::printf("hal_run: first dispatch %.4f ms\n",
                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_first).count());
-    // HAL_RUN_ITERS=N: then time N back-to-back dispatches (outputs are from the
-    // first, untimed one only when the kernel is idempotent; resid is not).
+    // HAL_RUN_ITERS=N: time N more back-to-back dispatches.
+    // The outputs then equal the first dispatch's only if the kernel is idempotent (resid is not).
     if (const char* it = std::getenv("HAL_RUN_ITERS")) {
       const int iters = std::atoi(it);
-      // host wall clock around the loop and the final wait: HRX event pairs
-      // recorded around plain dispatches measured ~0.6 us for a 47 MB read
+      // Host wall clock around the loop and the final wait: HRX event pairs around plain dispatches read near zero.
       const auto t0 = std::chrono::steady_clock::now();
       for (int i = 0; i < iters; ++i) gpu.Dispatch(exe, 0, cfg, nullptr, 0, refs.data(), refs.size());
       gpu.Synchronize();
@@ -137,7 +134,7 @@ int main(int argc, char** argv) {
     }
     for (const auto& [idx, file] : outs) {
       std::vector<char> host(refs[idx].length);
-      // owned buffers only: find which owned buffer backs this ref
+      // Outputs are always owned buffers: find the one that backs this ref.
       for (auto& b : owned) {
         if (b.handle == refs[idx].buffer) {
           gpu.D2H(b, host.data(), host.size());

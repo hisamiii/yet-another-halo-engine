@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# GPU generation gate: 20 greedy tokens from a fixed prompt must equal the
-# recorded reference, token for token. Runs on the HRX-native runner (no HIP).
+# GPU generation gate: 20 greedy tokens from a fixed prompt must equal the recorded reference, token for token.
 #
 # Usage: generate_gate.sh <model.gguf> [hal-dir]
 set -euo pipefail

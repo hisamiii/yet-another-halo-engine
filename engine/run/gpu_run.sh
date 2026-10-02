@@ -4,18 +4,10 @@
 # usage: gpu_run.sh <tag> -- <command...>
 #   env: YAH_GPU_LOG_DIR   where to write the log (default /home/q/yah-scratch)
 #
-# A bad dispatch on this target does not fail in-process. An access past an
-# allocation reaches unmapped VA and the shader hangs with NO page fault, so
-# there is nothing for the driver to report to the process: gfx_0.1.0 times out,
-# MES stops answering msg=RESET, the GPU reset fails, and the machine goes down.
-# The process prints nothing and the console is gone, so the kernel log is the
-# only record of what happened. On 2026-09-29 that cost a reboot and the crash
-# was only recoverable after the fact with `journalctl -k -b -1`.
-#
-# So: snapshot the log before, tail it into the same file for the duration (a
-# follower is flushed as it writes, unlike an after-the-fact dump), snapshot
-# again after, and always print where the log went. On a fresh boot the previous
-# boot's log is still in the journal:
+# A bad dispatch on this target does not fail in-process: an access past an allocation hangs with no page fault.
+# Then gfx_0.1.0 times out, MES stops answering msg=RESET, the GPU reset fails and the machine goes down.
+# The kernel log is the only record: snapshot it before, follow it during the run (flushed as it writes), snapshot after.
+# After a reboot, the previous boot's log is still in the journal:
 #   doas journalctl -k -b -1 --no-pager | grep -iE 'amdgpu|timeout|reset|MES'
 set -uo pipefail
 
@@ -26,12 +18,8 @@ if [ "$#" -lt 3 ] || [ "$2" != "--" ]; then
 fi
 TAG="$1"; shift 2
 
-# Refuse a driver binary older than its source. On 2026-09-30 an edit to
-# loom_forward_pp.cc was "built" with cmake --build, which does not build this
-# target (engine/build_hrx.sh does), and printed nothing. The 18:06 binary then
-# launched a new attention HAL on the old 16-token grid: twice the workgroups the
-# kernel's launch contract declares. Loom had used that contract to drop its
-# token clamps, so the extra workgroups read ~48 MiB past q/gate, and the ring hung.
+# Refuse a driver binary older than its source: cmake --build does not build these, engine/build_hrx.sh does.
+# A stale driver can launch a new HAL on an old grid; Loom drops clamps for the compiled grid, so it reads out of bounds.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 for pair in "loom_forward_pp:engine/run/loom_forward_pp.cc" "hal_bench:engine/run/hal_bench.cc"; do
   bin="${pair%%:*}"; src="$ROOT/${pair#*:}"
@@ -80,8 +68,7 @@ $DMESG >> "$LOG" 2>&1
 rm -f "$LOGDIR/.dmesg-w-${STAMP}.log"
 
 echo "gpu_run: exit=$RC log=$LOG"
-# only lines logged during the run (the follower section): the before/after
-# snapshots repeat the whole boot's history, old warnings included
+# Scan only the follower section: the before/after snapshots repeat the whole boot's history, old warnings included.
 DURING="$(sed -n '/^### --- dmesg follower ---/,/^### --- dmesg after ---/p' "$LOG")"
 FAULT="$(grep -icE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' <<<"$DURING" || true)"
 if [ "$FAULT" != "0" ]; then

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds engine/build/loomhip: runs a Loom hsaco through HIP so rocprofv3 (PMC, occupancy, ATT) can see it. HRX dispatches are invisible to rocprofv3.
+# Builds engine/build/loomhip, which runs a Loom hsaco through HIP so rocprofv3 (PMC, occupancy, ATT) can see it.
+# rocprofv3 does not see HRX dispatches.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$root/engine/build"

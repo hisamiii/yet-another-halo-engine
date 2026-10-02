@@ -126,23 +126,17 @@ struct LoomExecutable {
     }
     return 0;
   }
-  // The workgroup size this export was compiled with, or 0 when the metadata
-  // does not carry it. Callers used to hardcode this (32 at every GEMM site),
-  // which is wrong for any kernel declared with a different workgroup size: a
-  // wave64 kernel launched with 32 threads runs half a wavegroup, so it both
-  // computes the wrong tile and looks fast.
+  // The workgroup size this export was compiled with, or 0 if the metadata does not carry it.
+  // Do not hardcode it: a wave64 kernel launched with 32 threads computes a wrong tile and looks fast.
   [[nodiscard]] uint32_t WorkgroupSize(uint32_t ordinal) const {
     if (ordinal < infos.size() && infos[ordinal].workgroup_size[0] != 0) {
       return infos[ordinal].workgroup_size[0];
     }
     return 0;
   }
-  // How many buffers this export's dispatch binds. The GEMM family is not
-  // uniform: the IQ grid/signs formats take (weight, grid, [ksigns], input,
-  // wstage, ostage, out) -- 7 for iq3xxs/iq2xxs/iq2xs, 6 for iq3s -- while
-  // every other format takes just (weight, input, wstage, ostage, out) = 5.
-  // A caller that hardcodes 6 rejects the whole non-grid family with
-  // "dispatch binding count mismatch; expected 5 but got 6".
+  // How many buffers this export's dispatch binds. The GEMM family is not uniform:
+  // IQ grid formats bind (weight, grid, [ksigns], input, wstage, ostage, out): 7 for iq3xxs/iq2xxs/iq2xs, 6 for iq3s.
+  // Every other format binds (weight, input, wstage, ostage, out) = 5.
   [[nodiscard]] uint32_t BindingCount(uint32_t ordinal) const {
     if (ordinal < infos.size()) return infos[ordinal].binding_count;
     return 0;
@@ -164,11 +158,8 @@ class LoomDevice {
   LoomDevice& operator=(const LoomDevice&) = delete;
   ~LoomDevice() {
     if (stream_) hrx_stream_release(stream_);
-    // device_ is borrowed: hrx_gpu_device_get does not retain it, so releasing
-    // it here drops the runtime's own reference and clears the device before
-    // hrx_gpu_shutdown runs. That silently skipped the device profiling end:
-    // with HRX_PROFILE_FILE set, the profile had a session_begin and nothing
-    // else (no dispatch events, no session_end). hrx_gpu_shutdown releases it.
+    // device_ is borrowed (hrx_gpu_device_get does not retain it); hrx_gpu_shutdown releases it.
+    // Do not release it here: that clears the device early and HRX_PROFILE_FILE gets no dispatch events or session_end.
     if (initialized_) hrx_gpu_shutdown();
   }
 
@@ -200,8 +191,8 @@ class LoomDevice {
     return buffer;
   }
 
-  // Import an external host pointer (e.g. a GGUF mmap window) as an HRX
-  // buffer. The caller must keep the mapping alive while the buffer is used.
+  // Import an external host pointer (e.g. a GGUF mmap window) as an HRX buffer.
+  // The caller must keep the mapping alive while the buffer is in use.
   [[nodiscard]] LoomBuffer Import(void* host_ptr, size_t bytes) {
     LoomBuffer buffer;
     buffer.size = bytes;
@@ -241,16 +232,13 @@ class LoomDevice {
   // The next Dispatch may overlap the one after it (no trailing ordering barrier). Needs the local libhrx flag
   // HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER (bit 2, not upstream); on stock HRX dispatches stay ordered.
   void NoBarrierNext() { next_flags_ = 1u << 2; }
-  // Sleep-poll synchronize: with N > 0 the wait polls an event recorded at
-  // the stream tail and sleeps N us between checks, instead of the runtime's
-  // blocking wait, which busy-polls a host core for the whole wait (ROCr). A
-  // driver that queues a long run before one wait (the prefill) opts in.
-  // Off by default: probes time single short waits, where N us of slack shows.
+  // Sleep-poll synchronize: with us > 0, poll an event at the stream tail and sleep us between checks.
+  // The runtime's blocking wait busy-polls a host core (ROCr); a long queued run (the prefill) opts in.
+  // Off by default: on short single waits the sleep slack shows in the timing.
   void SetSleepSync(long us) { sleep_us_ = us; }
   void Synchronize() {
     if (sleep_us_ > 0) {
-      // hrx_stream_query reports complete while the stream timepoint is 0, which
-      // it is for plain dispatches: poll an event recorded at the tail instead.
+      // hrx_stream_query reports complete while the stream timepoint is 0 (true for plain dispatches): poll an event.
       LoomEvent tail;
       LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_NONE, &tail.handle), "hrx_event_create");
       LoomCheck(hrx_event_record(tail.handle, stream_), "hrx_event_record");

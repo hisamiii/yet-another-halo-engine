@@ -2,13 +2,11 @@
 //
 // usage: loom_decode <model.gguf> <hal_dir> --ids "1 2 3" [--gen N] [--logits FILE]
 //
-// The prompt goes through the decode path one token at a time (positions 0..n-1),
-// then N tokens are generated greedily. HAL set: tools/emit_decode.py. Steps are
-// enqueued back to back; the host waits after the prompt (to time generation alone)
-// and at the end, or after every step with --logits / YAH_DEC_TRACE.
+// The prompt goes through the decode path one token at a time (positions 0..n-1), then N tokens are generated greedily.
+// HAL set: tools/emit_decode.py. Steps queue back to back.
+// The host waits after the prompt (to time generation alone) and at the end; --logits / YAH_DEC_TRACE wait every step.
 // --logits FILE appends every step's 248320 logits (f32) for an external KL gate.
-// For decode after a Loom prefill (its KV pools and recurrent state), see
-// loom_forward_pp with YAH_GEN.
+// For decode after a Loom prefill, see loom_forward_pp with YAH_GEN.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -105,7 +103,7 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i < step_ms.size(); ++i)
         std::fprintf(stderr, "%.1f%s", step_ms[i], i + 1 == step_ms.size() ? "\n" : " ");
     }
-    // decode rate over the generation steps (positions n .. steps - 1)
+    // Decode rate over the generation steps (positions n .. steps - 1).
     const std::uint32_t dn = steps - n;
     if (dn) std::fprintf(stderr, "decode_ms=%.2f decode_tok_s=%.2f\n", gen_ms / dn, 1000.0 * dn / gen_ms);
     std::printf("generated_ids=");

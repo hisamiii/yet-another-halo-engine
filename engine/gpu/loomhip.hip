@@ -1,14 +1,11 @@
-// loomhip: launch a Loom-compiled kernel (hsaco from loom-compile) through the
-// HIP runtime, so rocprofv3 (kernel trace, PMC incl. occupancy, ATT per-wave)
-// can profile Loom code with the same tools as the HIP reference kernels.
-// rocprofv3 cannot see dispatches made through HRX.
+// loomhip: launches a Loom-compiled kernel (hsaco from loom-compile) through the HIP runtime.
+// So rocprofv3 (kernel trace, PMC incl. occupancy, per-wave ATT) can profile Loom code; it cannot see HRX dispatches.
 //
 // usage: loomhip <hsaco> <kernel> <gx> <gy> <block_x> <iters> <buf>...
 //   buf: f:<path>            device buffer initialised from a raw file
 //        z:<bytes>           zero-filled device buffer
 //        o:<bytes>:<path>    zero-filled, written to <path> after the first launch
-// Kernel arguments are the buffers' device pointers, in order (Loom's ABI for
-// kernels without scalar arguments: 8 bytes per binding).
+// Kernel arguments are the buffers' device pointers, in order (Loom ABI without scalar arguments: 8 bytes per binding).
 #include <hip/hip_runtime.h>
 
 #include <chrono>
@@ -43,9 +40,8 @@ static std::vector<char> ReadFile(const std::string& path) {
   return v;
 }
 
-// The kernel descriptor's kernarg_size (amd_kernel_code_t-style .kd symbol:
-// group_segment u32 @0, private_segment u32 @4, kernarg_size u32 @8), read
-// straight from the ELF. Returns -1 if the symbol is missing.
+// Reads kernarg_size from the kernel descriptor (.kd symbol) in the ELF; -1 if the symbol is missing.
+// .kd layout: group_segment u32 @0, private_segment u32 @4, kernarg_size u32 @8.
 static long KernargSize(const std::vector<char>& elf, const std::string& kernel) {
   auto u16 = [&](size_t o) {
     uint16_t v;
@@ -95,11 +91,8 @@ int main(int argc, char** argv) {
   const unsigned gx = std::atoi(argv[3]), gy = std::atoi(argv[4]), bx = std::atoi(argv[5]);
   const int iters = std::atoi(argv[6]);
 
-  // Refuse a launch whose buffer count does not match the kernel's argument
-  // block. On 2026-10-01 an IQ3_S kernel (6 bindings, kernarg_size 48) was
-  // launched with 5 buffers: it read its sixth pointer past the 40 given bytes,
-  // stored through it, and hung the GPU (ring timeouts, GPU reset) -- on this
-  // target a wild access hangs instead of faulting.
+  // Refuse a launch whose buffer count does not match the kernel's argument block.
+  // With a missing buffer the kernel reads a garbage pointer past the given bytes; a wild access hangs this GPU.
   const long kas = KernargSize(ReadFile(hsaco), kernel);
   const long given = static_cast<long>(argc - 7) * 8;
   if (kas < 0) {
@@ -159,7 +152,7 @@ int main(int argc, char** argv) {
     std::fwrite(h.data(), 1, h.size(), f);
     std::fclose(f);
   }
-  // wall clock around a device sync (hipEvent timing on the null stream read 0)
+  // Wall clock around a device sync: hipEvent timing on the null stream reads 0.
   CHECK(hipDeviceSynchronize());
   auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < iters; ++i) launch();

@@ -96,9 +96,8 @@ Qwen35Config Qwen35Config::FromGguf(const Gguf& gguf) {
 }
 
 TokenizerConfig TokenizerConfig::FromGguf(const Gguf& gguf) {
-  // Only the model name and the two special ids are assumed present. The other
-  // shard on this machine omits add_bos_token entirely, so every other key
-  // falls back rather than failing the load.
+  // Only the model name and the two special ids are required; some shards omit add_bos_token.
+  // Every other key falls back to a default instead of failing the load.
   TokenizerConfig tokenizer;
   tokenizer.model = Str(gguf, "tokenizer.ggml.model");
   tokenizer.pre = StrOr(gguf, "tokenizer.ggml.pre", "");

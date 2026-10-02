@@ -25,10 +25,8 @@ struct TokenizerOptions {
   bool parse_special_tokens{true};
 };
 
-// Byte-level BPE for Qwen3.8, matching the HF tokenizer. The "qwen35"
-// pre-tokenizer is a Unicode split with contractions, so it needs ICU for the
-// general-category predicates and for NFC. Ported from the reference engine,
-// which validates it against HF golden token hashes.
+// Byte-level BPE for Qwen3.8 that matches the HF tokenizer.
+// The "qwen35" pre-tokenizer is a Unicode split with contractions, so it needs ICU for general categories and NFC.
 class Tokenizer {
  public:
   static Tokenizer FromGguf(const Gguf& gguf, const TokenizerConfig& config);
