@@ -2061,6 +2061,15 @@ What mattered, in order (each measured on the full decode):
   input; stress-tested over 51 back-to-back dispatches): neutral, 61.30 vs
   61.18 ms. 128 fewer dispatches (gaps 3.20 -> 2.76 ms) but each call grows
   ~5 us by the serial norm tail. Off by default (`YAH_DEC_RESNORM=1`).
+- **DeltaNet:** state loads hoisted above the q / k norm phase (61.2 -> 60.87 ms)
+  and the decode conv fused in (`deltanet_conv`, 60.87 -> 60.59): lanes 0..127
+  convolve their q / k / v channels; the conv state ping-pongs between two
+  buffers per token, so the three value heads sharing a key head never read a
+  half-updated state. Bit-identical to the separate conv + DeltaNet.
+- No gain, measured: SwiGLU rows / waves per workgroup (1x4 .. 2x8, all within
+  0.2 ms: geometry is not the limit), an LDS sign-mask table in place of the
+  quarter-rate v_mul_lo_u32 (67 -> 7 per kernel, neutral: not VALU-bound after
+  word decode), index.assume in place of load clamps (-4% VALU, neutral).
 - Profiling: `HRX_PROFILE_MODE=dispatch` (timestamps only) costs ~1%;
   counters mode inflates dispatch gaps ~4x. A kernel right after a no-barrier
   group shows the group's tail in its own duration.

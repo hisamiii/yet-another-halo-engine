@@ -12,7 +12,8 @@ usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, m
                                  ffn_gate + ffn_up
   dattn_{kvappend,part,reduce}   tools/gen_decode_attn.py: attention over the paged
                                  fp16 KV pools (the prefill's YAH_KV_PAGED layout)
-  rmsnorm, deltanet              tools/gen_decode_misc.py (the ports' math, 512 lanes)
+  rmsnorm, deltanet[_conv]       tools/gen_decode_misc.py (the ports' math, 512 lanes;
+                                 deltanet_conv also runs the decode conv, the default)
   unpack, rope, ssmconv, argmax: the ported HIP decode kernels.
                                  rope's own cache write goes to a one-row dummy
                                  (max_context=1); dattn_kvappend writes the pools.
@@ -34,6 +35,12 @@ import gen_decode_misc as DM  # noqa: E402
 import gen_gemv as GV  # noqa: E402
 
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
+# YAH_GV_RW="swiglu:1,8;resid:2,4": rows per wave R and waves per workgroup W per GEMV kind
+# (plain, resid, resid_norm, swiglu, bands); default 2,4. Recorded in decode.txt ("rw kind R W").
+RW = {k: (2, 4) for k in ("plain", "resid", "resid_norm", "swiglu", "bands")}
+for item in filter(None, os.environ.get("YAH_GV_RW", "").split(";")):
+    k, v = item.split(":")
+    RW[k] = tuple(int(x) for x in v.split(","))
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):
@@ -119,10 +126,13 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     gs = gemv_set(model)
     for name, (kind, fmts, M, K) in sorted(gs.items()):
-        emit_src(GV.gen(kind, fmts, M, K), name, outdir)
+        R, W = RW[kind]
+        if M % (R * W):   # small outputs (48 rows) keep the default geometry
+            R, W = 2, 4
+        emit_src(GV.gen(kind, fmts, M, K, R, W), name, outdir)
     bs = bands_set(model)
     for name, (fmts, Ms, K) in sorted(bs.items()):
-        emit_src(GV.gen_bands(fmts, Ms, K), name, outdir)
+        emit_src(GV.gen_bands(fmts, Ms, K, *RW["bands"]), name, outdir)
     for which in ("kvappend", "part", "reduce"):
         emit_src(DA.gen(which, T), "dattn_" + which, outdir)
     L = lambda f: os.path.join(LOOM, f)
@@ -138,12 +148,14 @@ def main():
         "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
     emit_file(L("yah_ssm_conv_decode_f32.loom"), "ssmconv", outdir,
               ["yah_ssm_conv_decode.qkv_dim=10240", "yah_ssm_conv_decode.rows=1"])
-    emit_src(DM.gen_deltanet(), "deltanet", outdir)
+    emit_src(DM.gen_deltanet(hoist=True), "deltanet", outdir)
+    emit_src(DM.gen_deltanet(fuse=True, hoist=True), "deltanet_conv", outdir)   # + the decode conv
     emit_src(DM.gen_embed_iq4xs(), "embed", outdir)      # token_embd row from the device token stream        # 512 lanes per head (the port: one wave)
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
-    open(os.path.join(outdir, "decode.txt"), "w").write("ctx %d\n" % T)
+    open(os.path.join(outdir, "decode.txt"), "w").write(
+        "ctx %d\n" % T + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + 10 decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))
 

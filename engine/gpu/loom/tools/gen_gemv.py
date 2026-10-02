@@ -57,6 +57,19 @@ ABL = os.environ.get("YAH_GV_ABL", "")
 # Full decode, one round each (2026-10-02, word decode): no pipeline 68.2 ms/token,
 # depth 2 63.1, depth 3 66.1, depth 4 67.8, depth 2 + unroll 2 63.5, unroll 2 70.2.
 PIPE = int(os.environ.get("YAH_GV_PIPE", "2"))
+# YAH_GV_ASSUME=1: in-range offsets are promised with index.assume (no VALU) instead of
+# being clamped with index.max / index.min (2 VALU per load). Every offset is in range by
+# construction (rows < M, blocks < K / qk, grid indices < 512, ksigns < 128); gemv_check
+# covers every (format, K) and kind.
+ASSUME = os.environ.get("YAH_GV_ASSUME", "0") == "1"
+# YAH_GV_SMASK_LDS=1: sign masks (4 sign bits -> 4 bytes of 0x00 / 0xFF) from a 16-entry
+# i32 table in LDS (HIP's kDeviceIq3sSignMask) instead of two v_mul_lo_u32 (quarter rate).
+# Full decode, one round each (2026-10-02): base 61.25, table 61.69, table + ASSUME 61.47
+# ms/token -- neutral: the v_mul_lo_u32 (67 -> 7) were not the limit, the GEMVs are not
+# VALU-bound after word decode. Off by default; kept as switches.
+SMASK_LDS = os.environ.get("YAH_GV_SMASK_LDS", "0") == "1"
+def _s32(v):
+    return v - (1 << 32) if v >= (1 << 31) else v
 UNROLL = int(os.environ.get("YAH_GV_UNROLL", "0"))
 # YAH_GV_WORD=1: decode on 32-bit words (vector<4xi32>) to unsigned byte codes plus a
 # bias folded into the offset, converted with uitofp. The byte-vector form
@@ -305,8 +318,11 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             else:
                 b(f"    %{p}{nm} = vector.from_elements " + ", ".join([f"%{p}{nm}x"] * n) + f" : vector<{n}xi32>")
             return f"%{p}{nm}"
-        b(f"    %{p}{nm}z = index.max {off}, {e.ci(0)} : index")
-        b(f"    %{p}{nm}c = index.min %{p}{nm}z, {lim} : index")
+        if ASSUME:
+            b(f"    %{p}{nm}c = index.assume {off} [range({off}, 0, {nbytes - n + 1})] : index")
+        else:
+            b(f"    %{p}{nm}z = index.max {off}, {e.ci(0)} : index")
+            b(f"    %{p}{nm}c = index.min %{p}{nm}z, {lim} : index")
         if n == 1:
             b(f"    %{p}{nm} = view.load {view}[%{p}{nm}c] : view<{nbytes}x{ty}> -> {ty}")
         else:
@@ -365,8 +381,19 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         b(f"    %{p}{nm} = vector.bitcast {w4} : vector<4xi32> to vector<16xi8>")
         return f"%{p}{nm}"
 
+    if SMASK_LDS:
+        for v in [0, 1, 2, 3] + [_s32(255 << (8 * j)) for j in range(4)]:
+            e.cs(v)
+        e.ci(16)
+
     def spread(p, nm, nib):
         """i32 nibble (4 sign bits) -> byte mask word (0x00 / 0xFF per byte)"""
+        if SMASK_LDS:
+            e.consts["%smask_used"] = ""
+            b(f"    %{p}{nm}x = index.cast {nib} : i32 to index")
+            b(f"    %{p}{nm}c = index.assume %{p}{nm}x [range(%{p}{nm}x, 0, 16)] : index")
+            b(f"    %{p}{nm} = view.load %smask[%{p}{nm}c] : view<16xi32> -> i32")
+            return f"%{p}{nm}"
         b(f"    %{p}{nm}a = scalar.muli {nib}, {e.cs(2113665)} : i32")          # 0x00204081
         b(f"    %{p}{nm}b = scalar.andi %{p}{nm}a, {e.cs(16843009)} : i32")      # 0x01010101
         b(f"    %{p}{nm} = scalar.muli %{p}{nm}b, {e.cs(255)} : i32")
@@ -996,17 +1023,37 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         o("\n".join(f"  %kvu{i} = scalar.constant {v + 128 - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)))
         o("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
     for k in sorted(e.consts, key=lambda n: (not n.startswith("%c"), n)):
-        if not k.startswith("%sv") and k != "%sgnsh" and not k.startswith("%ws"):
+        if not k.startswith("%sv") and k != "%sgnsh" and not k.startswith("%ws") and k != "%smask_used":
             o(e.consts[k])
     for k in sorted(e.consts):
         if k.startswith("%sv") or k == "%sgnsh" or k.startswith("%ws"):
             o(e.consts[k])
+    if "%smask_used" in e.consts:      # 16-entry sign-mask table in LDS, filled by lanes 0..15
+        o("  %smb = index.constant 64 : offset")
+        o("  %smp = buffer.alloca<workgroup> align(16) %smb : buffer")
+        o("  %smask = buffer.view %smp[%base] : buffer -> view<16xi32>")
+        o("  %smt = kernel.workitem.id<x> : index")
+        o("  %smt16 = index.cmp ult, %smt, %ci16 : index")
+        o("  scf.if %smt16 {")
+        o("    %smti = index.cast %smt : index to i32")
+        # mask(i) = sum over set bits j of 0xFF << 8 j, computed arithmetically once per lane
+        o("    %smv0 = scalar.constant 0 : i32")
+        cur = "%smv0"
+        for j in range(4):
+            o(f"    %smb{j} = scalar.shrui %smti, %cw{j} : i32")
+            o(f"    %smc{j} = scalar.andi %smb{j}, %cw1 : i32")
+            o(f"    %smd{j} = scalar.muli %smc{j}, %cw{str(_s32(255 << (8 * j))).replace('-', 'm')} : i32")
+            o(f"    %sme{j} = scalar.ori {cur}, %smd{j} : i32")
+            cur = f"%sme{j}"
+        o(f"    view.store {cur}, %smask[%smt] : i32, view<16xi32>")
+        o("  }")
+        o("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     out += body
     o("}")
     return "\n".join(out) + "\n"
 
 
-_SHARED = re.compile(r"%(c[iwbf]\w*|ws\w*|sv\w*|sgnsh|kvtu?|t_\w+|xv)$")
+_SHARED = re.compile(r"%(c[iwbf]\w*|ws\w*|sv\w*|sgnsh|kvtu?|t_\w+|xv|smask)$")
 
 
 def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv"):
@@ -1065,11 +1112,31 @@ def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv"):
         o("\n".join(f"  %kvu{i} = scalar.constant {v + 128 - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)))
         o("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
     for k in sorted(e.consts, key=lambda n: (not n.startswith("%c"), n)):
-        if not k.startswith("%sv") and k != "%sgnsh" and not k.startswith("%ws"):
+        if not k.startswith("%sv") and k != "%sgnsh" and not k.startswith("%ws") and k != "%smask_used":
             o(e.consts[k])
     for k in sorted(e.consts):
         if k.startswith("%sv") or k == "%sgnsh" or k.startswith("%ws"):
             o(e.consts[k])
+    if "%smask_used" in e.consts:      # 16-entry sign-mask table in LDS, filled by lanes 0..15
+        o("  %smb = index.constant 64 : offset")
+        o("  %smp = buffer.alloca<workgroup> align(16) %smb : buffer")
+        o("  %smask = buffer.view %smp[%base] : buffer -> view<16xi32>")
+        o("  %smt = kernel.workitem.id<x> : index")
+        o("  %smt16 = index.cmp ult, %smt, %ci16 : index")
+        o("  scf.if %smt16 {")
+        o("    %smti = index.cast %smt : index to i32")
+        # mask(i) = sum over set bits j of 0xFF << 8 j, computed arithmetically once per lane
+        o("    %smv0 = scalar.constant 0 : i32")
+        cur = "%smv0"
+        for j in range(4):
+            o(f"    %smb{j} = scalar.shrui %smti, %cw{j} : i32")
+            o(f"    %smc{j} = scalar.andi %smb{j}, %cw1 : i32")
+            o(f"    %smd{j} = scalar.muli %smc{j}, %cw{str(_s32(255 << (8 * j))).replace('-', 'm')} : i32")
+            o(f"    %sme{j} = scalar.ori {cur}, %smd{j} : i32")
+            cur = f"%sme{j}"
+        o(f"    view.store {cur}, %smask[%smt] : i32, view<16xi32>")
+        o("  }")
+        o("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     o("  %wgg = kernel.workgroup.id<x> : index")
     # if wgg < end_0 { band 0 } else { if wgg < end_1 { band 1 } else { ... } }
     depth = 0
