@@ -3,23 +3,17 @@
 
 usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, multiple of 256)
 
-  gb_<fmts>_<Ms>_<K>.hal         tools/gen_gemv.py gen_bands: a layer's input projections
-                                 in one dispatch (the decoder's default)
-  gv_<kind>_<fmts>_<M>_<K>.hal   tools/gen_gemv.py, one per distinct (kind, formats,
-                                 shape) on the shard: plain for the input projections
-                                 and the head, resid for attn_output / ssm_out /
-                                 ffn_down (the residual add fused), swiglu for
-                                 ffn_gate + ffn_up
-  dattn_{kvappend,part,reduce}   tools/gen_decode_attn.py: attention over the paged
-                                 fp16 KV pools (the prefill's YAH_KV_PAGED layout)
-  dattn_{kappend,vappend,part}_q with the prefill's quantized-KV switches
-                                 (YAH_KV=kv8 | kv4 | k8v4 | k4v8, as the prefill set):
-                                 the kv8a16 / kv4a16 pools; decode.txt "kv q KB VB"
-  rmsnorm, deltanet_conv         tools/gen_decode_misc.py (the ports' math, 512 lanes;
-                                 deltanet_conv also runs the decode conv)
-  unpack, rope, argmax:          the ported HIP decode kernels.
-                                 rope's own cache write goes to a one-row dummy
-                                 (max_context=1); dattn_kvappend writes the pools.
+  gb_<fmts>_<Ms>_<K>.hal         tools/gen_gemv.py gen_bands: a layer's input projections in one dispatch (the decoder's default)
+  gv_<kind>_<fmts>_<M>_<K>.hal   tools/gen_gemv.py, one per distinct (kind, formats, shape) on the shard:
+                                 plain for the input projections and the head,
+                                 resid for attn_output / ssm_out / ffn_down (residual add fused),
+                                 swiglu for ffn_gate + ffn_up
+  dattn_{kvappend,part,reduce}   tools/gen_decode_attn.py: attention over the paged fp16 KV pools of the prefill
+  dattn_{kappend,vappend,part}_q only with a quantized YAH_KV (kv8 | kv4 | k8v4 | k4v8, same as the prefill set):
+                                 the kv8a16 / kv4a16 pools; decode.txt gets "kv q KB VB"
+  rmsnorm, deltanet_conv, embed  tools/gen_decode_misc.py (deltanet_conv also runs the decode conv)
+  unpack, rope, argmax           hand-written kernels in loom/*.loom.
+                                 rope's own cache write goes to a one-row dummy (max_context=1); dattn_kvappend writes the pools.
   grid_*.bin, ksigns_iq2xs.bin   the IQ tables (loom/tables)
   decode.txt                     "ctx <max_context>", GEMV geometry and grids
 """
@@ -39,7 +33,7 @@ import gen_gemv as GV  # noqa: E402
 import gen_kvq  # noqa: E402
 
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
-# rows per wave R and waves per workgroup W per GEMV kind, recorded in decode.txt ("rw kind R W")
+# rows per wave R and waves per workgroup W per GEMV kind; recorded in decode.txt ("rw kind R W")
 RW = {k: (2, 4) for k in ("plain", "resid", "swiglu", "bands")}
 
 
@@ -61,8 +55,10 @@ def emit_file(path, name, outdir, configs):
 
 
 def kv_bits():
-    """(K bits, V bits) of YAH_KV, as the prefill set was emitted with. The decode attention has no mixed
-    fp16 / quantized form, so K and V are both quantized or both fp16."""
+    """(K bits, V bits) of YAH_KV; must match the prefill set.
+
+    The decode attention has no mixed fp16 / quantized form, so K and V are both quantized or both fp16.
+    """
     kb, vb = gen_kvq.kv_bits()
     if (kb == 16) != (vb == 16):
         raise SystemExit("decode: YAH_KV must quantize both K and V (kv8, kv4, k8v4, k4v8) or neither")
@@ -78,8 +74,10 @@ def bands_name(fmts, Ms, K):
 
 
 def bands_set(model):
-    """{name: (fmts, Ms, K)}: the input projections of each layer as one band-fused GEMV
-    (attn_qkv / attn_gate / ssm_alpha / ssm_beta, or attn_q / attn_k / attn_v)."""
+    """{name: (fmts, Ms, K)}: each layer's input projections as one band-fused GEMV.
+
+    The bands are attn_qkv / attn_gate / ssm_alpha / ssm_beta (DeltaNet layers) or attn_q / attn_k / attn_v (attention layers).
+    """
     t = {}
     for nm, dims, ty in EP.parse(model):
         t[nm] = (GV.GGML.get(ty), int(dims[0]), int(dims[1]) if len(dims) > 1 else 1)
@@ -133,7 +131,9 @@ def main():
         raise SystemExit("max_context must be a multiple of 256")
     os.makedirs(outdir, exist_ok=True)
     gs = gemv_set(model)
-    grids = {}   # exact launch grid of every GEMV kernel: the decoder refuses any other
+    # Exact launch grid of every GEMV kernel; the decoder refuses any other.
+    # Loom may drop row clamps it proves redundant for this grid, so a larger grid reads out of bounds and can hang the GPU.
+    grids = {}
     for name, (kind, fmts, M, K) in sorted(gs.items()):
         R, W = RW[kind]
         emit_src(GV.gen(kind, fmts, M, K, R, W), name, outdir)
@@ -150,7 +150,7 @@ def main():
         emit_src(DA.gen_vappend_q(T, vb), "dattn_vappend_q", outdir)
         emit_src(DA.gen_part_q(T, kb, vb), "dattn_part_q", outdir)
     L = lambda f: os.path.join(LOOM, f)
-    emit_src(DM.gen_rmsnorm(), "rmsnorm", outdir)          # 512 lanes (the port: one 32-lane subgroup)
+    emit_src(DM.gen_rmsnorm(), "rmsnorm", outdir)
     emit_file(L("yah_unpack_qg_f32.loom"), "unpack", outdir,
               ["yah_unpack_qg.batch=1", "yah_unpack_qg.num_heads=%d" % NUM_HEADS, "yah_unpack_qg.head_dim=%d" % HEAD_DIM])
     emit_file(L("yah_fused_qk_rope_f32.loom"), "rope", outdir, [
@@ -160,7 +160,7 @@ def main():
         "yah_fused_qk_rope.q_elems=%d" % (NUM_HEADS * HEAD_DIM), "yah_fused_qk_rope.kv_elems=%d" % (NUM_KV * HEAD_DIM),
         "yah_fused_qk_rope.cache32_elems=%d" % (NUM_KV * HEAD_DIM),
         "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
-    emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # 512 lanes per head, + the decode conv
+    emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # also runs the decode conv
     emit_src(DM.gen_embed_iq4xs(), "embed", outdir)      # token_embd row from the device token stream
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     for f in os.listdir(os.path.join(LOOM, "tables")):

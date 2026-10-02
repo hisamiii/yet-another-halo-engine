@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Small single-token decode kernels.
 
-  rmsnorm   out[i] = (x[i] * rsqrt(sum(x^2) / D + eps)) * w[i], one 512-lane workgroup
-            (yah_rmsnorm_f32's math; that port runs one 32-lane subgroup per row,
-            ~70 us at D = 5120, 129 calls per token)
+  rmsnorm   out[i] = (x[i] * rsqrt(sum(x^2) / D + eps)) * w[i], one 512-lane workgroup.
+            Same math as the prefill yah_rmsnorm_f32; its one 32-lane subgroup per row is too slow for one row (~70 us).
+  deltanet  one gated DeltaNet step (conv, recurrence, gated RMSNorm), one workgroup per value head.
+  embed     dequantize the IQ4_XS token_embd row of the current token.
+Usage: gen_decode_misc.py <rmsnorm|deltanet|embed> <out.loom>
 """
 import sys
 
@@ -70,17 +72,17 @@ def gen_rmsnorm(D=5120, eps=1e-6, NT=512):
 
 
 def gen_deltanet(NH=48, NKH=16, D=128):
-    """yah_deltanet_decode_resident_f32's math (see its header), one workgroup per
-    value head, 512 lanes: lane t owns row j = t / 4 and keys 32 (t % 4) .. +32,
-    k_norm / q_norm in LDS, the two row dots finished with xor shuffles 1, 2.
+    """One gated DeltaNet decode step, one 512-lane workgroup per value head.
 
-    The decode conv (dot = s1 w0 + s2 w1 + s3 w2 + x w3,
-    silu, state shift) runs here on the raw qkv projection: lanes 0..127 convolve the
-    head's q / k channels (key head kh = h % NKH, recomputed by its NH / NKH value
-    heads) and v channels. The conv state ping-pongs between a read and a write buffer
-    (the caller swaps them every token): a sibling head's reads never see this
-    step's writes, and each channel is written once (q / k by head h < NKH).
-    The row lanes issue their state loads before the norm phase."""
+    alpha = exp(softplus(a + dt) * ssm_a), beta = sigmoid(b); S = alpha S; S += beta (v - S k) k^T; o = S q.
+    out = rmsnorm(o) * ssm_norm * silu(gate). k, q are L2-normalized, q also scaled by 1 / sqrt(D).
+    Lane t owns state row j = t / 4 and keys 32 (t % 4) .. +32; k_norm / q_norm in LDS; the row dots end with xor shuffles 1, 2.
+    The conv (dot = s1 w0 + s2 w1 + s3 w2 + x w3, silu, state shift) runs here on the raw qkv projection.
+    Lanes 0..127 convolve the head's v channels and q / k channels (key head kh = h % NKH, recomputed by each of its NH / NKH value heads).
+    The conv state ping-pongs between a read and a write buffer (the caller swaps them every token).
+    So a sibling head's reads never see this step's writes, and each channel is written once (q / k by head h < NKH).
+    The row lanes issue their state loads before the norm phase.
+    """
     NT = 512
     nw = NT // 32
     SN = NH * D * D
@@ -356,10 +358,11 @@ IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 
 
 
 def gen_embed_iq4xs(D=5120, V=248320):
-    """hidden[k] = dequant(token_embd row tok)[k], tok = tokens[0] (the caller binds the
-    token stream at the step's offset). IQ4_XS: per 256-block d f16, scales_h u16,
-    scales_l[4], qs[128]; value = (d * (sc - 32)) * kvalues[nibble], as the host
-    DequantIq4XsRow. One 320-lane workgroup, lane = 16-element sub-block."""
+    """hidden[k] = dequant(token_embd row tok)[k], tok = tokens[0]; the caller binds the token stream at the step's offset.
+
+    IQ4_XS per 256-block: d f16, scales_h u16, scales_l[4], qs[128]; value = (d * (sc - 32)) * kvalues[nibble] (as the host DequantIq4XsRow).
+    One 320-lane workgroup; lane = 16-element sub-block.
+    """
     NS = D // 16
     RB = D // 256 * 136
     L = []

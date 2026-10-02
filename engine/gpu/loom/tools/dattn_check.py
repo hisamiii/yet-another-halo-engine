@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Check gen_decode_attn.py (kvappend, part, reduce) against numpy on random data
-with a scrambled page table.
+"""Check gen_decode_attn.py (kvappend, part, reduce) against numpy on random data with a scrambled page table.
 
 usage: dattn_check.py <model.gguf> <workdir> [T] [pos]
 (the model is only opened by hal_run; no tensor is bound)

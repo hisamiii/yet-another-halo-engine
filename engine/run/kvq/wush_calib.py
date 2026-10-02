@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""wush_calib.py <dump dir> <out.npz> [rows]: static WUSH-KV transforms per
-attention layer and KV head from a tier A dump (first `rows` K rows, default
-2048, and the Q rows among them), for KVQ_WUSH_FILE."""
+"""Static WUSH-KV transforms per attention layer and KV head from a tier A dump, for KVQ_WUSH_FILE.
+
+  wush_calib.py <dump dir> <out.npz> [rows]
+
+Uses the first `rows` K rows (default 2048) and the Q rows among them.
+"""
 import glob
 import os
 import sys

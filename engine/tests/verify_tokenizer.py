@@ -43,9 +43,8 @@ def main() -> int:
             print(f"FAIL {case['name']}: {proc.stderr.decode().strip()}")
             failures += 1
             continue
-        # The decoded line can contain raw non-UTF-8 bytes (byte-level tokens
-        # decode to individual bytes), so stay in bytes and read only the two
-        # lines that carry the result.
+        # The decoded line can contain raw non-UTF-8 bytes (byte-level tokens decode to single bytes).
+        # So stay in bytes and read only the two lines that carry the result.
         lines = proc.stdout.split(b"\n")
         count = int(lines[0].split(b"=")[1])
         ids = [int(value) for value in lines[1].split()] if count else []

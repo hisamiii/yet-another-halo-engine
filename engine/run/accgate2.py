@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-"""accgate2.py: multi-window, all-position correctness gate (tier T1/T2, see
-engine/run/RESEARCH_PREFILL.md section 3).
+"""Multi-window, all-position correctness gate: candidate logits vs golden logits.
 
-Inputs are directories holding per-window f32 logits of the scored positions,
-`wNN.all_logits` (rows = positions FROM..2047, vocab-major rows), as written by
-loom_forward_pp with YAH_LOGITS_FROM=FROM (gate_run.sh). The token ids of each window
-(corpus/ids2048_wNN.txt) give the next-token targets for NLL.
+Inputs are directories of per-window f32 logits of the scored positions, `wNN.all_logits` (rows = positions FROM..2047, vocab-major rows).
+loom_forward_pp writes them with YAH_LOGITS_FROM=FROM (gate/gate_run.sh).
+The token ids of each window (corpus/ids2048_wNN.txt) give the next-token targets for NLL.
 
   accgate2.py stats     <golden_dir> <cand_dir> [--windows 00,01,...]
   accgate2.py calibrate <golden_dir> <ref_dir> <thresholds.json> [--windows ...] [--tier T1]
   accgate2.py check     <golden_dir> <cand_dir> <thresholds.json> [--windows ...]
 
-Per position (f64): KL(golden || cand), logits relative RMS, top-1 flip (counted
-only where the golden top-1/top-2 gap exceeds TIE logits), NLL of the actual
-next token in both. Summary: KL mean / p99 / p99.9 / max, flips, mean ln PPL
-ratio (cand vs golden), max logits rel RMS, non-finite count.
+Per position (f64): KL(golden || cand), logits relative RMS, top-1 flip, NLL of the actual next token in both.
+A flip counts only where the golden top-1/top-2 gap exceeds TIE logits.
+Summary: KL mean / p99 / p99.9 / max, flips, mean ln PPL ratio (cand vs golden), max logits rel RMS, non-finite count.
 
-Calibration (T1, rounding level): thresholds from a reference engine's distance
-to the golden (HIP): mean KL <= FACTOR*D_mean, p99.9 KL <= D_p99.9,
-flips <= D_flips, |ln PPL ratio| <= max(|D_lnppl|, 1e-4). FACTOR defaults 0.25.
+Calibration (tier T1, rounding level): thresholds from a reference engine's distance D to the golden.
+mean KL <= FACTOR * D_mean (FACTOR default 0.25), p99.9 KL <= D_p99.9, flips <= D_flips, |ln PPL ratio| <= max(|D_lnppl|, 1e-4).
 """
 import json
 import os
@@ -31,8 +27,8 @@ FROM = int(os.environ.get("FROM", "1536"))
 TIE = float(os.environ.get("TIE", "0.1"))
 CORPUS = os.environ.get("CORPUS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate", "corpus"))
 CHUNK = 32
-# Long windows "L<n>": corpus/ids8192_w<n>.txt, scored from FROM_L (default
-# 7680, 512 positions like the 2048 windows), run on an 8192-token HAL set.
+# Long windows "L<n>": corpus/ids8192_w<n>.txt, run on an 8192-token HAL set.
+# Scored from FROM_L (default 7680: 512 positions, as in the 2048 windows).
 FROM_L = int(os.environ.get("FROM_L", "7680"))
 
 

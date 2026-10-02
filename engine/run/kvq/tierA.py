@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""tierA.py: per-layer KV-codec fidelity on a dump (kvcodec.py --dump DIR, with
-YAH_KV_HOOK_QSTRIDE so roped Q rows are included).
+"""Per-layer KV-codec fidelity on a dump (kvcodec.py --dump DIR, with YAH_KV_HOOK_QSTRIDE so roped Q rows are included).
 
   tierA.py <dump dir> <kcodec:vcodec> [<kcodec:vcodec> ...] [--layers 0,5,15]
 
-For every attention layer, the codec is applied chunk by chunk (2048 rows, as
-the engine streams it) and, for each sampled query row q at position p and each
-of the 24 query heads (GQA 6 per KV head), compared with exact attention over
-keys 0..p (fp32, the dumped f16 K/V as the reference):
+For every attention layer, the codec runs chunk by chunk (2048 rows, as the engine streams it).
+For each sampled query row q at position p and each of the 24 query heads (GQA 6 per KV head), it is compared with exact attention over keys 0..p.
+The reference is fp32 attention over the dumped f16 K/V:
   out_err = |o_cand - o_ref| / |o_ref|   (attention output, pre-gate)
   kl      = KL(softmax_ref || softmax_cand) over the keys
-Reported per codec: median / p90 / p99 of out_err, mean KL, and the mean of
-out_err in query-position bins, plus K-only (V exact) and V-only (K exact)
-splits, so each side of a codec is measured alone.
+Reported per codec: median / p90 / p99 of out_err, mean KL, and the mean of out_err in query-position bins.
+K-only (V exact) and V-only (K exact) splits measure each side of a codec alone.
 """
 import glob
 import os
@@ -29,8 +26,10 @@ BINS = [0, 2048, 8192, 16384, 32768, 65536]
 
 
 def apply(codec_name, layer, x, qp=None, qs=None):
-    """stream x through the codec chunk by chunk, with the chunk's dumped Q rows
-    (unscaled, as the engine sends them) for codecs that calibrate on Q"""
+    """Stream x through the codec chunk by chunk, with the chunk's dumped Q rows for codecs that calibrate on Q.
+
+    The Q rows are unscaled, as the engine sends them.
+    """
     c = Codec(codec_name)
     out = []
     for s in range(0, len(x), CHUNK):

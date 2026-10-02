@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""gate2.py: compare compact row stats (loom_forward_pp YAH_ROWSTATS) of a
-candidate KV codec against the fp16-KV reference, per context-position bin,
-with block-bootstrap confidence intervals across documents.
+"""Compare the row stats (loom_forward_pp YAH_ROWSTATS) of a candidate KV codec with the fp16-KV reference.
+
+Results are per context-position bin, with block-bootstrap confidence intervals across documents.
 
   gate2.py <ref1.rs,ref2.rs,...> <cand1.rs,cand2.rs,...> [--name NAME]
 
 Pairs are matched by position. Per position:
   dNLL  = NLL_cand - NLL_ref of the true next token (nats)
-  KL    ~ KL(ref || cand) over the reference's top-64 tokens (candidate log-probs
-          outside its own top-64 bounded by its 64th logit: a slight underestimate)
+  KL    ~ KL(ref || cand) over the reference's top-64 tokens
+          (a candidate log-prob outside its own top-64 is set to its 64th logit: a slight underestimate)
   flip  = argmax differs where the reference top-1/top-2 gap exceeds TIE (0.1)
   margin: reference argmax token's logit minus the best other, in the candidate
 Bins: [1K,2K) [2K,4K) [4K,8K) [8K,16K) [16K,32K) [32K,64K) ...
-CI: 2000 bootstrap resamples of blocks of BLOCK consecutive sampled positions
-(per document), 95% percentile interval of the mean.
+CI: 2000 bootstrap resamples of blocks of BLOCK consecutive sampled positions (per document), 95% percentile interval of the mean.
 """
 import sys
 
@@ -51,7 +50,7 @@ def per_pos(r, c):
 
 
 def boot_ci(groups, rng, n=2000):
-    """groups: list of 1-D arrays (one per document); block bootstrap of the mean"""
+    """Block bootstrap of the mean; groups is a list of 1-D arrays, one per document."""
     blocks = []
     for g in groups:
         for s in range(0, len(g), BLOCK):
@@ -69,9 +68,9 @@ def main():
     name = sys.argv[sys.argv.index("--name") + 1] if "--name" in sys.argv else cands[0]
     rng = np.random.default_rng(0)
     docs = [per_pos(load(a), load(b)) for a, b in zip(refs, cands)]
-    if "--summary" in sys.argv:     # one markdown row: PPL delta vs the reference, mean / p99 / p99.9 KL,
-        # 99.9% precision = 100 exp(-(p99.9 KL - p99.9 KL of the reference)); the reference here is the
-        # fp16 KV cache itself, so its KL is 0. Same top token % = llama.cpp "Same top p".
+    if "--summary" in sys.argv:     # one markdown row: PPL delta, KL mean / p99 / p99.9, 99% / 99.9% precision, same top %
+        # precision = 100 exp(-(KL percentile - same percentile of the reference)); the reference is the fp16 KV cache, so its KL is 0.
+        # Same top % = llama.cpp "Same top p".
         kl = np.concatenate([d["kl"][d["ok"]] for d in docs])
         nr = np.concatenate([d["nll_r"][d["ok"]] for d in docs]); dn = np.concatenate([d["dnll"][d["ok"]] for d in docs])
         p999 = np.percentile(kl, 99.9)

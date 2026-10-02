@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""Decode (one query token) attention over the paged fp16 KV cache.
+"""Decode (one query token) attention over the paged KV cache of one layer.
 
-Layout (the prefill's YAH_KV_PAGED pools, one layer):
-  K pool    [pool_rows][1024] f16, logical position p in row ptab[p / 256] * 256 + p % 256
-  V^T pool  [4 kv heads][pool_rows / 16 tiles][256 dims][16 keys] f16, same physical row
-            (tile = row / 16, key = row % 16)
+Layout (the prefill's paged pools):
+  K pool    [pool_rows][1024] f16; logical position p is in row ptab[p / 256] * 256 + p % 256.
+  V^T pool  [4 kv heads][pool_rows / 16 tiles][256 dims][16 keys] f16, same physical row (tile = row / 16, key = row % 16).
 The current position comes from a device i32 (pos); keys 0..pos are visible.
 
-Kernels (gen(which, T) with T = pool rows, a multiple of 256):
-  kvappend  write the new token's K (roped, f32) and V (f32) into its row: grid 4 x 256
-  part      one workgroup per (kv head, page s): the page's 256 keys against the
-            six query heads of the GQA group. Scores (thread = key, from its K row),
-            per-head block max / sum, p in LDS, then P.V (thread = dim, the page's V^T
-            slab of 16 tiles x 256 dims x 16 keys is contiguous per kv head).
+Kernels (gen(which, T), T = pool rows, a multiple of 256):
+  kvappend  write the new token's K (roped, f32) and V (f32) into its row. Grid 4 x 256.
+  part      one workgroup per (kv head, page s): the page's 256 keys against the 6 query heads of the GQA group.
+            Scores (thread = key), per-head block max / sum, p in LDS, then P.V (thread = dim).
+            The page's V^T slab (16 tiles x 256 dims x 16 keys) is contiguous per kv head.
             Writes acc[s][head][256], m[s][head], l[s][head]. Grid (4, pages used).
   reduce    one workgroup per head, thread = dim: merge the pages,
             out = (sum_s e^(m_s - M) acc_s) / (sum_s e^(m_s - M) l_s) * sigmoid(gate).
-Math as QwenDecodeOnlineAttentionHalfKernel (score = q.k / 16, softmax, gate), with
-the softmax in two levels instead of online.
+score = q.k / 16 (1 / sqrt(256)). The softmax has two levels (per page, then across pages), not an online one.
 """
 import sys
 
@@ -106,9 +103,8 @@ def gen_part(T):
     e("  %c4 = index.constant 4 : index")
     e("  %c256 = index.constant 256 : index")
     e(f"  %cnp = index.constant {npg} : index")
-    # grid (4 kv heads, pages): the four heads of a page run together, so each 2 KB K row
-    # is consumed at once (page-major order read one 512 B quarter per row at a time:
-    # 43 -> 71 GB/s at 32K only). The host dispatches the pages in use, ceil((pos + 1) / 256).
+    # Grid (4 kv heads, pages): the 4 kv heads of a page run together, so each 2 KB K row is read in full at once.
+    # The host dispatches only the pages in use, ceil((pos + 1) / 256).
     e("  kernel.launch.config workgroups(%c4, %cnp, %u1) workgroup_size(%c256, %u1, %u1) : index")
     e("} launch(%q: buffer, %kp: buffer, %vtp: buffer, %ptab: buffer, %pos: buffer, %acc: buffer, %ml: buffer) {")
     e("  %base = index.constant 0 : offset")
@@ -383,19 +379,18 @@ def gen_reduce(T):
 
 # ---------------------------------------------------------------------------
 # Quantized KV (the prefill's kv8a16 / kv4a16 formats, gen_kvq.py), paged.
-#   K8: kq [row][256 dwords]: bytes u = rne((k - m) / s) + 128, lane chunk c of 8 dims in
-#       2 dwords, byte slot order (d0, d2, d1, d3); ks [row][8] f16x2 (256 s, -384 s),
-#       index head * 2 + half.  k - m = s (u - 128).
-#   K4: kq [row][128 dwords]: H256 (k - m) / 16 quantized per 32-dim group (asymmetric);
-#       lane chunk c of 8 rotated dims in one dword, dim 2j at bits 4j, 2j+1 at 16 + 4j;
-#       ks [row][32] f16x2 (16 s, lo - 16 s), index head * 8 + group.  value = s u + lo.
-#   V8 / V4: per channel per 16-key tile: vq [kv head][tile][256 dims][4 | 2 dwords],
+#   K8: kq [row][256 dwords]: bytes u = rne((k - m) / s) + 128; k - m = s (u - 128).
+#       Lane chunk c of 8 dims in 2 dwords, byte slot order (d0, d2, d1, d3).
+#       ks [row][8] f16x2 (256 s, -384 s), index head * 2 + half.
+#   K4: kq [row][128 dwords]: H256 (k - m) / 16, asymmetric 4-bit per 32-dim group; value = s u + lo.
+#       Lane chunk c of 8 rotated dims in one dword: dim 2j at bits 4j, dim 2j+1 at bits 16 + 4j.
+#       ks [row][32] f16x2 (16 s, lo - 16 s), index head * 8 + group.
+#   V8 / V4: per channel per 16-key tile: vq [kv head][tile][256 dims][4 | 2 dwords].
 #       vs [kv head][tile][256] f16x2 (S, C'): v = (1 + u / 256 | 16) S + C'.
-#       V8 dword w: keys 4w + (0, 2, 1, 3)[byte]; V4 dword w: low nibbles keys
-#       8w + (0, 4, 1, 5), high nibbles 8w + (2, 6, 3, 7).
-# The decode keeps the current 16-key tile of V open in f16 ([kv head][256][16]) and
-# quantizes it when its 16th key arrives (vappend); the attention reads the open tile
-# in f16 and every earlier tile quantized.
+#       V8 dword w: keys 4w + (0, 2, 1, 3)[byte].
+#       V4 dword w: low nibbles keys 8w + (0, 4, 1, 5), high nibbles keys 8w + (2, 6, 3, 7).
+# The current 16-key V tile stays open in f16 ([kv head][256][16]); vappend quantizes it when its 16th key arrives.
+# The attention reads the open tile in f16 and every earlier tile quantized.
 # ---------------------------------------------------------------------------
 
 
@@ -405,8 +400,10 @@ def _hdr(e, name):
 
 
 def gen_vappend_q(T, vb):
-    """V of the new token into the open f16 tile; on the tile's 16th key, quantize
-    each channel (gen_kvq gen_vqt's arithmetic) into the paged vq / vs pools."""
+    """Write the new token's V into the open f16 tile.
+
+    On the tile's 16th key, quantize each channel (gen_kvq gen_vqt arithmetic) into the paged vq / vs pools.
+    """
     npg, tiles = T // 256, T // 16
     nw = 2 if vb == 4 else 4
     lv, off, umax = (14, 7, 14) if vb == 4 else (254, 128, 255)
@@ -543,11 +540,12 @@ def gen_vappend_q(T, vb):
 
 
 def gen_part_q(T, kb, vb):
-    """yah_dattn_part over quantized K (kb 8 | 4) and V (vb 8 | 4), paged; same grid,
-    LDS reductions and outputs as gen_part. K: q goes to LDS in the codes' storage order
-    (K4: H256-rotated first, plus per-group sums for the offset term); each key thread
-    dequantizes its own row. V: tiles before the current one dequantized from vq / vs
-    against p in storage order; the current tile from the open f16 buffer."""
+    """yah_dattn_part over quantized K (kb 8 | 4) and V (vb 8 | 4); same grid, LDS reductions and outputs as gen_part.
+
+    K: q goes to LDS in the codes' storage order (K4: H256-rotated first, plus per-group sums for the offset term).
+    Each key thread dequantizes its own K row.
+    V: tiles before the current one come from vq / vs against p in storage order; the current tile from the open f16 buffer.
+    """
     npg, tiles = T // 256, T // 16
     nwv = 2 if vb == 4 else 4
     kdw = 64 if kb == 8 else 32          # dwords of one head's K row
@@ -582,8 +580,8 @@ def gen_part_q(T, kb, vb):
     e("  %posv = buffer.view %pos_na[%base] : buffer -> view<1xi32>")
     e(f"  %accv = buffer.view %acc_na[%base] : buffer -> view<{npg * NH * HD}xf32>")
     e(f"  %mlv = buffer.view %ml_na[%base] : buffer -> view<{npg * NH * 2}xf32>")
-    # LDS: q (storage order) [G][256] | p [G][256] | p storage order [G][256] | qsum [G][8] | partials
-    QO, PO, PSO, QSO = 0, G * HD, 2 * G * HD, 3 * G * HD   # qsum: [G][16] (K4)
+    # LDS: q (storage order) [G][256] | p [G][256] | p storage order [G][256] | qsum [G][16] (K4) | partials
+    QO, PO, PSO, QSO = 0, G * HD, 2 * G * HD, 3 * G * HD
     MO = QSO + G * 16
     SO = MO + 8 * G
     NL = SO + 8 * G
@@ -737,8 +735,8 @@ def gen_part_q(T, kb, vb):
     e("  %f128v = vector.splat %f128 : vector<16xf32>")
     e(f"  %cpk = index.constant {PIPE_K} : index")
     nit = 16
-    # per iteration: K8 4 dwords = 16 dims (half: iterations 0-7 / 8-15); K4 2 dwords =
-    # half a 32-dim group (storage positions g 32 + hf 8 + [0, 8) low nibbles, + 16 high)
+    # Per iteration: K8 4 dwords = 16 dims (scale half: iterations 0-7 / 8-15).
+    # K4 2 dwords = half a 32-dim group (storage positions g 32 + hf 8 + [0, 8) low nibbles, + 16 high nibbles).
     inits = ", ".join(f"%sa{j} = %zf : f32" for j in range(G))
     res = ", ".join(f"%sr{j}" for j in range(G))
     e(f"  %cit = index.constant {nit} : index")
@@ -934,7 +932,7 @@ def gen_part_q(T, kb, vb):
     e("    %sa0 = index.mul %td, %c2 : index")
     e("    %sa = index.min %sa0, %slim : index")
     e("    %k16 = index.mul %i, %c16 : index")
-    # quantized tile (storage order) -- loaded unconditionally (finite codes), used if older
+    # Quantized tile (storage order): always loaded, used only if older than the current tile.
     e(f"    %vw = vector.load %vqv[%va] : view<{VQN}xi32> -> vector<{nwv}xi32>")
     e(f"    %vS = view.load %vsv[%sa] : view<{VSN}xf16> -> f16")
     e("    %sa1 = index.add %sa, %c1 : index")
@@ -960,8 +958,8 @@ def gen_part_q(T, kb, vb):
         e("    %vb8 = vector.bitcast %vcat : vector<4xi32> to vector<16xi8>")
         e("    %vu = vector.uitofp %vb8 : vector<16xi8> to vector<16xf32>")
     e("    %vq16 = vector.fmaf %vu, %vmv, %vav : vector<16xf32>")
-    # quantized tiles before the current one; zeros at and after it (unwritten pool
-    # bytes may decode to NaN; p is 0 there). The open tile is added after the loop.
+    # Quantized tiles before the current one; zeros at and after it (unwritten pool bytes may decode to NaN, and 0 * NaN = NaN).
+    # The open tile is added after the loop.
     e("    %vsel = scf.select %older, %vq16, %zv16 : vector<16xf32>")
     e(f"    %cpso = index.constant {PSO} : index")
     e("    %pbk = index.add %cpso, %k16 : index")
@@ -1009,10 +1007,11 @@ def gen_part_q(T, kb, vb):
 
 
 def gen_kappend_q(T, kb):
-    """The new token's K quantized in the prefill's format (gen_kvq.py yah_kq8 / yah_kq4
-    arithmetic, taken verbatim: f16-rounded, minus the layer's channel means) into the
-    paged kq / ks pools at row ptab[pos / 256] * 256 + pos % 256. One workgroup of 128
-    lanes (8 dims each). Bindings (k f32 [1024], mean f32 [1024], kq, ks, ptab, pos)."""
+    """Quantize the new token's K into the paged kq / ks pools at row ptab[pos / 256] * 256 + pos % 256.
+
+    Arithmetic copied from gen_kvq.py yah_kq8 / yah_kq4 (f16-rounded, minus the layer's channel means).
+    One workgroup of 128 lanes, 8 dims each. Bindings (k f32 [1024], mean f32 [1024], kq, ks, ptab, pos).
+    """
     import gen_kvq as KQ
     src = KQ._gen_kq8() if kb == 8 else KQ._gen_kq4()
     npg = T // 256

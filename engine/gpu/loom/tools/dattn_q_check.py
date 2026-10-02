@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Check gen_decode_attn.py's quantized-KV decode kernels (kappend_q, vappend_q,
-part_q + the shared reduce) against numpy models of the prefill's kv8a16 / kv4a16
-formats (gen_kvq.py), with a scrambled page table.
+"""Check the quantized-KV decode kernels of gen_decode_attn.py (kappend_q, vappend_q, part_q + the shared reduce).
+
+The reference is a numpy model of the prefill's kv8a16 / kv4a16 formats (gen_kvq.py), with a scrambled page table.
 
 usage: dattn_q_check.py <model.gguf> <workdir> <bits 8|4|kb,vb> [T] [pos]
 (the model is only opened by hal_run; no tensor is bound)

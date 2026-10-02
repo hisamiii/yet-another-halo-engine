@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
-"""gen_needle.py: multi-key retrieval prompts for gate v2 tier C.
+"""Multi-key retrieval prompts for gate v2 tier C.
 
   gen_needle.py <book .ids.raw> <length> <seed> <out prefix>
 
-Builds a token sequence of exactly <length> tokens: book text (token slices of
-an already tokenized book) with NKEYS facts inserted at depths 5%..95%:
+Builds a sequence of exactly <length> tokens: book text (token slices of a tokenized book) with NKEYS facts at depths 5%..95%:
     "\\nThe access code of agent Falcon-17 is 4829173.\\n"
-keys are near-duplicates (agent names share a prefix, numbers differ in one or
-two digits), values random 7-digit codes. The prompt ends with NQ questions
+Keys are near-duplicates (agent names share a prefix, numbers differ in one or two digits); values are random 7-digit codes.
+The prompt ends with NQ questions:
     "\\nThe access code of agent Falcon-17 is" + " 4829173" + ".\\n"
-whose answer tokens are scored teacher-forced (the logits at the position
-before each answer token). Segments are tokenized separately and concatenated
-at the token level, so every answer position is exact.
+Their answer tokens are scored teacher-forced (the logits at the position before each answer token).
+Segments are tokenized separately and joined at the token level, so every answer position is exact.
 
-Harder variant (v2, env KVQ_NKEYS / KVQ_NQ / KVQ_NUPD / KVQ_WARM): more keys,
-NUPD of the queried keys are reassigned later in the text ("The access code of
-agent X was changed to Y."; the question asks for the current code), and WARM
-unscored warm-up questions precede the scored ones so the first scored query
-is not dominated by format uncertainty.
+Harder variant (env KVQ_NKEYS / KVQ_NQ / KVQ_NUPD / KVQ_WARM): more keys, and NUPD of the queried keys are reassigned later in the text.
+A reassignment reads "The access code of agent X was changed to Y."; the question asks for the current code.
+WARM unscored warm-up questions come before the scored ones, so format uncertainty does not dominate the first scored query.
 
-Writes <prefix>.ids (space-separated ids), <prefix>.pos (positions to score,
-one per line) and <prefix>.json (keys, values, depths, answer spans).
+Writes <prefix>.ids (space-separated ids), <prefix>.pos (positions to score, one per line) and <prefix>.json (keys, values, depths, answer spans).
 """
 import json
 import os

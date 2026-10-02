@@ -3,11 +3,10 @@
 
 usage: gemv_check.py <model.gguf> <workdir> [kind ...]      (kinds: plain resid swiglu bands)
 
-For every (format, K) present on the shard it takes the first matching tensor,
-generates and emits the kernel, dispatches it once through engine/build/hal_run
-(which refuses any binding smaller than gen_gemv.footprint) and compares y with
-gguf-py's dequantization: y_ref = W.astype(f64) @ x. Reports the error relative
-to max |y_ref|; the f32 accumulation of a 17408-long dot lands near 1e-6.
+For every (format, K) on the shard: take the first matching tensor, emit the kernel and dispatch it once through engine/build/hal_run.
+hal_run refuses any binding smaller than gen_gemv.footprint.
+y is compared with gguf-py's dequantization, y_ref = W.astype(f64) @ x; the error is relative to max |y_ref|.
+Expect about 1e-6 (f32 accumulation of a 17408-long dot).
 Needs PYTHONPATH with llama.cpp's gguf-py and a numpy with BLAS.
 """
 import collections
@@ -72,7 +71,7 @@ def run_kernel(model, work, tag, kind, fmts, M, K, tensors, x, y0=None, R=2, W=4
 
 
 def check_bands(model, work, rd, dequantize, rng, layers):
-    """band-fused input projections of real layers vs the oracle"""
+    """Band-fused input projections of real layers vs the oracle."""
     worst = 0.0
     t = {x.name: x for x in rd.tensors}
     for l in layers:

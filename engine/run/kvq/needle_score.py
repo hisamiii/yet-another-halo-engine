@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""needle_score.py: tier C scoring. For each prompt (gen_needle.py .json) and
-run (row stats at the answer positions), per query: log p(answer) = sum over
-answer tokens of (logit_target - logsumexp), correct = every answer token is
-the argmax, margin = min over answer tokens of (target logit - best other).
+"""Tier C scoring of needle prompts (gen_needle.py .json) from row stats at the answer positions.
+
+Per query: log p(answer) = sum over answer tokens of (logit_target - logsumexp).
+correct = every answer token is the argmax; margin = min over answer tokens of (target logit - best other).
 
   needle_score.py <prompt.json,...> <ref.rs,...> <cand.rs,...> [--name N]
 Reports per-query deltas vs the reference with a bootstrap CI over queries.

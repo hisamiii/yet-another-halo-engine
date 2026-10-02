@@ -3,27 +3,21 @@
 
     y[m] = sum_k W[m, k] * x[k]          W packed in a GGUF quant format, x f32
 
-The decode arithmetic is HIP's (Q8KBlockGEMVKernel_2Rows over QuantWarpBlockDot,
-quant_ops.hpp): a weight row is cut into 16-element sub-blocks, lane l of a wave
-owns sub-blocks l, l + 32, ..., and each sub-block decodes (DecodeQuantSub16)
-to sixteen small integers q, a scale and an offset, so that
+A weight row is cut into 16-element sub-blocks; lane l of a wave owns sub-blocks l, l + 32, ...
+Each sub-block decodes to 16 small integers q, a scale and an offset:
 
     w[j] = scale * q[j] - offset          partial += scale * dot(q, x) - offset * sum(x)
 
-followed by a butterfly reduction over the 32 lanes. Differences from HIP: the
-format and shape are compile-time (one kernel per tensor shape, like the prefill
-GEMMs), one wave carries R rows at once so every x load serves R rows, and the
-per-lane decode constants (which sub-block of the 256-element block a lane owns,
-shifts, scale indices) are loop invariant because K / 16 is a multiple of 32.
+A butterfly reduction over the 32 lanes follows.
+Format and shape are compile-time (one kernel per tensor shape). One wave carries R rows, so every x load serves R rows.
+The per-lane decode constants (sub-block of the 256-element block, shifts, scale indices) are loop invariant because K / 16 is a multiple of 32.
 
 Kinds:
   plain   y[m] = W x
-  resid   y[m] += W x                    (the residual add fused, y read and written)
-  swiglu  y[m] = silu(G x) * (U x)       G, U may have different formats; HIP's
-                                         (g * (1 / (1 + exp(-g)))) * u
+  resid   y[m] += W x                    (residual add fused: y is read and written)
+  swiglu  y[m] = silu(G x) * (U x)       G, U may have different formats; order (g * (1 / (1 + exp(-g)))) * u
 Usage (module): gen(kind, fmts, M, K, R=2, W=4) -> Loom source text.
-Bindings: weights (one per format in fmts), then the IQ tables the formats need
-(TABLE_ORDER), then x, then y.
+Bindings: weights (one per format in fmts), then the IQ tables the formats need (TABLE_ORDER), then x, then y.
 """
 import re
 import sys
@@ -47,16 +41,17 @@ TABLES = {"grid_iq3s": ("i32", 512), "grid_iq3xxs": ("i32", 256), "grid_iq2xxs":
           "grid_iq2xs": ("i32", 1024), "ksigns": ("i8", 128)}
 TABLE_ORDER = ["grid_iq3s", "grid_iq3xxs", "grid_iq2xxs", "grid_iq2xs", "ksigns"]
 IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
-# Loom read-ahead depth of the sub-block loop (full decode: none 68.2, 2: 63.1, 3: 66.1 ms/token).
+# Loom read-ahead depth of the sub-block loop: 2 is the fastest on the full decode (none and 3 are slower).
 PIPE = 2
 GGML = {8: "q8_0", 10: "q2k", 11: "q3k", 12: "q4k", 13: "q5k", 14: "q6k", 16: "iq2xxs", 17: "iq2xs",
         18: "iq3xxs", 21: "iq3s", 23: "iq4xs"}
 
 
 def rows_per_wg(R=2, W=4):
-    """output rows per workgroup of a gen() / gen_bands() kernel: launch M / rows_per_wg
-    workgroups exactly. Loom takes workgroup.id < grid from the launch config, so its
-    range analysis may drop the row clamps: a larger grid reads out of bounds."""
+    """Output rows per workgroup of a gen() / gen_bands() kernel: launch exactly M / rows_per_wg workgroups.
+
+    Loom takes workgroup.id < grid from the launch config and may drop the row clamps: a larger grid reads out of bounds.
+    """
     return R * W
 
 
@@ -150,7 +145,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             if f == "q5k":
                 b(f"  %{p}ho = index.add %{p}l16, {e.ci(16)} : index")
                 S["hsh"] = shsplat("hshv", f"%{p}s32i")
-            # scales (HIP SharedScales form): base = sb32 & 3 at +4, +8, +12; upper = sb32 >> 2
+            # scales: base = sb32 & 3 at +4, +8, +12; upper = sb32 >> 2
             b(f"  %{p}sbase = index.rem %{p}s32, {e.ci(4)} : index")
             b(f"  %{p}so0 = index.add %{p}sbase, {e.ci(4)} : index")
             b(f"  %{p}so1 = index.add %{p}sbase, {e.ci(8)} : index")
@@ -193,8 +188,8 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             b(f"  %{p}qb1 = index.add %{p}qb0, %{p}l16 : index")
             b(f"  %{p}qo = index.add %{p}qb1, {e.ci(32)} : index")
             b(f"  %{p}ho = index.add %{p}l16, {e.ci(0)} : index")
-            # scale index si = half * 8 + sp * 2 + hlf; low nibble byte s[si & 7] >> 4 * (si >> 3);
-            # high pair (s[8 + si % 4] >> 2 * (si / 4)) & 3
+            # scale index si = half * 8 + sp * 2 + hlf.
+            # low nibble: byte s[si & 7] >> 4 * (si >> 3); high pair: (s[8 + si % 4] >> 2 * (si / 4)) & 3
             b(f"  %{p}si0 = index.mul %{p}half, {e.ci(8)} : index")
             b(f"  %{p}si1 = index.mul %{p}sp, {e.ci(2)} : index")
             b(f"  %{p}si2 = index.add %{p}si0, %{p}si1 : index")
@@ -338,8 +333,10 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         return f"%{p}{nm}"
 
     def signed_grid(p, gw, s0, s1):
-        """grid words gw (vector<4xi32>, unsigned magnitudes <= 62) with sign bytes s0 (words 0, 1)
-        and s1 (words 2, 3) -> 64 + sign * g per byte (borrow-free: 64 - g >= 2)"""
+        """Grid words gw (vector<4xi32>, magnitudes <= 62) + sign bytes s0 (words 0, 1), s1 (words 2, 3) -> 64 + sign * g per byte.
+
+        No borrow crosses bytes because 64 - g >= 2.
+        """
         ms = []
         for k, (sb, sh) in enumerate(((s0, 0), (s0, 4), (s1, 0), (s1, 4))):
             if sh:
@@ -357,8 +354,10 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
 
 
     def decode_w(f, S, p, wv, hv, nb, boff, lp):
-        """Word-level decode: (unsigned byte codes vector<16xi8>, scale, total offset) with
-        w = scale * code - offset (biases folded into offset)."""
+        """Word-level decode -> (unsigned byte codes vector<16xi8>, scale, total offset), w = scale * code - offset.
+
+        Code biases are folded into the offset.
+        """
         nh = nb // 2
         bias = 0
         if f == "q8_0":
@@ -647,7 +646,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             nxt.append(f"%{p}n")
     b(f"    scf.yield {', '.join(nxt)} : {', '.join(['f32'] * len(accs))}")
     b("  }")
-    # butterfly reduction (HIP __shfl_xor 16, 8, 4, 2, 1)
+    # butterfly reduction over the 32 lanes: xor 16, 8, 4, 2, 1
     tot = []
     for j in range(len(accs)):
         cur = f"%res{j}"
@@ -729,9 +728,11 @@ _SHARED = re.compile(r"%(c[iwbf]\w*|ws\w*|sv\w*|kvtu|t_\w+|xv)$")
 
 
 def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv"):
-    """Several plain GEMVs over one input in one dispatch: band b is fmts[b] with Ms[b]
-    rows, written to its own output; workgroup ranges map to bands. Bindings: the
-    weights, the IQ tables of all bands (TABLE_ORDER), x, then the outputs."""
+    """Several plain GEMVs over one input in one dispatch; workgroup ranges map to bands.
+
+    Band b is fmts[b] with Ms[b] rows, written to its own output.
+    Bindings: the weights, the IQ tables of all bands (TABLE_ORDER), x, then the outputs.
+    """
     rows_wg = R * W
     e = E()
     bodies, wnbs, starts = [], [], []
@@ -805,7 +806,7 @@ def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv"):
         o("  }")
     o("  kernel.return")
     o("}")
-    # constants referenced after the chain was opened (e.ci(end) above) are already in e.consts:
+    # Constants created after the header was built (e.ci(end) above) are in e.consts but not in the text: insert them.
     text = "\n".join(out) + "\n"
     missing = [c for c in e.consts if c not in text.split("%wgg = kernel.workgroup.id<x> : index")[0]]
     if missing:   # re-emit with the late constants
