@@ -101,6 +101,7 @@ One line each: what, the measured effect, when the set was current. Prefill numb
 
 Prefill:
 
+- Prefill as one HRX graph per chunk, independent kernels overlapping (stock HRX): pp2048 ~3090 -> 3032 ms, a 500-token prompt 970 -> 926 ms; bit-identical.
 - Tile GEMM (128 x 256 per workgroup, 16 wave32 waves, both operands in padded LDS) replacing the shared-decode GEMM: pp2048 device time 5263 -> 4574 ms.
 - LDS row padding (+8 f16 per weight row): IQ3_S kstore 19.9 -> 11.1 ms standalone (bank conflicts gone).
 - Schedule fence between a phase's LDS stores and the next phase's loads: IQ4_XS kstore 12.1 -> 10.3 ms; GEMM device time 3675 -> 3516 ms.
@@ -184,7 +185,6 @@ Prefill attention, DeltaNet and pipeline:
 - DeltaNet dual-issue FMAs (`vector.dotf`): +1.6-2.3% cycles; VOPD pairs across chains stretch the per-token latency path.
 - FLA-style 3-kernel DeltaNet split: per-chunk state snapshots ~150 ms over 48 layers at pp8192 vs ~350 ms for all of DeltaNet.
 - Chunked DeltaNet packed f16 pair stores: 3.702 -> 3.744 M cycles; the stores queue behind LDS traffic.
-- Concurrent DeltaNet + z projection (no ordering barrier): -0.6% of pp2048, but needs a local HRX patch; stock HRX cannot.
 - Weights as a device-local copy or a 2 MB THP copy: 3505 / 3522 vs 3527 ms (noise), load +5 s / +43 s; GEMMs reuse each weight tile 2048 times.
 - Load-time tricks on the GGUF mapping: prefault on a thread (device init 180 -> 437 ms, it holds `mmap_lock`), `MADV_HUGEPAGE` (cold load +0.6 s), `MADV_POPULATE_READ` (-30 ms only).
 - Freeing host power (no busy-poll) for GPU clock: no clock gain; the GPU is thermal-limited, not power-limited.

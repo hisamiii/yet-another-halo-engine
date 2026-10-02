@@ -2,9 +2,13 @@
 #ifndef YAH_MODEL_LOOM_RUNTIME_HPP_
 #define YAH_MODEL_LOOM_RUNTIME_HPP_
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -288,6 +292,84 @@ class LoomDevice {
   bool no_barrier_ok_ = true;
   long sleep_us_ = 0;
   bool initialized_ = false;
+};
+
+// Records dispatches into one HRX graph and launches it on the device stream. Each dispatch waits only for what it
+// touches: the last earlier write to any byte range it reads or writes, and, for a write, the reads since then.
+// Independent dispatches get no edge and HRX records no barrier between them, so they can run at the same time on the
+// GPU. (Stream dispatches always end with an ordering barrier; graphs are the stock-HRX way to overlap kernels.)
+class LoomGraph {
+ public:
+  explicit LoomGraph(LoomDevice& gpu) : gpu_(gpu) {
+    LoomCheck(hrx_graph_create(gpu.device(), 0, &graph_), "hrx_graph_create");
+  }
+  ~LoomGraph() {
+    if (graph_) hrx_graph_release(graph_);
+  }
+  LoomGraph(const LoomGraph&) = delete;
+  LoomGraph& operator=(const LoomGraph&) = delete;
+
+  // A buffer no recorded dispatch writes (weights, lookup tables): it orders nothing.
+  void ReadOnly(hrx_buffer_t buffer) { read_only_.insert(buffer); }
+
+  // writes: bit i set if the dispatch may write binding i. A missing bit is a race; an extra one only costs overlap.
+  void Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
+                const hrx_buffer_ref_t* bindings, size_t binding_count, uint64_t writes) {
+    std::vector<hrx_graph_node_t> deps;
+    for (size_t i = 0; i < binding_count; ++i)
+      if (!read_only_.count(bindings[i].buffer)) Depend(bindings[i], (writes >> i) & 1, &deps);
+    std::sort(deps.begin(), deps.end());
+    deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
+    // The graph keeps the binding pointer until it is instantiated.
+    const auto& b = bindings_.emplace_back(bindings, bindings + binding_count);
+    hrx_graph_kernel_node_attrs_t attrs{};
+    attrs.executable = executable.handle;
+    attrs.export_ordinal = ordinal;
+    attrs.config = config;
+    attrs.bindings = b.data();
+    attrs.binding_count = b.size();
+    hrx_graph_node_t node = nullptr;
+    LoomCheck(hrx_graph_add_kernel_node(graph_, deps.data(), deps.size(), &attrs, &node), "hrx_graph_add_kernel_node");
+    for (size_t i = 0; i < binding_count; ++i)
+      if (!read_only_.count(bindings[i].buffer))
+        accesses_[bindings[i].buffer].push_back({bindings[i].offset, bindings[i].length, ((writes >> i) & 1) != 0, node});
+  }
+
+  // Instantiates the graph and queues it on the device stream, after everything queued before.
+  void Launch() {
+    hrx_graph_exec_t exec = nullptr;
+    LoomCheck(hrx_graph_instantiate(graph_, 0, &exec), "hrx_graph_instantiate");
+    const hrx_status_t status = hrx_graph_exec_launch(exec, gpu_.stream());
+    hrx_graph_exec_release(exec);
+    LoomCheck(status, "hrx_graph_exec_launch");
+  }
+
+ private:
+  struct Access {
+    size_t offset, length;
+    bool write;
+    hrx_graph_node_t node;
+  };
+  // Newest first: every overlapping earlier write orders this access, a write also waits for the overlapping reads.
+  // A write that covers the whole range was itself ordered after everything older, so the scan stops there.
+  void Depend(const hrx_buffer_ref_t& b, bool write, std::vector<hrx_graph_node_t>* deps) {
+    const auto& list = accesses_[b.buffer];
+    for (auto it = list.rbegin(); it != list.rend(); ++it) {
+      if (it->offset >= b.offset + b.length || b.offset >= it->offset + it->length) continue;
+      if (it->write) {
+        deps->push_back(it->node);
+        if (it->offset <= b.offset && it->offset + it->length >= b.offset + b.length) return;
+      } else if (write) {
+        deps->push_back(it->node);
+      }
+    }
+  }
+
+  LoomDevice& gpu_;
+  hrx_graph_t graph_ = nullptr;
+  std::set<hrx_buffer_t> read_only_;
+  std::map<hrx_buffer_t, std::vector<Access>> accesses_;
+  std::deque<std::vector<hrx_buffer_ref_t>> bindings_;
 };
 
 // The model's tensor-data region (the GGUF mmap) imported once as one device-visible buffer; every tensor is an offset

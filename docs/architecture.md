@@ -90,6 +90,10 @@ It is not bit-identical to the HIP-order kernel; the tiered accuracy gate accept
 
 `tools/gen_gdn_chunk.py`: the chunked WY form (chunk C = 32 tokens). A workgroup takes 64 value rows of one head (grid 2 x 48), 8 waves; the state stays in f32 WMMA accumulators and the matmul inputs are f16. Gating is in log space; log2(alpha) is clamped at -100 because alpha underflows to 0 deep in the model. Output error vs the exact recurrence is ~2e-4 relative; end-to-end KLD ~3e-6.
 
+### One HRX graph per chunk
+
+`RunLayers` records a chunk's ~870 dispatches into one HRX graph (`LoomGraph` in `engine/model/loom_runtime.hpp`) and launches it once. Edges come from the byte ranges each dispatch reads and writes: the GEMMs declare their outputs, every other kernel counts all its bindings as written. Kernels with no data between them run at the same time: a layer's input projections, and the DeltaNet gate projection beside the conv and the DeltaNet. A stream dispatch always ends with an ordering barrier and the GPU has one queue, so the graph is how stock HRX overlaps kernels. Results are bit-identical to dispatching on the stream.
+
 ### Chunked prefill (long context)
 
 A set emitted with `YAH_CTX=T` runs every kernel at the chunk size B but sizes the KV pools for T tokens. The prompt runs in passes of B tokens over the 64 layers, carrying the conv ring and the DeltaNet state between chunks. One-pass and chunked runs are bit-identical at 8K.

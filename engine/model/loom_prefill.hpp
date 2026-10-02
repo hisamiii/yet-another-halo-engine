@@ -104,6 +104,13 @@ class LoomPrefill {
   void RunLayers(std::uint32_t ci, const KvHook& hook = {}) {
     if (std::size_t{ci + 1} * B_ > T_) throw LoomError("prefill: chunk past the emitted context");
     if (n_ == 0) throw LoomError("prefill: RunLayers before Embed");
+    // The layers go into one graph, so kernels with no data between them (the input projections of a layer, the DeltaNet
+    // gate projection and the conv / DeltaNet chain) can run at the same time.
+    LoomGraph graph(gpu_);
+    graph.ReadOnly(weights_);
+    for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
+      graph.ReadOnly(t->handle);
+    graph_ = &graph;
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       RunNorm(pre + "attn_norm.weight");
@@ -116,6 +123,8 @@ class LoomPrefill {
       RunSwiglu(pre + "ffn_up.weight");
       RunResidual(pre + "ffn_down.weight", *ffnup_);
     }
+    graph_ = nullptr;
+    graph.Launch();
   }
 
   // Final norm + output head of hidden() row `row` (this chunk) into dst (kVocab f32).
@@ -300,11 +309,28 @@ class LoomPrefill {
     return it->second;
   }
   // The export's own workgroup size wins; sx is only the fallback for metadata without one.
+  // writes: the bindings the kernel may write (bit i = binding i), for the graph's dependencies; by default all of them.
   void Dispatch(const LoomExecutable& exe, const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
-                std::uint32_t sx, std::uint32_t sy, std::uint32_t sz, const std::vector<hrx_buffer_ref_t>& b) {
+                std::uint32_t sx, std::uint32_t sy, std::uint32_t sz, const std::vector<hrx_buffer_ref_t>& b,
+                std::uint64_t writes = ~std::uint64_t{0}) {
     const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
-    gpu_.Dispatch(exe, ordinal, LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz), nullptr, 0, b.data(), b.size());
+    const hrx_dispatch_config_t config = LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz);
+    if (graph_)
+      graph_->Dispatch(exe, ordinal, config, b.data(), b.size(), writes);
+    else
+      gpu_.Dispatch(exe, ordinal, config, nullptr, 0, b.data(), b.size());
+  }
+  // A GEMM writes only its outputs; the hand-written Q2_K GEMM also stages its accumulators in ostage.
+  std::uint64_t GemmWrites(const std::vector<hrx_buffer_ref_t>& b, const Fmt& f,
+                           std::initializer_list<const LoomBuffer*> outs) const {
+    std::uint64_t m = 0;
+    for (std::size_t i = 0; i < b.size(); ++i) {
+      for (const LoomBuffer* o : outs)
+        if (b[i].buffer == o->handle) m |= std::uint64_t{1} << i;
+      if (std::string(f.name) == "q2k" && b[i].buffer == ostage_->handle) m |= std::uint64_t{1} << i;
+    }
+    return m;
   }
   // A per-chunk HAL: chunk 0 is "<stem>.hal", chunk c "<stem>_c<c>.hal" (start_pos is compiled in).
   LoomExecutable& ChunkExe(const std::string& stem, std::uint32_t c) {
@@ -475,7 +501,7 @@ class LoomPrefill {
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_}) b.push_back(Ref(*x));
     b.push_back(Ref(out));
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32,
-             1, 1, b);
+             1, 1, b, GemmWrites(b, f, {&out}));
   }
   // The attention q projection with the q / gate unpack fused in (rows = heads x [256 q | 256 gate]).
   // Returns false if the set has no such HAL; the caller then runs kstore + yah_unpack_qg.
@@ -489,7 +515,7 @@ class LoomPrefill {
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, q_, gate_}) b.push_back(Ref(*x));
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_kqg").c_str(), MTiles(*t) / g.rowgrp,
-             TokenTiles(g), 1, 32, 1, 1, b);
+             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {q_, gate_}));
     return true;
   }
   void RunSwiglu(const std::string& wname) {
@@ -500,7 +526,7 @@ class LoomPrefill {
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, gateffn_, uwstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(), MTiles(*t) / g.rowgrp,
-             TokenTiles(g), 1, 32, 1, 1, b);
+             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
   }
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
@@ -513,7 +539,7 @@ class LoomPrefill {
       auto b = GemmWeights(*t, f);
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, hidden_, wstage_, ostage_, hidden2_}) b.push_back(Ref(*x));
       Dispatch(Exe(fused), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(), MTiles(*t) / g.rowgrp,
-               TokenTiles(g), 1, 32, 1, 1, b);
+               TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
       std::swap(hidden_, hidden2_);
       return;
     }
@@ -522,7 +548,7 @@ class LoomPrefill {
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_, partial_}) b.push_back(Ref(*x));
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32,
-             1, 1, b);
+             1, 1, b, GemmWrites(b, f, {partial_}));
     const std::size_t n = std::size_t{B_} * kHidden;
     Dispatch(Exe("accum.hal"), "yah_residual_1d", static_cast<std::uint32_t>(n / 256), 1, 1, 256, 1, 1,
              {Ref(*hidden_), {partial_->handle, 0, n * 4}, Ref(*hidden2_)});
@@ -657,6 +683,7 @@ class LoomPrefill {
   std::deque<LoomBuffer> keep_;  // stable addresses
   std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, attn_hpw_ = 0, attn_tpw_ = 0;
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
+  LoomGraph* graph_ = nullptr;  // open while RunLayers records
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool attn_kq4_ = false, attn_kq8_ = false, attn_vq4_ = false, attn_vq8_ = false, attn_vqt_ = false;
   bool paged_f16k_ = false, paged_f16v_ = false;
