@@ -74,7 +74,7 @@ def gen_deltanet(NH=48, NKH=16, D=128):
     value head, 512 lanes: lane t owns row j = t / 4 and keys 32 (t % 4) .. +32,
     k_norm / q_norm in LDS, the two row dots finished with xor shuffles 1, 2.
 
-    The decode conv (yah_ssm_conv_decode: dot = s1 w0 + s2 w1 + s3 w2 + x w3,
+    The decode conv (dot = s1 w0 + s2 w1 + s3 w2 + x w3,
     silu, state shift) runs here on the raw qkv projection: lanes 0..127 convolve the
     head's q / k channels (key head kh = h % NKH, recomputed by its NH / NKH value
     heads) and v channels. The conv state ping-pongs between a read and a write buffer
