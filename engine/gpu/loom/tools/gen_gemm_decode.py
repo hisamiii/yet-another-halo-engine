@@ -337,17 +337,19 @@ def iq3s_compute(v, gb):
         e(f"    %dsc_v8_{u} = vector.splat %dsc{u} : vector<8xf32>")
         _col_of(e, u)
         gws = []
+        # grid indices from 32-bit words (one v_bfe_u32 each); their range is known, so no clamp
+        e(f"    %qsw{u} = vector.bitcast {qs} : vector<8xi8> to vector<2xi32>")
         for lw in range(8):
             t = f"{u}_{lw}"
-            e(f"    %qlo8_{t} = vector.extract {qs}[{lw}] : vector<8xi8> -> i8")
-            e(f"    %qlo_{t} = scalar.extui %qlo8_{t} : i8 to i32")
+            e(f"    %qwd_{t} = vector.extract %qsw{u}[{lw // 4}] : vector<2xi32> -> i32")
+            e(f"    %qsh_{t} = scalar.shrui %qwd_{t}, %c{8 * (lw % 4)}i : i32")
+            e(f"    %qlo_{t} = scalar.andi %qsh_{t}, %c255i : i32")
             e(f"    %hb0_{t} = scalar.shrui %qhb{u}, %c{lw}i : i32")
             e(f"    %hb_{t} = scalar.andi %hb0_{t}, %c1i : i32")
             e(f"    %hb8_{t} = scalar.shli %hb_{t}, %c8i : i32")
             e(f"    %gi_{t} = scalar.ori %qlo_{t}, %hb8_{t} : i32")
             e(f"    %gix_{t} = index.cast %gi_{t} : i32 to index")
-            e(f"    %gil_{t} = index.max %gix_{t}, %c0 : index")
-            e(f"    %gid_{t} = index.min %gil_{t}, %c511 : index")
+            e(f"    %gid_{t} = index.assume %gix_{t} [range(%gix_{t}, 0, 511)] : index")
             e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<512xi32> -> i32")
             gws.append(f"%gw_{t}")
         for pp in range(4):
@@ -425,21 +427,22 @@ def iq3xxs_compute(v, gb):
         e(f"    %dsc_v8_{u} = vector.splat %dsc{u} : vector<8xf32>")
         _col_of(e, u)
         gws = []
+        # grid indices from 32-bit words (one v_bfe_u32 each); their range is known, so no clamp
+        e(f"    %qsw{u} = vector.bitcast {qs} : vector<8xi8> to vector<2xi32>")
         for lw in range(8):
             t = f"{u}_{lw}"
-            e(f"    %qlo8_{t} = vector.extract {qs}[{lw}] : vector<8xi8> -> i8")
-            e(f"    %qlo_{t} = scalar.extui %qlo8_{t} : i8 to i32")
+            e(f"    %qwd_{t} = vector.extract %qsw{u}[{lw // 4}] : vector<2xi32> -> i32")
+            e(f"    %qsh_{t} = scalar.shrui %qwd_{t}, %c{8 * (lw % 4)}i : i32")
+            e(f"    %qlo_{t} = scalar.andi %qsh_{t}, %c255i : i32")
             e(f"    %gix_{t} = index.cast %qlo_{t} : i32 to index")
-            e(f"    %gil_{t} = index.max %gix_{t}, %c0 : index")
-            e(f"    %gid_{t} = index.min %gil_{t}, %c255 : index")
+            e(f"    %gid_{t} = index.assume %gix_{t} [range(%gix_{t}, 0, 255)] : index")
             e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<256xi32> -> i32")
             gws.append(f"%gw_{t}")
         for pp in range(4):
             e(f"    %sid0_{u}_{pp} = scalar.shrui %aux{u}, %c{7 * pp}i : i32")
             e(f"    %sid_{u}_{pp} = scalar.andi %sid0_{u}_{pp}, %c127i : i32")
             e(f"    %sidx_{u}_{pp} = index.cast %sid_{u}_{pp} : i32 to index")
-            e(f"    %sidl_{u}_{pp} = index.max %sidx_{u}_{pp}, %c0 : index")
-            e(f"    %sidc_{u}_{pp} = index.min %sidl_{u}_{pp}, %c127 : index")
+            e(f"    %sidc_{u}_{pp} = index.assume %sidx_{u}_{pp} [range(%sidx_{u}_{pp}, 0, 127)] : index")
             e(f"    %ks8_{u}_{pp} = view.load %ksigns_view[%sidc_{u}_{pp}] : view<128xi8> -> i8")
             _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%ks8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}")
     return L
