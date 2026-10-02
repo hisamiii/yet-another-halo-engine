@@ -93,29 +93,10 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     import gen_gemm_tile as TG
     if fmt not in TILE_FMTS:
         return None
-    prev_geom = TG.set_geometry(*geom) if geom else None
-    try:
-        return _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind)
-    finally:
-        if prev_geom:
-            TG.set_geometry(*prev_geom)
-
-
-def _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind):
-    tile, rowgrp = TG.geometry()
-    if mt % rowgrp or B % tile:
+    t = TG.default_tile(fmt, kind, kb, geom)
+    if mt % t.rowgrp:
         return None
-    decahead = (fmt, kind, kb) not in DECAHEAD_SKIP
-    return _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp, decahead)
-
-
-# Short-K residual GEMMs keep the plain schedule: with decode-ahead, 45% of wave time is s_waitcnt vmcnt(0) in the K loop.
-# These full drains serialize the read-ahead.
-DECAHEAD_SKIP = {("iq4xs", "kres", 24), ("q4k", "kres", 24)}
-
-
-def _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp, decahead):
-    return _emit_gen(lambda f, k: TG.gen(f, k, decahead), tile, fmt, mt, kb, B, out, outdir, kind, rowgrp)
+    return _emit_gen(lambda f, k: TG.gen(f, k, t), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp)
 
 
 def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp):

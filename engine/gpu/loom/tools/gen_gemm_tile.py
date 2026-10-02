@@ -11,31 +11,24 @@ Many waves per SIMD hide the load latency that the wave64 shared kernel (about 2
 """
 import os
 import sys
+from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gen_gemm_decode as G  # noqa: E402
 
-# Workgroup geometry: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).
+# Default workgroup: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).
 # 256 x 256 does not fit: 64 KB of tiles plus the IQ grid table in LDS is over gfx11's 64 KB per workgroup.
-BN = 256   # tokens per workgroup
-BM = 128   # rows per workgroup
-WM = 4     # waves along rows
-WN = 4     # waves along tokens
-TM, TN = BM // WM, BN // WN   # per-wave tile
-FM, FN = TM // 16, TN // 16   # fragments per wave
-NWAVE = WM * WN
 WS = 32
-LANES = WS * NWAVE
-assert BM % (16 * WM) == 0 and BN % (16 * WN) == 0 and LANES >= BM and LANES % BN == 0
-ROWGRP = BM // 16             # m_tiles per workgroup
-APL = LANES // BN             # lanes staging one token row of the activation tile
 APAD = 8                      # f16 of padding per LDS activation row
 # Decode-ahead: after the barrier the decoding waves decode the next phase into a second weight tile.
 # So their VALU overlaps every wave's MMAs of the current phase. Needs two weight tiles in LDS: KSUB=32 at 128 x 256.
 # Off for the IQ3 formats: their LDS grid lookups contend with the MMA fragment loads.
 # Off for Q5_K: its read-ahead loads meet s_waitcnt vmcnt(0) drains inside the K loop, which serialize the prefetch.
 DECAHEAD_FMTS = ("iq4xs", "q4k", "q6k")
+# Short-K residual GEMMs keep the plain schedule: with decode-ahead, 45% of wave time is s_waitcnt vmcnt(0) in the K loop.
+# These full drains serialize the read-ahead.
+DECAHEAD_SKIP = {("iq4xs", "kres", 24), ("q4k", "kres", 24)}
 # The swiglu epilogue through lds_epilogue (one barrier, wave-private slabs, 4-row vector loads/stores).
 # swiglu_epilogue issues one dependent gate load per element in a rolled loop; with one workgroup per WGP nothing hides it.
 # IQ4_XS keeps swiglu_epilogue: neutral at 2x the code.
@@ -64,91 +57,125 @@ KSL_FMTS = ("iq4xs", "q4k", "iq3s", "iq3xxs", "q3k")
 # EPAD: pad of the LDS epilogue slab's token pitch (f32).
 # With pitch TM the 16 lanes storing a fragment row are 128 B apart (one or two banks).
 EPAD = 4
-
-# set per format by configure()
-DECAHEAD = KSL = DECLOAD = RHS_OUTER = False
-RHS_FENCE = 0
-
-
-def configure(fmt, decahead):
-    """Set the per-format switches and gen_gemm_decode's decode geometry for fmt; return KSUB."""
-    global DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE
-    RHS_OUTER = fmt in RHSO_FMTS
-    RHS_FENCE = RHSO_FMTS.get(fmt, 0)
-    KSL = fmt in KSL_FMTS
-    DECLOAD = fmt in KSL_FMTS
-    DECAHEAD = decahead and fmt in DECAHEAD_FMTS
-    # the decoding lanes must be whole waves (a wave-uniform branch): not so for the 16-row tiles, which keep the plain schedule
-    if DECAHEAD and BM % WS:
-        DECAHEAD = False
-    # KSUB=64 (32 for decode-ahead's two weight tiles): at 128 the 128 x 256 tiles need ~104 KB of LDS
-    ksub = 32 if DECAHEAD else 64
-    G.KSUB = ksub
-    G.PAD = WPAD
-    G.ROWP = ksub + G.PAD
-    G.PH = 256 // ksub
-    G.GPP = ksub // 32
-    # one group per decoding lane (q4k/q5k pick the nibble at run time)
-    G.GPL = 1
-    G.Q4_HDR = fmt in ("q4k", "q5k")
-    # IQ3 word-path decode (gen_gemm_decode VDEC_W, IQ3_U8F, VDECW_FR), bit-identical: IQ3_XXS, and IQ3_S at 4 x 2.
-    # At 4 x 4 IQ3_S gains nothing: the longer dependent chain is exposed between barriers, where every wave decodes at once.
-    w3 = fmt == "iq3xxs" or (fmt == "iq3s" and (WM, WN) == (4, 2))
-    G.VDEC_W = w3
-    G.IQ3_U8F = w3
-    # Q4_K: subtract-and-narrow through v_fma_mix (gen_gemm_decode Q4FMIX); this lets Q4_K run at 4 x 2 without spills
-    G.Q4FMIX = fmt in ("q4k", "q5k")
-    G.VDECW_FR = w3
-    G.LR = BM
-    G.NW = NWAVE // 2          # table-staging stride 64*NW = LANES
-    assert G.GPP * BM <= LANES, "not enough lanes to decode a phase in one pass"
-    assert (ksub // 8) % APL == 0, "activation row does not split evenly over its lanes"
-    return ksub
-
-
-def geometry():
-    """(tokens per workgroup, m_tiles per workgroup) for dispatch.txt."""
-    return BN, ROWGRP
-
-
-def set_geometry(bm=None, bn=None, wm=None, wn=None):
-    """Switch the workgroup geometry for the next gen() (e.g. 16-row tiles for 48-row matrices).
-    Return the previous (BM, BN, WM, WN)."""
-    global BM, BN, WM, WN, TM, TN, FM, FN, NWAVE, LANES, ROWGRP, APL
-    prev = (BM, BN, WM, WN)
-    BM, BN, WM, WN = bm or BM, bn or BN, wm or WM, wn or WN
-    TM, TN = BM // WM, BN // WN
-    FM, FN = TM // 16, TN // 16
-    NWAVE = WM * WN
-    LANES = WS * NWAVE
-    assert BM % (16 * WM) == 0 and BN % (16 * WN) == 0 and LANES >= BM and LANES % BN == 0
-    ROWGRP = BM // 16
-    APL = LANES // BN
-    return prev
-
-
 # Formats that run 4 x 2 waves (32 x 128 per wave) on the 128 x 256 geometry: fewer fragment loads per WMMA (1.5 -> 1.25).
 # 2 x 4 (64 x 64) has fewer instructions still but drops off the issue bound (exposed latency).
-# Q4_K / Q5_K fit in VGPRs at 4 x 2 only with Q4FMIX, IQ3_S only with the word-path decode (configure()).
+# Q4_K / Q5_K fit in VGPRs at 4 x 2 only with Q4FMIX, IQ3_S only with the word-path decode (w3).
 # IQ3_XXS swiglu at 4 x 2 needs the LDS epilogue (SWEPI_FMTS).
 WAVE_FMTS = ("iq4xs", "iq3xxs", "q3k", "iq3s", "q4k", "q5k")
 
 
-def gen(fmt, kind="kstore", decahead=True):
-    """Return the kernel text for fmt; kind as gen_gemm_decode.gen() plus "kqg".
-    decahead=False keeps the plain schedule for a format in DECAHEAD_FMTS."""
-    if fmt in WAVE_FMTS and (BM, BN, WM, WN) == (128, 256, 4, 4):
-        prev = set_geometry(wm=4, wn=2)
-        try:
-            return _gen(fmt, kind, decahead)
-        finally:
-            set_geometry(*prev)
-    return _gen(fmt, kind, decahead)
+@dataclass(frozen=True)
+class Tile:
+    """The knobs of one tile GEMM. default_tile() gives the shipped choice; a tuner may pick another legal Tile.
+    No knob changes the per-accumulator MMA order or the decode arithmetic, so every legal Tile gives bit-identical output."""
+    bm: int = 128              # weight rows per workgroup
+    bn: int = 256              # tokens per workgroup
+    wm: int = 4                # waves along rows
+    wn: int = 4                # waves along tokens
+    ksub: int = 64             # K per phase
+    decahead: bool = False     # decode the next phase during this phase's MMAs (two weight tiles)
+    ksl: bool = False          # straight-line k steps (KSL_FMTS)
+    decload: bool = False      # under decode-ahead only the decoding waves load weights (DECLOAD)
+    rhs_outer: bool = False    # rhs-outer MMA order
+    rhs_fence: int = 0         # fence every n rhs groups under rhs_outer
+    w3: bool = False           # IQ3 word-path decode (gen_gemm_decode VDEC_W, IQ3_U8F, VDECW_FR)
+    q4fmix: bool = False       # Q4_K/Q5_K subtract-and-narrow through v_fma_mix (gen_gemm_decode Q4FMIX)
+    swepi: bool = False        # swiglu through lds_epilogue
+    stagger: int = STAGGER     # barriers the second workgroup per WGP waits in the first round
+
+    @property
+    def tm(self):
+        return self.bm // self.wm
+
+    @property
+    def tn(self):
+        return self.bn // self.wn
+
+    @property
+    def nwave(self):
+        return self.wm * self.wn
+
+    @property
+    def lanes(self):
+        return WS * self.nwave
+
+    @property
+    def rowgrp(self):
+        """m_tiles per workgroup."""
+        return self.bm // 16
+
+    @property
+    def apl(self):
+        """Lanes staging one token row of the activation tile."""
+        return self.lanes // self.bn
 
 
-def _gen(fmt, kind, decahead):
+def default_tile(fmt, kind, kb, geom=None):
+    """The shipped Tile for fmt / kind at k_blocks kb; geom=(BM, BN, WM, WN) overrides the geometry (16-row tiles)."""
+    if geom:
+        bm, bn, wm, wn = geom
+    else:
+        bm, bn, wm, wn = (128, 256, 4, 2) if fmt in WAVE_FMTS else (128, 256, 4, 4)
+    # the decoding lanes must be whole waves (a wave-uniform branch): not so for the 16-row tiles, which keep the plain schedule
+    decahead = fmt in DECAHEAD_FMTS and (fmt, kind, kb) not in DECAHEAD_SKIP and bm % WS == 0
+    # IQ3 word-path decode, bit-identical: IQ3_XXS, and IQ3_S at 4 x 2.
+    # At 4 x 4 IQ3_S gains nothing: the longer dependent chain is exposed between barriers, where every wave decodes at once.
+    w3 = fmt == "iq3xxs" or (fmt == "iq3s" and (wm, wn) == (4, 2))
+    return Tile(bm, bn, wm, wn,
+                # KSUB=64 (32 for decode-ahead's two weight tiles): at 128 the 128 x 256 tiles need ~104 KB of LDS
+                ksub=32 if decahead else 64,
+                decahead=decahead, ksl=fmt in KSL_FMTS, decload=fmt in KSL_FMTS,
+                rhs_outer=fmt in RHSO_FMTS, rhs_fence=RHSO_FMTS.get(fmt, 0), w3=w3,
+                # Q4_K: this lets Q4_K run at 4 x 2 without spills
+                q4fmix=fmt in ("q4k", "q5k"),
+                swepi=kind == "swiglu" and fmt in SWEPI_FMTS and bm // wm == 32)
+
+
+def check(t):
+    """Raise ValueError if t cannot be emitted (shape rules only; the compiler rejects LDS or VGPR overflow)."""
+    rules = [
+        (t.bm % (16 * t.wm) == 0 and t.bn % (16 * t.wn) == 0, "per-wave tile is not whole 16 x 16 fragments"),
+        (t.lanes >= t.bm and t.lanes % t.bn == 0, "lanes do not cover the weight rows and token rows"),
+        (t.ksub in (32, 64, 128) and (not t.decahead or t.bm % WS == 0), "KSUB or decode-ahead geometry"),
+        (t.ksub // 32 * t.bm <= t.lanes, "not enough lanes to decode a phase in one pass"),
+        ((t.ksub // 8) % t.apl == 0, "activation row does not split evenly over its lanes"),
+        (not t.swepi or t.tm == 32, "the LDS swiglu epilogue needs 32 rows per wave"),
+    ]
+    for ok, why in rules:
+        if not ok:
+            raise ValueError(f"{t}: {why}")
+
+
+def configure(fmt, t):
+    """Set gen_gemm_decode's decode geometry and switches for fmt under tile t."""
+    G.KSUB = t.ksub
+    G.PAD = WPAD
+    G.ROWP = t.ksub + G.PAD
+    G.PH = 256 // t.ksub
+    G.GPP = t.ksub // 32
+    # one group per decoding lane (q4k/q5k pick the nibble at run time)
+    G.GPL = 1
+    G.Q4_HDR = fmt in ("q4k", "q5k")
+    G.VDEC_W = G.IQ3_U8F = G.VDECW_FR = t.w3
+    G.Q4FMIX = t.q4fmix
+    G.LR = t.bm
+    G.NW = t.nwave // 2        # table-staging stride 64*NW = LANES
+
+
+def gen(fmt, kind="kstore", tile=None):
+    """Return the kernel text for fmt; kind as gen_gemm_decode.gen() plus "kqg". tile defaults to default_tile()."""
+    t = tile or default_tile(fmt, kind, 0)
+    check(t)
+    configure(fmt, t)
+    return _gen(fmt, kind, t)
+
+
+def _gen(fmt, kind, t):
+    BM, BN, WM, WN, TM, TN = t.bm, t.bn, t.wm, t.wn, t.tm, t.tn
+    FM, FN, NWAVE, LANES, ROWGRP, APL = TM // 16, TN // 16, t.nwave, t.lanes, t.rowgrp, t.apl
+    DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE = t.decahead, t.ksl, t.decload, t.rhs_outer, t.rhs_fence
     F = G.FMTS[fmt]
-    ksub = configure(fmt, decahead)
+    ksub = t.ksub
     bb, (loads, compute) = F["bb"], F["decode"]
     kr = kind == "kres"
     sw = kind == "swiglu"
@@ -185,7 +212,7 @@ def _gen(fmt, kind, decahead):
     e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
     e("  %base = index.constant 0 : offset")
-    for v in sorted({0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN - 1}):
+    for v in sorted({0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN}):
         e(f"  %c{v} = index.constant {v} : index")
     # the same i32 constants gen_gemm_decode defines (q8_0 needs 18 and 34)
     for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 18, 21, 24, 28, 32, 34, 48, 63, 64, 66, 74, 104, 106, 127, 128, 192, 255):
@@ -275,7 +302,7 @@ def _gen(fmt, kind, decahead):
     e(f"  %stg_w2 = index.constant {2 * STG_NWGP} : index")
     e("  %stg_ge = index.cmp uge, %stg_lin, %stg_w : index")
     e("  %stg_lt = index.cmp ult, %stg_lin, %stg_w2 : index")
-    e(f"  %stg_n = index.constant {STAGGER} : index")
+    e(f"  %stg_n = index.constant {t.stagger} : index")
     e("  %stg_n1 = scf.select %stg_ge, %stg_n, %c0 : index")
     e("  %stg_n2 = scf.select %stg_lt, %stg_n1, %c0 : index")
     e("  %stg_iters = scf.select %stg_big, %stg_n2, %c0 : index")
@@ -530,18 +557,18 @@ def _gen(fmt, kind, decahead):
         e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
           + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
         e("  }")
-    if sw and fmt in SWEPI_FMTS and TM == 32:
-        lds_epilogue(e, kr, V8, sw=True)
+    if t.swepi:
+        lds_epilogue(e, t, kr, V8, sw=True)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
     if sw:
-        swiglu_epilogue(e, arow)
+        swiglu_epilogue(e, t, arow)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
     if TM == 32:
-        lds_epilogue(e, kr, V8, qg=qg)
+        lds_epilogue(e, t, kr, V8, qg=qg)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
@@ -567,10 +594,11 @@ def _gen(fmt, kind, decahead):
     return "\n".join(L) + "\n"
 
 
-def lds_epilogue(e, kr, V8, sw=False, qg=False):
+def lds_epilogue(e, t, kr, V8, sw=False, qg=False):
     """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
     A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical."""
+    TM, FM, FN = t.tm, t.tm // 16, t.tn // 16
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e(f"  %es_ctm = index.constant {TM + EPAD} : index")
     e("  %es_lay = encoding.layout.strided [%c1, %es_ctm] : encoding<layout>")
@@ -665,10 +693,11 @@ def lds_epilogue(e, kr, V8, sw=False, qg=False):
                 e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
 
 
-def swiglu_epilogue(e, arow):
+def swiglu_epilogue(e, t, arow):
     """out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the .loom kernel's scalar ops in order (bit-identical).
     As in gen_gemm_decode, each 16-row x ES-token slab goes through a per-wave f32 LDS tile; a loop walks it lane-contiguous.
     ES is the larger of 32, 16 for which all waves' slabs fit in the activation tile's LDS."""
+    BN, TN, NWAVE, FM, FN = t.bn, t.tn, t.nwave, t.tm // 16, t.tn // 16
     ES = next(x for x in (32, 16) if x <= TN and NWAVE * 16 * x * 4 <= BN * arow * 2)
     assert TN % ES == 0
     V8 = "vector<8xf32>"
