@@ -249,3 +249,36 @@ is a wash: it helps tier A and the 99% column and hurts the arXiv mean.
 
 Pick for kv4a4: H256 + asymmetric int4 per token-half (zero point as a rank-1
 correction). For kv4a8: asymmetric per 32-dim group, applied at staging decode.
+
+## Real kernels (2026-10-02, commit b875efe): kv4a4 v2, kv4a16, kv8a16
+
+Gate: 4 docs (both books, code, arXiv) x first 8192 tokens, one-pass B=8192,
+vs fp16 (/home/q/yah-hal-p63-8192). Sets: /home/q/yah-hal-p67{kv4a4,kv4a16,kv8a16}-8192.
+
+| config | dPPL | mean KLD | 99% KLD | 99.9% KLD | 99% prec | 99.9% prec | same top |
+|---|---|---|---|---|---|---|---|
+| int8 old (iu8, Q int8) | -0.00% | 0.000063 | 0.0016 | 0.0044 | 99.84% | 99.56% | 99.80% |
+| kv8a16 | -0.03% | 0.000045 | 0.0011 | 0.0046 | 99.89% | 99.54% | 99.83% |
+| kv4a16 | +0.02% | 0.001343 | 0.0152 | 0.0677 | 98.49% | 93.45% | 98.30% |
+| kv4a4 new (H256 + asym/half) | +0.15% | 0.003753 | 0.0372 | 0.1300 | 96.35% | 87.81% | 97.54% |
+| kv4a4 old (basic) | +0.76% | 0.008525 | 0.0903 | 0.1999 | 91.36% | 81.88% | 95.51% |
+
+pp8192 attention cycles (SQ_BUSY_CYCLES, one round each, APU <= 55 C + 30 s):
+
+| config | attention kernel | + quantizers | attention total | vs fp16 |
+|---|---|---|---|---|
+| fp16 | 1021.6 M | 7.1 M | 1028.7 M | - |
+| kv4a4 old | 878.8 M | 9.4 M | 888.3 M | -13.7% |
+| kv4a4 new | 900.1 M | 11.1 M | 911.2 M | -11.4% |
+| int8 old | 1005.8 M | 8.9 M | 1014.6 M | -1.4% |
+| kv8a16 | 1148.0 M | 8.8 M | 1156.7 M | +12.4% |
+| kv4a16 | 1169.2 M | 11.1 M | 1180.3 M | +14.7% |
+
+- kv4a4 v2 costs +2.4% attention over v1: the rank-1 fma plus the zero loads.
+- The a16 configs pay for the int-to-f16 staging decode (~32 VALU per thread
+  per K tile) in an issue-bound kernel. They are memory/quality configs.
+- Attention is ~3.5% of pp8192 cycles (1.03 of 29.0 G), so kv4a4 saves
+  ~0.4% of pp8192.
+- Prefill totals vary +-200 M between runs (non-attention kernels): compare
+  the attention rows.
+- Quantized KV is not yet supported in chunked prefill (YAH_CTX > B).
