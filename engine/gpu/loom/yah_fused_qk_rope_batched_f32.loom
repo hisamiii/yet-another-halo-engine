@@ -41,6 +41,10 @@ config.decl @yah_fused_qk_rope_batched.cache32_elems : %value: index where [rang
 config.decl @yah_fused_qk_rope_batched.cache16_elems : %value: index where [range(%value, 1, 1073741824)]
 
 config.def @yah_fused_qk_rope_batched.theta = 10000000.0 : f32
+// cache_start: first position held by the f16 cache (row cur - cache_start).
+// 0 (default) = the whole context; chunked prefill with a quantized KV cache
+// sets it to the chunk start, so the f16 cache is a one-chunk scratch.
+config.def @yah_fused_qk_rope_batched.cache_start = 0 : index
 
 kernel.def target(@yah_wave32) @yah_fused_qk_rope_batched() {
   %unit = index.constant 1 : index
@@ -61,6 +65,7 @@ kernel.def target(@yah_wave32) @yah_fused_qk_rope_batched() {
   %start_pos = config.get @yah_fused_qk_rope_batched.start_pos : index
   %layer_idx = config.get @yah_fused_qk_rope_batched.layer_idx : index
   %max_context = config.get @yah_fused_qk_rope_batched.max_context : index
+  %cache_start = config.get @yah_fused_qk_rope_batched.cache_start : index
   %num_heads = config.get @yah_fused_qk_rope_batched.num_heads : index
   %num_kv_heads = config.get @yah_fused_qk_rope_batched.num_kv_heads : index
   %head_dim = config.get @yah_fused_qk_rope_batched.head_dim : index
@@ -189,7 +194,8 @@ kernel.def target(@yah_wave32) @yah_fused_qk_rope_batched() {
     %cache32_max = index.sub %cache32_elems, %head_dim : index
     %kv_off = index.min %kv_off_raw, %cache32_max : index
     %lm = index.mul %layer_idx, %max_context : index
-    %lmp = index.add %lm, %cur : index
+    %cur16 = index.sub %cur, %cache_start : index
+    %lmp = index.add %lm, %cur16 : index
     %f16_pre = index.mul %lmp, %kv_width : index
     %f16_off_raw = index.add %f16_pre, %hbkq : index
     %cache16_max = index.sub %cache16_elems, %head_dim : index

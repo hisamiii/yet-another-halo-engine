@@ -399,9 +399,9 @@ def main():
             open(kmean_src, "w").write(gen_kvq.gen_kmean())
             open(kq8_src, "w").write(gen_kvq.gen_kq4() if kq4_mode else gen_kvq.gen_kq8())
             geom.append(("attn_kq4" if kq4_mode else "attn_kq8", 0, 0, 0))
-        # YAH_ATTN_FA_VQ8=1 (int8 config, V half): uint8 V^T by yah_vstat +
-        # yah_vq8 instead of the f16 transpose
-        # YAH_ATTN_FA_VQ4=1 (kv4 configs): nibble V^T + (S, C') by yah_vq4
+        # YAH_ATTN_FA_VQ8=1 (kv8a16) / YAH_ATTN_FA_VQ4=1 (kv4a16): V^T as bytes /
+        # nibbles per channel per 16-key tile + (S, C') by yah_vq8 / yah_vq4
+        # instead of the f16 transpose (one HAL per chunk: start_pos)
         vq4_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
                   and os.environ.get("YAH_ATTN_FA_VQ4", "0") == "1")
         if vq4_on:
@@ -413,9 +413,7 @@ def main():
                   and os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1")
         if vq8_on:
             import gen_kvq
-            vstat_src = os.path.join(tmp, "yah_vstat.loom")
             vq8_src = os.path.join(tmp, "yah_vq8.loom")
-            open(vstat_src, "w").write(gen_kvq.gen_vstat())
             open(vq8_src, "w").write(gen_kvq.gen_vq8())
             geom.append(("attn_vq8", 0, 0, 0))
         if gen_attn_hip.F16OUT:
@@ -449,9 +447,15 @@ def main():
     # loom_forward_pp reads this instead of recomputing the grid, so the dispatch
     # site and the compiled kernel cannot disagree (see tools/emit_prefill.py,
     # chain=). A mismatch is silent and wrong, not a crash.
+    # Quantized K and V: attention never reads the f16 KV cache, so it becomes
+    # a one-layer, one-chunk scratch (RoPE writes row cur - cache_start; the
+    # quantizers read it right after): the driver sizes kv16 by this marker.
+    kv16_scratch = kq8_on and (vq4_on or vq8_on)
+    if kv16_scratch:
+        geom.append(("kv16_scratch", 0, 0, 0))
     if NCH > 1:
-        if kq8_on or vq8_on or vq4_on:
-            raise SystemExit("chunked prefill (YAH_CTX) supports the f16 KV cache only for now")
+        # quantized KV: K quantizers run per chunk on cache slices (kmean on
+        # chunk 0 only), V quantizers per chunk with start_pos (vq*_c<i>.hal)
         geom.append(("ctx", B, 0, T))     # chunk size, total context
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
@@ -509,7 +513,8 @@ def main():
             "yah_fused_qk_rope_batched.q_elems=%d" % (6144 * B),
             "yah_fused_qk_rope_batched.kv_elems=%d" % (1024 * B),
             "yah_fused_qk_rope_batched.cache32_elems=%d" % KC,
-            "yah_fused_qk_rope_batched.cache16_elems=%d" % KC]) for c in range(NCH)],
+            "yah_fused_qk_rope_batched.cache16_elems=%d" % (1024 * B if kv16_scratch else KC),
+            *(["yah_fused_qk_rope_batched.cache_start=%d" % (c * B)] if kv16_scratch else [])]) for c in range(NCH)],
         *[(attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
@@ -522,10 +527,12 @@ def main():
         *([(kmean_src, "kmean.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B]),
            (kq8_src, "kq8.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
           if kq8_on else []),
-        *([(vstat_src, "vstat.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B]),
-           (vq8_src, "vq8.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
-          if vq8_on else []),
-        *([(vq4_src, "vq4.hal", ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % B])]
+        *([(vq8_src, "vq8.hal" if c == 0 else "vq8_c%d.hal" % c,
+            ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % T, "yah_kvq.start_pos=%d" % (c * B)])
+           for c in range(NCH)] if vq8_on else []),
+        *([(vq4_src, "vq4.hal" if c == 0 else "vq4_c%d.hal" % c,
+            ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % T, "yah_kvq.start_pos=%d" % (c * B)])
+           for c in range(NCH)]
           if vq4_on else []),
         *([("yah_conv_state_f32.loom", "convstate.hal",
             ["yah_conv_state.batch=%d" % B, "yah_conv_state.channels=10240"])] if NCH > 1 else []),
