@@ -38,7 +38,7 @@ class LoomPrefill {
   static constexpr std::uint32_t kHeads = 24, kKvHeads = 4, kHeadDim = 256, kVocab = 248320;
   static constexpr std::uint32_t kKvRow = kKvHeads * kHeadDim;  // one KV cache row: all KV heads of one token
 
-  // Called after RoPE of attention layer ai in chunk ci, with the layer's f16 K and V offsets in kv16().
+  // Called after RoPE of attention layer ai in chunk ci, with the layer's f16 K and V offsets in the KV scratch.
   using KvHook = std::function<void(std::uint32_t ai, std::uint32_t ci, std::size_t koff, std::size_t voff)>;
 
   // tokens: the token count of a one-pass (unchunked) set; ignored for a chunked set, which fixes B.
@@ -68,10 +68,6 @@ class LoomPrefill {
     return {attn_kq4_ ? 4u : attn_kq8_ ? 8u : 16u, attn_vq4_ ? 4u : attn_vq8_ ? 8u : 16u};
   }
   LoomBuffer& hidden() { return *hidden_; }
-  LoomBuffer& q() { return *q_; }
-  LoomBuffer& kv16() { return *kv16_; }
-  // True when kv16() holds only the current layer's chunk (paged or quantized KV), not every layer's whole cache.
-  [[nodiscard]] bool kv16_scratch() const { return kv16_scratch_; }
 
   // Zero the recurrent state before a new sequence. KV rows need no reset: attention reads only keys <= the query.
   void Reset() {
@@ -130,7 +126,7 @@ class LoomPrefill {
     Dispatch(Exe("argmax.hal"), "yah_argmax", 1, 1, 1, 32, 1, 1, {logits, dst});
   }
 
-  // Quantized V, from a KvHook of the last chunk: copy rows r0..r0+cnt of the layer's f16 V (voff in kv16()) into a
+  // Quantized V, from a KvHook of the last chunk: copy rows r0..r0+cnt of the layer's f16 V (voff in the KV scratch) into a
   // decoder's open tile dst. params: device i32 (r0, cnt).
   void SeedOpenTile(std::size_t voff, const hrx_buffer_ref_t& params, const hrx_buffer_ref_t& dst) {
     Dispatch(Exe("vseed.hal"), "yah_vseed", 4, 1, 1, 256, 1, 1,

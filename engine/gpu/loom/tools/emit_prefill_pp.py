@@ -70,31 +70,17 @@ def rope_kpaged(text):
     return text
 
 
-def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
-    """Emit a generated GEMM for this shape and kind; return its dispatch.txt row, or None for the hand-written kernel.
-    Tries the tile GEMM (tools/gen_gemm_tile.py) first, then the shared-decode GEMM (tools/gen_gemm_shared.py).
-    """
-    import gen_gemm_shared as G
-    if fmt not in G.FMTS:
-        return None
+def qk_of(fmt):
+    return next(qk for f, _, qk in E.FMT.values() if f == fmt)
+
+
+def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
+    """Emit the tile GEMM (tools/gen_gemm_tile.py) of this shape and kind; return its dispatch.txt row, or None."""
     r = tile_kstore(fmt, mt, kb, B, out, outdir, kind)
-    if r:
-        return r
-    if mt < 4:
+    if not r and mt < 4:
         # the 48-row ssm_alpha/ssm_beta: one 16-row tile per workgroup, 64 tokens over 2 waves, grid (3, B/64)
         r = tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=(16, 64, 1, 2))
-        if r:
-            return r
-    if mt % 4 and mt > 4:
-        return None
-    # shared GEMM for matrices under 64 rows: m_tiles row tiles per wave and 16-token waves, so the grid has 8x more workgroups
-    small = mt < 4
-    prev = G.set_geometry(mt=mt, tok=16) if small else None
-    try:
-        return _emit_shared(G, fmt, mt, kb, B, out, outdir, kind, rowgrp=mt if small else 4)
-    finally:
-        if prev:
-            G.set_geometry(*prev)
+    return r
 
 
 # Formats the tile GEMM (tools/gen_gemm_tile.py) is verified bit-identical on in the pp2048 pipeline.
@@ -129,18 +115,7 @@ DECAHEAD_SKIP = {("iq4xs", "kres", 24), ("q4k", "kres", 24)}
 
 
 def _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp, decahead):
-    # TG.configure() rewrites gen_gemm_shared's module globals (NW, LR, KSUB...); restore them for later shared-GEMM emits
-    G = TG.G
-    keep = {k: getattr(G, k) for k in ("KSUB", "PAD", "ROWP", "PH", "GPP", "GPL", "LR", "NW")}
-    try:
-        return _emit_gen(lambda f, k: TG.gen(f, k, decahead), tile, fmt, mt, kb, B, out, outdir, kind, rowgrp)
-    finally:
-        for k, v in keep.items():
-            setattr(G, k, v)
-
-
-def _emit_shared(G, fmt, mt, kb, B, out, outdir, kind, rowgrp):
-    return _emit_gen(G.gen, G.TOK * G.NW, fmt, mt, kb, B, out, outdir, kind, rowgrp)
+    return _emit_gen(lambda f, k: TG.gen(f, k, decahead), tile, fmt, mt, kb, B, out, outdir, kind, rowgrp)
 
 
 def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp):
@@ -202,57 +177,23 @@ def main():
     n = 0
     geom = []  # (<hal>, <tokens per workgroup>, <row groups>, <token_tiles>)
     for kind, fmt, port, mt, kb in sorted(combos):
-        # the residual projections get a kstore and the fused-residual kres variant (loom_forward_pp prefers kres)
-        if kind in ("kstore", "residual"):
-            f = "yah_ffn_gemm_%s_f32.loom" % port
-        else:
-            f = "yah_ffn_gemm_%s_swiglu_f16.loom" % port
-        sym = E.sym_of(f)
-        if kind == "residual":
-            kout = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
-            sg = shared_kstore(fmt, mt, kb, B, kout, outdir)
-            if sg:
-                geom.append(sg)
-                kr = shared_kstore(fmt, mt, kb, B, "gemm_kres_%s_%d_%d.hal" % (fmt, mt, kb),
-                                   outdir, kind="kres")
-                if kr:
-                    geom.append(kr)
-                n += 1
-                continue
-            cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
-                   "%s.token_tiles=%d" % (sym, TT)]
-            if port == "iq3s":
-                cfg.append("%s.word_decode=1" % sym)
-            out = kout
-        elif kind == "kstore":
-            sg = shared_kstore(fmt, mt, kb, B, "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb), outdir)
-            if sg:
-                geom.append(sg)
-                # the attention q projection (12288 rows = 24 heads x [q|gate]) also gets kqg, which stores q and gate unpacked.
-                # loom_forward_pp prefers it and skips yah_unpack_qg.
-                if mt == 768:
-                    qgv = shared_kstore(fmt, mt, kb, B, "gemm_kqg_%s_%d_%d.hal" % (fmt, mt, kb),
-                                        outdir, kind="kqg")
-                    if qgv:
-                        geom.append(qgv)
-                n += 1
-                continue
-            cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
-                   "%s.token_tiles=%d" % (sym, TT)]
-            if port == "iq3s":
-                cfg.append("%s.word_decode=%d" % (sym, 0 if mt == 1088 else 1))
-            out = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
-        else:
-            out = "gemm_swiglu_%s_%d_%d.hal" % (fmt, mt, kb)
-            sg = shared_kstore(fmt, mt, kb, B, out, outdir, kind="swiglu")
-            if sg:
-                geom.append(sg)
-                n += 1
-                continue
-            cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
-                   "%s.token_tiles=%d" % (sym, TT)]
-        E.emit(f, cfg, out, outdir)
-        geom.append((out, TILE, 1, TT))
+        name = lambda k: "gemm_%s_%s_%d_%d.hal" % (k, fmt, mt, kb)
+        # A residual projection gets a kstore and the fused-residual kres; the attention q projection (12288 rows =
+        # 24 heads x [q | gate]) also gets kqg, which stores q and gate unpacked. The driver prefers kres and kqg.
+        kinds = {"kstore": ["kstore"] + (["kqg"] if mt == 768 else []), "residual": ["kstore", "kres"],
+                 "swiglu": ["swiglu"]}[kind]
+        for k in kinds:
+            r = gemm(fmt, mt, kb, B, name(k), outdir, kind=k)
+            if r:
+                geom.append(r)
+            elif k == "kstore" and fmt == "q2k":
+                # Q2_K has no tile decoder; its only tensors here are the 48-row ssm_alpha / ssm_beta.
+                sym = E.sym_of("yah_ffn_gemm_q2k_f32.loom")
+                E.emit("yah_ffn_gemm_q2k_f32.loom", ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
+                                                     "%s.token_tiles=%d" % (sym, TT)], name(k), outdir)
+                geom.append((name(k), TILE, 1, TT))
+            elif k == kinds[0]:
+                raise SystemExit("no GEMM kernel for %s %s (%d rows, K = %d)" % (fmt, k, mt * 16, kb * qk_of(fmt)))
         n += 1
 
     # Attention: tools/gen_attn_fa.py, 32 tokens x 2 heads per workgroup; reads V^T (vtrans.hal, or the paged / quantized pools).

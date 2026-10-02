@@ -3,7 +3,7 @@
 //   sub = i/16, l = i%16, shift = 2*((sub%8)/2), sc = scales[sub]
 //   q = (qs[(sub/8)*32 + (sub%2)*16 + l] >> shift) & 3; value = f32(d)*(sc & 15)*q - f32(dmin)*(sc >> 4)
 // d and dmin are at the end of the block, not at byte 0 as in Q4_K.
-// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Q2_K has no tile-GEMM decoder: emit_prefill_pp.py uses this kernel for it (the 48-row ssm_alpha / ssm_beta here).
 // Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
 // Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
 // Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k],

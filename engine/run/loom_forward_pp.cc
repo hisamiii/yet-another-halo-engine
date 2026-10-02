@@ -10,12 +10,6 @@
 //   YAH_LOGITS_FROM=P   f32 logits of positions P..tokens-1 into <out-prefix>.all_logits (engine/run/gate)
 //   YAH_ROWSTATS=<file> compact per-position logit statistics (engine/run/kvq/gate2.py); YAH_ROWSTATS_FROM (1024),
 //                       YAH_ROWSTATS_STRIDE (8) or a position list in YAH_ROWSTATS_POS
-//   YAH_KV_HOOK="cmd"   a child process rewrites each chunk's f16 K / V rows (KV codec study, engine/run/kvq);
-//                       YAH_KV_HOOK_QSTRIDE=n also sends every n-th roped Q row
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -23,7 +17,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
-#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,83 +50,6 @@ std::vector<std::uint32_t> ParseIds(const char* path) {
   if (ids.empty()) throw LoomError("ids file is empty");
   return ids;
 }
-
-// YAH_KV_HOOK protocol per (layer, chunk), little endian:
-//   -> int32 magic 0x4b56484b, attn layer, chunk, first row, rows, cols (1024), q_rows,
-//      then K rows x cols f16, V rows x cols f16, then q_rows x (int32 abs position + 6144 f32 roped Q)
-//   <- K rows x cols f16, V rows x cols f16 (written back into the cache)
-// A final header with rows = 0 tells the child to finish.
-class KvHook {
- public:
-  explicit KvHook(const char* cmd) {
-    int to_child[2], from_child[2];
-    if (pipe(to_child) || pipe(from_child)) throw LoomError("YAH_KV_HOOK: pipe failed");
-    pid_ = fork();
-    if (pid_ == 0) {
-      dup2(to_child[0], 0);
-      dup2(from_child[1], 1);
-      close(to_child[1]);
-      close(from_child[0]);
-      execl("/bin/sh", "sh", "-c", cmd, static_cast<char*>(nullptr));
-      _exit(127);
-    }
-    close(to_child[0]);
-    close(from_child[1]);
-    in_ = fdopen(to_child[1], "wb");
-    out_ = fdopen(from_child[0], "rb");
-    if (const char* qs = std::getenv("YAH_KV_HOOK_QSTRIDE")) qstride_ = std::atoi(qs);
-  }
-  ~KvHook() {
-    const std::int32_t fin[7] = {0x4b56484b, -1, -1, 0, 0, 0, 0};
-    std::fwrite(fin, 4, 7, in_);
-    std::fclose(in_);
-    std::fclose(out_);
-    int status = 0;
-    waitpid(pid_, &status, 0);
-  }
-  // Exchange one chunk of attention layer ai (the prefill's kv16 holds the whole cache: no quantized KV).
-  void Run(LoomDevice& gpu, LoomPrefill& pf, std::uint32_t ai, std::uint32_t ci, std::size_t koff, std::size_t voff) {
-    gpu.Synchronize();
-    const std::uint32_t B = pf.chunk();
-    const std::size_t first = std::size_t{ci} * B, cols = LoomPrefill::kKvRow;
-    const std::size_t bytes = std::size_t{B} * cols * 2;
-    std::vector<std::uint8_t> kk(bytes), vv(bytes);
-    gpu.D2H(pf.kv16(), kk.data(), bytes, koff + first * cols * 2);
-    gpu.D2H(pf.kv16(), vv.data(), bytes, voff + first * cols * 2);
-    std::vector<std::uint32_t> qpos;
-    if (qstride_)
-      for (std::uint32_t r = 0; r < B; ++r)
-        if ((first + r) % qstride_ == 0) qpos.push_back(r);
-    const std::int32_t hdr[7] = {0x4b56484b,
-                                 static_cast<std::int32_t>(ai),
-                                 static_cast<std::int32_t>(ci),
-                                 static_cast<std::int32_t>(first),
-                                 static_cast<std::int32_t>(B),
-                                 static_cast<std::int32_t>(cols),
-                                 static_cast<std::int32_t>(qpos.size())};
-    std::fwrite(hdr, 4, 7, in_);
-    std::fwrite(kk.data(), 1, bytes, in_);
-    std::fwrite(vv.data(), 1, bytes, in_);
-    std::vector<float> qrow(LoomPrefill::kAttn);
-    for (std::uint32_t r : qpos) {
-      gpu.D2H(pf.q(), qrow.data(), qrow.size() * 4, std::size_t{r} * LoomPrefill::kAttn * 4);
-      const std::int32_t ap = static_cast<std::int32_t>(first + r);
-      std::fwrite(&ap, 4, 1, in_);
-      std::fwrite(qrow.data(), 4, qrow.size(), in_);
-    }
-    std::fflush(in_);
-    if (std::fread(kk.data(), 1, bytes, out_) != bytes || std::fread(vv.data(), 1, bytes, out_) != bytes)
-      throw LoomError("YAH_KV_HOOK: short reply from the hook process");
-    gpu.H2D(pf.kv16(), kk.data(), bytes, koff + first * cols * 2);
-    gpu.H2D(pf.kv16(), vv.data(), bytes, voff + first * cols * 2);
-  }
-
- private:
-  FILE* in_ = nullptr;
-  FILE* out_ = nullptr;
-  pid_t pid_ = -1;
-  std::uint32_t qstride_ = 0;
-};
 
 // One YAH_ROWSTATS record per position (little endian): int32 pos, int32 next-token id (-1 at the end), f32 logsumexp,
 // f32 logit of the next token, int32 argmax, f32 top1, f32 top2, then 64 x (int32 id, f32 logit), highest first.
@@ -214,25 +130,16 @@ int main(int argc, char** argv) {
     }
     std::uint32_t rs_max = 1;  // rows per chunk
     for (std::uint32_t c = 0; c < n_chunks; ++c)
-      rs_max = std::max<std::uint32_t>(rs_max, std::count(rs_want.begin() + std::size_t{c} * B,
-                                                          rs_want.begin() + std::size_t{c + 1} * B, 1));
+      rs_max = std::max<std::uint32_t>(
+          rs_max, std::count(rs_want.begin() + std::size_t{c} * B, rs_want.begin() + std::size_t{c + 1} * B, 1));
     LoomBuffer rsbuf = gpu.Allocate(std::size_t{rs_max} * kVocab * 4);
-    std::unique_ptr<KvHook> hook;
-    if (const char* hc = std::getenv("YAH_KV_HOOK")) {
-      if (pf.kv16_scratch()) throw LoomError("YAH_KV_HOOK needs an unpaged fp16-KV set (the f16 cache of every layer)");
-      hook = std::make_unique<KvHook>(hc);
-    }
-    const LoomPrefill::KvHook layer_hook = [&](std::uint32_t ai, std::uint32_t ci, std::size_t koff,
-                                               std::size_t voff) {
-      if (hook) hook->Run(gpu, pf, ai, ci, koff, voff);
-    };
 
     gpu.Synchronize();
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
     for (std::uint32_t ci = 0; ci < n_chunks; ++ci) {
       pf.Embed(ids.data() + std::size_t{ci} * B, B);
-      pf.RunLayers(ci, hook ? layer_hook : LoomPrefill::KvHook{});
+      pf.RunLayers(ci);
       for (std::uint32_t ra = std::max(logits_from, ci * B); logits_from < T_run && ra < (ci + 1) * B; ++ra)
         pf.Head(ra - ci * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});
       if (rowstats) {
@@ -255,7 +162,6 @@ int main(int argc, char** argv) {
     }
     gpu.Synchronize();
     if (rowstats) std::fclose(rowstats);
-    hook.reset();
     const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
 

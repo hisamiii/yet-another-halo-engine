@@ -3,8 +3,8 @@
 
 Workgroup: BM rows x BN tokens (128 x 256) over WM x WN wave32 waves (4 x 4, or 4 x 2 for WAVE_FMTS), each owning a TM x TN tile.
 Grid: (m_tiles / ROWGRP, token_tiles); geometry() gives the dispatch.txt tile.
-Bindings and layouts as gen_gemm_shared.py, plus gate_out for kqg.
-The decode arithmetic and per-accumulator MMA order match gen_gemm_shared.py, so the output is bit-identical to it.
+Bindings and layouts as gen_gemm_decode.py, plus gate_out for kqg.
+The decode arithmetic and per-accumulator MMA order match gen_gemm_decode.py, so the output is bit-identical to it.
 Per K phase the decoded weight tile (BM x KSUB) and the activation tile (BN x KSUB) sit in LDS, so the MMA loop reads only LDS.
 The next phase's weight bytes and activation rows load into registers during this phase and go to LDS after it.
 Many waves per SIMD hide the load latency that the wave64 shared kernel (about 2 waves per SIMD) leaves exposed.
@@ -14,7 +14,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import gen_gemm_shared as G  # noqa: E402
+import gen_gemm_decode as G  # noqa: E402
 
 # Workgroup geometry: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).
 # 256 x 256 does not fit: 64 KB of tiles plus the IQ grid table in LDS is over gfx11's 64 KB per workgroup.
@@ -71,7 +71,7 @@ RHS_FENCE = 0
 
 
 def configure(fmt, decahead):
-    """Set the per-format switches and gen_gemm_shared's decode geometry for fmt; return KSUB."""
+    """Set the per-format switches and gen_gemm_decode's decode geometry for fmt; return KSUB."""
     global DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE
     RHS_OUTER = fmt in RHSO_FMTS
     RHS_FENCE = RHSO_FMTS.get(fmt, 0)
@@ -91,12 +91,12 @@ def configure(fmt, decahead):
     # one group per decoding lane (q4k/q5k pick the nibble at run time)
     G.GPL = 1
     G.Q4_HDR = fmt in ("q4k", "q5k")
-    # IQ3 word-path decode (gen_gemm_shared VDEC_W, IQ3_U8F, VDECW_FR), bit-identical: IQ3_XXS, and IQ3_S at 4 x 2.
+    # IQ3 word-path decode (gen_gemm_decode VDEC_W, IQ3_U8F, VDECW_FR), bit-identical: IQ3_XXS, and IQ3_S at 4 x 2.
     # At 4 x 4 IQ3_S gains nothing: the longer dependent chain is exposed between barriers, where every wave decodes at once.
     w3 = fmt == "iq3xxs" or (fmt == "iq3s" and (WM, WN) == (4, 2))
     G.VDEC_W = w3
     G.IQ3_U8F = w3
-    # Q4_K: subtract-and-narrow through v_fma_mix (gen_gemm_shared Q4FMIX); this lets Q4_K run at 4 x 2 without spills
+    # Q4_K: subtract-and-narrow through v_fma_mix (gen_gemm_decode Q4FMIX); this lets Q4_K run at 4 x 2 without spills
     G.Q4FMIX = fmt in ("q4k", "q5k")
     G.VDECW_FR = w3
     G.LR = BM
@@ -135,7 +135,7 @@ WAVE_FMTS = ("iq4xs", "iq3xxs", "q3k", "iq3s", "q4k", "q5k")
 
 
 def gen(fmt, kind="kstore", decahead=True):
-    """Return the kernel text for fmt; kind as gen_gemm_shared.gen() plus "kqg".
+    """Return the kernel text for fmt; kind as gen_gemm_decode.gen() plus "kqg".
     decahead=False keeps the plain schedule for a format in DECAHEAD_FMTS."""
     if fmt in WAVE_FMTS and (BM, BN, WM, WN) == (128, 256, 4, 4):
         prev = set_geometry(wm=4, wn=2)
@@ -187,7 +187,7 @@ def _gen(fmt, kind, decahead):
     e("  %base = index.constant 0 : offset")
     for v in sorted({0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN - 1}):
         e(f"  %c{v} = index.constant {v} : index")
-    # the same i32 constants gen_gemm_shared defines (q8_0 needs 18 and 34)
+    # the same i32 constants gen_gemm_decode defines (q8_0 needs 18 and 34)
     for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 18, 21, 24, 28, 32, 34, 48, 63, 64, 66, 74, 104, 106, 127, 128, 192, 255):
         e(f"  %c{v}i = scalar.constant {v} : i32")
     e(f"  %cbb = index.constant {bb} : index")
@@ -202,7 +202,7 @@ def _gen(fmt, kind, decahead):
     e("  %n = index.constant 16 : index")
     e("  %k = index.constant 16 : index")
     e(f"  %m_tiles = config.get @{sym}.m_tiles : index")
-    # q8_0's k_blocks counts 32-wide blocks; the decode walks 256-wide ones (bb=272 = 8 x 34), as in gen_gemm_shared.
+    # q8_0's k_blocks counts 32-wide blocks; the decode walks 256-wide ones (bb=272 = 8 x 34), as in gen_gemm_decode.
     # Without the division the kernel reads 8x past the weights and hangs the ring.
     kdiv = F.get("kdiv", 1)
     if kdiv == 1:
@@ -667,7 +667,7 @@ def lds_epilogue(e, kr, V8, sw=False, qg=False):
 
 def swiglu_epilogue(e, arow):
     """out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the .loom kernel's scalar ops in order (bit-identical).
-    As in gen_gemm_shared, each 16-row x ES-token slab goes through a per-wave f32 LDS tile; a loop walks it lane-contiguous.
+    As in gen_gemm_decode, each 16-row x ES-token slab goes through a per-wave f32 LDS tile; a loop walks it lane-contiguous.
     ES is the larger of 32, 16 for which all waves' slabs fit in the activation tile's LDS."""
     ES = next(x for x in (32, 16) if x <= TN and NWAVE * 16 * x * 4 <= BN * arow * 2)
     assert TN % ES == 0
