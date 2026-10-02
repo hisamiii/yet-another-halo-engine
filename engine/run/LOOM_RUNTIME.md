@@ -2056,6 +2056,11 @@ What mattered, in order (each measured on the full decode):
   3.57 us on the stream (yah-scratch/decode/probe/graph_probe.cc); only fewer
   dependent dispatches do. An explicit fma chain for the 16-element dot gave
   the same VALU count (the compiler already contracts mul + reduce).
+- **RMSNorm folded into the residual GEMV** (`resid_norm`: the last workgroup,
+  found with a device-scope acq_rel counter, writes the next layer's normed
+  input; stress-tested over 51 back-to-back dispatches): neutral, 61.30 vs
+  61.18 ms. 128 fewer dispatches (gaps 3.20 -> 2.76 ms) but each call grows
+  ~5 us by the serial norm tail. Off by default (`YAH_DEC_RESNORM=1`).
 - Profiling: `HRX_PROFILE_MODE=dispatch` (timestamps only) costs ~1%;
   counters mode inflates dispatch gaps ~4x. A kernel right after a no-barrier
   group shows the group's tail in its own duration.

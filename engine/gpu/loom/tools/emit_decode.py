@@ -105,6 +105,7 @@ def gemv_set(model):
         for n in ("attn_output", "ssm_out", "ffn_down"):
             if p + n + ".weight" in t:
                 add("resid", [p + n + ".weight"])
+                add("resid_norm", [p + n + ".weight"])
         add("swiglu", [p + "ffn_gate.weight", p + "ffn_up.weight"])
     add("plain", ["output.weight"])
     return out

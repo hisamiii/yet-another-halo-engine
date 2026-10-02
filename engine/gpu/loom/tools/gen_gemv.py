@@ -106,7 +106,7 @@ class E:
 
 
 def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
-    assert kind in ("plain", "resid", "swiglu")
+    assert kind in ("plain", "resid", "resid_norm", "swiglu")
     assert len(fmts) == (2 if kind == "swiglu" else 1)
     assert K % 512 == 0, "K / 16 sub-blocks must split evenly over 32 lanes"
     rows_wg = R * W
@@ -860,7 +860,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         b(f"    %orc{r} = index.min %orow{r}, {e.ci(M - 1)} : index")
         if kind == "plain":
             v = tot[r]
-        elif kind == "resid":
+        elif kind in ("resid", "resid_norm"):
             b(f"    %old{r} = view.load %yv[%orc{r}] : view<{M}xf32> -> f32")
             b(f"    %new{r} = scalar.addf %old{r}, {tot[r]} : f32")
             v = f"%new{r}"
@@ -878,6 +878,61 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     if _parts is not None:               # gen_bands: hand back the body, constants stay in e
         _parts.update(body=body, wnb=wnb, tabs=tabs)
         return None
+    if kind == "resid_norm":
+        # The last workgroup to finish (device-scope counter, acq_rel) computes the next
+        # RMSNorm of the updated vector: nout = (y * rsqrt(mean(y^2) + eps)) * nw, and
+        # resets the counter. Every thread does its own device-scope acquire before reading
+        # y (a workgroup may span two CUs with separate L0 caches).
+        NT = 32 * W
+        assert M % NT == 0
+        per = M // NT
+        nwg_ = M // rows_wg
+        b("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        b(f"  %rn_t0 = index.cmp eq, %tid, {e.ci(0)} : index")
+        b("  scf.if %rn_t0 {")
+        b(f"    %rn_old = view.atomic.rmw<addi> {e.cs(1)}, %cntv[{e.ci(0)}] {{ordering = acq_rel, scope = device}} : i32, view<1xi32> -> i32")
+        b(f"    %rn_last = scalar.cmpi eq, %rn_old, {e.cs(nwg_ - 1)} : i32")
+        b("    %rn_fl = scf.if %rn_last -> (i32) {")
+        b(f"      scf.yield {e.cs(1)} : i32")
+        b("    } else {")
+        b(f"      scf.yield {e.cs(0)} : i32")
+        b("    }")
+        b(f"    view.store %rn_fl, %rnflag[{e.ci(0)}] : i32, view<4xi32>")
+        b("  }")
+        b("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        b(f"  %rn_flv = view.load %rnflag[{e.ci(0)}] : view<4xi32> -> i32")
+        b(f"  %rn_is = scalar.cmpi eq, %rn_flv, {e.cs(1)} : i32")
+        b("  scf.if %rn_is {")
+        b(f"    %rn_acq = view.atomic.load %cntv[{e.ci(0)}] {{ordering = acquire, scope = device}} : view<1xi32> -> i32")
+        acc = "%zf"
+        for k in range(per):
+            b(f"    %rn_i{k} = index.add %tid, {e.ci(k * NT)} : index")
+            b(f"    %rn_x{k} = view.load %yv[%rn_i{k}] : view<{M}xf32> -> f32")
+            b(f"    %rn_s{k} = scalar.fmaf %rn_x{k}, %rn_x{k}, {acc} : f32")
+            acc = f"%rn_s{k}"
+        b(f"    %rn_ws = kernel.subgroup.reduce<addf> {acc} : f32")
+        b(f"    %rn_l0 = index.cmp eq, %lane, {e.ci(0)} : index")
+        b("    scf.if %rn_l0 {")
+        b(f"      view.store %rn_ws, %rnpart[%wave] : f32, view<{W}xf32>")
+        b("    }")
+        b("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        tot_ = "%zf"
+        for w in range(W):
+            b(f"    %rn_p{w} = view.load %rnpart[{e.ci(w)}] : view<{W}xf32> -> f32")
+            b(f"    %rn_a{w} = scalar.addf {tot_}, %rn_p{w} : f32")
+            tot_ = f"%rn_a{w}"
+        b(f"    %rn_mean = scalar.mulf {tot_}, {e.cs(1.0 / M, 'f32')} : f32")
+        b(f"    %rn_sh = scalar.addf %rn_mean, {e.cs(1e-6, 'f32')} : f32")
+        b("    %rn_inv = scalar.rsqrtf %rn_sh : f32")
+        for k in range(per):
+            b(f"    %rn_w{k} = view.load %nwv[%rn_i{k}] : view<{M}xf32> -> f32")
+            b(f"    %rn_n{k} = scalar.mulf %rn_x{k}, %rn_inv : f32")
+            b(f"    %rn_y{k} = scalar.mulf %rn_n{k}, %rn_w{k} : f32")
+            b(f"    view.store %rn_y{k}, %noutv[%rn_i{k}] : f32, view<{M}xf32>")
+        b("    scf.if %rn_t0 {")
+        b(f"      view.store {e.cs(0)}, %cntv[{e.ci(0)}] : i32, view<1xi32>")
+        b("    }")
+        b("  }")
     b("  kernel.return")
 
     # ---- assemble ----
@@ -892,6 +947,8 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     o(f"  %wgs = index.constant {32 * W} : index")
     o("  kernel.launch.config workgroups(%nwg, %u1, %u1) workgroup_size(%wgs, %u1, %u1) : index")
     params = [f"%w{i}: buffer" for i in range(nw)] + [f"%{t}: buffer" for t in tabs] + ["%x: buffer", "%y: buffer"]
+    if kind == "resid_norm":
+        params += ["%nw: buffer", "%nout: buffer", "%cnt: buffer"]
     o(f"}} launch({', '.join(params)}) {{")
     o("  %base = index.constant 0 : offset")
     names = [p.split(":")[0] for p in params]
@@ -922,6 +979,17 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         o("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     o(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{K}xf32>")
     o(f"  %yv = buffer.view %y_na[%base] : buffer -> view<{M}xf32>")
+    if kind == "resid_norm":
+        o(f"  %nwv = buffer.view %nw_na[%base] : buffer -> view<{M}xf32>")
+        o(f"  %noutv = buffer.view %nout_na[%base] : buffer -> view<{M}xf32>")
+        o("  %cnt_g = buffer.assume.memory_space<global> %cnt_na : buffer")
+        o("  %cntv = buffer.view %cnt_g[%base] : buffer -> view<1xi32>")
+        o("  %rnfb = index.constant 16 : offset")
+        o("  %rnfp = buffer.alloca<workgroup> align(16) %rnfb : buffer")
+        o("  %rnflag = buffer.view %rnfp[%base] : buffer -> view<4xi32>")
+        o(f"  %rnpb = index.constant {max(16, 4 * W)} : offset")
+        o("  %rnpp = buffer.alloca<workgroup> align(16) %rnpb : buffer")
+        o(f"  %rnpart = buffer.view %rnpp[%base] : buffer -> view<{W}xf32>")
     if "iq4xs" in fmts:
         o("\n".join(f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)))
         o("  %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
@@ -1038,12 +1106,12 @@ def footprint_bands(fmts, Ms, K):
 
 
 def footprint(kind, fmts, M, K):
-    """Exact binding sizes in bytes, in binding order (weights, tables, x, y)."""
+    """Exact binding sizes in bytes, in binding order (weights, tables, x, y[, nw, nout, cnt])."""
     sizes = [row_bytes(f, K) * M for f in fmts]
     for t in tables_for(fmts):
         ty, n = TABLES[t]
         sizes.append(n * (4 if ty == "i32" else 1))
-    return sizes + [K * 4, M * 4]
+    return sizes + [K * 4, M * 4] + ([M * 4, M * 4, 4] if kind == "resid_norm" else [])
 
 
 if __name__ == "__main__":
