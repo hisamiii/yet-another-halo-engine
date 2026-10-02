@@ -487,6 +487,23 @@ class LoomPrefill {
     return std::string(kind) + "_" + f->name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
   }
   std::uint32_t MTiles(const core::TensorInfo& t) const { return static_cast<std::uint32_t>(t.dims[1] / 16); }
+  // The GEMM variant for this chunk's real tokens: the set may carry "<hal>.t128.hal" / ".t64.hal" with narrower token
+  // tiles. Pick the least (padded token rows x cost per row); a narrow tile pads less but costs more per row (measured:
+  // x1.12 at 128 tokens, x1.6 at 64). Every variant computes the same values.
+  std::string PickGemm(const std::string& hal) const {
+    std::string best = hal;
+    double best_cost = 1e30;
+    const std::string stem = hal.substr(0, hal.size() - 4);
+    for (const std::string& h : {hal, stem + ".t128.hal", stem + ".t64.hal"}) {
+      const auto it = geom_.find(h);
+      if (it == geom_.end()) continue;
+      const std::uint32_t bn = it->second.tokens;
+      const double weight = bn >= 256 ? 1.0 : bn >= 128 ? 1.12 : 1.6;
+      const double cost = static_cast<double>((n_ + bn - 1) / bn * bn) * weight;
+      if (cost < best_cost) best = h, best_cost = cost;
+    }
+    return best;
+  }
 
   void RunNorm(const std::string& wname) {
     // One wave per row; a workgroup of w waves takes w rows.
@@ -500,7 +517,7 @@ class LoomPrefill {
   void RunKstore(const std::string& wname, const LoomBuffer& out) {
     const auto* t = Find(wname);
     Fmt f{};
-    const std::string hal = GemmHal("gemm_kstore", *t, &f);
+    const std::string hal = PickGemm(GemmHal("gemm_kstore", *t, &f));
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_}) b.push_back(Ref(*x));
@@ -514,8 +531,9 @@ class LoomPrefill {
     const auto* t = Find(wname);
     Fmt f{};
     if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) return false;
-    const std::string hal = GemmHal("gemm_kqg", *t, &f);
+    std::string hal = GemmHal("gemm_kqg", *t, &f);
     if (!geom_.count(hal)) return false;
+    hal = PickGemm(hal);
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, q_, gate_}) b.push_back(Ref(*x));
@@ -526,7 +544,7 @@ class LoomPrefill {
   void RunSwiglu(const std::string& wname) {
     const auto* t = Find(wname);
     Fmt f{};
-    const std::string hal = GemmHal("gemm_swiglu", *t, &f);
+    const std::string hal = PickGemm(GemmHal("gemm_swiglu", *t, &f));
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, gateffn_, uwstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
@@ -538,8 +556,9 @@ class LoomPrefill {
   void RunResidual(const std::string& wname, const LoomBuffer& input) {
     const auto* t = Find(wname);
     Fmt f{};
-    const std::string fused = GemmHal("gemm_kres", *t, &f);
-    if (geom_.count(fused)) {
+    const std::string fused0 = GemmHal("gemm_kres", *t, &f);
+    if (geom_.count(fused0)) {
+      const std::string fused = PickGemm(fused0);
       const Geom g = GeomOf(fused);
       auto b = GemmWeights(*t, f);
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, hidden_, wstage_, ostage_, hidden2_}) b.push_back(Ref(*x));
@@ -548,7 +567,7 @@ class LoomPrefill {
       std::swap(hidden_, hidden2_);
       return;
     }
-    const std::string hal = GemmHal("gemm_kstore", *t, &f);
+    const std::string hal = PickGemm(GemmHal("gemm_kstore", *t, &f));
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_, partial_}) b.push_back(Ref(*x));

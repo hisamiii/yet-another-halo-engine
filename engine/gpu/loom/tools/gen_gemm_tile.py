@@ -285,6 +285,9 @@ def _gen(fmt, kind, t, masked):
     slabs = NWAVE * (TM + EPAD) * 16 * 4
     if TM == 32:
         al_bytes = max(al_bytes, slabs)
+    if sw and not t.swepi:
+        # swiglu_epilogue's per-wave slabs; narrow tiles need more than the activation tile holds
+        al_bytes = max(al_bytes, NWAVE * 16 * swiglu_slab(t, arow) * 4)
     e(f"  %al_bytes = index.constant {al_bytes} : offset")
     e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
     e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
@@ -743,12 +746,17 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
             e("  }")
 
 
+def swiglu_slab(t, arow):
+    """Tokens per swiglu_epilogue slab: the larger of 32, 16 whose slabs fit in the activation tile, else 16."""
+    return next((x for x in (32, 16) if x <= t.tn and t.nwave * 16 * x * 4 <= t.bn * arow * 2), 16)
+
+
 def swiglu_epilogue(e, t, arow, masked=False):
     """out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the .loom kernel's scalar ops in order (bit-identical).
     As in gen_gemm_decode, each 16-row x ES-token slab goes through a per-wave f32 LDS tile; a loop walks it lane-contiguous.
     ES is the larger of 32, 16 for which all waves' slabs fit in the activation tile's LDS."""
     BN, TN, NWAVE, FM, FN = t.bn, t.tn, t.nwave, t.tm // 16, t.tn // 16
-    ES = next(x for x in (32, 16) if x <= TN and NWAVE * 16 * x * 4 <= BN * arow * 2)
+    ES = swiglu_slab(t, arow)
     assert TN % ES == 0
     V8 = "vector<8xf32>"
     e("  %ep_lay = encoding.layout.strided [%c1, %c16] : encoding<layout>")

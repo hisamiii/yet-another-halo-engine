@@ -28,7 +28,7 @@ A prompt that ends inside a chunk (chunked 32K set, fp16 KV, `layers_ms`; the la
 | 1025 | 2034.6 ms | 3092.1 ms | 2026-10-02 |
 | 1537 | 2786.5 ms | 3104.6 ms | 2026-10-02 |
 
-Through `yah_server` (kv8 serve sets): an 18-token prompt prefills in 0.63 s, a 621-token one in 1.33 s (both were ~3.1 s).
+Through `yah_server` (kv8 serve sets): an 18-token prompt prefills in 0.42 s (0.63 s before the narrow tiles), a 621-token one in 1.33 s (both were ~3.1 s with padded chunks).
 
 Decode, greedy, ms per generated token (mean over 63 steps after the prompt; `loom_forward_pp` with `YAH_GEN=64`, prefill sets as above):
 
@@ -103,6 +103,7 @@ One line each: what, the measured effect, when the set was current. Prefill numb
 
 Prefill:
 
+- Narrow GEMM token tiles for short chunks (chunked sets carry 128- and 64-token variants; the driver picks per chunk by padded rows x cost per row): 18 tokens 595 -> 404 ms, 100 tokens ~595 -> 456 ms, 300 tokens 909 -> 801 ms; 1000+ tokens unchanged; logits identical. Through `yah_server` an 18-token prompt prefills in 415 ms (was 607-630).
 - `yah_half_norm` with 4 rows (waves) per workgroup instead of 1: 46.1 -> 41.9 ms per pp2048 (-3.5% of its cycles); bit-identical.
 - HRX pin moved to a02a5ab94 plus the f16 WMMA operand placement (patch 0005; upstream enables #1160 for bf16 only): GEMM cycles -3.2%, prefill cycles -2.8%, pp2048 3047 -> 3000.5 ms; bit-identical. Decode 61.1 -> 60.8 ms (noise).
 - Prefill as one HRX graph per chunk, independent kernels overlapping (stock HRX): pp2048 ~3090 -> 3032 ms, a 500-token prompt 970 -> 926 ms; bit-identical.

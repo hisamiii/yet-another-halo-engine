@@ -90,6 +90,34 @@ def tiles():
     return json.load(open(path)) if path else {}
 
 
+# Narrower token tiles for chunks with few real tokens; the driver picks one per chunk (LoomPrefill::PickGemm).
+# A narrow tile pads less but costs more per token row (x1.12 at 128, x1.6 at 64, measured): an 18-token prompt
+# 595 -> 404 ms with 64, a 300-token prompt 909 -> 802 ms with 128. Same values as the default tile.
+NARROW = ((128, 2), (64, 2))
+
+
+def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
+    """Emit "<hal>.t<BN>.hal" for each NARROW token tile the default tile of this GEMM allows; return their rows."""
+    import gen_gemm_tile as TG
+    if fmt not in TILE_FMTS or mt < 4:
+        return []
+    base, rows = TG.default_tile(fmt, kind, kb), []
+    for bn, wn in NARROW:
+        t = dataclasses.replace(base, bn=bn, wn=wn)
+        try:
+            TG.check(t)
+        except ValueError:
+            continue
+        if bn >= base.bn or mt % t.rowgrp:
+            continue
+        masked = B % bn != 0
+        r = _emit_gen(lambda f, k: TG.gen(f, k, t, masked), bn, fmt, mt, kb, B, out[:-4] + ".t%d.hal" % bn, outdir, kind,
+                      t.rowgrp, masked)
+        if r:
+            rows.append(r)
+    return rows
+
+
 # Formats the tile GEMM (tools/gen_gemm_tile.py) is verified bit-identical on in the pp2048 pipeline.
 TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "q3k", "q8_0")
 
@@ -179,6 +207,8 @@ def main():
             r = gemm(fmt, mt, kb, B, name(k), outdir, kind=k)
             if r:
                 geom.append(r)
+                if T > B:  # chunked sets: their last chunk may be short; a one-pass set always runs all B tokens
+                    geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k))
             elif k == "kstore" and fmt == "q2k":
                 # Q2_K has no tile decoder; its only tensors here are the 48-row ssm_alpha / ssm_beta.
                 sym = E.sym_of("yah_ffn_gemm_q2k_f32.loom")
