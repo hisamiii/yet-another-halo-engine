@@ -68,3 +68,24 @@ Next structural step (not done): FLA's 3-kernel split.
 2. A lean sequential state kernel: per chunk Vn = U - W S^T and the update.
 3. Outputs O = Q S_c^T + P Vn in parallel over chunks, from per-chunk state
    snapshots (f16: 128 x 128 x 2 B per head per chunk).
+
+## The FLA-style split, evaluated (2026-10-02): not worth it here
+
+- **FLA's per-chunk state snapshots:** at pp8192 that is ~400 MB written and
+  read back per layer (f16, C = 32). That is ~3 ms per layer at ~256 GB/s,
+  ~150 ms over 48 layers, against ~350 ms for DeltaNet in total. Not viable
+  on this APU.
+- **Without snapshots:** a parallel prep kernel (K K^T, Q K^T -> P, solve ->
+  T', T'') plus a sequential state/output kernel. GDN_ABL=prep measures the
+  state/output part alone: 3.356 M cycles vs 3.702 M for the fused v5. The
+  prep is only 0.35 M (9%), so the split's best case is about -18% vs
+  recurrent, realistically -12-15% with kernel A's own cost.
+- **What bounds it:** the state/output phases are LDS-bandwidth- and
+  barrier-bound. Per chunk each wave does ~26 MMAs, each with 2 fragment loads
+  (2 x b128) from LDS, plus the f16 copy of the 64 x 128 state and the
+  K / Kt / V / W / Vn staging stores. With 16 waves per WGP that is ~2x the
+  WMMA time in LDS traffic (estimate).
+- **Possible further directions:** keep shared operands in registers (S
+  fragments shared by X and O1 are loaded twice in v5), C = 64 to halve the
+  per-token state-copy cost (but 1 WG per WGP), or a different row/key split.
+  Each is worth single-digit percent of DeltaNet.

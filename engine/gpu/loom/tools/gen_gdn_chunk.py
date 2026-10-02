@@ -38,7 +38,7 @@ import sys
 # out[slot * 16384 dwords] after phases 1, 2, 3, 4, 5 (slots 0..4)
 DBG = os.environ.get("GDN_DBG", "0") == "1"
 # GDN_ABL (ablation, wrong results): "solve" = T = I (no forward substitution)
-ABL = os.environ.get("GDN_ABL", "")
+ABL = os.environ.get("GDN_ABL", "")   # also "prep": no KK/QK, no solve (+ their barriers)
 
 C, R, D = 32, 64, 128
 V8 = "vector<8xf32>"
@@ -342,6 +342,8 @@ def gen():
     nxt = fetch("%cn", "nx_", I)
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     dbg(0)
+    if ABL == "prep":   # ablation: what a state/output-only kernel would cost
+        e = lambda *_: None
     # ---- phase 2: KK^T (waves 0-3) -> A (f32), QK^T (waves 4-7) -> P (f16)
     e(f"{I}%p2t = index.rem %sg, %c4 : index")
     e(f"{I}%p2mi = index.div %p2t, %c2 : index")
@@ -395,6 +397,9 @@ def gen():
     e(f"{I}}}")
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     dbg(1)
+    e = L.append
+    if ABL == "prep":
+        e(f"{I}%zs = vector.fragment<init> %zeros8 shape [%m, %n] : {V8}")
     # ---- O1 = Q S^T (every wave; waves 1-7 run it while wave 0 solves)
     e(f"{I}%oq0 = index.add %ut0, %c32 : index")
     oa = "%zs"
@@ -404,6 +409,8 @@ def gen():
         e(f"{I}%oa{c} = vector.fragment.load<lhs> %kq_l[%oq0, %xk{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
         e(f"{I}%oc{c} = vector.mma %oa{c}, %xb{c}, {oa} : {V16H}, {V16H}, {V8}")
         oa = f"%oc{c}"
+    if ABL == "prep":
+        e = lambda *_: None
     # ---- phase 3: T = (I + A)^-1 by forward substitution, wave 0, lane = column
     e(f"{I}scf.if %isw0 {{")
     # right-looking: once t_j is final, every pending row i > j takes its
@@ -442,6 +449,7 @@ def gen():
     e(f"{I}}}")
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     dbg(2)
+    e = L.append
     # ---- phase 4: W = T1 Kt (2 tiles / wave) -> rows 0-31 of the K|Q view; U = T2 Vt; S -> f16
     e(f"{I}%wm0 = index.mul %wd4, %c16 : index")
     for p in range(2):
