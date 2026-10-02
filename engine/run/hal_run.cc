@@ -117,8 +117,12 @@ int main(int argc, char** argv) {
     }
     LoomExecutable exe = gpu.Load(hal);
     const auto cfg = LoomDevice::Config(gx, gy, 1, wg, 1, 1);
+    const auto t_first = std::chrono::steady_clock::now();
     gpu.Dispatch(exe, 0, cfg, nullptr, 0, refs.data(), refs.size());
     gpu.Synchronize();
+    if (std::getenv("HAL_RUN_TIME1"))   // the first dispatch alone (stateful kernels)
+      std::printf("hal_run: first dispatch %.4f ms\n",
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_first).count());
     // HAL_RUN_ITERS=N: then time N back-to-back dispatches (outputs are from the
     // first, untimed one only when the kernel is idempotent; resid is not).
     if (const char* it = std::getenv("HAL_RUN_ITERS")) {

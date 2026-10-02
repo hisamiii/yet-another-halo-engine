@@ -2075,6 +2075,16 @@ What mattered, in order (each measured on the full decode):
   60-75 -> 103-114 VGPRs; slower (61.77 vs 60.48 ms), the occupancy loss
   outweighs the saved issue. Residual GEMV geometry (R x W): the default 2 x 4
   wins by 1-1.5 ms over 1 x 4, 2 x 8, 1 x 8, 4 x 4.
+- **Persistent megakernel, feasibility (not built).** A grid barrier inside a
+  resident kernel (atomic arrive with release, spin on an acquire load; spin
+  capped so missing residency cannot hang; `research/gen_gbar.py`,
+  `hal_run HAL_RUN_TIME1`) costs 0.26 us at 20-40 workgroups, 0.37 at 80, 0.49 at
+  160, vs ~3.5-4 us per dependent dispatch: at most ~1.3 ms/token to gain from
+  the ~436 boundaries. But persistent GEMVs (`YAH_GV_PERSIST=G`, workgroups
+  looping over row groups) lose: SwiGLU +3.7% at G = 640 (static round-robin's
+  ragged last round), 61.67 vs 60.48 ms overall; one-group-per-workgroup
+  kernels unchanged. With that loss and the megakernel's register count being
+  the maximum over all its phases, the expected net is ~0; not pursued.
 - Profiling: `HRX_PROFILE_MODE=dispatch` (timestamps only) costs ~1%;
   counters mode inflates dispatch gaps ~4x. A kernel right after a no-barrier
   group shows the group's tail in its own duration.

@@ -75,6 +75,12 @@ SMASK_LDS = os.environ.get("YAH_GV_SMASK_LDS", "0") == "1"
 # 103-114 (occupancy): full decode 61.77 vs 60.48 ms/token (with pipeline(0): 68.39).
 # Off by default; the same trade HIP's quant_ops.hpp notes for its 32-element variant.
 G2 = os.environ.get("YAH_GV_G2", "0") == "1"
+# YAH_GV_PERSIST=G (megakernel feasibility): launch G workgroups that loop over the row
+# groups (rg = wg, wg + G, ...) instead of one workgroup per row group.
+# Full decode (2026-10-02): G = 160 / 320 / 640 -> 62.43 / 62.20 / 61.67 vs 60.48 ms/token;
+# kernels with one row group per workgroup are unchanged, SwiGLU (3.4 groups each at
+# G = 640) +3.7%: static round-robin leaves a ragged last round. Off by default.
+PERSIST = int(os.environ.get("YAH_GV_PERSIST", "0"))
 def _s32(v):
     return v - (1 << 32) if v >= (1 << 31) else v
 UNROLL = int(os.environ.get("YAH_GV_UNROLL", "0"))
@@ -1394,7 +1400,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     o("")
     o(f"kernel.def target(@gv32) @{name}() {{")
     o("  %u1 = index.constant 1 : index")
-    o(f"  %nwg = index.constant {M // rows_wg} : index")
+    o(f"  %nwg = index.constant {min(PERSIST, M // rows_wg) if PERSIST else M // rows_wg} : index")
     o(f"  %wgs = index.constant {32 * W} : index")
     o("  kernel.launch.config workgroups(%nwg, %u1, %u1) workgroup_size(%wgs, %u1, %u1) : index")
     params = [f"%w{i}: buffer" for i in range(nw)] + [f"%{t}: buffer" for t in tabs] + ["%x: buffer", "%y: buffer"]
@@ -1472,7 +1478,21 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         o(f"    view.store {cur}, %smask[%smt] : i32, view<16xi32>")
         o("  }")
         o("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    out += body
+    if PERSIST and kind != "resid_norm":
+        G_ = min(PERSIST, M // rows_wg)
+        assert body[-1].strip() == "kernel.return"
+        inner = [l.replace("%wg = kernel.workgroup.id<x> : index", "%wg = index.add %rg, %pz : index") for l in body[:-1]]
+        o("  %wgid = kernel.workgroup.id<x> : index")
+        o("  %pz = index.constant 0 : index")
+        o(f"  %pG = index.constant {G_} : index")
+        o(f"  %pN = index.constant {M // rows_wg} : index")
+        o("  %prs = scf.for %rg = [%wgid to %pN step %pG](%pk = %pz : index) -> (index) {")
+        out += inner
+        o("    scf.yield %pk : index")
+        o("  }")
+        o("  kernel.return")
+    else:
+        out += body
     o("}")
     return "\n".join(out) + "\n"
 

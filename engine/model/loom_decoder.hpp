@@ -65,8 +65,10 @@ class LoomDecoder {
       // "rw <kind> R W": the GEMV launch geometry of each kind in this set
       std::string kind;
       std::uint32_t r = 0, w = 0;
-      while (in >> k >> kind >> r >> w)
+      while (in >> k >> kind >> r >> w) {
         if (k == "rw") rw_[kind] = {r, w};
+        if (k == "persist") persist_ = r;   // gv kernels (not resid_norm) launch min(r, row groups)
+      }
     }
     const std::uint32_t npg = T_ / 256;
     if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != 23)
@@ -313,7 +315,9 @@ class LoomDecoder {
     LoomExecutable& exe = Load(name);
     if (overlap && overlap_) gpu_.NoBarrierNext();
     auto [R, W] = Rw(kind, M);
-    Dispatch(exe, M / (R * W), 1, 32 * W, b);
+    std::uint32_t gx = M / (R * W);
+    if (persist_ && std::string(kind) != "resid_norm") gx = std::min(gx, persist_);
+    Dispatch(exe, gx, 1, 32 * W, b);
   }
   // A layer's input projections of normed_: one band-fused GEMV (gen_gemv gen_bands), or
   // with YAH_DEC_BANDS=0 one GEMV each, the later ones without an ordering barrier.
@@ -397,6 +401,7 @@ class LoomDecoder {
   std::deque<LoomBuffer> keep_;   // stable addresses
   std::map<std::string, LoomExecutable> exes_;
   std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> rw_;
+  std::uint32_t persist_ = 0;
   std::vector<hrx_buffer_ref_t> tabs_;
   LoomDecoderState st_;
   LoomBuffer *hidden_, *normed_, *qg_, *q_, *gate_, *kb_, *vb_, *aout_, *qkv_, *alpha_, *beta_, *convout_, *ssmout_,

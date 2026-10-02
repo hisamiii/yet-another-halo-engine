@@ -155,7 +155,8 @@ def main():
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())))
+        "ctx %d\n" % T + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
+        ("persist gv %d 0\n" % GV.PERSIST if GV.PERSIST else ""))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + 10 decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))
 
