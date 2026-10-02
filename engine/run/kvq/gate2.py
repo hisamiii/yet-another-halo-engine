@@ -69,13 +69,15 @@ def main():
     name = sys.argv[sys.argv.index("--name") + 1] if "--name" in sys.argv else cands[0]
     rng = np.random.default_rng(0)
     docs = [per_pos(load(a), load(b)) for a, b in zip(refs, cands)]
-    if "--summary" in sys.argv:     # one markdown row: PPL delta vs the reference, mean / p99 / p99.9 KL, same top token %
+    if "--summary" in sys.argv:     # one markdown row: PPL delta vs the reference, mean / p99 / p99.9 KL,
+        # 99.9% precision = 100 exp(-(p99.9 KL - p99.9 KL of the reference)); the reference here is the
+        # fp16 KV cache itself, so its KL is 0. Same top token % = llama.cpp "Same top p".
         kl = np.concatenate([d["kl"][d["ok"]] for d in docs])
         nr = np.concatenate([d["nll_r"][d["ok"]] for d in docs]); dn = np.concatenate([d["dnll"][d["ok"]] for d in docs])
         p999 = np.percentile(kl, 99.9)
         same = np.concatenate([d["same"][d["ok"]] for d in docs])
         pr = np.exp(nr.mean())
-        print(f"| {name} | {pr * np.exp(dn.mean()) - pr:+.3f} ({100 * np.expm1(dn.mean()):+.2f}%) | {max(kl.mean(), 0):.6f} | {np.percentile(kl, 99):.4f} | {p999:.4f} | {100 * same.mean():.2f}% |")
+        print(f"| {name} | {pr * np.exp(dn.mean()) - pr:+.3f} ({100 * np.expm1(dn.mean()):+.2f}%) | {max(kl.mean(), 0):.6f} | {np.percentile(kl, 99):.4f} | {p999:.4f} | {100 * np.exp(-p999):.2f}% | {100 * same.mean():.2f}% |")
         return
     print(f"== {name}  ({len(docs)} docs, {sum(len(d['pos']) for d in docs)} positions)")
     print(f"{'bin':>13s} {'n':>6s} {'dNLL mean [95% CI] (nats)':>36s} {'KL mean':>10s} {'KL p99':>9s} {'KL p99.9':>9s} {'flips/1k':>9s}")
