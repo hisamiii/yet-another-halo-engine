@@ -20,7 +20,7 @@ computed per chunk of C = 32 tokens in the WY / UT form (checked against the rec
     S  <- 2^G_C S + (diag(2^(G_C - G)) Vn)^T K
 
 Matmul inputs are f16 (WMMA, f32 accumulate); the state is carried in f32
-accumulators. f16 inputs cost mean KLD 3e-6 end to end (YAH_DN_F16SIM study).
+accumulators. f16 inputs cost mean KLD 3e-6 end to end.
 
 Workgroup = (64 value rows, one head): grid (2, num_heads) x 256 (8 waves,
 wave32), like yah_deltanet. Wave w owns state tiles rows 16 (w % 4), keys
@@ -30,17 +30,7 @@ U, Vn and O. batch must be a multiple of 32.
 WMMA accumulator layout (RDNA3 wave32, 16x16 f32): lane l holds column
 l % 16 and rows 2 i + l / 16, i = 0..7 (interleaved, not contiguous).
 """
-import os
 import sys
-
-# GDN_DBG=1 (debug only): workgroup (0, 0), chunk 0 copies the LDS pool to
-# out[slot * 16384 dwords] after phases 1, 2, 3, 4, 5 (slots 0..4)
-DBG = os.environ.get("GDN_DBG", "0") == "1"
-# GDN_ABL (ablation, wrong results): "solve" = T = I (no forward substitution)
-ABL = os.environ.get("GDN_ABL", "")
-# GDN_O1LATE=1: compute O1 = Q S^T next to X = W S^T, sharing the S fragment
-# loads (default: O1 early, overlapping wave 0's solve)
-O1LATE = os.environ.get("GDN_O1LATE", "1") == "1"   # default: 3.676 -> 3.566 M (shared S loads)   # also "prep": no KK/QK, no solve (+ their barriers)
 
 C, R, D = 32, 64, 128
 V8 = "vector<8xf32>"
@@ -75,7 +65,7 @@ def gen():
     e("  %c256 = index.constant 256 : index")
     e("  %num_heads = config.get @yah_deltanet.num_heads : index")
     e("  kernel.launch.config workgroups(%c2, %num_heads, %unit) workgroup_size(%c256, %unit, %unit) : index")
-    e("} launch(%conv: buffer, %kq: buffer, %ab: buffer, %state: buffer, %out: buffer" + (", %dbgb: buffer" if DBG else "") + ") {")
+    e("} launch(%conv: buffer, %kq: buffer, %ab: buffer, %state: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 8, 16, 31, 32, 40, 48, 64, 128, 136, 16384):
         e(f"  %c{v} = index.constant {v} : index")
@@ -148,33 +138,6 @@ def gen():
     e(f"  %ga = buffer.view %pool[{o}] : buffer -> view<6x32xf32>")
     for i, nm in enumerate(("LG", "G2", "BETA", "BG", "GC", "GG")):
         e(f"  %ga{nm} = index.constant {i} : index")
-
-    e(f"  %pool_i = buffer.view %pool[%base] : buffer -> view<{POOL // 4}xi32>")
-    if DBG:
-        e("  %out_i = buffer.view %dbgb[%base] : buffer -> view<81920xi32>")
-    dbg_n = [0]
-
-    def dbg(slot):
-        if not DBG:
-            return
-        k_ = dbg_n[0]; dbg_n[0] += 1
-        e(f"    %dbc{k_}a = index.cmp eq, %ci, %c0 : index")
-        e(f"    %dbc{k_}b = index.cmp eq, %blk, %c0 : index")
-        e(f"    %dbc{k_}c = index.cmp eq, %h, %c0 : index")
-        e(f"    %dbc{k_}d = scalar.andi %dbc{k_}a, %dbc{k_}b : i1")
-        e(f"    %dbc{k_} = scalar.andi %dbc{k_}d, %dbc{k_}c : i1")
-        e(f"    scf.if %dbc{k_} {{")
-        for j in range((POOL // 4 + 255) // 256):
-            e(f"      %db{k_}_{j}_c = index.constant {256 * j} : index")
-            e(f"      %db{k_}_{j}_s = index.add %tid, %db{k_}_{j}_c : index")
-            e(f"      %db{k_}_{j}_m = index.constant {POOL // 4 - 1} : index")
-            e(f"      %db{k_}_{j} = index.min %db{k_}_{j}_s, %db{k_}_{j}_m : index")
-            e(f"      %dv{k_}_{j} = view.load %pool_i[%db{k_}_{j}] : view<{POOL // 4}xi32> -> i32")
-            e(f"      %do{k_}_{j}_c = index.constant {slot * 16384} : index")
-            e(f"      %do{k_}_{j} = index.add %db{k_}_{j}, %do{k_}_{j}_c : index")
-            e(f"      view.store %dv{k_}_{j}, %out_i[%do{k_}_{j}] : i32, view<81920xi32>")
-        e("    }")
-        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
 
     # ids
     e("  %blk = kernel.workgroup.id<x> : index")
@@ -347,9 +310,6 @@ def gen():
     e(f"{I}%cn = index.min %cn0, %lastc : index")
     nxt = fetch("%cn", "nx_", I)
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    dbg(0)
-    if ABL == "prep":   # ablation: what a state/output-only kernel would cost
-        e = lambda *_: None
     # ---- phase 2: KK^T (waves 0-3) -> A (f32), QK^T (waves 4-7) -> P (f16)
     e(f"{I}%p2t = index.rem %sg, %c4 : index")
     e(f"{I}%p2mi = index.div %p2t, %c2 : index")
@@ -402,24 +362,6 @@ def gen():
         e(f"{I}  view.store %ph{i}, %p_v[%pm{i}, %p2n] : f16, view<32x40xf16>")
     e(f"{I}}}")
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    dbg(1)
-    e = L.append
-    if ABL == "prep":
-        e(f"{I}%zs = vector.fragment<init> %zeros8 shape [%m, %n] : {V8}")
-    # ---- O1 = Q S^T (every wave; waves 1-7 run it while wave 0 solves)
-    if O1LATE:
-        e = lambda *_: None
-    e(f"{I}%oq0 = index.add %ut0, %c32 : index")
-    oa = "%zs"
-    for c in range(8):
-        e(f"{I}%xk{c} = index.constant {16 * c} : index")
-        e(f"{I}%xb{c} = vector.fragment.load<rhs> %s_r[%xk{c}, %ur0] shape [%k, %n] : view<128x64xf16, %ss_lay> -> {V16H}")
-        e(f"{I}%oa{c} = vector.fragment.load<lhs> %kq_l[%oq0, %xk{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
-        e(f"{I}%oc{c} = vector.mma %oa{c}, %xb{c}, {oa} : {V16H}, {V16H}, {V8}")
-        oa = f"%oc{c}"
-    e = L.append
-    if ABL == "prep":
-        e = lambda *_: None
     # ---- phase 3: T = (I + A)^-1 by forward substitution, wave 0, lane = column
     e(f"{I}scf.if %isw0 {{")
     # right-looking: once t_j is final, every pending row i > j takes its
@@ -433,7 +375,7 @@ def gen():
     t = []
     for j in range(C):
         t.append(accs[j])
-        if ABL == "solve" or j == C - 1:
+        if j == C - 1:
             continue
         col = []
         for q in range((j + 1) // 4, 8):
@@ -457,8 +399,6 @@ def gen():
         e(f"{I}  view.store %th2_{i}, %t2_v[%ti{i}c, %lane] : f16, view<32x40xf16>")
     e(f"{I}}}")
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    dbg(2)
-    e = L.append
     # ---- phase 4: W = T1 Kt (2 tiles / wave) -> rows 0-31 of the K|Q view; U = T2 Vt; S -> f16
     e(f"{I}%wm0 = index.mul %wd4, %c16 : index")
     for p in range(2):
@@ -489,23 +429,20 @@ def gen():
         acc = f"%uc{c}"
     uacc = acc
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    dbg(3)
     # ---- phase 5: X = W S^T, O1 = Q S^T (tile tokens ut0, rows ur0)
+    # O1 next to X, sharing the S fragment loads
     xa = "%zs"
-    if O1LATE:
-        e(f"{I}%oq0 = index.add %ut0, %c32 : index")
-        oa = "%zs"
+    e(f"{I}%oq0 = index.add %ut0, %c32 : index")
+    oa = "%zs"
     for c in range(8):
-        if O1LATE:
-            e(f"{I}%xk{c} = index.constant {16 * c} : index")
+        e(f"{I}%xk{c} = index.constant {16 * c} : index")
         e(f"{I}%xb2{c} = vector.fragment.load<rhs> %s_r[%xk{c}, %ur0] shape [%k, %n] : view<128x64xf16, %ss_lay> -> {V16H}")
         e(f"{I}%xa{c} = vector.fragment.load<lhs> %kq_l[%ut0, %xk{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
         e(f"{I}%xc{c} = vector.mma %xa{c}, %xb2{c}, {xa} : {V16H}, {V16H}, {V8}")
         xa = f"%xc{c}"
-        if O1LATE:
-            e(f"{I}%oa{c} = vector.fragment.load<lhs> %kq_l[%oq0, %xk{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
-            e(f"{I}%oc{c} = vector.mma %oa{c}, %xb2{c}, {oa} : {V16H}, {V16H}, {V8}")
-            oa = f"%oc{c}"
+        e(f"{I}%oa{c} = vector.fragment.load<lhs> %kq_l[%oq0, %xk{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
+        e(f"{I}%oc{c} = vector.mma %oa{c}, %xb2{c}, {oa} : {V16H}, {V16H}, {V8}")
+        oa = f"%oc{c}"
     e(f"{I}%vn8 = vector.subf {uacc}, {xa} : {V8}")
     gts, gcs = [], []
     for i in range(8):
@@ -527,7 +464,6 @@ def gen():
         e(f"{I}view.store %vnh{i}, %vn_w[%ur_row, %vtk{i}] : f16, view<64x40xf16>")
         e(f"{I}view.store %vph{i}, %vnp_w[%ur_row, %vtk{i}] : f16, view<64x40xf16>")
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    dbg(4)
     # O = O1 + P Vn
     e(f"{I}%o1f = vector.fragment<init> %o18 shape [%m, %n] : {V8}")
     acc = "%o1f"

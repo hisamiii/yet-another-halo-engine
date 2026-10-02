@@ -19,14 +19,14 @@ yah_kq8: int8 K with one scale per (token, kv head, 128-dim half), the split
   shuffles. grid (ceil(cap / 2), 1, 1) x 256 (two tokens per workgroup);
   tokens >= token_count are written as zeros.
 """
-import os
 import sys
 
-# YAH_KV_PAGED (default 1; 0 = contiguous): the caches are paged (256-token pages, gen_attn_fa PAGED).
+# PAGED: the caches are paged (256-token pages, gen_attn_fa PAGED).
 # Writers read the chunk's token_count rows of the f16 scratch and write
 # physical row ptab[t / 256] * 256 + t % 256 (t = start_pos + local) of a
 # pool of pool_rows rows (V^T tiles: ptab[tile / 16] * 16 + tile % 16).
-PAGED = os.environ.get("YAH_KV_PAGED", "1") == "1"   # default on (p71); 0 = contiguous cache
+# emit_prefill_pp.py clears it when the context is not a multiple of 256.
+PAGED = True
 V8 = "vector<8xf32>"
 
 

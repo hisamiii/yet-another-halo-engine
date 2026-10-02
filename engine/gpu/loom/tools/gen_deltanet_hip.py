@@ -3,6 +3,9 @@
 
 usage: gen_deltanet_hip.py [out.loom]
 
+The prefill's fallback when the token count is not a multiple of 32 (the
+chunked tools/gen_gdn_chunk.py needs whole chunks); same ABI and grid.
+
 A port of BatchedDeltaNetRowSplitKernel<float, 16, 2, false, false>, the tile
 the HIP engine runs at pp2048 (ssm_row_split.hip), meant to be bit-identical to
 it: same inputs in, same raw output and final state out. The op sequence is
@@ -23,29 +26,15 @@ C++ source, because the fused multiply-adds decide the rounding:
 
 IEEE addition is commutative, so the butterfly's operand order (partner +
 own) does not matter; the association does and is kept. The k/q loads depend
-on the lane, so they are vector loads -- no SMEM drains, the regtile kernel's
-problem. This replaces the regtile kernel's arithmetic (one lane per row, a
-128-long sequential sum), so its output differs from that kernel's: the pp2048
-gate for this kernel is bit-identity with HIP's kernel on the same inputs
-and argmax + KLD for the whole model.
+on the lane, so they are vector loads (no SMEM drains).
 """
-import os
 import sys
 
-# YAH_DN_DOTF=1: the u/p dot groups as vector.dotf (see dot() below)
-DOTF = os.environ.get("YAH_DN_DOTF", "0") == "1"
-# YAH_DN_W64=1: wave64. Each 64-lane wave takes 16 rows (8 lane groups of 8,
-# second row 8 below) instead of 8; every row's arithmetic, including the
-# xor-1/2/4 butterfly inside its 8 lanes, is unchanged. Wave64 runs FP32 VALU
-# on both ALU halves without VOPD pairing (pure FMA probe: 60.0 vs 56.6
-# lane-FMAs/cycle/SIMD), and this kernel's v_fma_f32 cannot pair in wave32.
-# Default: B=2048 harness 4.752 -> 4.184 M cycles, bit-identical to HIP.
-W64 = os.environ.get("YAH_DN_W64", "1") == "1"
-# YAH_DN_F16SIM=1 (experiment only): round k, q, v, the state read by the
-# dot products and the update coefficient to f16 (state kept f32), the
-# precision a chunked WY kernel with f16 WMMA inputs would have Default off.
-F16SIM = os.environ.get("YAH_DN_F16SIM", "0") == "1"
-WSZ = 64 if W64 else 32
+# Wave64: each 64-lane wave takes 16 rows (8 lane groups of 8, second row 8
+# below); every row's arithmetic, including the xor-1/2/4 butterfly inside its
+# 8 lanes, is the same as in wave32. Wave64 runs FP32 VALU on both ALU halves
+# without VOPD pairing, and this kernel's v_fma_f32 cannot pair in wave32.
+WSZ = 64
 
 V4 = "vector<4xf32>"
 
@@ -158,9 +147,8 @@ def gen():
     # unroll(4) schedule(recurrence): the rolled loop copied the carried state
     # and the prefetched k/q/v back into place on every backedge (compile
     # report move_causes branch_edge, 60 v_mov per token against HIP's none);
-    # unrolled, the iterations alternate registers. 2.058 -> 1.829 ms
-    # standalone, bit-identical. YAH_DN_POL overrides.
-    pol = __import__("os").environ.get("YAH_DN_POL", "unroll(%c8) schedule(recurrence)")
+    # unrolled, the iterations alternate registers.
+    pol = "unroll(%c8) schedule(recurrence)"
     e(f"  {res} = scf.for %t = [%c0 to %batch step %c1]({carried}) -> ({ltypes}) {pol} {{")
     # next token's loads go out first; this token computes on the carried values
     e("    %t_n0 = index.add %t, %c1 : index")
@@ -188,27 +176,10 @@ def gen():
     e("    %ot0 = index.mul %t, %inner_size : index")
     e("    %ot = index.add %ot0, %o_rel0 : index")
     # extract k, q elements once
-    rounded = set()
-
-    def r16(n):
-        if not F16SIM:
-            return n
-        if n not in rounded:   # once per value (both dot products read the state)
-            rounded.add(n)
-            e(f"    {n}_h = scalar.fptrunc {n} : f32 to f16")
-            e(f"    {n}_r = scalar.extf {n}_h : f16 to f32")
-        return f"{n}_r"
     for g in range(4):
         for i in range(4):
-            if not F16SIM:
-                e(f"    %ke{g}{i} = vector.extract %k{g}[{i}] : {V4} -> f32")
-                e(f"    %qe{g}{i} = vector.extract %q{g}[{i}] : {V4} -> f32")
-                continue
-            e(f"    %ke{g}{i}0 = vector.extract %k{g}[{i}] : {V4} -> f32")
-            e(f"    %qe{g}{i}0 = vector.extract %q{g}[{i}] : {V4} -> f32")
-            for nm in ("ke", "qe"):
-                rr = r16(f"%{nm}{g}{i}0")
-                e(f"    %{nm}{g}{i} = scalar.addf {rr}, %negzero : f32")
+            e(f"    %ke{g}{i} = vector.extract %k{g}[{i}] : {V4} -> f32")
+            e(f"    %qe{g}{i} = vector.extract %q{g}[{i}] : {V4} -> f32")
     ys = []
     for r in range(2):
         for g in range(4):
@@ -219,23 +190,14 @@ def gen():
         def dot(tag, v):
             acc = "%zero"
             for g in range(4):
-                s = [r16(f"%se{r}{g}{i}") for i in range(4)]
+                s = [f"%se{r}{g}{i}" for i in range(4)]
                 x = [f"%{v}e{g}{i}" for i in range(4)]
                 n = f"{tag}{r}{g}"
-                if DOTF:
-                    # HIP's chain fma(s3,x3, fma(s2,x2, fma(s0,x0, s1*x1))) as one
-                    # vector.dotf over (1, 0, 2, 3) from -0.0: fma(a, b, -0) is
-                    # a*b to the sign of zero, and dotf lowers to v_fma + 3
-                    # v_fmac in element order, which VOPD can pair (v_fma_f32
-                    # cannot). Same roundings.
-                    e(f"    %{n}vs = vector.from_elements {s[1]}, {s[0]}, {s[2]}, {s[3]} : {V4}")
-                    e(f"    %{n}vx = vector.from_elements {x[1]}, {x[0]}, {x[2]}, {x[3]} : {V4}")
-                    e(f"    %{n}c = vector.dotf %{n}vs, %{n}vx, %negzero : {V4}, {V4}, f32")
-                else:
-                    e(f"    %{n}m = scalar.mulf {s[1]}, {x[1]} : f32")
-                    e(f"    %{n}a = scalar.fmaf {s[0]}, {x[0]}, %{n}m : f32")
-                    e(f"    %{n}b = scalar.fmaf {s[2]}, {x[2]}, %{n}a : f32")
-                    e(f"    %{n}c = scalar.fmaf {s[3]}, {x[3]}, %{n}b : f32")
+                # HIP's chain fma(s3,x3, fma(s2,x2, fma(s0,x0, s1*x1)))
+                e(f"    %{n}m = scalar.mulf {s[1]}, {x[1]} : f32")
+                e(f"    %{n}a = scalar.fmaf {s[0]}, {x[0]}, %{n}m : f32")
+                e(f"    %{n}b = scalar.fmaf {s[2]}, {x[2]}, %{n}a : f32")
+                e(f"    %{n}c = scalar.fmaf {s[3]}, {x[3]}, %{n}b : f32")
                 e(f"    %{n}s = scalar.addf {acc}, %{n}c : f32")
                 acc = f"%{n}s"
             for m in (1, 2, 4):
@@ -247,32 +209,23 @@ def gen():
             return acc
         u = dot("u", "k")
         p = dot("p", "q")
-        vv = r16(f"%v{r}")
-        e(f"    %vm{r} = scalar.fmaf %neg_inv_k, {u}, {vv} : f32")
+        e(f"    %vm{r} = scalar.fmaf %neg_inv_k, {u}, %v{r} : f32")
         e(f"    %d{r} = scalar.mulf %beta, %vm{r} : f32")
         e(f"    %dkq{r} = scalar.mulf %d{r}, %kq_dot : f32")
         e(f"    %o{r} = scalar.fmaf %q_scale, {p}, %dkq{r} : f32")
         e(f"    %oi{r} = index.add %ot, %row{r} : index")
         e(f"    view.store %o{r}, %out_view[%oi{r}] : f32, view<[%out_total]xf32>")
-        if F16SIM:
-            e(f"    %dk{r}0 = scalar.mulf %inv_k, %d{r} : f32")
-            e(f"    %dk{r} = scalar.addf {r16(f'%dk{r}0')}, %negzero : f32")
-        else:
-            e(f"    %dk{r} = scalar.mulf %inv_k, %d{r} : f32")
+        e(f"    %dk{r} = scalar.mulf %inv_k, %d{r} : f32")
         e(f"    %dkv{r} = vector.splat %dk{r} : {V4}")
         for g in range(4):
-            if __import__("os").environ.get("YAH_DN_COMPW", "1") == "1":
-                # componentwise, as the dot products already read k: then no
-                # consumer needs the whole k bank and the loop-carried k/q
-                # banks project to registers (compile-report suggest:
-                # vector.compare_componentwise_bank_state). Same fmas.
-                cs = []
-                for i in range(4):
-                    e(f"    %snc{r}{g}{i} = scalar.fmaf %dk{r}, %ke{g}{i}, %se{r}{g}{i} : f32")
-                    cs.append(f"%snc{r}{g}{i}")
-                e(f"    %sn{r}{g} = vector.from_elements {', '.join(cs)} : {V4}")
-            else:
-                e(f"    %sn{r}{g} = vector.fmaf %dkv{r}, %k{g}, %sa_{r}{g} : {V4}")
+            # componentwise, as the dot products already read k: then no
+            # consumer needs the whole k bank and the loop-carried k/q
+            # banks project to registers. Same fmas.
+            cs = []
+            for i in range(4):
+                e(f"    %snc{r}{g}{i} = scalar.fmaf %dk{r}, %ke{g}{i}, %se{r}{g}{i} : f32")
+                cs.append(f"%snc{r}{g}{i}")
+            e(f"    %sn{r}{g} = vector.from_elements {', '.join(cs)} : {V4}")
             ys.append(f"%sn{r}{g}")
     e(f"    scf.yield {', '.join(ys + nxt)} : {ltypes}")
     e("  }")

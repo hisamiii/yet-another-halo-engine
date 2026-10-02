@@ -27,6 +27,11 @@ import os, re, sys, shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import emit_prefill as E  # noqa: E402
+import gen_attn_fa  # noqa: E402
+import gen_deltanet_hip  # noqa: E402
+import gen_gdn_chunk  # noqa: E402
+import gen_half_norm  # noqa: E402
+import gen_kvq  # noqa: E402
 
 
 def widen_source(loomfile, text, tile):
@@ -42,7 +47,7 @@ def rope_kpaged(text):
     """yah_fused_qk_rope_batched -> paged-K variant: K rows go straight to the
     paged K pool (row ptab[cur / 256] * 256 + cur % 256, k16_elems elements,
     page index clamped into the pool); V keeps writing the one-chunk scratch for
-    yah_vtpage (KV paging, YAH_KV_PAGED)."""
+    yah_vtpage (KV paging)."""
     def r(a, b):
         nonlocal text
         assert text.count(a) == 1, a[:60]
@@ -395,126 +400,57 @@ def main():
                 geom.append((kout, ktile, krowgrp, ktt))
         n += 1
 
-    # Attention: tools/gen_attn_heads.py with H query heads of one GQA group per
-    # workgroup sharing each K/V tile (bit-identical to yah_attn_wmma_qb.loom).
-    # The driver reads H from this row's row-group field. YAH_ATTN_HEADS=0 keeps
-    # the hand-written kernel (one head per workgroup).
-    attn_heads = int(os.environ.get("YAH_ATTN_HEADS", "3"))
-    attn_src = "yah_attn_wmma_qb.loom"
-    # YAH_ATTN_HIP=1: tools/gen_attn_hip.py, bit-identical to HIP's
-    # WmmaCausalAttention<32, 16, true> (32 tokens x 2 heads per workgroup),
-    # reading V^T written per layer by yah_transpose_v16 (vtrans.hal row).
-    attn_hip = os.environ.get("YAH_ATTN_HIP", "1") == "1"
-    # KV paging (256-token pages) is the default since 2026-10-02 (p71): bit-
-    # identical and cycle-neutral. It needs the FA kernel and a context that is a
-    # multiple of 256; otherwise the default falls back to the contiguous cache
-    # and an explicit YAH_KV_PAGED=1 is an error. The decision is pinned in the
-    # env here, before gen_attn_fa / gen_kvq are imported (they read it).
-    kv_paged_env = os.environ.get("YAH_KV_PAGED")
-    kv_paged = kv_paged_env != "0"
-    if kv_paged:
-        why = ("the context to be a multiple of 256" if T % 256 else
-               "the FA attention kernel" if not (os.environ.get("YAH_ATTN_FA", "1") == "1" and attn_hip) else None)
-        if why and kv_paged_env == "1":
-            raise SystemExit("YAH_KV_PAGED needs " + why)
-        if why:
-            print("KV paging off: needs " + why)
-            kv_paged = False
-    os.environ["YAH_KV_PAGED"] = "1" if kv_paged else "0"
-    vtrans_src = None
-    kq8_on = False
-    vq8_on = False
-    vq4_on = False
-    if attn_hip:
-        os.environ.setdefault("YAH_ATTN_MAX_TOKENS", str(max(B, 2048)))
-        import gen_attn_hip
-        tmp = os.path.join(outdir, ".emit_tmp")
-        os.makedirs(tmp, exist_ok=True)
-        attn_src = os.path.join(tmp, "yah_attn_hip.loom")
-        with open(attn_src, "w") as fh:
-            # tools/gen_attn_fa.py by default (register softmax, not HIP's
-            # arithmetic order; accepted 2026-10-01 on kl_p999 / flips / PPL,
-            # see gate/README.md), same grid, bindings and f16 output.
-            # YAH_ATTN_FA=0: the HIP-order kernel (bit-identical to HIP).
-            if os.environ.get("YAH_ATTN_FA", "1") == "1":
-                import gen_attn_fa
-                fh.write(gen_attn_fa.gen())
-            else:
-                fh.write(gen_attn_hip.gen())
-        vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
-        with open(vtrans_src, "w") as fh:
-            fh.write(gen_attn_hip.gen_vtrans())
-        fa_gqa = (os.environ.get("YAH_ATTN_FA", "1") == "1"
-                  and os.environ.get("YAH_ATTN_FA_GQA", "0") == "1")
-        if fa_gqa:
-            # GQA-packed FA: 6 heads x 16 tokens, 384-thread workgroups
-            geom.append(("wmma.hal", 16, 6, (B + 15) // 16))
-            geom.append(("attn_wg384", 0, 0, 0))
-        else:
-            geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
-        # Quantized K (engine/run/kvq/README.md): YAH_ATTN_FA_K8=1 (kv8a16) int8 K
-        # by yah_kmean + yah_kq8; YAH_ATTN_FA_K4=1 (kv4a16) H256 + asymmetric
-        # int4 K by yah_kmean + yah_kq4. The attention decodes either to f16.
-        kq4_mode = os.environ.get("YAH_ATTN_FA_K4", "0") == "1"
-        kq8_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
-                  and (os.environ.get("YAH_ATTN_FA_K8", "0") == "1" or kq4_mode))
-        if kq8_on:
-            import gen_kvq
-            kmean_src = os.path.join(tmp, "yah_kmean.loom")
-            kq8_src = os.path.join(tmp, "yah_kq8.loom")
-            open(kmean_src, "w").write(gen_kvq.gen_kmean())
-            open(kq8_src, "w").write(gen_kvq.gen_kq4() if kq4_mode else gen_kvq.gen_kq8())
-            geom.append(("attn_kq4" if kq4_mode else "attn_kq8", 0, 0, 0))
-        # YAH_ATTN_FA_VQ8=1 (kv8a16) / YAH_ATTN_FA_VQ4=1 (kv4a16): V^T as bytes /
-        # nibbles per channel per 16-key tile + (S, C') by yah_vq8 / yah_vq4
-        # instead of the f16 transpose (one HAL per chunk: start_pos)
-        vq4_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
-                  and os.environ.get("YAH_ATTN_FA_VQ4", "0") == "1")
-        if vq4_on:
-            import gen_kvq
-            vq4_src = os.path.join(tmp, "yah_vq4.loom")
-            open(vq4_src, "w").write(gen_kvq.gen_vq4())
-            geom.append(("attn_vq4", 0, 0, 0))
-        vq8_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
-                  and os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1")
-        if vq8_on:
-            import gen_kvq
-            vq8_src = os.path.join(tmp, "yah_vq8.loom")
-            open(vq8_src, "w").write(gen_kvq.gen_vq8())
-            geom.append(("attn_vq8", 0, 0, 0))
-        if gen_attn_hip.F16OUT:
-            # marker: the attention HAL stores its output as f16 (no half_cast)
-            geom.append(("attn_f16out", 0, 0, 0))
-        geom.append(("vtrans.hal", 0, 0, 0))
-    elif attn_heads:
-        import gen_attn_heads
-        tmp = os.path.join(outdir, ".emit_tmp")
-        os.makedirs(tmp, exist_ok=True)
-        attn_src = os.path.join(tmp, "yah_attn_wmma_h%d.loom" % attn_heads)
-        with open(attn_src, "w") as fh:
-            fh.write(gen_attn_heads.gen(attn_heads))
-        geom.append(("wmma.hal", 16, attn_heads, (B + 15) // 16))
+    # Attention: tools/gen_attn_fa.py (register softmax), 32 tokens x 2 heads per
+    # workgroup, reading V^T (vtrans.hal, or the paged / quantized V pools).
+    # KV paging (256-token pages) needs a context that is a multiple of 256;
+    # otherwise the caches stay contiguous.
+    kv_paged = T % 256 == 0
+    if not kv_paged:
+        print("KV paging off: needs the context to be a multiple of 256")
+    gen_attn_fa.PAGED = gen_kvq.PAGED = kv_paged
+    gen_attn_fa.MAX_TOKENS = max(B, 2048)
+    tmp = os.path.join(outdir, ".emit_tmp")
+    os.makedirs(tmp, exist_ok=True)
+    attn_src = os.path.join(tmp, "yah_attn_hip.loom")
+    open(attn_src, "w").write(gen_attn_fa.gen())
+    vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
+    open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
+    geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
+    # Quantized K (engine/run/kvq/README.md): YAH_ATTN_FA_K8=1 (kv8a16) int8 K
+    # by yah_kmean + yah_kq8; YAH_ATTN_FA_K4=1 (kv4a16) H256 + asymmetric
+    # int4 K by yah_kmean + yah_kq4. The attention decodes either to f16.
+    kq4_mode = os.environ.get("YAH_ATTN_FA_K4", "0") == "1"
+    kq8_on = os.environ.get("YAH_ATTN_FA_K8", "0") == "1" or kq4_mode
+    if kq8_on:
+        kmean_src = os.path.join(tmp, "yah_kmean.loom")
+        kq8_src = os.path.join(tmp, "yah_kq8.loom")
+        open(kmean_src, "w").write(gen_kvq.gen_kmean())
+        open(kq8_src, "w").write(gen_kvq.gen_kq4() if kq4_mode else gen_kvq.gen_kq8())
+        geom.append(("attn_kq4" if kq4_mode else "attn_kq8", 0, 0, 0))
+    # YAH_ATTN_FA_VQ8=1 (kv8a16) / YAH_ATTN_FA_VQ4=1 (kv4a16): V^T as bytes /
+    # nibbles per channel per 16-key tile + (S, C') by yah_vq8 / yah_vq4
+    # instead of the f16 transpose (one HAL per chunk: start_pos)
+    vq4_on = os.environ.get("YAH_ATTN_FA_VQ4", "0") == "1"
+    if vq4_on:
+        vq4_src = os.path.join(tmp, "yah_vq4.loom")
+        open(vq4_src, "w").write(gen_kvq.gen_vq4())
+        geom.append(("attn_vq4", 0, 0, 0))
+    vq8_on = os.environ.get("YAH_ATTN_FA_VQ8", "0") == "1"
+    if vq8_on:
+        vq8_src = os.path.join(tmp, "yah_vq8.loom")
+        open(vq8_src, "w").write(gen_kvq.gen_vq8())
+        geom.append(("attn_vq8", 0, 0, 0))
+    # marker: the attention HAL stores its output as f16 (no half_cast)
+    geom.append(("attn_f16out", 0, 0, 0))
+    geom.append(("vtrans.hal", 0, 0, 0))
 
-    # DeltaNet: tools/gen_deltanet_hip.py, bit-identical to HIP's
-    # BatchedDeltaNetRowSplitKernel<float,16,2>, grid
-    # (2, heads) recorded as the rowsplit.hal row group. YAH_DELTANET_HIP=0 keeps
-    # the regtile kernel (Loom's own sequential-sum order).
-    dn_src = "yah_deltanet_rowsplit_f32.loom"
-    if os.environ.get("YAH_DELTANET_HIP", "1") != "0":
-        import gen_deltanet_hip
-        tmp = os.path.join(outdir, ".emit_tmp")
-        os.makedirs(tmp, exist_ok=True)
-        dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
-        # YAH_DN_CHUNK=1 (default): chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py):
-        # same ABI and (2, heads) grid, f16 WMMA inputs
-        # (output rel 2.1e-4 vs this kernel, end-to-end KLD ~3e-6), standalone
-        # pp2048 3.57 vs 4.12 M cycles. Needs B % 32 == 0 (else the recurrent kernel).
-        chunk_dn = os.environ.get("YAH_DN_CHUNK", "1") == "1" and B % 32 == 0
-        if chunk_dn:
-            import gen_gdn_chunk
-        with open(dn_src, "w") as fh:
-            fh.write(gen_gdn_chunk.gen() if chunk_dn else gen_deltanet_hip.gen())
-        geom.append(("rowsplit.hal", 0, 2, 0))
+    # DeltaNet: chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py), grid
+    # (2, heads) recorded as the rowsplit.hal row group, f16 WMMA inputs.
+    # It needs B % 32 == 0; otherwise the recurrent kernel
+    # (tools/gen_deltanet_hip.py, same ABI and grid).
+    dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
+    open(dn_src, "w").write(gen_gdn_chunk.gen() if B % 32 == 0 else gen_deltanet_hip.gen())
+    geom.append(("rowsplit.hal", 0, 2, 0))
 
     # Record the resolved launch geometry with the prepared executables.
     # loom_forward_pp reads this instead of recomputing the grid, so the dispatch
@@ -534,8 +470,6 @@ def main():
         geom.append(("kv16_scratch", 0, 0, 0))
     paged_f16k = kv_paged and not kq8_on
     paged_f16v = kv_paged and not (vq4_on or vq8_on)
-    if paged_f16k or paged_f16v:
-        import gen_kvq
     rope_src = "yah_fused_qk_rope_batched_f32.loom"
     if paged_f16k:   # RoPE writes K rows straight into the paged pool
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_kpaged.loom")
@@ -553,17 +487,9 @@ def main():
         for hal, tk, rg, tt in geom:
             fh.write("%s %d %d %d\n" % (hal, tk, rg, tt))
 
-    # The output norm is the fully unrolled fused=0 form (tools/gen_half_norm.py):
-    # same arithmetic in the same order, all loads issued up front; 0.54 -> 0.33
-    # ms per 2048-row call, bit-identical. YAH_NORM_UNROLLED=0 keeps the loop form.
-    norm_src = "yah_half_norm_f16.loom"
-    if os.environ.get("YAH_NORM_UNROLLED", "1") != "0":
-        import gen_half_norm
-        tmp = os.path.join(outdir, ".emit_tmp")
-        os.makedirs(tmp, exist_ok=True)
-        norm_src = os.path.join(tmp, "yah_half_norm_unrolled.loom")
-        with open(norm_src, "w") as fh:
-            fh.write(gen_half_norm.gen(5120))
+    # The output norm (tools/gen_half_norm.py): fully unrolled, all loads issued up front.
+    norm_src = os.path.join(tmp, "yah_half_norm_unrolled.loom")
+    open(norm_src, "w").write(gen_half_norm.gen(5120))
     fixed = [
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
