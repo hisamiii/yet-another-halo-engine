@@ -74,7 +74,8 @@ for p in "${patches[@]}"; do
   fi
 done
 
-# ROCm's clang builds the AMDGPU device code; the same toolchain builds the host side.
+# ROCm's clang builds the AMDGPU device code; the same toolchain builds the host side. Dependencies, including the HSA
+# headers, are HRX's pinned copies: a system ROCm's headers can be older than the runtime HRX was written against.
 rocm="${ROCM_PATH:-/opt/rocm}"
 cc="${CC:-$rocm/llvm/bin/clang}"
 cxx="${CXX:-$rocm/llvm/bin/clang++}"
@@ -82,6 +83,7 @@ build="$hrx/build/cmake"
 if [ ! -f "$build/CMakeCache.txt" ]; then
   cmake -S "$hrx" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" -DIREE_ROCM_PATH="$rocm" \
+    -DIREE_DEPENDENCY_MODE=pinned -DIREE_ROCM_DEPENDENCY_MODE=pinned \
     -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_HAL_DRIVER_TASK=ON \
     -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_SAMPLES=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
     -DLIBHRX_BUILD=ON -DLIBHRX_BUILD_HIP_BINDING=ON -DLIBHRX_BUILD_CTS=OFF \
