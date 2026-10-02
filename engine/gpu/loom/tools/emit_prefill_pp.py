@@ -291,7 +291,7 @@ def main():
         vq8_src = os.path.join(tmp, "yah_vq8.loom")
         open(vq8_src, "w").write(gen_kvq.gen_vq8())
         geom.append(("attn_vq8", 0, 0, 0))
-    # marker: the attention HAL stores its output as f16 (no half_cast)
+    # marker: the attention HAL stores f16 straight into the o-projection input
     geom.append(("attn_f16out", 0, 0, 0))
     geom.append(("vtrans.hal", 0, 0, 0))
 
@@ -338,16 +338,10 @@ def main():
         (norm_src, "norm.hal",
          ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
           "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"]),
-        ("yah_ssm_conv_f32.loom", "conv.hal",
-         ["yah_ssm_conv.batch=%d" % B, "yah_ssm_conv.qkv_dim=10240"]),
-        # conv with yah_deltanet_prep_kq fused in (the driver prefers it)
+        # the conv with the q / k L2 norm (prep_kq) fused in
         ("yah_ssm_conv_kq_f32.loom", "convkq.hal",
          ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
           "yah_ssm_conv_kq.num_key_heads=16"]),
-        ("yah_deltanet_prep_kq_f32.loom", "prepkq.hal",
-         ["yah_deltanet_prep_kq.batch=%d" % B,
-          "yah_deltanet_prep_kq.num_key_heads=16",
-          "yah_deltanet_prep_kq.qkv_size=10240"]),
         ("yah_deltanet_prep_ab_f32.loom", "prepab.hal",
          ["yah_deltanet_prep_ab.batch=%d" % B,
           "yah_deltanet_prep_ab.qkv_size=10240",
@@ -405,8 +399,6 @@ def main():
           if vq4_on else []),
         *([("yah_conv_state_f32.loom", "convstate.hal",
             ["yah_conv_state.batch=%d" % B, "yah_conv_state.channels=10240"])] if NCH > 1 else []),
-        ("yah_half_cast.loom", "cast.hal",
-         ["yah_half_cast.num_elements=%d" % (6144 * B)]),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",
          ["yah_rmsnorm.rows=1", "yah_rmsnorm.eps=1e-06"]),
         ("yah_gemv_q6k_f32.loom", "gemv.hal",
@@ -422,7 +414,6 @@ def main():
                      ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
                      ("grid_iq2xxs.bin", "grid_iq2xxs.bin"),
                      ("grid_iq2xs.bin", "grid_iq2xs.bin"),
-                     ("ksigns_iq2xs.bin", "ksigns_iq3xxs.bin"),
                      ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")]:
         shutil.copy(os.path.join(tables, src), os.path.join(outdir, dst))
     print("emitted %d GEMM + fixed prefill HALs for B=%d (tile=%d, token_tiles=%d)"

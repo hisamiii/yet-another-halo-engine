@@ -125,6 +125,7 @@ int main(int argc, char** argv) {
     // The outputs then equal the first dispatch's only if the kernel is idempotent (resid is not).
     if (const char* it = std::getenv("HAL_RUN_ITERS")) {
       const int iters = std::atoi(it);
+      if (iters <= 0) throw LoomError("HAL_RUN_ITERS must be positive");
       // Host wall clock around the loop and the final wait: HRX event pairs around plain dispatches read near zero.
       const auto t0 = std::chrono::steady_clock::now();
       for (int i = 0; i < iters; ++i) gpu.Dispatch(exe, 0, cfg, nullptr, 0, refs.data(), refs.size());

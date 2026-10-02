@@ -6,7 +6,7 @@ loom_forward_pp writes them with YAH_LOGITS_FROM=FROM (gate/gate_run.sh).
 The token ids of each window (corpus/ids2048_wNN.txt) give the next-token targets for NLL.
 
   accgate2.py stats     <golden_dir> <cand_dir> [--windows 00,01,...]
-  accgate2.py calibrate <golden_dir> <ref_dir> <thresholds.json> [--windows ...] [--tier T1]
+  accgate2.py calibrate <golden_dir> <ref_dir> <thresholds.json> [--windows ...]   (writes T1 thresholds)
   accgate2.py check     <golden_dir> <cand_dir> <thresholds.json> [--windows ...]
 
 Per position (f64): KL(golden || cand), logits relative RMS, top-1 flip, NLL of the actual next token in both.

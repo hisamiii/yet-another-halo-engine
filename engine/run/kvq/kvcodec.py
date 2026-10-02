@@ -88,7 +88,7 @@ def q_asym_clip(x, bits, group, kappa):
     return (np.clip(np.round((g - lo) / sc), 0, lv) * sc + lo).reshape(s)
 
 
-def wush_transform(kc, q, gamma=1e-2):
+def wush_transform(kc, q, gamma=1.0):
     """WUSH-KV K transform for one KV head (arXiv 2609.38121, closed form).
 
     L L^T = H + g tr(H)/d I, H = sum q q^T over the GQA group's query rows.

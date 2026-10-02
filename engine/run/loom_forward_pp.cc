@@ -223,12 +223,22 @@ void DequantIq4XsRow(const std::uint8_t* base, std::uint64_t row, float* out) {
   }
 }
 
-std::vector<std::uint32_t> ParseIds(const char* path) {
+FILE* OpenOut(const std::string& path) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) throw LoomError("cannot write " + path);
+  return f;
+}
+
+// Token ids index the embedding rows on the host: refuse any id outside the vocabulary.
+std::vector<std::uint32_t> ParseIds(const char* path, std::uint64_t vocab) {
   std::ifstream file(path);
   if (!file) throw LoomError(std::string("cannot read ids file ") + path);
   std::vector<std::uint32_t> ids;
   std::uint64_t v;
-  while (file >> v) ids.push_back(static_cast<std::uint32_t>(v));
+  while (file >> v) {
+    if (v >= vocab) throw LoomError("token id " + std::to_string(v) + " is outside the vocabulary");
+    ids.push_back(static_cast<std::uint32_t>(v));
+  }
   if (ids.empty()) throw LoomError("ids file is empty");
   return ids;
 }
@@ -248,7 +258,7 @@ int main(int argc, char** argv) {
   try {
     auto gguf = yah::core::Gguf::Open(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
-    std::vector<std::uint32_t> ids_all = ParseIds(ids_path);
+    std::vector<std::uint32_t> ids_all = ParseIds(ids_path, kVocab);
     g_b = want ? want : static_cast<std::uint32_t>(ids_all.size());
     if (ids_all.size() < g_b) {
       // Pad a short id file by repeating it: a timing run needs only a valid token stream of the right length.
@@ -316,7 +326,6 @@ int main(int argc, char** argv) {
     };
     LoomBuffer grid_iq3s = gpu.Allocate(std::size_t{512} * 4);
     LoomBuffer grid_iq3xxs = gpu.Allocate(std::size_t{256} * 4);
-    LoomBuffer ksigns_iq3xxs = gpu.Allocate(std::size_t{128});
     LoomBuffer grid_iq2xxs = gpu.Allocate(std::size_t{512} * 4);
     LoomBuffer grid_iq2xs = gpu.Allocate(std::size_t{1024} * 4);
     LoomBuffer ksigns_iq2xxs = gpu.Allocate(std::size_t{128});
@@ -329,11 +338,6 @@ int main(int argc, char** argv) {
       std::vector<std::uint8_t> v(256 * 4);
       ReadFile((dir + "/grid_iq3xxs.bin").c_str(), v.data(), v.size());
       gpu.H2D(grid_iq3xxs, v.data(), v.size());
-    }
-    {
-      std::vector<std::uint8_t> v(128);
-      ReadFile((dir + "/ksigns_iq3xxs.bin").c_str(), v.data(), v.size());
-      gpu.H2D(ksigns_iq3xxs, v.data(), v.size());
     }
     {
       std::vector<std::uint8_t> v(512 * 4);
@@ -365,7 +369,6 @@ int main(int argc, char** argv) {
     LoomBuffer q = gpu.Allocate(static_cast<std::size_t>(B) * kAttn * 4);
     LoomBuffer kbuf = gpu.Allocate(static_cast<std::size_t>(B) * kKv * 4);
     LoomBuffer vbuf = gpu.Allocate(static_cast<std::size_t>(B) * kKv * 4);
-    LoomBuffer aout = gpu.Allocate(static_cast<std::size_t>(B) * kAttn * 4);
     LoomBuffer raw = gpu.Allocate(static_cast<std::size_t>(B) * kInner * 4);
     LoomBuffer conv_out = gpu.Allocate(static_cast<std::size_t>(B) * kQkv * 4);
     LoomBuffer kqbuf = gpu.Allocate(static_cast<std::size_t>(B) * kKh * 3 * 4);
@@ -431,17 +434,7 @@ int main(int argc, char** argv) {
     embed(0, hidden);
 
     LoomExecutable& e_norm = load(dir + "/norm.hal");
-    LoomExecutable& e_conv = load(dir + "/conv.hal");
-    LoomExecutable& e_prepkq = load(dir + "/prepkq.hal");
-    // Optional convkq.hal: the conv with yah_deltanet_prep_kq fused in.
-    LoomExecutable* e_convkq = nullptr;
-    {
-      const std::string path = dir + "/convkq.hal";
-      if (FILE* f = std::fopen(path.c_str(), "rb")) {
-        std::fclose(f);
-        e_convkq = &load(path);
-      }
-    }
+    LoomExecutable& e_convkq = load(dir + "/convkq.hal");  // the conv with yah_deltanet_prep_kq fused in
     LoomExecutable& e_prepab = load(dir + "/prepab.hal");
     LoomExecutable& e_rowsplit = load(dir + "/rowsplit.hal");
     LoomExecutable& e_postnorm = load(dir + "/postnorm.hal");
@@ -512,7 +505,6 @@ int main(int argc, char** argv) {
       if (attn_kq8) e_kq8s.push_back(&load(dir + "/kq8" + sfx + ".hal"));
     }
     const hrx_buffer_ref_t ptab_ref{ptab.handle, 0, std::size_t{kv_paged ? kPages : 1} * 4};
-    LoomExecutable& e_cast = load(dir + "/cast.hal");
     LoomExecutable& e_gemv = load(dir + "/gemv.hal");
     LoomExecutable& e_rms = load(dir + "/rmsnorm.hal");
     LoomExecutable& e_argmax = load(dir + "/argmax.hal");
@@ -557,8 +549,8 @@ int main(int argc, char** argv) {
       Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name)).c_str(), mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1,
                b);
     };
-    // "attn_f16out": the attention HAL stores f16 straight into the o-projection input, so no yah_half_cast pass.
-    const bool attn_f16 = g_geom.count("attn_f16out") != 0;
+    // The attention HAL stores f16 straight into the o-projection input ("attn_f16out").
+    if (!g_geom.count("attn_f16out")) throw LoomError("dispatch.txt lacks attn_f16out (re-emit the set)");
     // gemm_kqg_*: the attention q projection with the q/gate unpack fused in (rows = heads x [256 q | 256 gate]).
     // Returns false if the set has no such HAL; the caller then runs kstore + yah_unpack_qg.
     auto run_kqg = [&](const std::string& wname) -> bool {
@@ -691,7 +683,7 @@ int main(int argc, char** argv) {
     std::FILE* rowstats = nullptr;
     std::vector<char> rs_want(T_ctx, 0);
     if (const char* rf = std::getenv("YAH_ROWSTATS")) {
-      rowstats = std::fopen(rf, "wb");
+      rowstats = OpenOut(rf);
       if (const char* pf = std::getenv("YAH_ROWSTATS_POS")) {
         std::ifstream pfs(pf);
         std::uint32_t pp;
@@ -878,7 +870,7 @@ int main(int argc, char** argv) {
                 : paged_f16v ? hrx_buffer_ref_t{vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}
                 : e_vtrans   ? hrx_buffer_ref_t{vt16.handle, 0, kVtBytes}
                              : hrx_buffer_ref_t{kv16.handle, voff, kKvCache * 2},
-                {attn_f16 ? scratch.handle : aout.handle, 0, attn_f16 ? hb(scratch) : hb(aout)},
+                {scratch.handle, 0, hb(scratch)},
                 {lse.handle, 0, hb(lse)}};
             if (attn_kq8) b.push_back({ksbuf.handle, ksoff, kKsBytes});
             if (attn_vqt) b.push_back({vqsbuf.handle, vqsoff, kVqsBytes});
@@ -886,24 +878,15 @@ int main(int argc, char** argv) {
             // dispatch.txt "wmma.hal" row: rowgrp = query heads of one GQA group per workgroup,
             // tokens = query tokens per workgroup, tt = query-token tiles.
             const auto attn_geom = g_geom.find("wmma.hal");
-            const std::uint32_t attn_hpw =
-                attn_geom != g_geom.end() && attn_geom->second.rowgrp ? attn_geom->second.rowgrp : 1;
+            if (attn_geom == g_geom.end() || !attn_geom->second.rowgrp || !attn_geom->second.tokens)
+              throw LoomError("dispatch.txt has no wmma.hal geometry (re-emit the set)");
+            const std::uint32_t attn_hpw = attn_geom->second.rowgrp, attn_tpw = attn_geom->second.tokens;
             if (kHeads % attn_hpw) throw LoomError("wmma.hal heads per workgroup does not divide the heads");
-            const std::uint32_t attn_tpw =
-                attn_geom != g_geom.end() && attn_geom->second.tokens ? attn_geom->second.tokens : 16;
             // Loom drops bounds clamps it proves from the launch contract: extra workgroups read unmapped VA and hang.
             // Refuse a grid the emitter did not record.
-            if (attn_geom != g_geom.end() && attn_geom->second.tt &&
-                (B + attn_tpw - 1) / attn_tpw != attn_geom->second.tt)
+            if (attn_geom->second.tt && (B + attn_tpw - 1) / attn_tpw != attn_geom->second.tt)
               throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
-            // "attn_wg384": 12-wave workgroups (GQA packing).
-            const std::uint32_t attn_wg = g_geom.count("attn_wg384") ? 384 : 256;
-            Dispatch(gpu, e_wmma, "yah_attn_wmma", (B + attn_tpw - 1) / attn_tpw, kHeads / attn_hpw, 1, attn_wg, 1, 1,
-                     b);
-          }
-          if (!attn_f16) {
-            std::vector<hrx_buffer_ref_t> b = {{aout.handle, 0, hb(aout)}, {scratch.handle, 0, hb(scratch)}};
-            Dispatch(gpu, e_cast, "yah_half_cast", 24 * B, 1, 1, 256, 1, 1, b);
+            Dispatch(gpu, e_wmma, "yah_attn_wmma", (B + attn_tpw - 1) / attn_tpw, kHeads / attn_hpw, 1, 256, 1, 1, b);
           }
           run_residual(pre + "attn_output.weight", scratch);
         } else {
@@ -926,22 +909,14 @@ int main(int argc, char** argv) {
             std::vector<hrx_buffer_ref_t> b = {{qkv.handle, 0, hb(qkv)},
                                                {w_conv.handle, w_conv.offset, w_conv.bytes},
                                                {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4},
-                                               {conv_out.handle, 0, hb(conv_out)}};
-            if (e_convkq) {
-              b.push_back({kqbuf.handle, 0, hb(kqbuf)});
-              Dispatch(gpu, *e_convkq, "yah_ssm_conv_kq", 40, B, 1, 256, 1, 1, b);
-            } else {
-              Dispatch(gpu, e_conv, "yah_ssm_conv", 40, B, 1, 256, 1, 1, b);
-            }
+                                               {conv_out.handle, 0, hb(conv_out)},
+                                               {kqbuf.handle, 0, hb(kqbuf)}};
+            Dispatch(gpu, e_convkq, "yah_ssm_conv_kq", 40, B, 1, 256, 1, 1, b);
           }
           if (e_convstate) {  // the next chunk's conv reads this chunk's last 3 inputs
             std::vector<hrx_buffer_ref_t> b = {{qkv.handle, 0, hb(qkv)},
                                                {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4}};
             Dispatch(gpu, *e_convstate, "yah_conv_state", (kQkv + 255) / 256, 1, 1, 256, 1, 1, b);
-          }
-          {
-            std::vector<hrx_buffer_ref_t> b = {{conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)}};
-            if (!e_convkq) Dispatch(gpu, e_prepkq, "yah_deltanet_prep_kq", kKh, B, 1, 32, 1, 1, b);
           }
           {
             std::vector<hrx_buffer_ref_t> b = {{alpha.handle, 0, hb(alpha)},
@@ -963,12 +938,10 @@ int main(int argc, char** argv) {
                                                {state.handle, st_off, std::size_t{kTs} * kState * kState * 4},
                                                {raw.handle, 0, hb(raw)}};
             // DeltaNet grid: (blocks per head, heads) x 256, blocks per head from the "rowsplit.hal" row group.
-            // Without that row: (heads) x 128.
             const auto dn_geom = g_geom.find("rowsplit.hal");
-            if (dn_geom != g_geom.end() && dn_geom->second.rowgrp)
-              Dispatch(gpu, e_rowsplit, "yah_deltanet", dn_geom->second.rowgrp, kTs, 1, 256, 1, 1, b);
-            else
-              Dispatch(gpu, e_rowsplit, "yah_deltanet", kTs, 1, 1, 128, 1, 1, b);
+            if (dn_geom == g_geom.end() || !dn_geom->second.rowgrp)
+              throw LoomError("dispatch.txt has no rowsplit.hal row group (re-emit the set)");
+            Dispatch(gpu, e_rowsplit, "yah_deltanet", dn_geom->second.rowgrp, kTs, 1, 256, 1, 1, b);
           }
           {
             std::vector<hrx_buffer_ref_t> b = {{raw.handle, 0, hb(raw)},
@@ -1074,7 +1047,7 @@ int main(int argc, char** argv) {
     {
       std::vector<float> out(static_cast<std::size_t>(B) * kHidden);
       gpu.D2H(hidden, out.data(), out.size() * 4, 0);
-      FILE* fo = std::fopen((prefix + ".hidden").c_str(), "wb");
+      FILE* fo = OpenOut(prefix + ".hidden");
       std::fwrite(out.data(), 4, out.size(), fo);
       std::fclose(fo);
     }
@@ -1103,7 +1076,7 @@ int main(int argc, char** argv) {
       gpu.D2H(token, &tok, 4, 0);
       std::vector<float> logit_host(kVocab);
       gpu.D2H(logits, logit_host.data(), logit_host.size() * 4, 0);
-      FILE* fl = std::fopen((prefix + ".logits").c_str(), "wb");
+      FILE* fl = OpenOut(prefix + ".logits");
       std::fwrite(logit_host.data(), 4, logit_host.size(), fl);
       std::fclose(fl);
       std::printf("argmax=%u\n", tok);
@@ -1125,7 +1098,7 @@ int main(int argc, char** argv) {
         if (dec.kv_bits() != std::make_pair(kbits, vbits))
           throw LoomError("YAH_GEN: decode set KV bits " + std::to_string(dec.kv_bits().first) + "/" +
                           std::to_string(dec.kv_bits().second) + " != prefill " + std::to_string(kbits) + "/" +
-                          std::to_string(vbits) + " (emit_decode.py with the same YAH_ATTN_FA_* switches)");
+                          std::to_string(vbits) + " (emit_decode.py with the same YAH_KV)");
         LoomDecoderState st;
         for (std::uint32_t ai = 0; ai < kFull; ++ai) {
           if (dec.quant()) {
@@ -1164,7 +1137,7 @@ int main(int argc, char** argv) {
         gpu.Synchronize();
         std::vector<float> host(rows * kVocab);
         gpu.D2H(every, host.data(), host.size() * 4, 0);
-        FILE* fa = std::fopen((prefix + ".all_logits").c_str(), "wb");
+        FILE* fa = OpenOut(prefix + ".all_logits");
         std::fwrite(host.data(), 4, host.size(), fa);
         std::fclose(fa);
         std::printf("all_logits rows=%zu from=%u\n", rows, logits_from);
