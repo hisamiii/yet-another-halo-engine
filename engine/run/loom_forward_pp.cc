@@ -580,7 +580,9 @@ int main(int argc, char** argv) {
     const bool attn_kq8 = g_geom.count("attn_kq8") != 0 || attn_kq4;
     LoomExecutable* e_kmean = attn_kq8 ? &load(dir + "/kmean.hal") : nullptr;
     LoomExecutable* e_kq8 = attn_kq8 ? &load(dir + "/kq8.hal") : nullptr;
-    const std::size_t kKsBytes = static_cast<std::size_t>(B) * 8 * 4;
+    // K scales: int8 [token][8] f32; int4 [token][32] dwords (the asymmetric
+    // formats of yah_kq4: a4 scale + zero per half, g32 f16 pairs per 32 dims)
+    const std::size_t kKsBytes = static_cast<std::size_t>(B) * (attn_kq4 ? 32 : 8) * 4;
     const std::size_t kKqBytes = attn_kq4 ? kKvCache / 2 : kKvCache;
     LoomBuffer kq8buf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKqBytes : 4);
     LoomBuffer ksbuf = gpu.Allocate(attn_kq8 ? std::size_t{kFull} * kKsBytes : 4);
@@ -1027,6 +1029,11 @@ int main(int argc, char** argv) {
               {kv16.handle, koff, kKvCache * 2}, {kmbuf.handle, 0, 4096},
               {kq8buf.handle, q8off, kKqBytes}, {ksbuf.handle, ksoff, kKsBytes}};
           Dispatch(gpu, *e_kq8, attn_kq4 ? "yah_kq4" : "yah_kq8", (B + 1) / 2, 1, 1, 256, 1, 1, b);
+          if (g_dump_layer == static_cast<int>(l)) {   // quantized K, its scales, the channel mean
+            dump_range(kq8buf, q8off, kKqBytes, ".akq");
+            dump_range(ksbuf, ksoff, kKsBytes, ".aks");
+            dump_range(kmbuf, 0, 4096, ".akm");
+          }
         }
         const std::size_t vq8off = std::size_t{ai} * kVq8Bytes;
         const std::size_t vsoff = std::size_t{ai} * 8192;

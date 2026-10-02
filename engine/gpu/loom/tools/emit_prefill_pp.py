@@ -391,8 +391,12 @@ def main():
         # YAH_ATTN_FA_KQ4=1 (kv4 configs): int4 K of H128 (k - m) by yah_kq4
         kq4_mode = (os.environ.get("YAH_ATTN_FA_KQ4", "0") == "1"
                     or os.environ.get("YAH_ATTN_FA_KA4", "0") == "1")   # kv4a4: same caches
+        # YAH_ATTN_FA_KASYM=1 with KA4 (kv4a4) or KQ4 (kv4a16): H256 + asymmetric
+        # int4 K (gen_kvq.gen_kq4 reads the same env). YAH_ATTN_FA_K8F16=1
+        # (kv8a16): int8 K in the f16-decode format (gen_kvq.gen_kq8 reads it).
         kq8_on = (os.environ.get("YAH_ATTN_FA", "1") == "1"
-                  and (os.environ.get("YAH_ATTN_FA_KQ8", "0") == "1" or kq4_mode))
+                  and (os.environ.get("YAH_ATTN_FA_KQ8", "0") == "1"
+                       or os.environ.get("YAH_ATTN_FA_K8F16", "0") == "1" or kq4_mode))
         if kq8_on:
             import gen_kvq
             kmean_src = os.path.join(tmp, "yah_kmean.loom")
