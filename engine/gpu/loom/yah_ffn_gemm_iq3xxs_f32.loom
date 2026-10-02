@@ -1,59 +1,17 @@
-// YAH FFN GEMM with in-kernel IQ3_XXS weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kIQ3_XXS, kStore>.
-//
-// HIP source: prefill_fp16.hip, element decoder DecodeQuantSub16 IQ3_XXS arm in
-// quant_ops.hpp. The weight stays packed IQ3_XXS and is decoded inside the K loop.
-//
-//   out[token*m + row] = sum_k iq3xxs_decode(W, row, k) * f16(A[token][k])
-//
-// block_iq3_xxs is 98 bytes: half d; uint8 qs[96]. qs[0..63] index the 256-entry
-// iq3xxs grid of four packed magnitudes; qs[64..95] are four aux words, one per
-// 32-element group. Element i of the block is
-//   group = i/32; half = (i/16)%2; j = i%16; q = j/8; which = (j/4)%2; b = j%4
-//   l = 2*half + q
-//   g_word = grid[qs[8*group + 2*l + which]]
-//   g_byte = (g_word >> (8*b)) & 0xFF
-//   aux32  = LE32(qs[64 + 4*group .. +3])
-//   signs  = ksigns[(aux32 >> (7*l)) & 127]
-//   sign_nib = which == 0 ? signs & 0xF : signs >> 4
-//   sign_bit = (sign_nib >> b) & 1
-//   mag = sign_bit ? -g_byte : g_byte
-//   scale = f32(d) * (0.5 + (aux32 >> 28)) * 0.5
-//   value = scale * f32(mag)
-//
-// TWO TABLE OPERANDS, as in yah_ffn_gemm_iq3xxs: the 256-word grid and the
-// 128-byte ksigns table are read-only buffer operands (Loom has no embedded
-// constant array). The aux word is four byte loads because the 98-byte block
-// stride is not 4-aligned. The sign is applied as a signed magnitude before the
-// float conversion: keeping the HIP byte-negate in i32 would read a byte like
-// 241 as +241 rather than -15.
-//
-// BLOCK ORDER: block_iq3_xxs stores d first (offset 0); qs starts at 2.
-//
-// Schedule, correctness first and tuning deferred: one workgroup per 16-row
-// tile, one wave. For each K step of 16 the 32 lanes decode the 16x16 weight
-// tile into the wstage global scratch, vector.fragment.load<lhs> reads it back,
-// four 16x16x16 MMAs cover the four N sub-tiles, and the accumulators go through
-// an ostage global scratch to the output with scalar stores so the output index
-// can follow the m_tiles config. Both fragment operands are staged through
-// global memory rather than LDS: a fragment load or store against a
-// buffer.alloca<workgroup> view compiles but does not produce the tile the
-// target reads, and the global form is the one yah_ffn_gemm_f16 validates.
-//
-// Measured: 15.62 ms at m_tiles=1088 (production 17408 rows), against the HIP
-// Q4_K kernel at 1.197 ms and the Q4_K port at 23.31 ms. 0.765 ms at m_tiles=1.
-// The deferred levers are the same as the other format ports, plus the two table
-// loads per element.
-//
-// Two cases, because the correctness shape and the production shape need
-// different configs:
-//   @yah_ffn_gemm_iq3xxs_case       m_tiles=1    packed fixture, captured reference
-//   @yah_ffn_gemm_iq3xxs_full_case  m_tiles=1088 all-zero weight, output must be 0
-// The all-zero weight is a valid IQ3_XXS block (d = 0) and exercises the full
-// decode path at production size; the fixture case pins the decode arithmetic.
-//
-// Required config (correctness): --config=yah_ffn_gemm_iq3xxs.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_iq3xxs.m_tiles=1088
+// IQ3_XXS GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_iq3_xxs (98 B, 256 weights): half d; u8 qs[64] @2 (grid indices); u32 aux[8] @66, one per 32-element group. Element i:
+//   group = i/32, half = (i/16)%2, j = i%16, q = j/8, which = (j/4)%2, b = j%4, l = 2*half + q
+//   g_byte = (grid[qs[8*group + 2*l + which]] >> 8*b) & 255
+//   aux = LE32(aux[group]); sign_bit = (ksigns[(aux >> 7*l) & 127] >> (4*which + b)) & 1; mag = sign_bit ? -g_byte : g_byte
+//   value = f32(d) * (0.5 + (aux >> 28)) * 0.5 * f32(mag)
+// aux is four byte loads: the 98-byte block stride is not 4-aligned.
+// The sign is applied to the i32 magnitude before the float conversion, so a negated byte does not read as a large positive value.
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, grid [256] i32, ksigns [128] u8, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_iq3xxs.m_tiles : %value: index where [range(%value, 1, 4096)]
@@ -241,7 +199,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3xxs() {
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      // conditional negate without a branch: (x ^ -s) + s
+      // Negate without a branch: (x ^ -s) + s, s = sign bit.
       %neg_one = scalar.subi %c0i, %sign_bit : i32
       %mag0 = scalar.xori %g_byte, %neg_one : i32
       %mag = scalar.addi %mag0, %sign_bit : i32

@@ -1,33 +1,14 @@
-// YAH FFN GEMM with in-kernel IQ4_XS weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kIQ4_XS, kStore>.
-//
-// HIP source: prefill_fp16.hip. block_iq4_xs is 136 bytes:
-//
-//   __half d; uint16 scales_h; uint8 scales_l[4]; uint8 qs[128]
-//
-// 256 weights in eight 32-element groups. Element e:
-//
-//   group = e/32; within = e%32; L = within%16; high = within >= 16
-//   qb = qs[group*16 + L]; nib = high ? qb>>4 : qb&15
-//   sc = ((scales_l[group/2] >> (4*(group%2))) & 15
-//         | (((scales_h >> (2*group)) & 3) << 4)) - 32
-//   value = f32(d) * sc * kValuesIq4Nl[nib]
-//
-// kValuesIq4Nl is the 16-entry non-linear IQ4 table, so the decoder is a
-// codebook select, not a scale-and-bias. The K loop, staging and epilogue are
-// the Q4_K GEMM.
-//
-// This is the dominant format of the Qwen3.8-27B-UD-Q4_K_S shard: 172 of its 866
-// tensors are IQ4_XS, more than Q4_K (95) and Q5_K (80) combined, and they
-// include the SSM attention projections (blk.0.attn_qkv.weight). The shard also
-// carries Q8_0 (99), Q6_K (18), IQ3_S (15), Q3_K (13), IQ4_NL (7), IQ3_XXS (5),
-// IQ2_XS and IQ2_S, none of which have a Loom GEMM yet.
-//
-// The fixture forces sc into [0,15] and d = 2^-13 so every product is exact in
-// f16.
-//
-// Required config (correctness): --config=yah_ffn_gemm_iq4xs.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_iq4xs.m_tiles=1088
+// IQ4_XS GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_iq4_xs (136 B, 256 weights): half d; u16 scales_h; u8 scales_l[4]; u8 qs[128]. Element e:
+//   group = e/32, w = e%32; qb = qs[group*16 + w%16]; nib = w >= 16 ? qb >> 4 : qb & 15
+//   sc = (((scales_l[group/2] >> (4*(group%2))) & 15) | (((scales_h >> (2*group)) & 3) << 4)) - 32
+//   value = f32(d) * sc * kvalues_iq4nl[nib]   (16-entry non-linear codebook)
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_iq4xs.m_tiles : %value: index where [range(%value, 1, 4096)]

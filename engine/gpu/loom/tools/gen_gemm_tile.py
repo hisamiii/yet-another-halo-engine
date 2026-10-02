@@ -1,32 +1,13 @@
 #!/usr/bin/env python3
-"""Generate the tile GEMM: wave32, many waves, both operands staged in LDS.
+"""Tile GEMM yah_ffn_gemm_<fmt>[_swiglu|_kres|_kqg]: wave32, many waves, decoded weights and activations both in LDS.
 
-Same ABI and output as gen_gemm_shared.py's kernels, and the same decode
-arithmetic and per-accumulator MMA order, so the output is bit-identical to
-them (hidden f837e614ff55d1d1 at pp2048). What changes is the latency structure,
-modelled on HIP's HalfPrefillGemmKernel<256, 256, 8, 4>:
-
-  * BM x BN per workgroup (128 rows x 256 tokens) over WM x WN wave32
-    waves (4 x 4 or 4 x 2), each owning a TM x TN tile;
-  * per K phase the decoded weight tile (BM x KSUB) AND the activation tile
-    (BN tokens x KSUB) sit in LDS, so the MMA loop reads only LDS;
-  * the next phase's weight bytes and activation rows are loaded from global
-    into registers while this phase computes, and stored to LDS after it.
-
-Why the shared kernel lost to HIP (ATT, IQ3_S 17408x5120 kStore): 80% of its
-wave time was s_waitcnt, mostly vmcnt on activation loads issued a few
-instructions before the WMMA that consumed them, with ~2 wave64 waves per SIMD
-to cover it. HIP's kernel waits just as much per wave but runs 8 waves per SIMD.
-
-Why the first version of this kernel (64 x 256, 8 waves) lost too (19.9 ms vs
-the shared kernel's 14.9): LDS bank conflicts. Unpadded, a decoded weight row is
-KSUB*2 = 128 B, so the 16 rows of an lhs fragment load hit 2 bank groups and
-every ds_load_b128 stalled at issue (62% of wave time in lgkmcnt waits). Padding
-each weight row by 8 f16 (WPAD) and each activation row by 8 f16 (APAD) takes
-it to 11.1 ms; 128 x 256 over 16 waves to 10.5 ms (HIP: ~11.3 ms in the
-pipeline). WPAD=4 is 19.6 ms, APAD=0 28 ms; 256 x 128 over 16 waves 14.4 ms;
-unroll(2|4) on the K step no better. 256 x 256 does not fit: 64 KB of tiles
-plus the IQ grid table staged in LDS is over the 64 KB workgroup limit.
+Workgroup: BM rows x BN tokens (128 x 256) over WM x WN wave32 waves (4 x 4, or 4 x 2 for WAVE_FMTS), each owning a TM x TN tile.
+Grid: (m_tiles / ROWGRP, token_tiles); geometry() gives the dispatch.txt tile.
+Bindings and layouts as gen_gemm_shared.py, plus gate_out for kqg.
+The decode arithmetic and per-accumulator MMA order match gen_gemm_shared.py, so the output is bit-identical to it.
+Per K phase the decoded weight tile (BM x KSUB) and the activation tile (BN x KSUB) sit in LDS, so the MMA loop reads only LDS.
+The next phase's weight bytes and activation rows load into registers during this phase and go to LDS after it.
+Many waves per SIMD hide the load latency that the wave64 shared kernel (about 2 waves per SIMD) leaves exposed.
 """
 import os
 import sys
@@ -35,10 +16,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gen_gemm_shared as G  # noqa: E402
 
-# Workgroup geometry: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2). HIP's
-# HalfPrefillGemmKernel<256, 256, 8, 4> is BM=BN=256, WM=8, WN=4, which does
-# not fit here: 64 KB of tiles plus the IQ grid table staged in LDS is over
-# gfx11's 64 KB per workgroup.
+# Workgroup geometry: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).
+# 256 x 256 does not fit: 64 KB of tiles plus the IQ grid table in LDS is over gfx11's 64 KB per workgroup.
 BN = 256   # tokens per workgroup
 BM = 128   # rows per workgroup
 WM = 4     # waves along rows
@@ -52,66 +31,38 @@ assert BM % (16 * WM) == 0 and BN % (16 * WN) == 0 and LANES >= BM and LANES % B
 ROWGRP = BM // 16             # m_tiles per workgroup
 APL = LANES // BN             # lanes staging one token row of the activation tile
 APAD = 8                      # f16 of padding per LDS activation row
-# Decode-ahead: decode one phase ahead into a second weight tile, after the
-# barrier, so the decoding waves' VALU overlaps every wave's MMAs of the
-# current phase (HIP decodes the next tile after its barrier too). Needs two
-# weight tiles in LDS: KSUB=32 at 128 x 256.
-# On for the formats whose decode reads no LDS table (the IQ3 grids
-# contend with the MMA's fragment loads: IQ3_S 10.10 -> 10.96 ms standalone).
-# Q5_K dropped (2026-10-01, ATT + counters): in its kernels the read-ahead loads
-# meet s_waitcnt vmcnt(0) full drains inside the K loop, which serialize the
-# prefetch again. Real bytes, M cycles, on -> off, bit-identical: kstore 768
-# 18.43 -> 17.23, kres K=6144 11.82 -> 9.65.
+# Decode-ahead: after the barrier the decoding waves decode the next phase into a second weight tile.
+# So their VALU overlaps every wave's MMAs of the current phase. Needs two weight tiles in LDS: KSUB=32 at 128 x 256.
+# Off for the IQ3 formats: their LDS grid lookups contend with the MMA fragment loads.
+# Off for Q5_K: its read-ahead loads meet s_waitcnt vmcnt(0) drains inside the K loop, which serialize the prefetch.
 DECAHEAD_FMTS = ("iq4xs", "q4k", "q6k")
-# The swiglu epilogue on lds_epilogue's structure (one barrier, wave-private
-# slabs, 4-row vector loads/stores) instead of scalar slab walks behind two
-# workgroup barriers each. The old scalar walk issues one dependent global gate
-# load per element in a rolled loop; with one workgroup per WGP nothing hides
-# it (IQ3_S swiglu at 90% of its issue bound). Real bytes, M cycles,
-# bit-identical: IQ3_S 27.56 -> 24.85, IQ3_XXS 27.27 -> 25.13 (with 4 x 2),
-# IQ4_XS 24.81 -> 24.71 (left off: neutral, 2x code).
+# The swiglu epilogue through lds_epilogue (one barrier, wave-private slabs, 4-row vector loads/stores).
+# swiglu_epilogue issues one dependent gate load per element in a rolled loop; with one workgroup per WGP nothing hides it.
+# IQ4_XS keeps swiglu_epilogue: neutral at 2x the code.
 SWEPI_FMTS = ("iq3s", "iq3xxs")
-# STAGGER: the second workgroup on each WGP in the first round runs STAGGER
-# workgroup barriers before starting, so co-resident workgroups drift out of
-# lockstep (short-K kres: every resident workgroup hit its residual epilogue
-# at once, 14.5% of SIMD time with no wave in its K loop). Results unchanged.
-# 8000 barriers (~380k cycles of offset, past the ~150-200k residual
-# epilogue burst), only on grids of >= STG_MINWG workgroups (8 rounds at 2
-# per WGP): the delay is a one-time cost. Real bytes, M cycles,
-# bit-identical: IQ4_XS kres K=6144 10.27 -> 9.51, IQ3_S kres K=6144 9.71 ->
-# 9.57, IQ3_S kstore 24.14 -> 23.83, IQ4_XS swiglu 24.62 -> 24.25. ATT: time
-# with no wave in its K loop 14.5% -> 0.7% on IQ4_XS kres K=6144.
+# STAGGER: in the first round the second workgroup on each WGP runs STAGGER barriers before it starts.
+# So co-resident workgroups drift out of lockstep; else on short-K kres they all hit the residual epilogue at once.
+# 8000 barriers is ~380k cycles of offset, past the ~150-200k cycle epilogue burst. Results are unchanged.
+# Only grids of >= STG_MINWG workgroups (8 rounds at 2 per WGP) stagger, so the delay is a one-time cost.
 STAGGER = 8000
 STG_MINWG = 320
 STG_NWGP = 20                 # WGPs on gfx1151
-# rhs-outer MMA order with a fence every n rhs groups, per format:
-# Q4_K at 4 x 2 13.77 -> 13.54 M
+# rhs-outer MMA order with a fence every n rhs groups, per format (fewer live fragments at 4 x 2)
 RHSO_FMTS = {"q4k": 1, "q5k": 1}
 
-# f16 of padding per decoded weight row: unpadded rows are 128 B apart at
-# KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts)
+# f16 of padding per decoded weight row (APAD likewise per activation row).
+# Unpadded rows are 128 B apart at KSUB=64, so a 16-lane lhs fragment load hits 2 bank groups (8-way conflicts).
 WPAD = 8
-# KSL: the k steps of a phase straight-line in program order (no read-ahead):
-# the fragment loads' lane/base address math, recomputed on every
-# step of the rolled loop (13 VALU per 8 WMMAs, two quarter-rate v_mul_lo),
-# is shared by low CSE. A fence keeps step s+1's loads after step s's MMAs.
-# On where measured, M cycles on real bytes: IQ4_XS 25.96 -> 24.50
-# (with DECLOAD), Q4_K 15.49 -> 15.21 (with DECLOAD; 15.83 without: the latch
-# copies' vmcnt(0) lands between the steps), IQ3_S 28.07 -> 27.06, IQ3_XXS
-# 26.99 -> 25.99, Q3_K 29.31 -> 28.62 (no decode-ahead, DECLOAD is a no-op).
-# Q5_K loses (19.34 -> 19.59 alone, 19.60 with DECLOAD): alone the latch copies'
-# vmcnt(0) sits between the steps; with DECLOAD the allocator, at the 144-VGPR
-# cap, interleaves ~48 moves between the MMA pairs. Q6_K, Q2_K, Q8, IQ2_*:
-# unmeasured.
+# KSL: the k steps of a phase straight-line in program order (no read-ahead).
+# Low CSE then shares the fragment loads' address math (13 VALU per 8 WMMAs in the rolled loop).
+# A fence keeps step s+1's loads after step s's MMAs.
+# Off for Q5_K: the latch copies' vmcnt(0) sits between the steps; with DECLOAD, at the 144-VGPR cap, ~48 moves appear.
+# Q6_K, Q2_K, Q8_0 and IQ2_* are not measured.
 KSL_FMTS = ("iq4xs", "q4k", "iq3s", "iq3xxs", "q3k")
-# DECLOAD: under decode-ahead only the decoding waves issue the phase's weight
-# loads. Every wave used to load them (the non-decoders clamped to another
-# group): rocprofv3 counters had 4x HIP's L2 hits and 3x its TA busy.
-# With KSL it also moves the prefetch's latch copies (and their vmcnt(0)) from
-# between the k steps to after the last MMA. On where KSL is.
-# EPAD: pad of the LDS epilogue slab's token pitch (f32). With pitch TM the 16
-# lanes storing a fragment row are 128 B apart -- one or two banks -- and the
-# slab carried every LDS bank conflict of the kernel (rocprofv3, via loomhip).
+# DECLOAD (on where KSL is): under decode-ahead only the decoding waves issue the phase's weight loads, not every wave.
+# With KSL it also moves the prefetch's latch copies (and their vmcnt(0)) from between the k steps to after the last MMA.
+# EPAD: pad of the LDS epilogue slab's token pitch (f32).
+# With pitch TM the 16 lanes storing a fragment row are 128 B apart (one or two banks).
 EPAD = 4
 
 # set per format by configure()
@@ -120,18 +71,17 @@ RHS_FENCE = 0
 
 
 def configure(fmt, decahead):
+    """Set the per-format switches and gen_gemm_shared's decode geometry for fmt; return KSUB."""
     global DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE
     RHS_OUTER = fmt in RHSO_FMTS
     RHS_FENCE = RHSO_FMTS.get(fmt, 0)
     KSL = fmt in KSL_FMTS
     DECLOAD = fmt in KSL_FMTS
     DECAHEAD = decahead and fmt in DECAHEAD_FMTS
-    # the decoding lanes must be whole waves (a wave-uniform branch): not so
-    # for the 16-row tiles, which keep the plain schedule
+    # the decoding lanes must be whole waves (a wave-uniform branch): not so for the 16-row tiles, which keep the plain schedule
     if DECAHEAD and BM % WS:
         DECAHEAD = False
-    # KSUB=64 (32 for decode-ahead's two weight tiles): at 128 the 128 x 256
-    # tiles need ~104 KB of LDS
+    # KSUB=64 (32 for decode-ahead's two weight tiles): at 128 the 128 x 256 tiles need ~104 KB of LDS
     ksub = 32 if DECAHEAD else 64
     G.KSUB = ksub
     G.PAD = WPAD
@@ -141,20 +91,12 @@ def configure(fmt, decahead):
     # one group per decoding lane (q4k/q5k pick the nibble at run time)
     G.GPL = 1
     G.Q4_HDR = fmt in ("q4k", "q5k")
-    # word-level grid sign application: IQ3_XXS 9.97 -> 9.82 ms; IQ3_S neutral
-    # at 4 x 4. IQ3_S at 4 x 2 takes it with U8F/FR below (WAVE_FMTS).
+    # IQ3 word-path decode (gen_gemm_shared VDEC_W, IQ3_U8F, VDECW_FR), bit-identical: IQ3_XXS, and IQ3_S at 4 x 2.
+    # At 4 x 4 IQ3_S gains nothing: the longer dependent chain is exposed between barriers, where every wave decodes at once.
     w3 = fmt == "iq3xxs" or (fmt == "iq3s" and (WM, WN) == (4, 2))
     G.VDEC_W = w3
-    # unsigned-byte + fused-multiply decode and the multiply-free sign spread
-    # (gen_gemm_shared IQ3_U8F / VDECW_FR), bit-identical. IQ3_XXS kstore on
-    # real bytes 25.99 -> 25.41 M cycles. IQ3_S loses (26.79 -> 27.23 with the
-    # word path): VALU/WMMA falls 7.64 -> 6.58 but the issue bound drops from
-    # 98% to 94% of measured -- the longer dependent chain is exposed between
-    # barriers, where every wave decodes in the same phase. At 4 x 2 it wins
-    # (each decode feeds twice the WMMAs; see WAVE_FMTS).
     G.IQ3_U8F = w3
-    # Q4_K: subtract-and-narrow through v_fma_mix (gen_gemm_shared Q4FMIX);
-    # what lets Q4_K run at 4 x 2 without spills
+    # Q4_K: subtract-and-narrow through v_fma_mix (gen_gemm_shared Q4FMIX); this lets Q4_K run at 4 x 2 without spills
     G.Q4FMIX = fmt in ("q4k", "q5k")
     G.VDECW_FR = w3
     G.LR = BM
@@ -170,8 +112,8 @@ def geometry():
 
 
 def set_geometry(bm=None, bn=None, wm=None, wn=None):
-    """Switch the workgroup geometry for the next gen() (the emitter uses a
-    16-row tile for the 48-row matrices); returns the previous (BM, BN, WM, WN)."""
+    """Switch the workgroup geometry for the next gen() (e.g. 16-row tiles for 48-row matrices).
+    Return the previous (BM, BN, WM, WN)."""
     global BM, BN, WM, WN, TM, TN, FM, FN, NWAVE, LANES, ROWGRP, APL
     prev = (BM, BN, WM, WN)
     BM, BN, WM, WN = bm or BM, bn or BN, wm or WM, wn or WN
@@ -185,32 +127,16 @@ def set_geometry(bm=None, bn=None, wm=None, wn=None):
     return prev
 
 
-# Formats that run 4 x 2 waves (32 x 128 per wave) on the 128 x 256 geometry.
-# IQ4_XS: fragment loads per WMMA 1.5 -> 1.25, kstore
-# 24.50 -> 23.12 M cycles (HIP 23.15), bit-identical; 2 x 4 (64 x 64) has fewer
-# instructions still but drops off the issue bound (25.88: exposed latency).
-# IQ3_XXS 25.41 -> 24.23, Q3_K 28.62 -> 25.12 M cycles (bit-identical).
-# Q4_K's spills at 4 x 2 (240 VGPRs, 65 scratch instructions: 44.05 M) were not
-# pressure: its decode narrowed with
-# v_cvt_f16_f32, whose result can only be v0..v127, and the 16 accumulators fill
-# exactly that window, so the allocator evicted accumulators to scratch for each
-# conversion. Through v_fma_mix (Q4FMIX) it fits (200-248 VGPRs, no scratch).
-# Real bytes, M cycles, bit-identical: kstore 15.21 -> 13.54 (HIP 13.64-13.71),
-# swiglu 27.52 -> 24.85, kres K=17408 25.75 -> 23.71, K=6144 ~neutral. Q5_K
-# (same decode): kstore 19.35 -> 17.09, kres K=6144 12.33 -> 10.81.
-# IQ3_S spills at 4 x 2 with its element decode (256 VGPRs: 52.78 M) but fits
-# with the word-path U8F/FR decode (224-248 VGPRs, no scratch; configure()),
-# which cuts its decode block 467 VALU / 32 WMMA -> 353 / 64. Real bytes, M
-# cycles, bit-identical: kstore 27.08 -> 24.15 (HIP 25.91), swiglu 28.52 ->
-# 27.76, kres K=17408 28.90 -> 24.18, K=6144 14.16 -> 9.86.
-# IQ3_XXS swiglu lost at 4 x 2 with the scalar swiglu epilogue (27.39 -> 27.76
-# standalone; pp2048 row +8.6 ms); with the LDS epilogue (SWEPI) it wins
-# (27.27 -> 25.13).
+# Formats that run 4 x 2 waves (32 x 128 per wave) on the 128 x 256 geometry: fewer fragment loads per WMMA (1.5 -> 1.25).
+# 2 x 4 (64 x 64) has fewer instructions still but drops off the issue bound (exposed latency).
+# Q4_K / Q5_K fit in VGPRs at 4 x 2 only with Q4FMIX, IQ3_S only with the word-path decode (configure()).
+# IQ3_XXS swiglu at 4 x 2 needs the LDS epilogue (SWEPI_FMTS).
 WAVE_FMTS = ("iq4xs", "iq3xxs", "q3k", "iq3s", "q4k", "q5k")
 
 
 def gen(fmt, kind="kstore", decahead=True):
-    """decahead=False keeps the plain schedule for a format in DECAHEAD_FMTS."""
+    """Return the kernel text for fmt; kind as gen_gemm_shared.gen() plus "kqg".
+    decahead=False keeps the plain schedule for a format in DECAHEAD_FMTS."""
     if fmt in WAVE_FMTS and (BM, BN, WM, WN) == (128, 256, 4, 4):
         prev = set_geometry(wm=4, wn=2)
         try:
@@ -226,9 +152,8 @@ def _gen(fmt, kind, decahead):
     bb, (loads, compute) = F["bb"], F["decode"]
     kr = kind == "kres"
     sw = kind == "swiglu"
-    # kqg: the attention q projection (rows = heads x [256 q | 256 gate]) storing
-    # q and gate straight into their own [tokens][heads*256] buffers, as
-    # yah_unpack_qg did in a separate pass. Same values, so bit-identical.
+    # kqg: the attention q projection (rows = heads x [256 q | 256 gate]) writes q and gate to [tokens][heads*256] buffers.
+    # Same values as the separate yah_unpack_qg pass, so bit-identical.
     qg = kind == "kqg"
     bufs = (["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
             + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []))
@@ -277,9 +202,8 @@ def _gen(fmt, kind, decahead):
     e("  %n = index.constant 16 : index")
     e("  %k = index.constant 16 : index")
     e(f"  %m_tiles = config.get @{sym}.m_tiles : index")
-    # q8_0's k_blocks counts 32-wide blocks; the decode works in 256-wide ones
-    # (bb=272 = 8 x 34), as gen_gemm_shared does it. A missed division here walks
-    # 8x past the weights -- the ring hang of 2026-09-29.
+    # q8_0's k_blocks counts 32-wide blocks; the decode walks 256-wide ones (bb=272 = 8 x 34), as in gen_gemm_shared.
+    # Without the division the kernel reads 8x past the weights and hangs the ring.
     kdiv = F.get("kdiv", 1)
     if kdiv == 1:
         e(f"  %k_blocks = config.get @{sym}.k_blocks : index")
@@ -337,8 +261,7 @@ def _gen(fmt, kind, decahead):
     e("  %wr = index.div %wave, %cwn : index")
     e("  %wt = index.rem %wave, %cwn : index")
     e("  %stg_row0 = index.cmp eq, %wg_y, %c0 : index")
-    # the second workgroup on each WGP in the first round: linear dispatch ids
-    # [NWGP, 2*NWGP) (the ATT trace shows co-resident pairs (i, i + 20))
+    # the second workgroup on each WGP in the first round: linear dispatch ids [NWGP, 2*NWGP) (co-resident pairs are (i, i + 20))
     e("  %stg_gx = kernel.workgroup.count<x> : index")
     e("  %stg_rx = kernel.workgroup.id<x> : index")
     e("  %stg_ry = kernel.workgroup.id<y> : index")
@@ -368,8 +291,7 @@ def _gen(fmt, kind, decahead):
     e("  %m_origin = index.add %wg_row, %wr_off : index")
     e("  %wtb = index.mul %wg_y, %cwtok : index")
     e("  %token_base = index.add %wtb, %wt_off : index")
-    # decode lane map: lane tid -> weight row tid % BM, slot tid / BM decodes
-    # group slot of the phase; slots >= GPP idle.
+    # decode lane map: lane tid decodes weight row tid % BM, group slot tid / BM of the phase; slots >= GPP idle
     e(f"  %l64 = index.rem %tid, %c{BM} : index")
     e(f"  %slot = index.div %tid, %c{BM} : index")
     e(f"  %drow = index.min %l64, %c{BM - 1} : index")
@@ -389,8 +311,7 @@ def _gen(fmt, kind, decahead):
     e("  %cgpl = scalar.constant 1 : i32")
     e("  %gl_i = scalar.muli %slot_i, %cgpl : i32")
     e("  %kphases = index.mul %k_blocks, %cph : index")
-    # activation staging map: lane tid stages segments [aseg0, aseg0+aspl) of
-    # token row tid % BN of the tile
+    # activation staging map: lane tid stages segments [aseg0, aseg0+aspl) of token row tid % BN of the tile
     e(f"  %atok = index.rem %tid, %c{BN} : index")
     e(f"  %apart = index.div %tid, %c{BN} : index")
     e(f"  %caspl8 = index.constant {8 * aspl} : index")
@@ -406,8 +327,8 @@ def _gen(fmt, kind, decahead):
     types = ", ".join([V8] * NA)
 
     def a_loads(p, kbase):
-        """This lane's token row of the next phase's activation tile, as aseg
-        16-byte vectors (clamped: the extra iteration's loads are in bounds)."""
+        """Load this lane's part of its token row of a phase's activation tile as 16-byte vectors.
+        Clamped, so the extra iteration's loads stay in bounds."""
         vals = []
         e(f"    %{p}ab = index.add %arow_g, {kbase} : index")
         e(f"    %{p}ao = index.add %{p}ab, %aseg0 : index")
@@ -471,10 +392,8 @@ def _gen(fmt, kind, decahead):
         e(f"    %as{sg}c = index.constant {8 * sg} : index")
         e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
         e(f"    vector.store {nm}, %al_rows[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
-    # next phase's loads. The fence keeps them below this phase's LDS stores: the
-    # scheduler otherwise hoists them above the stores and then has to wait
-    # vmcnt(0) -- for the loads it just issued -- before the first store (31%
-    # of IQ4_XS wave time in the ATT trace).
+    # Next phase's loads. The fence keeps them below this phase's LDS stores.
+    # Else the scheduler hoists them above the stores and then waits vmcnt(0) for them before the first store.
     e("    scf.schedule.fence")
     e(f"    %kp_n0 = index.add %kp, %c{2 if DECAHEAD else 1} : index")
     e("    %kp_last = index.sub %kphases, %c1 : index")
@@ -529,9 +448,8 @@ def _gen(fmt, kind, decahead):
         e("    %off_m0 = index.mul %buf_m, %wl_tb : index")
         e("    %off_m = index.cast %off_m0 : index to offset")
         e(f"    %wl_mma = buffer.view %wl[%off_m] : buffer -> view<{BM}x{G.ROWP}xf16>")
-        # decoding lanes are whole waves (tid < slots*BM): branch on the wave
-        # id so the branch is uniform -- a divergent one right before the MMA
-        # loop is rejected (divergent_loop_single_entry)
+        # decoding lanes are whole waves (tid < slots*BM): branch on the wave id so the branch is uniform.
+        # A divergent branch right before the MMA loop is rejected (divergent_loop_single_entry).
         assert (slots * BM) % WS == 0
         e("    %sg_id = kernel.subgroup.id : index")
         e(f"    %cdecw = index.constant {slots * BM // WS} : index")
@@ -544,9 +462,7 @@ def _gen(fmt, kind, decahead):
     alv = "%al_t"
     cb = ", ".join(f"%b{i} = %a{i} : {V8}" for i in range(NA))
     if KSL:
-        # the k steps straight-line in program order (no read-ahead): one
-        # block, so low CSE shares the fragment loads' lane/base address
-        # math across steps and the step offset becomes an immediate
+        # the k steps straight-line in one block: low CSE shares the fragment address math and the step offset becomes an immediate
         nst = ksub // 16
         acc = [f"%a{i}" for i in range(NA)]
         for st in range(nst):
@@ -566,9 +482,7 @@ def _gen(fmt, kind, decahead):
                 name = f"%r{n}" if st == nst - 1 else f"%sn{st}_{n}"
                 e(f"    {name} = vector.mma %slhs{st}_{i}, %srhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
             if RHS_OUTER:
-                # rhs-outer: each activation fragment dies after its FM MMAs,
-                # so a step holds FM + ~RHS_FENCE fragments instead of FM + FN
-                # (Q4_K at 4 x 2: all 10 of a step were live at the VGPR peak)
+                # rhs-outer: each activation fragment dies after its FM MMAs, so a step holds FM + ~RHS_FENCE fragments, not FM + FN
                 for j in range(FN):
                     srhs(j)
                     for i in range(FM):
@@ -595,9 +509,7 @@ def _gen(fmt, kind, decahead):
             e(f"      %tc{j} = index.add %wt_off, %c{16 * j} : index")
             e(f"      %rhs{j} = vector.fragment.load<rhs> {alv}[%ks, %tc{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
         if RHS_OUTER:
-            # rhs-outer: each rhs fragment dies after its FM MMAs, so only the lhs
-            # fragments and one or two rhs are live (compile-report suggest: the
-            # IQ4_XS peak held all 6 fragments, 144 VGPRs, one short of tier 8).
+            # rhs-outer: each rhs fragment dies after its FM MMAs, so only the lhs fragments and one or two rhs are live.
             # Every accumulator still takes one MMA per k step: same values.
             for j in range(FN):
                 rhs_load(j)
@@ -656,13 +568,9 @@ def _gen(fmt, kind, decahead):
 
 
 def lds_epilogue(e, kr, V8, sw=False, qg=False):
-    """out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column
-    of fragments at a time: fragments -> LDS slab (element (r, t) at t*TM + r)
-    -> each lane reads 16 contiguous rows of one token -> 4 b128 stores. Two
-    lanes cover a token's TM=32 rows (128 contiguous bytes). Same values, and
-    for kres the same resid + acc add, so bit-identical.
-    The direct fragment store wrote each lane's 8 values at an 8-byte row
-    stride: 64 global_store_b32 per wave, ~10% of IQ4_XS wave time."""
+    """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
+    Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
+    A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical."""
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e(f"  %es_ctm = index.constant {TM + EPAD} : index")
     e("  %es_lay = encoding.layout.strided [%c1, %es_ctm] : encoding<layout>")
@@ -672,15 +580,13 @@ def lds_epilogue(e, kr, V8, sw=False, qg=False):
     e(f"  %es_view = buffer.view %al[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
     e(f"  %es_flat = buffer.view %al[%es_off] : buffer -> view<{(TM + EPAD) * 16}xf32>")
     if sw:
-        # swiglu: out f16 = f16(silu(gate) * acc), the scalar ops of
-        # swiglu_epilogue per element (bit-identity), 4 rows per load/store
+        # swiglu: out f16 = f16(silu(gate) * acc), swiglu_epilogue's scalar ops per element (bit-identical), 4 rows per load/store
         e("  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%out_total]xf32>")
         e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
         e("  %negone = scalar.constant -1.0 : f32")
         e("  %one = scalar.constant 1.0 : f32")
     elif qg:
-        # q and gate halves: row r = head*512 + half*256 + d goes to
-        # (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
+        # row r = head*512 + half*256 + d goes to (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
         e("  %qg_tot = index.div %out_total, %c2 : index")
         e("  %qg_rows = index.div %m_rows, %c2 : index")
         e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
@@ -760,12 +666,9 @@ def lds_epilogue(e, kr, V8, sw=False, qg=False):
 
 
 def swiglu_epilogue(e, arow):
-    """out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the chained kernel's
-    scalar ops in its order (bit-identity), as in gen_gemm_shared: an f16 result
-    fragment store ignores the token-major strided layout, so each 16-row x
-    ES-token slab goes through a per-wave f32 LDS tile (f32 result stores honour
-    layouts) and a real loop walks it with lane-contiguous rows. The slab is half
-    the wave's tokens so all waves' tiles fit in the activation tile's LDS."""
+    """out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the .loom kernel's scalar ops in order (bit-identical).
+    As in gen_gemm_shared, each 16-row x ES-token slab goes through a per-wave f32 LDS tile; a loop walks it lane-contiguous.
+    ES is the larger of 32, 16 for which all waves' slabs fit in the activation tile's LDS."""
     ES = next(x for x in (32, 16) if x <= TN and NWAVE * 16 * x * 4 <= BN * arow * 2)
     assert TN % ES == 0
     V8 = "vector<8xf32>"

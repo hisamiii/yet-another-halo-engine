@@ -1,14 +1,5 @@
-// YAH fp32 to fp16 cast, Loom port of HalfCast.
-//
-// HIP source: models/qwen/hip/kernels/prefill_fp16.hip. Elementwise:
-//
-//   y[i] = f16(x[i])
-//
-// A flat index domain, so only the stride can be wrong. The check is exact and
-// needs no fixture: every integer below 2048 is an fp16 value, and an iota of
-// small integers round-trips bit for bit.
-//
-// Required config: --config=yah_half_cast.num_elements=8
+// f32 -> f16 cast: y[i] = f16(x[i]).
+// Grid: ceil(num_elements / 256) workgroups of 256 lanes, one element per lane.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_half_cast.num_elements : %value: index where [range(%value, 1, 1073741824)]

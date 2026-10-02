@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Helpers for the HAL emitters (emit_prefill_pp.py, emit_decode.py): the GGUF
-tensor table, the format map and emit() (one Loom source at one config -> one HAL).
+"""Helpers for the HAL emitters (emit_prefill_pp.py, emit_decode.py): the GGUF tensor table, the format map and emit().
 
-Naming convention so the C++ driver needs no manifest:
+Naming convention, so the C++ driver needs no manifest:
   <outdir>/gemm_<kind>_<fmt>_<m_tiles>_<k_blocks>.hal
   <outdir>/<fixed>.hal   for the non-GEMM kernels
 """
@@ -28,6 +27,7 @@ SWIGLU = {"ffn_up.weight"}
 
 
 def parse(model):
+    """Return [(name, dims, ggml type)] for every tensor of a GGUF file."""
     f = open(model, "rb"); f.read(8)
     nt, nkv = struct.unpack("<QQ", f.read(16))
     SIZ = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
@@ -59,6 +59,7 @@ def sym_of(loomfile):
 
 
 def emit(loomfile, configs, outname, outdir):
+    """Compile one Loom source (relative to engine/gpu/loom, or absolute) at one config to <outdir>/<outname>."""
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(LOOM, loomfile)

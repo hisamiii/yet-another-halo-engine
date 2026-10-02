@@ -1,18 +1,8 @@
-// YAH Q6_K block GEMV, Loom port of Q8KBlockGEMVKernel for the Q6_K format
-// (gemv_quant.hip). Decode each weight element with the Q6_K block decoder and
-// dot it against the fp32 activation row:
-//
-//   y[m] = sum_k q6k_decode(W, m, k) * x[k]
-//
-// One workgroup per output row, 32 lanes, each lane eight elements per block and
-// a subgroup add. This is the arm LaunchGEMV reaches through kHipQuantDirect. On
-// the Qwen3.8-27B shard the output projection is Q6_K, so the Q6_K arm runs at the
-// end of every prefill; the Q3_K arm is the tied lm-head fallback.
-//
-// Measured: 1.04 ms at 17408 rows x 5120. 0.0488 ms at 16 rows.
-//
-// Required config: --config=yah_gemv_q6k.m_rows=16
-//                  --config=yah_gemv_q6k.k_blocks=20
+// Q6_K GEMV for the lm head: y[m] = sum_k dequant(W)[m][k] * x[k], f32 activation and output.
+// Grid: m_rows workgroups of one wave32, one per output row; each lane takes 8 elements per 256-weight block, then a subgroup add.
+// block_q6_K (210 B): ql[128] @0, qh[64] @128, i8 scales[16] @192, half d @208.
+// The row stride is fixed at 20 blocks (4200 B, K = 5120); k_blocks only sizes x.
+// Bindings: weight [m_rows][20] blocks, x [k_blocks*256] f32, y [m_rows] f32.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_gemv_q6k.m_rows : %value: index where [range(%value, 1, 1048576)]
@@ -73,9 +63,8 @@ kernel.def target(@yah_wave32) @yah_gemv_q6k() {
   %w_last = index.sub %w_bytes, %c1 : index
   %w_half_last = index.sub %w_halfs, %c1 : index
   %x_last = index.sub %x_elems, %c1 : index
-  // Both loops unrolled: the same per-lane order of the products and adds, but
-  // the loads issue ahead instead of one dependent byte load per iteration.
-  // pp2048 lm head (248320 rows): 14.37 -> 5.86 ms standalone (HIP 4.46).
+  // Both loops are unrolled so the loads issue ahead; the per-lane order of products and adds does not change.
+  // lm head (248320 rows): 14.37 -> 5.86 ms.
   %acc0 = scf.for %kblk = [%c0 to %k_blocks step %c1](%a0 = %zero : f32) -> (f32) unroll {
     %kblk_i = index.cast %kblk : index to i32
     %row_off = scalar.muli %m_i, %c4200i : i32

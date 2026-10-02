@@ -1,79 +1,43 @@
 #!/usr/bin/env python3
-"""Generate the shared-decode kStore GEMM: several wave64 waves share one decoded
-64-row weight tile, and the decode is row-per-lane and branch-free.
+"""Shared-decode GEMM yah_ffn_gemm_<fmt>[_swiglu|_kres]: NW wave64 waves share one decoded f16 weight tile in LDS.
 
-The decode helpers (FMTS) are also what tools/gen_gemm_tile.py builds its tile
-GEMM from. emit_prefill_pp.py emits this kernel only for the shapes the tile
-GEMM does not take.
-
-Same ABI (weight, input, wstage, ostage, output), output layout and kStore
-semantics as the chained yah_ffn_gemm_<fmt> kernel it replaced, and the same
-arithmetic in the same order, so the output is meant to be bit-identical to it:
-
-  * each weight element is decoded with the same f32 ops (d*sc, then *code)
-    and rounded to f16 once;
-  * every accumulator sees the same MMA sequence, K ascending in steps of 16,
-    with the same lhs (16 rows of the decoded tile) and rhs (16 tokens) operands.
-
-What changes is how much work sits between the MMAs:
-
-  chained   one wave64 per workgroup (64 rows x 128 tokens); every 16-wide K
-            step re-stages and re-decodes 64x16 elements, one element per lane
-            per step, with a 4-level branch tree for the IQ4 codebook and five
-            LDS byte loads per element, behind three barriers -- the decode was
-            42% of the kernel in the corrected sweep (LOOM_RUNTIME.md).
-  shared    NW waves per workgroup (64 rows x 128*NW tokens), each wave the same
-            64x128 accumulator tile. The 64x256 block is decoded ONCE into LDS
-            per 256-wide K block, shared by all NW waves, row-per-lane: a lane
-            loads a group's scales once and its 16 qs bytes as one vector, and
-            the codebook is a vector.table.lookup. Two barriers per block.
-
-Decode per output falls by NW, and per element by the vectorised row-per-lane
-form. The workgroup covers 128*NW tokens, so the HAL's dispatch.txt tile is
-128*NW; the grid is (m_tiles/4, B/(128*NW)).
+Workgroup: 64*NW lanes, 16*MT rows x TOK*NW tokens; each wave owns a 16*MT x TOK accumulator tile.
+Grid: (m_tiles / MT, token_tiles); the HAL's dispatch.txt token tile is TOK*NW.
+Bindings: weight, [grid, ksigns,] input, [gate | resid,] wstage, ostage, output (wstage, ostage unused: the .loom ABI).
+input: f16, element (k, t) at t*K + k. output: element (row, t) at t*m_rows + row; f32, or f16 for swiglu.
+Each K phase decodes KSUB columns row-per-lane, branch-free, into LDS and runs the MMAs; the next phase's bytes load meanwhile.
+The f32 decode ops (one f16 rounding) and the MMA order (K ascending by 16) match the hand-written yah_ffn_gemm_<fmt>.
+So the output is bit-identical to that kernel.
+tools/gen_gemm_tile.py reuses the decode helpers (FMTS); emit_prefill_pp.py uses this kernel only for shapes the tile GEMM skips.
 """
 
 NW = 2                      # waves per workgroup, all on one decoded tile
-# 16-row tiles per wave (4 = 64 rows). Fewer serve matrices whose row count is
-# not a multiple of 64, e.g. the 48-row ssm_alpha/ssm_beta (m_tiles=3).
+# 16-row tiles per wave. Fewer than 4 serve row counts not a multiple of 64, e.g. 48-row ssm_alpha/ssm_beta (m_tiles=3).
 MT = 4
 LR = 16 * MT
 PAD = 0                     # f16 of padding per LDS weight row
-# Per-format decode variants. Off for this kernel; tools/gen_gemm_tile.py turns
-# them on per format (its configure()).
-# Q4_HDR: the Q4_K/Q5_K header (d, dmin, scales[12]) as one 16-byte load.
-# Each byte load carried its own address clamp: Q4_K VALU per WMMA 10.4 -> 6.6,
-# 5.93 -> 5.47 ms standalone. Q5_K is neutral (10.76 -> 10.86).
+# Per-format decode variants. Off for this kernel; tools/gen_gemm_tile.py turns them on per format (its configure()).
+# Q4_HDR: the Q4_K/Q5_K header (d, dmin, scales[12]) as one 16-byte load instead of byte loads that each carry an address clamp.
 Q4_HDR = False
 # VDEC_W: IQ3/IQ2 sign application on the two grid words instead of i8 vectors.
 VDEC_W = False
-# IQ3_U8F (IQ3_S / IQ3_XXS, word path): the signed magnitude bytes XOR 0x80 are
-# u = mag + 128 as unsigned bytes; v_cvt_f32_ubyteN reads each one directly and
-# the -128 rides the fused multiply's f32 addend: fptrunc(fma(dsc, u, -128*dsc)).
-# (u-128)*dsc has <= 24 significant bits (|mag| <= 127, dsc = d * odd <= 5 bits),
-# so it is exact in f32 and the single rounding equals today's: bit-identical.
-# Replaces sign-extend + sitofp + mulf + fptrunc per element.
+# IQ3_U8F (IQ3_S / IQ3_XXS, word path): mag bytes XOR 0x80 are u = mag + 128 as unsigned bytes, converted by v_cvt_f32_ubyteN.
+# The -128 rides the f32 addend: fptrunc(fma(dsc, u, -128*dsc)).
+# (u-128)*dsc has <= 24 significant bits (|mag| <= 127, dsc = d * odd <= 5 bits), so it is exact in f32: bit-identical.
 IQ3_U8F = False
-# VDECW_FR: the word path's sign spread without quarter-rate v_mul_lo_u32:
-# nibble * 0x00204081 as an index multiply (both fit 24 bits: v_mul_u32_u24,
-# full rate) and s1 * 255 as (s1 << 8) - s1 (each set byte becomes 0xFF; the top
-# byte wraps mod 2^32). Same integers: bit-identical.
+# VDECW_FR: the word path's sign spread without quarter-rate v_mul_lo_u32.
+# nibble * 0x00204081 becomes shifts and ORs, s1 * 255 becomes (s1 << 8) - s1 (top byte wraps). Same integers: bit-identical.
 VDECW_FR = False
-# Q4FMIX (Q4_K/Q5_K): the decode's subtract-and-narrow as fptrunc(fma(e, 1, -dm))
-# per element instead of fptrunc(e - dm). The product by 1 is exact, so it is
-# bit-identical, and it selects v_fma_mix{lo,hi}: v_cvt_f16_f32 writes only
-# v0..v127, and with 128 VGPRs of accumulators live (4 x 2 waves) the allocator
-# evicted accumulators to scratch for every conversion result. The 1.0 is built
-# from gb & ~gb so the canonicalizer cannot fold the fma back into a subf.
+# Q4FMIX (Q4_K/Q5_K): narrow as fptrunc(fma(e, 1, -dm)) instead of fptrunc(e - dm). The product by 1 is exact: bit-identical.
+# It selects v_fma_mix{lo,hi}. v_cvt_f16_f32 writes only v0..v127: with 128 VGPRs of accumulators live, each result spills one.
+# The 1.0 comes from gb & ~gb so the canonicalizer cannot fold the fma back into a subf.
 Q4FMIX = False
 
 KSUB = PH = GPP = GPL = ROWP = None
 
 
 def set_geometry(mt=None, tok=None, nw=None):
-    """Override the per-wave geometry (16-row tiles, tokens, waves) for the next
-    gen() calls and return the previous values, so an emitter can switch shape
-    per HAL: (MT, TOK, NW)."""
+    """Override MT, TOK and NW for the next gen() calls; return the previous (MT, TOK, NW)."""
     global MT, TOK, NW, NT, NA, LR
     prev = (MT, TOK, NW)
     if mt is not None:
@@ -89,13 +53,8 @@ def set_geometry(mt=None, tok=None, nw=None):
 
 
 def configure(fmt):
-    """Set the per-format phase geometry (FMTS[fmt]["ksub"]).
-
-    K columns decoded per phase. A whole 256-wide block (KSUB=256) is a 64x256 f16
-    tile, ~34 KB of LDS per workgroup, which dropped residency to ~1.5 waves/SIMD
-    and made the kernel slower than the chained one (13.98 -> 16.5 ms/dispatch at
-    pp2048, bit-identical). A narrower phase shrinks the tile at the cost of two
-    barriers per phase."""
+    """Set the per-format phase geometry: KSUB = FMTS[fmt]["ksub"] K columns decoded per phase.
+    A whole 256-wide block is a ~34 KB LDS tile (residency ~1.5 waves/SIMD); a narrower phase costs two barriers per phase."""
     global KSUB, ROWP, PH, GPP, GPL
     KSUB = FMTS[fmt]["ksub"]
     ROWP = KSUB + PAD           # f16 per LDS row
@@ -105,10 +64,8 @@ def configure(fmt):
     assert 256 % KSUB == 0 and GPP % NW == 0 and GPL >= 1
 
 
-# Tokens per wave. 128 gives 32 vector<4xf32> accumulators (128 VGPRs). 64 halves
-# the accumulators and removes the scratch spills, and is slower anyway (IQ3_S
-# 19.77 vs 15.86 ms, IQ4_XS 15.52 vs 9.71 at NW=4): the 64x128 per-wave tile's
-# operand reuse is worth more than the residency and the spill traffic.
+# Tokens per wave. 128 gives 32 vector<4xf32> accumulators (128 VGPRs) and some spills.
+# TOK=64 removes the spills but is slower (IQ4_XS 15.52 vs 9.71 ms): the operand reuse of the 64x128 tile is worth more.
 TOK = 128
 NT = TOK // 16              # 16-token sub-tiles per wave
 NA = MT * NT                # accumulators per wave
@@ -121,9 +78,8 @@ def _i8n(ty):
 
 
 def pack_vals(e, vals, tag):
-    """Bitcast carried vector<Nxi8> values to vector<N/4xi32>; returns new vals.
-    A vector<Nxi8> is lowered one byte per VGPR, so a carried qs[8] would cost 8
-    registers across the MMA loop."""
+    """Bitcast carried vector<Nxi8> values to vector<N/4xi32> and return the new (name, type) list.
+    A vector<Nxi8> lowers to one byte per VGPR, so a carried qs[8] would hold 8 registers across the MMA loop."""
     out = []
     for nm, ty in vals:
         n = _i8n(ty)
@@ -154,19 +110,14 @@ IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10,
 
 
 def iq4xs_loads(p, blk, gb):
-    """Issue this lane's raw-byte loads for one phase of row %drow.
-
-    blk: i32 SSA byte offset of the row's current block; gb: i32 SSA index of
-    the lane's first group in the block. Returns (lines, [(name, type)]) -- the
-    loaded values, which the caller either decodes at once or carries into the
-    next iteration as a prefetch.
-    block_iq4_xs: d f16 @0, scales_h u16 @2, scales_l[4] @4, qs[128] @8.
+    """Emit this lane's raw-byte loads for one phase of row %drow; return (lines, [(name, type)]) of the loaded values.
+    blk: i32 SSA byte offset of the row's current block; gb: i32 SSA index of the lane's first group in the block.
+    block_iq4_xs: d f16 @0, scales_h u16 @2, scales_l[4] @4, qs[128] @8. All *_loads share this contract.
     """
     L = []
     e = L.append
     vals = []
-    # the 8-byte header (d, scales_h, scales_l[4]) as one load, as HIP's
-    # CacheIqHeader does: one VMEM op instead of four byte/half loads
+    # the 8-byte header (d, scales_h, scales_l[4]) as one VMEM load instead of four byte/half loads
     e(f"    %{p}hd_ix = index.cast {blk} : i32 to index")
     e(f"    %{p}hd_lo = index.max %{p}hd_ix, %c0 : index")
     e(f"    %{p}hd_idx = index.min %{p}hd_lo, %w_lim8 : index")
@@ -196,11 +147,9 @@ def iq4xs_loads(p, blk, gb):
 
 
 def iq4xs_compute(v, gb):
-    """Decode loaded values v (as iq4xs_loads returned them, possibly renamed to
-    loop-carried names) into the LDS tile. Element g*32 + w: L = w%16,
-    nib = w<16 ? qs[g*16+L]&15 : qs[g*16+L]>>4,
-    sc = ((scales_l[g/2] >> 4*(g%2)) & 15 | ((scales_h >> 2g) & 3) << 4) - 32,
-    value = (d*sc) * kvalues[nib] -- the chained kernel's f32 op order."""
+    """Decode the loaded values v (iq4xs_loads order) into the LDS tile, in the .loom kernel's f32 op order.
+    Element g*32 + w, L = w%16: nib = w<16 ? qs[g*16+L]&15 : qs[g*16+L]>>4
+      sc = ((scales_l[g/2] >> 4*(g%2)) & 15 | ((scales_h >> 2g) & 3) << 4) - 32, value = (d*sc) * kvalues[nib]"""
     L = []
     e = L.append
     it = iter(v)
@@ -236,17 +185,14 @@ def iq4xs_compute(v, gb):
         e(f"    %dsc_v{u} = vector.splat %dsc{u} : vector<16xf32>")
         e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
         e(f"    %nhi{u} = vector.shrui {q}, %s4v : vector<16xi8>")
-        # The codebook offset by +128 (unsigned bytes): uitofp of a byte is one
-        # v_cvt_f32_ubyteN, and the -128 is folded into the fused multiply:
-        # fptrunc(fma(s, u, -128*s)) = fptrunc((u-128)*s), whose exact value fits
-        # f32 (<= 24 significant bits), so bit-identical; the bias rides
-        # v_fma_mix's f32 addend (no literal).
+        # The codebook +128 as unsigned bytes: uitofp of a byte is one v_cvt_f32_ubyteN.
+        # fptrunc(fma(s, u, -128*s)) = fptrunc((u-128)*s) exactly (<= 24 significant bits): bit-identical.
+        # The bias rides v_fma_mix's f32 addend (no literal).
         for part in ("lo", "hi"):
             e(f"    %cu{part}{u} = vector.table.lookup %kvtu[%n{part}{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
             e(f"    %fu{part}{u} = vector.uitofp %cu{part}{u} : vector<16xi8> to vector<16xf32>")
         e(f"    %nb{u} = scalar.mulf %dsc{u}, %cm128f_iq : f32")
-        # scalar form: fptrunc(fma) pairs feeding from_elements are what AMDGPU
-        # source-to-low selects as v_fma_mix{lo,hi}_f16
+        # scalar form: fptrunc(fma) pairs feeding from_elements select as v_fma_mix{lo,hi}_f16
         for part in ("lo", "hi"):
             hs = []
             for j in range(16):
@@ -275,11 +221,7 @@ def _ld8(e, p, name, off):
 
 def _ldv(e, p, name, off, n):
     """Load n consecutive weight bytes at i32 SSA offset `off` as vector<nxi8>.
-
-    The clamp must be w_bytes - n for THIS width. Clamping every width to
-    w_bytes - 16 moved the last row's final sign bytes (IQ3_S +74+4g, within the
-    last 16 bytes of the tensor) to the wrong address: one wrong row per
-    tensor, argmax 29779 at pp2048, caught by the r64t256 fixture at row 63."""
+    The clamp must be w_bytes - n for this n: w_bytes - 16 moves loads near the tensor end (IQ3_S signs) to a wrong address."""
     e(f"    %{p}{name}_ix = index.cast {off} : i32 to index")
     e(f"    %{p}{name}_lo = index.max %{p}{name}_ix, %c0 : index")
     e(f"    %{p}{name}_idx = index.min %{p}{name}_lo, %w_lim{n} : index")
@@ -296,15 +238,11 @@ def _ldd(e, p, blk):
 
 
 def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None):
-    """Vector decode of the 8 elements one sign byte covers (grid words lw=2p and
-    2p+1): mags = bytes of [gw0, gw1], s = bits of the sign byte (LSB first,
-    matching element lw*4 + b), mag = (g ^ -s) + s in i8 -- exact because grid
-    magnitudes are < 128 -- then one sitofp, mulf and fptrunc for all eight."""
+    """Decode the 8 elements one sign byte covers (grid words lw=2p and 2p+1) and store them to the LDS tile.
+    mags = bytes of [gw0, gw1], s = sign bits LSB first, mag = (g ^ -s) + s in i8 (exact: grid magnitudes are < 128)."""
     if VDEC_W:
-        # on the two grid words: s1 = sign bit i in byte i (the nibble times
-        # 0x00204081 puts bit i at bit 8i), m = s1 * 255, mag = (g ^ m) + s1 --
-        # per byte 256 - g for a set bit, never a carry since every grid
-        # magnitude is > 0. (The i8-vector form lowers element by element.)
+        # On the two grid words: s1 = sign bit i in byte i (nibble * 0x00204081), m = s1 * 255, mag = (g ^ m) + s1.
+        # Per byte that is 256 - g for a set bit, no carry since grid magnitudes are > 0. (i8 vectors lower element by element.)
         e(f"    %wsb_{t} = scalar.extui {sgb8} : i8 to i32")
         for h, gw in ((0, gw0), (1, gw1)):
             if h:
@@ -313,8 +251,7 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None):
                 e(f"    %wsn{h}_{t}0 = scalar.addi %wsb_{t}, %c0i : i32")
             e(f"    %wsn{h}_{t} = scalar.andi %wsn{h}_{t}0, %c15i : i32")
             if VDECW_FR:
-                # n * 0x00204081 & 0x01010101 == (t | t << 14) & 0x01010101 with
-                # t = n | n << 7 (n <= 15: bit i lands at 8i, OR cannot carry)
+                # n * 0x00204081 & 0x01010101 == (t | t << 14) & 0x01010101, t = n | n << 7 (n <= 15: OR cannot carry)
                 e(f"    %wst7{h}_{t} = scalar.shli %wsn{h}_{t}, %c7i : i32")
                 e(f"    %wst{h}_{t} = scalar.ori %wsn{h}_{t}, %wst7{h}_{t} : i32")
                 e(f"    %wst14{h}_{t} = scalar.shli %wst{h}_{t}, %c14i_vdw : i32")
@@ -370,9 +307,8 @@ def _col_of(e, u):
 
 
 def iq3s_loads(p, blk, gb):
-    """block_iq3_s (110 B): d f16 @0, qs[64] @2, qh[8] @66, signs[32] @74,
-    scales[4] @106. Group g reads qs[8g..8g+7], qh[g], signs[4g..4g+3] and the
-    scale byte g/2."""
+    """block_iq3_s (110 B): d f16 @0, qs[64] @2, qh[8] @66, signs[32] @74, scales[4] @106.
+    Group g reads qs[8g..8g+7], qh[g], signs[4g..4g+3] and the scale byte g/2."""
     L = []
     e = L.append
     vals = []
@@ -403,8 +339,7 @@ def iq3s_loads(p, blk, gb):
 
 
 def iq3s_compute(v, gb):
-    """The chained kernel's IQ3_S element decode, one row per lane. Element
-    lw*4 + b of group g (lw = 2*l + which):
+    """IQ3_S element decode, one row per lane, in the .loom kernel's op order. Element lw*4 + b of group g (lw = 2*l + which):
       gidx = qs[8g+lw] | ((qh[g] >> lw) & 1) << 8,  gword = grid[gidx]
       sign_nib = (signs[4g+l] >> 4*which) & 15,     s = (sign_nib >> b) & 1
       mag = ((gword >> 8b) & 255 ^ -s) + s
@@ -451,10 +386,8 @@ def iq3s_compute(v, gb):
 
 
 def iq3s_setup():
-    """The 512-word grid as %grid_view, copied into 2 KiB of workgroup memory
-    once, so the eight lookups per 32-element group are ds_reads instead of
-    dependent global gathers in front of every phase barrier. The first K phase
-    starts with a barrier, which publishes the copy."""
+    """Copy the 512-word grid into 2 KiB of LDS (%grid_view): the eight lookups per group are ds_reads, not global gathers.
+    The first K phase starts with a barrier, which publishes the copy."""
     return ["  %grid_g = buffer.view %grid_na[%base] : buffer -> view<512xi32>",
             "  %c511 = index.constant 511 : index",
             "  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32",
@@ -475,9 +408,8 @@ def iq3s_setup():
 
 
 def iq3xxs_loads(p, blk, gb):
-    """block_iq3_xxs (98 B): d f16 @0, qs[64] @2 (grid indices), aux[32] @66
-    (one LE32 word per 32-element group). Group g reads qs[8g..8g+7] and aux
-    bytes 66+4g..69+4g."""
+    """block_iq3_xxs (98 B): d f16 @0, qs[64] @2 (grid indices), aux[32] @66 (one LE32 word per 32-element group).
+    Group g reads qs[8g..8g+7] and aux bytes 66+4g..69+4g."""
     L = []
     e = L.append
     vals = []
@@ -499,8 +431,7 @@ def iq3xxs_loads(p, blk, gb):
 
 
 def iq3xxs_compute(v, gb):
-    """The chained kernel's IQ3_XXS element decode, one row per lane. Element
-    lw*4 + b of group g (lw = 2*l + which):
+    """IQ3_XXS element decode, one row per lane, in the .loom kernel's op order. Element lw*4 + b of group g (lw = 2*l + which):
       gword = grid[qs[8g+lw]],  aux = LE32(aux bytes of g)
       sign_nib = (ksigns[(aux >> 7l) & 127] >> 4*which) & 15, s = (sign_nib >> b) & 1
       mag = ((gword >> 8b) & 255 ^ -s) + s
@@ -544,8 +475,7 @@ def iq3xxs_compute(v, gb):
 
 
 def _stage_table(name, src, n, ty, bytes_per):
-    """Copy an n-entry read-only table into workgroup memory once; the first K
-    phase's leading barrier publishes it."""
+    """Copy an n-entry read-only table into LDS once; the first K phase's leading barrier publishes it."""
     return [f"  %{name}_g = buffer.view {src}[%base] : buffer -> view<{n}x{ty}>",
             f"  %{name}_bytes = index.constant {n * bytes_per} : offset",
             f"  %{name}_l = buffer.alloca<workgroup> align(16) %{name}_bytes : buffer",
@@ -572,14 +502,8 @@ def iq3xxs_setup():
 
 def q4k_loads(p, blk, gb, q5=False):
     """block_q4_K (144 B): d f16 @0, dmin f16 @2, scales[12] @4, qs[128] @16.
-    Sub-block g (32 elements) reads qs[32*(g/2) .. +31] (low nibbles for even g,
-    high for odd), and scale bytes 4+g, 8+g and g (get_scale_min_k4). A lane's
-    groups come in even/odd pairs (gb is even when GPL is), which share qs."""
-    # The nibble half is chosen by u's parity, which is g's parity only when a
-    # lane's first group is even, i.e. GPL even. At KSUB=64 (GPL=1) odd groups
-    # took the low nibbles: argmax 13 at pp2048.
-    # GPL=1 is fine here (g>>1 picks the qs pair at run time); q4k_compute then
-    # picks the nibble at run time too.
+    Sub-block g reads qs[32*(g/2) .. +31] (low nibbles for even g, high for odd) and scale bytes 4+g, 8+g, g (get_scale_min_k4).
+    With GPL even a lane's groups are even/odd pairs that share qs; with GPL odd, q4k_compute picks the nibble at run time."""
     L = []
     e = L.append
     vals = []
@@ -636,7 +560,7 @@ def q4k_loads(p, blk, gb, q5=False):
 
 
 def q4k_compute(v, gb, q5=False):
-    """The chained kernel's Q4_K element decode, one row per lane:
+    """Q4_K / Q5_K element decode, one row per lane, in the .loom kernel's op order:
       value = (d * f32(sc)) * f32(q) - dmin * f32(m)"""
     L = []
     e = L.append
@@ -672,8 +596,7 @@ def q4k_compute(v, gb, q5=False):
         e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
         e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
         if Q4_HDR:
-            # header byte k = 4 + g (la), 8 + g (lb), g (lc): word k/4, byte k%4;
-            # g < 8, so each picks between two adjacent words on g/4
+            # header byte k = 4 + g (la), 8 + g (lb), g (lc) is word k/4, byte k%4; g < 8: two adjacent words, picked on g/4
             e(f"    %hq{u} = scalar.shrui %g{u}, %c2i : i32")
             e(f"    %hq1_{u} = scalar.cmpi eq, %hq{u}, %c1i : i32")
             e(f"    %hr{u} = scalar.andi %g{u}, %c3i : i32")
@@ -710,9 +633,7 @@ def q4k_compute(v, gb, q5=False):
         e(f"    %dm_v{u} = vector.splat %dm{u} : vector<16xf32>")
         rt = GPL % 2 == 1
         if rt:
-            # one group per lane: its parity is only known at run time, so the
-            # nibble is (q >> 4*(g & 1)) & 15 -- the same value as the even
-            # (q & 15) and odd (q >> 4) forms, so bit-identical
+            # odd GPL: g's parity is known only at run time, so the nibble is (q >> 4*(g & 1)) & 15
             e(f"    %gpar{u} = scalar.andi %g{u}, %c1i : i32")
             e(f"    %gsh{u} = scalar.shli %gpar{u}, %c2i : i32")
             e(f"    %gsh8_{u} = scalar.trunci %gsh{u} : i32 to i8")
@@ -721,8 +642,7 @@ def q4k_compute(v, gb, q5=False):
             # fifth bit: quant = nibble + ((qh[lane] >> g) & 1) * 16
             e(f"    %g8_{u} = scalar.trunci %g{u} : i32 to i8")
             e(f"    %g8v_{u} = vector.splat %g8_{u} : vector<16xi8>")
-        # nibbles on whole 32-bit words, (w >> s) & 0x0f0f0f0f, as HIP
-        # does: per-byte i8 shifts and masks lower element by element
+        # nibbles on whole 32-bit words, (w >> s) & 0x0f0f0f0f: per-byte i8 shifts and masks lower element by element
         if rt:
             e(f"    %gshw{u} = vector.splat %gsh{u} : vector<4xi32>")
         else:
@@ -734,8 +654,7 @@ def q4k_compute(v, gb, q5=False):
             e(f"    %nq{half}{u} = vector.bitcast %qwm{half}{u} : vector<4xi32> to vector<16xi8>")
             src = f"%nq{half}{u}"
             if q5:
-                # the fifth bit on words too: ((qh >> g) & 0x01010101) << 4,
-                # OR the nibbles (the bits do not overlap, so it is the add)
+                # the fifth bit on words too: ((qh >> g) & 0x01010101) << 4, ORed in (the bits do not overlap, so OR is the add)
                 e(f"    %hw{half}{u} = vector.bitcast {qh} : vector<16xi8> to vector<4xi32>")
                 e(f"    %hgw{half}{u} = vector.splat %g{u} : vector<4xi32>")
                 e(f"    %hs{half}{u} = vector.shrui %hw{half}{u}, %hgw{half}{u} : vector<4xi32>")
@@ -744,8 +663,7 @@ def q4k_compute(v, gb, q5=False):
                 e(f"    %n5w{half}{u} = vector.ori %qwm{half}{u}, %h16{half}{u} : vector<4xi32>")
                 e(f"    %n5{half}{u} = vector.bitcast %n5w{half}{u} : vector<4xi32> to vector<16xi8>")
                 src = f"%n5{half}{u}"
-            # nibbles are 0..15 (0..31 with q5's high bit): uitofp is the same
-            # value and can select v_cvt_f32_ubyteN (no sign-extend)
+            # nibbles are 0..15 (0..31 with q5's bit): uitofp gives the same value and selects v_cvt_f32_ubyteN
             e(f"    %fq{half}{u} = vector.uitofp {src} : vector<16xi8> to vector<16xf32>")
             e(f"    %sq{half}{u} = vector.mulf %dsc_v{u}, %fq{half}{u} : vector<16xf32>")
             if Q4FMIX:
@@ -785,8 +703,8 @@ def q4k_setup():
 
 
 def iq2xxs_loads(p, blk, gb):
-    """block_iq2_xxs (66 B): d f16 @0, then per 32-element group g eight bytes at
-    2 + 8g: four grid codes (bytes 0..3) and one LE32 aux word (bytes 4..7)."""
+    """block_iq2_xxs (66 B): d f16 @0, then per 32-element group g eight bytes at 2 + 8g.
+    The eight bytes are four grid codes (bytes 0..3) and one LE32 aux word (bytes 4..7)."""
     L = []
     e = L.append
     vals = []
@@ -803,7 +721,7 @@ def iq2xxs_loads(p, blk, gb):
 
 
 def iq2xxs_compute(v, gb):
-    """The chained kernel's IQ2_XXS decode, 8 elements per grid code li:
+    """IQ2_XXS decode in the .loom kernel's op order, 8 elements per grid code li:
       gw = grid words (2*code, 2*code+1), s = bits of ksigns[(aux >> 7li) & 127]
       mag = (g ^ -s) + s, value = (d * ((f32(aux >> 28) + 0.5) * 0.25)) * f32(mag)"""
     L = []
@@ -845,9 +763,8 @@ def iq2xxs_compute(v, gb):
 
 
 def iq2xs_loads(p, blk, gb):
-    """block_iq2_xs (74 B): d f16 @0, qs[32] u16 @2, scales[8] @66. Group g
-    (32 elements) reads the four codes qs[4g..4g+3] (bytes 2 + 8g) and scale
-    byte 66 + g."""
+    """block_iq2_xs (74 B): d f16 @0, qs[32] u16 @2, scales[8] @66.
+    Group g (32 elements) reads the four codes qs[4g..4g+3] (bytes 2 + 8g) and scale byte 66 + g."""
     L = []
     e = L.append
     vals = []
@@ -868,8 +785,7 @@ def iq2xs_loads(p, blk, gb):
 
 
 def iq2xs_compute(v, gb):
-    """The chained kernel's IQ2_XS decode (yah_ffn_gemm_iq2xs_f32.loom), 8
-    elements per code l (elements 8l..8l+7 of the group):
+    """IQ2_XS decode in yah_ffn_gemm_iq2xs_f32.loom's op order, 8 elements per code l (elements 8l..8l+7 of the group):
       gw = grid words (2*(code & 511), +1), s = bits of ksigns[code >> 9],
       mag = (g ^ -s) + s, nib = scales[g] low nibble for l < 2, high for l >= 2,
       value = (d * ((f32(nib) + 0.5) * 0.25)) * f32(mag)"""
@@ -939,8 +855,8 @@ def iq2xxs_setup():
 
 def q6k_loads(p, blk, gb):
     """block_q6_K (210 B): ql[128] @0, qh[64] @128, int8 scales[16] @192, d @208.
-    Group g = 4*half + seg reads 32 ql bytes at 64*half + 32*(seg&1), 32 qh bytes
-    at 128 + 32*half, and the two scales 192 + 8*half + 2*seg (+1)."""
+    Group g = 4*half + seg reads 32 ql bytes at 64*half + 32*(seg&1) and 32 qh bytes at 128 + 32*half.
+    Its two scales are at 192 + 8*half + 2*seg (+1)."""
     L = []
     e = L.append
     vals = []
@@ -984,7 +900,7 @@ def q6k_loads(p, blk, gb):
 
 
 def q6k_compute(v, gb):
-    """The chained kernel's Q6_K element decode, one row per lane:
+    """Q6_K element decode, one row per lane, in the .loom kernel's op order:
       code = low4 | ((qh >> 2*seg) & 3) << 4
       value = (d * f32(int8 scale)) * f32(code - 32)"""
     L = []
@@ -1033,8 +949,7 @@ def q6k_setup():
 
 
 def q8_0_loads(p, blk, gb):
-    """Q8_0 in 256-element super-blocks of 8 blocks (272 B): group g is block g,
-    d f16 at 34g, qs int8[32] at 34g + 2."""
+    """Q8_0 in 256-element super-blocks of 8 blocks (272 B): group g is block g, d f16 at 34g, qs int8[32] at 34g + 2."""
     L = []
     e = L.append
     vals = []
@@ -1056,7 +971,7 @@ def q8_0_loads(p, blk, gb):
 
 
 def q8_0_compute(v, gb):
-    """The chained kernel's Q8_0 decode: value = d * f32(q)."""
+    """Q8_0 decode in the .loom kernel's op order: value = d * f32(q)."""
     L = []
     e = L.append
     it = iter(v)
@@ -1094,9 +1009,8 @@ def iq4xs_setup():
 
 def q3k_loads(p, blk, gb):
     """block_q3_K (110 B): hmask[32] @0, qs[64] @32, scales[12] @96, d f16 @108.
-    Group g (32 elements) of the block: half = g/4, sp = g%4; element h16*16 + j
-    reads qs[32*half + 16*h16 + j] (bits 2sp..2sp+1) and hmask[16*h16 + j] (bit
-    g); its two 16-element halves use scales si = 2g and 2g+1."""
+    Group g, half = g/4, sp = g%4: element h16*16 + j reads bits 2sp, 2sp+1 of qs[32*half + 16*h16 + j], bit g of hmask[16*h16 + j].
+    The group's two 16-element halves use scales si = 2g and 2g+1."""
     L = []
     e = L.append
     vals = []
@@ -1138,12 +1052,11 @@ def q3k_loads(p, blk, gb):
 
 
 def q3k_compute(v, gb):
-    """The chained kernel's Q3_K element decode (yah_ffn_gemm_q3k_f32.loom):
+    """Q3_K element decode in yah_ffn_gemm_q3k_f32.loom's op order:
       low = (qs >> 2sp) & 3, bit = (hmask >> g) & 1, quant = (low | bit<<2) - 4
       low4 = (scales[si&7] >> 4*(si>>3)) & 15, high2 = (scales[8+si%4] >> 2*(si>>2)) & 3
       scale = (low4 | high2<<4) - 32, value = (f32(d) * f32(scale)) * f32(quant)
-    The integer steps are exact, so doing them 16 lanes of a vector at a time
-    gives the chained kernel's values; the f32 products keep its order."""
+    The integer steps are exact, so 16 at a time in a vector gives the same values; the f32 products keep the .loom order."""
     L = []
     e = L.append
     it = iter(v)
@@ -1159,8 +1072,7 @@ def q3k_compute(v, gb):
     for u in range(GPL):
         qa = next(it); qb = next(it)
         e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
-        # scales[2*(g&3)], +1 at window bytes 2+2*(g&3); scales[8+2*(g&1)],
-        # +1 at 10+2*(g&1): 16-bit pairs from words 0..3
+        # scales[2*(g&3)], +1 at window bytes 2+2*(g&3); scales[8+2*(g&1)], +1 at 10+2*(g&1): 16-bit pairs from words 0..3
         e(f"    %q3g3_{u} = scalar.andi %g{u}, %c3i : i32")
         e(f"    %q3g1_{u} = scalar.andi %g{u}, %c1i : i32")
         e(f"    %q3z_{u} = scalar.cmpi eq, %q3g3_{u}, %c0i : i32")
@@ -1200,8 +1112,7 @@ def q3k_compute(v, gb):
         e(f"    %colh{u} = index.add %col{u}, %c16 : index")
         for hn, q, hm, lo8, hi8, col in (("lo", qa, hma, la, ha, f"%col{u}"), ("hi", qb, hmb, lb, hb, f"%colh{u}")):
             t = f"{hn}{u}"
-            # on 32-bit words: per byte (q >> 2sp) & 3 | ((hm >> g) & 1) << 2,
-            # minus 4 as (x | 0x80) - 4 ^ 0x80 (no borrow leaves a byte)
+            # on 32-bit words: per byte (q >> 2sp) & 3 | ((hm >> g) & 1) << 2, minus 4 as (x | 0x80) - 4 ^ 0x80 (no borrow)
             e(f"    %q3qw{t} = vector.bitcast {q} : vector<16xi8> to vector<4xi32>")
             e(f"    %q3hw{t} = vector.bitcast {hm} : vector<16xi8> to vector<4xi32>")
             e(f"    %q3lw{t} = vector.shrui %q3qw{t}, %q3lsw{u} : vector<4xi32>")
@@ -1250,11 +1161,8 @@ def q3k_setup():
 
 
 FMTS = {
-    # fmt: block bytes, (loads, compute), extra buffer bindings after %weight, setup
-    # ksub: measured best phase width at pp2048 (mean ms per dispatch, NW=2):
-    #   iq4xs 128 -> 9.71 (64: 12.08, 256: 12.53)
-    #   iq3s   64 -> 12.57 (128: 15.47) -- at 128 the 64-element decode per lane
-    #          pushes 8 accumulators into scratch (3151 private ops/work-item)
+    # bb: block bytes; kdiv: format blocks per 256-element super-block; decode: (loads, compute); extra: bindings after %weight
+    # ksub: best measured phase width at pp2048 (NW=2). At 128 the IQ3_S decode pushes 8 accumulators into scratch.
     "iq4xs": dict(bb=136, ksub=128, decode=(iq4xs_loads, iq4xs_compute), extra=[], setup=iq4xs_setup),
     "iq3s": dict(bb=110, ksub=64, decode=(iq3s_loads, iq3s_compute), extra=["grid"], setup=iq3s_setup),
     "q4k": dict(bb=144, ksub=128, decode=(q4k_loads, q4k_compute), extra=[], setup=q4k_setup),
@@ -1272,9 +1180,8 @@ FMTS = {
 
 
 def gen(fmt, kind="kstore"):
-    """kind: "kstore" (f32 token-major output) or "swiglu" (the ffn_up arm:
-    f16 output = round_f16(silu(gate) * acc), gate the f32 gate projection in
-    the same token-major layout -- yah_ffn_gemm_<fmt>_swiglu_f16.loom's epilogue)."""
+    """Return the kernel text for fmt. kind: "kstore" (f32 output = acc), "kres" (f32 output = resid + acc) or "swiglu".
+    swiglu is the ffn_up arm: f16 output = round_f16(silu(gate) * acc), gate the f32 gate projection in the output layout."""
     F = FMTS[fmt]
     configure(fmt)
     bb, decode = F["bb"], F["decode"]
@@ -1327,9 +1234,8 @@ def gen(fmt, kind="kstore"):
     if kdiv == 1:
         e(f"  %k_blocks = config.get @{sym}.k_blocks : index")
     else:
-        # the config counts the format's own blocks (32 elements for Q8_0); the
-        # kernel works in 256-element super-blocks of kdiv of them. Without this
-        # the Q8_0 kernel walked 8x past its weights and hung the gfx ring.
+        # The config counts the format's own blocks (32 elements for Q8_0); the kernel walks super-blocks of kdiv of them.
+        # Without the division the kernel reads 8x past its weights and hangs the gfx ring.
         e(f"  %k_blocks_cfg = config.get @{sym}.k_blocks : index")
         e(f"  %ckdiv = index.constant {kdiv} : index")
         e("  %k_blocks = index.div %k_blocks_cfg, %ckdiv : index")
@@ -1379,15 +1285,13 @@ def gen(fmt, kind="kstore"):
     e(f"  %ctok = index.constant {TOK} : index")
     e("  %wave_tok = index.mul %wv, %ctok : index")
     e("  %token_base = index.add %wtb, %wave_tok : index")
-    # decode lane map: lane l64 owns tile row l64 (global row m_origin + l64);
-    # token slice wv owns groups [wv*GPL, wv*GPL+GPL)
+    # decode lane map: lane l64 owns tile row l64 (global row m_origin + l64); wave wv owns groups [wv*GPL, wv*GPL+GPL)
     e(f"  %clr1 = index.constant {LR - 1} : index")
     e("  %drow0 = index.add %l64, %rg64 : index")
     e("  %drow = index.min %drow0, %clr1 : index")
     e("  %drow_i = index.cast %drow : index to i32")
     e("  %m_origin_i = index.cast %m_origin : index to i32")
-    # the decode row is clamped to the tile, so lanes past a short tile (MT < 4)
-    # re-decode its last row instead of reading past the matrix
+    # the decode row is clamped: lanes past a short tile (MT < 4) re-decode its last row instead of reading past the matrix
     e("  %grow_i = scalar.addi %m_origin_i, %drow_i : i32")
     e("  %k_blocks_i = index.cast %k_blocks : index to i32")
     e("  %bpr_i = scalar.muli %k_blocks_i, %cbbi : i32")
@@ -1407,9 +1311,8 @@ def gen(fmt, kind="kstore"):
     V4 = "vector<4xf32>"
     types = ", ".join([V4] * NA)
     loads, compute = decode
-    # Phase 0's raw bytes are loaded before the loop; each iteration decodes
-    # the carried bytes and then issues the NEXT phase's loads, so their DRAM
-    # latency runs under this phase's MMAs instead of in front of the decode.
+    # Phase 0's raw bytes load before the loop. Each iteration decodes the carried bytes, then issues the next phase's loads.
+    # So the DRAM latency runs under this phase's MMAs instead of in front of the decode.
     ca = ", ".join(f"%a{i} = %init : {V4}" for i in range(NA))
     L0, vals0 = loads("pf_", "%row_off_i", "%gl_i")
     L.extend(L0)
@@ -1435,8 +1338,7 @@ def gen(fmt, kind="kstore"):
     cur_names = unpack_vals(e, cur, orig0)
     L.extend(compute(cur_names, "%gb_i"))
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    # next phase, clamped to the last one (its loads are then redundant but
-    # in bounds, and the carried values are never decoded)
+    # next phase, clamped to the last one (its loads are then redundant but in bounds, and the carried values are never decoded)
     e("    %kp_n0 = index.add %kp, %c1 : index")
     e("    %kp_last = index.sub %kphases, %c1 : index")
     e("    %kp_n = index.min %kp_n0, %kp_last : index")
@@ -1474,16 +1376,10 @@ def gen(fmt, kind="kstore"):
     e("  %mo48 = index.add %m_origin, %c48 : index")
     rows = ["%m_origin", "%mo16", "%mo32", "%mo48"]
     if sw:
-        # SwiGLU epilogue: out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), with
-        # the chained kernel's scalar ops in its order (bit-identity).
-        # It cannot store an f16 result fragment: that store ignores the strided
-        # token-major layout and writes the tile row-major (probe: (t=16, r=17)
-        # received (t=17, r=16); pipeline hidden cosine ~0.6). A fully unrolled
-        # per-element form ran out of SGPRs (peak 215 of 106). So, per 16-row slab:
-        # the f32 fragments go to a per-wave LDS tile through a row-fastest strided
-        # view (f32 result stores honour layouts), then a real loop walks it with
-        # lane-contiguous rows, so the gate loads and f16 stores coalesce into 64 B
-        # runs. The weight tile's LDS is reused; it is sized for this in gen().
+        # SwiGLU epilogue: out[t*m + r] = f16(silu(gate[t*m + r]) * acc[r][t]), the .loom kernel's scalar ops in order.
+        # An f16 result-fragment store ignores the strided layout, and a fully unrolled per-element form runs out of SGPRs.
+        # So per 16-row slab: f32 fragments go to a per-wave LDS slab via a strided view (f32 result stores honour layouts),
+        # then a loop walks it with lane-contiguous rows, so gate loads and f16 stores coalesce. The slab reuses the weight LDS.
         e(f"  %ep_lay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
         e(f"  %ep_wbytes = index.constant {16 * TOK * 4} : index")
         e("  %ep_off_i = index.mul %wave, %ep_wbytes : index")
@@ -1527,12 +1423,8 @@ def gen(fmt, kind="kstore"):
             e(f"    scf.yield %em{i} : index")
             e("  }")
     elif kr:
-        # Fused residual: out = resid + acc, element for element. resid is read as
-        # an f32 result fragment through the same token-major strided view (f32
-        # result loads honour the layout), so it arrives in the accumulator's
-        # register layout. Same f32 add, same operand order as yah_residual_1d
-        # (a + b with a the running hidden state), so bit-identical to the
-        # kStore-into-partial + residual pass it replaces.
+        # Fused residual: out = resid + acc. resid loads as an f32 result fragment through the output view: accumulator layout.
+        # Same f32 add and operand order as yah_residual_add_1d (hidden state first), so bit-identical to kstore + that kernel.
         e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
         e("  %res_t_view = buffer.view %resid_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
         e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
@@ -1543,10 +1435,7 @@ def gen(fmt, kind="kstore"):
                 e(f"  %rs{a} = vector.addf %rf{a}, %acc{a} : {V4}")
                 e(f"  vector.fragment.store<result> %rs{a}, %out_t_view[{rows[i]}, {toks[j]}] shape [%m, %n] : {V4}, view<[%m_rows]x[%tokens]xf32, %out_layout>")
     else:
-        # Result fragments go straight to the token-major output through a
-        # strided [m_rows]x[tokens] view (element (row, t) at t*m_rows + row).
-        # The staged form wrote the f32 tile to ostage, re-read it and wrote it
-        # again transposed: 3x the output bytes (426 MB for a 17408x2048 gate).
+        # result fragments go straight to the output through a strided [m_rows]x[tokens] view
         e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
         e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
         for i in range(MT):

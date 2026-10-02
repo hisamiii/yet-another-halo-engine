@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 """footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048]
 
-Compile the exact source under the exact config, read each root's declared byte
-envelope from the compile report (loom_preflight.declared_envelopes), and refuse
-(exit 3) unless every one fits the buffer loom_forward_pp binds for that root.
-
-Why: an envelope past its buffer does not fault on this GPU -- the shader reads
-unmapped VA, the gfx ring times out, MES stops answering RESET (see
-docs/gpu-ring-hang-qdq.md). On 2026-09-30 a Q8_0 kernel whose k_blocks config was
-read as 256-element blocks instead of 32-element ones declared an 8x weight and
-input footprint and hung the ring. emit_prefill_pp runs this on every HAL the
-shared generator builds; safe_bench covers only the older 5/6/7-binding family.
+Compile the source under the exact config and read each root's declared byte envelope from the compile report.
+Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for that root.
+An envelope past its buffer does not fault on this GPU: the shader reads unmapped VA and the gfx ring times out.
+emit_prefill_pp runs this on every generated GEMM before it emits the HAL.
 """
 import os, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,8 +25,7 @@ bound = {"weight": M * kb * bpb, "input": B * K * 2, "resid": B * M * 4, "gate":
          "grid": {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(fmt, 0),
          "ksigns": 128,
          "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4}
-# YAH_LOOM_HOME selects the HRX/Loom tree whose build compiles the HALs (default
-# /home/q/hrx); an experimental compiler worktree is used by pointing it there.
+# YAH_LOOM_HOME selects the HRX/Loom tree whose build compiles the HALs (default /home/q/hrx).
 H = os.environ.get("YAH_LOOM_HOME", "/home/q/hrx")
 e = dict(os.environ)
 e["IREE_HAL_AMDGPU_LIBHSA_PATH"] = "/home/q/rocm10/x_runtime/opt/rocm/core-10.0/lib"

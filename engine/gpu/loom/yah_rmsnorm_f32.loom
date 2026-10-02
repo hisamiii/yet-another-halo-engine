@@ -1,15 +1,5 @@
-// YAH batched RMSNorm, Loom port of BatchedRMSNormKernel.
-//
-// HIP source: prefill_norm.hip. One subgroup per row: each lane accumulates the
-// sum of squares over its stride-32 slice, the subgroup reduces, and every lane
-// then writes its slice of the normalised row.
-//
-//   mean_sq = sum(x^2) / dim
-//   inv_rms = rsqrt(mean_sq + eps)
-//   out[i]  = (x[i] * inv_rms) * weight[i]
-//
-// First port: correctness and coverage, one subgroup per row. The HIP kernel uses
-// 256 threads per row with a shared-memory tree; that is a tuning question.
+// RMSNorm of rows of 5120 f32: out[r][i] = (x[r][i] * rsqrt(sum(x[r]^2) / 5120 + eps)) * weight[i].
+// Grid: rows workgroups of one wave32; each lane takes a stride-32 slice, then a subgroup add.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_rmsnorm.rows : %value: index where [range(%value, 1, 4096)]

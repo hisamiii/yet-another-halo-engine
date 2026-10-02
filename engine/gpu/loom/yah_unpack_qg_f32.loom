@@ -1,24 +1,6 @@
-// YAH batched QG unpack, Loom port of BatchedUnpackQGKernel.
-//
-// HIP source: prefill_unpack.hip. The source holds, for every row and head,
-// head_dim q values followed by head_dim gate values:
-//
-//   head_idx = idx / head_dim, dim_idx = idx % head_dim
-//   src      = head_idx * 2 * head_dim + dim_idx
-//   q_out[b][idx]    = qg[b][src]
-//   gate_out[b][idx] = qg[b][src + head_dim]
-//
-// head_dim defaults to 1 here. That is deliberate: with head_dim = 1 the source
-// index is exactly 2 * idx, so the interleaving is an arithmetic sequence and the
-// expectation is expressible with check.generate.iota -- even-indexed elements
-// become q and odd-indexed elements become gate. At head_dim = 128 a permuted
-// source cannot be written as an iota and a uniform fill would not catch the
-// interleaving at all, because any permutation of uniform data is uniform.
-// Production passes head_dim=128 through the configuration.
-//
-// The element counts are the same either way: head_dim 128 with 40 heads and
-// head_dim 1 with 5120 heads both give total_h = 5120, so the measured shape is
-// the production size even though the stride differs.
+// Split the interleaved q|gate projection: each head of qg holds head_dim q values, then head_dim gate values.
+//   q_out[b][h*head_dim + d] = qg[b][h*2*head_dim + d], gate_out[b][h*head_dim + d] = qg[b][h*2*head_dim + head_dim + d]
+// Grid: (ceil(num_heads*head_dim / 256), batch) workgroups of 256 lanes, one element per lane. The emitters set head_dim.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_unpack_qg.batch : %value: index where [range(%value, 1, 4096)]

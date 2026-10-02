@@ -1,22 +1,10 @@
-// YAH FFN GEMM with in-kernel Q4_K decode and the SwiGLU epilogue, Loom port of
-// HalfPrefillGemmKernel<..., kQ4_K, kSwiGLU>.
-//
-// HIP source: prefill_fp16.hip. The decoder and K loop are yah_ffn_gemm_q4k_f32;
-// the epilogue combines the accumulator with the separate f32 gate projection
-// and narrows to fp16:
-//
-//   out[token*m + row] = round_f16(silu(gate[token*m + row]) * acc[row][token])
-//
-// This is the FFN up-projection arm (LaunchBatchedQuantGEMMSwiGLUFp16) for the
-// Q4_K shard, taken when the paired gate/up kernel declines.
-//
-// Correctness case: the same packed fixture, the activation scaled to 1/16 so the
-// accumulator stays inside the f16 range, gate = 1, and the expected is
-// round_f16(silu(1) * acc). The production-size case uses an all-zero weight, so
-// the accumulator is zero and every output is zero.
-//
-// Required config (correctness): --config=yah_ffn_gemm_q4k_swiglu.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_q4k_swiglu.m_tiles=1088
+// Q4_K GEMM for the ffn_up arm, f16 output. Weight decode as in yah_ffn_gemm_q4k_f32.loom.
+// SwiGLU epilogue: out[t*m_rows + row] = f16(silu(gate[t*m_rows + row]) * acc[row][t]), gate is the f32 ffn_gate projection.
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k], gate f32 [tokens][m_rows],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f16 [tokens][m_rows].
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_q4k_swiglu.m_tiles : %value: index where [range(%value, 1, 4096)]

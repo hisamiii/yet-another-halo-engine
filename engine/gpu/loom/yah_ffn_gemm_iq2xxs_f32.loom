@@ -1,54 +1,14 @@
-// YAH FFN GEMM with in-kernel IQ2_XS weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kIQ2_XS, kStore>.
-//
-// HIP source: prefill_fp16.hip, element decoder DecodeQuantSub16 IQ2_XS arm in
-// quant_ops.hpp. The weight stays packed IQ2_XS and is decoded inside the K loop.
-//
-//   out[token*m + row] = sum_k iq2xs_decode(W, row, k) * f16(A[token][k])
-//
-// block_iq2_xs is 74 bytes: half d; uint16 qs[32]; uint8 scales[8]. Element i is
-//   sub16 = i/16; ib32 = (sub16/2)%8; half = sub16%2
-//   li = (i%16)/8; j = i%8; l = 2*half + li
-//   code = qs[4*ib32 + l]
-//   g_word = iq2xs_grid[code & 511]; g_byte = (g_word >> (8*j)) & 0xFF
-//   signs = ksigns[code >> 9]; sign_bit = (signs >> j) & 1
-//   mag = sign_bit ? -g_byte : g_byte
-//   nib = half == 0 ? scales[ib32] & 0xF : scales[ib32] >> 4
-//   value = f32(d) * (0.5 + nib) * 0.25 * mag
-//
-// As in the IQ2_XS port the 512-entry grid and the 128-byte ksigns table are
-// operands. The grid is 64-bit in HIP; here it is passed as the little-endian
-// i32 word pairs, so element j reads word (j/4) of the pair. The uint16 code is
-// two byte loads at 2 + 2*(4*ib32 + l) because the 74-byte block stride is not
-// 2-aligned in the general row.
-//
-// BLOCK ORDER: block_iq2_xs stores d first (offset 0); qs starts at 2 and scales
-// at 66. QK = 256, so the row stride is 20 blocks * 74 = 1480 bytes.
-//
-// Schedule, correctness first and tuning deferred: one workgroup per 16-row
-// tile, one wave. For each K step of 16 the 32 lanes decode the 16x16 weight
-// tile into the wstage global scratch, vector.fragment.load<lhs> reads it back,
-// four 16x16x16 MMAs cover the four N sub-tiles, and the accumulators go through
-// an ostage global scratch to the output with scalar stores so the output index
-// can follow the m_tiles config. Both fragment operands are staged through
-// global memory rather than LDS: a fragment load or store against a
-// buffer.alloca<workgroup> view compiles but does not produce the tile the
-// target reads, and the global form is the one yah_ffn_gemm_f16 validates.
-//
-// Measured: 19.85 ms at m_tiles=1088 (production 17408 rows), against the HIP
-// Q4_K kernel at 1.197 ms and the Q4_K port at 23.31 ms. 0.841 ms at m_tiles=1.
-// The deferred levers are the same as the other format ports, plus the grid and
-// ksigns loads.
-//
-// Two cases, because the correctness shape and the production shape need
-// different configs:
-//   @yah_ffn_gemm_iq2xxs_case       m_tiles=1    packed fixture, captured reference
-//   @yah_ffn_gemm_iq2xxs_full_case  m_tiles=1088 all-zero weight, output must be 0
-// The all-zero weight is a valid IQ2_XS block (d = 0) and exercises the full
-// decode path at production size; the fixture case pins the decode arithmetic.
-//
-// Required config (correctness): --config=yah_ffn_gemm_iq2xxs.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_iq2xxs.m_tiles=1088
+// IQ2_XXS GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_iq2_xxs (66 B, 256 weights): half d; then per 32-element group g eight bytes at 2 + 8g: four grid codes, one LE32 aux word.
+//   g = i/32, li = (i%32)/8, j = i%8; code = byte li of the group; aux = LE32(bytes 4..7 of the group)
+//   g_byte = byte j of iq2xxs_grid[code]; sign_bit = (ksigns[(aux >> 7*li) & 127] >> j) & 1
+//   value = f32(d) * (0.5 + (aux >> 28)) * 0.25 * (sign_bit ? -g_byte : g_byte)
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, grid [512] i32 (256 u64 entries as LE word pairs), ksigns [128] u8, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_iq2xxs.m_tiles : %value: index where [range(%value, 1, 4096)]
@@ -235,7 +195,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq2xxs() {
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      // conditional negate without a branch: (x ^ -s) + s
+      // Negate without a branch: (x ^ -s) + s, s = sign bit.
       %neg_one = scalar.subi %c0i, %sign_bit : i32
       %mag0 = scalar.xori %g_byte, %neg_one : i32
       %mag = scalar.addi %mag0, %sign_bit : i32

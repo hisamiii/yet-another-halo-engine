@@ -1,15 +1,5 @@
-// YAH 1-D residual add, Loom port of ResidualAddKernel.
-//
-// HIP source: models/qwen/hip/kernels/residual.hip. The decode-side twin of the
-// batched prefill residual add:
-//
-//   out[idx] = a[idx] + b[idx]
-//
-// A flat index domain with no routing, so only the stride can be wrong. The check
-// needs no fixture: a is an iota and b an iota with a different offset, so the sum
-// is the arithmetic sequence 100 + 2*idx.
-//
-// Required config: --config=yah_residual_1d.dim=8
+// Residual add: out[i] = a[i] + b[i] (f32).
+// Grid: ceil(dim / 256) workgroups of 256 lanes, one element per lane.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_residual_1d.dim : %value: index where [range(%value, 1, 1073741824)]

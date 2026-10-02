@@ -1,28 +1,8 @@
-// YAH fp16 SSM post-normalization + gate epilogue,
-// Loom port of BatchedSSMPostNormGateFp16Kernel.
-//
-// HIP source: models/qwen/hip/kernels/ssm_row_split.hip. Same arithmetic as the
-// fp32 epilogue but the heads are flat (token * num_heads + head) and the result is
-// written directly as fp16, which is what the SSM output consumer wants:
-//
-//   sum = sum_i raw[head*128 + i]^2
-//   inv = 1 / sqrt(sum/128 + 1e-6)
-//   out[head*128 + i] = f16((raw[i] * inv) * weight[i] * (g * sigmoid(g)))
-//
-// One subgroup per head, eight heads per workgroup, exactly the HIP geometry. Each
-// lane carries four values at stride 32; the four squared magnitudes are summed
-// into one partial and reduced once with `kernel.subgroup.reduce<addf>`, which is
-// the same total as the HIP kernel's four separate butterflies followed by a sum.
-//
-// The HIP kernel ends with an empty asm barrier that forces the f32 result to be
-// materialized before the fp16 conversion. That barrier only pins the floating-point
-// rounding at the source level and has no arithmetic effect, so the port stores the
-// same f32 value without it.
-//
-// The output is transcendental and rounds to fp16, so the expectation is the
-// generated fixture compared with a tolerance.
-//
-// Required config: --config=yah_ssm_postnorm_fp16.head_count=3
+// DeltaNet output norm + gate, f16 output. For each of head_count flat (token, head) rows of 128:
+//   inv = 1 / sqrt(sum_i raw[h*128 + i]^2 / 128 + 1e-6)
+//   out[h*128 + i] = f16((raw[h*128 + i] * inv) * weight[i] * (g * sigmoid(g))), g = gate[h*128 + i]
+// Grid: ceil(head_count / 8) workgroups of 256 lanes; one wave32 per head, each lane takes four values at stride 32.
+// Bindings: raw [head_count][128] f32, weight [128] f32, gate [head_count][128] f32, out [head_count][128] f16.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_ssm_postnorm_fp16.head_count : %value: index where [range(%value, 1, 1048576)]

@@ -1,10 +1,7 @@
-// yah_conv_state: carry the short-conv state between prefill chunks.
-// The conv kernels read, for token t < 3 of a chunk, the previous chunk's last
-// inputs from state[c*4 + 1..3] (yah_ssm_conv: s2 = state[c*4+3] = x[-1],
-// state[c*4+2] = x[-2], state[c*4+1] = x[-3]). After a chunk's conv, this
-// writes the chunk's last three input rows there:
-//   state[c*4 + 1 + j] = x[(batch - 3 + j) * channels + c],  j = 0..2
-// Required config: --config=yah_conv_state.batch=B --config=yah_conv_state.channels=10240
+// Carry the short-conv state from one prefill chunk to the next: copy the chunk's last three input rows into the state.
+//   state[c*4 + 1 + j] = x[(batch - 3 + j) * channels + c], j = 0..2
+// The conv kernels read these for tokens t < 3 of the next chunk: state[c*4+3] = x[-1], state[c*4+2] = x[-2], state[c*4+1] = x[-3].
+// Grid: ceil(channels / 256) x 256 lanes, one lane per channel. Bindings: x [batch][channels] f32, state [channels][4] f32.
 amdgpu.target<gfx1151> @cs_w32 {subgroup_size = 32}
 config.decl @yah_conv_state.batch : %value: index where [range(%value, 3, 1048576)]
 config.decl @yah_conv_state.channels : %value: index where [range(%value, 1, 1048576)]

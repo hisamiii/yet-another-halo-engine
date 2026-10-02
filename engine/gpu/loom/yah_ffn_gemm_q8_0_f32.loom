@@ -1,21 +1,12 @@
-// YAH FFN GEMM with in-kernel Q8_0 weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kQ8_0, kStore>.
-//
-// HIP source: prefill_fp16.hip. block_q8_0 is 34 bytes:
-//
-//   __half d; int8 qs[32]
-//
-// so element e is value = f32(d) * qs[e] with a signed 8-bit quant. The block is
-// 32 wide rather than 256, so the block index is kk >> 5 and the in-block index is
-// kk & 31; the sign extension is scalar.extsi. The K loop, staging and epilogue
-// are the Q4_K GEMM.
-//
-// Q8_0 is 99 of the Qwen3.8-27B-UD-Q4_K_S shard tensors and it is 9 of the 11
-// formats; the fixture keeps qs in [-63, 63] and d = 2^-5 so the products are
-// exact in f16.
-//
-// Required config (correctness): --config=yah_ffn_gemm_q8_0.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_q8_0.m_tiles=1088
+// Q8_0 GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_q8_0 (34 B, 32 weights): half d; i8 qs[32]. value = f32(d) * qs[e].
+// k_blocks counts 32-element blocks: the block of K step kk is kk >> 5.
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_q8_0.m_tiles : %value: index where [range(%value, 1, 4096)]

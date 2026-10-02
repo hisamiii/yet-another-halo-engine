@@ -1,27 +1,13 @@
-// YAH causal SSM convolution + gate, Loom port of BatchedSSMConvKernel.
-//
-// HIP source: models/qwen/hip/kernels/ssm_recurrence.hip. One work-item owns one
-// (token, channel) pair of a 4-tap causal convolution over the qkv stream:
-//
-//   w0..w3 = conv_weights[c*4 + 0..3]                (0, 0, 0, 1 when absent)
-//   s3 = x[t][c]
+// DeltaNet short convolution (causal conv1d + SiLU) for a batch of tokens.
+// One lane per (token t, channel c) of a 4-tap causal convolution over the qkv stream, then SiLU:
+//   w0..w3 = conv_weights[c*4 + 0..3]; s3 = x[t][c]
 //   s2 = t >= 1 ? x[t-1][c] : state[c*4 + 3]
 //   s1 = t >= 2 ? x[t-2][c] : (t == 1 ? state[c*4 + 3] : state[c*4 + 2])
-//   s0 = t >= 3 ? x[t-3][c] : (t == 2 ? state[c*4 + 3]
-//                                 : (t == 1 ? state[c*4 + 2] : state[c*4 + 1]))
-//   dot = s0*w0 + s1*w1 + s2*w2 + s3*w3
-//   conv_out[t][c] = dot * sigmoid(dot)
-//
-// The history ring is read-only here; BatchedDeltaNetPrepAlphaBetaKernel advances
-// it. Slot 0 of each channel's four is never read, which is the upstream layout and
-// is preserved. The fallback ladder only differs over the first three tokens, so the
-// fixture is built to make those tokens carry different values.
-//
-// The output is a transcendental, so the expectation is the generated fixture
-// compared with a tolerance rather than byte-exactly. That tolerance is the numeric
-// contract: both sides compute an expf, and their last ulp need not agree.
-//
-// Required config: --config=yah_ssm_conv.batch=4 --config=yah_ssm_conv.qkv_dim=16
+//   s0 = t >= 3 ? x[t-3][c] : (t == 2 ? state[c*4 + 3] : (t == 1 ? state[c*4 + 2] : state[c*4 + 1]))
+//   dot = s0*w0 + s1*w1 + s2*w2 + s3*w3; conv_out[t][c] = dot * sigmoid(dot)
+// The state ring is read only; slot 0 of each channel is never read.
+// Grid: (ceil(qkv_dim / 256), batch) workgroups of 256 lanes.
+// Bindings: x [batch][qkv_dim], conv_weights [qkv_dim][4], state [qkv_dim][4], conv_out [batch][qkv_dim], all f32.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_ssm_conv.batch : %value: index where [range(%value, 1, 1048576)]

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Generate the fully unrolled fp16 output norm for one row width.
+"""Generate yah_half_norm, the fully unrolled RMS norm with f16 output, for one row width.
 
 usage: gen_half_norm.py [out.loom] [dim=5120]
 
-One wave32 per row, lane l owns elements l, l+32, ..., the sum of squares is
-((0 + v0*v0) + v1*v1) + ... per lane (mulf then addf, not fma) followed by a
-subgroup reduction, and the output is f16((v * inv) * w).
+Grid (rows) x 32: one wave32 per row; lane l owns elements l, l+32, ...
+Bindings: x (f32 [rows][dim]), weight (f32 [dim]), out (f16 [rows][dim]); residual and sum_out are not read.
+Per lane the sum of squares is ((0 + v0*v0) + v1*v1) + ... (mulf then addf, not fma), then a subgroup reduction.
+The output is f16((v * inv) * w).
 
-Fully unrolled: each lane issues all dim/32 loads up front and keeps the values
-in registers, so the second pass reads only the weight (a loop form made ~160
-dependent round trips per lane).
+Fully unrolled: each lane issues all dim/32 loads up front and keeps the values in registers,
+so the second pass reads mostly the weight (a loop form makes ~160 dependent round trips per lane).
 """
 import sys
 
@@ -65,16 +65,14 @@ def gen(dim=5120):
     e("  %shifted = scalar.addf %mean, %eps : f32")
     e("  %root = scalar.sqrtf %shifted : f32")
     e("  %inv = scalar.divf %one, %root : f32")
-    # hold the first `keep` row values across the reduction and reload the
-    # rest for the output pass (fewer VGPRs: one more wave per SIMD).
-    # 56 was fastest at 5120 (2048 rows: all held 0.357 ms, 56 0.328).
+    # Hold the first `keep` row values across the reduction and reload the rest for the output pass.
+    # Fewer VGPRs give one more wave per SIMD: 56 is 8% faster than holding all 160 at dim 5120.
     keep = 56 if dim == 5120 else n
     for k in range(n):
         e(f"  %wi{k} = index.add %lane, %o{k} : index")
         e(f"  %w{k} = view.load %weight_view[%wi{k}] : view<[%dim]xf32> -> f32")
         xk = f"%x{k}"
         if k >= keep:
-            # reloaded instead of held across the reduction; same value
             e(f"  %xr{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
             xk = f"%xr{k}"
         e(f"  %nm{k} = scalar.mulf {xk}, %inv : f32")

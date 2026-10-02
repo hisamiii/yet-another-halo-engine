@@ -1,21 +1,8 @@
-// YAH argmax over logits, Loom port of ArgmaxKernel.
-//
-// HIP source: sample.hip. The HIP kernel scans with 256 threads into a shared
-// (value, index) pair and tree-reduces, ignoring non-finite values and keeping the
-// lowest index on ties because the comparison is strict.
-//
-// This port reaches the same answer in two passes, which avoids needing a
-// scalar select (the scalar dialect has cmpf, isfinitef and maxnumf, but no
-// scalar.select):
-//
-//   pass 1  each lane takes the max over its stride-32 slice, mapping non-finite
-//           entries to -3e38, then kernel.subgroup.reduce<maxnumf> gives the row max
-//   pass 2  each lane records the lowest index in its slice equal to that max
-//   combine lane 0 scans the 32 per-lane candidates from workgroup memory and
-//           keeps the minimum, which is the lowest index on ties
-//
-// Two passes read the logits twice. That is a correctness-first choice; the HIP
-// kernel reads once.
+// argmax over the f32 logits -> out_token (i32). NaN and +inf are skipped; ties keep the lowest index.
+// Grid: one workgroup of 1024 lanes (32 wave32 waves). Bindings: logits [vocab] f32, out_token [1] i32.
+// Two passes over the logits, because the scalar dialect has no select:
+//   pass 1: each lane takes the max of its stride-1024 slice; subgroup and LDS reductions give the row max.
+//   pass 2: each lane takes the max of -index over its entries equal to the row max; the same reductions give the lowest index.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_argmax.vocab : %value: index where [range(%value, 1, 1048576)]
@@ -25,11 +12,8 @@ kernel.def target(@yah_wave32) @yah_argmax() {
   %workgroup_size = index.constant 1024 : index
   kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
 } launch(%logits: buffer, %out_token: buffer) {
-  // One 1024-lane workgroup: each lane scans a stride-1024 slice (unrolled so
-  // loads overlap), waves reduce with subgroup maxima, and 32 per-wave values
-  // meet in LDS. The lowest matching index is found as the maximum of -index
-  // in f32 (exact below 2^24). Max and lowest-index are order-independent, so
-  // the result is the one-wave kernel's exactly. 248320 logits: 1.9 ms before.
+  // -index in f32 is exact below 2^24 (vocab is at most 2^20).
+  // Max and lowest index do not depend on the reduction order, so the result is deterministic.
   %base = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -54,7 +38,7 @@ kernel.def target(@yah_wave32) @yah_argmax() {
 
   %slice_max = scf.for %i = [%tid to %vocab step %c1024](%acc = %neg_big : f32) -> (f32) unroll(%c8) {
     %v = view.load %logits_view[%i] : view<[%vocab]xf32> -> f32
-    // NaN and +inf fail this bound and are dropped (see the one-wave version).
+    // NaN and +inf fail this bound and are dropped.
     %finite = scalar.cmpf ole, %v, %pos_limit : f32
     %fv = scf.if %finite -> (f32) {
       scf.yield %v : f32

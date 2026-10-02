@@ -1,56 +1,15 @@
-// YAH FFN GEMM with in-kernel Q6_K weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kQ6_K, kStore>.
-//
-// HIP source: prefill_fp16.hip, element decoder Q6KValue / DecodeQuantSub16 in
-// quant_ops.hpp. The weight stays packed Q6_K and is decoded inside the K loop.
-//
-//   out[token*m + row] = sum_k q6k_decode(W, row, k) * f16(A[token][k])
-//
-// block_q6_K is 210 bytes and holds 256 weights:
-//   uint8 ql[128]; uint8 qh[64]; int8 scales[16]; half d
-// element i of the block is
-//   half = i/128; within = i%128; segment = within/32; lane = within%32
-//   low  = segment 0/2 ? ql[half*64 + lane] & 0xF
-//                       : ql[half*64 + 32 + lane] & 0xF
-//          (segments 2/3 take the high nibble of the same two bytes)
-//   high = (qh[half*32 + lane] >> (2*segment)) & 3
-//   scale = scales[half*8 + lane/16 + segment*2]        (int8)
+// Q6_K GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_q6_K (210 B, 256 weights): u8 ql[128]; u8 qh[64]; i8 scales[16]; half d @208. Element i:
+//   half = i/128, seg = (i%128)/32, l = i%32
+//   low = segments 0, 1: low nibble of ql[half*64 + l], ql[half*64 + 32 + l]; segments 2, 3: high nibble of the same bytes
+//   high = (qh[half*32 + l] >> (2*seg)) & 3; scale = scales[half*8 + l/16 + seg*2]
 //   value = f32(d) * f32(scale) * f32(((high << 4) | low) - 32)
-//
-// BLOCK ORDER: unlike Q6_K, block_q6_K stores d last (offset 208), so the fp16
-// d view index is blk_off/2 + 104. ql/qh/scales start at 0, 128 and 192. The
-// fixture and yah_dequant_q6k_bf16 both follow this order.
-//
-// Schedule, correctness first and tuning deferred: one workgroup per 16-row
-// tile, one wave. For each K step of 16 the 32 lanes decode the 16x16 weight
-// tile into the wstage global scratch, vector.fragment.load<lhs> reads it back,
-// four 16x16x16 MMAs cover the four N sub-tiles, and the accumulators go through
-// an ostage global scratch to the output with scalar stores so the output index
-// can follow the m_tiles config. Both fragment operands are staged through
-// global memory rather than LDS: a fragment load or store against a
-// buffer.alloca<workgroup> view compiles but does not produce the tile the
-// target reads, and the global form is the one yah_ffn_gemm_f16 validates.
-//
-// Measured: 17.47 ms at m_tiles=1088 (production 17408 rows), against the HIP
-// Q4_K kernel at 1.197 ms and the Q4_K port at 23.31 ms. The levers, all
-// deferred: decode a whole 256-wide block once per workgroup and reuse its
-// scale bytes across 16 K steps, keep the staged tile in LDS instead of global,
-// and drop the full-width 178 MB staging buffer in favour of a 16-column tile
-// once the LDS fragment path is understood. 0.555 ms at m_tiles=1.
-//
-// Two cases, because the correctness shape and the production shape need
-// different configs:
-//   @yah_ffn_gemm_q6k_case       m_tiles=1    packed fixture, captured reference
-//   @yah_ffn_gemm_q6k_full_case  m_tiles=1088 all-zero weight, output must be 0
-// The all-zero weight is a valid Q6_K block (d = 0) and exercises the full
-// decode path at production size; the fixture case pins the decode arithmetic.
-// The fixture case uses atol/rtol 1e-5 like yah_ffn_gemm_q8_0_f32: the decode is
-// bit-exact against Q6KValue (all 81920 block-row elements), but the f32 MMA
-// accumulator rounds once per 16-wide K step, which leaves a max absolute error
-// of 1.9e-6 at K = 5120. Half the outputs are still exact.
-//
-// Required config (correctness): --config=yah_ffn_gemm_q6k.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_q6k.m_tiles=1088
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_q6k.m_tiles : %value: index where [range(%value, 1, 4096)]

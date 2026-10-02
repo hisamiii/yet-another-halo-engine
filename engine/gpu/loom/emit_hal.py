@@ -3,14 +3,9 @@
 
 usage: emit_hal.py <file.loom> <outdir> <symbol=value> [symbol=value ...]
 
-iree-run-loom can emit a HAL executable (--emit-only --emit-hal-executable) but
-has no --config flag, and iree-benchmark-loom needs a matching check.case
-before it will dispatch. Neither fits a production shape whose case bindings
-are small. So this tool rewrites each `config.get @symbol` to a constant, drops
-the corresponding config.decl, and lets iree-run-loom emit the kernel with no
-dispatch at all. The kernel is therefore built for exactly the given config.
-
-Prints the .hal path, then one line per export from the KERNEL ABI metadata.
+iree-run-loom can emit a HAL executable (--emit-only --emit-hal-executable) but has no --config flag.
+So this tool rewrites each `config.get @symbol` to a constant, drops its config.decl, and lets iree-run-loom emit without a dispatch.
+The kernel is built for exactly the given config. Prints the .hal path.
 """
 import os
 import re
@@ -18,8 +13,7 @@ import subprocess
 import sys
 import tempfile
 
-# YAH_LOOM_HOME selects the HRX/Loom tree whose build compiles the HALs (default
-# /home/q/hrx); an experimental compiler worktree is used by pointing it there.
+# YAH_LOOM_HOME selects the HRX/Loom tree whose build compiles the HALs (default /home/q/hrx).
 H = os.environ.get("YAH_LOOM_HOME", "/home/q/hrx")
 TR = "/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0"
 R = "/home/q/rocm10/x_runtime/opt/rocm/core-10.0/lib"
@@ -80,9 +74,8 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(source))[0]
     rewritten = os.path.join(tempfile.gettempdir(), stem + "_emit.loom")
-    # YAH_LOOM_TARGET selects the compile target: default gfx1151, the Strix Halo
-    # GPU itself (full 1536-VGPR file, granule 24). gfx11-generic models the
-    # 1024-VGPR RDNA3 parts; end to end the two measured the same (2026-09-30).
+    # YAH_LOOM_TARGET selects the compile target: default gfx1151 (1536-VGPR file, granule 24).
+    # gfx11-generic models the 1024-VGPR RDNA3 parts.
     tgt = os.environ.get("YAH_LOOM_TARGET", "gfx1151")
     text = "\n".join(out) + "\n"
     if tgt != "gfx1151":
@@ -98,10 +91,7 @@ def main():
            "--emit-target-artifact=" + target]
     result = subprocess.run(cmd, env=env(), capture_output=True, text=True)
     if result.returncode != 0 or not os.path.exists(hal_path):
-        # Write the WHOLE diagnostic, head first. This used to write
-        # result.stderr[-4000:], which for a 40+ error compile drops the primary
-        # diagnostic and leaves a mid-token fragment -- four rounds were spent
-        # reading the tail symptom (%acc8 undefined) instead of the first error.
+        # write the whole diagnostic: the first error is at the head, and a tail cut drops it
         sys.stderr.write(result.stderr)
         return 1
     print(hal_path)

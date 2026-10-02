@@ -1,30 +1,12 @@
-// YAH DeltaNet alpha/beta prep, Loom port of BatchedDeltaNetPrepAlphaBetaKernel.
-//
-// HIP source: models/qwen/hip/kernels/ssm_row_split.hip. One launch does two
-// unrelated jobs, both gridded over their own extent:
-//
-//   channel c < qkv_size: advance the conv history ring (StoreSSMConvHistory),
-//     reading the four tail values before writing any of them, since the read
-//     index batch+j always exceeds the write index j for batch >= 1.
-//     tail[j] = (batch + j >= 4) ? qkv_in[(batch + j - 4)*qkv_size + c]
-//                                : conv_state[c*4 + batch + j]
-//   token-head i < count = batch*num_heads, h = i % num_heads:
-//     alpha_biased   = alpha_buf[i] + ssm_dt[h]
-//     alpha_softplus = alpha_biased > 20 ? alpha_biased : log1p(exp(alpha_biased))
-//     ab[2i]     = exp(alpha_softplus * ssm_a[h])
-//     ab[2i + 1] = 1 / (1 + exp(-beta_buf[i]))
-//
-// The 20.0 branch is a guard against exp overflow, not an approximation, so it is
-// kept. The port requires alpha_buf, beta_buf, ssm_a and ssm_dt to be present; the
-// HIP kernel folds null pointers to 0.0, -0.05 and 0.0, and those forms are not
-// covered here.
-//
-// The grid covers max(count, qkv_size) by sizing for count + qkv_size, which
-// over-covers both and costs only idle lanes.
-//
-// Required config: --config=yah_deltanet_prep_ab.batch=2
-//                  --config=yah_deltanet_prep_ab.qkv_size=16
-//                  --config=yah_deltanet_prep_ab.num_heads=4
+// DeltaNet prep: one launch does two unrelated jobs, each over its own range of the lane index i.
+//   i < qkv_size: advance the conv history ring of channel c = i.
+//     tail[j] = (batch + j >= 4) ? qkv_in[(batch + j - 4)*qkv_size + c] : conv_state[c*4 + batch + j], j = 0..3
+//     All four ring values are read before any is written: the read slot batch+j is always past the write slot j.
+//   i < count = batch*num_heads, h = i % num_heads: the per-token-head gate (alpha) and beta.
+//     alpha_softplus = (alpha_buf[i] + ssm_dt[h] > 20) ? alpha_buf[i] + ssm_dt[h] : log1p(exp(alpha_buf[i] + ssm_dt[h]))
+//     ab[2i] = exp(alpha_softplus * ssm_a[h]), ab[2i + 1] = 1 / (1 + exp(-beta_buf[i]))
+// The > 20 branch prevents exp overflow; it is not an approximation.
+// Grid: ceil((count + qkv_size) / 256) x 256 lanes; this covers max(count, qkv_size), the extra lanes are idle.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_deltanet_prep_ab.batch : %value: index where [range(%value, 1, 1048576)]
@@ -79,7 +61,7 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
   %i = index.add %wg_base, %lane : index
   %in_channels = index.cmp ult, %i, %qkv_size : index
   scf.if %in_channels {
-    // The whole 4-slot history ring, read once with constant indices.
+    // Read the whole 4-slot ring once, with constant indices.
     %ring_slot = index.mul %i, %c4 : index
     %ring0_off = index.add %ring_slot, %c0 : index
     %ring1_off = index.add %ring_slot, %c1 : index
@@ -105,11 +87,8 @@ kernel.def target(@yah_wave32) @yah_deltanet_prep_ab() {
         %v = view.load %qkv_view[%src] : view<[%qkv_total]xf32> -> f32
         scf.yield %v : f32
       } else {
-        // This branch runs only when batch + j < 4, so the ring slot is one of
-        // the four loaded above. Selecting among them as registers keeps every
-        // memory index static: indexing the state with batch + j instead makes the
-        // footprint analysis bound the index as c*4 + batch + j and declare a
-        // read past the end of the buffer.
+        // Here batch + j < 4, so the slot is one of the four ring values in registers.
+        // Do not index the state with batch + j: the footprint analysis bounds c*4 + batch + j and reports a read past the buffer.
         %ringed = scf.if %is_slot0 -> (f32) {
           scf.yield %ring0 : f32
         } else {

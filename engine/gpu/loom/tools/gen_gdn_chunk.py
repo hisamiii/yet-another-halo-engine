@@ -3,9 +3,8 @@
 
 usage: gen_gdn_chunk.py [out.loom]
 
-Same ABI and math as tools/gen_deltanet_hip.py (yah_deltanet): with
-k_hat = inv_k k and q_hat = q_scale q (yah_deltanet_prep_kq), value head h
-reading key head h mod 16,
+Same ABI and math as tools/gen_deltanet_hip.py (yah_deltanet).
+With k_hat = inv_k k and q_hat = q_scale q (yah_deltanet_prep_kq), and value head h reading key head h mod 16:
 
     S_t = a_t S_{t-1} + b_t (v_t - a_t S_{t-1} k_hat_t) k_hat_t^T,  o_t = S_t q_hat_t
 
@@ -19,16 +18,14 @@ computed per chunk of C = 32 tokens in the WY / UT form (checked against the rec
     O   = diag(2^G) Q S^T + P Vn
     S  <- 2^G_C S + (diag(2^(G_C - G)) Vn)^T K
 
-Matmul inputs are f16 (WMMA, f32 accumulate); the state is carried in f32
-accumulators. f16 inputs cost mean KLD 3e-6 end to end.
+Matmul inputs are f16 (WMMA, f32 accumulate); the state is carried in f32 accumulators.
+f16 inputs cost mean KLD 3e-6 end to end.
 
-Workgroup = (64 value rows, one head): grid (2, num_heads) x 256 (8 waves,
-wave32), like yah_deltanet. Wave w owns state tiles rows 16 (w % 4), keys
-64 (w / 4) .. +63 (4 tiles), and the (token, row) tile (w / 4, w % 4) of
-U, Vn and O. batch must be a multiple of 32.
+Workgroup = (64 value rows, one head): grid (2, num_heads) x 256 threads (8 wave32 waves), like yah_deltanet.
+Wave w owns the state tiles of rows 16 (w % 4) and keys 64 (w / 4) .. +63 (4 tiles),
+and the (token, row) tile (w / 4, w % 4) of U, Vn and O. batch must be a multiple of 32.
 
-WMMA accumulator layout (RDNA3 wave32, 16x16 f32): lane l holds column
-l % 16 and rows 2 i + l / 16, i = 0..7 (interleaved, not contiguous).
+WMMA accumulator layout (RDNA3 wave32, 16x16 f32): lane l holds column l % 16 and rows 2 i + l / 16, i = 0..7 (interleaved).
 """
 import sys
 
@@ -104,7 +101,6 @@ def gen():
     def lay(name, pitch):
         e(f"  %{name}_lay = encoding.layout.strided [1, {pitch}] : encoding<layout>")
         return f"%{name}_lay"
-    # views
     o = region("kr", KR)
     e(f"  %kq_l = buffer.view %pool[{o}] : buffer -> view<64x136xf16>")          # rows 0-31 K (later W), 32-63 Q
     l_ = lay("kr", 136)
@@ -139,7 +135,6 @@ def gen():
     for i, nm in enumerate(("LG", "G2", "BETA", "BG", "GC", "GG")):
         e(f"  %ga{nm} = index.constant {i} : index")
 
-    # ids
     e("  %blk = kernel.workgroup.id<x> : index")
     e("  %h = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
@@ -195,8 +190,8 @@ def gen():
         st.append(f"%si{j}")
     e("  %nchunks = index.div %batch, %c32 : index")
     e("  %lastc = index.sub %nchunks, %c1 : index")
-    # per-thread fetch map: token lt = tid / 8; K/Q dims (tid % 8) * 16 .. +15;
-    # V rows (tid % 8) * 8 .. +7; alpha / beta of token lane (wave 0 uses them)
+    # per-thread fetch map: token lt = tid / 8; K/Q dims (tid % 8) * 16 .. +15; V rows (tid % 8) * 8 .. +7
+    # alpha / beta of token lane (wave 0 uses them)
     e("  %lt = index.div %tid, %c8 : index")
     e("  %seg8 = index.rem %tid, %c8 : index")
     e("  %dseg = index.mul %seg8, %c16 : index")
@@ -287,8 +282,8 @@ def gen():
             e(f"{I}view.store %seh{j}{i}, %s_w[%ser{j}{i}, %sek{j}{i}] : f16, view<64x136xf16>")
     # decay: wave 0, lane = token: G2 = inclusive scan of log2 alpha (one barrier)
     e(f"{I}scf.if %isw0 {{")
-    # alpha can underflow to 0 (exp of a large negative): log2 -> -inf, and
-    # -inf - -inf = NaN in the decay differences. Clamp at 2^-100 (= no carry-over).
+    # alpha can underflow to 0 (exp of a large negative): log2 gives -inf, and -inf - -inf = NaN in the decay differences.
+    # Clamp at 2^-100 (= no carry-over).
     e(f"{I}  %lg0 = scalar.log2f<afn> %alpha : f32")
     e(f"{I}  %lgmin = scalar.constant -100.0 : f32")
     e(f"{I}  %lg = scalar.maxnumf %lg0, %lgmin : f32")
@@ -364,8 +359,8 @@ def gen():
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     # ---- phase 3: T = (I + A)^-1 by forward substitution, wave 0, lane = column
     e(f"{I}scf.if %isw0 {{")
-    # right-looking: once t_j is final, every pending row i > j takes its
-    # -A[i][j] t_j term (independent fmas); column j of A = row j of A^T
+    # right-looking: once t_j is final, every pending row i > j takes its -A[i][j] t_j term (independent fmas)
+    # column j of A = row j of A^T
     accs = []
     for i in range(C):
         e(f"{I}  %ti{i}c = index.constant {i} : index")
@@ -429,8 +424,7 @@ def gen():
         acc = f"%uc{c}"
     uacc = acc
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    # ---- phase 5: X = W S^T, O1 = Q S^T (tile tokens ut0, rows ur0)
-    # O1 next to X, sharing the S fragment loads
+    # ---- phase 5: X = W S^T, O1 = Q S^T (tile tokens ut0, rows ur0); O1 shares the S fragment loads with X
     xa = "%zs"
     e(f"{I}%oq0 = index.add %ut0, %c32 : index")
     oa = "%zs"
@@ -483,7 +477,7 @@ def gen():
         e(f"{I}%ot{i} = index.add %ot{i}3, %ur_row : index")
         e(f"{I}view.store %oe{i}, %out_view[%ot{i}] : f32, view<[%out_total]xf32>")
     # S <- 2^G_C S + Vn'^T K
-    e(f"{I}%gtot = view.load %ga[%gaGC, %c0] : view<6x32xf32> -> f32")   # 2^(G_31 - G_0) / ... see below
+    e(f"{I}%gtot = view.load %ga[%gaGC, %c0] : view<6x32xf32> -> f32")   # 2^(G_31 - G_0)
     e(f"{I}%gg0 = view.load %ga[%gaGG, %c0] : view<6x32xf32> -> f32")
     e(f"{I}%gall = scalar.mulf %gtot, %gg0 : f32")                       # 2^(G_31 - G_0) 2^G_0 = 2^G_31
     e(f"{I}%gall8 = vector.splat %gall : {V8}")

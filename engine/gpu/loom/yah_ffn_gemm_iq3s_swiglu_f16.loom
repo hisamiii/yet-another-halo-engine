@@ -1,26 +1,10 @@
-// YAH FFN GEMM with in-kernel IQ3_S decode and the SwiGLU epilogue, Loom port of
-// HalfPrefillGemmKernel<..., kIQ3_S, kSwiGLU>.
-//
-// HIP source: prefill_fp16.hip. The decoder and K loop are yah_ffn_gemm_iq3s_swiglu_f32;
-// the epilogue combines the accumulator with the separate f32 gate projection:
-//
-//   out[token*m + row] = round_f16(silu(gate[token*m + row]) * acc[row][token])
-//
-// This is the FFN up-projection fallback arm (LaunchBatchedQuantGEMMSwiGLUFp16),
-// taken when TryLaunchBatchedDualQuantGEMMSwiGLUFp16 declines the pair: it only
-// instantiates ten mixed pairs and four same-format pairs, so every other layer
-// of this shard runs this arm. It is on the route.
-//
-// Measured: 17.47 ms at m_tiles=1088 (production 17408 rows). The decoder, K
-// loop and the silu combine are untuned.
-//
-// Correctness case: the same packed fixture, the activation scaled to 64 so the
-// accumulator stays inside the f16 range, gate = 1, and the expected is
-// round_f16(silu(1) * acc). The production-size case uses an all-zero weight, so
-// the accumulator is zero and every output is zero.
-//
-// Required config (correctness): --config=yah_ffn_gemm_iq3s_swiglu_swiglu.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_iq3s_swiglu_swiglu.m_tiles=1088
+// IQ3_S GEMM for the ffn_up arm, f16 output. Weight decode as in yah_ffn_gemm_iq3s_f32.loom.
+// SwiGLU epilogue: out[t*m_rows + row] = f16(silu(gate[t*m_rows + row]) * acc[row][t]), gate is the f32 ffn_gate projection.
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, grid [512] i32, input f16 [tokens][k], gate f32 [tokens][m_rows],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f16 [tokens][m_rows].
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_iq3s_swiglu.m_tiles : %value: index where [range(%value, 1, 4096)]
@@ -119,7 +103,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s_swiglu() {
     %kk_i = index.cast %kk : index to i32
     %kbase = scalar.andi %kk_i, %c255i : i32
     %kblk = scalar.shrui %kk_i, %c8i : i32
-    // Hoist the j-invariant part of the block decode out of the element loop.
+    // The column is lane&15 for every j (j*32 is a multiple of 16): only the row varies in the loop.
     %c_i = scalar.andi %lane_i, %c15i : i32
     %i_i = scalar.addi %kbase, %c_i : i32
     %blk_off0 = scalar.muli %kblk, %c110i : i32
@@ -184,7 +168,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s_swiglu() {
       %sg_idx = index.min %sg_lo, %w_last : index
       %sgb8 = view.load %w_view[%sg_idx] : view<[%w_bytes]xi8> -> i8
       %sgb = scalar.extui %sgb8 : i8 to i32
-      // branch-free nibble select: shift = 4*which
+      // Branch-free nibble select (shift = 4*which): an scf.if on a lane-varying selector splits the wave.
       %sn_sh = scalar.shli %which, %c2i : i32
       %sn_t = scalar.shrui %sgb, %sn_sh : i32
       %sign_nib = scalar.andi %sn_t, %c15i : i32
@@ -192,7 +176,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s_swiglu() {
       %sign_bit = scalar.andi %sbit0, %c1i : i32
       %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
       %neg_g = scalar.subi %c0i, %g_byte : i32
-      // conditional negate without a branch: (x ^ -s) + s
+      // Negate without a branch: (x ^ -s) + s, s = sign bit.
       %neg_one = scalar.subi %c0i, %sign_bit : i32
       %mag0 = scalar.xori %g_byte, %neg_one : i32
       %mag = scalar.addi %mag0, %sign_bit : i32
@@ -202,7 +186,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s_swiglu() {
       %sc_idx = index.min %sc_lo, %w_last : index
       %scb8 = view.load %w_view[%sc_idx] : view<[%w_bytes]xi8> -> i8
       %scb = scalar.extui %scb8 : i8 to i32
-      // branch-free nibble select: shift = 4*odd
+      // Branch-free nibble select: shift = 4*odd.
       %nb_sh = scalar.shli %odd, %c2i : i32
       %nb_t = scalar.shrui %scb, %nb_sh : i32
       %nib = scalar.andi %nb_t, %c15i : i32

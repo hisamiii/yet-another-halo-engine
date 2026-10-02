@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
-"""Generate the FlashAttention-style causal prefill attention (register softmax).
+"""Generate yah_attn_wmma, the FlashAttention-style causal prefill attention (softmax in registers), and yah_transpose_v16.
 
 usage: gen_attn_fa.py [out.loom]
        gen_attn_fa.py vtrans [out.loom]
 
-Kernel yah_attn_wmma. Not HIP's arithmetic order: checked by the T1 numerics
-gate, not md5.
+Not HIP's arithmetic order: checked by the T1 numerics gate, not by md5.
 
-Layout: block = 32 query tokens x 2 query heads of one GQA group (4 query
-blocks of 16), 8 waves: wave w owns query block w/2 and head-dim half w%2.
-  S^T = K Q^T  (K as A: rows keys; Q^T as B: columns queries) over the wave's
-               128 dims, 8 WMMAs; the pair adds partials through a private
-               LDS slot (s = own + partner: f32 add commutes, both waves agree)
-  softmax in registers: lane (q = lane%16, h = lane/16) holds keys 8h..8h+7 of
-               query q (K rows are permuted at staging: LDS row 2i+h holds key
-               8h+i), so the row max is an in-lane max + one xor-16 shuffle
-  P^T as B   : f16(p) of both halves, one xor-16 shuffle of 4 dwords, concat
-  O^T += V^T P^T: V^T as A (rows dims, permuted at staging so element i of
-               lane half h is dim 8h+i: contiguous output per lane), 8 WMMAs
-K is staged one tile ahead; V(i) is loaded at the top of phase A and staged at
-its end. Two barriers per tile (A: QK, S store, stage V / B: stage next K,
-softmax, P.V).
+Bindings: query and gate (f32 [token][6144]), key_cache, value_cache, output (f16 [token][6144]), lse (not read),
+then kscale (quantized K), vstat4 (quantized V) and ptab (paged caches) when those modes are on.
+Grid: (query blocks of 32 tokens, head pairs); 256 threads = 8 waves.
+One workgroup = 32 query tokens x 2 query heads of one GQA group (4 query blocks of 16).
+Wave w owns query block w/2 and head-dim half w%2.
+  S^T = K Q^T: K as A (rows = keys), Q^T as B (columns = queries), 8 WMMAs over the wave's 128 dims.
+               The wave pair adds partials through a private LDS slot (s = own + partner: f32 add commutes, both waves agree).
+  softmax:     lane (q = lane%16, h = lane/16) holds keys 8h..8h+7 of query q.
+               K rows are permuted at staging (LDS row 2i+h holds key 8h+i), so the row max is an in-lane max + one xor-16 shuffle.
+  P^T as B:    f16(p) of both halves, one xor-16 shuffle of 4 dwords, concat.
+  O^T += V^T P^T: V^T as A (rows = dims), permuted at staging so element i of lane half h is dim 8h+i (contiguous output per lane), 8 WMMAs.
+K is staged one tile ahead; V(i) is loaded at the top of phase A and staged at its end.
+Two barriers per tile: A = QK, S store, stage V; B = stage next K, softmax, P.V.
 """
 import os
 import sys
@@ -38,61 +36,51 @@ V4I = "vector<4xi32>"
 MAX_TOKENS = 2048
 # A schedule fence after every QKF QK MMAs caps the K fragments in flight.
 QKF = 2
-# The O rescale is skipped when no row max of the wave grew (FA4 conditional
-# rescale, exact): the skip path yields alpha = 1.0, same bits as always rescaling.
-# Rounding follows HIP wherever it is cheap, so the output stays near the
-# HIP-order golden (T1): p = exp2((s - m) * log2e) instead of one fma, the
-# row sum as HIP groups it per tile (4-key partials, (a + b) + (c + d) across
-# the lane halves, sum = fma(sum, prior, part)) and o / sum by IEEE division.
-# Workgroup order: head pair fastest, so the 3 pairs of a KV head (GQA 6) run
-# side by side on the same K/V tiles (L2 hits), and longest query blocks first (LPT).
+# The O rescale is skipped when no row max of the wave grew (FA4 conditional rescale).
+# The skip path yields alpha = 1.0, so the result has the same bits as always rescaling.
+# Rounding follows HIP where it is cheap, so the output stays near the HIP-order golden (T1):
+# p = exp2((s - m) * log2e) instead of one fma, the row sum grouped as HIP does per tile
+# (4-key partials, (a + b) + (c + d) across the lane halves, sum = fma(sum, prior, part)), and o / sum by IEEE division.
+# Workgroup order: head pair fastest, so the 3 pairs of a KV head (GQA 6) run side by side on the same K/V tiles (L2 hits).
+# Longest query blocks go first (LPT).
 
 # LDS (bytes). The Q stage (prologue only) aliases the rest.
-# Pitches are conflict-free under b128's 8-lane passes (128 B): K rows 528 B,
-# V rows 48 B (32-B rows put lanes r and r+4 on the same banks).
+# Pitches are conflict-free under the 8-lane passes of b128 accesses (128 B): K rows 528 B, V rows 48 B.
+# 32-B V rows put lanes r and r+4 on the same banks.
 KT_PITCH = 264                       # K: 16 keys x 256 dims (+8 pad)
 VT_PITCH = 24                        # V^T: 256 dims x 16 keys (+8 pad)
-# K(i+1) is loaded at the top of phase A and staged in phase B of the same
-# tile: nothing in flight crosses the loop back edge, where the compiler
-# drains vmcnt(0).
+# K(i+1) is loaded at the top of phase A and staged in phase B of the same tile.
+# So nothing in flight crosses the loop back edge, where the compiler drains vmcnt(0).
 K_OFF = 0                            # 16 x 264 x 2
 V_OFF = 16 * 264 * 2
 HPW, QT = 2, 32                      # query heads, query tokens per workgroup
 NQB = HPW * QT // 16                 # query blocks (wave pairs)
 NT = 64 * NQB                        # threads
 KT = 16                              # keys per tile
-# VQ8 (kv8a16, V half): V^T as 255-level bytes per channel per 16-key tile
-# with f16 (S, C') = (256 s, c - 384 s) (yah_vq8); staging builds f16
-# 1 + u/256 (0x3c00 | u << 2) by masks and one packed fma f * S + C', like VQ4.
-# Per-tile ranges stream with chunked prefill (no prompt-wide statistics).
+# VQ8 (V half of kv8a16): V^T as 255-level bytes per channel per 16-key tile, f16 (S, C') = (256 s, c - 384 s) (yah_vq8).
+# Staging builds f16 1 + u/256 (0x3c00 | u << 2) with masks, then one packed fma f * S + C'.
+# Ranges are per tile, so they stream with chunked prefill (no prompt-wide statistics).
 VQ8 = gen_kvq.kv_bits()[1] == 8
-# VQ4 (kv4 configs, V half): V^T 15-level nibbles per channel per 16-key tile
-# with f16 (S, C') = (16 s, c - 23 s) (yah_vq4); staging builds f16 1 + u/16
-# (0x3c00 | u << 6) by masks and one packed fma f * S + C'. P.V stays f16.
+# VQ4 (V half of the kv4 configs): V^T as 15-level nibbles per channel per 16-key tile, f16 (S, C') = (16 s, c - 23 s) (yah_vq4).
+# Staging builds f16 1 + u/16 (0x3c00 | u << 6) with masks, then one packed fma f * S + C'. P.V stays f16.
 VQ4 = gen_kvq.kv_bits()[1] == 4
-# Quantized K (engine/run/kvq/README.md): the K cache is centred by its
-# per-channel prompt mean (yah_kmean) and decoded to f16 while staging; QK^T
-# runs the f16 path with an f16 (unquantized) Q.
-#   K4 (kv4a16): H256 (k - m) as asymmetric int4 per 32-dim
-#     group (yah_kq4), decoded as (1 + u/16) * 16 s + lo - 16 s, one packed fma
-#     per pair; Q is rotated by the same H256 while staging.
-#   K8 (kv8a16): int8 per token half (yah_kq8), decoded as
-#     (1 + u/256) * 256 s - 384 s.
+# Quantized K (engine/run/kvq/README.md): the K cache is centred by its per-channel prompt mean (yah_kmean).
+# Staging decodes it to f16, and QK^T runs the f16 path with an unquantized f16 Q.
+#   K4 (kv4a16): H256 (k - m) as asymmetric int4 per 32-dim group (yah_kq4).
+#     Decoded as (1 + u/16) * 16 s + lo - 16 s, one packed fma per pair; Q is rotated by the same H256 at staging.
+#   K8 (kv8a16): int8 per token half (yah_kq8), decoded as (1 + u/256) * 256 s - 384 s.
 K4 = gen_kvq.kv_bits()[0] == 4
 K8 = gen_kvq.kv_bits()[0] == 8
 KDEC = K4 or K8                       # K decoded to f16 at staging
-# PAGED: the K / V caches are paged in 256-token pages. A page
-# table ptab[logical page] -> physical page renumbers K rows (and K scales):
-# row' = ptab[row / 256] * 256 + row % 256, and V^T tiles (and V stats):
-# tile' = ptab[tile / 16] * 16 + tile % 16 (layouts unchanged). Every 16-key
-# tile lies in one page: one uniform table load per K tile and per V tile.
+# PAGED: the K / V caches are paged in 256-token pages; ptab[logical page] = physical page.
+# K rows (and K scales): row' = ptab[row / 256] * 256 + row % 256.
+# V^T tiles (and V stats): tile' = ptab[tile / 16] * 16 + tile % 16. The layouts do not change.
+# Every 16-key tile lies in one page: one uniform table load per K tile and per V tile.
 # emit_prefill_pp.py clears it when the context is not a multiple of 256.
 PAGED = True
-# Page lookups are scalar (SMEM) loads of the global table; the paging cost is
-# the per-tile index math, not the load (an LDS copy of the table was slower).
-# The host validates every table entry (< npages) before upload, and the
-# cache writers clamp page indices into their pools; an in-kernel clamp here
-# cost +1% attention.
+# Page lookups are scalar (SMEM) loads of the global table; an LDS copy of the table was slower.
+# No in-kernel clamp (it cost 1%): the host validates every entry (< npages) before upload,
+# and the cache writers clamp page indices into their pools.
 assert not (K4 and K8)
 S_OFF = V_OFF + 256 * VT_PITCH * 2   # S partials: 2 planes x NT x 4 f32
 Q_PITCH = 264
@@ -104,10 +92,9 @@ assert POOL <= 65536
 
 
 def had64(e, pre, vecs, xors, scale):
-    """Walsh-Hadamard over this thread's 64 dims (16 vector<4xf32> in dim order:
-    stages 1..32 in-thread) and across threads (lane xor x = qpart bit log2(x):
-    dims 64, 128 apart), times `scale`. Butterfly: lower a + b, upper
-    lower - upper, as yah_kq4 (same orthogonal H on both sides)."""
+    """Walsh-Hadamard times `scale`: stages 1..32 inside this thread's 64 dims (16 vector<4xf32> in dim order),
+    then across threads (lane xor x flips qpart bit log2(x): dims 64, 128 apart).
+    Butterfly as in yah_kq4 (lower = a + b, upper = lower - upper), so both sides use the same orthogonal H."""
     xs = []
     for c in range(16):
         for i in range(4):
@@ -225,8 +212,9 @@ def gen():
     e("  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf32>")
     e("  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
-    if KDEC:   # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
-        # kv8a16: int8 K [token][256 dwords], f16x2 (256 s, -384 s) [token][8]
+    # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
+    # kv8a16: int8 K [token][256 dwords], f16x2 (256 s, -384 s) [token][8]
+    if KDEC:
         e(f"  %kq32tot = index.mul {CAPV}, %c{128 if K4 else 256} : index")
         e(f"  %kstot = index.mul {CAPV}, %c{32 if K4 else 8} : index")
         e("  %k_flat = buffer.view %k_na[%base] : buffer -> view<[%kq32tot]xi32>")
@@ -403,11 +391,9 @@ def gen():
         e(f"  %qfd0{c} = index.add %hd128, %qfd0{c}c : index")
         e(f"  %ql0f{c} = vector.fragment.load<rhs> %q_fr[%qfd0{c}, %wq16] shape [%k, %n] : view<256x{NQB * 16}xf16, %q_lay> -> {V16H}")
         names.append(f"%ql0f{c}")
-    # Loom does not drain these LDS loads before the barrier below (no
-    # lgkmcnt(0) ahead of s_barrier), and the prologue then stages K/V over
-    # the Q stage: a fast wave overwrote Q rows a slow wave was still reading
-    # (a few corrupted query lanes per run, varying). An LDS store of a value
-    # built from both halves of every fragment forces the drain first.
+    # Loom does not drain these LDS loads before the barrier below (no lgkmcnt(0) ahead of s_barrier).
+    # The prologue then stages K/V over the Q stage, so a fast wave can overwrite Q rows a slow wave still reads.
+    # An LDS store of a value built from both halves of every fragment forces the drain first.
     acc = None
     for c in range(8):
         for j in (0, 8):
@@ -425,9 +411,9 @@ def gen():
     for c in range(8):
         e(f"  %qf{c} = vector.fragment<rhs> %ql0f{c} shape [%k, %n] : {V16H}")
 
-    # staging maps. K: item j = tid + 256nn, key = j/32, d8 = (j%32)*8 (one key
-    # row per wave: coalesced global, contiguous LDS); LDS row 2*(key%8) +
-    # key/8. V^T: lane = dim, LDS row (dim/16)*16 + 2*(dim%8) + (dim%16)/8.
+    # Staging maps. K: item j = tid + 256nn, key = j/32, d8 = (j%32)*8, LDS row 2*(key%8) + key/8.
+    # One key row per wave: coalesced global, contiguous LDS.
+    # V^T: lane = dim, LDS row (dim/16)*16 + 2*(dim%8) + (dim%16)/8.
     e("  %vdl = index.rem %vt, %c16 : index")
     e("  %vdb = index.sub %vt, %vdl : index")
     e("  %vdl8 = index.rem %vdl, %c8 : index")
@@ -476,7 +462,7 @@ def gen():
         e("  %kdgm = scalar.constant 1006648320 : i32")      # 0x3c003c00
 
     def page_of(start, p, ind, tag):
-        """physical page of the (uniform) tile start; start already clamped"""
+        """Physical page of the (uniform) tile start; start is already clamped."""
         e(f"{ind}%{p}{tag}lp = index.div {start}, %c256 : index")
         e(f"{ind}%{p}{tag}pg0 = view.load %pt_flat[%{p}{tag}lp] : view<[%npages]xi32> -> i32")
         e(f"{ind}%{p}{tag}pgr = index.cast %{p}{tag}pg0 : i32 to index")
@@ -484,7 +470,7 @@ def gen():
         return f"%{p}{tag}pg"
 
     def phys_row(kc, ks, p, ind, tag):
-        """row kc (clamped, same page as ks's clamp) -> physical row"""
+        """Row kc (clamped, in the same page as the clamped ks) -> physical row."""
         if not PAGED:
             return kc
         e(f"{ind}%{p}{tag}ksc = index.min {ks}, %cap_1 : index")
@@ -495,7 +481,7 @@ def gen():
         return f"%{p}{tag}pr"
 
     def phys_tilestart(vks, p, ind, tag):
-        """V^T tile start vks (multiple of 16) -> physical tile start (keys)"""
+        """V^T tile start vks (a multiple of 16) -> physical tile start (in keys)."""
         if not PAGED:
             return vks
         pg = page_of(vks, p, ind, tag)
@@ -593,7 +579,7 @@ def gen():
                     e(f"{ind}%{p}m{d}{k} = scalar.andi %{p}t{d}{k}, %kdm : i32")
                     e(f"{ind}%{p}g{d}{k} = scalar.ori %{p}m{d}{k}, %kdgm : i32")
                     ws.append(f"%{p}g{d}{k}")
-            # ONE 16-wide fma (see vq4_unpack: two 8-wide ones miscompiled)
+            # ONE 16-wide fma: two 8-wide ones miscompile (see vq4_unpack)
             e(f"{ind}%{p}pk = vector.from_elements {', '.join(ws)} : vector<8xi32>")
             e(f"{ind}%{p}pf = vector.bitcast %{p}pk : vector<8xi32> to {V16H}")
             e(f"{ind}%{p}S16 = vector.splat %{p}sS : {V16H}")
@@ -612,9 +598,8 @@ def gen():
             e(f"{ind}vector.store %{p}sv{nn}, %k_view[%kr{nn}, %kd{nn}] : {V8H}, view<{KT}x{KT_PITCH}xf16>")
 
     def vq8_unpack(cur, p, ind):
-        # bytes (k0, k2, k1, k3) per dword -> f16 1 + u/256 pairs (keys 2k,
-        # 2k+1) via (w << 2, w >> 6) & 0x03fc03fc | 0x3c003c00, then ONE
-        # 16-wide fma f * S + C' (see vq4_unpack)
+        # bytes (k0, k2, k1, k3) per dword -> f16 1 + u/256 pairs (keys 2k, 2k+1) via (w << 2, w >> 6) & 0x03fc03fc | 0x3c003c00
+        # then ONE 16-wide fma f * S + C' (see vq4_unpack)
         e(f"{ind}%{p}vs1 = vector.from_elements {cur[1]} : vector<1xi32>")
         e(f"{ind}%{p}vsv = vector.bitcast %{p}vs1 : vector<1xi32> to vector<2xf16>")
         e(f"{ind}%{p}vss = vector.extract %{p}vsv[0] : vector<2xf16> -> f16")
@@ -658,9 +643,8 @@ def gen():
                 e(f"{ind}%{p}vmk{d}{k} = scalar.andi %{p}vsh{d}{k}, %v4m : i32")
                 e(f"{ind}%{p}vmg{d}{k} = scalar.ori %{p}vmk{d}{k}, %v4g : i32")
                 ws.append(f"%{p}vmg{d}{k}")
-        # ONE 16-wide fma: with two 8-wide fmas Loom CSE'd their identical
-        # addend splats and tied both in-place v_pk_fmac to one register, so
-        # keys 8..15 got f * S + (keys 0..7's result) (micro-test unpk.loom)
+        # ONE 16-wide fma: with two 8-wide fmas Loom CSEs their identical addend splats
+        # and ties both in-place v_pk_fmac to one register, so keys 8..15 get f * S + (the result of keys 0..7).
         e(f"{ind}%{p}vpk = vector.from_elements {', '.join(ws)} : vector<8xi32>")
         e(f"{ind}%{p}vf = vector.bitcast %{p}vpk : vector<8xi32> to vector<16xf16>")
         e(f"{ind}%{p}vss16 = vector.splat %{p}vss : vector<16xf16>")
@@ -711,8 +695,7 @@ def gen():
         e(f"    vector.store %sst1, %s_view[%tid2, %c0] : {V4}, view<{2 * NT}x4xf32>")
         # V(ks): the previous tile's P.V finished at the last barrier
         if VQ8 or VQ4:
-            # keep the uint8 unpack after QK: hoisted between the QK MMAs it
-            # waited for the V load ~4 MMAs after issue
+            # keep the unpack after QK: hoisted between the QK MMAs, it waits for the V load ~4 MMAs after issue
             e("    scf.schedule.fence")
         stage_v(nv, "%c0", "stv", "    ")
         e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
@@ -748,8 +731,7 @@ def gen():
         e("    %tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
         e("    %tmf = scalar.bitcast %tmx : i32 to f32")
         e("    %tmax = scalar.maxnumf %tmax0, %tmf : f32")
-        # one wave-uniform branch: raise the max and rescale O / l only
-        # when some row needs it (FA4 conditional rescale)
+        # one wave-uniform branch: raise the max and rescale O / l only when some row needs it (FA4 conditional rescale)
         e("    %grow = scalar.cmpf ogt, %tmax, %rmax : f32")
         e("    %anygrow = kernel.subgroup.vote.any %grow : i1")
         otypes = ", ".join([V8] * 8 + ["f32", "f32"])
@@ -761,8 +743,7 @@ def gen():
         e(f"      %galpha8 = vector.splat %galpha : {V8}")
         for f in range(8):
             e(f"      %gos{f} = vector.mulf %o{f}, %galpha8 : {V8}")
-        # yields alpha (1.0 when skipped: O * 1.0 and fma(sum, 1.0, part)
-        # are exact, so the skip matches always rescaling bit for bit)
+        # yields alpha; 1.0 when skipped: O * 1.0 and fma(sum, 1.0, part) are exact, so the skip is bit-identical
         e(f"      scf.yield {', '.join(f'%gos{f}' for f in range(8))}, %gmx, %galpha : {otypes}")
         e("    } else {")
         e(f"      scf.yield {', '.join(f'%o{f}' for f in range(8))}, %rmax, %one : {otypes}")
@@ -791,10 +772,9 @@ def gen():
         e("    %pcd = scalar.bitcast %pcdi : i32 to f32")
         e("    %psum = scalar.addf %pab, %pcd : f32")
         e("    %nsum = scalar.fmaf %rsum, %rss, %psum : f32")
-        # P^T as the B operand: keys 0..7 from the h=0 lane, 8..15 from h=1
-        # f16(p) through v_fma_mix (fptrunc(fma(p, 1, 0)) with an opaque 1 and 0):
-        # v_cvt_f16_f32 results must sit in v0..v127, where Q^T and O live, and
-        # each conversion evicted a Q^T fragment to scratch (as Q4FMIX in the GEMMs)
+        # P^T as the B operand: keys 0..7 from the h=0 lane, 8..15 from h=1.
+        # f16(p) as fptrunc(fma(p, 1, 0)) with an opaque 1 and 0, which selects v_fma_mix (as Q4FMIX in the GEMMs).
+        # v_cvt_f16_f32 results must sit in v0..v127, where Q^T and O live: each conversion evicts a Q^T fragment to scratch.
         for i in range(8):
             e(f"    %pe{i} = vector.extract %p[{i}] : {V8} -> f32")
             e(f"    %pm{i} = scalar.fmaf %pe{i}, %one_o, %zero_o : f32")
@@ -826,8 +806,8 @@ def gen():
     e("  %spq1 = index.add %spq, %c1 : index")
     e("  %split0 = index.div %spq1, %c16 : index")
     e("  %split1 = index.mul %split0, %c16 : index")
-    # One masked loop over every tile: two loops (unmasked up to the diagonal,
-    # then masked) corrupted the O accumulators across the hand-off (Loom).
+    # One masked loop over every tile (split = 0, so the unmasked loop runs no iteration).
+    # Two loops (unmasked up to the diagonal, then masked) corrupt the O accumulators across the hand-off (Loom).
     e("  %split = index.min %c0, %max_vis : index")
 
     def loop(lo, hi, init_o, init_m, init_s, tail, res):
@@ -886,10 +866,8 @@ def gen():
 
 
 def gen_vtrans():
-    """yah_transpose_v16: token-major f16 V cache [token][1024] -> V^T blocked
-    [4 kv heads][ceil(capacity/16) tiles][256 dims][16 keys], tokens >=
-    token_count zero.
-    32 x 32 tiles through LDS; grid (1024/32, pitch/32 rounded up)."""
+    """yah_transpose_v16: token-major f16 V cache [token][1024] -> V^T blocked [4 kv heads][ceil(capacity/16) tiles][256 dims][16 keys].
+    Tokens >= token_count are zero. 32 x 32 tiles through LDS; grid (1024/32, pitch/32 rounded up)."""
     L = []
     e = L.append
     e("// GENERATED by tools/gen_attn_fa.py (gen_vtrans) -- edit the generator.")

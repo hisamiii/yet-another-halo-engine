@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
-"""Refuse to launch a Loom check.case whose config declares more operand bytes
-than the case actually binds.
+"""Refuse to launch a Loom check.case whose config declares more operand bytes than the case binds.
 
-Why this exists: on gfx1151 a Loom kernel cannot query its own operand size.
-`buffer.length` has no AMDGPU target-low contract, and a raw buffer carries no
-device-visible length, so every kernel extent comes from `config.*` values. An
-over-declared config therefore produces out-of-bounds global accesses, and this
-GPU does not fail cleanly on those: it faults UTCL2 and wedges the gfx ring
-until the kernel watchdog resets the device. That is how yah_qdq_f32 took the
-box down -- a 1024-element case benchmarked with --config=yah_qdq.blocks=10240,
-a 1.3 MB view over a 4 KB buffer.
+usage: loom_preflight.py <file.loom> <case symbol> <compile-report.json>
 
-The compile report already records the footprint the kernel was told to touch
-(`source_low.memory.roots[].interval_envelope.byte_count`). This script compares
-it positionally against the byte size of the tensors the case binds and exits
-non-zero on an overrun, so the mistake becomes a message instead of a reset.
+On gfx1151 a Loom kernel cannot query its operand size (`buffer.length` has no AMDGPU lowering).
+So every extent comes from config values.
+An over-declared config gives out-of-bounds accesses: they fault UTCL2 and wedge the gfx ring until the watchdog resets it.
+The compile report records the declared footprint (`source_low.memory.roots[].interval_envelope.byte_count`).
+This script compares it by position with the bytes of the tensors the case binds and exits non-zero on an overrun.
 """
 import json, re, sys
 
@@ -68,16 +61,9 @@ def case_bindings(text, case_symbol):
 
 
 def declared_envelopes(report_path, with_names=False):
-    """argument index -> declared envelope bytes (and optionally its root name).
-
-    with_names=True additionally returns {argument: source_root}, the name the
-    compiler recorded for that argument ('weight', 'input', 'wstage', 'ostage',
-    'output', ...). Callers that do NOT know the kernel's parameter order -- e.g.
-    safe_bench, which has to hand hal_bench a role-keyed argv -- must map by that
-    name: the argument order is not uniform across the GEMM family (the IQ
-    grid/signs formats interleave 'grid' and 'ksigns' before 'input'), so keying
-    a derived size table by a fixed driver slot silently swaps input and output
-    for every 5-argument format.
+    """Return {argument index: declared envelope bytes}, or None if the report has no roots.
+    with_names=True also returns {argument: source root name} ('weight', 'input', 'output', ...).
+    Callers that do not know the argument order must map by name: the IQ formats put 'grid' and 'ksigns' before 'input'.
     """
     document = json.load(open(report_path))
     found = []

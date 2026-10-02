@@ -1,64 +1,16 @@
-// YAH FFN GEMM with in-kernel IQ3_S weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kIQ3_S, kStore>.
-//
-// HIP source: prefill_fp16.hip, element decoder DecodeQuantSub16 IQ3_S arm in
-// quant_ops.hpp. The weight stays packed IQ3_S and is decoded inside the K loop.
-//
-//   out[token*m + row] = sum_k iq3s_decode(W, row, k) * f16(A[token][k])
-//
-// block_iq3_s is 110 bytes and holds 256 weights:
-//   half d; uint8 qs[64]; uint8 qh[8]; uint8 signs[32]; uint8 scales[4]
-// Each group of four elements is one entry of a 512-word grid of four packed
-// 4-bit magnitudes, with one sign bit per element and a 4-bit scale per 32.
-// element i of the block is
-//   group = i/32; half = (i/16)%2; j = i%16; q = j/8; which = (j/4)%2; b = j%4
-//   l = 2*half + q
-//   grid_lo = qs[group*8 + 2*l + which]
-//   hi_bit  = (qh[group] >> (2*l + which)) & 1
-//   g_word  = grid[grid_lo | (hi_bit << 8)]
-//   g_byte  = (g_word >> (8*b)) & 0xFF
-//   sign_nib = which == 0 ? signs[group*4+l] & 0xF : signs[group*4+l] >> 4
-//   sign_bit = (sign_nib >> b) & 1
-//   mag = sign_bit ? -g_byte : g_byte
-//   nib = group%2 == 0 ? scales[group/2] & 0xF : scales[group/2] >> 4
-//   value = f32(d) * f32(1 + 2*nib) * f32(mag)
-//
-// THE GRID IS AN OPERAND. The HIP kernel embeds a `__device__ constexpr`
-// 512-word table; Loom has no constant-array literal and the table is not
-// arithmetically derivable, so the port takes the grid as an extra read-only
-// buffer operand (2048 bytes). The sign mask the HIP arm applies word-wise is
-// rebuilt arithmetically per element: sign_byte = 0 - sign_bit (0 or 0xFF) and
-// mag = (g_byte ^ sign_byte) + sign_bit, which is the same carry-free byte
-// negate. This is the first port with an operand the HIP kernel did not have.
-//
-// BLOCK ORDER: block_iq3_s stores d first (offset 0), so the fp16 d view index
-// is blk_off/2. qs, qh, signs and scales start at 2, 66, 74 and 106.
-//
-// Schedule, correctness first and tuning deferred: one workgroup per 16-row
-// tile, one wave. For each K step of 16 the 32 lanes decode the 16x16 weight
-// tile into the wstage global scratch, vector.fragment.load<lhs> reads it back,
-// four 16x16x16 MMAs cover the four N sub-tiles, and the accumulators go through
-// an ostage global scratch to the output with scalar stores so the output index
-// can follow the m_tiles config. Both fragment operands are staged through
-// global memory rather than LDS: a fragment load or store against a
-// buffer.alloca<workgroup> view compiles but does not produce the tile the
-// target reads, and the global form is the one yah_ffn_gemm_f16 validates.
-//
-// Measured: 19.27 ms at m_tiles=1088 (production 17408 rows), against the HIP
-// Q4_K kernel at 1.197 ms and the Q4_K port at 23.31 ms. 0.997 ms at m_tiles=1.
-// The deferred levers are the same as the other format ports, plus the grid:
-// the per-element grid lookup is an extra dependent global load that a shared
-// or LDS-resident table would remove.
-//
-// Two cases, because the correctness shape and the production shape need
-// different configs:
-//   @yah_ffn_gemm_iq3s_case       m_tiles=1    packed fixture, captured reference
-//   @yah_ffn_gemm_iq3s_full_case  m_tiles=1088 all-zero weight, output must be 0
-// The all-zero weight is a valid IQ3_S block (d = 0) and exercises the full
-// decode path at production size; the fixture case pins the decode arithmetic.
-//
-// Required config (correctness): --config=yah_ffn_gemm_iq3s.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_iq3s.m_tiles=1088
+// IQ3_S GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_iq3_s (110 B, 256 weights): half d; u8 qs[64] @2; u8 qh[8] @66; u8 signs[32] @74; u8 scales[4] @106. Element i:
+//   group = i/32, half = (i/16)%2, j = i%16, q = j/8, which = (j/4)%2, b = j%4, l = 2*half + q
+//   g_word = grid[qs[group*8 + 2*l + which] | (((qh[group] >> (2*l + which)) & 1) << 8)]; g_byte = (g_word >> 8*b) & 255
+//   sign_bit = (signs[group*4 + l] >> (4*which + b)) & 1; mag = sign_bit ? -g_byte : g_byte
+//   value = f32(d) * f32(1 + 2*((scales[group/2] >> 4*(group%2)) & 15)) * f32(mag)
+// Loom has no constant arrays, so the 512-word grid is a read-only binding.
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, grid [512] i32, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_iq3s.m_tiles : %value: index where [range(%value, 1, 4096)]
@@ -155,17 +107,13 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
     %kk_i = index.cast %kk : index to i32
     %kbase = scalar.andi %kk_i, %c255i : i32
     %kblk = scalar.shrui %kk_i, %c8i : i32
-    // Two decode mappings, selected by config so the choice is reproducible from
-    // this source rather than from a hand-assembled HAL directory: 0 is the
-    // original one-element-per-lane mapping, 1 is the word mapping that gives one
-    // lane four consecutive columns off a single block read. Both produce the same
-    // 16x16 tile. The condition is a compile-time constant, so one branch folds.
+    // word_decode selects the decode lane map: 0 = one element per lane, 1 = four consecutive columns per lane.
+    // Both write the same 16x16 tile. The condition is a compile-time constant, so one branch folds away.
     %word_decode = config.get @yah_ffn_gemm_iq3s.word_decode : index
     %wd_i = index.cast %word_decode : index to i32
     %wd_old = scalar.cmpi eq, %wd_i, %c0i : i32
     scf.if %wd_old {
-      // Hoist the j-invariant part of the block decode out of the element loop: the
-      // column index is lane&15 (j*32 is a multiple of 16), so only the row varies.
+      // The column is lane&15 for every j (j*32 is a multiple of 16): only the row varies in the loop.
       %c_i = scalar.andi %lane_i, %c15i : i32
       %i_i = scalar.addi %kbase, %c_i : i32
       %blk_off0 = scalar.muli %kblk, %c110i : i32
@@ -227,8 +175,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
         %sg_idx = index.assume %sg_ix [le(%sg_ix, %w_last)] : index
         %sgb8 = view.load %w_view[%sg_idx] : view<[%w_bytes]xi8> -> i8
         %sgb = scalar.extui %sgb8 : i8 to i32
-        // branch-free nibble select: shift = 4*which. The old scf.if forked
-        // the wave on a lane-varying selector.
+        // Branch-free nibble select (shift = 4*which): an scf.if on a lane-varying selector splits the wave.
         %sn_sh = scalar.shli %which, %c2i : i32
         %sn_t = scalar.shrui %sgb, %sn_sh : i32
         %sign_nib = scalar.andi %sn_t, %c15i : i32
@@ -236,7 +183,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
         %sign_bit = scalar.andi %sbit0, %c1i : i32
         %is_neg = scalar.cmpi eq, %sign_bit, %c1i : i32
         %neg_g = scalar.subi %c0i, %g_byte : i32
-        // conditional negate without a branch: (x ^ -s) + s
+        // Negate without a branch: (x ^ -s) + s, s = sign bit.
         %neg_one = scalar.subi %c0i, %sign_bit : i32
         %mag0 = scalar.xori %g_byte, %neg_one : i32
         %mag = scalar.addi %mag0, %sign_bit : i32
@@ -245,7 +192,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
         %sc_idx = index.assume %sc_ix [le(%sc_ix, %w_last)] : index
         %scb8 = view.load %w_view[%sc_idx] : view<[%w_bytes]xi8> -> i8
         %scb = scalar.extui %scb8 : i8 to i32
-        // branch-free nibble select: shift = 4*odd
+        // Branch-free nibble select: shift = 4*odd.
         %nb_sh = scalar.shli %odd, %c2i : i32
         %nb_t = scalar.shrui %scb, %nb_sh : i32
         %nib = scalar.andi %nb_t, %c15i : i32
@@ -268,14 +215,9 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
         scf.yield %mk : index
       }
     } else {
-      // One lane owns a 4-column word: columns cb..cb+3, cb = 4*(lane&3). The four
-      // elements of a word share group/half/l/lw and therefore share the qs byte,
-      // the qh byte, the grid word, the signs byte, the scales nibble and d; they
-      // differ only in the byte selector b = column&3. The old mapping gave each
-      // lane one column, so those six loads and the whole offset chain were redone
-      // four times. Two words per lane cover the 16x16 tile: row = lane>>2 and
-      // (lane>>2)+8, which for a 16-step kbase leaves q/which/l/lw unchanged
-      // between the two words, so only the row offset differs.
+      // A lane owns columns cb..cb+3, cb = 4*(lane&3), in rows lane>>2 and (lane>>2)+8.
+      // The four columns share the qs, qh, signs and scales bytes, the grid word and d; only the byte selector b differs.
+      // The two rows share q, which, l and lw: only the row offset differs.
       %cg = scalar.andi %lane_i, %c3i : i32
       %row0 = scalar.shrui %lane_i, %c2i : i32
       %cb = scalar.shli %cg, %c2i : i32
@@ -284,8 +226,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
       %blk_off0 = scalar.muli %kblk, %c110i : i32
       %i_i = scalar.addi %kbase, %cb : i32
       %group_raw = scalar.shrui %i_i, %c5i : i32
-      // kbase is a multiple of 16 and cb <= 12, so i_i <= 252 and group <= 7; the
-      // mask both states that bound for the envelope analysis and is a no-op.
+      // group <= 7 already (kbase is a multiple of 16, cb <= 12); the mask gives that bound to the envelope analysis.
       %group = scalar.andi %group_raw, %c7i : i32
       %half0 = scalar.shrui %i_i, %c4i : i32
       %half = scalar.andi %half0, %c1i : i32
@@ -335,8 +276,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
         %sg_idx = index.assume %sg_ix [le(%sg_ix, %w_last)] : index
         %sgb8 = view.load %w_view[%sg_idx] : view<[%w_bytes]xi8> -> i8
         %sgb = scalar.extui %sgb8 : i8 to i32
-        // branch-free nibble select: shift = 4*which. The old scf.if forked
-        // the wave on a lane-varying selector.
+        // Branch-free nibble select (shift = 4*which): an scf.if on a lane-varying selector splits the wave.
         %sn_sh = scalar.shli %which, %c2i : i32
         %sn_t = scalar.shrui %sgb, %sn_sh : i32
         %sign_nib = scalar.andi %sn_t, %c15i : i32
@@ -345,7 +285,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_iq3s() {
         %sc_idx = index.assume %sc_ix [le(%sc_ix, %w_last)] : index
         %scb8 = view.load %w_view[%sc_idx] : view<[%w_bytes]xi8> -> i8
         %scb = scalar.extui %scb8 : i8 to i32
-        // branch-free nibble select: shift = 4*odd
+        // Branch-free nibble select: shift = 4*odd.
         %nb_sh = scalar.shli %odd, %c2i : i32
         %nb_t = scalar.shrui %scb, %nb_sh : i32
         %nib = scalar.andi %nb_t, %c15i : i32

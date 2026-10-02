@@ -3,17 +3,16 @@
 
 usage: gen_deltanet_hip.py [out.loom]
 
-The prefill's fallback when the token count is not a multiple of 32 (the
-chunked tools/gen_gdn_chunk.py needs whole chunks); same ABI and grid.
+The prefill's fallback when the token count is not a multiple of 32 (the chunked tools/gen_gdn_chunk.py needs whole chunks).
+Same ABI and grid as the chunked kernel.
+Bindings: conv (f32 [token][qkv_size]), kq (f32 [token][key head][3]: inv_k, q_scale, kq), ab (f32 [token][head][2]: alpha, beta),
+state (f32 [head][128][128], read and written), out (f32 [token][inner_size]).
 
-A port of BatchedDeltaNetRowSplitKernel<float, 16, 2, false, false>, the tile
-the HIP engine runs at pp2048 (ssm_row_split.hip), meant to be bit-identical to
-it: same inputs in, same raw output and final state out. The op sequence is
-taken from its compiled ISA (hipcc -O3, default FP contraction), not from the
-C++ source, because the fused multiply-adds decide the rounding:
+The op order is HIP's (its pp2048 DeltaNet kernel), so the raw output and the final state are bit-identical to the HIP engine.
+The sequence comes from the compiled ISA (hipcc -O3, default FP contraction), not the C++ source: the fused multiply-adds decide the rounding.
 
-  8 lanes per state row, 16 keys per lane (keys 16*seg .. +15), 2 rows per lane
-  (row0 and row0 + 4); 256 lanes = 64 rows per workgroup, grid (2, num_heads).
+  8 lanes per state row, 16 keys per lane (keys 16*seg .. +15), 2 rows per lane (row0 and row0 + WSZ/8).
+  256 lanes = 64 rows per workgroup, grid (2, num_heads).
   per token:   kq_dot = (inv_k * q_scale) * kq            (scalar unit)
   per row:     s    <- s * alpha                           (each element)
                t_g   = fma(s.w,k.w, fma(s.z,k.z, fma(s.x,k.x, s.y*k.y)))
@@ -24,16 +23,14 @@ C++ source, because the fused multiply-adds decide the rounding:
                out   = fma(q_scale, p, d * kq_dot)          (all 8 lanes store it)
                dk    = inv_k * d;  s <- fma(dk, k, s)
 
-IEEE addition is commutative, so the butterfly's operand order (partner +
-own) does not matter; the association does and is kept. The k/q loads depend
-on the lane, so they are vector loads (no SMEM drains).
+IEEE addition is commutative, so the operand order of the butterfly (partner + own) does not matter; the association does and is kept.
+The k/q loads depend on the lane, so they are vector loads (no SMEM drains).
 """
 import sys
 
-# Wave64: each 64-lane wave takes 16 rows (8 lane groups of 8, second row 8
-# below); every row's arithmetic, including the xor-1/2/4 butterfly inside its
-# 8 lanes, is the same as in wave32. Wave64 runs FP32 VALU on both ALU halves
-# without VOPD pairing, and this kernel's v_fma_f32 cannot pair in wave32.
+# Wave64: each wave takes 16 rows (8 lane groups of 8, second row 8 below).
+# The arithmetic of every row, including the xor-1/2/4 butterfly inside its 8 lanes, is the same as in wave32.
+# Wave64 runs FP32 VALU on both ALU halves without VOPD pairing; the v_fma_f32 of this kernel cannot pair in wave32.
 WSZ = 64
 
 V4 = "vector<4xf32>"
@@ -144,10 +141,8 @@ def gen():
     types = ", ".join([V4] * 8)
     ltypes = types + ", " + ", ".join(ptypes)
     res = ", ".join(f"%sf{r}{g}" for r in range(2) for g in range(4)) + ", " + ", ".join(f"%pf_{i}" for i in range(10))
-    # unroll(4) schedule(recurrence): the rolled loop copied the carried state
-    # and the prefetched k/q/v back into place on every backedge (compile
-    # report move_causes branch_edge, 60 v_mov per token against HIP's none);
-    # unrolled, the iterations alternate registers.
+    # Unrolled, the iterations alternate registers.
+    # The rolled loop copies the carried state and the prefetched k/q/v back into place on every backedge (~60 v_mov per token).
     pol = "unroll(%c8) schedule(recurrence)"
     e(f"  {res} = scf.for %t = [%c0 to %batch step %c1]({carried}) -> ({ltypes}) {pol} {{")
     # next token's loads go out first; this token computes on the carried values
@@ -218,9 +213,8 @@ def gen():
         e(f"    %dk{r} = scalar.mulf %inv_k, %d{r} : f32")
         e(f"    %dkv{r} = vector.splat %dk{r} : {V4}")
         for g in range(4):
-            # componentwise, as the dot products already read k: then no
-            # consumer needs the whole k bank and the loop-carried k/q
-            # banks project to registers. Same fmas.
+            # componentwise, as the dot products already read k: no consumer needs the whole k bank,
+            # so the loop-carried k/q banks project to registers. Same fmas.
             cs = []
             for i in range(4):
                 e(f"    %snc{r}{g}{i} = scalar.fmaf %dk{r}, %ke{g}{i}, %se{r}{g}{i} : f32")

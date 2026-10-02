@@ -1,19 +1,13 @@
-// YAH batched fused QK RMSNorm + RoPE + KV write (prefill), Loom port of
-// BatchedFusedQKNormRoPEKvWriteKernel (text/mRoPE-null path).
-//
-// HIP source: models/qwen/hip/kernels/prefill_rope.hip. Grid (heads, batch): block
-// b handles token b, blocks [0, num_heads) rotate Q in place, blocks
-// [num_heads, num_heads+num_kv_heads) rotate K and write both KV caches. The Q/K
-// operands are token-major, so each head base is offset by b times the token width.
-// The math is the decode port (`yah_fused_qk_rope_f32.loom`); only the row base and
-// `cur_pos = start_pos + b` differ.
-//
-// Required config: --config=yah_fused_qk_rope_batched.start_pos=0 --config=yah_fused_qk_rope_batched.batch=1
-//                  --config=yah_fused_qk_rope_batched.layer_idx=0 --config=yah_fused_qk_rope_batched.max_context=1
-//                  --config=yah_fused_qk_rope_batched.num_heads=1 --config=yah_fused_qk_rope_batched.num_kv_heads=1
-//                  --config=yah_fused_qk_rope_batched.head_dim=8 --config=yah_fused_qk_rope_batched.rotary_dim=8
-//                  --config=yah_fused_qk_rope_batched.q_elems=8 --config=yah_fused_qk_rope_batched.kv_elems=8
-//                  --config=yah_fused_qk_rope_batched.cache32_elems=8 --config=yah_fused_qk_rope_batched.cache16_elems=8
+// Prefill Q/K head RMSNorm + NeoX RoPE + KV cache write, for batch tokens at positions cur = start_pos + b.
+// Grid: (num_heads + num_kv_heads, batch) workgroups of 256 lanes; workgroup (h, b) does one head of token b.
+//   h < num_heads: q_out[b][h] = rope(rmsnorm(q[b][h]) * q_weight).
+//   h >= num_heads: k_out[b][kvh] = rope(rmsnorm(k[b][kvh]) * k_weight); K and V rows also go to both caches.
+// RoPE rotates pairs (p, p + rotary_dim/2), p < rotary_dim/2, by cur * theta^(-2p/rotary_dim).
+// Dims past rotary_dim only get the norm.
+// Layouts: q, q_out [batch][num_heads][head_dim], k, v, k_out [batch][num_kv_heads][head_dim] (f32, token-major).
+//   f32 caches: [layer][kv_head][max_context][head_dim]; f16 caches: [layer][cur - cache_start][kv_head][head_dim].
+// eps_buf holds the norm epsilon. Cache offsets are clamped into the declared element counts.
+// emit_prefill_pp.py rope_kpaged() rewrites this source for the paged K pool.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_fused_qk_rope_batched.start_pos : %value: index where [range(%value, 0, 1073741824)]
@@ -41,9 +35,8 @@ config.decl @yah_fused_qk_rope_batched.cache32_elems : %value: index where [rang
 config.decl @yah_fused_qk_rope_batched.cache16_elems : %value: index where [range(%value, 1, 1073741824)]
 
 config.def @yah_fused_qk_rope_batched.theta = 10000000.0 : f32
-// cache_start: first position held by the f16 cache (row cur - cache_start).
-// 0 (default) = the whole context; chunked prefill with a quantized KV cache
-// sets it to the chunk start, so the f16 cache is a one-chunk scratch.
+// cache_start: the first position in the f16 cache (row cur - cache_start).
+// 0 = the whole context; chunked prefill with a quantized KV cache sets the chunk start, so the f16 cache is a one-chunk scratch.
 config.def @yah_fused_qk_rope_batched.cache_start = 0 : index
 
 kernel.def target(@yah_wave32) @yah_fused_qk_rope_batched() {

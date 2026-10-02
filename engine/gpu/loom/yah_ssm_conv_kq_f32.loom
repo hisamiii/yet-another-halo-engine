@@ -1,29 +1,14 @@
-// yah_ssm_conv_kq: yah_ssm_conv with yah_deltanet_prep_kq fused in (bit-identical;
-// see the channel map below). Derived from yah_ssm_conv_f32.loom.
-// YAH causal SSM convolution + gate, Loom port of BatchedSSMConvKernel.
-//
-// HIP source: models/qwen/hip/kernels/ssm_recurrence.hip. One work-item owns one
-// (token, channel) pair of a 4-tap causal convolution over the qkv stream:
-//
-//   w0..w3 = conv_weights[c*4 + 0..3]                (0, 0, 0, 1 when absent)
-//   s3 = x[t][c]
+// yah_ssm_conv with yah_deltanet_prep_kq fused in; both results are bit-identical to the two separate kernels.
+// One lane per (token t, channel c) of a 4-tap causal convolution over the qkv stream, then SiLU:
+//   w0..w3 = conv_weights[c*4 + 0..3]; s3 = x[t][c]
 //   s2 = t >= 1 ? x[t-1][c] : state[c*4 + 3]
 //   s1 = t >= 2 ? x[t-2][c] : (t == 1 ? state[c*4 + 3] : state[c*4 + 2])
-//   s0 = t >= 3 ? x[t-3][c] : (t == 2 ? state[c*4 + 3]
-//                                 : (t == 1 ? state[c*4 + 2] : state[c*4 + 1]))
-//   dot = s0*w0 + s1*w1 + s2*w2 + s3*w3
-//   conv_out[t][c] = dot * sigmoid(dot)
-//
-// The history ring is read-only here; BatchedDeltaNetPrepAlphaBetaKernel advances
-// it. Slot 0 of each channel's four is never read, which is the upstream layout and
-// is preserved. The fallback ladder only differs over the first three tokens, so the
-// fixture is built to make those tokens carry different values.
-//
-// The output is a transcendental, so the expectation is the generated fixture
-// compared with a tolerance rather than byte-exactly. That tolerance is the numeric
-// contract: both sides compute an expf, and their last ulp need not agree.
-//
-// Required config: --config=yah_ssm_conv.batch=4 --config=yah_ssm_conv.qkv_dim=16
+//   s0 = t >= 3 ? x[t-3][c] : (t == 2 ? state[c*4 + 3] : (t == 1 ? state[c*4 + 2] : state[c*4 + 1]))
+//   dot = s0*w0 + s1*w1 + s2*w2 + s3*w3; conv_out[t][c] = dot * sigmoid(dot)
+// The state ring is read only; slot 0 of each channel is never read.
+// Grid: (ceil(qkv_dim / 256), batch) workgroups of 256 lanes; the channel map below assigns channels to workgroups.
+// Bindings: x [batch][qkv_dim],
+//   conv_weights [qkv_dim][4], state [qkv_dim][4], conv_out [batch][qkv_dim], scales [batch][num_key_heads][3], all f32.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_ssm_conv_kq.batch : %value: index where [range(%value, 1, 1048576)]
@@ -62,10 +47,9 @@ kernel.def target(@yah_wave32) @yah_ssm_conv_kq() {
   %t = kernel.workgroup.id<y> : index
   %wg = kernel.workgroup.id<x> : index
   %lane = kernel.workitem.id<x> : index
-  // Channel map: workgroup w < num_key_heads takes key head w's q channels
-  // (lanes 0..127: w*128 + l) and k channels (lanes 128..255: nkh*128 + w*128
-  // + l - 128), so the norms prep_kq computed can be taken here; the rest take
-  // the v channels 256 at a time. Each channel's conv is unchanged.
+  // Channel map: workgroup w < num_key_heads takes the q channels of key head w (lanes 0..127: w*128 + l)
+  // and its k channels (lanes 128..255: nkh*128 + w*128 + l - 128), so it can compute the K/Q norms of that head.
+  // The other workgroups take the v channels, 256 at a time.
   %nkh = config.get @yah_ssm_conv_kq.num_key_heads : index
   %c128 = index.constant 128 : index
   %is_qk = index.cmp ult, %wg, %nkh : index
@@ -178,9 +162,8 @@ kernel.def target(@yah_wave32) @yah_ssm_conv_kq() {
     view.store %result, %out_view[%s3_off] : f32, view<[%x_total]xf32>
     view.store %result, %kq_lds[%lane] : f32, view<256xf32>
   }
-  // yah_deltanet_prep_kq for key head w, token t, op for op on the same f32
-  // values: lane l of wave 0 sums elements 4l..4l+3 in order, then
-  // subgroup.reduce; lane 0 writes inv_k, q_scale, k.q.
+  // yah_deltanet_prep_kq for key head w, token t, with the same f32 ops in the same order:
+  // lane l of wave 0 sums elements 4l..4l+3, then a subgroup add; lane 0 writes inv_k, q_scale, k.q.
   scf.if %is_qk {
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
     %c32 = index.constant 32 : index
@@ -235,4 +218,3 @@ kernel.def target(@yah_wave32) @yah_ssm_conv_kq() {
   kernel.return
 }
 
-// Requires --config=yah_ssm_conv.batch=4 --config=yah_ssm_conv.qkv_dim=16.

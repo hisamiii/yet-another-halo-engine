@@ -1,25 +1,14 @@
-// YAH FFN GEMM with in-kernel Q5_K weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kQ5_K, kStore>.
-//
-// HIP source: prefill_fp16.hip. Identical to yah_ffn_gemm_q4k_f32 except for the
-// packed format. block_q5_K is 176 bytes:
-//
-//   __half d; __half dmin; uint8 scales[12]; uint8 qh[32]; uint8 qs[128]
-//
-// and element i of the 256-wide block is the Q4_K element with a fifth bit from
-// the qh plane:
-//
-//   quant = quant4 + ((qh[lane] >> (2*gg + (low ? 0 : 1))) & 1) * 16   (0..31)
-//   value = f32(d) * sc * quant - f32(dmin) * m
-//
-// The scale/min pair index sis is the same expression as the qh bit index, so the
-// port reuses %sis for the shift. The Q5_K decoder itself is the one
-// yah_dequant_q5k_bf16 validates; the K loop, staging and epilogue are the Q4_K
-// GEMM. The mixed Unsloth dynamic Q4_K shard carries Q5_K tensors, so this is a
-// production format, not a test-only one.
-//
-// Required config (correctness): --config=yah_ffn_gemm_q5k.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_q5k.m_tiles=1088
+// Q5_K GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_q5_K (176 B, 256 weights): half d; half dmin; u8 scales[12]; u8 qh[32]; u8 qs[128].
+// Element i is the Q4_K element with a fifth bit from the qh plane:
+//   q = q4 + ((qh[wv%32] >> (2*gg + (low ? 0 : 1))) & 1) * 16   (0..31); value = f32(d)*sc*q - f32(dmin)*m
+// The qh bit index is the scale/min index sis, so the shift reuses %sis.
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_q5k.m_tiles : %value: index where [range(%value, 1, 4096)]

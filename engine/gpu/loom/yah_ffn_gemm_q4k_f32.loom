@@ -1,49 +1,13 @@
-// YAH FFN GEMM with in-kernel Q4_K weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kQ4_K, kStore>.
-//
-// HIP source: prefill_fp16.hip. This is the production FFN GEMM: the weight
-// tensor stays packed Q4_K and is decoded inside the K loop, which is what
-// DirectGemm instantiates. It is the format-faithful counterpart of
-// yah_ffn_gemm_f16, which loads pre-decoded fp16 weights (the Fp16W ablation).
-//
-//   out[token*m + row] = sum_k q4k_decode(W, row, k) * f16(A[token][k])
-//
-// block_q4_K is 144 bytes and holds 256 weights:
-//   half d; half dmin; uint8 scales[12]; uint8 qs[128]
-// element i of the block is
-//   gg = i/64; wv = i%64; lane = wv%32; low = wv < 32
-//   qb = qs[gg*32+lane]; quant4 = low ? qb & 15 : qb >> 4
-//   (sc, m) = GetQKScaleMin(scales, 2*gg + (low ? 0 : 1))
-//   value = f32(d)*sc*quant4 - f32(dmin)*m
-// The decoder is the yah_dequant_q4k_bf16 body, inlined.
-//
-// Schedule, correctness first and tuning deferred: one workgroup per 16-row
-// tile, one wave. For each K step of 16 the 32 lanes decode the 16x16 weight
-// tile into the wstage global scratch, vector.fragment.load<lhs> reads it back,
-// four 16x16x16 MMAs cover the four N sub-tiles, and the accumulators go through
-// an ostage global scratch to the output with scalar stores so the output index
-// can follow the m_tiles config. Both fragment operands are staged through
-// global memory rather than LDS: a fragment load or store against a
-// buffer.alloca<workgroup> view compiles but does not produce the tile the
-// target reads, and the global form is the one yah_ffn_gemm_f16 validates.
-//
-// Measured: 23.31 ms at m_tiles=1088 (production 17408 rows), against the HIP
-// Q4_K kernel at 1.197 ms. The levers, all deferred: decode a whole 256-wide
-// block once per workgroup and reuse its scale bytes across 16 K steps (HIP
-// reads them once, this port once per step), keep the staged tile in LDS instead
-// of global, and drop the full-width 178 MB staging buffer in favour of a
-// 16-column tile once the LDS fragment path is understood. The staging buffer is
-// the dominant cost here, not the decode arithmetic.
-//
-// Two cases, because the correctness shape and the production shape need
-// different configs:
-//   @yah_ffn_gemm_q4k_case       m_tiles=1    packed fixture, captured reference
-//   @yah_ffn_gemm_q4k_full_case  m_tiles=1088 all-zero weight, output must be 0
-// The all-zero weight is a valid Q4_K block (d=0) and exercises the full decode
-// path at production size; the fixture case pins the decode arithmetic.
-//
-// Required config (correctness): --config=yah_ffn_gemm_q4k.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_q4k.m_tiles=1088
+// Q4_K GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_q4_K (144 B, 256 weights): half d; half dmin; u8 scales[12]; u8 qs[128]. Element i:
+//   gg = i/64, wv = i%64, low = wv < 32; qb = qs[gg*32 + wv%32]; q = low ? qb & 15 : qb >> 4
+//   (sc, m) = get_scale_min_k4(2*gg + (low ? 0 : 1), scales); value = f32(d)*sc*q - f32(dmin)*m
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_q4k.m_tiles : %value: index where [range(%value, 1, 4096)]

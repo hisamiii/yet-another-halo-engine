@@ -1,28 +1,12 @@
-// YAH fused QK RMSNorm + RoPE + KV write (decode), Loom port of
-// FusedQKNormRoPEKvWriteKernel (text/mRoPE-null path).
-//
-// HIP source: models/qwen/hip/kernels/fused.hip. One block per head: blocks
-// [0, num_heads) norm and rotate Q, blocks [num_heads, num_heads+num_kv_heads) do
-// the same for K and also write the canonical f32 and packed f16 KV caches plus V.
-// Per head:
-//
-//   inv_rms = rsqrt(sum_i x[i]^2 / head_dim + eps)
-//   normed[i] = (x[i] * inv_rms) * weight[i]
-//   angle(p) = pos * (1 / theta^(2p/rotary_dim));  cos/sin
-//   out[p]            = normed[p]*cos - normed[p+half_rot]*sin
-//   out[p+half_rot]   = normed[p]*sin + normed[p+half_rot]*cos
-//
-// The HIP kernel stages the normalized row in 256 floats of LDS and runs a shared
-// tree reduction. The port recomputes the normed value at its point of use and uses
-// one `kernel.workgroup.reduce<addf>`, so no LDS is needed. `RopePosition` returns
-// the physical position for the null mRoPE table, so this covers the text path; the
-// position comes from a device i32 and eps from a one-element buffer.
-//
-// Required config: --config=yah_fused_qk_rope.layer_idx=0 --config=yah_fused_qk_rope.max_context=4
-//                  --config=yah_fused_qk_rope.num_heads=1 --config=yah_fused_qk_rope.num_kv_heads=1
-//                  --config=yah_fused_qk_rope.head_dim=8 --config=yah_fused_qk_rope.rotary_dim=8
-//                  --config=yah_fused_qk_rope.q_elems=8 --config=yah_fused_qk_rope.kv_elems=8
-//                  --config=yah_fused_qk_rope.cache32_elems=32 --config=yah_fused_qk_rope.cache16_elems=32
+// Decode Q/K head RMSNorm + NeoX RoPE + KV cache write for one token at position d_pos[0].
+// Grid: num_heads + num_kv_heads workgroups of 256 lanes, one per head.
+// Heads >= num_heads are K heads: they also write K and V to the caches.
+//   inv_rms = rsqrt(sum_i x[i]^2 / head_dim + eps); normed[i] = (x[i] * inv_rms) * weight[i]
+//   angle(p) = pos / theta^(2p/rotary_dim), p < half_rot = rotary_dim/2
+//   out[p] = normed[p]*cos - normed[p+half_rot]*sin; out[p+half_rot] = normed[p]*sin + normed[p+half_rot]*cos
+// The normed value is recomputed where it is used, so the kernel needs no LDS row.
+// Layouts: f32 caches [layer][kv_head][max_context][head_dim]; f16 caches [layer][pos][kv_head][head_dim].
+// d_pos is a device i32 (the cache row is clamped to max_context - 1); eps_buf holds the norm epsilon.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_fused_qk_rope.layer_idx : %value: index where [range(%value, 0, 65536)]

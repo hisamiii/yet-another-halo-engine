@@ -1,57 +1,16 @@
-// YAH FFN GEMM with in-kernel Q3_K weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kQ3_K, kStore>.
-//
-// HIP source: prefill_fp16.hip, element decoder DecodeQuantSub16 Q3_K arm in
-// quant_ops.hpp. The weight stays packed Q3_K and is decoded inside the K loop.
-//
-//   out[token*m + row] = sum_k q3k_decode(W, row, k) * f16(A[token][k])
-//
-// block_q3_K is 110 bytes and holds 256 weights:
-//   uint8 hmask[32]; uint8 qs[64]; uint8 scales[12]; half d
-// element i of the block is
-//   group = i/32; half = group/4; sp = group%4; h16 = (i%32)/16; j = i%16
-//   low   = (qs[half*32 + h16*16 + j] >> (2*sp)) & 3
-//   bit   = (hmask[h16*16 + j] >> (half*4 + sp)) & 1
-//   quant = (low | (bit << 2)) - 4                     in [-4, 3]
-//   si = half*8 + sp*2 + h16
-//   low4  = si < 8 ? scales[si] & 0xF : (scales[si-8] >> 4) & 0xF
-//   high2 = (scales[8 + si%4] >> (2*(si/4))) & 3
-//   scale = (low4 | (high2 << 4)) - 32                 6-bit biased, signed
-//   value = f32(d) * f32(scale) * f32(quant)
-// The qs and hmask loads share the same lane, so both byte indices fall out of
-// one lane expression with two base offsets (qs at 32, hmask at 0); the packed
-// 12-byte scale array needs no index.div because si is 0..15 and both the
-// packed-byte (si&7) and high-byte (si&3) selectors are power-of-two masks.
-//
-// BLOCK ORDER: block_q3_K stores d last (offset 108), so the fp16 d view index
-// is blk_off/2 + 54. hmask, qs and scales start at 0, 32 and 96.
-//
-// Schedule, correctness first and tuning deferred: one workgroup per 16-row
-// tile, one wave. For each K step of 16 the 32 lanes decode the 16x16 weight
-// tile into the wstage global scratch, vector.fragment.load<lhs> reads it back,
-// four 16x16x16 MMAs cover the four N sub-tiles, and the accumulators go through
-// an ostage global scratch to the output with scalar stores so the output index
-// can follow the m_tiles config. Both fragment operands are staged through
-// global memory rather than LDS: a fragment load or store against a
-// buffer.alloca<workgroup> view compiles but does not produce the tile the
-// target reads, and the global form is the one yah_ffn_gemm_f16 validates.
-//
-// Measured: 18.01 ms at m_tiles=1088 (production 17408 rows), against the HIP
-// Q4_K kernel at 1.197 ms and the Q4_K port at 23.31 ms. 0.5275 ms at
-// m_tiles=1. The levers are the same three deferred ones as the other format
-// ports: decode a whole 256-wide block per workgroup and reuse its scale bytes
-// across 16 K steps, stage the tile in LDS, and drop the full-width staging
-// buffer.
-//
-// Two cases, because the correctness shape and the production shape need
-// different configs:
-//   @yah_ffn_gemm_q3k_case       m_tiles=1    packed fixture, captured reference
-//   @yah_ffn_gemm_q3k_full_case  m_tiles=1088 all-zero weight, output must be 0
-// The all-zero weight is a valid Q3_K block (d = 0) and exercises the full
-// decode path at production size; the fixture case pins the decode arithmetic.
-//
-// Required config (correctness): --config=yah_ffn_gemm_q3k.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_q3k.m_tiles=1088
+// Q3_K GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_q3_K (110 B, 256 weights): u8 hmask[32]; u8 qs[64]; u8 scales[12]; half d @108. Element i:
+//   group = i/32, half = group/4, sp = group%4, h16 = (i%32)/16, j = i%16
+//   low = (qs[half*32 + h16*16 + j] >> (2*sp)) & 3; bit = (hmask[h16*16 + j] >> (half*4 + sp)) & 1
+//   quant = (low | (bit << 2)) - 4   (-4..3)
+//   si = half*8 + sp*2 + h16; low4 = si < 8 ? scales[si] & 15 : scales[si-8] >> 4; high2 = (scales[8 + si%4] >> (2*(si/4))) & 3
+//   value = f32(d) * f32((low4 | (high2 << 4)) - 32) * f32(quant)
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_q3k.m_tiles : %value: index where [range(%value, 1, 4096)]

@@ -1,48 +1,13 @@
-// YAH FFN GEMM with in-kernel IQ4_NL weight decode, Loom port of
-// HalfPrefillGemmKernel<..., kIQ4_NL, kStore>.
-//
-// HIP source: prefill_fp16.hip, element decoder DecodeQuantSub16 IQ4_NL arm in
-// quant_ops.hpp. The weight stays packed IQ4_NL and is decoded inside the K loop.
-//
-//   out[token*m + row] = sum_k iq4nl_decode(W, row, k) * f16(A[token][k])
-//
-// block_iq4_nl is 18 bytes with QK=32: half d; uint8 qs[16]. Each qs byte holds
-// two nibbles; the low nibble is element local and the high nibble is local+16,
-// and each nibble indexes the 16-entry non-linear IQ4 codebook, so the element
-// is simply
-//   local = i % 32; qs_byte = qs[local % 16]
-//   nib = (qs_byte >> (4 * (local/16))) & 0xF
-//   value = f32(d) * kValuesIq4Nl[nib]
-// The codebook select is the same four-level scf.if tree as
-// yah_ffn_gemm_iq4xs_f32; both use DecodeQuantSub16 and the same 16 constants.
-//
-// BLOCK ORDER: block_iq4_nl stores d first (offset 0); qs starts at 2. The row
-// stride is 160 blocks * 18 = 2880 bytes and the per-K-step block index is
-// kk >> 5 because QK = 32, not 256 like the K-quants.
-//
-// Schedule, correctness first and tuning deferred: one workgroup per 16-row
-// tile, one wave. For each K step of 16 the 32 lanes decode the 16x16 weight
-// tile into the wstage global scratch, vector.fragment.load<lhs> reads it back,
-// four 16x16x16 MMAs cover the four N sub-tiles, and the accumulators go through
-// an ostage global scratch to the output with scalar stores so the output index
-// can follow the m_tiles config. Both fragment operands are staged through
-// global memory rather than LDS: a fragment load or store against a
-// buffer.alloca<workgroup> view compiles but does not produce the tile the
-// target reads, and the global form is the one yah_ffn_gemm_f16 validates.
-//
-// Measured: 13.86 ms at m_tiles=1088 (production 17408 rows), against the HIP
-// Q4_K kernel at 1.197 ms and the Q4_K port at 23.31 ms. 0.686 ms at m_tiles=1.
-// The deferred levers are the same three as the other format ports.
-//
-// Two cases, because the correctness shape and the production shape need
-// different configs:
-//   @yah_ffn_gemm_iq4nl_case       m_tiles=1    packed fixture, captured reference
-//   @yah_ffn_gemm_iq4nl_full_case  m_tiles=1088 all-zero weight, output must be 0
-// The all-zero weight is a valid IQ4_NL block (d = 0) and exercises the full
-// decode path at production size; the fixture case pins the decode arithmetic.
-//
-// Required config (correctness): --config=yah_ffn_gemm_iq4nl.m_tiles=1
-// Required config (benchmark):   --config=yah_ffn_gemm_iq4nl.m_tiles=1088
+// IQ4_NL GEMM, f32 output: out[t*m_rows + row] = sum_k dequant(W)[row][k] * A[t][k]; the packed weight is decoded in the K loop.
+// block_iq4_nl (18 B, 32 weights): half d; u8 qs[16]. Element e:
+//   l = e%32; nib = (qs[l%16] >> (4*(l/16))) & 15; value = f32(d) * kvalues_iq4nl[nib]
+// k_blocks counts 32-element blocks: the block of K step kk is kk >> 5.
+// emit_prefill_pp.py uses this kernel only when tools/gen_gemm_shared.py cannot emit the shape.
+// Grid: (m_tiles, token_tiles) workgroups of one wave32; a workgroup computes 16 rows x 64 tokens.
+// Each K step of 16: the lanes decode the 16x16 weight tile into LDS, then four 16x16x16 MMAs cover the 64 tokens.
+// Bindings: weight [m_rows][k_blocks] blocks, input f16 [tokens][k],
+//   wstage (not used), ostage f32 [m_rows][tokens] scratch, output f32 [tokens][m_rows].
+// The accumulators go through ostage, then scalar stores write the token-major output.
 amdgpu.target<gfx1151> @yah_gemm_wave32 {subgroup_size = 32}
 
 config.decl @yah_ffn_gemm_iq4nl.m_tiles : %value: index where [range(%value, 1, 4096)]

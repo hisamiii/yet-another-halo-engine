@@ -1,39 +1,35 @@
 #!/usr/bin/env python3
 """Generate the KV-cache quantizers for the quantized attention configs.
 
-usage: gen_kvq.py kmean|kq8 [out.loom]
+usage: gen_kvq.py kmean|kq8|kq4|vq8|vq4|vtpage [out.loom]
 
-yah_kmean: per-channel mean of this layer's f16 K over the prompt tokens,
-  m[kv_head * 256 + d] (f32). Subtracting any per-channel constant from K
-  shifts every score of a query row by the same q . m, so softmax is unchanged
-  (exact); the mean centres K before quantization (SageAttention's smoothing:
-  K's outlier channels are mostly a per-channel offset). Deterministic: one
-  workgroup per KV head, 32 column chunks x 8 row groups, fixed-order LDS sum.
-  grid (4, 1, 1) x 256.
+yah_kmean: per-channel mean of the f16 K of this layer over the prompt tokens, m[kv_head * 256 + d] (f32).
+  Subtracting a per-channel constant from K shifts every score of a query row by the same q . m: softmax is unchanged (exact).
+  The mean centres K before quantization (SageAttention smoothing: the outlier channels of K are mostly a per-channel offset).
+  Deterministic: one workgroup per KV head, 32 column chunks x 8 row groups, fixed-order LDS sum. grid (4, 1, 1) x 256.
 
-yah_kq8: int8 K with one scale per (token, kv head, 128-dim half), the split
-  the attention's wave pairs use: k8 = rne((k - m) / s), s = amax / 127
-  (amax 0 -> s = 1). Output kq8[token][256 dwords] (bytes u = k8 + 128 in an
-  f16-decode order, see gen_kq8), ks[token][8] = f16x2 (256 s, -384 s), index
-  head * 2 + half. 16 lanes per half, 8 dims per lane, amax by xor
-  shuffles. grid (ceil(cap / 2), 1, 1) x 256 (two tokens per workgroup);
-  tokens >= token_count are written as zeros.
+yah_kq8: int8 K with one scale per (token, kv head, 128-dim half), the split the wave pairs of the attention use.
+  k8 = rne((k - m) / s), s = amax / 127 (amax 0 -> s = 1).
+  Output kq8[token][256 dwords] (bytes u = k8 + 128 in an f16-decode order, see gen_kq8), ks[token][head * 2 + half] = f16x2 (256 s, -384 s).
+  16 lanes per half, 8 dims per lane, amax by xor shuffles. grid (ceil(cap / 2), 1, 1) x 256 (two tokens per workgroup).
+  Tokens >= token_count are written as zeros.
+
+yah_kq4, yah_vq4 / yah_vq8 and yah_vtpage: see gen_kq4, gen_vqt and gen_vtpage.
 """
 import os
 import re
 import sys
 
-# PAGED: the caches are paged (256-token pages, gen_attn_fa PAGED).
-# Writers read the chunk's token_count rows of the f16 scratch and write
-# physical row ptab[t / 256] * 256 + t % 256 (t = start_pos + local) of a
-# pool of pool_rows rows (V^T tiles: ptab[tile / 16] * 16 + tile % 16).
+# PAGED: the caches are paged in 256-token pages (as gen_attn_fa PAGED).
+# Writers read the token_count rows of the chunk from the f16 scratch and write physical row ptab[t / 256] * 256 + t % 256
+# (t = start_pos + local) of a pool of pool_rows rows. V^T tiles go to ptab[tile / 16] * 16 + tile % 16.
 # emit_prefill_pp.py clears it when the context is not a multiple of 256.
 PAGED = True
 
 
 def kv_bits():
-    """(K bits, V bits) of the KV cache from YAH_KV: unset or "fp16" -> (16, 16); "kv8" / "kv4" -> both
-    quantized; or explicit parts, e.g. "k8v4", "k4", "v8" (an absent part stays fp16)."""
+    """(K bits, V bits) of the KV cache from YAH_KV: unset or "fp16" -> (16, 16); "kv8" / "kv4" -> both quantized.
+    Explicit parts also work, e.g. "k8v4", "k4", "v8" (an absent part stays fp16)."""
     v = os.environ.get("YAH_KV", "fp16")
     v = {"fp16": "", "kv8": "k8v8", "kv4": "k4v4"}.get(v, v)
     m = re.fullmatch(r"(?:k([48]))?(?:v([48]))?", v)
@@ -60,7 +56,7 @@ def page_setup(e):
 
 
 def page_row(e, tok, out):
-    """physical pool row of chunk-local token `tok` (needs page_setup)"""
+    """Physical pool row of chunk-local token `tok` (needs page_setup)."""
     e(f"  %{out}l = index.add %start, {tok} : index")
     e(f"  %{out}lp = index.div %{out}l, %c256g : index")
     e(f"  %{out}g0 = view.load %pt_flat[%{out}lp] : view<[%npages]xi32> -> i32")
@@ -74,7 +70,7 @@ def page_row(e, tok, out):
 
 
 def paged_quantizer(text, rows_per_tok, scales_per_tok):
-    """yah_kq8 / yah_kq4 -> paged form: destination rows remapped, pool-sized views"""
+    """Rewrite yah_kq8 / yah_kq4 text to the paged form: destination rows remapped, pool-sized views."""
     t = text.replace("config.decl @yah_kvq.cache_capacity", PAGE_DECLS + "\nconfig.decl @yah_kvq.cache_capacity", 1)
     t = t.replace("launch(%src: buffer, %mean: buffer, %dst: buffer, %scale: buffer) {",
                   "launch(%src: buffer, %mean: buffer, %dst: buffer, %scale: buffer, %ptab: buffer) {", 1)
@@ -161,11 +157,9 @@ def gen_kmean():
 
 
 def gen_kq8():
-    """yah_kq8 (kv8a16, K decoded to f16 at staging; see the module doc for
-    the scale split): bytes u = q + 128 in the order d0, d2, d1, d3 per dword,
-    so ((w << 2), (w >> 6)) & 0x03fc03fc | 0x3c003c00 are the f16 pairs
-    1 + u/256 in dim order; ks[token][8] = f16x2 (256 s, -384 s), so one fused
-    fma gives s q = (1 + u/256) 256 s - 384 s."""
+    """yah_kq8 (kv8a16; scale split in the module doc). Bytes u = q + 128 in the order d0, d2, d1, d3 per dword,
+    so ((w << 2), (w >> 6)) & 0x03fc03fc | 0x3c003c00 are the f16 pairs 1 + u/256 in dim order.
+    ks[token][8] = f16x2 (256 s, -384 s), so one fma at staging gives s q = (1 + u/256) 256 s - 384 s."""
     L = []
     e = L.append
     e("// GENERATED by tools/gen_kvq.py (kq8) -- edit the generator.")
@@ -285,15 +279,12 @@ def gen_kq8():
 
 
 def gen_kq4():
-    """yah_kq4 (kv4a16, engine/run/kvq/README.md): H256 (k - m), the
-    orthonormal Walsh-Hadamard transform of the whole head (the attention
-    rotates Q the same way, so q.k is unchanged), quantized asymmetrically to
-    16 levels with one min/max range per 32-dim group. Codes u: dims 2j / 2j+1
-    of each 8 at bits 4j / 16 + 4j of the lane's dword (so (w << 6, w << 2,
-    w >> 2, w >> 6) & 0x03c003c0 | 0x3c003c00 are the f16 pairs 1 + u/16 in dim
-    order); kq4[token][128 dwords] (lane = head*32 + half*16 + 8-dim chunk);
-    ks[token][32] = f16x2 (16 s, lo - 16 s) per group (head*8 + group): the
-    attention decodes k = (1 + u/16) * 16 s + lo - 16 s with one fma."""
+    """yah_kq4 (kv4a16, engine/run/kvq/README.md): H256 (k - m), the orthonormal Walsh-Hadamard transform of the whole head.
+    The attention rotates Q the same way, so q.k is unchanged. Quantized asymmetrically to 16 levels, one min/max range per 32-dim group.
+    Codes u: dims 2j / 2j+1 of each 8 at bits 4j / 16 + 4j of the lane's dword,
+    so (w << 6, w << 2, w >> 2, w >> 6) & 0x03c003c0 | 0x3c003c00 are the f16 pairs 1 + u/16 in dim order.
+    kq4[token][128 dwords] (lane = head*32 + half*16 + 8-dim chunk); ks[token][head*8 + group] = f16x2 (16 s, lo - 16 s).
+    The attention decodes k = (1 + u/16) * 16 s + lo - 16 s with one fma."""
     L = []
     e = L.append
     e("// GENERATED by tools/gen_kvq.py (kq4) -- edit the generator.")
@@ -383,8 +374,7 @@ def gen_kq4():
 
 
 def gen_kq4_asym(e):
-    """quantize %xr (this lane's 8 rotated dims) asymmetrically, one range per
-    32-dim group (4 lanes: xor 1, 2); see gen_kq4."""
+    """Quantize %xr (the 8 rotated dims of this lane) asymmetrically, one range per 32-dim group (4 lanes: xor 1, 2); see gen_kq4."""
     red = (1, 2)
     e("  %zero = scalar.constant 0.0 : f32")
     e("  %one = scalar.constant 1.0 : f32")
@@ -475,23 +465,18 @@ def gen_vq8():
 
 
 def gen_vqt(bits):
-    """yah_vq4 / yah_vq8: V^T quantized per channel per 16-token tile around
-    the tile's midrange c with step s (per-channel per-tile range: attention
-    error 3.5e-2 -> 2.1e-2 vs per-channel over the prompt at 4 bits).
-      4 bits: u = rne((v - c) / s) + 7 in [0, 14], s = range / 14; in each of
-        the lane's 2 dwords nibble p holds key 2p (p < 4) or 2(p - 4) + 1, so
-        (w >> 4k ...) & 0x03c003c0 | 0x3c003c00 are f16 1 + u/16 for keys 2k,
-        2k + 1; stats (S, C') = (16 s, c - 23 s).
-      8 bits: u = rne((v - c) / s) + 128 in [1, 255], s = range / 254; each of
-        the lane's 4 dwords holds keys (k0, k2, k1, k3) of its 4, so (w << 2,
-        w >> 6) & 0x03fc03fc | 0x3c003c00 are f16 1 + u/256 for keys (k0, k1),
-        (k2, k3); stats (S, C') = (256 s, c - 384 s).
-    Either way the attention dequantizes with one fma f * S + C' while staging.
-    Output [kv head][tile][256 dims] x (2 or 4) dwords, stats [kv head][tile][256]
-    f16 pairs. Chunked prefill: src is the chunk's token_count rows of f16 V
-    (a slice of the cache), written at tiles start_pos / 16 + tile of a cache of
-    cache_capacity tokens. Tokens past token_count repeat the last one (keys
-    the softmax masks). grid (4, ceil(token_count / 16)) x 256 (lane = dim)."""
+    """yah_vq4 / yah_vq8: V^T quantized per channel per 16-token tile around the midrange c of the tile with step s.
+    A per-tile range (not one over the prompt) cuts the 4-bit attention error from 3.5e-2 to 2.1e-2.
+      4 bits: u = rne((v - c) / s) + 7 in [0, 14], s = range / 14; stats (S, C') = (16 s, c - 23 s).
+        In each of the 2 dwords of a lane, nibble p holds key 2p (p < 4) or 2(p - 4) + 1,
+        so (w >> 4k ...) & 0x03c003c0 | 0x3c003c00 are f16 1 + u/16 for keys 2k, 2k + 1.
+      8 bits: u = rne((v - c) / s) + 128 in [1, 255], s = range / 254; stats (S, C') = (256 s, c - 384 s).
+        Each of the 4 dwords of a lane holds keys (k0, k2, k1, k3) of its 4,
+        so (w << 2, w >> 6) & 0x03fc03fc | 0x3c003c00 are f16 1 + u/256 for keys (k0, k1), (k2, k3).
+    The attention dequantizes with one fma f * S + C' while staging.
+    Output [kv head][tile][256 dims] x (2 or 4) dwords; stats [kv head][tile][256] f16 pairs.
+    src is the token_count rows of f16 V of the chunk, written at tiles start_pos / 16 + tile of a cache of cache_capacity tokens.
+    Tokens past token_count repeat the last one (keys the softmax masks). grid (4, ceil(token_count / 16)) x 256 (lane = dim)."""
     nw = 2 if bits == 4 else 4
     lv = 14 if bits == 4 else 254              # range / s
     off = 7 if bits == 4 else 128              # u offset
@@ -665,11 +650,9 @@ def main():
 
 
 def gen_vtpage():
-    """yah_vtpage (paged fp16 V^T): the chunk's token_count f16 V rows (scratch)
-    -> V^T tiles [kv head][pool tiles][256 dims][16 keys] of the paged pool
-    (pool tiles = pool_rows / 16), physical tile ptab[tile / 16] * 16 + tile % 16
-    for logical tile (start_pos + local) / 16. 32 x 32 tiles through LDS (as
-    yah_transpose_v16); grid (1024 / 32, ceil(token_count / 32))."""
+    """yah_vtpage (paged fp16 V^T): the token_count f16 V rows of the chunk (scratch) -> V^T tiles of the paged pool.
+    Pool layout [kv head][pool_rows / 16 tiles][256 dims][16 keys]; logical tile (start_pos + local) / 16 goes to ptab[tile / 16] * 16 + tile % 16.
+    32 x 32 tiles through LDS (as yah_transpose_v16); grid (1024 / 32, ceil(token_count / 32))."""
     L = []
     e = L.append
     e("// GENERATED by tools/gen_kvq.py (vtpage) -- edit the generator.")
