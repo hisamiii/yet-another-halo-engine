@@ -156,6 +156,8 @@ Prefill GEMMs:
 - Widening the token tile of unchained GEMMs: wrong forward (argmax 220 vs 11751); cause not found.
 - int4 (iu4) GEMMs: need 4-bit activations (4-11% error without rotation) and cannot hold the IQ4_XS codebook. int8: per-32 scales cost ~4 VALU per WMMA, break-even at best.
 - Load cache hints: Loom's gfx11 encoding drops them; the ISA is byte-identical.
+- Activation (B) fragments straight from global memory instead of the LDS activation tile: GEMM cycles +48% (every format +30..87%), bit-identical. A fragment is 16 scattered 32-byte reads (token rows 10 KB apart) instead of one coalesced row load shared through LDS, 64-bit address math adds 8-20% VALU, and the load latency sits inside the barrier-synchronized K loop. The L1-resident `global_load` microbenchmark (2.5 cycles) does not transfer.
+- Decoding weights straight into the WMMA operand registers (no LDS weight tile): not built; each weight would be decoded by both token-waves and every 16-row fragment per wave, ~4x the decode instructions per WMMA, which outweighs the ~1.3 cycles/WMMA of LDS traffic it saves.
 - Hoisting the LDS fragment row offset out of the K loop (per-wave views): no change. The 4 `v_mul_lo_u32` per phase are the fragment loads' per-lane addresses (lane row x 144-byte padded row), generated inside the compiler: no LICM, and quarter-rate `v_mul_lo_u32` instead of a 24-bit multiply. Compiler-side, like the zero-init `v_mov` before each `v_fma_mix` pair (~0.5 per WMMA) and the carried-register copies (Q3_K / Q5_K / Q4_K latches, IQ4_XS decode-ahead operands); together <= 3-4% of GEMM cycles.
 
 Prefill attention, DeltaNet and pipeline:
