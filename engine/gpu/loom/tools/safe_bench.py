@@ -31,12 +31,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import loom_preflight as lp  # noqa: E402
 
-H = "/home/q/hrx"
-TR = "/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0"
-R = "/home/q/rocm10/x_runtime/opt/rocm/core-10.0/lib"
-LLVM_LIB = "/home/q/rocm10/x_llvm/opt/rocm/core-10.0/lib/llvm/lib"
-SYSDEPS = "/home/q/rocm10/x_sysdeps/opt/rocm/core-10.0/lib/rocm_sysdeps/lib"
-COMPILE = H + "/build/cmake/loom/src/loom/tools/loom-compile/loom-compile"
+sys.path.insert(0, os.path.dirname(HERE))
+import hrx_paths  # noqa: E402
+
+COMPILE = hrx_paths.LOOM_COMPILE
 SCRATCH_MIN = 64 << 20
 HAL_BENCH = os.environ.get("SAFE_BENCH_BIN", os.path.join(HERE, "..", "..", "..", "build", "hal_bench"))
 # argument order of each GEMM-family variant, by argument count
@@ -48,12 +46,7 @@ ROLE_ORDERS = {
 
 
 def env():
-    e = dict(os.environ)
-    e["IREE_HAL_AMDGPU_LIBHSA_PATH"] = R
-    e["LD_LIBRARY_PATH"] = ":".join([
-        TR + "/lib", H + "/libhrx/src/binding/hip", H + "/libhrx/src/libhrx",
-        R, LLVM_LIB, SYSDEPS, "/opt/rocm/lib"])
-    return e
+    return hrx_paths.env()
 
 
 def dispatch_geometry(hal):

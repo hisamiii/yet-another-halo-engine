@@ -8,3 +8,4 @@ notes/
 # Build output and emitted HAL sets.
 engine/build/
 engine/hal/
+external/

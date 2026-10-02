@@ -13,21 +13,8 @@ import subprocess
 import sys
 import tempfile
 
-# YAH_LOOM_HOME selects the HRX/Loom tree whose build compiles the HALs (default /home/q/hrx).
-H = os.environ.get("YAH_LOOM_HOME", "/home/q/hrx")
-TR = "/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0"
-R = "/home/q/rocm10/x_runtime/opt/rocm/core-10.0/lib"
-LLVM_LIB = "/home/q/rocm10/x_llvm/opt/rocm/core-10.0/lib/llvm/lib"
-SYSDEPS = "/home/q/rocm10/x_sysdeps/opt/rocm/core-10.0/lib/rocm_sysdeps/lib"
-
-
-def env():
-    e = dict(os.environ)
-    e["IREE_HAL_AMDGPU_LIBHSA_PATH"] = R
-    e["LD_LIBRARY_PATH"] = ":".join([
-        TR + "/lib", H + "/libhrx/src/binding/hip", H + "/libhrx/src/libhrx",
-        R, LLVM_LIB, SYSDEPS, "/opt/rocm/lib"])
-    return e
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hrx_paths  # noqa: E402
 
 
 def main():
@@ -85,11 +72,11 @@ def main():
 
     hal_path = os.path.join(outdir, stem + ".hal")
     target = os.path.join(outdir, stem + ".hsaco")
-    cmd = [H + "/build/cmake/loom/src/loom/tools/iree-run-loom/iree-run-loom",
+    cmd = [hrx_paths.IREE_RUN_LOOM,
            rewritten, "--device=amdgpu", "--target=amdgpu:" + tgt,
            "--emit-only", "--emit-hal-executable=" + hal_path,
            "--emit-target-artifact=" + target]
-    result = subprocess.run(cmd, env=env(), capture_output=True, text=True)
+    result = subprocess.run(cmd, env=hrx_paths.env(), capture_output=True, text=True)
     if result.returncode != 0 or not os.path.exists(hal_path):
         # write the whole diagnostic: the first error is at the head, and a tail cut drops it
         sys.stderr.write(result.stderr)

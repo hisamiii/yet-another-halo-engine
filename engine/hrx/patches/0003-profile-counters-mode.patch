@@ -1,0 +1,165 @@
+HRX_PROFILE_MODE=counters with HRX_PROFILE_COUNTERS=A,B,...: per-dispatch hardware counter samples. Adds the gfx11
+GL2C block (L2 / DRAM request counters); TCC and TCP are CDNA-only names.
+
+diff --git a/libhrx/src/libhrx/runtime.c b/libhrx/src/libhrx/runtime.c
+index 8bd2261a5..8a427b104 100644
+--- a/libhrx/src/libhrx/runtime.c
++++ b/libhrx/src/libhrx/runtime.c
+@@ -630,6 +630,13 @@ static iree_status_t hrx_get_profile_data_families(
+   } else if (strcmp(value, "executable") == 0) {
+     *out_data_families = IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA |
+                          IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_TRACES;
++  } else if (strcmp(value, "counters") == 0) {
++    // Local profiling-only addition: per-dispatch hardware counter samples,
++    // names from HRX_PROFILE_COUNTERS (comma separated), with dispatch events.
++    *out_data_families = IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA |
++                         IREE_HAL_DEVICE_PROFILING_DATA_DEVICE_QUEUE_EVENTS |
++                         IREE_HAL_DEVICE_PROFILING_DATA_DISPATCH_EVENTS |
++                         IREE_HAL_DEVICE_PROFILING_DATA_COUNTER_SAMPLES;
+   } else if (strcmp(value, "all") == 0) {
+     *out_data_families = IREE_HAL_DEVICE_PROFILING_DATA_QUEUE_EVENTS |
+                          IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA |
+@@ -653,6 +660,26 @@ static iree_status_t hrx_device_profile_begin(hrx_device_s* device,
+   iree_hal_device_profiling_options_t options = {0};
+   IREE_RETURN_IF_ERROR(hrx_get_profile_data_families(&options.data_families));
+   options.sink = sink;
++  // HRX_PROFILE_COUNTERS="A,B,C" (with HRX_PROFILE_MODE=counters): strict set.
++  iree_string_view_t counter_names[16];
++  iree_hal_profile_counter_set_selection_t counter_set = {0};
++  const char* counter_env = getenv("HRX_PROFILE_COUNTERS");
++  if ((options.data_families & IREE_HAL_DEVICE_PROFILING_DATA_COUNTER_SAMPLES) &&
++      counter_env && counter_env[0]) {
++    iree_string_view_t rest = iree_make_cstring_view(counter_env);
++    iree_host_size_t count = 0;
++    while (rest.size && count < IREE_ARRAYSIZE(counter_names)) {
++      iree_string_view_t head = iree_string_view_empty();
++      iree_string_view_split(rest, ',', &head, &rest);
++      head = iree_string_view_trim(head);
++      if (head.size) counter_names[count++] = head;
++    }
++    counter_set.name = IREE_SV("hrx_env");
++    counter_set.counter_name_count = count;
++    counter_set.counter_names = counter_names;
++    options.counter_set_count = 1;
++    options.counter_sets = &counter_set;
++  }
+   iree_status_t status =
+       iree_hal_device_profiling_begin(device->hal_device, &options);
+   if (iree_status_is_ok(status)) {
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c b/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
+index b2337675a..ee7f4bfe7 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
+@@ -434,6 +434,86 @@ static const iree_hal_amdgpu_profile_counter_descriptor_t
+                         IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
+                 },
+         },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C_MC_RDREQ"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "GL2C/EA read requests to the memory controller -- DRAM reads."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_COUNT,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_GL2C,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 96,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C_MC_WRREQ"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "GL2C/EA write requests to the memory controller -- DRAM writes."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_COUNT,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_GL2C,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 83,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C_HIT"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "L2 cache hits."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_COUNT,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_GL2C,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 42,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C_MISS"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "L2 cache misses; uncached reads count as misses."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_COUNT,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_GL2C,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 43,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C_EA_RDREQ_128B"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("GL2C"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "128-byte GL2C/EA read requests."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_COUNT,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_GL2C,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 102,
++                },
++        },
+ };
+ 
+ #undef IREE_HAL_AMDGPU_PROFILE_COUNTER_SV
+@@ -631,7 +711,10 @@ iree_hal_amdgpu_profile_counter_select_family(
+       }
+       return IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_UNSUPPORTED;
+     case 11:
+-      if (gfxip_version.minor == 0 && gfxip_version.stepping <= 2) {
++      // gfx11.0 (RDNA3) and gfx11.5 (Strix Halo / RDNA3.5) share the gfx11
++      // counter family; aqlprofile owns the per-factory PMC program generation.
++      if ((gfxip_version.minor == 0 && gfxip_version.stepping <= 2) ||
++          gfxip_version.minor == 5) {
+         return IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11;
+       }
+       return IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_UNSUPPORTED;
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/libaqlprofile.h b/runtime/src/iree/hal/drivers/amdgpu/util/libaqlprofile.h
+index 529244022..f5071023f 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/util/libaqlprofile.h
++++ b/runtime/src/iree/hal/drivers/amdgpu/util/libaqlprofile.h
+@@ -65,6 +65,9 @@ enum iree_hal_amdgpu_aqlprofile_block_name_e {
+   IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_TA = 10,
+   IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_TCC = 12,
+   IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_TCP = 13,
++  // RDNA3/RDNA3.5 expose L2 and DRAM traffic here; TCC and TCP are CDNA block
++  // names that do not exist on gfx11.
++  IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_GL2C = 29,
+ };
+ 
+ typedef union iree_hal_amdgpu_aqlprofile_buffer_desc_flags_t {

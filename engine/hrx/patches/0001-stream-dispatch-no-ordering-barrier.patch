@@ -1,0 +1,48 @@
+hrx_stream_dispatch flag HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER: skip the trailing ordering barrier so the next
+dispatch may overlap this one; the caller orders dependent work. Used by the decode step (independent projections).
+
+diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
+index 553074431..57e495bc8 100644
+--- a/libhrx/include/hrx_runtime.h
++++ b/libhrx/include/hrx_runtime.h
+@@ -233,6 +233,11 @@ typedef enum hrx_dispatch_flags_t {
+   HRX_DISPATCH_FLAG_NONE = 0,
+   HRX_DISPATCH_FLAG_CUSTOM_DIRECT_ARGUMENTS = 1 << 0,
+   HRX_DISPATCH_FLAG_ALLOW_INLINE_EXECUTION = 1 << 1,
++  // LOCAL PROTOTYPE (yah, not upstream): hrx_stream_dispatch only. Skip the
++  // trailing ordering barrier, so the stream's next dispatch may start while
++  // this one runs. The caller orders dependent work with
++  // hrx_stream_execution_barrier().
++  HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER = 1 << 2,
+ } hrx_dispatch_flags_t;
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/libhrx/src/libhrx/stream.c b/libhrx/src/libhrx/stream.c
+index cc5551d54..183dff4e1 100644
+--- a/libhrx/src/libhrx/stream.c
++++ b/libhrx/src/libhrx/stream.c
+@@ -424,6 +432,9 @@ hrx_status_t hrx_stream_dispatch(hrx_stream_t stream,
+   }
+ 
+   iree_hal_dispatch_flags_t hal_flags = IREE_HAL_DISPATCH_FLAG_NONE;
++  const bool no_ordering_barrier =
++      (flags & HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER) != 0;
++  flags &= ~(uint32_t)HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER;
+   hrx_status_t status = hrx_iree_dispatch_flags_from_hrx(flags, &hal_flags);
+   if (!hrx_status_is_ok(status)) {
+     HRX_RETURN_AND_END_ZONE(z0, status);
+@@ -486,9 +497,11 @@ hrx_status_t hrx_stream_dispatch(hrx_stream_t stream,
+     HRX_RETURN_AND_END_ZONE(z0, hrx_status_from_iree(iree_status));
+   }
+ 
+-  iree_status = hrx_stream_record_ordering_barrier(stream);
+-  if (!iree_status_is_ok(iree_status)) {
+-    HRX_RETURN_AND_END_ZONE(z0, hrx_status_from_iree(iree_status));
++  if (!no_ordering_barrier) {
++    iree_status = hrx_stream_record_ordering_barrier(stream);
++    if (!iree_status_is_ok(iree_status)) {
++      HRX_RETURN_AND_END_ZONE(z0, hrx_status_from_iree(iree_status));
++    }
+   }
+ 
+   stream->has_pending_work = true;

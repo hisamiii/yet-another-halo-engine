@@ -1,0 +1,27 @@
+Stream command buffers retain profile metadata while profiling is active, so HRX_PROFILE_MODE=dispatch records
+the dispatches of a stream-only program (graph_exec.c already does this).
+
+diff --git a/libhrx/src/libhrx/stream.c b/libhrx/src/libhrx/stream.c
+index cc5551d54..183dff4e1 100644
+--- a/libhrx/src/libhrx/stream.c
++++ b/libhrx/src/libhrx/stream.c
+@@ -16,9 +16,17 @@ static hrx_status_t hrx_stream_begin_cb(hrx_stream_t stream) {
+   }
+ 
+   iree_hal_command_buffer_t* command_buffer = NULL;
++  // Profile sessions attribute dispatch events through the command buffer's
++  // profile id, which the HAL only assigns to command buffers that retain
++  // profile metadata (same rule as graph_exec.c). Without this a stream-only
++  // program profiled with HRX_PROFILE_MODE=dispatch records no dispatches.
++  iree_hal_command_buffer_mode_t command_buffer_mode =
++      IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT;
++  if (stream->device && stream->device->profiling_active) {
++    command_buffer_mode |= IREE_HAL_COMMAND_BUFFER_MODE_RETAIN_PROFILE_METADATA;
++  }
+   iree_status_t status = iree_hal_command_buffer_create(
+-      iree_hal_queue_family(stream->hal_queue),
+-      IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
++      iree_hal_queue_family(stream->hal_queue), command_buffer_mode,
+       IREE_HAL_COMMAND_CATEGORY_TRANSFER | IREE_HAL_COMMAND_CATEGORY_DISPATCH,
+       /*binding_capacity=*/0, &command_buffer);
+   if (iree_status_is_ok(status)) {

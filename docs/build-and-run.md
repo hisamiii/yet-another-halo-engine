@@ -4,21 +4,22 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 
 ## Prerequisites
 
-- HRX built from source at `/home/q/hrx` (cmake tree `/home/q/hrx/build/cmake`, `YAH_HRX_BUILD` overrides). Loom tools (`loom-compile`, `iree-run-loom`, `iree-benchmark-loom`) come with that build.
-- The official ROCm Core SDK 10.0.0 runtime packages, extracted (no system install) by `engine/hrx-env.sh --fetch` into `/home/q/rocm10`. Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
-- `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`; `/opt/rocm` stays usable.
+- HRX / Loom: the revision pinned in `engine/hrx/PIN` plus the patches in `engine/hrx/patches/`. `engine/hrx/bootstrap.sh` clones it into `external/hrx` (gitignored; `YAH_HRX` overrides, and a symlink to an existing checkout works), checks out the pin, applies the patches and builds what the engine uses: `libhrx` and its HIP binding, `iree-run-loom`, `loom-compile`, `iree-profile`. `engine/hrx/bootstrap.sh --check` verifies the checkout; `engine/build_hrx.sh` refuses anything else.
+- The official ROCm Core SDK 10.0.0 runtime packages, extracted (no system install) by `engine/hrx-env.sh --fetch` into `external/rocm10` (`YAH_ROCM` overrides). Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
+- `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`; `/opt/rocm` stays usable. The Python emitters find the same paths through `engine/gpu/loom/hrx_paths.py`.
 - The model: `~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf`.
 - Python 3 with numpy for the emitters. The checkers also need llama.cpp's `gguf-py` on `PYTHONPATH`; use an OpenBLAS numpy (`/home/q/yah-scratch/venv/bin/python`), the system numpy is ~100x slower for the gate tools.
 
-### Local HRX patches
+### HRX patches
 
-The `/home/q/hrx` checkout carries uncommitted local patches. Everything builds and runs on stock HRX; the patches only add speed or profiling:
+Each patch says at its top what it is for. They apply idempotently, so one that upstream takes is skipped automatically, and one that no longer fits the pin stops the bootstrap. Raise the pin deliberately: bootstrap, rebuild, then check the emits and the GPU references.
 
-| patch | effect | on stock HRX |
-|---|---|---|
-| `HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER` (`libhrx` stream.c, hrx_runtime.h) | decode overlaps independent dispatches (`LoomDevice::NoBarrierNext`) | the flag is rejected; `LoomDevice::Dispatch` retries without it and keeps dispatches ordered (same results, slower decode) |
-| profile metadata for stream dispatches (stream.c) | `HRX_PROFILE_MODE=dispatch` records stream dispatches | no dispatch events in the profile |
-| `HRX_PROFILE_MODE=counters` (runtime.c) and the gfx1151 counter map (profile_counters.c) | per-dispatch PMC such as `SQ_BUSY_CYCLES` | not available |
+| patch | effect |
+|---|---|
+| `0001-stream-dispatch-no-ordering-barrier` | `HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER`: decode overlaps independent dispatches (`LoomDevice::NoBarrierNext`) |
+| `0002-stream-profile-metadata` | `HRX_PROFILE_MODE=dispatch` records stream dispatches |
+| `0003-profile-counters-mode` | `HRX_PROFILE_MODE=counters` with `HRX_PROFILE_COUNTERS`: per-dispatch PMC such as `SQ_BUSY_CYCLES`, plus the gfx11 GL2C counters |
+| `0004-loom-profile-function-filter` | `LOOM_PROFILE_FUNCTION=<glob>` for executable traces in the Loom HAL benchmark tool |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
@@ -163,9 +164,9 @@ Gate notes:
 
 | question | tool |
 |---|---|
-| device time per dispatch in the real pipeline | `HRX_PROFILE_FILE=p.irpf HRX_PROFILE_MODE=dispatch <driver ...>`, then `/home/q/hrx/build/cmake/runtime/src/iree/tools/iree-profile/iree-profile dispatch --dispatch_events --format=jsonl p.irpf`. Costs ~1%. |
+| device time per dispatch in the real pipeline | `HRX_PROFILE_FILE=p.irpf HRX_PROFILE_MODE=dispatch <driver ...>`, then `external/hrx/build/cmake/runtime/src/iree/tools/iree-profile/iree-profile dispatch --dispatch_events --format=jsonl p.irpf`. Costs ~1%. |
 | cycles per dispatch (clock-free) | `HRX_PROFILE_MODE=counters HRX_PROFILE_COUNTERS=SQ_BUSY_CYCLES`, then `iree-profile counter --format=jsonl --counter_samples`. Needs TheRock's `libhsa-amd-aqlprofile64` (`/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0/lib`) first on `LD_LIBRARY_PATH`. Inflates dispatch gaps ~4x. |
-| registers, spills, residency, schedule | `loom-compile k.loom --root=@k --target=amdgpu:gfx1151 --format=amdgpu-hsaco --output=k.hsaco --compile-report=details --compile-report-output=k.json`, then `PYTHONPATH=/home/q/hrx/loom/py python3 -m loom.tools.compile_report show\|suggest\|diff k.json`. Run `suggest --include-experimental` before hand-tuning. `allocation.materialized_spill_*` shows real spills even when `spill_count` is 0. |
+| registers, spills, residency, schedule | `loom-compile k.loom --root=@k --target=amdgpu:gfx1151 --format=amdgpu-hsaco --output=k.hsaco --compile-report=details --compile-report-output=k.json`, then `PYTHONPATH=external/hrx/loom/py python3 -m loom.tools.compile_report show\|suggest\|diff k.json`. Run `suggest --include-experimental` before hand-tuning. `allocation.materialized_spill_*` shows real spills even when `spill_count` is 0. |
 | instruction counts | `llvm-objdump -d --mcpu=gfx1151` on the hsaco (a `.hal` embeds the ELF from the first `\x7fELF`). Run it with `env -u LD_LIBRARY_PATH`. |
 | PMC, occupancy, per-wave ATT | rocprofv3 cannot see HRX dispatches. Run the kernel through `engine/build/loomhip <hsaco> <kernel> <gx> <gy> <block_x> <iters> <buf>...` under `rocprofv3 --pmc "A B C"` (one space-separated list) or `--att --att-library-path <TheRock lib>`. ~400 gfx1151 counters (`SQ_INST_CYCLES_VALU`, `SQ_WAIT_BARRIER`, `SPI_RA_*`) need `ROCPROFILER_METRICS_PATH` pointed at a copy of rocprof-compute's `sdk_config.yaml` renamed `config.yaml`. |
 | clocks, temperature, throttling | gpu_metrics v3 (`/sys/class/drm/card1/device/gpu_metrics`), the ryzen_smu PM table, `z13ctl status` for the APU temperature. See hardware.md. |
@@ -212,5 +213,5 @@ doas journalctl -k -b -1 --no-pager | grep -iE 'amdgpu|ring .*timeout|reset|MES'
 
 ## Further reading
 
-- HRX demos: [DEVELOPMENT.md](https://github.com/ROCm/hrx-demos/blob/main/DEVELOPMENT.md), [AGENTS.md](https://github.com/ROCm/hrx-demos/blob/main/AGENTS.md); Loom docs in `/home/q/hrx/loom/docs/`.
+- HRX demos: [DEVELOPMENT.md](https://github.com/ROCm/hrx-demos/blob/main/DEVELOPMENT.md), [AGENTS.md](https://github.com/ROCm/hrx-demos/blob/main/AGENTS.md); Loom docs in `external/hrx/loom/docs/`.
 - [gfx950 Gluon tutorials](https://github.com/ROCm/gfx950-gluon-tutorials), [HIP performance guidelines](https://rocmdocs.amd.com/projects/HIP/en/develop/how-to/performance_guidelines.html).

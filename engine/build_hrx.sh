@@ -5,11 +5,15 @@
 #   engine/build_hrx.sh <model.gguf>    also emit the decode HAL set into engine/hal
 #   engine/build_hrx.sh <model> <dir>   emit into <dir>
 #
-# HRX libraries come from $YAH_HRX_BUILD (default: the HRX cmake build tree). Source engine/hrx-env.sh before a run.
+# HRX comes from $YAH_HRX (default external/hrx: the pinned revision plus engine/hrx/patches, made by
+# engine/hrx/bootstrap.sh), libraries from its build tree $YAH_HRX_BUILD. Source engine/hrx-env.sh before a run.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-H="${YAH_HRX_BUILD:-/home/q/hrx/build/cmake}"
-inc="/home/q/hrx/libhrx/include"
+export YAH_HRX="${YAH_HRX:-$root/external/hrx}"
+H="${YAH_HRX_BUILD:-$YAH_HRX/build/cmake}"
+inc="$YAH_HRX/libhrx/include"
+# Build only against the pinned, patched HRX, so anyone can reproduce the binaries.
+"$root/engine/hrx/bootstrap.sh" --check >/dev/null || { "$root/engine/hrx/bootstrap.sh" --check; exit 1; }
 libhrx="$H/libhrx/src/libhrx"
 
 # Host code: clang, -O3 -march=native. -ffp-contract=off keeps float results (e.g. the host embedding dequant) the same as

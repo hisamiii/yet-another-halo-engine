@@ -190,7 +190,7 @@ A HAL set is a directory of compiled kernels plus one text file that records how
 ### From generator to HAL
 
 1. A generator (`tools/gen_*.py`) prints Loom text, one kernel per `gen_*` function. A few kernels are still hand-written `.loom` files in `engine/gpu/loom/`; the emitters compile those with fixed configs.
-2. `engine/gpu/loom/emit_hal.py <file.loom> <outdir> sym=value ...` replaces every `config.get` with its constant, drops the `config.decl`, and has `iree-run-loom --emit-only --emit-hal-executable` compile the kernel for gfx1151. The kernel is built for exactly that config. `YAH_LOOM_HOME` picks the HRX/Loom tree (default `/home/q/hrx`).
+2. `engine/gpu/loom/emit_hal.py <file.loom> <outdir> sym=value ...` replaces every `config.get` with its constant, drops the `config.decl`, and has `iree-run-loom --emit-only --emit-hal-executable` compile the kernel for gfx1151. The kernel is built for exactly that config. The HRX/Loom tree is `external/hrx` (`engine/gpu/loom/hrx_paths.py`; `YAH_LOOM_HOME` points it elsewhere for diagnosis).
 3. The emitter copies the result into the set and writes `dispatch.txt` or `decode.txt`.
 
-Production sets must build and run with stock HRX/Loom (see build-and-run.md, Local HRX patches). An experimental compiler may be used for diagnosis only.
+Production sets build with the pinned HRX/Loom plus `engine/hrx/patches` (see build-and-run.md, HRX patches). Any other compiler change is for diagnosis only until it is a patch there.

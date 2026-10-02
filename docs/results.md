@@ -131,7 +131,7 @@ Decode:
 - Word-level weight decode (no `vector<16xi8>` bit ops): 77.1 -> 68.2 ms.
 - `pipeline(2)` read-ahead on the GEMV sub-block loop: 68.2 -> 63.1 ms.
 - GPU embedding + device token stream (no host round trip): -0.9 ms.
-- Independent input projections without an ordering barrier: -1.4 ms (needs the local HRX dispatch flag; see build-and-run.md, Local HRX patches).
+- Independent input projections without an ordering barrier: -1.4 ms (HRX patch 0001; see build-and-run.md, HRX patches).
 - Long-context attention read-ahead and (head, page) grid order: 128 MB per call at 32K, 2955 -> 689 us (43 -> 195 GB/s).
 - DeltaNet state loads hoisted above the q / k norm: 61.2 -> 60.87 ms.
 - Decode conv fused into DeltaNet (ping-pong conv state): 60.87 -> 60.59 ms.

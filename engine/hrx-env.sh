@@ -11,7 +11,7 @@
 # PINNED: the AMD ROCm Core SDK 10.0.0 release (ROCm 7.14.x). Do not use TheRock nightlies.
 # HRX calls hsa_amd_queue_create; only the 10.0.0 release exports it (see docs/build-and-run.md).
 #
-# Three packages, ~174 MB, extracted under $YAH_HRX_ROOT (no system install):
+# Three packages, ~174 MB, extracted under $YAH_ROCM (default external/rocm10 in this repo; no system install):
 #   amdrocm-runtime10.0   HSA runtime; carries hsa_amd_queue_create@@ROCR_1
 #   amdrocm-sysdeps10.0   librocm_sysdeps_* (the HSA library links against them)
 #   amdrocm-llvm10.0      LLVM 23 matching libamd_comgr.so.3
@@ -19,19 +19,22 @@
 YAH_HRX_REPO=https://stable.repo.amd.com/rocm/core/packages/ubuntu2404/pool/main
 YAH_HRX_PKGS="amdrocm-runtime10.0_10.0.0-4_amd64.deb amdrocm-sysdeps10.0_10.0.0-4_amd64.deb amdrocm-llvm10.0_10.0.0-4_amd64.deb"
 
-if [ -z "$YAH_HRX_ROOT" ]; then YAH_HRX_ROOT=/home/q/rocm10; fi
-if [ -z "$YAH_HRX_BUILD" ]; then YAH_HRX_BUILD=/home/q/hrx/build/cmake; fi
+# HRX itself: the checkout engine/hrx/bootstrap.sh makes ($YAH_HRX, default external/hrx) and its build tree.
+yah_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+if [ -z "$YAH_ROCM" ]; then YAH_ROCM="$yah_root/external/rocm10"; fi
+if [ -z "$YAH_HRX" ]; then YAH_HRX="$yah_root/external/hrx"; fi
+if [ -z "$YAH_HRX_BUILD" ]; then YAH_HRX_BUILD="$YAH_HRX/build/cmake"; fi
 
-yah_hrx_libhsa_dir="$YAH_HRX_ROOT/x_runtime/opt/rocm/core-10.0/lib"
-yah_hrx_llvm_dir="$YAH_HRX_ROOT/x_llvm/opt/rocm/core-10.0/lib/llvm/lib"
-yah_hrx_sysdeps_dir="$YAH_HRX_ROOT/x_sysdeps/opt/rocm/core-10.0/lib/rocm_sysdeps/lib"
+yah_hrx_libhsa_dir="$YAH_ROCM/x_runtime/opt/rocm/core-10.0/lib"
+yah_hrx_llvm_dir="$YAH_ROCM/x_llvm/opt/rocm/core-10.0/lib/llvm/lib"
+yah_hrx_sysdeps_dir="$YAH_ROCM/x_sysdeps/opt/rocm/core-10.0/lib/rocm_sysdeps/lib"
 yah_hrx_hip_dir="$YAH_HRX_BUILD/libhrx/src/binding/hip"
 yah_hrx_libhrx_dir="$YAH_HRX_BUILD/libhrx/src/libhrx"
 
 yah_hrx_fetch() {
   local p d
-  mkdir -p "$YAH_HRX_ROOT"
-  cd "$YAH_HRX_ROOT" || return 1
+  mkdir -p "$YAH_ROCM"
+  cd "$YAH_ROCM" || return 1
   for p in $YAH_HRX_PKGS; do
     [ -f "$p" ] || curl -sL --max-time 900 -o "$p" "$YAH_HRX_REPO/$p" || return 1
     d=""
@@ -67,7 +70,7 @@ os.makedirs(dest, exist_ok=True)
 tarfile.open(fileobj=io.BytesIO(a[key]), mode='r:*').extractall(dest)
 PY
   done
-  echo "hrx-env: fetched into $YAH_HRX_ROOT"
+  echo "hrx-env: fetched into $YAH_ROCM"
 }
 
 yah_hrx_env() {
@@ -82,7 +85,7 @@ yah_hrx_check() {
     if [ -d "$d" ]; then echo "  ok      $d"; else echo "  MISSING $d"; miss=1; fi
   done
   if [ "$miss" != 0 ]; then
-    echo "  -> run: engine/hrx-env.sh --fetch   (and build HRX into $YAH_HRX_BUILD)"
+    echo "  -> run: engine/hrx-env.sh --fetch, then engine/hrx/bootstrap.sh"
     return 1
   fi
   yah_hrx_env

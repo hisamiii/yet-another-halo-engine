@@ -1,0 +1,32 @@
+LOOM_PROFILE_FUNCTION=<glob> sets the executable-trace capture filter in the Loom HAL benchmark tool, which
+refuses an empty filter.
+
+diff --git a/loom/src/loom/tooling/execution/hal/benchmark.c b/loom/src/loom/tooling/execution/hal/benchmark.c
+index c56a25b1a..cd2378a76 100644
+--- a/loom/src/loom/tooling/execution/hal/benchmark.c
++++ b/loom/src/loom/tooling/execution/hal/benchmark.c
+@@ -7,6 +7,7 @@
+ #include "loom/tooling/execution/hal/benchmark.h"
+ 
+ #include <stdint.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "iree/hal/utils/profile_file.h"
+@@ -141,6 +142,16 @@ void loom_run_hal_benchmark_options_initialize(
+       IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA;
+   out_options->profile_capture_filter =
+       iree_hal_profile_capture_filter_default();
++  // Local patch (yet-another-halo-engine): executable-trace profiling refuses
++  // an empty capture filter, and the tool had no way to set one.
++  // LOOM_PROFILE_FUNCTION=<glob> restricts capture to matching functions.
++  const char* function_pattern = getenv("LOOM_PROFILE_FUNCTION");
++  if (function_pattern && function_pattern[0]) {
++    out_options->profile_capture_filter.flags |=
++        IREE_HAL_PROFILE_CAPTURE_FILTER_FLAG_EXECUTABLE_FUNCTION_PATTERN;
++    out_options->profile_capture_filter.executable_function_pattern =
++        iree_make_cstring_view(function_pattern);
++  }
+ }
+ 
+ void loom_run_hal_benchmark_result_initialize(

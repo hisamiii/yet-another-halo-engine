@@ -26,17 +26,12 @@ bound = {"weight": M * kb * bpb, "input": B * K * 2, "resid": B * M * 4, "gate":
          "grid": {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(fmt, 0),
          "ksigns": 128,
          "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4}
-# YAH_LOOM_HOME selects the HRX/Loom tree whose build compiles the HALs (default /home/q/hrx).
-H = os.environ.get("YAH_LOOM_HOME", "/home/q/hrx")
-e = dict(os.environ)
-e["IREE_HAL_AMDGPU_LIBHSA_PATH"] = "/home/q/rocm10/x_runtime/opt/rocm/core-10.0/lib"
-e["LD_LIBRARY_PATH"] = ":".join(["/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0/lib",
-    H + "/libhrx/src/binding/hip", H + "/libhrx/src/libhrx", "/home/q/rocm10/x_runtime/opt/rocm/core-10.0/lib",
-    "/home/q/rocm10/x_llvm/opt/rocm/core-10.0/lib/llvm/lib",
-    "/home/q/rocm10/x_sysdeps/opt/rocm/core-10.0/lib/rocm_sysdeps/lib", "/opt/rocm/lib"])
+sys.path.insert(0, os.path.dirname(HERE))
+import hrx_paths  # noqa: E402
+e = hrx_paths.env()
 rep = "/tmp/footprint_gate_report.json"
 root = "@" + sym
-cmd = [H + "/build/cmake/loom/src/loom/tools/loom-compile/loom-compile", src, "--root=" + root,
+cmd = [hrx_paths.LOOM_COMPILE, src, "--root=" + root,
        "--target=amdgpu:gfx1151", "--format=amdgpu-hsaco", "--output=/tmp/footprint_gate.hsaco",
        "--compile-report=details", "--compile-report-output=" + rep,
        f"--config={sym}.m_tiles={mt}", f"--config={sym}.k_blocks={kb}", f"--config={sym}.token_tiles={tt}"]
