@@ -28,7 +28,7 @@ These are upstream candidates; do not push them to HRX without the owner's agree
 engine/build_hrx.sh
 ```
 
-It builds `libyah_core`, the core tools (`yah-tokenize`, `yah-dump`, `yah-weights`) and the drivers `loom_forward_pp`, `loom_decode`, `hal_run`, `hal_bench` into `engine/build/`. Always use this script: `cmake --build engine/build` does not build the drivers and prints nothing, and a stale driver with a new HAL set launches the wrong grid. `gpu_run.sh` refuses a driver binary older than its source.
+It builds `libyah_core`, the core tools (`yah-tokenize`, `yah-dump`, `yah-weights`), the drivers `loom_forward_pp`, `loom_decode`, `hal_run`, `hal_bench` and the server `yah_server` into `engine/build/`. Always use this script: `cmake --build engine/build` does not build the drivers and prints nothing, and a stale driver with a new HAL set launches the wrong grid. `gpu_run.sh` refuses a driver binary older than its source.
 
 `engine/build_loomhip.sh` builds `engine/build/loomhip` (needs hipcc), which runs one Loom hsaco through HIP for rocprofv3.
 
@@ -78,6 +78,51 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <gguf> <decode set> --ids 
 ```
 
 `--logits FILE` appends every step's logits (f32) for an external KL check.
+
+## Serving
+
+`engine/build/yah_server` serves the model over the OpenAI Responses API. It runs one generation at a time; other requests wait.
+
+```
+source engine/hrx-env.sh
+engine/run/gpu_run.sh serve -- engine/build/yah_server --model <gguf> --prefill <set> --decode <set> [--host 127.0.0.1] [--port 8080]
+engine/build/yah_server --model <gguf> --fake    # canned replies, CPU only: for clients and API tests
+```
+
+It logs one line per request to stderr: id, prompt and output tokens, prefill ms, decode tok/s, finish reason (`cancelled` when the client left).
+
+```
+curl -s localhost:8080/v1/responses -H 'Content-Type: application/json' \
+  -d '{"model": "qwen", "input": "Why is the sky blue?", "reasoning": {"effort": "low"}, "max_output_tokens": 2048}'
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+r = client.responses.create(model="qwen", instructions="Be brief.", input="Why is the sky blue?")
+print(r.output_text)
+for event in client.responses.create(model="qwen", input="Hi", stream=True):
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="", flush=True)
+```
+
+| | |
+|---|---|
+| endpoints | `POST /v1/responses` (plain and `stream: true` SSE), `GET /v1/models`, `GET /health` |
+| input | a string, or a list of `system` / `developer` / `user` / `assistant` messages with string or text-part content; `reasoning` items from earlier output; `instructions` |
+| reasoning | `reasoning.effort`: `none` / `minimal` (thinking off), `low`, `medium`, `high` (default, the template's `xhigh`). The thinking text comes back as a `reasoning` output item with `reasoning_text` content |
+| sampling | `temperature` (default 0.6), `top_p` (default 0.95), `max_output_tokens` (default: the rest of the context; prompt + max must fit) |
+| accepted and ignored | `store`, `metadata` (echoed), `user`, `service_tier`, `parallel_tool_calls`, and default values of `tool_choice`, `text`, `truncation` |
+| not supported (400) | tools, `previous_response_id` and stored responses, images and files, structured output, logprobs |
+
+All system and developer messages merge into one system message at the start. The chat template is a C++ port of the GGUF's Jinja template for this subset.
+
+Tests (no GPU):
+
+```
+PYTHONPATH=/home/q/llama.cpp/gguf-py /home/q/yah-scratch/venv/bin/python engine/serve/test_chat_template.py   # C++ template vs jinja2, byte for byte
+/home/q/yah-scratch/venv/bin/python engine/serve/test_responses.py   # yah_server --fake through the openai SDK
+```
 
 ## Correctness
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the HRX-native runners (loom_forward_pp, loom_decode, hal_bench, hal_run) without HIP or hipcc.
 #
-#   engine/build_hrx.sh                 build libyah_core, the core tools and the runners
+#   engine/build_hrx.sh                 build libyah_core, the core tools, the runners and yah_server
 #   engine/build_hrx.sh <model.gguf>    also emit the decode HAL set into engine/hal
 #   engine/build_hrx.sh <model> <dir>   emit into <dir>
 #
@@ -31,8 +31,16 @@ g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
 g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
     -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
+# Responses API server. model/engine.hpp (the GPU engine) is optional: without it only --fake works.
+server_hrx=()
+if [ -f "$root/engine/model/engine.hpp" ]; then server_hrx=(-I"$inc" -L"$libhrx" -lhrx); fi
+g++ -std=c++20 -O2 -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_server.cc" \
+    "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
+    "$root/engine/third_party/httplib/httplib.cpp" \
+    -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
+    "${server_hrx[@]}" -licuuc -lpthread
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"
 fi
-echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_bench,hal_run}"
+echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_bench,hal_run,yah_server}"
