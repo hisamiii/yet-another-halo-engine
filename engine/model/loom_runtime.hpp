@@ -286,6 +286,24 @@ class LoomDevice {
   bool initialized_ = false;
 };
 
+// The model's tensor-data region (the GGUF mmap) imported once as one device-visible buffer; every tensor is an offset
+// into it. Import needs a page-aligned start, so delta() is the offset of the region inside the import.
+class LoomWeights {
+ public:
+  LoomWeights(LoomDevice& gpu, const void* base, size_t bytes) {
+    const uintptr_t page = 4096;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(base) & ~(page - 1);
+    delta_ = reinterpret_cast<uintptr_t>(base) - start;
+    buffer_ = gpu.Import(reinterpret_cast<void*>(start), bytes + delta_);
+  }
+  [[nodiscard]] hrx_buffer_t handle() const { return buffer_.handle; }
+  [[nodiscard]] size_t delta() const { return delta_; }
+
+ private:
+  LoomBuffer buffer_;
+  size_t delta_ = 0;
+};
+
 }  // namespace yah::model
 
 #endif  // YAH_MODEL_LOOM_RUNTIME_HPP_
