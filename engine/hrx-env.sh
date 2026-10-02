@@ -21,9 +21,9 @@ YAH_HRX_PKGS="amdrocm-runtime10.0_10.0.0-4_amd64.deb amdrocm-sysdeps10.0_10.0.0-
 
 # HRX itself: the checkout engine/hrx/bootstrap.sh makes ($YAH_HRX, default external/hrx) and its build tree.
 yah_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-if [ -z "$YAH_ROCM" ]; then YAH_ROCM="$yah_root/external/rocm10"; fi
-if [ -z "$YAH_HRX" ]; then YAH_HRX="$yah_root/external/hrx"; fi
-if [ -z "$YAH_HRX_BUILD" ]; then YAH_HRX_BUILD="$YAH_HRX/build/cmake"; fi
+if [ -z "${YAH_ROCM:-}" ]; then YAH_ROCM="$yah_root/external/rocm10"; fi
+if [ -z "${YAH_HRX:-}" ]; then YAH_HRX="$yah_root/external/hrx"; fi
+if [ -z "${YAH_HRX_BUILD:-}" ]; then YAH_HRX_BUILD="$YAH_HRX/build/cmake"; fi
 
 yah_hrx_libhsa_dir="$YAH_ROCM/x_runtime/opt/rocm/core-10.0/lib"
 yah_hrx_llvm_dir="$YAH_ROCM/x_llvm/opt/rocm/core-10.0/lib/llvm/lib"
@@ -76,7 +76,7 @@ PY
 yah_hrx_env() {
   export IREE_HAL_AMDGPU_LIBHSA_PATH="$yah_hrx_libhsa_dir"
   # HRX's libamdhip64 must win over ROCm's; ROCm's own libs stay reachable.
-  export LD_LIBRARY_PATH="$yah_hrx_hip_dir:$yah_hrx_libhrx_dir:$yah_hrx_libhsa_dir:$yah_hrx_llvm_dir:$yah_hrx_sysdeps_dir:/opt/rocm/lib:$LD_LIBRARY_PATH"
+  export LD_LIBRARY_PATH="$yah_hrx_hip_dir:$yah_hrx_libhrx_dir:$yah_hrx_libhsa_dir:$yah_hrx_llvm_dir:$yah_hrx_sysdeps_dir:/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 }
 
 yah_hrx_check() {
@@ -102,7 +102,7 @@ yah_hrx_check() {
   fi
 }
 
-yah_hrx_arg="$1"
+yah_hrx_arg="${1:-}"
 if [ -z "$yah_hrx_arg" ]; then yah_hrx_arg=--env; fi
 case "$yah_hrx_arg" in
   --fetch) yah_hrx_fetch ;;
