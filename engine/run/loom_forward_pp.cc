@@ -1,8 +1,9 @@
 // loom_forward_pp: the Loom prefill on HRX (model/loom_prefill.hpp) as a command-line tool.
 //
 // usage: loom_forward_pp <model.gguf> <haldir> <out-prefix> [tokens] [ids-file]
-// outputs: <out-prefix>.logits (vocab f32, last token) and <out-prefix>.hidden (B x 5120 f32, token major, last chunk)
-// tokens: a one-pass set runs exactly its B; a chunked set runs any multiple of its chunk up to its context.
+// outputs: <out-prefix>.logits (vocab f32, last token) and <out-prefix>.hidden (B x 5120 f32, token major, last chunk;
+//          rows past a partial chunk's tokens are padding)
+// tokens: any count up to the set's context; the last chunk may be partial (masked prefill, as the Engine runs it).
 // A short ids file is repeated to the token count.
 //
 // env:
@@ -97,13 +98,12 @@ int main(int argc, char** argv) {
     LoomWeights weights(gpu, gguf.tensor_data_base(), gguf.tensor_data_size());
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights.handle(), weights.delta(), want);
     const std::uint32_t B = pf.chunk(), T_run = want ? want : B;
-    if (T_run > pf.context() || T_run % B) {
-      std::fprintf(stderr, "tokens=%u must be a multiple of the chunk %u and at most the context %u\n", T_run, B,
-                   pf.context());
+    if (T_run == 0 || T_run > pf.context()) {
+      std::fprintf(stderr, "tokens=%u must be at most the context %u\n", T_run, pf.context());
       return 2;
     }
     for (std::size_t i = ids.size(), n = ids.size(); i < T_run; ++i) ids.push_back(ids[i % n]);
-    const std::uint32_t n_chunks = T_run / B;
+    const std::uint32_t n_chunks = (T_run + B - 1) / B, last_n = T_run - (n_chunks - 1) * B;
     std::fprintf(stderr, "loom_forward_pp: tokens=%u chunk=%u context=%u\n", T_run, B, pf.context());
 
     std::uint32_t logits_from = T_run;
@@ -138,13 +138,13 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
     for (std::uint32_t ci = 0; ci < n_chunks; ++ci) {
-      pf.Embed(ids.data() + std::size_t{ci} * B, B);
+      pf.Embed(ids.data() + std::size_t{ci} * B, ci + 1 == n_chunks ? last_n : B);
       pf.RunLayers(ci);
-      for (std::uint32_t ra = std::max(logits_from, ci * B); logits_from < T_run && ra < (ci + 1) * B; ++ra)
+      for (std::uint32_t ra = std::max(logits_from, ci * B); ra < std::min((ci + 1) * B, T_run); ++ra)
         pf.Head(ra - ci * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});
       if (rowstats) {
         std::vector<std::uint32_t> rows;
-        for (std::uint32_t r = 0; r < B; ++r)
+        for (std::uint32_t r = 0; r < (ci + 1 == n_chunks ? last_n : B); ++r)
           if (rs_want[std::size_t{ci} * B + r]) rows.push_back(r);
         for (std::size_t i = 0; i < rows.size(); ++i)
           pf.Head(rows[i], {rsbuf.handle, i * kVocab * 4, std::size_t{kVocab} * 4});
@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
     }
     LoomBuffer logits = gpu.Allocate(std::size_t{kVocab} * 4);
     LoomBuffer token = gpu.Allocate(4);
-    pf.Head(B - 1, {logits.handle, 0, logits.size});
+    pf.Head(last_n - 1, {logits.handle, 0, logits.size});
     pf.Argmax({logits.handle, 0, logits.size}, {token.handle, 0, 4});
     gpu.Synchronize();
     std::uint32_t tok = 0;

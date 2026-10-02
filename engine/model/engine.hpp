@@ -76,12 +76,13 @@ class Engine : public TextGenerator {
                                              : static_cast<std::uint64_t>(t0.time_since_epoch().count()));
     const bool greedy = params.sampling.temperature <= 0.0f;
 
-    // Prompt: whole chunks through the prefill; the tail as one more (padded) chunk or through decode steps.
+    // Prompt: whole chunks through the prefill; the tail as one more partial chunk or through decode steps, whichever
+    // the measured costs say is cheaper (a partial chunk runs only the GEMM token tiles that hold its tokens).
     prefill_.Reset();
     decoder_.Bind(prefill_.DecoderState());
     const std::uint32_t B = prefill_.chunk(), full = n / B * B, tail = n - full;
     const bool tail_chunk =
-        tail && (tail_ == Tail::kChunk || (tail_ == Tail::kAuto && tail * step_ms_ > chunk_ms_));
+        tail && (tail_ == Tail::kChunk || (tail_ == Tail::kAuto && tail * step_ms_ > chunk_ms_ * ChunkShare(tail)));
     const std::uint32_t chunks = full / B + (tail_chunk ? 1 : 0);
     for (std::uint32_t c = 0; c < chunks; ++c) {
       const auto tc = std::chrono::steady_clock::now();
@@ -99,7 +100,7 @@ class Engine : public TextGenerator {
       prefill_.RunLayers(c, hook);
       if (c + 1 == chunks && (tail_chunk || tail == 0)) prefill_.Head(valid - 1, Ref(logits_));
       if (c + 1 == chunks) gpu_.Synchronize();
-      Track(chunk_ms_, std::chrono::steady_clock::now() - tc, c + 1 == chunks);
+      Track(chunk_ms_, (std::chrono::steady_clock::now() - tc) / ChunkShare(valid), c + 1 == chunks);
     }
     core::TokenId tok;
     if (tail == 0 || tail_chunk) {
@@ -139,6 +140,12 @@ class Engine : public TextGenerator {
 
  private:
   static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
+  // A chunk of n real tokens costs about this share of a full one: the GEMMs (~92% of a full chunk) run whole 256-token
+  // tiles, everything else runs the whole chunk.
+  double ChunkShare(std::uint32_t n) const {
+    const std::uint32_t B = prefill_.chunk(), tiles = (n + 255) / 256 * 256;
+    return 0.08 + 0.92 * std::min(1.0, double(tiles) / B);
+  }
   // Running estimate of a cost in ms; only timings that include the GPU work (synced) count.
   template <class D>
   static void Track(double& est, D elapsed, bool synced) {

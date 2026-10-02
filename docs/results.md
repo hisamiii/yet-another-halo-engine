@@ -18,6 +18,16 @@ Prefill, default set (p71: FA attention, chunked DeltaNet, paged KV), `layers_ms
 
 The quantized-KV prefill rows are within run-to-run noise of fp16: their attention kernels cost +12-15% (int-to-f16 decode at staging), and attention is ~3.5% of pp8192.
 
+A prompt that ends inside a chunk (chunked 32K set, fp16 KV, `layers_ms`; the last token's logits are bit-identical to the padded chunk):
+
+| prompt | partial chunk | padded chunk | measured |
+|---:|---:|---:|---|
+| 500 | 969.7 ms | 3082.4 ms | 2026-10-02 |
+| 1025 | 2034.6 ms | 3092.1 ms | 2026-10-02 |
+| 1537 | 2786.5 ms | 3104.6 ms | 2026-10-02 |
+
+Through `yah_server` (kv8 serve sets): an 18-token prompt prefills in 0.63 s, a 621-token one in 1.33 s (both were ~3.1 s).
+
 Decode, greedy, ms per generated token (mean over 63 steps after the prompt; `loom_forward_pp` with `YAH_GEN=64`, prefill sets as above):
 
 | context | fp16 KV | kv8a16 | kv4a16 | HIP | measured |

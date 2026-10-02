@@ -206,6 +206,10 @@ class LoomDevice {
     return buffer;
   }
 
+  // Fill the whole buffer with a 32-bit pattern, in stream order.
+  void Fill(const LoomBuffer& buffer, uint32_t pattern) {
+    LoomCheck(hrx_stream_fill_buffer(stream_, buffer.handle, 0, buffer.size, &pattern, 4), "hrx_stream_fill_buffer");
+  }
   void H2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
     LoomCheck(hrx_synchronous_h2d(device_, host, buffer.handle, offset, bytes), "hrx_synchronous_h2d");
   }

@@ -76,8 +76,11 @@ class LoomPrefill {
   }
 
   // Host-dequantize the token_embd rows of ids[0..n) into hidden() for the next RunLayers. n < B pads the chunk with
-  // the last token: padding tokens leave the recurrent state unchanged, and attention is causal, so the real tokens'
-  // results and the state carried forward are exact. Waits for queued work that reads hidden().
+  // the last token. The GEMMs (~92% of the time) run only the token tiles that hold real tokens; every other kernel runs
+  // the whole chunk, so padding rows next to the real ones keep their padded-path values. Shrinking the norms as well
+  // changed the last token's logits by ~1e-4 when it sat alone in its 16-token group (cause not found yet). Padding tokens leave the recurrent state
+  // unchanged and attention is causal, so the real tokens' results and the state carried forward are exact.
+  // Waits for queued work that reads hidden().
   void Embed(const std::uint32_t* ids, std::uint32_t n) {
     if (n == 0 || n > B_) throw LoomError("prefill: chunk token count out of range");
     gpu_.Synchronize();
@@ -94,11 +97,13 @@ class LoomPrefill {
     gpu_.H2D(*hidden_, host_hidden_.data(), host_hidden_.size() * 4);
     const std::int32_t valid = static_cast<std::int32_t>(n);
     gpu_.H2D(*valid_, &valid, 4);
+    n_ = n;
   }
 
   // Enqueue the 64 layers for chunk ci (absolute positions ci * B ..), on the hidden() rows from Embed().
   void RunLayers(std::uint32_t ci, const KvHook& hook = {}) {
     if (std::size_t{ci + 1} * B_ > T_) throw LoomError("prefill: chunk past the emitted context");
+    if (n_ == 0) throw LoomError("prefill: RunLayers before Embed");
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       RunNorm(pre + "attn_norm.weight");
@@ -199,7 +204,8 @@ class LoomPrefill {
     const auto it = geom_.find(hal);
     if (it == geom_.end()) throw LoomError("dispatch.txt has no row for " + hal);
     const Geom g = it->second;
-    if (g.tokens == 0 || g.rowgrp == 0 || B_ % g.tokens != 0 || B_ / g.tokens != g.tt)
+    // A token tile need not divide the chunk: the last one is masked in the kernel.
+    if (g.tokens == 0 || g.rowgrp == 0 || (B_ + g.tokens - 1) / g.tokens != g.tt)
       throw LoomError(hal + ": emitted for another token count");
     return g;
   }
@@ -273,14 +279,21 @@ class LoomPrefill {
     if (!t) throw LoomError("tensor not found: " + name);
     return t;
   }
+  // Zero-filled: a partial chunk leaves rows past its last token tile unwritten, and the full-chunk kernels (conv,
+  // DeltaNet) read them. They must be finite: the DeltaNet masks a padding token by multiplying it with 0.
   LoomBuffer& Alloc(std::size_t bytes) {
     keep_.push_back(gpu_.Allocate(bytes));
+    Zero(keep_.back());
     return keep_.back();
   }
+  // Waits: the fill is stream work, while uploads (tables, Embed) are synchronous copies that would otherwise land first
+  // and be zeroed.
   void Zero(LoomBuffer& b) {
-    std::vector<std::uint8_t> z(b.size, 0);
-    gpu_.H2D(b, z.data(), z.size());
+    gpu_.Fill(b, 0);
+    gpu_.Synchronize();
   }
+  // GEMM token tiles covering this chunk's real tokens.
+  std::uint32_t TokenTiles(const Geom& g) const { return (n_ + g.tokens - 1) / g.tokens; }
   LoomExecutable& Exe(const std::string& hal) {
     auto it = exes_.find(hal);
     if (it == exes_.end()) it = exes_.emplace(hal, gpu_.Load(dir_ + "/" + hal)).first;
@@ -461,7 +474,7 @@ class LoomPrefill {
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_}) b.push_back(Ref(*x));
     b.push_back(Ref(out));
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, B_ / g.tokens, 1, 32,
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32,
              1, 1, b);
   }
   // The attention q projection with the q / gate unpack fused in (rows = heads x [256 q | 256 gate]).
@@ -476,7 +489,7 @@ class LoomPrefill {
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, q_, gate_}) b.push_back(Ref(*x));
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_kqg").c_str(), MTiles(*t) / g.rowgrp,
-             B_ / g.tokens, 1, 32, 1, 1, b);
+             TokenTiles(g), 1, 32, 1, 1, b);
     return true;
   }
   void RunSwiglu(const std::string& wname) {
@@ -487,7 +500,7 @@ class LoomPrefill {
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, gateffn_, uwstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(), MTiles(*t) / g.rowgrp,
-             B_ / g.tokens, 1, 32, 1, 1, b);
+             TokenTiles(g), 1, 32, 1, 1, b);
   }
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
@@ -500,7 +513,7 @@ class LoomPrefill {
       auto b = GemmWeights(*t, f);
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, hidden_, wstage_, ostage_, hidden2_}) b.push_back(Ref(*x));
       Dispatch(Exe(fused), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(), MTiles(*t) / g.rowgrp,
-               B_ / g.tokens, 1, 32, 1, 1, b);
+               TokenTiles(g), 1, 32, 1, 1, b);
       std::swap(hidden_, hidden2_);
       return;
     }
@@ -508,7 +521,7 @@ class LoomPrefill {
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_, partial_}) b.push_back(Ref(*x));
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, B_ / g.tokens, 1, 32,
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32,
              1, 1, b);
     const std::size_t n = std::size_t{B_} * kHidden;
     Dispatch(Exe("accum.hal"), "yah_residual_1d", static_cast<std::uint32_t>(n / 256), 1, 1, 256, 1, 1,
@@ -643,6 +656,7 @@ class LoomPrefill {
   std::map<std::string, LoomExecutable> exes_;
   std::deque<LoomBuffer> keep_;  // stable addresses
   std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, attn_hpw_ = 0, attn_tpw_ = 0;
+  std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool attn_kq4_ = false, attn_kq8_ = false, attn_vq4_ = false, attn_vq8_ = false, attn_vqt_ = false;
   bool paged_f16k_ = false, paged_f16v_ = false;
