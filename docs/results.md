@@ -133,7 +133,8 @@ One line each: what, the number, why.
 Prefill GEMMs:
 
 - Wave64 tile GEMM: IQ3_S kstore 23.93 -> 31.27 M cycles; wave64 VALU / LDS instructions cost ~1.7x and operand fragments do not shrink.
-- KSUB = 32 for more residency: IQ3_S kstore 23.84 -> 27.34 M cycles; twice the phases, twice the barriers, and the kernel was already at its issue bound.
+- KSUB = 32 for more residency: IQ3_S ffn_gate +6.8% cycles in pp2048; twice the phases, twice the barriers, and the kernel was already at its issue bound.
+- 512-token tiles (16 waves, 4 x 4 of 32 x 128, KSUB 32 so LDS fits): IQ3_S ffn_gate +16.7% cycles in pp2048, bit-identical. Decode per WMMA halves (VALU -13%) but is mostly hidden already; KSUB 32 costs ~7% and each phase waits for the slowest of 16 waves (~9% at equal KSUB). With decode-ahead (63.5 KB LDS): +23.7%, its LDS grid lookups contend with the fragment loads. The LDS-staged design cannot amortize decode over more tokens.
 - 2 x 4 wave layout (64 x 64 per wave) for IQ4_XS: 25.88 vs 23.12 M cycles (4 x 2); fewer instructions but latency exposed (93% of issue bound).
 - IQ3_S word-path decode at 4 x 4: 26.79 -> 27.23 M cycles; longer dependent chain exposed between barriers.
 - IQ3_S f16 table decode: -0.7% cycles only; each removed decode VALU saves ~0.23 cycles (kept off).

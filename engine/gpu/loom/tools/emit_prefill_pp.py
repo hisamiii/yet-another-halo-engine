@@ -9,7 +9,7 @@ HAL names follow emit_prefill.py.
 
 usage: emit_prefill_pp.py <model.gguf> <outdir> [tokens]   (default 2048 tokens)
 """
-import os, re, sys, shutil
+import dataclasses, functools, json, os, re, sys, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -83,6 +83,13 @@ def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
     return r
 
 
+@functools.cache
+def tiles():
+    """YAH_TILES=<file.json>: per-GEMM Tile overrides from a tuner, {"gemm_kstore_iq3s_1088_20": {"bn": 512, ...}}."""
+    path = os.environ.get("YAH_TILES")
+    return json.load(open(path)) if path else {}
+
+
 # Formats the tile GEMM (tools/gen_gemm_tile.py) is verified bit-identical on in the pp2048 pipeline.
 TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "q3k", "q8_0")
 
@@ -94,6 +101,8 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     if fmt not in TILE_FMTS:
         return None
     t = TG.default_tile(fmt, kind, kb, geom)
+    if not geom and out[:-4] in tiles():
+        t = dataclasses.replace(t, **tiles()[out[:-4]])
     if mt % t.rowgrp:
         return None
     return _emit_gen(lambda f, k: TG.gen(f, k, t), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp)

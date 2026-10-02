@@ -33,6 +33,24 @@ for pair in "loom_forward_pp:engine/run/loom_forward_pp.cc" "hal_bench:engine/ru
     esac
   done
 done
+
+# Refuse a shared GPU: another compute client, or another workload keeping it busy, skews every timing and counter.
+# The desktop holds the render node and idles at a few percent busy.
+KFD="$(doas fuser /dev/kfd 2>/dev/null | tr -s ' ')"
+if [ -n "${KFD// /}" ]; then
+  echo "gpu_run: /dev/kfd is open by pid(s)$KFD -- refusing a shared GPU" >&2
+  exit 4
+fi
+BUSY=0
+for _ in 1 2 3 4 5; do
+  b="$(cat /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | sort -n | tail -1)"
+  BUSY=$((BUSY + ${b:-0}))
+  sleep 0.2
+done
+if [ $((BUSY / 5)) -gt 20 ]; then
+  echo "gpu_run: GPU is $((BUSY / 5))% busy before the run -- refusing a shared GPU" >&2
+  exit 4
+fi
 mkdir -p "$LOGDIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG="$LOGDIR/gpu-${TAG}-${STAMP}.dmesg.log"
