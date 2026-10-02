@@ -69,18 +69,18 @@ def gen_rmsnorm(D=5120, eps=1e-6, NT=512):
     return "\n".join(L) + "\n"
 
 
-def gen_deltanet(NH=48, NKH=16, D=128, fuse=False, hoist=False):
+def gen_deltanet(NH=48, NKH=16, D=128):
     """yah_deltanet_decode_resident_f32's math (see its header), one workgroup per
     value head, 512 lanes: lane t owns row j = t / 4 and keys 32 (t % 4) .. +32,
     k_norm / q_norm in LDS, the two row dots finished with xor shuffles 1, 2.
 
-    fuse: the decode conv (yah_ssm_conv_decode: dot = s1 w0 + s2 w1 + s3 w2 + x w3,
+    The decode conv (yah_ssm_conv_decode: dot = s1 w0 + s2 w1 + s3 w2 + x w3,
     silu, state shift) runs here on the raw qkv projection: lanes 0..127 convolve the
     head's q / k channels (key head kh = h % NKH, recomputed by its NH / NKH value
     heads) and v channels. The conv state ping-pongs between a read and a write buffer
     (the caller swaps them every token): a sibling head's reads never see this
     step's writes, and each channel is written once (q / k by head h < NKH).
-    hoist: the row lanes issue their state loads before the norm phase."""
+    The row lanes issue their state loads before the norm phase."""
     NT = 512
     nw = NT // 32
     SN = NH * D * D
@@ -94,10 +94,7 @@ def gen_deltanet(NH=48, NKH=16, D=128, fuse=False, hoist=False):
     e(f"  %nh = index.constant {NH} : index")
     e(f"  %nt = index.constant {NT} : index")
     e("  kernel.launch.config workgroups(%nh, %u1, %u1) workgroup_size(%nt, %u1, %u1) : index")
-    if fuse:
-        e("} launch(%conv: buffer, %cw: buffer, %csr: buffer, %csw: buffer, %state: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, %ssm_dt: buffer, %ssm_norm: buffer, %gate: buffer, %out: buffer) {")
-    else:
-        e("} launch(%conv: buffer, %state: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, %ssm_dt: buffer, %ssm_norm: buffer, %gate: buffer, %out: buffer) {")
+    e("} launch(%conv: buffer, %cw: buffer, %csr: buffer, %csw: buffer, %state: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, %ssm_dt: buffer, %ssm_norm: buffer, %gate: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 4, 32, 128):
         e(f"  %c{v} = index.constant {v} : index")
@@ -111,13 +108,10 @@ def gen_deltanet(NH=48, NKH=16, D=128, fuse=False, hoist=False):
     e("  %w1 = scalar.constant 1 : i32")
     e("  %w2 = scalar.constant 2 : i32")
     e("  %w32 = scalar.constant 32 : i32")
-    if fuse:
-        e("  %c_na, %cw_na, %csr_na, %csw_na, %s_na, %a_na, %b_na, %sa_na, %dt_na, %n_na, %g_na, %o_na = buffer.assume.noalias %conv, %cw, %csr, %csw, %state, %alpha, %beta, %ssm_a, %ssm_dt, %ssm_norm, %gate, %out : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer")
-        e(f"  %cwv = buffer.view %cw_na[%base] : buffer -> view<{4 * CV}xf32>")
-        e(f"  %csrv = buffer.view %csr_na[%base] : buffer -> view<{4 * CV}xf32>")
-        e(f"  %cswv = buffer.view %csw_na[%base] : buffer -> view<{4 * CV}xf32>")
-    else:
-        e("  %c_na, %s_na, %a_na, %b_na, %sa_na, %dt_na, %n_na, %g_na, %o_na = buffer.assume.noalias %conv, %state, %alpha, %beta, %ssm_a, %ssm_dt, %ssm_norm, %gate, %out : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer")
+    e("  %c_na, %cw_na, %csr_na, %csw_na, %s_na, %a_na, %b_na, %sa_na, %dt_na, %n_na, %g_na, %o_na = buffer.assume.noalias %conv, %cw, %csr, %csw, %state, %alpha, %beta, %ssm_a, %ssm_dt, %ssm_norm, %gate, %out : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer")
+    e(f"  %cwv = buffer.view %cw_na[%base] : buffer -> view<{4 * CV}xf32>")
+    e(f"  %csrv = buffer.view %csr_na[%base] : buffer -> view<{4 * CV}xf32>")
+    e(f"  %cswv = buffer.view %csw_na[%base] : buffer -> view<{4 * CV}xf32>")
     e(f"  %cv = buffer.view %c_na[%base] : buffer -> view<{CV}xf32>")
     e(f"  %sv = buffer.view %s_na[%base] : buffer -> view<{SN}xf32>")
     for nm in ("a", "b", "sa", "dt"):
@@ -125,7 +119,7 @@ def gen_deltanet(NH=48, NKH=16, D=128, fuse=False, hoist=False):
     e(f"  %nv = buffer.view %n_na[%base] : buffer -> view<{D}xf32>")
     e(f"  %gv = buffer.view %g_na[%base] : buffer -> view<{NH * D}xf32>")
     e(f"  %ov = buffer.view %o_na[%base] : buffer -> view<{NH * D}xf32>")
-    NL = 2 * D + 3 * nw + (D if fuse else 0)     # + conv'd v (fuse) at VB
+    NL = 2 * D + 3 * nw + D     # + conv'd v at VB
     VB = 2 * D + 3 * nw
     LV = f"view<{NL}xf32>"
     e(f"  %pb = index.constant {NL * 4} : offset")
@@ -137,22 +131,18 @@ def gen_deltanet(NH=48, NKH=16, D=128, fuse=False, hoist=False):
     e("  %ln = index.rem %t, %c32 : index")
     e("  %l0 = index.cmp eq, %ln, %c0 : index")
     e("  %kh = index.rem %h, %cnkh : index")
-
-    def row_setup_and_loads():
-        e("  %j = index.div %t, %c4 : index")
-        e("  %p = index.rem %t, %c4 : index")
-        e("  %p32 = index.mul %p, %c32 : index")
-        e(f"  %hb = index.constant {D * D} : index")
-        e("  %so0 = index.mul %h, %hb : index")
-        e("  %so1 = index.mul %j, %c128 : index")
-        e("  %so2 = index.add %so0, %so1 : index")
-        e("  %so = index.add %so2, %p32 : index")
-        for c in range(8):
-            e(f"  %o{c}c = index.constant {4 * c} : index")
-            e(f"  %sa{c} = index.add %so, %o{c}c : index")
-            e(f"  %S{c} = vector.load %sv[%sa{c}] : view<{SN}xf32> -> vector<4xf32>")
-    if hoist:
-        row_setup_and_loads()
+    e("  %j = index.div %t, %c4 : index")
+    e("  %p = index.rem %t, %c4 : index")
+    e("  %p32 = index.mul %p, %c32 : index")
+    e(f"  %hb = index.constant {D * D} : index")
+    e("  %so0 = index.mul %h, %hb : index")
+    e("  %so1 = index.mul %j, %c128 : index")
+    e("  %so2 = index.add %so0, %so1 : index")
+    e("  %so = index.add %so2, %p32 : index")
+    for c in range(8):
+        e(f"  %o{c}c = index.constant {4 * c} : index")
+        e(f"  %sa{c} = index.add %so, %o{c}c : index")
+        e(f"  %S{c} = vector.load %sv[%sa{c}] : view<{SN}xf32> -> vector<4xf32>")
     # decay / learning rate
     e("  %dt = view.load %dtv[%h] : view<" + str(NH) + "xf32> -> f32")
     e("  %aval = view.load %sav[%h] : view<" + str(NH) + "xf32> -> f32")
@@ -184,57 +174,53 @@ def gen_deltanet(NH=48, NKH=16, D=128, fuse=False, hoist=False):
     e(f"  %kb0 = index.add %cnkh, %kh : index")
     e("  %kb = index.mul %kb0, %c128 : index")
     e("  %ki = index.add %kb, %tee : index")
-    if fuse:
-        e(f"  %vb0 = index.constant {2 * NKH * D} : index")
-        e("  %vh0 = index.mul %h, %c128 : index")
-        e("  %vi1 = index.add %vb0, %vh0 : index")
-        e("  %vci = index.add %vi1, %tee : index")
-        e("  %ownqk = index.cmp ult, %h, %cnkh : index")
-        for nm, ch, own in (("qx", "%qi", "%ownqk"), ("kx", "%ki", "%ownqk"), ("vx", "%vci", None)):
-            e(f"  %{nm}c4 = index.mul {ch}, %c4 : index")
-            ws, ss = [], []
-            for k in range(4):
-                e(f"  %{nm}o{k} = index.add %{nm}c4, %c{k} : index") if k in (0, 1, 2, 4) else \
-                    e(f"  %{nm}o{k} = index.add %{nm}c4, %c3_ : index")
-                e(f"  %{nm}w{k} = view.load %cwv[%{nm}o{k}] : view<{4 * CV}xf32> -> f32")
-                ws.append(f"%{nm}w{k}")
-                if k:
-                    e(f"  %{nm}s{k} = view.load %csrv[%{nm}o{k}] : view<{4 * CV}xf32> -> f32")
-                    ss.append(f"%{nm}s{k}")
-            e(f"  %{nm}in = view.load %cv[{ch}] : view<{CV}xf32> -> f32")
-            e(f"  %{nm}t1 = scalar.mulf {ss[0]}, {ws[0]} : f32")
-            e(f"  %{nm}t2 = scalar.mulf {ss[1]}, {ws[1]} : f32")
-            e(f"  %{nm}t3 = scalar.mulf {ss[2]}, {ws[2]} : f32")
-            e(f"  %{nm}t4 = scalar.mulf %{nm}in, {ws[3]} : f32")
-            e(f"  %{nm}a1 = scalar.addf %{nm}t1, %{nm}t2 : f32")
-            e(f"  %{nm}a2 = scalar.addf %{nm}a1, %{nm}t3 : f32")
-            e(f"  %{nm}d = scalar.addf %{nm}a2, %{nm}t4 : f32")
-            e(f"  %{nm}ng = scalar.negf %{nm}d : f32")
-            e(f"  %{nm}e = scalar.expf<afn> %{nm}ng : f32")
-            e(f"  %{nm}den = scalar.addf %one, %{nm}e : f32")
-            e(f"  %{nm}sg = scalar.divf %one, %{nm}den : f32")
-            e(f"  %{nm} = scalar.mulf %{nm}d, %{nm}sg : f32")
-            cond = "%isel" if own is None else f"%{nm}wr"
-            if own is not None:
-                e(f"  %{nm}wr0 = index.cmp ult, %t, %c128 : index")
-                e(f"  %{nm}wr = scf.if %{nm}wr0 -> (i1) {{")
-                e(f"    scf.yield {own} : i1")
-                e("  } else {")
-                e("    %fls = index.cmp ult, %c1, %c0 : index")
-                e("    scf.yield %fls : i1")
-                e("  }")
-            e(f"  scf.if {cond} {{")
-            for k, v in enumerate(ss + [f"%{nm}in"]):
-                e(f"    view.store {v}, %cswv[%{nm}o{k}] : f32, view<{4 * CV}xf32>")
+    e(f"  %vb0 = index.constant {2 * NKH * D} : index")
+    e("  %vh0 = index.mul %h, %c128 : index")
+    e("  %vi1 = index.add %vb0, %vh0 : index")
+    e("  %vci = index.add %vi1, %tee : index")
+    e("  %ownqk = index.cmp ult, %h, %cnkh : index")
+    for nm, ch, own in (("qx", "%qi", "%ownqk"), ("kx", "%ki", "%ownqk"), ("vx", "%vci", None)):
+        e(f"  %{nm}c4 = index.mul {ch}, %c4 : index")
+        ws, ss = [], []
+        for k in range(4):
+            e(f"  %{nm}o{k} = index.add %{nm}c4, %c{k} : index") if k in (0, 1, 2, 4) else \
+                e(f"  %{nm}o{k} = index.add %{nm}c4, %c3_ : index")
+            e(f"  %{nm}w{k} = view.load %cwv[%{nm}o{k}] : view<{4 * CV}xf32> -> f32")
+            ws.append(f"%{nm}w{k}")
+            if k:
+                e(f"  %{nm}s{k} = view.load %csrv[%{nm}o{k}] : view<{4 * CV}xf32> -> f32")
+                ss.append(f"%{nm}s{k}")
+        e(f"  %{nm}in = view.load %cv[{ch}] : view<{CV}xf32> -> f32")
+        e(f"  %{nm}t1 = scalar.mulf {ss[0]}, {ws[0]} : f32")
+        e(f"  %{nm}t2 = scalar.mulf {ss[1]}, {ws[1]} : f32")
+        e(f"  %{nm}t3 = scalar.mulf {ss[2]}, {ws[2]} : f32")
+        e(f"  %{nm}t4 = scalar.mulf %{nm}in, {ws[3]} : f32")
+        e(f"  %{nm}a1 = scalar.addf %{nm}t1, %{nm}t2 : f32")
+        e(f"  %{nm}a2 = scalar.addf %{nm}a1, %{nm}t3 : f32")
+        e(f"  %{nm}d = scalar.addf %{nm}a2, %{nm}t4 : f32")
+        e(f"  %{nm}ng = scalar.negf %{nm}d : f32")
+        e(f"  %{nm}e = scalar.expf<afn> %{nm}ng : f32")
+        e(f"  %{nm}den = scalar.addf %one, %{nm}e : f32")
+        e(f"  %{nm}sg = scalar.divf %one, %{nm}den : f32")
+        e(f"  %{nm} = scalar.mulf %{nm}d, %{nm}sg : f32")
+        cond = "%isel" if own is None else f"%{nm}wr"
+        if own is not None:
+            e(f"  %{nm}wr0 = index.cmp ult, %t, %c128 : index")
+            e(f"  %{nm}wr = scf.if %{nm}wr0 -> (i1) {{")
+            e(f"    scf.yield {own} : i1")
+            e("  } else {")
+            e("    %fls = index.cmp ult, %c1, %c0 : index")
+            e("    scf.yield %fls : i1")
             e("  }")
-        e("  %vlb = index.constant " + str(VB) + " : index")
-        e("  %vla = index.add %vlb, %tee : index")
-        e("  scf.if %isel {")
-        e(f"    view.store %vx, %lv[%vla] : f32, view<{NL}xf32>")
+        e(f"  scf.if {cond} {{")
+        for k, v in enumerate(ss + [f"%{nm}in"]):
+            e(f"    view.store {v}, %cswv[%{nm}o{k}] : f32, view<{4 * CV}xf32>")
         e("  }")
-    else:
-        e(f"  %qx = view.load %cv[%qi] : view<{CV}xf32> -> f32")
-        e(f"  %kx = view.load %cv[%ki] : view<{CV}xf32> -> f32")
+    e("  %vlb = index.constant " + str(VB) + " : index")
+    e("  %vla = index.add %vlb, %tee : index")
+    e("  scf.if %isel {")
+    e(f"    view.store %vx, %lv[%vla] : f32, view<{NL}xf32>")
+    e("  }")
     e("  %qq0 = scalar.mulf %qx, %qx : f32")
     e("  %kk0 = scalar.mulf %kx, %kx : f32")
     e("  %qq = scf.if %isel -> (f32) {")
@@ -284,8 +270,6 @@ def gen_deltanet(NH=48, NKH=16, D=128, fuse=False, hoist=False):
     e("  }")
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     # rows: j = t / 4, keys 32 p .. 32 p + 32
-    if not hoist:
-        row_setup_and_loads()
     e("  %as = vector.splat %alph : vector<4xf32>")
     srow, kn4, qn4 = [], [], []
     u = "%zf"
@@ -306,16 +290,10 @@ def gen_deltanet(NH=48, NKH=16, D=128, fuse=False, hoist=False):
             cur = f"%{tag}{m}"
         return cur
     uj = xred(u, "ux")
-    e(f"  %vb = index.constant {2 * NKH * D} : index")
     e("  %vh = index.mul %h, %c128 : index")
-    e("  %vi0 = index.add %vb, %vh : index")
-    e("  %vi = index.add %vi0, %j : index")
-    if fuse:
-        e(f"  %vjl0 = index.constant {VB} : index")
-        e("  %vjl = index.add %vjl0, %j : index")
-        e(f"  %vj = view.load %lv[%vjl] : {LV} -> f32")
-    else:
-        e(f"  %vj = view.load %cv[%vi] : view<{CV}xf32> -> f32")
+    e(f"  %vjl0 = index.constant {VB} : index")
+    e("  %vjl = index.add %vjl0, %j : index")
+    e(f"  %vj = view.load %lv[%vjl] : {LV} -> f32")
     e(f"  %dv = scalar.subf %vj, {uj} : f32")
     e("  %dj = scalar.mulf %dv, %bet : f32")
     e("  %ds = vector.splat %dj : vector<4xf32>")

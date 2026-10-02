@@ -9,13 +9,10 @@
 // takes the token count B from the command line and every kernel is dispatched
 // with its token axes multiplied out:
 //
-//   GEMM family    grid (m_tiles, token_tiles, 1|k_split), token_tiles = B/TILE
+//   GEMM family    grid (m_tiles, token_tiles, 1), token_tiles = B/TILE
 //   norm/conv/...  grid (tiles, B) or (B, 1, 1)
 //   attention      grid (heads, B), one workgroup per (head, token), keys
 //                  0..token causal, KV cache max_context = B deep
-//   residual       the K-split partials are token-major over the WHOLE prompt,
-//                  so the reduction dim is 5120*B (not 5120*TILE) and the
-//                  per-split stride is m_rows*B
 //
 // One pass means start_pos is 0 everywhere and the recurrent state (the ssm conv
 // ring, the DeltaNet state) starts zeroed, so the recurrence is unchanged: this
@@ -27,8 +24,6 @@
 // grid and that is not a caught error.
 //
 // usage: loom_forward_pp <model.gguf> <haldir> <out-prefix> [tokens] [ids-file]
-//   env YAH_LOOM_TIME=1|2   category / per-dispatch timing
-//   env YAH_SKIP_HEAD=1     skip the output projection and argmax
 //
 // outputs: <out-prefix>.logits (vocab f32, last token) and <out-prefix>.hidden
 //          (B x 5120 f32, token major)
@@ -44,7 +39,6 @@
 #include <map>
 #include <string>
 #include <utility>
-#include <random>
 #include <vector>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -78,10 +72,6 @@ constexpr std::uint32_t kHeads = 24;
 constexpr std::uint32_t kKvHeads = 4;
 constexpr std::uint32_t kHeadDim = 256;
 constexpr std::uint32_t kVocab = 248320;
-// K-split factor for the residual projections. Runtime, so the emitter's
-// YAH_KSPLIT and the driver's YAH_KSPLIT can be swept: the 4-way split is the
-// only geometry where the residual arm was ever measured to be nondeterministic.
-std::uint32_t g_ksplit = 4;
 // One KV slot per prompt token per layer.
 constexpr std::uint32_t kKvRow = kKvHeads * kHeadDim;  // 1024
 
@@ -110,8 +100,6 @@ bool FmtOf(std::uint32_t type, Fmt* out) {
 struct Imported { hrx_buffer_t handle; std::size_t offset; std::size_t bytes; };
 
 std::uint32_t g_b = 0;   // prompt tokens in this run
-int g_dump_layer = -1;   // YAH_DUMP_LAYER: checkpoint this layer's stages
-int g_layer_now = -1;    // the layer the driver is on
 std::uint32_t g_tt = 0;  // GEMM token tiles = g_b / g_gtile
 // The GEMM launch geometry the HAL set was emitted with, read from
 // <haldir>/dispatch.json. The emitter writes it, so the grid this driver passes
@@ -122,77 +110,17 @@ std::uint32_t g_tt = 0;  // GEMM token tiles = g_b / g_gtile
 // "Launch geometry is not public stage configuration ... stage authoring code
 // must not mirror the arithmetic in C."
 std::uint32_t g_gtile = kTile;  // fallback GEMM tile when dispatch.txt says nothing
-int g_time = 0;
-std::string g_key;  // YAH_LOOM_TIME=3: timing key for the next dispatch
-bool g_fused_residual = true;  // YAH_FUSED_RESIDUAL=0 disables the gemm_kres path
-std::map<std::string, double> g_per_name;
-std::map<std::string, int> g_per_count;
-std::chrono::steady_clock::time_point g_mark = std::chrono::steady_clock::now();
-// YAH_TRACE_LOAD: wall time since process start at each setup/teardown phase.
-const std::chrono::steady_clock::time_point g_start = std::chrono::steady_clock::now();
-void Phase(const char* what) {
-  static const bool on = std::getenv("YAH_TRACE_LOAD") != nullptr;
-  if (on)
-    std::fprintf(stderr, "[phase] %8.1f ms  %s\n",
-                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_start).count(), what);
-}
-// YAH_LOOM_SEQ=<path>: every dispatch's key (HAL or kernel name) and grid in
-// submission order, written at exit. No synchronization, so it pairs with an
-// HRX_PROFILE_FILE=... HRX_PROFILE_MODE=dispatch capture of the same run: the
-// profile has device durations per dispatch but only anonymous executable ids.
-std::FILE* g_seq = nullptr;
-std::size_t g_seq_n = 0;
 
 void Dispatch(LoomDevice& gpu, const LoomExecutable& exe, const char* name,
               std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
               std::uint32_t sx, std::uint32_t sy, std::uint32_t sz,
               const std::vector<hrx_buffer_ref_t>& b) {
-  static const bool dt = std::getenv("YAH_LOOM_DISPATCH_TIMING") != nullptr;
-  static double in_us = 0, between_us = 0, meta_us = 0; static long n = 0;
-  static std::chrono::steady_clock::time_point last_return;
-  const auto t_in = std::chrono::steady_clock::now();
-  static std::map<std::string, std::pair<double, long>> gap_by_next;
-  if (dt && n) {
-    const double g = std::chrono::duration<double, std::micro>(t_in - last_return).count();
-    between_us += g;
-    auto& e = gap_by_next[name]; e.first += g; ++e.second;
-  }
   // The executable's own workgroup size is authoritative; sx is only the
   // fallback for metadata that does not carry one.
   const std::uint32_t ordinal = exe.OrdinalOrZero(name);
   const std::uint32_t ws = exe.WorkgroupSize(ordinal);
-  if (dt) meta_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_in).count();
-  struct Report { ~Report() {
-    if (!(dt && n)) return;
-    std::fprintf(stderr, "Dispatch(): %ld calls, inside %.1f ms (metadata %.1f ms), between calls %.1f ms\n", n, in_us / 1000, meta_us / 1000, between_us / 1000);
-    std::vector<std::pair<double, std::string>> v;
-    for (auto& kv : gap_by_next) v.push_back({kv.second.first, kv.first + " (" + std::to_string(kv.second.second) + ")"});
-    std::sort(v.rbegin(), v.rend());
-    for (std::size_t i = 0; i < v.size() && i < 8; ++i) std::fprintf(stderr, "  host gap before %-40s %8.1f ms\n", v[i].second.c_str(), v[i].first / 1000);
-  } };
-  static Report report;
-  if (g_seq)
-    std::fprintf(g_seq, "%zu,%s,%u,%u,%u\n", g_seq_n++,
-                 g_key.empty() ? name : g_key.c_str(), gx, gy, gz);
-  if (g_time >= 2) gpu.Synchronize();
-  g_mark = std::chrono::steady_clock::now();
   gpu.Dispatch(exe, ordinal, LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz),
                nullptr, 0, b.data(), b.size());
-  if (g_time >= 2) {
-    gpu.Synchronize();
-    // YAH_LOOM_TIME=3 keys the GEMMs by their HAL (format and shape) instead of
-    // the kernel name, so per-shape efficiency is visible.
-    const std::string key = (g_time >= 3 && !g_key.empty()) ? g_key : std::string(name);
-    g_per_name[key] += std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now() - g_mark).count();
-    g_per_count[key]++;
-  }
-  g_key.clear();
-  if (dt) {
-    last_return = std::chrono::steady_clock::now();
-    in_us += std::chrono::duration<double, std::micro>(last_return - t_in).count();
-    ++n;
-  }
 }
 
 // The launch geometry each GEMM HAL was compiled for, read from
@@ -307,34 +235,9 @@ int main(int argc, char** argv) {
   const std::string prefix = argv[3];
   const std::uint32_t want = argc > 4 ? std::strtoul(argv[4], nullptr, 10) : 2048;
   const char* ids_path = argc > 5 ? argv[5] : "/home/q/yah-scratch/ids2048.txt";
-  { const char* t = std::getenv("YAH_LOOM_TIME");
-    g_time = t ? std::min(std::atoi(t), 3) : 0; }
-  if (const char* q = std::getenv("YAH_LOOM_SEQ")) {
-    g_seq = std::fopen(q, "w");
-    if (g_seq) std::fprintf(g_seq, "seq,key,gx,gy,gz\n");
-  }
-  // YAH_DUMP_LAYER=<l> writes three checkpoints from layer l: the mixer input
-  // (the f16 normed activation), hidden after the mixer, and hidden after the
-  // FFN. It exists to locate a stage that disagrees between two token counts.
-  { const char* t = std::getenv("YAH_DUMP_LAYER"); if (t) g_dump_layer = std::atoi(t); }
-  { const char* t = std::getenv("YAH_KSPLIT");
-    if (t) { g_ksplit = std::atoi(t); }
-    if (g_ksplit < 1 || g_ksplit > 8) throw LoomError("YAH_KSPLIT must be 1..8"); }
-  const bool skip_head = std::getenv("YAH_SKIP_HEAD") != nullptr;
-  { const char* t = std::getenv("YAH_FUSED_RESIDUAL"); if (t && std::string(t) == "0") g_fused_residual = false; }
-  // YAH_KSTORE_RESIDUAL=1 runs the gemm_residual projections (ffn_down,
-  // attn_output, ssm_out) on the CHAINED kStore HAL instead of the residual
-  // source. The residual source still uses the old one-column-per-lane decode
-  // that widen_rows cannot address, so it runs at the shipping geometry; the
-  // kStore variant is the chained one. The accumulate is unchanged -- the kStore
-  // writes the same token-major [B][m_rows] layout into 'partial' split 0, and
-  // the reduction below adds that into the residual exactly as before.
-  const char* ks_env = std::getenv("YAH_KSTORE_RESIDUAL");
-  const std::string ks_residual = ks_env ? std::string(ks_env) : std::string();
   try {
     auto gguf = yah::core::Gguf::Open(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
-    Phase("gguf open");
     std::vector<std::uint32_t> ids_all = ParseIds(ids_path);
     g_b = want ? want : static_cast<std::uint32_t>(ids_all.size());
     if (ids_all.size() < g_b) {
@@ -379,13 +282,10 @@ int main(int argc, char** argv) {
     std::uint32_t kFull = 0;
     for (std::uint32_t l = 0; l < cfg.main_block_count(); ++l)
       if (cfg.IsFullAttention(l)) ++kFull;
-    Phase("dispatch table");
     LoomDevice gpu;
     // The layers queue ~950 dispatches and wait once at the end; the runtime
     // wait would busy-poll a core for the whole prefill (LOOM_RUNTIME.md).
-    // YAH_LOOM_TIME waits after every stage, so it keeps the runtime wait.
-    if (!g_time) gpu.SetSleepSync(200);
-    Phase("device");
+    gpu.SetSleepSync(200);
     std::fprintf(stderr,
                  "loom_forward_pp: tokens=%u tile=%u token_tiles=%u layers=%u geometry=%zu hal(s)\n",
                  B, g_gtile, g_tt, cfg.main_block_count(), g_geom.size());
@@ -399,18 +299,8 @@ int main(int argc, char** argv) {
       const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(wbase) & ~(page - 1);
       weights_delta = reinterpret_cast<std::uintptr_t>(wbase) - start;
       const std::size_t wbytes = gguf.tensor_data_size() + weights_delta;
-      if (std::getenv("YAH_LOOM_WEIGHTS_DEVICE")) {
-        // A device-local copy instead of the imported mmap (HIP's layout).
-        weights = gpu.Allocate(wbytes);
-        const std::size_t chunk = std::size_t{256} << 20;
-        for (std::size_t off = 0; off < wbytes; off += chunk)
-          gpu.H2D(weights, reinterpret_cast<const void*>(start + off),
-                  std::min(chunk, wbytes - off), off);
-      } else {
-        weights = gpu.Import(reinterpret_cast<void*>(start), wbytes);
-      }
+      weights = gpu.Import(reinterpret_cast<void*>(start), wbytes);
     }
-    Phase("weights import");
     auto ImportTensor = [&](const yah::core::TensorInfo& t) -> Imported {
       return {weights.handle, weights_delta + static_cast<std::size_t>(t.offset),
               static_cast<std::size_t>(t.bytes)};
@@ -418,10 +308,7 @@ int main(int argc, char** argv) {
     std::map<std::string, LoomExecutable> exes;
     auto load = [&](const std::string& path) -> LoomExecutable& {
       auto it = exes.find(path);
-      if (it == exes.end()) {
-        if (std::getenv("YAH_TRACE_LOAD")) std::fprintf(stderr, "[load] %s\n", path.c_str());
-        it = exes.emplace(path, gpu.Load(path)).first;
-      }
+      if (it == exes.end()) it = exes.emplace(path, gpu.Load(path)).first;
       return it->second;
     };
     auto find = [&](const std::string& name) {
@@ -483,67 +370,20 @@ int main(int argc, char** argv) {
     LoomBuffer uwstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
     LoomBuffer wstage = gpu.Allocate(std::size_t{kFfn} * 16 * 2);
     // ostage is the epilogue scratch. The compiler declares it over the whole
-    // [m_rows][tokens] tile, so it must cover the widest GEMM (17408 rows) and
-    // the 4-way residual split (4 * 5120 rows) at this token count.
-    const std::size_t kStageRows = std::max<std::size_t>(kFfn, std::size_t{g_ksplit} * kHidden);
-    LoomBuffer ostage = gpu.Allocate(kStageRows * B * 4);
-    LoomBuffer partial = gpu.Allocate(kOutTotal * g_ksplit * 4);
+    // [m_rows][tokens] tile, so it must cover the widest GEMM (17408 rows) at this token count.
+    LoomBuffer ostage = gpu.Allocate(std::size_t{kFfn} * B * 4);
+    LoomBuffer partial = gpu.Allocate(kOutTotal * 4);
     LoomBuffer hidden2 = gpu.Allocate(kOutTotal * 4);
     LoomBuffer normed = gpu.Allocate(std::size_t{kHidden} * 4);
     LoomBuffer logits = gpu.Allocate(std::size_t{kVocab} * 4);
     LoomBuffer token = gpu.Allocate(4);
 
     const auto hb = [](const LoomBuffer& b) { return b.size; };
-    // Diagnostics probe: hold every per-layer weight buffer alive so the
-    // allocator cannot hand the same address back while a queued dispatch still
-    // references it. If the forward becomes deterministic with this, the
-    // nondeterminism is HRX VA reuse, not a kernel race.
-    std::vector<LoomBuffer> keep;
-    const auto dump_buf = [&](const LoomBuffer& src, std::size_t bytes, const std::string& tag) {
-      // Synchronize first. hrx_synchronous_d2h is synchronous for the copy, not
-      // for the stream, so a dump taken while dispatches are still queued reads a
-      // buffer that is mid-write -- the first bisect with these hooks reported
-      // stages as "differing" in an order that contradicted the data flow.
-      gpu.Synchronize();
-      std::vector<std::uint8_t> v(bytes);
-      gpu.D2H(src, v.data(), bytes, 0);
-      FILE* f = std::fopen((prefix + tag).c_str(), "wb");
-      std::fwrite(v.data(), 1, bytes, f);
-      std::fclose(f);
-    };
-    // dump_buf for a byte range (e.g. one layer's slot of the KV cache)
-    const auto dump_range = [&](const LoomBuffer& src, std::size_t offset, std::size_t bytes,
-                                const std::string& tag) {
-      gpu.Synchronize();
-      std::vector<std::uint8_t> v(bytes);
-      gpu.D2H(src, v.data(), bytes, offset);
-      FILE* f = std::fopen((prefix + tag).c_str(), "wb");
-      std::fwrite(v.data(), 1, bytes, f);
-      std::fclose(f);
-    };
     const float epsv = 1.0e-6f; gpu.H2D(eps, &epsv, 4);
     { std::vector<std::uint8_t> z(std::size_t{48} * kQkv * 4 * 4, 0); gpu.H2D(conv_state, z.data(), z.size()); }
     { std::vector<std::uint8_t> z(std::size_t{48} * kTs * kState * kState * 4, 0); gpu.H2D(state, z.data(), z.size()); }
     { std::vector<std::uint8_t> z(kv16_scratch ? 2 * kKv16Layer : std::size_t{2} * kFull * kKvCache * 2, 0); gpu.H2D(kv16, z.data(), z.size()); }
     { std::vector<std::uint8_t> z(static_cast<std::size_t>(B) * kHidden * 4, 0); gpu.H2D(reszero, z.data(), z.size()); }
-    // YAH_ZERO=1 pre-zeroes every scratch buffer. It is a diagnostic: if the
-    // forward stops varying between runs with it set, a kernel is reading a
-    // region the driver never wrote (HRX device memory is not zeroed, so its
-    // contents differ per process).
-    if (std::getenv("YAH_ZERO") != nullptr) {
-      const LoomBuffer* all[] = {&scratch, &qkv, &gate, &aout, &raw, &conv_out,
-                                 &kqbuf, &ab, &ffnup, &gateffn, &partial,
-                                 &hidden2, &sumout, &lse, &alpha, &beta, &q,
-                                 &kbuf, &vbuf, &ostage, &gwstage, &uwstage,
-                                 &wstage};
-      std::vector<std::uint8_t> z(1u << 20, 0);
-      for (const LoomBuffer* b : all) {
-        for (std::size_t off = 0; off < b->size; off += z.size())
-          gpu.H2D(*b, z.data(), std::min<std::size_t>(z.size(), b->size - off), off);
-      }
-    }
-
-    Phase("buffers");
     const auto* emb = find("token_embd.weight");
     std::vector<float> host_hidden(static_cast<std::size_t>(B) * kHidden);
     const std::uint8_t* emb_data = gguf.Data(*emb);
@@ -563,11 +403,8 @@ int main(int argc, char** argv) {
     // yah_ssm_conv_kq: the conv with prep_kq fused in, when the set has it
     LoomExecutable* e_convkq = nullptr;
     {
-      const char* off = std::getenv("YAH_CONVKQ");
       const std::string path = dir + "/convkq.hal";
-      if (!(off && std::string(off) == "0")) {
-        if (FILE* f = std::fopen(path.c_str(), "rb")) { std::fclose(f); e_convkq = &load(path); }
-      }
+      if (FILE* f = std::fopen(path.c_str(), "rb")) { std::fclose(f); e_convkq = &load(path); }
     }
     LoomExecutable& e_prepab = load(dir + "/prepab.hal");
     LoomExecutable& e_rowsplit = load(dir + "/rowsplit.hal");
@@ -587,17 +424,12 @@ int main(int argc, char** argv) {
     // sequence (logical page -> physical page, shared by all layers) bound to
     // attention and every cache writer. fp16 K / V go to paged pools through
     // RoPE (paged K store) / yah_vtpage per chunk (no V^T re-transpose of the whole cache).
-    // YAH_PAGE_SCRAMBLE=<seed>: a shuffled page assignment (testing).
     const bool kv_paged = g_geom.count("kv_paged") != 0;
     const std::uint32_t kPages = (T_ctx + 255) / 256;
     LoomBuffer ptab = gpu.Allocate(std::size_t{kv_paged ? kPages : 1} * 4);
     if (kv_paged) {
       std::vector<std::int32_t> pages(kPages);
       for (std::uint32_t i = 0; i < kPages; ++i) pages[i] = static_cast<std::int32_t>(i);
-      if (const char* sc = std::getenv("YAH_PAGE_SCRAMBLE")) {
-        std::mt19937 rng(static_cast<std::uint32_t>(std::atoi(sc)));
-        std::shuffle(pages.begin(), pages.end(), rng);
-      }
       // attention trusts the table (bounds assumed, not clamped): validate it here
       for (std::int32_t pg : pages)
         if (pg < 0 || pg >= static_cast<std::int32_t>(kPages)) throw LoomError("page table entry out of range");
@@ -696,9 +528,7 @@ int main(int argc, char** argv) {
       const std::string hal = std::string("gemm_kstore_") + f.name + "_" +
                               std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
-      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
-      g_key = hal;
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
@@ -714,13 +544,12 @@ int main(int argc, char** argv) {
     };
     // The attention q projection with the q/gate unpack fused into its epilogue
     // (gemm_kqg_*: rows = heads x [256 q | 256 gate] stored straight into q and
-    // gate, as yah_unpack_qg did). False if the set has no such HAL or
-    // YAH_KQG=0; the caller then runs kstore + unpack.
+    // gate, as yah_unpack_qg did). False if the set has no such HAL; the
+    // caller then runs kstore + unpack.
     // The set's attention HAL stores f16 straight into the o-projection input
     // (emitter marker "attn_f16out"): no yah_half_cast pass.
     const bool attn_f16 = g_geom.count("attn_f16out") != 0;
     auto run_kqg = [&](const std::string& wname) -> bool {
-      { const char* e = std::getenv("YAH_KQG"); if (e && std::string(e) == "0") return false; }
       const auto* tw = find(wname);
       Fmt f{};
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) return false;
@@ -731,9 +560,7 @@ int main(int argc, char** argv) {
       if (g_geom.find(hal) == g_geom.end()) return false;
       const Imported w = ImportTensor(*tw);
       LoomExecutable& exe = load(dir + "/" + hal);
-      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
-      g_key = hal;
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
@@ -759,9 +586,7 @@ int main(int argc, char** argv) {
       const std::string hal = std::string("gemm_swiglu_") + f.name + "_" +
                               std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
-      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
-      g_key = hal;
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
@@ -777,15 +602,6 @@ int main(int argc, char** argv) {
                mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1, b);
     };
     auto run_residual = [&](const std::string& wname, const LoomBuffer& input) {
-      // Narrow the kStore swap to ffn_down until its output layout is proven
-      // against the residual's partial. Routing all three residual projections at
-      // once made one bad path corrupt the whole residual stream.
-      // Default ON: route every residual projection through the chained kStore.
-      // YAH_KSTORE_RESIDUAL=off restores the residual source; any other value
-      // selects only the projections whose weight name contains it.
-      const bool kres = ks_residual.empty()
-                            ? true
-                            : (ks_residual != "off" && wname.find(ks_residual) != std::string::npos);
       const auto* tw = find(wname);
       Fmt f{};
       if (!FmtOf(static_cast<std::uint32_t>(tw->type), &f)) throw LoomError("no residual port for type on " + wname);
@@ -795,13 +611,12 @@ int main(int argc, char** argv) {
       // Fused residual (gen_gemm_shared kind "kres"): the GEMM reads hidden and
       // writes hidden + acc into hidden2 itself, so neither the partial buffer nor
       // the yah_residual_1d pass is needed; the handles are swapped after.
-      // Taken whenever the HAL set carries one; YAH_FUSED_RESIDUAL=0 disables it.
+      // Taken whenever the HAL set carries one.
       const std::string fused_hal = std::string("gemm_kres_") + f.name + "_" +
                                     std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
-      if (kres && g_fused_residual && g_geom.count(fused_hal)) {
+      if (g_geom.count(fused_hal)) {
         LoomExecutable& fx = load(dir + "/" + fused_hal);
         const Geom fg = GeomOf(fused_hal, B);
-        g_key = fused_hal;
         std::vector<hrx_buffer_ref_t> fb = {{w.handle, w.offset, w.bytes}};
         if (f.name == std::string("iq3s")) fb.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
         if (f.name == std::string("iq3xxs")) fb.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
@@ -818,97 +633,34 @@ int main(int argc, char** argv) {
         std::swap(hidden, hidden2);
         return;
       }
-      const std::string hal = std::string(kres ? "gemm_kstore_" : "gemm_residual_") +
-                              f.name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
-
+      // Otherwise the chained kStore writes the token-major [B][m_rows] product
+      // into partial and yah_residual_1d adds it into the residual.
+      const std::string hal = std::string("gemm_kstore_") + f.name + "_" + std::to_string(mt) + "_" +
+                              std::to_string(kb) + ".hal";
       LoomExecutable& exe = load(dir + "/" + hal);
-      if (std::getenv("YAH_TRACE_GEMM")) std::fprintf(stderr, "[hal] %s -> %s%c", wname.c_str(), hal.c_str(), 10);
       const Geom gm = GeomOf(hal, B);
-      g_key = hal;
       std::vector<hrx_buffer_ref_t> b = {{w.handle, w.offset, w.bytes}};
       if (f.name == std::string("iq3s")) b.push_back({grid_iq3s.handle, 0, hb(grid_iq3s)});
       if (f.name == std::string("iq3xxs")) b.push_back({grid_iq3xxs.handle, 0, hb(grid_iq3xxs)});
       if (f.name == std::string("iq2xxs")) b.push_back({grid_iq2xxs.handle, 0, hb(grid_iq2xxs)});
       if (f.name == std::string("iq2xs")) b.push_back({grid_iq2xs.handle, 0, hb(grid_iq2xs)});
       if (f.name == std::string("iq3xxs") || f.name == std::string("iq2xxs") || f.name == std::string("iq2xs")) b.push_back({ksigns_iq2xxs.handle, 0, hb(ksigns_iq2xxs)});
-      // This 3rd binding is the ACTIVATION for both sources. run_kstore hardcodes
-      // 'scratch' only because its callers' activation always lives there; for the
-      // residual projections the activation is the caller's input (ffnup for
-      // ffn_down, scratch for attn_output/ssm_out). Binding scratch unconditionally
-      // fed the kStore the wrong activation and produced uncorrelated output.
+      // The activation is the caller's input (ffnup for ffn_down, scratch for attn_output / ssm_out), not scratch as in run_kstore.
       b.push_back({input.handle, 0, hb(input)});
       b.push_back({wstage.handle, 0, hb(wstage)});
       b.push_back({ostage.handle, 0, hb(ostage)});
       b.push_back({partial.handle, 0, hb(partial)});
-      Dispatch(gpu, exe,
-               (std::string("yah_ffn_gemm_") + std::string(f.name) +
-                (kres ? "" : "_residual")).c_str(),
-               mt / gm.rowgrp, B / gm.tokens, kres ? 1u : g_ksplit, 32, 1, 1, b);
-      if (g_dump_layer == g_layer_now && &input == &ffnup) {
-        dump_buf(partial, kOutTotal * g_ksplit * 4, ".partial");
-        std::fprintf(stderr, "[dump] partial for layer %d\n", g_layer_now);
-      }
-      // Reduce the k_split partials into the residual: hidden += sum_s partial[s].
-      // The partial is token major over the whole prompt, so split s starts at
-      // s * (m_rows * B) floats -- that is why the dimension is 5120*B and not
-      // 5120*TILE. Ping-pong through hidden2 so the reduction's a and out
-      // bindings never alias; the last step lands in hidden (with a final
-      // zero-add pass when the split count is odd).
-      const std::size_t out_bytes = kOutTotal * 4;
-      const LoomBuffer* land = &hidden;
-      const std::uint32_t splits = kres ? 1u : g_ksplit;
-      for (std::uint32_t s = 0; s < splits; ++s) {
-        const LoomBuffer& src = (s % 2 == 0) ? hidden : hidden2;
-        const LoomBuffer& dst = (s % 2 == 0) ? hidden2 : hidden;
-        std::vector<hrx_buffer_ref_t> r = {
-            {src.handle, 0, hb(src)},
-            {partial.handle, std::size_t{s} * out_bytes, out_bytes},
-            {dst.handle, 0, hb(dst)}};
-        Dispatch(gpu, e_accum, "yah_residual_1d", static_cast<std::uint32_t>(kOutTotal / 256), 1, 1, 256, 1, 1, r);
-        land = &dst;
-      }
-      if (land != &hidden) {
-        // An odd split count (always, on the kStore-residual path) leaves the
-        // running sum in hidden2. Swap the two handles instead of copying it
-        // back through a zero-add pass: that pass was half of every residual's
-        // dispatches (128 of 256 per forward) and moved 126 MB each. Every
-        // consumer names the variable, so it follows the swap.
-        std::swap(hidden, hidden2);
-      }
+      Dispatch(gpu, exe, ("yah_ffn_gemm_" + std::string(f.name)).c_str(), mt / gm.rowgrp, B / gm.tokens, 1, 32, 1, 1,
+               b);
+      // The sum lands in hidden2; swap the two handles instead of copying it back.
+      // Every consumer names the variable, so it follows the swap.
+      std::vector<hrx_buffer_ref_t> r = {
+          {hidden.handle, 0, hb(hidden)}, {partial.handle, 0, kOutTotal * 4}, {hidden2.handle, 0, hb(hidden2)}};
+      Dispatch(gpu, e_accum, "yah_residual_1d", static_cast<std::uint32_t>(kOutTotal / 256), 1, 1, 256, 1, 1, r);
+      std::swap(hidden, hidden2);
     };
-    double t_norm = 0.0, t_mixer = 0.0, t_attn = 0.0, t_ssm = 0.0;
-    double t_ffn = 0.0, t_ffn_norm = 0.0, t_ffn_gate = 0.0, t_ffn_up = 0.0, t_ffn_down = 0.0;
-    std::chrono::steady_clock::time_point mark = std::chrono::steady_clock::now();
-    const auto tick = [&]() {
-      if (!g_time) return 0.0;
-      gpu.Synchronize();
-      const double d = std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now() - mark).count();
-      mark = std::chrono::steady_clock::now();
-      return d;
-    };
-    // YAH_LOOM_PRELOAD=1: load every GEMM HAL of the set before the timed
-    // region instead of lazily at first use (diagnostic for the host-side
-    // polling investigation; measured neutral, so off by default to keep
-    // layers_ms comparable with earlier runs).
-    if (std::getenv("YAH_LOOM_PRELOAD")) {
-      for (const auto& kv : g_geom) {
-        const std::string path = dir + "/" + kv.first;
-        if (FILE* f = std::fopen(path.c_str(), "rb")) {
-          std::fclose(f);
-          load(path);
-        }
-      }
-    }
     gpu.Synchronize();
-    Phase("embed + first HALs");
-    if (std::getenv("YAH_TRACE_LOAD")) std::fprintf(stderr, "[load] ---- timed region starts ----\n");
     const auto t0 = std::chrono::steady_clock::now();
-    // YAH_LAYERS=N stops after N layers. It exists to bisect a stage that
-    // disagrees between runs, which is how the residual-geometry race in the
-    // k-split GEMM was localised.
-    const char* lv = std::getenv("YAH_LAYERS");
-    const std::uint32_t n_layers = lv ? std::min<std::uint32_t>(std::atoi(lv), cfg.main_block_count()) : cfg.main_block_count();
     // YAH_LOGITS_FROM=P: f32 logits of every absolute position P..T-1 into
     // <prefix>.all_logits ((T-P) x vocab, row-major) for the correctness gate
     // (engine/run/accgate2.py), gathered after each chunk's layers.
@@ -1022,14 +774,10 @@ int main(int argc, char** argv) {
     }
     LoomExecutable& e_rope = *e_ropes[ci];
     LoomExecutable& e_wmma = *e_wmmas[ci];
-    for (std::uint32_t l = 0; l < n_layers; ++l) {
+    for (std::uint32_t l = 0; l < cfg.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
-      g_layer_now = static_cast<int>(l);
       const bool full = cfg.IsFullAttention(l);
       run_norm(pre + "attn_norm.weight");
-      if (g_dump_layer == static_cast<int>(l))
-        dump_buf(scratch, static_cast<std::size_t>(B) * kHidden * 2, ".xn");
-      t_norm += tick();
       if (full) {
         const std::uint32_t ai = l / cfg.full_attention_interval;
         const bool qg_fused = run_kqg(pre + "attn_q.weight");
@@ -1065,13 +813,6 @@ int main(int argc, char** argv) {
         }
         kv_hook(ai, ci, koff, voff);
         // w_qn/w_kn are views into the import; nothing to keep alive.
-        if (g_dump_layer == static_cast<int>(l)) {
-          // the attention kernel's inputs: roped q, gate, this layer's f16 K and V
-          dump_buf(q, static_cast<std::size_t>(B) * 6144 * 4, ".aq");
-          dump_buf(gate, static_cast<std::size_t>(B) * 6144 * 4, ".agate");
-          dump_range(kv16, koff, kKv16Layer, ".ak16");
-          dump_range(kv16, voff, kKv16Layer, ".av16");
-        }
         const std::size_t q8off = std::size_t{ai} * kKqBytes;
         const std::size_t ksoff = std::size_t{ai} * kKsBytes;
         const std::size_t kmoff = std::size_t{ai} * 4096;
@@ -1093,11 +834,6 @@ int main(int argc, char** argv) {
             b.push_back(ptab_ref);
           }
           Dispatch(gpu, kv_paged ? *e_kq8s[ci] : *e_kq8, attn_kq4 ? "yah_kq4" : "yah_kq8", (B + 1) / 2, 1, 1, 256, 1, 1, b);
-          if (g_dump_layer == static_cast<int>(l)) {   // quantized K, its scales, the channel mean
-            dump_range(kq8buf, q8off, kKqBytes, ".akq");
-            dump_range(ksbuf, ksoff, kKsBytes, ".aks");
-            dump_range(kmbuf, kmoff, 4096, ".akm");
-          }
         }
         const std::size_t vqoff = std::size_t{ai} * kVqBytes, vqsoff = std::size_t{ai} * kVqsBytes;
         if (attn_vqt) {
@@ -1106,10 +842,6 @@ int main(int argc, char** argv) {
               {vqsbuf.handle, vqsoff, kVqsBytes}};
           if (kv_paged) b.push_back(ptab_ref);
           Dispatch(gpu, *e_vqs[ci], attn_vq8 ? "yah_vq8" : "yah_vq4", 4, (B + 15) / 16, 1, 256, 1, 1, b);
-          if (g_dump_layer == static_cast<int>(l)) {   // quantized V^T and its (S, C') stats
-            dump_range(vqbuf, vqoff, kVqBytes, ".avq");
-            dump_range(vqsbuf, vqsoff, kVqsBytes, ".avs");
-          }
         } else if (paged_f16v) {
           std::vector<hrx_buffer_ref_t> b = {
               {kv16.handle, voff, f16rows}, {vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes}, ptab_ref};
@@ -1133,11 +865,6 @@ int main(int argc, char** argv) {
           if (attn_kq8) b.push_back({ksbuf.handle, ksoff, kKsBytes});
           if (attn_vqt) b.push_back({vqsbuf.handle, vqsoff, kVqsBytes});
           if (kv_paged) b.push_back(ptab_ref);
-          // YAH_ATTN_GRID_OLD restores the pre-WMMA attention launch geometry so the
-          // two attention kernels can be A/Bd from ONE binary, interleaved, without a
-          // rebuild between runs (a failed rebuild leaves a stale binary and a mismatched
-          // grid silently produces garbage).
-          const bool attn_old_grid = std::getenv("YAH_ATTN_GRID_OLD") != nullptr;
           // tools/gen_attn_heads.py runs H query heads of one GQA group per
           // workgroup; dispatch.txt records H as the "wmma.hal" row group.
           const auto attn_geom = g_geom.find("wmma.hal");
@@ -1150,42 +877,26 @@ int main(int argc, char** argv) {
           // The kernel's launch contract fixes its grid, and Loom drops bounds
           // clamps it proves from it: extra workgroups read unmapped VA and hang
           // the ring. Refuse a grid the emitter did not record.
-          if (!attn_old_grid && attn_geom != g_geom.end() && attn_geom->second.tt &&
+          if (attn_geom != g_geom.end() && attn_geom->second.tt &&
               (B + attn_tpw - 1) / attn_tpw != attn_geom->second.tt)
             throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
           // gen_attn_fa with GQA packing runs 12-wave workgroups ("attn_wg384")
           const std::uint32_t attn_wg = g_geom.count("attn_wg384") ? 384 : 256;
-          Dispatch(gpu, e_wmma, "yah_attn_wmma",
-                   attn_old_grid ? kHeads : (B + attn_tpw - 1) / attn_tpw,
-                   attn_old_grid ? B : kHeads / attn_hpw, 1,
-                   attn_old_grid ? 32 : attn_wg, 1, 1, b);
+          Dispatch(gpu, e_wmma, "yah_attn_wmma", (B + attn_tpw - 1) / attn_tpw, kHeads / attn_hpw, 1, attn_wg, 1, 1,
+                   b);
         }
-        if (g_dump_layer == static_cast<int>(l) && !attn_f16)
-          dump_buf(aout, static_cast<std::size_t>(B) * 6144 * 4, ".aout");
         if (!attn_f16) {
           std::vector<hrx_buffer_ref_t> b = {
               {aout.handle, 0, hb(aout)}, {scratch.handle, 0, hb(scratch)}};
           Dispatch(gpu, e_cast, "yah_half_cast", 24 * B, 1, 1, 256, 1, 1, b);
         }
         run_residual(pre + "attn_output.weight", scratch);
-        t_attn += tick();
       } else {
         const std::uint32_t si = l - l / cfg.full_attention_interval;
         run_kstore(pre + "attn_qkv.weight", qkv);
-        if (g_dump_layer == static_cast<int>(l))
-          dump_buf(qkv, static_cast<std::size_t>(B) * kQkv * 4, ".qkv");
-        // YAH_CONCUR=1 (needs the local HRX no-barrier prototype): the z
-        // projection runs after DeltaNet with no barrier between them, so the
-        // WMMA-bound GEMM overlaps the VALU-bound scan; postnorm (the first
-        // consumer of both) keeps its barrier.
-        static const bool concur = std::getenv("YAH_CONCUR") != nullptr;
-        if (!concur) run_kstore(pre + "attn_gate.weight", gate);
+        run_kstore(pre + "attn_gate.weight", gate);
         run_kstore(pre + "ssm_alpha.weight", alpha);
         run_kstore(pre + "ssm_beta.weight", beta);
-        if (g_dump_layer == static_cast<int>(l)) {
-          dump_buf(alpha, static_cast<std::size_t>(B) * kTs * 4, ".alpha");
-          dump_buf(beta, static_cast<std::size_t>(B) * kTs * 4, ".beta");
-        }
         const auto* convw = find(pre + "ssm_conv1d.weight");
         const Imported w_conv = ImportTensor(*convw);
         const auto* ta = find(pre + "ssm_a");
@@ -1214,16 +925,12 @@ int main(int argc, char** argv) {
               {qkv.handle, 0, hb(qkv)}, {conv_state.handle, cs_off, std::size_t{kQkv} * 4 * 4}};
           Dispatch(gpu, *e_convstate, "yah_conv_state", (kQkv + 255) / 256, 1, 1, 256, 1, 1, b);
         }
-        if (g_dump_layer == static_cast<int>(l))
-          dump_buf(conv_out, static_cast<std::size_t>(B) * kQkv * 4, ".conv");
         // w_conv is a view into the import; nothing to keep alive.
         {
           std::vector<hrx_buffer_ref_t> b = {
               {conv_out.handle, 0, hb(conv_out)}, {kqbuf.handle, 0, hb(kqbuf)}};
           if (!e_convkq) Dispatch(gpu, e_prepkq, "yah_deltanet_prep_kq", kKh, B, 1, 32, 1, 1, b);
         }
-        if (g_dump_layer == static_cast<int>(l))
-          dump_buf(kqbuf, static_cast<std::size_t>(B) * kKh * 3 * 4, ".kq");
         {
           std::vector<hrx_buffer_ref_t> b = {
               {alpha.handle, 0, hb(alpha)}, {beta.handle, 0, hb(beta)},
@@ -1240,8 +947,6 @@ int main(int argc, char** argv) {
           const std::uint32_t prebab_tiles = (std::max<std::uint32_t>(B * kTs, kQkv) + 255u) / 256u;
           Dispatch(gpu, e_prepab, "yah_deltanet_prep_ab", prebab_tiles, 1, 1, 256, 1, 1, b);
         }
-        if (g_dump_layer == static_cast<int>(l))
-          dump_buf(ab, static_cast<std::size_t>(B) * kTs * 2 * 4, ".ab");
         // w_a/w_dt are views into the import; nothing to keep alive.
         {
           std::vector<hrx_buffer_ref_t> b = {
@@ -1254,15 +959,11 @@ int main(int argc, char** argv) {
           // row-group field is the blocks per head. Without it: the regtile
           // kernel's (heads) x 128.
           const auto dn_geom = g_geom.find("rowsplit.hal");
-          if (concur) gpu.NoBarrierNext();
           if (dn_geom != g_geom.end() && dn_geom->second.rowgrp)
             Dispatch(gpu, e_rowsplit, "yah_deltanet", dn_geom->second.rowgrp, kTs, 1, 256, 1, 1, b);
           else
             Dispatch(gpu, e_rowsplit, "yah_deltanet", kTs, 1, 1, 128, 1, 1, b);
         }
-        if (concur) run_kstore(pre + "attn_gate.weight", gate);
-        if (g_dump_layer == static_cast<int>(l))
-          dump_buf(raw, static_cast<std::size_t>(B) * kInner * 4, ".raw");
         {
           std::vector<hrx_buffer_ref_t> b = {
               {raw.handle, 0, hb(raw)}, {w_sn.handle, w_sn.offset, w_sn.bytes},
@@ -1270,33 +971,15 @@ int main(int argc, char** argv) {
               {scratch.handle, 0, hb(scratch)}};
           Dispatch(gpu, e_postnorm, "yah_ssm_postnorm_fp16", 6 * B, 1, 1, 256, 1, 1, b);
         }
-        if (g_dump_layer == static_cast<int>(l))
-          dump_buf(scratch, static_cast<std::size_t>(B) * kInner * 2, ".ssm");
         // w_sn is a view into the import; nothing to keep alive.
         run_residual(pre + "ssm_out.weight", scratch);
-        t_ssm += tick();
       }
-      t_mixer += tick();
-      if (g_dump_layer == static_cast<int>(l))
-        dump_buf(hidden, static_cast<std::size_t>(B) * kHidden * 4, ".mixer");
       run_norm(pre + "post_attention_norm.weight");
-      if (g_dump_layer == static_cast<int>(l))
-        dump_buf(scratch, static_cast<std::size_t>(B) * kHidden * 2, ".fn");
-      t_ffn_norm += tick();
       run_kstore(pre + "ffn_gate.weight", gateffn);
-      if (g_dump_layer == static_cast<int>(l))
-        dump_buf(gateffn, static_cast<std::size_t>(B) * kFfn * 4, ".gate");
-      t_ffn_gate += tick();
       run_swiglu(pre + "ffn_up.weight");
-      if (g_dump_layer == static_cast<int>(l))
-        dump_buf(ffnup, static_cast<std::size_t>(B) * kFfn * 2, ".up");
-      t_ffn_up += tick();
       run_residual(pre + "ffn_down.weight", ffnup);
-      t_ffn_down += tick();
-      if (g_dump_layer == static_cast<int>(l))
-        dump_buf(hidden, static_cast<std::size_t>(B) * kHidden * 4, ".ffn");
     }
-    if (!skip_head && logits_from < T_run && std::size_t{ci + 1} * B > logits_from) {
+    if (logits_from < T_run && std::size_t{ci + 1} * B > logits_from) {
       const Imported wnorm = ImportTensor(*head_onw);
       const Imported w = ImportTensor(*head_ow);
       const std::uint32_t lo = std::max<std::uint32_t>(logits_from, ci * B);
@@ -1314,7 +997,7 @@ int main(int argc, char** argv) {
         Dispatch(gpu, e_gemv, "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, b);
       }
     }
-    if (rowstats && !skip_head) {
+    if (rowstats) {
       std::vector<std::uint32_t> rows;
       for (std::uint32_t r = 0; r < B; ++r)
         if (rs_want[std::size_t{ci} * B + r]) rows.push_back(r);
@@ -1375,7 +1058,6 @@ int main(int argc, char** argv) {
     const double layer_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
-    Phase("layers");
 
     {
       std::vector<float> out(static_cast<std::size_t>(B) * kHidden);
@@ -1385,7 +1067,7 @@ int main(int argc, char** argv) {
       std::fclose(fo);
     }
     std::uint32_t tok = 0;
-    if (!skip_head) {
+    {
       const auto* onw = find("output_norm.weight");
       const auto* ow = find("output.weight");
       const Imported wnorm = ImportTensor(*onw);
@@ -1480,28 +1162,6 @@ int main(int argc, char** argv) {
         std::printf("all_logits rows=%zu from=%u\n", rows, logits_from);
       }
     }
-    if (g_time) {
-      const double ffn = t_ffn_norm + t_ffn_gate + t_ffn_up + t_ffn_down;
-      std::fprintf(stderr,
-                   "== loom pp timing: norm=%.1f attn=%.1f ssm=%.1f mixer=%.1f "
-                   "ffn=%.1f (ffn_norm=%.1f gate=%.1f up=%.1f down=%.1f) sum=%.1f ms ==\n",
-                   t_norm, t_attn, t_ssm, t_mixer, ffn, t_ffn_norm, t_ffn_gate,
-                   t_ffn_up, t_ffn_down, t_norm + t_mixer + ffn);
-    }
-    if (g_time >= 2) {
-      std::vector<std::pair<double, std::string>> rows;
-      double sum = 0.0;
-      for (auto& kv : g_per_name) {
-        rows.push_back({kv.second, kv.first});
-        sum += kv.second;
-      }
-      std::sort(rows.rbegin(), rows.rend());
-      std::fprintf(stderr, "== loom per-dispatch timing sum=%.1f ms ==\n", sum);
-      for (auto& r : rows)
-        std::fprintf(stderr, "%9.1f  %5d  %7.3f  %s\n", r.first, g_per_count[r.second], r.first / g_per_count[r.second], r.second.c_str());
-    }
-    if (g_seq) std::fclose(g_seq);
-    Phase("head + outputs");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "loom_forward_pp: %s\n", error.what());

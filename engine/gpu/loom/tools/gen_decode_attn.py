@@ -21,14 +21,9 @@ the softmax in two levels instead of online.
 """
 import sys
 
-import os
-
 KVW = 1024          # 4 kv heads x 256
-# YAH_DA_PIPE_K / YAH_DA_PIPE_V: Loom read-ahead depth on the K-row and V^T-tile loops of
-# part. T = 8192, pos 8191 (32 MB of K + V per call), one round each: none 428 us,
-# 2/2 155, 3/2 134 (~240 GB/s, the measured peak), 4/2 152; V depth 3+ spills.
-PIPE_K = int(os.environ.get("YAH_DA_PIPE_K", "3"))
-PIPE_V = int(os.environ.get("YAH_DA_PIPE_V", "2"))
+# Loom read-ahead depth on the K-row and V^T-tile loops of part (V depth 3+ spills).
+PIPE_K, PIPE_V = 3, 2
 NH, NKV, HD = 24, 4, 256
 G = NH // NKV       # query heads per kv head
 
@@ -181,10 +176,8 @@ def gen_part(T):
     e("  %zv8 = vector.constant 0.0 : vector<8xf32>")
     inits = ", ".join(f"%sa{j} = %zv8 : vector<8xf32>" for j in range(G))
     res = ", ".join(f"%sr{j}" for j in range(G))
-    pk = f" pipeline(%cpk)" if PIPE_K > 1 else ""
-    if PIPE_K > 1:
-        e(f"  %cpk = index.constant {PIPE_K} : index")
-    e(f"  {res} = scf.for %c = [%c0 to %c32 step %c1]({inits}) -> ({', '.join(['vector<8xf32>'] * G)}){pk} {{")
+    e(f"  %cpk = index.constant {PIPE_K} : index")
+    e(f"  {res} = scf.for %c = [%c0 to %c32 step %c1]({inits}) -> ({', '.join(['vector<8xf32>'] * G)}) pipeline(%cpk) {{")
     e("    %d8 = index.mul %c, %c8 : index")
     e("    %ka0 = index.add %kr, %d8 : index")
     e("    %ka = index.min %ka0, %klim : index")
@@ -279,10 +272,8 @@ def gen_part(T):
     e("  %zv16 = vector.constant 0.0 : vector<16xf32>")
     inits = ", ".join(f"%oa{j} = %zv16 : vector<16xf32>" for j in range(G))
     res = ", ".join(f"%or{j}" for j in range(G))
-    pv = f" pipeline(%cpv)" if PIPE_V > 1 else ""
-    if PIPE_V > 1:
-        e(f"  %cpv = index.constant {PIPE_V} : index")
-    e(f"  {res} = scf.for %i = [%c0 to %c16 step %c1]({inits}) -> ({', '.join(['vector<16xf32>'] * G)}){pv} {{")
+    e(f"  %cpv = index.constant {PIPE_V} : index")
+    e(f"  {res} = scf.for %i = [%c0 to %c16 step %c1]({inits}) -> ({', '.join(['vector<16xf32>'] * G)}) pipeline(%cpv) {{")
     e("    %ti = index.add %vtb, %i : index")
     e("    %tr = index.mul %ti, %c256 : index")
     e("    %td = index.add %tr, %t : index")
@@ -744,16 +735,14 @@ def gen_part_q(T, kb, vb):
     e(f"  %w4v = vector.splat %w4 : vector<{4 if kb == 8 else 2}xi32>")
     e("  %f128 = scalar.constant 128.0 : f32")
     e("  %f128v = vector.splat %f128 : vector<16xf32>")
-    pk = f" pipeline(%cpk)" if PIPE_K > 1 else ""
-    if PIPE_K > 1:
-        e(f"  %cpk = index.constant {PIPE_K} : index")
+    e(f"  %cpk = index.constant {PIPE_K} : index")
     nit = 16
     # per iteration: K8 4 dwords = 16 dims (half: iterations 0-7 / 8-15); K4 2 dwords =
     # half a 32-dim group (storage positions g 32 + hf 8 + [0, 8) low nibbles, + 16 high)
     inits = ", ".join(f"%sa{j} = %zf : f32" for j in range(G))
     res = ", ".join(f"%sr{j}" for j in range(G))
     e(f"  %cit = index.constant {nit} : index")
-    e(f"  {res} = scf.for %c = [%c0 to %cit step %c1]({inits}) -> ({', '.join(['f32'] * G)}){pk} {{")
+    e(f"  {res} = scf.for %c = [%c0 to %cit step %c1]({inits}) -> ({', '.join(['f32'] * G)}) pipeline(%cpk) {{")
     kvw = 4 if kb == 8 else 2
     e(f"    %ckvw = index.constant {kvw} : index")
     e("    %d4 = index.mul %c, %ckvw : index")
@@ -932,10 +921,8 @@ def gen_part_q(T, kb, vb):
     e(f"  %vsm = scalar.constant {1.0 / 256 if vb == 8 else 1.0 / 16} : f32")
     inits = ", ".join(f"%oa{j} = %zv16 : vector<16xf32>" for j in range(G))
     res = ", ".join(f"%or{j}" for j in range(G))
-    pv = f" pipeline(%cpv)" if PIPE_V > 1 else ""
-    if PIPE_V > 1:
-        e(f"  %cpv = index.constant {PIPE_V} : index")
-    e(f"  {res} = scf.for %i = [%c0 to %c16 step %c1]({inits}) -> ({', '.join(['vector<16xf32>'] * G)}){pv} {{")
+    e(f"  %cpv = index.constant {PIPE_V} : index")
+    e(f"  {res} = scf.for %i = [%c0 to %c16 step %c1]({inits}) -> ({', '.join(['vector<16xf32>'] * G)}) pipeline(%cpv) {{")
     e("    %gt = index.add %gt0, %i : index")
     e("    %older = index.cmp ult, %gt, %curt : index")
     e("    %ti = index.add %vtb, %i : index")

@@ -138,24 +138,6 @@ int main(int argc, char** argv) {
   gpu.H2D(grid, hg.data(), GRID);
   gpu.H2D(ksigns, hk.data(), KSIGNS);
   gpu.H2D(input, hin.data(), IN);
-  // Opt-in: pre-fill the output with zeros so a cell the kernel never writes is
-  // distinguishable from one it computed. A freshly allocated device buffer is
-  // not zeroed, so without this an UNWRITTEN cell reads as whatever the previous
-  // allocation left there -- often a NaN pattern, which compares "different"
-  // against everything (NaN != NaN) and makes an oracle report 100% disagreement
-  // between two bit-identical kernels. Set this before reading anything into a
-  // comparison.
-  if (std::getenv("YAH_BENCH_ZERO_OUT")) {
-    size_t scratch = (WST > OST) ? WST : OST;
-    std::vector<uint8_t> zeros(scratch, 0);
-    gpu.H2D(output, zeros.data(), OUT);
-    // wstage and ostage are scratch the kernel reads back, so an unwritten cell
-    // there is read as garbage -- and the shader never returns an error for it,
-    // it computes a NaN that then lands in the output. Zeroing them separates
-    // "the kernel computed this" from "the kernel read something never written".
-    gpu.H2D(wstage, zeros.data(), WST);
-    gpu.H2D(ostage, zeros.data(), OST);
-  }
 
   const char* name = e.names.empty() ? "?" : e.names[0].c_str();
   const uint32_t ordinal = e.OrdinalOrZero(name);

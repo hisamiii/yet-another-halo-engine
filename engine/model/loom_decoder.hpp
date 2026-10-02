@@ -6,8 +6,8 @@
 //   rmsnorm -> full attention: attn_q / attn_k / attn_v GEMV, unpack q|gate, QK norm
 //              + RoPE, append K / V to the paged pools, split-K attention + reduce
 //              (gate), attn_output GEMV += hidden
-//           -> recurrent:      attn_qkv / attn_gate / ssm_alpha / ssm_beta GEMV, conv,
-//              DeltaNet (gated norm inside), ssm_out GEMV += hidden
+//           -> recurrent:      attn_qkv / attn_gate / ssm_alpha / ssm_beta GEMV, conv +
+//              DeltaNet in one kernel (gated norm inside), ssm_out GEMV += hidden
 //   rmsnorm -> ffn_gate|ffn_up SwiGLU GEMV -> ffn_down GEMV += hidden
 // head: rmsnorm -> output GEMV -> argmax into a device token stream that the next
 // step's embedding kernel (IQ4_XS token_embd) reads, so steps are enqueued back to
@@ -74,7 +74,6 @@ class LoomDecoder {
       std::uint32_t r = 0, w = 0;
       while (in >> k >> kind >> r >> w) {
         if (k == "rw") rw_[kind] = {r, w};
-        if (k == "persist") persist_ = r;   // gv kernels (not resid_norm) launch min(r, row groups)
         if (k == "grid") grid_[kind] = r;   // the exact grid each GEMV kernel was compiled for
         if (k == "kv") { kbits_ = r; vbits_ = w; }   // "kv q KB VB"
       }
@@ -94,8 +93,8 @@ class LoomDecoder {
     hidden_ = &Alloc(kHidden * 4); normed_ = &Alloc(kHidden * 4); qg_ = &Alloc(kQProj * 4);
     q_ = &Alloc(kAttn * 4); gate_ = &Alloc(kAttn * 4); kb_ = &Alloc(kKv * 4); vb_ = &Alloc(kKv * 4);
     aout_ = &Alloc(kAttn * 4); qkv_ = &Alloc(kQkv * 4); alpha_ = &Alloc(kTs * 4); beta_ = &Alloc(kTs * 4);
-    convout_ = &Alloc(kQkv * 4); ssmout_ = &Alloc(kInner * 4); ffnact_ = &Alloc(kFfn * 4);
-    logits_ = &Alloc(std::size_t{kVocab} * 4); sink_ = &Alloc(4); cnt_ = &Alloc(4);
+    ssmout_ = &Alloc(kInner * 4); ffnact_ = &Alloc(kFfn * 4);
+    logits_ = &Alloc(std::size_t{kVocab} * 4); sink_ = &Alloc(4);
     toks_ = &Alloc((std::size_t{T_} + 1) * 4); posarr_ = &Alloc(std::size_t{T_} * 4); eps_ = &Alloc(4);
     c32a_ = &Alloc(kKv * 4); c32b_ = &Alloc(kKv * 4); c16a_ = &Alloc(kKv * 2); c16b_ = &Alloc(kKv * 2);
     acc_ = &Alloc(std::size_t{npg} * kHeads * 256 * 4); ml_ = &Alloc(std::size_t{npg} * kHeads * 2 * 4);
@@ -107,14 +106,6 @@ class LoomDecoder {
     for (std::uint32_t i = 0; i < T_; ++i) pv[i] = static_cast<std::int32_t>(i);
     gpu_.H2D(*posarr_, pv.data(), pv.size() * 4);
     trace_ = std::getenv("YAH_DEC_TRACE") != nullptr;
-    overlap_ = std::getenv("YAH_DEC_NO_OVERLAP") == nullptr;
-    { const char* v = std::getenv("YAH_DEC_BANDS"); bands_ = !(v && std::string(v) == "0"); }
-    // YAH_DEC_RESNORM=1: fold each following RMSNorm into the residual GEMV (gen_gemv
-    // resid_norm). Off: neutral (61.30 vs 61.18 ms) -- the last workgroup's ~5 us norm
-    // tail cancels the ~3.4 us dependent-dispatch latency it removes, 128 times a token.
-    // YAH_DEC_FUSECONV=0: separate conv dispatch (default: conv fused into DeltaNet)
-    { const char* v = std::getenv("YAH_DEC_FUSECONV"); fuseconv_ = !(v && std::string(v) == "0"); }
-    { const char* v = std::getenv("YAH_DEC_RESNORM"); resnorm_ = v && std::string(v) == "1"; }
   }
 
   [[nodiscard]] std::uint32_t context() const { return T_; }
@@ -178,7 +169,7 @@ class LoomDecoder {
     st_ = st;
     next_pos_ = kAnyTile;
     cs_[0] = st.convstate;
-    if (fuseconv_ && !cs_[1]) cs_[1] = Alloc(std::size_t{recurrent_layers()} * kConvState * 4).handle;
+    if (!cs_[1]) cs_[1] = Alloc(std::size_t{recurrent_layers()} * kConvState * 4).handle;
     cs_cur_ = 0;
   }
 
@@ -210,14 +201,9 @@ class LoomDecoder {
     Dispatch(Load("embed"), 1, 1, kHidden / 16,
              {TRef("token_embd.weight"), {toks_->handle, std::size_t{pos} * 4, 4}, Ref(*hidden_)});
     const std::uint32_t nl = cfg_.main_block_count();
-    // with resnorm_, each residual GEMV's last workgroup also writes the next RMSNorm
-    // (gen_gemv resid_norm); only layer 0's input norm is a dispatch of its own
-    auto next_norm = [&](std::uint32_t l) {
-      return l + 1 < nl ? "blk." + std::to_string(l + 1) + ".attn_norm.weight" : std::string("output_norm.weight");
-    };
     for (std::uint32_t l = 0; l < nl; ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
-      if (!resnorm_ || l == 0) Rmsnorm(*hidden_, pre + "attn_norm.weight", *normed_);
+      Rmsnorm(*hidden_, pre + "attn_norm.weight", *normed_);
       Tr("in", l, *hidden_, kHidden);
       if (cfg_.IsFullAttention(l)) {
         const std::uint32_t ai = l / cfg_.full_attention_interval;
@@ -228,7 +214,7 @@ class LoomDecoder {
                   Ref(*q_), Ref(*kb_), Ref(*c32a_), Ref(*c32b_), Ref(*c16a_), Ref(*c16b_), dposr, Ref(*eps_)});
         if (quant()) {
           Dispatch(Load("dattn_kappend_q"), 1, 1, 128, {Ref(*kb_), st_.km[ai], st_.kq[ai], st_.ks[ai], st_.ptab, dposr});
-          if (overlap_) gpu_.NoBarrierNext();   // independent of the K append
+          gpu_.NoBarrierNext();   // independent of the K append
           Dispatch(Load("dattn_vappend_q"), kKvHeads, 1, 256,
                    {Ref(*vb_), vopen_[ai], st_.vq[ai], st_.vs[ai], st_.ptab, dposr});
           Dispatch(Load("dattn_part_q"), kKvHeads, pos / 256 + 1, 256,
@@ -242,40 +228,31 @@ class LoomDecoder {
         }
         Dispatch(Load("dattn_reduce"), kHeads, 1, 256, {Ref(*acc_), Ref(*ml_), Ref(*gate_), dposr, Ref(*aout_)});
         Tr("attn", l, *aout_, kAttn);
-        Resid(pre + "attn_output.weight", *aout_, pre + "post_attention_norm.weight");
+        Gemv("resid", {pre + "attn_output.weight"}, *aout_, *hidden_);
       } else {
         const std::uint32_t si = l - l / cfg_.full_attention_interval;
         Project({pre + "attn_qkv.weight", pre + "attn_gate.weight", pre + "ssm_alpha.weight", pre + "ssm_beta.weight"},
                 {qkv_, gate_, alpha_, beta_});
         const hrx_buffer_ref_t dst{st_.dstate, std::size_t{si} * kStateElems * 4, std::size_t{kStateElems} * 4};
-        if (fuseconv_) {
-          // conv state ping-pong: this step reads cs_[cs_cur_] and writes the other one
-          const std::size_t co = std::size_t{si} * kConvState * 4, cb = std::size_t{kConvState} * 4;
-          Dispatch(Load("deltanet_conv"), kHeadsV, 1, 512,
-                   {{qkv_->handle, 0, std::size_t{kQkv} * 4}, TRef(pre + "ssm_conv1d.weight"),
-                    {cs_[cs_cur_], co, cb}, {cs_[1 - cs_cur_], co, cb}, dst, Ref(*alpha_), Ref(*beta_),
-                    TRef(pre + "ssm_a"), TRef(pre + "ssm_dt.bias"), TRef(pre + "ssm_norm.weight"), Ref(*gate_),
-                    Ref(*ssmout_)});
-        } else {
-          Dispatch(Load("ssmconv"), (kQkv + 255) / 256, 1, 256,
-                   {{qkv_->handle, 0, std::size_t{kQkv} * 4}, TRef(pre + "ssm_conv1d.weight"),
-                    {cs_[cs_cur_], std::size_t{si} * kConvState * 4, std::size_t{kConvState} * 4}, Ref(*convout_)});
-          Dispatch(Load("deltanet"), kHeadsV, 1, 512,
-                   {Ref(*convout_), dst, Ref(*alpha_), Ref(*beta_), TRef(pre + "ssm_a"), TRef(pre + "ssm_dt.bias"),
-                    TRef(pre + "ssm_norm.weight"), Ref(*gate_), Ref(*ssmout_)});
-        }
+        // conv state ping-pong: this step reads cs_[cs_cur_] and writes the other one
+        const std::size_t co = std::size_t{si} * kConvState * 4, cb = std::size_t{kConvState} * 4;
+        Dispatch(Load("deltanet_conv"), kHeadsV, 1, 512,
+                 {{qkv_->handle, 0, std::size_t{kQkv} * 4}, TRef(pre + "ssm_conv1d.weight"),
+                  {cs_[cs_cur_], co, cb}, {cs_[1 - cs_cur_], co, cb}, dst, Ref(*alpha_), Ref(*beta_),
+                  TRef(pre + "ssm_a"), TRef(pre + "ssm_dt.bias"), TRef(pre + "ssm_norm.weight"), Ref(*gate_),
+                  Ref(*ssmout_)});
         Tr("ssm", l, *ssmout_, kInner);
-        Resid(pre + "ssm_out.weight", *ssmout_, pre + "post_attention_norm.weight");
+        Gemv("resid", {pre + "ssm_out.weight"}, *ssmout_, *hidden_);
       }
-      if (!resnorm_) Rmsnorm(*hidden_, pre + "post_attention_norm.weight", *normed_);
+      Rmsnorm(*hidden_, pre + "post_attention_norm.weight", *normed_);
       Gemv("swiglu", {pre + "ffn_gate.weight", pre + "ffn_up.weight"}, *normed_, *ffnact_);
       Tr("ffnact", l, *ffnact_, kFfn);
-      Resid(pre + "ffn_down.weight", *ffnact_, next_norm(l));
+      Gemv("resid", {pre + "ffn_down.weight"}, *ffnact_, *hidden_);
     }
-    if (!resnorm_) Rmsnorm(*hidden_, "output_norm.weight", *normed_);
+    Rmsnorm(*hidden_, "output_norm.weight", *normed_);
     Gemv("plain", {"output.weight"}, *normed_, *logits_);
     Tr("logits", 99, *logits_, kVocab);
-    if (fuseconv_) cs_cur_ = 1 - cs_cur_;
+    cs_cur_ = 1 - cs_cur_;
     Dispatch(Load("argmax"), 1, 1, 1024,
              {Ref(*logits_), pos + 1 >= keep_from ? hrx_buffer_ref_t{toks_->handle, std::size_t{pos + 1} * 4, 4}
                                                   : Ref(*sink_)});
@@ -323,10 +300,7 @@ class LoomDecoder {
   }
   LoomExecutable& Load(const std::string& name) {
     auto it = exes_.find(name);
-    if (it == exes_.end()) {
-      it = exes_.emplace(name, gpu_.Load(dir_ + "/" + name + ".hal")).first;
-      if (std::getenv("YAH_DEC_LIST")) std::fprintf(stderr, "loaded %zu %s\n", exes_.size(), name.c_str());
-    }
+    if (it == exes_.end()) it = exes_.emplace(name, gpu_.Load(dir_ + "/" + name + ".hal")).first;
     return it->second;
   }
   // workgroup size and binding count come from the compiled export and must agree with
@@ -340,11 +314,8 @@ class LoomDecoder {
                       ", bindings " + std::to_string(b.size()) + " vs " + std::to_string(cb));
     gpu_.Dispatch(e, 0, LoomDevice::Config(gx, gy, 1, wg, 1, 1), nullptr, 0, b.data(), b.size());
   }
-  // GEMV: names and footprints as tools/gen_gemv.py. overlap: no ordering barrier
-  // against the previous dispatch (independent projections of one input); the next
-  // barriered dispatch still waits for all of them.
-  void Gemv(const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y,
-            bool overlap = false, const std::vector<hrx_buffer_ref_t>& extra = {}) {
+  // GEMV: names and footprints as tools/gen_gemv.py.
+  void Gemv(const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y) {
     std::string name = std::string("gv_") + kind;
     std::uint32_t tbits = 0, M = 0, K = 0;
     std::vector<hrx_buffer_ref_t> b;
@@ -365,22 +336,14 @@ class LoomDecoder {
     if (x.size < std::size_t{K} * 4 || y.size < std::size_t{M} * 4) throw LoomError("GEMV operand too small: " + name);
     b.push_back({x.handle, 0, std::size_t{K} * 4});
     b.push_back({y.handle, 0, std::size_t{M} * 4});
-    b.insert(b.end(), extra.begin(), extra.end());
     LoomExecutable& exe = Load(name);
-    if (overlap && overlap_) gpu_.NoBarrierNext();
-    auto [R, W] = Rw(kind, M);
-    std::uint32_t gx = M / (R * W);
-    if (persist_ && std::string(kind) != "resid_norm") gx = std::min(gx, persist_);
+    auto [R, W] = Rw(kind);
+    const std::uint32_t gx = M / (R * W);
     CheckGrid(name, gx);
     Dispatch(exe, gx, 1, 32 * W, b);
   }
-  // A layer's input projections of normed_: one band-fused GEMV (gen_gemv gen_bands), or
-  // with YAH_DEC_BANDS=0 one GEMV each, the later ones without an ordering barrier.
+  // A layer's input projections of normed_: one band-fused GEMV (gen_gemv gen_bands).
   void Project(const std::vector<std::string>& ws, const std::vector<LoomBuffer*>& ys) {
-    if (!bands_) {
-      for (std::size_t i = 0; i < ws.size(); ++i) Gemv("plain", {ws[i]}, *normed_, *ys[i], i > 0);
-      return;
-    }
     std::string fn, mn;
     std::uint32_t tbits = 0, K = 0, rows = 0;
     std::vector<hrx_buffer_ref_t> b;
@@ -392,7 +355,7 @@ class LoomDecoder {
       if (i && k != K) throw LoomError("bands need one K");
       K = k;
       if (t->bytes != std::uint64_t{K} / f.qk * f.bb * M) throw LoomError("footprint mismatch on " + ws[i]);
-      if (M % (Rw("bands", 0).first * Rw("bands", 0).second) || ys[i]->size < std::size_t{M} * 4)
+      if (M % (Rw("bands").first * Rw("bands").second) || ys[i]->size < std::size_t{M} * 4)
         throw LoomError("band output: " + ws[i]);
       fn += std::string("_") + f.name;
       mn += "_" + std::to_string(M);
@@ -407,25 +370,15 @@ class LoomDecoder {
       const auto* t = Find(ws[i]);
       b.push_back({ys[i]->handle, 0, static_cast<std::size_t>(t->dims[1]) * 4});
     }
-    auto [R, W] = Rw("bands", 0);
+    auto [R, W] = Rw("bands");
     const std::string bn = "gb" + fn + mn + "_" + std::to_string(K);
     CheckGrid(bn, rows / (R * W));
     Dispatch(Load(bn), rows / (R * W), 1, 32 * W, b);
   }
-  // hidden += W x; with resnorm_ the same dispatch also writes normed_ = rmsnorm(hidden) * nw
-  void Resid(const std::string& w, const LoomBuffer& x, const std::string& nw) {
-    if (!resnorm_) {
-      Gemv("resid", {w}, x, *hidden_);
-      return;
-    }
-    Gemv("resid_norm", {w}, x, *hidden_, false, {TRef(nw), Ref(*normed_), Ref(*cnt_)});
-  }
-  // (R, W) of a GEMV kind in this set (decode.txt); outputs not divisible keep the default
-  std::pair<std::uint32_t, std::uint32_t> Rw(const std::string& kind, std::uint32_t M) const {
+  // (R, W) of a GEMV kind in this set (decode.txt)
+  std::pair<std::uint32_t, std::uint32_t> Rw(const std::string& kind) const {
     auto it = rw_.find(kind);
-    std::pair<std::uint32_t, std::uint32_t> rw = it == rw_.end() ? std::make_pair(kR, kW) : it->second;
-    if (M && M % (rw.first * rw.second)) rw = {kR, kW};
-    return rw;
+    return it == rw_.end() ? std::make_pair(kR, kW) : it->second;
   }
   // A grid larger than the compiled one reads out of bounds (Loom drops clamps it proves
   // redundant from the launch config); the set records every GEMV kernel's grid.
@@ -462,18 +415,17 @@ class LoomDecoder {
   static constexpr std::uint32_t kAnyTile = 0xffffffffu;
   std::uint32_t T_ = 0, cur_pos_ = 0, kbits_ = 16, vbits_ = 16, next_pos_ = kAnyTile;
   std::vector<hrx_buffer_ref_t> vopen_;   // quantized V: each layer's open tile, [1024][16] f16
-  bool trace_ = false, overlap_ = true, bands_ = true, resnorm_ = false, fuseconv_ = true;
-  hrx_buffer_t cs_[2] = {nullptr, nullptr};   // conv state ping-pong (fused conv)
+  bool trace_ = false;
+  hrx_buffer_t cs_[2] = {nullptr, nullptr};   // conv state ping-pong
   int cs_cur_ = 0;
   std::deque<LoomBuffer> keep_;   // stable addresses
   std::map<std::string, LoomExecutable> exes_;
   std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> rw_;
-  std::uint32_t persist_ = 0;
   std::map<std::string, std::uint32_t> grid_;
   std::vector<hrx_buffer_ref_t> tabs_;
   LoomDecoderState st_;
-  LoomBuffer *hidden_, *normed_, *qg_, *q_, *gate_, *kb_, *vb_, *aout_, *qkv_, *alpha_, *beta_, *convout_, *ssmout_,
-      *ffnact_, *logits_, *sink_, *toks_, *posarr_, *eps_, *c32a_, *c32b_, *c16a_, *c16b_, *acc_, *ml_, *cnt_;
+  LoomBuffer *hidden_, *normed_, *qg_, *q_, *gate_, *kb_, *vb_, *aout_, *qkv_, *alpha_, *beta_, *ssmout_, *ffnact_,
+      *logits_, *sink_, *toks_, *posarr_, *eps_, *c32a_, *c32b_, *c16a_, *c16b_, *acc_, *ml_;
 };
 
 }  // namespace yah::model

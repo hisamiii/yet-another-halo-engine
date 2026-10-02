@@ -5,7 +5,7 @@
 // The prompt goes through the decode path one token at a time (positions 0..n-1),
 // then N tokens are generated greedily. HAL set: tools/emit_decode.py. Steps are
 // enqueued back to back; the host waits after the prompt (to time generation alone)
-// and at the end, or after every step with --logits / YAH_DEC_TRACE / YAH_DEC_SYNC.
+// and at the end, or after every step with --logits / YAH_DEC_TRACE.
 // --logits FILE appends every step's 248320 logits (f32) for an external KL gate.
 // For decode after a Loom prefill (its KV pools and recurrent state), see
 // loom_forward_pp with YAH_GEN.
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
 
     std::FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
     std::vector<float> host_logits(lf ? LoomDecoder::kVocab : 0);
-    const bool sync_steps = lf || std::getenv("YAH_DEC_TRACE") || std::getenv("YAH_DEC_SYNC");
+    const bool sync_steps = lf || std::getenv("YAH_DEC_TRACE");
     std::vector<double> step_ms;
     auto tgen = std::chrono::steady_clock::now();
     for (std::uint32_t pos = 0; pos < steps; ++pos) {

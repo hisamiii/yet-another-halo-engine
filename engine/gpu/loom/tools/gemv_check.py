@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check gen_gemv.py kernels on real GGUF tensors against a float64 numpy oracle.
 
-usage: gemv_check.py <model.gguf> <workdir> [kind ...]      (kinds: plain resid swiglu)
+usage: gemv_check.py <model.gguf> <workdir> [kind ...]      (kinds: plain resid swiglu bands)
 
 For every (format, K) present on the shard it takes the first matching tensor,
 generates and emits the kernel, dispatches it once through engine/build/hal_run
@@ -121,64 +121,6 @@ def check_bands(model, work, rd, dequantize, rng, layers):
     return worst
 
 
-def check_resid_norm(model, work, rd, dequantize, rng, pick):
-    """resid_norm: y += W x, then the last workgroup writes rmsnorm(y) * nw and resets the
-    counter. One dispatch checked against the oracle, then 50 more back to back: y must
-    equal y0 + 51 W x, nout the norm of that, and the counter 0."""
-    worst = 0.0
-    for (fmt, K), t in pick.items():
-        M = int(t.shape[1])
-        if M != 5120:
-            continue
-        x = rng.standard_normal(K).astype(np.float32)
-        y0 = rng.standard_normal(M).astype(np.float32)
-        nw = (1 + 0.1 * rng.standard_normal(M)).astype(np.float32)
-        wx = dequantize(t.data, t.tensor_type).astype(np.float64) @ x.astype(np.float64)
-        tag = f"rn_{fmt}_{K}"
-        src = os.path.join(work, tag + ".loom")
-        open(src, "w").write(G.gen("resid_norm", [fmt], M, K))
-        r = subprocess.run([sys.executable, EMIT, src, os.path.join(work, tag), "nop=0"], capture_output=True, text=True)
-        if r.returncode:
-            raise SystemExit(f"{tag}: emit failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
-        hal = r.stdout.strip().splitlines()[0]
-        fs = {}
-        for nm, a in (("x", x), ("y0", y0), ("nw", nw), ("cnt", np.zeros(1, np.int32))):
-            fs[nm] = os.path.join(work, f"{tag}.{nm}"); a.tofile(fs[nm])
-        errs = []
-        for iters in (0, 50):
-            env = dict(os.environ)
-            if iters:
-                env["HAL_RUN_ITERS"] = str(iters)
-            binds = [f"t:{t.name}"] + [f"f:{os.path.join(TABLE_DIR, TABLE_FILE[q])}" for q in G.tables_for([fmt])]
-            binds += [f"f:{fs['x']}", f"io:{fs['y0']}:{fs['y0']}.out", f"f:{fs['nw']}", f"o:{M * 4}:{fs['nw']}.out", f"io:{fs['cnt']}:{fs['cnt']}.out"]
-            mins = ",".join(str(v) for v in G.footprint("resid_norm", [fmt], M, K))
-            r = subprocess.run([GPURUN, "gemv-check", "--", HALRUN, model, hal, str(M // G.rows_per_wg()), "128", mins] + binds,
-                               capture_output=True, text=True, timeout=120, env=env)
-            if "hal_run: ok" not in r.stdout:
-                raise SystemExit(f"{tag}: hal_run failed\n{r.stdout[-1500:]}{r.stderr[-1500:]}")
-            y = np.fromfile(fs["y0"] + ".out", np.float32)
-            nout = np.fromfile(fs["nw"] + ".out", np.float32)
-            cnt = int(np.fromfile(fs["cnt"] + ".out", np.int32)[0])
-            yref = y0.astype(np.float64) + (1 + iters) * wx
-            nref = yref / np.sqrt((yref ** 2).mean() + 1e-6) * nw
-            ey = float(np.abs(y - yref).max() / np.abs(yref).max())
-            # the norm of the y actually produced (isolates the epilogue from GEMV rounding)
-            yy = y.astype(np.float64)
-            en = float(np.abs(nout - yy / np.sqrt((yy ** 2).mean() + 1e-6) * nw).max() / np.abs(nref).max())
-            errs.append(max(ey, en))
-            print(f"{tag:18s} dispatches {1 + iters:3d}: y err {ey:.2e}  norm err {en:.2e}  counter {cnt}"
-                  f"{'   <-- FAIL' if max(ey, en) > 1e-4 or cnt != 0 else ''}", flush=True)
-            for o in (".out",):
-                for nm in ("y0", "nw", "cnt"):
-                    if os.path.exists(fs[nm] + o):
-                        os.remove(fs[nm] + o)
-        for f in fs.values():
-            os.remove(f)
-        os.remove(src)
-        worst = max(worst, max(errs))
-    return worst
-
-
 def main():
     model, work = sys.argv[1], sys.argv[2]
     kinds = sys.argv[3:] or ["plain"]
@@ -197,9 +139,6 @@ def main():
         pick.setdefault((fmt, K), t)
     rng = np.random.default_rng(1)
     worst = 0.0
-    if "resid_norm" in kinds:
-        kinds = [k for k in kinds if k != "resid_norm"]
-        worst = max(worst, check_resid_norm(model, work, rd, dequantize, rng, pick))
     if "bands" in kinds:
         kinds = [k for k in kinds if k != "bands"]
         worst = max(worst, check_bands(model, work, rd, dequantize, rng, [0, 1, 2, 3, 5, 14, 22, 63]))
@@ -234,8 +173,7 @@ def main():
             tag = f"{kind}_{'_'.join(fmts)}_{K}"
             if ONLY and not re.search(ONLY, tag):
                 continue
-            y, ms = run_kernel(model, work, tag, kind, fmts, M, K, [z.name for z in ts], x, y0,
-                               int(os.environ.get("GEMV_R", "2")), int(os.environ.get("GEMV_W", "4")))
+            y, ms = run_kernel(model, work, tag, kind, fmts, M, K, [z.name for z in ts], x, y0)
             err = float(np.max(np.abs(y - ref)) / max(np.max(np.abs(ref)), 1e-30))
             worst = max(worst, err)
             perf = ""

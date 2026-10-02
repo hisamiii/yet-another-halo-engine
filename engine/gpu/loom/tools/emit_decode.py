@@ -15,13 +15,13 @@ usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, m
   dattn_{kappend,vappend,part}_q with the prefill's quantized-KV switches
                                  (YAH_ATTN_FA_K8 / _K4 with YAH_ATTN_FA_VQ8 / _VQ4):
                                  the kv8a16 / kv4a16 pools; decode.txt "kv q KB VB"
-  rmsnorm, deltanet[_conv]       tools/gen_decode_misc.py (the ports' math, 512 lanes;
-                                 deltanet_conv also runs the decode conv, the default)
-  unpack, rope, ssmconv, argmax: the ported HIP decode kernels.
+  rmsnorm, deltanet_conv         tools/gen_decode_misc.py (the ports' math, 512 lanes;
+                                 deltanet_conv also runs the decode conv)
+  unpack, rope, argmax:          the ported HIP decode kernels.
                                  rope's own cache write goes to a one-row dummy
                                  (max_context=1); dattn_kvappend writes the pools.
   grid_*.bin, ksigns_iq2xs.bin   the IQ tables (loom/tables)
-  decode.txt                     "ctx <max_context>"
+  decode.txt                     "ctx <max_context>", GEMV geometry and grids
 """
 import os
 import shutil
@@ -38,12 +38,8 @@ import gen_decode_misc as DM  # noqa: E402
 import gen_gemv as GV  # noqa: E402
 
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
-# YAH_GV_RW="swiglu:1,8;resid:2,4": rows per wave R and waves per workgroup W per GEMV kind
-# (plain, resid, resid_norm, swiglu, bands); default 2,4. Recorded in decode.txt ("rw kind R W").
-RW = {k: (2, 4) for k in ("plain", "resid", "resid_norm", "swiglu", "bands")}
-for item in filter(None, os.environ.get("YAH_GV_RW", "").split(";")):
-    k, v = item.split(":")
-    RW[k] = tuple(int(x) for x in v.split(","))
+# rows per wave R and waves per workgroup W per GEMV kind, recorded in decode.txt ("rw kind R W")
+RW = {k: (2, 4) for k in ("plain", "resid", "swiglu", "bands")}
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):
@@ -126,8 +122,6 @@ def gemv_set(model):
         for n in ("attn_output", "ssm_out", "ffn_down"):
             if p + n + ".weight" in t:
                 add("resid", [p + n + ".weight"])
-                if GV.LPR == 32:
-                    add("resid_norm", [p + n + ".weight"])
         add("swiglu", [p + "ffn_gate.weight", p + "ffn_up.weight"])
     add("plain", ["output.weight"])
     return out
@@ -143,12 +137,8 @@ def main():
     grids = {}   # exact launch grid of every GEMV kernel: the decoder refuses any other
     for name, (kind, fmts, M, K) in sorted(gs.items()):
         R, W = RW[kind]
-        if M % (R * W):   # small outputs (48 rows) keep the default geometry
-            R, W = 2, 4
         emit_src(GV.gen(kind, fmts, M, K, R, W), name, outdir)
         grids[name] = M // GV.rows_per_wg(R, W)
-        if GV.PERSIST and kind != "resid_norm":
-            grids[name] = min(grids[name], GV.PERSIST)
     bs = bands_set(model)
     for name, (fmts, Ms, K) in sorted(bs.items()):
         emit_src(GV.gen_bands(fmts, Ms, K, *RW["bands"]), name, outdir)
@@ -171,20 +161,16 @@ def main():
         "yah_fused_qk_rope.q_elems=%d" % (NUM_HEADS * HEAD_DIM), "yah_fused_qk_rope.kv_elems=%d" % (NUM_KV * HEAD_DIM),
         "yah_fused_qk_rope.cache32_elems=%d" % (NUM_KV * HEAD_DIM),
         "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
-    emit_file(L("yah_ssm_conv_decode_f32.loom"), "ssmconv", outdir,
-              ["yah_ssm_conv_decode.qkv_dim=10240", "yah_ssm_conv_decode.rows=1"])
-    emit_src(DM.gen_deltanet(hoist=True), "deltanet", outdir)
-    emit_src(DM.gen_deltanet(fuse=True, hoist=True), "deltanet_conv", outdir)   # + the decode conv
-    emit_src(DM.gen_embed_iq4xs(), "embed", outdir)      # token_embd row from the device token stream        # 512 lanes per head (the port: one wave)
+    emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # 512 lanes per head, + the decode conv
+    emit_src(DM.gen_embed_iq4xs(), "embed", outdir)      # token_embd row from the device token stream
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + "".join("rw %s %d %d\n" % (k, r * (2 if GV.LPR == 16 else 1), w) for k, (r, w) in sorted(RW.items())) +
-        ("persist gv %d 0\n" % GV.PERSIST if GV.PERSIST else "") +
+        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
-    print("emitted %d GEMV + %d band GEMV + 10 decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))
+    print("emitted %d GEMV + %d band GEMV + the decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))
 
 
 if __name__ == "__main__":

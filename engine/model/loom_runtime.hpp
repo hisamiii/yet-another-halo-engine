@@ -4,11 +4,7 @@
 
 #include <chrono>
 #include <cstddef>
-#include <cstdio>
-#include <cstring>
-#include <deque>
 #include <utility>
-#include <cstdlib>
 #include <thread>
 #include <cstdint>
 #include <stdexcept>
@@ -173,13 +169,6 @@ class LoomDevice {
   LoomDevice(const LoomDevice&) = delete;
   LoomDevice& operator=(const LoomDevice&) = delete;
   ~LoomDevice() {
-    if (std::getenv("YAH_LOOM_SLEEP_SYNC_US"))
-      std::fprintf(stderr, "sync sleeps: %ld\n", sync_sleeps_);
-    if (dispatch_n_)
-      std::fprintf(stderr, "dispatch timing: %ld calls, %.1f ms total in hrx_stream_dispatch, max %.1f us, first->last enqueue %.1f ms\n",
-                   dispatch_n_, dispatch_us_ / 1000.0, dispatch_max_us_,
-                   std::chrono::duration<double, std::milli>(last_dispatch_ - first_dispatch_).count());
-    pace_events_.clear();  // before the stream and runtime go away
     if (stream_) hrx_stream_release(stream_);
     // device_ is borrowed: hrx_gpu_device_get does not retain it, so releasing
     // it here drops the runtime's own reference and clears the device before
@@ -256,64 +245,24 @@ class LoomDevice {
                 const hrx_dispatch_config_t& config, const void* constants,
                 size_t constants_size, const hrx_buffer_ref_t* bindings,
                 size_t binding_count) {
-    static const bool time_dispatch = std::getenv("YAH_LOOM_DISPATCH_TIMING") != nullptr;
-    const auto t0 = time_dispatch ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const uint32_t flags = next_flags_;
     next_flags_ = 0;
     LoomCheck(hrx_stream_dispatch(stream_, executable.handle, ordinal, &config,
                                   constants, constants_size, bindings,
                                   binding_count, flags),
               "hrx_stream_dispatch");
-    if (time_dispatch) {
-      const auto t1 = std::chrono::steady_clock::now();
-      if (!dispatch_n_) first_dispatch_ = t0;
-      last_dispatch_ = t1;
-      const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-      dispatch_us_ += us; dispatch_max_us_ = us > dispatch_max_us_ ? us : dispatch_max_us_; ++dispatch_n_;
-    }
-    Pace();
   }
 
-  // YAH_LOOM_PACE=N[,M]: record an event every N dispatches and keep at most M
-  // (default 4) outstanding; past that, sleep-poll on the oldest instead of
-  // letting hrx_stream_dispatch spin on queue backpressure (one host core for
-  // the whole prefill on an APU whose CPU and GPU share one power budget).
-  void Pace() {
-    static const std::pair<long, long> cfg = [] {
-      const char* v = std::getenv("YAH_LOOM_PACE");
-      long n = v ? std::atol(v) : 0, m = 4;
-      if (v && std::strchr(v, ',')) m = std::atol(std::strchr(v, ',') + 1);
-      return std::make_pair(n, m);
-    }();
-    if (cfg.first <= 0 || ++paced_ % cfg.first != 0) return;
-    LoomEvent event;
-    LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_NONE, &event.handle), "hrx_event_create");
-    LoomCheck(hrx_event_record(event.handle, stream_), "hrx_event_record");
-    pace_events_.push_back(std::move(event));
-    while (static_cast<long>(pace_events_.size()) > cfg.second) {
-      bool complete = false;
-      for (;;) {
-        LoomCheck(hrx_event_query(pace_events_.front().handle, &complete), "hrx_event_query");
-        if (complete) break;
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-      }
-      pace_events_.pop_front();
-    }
-  }
-
-  // Sleep-poll synchronize: with N > 0 the wait polls an event recorded at
-  // the stream tail and sleeps N us between checks, instead of the runtime's
-  // blocking wait, which busy-polls a host core for the whole wait (ROCr). A
-  // driver that queues a long run before one wait (the prefill) opts in with
-  // SetSleepSync(); YAH_LOOM_SLEEP_SYNC_US=N overrides it (0 = runtime wait).
-  // Off by default: probes time single short waits, where N us of slack shows.
   // Experimental (needs the local HRX prototype flag, bit 2: skip the
   // trailing ordering barrier): the next Dispatch may overlap the one after
   // it. Never set against stock HRX, which rejects unknown flags.
   void NoBarrierNext() { next_flags_ = 1u << 2; }
-  void SetSleepSync(long us) {
-    if (!std::getenv("YAH_LOOM_SLEEP_SYNC_US")) sleep_us_ = us;
-  }
+  // Sleep-poll synchronize: with N > 0 the wait polls an event recorded at
+  // the stream tail and sleeps N us between checks, instead of the runtime's
+  // blocking wait, which busy-polls a host core for the whole wait (ROCr). A
+  // driver that queues a long run before one wait (the prefill) opts in.
+  // Off by default: probes time single short waits, where N us of slack shows.
+  void SetSleepSync(long us) { sleep_us_ = us; }
   void Synchronize() {
     if (sleep_us_ > 0) {
       // hrx_stream_query reports complete while the stream timepoint is 0, which
@@ -325,7 +274,6 @@ class LoomDevice {
       for (;;) {
         LoomCheck(hrx_event_query(tail.handle, &complete), "hrx_event_query");
         if (complete) break;
-        ++sync_sleeps_;
         std::this_thread::sleep_for(std::chrono::microseconds(sleep_us_));
       }
     }
@@ -365,17 +313,8 @@ class LoomDevice {
  private:
   hrx_device_t device_ = nullptr;
   hrx_stream_t stream_ = nullptr;
-  long paced_ = 0;
-  long dispatch_n_ = 0;
-  long sync_sleeps_ = 0;
   uint32_t next_flags_ = 0;
-  long sleep_us_ = [] {
-    const char* v = std::getenv("YAH_LOOM_SLEEP_SYNC_US");
-    return v ? std::atol(v) : 0L;
-  }();
-  std::chrono::steady_clock::time_point first_dispatch_, last_dispatch_;
-  double dispatch_us_ = 0, dispatch_max_us_ = 0;
-  std::deque<LoomEvent> pace_events_;
+  long sleep_us_ = 0;
   bool initialized_ = false;
 };
 
