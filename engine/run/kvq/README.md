@@ -180,3 +180,36 @@ K kernel's format with no calibration):
 
 WUSH's calibration adds only ~7% over a fixed Hadamard in this format; the
 rotation does nearly all of the work.
+
+## Round 3 (2026-10-02): code + arXiv paper, 32K each
+
+Documents: code = HRX loom/src/loom/ir/module.c (reference PPL 1.296); arxiv
+= 2608.13365 pdftotext (reference PPL 3.335). Static WUSH is still calibrated on
+Anna Karenina. 99% / 99.9% precision = 100 exp(-KLD at that percentile).
+
+| doc | K / V | dPPL | mean KLD | 99% KLD | 99.9% KLD | 99% prec | 99.9% prec | same top |
+|---|---|---|---|---|---|---|---|---|
+| code | int8 | -0.00% | 0.000032 | 0.0008 | 0.0038 | 99.92% | 99.62% | 99.92% |
+| code | h256g32 | -0.10% | 0.001010 | 0.0161 | 0.0792 | 98.41% | 92.39% | 99.45% |
+| code | wushs | -0.08% | 0.001360 | 0.0247 | 0.0804 | 97.56% | 92.27% | 99.22% |
+| code | wushs-static | +0.12% | 0.001617 | 0.0276 | 0.0687 | 97.28% | 93.36% | 99.19% |
+| code | h256s | +0.08% | 0.001695 | 0.0273 | 0.1568 | 97.31% | 85.48% | 99.29% |
+| code | kv4 | +0.22% | 0.002900 | 0.0508 | 0.1573 | 95.05% | 85.45% | 99.34% |
+| code | uq | +0.66% | 0.009415 | 0.0932 | 0.7080 | 91.10% | 49.26% | 98.79% |
+| code | bad3 | +0.89% | 0.019853 | 0.3420 | 1.1028 | 71.04% | 33.19% | 97.56% |
+| arxiv | int8 | -0.01% | 0.000087 | 0.0015 | 0.0128 | 99.85% | 98.72% | 99.87% |
+| arxiv | h256g32 | +0.12% | 0.003240 | 0.0313 | 0.1548 | 96.92% | 85.65% | 97.73% |
+| arxiv | wushs | +0.02% | 0.004123 | 0.0468 | 0.3018 | 95.42% | 73.95% | 97.73% |
+| arxiv | h256s | +0.13% | 0.004642 | 0.0517 | 0.2498 | 94.96% | 77.89% | 97.56% |
+| arxiv | wushs-static | +0.11% | 0.005013 | 0.0526 | 0.2269 | 94.88% | 79.70% | 96.98% |
+| arxiv | kv4 | +0.76% | 0.008968 | 0.0749 | 0.5570 | 92.79% | 57.29% | 96.27% |
+| arxiv | uq | +0.76% | 0.016819 | 0.1478 | 0.6495 | 86.26% | 52.23% | 94.41% |
+| arxiv | bad3 | +4.49% | 0.059623 | 0.6448 | 1.7137 | 52.48% | 18.02% | 90.40% |
+
+- The ranking holds across all three domains: h256g32 best; the kernel-format
+  rotations (h256s / wushs / wushs-static) within ~0.5 points of each other at
+  99%; kv4 basic 1.3-2.3 points behind; UltraQuant and bad3 last.
+- The arXiv paper is the hardest text.
+- The novel-calibrated WUSH transfers to code and paper.
+- 99.9% columns rest on ~4 positions per document: use mean and 99% for
+  decisions.
