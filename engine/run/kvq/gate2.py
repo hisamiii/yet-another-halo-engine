@@ -77,7 +77,7 @@ def main():
         p999 = np.percentile(kl, 99.9)
         same = np.concatenate([d["same"][d["ok"]] for d in docs])
         pr = np.exp(nr.mean())
-        print(f"| {name} | {pr * np.exp(dn.mean()) - pr:+.3f} ({100 * np.expm1(dn.mean()):+.2f}%) | {max(kl.mean(), 0):.6f} | {np.percentile(kl, 99):.4f} | {p999:.4f} | {100 * np.exp(-p999):.2f}% | {100 * same.mean():.2f}% |")
+        print(f"| {name} | {pr * np.exp(dn.mean()) - pr:+.3f} ({100 * np.expm1(dn.mean()):+.2f}%) | {max(kl.mean(), 0):.6f} | {np.percentile(kl, 99):.4f} | {p999:.4f} | {100 * np.exp(-np.percentile(kl, 99)):.2f}% | {100 * np.exp(-p999):.2f}% | {100 * same.mean():.2f}% |")
         return
     print(f"== {name}  ({len(docs)} docs, {sum(len(d['pos']) for d in docs)} positions)")
     print(f"{'bin':>13s} {'n':>6s} {'dNLL mean [95% CI] (nats)':>36s} {'KL mean':>10s} {'KL p99':>9s} {'KL p99.9':>9s} {'flips/1k':>9s}")
