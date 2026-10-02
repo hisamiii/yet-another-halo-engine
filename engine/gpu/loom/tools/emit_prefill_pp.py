@@ -4,7 +4,7 @@
 Same naming convention as emit_prefill.py, but *every* token dimension is bound
 to B instead of the 5-token batch:
 
-  GEMM family      token_tiles = B / TOKEN_TILE        (grid y)
+  GEMM family      token_tiles = B / tile              (grid y)
   fixed kernels    batch = B
   attention        max_context = score_capacity = B, KV cache B deep
   residual reduce  dim = 5120 * B                      (the whole prompt)
@@ -15,12 +15,7 @@ starts zeroed -- exactly the first-chunk case the 5-token path already
 validates. No token-tile loop, and therefore no per-tile launch overhead: the
 GEMM grid carries the token dimension the same way the benchmark arms do.
 
-usage: emit_prefill_pp.py <model.gguf> <outdir> [tokens]
-
-env:
-  YAH_TOKEN_TILE  GEMM tokens per workgroup (16|64|128|256; default 64).
-                  Anything but 64 goes through tools/widen_tokens.widen().
-  YAH_PP_TOKENS   default token count when argv[3] is absent.
+usage: emit_prefill_pp.py <model.gguf> <outdir> [tokens]   (default 2048 tokens)
 """
 import os, re, sys, shutil
 
@@ -32,15 +27,6 @@ import gen_deltanet_hip  # noqa: E402
 import gen_gdn_chunk  # noqa: E402
 import gen_half_norm  # noqa: E402
 import gen_kvq  # noqa: E402
-
-
-def widen_source(loomfile, text, tile):
-    """Widen (or leave at 64) the N sub-tiles of a GEMM port source."""
-    if tile == 64:
-        return text
-    import widen_tokens as W
-    origin = "%m_origin_s" if "%m_origin_s" in text else "%m_origin"
-    return W.widen(text, tile // 16, m_origin=origin)
 
 
 def rope_kpaged(text):
@@ -97,12 +83,12 @@ def shared_kstore(fmt, mt, kb, B, out, outdir, kind="kstore"):
     """Emit the shared-decode kStore (tools/gen_gemm_shared.py) for this shape if
     it covers the format, and return its dispatch.txt geometry, else None.
 
-    It replaces the chained kStore: same ABI and output, bit-identical, with the
-    decoded weight tile shared by NW waves, a prefetched branch-free decode and a
-    direct token-major epilogue. YAH_SHARED_GEMM=0 keeps the chained kernel.
+    It replaces the hand-written kStore: same ABI and output, bit-identical, with
+    the decoded weight tile shared by NW waves, a prefetched branch-free decode
+    and a direct token-major epilogue.
     """
     import gen_gemm_shared as G
-    if os.environ.get("YAH_SHARED_GEMM", "1") == "0" or fmt not in G.FMTS:
+    if fmt not in G.FMTS:
         return None
     r = tile_kstore(fmt, mt, kb, B, out, outdir, kind)
     if r:
@@ -135,10 +121,9 @@ TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", 
 def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     """Emit the tile GEMM (tools/gen_gemm_tile.py: 16 wave32 waves over a
     128-row x 256-token workgroup, both operands in padded LDS tiles) for this
-    shape if it covers it, and return its dispatch.txt geometry, else None.
-    YAH_TILE_GEMM=0 keeps the shared-decode kernel."""
+    shape if it covers it, and return its dispatch.txt geometry, else None."""
     import gen_gemm_tile as TG
-    if os.environ.get("YAH_TILE_GEMM", "1") == "0" or fmt not in TILE_FMTS:
+    if fmt not in TILE_FMTS:
         return None
     prev_geom = TG.set_geometry(*geom) if geom else None
     try:
@@ -152,18 +137,10 @@ def _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind):
     tile, rowgrp = TG.geometry()
     if mt % rowgrp or B % tile:
         return None
-    # grouped launch order (gen_gemm_tile SWZ) where the row groups divide by it
-    swz = int(os.environ.get("YAH_TILE_SWZ", "0"))
-    prev_swz, prev_da = TG.SWZ, TG.DECAHEAD_ENV
-    TG.SWZ = swz if swz and (mt // rowgrp) % swz == 0 else 0
     # decode-ahead lost on this one shape in two paired pp2048 profiles
     # (IQ4_XS kres 5120 x 6144: 88.5 -> 93.7 / 95.5 ms); it keeps KSUB=64
-    if (fmt, kind, kb) in DECAHEAD_SKIP and prev_da is None:
-        TG.DECAHEAD_ENV = "0"
-    try:
-        return _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp)
-    finally:
-        TG.SWZ, TG.DECAHEAD_ENV = prev_swz, prev_da
+    decahead = (fmt, kind, kb) not in DECAHEAD_SKIP
+    return _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp, decahead)
 
 
 # Short-K residual GEMMs: with decode-ahead, 45% of wave time is s_waitcnt
@@ -172,14 +149,14 @@ def _tile_kstore(TG, fmt, mt, kb, B, out, outdir, kind):
 DECAHEAD_SKIP = {("iq4xs", "kres", 24), ("q4k", "kres", 24)}
 
 
-def _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp):
+def _tile_emit(TG, fmt, mt, kb, B, out, outdir, kind, tile, rowgrp, decahead):
     # TG.configure() rewrites gen_gemm_shared's module globals (NW, LR, KSUB...)
     # to drive the shared decode helpers; put them back for the kernels the
     # shared generator still emits in this process.
     G = TG.G
     keep = {k: getattr(G, k) for k in ("KSUB", "PAD", "ROWP", "PH", "GPP", "GPL", "LR", "NW")}
     try:
-        return _emit_gen(lambda f, k: TG.gen(f, k), tile, fmt, mt, kb, B, out, outdir, kind, rowgrp)
+        return _emit_gen(lambda f, k: TG.gen(f, k, decahead), tile, fmt, mt, kb, B, out, outdir, kind, rowgrp)
     finally:
         for k, v in keep.items():
             setattr(G, k, v)
@@ -194,8 +171,6 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp):
         return None
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
-    # Not named yah_ffn_gemm_*: E.emit applies the chain/widen/epilogue rewrites
-    # to that prefix, and this source is already in its final form.
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     with open(src, "w") as fh:
         fh.write(gen(fmt, kind))
@@ -215,34 +190,11 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp):
 
 def main():
     model, outdir = sys.argv[1], sys.argv[2]
-    B = int(sys.argv[3]) if len(sys.argv) > 3 else int(os.environ.get("YAH_PP_TOKENS", "2048"))
-    TILE = int(os.environ.get("YAH_TOKEN_TILE", "64"))
-    # YAH_GEMM_W64=1 (with YAH_ROWGRP) rebuilds the GEMM sources the wave64/row-
-    # group chain can address as the measured-best arm; the rest keep the
-    # shipping wave32 geometry. dispatch.txt records which is which.
-    CHAIN = os.environ.get("YAH_GEMM_W64") == "1"
-    # YAH_WIDEN_ALL=1 decouples the token-tile widening from the chain. MEASURED
-    # BROKEN -- do not ship, and do not assume the coupling below is incidental.
-    # widen_tokens itself is fine: it completes on every FFN source (iq3xxs/iq4xs/
-    # q5k included) and its output IR is textually complete (tokens 64->128, 8
-    # accumulators, 8 rhs loads, the copy-out rescaled to >>7 / &127), and all 64
-    # widened HALs compile. But the forward is WRONG: B=2048 argmax is 220 with
-    # every family widened, and still 220 when ONLY gemm_swiglu_iq3xxs_1088_20 is
-    # widened (1 file), 220 for kstore-only, 220 for residual-only, 198 for the
-    # non-FFN formats -- against argmax 11751 for the untouched shipped set, run
-    # interleaved on the same binary. So the coupling is load-bearing: the widened
-    # UNCHAINED kernels are not usable, and the root cause is not yet established
-    # (it is NOT a missing rewrite in widen_tokens; register pressure at wave32
-    # with 8 live accumulators, or a layout the chain's later steps normally fix,
-    # both remain open). Default OFF: unset, the emitted set is byte-identical.
-    WIDEN_ALL = os.environ.get("YAH_WIDEN_ALL") == "1"
-    LEVEL = os.environ.get("YAH_CHAIN_LEVEL", "full")
-    ROWGRP = int(os.environ.get("YAH_ROWGRP", "4"))
-    KSPLIT = int(os.environ.get("YAH_KSPLIT", "4"))
+    B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
+    # GEMM tokens per workgroup of the hand-written sources
+    TILE = 64
     if B % TILE:
         raise SystemExit("tokens=%d must be a multiple of the token tile=%d" % (B, TILE))
-    E.TOKEN_TILE = TILE
-    E.WIDEN_TILE = TILE
     TT = B // TILE
     # Chunked prefill: YAH_CTX=T (> B) emits every kernel at the chunk size B,
     # the KV cache (rope's max_context, attention's cache_capacity, the V^T
@@ -277,59 +229,37 @@ def main():
     n = 0
     geom = []  # (<hal>, <tokens per workgroup>, <row groups>, <token_tiles>)
     for kind, fmt, port, mt, kb in sorted(combos):
-        if kind == "kstore":
+        # The residual projections run as a kStore plus the fused-residual kres
+        # variant (loom_forward_pp prefers kres when present).
+        if kind in ("kstore", "residual"):
             f = "yah_ffn_gemm_%s_f32.loom" % port
-        elif kind == "residual":
-            f = "yah_ffn_gemm_%s_residual_f32.loom" % port
         else:
             f = "yah_ffn_gemm_%s_swiglu_f16.loom" % port
-        # Only the sources the chain can rebuild get the wider tile. chain_applies
-        # runs the real transform and fails loudly on an anchor it does not know,
-        # so the tile this emitter binds and the grid the driver passes cannot
-        # drift apart by accident.
-        # mt % rowgrp == 0 or the row-grouped grid truncates: the iq3s family
-        # contains a 48-row weight (m_tiles=3), where grid x would become 0.
-        # YAH_CHAIN_LEVEL=w64 emits each source through the wave64 port only. The
-        # row group needs widen_rows, which needs the iq3s lane map, so rowgrp stays
-        # 1 at that level; the tile still widens because widen_tokens is
-        # format-agnostic. chain_applies() probes the level actually selected,
-        # because _chain() is what it runs and _chain() honours the same env var.
-        # full chain where it applies, wave64-only for the rest at level=w64.
-        # The two probes must stay separate: a source that supports the full chain
-        # has to KEEP its row groups even when the level asks for wave64, or the
-        # emit silently regresses the already-chained iq3s HALs.
-        full = ((E.chain_applies(f, tile=TILE, level="full") if CHAIN else False)
-                and mt % ROWGRP == 0)
-        # The reduced levels are a FALLBACK for sources that cannot take the full
-        # chain: a source that can must keep it, or the emit silently drops the
-        # row groups it already had.
-        alt_level = LEVEL if LEVEL in ("rows", "w64") else None
-        alt = (E.chain_applies(f, tile=TILE, level=alt_level)
-               if (CHAIN and alt_level) else False)
-        # 'rows' applies widen_rows, so it divides the x grid by rowgrp exactly
-        # like the full chain and needs the same divisibility guard. Without it
-        # mt=3 (m_tiles=3) becomes m_groups = 3/4 = 0 and the ostage fragment
-        # store cannot prove its bound: "vector_extent is 16, view_bound is 48,
-        # and the maximum legal origin is 32".
-        if alt_level == "rows":
-            alt = alt and mt % ROWGRP == 0
-        chain_level = "full" if full else (alt_level if alt else None)
-        use = chain_level is not None
-        # widenable: every source widen_tokens can widen, chained or not. The row
-        # group still requires the chain (widen_rows), so rowgrp stays 1 without it.
-        tile = TILE if (use or WIDEN_ALL) else 64
-        tt = B // tile
-        # 'rows' applies widen_rows, so it keeps the row-group grid; 'w64' does not.
-        rowgrp = ROWGRP if chain_level in ("full", "rows") else 1
         sym = E.sym_of(f)
-        if kind == "kstore":
+        if kind == "residual":
+            kout = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
+            sg = shared_kstore(fmt, mt, kb, B, kout, outdir)
+            if sg:
+                geom.append(sg)
+                kr = shared_kstore(fmt, mt, kb, B, "gemm_kres_%s_%d_%d.hal" % (fmt, mt, kb),
+                                   outdir, kind="kres")
+                if kr:
+                    geom.append(kr)
+                n += 1
+                continue
+            cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
+                   "%s.token_tiles=%d" % (sym, TT)]
+            if port == "iq3s":
+                cfg.append("%s.word_decode=1" % sym)
+            out = kout
+        elif kind == "kstore":
             sg = shared_kstore(fmt, mt, kb, B, "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb), outdir)
             if sg:
                 geom.append(sg)
                 # the attention q projection (12288 rows = 24 heads x [q|gate]):
                 # also the variant that stores q and gate unpacked
                 # (loom_forward_pp prefers it and skips yah_unpack_qg)
-                if mt == 768 and os.environ.get("YAH_KQG", "1") == "1":
+                if mt == 768:
                     qgv = shared_kstore(fmt, mt, kb, B, "gemm_kqg_%s_%d_%d.hal" % (fmt, mt, kb),
                                         outdir, kind="kqg")
                     if qgv:
@@ -337,18 +267,10 @@ def main():
                 n += 1
                 continue
             cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
-                   "%s.token_tiles=%d" % (sym, tt)]
-            # The chain drops the runtime word_decode switch outright (it keeps
-            # the word body), so the binding must go too or the compile rejects
-            # it as an unused config.
-            if port == "iq3s" and not use:
+                   "%s.token_tiles=%d" % (sym, TT)]
+            if port == "iq3s":
                 cfg.append("%s.word_decode=%d" % (sym, 0 if mt == 1088 else 1))
             out = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
-        elif kind == "residual":
-            cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
-                   "%s.token_tiles=%d" % (sym, tt),
-                   "%s.k_split=%d" % (sym, KSPLIT), "%s.accum=0" % sym]
-            out = "gemm_residual_%s_%d_%d.hal" % (fmt, mt, kb)
         else:
             out = "gemm_swiglu_%s_%d_%d.hal" % (fmt, mt, kb)
             sg = shared_kstore(fmt, mt, kb, B, out, outdir, kind="swiglu")
@@ -357,47 +279,9 @@ def main():
                 n += 1
                 continue
             cfg = ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
-                   "%s.token_tiles=%d" % (sym, tt)]
-        E.emit(f, cfg, out, outdir, widen=tile, chain=use,
-               chain_level=(chain_level or "full"))
-        geom.append((out, tile, rowgrp, tt))
-        # YAH_KSTORE_RESIDUAL=1 additionally emits the CHAINED kStore HAL for
-        # every residual shape, so a driver can run those projections on the fast
-        # decode instead of the residual source (whose decode widen_rows cannot
-        # address). Additive and opt-in: with the env var unset the emitted set is
-        # byte-identical to before. The residual HAL is still emitted either way,
-        # and the driver loads by exact name, so nothing changes until the driver
-        # is taught to ask for the kStore variant.
-        if kind == "residual" and os.environ.get("YAH_KSTORE_RESIDUAL") != "off":
-            kf = "yah_ffn_gemm_%s_f32.loom" % port
-            kfull = E.chain_applies(kf, tile=TILE, level="full") and mt % ROWGRP == 0
-            kalt = (E.chain_applies(kf, tile=TILE, level=alt_level)
-                    if alt_level else False)
-            if alt_level == "rows":
-                kalt = kalt and mt % ROWGRP == 0
-            kchain_level = "full" if kfull else (alt_level if kalt else None)
-            kuse = kchain_level is not None
-            ktile = TILE if (kuse or WIDEN_ALL) else 64
-            ktt = B // ktile
-            krowgrp = ROWGRP if kchain_level in ("full", "rows") else 1
-            ksym = E.sym_of(kf)
-            kcfg = ["%s.m_tiles=%d" % (ksym, mt), "%s.k_blocks=%d" % (ksym, kb),
-                    "%s.token_tiles=%d" % (ksym, ktt)]
-            if port == "iq3s" and not kuse:
-                kcfg.append("%s.word_decode=%d" % (ksym, 1))
-            kout = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
-            sg = shared_kstore(fmt, mt, kb, B, kout, outdir)
-            if sg:
-                geom.append(sg)
-                # the fused-residual variant (loom_forward_pp prefers it when present)
-                kr = shared_kstore(fmt, mt, kb, B, "gemm_kres_%s_%d_%d.hal" % (fmt, mt, kb),
-                                   outdir, kind="kres")
-                if kr:
-                    geom.append(kr)
-            else:
-                E.emit(kf, kcfg, kout, outdir, widen=ktile, chain=kuse,
-                       chain_level=(kchain_level or "full"))
-                geom.append((kout, ktile, krowgrp, ktt))
+                   "%s.token_tiles=%d" % (sym, TT)]
+        E.emit(f, cfg, out, outdir)
+        geom.append((out, TILE, 1, TT))
         n += 1
 
     # Attention: tools/gen_attn_fa.py (register softmax), 32 tokens x 2 heads per
