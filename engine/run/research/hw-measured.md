@@ -69,3 +69,21 @@ Implication: our tile GEMMs issue ~1.7 b128 fragment loads per WMMA (SQ_INSTS_LD
 | attention pp8192 | 63.9 | 16.61 | 4.01 | 98% | 9% |
 
 All at the issue bound: barrier waits and stalls are absorbed by other waves; only instructions per WMMA (VALU, LDS) move cycles. Extended counters: SQ_INST_CYCLES_VALU counts one per instruction (+extra for multi-cycle ops), not WMMA pipe time.
+
+## DRAM bandwidth (2026-10-02, Loom streaming kernels through HRX, engine/build/hal_run)
+
+1 GiB buffers (far past the 32 MB MALL), 16-byte vector accesses, grid-stride,
+10 dispatches timed by host wall clock around the loop and the final wait, one
+round each from APU <= 55 C, 1 s gaps.
+
+| kernel | best launch | GB/s |
+|---|---|---:|
+| read (sum into a register) | 16384 x 256, 1 access per iteration | 240.5 |
+| read | 2048 x 256, unroll 4 | 230.1 |
+| copy (read + write, both counted) | 2048 x 256, unroll 4 | 193.9 |
+| write | 2048 x 256, unroll 4 | 170.5 |
+
+Read saturates near 240 GB/s (94% of LPDDR5X-8000 x 256-bit, 256 GB/s) once
+there are a few thousand workgroups in flight. Decode roofline on the IQ4_XS
+shard: 12.40 GB of weights per token / 240 GB/s = 51.7 ms, 19.4 tok/s. HIP
+decode runs at 68.6 ms (75% of this), Loom loom_decode at 77.1 ms (67%).

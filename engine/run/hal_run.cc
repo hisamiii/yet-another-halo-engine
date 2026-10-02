@@ -11,6 +11,7 @@
 //              f:<file>            a device buffer initialized from the file
 //              o:<bytes>:<file>    a zeroed device buffer, written to <file> after
 //              io:<in>:<out>       initialized from <in>, written to <out> after
+//              z:<bytes>           an uninitialized device buffer, not read back
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -93,6 +94,10 @@ int main(int argc, char** argv) {
         gpu.H2D(owned.back(), data.data(), size);
         refs.push_back({owned.back().handle, 0, size});
         if (io) outs.emplace_back(refs.size() - 1, out);
+      } else if (spec.rfind("z:", 0) == 0) {          // scratch: allocated, not initialized or read back
+        size = std::strtoull(spec.substr(2).c_str(), nullptr, 10);
+        owned.push_back(gpu.Allocate(size));
+        refs.push_back({owned.back().handle, 0, size});
       } else if (spec.rfind("o:", 0) == 0) {
         const size_t c = spec.find(':', 2);
         size = std::strtoull(spec.substr(2, c - 2).c_str(), nullptr, 10);
