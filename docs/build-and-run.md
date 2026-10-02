@@ -95,10 +95,10 @@ engine/build/yah_server --model <gguf> --fake    # canned replies, CPU only: for
 
 A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is padded (the padding leaves the recurrent state unchanged) unless decode steps are cheaper for that tail (short prompts: about 62 ms per token against about 3.1 s per chunk).
 
-For quick tests, `engine/serve/chat.py` is a terminal chat client (standard library only): it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply.
+For quick tests, `engine/build/yah_chat` is a terminal chat client: it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply. Commands: `/reset`, `/effort E`, `/temp T`, `/max N`, `/system TEXT`, `/quit`; Ctrl-C stops a reply.
 
 ```
-python3 engine/serve/chat.py --url http://127.0.0.1:8080 [--effort none|low|medium|high] [--temperature T] [--max N]
+engine/build/yah_chat --url http://127.0.0.1:8080 [--effort none|low|medium|high] [--temperature T] [--max N] [--system TEXT]
 ```
 
 It logs one line per request to stderr: id, prompt and output tokens, prefill ms, decode tok/s, finish reason (`cancelled` when the client left).
