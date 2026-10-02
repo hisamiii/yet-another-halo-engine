@@ -7,6 +7,7 @@ usage: dattn_check.py <model.gguf> <workdir> [T] [pos]
 """
 import os
 import subprocess
+import time
 import sys
 
 import numpy as np
@@ -30,11 +31,22 @@ def build(work, which, T):
     return r.stdout.strip().splitlines()[0]
 
 
-def run(model, hal, grid, binds, mins):
+BENCH = int(os.environ.get("DATTN_BENCH", "0"))   # N: also time the part kernel over N dispatches
+
+
+def run(model, hal, grid, binds, mins, bench=False):
     cmd = [GPURUN, "dattn-check", "--", HALRUN, model, hal, grid, "256", ",".join(map(str, mins))] + binds
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    env = dict(os.environ)
+    if bench and BENCH:
+        env["HAL_RUN_ITERS"] = str(BENCH)
+        time.sleep(1)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
     if "hal_run: ok" not in r.stdout:
         raise SystemExit(r.stdout[-1500:] + r.stderr[-1500:])
+    for line in r.stdout.splitlines():
+        if "ms per dispatch" in line:
+            ms = float(line.split()[1])
+            print(f"part: {ms * 1000:.1f} us per dispatch ({grid} workgroups)")
 
 
 def main():
@@ -63,9 +75,9 @@ def main():
     used = pos // 256 + 1
     acc_b, ml_b = npg * 24 * 256 * 4, npg * 24 * 2 * 4
     hp = build(work, "part", T)
-    run(model, hp, f"{used},4", [f"f:{fq}", f"f:{fk}", f"f:{fv}", f"f:{fp}", f"f:{fpos}",
+    run(model, hp, f"4,{used}", [f"f:{fq}", f"f:{fk}", f"f:{fv}", f"f:{fp}", f"f:{fpos}",
                                   f"o:{acc_b}:{work}/acc", f"o:{ml_b}:{work}/ml"],
-        [24 * 256 * 4, T * 2048, T * 2048, npg * 4, 4, acc_b, ml_b])
+        [24 * 256 * 4, T * 2048, T * 2048, npg * 4, 4, acc_b, ml_b], bench=True)
     hr = build(work, "reduce", T)
     run(model, hr, "24", [f"f:{work}/acc", f"f:{work}/ml", f"f:{fg}", f"f:{fpos}", f"o:{24 * 256 * 4}:{work}/out"],
         [acc_b, ml_b, 24 * 256 * 4, 4, 24 * 256 * 4])

@@ -9,11 +9,11 @@ The current position comes from a device i32 (pos); keys 0..pos are visible.
 
 Kernels (gen(which, T) with T = pool rows, a multiple of 256):
   kvappend  write the new token's K (roped, f32) and V (f32) into its row: grid 4 x 256
-  part      one workgroup per (page s, kv head): the page's 256 keys against the
+  part      one workgroup per (kv head, page s): the page's 256 keys against the
             six query heads of the GQA group. Scores (thread = key, from its K row),
             per-head block max / sum, p in LDS, then P.V (thread = dim, the page's V^T
             slab of 16 tiles x 256 dims x 16 keys is contiguous per kv head).
-            Writes acc[s][head][256], m[s][head], l[s][head]. Grid (pages used, 4).
+            Writes acc[s][head][256], m[s][head], l[s][head]. Grid (4, pages used).
   reduce    one workgroup per head, thread = dim: merge the pages,
             out = (sum_s e^(m_s - M) acc_s) / (sum_s e^(m_s - M) l_s) * sigmoid(gate).
 Math as QwenDecodeOnlineAttentionHalfKernel (score = q.k / 16, softmax, gate), with
@@ -21,7 +21,14 @@ the softmax in two levels instead of online.
 """
 import sys
 
+import os
+
 KVW = 1024          # 4 kv heads x 256
+# YAH_DA_PIPE_K / YAH_DA_PIPE_V: Loom read-ahead depth on the K-row and V^T-tile loops of
+# part. T = 8192, pos 8191 (32 MB of K + V per call), one round each: none 428 us,
+# 2/2 155, 3/2 134 (~240 GB/s, the measured peak), 4/2 152; V depth 3+ spills.
+PIPE_K = int(os.environ.get("YAH_DA_PIPE_K", "3"))
+PIPE_V = int(os.environ.get("YAH_DA_PIPE_V", "2"))
 NH, NKV, HD = 24, 4, 256
 G = NH // NKV       # query heads per kv head
 
@@ -104,8 +111,10 @@ def gen_part(T):
     e("  %c4 = index.constant 4 : index")
     e("  %c256 = index.constant 256 : index")
     e(f"  %cnp = index.constant {npg} : index")
-    # grid x = pages; the host dispatches only the pages in use (ceil((pos + 1) / 256))
-    e("  kernel.launch.config workgroups(%cnp, %c4, %u1) workgroup_size(%c256, %u1, %u1) : index")
+    # grid (4 kv heads, pages): the four heads of a page run together, so each 2 KB K row
+    # is consumed at once (page-major order read one 512 B quarter per row at a time:
+    # 43 -> 71 GB/s at 32K only). The host dispatches the pages in use, ceil((pos + 1) / 256).
+    e("  kernel.launch.config workgroups(%c4, %cnp, %u1) workgroup_size(%c256, %u1, %u1) : index")
     e("} launch(%q: buffer, %kp: buffer, %vtp: buffer, %ptab: buffer, %pos: buffer, %acc: buffer, %ml: buffer) {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 4, 8, 16, 32, 256):
@@ -130,8 +139,8 @@ def gen_part(T):
     e(f"  %ldsb = index.constant {nlds * 4} : offset")
     e("  %ldsp = buffer.alloca<workgroup> align(16) %ldsb : buffer")
     e(f"  %lds = buffer.view %ldsp[%base] : buffer -> view<{nlds}xf32>")
-    e("  %s = kernel.workgroup.id<x> : index")
-    e("  %h = kernel.workgroup.id<y> : index")
+    e("  %h = kernel.workgroup.id<x> : index")
+    e("  %s = kernel.workgroup.id<y> : index")
     e("  %t = kernel.workitem.id<x> : index")
     e("  %wv = index.div %t, %c32 : index")
     e("  %ln = index.rem %t, %c32 : index")
@@ -172,7 +181,10 @@ def gen_part(T):
     e("  %zv8 = vector.constant 0.0 : vector<8xf32>")
     inits = ", ".join(f"%sa{j} = %zv8 : vector<8xf32>" for j in range(G))
     res = ", ".join(f"%sr{j}" for j in range(G))
-    e(f"  {res} = scf.for %c = [%c0 to %c32 step %c1]({inits}) -> ({', '.join(['vector<8xf32>'] * G)}) {{")
+    pk = f" pipeline(%cpk)" if PIPE_K > 1 else ""
+    if PIPE_K > 1:
+        e(f"  %cpk = index.constant {PIPE_K} : index")
+    e(f"  {res} = scf.for %c = [%c0 to %c32 step %c1]({inits}) -> ({', '.join(['vector<8xf32>'] * G)}){pk} {{")
     e("    %d8 = index.mul %c, %c8 : index")
     e("    %ka0 = index.add %kr, %d8 : index")
     e("    %ka = index.min %ka0, %klim : index")
@@ -267,7 +279,10 @@ def gen_part(T):
     e("  %zv16 = vector.constant 0.0 : vector<16xf32>")
     inits = ", ".join(f"%oa{j} = %zv16 : vector<16xf32>" for j in range(G))
     res = ", ".join(f"%or{j}" for j in range(G))
-    e(f"  {res} = scf.for %i = [%c0 to %c16 step %c1]({inits}) -> ({', '.join(['vector<16xf32>'] * G)}) {{")
+    pv = f" pipeline(%cpv)" if PIPE_V > 1 else ""
+    if PIPE_V > 1:
+        e(f"  %cpv = index.constant {PIPE_V} : index")
+    e(f"  {res} = scf.for %i = [%c0 to %c16 step %c1]({inits}) -> ({', '.join(['vector<16xf32>'] * G)}){pv} {{")
     e("    %ti = index.add %vtb, %i : index")
     e("    %tr = index.mul %ti, %c256 : index")
     e("    %td = index.add %tr, %t : index")

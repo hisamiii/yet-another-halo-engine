@@ -52,6 +52,7 @@
 
 #include "core/config.hpp"
 #include "core/gguf.hpp"
+#include "model/loom_decoder.hpp"
 #include "model/loom_runtime.hpp"
 
 using namespace yah::model;  // NOLINT(google-build-using-namespace)
@@ -349,16 +350,21 @@ int main(int argc, char** argv) {
     // records the chunk size (tokens column) and the context T (tt column). The
     // command-line token count is T; every kernel runs at the chunk size, the
     // KV cache holds T, and the T / chunk passes carry the DeltaNet and conv state.
+    // T_ctx is the context the set was emitted for (KV pool capacity); T_run, the
+    // tokens processed, may be any multiple of the chunk up to T_ctx (room left for
+    // decode after the prompt, YAH_GEN).
     std::uint32_t T_ctx = g_b;
+    const std::uint32_t T_run = g_b;
     if (const auto it = g_geom.find("ctx"); it != g_geom.end()) {
       T_ctx = it->second.tt;
-      if (g_b != T_ctx) {
-        std::fprintf(stderr, "chunked set: tokens=%u must equal the emitted context %u\n", g_b, T_ctx);
+      if (T_run > T_ctx || T_run % it->second.tokens) {
+        std::fprintf(stderr, "chunked set: tokens=%u must be a multiple of the chunk %u and at most the emitted context %u\n",
+                     T_run, it->second.tokens, T_ctx);
         return 2;
       }
       g_b = it->second.tokens;
     }
-    const std::uint32_t n_chunks = T_ctx / g_b;
+    const std::uint32_t n_chunks = T_run / g_b;
     if (g_b % g_gtile) {
       std::fprintf(stderr, "tokens=%u must be a multiple of the token tile=%u\n", g_b, g_gtile);
       return 2;
@@ -572,7 +578,9 @@ int main(int argc, char** argv) {
       e_ropes.push_back(&load(dir + (c ? "/rope_c" + std::to_string(c) + ".hal" : std::string("/rope.hal"))));
       e_wmmas.push_back(&load(dir + (c ? "/wmma_c" + std::to_string(c) + ".hal" : std::string("/wmma.hal"))));
     }
-    LoomExecutable* e_convstate = n_chunks > 1 ? &load(dir + "/convstate.hal") : nullptr;
+    // emitted for chunked sets; runs after every processed chunk, so the last one
+    // also leaves its final conv state (the decode handoff reads it)
+    LoomExecutable* e_convstate = T_ctx > g_b ? &load(dir + "/convstate.hal") : nullptr;
     // tools/gen_attn_hip.py: a vtrans.hal row means the attention reads V as
     // [kv head][16-key tile][dim][16] f16, written per layer by yah_transpose_v16.
     // Paged K / V caches ("kv_paged"): 256-token pages; one page table per
@@ -904,14 +912,14 @@ int main(int argc, char** argv) {
     // YAH_LOGITS_FROM=P: f32 logits of every absolute position P..T-1 into
     // <prefix>.all_logits ((T-P) x vocab, row-major) for the correctness gate
     // (engine/run/accgate2.py), gathered after each chunk's layers.
-    std::uint32_t logits_from = T_ctx;
+    std::uint32_t logits_from = T_run;
     if (const char* lf = std::getenv("YAH_LOGITS_FROM")) {
       logits_from = static_cast<std::uint32_t>(std::atoi(lf));
-      if (logits_from >= T_ctx) throw LoomError("YAH_LOGITS_FROM must be below the token count");
+      if (logits_from >= T_run) throw LoomError("YAH_LOGITS_FROM must be below the token count");
     }
     const auto* head_onw = find("output_norm.weight");
     const auto* head_ow = find("output.weight");
-    LoomBuffer every = gpu.Allocate(std::size_t{T_ctx - logits_from + (logits_from == T_ctx)} * kVocab * 4);
+    LoomBuffer every = gpu.Allocate(std::size_t{T_run - logits_from + (logits_from == T_run)} * kVocab * 4);
     // YAH_ROWSTATS=<file>: compact per-position statistics for the quality gate
     // (engine/run/kvq/gate2.py) instead of full logit rows. Positions: those
     // >= YAH_ROWSTATS_FROM (default 1024) that are multiples of
@@ -1288,7 +1296,7 @@ int main(int argc, char** argv) {
       if (g_dump_layer == static_cast<int>(l))
         dump_buf(hidden, static_cast<std::size_t>(B) * kHidden * 4, ".ffn");
     }
-    if (!skip_head && logits_from < T_ctx && std::size_t{ci + 1} * B > logits_from) {
+    if (!skip_head && logits_from < T_run && std::size_t{ci + 1} * B > logits_from) {
       const Imported wnorm = ImportTensor(*head_onw);
       const Imported w = ImportTensor(*head_ow);
       const std::uint32_t lo = std::max<std::uint32_t>(logits_from, ci * B);
@@ -1332,7 +1340,7 @@ int main(int argc, char** argv) {
         for (std::size_t i = 0; i < rows.size(); ++i) {
           const float* lg = host.data() + i * kVocab;
           const std::uint32_t pos = ci * B + rows[i];
-          const std::int32_t nxt = pos + 1 < T_ctx ? static_cast<std::int32_t>(ids_all[pos + 1]) : -1;
+          const std::int32_t nxt = pos + 1 < T_run ? static_cast<std::int32_t>(ids_all[pos + 1]) : -1;
           double mx = lg[0];
           for (std::uint32_t v = 1; v < kVocab; ++v) mx = std::max<double>(mx, lg[v]);
           double se = 0.0;
@@ -1408,12 +1416,47 @@ int main(int argc, char** argv) {
       std::fclose(fl);
       std::printf("argmax=%u\n", tok);
 
+      // YAH_GEN=N with YAH_DECODE_HAL=<emit_decode set, ctx = this set's context>:
+      // N greedy tokens (the prefill's argmax first) by the GEMV decoder on this
+      // prefill's paged KV pools, page table, conv and DeltaNet state.
+      if (const char* gv = std::getenv("YAH_GEN"); gv && std::atoi(gv) > 0) {
+        const std::uint32_t ngen = static_cast<std::uint32_t>(std::atoi(gv));
+        const char* ddir = std::getenv("YAH_DECODE_HAL");
+        if (!ddir) throw LoomError("YAH_GEN needs YAH_DECODE_HAL (tools/emit_decode.py set)");
+        if (!(kv_paged && paged_f16k && paged_f16v)) throw LoomError("YAH_GEN needs paged fp16 K / V (the default set)");
+        if (T_run + ngen - 1 > T_ctx) throw LoomError("YAH_GEN: prompt + gen exceeds the emitted context");
+        LoomDecoder dec(gpu, gguf, cfg, ddir, weights.handle, weights_delta);
+        if (dec.context() != kPages * 256)
+          throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) +
+                          " != prefill pool rows " + std::to_string(kPages * 256));
+        LoomDecoderState st;
+        for (std::uint32_t ai = 0; ai < kFull; ++ai) {
+          st.kpool.push_back({kpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes});
+          st.vtpool.push_back({vtpool.handle, std::size_t{ai} * kPoolBytes, kPoolBytes});
+        }
+        st.ptab = ptab_ref;
+        st.convstate = conv_state.handle;
+        st.dstate = state.handle;
+        dec.Bind(st);
+        dec.SetTokens(&tok, 1, T_run);
+        gpu.Synchronize();
+        const auto tg = std::chrono::steady_clock::now();
+        for (std::uint32_t pos = T_run; pos + 1 < T_run + ngen; ++pos) dec.Step(pos, T_run);
+        gpu.Synchronize();
+        const double gms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
+        const std::vector<std::uint32_t> gen = dec.Tokens(T_run, T_run + ngen);
+        std::printf("generated_ids=");
+        for (std::size_t i = 0; i < gen.size(); ++i) std::printf("%u%s", gen[i], i + 1 == gen.size() ? "" : " ");
+        std::printf("\n");
+        if (ngen > 1) std::printf("decode_ms=%.2f decode_tok_s=%.2f (context %u)\n", gms / (ngen - 1), 1000.0 * (ngen - 1) / gms, T_run);
+      }
+
       // YAH_LOGITS_FROM=P: f32 logits of every position P..B-1 into
       // <prefix>.all_logits ((B-P) x vocab, row-major) for the tiered
       // correctness gate (engine/run/accgate2.py). The same head kernels as the
       // last-token path, one row at a time into one device buffer.
-      if (logits_from < T_ctx) {
-        const std::size_t rows = T_ctx - logits_from;
+      if (logits_from < T_run) {
+        const std::size_t rows = T_run - logits_from;
         gpu.Synchronize();
         std::vector<float> host(rows * kVocab);
         gpu.D2H(every, host.data(), host.size() * 4, 0);

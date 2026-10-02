@@ -1987,24 +1987,72 @@ the back-edge `vmcnt(0)` (0.9% of wave time) goes, a `vmcnt(1)` (2.8%) comes
 
 ## 7. Decode and the HIP removal
 
-The decode forward is `engine/run/yah_hrx.cc`, built by `engine/build_hrx.sh`.
-It processes one token at a time (prompt and generation share the path):
+### Loom decode (2026-10-02): GEMV-based, prefill handoff
 
-- a host IQ4_XS embedding row lookup;
-- a persistent fp16 KV cache in `[layer][position][kv_head][dim]` layout,
-  written by `yah_fused_qk_rope` (position from a device i32) and read by
-  `yah_decode_attn`;
-- `yah_ssm_conv_decode` + `yah_deltanet_decode` for the recurrent state;
-- the `token_tiles=1` prefill GEMM HALs for every projection (only token 0 of the
-  64-token tile is used);
-- `yah_rmsnorm` + `yah_gemv_q6k` + `yah_argmax` for the head.
+`engine/model/loom_decoder.hpp` (`LoomDecoder`) is the single-token step, driven
+by `engine/run/loom_decode.cc` (prompt fed through decode) or by
+`loom_forward_pp` after a prefill (`YAH_GEN=N YAH_DECODE_HAL=<set>`). The HAL set
+comes from `tools/emit_decode.py <model> <dir> <max_context>`:
 
-`engine/gpu/loom/tools/emit_decode.py` emits the decode HAL set: it reuses
-`emit_prefill.py` for the GEMMs and adds the decode kernels, with one
-`yah_decode_attn` HAL per `start_pos`. On Qwen3.8-27B-IQ4_XS the runner
-reproduces the recorded HIP sequence exactly (`11751 13 198 760 6511 314 9564
-369 19241 13 198 760 6511 314 14898 369`), and `engine/tests/m0_gate.sh` and
-`generate_gate.sh` pass against it.
+- `tools/gen_gemv.py`: one GEMV per (kind, formats, M, K) on the shard. HIP's
+  sub16 decode for Q2_K..Q8_0 and IQ2_XXS / IQ2_XS / IQ3_XXS / IQ3_S / IQ4_XS,
+  done on 32-bit words to unsigned byte codes (biases folded into the offset
+  term), two rows per wave sharing x, `pipeline(2)` read-ahead, butterfly
+  reduce. Kinds: plain, resid (residual add fused), swiglu (gate + up fused).
+  `tools/gemv_check.py`: every (format, K) against a float64 gguf-py oracle,
+  worst 1.7e-6.
+- `tools/gen_decode_attn.py`: attention over the prefill's paged fp16 pools
+  (kvappend; split-K part, one workgroup per (kv head, 256-key page) with the
+  six GQA heads; reduce with the sigmoid gate). `tools/dattn_check.py` checks
+  it against numpy with scrambled page tables.
+- `tools/gen_decode_misc.py`: 512-lane RMSNorm and DeltaNet decode (the ports'
+  math), and the IQ4_XS embedding row from a device token stream.
+- The step is enqueued back to back: argmax writes the next token into the
+  stream the next embedding reads, positions come from a device array, so the
+  host waits only after the prompt and at the end. Independent input
+  projections go without an ordering barrier.
+
+Prefill handoff: a chunked prefill set (`YAH_CTX`) may now process fewer tokens
+than it was emitted for (a multiple of the chunk), leaving pool room; the
+decoder binds the prefill's K / V^T pools, page table, conv state (saved after
+the last chunk too) and DeltaNet state, whose layouts it shares. The decode
+set's context must equal the prefill pool rows.
+
+Results (IQ4_XS shard, 64 greedy tokens, every token identical to HIP's):
+
+| context after prefill | Loom | HIP |
+| --- | ---: | ---: |
+| 5 (prompt fed through decode) | 16.43 tok/s (60.9 ms) | 14.58 tok/s (68.6 ms) |
+| 2048 | 15.97 tok/s (62.6 ms) | 14.07 tok/s (71.1 ms) |
+| 8192 | 15.16 tok/s (65.9 ms) | 13.46 tok/s (74.3 ms) |
+| 30720 (arXiv 2608.13365) | 13.31 tok/s (75.2 ms) | 11.75 tok/s (85.1 ms) |
+
+Roofline: 12.40 GB of weights per token / 240 GB/s = 51.7 ms. The GEMV
+families run at 214-236 GB/s.
+
+What mattered, in order (each measured on the full decode):
+
+- **Low-bit GEMVs were VALU-bound.** `vector<16xi8>` shifts and masks lower
+  byte by byte (unpack, shift, repack), ~240 VALU per 16 weights on IQ3_S; a
+  VALU-count model predicted the measured 115-175 GB/s per format. Word-level
+  decode: 77.1 -> 68.2 ms.
+- **Read-ahead.** `pipeline(2)` on the GEMV sub-block loop: 68.2 -> 63.1 ms
+  (depth 3 66.1, 4 67.8: the queue costs registers).
+- **No host round trip** (GPU embedding, device token stream): -0.9 ms;
+  barrier-free independent projections: -1.4 ms.
+- **Attention at long context.** Read-ahead on the K and V^T loops (depth 3 / 2)
+  and a (head, page) grid order so the four heads of a page read each 2 KB K
+  row together: 128 MB of K / V per call at 32K went 2955 -> 689 us
+  (43 -> 195 GB/s). Standalone timings below ~32 MB are flattered by the
+  32 MB MALL; benchmark attention at 32K.
+- Profiling: `HRX_PROFILE_MODE=dispatch` (timestamps only) costs ~1%;
+  counters mode inflates dispatch gaps ~4x. A kernel right after a no-barrier
+  group shows the group's tail in its own duration.
+
+The previous decode runner (`yah-hrx`, removed) drove the prefill GEMM HALs with a
+64-token tile per generated token (1.46 tok/s).
+
+### History
 
 HIP runs **alongside** HRX again. It was removed in `01279d6` before tuning was
 finished; `9f8b142` restores the 141 deleted files (a pure deletion, so the
