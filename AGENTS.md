@@ -22,7 +22,7 @@ Layout:
 - Reuse what exists (generators, `hal_run`, `gpu_run.sh`, the checkers) before adding a new tool or subsystem.
 - Read the surrounding code first and match it: naming, idioms, comment density.
 - ASCII only, in code, comments and docs: `-`, `->`, `x`, `...`, not em-dashes, arrows, `×` or `…`.
-- C++: C++20, the existing style (types and functions `CamelCase`, locals `snake_case`, members `snake_case_`, constants `kName`), 2-space indent, 120 columns. Format with `clang-format` (`.clang-format` in the root). Sized integers (`std::uint32_t`) for sizes and indices that cross the host/device boundary.
+- C++: C++20, built with clang (`-O3 -march=native -ffp-contract=off`; no FMA contraction, so host float math stays bit-identical), the existing style (types and functions `CamelCase`, locals `snake_case`, members `snake_case_`, constants `kName`), 2-space indent, 120 columns. Format with `clang-format` (`.clang-format` in the root). Sized integers (`std::uint32_t`) for sizes and indices that cross the host/device boundary.
 - Python: 4-space indent, the existing style. Generators print Loom text with `e(...)`; keep one kernel per `gen_*` function.
 - No dead code. When an experiment loses, delete its switch and code path and record one line in `docs/results.md` (what, the number, why). Git keeps the code if it is ever needed again.
 - Environment switches are for real modes only (context size, KV format, debug dumps), not for parked experiments.

@@ -12,33 +12,42 @@ H="${YAH_HRX_BUILD:-/home/q/hrx/build/cmake}"
 inc="/home/q/hrx/libhrx/include"
 libhrx="$H/libhrx/src/libhrx"
 
-cmake -S "$root/engine" -B "$root/engine/build" -DCMAKE_BUILD_TYPE=Release >/dev/null
+# Host code: clang, -O3 -march=native. -ffp-contract=off keeps float results (e.g. the host embedding dequant) the same as
+# without FMA, so outputs stay bit-identical across compilers and flags.
+CXX="${CXX:-clang++}"
+cxxflags=(-std=c++20 -O3 -march=native -ffp-contract=off)
+cache="$root/engine/build/CMakeCache.txt"
+if [ -f "$cache" ] && ! grep -q "^CMAKE_CXX_COMPILER:[A-Z]*=$(command -v "$CXX")$" "$cache"; then
+  rm -rf "$cache" "$root/engine/build/CMakeFiles"  # the compiler changed: CMake needs a fresh configure
+fi
+cmake -S "$root/engine" -B "$root/engine/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$(command -v "$CXX")" \
+    -DCMAKE_CXX_FLAGS_RELEASE="${cxxflags[*]:1}" >/dev/null
 cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # The runners below are not CMake targets. Build them here so a stale binary never runs against a new HAL set.
 # Single-kernel timing harness.
-g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
     -o "$root/engine/build/hal_bench" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # Prefill driver.
-g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/loom_forward_pp.cc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_forward_pp.cc" \
     -o "$root/engine/build/loom_forward_pp" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # Decode driver (tools/emit_decode.py sets).
-g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
     -o "$root/engine/build/loom_decode" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # One-dispatch correctness harness for generated kernels (tools/gemv_check.py).
-g++ -std=c++20 -O2 -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
     -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # The Responses API server (engine/serve).
-g++ -std=c++20 -O2 -I"$root/engine" -I"$root/engine/third_party" -I"$inc" "$root/engine/serve/yah_server.cc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" "$root/engine/serve/yah_server.cc" \
     "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
     "$root/engine/third_party/httplib/httplib.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # Terminal chat client for yah_server.
-g++ -std=c++20 -O2 -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_chat.cc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_chat.cc" \
     "$root/engine/third_party/httplib/httplib.cpp" -o "$root/engine/build/yah_chat" -lpthread
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
