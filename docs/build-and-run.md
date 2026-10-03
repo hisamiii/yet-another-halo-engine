@@ -21,6 +21,8 @@ Each patch says at its top what it is for. They apply idempotently, so one that 
 | `0003-profile-counters-mode` | `HRX_PROFILE_MODE=counters` with `HRX_PROFILE_COUNTERS`: per-dispatch PMC such as `SQ_BUSY_CYCLES`, plus the gfx11 GL2C counters |
 | `0004-loom-profile-function-filter` | `LOOM_PROFILE_FUNCTION=<glob>` for executable traces in the Loom HAL benchmark tool |
 | `0005-gfx1151-f16-wmma-operand-placement` | the f16 WMMA spreads its operands over the register banks (upstream does it for bf16 only): prefill GEMM cycles -2.6% |
+| `0006-dispatch-timestamps-callback` | dispatch device timestamps to an in-process callback (`hrx_device_profile_dispatches_*`), used by the shelved prefill calibration |
+| `0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 

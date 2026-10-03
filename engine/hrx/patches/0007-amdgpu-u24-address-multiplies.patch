@@ -1,0 +1,182 @@
+Address multiplies use v_mul_u32_u24 (full rate) instead of v_mul_lo_u32 (quarter rate) when value facts prove the
+operands fit 24 bits: fragment-memory lane offsets and scaled terms, and memory-address scale terms. Bit-identical
+results; prefill GEMM cycles -0.28% on gfx1151 (476 of 663 multiplies in the prefill set).
+
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/fragment_memory/address.c b/loom/src/loom/target/arch/amdgpu/lower/fragment_memory/address.c
+index a7a43472c..b0960b50e 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/fragment_memory/address.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/fragment_memory/address.c
+@@ -306,10 +306,20 @@ static iree_status_t loom_amdgpu_fragment_memory_lookup_product_value(
+   return iree_ok_status();
+ }
+ 
++// True when facts prove a value in [0, 2^24): v_mul_u32_u24 then gives the same
++// low 32 bits as v_mul_lo_u32, at full rate instead of quarter rate.
++static bool loom_amdgpu_fragment_memory_facts_fit_u24(loom_value_facts_t facts) {
++  int64_t maximum = 0;
++  return loom_value_facts_as_non_negative_i64_maximum(facts, &maximum) &&
++         maximum < (INT64_C(1) << 24);
++}
++
++// lhs_facts / rhs_facts: what is known about the operands (unknown is fine).
+ static iree_status_t loom_amdgpu_fragment_memory_multiply_address_values(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+     loom_amdgpu_fragment_memory_address_accumulator_t lhs,
+     loom_amdgpu_fragment_memory_address_accumulator_t rhs,
++    loom_value_facts_t lhs_facts, loom_value_facts_t rhs_facts,
+     loom_type_t sgpr_type, loom_type_t vgpr_type,
+     loom_amdgpu_fragment_memory_address_accumulator_t* out_product) {
+   if (lhs.register_kind == LOOM_AMDGPU_FRAGMENT_MEMORY_ADDRESS_REGISTER_SGPR &&
+@@ -329,9 +339,13 @@ static iree_status_t loom_amdgpu_fragment_memory_multiply_address_values(
+   }
+   out_product->register_kind =
+       LOOM_AMDGPU_FRAGMENT_MEMORY_ADDRESS_REGISTER_VGPR;
++  const bool u24 = loom_amdgpu_fragment_memory_facts_fit_u24(lhs_facts) &&
++                   loom_amdgpu_fragment_memory_facts_fit_u24(rhs_facts);
+   return loom_amdgpu_emit_binary(
+-      context, source_op, LOOM_AMDGPU_DESCRIPTOR_REF_V_MUL_LO_U32, low_lhs,
+-      low_rhs, vgpr_type, &out_product->value);
++      context, source_op,
++      u24 ? LOOM_AMDGPU_DESCRIPTOR_REF_V_MUL_U32_U24
++          : LOOM_AMDGPU_DESCRIPTOR_REF_V_MUL_LO_U32,
++      low_lhs, low_rhs, vgpr_type, &out_product->value);
+ }
+ 
+ static iree_status_t loom_amdgpu_fragment_memory_materialize_product(
+@@ -350,8 +364,8 @@ static iree_status_t loom_amdgpu_fragment_memory_materialize_product(
+         context, source_op, source_values[i], product_facts, sgpr_type,
+         vgpr_type, &factor));
+     IREE_RETURN_IF_ERROR(loom_amdgpu_fragment_memory_multiply_address_values(
+-        context, source_op, *out_product, factor, sgpr_type, vgpr_type,
+-        out_product));
++        context, source_op, *out_product, factor, loom_value_facts_unknown(),
++        loom_value_facts_unknown(), sgpr_type, vgpr_type, out_product));
+   }
+   if (static_coefficient == 1) {
+     return iree_ok_status();
+@@ -362,9 +376,19 @@ static iree_status_t loom_amdgpu_fragment_memory_materialize_product(
+         context, source_op, out_product->value, static_coefficient, sgpr_type,
+         &out_product->value);
+   }
++  // product_facts bound value x static_coefficient: a non-negative product
++  // below 2^24 x coefficient proves the unscaled value fits 24 bits.
++  int64_t product_max = 0;
++  const bool value_u24 =
++      static_coefficient != 0 &&
++      loom_value_facts_as_non_negative_i64_maximum(product_facts,
++                                                   &product_max) &&
++      product_max / (int64_t)static_coefficient < (INT64_C(1) << 24);
+   return loom_amdgpu_emit_vgpr_scale_u32(
+       context, source_op, out_product->value, static_coefficient,
+-      LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE, vgpr_type, &out_product->value);
++      value_u24 ? LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_VALUE_UNSIGNED_24
++                : LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE,
++      vgpr_type, &out_product->value);
+ }
+ 
+ static bool loom_amdgpu_fragment_memory_axis_stride_product_is_equal(
+@@ -436,8 +460,9 @@ static iree_status_t loom_amdgpu_emit_fragment_memory_dynamic_source_terms(
+             vgpr_type, &low_index));
+         IREE_RETURN_IF_ERROR(
+             loom_amdgpu_fragment_memory_multiply_address_values(
+-                context, source_op, low_index, *shared_axis_stride, sgpr_type,
+-                vgpr_type, &low_term));
++                context, source_op, low_index, *shared_axis_stride,
++                loom_value_facts_unknown(), loom_value_facts_unknown(),
++                sgpr_type, vgpr_type, &low_term));
+       } else {
+         loom_value_id_t source_values
+             [LOOM_AMDGPU_FRAGMENT_MEMORY_ADDRESS_PRODUCT_VALUE_CAPACITY] = {
+@@ -916,10 +941,14 @@ iree_status_t loom_amdgpu_initialize_fragment_memory_address_state(
+         .value = low_lane_coordinate,
+         .register_kind = LOOM_AMDGPU_FRAGMENT_MEMORY_ADDRESS_REGISTER_VGPR,
+     };
++    // A lane digit is below 64; scaled, it stays below 64 x scale.
++    const loom_value_facts_t lane_facts = loom_value_facts_make(
++        0, 63 * (int64_t)runtime_axis->lane_coordinate_scale, 1);
+     loom_amdgpu_fragment_memory_address_accumulator_t lane_byte_offset;
+     IREE_RETURN_IF_ERROR(loom_amdgpu_fragment_memory_multiply_address_values(
+-        context, source_op, axis_state->byte_stride, lane_coordinate, sgpr_type,
+-        vgpr_type, &lane_byte_offset));
++        context, source_op, axis_state->byte_stride, lane_coordinate,
++        runtime_axis->byte_stride.byte_facts, lane_facts, sgpr_type, vgpr_type,
++        &lane_byte_offset));
+     IREE_RETURN_IF_ERROR(loom_amdgpu_emit_fragment_memory_add_address_term(
+         context, source_op, lane_byte_offset.value,
+         lane_byte_offset.register_kind, sgpr_type, vgpr_type,
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/memory_address.c b/loom/src/loom/target/arch/amdgpu/lower/memory_address.c
+index 9634391ab..a3ecf3f6c 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/memory_address.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/memory_address.c
+@@ -274,6 +274,21 @@ typedef struct loom_amdgpu_memory_vaddr_affine_group_t {
+   loom_value_facts_t facts;
+ } loom_amdgpu_memory_vaddr_affine_group_t;
+ 
++// Scale flags for an index whose byte offset index x byte_stride is described
++// by product_facts: a non-negative product below 2^24 x byte_stride proves the
++// index fits 24 bits, so v_mul_u32_u24 (full rate) replaces v_mul_lo_u32.
++static loom_amdgpu_vgpr_scale_u32_flags_t loom_amdgpu_memory_scale_flags(
++    loom_value_facts_t product_facts, uint64_t byte_stride) {
++  int64_t product_max = 0;
++  if (byte_stride == 0 || byte_stride > INT64_MAX ||
++      !loom_value_facts_as_non_negative_i64_maximum(product_facts,
++                                                    &product_max) ||
++      product_max / (int64_t)byte_stride >= (INT64_C(1) << 24)) {
++    return LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE;
++  }
++  return LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_VALUE_UNSIGNED_24;
++}
++
+ static iree_status_t loom_amdgpu_try_emit_memory_vaddr_mad_u24(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+     loom_value_id_t low_value, loom_value_facts_t value_facts,
+@@ -402,7 +417,10 @@ static iree_status_t loom_amdgpu_try_emit_memory_vaddr_affine_terms(
+     IREE_ASSERT_GT(group_count, 0u);
+     IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_scale_u32(
+         context, source_op, groups[0].low_value, groups[0].coefficient,
+-        LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE, vgpr_type, &low_accumulator));
++        loom_value_facts_fit_unsigned_bit_count(groups[0].facts, 24)
++            ? LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_VALUE_UNSIGNED_24
++            : LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE,
++        vgpr_type, &low_accumulator));
+     group_emitted[0] = true;
+   }
+ 
+@@ -428,7 +446,10 @@ static iree_status_t loom_amdgpu_try_emit_memory_vaddr_affine_terms(
+       loom_value_id_t low_scaled = LOOM_VALUE_ID_INVALID;
+       IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_scale_u32(
+           context, source_op, groups[i].low_value, groups[i].coefficient,
+-          LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE, vgpr_type, &low_scaled));
++          loom_value_facts_fit_unsigned_bit_count(groups[i].facts, 24)
++              ? LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_VALUE_UNSIGNED_24
++              : LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE,
++          vgpr_type, &low_scaled));
+       IREE_RETURN_IF_ERROR(loom_amdgpu_emit_binary(
+           context, source_op, LOOM_AMDGPU_DESCRIPTOR_REF_V_ADD_U32,
+           low_accumulator, low_scaled, vgpr_type, &low_sum));
+@@ -500,7 +521,11 @@ iree_status_t loom_amdgpu_emit_memory_vaddr(
+         // affine terms exactly modulo 2^32.
+         IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_scale_u32(
+             context, source_op, low_offset, (uint32_t)term->byte_stride,
+-            LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE, vgpr_type, &low_offset));
++            term->stride_value_count == 0
++                ? loom_amdgpu_memory_scale_flags(term->byte_facts,
++                                                 (uint64_t)term->byte_stride)
++                : LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE,
++            vgpr_type, &low_offset));
+       }
+       if (low_accumulator == LOOM_VALUE_ID_INVALID) {
+         low_accumulator = low_offset;
+@@ -935,7 +960,11 @@ static iree_status_t loom_amdgpu_emit_memory_flat_bounded_u32_dynamic_term(
+     IREE_ASSERT(term->byte_stride > 0 && term->byte_stride <= UINT32_MAX);
+     IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_scale_u32(
+         context, source_op, low_offset, (uint32_t)term->byte_stride,
+-        LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE, vgpr_type, &low_offset));
++        term->stride_value_count == 0
++            ? loom_amdgpu_memory_scale_flags(term->byte_facts,
++                                             (uint64_t)term->byte_stride)
++            : LOOM_AMDGPU_VGPR_SCALE_U32_FLAG_NONE,
++        vgpr_type, &low_offset));
+   }
+ 
+   *out_low_lo = low_offset;
