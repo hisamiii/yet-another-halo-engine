@@ -45,6 +45,10 @@ LG, G2, BETA, BG, GC, GG = range(6)
 # compiler drains every outstanding global store (s_waitcnt_vscnt 0) before the scan's ds_bpermute and before global
 # loads (no alias tracking), so stores at the chunk end stalled wave 0, the critical wave, at the next chunk's start.
 OLATE = True
+# CONV16: the conv hands over f16 K, Q, V with K and Q already normalized: f16(k * inv_k), f16(q * q_scale), f16(v), the
+# same f32 ops and rounding this kernel did on the f32 conv output, so the result is bit-identical; half the bytes,
+# and phase 1 only moves them into LDS. The f16 rows are carried raw through the prefetch.
+CONV16 = True
 TPRE = 2   # phase 3 column loads this many steps ahead (0: at their step); 2: -5.2% (3 hits 256 VGPRs, 4 spills)
 
 
@@ -92,7 +96,7 @@ def gen():
     e("  %state_total = index.mul %num_heads, %c16384 : index")
     e("  %out_total = index.mul %batch, %inner_size : index")
     e("  %cv_na, %kq_na, %ab_na, %st_na, %out_na = buffer.assume.noalias %conv, %kq, %ab, %state, %out : buffer, buffer, buffer, buffer, buffer")
-    e("  %conv_view = buffer.view %cv_na[%base] : buffer -> view<[%conv_total]xf32>")
+    e(f"  %conv_view = buffer.view %cv_na[%base] : buffer -> view<[%conv_total]x{'f16' if CONV16 else 'f32'}>")
     e("  %kq_view = buffer.view %kq_na[%base] : buffer -> view<[%kq_total]xf32>")
     e("  %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>")
     e("  %state_view = buffer.view %st_na[%base] : buffer -> view<[%state_total]xf32>")
@@ -211,22 +215,31 @@ def gen():
         e(f"{ind}%{p}kqb1 = index.add %{p}kqb0, %kh : index")
         e(f"{ind}%{p}kqb = index.mul %{p}kqb1, %c3 : index")
         e(f"{ind}%{p}kqb_1 = index.add %{p}kqb, %c1 : index")
-        e(f"{ind}%{p}ik = view.load %kq_view[%{p}kqb] : view<[%kq_total]xf32> -> f32")
-        e(f"{ind}%{p}qs = view.load %kq_view[%{p}kqb_1] : view<[%kq_total]xf32> -> f32")
-        names = [f"%{p}ik", f"%{p}qs"]
+        names = []
+        if not CONV16:
+            e(f"{ind}%{p}ik = view.load %kq_view[%{p}kqb] : view<[%kq_total]xf32> -> f32")
+            e(f"{ind}%{p}qs = view.load %kq_view[%{p}kqb_1] : view<[%kq_total]xf32> -> f32")
+            names = [f"%{p}ik", f"%{p}qs"]
         for nm, rel in (("k", "%k_rel"), ("q", "%q_rel")):
             e(f"{ind}%{p}{nm}base0 = index.add %{p}crow, {rel} : index")
             e(f"{ind}%{p}{nm}base = index.add %{p}{nm}base0, %dseg : index")
             for g in range(4):
                 e(f"{ind}%{p}{nm}a{g}c = index.constant {4 * g} : index")
                 e(f"{ind}%{p}{nm}a{g} = index.add %{p}{nm}base, %{p}{nm}a{g}c : index")
-                e(f"{ind}%{p}{nm}v{g} = vector.load %conv_view[%{p}{nm}a{g}] : view<[%conv_total]xf32> -> {V4}")
+                if CONV16:
+                    e(f"{ind}%{p}{nm}v{g} = vector.load %conv_view[%{p}{nm}a{g}] : view<[%conv_total]xf16> -> {V4H}")
+                else:
+                    e(f"{ind}%{p}{nm}v{g} = vector.load %conv_view[%{p}{nm}a{g}] : view<[%conv_total]xf32> -> {V4}")
                 names.append(f"%{p}{nm}v{g}")
         e(f"{ind}%{p}va0 = index.add %{p}crow, %v_rel : index")
         e(f"{ind}%{p}va = index.add %{p}va0, %rseg : index")
         e(f"{ind}%{p}va4 = index.add %{p}va, %c4 : index")
-        e(f"{ind}%{p}vv0 = vector.load %conv_view[%{p}va] : view<[%conv_total]xf32> -> {V4}")
-        e(f"{ind}%{p}vv1 = vector.load %conv_view[%{p}va4] : view<[%conv_total]xf32> -> {V4}")
+        if CONV16:
+            for q, a in ((0, "va"), (1, "va4")):
+                e(f"{ind}%{p}vv{q} = vector.load %conv_view[%{p}{a}] : view<[%conv_total]xf16> -> {V4H}")
+        else:
+            e(f"{ind}%{p}vv0 = vector.load %conv_view[%{p}va] : view<[%conv_total]xf32> -> {V4}")
+            e(f"{ind}%{p}vv1 = vector.load %conv_view[%{p}va4] : view<[%conv_total]xf32> -> {V4}")
         names += [f"%{p}vv0", f"%{p}vv1"]
         e(f"{ind}%{p}abt = index.add %{p}t0, %lane : index")
         e(f"{ind}%{p}ab0 = index.mul %{p}abt, %num_heads : index")
@@ -248,8 +261,9 @@ def gen():
             e(f"{ind}%{p}t{i}3 = index.add %{p}t{i}2, %o_rel : index")
             e(f"{ind}%{p}t{i} = index.add %{p}t{i}3, %ur_row : index")
             e(f"{ind}view.store %{p}e{i}, %out_view[%{p}t{i}] : f32, view<[%out_total]xf32>")
-    ftypes = ["f32", "f32"] + [V4] * 10 + ["f32", "f32"]
-    fnames = ["%inv_k", "%q_scale"] + [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + ["%vv0", "%vv1", "%alpha", "%beta"]
+    ftypes = ([] if CONV16 else ["f32", "f32"]) + [V4H if CONV16 else V4] * 10 + ["f32", "f32"]
+    fnames = ([] if CONV16 else ["%inv_k", "%q_scale"]) + [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + \
+        ["%vv0", "%vv1", "%alpha", "%beta"]
     pre = fetch("%c0", "f0_", "  ")
     carried = ", ".join(f"%s{j} = {st[j]} : {V8}" for j in range(4))
     carried += ", " + ", ".join(f"{n} = {v} : {t}" for n, v, t in zip(fnames, pre, ftypes))
@@ -263,11 +277,15 @@ def gen():
     I = "    "
     e(f"{I}%t0 = index.mul %ci, %c32 : index")
     # ---- phase 1: K, Q (normalized, f16) -> Kr/Qr rows, Kt; V -> Vt; alpha / beta
-    e(f"{I}%ik4 = vector.splat %inv_k : {V4}")
-    e(f"{I}%qs4 = vector.splat %q_scale : {V4}")
+    if not CONV16:
+        e(f"{I}%ik4 = vector.splat %inv_k : {V4}")
+        e(f"{I}%qs4 = vector.splat %q_scale : {V4}")
     for nm, rel, sc, row in (("k", "%k_rel", "%ik4", "%lt"), ("q", "%q_rel", "%qs4", "%qrow")):
         hs = []
         for g in range(4):
+            if CONV16:
+                hs.append(f"%{nm}v{g}")
+                continue
             e(f"{I}%{nm}n{g} = vector.mulf %{nm}v{g}, {sc} : {V4}")
             e(f"{I}%{nm}h{g} = vector.fptrunc %{nm}n{g} : {V4} to {V4H}")
             hs.append(f"%{nm}h{g}")
@@ -278,15 +296,17 @@ def gen():
         if nm == "k":   # transposed copy Kt[key][tok]
             for g in range(4):
                 for i in range(4):
-                    e(f"{I}%kt{g}{i}e = vector.extract %kh{g}[{i}] : {V4H} -> f16")
+                    e(f"{I}%kt{g}{i}e = vector.extract {hs[g]}[{i}] : {V4H} -> f16")
                     e(f"{I}%kt{g}{i}c = index.constant {4 * g + i} : index")
                     e(f"{I}%kt{g}{i}r = index.add %dseg, %kt{g}{i}c : index")
                     e(f"{I}view.store %kt{g}{i}e, %kt_w[%kt{g}{i}r, %lt] : f16, view<128x40xf16>")
     # V: thread (token lt, rows (tid % 8) * 8 .. +7) -> Vt[row][tok]
     for p in range(2):
-        e(f"{I}%vh{p} = vector.fptrunc %vv{p} : {V4} to {V4H}")
+        vh = f"%vv{p}" if CONV16 else f"%vh{p}"   # f16 input: already the f16 the fptrunc would give
+        if not CONV16:
+            e(f"{I}%vh{p} = vector.fptrunc %vv{p} : {V4} to {V4H}")
         for i in range(4):
-            e(f"{I}%vt{p}{i}e = vector.extract %vh{p}[{i}] : {V4H} -> f16")
+            e(f"{I}%vt{p}{i}e = vector.extract {vh}[{i}] : {V4H} -> f16")
             e(f"{I}%vt{p}{i}c = index.constant {4 * p + i} : index")
             e(f"{I}%vt{p}{i}r = index.add %rseg, %vt{p}{i}c : index")
             e(f"{I}view.store %vt{p}{i}e, %vt_w[%vt{p}{i}r, %lt] : f16, view<64x40xf16>")
