@@ -103,7 +103,9 @@ class Engine : public TextGenerator {
           prefill_.SeedOpenTile(voff, Ref(seed_), decoder_.OpenTile(ai));
         };
       }
-      prefill_.RunLayers(c, hook);
+      // only the last chunk's last row is read (Head), and only when the prompt ends in it
+      const bool head = c + 1 == chunks && (tail_chunk || tail == 0);
+      prefill_.RunLayers(c, hook, head ? std::int64_t{valid} - 1 : LoomPrefill::kNoRows);
       if (c + 1 == chunks && (tail_chunk || tail == 0)) prefill_.Head(valid - 1, Ref(logits_));
       if (c + 1 == chunks) gpu_.Synchronize();
       Track(chunk_ms_, (std::chrono::steady_clock::now() - tc) / ChunkShare(valid), c + 1 == chunks);

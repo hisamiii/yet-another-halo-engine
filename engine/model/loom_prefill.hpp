@@ -102,8 +102,14 @@ class LoomPrefill {
     n_ = n;
   }
 
+  // RunLayers' keep: which rows of hidden() the caller reads after the last layer (Head). kAllRows: every row; kNoRows:
+  // none, so the last layer's tail (attention / o-proj or postnorm / ssm_out, and the FFN) is skipped (its K / V and
+  // recurrent state are still written); a row index: the tail's GEMMs run only the token tile that holds it.
+  static constexpr std::int64_t kAllRows = -1, kNoRows = -2;
+
   // Enqueue the 64 layers for chunk ci (absolute positions ci * B ..), on the hidden() rows from Embed().
-  void RunLayers(std::uint32_t ci, const KvHook& hook = {}) {
+  void RunLayers(std::uint32_t ci, const KvHook& hook = {}, std::int64_t keep = kAllRows) {
+    keep_rows_ = keep;
     if (std::size_t{ci + 1} * B_ > T_) throw LoomError("prefill: chunk past the emitted context");
     if (n_ == 0) throw LoomError("prefill: RunLayers before Embed");
     // The layers go into one graph, so kernels with no data between them (the input projections of a layer, the DeltaNet
@@ -147,6 +153,7 @@ class LoomPrefill {
   void RecordLayers(std::uint32_t ci, const KvHook& hook) {
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
+      tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
       if (cfg_.IsFullAttention(l)) {
         const bool q_af = Af("gemm_kqg", pre + "attn_q.weight");
         const bool k_af = Af("gemm_kstore", pre + "attn_k.weight");
@@ -162,9 +169,14 @@ class LoomPrefill {
         RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow);
         RunDeltaNet(l, pre, qkv_af, gate_af);
       }
+      if (tail_ == kNoRows) continue;
+      trim_row_ = tail_;
       RunFfn(pre);
+      trim_row_ = kAllRows;
     }
+    tail_ = kAllRows;
   }
+
 
   // Calibrate the GEMM variants while serving (model/prefill_calib.hpp), state in path. The caller runs Collect() after
   // the chunks of a prompt completed (Synchronize).
@@ -377,6 +389,22 @@ class LoomPrefill {
   }
   // GEMM token tiles covering this chunk's real tokens.
   std::uint32_t TokenTiles(const Geom& g) const { return (n_ + g.tokens - 1) / g.tokens; }
+  // The last layer's tail on one row (trim_row_ >= 0): a GEMM dispatches only the token tile that holds the row, its
+  // token-major bindings b[first..] moved to that tile (row_bytes: bytes per token row, 0 for the others). Each output row
+  // depends only on its own input row, so the kept row is the same; the other rows are left unwritten. The
+  // fragment-major layout groups 16 rows per tile row, so a tile start (a multiple of 16) has the same byte offset.
+  // Returns the token tiles to launch.
+  std::uint32_t Trim(std::vector<hrx_buffer_ref_t>& b, std::size_t first, std::initializer_list<std::size_t> row_bytes,
+                     const Geom& g) const {
+    if (trim_row_ < 0) return TokenTiles(g);
+    const std::size_t t0 = static_cast<std::size_t>(trim_row_) / g.tokens * g.tokens;
+    std::size_t i = first;
+    for (const std::size_t rb : row_bytes) {
+      if (rb) b[i].offset += t0 * rb, b[i].length -= t0 * rb;
+      ++i;
+    }
+    return 1;
+  }
   LoomExecutable& Exe(const std::string& hal) {
     auto it = exes_.find(hal);
     if (it == exes_.end()) it = exes_.emplace(hal, gpu_.Load(dir_ + "/" + hal)).first;
@@ -663,9 +691,11 @@ class LoomPrefill {
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*tg, f);
     b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
+    const std::size_t first = b.size();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), MTiles(*tg) / g.rowgrp, TokenTiles(g),
-             1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(tg->dims[1]) * 2}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1,
+             1, b, GemmWrites(b, f, {ffnup_}));
     RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
     return true;
   }
@@ -768,12 +798,14 @@ class LoomPrefill {
     const std::string hal = af ? AfHal(base) : df.empty() ? PickGemm(base) : df;
     const Geom g = GeomOf(hal);
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
+    const std::size_t first = b.size();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_})
       b.push_back(Ref(*x));
     b.push_back(Ref(out));
+    const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, 0, 0, std::size_t(t->dims[1]) * 4}, g);
     if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16")).c_str(), MTiles(*t) / g.rowgrp,
-             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {&out}));
+             tt, 1, 32, 1, 1, b, GemmWrites(b, f, {&out}));
     if (!df.empty()) DfNext();
   }
   // The attention q projection with the q / gate unpack fused in (rows = heads x [256 q | 256 gate]).
@@ -808,12 +840,15 @@ class LoomPrefill {
     if (hal.empty()) throw LoomError(base + ": the set lacks its afrag form");
     const Geom g = GeomOf(hal);
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
+    const std::size_t first = b.size();
     for (const LoomBuffer* x :
          std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, gateffn_, uwstage_, ostage_, ffnup_})
       b.push_back(Ref(*x));
+    const std::size_t M = t->dims[1];
+    const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 2}, g);
     if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16") + "_swiglu").c_str(),
-             MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+             MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
     if (!df.empty()) DfNext();
   }
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
@@ -828,10 +863,13 @@ class LoomPrefill {
       const std::string fused = af ? AfHal(fused0) : df.empty() ? PickGemm(fused0) : df;
       const Geom g = GeomOf(fused);
       auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
+      const std::size_t first = b.size();
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, hidden_, wstage_, ostage_, hidden2_}) b.push_back(Ref(*x));
+      const std::size_t M = t->dims[1];
+      const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 4}, g);
       if (!df.empty()) DfAhead(b);
       Dispatch(Exe(fused), (std::string("yah_ffn_gemm_") + (df.empty() ? f.name : "f16") + "_kres").c_str(),
-               MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+               MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
       if (!df.empty()) DfNext();
       std::swap(hidden_, hidden2_);
       return;
@@ -924,6 +962,7 @@ class LoomPrefill {
       Dispatch(Exe("vtrans.hal"), "yah_transpose_v16", 32, (T_ + 31) / 32, 1, 256, 1, 1,
                {{kv16_->handle, voff, kv_cache_ * 2}, {vt16_->handle, 0, vt_bytes_}});
     }
+    if (tail_ == kNoRows) return;  // K / V are written; nothing reads this layer's output
     {
       std::vector<hrx_buffer_ref_t> b = {
           Ref(*q_),
@@ -943,7 +982,9 @@ class LoomPrefill {
       Dispatch(ChunkExe(o_af ? "wmma_t" : "wmma", ci), "yah_attn_wmma", (B_ + attn_tpw_ - 1) / attn_tpw_, kHeads / attn_hpw_, 1, 256, 1,
                1, b);
     }
+    trim_row_ = tail_;
     RunResidual(pre + "attn_output.weight", *scratch_, o_af);
+    trim_row_ = kAllRows;
   }
 
   void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
@@ -967,12 +1008,15 @@ class LoomPrefill {
     // DeltaNet grid: (blocks per head, heads) x 256, blocks per head from the "rowsplit.hal" row group.
     Dispatch(Exe("rowsplit.hal"), "yah_deltanet", dn_rowgrp_, kTs, 1, 256, 1, 1,
              {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
+    if (tail_ == kNoRows) return;  // the recurrent state is written; nothing reads this layer's output
     // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
     const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
     Dispatch(Exe(out_af ? "postnorm_t.hal" : "postnorm.hal"), "yah_ssm_postnorm_fp16", 6 * B_, 1, 1, 256, 1, 1,
              {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), {gate_->handle, 0, std::size_t{B_} * kInner * 4},
               Ref(*scratch_)});
+    trim_row_ = tail_;
     RunResidual(pre + "ssm_out.weight", *scratch_, out_af);
+    trim_row_ = kAllRows;
   }
 
   LoomDevice& gpu_;
@@ -1011,6 +1055,7 @@ class LoomPrefill {
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
              *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr,
              *normt_ = nullptr;
+  std::int64_t keep_rows_ = kAllRows, tail_ = kAllRows, trim_row_ = kAllRows;
 };
 
 }  // namespace yah::model

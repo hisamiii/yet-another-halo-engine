@@ -139,7 +139,11 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> idx(kVocab);
     for (std::uint32_t ci = 0; ci < n_chunks; ++ci) {
       pf.Embed(ids.data() + std::size_t{ci} * B, ci + 1 == n_chunks ? last_n : B);
-      pf.RunLayers(ci);
+      // the last layer's tail only for the rows read below: every row for logits_from / rowstats, else the last row
+      const bool rows = rowstats || logits_from < std::min((ci + 1) * B, T_run);
+      pf.RunLayers(ci, {}, rows ? LoomPrefill::kAllRows
+                       : ci + 1 == n_chunks ? std::int64_t{last_n} - 1
+                                            : LoomPrefill::kNoRows);
       for (std::uint32_t ra = std::max(logits_from, ci * B); ra < std::min((ci + 1) * B, T_run); ++ra)
         pf.Head(ra - ci * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});
       if (rowstats) {
