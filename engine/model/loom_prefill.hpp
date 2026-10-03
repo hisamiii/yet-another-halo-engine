@@ -385,7 +385,7 @@ class LoomPrefill {
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
     const hrx_dispatch_config_t config = LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz);
     if (graph_) {
-      graph_->Dispatch(exe, ordinal, config, b.data(), b.size(), writes);
+      graph_->Dispatch(exe, ordinal, config, b.data(), b.size(), writes, df_after_.empty() ? nullptr : &df_after_);
       nodes_.push_back({{gx, gy, gz}, name, pending_tag_});
       pending_tag_ = -1;
     } else
@@ -622,6 +622,7 @@ class LoomPrefill {
   bool df_planned_ = false, df_planning_ = false, df_on_ = false;
   std::size_t df_k_ = 0;
   LoomBuffer* df_w_[3] = {nullptr, nullptr, nullptr};
+  std::vector<hrx_buffer_ref_t> df_after_;
 
   // Records the GEMMs that have a decode-free path, in dispatch order (a dry run: Dispatch records nothing), and sizes
   // the scratch for the largest.
@@ -656,21 +657,29 @@ class LoomPrefill {
     if (df_k_ >= df_plan_.size() || df_plan_[df_k_].t != &t) throw LoomError("prefill: decode-free plan out of step");
     return gemm;
   }
-  // Decode plan step k's weights into its scratch slot.
+  // Decode plan step k's weights into its scratch slot. The dequant is persistent: its row's first column is the
+  // workgroup count (one per WGP), and its workgroups walk the tensor.
   void DispatchDequant(std::size_t k) {
     const DfStep& s = df_plan_[k];
-    const Geom g = geom_.at(s.dq);  // row group, K-block groups (no token tiles: GeomOf does not apply)
+    const Geom g = geom_.at(s.dq);
     auto b = GemmWeights(*s.t, s.f);
     b.push_back(Ref(*df_w_[k % 3]));
-    Dispatch(Exe(s.dq), ("yah_dequant_" + std::string(s.f.name)).c_str(), MTiles(*s.t) / g.rowgrp, g.tt, 1, 256, 1, 1,
-             b, std::uint64_t{1} << (b.size() - 1));
+    Dispatch(Exe(s.dq), ("yah_dequant_" + std::string(s.f.name)).c_str(), g.tokens, 1, 1, 256, 1, 1, b,
+             std::uint64_t{1} << (b.size() - 1));
   }
   // The weight binding of the current decode-free GEMM.
   std::vector<hrx_buffer_ref_t> DfWeights() const { return {Ref(*df_w_[df_k_ % 3])}; }
-  // After a decode-free GEMM: the next one's weights, recorded beside it.
-  void DfNext() {
-    if (++df_k_ < df_plan_.size()) DispatchDequant(df_k_);
+  // Before a decode-free GEMM: the next one's weights. Recorded first, so its few workgroups launch before the GEMM's
+  // and run beside them (a dispatch's workgroups only launch once the previous dispatch's have all launched).
+  // gemm: the GEMM's bindings; the dequant is ordered after its inputs (not its weights) so that the barrier the GEMM
+  // needs falls before the dequant and the two share a graph segment.
+  void DfAhead(const std::vector<hrx_buffer_ref_t>& gemm) {
+    if (df_k_ + 1 >= df_plan_.size()) return;
+    df_after_.assign(gemm.begin() + 1, gemm.end());
+    DispatchDequant(df_k_ + 1);
+    df_after_.clear();
   }
+  void DfNext() { ++df_k_; }
 
   void RunKstore(const std::string& wname, const LoomBuffer& out) {
     const auto* t = Find(wname);
@@ -682,6 +691,7 @@ class LoomPrefill {
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_}) b.push_back(Ref(*x));
     b.push_back(Ref(out));
+    if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16")).c_str(), MTiles(*t) / g.rowgrp,
              TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {&out}));
     if (!df.empty()) DfNext();
@@ -699,6 +709,7 @@ class LoomPrefill {
     const Geom g = GeomOf(hal);
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, q_, gate_}) b.push_back(Ref(*x));
+    if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16") + "_kqg").c_str(),
              MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {q_, gate_}));
     if (!df.empty()) DfNext();
@@ -713,6 +724,7 @@ class LoomPrefill {
     const Geom g = GeomOf(hal);
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, gateffn_, uwstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
+    if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16") + "_swiglu").c_str(),
              MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
     if (!df.empty()) DfNext();
@@ -729,6 +741,7 @@ class LoomPrefill {
       const Geom g = GeomOf(fused);
       auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, hidden_, wstage_, ostage_, hidden2_}) b.push_back(Ref(*x));
+      if (!df.empty()) DfAhead(b);
       Dispatch(Exe(fused), (std::string("yah_ffn_gemm_") + (df.empty() ? f.name : "f16") + "_kres").c_str(),
                MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
       if (!df.empty()) DfNext();
@@ -741,6 +754,7 @@ class LoomPrefill {
     const Geom g = GeomOf(hal);
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_, partial_}) b.push_back(Ref(*x));
+    if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16")).c_str(), MTiles(*t) / g.rowgrp,
              TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {partial_}));
     if (!df.empty()) DfNext();

@@ -340,11 +340,17 @@ class LoomGraph {
 
   // writes: bit i set if the dispatch may write binding i. A missing bit is a race; an extra one only costs overlap.
   // Returns the node's index: dispatch timestamps of the launched graph carry it as their command index.
+  // after: ranges this dispatch is ordered after as if it read them, though it does not (it gets the same barrier as a
+  // dispatch that does, so the two can run together); not recorded as accesses.
   size_t Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
-                const hrx_buffer_ref_t* bindings, size_t binding_count, uint64_t writes) {
+                const hrx_buffer_ref_t* bindings, size_t binding_count, uint64_t writes,
+                const std::vector<hrx_buffer_ref_t>* after = nullptr) {
     std::vector<hrx_graph_node_t> deps;
     for (size_t i = 0; i < binding_count; ++i)
       if (!read_only_.count(bindings[i].buffer)) Depend(bindings[i], (writes >> i) & 1, &deps);
+    if (after)
+      for (const hrx_buffer_ref_t& r : *after)
+        if (!read_only_.count(r.buffer)) Depend(r, false, &deps);
     std::sort(deps.begin(), deps.end());
     deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
     // The graph keeps the binding pointer until it is instantiated.

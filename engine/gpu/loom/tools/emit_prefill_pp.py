@@ -88,6 +88,7 @@ MODEL = None  # set by main(): tiles() reads this model's table
 # epilogue streams its gate in bursts, the K=17408 down projection is memory-bound in f16, and the dequant pass costs
 # ~25% of a GEMM. kstore / kqg alone are -9% (standalone, bit-identical).
 DECODE_FREE = os.environ.get("YAH_DECODE_FREE", "0") == "1"
+DECODE_FREE_KINDS = ("kstore", "kqg")
 
 
 @functools.cache
@@ -209,18 +210,22 @@ def decode_free(fmt, mt, kb, B, kind, outdir, done):
     decode, so the same f16 values), "gemm_<kind>_f16_<mt>_<kb>.hal" multiplies them without decode. Shared per shape.
     The driver dequantizes GEMM k+1's weights beside GEMM k. Returns the new dispatch.txt rows."""
     import gen_gemm_tile as TG
-    if fmt not in TILE_FMTS or mt < 4:
+    # only where it wins (2026-10-03, clock-free): kstore -9%, kqg -6%; kres at K = 17408 is memory-bound in f16 and the
+    # swiglu epilogue's gate stream lands in bursts under the token-fastest order (+5%)
+    if fmt not in TILE_FMTS or mt < 4 or kind not in DECODE_FREE_KINDS:
         return []
     rows = []
     kblk = kb // TG.G.FMTS[fmt].get("kdiv", 1)   # 256-wide blocks (q8_0 counts 32-wide ones)
     dq = "dq_%s_%d_%d.hal" % (fmt, mt, kb)
     if dq not in done:
+        # 64 rows, double-buffered: 2 x 9 KB (+ the IQ grid table) fits the 20 KB of LDS two GEMM workgroups leave free
+        # on a WGP, so the dequant runs beside the GEMM instead of after it
         t = TG.default_tile(fmt, "kstore", kb)
-        t = dataclasses.replace(t, decahead=False, ksub=64, dbuf=False)
+        t = dataclasses.replace(t, bm=64, wm=2, wn=4, decahead=False, ksub=64, dbuf=False)
         if mt % t.rowgrp == 0 and kblk % TG.DQ_BLOCKS == 0:
             r = _emit_gen(lambda f, k: TG.gen(f, "dequant", t), t.bn, fmt, mt, kb, B, dq, outdir, "dequant", t.rowgrp)
             if r:
-                rows.append((dq, 0, t.rowgrp, kblk // TG.DQ_BLOCKS))
+                rows.append((dq, TG.DQ_WGS, t.rowgrp, 1))   # persistent: <workgroups> in the token-tile column
                 done.add(dq)
     gf = "gemm_%s_f16_%d_%d.hal" % (kind, mt, kblk)
     if dq in done and gf not in done:

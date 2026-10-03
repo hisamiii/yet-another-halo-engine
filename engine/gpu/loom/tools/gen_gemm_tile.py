@@ -183,8 +183,10 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
     return _gen(fmt, kind, t, masked)
 
 
-# dequant kernels: 256-wide K blocks per workgroup (the table staging and launch cost amortize over them)
+# dequant kernels: 256-wide K blocks per work item (the table staging and pipeline fill amortize over them), and the
+# persistent grid (one workgroup per WGP: 20 KB of LDS fits beside two GEMM workgroups)
 DQ_BLOCKS = 4
+DQ_WGS = 20
 
 
 def _gen(fmt, kind, t, masked):
@@ -246,7 +248,10 @@ def _gen(fmt, kind, t, masked):
         # DQ_BLOCKS 256-wide blocks per workgroup (k_blocks is a multiple of it: 20 and 68 here)
         e(f"  %cdqb = index.constant {DQ_BLOCKS} : index")
         e("  %kgl = index.div %kbl, %cdqb : index")
-        e("  kernel.launch.config workgroups(%m_groups, %kgl, %unit) workgroup_size(%wgs, %unit, %unit) : index")
+        # persistent: DQ_WGS workgroups (one per WGP) walk the (row group, K group) items, so the dequant fits beside a running
+        # GEMM (whose workgroups would otherwise all launch first) and finishes within it
+        e(f"  %dqw = index.constant {DQ_WGS} : index")
+        e("  kernel.launch.config workgroups(%dqw, %unit, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     else:
         e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
@@ -307,7 +312,7 @@ def _gen(fmt, kind, t, masked):
     if not dq:
         e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
     # LDS: decoded weight tile and staged activation tile
-    e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF else 1)} : offset")
+    e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF or dq else 1)} : offset")
     e(f"  %wl_tb = index.constant {BM * G.ROWP * 2} : index")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
@@ -338,6 +343,17 @@ def _gen(fmt, kind, t, masked):
         e("  %wg_lin = index.add %wg_l0, %wg_rx : index")
         e("  %wg_x = index.div %wg_lin, %wg_gy : index")
         e("  %wg_y = index.rem %wg_lin, %wg_gy : index")
+    elif dq:
+        e("  %dq_wid = kernel.workgroup.id<x> : index")
+        e("  %dq_nwg = kernel.workgroup.count<x> : index")
+        e(f"  %dq_cdqb = index.constant {DQ_BLOCKS} : index")
+        e("  %dq_kg = index.div %k_blocks, %dq_cdqb : index")
+        e(f"  %rowgrp_k = index.constant {ROWGRP} : index")
+        e("  %dq_mg = index.div %m_tiles, %rowgrp_k : index")
+        e("  %dq_nit = index.mul %dq_mg, %dq_kg : index")
+        e("  scf.for %dq_item = [%dq_wid to %dq_nit step %dq_nwg] {")
+        e("  %wg_x = index.div %dq_item, %dq_kg : index")
+        e("  %wg_y = index.rem %dq_item, %dq_kg : index")
     else:
         e("  %wg_x = kernel.workgroup.id<x> : index")
         e("  %wg_y = kernel.workgroup.id<y> : index")
@@ -427,46 +443,72 @@ def _gen(fmt, kind, t, masked):
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e("  %dq_tot = index.mul %m_rows, %ktot : index")
         e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xf16>")
-        e("  %dq_g = kernel.workgroup.id<y> : index")
+        e("  %dq_g = index.add %wg_y, %c0 : index")
         e(f"  %dq_np = index.constant {DQ_BLOCKS * G.PH} : index")
         e("  %dq_p0 = index.mul %dq_g, %dq_np : index")
-        e("  scf.for %dq_it = [%c0 to %dq_np step %c1] {")
+        # phase p's bytes are carried in registers (loaded during phase p - 1); the tile is double-buffered, so one
+        # barrier per phase separates decode into buffer p % 2 from its copy-out (buffer p % 2 is next written at p + 2)
+        def dq_loads(pfx, kp):
+            e(f"  %{pfx}kb = index.div {kp}, %cph : index")
+            e(f"  %{pfx}ph = index.rem {kp}, %cph : index")
+            e(f"  %{pfx}kbi = index.cast %{pfx}kb : index to i32")
+            e(f"  %{pfx}phi = index.cast %{pfx}ph : index to i32")
+            e(f"  %{pfx}bo = scalar.muli %{pfx}kbi, %cbbi : i32")
+            e(f"  %{pfx}blk = scalar.addi %row_off_i, %{pfx}bo : i32")
+            e(f"  %{pfx}gg = scalar.muli %{pfx}phi, %cgppi : i32")
+            e(f"  %{pfx}gb = scalar.addi %{pfx}gg, %gl_i : i32")
+            Ld, wd = loads(pfx + "w_", f"%{pfx}blk", f"%{pfx}gb")
+            L.extend(Ld)
+            return wd
+        e("  %dq_plast0 = index.add %dq_p0, %dq_np : index")
+        e("  %dq_plast = index.sub %dq_plast0, %c1 : index")
+        w0 = dq_loads("dq0_", "%dq_p0")
+        orig = w0
+        w0p = G.pack_vals(e, w0, "dq0")
+        ctys = ", ".join(ty for _, ty in w0p)
+        e("  " + ", ".join(f"%dqo{x}" for x in range(len(w0p))) + " = scf.for %dq_it = [%c0 to %dq_np step %c1]("
+          + ", ".join(f"%dqv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(w0p)) + f") -> ({ctys}) {{")
         e("  %dq_kp = index.add %dq_p0, %dq_it : index")
         e("  %dq_kb = index.div %dq_kp, %cph : index")
         e("  %dq_ph = index.rem %dq_kp, %cph : index")
-        e("  %dq_kbi = index.cast %dq_kb : index to i32")
         e("  %dq_phi = index.cast %dq_ph : index to i32")
-        e("  %dq_bo = scalar.muli %dq_kbi, %cbbi : i32")
-        e("  %dq_blk = scalar.addi %row_off_i, %dq_bo : i32")
         e("  %dq_gg = scalar.muli %dq_phi, %cgppi : i32")
         e("  %dq_gb = scalar.addi %dq_gg, %gl_i : i32")
-        Ld, wd = loads("dqd_", "%dq_blk", "%dq_gb")
-        L.extend(Ld)
+        e("  %dq_buf = index.rem %dq_it, %c2 : index")
+        e("  %dq_bo0 = index.mul %dq_buf, %wl_tb : index")
+        e("  %dq_bof = index.cast %dq_bo0 : index to offset")
+        e(f"  %wl_dq = buffer.view %wl[%dq_bof] : buffer -> view<{BM}x{G.ROWP}xf16>")
         e("  scf.if %decoder {")
-        L.extend(compute([nm for nm, _ in wd], "%dq_gb"))
+        names = G.unpack_vals(e, [(f"%dqv{x}", ty) for x, (_, ty) in enumerate(w0p)], orig)
+        L.extend(l.replace("%wl_view[", "%wl_dq[") for l in compute(names, "%dq_gb"))
         e("  }")
+        # the next phase's bytes, in flight while this phase is copied out
+        e("  scf.schedule.fence")
+        e("  %dq_kn0 = index.add %dq_kp, %c1 : index")
+        e("  %dq_kn = index.min %dq_kn0, %dq_plast : index")
+        wn = G.pack_vals(e, dq_loads("dqn_", "%dq_kn"), "dqn")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         # copy the BM x KSUB tile to out[row][K] (f16), 8 halves per store
         e("  %dq_k0 = index.mul %dq_kp, %cksub : index")
         cpr = ksub // 8
         nch = BM * cpr
         e(f"  %dq_cpr = index.constant {cpr} : index")
+        e(f"  %dq_qm = index.constant {BM * cpr - 1} : index")
         for i in range(-(-nch // LANES)):
             e(f"  %dq_q{i}c = index.constant {i * LANES} : index")
             e(f"  %dq_q{i}0 = index.add %tid, %dq_q{i}c : index")
-            e(f"  %dq_q{i} = index.min %dq_q{i}0, %c{BM * cpr - 1} : index" if (BM * cpr - 1) in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN)
-              else f"  %dq_qm{i} = index.constant {BM * cpr - 1} : index\n  %dq_q{i} = index.min %dq_q{i}0, %dq_qm{i} : index")
+            e(f"  %dq_q{i} = index.min %dq_q{i}0, %dq_qm : index")
             e(f"  %dq_r{i} = index.div %dq_q{i}, %dq_cpr : index")
             e(f"  %dq_cq{i} = index.rem %dq_q{i}, %dq_cpr : index")
             e(f"  %dq_c{i} = index.mul %dq_cq{i}, %c8 : index")
-            e(f"  %dq_v{i} = vector.load %wl_view[%dq_r{i}, %dq_c{i}] : view<{BM}x{G.ROWP}xf16> -> vector<8xf16>")
+            e(f"  %dq_v{i} = vector.load %wl_dq[%dq_r{i}, %dq_c{i}] : view<{BM}x{G.ROWP}xf16> -> vector<8xf16>")
             e(f"  %dq_gr{i} = index.add %wg_row, %dq_r{i} : index")
             e(f"  %dq_go{i} = index.mul %dq_gr{i}, %ktot : index")
             e(f"  %dq_gk{i} = index.add %dq_k0, %dq_c{i} : index")
             e(f"  %dq_ga{i} = index.add %dq_go{i}, %dq_gk{i} : index")
             e(f"  vector.store %dq_v{i}, %dq_out[%dq_ga{i}] : vector<8xf16>, view<[%dq_tot]xf16>")
-        # the next phase's decode overwrites the tile
-        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  scf.yield " + ", ".join(nm for nm, _ in wn) + f" : {ctys}")
+        e("  }")
         e("  }")
         e("  kernel.return")
         e("}")
