@@ -41,6 +41,7 @@ KR, QR, KT, VT, AF, PP, T1, T2, SS, GA = (0, 8704, 17408, 27648, 32768, 37888, 4
 POOL = GA + 6 * 32 * 4          # LG, G2, BETA, BG, GC, GG
 assert POOL <= 65536
 LG, G2, BETA, BG, GC, GG = range(6)
+TPRE = 2   # phase 3 column loads this many steps ahead (0: at their step); 2: -5.2% (3 hits 256 VGPRs, 4 spills)
 
 
 def gen():
@@ -340,13 +341,16 @@ def gen():
     e(f"{I}%ed8 = vector.exp2f<afn> %gd8c : {V8}")
     e(f"{I}%sd8 = vector.mulf {acc}, %ed8 : {V8}")
     e(f"{I}%ad8 = vector.mulf %sd8, %bm8 : {V8}")
+    # A is stored negated: phase 3 (one wave) takes -A[i][j] t_j terms, so the negation runs here on every wave, 8 wide,
+    # not 496 times on its critical path (negf is exact: the same bits)
+    e(f"{I}%adn8 = vector.negf %ad8 : {V8}")
     e(f"{I}scf.if %iskk {{")
     for i in range(8):
         e(f"{I}  %am{i} = index.add %p2e{i}, %c0 : index")
         e(f"{I}  %agt{i} = index.cmp ugt, %am{i}, %p2n : index")
-        e(f"{I}  %ae{i} = vector.extract %ad8[{i}] : {V8} -> f32")
+        e(f"{I}  %ae{i} = vector.extract %adn8[{i}] : {V8} -> f32")
         e(f"{I}  %av{i} = scf.select %agt{i}, %ae{i}, %zero : f32")
-        e(f"{I}  view.store %av{i}, %a_v[%p2n, %am{i}] : f32, view<32x36xf32>")   # A^T
+        e(f"{I}  view.store %av{i}, %a_v[%p2n, %am{i}] : f32, view<32x36xf32>")   # -A^T
     e(f"{I}}} else {{")
     for i in range(8):
         e(f"{I}  %pm{i} = index.add %p2e{i}, %c0 : index")
@@ -360,7 +364,7 @@ def gen():
     # ---- phase 3: T = (I + A)^-1 by forward substitution, wave 0, lane = column
     e(f"{I}scf.if %isw0 {{")
     # right-looking: once t_j is final, every pending row i > j takes its -A[i][j] t_j term (independent fmas)
-    # column j of A = row j of A^T
+    # column j of -A = row j of -A^T (stored negated in phase 2)
     accs = []
     for i in range(C):
         e(f"{I}  %ti{i}c = index.constant {i} : index")
@@ -368,20 +372,30 @@ def gen():
         e(f"{I}  %td{i} = scf.select %tie{i}, %one, %zero : f32")
         accs.append(f"%td{i}")
     t = []
+
+    def col_loads(j):
+        for q in range((j + 1) // 4, 8):
+            e(f"{I}  %tc{j}_{q}c = index.constant {4 * q} : index")
+            e(f"{I}  %tc{j}_{q} = vector.load %a_v[%ti{j}c, %tc{j}_{q}c] : view<32x36xf32> -> {V4}")
+    # The column loads go TPRE steps ahead, a fence keeping them above the step's fmas: the scheduler charges an LDS load
+    # ~1 cycle and otherwise waits on each right before its fmas (2 in flight: the LDS latency 136 times per chunk on the
+    # one wave every other waits for). Same fmas in the same order.
+    for j in range(min(TPRE, C - 1)):
+        col_loads(j)
     for j in range(C):
         t.append(accs[j])
         if j == C - 1:
             continue
-        col = []
-        for q in range((j + 1) // 4, 8):
-            e(f"{I}  %tc{j}_{q}c = index.constant {4 * q} : index")
-            e(f"{I}  %tc{j}_{q} = vector.load %a_v[%ti{j}c, %tc{j}_{q}c] : view<32x36xf32> -> {V4}")
-            col.append(q)
+        if TPRE:
+            if j + TPRE < C - 1:
+                col_loads(j + TPRE)
+            e(f"{I}  scf.schedule.fence")
+        else:
+            col_loads(j)
         for i in range(j + 1, C):
             q = i // 4
             e(f"{I}  %tx{j}_{i} = vector.extract %tc{j}_{q}[{i % 4}] : {V4} -> f32")
-            e(f"{I}  %tn{j}_{i} = scalar.negf %tx{j}_{i} : f32")
-            e(f"{I}  %tf{j}_{i} = scalar.fmaf %tn{j}_{i}, {t[j]}, {accs[i]} : f32")
+            e(f"{I}  %tf{j}_{i} = scalar.fmaf %tx{j}_{i}, {t[j]}, {accs[i]} : f32")
             accs[i] = f"%tf{j}_{i}"
     e(f"{I}  %tbg = view.load %ga[%gaBG, %lane] : view<6x32xf32> -> f32")
     e(f"{I}  %tbe = view.load %ga[%gaBETA, %lane] : view<6x32xf32> -> f32")
