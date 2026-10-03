@@ -367,7 +367,7 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     with open(src, "w") as fh:
         fh.write(gen(fmt, kind))
-    sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg"}.get(kind, ""))
+    sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
     if kind == "dequant":
         sym = "yah_dequant_" + fmt
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.

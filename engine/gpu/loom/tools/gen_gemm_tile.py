@@ -87,6 +87,8 @@ class Tile:
     tokfast: bool = False      # launch order token tiles fastest: the token tiles of a row block run together (L2 shares weights)
     afrag: bool = False        # activations not staged in LDS: the MMA's B fragments load straight from the input (needs dbuf)
     atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
+    ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
+                               # (the weight binding spans ffn_gate and the ffn_up right after it: up row r is row m_rows + r)
     tallepi: bool = False      # afrag kstore / kres: the LDS epilogue in 16-row slabs in the weight tile (else fragment stores)
     tout: bool = False         # swiglu: store the output fragment-major (atiled layout over K = rows) for an afrag consumer
     stg_minwg: int = STG_MINWG  # smallest grid that staggers (afrag: every grid; lockstep costs it 6-9%)
@@ -114,8 +116,8 @@ class Tile:
 
     @property
     def rowgrp(self):
-        """m_tiles per workgroup."""
-        return self.bm // 16
+        """m_tiles per workgroup (ffn: output rows, half the weight tile)."""
+        return self.bm // (32 if self.ffn else 16)
 
     @property
     def apl(self):
@@ -160,6 +162,8 @@ def check(t):
         (not t.b0early or (t.afrag and not t.dbuf and not t.decahead), "early step-0 B is for afrag without dbuf/decode-ahead"),
         (not t.tout or (t.afrag and not t.swepi), "tiled swiglu output is the plain swiglu epilogue of an afrag tile"),
         (not t.tallepi or t.tm > 32, "the tall LDS epilogue is for waves over 32 rows"),
+        (not t.ffn or (t.afrag and t.tallepi and t.bm == 128 and t.wm == 1 and not t.dbuf and not t.decahead),
+         "the fused gate / up GEMM is an afrag 128-row tile (64 gate + 64 up rows) with the tall epilogue"),
         (not t.wlate or (t.afrag and not t.dbuf and not t.decahead and not t.rhs_outer), "late weight loads are for afrag without dbuf/decode-ahead/rhs-outer"),
     ]
     for ok, why in rules:
@@ -221,9 +225,13 @@ def _gen(fmt, kind, t, masked):
     qg = kind == "kqg"
     # dequant: decode the weights to f16 [rows][K] once with this tile's decode (the decode-free GEMMs read that)
     dq = kind == "dequant"
+    # ffn: ffn_gate and ffn_up (same format) in one GEMM, out = f16(silu(gate) * up), the swiglu GEMM's scalar ops
+    ff = kind == "ffn"
+    assert ff == t.ffn, "kind ffn needs Tile.ffn"
     bufs = (["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
             + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []))
-    sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
+    sym = (f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
+           + ("_ffn" if ff else ""))
     if dq:
         assert not (DECAHEAD or DBUF or masked)
         bufs = ["weight"] + F["extra"] + ["output"]
@@ -308,8 +316,14 @@ def _gen(fmt, kind, t, masked):
     e("  %m_rows = index.mul %m_tiles, %c16 : index")
     e("  %bpr = index.mul %k_blocks, %cbb : index")
     e("  %hpr = index.mul %k_blocks, %cbbh : index")
-    e("  %w_bytes = index.mul %m_rows, %bpr : index")
-    e("  %w_halfs = index.mul %m_rows, %hpr : index")
+    if ff:
+        # gate rows then up rows
+        e("  %w_rows = index.mul %m_rows, %c2 : index")
+        e("  %w_bytes = index.mul %w_rows, %bpr : index")
+        e("  %w_halfs = index.mul %w_rows, %hpr : index")
+    else:
+        e("  %w_bytes = index.mul %m_rows, %bpr : index")
+        e("  %w_halfs = index.mul %m_rows, %hpr : index")
     e("  %w_last = index.sub %w_bytes, %c1 : index")
     e("  %w_lim = index.sub %w_bytes, %c16 : index")
     for nb in (4, 8, 16):
@@ -407,7 +421,7 @@ def _gen(fmt, kind, t, masked):
     e("  scf.for %stg_i = [%c0 to %stg_iters step %c1] {")
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("  }")
-    e(f"  %wg_row = index.mul %wg_x, %c{BM} : index")
+    e(f"  %wg_row = index.mul %wg_x, %c{BM // 2 if ff else BM} : index")
     e(f"  %ctm = index.constant {TM} : index")
     e(f"  %ctn = index.constant {TN} : index")
     e("  %wr_off = index.mul %wr, %ctm : index")
@@ -421,7 +435,17 @@ def _gen(fmt, kind, t, masked):
     e(f"  %drow = index.min %l64, %c{BM - 1} : index")
     e("  %drow_i = index.cast %drow : index to i32")
     e("  %wg_row_i = index.cast %wg_row : index to i32")
-    e("  %grow_i = scalar.addi %wg_row_i, %drow_i : i32")
+    if ff:
+        # weight tile row drow: gate row drow (< 64) or up row drow - 64 of the workgroup's 64 rows; the up rows are
+        # m_rows further on in the binding (no branch: a branch around the loads drains vmcnt(0) at its join every phase)
+        e("  %drow_g = index.rem %drow, %c64 : index")
+        e("  %ff_up = index.cmp uge, %drow, %c64 : index")
+        e("  %ff_upr = scf.select %ff_up, %m_rows, %c0 : index")
+        e("  %drow_t = index.add %drow_g, %ff_upr : index")
+        e("  %drow_gi = index.cast %drow_t : index to i32")
+        e("  %grow_i = scalar.addi %wg_row_i, %drow_gi : i32")
+    else:
+        e("  %grow_i = scalar.addi %wg_row_i, %drow_i : i32")
     e("  %k_blocks_i = index.cast %k_blocks : index to i32")
     e("  %bpr_i = scalar.muli %k_blocks_i, %cbbi : i32")
     e("  %row_off_i = scalar.muli %grow_i, %bpr_i : i32")
@@ -908,6 +932,11 @@ def _gen(fmt, kind, t, masked):
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
+    if ff:
+        _lds_epilogue_ffn(e, t, V8)
+        e("  kernel.return")
+        e("}")
+        return "\n".join(L) + "\n"
     if t.tallepi:
         _lds_epilogue_tall(e, t, kr, V8, masked=masked, qg=qg)
         e("  kernel.return")
@@ -1152,6 +1181,87 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     e(f"  vector.store {val}, %out_flat[%et_oi{y}] : vector<4xf32>, view<[%out_total]xf32>")
             if masked:
                 e("  }")
+
+
+def _lds_epilogue_ffn(e, t, V8, sr=16):
+    """ffn: out[t][r] = f16(silu(gate) * up) for the workgroup's 64 rows; gate in accumulator rows 0-63 (fragments 0-3),
+    up in 64-127 (4-7), the same lane / element in both. The swiglu GEMM's scalar ops per element (bit-identical: the
+    gate is the f32 value the gate GEMM stored), then through sr-row slabs in the weight tile as _lds_epilogue_tall,
+    4-row f16 stores, row-major or fragment-major (t.tout). (Staging gate and up through LDS slabs first and doing the
+    math per slab was slower: IQ4_XS 41.31 vs 40.70 M.)"""
+    FN = t.tn // 16
+    FG = t.tm // 32                  # gate fragments
+    assert sr == 16
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    e("  %negone = scalar.constant -1.0 : f32")
+    e("  %one = scalar.constant 1.0 : f32")
+    for i in range(FG):
+        for j in range(FN):
+            g, u = i * FN + j, (i + FG) * FN + j
+            xs = []
+            for x in range(8):
+                y = f"{i}_{j}_{x}"
+                e(f"  %fg_{y} = vector.extract %acc{g}[{x}] : {V8} -> f32")
+                e(f"  %fu_{y} = vector.extract %acc{u}[{x}] : {V8} -> f32")
+                e(f"  %fng_{y} = scalar.mulf %fg_{y}, %negone : f32")
+                e(f"  %fex_{y} = scalar.expf<afn> %fng_{y} : f32")
+                e(f"  %fdn_{y} = scalar.addf %one, %fex_{y} : f32")
+                e(f"  %fiv_{y} = scalar.divf %one, %fdn_{y} : f32")
+                e(f"  %fsg_{y} = scalar.mulf %fg_{y}, %fiv_{y} : f32")
+                e(f"  %fac_{y} = scalar.mulf %fsg_{y}, %fu_{y} : f32")
+                xs.append(f"%fac_{y}")
+            e(f"  %fo{i}_{j} = vector.from_elements {', '.join(xs)} : {V8}")
+    e(f"  %et_cs = index.constant {sr + EPAD} : index")
+    e("  %et_lay = encoding.layout.strided [%c1, %et_cs] : encoding<layout>")
+    e(f"  %et_wb = index.constant {(sr + EPAD) * 16 * 4} : index")
+    e("  %et_off_i = index.mul %wave, %et_wb : index")
+    e("  %et_off = index.cast %et_off_i : index to offset")
+    e(f"  %et_view = buffer.view %wl[%et_off] : buffer -> view<{sr}x16xf32, %et_lay>")
+    e(f"  %et_flat = buffer.view %wl[%et_off] : buffer -> view<{(sr + EPAD) * 16}xf32>")
+    e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
+    e("  %et_last4 = index.sub %out_total, %c4 : index")
+    e("  %et_lane = index.rem %tid, %c32 : index")
+    e("  %et_t = index.div %et_lane, %c2 : index")
+    e("  %et_h0 = index.rem %et_lane, %c2 : index")
+    e(f"  %et_h = index.mul %et_h0, %c{sr // 2} : index")
+    e("  %et_tt = index.mul %et_t, %et_cs : index")
+    e("  %et_rd = index.add %et_tt, %et_h : index")
+    e("  %et_rowb = index.add %m_origin, %et_h : index")
+    if t.tout:
+        e("  %et_mt = index.div %m_rows, %c16 : index")
+    for g in range(FG):
+        e(f"  %et_gr{g} = index.constant {g * sr} : index")
+        e(f"  %et_row{g} = index.add %et_rowb, %et_gr{g} : index")
+        for j in range(FN):
+            q0 = f"{g}_{j}"
+            e("  scf.schedule.fence")
+            e(f"  vector.fragment.store<result> %fo{g}_{j}, %et_view[%c0, %c0] shape [%m, %n] : {V8}, view<{sr}x16xf32, %et_lay>")
+            e(f"  %et_tc{q0} = index.constant {16 * j} : index")
+            e(f"  %et_tk{q0}0 = index.add %token_base, %et_tc{q0} : index")
+            e(f"  %et_tk{q0} = index.add %et_tk{q0}0, %et_t : index")
+            for q in range(sr // 8):
+                y = f"{q0}_{q}"
+                e(f"  %et_q{y}c = index.constant {4 * q} : index")
+                e(f"  %et_ri{y} = index.add %et_rd, %et_q{y}c : index")
+                e(f"  %et_v{y} = vector.load %et_flat[%et_ri{y}] : view<{(sr + EPAD) * 16}xf32> -> vector<4xf32>")
+                e(f"  %et_h{y} = vector.fptrunc %et_v{y} : vector<4xf32> to vector<4xf16>")
+                e(f"  %et_r{y} = index.add %et_row{g}, %et_q{y}c : index")
+                if t.tout:
+                    e(f"  %et_a{y} = index.div %et_tk{q0}, %c16 : index")
+                    e(f"  %et_b{y} = index.rem %et_tk{q0}, %c16 : index")
+                    e(f"  %et_c{y} = index.div %et_r{y}, %c16 : index")
+                    e(f"  %et_d{y} = index.rem %et_r{y}, %c16 : index")
+                    e(f"  %et_e{y} = index.mul %et_a{y}, %et_mt : index")
+                    e(f"  %et_f{y} = index.add %et_e{y}, %et_c{y} : index")
+                    e(f"  %et_g{y} = index.mul %et_f{y}, %c256 : index")
+                    e(f"  %et_i{y} = index.mul %et_b{y}, %c16 : index")
+                    e(f"  %et_j{y} = index.add %et_g{y}, %et_i{y} : index")
+                    e(f"  %et_o{y}0 = index.add %et_j{y}, %et_d{y} : index")
+                else:
+                    e(f"  %et_m{y} = index.mul %et_tk{q0}, %m_rows : index")
+                    e(f"  %et_o{y}0 = index.add %et_m{y}, %et_r{y} : index")
+                e(f"  %et_o{y} = index.min %et_o{y}0, %et_last4 : index")   # always in range; for the bound proof
+                e(f"  vector.store %et_h{y}, %out_h[%et_o{y}] : vector<4xf16>, view<[%out_total]xf16>")
 
 
 def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):

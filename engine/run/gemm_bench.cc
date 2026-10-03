@@ -148,17 +148,19 @@ int main(int argc, char** argv) {
       }
       if (j.tokens == 0 || j.tokens > kChunk || m_rows % 16 || (m_rows / 16) % j.rowgrp)
         throw LoomError(j.hal + ": bad shape or token count");
-      if (weight_names != j.tensor) {
+      if (weight_names != j.tensor + j.kind) {
         weights.clear();
         for (const auto* u : ts) {
-          weights.push_back(gpu.Allocate(u->bytes));
-          gpu.H2D(weights.back(), gguf.Data(*u), u->bytes);
+          // ffn (fused gate / up): the binding spans gate then up; here the same tensor twice
+          const int copies = j.kind == "ffn" ? 2 : 1;
+          weights.push_back(gpu.Allocate(u->bytes * copies));
+          for (int c = 0; c < copies; ++c) gpu.H2D(weights.back(), gguf.Data(*u), u->bytes, u->bytes * c);
         }
         if (!file_w.empty()) {
           weights.push_back(gpu.Allocate(file_w.size()));
           gpu.H2D(weights.back(), file_w.data(), file_w.size());
         }
-        weight_names = j.tensor;
+        weight_names = j.tensor + j.kind;
       }
       LoomBuffer grid;
       const bool needs_grid = j.fmt == "iq3s" || j.fmt == "iq3xxs" || j.fmt == "iq2xxs" || j.fmt == "iq2xs";
@@ -214,7 +216,7 @@ int main(int argc, char** argv) {
       gpu.Dispatch(exe, ord, cfg, nullptr, 0, with_weight(0), b.size());
       gpu.Synchronize();
       // The real token rows of the outputs: [token][rows], f16 for swiglu, q and gate halves for kqg.
-      const std::size_t row_bytes = j.kind == "swiglu" ? std::size_t{m_rows} * 2
+      const std::size_t row_bytes = j.kind == "swiglu" || j.kind == "ffn" ? std::size_t{m_rows} * 2
                                     : j.kind == "kqg"  ? std::size_t{m_rows} / 2 * 4
                                                        : std::size_t{m_rows} * 4;
       std::vector<std::uint8_t> host(row_bytes * j.tokens);

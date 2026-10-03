@@ -19,8 +19,8 @@ B = int(sys.argv[8]) if len(sys.argv) > 8 else 2048
 # masked: the kernel declares its token count (config "tokens") and the last token tile is partial
 qk, bpb = QB[fmt]
 M, K = mt * 16, kb * qk
-bound = {"weight": M * kb * bpb, "input": B * K * 2, "resid": B * M * 4, "gate": B * M * 4,
-         "output": M * K * 2 if kind == "dequant" else B * M * (2 if kind in ("swiglu", "kqg") else 4),
+bound = {"weight": M * kb * bpb * (2 if kind == "ffn" else 1), "input": B * K * 2, "resid": B * M * 4, "gate": B * M * 4,
+         "output": M * K * 2 if kind == "dequant" else B * M * (2 if kind in ("swiglu", "kqg", "ffn") else 4),
          "gate_out": B * M * 2,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
          "grid": {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(fmt, 0),
