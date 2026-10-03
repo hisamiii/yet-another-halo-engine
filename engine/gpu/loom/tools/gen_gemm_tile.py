@@ -88,6 +88,7 @@ class Tile:
     tokfast: bool = False      # launch order token tiles fastest: the token tiles of a row block run together (L2 shares weights)
     afrag: bool = False        # activations not staged in LDS: the MMA's B fragments load straight from the input (needs dbuf)
     atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
+    respre: int = 0            # kres tall epilogue: issue each slab group's residual loads this many groups ahead (0: at use)
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
     ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
                                # (the weight binding spans ffn_gate and the ffn_up right after it: up row r is row m_rows + r)
@@ -1233,7 +1234,43 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
     e("  %et_tt = index.mul %et_t, %et_cs : index")
     e("  %et_rd = index.add %et_tt, %et_h : index")
     e("  %et_rowb = index.add %m_origin, %et_h : index")
-    for g in range(TM // sr):
+    pre = t.respre if kr and not masked and not qg else 0
+    groups = [(g, j) for g in range(TM // sr) for j in range(FN)]
+
+    def res_addr(g, j):
+        q0 = f"{g}_{j}"
+        e(f"  %et_tc{q0} = index.constant {16 * j} : index")
+        e(f"  %et_tk{q0}0 = index.add %token_base, %et_tc{q0} : index")
+        e(f"  %et_tk{q0} = index.add %et_tk{q0}0, %et_t : index")
+        e(f"  %et_tm{q0} = index.mul %et_tk{q0}, %m_rows : index")
+        e(f"  %et_ob{q0} = index.add %et_tm{q0}, %et_row{g} : index")
+        for q in range(sr // 8):
+            y = f"{q0}_{q}"
+            e(f"  %et_q{y}c = index.constant {4 * q} : index")
+            e(f"  %et_oi{y} = index.add %et_ob{q0}, %et_q{y}c : index")
+            e(f"  %et_rf{y} = vector.load %res_flat[%et_oi{y}] : view<[%out_total]xf32> -> vector<4xf32>")
+    if pre:
+        # residual loads run `pre` slab groups ahead of their adds: one DRAM round trip per wave, not one per group
+        for g in range(TM // sr):
+            e(f"  %et_gr{g} = index.constant {g * sr} : index")
+            e(f"  %et_row{g} = index.add %et_rowb, %et_gr{g} : index")
+        for n in range(min(pre, len(groups))):
+            res_addr(*groups[n])
+        for n, (g, j) in enumerate(groups):
+            q0 = f"{g}_{j}"
+            e("  scf.schedule.fence")
+            if n + pre < len(groups):
+                res_addr(*groups[n + pre])
+            for i in range(g * sr // 16, (g + 1) * sr // 16):
+                e(f"  %et_r{i}_{j} = index.constant {16 * i - g * sr} : index")
+                e(f"  vector.fragment.store<result> %acc{i * FN + j}, %et_view[%et_r{i}_{j}, %c0] shape [%m, %n] : {V8}, view<{sr}x16xf32, %et_lay>")
+            for q in range(sr // 8):
+                y = f"{q0}_{q}"
+                e(f"  %et_ri{y} = index.add %et_rd, %et_q{y}c : index")
+                e(f"  %et_v{y} = vector.load %et_flat[%et_ri{y}] : view<{(sr + EPAD) * 16}xf32> -> vector<4xf32>")
+                e(f"  %et_rs{y} = vector.addf %et_rf{y}, %et_v{y} : vector<4xf32>")
+                e(f"  vector.store %et_rs{y}, %out_flat[%et_oi{y}] : vector<4xf32>, view<[%out_total]xf32>")
+    for g in range(TM // sr) if not pre else []:
         e(f"  %et_gr{g} = index.constant {g * sr} : index")
         e(f"  %et_row{g} = index.add %et_rowb, %et_gr{g} : index")
         if qg:

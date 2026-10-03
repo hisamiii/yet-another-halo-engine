@@ -364,6 +364,10 @@ AF = {
     ("q4k", "kstore", 64, 20): dict(AF_KQ),                                     # -16.0%
     ("q5k", "kstore", 64, 20): dict(AF_KQ, ksl=True),                           # -10.4%
     ("q6k", "kstore", 64, 20): dict(AF_KQ, ksl=True, wlate=True),               # -10.2% (208 VGPRs: 32 workgroups anyway)
+    # IQ2: the grid / sign lookups leave no room for B prefetch (bpre 1-2: 208-216 VGPRs, one workgroup per WGP)
+    ("iq2xxs", "kstore", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),   # -19.3%
+    ("iq2xxs", "swiglu", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),   # -16.6%
+    ("iq2xs", "kstore", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),    # -18.4%
 }
 
 
@@ -639,14 +643,14 @@ def main():
     norm_src = os.path.join(tmp, "yah_half_norm_unrolled.loom")
     # 4 rows (waves) per workgroup: 46.1 -> 41.9 ms per pp2048 vs one row per workgroup. The tuner's table may set it
     # ({"norm": {"wpr": 2}}); the driver derives the grid from the kernel's workgroup size.
-    open(norm_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4)))
+    open(norm_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), wlds=True))
     # the FFN norm for afrag GEMMs: the same values, stored fragment-major
     normt_src = os.path.join(tmp, "yah_half_norm_tiled.loom")
-    open(normt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled=True))
+    open(normt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled=True, wlds=True))
     any_af = any(h.endswith(".af.hal") for h, *_ in geom)
     # attn_norm where some of its GEMMs are afrag (DeltaNet alpha / beta never): both layouts in one pass
     normrt_src = os.path.join(tmp, "yah_half_norm_both.loom")
-    open(normrt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled="both"))
+    open(normrt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled="both", wlds=True))
     # the DeltaNet postnorm, fragment-major for an afrag ssm_out
     postnorm_t_src = os.path.join(tmp, "yah_ssm_postnorm_tiled.loom")
     open(postnorm_t_src, "w").write(postnorm_tiled(open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()))

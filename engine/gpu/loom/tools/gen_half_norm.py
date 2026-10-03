@@ -14,10 +14,15 @@ so the second pass reads mostly the weight (a loop form makes ~160 dependent rou
 import sys
 
 
-def gen(dim=5120, wpr=1, tiled=False):
+def gen(dim=5120, wpr=1, tiled=False, resadd=False, keep=None, wlds=False):
     """tiled: the output fragment-major for the afrag GEMMs (gen_gemm_tile Tile.atiled): 16 x 16 tiles (row / 16,
     col / 16) of 256 halves, column fastest inside. Lane l's column l + 32k is tile column 2k + l / 16, offset l % 16.
-    tiled="both": the row-major output to out and the fragment-major one to a sixth binding out_t."""
+    tiled="both": the row-major output to out and the fragment-major one to a sixth binding out_t.
+    resadd: the residual add of the GEMM before it moves here: v = x + residual (the GEMM's f32 output, the same f32
+    add the kres epilogue did), v is stored to sum_out (the new residual stream; x and residual are only read) and
+    normalized as x was. Rows past `keep` reload x and residual and add again (no read of the stored v).
+    wlds: the workgroup stages the weight vector in LDS once (16-byte loads); the output pass reads it from LDS
+    instead of every row walking it through L2 two loads at a time."""
     both = tiled == "both"
     assert dim % 32 == 0
     n = dim // 32
@@ -53,12 +58,18 @@ def gen(dim=5120, wpr=1, tiled=False):
     e("  %eps = config.get @yah_half_norm.eps : f32")
     e("  %rows = config.get @yah_half_norm.rows : index")
     e("  %total_elems = index.mul %rows, %dim : index")
-    if both:
+    if resadd:
+        assert not both
+        e("  %x_na, %res_na, %weight_na, %nres_na, %out_na = buffer.assume.noalias %x, %residual, %weight, %sum_out, %out : buffer, buffer, buffer, buffer, buffer")
+    elif both:
         e("  %x_na, %weight_na, %out_na, %out_t_na = buffer.assume.noalias %x, %weight, %out, %out_t : buffer, buffer, buffer, buffer")
     else:
         e("  %x_na, %weight_na, %out_na = buffer.assume.noalias %x, %weight, %out : buffer, buffer, buffer")
     e("  %x_view = buffer.view %x_na[%base] : buffer -> view<[%total_elems]xf32>")
     e("  %weight_view = buffer.view %weight_na[%base] : buffer -> view<[%dim]xf32>")
+    if resadd:
+        e("  %res_view = buffer.view %res_na[%base] : buffer -> view<[%total_elems]xf32>")
+        e("  %nres_view = buffer.view %nres_na[%base] : buffer -> view<[%total_elems]xf32>")
     e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%total_elems]xf16>")
     if both:
         e("  %out_t_view = buffer.view %out_t_na[%base] : buffer -> view<[%total_elems]xf16>")
@@ -90,10 +101,29 @@ def gen(dim=5120, wpr=1, tiled=False):
         e("  %tt3 = index.mul %trr, %c16t : index")
         e("  %tt4 = index.add %tt2, %tt3 : index")
         e("  %tbase = index.add %tt4, %tll : index")
+    if wlds:
+        assert wpr > 1 and dim % (4 * 32 * wpr) == 0
+        e(f"  %wl_bytes = index.constant {dim * 4} : offset")
+        e("  %wl_buf = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
+        e(f"  %wl_view = buffer.view %wl_buf[%base] : buffer -> view<{dim}xf32>")
+        e("  %wl_c4 = index.constant 4 : index")
+        e("  %wl_t4 = index.mul %tid, %wl_c4 : index")
+        for c in range(dim // (4 * 32 * wpr)):
+            e(f"  %wl_o{c} = index.constant {c * 4 * 32 * wpr} : index")
+            e(f"  %wl_i{c} = index.add %wl_t4, %wl_o{c} : index")
+            e(f"  %wl_v{c} = vector.load %weight_view[%wl_i{c}] : view<[%dim]xf32> -> vector<4xf32>")
+            e(f"  vector.store %wl_v{c}, %wl_view[%wl_i{c}] : vector<4xf32>, view<{dim}xf32>")
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     for k in range(n):
         e(f"  %o{k} = index.constant {32 * k} : index")
         e(f"  %a{k} = index.add %lane_base, %o{k} : index")
-        e(f"  %x{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
+        if resadd:
+            e(f"  %xa{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
+            e(f"  %ga{k} = view.load %res_view[%a{k}] : view<[%total_elems]xf32> -> f32")
+            e(f"  %x{k} = scalar.addf %xa{k}, %ga{k} : f32")
+            e(f"  view.store %x{k}, %nres_view[%a{k}] : f32, view<[%total_elems]xf32>")
+        else:
+            e(f"  %x{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
     s = "%zero"
     for k in range(n):
         e(f"  %q{k} = scalar.mulf %x{k}, %x{k} : f32")
@@ -108,13 +138,22 @@ def gen(dim=5120, wpr=1, tiled=False):
     e("  %inv = scalar.divf %one, %root : f32")
     # Hold the first `keep` row values across the reduction and reload the rest for the output pass.
     # Fewer VGPRs give one more wave per SIMD: 56 is 8% faster than holding all 160 at dim 5120.
-    keep = 56 if dim == 5120 else n
+    if keep is None:
+        keep = 56 if dim == 5120 else n
     for k in range(n):
         e(f"  %wi{k} = index.add %lane, %o{k} : index")
-        e(f"  %w{k} = view.load %weight_view[%wi{k}] : view<[%dim]xf32> -> f32")
+        if wlds:
+            e(f"  %w{k} = view.load %wl_view[%wi{k}] : view<{dim}xf32> -> f32")
+        else:
+            e(f"  %w{k} = view.load %weight_view[%wi{k}] : view<[%dim]xf32> -> f32")
         xk = f"%x{k}"
         if k >= keep:
-            e(f"  %xr{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
+            if resadd:
+                e(f"  %xra{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
+                e(f"  %gra{k} = view.load %res_view[%a{k}] : view<[%total_elems]xf32> -> f32")
+                e(f"  %xr{k} = scalar.addf %xra{k}, %gra{k} : f32")
+            else:
+                e(f"  %xr{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
             xk = f"%xr{k}"
         e(f"  %nm{k} = scalar.mulf {xk}, %inv : f32")
         e(f"  %wt{k} = scalar.mulf %nm{k}, %w{k} : f32")
