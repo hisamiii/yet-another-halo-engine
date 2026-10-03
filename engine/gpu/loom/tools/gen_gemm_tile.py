@@ -32,7 +32,7 @@ DECAHEAD_SKIP = {("iq4xs", "kres", 24), ("q4k", "kres", 24)}
 # The swiglu epilogue through lds_epilogue (one barrier, wave-private slabs, 4-row vector loads/stores).
 # swiglu_epilogue issues one dependent gate load per element in a rolled loop; with one workgroup per WGP nothing hides it.
 # IQ4_XS keeps swiglu_epilogue: neutral at 2x the code.
-SWEPI_FMTS = ("iq3s", "iq3xxs")
+SWEPI_FMTS = ("iq3s", "iq3xxs", "f16")
 # STAGGER: in the first round the second workgroup on each WGP runs STAGGER barriers before it starts.
 # So co-resident workgroups drift out of lockstep; else on short-K kres they all hit the residual epilogue at once.
 # 8000 barriers is ~380k cycles of offset, past the ~150-200k cycle epilogue burst. Results are unchanged.
@@ -51,7 +51,7 @@ WPAD = 8
 # A fence keeps step s+1's loads after step s's MMAs.
 # Off for Q5_K: the latch copies' vmcnt(0) sits between the steps; with DECLOAD, at the 144-VGPR cap, ~48 moves appear.
 # Q6_K, Q2_K, Q8_0 and IQ2_* are not measured.
-KSL_FMTS = ("iq4xs", "q4k", "iq3s", "iq3xxs", "q3k")
+KSL_FMTS = ("iq4xs", "q4k", "iq3s", "iq3xxs", "q3k", "f16")
 # DECLOAD (on where KSL is): under decode-ahead only the decoding waves issue the phase's weight loads, not every wave.
 # With KSL it also moves the prefetch's latch copies (and their vmcnt(0)) from between the k steps to after the last MMA.
 # EPAD: pad of the LDS epilogue slab's token pitch (f32).
@@ -61,7 +61,7 @@ EPAD = 4
 # 2 x 4 (64 x 64) has fewer instructions still but drops off the issue bound (exposed latency).
 # Q4_K / Q5_K fit in VGPRs at 4 x 2 only with Q4FMIX, IQ3_S only with the word-path decode (w3).
 # IQ3_XXS swiglu at 4 x 2 needs the LDS epilogue (SWEPI_FMTS).
-WAVE_FMTS = ("iq4xs", "iq3xxs", "q3k", "iq3s", "q4k", "q5k")
+WAVE_FMTS = ("iq4xs", "iq3xxs", "q3k", "iq3s", "q4k", "q5k", "f16")
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,7 @@ class Tile:
     stagger: int = STAGGER     # barriers the second workgroup per WGP waits in the first round
     gstage: bool = False       # stage activations through the general segment map even where the row map fits
     dbuf: bool = False         # double-buffered LDS tiles, one barrier per phase (decode / stage phase k+1 while multiplying k)
+    tokfast: bool = False      # launch order token tiles fastest: the token tiles of a row block run together (L2 shares weights)
 
     @property
     def tm(self):
@@ -130,7 +131,9 @@ def default_tile(fmt, kind, kb, geom=None):
                 rhs_outer=fmt in RHSO_FMTS, rhs_fence=RHSO_FMTS.get(fmt, 0), w3=w3,
                 # Q4_K: this lets Q4_K run at 4 x 2 without spills
                 q4fmix=fmt in ("q4k", "q5k"),
-                swepi=kind == "swiglu" and fmt in SWEPI_FMTS and bm // wm == 32)
+                swepi=kind == "swiglu" and fmt in SWEPI_FMTS and bm // wm == 32,
+                # decode-free f16 GEMMs read 2 B per weight: the token tiles of a row block run together so L2 serves 7 of 8
+                tokfast=fmt == "f16")
 
 
 def check(t):
@@ -180,6 +183,10 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
     return _gen(fmt, kind, t, masked)
 
 
+# dequant kernels: 256-wide K blocks per workgroup (the table staging and launch cost amortize over them)
+DQ_BLOCKS = 4
+
+
 def _gen(fmt, kind, t, masked):
     BM, BN, WM, WN, TM, TN = t.bm, t.bn, t.wm, t.wn, t.tm, t.tn
     FM, FN, NWAVE, LANES, ROWGRP, APL = TM // 16, TN // 16, t.nwave, t.lanes, t.rowgrp, t.apl
@@ -193,9 +200,15 @@ def _gen(fmt, kind, t, masked):
     # kqg: the attention q projection (rows = heads x [256 q | 256 gate]) writes q and gate to [tokens][heads*256] buffers.
     # Same values as the separate yah_unpack_qg pass, so bit-identical.
     qg = kind == "kqg"
+    # dequant: decode the weights to f16 [rows][K] once with this tile's decode (the decode-free GEMMs read that)
+    dq = kind == "dequant"
     bufs = (["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
             + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []))
     sym = f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
+    if dq:
+        assert not (DECAHEAD or DBUF or masked)
+        bufs = ["weight"] + F["extra"] + ["output"]
+        sym = f"yah_dequant_{fmt}"
     slots = G.GPP                   # decoding lane groups of BM per phase
     arow = ksub + APAD              # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
@@ -225,7 +238,17 @@ def _gen(fmt, kind, t, masked):
     e(f"  %wgs = index.constant {LANES} : index")
     e(f"  %rowgrp = index.constant {ROWGRP} : index")
     e("  %m_groups = index.div %m_tiles, %rowgrp : index")
-    e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
+    if dq:
+        # one workgroup per (row group, K phase)
+        e(f"  %kbl0 = config.get @{sym}.k_blocks : index")
+        e(f"  %kdivl = index.constant {F.get('kdiv', 1)} : index")
+        e("  %kbl = index.div %kbl0, %kdivl : index")
+        # DQ_BLOCKS 256-wide blocks per workgroup (k_blocks is a multiple of it: 20 and 68 here)
+        e(f"  %cdqb = index.constant {DQ_BLOCKS} : index")
+        e("  %kgl = index.div %kbl, %cdqb : index")
+        e("  kernel.launch.config workgroups(%m_groups, %kgl, %unit) workgroup_size(%wgs, %unit, %unit) : index")
+    else:
+        e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
     e("  %base = index.constant 0 : offset")
     for v in sorted({0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN}):
@@ -281,30 +304,43 @@ def _gen(fmt, kind, t, masked):
       + ", ".join(f"%{b}" for b in bufs) + " : " + ", ".join(["buffer"] * len(bufs)))
     e("  %w_view = buffer.view %weight_na[%base] : buffer -> view<[%w_bytes]xi8>")
     e("  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>")
-    e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
+    if not dq:
+        e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
     # LDS: decoded weight tile and staged activation tile
     e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF else 1)} : offset")
     e(f"  %wl_tb = index.constant {BM * G.ROWP * 2} : index")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
-    # the LDS epilogue's wave-private TM x 16 f32 slabs live in the activation tile
-    al_bytes = BN * arow * 2 * (2 if DBUF else 1)
-    slabs = NWAVE * (TM + EPAD) * 16 * 4
-    if TM == 32:
-        al_bytes = max(al_bytes, slabs)
-    if sw and not t.swepi:
-        # swiglu_epilogue's per-wave slabs; narrow tiles need more than the activation tile holds
-        al_bytes = max(al_bytes, NWAVE * 16 * swiglu_slab(t, arow) * 4)
-    e(f"  %al_bytes = index.constant {al_bytes} : offset")
-    e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
-    e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
-    e(f"  %carow = index.constant {arow} : index")
-    e(f"  %cksubi = index.constant {ksub} : index")
-    e("  %al_layout = encoding.layout.strided [%c1, %carow] : encoding<layout>")
-    e(f"  %al_t = buffer.view %al[%base] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
-    e(f"  %al_tb = index.constant {BN * arow * 2} : index")
-    e("  %wg_x = kernel.workgroup.id<x> : index")
-    e("  %wg_y = kernel.workgroup.id<y> : index")
+    if not dq:
+        # the LDS epilogue's wave-private TM x 16 f32 slabs live in the activation tile
+        al_bytes = BN * arow * 2 * (2 if DBUF else 1)
+        slabs = NWAVE * (TM + EPAD) * 16 * 4
+        if TM == 32:
+            al_bytes = max(al_bytes, slabs)
+        if sw and not t.swepi:
+            # swiglu_epilogue's per-wave slabs; narrow tiles need more than the activation tile holds
+            al_bytes = max(al_bytes, NWAVE * 16 * swiglu_slab(t, arow) * 4)
+        e(f"  %al_bytes = index.constant {al_bytes} : offset")
+        e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
+        e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
+        e(f"  %carow = index.constant {arow} : index")
+        e(f"  %cksubi = index.constant {ksub} : index")
+        e("  %al_layout = encoding.layout.strided [%c1, %carow] : encoding<layout>")
+        e(f"  %al_t = buffer.view %al[%base] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
+        e(f"  %al_tb = index.constant {BN * arow * 2} : index")
+    if t.tokfast:
+        # linear id -> (row block, token tile) with the token tile fastest; the same grid, a different order
+        e("  %wg_rx = kernel.workgroup.id<x> : index")
+        e("  %wg_ry = kernel.workgroup.id<y> : index")
+        e("  %wg_gx = kernel.workgroup.count<x> : index")
+        e("  %wg_gy = kernel.workgroup.count<y> : index")
+        e("  %wg_l0 = index.mul %wg_ry, %wg_gx : index")
+        e("  %wg_lin = index.add %wg_l0, %wg_rx : index")
+        e("  %wg_x = index.div %wg_lin, %wg_gy : index")
+        e("  %wg_y = index.rem %wg_lin, %wg_gy : index")
+    else:
+        e("  %wg_x = kernel.workgroup.id<x> : index")
+        e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
     e(f"  %wave = index.div %tid, %c{WS} : index")
     e(f"  %cwn = index.constant {WN} : index")
@@ -325,7 +361,7 @@ def _gen(fmt, kind, t, masked):
     e(f"  %stg_w2 = index.constant {2 * STG_NWGP} : index")
     e("  %stg_ge = index.cmp uge, %stg_lin, %stg_w : index")
     e("  %stg_lt = index.cmp ult, %stg_lin, %stg_w2 : index")
-    e(f"  %stg_n = index.constant {t.stagger} : index")
+    e(f"  %stg_n = index.constant {0 if dq else t.stagger} : index")
     e("  %stg_n1 = scf.select %stg_ge, %stg_n, %c0 : index")
     e("  %stg_n2 = scf.select %stg_lt, %stg_n1, %c0 : index")
     e("  %stg_iters = scf.select %stg_big, %stg_n2, %c0 : index")
@@ -384,6 +420,57 @@ def _gen(fmt, kind, t, masked):
             e(f"  %grp{i} = index.mul %grt{i}, %apitch : index")
             e(f"  %gro{i} = index.add %grp{i}, %gc{i} : index")
     L.extend(F["setup"]())
+    if dq:
+        # the setup's LDS tables visible, then this workgroup's phase (wg_y) decoded into the LDS tile as the GEMM does it
+        e("  %z8s = scalar.constant 0 : i8")
+        e("  %z8v = vector.splat %z8s : vector<8xi8>")
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  %dq_tot = index.mul %m_rows, %ktot : index")
+        e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xf16>")
+        e("  %dq_g = kernel.workgroup.id<y> : index")
+        e(f"  %dq_np = index.constant {DQ_BLOCKS * G.PH} : index")
+        e("  %dq_p0 = index.mul %dq_g, %dq_np : index")
+        e("  scf.for %dq_it = [%c0 to %dq_np step %c1] {")
+        e("  %dq_kp = index.add %dq_p0, %dq_it : index")
+        e("  %dq_kb = index.div %dq_kp, %cph : index")
+        e("  %dq_ph = index.rem %dq_kp, %cph : index")
+        e("  %dq_kbi = index.cast %dq_kb : index to i32")
+        e("  %dq_phi = index.cast %dq_ph : index to i32")
+        e("  %dq_bo = scalar.muli %dq_kbi, %cbbi : i32")
+        e("  %dq_blk = scalar.addi %row_off_i, %dq_bo : i32")
+        e("  %dq_gg = scalar.muli %dq_phi, %cgppi : i32")
+        e("  %dq_gb = scalar.addi %dq_gg, %gl_i : i32")
+        Ld, wd = loads("dqd_", "%dq_blk", "%dq_gb")
+        L.extend(Ld)
+        e("  scf.if %decoder {")
+        L.extend(compute([nm for nm, _ in wd], "%dq_gb"))
+        e("  }")
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        # copy the BM x KSUB tile to out[row][K] (f16), 8 halves per store
+        e("  %dq_k0 = index.mul %dq_kp, %cksub : index")
+        cpr = ksub // 8
+        nch = BM * cpr
+        e(f"  %dq_cpr = index.constant {cpr} : index")
+        for i in range(-(-nch // LANES)):
+            e(f"  %dq_q{i}c = index.constant {i * LANES} : index")
+            e(f"  %dq_q{i}0 = index.add %tid, %dq_q{i}c : index")
+            e(f"  %dq_q{i} = index.min %dq_q{i}0, %c{BM * cpr - 1} : index" if (BM * cpr - 1) in (0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN)
+              else f"  %dq_qm{i} = index.constant {BM * cpr - 1} : index\n  %dq_q{i} = index.min %dq_q{i}0, %dq_qm{i} : index")
+            e(f"  %dq_r{i} = index.div %dq_q{i}, %dq_cpr : index")
+            e(f"  %dq_cq{i} = index.rem %dq_q{i}, %dq_cpr : index")
+            e(f"  %dq_c{i} = index.mul %dq_cq{i}, %c8 : index")
+            e(f"  %dq_v{i} = vector.load %wl_view[%dq_r{i}, %dq_c{i}] : view<{BM}x{G.ROWP}xf16> -> vector<8xf16>")
+            e(f"  %dq_gr{i} = index.add %wg_row, %dq_r{i} : index")
+            e(f"  %dq_go{i} = index.mul %dq_gr{i}, %ktot : index")
+            e(f"  %dq_gk{i} = index.add %dq_k0, %dq_c{i} : index")
+            e(f"  %dq_ga{i} = index.add %dq_go{i}, %dq_gk{i} : index")
+            e(f"  vector.store %dq_v{i}, %dq_out[%dq_ga{i}] : vector<8xf16>, view<[%dq_tot]xf16>")
+        # the next phase's decode overwrites the tile
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  }")
+        e("  kernel.return")
+        e("}")
+        return "\n".join(L) + "\n"
     e("  %z8s = scalar.constant 0 : i8")
     e("  %z8v = vector.splat %z8s : vector<8xi8>")
     e(f"  %zeros = vector.constant 0.0 : {V8}")
@@ -711,10 +798,19 @@ def _gen(fmt, kind, t, masked):
     return "\n".join(L) + "\n"
 
 
+# swiglu through lds_epilogue: the gate loads of a 16-token column are issued this many columns before it is processed,
+# so their memory latency overlaps the column in between (0: each column loads its gate just before use). Measured
+# 2026-10-03: 1 is -1.2% IQ3_S / -0.7% IQ3_XXS swiglu cycles; 2 and 4 are slower (the epilogue is mostly a gate-stream
+# bandwidth burst at the end of each workgroup, not load latency).
+SW_GATE_AHEAD = 1
+
+
 def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
     """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
     A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical."""
+    if sw and SW_GATE_AHEAD:
+        return _lds_epilogue_ahead(e, t, kr, V8, sw, qg, masked)
     TM, FM, FN = t.tm, t.tm // 16, t.tn // 16
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e(f"  %es_ctm = index.constant {TM + EPAD} : index")
@@ -793,6 +889,137 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
                 val = f"%es_rs{j}_{q}"
             if sw:
                 e(f"  %es_g{j}_{q} = vector.load %gate_view[%es_oi{j}_{q}] : view<[%out_total]xf32> -> vector<4xf32>")
+                hs = []
+                for x in range(4):
+                    y = f"{j}_{q}_{x}"
+                    e(f"  %g_{y} = vector.extract %es_g{j}_{q}[{x}] : vector<4xf32> -> f32")
+                    e(f"  %v_{y} = vector.extract %es_v{j}_{q}[{x}] : vector<4xf32> -> f32")
+                    e(f"  %ng_{y} = scalar.mulf %g_{y}, %negone : f32")
+                    e(f"  %ex_{y} = scalar.expf<afn> %ng_{y} : f32")
+                    e(f"  %dn_{y} = scalar.addf %one, %ex_{y} : f32")
+                    e(f"  %iv_{y} = scalar.divf %one, %dn_{y} : f32")
+                    e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
+                    e(f"  %ac_{y} = scalar.mulf %sg_{y}, %v_{y} : f32")
+                    e(f"  %h_{y} = scalar.fptrunc %ac_{y} : f32 to f16")
+                    hs.append(f"%h_{y}")
+                e(f"  %hv{j}_{q} = vector.from_elements {', '.join(hs)} : vector<4xf16>")
+                e(f"  vector.store %hv{j}_{q}, %out_h[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
+            elif qg:
+                # always in range; the clamp states it for the bound proof
+                e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
+                e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
+                e(f"  scf.if %qg_isq {{")
+                e(f"    vector.store {val}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e("  } else {")
+                e(f"    vector.store {val}, %g_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e("  }")
+            else:
+                e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
+        if masked:
+            e("  }")
+
+
+
+
+def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
+    """lds_epilogue with the swiglu gate loads issued SW_GATE_AHEAD columns before use (same values).
+    Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
+    Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
+    A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical."""
+    TM, FM, FN = t.tm, t.tm // 16, t.tn // 16
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    e(f"  %es_ctm = index.constant {TM + EPAD} : index")
+    e("  %es_lay = encoding.layout.strided [%c1, %es_ctm] : encoding<layout>")
+    e(f"  %es_wb = index.constant {(TM + EPAD) * 16 * 4} : index")
+    e("  %es_off_i = index.mul %wave, %es_wb : index")
+    e("  %es_off = index.cast %es_off_i : index to offset")
+    e(f"  %es_view = buffer.view %al[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
+    e(f"  %es_flat = buffer.view %al[%es_off] : buffer -> view<{(TM + EPAD) * 16}xf32>")
+    if sw:
+        # swiglu: out f16 = f16(silu(gate) * acc), swiglu_epilogue's scalar ops per element (bit-identical), 4 rows per load/store
+        e("  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%out_total]xf32>")
+        e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
+        e("  %negone = scalar.constant -1.0 : f32")
+        e("  %one = scalar.constant 1.0 : f32")
+    elif qg:
+        # row r = head*512 + half*256 + d goes to (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
+        e("  %qg_tot = index.div %out_total, %c2 : index")
+        e("  %qg_rows = index.div %m_rows, %c2 : index")
+        e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
+        e("  %qg_c512 = index.constant 512 : index")
+        e("  %qg_c256 = index.constant 256 : index")
+    else:
+        e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+    if kr:
+        e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
+    if masked:
+        e("  %es_tok_last = index.sub %tokens, %c1 : index")
+    e("  %es_lane = index.rem %tid, %c32 : index")
+    e("  %es_t = index.div %es_lane, %c2 : index")
+    e("  %es_h0 = index.rem %es_lane, %c2 : index")
+    e("  %es_h = index.mul %es_h0, %c16 : index")
+    e(f"  %es_tt = index.mul %es_t, %es_ctm : index")
+    e("  %es_rd = index.add %es_tt, %es_h : index")
+    e("  %es_row = index.add %m_origin, %es_h : index")
+    if qg:
+        e("  %qg_head = index.div %es_row, %qg_c512 : index")
+        e("  %qg_w = index.rem %es_row, %qg_c512 : index")
+        e("  %qg_half = index.div %qg_w, %qg_c256 : index")
+        e("  %qg_d = index.rem %qg_w, %qg_c256 : index")
+        e("  %qg_hb = index.mul %qg_head, %qg_c256 : index")
+        e("  %qg_col = index.add %qg_hb, %qg_d : index")
+        e("  %qg_isq = index.cmp eq, %qg_half, %c0 : index")
+    tka = {}
+
+    def col_addr(j):
+        """Column j's token and output offsets (es_tk{j}, es_ob{j}, es_oi{j}_q)."""
+        e(f"  %es_tc{j} = index.constant {16 * j} : index")
+        e(f"  %es_tk{j}0 = index.add %token_base, %es_tc{j} : index")
+        e(f"  %es_tk{j} = index.add %es_tk{j}0, %es_t : index")
+        es_tka = f"%es_tk{j}"
+        if masked:
+            # the guard skips tokens past the last; the clamp lets the compiler prove the addresses in bounds
+            e(f"  %es_tkc{j} = index.min %es_tk{j}, %es_tok_last : index")
+            es_tka = f"%es_tkc{j}"
+        tka[j] = es_tka
+        e(f"  %es_tm{j} = index.mul {es_tka}, %m_rows : index")
+        e(f"  %es_ob{j} = index.add %es_tm{j}, %es_row : index")
+        for q in range(4):
+            e(f"  %es_q{j}_{q}c = index.constant {4 * q} : index")
+            e(f"  %es_oi{j}_{q} = index.add %es_ob{j}, %es_q{j}_{q}c : index")
+        if sw:
+            # gate loads at the (clamped, in-bounds) address; issued SW_GATE_AHEAD columns before their use
+            for q in range(4):
+                e(f"  %es_g{j}_{q} = vector.load %gate_view[%es_oi{j}_{q}] : view<[%out_total]xf32> -> vector<4xf32>")
+    ahead = SW_GATE_AHEAD if sw else 0
+    for j in range(min(ahead, FN)):
+        col_addr(j)
+    for j in range(FN):
+        if ahead and j + ahead < FN:
+            col_addr(j + ahead)
+        for i in range(FM):
+            e(f"  %es_r{i}_{j} = index.constant {16 * i} : index")
+            e(f"  vector.fragment.store<result> %acc{i * FN + j}, %es_view[%es_r{i}_{j}, %c0] shape [%m, %n] : {V8}, view<{TM}x16xf32, %es_lay>")
+        if not ahead:
+            col_addr(j)
+        if qg:
+            e(f"  %qg_tm{j} = index.mul {tka[j]}, %qg_rows : index")
+            e(f"  %qg_ob{j} = index.add %qg_tm{j}, %qg_col : index")
+        if masked:
+            # this lane's token past the last valid one: no residual / gate load, no store
+            e(f"  %es_ok{j} = index.cmp ult, %es_tk{j}, %tokens : index")
+            e(f"  scf.if %es_ok{j} {{")
+        for q in range(4):
+            e(f"  %es_ri{j}_{q} = index.add %es_rd, %es_q{j}_{q}c : index")
+            e(f"  %es_v{j}_{q} = vector.load %es_flat[%es_ri{j}_{q}] : view<{(TM + EPAD) * 16}xf32> -> vector<4xf32>")
+            val = f"%es_v{j}_{q}"
+            if kr:
+                e(f"  %es_rf{j}_{q} = vector.load %res_flat[%es_oi{j}_{q}] : view<[%out_total]xf32> -> vector<4xf32>")
+                e(f"  %es_rs{j}_{q} = vector.addf %es_rf{j}_{q}, %es_v{j}_{q} : vector<4xf32>")
+                val = f"%es_rs{j}_{q}"
+            if sw:
                 hs = []
                 for x in range(4):
                     y = f"{j}_{q}_{x}"

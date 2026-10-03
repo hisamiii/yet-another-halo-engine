@@ -84,6 +84,10 @@ def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
 
 
 MODEL = None  # set by main(): tiles() reads this model's table
+# Decode-free GEMMs (decode_free): off by default (YAH_DECODE_FREE=1): +12% pp2048 as built (2026-10-03): the f16 swiglu
+# epilogue streams its gate in bursts, the K=17408 down projection is memory-bound in f16, and the dequant pass costs
+# ~25% of a GEMM. kstore / kqg alone are -9% (standalone, bit-identical).
+DECODE_FREE = os.environ.get("YAH_DECODE_FREE", "0") == "1"
 
 
 @functools.cache
@@ -200,6 +204,34 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
 TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "q3k", "q8_0")
 
 
+def decode_free(fmt, mt, kb, B, kind, outdir, done):
+    """Decode-free GEMMs: "dq_<fmt>_<mt>_<kb>.hal" decodes the weights to f16 [rows][K] once per chunk (the tile GEMM's own
+    decode, so the same f16 values), "gemm_<kind>_f16_<mt>_<kb>.hal" multiplies them without decode. Shared per shape.
+    The driver dequantizes GEMM k+1's weights beside GEMM k. Returns the new dispatch.txt rows."""
+    import gen_gemm_tile as TG
+    if fmt not in TILE_FMTS or mt < 4:
+        return []
+    rows = []
+    kblk = kb // TG.G.FMTS[fmt].get("kdiv", 1)   # 256-wide blocks (q8_0 counts 32-wide ones)
+    dq = "dq_%s_%d_%d.hal" % (fmt, mt, kb)
+    if dq not in done:
+        t = TG.default_tile(fmt, "kstore", kb)
+        t = dataclasses.replace(t, decahead=False, ksub=64, dbuf=False)
+        if mt % t.rowgrp == 0 and kblk % TG.DQ_BLOCKS == 0:
+            r = _emit_gen(lambda f, k: TG.gen(f, "dequant", t), t.bn, fmt, mt, kb, B, dq, outdir, "dequant", t.rowgrp)
+            if r:
+                rows.append((dq, 0, t.rowgrp, kblk // TG.DQ_BLOCKS))
+                done.add(dq)
+    gf = "gemm_%s_f16_%d_%d.hal" % (kind, mt, kblk)
+    if dq in done and gf not in done:
+        t = TG.default_tile("f16", kind, kblk)
+        r = _emit_gen(lambda f, k: TG.gen("f16", k, t), t.bn, "f16", mt, kblk, B, gf, outdir, kind, t.rowgrp)
+        if r:
+            rows.append(r)
+            done.add(gf)
+    return rows
+
+
 def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     """Emit the tile GEMM (tools/gen_gemm_tile.py) for this shape if it covers it; return its dispatch.txt row, else None.
     geom=(BM, BN, WM, WN) overrides the workgroup geometry for this one kernel."""
@@ -226,6 +258,8 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     with open(src, "w") as fh:
         fh.write(gen(fmt, kind))
     sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg"}.get(kind, ""))
+    if kind == "dequant":
+        sym = "yah_dequant_" + fmt
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     import subprocess
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
@@ -289,6 +323,7 @@ def main():
     combos = gemm_combos(rows)
 
     n = 0
+    df_done = set()
     geom = []  # (<hal>, <tokens per workgroup>, <row groups>, <token_tiles>)
     for kind, fmt, port, mt, kb in sorted(combos):
         name = lambda k: "gemm_%s_%s_%d_%d.hal" % (k, fmt, mt, kb)
@@ -301,6 +336,8 @@ def main():
                 geom.append(r)
                 if T > B:  # chunked sets: their last chunk may be short; a one-pass set always runs all B tokens
                     geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k))
+                if DECODE_FREE:
+                    geom.extend(decode_free(fmt, mt, kb, B, k, outdir, df_done))
             elif k == "kstore" and fmt == "q2k":
                 # Q2_K has no tile decoder; its only tensors here are the 48-row ssm_alpha / ssm_beta.
                 sym = E.sym_of("yah_ffn_gemm_q2k_f32.loom")

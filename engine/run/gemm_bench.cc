@@ -3,7 +3,7 @@
 // usage: gemm_bench <model.gguf> <table dir> <job file>
 //
 // Each job line: <hal> <export> <tensors> <fmt> <kind> <row groups> <tokens per workgroup> <tokens> <reps> <roles>
-//   tensors: comma separated, same shape; the dispatches rotate through them like the layers of a forward pass, so the
+//   tensors: comma separated, same shape (or file:<path>:<rows>, raw weight bytes); the dispatches rotate through them like the layers of a forward pass, so the
 //   weights stream from DRAM as in the pipeline instead of staying in the last-level cache.
 //   roles: the kernel's bindings in order, comma separated (weight, grid, ksigns, input, gate, resid, wstage, ostage,
 //   output, gate_out). The table dir holds grid_<fmt>.bin / ksigns_iq2xxs.bin (any prefill HAL set).
@@ -120,18 +120,26 @@ int main(int argc, char** argv) {
     std::string weight_names;
     for (std::size_t i = 0; i < jobs.size(); ++i) {
       const Job& j = jobs[i];
+      // "file:<path>:<rows>": raw weight bytes from a file (e.g. pre-dequantized f16), instead of GGUF tensors
+      std::vector<std::uint8_t> file_w;
+      std::uint32_t m_rows = 0;
       std::vector<const yah::core::TensorInfo*> ts;
-      for (std::size_t a = 0, b; a <= j.tensor.size(); a = b + 1) {
-        b = j.tensor.find(',', a);
-        if (b == std::string::npos) b = j.tensor.size();
-        const auto* t = gguf.Find(j.tensor.substr(a, b - a));
-        if (!t || t->dims.size() < 2) throw LoomError("tensor not found: " + j.tensor.substr(a, b - a));
-        ts.push_back(t);
+      if (j.tensor.rfind("file:", 0) == 0) {
+        const std::size_t c = j.tensor.rfind(':');
+        file_w = ReadFile(j.tensor.substr(5, c - 5));
+        m_rows = static_cast<std::uint32_t>(std::stoul(j.tensor.substr(c + 1)));
+      } else {
+        for (std::size_t a = 0, b; a <= j.tensor.size(); a = b + 1) {
+          b = j.tensor.find(',', a);
+          if (b == std::string::npos) b = j.tensor.size();
+          const auto* t = gguf.Find(j.tensor.substr(a, b - a));
+          if (!t || t->dims.size() < 2) throw LoomError("tensor not found: " + j.tensor.substr(a, b - a));
+          ts.push_back(t);
+        }
+        for (const auto* u : ts)
+          if (u->bytes != ts[0]->bytes || u->dims != ts[0]->dims) throw LoomError(j.hal + ": tensors of different shapes");
+        m_rows = static_cast<std::uint32_t>(ts[0]->dims[1]);
       }
-      const auto* t = ts[0];
-      for (const auto* u : ts)
-        if (u->bytes != t->bytes || u->dims != t->dims) throw LoomError(j.hal + ": tensors of different shapes");
-      const std::uint32_t m_rows = static_cast<std::uint32_t>(t->dims[1]);
       if (j.tokens == 0 || j.tokens > kChunk || m_rows % 16 || (m_rows / 16) % j.rowgrp)
         throw LoomError(j.hal + ": bad shape or token count");
       if (weight_names != j.tensor) {
@@ -139,6 +147,10 @@ int main(int argc, char** argv) {
         for (const auto* u : ts) {
           weights.push_back(gpu.Allocate(u->bytes));
           gpu.H2D(weights.back(), gguf.Data(*u), u->bytes);
+        }
+        if (!file_w.empty()) {
+          weights.push_back(gpu.Allocate(file_w.size()));
+          gpu.H2D(weights.back(), file_w.data(), file_w.size());
         }
         weight_names = j.tensor;
       }

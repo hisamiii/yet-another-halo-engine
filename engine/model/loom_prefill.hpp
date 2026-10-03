@@ -112,21 +112,14 @@ class LoomPrefill {
     graph.ReadOnly(weights_);
     for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
       graph.ReadOnly(t->handle);
+    if (!df_planned_) PlanDecodeFree(ci);
     graph_ = &graph;
     nodes_.clear();
     const bool calibrate = calib_ && calib_->BeginChunk(n_);
-    for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
-      const std::string pre = "blk." + std::to_string(l) + ".";
-      RunNorm(pre + "attn_norm.weight");
-      if (cfg_.IsFullAttention(l))
-        RunAttention(l, ci, pre, hook);
-      else
-        RunDeltaNet(l, pre);
-      RunNorm(pre + "post_attention_norm.weight");
-      RunKstore(pre + "ffn_gate.weight", *gateffn_);
-      RunSwiglu(pre + "ffn_up.weight");
-      RunResidual(pre + "ffn_down.weight", *ffnup_);
-    }
+    df_on_ = !df_plan_.empty() && n_ > kDfMinTokens;
+    df_k_ = 0;
+    if (df_on_) DispatchDequant(0);
+    RecordLayers(ci, hook);
     graph_ = nullptr;
     if (calibrate && !gpu_.profiling()) {
       try {
@@ -149,6 +142,22 @@ class LoomPrefill {
     int tag = -1;  // the calibration's tag (PrefillCalib::Choose)
   };
   [[nodiscard]] const std::vector<Node>& nodes() const { return nodes_; }
+
+  // The 64 layers of chunk ci, in dispatch order.
+  void RecordLayers(std::uint32_t ci, const KvHook& hook) {
+    for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
+      const std::string pre = "blk." + std::to_string(l) + ".";
+      RunNorm(pre + "attn_norm.weight");
+      if (cfg_.IsFullAttention(l))
+        RunAttention(l, ci, pre, hook);
+      else
+        RunDeltaNet(l, pre);
+      RunNorm(pre + "post_attention_norm.weight");
+      RunKstore(pre + "ffn_gate.weight", *gateffn_);
+      RunSwiglu(pre + "ffn_up.weight");
+      RunResidual(pre + "ffn_down.weight", *ffnup_);
+    }
+  }
 
   // Calibrate the GEMM variants while serving (model/prefill_calib.hpp), state in path. The caller runs Collect() after
   // the chunks of a prompt completed (Synchronize).
@@ -371,6 +380,7 @@ class LoomPrefill {
   void Dispatch(const LoomExecutable& exe, const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
                 std::uint32_t sx, std::uint32_t sy, std::uint32_t sz, const std::vector<hrx_buffer_ref_t>& b,
                 std::uint64_t writes = ~std::uint64_t{0}) {
+    if (df_planning_) return;
     const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
     const hrx_dispatch_config_t config = LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz);
@@ -596,16 +606,85 @@ class LoomPrefill {
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1,
              {Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_), Ref(*scratch_)});
   }
+  // Decode-free GEMMs (emit_prefill_pp.py decode_free): "dq_<fmt>_<mt>_<kb>.hal" decodes a GEMM's weights to f16 scratch
+  // once per chunk with the tile GEMM's own decode (the same f16 values), "gemm_<kind>_f16_<mt>_<kb>.hal" multiplies them
+  // without decode. The pass for the next GEMM is recorded right after each GEMM: no edge between them, so they share a
+  // graph segment and run together; the barrier before the GEMM's consumer drains both. Three scratch slots rotate, so a
+  // slot is rewritten only after the GEMM two before has drained. Chunks of at most kDfMinTokens real tokens keep the
+  // fused decode: one token tile decodes each weight once anyway.
+  static constexpr std::uint32_t kDfMinTokens = 512;
+  struct DfStep {
+    std::string dq, gemm;
+    const core::TensorInfo* t;
+    Fmt f;
+  };
+  std::vector<DfStep> df_plan_;
+  bool df_planned_ = false, df_planning_ = false, df_on_ = false;
+  std::size_t df_k_ = 0;
+  LoomBuffer* df_w_[3] = {nullptr, nullptr, nullptr};
+
+  // Records the GEMMs that have a decode-free path, in dispatch order (a dry run: Dispatch records nothing), and sizes
+  // the scratch for the largest.
+  void PlanDecodeFree(std::uint32_t ci) {
+    df_planned_ = true;
+    bool any = false;
+    for (const auto& [name, g] : geom_) any = any || name.rfind("dq_", 0) == 0;
+    if (!any) return;
+    LoomBuffer* h = hidden_;
+    LoomBuffer* h2 = hidden2_;
+    df_planning_ = true;
+    RecordLayers(ci, {});
+    df_planning_ = false;
+    hidden_ = h, hidden2_ = h2;
+    std::size_t most = 0;
+    for (const DfStep& s : df_plan_) most = std::max<std::size_t>(most, std::size_t{s.t->dims[1]} * s.t->dims[0] * 2);
+    for (auto& w : df_w_) w = &Alloc(most);
+  }
+  // The f16 GEMM to run for this call, or "" for the fused path. Planning: records the call.
+  std::string DfGemm(const char* kind, const core::TensorInfo& t, const Fmt& f) {
+    const std::uint32_t mt = MTiles(t);
+    const std::string dq = "dq_" + std::string(f.name) + "_" + std::to_string(mt) + "_" +
+                           std::to_string(t.dims[0] / f.qk) + ".hal";
+    const std::string gemm = "gemm_" + std::string(kind) + "_f16_" + std::to_string(mt) + "_" +
+                             std::to_string(t.dims[0] / 256) + ".hal";
+    if (!geom_.count(dq) || !geom_.count(gemm)) return "";
+    if (df_planning_) {
+      df_plan_.push_back({dq, gemm, &t, f});
+      return "";
+    }
+    if (!df_on_) return "";
+    if (df_k_ >= df_plan_.size() || df_plan_[df_k_].t != &t) throw LoomError("prefill: decode-free plan out of step");
+    return gemm;
+  }
+  // Decode plan step k's weights into its scratch slot.
+  void DispatchDequant(std::size_t k) {
+    const DfStep& s = df_plan_[k];
+    const Geom g = geom_.at(s.dq);  // row group, K-block groups (no token tiles: GeomOf does not apply)
+    auto b = GemmWeights(*s.t, s.f);
+    b.push_back(Ref(*df_w_[k % 3]));
+    Dispatch(Exe(s.dq), ("yah_dequant_" + std::string(s.f.name)).c_str(), MTiles(*s.t) / g.rowgrp, g.tt, 1, 256, 1, 1,
+             b, std::uint64_t{1} << (b.size() - 1));
+  }
+  // The weight binding of the current decode-free GEMM.
+  std::vector<hrx_buffer_ref_t> DfWeights() const { return {Ref(*df_w_[df_k_ % 3])}; }
+  // After a decode-free GEMM: the next one's weights, recorded beside it.
+  void DfNext() {
+    if (++df_k_ < df_plan_.size()) DispatchDequant(df_k_);
+  }
+
   void RunKstore(const std::string& wname, const LoomBuffer& out) {
     const auto* t = Find(wname);
     Fmt f{};
-    const std::string hal = PickGemm(GemmHal("gemm_kstore", *t, &f));
+    const std::string base = GemmHal("gemm_kstore", *t, &f);
+    const std::string df = DfGemm("kstore", *t, f);
+    const std::string hal = df.empty() ? PickGemm(base) : df;
     const Geom g = GeomOf(hal);
-    auto b = GemmWeights(*t, f);
+    auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_}) b.push_back(Ref(*x));
     b.push_back(Ref(out));
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32,
-             1, 1, b, GemmWrites(b, f, {&out}));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16")).c_str(), MTiles(*t) / g.rowgrp,
+             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {&out}));
+    if (!df.empty()) DfNext();
   }
   // The attention q projection with the q / gate unpack fused in (rows = heads x [256 q | 256 gate]).
   // Returns false if the set has no such HAL; the caller then runs kstore + yah_unpack_qg.
@@ -615,23 +694,28 @@ class LoomPrefill {
     if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) return false;
     std::string hal = GemmHal("gemm_kqg", *t, &f);
     if (!geom_.count(hal)) return false;
-    hal = PickGemm(hal);
+    const std::string df = DfGemm("kqg", *t, f);
+    hal = df.empty() ? PickGemm(hal) : df;
     const Geom g = GeomOf(hal);
-    auto b = GemmWeights(*t, f);
+    auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, q_, gate_}) b.push_back(Ref(*x));
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_kqg").c_str(), MTiles(*t) / g.rowgrp,
-             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {q_, gate_}));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16") + "_kqg").c_str(),
+             MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {q_, gate_}));
+    if (!df.empty()) DfNext();
     return true;
   }
   void RunSwiglu(const std::string& wname) {
     const auto* t = Find(wname);
     Fmt f{};
-    const std::string hal = PickGemm(GemmHal("gemm_swiglu", *t, &f));
+    const std::string base = GemmHal("gemm_swiglu", *t, &f);
+    const std::string df = DfGemm("swiglu", *t, f);
+    const std::string hal = df.empty() ? PickGemm(base) : df;
     const Geom g = GeomOf(hal);
-    auto b = GemmWeights(*t, f);
+    auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, gateffn_, uwstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(), MTiles(*t) / g.rowgrp,
-             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16") + "_swiglu").c_str(),
+             MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    if (!df.empty()) DfNext();
   }
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
@@ -640,21 +724,26 @@ class LoomPrefill {
     Fmt f{};
     const std::string fused0 = GemmHal("gemm_kres", *t, &f);
     if (geom_.count(fused0)) {
-      const std::string fused = PickGemm(fused0);
+      const std::string df = DfGemm("kres", *t, f);
+      const std::string fused = df.empty() ? PickGemm(fused0) : df;
       const Geom g = GeomOf(fused);
-      auto b = GemmWeights(*t, f);
+      auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, hidden_, wstage_, ostage_, hidden2_}) b.push_back(Ref(*x));
-      Dispatch(Exe(fused), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(), MTiles(*t) / g.rowgrp,
-               TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+      Dispatch(Exe(fused), (std::string("yah_ffn_gemm_") + (df.empty() ? f.name : "f16") + "_kres").c_str(),
+               MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+      if (!df.empty()) DfNext();
       std::swap(hidden_, hidden2_);
       return;
     }
-    const std::string hal = PickGemm(GemmHal("gemm_kstore", *t, &f));
+    const std::string base = GemmHal("gemm_kstore", *t, &f);
+    const std::string df = DfGemm("kstore", *t, f);
+    const std::string hal = df.empty() ? PickGemm(base) : df;
     const Geom g = GeomOf(hal);
-    auto b = GemmWeights(*t, f);
+    auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_, partial_}) b.push_back(Ref(*x));
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32,
-             1, 1, b, GemmWrites(b, f, {partial_}));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16")).c_str(), MTiles(*t) / g.rowgrp,
+             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {partial_}));
+    if (!df.empty()) DfNext();
     const std::size_t n = std::size_t{B_} * kHidden;
     Dispatch(Exe("accum.hal"), "yah_residual_1d", static_cast<std::uint32_t>(n / 256), 1, 1, 256, 1, 1,
              {Ref(*hidden_), {partial_->handle, 0, n * 4}, Ref(*hidden2_)});

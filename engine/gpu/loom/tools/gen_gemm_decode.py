@@ -965,6 +965,42 @@ def q8_0_compute(v, gb):
     return L
 
 
+def f16_loads(p, blk, gb):
+    """Pre-dequantized f16 weights (probe for decode-free GEMMs): a 256-element block is 512 B; group g is 32 halves at 64g."""
+    L = []
+    e = L.append
+    vals = []
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}g64_{u} = scalar.muli %{p}g{u}, %c64i : i32")
+        e(f"    %{p}bo{u} = scalar.addi {blk}, %{p}g64_{u} : i32")
+        e(f"    %{p}hb{u} = scalar.shrui %{p}bo{u}, %c1i : i32")
+        e(f"    %{p}hx{u} = index.cast %{p}hb{u} : i32 to index")
+        e(f"    %{p}hl{u} = index.max %{p}hx{u}, %c0 : index")
+        e(f"    %{p}hlim{u} = index.sub %w_halfs, %c32 : index")
+        e(f"    %{p}ha{u} = index.min %{p}hl{u}, %{p}hlim{u} : index")
+        e(f"    %{p}hb16_{u} = index.add %{p}ha{u}, %c16 : index")
+        e(f"    %{p}fa{u} = vector.load %w_f16_view[%{p}ha{u}] : view<[%w_halfs]xf16> -> vector<16xf16>")
+        e(f"    %{p}fb{u} = vector.load %w_f16_view[%{p}hb16_{u}] : view<[%w_halfs]xf16> -> vector<16xf16>")
+        vals += [(f"%{p}fa{u}", "vector<16xf16>"), (f"%{p}fb{u}", "vector<16xf16>")]
+    return L, vals
+
+
+def f16_compute(v, gb):
+    """f16 weights: copy into the LDS weight tile (no decode)."""
+    L = []
+    e = L.append
+    it = iter(v)
+    for u in range(GPL):
+        fa = next(it); fb = next(it)
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        _col_of(e, u)
+        e(f"    %colh{u} = index.add %col{u}, %c16 : index")
+        e(f"    vector.store {fa}, %wl_view[%drow, %col{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+        e(f"    vector.store {fb}, %wl_view[%drow, %colh{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+    return L
+
+
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
     L += ["  %c15b_iq = scalar.constant 15 : i8", "  %c4b_iq = scalar.constant 4 : i8",
@@ -1145,6 +1181,8 @@ FMTS = {
                                           lambda v, g: q4k_compute(v, g, q5=True)),
                 extra=[], setup=q4k_setup),
     "q8_0": dict(bb=272, kdiv=8, ksub=64, decode=(q8_0_loads, q8_0_compute), extra=[], setup=lambda: []),
+    # probe only: pre-dequantized f16 weights, decode-free
+    "f16": dict(bb=512, ksub=64, decode=(f16_loads, f16_compute), extra=[], setup=lambda: []),
     "q6k": dict(bb=210, ksub=64, decode=(q6k_loads, q6k_compute), extra=[], setup=q6k_setup),
     "q3k": dict(bb=110, ksub=64, decode=(q3k_loads, q3k_compute), extra=[], setup=q3k_setup),
     "iq2xxs": dict(bb=66, ksub=64, decode=(iq2xxs_loads, iq2xxs_compute), extra=["grid", "ksigns"], setup=iq2xxs_setup),
