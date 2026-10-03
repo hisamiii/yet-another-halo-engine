@@ -490,10 +490,26 @@ class LoomPrefill {
   // The GEMM variant for this chunk's real tokens: the set may carry "<hal>.t128.hal" / ".t64.hal" with narrower token
   // tiles. Pick the least (padded token rows x cost per row); a narrow tile pads less but costs more per row (measured:
   // x1.12 at 128 tokens, x1.6 at 64). Every variant computes the same values.
+  // A tuned set (engine/tune) carries the measured choice instead: "pick:<hal>:<max tokens>" rows map a token bucket to
+  // the token tile to use; chunks above the largest bucket take the full tile.
   std::string PickGemm(const std::string& hal) const {
+    const std::string stem = hal.substr(0, hal.size() - 4);
+    const std::string prefix = "pick:" + hal + ":";
+    bool tuned = false;
+    std::uint32_t bucket = ~0u, bn = 0;
+    for (auto it = geom_.lower_bound(prefix); it != geom_.end() && it->first.compare(0, prefix.size(), prefix) == 0;
+         ++it) {
+      tuned = true;
+      if (it->second.tokens >= n_ && it->second.tokens < bucket) bucket = it->second.tokens, bn = it->second.rowgrp;
+    }
+    if (tuned) {
+      const auto full = geom_.find(hal);
+      if (bn == 0 || (full != geom_.end() && bn == full->second.tokens)) return hal;
+      const std::string v = stem + ".t" + std::to_string(bn) + ".hal";
+      return geom_.count(v) ? v : hal;
+    }
     std::string best = hal;
     double best_cost = 1e30;
-    const std::string stem = hal.substr(0, hal.size() - 4);
     for (const std::string& h : {hal, stem + ".t128.hal", stem + ".t64.hal"}) {
       const auto it = geom_.find(h);
       if (it == geom_.end()) continue;

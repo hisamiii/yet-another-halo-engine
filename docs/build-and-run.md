@@ -34,6 +34,14 @@ It builds `libyah_core`, the core tools (`yah-tokenize`, `yah-dump`, `yah-weight
 
 `engine/build_loomhip.sh` builds `engine/build/loomhip` (needs hipcc), which runs one Loom hsaco through HIP for rocprofv3.
 
+## Autotune
+
+```
+engine/tune/tune.py <model.gguf>        # ~7 min; writes engine/tune/tables/<model>.json
+```
+
+It tunes every tile GEMM the driver runs (42 for this model) at five token counts (64, 128, 256, 512, 2048): it enumerates the legal tiles (token tile, waves along tokens, KSUB, decode-ahead), compiles them in parallel through the emitter (footprint gate included, spilling tiles dropped), measures clock-free cycles on the model's real weights with `engine/build/gemm_bench` (rotating through each shape's tensors so weights stream from DRAM as in the pipeline), then re-measures the best few (successive halving). Every candidate's output must hash the same as the default tile's. The table holds the full-chunk tile per GEMM, up to two narrower variants and the measured best variant per token bucket. The emitters use the model's table automatically (`YAH_TILES=<file>` picks another, `YAH_TILES=` none); `LoomPrefill::PickGemm` follows its per-bucket picks. Tuning changes no result bits: re-emit, then check the GPU references.
+
 ## Emit HAL sets
 
 Emitters run on the CPU and take a few minutes. Paths below are relative to `engine/gpu/loom`.

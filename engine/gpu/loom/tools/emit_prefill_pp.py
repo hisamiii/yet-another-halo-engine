@@ -83,11 +83,20 @@ def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
     return r
 
 
+MODEL = None  # set by main(): tiles() reads this model's table
+
+
 @functools.cache
 def tiles():
-    """YAH_TILES=<file.json>: per-GEMM Tile overrides from a tuner, {"gemm_kstore_iq3s_1088_20": {"bn": 512, ...}}."""
-    path = os.environ.get("YAH_TILES")
-    return json.load(open(path)) if path else {}
+    """The autotuner's table for MODEL (tune_table.py: YAH_TILES or engine/tune/tables/<model>.json):
+    {"tiles": {hal: knobs}, "variants": {hal: [knobs incl. "bn", ...]}, "pick": {hal: {max tokens: bn}},
+     "norm": {...}, "rw": {...}}. A flat {hal: knobs, ...} file is read as its "tiles"."""
+    import tune_table
+    t = tune_table.load(MODEL) if MODEL else {}
+    if "tiles" not in t:
+        t = {"tiles": {k: v for k, v in t.items() if k.startswith("gemm_")},
+             **{k: v for k, v in t.items() if not k.startswith("gemm_")}}
+    return t
 
 
 # Narrower token tiles for chunks with few real tokens; the driver picks one per chunk (LoomPrefill::PickGemm).
@@ -97,24 +106,30 @@ NARROW = ((128, 2), (64, 2))
 
 
 def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
-    """Emit "<hal>.t<BN>.hal" for each NARROW token tile the default tile of this GEMM allows; return their rows."""
+    """Emit "<hal>.t<BN>.hal" for each narrow token tile of this GEMM (the tuner's "variants", else NARROW on the
+    default tile), plus the tuner's per-bucket choices as "pick:<hal>:<max tokens> <max tokens> <bn> 0" rows."""
     import gen_gemm_tile as TG
     if fmt not in TILE_FMTS or mt < 4:
         return []
     base, rows = TG.default_tile(fmt, kind, kb), []
-    for bn, wn in NARROW:
-        t = dataclasses.replace(base, bn=bn, wn=wn)
+    full = dataclasses.replace(base, **tiles()["tiles"].get(out[:-4], {}))
+    tuned = tiles().get("variants", {}).get(out[:-4])
+    for knobs in (tuned if tuned is not None else [{"bn": bn, "wn": wn} for bn, wn in NARROW]):
+        t = dataclasses.replace(base, **knobs)
+        bn = t.bn
         try:
             TG.check(t)
         except ValueError:
             continue
-        if bn >= base.bn or mt % t.rowgrp:
+        if bn >= full.bn or mt % t.rowgrp:
             continue
         masked = B % bn != 0
         r = _emit_gen(lambda f, k: TG.gen(f, k, t, masked), bn, fmt, mt, kb, B, out[:-4] + ".t%d.hal" % bn, outdir, kind,
                       t.rowgrp, masked)
         if r:
             rows.append(r)
+    for maxtok, bn in sorted(tiles().get("pick", {}).get(out[:-4], {}).items(), key=lambda kv: int(kv[0])):
+        rows.append(("pick:%s:%s" % (out, maxtok), int(maxtok), int(bn), 0))
     return rows
 
 
@@ -129,8 +144,8 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     if fmt not in TILE_FMTS:
         return None
     t = TG.default_tile(fmt, kind, kb, geom)
-    if not geom and out[:-4] in tiles():
-        t = dataclasses.replace(t, **tiles()[out[:-4]])
+    if not geom and out[:-4] in tiles()["tiles"]:
+        t = dataclasses.replace(t, **tiles()["tiles"][out[:-4]])
     if mt % t.rowgrp:
         return None
     # a token tile that does not divide the chunk: the last tile is masked (gen_gemm_tile.gen masked=)
@@ -189,7 +204,9 @@ def gemm_kinds(kind, mt):
 
 
 def main():
+    global MODEL
     model, outdir = sys.argv[1], sys.argv[2]
+    MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
     # GEMM tokens per workgroup of the hand-written sources
     TILE = 64

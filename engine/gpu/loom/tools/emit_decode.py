@@ -36,10 +36,8 @@ import gen_kvq  # noqa: E402
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
 # rows per wave R and waves per workgroup W per GEMV kind; recorded in decode.txt ("rw kind R W")
 RW = {k: (2, 4) for k in ("plain", "resid", "swiglu", "bands")}
-# YAH_TILES=<file.json> (the tuner's table, as for emit_prefill_pp.py) may override them: {"rw": {"bands": [4, 4], ...}}.
-# Every row is still reduced over the 32 lanes of one wave, so R and W change no result bits.
-if os.environ.get("YAH_TILES"):
-    RW.update({k: tuple(v) for k, v in json.load(open(os.environ["YAH_TILES"])).get("rw", {}).items()})
+# The tuner's table (tune_table.py) may override them: {"rw": {"bands": [4, 4], ...}}. Every row is still reduced over
+# the 32 lanes of one wave, so R and W change no result bits.
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):
@@ -131,6 +129,8 @@ def gemv_set(model):
 
 def main():
     model, outdir = sys.argv[1], sys.argv[2]
+    import tune_table
+    RW.update({k: tuple(v) for k, v in tune_table.load(model).get("rw", {}).items()})
     T = int(sys.argv[3]) if len(sys.argv) > 3 else 4096
     if T % 256:
         raise SystemExit("max_context must be a multiple of 256")

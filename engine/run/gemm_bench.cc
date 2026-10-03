@@ -2,15 +2,17 @@
 //
 // usage: gemm_bench <model.gguf> <table dir> <job file>
 //
-// Each job line: <hal> <export> <tensor> <fmt> <kind> <row groups> <tokens per workgroup> <tokens> <reps> <roles>
+// Each job line: <hal> <export> <tensors> <fmt> <kind> <row groups> <tokens per workgroup> <tokens> <reps> <roles>
+//   tensors: comma separated, same shape; the dispatches rotate through them like the layers of a forward pass, so the
+//   weights stream from DRAM as in the pipeline instead of staying in the last-level cache.
 //   roles: the kernel's bindings in order, comma separated (weight, grid, ksigns, input, gate, resid, wstage, ostage,
 //   output, gate_out). The table dir holds grid_<fmt>.bin / ksigns_iq2xxs.bin (any prefill HAL set).
 // Every binding is at least as large as loom_forward_pp's largest use of it (chunk 2048), so a HAL that passed the
 // emitter's footprint gate is in bounds here too. The grid is (m_tiles / row groups, ceil(tokens / tile)): a subset of
 // the compiled grid whenever tokens <= the chunk.
 // Per job it prints "job <i> wall_ms <ms per rep> hash <h>": h hashes the output of the real token rows only (variants
-// pad differently), after 2 warmup dispatches. Run under HRX_PROFILE_MODE=counters for clock-free cycles: the
-// dispatches appear in job order, 2 warmups + reps per job.
+// pad differently) of one dispatch on the first tensor. Run under HRX_PROFILE_MODE=counters for clock-free cycles: the
+// dispatches appear in job order, 2 warmups + 1 hashed + reps per job.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -114,15 +116,32 @@ int main(int argc, char** argv) {
       if (k.size() != 128) throw LoomError("ksigns_iq2xxs.bin is not 128 bytes");
       gpu.H2D(ksigns, k.data(), 128);
     }
+    std::vector<LoomBuffer> weights;  // the current job's tensors; consecutive jobs of one kernel reuse them
+    std::string weight_names;
     for (std::size_t i = 0; i < jobs.size(); ++i) {
       const Job& j = jobs[i];
-      const auto* t = gguf.Find(j.tensor);
-      if (!t || t->dims.size() < 2) throw LoomError("tensor not found: " + j.tensor);
+      std::vector<const yah::core::TensorInfo*> ts;
+      for (std::size_t a = 0, b; a <= j.tensor.size(); a = b + 1) {
+        b = j.tensor.find(',', a);
+        if (b == std::string::npos) b = j.tensor.size();
+        const auto* t = gguf.Find(j.tensor.substr(a, b - a));
+        if (!t || t->dims.size() < 2) throw LoomError("tensor not found: " + j.tensor.substr(a, b - a));
+        ts.push_back(t);
+      }
+      const auto* t = ts[0];
+      for (const auto* u : ts)
+        if (u->bytes != t->bytes || u->dims != t->dims) throw LoomError(j.hal + ": tensors of different shapes");
       const std::uint32_t m_rows = static_cast<std::uint32_t>(t->dims[1]);
       if (j.tokens == 0 || j.tokens > kChunk || m_rows % 16 || (m_rows / 16) % j.rowgrp)
         throw LoomError(j.hal + ": bad shape or token count");
-      LoomBuffer weight = gpu.Allocate(t->bytes);
-      gpu.H2D(weight, gguf.Data(*t), t->bytes);
+      if (weight_names != j.tensor) {
+        weights.clear();
+        for (const auto* u : ts) {
+          weights.push_back(gpu.Allocate(u->bytes));
+          gpu.H2D(weights.back(), gguf.Data(*u), u->bytes);
+        }
+        weight_names = j.tensor;
+      }
       LoomBuffer grid;
       const bool needs_grid = j.fmt == "iq3s" || j.fmt == "iq3xxs" || j.fmt == "iq2xxs" || j.fmt == "iq2xs";
       if (needs_grid) {
@@ -132,7 +151,7 @@ int main(int argc, char** argv) {
       }
       std::vector<hrx_buffer_ref_t> b;
       for (const std::string& r : j.roles) {
-        const LoomBuffer* x = r == "weight"    ? &weight
+        const LoomBuffer* x = r == "weight"    ? &weights[0]
                               : r == "grid"    ? (needs_grid ? &grid : nullptr)
                               : r == "ksigns"  ? &ksigns
                               : r == "input"   ? &input
@@ -151,9 +170,18 @@ int main(int argc, char** argv) {
       const std::uint32_t ws = exe.WorkgroupSize(ord);
       if (!ws) throw LoomError(j.hal + ": no workgroup size in the export metadata");
       const auto cfg = LoomDevice::Config(m_rows / 16 / j.rowgrp, (j.tokens + j.tile - 1) / j.tile, 1, ws, 1, 1);
+      // binding 0..: the role "weight" is rebound to each tensor in turn
+      std::size_t wslot = 0;
+      while (wslot < j.roles.size() && j.roles[wslot] != "weight") ++wslot;
+      if (wslot == j.roles.size()) throw LoomError(j.hal + ": no weight binding");
+      auto with_weight = [&](std::size_t r) {
+        b[wslot] = {weights[r % weights.size()].handle, 0, weights[r % weights.size()].size};
+        return b.data();
+      };
+      for (int w = 0; w < 2; ++w) gpu.Dispatch(exe, ord, cfg, nullptr, 0, with_weight(w + 1), b.size());
       gpu.Fill(output, 0);
       gpu.Fill(gate_out, 0);
-      for (int w = 0; w < 2; ++w) gpu.Dispatch(exe, ord, cfg, nullptr, 0, b.data(), b.size());
+      gpu.Dispatch(exe, ord, cfg, nullptr, 0, with_weight(0), b.size());
       gpu.Synchronize();
       // The real token rows of the outputs: [token][rows], f16 for swiglu, q and gate halves for kqg.
       const std::size_t row_bytes = j.kind == "swiglu" ? std::size_t{m_rows} * 2
@@ -167,7 +195,7 @@ int main(int argc, char** argv) {
         h = Hash(host, h);
       }
       const auto t0 = std::chrono::steady_clock::now();
-      for (std::uint32_t r = 0; r < j.reps; ++r) gpu.Dispatch(exe, ord, cfg, nullptr, 0, b.data(), b.size());
+      for (std::uint32_t r = 0; r < j.reps; ++r) gpu.Dispatch(exe, ord, cfg, nullptr, 0, with_weight(r + 1), b.size());
       gpu.Synchronize();
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       std::printf("job %zu wall_ms %.4f hash %016llx\n", i, j.reps ? ms / j.reps : 0.0,

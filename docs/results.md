@@ -103,6 +103,7 @@ One line each: what, the measured effect, when the set was current. Prefill numb
 
 Prefill:
 
+- Autotuned GEMM tiles (`engine/tune/tune.py`, 1680 candidates, 7426 measurements, 7 minutes): prefill cycles -0.13% (GEMM -0.18%; the tuner predicted -0.21%), bit-identical. The full-chunk defaults were already best for the large GEMMs; the wins are the small 1024-row GEMMs (Q4_K -35%, IQ4_XS -33%, Q6_K -13%), IQ2_XXS (-4.6% / -2.8%), IQ4_XS kqg and Q8_0. A first run with the weights resident in the last-level cache chose decode-ahead off for IQ4_XS (-8.5% in the bench, 0% in the pipeline); the bench now streams weights like the pipeline. Wall-time rounds vary about 3% with the starting temperature (2952 ms from 42 C, 3030 ms from 47 C).
 - Narrow GEMM token tiles for short chunks (chunked sets carry 128- and 64-token variants; the driver picks per chunk by padded rows x cost per row): 18 tokens 595 -> 404 ms, 100 tokens ~595 -> 456 ms, 300 tokens 909 -> 801 ms; 1000+ tokens unchanged; logits identical. Through `yah_server` an 18-token prompt prefills in 415 ms (was 607-630).
 - `yah_half_norm` with 4 rows (waves) per workgroup instead of 1: 46.1 -> 41.9 ms per pp2048 (-3.5% of its cycles); bit-identical.
 - HRX pin moved to a02a5ab94 plus the f16 WMMA operand placement (patch 0005; upstream enables #1160 for bf16 only): GEMM cycles -3.2%, prefill cycles -2.8%, pp2048 3047 -> 3000.5 ms; bit-identical. Decode 61.1 -> 60.8 ms (noise).

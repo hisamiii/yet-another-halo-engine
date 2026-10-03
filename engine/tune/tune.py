@@ -52,7 +52,7 @@ class Kernel:
     kind: str         # kstore / kres / kqg / swiglu
     mt: int
     kb: int
-    tensor: str       # a tensor of this shape (real weights for the bench)
+    tensors: list     # this shape's tensors: the bench rotates through up to 6 (as the layers do), so weights come from DRAM
     uses: int         # tensors running this HAL per pass
 
     @property
@@ -70,7 +70,7 @@ def inventory(model):
         if fmt not in EP.TILE_FMTS or mt < 4:
             continue
         k = EP.gemm_kinds(kind, mt)[-1]  # the one the driver runs
-        out.append(Kernel("gemm_%s_%s_%d_%d" % (k, fmt, mt, kb), fmt, k, mt, kb, names[0], len(names)))
+        out.append(Kernel("gemm_%s_%s_%d_%d" % (k, fmt, mt, kb), fmt, k, mt, kb, names, len(names)))
     return out
 
 
@@ -140,7 +140,8 @@ def bench(model, table_dir, jobs, work, tag):
     jf = os.path.join(work, tag + ".jobs")
     with open(jf, "w") as f:
         for k, t, hal, roles, n, reps in jobs:
-            f.write("%s %s %s %s %s %d %d %d %d %s\n" % (hal, k.export, k.tensor, k.fmt, k.kind, t.rowgrp, t.bn, n, reps,
+            f.write("%s %s %s %s %s %d %d %d %d %s\n" % (hal, k.export, ",".join(k.tensors[:6]), k.fmt, k.kind, t.rowgrp, t.bn,
+                                                          n, reps,
                                                           ",".join(roles)))
     env = hrx_paths.env()
     counters = os.path.isdir(AQL)
@@ -180,8 +181,8 @@ def bench(model, table_dir, jobs, work, tag):
     os.remove(prof)
     out, i = [], 0
     for (k, t, hal, roles, n, reps), h in zip(jobs, hashes):
-        mine = ev[i + 2:i + 2 + reps]  # after the 2 warmups
-        i += 2 + reps
+        mine = ev[i + 3:i + 3 + reps]  # after the 2 warmups and the hashed dispatch
+        i += 3 + reps
         out.append((statistics.median(cyc.get(d["event_id"], 0.0) for d in mine) if mine else float("inf"), h))
     if i != len(ev):
         raise SystemExit("profile has %d GEMM dispatches, expected %d (%s)" % (len(ev), i, tag))
@@ -191,12 +192,15 @@ def bench(model, table_dir, jobs, work, tag):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model")
-    ap.add_argument("--out", default="tiles.json")
+    ap.add_argument("--out", default="", help="default: engine/tune/tables/<model>.json, which the emitters then use")
     ap.add_argument("--kernels", default="", help="regex over HAL names (default: all)")
     ap.add_argument("--top", type=int, default=4, help="candidates per kernel and bucket kept for the second round")
     ap.add_argument("--keep", default="", help="keep candidate HALs here instead of a temporary directory")
     a = ap.parse_args()
 
+    if not a.out:
+        os.makedirs(os.path.join(ROOT, "engine/tune/tables"), exist_ok=True)
+        a.out = os.path.join(ROOT, "engine/tune/tables", os.path.splitext(os.path.basename(a.model))[0] + ".json")
     kernels = [k for k in inventory(a.model) if re.search(a.kernels, k.hal)]
     kernels.sort(key=lambda k: -k.weight)
     total = sum(k.weight for k in kernels)
@@ -272,9 +276,9 @@ def main():
         gain += k.weight / total * (1 - best[CHUNK][0] / base_cyc)
         # narrow variants: the best tiles of the small buckets that are narrower than the full-chunk tile
         variants = []
-        for b in BUCKETS[:-1]:
+        for b in BUCKETS[:-1]:  # smallest bucket first: it decides a token tile's variant when two share it
             t = todo[best[b][1]][1]
-            if t.bn < full.bn and t not in variants:
+            if t.bn < full.bn and t.bn not in [v.bn for v in variants]:
                 variants.append(t)
         variants = sorted(variants, key=lambda t: t.bn)[:2]
         if variants:
