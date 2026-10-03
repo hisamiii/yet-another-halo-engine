@@ -701,11 +701,14 @@ class LoomPrefill {
   }
 
   void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow) {
-    // One wave per row; a workgroup of w waves takes w rows.
+    // A row takes `split` waves (dispatch.txt norm_split, else 1); a workgroup of w waves takes w / split rows.
     const LoomExecutable& exe =
         Exe(mode == NormOut::kTiled ? "norm_t.hal" : mode == NormOut::kBoth ? "norm_rt.hal" : "norm.hal");
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
-    const std::uint32_t rows_per_wg = ws ? ws / 32 : 1;
+    const auto ns = geom_.find("norm_split");
+    const std::uint32_t split = ns != geom_.end() && ns->second.rowgrp ? ns->second.rowgrp : 1;
+    const std::uint32_t rows_per_wg = ws ? ws / 32 / split : 1;
+    if (!rows_per_wg || (ws && ws % (32 * split))) throw LoomError("norm.hal: workgroup size does not match norm_split");
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1,
              mode == NormOut::kBoth

@@ -144,6 +144,9 @@ def conv_n16(text):
     return text
 
 
+NORM_SPLIT = 2
+
+
 def qk_of(fmt):
     return next(qk for f, _, qk in E.FMT.values() if f == fmt)
 
@@ -639,6 +642,9 @@ def main():
     if NCH > 1:
         # quantized KV: K quantizers run per chunk on cache slices (kmean on chunk 0 only), V quantizers per chunk (vq*_c<i>.hal)
         geom.append(("ctx", B, 0, T))     # chunk size, total context
+    # Each row over NORM_SPLIT waves (gen_half_norm.gen_split: the same per-lane chain order, so the same bits):
+    # 0.383 -> 0.299 ms per call at 2048 rows (latency-bound -> ~214 GB/s). The driver reads the split from dispatch.txt.
+    geom.append(("norm_split", 0, NORM_SPLIT, 0))
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
             fh.write("%s %d %d %d\n" % (hal, tk, rg, tt))
@@ -647,14 +653,14 @@ def main():
     norm_src = os.path.join(tmp, "yah_half_norm_unrolled.loom")
     # 4 rows (waves) per workgroup: 46.1 -> 41.9 ms per pp2048 vs one row per workgroup. The tuner's table may set it
     # ({"norm": {"wpr": 2}}); the driver derives the grid from the kernel's workgroup size.
-    open(norm_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), wlds=True))
+    open(norm_src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT))
     # the FFN norm for afrag GEMMs: the same values, stored fragment-major
     normt_src = os.path.join(tmp, "yah_half_norm_tiled.loom")
-    open(normt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled=True, wlds=True))
+    open(normt_src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True))
     any_af = any(h.endswith(".af.hal") for h, *_ in geom)
     # attn_norm where some of its GEMMs are afrag (DeltaNet alpha / beta never): both layouts in one pass
     normrt_src = os.path.join(tmp, "yah_half_norm_both.loom")
-    open(normrt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled="both", wlds=True))
+    open(normrt_src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled="both"))
     # the DeltaNet postnorm, fragment-major for an afrag ssm_out
     postnorm_t_src = os.path.join(tmp, "yah_ssm_postnorm_tiled.loom")
     open(postnorm_t_src, "w").write(postnorm_tiled(open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()))
