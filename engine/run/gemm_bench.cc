@@ -13,6 +13,7 @@
 // Per job it prints "job <i> wall_ms <ms per rep> hash <h>": h hashes the output of the real token rows only (variants
 // pad differently) of one dispatch on the first tensor. Run under HRX_PROFILE_MODE=counters for clock-free cycles: the
 // dispatches appear in job order, 2 warmups + 1 hashed + reps per job.
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -108,7 +109,12 @@ int main(int argc, char** argv) {
                resid = gpu.Allocate(kChunk * kFfn * 4), wstage = gpu.Allocate(kFfn * 16 * 2),
                ostage = gpu.Allocate(kFfn * kChunk * 4), output = gpu.Allocate(kChunk * kFfn * 4),
                gate_out = gpu.Allocate(kChunk * kFfn * 4), ksigns = gpu.Allocate(128);
-    gpu.H2D(input, Pattern(input.size, true, 1).data(), input.size);
+    const std::vector<std::uint8_t> input_host = Pattern(input.size, true, 1);
+    gpu.H2D(input, input_host.data(), input.size);
+    // "input_tiled": the same activations [token][K] laid out fragment-major for Tile.atiled: 16 x 16 tiles
+    // (token / 16, k / 16) of 512 contiguous bytes, token-major tiles, k fastest inside; built per K on demand
+    LoomBuffer input_tiled = gpu.Allocate(input.size);
+    std::uint32_t tiled_k = 0;
     gpu.H2D(gate, Pattern(gate.size, false, 2).data(), gate.size);
     gpu.H2D(resid, Pattern(resid.size, false, 3).data(), resid.size);
     {
@@ -161,12 +167,24 @@ int main(int argc, char** argv) {
         grid = gpu.Allocate(g.size());
         gpu.H2D(grid, g.data(), g.size());
       }
+      const std::uint32_t k_dim = ts.empty() ? 0 : static_cast<std::uint32_t>(ts[0]->dims[0]);
+      if (std::find(j.roles.begin(), j.roles.end(), "input_tiled") != j.roles.end() && tiled_k != k_dim) {
+        if (!k_dim || k_dim % 16) throw LoomError(j.hal + ": input_tiled needs a GGUF weight with K % 16 == 0");
+        const auto* src = reinterpret_cast<const std::uint16_t*>(input_host.data());
+        std::vector<std::uint16_t> t(std::size_t{kChunk} * k_dim);
+        for (std::size_t tok = 0; tok < kChunk; ++tok)
+          for (std::size_t k = 0; k < k_dim; ++k)
+            t[((tok / 16) * (k_dim / 16) + k / 16) * 256 + (tok % 16) * 16 + k % 16] = src[tok * k_dim + k];
+        gpu.H2D(input_tiled, t.data(), t.size() * 2);
+        tiled_k = k_dim;
+      }
       std::vector<hrx_buffer_ref_t> b;
       for (const std::string& r : j.roles) {
         const LoomBuffer* x = r == "weight"    ? &weights[0]
                               : r == "grid"    ? (needs_grid ? &grid : nullptr)
                               : r == "ksigns"  ? &ksigns
                               : r == "input"   ? &input
+                              : r == "input_tiled" ? &input_tiled
                               : r == "gate"    ? &gate
                               : r == "resid"   ? &resid
                               : r == "wstage"  ? &wstage
