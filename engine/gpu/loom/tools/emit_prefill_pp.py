@@ -589,7 +589,7 @@ def main():
     gen_attn_fa.MAX_TOKENS = max(B, 2048)
     # YAH_ATTN_SHAPE=<heads>x<tokens>: attention workgroup shape. 6 x 16 (a whole GQA group: each K / V tile staged once for
     # its 6 heads) is bit-identical to 2 x 32, pp2048 attention -4.9%, pp8192 even
-    a_hpw, a_qt = map(int, os.environ.get("YAH_ATTN_SHAPE", "6x16").split("x"))
+    a_hpw, a_qt = map(int, os.environ.get("YAH_ATTN_SHAPE", "2x32").split("x"))
     gen_attn_fa.configure(a_hpw, a_qt)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
