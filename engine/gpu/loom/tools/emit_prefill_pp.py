@@ -311,7 +311,9 @@ def main():
                 raise SystemExit("no GEMM kernel for %s %s (%d rows, K = %d)" % (fmt, k, mt * 16, kb * qk_of(fmt)))
         n += 1
 
-    if T > B:  # served sets calibrate their GEMM tiles while running (engine/model/prefill_calib.hpp)
+    # The calibration menu (calibration_menu, for engine/model/prefill_calib.hpp) is shelved with the calibration;
+    # YAH_CALIB_MENU=1 still emits it.
+    if T > B and os.environ.get("YAH_CALIB_MENU") == "1":
         geom.extend(calibration_menu(model, outdir, B))
 
     # Attention: tools/gen_attn_fa.py, 32 tokens x 2 heads per workgroup; reads V^T (vtrans.hal, or the paged / quantized pools).

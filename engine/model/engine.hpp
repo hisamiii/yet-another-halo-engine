@@ -54,7 +54,8 @@ class Engine : public TextGenerator {
     if (decoder_.kv_bits() != prefill_.kv_bits())
       throw LoomError("engine: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
     gpu_.SetSleepSync(200);
-    prefill_.EnableCalibration(CalibrationPath(o.prefill_hal));
+    // Prefill calibration while serving (model/prefill_calib.hpp) is shelved: it converged too slowly to pay off yet.
+    // To resume: prefill_.EnableCalibration(CalibrationPath(o.prefill_hal)) and emit sets with the calibration menu.
     logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
     token_ = gpu_.Allocate(4);
     seed_ = gpu_.Allocate(8);
