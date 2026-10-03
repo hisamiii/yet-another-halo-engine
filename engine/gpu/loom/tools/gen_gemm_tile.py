@@ -83,6 +83,7 @@ class Tile:
     swepi: bool = False        # swiglu through lds_epilogue
     stagger: int = STAGGER     # barriers the second workgroup per WGP waits in the first round
     gstage: bool = False       # stage activations through the general segment map even where the row map fits
+    dbuf: bool = False         # double-buffered LDS tiles, one barrier per phase (decode / stage phase k+1 while multiplying k)
 
     @property
     def tm(self):
@@ -140,6 +141,7 @@ def check(t):
         (t.ksub in (32, 64, 128) and (not t.decahead or t.bm % WS == 0), "KSUB or decode-ahead geometry"),
         (t.ksub // 32 * t.bm <= t.lanes, "not enough lanes to decode a phase in one pass"),
         (not t.swepi or t.tm == 32, "the LDS swiglu epilogue needs 32 rows per wave"),
+        (not (t.dbuf and t.decahead), "double buffering replaces decode-ahead"),
     ]
     for ok, why in rules:
         if not ok:
@@ -182,6 +184,7 @@ def _gen(fmt, kind, t, masked):
     BM, BN, WM, WN, TM, TN = t.bm, t.bn, t.wm, t.wn, t.tm, t.tn
     FM, FN, NWAVE, LANES, ROWGRP, APL = TM // 16, TN // 16, t.nwave, t.lanes, t.rowgrp, t.apl
     DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE = t.decahead, t.ksl, t.decload, t.rhs_outer, t.rhs_fence
+    DBUF = t.dbuf
     F = G.FMTS[fmt]
     ksub = t.ksub
     bb, (loads, compute) = F["bb"], F["decode"]
@@ -280,12 +283,12 @@ def _gen(fmt, kind, t, masked):
     e("  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>")
     e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
     # LDS: decoded weight tile and staged activation tile
-    e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2 * (2 if DECAHEAD else 1)} : offset")
+    e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF else 1)} : offset")
     e(f"  %wl_tb = index.constant {BM * G.ROWP * 2} : index")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
     # the LDS epilogue's wave-private TM x 16 f32 slabs live in the activation tile
-    al_bytes = BN * arow * 2
+    al_bytes = BN * arow * 2 * (2 if DBUF else 1)
     slabs = NWAVE * (TM + EPAD) * 16 * 4
     if TM == 32:
         al_bytes = max(al_bytes, slabs)
@@ -299,6 +302,7 @@ def _gen(fmt, kind, t, masked):
     e(f"  %cksubi = index.constant {ksub} : index")
     e("  %al_layout = encoding.layout.strided [%c1, %carow] : encoding<layout>")
     e(f"  %al_t = buffer.view %al[%base] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
+    e(f"  %al_tb = index.constant {BN * arow * 2} : index")
     e("  %wg_x = kernel.workgroup.id<x> : index")
     e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
@@ -408,6 +412,16 @@ def _gen(fmt, kind, t, masked):
             vals.append((f"%{p}av{sg}", "vector<8xf16>"))
         return vals
 
+    def stage_acts(names, view):
+        """Store this lane's staged activation vectors into the activation tile view (rows x arow)."""
+        for sg, nm in enumerate(names):
+            if not legacy:
+                e(f"    vector.store {nm}, {view}[%gr{sg}, %gc{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+                continue
+            e(f"    %as{sg}c = index.constant {8 * sg} : index")
+            e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
+            e(f"    vector.store {nm}, {view}[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
+
     if DECAHEAD:
         # phase 0 decoded into weight tile 0 now; phase 1's bytes carried
         L0, w00 = loads("pf_", "%row_off_i", "%gl_i")
@@ -427,20 +441,46 @@ def _gen(fmt, kind, t, masked):
         e("  %gb1 = scalar.addi %gb1g, %gl_i : i32")
         L1, wv0 = loads("p1_", "%blk1", "%gb1")
         L.extend(L1)
+    elif DBUF:
+        # phase 0 decoded and staged into buffer 0 now; phase 1's bytes and activations carried
+        L0, w00 = loads("pf_", "%row_off_i", "%gl_i")
+        L.extend(L0)
+        a00 = a_loads("pa0_", "%c0")
+        # the setup's LDS tables (IQ grids) must be visible before the first decode; the loop's top barrier did this before
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  scf.if %decoder {")
+        L.extend(compute([nm for nm, _ in w00], "%gl_i"))
+        e("  }")
+        stage_acts([nm for nm, _ in a00], "%al_rows")
+        e("  %kp1_l = index.sub %kphases, %c1 : index")
+        e("  %kp1 = index.min %c1, %kp1_l : index")
+        e("  %kb1 = index.div %kp1, %cph : index")
+        e("  %ph1 = index.rem %kp1, %cph : index")
+        e("  %kb1_i = index.cast %kb1 : index to i32")
+        e("  %ph1_i = index.cast %ph1 : index to i32")
+        e("  %blk1o = scalar.muli %kb1_i, %cbbi : i32")
+        e("  %blk1 = scalar.addi %row_off_i, %blk1o : i32")
+        e("  %gb1g = scalar.muli %ph1_i, %cgppi : i32")
+        e("  %gb1 = scalar.addi %gb1g, %gl_i : i32")
+        L1, wv0 = loads("p1_", "%blk1", "%gb1")
+        L.extend(L1)
+        e("  %kk1 = index.mul %kp1, %cksub : index")
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     else:
         # prefetch phase 0: weight bytes and activation row
         L0, wv0 = loads("pf_", "%row_off_i", "%gl_i")
         L.extend(L0)
     orig0 = wv0
     wv0 = G.pack_vals(e, wv0, "0")
-    av0 = a_loads("pa_", "%c0")
+    av0 = a_loads("pa_", "%kk1" if DBUF else "%c0")
     carried = wv0 + av0
     ca = ", ".join(f"%a{i} = %init : {V8}" for i in range(NA))
     ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(carried))
     carried_t = types + ", " + ", ".join(ty for _, ty in carried)
     res = ", ".join(f"%acc{i}" for i in range(NA)) + ", " + ", ".join(f"%cvo{x}" for x in range(len(carried)))
     e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t})  {{")
-    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    if not DBUF:
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("    %kb = index.div %kp, %cph : index")
     e("    %ph = index.rem %kp, %cph : index")
     e("    %ph_i = index.cast %ph : index to i32")
@@ -449,14 +489,42 @@ def _gen(fmt, kind, t, masked):
     e("    %kb_k = index.mul %kp, %cksub : index")
     cur_w = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(wv0)]
     cur_a = [f"%cv{len(wv0) + x}" for x in range(len(av0))]
+    if DBUF:
+        # the carried registers hold phase kp+1: decode and stage them into buffer (kp+1)%2 while buffer kp%2 is multiplied
+        e("    %kpl = index.sub %kphases, %c1 : index")
+        e("    %kp_d0 = index.add %kp, %c1 : index")
+        e("    %kp_d = index.min %kp_d0, %kpl : index")
+        e("    %ph_d = index.rem %kp_d, %cph : index")
+        e("    %ph_di = index.cast %ph_d : index to i32")
+        e("    %phg_d = scalar.muli %ph_di, %cgppi : i32")
+        e("    %gb_d = scalar.addi %phg_d, %gl_i : i32")
+        e("    %buf_d = index.rem %kp_d0, %c2 : index")
+        e("    %buf_m = index.rem %kp, %c2 : index")
+        e("    %wo_d0 = index.mul %buf_d, %wl_tb : index")
+        e("    %wo_d = index.cast %wo_d0 : index to offset")
+        e(f"    %wl_dec = buffer.view %wl[%wo_d] : buffer -> view<{BM}x{G.ROWP}xf16>")
+        e("    %wo_m0 = index.mul %buf_m, %wl_tb : index")
+        e("    %wo_m = index.cast %wo_m0 : index to offset")
+        e(f"    %wl_mma = buffer.view %wl[%wo_m] : buffer -> view<{BM}x{G.ROWP}xf16>")
+        e("    %ao_d0 = index.mul %buf_d, %al_tb : index")
+        e("    %ao_d = index.cast %ao_d0 : index to offset")
+        e(f"    %al_dec = buffer.view %al[%ao_d] : buffer -> view<{BN}x{arow}xf16>")
+        e("    %ao_m0 = index.mul %buf_m, %al_tb : index")
+        e("    %ao_m = index.cast %ao_m0 : index to offset")
+        e(f"    %al_mma = buffer.view %al[%ao_m] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
+        e("    scf.if %decoder {")
+        names = G.unpack_vals(e, cur_w, orig0)
+        L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
+        e("    }")
+        stage_acts(cur_a, "%al_dec")
     # decode (only the decoding slots) into the weight tile
-    if not DECAHEAD:
+    if not DECAHEAD and not DBUF:
         e("    scf.if %decoder {")
         names = G.unpack_vals(e, cur_w, orig0)
         L.extend(compute(names, "%gb_i"))
         e("    }")
     # stage the activation row into the LDS activation tile
-    for sg, nm in enumerate(cur_a):
+    for sg, nm in ([] if DBUF else enumerate(cur_a)):
         if not legacy:
             e(f"    vector.store {nm}, %al_rows[%gr{sg}, %gc{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
             continue
@@ -466,7 +534,7 @@ def _gen(fmt, kind, t, masked):
     # Next phase's loads. The fence keeps them below this phase's LDS stores.
     # Else the scheduler hoists them above the stores and then waits vmcnt(0) for them before the first store.
     e("    scf.schedule.fence")
-    e(f"    %kp_n0 = index.add %kp, %c{2 if DECAHEAD else 1} : index")
+    e(f"    %kp_n0 = index.add %kp, %c{2 if DECAHEAD or DBUF else 1} : index")
     e("    %kp_last = index.sub %kphases, %c1 : index")
     e("    %kp_n = index.min %kp_n0, %kp_last : index")
     e("    %kb_n = index.div %kp_n, %cph : index")
@@ -502,7 +570,8 @@ def _gen(fmt, kind, t, masked):
     else:
         e("    %kk_n = index.mul %kp_n, %cksub : index")
     anx = a_loads("na_", "%kk_n")
-    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    if not DBUF:
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     if DECAHEAD:
         # phase kp+1 into tile (kp+1)%2 while every wave multiplies tile kp%2
         e("    %kp_d0 = index.add %kp, %c1 : index")
@@ -529,8 +598,8 @@ def _gen(fmt, kind, t, masked):
         names = G.unpack_vals(e, cur_w, orig0)
         L.extend(l.replace("%wl_view[", "%wl_dec[") for l in compute(names, "%gb_d"))
         e("    }")
-    wlv = "%wl_mma" if DECAHEAD else "%wl_view"
-    alv = "%al_t"
+    wlv = "%wl_mma" if DECAHEAD or DBUF else "%wl_view"
+    alv = "%al_mma" if DBUF else "%al_t"
     cb = ", ".join(f"%b{i} = %a{i} : {V8}" for i in range(NA))
     if KSL:
         # the k steps straight-line in one block: low CSE shares the fragment address math and the step offset becomes an immediate
@@ -567,6 +636,8 @@ def _gen(fmt, kind, t, masked):
                     for j in range(FN):
                         smma(i, j)
             acc = [f"%sn{st}_{n}" for n in range(NA)]
+        if DBUF:
+            e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
           + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
         e("  }")
@@ -598,6 +669,8 @@ def _gen(fmt, kind, t, masked):
                     e(f"      %n{n} = vector.mma %lhs{i}, %rhs{j}, %b{n} : {VF}, {VF}, {V8}")
         e("      scf.yield " + ", ".join(f"%n{i}" for i in range(NA)) + f" : {types}")
         e("    }")
+        if DBUF:
+            e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
           + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
         e("  }")
