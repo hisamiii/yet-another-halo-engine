@@ -46,6 +46,7 @@ PIPE2 = False
 # disjoint 4-bank groups) instead of rows 0, 2, .. 14 (two lanes per bank group).
 VSWZ = True
 VSWZ_T = True    # VSWZ also in TILED_OUT builds: there it costs the 4th workgroup (236 VGPRs) but measured 72.3 vs 77.9 M (pp2048)
+VSWZR = True     # VSWZ: recompute the staged dim's global offset per tile instead of keeping it live through the loop
 VSWZF = 0        # formulation of the swizzled dim (same values; the register allocator is sensitive to it)
 # QDIRECT (Q16 only): each lane loads its Q^T fragments straight from the f16 query (lane = query row, 16 contiguous dims
 # = one 32-B load per fragment), no LDS Q stage: no prologue stores (4-way bank conflicts), barriers or drain store, and
@@ -658,7 +659,12 @@ def gen():
         else:
             e(f"{ind}%{p}vks = index.min {ks}, %vlast : index")
         e(f"{ind}%{p}vtb = index.mul %{p}vks, %c256 : index")
-        e(f"{ind}%{p}va0 = index.add %vhl, %{p}vtb : index")
+        if VSWZR:
+            e(f"{ind}%{p}vln = index.mul %vdim, %c16 : index")
+            e(f"{ind}%{p}vhl = index.add %vhb, %{p}vln : index")
+            e(f"{ind}%{p}va0 = index.add %{p}vhl, %{p}vtb : index")
+        else:
+            e(f"{ind}%{p}va0 = index.add %vhl, %{p}vtb : index")
         e(f"{ind}%{p}va1 = index.add %{p}va0, %c8 : index")
         names = []
         for nn in range(2):
