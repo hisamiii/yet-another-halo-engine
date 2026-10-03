@@ -148,8 +148,13 @@ class LoomPrefill {
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       if (cfg_.IsFullAttention(l)) {
-        RunNorm(pre + "attn_norm.weight");
-        RunAttention(l, ci, pre, hook);
+        const bool q_af = Af("gemm_kqg", pre + "attn_q.weight");
+        const bool k_af = Af("gemm_kstore", pre + "attn_k.weight");
+        const bool v_af = Af("gemm_kstore", pre + "attn_v.weight");
+        RunNorm(pre + "attn_norm.weight", q_af && k_af && v_af   ? NormOut::kTiled
+                                          : q_af || k_af || v_af ? NormOut::kBoth
+                                                                 : NormOut::kRow);
+        RunAttention(l, ci, pre, hook, q_af, k_af, v_af);
       } else {
         // afrag qkv / gate read the fragment-major copy; alpha / beta keep the row-major one
         const bool qkv_af = Af("gemm_kstore", pre + "attn_qkv.weight");
@@ -748,17 +753,20 @@ class LoomPrefill {
   }
   // The attention q projection with the q / gate unpack fused in (rows = heads x [256 q | 256 gate]).
   // Returns false if the set has no such HAL; the caller then runs kstore + yah_unpack_qg.
-  bool RunKqg(const std::string& wname) {
+  // af: the afrag form, input normt_ (fragment-major)
+  bool RunKqg(const std::string& wname, bool af = false) {
     const auto* t = Find(wname);
     Fmt f{};
     if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) return false;
     std::string hal = GemmHal("gemm_kqg", *t, &f);
     if (!geom_.count(hal)) return false;
-    const std::string df = DfGemm("kqg", *t, f);
-    hal = df.empty() ? PickGemm(hal) : df;
+    const std::string df = af ? "" : DfGemm("kqg", *t, f);
+    hal = af ? AfHal(hal) : df.empty() ? PickGemm(hal) : df;
     const Geom g = GeomOf(hal);
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
-    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, q_, gate_}) b.push_back(Ref(*x));
+    for (const LoomBuffer* x :
+         std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_, q_, gate_})
+      b.push_back(Ref(*x));
     if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16") + "_kqg").c_str(),
              MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {q_, gate_}));
@@ -819,15 +827,16 @@ class LoomPrefill {
     std::swap(hidden_, hidden2_);
   }
 
-  void RunAttention(std::uint32_t l, std::uint32_t ci, const std::string& pre, const KvHook& hook) {
+  void RunAttention(std::uint32_t l, std::uint32_t ci, const std::string& pre, const KvHook& hook, bool q_af, bool k_af,
+                    bool v_af) {
     const std::uint32_t ai = l / cfg_.full_attention_interval;
     if (ai >= full_) throw LoomError("full-attention layer index past the KV slot count");
     // an afrag o-projection reads the attention output fragment-major (wmma_t)
     const bool o_af = Af("gemm_kres", pre + "attn_output.weight");
-    const bool qg_fused = RunKqg(pre + "attn_q.weight");
+    const bool qg_fused = RunKqg(pre + "attn_q.weight", q_af);
     if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
-    RunKstore(pre + "attn_k.weight", *kbuf_);
-    RunKstore(pre + "attn_v.weight", *vbuf_);
+    RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
+    RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
     if (!qg_fused)
       Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
     const std::size_t koff = kv16_scratch_ ? 0 : std::size_t{ai} * kv_cache_ * 2;

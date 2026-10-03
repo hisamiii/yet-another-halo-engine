@@ -908,8 +908,8 @@ def _gen(fmt, kind, t, masked):
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
-    if t.tallepi and not qg:
-        _lds_epilogue_tall(e, t, kr, V8, masked=masked)
+    if t.tallepi:
+        _lds_epilogue_tall(e, t, kr, V8, masked=masked, qg=qg)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
@@ -1058,10 +1058,11 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
 
 
 
-def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16):
+def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
     """lds_epilogue for waves taller than 32 rows (afrag: 128): sr-row slabs, so 16 waves' slabs fit in the weight tile,
     which is free after the K loop. Per 16-token column and slab, each lane reads sr / 2 contiguous rows of one token (two
-    lanes per token) and writes them with b128 stores. kstore / kres. Same values as the direct fragment store."""
+    lanes per token) and writes them with b128 stores. kstore / kres / kqg (a slab sits inside one 256-row q or gate
+    half: row r = head * 512 + half * 256 + d goes to (q | gate)[t][head * 256 + d]). Same values as lds_epilogue."""
     TM, FM, FN = t.tm, t.tm // 16, t.tn // 16
     assert TM % sr == 0 and sr % 16 == 0
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
@@ -1072,7 +1073,16 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16):
     e("  %et_off = index.cast %et_off_i : index to offset")
     e(f"  %et_view = buffer.view %wl[%et_off] : buffer -> view<{sr}x16xf32, %et_lay>")
     e(f"  %et_flat = buffer.view %wl[%et_off] : buffer -> view<{(sr + EPAD) * 16}xf32>")
-    e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+    if qg:
+        e("  %qg_tot = index.div %out_total, %c2 : index")
+        e("  %qg_rows = index.div %m_rows, %c2 : index")
+        e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
+        e("  %qg_c512 = index.constant 512 : index")
+        e("  %qg_c256 = index.constant 256 : index")
+    else:
+        e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
     if masked:
@@ -1087,6 +1097,14 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16):
     for g in range(TM // sr):
         e(f"  %et_gr{g} = index.constant {g * sr} : index")
         e(f"  %et_row{g} = index.add %et_rowb, %et_gr{g} : index")
+        if qg:
+            e(f"  %qg_head{g} = index.div %et_row{g}, %qg_c512 : index")
+            e(f"  %qg_w{g} = index.rem %et_row{g}, %qg_c512 : index")
+            e(f"  %qg_half{g} = index.div %qg_w{g}, %qg_c256 : index")
+            e(f"  %qg_d{g} = index.rem %qg_w{g}, %qg_c256 : index")
+            e(f"  %qg_hb{g} = index.mul %qg_head{g}, %qg_c256 : index")
+            e(f"  %qg_col{g} = index.add %qg_hb{g}, %qg_d{g} : index")
+            e(f"  %qg_isq{g} = index.cmp eq, %qg_half{g}, %c0 : index")
         for j in range(FN):
             q0 = f"{g}_{j}"
             if kr:
@@ -1102,8 +1120,12 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16):
             if masked:
                 e(f"  %et_tkc{q0} = index.min %et_tk{q0}, %et_tok_last : index")
                 tka = f"%et_tkc{q0}"
-            e(f"  %et_tm{q0} = index.mul {tka}, %m_rows : index")
-            e(f"  %et_ob{q0} = index.add %et_tm{q0}, %et_row{g} : index")
+            if qg:
+                e(f"  %et_tm{q0} = index.mul {tka}, %qg_rows : index")
+                e(f"  %et_ob{q0} = index.add %et_tm{q0}, %qg_col{g} : index")
+            else:
+                e(f"  %et_tm{q0} = index.mul {tka}, %m_rows : index")
+                e(f"  %et_ob{q0} = index.add %et_tm{q0}, %et_row{g} : index")
             if masked:
                 e(f"  %et_ok{q0} = index.cmp ult, %et_tk{q0}, %tokens : index")
                 e(f"  scf.if %et_ok{q0} {{")
@@ -1118,7 +1140,16 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16):
                     e(f"  %et_rf{y} = vector.load %res_flat[%et_oi{y}] : view<[%out_total]xf32> -> vector<4xf32>")
                     e(f"  %et_rs{y} = vector.addf %et_rf{y}, %et_v{y} : vector<4xf32>")
                     val = f"%et_rs{y}"
-                e(f"  vector.store {val}, %out_flat[%et_oi{y}] : vector<4xf32>, view<[%out_total]xf32>")
+                if qg:
+                    # always in range; the clamp states it for the bound proof
+                    e(f"  %qg_oi{y} = index.min %et_oi{y}, %qg_last4 : index")
+                    e(f"  scf.if %qg_isq{g} {{")
+                    e(f"    vector.store {val}, %q_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                    e("  } else {")
+                    e(f"    vector.store {val}, %g_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                    e("  }")
+                else:
+                    e(f"  vector.store {val}, %out_flat[%et_oi{y}] : vector<4xf32>, view<[%out_total]xf32>")
             if masked:
                 e("  }")
 

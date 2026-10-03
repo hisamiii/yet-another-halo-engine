@@ -310,6 +310,18 @@ AF = {
     ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=4),                 # -10.9%
     ("q4k", "kstore", 384, 20): dict(AF_KQ),                                    # -6.0%
     ("q3k", "kstore", 384, 20): dict(AF_KQ),                                    # -6.4%
+    ("q5k", "kres", 320, 24): dict(AF_KQ, ksl=True, wlate=True),                # -4.6%
+    # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
+    ("iq3s", "kqg", 768, 20): dict(AF_PIPE),                                    # -8.4%
+    ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
+    ("iq3xxs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=4),                    # -9.3%
+    ("q4k", "kqg", 768, 20): dict(AF_KQ),                                       # -6.7%
+    ("q3k", "kqg", 768, 20): dict(AF_KQ),                                       # -5.0%
+    ("q5k", "kqg", 768, 20): dict(AF_KQ, ksl=True, wlate=True),                 # -10.8%
+    ("iq4xs", "kstore", 64, 20): dict(AF_PIPE),                                 # -15.7%
+    ("q4k", "kstore", 64, 20): dict(AF_KQ),                                     # -16.0%
+    ("q5k", "kstore", 64, 20): dict(AF_KQ, ksl=True),                           # -10.4%
+    ("q6k", "kstore", 64, 20): dict(AF_KQ, ksl=True, wlate=True),               # -10.2% (208 VGPRs: 32 workgroups anyway)
 }
 
 
@@ -465,8 +477,6 @@ def main():
     open(attn_src, "w").write(gen_attn_fa.gen())
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
     af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
-    af_dn_in = any(h.startswith("gemm_kstore_") and (h.endswith("_640_20.af.hal") or h.endswith("_384_20.af.hal"))
-                   for h, *_ in geom)
     attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
     if af24:
         gen_attn_fa.TILED_OUT = True
@@ -548,7 +558,7 @@ def main():
     normt_src = os.path.join(tmp, "yah_half_norm_tiled.loom")
     open(normt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled=True))
     any_af = any(h.endswith(".af.hal") for h, *_ in geom)
-    # DeltaNet layers' attn_norm: row-major for alpha / beta and fragment-major for afrag qkv / gate, in one pass
+    # attn_norm where some of its GEMMs are afrag (DeltaNet alpha / beta never): both layouts in one pass
     normrt_src = os.path.join(tmp, "yah_half_norm_both.loom")
     open(normrt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled="both"))
     # the DeltaNet postnorm, fragment-major for an afrag ssm_out
@@ -565,7 +575,7 @@ def main():
              "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"])] if any_af else []),
         *([(normrt_src, "norm_rt.hal",
             ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
-             "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"])] if af_dn_in else []),
+             "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"])] if any_af else []),
         *([(postnorm_t_src, "postnorm_t.hal", ["yah_ssm_postnorm_fp16.head_count=%d" % (48 * B)])] if af24 else []),
         # the conv with the q / k L2 norm (prep_kq) fused in
         ("yah_ssm_conv_kq_f32.loom", "convkq.hal",
