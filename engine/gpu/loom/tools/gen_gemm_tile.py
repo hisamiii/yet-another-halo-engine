@@ -87,6 +87,7 @@ class Tile:
     tokfast: bool = False      # launch order token tiles fastest: the token tiles of a row block run together (L2 shares weights)
     afrag: bool = False        # activations not staged in LDS: the MMA's B fragments load straight from the input (needs dbuf)
     atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
+    tallepi: bool = False      # afrag kstore / kres: the LDS epilogue in 16-row slabs in the weight tile (else fragment stores)
     tout: bool = False         # swiglu: store the output fragment-major (atiled layout over K = rows) for an afrag consumer
     stg_minwg: int = STG_MINWG  # smallest grid that staggers (afrag: every grid; lockstep costs it 6-9%)
     wlate: bool = False        # afrag: next phase's weight loads in the last k step (registers free in the MMA section)
@@ -158,6 +159,7 @@ def check(t):
         (not t.bpre or (t.afrag and not t.rhs_outer), "B prefetch is for afrag without rhs-outer"),
         (not t.b0early or (t.afrag and not t.dbuf and not t.decahead), "early step-0 B is for afrag without dbuf/decode-ahead"),
         (not t.tout or (t.afrag and not t.swepi), "tiled swiglu output is the plain swiglu epilogue of an afrag tile"),
+        (not t.tallepi or t.tm > 32, "the tall LDS epilogue is for waves over 32 rows"),
         (not t.wlate or (t.afrag and not t.dbuf and not t.decahead and not t.rhs_outer), "late weight loads are for afrag without dbuf/decode-ahead/rhs-outer"),
     ]
     for ok, why in rules:
@@ -906,6 +908,11 @@ def _gen(fmt, kind, t, masked):
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
+    if t.tallepi and not qg:
+        _lds_epilogue_tall(e, t, kr, V8, masked=masked)
+        e("  kernel.return")
+        e("}")
+        return "\n".join(L) + "\n"
     e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
     e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
     if kr:
@@ -1049,6 +1056,71 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
             e("  }")
 
 
+
+
+def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16):
+    """lds_epilogue for waves taller than 32 rows (afrag: 128): sr-row slabs, so 16 waves' slabs fit in the weight tile,
+    which is free after the K loop. Per 16-token column and slab, each lane reads sr / 2 contiguous rows of one token (two
+    lanes per token) and writes them with b128 stores. kstore / kres. Same values as the direct fragment store."""
+    TM, FM, FN = t.tm, t.tm // 16, t.tn // 16
+    assert TM % sr == 0 and sr % 16 == 0
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    e(f"  %et_cs = index.constant {sr + EPAD} : index")
+    e("  %et_lay = encoding.layout.strided [%c1, %et_cs] : encoding<layout>")
+    e(f"  %et_wb = index.constant {(sr + EPAD) * 16 * 4} : index")
+    e("  %et_off_i = index.mul %wave, %et_wb : index")
+    e("  %et_off = index.cast %et_off_i : index to offset")
+    e(f"  %et_view = buffer.view %wl[%et_off] : buffer -> view<{sr}x16xf32, %et_lay>")
+    e(f"  %et_flat = buffer.view %wl[%et_off] : buffer -> view<{(sr + EPAD) * 16}xf32>")
+    e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+    if kr:
+        e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
+    if masked:
+        e("  %et_tok_last = index.sub %tokens, %c1 : index")
+    e("  %et_lane = index.rem %tid, %c32 : index")
+    e("  %et_t = index.div %et_lane, %c2 : index")
+    e("  %et_h0 = index.rem %et_lane, %c2 : index")
+    e(f"  %et_h = index.mul %et_h0, %c{sr // 2} : index")
+    e("  %et_tt = index.mul %et_t, %et_cs : index")
+    e("  %et_rd = index.add %et_tt, %et_h : index")
+    e("  %et_rowb = index.add %m_origin, %et_h : index")
+    for g in range(TM // sr):
+        e(f"  %et_gr{g} = index.constant {g * sr} : index")
+        e(f"  %et_row{g} = index.add %et_rowb, %et_gr{g} : index")
+        for j in range(FN):
+            q0 = f"{g}_{j}"
+            if kr:
+                # one slab at a time: else the residual loads are hoisted over every slab (256 VGPRs beside the accumulators)
+                e("  scf.schedule.fence")
+            for i in range(g * sr // 16, (g + 1) * sr // 16):
+                e(f"  %et_r{i}_{j} = index.constant {16 * i - g * sr} : index")
+                e(f"  vector.fragment.store<result> %acc{i * FN + j}, %et_view[%et_r{i}_{j}, %c0] shape [%m, %n] : {V8}, view<{sr}x16xf32, %et_lay>")
+            e(f"  %et_tc{q0} = index.constant {16 * j} : index")
+            e(f"  %et_tk{q0}0 = index.add %token_base, %et_tc{q0} : index")
+            e(f"  %et_tk{q0} = index.add %et_tk{q0}0, %et_t : index")
+            tka = f"%et_tk{q0}"
+            if masked:
+                e(f"  %et_tkc{q0} = index.min %et_tk{q0}, %et_tok_last : index")
+                tka = f"%et_tkc{q0}"
+            e(f"  %et_tm{q0} = index.mul {tka}, %m_rows : index")
+            e(f"  %et_ob{q0} = index.add %et_tm{q0}, %et_row{g} : index")
+            if masked:
+                e(f"  %et_ok{q0} = index.cmp ult, %et_tk{q0}, %tokens : index")
+                e(f"  scf.if %et_ok{q0} {{")
+            for q in range(sr // 8):
+                y = f"{q0}_{q}"
+                e(f"  %et_q{y}c = index.constant {4 * q} : index")
+                e(f"  %et_ri{y} = index.add %et_rd, %et_q{y}c : index")
+                e(f"  %et_v{y} = vector.load %et_flat[%et_ri{y}] : view<{(sr + EPAD) * 16}xf32> -> vector<4xf32>")
+                e(f"  %et_oi{y} = index.add %et_ob{q0}, %et_q{y}c : index")
+                val = f"%et_v{y}"
+                if kr:
+                    e(f"  %et_rf{y} = vector.load %res_flat[%et_oi{y}] : view<[%out_total]xf32> -> vector<4xf32>")
+                    e(f"  %et_rs{y} = vector.addf %et_rf{y}, %et_v{y} : vector<4xf32>")
+                    val = f"%et_rs{y}"
+                e(f"  vector.store {val}, %out_flat[%et_oi{y}] : vector<4xf32>, view<[%out_total]xf32>")
+            if masked:
+                e("  }")
 
 
 def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):

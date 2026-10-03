@@ -241,22 +241,24 @@ def decode_free(fmt, mt, kb, B, kind, outdir, done):
 # FFN norm "norm_t.hal" and the swiglu "<hal>.af.to.hal" write it). 512-token tiles, only the decoded weights in LDS.
 # Same values as the GEMM. YAH_AFRAG=0 leaves them out.
 AFRAG = os.environ.get("YAH_AFRAG", "1") != "0"
-AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, stg_minwg=0)
+AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, stg_minwg=0,
+               tallepi=True)
 AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
 # The GEMMs with an afrag form and their knobs on top of AF_TILE; clock-free vs the GEMM (one round each, 2026-10-03).
 # The best lhs_stream depends on the decoder's register allocation: IQ3_XXS kstore without it waits vmcnt(0) twice per
-# phase on the step-1 B prefetch (-0.2% instead of -5.5%). Q3_K: the prefetch needs 208 VGPRs (one workgroup per WGP).
+# phase on the step-1 B prefetch. Q3_K: the prefetch needs 208 VGPRs (one workgroup per WGP).
+# tallepi (kstore / kres): the LDS epilogue in 16-row slabs; the fragment stores cost the K = 6144 kres 15%.
 AF = {
-    ("iq3s", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                  # -3.9%
-    ("iq4xs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                 # -5.8%
-    ("iq3xxs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=4),                # -5.5%
-    ("q3k", "kstore", 1088, 20): dict(rhs_outer=False, rhs_fence=0),            # -2.8%
+    ("iq3s", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                  # -9.1%
+    ("iq4xs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                 # -12.9%
+    ("iq3xxs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=4),                # -11.3%
+    ("q3k", "kstore", 1088, 20): dict(rhs_outer=False, rhs_fence=0),            # -7.2%
     ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),     # -11.6%
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),   # -12.1%
-    ("iq3s", "kres", 320, 68): dict(AF_PIPE),                                   # -4.1%
-    ("iq4xs", "kres", 320, 68): dict(AF_PIPE),                                  # -6.5%
-    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4),                   # -5.1%
+    ("iq3s", "kres", 320, 68): dict(AF_PIPE),                                   # -8.6%
+    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4),                    # -10.4%
+    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2),                   # -8.2%
 }
 
 
