@@ -555,6 +555,10 @@ def main():
         print("KV paging off: needs the context to be a multiple of 256")
     gen_attn_fa.PAGED = gen_kvq.PAGED = kv_paged
     gen_attn_fa.MAX_TOKENS = max(B, 2048)
+    # YAH_ATTN_SHAPE=<heads>x<tokens>: attention workgroup shape. 6 x 16 (a whole GQA group: each K / V tile staged once for
+    # its 6 heads) is bit-identical to 2 x 32, pp2048 attention -4.9%, pp8192 even
+    a_hpw, a_qt = map(int, os.environ.get("YAH_ATTN_SHAPE", "6x16").split("x"))
+    gen_attn_fa.configure(a_hpw, a_qt)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
@@ -568,7 +572,7 @@ def main():
         gen_attn_fa.TILED_OUT = False
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
-    geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
+    geom.append(("wmma.hal", a_qt, a_hpw, (B + a_qt - 1) // a_qt))
     # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md).
     # K: int8 (yah_kq8) or H256 + asymmetric int4 (yah_kq4) after yah_kmean centres it; the attention decodes it to f16.
     kv_k, kv_v = gen_kvq.kv_bits()

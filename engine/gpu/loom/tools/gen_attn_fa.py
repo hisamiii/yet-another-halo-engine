@@ -94,6 +94,19 @@ POOL = max(S_OFF + NT * 32, DRAIN_OFF + NT * 16)
 assert POOL <= 65536
 
 
+def configure(hpw, qt):
+    """Workgroup shape: hpw query heads (of one GQA group) x qt query tokens; recomputes the derived sizes.
+    The default is 2 x 32; 6 x 16 packs a whole GQA group (each K / V tile staged once for all 6 heads)."""
+    global HPW, QT, NQB, NT, Q_END, DRAIN_OFF, POOL
+    HPW, QT = hpw, qt
+    NQB = HPW * QT // 16
+    NT = 64 * NQB
+    Q_END = NQB * 16 * Q_PITCH * 2
+    DRAIN_OFF = S_OFF if S_OFF >= Q_END else Q_END
+    POOL = max(S_OFF + NT * 32, DRAIN_OFF + NT * 16)
+    assert POOL <= 65536
+
+
 def had64(e, pre, vecs, xors, scale):
     """Walsh-Hadamard times `scale`: stages 1..32 inside this thread's 64 dims (16 vector<4xf32> in dim order),
     then across threads (lane xor x flips qpart bit log2(x): dims 64, 128 apart).
@@ -292,17 +305,26 @@ def gen():
     e("  %one_o = scalar.bitcast %lob : i32 to f32")
     e("  %zero_o = scalar.bitcast %lz : i32 to f32")
     e("  %qs = index.mul %qb, %cqt : index")
-    e("  %kvh = index.div %hp, %c3 : index")
-    e("  %pig = index.rem %hp, %c3 : index")
-    e("  %kvh6 = index.mul %kvh, %c6 : index")
-    e("  %pig2 = index.mul %pig, %c2 : index")
-    e("  %head0 = index.add %kvh6, %pig2 : index")
+    if HPW == 6:   # one workgroup = a whole GQA group
+        e("  %kvh = index.add %hp, %c0 : index")
+        e("  %head0 = index.mul %kvh, %c6 : index")
+    else:
+        assert HPW == 2
+        e("  %kvh = index.div %hp, %c3 : index")
+        e("  %pig = index.rem %hp, %c3 : index")
+        e("  %kvh6 = index.mul %kvh, %c6 : index")
+        e("  %pig2 = index.mul %pig, %c2 : index")
+        e("  %head0 = index.add %kvh6, %pig2 : index")
     e("  %kvbase = index.mul %kvh, %c256 : index")
     e("  %vhb0 = index.mul %kvh, %vtiles : index")
     e("  %vhb = index.mul %vhb0, %c4096 : index")
-    # V staging: lane = dim
-    e("  %vtoff = index.constant 0 : index")
-    e("  %vt = index.add %tid, %c0 : index")
+    # V staging: lane = dim, the last 256 threads (K: the first 256)
+    e(f"  %vtoff = index.constant {NT - 256} : index")
+    if NT > 256:   # max(): threads below vtoff only stage K (their V stores are guarded) but stay in range
+        e("  %vtm = index.max %tid, %vtoff : index")
+        e("  %vt = index.sub %vtm, %vtoff : index")
+    else:
+        e("  %vt = index.add %tid, %c0 : index")
     e("  %vlane = index.mul %vt, %c16 : index")
     e("  %vhl = index.add %vhb, %vlane : index")
     if VQ4 or VQ8:
@@ -561,7 +583,22 @@ def gen():
             names.append(f"%{p}vv{nn}")
         return names
 
+    if NT > 256:
+        # wave-uniform role guards from the subgroup id; loads stay unconditional (out-of-role threads load clamped,
+        # in-range rows), only the LDS stores are guarded: an scf.if around loads drains vmcnt(0) at its exit
+        e("  %sgid = kernel.subgroup.id : index")
+        e(f"  %vsg0 = index.constant {(NT - 256) // 32} : index")
+        e("  %kstg = index.cmp ult, %sgid, %c8 : index")
+        e("  %vstg = index.cmp uge, %sgid, %vsg0 : index")
+
     def stage_k(ks, cur, p, ind):
+        if NT == 256:
+            return stage_k_(ks, cur, p, ind)
+        e(f"{ind}scf.if %kstg {{")
+        stage_k_(ks, cur, p, ind + "  ")
+        e(f"{ind}}}")
+
+    def stage_k_(ks, cur, p, ind):
         """K tile at key ks (rows permuted, zero past ctx_end) to LDS."""
         if KDEC:
             nw = 2 if K4 else 4
@@ -660,11 +697,18 @@ def gen():
         return hv
 
     def stage_v(cur, vb, p, ind):
-        e(f"{ind}%{p}vr = index.add {vb}, %vrow : index")
-        if VQ4:
+        if VQ4:   # unpack outside the guard (an scf.if reading loaded registers drains vmcnt(0) at entry)
             cur = vq4_unpack(cur, p, ind)
         if VQ8:
             cur = vq8_unpack(cur, p, ind)
+        if NT == 256:
+            return stage_v_(cur, vb, p, ind)
+        e(f"{ind}scf.if %vstg {{")
+        stage_v_(cur, vb, p, ind + "  ")
+        e(f"{ind}}}")
+
+    def stage_v_(cur, vb, p, ind):
+        e(f"{ind}%{p}vr = index.add {vb}, %vrow : index")
         for j, v in enumerate(cur):
             e(f"{ind}vector.store {v}, %v_view[%{p}vr, %c{8 * j}] : {V8H}, view<256x{VT_PITCH}xf16>")
 
