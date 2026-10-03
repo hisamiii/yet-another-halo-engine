@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -128,12 +129,23 @@ int main(int argc, char** argv) {
       const Job& j = jobs[i];
       // "file:<path>:<rows>": raw weight bytes from a file (e.g. pre-dequantized f16), instead of GGUF tensors
       std::vector<std::uint8_t> file_w;
-      std::uint32_t m_rows = 0;
+      std::uint32_t m_rows = 0, tiled_dims0 = 0;
       std::vector<const yah::core::TensorInfo*> ts;
       if (j.tensor.rfind("file:", 0) == 0) {
         const std::size_t c = j.tensor.rfind(':');
         file_w = ReadFile(j.tensor.substr(5, c - 5));
         m_rows = static_cast<std::uint32_t>(std::stoul(j.tensor.substr(c + 1)));
+      } else if (j.kind == "ffn" && j.tensor.find('+') != std::string::npos) {
+        // "<gate>+<up>": a mixed-format fused gate / up GEMM's one binding, the two tensors back to back
+        const std::size_t c = j.tensor.find('+');
+        const auto* g = gguf.Find(j.tensor.substr(0, c));
+        const auto* u = gguf.Find(j.tensor.substr(c + 1));
+        if (!g || !u || g->dims[1] != u->dims[1]) throw LoomError("ffn pair not found or of different rows: " + j.tensor);
+        file_w.resize(g->bytes + u->bytes);
+        std::memcpy(file_w.data(), gguf.Data(*g), g->bytes);
+        std::memcpy(file_w.data() + g->bytes, gguf.Data(*u), u->bytes);
+        m_rows = static_cast<std::uint32_t>(g->dims[1]);
+        tiled_dims0 = static_cast<std::uint32_t>(g->dims[0]);
       } else {
         for (std::size_t a = 0, b; a <= j.tensor.size(); a = b + 1) {
           b = j.tensor.find(',', a);
@@ -169,7 +181,7 @@ int main(int argc, char** argv) {
         grid = gpu.Allocate(g.size());
         gpu.H2D(grid, g.data(), g.size());
       }
-      const std::uint32_t k_dim = ts.empty() ? 0 : static_cast<std::uint32_t>(ts[0]->dims[0]);
+      const std::uint32_t k_dim = ts.empty() ? tiled_dims0 : static_cast<std::uint32_t>(ts[0]->dims[0]);
       if (std::find(j.roles.begin(), j.roles.end(), "input_tiled") != j.roles.end() && tiled_k != k_dim) {
         if (!k_dim || k_dim % 16) throw LoomError(j.hal + ": input_tiled needs a GGUF weight with K % 16 == 0");
         const auto* src = reinterpret_cast<const std::uint16_t*>(input_host.data());

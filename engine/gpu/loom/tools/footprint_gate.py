@@ -17,13 +17,16 @@ src, sym, fmt, kind, mt, kb, tt = sys.argv[1:8]
 mt, kb, tt = int(mt), int(kb), int(tt)
 B = int(sys.argv[8]) if len(sys.argv) > 8 else 2048
 # masked: the kernel declares its token count (config "tokens") and the last token tile is partial
-qk, bpb = QB[fmt]
+# mixed ffn "<gate fmt>:<up fmt>": the weight binding holds both tensors
+fmts = fmt.split(":")
+qk, bpb = QB[fmts[0]]
 M, K = mt * 16, kb * qk
-bound = {"weight": M * kb * bpb * (2 if kind == "ffn" else 1), "input": B * K * 2, "resid": B * M * 4, "gate": B * M * 4,
+wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else M * kb * bpb * (2 if kind == "ffn" else 1)
+bound = {"weight": wbytes, "input": B * K * 2, "resid": B * M * 4, "gate": B * M * 4,
          "output": M * K * 2 if kind == "dequant" else B * M * (2 if kind in ("swiglu", "kqg", "ffn") else 4),
          "gate_out": B * M * 2,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
-         "grid": {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(fmt, 0),
+         "grid": max({"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(f, 0) for f in fmts),
          "ksigns": 128,
          "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4}
 sys.path.insert(0, os.path.dirname(HERE))

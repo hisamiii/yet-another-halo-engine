@@ -11,6 +11,7 @@ Many waves per SIMD hide the load latency that the wave64 shared kernel (about 2
 """
 import os
 import sys
+import dataclasses
 from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -87,6 +88,7 @@ class Tile:
     tokfast: bool = False      # launch order token tiles fastest: the token tiles of a row block run together (L2 shares weights)
     afrag: bool = False        # activations not staged in LDS: the MMA's B fragments load straight from the input (needs dbuf)
     atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
+    ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
     ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
                                # (the weight binding spans ffn_gate and the ffn_up right after it: up row r is row m_rows + r)
     tallepi: bool = False      # afrag kstore / kres: the LDS epilogue in 16-row slabs in the weight tile (else fragment stores)
@@ -199,8 +201,12 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
         raise ValueError("decode-ahead is only verified for " + ", ".join(DECAHEAD_FMTS))
     if masked and t.tm != 32:
         raise ValueError(f"{t}: a masked token tile needs the LDS epilogue (32 rows per wave)")
+    # ffn of mixed formats: fmt "<gate fmt>:<up fmt>"
+    fmt, fmt_up = fmt.split(":") if ":" in fmt else (fmt, None)
+    if fmt_up is not None and (kind != "ffn" or fmt_up == fmt):
+        raise ValueError("a gate:up format pair is for kind ffn with two formats")
     configure(fmt, t)
-    return _gen(fmt, kind, t, masked)
+    return _gen(fmt, kind, t, masked, fmt_up)
 
 
 # dequant kernels: 256-wide K blocks per work item (the table staging and pipeline fill amortize over them), and the
@@ -209,7 +215,7 @@ DQ_BLOCKS = 4
 DQ_WGS = 20
 
 
-def _gen(fmt, kind, t, masked):
+def _gen(fmt, kind, t, masked, fmt_up=None):
     BM, BN, WM, WN, TM, TN = t.bm, t.bn, t.wm, t.wn, t.tm, t.tn
     FM, FN, NWAVE, LANES, ROWGRP, APL = TM // 16, TN // 16, t.nwave, t.lanes, t.rowgrp, t.apl
     DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE = t.decahead, t.ksl, t.decload, t.rhs_outer, t.rhs_fence
@@ -218,6 +224,24 @@ def _gen(fmt, kind, t, masked):
     F = G.FMTS[fmt]
     ksub = t.ksub
     bb, (loads, compute) = F["bb"], F["decode"]
+    # mixed ffn: the up rows decode with fmt_up's decoder, generated under its own configuration (its w3 / q4fmix
+    # switches from its own default tile); every lane loads its row of both (no branch around the loads: a branch drains
+    # vmcnt(0) at its join) and carries both, each wave decodes the one its rows are
+    MX = fmt_up is not None
+    if MX:
+        Fu = G.FMTS[fmt_up]
+        bbu, (loads_u, compute_u) = Fu["bb"], Fu["decode"]
+        du = default_tile(fmt_up, "swiglu", 20)
+        tu = dataclasses.replace(t, w3=du.w3, q4fmix=du.q4fmix)
+        if set(F["extra"]) & set(Fu["extra"]):
+            raise ValueError(f"{fmt}:{fmt_up}: both formats need the same table binding")
+
+        def as_up(fn):
+            configure(fmt_up, tu)
+            try:
+                return fn()
+            finally:
+                configure(fmt, t)
     kr = kind == "kres"
     sw = kind == "swiglu"
     # kqg: the attention q projection (rows = heads x [256 q | 256 gate]) writes q and gate to [tokens][heads*256] buffers.
@@ -228,9 +252,9 @@ def _gen(fmt, kind, t, masked):
     # ffn: ffn_gate and ffn_up (same format) in one GEMM, out = f16(silu(gate) * up), the swiglu GEMM's scalar ops
     ff = kind == "ffn"
     assert ff == t.ffn, "kind ffn needs Tile.ffn"
-    bufs = (["weight"] + F["extra"] + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
+    bufs = (["weight"] + F["extra"] + (Fu["extra"] if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
             + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []))
-    sym = (f"yah_ffn_gemm_{fmt}" + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
+    sym = (f"yah_ffn_gemm_{fmt}" + (f"_{fmt_up}" if MX else "") + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
            + ("_ffn" if ff else ""))
     if dq:
         assert not (DECAHEAD or DBUF or masked)
@@ -316,7 +340,13 @@ def _gen(fmt, kind, t, masked):
     e("  %m_rows = index.mul %m_tiles, %c16 : index")
     e("  %bpr = index.mul %k_blocks, %cbb : index")
     e("  %hpr = index.mul %k_blocks, %cbbh : index")
-    if ff:
+    if MX:
+        # gate rows (bb bytes per block) then up rows (bbu)
+        e(f"  %cbbs = index.constant {bb + bbu} : index")
+        e("  %bprs = index.mul %k_blocks, %cbbs : index")
+        e("  %w_bytes = index.mul %m_rows, %bprs : index")
+        e("  %w_halfs = index.div %w_bytes, %c2 : index")
+    elif ff:
         # gate rows then up rows
         e("  %w_rows = index.mul %m_rows, %c2 : index")
         e("  %w_bytes = index.mul %w_rows, %bpr : index")
@@ -435,7 +465,13 @@ def _gen(fmt, kind, t, masked):
     e(f"  %drow = index.min %l64, %c{BM - 1} : index")
     e("  %drow_i = index.cast %drow : index to i32")
     e("  %wg_row_i = index.cast %wg_row : index to i32")
-    if ff:
+    if MX:
+        # both rows: gate row drow % 64 at row_off_i, up row drow % 64 at row_off_u (after the gate tensor)
+        e("  %drow_g = index.rem %drow, %c64 : index")
+        e("  %ff_up = index.cmp uge, %drow, %c64 : index")
+        e("  %drow_gi = index.cast %drow_g : index to i32")
+        e("  %grow_i = scalar.addi %wg_row_i, %drow_gi : i32")
+    elif ff:
         # weight tile row drow: gate row drow (< 64) or up row drow - 64 of the workgroup's 64 rows; the up rows are
         # m_rows further on in the binding (no branch: a branch around the loads drains vmcnt(0) at its join every phase)
         e("  %drow_g = index.rem %drow, %c64 : index")
@@ -449,6 +485,13 @@ def _gen(fmt, kind, t, masked):
     e("  %k_blocks_i = index.cast %k_blocks : index to i32")
     e("  %bpr_i = scalar.muli %k_blocks_i, %cbbi : i32")
     e("  %row_off_i = scalar.muli %grow_i, %bpr_i : i32")
+    if MX:
+        e(f"  %cbbu_i = scalar.constant {bbu} : i32")
+        e("  %bpru_i = scalar.muli %k_blocks_i, %cbbu_i : i32")
+        e("  %m_rows_i = index.cast %m_rows : index to i32")
+        e("  %gate_tot_i = scalar.muli %m_rows_i, %bpr_i : i32")
+        e("  %row_off_u0 = scalar.muli %grow_i, %bpru_i : i32")
+        e("  %row_off_u = scalar.addi %gate_tot_i, %row_off_u0 : i32")
     e(f"  %cslots = index.constant {slots} : index")
     e("  %slot_c = index.min %slot, %cslots : index")
     e("  %decoder = index.cmp ult, %slot, %cslots : index")
@@ -482,6 +525,8 @@ def _gen(fmt, kind, t, masked):
             e(f"  %grp{i} = index.mul %grt{i}, %apitch : index")
             e(f"  %gro{i} = index.add %grp{i}, %gc{i} : index")
     L.extend(F["setup"]())
+    if MX:
+        L.extend(as_up(lambda: Fu["setup"]()))
     if dq:
         # the setup's LDS tables visible, then this workgroup's phase (wg_y) decoded into the LDS tile as the GEMM does it
         e("  %z8s = scalar.constant 0 : i8")
@@ -645,14 +690,22 @@ def _gen(fmt, kind, t, masked):
         # prefetch phase 0: weight bytes and activation row
         L0, wv0 = loads("pf_", "%row_off_i", "%gl_i")
         L.extend(L0)
-    orig0 = wv0
+    wv0u = []
+    if MX and t.ffn_inload:
+        del L[len(L) - len(L0):]   # no prefetch: the decode loads (in place: e appends to L)
+        wv0 = []
+    elif MX:
+        L0u, wv0u = as_up(lambda: loads_u("pfu_", "%row_off_u", "%gl_i"))
+        L.extend(L0u)
+    orig0, orig0u = wv0, wv0u
     wv0 = G.pack_vals(e, wv0, "0")
+    wv0u = G.pack_vals(e, wv0u, "0u")
     av0 = [] if AFRAG else a_loads("pa_", "%kk1" if DBUF else "%c0")
-    carried = wv0 + av0
+    carried = wv0 + wv0u + av0
     ca = ", ".join(f"%a{i} = %init : {V8}" for i in range(NA))
-    ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(carried))
-    carried_t = types + ", " + ", ".join(ty for _, ty in carried)
-    res = ", ".join(f"%acc{i}" for i in range(NA)) + ", " + ", ".join(f"%cvo{x}" for x in range(len(carried)))
+    ca += "".join(f", %cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(carried))
+    carried_t = types + "".join(f", {ty}" for _, ty in carried)
+    res = ", ".join(f"%acc{i}" for i in range(NA)) + "".join(f", %cvo{x}" for x in range(len(carried)))
     e("  " + res + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ({carried_t})  {{")
     if not DBUF:
         e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
@@ -663,7 +716,8 @@ def _gen(fmt, kind, t, masked):
     e("    %gb_i = scalar.addi %phg_i, %gl_i : i32")
     e("    %kb_k = index.mul %kp, %cksub : index")
     cur_w = [(f"%cv{x}", ty) for x, (_, ty) in enumerate(wv0)]
-    cur_a = [f"%cv{len(wv0) + x}" for x in range(len(av0))]
+    cur_wu = [(f"%cv{len(wv0) + x}", ty) for x, (_, ty) in enumerate(wv0u)]
+    cur_a = [f"%cv{len(wv0) + len(wv0u) + x}" for x in range(len(av0))]
 
     def afrag_rhs(st, j):
         """afrag: k step st's B fragment j straight from the input (defines %srhs{st}_{j})"""
@@ -719,8 +773,30 @@ def _gen(fmt, kind, t, masked):
     # decode (only the decoding slots) into the weight tile
     if not DECAHEAD and not DBUF:
         e("    scf.if %decoder {")
-        names = G.unpack_vals(e, cur_w, orig0)
+        if MX and t.ffn_inload:
+            e("    %kb_i0 = index.cast %kb : index to i32")
+            e("    %blk_cg0 = scalar.muli %kb_i0, %cbbi : i32")
+            e("    %blk_cg = scalar.addi %row_off_i, %blk_cg0 : i32")
+            e("    %blk_cu0 = scalar.muli %kb_i0, %cbbu_i : i32")
+            e("    %blk_cu = scalar.addi %row_off_u, %blk_cu0 : i32")
+            e("    scf.if %ff_up {")
+            Lcu, vcu = as_up(lambda: loads_u("cu_", "%blk_cu", "%gb_i"))
+            L.extend(Lcu)
+            L.extend(as_up(lambda: compute_u([n for n, _ in vcu], "%gb_i")))
+            e("    } else {")
+            Lcg, vcg = loads("cg_", "%blk_cg", "%gb_i")
+            L.extend(Lcg)
+            names = [n for n, _ in vcg]
+        elif MX:
+            e("    scf.if %ff_up {")
+            names_u = G.unpack_vals(e, cur_wu, orig0u)
+            L.extend(as_up(lambda: compute_u(names_u, "%gb_i")))
+            e("    } else {")
+        if not (MX and t.ffn_inload):
+            names = G.unpack_vals(e, cur_w, orig0)
         L.extend(compute(names, "%gb_i"))
+        if MX:
+            e("    }")
         e("    }")
     # stage the activation row into the LDS activation tile
     for sg, nm in ([] if DBUF else enumerate(cur_a)):
@@ -762,8 +838,14 @@ def _gen(fmt, kind, t, masked):
             e("    }")
             nxt = [(f"%nxw{x}", ty) for x, (_, ty) in enumerate(cur_w)]
         else:
-            L.extend(Ln)
-            nxt = G.pack_vals(e, nxt, "n")
+            L.extend(Ln if not (MX and t.ffn_inload) else [])
+            nxt = G.pack_vals(e, nxt, "n") if not (MX and t.ffn_inload) else []
+            if MX and not t.ffn_inload:
+                e("    %blk_off0n_u = scalar.muli %kb_ni, %cbbu_i : i32")
+                e("    %blk_n_u = scalar.addi %row_off_u, %blk_off0n_u : i32")
+                Lnu, nxtu = as_up(lambda: loads_u("nxu_", "%blk_n_u", "%gb_n"))
+                L.extend(Lnu)
+                nxt = nxt + G.pack_vals(e, nxtu, "nu")
         if DECAHEAD:
             e("    %kp_a0 = index.add %kp, %c1 : index")
             e("    %kp_a = index.min %kp_a0, %kp_last : index")
@@ -881,8 +963,8 @@ def _gen(fmt, kind, t, masked):
             acc = [f"%sn{st}_{n}" for n in range(NA)]
         if DBUF:
             e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
-          + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
+        e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA))
+          + "".join(f", {nm}" for nm, _ in nxt + anx) + f" : {carried_t}")
         e("  }")
     else:
         e("    " + ", ".join(f"%r{i}" for i in range(NA)) + f" = scf.for %ks = [%c0 to %cksub step %c16]({cb}) -> ({types})  {{")
@@ -914,8 +996,8 @@ def _gen(fmt, kind, t, masked):
         e("    }")
         if DBUF:
             e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA)) + ", "
-          + ", ".join(nm for nm, _ in nxt + anx) + f" : {carried_t}")
+        e("    scf.yield " + ", ".join(f"%r{i}" for i in range(NA))
+          + "".join(f", {nm}" for nm, _ in nxt + anx) + f" : {carried_t}")
         e("  }")
     if t.swepi:
         lds_epilogue(e, t, kr, V8, sw=True, masked=masked)
