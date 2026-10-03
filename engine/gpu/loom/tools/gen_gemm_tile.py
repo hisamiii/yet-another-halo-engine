@@ -85,6 +85,10 @@ class Tile:
     gstage: bool = False       # stage activations through the general segment map even where the row map fits
     dbuf: bool = False         # double-buffered LDS tiles, one barrier per phase (decode / stage phase k+1 while multiplying k)
     tokfast: bool = False      # launch order token tiles fastest: the token tiles of a row block run together (L2 shares weights)
+    afrag: bool = False        # activations not staged in LDS: the MMA's B fragments load straight from the input (needs dbuf)
+    atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
+    lhs_stream: int = 0        # straight-line k steps: load the B fragments first, then each A fragment just before its MMAs,
+                               # with a scheduling fence every lhs_stream A fragments (few A fragments live: tall per-wave tiles)
 
     @property
     def tm(self):
@@ -145,6 +149,7 @@ def check(t):
         (t.ksub // 32 * t.bm <= t.lanes, "not enough lanes to decode a phase in one pass"),
         (not t.swepi or t.tm == 32, "the LDS swiglu epilogue needs 32 rows per wave"),
         (not (t.dbuf and t.decahead), "double buffering replaces decode-ahead"),
+        (not t.afrag or t.ksl, "activation fragments from global need the straight-line k steps"),
     ]
     for ok, why in rules:
         if not ok:
@@ -194,6 +199,7 @@ def _gen(fmt, kind, t, masked):
     FM, FN, NWAVE, LANES, ROWGRP, APL = TM // 16, TN // 16, t.nwave, t.lanes, t.rowgrp, t.apl
     DECAHEAD, KSL, DECLOAD, RHS_OUTER, RHS_FENCE = t.decahead, t.ksl, t.decload, t.rhs_outer, t.rhs_fence
     DBUF = t.dbuf
+    AFRAG = t.afrag
     F = G.FMTS[fmt]
     ksub = t.ksub
     bb, (loads, compute) = F["bb"], F["decode"]
@@ -311,6 +317,11 @@ def _gen(fmt, kind, t, masked):
     e("  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>")
     if not dq:
         e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
+    if AFRAG:
+        e("  %a_rhs = buffer.view %input_na[%base] : buffer -> view<[%ktot]x[%tokens]xf16, %a_layout>")
+        if t.atiled:
+            e("  %a_ktiles = index.div %ktot, %c16 : index")
+            e("  %a_tlay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
     # LDS: decoded weight tile and staged activation tile
     e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF or dq else 1)} : offset")
     e(f"  %wl_tb = index.constant {BM * G.ROWP * 2} : index")
@@ -318,7 +329,7 @@ def _gen(fmt, kind, t, masked):
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
     if not dq:
         # the LDS epilogue's wave-private TM x 16 f32 slabs live in the activation tile
-        al_bytes = BN * arow * 2 * (2 if DBUF else 1)
+        al_bytes = 256 if AFRAG else BN * arow * 2 * (2 if DBUF else 1)
         slabs = NWAVE * (TM + EPAD) * 16 * 4
         if TM == 32:
             al_bytes = max(al_bytes, slabs)
@@ -574,7 +585,7 @@ def _gen(fmt, kind, t, masked):
         # phase 0 decoded and staged into buffer 0 now; phase 1's bytes and activations carried
         L0, w00 = loads("pf_", "%row_off_i", "%gl_i")
         L.extend(L0)
-        a00 = a_loads("pa0_", "%c0")
+        a00 = [] if AFRAG else a_loads("pa0_", "%c0")
         # the setup's LDS tables (IQ grids) must be visible before the first decode; the loop's top barrier did this before
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e("  scf.if %decoder {")
@@ -601,7 +612,7 @@ def _gen(fmt, kind, t, masked):
         L.extend(L0)
     orig0 = wv0
     wv0 = G.pack_vals(e, wv0, "0")
-    av0 = a_loads("pa_", "%kk1" if DBUF else "%c0")
+    av0 = [] if AFRAG else a_loads("pa_", "%kk1" if DBUF else "%c0")
     carried = wv0 + av0
     ca = ", ".join(f"%a{i} = %init : {V8}" for i in range(NA))
     ca += ", " + ", ".join(f"%cv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(carried))
@@ -698,7 +709,7 @@ def _gen(fmt, kind, t, masked):
         e("    %kk_n = index.mul %kp_a, %cksub : index")
     else:
         e("    %kk_n = index.mul %kp_n, %cksub : index")
-    anx = a_loads("na_", "%kk_n")
+    anx = [] if AFRAG else a_loads("na_", "%kk_n")
     if not DBUF:
         e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     if DECAHEAD:
@@ -738,19 +749,49 @@ def _gen(fmt, kind, t, masked):
             if st:
                 e("    scf.schedule.fence")
             e(f"    %sks{st} = index.constant {16 * st} : index")
-            for i in range(FM):
+
+            def slhs(i):
                 e(f"    %slr{st}_{i} = index.add %wr_off, %c{16 * i} : index")
                 e(f"    %slhs{st}_{i} = vector.fragment.load<lhs> {wlv}[%slr{st}_{i}, %sks{st}] shape [%m, %k] : view<{BM}x{G.ROWP}xf16> -> {VF}")
+            if not t.lhs_stream:
+                for i in range(FM):
+                    slhs(i)
 
             def srhs(j):
                 e(f"    %stc{st}_{j} = index.add %wt_off, %c{16 * j} : index")
-                e(f"    %srhs{st}_{j} = vector.fragment.load<rhs> {alv}[%sks{st}, %stc{st}_{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
+                if AFRAG:
+                    # straight from the [tokens][K] input: each lane's 16 halves of its token row are contiguous
+                    e(f"    %sgk{st}_{j} = index.add %kb_k, %sks{st} : index")
+                    e(f"    %sgt{st}_{j} = index.add %token_base, %c{16 * j} : index")
+                    if t.atiled:
+                        # tile (token / 16, k / 16) starts at ((token / 16) * (ktot / 16) + k / 16) * 256 halves
+                        e(f"    %sgtt{st}_{j} = index.div %sgt{st}_{j}, %c16 : index")
+                        e(f"    %sgkt{st}_{j} = index.div %sgk{st}_{j}, %c16 : index")
+                        e(f"    %sgr{st}_{j} = index.mul %sgtt{st}_{j}, %a_ktiles : index")
+                        e(f"    %sgi{st}_{j} = index.add %sgr{st}_{j}, %sgkt{st}_{j} : index")
+                        e(f"    %sgo{st}_{j} = index.mul %sgi{st}_{j}, %c512 : index")
+                        e(f"    %sgob{st}_{j} = index.cast %sgo{st}_{j} : index to offset")
+                        e(f"    %sgv{st}_{j} = buffer.view %input_na[%sgob{st}_{j}] : buffer -> view<16x16xf16, %a_tlay>")
+                        e(f"    %srhs{st}_{j} = vector.fragment.load<rhs> %sgv{st}_{j}[%c0, %c0] shape [%k, %n] : view<16x16xf16, %a_tlay> -> {VF}")
+                    else:
+                        e(f"    %srhs{st}_{j} = vector.fragment.load<rhs> %a_rhs[%sgk{st}_{j}, %sgt{st}_{j}] shape [%k, %n] : view<[%ktot]x[%tokens]xf16, %a_layout> -> {VF}")
+                else:
+                    e(f"    %srhs{st}_{j} = vector.fragment.load<rhs> {alv}[%sks{st}, %stc{st}_{j}] shape [%k, %n] : view<{ksub}x{BN}xf16, %al_layout> -> {VF}")
 
             def smma(i, j):
                 n = i * FN + j
                 name = f"%r{n}" if st == nst - 1 else f"%sn{st}_{n}"
                 e(f"    {name} = vector.mma %slhs{st}_{i}, %srhs{st}_{j}, {acc[n]} : {VF}, {VF}, {V8}")
-            if RHS_OUTER:
+            if t.lhs_stream:
+                for j in range(FN):
+                    srhs(j)
+                for i in range(FM):
+                    slhs(i)
+                    for j in range(FN):
+                        smma(i, j)
+                    if (i + 1) % t.lhs_stream == 0 and i + 1 < FM:
+                        e("    scf.schedule.fence")
+            elif RHS_OUTER:
                 # rhs-outer: each activation fragment dies after its FM MMAs, so a step holds FM + ~RHS_FENCE fragments, not FM + FN
                 for j in range(FN):
                     srhs(j)
