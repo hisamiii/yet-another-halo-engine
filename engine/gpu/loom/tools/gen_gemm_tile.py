@@ -87,6 +87,8 @@ class Tile:
     tokfast: bool = False      # launch order token tiles fastest: the token tiles of a row block run together (L2 shares weights)
     afrag: bool = False        # activations not staged in LDS: the MMA's B fragments load straight from the input (needs dbuf)
     atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
+    tout: bool = False         # swiglu: store the output fragment-major (atiled layout over K = rows) for an afrag consumer
+    stg_minwg: int = STG_MINWG  # smallest grid that staggers (afrag: every grid; lockstep costs it 6-9%)
     wlate: bool = False        # afrag: next phase's weight loads in the last k step (registers free in the MMA section)
     b0early: bool = False      # afrag: issue k step 0's B fragments at the top of the phase, before the decode hides their latency
     bpre: int = 0              # afrag: each k step loads the first bpre of the next step's B fragments before its MMAs (in-phase)
@@ -155,6 +157,7 @@ def check(t):
         (not t.afrag or t.ksl, "activation fragments from global need the straight-line k steps"),
         (not t.bpre or (t.afrag and not t.rhs_outer), "B prefetch is for afrag without rhs-outer"),
         (not t.b0early or (t.afrag and not t.dbuf and not t.decahead), "early step-0 B is for afrag without dbuf/decode-ahead"),
+        (not t.tout or (t.afrag and not t.swepi), "tiled swiglu output is the plain swiglu epilogue of an afrag tile"),
         (not t.wlate or (t.afrag and not t.dbuf and not t.decahead and not t.rhs_outer), "late weight loads are for afrag without dbuf/decode-ahead/rhs-outer"),
     ]
     for ok, why in rules:
@@ -388,7 +391,7 @@ def _gen(fmt, kind, t, masked):
     e("  %stg_lin = index.add %stg_l0, %stg_rx : index")
     e("  %stg_gy = kernel.workgroup.count<y> : index")
     e("  %stg_tot = index.mul %stg_gx, %stg_gy : index")
-    e(f"  %stg_minwg = index.constant {STG_MINWG} : index")
+    e(f"  %stg_minwg = index.constant {t.stg_minwg} : index")
     e("  %stg_big = index.cmp uge, %stg_tot, %stg_minwg : index")
     e(f"  %stg_w = index.constant {STG_NWGP} : index")
     e(f"  %stg_w2 = index.constant {2 * STG_NWGP} : index")
@@ -1204,6 +1207,8 @@ def swiglu_epilogue(e, t, arow, masked=False):
     e("  %lane = index.rem %tid, %c32 : index")
     e(f"  %ep_n = index.constant {16 * ES // 32} : index")
     e(f"  %ep_last = index.constant {16 * ES - 1} : index")
+    if t.tout:
+        e("  %ep_mt = index.div %m_rows, %c16 : index")
     for i in range(FM):
         e(f"  %sr{i} = index.add %m_origin, %c{16 * i} : index")
         for h in range(TN // ES):
@@ -1227,6 +1232,19 @@ def swiglu_epilogue(e, t, arow, masked=False):
             e(f"    %gtok_{q} = index.add %st{q}, %et_{q} : index")
             e(f"    %gto_{q} = index.mul %gtok_{q}, %m_rows : index")
             e(f"    %gix0_{q} = index.add %gto_{q}, %grow_{q} : index")
+            if t.tout:
+                # the output fragment-major (the gate stays row-major): tile (token / 16, row / 16), row fastest inside
+                e(f"    %gtt_{q} = index.div %gtok_{q}, %c16 : index")
+                e(f"    %gtr_{q} = index.rem %gtok_{q}, %c16 : index")
+                e(f"    %grt_{q} = index.div %grow_{q}, %c16 : index")
+                e(f"    %grr_{q} = index.rem %grow_{q}, %c16 : index")
+                e(f"    %gtm_{q} = index.mul %gtt_{q}, %ep_mt : index")
+                e(f"    %gti_{q} = index.add %gtm_{q}, %grt_{q} : index")
+                e(f"    %gtb_{q} = index.mul %gti_{q}, %c256 : index")
+                e(f"    %gtw_{q} = index.mul %gtr_{q}, %c16 : index")
+                e(f"    %gtx_{q} = index.add %gtb_{q}, %gtw_{q} : index")
+                e(f"    %tix0_{q} = index.add %gtx_{q}, %grr_{q} : index")
+                e(f"    %tix_{q} = index.min %tix0_{q}, %out_last : index")
             e(f"    %gix_{q} = index.min %gix0_{q}, %out_last : index")
             if masked:
                 e(f"    %gok_{q} = index.cmp ult, %gtok_{q}, %tokens : index")
@@ -1239,7 +1257,7 @@ def swiglu_epilogue(e, t, arow, masked=False):
             e(f"    %sg_{q} = scalar.mulf %g_{q}, %iv_{q} : f32")
             e(f"    %ac_{q} = scalar.mulf %sg_{q}, %v_{q} : f32")
             e(f"    %h_{q} = scalar.fptrunc %ac_{q} : f32 to f16")
-            e(f"    view.store %h_{q}, %out_h[%gix_{q}] : f16, view<[%out_total]xf16>")
+            e(f"    view.store %h_{q}, %out_h[%{'tix' if t.tout else 'gix'}_{q}] : f16, view<[%out_total]xf16>")
             if masked:
                 e("    }")
             e(f"    scf.yield %em{q} : index")

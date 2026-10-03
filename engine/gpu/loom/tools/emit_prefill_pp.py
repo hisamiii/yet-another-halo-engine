@@ -237,6 +237,33 @@ def decode_free(fmt, mt, kb, B, kind, outdir, done):
     return rows
 
 
+# Activations-from-global GEMMs (gen_gemm_tile Tile.afrag): "<hal>.af.hal" reads a fragment-major input (Tile.atiled; the
+# FFN norm "norm_t.hal" and the swiglu "<hal>.af.to.hal" write it). 512-token tiles, only the decoded weights in LDS.
+# Same values as the GEMM. Where they win, clock-free (2026-10-03): swiglu -7.6..-11.7%, kstore 1088 rows -0.8..-6.5%,
+# kres K = 17408 -0.2..-5.7%. YAH_AFRAG=0 leaves them out.
+AFRAG = os.environ.get("YAH_AFRAG", "1") != "0"
+AF_FMTS = ("iq3s", "iq3xxs", "iq4xs")
+AF_SHAPES = {("kstore", 1088, 20), ("swiglu", 1088, 20), ("kres", 320, 68)}
+AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, wlate=True,
+               bpre=2, b0early=True, stg_minwg=0)
+
+
+def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
+    """Emit "<hal>.af.hal" (and for swiglu "<hal>.af.to.hal", fragment-major output) if this GEMM has an afrag form."""
+    import gen_gemm_tile as TG
+    if not AFRAG or fmt not in AF_FMTS or (kind, mt, kb) not in AF_SHAPES or B % AF_TILE["bn"]:
+        return []
+    t = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **({"swepi": False} if kind == "swiglu" else {}))
+    rows = []
+    for suffix, tt in [(".af.hal", t)] + ([(".af.to.hal", dataclasses.replace(t, tout=True))] if kind == "swiglu" else []):
+        TG.check(tt)
+        r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, fmt, mt, kb, B, out[:-4] + suffix, outdir, kind,
+                      tt.rowgrp)
+        if r:
+            rows.append(r)
+    return rows
+
+
 def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     """Emit the tile GEMM (tools/gen_gemm_tile.py) for this shape if it covers it; return its dispatch.txt row, else None.
     geom=(BM, BN, WM, WN) overrides the workgroup geometry for this one kernel."""
@@ -343,6 +370,7 @@ def main():
                     geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k))
                 if DECODE_FREE:
                     geom.extend(decode_free(fmt, mt, kb, B, k, outdir, df_done))
+                geom.extend(afrag_variants(fmt, mt, kb, B, name(k), outdir, k))
             elif k == "kstore" and fmt == "q2k":
                 # Q2_K has no tile decoder; its only tensors here are the 48-row ssm_alpha / ssm_beta.
                 sym = E.sym_of("yah_ffn_gemm_q2k_f32.loom")
@@ -441,12 +469,19 @@ def main():
     # 4 rows (waves) per workgroup: 46.1 -> 41.9 ms per pp2048 vs one row per workgroup. The tuner's table may set it
     # ({"norm": {"wpr": 2}}); the driver derives the grid from the kernel's workgroup size.
     open(norm_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4)))
+    # the FFN norm for afrag GEMMs: the same values, stored fragment-major
+    normt_src = os.path.join(tmp, "yah_half_norm_tiled.loom")
+    open(normt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled=True))
+    any_af = any(h.endswith(".af.hal") for h, *_ in geom)
     fixed = [
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
         (norm_src, "norm.hal",
          ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
           "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"]),
+        *([(normt_src, "norm_t.hal",
+            ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
+             "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"])] if any_af else []),
         # the conv with the q / k L2 norm (prep_kq) fused in
         ("yah_ssm_conv_kq_f32.loom", "convkq.hal",
          ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",

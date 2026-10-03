@@ -152,10 +152,7 @@ class LoomPrefill {
         RunAttention(l, ci, pre, hook);
       else
         RunDeltaNet(l, pre);
-      RunNorm(pre + "post_attention_norm.weight");
-      RunKstore(pre + "ffn_gate.weight", *gateffn_);
-      RunSwiglu(pre + "ffn_up.weight");
-      RunResidual(pre + "ffn_down.weight", *ffnup_);
+      RunFfn(pre);
     }
   }
 
@@ -453,6 +450,10 @@ class LoomPrefill {
     lse_ = &Alloc(B * kHeads * 4);
     eps_ = &Alloc(4);
     ffnup_ = &Alloc(B * kFfn * 2);
+    // the FFN norm's fragment-major copy for the afrag GEMMs (norm_t.hal), only in sets that have them
+    bool any_af = false;
+    for (const auto& [name, g] : geom_) any_af = any_af || name.size() > 7 && name.compare(name.size() - 7, 7, ".af.hal") == 0;
+    if (any_af) normt_ = &Alloc(B * kHidden * 2);
     gateffn_ = &Alloc(B * kFfn * 4);
     // Per-workgroup weight staging (ABI only: the tile GEMMs stage in LDS) and epilogue scratch sized for the widest
     // GEMM, which the compiler declares over the whole [m_rows][tokens] tile.
@@ -597,14 +598,46 @@ class LoomPrefill {
     return best;
   }
 
-  void RunNorm(const std::string& wname) {
+  // The afrag form of a GEMM HAL ("<hal>.af.hal" / ".af.to.hal", emit_prefill_pp.py afrag_variants), or "".
+  std::string AfHal(const std::string& hal, const char* suffix = ".af.hal") const {
+    const std::string v = hal.substr(0, hal.size() - 4) + suffix;
+    return geom_.count(v) ? v : "";
+  }
+  // The FFN: norm, gate, swiglu (up), down. A GEMM with an afrag form reads its input fragment-major: the norm writes
+  // that layout into normt_ for gate / up (and the plain one into scratch_ if one of them has no afrag form), the swiglu
+  // writes it into ffnup_ for down when both have afrag forms.
+  // afrag GEMMs take 512-token tiles: a short chunk pads more with them than with the narrow tiles PickGemm would take
+  // (300 tokens: 384 rows at x1.12, +2.4% with afrag). They run when their padded rows at ~0.93 the cost per row (their
+  // clock-free gain) cost no more than the best of the full and the set's narrow tiles, PickGemm's untuned weights.
+  bool AfChunk() const {
+    const auto padded = [&](std::uint32_t bn) { return static_cast<double>((n_ + bn - 1) / bn * bn); };
+    double best = padded(256);
+    if (std::any_of(geom_.begin(), geom_.end(),
+                    [](const auto& g) { return g.first.find(".t128.hal") != std::string::npos; }))
+      best = std::min({best, padded(128) * 1.12, padded(64) * 1.6});
+    return padded(512) * 0.93 <= best;
+  }
+  void RunFfn(const std::string& pre) {
+    Fmt f{};
+    const bool chunk_af = AfChunk();
+    const bool gate_af = chunk_af && !AfHal(GemmHal("gemm_kstore", *Find(pre + "ffn_gate.weight"), &f)).empty();
+    const bool up_af = chunk_af && !AfHal(GemmHal("gemm_swiglu", *Find(pre + "ffn_up.weight"), &f)).empty();
+    const bool down_af = up_af && !AfHal(GemmHal("gemm_kres", *Find(pre + "ffn_down.weight"), &f)).empty();
+    if (!gate_af || !up_af) RunNorm(pre + "post_attention_norm.weight");
+    if (gate_af || up_af) RunNorm(pre + "post_attention_norm.weight", true);
+    RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
+    RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
+    RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
+  }
+
+  void RunNorm(const std::string& wname, bool tiled = false) {
     // One wave per row; a workgroup of w waves takes w rows.
-    const LoomExecutable& exe = Exe("norm.hal");
+    const LoomExecutable& exe = Exe(tiled ? "norm_t.hal" : "norm.hal");
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const std::uint32_t rows_per_wg = ws ? ws / 32 : 1;
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1,
-             {Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_), Ref(*scratch_)});
+             {Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_), Ref(tiled ? *normt_ : *scratch_)});
   }
   // Decode-free GEMMs (emit_prefill_pp.py decode_free): "dq_<fmt>_<mt>_<kb>.hal" decodes a GEMM's weights to f16 scratch
   // once per chunk with the tile GEMM's own decode (the same f16 values), "gemm_<kind>_f16_<mt>_<kb>.hal" multiplies them
@@ -681,15 +714,17 @@ class LoomPrefill {
   }
   void DfNext() { ++df_k_; }
 
-  void RunKstore(const std::string& wname, const LoomBuffer& out) {
+  // af: the afrag form, input normt_ (fragment-major)
+  void RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false) {
     const auto* t = Find(wname);
     Fmt f{};
     const std::string base = GemmHal("gemm_kstore", *t, &f);
-    const std::string df = DfGemm("kstore", *t, f);
-    const std::string hal = df.empty() ? PickGemm(base) : df;
+    const std::string df = af ? "" : DfGemm("kstore", *t, f);
+    const std::string hal = af ? AfHal(base) : df.empty() ? PickGemm(base) : df;
     const Geom g = GeomOf(hal);
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
-    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_}) b.push_back(Ref(*x));
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_})
+      b.push_back(Ref(*x));
     b.push_back(Ref(out));
     if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16")).c_str(), MTiles(*t) / g.rowgrp,
@@ -715,15 +750,19 @@ class LoomPrefill {
     if (!df.empty()) DfNext();
     return true;
   }
-  void RunSwiglu(const std::string& wname) {
+  // af: the afrag form, input normt_; tout: its output fragment-major (for an afrag down projection)
+  void RunSwiglu(const std::string& wname, bool af = false, bool tout = false) {
     const auto* t = Find(wname);
     Fmt f{};
     const std::string base = GemmHal("gemm_swiglu", *t, &f);
-    const std::string df = DfGemm("swiglu", *t, f);
-    const std::string hal = df.empty() ? PickGemm(base) : df;
+    const std::string df = af ? "" : DfGemm("swiglu", *t, f);
+    const std::string hal = af ? AfHal(base, tout ? ".af.to.hal" : ".af.hal") : df.empty() ? PickGemm(base) : df;
+    if (hal.empty()) throw LoomError(base + ": the set lacks its afrag form");
     const Geom g = GeomOf(hal);
     auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
-    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, gateffn_, uwstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
+    for (const LoomBuffer* x :
+         std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, gateffn_, uwstage_, ostage_, ffnup_})
+      b.push_back(Ref(*x));
     if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16") + "_swiglu").c_str(),
              MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
@@ -731,13 +770,14 @@ class LoomPrefill {
   }
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
-  void RunResidual(const std::string& wname, const LoomBuffer& input) {
+  // af: the afrag form of the fused kres GEMM (input fragment-major)
+  void RunResidual(const std::string& wname, const LoomBuffer& input, bool af = false) {
     const auto* t = Find(wname);
     Fmt f{};
     const std::string fused0 = GemmHal("gemm_kres", *t, &f);
     if (geom_.count(fused0)) {
-      const std::string df = DfGemm("kres", *t, f);
-      const std::string fused = df.empty() ? PickGemm(fused0) : df;
+      const std::string df = af ? "" : DfGemm("kres", *t, f);
+      const std::string fused = af ? AfHal(fused0) : df.empty() ? PickGemm(fused0) : df;
       const Geom g = GeomOf(fused);
       auto b = df.empty() ? GemmWeights(*t, f) : DfWeights();
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, hidden_, wstage_, ostage_, hidden2_}) b.push_back(Ref(*x));
@@ -916,7 +956,8 @@ class LoomPrefill {
              *lse_ = nullptr, *eps_ = nullptr, *ffnup_ = nullptr, *gateffn_ = nullptr, *uwstage_ = nullptr,
              *wstage_ = nullptr, *ostage_ = nullptr, *partial_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
-             *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr;
+             *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr,
+             *normt_ = nullptr;
 };
 
 }  // namespace yah::model

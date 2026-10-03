@@ -14,7 +14,9 @@ so the second pass reads mostly the weight (a loop form makes ~160 dependent rou
 import sys
 
 
-def gen(dim=5120, wpr=1):
+def gen(dim=5120, wpr=1, tiled=False):
+    """tiled: the output fragment-major for the afrag GEMMs (gen_gemm_tile Tile.atiled): 16 x 16 tiles (row / 16,
+    col / 16) of 256 halves, column fastest inside. Lane l's column l + 32k is tile column 2k + l / 16, offset l % 16."""
     assert dim % 32 == 0
     n = dim // 32
     L = []
@@ -66,6 +68,20 @@ def gen(dim=5120, wpr=1):
         e("  %row = index.add %wgrow, %wave : index")
     e("  %row_base = index.mul %row, %dim : index")
     e("  %lane_base = index.add %row_base, %lane : index")
+    if tiled:
+        e("  %c16t = index.constant 16 : index")
+        e("  %c256t = index.constant 256 : index")
+        e(f"  %ctiles = index.constant {dim // 16} : index")
+        e("  %trow = index.div %row, %c16t : index")
+        e("  %trr = index.rem %row, %c16t : index")
+        e("  %tlh = index.div %lane, %c16t : index")
+        e("  %tll = index.rem %lane, %c16t : index")
+        e("  %tt0 = index.mul %trow, %ctiles : index")
+        e("  %tt1 = index.add %tt0, %tlh : index")
+        e("  %tt2 = index.mul %tt1, %c256t : index")
+        e("  %tt3 = index.mul %trr, %c16t : index")
+        e("  %tt4 = index.add %tt2, %tt3 : index")
+        e("  %tbase = index.add %tt4, %tll : index")
     for k in range(n):
         e(f"  %o{k} = index.constant {32 * k} : index")
         e(f"  %a{k} = index.add %lane_base, %o{k} : index")
@@ -95,7 +111,12 @@ def gen(dim=5120, wpr=1):
         e(f"  %nm{k} = scalar.mulf {xk}, %inv : f32")
         e(f"  %wt{k} = scalar.mulf %nm{k}, %w{k} : f32")
         e(f"  %h{k} = scalar.fptrunc %wt{k} : f32 to f16")
-        e(f"  view.store %h{k}, %out_view[%a{k}] : f16, view<[%total_elems]xf16>")
+        if tiled:
+            e(f"  %to{k} = index.constant {512 * k} : index")
+            e(f"  %ta{k} = index.add %tbase, %to{k} : index")
+            e(f"  view.store %h{k}, %out_view[%ta{k}] : f16, view<[%total_elems]xf16>")
+        else:
+            e(f"  view.store %h{k}, %out_view[%a{k}] : f16, view<[%total_elems]xf16>")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

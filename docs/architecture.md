@@ -51,10 +51,12 @@ Gated DeltaNet layer:
 
 Then the FFN, for every layer:
 
-1. `yah_half_norm` (post_attention_norm).
+1. `yah_half_norm` (post_attention_norm); `norm_t.hal` writes the fragment-major copy for afrag GEMMs (both when one of gate / up has no afrag form).
 2. `gemm_kstore` ffn_gate (17408 rows, f32 out).
-3. `gemm_swiglu` ffn_up: `silu(gate) * up`, f16 out.
+3. `gemm_swiglu` ffn_up: `silu(gate) * up`, f16 out (fragment-major, `.af.to.hal`, when ffn_down is afrag too).
 4. `gemm_kres` ffn_down (5120 x 17408).
+
+For IQ3_S, IQ3_XXS and IQ4_XS these three GEMMs run their afrag forms (below) on chunks where 512-token tiles pad no worse than the narrow ones (`LoomPrefill::AfChunk`).
 
 After the last layer of the last chunk: `yah_rmsnorm` on the last token, the Q6_K output GEMV (`yah_gemv_q6k`, 248320 rows) and `yah_argmax`. A pp2048 pass is 867 dispatches. The token embedding is dequantized on the host and uploaded once per chunk.
 
@@ -70,6 +72,7 @@ All big GEMMs come from `tools/gen_gemm_tile.py`. They are about 90% of prefill 
 - Epilogue kinds: `kstore` (plain store), `kqg` (q / gate split), `swiglu` (reads the f32 gate, LDS epilogue for IQ3), `kres` (fused residual add into a second hidden buffer; the driver swaps the two).
 - On grids of 320 or more workgroups, the second workgroup on each WGP in the first round runs 8000 empty workgroup barriers before it starts. This breaks the lockstep epilogue bursts of the short-K residual GEMMs.
 - Small shapes (the 48-row ssm_alpha / ssm_beta) use a 16-row x 64-token tile.
+- Afrag forms (`<hal>.af.hal`, `Tile.afrag`; the FFN GEMMs of `AF_FMTS` in `emit_prefill_pp.py`): only the decoded weights go to LDS; the activations are WMMA B fragments loaded straight from a fragment-major input (16 x 16 tiles of 512 contiguous bytes, `[token / 16][k / 16][token % 16][k % 16]`). 128 x 512 workgroups of 16 waves x (128 rows x 32 tokens), KSUB 128, two workgroups per WGP at 192 VGPRs, staggered on every grid. Each k step loads the next step's B fragments; the next phase's weight loads go in the last k step.
 
 HAL names encode the shape: `gemm_<kind>_<fmt>_<m_tiles>_<k_blocks>.hal`, with m_tiles = rows / 16 and k_blocks = K / 256 (Q8_0: K / 32). For example `gemm_kstore_iq4xs_1088_20` is a 17408 x 5120 IQ4_XS GEMM.
 
