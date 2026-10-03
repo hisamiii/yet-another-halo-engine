@@ -147,6 +147,20 @@ def conv_n16(text):
 NORM_SPLIT = 2
 
 
+def rope_live(text):
+    """yah_fused_qk_rope_batched without its dead stores: nothing in the prefill reads the f32 K / V cache copies
+    (k_cache / v_cache) or the in-place f32 k_out (the attention reads the f16 caches)."""
+    n = 0
+    out = []
+    for line in text.split("\n"):
+        if re.match(r"\s*view\.store %\w+, %(ko|kc|vc)_view\[", line):
+            n += 1
+            continue
+        out.append(line)
+    assert n >= 5, n
+    return "\n".join(out)
+
+
 def rope_q16(text):
     """yah_fused_qk_rope_batched storing Q as f16(q * 0.0625): the attention's own Q scale and rounding (gen_attn_fa
     Q16), done where Q is produced (half the Q bytes written and read; the same bits)."""
@@ -650,6 +664,9 @@ def main():
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_kpaged.loom")
         open(rope_src, "w").write(rope_kpaged(open(os.path.join(E.LOOM, "yah_fused_qk_rope_batched_f32.loom")).read()))
         geom.append(("rope_kpaged", 0, 0, 0))
+    text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
+    rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_live.loom")
+    open(rope_src, "w").write(rope_live(text))
     if gen_attn_fa.Q16:   # RoPE hands the attention f16(q / 16) (not with K4: its H256 rotates the f32 Q)
         text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_q16.loom")
