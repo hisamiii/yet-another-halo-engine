@@ -56,7 +56,7 @@ Then the FFN, for every layer:
 3. `gemm_swiglu` ffn_up: `silu(gate) * up`, f16 out (fragment-major, `.af.to.hal`, when ffn_down is afrag too).
 4. `gemm_kres` ffn_down (5120 x 17408).
 
-For IQ3_S, IQ3_XXS and IQ4_XS these three GEMMs run their afrag forms (below) on chunks where 512-token tiles pad no worse than the narrow ones (`LoomPrefill::AfChunk`).
+Where the set has afrag forms (below; `AF` in `emit_prefill_pp.py`), the GEMMs run them, also the DeltaNet qkv / gate (`norm_rt.hal` writes both layouts: alpha / beta stay row-major), ssm_out (`postnorm_t.hal`) and the attention o-projection (`wmma_t[_c<i>].hal`), each producer storing fragment-major. These GEMMs run their afrag forms on chunks where 512-token tiles pad no worse than the narrow ones (`LoomPrefill::AfChunk`).
 
 After the last layer of the last chunk: `yah_rmsnorm` on the last token, the Q6_K output GEMV (`yah_gemv_q6k`, 248320 rows) and `yah_argmax`. A pp2048 pass is 867 dispatches. The token embedding is dequantized on the host and uploaded once per chunk.
 

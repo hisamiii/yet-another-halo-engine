@@ -147,11 +147,16 @@ class LoomPrefill {
   void RecordLayers(std::uint32_t ci, const KvHook& hook) {
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
-      RunNorm(pre + "attn_norm.weight");
-      if (cfg_.IsFullAttention(l))
+      if (cfg_.IsFullAttention(l)) {
+        RunNorm(pre + "attn_norm.weight");
         RunAttention(l, ci, pre, hook);
-      else
-        RunDeltaNet(l, pre);
+      } else {
+        // afrag qkv / gate read the fragment-major copy; alpha / beta keep the row-major one
+        const bool qkv_af = Af("gemm_kstore", pre + "attn_qkv.weight");
+        const bool gate_af = Af("gemm_kstore", pre + "attn_gate.weight");
+        RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow);
+        RunDeltaNet(l, pre, qkv_af, gate_af);
+      }
       RunFfn(pre);
     }
   }
@@ -617,27 +622,37 @@ class LoomPrefill {
       best = std::min({best, padded(128) * 1.12, padded(64) * 1.6});
     return padded(512) * 0.93 <= best;
   }
-  void RunFfn(const std::string& pre) {
+  // Whether the GEMM of this kind on tensor wname runs its afrag form in this chunk.
+  bool Af(const char* kind, const std::string& wname) const {
     Fmt f{};
-    const bool chunk_af = AfChunk();
-    const bool gate_af = chunk_af && !AfHal(GemmHal("gemm_kstore", *Find(pre + "ffn_gate.weight"), &f)).empty();
-    const bool up_af = chunk_af && !AfHal(GemmHal("gemm_swiglu", *Find(pre + "ffn_up.weight"), &f)).empty();
-    const bool down_af = up_af && !AfHal(GemmHal("gemm_kres", *Find(pre + "ffn_down.weight"), &f)).empty();
-    if (!gate_af || !up_af) RunNorm(pre + "post_attention_norm.weight");
-    if (gate_af || up_af) RunNorm(pre + "post_attention_norm.weight", true);
+    return AfChunk() && !AfHal(GemmHal(kind, *Find(wname), &f)).empty();
+  }
+  void RunFfn(const std::string& pre) {
+    const bool gate_af = Af("gemm_kstore", pre + "ffn_gate.weight");
+    const bool up_af = Af("gemm_swiglu", pre + "ffn_up.weight");
+    const bool down_af = up_af && Af("gemm_kres", pre + "ffn_down.weight");
+    RunNorm(pre + "post_attention_norm.weight",
+            gate_af && up_af ? NormOut::kTiled : gate_af || up_af ? NormOut::kBoth : NormOut::kRow);
     RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
     RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
     RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
   }
 
-  void RunNorm(const std::string& wname, bool tiled = false) {
+  // kRow: f16 row-major into scratch_; kTiled: fragment-major into normt_ (afrag GEMMs); kBoth: both, one pass.
+  enum class NormOut { kRow, kTiled, kBoth };
+  void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow) {
     // One wave per row; a workgroup of w waves takes w rows.
-    const LoomExecutable& exe = Exe(tiled ? "norm_t.hal" : "norm.hal");
+    const LoomExecutable& exe =
+        Exe(mode == NormOut::kTiled ? "norm_t.hal" : mode == NormOut::kBoth ? "norm_rt.hal" : "norm.hal");
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const std::uint32_t rows_per_wg = ws ? ws / 32 : 1;
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1,
-             {Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_), Ref(tiled ? *normt_ : *scratch_)});
+             mode == NormOut::kBoth
+                 ? std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
+                                                 Ref(*scratch_), Ref(*normt_)}
+                 : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
+                                                 Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)});
   }
   // Decode-free GEMMs (emit_prefill_pp.py decode_free): "dq_<fmt>_<mt>_<kb>.hal" decodes a GEMM's weights to f16 scratch
   // once per chunk with the tile GEMM's own decode (the same f16 values), "gemm_<kind>_f16_<mt>_<kb>.hal" multiplies them
@@ -807,6 +822,8 @@ class LoomPrefill {
   void RunAttention(std::uint32_t l, std::uint32_t ci, const std::string& pre, const KvHook& hook) {
     const std::uint32_t ai = l / cfg_.full_attention_interval;
     if (ai >= full_) throw LoomError("full-attention layer index past the KV slot count");
+    // an afrag o-projection reads the attention output fragment-major (wmma_t)
+    const bool o_af = Af("gemm_kres", pre + "attn_output.weight");
     const bool qg_fused = RunKqg(pre + "attn_q.weight");
     if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
     RunKstore(pre + "attn_k.weight", *kbuf_);
@@ -889,16 +906,16 @@ class LoomPrefill {
       if (attn_kq8_) b.push_back({ksbuf_->handle, ksoff, ks_bytes_});
       if (attn_vqt_) b.push_back({vqsbuf_->handle, vqsoff, vqs_bytes_});
       if (kv_paged_) b.push_back(ptab_ref_);
-      Dispatch(ChunkExe("wmma", ci), "yah_attn_wmma", (B_ + attn_tpw_ - 1) / attn_tpw_, kHeads / attn_hpw_, 1, 256, 1,
+      Dispatch(ChunkExe(o_af ? "wmma_t" : "wmma", ci), "yah_attn_wmma", (B_ + attn_tpw_ - 1) / attn_tpw_, kHeads / attn_hpw_, 1, 256, 1,
                1, b);
     }
-    RunResidual(pre + "attn_output.weight", *scratch_);
+    RunResidual(pre + "attn_output.weight", *scratch_, o_af);
   }
 
-  void RunDeltaNet(std::uint32_t l, const std::string& pre) {
+  void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
     const std::uint32_t si = l - l / cfg_.full_attention_interval;
-    RunKstore(pre + "attn_qkv.weight", *qkv_);
-    RunKstore(pre + "attn_gate.weight", *gate_);
+    RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af);
+    RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
     RunKstore(pre + "ssm_alpha.weight", *alpha_);
     RunKstore(pre + "ssm_beta.weight", *beta_);
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
@@ -916,10 +933,12 @@ class LoomPrefill {
     // DeltaNet grid: (blocks per head, heads) x 256, blocks per head from the "rowsplit.hal" row group.
     Dispatch(Exe("rowsplit.hal"), "yah_deltanet", dn_rowgrp_, kTs, 1, 256, 1, 1,
              {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
-    Dispatch(Exe("postnorm.hal"), "yah_ssm_postnorm_fp16", 6 * B_, 1, 1, 256, 1, 1,
+    // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
+    const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
+    Dispatch(Exe(out_af ? "postnorm_t.hal" : "postnorm.hal"), "yah_ssm_postnorm_fp16", 6 * B_, 1, 1, 256, 1, 1,
              {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), {gate_->handle, 0, std::size_t{B_} * kInner * 4},
               Ref(*scratch_)});
-    RunResidual(pre + "ssm_out.weight", *scratch_);
+    RunResidual(pre + "ssm_out.weight", *scratch_, out_af);
   }
 
   LoomDevice& gpu_;

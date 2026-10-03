@@ -16,7 +16,9 @@ import sys
 
 def gen(dim=5120, wpr=1, tiled=False):
     """tiled: the output fragment-major for the afrag GEMMs (gen_gemm_tile Tile.atiled): 16 x 16 tiles (row / 16,
-    col / 16) of 256 halves, column fastest inside. Lane l's column l + 32k is tile column 2k + l / 16, offset l % 16."""
+    col / 16) of 256 halves, column fastest inside. Lane l's column l + 32k is tile column 2k + l / 16, offset l % 16.
+    tiled="both": the row-major output to out and the fragment-major one to a sixth binding out_t."""
+    both = tiled == "both"
     assert dim % 32 == 0
     n = dim // 32
     L = []
@@ -42,7 +44,8 @@ def gen(dim=5120, wpr=1, tiled=False):
         e(f"  %cwgs = index.constant {32 * wpr} : index")
         e("  %wgs = index.div %rows, %cwpr : index")
         e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%cwgs, %unit, %unit) : index")
-    e("} launch(%x: buffer, %residual: buffer, %weight: buffer, %sum_out: buffer, %out: buffer) {")
+    e("} launch(%x: buffer, %residual: buffer, %weight: buffer, %sum_out: buffer, %out: buffer"
+      + (", %out_t: buffer" if both else "") + ") {")
     e("  %base = index.constant 0 : offset")
     e("  %zero = scalar.constant 0.0 : f32")
     e("  %one = scalar.constant 1.0 : f32")
@@ -50,10 +53,15 @@ def gen(dim=5120, wpr=1, tiled=False):
     e("  %eps = config.get @yah_half_norm.eps : f32")
     e("  %rows = config.get @yah_half_norm.rows : index")
     e("  %total_elems = index.mul %rows, %dim : index")
-    e("  %x_na, %weight_na, %out_na = buffer.assume.noalias %x, %weight, %out : buffer, buffer, buffer")
+    if both:
+        e("  %x_na, %weight_na, %out_na, %out_t_na = buffer.assume.noalias %x, %weight, %out, %out_t : buffer, buffer, buffer, buffer")
+    else:
+        e("  %x_na, %weight_na, %out_na = buffer.assume.noalias %x, %weight, %out : buffer, buffer, buffer")
     e("  %x_view = buffer.view %x_na[%base] : buffer -> view<[%total_elems]xf32>")
     e("  %weight_view = buffer.view %weight_na[%base] : buffer -> view<[%dim]xf32>")
     e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%total_elems]xf16>")
+    if both:
+        e("  %out_t_view = buffer.view %out_t_na[%base] : buffer -> view<[%total_elems]xf16>")
     if wpr == 1:
         e("  %row = kernel.workgroup.id<x> : index")
         e("  %lane = kernel.workitem.id<x> : index")
@@ -114,7 +122,9 @@ def gen(dim=5120, wpr=1, tiled=False):
         if tiled:
             e(f"  %to{k} = index.constant {512 * k} : index")
             e(f"  %ta{k} = index.add %tbase, %to{k} : index")
-            e(f"  view.store %h{k}, %out_view[%ta{k}] : f16, view<[%total_elems]xf16>")
+            if both:
+                e(f"  view.store %h{k}, %out_view[%a{k}] : f16, view<[%total_elems]xf16>")
+            e(f"  view.store %h{k}, %{'out_t_view' if both else 'out_view'}[%ta{k}] : f16, view<[%total_elems]xf16>")
         else:
             e(f"  view.store %h{k}, %out_view[%a{k}] : f16, view<[%total_elems]xf16>")
     e("  kernel.return")

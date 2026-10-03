@@ -78,6 +78,9 @@ KDEC = K4 or K8                       # K decoded to f16 at staging
 # Every 16-key tile lies in one page: one uniform table load per K tile and per V tile.
 # emit_prefill_pp.py clears it when the context is not a multiple of 256.
 PAGED = True
+# TILED_OUT: store the output fragment-major for an afrag o-projection (gen_gemm_tile Tile.atiled over K = 6144): 16 x 16
+# tiles (token / 16, column / 16) of 256 halves, column fastest. A lane's 8 halves sit inside one tile row.
+TILED_OUT = False
 # Page lookups are scalar (SMEM) loads of the global table; an LDS copy of the table was slower.
 # No in-kernel clamp (it cost 1%): the host validates every entry (< npages) before upload,
 # and the cache writers clamp page indices into their pools.
@@ -846,6 +849,25 @@ def gen():
         e(f"  %eg{f}b = vector.load %g_flat[%eo{f}b] : view<[%qtot]xf32> -> {V4}")
     for f in range(8):   # all gate loads together (latency)
         gate_loads(f)
+    if TILED_OUT:
+        e("  %et16 = index.constant 16 : index")
+        e("  %et384 = index.constant 384 : index")
+        e("  %etk = index.div %elc, %et16 : index")
+        e("  %etr = index.rem %elc, %et16 : index")
+        e("  %etkb = index.mul %etk, %et384 : index")
+        e("  %etrb = index.mul %etr, %et16 : index")
+        e("  %etc0a = index.add %ehb, %hd128 : index")   # the lane's column: head * 256 + d
+        e("  %etc0 = index.add %etc0a, %eh8 : index")
+        e("  %etlast = index.sub %qtot, %c8 : index")
+        for f in range(8):
+            e(f"  %etc{f}f = index.add %etc0, %eo{f}c : index")
+            e(f"  %ett{f} = index.div %etc{f}f, %et16 : index")
+            e(f"  %etm{f} = index.rem %etc{f}f, %et16 : index")
+            e(f"  %eti{f} = index.add %etkb, %ett{f} : index")
+            e(f"  %etb{f} = index.mul %eti{f}, %c256 : index")
+            e(f"  %ets{f} = index.add %etb{f}, %etrb : index")
+            e(f"  %etu{f} = index.add %ets{f}, %etm{f} : index")
+            e(f"  %eto{f} = index.min %etu{f}, %etlast : index")   # always in range; states it for the bound proof
     for f in range(8):
         e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
         e(f"  %egn{f} = vector.negf %eg{f} : {V8}")
@@ -858,7 +880,7 @@ def gen():
         e(f"  %eout{f} = vector.mulf %eov{f}, %egr{f} : {V8}")
         e(f"  scf.if %r_live {{")
         e(f"    %eoh{f} = vector.fptrunc %eout{f} : {V8} to {V8H}")
-        e(f"    vector.store %eoh{f}, %o_flat[%eo{f}] : {V8H}, view<[%qtot]xf16>")
+        e(f"    vector.store %eoh{f}, %o_flat[%{'eto' if TILED_OUT else 'eo'}{f}] : {V8H}, view<[%qtot]xf16>")
         e("  }")
     e("  kernel.return")
     e("}")

@@ -70,6 +70,38 @@ def rope_kpaged(text):
     return text
 
 
+def postnorm_tiled(text):
+    """Rewrite yah_ssm_postnorm_fp16 to store fragment-major for an afrag ssm_out (gen_gemm_tile Tile.atiled over
+    K = 6144 = 48 heads x 128): row (token, head) column c is k = head * 128 + c of that token."""
+    def r(a, b):
+        nonlocal text
+        assert text.count(a) == 1, a[:60]
+        text = text.replace(a, b)
+    r("  %c128 = index.constant 128 : index\n",
+      "  %c128 = index.constant 128 : index\n"
+      "  %pt16 = index.constant 16 : index\n"
+      "  %pt48 = index.constant 48 : index\n"
+      "  %pt256 = index.constant 256 : index\n"
+      "  %pt384 = index.constant 384 : index\n")
+    r("      view.store %half, %out_view[%off2] : f16, view<[%io_total]xf16>\n",
+      "      %pt_tok = index.div %head, %pt48 : index\n"
+      "      %pt_hh = index.rem %head, %pt48 : index\n"
+      "      %pt_k0 = index.mul %pt_hh, %c128 : index\n"
+      "      %pt_k = index.add %pt_k0, %column : index\n"
+      "      %pt_tt = index.div %pt_tok, %pt16 : index\n"
+      "      %pt_tr = index.rem %pt_tok, %pt16 : index\n"
+      "      %pt_kt = index.div %pt_k, %pt16 : index\n"
+      "      %pt_kr = index.rem %pt_k, %pt16 : index\n"
+      "      %pt_a = index.mul %pt_tt, %pt384 : index\n"
+      "      %pt_b = index.add %pt_a, %pt_kt : index\n"
+      "      %pt_c = index.mul %pt_b, %pt256 : index\n"
+      "      %pt_d = index.mul %pt_tr, %pt16 : index\n"
+      "      %pt_e = index.add %pt_c, %pt_d : index\n"
+      "      %pt_off = index.add %pt_e, %pt_kr : index\n"
+      "      view.store %half, %out_view[%pt_off] : f16, view<[%io_total]xf16>\n")
+    return text
+
+
 def qk_of(fmt):
     return next(qk for f, _, qk in E.FMT.values() if f == fmt)
 
@@ -244,6 +276,7 @@ AFRAG = os.environ.get("YAH_AFRAG", "1") != "0"
 AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, stg_minwg=0,
                tallepi=True)
 AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
+AF_KQ = dict(rhs_outer=False, rhs_fence=0)   # K-quants: no B prefetch (their decoders need 200-208 VGPRs with it)
 # The GEMMs with an afrag form and their knobs on top of AF_TILE; clock-free vs the GEMM (one round each, 2026-10-03).
 # The best lhs_stream depends on the decoder's register allocation: IQ3_XXS kstore without it waits vmcnt(0) twice per
 # phase on the step-1 B prefetch. Q3_K: the prefetch needs 208 VGPRs (one workgroup per WGP).
@@ -252,13 +285,31 @@ AF = {
     ("iq3s", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                  # -9.1%
     ("iq4xs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                 # -12.9%
     ("iq3xxs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=4),                # -11.3%
-    ("q3k", "kstore", 1088, 20): dict(rhs_outer=False, rhs_fence=0),            # -7.2%
+    ("q3k", "kstore", 1088, 20): dict(AF_KQ),                                   # -7.2%
     ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),     # -11.6%
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),   # -12.1%
     ("iq3s", "kres", 320, 68): dict(AF_PIPE),                                   # -8.6%
     ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4),                    # -10.4%
     ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2),                   # -8.2%
+    ("q4k", "kres", 320, 68): dict(AF_KQ),                                      # -10.4%
+    ("q4k", "swiglu", 1088, 20): dict(AF_KQ, swepi=False),                      # -7.7%
+    # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
+    ("iq3s", "kres", 320, 24): dict(AF_PIPE),                                   # -8.8%
+    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4),                   # -8.5%
+    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4),                    # -8.8%
+    ("q4k", "kres", 320, 24): dict(AF_KQ),                                      # -5.3%
+    # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
+    ("iq3s", "kstore", 640, 20): dict(AF_PIPE),                                 # -9.6%
+    ("iq4xs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=2),                  # -10.3%
+    ("iq3xxs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=4),                 # -11.4%
+    ("q4k", "kstore", 640, 20): dict(AF_KQ),                                    # -7.4%
+    ("q3k", "kstore", 640, 20): dict(AF_KQ),                                    # -7.7%
+    ("iq3s", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=4),                   # -9.4%
+    ("iq4xs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=2),                  # -9.9%
+    ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=4),                 # -10.9%
+    ("q4k", "kstore", 384, 20): dict(AF_KQ),                                    # -6.0%
+    ("q3k", "kstore", 384, 20): dict(AF_KQ),                                    # -6.4%
 }
 
 
@@ -412,6 +463,15 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     open(attn_src, "w").write(gen_attn_fa.gen())
+    # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
+    af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
+    af_dn_in = any(h.startswith("gemm_kstore_") and (h.endswith("_640_20.af.hal") or h.endswith("_384_20.af.hal"))
+                   for h, *_ in geom)
+    attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
+    if af24:
+        gen_attn_fa.TILED_OUT = True
+        open(attn_t_src, "w").write(gen_attn_fa.gen())
+        gen_attn_fa.TILED_OUT = False
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
     geom.append(("wmma.hal", 32, 2, (B + 31) // 32))
@@ -488,6 +548,12 @@ def main():
     normt_src = os.path.join(tmp, "yah_half_norm_tiled.loom")
     open(normt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled=True))
     any_af = any(h.endswith(".af.hal") for h, *_ in geom)
+    # DeltaNet layers' attn_norm: row-major for alpha / beta and fragment-major for afrag qkv / gate, in one pass
+    normrt_src = os.path.join(tmp, "yah_half_norm_both.loom")
+    open(normrt_src, "w").write(gen_half_norm.gen(5120, wpr=tiles().get("norm", {}).get("wpr", 4), tiled="both"))
+    # the DeltaNet postnorm, fragment-major for an afrag ssm_out
+    postnorm_t_src = os.path.join(tmp, "yah_ssm_postnorm_tiled.loom")
+    open(postnorm_t_src, "w").write(postnorm_tiled(open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()))
     fixed = [
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
@@ -497,6 +563,10 @@ def main():
         *([(normt_src, "norm_t.hal",
             ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
              "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"])] if any_af else []),
+        *([(normrt_src, "norm_rt.hal",
+            ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
+             "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"])] if af_dn_in else []),
+        *([(postnorm_t_src, "postnorm_t.hal", ["yah_ssm_postnorm_fp16.head_count=%d" % (48 * B)])] if af24 else []),
         # the conv with the q / k L2 norm (prep_kq) fused in
         ("yah_ssm_conv_kq_f32.loom", "convkq.hal",
          ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
@@ -535,6 +605,12 @@ def main():
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH)],
+        *[(attn_t_src, "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
+            "attention_prefill.cache_capacity=%d" % T,
+            "attention_prefill.token_count=%d" % B,
+            "attention_prefill.start_pos=%d" % (c * B),
+            "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
+            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH) if af24],
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
           if vtrans_src else []),
