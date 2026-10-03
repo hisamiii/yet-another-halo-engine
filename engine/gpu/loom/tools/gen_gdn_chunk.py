@@ -41,6 +41,10 @@ KR, QR, KT, VT, AF, PP, T1, T2, SS, GA = (0, 8704, 17408, 27648, 32768, 37888, 4
 POOL = GA + 6 * 32 * 4          # LG, G2, BETA, BG, GC, GG
 assert POOL <= 65536
 LG, G2, BETA, BG, GC, GG = range(6)
+# OLATE: a chunk's O stores go into the next iteration, after its decay scan and next-chunk loads are issued. The
+# compiler drains every outstanding global store (s_waitcnt_vscnt 0) before the scan's ds_bpermute and before global
+# loads (no alias tracking), so stores at the chunk end stalled wave 0, the critical wave, at the next chunk's start.
+OLATE = True
 TPRE = 2   # phase 3 column loads this many steps ahead (0: at their step); 2: -5.2% (3 hits 256 VGPRs, 4 spills)
 
 
@@ -233,6 +237,17 @@ def gen():
         e(f"{ind}%{p}be = view.load %ab_view[%{p}ab3] : view<[%ab_total]xf32> -> f32")
         names += [f"%{p}al", f"%{p}be"]
         return names
+    def ostore(ind, t0, acc, p):
+        """O tile (tokens ut_row0 + 2 i of the chunk at t0, row ur_row) -> out"""
+        for i in range(8):
+            e(f"{ind}%{p}e{i} = vector.extract {acc}[{i}] : {V8} -> f32")
+            e(f"{ind}%{p}t{i}c = index.constant {2 * i} : index")
+            e(f"{ind}%{p}t{i}0 = index.add {t0}, %ut_row0 : index")
+            e(f"{ind}%{p}t{i}1 = index.add %{p}t{i}0, %{p}t{i}c : index")
+            e(f"{ind}%{p}t{i}2 = index.mul %{p}t{i}1, %inner_size : index")
+            e(f"{ind}%{p}t{i}3 = index.add %{p}t{i}2, %o_rel : index")
+            e(f"{ind}%{p}t{i} = index.add %{p}t{i}3, %ur_row : index")
+            e(f"{ind}view.store %{p}e{i}, %out_view[%{p}t{i}] : f32, view<[%out_total]xf32>")
     ftypes = ["f32", "f32"] + [V4] * 10 + ["f32", "f32"]
     fnames = ["%inv_k", "%q_scale"] + [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + ["%vv0", "%vv1", "%alpha", "%beta"]
     pre = fetch("%c0", "f0_", "  ")
@@ -240,6 +255,10 @@ def gen():
     carried += ", " + ", ".join(f"{n} = {v} : {t}" for n, v, t in zip(fnames, pre, ftypes))
     res = ", ".join(f"%sf{j}" for j in range(4)) + ", " + ", ".join(f"%ff{i}" for i in range(len(fnames)))
     alltypes = ", ".join([V8] * 4 + ftypes)
+    if OLATE:   # the previous chunk's O (8 f32 per lane), stored next iteration
+        carried += f", %opv = %zeros8 : {V8}"
+        res += ", %opf"
+        alltypes += f", {V8}"
     e(f"  {res} = scf.for %ci = [%c0 to %nchunks step %c1]({carried}) -> ({alltypes}) {{")
     I = "    "
     e(f"{I}%t0 = index.mul %ci, %c32 : index")
@@ -305,6 +324,13 @@ def gen():
     e(f"{I}%cn0 = index.add %ci, %c1 : index")
     e(f"{I}%cn = index.min %cn0, %lastc : index")
     nxt = fetch("%cn", "nx_", I)
+    if OLATE:
+        # the previous chunk's O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores
+        # zeros to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same addresses, in order)
+        e(f"{I}%opc0 = index.max %ci, %c1 : index")
+        e(f"{I}%opc = index.sub %opc0, %c1 : index")
+        e(f"{I}%opt0 = index.mul %opc, %c32 : index")
+        ostore(I, "%opt0", "%opv", "ox")
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     # ---- phase 2: KK^T (waves 0-3) -> A (f32), QK^T (waves 4-7) -> P (f16)
     e(f"{I}%p2t = index.rem %sg, %c4 : index")
@@ -481,15 +507,9 @@ def gen():
         e(f"{I}%pb{c} = vector.fragment.load<rhs> %vn_r[%pk{c}, %ur0] shape [%k, %n] : view<32x64xf16, %vn_lay> -> {V16H}")
         e(f"{I}%pc{c} = vector.mma %pa{c}, %pb{c}, {acc} : {V16H}, {V16H}, {V8}")
         acc = f"%pc{c}"
-    for i in range(8):
-        e(f"{I}%oe{i} = vector.extract {acc}[{i}] : {V8} -> f32")
-        e(f"{I}%ot{i}c = index.constant {2 * i} : index")
-        e(f"{I}%ot{i}0 = index.add %t0, %ut_row0 : index")
-        e(f"{I}%ot{i}1 = index.add %ot{i}0, %ot{i}c : index")
-        e(f"{I}%ot{i}2 = index.mul %ot{i}1, %inner_size : index")
-        e(f"{I}%ot{i}3 = index.add %ot{i}2, %o_rel : index")
-        e(f"{I}%ot{i} = index.add %ot{i}3, %ur_row : index")
-        e(f"{I}view.store %oe{i}, %out_view[%ot{i}] : f32, view<[%out_total]xf32>")
+    oacc = acc
+    if not OLATE:
+        ostore(I, "%t0", acc, "o")
     # S <- 2^G_C S + Vn'^T K
     e(f"{I}%gtot = view.load %ga[%gaGC, %c0] : view<6x32xf32> -> f32")   # 2^(G_31 - G_0)
     e(f"{I}%gg0 = view.load %ga[%gaGG, %c0] : view<6x32xf32> -> f32")
@@ -510,8 +530,11 @@ def gen():
             acc = f"%ukc{j}{c}"
         new.append(acc)
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    e(f"{I}scf.yield {', '.join(new + nxt)} : {alltypes}")
+    e(f"{I}scf.yield {', '.join(new + nxt + ([oacc] if OLATE else []))} : {alltypes}")
     e("  }")
+    if OLATE:   # the last chunk's O
+        e("  %oplast = index.mul %lastc, %c32 : index")
+        ostore("  ", "%oplast", "%opf", "ol")
     # ---- final state
     for j in range(4):
         for i in range(8):
