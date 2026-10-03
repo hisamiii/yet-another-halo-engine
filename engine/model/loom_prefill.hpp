@@ -470,6 +470,8 @@ class LoomPrefill {
     alpha_ = &Alloc(B * kTs * 4);
     beta_ = &Alloc(B * kTs * 4);
     q_ = &Alloc(B * kAttn * 4);
+    // q16 sets: RoPE writes the attention's f16(q / 16) here instead of the f32 query in place
+    q16_ = geom_.count("q16") ? &Alloc(B * kAttn * 2) : q_;
     kbuf_ = &Alloc(B * kKv * 4);
     vbuf_ = &Alloc(B * kKv * 4);
     raw_ = &Alloc(B * kInner * 4);
@@ -915,7 +917,7 @@ class LoomPrefill {
                                          Ref(*vbuf_),
                                          TRef(*Find(pre + "attn_q_norm.weight")),
                                          TRef(*Find(pre + "attn_k_norm.weight")),
-                                         Ref(*q_),
+                                         Ref(*q16_),
                                          Ref(*kbuf_),
                                          Ref(*kc32_),
                                          Ref(*vc32_),
@@ -968,7 +970,7 @@ class LoomPrefill {
     if (tail_ == kNoRows) return;  // K / V are written; nothing reads this layer's output
     {
       std::vector<hrx_buffer_ref_t> b = {
-          Ref(*q_),
+          Ref(*q16_),
           Ref(*gate_),
           attn_kq8_     ? hrx_buffer_ref_t{kq8buf_->handle, q8off, kq_bytes_}
           : paged_f16k_ ? kpool_l
@@ -1050,7 +1052,7 @@ class LoomPrefill {
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
-             *gate_ = nullptr, *alpha_ = nullptr, *beta_ = nullptr, *q_ = nullptr, *kbuf_ = nullptr,
+             *gate_ = nullptr, *alpha_ = nullptr, *beta_ = nullptr, *q_ = nullptr, *q16_ = nullptr, *kbuf_ = nullptr,
              *vbuf_ = nullptr, *raw_ = nullptr, *conv_out_ = nullptr, *kqbuf_ = nullptr, *ab_ = nullptr,
              *conv_state_ = nullptr, *state_ = nullptr, *kv16_ = nullptr, *kc32_ = nullptr, *vc32_ = nullptr,
              *lse_ = nullptr, *eps_ = nullptr, *ffnup_ = nullptr, *gateffn_ = nullptr, *uwstage_ = nullptr,

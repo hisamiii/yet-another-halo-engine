@@ -85,6 +85,9 @@ TILED_OUT = False
 # No in-kernel clamp (it cost 1%): the host validates every entry (< npages) before upload,
 # and the cache writers clamp page indices into their pools.
 assert not (K4 and K8)
+# Q16: the query arrives as f16(q * 0.0625) from RoPE (emit_prefill_pp.rope_q16), the scale and rounding this kernel
+# applied to the f32 query: half the Q bytes, same bits. Not with K4 (its H256 rotates the scaled f32 Q first).
+Q16 = not K4
 S_OFF = V_OFF + 256 * VT_PITCH * 2   # S partials: 2 planes x NT x 4 f32
 Q_PITCH = 264
 Q_END = NQB * 16 * Q_PITCH * 2           # Q stage (prologue only)
@@ -225,7 +228,7 @@ def gen():
         CAPV = "%pcap"
     e(f"  %kvtot = index.mul {CAPV}, %c1024 : index")
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
-    e("  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf32>")
+    e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if Q16 else 'f32'}>")
     e("  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
     # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
@@ -397,14 +400,18 @@ def gen():
             e(f"  %qdg{t}c = index.constant 0 : index")
             e(f"  %qdg{t} = index.add %qd{t}, %qdg{t}c : index")
             e(f"  %qa{t} = index.add %qrow, %qdg{t} : index")
-            e(f"  %qa{t}b = index.add %qa{t}, %c4 : index")
-            e(f"  %qv{t}a = vector.load %q_flat[%qa{t}] : view<[%qtot]xf32> -> {V4}")
-            e(f"  %qv{t}b = vector.load %q_flat[%qa{t}b] : view<[%qtot]xf32> -> {V4}")
-            e(f"  %qm{t}a = vector.mulf %qv{t}a, %qsc_v : {V4}")
-            e(f"  %qm{t}b = vector.mulf %qv{t}b, %qsc_v : {V4}")
-        e(f"  %qh{t}a = vector.fptrunc %qm{t}a : {V4} to vector<4xf16>")
-        e(f"  %qh{t}b = vector.fptrunc %qm{t}b : {V4} to vector<4xf16>")
-        e(f"  %qh{t} = vector.concat<0> %qh{t}a, %qh{t}b : vector<4xf16>, vector<4xf16> -> {V8H}")
+            if Q16:
+                e(f"  %qh{t} = vector.load %q_flat[%qa{t}] : view<[%qtot]xf16> -> {V8H}")
+            else:
+                e(f"  %qa{t}b = index.add %qa{t}, %c4 : index")
+                e(f"  %qv{t}a = vector.load %q_flat[%qa{t}] : view<[%qtot]xf32> -> {V4}")
+                e(f"  %qv{t}b = vector.load %q_flat[%qa{t}b] : view<[%qtot]xf32> -> {V4}")
+                e(f"  %qm{t}a = vector.mulf %qv{t}a, %qsc_v : {V4}")
+                e(f"  %qm{t}b = vector.mulf %qv{t}b, %qsc_v : {V4}")
+        if not (Q16 and not K4):
+            e(f"  %qh{t}a = vector.fptrunc %qm{t}a : {V4} to vector<4xf16>")
+            e(f"  %qh{t}b = vector.fptrunc %qm{t}b : {V4} to vector<4xf16>")
+            e(f"  %qh{t} = vector.concat<0> %qh{t}a, %qh{t}b : vector<4xf16>, vector<4xf16> -> {V8H}")
         e(f"  %qz{t} = scf.select %qlive, %qh{t}, %zh8 : {V8H}")
         e(f"  vector.store %qz{t}, %qs_view[%qr, %qd{t}] : {V8H}, view<{NQB * 16}x{Q_PITCH}xf16>")
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")

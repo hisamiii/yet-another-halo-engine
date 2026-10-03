@@ -147,6 +147,21 @@ def conv_n16(text):
 NORM_SPLIT = 2
 
 
+def rope_q16(text):
+    """yah_fused_qk_rope_batched storing Q as f16(q * 0.0625): the attention's own Q scale and rounding (gen_attn_fa
+    Q16), done where Q is produced (half the Q bytes written and read; the same bits)."""
+    a = "%qo_view = buffer.view %qo_na[%base] : buffer -> view<[%q_elems]xf32>"
+    assert text.count(a) == 1
+    text = text.replace(a, a.replace("xf32>", "xf16>") + "\n  %qsc16 = scalar.constant 0.0625 : f32")
+    stores = re.findall(r"view\.store (%\w+), %qo_view\[(%\w+)\] : f32, view<\[%q_elems\]xf32>", text)
+    assert len(stores) == 3, stores
+    for v, i in stores:
+        text = text.replace(f"view.store {v}, %qo_view[{i}] : f32, view<[%q_elems]xf32>",
+                            f"%{v[1:]}q16s = scalar.mulf {v}, %qsc16 : f32\n      %{v[1:]}q16h = scalar.fptrunc %{v[1:]}q16s : f32 to f16\n"
+                            f"      view.store %{v[1:]}q16h, %qo_view[{i}] : f16, view<[%q_elems]xf16>")
+    return text
+
+
 def qk_of(fmt):
     return next(qk for f, _, qk in E.FMT.values() if f == fmt)
 
@@ -635,6 +650,11 @@ def main():
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_kpaged.loom")
         open(rope_src, "w").write(rope_kpaged(open(os.path.join(E.LOOM, "yah_fused_qk_rope_batched_f32.loom")).read()))
         geom.append(("rope_kpaged", 0, 0, 0))
+    if gen_attn_fa.Q16:   # RoPE hands the attention f16(q / 16) (not with K4: its H256 rotates the f32 Q)
+        text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
+        rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_q16.loom")
+        open(rope_src, "w").write(rope_q16(text))
+        geom.append(("q16", 0, 0, 0))
     if paged_f16v:
         vtpage_src = os.path.join(tmp, "yah_vtpage.loom")
         open(vtpage_src, "w").write(gen_kvq.gen_vtpage())
