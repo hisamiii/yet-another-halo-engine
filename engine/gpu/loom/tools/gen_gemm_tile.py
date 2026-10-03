@@ -168,6 +168,10 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
     and skips every per-token load and store past it, so the valid tokens are computed exactly as unmasked."""
     t = tile or default_tile(fmt, kind, 0)
     check(t)
+    # Measured 2026-10-03: decode-ahead outside DECAHEAD_FMTS gives nondeterministic output (IQ3_XXS kres differed on 1 of
+    # 4 runs; IQ3_S, IQ2_XS also seen); the cause is not traced. Within DECAHEAD_FMTS 448 hashed runs agreed.
+    if t.decahead and fmt not in DECAHEAD_FMTS:
+        raise ValueError("decode-ahead is only verified for " + ", ".join(DECAHEAD_FMTS))
     if masked and t.tm != 32:
         raise ValueError(f"{t}: a masked token tile needs the LDS epilogue (32 rows per wave)")
     configure(fmt, t)

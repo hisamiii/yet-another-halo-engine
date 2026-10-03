@@ -105,6 +105,67 @@ def tiles():
 NARROW = ((128, 2), (64, 2))
 
 
+VARIANTS = {}  # GEMM HAL -> [(variant HAL, Tile)] that narrow_variants emitted
+
+
+def calibration_menu(model, outdir, B):
+    """Emit "<gemm>.m<i>.hal": the prefill calibration menu (engine/tune/tune.py menu) of each tile GEMM in this set, built
+    in parallel. Every menu entry and narrow variant must hash the same as its GEMM on the GPU (gemm_bench, real
+    weights); a menu entry that does not is dropped, a narrow variant that does not stops the emit. Returns the rows."""
+    sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..", "..", "tune")))
+    import tempfile
+    from concurrent.futures import ProcessPoolExecutor
+    import gen_gemm_tile as TG
+    import tune
+    if B != tune.CHUNK:
+        return []
+    work = tempfile.mkdtemp(prefix="yah-menu-")
+    kernels = [k for k in tune.inventory(model) if os.path.exists(os.path.join(outdir, k.hal + ".hal"))]
+    todo = []
+    for k in kernels:
+        base = dataclasses.replace(TG.default_tile(k.fmt, k.kind, k.kb), **tiles()["tiles"].get(k.hal, {}))
+        have = [t for _, t in VARIANTS.get(k.hal + ".hal", [])]
+        for i, t in enumerate(tune.menu(k, base, have)):
+            todo.append((k, t, os.path.join(work, "%s.m%d" % (k.hal, i)), i))
+    with ProcessPoolExecutor(os.cpu_count()) as pool:
+        built = list(pool.map(tune.compile_one, [(k, t, d) for k, t, d, _ in todo]))
+    # Each entry against its GEMM at a full and a partial chunk, twice: a race shows as a hash that differs on some runs.
+    CHECKS = [(B, 0), (B, 1), (777, 0), (777, 1)]
+    jobs, meta = [], []
+    for k in kernels:
+        base = dataclasses.replace(TG.default_tile(k.fmt, k.kind, k.kb), **tiles()["tiles"].get(k.hal, {}))
+        roles = tune.roles_of(TG.gen(k.fmt, k.kind, base, B % base.bn != 0))
+        entries = [(base, os.path.join(outdir, k.hal + ".hal"), None, None)]
+        entries += [(t, os.path.join(outdir, hal), hal, None) for hal, t in VARIANTS.get(k.hal + ".hal", [])]
+        entries += [(t, path, "%s.m%d.hal" % (k.hal, i), path)
+                    for (kk, t, d, i), (path, _) in zip(todo, built) if kk is k and path]
+        for t, path, hal, copy in entries:
+            for n, _ in CHECKS:
+                jobs.append((k, t, path, roles, n, 0))
+            meta.append((k, t, hal, copy))
+    res = [h for _, h in tune.bench(model, tune.tables(work), jobs, work, "menu", counters=False)]
+    rows, ref, dropped = [], None, 0
+    for j, (k, t, hal, copy) in enumerate(meta):
+        h = tuple(res[j * len(CHECKS):(j + 1) * len(CHECKS)])
+        if hal is None:
+            ref = h
+            if len(set(h[0:2])) > 1 or len(set(h[2:4])) > 1:
+                raise SystemExit("%s.hal is nondeterministic" % k.hal)
+        elif h != ref:
+            if not copy:
+                raise SystemExit("variant %s computes different values from %s.hal" % (hal, k.hal))
+            dropped += 1
+            print("calibration menu: %s differs from %s.hal (%s), dropped" % (hal, k.hal, tune.knobs(t, TG.default_tile(
+                k.fmt, k.kind, k.kb))))
+        elif copy:
+            shutil.copy(copy, os.path.join(outdir, hal))
+            rows.append((hal, t.bn, t.rowgrp, -(-B // t.bn)))
+    shutil.rmtree(work, ignore_errors=True)
+    print("calibration menu: %d entries for %d GEMMs (%d failed to build, %d differed)"
+          % (len(rows), len(kernels), sum(1 for p, _ in built if not p), dropped))
+    return rows
+
+
 def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
     """Emit "<hal>.t<BN>.hal" for each narrow token tile of this GEMM (the tuner's "variants", else NARROW on the
     default tile), plus the tuner's per-bucket choices as "pick:<hal>:<max tokens> <max tokens> <bn> 0" rows."""
@@ -113,6 +174,7 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
         return []
     base, rows = TG.default_tile(fmt, kind, kb), []
     full = dataclasses.replace(base, **tiles()["tiles"].get(out[:-4], {}))
+    VARIANTS[out] = []
     tuned = tiles().get("variants", {}).get(out[:-4])
     for knobs in (tuned if tuned is not None else [{"bn": bn, "wn": wn} for bn, wn in NARROW]):
         t = dataclasses.replace(base, **knobs)
@@ -128,6 +190,7 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
                       t.rowgrp, masked)
         if r:
             rows.append(r)
+            VARIANTS[out].append((r[0], t))
     for maxtok, bn in sorted(tiles().get("pick", {}).get(out[:-4], {}).items(), key=lambda kv: int(kv[0])):
         rows.append(("pick:%s:%s" % (out, maxtok), int(maxtok), int(bn), 0))
     return rows
@@ -247,6 +310,9 @@ def main():
             elif k == kinds[0]:
                 raise SystemExit("no GEMM kernel for %s %s (%d rows, K = %d)" % (fmt, k, mt * 16, kb * qk_of(fmt)))
         n += 1
+
+    if T > B:  # served sets calibrate their GEMM tiles while running (engine/model/prefill_calib.hpp)
+        geom.extend(calibration_menu(model, outdir, B))
 
     # Attention: tools/gen_attn_fa.py, 32 tokens x 2 heads per workgroup; reads V^T (vtrans.hal, or the paged / quantized pools).
     # KV paging (256-token pages) needs a context that is a multiple of 256; otherwise the caches stay contiguous.

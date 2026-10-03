@@ -1,0 +1,186 @@
+In-process dispatch timestamps: hrx_device_profile_dispatches_begin/flush/end hand completed dispatches (device
+start/end ticks, command buffer, command index, grid) to a callback instead of a profile file. The engine's prefill
+calibration times its GEMM candidates with them during real prefills.
+
+diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
+--- a/libhrx/include/hrx_runtime.h
++++ b/libhrx/include/hrx_runtime.h
+@@ -907,6 +907,37 @@
+                                            hrx_event_t event);
+ 
+ //===----------------------------------------------------------------------===//
++// Dispatch timestamps (LOCAL PROTOTYPE, yah, not upstream)
++//===----------------------------------------------------------------------===//
++
++// One completed dispatch: device start/end ticks and what ran. Graph dispatches
++// carry their command buffer and command index; direct stream dispatches carry
++// command_buffer_id 0 and command_index UINT32_MAX.
++typedef struct hrx_profile_dispatch_t {
++  uint64_t command_buffer_id;
++  uint64_t executable_id;
++  uint32_t command_index;
++  uint32_t function_ordinal;
++  uint32_t workgroup_count[3];
++  uint64_t start_tick;
++  uint64_t end_tick;
++} hrx_profile_dispatch_t;
++
++// Receives completed dispatches during hrx_device_profile_dispatches_flush/end.
++// |dropped| counts records the device could not keep since the last call.
++typedef void (*hrx_profile_dispatch_fn_t)(void* user,
++                                          const hrx_profile_dispatch_t* events,
++                                          size_t count, uint64_t dropped);
++
++// Starts recording dispatch timestamps on |device| (fails while another
++// profile capture, e.g. HRX_PROFILE_FILE, is active). Flush delivers the
++// dispatches completed so far to |fn|; end delivers the rest and stops.
++HRX_API hrx_status_t hrx_device_profile_dispatches_begin(
++    hrx_device_t device, hrx_profile_dispatch_fn_t fn, void* user);
++HRX_API hrx_status_t hrx_device_profile_dispatches_flush(hrx_device_t device);
++HRX_API hrx_status_t hrx_device_profile_dispatches_end(hrx_device_t device);
++
++//===----------------------------------------------------------------------===//
+ // Device memory/peer info
+ //===----------------------------------------------------------------------===//
+ 
+diff --git a/libhrx/src/libhrx/runtime.c b/libhrx/src/libhrx/runtime.c
+--- a/libhrx/src/libhrx/runtime.c
++++ b/libhrx/src/libhrx/runtime.c
+@@ -707,6 +707,137 @@
+   return status;
+ }
+ 
++//===----------------------------------------------------------------------===//
++// Dispatch timestamps to a callback (LOCAL PROTOTYPE, yah, not upstream)
++//===----------------------------------------------------------------------===//
++
++typedef struct hrx_dispatch_sink_t {
++  iree_hal_resource_t resource;
++  iree_allocator_t host_allocator;
++  hrx_profile_dispatch_fn_t fn;
++  void* user;
++} hrx_dispatch_sink_t;
++
++static const iree_hal_profile_sink_vtable_t hrx_dispatch_sink_vtable;
++
++static void hrx_dispatch_sink_destroy(iree_hal_profile_sink_t* base_sink) {
++  hrx_dispatch_sink_t* sink = (hrx_dispatch_sink_t*)base_sink;
++  iree_allocator_free(sink->host_allocator, sink);
++}
++
++static iree_status_t hrx_dispatch_sink_begin_session(
++    iree_hal_profile_sink_t* base_sink,
++    const iree_hal_profile_chunk_metadata_t* metadata) {
++  return iree_ok_status();
++}
++
++static iree_status_t hrx_dispatch_sink_write(
++    iree_hal_profile_sink_t* base_sink,
++    const iree_hal_profile_chunk_metadata_t* metadata,
++    iree_host_size_t iovec_count, const iree_const_byte_span_t* iovecs) {
++  hrx_dispatch_sink_t* sink = (hrx_dispatch_sink_t*)base_sink;
++  if (!iree_string_view_equal(metadata->content_type,
++                              IREE_HAL_PROFILE_CONTENT_TYPE_DISPATCH_EVENTS)) {
++    return iree_ok_status();
++  }
++  hrx_profile_dispatch_t batch[256];
++  size_t count = 0;
++  uint64_t dropped = metadata->dropped_record_count;
++  for (iree_host_size_t i = 0; i < iovec_count; ++i) {
++    const uint8_t* p = iovecs[i].data;
++    const uint8_t* end = p + iovecs[i].data_length;
++    while (p + sizeof(uint32_t) <= end) {
++      iree_hal_profile_dispatch_event_t e;
++      uint32_t length = 0;
++      memcpy(&length, p, sizeof(length));
++      if (length < sizeof(e) || p + length > end) {
++        return iree_make_status(IREE_STATUS_DATA_LOSS,
++                                "malformed dispatch event record");
++      }
++      memcpy(&e, p, sizeof(e));
++      p += length;
++      batch[count++] = (hrx_profile_dispatch_t){
++          .command_buffer_id = e.command_buffer_id,
++          .executable_id = e.executable_id,
++          .command_index = e.command_index,
++          .function_ordinal = e.function_ordinal,
++          .workgroup_count = {e.workgroup_count[0], e.workgroup_count[1],
++                              e.workgroup_count[2]},
++          .start_tick = e.start_tick,
++          .end_tick = e.end_tick,
++      };
++      if (count == IREE_ARRAYSIZE(batch)) {
++        sink->fn(sink->user, batch, count, dropped);
++        count = 0;
++        dropped = 0;
++      }
++    }
++  }
++  if (count || dropped) sink->fn(sink->user, batch, count, dropped);
++  return iree_ok_status();
++}
++
++static iree_status_t hrx_dispatch_sink_end_session(
++    iree_hal_profile_sink_t* base_sink,
++    const iree_hal_profile_chunk_metadata_t* metadata,
++    iree_status_code_t session_status_code) {
++  return iree_ok_status();
++}
++
++static const iree_hal_profile_sink_vtable_t hrx_dispatch_sink_vtable = {
++    .destroy = hrx_dispatch_sink_destroy,
++    .begin_session = hrx_dispatch_sink_begin_session,
++    .write = hrx_dispatch_sink_write,
++    .end_session = hrx_dispatch_sink_end_session,
++};
++
++hrx_status_t hrx_device_profile_dispatches_begin(
++    hrx_device_t device, hrx_profile_dispatch_fn_t fn, void* user) {
++  if (!device || !device->hal_device || !fn) {
++    return hrx_make_status(HRX_STATUS_INVALID_ARGUMENT,
++                           "device or callback is NULL");
++  }
++  if (device->profiling_active) {
++    return hrx_make_status(HRX_STATUS_FAILED_PRECONDITION,
++                           "a profile capture is already active");
++  }
++  iree_allocator_t alloc = iree_allocator_system();
++  hrx_dispatch_sink_t* sink = NULL;
++  iree_status_t status =
++      iree_allocator_malloc(alloc, sizeof(*sink), (void**)&sink);
++  if (iree_status_is_ok(status)) {
++    iree_hal_resource_initialize(&hrx_dispatch_sink_vtable, &sink->resource);
++    sink->host_allocator = alloc;
++    sink->fn = fn;
++    sink->user = user;
++    iree_hal_device_profiling_options_t options = {0};
++    options.data_families = IREE_HAL_DEVICE_PROFILING_DATA_DISPATCH_EVENTS;
++    options.sink = (iree_hal_profile_sink_t*)sink;
++    status = iree_hal_device_profiling_begin(device->hal_device, &options);
++    // The device retains the sink for the session.
++    iree_hal_profile_sink_release((iree_hal_profile_sink_t*)sink);
++  }
++  if (iree_status_is_ok(status)) device->profiling_active = true;
++  return hrx_status_from_iree(status);
++}
++
++hrx_status_t hrx_device_profile_dispatches_flush(hrx_device_t device) {
++  if (!device || !device->profiling_active) {
++    return hrx_make_status(HRX_STATUS_FAILED_PRECONDITION,
++                           "no dispatch profile is active");
++  }
++  return hrx_status_from_iree(
++      iree_hal_device_profiling_flush(device->hal_device));
++}
++
++hrx_status_t hrx_device_profile_dispatches_end(hrx_device_t device) {
++  if (!device || !device->profiling_active) {
++    return hrx_make_status(HRX_STATUS_FAILED_PRECONDITION,
++                           "no dispatch profile is active");
++  }
++  return hrx_status_from_iree(hrx_device_profile_end(device));
++}
++
+ static iree_status_t hrx_gpu_end_all_profiling(void) {
+   iree_status_t status = iree_ok_status();
+   for (int i = 0; i < g_gpu.device_count; ++i) {

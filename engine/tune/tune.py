@@ -103,6 +103,41 @@ def space(k, bucket):
     return out
 
 
+def menu(k, base, exclude=()):
+    """The prefill calibration menu of kernel k (engine/model/prefill_calib.hpp picks among these and base while serving):
+    one knob of base changed at a time, plus narrow token tiles for short chunks. Legal tiles only, none in exclude."""
+    seen = {dataclasses.astuple(t) for t in (base,) + tuple(exclude)}
+    out = []
+    for kw in (dict(decahead=not base.decahead, ksub=64 if base.decahead else 32),
+               dict(ksub=32 if base.ksub == 64 else 64),
+               dict(wn=2 if base.wn != 2 else 4),
+               dict(bn=128, wn=2), dict(bn=128, wn=4), dict(bn=384, wn=4),
+               dict(bn=64, wn=2), dict(bn=32, wn=1, ksub=32)):
+        t = dataclasses.replace(base, **kw)
+        try:
+            TG.check(t)
+        except ValueError:
+            continue
+        if t.decahead and k.fmt not in TG.DECAHEAD_FMTS:
+            continue
+        if k.mt % t.rowgrp or t.nwave > 16 or dataclasses.astuple(t) in seen:
+            continue
+        seen.add(dataclasses.astuple(t))
+        out.append(t)
+    return out
+
+
+def tables(work):
+    """The lookup tables (IQ grids, sign masks) gemm_bench reads, as a prefill set ships them, in work/tables."""
+    table_dir = os.path.join(work, "tables")
+    os.makedirs(table_dir, exist_ok=True)
+    for src, dst in (("grid_iq3s.bin", "grid_iq3s.bin"), ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
+                     ("grid_iq2xxs.bin", "grid_iq2xxs.bin"), ("grid_iq2xs.bin", "grid_iq2xs.bin"),
+                     ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")):
+        shutil.copy(os.path.join(E.LOOM, "tables", src), os.path.join(table_dir, dst))
+    return table_dir
+
+
 def knobs(t, base):
     """The fields of t that differ from the default tile (the YAH_TILES form)."""
     return {f.name: getattr(t, f.name) for f in dataclasses.fields(t) if getattr(t, f.name) != getattr(base, f.name)}
@@ -131,12 +166,17 @@ def compile_one(args):
     m = re.search(r"\.private_segment_fixed_size:\s*(\d+)", notes)
     if m and int(m.group(1)) > 0:
         return None, "spills (%s B private)" % m.group(1)
-    roles = [a.split(":")[0].strip().lstrip("%") for a in re.search(r"\} launch\(([^)]*)\)", src).group(1).split(",")]
-    return hal, roles
+    return hal, roles_of(src)
 
 
-def bench(model, table_dir, jobs, work, tag):
-    """Run jobs [(kernel, tile, hal, roles, tokens, reps)] in one gemm_bench process; return [(cycles, hash)] per job."""
+def roles_of(src):
+    """The bindings of a tile GEMM source in order (its launch signature), as gemm_bench names them."""
+    return [a.split(":")[0].strip().lstrip("%") for a in re.search(r"\} launch\(([^)]*)\)", src).group(1).split(",")]
+
+
+def bench(model, table_dir, jobs, work, tag, counters=True):
+    """Run jobs [(kernel, tile, hal, roles, tokens, reps)] in one gemm_bench process; return [(cycles, hash)] per job
+    (wall ms instead of cycles without counters)."""
     jf = os.path.join(work, tag + ".jobs")
     with open(jf, "w") as f:
         for k, t, hal, roles, n, reps in jobs:
@@ -144,7 +184,7 @@ def bench(model, table_dir, jobs, work, tag):
                                                           n, reps,
                                                           ",".join(roles)))
     env = hrx_paths.env()
-    counters = os.path.isdir(AQL)
+    counters = counters and os.path.isdir(AQL)
     prof = os.path.join(work, tag + ".irpf")
     if counters:
         env.update(HRX_PROFILE_FILE=prof, HRX_PROFILE_MODE="counters", HRX_PROFILE_COUNTERS="SQ_BUSY_CYCLES",
@@ -206,13 +246,7 @@ def main():
     total = sum(k.weight for k in kernels)
     work = a.keep or tempfile.mkdtemp(prefix="yah-tune-")
     os.makedirs(work, exist_ok=True)
-    # Tables (IQ grids, sign masks) as a prefill set ships them.
-    table_dir = os.path.join(work, "tables")
-    os.makedirs(table_dir, exist_ok=True)
-    for src, dst in (("grid_iq3s.bin", "grid_iq3s.bin"), ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
-                     ("grid_iq2xxs.bin", "grid_iq2xxs.bin"), ("grid_iq2xs.bin", "grid_iq2xs.bin"),
-                     ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")):
-        shutil.copy(os.path.join(E.LOOM, "tables", src), os.path.join(table_dir, dst))
+    table_dir = tables(work)
     print("tune: %d GEMMs, work dir %s, %s" % (len(kernels), work,
           "cycles from HRX counters" if os.path.isdir(AQL) else "wall time (no aqlprofile)"), flush=True)
 

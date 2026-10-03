@@ -4,6 +4,8 @@
 usage: gen_kvq.py kmean|kq8|kq4|vq8|vq4|vtpage [out.loom]
 
 yah_kmean: per-channel mean of the f16 K of this layer over the prompt tokens, m[kv_head * 256 + d] (f32).
+  The prompt tokens are the first `valid` rows (a device i32, the chunk's real tokens): the rows past them are padding
+  whose content depends on the GEMM tiles that ran and on earlier prompts.
   Subtracting a per-channel constant from K shifts every score of a query row by the same q . m: softmax is unchanged (exact).
   The mean centres K before quantization (SageAttention smoothing: the outlier channels of K are mostly a per-channel offset).
   Deterministic: one workgroup per KV head, 32 column chunks x 8 row groups, fixed-order LDS sum. grid (4, 1, 1) x 256.
@@ -107,13 +109,18 @@ def gen_kmean():
     e("  %c4 = index.constant 4 : index")
     e("  %c256 = index.constant 256 : index")
     e("  kernel.launch.config workgroups(%c4, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index")
-    e("} launch(%src: buffer, %mean: buffer) {")
+    e("} launch(%src: buffer, %mean: buffer, %valid: buffer) {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 8, 32, 256, 1024):
         e(f"  %c{v} = index.constant {v} : index")
     e("  %ntok0 = config.get @yah_kvq.token_count : index")
     e("  %cap = config.get @yah_kvq.cache_capacity : index")
-    e("  %ntok = index.min %ntok0, %cap : index")
+    e("  %ntok1 = index.min %ntok0, %cap : index")
+    e("  %vl_flat = buffer.view %valid[%base] : buffer -> view<1xi32>")
+    e("  %nv0 = view.load %vl_flat[%c0] : view<1xi32> -> i32")
+    e("  %nvu = index.cast %nv0 : i32 to index")
+    e("  %nv1 = index.max %nvu, %c1 : index")
+    e("  %ntok = index.min %ntok1, %nv1 : index")
     e("  %stot = index.mul %cap, %c1024 : index")
     e("  %s_na, %m_na = buffer.assume.noalias %src, %mean : buffer, buffer")
     e("  %s_flat = buffer.view %s_na[%base] : buffer -> view<[%stot]xf16>")
@@ -476,7 +483,8 @@ def gen_vqt(bits):
     The attention dequantizes with one fma f * S + C' while staging.
     Output [kv head][tile][256 dims] x (2 or 4) dwords; stats [kv head][tile][256] f16 pairs.
     src is the token_count rows of f16 V of the chunk, written at tiles start_pos / 16 + tile of a cache of cache_capacity tokens.
-    Tokens past token_count repeat the last one (keys the softmax masks). grid (4, ceil(token_count / 16)) x 256 (lane = dim)."""
+    Tokens past the chunk's real ones (`valid`, a device i32) repeat the last real one (keys the softmax masks), so the
+    padding rows never enter a tile's range. grid (4, ceil(token_count / 16)) x 256 (lane = dim)."""
     nw = 2 if bits == 4 else 4
     lv = 14 if bits == 4 else 254              # range / s
     off = 7 if bits == 4 else 128              # u offset
@@ -500,7 +508,7 @@ def gen_vqt(bits):
     e("  %t0 = index.add %ntk, %c15 : index")
     e("  %tiles = index.div %t0, %c16 : index")
     e("  kernel.launch.config workgroups(%c4, %tiles, %c1) workgroup_size(%c256, %c1, %c1) : index")
-    e("} launch(%src: buffer, %dst: buffer, %stat: buffer" + (", %ptab: buffer" if PAGED else "") + ") {")
+    e("} launch(%src: buffer, %dst: buffer, %stat: buffer" + (", %ptab: buffer" if PAGED else "") + ", %valid: buffer) {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 4, 15, 16, 256, 1024):
         e(f"  %c{v} = index.constant {v} : index")
@@ -540,7 +548,12 @@ def gen_vqt(bits):
     e("  %hb = index.mul %head, %c256 : index")
     e("  %col = index.add %hb, %d : index")
     e("  %t16 = index.mul %ltile, %c16 : index")
-    e("  %ntok1 = index.sub %ntok, %c1 : index")
+    e("  %vl_flat = buffer.view %valid[%base] : buffer -> view<1xi32>")
+    e("  %nv0 = view.load %vl_flat[%c0] : view<1xi32> -> i32")
+    e("  %nvu = index.cast %nv0 : i32 to index")
+    e("  %nv1 = index.max %nvu, %c1 : index")
+    e("  %nreal = index.min %ntok, %nv1 : index")
+    e("  %ntok1 = index.sub %nreal, %c1 : index")
     vals = []
     for j in range(16):
         e(f"  %tk{j}c = index.constant {j} : index")

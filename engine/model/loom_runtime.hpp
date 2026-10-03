@@ -3,10 +3,12 @@
 #define YAH_MODEL_LOOM_RUNTIME_HPP_
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -161,6 +163,7 @@ class LoomDevice {
   LoomDevice(const LoomDevice&) = delete;
   LoomDevice& operator=(const LoomDevice&) = delete;
   ~LoomDevice() {
+    if (profiling_) hrx_device_profile_dispatches_end(device_);
     if (stream_) hrx_stream_release(stream_);
     // device_ is borrowed (hrx_gpu_device_get does not retain it); hrx_gpu_shutdown releases it.
     // Do not release it here: that clears the device early and HRX_PROFILE_FILE gets no dispatch events or session_end.
@@ -168,6 +171,22 @@ class LoomDevice {
   }
 
   [[nodiscard]] hrx_device_t device() const { return device_; }
+
+  // Device timestamps of completed dispatches (HRX patch 0006). ProfileFlush / ProfileEnd hand the dispatches
+  // completed so far to the sink, with the count of records the device dropped; Synchronize first to get them all.
+  using DispatchSink = std::function<void(const hrx_profile_dispatch_t*, size_t, uint64_t)>;
+  void ProfileBegin(DispatchSink sink) {
+    sink_ = std::move(sink);
+    LoomCheck(hrx_device_profile_dispatches_begin(device_, &LoomDevice::OnDispatches, this),
+              "hrx_device_profile_dispatches_begin");
+    profiling_ = true;
+  }
+  void ProfileFlush() { LoomCheck(hrx_device_profile_dispatches_flush(device_), "hrx_device_profile_dispatches_flush"); }
+  void ProfileEnd() {
+    profiling_ = false;
+    LoomCheck(hrx_device_profile_dispatches_end(device_), "hrx_device_profile_dispatches_end");
+  }
+  [[nodiscard]] bool profiling() const { return profiling_; }
   [[nodiscard]] hrx_stream_t stream() const { return stream_; }
 
   [[nodiscard]] LoomExecutable Load(const std::string& path, const char* target_key = "gfx1151") {
@@ -292,6 +311,13 @@ class LoomDevice {
   bool no_barrier_ok_ = true;
   long sleep_us_ = 0;
   bool initialized_ = false;
+  bool profiling_ = false;
+  DispatchSink sink_;
+
+  static void OnDispatches(void* user, const hrx_profile_dispatch_t* events, size_t count, uint64_t dropped) {
+    auto* self = static_cast<LoomDevice*>(user);
+    if (self->sink_) self->sink_(events, count, dropped);
+  }
 };
 
 // Records dispatches into one HRX graph and launches it on the device stream. Each dispatch waits only for what it
@@ -313,7 +339,8 @@ class LoomGraph {
   void ReadOnly(hrx_buffer_t buffer) { read_only_.insert(buffer); }
 
   // writes: bit i set if the dispatch may write binding i. A missing bit is a race; an extra one only costs overlap.
-  void Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
+  // Returns the node's index: dispatch timestamps of the launched graph carry it as their command index.
+  size_t Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
                 const hrx_buffer_ref_t* bindings, size_t binding_count, uint64_t writes) {
     std::vector<hrx_graph_node_t> deps;
     for (size_t i = 0; i < binding_count; ++i)
@@ -333,7 +360,12 @@ class LoomGraph {
     for (size_t i = 0; i < binding_count; ++i)
       if (!read_only_.count(bindings[i].buffer))
         accesses_[bindings[i].buffer].push_back({bindings[i].offset, bindings[i].length, ((writes >> i) & 1) != 0, node});
+    grids_.push_back({config.workgroup_count[0], config.workgroup_count[1], config.workgroup_count[2]});
+    return grids_.size() - 1;
   }
+  // The workgroup count node i was recorded with.
+  [[nodiscard]] const std::array<uint32_t, 3>& Grid(size_t i) const { return grids_[i]; }
+  [[nodiscard]] size_t size() const { return grids_.size(); }
 
   // Instantiates the graph and queues it on the device stream, after everything queued before.
   void Launch() {
@@ -370,6 +402,7 @@ class LoomGraph {
   std::set<hrx_buffer_t> read_only_;
   std::map<hrx_buffer_t, std::vector<Access>> accesses_;
   std::deque<std::vector<hrx_buffer_ref_t>> bindings_;
+  std::vector<std::array<uint32_t, 3>> grids_;
 };
 
 // The model's tensor-data region (the GGUF mmap) imported once as one device-visible buffer; every tensor is an offset

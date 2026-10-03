@@ -9,7 +9,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <string>
@@ -50,6 +54,7 @@ class Engine : public TextGenerator {
     if (decoder_.kv_bits() != prefill_.kv_bits())
       throw LoomError("engine: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
     gpu_.SetSleepSync(200);
+    prefill_.EnableCalibration(CalibrationPath(o.prefill_hal));
     logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
     token_ = gpu_.Allocate(4);
     seed_ = gpu_.Allocate(8);
@@ -102,6 +107,7 @@ class Engine : public TextGenerator {
       if (c + 1 == chunks) gpu_.Synchronize();
       Track(chunk_ms_, (std::chrono::steady_clock::now() - tc) / ChunkShare(valid), c + 1 == chunks);
     }
+    prefill_.Collect();
     core::TokenId tok;
     if (tail == 0 || tail_chunk) {
       decoder_.ResumeAt(n);
@@ -142,6 +148,27 @@ class Engine : public TextGenerator {
   static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
   // A chunk of n real tokens costs about this share of a full one: the GEMMs (~92% of a full chunk) run whole 256-token
   // tiles, everything else runs the whole chunk.
+  // The prefill calibration's state file: $XDG_CACHE_HOME/yah (else ~/.cache/yah), one per emitted set (its
+  // dispatch.txt contents and time; a re-emit starts over). "" when there is no cache directory.
+  static std::string CalibrationPath(const std::string& set) {
+    namespace fs = std::filesystem;
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    const char* home = std::getenv("HOME");
+    if (!(xdg && *xdg) && !(home && *home)) return "";
+    const fs::path dir = (xdg && *xdg) ? fs::path(xdg) / "yah" : fs::path(home) / ".cache" / "yah";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) return "";
+    std::ifstream f(set + "/dispatch.txt", std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(f)), {});
+    text += std::to_string(fs::last_write_time(set + "/dispatch.txt", ec).time_since_epoch().count());
+    std::uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : text) h = (h ^ c) * 1099511628211ull;
+    char name[40];
+    std::snprintf(name, sizeof name, "calib-%016llx.txt", static_cast<unsigned long long>(h));
+    return (dir / name).string();
+  }
+
   double ChunkShare(std::uint32_t n) const {
     const std::uint32_t B = prefill_.chunk(), tiles = (n + 255) / 256 * 256;
     return 0.08 + 0.92 * std::min(1.0, double(tiles) / B);

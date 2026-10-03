@@ -42,6 +42,8 @@ engine/tune/tune.py <model.gguf>        # ~7 min; writes engine/tune/tables/<mod
 
 It tunes every tile GEMM the driver runs (42 for this model) at five token counts (64, 128, 256, 512, 2048): it enumerates the legal tiles (token tile, waves along tokens, KSUB, decode-ahead), compiles them in parallel through the emitter (footprint gate included, spilling tiles dropped), measures clock-free cycles on the model's real weights with `engine/build/gemm_bench` (rotating through each shape's tensors so weights stream from DRAM as in the pipeline), then re-measures the best few (successive halving). Every candidate's output must hash the same as the default tile's. The table holds the full-chunk tile per GEMM, up to two narrower variants and the measured best variant per token bucket. The emitters use the model's table automatically (`YAH_TILES=<file>` picks another, `YAH_TILES=` none); `LoomPrefill::PickGemm` follows its per-bucket picks. Tuning changes no result bits: re-emit, then check the GPU references.
 
+The server also calibrates while it runs (no command): chunked sets carry a menu of tile variants and `yah_server` picks among them from device timestamps of real prefills, keeping its state in `~/.cache/yah` (see architecture.md, Prefill calibration while serving). The offline table sets each GEMM's own tile; the menu is built around it.
+
 ## Emit HAL sets
 
 Emitters run on the CPU and take a few minutes. Paths below are relative to `engine/gpu/loom`.

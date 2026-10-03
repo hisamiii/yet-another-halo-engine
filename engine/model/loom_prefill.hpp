@@ -20,6 +20,7 @@
 #include <functional>
 #include <initializer_list>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "core/gguf.hpp"
 #include "model/loom_decoder.hpp"
 #include "model/loom_runtime.hpp"
+#include "model/prefill_calib.hpp"
 
 namespace yah::model {
 
@@ -111,6 +113,8 @@ class LoomPrefill {
     for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
       graph.ReadOnly(t->handle);
     graph_ = &graph;
+    nodes_.clear();
+    const bool calibrate = calib_ && calib_->BeginChunk(n_);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       RunNorm(pre + "attn_norm.weight");
@@ -124,8 +128,62 @@ class LoomPrefill {
       RunResidual(pre + "ffn_down.weight", *ffnup_);
     }
     graph_ = nullptr;
+    if (calibrate && !gpu_.profiling()) {
+      try {
+        gpu_.ProfileBegin([this](const hrx_profile_dispatch_t* e, std::size_t n, std::uint64_t) {
+          session_.insert(session_.end(), e, e + n);
+        });
+      } catch (const LoomError& e) {  // e.g. HRX_PROFILE_FILE holds the device's profiler
+        std::fprintf(stderr, "prefill calibration off: %s\n", e.what());
+        calib_.reset();
+      }
+    }
+    if (gpu_.profiling()) session_chunks_.push_back(nodes_);  // every graph of the session, to match them in order
     graph.Launch();
   }
+
+  // The last RunLayers graph's dispatches in node order (= the command index of their dispatch timestamps).
+  struct Node {
+    std::array<std::uint32_t, 3> grid;
+    std::string name;
+    int tag = -1;  // the calibration's tag (PrefillCalib::Choose)
+  };
+  [[nodiscard]] const std::vector<Node>& nodes() const { return nodes_; }
+
+  // Calibrate the GEMM variants while serving (model/prefill_calib.hpp), state in path. The caller runs Collect() after
+  // the chunks of a prompt completed (Synchronize).
+  void EnableCalibration(const std::string& path) {
+    std::map<std::string, std::uint32_t> hals;
+    for (const auto& [name, g] : geom_) hals[name] = g.tokens;
+    calib_ = std::make_unique<PrefillCalib>(hals, path);
+  }
+  // Ends the profile session, if any, and hands each chunk's dispatch timestamps to the calibration.
+  void Collect() {
+    if (!gpu_.profiling()) return;
+    gpu_.ProfileEnd();
+    // Each command buffer of the session in launch order; a chunk's graph is the next one with its node count (stream
+    // dispatches, e.g. the output head, come in command buffers of their own).
+    std::map<std::uint64_t, std::vector<hrx_profile_dispatch_t>> buffers;
+    for (const auto& e : session_) buffers[e.command_buffer_id].push_back(e);
+    const auto before = calib_->Progress();
+    auto chunk = session_chunks_.begin();
+    for (auto& [id, ev] : buffers) {
+      if (chunk == session_chunks_.end()) break;
+      if (ev.size() != chunk->size()) continue;
+      std::sort(ev.begin(), ev.end(), [](const auto& a, const auto& b) { return a.command_index < b.command_index; });
+      std::vector<int> tags;
+      std::vector<std::array<std::uint32_t, 3>> grids;
+      for (const Node& nd : *chunk++) tags.push_back(nd.tag), grids.push_back(nd.grid);
+      calib_->EndChunk(tags, grids, ev);
+    }
+    calib_->EndSession();
+    const auto after = calib_->Progress();
+    if (after != before)
+      std::fprintf(stderr, "prefill calibration: %d GEMM buckets settled, %d open\n", after.first, after.second);
+    session_.clear();
+    session_chunks_.clear();
+  }
+  [[nodiscard]] const PrefillCalib* calibration() const { return calib_.get(); }
 
   // Final norm + output head of hidden() row `row` (this chunk) into dst (kVocab f32).
   void Head(std::uint32_t row, const hrx_buffer_ref_t& dst) {
@@ -316,9 +374,11 @@ class LoomPrefill {
     const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
     const hrx_dispatch_config_t config = LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz);
-    if (graph_)
+    if (graph_) {
       graph_->Dispatch(exe, ordinal, config, b.data(), b.size(), writes);
-    else
+      nodes_.push_back({{gx, gy, gz}, name, pending_tag_});
+      pending_tag_ = -1;
+    } else
       gpu_.Dispatch(exe, ordinal, config, nullptr, 0, b.data(), b.size());
   }
   // A GEMM writes only its outputs; the hand-written Q2_K GEMM also stages its accumulators in ostage.
@@ -492,7 +552,13 @@ class LoomPrefill {
   // x1.12 at 128 tokens, x1.6 at 64). Every variant computes the same values.
   // A tuned set (engine/tune) carries the measured choice instead: "pick:<hal>:<max tokens>" rows map a token bucket to
   // the token tile to use; chunks above the largest bucket take the full tile.
-  std::string PickGemm(const std::string& hal) const {
+  std::string PickGemm(const std::string& hal) {
+    if (calib_ && graph_) {
+      int tag = -1;
+      std::string v = calib_->Choose(hal, &tag);
+      pending_tag_ = tag;
+      if (!v.empty()) return v;
+    }
     const std::string stem = hal.substr(0, hal.size() - 4);
     const std::string prefix = "pick:" + hal + ":";
     bool tuned = false;
@@ -635,7 +701,7 @@ class LoomPrefill {
       const std::size_t qrow = kq_bytes_ / T_, srow = ks_bytes_ / T_;
       if (ci == 0)  // channel mean of the first chunk, kept for the later ones
         Dispatch(Exe("kmean.hal"), "yah_kmean", 4, 1, 1, 256, 1, 1,
-                 {{kv16_->handle, koff, f16rows}, {kmbuf_->handle, kmoff, 4096}});
+                 {{kv16_->handle, koff, f16rows}, {kmbuf_->handle, kmoff, 4096}, Ref(*valid_)});
       std::vector<hrx_buffer_ref_t> b = {{kv16_->handle, koff + f16first, f16rows},
                                          {kmbuf_->handle, kmoff, 4096},
                                          {kq8buf_->handle, q8off + first * qrow, B_ * qrow},
@@ -654,6 +720,7 @@ class LoomPrefill {
                                          {vqbuf_->handle, vqoff, vq_bytes_},
                                          {vqsbuf_->handle, vqsoff, vqs_bytes_}};
       if (kv_paged_) b.push_back(ptab_ref_);
+      b.push_back(Ref(*valid_));
       Dispatch(ChunkExe(attn_vq8_ ? "vq8" : "vq4", ci), attn_vq8_ ? "yah_vq8" : "yah_vq4", 4, (B_ + 15) / 16, 1, 256,
                1, 1, b);
     } else if (paged_f16v_) {
@@ -724,6 +791,12 @@ class LoomPrefill {
   std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, attn_hpw_ = 0, attn_tpw_ = 0;
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records
+  // The last RunLayers graph's dispatches in node order.
+  std::vector<Node> nodes_;
+  std::unique_ptr<PrefillCalib> calib_;
+  int pending_tag_ = -1;
+  std::vector<hrx_profile_dispatch_t> session_;   // dispatch timestamps of the open profile session
+  std::vector<std::vector<Node>> session_chunks_;  // the graphs launched in it
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool attn_kq4_ = false, attn_kq8_ = false, attn_vq4_ = false, attn_vq8_ = false, attn_vqt_ = false;
   bool paged_f16k_ = false, paged_f16v_ = false;
