@@ -633,6 +633,7 @@ class LoomPrefill {
     return AfChunk() && !AfHal(GemmHal(kind, *Find(wname), &f)).empty();
   }
   void RunFfn(const std::string& pre) {
+    if (RunFfnFused(pre)) return;
     const bool gate_af = Af("gemm_kstore", pre + "ffn_gate.weight");
     const bool up_af = Af("gemm_swiglu", pre + "ffn_up.weight");
     const bool down_af = up_af && Af("gemm_kres", pre + "ffn_down.weight");
@@ -645,6 +646,30 @@ class LoomPrefill {
 
   // kRow: f16 row-major into scratch_; kTiled: fragment-major into normt_ (afrag GEMMs); kBoth: both, one pass.
   enum class NormOut { kRow, kTiled, kBoth };
+  // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): both of one
+  // format and ffn_up stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r).
+  // It writes f16(silu(gate) * up) into ffnup_, fragment-major when ffn_down is afrag too. Returns false if not taken.
+  bool RunFfnFused(const std::string& pre) {
+    if (!AfChunk()) return false;
+    const auto* tg = Find(pre + "ffn_gate.weight");
+    const auto* tu = Find(pre + "ffn_up.weight");
+    if (tg->type != tu->type || tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
+    Fmt f{};
+    const std::string base = GemmHal("gemm_ffn", *tg, &f);
+    const bool down_af = Af("gemm_kres", pre + "ffn_down.weight");
+    const std::string hal = AfHal(base, down_af ? ".af.to.hal" : ".af.hal");
+    if (hal.empty()) return false;
+    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled);
+    const Geom g = GeomOf(hal);
+    auto b = GemmWeights(*tg, f);
+    b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), MTiles(*tg) / g.rowgrp, TokenTiles(g),
+             1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
+    return true;
+  }
+
   void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow) {
     // One wave per row; a workgroup of w waves takes w rows.
     const LoomExecutable& exe =

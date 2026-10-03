@@ -971,6 +971,33 @@ def _gen(fmt, kind, t, masked):
 SW_GATE_AHEAD = 1
 
 
+# silu's 1 / (1 + exp(-g)): v_rcp_f32 and one Newton step instead of the exact division (~10 VALU -> 4). Bit-exact for
+# every f32 dn in [1, 2^126] (exhaustive on the GPU, yah-scratch/rcp/rcp_dump.loom: 0 of 1.06e9 differ) and dn = inf (the
+# select). In (2^126, inf) 1/dn is denormal and can differ, but there g is in [-88.7, -87.3], so g * iv * up is below
+# 1e-35 for any finite up and f16 rounds both to the same signed zero.
+FAST_RCP = True
+
+
+def rcp_consts(e, ind="  "):
+    if FAST_RCP:
+        e(f"{ind}%rcp_infb = scalar.constant 2139095040 : i32")
+        e(f"{ind}%rcp_inf = scalar.bitcast %rcp_infb : i32 to f32")
+        e(f"{ind}%rcp_zero = scalar.constant 0.0 : f32")
+
+
+def recip1(e, out, dn, ind="  "):
+    """out = 1 / dn for dn >= 1 (a sigmoid's denominator); needs %one, %negone and rcp_consts."""
+    if not FAST_RCP:
+        e(f"{ind}{out} = scalar.divf %one, {dn} : f32")
+        return
+    e(f"{ind}{out}_r0 = scalar.divf<nnan|ninf|nsz|arcp> %one, {dn} : f32")
+    e(f"{ind}{out}_nd = scalar.mulf {dn}, %negone : f32")
+    e(f"{ind}{out}_er = scalar.fmaf {out}_nd, {out}_r0, %one : f32")
+    e(f"{ind}{out}_r1 = scalar.fmaf {out}_er, {out}_r0, {out}_r0 : f32")
+    e(f"{ind}{out}_if = scalar.cmpf oeq, {dn}, %rcp_inf : f32")
+    e(f"{ind}{out} = scf.select {out}_if, %rcp_zero, {out}_r1 : f32")
+
+
 def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
     """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
@@ -991,6 +1018,7 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
         e("  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%out_total]xf32>")
         e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
         e("  %negone = scalar.constant -1.0 : f32")
+        rcp_consts(e)
         e("  %one = scalar.constant 1.0 : f32")
     elif qg:
         # row r = head*512 + half*256 + d goes to (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
@@ -1063,7 +1091,7 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
                     e(f"  %ng_{y} = scalar.mulf %g_{y}, %negone : f32")
                     e(f"  %ex_{y} = scalar.expf<afn> %ng_{y} : f32")
                     e(f"  %dn_{y} = scalar.addf %one, %ex_{y} : f32")
-                    e(f"  %iv_{y} = scalar.divf %one, %dn_{y} : f32")
+                    recip1(e, f"%iv_{y}", f"%dn_{y}")
                     e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
                     e(f"  %ac_{y} = scalar.mulf %sg_{y}, %v_{y} : f32")
                     e(f"  %h_{y} = scalar.fptrunc %ac_{y} : f32 to f16")
@@ -1194,6 +1222,7 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
     assert sr == 16
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("  %negone = scalar.constant -1.0 : f32")
+    rcp_consts(e)
     e("  %one = scalar.constant 1.0 : f32")
     for i in range(FG):
         for j in range(FN):
@@ -1206,7 +1235,7 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
                 e(f"  %fng_{y} = scalar.mulf %fg_{y}, %negone : f32")
                 e(f"  %fex_{y} = scalar.expf<afn> %fng_{y} : f32")
                 e(f"  %fdn_{y} = scalar.addf %one, %fex_{y} : f32")
-                e(f"  %fiv_{y} = scalar.divf %one, %fdn_{y} : f32")
+                recip1(e, f"%fiv_{y}", f"%fdn_{y}")
                 e(f"  %fsg_{y} = scalar.mulf %fg_{y}, %fiv_{y} : f32")
                 e(f"  %fac_{y} = scalar.mulf %fsg_{y}, %fu_{y} : f32")
                 xs.append(f"%fac_{y}")
@@ -1283,6 +1312,7 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
         e("  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%out_total]xf32>")
         e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
         e("  %negone = scalar.constant -1.0 : f32")
+        rcp_consts(e)
         e("  %one = scalar.constant 1.0 : f32")
     elif qg:
         # row r = head*512 + half*256 + d goes to (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
@@ -1371,7 +1401,7 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
                     e(f"  %ng_{y} = scalar.mulf %g_{y}, %negone : f32")
                     e(f"  %ex_{y} = scalar.expf<afn> %ng_{y} : f32")
                     e(f"  %dn_{y} = scalar.addf %one, %ex_{y} : f32")
-                    e(f"  %iv_{y} = scalar.divf %one, %dn_{y} : f32")
+                    recip1(e, f"%iv_{y}", f"%dn_{y}")
                     e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
                     e(f"  %ac_{y} = scalar.mulf %sg_{y}, %v_{y} : f32")
                     e(f"  %h_{y} = scalar.fptrunc %ac_{y} : f32 to f16")
@@ -1415,6 +1445,7 @@ def swiglu_epilogue(e, t, arow, masked=False):
     e("  %gate_view = buffer.view %gate_na[%base] : buffer -> view<[%out_total]xf32>")
     e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
     e("  %negone = scalar.constant -1.0 : f32")
+    rcp_consts(e)
     e("  %one = scalar.constant 1.0 : f32")
     e("  %out_last = index.sub %out_total, %c1 : index")
     e("  %lane = index.rem %tid, %c32 : index")
@@ -1466,7 +1497,7 @@ def swiglu_epilogue(e, t, arow, masked=False):
             e(f"    %ng_{q} = scalar.mulf %g_{q}, %negone : f32")
             e(f"    %ex_{q} = scalar.expf<afn> %ng_{q} : f32")
             e(f"    %dn_{q} = scalar.addf %one, %ex_{q} : f32")
-            e(f"    %iv_{q} = scalar.divf %one, %dn_{q} : f32")
+            recip1(e, f"%iv_{q}", f"%dn_{q}", "    ")
             e(f"    %sg_{q} = scalar.mulf %g_{q}, %iv_{q} : f32")
             e(f"    %ac_{q} = scalar.mulf %sg_{q}, %v_{q} : f32")
             e(f"    %h_{q} = scalar.fptrunc %ac_{q} : f32 to f16")

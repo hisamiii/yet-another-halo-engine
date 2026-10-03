@@ -325,6 +325,42 @@ AF = {
 }
 
 
+# Fused ffn_gate + ffn_up (gen_gemm_tile kind "ffn"): one afrag GEMM writes f16(silu(gate) * up) for layers whose gate
+# and up share a format (the driver binds both tensors as one: the GGUF stores ffn_up right after ffn_gate). Same
+# values as kstore + swiglu. vs the two afrag GEMMs, clock-free (2026-10-03, fast reciprocal in both): IQ3_S -3.5%,
+# IQ4_XS -0.9%, IQ3_XXS -3.1%.
+AF_FFN = {
+    "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False),
+    "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False),
+    "iq3xxs": dict(AF_PIPE, lhs_stream=2, swepi=False),
+}
+
+
+def ffn_fused(rows, B, outdir):
+    """Emit "gemm_ffn_<fmt>_<mt>_<kb>.af.hal" / ".af.to.hal" for each AF_FFN format some layer uses for both its gate
+    and up; return the dispatch.txt rows."""
+    import gen_gemm_tile as TG
+    if not AFRAG or B % AF_TILE["bn"]:
+        return []
+    by = {}
+    for nm, dims, ty in rows:
+        parts = nm.split(".")
+        if len(parts) > 2 and parts[0] == "blk" and parts[2] in ("ffn_gate", "ffn_up") and E.FMT.get(ty):
+            by.setdefault(parts[1], {})[parts[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
+    out = []
+    for fmt, mt, kb in sorted({l["ffn_gate"] for l in by.values() if l.get("ffn_gate") == l.get("ffn_up")}):
+        if fmt not in AF_FFN:
+            continue
+        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
+        for suffix, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
+            TG.check(tt)
+            r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, fmt, mt, kb, B,
+                          "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, suffix), outdir, "ffn", tt.rowgrp)
+            if r:
+                out.append(r)
+    return out
+
+
 def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     """Emit "<hal>.af.hal" (and for swiglu "<hal>.af.to.hal", fragment-major output) if this GEMM has an afrag form."""
     import gen_gemm_tile as TG
@@ -458,6 +494,8 @@ def main():
             elif k == kinds[0]:
                 raise SystemExit("no GEMM kernel for %s %s (%d rows, K = %d)" % (fmt, k, mt * 16, kb * qk_of(fmt)))
         n += 1
+
+    geom.extend(ffn_fused(rows, B, outdir))
 
     # The calibration menu (calibration_menu, for engine/model/prefill_calib.hpp) is shelved with the calibration;
     # YAH_CALIB_MENU=1 still emits it.
