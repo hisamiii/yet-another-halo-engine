@@ -2547,7 +2547,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
             ER = "reg<aie2p.er>"
             if unit:   # push u = 2 mp + (t's place in DFR_T): (j, i, r) = (u >> 2, u >> 1 & 1, u & 1), in P4 / Q4K order
                 # (one format: both per two slabs): slab i, half j, the gate block at 1024 (mp & 1) + 256 (mp >> 1) +
-                # 512 r + 512 (jbody's address)
+                # 512 r + 512 (jloop's gate block address)
                 assert cfg.hord and NP == 4 and not pair
                 e(f"  {p}ua = and %mp, %one")
                 e(f"  {p}k10 = mova.i32 10")
@@ -2706,104 +2706,45 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
                 e(f"^{s_}x{t}{tag}:")
 
             def jloop(lo, hi, kind, tag, fifo, one=None):
-                """j over the gate slabs lo .. hi - 1, i over their two 8-row halves; kind "sw": g and u from this C, h
-                pushed; "graw" / "gsig" (gate tail): g / silu(g) to the gate buffer; "usig" / "umul" (up tail): h from
-                the buffer's g / silu(g). Returns the exit's store fifo. one: (j, i) registers, a single push (r 0).
+                """j over the gate slabs lo .. hi - 1, i over their two 8-row halves, unrolled into one schedule
+                (lsched); kind "sw": g and u from this C, h pushed; "graw" / "gsig" (gate tail): g / silu(g) to the gate
+                buffer; "usig" / "umul" (up tail): h from the buffer's g / silu(g). Returns the exit's store fifo.
+                one: (j, i) registers, a single push (r 0).
                 """
-                nonlocal nf
                 q, T = p + tag, f"{t}{tag}"
+                s0 = len(L)
                 if one:   # (j, i) as the gate block's address: one[0] + one[1]
                     e(f"  {q}gib = add.rr {one[0]}, {one[1]}")
                     e(f"  {q}kup = mov.i32 {1024 * NP // 2}")
                     e(f"  {q}uib = add.rr {q}gib, {q}kup")
-                    return jbody(q, T, kind, fifo, [0], addr=False)
-                if kind == "sw" and not pair:   # unrolled: one schedule over the segment's pushes
-                    s0 = len(L)
-                    for j in range(lo, hi):
-                        for i in range(2):
-                            qq = f"{q}u{j}{i}"
-                            jj, ii = ((j & ~1) + i, j & 1) if cfg.hord else (j, i)
-                            e(f"  {qq}gk = mov.i32 {1024 * jj + 256 * ii + 512}")
-                            e(f"  {qq}gib = add.rr {p}ss, {qq}gk")
-                            e(f"  {qq}uk = mov.i32 {1024 * jj + 256 * ii + 512 + 1024 * NP // 2}")
+                    fifo = jpush(q, T, kind, fifo, [0])
+                for j in range(lo, hi) if not one else ():
+                    for i in range(2):
+                        # gate rows: slab j, half i (sub-tiles at 256 i, 512 + 256 i); up: NP / 2 slabs on. The record
+                        # takes the 8-feature blocks 2 j + i in loop order; P4 (and Q4K's 4 gate k-blocks of one
+                        # format, its slabs 32 rows apart): per two slabs blocks 0, 2, 1, 3, so (j, i) stand for slab
+                        # (j & ~1) | i, half j & 1; Q4K over 4 slabs (pairs): blocks 0, 4, 1, 5, 2, 6, 3, 7, slab
+                        # (j >> 1) + 2 i, half j & 1 (2 slab: the slab offsets take half the step)
+                        qq = f"{q}u{j}{i}"
+                        jj, ii, jstep = j, i, 1
+                        if cfg.hord == "Q4K" and pair:
+                            jj, ii, jstep = (j & ~1) + 4 * i, j & 1, 2
+                        elif cfg.hord:
+                            jj, ii = (j & ~1) + i, j & 1
+                        go = 1024 // jstep * jj + 256 * ii + 512
+                        e(f"  {qq}gk = mov.i32 {go}")
+                        e(f"  {qq}gib = add.rr {p}ss, {qq}gk")
+                        if pair:   # the slab is up (up tail) or gate (gate tail) rows; the gate buffer's block (j, i):
+                            # 256 bytes in loop order (the pair's tails share the loop's slab order)
+                            e(f"  {qq}uib = add.rr {qq}gib, %zero")
+                            e(f"  {qq}gbk = mov.i32 {512 * j + 256 * i}")
+                            e(f"  {qq}gbb = add.rr {p}gbs0, {qq}gbk")
+                        else:
+                            e(f"  {qq}uk = mov.i32 {go + 1024 * NP // 2}")
                             e(f"  {qq}uib = add.rr {p}ss, {qq}uk")
-                            fifo = jpush(qq, T, kind, fifo, range(2))
-                    L[s0:] = lsched(L[s0:])
-                    return fifo
-                e(f"  {q}j0 = mova.i32 {lo}")
-                e(f"  {q}nj = mova.i32 {hi}")
-                e(f"  low.br ^swj{T}({q}j0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
-                e(f"^swj{T}({q}j: {ER}, {q}JF: {MF}, {q}JO: {MP_}, {q}JP: {MS}):")
-                e(f"  {q}jm = lt {q}j, {q}nj")
-                e(f"  low.cond_br {q}jm, ^swjb{T}, ^swjx{T} : {ER}")
-                e(f"^swjb{T}:")
-                e(f"  {q}ji0 = mova.i32 0")
-                e(f"  low.br ^swi{T}({q}ji0: {ER}, {q}JF: {MF}, {q}JO: {MP_}, {q}JP: {MS})")
-                e(f"^swi{T}({q}i: {ER}, {q}F: {MF}, {q}O: {MP_}, {q}P: {MS}):")
-                e(f"  {q}nbk = mova.i32 2")
-                e(f"  {q}im = lt {q}i, {q}nbk")
-                e(f"  low.cond_br {q}im, ^swib{T}, ^swix{T} : {ER}")
-                e(f"^swib{T}:")
-                fifo = jbody(q, T, kind, (f"{q}F", f"{q}O", f"{q}P"), range(2))
-                e(f"  {q}i1 = add.rr {q}i, %one")
-                e(f"  low.br ^swi{T}({q}i1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
-                e(f"^swix{T}:")
-                fifo = (f"{q}F", f"{q}O", f"{q}P")
-                e(f"  {q}j1 = add.rr {q}j, %one")
-                e(f"  low.br ^swj{T}({q}j1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
-                e(f"^swjx{T}:")
-                return (f"{q}JF", f"{q}JO", f"{q}JP")
-
-            def jbody(q, T, kind, fifo, rs, addr=True):
-                """jloop's body: block (j, i)'s pushes r in rs from fifo; returns the store fifo. addr False: {q}gib,
-                {q}uib made by the caller."""
-                nonlocal nf
-                s0 = len(L)
-                if addr:
-                    jaddr(q)
-                fifo = jpush(q, T, kind, fifo, rs)
+                        fifo = jpush(qq, T, kind, fifo, range(2))
                 L[s0:] = lsched(L[s0:], 24 if kind == "sw" else 12)   # (column pairs' tails: vec256 pressure)
                 return fifo
-
-            def jaddr(q):
-                # gate rows: slab j, half i (sub-tiles at 256 i, 512 + 256 i); up: NP / 2 slabs on. The record takes the
-                # 8-feature blocks 2 j + i in loop order; P4 (and Q4K's 4 gate k-blocks of one format, its slabs 32 rows
-                # apart): per two slabs blocks 0, 2, 1, 3, so the loop's (j, i) stand for slab (j & ~1) | i, half j & 1;
-                # Q4K over 4 slabs (pairs): blocks 0, 4, 1, 5, 2, 6, 3, 7, slab (j >> 1) + 2 i, half j & 1
-                jj, ii, jstep = f"{q}j", f"{q}i", 1
-                if cfg.hord == "Q4K" and pair:
-                    e(f"  {q}hk1 = mov.i32 1")
-                    e(f"  {q}hk2 = mov.i32 2")
-                    e(f"  {q}jod = and {q}j, {q}hk1")
-                    e(f"  {q}jev = sub {q}j, {q}jod")
-                    e(f"  {q}jhf = mul {q}i, {q}hk2")
-                    e(f"  {q}jh2 = add.rr {q}jev, {q}jhf")
-                    e(f"  {q}jpe = add.rr {q}jh2, {q}jhf")      # 2 slab: the slab offsets below take half the step
-                    jj, ii, jstep = f"{q}jpe", f"{q}jod", 2
-                elif cfg.hord:
-                    e(f"  {q}hk1 = mov.i32 1")
-                    e(f"  {q}jod = and {q}j, {q}hk1")
-                    e(f"  {q}jev = sub {q}j, {q}jod")
-                    e(f"  {q}jpe = add.rr {q}jev, {q}i")
-                    jj, ii = f"{q}jpe", f"{q}jod"
-                e(f"  {q}jsl = mov.i32 {1024 // jstep}")
-                e(f"  {q}jo = mul {jj}, {q}jsl")
-                e(f"  {q}k256 = mov.i32 256")
-                e(f"  {q}io = mul {ii}, {q}k256")
-                e(f"  {q}ja = add.rr {p}ss, {q}jo")
-                e(f"  {q}ia = add.rr {q}ja, {q}io")
-                e(f"  {q}k512 = mov.i32 512")
-                e(f"  {q}gib = add.rr {q}ia, {q}k512")
-                if pair:   # the slab is up (up tail) or gate (gate tail) rows; the gate buffer's block (j, i): 256 bytes in
-                    # loop order (the pair's tails share the loop's slab order), so a run of slabs is a run of rows
-                    e(f"  {q}uib = add.rr {q}gib, %zero")
-                    e(f"  {q}gjo = mul {q}j, {q}k512")
-                    e(f"  {q}gio = mul {q}i, {q}k256")
-                    e(f"  {q}gja = add.rr {p}gbs0, {q}gjo")
-                    e(f"  {q}gbb = add.rr {q}gja, {q}gio")
-                else:
-                    e(f"  {q}kup = mov.i32 {1024 * NP // 2}")
-                    e(f"  {q}uib = add.rr {q}gib, {q}kup")
 
             def jpush(q, T, kind, fifo, rs):
                 nonlocal nf
