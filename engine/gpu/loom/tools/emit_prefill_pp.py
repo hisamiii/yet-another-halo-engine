@@ -1028,9 +1028,10 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         rs = list(ex.map(compile_one, [source(*j) for j in jobs]))
         # ghelp's helper (a decoder plus the gate's waiter) can exceed the core's program memory: that image with
-        # the helpers' scale halves rolled (hvroll), else without ghelp
-        for fix, msg in ((dict(hvroll=1), "hvroll"), (dict(hvroll=1, htab=0), "hvroll, helper table per unit"),
-                     (dict(ghelp=0, hvroll=0, htab=1), "no ghelp")):
+        # no seam on the helpers, then the helpers' scale halves rolled (hvroll), else without ghelp
+        for fix, msg in ((dict(seam=2), "helper without seam"), (dict(hvroll=1), "hvroll"),
+                         (dict(hvroll=1, htab=0), "hvroll, helper table per unit"),
+                         (dict(ghelp=0, hvroll=0, htab=1), "no ghelp")):
             redo = [i for i, r in enumerate(rs) if r.returncode and jobs[i][0].ghelp and "core program memory" in r.stderr]
             for i in redo:
                 jobs[i] = (dataclasses.replace(jobs[i][0], **fix),) + tuple(jobs[i][1:])

@@ -94,6 +94,9 @@ class Config:
                         # decode row 1 themselves and hand its records to the head over neighbor memory (fuse_helper)
     hvroll: int = 0     # ghelp: the helpers' decoder with its scale halves rolled (gen_npu_dec VROLL; program memory)
     htab: int = 1       # ghelp: the helpers' decoder table built once per fill (else every unit; program memory)
+    seam: int = 1       # head / mids: the next iteration's first sub-tile init and its WB pops ride with the last
+                        # sub-tile's cascade writes (carried across the back edge), like the inner sub-tile boundaries;
+                        # 2: not on ghelp's helpers (program memory)
     rskip: int = 1      # fuse 2: decode only the half super-blocks (16 k-blocks) overlapping the filler's k-blocks
     hsplit: int = 1     # ghelp: the head's k-blocks past its last whole super-block come from the helper, which decodes
                         # that super-block anyway (the head, the fill's slowest core, decodes one super-block less)
@@ -1707,7 +1710,7 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None, helper=Non
     if gate:   # job state: private storage, zeroed by the array setup of a core stream plan
         e("  %gst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
         e("  %gsp = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
-    body(L, cfg, role, ks, a_adv, acap, gate, pair, fills)
+    body(L, cfg, role, ks, a_adv, acap, gate, pair, fills, helper)
 
 
 def gate_parked(e):
@@ -1996,7 +1999,7 @@ def waiter_epilogue(e, S, parked):
     e("  return")
 
 
-def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
+def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helper=None):
     """The locked stream: per sub-tile MMA + pop bundles, then the cascade boundary.
     head: chains start with mmul; after each sub-tile, 16 cascade writes (the next sub-tile's pops ride with them)
     mid:  mmul at k 0, then k 1-4 add the incoming partial quarter by quarter (fused cascade MMA); writes like the head
@@ -2045,6 +2048,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
         e("  %dqf0 = vlda.store-fifo.high512 %dsp, %dsl, 64")
         e("  %dqo0 = copy %dsp : reg<aie2p.ep> -> reg<aie2p.mpfs>")
         e("  %dqp0 = mova.fifo.store.position 0")
+    hdr = len(L)   # (seam: the entry and the header are rewritten once the first sub-tile's carried values are known)
     e(f"  low.br ^outer(%zero: reg<aie2p.er>, {a0}: {pat}, {po0}: {pct}, %fa0: reg<aie2p.eldfiforeg>, %fw0: reg<aie2p.eldfiforeg>{pla}{dfa(('%dqf0', '%dqo0', '%dqp0'))})")
     e(f"^outer(%mp: reg<aie2p.er>, %pa: {pat}, %po: {pct}, %fa: reg<aie2p.eldfiforeg>, %fw: reg<aie2p.eldfiforeg>{plp}{dfa(("%dqf", "%dqo", "%dqp"))}):")
     dfifo = ("%dqf", "%dqo", "%dqp")
@@ -2115,6 +2119,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
     # sub-tile's FIFO init fills the MMA -> cascade-write latency window and its first WB pops pair with the writes
     slots, prologue, wblock, held = {}, [], {}, {}
     wb = 0 if tail else WB
+    seam = bool(cfg.seam and wb) and not (cfg.seam == 2 and helper == "M")
     for t in range(NT):
         base = t * ks * 4 - LAGU
         early, init, units = units_for(t)
@@ -2126,6 +2131,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
             for u in range(wb, len(units)):
                 slots.setdefault(s0 + u - wb, []).extend(units[u])
             continue
+        if seam:   # t 0: init + the first WB units are carried in (entry: before the loop; back edge: the last writes)
+            assert wb == LAGU and not early
+            seam0 = init + [ln for u in units[:wb] for ln in u]
+            for u in range(wb, len(units)):
+                slots.setdefault(u - wb, []).extend(units[u])
+            continue
         units[0] = init + units[0]
         for i, line in enumerate(early):
             g = base - (len(early) - i)
@@ -2136,6 +2147,94 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                 held.setdefault(t, []).extend(lines)
                 continue
             (prologue if g < 0 else slots.setdefault(g, [])).extend(lines)
+
+    def a_next(e):
+        """%pan: the next iteration's A slab pointer (seam: the last iteration's stays put, the carried pops read it)."""
+        steps = cfg.mu if a_adv else 1
+        mf = "%mf"
+        if seam and a_adv:
+            e("  %fsn = mul %fstep, %nxm")
+            e("  %mfn = mov.modifier %fsn")
+            mf = "%mfn"
+        if not a_adv and (cfg.mu, acap) == (1, 2):   # alternate slots: step = fstep (1 - 2 (mp & 1))
+            e("  %ph = lshl %mp, %am1")
+            e("  %ph2 = add.rr %ph, %ph")
+            e("  %par = sub %mp, %ph2")
+            e("  %fst2 = add.rr %fstep, %fstep")
+            e("  %pst0 = mul %par, %fst2")
+            if seam:
+                e("  %pstr = sub %fstep, %pst0")
+                e("  %pst = mul %pstr, %nxm")
+            else:
+                e("  %pst = sub %fstep, %pst0")
+        if spa and not a_adv and (cfg.mu, acap) == (1, 2):
+            e("  %pan = add.rr %pa, %pst")
+        elif not a_adv and (cfg.mu, acap) == (1, 2):
+            e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e("  %pmod = mov.modifier %pst")
+            e("  %pan = padds.modifier %pac, %pmod")
+        elif spa:   # scalar A pointer: advance by steps slab strides
+            e(f"  %kpst = mova.i32 {steps if a_adv else 0}")
+            e("  %pastep = mul %fstep, %kpst")
+            e("  %pan = add.rr %pa, %pastep")
+        else:
+            e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e(f"  %pan0 = padds.modifier %pac, {mf if a_adv else '%mz'}")
+            for j in range(1, steps):
+                e(f"  %pan{j}c = copy %pan{j - 1} : reg<aie2p.ep> -> reg<aie2p.ep>")
+                e(f"  %pan{j} = padds.modifier %pan{j}c, {mf}")
+            e(f"  %pan = copy %pan{steps - 1} : reg<aie2p.ep> -> reg<aie2p.ep>")
+
+    if seam:
+        defd, used = [], set()
+        for ln in seam0:
+            lhs, _, rhs = ln.partition("=")
+            if rhs:
+                defd += re.findall(r"%\w+", lhs)
+            used |= set(re.findall(r"%\w+", rhs if rhs else lhs))
+        kind = lambda n: ("mexa" if re.match(r"%s0[aw]\d", n) else "eps" if n.startswith("%s0p") else
+                          "eldfiforeg" if n.startswith("%s0f") else "erf2" if n.startswith("%s0q") else None)
+        carried = [n for n in defd if kind(n) == "mexa" or (kind(n) and n not in used)]
+        assert all(kind(n) for n in carried) and len([n for n in carried if kind(n) == "mexa"]) == wb
+
+        def seam_copy(pfx, pa_, fa_, fw_):
+            """seam0 with its own names prefixed pfx, the A pointer pa_, the fifos fa_ / fw_."""
+            out = []
+            for ln in seam0:
+                ln = re.sub(r"%s0(\w*)", lambda m: f"%{pfx}" + m.group(1) if "%s0" + m.group(1) in defd else m.group(0), ln)
+                ln = re.sub(r"%pa\b", pa_, ln)
+                out.append(re.sub(r"%fw\b", fw_, re.sub(r"%fa\b", fa_, ln)))
+            return out
+        ren = lambda pfx: [f"%{pfx}" + n[3:] for n in carried]
+        cty = lambda names: "".join(f", {n}: reg<aie2p.{kind('%s0' + n[3:])}>" for n in names)
+        # the header tests the latch's condition (%more; the entry's: MP // mu > 0)
+        assert L[hdr + 2].strip() == "%omore = lt %mp, %nmp"
+        L[hdr:hdr + 4] = seam_copy("e0", a0, "%fa0", "%fw0") + [
+            f"  low.br ^outer(%zero: reg<aie2p.er>, {a0}: {pat}, {po0}: {pct}, %one: reg<aie2p.er>{cty(ren('e0'))})",
+            f"^outer(%mp: reg<aie2p.er>, %pa: {pat}, %po: {pct}, %more: reg<aie2p.er>{cty(carried)}):",
+            "  low.cond_br %more, ^obody, ^exit : reg<aie2p.er>"]
+        # the latch: its scalar work rides with the last sub-tile's MMAs, the next iteration's A slab (acquired only if
+        # it runs) and init with its last 9 (no pops: the last pop is 10 MMAs before the end), the WB pops with the writes
+        nxt0 = seam_copy("n0", "%pan", fifo["a"], fifo["w"])
+        assert nxt0[0].strip() == "acq %am1, 0"
+        lat = ["  %mpn = add.rr %mp, %one", "  %nxm = lt %mpn, %nmp",
+               "  %cqn = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>"]
+        a_next(lat.append)
+        init_n = [ln for ln in nxt0[1:] if ".pop." not in ln]
+        pos = [ln for ln in init_n if "fifo.position" in ln]
+        # the last 9 MMAs: the positions, the release (pops done), the conditional acquire (lock latency apart); the
+        # MMA -> write gap: the pointer copies and fills (as at the inner boundaries)
+        G = NT * ks * 4
+        assert len(pos) == 2 and len(lat) <= ks * 4 - 9 - wb and max(slots) < G - 9
+        # one op per B-pop MMA (a rematerialized constant's MOVA takes the A load slot; every other MMA hides latency)
+        bs = [g for g in range(G - 10, G - ks * 4, -1) if any("vldb.pop" in ln for ln in slots.get(g, []))
+              and not any("vlda." in ln for ln in slots[g])][:len(lat)]
+        assert len(bs) == len(lat)
+        for g, ln in zip(sorted(bs), lat):
+            slots[g].append(ln)
+        for g, ln in ((G - 9, pos[0]), (G - 8, pos[1]), (G - 7, "  rel %one, 0"), (G - 3, "  acq.cond %am1, %cqn, 0")):
+            slots.setdefault(g, []).append(ln)
+        wblock[NT - 1] = [[ln for ln in init_n if ln not in pos]] + [[ln] for ln in nxt0 if ".pop." in ln]
 
     def emit_writes(t):
         blk = wblock.get(t, [[]])
@@ -2834,33 +2933,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
             for c in range(4):
                 e(f"  %z{t + 1}_{c} = concat(%l{t + 1}_{c}_0, %l{t + 1}_{c}_1, %l{t + 1}_{c}_2, %l{t + 1}_{c}_3) : {MBMS4}")
                 cur[c] = f"%z{t + 1}_{c}"
-    e("  rel %one, 0")
-    steps = cfg.mu if a_adv else 1
-    if not a_adv and (cfg.mu, acap) == (1, 2):   # alternate slots: step = fstep (1 - 2 (mp & 1))
-        e("  %kh = mova.i32 -1")
-        e("  %ph = lshl %mp, %kh")
-        e("  %ph2 = add.rr %ph, %ph")
-        e("  %par = sub %mp, %ph2")
-        e("  %fst2 = add.rr %fstep, %fstep")
-        e("  %pst0 = mul %par, %fst2")
-        e("  %pst = sub %fstep, %pst0")
-    if spa and not a_adv and (cfg.mu, acap) == (1, 2):
-        e("  %pan = add.rr %pa, %pst")
-    elif not a_adv and (cfg.mu, acap) == (1, 2):
-        e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
-        e("  %pmod = mov.modifier %pst")
-        e("  %pan = padds.modifier %pac, %pmod")
-    elif spa:   # scalar A pointer: advance by steps slab strides
-        e(f"  %kpst = mova.i32 {steps if a_adv else 0}")
-        e("  %pastep = mul %fstep, %kpst")
-        e("  %pan = add.rr %pa, %pastep")
-    else:
-        e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
-        e(f"  %pan0 = padds.modifier %pac, {'%mf' if a_adv else '%mz'}")
-        for j in range(1, steps):
-            e(f"  %pan{j}c = copy %pan{j - 1} : reg<aie2p.ep> -> reg<aie2p.ep>")
-            e(f"  %pan{j} = padds.modifier %pan{j}c, %mf")
-        e(f"  %pan = copy %pan{steps - 1} : reg<aie2p.ep> -> reg<aie2p.ep>")
+    if not seam:
+        e("  rel %one, 0")
+        a_next(e)
     if tail:
         e(f"  %pcl = copy {pc[-1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if cfg.swiglu:
@@ -2876,9 +2951,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
             e("  %pln = padds.modifier %plx, %mls")
     else:
         e("  %pon = copy %po : reg<aie2p.er> -> reg<aie2p.er>")
-    e("  %mpn = add.rr %mp, %one")
-    pln = ", %pln: reg<aie2p.ep>" if tail else ""
-    e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln}{dfa(dfifo)})")
+    if seam:
+        e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, %nxm: reg<aie2p.er>{cty(ren('n0'))})")
+    else:
+        e("  %mpn = add.rr %mp, %one")
+        pln = ", %pln: reg<aie2p.ep>" if tail else ""
+        e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln}{dfa(dfifo)})")
     e("^exit:")
     if tail and cfg.dfr:   # the deferred segment: pads, flush (convert_swiglu's), its slot released
         e("  low.cond_br %dfx, ^dfl, ^dfe : reg<aie2p.er>")
