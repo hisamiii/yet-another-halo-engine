@@ -109,6 +109,8 @@ class Config:
                         # at pass s, one h block (a push) after sub-tiles DFR_T of each iteration, in the tail's cascade
                         # slack; the C ring's other half (2 MP slots, released in the same order, so the records and
                         # their addressing are unchanged); the call's last block runs it whole on its last pass
+    dfi: int = 1        # dfr: the deferred push inline (no branch: a firing without a deferred segment pushes into a
+                        # dummy buffer), so no branch delay / quiescence splits the push tile
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
                         # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
                         # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
@@ -284,6 +286,87 @@ def shuffle16_cycles():
 
 
 SHUFFLE16_CYCLES = shuffle16_cycles()
+
+
+# lsched: slot classes and result latencies (Loom's AIE2P itineraries) of a locked straight-line block's ops
+LS_FREE = ("slice", "concat")
+LS_SLOT = (("vlda", "lda", 7), ("mova", "lda", 1), ("mov.scalar-to-address", "lda", 1), ("vldb", "ldb", 7),
+           ("vconv", "st", 2), ("vst", "st", 1), ("vups", "mv", 3), ("vband", "mv", 2), ("vbor", "mv", 2),
+           ("vmax", "mv", 2), ("vmin", "mv", 2), ("vmov", "mv", 2), ("vadd", "mv", 2), ("vbcst", "mv", 2),
+           ("vshuffle", "mv", 2), ("vsel", "mv", 2), ("vlt", "mv", 2), ("vmul", "vec", 6), ("vmac", "vec", 6),
+           ("mov.i32", "lng", 1))
+
+
+def lsched(lines, window=24, alpha=1.0):
+    """Reorders a straight-line block (SSA lines, no labels) for the locked schedule, where the emission order is the
+    issue order and only adjacent independent ops of different slots pack: cycle-driven list scheduling on LS_SLOT's
+    slot classes and latencies (one op a slot a cycle; priority: latency-weighted height less alpha x the original
+    position, which keeps the chains' register pressure near the original order's). An op may not pass one more than
+    window lines earlier in the original order. Free views (slice / concat) follow their inputs, constants
+    (mov.i32 / vbcst: Loom rematerializes them at every use anyway) go just before their first user, and loads stay
+    before the stores after them (the epilogue's store fifo overwrites C in place)."""
+    import re
+    ops = []
+    for i, x in enumerate(lines):
+        lhs, eq, rhs = x.partition(" = ")
+        if not eq:
+            lhs, rhs = "", x
+        mn = rhs.split()[0] if rhs.split() else ""
+        if mn.startswith(LS_FREE):
+            slot, lat = None, 0
+        else:
+            slot, lat = next(((sl, la) for pre, sl, la in LS_SLOT if mn.startswith(pre)), ("alu", 1))
+        ops.append(dict(x=x, mn=mn, defs=re.findall(r"%[\w.]+", lhs),
+                        uses=re.findall(r"%[\w.]+", rhs.split(" : ")[0]), slot=slot, lat=lat))
+    by = {d: i for i, o in enumerate(ops) for d in o["defs"]}
+    preds = [set(by[u] for u in o["uses"] if u in by and by[u] != i) for i, o in enumerate(ops)]
+    for i, o in enumerate(ops):
+        if o["mn"].startswith("vst"):
+            preds[i] |= {k for k in range(i) if ops[k]["mn"].startswith(("vlda", "vst"))}
+    succ = [[] for _ in ops]
+    for i, ps in enumerate(preds):
+        for k in ps:
+            succ[k].append(i)
+    h = [0] * len(ops)
+    for i in reversed(range(len(ops))):
+        h[i] = ops[i]["lat"] + max((h[j] for j in succ[i]), default=0)
+    kdef = [False] * len(ops)
+    for i, o in enumerate(ops):
+        kdef[i] = o["mn"].startswith(("mov.i32", "vbcst")) and all(kdef[k] for k in preds[i])
+
+    def kneed(i, acc):
+        for k in preds[i]:
+            if kdef[k] and k not in acc:
+                acc.add(k)
+                kneed(k, acc)
+        return acc
+    done, ready, out, cyc = [False] * len(ops), [0] * len(ops), [], 0
+    while True:
+        lo = min((i for i in range(len(ops)) if not done[i] and not kdef[i]), default=None)
+        if lo is None:   # (constants nobody uses)
+            out.extend(o["x"] for i, o in enumerate(ops) if not done[i])
+            return out
+        assert cyc < 20 * len(ops) + 100, "lsched stuck"
+        used = set()
+        while True:
+            free = [i for i in range(len(ops)) if not done[i] and not kdef[i] and ops[i]["slot"] is None and
+                    all(done[k] for k in preds[i])]
+            cand = free or [i for i in range(len(ops)) if not done[i] and not kdef[i] and i <= lo + window and
+                            ops[i]["slot"] is not None and ops[i]["slot"] not in used and
+                            all(kdef[k] or done[k] and ready[k] <= cyc for k in preds[i])]
+            if not cand:
+                break
+            i = cand[0] if free else max(cand, key=lambda k: (h[k] - alpha * k, -k))
+            for k in sorted(kneed(i, set())):
+                if not done[k]:
+                    done[k], ready[k] = True, cyc
+                    out.append(ops[k]["x"])
+            done[i] = True
+            ready[i] = max([ready[k] for k in preds[i]] + [cyc]) if free else cyc + ops[i]["lat"]
+            out.append(ops[i]["x"])
+            if not free:
+                used.add(ops[i]["slot"])
+        cyc += 1
 
 
 def bump(L, dst, src, off):
@@ -1689,6 +1772,10 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None, helper=Non
         e("  %zbp = storage_address %zst : low.storage<private> -> reg<aie2p.ep>")
         if cfg.dfr:   # the zero buffer's address: the deferred store fifo's dummy source
             e("  %zsc0 = mov.address-to-scalar %zbp")
+        if cfg.dfr and cfg.dfi:   # the inline push's target in a firing without a deferred segment
+            e("  %dmst = storage {byte_alignment = 64, byte_length = 1024} : low.storage<private>")
+            e("  %dmsp = storage_address %dmst : low.storage<private> -> reg<aie2p.ep>")
+            e("  %dmsc = mov.address-to-scalar %dmsp")
         e("  low.cond_br %first, ^zfill, ^nofill : reg<aie2p.er>")
         e("^nofill:")
         e(f"  %olc = copy {'%oh' if cfg.dfr else '%o'} : reg<aie2p.ep> -> reg<aie2p.ep>")
@@ -2065,10 +2152,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
         a0 = "%as0"
     dft = DFT.split(", ")
     dfa = lambda v: "".join(f", {x}: {ty}" for x, ty in zip(v, dft)) if tail and cfg.dfr else ""
-    if tail and cfg.dfr:   # the deferred segment's store fifo (the zero buffer when there is none: never pushed)
-        e("  %dsd = sub %dss, %zsc0")
+    if tail and cfg.dfr:   # the deferred segment's store fifo (when there is none: dfi's dummy buffer, else the zero
+        # buffer, never pushed)
+        dz = "%dmsc" if cfg.dfi else "%zsc0"
+        e(f"  %dsd = sub %dss, {dz}")
         e("  %dsm = mul %dfx, %dsd")
-        e("  %dsa = add.rr %zsc0, %dsm")
+        e(f"  %dsa = add.rr {dz}, %dsm")
         e("  %dsp = mov.scalar-to-address %dsa")
         e("  %dsl = vlda.store-fifo.low512 %dsp, 0")
         e("  %dqf0 = vlda.store-fifo.high512 %dsp, %dsl, 64")
@@ -2436,11 +2525,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
             if unit:   # the C pointers parked as scalars across the push (the tail's ep budget is 8)
                 e(f"  %dub{t} = mov.address-to-scalar {base}")
                 e(f"  %dul{t} = mov.address-to-scalar {lp}")
+            if unit and not cfg.dfi:
                 e(f"  low.cond_br %dfx, ^du{t}, ^dn{t} : reg<aie2p.er>")
                 e(f"^dn{t}:")
                 e(f"  low.br ^dj{t}({unit[0]}: reg<aie2p.mstfifo>, {unit[1]}: reg<aie2p.mpfs>, {unit[2]}: reg<aie2p.mr26_fifo_st>)")
                 e(f"^du{t}:")
-            else:
+            elif not unit:
                 e(f"  low.cond_br {cnd}, ^cv{t}, ^nc{t} : reg<aie2p.er>")
                 e(f"^nc{t}:")
                 e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>, {lp}: reg<aie2p.ep>{ca})")
@@ -2487,12 +2577,21 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
             # across the body's four chains pins too many accumulators)
 
             def kbf(x):                                         # a bf16 constant in 32 lanes
-                if ("b", bf16_bits(x), kch[0]) in kmemo:
-                    return kmemo[("b", bf16_bits(x), kch[0])]
+                return kbits(bf16_bits(x))
+
+            def kbits(b):
+                if ("b", b, kch[0]) in kmemo:
+                    return kmemo[("b", b, kch[0])]
                 kn[0] += 1
-                e(f"  {p}kc{kn[0]} = mov.i32 {bf16_bits(x)}")
-                e(f"  {p}kv{kn[0]} = vbcst.16 {p}kc{kn[0]}")
-                kmemo[("b", bf16_bits(x), kch[0])] = f"{p}kv{kn[0]}"
+                if b in SL_K:   # loaded from the table's tail (a broadcast would be rematerialized at every use)
+                    if ("p", kch[0]) not in kmemo:
+                        e(f"  {p}kvp{kn[0]} = mov.scalar-to-address {p}cts")
+                        kmemo[("p", kch[0])] = f"{p}kvp{kn[0]}"
+                    e(f"  {p}kv{kn[0]} = vlda.512.i8x64 {kmemo[('p', kch[0])]}, {64 * SL_K.index(b) - 512}")
+                else:
+                    e(f"  {p}kc{kn[0]} = mov.i32 {b}")
+                    e(f"  {p}kv{kn[0]} = vbcst.16 {p}kc{kn[0]}")
+                kmemo[("b", b, kch[0])] = f"{p}kv{kn[0]}"
                 return f"{p}kv{kn[0]}"
 
             def kacc(x):                                        # an f32 constant (exact in bf16) in 32 accumulator lanes
@@ -2523,14 +2622,16 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
                     for sg in segs:
                         if i < len(sg):
                             L.extend(sg[i])
-            e(f"  {p}amk = mov.i32 32767")                      # bf16 |x| mask
-            e(f"  {p}amv = vbcst.16 {p}amk")
             e(f"  {p}sh2 = mov.shift 2")
             e(f"  {p}m24 = mova.i32 24")                        # vshuffle: each 8-byte piece's first value
             e(f"  {p}tla = mov.local-address @silu_t")
             e(f"  {p}tla0 = mov.address-to-scalar {p}tla")
-            e(f"  {p}tlk = mov.i32 {4 * SL_LO}")
-            e(f"  {p}tls = sub {p}tla0, {p}tlk")                 # the table's address less 4 SL_LO: index = |g|'s bits
+            e(f"  {p}km2 = mova.i32 -2")
+            e(f"  {p}tq4 = lshl {p}tla0, {p}km2")
+            e(f"  {p}tqk = mov.i32 {SL_LO}")
+            e(f"  {p}tq = sub {p}tq4, {p}tqk")                   # (the table's address - 4 SL_LO) / 4: index = |g|'s bits
+            e(f"  {p}ctk = mov.i32 {silu_kofs() + 512}")
+            e(f"  {p}cts = add.rr {p}tla0, {p}ctk")              # SL_K's vectors (+ 512)
             if pair:   # the gate buffer's address as a scalar
                 if cfg.pnbr:
                     e(f"  {p}gbs0 = mov.address-to-scalar %xnb")
@@ -2616,6 +2717,19 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
                     e(f"  {q}kup = mov.i32 {1024 * NP // 2}")
                     e(f"  {q}uib = add.rr {q}gib, {q}kup")
                     return jbody(q, T, kind, fifo, [0], addr=False)
+                if kind == "sw" and not pair:   # unrolled: one schedule over the segment's pushes
+                    s0 = len(L)
+                    for j in range(lo, hi):
+                        for i in range(2):
+                            qq = f"{q}u{j}{i}"
+                            jj, ii = ((j & ~1) + i, j & 1) if cfg.hord else (j, i)
+                            e(f"  {qq}gk = mov.i32 {1024 * jj + 256 * ii + 512}")
+                            e(f"  {qq}gib = add.rr {p}ss, {qq}gk")
+                            e(f"  {qq}uk = mov.i32 {1024 * jj + 256 * ii + 512 + 1024 * NP // 2}")
+                            e(f"  {qq}uib = add.rr {p}ss, {qq}uk")
+                            fifo = jpush(qq, T, kind, fifo, range(2))
+                    L[s0:] = lsched(L[s0:])
+                    return fifo
                 e(f"  {q}j0 = mova.i32 {lo}")
                 e(f"  {q}nj = mova.i32 {hi}")
                 e(f"  low.br ^swj{T}({q}j0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
@@ -2644,9 +2758,11 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
                 """jloop's body: block (j, i)'s pushes r in rs from fifo; returns the store fifo. addr False: {q}gib,
                 {q}uib made by the caller."""
                 nonlocal nf
+                s0 = len(L)
                 if addr:
                     jaddr(q)
                 fifo = jpush(q, T, kind, fifo, rs)
+                L[s0:] = lsched(L[s0:], 24 if kind == "sw" else 12)   # (column pairs' tails: vec256 pressure)
                 return fifo
 
             def jaddr(q):
@@ -2717,21 +2833,23 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
                         (clamped). fill: independent instructions (emitters) spread between the gathers, whose load slot
                         leaves the vector units free. Returns t."""
                         g_ = f"{n}gb{h}"
-                        e(f"  {n}la{h} = vband {g_}, {p}amv")                       # |g|
+                        e(f"  {n}la{h} = vband {g_}, {kbits(0x7FFF)}")                 # |g|
                         # clamped as integers (a float compare lets NaN through: an address past the table)
                         e(f"  {n}lc0{h}, {n}lc0m{h} = vmax_lt.s16x32 {n}la{h}, {kbf(2.0 ** -8)}")
                         e(f"  {n}lc{h}, {n}lcm{h} = vmin_ge.s16x32 {n}lc0{h}, {kbf(128.0)}")
-                        e(f"  {n}lu{h} = vups.2x.x-to-c.unsigned {n}lc{h}, {p}sh2")  # 4 bits, i32
-                        if ("t", kch[0]) not in kmemo:
+                        # + the table's address / 4 less SL_LO in 16 bits (the table ends below 2^18), then x 4 as i32:
+                        # the gathers' byte addresses
+                        if ("q", kch[0]) not in kmemo:
                             kn[0] += 1
-                            e(f"  {p}kv{kn[0]} = vbcst.32 {p}tls")
-                            kmemo[("t", kch[0])] = f"{p}kv{kn[0]}"
+                            e(f"  {p}kv{kn[0]} = vbcst.16 {p}tq")
+                            kmemo[("q", kch[0])] = f"{p}kv{kn[0]}"
+                        e(f"  {n}lb{h} = vadd.16 {n}lc{h}, {kmemo[('q', kch[0])]}")
+                        e(f"  {n}lu{h} = vups.2x.x-to-c.unsigned {n}lb{h}, {p}sh2")
                         fill, tv = list(fill), []
 
                         def addr(q):   # 16 lanes' 8 lane addresses x 2
                             e(f"  {n}lq{h}{q} = slice {n}lu{h}[{q}] : {M2} -> {M1}")
-                            e(f"  {n}lv{h}{q} = vmov.accumulator512.to.vector512 {n}lq{h}{q}")
-                            e(f"  {n}ld{h}{q} = vadd.32 {n}lv{h}{q}, {kmemo[('t', kch[0])]}")
+                            e(f"  {n}ld{h}{q} = vmov.accumulator512.to.vector512 {n}lq{h}{q}")
                         addr(0)
                         for q in range(2):   # 4 gathers, the next half's addresses (gather latency), the 16 values
                             pr = []
@@ -2875,6 +2993,11 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
                 stream(8 * NP, 16 * NP, "b")
                 fifo = jloop(H2, NP, "umul", "b", (f"{p}f2", f"{p}op2", f"{p}ps2"))
                 unstream()
+            elif unit and cfg.dfi:
+                fifo = jloop(0, H2, "sw", "", fifo, one=(f"{p}uf", f"{p}ue"))
+                e(f"  %duB{t} = mov.scalar-to-address %dub{t}")
+                e(f"  %duL{t} = mov.scalar-to-address %dul{t}")
+                return f"%duB{t}", f"%duL{t}", fifo
             elif unit:
                 fifo = jloop(0, H2, "sw", "", fifo, one=(f"{p}uf", f"{p}ue"))
                 e(f"  low.br ^dj{t}({fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
@@ -3012,6 +3135,15 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
 SL_LO, SL_HI = 0x3B80, 0x4300
 
 
+SL_K = (0x7FFF, 0x3B80, 0x4300, 0x0000, 0x8000, 0x3F80)   # bf16x32 constants after the table (epilogue loads)
+
+
+def silu_kofs():
+    """The byte offset of SL_K's first vector from @silu_t."""
+    n = ((SL_HI - SL_LO + 1 + 15) // 16) * 32 + 32
+    return 2 * (n + (-n % 32))
+
+
 def silu_rodata():
     import numpy as np
     x = (np.arange(SL_LO, SL_HI + 1, dtype=np.uint32) << 16).view(np.float32).astype(np.float64)
@@ -3023,6 +3155,7 @@ def silu_rodata():
     blk[:len(tb)] = tb
     blk = blk.reshape(-1, 16)
     pay = np.concatenate([np.stack([blk, blk], 1).reshape(-1), np.zeros(32, np.uint16)])
+    pay = np.concatenate([pay, np.zeros(-len(pay) % 32, np.uint16)] + [np.full(32, k, np.uint16) for k in SL_K])
     return f'global.rodata.def @silu_t = align(64) bytes("{pay.view(np.uint8).tobytes().hex()}")'
 
 
