@@ -97,6 +97,8 @@ class Config:
     seam: int = 1       # head / mids: the next iteration's first sub-tile init and its WB pops ride with the last
                         # sub-tile's cascade writes (carried across the back edge), like the inner sub-tile boundaries;
                         # 2: not on ghelp's helpers (program memory)
+    eg512: int = 1      # fuse 2: egress records copied 64 bytes a load / store (every source 64-byte aligned: ks and
+                        # the hsplit piece multiples of 4 k-blocks), else 16
     rskip: int = 1      # fuse 2: decode only the half super-blocks (16 k-blocks) overlapping the filler's k-blocks
     hsplit: int = 1     # ghelp: the head's k-blocks past its last whole super-block come from the helper, which decodes
                         # that super-block anyway (the head, the fill's slowest core, decodes one super-block less)
@@ -1296,7 +1298,8 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
         pieces = []
     if hrow is not None:
         assert len(cov) == 2 and cov[0] == hrow and pieces[0][1] == pieces[1][1]
-        fuse_egress_helped(e, dp, pieces[1][1] // fw, fw, OUT + (pieces[1][0] - 32 * s0) * 144, 36 * hx // fw, cfg.hcap)
+        fuse_egress_helped(e, dp, pieces[1][1] // fw, fw, OUT + (pieces[1][0] - 32 * s0) * 144, 36 * hx // fw, cfg.hcap,
+                           eg512(cfg))
         pieces = []
     for i, (kb0, sw) in enumerate(pieces):
         x = f"^fze{i + 1}" if i + 1 < len(pieces) else "^fzex"
@@ -1313,7 +1316,8 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
         e(f"  low.cond_br %fzem{i}, ^fze{i}b, ^fze{i}s : reg<aie2p.er>")
         e(f"^fze{i}b:")
         e(f"  acq %fzEm1, {dp}")
-        sp_, b_ = egress_record(e, f"{i}", f"%fzes{i}", f"%fzec{i}", f"%fzdl{i}", fw, cfg.hcap if helper == "M" else 2)
+        sp_, b_ = egress_record(e, f"{i}", f"%fzes{i}", f"%fzec{i}", f"%fzdl{i}", fw, cfg.hcap if helper == "M" else 2,
+                                eg512(cfg))
         e(f"  rel %fzE1, {dp}")
         e(f"  %fzcs{i} = padda {sp_}, {4 * fw - b_}")
         e(f"  %fzec1{i} = add.rr %fzec{i}, %fzE1")
@@ -1374,17 +1378,39 @@ def raw_stream_unit(e, D, RW, inb):
     e("^fzrx:")
 
 
-def egress_record(e, t, src, cnt, ring, fw, slots=2):
+def eg512(cfg):
+    """fuse 2: every egress source is 64-byte aligned (scratch and channel rings are; records are 64-byte multiples
+    from k-block offsets that are multiples of 4: 4 k-blocks are 576 bytes)."""
+    return bool(cfg.eg512) and all(k % 4 == 0 for k in cfg.ks) and fuse_hx(cfg) % 4 == 0
+
+
+def egress_record(e, t, src, cnt, ring, fw, slots=2, w512=False):
     """One egress record: fw words from src (16-byte aligned: k-blocks are 144 bytes) into the egress ring slot of
     record count cnt mod slots, straight-line in chunks of up to 12 copies (all loads, then all stores), each through
-    pointers 64 bytes in (immediates reach -128 .. 112; padda steps by multiples of 64). Returns (the source pointer
-    now: padda consumes src, its byte offset from src)."""
+    pointers 64 bytes in (immediates reach -128 .. 112; padda steps by multiples of 64). w512 (64-byte aligned src):
+    64-byte copies in chunks of up to 7, loads alternating the A / B lanes, pointers 256 bytes in. Returns (the source
+    pointer now: padda consumes src, its byte offset from src)."""
     e(f"  %fzk1{t} = mova.i32 {slots - 1}")
     e(f"  %fzer{t} = and {cnt}, %fzk1{t}")
     e(f"  %fzerb{t} = mov.i32 {4 * fw}")
     e(f"  %fzeo{t} = mul %fzer{t}, %fzerb{t}")
     e(f"  %fzea{t} = add.rr {ring}, %fzeo{t}")
     off = 0
+    if w512:
+        assert fw % 16 == 0
+        for c, q0 in enumerate(range(0, fw // 16, 7)):   # (padda steps reach 448)
+            o = 64 * q0 + 256
+            e(f"  %fzsx{t}_{c} = padda {src}, {o - off}")
+            src, off = f"%fzsx{t}_{c}", o
+            e(f"  %fzeb{t}_{c} = mov.i32 {o}")
+            e(f"  %fzea{t}_{c} = add.rr %fzea{t}, %fzeb{t}_{c}")
+            e(f"  %fzed{t}_{c} = mov.scalar-to-address %fzea{t}_{c}")
+            qs = range(q0, min(q0 + 7, fw // 16))
+            for q in qs:
+                e(f"  %fzv{t}_{q} = {'vldb' if q % 2 else 'vlda'}.512.i32x16 {src}, {64 * (q - q0) - 256}")
+            for q in qs:
+                e(f"  vst.512.i32x16 %fzv{t}_{q}, %fzed{t}_{c}, {64 * (q - q0) - 256}")
+        return src, off
     for c, q0 in enumerate(range(0, fw // 4, 12)):
         o = 16 * q0 + 64
         e(f"  %fzsx{t}_{c} = padda {src}, {o - off}")
@@ -1400,7 +1426,7 @@ def egress_record(e, t, src, cnt, ring, fw, slots=2):
     return src, off
 
 
-def fuse_egress_helped(e, dp, nr, fw, own, xr=0, hcap=2):
+def fuse_egress_helped(e, dp, nr, fw, own, xr=0, hcap=2, w512=False):
     """fuse_decode's egress for a helped head (ghelp): per unit, the helper's nr records (each copied from the helper's
     channel ring, slot: the helper record count mod hcap), then its own nr from the decoded super-blocks at own (bytes
     from the scratch base), one record loop around a single copy (program memory). hsplit: the last xr of its own come
@@ -1439,7 +1465,7 @@ def fuse_egress_helped(e, dp, nr, fw, own, xr=0, hcap=2):
     e("  low.br ^fzmcp(%fzmo: reg<aie2p.er>, %fzmh: reg<aie2p.er>, %fzmo1: reg<aie2p.er>)")
     e("^fzmcp(%fzmsrc: reg<aie2p.er>, %fzmh2: reg<aie2p.er>, %fzmo2: reg<aie2p.er>):")
     e("  %fzmsp = mov.scalar-to-address %fzmsrc")
-    egress_record(e, "m", "%fzmsp", "%fzmc", "%fzdl", fw)
+    egress_record(e, "m", "%fzmsp", "%fzmc", "%fzdl", fw, w512=w512)
     helped_rec(e, "%fzmw2", xr)
     e("  low.cond_br %fzmw2, ^fzmrh, ^fzmj : reg<aie2p.er>")
     e("^fzmrh:")
@@ -1494,7 +1520,7 @@ def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
     e("^fzeb:")
     e(f"  acq %fzBm1, {dp}")
     e("  %fzesp = mov.scalar-to-address %fzes")
-    egress_record(e, "", "%fzesp", "%fzec", "%fzdl", fw)
+    egress_record(e, "", "%fzesp", "%fzec", "%fzdl", fw, w512=eg512(cfg))
     e(f"  rel %fzB1, {dp}")
     e("  %fzec1 = add.rr %fzec, %fzB1")
     e("  %fzei1 = add.rr %fzei, %fzB1")
