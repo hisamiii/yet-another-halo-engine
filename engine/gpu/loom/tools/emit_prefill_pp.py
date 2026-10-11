@@ -1142,7 +1142,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         name = "npu_ffnsp_%s_%s%s" % (gf, uf, hord and "_" + hord.lower())
         if NPU_FUSE:   # pair u: gate column 2 u, up column 2 u + 1, features 256 j + 64 u + [0, 64) of call j
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, swiglu=True,
-                                   swcol=64, hpass=F // 1024, hord=hord, fmt=DCOL_FMTS[gf][0], ufmt=DCOL_FMTS[uf][0]),
+                                   pnbr=1, swcol=64, hpass=F // 1024, hord=hord, fmt=DCOL_FMTS[gf][0], ufmt=DCOL_FMTS[uf][0]),
                          name, None, (4, True)))
             continue
         jobs.append((GN.Config(6, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[gf][0],

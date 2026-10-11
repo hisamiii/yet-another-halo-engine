@@ -93,6 +93,8 @@ class Config:
     ghelp: int = 0      # gwest: the gate's cores (row 1 of columns 1, 2), idle while their heads decode rows 1 and 0,
                         # decode row 1 themselves and hand its records to the head over neighbor memory (fuse_helper)
     hvroll: int = 0     # ghelp: the helpers' decoder with its scale halves rolled (gen_npu_dec VROLL; program memory)
+    pnbr: int = 0       # column pairs (fuse 2): the gate tail's g / silu(g) halves reach the up tail over a leaf-synced
+                        # neighbor ring (two 1 KB records a segment: half a in slot 0, b in slot 1) instead of the core stream
     dfr: int = 0        # swiglu (mu 1, not paired): each M block's epilogue deferred into the next block's passes: segment s
                         # at pass s, one h block (a push) after sub-tiles DFR_T of each iteration, in the tail's cascade
                         # slack; the C ring's other half (2 MP slots, released in the same order, so the records and
@@ -360,7 +362,7 @@ def array_program(L, cfg):
         e(f"  %sc{c} = sender %k{c}_{rows - 1}, 2 : reg<aie2p.array.sender : {stype}>")
         e(f"  %chc{c} = channel %sc{c}, %cr{c}, %n{MP * (2 if cfg.dfr else 1)}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
         e(f"  constrain.leaf_sync %chc{c}")
-    if cfg.ufmt:   # gate tail u -> up tail u + 3: its C segment as bf16 (core streams, 512 words a segment)
+    if cfg.ufmt and not (fpair(cfg) and cfg.pnbr):   # gate tail u -> up tail u + 3: its C segment as bf16 (core streams, 512 words a segment)
         e(f"  %nxs = constant.u32 {nb * MP * 512} : reg<aie2p.array.scalar : index>")
         for u in range(cols // 2):
             g_, u_ = (2 * u, 2 * u + 1) if cfg.fuse else (u, u + cols // 2)
@@ -459,6 +461,14 @@ def array_program(L, cfg):
         e("  constrain.core_stream %chgs")
         e("  constrain.gate %chgs")
         e("  constrain.signal %chgs")
+    if fpair(cfg) and cfg.pnbr:   # gate tail 2 u -> up tail 2 u + 1 (its east neighbor): the halves as records (last:
+        # the gate tail's own memory holds the ring, after its input rings)
+        e(f"  %nxs = constant.u32 {nb * MP * 2} : reg<aie2p.array.scalar : index>")
+        for u in range(cols // 2):
+            e(f"  %xs{u} = sender %k{2 * u}_{rows - 1}, 3 : reg<aie2p.array.sender : tile<{NP * 64}xi32>>")
+            e(f"  %xr{u} = receiver %k{2 * u + 1}_{rows - 1}, 3 : reg<aie2p.array.receiver : tile<{NP * 64}xi32>>")
+            e(f"  %chx{u} = channel %xs{u}, %xr{u}, %two, %nxs : reg<aie2p.array.channel : tile<{NP * 64}xi32>>")
+            e(f"  constrain.leaf_sync %chx{u}")
     e("  return\n}\n")
 
 
@@ -1506,6 +1516,8 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None, helper=Non
         e(f"  %gn1{rs} = resource<native_pointer> {{index = {gp['nbr']}, source_type = buffer}} : reg<aie2p.ep>")
     if tail:
         e("  %o = resource<native_pointer> {index = 2, source_type = buffer} : reg<aie2p.ep>")
+    if pair and cfg.pnbr:   # the pair's neighbor ring (slot 0: half a, slot 1: half b)
+        e("  %xnb = resource<native_pointer> {index = 3, source_type = buffer} : reg<aie2p.ep>")
     if role != "head":
         e("  set.scd-enable 1")
     if role != "tail":
@@ -1598,7 +1610,7 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None, helper=Non
             e("  %dss = add.rr %dsh, %dso")
         # first pass: C loads read a 1 KB zero buffer with step 0
         e("  %zst = storage {byte_alignment = 64, byte_length = 1024} : low.storage<private>")
-        if pair:   # a segment's gate values (bf16) on their way through the core stream
+        if pair and not cfg.pnbr:   # a segment's gate values (bf16) on their way through the core stream
             e(f"  %gbs = storage {{byte_alignment = 64, byte_length = {NP * 512}}} : low.storage<private>")
         e("  %zbp = storage_address %zst : low.storage<private> -> reg<aie2p.ep>")
         if cfg.dfr:   # the zero buffer's address: the deferred store fifo's dummy source
@@ -2350,8 +2362,11 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
             e(f"  {p}tlk = mov.i32 {4 * SL_LO}")
             e(f"  {p}tls = sub {p}tla0, {p}tlk")                 # the table's address less 4 SL_LO: index = |g|'s bits
             if pair:   # the gate buffer's address as a scalar
-                e(f"  {p}gba = storage_address %gbs : low.storage<private> -> reg<aie2p.ep>")
-                e(f"  {p}gbs0 = mov.address-to-scalar {p}gba")
+                if cfg.pnbr:
+                    e(f"  {p}gbs0 = mov.address-to-scalar %xnb")
+                else:
+                    e(f"  {p}gba = storage_address %gbs : low.storage<private> -> reg<aie2p.ep>")
+                    e(f"  {p}gbs0 = mov.address-to-scalar {p}gba")
                 e(f"  {p}k32 = mov.i32 32")
             if unit:
                 fifo = unit
@@ -2376,7 +2391,11 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                 """Column pairs: the gate buffer's 32-byte rows lo .. hi - 1 over the core stream (gate tail: out, up
                 tail: in), 4 rows (32 words) an iteration. The tails are locked (one instruction a bundle), so the
                 order is the schedule: each row's 8 transfers alternate with the next row's 8 loads (send) / reads
-                (recv), which then sit 8+ cycles ahead of their use, and each row's pointer is made a row ahead."""
+                (recv), which then sit 8+ cycles ahead of their use, and each row's pointer is made a row ahead.
+                pnbr: the half's ring slot is acquired instead (released by unstream)."""
+                if cfg.pnbr:
+                    e("  acq %am1, 3")
+                    return
                 s_ = "sd" if pair == "send" else "rv"
                 q = f"{p}{s_}{tag}"
                 R = 4 if (hi - lo) % 4 == 0 else 1
@@ -2650,10 +2669,22 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                     e(f"  {nxt[0]}, {nxt[1]}, {nxt[2]} = vst.push.bfp16ebs8.from.fp32 {fifo[0]}, {n}H, {fifo[1]}, {fifo[2]}")
                     fifo = nxt
                 return fifo
+
+            def unstream():
+                if cfg.pnbr:
+                    e("  rel %one, 3")
+
             # column pairs split the sigmoid: the gate tail sends slabs 0 .. NP / 2 - 1 as g, makes silu(g) of the rest
             # while the up tail works on the first, then sends those (both tails round silu(g) to bf16: bit-exact)
             H2 = NP // 2
-            if pair == "send":
+            if pair == "send" and cfg.pnbr:
+                stream(0, 8 * NP, "a")
+                fifo = jloop(0, H2, "graw", "a", fifo)
+                unstream()
+                stream(8 * NP, 16 * NP, "b")
+                fifo = jloop(H2, NP, "gsig", "b", fifo)
+                unstream()
+            elif pair == "send":
                 fifo = jloop(0, H2, "graw", "a", fifo)
                 stream(0, 8 * NP, "a")
                 fifo = jloop(H2, NP, "gsig", "b", fifo)
@@ -2661,6 +2692,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
             elif pair == "recv":
                 stream(0, 8 * NP, "a")
                 fifo = jloop(0, H2, "usig", "a", fifo)
+                unstream()
                 # the record as two store streams (one stream lost its 18th line): the second at 576
                 e(f"  {p}rf, {p}rp, {p}rq_ = vst.flush.512 {fifo[0]}, {fifo[1]}, {fifo[2]}")
                 e(f"  {p}k576 = mov.i32 {2 * H2 * 144}")
@@ -2672,6 +2704,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                 e(f"  {p}ps2 = mova.fifo.store.position 0")
                 stream(8 * NP, 16 * NP, "b")
                 fifo = jloop(H2, NP, "umul", "b", (f"{p}f2", f"{p}op2", f"{p}ps2"))
+                unstream()
             elif unit:
                 fifo = jloop(0, H2, "sw", "", fifo, one=(f"{p}uf", f"{p}ue"))
                 e(f"  low.br ^dj{t}({fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
