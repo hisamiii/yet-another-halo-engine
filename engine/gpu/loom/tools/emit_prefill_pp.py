@@ -676,9 +676,10 @@ NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
 # (F / 256 of them) column c features 256 j + 32 c + [0, 32) of F (gen_npu_gemm swcol 32), down in 640-row calls.
 # Down's K parts (both kinds): F's passes in the fewest parts of at most 5 (a fused panel holds a part), sizes balanced.
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
-# YAH_NPU_FFNRES=0 (fused sets): the GPU window writes f32 and npu_unpack_ffnblk adds hidden + it + the NPU's partials
-# after the job, instead of its residual epilogue waiting for the NPU (npuffnres; slower while the NPU is the late one)
-NPU_FFNRES = os.environ.get("YAH_NPU_FFNRES", "1") == "1"
+# Fused sets: the GPU window writes f32 and npu_unpack_ffnblk adds hidden + it + the NPU's partials after the job.
+# YAH_NPU_FFNRES=1: its residual epilogue waits for the NPU instead (npuffnres). Only 20 of its workgroups fit at once
+# (one per WGP), so while the NPU is the late one the rest of the GPU's down starts after the NPU's (~5 ms a layer).
+NPU_FFNRES = os.environ.get("YAH_NPU_FFNRES", "0") == "1"
 FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs", "q3k", "iq2xxs", "iq2xs")
 FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs", "iq4xs", "q4k")
 # the down decoders' k-block order where it is not natural: their layers' gate / up images write H in it (_p4 / _q4k)
