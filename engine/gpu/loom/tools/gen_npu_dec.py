@@ -72,6 +72,9 @@ KV = I.KV if FMT == "IQ4_XS" else [float(v) for v in range(16)]
 OUTCAP = 2
 INLINE = [0]                    # leaf_inline: super-blocks per input record (0: a standalone leaf)
 VROLL = [False]                 # leaf_inline: the scale halves rolled whatever the format (program memory)
+TONCE = [True]                  # leaf_inline: the table built once per fill (flag at TFLAG), else every invocation
+TFLAG = 32                      # leaf_inline: the table-built flag's byte offset in the caller's private storage %fzs
+                                # (past scalar lda / st immediates: addressed through a pointer at it)
 TC_IQ4 = (("su", 0x380), ("sv", 0), ("u", 0xC6A0), ("v", 0xC320), ("s", 0xC681), ("1", 0x4A01), ("1", 0x4901))
 TC_Q4K = (("su", 0x380), ("sv", 0), ("u", 0xC680), ("v", 0xC300), ("s", 0xC681), ("1", 0x4A01))   # T = d sc
 NPARTS = 4 if FMT in ("Q4_K", "Q3_K", "IQ2_XS") else 2   # bf16 parts per scale line (T hi / lo; Q4_K adds -M hi / lo, Q3_K
@@ -323,8 +326,15 @@ def leaf(name="dec", nports=1):
     elif not Q3K:
         # ---- table (once per invocation of the program: a flag in private storage)
         tb_, tdone = label("tbuild"), label("tdone")
-        if INLINE[0]:                                        # the storages are scratch: build the table every time
+        if INLINE[0] and not TONCE[0]:                      # every invocation (program memory)
             e(f"low.br ^{tb_}")
+        elif INLINE[0]:   # the storages are the caller's scratch: built once per fill (the caller clears the flag)
+            e("%tfp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+            e("%tfs = mov.address-to-scalar %tfp")
+            e(f"%tft = add %tfs, {TFLAG}")
+            e("%tfr = mov.scalar-to-address %tft")
+            e("%tflag = lda %tfr, 0")
+            e(f"low.cond_br %tflag, ^{tdone}, ^{tb_} : reg<aie2p.er>")
         else:
             stp = P(e, "%spa", STATE)
             e(f"%tflag = lda {stp}, 0")
@@ -370,6 +380,12 @@ def leaf(name="dec", nports=1):
             e("low.br ^tlh(%tl_n: reg<aie2p.er>, %tla1: reg<aie2p.er>, %tlb1: reg<aie2p.er>)")
             e.L.append("// LOOP-END")
             e.L.append("^tlx:")
+            if INLINE[0] and TONCE[0]:
+                e("%tfq = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+                e("%tfqs = mov.address-to-scalar %tfq")
+                e(f"%tfqt = add %tfqs, {TFLAG}")
+                e("%tfqr = mov.scalar-to-address %tfqt")
+                e(f"st {k(1)}, %tfqr, 0")
         else:
             for m in range(16):
                 e(f"%kb{m} = mov.i32 {I.bf16_bits(KV[m])}")
@@ -1759,22 +1775,22 @@ def leaf(name="dec", nports=1):
     return "\n".join(pre_ + e.L[:hdr_end] + place_consts(e.pre, e.L[hdr_end:]))
 
 
-def leaf_inline(nsb, name="inl", vroll=False):
+def leaf_inline(nsb, name="inl", vroll=False, tonce=True):
     """The leaf's body for inlining into another core function: decodes nsb super-blocks of an input record
     ([16 rows][RECROW]) at %in into OUT_B records at %out (2 per super-block, no output ring), storages at %sp
     (SCR_B, 2048-aligned) and %sp2 (SCR2_B), all defined by the caller (the table is rebuilt each call). Returns the
     lines (not renamed; the caller prefixes its values and labels). Grid formats gather from module rodata
     (inline_rodata(name), defined once by the caller's module)."""
-    INLINE[0], VROLL[0] = nsb, vroll
+    INLINE[0], VROLL[0], TONCE[0] = nsb, vroll, tonce
     try:
         txt = leaf(name, 1)
     finally:
-        INLINE[0], VROLL[0] = 0, False
+        INLINE[0], VROLL[0], TONCE[0] = 0, False, True
     out = []
     for ln in txt.split("\n"):
         t = ln.strip()
         if (t.startswith("global.rodata.def ") or t.startswith("low.func.def ") or " = resource<" in t or
-                " = storage " in t or " = storage_address " in t or t in ("return", "}")):
+                " = storage " in t or (" = storage_address " in t and "%fzs" not in t) or t in ("return", "}")):
             continue
         out.append(ln)
     return out
@@ -1822,7 +1838,7 @@ def place_consts(pre, body):
     first, cond, region_of = {}, None, {}
     for n_, l in enumerate(body):
         t_ = l.strip()
-        if t_.startswith("^tbuild") and not INLINE[0]:          # inline: the table build is unconditional
+        if t_.startswith("^tbuild") and not (INLINE[0] and not TONCE[0]):   # (inline: conditional on the fill's flag)
             cond = (max(i for i in range(n_) if body[i].strip().startswith("low.cond_br")), "^tdone")
         elif cond and t_.startswith(cond[1]):
             cond = None

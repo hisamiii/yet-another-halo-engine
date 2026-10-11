@@ -93,6 +93,7 @@ class Config:
     ghelp: int = 0      # gwest: the gate's cores (row 1 of columns 1, 2), idle while their heads decode rows 1 and 0,
                         # decode row 1 themselves and hand its records to the head over neighbor memory (fuse_helper)
     hvroll: int = 0     # ghelp: the helpers' decoder with its scale halves rolled (gen_npu_dec VROLL; program memory)
+    htab: int = 1       # ghelp: the helpers' decoder table built once per fill (else every unit; program memory)
     pnbr: int = 0       # column pairs (fuse 2): the gate tail's g / silu(g) halves reach the up tail over a leaf-synced
                         # neighbor ring (two 1 KB records a segment: half a in slot 0, b in slot 1) instead of the core stream
     dfr: int = 0        # swiglu (mu 1, not paired): each M block's epilogue deferred into the next block's passes: segment s
@@ -1183,6 +1184,13 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     e("^fzdq(%fzN: reg<aie2p.er>):")
     e("  %fzpD = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  st %fzN, %fzpD, 12")                       # the units left
+    tonce = not (D.GRID or D.Q3K) and (helper != "M" or bool(cfg.htab))
+    if tonce:                                       # the decoder's table: built by the fill's first unit
+        e("  %fzT0 = mova.i32 0")
+        e("  %fzTs = mov.address-to-scalar %fzpD")
+        e(f"  %fzTt = add %fzTs, {D.TFLAG}")
+        e("  %fzTr = mov.scalar-to-address %fzTt")
+        e("  st %fzT0, %fzTr, 0")
     rawport = HELP_RAW if helper == "M" else fuse_ports("")[1]
     cap = fuse_raw_ring(cfg, dcov)[1] if cfg.rawdma else 0
     if cfg.rawdma:   # the W ring is idle: grant the raw ring's records
@@ -1231,8 +1239,8 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     for nm in ("sp", "in", "sp2", "out"):
         e(f"  %dq_{nm} = mov.scalar-to-address {inb if nm == 'in' else '%fza_' + nm}")
     # the decoder (its values and labels prefixed)
-    ren = lambda m: m.group(1) + "dq_" + m.group(2)
-    for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool(helper == "M" and cfg.hvroll)):
+    ren = lambda m: m.group(0) if m.group(2) == "fzs" else m.group(1) + "dq_" + m.group(2)
+    for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool(helper == "M" and cfg.hvroll), tonce=tonce):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if cfg.rawdma:   # the raw record is consumed: back to the DMA, but for the last cap units (the panel follows them)
