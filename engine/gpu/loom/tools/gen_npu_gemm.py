@@ -95,6 +95,9 @@ class Config:
     hvroll: int = 0     # ghelp: the helpers' decoder with its scale halves rolled (gen_npu_dec VROLL; program memory)
     htab: int = 1       # ghelp: the helpers' decoder table built once per fill (else every unit; program memory)
     rskip: int = 1      # fuse 2: decode only the half super-blocks (16 k-blocks) overlapping the filler's k-blocks
+    hsplit: int = 1     # ghelp: the head's k-blocks past its last whole super-block come from the helper, which decodes
+                        # that super-block anyway (the head, the fill's slowest core, decodes one super-block less)
+    hcap: int = 4       # ghelp: the helper's record ring depth (a power of 2; 2 couples the helper to the head's egress)
     pnbr: int = 0       # column pairs (fuse 2): the gate tail's g / silu(g) halves reach the up tail over a leaf-synced
                         # neighbor ring (two 1 KB records a segment: half a in slot 0, b in slot 1) instead of the core stream
     dfr: int = 0        # swiglu (mu 1, not paired): each M block's epilogue deferred into the next block's passes: segment s
@@ -712,6 +715,12 @@ def fuse_helper(cfg, c):
     return None
 
 
+def fuse_hx(cfg):
+    """hsplit: the head's k-blocks the helper decodes and sends after its own slice (0: none)."""
+    x = cfg.ks[0] % 32
+    return x if cfg.fuse == 2 and cfg.ghelp and cfg.hsplit and cfg.ks[0] >= 32 else 0
+
+
 def fuse_dcov(cfg, c, r):
     """The rows worker (c, r) decodes (fuse_cover less a helper's row; None: it decodes nothing)."""
     cov, h = fuse_cover(cfg, c).get(r), fuse_helper(cfg, c)
@@ -728,7 +737,8 @@ def fuse_record(cfg, cov):
     unit = NP * sum(slab(cfg.ks[j]) for j in cov) // 4   # (fuse 1: cov in row order)
     if cfg.fuse == 2:   # whole 64-byte copies, whole records per slab
         # (swiglu: not C's record size, LOOM_EXP_LS_SEND_PITCH_RECORD would pitch the egress ring like C's)
-        fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for _, sw in fuse_pieces(cfg, cov))
+        xs = [36 * fuse_hx(cfg)] if cov == (1, 0) and fuse_hx(cfg) else []   # (hsplit: the helper's extra piece)
+        fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for sw in [sw for _, sw in fuse_pieces(cfg, cov)] + xs)
                  and not (cfg.swiglu and 4 * w == SW_REC))
         return fw, cfg.passes * unit // fw
     g = math.gcd(*(len(p) * unit for p in fuse_groups(cfg)))
@@ -864,8 +874,8 @@ def fuse_channels(e, cfg, panel):
         if h is not None:   # the helper: its raw intake, its records to the head (the head's record size)
             ut = f"16x{uw // 16}"
             fw, _ = fuse_record(cfg, fuse_cover(cfg, c)[0])
-            assert fuse_record(cfg, (h,))[0] == fw
-            nrec = cfg.passes * NP * (slab(cfg.ks[h]) // 4) // fw
+            assert (slab(cfg.ks[h]) // 4) % fw == 0 and (36 * fuse_hx(cfg)) % fw == 0
+            nrec = cfg.passes * NP * (slab(cfg.ks[h]) // 4 + 36 * fuse_hx(cfg)) // fw
             e(f"  %frr{c}_{h} = receiver %k{c}_{h}, {HELP_RAW} : reg<aie2p.array.receiver : tile<{ut}xi32>>")
             cap = fuse_raw_ring(colcfg(cfg, c), (h,))[1]
             e(f"  %chr{c}_{h} = channel %fru{c}, %frr{c}_{h}, %n{cap}, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
@@ -874,7 +884,8 @@ def fuse_channels(e, cfg, panel):
             e(f"  %fhn{c} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
             e(f"  %fhs{c} = sender %k{c}_{h}, {HELP_SEND} : reg<aie2p.array.sender : tile<{fw}xi32>>")
             e(f"  %fhr{c} = receiver %k{c}_0, {HELP_RECV} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
-            e(f"  %chh{c} = channel %fhs{c}, %fhr{c}, %two, %fhn{c} : reg<aie2p.array.channel : tile<{fw}xi32>>")
+            assert cfg.hcap & (cfg.hcap - 1) == 0   # (slots: record count & (hcap - 1))
+            e(f"  %chh{c} = channel %fhs{c}, %fhr{c}, %n{cfg.hcap}, %fhn{c} : reg<aie2p.array.channel : tile<{fw}xi32>>")
             e(f"  constrain.leaf_sync %chh{c}")
 
 
@@ -1179,6 +1190,13 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     fw, _ = fuse_record(cfg, cov)
     RW = FUSE_SB * D.BLK // 4                          # words per row of a unit (its super-blocks need not align)
     pieces = fuse_pieces(cfg, cov)
+    hx = fuse_hx(cfg) if helper else 0
+    if hx and helper == "H":                           # hsplit: the head decodes its whole super-blocks only
+        k1 -= hx
+        nsb = -(-k1 // 32) - s0
+    elif hx:                                           # the helper: its slice, then the head's last hx k-blocks
+        fw = fuse_record(cfg, (1, 0))[0]
+        pieces = pieces + [(cfg.ks[0] - hx, 36 * hx)]
     assert FUSE_SB * D.BLK <= D.RECROW and FUSE_SB * D.BLK % 4 == 0
     SP, IN, SP2, OUT = fuse_scratch(cfg, dcov)
     assert fw % 16 == 0
@@ -1269,12 +1287,13 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     e("  %fzwb2 = add.rr %fzw0l2, %fzk2047b")
     e("  %fzkm2048b = mov.i32 -2048")
     e("  %fzsb2 = and %fzwb2, %fzkm2048b")
-    if all(4 * sw == 144 * cfg.ks[j] for j, (_, sw) in zip(cov, pieces)) and len(pieces) > 1 and hrow is None:
+    if (all(4 * sw == 144 * cfg.ks[j] for j, (_, sw) in zip(cov, pieces)) and len(pieces) > 1 and hrow is None
+            and len(pieces) == len(cov)):
         fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0)
         pieces = []
     if hrow is not None:
         assert len(cov) == 2 and cov[0] == hrow and pieces[0][1] == pieces[1][1]
-        fuse_egress_helped(e, dp, pieces[1][1] // fw, fw, OUT + (pieces[1][0] - 32 * s0) * 144)
+        fuse_egress_helped(e, dp, pieces[1][1] // fw, fw, OUT + (pieces[1][0] - 32 * s0) * 144, 36 * hx // fw, cfg.hcap)
         pieces = []
     for i, (kb0, sw) in enumerate(pieces):
         x = f"^fze{i + 1}" if i + 1 < len(pieces) else "^fzex"
@@ -1291,7 +1310,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
         e(f"  low.cond_br %fzem{i}, ^fze{i}b, ^fze{i}s : reg<aie2p.er>")
         e(f"^fze{i}b:")
         e(f"  acq %fzEm1, {dp}")
-        sp_, b_ = egress_record(e, f"{i}", f"%fzes{i}", f"%fzec{i}", f"%fzdl{i}", fw)
+        sp_, b_ = egress_record(e, f"{i}", f"%fzes{i}", f"%fzec{i}", f"%fzdl{i}", fw, cfg.hcap if helper == "M" else 2)
         e(f"  rel %fzE1, {dp}")
         e(f"  %fzcs{i} = padda {sp_}, {4 * fw - b_}")
         e(f"  %fzec1{i} = add.rr %fzec{i}, %fzE1")
@@ -1352,12 +1371,12 @@ def raw_stream_unit(e, D, RW, inb):
     e("^fzrx:")
 
 
-def egress_record(e, t, src, cnt, ring, fw):
+def egress_record(e, t, src, cnt, ring, fw, slots=2):
     """One egress record: fw words from src (16-byte aligned: k-blocks are 144 bytes) into the egress ring slot of
-    record count cnt's parity, straight-line in chunks of up to 12 copies (all loads, then all stores), each through
+    record count cnt mod slots, straight-line in chunks of up to 12 copies (all loads, then all stores), each through
     pointers 64 bytes in (immediates reach -128 .. 112; padda steps by multiples of 64). Returns (the source pointer
     now: padda consumes src, its byte offset from src)."""
-    e(f"  %fzk1{t} = mova.i32 1")
+    e(f"  %fzk1{t} = mova.i32 {slots - 1}")
     e(f"  %fzer{t} = and {cnt}, %fzk1{t}")
     e(f"  %fzerb{t} = mov.i32 {4 * fw}")
     e(f"  %fzeo{t} = mul %fzer{t}, %fzerb{t}")
@@ -1378,11 +1397,14 @@ def egress_record(e, t, src, cnt, ring, fw):
     return src, off
 
 
-def fuse_egress_helped(e, dp, nr, fw, own):
+def fuse_egress_helped(e, dp, nr, fw, own, xr=0, hcap=2):
     """fuse_decode's egress for a helped head (ghelp): per unit, the helper's nr records (each copied from the helper's
-    channel ring, slot: the helper record count's parity), then its own nr from the decoded super-blocks at own (bytes
-    from the scratch base), one record loop around a single copy (program memory)."""
+    channel ring, slot: the helper record count mod hcap), then its own nr from the decoded super-blocks at own (bytes
+    from the scratch base), one record loop around a single copy (program memory). hsplit: the last xr of its own come
+    from the helper too (after its nr)."""
     e(f"  %fzmn = mov.i32 {nr}")
+    if xr:
+        e(f"  %fzmx = mov.i32 {2 * nr - xr - 1}")
     e(f"  %fzm2n = mov.i32 {2 * nr}")
     e(f"  %fzmb = mov.i32 {4 * fw}")
     e(f"  %fzmoo = mov.i32 {own}")
@@ -1399,11 +1421,12 @@ def fuse_egress_helped(e, dp, nr, fw, own):
     e("  low.cond_br %fzmm, ^fzmb, ^fzms : reg<aie2p.er>")
     e("^fzmb:")
     e(f"  acq %fzEm1, {dp}")
-    e("  %fzmw = lt %fzmi, %fzmn")
+    helped_rec(e, "%fzmw", xr)
     e("  low.cond_br %fzmw, ^fzmhh, ^fzmoo : reg<aie2p.er>")
     e("^fzmhh:")                                        # a helper record: its slot
     e(f"  acq %fzEm1, {HELP_RECV}")
-    e("  %fzmhp = and %fzmh, %fzE1")
+    e(f"  %fzmhk = mova.i32 {hcap - 1}")
+    e("  %fzmhp = and %fzmh, %fzmhk")
     e("  %fzmho = mul %fzmhp, %fzmb")
     e("  %fzmha = add.rr %fzhl, %fzmho")
     e("  %fzmh1 = add.rr %fzmh, %fzE1")
@@ -1414,7 +1437,7 @@ def fuse_egress_helped(e, dp, nr, fw, own):
     e("^fzmcp(%fzmsrc: reg<aie2p.er>, %fzmh2: reg<aie2p.er>, %fzmo2: reg<aie2p.er>):")
     e("  %fzmsp = mov.scalar-to-address %fzmsrc")
     egress_record(e, "m", "%fzmsp", "%fzmc", "%fzdl", fw)
-    e("  %fzmw2 = lt %fzmi, %fzmn")
+    helped_rec(e, "%fzmw2", xr)
     e("  low.cond_br %fzmw2, ^fzmrh, ^fzmj : reg<aie2p.er>")
     e("^fzmrh:")
     e(f"  rel %fzE1, {HELP_RECV}")
@@ -1430,6 +1453,16 @@ def fuse_egress_helped(e, dp, nr, fw, own):
     e("  %fzxF = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
     e("  st %fzmh, %fzxF, 4")
     e("  low.br ^fzex")
+
+
+def helped_rec(e, v, xr):
+    """v = 1 when fuse_egress_helped's record %fzmi is the helper's (i < nr, hsplit: or i > 2 nr - xr - 1)."""
+    if not xr:
+        e(f"  {v} = lt %fzmi, %fzmn")
+        return
+    e(f"  {v}a = lt %fzmi, %fzmn")
+    e(f"  {v}b = lt %fzmx, %fzmi")
+    e(f"  {v} = add.rr {v}a, {v}b")
 
 
 def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
