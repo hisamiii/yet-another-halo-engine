@@ -92,6 +92,7 @@ class Config:
                         # patch 0025)
     ghelp: int = 0      # gwest: the gate's cores (row 1 of columns 1, 2), idle while their heads decode rows 1 and 0,
                         # decode row 1 themselves and hand its records to the head over neighbor memory (fuse_helper)
+    hvroll: int = 0     # ghelp: the helpers' decoder with its scale halves rolled (gen_npu_dec VROLL; program memory)
     dfr: int = 0        # swiglu (mu 1, not paired): each M block's epilogue deferred into the next block's passes: segment s
                         # at pass s, one h block (a push) after sub-tiles DFR_T of each iteration, in the tail's cascade
                         # slack; the C ring's other half (2 MP slots, released in the same order, so the records and
@@ -1221,7 +1222,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
         e(f"  %dq_{nm} = mov.scalar-to-address {inb if nm == 'in' else '%fza_' + nm}")
     # the decoder (its values and labels prefixed)
     ren = lambda m: m.group(1) + "dq_" + m.group(2)
-    for ln in D.leaf_inline(nsb, dec_tag(cfg)):
+    for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool(helper == "M" and cfg.hvroll)):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if cfg.rawdma:   # the raw record is consumed: back to the DMA, but for the last cap units (the panel follows them)
@@ -1652,20 +1653,31 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None, helper=Non
     body(L, cfg, role, ks, a_adv, acap, gate, pair, fills)
 
 
+def gate_parked(e):
+    e("  %gnpP = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
+    e("  %gnpl = lda %gnpP, 8")
+    e("  %gn1 = mov.scalar-to-address %gnpl")
+
+
+def imm32(v):
+    """The constant op for v: mova.i32 (4 bytes, load slot) where its 11-bit immediate holds v, else mov.i32."""
+    return "mova.i32" if -1024 <= v < 1024 else "mov.i32"
+
+
 def gate_epilogue(L, cfg, gate, parked=False):
     """The gated leaves' end of firing (see GATE): job accounting, background supply drain, the wait, the relay.
     parked: the neighbor channel's pointer is in the fill's private storage (fuse2_entry)."""
     e = L.append
     S, FPC = cfg.gate, cfg.nb * cfg.passes
-    if parked:
-        e("  %gnpP = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
-        e("  %gnpl = lda %gnpP, 8")
-        e("  %gn1 = mov.scalar-to-address %gnpl")
-    e("  %g0 = mov.i32 0")
-    e("  %g1 = mov.i32 1")
-    e("  %g2 = mov.i32 2")
-    e("  %gm1 = mov.i32 -1")
-    e(f"  %gfpc = mov.i32 {FPC}")
+    if parked and not (gate == "waiter" and cfg.ghelp):
+        gate_parked(e)
+    e("  %g0 = mova.i32 0")   # (mova: 4 bytes in the load slot, |immediate| < 1024; mov.i32 is a 6-byte bundle)
+    e("  %g1 = mova.i32 1")
+    e("  %g2 = mova.i32 2")
+    e("  %gm1 = mova.i32 -1")
+    e(f"  %gfpc = {imm32(FPC)} {FPC}")
+    if gate == "waiter" and cfg.ghelp:   # (the helper's program memory: waiter_epilogue)
+        return waiter_epilogue(e, S, parked)
     e("  %gF = lda %gsp, 0")
     e("  %gN = lda %gsp, 4")
     if gate == "waiter":
@@ -1818,6 +1830,113 @@ def gate_epilogue(L, cfg, gate, parked=False):
         e("  st %g0, %gsp, 0")
         e("  st %gNn, %gsp, 4")
         e("  return")
+
+
+def waiter_epilogue(e, S, parked):
+    """gate_epilogue's waiter in less program (ghelp: it shares the core with a decoder). The same protocol in fewer
+    blocks and constants: one supply loop per firing reads n and ticks m records, a read and a tick per iteration (the
+    reads trail the ticks by the pending count), m = min(L, GB) and n = Q, or at the job's end m = L, n = Q + L; the
+    wait polls with its pace spin in the same loop and selects the handoff branch-free. Its private state: firings left
+    (0: one call, the setup call's), -, leftover supply, pending reads, the last job's ready value. Ticks carry the read
+    bound (the tick binding is scratch). sel.eqz / sel.nez a, b, c: c (in r27) == 0 / != 0 ? a : b."""
+    R27 = "reg<aie2p.er> -> reg<aie2p.mr27_select>"
+    e("  %gR = lda %gsp, 0")
+    e("  %gL = lda %gsp, 8")
+    e("  %gQ = lda %gsp, 12")
+    e("  %gE = lda %gsp, 16")
+    if parked:
+        gate_parked(e)
+    e("  %gRs = copy %gR : " + R27)
+    e("  %gRv = sel.eqz %gfpc, %gR, %gRs")
+    e("  %gR1 = add %gRv, -1")                    # this firing ends the job: R1 == 0
+    e(f"  %ggb = mova.i32 {GB}")
+    e("  %gls = lt.select %gL, %ggb")             # m = min(L, GB), or L at the end
+    e("  %gmin = sel.nez %gL, %ggb, %gls")
+    e("  %gcs = copy %gR1 : " + R27)
+    e("  %gm = sel.nez %gmin, %gL, %gcs")
+    e("  %gQL = add.rr %gQ, %gL")
+    e("  %gn = sel.nez %gQ, %gQL, %gcs")
+    e("  low.br ^gd(%g0: reg<aie2p.er>)")
+    e("^gd(%gdi: reg<aie2p.er>):")   # (the conditions up front: a branch waits for its block's work)
+    e("  %gdtm = lt %gdi, %gm")
+    e("  %gdrm = lt %gdi, %gn")
+    e("  %gdm = or %gdtm, %gdrm")                # (max(m, n) iterations)
+    e("  %gdi1 = add %gdi, 1")
+    e("  low.cond_br %gdm, ^gdr, ^gdx : reg<aie2p.er>")
+    e("^gdr:")   # the read first: no more than GB records outstanding (at the job's end Q >= 1 while L > 0)
+    e("  low.cond_br %gdrm, ^gdr1, ^gdt : reg<aie2p.er>")
+    e("^gdr1:")
+    for i in range(4):
+        e(f"  %gdx{i} = mov.ss")
+    e("  low.br ^gdt")
+    e("^gdt:")
+    e("  low.cond_br %gdtm, ^gdt1, ^gdn : reg<aie2p.er>")
+    e("^gdt1:")
+    for i in range(4):
+        e("  mov.ms %gn")
+    e("  low.br ^gdn")
+    e("^gdn:")
+    e("  low.br ^gd(%gdi1: reg<aie2p.er>)")
+    e("^gdx:")
+    e("  low.cond_br %gR1, ^gmid, ^gend : reg<aie2p.er>")
+    e("^gmid:")
+    e("  st %gR1, %gsp, 0")
+    e("  %gL2 = sub %gL, %gm")
+    e("  st %gL2, %gsp, 8")
+    e("  st %gm, %gsp, 12")
+    e("  return")
+    e("^gend:")
+    # the wait for ready >= the last job's + GATE_CALLS: poll, then spin the pace (GP0 + GPS * max(0, polls - GFAST))
+    e(f"  %g64 = mova.i32 {GATE_CALLS}")
+    e("  %gexp = add.rr %gE, %g64")
+    e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
+    e("^gp(%gpn: reg<aie2p.er>, %gpw: reg<aie2p.er>):")
+    e("  low.cond_br %gpw, ^gspin, ^gask : reg<aie2p.er>")
+    e("^gspin:")
+    e("  %gpw1 = add %gpw, -1")
+    e("  low.br ^gp(%gpn: reg<aie2p.er>, %gpw1: reg<aie2p.er>)")
+    e("^gask:")
+    for i in range(4):
+        e("  mov.ms %gpn")
+    e("  %grdy = mov.ss")
+    e("  %gy1 = mov.ss")
+    e("  %gy2 = mov.ss")
+    e("  %gy3 = mov.ss")
+    e("  %gpn1 = add %gpn, 1")
+    e("  %glate = lt %grdy, %gexp")
+    e(f"  %gsl = mova.i32 {S - 1}")
+    e("  %gquit = lt %gsl, %gpn1")                # (pn + 1 >= S; pn and pw die before the back edge's values)
+    e("  %gwait = lt %gquit, %glate")
+    e(f"  %gfast = {imm32(GFAST)} {GFAST}")
+    e("  %gslow = lt.select %gfast, %gpn1")
+    e("  %gover = sub %gpn1, %gfast")
+    e("  %govs = sel.nez %gover, %gpw, %gslow")   # (%gpw: 0 here)
+    e(f"  %gps = mov.i32 {GPS}")
+    e("  %ggrow = mul %govs, %gps")
+    e(f"  %gp0 = mov.i32 {GP0}")
+    e("  %gpace = add.rr %ggrow, %gp0")
+    e("  low.cond_br %gwait, ^gpgo, ^ghand : reg<aie2p.er>")
+    e("^gpgo:")
+    e("  low.br ^gp(%gpn1: reg<aie2p.er>, %gpace: reg<aie2p.er>)")
+    e("^ghand:")   # opened: [ready, 1, polls, calls]; gave up after S polls: [expected, 2, S, 0] (the next job: one call)
+    e("  %gls27 = copy %glate : " + R27)
+    e("  %ghs = add %glate, 1")
+    e("  %ghv = sel.nez %gexp, %grdy, %gls27")
+    e("  %ghc = sub %ghv, %gexp")                # (the job's calls when open, else 0)
+    e("  acq %gm1, 4")
+    e("  st %ghv, %gn1, 0")
+    e("  st %ghs, %gn1, 4")
+    e("  st %gpn1, %gn1, 8")
+    e("  st %ghc, %gn1, 12")
+    e("  rel %g1, 4")
+    e("  %gNn = mul %ghc, %gfpc")
+    e("  %gLn1 = sub %gsl, %gpn1")
+    e("  %gLn = add %gLn1, 1")                    # (S - (pn + 1))
+    e("  st %gNn, %gsp, 0")
+    e("  st %gLn, %gsp, 8")
+    e("  st %gR1, %gsp, 12")                      # (%gR1: 0 at the job's end)
+    e("  st %gexp, %gsp, 16")
+    e("  return")
 
 
 def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):

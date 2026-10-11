@@ -71,6 +71,7 @@ TABV, BASEV = [TAB], ["%sp"]
 KV = I.KV if FMT == "IQ4_XS" else [float(v) for v in range(16)]
 OUTCAP = 2
 INLINE = [0]                    # leaf_inline: super-blocks per input record (0: a standalone leaf)
+VROLL = [False]                 # leaf_inline: the scale halves rolled whatever the format (program memory)
 TC_IQ4 = (("su", 0x380), ("sv", 0), ("u", 0xC6A0), ("v", 0xC320), ("s", 0xC681), ("1", 0x4A01), ("1", 0x4901))
 TC_Q4K = (("su", 0x380), ("sv", 0), ("u", 0xC680), ("v", 0xC300), ("s", 0xC681), ("1", 0x4A01))   # T = d sc
 NPARTS = 4 if FMT in ("Q4_K", "Q3_K", "IQ2_XS") else 2   # bf16 parts per scale line (T hi / lo; Q4_K adds -M hi / lo, Q3_K
@@ -713,7 +714,7 @@ def leaf(name="dec", nports=1):
         e("%ctp = mov.scalar-to-address %ctpa")          # one constant-table pointer shared by both halves
         CTP["on"] = True
     halves_s = []
-    vroll = hroll or ((X2 or FMT == "Q4_K") and HROLL and INLINE[0])   # Q3_K, IQ2_XS, IQ2_XXS, Q4_K: the halves in a loop (program memory) instead of two interleaved streams
+    vroll = hroll or ((X2 or FMT == "Q4_K" or VROLL[0]) and HROLL and INLINE[0])   # Q3_K, IQ2_XS, IQ2_XXS, Q4_K: the halves in a loop (program memory) instead of two interleaved streams
     if vroll:
         hv_i, _ = loop_begin("vl", 2)
     for h in range(1 if vroll else 2):
@@ -1758,17 +1759,17 @@ def leaf(name="dec", nports=1):
     return "\n".join(pre_ + e.L[:hdr_end] + place_consts(e.pre, e.L[hdr_end:]))
 
 
-def leaf_inline(nsb, name="inl"):
+def leaf_inline(nsb, name="inl", vroll=False):
     """The leaf's body for inlining into another core function: decodes nsb super-blocks of an input record
     ([16 rows][RECROW]) at %in into OUT_B records at %out (2 per super-block, no output ring), storages at %sp
     (SCR_B, 2048-aligned) and %sp2 (SCR2_B), all defined by the caller (the table is rebuilt each call). Returns the
     lines (not renamed; the caller prefixes its values and labels). Grid formats gather from module rodata
     (inline_rodata(name), defined once by the caller's module)."""
-    INLINE[0] = nsb
+    INLINE[0], VROLL[0] = nsb, vroll
     try:
         txt = leaf(name, 1)
     finally:
-        INLINE[0] = 0
+        INLINE[0], VROLL[0] = 0, False
     out = []
     for ln in txt.split("\n"):
         t = ln.strip()

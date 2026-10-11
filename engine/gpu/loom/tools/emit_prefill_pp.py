@@ -1027,13 +1027,15 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
                               env=env)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         rs = list(ex.map(compile_one, [source(*j) for j in jobs]))
-        # ghelp's helper (a decoder plus the gate's waiter) can exceed the core's program memory: that image without it
-        redo = [i for i, r in enumerate(rs) if r.returncode and jobs[i][0].ghelp and "core program memory" in r.stderr]
-        for i in redo:
-            jobs[i] = (dataclasses.replace(jobs[i][0], ghelp=0),) + tuple(jobs[i][1:])
-            print("%s: no ghelp (program memory)" % jobs[i][1], file=sys.stderr)
-        for i, r in zip(redo, ex.map(compile_one, [source(*jobs[i]) for i in redo])):
-            rs[i] = r
+        # ghelp's helper (a decoder plus the gate's waiter) can exceed the core's program memory: that image with
+        # the helpers' scale halves rolled (hvroll), else without ghelp
+        for fix, msg in ((dict(hvroll=1), "hvroll"), (dict(ghelp=0, hvroll=0), "no ghelp")):
+            redo = [i for i, r in enumerate(rs) if r.returncode and jobs[i][0].ghelp and "core program memory" in r.stderr]
+            for i in redo:
+                jobs[i] = (dataclasses.replace(jobs[i][0], **fix),) + tuple(jobs[i][1:])
+                print("%s: %s (program memory)" % (jobs[i][1], msg), file=sys.stderr)
+            for i, r in zip(redo, ex.map(compile_one, [source(*jobs[i]) for i in redo])):
+                rs[i] = r
     for (cfg, name, _, _), r in zip(jobs, rs):
         if r.returncode:
             raise SystemExit("NPU decoder-column compile failed (%s): %s" % (name, r.stderr[-800:]))
