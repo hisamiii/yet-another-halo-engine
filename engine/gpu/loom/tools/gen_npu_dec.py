@@ -75,6 +75,7 @@ VROLL = [False]                 # leaf_inline: the scale halves rolled whatever 
 TONCE = [True]                  # leaf_inline: the table built once per fill (flag at TFLAG), else every invocation
 TFLAG = 32                      # leaf_inline: the table-built flag's byte offset in the caller's private storage %fzs
                                 # (past scalar lda / st immediates: addressed through a pointer at it)
+RREC = [None]                   # leaf_inline: (first, end) output record decoded (records 2 j + r), None: all
 TC_IQ4 = (("su", 0x380), ("sv", 0), ("u", 0xC6A0), ("v", 0xC320), ("s", 0xC681), ("1", 0x4A01), ("1", 0x4901))
 TC_Q4K = (("su", 0x380), ("sv", 0), ("u", 0xC680), ("v", 0xC300), ("s", 0xC681), ("1", 0x4A01))   # T = d sc
 NPARTS = 4 if FMT in ("Q4_K", "Q3_K", "IQ2_XS") else 2   # bf16 parts per scale line (T hi / lo; Q4_K adds -M hi / lo, Q3_K
@@ -396,14 +397,15 @@ def leaf(name="dec", nports=1):
         e.L.append(f"^{tdone}:")
 
     # ---- loop helpers
-    def loop_begin(nm, n, args=()):
-        """args: [(init, type)]; returns the loop counter and the block arg names."""
-        z = k(0)
+    def loop_begin(nm, n, args=(), start=None):
+        """args: [(init, type)]; n: a count or a register bound; start: a register (else 0); returns the loop counter and
+        the block arg names."""
+        z = start or k(0)
         names = [f"%{nm}_a{i}" for i in range(len(args))]
         ext = "".join(f", {v}: {t}" for v, t in args)
         e(f"low.br ^{nm}h({z}: reg<aie2p.er>{ext})")
         e.L.append(f"^{nm}h(%{nm}_i: reg<aie2p.er>" + "".join(f", {n_}: {t}" for n_, (v, t) in zip(names, args)) + "):")
-        e(f"%{nm}_m = lt %{nm}_i, {k(n)}")
+        e(f"%{nm}_m = lt %{nm}_i, {k(n) if isinstance(n, int) else n}")
         e(f"low.cond_br %{nm}_m, ^{nm}b, ^{nm}x : reg<aie2p.er>")
         e.L.append(f"^{nm}b:")
         e.L.append("// LOOP-BEGIN")
@@ -1029,9 +1031,25 @@ def leaf(name="dec", nports=1):
     e("%mark_hotsetup = mova.i32 0") if os.environ.get("DQ_MARK") else None
     # -- hot: two output records (slots 0, 1), each 2 iterations of 2 sub-blocks (u) x 4 chunk-halves; T row-broadcast
     # from the halves' PARTS ((4 p + 2 r + t) 64: record r = sub-block group f, iteration t = sl // 2, u = sl % 2)
+    rlo, rhi = RREC[0] or (0, 2 * INLINE[0])
+    rs = rn = None
+    if INLINE[0] and (rlo, rhi) != (0, 2 * INLINE[0]):  # skipped records: the first super-block's record 0, the last's 1
+        assert 0 <= rlo <= 1 and 2 * INLINE[0] - 1 <= rhi <= 2 * INLINE[0] and os.environ.get("DQ_SLU", "1") == "1"
+        if rlo:
+            e(f"%rls = lt {j}, {k(1)}")
+            rs = "%rls"
+        if rhi < 2 * INLINE[0]:
+            e(f"%rll = lt {k(INLINE[0] - 2)}, {j}")
+            e(f"%rln = sub {k(2)}, %rll")
+            rn = "%rln"
     e(f"%pp0a = add.rr %spb, {k(PARTSS)}")              # record r's parts: lines (hh NP + p) 64 at + 2 NP 64 r
-    e("%pp0 = mov.scalar-to-address %pp0a")
-    r_, (rp0,) = loop_begin("rl", 2, [("%pp0", "reg<aie2p.ep>")])
+    if rs:
+        e(f"%pp0o = mul {rs}, {k(2 * NPARTS * 64)}")
+        e("%pp0b = add.rr %pp0a, %pp0o")
+        e("%pp0 = mov.scalar-to-address %pp0b")
+    else:
+        e("%pp0 = mov.scalar-to-address %pp0a")
+    r_, (rp0,) = loop_begin("rl", rn or 2, [("%pp0", "reg<aie2p.ep>")], start=rs)
     # -- record r: qs rows of both halves realigned (vshift) and transposed for chunks 8 r .. 8 r + 7, then their 64
     # gather addresses each (GT + 8 b = (b + (GT >> 3)) << 3) at GAS + 1024 (local sub-block) + 512 h + 256 cc
     if GRID:
@@ -1775,17 +1793,18 @@ def leaf(name="dec", nports=1):
     return "\n".join(pre_ + e.L[:hdr_end] + place_consts(e.pre, e.L[hdr_end:]))
 
 
-def leaf_inline(nsb, name="inl", vroll=False, tonce=True):
+def leaf_inline(nsb, name="inl", vroll=False, tonce=True, rec=None):
     """The leaf's body for inlining into another core function: decodes nsb super-blocks of an input record
     ([16 rows][RECROW]) at %in into OUT_B records at %out (2 per super-block, no output ring), storages at %sp
     (SCR_B, 2048-aligned) and %sp2 (SCR2_B), all defined by the caller (the table is rebuilt each call). Returns the
     lines (not renamed; the caller prefixes its values and labels). Grid formats gather from module rodata
-    (inline_rodata(name), defined once by the caller's module)."""
-    INLINE[0], VROLL[0], TONCE[0] = nsb, vroll, tonce
+    (inline_rodata(name), defined once by the caller's module). rec: (first, end) of the records 2 j + r to decode
+    (the others are left as they are)."""
+    INLINE[0], VROLL[0], TONCE[0], RREC[0] = nsb, vroll, tonce, rec
     try:
         txt = leaf(name, 1)
     finally:
-        INLINE[0], VROLL[0], TONCE[0] = 0, False, True
+        INLINE[0], VROLL[0], TONCE[0], RREC[0] = 0, False, True, None
     out = []
     for ln in txt.split("\n"):
         t = ln.strip()

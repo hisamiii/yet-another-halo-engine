@@ -94,6 +94,7 @@ class Config:
                         # decode row 1 themselves and hand its records to the head over neighbor memory (fuse_helper)
     hvroll: int = 0     # ghelp: the helpers' decoder with its scale halves rolled (gen_npu_dec VROLL; program memory)
     htab: int = 1       # ghelp: the helpers' decoder table built once per fill (else every unit; program memory)
+    rskip: int = 1      # fuse 2: decode only the half super-blocks (16 k-blocks) overlapping the filler's k-blocks
     pnbr: int = 0       # column pairs (fuse 2): the gate tail's g / silu(g) halves reach the up tail over a leaf-synced
                         # neighbor ring (two 1 KB records a segment: half a in slot 0, b in slot 1) instead of the core stream
     dfr: int = 0        # swiglu (mu 1, not paired): each M block's epilogue deferred into the next block's passes: segment s
@@ -1240,7 +1241,10 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
         e(f"  %dq_{nm} = mov.scalar-to-address {inb if nm == 'in' else '%fza_' + nm}")
     # the decoder (its values and labels prefixed)
     ren = lambda m: m.group(0) if m.group(2) == "fzs" else m.group(1) + "dq_" + m.group(2)
-    for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool(helper == "M" and cfg.hvroll), tonce=tonce):
+    # only the records (half super-blocks: 16 k-blocks) overlapping k0 .. k1: the egress reads nothing else
+    rec = ((k0 - 32 * s0) // 16, -(-(k1 - 32 * s0) // 16)) if cfg.rskip else None
+    assert D.OUT_B == 16 * 144
+    for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool(helper == "M" and cfg.hvroll), tonce=tonce, rec=rec):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if cfg.rawdma:   # the raw record is consumed: back to the DMA, but for the last cap units (the panel follows them)
