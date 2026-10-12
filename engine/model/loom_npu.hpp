@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -256,41 +257,54 @@ class LoomNpu {
     const iree_hal_amd_xdna_image_tables_t* tables = iree_hal_amd_xdna_image_tables(image);
     const iree_xdna_elf_entry_record_t rec = iree_hal_amd_xdna_image_tables_entry(tables, entry_ordinal);
     if (rec.binding_count != views.size()) throw LoomError("npu: " + path + ": binding count");
+    if (rec.invocation_count != 7 && rec.invocation_count != 4)
+      throw LoomError("npu: " + path + " has no gate (re-emit it)");
     auto k = std::make_unique<Kernel>();
     k->image_key = image;
     k->image = image;
     k->entry_ordinal = entry_ordinal;
-    const std::vector<iree_hal_amd_xdna_executable_binding_t> bindings = Bindings(*k, views);
-    k->storage.resize(rec.allocation_use_count);
-    k->storage_maps.resize(rec.allocation_use_count);
-    for (uint32_t i = 0; i < rec.allocation_use_count; ++i) {
-      const uint32_t ord = iree_hal_amd_xdna_image_tables_allocation_use(tables, rec.first_allocation_use + i);
-      AllocateStorage(iree_hal_amd_xdna_image_tables_allocation(tables, ord), &k->storage[i], &k->storage_maps[i]);
-    }
-    const auto n = static_cast<iree_host_size_t>(k->storage.size());
-    NpuCheck(iree_hal_amd_xdna_executable_load(image, entry_ordinal, n, k->storage.data()), "executable_load");
-    NpuCheck(iree_hal_amd_xdna_executable_bind(image, entry_ordinal, n, k->storage.data(), bindings.size(),
-                                               bindings.data()),
-             "executable_bind");
-    for (uint32_t i = 0; i < n; ++i)
-      YAH_AMDF(api_->host_mapping_cache_control(k->storage_maps[i], AMDF_HOST_CACHE_OPERATION_FLUSH, 0,
-                                                k->storage[i].mapping.data_length),
-               "host_mapping_cache_control(storage)");
-    NpuCheck(iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), false,
-                                                             &k->first),
-             "query_invocation");
-    if (rec.invocation_count != 7 && rec.invocation_count != 4)
-      throw LoomError("npu: " + path + " has no gate (re-emit it)");
     k->streamed = rec.invocation_count == 7;
-    amdf_xdna_kernel_command_t* const streamed[] = {&k->push[0], &k->push[1], &k->wait, &k->lead, &k->gate, &k->done};
-    amdf_xdna_kernel_command_t* const single[] = {&k->call, &k->gate, &k->done};
-    for (uint32_t i = 0; i + 1 < rec.invocation_count; ++i)
-      NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(image, entry_ordinal, n, k->storage.data(), i + 1,
-                                                                     k->streamed ? streamed[i] : single[i]),
-               "query_invocation_ordinal");
+    LoadStorage(*k, views);
     kernels_.push_back(std::move(k));
     return *kernels_.back();
   }
+  // k's command storage: the image's commands loaded into it, bound to views, and k's invocations in it.
+  void LoadStorage(Kernel& k, const std::vector<View>& views) {
+    const iree_hal_amd_xdna_image_tables_t* tables = iree_hal_amd_xdna_image_tables(k.image);
+    const iree_xdna_elf_entry_record_t rec = iree_hal_amd_xdna_image_tables_entry(tables, k.entry_ordinal);
+    k.storage.resize(rec.allocation_use_count);
+    k.storage_maps.resize(rec.allocation_use_count);
+    for (uint32_t i = 0; i < rec.allocation_use_count; ++i) {
+      const uint32_t ord = iree_hal_amd_xdna_image_tables_allocation_use(tables, rec.first_allocation_use + i);
+      AllocateStorage(iree_hal_amd_xdna_image_tables_allocation(tables, ord), &k.storage[i], &k.storage_maps[i]);
+    }
+    const auto n = static_cast<iree_host_size_t>(k.storage.size());
+    NpuCheck(iree_hal_amd_xdna_executable_load(k.image, k.entry_ordinal, n, k.storage.data()), "executable_load");
+    Rebind(k, views);
+    NpuCheck(
+        iree_hal_amd_xdna_executable_query_continuation(k.image, k.entry_ordinal, n, k.storage.data(), false, &k.first),
+        "query_invocation");
+    amdf_xdna_kernel_command_t* const streamed[] = {&k.push[0], &k.push[1], &k.wait, &k.lead, &k.gate, &k.done};
+    amdf_xdna_kernel_command_t* const single[] = {&k.call, &k.gate, &k.done};
+    for (uint32_t i = 0; i + 1 < rec.invocation_count; ++i)
+      NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(k.image, k.entry_ordinal, n, k.storage.data(),
+                                                                     i + 1, k.streamed ? streamed[i] : single[i]),
+               "query_invocation_ordinal");
+  }
+  // Frees k's command storage (LoadStorage brings it back). Only for an instance whose commands are all copied out
+  // (Snapshot, its setup copy): no command in it was submitted, so the NPU never read these pages.
+  void UnloadStorage(Kernel& k) {
+    for (std::size_t i = 0; i < k.storage.size(); ++i) {
+      api_->host_mapping_destroy(k.storage_maps[i]);
+      api_->memory_destroy(k.storage[i].memory);
+      storage_bytes_ -= storage_size_.at(k.storage[i].memory);
+      storage_size_.erase(k.storage[i].memory);
+      --storage_count_;
+    }
+    k.storage.clear(), k.storage_maps.clear();
+    k.first = {}, k.push[0] = {}, k.push[1] = {}, k.wait = {}, k.lead = {}, k.gate = {}, k.done = {}, k.call = {};
+  }
+  [[nodiscard]] static bool Loaded(const Kernel& k) { return !k.storage.empty(); }
 
   // The executable bindings of views for instance k (k.buffers keeps the range wrappers). DMA-BUF views are imported
   // once per view; registered host pages bind at the view's offset.
@@ -1019,6 +1033,7 @@ class LoomNpu {
     YAH_AMDF(api_->memory_create(scope, &ci, &out->memory),
              ("memory_create(storage) " + std::to_string(storage_count_) + " storages, " +
               std::to_string(storage_bytes_ >> 10) + " KB with this one").c_str());
+    storage_size_[out->memory] = ci.byte_length;
     YAH_AMDF(api_->memory_query_address(out->memory, 0, kind, &out->device_address), "memory_query_address(storage)");
     amdf_memory_map_info_t mi{};
     mi.type = AMDF_STRUCTURE_TYPE_MEMORY_MAP_INFO;
@@ -1054,6 +1069,7 @@ class LoomNpu {
   const void* resident_ = nullptr;  // the image (family) whose array state is set up; under mu_
   std::uint64_t storage_bytes_ = 0;    // command-memory storages allocated (images' and the command arenas')
   std::uint32_t storage_count_ = 0;
+  std::map<const amdf_memory_t*, std::uint64_t> storage_size_;  // per storage: its bytes in storage_bytes_
   int resident_dec_ = -1;            // its decoder format at the end of the last submitted command; under mu_
   std::map<std::tuple<const Shared*, std::size_t, std::size_t>, amdf_memory_t*> imports_;   // DMA-BUF views
   std::atomic<double> last_command_ms_{0};
@@ -1160,7 +1176,9 @@ class LoomNpuSplit : public NpuSplit {
                           std::vector<LoomNpu::View> views) {
     // one instance per image, re-bound per call (an instance's storage is ~0.7 MB, mostly its array setup)
     LoomNpu::Kernel*& k = instances_[image];
-    if (!k) {
+    if (k && !LoomNpu::Loaded(*k)) {  // (EndBinding)
+      npu_.LoadStorage(*k, views);
+    } else if (!k) {
       k = &npu_.Load(image, "npu_gemm", views);
       LoomNpu::Kernel*& sw = instances_[swap];
       if (!sw) sw = &npu_.Load(swap, "npu_gemm", views);   // only its setup runs
@@ -1186,6 +1204,15 @@ class LoomNpuSplit : public NpuSplit {
     }
     calls_.push_back(npu_.Snapshot(*k));
     return static_cast<std::uint32_t>(calls_.size() - 1);
+  }
+  // An instance's commands are copies once bound (Snapshot; FusedCommand splices its setup copy), except a swap image's
+  // setup, which FusedCommand reads from its storage, and the first of an image with no setup copy, which runs as is.
+  void EndBinding() override {
+    std::set<const LoomNpu::Kernel*> keep;
+    for (const auto& [path, k] : instances_)
+      if (k && k->swap && k->swap != k) keep.insert(k->swap);
+    for (const auto& [path, k] : instances_)
+      if (k && LoomNpu::Loaded(*k) && !k->setup.empty() && !keep.count(k)) npu_.UnloadStorage(*k);
   }
   // A flag word from / to the host, through memory (the NPU does not snoop CPU caches).
   void HostStore(std::uint32_t word, std::uint32_t value) override {

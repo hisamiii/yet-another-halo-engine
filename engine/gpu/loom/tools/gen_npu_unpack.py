@@ -28,7 +28,7 @@ def wg(cols):
 
 
 def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=False, tiled=False, qg=False, rem=False,
-        bfp=None, last8=False, dup=None):
+        bfp=None, last8=False, dup=None, trange=None):
     """resid: out = resid + C (f32; bindings c, resid, out), the kres GEMMs. parts: C is that many consecutive partial C
     blocks (the K chunks of one GEMM), summed in order. swiglu: C is the gate block then the up block; out =
     f16(silu(gate) * up) with the swiglu epilogue's scalar ops. tiled: f16 out fragment-major ([token / 16][column / 16]
@@ -43,15 +43,18 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     last8: only the last 8 tokens (the conv ring of a qkv split whose conv reads C itself, gen_conv_kq.gen_c).
     dup = (col0, base) with resid and rem (the NPU's FFN block, whose down calls cover all rows): C columns from col0 on
     (the last call, which overlaps the one before it) go to out column base + (col - col0) * TN + 8 j (the overlapped
-    columns are written twice with equal values), and rem is the GPU's f32 [token][stride] partial over the other K."""
+    columns are written twice with equal values), and rem is the GPU's f32 [token][stride] partial over the other K.
+    trange = (t0, n): only C's tokens t0 .. t0 + n - 1 (a token half of a whole-chunk C); every other binding starts at t0."""
     assert not (resid and (swiglu or tiled or out16)) and not (swiglu and parts > 1) and (resid or not rem)
     assert not bfp or swiglu
+    assert not trange or (not last8 and not bfp and trange[0] % 64 == 0 and trange[1] % 64 == 0 and sum(trange) <= tokens)
+    t0, ntok = trange or (0, tokens)
     assert not qg or not (resid or swiglu or tiled or out16)
     out16 = out16 or swiglu or tiled
     TN, NJ = GN.TN, GN.TN // 8
     assert not dup or (resid and rem and off == 0 and dup[0] <= cols < 2 * dup[0] and dup[1] + (cols - dup[0]) * TN == stride)
     assert tokens % 64 == 0 and (dup or off + TN * cols <= (2 if qg else 1) * stride)
-    items = (8 if last8 else tokens) * cols * NJ
+    items = (8 if last8 else ntok) * cols * NJ
     c_elems = tokens * cols * TN * CG   # one call's C: per column [group][M block][...]
     L = []
     e = L.append
@@ -82,11 +85,11 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e("} launch(%c: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
     e(f"  %nc = index.constant {c_elems * nblk // 2} : index")   # bf16 pairs
-    e(f"  %no = index.constant {tokens * stride} : index")
+    e(f"  %no = index.constant {ntok * stride} : index")
     if resid and rem:
         e("  %c_na, %res_na, %rem_na, %out_na = buffer.assume.noalias %c, %resid, %rem, %out : buffer, buffer, buffer, buffer")
         e("  %rv = buffer.view %res_na[%base] : buffer -> view<[%no]xf32>")
-        e(f"  %nrem = index.constant {tokens * (stride if dup else cols * TN)} : index")
+        e(f"  %nrem = index.constant {ntok * (stride if dup else cols * TN)} : index")
         e("  %remv = buffer.view %rem_na[%base] : buffer -> view<[%nrem]xf32>")
     elif resid:
         e("  %c_na, %res_na, %out_na = buffer.assume.noalias %c, %resid, %out : buffer, buffer, buffer")
@@ -131,6 +134,10 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e("  %wp0 = index.div %wg, %cnq : index")
         e(f"  %cwpl = index.constant {tokens // 8 - 1} : index")
         e("  %wp = index.add %wp0, %cwpl : index")
+    elif t0:
+        e("  %wp0 = index.div %wg, %cnq : index")
+        e(f"  %cwpt = index.constant {t0 // 8} : index")
+        e("  %wp = index.add %wp0, %cwpt : index")
     else:
         e("  %wp = index.div %wg, %cnq : index")
     e("  %tg8 = index.mul %wp, %c8 : index")
@@ -161,9 +168,14 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %a8 = index.add %a6, %a7 : index")
     e("  %a9 = index.mul %tile, %ctile : index")
     e("  %ca = index.add %a9, %a8 : index")
-    # out: token blk * 64 + r, column col * TN + 8 * j + off
+    # out: token blk * 64 + r (- t0: the other bindings start there), column col * TN + 8 * j + off
     e("  %t0 = index.mul %blk, %c64 : index")
-    e("  %tok = index.add %t0, %r : index")
+    if t0:
+        e(f"  %ct0 = index.constant {t0} : index")
+        e("  %t0l = index.sub %t0, %ct0 : index")
+        e("  %tok = index.add %t0l, %r : index")
+    else:
+        e("  %tok = index.add %t0, %r : index")
     e("  %j0 = index.mul %col, %ctn : index")
     e("  %j1 = index.mul %j, %c8 : index")
     e("  %j2 = index.add %j0, %j1 : index")
@@ -192,7 +204,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e("  %ot4 = index.mul %otr, %c16 : index")
         e("  %ot5 = index.add %ot3, %ot4 : index")
         e("  %oa0 = index.add %ot5, %ojr : index")
-        e(f"  %olast = index.constant {tokens * stride - 8} : index")
+        e(f"  %olast = index.constant {ntok * stride - 8} : index")
         e("  %oa = index.min %oa0, %olast : index")   # always in range; for the bound proof
     elif qg:   # j -> head jo / 512, half (jo / 256) % 2, d = jo % 256
         e("  %qh = index.div %jo, %c512q : index")
@@ -203,7 +215,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e("  %qc = index.add %qc0, %qd : index")
         e("  %tb = index.mul %tok, %cstride : index")
         e("  %oa0 = index.add %tb, %qc : index")
-        e(f"  %olast = index.constant {tokens * stride - 8} : index")
+        e(f"  %olast = index.constant {ntok * stride - 8} : index")
         e("  %oa = index.min %oa0, %olast : index")   # always in range; for the bound proof
     else:
         e("  %tb = index.mul %tok, %cstride : index")

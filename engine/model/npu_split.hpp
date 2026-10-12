@@ -75,6 +75,9 @@ class NpuSplit {
   virtual Job NewJob(const std::vector<std::uint32_t>& calls) = 0;
   // Before a chunk's first NewJob: decoder-column sets restart the job count per chunk (and per image family run).
   virtual void BeginChunk() {}
+  // After the calls are bound (the caller's binding pass): images whose commands the calls hold as copies free their
+  // command storage (the NPU's command memory is ~64 MB per process); a later new bind loads its image again.
+  virtual void EndBinding() {}
   // A job to queue: its calls, a tag naming it in the stats, its words.
   struct Queued {
     std::vector<std::uint32_t> calls;

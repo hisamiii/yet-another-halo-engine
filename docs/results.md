@@ -27,6 +27,8 @@ NPU FFN block with Q3_K gates (2026-10-09, 59 of 64 layers, the Q3_K decoder bit
 NPU FFN block with IQ2_XXS (2026-10-09, 62 of 64 layers; the IQ2_XXS decoder is IQ3_XXS's with 8-value grid entries as two table halves, bit-exact): KL mean 1.05e-4, p99.9 2.6e-3, max 5.5e-3, 0 flips, PPL 6.69427. pp2048 ~4320 ms (one run, untuned).
 NPU FFN block with IQ2_XS (2026-10-09, 63 of 64 layers: every layer but the last, whose FFN runs only the kept rows): KL mean 9.8e-5, p99.9 2.1e-3, max 5.2e-3, 0 flips, PPL 6.69812. pp2048 ~4360 ms (one run, untuned).
 
+NPU token halves (2026-10-12; fused decoder-column set with `YAH_NPU_SPLIT=qkv=5120,gate=3072,q=6144,out=2560 YAH_NPU_FFNBLK=8192`, AC, balanced, 156/156/130/130 W, cooled to 55 C + 15 s): pp2048 2413.7 -> 2323.8 ms (one round each), NPU busy 2394.6 -> 2298.9 ms, 202.4 MB of commands (+16), longest command 57 ms. A two-device schedule model of the pp2048 timeline (GPU kernel times from a dispatch profile, NPU job times from a watch run) predicted ~2320. jobs: qkv 65 -> 130, q 15 -> 29, out 60 -> 117 (57 out sites by halves; the last layer, which keeps one row, runs whole). Hidden state and logits bit-identical to the whole-chunk path on the 16 gate windows.
+
 NPU GEMM path pieces (2026-10-06; checks byte-exact against numpy oracles):
 
 | piece | measured |

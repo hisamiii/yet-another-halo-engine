@@ -171,10 +171,11 @@ def gen(dim=5120, wpr=1, tiled=False, resadd=False, keep=None, wlds=False):
     return "\n".join(L) + "\n"
 
 
-def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
+def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None, bfp_part=None):
     """The same norm with each row split over `split` waves (part p holds k in [p n/S, (p+1) n/S), all in registers).
     bfp = (tokens, ks, passes): also the NPU's BFP16 activation stream of the output (gen_bfp16_encode "act", binding ab after
-    the outputs), encoded from the f16 values; see split_bfp_out.
+    the outputs), encoded from the f16 values; see split_bfp_out. bfp_part = (row0, rows): the kernel's rows are the
+    stream's tokens row0 .. row0 + rows - 1 (its other bindings start at row0: a token half of a whole-chunk stream).
     Lane l's sum of squares stays one chain in k order: part p continues it from part p-1's partial (LDS, barrier
     between steps), so the bits are those of gen(). Branch-free: at step p every wave runs its chain from its
     predecessor's partial, only part p's result is used. Fewer values per wave: more waves and loads in flight."""
@@ -308,7 +309,7 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
     e("  %ivr = index.add %ivr0, %lastp : index")
     e(f"  %inv = view.load %iv_view[%ivr] : view<{wpr * split}xf32> -> f32")
     if bfp:
-        split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp)
+        split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp, bfp_part)
         return split_finish(L, split)
     if tiled:
         e("  %c16t = index.constant 16 : index")
@@ -354,7 +355,7 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
                .replace("  %base = index.constant 0 : offset\n", "  %base = index.constant 0 : offset\n" + consts, 1)
 
 
-def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp):
+def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp, part=None):
     """gen_split's output pass with 8 consecutive columns per lane: thread t = part * 32 + lane of a row takes columns
     8 (t + 32 split j), re-reads their x (cached), applies the same per-element ops (same f16 bits) and stores 16 bytes
     per layout.
@@ -363,8 +364,10 @@ def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp):
     import gen_bfp16_encode as GE
     import gen_npu_unpack as GU
     tokens, ks, passes = bfp
+    row0, rows = part or (0, tokens)
     both = tiled == "both"
     assert wpr == 4, "4 rows per workgroup: half a fragment per k-block"
+    assert row0 % 8 == 0 and row0 + rows <= tokens
     nkb, nth = dim // 8, 32 * wpr * split
     nab = GE.layout_bytes("act", tokens, ks, passes)
     e(f"  %nab4 = index.constant {nab // 4} : index")
@@ -386,7 +389,7 @@ def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp):
         e("  %trr = index.rem %row, %c16t : index")
         e("  %tt0 = index.mul %trow, %ctiles : index")
         e("  %tt3 = index.mul %trr, %c16t : index")
-        e(f"  %tlast = index.constant {tokens * dim - 8} : index")
+        e(f"  %tlast = index.constant {rows * dim - 8} : index")
     for j in range(nkb // (32 * split)):
         e(f"  %bgo{j} = index.constant {32 * split * j} : index")
         e(f"  %bg{j} = index.add %bt, %bgo{j} : index")
@@ -433,7 +436,12 @@ def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp):
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     # copy-out: dword d = k-block d / 9, word d % 9 of the workgroup's 36 bytes at stream fragment (row0 / 8, k-block) +
     # 36 * (row0 / 4 % 2)
-    e("  %row0 = index.mul %wg, %cwprb : index")
+    if row0:   # the stream's token
+        e("  %row0l = index.mul %wg, %cwprb : index")
+        e(f"  %brow0 = index.constant {row0} : index")
+        e("  %row0 = index.add %row0l, %brow0 : index")
+    else:
+        e("  %row0 = index.mul %wg, %cwprb : index")
     e("  %bo_g8 = index.div %row0, %c8 : index")
     e("  %bo_h0 = index.div %row0, %cwpr4 : index")
     e("  %c2o = index.constant 2 : index")

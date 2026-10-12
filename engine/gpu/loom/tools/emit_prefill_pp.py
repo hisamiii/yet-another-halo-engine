@@ -666,6 +666,16 @@ KCHAIN = lambda fmt: dict(kchain=1, hcap=2, gtail=1, hlate=int(fmt in ("iq3s", "
 # the decoder-column images' setups run no call (gen_npu_gemm gfirst: the gate waits at a job's first firing), so an
 # image switch inside a command costs no dummy call; dispatch.txt "npugfirst"
 NPU_GFIRST = 1
+# Token halves (LoomPrefill halves): the qkv / q and out jobs and their GPU chains run per half of the chunk, so the NPU works during the DeltaNet / attention chain.
+# main emits the set at half the chunk into "<outdir>/h" (YAH_EMIT_HALF=1: only what the halves run); the FFN block's unpack and norm get "_h<i>" forms for half i's tokens.
+EMIT_HALF = os.environ.get("YAH_EMIT_HALF") == "1"
+
+
+def npu_halves(B):
+    split = set(NPU_SPLIT)
+    return NPU_DCOL and B % 128 == 0 and bool({"qkv", "q", "out"} & split) and not {"ffn", "down"} & split
+
+
 NPU_COLS = 7 if NPU_DCOL and not NPU_FUSE else 8
 NPU_NP = 4 if NPU_FUSE else GN.NP   # 16-row slabs per column of a site call
 NPU_ROWS = NPU_COLS * 16 * NPU_NP   # output rows per NPU call
@@ -1169,34 +1179,39 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     # sets add them in the GPU window's residual epilogue (npuffnres) unless NPU_FFNRES is off
     N, calls = 5120, -(-5120 // rows)
     assert not pairs or len(ffnblk_parts(PF)) == len(parts)
+    # token halves (LoomPrefill halves): "_h<i>" unpacks half i's tokens of the same C
     if not (NPU_FUSE and NPU_FFNRES):
-        cg = GU.CG
-        GU.CG = 1
-        try:
-            with GN.np_override(4 if NPU_FUSE else GN.NP):
-                text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
-                              dup=((calls - 1) * NPU_COLS, N - rows))
-                nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
-        finally:
-            GU.CG = cg
-        src = os.path.join(tmp, "npu_unpack_ffnblk.loom")
-        open(src, "w").write(text)
-        E.emit(src, ["nop=0"], "npu_unpack_ffnblk.hal", outdir)
-        out.append(("npu_unpack_ffnblk.hal", B * calls * NPU_COLS * nj // wg, wg, 0))
+        for name, tr in (("npu_unpack_ffnblk", None),) + tuple(("npu_unpack_ffnblk_h%d" % h, (h * B // 2, B // 2))
+                                                                for h in range(2) if npu_halves(B)):
+            cg = GU.CG
+            GU.CG = 1
+            try:
+                with GN.np_override(4 if NPU_FUSE else GN.NP):
+                    text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
+                                  dup=((calls - 1) * NPU_COLS, N - rows), trange=tr)
+                    nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
+            finally:
+                GU.CG = cg
+            src = os.path.join(tmp, name + ".loom")
+            open(src, "w").write(text)
+            E.emit(src, ["nop=0"], name + ".hal", outdir)
+            out.append((name + ".hal", (tr[1] if tr else B) * calls * NPU_COLS * nj // wg, wg, 0))
     # gate / up read their activations in one replay group: the norm before them writes that stream (fragment-major)
     import gen_half_norm
     groups, perm = GE.GROUPS, GE.ACT_PERM
     dfrs = sorted({j[0].fmt for j in jobs if j[0].dfr})
+    # "_h<i>": half i's rows (token halves), into the whole chunk's stream
     for name, ks in (("norm_t_bfp_g1", NPU_KS),) + ((("norm_t_bfp_g1s", NPU_DFR_KS),) if dfrs else ()):
-        GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
-        try:
-            src = os.path.join(tmp, name + ".loom")
-            open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
-                                                         bfp=(B, list(ks), NPU_PASSES)))
-        finally:
-            GE.GROUPS, GE.ACT_PERM = groups, perm
-        E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
-                     "yah_half_norm.fused=0"], name + ".hal", outdir)
+        for sfx, part in (("", None),) + tuple(("_h%d" % h, (h * B // 2, B // 2)) for h in range(2) if npu_halves(B)):
+            GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
+            try:
+                src = os.path.join(tmp, name + sfx + ".loom")
+                open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
+                                                             bfp=(B, list(ks), NPU_PASSES), bfp_part=part))
+            finally:
+                GE.GROUPS, GE.ACT_PERM = groups, perm
+            E.emit(src, ["yah_half_norm.rows=%d" % (part[1] if part else B), "yah_half_norm.dim=5120",
+                         "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"], name + sfx + ".hal", outdir)
     for fmt in NPU_DFR_FMTS:
         if DCOL_FMTS[fmt][0] in dfrs:
             out.append(("npuffndfr_" + fmt, 1, 0, 0))
@@ -1298,7 +1313,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL
+    global MODEL, NPU_FFNBLK
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1322,7 +1337,10 @@ def main():
     n = 0
     df_done = set()
     geom = []  # (<hal>, <tokens per workgroup>, <row groups>, <token_tiles>)
-    for kind, fmt, port, mt, kb in sorted(combos):
+    if EMIT_HALF:   # a half set: no GEMMs of its own (the NPU split's GPU shares come from npu_split)
+        NPU_FFNBLK = 0
+        assert not {"ffn", "down"} & set(NPU_SPLIT) and T % (2 * B) == 0
+    for kind, fmt, port, mt, kb in sorted(combos) if not EMIT_HALF else ():
         name = lambda k: "gemm_%s_%s_%d_%d.hal" % (k, fmt, mt, kb)
         # A residual projection gets a kstore and the fused-residual kres; the attention q projection (12288 rows =
         # 24 heads x [q | gate]) also gets kqg, which stores q and gate unpacked. The driver prefers kres and kqg.
@@ -1346,7 +1364,8 @@ def main():
                 raise SystemExit("no GEMM kernel for %s %s (%d rows, K = %d)" % (fmt, k, mt * 16, kb * qk_of(fmt)))
         n += 1
 
-    geom.extend(ffn_fused(rows, B, outdir))
+    if not EMIT_HALF:
+        geom.extend(ffn_fused(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
         import gen_bfp16_encode as GE
         import gen_npu_unpack as GU
@@ -1418,6 +1437,10 @@ def main():
     write_attn(attn_src)
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
     af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
+    if EMIT_HALF:   # the whole set's (its o-projections' afrag forms)
+        af24 = AFRAG and B % AF_TILE["bn"] == 0 and any(
+            AF.get((fmt, "kres", mt, kb)) is not None for kind, fmt, port, mt, kb in combos
+            if kind == "residual" and (mt, kb) == (320, 24))
     attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
     if af24:
         gen_attn_fa.TILED_OUT = True
@@ -1705,6 +1728,8 @@ def main():
         if loom in (attn_src, attn_t_src) and (not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
+    if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)
+        fixed = [f for f in fixed if f[1].startswith(("prepab", "rowsplit", "postnorm", "rope", "vtpage", "wmma"))]
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
         if outname.startswith("wmma") and "_kt2" in loom:   # KT2 past 240 VGPRs loses its third workgroup: use the old twin
@@ -1725,7 +1750,7 @@ def main():
         n += 1
 
     tables = os.path.join(E.LOOM, "tables")
-    for src, dst in [("grid_iq3s.bin", "grid_iq3s.bin"),
+    for src, dst in [] if EMIT_HALF else [("grid_iq3s.bin", "grid_iq3s.bin"),
                      ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
                      ("grid_iq2xxs.bin", "grid_iq2xxs.bin"),
                      ("grid_iq2xs.bin", "grid_iq2xs.bin"),
@@ -1733,6 +1758,10 @@ def main():
         shutil.copy(os.path.join(tables, src), os.path.join(outdir, dst))
     print("emitted %d GEMM + fixed prefill HALs for B=%d (tile=%d, token_tiles=%d)"
           % (n, B, TILE, TT))
+    if npu_halves(B) and not EMIT_HALF:
+        env = {k: v for k, v in os.environ.items() if k != "YAH_NPU_FFNBLK"}
+        env.update(YAH_EMIT_HALF="1", YAH_CTX=str(T))
+        subprocess.run([sys.executable, os.path.abspath(__file__), model, os.path.join(outdir, "h"), str(B // 2)], env=env, check=True)
 
 
 if __name__ == "__main__":
