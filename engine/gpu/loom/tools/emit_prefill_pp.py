@@ -658,6 +658,9 @@ NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-sli
 # place): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
 # layer writes this split's stream ("norm_t_bfp_g1s.hal", dispatch row "npuffndfr_<fmt>")
 NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs"), (40, 40, 40, 8)
+# the fused site images of the formats whose four cores each decode one super-block of every unit (gen_npu_gemm kchain;
+# the grid formats' cores can't hold a fourth table), the gate's waiter and relay on tails (gtail: rows 1 are decoders)
+NPU_KCHAIN_FMTS = ("iq4xs", "q4k")
 NPU_COLS = 7 if NPU_DCOL and not NPU_FUSE else 8
 NPU_NP = 4 if NPU_FUSE else GN.NP   # 16-row slabs per column of a site call
 NPU_ROWS = NPU_COLS * 16 * NPU_NP   # output rows per NPU call
@@ -1004,7 +1007,7 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     for fmt, K in sorted(images):
         if NPU_FUSE:
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, kraw=K,
-                            fmt=DCOL_FMTS[fmt][0])
+                            fmt=DCOL_FMTS[fmt][0], **(dict(kchain=1, hcap=2, gtail=1) if fmt in NPU_KCHAIN_FMTS else {}))
         else:
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
                             kraw=K)
