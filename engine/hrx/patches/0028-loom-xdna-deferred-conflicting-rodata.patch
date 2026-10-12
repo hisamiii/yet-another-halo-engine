@@ -1,0 +1,158 @@
+A Loom AIE2P planner change for read-only data with bank conflicts (`conflicts([...])`; yah gen_npu_dec grid decoders:
+the grid table and the sign table in different banks, so a gather's address lanes 0, 1 and 2, 3 never share a bank
+and it issues without the bank stall):
+- Such data took the first bank without a conflicting peer at once, before the channel rings, and the bank it claimed
+  could leave a ring no room (an IQ3_S swiglu image: XDNA/006 on an activation ring channel). Now it takes its ordinary
+  place unless that shares a bank with a placed peer; else it is placed after the channel rings, in a bank without a
+  peer. Data without bank conflicts is placed as before.
+- The LOOM_EXP_PACK_LOW bank order is read in one place (loom_aie2p_array_pack_low) and applies to both placements.
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -1787,19 +1787,24 @@
+   return false;
+ }
+ 
+-static bool loom_aie2p_array_propose_read_only_data(
+-    const loom_aie2p_array_plan_builder_t* builder, uint32_t worker_index,
+-    const loom_low_read_only_data_requirement_t* requirement,
+-    const loom_aie2p_array_tile_state_t* tile_state,
+-    loom_aie2p_array_local_memory_proposal_t* out_proposal) {
+-  // EXPERIMENT: LOOM_EXP_PACK_LOW=1 tries the low banks first (wide ring
+-  // records too, loom_aie2p_array_local_memory_propose_channel), so a record
+-  // narrower than a bank keeps a whole upper bank.
++// EXPERIMENT: LOOM_EXP_PACK_LOW=1 tries the low banks first (wide ring
++// records too, loom_aie2p_array_local_memory_propose_channel), so a record
++// narrower than a bank keeps a whole upper bank.
++static bool loom_aie2p_array_pack_low(void) {
+   static int low = -1;
+   if (low < 0) {
+     const char* value = getenv("LOOM_EXP_PACK_LOW");
+     low = value && value[0] == '1';
+   }
++  return low != 0;
++}
++
++static bool loom_aie2p_array_propose_read_only_data(
++    const loom_aie2p_array_plan_builder_t* builder, uint32_t worker_index,
++    const loom_low_read_only_data_requirement_t* requirement,
++    const loom_aie2p_array_tile_state_t* tile_state,
++    loom_aie2p_array_local_memory_proposal_t* out_proposal) {
++  const bool low = loom_aie2p_array_pack_low();
+   if (requirement->bank_conflicts.count == 0 && !low) {
+     return loom_aie2p_array_local_memory_propose_worker(
+         tile_state->resources.facts, tile_state->resources.bank_cursors,
+@@ -1824,6 +1829,26 @@
+   return false;
+ }
+ 
++// The first place in loom_aie2p_array_propose_read_only_data's bank order,
++// bank conflicts not checked.
++static bool loom_aie2p_array_propose_read_only_data_unchecked(
++    const loom_low_read_only_data_requirement_t* requirement,
++    const loom_aie2p_array_tile_state_t* tile_state,
++    loom_aie2p_array_local_memory_proposal_t* out_proposal) {
++  const bool low = loom_aie2p_array_pack_low();
++  const uint8_t bank_count = tile_state->resources.facts->memory.bank_count;
++  for (uint8_t attempt = 0; attempt < bank_count; ++attempt) {
++    const uint8_t bank = low ? attempt : (uint8_t)(bank_count - attempt - 1u);
++    if (loom_aie2p_array_local_memory_propose_worker_from_bank(
++            tile_state->resources.facts, tile_state->resources.bank_cursors,
++            bank, requirement->contents.data_length,
++            requirement->minimum_alignment, out_proposal)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ // EXPERIMENT (diagnosis only): LOOM_EXP_LATE_STORAGE=1 reserves authored worker
+ // storage after channel rings so large ring records keep whole banks.
+ static bool loom_aie2p_array_late_storage(void) {
+@@ -1933,7 +1958,30 @@
+       const loom_low_read_only_data_requirement_t* requirement =
+           &requirements->read_only_data[requirement_ordinal];
+       uint32_t owner_offset = 0;
+-      if (requirement->contents.data_length != 0) {
++      if (requirement->contents.data_length != 0 &&
++          requirement->bank_conflicts.count != 0) {
++        // Data with bank conflicts takes its ordinary place unless that shares
++        // a bank with a placed peer; else it is placed after the channel rings
++        // (loom_aie2p_array_plan_deferred_read_only_data), so the bank it would
++        // claim here stays whole for them. A zero byte_length marks it.
++        loom_aie2p_array_local_memory_proposal_t proposal;
++        if (!loom_aie2p_array_propose_read_only_data_unchecked(
++                requirement, tile_state, &proposal) ||
++            loom_aie2p_array_read_only_data_proposal_conflicts(
++                builder, (uint32_t)worker_index, requirement, &proposal)) {
++          builder->read_only_data[builder->read_only_data_cursor++] =
++              (loom_aie2p_array_read_only_data_plan_t){
++                  .worker_index = (uint32_t)worker_index,
++                  .requirement_ordinal = (uint32_t)requirement_ordinal,
++              };
++          continue;
++        }
++        loom_aie2p_array_local_memory_commit(tile_state->resources.facts,
++                                             &proposal,
++                                             tile_state->resources.bank_cursors,
++                                             &tile_state->resources.next_bank);
++        owner_offset = proposal.owner_offset;
++      } else if (requirement->contents.data_length != 0) {
+         loom_aie2p_array_local_memory_proposal_t proposal;
+         if (!loom_aie2p_array_propose_read_only_data(
+                 builder, (uint32_t)worker_index, requirement, tile_state,
+@@ -1977,6 +2025,44 @@
+   return iree_ok_status();
+ }
+ 
++// Places the read-only data deferred past the channel rings
++// (loom_aie2p_array_plan_workers) in banks without a conflicting peer.
++static iree_status_t loom_aie2p_array_plan_deferred_read_only_data(
++    loom_aie2p_array_plan_builder_t* builder) {
++  for (iree_host_size_t i = 0; i < builder->read_only_data_cursor; ++i) {
++    loom_aie2p_array_read_only_data_plan_t* placement =
++        &builder->read_only_data[i];
++    const loom_aie2p_array_worker_t* worker =
++        &builder->workers[placement->worker_index];
++    const loom_low_read_only_data_requirement_t* requirement =
++        &worker->leaf->requirements
++             .read_only_data[placement->requirement_ordinal];
++    if (placement->byte_length != 0 ||
++        requirement->contents.data_length == 0) {
++      continue;
++    }
++    loom_aie2p_array_tile_state_t* tile_state =
++        loom_aie2p_array_tile_state(builder, worker->coordinate);
++    loom_aie2p_array_local_memory_proposal_t proposal;
++    if (!loom_aie2p_array_propose_read_only_data(
++            builder, placement->worker_index, requirement, tile_state,
++            &proposal)) {
++      return loom_aie2p_array_reject_read_only_data_bank_conflicts(
++          builder, placement->worker_index, requirement);
++    }
++    loom_aie2p_array_local_memory_commit(tile_state->resources.facts,
++                                         &proposal,
++                                         tile_state->resources.bank_cursors,
++                                         &tile_state->resources.next_bank);
++    placement->owner_offset = proposal.owner_offset;
++    placement->load_address =
++        tile_state->resources.facts->memory.local_load_base +
++        proposal.owner_offset;
++    placement->byte_length = (uint32_t)requirement->contents.data_length;
++  }
++  return iree_ok_status();
++}
++
+ // Indexed output extents retained while private fold allocations are formed.
+ typedef struct loom_aie2p_array_fold_geometry_t {
+   // Byte lengths in the worker's contiguous folded-output port order.
+@@ -3963,6 +4049,10 @@
+     return iree_ok_status();
+   }
+   IREE_RETURN_IF_ERROR(loom_aie2p_array_plan_channels(&builder));
++  if (builder.valid) {
++    IREE_RETURN_IF_ERROR(
++        loom_aie2p_array_plan_deferred_read_only_data(&builder));
++  }
+   if (builder.valid && loom_aie2p_array_late_storage()) {
+     for (iree_host_size_t i = 0; i < builder.plan->worker_count; ++i) {
+       IREE_RETURN_IF_ERROR(

@@ -33,6 +33,8 @@ Whole-chunk gate in token halves (2026-10-12, same set and power state, GPU edge
 
 Grid decoder hot loop (2026-10-13, same set and power state): the IQ3_S / IQ3_XXS / IQ2_XXS decoders give each k-block's sign and grid gathers their own streams (signs first) and multiply T one part at a time. Hot loop 1023 -> 880 bundles (NOPs 508 -> 301), 224 B less code (three column-pair images now fit without hvroll); IQ3_S sw call 808.6K -> 791.3K cycles (-2.1%); NPU busy ~-20 ms in watch runs. pp2048 2319.5 -> 2298.2 ms (one round each, both with the longest NPU command ~62 ms: runs whose longest command is 108-144 ms come out ~60 ms slower on either set). Bit-identical on the 16 gate windows.
 
+Grid decoder lane mixing (2026-10-13, HRX patch 0028): the IQ3_S / IQ3_XXS / IQ2_XXS decoders keep the sign table in its own read-only object, in another bank than the grid, and give each gather two grid and two sign address lanes (the vbor that joins the gathers is commutative), so no gather pays the bank stall (~250 cycles per hot-loop iteration). IQ3_S sw call 796.1K -> 777.9K cycles (-2.3%); NPU busy ~-7 ms in a watch run (two outlier jobs of a slow-state run excluded). It costs 256 B of decoder code: three IQ3_XXS column-pair images are back on hvroll without the seam. pp2048: the one fast-state run 2264.8 ms against s27's fast-state runs 2279.7-2320.9 ms; most runs that night were slow-state on both sets (longest command 126-233 ms), with 8-73K pages swapped out per run. Bit-identical on the 16 gate windows.
+
 NPU GEMM path pieces (2026-10-06; checks byte-exact against numpy oracles):
 
 | piece | measured |

@@ -33,6 +33,8 @@ BLK = {"IQ4_XS": 136, "Q4_K": 144, "IQ3_S": 110, "IQ3_XXS": 98, "IQ2_XXS": 66, "
 HBY = {"IQ4_XS": 8, "Q4_K": 16, "IQ3_S": 2, "IQ3_XXS": 2, "IQ2_XXS": 2, "IQ2_XS": 2,
        "Q3_K": 0}[FMT]        # header bytes before qs
 GRID = FMT in ("IQ3_S", "IQ3_XXS", "IQ2_XXS", "IQ2_XS")   # grid formats: gathers of 4-value grid pieces + sign masks (rodata)
+# grid and sign tables in different banks, each gather's address lanes 0, 1 at one and 2, 3 at the other (no bank stall)
+GMIX = GRID and FMT != "IQ2_XS"
 GP4 = os.environ.get("DQ_GORD", "P4") == "P4"   # grid formats push in IQ4_XS's k-block order (0, 2, 1, 3) per sub-block
 gpair = (lambda kb: 2 * (kb // 4) + kb % 2) if GP4 else (lambda kb: kb // 2)   # hot-loop pair of a k-block
 gpos = (lambda kb: (kb % 4) // 2) if GP4 else (lambda kb: kb % 2)               # its position in the pair
@@ -119,10 +121,13 @@ def grid_rodata(name):
             ks = f | ((bin(f).count("1") & 1) << 7)
             for j in range(8):
                 st[f >> 2, j // 4, f & 3, j % 4] = 0x8000 if (ks >> j) & 1 else 0
-        # one object, the sign table on the page after the grid's (its 2 KB alone would take a whole aligned page)
+        if GMIX:   # the sign table its own object, in another bank
+            return [f'global.rodata.def @gt_{name} = align(4096) conflicts([@gs_{name}]) bytes("{hexs(gt)}")',
+                    f'global.rodata.def @gs_{name} = align(64) conflicts([@gt_{name}]) bytes("{hexs(st)}")']
+        # IQ2_XS: one object, the sign table on the pages after the grid's
         return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(gt)}{hexs(st)}")']
-    # IQ3_S: the grid's 2 pages, then (page 2) the signs by nibble n (even lanes: the low nibble -> values 0-3, odd
-    # lanes: the high nibble -> values 4-7: both halves alike) and the qh bit masks [kb 4][row 8][e 2] = 1 << (2 kb + e)
+    # IQ3_S: the grid's 2 pages and the qh bit masks [kb 4][row 8][e 2] = 1 << (2 kb + e); in another bank the signs by
+    # nibble n (even lanes: the low nibble -> values 0-3, odd lanes: the high nibble -> values 4-7: both halves alike)
     grid = grid_table("grid_iq3s.bin", 512).astype(np.float32)
     gt = np.zeros((128, 2, 4, 4), np.uint16)
     for idx in range(512):
@@ -132,7 +137,8 @@ def grid_rodata(name):
         for v in range(4):
             st[n >> 2, :, n & 3, v] = 0x8000 if (n >> v) & 1 else 0
     hm = np.array([1 << (2 * (i // 16) + i % 2) for i in range(64)], np.uint8)
-    return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(gt)}{hexs(st)}{hexs(hm)}")']
+    return [f'global.rodata.def @gt_{name} = align(4096) conflicts([@gs_{name}]) bytes("{hexs(gt)}{hexs(hm)}")',
+            f'global.rodata.def @gs_{name} = align(256) conflicts([@gt_{name}]) bytes("{hexs(st)}")']
 
 
 def leaf(name="dec", nports=1):
@@ -321,10 +327,19 @@ def leaf(name="dec", nports=1):
         e(f"%gtp = mov.local-address @gt_{name}")
         e(f"%gta = mov.address-to-scalar %gtp")
         e(f"%gtc = lshl %gta, {k(-12)}")
-        # the sign table: the pages after the grid's (grid_rodata)
-        e(f"%stc = add.rr %gtc, {k(1 if XXS else 2)}")
+        if GMIX:   # the sign table's own object (XXS: 64-aligned, addresses base + 16 f); u32 lanes 4 q, 4 q + 1: grid
+            e(f"%gsp = mov.local-address @gs_{name}")
+            e("%gsa = mov.address-to-scalar %gsp")
+            e(f"%stc = lshl %gsa, {k(-12)}")
+            e(f"%sb4 = lshl %gsa, {k(-4)}")
+            e(f"%gq0 = vbcst.32 {k(0)}")
+            e(f"%gq1 = vbcst.32 {k(1)}")
+            e(f"%gqp = vshuffle %gq0, %gq1, {k(14)}")
+            e("%gmk = vlt.u32x16.el.low32 %gqp, %gq1")
+        else:      # IQ2_XS: the sign table on the pages after the grid's (grid_rodata)
+            e(f"%stc = add.rr %gtc, {k(2)}")
         if not (XXS or XS2):
-            e(f"%hma = add.rr %gta, {k(8192 + 256)}")      # IQ3_S: the qh bit masks
+            e(f"%hma = add.rr %gta, {k(8192)}")      # IQ3_S: the qh bit masks
     elif not Q3K:
         # ---- table (once per invocation of the program: a flag in private storage)
         tb_, tdone = label("tbuild"), label("tdone")
@@ -1069,6 +1084,8 @@ def leaf(name="dec", nports=1):
         if not (X2 or XS2):
             e("%cgv = vbcst.8 %gtc")
             e("%csv = vbcst.8 %stc")
+            if not XXS:
+                e("%csl = vbcst.8 %sb4")                       # IQ3_S: the sign table's address bits 8-11, << 4
         e("%sh4 = mov.shift 4")
 
         def qhrow(x, row):
@@ -1159,15 +1176,19 @@ def leaf(name="dec", nports=1):
                 continue
             if X2:
                 # IQ2_XXS record r: the 4 sub-blocks' index words (even units) and aux words (odd units) of 8 rows,
-                # transposed; index byte l / sign field l -> (v | page << 8) [ib 4][row], duplicated -> addresses
-                for kind, sel_, page_, wd in (("g", 4, "%gtc", 8), ("s", 5, "%stc", 7)):
+                # transposed; index byte l -> (v | page << 8), sign field l -> v + base / 16 [ib 4][row], duplicated
+                # -> addresses
+                for kind, sel_, page_, wd in (("g", 4, "%gtc", 8), ("s", 5, "%sb4", 7)):
                     x = e.stream()
                     xa = x.t("xra")
                     x(f"{xa} = add.rr %goq, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %goq, {k(0)}")
                     O = aux_words(x, xa, 0, sel_)
                     cw_, cv_ = x.t("cw"), x.t("cv")
-                    x(f"{cw_} = lshl {page_}, {k(8)}")
-                    x(f"{cv_} = vbcst.16 {cw_}")
+                    if kind == "s":
+                        x(f"{cv_} = vbcst.16 {page_}")
+                    else:
+                        x(f"{cw_} = lshl {page_}, {k(8)}")
+                        x(f"{cv_} = vbcst.16 {cw_}")
                     for l in range(4):
                         shr = x.t("shl")
                         x(f"{shr} = mov.shift {wd * l}")
@@ -1175,7 +1196,7 @@ def leaf(name="dec", nports=1):
                         if wd * l + wd == 32:                   # the field's shift is arithmetic: v - 256 for v >= 128
                             f_ = band(x, f_, 0xFF)
                         u_ = x.t("su")
-                        x(f"{u_} = vbor {f_}, {cv_}")
+                        x(f"{u_} = {'vadd.16' if kind == 's' else 'vbor'} {f_}, {cv_}")
                         for h2, md2 in enumerate((k(18), k(19))):
                             du, ua = x.t("sd"), x.t("sa")
                             x(f"{du} = vshuffle {u_}, {u_}, {md2}")    # [ib 2][row][dup]
@@ -1215,21 +1236,20 @@ def leaf(name="dec", nports=1):
                             x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
                             x(f"vst.acc {q1}, {pgg}, {256 * (gpair(kb_) - 2 * g) + 64 * gpos(kb_)}")
                 run(rq, int(os.environ.get("DQ_QWIN", "6")))
-                # signs: the record's 4 aux words per row -> fields f_l = (w >> 7 l) & 127 [ib][row] -> (f | page_s << 8)
+                # signs: the record's 4 aux words per row -> fields f_l = (w >> 7 l) & 127 [ib][row] -> f + base / 16
                 # twice -> sign addresses of kb 4 ib + l
                 x = e.stream()
                 xa = x.t("xra")
                 x(f"{xa} = add.rr %gor, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %gor, {k(0)}")
                 O = aux_words(x, xa, 0)
-                csw, csv16 = x.t("cw"), x.t("cv")
-                x(f"{csw} = lshl %stc, {k(8)}")
-                x(f"{csv16} = vbcst.16 {csw}")
+                csv16 = x.t("cv")
+                x(f"{csv16} = vbcst.16 %sb4")
                 for l in range(4):
                     shr = x.t("shl")
                     x(f"{shr} = mov.shift {7 * l}")
                     f_ = field(x, O[0], O[1], 127 << (7 * l), shr)
                     u_ = x.t("su")
-                    x(f"{u_} = vbor {f_}, {csv16}")                     # f + 256 page_s, lanes [ib 4][row]
+                    x(f"{u_} = vadd.16 {f_}, {csv16}")                  # f + base / 16, lanes [ib 4][row]
                     for h2, md2 in enumerate((k(18), k(19))):
                         du, ua = x.t("sd"), x.t("sa")
                         x(f"{du} = vshuffle {u_}, {u_}, {md2}")        # [ib 2][row][dup]
@@ -1293,9 +1313,11 @@ def leaf(name="dec", nports=1):
                     sl_, nb_ = x.t("sl"), x.t("snb")
                     x(f"{sl_} = slice {SV[i]}[{part}] : {V2} -> {V1}")
                     x(f"{nb_} = vunpack.u4.to.u8x64 {sl_}")   # [kb 4][row][nibble]: even lanes values 0-3, odd 4-7
+                    nbo = x.t("snb")
+                    x(f"{nbo} = vbor {nb_}, %csl")
                     for h2, md2 in enumerate((m20, m21)):
                         du, ua = x.t("sd"), x.t("sa")
-                        x(f"{du} = vshuffle {nb_}, %csv, {md2}")   # nibble | page_s << 8, [kb 2][row][nibble]
+                        x(f"{du} = vshuffle {nbo}, %csv, {md2}")   # (base >> 4) + nibble, [kb 2][row][nibble]
                         x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh4")
                         for q2 in range(2):
                             q1 = x.t("sg")
@@ -1503,8 +1525,20 @@ def leaf(name="dec", nports=1):
                             x = e.stream()
                             frags.append(x)
                             tails.append([])
-                        ad = x.t("ad")
-                        x(f"{ad} = vlda.512.i8x64 {gpp[(hh, pr // 4)]}, {256 * (pr % 4) + off + 64 * pos - 512}")
+                        if GMIX and kind == "s":   # both address vectors, mixed: (grid, grid, sign, sign) and the reverse
+                            ads = {}
+                            for kd_, of_ in (("g", 0), ("s", 128)):
+                                ads[kd_] = x.t("ad")
+                                x(f"{ads[kd_]} = vlda.512.i8x64 {gpp[(hh, pr // 4)]}, {256 * (pr % 4) + of_ + 64 * pos - 512}")
+                            mg, ms = x.t("ad"), x.t("ad")
+                            x(f"{mg} = vsel.32.mask64 {ads['s']}, {ads['g']}, %gmk")
+                            x(f"{ms} = vsel.32.mask64 {ads['g']}, {ads['s']}, %gmk")
+                            ads = {"g": mg, "s": ms}
+                        if GMIX:
+                            ad = ads[kind]
+                        else:
+                            ad = x.t("ad")
+                            x(f"{ad} = vlda.512.i8x64 {gpp[(hh, pr // 4)]}, {256 * (pr % 4) + off + 64 * pos - 512}")
                         for hf_ in range(2):
                             av, gl, gh, gc = x.t("av"), x.t("gl"), x.t("gh"), x.t("gc")
                             x(f"{av} = slice {ad}[{hf_}] : {V2} -> {V1}")
