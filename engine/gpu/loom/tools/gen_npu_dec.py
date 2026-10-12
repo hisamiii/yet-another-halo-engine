@@ -1481,9 +1481,9 @@ def leaf(name="dec", nports=1):
         st["fifo"] = nxt
 
     if GRID:
-        # ---- grid hot: per k-block pair (same sub-block) and row half. G streams (per k-block and table): one
-        # address vector -> 4 gathers (rows in lane order: [row][8] directly); C stream: T rows (2 parts), X = grid |
-        # signs, 2 MACs per k-block, pushes [kb][h]. Small G streams keep many gathers in flight (IQ4_XS's shape).
+        # ---- grid hot: per k-block pair (same sub-block) and row half. G streams (per k-block and table, signs first;
+        # IQ2_XS per k-block): one address vector -> 4 gathers (rows in lane order: [row][8] directly), X = grid | signs;
+        # C stream: T rows a part at a time, 2 MACs per k-block, pushes [kb][h]. Small G streams keep gathers in flight.
         frags, tails = [], []
         gpp = {}
         for pr in range(8):
@@ -1498,7 +1498,11 @@ def leaf(name="dec", nports=1):
                     if (hh, pr // 4) not in gpp:     # pairs 4 j .. 4 j + 3 of a half: offsets -512 .. 448
                         gpp[(hh, pr // 4)] = P(x, "%spb", GAS + 2048 * hh + 1024 * (pr // 4) + 512)
                     gv = {}
-                    for kind, off in (("g", 0), ("s", 128)):
+                    for kind, off in (("g", 0), ("s", 128)) if XS2 else (("s", 128), ("g", 0)):
+                        if kind == "g" and not XS2:
+                            x = e.stream()
+                            frags.append(x)
+                            tails.append([])
                         ad = x.t("ad")
                         x(f"{ad} = vlda.512.i8x64 {gpp[(hh, pr // 4)]}, {256 * (pr % 4) + off + 64 * pos - 512}")
                         for hf_ in range(2):
@@ -1519,9 +1523,9 @@ def leaf(name="dec", nports=1):
                 x = e.stream()
                 frags.append(x)
 
-                def tload(line0, lane):
+                def tload(line0, lane, parts=(0, 1)):
                     t4s = []
-                    for p in range(2):
+                    for p in parts:
                         ld, bc, ra, rb, t4 = x.t("pl"), x.t("bc"), x.t("ra"), x.t("rb"), x.t("TB")
                         x(f"{ld} = vlda.512.bf16x32 {sp0}, {(line0 + p) * 64}")
                         x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {lane}")
@@ -1537,11 +1541,17 @@ def leaf(name="dec", nports=1):
                         t4s = tload(hh * NPARTS + 2 * (kb_ // 8), (kb_ // 2) % 4)
                         acc = mac(x, None, t4s[0], x4)
                         accs.append(mac(x, acc, t4s[1], x4))
-                else:             # (IQ2_XS in natural order: the pair is one group, pr)
-                    t4s = tload(hh * NPARTS + 2 * (pr // 4), pr % 4) if XS2 else tload(hh * NPARTS, sl_)
+                elif XS2:         # (IQ2_XS in natural order: the pair is one group, pr)
+                    t4s = tload(hh * NPARTS + 2 * (pr // 4), pr % 4)
                     for x4 in xs4:
                         acc = mac(x, None, t4s[0], x4)
                         accs.append(mac(x, acc, t4s[1], x4))
+                else:
+                    accs = [None, None]
+                    for p in range(2):
+                        t4 = tload(hh * NPARTS, sl_, (p,))[0]
+                        for n_, x4 in enumerate(xs4):
+                            accs[n_] = mac(x, accs[n_], t4, x4)
                 if hh == 0:
                     parked = accs
                     tails.append([])
