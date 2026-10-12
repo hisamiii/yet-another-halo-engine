@@ -654,10 +654,10 @@ DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4")}
 NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
-# the fused FFN block's gate / up of one format whose filler cores hold 40 k-block slices (the grid decoders' tables leave
-# no room): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
+# the fused FFN block's gate / up of the formats whose filler cores hold 40 k-block slices (IQ3_S's head A ring does not
+# place): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
 # layer writes this split's stream ("norm_t_bfp_g1s.hal", dispatch row "npuffndfr_<fmt>")
-NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs",), (40, 40, 40, 8)
+NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs"), (40, 40, 40, 8)
 NPU_COLS = 7 if NPU_DCOL and not NPU_FUSE else 8
 NPU_NP = 4 if NPU_FUSE else GN.NP   # 16-row slabs per column of a site call
 NPU_ROWS = NPU_COLS * 16 * NPU_NP   # output rows per NPU call
