@@ -104,6 +104,8 @@ class Config:
                         # that super-block anyway (the head, the fill's slowest core, decodes one super-block less)
     hcap: int = 4       # ghelp: the helper's record ring depth (a power of 2; 2 couples the helper to the head's egress)
     thelp: int = 0      # fuse 2: the tail decodes its own slice for the last mid (a helper like ghelp's: fuse_helpers)
+    hlate: int = 0      # kchain: the helper rings declared after the A rings (rings are placed in channel order: the mids'
+                        # second small ring would split their banks so no contiguous A ring is left: grid formats)
     gtail: int = 0      # kchain gwest: the gate's waiter and relay on the tails of columns 1, 2 (rows 1: program memory)
     kchain: int = 0     # fuse 2: core r decodes super-block r of each unit (the fill balanced) whatever the k-slices: each row
                         # sends the k-blocks of its super-block before its slice to the row above (kchain_send)
@@ -527,6 +529,9 @@ def array_program(L, cfg):
             e(f"  %cha{c}_{r} = channel %a{r}, %ra{c}_{r}, %n{acap}, %arec{r} : reg<aie2p.array.channel : tile<{arec}>>")
             e(f"  constrain.leaf_sync %cha{c}_{r}")
             e(f"  constrain.stage %cha{c}_{r}, %n{astage(r, cols, cfg.gwest) if cols > 1 else 2}")
+    for ln in _HLATE if cfg.hlate else ():   # (fuse_channels)
+        e(ln)
+    _HLATE.clear()
     if cfg.gate:
         S = cfg.gate
         e('  %fb = binding 3, "read"')
@@ -954,6 +959,9 @@ def fuse_raw(w, cfg):
     return np.concatenate(out)
 
 
+_HLATE = []   # Config.hlate: fuse_channels' helper-ring lines, emitted by array_program after the A rings
+
+
 def fuse_channels(e, cfg, panel):
     """Per filling worker (fuse_cover): its leaf-synced egress ring (the source of its panel's fill; the dummy
     write binding, a lane per worker, is never transferred), and its column's raw stream, multicast over the column's
@@ -1045,13 +1053,14 @@ def fuse_channels(e, cfg, panel):
                 e(f"  %chr{c}_{h} = channel %fru{c}, %frr{c}_{h}, %n{cap}, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
                 e(f"  constrain.stage %chr{c}_{h}, %n{c if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chr{c}_{h}")
-            e(f"  %fhn{c}{s} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
-            e(f"  %fhs{c}{s} = sender %k{c}_{h}, {HELP_SEND} : reg<aie2p.array.sender : tile<{fw}xi32>>")
+            eh = _HLATE.append if cfg.hlate else e   # (hlate: array_program emits them after the A rings)
+            eh(f"  %fhn{c}{s} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
+            eh(f"  %fhs{c}{s} = sender %k{c}_{h}, {HELP_SEND} : reg<aie2p.array.sender : tile<{fw}xi32>>")
             rp = HELP_RELAY if hd not in fuse_cover(cfg, c) else HELP_RECV   # (kchain: a relaying row's receiver)
-            e(f"  %fhr{c}{s} = receiver %k{c}_{hd}, {rp} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
+            eh(f"  %fhr{c}{s} = receiver %k{c}_{hd}, {rp} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
             assert cfg.hcap & (cfg.hcap - 1) == 0   # (slots: record count & (hcap - 1))
-            e(f"  %chh{c}{s} = channel %fhs{c}{s}, %fhr{c}{s}, %n{cfg.hcap}, %fhn{c}{s} : reg<aie2p.array.channel : tile<{fw}xi32>>")
-            e(f"  constrain.leaf_sync %chh{c}{s}")
+            eh(f"  %chh{c}{s} = channel %fhs{c}{s}, %fhr{c}{s}, %n{cfg.hcap}, %fhn{c}{s} : reg<aie2p.array.channel : tile<{fw}xi32>>")
+            eh(f"  constrain.leaf_sync %chh{c}{s}")
 
 
 class _Fill:

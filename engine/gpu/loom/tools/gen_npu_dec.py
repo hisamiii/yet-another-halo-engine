@@ -66,7 +66,8 @@ HS = 512                       # half regions now hold only the scale-path tempo
 STATE, KVS = HR + 2 * HS, HR + 2 * HS + 64
 SCR_B = KVS + 64                # storage A (2048-aligned: the table)
 GAS, PARTSS, GT2 = 0, 4096, 5120
-SCR2_B = GT2 + 2048 + 64        # storage B (gather addresses, T parts, the table's second copy; +64: gathers read a + 32)
+SCR2_B = GT2 + (0 if GRID else 2048) + 64   # storage B (gather addresses, T parts, the table's second copy (not the
+                                          # grid formats': theirs is rodata); +64: gathers read a + 32)
 TABV, BASEV = [TAB], ["%sp"]
 KV = I.KV if FMT == "IQ4_XS" else [float(v) for v in range(16)]
 OUTCAP = 2
