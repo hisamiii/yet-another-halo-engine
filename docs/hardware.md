@@ -143,6 +143,7 @@ Measured on low-asm leaves compiled by `loom-compile` (static bundle counts of s
 - Budgets: 24 vec256 units, 5 accumulators of 2048 bits, 8 pointer registers. Pointer adds take immediates in multiples of 64 (others through a modifier register), scalar loads / stores -32..28 bytes, 512-bit loads -512..448. A `concat` of separately loaded halves often costs register moves.
 - `vshuffle` modes 0-55 are permutations (56 and up are not); among them byte, 16-bit and 32-bit (de)interleaves and transposes, e.g. mode 35 is an 8 x 8 byte transpose. There is no data-dependent lane permute; `vldb.4x{16,32,64}` gathers four 64-bit windows from four pointers held in a vector.
 - A gather (`vldb.4x32.lo` / `.hi`) costs one memory stall cycle unless its address lanes 0 / 2 and 1 / 3 hit different 16 KB banks; addresses within a bank do not matter (65,536 gathers per call, 2026-10-09). The IQ3_S / IQ3_XXS / IQ2_XXS decoders keep the grid and sign tables in different banks and give each gather two grid and two sign lanes (HRX patch 0028 places such tables after the channel rings).
+- A core starts at program address 0. Branch targets are absolute; `J` (6 bytes) runs 5 delay bundles, so a jump with 2-byte NOPs in its delay slots fills exactly 16 bytes (HRX patch 0029's startup jump).
 
 ## NPU data movement (AIE2P) (2026-10-08)
 
