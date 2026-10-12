@@ -82,12 +82,13 @@ class LoomNpu {
     int dec = -1;
     const Kernel* swap = nullptr;
     // the bytes of first bound to a scratch C (the array setup and one ungated call, the state the gate expects before
-    // its first job), spliced in where a job's family differs from the array's (FusedCommand); empty: none. A copy, not
-    // a second instance: the NPU's command memory holds ~90 instances (hardware.md)
+    // its first job; a gfirst set's: the setup alone), spliced in where a job's family differs from the array's
+    // (FusedCommand); empty: none. A copy, not a second instance: the NPU's command memory holds ~90 instances
+    // (hardware.md)
     std::vector<std::uint8_t> setup;
     amdf_xdna_kernel_command_t first{};
-    // first sets the array up and runs one whole call (any data). gate opens a job once its ready word reaches the
-    // job's gate value; done writes the done word after the job's last C (gen_npu_gemm GATE).
+    // first sets the array up and runs one whole call (any data; gfirst: no call). gate opens a job once its ready word
+    // reaches the job's gate value; done writes the done word after the job's last C (gen_npu_gemm GATE).
     // Streamed (seven invocations): push[parity] queues a call and wait retires the oldest queued one; lead is the even
     // push with its weight fills unpaced, for the first call of a job (nothing computes yet that pacing would
     // protect). Not streamed (four invocations, one replay group, HRX patch 0017): call runs one whole call.
@@ -389,7 +390,8 @@ class LoomNpu {
     std::string tag;
   };
   // Gated jobs as one command, submitted now (no host between the jobs). The first job of an image first runs its setup
-  // as its own command (one ungated call, any data; the host waits for it once), after which the gate waits for job 1.
+  // as its own command (one ungated call, any data, unless gfirst; the host waits for it once), after which the gate
+  // waits for job 1.
   // After a failure the reaper stores gate | kGateFailed to the done words of this and every later command's jobs, so
   // the GPU's waits end and report it.
   // fresh: set the first job's image up even if its family is resident (a chunk's first command: the gate's job
@@ -1168,8 +1170,10 @@ class LoomNpuSplit : public NpuSplit {
       npu_.Rebind(*k, scratch);
       k->setup = npu_.FirstBytes(*k);
       npu_.Rebind(*k, views);
-      if (k->setup == npu_.FirstBytes(*k))   // the copy relies on C's address living in first's own bytes
-        throw LoomError("npu: " + image + ": first does not hold C's address");
+      // the copy relies on C's address living in first's own bytes; a gfirst set's first is the setup alone (no C)
+      if ((k->setup == npu_.FirstBytes(*k)) != plan_.gfirst)
+        throw LoomError("npu: " + image +
+                        (plan_.gfirst ? ": first runs a call (re-emit the set)" : ": first does not hold C's address"));
     } else {
       npu_.Rebind(*k, views);
     }

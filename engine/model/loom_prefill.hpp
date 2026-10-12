@@ -108,6 +108,7 @@ class LoomPrefill {
                                                          NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c);
     }
     p.dcol = geom_.count("npudcol") != 0;
+    p.gfirst = geom_.count("npugfirst") != 0;
     if (p.dcol) {
       // the NPU decodes raw rows: W is one call's unread panel binding; A holds the p4 stream, then the pk one (Q4_K)
       p.w_bytes = NpuK(5120).w;
@@ -255,7 +256,7 @@ class LoomPrefill {
         std::vector<std::uint32_t> before;   // the job's gate slots, to report which words its calls changed
         for (std::uint32_t k = w.ready; k <= w.done + 16; ++k) before.push_back(npu_->HostLoad(k));
         if (const char* h = std::getenv("YAH_NPU_CPU_HOLD"); h && std::strtoul(h, nullptr, 10) == i) {
-          // the job parked at its gate (its setup call done): the stall command sees the array waiting
+          // the job parked at its gate (its setup done): the stall command sees the array waiting
           std::this_thread::sleep_for(std::chrono::milliseconds(300));
           if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);
         }

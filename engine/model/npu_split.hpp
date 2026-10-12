@@ -22,6 +22,9 @@ struct NpuPlan {
   // dispatch.txt "npudcol": the NPU decodes the weights itself from raw GGUF rows (gen_npu_gemm dcol 2; w_bytes is
   // then one call's unread panel binding).
   bool dcol = false;
+  // dispatch.txt "npugfirst": the images' setups run no call (gen_npu_gemm gfirst: the gate waits at a job's first
+  // firing).
+  bool gfirst = false;
 };
 
 // A byte range of A, W or C (in_c: an activation view of C, e.g. the FFN block's H, read by its down calls).

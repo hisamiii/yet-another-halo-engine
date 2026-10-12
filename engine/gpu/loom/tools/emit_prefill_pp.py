@@ -663,6 +663,9 @@ NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs"), (40, 40, 40, 8)
 # (hlate: their tables leave the mids no contiguous A ring otherwise)
 NPU_KCHAIN_FMTS = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs")
 KCHAIN = lambda fmt: dict(kchain=1, hcap=2, gtail=1, hlate=int(fmt in ("iq3s", "iq3xxs"))) if fmt in NPU_KCHAIN_FMTS else {}
+# the decoder-column images' setups run no call (gen_npu_gemm gfirst: the gate waits at a job's first firing), so an
+# image switch inside a command costs no dummy call; dispatch.txt "npugfirst"
+NPU_GFIRST = 1
 NPU_COLS = 7 if NPU_DCOL and not NPU_FUSE else 8
 NPU_NP = 4 if NPU_FUSE else GN.NP   # 16-row slabs per column of a site call
 NPU_ROWS = NPU_COLS * 16 * NPU_NP   # output rows per NPU call
@@ -676,7 +679,8 @@ NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
 # [M block][pass 7][16-token slab][128 k-blocks] (hpass). Its down calls (ain "h": 4 + 3 passes, 560 rows each, the 10th
 # call overlapping the 9th) write their partials. The GPU runs the other features through the fused ffn's split
 # (".npu.hal", nn = F) and down over them ("npuffnrem_<fmt>.hal", a K window); npu_unpack_ffnblk.hal adds hidden + both.
-# A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup and one ungated call).
+# A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup, and one ungated call
+# unless NPU_GFIRST).
 # With YAH_NPU_FUSE (any F = 1024 n; layers whose three tensors are in FUSE_FMTS): gate / up on 8 fused columns, call j
 # (F / 256 of them) column c features 256 j + 32 c + [0, 32) of F (gen_npu_gemm swcol 32), down in 640-row calls.
 # Down's K parts (both kinds): F's passes in the fewest parts of at most 5 (a fused panel holds a part), sizes balanced.
@@ -1020,6 +1024,8 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     jobs += [(cfg, name, mode, np_) for cfg, name, mode, np_ in extra]
     # sources and environments first (gen_npu_gemm's NP is module state), then the compiles in parallel
     def source(cfg, name, mode, np_):
+        if cfg.gate and NPU_GFIRST:
+            cfg = dataclasses.replace(cfg, gfirst=1)
         with GN.np_override(*(np_ if isinstance(np_, tuple) else (np_,))):
             src = os.path.join(tmp, name + ".loom")
             open(src, "w").write(GN.gen(cfg))
@@ -1050,7 +1056,8 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     # a site's K = 5120 call (with no sites, the FFN block's gate / up activations still use its A)
     cfg = jobs[0][0] if images else GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
                                               fmt="IQ4_XS")
-    return [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(cfg)), ("npurows", NPU_ROWS, 0, 0)]
+    out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(cfg)), ("npurows", NPU_ROWS, 0, 0)]
+    return out + ([("npugfirst", 1, 0, 0)] if NPU_GFIRST else [])
 
 
 def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
