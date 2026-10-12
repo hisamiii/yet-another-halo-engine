@@ -659,8 +659,9 @@ class LoomNpu {
           ++i;
           continue;
         }
-        std::uint32_t end = i + 1;   // a run of differing words; gaps below a header's 4 words are written too
-        for (std::uint32_t j = end; j < words && j < end + 4; ++j)
+        // a run of differing words; gaps under 32 words are written too (a write op costs about as much as 150 bytes)
+        std::uint32_t end = i + 1;
+        for (std::uint32_t j = end; j < words && j < end + 32; ++j)
           if (differs(j)) end = j + 1;
         const std::uint32_t bl = 16 + 4 * (end - i), at = addr + 4 * i;
         const std::size_t h = out.size();
