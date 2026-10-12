@@ -29,6 +29,8 @@ NPU FFN block with IQ2_XS (2026-10-09, 63 of 64 layers: every layer but the last
 
 NPU token halves (2026-10-12; fused decoder-column set with `YAH_NPU_SPLIT=qkv=5120,gate=3072,q=6144,out=2560 YAH_NPU_FFNBLK=8192`, AC, balanced, 156/156/130/130 W, cooled to 55 C + 15 s): pp2048 2413.7 -> 2323.8 ms (one round each), NPU busy 2394.6 -> 2298.9 ms, 202.4 MB of commands (+16), longest command 57 ms. A two-device schedule model of the pp2048 timeline (GPU kernel times from a dispatch profile, NPU job times from a watch run) predicted ~2320. jobs: qkv 65 -> 130, q 15 -> 29, out 60 -> 117 (57 out sites by halves; the last layer, which keeps one row, runs whole). Hidden state and logits bit-identical to the whole-chunk path on the 16 gate windows.
 
+Whole-chunk gate in token halves (2026-10-12, same set and power state, GPU edge cooled to 50 C + 15 s, another session's one-core CPU job running): in the 19 DeltaNet layers whose qkv and gate formats differ, gate's two half jobs (one paying an image switch) become one whole-chunk job between qkv's halves. pp2048 2359.8 -> 2343.0 ms (one round each), qkv jobs 130 -> 111, calls 1472 -> 1358. Watch data predicted -18 ms (those gate jobs: 64.6 ms whole in s25 vs 82.7 ms by halves in s26). Bit-identical on the 16 gate windows.
+
 NPU GEMM path pieces (2026-10-06; checks byte-exact against numpy oracles):
 
 | piece | measured |

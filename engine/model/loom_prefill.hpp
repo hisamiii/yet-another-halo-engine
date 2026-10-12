@@ -2259,13 +2259,28 @@ class LoomPrefill {
     const bool two = DcolImage(wq, nullptr, true) != DcolImage(wg, nullptr, true) &&
                      ::access((hdir_ + "/npu_dcol_iq4xs.swap.xdna").c_str(), R_OK) != 0;
     const auto rq = NpuRawRows("qkv", wq, nq), rg = NpuRawRows("gate", wg, ng);
-    std::uint32_t job[2] = {};
+    // with two images gate runs whole between qkv's halves (one switch and one fill less than its halves): its own A
+    // stream in out's half-1 slots (free until A_1) and C past half 0's region (dead past C_1's FFN unpack)
+    const std::string genc = std::string("npu_enc_5120") + (kg ? "_pk" : "") + ".hal";
+    const NpuView ga{4 * HNpuK(5120).a, NpuK(5120).a};
+    const std::size_t gc0 = (HalfC(0) + HalfCBytes() + 4095) / 4096 * 4096;
+    const bool gwhole = two && ga.length == 2 * HNpuK(5120).a && geom_.count(genc) && !DcolImage(wg).empty() &&
+                        gc0 + HalfCalls("gate") * NpuK(5120).c <= HalfC(1);
+    std::uint32_t job[2] = {}, gjob = 0;
     NpuView cq[2], cg[2];
     for (int h = 0; h < 2; ++h) {
       FfnUnpackPending(h);
       HalfNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow, h);
       const NpuView a4 = HalfA(false, h, false), ak = HalfA(false, h, true);
-      if (kq || kg) HalfEncode("npu_enc_5120_pk.hal", *scratch_, std::size_t{kHidden} * 2, h, ak);
+      if (kq || (kg && !gwhole)) HalfEncode("npu_enc_5120_pk.hal", *scratch_, std::size_t{kHidden} * 2, h, ak);
+      if (gwhole && h == 1) {
+        const Geom& g = geom_.at(genc);
+        Dispatch(Exe(genc), "yah_bfp16_encode_act", g.tokens, 1, 1, g.rowgrp, 1, 1, {Ref(*scratch_), AView(ga)}, 2);
+        std::size_t c_off = gc0;
+        std::vector<std::uint32_t> calls;
+        cg[0] = NpuCalls("gate", {ga}, rg, c_off, calls, wg);
+        gjob = NpuEnqueue(std::move(calls), "qkv", {{AView(ga)}, CView(cg[0])});
+      }
       std::size_t c_off = HalfC(h);
       std::vector<std::uint32_t> calls;
       const auto add = [&](bool qkv) {  // one matrix's calls (and job, with two images)
@@ -2274,8 +2289,8 @@ class LoomPrefill {
         (qkv ? cq : cg)[h] = NpuCalls(qkv ? "qkv" : "gate", {a}, qkv ? rq : rg, c_off, calls, qkv ? wq : wg, true);
         if (two) job[h] = NpuEnqueue(std::exchange(calls, {}), "qkv", {{AView(a)}, CView({c0, c_off - c0})});
       };
-      add(h == 0);
-      add(h != 0);
+      add(h == 0 || gwhole);
+      if (!gwhole) add(h != 0);
       if (!two) {
         std::vector<hrx_buffer_ref_t> as{AView(kq ? ak : a4)};
         if (kq != kg) as.push_back(AView(kg ? ak : a4));
@@ -2306,7 +2321,12 @@ class LoomPrefill {
       NpuJoin(job[h]);
       // the conv reads the NPU's v channels from C; the unpack writes the conv ring's tokens (prep_ab reads them)
       NpuUnpack("npu_unpack_qkv_tail.hal", cq[h], {Tok(*qkv_, h, rqkv)}, 2, true);
-      NpuUnpack("npu_unpack_gate.hal", cg[h], {Tok(*gate_, h, rin)}, 2, true);
+      if (!gwhole) {
+        NpuUnpack("npu_unpack_gate.hal", cg[h], {Tok(*gate_, h, rin)}, 2, true);
+      } else if (h == 0) {
+        NpuJoin(gjob);
+        NpuUnpack("npu_unpack_gate.hal", cg[0], {Ref(*gate_)}, 2);
+      }
       Dispatch(HExe("convkq_g.hal"), "yah_ssm_conv_kq", gg.tokens, HB() / conv_tb, 1, 256, 1, 1,
                {Tok(*qkv_, h, rqkv), TRef(*w1d), cs, Tok(*conv_out_, h, rqkv), Tok(*kqbuf_, h, rkq)});
       Dispatch(HExe("convkq_c.hal"), "yah_ssm_conv_kq_c", gc.tokens, gc.tt, 1, gc.rowgrp, 1, 1,
