@@ -1801,7 +1801,7 @@ def leaf(name="dec", nports=1):
                         flush(pt)                          # every 8 pushes (SLU: the iteration-end flush too)
                 tails.append(pt.L)
     run(frags, int(os.environ.get("DQ_WINH", "1" if Q3K else "6")), tails,   # Q3_K: 4 x4 operands per stream
-        hv=int(os.environ.get("DQ_HHV", "20" if GRID else "24")))   # grid: X (4 vec256) per G stream, 8 T rows per C
+        hv=int(os.environ.get("DQ_HHV", "20" if XS2 else "24")))   # IQ2_XS: X (4 vec256) per G stream, 8 T rows per C
     if SLU:
         e(f"%spc0 = copy {sp0} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if 2 * NPARTS * 64 <= 448:
