@@ -1174,6 +1174,13 @@ class LoomNpuSplit : public NpuSplit {
       if ((k->setup == npu_.FirstBytes(*k)) != plan_.gfirst)
         throw LoomError("npu: " + image +
                         (plan_.gfirst ? ": first runs a call (re-emit the set)" : ": first does not hold C's address"));
+      // an image whose setup is another's byte for byte (a format's site images of K = 5120 and 6144: the NPU takes
+      // K 0 - 5119 of both) sets the array up the same way: one family, so no setup runs between their jobs
+      for (const auto& [path, other] : instances_)
+        if (other && other != k && other->family && other->dec == k->dec && other->setup == k->setup) {
+          k->family = other->family;
+          break;
+        }
     } else {
       npu_.Rebind(*k, views);
     }
