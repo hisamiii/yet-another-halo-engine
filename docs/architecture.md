@@ -51,8 +51,8 @@ The token embedding is `gen_decode_misc.gen_embed_q8_0`. MQ4 has no afrag, fused
 
 Prefill on an HFQ model (A4, the default; `YAH_A16=1` emits W4A16): the GEMMs run on `v_wmma_i32_16x16x16_iu4` with int4 activations. The set carries an `a4` row. Each GEMM input site runs `gen_rot.gen_q`'s `yah_rotq256` instead of the rotation (the same sites and awq; `rotq_heads.hal` for ssm_out): the same rotation in f32, then int4 codes and one f32 scale per 128 values of each token (hipfire's recipe: the best of 8 candidate scales (amax / 7)(1 + j / 7) / 2 by squared error, round to nearest even, clamp to [-8, 7]) into `aq_` / `ad_`. `tools/gen_gemm_iu4.py` (`iu4_<kind>_<m_tiles>_<k_blocks>.hal`, kinds kstore, kqg, swiglu, kres) multiplies the MQ4 rows by them:
 
-- Workgroup 128 rows x 256 tokens, 4 x 4 waves of 32 x 64 (the 48-row alpha / beta: 48 x 256, 3 x 4 waves).
-- Per 128-K phase (one weight scale group) the weight nibbles, the phase's weight scales and the activation nibbles are staged in LDS, double-buffered with one barrier per phase.
+- Workgroup 128 rows x 128 tokens, 4 x 2 waves of 32 x 64 (the 48-row alpha / beta: 48 x 128, 3 x 2 waves): at 216-232 VGPRs and 39 KB LDS three workgroups share a WGP, so one's fold, barrier and epilogue stalls overlap the others' WMMAs (one 128 x 256 workgroup per WGP left the SIMDs idle ~45% of the time).
+- Per 128-K phase (one scale group) the weight and activation nibbles and scales are staged in LDS, double-buffered with one barrier per phase (activation scales read from global memory in the phase that uses them would wait, in order, behind the next phase's prefetch).
 - Each wave runs 8 k steps of i32 WMMAs into zeroed accumulators, then folds them: acc += f32(c) x (weight scale x activation scale). In the iu4 C layout, element i of lane l is row 2i + l / 16 and token l % 16, so the weight scales sit in LDS in that order (one vector load) and the activation scale is one value per lane.
 - Epilogues: `gen_gemm_tile.lds_epilogue` (the f32 kstore with fragment stores on the 48-row tile).
 
