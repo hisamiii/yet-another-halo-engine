@@ -235,11 +235,18 @@ def gen_q(K, rows, span, awq=True, heads=None):
     e("  %am7s = scf.select %anz, %am7, %fone : f32")   # all zero: any scale, q = 0
     e("  %amh = scalar.mulf %am7s, %fhalf : f32")
     errs = []
-    for j in range(8):
+    for j in range(8):   # scale candidates d = (amax / 7)(1 + j / 7) / 2
         e(f"  %cj{j} = scalar.constant {1.0 + j / 7.0!r} : f32")
         e(f"  %dj{j} = scalar.mulf %amh, %cj{j} : f32")
         e(f"  %djv{j} = vector.splat %dj{j} : vector<16xf32>")
-        e(f"  %qd{j} = vector.divf %xq, %djv{j} : vector<16xf32>")
+        # x / d as one divide per lane plus a Markstein step: q1 = q0 + (x - q0 d) / d rounds once, so equals divf
+        e(f"  %ij{j} = scalar.divf %fone, %dj{j} : f32")
+        e(f"  %ijv{j} = vector.splat %ij{j} : vector<16xf32>")
+        e(f"  %nd{j} = scalar.negf %dj{j} : f32")
+        e(f"  %ndv{j} = vector.splat %nd{j} : vector<16xf32>")
+        e(f"  %q0{j} = vector.mulf %xq, %ijv{j} : vector<16xf32>")
+        e(f"  %rr{j} = vector.fmaf %q0{j}, %ndv{j}, %xq : vector<16xf32>")
+        e(f"  %qd{j} = vector.fmaf %rr{j}, %ijv{j}, %q0{j} : vector<16xf32>")
         e(f"  %qr{j} = vector.roundevenf %qd{j} : vector<16xf32>")
         e(f"  %ql{j} = vector.maxnumf %qr{j}, %fl8v : vector<16xf32>")
         e(f"  %qc{j} = vector.minnumf %ql{j}, %fh7v : vector<16xf32>")
@@ -250,27 +257,23 @@ def gen_q(K, rows, span, awq=True, heads=None):
         errs.append(f"%ms{j}")
     e("  %msv = vector.from_elements " + ", ".join(errs) + " : vector<8xf32>")
     msr = reduce("%msv", "vector<8xf32>", "addf", "ms")
-    best, bm = "%dj0", None
+    best, bq, bm = "%dj0", "%qc0", "%mr0"
     for j in range(8):
         e(f"  %mr{j} = vector.extract {msr}[{j}] : vector<8xf32> -> f32")
         if j:
             e(f"  %lt{j} = scalar.cmpf olt, %mr{j}, {bm} : f32")   # the first minimum wins, as hipfire
             e(f"  %bm{j} = scf.select %lt{j}, %mr{j}, {bm} : f32")
             e(f"  %bd{j} = scf.select %lt{j}, %dj{j}, {best} : f32")
-            best = f"%bd{j}"
-        bm = f"%bm{j}" if j else "%mr0"
-    e(f"  %dv = vector.splat {best} : vector<16xf32>")
-    e("  %fq = vector.divf %xq, %dv : vector<16xf32>")
-    e("  %fr = vector.roundevenf %fq : vector<16xf32>")
-    e("  %fl = vector.maxnumf %fr, %fl8v : vector<16xf32>")
-    e("  %fc = vector.minnumf %fl, %fh7v : vector<16xf32>")
+            e(f"  %bq{j} = scf.select %lt{j}, %qc{j}, {bq} : vector<16xf32>")
+            best, bq, bm = f"%bd{j}", f"%bq{j}", f"%bm{j}"
+    fc = bq                                                       # the winner's clamped codes
     e("  %m15 = scalar.constant 15 : i32")
     words = []
     for w in range(2):
         acc = None
         for j in range(8):
             i = 8 * w + j
-            e(f"  %ne{i} = vector.extract %fc[{i}] : vector<16xf32> -> f32")
+            e(f"  %ne{i} = vector.extract {fc}[{i}] : vector<16xf32> -> f32")
             e(f"  %ni{i} = scalar.fptosi %ne{i} : f32 to i32")
             e(f"  %nn{i} = scalar.andi %ni{i}, %m15 : i32")
             cur = f"%nn{i}"
