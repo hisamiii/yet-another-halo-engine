@@ -1,0 +1,410 @@
+Loom: let register allocation see instruction operand preferences (matrix operand banks), not only final numbering.
+On gfx1151 an iu4 WMMA costs 16, 17 or 18 cycles by its A/B/C start banks (16 iff {A, B} = {C+2, C+3} mod 4); the
+numbering pass can only permute packed blocks without regressing any use and cannot reach that layout. Allocation now
+also tries a first fit whose queries see instruction uses, grouped across whole-value copies, moves and edges (an
+accumulator seeded by a copy then sees its WMMAs), and keeps it only without spills and without a lower residency
+tier (attention wmma would lose a wave). Adds the gfx1151 iu4 WMMA qualification. Bit-identical results;
+yah gu 17.47 -> 16.19 predicted cycles/WMMA, pp2048 GEMM cycles -3.9%.
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py b/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
+index e17ed34bd..2d46a5ca7 100644
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
+@@ -24,6 +24,7 @@ MATRIX_OPERAND_PLACEMENT_QUALIFICATIONS = (
+     ("gfx1100", 32, "amdgpu.v_wmma_f32_16x16x16_bf16"),
+     ("gfx1151", 32, "amdgpu.v_wmma_f32_16x16x16_bf16"),
+     ("gfx1151", 32, "amdgpu.v_wmma_f32_16x16x16_f16"),
++    ("gfx1151", 32, "amdgpu.v_wmma_i32_16x16x16_iu4"),
+ )
+ 
+ _WMMA_GFX11_WAVE64_ACCUMULATOR_SIZE_REASON = "gfx11-wave64-wmma-half-width-accumulator"
+diff --git a/loom/src/loom/codegen/low/allocation.c b/loom/src/loom/codegen/low/allocation.c
+index d0e8e413a..5b9a09f5b 100644
+--- a/loom/src/loom/codegen/low/allocation.c
++++ b/loom/src/loom/codegen/low/allocation.c
+@@ -125,13 +125,32 @@ loom_low_allocation_make_interval_assignment_context(
+   };
+ }
+ 
+-// Selects between first-fit and an isolated fragmentation-repair coloring.
+-// A winning repair retains its owned arrays and recycles the first-fit state.
+-static iree_status_t loom_low_allocation_repair_fragmentation(
++// Alternative interval assignments tried after first fit.
++typedef enum loom_low_allocation_alternative_e {
++  // Fragmentation-repair coloring; wins by removing spills or spill traffic.
++  LOOM_LOW_ALLOCATION_ALTERNATIVE_FRAGMENTATION_REPAIR = 0,
++  // First fit whose queries also see instruction operand preferences; wins
++  // only without spills and without lowering the residency tier.
++  LOOM_LOW_ALLOCATION_ALTERNATIVE_INSTRUCTION_PREFERENCES = 1,
++} loom_low_allocation_alternative_t;
++
++static uint32_t loom_low_allocation_residency_tier(
++    const loom_low_allocation_build_state_t* state, const uint32_t* extents) {
++  if (loom_target_residency_model_is_empty(state->options->residency.model)) {
++    return 0;
++  }
++  return loom_target_residency_evaluate_tier_with_direct_resource_override(
++      state->options->residency, extents, 0, extents[0]);
++}
++
++// Runs an isolated alternative assignment against the current one. A winning
++// alternative retains its owned arrays and recycles the current state.
++static iree_status_t loom_low_allocation_try_alternative(
+     loom_low_allocation_build_state_t* state,
+     const loom_low_function_model_t* model,
+     const loom_local_value_domain_t* value_domain,
+-    const iree_arena_checkpoint_t* assignment_checkpoint) {
++    const iree_arena_checkpoint_t* assignment_checkpoint,
++    loom_low_allocation_alternative_t alternative) {
+   iree_arena_allocator_t scratch_arena;
+   iree_arena_initialize(state->arena->block_pool, &scratch_arena);
+ 
+@@ -172,23 +191,41 @@ static iree_status_t loom_low_allocation_repair_fragmentation(
+ 
+   loom_low_allocation_interval_assignment_result_t scratch_result = {0};
+   if (iree_status_is_ok(status)) {
+-    const loom_low_allocation_interval_assignment_context_t scratch_context =
++    loom_low_allocation_interval_assignment_context_t scratch_context =
+         loom_low_allocation_make_interval_assignment_context(
+             state, model,
+-            LOOM_LOW_ALLOCATION_SEARCH_STRATEGY_FRAGMENTATION_REPAIR,
++            alternative == LOOM_LOW_ALLOCATION_ALTERNATIVE_FRAGMENTATION_REPAIR
++                ? LOOM_LOW_ALLOCATION_SEARCH_STRATEGY_FRAGMENTATION_REPAIR
++                : LOOM_LOW_ALLOCATION_SEARCH_STRATEGY_FIRST_FIT,
+             &scratch_arena, &scratch_target_constraints,
+             &scratch_storage_leases);
++    if (alternative ==
++        LOOM_LOW_ALLOCATION_ALTERNATIVE_INSTRUCTION_PREFERENCES) {
++      scratch_context.preferences = state->preferences.instruction_aware;
++    }
+     status = loom_low_allocation_interval_assignment_build(&scratch_context,
+                                                            &scratch_result);
+   }
+   if (iree_status_is_ok(status)) {
+-    const bool use_repair =
+-        scratch_target_constraints.error_count == 0 &&
+-        (scratch_result.spill_count == 0 ||
+-         (state->target_constraints.error_count == 0 &&
+-          scratch_result.spill_traffic_bytes <
+-              state->interval_assignment.spill_traffic_bytes));
+-    if (use_repair) {
++    bool use_alternative = scratch_target_constraints.error_count == 0;
++    if (alternative == LOOM_LOW_ALLOCATION_ALTERNATIVE_FRAGMENTATION_REPAIR) {
++      use_alternative &=
++          scratch_result.spill_count == 0 ||
++          (state->target_constraints.error_count == 0 &&
++           scratch_result.spill_traffic_bytes <
++               state->interval_assignment.spill_traffic_bytes);
++    } else {
++      use_alternative &=
++          scratch_result.spill_count == 0 &&
++          scratch_result.spill_plan_count == 0 &&
++          loom_low_allocation_residency_tier(
++              state, scratch_target_constraints
++                         .max_assigned_location_end_by_reg_class) >=
++              loom_low_allocation_residency_tier(
++                  state, state->target_constraints
++                             .max_assigned_location_end_by_reg_class);
++    }
++    if (use_alternative) {
+       iree_arena_checkpoint_restore(assignment_checkpoint);
+       iree_arena_transfer(&scratch_arena, state->arena);
+       state->target_constraints.error_count = 0;
+@@ -354,8 +391,19 @@ iree_status_t loom_low_allocate_function(
+         state.interval_assignment.spill_count != 0) ||
+        loom_low_allocation_failure_is_present(
+            &state.target_constraints.failure))) {
+-    status = loom_low_allocation_repair_fragmentation(
+-        &state, model, value_domain, &interval_assignment_checkpoint);
++    status = loom_low_allocation_try_alternative(
++        &state, model, value_domain, &interval_assignment_checkpoint,
++        LOOM_LOW_ALLOCATION_ALTERNATIVE_FRAGMENTATION_REPAIR);
++  }
++  // Instruction operand preferences (such as matrix operand banks) are
++  // otherwise applied only by final numbering, which cannot move storage.
++  if (iree_status_is_ok(status) && state.target_constraints.error_count == 0 &&
++      state.preferences.instruction_aware != NULL &&
++      state.interval_assignment.spill_count == 0 &&
++      state.interval_assignment.spill_plan_count == 0) {
++    status = loom_low_allocation_try_alternative(
++        &state, model, value_domain, &interval_assignment_checkpoint,
++        LOOM_LOW_ALLOCATION_ALTERNATIVE_INSTRUCTION_PREFERENCES);
+   }
+   // Backedge placement belongs to the final physical assignment. Spill repair
+   // rewrites the IR and rebuilds the frame, so relocating a provisional spill
+diff --git a/loom/src/loom/codegen/low/allocation/preference.c b/loom/src/loom/codegen/low/allocation/preference.c
+index 56a4cd79e..ea0eb9552 100644
+--- a/loom/src/loom/codegen/low/allocation/preference.c
++++ b/loom/src/loom/codegen/low/allocation/preference.c
+@@ -49,7 +49,11 @@ iree_status_t loom_low_allocation_preference_workspace_initialize(
+ }
+ 
+ static loom_value_ordinal_t loom_low_allocation_preference_origin(
++    const loom_low_placement_preference_index_t* index,
+     const loom_low_placement_table_t* placement, loom_value_ordinal_t ordinal) {
++  if (index->origins_by_value_ordinal != NULL) {
++    return index->origins_by_value_ordinal[ordinal];
++  }
+   return placement->tied_storage_origins_by_value_ordinal
+              ? placement->tied_storage_origins_by_value_ordinal[ordinal]
+              : ordinal;
+@@ -62,7 +66,7 @@ bool loom_low_allocation_preference_has_uses(
+     return false;
+   }
+   const loom_value_ordinal_t origin =
+-      loom_low_allocation_preference_origin(placement, ordinal);
++      loom_low_allocation_preference_origin(index, placement, ordinal);
+   return index->offsets_by_origin[origin] !=
+          index->offsets_by_origin[origin + 1];
+ }
+@@ -132,7 +136,7 @@ static void loom_low_allocation_preference_prepare_use(
+   for (uint16_t i = 0; i < use->preference->value_count; ++i) {
+     const loom_value_ordinal_t ordinal = bindings[i].value_ordinal;
+     const loom_value_ordinal_t origin =
+-        loom_low_allocation_preference_origin(placement, ordinal);
++        loom_low_allocation_preference_origin(index, placement, ordinal);
+     locations[i] = (loom_low_allocation_preference_location_t){
+         .assignment = loom_low_allocation_preference_assignment(
+             assignments, constraints, ordinal),
+@@ -156,7 +160,7 @@ static void loom_low_allocation_preference_prepare_use(
+       continue;
+     }
+     const loom_value_ordinal_t origin = loom_low_allocation_preference_origin(
+-        placement, bindings[i].value_ordinal);
++        index, placement, bindings[i].value_ordinal);
+     if (origin != bindings[i].value_ordinal) {
+       locations[i].assignment = loom_low_allocation_preference_assignment(
+           assignments, constraints, origin);
+@@ -310,11 +314,12 @@ loom_low_allocation_preference_query_t loom_low_allocation_preference_prepare(
+     return query;
+   }
+   const loom_value_ordinal_t primary_origin =
+-      loom_low_allocation_preference_origin(placement, primary_ordinal);
++      loom_low_allocation_preference_origin(index, placement, primary_ordinal);
+   const loom_value_ordinal_t secondary_origin =
+       secondary_ordinal == LOOM_VALUE_ORDINAL_INVALID
+           ? LOOM_VALUE_ORDINAL_INVALID
+-          : loom_low_allocation_preference_origin(placement, secondary_ordinal);
++          : loom_low_allocation_preference_origin(index, placement,
++                                                  secondary_ordinal);
+   uint32_t primary = index->offsets_by_origin[primary_origin];
+   const uint32_t primary_end = index->offsets_by_origin[primary_origin + 1];
+   uint32_t secondary = 0;
+diff --git a/loom/src/loom/codegen/low/placement.c b/loom/src/loom/codegen/low/placement.c
+index 670ac7de0..8e3f3a3f2 100644
+--- a/loom/src/loom/codegen/low/placement.c
++++ b/loom/src/loom/codegen/low/placement.c
+@@ -1100,39 +1100,17 @@ static iree_status_t loom_low_placement_build_storage_value_order(
+   return iree_ok_status();
+ }
+ 
+-static iree_status_t loom_low_placement_index_preferences(
+-    loom_low_placement_build_state_t* state,
+-    loom_low_placement_preference_index_t* out_index) {
+-  const uint32_t use_count = (uint32_t)state->preferences.use_count;
+-  if (use_count == 0) {
+-    return iree_ok_status();
+-  }
+-  const uint32_t binding_count = (uint32_t)state->preferences.binding_count;
+-  const uint32_t instruction_use_count =
+-      state->preferences.instruction_use_count;
+-  loom_low_placement_preference_use_t* uses = NULL;
+-  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
+-      state->preference_arena, use_count, sizeof(*uses), (void**)&uses));
+-  memcpy(uses, state->preferences.uses, use_count * sizeof(*uses));
+-  loom_low_placement_preference_binding_t* bindings = NULL;
+-  IREE_RETURN_IF_ERROR(
+-      iree_arena_allocate_array(state->preference_arena, binding_count,
+-                                sizeof(*bindings), (void**)&bindings));
+-  memcpy(bindings, state->preferences.bindings,
+-         binding_count * sizeof(*bindings));
+-  *out_index = (loom_low_placement_preference_index_t){
+-      .uses = uses,
+-      .bindings = bindings,
+-      .use_count = use_count,
+-      .instruction_use_count = instruction_use_count,
+-      .binding_count = binding_count,
+-  };
+-  if (instruction_use_count == use_count) {
+-    return iree_ok_status();
+-  }
++// Groups uses [first_use, use_count) of |index| by preference origin and
++// retains each binding's representative slot in |bindings|. A NULL |origins|
++// groups by value ordinal.
++static iree_status_t loom_low_placement_index_preference_incidence(
++    loom_low_placement_build_state_t* state, uint32_t first_use,
++    const loom_value_ordinal_t* origins,
++    loom_low_placement_preference_binding_t* bindings,
++    loom_low_placement_preference_index_t* index) {
+   const loom_value_ordinal_t value_count = state->value_domain->value_count;
+-  const loom_value_ordinal_t* origins =
+-      state->tied_storage_origins_by_value_ordinal;
++  const loom_low_placement_preference_use_t* uses = index->uses;
++  const uint32_t use_count = index->use_count;
+   uint32_t* offsets = NULL;
+   IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
+       state->preference_arena, (iree_host_size_t)value_count + 1,
+@@ -1144,7 +1122,7 @@ static iree_status_t loom_low_placement_index_preferences(
+       (void**)&last_bindings));
+   memset(last_bindings, 0, value_count * sizeof(*last_bindings));
+   uint32_t max_memo_entry_count = 0;
+-  for (uint32_t i = instruction_use_count; i < use_count; ++i) {
++  for (uint32_t i = first_use; i < use_count; ++i) {
+     const loom_low_placement_preference_use_t* use = &uses[i];
+     if (use->memo.index_bit_count_plus_one != 0) {
+       max_memo_entry_count =
+@@ -1180,7 +1158,7 @@ static iree_status_t loom_low_placement_index_preferences(
+       iree_arena_allocate_array(state->preference_arena, incidence_count,
+                                 sizeof(*use_indices), (void**)&use_indices));
+   uint32_t max_incident_binding_count = 0;
+-  for (uint32_t i = use_count; i > instruction_use_count; --i) {
++  for (uint32_t i = use_count; i > first_use; --i) {
+     const loom_low_placement_preference_use_t* use = &uses[i - 1];
+     for (uint16_t slot = 0; slot < use->preference->value_count; ++slot) {
+       const loom_low_placement_preference_binding_t* binding =
+@@ -1200,11 +1178,125 @@ static iree_status_t loom_low_placement_index_preferences(
+     offsets[i] = offsets[i + 1];
+   }
+   offsets[value_count] = incidence_count;
+-  out_index->use_indices = use_indices;
+-  out_index->offsets_by_origin = offsets;
+-  out_index->max_incident_use_count = max_incident_use_count;
+-  out_index->max_incident_binding_count = max_incident_binding_count;
+-  out_index->max_memo_entry_count = max_memo_entry_count;
++  index->use_indices = use_indices;
++  index->offsets_by_origin = offsets;
++  index->max_incident_use_count = max_incident_use_count;
++  index->max_incident_binding_count = max_incident_binding_count;
++  index->max_memo_entry_count = max_memo_entry_count;
++  return iree_ok_status();
++}
++
++
++// Extends tied storage origins across whole-value copies, moves and edge
++// payloads, which coalescing normally places in one storage. An accumulator
++// seeded by a copy or loop entry then sees the instruction uses of its chain.
++static iree_status_t loom_low_placement_build_chain_origins(
++    loom_low_placement_build_state_t* state,
++    loom_value_ordinal_t** out_origins) {
++  const loom_value_ordinal_t value_count = state->value_domain->value_count;
++  loom_value_ordinal_t* origins = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      state->preference_arena, value_count, sizeof(*origins),
++      (void**)&origins));
++  for (loom_value_ordinal_t i = 0; i < value_count; ++i) {
++    origins[i] = state->tied_storage_origins_by_value_ordinal
++                     ? state->tied_storage_origins_by_value_ordinal[i]
++                     : i;
++  }
++  for (uint32_t i = 0; i < state->relation_count; ++i) {
++    const loom_low_placement_relation_t* relation = &state->relations[i];
++    if (relation->kind != LOOM_LOW_PLACEMENT_RELATION_SAME_STORAGE ||
++        !(loom_low_placement_cause_is_edge(relation->cause) ||
++          loom_low_placement_cause_is_defining_transfer(relation->cause)) ||
++        !loom_low_placement_relation_can_alias(relation) ||
++        relation->result_unit_offset != 0 ||
++        relation->source_unit_offset != 0) {
++      continue;
++    }
++    const loom_liveness_interval_t* result =
++        loom_liveness_interval_for_value_ordinal(state->liveness,
++                                                 relation->result_ordinal);
++    const loom_liveness_interval_t* source =
++        loom_liveness_interval_for_value_ordinal(state->liveness,
++                                                 relation->source_ordinal);
++    if (result->unit_count != relation->unit_count ||
++        source->unit_count != relation->unit_count) {
++      continue;
++    }
++    const loom_value_ordinal_t a = loom_low_placement_tied_storage_origin(
++        origins, relation->result_ordinal);
++    const loom_value_ordinal_t b = loom_low_placement_tied_storage_origin(
++        origins, relation->source_ordinal);
++    origins[iree_max(a, b)] = iree_min(a, b);
++  }
++  for (loom_value_ordinal_t i = 0; i < value_count; ++i) {
++    origins[i] = loom_low_placement_tied_storage_origin(origins, i);
++  }
++  *out_origins = origins;
++  return iree_ok_status();
++}
++
++static iree_status_t loom_low_placement_index_preferences(
++    loom_low_placement_build_state_t* state,
++    loom_low_placement_preference_index_t* out_index) {
++  const uint32_t use_count = (uint32_t)state->preferences.use_count;
++  if (use_count == 0) {
++    return iree_ok_status();
++  }
++  const uint32_t binding_count = (uint32_t)state->preferences.binding_count;
++  const uint32_t instruction_use_count =
++      state->preferences.instruction_use_count;
++  loom_low_placement_preference_use_t* uses = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      state->preference_arena, use_count, sizeof(*uses), (void**)&uses));
++  memcpy(uses, state->preferences.uses, use_count * sizeof(*uses));
++  loom_low_placement_preference_binding_t* bindings = NULL;
++  IREE_RETURN_IF_ERROR(
++      iree_arena_allocate_array(state->preference_arena, binding_count,
++                                sizeof(*bindings), (void**)&bindings));
++  memcpy(bindings, state->preferences.bindings,
++         binding_count * sizeof(*bindings));
++  *out_index = (loom_low_placement_preference_index_t){
++      .uses = uses,
++      .bindings = bindings,
++      .use_count = use_count,
++      .instruction_use_count = instruction_use_count,
++      .binding_count = binding_count,
++  };
++  if (instruction_use_count != use_count) {
++    IREE_RETURN_IF_ERROR(loom_low_placement_index_preference_incidence(
++        state, instruction_use_count,
++        state->tied_storage_origins_by_value_ordinal, bindings, out_index));
++  }
++  if (instruction_use_count == 0) {
++    return iree_ok_status();
++  }
++
++  // The companion index lets assignment queries see instruction uses too.
++  // Allocation adopts its result only when residency does not drop.
++  loom_low_placement_preference_index_t* aware = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate(
++      state->preference_arena, sizeof(*aware), (void**)&aware));
++  loom_low_placement_preference_binding_t* aware_bindings = NULL;
++  IREE_RETURN_IF_ERROR(
++      iree_arena_allocate_array(state->preference_arena, binding_count,
++                                sizeof(*aware_bindings),
++                                (void**)&aware_bindings));
++  memcpy(aware_bindings, state->preferences.bindings,
++         binding_count * sizeof(*aware_bindings));
++  loom_value_ordinal_t* chain_origins = NULL;
++  IREE_RETURN_IF_ERROR(
++      loom_low_placement_build_chain_origins(state, &chain_origins));
++  *aware = (loom_low_placement_preference_index_t){
++      .uses = uses,
++      .bindings = aware_bindings,
++      .origins_by_value_ordinal = chain_origins,
++      .use_count = use_count,
++      .binding_count = binding_count,
++  };
++  IREE_RETURN_IF_ERROR(loom_low_placement_index_preference_incidence(
++      state, 0, chain_origins, aware_bindings, aware));
++  out_index->instruction_aware = aware;
+   return iree_ok_status();
+ }
+ 
+diff --git a/loom/src/loom/codegen/low/placement.h b/loom/src/loom/codegen/low/placement.h
+index f5e062eb8..38f51eb0b 100644
+--- a/loom/src/loom/codegen/low/placement.h
++++ b/loom/src/loom/codegen/low/placement.h
+@@ -307,6 +307,11 @@ typedef struct loom_low_placement_preference_index_t {
+   const uint32_t* use_indices;
+   // Offsets into use_indices, with value_count + 1 entries; NULL when inert.
+   const uint32_t* offsets_by_origin;
++  // Preference origin by value ordinal; NULL groups by tied storage origin.
++  const loom_value_ordinal_t* origins_by_value_ordinal;
++  // Companion index whose assignment queries also see instruction uses,
++  // grouped across whole-value copies and edges; NULL without instruction uses.
++  const struct loom_low_placement_preference_index_t* instruction_aware;
+   // Number of bound uses.
+   uint32_t use_count;
+   // Leading instruction uses deferred until final register numbering.
