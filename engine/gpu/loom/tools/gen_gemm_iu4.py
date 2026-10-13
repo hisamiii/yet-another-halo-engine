@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tile GEMM yah_iu4_gemm[_swiglu|_kres|_kqg]: MQ4G256 weights x int4 activations (the A4 path) on v_wmma_i32_16x16x16_iu4.
+"""Tile GEMM yah_iu4_gemm[_kres|_kqg|_gu]: MQ4G256 weights x int4 activations (the A4 path) on v_wmma_i32_16x16x16_iu4.
 
 Weights: MQ4G256 rows (136 B per 256 K: f16 scale0, zero0, scale1, zero1, 128 B of nibbles), the loader's signed codes, so
 w = code * scale per 128 K. Activations: gen_rot.gen_q's int4 rows (aq, [tokens][K / 2] bytes) and f32 scales (ad, one per
@@ -10,8 +10,9 @@ runs 8 k steps of i32 WMMAs into zeroed accumulators, then folds them into its f
 acc += f32(c) * (weight scale * activation scale).
 The iu4 C layout (wave32): element i of lane l is row 2 i + l / 16, token l % 16, so the weight scale is a per-element
 vector (LDS holds each 16-row tile's scales in that order) and the activation scale is one value per lane.
-Epilogues: gen_gemm_tile.lds_epilogue (kstore, kres, swiglu, kqg); the 48-row tile (TM 16) stores its f32 fragments.
-Bindings: weight, aq, ad, then kstore: output; kres: resid, output; swiglu: gate, output (f16); kqg: output (q), gate_out.
+Epilogues: gen_gemm_tile.lds_epilogue (kstore, kres, kqg); the 48-row tile (TM 16) stores its f32 fragments; gu pairs
+gate and up rows through LDS (gu_epilogue).
+Bindings: weight, aq, ad, then kstore: output; kres: resid, output; kqg: output (q), gate_out; gu: up, output (f16).
 """
 import os
 import sys
@@ -34,20 +35,24 @@ def tile(M):
 
 
 def sym(kind):
-    return "yah_iu4_gemm" + {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg"}.get(kind, "")
+    return "yah_iu4_gemm" + {"kres": "_kres", "kqg": "_kqg", "gu": "_gu"}.get(kind, "")
 
 
 def gen(kind, M, out16=False):
-    """out16: kstore stores f16 (gen_gemm_tile.OUT16)."""
+    """out16: kstore stores f16 (gen_gemm_tile.OUT16). Kind gu: the FFN's gate and up in one GEMM, f16 silu(gate) * up
+    of M features; a workgroup stages BM / 2 gate rows and the same features' up rows (wave rows WM / 2 and up) and
+    pairs them through LDS, so the gate never goes to memory."""
     BM, BN, WM, WN = tile(M)
+    GU = kind == "gu"
+    BO = BM // 2 if GU else BM         # output rows of a workgroup
     t = TG.Tile(bm=BM, bn=BN, wm=WM, wn=WN)
     TM, TN = t.tm, t.tn
     FM, FN, NWAVE = TM // 16, TN // 16, WM * WN
     LANES = 32 * NWAVE
     assert TM % 16 == 0 and TN % 16 == 0 and (kind != "kqg" or TM == 32)
     s = sym(kind)
-    bufs = ["weight", "aq", "ad"] + {"kstore": ["output"], "kres": ["resid", "output"], "swiglu": ["gate", "output"],
-                                     "kqg": ["output", "gate_out"]}[kind]
+    bufs = ["weight", "aq", "ad"] + {"kstore": ["output"], "kres": ["resid", "output"], "kqg": ["output", "gate_out"],
+                                     "gu": ["up", "output"]}[kind]
     WB, AB = BM * WP, BN * WP          # dwords of one staged weight / activation tile
     SB = 2 * (WB + AB + BM + BN)       # dwords: two each of the weight, activation, weight scale, activation scale tiles
     epi = NWAVE * (TM + TG.EPAD) * 16  # f32 of the epilogue slabs (alias the tiles)
@@ -65,7 +70,7 @@ def gen(kind, M, out16=False):
     e(f"  %m_tiles = config.get @{s}.m_tiles : index")
     e(f"  %token_tiles = config.get @{s}.token_tiles : index")
     e(f"  %wgs = index.constant {LANES} : index")
-    e(f"  %rowgrp = index.constant {BM // 16} : index")
+    e(f"  %rowgrp = index.constant {BO // 16} : index")
     e("  %m_groups = index.div %m_tiles, %rowgrp : index")
     e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
@@ -99,6 +104,9 @@ def gen(kind, M, out16=False):
     e("  %whv = buffer.view %weight_na[%base] : buffer -> view<[%w_h]xf16>")
     e("  %aqv = buffer.view %aq_na[%base] : buffer -> view<[%a_dw]xi32>")
     e("  %adv = buffer.view %ad_na[%base] : buffer -> view<[%d_tot]xf32>")
+    if GU:
+        e("  %uv = buffer.view %up_na[%base] : buffer -> view<[%w_dw]xi32>")
+        e("  %uhv = buffer.view %up_na[%base] : buffer -> view<[%w_h]xf16>")
     e(f"  %al_bytes = index.constant {LDSW * 4} : offset")
     e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
     e(f"  %lv = buffer.view %al[%base] : buffer -> view<{LDSW}xi32>")
@@ -114,7 +122,8 @@ def gen(kind, M, out16=False):
     e("  %wr = index.div %wave, %cwn : index")
     e("  %wt = index.rem %wave, %cwn : index")
     e(f"  %cbm = index.constant {BM} : index")
-    e("  %wg_row = index.mul %wg_x, %cbm : index")
+    e(f"  %cbo = index.constant {BO} : index")
+    e("  %wg_row = index.mul %wg_x, %cbo : index")
     e("  %wtb = index.mul %wg_y, %cwtok : index")
     e(f"  %ctm = index.constant {TM} : index")
     e(f"  %ctn = index.constant {TN} : index")
@@ -124,6 +133,7 @@ def gen(kind, M, out16=False):
     e("  %token_base = index.add %wtb, %wt_off : index")
     # staging map: chunk c = tid + LANES * r (16 bytes: weight row c / 4 or token c / 4, quarter c % 4 of its 64 bytes)
     nwc, nac = -(-BM * 4 // LANES), -(-BN * 4 // LANES)
+    assert not GU or nwc == 2 and BM * 2 == LANES   # gu: chunk 0 of every lane is a gate row, chunk 1 the up row
     e(f"  %w_clast = index.constant {BM * 4 - 1} : index")
     e(f"  %a_clast = index.constant {BN * 4 - 1} : index")
     e("  %w_dlim = index.sub %w_dw, %c4 : index")
@@ -142,7 +152,11 @@ def gen(kind, M, out16=False):
             e(f"  {p}lr = index.mul {p}row, %c{WP} : index")
             e(f"  {p}lo = index.add {p}lr, {p}q4 : index")             # LDS dword within the tile
             if nm == "w":
-                e(f"  {p}gr = index.add %wg_row, {p}row : index")
+                if GU and r:
+                    e(f"  {p}gr0 = index.add %wg_row, {p}row : index")
+                    e(f"  {p}gr = index.sub {p}gr0, %cbo : index")
+                else:
+                    e(f"  {p}gr = index.add %wg_row, {p}row : index")
                 e(f"  {p}gb = index.mul {p}gr, %bpr : index")
                 e(f"  {p}qb = index.mul {p}q, %c16 : index")
                 e(f"  {p}gbq = index.add {p}gb, {p}qb : index")         # + 136 * block + 8 + 64 * half per phase
@@ -153,7 +167,12 @@ def gen(kind, M, out16=False):
     # scales: lane tid < BM loads row tid's f16 scale, stores it at its C-layout slot: tile r / 16, half r % 2, i (r % 16) / 2
     e(f"  %sc_last = index.constant {BM - 1} : index")
     e("  %sc_r = index.min %tid, %sc_last : index")
-    e("  %sc_gr = index.add %wg_row, %sc_r : index")
+    if GU:
+        e("  %sc_up = index.cmp uge, %sc_r, %cbo : index")      # rows BO.. are the up tensor's
+        e("  %sc_rf = index.rem %sc_r, %cbo : index")
+        e("  %sc_gr = index.add %wg_row, %sc_rf : index")
+    else:
+        e("  %sc_gr = index.add %wg_row, %sc_r : index")
     e("  %sc_gb = index.mul %sc_gr, %bpr : index")
     e("  %sc_t = index.div %sc_r, %c16 : index")
     e("  %sc_rr = index.rem %sc_r, %c16 : index")
@@ -191,7 +210,8 @@ def gen(kind, M, out16=False):
                     e(f"  %{pfx}w{r}b = index.add {p}gbq, %{pfx}wo : index")
                     e(f"  %{pfx}w{r}d0 = index.div %{pfx}w{r}b, %c4 : index")
                     e(f"  %{pfx}w{r}d = index.min %{pfx}w{r}d0, %w_dlim : index")
-                    e(f"  %{pfx}w{r} = vector.load %wv[%{pfx}w{r}d] : view<[%w_dw]xi32> -> vector<4xi32>")
+                    wv = "%uv" if GU and r else "%wv"
+                    e(f"  %{pfx}w{r} = vector.load {wv}[%{pfx}w{r}d] : view<[%w_dw]xi32> -> vector<4xi32>")
                 else:
                     e(f"  %{pfx}a{r}d0 = index.add {p}gbq, %{pfx}ao : index")
                     e(f"  %{pfx}a{r}d = index.min %{pfx}a{r}d0, %a_dlim : index")
@@ -202,7 +222,12 @@ def gen(kind, M, out16=False):
         e(f"  %{pfx}sb = index.add %{pfx}sb0, %{pfx}hf4 : index")
         e(f"  %{pfx}sh0 = index.div %{pfx}sb, %c2 : index")
         e(f"  %{pfx}sh = index.min %{pfx}sh0, %w_hlim : index")
-        e(f"  %{pfx}sc = view.load %whv[%{pfx}sh] : view<[%w_h]xf16> -> f16")
+        if GU:
+            e(f"  %{pfx}scg = view.load %whv[%{pfx}sh] : view<[%w_h]xf16> -> f16")
+            e(f"  %{pfx}scu = view.load %uhv[%{pfx}sh] : view<[%w_h]xf16> -> f16")
+            e(f"  %{pfx}sc = scf.select %sc_up, %{pfx}scu, %{pfx}scg : f16")
+        else:
+            e(f"  %{pfx}sc = view.load %whv[%{pfx}sh] : view<[%w_h]xf16> -> f16")
         out.append(("s", f"%{pfx}sc", "%sc_lo", None))
         e(f"  %{pfx}di = index.add %ds_gb, {kp} : index")
         e(f"  %{pfx}dt = view.load %adv[%{pfx}di] : view<[%d_tot]xf32> -> f32")
@@ -321,7 +346,9 @@ def gen(kind, M, out16=False):
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("    scf.yield " + ", ".join(acc) + " : " + ", ".join([V8] * NA))
     e("  }")
-    if TM != 32:
+    if GU:
+        gu_epilogue(e, TM, FM, FN, WN, V8)
+    elif TM != 32:
         # lds_epilogue reads 32-row slabs: other tiles store the result fragments directly (f32 kstore)
         assert kind == "kstore" and not out16
         e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
@@ -335,12 +362,84 @@ def gen(kind, M, out16=False):
     else:
         TG.OUT16, TG.OSTRIDE = out16, 0
         try:
-            TG.lds_epilogue(e, t, kind == "kres", V8, sw=kind == "swiglu", qg=kind == "kqg")
+            TG.lds_epilogue(e, t, kind == "kres", V8, qg=kind == "kqg")
         finally:
             TG.OUT16 = False
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def gu_epilogue(e, TM, FM, FN, WN, V8):
+    """gu: per 16-token column every wave puts its fragments in its LDS slab; then gate wave w (wave rows 0, 1) and up
+    wave w + 2 WN each take half of their 32 rows: lane l, token l / 2, rows 16 (l % 2) + 8 p (p: 0 gate wave, 1 up
+    wave), 8 x f16(silu(gate) * up) per 16-byte store. The silu is lds_epilogue's swiglu (bit-identical)."""
+    W = (TM + TG.EPAD) * 16            # f32 of a slab
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    e(f"  %es_ctm = index.constant {TM + TG.EPAD} : index")
+    e("  %es_lay = encoding.layout.strided [%c1, %es_ctm] : encoding<layout>")
+    e(f"  %es_wb = index.constant {W * 4} : index")
+    e("  %es_off_i = index.mul %wave, %es_wb : index")
+    e("  %es_off = index.cast %es_off_i : index to offset")
+    e(f"  %es_view = buffer.view %al[%es_off] : buffer -> view<{TM}x16xf32, %es_lay>")
+    e(f"  %gu_all = buffer.view %al[%base] : buffer -> view<{W * 4 * WN}xf32>")
+    e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
+    e("  %negone = scalar.constant -1.0 : f32")
+    TG.rcp_consts(e)
+    e("  %one = scalar.constant 1.0 : f32")
+    e("  %gu_p = index.div %wr, %c2 : index")               # 0: a gate wave, 1: an up wave
+    e("  %gu_wr = index.rem %wr, %c2 : index")
+    e(f"  %gu_cw = index.constant {WN} : index")
+    e("  %gu_gw0 = index.mul %gu_wr, %gu_cw : index")
+    e("  %gu_gw = index.add %gu_gw0, %wt : index")          # the pair's gate wave
+    e(f"  %gu_cs = index.constant {W} : index")
+    e("  %gu_gs = index.mul %gu_gw, %gu_cs : index")
+    e(f"  %gu_cu = index.constant {2 * WN * W} : index")
+    e("  %gu_us = index.add %gu_gs, %gu_cu : index")
+    e("  %gu_t = index.div %lane, %c2 : index")
+    e("  %gu_h0 = index.rem %lane, %c2 : index")
+    e("  %gu_h = index.mul %gu_h0, %c16 : index")
+    e("  %gu_p8 = index.mul %gu_p, %c8 : index")
+    e("  %gu_r = index.add %gu_h, %gu_p8 : index")          # first of the lane's 8 rows within the wave's 32
+    e("  %gu_tt = index.mul %gu_t, %es_ctm : index")
+    e("  %gu_rd = index.add %gu_tt, %gu_r : index")
+    e("  %gu_gr = index.add %gu_gs, %gu_rd : index")
+    e("  %gu_ur = index.add %gu_us, %gu_rd : index")
+    e(f"  %gu_ctm = index.constant {TM} : index")
+    e("  %gu_fo = index.mul %gu_wr, %gu_ctm : index")
+    e("  %gu_f0 = index.add %wg_row, %gu_fo : index")
+    e("  %gu_f = index.add %gu_f0, %gu_r : index")          # the lane's first feature
+    for j in range(FN):
+        for i in range(FM):
+            e(f"  %es_r{i}_{j} = index.constant {16 * i} : index")
+            e(f"  vector.fragment.store<result> %acc{i * FN + j}, %es_view[%es_r{i}_{j}, %c0] shape [%m, %n] : {V8}, view<{TM}x16xf32, %es_lay>")
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e(f"  %gu_tc{j} = index.constant {16 * j} : index")
+        e(f"  %gu_tk{j}0 = index.add %token_base, %gu_tc{j} : index")
+        e(f"  %gu_tk{j} = index.add %gu_tk{j}0, %gu_t : index")
+        e(f"  %gu_tm{j} = index.mul %gu_tk{j}, %m_rows : index")
+        e(f"  %gu_ob{j} = index.add %gu_tm{j}, %gu_f : index")
+        hs = []
+        for q in range(2):
+            e(f"  %gu_gi{j}_{q} = index.add %gu_gr, %c{4 * q} : index")
+            e(f"  %gu_ui{j}_{q} = index.add %gu_ur, %c{4 * q} : index")
+            e(f"  %gu_g{j}_{q} = vector.load %gu_all[%gu_gi{j}_{q}] : view<{W * 4 * WN}xf32> -> vector<4xf32>")
+            e(f"  %gu_u{j}_{q} = vector.load %gu_all[%gu_ui{j}_{q}] : view<{W * 4 * WN}xf32> -> vector<4xf32>")
+            for x in range(4):
+                y = f"{j}_{q}_{x}"
+                e(f"  %g_{y} = vector.extract %gu_g{j}_{q}[{x}] : vector<4xf32> -> f32")
+                e(f"  %v_{y} = vector.extract %gu_u{j}_{q}[{x}] : vector<4xf32> -> f32")
+                e(f"  %ng_{y} = scalar.mulf %g_{y}, %negone : f32")
+                e(f"  %ex_{y} = scalar.expf<afn> %ng_{y} : f32")
+                e(f"  %dn_{y} = scalar.addf %one, %ex_{y} : f32")
+                TG.recip1(e, f"%iv_{y}", f"%dn_{y}")
+                e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
+                e(f"  %ac_{y} = scalar.mulf %sg_{y}, %v_{y} : f32")
+                e(f"  %h_{y} = scalar.fptrunc %ac_{y} : f32 to f16")
+                hs.append(f"%h_{y}")
+        e(f"  %hv{j} = vector.from_elements {', '.join(hs)} : vector<8xf16>")
+        e(f"  vector.store %hv{j}, %out_h[%gu_ob{j}] : vector<8xf16>, view<[%out_total]xf16>")
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
 
 
 if __name__ == "__main__":

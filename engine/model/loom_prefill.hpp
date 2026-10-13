@@ -702,7 +702,7 @@ class LoomPrefill {
     bool any_af = false;
     for (const auto& [name, g] : geom_) any_af = any_af || name.size() > 7 && name.compare(name.size() - 7, 7, ".af.hal") == 0;
     if (any_af) normt_ = &Alloc(B * kHidden * 2);
-    gateffn_ = &Alloc(B * kFfn * 4);
+    if (!a4_) gateffn_ = &Alloc(B * kFfn * 4);   // A4's gu GEMM keeps the gate in LDS
     // Per-workgroup weight staging (ABI only: the tile GEMMs stage in LDS) and epilogue scratch sized for the widest
     // GEMM, which the compiler declares over the whole [m_rows][tokens] tile.
     uwstage_ = &Alloc(std::size_t{kFfn} * 16 * 2);
@@ -910,6 +910,10 @@ class LoomPrefill {
       RunSwigluSplit(pre + "ffn_up.weight", up_af, us, nn);
       NpuJoin();
       FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
+    } else if (a4_) {
+      // one GEMM for gate and up: silu(gate) * up straight into ffnup_ (gen_gemm_iu4 gu)
+      const auto* up = Find(pre + "ffn_up.weight");
+      RunIu4("gu", *Find(pre + "ffn_gate.weight"), {ffnup_}, {std::size_t(up->dims[1]) * 2}, 0b10000, up);
     } else {
       RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
       RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
@@ -1251,18 +1255,19 @@ class LoomPrefill {
   }
   // A4 sets: the iu4 GEMM (gen_gemm_iu4) of kind on t over aq_ / ad_; io: the kind's bindings after them (outputs at
   // the bits of writes), row_bytes: their bytes per token.
+  // t2: a second weight tensor bound after the activations (gu: up beside gate).
   void RunIu4(const char* kind, const core::TensorInfo& t, std::initializer_list<const LoomBuffer*> io,
-              std::initializer_list<std::size_t> row_bytes, std::uint64_t writes) {
+              std::initializer_list<std::size_t> row_bytes, std::uint64_t writes, const core::TensorInfo* t2 = nullptr) {
     const std::size_t K = t.dims[0];
     const std::string hal = std::string("iu4_") + kind + "_" + std::to_string(MTiles(t)) + "_" + std::to_string(K / 256) + ".hal";
     const Geom g = GeomOf(hal);
     std::vector<hrx_buffer_ref_t> b = {TRef(t), Ref(*aq_), Ref(*ad_)};
-    for (const LoomBuffer* x : io) b.push_back(Ref(*x));
-    const bool kres = std::strcmp(kind, "kres") == 0;
     std::vector<std::size_t> rb = {K / 2, K / 128 * 4};
+    if (t2) b.push_back(TRef(*t2)), rb.push_back(0);
+    for (const LoomBuffer* x : io) b.push_back(Ref(*x));
     rb.insert(rb.end(), row_bytes);
     const std::uint32_t tt = Trim(b, 1, rb, g);
-    const char* sfx = kres ? "_kres" : std::strcmp(kind, "swiglu") == 0 ? "_swiglu" : std::strcmp(kind, "kqg") == 0 ? "_kqg" : "";
+    const char* sfx = std::strcmp(kind, "kres") == 0 ? "_kres" : std::strcmp(kind, "kqg") == 0 ? "_kqg" : std::strcmp(kind, "gu") == 0 ? "_gu" : "";
     Dispatch(Exe(hal), (std::string("yah_iu4_gemm") + sfx).c_str(), MTiles(t) / g.rowgrp, tt, 1, 32, 1, 1, b, writes);
   }
   // Debug (YAH_DUMP_ACT=<prefix>, YAH_DUMP_LAYERS=l0,l1,..): the row-major f16 output of each RMSNorm that feeds a GEMM
@@ -1776,7 +1781,6 @@ class LoomPrefill {
   // af: the afrag form, input normt_; tout: its output fragment-major (for an afrag down projection)
   void RunSwiglu(const std::string& wname, bool af = false, bool tout = false) {
     const auto* t = Find(wname);
-    if (a4_) return RunIu4("swiglu", *t, {gateffn_, ffnup_}, {std::size_t(t->dims[1]) * 4, std::size_t(t->dims[1]) * 2}, 0b10000);
     Fmt f{};
     const std::string base = GemmHal("gemm_swiglu", *t, &f);
     const std::string df = af ? "" : DfGemm("swiglu", *t, f);

@@ -29,7 +29,9 @@ KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")
 # a split ffn reads the full gate tensor's rows before the up rows
 wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
 bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate": B * MO * 4,
-         "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4),
+         "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn", "gu") else 4),
+         # A4 gu (gen_gemm_iu4): the up tensor beside the gate tensor in "weight"
+         "up": wbytes,
          "gate_out": B * MO * 2,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
          "grid": max({"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(f, 0) for f in fmts),

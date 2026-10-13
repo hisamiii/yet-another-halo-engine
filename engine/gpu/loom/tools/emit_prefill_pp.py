@@ -1290,6 +1290,8 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
 def iu4_gemm(kind, mt, kb, B, outdir):
     """Emit the A4 GEMM (tools/gen_gemm_iu4.py) of an MQ4 tensor; return its dispatch.txt row."""
     bm, bn, _, _ = gen_gemm_iu4.tile(mt * 16)
+    if kind == "gu":
+        bm //= 2   # a gu workgroup stages bm rows of gate and up for bm / 2 features
     if B % bn or (mt * 16) % bm:
         raise SystemExit("iu4 GEMM %s: %d rows / %d tokens do not tile" % (kind, mt * 16, B))
     tt = B // bn
@@ -1373,7 +1375,10 @@ def main():
         # 24 heads x [q | gate]) also gets kqg, which stores q and gate unpacked. The driver prefers kres and kqg.
         kinds = gemm_kinds(kind, mt)
         if a4 and fmt == "mq4":
-            for k in kinds:
+            # A4: the FFN's gate and up run as one gu GEMM (on the up combo); the gate tensors need no kstore
+            if all(t.endswith("ffn_gate.weight") for t in combos[(kind, fmt, port, mt, kb)]):
+                continue
+            for k in (["gu"] if kind == "swiglu" else kinds):
                 if k != "kstore" or kind != "residual":
                     geom.append(iu4_gemm(k, mt, kb, B, outdir))
             n += 1
