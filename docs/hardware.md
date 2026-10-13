@@ -144,6 +144,7 @@ Measured on low-asm leaves compiled by `loom-compile` (static bundle counts of s
 - `vshuffle` modes 0-55 are permutations (56 and up are not); among them byte, 16-bit and 32-bit (de)interleaves and transposes, e.g. mode 35 is an 8 x 8 byte transpose. There is no data-dependent lane permute; `vldb.4x{16,32,64}` gathers four 64-bit windows from four pointers held in a vector.
 - A gather (`vldb.4x32.lo` / `.hi`) costs one memory stall cycle unless its address lanes 0 / 2 and 1 / 3 hit different 16 KB banks; addresses within a bank do not matter (65,536 gathers per call, 2026-10-09). The IQ3_S / IQ3_XXS / IQ2_XXS decoders keep the grid and sign tables in different banks and give each gather two grid and two sign lanes (HRX patch 0028 places such tables after the channel rings).
 - A core starts at program address 0. Branch targets are absolute; `J` (6 bytes) runs 5 delay bundles, so a jump with 2-byte NOPs in its delay slots fills exactly 16 bytes (HRX patch 0029's startup jump).
+- Loom's issue distances on the core (from its bundles, 2026-10-13): a `vlda` / `vldb` result 7 cycles to its user, `vsel` / `vbor` / `vshuffle` 2, `vbroadcast` -> `vshuffle` 1, `mmul` -> `mma` on the accumulator 4, `mma` -> `vst.push` of it 6. Every load waits 4 cycles after a store (`vst.push` too: pointers from `mov.scalar-to-address` and gather addresses may alias anything). With `LOOM_EXP_LOCKED_PACK` a load authored after an MV op of the same cycle goes to the next bundle; authored first, it shares the bundle.
 
 ## NPU data movement (AIE2P) (2026-10-08)
 

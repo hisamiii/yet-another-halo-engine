@@ -35,6 +35,13 @@ HBY = {"IQ4_XS": 8, "Q4_K": 16, "IQ3_S": 2, "IQ3_XXS": 2, "IQ2_XXS": 2, "IQ2_XS"
 GRID = FMT in ("IQ3_S", "IQ3_XXS", "IQ2_XXS", "IQ2_XS")   # grid formats: gathers of 4-value grid pieces + sign masks (rodata)
 # grid and sign tables in different banks, each gather's address lanes 0, 1 at one and 2, 3 at the other (no bank stall)
 GMIX = GRID and FMT != "IQ2_XS"
+# GMIX hot loop: op offsets (cycles) in a unit (pr, hh); a unit starts every GII cycles. Modulo schedule from npu_modsched.py:
+# Loom's latencies, vec256 peak 22 of 24, pushes of a pr in a 7-cycle window without loads (Loom loads wait 4 cycles after a store)
+GII = 29
+GMOD = dict(a1s=5, a1g=6, a0s=14, mg1=14, a0g=15, ms1=15, g1g0l=16, g1g0h=17, g1g1l=18, g1g1h=19, g1s1l=20, g1s1h=21,
+            g1s0h=22, ms0=22, g1s0l=23, mg0=23, g0s1l=24, t0=25, g0s1h=26, g0s0l=27, g0s0h=28, b11=29, g0g1l=29, b10=30,
+            g0g1h=30, g0g0l=31, c0=32, g0g0h=32, r0b=33, t1=33, r0a=34, p0=36, b01=37, b00=39, c1=40, m01=40, m00=41,
+            r1a=41, r1b=42, m11=44, m10=45, p1=64, p2=66, p3=67, fl=68)
 GP4 = os.environ.get("DQ_GORD", "P4") == "P4"   # grid formats push in IQ4_XS's k-block order (0, 2, 1, 3) per sub-block
 gpair = (lambda kb: 2 * (kb // 4) + kb % 2) if GP4 else (lambda kb: kb // 2)   # hot-loop pair of a k-block
 gpos = (lambda kb: (kb % 4) // 2) if GP4 else (lambda kb: kb % 2)               # its position in the pair
@@ -1502,14 +1509,93 @@ def leaf(name="dec", nports=1):
         x(f"{nxt[0]}, {nxt[1]}, {nxt[2]} = vst.flush.512 {fifo[0]}, {fifo[1]}, {fifo[2]}")
         st["fifo"] = nxt
 
-    if GRID:
-        # ---- grid hot: per k-block pair (same sub-block) and row half. G streams (per k-block and table, signs first;
-        # IQ2_XS per k-block): one address vector -> 4 gathers (rows in lane order: [row][8] directly), X = grid | signs;
-        # C stream: T rows a part at a time, 2 MACs per k-block, pushes [kb][h]. Small G streams keep gathers in flight.
+    if GMIX:
+        # ---- grid hot, modulo-scheduled (GMOD) in one in-order stream: unit (pr, hh) = both positions of a k-block
+        # pair; per position 2 address loads, 2 vsel (lane mixing), 8 gathers, X = grid | signs; T shared; pushes [kb][h]
+        x = e.stream()
+        tl = []
+
+        def op(c, s_):
+            tl.append((c, len(tl), "  " + s_))
+
+        def cap(c, fn):
+            n0 = len(x.L)
+            r_ = fn()
+            for s_ in x.L[n0:]:
+                tl.append((c, len(tl), s_))
+            del x.L[n0:]
+            return r_
+        O = GMOD
+        gpp, parked = {}, {}
+        for pr in range(8):
+            sl_ = pr // 2
+            for hh in range(2):
+                t = (2 * pr + hh) * GII
+                key = (hh, pr // 4)
+                if key not in gpp:     # pairs 4 j .. 4 j + 3 of a half: offsets -512 .. 448
+                    gpp[key] = cap(t + min(O.values()) - 3, lambda: P(x, "%spb", GAS + 2048 * hh + 1024 * (pr // 4) + 512))
+                xs4 = []
+                for pos in range(2):
+                    base = 256 * (pr % 4) + 64 * pos - 512
+                    ad = {"g": x.t("ad"), "s": x.t("ad")}
+                    op(t + O[f"a{pos}g"], f"{ad['g']} = vlda.512.i8x64 {gpp[key]}, {base}")
+                    op(t + O[f"a{pos}s"], f"{ad['s']} = vlda.512.i8x64 {gpp[key]}, {base + 128}")
+                    mg, ms = x.t("ad"), x.t("ad")   # (grid, grid, sign, sign) address lanes and the reverse
+                    op(t + O[f"ms{pos}"], f"{ms} = vsel.32.mask64 {ad['g']}, {ad['s']}, %gmk")
+                    op(t + O[f"mg{pos}"], f"{mg} = vsel.32.mask64 {ad['s']}, {ad['g']}, %gmk")
+                    gv = {}
+                    for hf_ in range(2):
+                        for kind, src in (("s", ms), ("g", mg)):
+                            av, gl, gh, gc = x.t("av"), x.t("gl"), x.t("gh"), x.t("gc")
+                            cl, ch = t + O[f"g{pos}{kind}{hf_}l"], t + O[f"g{pos}{kind}{hf_}h"]
+                            op(min(cl, ch), f"{av} = slice {src}[{hf_}] : {V2} -> {V1}")
+                            op(cl, f"{gl} = vldb.4x32.lo {av}")
+                            op(ch, f"{gh} = vldb.4x32.hi {av}")
+                            op(max(cl, ch), f"{gc} = concat({gl}, {gh}) : ({V1}, {V1}) -> {V2}")
+                            gv[(kind, hf_)] = gc
+                    xvs = [x.t("xv"), x.t("xv")]
+                    for hf_ in range(2):
+                        op(t + O[f"b{pos}{hf_}"], f"{xvs[hf_]} = vbor {gv[('g', hf_)]}, {gv[('s', hf_)]}")
+                    x4 = x.t("X")
+                    op(t + max(O[f"b{pos}0"], O[f"b{pos}1"]), f"{x4} = concat({xvs[0]}, {xvs[1]}) : ({V2}, {V2}) -> {V4}")
+                    xs4.append(x4)
+                ts = []
+                for p in range(2):
+                    ld, bc, ra, rb, t4 = x.t("pl"), x.t("bc"), x.t("ra"), x.t("rb"), x.t("TB")
+                    op(t + O[f"t{p}"], f"{ld} = vlda.512.bf16x32 {sp0}, {(hh * NPARTS + p) * 64}")
+                    op(t + O[f"c{p}"], f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {sl_}")
+                    op(t + O[f"r{p}a"], f"{ra} = vshuffle {bc}, {bc}, {m52}")
+                    op(t + O[f"r{p}b"], f"{rb} = vshuffle {bc}, {bc}, {m53}")
+                    op(t + max(O[f"r{p}a"], O[f"r{p}b"]), f"{t4} = concat({ra}, {rb}) : ({V2}, {V2}) -> {V4}")
+                    ts.append(t4)
+                accs = []
+                for pos in range(2):
+                    a0 = x.t("ac")
+                    op(t + O[f"m0{pos}"], f"{a0} = mmul.bf16bf16.m8n8k1 {ts[0]}, {xs4[pos]}, {conf}")
+                    accs.append(a0)
+                for pos in range(2):
+                    a1 = x.t("ac")
+                    op(t + O[f"m1{pos}"], f"{a1} = mma.bf16bf16.m8n8k1 {accs[pos]}, {ts[1]}, {xs4[pos]}, {conf}")
+                    accs[pos] = a1
+                if hh == 0:
+                    parked[pr] = accs
+                    continue
+                for n_ in range(2):
+                    for j_, a_ in enumerate((parked[pr][n_], accs[n_])):
+                        cap(t + O[f"p{2 * n_ + j_}"], lambda: push(x, a_))
+                if pr % 2 == 1:
+                    cap(t + O["fl"], lambda: flush(x))
+        # same cycle: slices, then loads, then the rest (Loom splits a bundle where a load follows an MV op)
+        tl.sort(key=lambda r_: (r_[0], 0 if " = slice" in r_[2] else 1 if " = vld" in r_[2] else 2, r_[1]))
+        e.L += [s_ for _, _, s_ in tl]
+        frags, tails = [], []
+    elif GRID:
+        # ---- IQ2_XS hot: per k-block pair (same sub-block) and row half. A G stream per k-block: one address vector per
+        # table -> 4 gathers (rows in lane order: [row][8] directly), X = grid | signs; C stream: T per k-block (its
+        # 16-value group), 2 MACs per k-block, pushes [kb][h]. Small G streams keep gathers in flight.
         frags, tails = [], []
         gpp = {}
         for pr in range(8):
-            sl_ = pr // 2
             parked = None
             for hh in range(2):
                 xs4 = []
@@ -1520,25 +1606,9 @@ def leaf(name="dec", nports=1):
                     if (hh, pr // 4) not in gpp:     # pairs 4 j .. 4 j + 3 of a half: offsets -512 .. 448
                         gpp[(hh, pr // 4)] = P(x, "%spb", GAS + 2048 * hh + 1024 * (pr // 4) + 512)
                     gv = {}
-                    for kind, off in (("g", 0), ("s", 128)) if XS2 else (("s", 128), ("g", 0)):
-                        if kind == "g" and not XS2:
-                            x = e.stream()
-                            frags.append(x)
-                            tails.append([])
-                        if GMIX and kind == "s":   # both address vectors, mixed: (grid, grid, sign, sign) and the reverse
-                            ads = {}
-                            for kd_, of_ in (("g", 0), ("s", 128)):
-                                ads[kd_] = x.t("ad")
-                                x(f"{ads[kd_]} = vlda.512.i8x64 {gpp[(hh, pr // 4)]}, {256 * (pr % 4) + of_ + 64 * pos - 512}")
-                            mg, ms = x.t("ad"), x.t("ad")
-                            x(f"{mg} = vsel.32.mask64 {ads['s']}, {ads['g']}, %gmk")
-                            x(f"{ms} = vsel.32.mask64 {ads['g']}, {ads['s']}, %gmk")
-                            ads = {"g": mg, "s": ms}
-                        if GMIX:
-                            ad = ads[kind]
-                        else:
-                            ad = x.t("ad")
-                            x(f"{ad} = vlda.512.i8x64 {gpp[(hh, pr // 4)]}, {256 * (pr % 4) + off + 64 * pos - 512}")
+                    for kind, off in (("g", 0), ("s", 128)):
+                        ad = x.t("ad")
+                        x(f"{ad} = vlda.512.i8x64 {gpp[(hh, pr // 4)]}, {256 * (pr % 4) + off + 64 * pos - 512}")
                         for hf_ in range(2):
                             av, gl, gh, gc = x.t("av"), x.t("gl"), x.t("gh"), x.t("gc")
                             x(f"{av} = slice {ad}[{hf_}] : {V2} -> {V1}")
@@ -1569,23 +1639,17 @@ def leaf(name="dec", nports=1):
                         t4s.append(t4)
                     return t4s
                 accs = []
-                if XS2 and GP4:   # the k-block's 16-value group g = kb // 2: line 2 (g // 4) + p, lane g % 4 (one T live)
+                if GP4:   # the k-block's 16-value group g = kb // 2: line 2 (g // 4) + p, lane g % 4 (one T live)
                     for pos, x4 in enumerate(xs4):
-                        kb_ = 4 * (pr // 2) + 2 * pos + pr % 2 if GP4 else 2 * pr + pos
+                        kb_ = 4 * (pr // 2) + 2 * pos + pr % 2
                         t4s = tload(hh * NPARTS + 2 * (kb_ // 8), (kb_ // 2) % 4)
                         acc = mac(x, None, t4s[0], x4)
                         accs.append(mac(x, acc, t4s[1], x4))
-                elif XS2:         # (IQ2_XS in natural order: the pair is one group, pr)
+                else:     # natural order: the pair is one group, pr
                     t4s = tload(hh * NPARTS + 2 * (pr // 4), pr % 4)
                     for x4 in xs4:
                         acc = mac(x, None, t4s[0], x4)
                         accs.append(mac(x, acc, t4s[1], x4))
-                else:
-                    accs = [None, None]
-                    for p in range(2):
-                        t4 = tload(hh * NPARTS, sl_, (p,))[0]
-                        for n_, x4 in enumerate(xs4):
-                            accs[n_] = mac(x, accs[n_], t4, x4)
                 if hh == 0:
                     parked = accs
                     tails.append([])
@@ -1800,8 +1864,9 @@ def leaf(name="dec", nports=1):
                     if cc == 1 and (u == 0 or SLU):
                         flush(pt)                          # every 8 pushes (SLU: the iteration-end flush too)
                 tails.append(pt.L)
-    run(frags, int(os.environ.get("DQ_WINH", "1" if Q3K else "6")), tails,   # Q3_K: 4 x4 operands per stream
-        hv=int(os.environ.get("DQ_HHV", "20" if XS2 else "24")))   # IQ2_XS: X (4 vec256) per G stream, 8 T rows per C
+    if frags:
+        run(frags, int(os.environ.get("DQ_WINH", "1" if Q3K else "6")), tails,   # Q3_K: 4 x4 operands per stream
+            hv=int(os.environ.get("DQ_HHV", "20" if XS2 else "24")))   # IQ2_XS: X (4 vec256) per G stream, 8 T rows per C
     if SLU:
         e(f"%spc0 = copy {sp0} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if 2 * NPARTS * 64 <= 448:
