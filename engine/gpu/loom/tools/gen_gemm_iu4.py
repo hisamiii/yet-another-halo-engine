@@ -22,7 +22,7 @@ sys.path.insert(0, HERE)
 import gen_gemm_tile as TG  # noqa: E402
 
 KP = 128        # K per phase: one weight scale group
-WP = 18         # LDS dwords per staged row: 16 of nibbles + 2 of pad
+WP = 20         # LDS dwords per staged row: 16 of nibbles + 4 of pad (16-byte rows: aligned b128 staging stores)
 V8 = "vector<8xf32>"
 VI = "vector<8xi32>"
 V2 = "vector<2xi32>"
@@ -30,7 +30,7 @@ V2 = "vector<2xi32>"
 
 def tile(M):
     """The workgroup geometry (BM, BN, WM, WN) for M rows: 8 waves of 32 x 64, so 3 workgroups fit a WGP (216 VGPRs,
-    39 KB LDS) and one's fold, barrier and epilogue stalls overlap the others' WMMAs."""
+    42 KB LDS) and one's fold, barrier and epilogue stalls overlap the others' WMMAs."""
     return (128, 128, 4, 2) if M % 128 == 0 else (48, 128, 3, 2)
 
 
