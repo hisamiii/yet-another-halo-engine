@@ -97,6 +97,15 @@ def units(mn, rhs, full=False):
 NAME = re.compile(r"%[\w.]+")
 
 
+def dsizes(mn, rhs, defs, full=False):
+    """(def, class, units) per result: the first by units(), a post-increment's pointer result one p."""
+    cls, sz = units(mn, rhs, full)
+    out = [(defs[0], cls, sz)] if defs and cls else []
+    if ".post" in mn and len(defs) > 1:
+        out.append((defs[1], "p", 1))
+    return out
+
+
 def parse(op):
     s = op.strip()
     if "=" in s.split("(")[0] or re.match(r"^%[\w.]+(, %[\w.]+)* = ", s):
@@ -138,8 +147,7 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
             mn, defs, uses = parse(op)
             for u in uses:
                 nuse[u] = nuse.get(u, 0) + 1
-            cls, sz = units(mn, op, full)
-            for d in defs[:1]:
+            for d, cls, sz in dsizes(mn, op, defs, full):
                 size[d] = (cls, sz)
     live = {"v": 0, "a": 0, "p": 0}
     livev = {}
@@ -152,10 +160,10 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
                 cnt[u] = cnt.get(u, 0) + 1
         for op in sq:
             mn, defs, uses = parse(op)
-            c, z = units(mn, op, full)
-            if c and defs:
-                lv[c] += z
-                pk[c] = max(pk[c], lv[c])
+            for d, c, z in dsizes(mn, op, defs, full):
+                if nuse.get(d):
+                    lv[c] += z
+                    pk[c] = max(pk[c], lv[c])
             for u in uses:
                 if u in cnt:
                     cnt[u] -= 1
@@ -172,9 +180,8 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
         for op in sq:
             traj.append(dict(lv))
             mn, defs, uses = parse(op)
-            c, z = units(mn, op, full)
-            if c and defs:
-                lv[c] += z
+            for d, c, z in dsizes(mn, op, defs, full):
+                lv[c] += z if nuse.get(d) else 0
             snap = dict(lv)
             for u in uses:
                 if u in cnt:
@@ -248,24 +255,32 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
                 if not ok:
                     if BLOCK is not None: BLOCK[f"operand {mn}"] += 1
                     continue
-                cls, sz = units(mn, op, full)
+                ds = [x_ for x_ in dsizes(mn, op, defs, full) if nuse.get(x_[0], 0)]   # (unused: dead at the def)
+                add = {"v": 0, "a": 0, "p": 0}
+                for _, c, z in ds:
+                    add[c] += z
                 freed = {"v": 0, "a": 0, "p": 0}
                 for u in set(uses):
                     if u in size and size[u][0] and nuse.get(u, 0) == uses.count(u):
                         freed[size[u][0]] += size[u][1]
-                if cls and sz > freed[cls]:
-                    # banker's rule: leave room for every older active stream to finish (they push first)
-                    older = sum(needs[o][pos[o]][cls] for o in active if o < i)
-                    if live[cls] - freed[cls] + sz + older > hard[CL.index(cls)]:
-                        if BLOCK is not None: BLOCK[f"budget {cls}"] += 1
-                        continue
+                over = False
+                for cls in CL:
+                    if add[cls] > freed[cls]:
+                        # banker's rule: leave room for every older active stream to finish (they push first)
+                        older = sum(needs[o][pos[o]][cls] for o in active if o < i)
+                        if live[cls] - freed[cls] + add[cls] + older > hard[CL.index(cls)]:
+                            over = True
+                            if BLOCK is not None: BLOCK[f"budget {cls}"] += 1
+                            break
+                if over:
+                    continue
                 for u in uses:
                     nuse[u] -= 1
                     if nuse[u] == 0 and u in size and size[u][0]:
                         live[size[u][0]] -= size[u][1]
-                if cls and defs and nuse.get(defs[0], 0):            # a value without uses is dead at its def
-                    live[cls] += sz
-                    livev[defs[0]] = (cls, sz)
+                for d, c, z in ds:
+                    live[c] += z
+                    livev[d] = (c, z)
                 for u in uses:
                     if nuse.get(u, 1) == 0:
                         livev.pop(u, None)

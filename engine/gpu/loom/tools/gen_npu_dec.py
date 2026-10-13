@@ -491,27 +491,32 @@ def leaf(name="dec", nports=1):
             for i_ in range(2):
                 x(f"st {ws[2 * c_ + i_]}, {ps_}, {4 * i_ - 32}")
 
-    def aux_words(x, base_scalar, row0, sel=None):
+    def aux_words(x, base_scalar, sel=None, rmod=None):
         """8 rows' aux words (realigned 64 B at base + 576 row) transposed: O[i] = words [2 i, 2 i + 1][row 0..7]
         (zips 16, 14 / 15, 12 / 13 on 4-byte units). sel: a shuffle mode applied to each row first (IQ2_XXS: 4 / 5,
-        its even / odd 4-byte units)."""
+        its even / odd 4-byte units). One pointer walks the rows; rmod: a modifier of ROWB - 64 (else made here)."""
         sh_, al_ = x.t("ash"), x.t("aal")
         x(f"{sh_} = and {base_scalar}, {k(63)}")
         x(f"{al_} = and {base_scalar}, {k(-64)}")
+        if rmod is None:
+            rmod = x.t("amd")
+            x(f"{rmod} = mov.modifier {k(ROWB - 64)}")
         R = []
+        pw = Pr(x, al_)
         for r in range(8):
-            pa_ = x.t("pa")
-            x(f"{pa_} = add.rr {al_}, {k(ROWB * (row0 + r))}" if row0 + r else f"{pa_} = or {al_}, {k(0)}")
-            pv = Pr(x, pa_)
-            va, vb, q = x.t("va"), x.t("vb"), x.t("q")
-            x(f"{va} = vlda.512.i8x64 {pv}, 0")
-            x(f"{vb} = vlda.512.i8x64 {pv}, 64")
+            va, vb, q, p1, p2 = x.t("va"), x.t("vb"), x.t("q"), x.t("pr"), x.t("pr")
+            x(f"{va}, {p1} = vlda.512.i8x64.post {pw}, 64")
+            x(f"{vb}, {p2} = vlda.512.i8x64.post.modifier {p1}, {rmod}")
+            pw = p2
             x(f"{q} = vshift {va}, {vb}, {sh_}")
-            if sel is not None:
+            R.append(q)
+        if sel is not None:
+            R2 = []
+            for q in R:
                 q2_ = x.t("qs")
                 x(f"{q2_} = vshuffle {q}, {q}, {k(sel)}")
-                q = q2_
-            R.append(q)
+                R2.append(q2_)
+            R = R2
         P_ = []
         for q in range(4):
             v = x.t("ap")
@@ -530,6 +535,45 @@ def leaf(name="dec", nports=1):
                 x(f"{v} = vshuffle {Qv[i_]}, {Qv[j_]}, {md}")
                 O.append(v)
         return O
+
+    def aux_words2(x, base_scalar, sels, rmod):
+        """aux_words for each shuffle mode in sels from one walk of the rows (row pairs: both modes' first zip)."""
+        sh_, al_ = x.t("ash"), x.t("aal")
+        x(f"{sh_} = and {base_scalar}, {k(63)}")
+        x(f"{al_} = and {base_scalar}, {k(-64)}")
+        pw = Pr(x, al_)
+        P_ = {sl: [] for sl in sels}
+        for q in range(4):
+            R = []
+            for r in range(2):
+                va, vb, qq, p1, p2 = x.t("va"), x.t("vb"), x.t("q"), x.t("pr"), x.t("pr")
+                x(f"{va}, {p1} = vlda.512.i8x64.post {pw}, 64")
+                x(f"{vb}, {p2} = vlda.512.i8x64.post.modifier {p1}, {rmod}")
+                pw = p2
+                x(f"{qq} = vshift {va}, {vb}, {sh_}")
+                R.append(qq)
+            for sl in sels:
+                a_, b_, v = x.t("qs"), x.t("qs"), x.t("ap")
+                x(f"{a_} = vshuffle {R[0]}, {R[0]}, {k(sl)}")
+                x(f"{b_} = vshuffle {R[1]}, {R[1]}, {k(sl)}")
+                x(f"{v} = vshuffle {a_}, {b_}, {k(16)}")
+                P_[sl].append(v)
+        Os = []
+        for sl in sels:
+            Qv = []
+            for i_, j_ in ((0, 1), (2, 3)):
+                for md in (k(14), k(15)):
+                    v = x.t("aq")
+                    x(f"{v} = vshuffle {P_[sl][i_]}, {P_[sl][j_]}, {md}")
+                    Qv.append(v)
+            O = []
+            for i_, j_ in ((0, 2), (1, 3)):
+                for md in (k(12), k(13)):
+                    v = x.t("ao")
+                    x(f"{v} = vshuffle {Qv[i_]}, {Qv[j_]}, {md}")
+                    O.append(v)
+            Os.append(O)
+        return Os
 
     def field(x, oa, ob, mask, shreg):
         """u16 lanes [word 4][row 8] of (w & mask) >> sh for the words of oa, ob (the accumulator path is signed)."""
@@ -551,7 +595,7 @@ def leaf(name="dec", nports=1):
         first row, scalar)."""
         ab = x.t("xab")
         x(f"{ab} = add.rr {hin}, {k(2 if X2 else 66)}")
-        O = aux_words(x, ab, 0, 5 if X2 else None)
+        O = aux_words(x, ab, 5 if X2 else None)
         sh28 = x.t("s28")
         x(f"{sh28} = mov.shift 28")
         cs_ = []
@@ -1104,6 +1148,28 @@ def leaf(name="dec", nports=1):
                 e(f"%anm{v} = mov.modifier {k(v)}")
             return anp[("m", v)]
 
+        def km(v):
+            """Shuffle mode v; the most used ones live in registers for the record (Loom rematerializes a constant
+            before each use: a mova per vshuffle). %anz, a computed 0 (r < 256), keeps them from being constants."""
+            if v not in (18, 19, 20, 21, 35, 45):
+                return k(v)
+            if "anz" not in anp:
+                anp["anz"] = 1
+                e(f"%anz = lshl {r_}, {k(-8)}")
+            if ("k", v) not in anp:
+                anp[("k", v)] = f"%ank{v}"
+                e(f"%ank{v} = add %anz, {v}")
+            return anp[("k", v)]
+
+        def gst(x, q1, off, own=False):
+            """vst.acc of q1 at GAS + off through a pointer into its 1 KB window, made by its first user: the record's,
+            or (own) stream x's (IQ3_S: its 4 windows held through the record leave Loom's pointer budget no room)."""
+            w = off // 1024
+            key = ("g", w) + ((id(x),) if own else ())
+            if key not in anp:
+                anp[key] = P(x, "%spb", GAS + 1024 * w + 512)
+            x(f"vst.acc {q1}, {anp[key]}, {off - 1024 * w - 512}")
+
         def qhrow(x, row):
             """IQ3_S: the row's qh word w (4 B at +66 + 4 r) as [s 4][8] bytes w_s (V1; bits picked after the network)."""
             ph_, h0_, h1_, h1s, hw, bc, sp, r1 = (x.t(n) for n in ("ph", "h0", "h1", "h1s", "hw", "hbc", "hsp", "hr"))
@@ -1117,7 +1183,7 @@ def leaf(name="dec", nports=1):
             x(f"{h1s} = lshl {h1_}, {k(16)}")
             x(f"{hw} = or {h0_}, {h1s}")
             x(f"{bc} = vbcst.32 {hw}")
-            x(f"{sp} = vshuffle {bc}, {bc}, {k(35)}")       # 8 x 8 transpose of 16 copies: [s][8 copies] (twice)
+            x(f"{sp} = vshuffle {bc}, {bc}, {km(35)}")       # 8 x 8 transpose of 16 copies: [s][8 copies] (twice)
             x(f"{r1} = slice {sp}[0] : {V2} -> {V1}")
             return r1
 
@@ -1143,19 +1209,19 @@ def leaf(name="dec", nports=1):
             for q in range(4):
                 c_, a_ = x.t("pc"), x.t("za")
                 x(f"{c_} = concat({R[2 * q]}, {R[2 * q + 1]}) : ({V1}, {V1}) -> {V2}")
-                x(f"{a_} = vshuffle {c_}, {c_}, {k(45)}")
+                x(f"{a_} = vshuffle {c_}, {c_}, {km(45)}")
                 A.append(a_)
             B = []
             for i_, j_ in ((0, 1), (2, 3)):
-                for md in (k(16), k(17)):
+                for md in (16, 17):
                     b_ = x.t("zb")
-                    x(f"{b_} = vshuffle {A[i_]}, {A[j_]}, {md}")
+                    x(f"{b_} = vshuffle {A[i_]}, {A[j_]}, {km(md)}")
                     B.append(b_)                         # B0 (kb 0-7, r 0-3), B1 (kb 8-15, r 0-3), B2, B3 (r 4-7)
             O = []
             for i_, j_ in ((0, 2), (1, 3)):
-                for md in (k(14), k(15)):
+                for md in (14, 15):
                     o_ = x.t("zo")
-                    x(f"{o_} = vshuffle {B[i_]}, {B[j_]}, {md}")
+                    x(f"{o_} = vshuffle {B[i_]}, {B[j_]}, {km(md)}")
                     O.append(o_)
             return O
         for hh in range(2):
@@ -1163,9 +1229,10 @@ def leaf(name="dec", nports=1):
                 # IQ2_XS record r: 8 rows' u16 words (k-blocks 2 w, 2 w + 1) transposed; grid index (9 bit, + page << 8:
                 # the 8 KB table crosses a page) and sign field (7 bit, | page << 8) per k-block -> addresses
                 x = e.stream()
+                sx = [x]
                 xa = x.t("xra")
                 x(f"{xa} = add.rr %goq, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %goq, {k(0)}")
-                O = aux_words(x, xa, 0)
+                O = aux_words(x, xa, rmod=anmod(ROWB - 64))
                 cvs = {}
                 for kind, page_ in (("g", "%gtc"), ("s", "%stc")):
                     cw_, cv_ = x.t("cw"), x.t("cv")
@@ -1174,6 +1241,8 @@ def leaf(name="dec", nports=1):
                     cvs[kind] = cv_
                 for a_ in range(2):                             # words 4 a .. 4 a + 3
                     for e_ in range(2):                         # the u16 of k-block 2 w + e
+                        x = e.stream()                          # a stream per field
+                        sx.append(x)
                         for kind, msk, sh0, mx in (("g", 0x1FF, 0, 0), ("s", 0xFE00, 9, 127)):
                             shr = x.t("shl")
                             x(f"{shr} = mov.shift {sh0 + 16 * e_}")
@@ -1182,28 +1251,31 @@ def leaf(name="dec", nports=1):
                                 f_ = band(x, f_, mx)
                             u_ = x.t("su")
                             x(f"{u_} = {'vadd.16' if kind == 'g' else 'vbor'} {f_}, {cvs[kind]}")
-                            for h2, md2 in enumerate((k(18), k(19))):
+                            for h2, md2 in enumerate((18, 19)):
                                 du, ua = x.t("sd"), x.t("sa")
-                                x(f"{du} = vshuffle {u_}, {u_}, {md2}")    # [w 2][row][dup]
+                                x(f"{du} = vshuffle {u_}, {u_}, {km(md2)}")    # [w 2][row][dup]
                                 x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh4")
                                 for q2 in range(2):
                                     q1 = x.t("sg")
                                     kb_ = 2 * (4 * a_ + 2 * h2 + q2) + e_
                                     x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
-                                    pgs = P(x, "%spb", GAS + 2048 * hh + 256 * gpair(kb_) +
-                                            (128 if kind == "s" else 0) + 64 * gpos(kb_))
-                                    x(f"vst.acc {q1}, {pgs}, 0")
-                anq.append(x)
+                                    gst(x, q1, 2048 * hh + 256 * gpair(kb_) + (128 if kind == "s" else 0) +
+                                        64 * gpos(kb_))
+                anq.extend(sx)
                 continue
             if X2:
                 # IQ2_XXS record r: the 4 sub-blocks' index words (even units) and aux words (odd units) of 8 rows,
                 # transposed; index byte l -> (v | page << 8), sign field l -> v + base / 16 [ib 4][row], duplicated
                 # -> addresses
+                x = e.stream()
+                anq.append(x)
+                xa = x.t("xra")
+                x(f"{xa} = add.rr %goq, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %goq, {k(0)}")
+                O2 = aux_words2(x, xa, (4, 5), anmod(ROWB - 64))      # both kinds' words from one walk of the rows
                 for kind, sel_, page_, wd in (("g", 4, "%gtc", 8), ("s", 5, "%sb4", 7)):
                     x = e.stream()
-                    xa = x.t("xra")
-                    x(f"{xa} = add.rr %goq, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %goq, {k(0)}")
-                    O = aux_words(x, xa, 0, sel_)
+                    sx = [x]
+                    O = O2[sel_ - 4]
                     cw_, cv_ = x.t("cw"), x.t("cv")
                     if kind == "s":
                         x(f"{cv_} = vbcst.16 {page_}")
@@ -1211,6 +1283,8 @@ def leaf(name="dec", nports=1):
                         x(f"{cw_} = lshl {page_}, {k(8)}")
                         x(f"{cv_} = vbcst.16 {cw_}")
                     for l in range(4):
+                        x = e.stream()                          # a stream per field
+                        sx.append(x)
                         shr = x.t("shl")
                         x(f"{shr} = mov.shift {wd * l}")
                         f_ = field(x, O[0], O[1], ((1 << wd) - 1) << (wd * l), shr)
@@ -1218,18 +1292,16 @@ def leaf(name="dec", nports=1):
                             f_ = band(x, f_, 0xFF)
                         u_ = x.t("su")
                         x(f"{u_} = {'vadd.16' if kind == 's' else 'vbor'} {f_}, {cv_}")
-                        for h2, md2 in enumerate((k(18), k(19))):
+                        for h2, md2 in enumerate((18, 19)):
                             du, ua = x.t("sd"), x.t("sa")
-                            x(f"{du} = vshuffle {u_}, {u_}, {md2}")    # [ib 2][row][dup]
+                            x(f"{du} = vshuffle {u_}, {u_}, {km(md2)}")    # [ib 2][row][dup]
                             x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh4")
                             for q2 in range(2):
                                 q1 = x.t("sg")
                                 kb_ = 4 * (2 * h2 + q2) + l
                                 x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
-                                pgs = P(x, "%spb", GAS + 2048 * hh + 256 * gpair(kb_) + (128 if kind == "s" else 0) +
-                                        64 * gpos(kb_))
-                                x(f"vst.acc {q1}, {pgs}, 0")
-                    anq.append(x)
+                                gst(x, q1, 2048 * hh + 256 * gpair(kb_) + (128 if kind == "s" else 0) + 64 * gpos(kb_))
+                    anq.extend(sx)
                 continue
             # grid: qs rows (V1) and the qh-bit rows (gathers from the bit table) through the same network, then per
             # group: u16 qs | (page_g + bit) << 8, vups << 4 -> grid addresses
@@ -1246,63 +1318,65 @@ def leaf(name="dec", nports=1):
             if XXS:
                 Os = net16(x, Rq)
                 for g in range(4):
-                    pgg = P(x, "%spb", GAS + 2048 * hh + 512 * g)
-                    for part, md in enumerate((m20, m21)):
+                    for part, md in enumerate((20, 21)):
                         z, ua = x.t("gz"), x.t("gu")
-                        x(f"{z} = vshuffle {Os[g]}, %cgv, {md}")          # qs | page_g << 8
+                        x(f"{z} = vshuffle {Os[g]}, %cgv, {km(md)}")          # qs | page_g << 8
                         x(f"{ua} = vups.2x.x-to-c.unsigned {z}, %sh4")
                         for q2 in range(2):
                             q1 = x.t("ga")
                             kb_ = 4 * g + 2 * part + q2
                             x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
-                            x(f"vst.acc {q1}, {pgg}, {256 * (gpair(kb_) - 2 * g) + 64 * gpos(kb_)}")
+                            gst(x, q1, 2048 * hh + 256 * gpair(kb_) + 64 * gpos(kb_))
                 anq.extend(rq)
                 # signs: the record's 4 aux words per row -> fields f_l = (w >> 7 l) & 127 [ib][row] -> f + base / 16
                 # twice -> sign addresses of kb 4 ib + l
                 x = e.stream()
+                sx = [x]
                 xa = x.t("xra")
                 x(f"{xa} = add.rr %gor, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %gor, {k(0)}")
-                O = aux_words(x, xa, 0)
+                O = aux_words(x, xa, rmod=anmod(ROWB - 64))
                 csv16 = x.t("cv")
                 x(f"{csv16} = vbcst.16 %sb4")
                 for l in range(4):
+                    x = e.stream()                              # a stream per field
+                    sx.append(x)
                     shr = x.t("shl")
                     x(f"{shr} = mov.shift {7 * l}")
                     f_ = field(x, O[0], O[1], 127 << (7 * l), shr)
                     u_ = x.t("su")
                     x(f"{u_} = vadd.16 {f_}, {csv16}")                  # f + base / 16, lanes [ib 4][row]
-                    for h2, md2 in enumerate((k(18), k(19))):
+                    for h2, md2 in enumerate((18, 19)):
                         du, ua = x.t("sd"), x.t("sa")
-                        x(f"{du} = vshuffle {u_}, {u_}, {md2}")        # [ib 2][row][dup]
+                        x(f"{du} = vshuffle {u_}, {u_}, {km(md2)}")        # [ib 2][row][dup]
                         x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh4")
                         for q2 in range(2):
                             q1 = x.t("sg")
                             kb_ = 4 * (2 * h2 + q2) + l
                             x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
-                            pgs = P(x, "%spb", GAS + 2048 * hh + 256 * gpair(kb_) + 128 + 64 * gpos(kb_))
-                            x(f"vst.acc {q1}, {pgs}, 0")
-                anq.append(x)
+                            gst(x, q1, 2048 * hh + 256 * gpair(kb_) + 128 + 64 * gpos(kb_))
+                anq.extend(sx)
                 continue
             Hs = net16(x, Hrows)                                # [kb 4][row][e]: w_g (sub-block g's qh byte)
             Os = net16(x, Rq)
             hmv, one = x.t("hmv"), x.t("one")
             x(f"{hmv} = vlda.512.i8x64 {Pr(x, '%hma')}, 0")      # 1 << (2 kb + e)
             x(f"{one} = vbcst.8 {k(1)}")
-            for g in range(4):
-                pgg = P(x, "%spb", GAS + 2048 * hh + 512 * g)    # pairs 2 g, 2 g + 1 (short-lived: pointer budget)
+            for g in range(4):                                  # a stream per group (the network's tail runs 4 wide)
+                x = e.stream()
+                rq.append(x)
                 hb, h1, hc = x.t("hb"), x.t("h1"), x.t("hc")
                 x(f"{hb} = vband {Hs[g]}, {hmv}")
                 x(f"{h1} = min.u8x64 {hb}, {one}")                # the index's bit 8
                 x(f"{hc} = vadd.8 {h1}, %cgv")
-                for part, md in enumerate((m20, m21)):
+                for part, md in enumerate((20, 21)):
                     z, ua = x.t("gz"), x.t("gu")
-                    x(f"{z} = vshuffle {Os[g]}, {hc}, {md}")
+                    x(f"{z} = vshuffle {Os[g]}, {hc}, {km(md)}")
                     x(f"{ua} = vups.2x.x-to-c.unsigned {z}, %sh4")
                     for q2 in range(2):
                         q1 = x.t("ga")
                         kb_ = 4 * g + 2 * part + q2
                         x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
-                        x(f"vst.acc {q1}, {pgg}, {256 * (gpair(kb_) - 2 * g) + 64 * gpos(kb_)}")
+                        gst(x, q1, 2048 * hh + 256 * gpair(kb_) + 64 * gpos(kb_), own=True)
             anq.extend(rq)
             # signs: [row][16 B] (V2 rows) -> [kb][row] bytes (zips 20, 18, 16 / 17); (page_s << 8 | byte) twice -> GA
             rsg = []
@@ -1316,35 +1390,36 @@ def leaf(name="dec", nports=1):
             C_ = []
             for q in range(4):
                 c_ = x.t("sc")
-                x(f"{c_} = vshuffle {Rs[2 * q]}, {Rs[2 * q + 1]}, {k(20)}")
+                x(f"{c_} = vshuffle {Rs[2 * q]}, {Rs[2 * q + 1]}, {km(20)}")
                 C_.append(c_)
             D_ = []
             for i_, j_ in ((0, 1), (2, 3)):
                 d_ = x.t("sd")
-                x(f"{d_} = vshuffle {C_[i_]}, {C_[j_]}, {k(18)}")
+                x(f"{d_} = vshuffle {C_[i_]}, {C_[j_]}, {km(18)}")
                 D_.append(d_)
             SV = []
-            for md in (k(16), k(17)):
+            for md in (16, 17):
                 sv_ = x.t("sv")
-                x(f"{sv_} = vshuffle {D_[0]}, {D_[1]}, {md}")
+                x(f"{sv_} = vshuffle {D_[0]}, {D_[1]}, {km(md)}")
                 SV.append(sv_)
             for i in range(2):                               # kb 8 i .. 8 i + 7
                 for part in range(2):                        # kb 8 i + 4 part .. + 3
-                    pgs = P(x, "%spb", GAS + 2048 * hh + 256 * (4 * i + 2 * part) + 128)
+                    x = e.stream()
+                    rsg.append(x)
                     sl_, nb_ = x.t("sl"), x.t("snb")
                     x(f"{sl_} = slice {SV[i]}[{part}] : {V2} -> {V1}")
                     x(f"{nb_} = vunpack.u4.to.u8x64 {sl_}")   # [kb 4][row][nibble]: even lanes values 0-3, odd 4-7
                     nbo = x.t("snb")
                     x(f"{nbo} = vbor {nb_}, %csl")
-                    for h2, md2 in enumerate((m20, m21)):
+                    for h2, md2 in enumerate((20, 21)):
                         du, ua = x.t("sd"), x.t("sa")
-                        x(f"{du} = vshuffle {nbo}, %csv, {md2}")   # (base >> 4) + nibble, [kb 2][row][nibble]
+                        x(f"{du} = vshuffle {nbo}, %csv, {km(md2)}")   # (base >> 4) + nibble, [kb 2][row][nibble]
                         x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh4")
                         for q2 in range(2):
                             q1 = x.t("sg")
                             kb_ = 8 * i + 4 * part + 2 * h2 + q2
                             x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
-                            x(f"vst.acc {q1}, {pgs}, {256 * (gpair(kb_) - 4 * i - 2 * part) + 64 * gpos(kb_)}")
+                            gst(x, q1, 2048 * hh + 256 * gpair(kb_) + 128 + 64 * gpos(kb_), own=True)
             anq.extend(rsg)
         run(anq, int(os.environ.get("DQ_QWIN", "6")), hv=22)       # (Loom's vec256 overflows at hv 24)
     elif Q3K:
