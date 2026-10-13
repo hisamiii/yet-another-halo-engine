@@ -15,6 +15,7 @@ namespace yah::core {
 namespace {
 
 constexpr std::uint32_t kGgufMagic = 0x46554747U;  // "GGUF"
+constexpr std::uint32_t kHfqMagic = 0x4D514648U;   // "HFQM"
 
 struct TypeTraits {
   const char* name;
@@ -129,16 +130,24 @@ MetadataValue ReadValue(Cursor& c, std::uint32_t kind) {
   return v;
 }
 
+bool IsHfq(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  std::uint32_t magic = 0;
+  const bool hfq = fd >= 0 && ::pread(fd, &magic, 4, 0) == 4 && magic == kHfqMagic;
+  if (fd >= 0) ::close(fd);
+  return hfq;
+}
+
 }  // namespace
 
 const char* TypeName(GgmlType type) {
-  return kTraits[static_cast<std::size_t>(type)].name;
+  return type == GgmlType::kMQ4G256 ? "MQ4G256" : kTraits[static_cast<std::size_t>(type)].name;
 }
 std::uint32_t BlockElements(GgmlType type) {
-  return kTraits[static_cast<std::size_t>(type)].elements;
+  return type == GgmlType::kMQ4G256 ? 256 : kTraits[static_cast<std::size_t>(type)].elements;
 }
 std::uint32_t BlockBytes(GgmlType type) {
-  return kTraits[static_cast<std::size_t>(type)].bytes;
+  return type == GgmlType::kMQ4G256 ? 136 : kTraits[static_cast<std::size_t>(type)].bytes;
 }
 
 Gguf::Gguf(Gguf&& other) noexcept {
@@ -181,6 +190,7 @@ void Gguf::Close() {
 }
 
 Gguf Gguf::Open(const std::string& path) {
+  if (IsHfq(path)) return OpenHfq(path, false);
   Gguf g;
   g.fd_ = ::open(path.c_str(), O_RDONLY);
   if (g.fd_ < 0) throw std::runtime_error("gguf: cannot open " + path);
@@ -273,10 +283,8 @@ const MetadataValue* Gguf::Meta(const std::string& key) const {
   return it == meta_.end() ? nullptr : &it->second;
 }
 
-Gguf Gguf::OpenResident(const std::string& path) {
-  Gguf g = Open(path);
+std::uint8_t* Gguf::Reserve(std::size_t bytes, const std::string& path) {
   constexpr std::size_t kHuge = std::size_t{2} << 20;
-  const std::size_t bytes = (g.size_ + kHuge - 1) & ~(kHuge - 1);
   void* raw = ::mmap(nullptr, bytes + kHuge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (raw == MAP_FAILED) throw std::runtime_error("gguf: cannot reserve memory for " + path);
   // 2 MB aligned, so whole huge pages map it
@@ -286,14 +294,29 @@ Gguf Gguf::OpenResident(const std::string& path) {
   if (r + kHuge > a) ::munmap(reinterpret_cast<void*>(a + bytes), r + kHuge - a);
   auto* p = reinterpret_cast<std::uint8_t*>(a);
   ::madvise(p, bytes, MADV_HUGEPAGE);
-  for (std::size_t off = 0; off < g.size_;) {
-    const ssize_t n = ::pread(g.fd_, p + off, std::min<std::size_t>(g.size_ - off, std::size_t{1} << 30),
-                              static_cast<off_t>(off));
-    if (n <= 0) {
-      ::munmap(p, bytes);
-      throw std::runtime_error("gguf: read failed: " + path);
-    }
+  return p;
+}
+
+void Gguf::ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) const {
+  for (std::size_t off = 0; off < size;) {
+    const ssize_t n =
+        ::pread(fd_, p + off, std::min<std::size_t>(size - off, std::size_t{1} << 30), static_cast<off_t>(off));
+    if (n <= 0) throw std::runtime_error("gguf: read failed: " + path);
     off += static_cast<std::size_t>(n);
+  }
+}
+
+Gguf Gguf::OpenResident(const std::string& path) {
+  if (IsHfq(path)) return OpenHfq(path, true);
+  Gguf g = Open(path);
+  constexpr std::size_t kHuge = std::size_t{2} << 20;
+  const std::size_t bytes = (g.size_ + kHuge - 1) & ~(kHuge - 1);
+  std::uint8_t* p = Reserve(bytes, path);
+  try {
+    g.ReadAll(p, g.size_, path);
+  } catch (...) {
+    ::munmap(p, bytes);
+    throw;
   }
   if (::mlock(p, bytes) != 0) std::fprintf(stderr, "gguf: cannot lock the model in memory (RLIMIT_MEMLOCK)\n");
   ::munmap(g.base_, g.map_bytes_);

@@ -7,12 +7,14 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# core: GGUF reader, mmap, tensor table, tokenizer. No GPU or NPU dependency.
+# core: GGUF and HFQ readers, mmap, tensor table, tokenizer. No GPU or NPU dependency.
 find_package(ICU COMPONENTS uc REQUIRED)
 
-add_library(yah_core STATIC core/gguf.cpp core/config.cpp core/tokenizer.cpp model/weights.cpp)
+find_package(Threads REQUIRED)
+add_library(yah_core STATIC core/gguf.cpp core/hfq.cpp core/config.cpp core/tokenizer.cpp model/weights.cpp)
 target_include_directories(yah_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(yah_core PUBLIC ICU::uc)
+target_include_directories(yah_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_link_libraries(yah_core PUBLIC ICU::uc Threads::Threads)
 target_compile_options(yah_core PRIVATE -Wall -Wextra -Wpedantic)
 
 # yah-dump: print the tensor table and a per-type byte tally. The first

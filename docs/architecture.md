@@ -23,6 +23,21 @@ Qwen3.8-27B is a hybrid: every 4th layer is full (softmax) attention, the others
 
 The weights are the GGUF read into locked anonymous memory (`Gguf::OpenResident`: 2 MB pages where the kernel has them, the file mapping dropped), imported once into HRX as one device-visible buffer. Every tensor is an offset into that import. There is no second copy and no repacking. The NPU pins its raw rows of the same pages. A mapped file does not work: reclaim and compaction scan its page-cache folios (large folios escape mlock), and every scan of a GPU-imported page evicts all of the process's GPU queues (hardware.md).
 
+### HFQ model (W4 engine, in progress)
+
+The engine is moving to hipfire's `qwen3.8-27b.mq4-xts` (HFQ container, 13.96 GiB): every linear layer, the output head included, is MQ4G256 (symmetric int4, one f16 scale per 128 weights, 136 B per 256), the token embedding is Q8_0, the rest f16. Each 256-wide group of every weight row is stored in a rotated basis (random signs, 256-point Walsh-Hadamard, random signs), so every GEMM input must get the same rotation. Each projection also carries an AWQ activation scale (`blk.N.<weight>.awq`, f32): the input is divided by it before the rotation.
+
+`Gguf::Open` and `Gguf::OpenResident` detect the container by its magic (`engine/core/hfq.cpp`) and present it as the GGUF the engine reads: GGUF tensor names and dims, GGUF metadata keys for the config and the tokenizer (tokenizer goldens pass), no MTP layer. The file is read into resident memory as above and changed in place at load (about 4 s):
+
+| tensor | change at load |
+|---|---|
+| MQ4G256 weights | nibbles xor 8: signed codes, weight = nibble x scale (the stored zero is always -8 x scale) |
+| DeltaNet value heads | GGUF order (value head i uses key head i mod 16; HF groups them by key head): rows of `attn_qkv` (v part), `attn_gate`, `ssm_alpha`, `ssm_beta`, channels of `ssm_conv1d`, `ssm_a`, `ssm_dt` |
+| norms | f32, 1 + w as GGUF stores them (DeltaNet `ssm_norm` as is) |
+| `ssm_a`, `ssm_dt`, `ssm_conv1d`, AWQ scales | f32 (`ssm_a` = -exp(A_log)), placed after the file's bytes in the same import |
+
+`ssm_out` keeps the HF value-head order on its input axis: a head permutation does not commute with the rotation, so its input must be written in HF head order. The values of all converted tensors match the IQ4_XS GGUF bit for bit, except `ssm_conv1d`, which this file stores as Q8_0.
+
 ## Prefill
 
 `engine/model/loom_prefill.hpp` (`LoomPrefill`) runs a prompt through all 64 layers as one batch of B tokens (B = 2048 by default); `loom_forward_pp` is its command-line driver. Every kernel has the token count in its grid, so there is no per-tile loop. All activations are token-major (`[token][row]`). The residual stream is f32; GEMM inputs are f16.

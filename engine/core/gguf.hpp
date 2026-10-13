@@ -40,6 +40,9 @@ enum class GgmlType : std::uint32_t {
   kF64 = 28,
   kIQ1_M = 29,
   kBF16 = 30,
+  // Not a GGML type: hipfire MQ4G256V2 (HFQ qt 44), 136 B per 256: f16 scale per 128 (4 B pairs), 128 B nibbles.
+  // The HFQ loader stores the nibbles as signed codes (code - 8), so a weight is nibble * scale.
+  kMQ4G256 = 44,
 };
 
 [[nodiscard]] const char* TypeName(GgmlType type);
@@ -67,6 +70,7 @@ struct MetadataValue {
 };
 
 // A read-only, mmapped GGUF file. Weight bytes are not copied: Data() points into the mapping.
+// An HFQ container (hipfire, core/hfq.cpp) opens as the GGUF the engine reads: GGUF names, dims and metadata.
 class Gguf {
  public:
   static Gguf Open(const std::string& path);
@@ -100,6 +104,10 @@ class Gguf {
  private:
   Gguf() = default;
   void Close();
+  static Gguf OpenHfq(const std::string& path, bool lock);
+  // 2 MB aligned anonymous memory of at least `bytes` (a multiple of 2 MB) for a resident copy.
+  static std::uint8_t* Reserve(std::size_t bytes, const std::string& path);
+  void ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) const;
 
   std::uint8_t* base_{nullptr};
   std::size_t size_{0};
