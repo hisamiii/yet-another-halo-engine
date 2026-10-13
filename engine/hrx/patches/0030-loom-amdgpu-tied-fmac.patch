@@ -1,0 +1,136 @@
+Loom AMDGPU: lower f32 fma (scalar.fmaf and vector.fmaf) to the tied VOP2 v_fmac_f32 when the addend dies at the fma,
+so the VOPD planner can pair it (v_dual_fmac_f32). Same single rounding as v_fma_f32 (bit-identical results). A splat
+addend keeps the VOP3 form: its lanes are copies of one scalar that the allocator may place in one register, which the
+tied form would overwrite for the remaining lanes (kv8 decode attention's dequant). The yah iu4 GEMM fold
+(acc = fma(f32(c), scale, acc)) goes from 64 VOP3 fma to 34 dual + 3 single fmac per phase: 31 fewer VALU issue slots,
+pp2048 GEMM cycles -0.5%.
+--- a/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py
++++ b/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py
+@@ -129,6 +129,7 @@ _DESCRIPTOR_KEYS = (
+     "amdgpu.v_mul_f16",
+     "amdgpu.v_fma_f32",
+     "amdgpu.v_fmaak_f32",
++    "amdgpu.v_fmac_f32",
+     "amdgpu.v_fmamk_f32",
+     "amdgpu.v_pk_add_f32",
+     "amdgpu.v_pk_mul_f32",
+@@ -3016,6 +3017,7 @@ def _f32_fma_rule(
+     b_register_class: str,
+     c_register_class: str,
+     materialize_c: bool,
++    extra_guards: tuple[Guard, ...] = (),
+ ) -> DescriptorRule:
+     descriptor = _descriptor("amdgpu.v_fma_f32")
+     materializer_guards: tuple[Guard, ...] = ()
+@@ -3038,6 +3040,7 @@ def _f32_fma_rule(
+             _register_class("b", b_register_class),
+             _register_class("c", c_register_class),
+             *materializer_guards,
++            *extra_guards,
+             Guard.descriptor_available(descriptor),
+         ),
+         emit=(
+@@ -3055,6 +3058,42 @@ def _f32_fma_rule(
+     )
+ 
+ 
++def _f32_fmac_rule(
++    source_op: Op,
++    type_pattern: TypePattern,
++    *,
++    src0_field: str,
++    src0_register_class: str,
++    vsrc1_field: str,
++) -> DescriptorRule:
++    """Tied-accumulator VOP2 form when the addend dies here (VOPD-pairable)."""
++    descriptor = _descriptor("amdgpu.v_fmac_f32")
++    return DescriptorRule(
++        source_op=source_op,
++        descriptor=descriptor,
++        guards=(
++            *_typed_guards(("a", "b", "c", "result"), type_pattern),
++            _register_class(src0_field, src0_register_class),
++            _register_class(vsrc1_field, "amdgpu.vgpr"),
++            _register_class("c", "amdgpu.vgpr"),
++            Guard.value_no_uses_after("c"),
++            Guard.descriptor_available(descriptor),
++        ),
++        emit=(
++            EmitDescriptorOp(
++                descriptor=descriptor,
++                operands={
++                    "acc": ValueRef.operand("c"),
++                    "a": ValueRef.operand(src0_field),
++                    "b": ValueRef.operand(vsrc1_field),
++                },
++                results={"dst": ValueRef.result("result")},
++                form=_emit_form(type_pattern),
++            ),
++        ),
++    )
++
++
+ def _f32_fmaak_literal_rule(
+     source_op: Op,
+     type_pattern: TypePattern,
+@@ -3142,6 +3181,8 @@ def _f32_fmamk_literal_rule(
+ def _f32_fma_rules(
+     source_op: Op,
+     type_pattern: TypePattern,
++    *,
++    tied: bool = False,
+ ) -> tuple[DescriptorRule, ...]:
+     rules: list[DescriptorRule] = []
+     register_classes = ("amdgpu.sgpr", "amdgpu.vgpr")
+@@ -3171,6 +3212,33 @@ def _f32_fma_rules(
+                 multiply_register_class=register_class,
+             )
+         )
++    if tied:
++        # A splat addend's lanes are copies of one scalar that may share one register: the tied form would overwrite it
++        # for the remaining lanes, so splat addends keep the VOP3 form (matched first).
++        for a_register_class in register_classes:
++            for b_register_class in register_classes:
++                rules.append(
++                    _f32_fma_rule(
++                        source_op,
++                        type_pattern,
++                        a_register_class=a_register_class,
++                        b_register_class=b_register_class,
++                        c_register_class="amdgpu.vgpr",
++                        materialize_c=False,
++                        extra_guards=(Guard.exact_uniform_element_origin_type("c", _F32),),
++                    )
++                )
++        for src0_field, vsrc1_field in (("a", "b"), ("b", "a")):
++            for src0_register_class in register_classes:
++                rules.append(
++                    _f32_fmac_rule(
++                        source_op,
++                        type_pattern,
++                        src0_field=src0_field,
++                        src0_register_class=src0_register_class,
++                        vsrc1_field=vsrc1_field,
++                    )
++                )
+     for a_register_class in register_classes:
+         for b_register_class in register_classes:
+             for c_register_class in register_classes:
+@@ -3905,7 +3973,7 @@ def _rules() -> tuple[ContractCase, ...]:
+             *_vector_integer_conversion_recipe_rules(),
+             *_vector_16bit_float_conversion_recipe_rules(),
+             _vector_transform_recipe_rule(),
+-            *_f32_fma_rules(vector.vector_fmaf, _VEC_F32_STATIC),
++            *_f32_fma_rules(vector.vector_fmaf, _VEC_F32_STATIC, tied=True),
+             _unary_rule(vector.vector_exp2f, _VEC_F32_STATIC, "amdgpu.v_exp_f32"),
+             _unary_rule(vector.vector_log2f, _VEC_F32_STATIC, "amdgpu.v_log_f32"),
+             _unary_rule(vector.vector_sinturnsf, _VEC_F32_STATIC, "amdgpu.v_sin_f32"),
+@@ -4175,7 +4243,7 @@ def _rules() -> tuple[ContractCase, ...]:
+             _divf_arcp_literal_lhs_rule(scalar_arithmetic.scalar_divf, _F32),
+             _divf_arcp_rule(scalar_arithmetic.scalar_divf, _F32),
+             _divf_exact_rule(scalar_arithmetic.scalar_divf, _F32),
+-            *_f32_fma_rules(scalar_math.scalar_fmaf, _F32),
++            *_f32_fma_rules(scalar_math.scalar_fmaf, _F32, tied=True),
+             _unary_rule(scalar_math.scalar_exp2f, _F32, "amdgpu.v_exp_f32"),
+             _unary_rule(scalar_math.scalar_log2f, _F32, "amdgpu.v_log_f32"),
+             _unary_rule(scalar_math.scalar_sinturnsf, _F32, "amdgpu.v_sin_f32"),

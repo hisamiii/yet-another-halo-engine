@@ -32,6 +32,7 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0017-loom-xdna-gated-call-invocations` | gated plans that are not streamed (one replay group: the NPU GEMM with final outputs) publish [call \| gate \| done] as separate invocations, so a job of calls runs as [gate][call]...[call][done] with one gate; existing images byte-identical |
 | `0028-loom-xdna-deferred-conflicting-rodata` | Loom AIE2P: read-only data with bank conflicts that would share a bank with a placed peer is placed after the channel rings, in a bank without one (the grid decoders' grid and sign tables; placed at once, the table left an activation ring no room) |
 | `0029-loom-xdna-top-aligned-programs` | Loom AIE2P: every core program ends at the top of program memory behind a 16-byte startup jump at address 0, so images that share a code tail (the GEMM loop after a format's decoder) hold it at the same addresses and an image switch rewrites less program memory |
+| `0030-loom-amdgpu-tied-fmac` | Loom AMDGPU: an f32 fma whose addend dies there becomes the tied `v_fmac_f32`, which VOPD pairs (`v_dual_fmac_f32`); bit-identical. A splat addend keeps the VOP3 form (its lanes may share one register). The iu4 GEMM fold: 31 fewer VALU issue slots per phase |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
