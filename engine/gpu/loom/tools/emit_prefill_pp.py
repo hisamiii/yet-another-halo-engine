@@ -23,6 +23,7 @@ import gen_half_norm  # noqa: E402
 import gen_decode_misc  # noqa: E402
 import gen_gemv  # noqa: E402
 import gen_rot  # noqa: E402
+import gen_gemm_iu4  # noqa: E402
 import gen_kvq  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
 
@@ -1286,6 +1287,26 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     return (out, tile, rowgrp, tt)
 
 
+def iu4_gemm(kind, mt, kb, B, outdir):
+    """Emit the A4 GEMM (tools/gen_gemm_iu4.py) of an MQ4 tensor; return its dispatch.txt row."""
+    bm, bn, _, _ = gen_gemm_iu4.tile(mt * 16)
+    if B % bn or (mt * 16) % bm:
+        raise SystemExit("iu4 GEMM %s: %d rows / %d tokens do not tile" % (kind, mt * 16, B))
+    tt = B // bn
+    sym = gen_gemm_iu4.sym(kind)
+    out = "iu4_%s_%d_%d.hal" % (kind, mt, kb)
+    tmp = os.path.join(outdir, ".emit_tmp")
+    os.makedirs(tmp, exist_ok=True)
+    src = os.path.join(tmp, out[:-4] + ".loom")
+    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, kind == "kstore" and mt in O16_MT))
+    gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, "mq4", kind, str(mt), str(kb),
+                           str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP], capture_output=True, text=True)
+    if gate.returncode != 0:
+        raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
+    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)], out, outdir)
+    return (out, bn, bm // 16, tt)
+
+
 def gemm_combos(rows):
     """{(kind, fmt, port, m_tiles, k_blocks): [tensor names]} of the model's GEMM tensors; kind is kstore, residual or
     swiglu. rows: emit_prefill.parse(model)."""
@@ -1335,6 +1356,10 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     rows = E.parse(model)
     combos = gemm_combos(rows)
+    types = {nm: ty for nm, _, ty in rows}
+    # MQ4 (HFQ) models: A4 prefill (int4 activations, iu4 GEMMs) unless YAH_A16=1 (W4A16: f16 activations, the quality mode)
+    rot = types.get("blk.0.ffn_down.weight") == 44
+    a4 = rot and os.environ.get("YAH_A16") != "1"
 
     n = 0
     df_done = set()
@@ -1347,6 +1372,12 @@ def main():
         # A residual projection gets a kstore and the fused-residual kres; the attention q projection (12288 rows =
         # 24 heads x [q | gate]) also gets kqg, which stores q and gate unpacked. The driver prefers kres and kqg.
         kinds = gemm_kinds(kind, mt)
+        if a4 and fmt == "mq4":
+            for k in kinds:
+                if k != "kstore" or kind != "residual":
+                    geom.append(iu4_gemm(k, mt, kb, B, outdir))
+            n += 1
+            continue
         for k in kinds:
             r = gemm(fmt, mt, kb, B, name(k), outdir, kind=k)
             if r:
@@ -1589,22 +1620,33 @@ def main():
     # The chunk's token_embd rows from its token ids on the GPU (gen_decode_misc.gen_embed_iq4xs, one workgroup per row),
     # so the host stages ids and never waits between chunks.
     embed_src = os.path.join(tmp, "yah_embed.loom")
-    types = {nm: ty for nm, _, ty in rows}
     q8_embed = types["token_embd.weight"] == 8   # HFQ models
     open(embed_src, "w").write(gen_decode_misc.gen_embed_q8_0(rows=B) if q8_embed else gen_decode_misc.gen_embed_iq4xs(rows=B))
     geom.append(("embed.hal", 1, 5120 // 16, B))   # one token per workgroup
     # MQ4 GEMMs read their input in the weights' rotated basis (gen_rot): the driver rotates each GEMM input site in place,
-    # the DeltaNet postnorm's out of place (dst in HF head order); the head's f32 norm row without awq
-    rot = types.get("blk.0.ffn_down.weight") == 44
+    # the DeltaNet postnorm's out of place (dst in HF head order); the head's f32 norm row without awq.
+    # A4 sets rotate and quantize instead (rotq_*: int4 activations with one scale per 128 values, the iu4 GEMM's K phase;
+    # rows "<hal> 0 <lanes> <workgroups>"). Per-token scales for the norm-fed sites and 512-value spans for the others cost
+    # WT2 KL 0.064 vs 0.051 (2 chunks; p99.9 2.08 vs 1.01).
     rot_src = {}
     if rot:
-        for name, args in (("rot_5120.hal", (5120, B)), ("rot_6144.hal", (6144, B)), ("rot_17408.hal", (17408, B)),
-                           ("rot_heads.hal", (6144, B, True, (48, 16, 128))), ("rot_head.hal", (5120, 1, False, None, "f32"))):
+        rots = [("rot_head.hal", (5120, 1, False, None, "f32"))]
+        if not a4:
+            rots += [("rot_5120.hal", (5120, B)), ("rot_6144.hal", (6144, B)), ("rot_17408.hal", (17408, B)),
+                     ("rot_heads.hal", (6144, B, True, (48, 16, 128)))]
+        for name, args in rots:
             rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
             open(rot_src[name], "w").write(gen_rot.gen(*args))
+        for name, (k, heads) in (("rotq_5120.hal", (5120, None)), ("rotq_6144.hal", (6144, None)),
+                                 ("rotq_17408.hal", (17408, None)), ("rotq_heads.hal", (6144, (48, 16, 128)))) if a4 else ():
+            rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
+            open(rot_src[name], "w").write(gen_rot.gen_q(k, B, gen_gemm_iu4.KP, True, heads))
+            geom.append((name, 0, 64, k // 1024))
         with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
             fh.write(gen_rot.signs())
         geom.append(("rot", 0, 0, 0))
+        if a4:
+            geom.append(("a4", 0, 0, 0))
     # the output head: the tile-free GEMV (gen_gemv) for MQ4, rows per workgroup / lanes / workgroups in its row
     head_src = None
     if types["output.weight"] == 44:

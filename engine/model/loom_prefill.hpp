@@ -586,7 +586,7 @@ class LoomPrefill {
   // depends only on its own input row, so the kept row is the same; the other rows are left unwritten. The
   // fragment-major layout groups 16 rows per tile row, so a tile start (a multiple of 16) has the same byte offset.
   // Returns the token tiles to launch.
-  std::uint32_t Trim(std::vector<hrx_buffer_ref_t>& b, std::size_t first, std::initializer_list<std::size_t> row_bytes,
+  std::uint32_t Trim(std::vector<hrx_buffer_ref_t>& b, std::size_t first, const std::vector<std::size_t>& row_bytes,
                      const Geom& g) const {
     if (trim_row_ < 0) return TokenTiles(g);
     const std::size_t t0 = static_cast<std::size_t>(trim_row_) / g.tokens * g.tokens;
@@ -650,6 +650,7 @@ class LoomPrefill {
     grid_iq2xs_ = &table("grid_iq2xs.bin", 1024 * 4);
     ksigns_ = &table("ksigns_iq2xxs.bin", 128);
     rot_ = geom_.count("rot") != 0;
+    a4_ = geom_.count("a4") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
@@ -661,7 +662,8 @@ class LoomPrefill {
     reszero_ = &Alloc(B * kHidden * 4);
     sumout_ = &Alloc(B * kHidden * 4);
     scratch_ = &Alloc(B * kFfn * 2);
-    if (rot_) rotbuf_ = &Alloc(B * kInner * 2);
+    if (rot_ && !a4_) rotbuf_ = &Alloc(B * kInner * 2);
+    if (a4_) aq_ = &Alloc(B * kFfn / 2), ad_ = &Alloc(B * (kFfn / 128) * 4);
     qkv_ = &Alloc(B * kQProj * 4);
     gate_ = &Alloc(B * kInner * 4);
     alpha_ = &Alloc(B * kTs * 4);
@@ -1225,7 +1227,10 @@ class LoomPrefill {
       const char* w = wname.find("post_attention_norm") != std::string::npos   ? "ffn_gate"
                       : cfg_.IsFullAttention(std::stoul(wname.substr(4))) ? "attn_q"
                                                                           : "attn_qkv";
-      Rotate(*scratch_, nullptr, kHidden, pre + w + ".awq");
+      if (a4_)
+        RotQ(*scratch_, kHidden, pre + w + ".awq", false);
+      else
+        Rotate(*scratch_, nullptr, kHidden, pre + w + ".awq");
     }
   }
   // MQ4 sets: x (B_ rows of k f16) into the weights' basis (gen_rot): in place, or dst != nullptr (k = kInner, ssm_out):
@@ -1235,6 +1240,30 @@ class LoomPrefill {
     if (dst) b.push_back(Ref(*dst));
     Dispatch(Exe(dst ? std::string("rot_heads.hal") : "rot_" + std::to_string(k) + ".hal"), "yah_rot256", k / 1024, B_,
              1, 64, 1, 1, b);
+  }
+  // A4 sets: x (B_ rows of k f16) rotated and quantized into aq_ / ad_ (gen_rot.gen_q, one scale per 128 values);
+  // heads: ssm_out's value heads from GGUF into HF order.
+  void RotQ(const LoomBuffer& x, std::uint32_t k, const std::string& awq, bool heads) {
+    const std::string hal = heads ? std::string("rotq_heads.hal") : "rotq_" + std::to_string(k) + ".hal";
+    const Geom& g = geom_.at(hal);
+    Dispatch(Exe(hal), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1,
+             {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b11000);
+  }
+  // A4 sets: the iu4 GEMM (gen_gemm_iu4) of kind on t over aq_ / ad_; io: the kind's bindings after them (outputs at
+  // the bits of writes), row_bytes: their bytes per token.
+  void RunIu4(const char* kind, const core::TensorInfo& t, std::initializer_list<const LoomBuffer*> io,
+              std::initializer_list<std::size_t> row_bytes, std::uint64_t writes) {
+    const std::size_t K = t.dims[0];
+    const std::string hal = std::string("iu4_") + kind + "_" + std::to_string(MTiles(t)) + "_" + std::to_string(K / 256) + ".hal";
+    const Geom g = GeomOf(hal);
+    std::vector<hrx_buffer_ref_t> b = {TRef(t), Ref(*aq_), Ref(*ad_)};
+    for (const LoomBuffer* x : io) b.push_back(Ref(*x));
+    const bool kres = std::strcmp(kind, "kres") == 0;
+    std::vector<std::size_t> rb = {K / 2, K / 128 * 4};
+    rb.insert(rb.end(), row_bytes);
+    const std::uint32_t tt = Trim(b, 1, rb, g);
+    const char* sfx = kres ? "_kres" : std::strcmp(kind, "swiglu") == 0 ? "_swiglu" : std::strcmp(kind, "kqg") == 0 ? "_kqg" : "";
+    Dispatch(Exe(hal), (std::string("yah_iu4_gemm") + sfx).c_str(), MTiles(t) / g.rowgrp, tt, 1, 32, 1, 1, b, writes);
   }
   // Debug (YAH_DUMP_ACT=<prefix>, YAH_DUMP_LAYERS=l0,l1,..): the row-major f16 output of each RMSNorm that feeds a GEMM
   // in those layers (n_ rows x 5120) to <prefix>_<norm weight name>.f16, from an extra norm.hal pass into its own buffer.
@@ -1701,6 +1730,7 @@ class LoomPrefill {
   // af: the afrag form, input normt_ (fragment-major)
   void RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false) {
     const auto* t = Find(wname);
+    if (a4_) return RunIu4("kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000);
     Fmt f{};
     const std::string base = GemmHal("gemm_kstore", *t, &f);
     const std::string df = af ? "" : DfGemm("kstore", *t, f);
@@ -1722,6 +1752,10 @@ class LoomPrefill {
   // af: the afrag form, input normt_ (fragment-major)
   bool RunKqg(const std::string& wname, bool af = false) {
     const auto* t = Find(wname);
+    if (a4_) {
+      RunIu4("kqg", *t, {q_, gate_}, {std::size_t(t->dims[1]) * 2, std::size_t(t->dims[1]) * 2}, 0b11000);
+      return true;
+    }
     Fmt f{};
     if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) return false;
     std::string hal = GemmHal("gemm_kqg", *t, &f);
@@ -1742,6 +1776,7 @@ class LoomPrefill {
   // af: the afrag form, input normt_; tout: its output fragment-major (for an afrag down projection)
   void RunSwiglu(const std::string& wname, bool af = false, bool tout = false) {
     const auto* t = Find(wname);
+    if (a4_) return RunIu4("swiglu", *t, {gateffn_, ffnup_}, {std::size_t(t->dims[1]) * 4, std::size_t(t->dims[1]) * 2}, 0b10000);
     Fmt f{};
     const std::string base = GemmHal("gemm_swiglu", *t, &f);
     const std::string df = af ? "" : DfGemm("swiglu", *t, f);
@@ -1766,7 +1801,14 @@ class LoomPrefill {
   void RunResidual(const std::string& wname, const LoomBuffer& in, bool af = false) {
     const auto* t = Find(wname);
     const bool heads = rot_ && wname.find("ssm_out") != std::string::npos;
-    if (rot_) Rotate(in, heads ? rotbuf_ : nullptr, static_cast<std::uint32_t>(t->dims[0]), wname.substr(0, wname.size() - 6) + "awq");
+    const std::string awq = wname.substr(0, wname.size() - 6) + "awq";
+    if (a4_) {
+      RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads);
+      RunIu4("kres", *t, {hidden_, hidden2_}, {std::size_t(t->dims[1]) * 4, std::size_t(t->dims[1]) * 4}, 0b10000);
+      std::swap(hidden_, hidden2_);
+      return;
+    }
+    if (rot_) Rotate(in, heads ? rotbuf_ : nullptr, static_cast<std::uint32_t>(t->dims[0]), awq);
     const LoomBuffer& input = heads ? *rotbuf_ : in;
     Fmt f{};
     const std::string fused0 = GemmHal("gemm_kres", *t, &f);
@@ -2527,6 +2569,9 @@ class LoomPrefill {
   // MQ4 sets ("rot"): the rotation signs (gen_rot.signs) and ssm_out's input in HF head order
   bool rot_ = false;
   LoomBuffer *rot_signs_ = nullptr, *rotbuf_ = nullptr;
+  // A4 sets (dispatch.txt "a4"): int4 activations (B_ x kFfn / 2 bytes) and their scales (one per 128) for the iu4 GEMMs
+  bool a4_ = false;
+  LoomBuffer *aq_ = nullptr, *ad_ = nullptr;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
