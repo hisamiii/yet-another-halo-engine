@@ -40,7 +40,7 @@ TRACE = None   # set to [] to record (cycle, stream, op) of the next schedule() 
 
 
 def model():
-    """mnemonic -> (slot, result ready stage, [read stage per operand in asm order])."""
+    """mnemonic -> (slot, (ready stage per result in asm order), [read stage per operand in asm order])."""
     global _MODEL
     if _MODEL is None:
         from loom.target.arch.amd.xdna.aie2p.core_descriptors import AIE2P_CORE_DESCRIPTOR_SET as S
@@ -54,7 +54,7 @@ def model():
             parts = sc.split(".")
             slot = parts[5] if len(parts) > 5 else "none"
             ops = {o.field_name: o for o in d.operands}
-            ready = max([o.ready_stage for o in d.operands if o.role.name == "RESULT"] or [1])
+            ready = tuple(o.ready_stage for o in d.operands if o.role.name == "RESULT") or (1,)
             reads = [ops[n].read_stage if n in ops else 1 for n in f.operands]
             m[f.mnemonic] = (slot, ready, reads)
         # LS_LAT="mnemonic=ready,...": override result-ready stages (latency experiments)
@@ -63,7 +63,7 @@ def model():
             k_, v_ = item.split("=")
             for mn in list(m):
                 if mn == k_ or mn.startswith(k_ + "*") or (k_.endswith("*") and mn.startswith(k_[:-1])):
-                    m[mn] = (m[mn][0], int(v_), m[mn][2])
+                    m[mn] = (m[mn][0], (int(v_),) + m[mn][1][1:], m[mn][2])
         _MODEL = m
     return _MODEL
 
@@ -73,20 +73,19 @@ FREE = ("concat", "slice", "copy", "low.schedule", "return")
 VEC = {"vldb.unpack": 2, "vlda.512": 2, "vldb.512": 2, "vshuffle": 2, "vbcst": 2, "vbroadcast": 2, "vadd.16": 2,
        "vsub.16": 2, "vband": 2, "vbor": 2, "vmov.512": 2, "vlda.256": 1, "vldb.256": 1, "vconv.bf16": 2, "max.u16": 2,
        "vunpack": 2}
-if os.environ.get("LS_UNITS2", "0") == "1":       # ops the table missed (0 units); off: measured worse (hot 361 -> 411)
-    VEC.update({"vshift": 2, "vadd.8": 2, "vadd.32": 2, "vldb.4x": 1})
 ACC = {"vlda.acc": 1, "mma.": 4, "mmul.": 4, "vadd.f32x64": 4, "vconv.fp32": 2}
-if os.environ.get("LS_UNITS2", "0") == "1":
-    ACC.update({"vups.4x": 2, "vadd.acc.integer": 4})
+# ops the tables miss (full=True adds them; measured worse on the plain decoders' main loops, hot 361 -> 411)
+VEC_FULL = dict(VEC, **{"vshift": 2, "vadd.8": 2, "vadd.32": 2, "vldb.4x": 1})
+ACC_FULL = dict(ACC, **{"vups.4x": 2, "vadd.acc.integer": 4})
 
 
-def units(mn, rhs):
+def units(mn, rhs, full=False):
     if mn in ("padda", "padda.modifier", "paddb", "padds", "mov.scalar-to-address") or (mn == "copy" and "-> reg<aie2p.ep>" in rhs):
         return ("p", 1)
-    for k, v in VEC.items():
+    for k, v in (VEC_FULL if full else VEC).items():
         if mn.startswith(k):
             return ("v", v)
-    for k, v in ACC.items():
+    for k, v in (ACC_FULL if full else ACC).items():
         if mn.startswith(k):
             return ("a", v)
     if mn == "concat":
@@ -112,10 +111,11 @@ def parse(op):
     return mn, defs, uses
 
 
-def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(0, 0, 0)):
+def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(0, 0, 0), full=False):
     """Merge streams (lists of op strings; each in its own dependency order) into one issue order.
     tails[i] (list) run after stream i's body and after tails[i - 1] (ordered side effects, e.g. FIFO pushes).
-    At most `window` streams are active at a time (bounds register pressure). Returns the op list."""
+    At most `window` streams are active at a time (bounds register pressure); full: VEC_FULL / ACC_FULL units.
+    Returns the op list."""
     M = model()
     RES = resources() if os.environ.get("LS_RES", "0") == "1" else {}
     req, rsv = set(), set()     # scoreboard: (cycle, resource) booked by required / reserved stages
@@ -138,7 +138,7 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
             mn, defs, uses = parse(op)
             for u in uses:
                 nuse[u] = nuse.get(u, 0) + 1
-            cls, sz = units(mn, op)
+            cls, sz = units(mn, op, full)
             for d in defs[:1]:
                 size[d] = (cls, sz)
     live = {"v": 0, "a": 0, "p": 0}
@@ -152,7 +152,7 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
                 cnt[u] = cnt.get(u, 0) + 1
         for op in sq:
             mn, defs, uses = parse(op)
-            c, z = units(mn, op)
+            c, z = units(mn, op, full)
             if c and defs:
                 lv[c] += z
                 pk[c] = max(pk[c], lv[c])
@@ -172,7 +172,7 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
         for op in sq:
             traj.append(dict(lv))
             mn, defs, uses = parse(op)
-            c, z = units(mn, op)
+            c, z = units(mn, op, full)
             if c and defs:
                 lv[c] += z
             snap = dict(lv)
@@ -218,7 +218,7 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
                     continue
                 mn, defs, uses = parse(op)
                 free = mn.startswith(FREE) or mn == ""
-                info = M.get(mn, ("none", 1, []))
+                info = M.get(mn, ("none", (1,), []))
                 slot = "free" if free else info[0]
                 # gathers (vldb.4x*) issue in the ldb slot but book load unit A's address port (DM_ADA, itinerary
                 # II_VLDB_4x32_*): no vlda in the same bundle
@@ -248,7 +248,7 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
                 if not ok:
                     if BLOCK is not None: BLOCK[f"operand {mn}"] += 1
                     continue
-                cls, sz = units(mn, op)
+                cls, sz = units(mn, op, full)
                 freed = {"v": 0, "a": 0, "p": 0}
                 for u in set(uses):
                     if u in size and size[u][0] and nuse.get(u, 0) == uses.count(u):
@@ -280,9 +280,10 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
                         (req if need else rsv).add((c_, r_))
                 if is_store:
                     last_store[0] = cyc
-                for d in defs:
+                for j, d in enumerate(defs):
                     # calibrated: accumulating vec-slot ops (MAC / f32 add) feed any consumer ~9 cycles later
-                    lat = 9 + 0 if (not free and info[0] == "vec") else (0 if free else info[1] - 1)
+                    rd = info[1][min(j, len(info[1]) - 1)]
+                    lat = 9 + 0 if (not free and info[0] == "vec") else (0 if free else rd - 1)
                     avail[d] = cyc + lat
                 pos[i] += 1
                 if pos[i] == len(seqs[i]):

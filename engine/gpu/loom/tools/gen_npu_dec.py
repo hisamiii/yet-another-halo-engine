@@ -268,10 +268,10 @@ def leaf(name="dec", nports=1):
     import npu_lsched as lsched
     WIN = int(os.environ.get("DQ_WIN", "4"))
 
-    def run(streams, window_=None, tails=None, ext=(0, 0, 0), hv=None):
+    def run(streams, window_=None, tails=None, ext=(0, 0, 0), hv=None, full=GRID):   # full: lsched VEC_FULL / ACC_FULL
         if os.environ.get("DQ_LS", "1") == "1":
-            e.L += lsched.schedule([x.L for x in streams], window_ or WIN, tails, ext=ext,
-                                   hard=(hv or int(os.environ.get("DQ_HV", "24")), 20, int(os.environ.get("DQ_PH", "2" if GRID else "3"))))
+            e.L += lsched.schedule([x.L for x in streams], window_ or WIN, tails, ext=ext, full=full,
+                                   hard=(hv or int(os.environ.get("DQ_HV", "24")), 20, int(os.environ.get("DQ_PH", "4" if GRID else "3"))))
             if os.environ.get("DQ_PRED"):
                 print(f"pred {len(streams)} streams: {lsched.schedule.cycles} cycles", file=sys.stderr)
         else:
@@ -1076,6 +1076,7 @@ def leaf(name="dec", nports=1):
     # -- record r: qs rows of both halves realigned (vshift) and transposed for chunks 8 r .. 8 r + 7, then their 64
     # gather addresses each (GT + 8 b = (b + (GT >> 3)) << 3) at GAS + 1024 (local sub-block) + 512 h + 256 cc
     if GRID:
+        anq = []                                        # the record's address-network streams: one run at its end
         # ---- IQ3_S record r (sub-blocks 4 r .. 4 r + 3) of both halves: qs (32 B at +2 + 32 r) and signs (16 B at
         # +74 + 16 r) realigned per row; qh (4 B at +66 + 4 r) by u16 loads into QS staging [row][s]; qh bits [s][l][e]
         # per row from the qh-bit table (gathers); qs and bits transposed to [kb][row][e] (zips 18, 16 / 17, 14 / 15),
@@ -1095,13 +1096,24 @@ def leaf(name="dec", nports=1):
                 e("%csl = vbcst.8 %sb4")                       # IQ3_S: the sign table's address bits 8-11, << 4
         e("%sh4 = mov.shift 4")
 
+        anp = {}                                        # per table: the pointer walking its rows (post-increment)
+
+        def anmod(v):
+            if ("m", v) not in anp:
+                anp[("m", v)] = f"%anm{v}"
+                e(f"%anm{v} = mov.modifier {k(v)}")
+            return anp[("m", v)]
+
         def qhrow(x, row):
             """IQ3_S: the row's qh word w (4 B at +66 + 4 r) as [s 4][8] bytes w_s (V1; bits picked after the network)."""
             ph_, h0_, h1_, h1s, hw, bc, sp, r1 = (x.t(n) for n in ("ph", "h0", "h1", "h1s", "hw", "hbc", "hsp", "hr"))
-            x(f"{ph_} = add.rr %goh, {k(ROWB * row)}" if row else f"{ph_} = or %goh, {k(0)}")
-            pq_ = Pr(x, ph_)
-            x(f"{h0_} = lda.u16 {pq_}, 0")
-            x(f"{h1_} = lda.u16 {pq_}, 2")
+            if "h" not in anp:
+                assert row == 0
+                anp["h"] = Pr(x, "%goh")
+            p1, p2 = x.t("pq"), x.t("pq")
+            x(f"{h0_}, {p1} = lda.u16.post {anp['h']}, 2")
+            x(f"{h1_}, {p2} = lda.u16.post.modifier {p1}, {anmod(ROWB - 2)}")
+            anp["h"] = p2
             x(f"{h1s} = lshl {h1_}, {k(16)}")
             x(f"{hw} = or {h0_}, {h1s}")
             x(f"{bc} = vbcst.32 {hw}")
@@ -1110,12 +1122,14 @@ def leaf(name="dec", nports=1):
             return r1
 
         def rowload(x, nm_, row, v1):
-            pa_ = x.t("pa")
-            x(f"{pa_} = add.rr %gal{nm_}, {k(ROWB * row)}" if row else f"{pa_} = or %gal{nm_}, {k(0)}")
-            pv = Pr(x, pa_)
             va, vb, q = x.t("va"), x.t("vb"), x.t("q")
-            x(f"{va} = vlda.512.i8x64 {pv}, 0")
-            x(f"{vb} = vlda.512.i8x64 {pv}, 64")
+            if nm_ not in anp:
+                assert row == 0
+                anp[nm_] = Pr(x, f"%gal{nm_}")
+            p1, p2 = x.t("pr"), x.t("pr")
+            x(f"{va}, {p1} = vlda.512.i8x64.post {anp[nm_]}, 64")
+            x(f"{vb}, {p2} = vlda.512.i8x64.post.modifier {p1}, {anmod(ROWB - 64)}")
+            anp[nm_] = p2
             x(f"{q} = vshift {va}, {vb}, %gsh{nm_}")
             if not v1:
                 return q
@@ -1179,7 +1193,7 @@ def leaf(name="dec", nports=1):
                                     pgs = P(x, "%spb", GAS + 2048 * hh + 256 * gpair(kb_) +
                                             (128 if kind == "s" else 0) + 64 * gpos(kb_))
                                     x(f"vst.acc {q1}, {pgs}, 0")
-                run([x], 1)
+                anq.append(x)
                 continue
             if X2:
                 # IQ2_XXS record r: the 4 sub-blocks' index words (even units) and aux words (odd units) of 8 rows,
@@ -1215,7 +1229,7 @@ def leaf(name="dec", nports=1):
                                 pgs = P(x, "%spb", GAS + 2048 * hh + 256 * gpair(kb_) + (128 if kind == "s" else 0) +
                                         64 * gpos(kb_))
                                 x(f"vst.acc {q1}, {pgs}, 0")
-                    run([x], 1)
+                    anq.append(x)
                 continue
             # grid: qs rows (V1) and the qh-bit rows (gathers from the bit table) through the same network, then per
             # group: u16 qs | (page_g + bit) << 8, vups << 4 -> grid addresses
@@ -1242,7 +1256,7 @@ def leaf(name="dec", nports=1):
                             kb_ = 4 * g + 2 * part + q2
                             x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
                             x(f"vst.acc {q1}, {pgg}, {256 * (gpair(kb_) - 2 * g) + 64 * gpos(kb_)}")
-                run(rq, int(os.environ.get("DQ_QWIN", "6")))
+                anq.extend(rq)
                 # signs: the record's 4 aux words per row -> fields f_l = (w >> 7 l) & 127 [ib][row] -> f + base / 16
                 # twice -> sign addresses of kb 4 ib + l
                 x = e.stream()
@@ -1267,7 +1281,7 @@ def leaf(name="dec", nports=1):
                             x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
                             pgs = P(x, "%spb", GAS + 2048 * hh + 256 * gpair(kb_) + 128 + 64 * gpos(kb_))
                             x(f"vst.acc {q1}, {pgs}, 0")
-                run([x], 1)
+                anq.append(x)
                 continue
             Hs = net16(x, Hrows)                                # [kb 4][row][e]: w_g (sub-block g's qh byte)
             Os = net16(x, Rq)
@@ -1289,7 +1303,7 @@ def leaf(name="dec", nports=1):
                         kb_ = 4 * g + 2 * part + q2
                         x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
                         x(f"vst.acc {q1}, {pgg}, {256 * (gpair(kb_) - 2 * g) + 64 * gpos(kb_)}")
-            run(rq, int(os.environ.get("DQ_QWIN", "6")))
+            anq.extend(rq)
             # signs: [row][16 B] (V2 rows) -> [kb][row] bytes (zips 20, 18, 16 / 17); (page_s << 8 | byte) twice -> GA
             rsg = []
             Rs = []
@@ -1331,7 +1345,8 @@ def leaf(name="dec", nports=1):
                             kb_ = 8 * i + 4 * part + 2 * h2 + q2
                             x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
                             x(f"vst.acc {q1}, {pgs}, {256 * (gpair(kb_) - 4 * i - 2 * part) + 64 * gpos(kb_)}")
-            run(rsg, int(os.environ.get("DQ_QWIN", "6")))
+            anq.extend(rsg)
+        run(anq, int(os.environ.get("DQ_QWIN", "6")), hv=22)       # (Loom's vec256 overflows at hv 24)
     elif Q3K:
         # ---- Q3_K record r (values 128 r ..): per half the rows' [hmask 32 B | qs 32 B at 32 + 32 r] realigned and
         # transposed to [chunk][row][8 B] (chunks 0-3 hmask, 4-7 qs), nibble-unpacked into NIB: hmask nibble r (mode r:
@@ -1866,7 +1881,8 @@ def leaf(name="dec", nports=1):
                 tails.append(pt.L)
     if frags:
         run(frags, int(os.environ.get("DQ_WINH", "1" if Q3K else "6")), tails,   # Q3_K: 4 x4 operands per stream
-            hv=int(os.environ.get("DQ_HHV", "20" if XS2 else "24")))   # IQ2_XS: X (4 vec256) per G stream, 8 T rows per C
+            hv=int(os.environ.get("DQ_HHV", "20" if XS2 else "24")),   # IQ2_XS: X (4 vec256) per G stream, 8 T rows per C
+            full=False)                                     # (the full unit table slows the IQ2_XS hot loop)
     if SLU:
         e(f"%spc0 = copy {sp0} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if 2 * NPARTS * 64 <= 448:
