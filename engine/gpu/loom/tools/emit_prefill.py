@@ -18,6 +18,7 @@ FMT = {
     18: ("iq3xxs", "iq3xxs", 256), 20: ("iq4nl", "iq4nl", 32),
     17: ("iq2xs", "iq2xs", 256), 8: ("q8_0", "q8_0", 32),
     16: ("iq2xxs", "iq2xxs", 256), 10: ("q2k", "q2k", 256),
+    44: ("mq4", "mq4", 256),   # hipfire MQ4G256 (HFQ models; not a ggml type)
 }
 KSTORE = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight",
           "ssm_beta.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
@@ -27,8 +28,13 @@ SWIGLU = {"ffn_up.weight"}
 
 
 def parse(model):
-    """Return [(name, dims, ggml type)] for every tensor of a GGUF file."""
-    f = open(model, "rb"); f.read(8)
+    """Return [(name, dims, ggml type)] for every tensor of a GGUF file, or of an HFQ one as the engine sees it."""
+    f = open(model, "rb")
+    if f.read(4) == b"HFQM":
+        dump = os.path.join(LOOM, "..", "..", "build", "yah-dump")
+        out = subprocess.run([dump, model, "--table"], capture_output=True, text=True, check=True).stdout
+        return [(p[0], [int(d) for d in p[2:]], int(p[1])) for p in (ln.split() for ln in out.splitlines())]
+    f.seek(8)
     nt, nkv = struct.unpack("<QQ", f.read(16))
     SIZ = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
     def rd():

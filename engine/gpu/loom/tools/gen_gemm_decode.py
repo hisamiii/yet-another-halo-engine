@@ -1414,6 +1414,68 @@ def f16_compute(v, gb):
     return L
 
 
+def mq4_loads(p, blk, gb):
+    """MQ4G256 (hipfire MQ4G256V2, nibbles stored signed by the HFQ loader): f16 scale of K 0-127 @0, of K 128-255 @4,
+    nibble bytes @8 (byte j: element 2j low, 2j + 1 high). Group g reads scale g / 4 and bytes 16g .. 16g + 15."""
+    L = []
+    e = L.append
+    vals = []
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}gs{u} = scalar.shrui %{p}g{u}, %c2i : i32")
+        e(f"    %{p}gs2_{u} = scalar.shli %{p}gs{u}, %c1i : i32")
+        e(f"    %{p}bh{u} = scalar.shrui {blk}, %c1i : i32")
+        e(f"    %{p}dh_i{u} = scalar.addi %{p}bh{u}, %{p}gs2_{u} : i32")
+        e(f"    %{p}dx{u} = index.cast %{p}dh_i{u} : i32 to index")
+        e(f"    %{p}dl{u} = index.max %{p}dx{u}, %c0 : index")
+        e(f"    %{p}dc{u} = index.min %{p}dl{u}, %w_half_last : index")
+        e(f"    %{p}dh{u} = view.load %w_f16_view[%{p}dc{u}] : view<[%w_halfs]xf16> -> f16")
+        e(f"    %{p}g16_{u} = scalar.shli %{p}g{u}, %c4i : i32")
+        e(f"    %{p}qa{u} = scalar.addi {blk}, %c8i : i32")
+        e(f"    %{p}qb{u} = scalar.addi %{p}qa{u}, %{p}g16_{u} : i32")
+        _ldv(e, p, f"q_v{u}", f"%{p}qb{u}", 16)
+        vals += [(f"%{p}dh{u}", "f16"), (f"%{p}q_v{u}", "vector<16xi8>")]
+    return L, vals
+
+
+def mq4_compute(v, gb):
+    """MQ4G256 decode: value = f16(d * n), n the signed nibble, as fma(d, n ^ 8, -8 d) from the unsigned code (exact in f32)."""
+    L = []
+    e = L.append
+    it = iter(v)
+    for u in range(GPL):
+        dh = next(it); q = next(it)
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %d{u} = scalar.extf {dh} : f16 to f32")
+        e(f"    %nb{u} = scalar.mulf %d{u}, %cm8f_mq : f32")
+        e(f"    %qc{u} = vector.xori {q}, %m88v_mq : vector<16xi8>")
+        e(f"    %nlo{u} = vector.andi %qc{u}, %m15v_mq : vector<16xi8>")
+        e(f"    %nhi{u} = vector.shrui %qc{u}, %s4v_mq : vector<16xi8>")
+        e(f"    %flo{u} = vector.uitofp %nlo{u} : vector<16xi8> to vector<16xf32>")
+        e(f"    %fhi{u} = vector.uitofp %nhi{u} : vector<16xi8> to vector<16xf32>")
+        hs = []
+        for j in range(32):
+            src = f"%flo{u}" if j % 2 == 0 else f"%fhi{u}"
+            e(f"    %y{u}_{j} = vector.extract {src}[{j // 2}] : vector<16xf32> -> f32")
+            e(f"    %m{u}_{j} = scalar.fmaf %d{u}, %y{u}_{j}, %nb{u} : f32")
+            e(f"    %t{u}_{j} = scalar.fptrunc %m{u}_{j} : f32 to f16")
+            hs.append(f"%t{u}_{j}")
+        e(f"    %hlo{u} = vector.from_elements {', '.join(hs[:16])} : vector<16xf16>")
+        e(f"    %hhi{u} = vector.from_elements {', '.join(hs[16:])} : vector<16xf16>")
+        _col_of(e, u)
+        e(f"    %colh{u} = index.add %col{u}, %c16 : index")
+        e(f"    vector.store %hlo{u}, %wl_view[%drow, %col{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+        e(f"    vector.store %hhi{u}, %wl_view[%drow, %colh{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+    return L
+
+
+def mq4_setup():
+    return ["  %c88b_mq = scalar.constant -120 : i8", "  %m88v_mq = vector.splat %c88b_mq : vector<16xi8>",
+            "  %c15b_mq = scalar.constant 15 : i8", "  %m15v_mq = vector.splat %c15b_mq : vector<16xi8>",
+            "  %c4b_mq = scalar.constant 4 : i8", "  %s4v_mq = vector.splat %c4b_mq : vector<16xi8>",
+            "  %cm8f_mq = scalar.constant -8.0 : f32"]
+
+
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
     L += ["  %c16i_sc4 = scalar.constant 16 : i32"] if IQ4_SC4 else []
@@ -1655,6 +1717,8 @@ FMTS = {
     "q8_0": dict(bb=272, kdiv=8, ksub=64, decode=(q8_0_loads, q8_0_compute), extra=[], setup=lambda: []),
     # probe only: pre-dequantized f16 weights, decode-free
     "f16": dict(bb=512, ksub=64, decode=(f16_loads, f16_compute), extra=[], setup=lambda: []),
+    # hipfire MQ4G256V2 (HFQ models): scale per 128, signed nibbles
+    "mq4": dict(bb=136, ksub=64, decode=(mq4_loads, mq4_compute), extra=[], setup=mq4_setup),
     "q6k": dict(bb=210, ksub=64, decode=(q6k_loads, q6k_compute), extra=[], setup=q6k_setup),
     "q3k": dict(bb=110, ksub=64, decode=(q3k_loads, q3k_compute), extra=[], setup=q3k_setup),
     "iq2xxs": dict(bb=66, ksub=64, decode=(iq2xxs_loads, iq2xxs_compute), extra=["grid", "ksigns"], setup=iq2xxs_setup),

@@ -38,6 +38,19 @@ The engine is moving to hipfire's `qwen3.8-27b.mq4-xts` (HFQ container, 13.96 Gi
 
 `ssm_out` keeps the HF value-head order on its input axis: a head permutation does not commute with the rotation, so its input must be written in HF head order. The values of all converted tensors match the IQ4_XS GGUF bit for bit, except `ssm_conv1d`, which this file stores as Q8_0.
 
+Prefill on an HFQ model (W4A16, the reference path): `emit_prefill_pp.py` reads the tensor table through `yah-dump --table` and emits the same pipeline with MQ4 tile GEMMs (`gen_gemm_decode` "mq4": weight = f16(nibble x scale), f16 activations). The set carries a `rot` row, `rot_signs.bin` and `tools/gen_rot.py`'s `yah_rot256` (x / awq, signs, H256 as H16 x H16 through LDS, signs / 16), which the driver runs on each GEMM input:
+
+| input | rotation |
+|---|---|
+| attn_norm, post_attention_norm output (row-major f16) | in place, after the norm; the site's awq (identical for qkv / gate / alpha / beta, q / k / v, gate / up) |
+| attention output, swiglu output | in place, before the kres GEMM |
+| DeltaNet postnorm output | `rot_heads.hal`: gathers GGUF into HF value-head order into its own buffer, which ssm_out reads |
+| output head (the f32 norm row) | `rot_head.hal`, no awq; then `gen_gemv`'s MQ4 GEMV (dispatch.txt `gemv.hal <rows per workgroup> <lanes> <workgroups>`) |
+
+The token embedding is `gen_decode_misc.gen_embed_q8_0`. MQ4 has no afrag, fused-FFN or NPU forms, so these sets run the row-major path.
+
+Decode on an HFQ model: `emit_decode.py` emits the MQ4 GEMVs (`gen_gemv` "mq4": unsigned codes nibble xor 8 with bias 8) and `drot_*` (`gen_rot` on one f32 row); `decode.txt` gets `rot`, and the decoder rotates the same inputs in the same places (`LoomDecoder::Rotate`).
+
 ## Prefill
 
 `engine/model/loom_prefill.hpp` (`LoomPrefill`) runs a prompt through all 64 layers as one batch of B tokens (B = 2048 by default); `loom_forward_pp` is its command-line driver. Every kernel has the token count in its grid, so there is no per-tile loop. All activations are token-major (`[token][row]`). The residual stream is f32; GEMM inputs are f16.

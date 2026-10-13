@@ -12,6 +12,7 @@ usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, m
   dattn_{kappend,vappend,part}_q only with a quantized YAH_KV (kv8 | kv4 | k8v4 | k4v8, same as the prefill set):
                                  the kv8a16 / kv4a16 pools; decode.txt gets "kv q KB VB"
   rmsnorm, deltanet_conv, embed  tools/gen_decode_misc.py (deltanet_conv also runs the decode conv)
+  drot_*, rot_signs.bin          MQ4 models only: tools/gen_rot.py on the f32 GEMV inputs (decode.txt "rot")
   unpack, rope, argmax           hand-written kernels in loom/*.loom.
                                  rope's own cache write goes to a one-row dummy (max_context=1); dattn_kvappend writes the pools.
   grid_*.bin, ksigns_iq2xs.bin   the IQ tables (loom/tables)
@@ -32,6 +33,7 @@ import gen_decode_attn as DA  # noqa: E402
 import gen_decode_misc as DM  # noqa: E402
 import gen_gemv as GV  # noqa: E402
 import gen_kvq  # noqa: E402
+import gen_rot  # noqa: E402
 
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
 # rows per wave R and waves per workgroup W per GEMV kind; recorded in decode.txt ("rw kind R W")
@@ -166,13 +168,23 @@ def main():
         "yah_fused_qk_rope.cache32_elems=%d" % (NUM_KV * HEAD_DIM),
         "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
     emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # also runs the decode conv
-    emit_src(DM.gen_embed_iq4xs(), "embed", outdir)      # token_embd row from the device token stream
+    types = {nm: ty for nm, _, ty in EP.parse(model)}
+    # token_embd row from the device token stream (Q8_0 in HFQ models)
+    emit_src(DM.gen_embed_q8_0() if types["token_embd.weight"] == 8 else DM.gen_embed_iq4xs(), "embed", outdir)
+    # MQ4 GEMVs read x in the weights' rotated basis: in place per input site, ssm_out's input gathered into HF head
+    # order, the head's without awq
+    rot = types.get("blk.0.ffn_down.weight") == 44
+    if rot:
+        for name, args in (("drot_5120", (5120, 1)), ("drot_6144", (6144, 1)), ("drot_17408", (17408, 1)),
+                           ("drot_heads", (6144, 1, True, (48, 16, 128))), ("drot_head", (5120, 1, False))):
+            emit_src(gen_rot.gen(*args, ty="f32"), name, outdir)
+        open(os.path.join(outdir, "rot_signs.bin"), "wb").write(gen_rot.signs())
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-p sampling into the token stream
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
+        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\n" if rot else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + the decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))

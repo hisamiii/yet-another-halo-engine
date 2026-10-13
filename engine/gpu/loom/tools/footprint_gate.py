@@ -13,7 +13,7 @@ sys.path.insert(0, HERE)
 import loom_preflight as lp
 QB = {"q4k": (256, 144), "q5k": (256, 176), "q6k": (256, 210), "q3k": (256, 110), "q2k": (256, 84),
       "iq4xs": (256, 136), "iq3s": (256, 110), "iq3xxs": (256, 98), "iq2xxs": (256, 66), "iq2xs": (256, 74),
-      "q8_0": (32, 34), "iq4nl": (32, 18), "f16": (256, 512)}
+      "q8_0": (32, 34), "iq4nl": (32, 18), "f16": (256, 512), "mq4": (256, 136)}
 src, sym, fmt, kind, mt, kb, tt = sys.argv[1:8]
 mt, kb, tt = int(mt), int(kb), int(tt)
 B = int(sys.argv[8]) if len(sys.argv) > 8 else 2048

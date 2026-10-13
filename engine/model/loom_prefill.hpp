@@ -405,6 +405,13 @@ class LoomPrefill {
     const auto* ow = Find("output.weight");
     Dispatch(Exe("rmsnorm.hal"), "yah_rmsnorm", 1, 1, 1, 32, 1, 1,
              {{hidden_->handle, std::size_t{row} * kHidden * 4, std::size_t{kHidden} * 4}, TRef(*onw), Ref(*normed_)});
+    if (rot_) {
+      // MQ4 head: the f32 norm row into the weights' basis (no awq), then gen_gemv's tile-free GEMV
+      Dispatch(Exe("rot_head.hal"), "yah_rot256", kHidden / 1024, 1, 1, 64, 1, 1, {Ref(*normed_), Ref(*rot_signs_)});
+      const Geom& g = geom_.at("gemv.hal");   // (rows per workgroup, lanes, workgroups)
+      Dispatch(Exe("gemv.hal"), "yah_gemv", g.tt, 1, 1, g.rowgrp, 1, 1, {TRef(*ow), Ref(*normed_), dst});
+      return;
+    }
     Dispatch(Exe("gemv.hal"), "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, {TRef(*ow), Ref(*normed_), dst});
   }
   // Argmax of kVocab f32 logits into dst (one u32).
@@ -513,6 +520,7 @@ class LoomPrefill {
       case 8: *out = {"q8_0", 32}; return true;
       case 16: *out = {"iq2xxs", 256}; return true;
       case 10: *out = {"q2k", 256}; return true;
+      case 44: *out = {"mq4", 256}; return true;
       default: return false;
     }
   }
@@ -641,6 +649,8 @@ class LoomPrefill {
     grid_iq2xxs_ = &table("grid_iq2xxs.bin", 512 * 4);
     grid_iq2xs_ = &table("grid_iq2xs.bin", 1024 * 4);
     ksigns_ = &table("ksigns_iq2xxs.bin", 128);
+    rot_ = geom_.count("rot") != 0;
+    if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
   void AllocateBuffers() {
@@ -651,6 +661,7 @@ class LoomPrefill {
     reszero_ = &Alloc(B * kHidden * 4);
     sumout_ = &Alloc(B * kHidden * 4);
     scratch_ = &Alloc(B * kFfn * 2);
+    if (rot_) rotbuf_ = &Alloc(B * kInner * 2);
     qkv_ = &Alloc(B * kQProj * 4);
     gate_ = &Alloc(B * kInner * 4);
     alpha_ = &Alloc(B * kTs * 4);
@@ -780,8 +791,9 @@ class LoomPrefill {
                             "gemv.hal", "rmsnorm.hal", "argmax.hal", "accum.hal", "embed.hal"})
       Exe(hal);
     GeomOf("embed.hal");   // one token per workgroup: refuses a set emitted for another chunk size
-    if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != 23)
-      throw LoomError("prefill: token_embd: only IQ4_XS is wired (embed.hal)");
+    // embed.hal decodes IQ4_XS, or Q8_0 in the HFQ models' sets
+    if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != (rot_ ? 8u : 23u))
+      throw LoomError("prefill: token_embd: its format does not match embed.hal (re-emit the set)");
   }
 
   // Bindings shared by every GEMM: weights, then the IQ grid / sign tables the format needs.
@@ -1206,6 +1218,23 @@ class LoomPrefill {
                                             Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)};
     if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
+    if (rot_) {
+      // one awq per input site: the post-attention norm feeds the FFN, attn_norm qkv / gate / alpha / beta or q / k / v
+      if (mode != NormOut::kRow || bfp) throw LoomError("prefill: MQ4 sets rotate only the row-major norm output");
+      const std::string pre = wname.substr(0, wname.find('.', 4) + 1);
+      const char* w = wname.find("post_attention_norm") != std::string::npos   ? "ffn_gate"
+                      : cfg_.IsFullAttention(std::stoul(wname.substr(4))) ? "attn_q"
+                                                                          : "attn_qkv";
+      Rotate(*scratch_, nullptr, kHidden, pre + w + ".awq");
+    }
+  }
+  // MQ4 sets: x (B_ rows of k f16) into the weights' basis (gen_rot): in place, or dst != nullptr (k = kInner, ssm_out):
+  // the DeltaNet value heads from GGUF into HF order into dst.
+  void Rotate(const LoomBuffer& x, const LoomBuffer* dst, std::uint32_t k, const std::string& awq) {
+    std::vector<hrx_buffer_ref_t> b = {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_)};
+    if (dst) b.push_back(Ref(*dst));
+    Dispatch(Exe(dst ? std::string("rot_heads.hal") : "rot_" + std::to_string(k) + ".hal"), "yah_rot256", k / 1024, B_,
+             1, 64, 1, 1, b);
   }
   // Debug (YAH_DUMP_ACT=<prefix>, YAH_DUMP_LAYERS=l0,l1,..): the row-major f16 output of each RMSNorm that feeds a GEMM
   // in those layers (n_ rows x 5120) to <prefix>_<norm weight name>.f16, from an extra norm.hal pass into its own buffer.
@@ -1734,8 +1763,11 @@ class LoomPrefill {
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
   // af: the afrag form of the fused kres GEMM (input fragment-major)
-  void RunResidual(const std::string& wname, const LoomBuffer& input, bool af = false) {
+  void RunResidual(const std::string& wname, const LoomBuffer& in, bool af = false) {
     const auto* t = Find(wname);
+    const bool heads = rot_ && wname.find("ssm_out") != std::string::npos;
+    if (rot_) Rotate(in, heads ? rotbuf_ : nullptr, static_cast<std::uint32_t>(t->dims[0]), wname.substr(0, wname.size() - 6) + "awq");
+    const LoomBuffer& input = heads ? *rotbuf_ : in;
     Fmt f{};
     const std::string fused0 = GemmHal("gemm_kres", *t, &f);
     if (geom_.count(fused0)) {
@@ -2492,6 +2524,9 @@ class LoomPrefill {
               vqs_bytes_ = 0, pool_bytes_ = 0;
   hrx_buffer_ref_t ptab_ref_{};
   std::vector<std::uint32_t> host_ids_;  // Embed's staging
+  // MQ4 sets ("rot"): the rotation signs (gen_rot.signs) and ssm_out's input in HF head order
+  bool rot_ = false;
+  LoomBuffer *rot_signs_ = nullptr, *rotbuf_ = nullptr;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,

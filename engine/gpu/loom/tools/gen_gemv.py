@@ -31,6 +31,7 @@ FMT = {
     "q5k": (256, 176, ()),
     "q6k": (256, 210, ()),
     "iq4xs": (256, 136, ()),
+    "mq4": (256, 136, ()),
     "iq3s": (256, 110, ("grid_iq3s",)),
     "iq3xxs": (256, 98, ("grid_iq3xxs", "ksigns")),
     "iq2xxs": (256, 66, ("grid_iq2xxs", "ksigns")),
@@ -44,7 +45,7 @@ IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 
 # Loom read-ahead depth of the sub-block loop: 2 is the fastest on the full decode (none and 3 are slower).
 PIPE = 2
 GGML = {8: "q8_0", 10: "q2k", 11: "q3k", 12: "q4k", 13: "q5k", 14: "q6k", 16: "iq2xxs", 17: "iq2xs",
-        18: "iq3xxs", 21: "iq3s", 23: "iq4xs"}
+        18: "iq3xxs", 21: "iq3s", 23: "iq4xs", 44: "mq4"}
 
 
 def rows_per_wg(R=2, W=4):
@@ -226,6 +227,14 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             b(f"  %{p}sl1 = scalar.andi %{p}s32i, {e.cs(1)} : i32")
             b(f"  %{p}sls = scalar.shli %{p}sl1, {e.cs(2)} : i32")              # 4 * (sb32 % 2)
             b(f"  %{p}shs = scalar.shli %{p}s32i, {e.cs(1)} : i32")              # 2 * sb32
+        elif f == "mq4":
+            # sub-block (s32, hlf): nibble bytes 16 s32 + 8 hlf .. + 7 at 8, scale f16 at 4 (s32 / 4)
+            b(f"  %{p}qb0 = index.mul %{p}s32, {e.ci(16)} : index")
+            b(f"  %{p}qb1 = index.mul %{p}hlf, {e.ci(8)} : index")
+            b(f"  %{p}qb2 = index.add %{p}qb0, %{p}qb1 : index")
+            b(f"  %{p}qo = index.add %{p}qb2, {e.ci(8)} : index")
+            b(f"  %{p}s4 = index.div %{p}s32, {e.ci(4)} : index")
+            b(f"  %{p}so = index.mul %{p}s4, {e.ci(4)} : index")
         elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs"):
             # sign of element j: bit (j % 8) of sign byte l = 2 * hlf + j / 8
             b(f"  %{p}l0 = index.mul %{p}hlf, {e.ci(2)} : index")                # l of the first eight
@@ -486,6 +495,27 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             d = ld_d(hv, nh, boff, 0, p, "d")
             b(f"    %{p}scale0 = scalar.mulf {d}, %{p}scf : f32")
             scale = f"%{p}scale0"
+        elif f == "mq4":
+            # signed nibbles (the HFQ loader's code - 8) ^ 8 = the unsigned codes; byte j holds elements 2j (low), 2j + 1
+            b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
+            raw = ld(wv, nb, f"%{p}qa", p, "qr", 8)
+            b(f"    %{p}qw = vector.bitcast {raw} : vector<8xi8> to vector<2xi32>")
+            b(f"    %{p}qx = vector.xori %{p}qw, %ws2_88 : vector<2xi32>")
+            b(f"    %{p}ql = vector.andi %{p}qx, %ws2_0f : vector<2xi32>")
+            b(f"    %{p}qs = vector.shrui %{p}qx, %ws2_4 : vector<2xi32>")
+            b(f"    %{p}qh = vector.andi %{p}qs, %ws2_0f : vector<2xi32>")
+            for nm, cv in (("%ws2_88", -2004318072), ("%ws2_0f", 0x0F0F0F0F), ("%ws2_4", 4)):
+                e.consts[nm] = f"  {nm} = vector.splat {e.cs(cv)} : vector<2xi32>"
+            for k in range(2):
+                b(f"    %{p}ql{k} = vector.extract %{p}ql[{k}] : vector<2xi32> -> i32")
+                b(f"    %{p}qh{k} = vector.extract %{p}qh[{k}] : vector<2xi32> -> i32")
+            b(f"    %{p}qlh = vector.from_elements %{p}ql0, %{p}ql1, %{p}qh0, %{p}qh1 : vector<4xi32>")
+            qb = tob(p, f"%{p}qlh", "qlb")
+            b(f"    %{p}q = vector.shuffle<[0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15]> {qb} : vector<16xi8>")
+            q = f"%{p}q"
+            bias = 8
+            b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
+            scale = ld_d(hv, nh, f"%{p}sa", 0, p, "d")
         elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs"):
             (gw, s0, s1), scale = decode_grid(f, S, p, wv, hv, nb, boff, lp)
             q = signed_grid(p, gw, s0, s1)

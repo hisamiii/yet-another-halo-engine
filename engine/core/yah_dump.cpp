@@ -1,5 +1,6 @@
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 
@@ -7,11 +8,20 @@
 #include "core/gguf.hpp"
 
 int main(int argc, char** argv) {
-  if (argc < 2) {
-    std::fprintf(stderr, "usage: yah-dump <model.gguf>\n");
+  if (argc < 2 || (argc == 3 && std::strcmp(argv[2], "--table") != 0) || argc > 3) {
+    std::fprintf(stderr, "usage: yah-dump <model.gguf | model.hfq> [--table]\n");
     return 2;
   }
   auto gguf = yah::core::Gguf::Open(argv[1]);
+  if (argc == 3) {
+    // one line per tensor as the engine sees it: name, type id, dims (GGUF order); the emitter reads HFQ models with it
+    for (const auto& t : gguf.tensors()) {
+      std::printf("%s %u", t.name.c_str(), static_cast<unsigned>(t.type));
+      for (const auto d : t.dims) std::printf(" %" PRIu64, d);
+      std::printf("\n");
+    }
+    return 0;
+  }
   std::printf("version=%u tensors=%zu metadata=%zu file=%.2f GiB data_offset=%zu\n", gguf.version(),
               gguf.tensors().size(), gguf.metadata_count(), static_cast<double>(gguf.file_size()) / 1073741824.0,
               gguf.tensor_data_offset());

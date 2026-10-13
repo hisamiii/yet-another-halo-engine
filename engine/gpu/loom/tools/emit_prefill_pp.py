@@ -21,6 +21,8 @@ import gen_conv_kq  # noqa: E402
 import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
 import gen_decode_misc  # noqa: E402
+import gen_gemv  # noqa: E402
+import gen_rot  # noqa: E402
 import gen_kvq  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
 
@@ -428,7 +430,7 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
 
 
 # Formats the tile GEMM (tools/gen_gemm_tile.py) is verified bit-identical on in the pp2048 pipeline.
-TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "q3k", "q8_0")
+TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "q3k", "q8_0", "mq4")
 
 
 def decode_free(fmt, mt, kb, B, kind, outdir, done):
@@ -1587,8 +1589,28 @@ def main():
     # The chunk's token_embd rows from its token ids on the GPU (gen_decode_misc.gen_embed_iq4xs, one workgroup per row),
     # so the host stages ids and never waits between chunks.
     embed_src = os.path.join(tmp, "yah_embed.loom")
-    open(embed_src, "w").write(gen_decode_misc.gen_embed_iq4xs(rows=B))
+    types = {nm: ty for nm, _, ty in rows}
+    q8_embed = types["token_embd.weight"] == 8   # HFQ models
+    open(embed_src, "w").write(gen_decode_misc.gen_embed_q8_0(rows=B) if q8_embed else gen_decode_misc.gen_embed_iq4xs(rows=B))
     geom.append(("embed.hal", 1, 5120 // 16, B))   # one token per workgroup
+    # MQ4 GEMMs read their input in the weights' rotated basis (gen_rot): the driver rotates each GEMM input site in place,
+    # the DeltaNet postnorm's out of place (dst in HF head order); the head's f32 norm row without awq
+    rot = types.get("blk.0.ffn_down.weight") == 44
+    rot_src = {}
+    if rot:
+        for name, args in (("rot_5120.hal", (5120, B)), ("rot_6144.hal", (6144, B)), ("rot_17408.hal", (17408, B)),
+                           ("rot_heads.hal", (6144, B, True, (48, 16, 128))), ("rot_head.hal", (5120, 1, False, None, "f32"))):
+            rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
+            open(rot_src[name], "w").write(gen_rot.gen(*args))
+        with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
+            fh.write(gen_rot.signs())
+        geom.append(("rot", 0, 0, 0))
+    # the output head: the tile-free GEMV (gen_gemv) for MQ4, rows per workgroup / lanes / workgroups in its row
+    head_src = None
+    if types["output.weight"] == 44:
+        head_src = os.path.join(tmp, "yah_gemv_head.loom")
+        open(head_src, "w").write(gen_gemv.gen("plain", ["mq4"], 248320, 5120))
+        geom.append(("gemv.hal", gen_gemv.rows_per_wg(), 32 * 4, 248320 // gen_gemv.rows_per_wg()))
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
             fh.write("%s %d %d %d\n" % (hal, tk, rg, tt))
@@ -1712,8 +1734,9 @@ def main():
         *([(vseed_src, "vseed.hal", ["yah_kvq.token_count=%d" % B])] if (vq8_on or vq4_on) else []),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",
          ["yah_rmsnorm.rows=1", "yah_rmsnorm.eps=1e-06"]),
-        ("yah_gemv_q6k_f32.loom", "gemv.hal",
-         ["yah_gemv_q6k.m_rows=248320", "yah_gemv_q6k.k_blocks=20"]),
+        *([(head_src, "gemv.hal", ["nop=0"])] if head_src else [("yah_gemv_q6k_f32.loom", "gemv.hal",
+          ["yah_gemv_q6k.m_rows=248320", "yah_gemv_q6k.k_blocks=20"])]),
+        *[(src, name, ["nop=0"]) for name, src in rot_src.items()],
         ("yah_argmax_f32.loom", "argmax.hal", ["yah_argmax.vocab=248320"]),
     ]
     # Loom low-level LICM (HRX patch 0011) for the attention kernels where it wins: it hoists the fragment loads'
