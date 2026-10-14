@@ -58,8 +58,8 @@ class LoomDecoder {
   static constexpr std::uint32_t kR = 2, kW = 4;  // gen_gemv defaults: rows per wave, waves per workgroup
 
   LoomDecoder(LoomDevice& gpu, const core::Gguf& gguf, const core::Qwen35Config& cfg, std::string dir,
-              hrx_buffer_t weights, std::size_t delta)
-      : gpu_(gpu), gguf_(gguf), cfg_(cfg), dir_(std::move(dir)), weights_(weights), delta_(delta) {
+              const LoomWeights& weights)
+      : gpu_(gpu), gguf_(gguf), cfg_(cfg), dir_(std::move(dir)), weights_(weights) {
     {
       const auto txt = ReadAll(dir_ + "/decode.txt");
       std::istringstream in(std::string(txt.begin(), txt.end()));
@@ -394,7 +394,7 @@ class LoomDecoder {
   }
   hrx_buffer_ref_t TRef(const std::string& n) const {
     const auto* t = Find(n);
-    return {weights_, delta_ + static_cast<std::size_t>(t->offset), static_cast<std::size_t>(t->bytes)};
+    return weights_.Ref(*t);
   }
   LoomExecutable& Load(const std::string& name) {
     auto it = exes_.find(name);
@@ -520,8 +520,7 @@ class LoomDecoder {
   const core::Gguf& gguf_;
   const core::Qwen35Config& cfg_;
   std::string dir_;
-  hrx_buffer_t weights_;
-  std::size_t delta_;
+  const LoomWeights& weights_;
   static constexpr std::uint32_t kAnyTile = 0xffffffffu;
   std::uint32_t T_ = 0, cur_pos_ = 0, kbits_ = 16, vbits_ = 16, next_pos_ = kAnyTile;
   std::vector<hrx_buffer_ref_t> vopen_;  // quantized V: each layer's open tile, [1024][16] f16

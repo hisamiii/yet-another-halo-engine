@@ -100,6 +100,9 @@ class Gguf {
   [[nodiscard]] const std::uint8_t* Data(const TensorInfo& tensor) const {
     return base_ + data_offset_ + tensor.offset;
   }
+  // Drops the host pages wholly inside [offset, offset + bytes) of the tensor-data region, once a device holds its own
+  // copy: Data() then reads zeros (resident) or the file again (mapped) there.
+  void ReleaseData(std::size_t offset, std::size_t bytes);
 
  private:
   Gguf() = default;

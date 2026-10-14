@@ -99,11 +99,13 @@ int main(int argc, char** argv) {
     LoomDevice gpu;
     // The layers queue ~950 dispatches and wait once: the runtime wait would busy-poll a host core the whole time.
     gpu.SetSleepSync(200);
-    LoomWeights weights(gpu, gguf.tensor_data_base(), gguf.tensor_data_size());
-    LoomPrefill pf(gpu, gguf, cfg, argv[2], weights.handle(), weights.delta(), want);
     // YAH_NPU=1: the NPU computes the trailing rows of the set's split GEMMs (a set emitted with YAH_NPU_SPLIT).
+    const char* npu_env = std::getenv("YAH_NPU");
+    const bool npu_on = npu_env && std::string(npu_env) == "1";
+    LoomWeights weights(gpu, gguf, npu_on);
+    LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
-    if (const char* e = std::getenv("YAH_NPU"); e && std::string(e) == "1") {
+    if (npu_on) {
       const auto plan = pf.npu_plan();
       if (plan.a_bytes == 0) {
         std::fprintf(stderr, "YAH_NPU=1: the set has no NPU split (emit it with YAH_NPU_SPLIT)\n");
@@ -224,7 +226,7 @@ int main(int argc, char** argv) {
       const char* ddir = std::getenv("YAH_DECODE_HAL");
       if (!ddir) throw LoomError("YAH_GEN needs YAH_DECODE_HAL (tools/emit_decode.py set)");
       if (T_run + ngen - 1 > pf.context()) throw LoomError("YAH_GEN: prompt + gen exceeds the emitted context");
-      LoomDecoder dec(gpu, gguf, cfg, ddir, weights.handle(), weights.delta());
+      LoomDecoder dec(gpu, gguf, cfg, ddir, weights);
       if (dec.context() != pf.pool_rows())
         throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) + " != prefill pool rows " +
                         std::to_string(pf.pool_rows()));

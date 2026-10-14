@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/gguf.hpp"
 #include "hrx_runtime.h"
 
 namespace yah::model {
@@ -476,22 +477,52 @@ class LoomGraph {
   std::vector<std::array<uint32_t, 3>> grids_;
 };
 
-// The model's tensor-data region (the GGUF mmap) imported once as one device-visible buffer; every tensor is an offset
-// into it. Import needs a page-aligned start, so delta() is the offset of the region inside the import.
+// The model's tensor data on the GPU; Ref(t) binds a tensor. By default it is copied into device-local buffers of about
+// 1 GiB cut at tensor boundaries, each host range released right after its copy (RAM holds one copy of the model):
+// the GPU reads imported host pages snooped, ~6% more GEMM cycles. in_place: the host region imported once (the NPU
+// split also reads the weights through host pointers); the import needs a page-aligned start, hence a delta inside it.
 class LoomWeights {
  public:
-  LoomWeights(LoomDevice& gpu, const void* base, size_t bytes) {
-    const uintptr_t page = 4096;
-    const uintptr_t start = reinterpret_cast<uintptr_t>(base) & ~(page - 1);
-    delta_ = reinterpret_cast<uintptr_t>(base) - start;
-    buffer_ = gpu.Import(reinterpret_cast<void*>(start), bytes + delta_);
+  LoomWeights(LoomDevice& gpu, core::Gguf& gguf, bool in_place = false) {
+    if (in_place) {
+      const uintptr_t base = reinterpret_cast<uintptr_t>(gguf.tensor_data_base()), start = base & ~uintptr_t{4095};
+      LoomBuffer buffer = gpu.Import(reinterpret_cast<void*>(start), gguf.tensor_data_size() + base - start);
+      chunks_.push_back({0, base - start, std::move(buffer)});
+      return;
+    }
+    constexpr size_t kChunk = size_t{1} << 30;
+    constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
+    std::vector<std::pair<size_t, size_t>> spans;
+    for (const auto& t : gguf.tensors()) spans.emplace_back(t.offset, t.offset + t.bytes);
+    std::sort(spans.begin(), spans.end());
+    for (size_t i = 0; i < spans.size();) {
+      const size_t begin = spans[i].first;
+      size_t end = spans[i].second;
+      for (++i; i < spans.size() && spans[i].second - begin <= kChunk; ++i) end = std::max(end, spans[i].second);
+      LoomBuffer buffer = gpu.Allocate(end - begin + kPad);
+      gpu.H2D(buffer, gguf.tensor_data_base() + begin, end - begin);
+      gguf.ReleaseData(begin, end - begin);
+      chunks_.push_back({begin, 0, std::move(buffer)});
+    }
   }
-  [[nodiscard]] hrx_buffer_t handle() const { return buffer_.handle; }
-  [[nodiscard]] size_t delta() const { return delta_; }
+  [[nodiscard]] hrx_buffer_ref_t Ref(const core::TensorInfo& t) const {
+    const size_t off = static_cast<size_t>(t.offset);
+    const auto it = std::upper_bound(chunks_.begin(), chunks_.end(), off,
+                                     [](size_t o, const Chunk& c) { return o < c.begin; }) - 1;
+    return {it->buffer.handle, it->delta + off - it->begin, static_cast<size_t>(t.bytes)};
+  }
+  template <typename F>
+  void ForEachBuffer(F&& f) const {
+    for (const Chunk& c : chunks_) f(c.buffer.handle);
+  }
 
  private:
-  LoomBuffer buffer_;
-  size_t delta_ = 0;
+  struct Chunk {
+    size_t begin;  // tensor-data offset of the buffer's first byte (in_place: 0)
+    size_t delta;  // in_place: the region's offset inside the import
+    LoomBuffer buffer;
+  };
+  std::vector<Chunk> chunks_;
 };
 
 }  // namespace yah::model

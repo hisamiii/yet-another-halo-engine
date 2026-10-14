@@ -58,15 +58,8 @@ int main(int argc, char** argv) {
     if (prompt.empty() || gen_count == 0) throw LoomError("--ids and --gen >= 1 are required");
 
     LoomDevice gpu;
-    LoomBuffer weights;
-    std::size_t delta = 0;
-    {
-      const std::uint8_t* wbase = gguf.tensor_data_base();
-      const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(wbase) & ~std::uintptr_t{4095};
-      delta = reinterpret_cast<std::uintptr_t>(wbase) - start;
-      weights = gpu.Import(reinterpret_cast<void*>(start), gguf.tensor_data_size() + delta);
-    }
-    LoomDecoder dec(gpu, gguf, cfg, dir, weights.handle, delta);
+    LoomWeights weights(gpu, gguf);
+    LoomDecoder dec(gpu, gguf, cfg, dir, weights);
     const std::uint32_t n = static_cast<std::uint32_t>(prompt.size());
     const std::uint32_t steps = n + gen_count - 1;
     if (steps > dec.context()) throw LoomError("prompt + gen exceeds the set's max context");

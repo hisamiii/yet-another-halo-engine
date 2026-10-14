@@ -306,6 +306,15 @@ void Gguf::ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) c
   }
 }
 
+void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
+  constexpr std::uintptr_t kPage = 4096;
+  const auto a = reinterpret_cast<std::uintptr_t>(base_ + data_offset_ + offset);
+  const std::uintptr_t lo = (a + kPage - 1) & ~(kPage - 1), hi = (a + bytes) & ~(kPage - 1);
+  if (hi <= lo) return;
+  ::munlock(reinterpret_cast<void*>(lo), hi - lo);
+  ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
+}
+
 Gguf Gguf::OpenResident(const std::string& path) {
   if (IsHfq(path)) return OpenHfq(path, true);
   Gguf g = Open(path);

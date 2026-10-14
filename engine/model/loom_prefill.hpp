@@ -52,8 +52,8 @@ class LoomPrefill {
 
   // tokens: the token count of a one-pass (unchunked) set; ignored for a chunked set, which fixes B.
   LoomPrefill(LoomDevice& gpu, const core::Gguf& gguf, const core::Qwen35Config& cfg, std::string dir,
-              hrx_buffer_t weights, std::size_t delta, std::uint32_t tokens = 0)
-      : gpu_(gpu), gguf_(gguf), cfg_(cfg), dir_(std::move(dir)), weights_(weights), delta_(delta) {
+              const LoomWeights& weights, std::uint32_t tokens = 0)
+      : gpu_(gpu), gguf_(gguf), cfg_(cfg), dir_(std::move(dir)), weights_(weights) {
     LoadDispatch();
     B_ = tokens;
     T_ = tokens;
@@ -559,7 +559,7 @@ class LoomPrefill {
   }
   static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
   hrx_buffer_ref_t TRef(const core::TensorInfo& t) const {
-    return {weights_, delta_ + static_cast<std::size_t>(t.offset), static_cast<std::size_t>(t.bytes)};
+    return weights_.Ref(t);
   }
   const core::TensorInfo* Find(const std::string& name) const {
     const auto* t = gguf_.Find(name);
@@ -1636,7 +1636,7 @@ class LoomPrefill {
   void NewGraph() {
     chunk_graph_ = std::make_unique<LoomGraph>(gpu_);
     LoomGraph& g = *chunk_graph_;
-    g.ReadOnly(weights_);
+    weights_.ForEachBuffer([&](hrx_buffer_t h) { g.ReadOnly(h); });
     for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
       g.ReadOnly(t->handle);
     graph_ = &g;
@@ -2517,8 +2517,7 @@ class LoomPrefill {
   const core::Gguf& gguf_;
   const core::Qwen35Config& cfg_;
   std::string dir_;
-  hrx_buffer_t weights_;
-  std::size_t delta_;
+  const LoomWeights& weights_;
   std::map<std::string, Geom> geom_;
   std::map<std::string, LoomExecutable> exes_;
   std::deque<LoomBuffer> keep_;  // stable addresses

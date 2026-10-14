@@ -46,9 +46,9 @@ class Engine : public TextGenerator {
       : gguf_(core::Gguf::OpenResident(o.model)),
         cfg_(core::Qwen35Config::FromGguf(gguf_)),
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
-        weights_(gpu_, gguf_.tensor_data_base(), gguf_.tensor_data_size()),
-        prefill_(gpu_, gguf_, cfg_, o.prefill_hal, weights_.handle(), weights_.delta()),
-        decoder_(gpu_, gguf_, cfg_, o.decode_hal, weights_.handle(), weights_.delta()) {
+        weights_(gpu_, gguf_, o.npu),
+        prefill_(gpu_, gguf_, cfg_, o.prefill_hal, weights_),
+        decoder_(gpu_, gguf_, cfg_, o.decode_hal, weights_) {
     if (decoder_.context() != prefill_.pool_rows())
       throw LoomError("engine: decode set context " + std::to_string(decoder_.context()) + " != prefill pool rows " +
                       std::to_string(prefill_.pool_rows()));

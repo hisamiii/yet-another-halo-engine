@@ -4,7 +4,7 @@
 // usage: hal_run <model.gguf> <hal> <gx[,gy]> <wg_size> <min_sizes> <binding>...
 //   min_sizes  comma-separated byte sizes, one per binding: the kernel's declared footprint (gen_gemv.footprint).
 //              A smaller binding stops the run before dispatch (exit 3): a read past an allocation hangs this GPU.
-//   binding    t:<tensor>          a GGUF tensor, bound in place (exact bytes)
+//   binding    t:<tensor>          a GGUF tensor, copied to the device (exact bytes)
 //              f:<file>            a device buffer initialized from the file
 //              o:<bytes>:<file>    a zeroed device buffer, written to <file> after the run
 //              io:<in>:<out>       initialized from <in>, written to <out> after the run
@@ -58,14 +58,6 @@ int main(int argc, char** argv) {
       return 3;
     }
     LoomDevice gpu;
-    LoomBuffer weights;
-    size_t delta = 0;
-    {
-      const std::uint8_t* wbase = gguf.tensor_data_base();
-      const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(wbase) & ~std::uintptr_t{4095};
-      delta = reinterpret_cast<std::uintptr_t>(wbase) - start;
-      weights = gpu.Import(reinterpret_cast<void*>(start), gguf.tensor_data_size() + delta);
-    }
     std::vector<LoomBuffer> owned;
     owned.reserve(nb);
     std::vector<hrx_buffer_ref_t> refs;
@@ -77,7 +69,10 @@ int main(int argc, char** argv) {
         const auto* t = gguf.Find(spec.substr(2));
         if (!t) throw LoomError("tensor not found: " + spec.substr(2));
         size = static_cast<size_t>(t->bytes);
-        refs.push_back({weights.handle, delta + static_cast<size_t>(t->offset), size});
+        // a device copy, as LoomWeights binds the model (64 KiB past it stay mapped)
+        owned.push_back(gpu.Allocate(size + (size_t{64} << 10)));
+        gpu.H2D(owned.back(), gguf.Data(*t), size);
+        refs.push_back({owned.back().handle, 0, size});
       } else if (spec.rfind("f:", 0) == 0 || spec.rfind("io:", 0) == 0) {
         const bool io = spec[0] == 'i';
         std::string in = spec.substr(io ? 3 : 2), out;
