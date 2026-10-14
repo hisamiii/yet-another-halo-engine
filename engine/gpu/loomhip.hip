@@ -5,6 +5,7 @@
 //   buf: f:<path>            device buffer initialised from a raw file
 //        z:<bytes>           zero-filled device buffer
 //        o:<bytes>:<path>    zero-filled, written to <path> after the first launch
+//        fo:<in>:<out>       initialised from <in>, written to <out> after the first launch
 // Kernel arguments are the buffers' device pointers, in order (Loom ABI without scalar arguments: 8 bytes per binding).
 #include <hip/hip_runtime.h>
 
@@ -120,7 +121,15 @@ int main(int argc, char** argv) {
     std::string s = argv[i];
     void* d = nullptr;
     size_t bytes = 0;
-    if (s.rfind("f:", 0) == 0) {
+    if (s.rfind("fo:", 0) == 0) {
+      std::string rest = s.substr(3);
+      size_t c = rest.find(':');
+      auto v = ReadFile(rest.substr(0, c));
+      bytes = v.size();
+      CHECK(hipMalloc(&d, bytes));
+      CHECK(hipMemcpy(d, v.data(), bytes, hipMemcpyHostToDevice));
+      dumps.push_back({static_cast<int>(ptrs.size()), rest.substr(c + 1)});
+    } else if (s.rfind("f:", 0) == 0) {
       auto v = ReadFile(s.substr(2));
       bytes = v.size();
       CHECK(hipMalloc(&d, bytes));
