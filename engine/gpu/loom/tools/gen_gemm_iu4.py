@@ -373,7 +373,7 @@ def gen(kind, M, out16=False):
     else:
         TG.OUT16, TG.OSTRIDE = out16, 0
         try:
-            TG.lds_epilogue(e, t, kind == "kres", V8, qg=kind == "kqg")
+            TG.lds_epilogue(e, t, kind == "kres", V8, qg=kind == "kqg", col_fence=kind == "kres")
         finally:
             TG.OUT16 = False
     e("  kernel.return")
