@@ -1,0 +1,103 @@
+Loom: the inline-accumulator iu4 WMMA forms (`.acc_zero`, `.acc_inv_2pi`) get their own measured gfx1151 placement
+preference: 16 cycles iff A and B start in different VGPR banks (mod 4), else 17. 0031 qualified only the
+register-accumulator form, so the k-step-0 WMMAs of every tile landed with A and B in one bank. The generated
+placement bindings now carry a preference index per qualification. Steady-loop WMMA issue: gu 16.16 -> 16.00 cycles,
+plain/kres 16.19 -> 16.06; bit-identical results, pp2048 cycles -0.6%.
+diff --git a/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_descriptor_tables.py b/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_descriptor_tables.py
+index f09b735fe..8341da781 100644
+--- a/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_descriptor_tables.py
++++ b/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_descriptor_tables.py
+@@ -43,7 +43,10 @@ from loom.gen.target.arch.amdgpu.refs.amdgpu_target_refs import (  # noqa: E402
+     generate_target_ref_outputs,
+     select_target_ref_descriptor_set_infos,
+ )
+-from loom.target.arch.amdgpu.descriptors.matrix import MATRIX_OPERAND_PLACEMENT_QUALIFICATIONS  # noqa: E402
++from loom.target.arch.amdgpu.descriptors.matrix import (  # noqa: E402
++    MATRIX_INLINE_ACCUMULATOR_PLACEMENT_QUALIFICATIONS,
++    MATRIX_OPERAND_PLACEMENT_QUALIFICATIONS,
++)
+ from loom.target.arch.amdgpu.target_info import (  # noqa: E402
+     amdgpu_descriptor_set_ordinal,
+     amdgpu_target_descriptor_set_key,
+@@ -58,7 +61,11 @@ def _instruction_placement_bindings(inputs: AmdgpuPlanningTableInputs) -> str:
+     lookups: dict[tuple[str, str, int], list[int]] = {}
+     bindings: list[tuple[int, int, tuple[str, str, int]]] = []
+     ranges: list[tuple[int, int]] = []
+-    qualifications = set(MATRIX_OPERAND_PLACEMENT_QUALIFICATIONS)
++    # Preference index per qualification (placement.c kInstructionPreferences + 1): register accumulators 1,
++    # inline accumulators 2.
++    rules = {row: 1 for row in MATRIX_OPERAND_PLACEMENT_QUALIFICATIONS}
++    rules.update({row: 2 for row in MATRIX_INLINE_ACCUMULATOR_PLACEMENT_QUALIFICATIONS})
++    qualifications = set(rules)
+     processors = sorted_processor_infos()
+     unknown = {row[0] for row in qualifications} - {info.processor for info in processors}
+     if unknown:
+@@ -76,15 +83,17 @@ def _instruction_placement_bindings(inputs: AmdgpuPlanningTableInputs) -> str:
+                     raise ValueError(f"placement qualification '{descriptor_key}' is absent from '{key}'")
+                 descriptor = descriptor_set.descriptors[ordinal]
+                 operands = tuple(operand for operand in descriptor.operands if operand.role is OperandRole.OPERAND)
+-                if tuple(operand.field_name for operand in operands) != ("lhs", "rhs", "acc") or any(
+-                    operand.unit_count < minimum or not any(alt.reg_class is not None for alt in operand.reg_alts) for operand, minimum in zip(operands, (1, 1, 2), strict=True)
++                rule = rules[(name, subgroup_size, descriptor_key)]
++                names, minimums = (("lhs", "rhs", "acc"), (1, 1, 2)) if rule == 1 else (("lhs", "rhs"), (1, 1))
++                if tuple(operand.field_name for operand in operands) != names or any(
++                    operand.unit_count < minimum or not any(alt.reg_class is not None for alt in operand.reg_alts) for operand, minimum in zip(operands, minimums, strict=True)
+                 ):
+-                    raise ValueError(f"placement qualification '{descriptor_key}' requires register lhs/rhs/acc coordinates and two accumulator units")
++                    raise ValueError(f"placement qualification '{descriptor_key}' requires register {'/'.join(names)} coordinates" + (" and two accumulator units" if rule == 1 else ""))
+                 # Descriptor vocabulary may be shared without sharing measured
+                 # processor/subgroup qualifications.
+                 lookup_key = (key, name, subgroup_size)
+                 lookup = lookups.setdefault(lookup_key, [0] * len(descriptor_set.descriptors))
+-                lookup[ordinal] = 1
++                lookup[ordinal] = rule
+                 binding = (amdgpu_descriptor_set_ordinal(key), subgroup_size, lookup_key)
+                 if binding not in bindings[first_binding:]:
+                     bindings.append(binding)
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py b/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
+index f514e1a4c..b90020d7e 100644
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
+@@ -27,6 +27,14 @@ MATRIX_OPERAND_PLACEMENT_QUALIFICATIONS = (
+     ("gfx1151", 32, "amdgpu.v_wmma_i32_16x16x16_iu4"),
+ )
+ 
++# Measured placement qualifications of inline-accumulator forms (no accumulator
++# register): gfx1151 iu4 issues in 16 cycles iff A and B start in different
++# banks, else 17, whatever the result's bank.
++MATRIX_INLINE_ACCUMULATOR_PLACEMENT_QUALIFICATIONS = (
++    ("gfx1151", 32, "amdgpu.v_wmma_i32_16x16x16_iu4.acc_zero"),
++    ("gfx1151", 32, "amdgpu.v_wmma_i32_16x16x16_iu4.acc_inv_2pi"),
++)
++
+ _WMMA_GFX11_WAVE64_ACCUMULATOR_SIZE_REASON = "gfx11-wave64-wmma-half-width-accumulator"
+ _GFX12_WAVE64_MATRIX_OPERAND_SIZE_REASON = "gfx12-wave64-matrix-half-width-operands"
+ _CDNA4_F8F6F4_VARIABLE_OPERAND_WIDTH_REASON = (
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/placement.c b/loom/src/loom/target/arch/amdgpu/planning/placement.c
+index 6f38a7afe..fa5841758 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/placement.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/placement.c
+@@ -33,9 +33,23 @@ static const loom_low_placement_clause_t kMatrixClauses[] = {
+     {5, 2, 1, LOOM_LOW_PLACEMENT_CLAUSE_ALL},
+     {7, 2, 1, LOOM_LOW_PLACEMENT_CLAUSE_ALL},
+ };
++// Inline-accumulator forms: one rank when A and B share a bank modulo four.
++static const loom_low_placement_value_ref_t kInlineMatrixValues[] = {
++    {0, LOOM_LOW_PLACEMENT_VALUE_OPERAND, 0},
++    {0, LOOM_LOW_PLACEMENT_VALUE_OPERAND, 1},
++};
++static const loom_low_placement_predicate_t kInlineMatrixPredicates[] = {
++    {0, 1, 0, 0, 1, LOOM_LOW_PLACEMENT_RELATION_DIFFERENT_MASKED_LOCATION, 3},
++};
++static const loom_low_placement_clause_t kInlineMatrixClauses[] = {
++    {0, 1, 1, LOOM_LOW_PLACEMENT_CLAUSE_ANY},
++};
++// Indexed by the generated descriptor lookup minus one.
+ static const loom_low_placement_preference_t kInstructionPreferences[] = {
+     {kMatrixValues, kMatrixPredicates, kMatrixClauses,
+      IREE_ARRAYSIZE(kMatrixValues), IREE_ARRAYSIZE(kMatrixClauses)},
++    {kInlineMatrixValues, kInlineMatrixPredicates, kInlineMatrixClauses,
++     IREE_ARRAYSIZE(kInlineMatrixValues), IREE_ARRAYSIZE(kInlineMatrixClauses)},
+ };
+ 
+ typedef struct loom_amdgpu_placement_binding_t {
