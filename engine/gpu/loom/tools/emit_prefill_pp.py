@@ -1381,6 +1381,8 @@ def main():
             for k in (["gu"] if kind == "swiglu" else kinds):
                 if k != "kstore" or kind != "residual":
                     geom.append(iu4_gemm(k, mt, kb, B, outdir))
+                    if gen_gemm_iu4.group_of(k, mt * 16):   # grouped grid: the engine launches (G, tiles, row tiles / G)
+                        geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
             n += 1
             continue
         for k in kinds:

@@ -1268,7 +1268,13 @@ class LoomPrefill {
     rb.insert(rb.end(), row_bytes);
     const std::uint32_t tt = Trim(b, 1, rb, g);
     const char* sfx = std::strcmp(kind, "kres") == 0 ? "_kres" : std::strcmp(kind, "kqg") == 0 ? "_kqg" : std::strcmp(kind, "gu") == 0 ? "_gu" : "";
-    Dispatch(Exe(hal), (std::string("yah_iu4_gemm") + sfx).c_str(), MTiles(t) / g.rowgrp, tt, 1, 32, 1, 1, b, writes);
+    // dispatch.txt "iu4grp_<hal> G": grouped grid (G, token tiles, row tiles / G), x fastest = bands of G weight tiles
+    std::uint32_t gx = MTiles(t) / g.rowgrp, gz = 1;
+    if (const auto it = geom_.find("iu4grp_" + hal); it != geom_.end()) {
+      if (it->second.tokens == 0 || gx % it->second.tokens != 0) throw LoomError(hal + ": iu4grp does not divide the row tiles");
+      gz = gx / it->second.tokens, gx = it->second.tokens;
+    }
+    Dispatch(Exe(hal), (std::string("yah_iu4_gemm") + sfx).c_str(), gx, tt, gz, 32, 1, 1, b, writes);
   }
   // Debug (YAH_DUMP_ACT=<prefix>, YAH_DUMP_LAYERS=l0,l1,..): the row-major f16 output of each RMSNorm that feeds a GEMM
   // in those layers (n_ rows x 5120) to <prefix>_<norm weight name>.f16, from an extra norm.hal pass into its own buffer.

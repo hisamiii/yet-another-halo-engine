@@ -27,6 +27,18 @@ WP = 20         # LDS dwords per staged row: 16 of nibbles + 4 of pad (16-byte r
 V8 = "vector<8xf32>"
 VI = "vector<8xi32>"
 V2 = "vector<2xi32>"
+GROUP = 8   # grouped workgroup order: row tiles per launch band (group_of)
+
+
+def group_of(kind, M):
+    """Row tiles per launch band: the largest divisor of the row tile count <= GROUP. The grid is (G, token tiles, row
+    tiles / G); x runs fastest, so a band of G weight tiles serves every token tile before the next band starts (its 16
+    re-reads hit the MALL instead of DRAM: gu -2%) and consecutive workgroups still touch different weight tiles
+    (staggered first fetches; token-fast order stalls on them). Nothing derives from the grid size (Loom folds
+    workgroup.count to the config), so the engine's one-tile Trim launch stays right."""
+    BM = tile(M)[0]
+    n = M // (BM // 2 if kind == "gu" else BM)
+    return max(g for g in range(1, min(GROUP, n) + 1) if n % g == 0)
 
 
 def tile(M):
@@ -73,7 +85,13 @@ def gen(kind, M, out16=False):
     e(f"  %wgs = index.constant {LANES} : index")
     e(f"  %rowgrp = index.constant {BO // 16} : index")
     e("  %m_groups = index.div %m_tiles, %rowgrp : index")
-    e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
+    G = group_of(kind, M)
+    if G:
+        e(f"  %grp = index.constant {G} : index")
+        e("  %m_bands = index.div %m_groups, %grp : index")
+        e("  kernel.launch.config workgroups(%grp, %token_tiles, %m_bands) workgroup_size(%wgs, %unit, %unit) : index")
+    else:
+        e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
     e("  %base = index.constant 0 : offset")
     for v in sorted({0, 1, 2, 4, 8, 16, 32, 64, 256, WP, BM, BN, LANES}):
@@ -113,7 +131,14 @@ def gen(kind, M, out16=False):
     e(f"  %lv = buffer.view %al[%base] : buffer -> view<{LDSW}xi32>")
     e(f"  %lf = buffer.view %al[%base] : buffer -> view<{LDSW}xf32>")
     e(f"  %lb = buffer.view %al[%base] : buffer -> view<{LDSW * 4}xi8>")   # K-loop accesses: byte offsets need no shifts
-    e("  %wg_x = kernel.workgroup.id<x> : index")
+    if G:
+        e("  %wg_gx = kernel.workgroup.id<x> : index")
+        e("  %wg_gz = kernel.workgroup.id<z> : index")
+        e(f"  %wg_gc = index.constant {G} : index")
+        e("  %wg_gb = index.mul %wg_gz, %wg_gc : index")
+        e("  %wg_x = index.add %wg_gb, %wg_gx : index")
+    else:
+        e("  %wg_x = kernel.workgroup.id<x> : index")
     e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
     e("  %wave = index.div %tid, %c32 : index")

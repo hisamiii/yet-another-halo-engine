@@ -1,7 +1,7 @@
 // hal_run: dispatches one HAL once with bindings from GGUF tensors and files, then writes the output bindings to files.
 // A correctness harness for generated kernels (e.g. gen_gemv.py decode GEMVs) against an external numpy oracle.
 //
-// usage: hal_run <model.gguf> <hal> <gx[,gy]> <wg_size> <min_sizes> <binding>...
+// usage: hal_run <model.gguf> <hal> <gx[,gy[,gz]]> <wg_size> <min_sizes> <binding>...
 //   min_sizes  comma-separated byte sizes, one per binding: the kernel's declared footprint (gen_gemv.footprint).
 //              A smaller binding stops the run before dispatch (exit 3): a read past an allocation hangs this GPU.
 //   binding    t:<tensor>          a GGUF tensor, copied to the device (exact bytes)
@@ -42,9 +42,11 @@ int main(int argc, char** argv) {
   try {
     auto gguf = yah::core::Gguf::OpenResident(argv[1]);
     const std::string hal = argv[2];
-    const uint32_t gx = static_cast<uint32_t>(std::atoi(argv[3]));  // "gx" or "gx,gy"
+    const uint32_t gx = static_cast<uint32_t>(std::atoi(argv[3]));  // "gx", "gx,gy" or "gx,gy,gz"
     const char* comma = std::strchr(argv[3], ',');
     const uint32_t gy = comma ? static_cast<uint32_t>(std::atoi(comma + 1)) : 1;
+    const char* comma2 = comma ? std::strchr(comma + 1, ',') : nullptr;
+    const uint32_t gz = comma2 ? static_cast<uint32_t>(std::atoi(comma2 + 1)) : 1;
     const uint32_t wg = static_cast<uint32_t>(std::atoi(argv[4]));
     std::vector<size_t> mins;
     {
@@ -109,7 +111,7 @@ int main(int argc, char** argv) {
       }
     }
     LoomExecutable exe = gpu.Load(hal);
-    const auto cfg = LoomDevice::Config(gx, gy, 1, wg, 1, 1);
+    const auto cfg = LoomDevice::Config(gx, gy, gz, wg, 1, 1);
     const auto t_first = std::chrono::steady_clock::now();
     gpu.Dispatch(exe, 0, cfg, nullptr, 0, refs.data(), refs.size());
     gpu.Synchronize();
