@@ -2,12 +2,13 @@
 """Tile GEMM yah_iu4_gemm[_kres|_kqg|_gu]: MQ4G256 weights x int4 activations (the A4 path) on v_wmma_i32_16x16x16_iu4.
 
 Weights: MQ4G256 rows (136 B per 256 K: f16 scale0, zero0, scale1, zero1, 128 B of nibbles), the loader's signed codes, so
-w = code * scale per 128 K. Activations: gen_rot.gen_q's int4 rows (aq, [tokens][K / 2] bytes) and f32 scales (ad, one per
-128 values of each token).
+w = code * scale per 128 K. Activations: gen_rot.gen_q's int4 rows (aq, [tokens][K / 2] bytes) and f32 scales times 2^26
+(ad, one per 128 values of each token).
 Workgroup: BM rows x BN tokens over WM x WN wave32 waves, TM x TN each. Per 128-K phase the workgroup stages the weight
 nibbles and scales and the activation nibbles and scales in LDS (double-buffered, one barrier per phase); each wave
-runs 8 k steps of i32 WMMAs into zeroed accumulators, then folds them into its f32 accumulators:
-acc += f32(c) * (weight scale * activation scale).
+runs 8 k steps of i32 WMMAs into accumulators seeded with the bits of 1/(2 pi), then folds them into its f32
+accumulators: acc += (f32 bits - 1/(2 pi)) * (weight scale * activation scale * 2^26), the same values as f32(c) * the
+scales.
 The iu4 C layout (wave32): element i of lane l is row 2 i + l / 16, token l % 16, so the weight scale is a per-element
 vector (LDS holds each 16-row tile's scales in that order) and the activation scale is one value per lane.
 Epilogues: gen_gemm_tile.lds_epilogue (kstore, kres, kqg); the 48-row tile (TM 16) stores its f32 fragments; gu pairs
@@ -285,8 +286,12 @@ def gen(kind, M, out16=False):
         e(f"  %ft{j} = index.add %ft{j}2, %ft{j}cw : index")
         e(f"  %fd{j} = index.add %ft{j}1, %ds_base : index")   # this lane's token's activation scale
     e("  %schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>")
-    e("  %zi = scalar.constant 0 : i32")
-    e(f"  %zv = vector.splat %zi : {VI}")
+    # WMMA chains start from the bits of 1/(2 pi) (an inline source): the result, read as f32, is 1/(2 pi) + c * 2^-26
+    # exactly (|c| <= 8192), so one subtract converts it; rotq stores the activation scales times 2^26 to match
+    e("  %mzi = scalar.constant 1042479491 : i32")
+    e(f"  %mzv = vector.splat %mzi : {VI}")
+    e("  %minv = scalar.constant 0.15915494 : f32")
+    e(f"  %minvv = vector.splat %minv : {V8}")
     e("  %zf = scalar.constant 0.0 : f32")
     e(f"  %zfv = vector.splat %zf : {V8}")
     NA = FM * FN
@@ -315,7 +320,7 @@ def gen(kind, M, out16=False):
             for i in range(FM):
                 for j in range(FN):
                     if st == 0:
-                        e(f"    %{q}init{i}_{j} = vector.fragment<init> %zv shape [%m, %n] : {VI}")
+                        e(f"    %{q}init{i}_{j} = vector.fragment<init> %mzv shape [%m, %n] : {VI}")
                         c[i, j] = f"%{q}init{i}_{j}"
                     e(f"    %{q}c{st}_{i}_{j} = vector.mma %{q}lhs{st}_{i}, %{q}rhs{st}_{j}, {c[i, j]} : {V2}, {V2}, {VI}")
                     c[i, j] = f"%{q}c{st}_{i}_{j}"
@@ -331,7 +336,8 @@ def gen(kind, M, out16=False):
         for i in range(FM):
             for j in range(FN):
                 x = i * FN + j
-                e(f"    %{q}cf{x} = vector.sitofp {c[i, j]} : {VI} to {V8}")
+                e(f"    %{q}cb{x} = vector.bitcast {c[i, j]} : {VI} to {V8}")
+                e(f"    %{q}cf{x} = vector.subf %{q}cb{x}, %minvv : {V8}")
                 e(f"    %{q}sc{x} = vector.mulf %{q}ws{i}, %{q}dtv{j} : {V8}")
                 e(f"    %{q}f{x} = vector.fmaf %{q}cf{x}, %{q}sc{x}, {acc[x]} : {V8}")
                 out.append(f"%{q}f{x}")

@@ -1,0 +1,440 @@
+Loom: an iu4 WMMA whose accumulator is a splat of the i32 bits of 1/(2 pi) selects a form with that inline source in
+SRC2 (`.acc_inv_2pi`, beside `.acc_zero`), x - c with an inline f32 constant c selects v_subrev_f32 with c in src0,
+and VOPD pairs such a subrev (new BINARY_SRC0_INLINE component form: the inline source needs no register bank). Yah
+seeds the iu4 GEMM accumulators with those bits: read as f32 the result is 1/(2 pi) + c * 2^-26 exactly, so one
+paired subtract replaces the int-to-float conversion (activation scales stored times 2^26). Bit-identical results;
+fold VALU -19% per phase, pp2048 GEMM cycles unchanged (the shorter loop waits on its next-phase loads).
+diff --git a/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables.py b/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables.py
+--- a/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables.py
++++ b/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables.py
+@@ -55,6 +55,7 @@
+ _DESCRIPTOR_SET_GROUP_RDNA4_GFX125X = "rdna4_gfx125x"
+ 
+ _FORM_BINARY_VGPR = "LOOM_AMDGPU_VOPD_COMPONENT_FORM_BINARY_VGPR"
++_FORM_BINARY_SRC0_INLINE = "LOOM_AMDGPU_VOPD_COMPONENT_FORM_BINARY_SRC0_INLINE"
+ _FORM_CNDMASK_VCC = "LOOM_AMDGPU_VOPD_COMPONENT_FORM_CNDMASK_VCC"
+ _FORM_FMAAK_LITERAL = "LOOM_AMDGPU_VOPD_COMPONENT_FORM_FMAAK_LITERAL"
+ _FORM_FMAMK_LITERAL = "LOOM_AMDGPU_VOPD_COMPONENT_FORM_FMAMK_LITERAL"
+@@ -371,6 +372,13 @@
+         _component("add_f32", 4),
+         _component("sub_f32", 5),
+         _component("subrev_f32", 6),
++        _component(
++            "subrev_f32",
++            6,
++            descriptor_key="amdgpu.v_subrev_f32.src0_inline",
++            form=_FORM_BINARY_SRC0_INLINE,
++            source_register_mask=_SOURCE_VSRC1,
++        ),
+         _component("mov_b32", 8, form=_FORM_INLINE_MOV, source_register_mask=_SOURCE_NONE),
+         _component(
+             "mov_b32",
+@@ -736,7 +744,7 @@
+         _FORM_FMAMK_LITERAL,
+     ):
+         return 0 if source_mask == _SOURCE_SRC0 else 1
+-    if component.form == _FORM_REGISTER_MOV:
++    if component.form in (_FORM_REGISTER_MOV, _FORM_BINARY_SRC0_INLINE):
+         return 0
+     raise ValueError(f"AMDGPU VOPD component '{component.descriptor_key}' has unsupported source form '{component.form}'")
+ 
+@@ -754,7 +762,7 @@
+         return 3
+     if component.form == _FORM_INLINE_MOV:
+         return 0
+-    if component.form == _FORM_REGISTER_MOV:
++    if component.form in (_FORM_REGISTER_MOV, _FORM_BINARY_SRC0_INLINE):
+         return 1
+     raise ValueError(f"AMDGPU VOPD component '{component.descriptor_key}' has unsupported operand form '{component.form}'")
+ 
+diff --git a/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py b/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py
+--- a/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py
++++ b/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py
+@@ -101,6 +101,7 @@
+     "amdgpu.v_sub_f32",
+     "amdgpu.v_sub_f32.lit",
+     "amdgpu.v_sub_f32.src0_inline",
++    "amdgpu.v_subrev_f32.src0_inline",
+     "amdgpu.v_mul_f32",
+     "amdgpu.v_mul_f32.lit",
+     "amdgpu.v_mul_f32.src0_inline",
+@@ -2415,6 +2416,7 @@
+     literal_source: str,
+     nonliteral_source: str,
+     f32_operand: bool = False,
++    operand_name: str = "rhs",
+     extra_guards: tuple[Guard, ...] = (),
+ ) -> DescriptorRule:
+     descriptor = _descriptor(descriptor_key)
+@@ -2434,7 +2436,7 @@
+             EmitDescriptorOp(
+                 descriptor=descriptor,
+                 operands={
+-                    "rhs": _f32_vgpr_operand(nonliteral_source)
++                    operand_name: _f32_vgpr_operand(nonliteral_source)
+                     if f32_operand
+                     else ValueRef.operand(nonliteral_source)
+                 },
+@@ -2457,6 +2459,7 @@
+     nonliteral_source: str,
+     literal_value: float,
+     f32_operand: bool = False,
++    operand_name: str = "rhs",
+     extra_guards: tuple[Guard, ...] = (),
+ ) -> DescriptorRule:
+     descriptor = _descriptor(descriptor_key)
+@@ -2477,7 +2480,7 @@
+             EmitDescriptorOp(
+                 descriptor=descriptor,
+                 operands={
+-                    "rhs": _f32_vgpr_operand(nonliteral_source)
++                    operand_name: _f32_vgpr_operand(nonliteral_source)
+                     if f32_operand
+                     else ValueRef.operand(nonliteral_source)
+                 },
+@@ -3514,6 +3517,20 @@
+             nonliteral_source="rhs",
+             f32_operand=True,
+         ),
++        # x - c: the reversed subtract takes the constant in src0, so it stays VOPD-pairable without a register
++        *(
++            _f32_inline_binary_rule(
++                vector.vector_subf,
++                _VEC_F32_STATIC,
++                "amdgpu.v_subrev_f32.src0_inline",
++                literal_source="rhs",
++                nonliteral_source="lhs",
++                literal_value=literal_value,
++                f32_operand=True,
++                operand_name="lhs",
++            )
++            for literal_value in AMDGPU_SOURCE_INLINE_F32_VALUES
++        ),
+     )
+ 
+ 
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/contracts.py b/loom/py/loom/target/arch/amdgpu/descriptors/contracts.py
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/contracts.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/contracts.py
+@@ -89,6 +89,7 @@
+     "amdgpu.v_sub_f32": _v_sub_f32_overlay,
+     "amdgpu.v_sub_f32.lit": _v_sub_f32_literal_overlay,
+     "amdgpu.v_sub_f32.src0_inline": _v_sub_f32_src0_inline_overlay,
++    "amdgpu.v_subrev_f32.src0_inline": _v_subrev_f32_src0_inline_overlay,
+     "amdgpu.v_mul_f32": _v_mul_f32_overlay,
+     "amdgpu.v_mul_f32.lit": _v_mul_f32_literal_overlay,
+     "amdgpu.v_mul_f32.src0_inline": _v_mul_f32_src0_inline_overlay,
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py b/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/matrix.py
+@@ -97,45 +97,75 @@
+     )
+ 
+ 
++# Inline accumulator forms: (descriptor key suffix, accumulator element bits, ISA predefined source name).
++_ZERO_ACCUMULATOR_FORM = ("acc_zero", 0, "0")
++# Integer accumulators seeded with the 1/(2 pi) inline source read its f32 bit pattern 0x3e22f983: an i32 WMMA result
++# is then the f32 value 1/(2 pi) + c * 2^-26 exactly for |c| < 2^21, so one f32 subtract replaces the int-to-float
++# conversion.
++_INV_2PI_ACCUMULATOR_FORM = ("acc_inv_2pi", 0x3E22F983, "0.15915494")
++
++
+ def _with_zero_accumulator_form(
+     overlay: AmdgpuDescriptorOverlay,
+-) -> tuple[AmdgpuDescriptorOverlay, AmdgpuDescriptorOverlay]:
++) -> tuple[AmdgpuDescriptorOverlay, ...]:
++    return _with_inline_accumulator_forms(overlay, (_ZERO_ACCUMULATOR_FORM,))
++
++
++def _with_inline_accumulator_forms(
++    overlay: AmdgpuDescriptorOverlay,
++    forms: tuple[tuple[str, int, str], ...],
++) -> tuple[AmdgpuDescriptorOverlay, ...]:
+     if overlay.mnemonic is None:
+         raise ValueError(
+             f"WMMA descriptor '{overlay.descriptor_key}' needs a mnemonic for "
+-            "its zero-accumulator asm form"
++            "its inline-accumulator asm forms"
+         )
+-    zero_descriptor_key = f"{overlay.descriptor_key}.acc_zero"
+     source_overlay = replace(
+         overlay,
+         operand_forms=(
+             *overlay.operand_forms,
+-            OperandForm(
+-                replacement_descriptor=zero_descriptor_key,
+-                matches=(
+-                    OperandFormMatch(
+-                        source_operand="acc",
+-                        match_kind=OperandFormMatchKind.ALL_EQUAL_I64,
+-                        match_i64=0,
++            *(
++                OperandForm(
++                    replacement_descriptor=f"{overlay.descriptor_key}.{suffix}",
++                    matches=(
++                        OperandFormMatch(
++                            source_operand="acc",
++                            match_kind=OperandFormMatchKind.ALL_EQUAL_I64,
++                            match_i64=bits,
++                        ),
+                     ),
+-                ),
++                )
++                for suffix, bits, _ in forms
+             ),
+         ),
+     )
++    return (
++        source_overlay,
++        *(
++            _inline_accumulator_overlay(overlay, suffix, source_name)
++            for suffix, _, source_name in forms
++        ),
++    )
++
++
++def _inline_accumulator_overlay(
++    overlay: AmdgpuDescriptorOverlay, suffix: str, source_name: str
++) -> AmdgpuDescriptorOverlay:
++    inline_descriptor_key = f"{overlay.descriptor_key}.{suffix}"
+ 
+-    zero_operands = tuple(
++    inline_operands = tuple(
+         operand_overlay
+         for operand_overlay in overlay.operands
+         if operand_overlay.descriptor_operand.field_name != "acc"
+     )
+-    zero_result_names = tuple(
++    inline_result_names = tuple(
+         operand_overlay.descriptor_operand.field_name
+-        for operand_overlay in zero_operands
++        for operand_overlay in inline_operands
+         if operand_overlay.descriptor_operand.role is OperandRole.RESULT
+     )
+-    zero_operand_names = tuple(
++    inline_operand_names = tuple(
+         operand_overlay.descriptor_operand.field_name
+-        for operand_overlay in zero_operands
++        for operand_overlay in inline_operands
+         if operand_overlay.descriptor_operand.role
+         in (OperandRole.OPERAND, OperandRole.PREDICATE, OperandRole.RESOURCE)
+         and OperandFlag.IMPLICIT not in operand_overlay.descriptor_operand.flags
+@@ -145,17 +175,17 @@
+         if len(overlay.asm_forms) != 1:
+             raise ValueError(
+                 f"WMMA descriptor '{overlay.descriptor_key}' must have exactly "
+-                "one base asm form for its zero-accumulator asm form"
++                "one base asm form for its inline-accumulator asm forms"
+             )
+         base_native_mnemonic = (
+             overlay.asm_forms[0].native_assembly_mnemonic or overlay.mnemonic
+         )
+-    zero_native_values = tuple(
+-        _native_result(field_name) for field_name in zero_result_names
+-    ) + tuple(_native_operand(field_name) for field_name in zero_operand_names)
+-    zero_native_modifiers = ()
++    inline_native_values = tuple(
++        _native_result(field_name) for field_name in inline_result_names
++    ) + tuple(_native_operand(field_name) for field_name in inline_operand_names)
++    inline_native_modifiers = ()
+     if overlay.asm_forms is not None:
+-        zero_native_modifiers = tuple(
++        inline_native_modifiers = tuple(
+             value
+             for value in overlay.asm_forms[0].native_assembly_values
+             if value.kind
+@@ -165,29 +195,29 @@
+                 NativeAsmValueKind.IMMEDIATE_TARGET_FORMAT,
+             )
+         )
+-    zero_overlay = replace(
++    inline_overlay = replace(
+         overlay,
+-        descriptor_key=zero_descriptor_key,
+-        operands=zero_operands,
++        descriptor_key=inline_descriptor_key,
++        operands=inline_operands,
+         fixed_encoding_fields=(
+             *overlay.fixed_encoding_fields,
+-            ("SRC2", _predefined("0")),
++            ("SRC2", _predefined(source_name)),
+         ),
+         constraints=_EARLY_CLOBBER_RESULT_CONSTRAINTS,
+         operand_forms=(),
+         asm_forms=_asm(
+-            mnemonic=f"{overlay.mnemonic}_acc_zero",
++            mnemonic=f"{overlay.mnemonic}_{suffix}",
+             native_assembly_mnemonic=base_native_mnemonic,
+-            results=zero_result_names,
+-            operands=zero_operand_names,
++            results=inline_result_names,
++            operands=inline_operand_names,
+             native_assembly_values=(
+-                *zero_native_values,
+-                _native_literal("0"),
+-                *zero_native_modifiers,
++                *inline_native_values,
++                _native_literal(source_name),
++                *inline_native_modifiers,
+             ),
+         ),
+     )
+-    return source_overlay, zero_overlay
++    return inline_overlay
+ 
+ 
+ def _v_wmma_f32_16x16x16_f16_overlay(
+@@ -1874,5 +1904,8 @@
+     "_v_wmma_i32_16x16x16_overlay",
+     "_v_wmma_i32_16x16x32_iu4_overlay",
+     "_vop3p_packed_dot_fixed_fields",
++    "_with_inline_accumulator_forms",
++    "_INV_2PI_ACCUMULATOR_FORM",
++    "_ZERO_ACCUMULATOR_FORM",
+     "_with_zero_accumulator_form",
+ )
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/sets.py b/loom/py/loom/target/arch/amdgpu/descriptors/sets.py
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/sets.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/sets.py
+@@ -1490,11 +1490,12 @@
+                 mirrors_sign_select_to_high_halves=True,
+             )
+         ),
+-        *_with_zero_accumulator_form(
++        *_with_inline_accumulator_forms(
+             _v_wmma_i32_16x16x16_iu4_overlay(
+                 operand_units=2,
+                 mirrors_sign_select_to_high_halves=True,
+-            )
++            ),
++            (_ZERO_ACCUMULATOR_FORM, _INV_2PI_ACCUMULATOR_FORM),
+         ),
+         *_with_zero_accumulator_form(
+             _v_wmma_i32_16x16x16_iu4_overlay(
+diff --git a/loom/src/loom/target/arch/amdgpu/instruction_constraints.c b/loom/src/loom/target/arch/amdgpu/instruction_constraints.c
+--- a/loom/src/loom/target/arch/amdgpu/instruction_constraints.c
++++ b/loom/src/loom/target/arch/amdgpu/instruction_constraints.c
+@@ -180,6 +180,7 @@
+     case LOOM_AMDGPU_DESCRIPTOR_REF_V_SWMMAC_I32_16X16X64_IU4:
+     case LOOM_AMDGPU_DESCRIPTOR_REF_V_WMMA_I32_16X16X16_IU4:
+     case LOOM_AMDGPU_DESCRIPTOR_REF_V_WMMA_I32_16X16X16_IU4_ACC_ZERO:
++    case LOOM_AMDGPU_DESCRIPTOR_REF_V_WMMA_I32_16X16X16_IU4_ACC_INV_2PI:
+     case LOOM_AMDGPU_DESCRIPTOR_REF_V_WMMA_I32_16X16X16_IU4_W64:
+     case LOOM_AMDGPU_DESCRIPTOR_REF_V_WMMA_I32_16X16X16_IU4_W64_ACC_ZERO:
+     case LOOM_AMDGPU_DESCRIPTOR_REF_V_WMMA_I32_16X16X16_IU8:
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/vopd_component.h b/loom/src/loom/target/arch/amdgpu/planning/vopd_component.h
+--- a/loom/src/loom/target/arch/amdgpu/planning/vopd_component.h
++++ b/loom/src/loom/target/arch/amdgpu/planning/vopd_component.h
+@@ -109,6 +109,8 @@
+   LOOM_AMDGPU_VOPD_COMPONENT_FORM_REGISTER_MOV = 5,
+   // Two-source conditional select with an unencoded VCC predicate operand.
+   LOOM_AMDGPU_VOPD_COMPONENT_FORM_CNDMASK_VCC = 6,
++  // Two-source VALU component whose src0 is an inline constant.
++  LOOM_AMDGPU_VOPD_COMPONENT_FORM_BINARY_SRC0_INLINE = 7,
+ } loom_amdgpu_vopd_component_form_t;
+ 
+ typedef enum loom_amdgpu_vopd_component_lane_bits_e {
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
+--- a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
+@@ -1230,6 +1230,42 @@
+   return true;
+ }
+ 
++static bool loom_amdgpu_vopd_read_binary_src0_inline_component(
++    const loom_amdgpu_vopd_plan_builder_t* builder,
++    const loom_low_packet_view_t* packet,
++    loom_amdgpu_vopd_candidate_component_t* out_component) {
++  *out_component = (loom_amdgpu_vopd_candidate_component_t){0};
++
++  const loom_op_t* op = packet->node->op;
++  if (op->result_count != 1 || op->operand_count != 1 ||
++      packet->descriptor->immediate_count != 1) {
++    return false;
++  }
++  const loom_low_allocation_assignment_t* result_assignment =
++      loom_low_packet_result_assignment(builder->allocation, packet, 0);
++  const loom_low_allocation_assignment_t* vsrc1_assignment =
++      loom_low_packet_operand_assignment(builder->allocation, packet, 0);
++  if (!loom_amdgpu_vopd_assignment_single_physical_vgpr(result_assignment,
++                                                        &out_component->vdst)) {
++    return false;
++  }
++  if (!loom_amdgpu_vopd_assignment_single_physical_vgpr(
++          vsrc1_assignment, &out_component->vsrc1)) {
++    return false;
++  }
++  // The descriptor immediate holds the f32 bit pattern of an inline source; it
++  // is not a VOPD literal, so pairs keep their single literal slot.
++  const uint32_t bit_pattern =
++      loom_amdgpu_vopd_read_immediate_u32(builder, packet, 0);
++  const loom_low_descriptor_set_t* descriptor_set =
++      builder->schedule->target.descriptor_set;
++  const loom_amdgpu_encoding_table_t* encoding_table =
++      loom_amdgpu_encoding_table_for_descriptor_set_ordinal(
++          descriptor_set->descriptor_set_ordinal);
++  return loom_amdgpu_encoding_inline_f32_source(
++      encoding_table, bit_pattern, &out_component->src0_selector);
++}
++
+ static bool loom_amdgpu_vopd_read_register_mov_component(
+     const loom_amdgpu_vopd_plan_builder_t* builder,
+     const loom_low_packet_view_t* packet,
+@@ -1308,6 +1344,10 @@
+       eligible = loom_amdgpu_vopd_read_cndmask_vcc_component(builder, packet,
+                                                              out_component);
+       break;
++    case LOOM_AMDGPU_VOPD_COMPONENT_FORM_BINARY_SRC0_INLINE:
++      eligible = loom_amdgpu_vopd_read_binary_src0_inline_component(
++          builder, packet, out_component);
++      break;
+     default:
+       IREE_ASSERT_UNREACHABLE("AMDGPU VOPD component rule has unknown form");
+       return false;
+@@ -1406,7 +1446,9 @@
+     const loom_amdgpu_vopd_plan_builder_t* builder,
+     const loom_amdgpu_vopd_candidate_component_t* candidate) {
+   uint16_t src0_selector = 0;
+-  if (candidate->rule->form == LOOM_AMDGPU_VOPD_COMPONENT_FORM_INLINE_MOV) {
++  if (candidate->rule->form == LOOM_AMDGPU_VOPD_COMPONENT_FORM_INLINE_MOV ||
++      candidate->rule->form ==
++          LOOM_AMDGPU_VOPD_COMPONENT_FORM_BINARY_SRC0_INLINE) {
+     src0_selector = candidate->src0_selector;
+   } else {
+     IREE_ASSERT(iree_any_bit_set(candidate->rule->source_register_mask,
+diff --git a/loom/src/loom/target/emit/native/amdgpu/assembly.c b/loom/src/loom/target/emit/native/amdgpu/assembly.c
+--- a/loom/src/loom/target/emit/native/amdgpu/assembly.c
++++ b/loom/src/loom/target/emit/native/amdgpu/assembly.c
+@@ -3279,6 +3279,22 @@
+                                            component->immediate_u32);
+ }
+ 
++static iree_status_t loom_amdgpu_append_vopd_binary_src0_inline_component(
++    const loom_native_assembly_packet_context_t* context,
++    const loom_amdgpu_vopd_component_t* component,
++    iree_string_view_t mnemonic) {
++  IREE_RETURN_IF_ERROR(loom_amdgpu_append_vopd_mnemonic(context, mnemonic));
++  IREE_RETURN_IF_ERROR(loom_amdgpu_append_vopd_vgpr(context, component->vdst));
++  IREE_RETURN_IF_ERROR(loom_amdgpu_append_comma(context));
++  IREE_RETURN_IF_ERROR(loom_amdgpu_append_fixed_source_selector(
++      context,
++      loom_amdgpu_encoding_table_for_descriptor_set_ordinal(
++          context->schedule->target.descriptor_set->descriptor_set_ordinal),
++      component->src0_selector));
++  IREE_RETURN_IF_ERROR(loom_amdgpu_append_comma(context));
++  return loom_amdgpu_append_vopd_vgpr(context, component->vsrc1);
++}
++
+ static iree_status_t loom_amdgpu_append_vopd_register_mov_component(
+     const loom_native_assembly_packet_context_t* context,
+     const loom_amdgpu_vopd_component_t* component,
+@@ -3323,6 +3339,9 @@
+     case LOOM_AMDGPU_VOPD_COMPONENT_FORM_CNDMASK_VCC:
+       return loom_amdgpu_append_vopd_binary_component(context, component,
+                                                       mnemonic);
++    case LOOM_AMDGPU_VOPD_COMPONENT_FORM_BINARY_SRC0_INLINE:
++      return loom_amdgpu_append_vopd_binary_src0_inline_component(
++          context, component, mnemonic);
+     default:
+       IREE_ASSERT_UNREACHABLE(
+           "AMDGPU VOPD component metadata must use a known form");

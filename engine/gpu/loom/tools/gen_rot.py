@@ -10,7 +10,8 @@ signs (f32 [512]: s1, then s2 / 16; signs() writes it).
 yah_rotq256 (gen_q): the same rotation of f16 rows, then int4 quantization for the iu4 GEMMs (the A4 path) instead of
 the f16 store: one scale per span values of a row, hipfire's recipe (amax, the best of 8 candidate scales
 (amax / 7) * (1 + j / 7) / 2 by squared error, round to nearest even, clamp to [-8, 7]). Writes q (row-major nibbles,
-value 2j in the low nibble of byte j) and d (f32 [rows][K / span]). Workgroup and grid as yah_rot256.
+value 2j in the low nibble of byte j) and d times 2^26 (f32 [rows][K / span], the iu4 GEMMs' fold scale). Workgroup and
+grid as yah_rot256.
 """
 import struct
 
@@ -297,8 +298,10 @@ def gen_q(K, rows, span, awq=True, heads=None):
     e("  %sk = index.rem %kk, %cspan : index")
     e("  %first = index.cmp eq, %sk, %c0 : index")
     e("  %di = index.div %qk0, %cspan : index")
-    e("  scf.if %first {")
-    e(f"    view.store {best}, %dview[%di] : f32, view<{total // span}xf32>")
+    e("  scf.if %first {")   # stored times 2^26 (exact): the iu4 GEMM fold reads its integers as c * 2^-26
+    e("    %d2p26 = scalar.constant 67108864.0 : f32")
+    e(f"    %dst = scalar.mulf {best}, %d2p26 : f32")
+    e(f"    view.store %dst, %dview[%di] : f32, view<{total // span}xf32>")
     e("  }")
     e("  kernel.return")
     e("}")

@@ -35,6 +35,7 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0030-loom-amdgpu-tied-fmac` | Loom AMDGPU: an f32 fma whose addend dies there becomes the tied `v_fmac_f32`, which VOPD pairs (`v_dual_fmac_f32`); bit-identical. A splat addend keeps the VOP3 form (its lanes may share one register). The iu4 GEMM fold: 31 fewer VALU issue slots per phase |
 | `0031-loom-amdgpu-matrix-bank-allocation` | Loom: register allocation also tries a first fit that sees instruction operand preferences (matrix operand banks), grouped across whole-value copies and edges, and keeps it only without spills and without a lower residency tier; final numbering alone cannot move storage. Adds the gfx1151 iu4 WMMA qualification; bit-identical |
 | `0032-loom-kernel-priority` | Loom: `kernel.priority {level = N}` sets the current subgroup's issue priority; AMDGPU lowers it to `s_setprio` as an ordered execution barrier, so a pair brackets the instructions between them. Used around the iu4 GEMM fold; bit-identical |
+| `0033-loom-amdgpu-iu4-inline-seed-subrev` | Loom: an iu4 WMMA accumulator splat of the i32 bits of 1/(2 pi) selects the inline-source form (`.acc_inv_2pi`, beside `.acc_zero`); `x - c` with an inline f32 `c` selects `v_subrev_f32` with `c` in src0, and VOPD pairs it. The iu4 GEMM fold converts its integers with one paired subtract; bit-identical |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
