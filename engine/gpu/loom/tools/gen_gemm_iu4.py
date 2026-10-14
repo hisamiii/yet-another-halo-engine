@@ -348,8 +348,7 @@ def gen(kind, M, out16=False):
             e(f"    %{q}dt{j}v = vector.bitcast %{q}dt{j}b : vector<4xi8> to vector<1xf32>")
             e(f"    %{q}dt{j} = vector.extract %{q}dt{j}v[0] : vector<1xf32> -> f32")
             e(f"    %{q}dtv{j} = vector.splat %{q}dt{j} : {V8}")
-        c = {}
-        for st in range(KP // 16):
+        def frag_loads(st):
             for i in range(FM):
                 e(f"    %{q}la{st}_{i}c = index.constant {(16 * i * WP + 2 * st) * 4} : index")
                 e(f"    %{q}la{st}_{i} = index.add {ba['la']}, %{q}la{st}_{i}c : index")
@@ -362,6 +361,10 @@ def gen(kind, M, out16=False):
                 e(f"    %{q}ad{st}_{j}b = vector.load %lb[%{q}lb{st}_{j}] : view<{LDSW * 4}xi8> -> vector<8xi8>")
                 e(f"    %{q}ad{st}_{j} = vector.bitcast %{q}ad{st}_{j}b : vector<8xi8> to {V2}")
                 e(f"    %{q}rhs{st}_{j} = vector.fragment<rhs> %{q}ad{st}_{j} shape [%k, %n] using {{schema = %schema : encoding<schema>}} : {V2}")
+
+        c = {}
+
+        def mmas(st):
             for i in range(FM):
                 for j in range(FN):
                     if st == 0:
@@ -369,6 +372,17 @@ def gen(kind, M, out16=False):
                         c[i, j] = f"%{q}init{i}_{j}"
                     e(f"    %{q}c{st}_{i}_{j} = vector.mma %{q}lhs{st}_{i}, %{q}rhs{st}_{j}, {c[i, j]} : {V2}, {V2}, {VI}")
                     c[i, j] = f"%{q}c{st}_{i}_{j}"
+
+        # step s + 1's fragment loads go before step s's WMMAs, behind a fence: unfenced, the scheduler hoists every
+        # load of the phase (all offsets are immediates) and the extra live fragments cost the WMMA operand banks
+        NST = KP // 16
+        frag_loads(0)
+        for st in range(NST):
+            if st + 1 < NST:
+                frag_loads(st + 1)
+            mmas(st)
+            if st < NST - 1:
+                e("    scf.schedule.fence")
         # fold: acc += f32(c) * weight scale (per element) * activation scale (per lane), at raised issue priority so
         # the folding wave's VALU wins arbitration against the other waves' WMMAs and it gets back to its own sooner
         out = []
@@ -392,22 +406,28 @@ def gen(kind, M, out16=False):
         return out
 
     ca = ", ".join(f"%a{x} = %zfv : {V8}" for x in range(NA))
-    e("  " + ", ".join(f"%acc{x}" for x in range(NA)) + f" = scf.for %kp = [%c0 to %kphases step %c1]({ca}) -> ("
+    e("  " + ", ".join(f"%acc{x}" for x in range(NA)) + f" = scf.for %kp = [%c0 to %kphases step %c2]({ca}) -> ("
       + ", ".join([V8] * NA) + ") {")
-    e("    %buf = index.rem %kp, %c2 : index")
-    e("    %nbuf = index.sub %c1, %buf : index")
-    e("    %kn0 = index.add %kp, %c1 : index")
-    e("    %kn = index.min %kn0, %plast : index")
-    regs = loads("n_", "%kn")
-    offsets("u_", "%buf")
-    # one base per LDS read stream; fragment, tile and k-step offsets are immediates
-    b = {}
-    for n, inv, off in (("la", "%fr0", "%u_wbo"), ("lb", "%ft0", "%u_abo0"), ("dt", "%fd0", "%u_dbo"),
-                        ("ws", "%fs0", "%u_sbo")):
-        e(f"    %bi_{n} = index.add {inv}, {off} : index")
-        b[n] = f"%bi_{n}"
-    acc = phase("u_", [f"%a{x}" for x in range(NA)], b, lambda: stores("n_", regs, "%nbuf"))
-    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    def half(h, kp, buf, nbuf, acc):
+        """One phase at K phase kp (an index) from LDS buffer buf, loading phase kp + 1 into nbuf; h: name prefix."""
+        e(f"    %{h}kn0 = index.add {kp}, %c1 : index")
+        e(f"    %{h}kn = index.min %{h}kn0, %plast : index")
+        regs = loads(h + "n_", f"%{h}kn")
+        offsets(h + "u_", buf)
+        # one base per LDS read stream; fragment, tile and k-step offsets are immediates
+        b = {}
+        for n, inv, off in (("la", "%fr0", "wbo"), ("lb", "%ft0", "abo0"), ("dt", "%fd0", "dbo"), ("ws", "%fs0", "sbo")):
+            e(f"    %{h}bi_{n} = index.add {inv}, %{h}u_{off} : index")
+            b[n] = f"%{h}bi_{n}"
+        acc = phase(h + "u_", acc, b, lambda: stores(h + "n_", regs, nbuf))
+        e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        return acc
+
+    # two phases per iteration (the phase count 2 k_blocks is even): constant LDS buffers, so the buffer offsets are
+    # immediates instead of VALU on the parity (-11 VALU per phase, GEMMs -3.7%)
+    acc = half("p0", "%kp", "%c0", "%c1", [f"%a{x}" for x in range(NA)])
+    e("    %kp1 = index.add %kp, %c1 : index")
+    acc = half("p1", "%kp1", "%c1", "%c0", acc)
     e("    scf.yield " + ", ".join(acc) + " : " + ", ".join([V8] * NA))
     e("  }")
     if GU:
