@@ -101,17 +101,18 @@ def gen(kind, M, out16=False):
     e("  %d_tot = index.mul %tokens, %kphases : index")
     e("  " + ", ".join(f"%{b}_na" for b in bufs) + " = buffer.assume.noalias " + ", ".join(f"%{b}" for b in bufs)
       + " : " + ", ".join(["buffer"] * len(bufs)))
-    e("  %wv = buffer.view %weight_na[%base] : buffer -> view<[%w_dw]xi32>")
-    e("  %whv = buffer.view %weight_na[%base] : buffer -> view<[%w_h]xf16>")
-    e("  %aqv = buffer.view %aq_na[%base] : buffer -> view<[%a_dw]xi32>")
-    e("  %adv = buffer.view %ad_na[%base] : buffer -> view<[%d_tot]xf32>")
+    e("  %wv = buffer.view %weight_na[%base] : buffer -> view<[%w_bytes]xi8>")
+    e("  %a_bytes = index.mul %a_dw, %c4 : index")
+    e("  %aqv = buffer.view %aq_na[%base] : buffer -> view<[%a_bytes]xi8>")
+    e("  %d_bytes = index.mul %d_tot, %c4 : index")
+    e("  %adv = buffer.view %ad_na[%base] : buffer -> view<[%d_bytes]xi8>")
     if GU:
-        e("  %uv = buffer.view %up_na[%base] : buffer -> view<[%w_dw]xi32>")
-        e("  %uhv = buffer.view %up_na[%base] : buffer -> view<[%w_h]xf16>")
+        e("  %uv = buffer.view %up_na[%base] : buffer -> view<[%w_bytes]xi8>")
     e(f"  %al_bytes = index.constant {LDSW * 4} : offset")
     e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
     e(f"  %lv = buffer.view %al[%base] : buffer -> view<{LDSW}xi32>")
     e(f"  %lf = buffer.view %al[%base] : buffer -> view<{LDSW}xf32>")
+    e(f"  %lb = buffer.view %al[%base] : buffer -> view<{LDSW * 4}xi8>")   # K-loop accesses: byte offsets need no shifts
     e("  %wg_x = kernel.workgroup.id<x> : index")
     e("  %wg_y = kernel.workgroup.id<y> : index")
     e("  %tid = kernel.workitem.id<x> : index")
@@ -137,9 +138,9 @@ def gen(kind, M, out16=False):
     assert not GU or nwc == 2 and BM * 2 == LANES   # gu: chunk 0 of every lane is a gate row, chunk 1 the up row
     e(f"  %w_clast = index.constant {BM * 4 - 1} : index")
     e(f"  %a_clast = index.constant {BN * 4 - 1} : index")
-    e("  %w_dlim = index.sub %w_dw, %c4 : index")
-    e("  %a_dlim = index.sub %a_dw, %c4 : index")
-    e("  %w_hlim = index.sub %w_h, %c1 : index")
+    e("  %w_dlim = index.sub %w_bytes, %c16 : index")
+    e("  %a_dlim = index.sub %a_bytes, %c16 : index")
+    e("  %w_hlim = index.sub %w_bytes, %c2 : index")
     for nm, n, last in (("w", nwc, "%w_clast"), ("a", nac, "%a_clast")):
         for r in range(n):
             p = f"%{nm}s{r}"
@@ -151,7 +152,8 @@ def gen(kind, M, out16=False):
             e(f"  {p}q = index.rem {p}c, %c4 : index")
             e(f"  {p}q4 = index.mul {p}q, %c4 : index")
             e(f"  {p}lr = index.mul {p}row, %c{WP} : index")
-            e(f"  {p}lo = index.add {p}lr, {p}q4 : index")             # LDS dword within the tile
+            e(f"  {p}lo0 = index.add {p}lr, {p}q4 : index")            # LDS dword within the tile
+            e(f"  {p}lo = index.mul {p}lo0, %c4 : index")
             if nm == "w":
                 if GU and r:
                     e(f"  {p}gr0 = index.add %wg_row, {p}row : index")
@@ -164,7 +166,8 @@ def gen(kind, M, out16=False):
             else:
                 e(f"  {p}gt = index.add %wtb, {p}row : index")
                 e(f"  {p}gb = index.mul {p}gt, %a_rowdw : index")
-                e(f"  {p}gbq = index.add {p}gb, {p}q4 : index")        # + 16 * phase dwords
+                e(f"  {p}gbq0 = index.add {p}gb, {p}q4 : index")
+                e(f"  {p}gbq = index.mul {p}gbq0, %c4 : index")          # bytes; + 64 * phase
     # scales: lane tid < BM loads row tid's f16 scale, stores it at its C-layout slot: tile r / 16, half r % 2, i (r % 16) / 2
     e(f"  %sc_last = index.constant {BM - 1} : index")
     e("  %sc_r = index.min %tid, %sc_last : index")
@@ -184,15 +187,18 @@ def gen(kind, M, out16=False):
     e("  %sc_o0 = index.add %sc_t16, %sc_h8 : index")
     e(f"  %sc_base = index.constant {2 * (WB + AB)} : index")
     e("  %sc_o1 = index.add %sc_o0, %sc_i : index")
-    e("  %sc_lo = index.add %sc_o1, %sc_base : index")
+    e("  %sc_lo0 = index.add %sc_o1, %sc_base : index")
+    e("  %sc_lo = index.mul %sc_lo0, %c4 : index")
     # activation scales: lane tid < BN loads token tid's; global loads in the phase that uses them would make its fold
     # wait (in order) for the next phase's prefetch
     e(f"  %ds_last = index.constant {BN - 1} : index")
     e("  %ds_t = index.min %tid, %ds_last : index")
     e("  %ds_gt = index.add %wtb, %ds_t : index")
-    e("  %ds_gb = index.mul %ds_gt, %kphases : index")
+    e("  %ds_gd = index.mul %ds_gt, %kphases : index")
+    e("  %ds_gb = index.mul %ds_gd, %c4 : index")
     e(f"  %ds_base = index.constant {2 * (WB + AB + BM)} : index")
-    e("  %ds_lo = index.add %ds_t, %ds_base : index")
+    e("  %ds_lo0 = index.add %ds_t, %ds_base : index")
+    e("  %ds_lo = index.mul %ds_lo0, %c4 : index")
 
     def loads(pfx, kp):
         """The global loads of phase kp into registers; returns [(kind, value, lds offset, live)]."""
@@ -202,49 +208,54 @@ def gen(kind, M, out16=False):
         e(f"  %{pfx}hf64 = index.mul %{pfx}hf, %c64 : index")
         e(f"  %{pfx}wo0 = index.add %{pfx}kb136, %{pfx}hf64 : index")
         e(f"  %{pfx}wo = index.add %{pfx}wo0, %c8 : index")            # nibble bytes of the phase within the row
-        e(f"  %{pfx}ao = index.mul {kp}, %c16 : index")                  # activation dwords of the phase within the row
+        e(f"  %{pfx}ao = index.mul {kp}, %c64 : index")                  # activation bytes of the phase within the row
         out = []
         for nm, n in (("w", nwc), ("a", nac)):
             for r in range(n):
                 p = f"%{nm}s{r}"
                 if nm == "w":
-                    e(f"  %{pfx}w{r}b = index.add {p}gbq, %{pfx}wo : index")
-                    e(f"  %{pfx}w{r}d0 = index.div %{pfx}w{r}b, %c4 : index")
+                    e(f"  %{pfx}w{r}d0 = index.add {p}gbq, %{pfx}wo : index")
                     e(f"  %{pfx}w{r}d = index.min %{pfx}w{r}d0, %w_dlim : index")
                     wv = "%uv" if GU and r else "%wv"
-                    e(f"  %{pfx}w{r} = vector.load {wv}[%{pfx}w{r}d] : view<[%w_dw]xi32> -> vector<4xi32>")
+                    e(f"  %{pfx}w{r}8 = vector.load {wv}[%{pfx}w{r}d] : view<[%w_bytes]xi8> -> vector<16xi8>")
+                    e(f"  %{pfx}w{r} = vector.bitcast %{pfx}w{r}8 : vector<16xi8> to vector<4xi32>")
                 else:
                     e(f"  %{pfx}a{r}d0 = index.add {p}gbq, %{pfx}ao : index")
                     e(f"  %{pfx}a{r}d = index.min %{pfx}a{r}d0, %a_dlim : index")
-                    e(f"  %{pfx}a{r} = vector.load %aqv[%{pfx}a{r}d] : view<[%a_dw]xi32> -> vector<4xi32>")
+                    e(f"  %{pfx}a{r}8 = vector.load %aqv[%{pfx}a{r}d] : view<[%a_bytes]xi8> -> vector<16xi8>")
+                    e(f"  %{pfx}a{r} = vector.bitcast %{pfx}a{r}8 : vector<16xi8> to vector<4xi32>")
                 out.append((nm, f"%{pfx}{nm}{r}", f"{p}lo", f"{p}live"))
         e(f"  %{pfx}hf4 = index.mul %{pfx}hf, %c4 : index")
         e(f"  %{pfx}sb0 = index.add %sc_gb, %{pfx}kb136 : index")
         e(f"  %{pfx}sb = index.add %{pfx}sb0, %{pfx}hf4 : index")
-        e(f"  %{pfx}sh0 = index.div %{pfx}sb, %c2 : index")
-        e(f"  %{pfx}sh = index.min %{pfx}sh0, %w_hlim : index")
+        e(f"  %{pfx}sh = index.min %{pfx}sb, %w_hlim : index")
+        for nm, v in (("g", "%wv"), ("u", "%uv")) if GU else (("", "%wv"),):
+            e(f"  %{pfx}sc{nm}8 = vector.load {v}[%{pfx}sh] : view<[%w_bytes]xi8> -> vector<2xi8>")
+            e(f"  %{pfx}sc{nm}h = vector.bitcast %{pfx}sc{nm}8 : vector<2xi8> to vector<1xf16>")
+            e(f"  %{pfx}sc{nm} = vector.extract %{pfx}sc{nm}h[0] : vector<1xf16> -> f16")
         if GU:
-            e(f"  %{pfx}scg = view.load %whv[%{pfx}sh] : view<[%w_h]xf16> -> f16")
-            e(f"  %{pfx}scu = view.load %uhv[%{pfx}sh] : view<[%w_h]xf16> -> f16")
             e(f"  %{pfx}sc = scf.select %sc_up, %{pfx}scu, %{pfx}scg : f16")
-        else:
-            e(f"  %{pfx}sc = view.load %whv[%{pfx}sh] : view<[%w_h]xf16> -> f16")
         out.append(("s", f"%{pfx}sc", "%sc_lo", None))
-        e(f"  %{pfx}di = index.add %ds_gb, {kp} : index")
-        e(f"  %{pfx}dt = view.load %adv[%{pfx}di] : view<[%d_tot]xf32> -> f32")
+        e(f"  %{pfx}kp4 = index.mul {kp}, %c4 : index")
+        e(f"  %{pfx}di = index.add %ds_gb, %{pfx}kp4 : index")
+        e(f"  %{pfx}dt8 = vector.load %adv[%{pfx}di] : view<[%d_bytes]xi8> -> vector<4xi8>")
+        e(f"  %{pfx}dtv = vector.bitcast %{pfx}dt8 : vector<4xi8> to vector<1xf32>")
+        e(f"  %{pfx}dt = vector.extract %{pfx}dtv[0] : vector<1xf32> -> f32")
         out.append(("d", f"%{pfx}dt", "%ds_lo", None))
         return out
 
     def offsets(q, buf):
-        """The dword offsets of LDS buffer buf (an index value) as %{q}wbo / abo / sbo / dbo."""
-        e(f"  %{q}cwb = index.constant {WB} : index")
-        e(f"  %{q}cab = index.constant {AB} : index")
+        """The byte offsets of LDS buffer buf (an index value) as %{q}wbo / abo / sbo / dbo."""
+        e(f"  %{q}cwb = index.constant {WB * 4} : index")
+        e(f"  %{q}cab = index.constant {AB * 4} : index")
         e(f"  %{q}wbo = index.mul {buf}, %{q}cwb : index")
         e(f"  %{q}abo0 = index.mul {buf}, %{q}cab : index")
-        e(f"  %{q}cwb2 = index.constant {2 * WB} : index")
+        e(f"  %{q}cwb2 = index.constant {2 * WB * 4} : index")
         e(f"  %{q}abo = index.add %{q}abo0, %{q}cwb2 : index")
-        e(f"  %{q}sbo = index.mul {buf}, %cbm : index")
-        e(f"  %{q}dbo = index.mul {buf}, %cwtok : index")
+        e(f"  %{q}cbm4 = index.constant {BM * 4} : index")
+        e(f"  %{q}cbn4 = index.constant {BN * 4} : index")
+        e(f"  %{q}sbo = index.mul {buf}, %{q}cbm4 : index")
+        e(f"  %{q}dbo = index.mul {buf}, %{q}cbn4 : index")
 
     def stores(pfx, regs, buf):
         """Store the registers of loads() into LDS buffer buf (an index value: 0 or 1)."""
@@ -253,38 +264,44 @@ def gen(kind, M, out16=False):
             off = {"w": f"%{pfx}wbo", "a": f"%{pfx}abo", "s": f"%{pfx}sbo", "d": f"%{pfx}dbo"}[nm]
             e(f"  %{pfx}st{x} = index.add {lo}, {off} : index")
             # scales: every lane stores; lanes past the tile repeat the last row's (token's) value at its slot
-            if nm == "s":
-                e(f"  %{pfx}sf = scalar.extf {v} : f16 to f32")
-                e(f"  view.store %{pfx}sf, %lf[%{pfx}st{x}] : f32, view<{LDSW}xf32>")
-            elif nm == "d":
-                e(f"  view.store {v}, %lf[%{pfx}st{x}] : f32, view<{LDSW}xf32>")
+            if nm in "sd":
+                f = v
+                if nm == "s":
+                    f = f"%{pfx}sf"
+                    e(f"  {f} = scalar.extf {v} : f16 to f32")
+                e(f"  %{pfx}st{x}v = vector.from_elements {f} : vector<1xf32>")
+                e(f"  %{pfx}st{x}b = vector.bitcast %{pfx}st{x}v : vector<1xf32> to vector<4xi8>")
+                e(f"  vector.store %{pfx}st{x}b, %lb[%{pfx}st{x}] : vector<4xi8>, view<{LDSW * 4}xi8>")
             else:
                 e(f"  scf.if {live} {{")
-                e(f"    vector.store {v}, %lv[%{pfx}st{x}] : vector<4xi32>, view<{LDSW}xi32>")
+                e(f"    vector.store {v}8, %lb[%{pfx}st{x}] : vector<16xi8>, view<{LDSW * 4}xi8>")
                 e("  }")
 
     # prologue: phase 0 into buffer 0
     stores("p0_", loads("p0_", "%c0"), "%c0")
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    # per-lane fragment offsets within a tile: weight row m0 + 16 i + l16, token n0 + 16 j + l16
+    # per-lane LDS byte offsets of fragment 0 in buffer 0: weight row m0 + l16, token n0 + l16 (fragment i / j is 16 i / j
+    # rows further), the weight scale slots (tile * 16 + half * 8) and this lane's token's activation scale
     for i in range(FM):
         e(f"  %fr{i}c = index.constant {16 * i} : index")
-        e(f"  %fr{i}0 = index.add %wr_off, %fr{i}c : index")
-        e(f"  %fr{i}1 = index.add %fr{i}0, %l16 : index")
-        e(f"  %fr{i} = index.mul %fr{i}1, %c{WP} : index")
-        e(f"  %fs{i}t = index.div %fr{i}0, %c16 : index")                  # scale slot: tile * 16 + half * 8
-        e(f"  %fs{i}t16 = index.mul %fs{i}t, %c16 : index")
-        e(f"  %fs{i}h = index.mul %lh, %c8 : index")
-        e(f"  %fs{i}0 = index.add %fs{i}t16, %fs{i}h : index")
-        e(f"  %fs{i} = index.add %fs{i}0, %sc_base : index")
     for j in range(FN):
         e(f"  %ft{j}c = index.constant {16 * j} : index")
-        e(f"  %ft{j}0 = index.add %wt_off, %ft{j}c : index")
-        e(f"  %ft{j}1 = index.add %ft{j}0, %l16 : index")
-        e(f"  %ft{j}2 = index.mul %ft{j}1, %c{WP} : index")
-        e(f"  %ft{j}cw = index.constant {2 * WB} : index")
-        e(f"  %ft{j} = index.add %ft{j}2, %ft{j}cw : index")
-        e(f"  %fd{j} = index.add %ft{j}1, %ds_base : index")   # this lane's token's activation scale
+    e("  %fr1 = index.add %wr_off, %l16 : index")
+    e(f"  %frd = index.mul %fr1, %c{WP} : index")
+    e("  %fr0 = index.mul %frd, %c4 : index")
+    e("  %fst = index.div %wr_off, %c16 : index")
+    e("  %fst16 = index.mul %fst, %c16 : index")
+    e("  %fsh = index.mul %lh, %c8 : index")
+    e("  %fs1 = index.add %fst16, %fsh : index")
+    e("  %fsd = index.add %fs1, %sc_base : index")
+    e("  %fs0 = index.mul %fsd, %c4 : index")
+    e("  %ft1 = index.add %wt_off, %l16 : index")
+    e(f"  %ft2 = index.mul %ft1, %c{WP} : index")
+    e(f"  %ftcw = index.constant {2 * WB} : index")
+    e("  %ftd = index.add %ft2, %ftcw : index")
+    e("  %ft0 = index.mul %ftd, %c4 : index")
+    e("  %fdd = index.add %ft1, %ds_base : index")
+    e("  %fd0 = index.mul %fdd, %c4 : index")
     e("  %schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>")
     # WMMA chains start from the bits of 1/(2 pi) (an inline source): the result, read as f32, is 1/(2 pi) + c * 2^-26
     # exactly (|c| <= 8192), so one subtract converts it; rotq stores the activation scales times 2^26 to match
@@ -296,26 +313,29 @@ def gen(kind, M, out16=False):
     e(f"  %zfv = vector.splat %zf : {V8}")
     NA = FM * FN
 
-    def phase(q, acc, mid=None):
-        """The WMMAs of the phase in the LDS buffer at %{q}wbo / abo / sbo / dbo, then mid(), then the fold into acc;
-        returns the new accumulator names."""
+    def phase(q, acc, ba, mid=None):
+        """The WMMAs of the phase in the LDS buffer whose lane addresses (fragment 0, k step 0) are ba[la / lb / dt /
+        ws], then mid(), then the fold into acc; returns the new accumulator names."""
         for j in range(FN):
-            e(f"    %{q}dti{j} = index.add %fd{j}, %{q}dbo : index")
-            e(f"    %{q}dt{j} = view.load %lf[%{q}dti{j}] : view<{LDSW}xf32> -> f32")
+            e(f"    %{q}dti{j}c = index.constant {64 * j} : index")
+            e(f"    %{q}dti{j} = index.add {ba['dt']}, %{q}dti{j}c : index")
+            e(f"    %{q}dt{j}b = vector.load %lb[%{q}dti{j}] : view<{LDSW * 4}xi8> -> vector<4xi8>")
+            e(f"    %{q}dt{j}v = vector.bitcast %{q}dt{j}b : vector<4xi8> to vector<1xf32>")
+            e(f"    %{q}dt{j} = vector.extract %{q}dt{j}v[0] : vector<1xf32> -> f32")
             e(f"    %{q}dtv{j} = vector.splat %{q}dt{j} : {V8}")
         c = {}
         for st in range(KP // 16):
             for i in range(FM):
-                e(f"    %{q}la{st}_{i}c = index.constant {2 * st} : index")
-                e(f"    %{q}la{st}_{i}0 = index.add %fr{i}, %{q}wbo : index")
-                e(f"    %{q}la{st}_{i} = index.add %{q}la{st}_{i}0, %{q}la{st}_{i}c : index")
-                e(f"    %{q}wd{st}_{i} = vector.load %lv[%{q}la{st}_{i}] : view<{LDSW}xi32> -> {V2}")
+                e(f"    %{q}la{st}_{i}c = index.constant {(16 * i * WP + 2 * st) * 4} : index")
+                e(f"    %{q}la{st}_{i} = index.add {ba['la']}, %{q}la{st}_{i}c : index")
+                e(f"    %{q}wd{st}_{i}b = vector.load %lb[%{q}la{st}_{i}] : view<{LDSW * 4}xi8> -> vector<8xi8>")
+                e(f"    %{q}wd{st}_{i} = vector.bitcast %{q}wd{st}_{i}b : vector<8xi8> to {V2}")
                 e(f"    %{q}lhs{st}_{i} = vector.fragment<lhs> %{q}wd{st}_{i} shape [%m, %k] using {{schema = %schema : encoding<schema>}} : {V2}")
             for j in range(FN):
-                e(f"    %{q}lb{st}_{j}c = index.constant {2 * st} : index")
-                e(f"    %{q}lb{st}_{j}0 = index.add %ft{j}, %{q}abo0 : index")      # %ft includes the 2 WB base
-                e(f"    %{q}lb{st}_{j} = index.add %{q}lb{st}_{j}0, %{q}lb{st}_{j}c : index")
-                e(f"    %{q}ad{st}_{j} = vector.load %lv[%{q}lb{st}_{j}] : view<{LDSW}xi32> -> {V2}")
+                e(f"    %{q}lb{st}_{j}c = index.constant {(16 * j * WP + 2 * st) * 4} : index")
+                e(f"    %{q}lb{st}_{j} = index.add {ba['lb']}, %{q}lb{st}_{j}c : index")
+                e(f"    %{q}ad{st}_{j}b = vector.load %lb[%{q}lb{st}_{j}] : view<{LDSW * 4}xi8> -> vector<8xi8>")
+                e(f"    %{q}ad{st}_{j} = vector.bitcast %{q}ad{st}_{j}b : vector<8xi8> to {V2}")
                 e(f"    %{q}rhs{st}_{j} = vector.fragment<rhs> %{q}ad{st}_{j} shape [%k, %n] using {{schema = %schema : encoding<schema>}} : {V2}")
             for i in range(FM):
                 for j in range(FN):
@@ -328,8 +348,10 @@ def gen(kind, M, out16=False):
         # the folding wave's VALU wins arbitration against the other waves' WMMAs and it gets back to its own sooner
         out = []
         for i in range(FM):
-            e(f"    %{q}wsi{i} = index.add %fs{i}, %{q}sbo : index")
-            e(f"    %{q}ws{i} = vector.load %lf[%{q}wsi{i}] : view<{LDSW}xf32> -> {V8}")
+            e(f"    %{q}wsi{i}c = index.constant {64 * i} : index")
+            e(f"    %{q}wsi{i} = index.add {ba['ws']}, %{q}wsi{i}c : index")
+            e(f"    %{q}ws{i}b = vector.load %lb[%{q}wsi{i}] : view<{LDSW * 4}xi8> -> vector<32xi8>")
+            e(f"    %{q}ws{i} = vector.bitcast %{q}ws{i}b : vector<32xi8> to {V8}")
         if mid:
             mid()       # priority is a scheduling boundary: work that should overlap the WMMAs goes before it
         e("    kernel.priority {level = 3}")
@@ -353,7 +375,13 @@ def gen(kind, M, out16=False):
     e("    %kn = index.min %kn0, %plast : index")
     regs = loads("n_", "%kn")
     offsets("u_", "%buf")
-    acc = phase("u_", [f"%a{x}" for x in range(NA)], lambda: stores("n_", regs, "%nbuf"))
+    # one base per LDS read stream; fragment, tile and k-step offsets are immediates
+    b = {}
+    for n, inv, off in (("la", "%fr0", "%u_wbo"), ("lb", "%ft0", "%u_abo0"), ("dt", "%fd0", "%u_dbo"),
+                        ("ws", "%fs0", "%u_sbo")):
+        e(f"    %bi_{n} = index.add {inv}, {off} : index")
+        b[n] = f"%bi_{n}"
+    acc = phase("u_", [f"%a{x}" for x in range(NA)], b, lambda: stores("n_", regs, "%nbuf"))
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("    scf.yield " + ", ".join(acc) + " : " + ", ".join([V8] * NA))
     e("  }")
