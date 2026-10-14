@@ -1654,6 +1654,13 @@ def main():
             rot_src["normq_5120.hal"] = os.path.join(tmp, "normq_5120.loom")
             open(rot_src["normq_5120.hal"], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP))
             geom.append(("normq_5120.hal", 0, 16 * 5120 // 256, 1))
+            if DNSPLIT == (40, 8):
+                # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq): part a beside DeltaNet's second part, b after it
+                for part in "ab":
+                    name = "pnq_%s.hal" % part
+                    rot_src[name] = os.path.join(tmp, "pnq_%s.loom" % part)
+                    open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part, DNSPLIT[0]))
+                    geom.append((name, 0, 64, len(gen_rot.pnq_groups(part, DNSPLIT[0])) // 4))
         with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
             fh.write(gen_rot.signs())
         geom.append(("rot", 0, 0, 0))

@@ -1819,12 +1819,13 @@ class LoomPrefill {
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
   // af: the afrag form of the fused kres GEMM (input fragment-major)
-  void RunResidual(const std::string& wname, const LoomBuffer& in, bool af = false) {
+  // quantized (A4): aq_ / ad_ already hold the rotated input (gen_pnq), in is not read
+  void RunResidual(const std::string& wname, const LoomBuffer& in, bool af = false, bool quantized = false) {
     const auto* t = Find(wname);
     const bool heads = rot_ && wname.find("ssm_out") != std::string::npos;
     const std::string awq = wname.substr(0, wname.size() - 6) + "awq";
     if (a4_) {
-      RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads);
+      if (!quantized) RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads);
       RunIu4("kres", *t, {hidden_, hidden2_}, {std::size_t(t->dims[1]) * 4, std::size_t(t->dims[1]) * 4}, 0b10000);
       std::swap(hidden_, hidden2_);
       return;
@@ -2139,6 +2140,23 @@ class LoomPrefill {
     // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
     const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
     const hrx_buffer_ref_t gate{gate_->handle, 0, std::size_t{B_} * kInner * 4};
+    if (a4_ && dnsplit_a_ && !out_af && geom_.count("pnq_a.hal")) {
+      // A4: the postnorm and ssm_out's rotq in one kernel per DeltaNet part (gen_rot.gen_pnq); part a reads only raw_,
+      // so it runs beside the second DeltaNet part
+      const auto* nw = Find(pre + "ssm_norm.weight");
+      const auto* aw = Find(pre + "ssm_out.awq");
+      const Geom& ga = geom_.at("pnq_a.hal");
+      const Geom& gb = geom_.at("pnq_b.hal");
+      Dispatch(Exe("pnq_a.hal"), "yah_pnq", ga.tt, B_, 1, ga.rowgrp, 1, 1,
+               {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b1100000);
+      Dispatch(Exe("pnq_b.hal"), "yah_pnq", gb.tt, B_, 1, gb.rowgrp, 1, 1,
+               {Ref(*raw_), Ref(*raw2_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)},
+               0b11000000);
+      trim_row_ = tail_;
+      RunResidual(pre + "ssm_out.weight", *scratch_, false, true);
+      trim_row_ = kAllRows;
+      return;
+    }
     if (dnsplit_a_) {
       const std::string pn = out_af ? "postnorm_t" : "postnorm";
       // heads [0, a) are ssm_out's NPU K chunk: with "npupostnormbfp" this part also writes the NPU's input into A and
