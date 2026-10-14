@@ -1,7 +1,7 @@
 // loomhip: launches a Loom-compiled kernel (hsaco from loom-compile) through the HIP runtime.
 // So rocprofv3 (kernel trace, PMC incl. occupancy, per-wave ATT) can profile Loom code; it cannot see HRX dispatches.
 //
-// usage: loomhip <hsaco> <kernel> <gx> <gy> <block_x> <iters> <buf>...
+// usage: loomhip <hsaco> <kernel> <gx> <gy[,gz]> <block_x> <iters> <buf>...
 //   buf: f:<path>            device buffer initialised from a raw file
 //        z:<bytes>           zero-filled device buffer
 //        o:<bytes>:<path>    zero-filled, written to <path> after the first launch
@@ -89,6 +89,8 @@ int main(int argc, char** argv) {
   }
   const std::string hsaco = argv[1], kernel = argv[2];
   const unsigned gx = std::atoi(argv[3]), gy = std::atoi(argv[4]), bx = std::atoi(argv[5]);
+  const char* gzs = std::strchr(argv[4], ',');
+  const unsigned gz = gzs ? std::atoi(gzs + 1) : 1;
   const int iters = std::atoi(argv[6]);
 
   // Refuse a launch whose buffer count does not match the kernel's argument block.
@@ -142,7 +144,7 @@ int main(int argc, char** argv) {
   size_t kbytes = kernarg.size();
   void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, kernarg.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &kbytes,
                     HIP_LAUNCH_PARAM_END};
-  auto launch = [&] { CHECK(hipModuleLaunchKernel(fn, gx, gy, 1, bx, 1, 1, 0, nullptr, nullptr, config)); };
+  auto launch = [&] { CHECK(hipModuleLaunchKernel(fn, gx, gy, gz, bx, 1, 1, 0, nullptr, nullptr, config)); };
   launch();
   CHECK(hipDeviceSynchronize());
   for (auto& [idx, path] : dumps) {
