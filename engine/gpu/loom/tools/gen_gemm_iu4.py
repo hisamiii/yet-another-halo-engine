@@ -291,9 +291,9 @@ def gen(kind, M, out16=False):
     e(f"  %zfv = vector.splat %zf : {V8}")
     NA = FM * FN
 
-    def phase(q, acc):
-        """The WMMAs of the phase in the LDS buffer at %{q}wbo / abo / sbo / dbo and the fold into acc; returns the new
-        accumulator names."""
+    def phase(q, acc, mid=None):
+        """The WMMAs of the phase in the LDS buffer at %{q}wbo / abo / sbo / dbo, then mid(), then the fold into acc;
+        returns the new accumulator names."""
         for j in range(FN):
             e(f"    %{q}dti{j} = index.add %fd{j}, %{q}dbo : index")
             e(f"    %{q}dt{j} = view.load %lf[%{q}dti{j}] : view<{LDSW}xf32> -> f32")
@@ -319,17 +319,23 @@ def gen(kind, M, out16=False):
                         c[i, j] = f"%{q}init{i}_{j}"
                     e(f"    %{q}c{st}_{i}_{j} = vector.mma %{q}lhs{st}_{i}, %{q}rhs{st}_{j}, {c[i, j]} : {V2}, {V2}, {VI}")
                     c[i, j] = f"%{q}c{st}_{i}_{j}"
-        # fold: acc += f32(c) * weight scale (per element) * activation scale (per lane)
+        # fold: acc += f32(c) * weight scale (per element) * activation scale (per lane), at raised issue priority so
+        # the folding wave's VALU wins arbitration against the other waves' WMMAs and it gets back to its own sooner
         out = []
         for i in range(FM):
             e(f"    %{q}wsi{i} = index.add %fs{i}, %{q}sbo : index")
             e(f"    %{q}ws{i} = vector.load %lf[%{q}wsi{i}] : view<{LDSW}xf32> -> {V8}")
+        if mid:
+            mid()       # priority is a scheduling boundary: work that should overlap the WMMAs goes before it
+        e("    kernel.priority {level = 3}")
+        for i in range(FM):
             for j in range(FN):
                 x = i * FN + j
                 e(f"    %{q}cf{x} = vector.sitofp {c[i, j]} : {VI} to {V8}")
                 e(f"    %{q}sc{x} = vector.mulf %{q}ws{i}, %{q}dtv{j} : {V8}")
                 e(f"    %{q}f{x} = vector.fmaf %{q}cf{x}, %{q}sc{x}, {acc[x]} : {V8}")
                 out.append(f"%{q}f{x}")
+        e("    kernel.priority {level = 0}")
         return out
 
     ca = ", ".join(f"%a{x} = %zfv : {V8}" for x in range(NA))
@@ -341,8 +347,7 @@ def gen(kind, M, out16=False):
     e("    %kn = index.min %kn0, %plast : index")
     regs = loads("n_", "%kn")
     offsets("u_", "%buf")
-    acc = phase("u_", [f"%a{x}" for x in range(NA)])
-    stores("n_", regs, "%nbuf")
+    acc = phase("u_", [f"%a{x}" for x in range(NA)], lambda: stores("n_", regs, "%nbuf"))
     e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("    scf.yield " + ", ".join(acc) + " : " + ", ".join([V8] * NA))
     e("  }")

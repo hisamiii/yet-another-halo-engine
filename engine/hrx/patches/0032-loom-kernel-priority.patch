@@ -1,0 +1,361 @@
+Loom: kernel.priority {level = N}, the issue priority of the current subgroup, lowered on AMDGPU to s_setprio.
+The descriptor is an ordered execution barrier, so a pair of kernel.priority ops brackets the target instructions
+between them; work meant to overlap with other code goes before the first one. Yah raises the iu4 GEMM fold to
+priority 3: the folding wave's VALU wins issue arbitration over the other waves' WMMAs and it returns to its own
+sooner. Bit-identical results; gu -2.8% cycles standalone, pp2048 GEMM cycles -1.1%.
+diff --git a/loom/py/loom/dialect/kernel/builders/__init__.pyi b/loom/py/loom/dialect/kernel/builders/__init__.pyi
+--- a/loom/py/loom/dialect/kernel/builders/__init__.pyi
++++ b/loom/py/loom/dialect/kernel/builders/__init__.pyi
+@@ -587,3 +587,9 @@
+         phase: ValueRef,
+         location_id: int | None = ...,
+     ) -> None: ...
++    def priority(
++        self,
++        *,
++        level: int,
++        location_id: int | None = ...,
++    ) -> None: ...
+diff --git a/loom/py/loom/dialect/kernel/defs.py b/loom/py/loom/dialect/kernel/defs.py
+--- a/loom/py/loom/dialect/kernel/defs.py
++++ b/loom/py/loom/dialect/kernel/defs.py
+@@ -54,6 +54,7 @@
+     INTEGER,
+     ISOLATED_FROM_ABOVE,
+     MEMORY_FENCE,
++    OBSERVABLE_EFFECT,
+     PURE,
+     SCALAR,
+     SYMBOL_DEFINE,
+@@ -1930,6 +1931,39 @@
+ )
+ 
+ # ============================================================================
++# kernel.priority — issue priority hint for the current subgroup
++# ============================================================================
++
++kernel_priority = Op(
++    name="kernel.priority",
++    group=kernel_ops,
++    phase=OpPhase.EXECUTABLE,
++    doc=(
++        "Set the instruction issue priority of the current subgroup relative "
++        "to other subgroups resident on the same execution unit. Level 0 is "
++        "the default; higher levels win issue arbitration until the next "
++        "kernel.priority. The op has no memory or value effects and keeps its "
++        "position relative to the surrounding target instructions, so a pair "
++        "of kernel.priority ops brackets the code that should issue first."
++    ),
++    attrs=[
++        AttrDef(
++            "level",
++            ATTR_TYPE_I64,
++            doc="Issue priority level, 0 (default) through 3.",
++        ),
++    ],
++    traits=[OBSERVABLE_EFFECT, HasAncestor("kernel.def")],
++    verify="loom_kernel_priority_verify",
++    format=[
++        AttrDict(),
++    ],
++    examples=[
++        "kernel.priority {level = 3}",
++    ],
++)
++
++# ============================================================================
+ # Host launch programs
+ # ============================================================================
+ 
+@@ -2269,4 +2303,5 @@
+     kernel_launch_concurrent,
+     kernel_barrier_arrive,
+     kernel_barrier_wait,
++    kernel_priority,
+ )
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/control.py b/loom/py/loom/target/arch/amdgpu/descriptors/control.py
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/control.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/control.py
+@@ -341,6 +341,22 @@
+     )
+ 
+ 
++def _s_setprio_overlay() -> AmdgpuDescriptorOverlay:
++    return AmdgpuDescriptorOverlay(
++        descriptor_key="amdgpu.s_setprio",
++        instruction_name="S_SETPRIO",
++        mnemonic="s_setprio",
++        encoding_name="ENC_SOPP",
++        semantic_tag="control.priority",
++        schedule_class=_SCHEDULE_MODE_CONTROL,
++        operands=(),
++        immediate_fields=("SIMM16",),
++        immediates=(_u32_immediate("level"),),
++        effects=(_EXECUTION_BARRIER_EFFECT,),
++        flags=(DescriptorFlag.SIDE_EFFECTING, DescriptorFlag.BARRIER),
++    )
++
++
+ def _s_trap_overlay() -> AmdgpuDescriptorOverlay:
+     return AmdgpuDescriptorOverlay(
+         descriptor_key="amdgpu.s_trap",
+@@ -761,6 +777,7 @@
+     "_s_sendmsg_overlay",
+     "_s_sendmsg_rtn_b32_overlay",
+     "_s_sethalt_overlay",
++    "_s_setprio_overlay",
+     "_s_set_inst_prefetch_distance_overlay",
+     "_s_set_vgpr_msb_descriptor",
+     "_s_trap_overlay",
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/sets.py b/loom/py/loom/target/arch/amdgpu/descriptors/sets.py
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/sets.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/sets.py
+@@ -909,6 +909,7 @@
+         _s_barrier_overlay(),
+         _s_sendmsg_overlay(),
+         _s_sethalt_overlay(),
++        _s_setprio_overlay(),
+         _s_trap_overlay(),
+         *_gfx950_cache_control_overlays(),
+         _s_waitcnt_overlay(
+@@ -1509,6 +1510,7 @@
+         _s_sendmsg_overlay(),
+         _s_sendmsg_rtn_b32_overlay(),
+         _s_sethalt_overlay(),
++        _s_setprio_overlay(),
+         _s_trap_overlay(),
+         *_gfx11_cache_control_overlays(),
+         _s_waitcnt_overlay(
+@@ -2250,6 +2252,7 @@
+         _s_sendmsg_overlay(),
+         _s_sendmsg_rtn_b32_overlay(),
+         _s_sethalt_overlay(),
++        _s_setprio_overlay(),
+         _s_trap_overlay(),
+         *_gfx12_cache_control_overlays(),
+         *_gfx12_prefetch_overlays(),
+diff --git a/loom/src/loom/editor/textmate/loom.tmLanguage.json b/loom/src/loom/editor/textmate/loom.tmLanguage.json
+--- a/loom/src/loom/editor/textmate/loom.tmLanguage.json
++++ b/loom/src/loom/editor/textmate/loom.tmLanguage.json
+@@ -173,7 +173,7 @@
+         },
+         {
+           "name": "meta.operation-name.loom",
+-          "match": "\\b(kernel)\\.(async\\.tensor\\.store\\.from\\.lds|async\\.cluster\\.gather\\.mask|cluster\\.workgroup\\.flat_id|async\\.tensor\\.load\\.to\\.lds|subgroup\\.broadcast\\.first|tensor\\.lds\\.descriptor|async\\.cluster\\.gather|cluster\\.workgroup\\.id|subgroup\\.active\\.mask|subgroup\\.vote\\.ballot|workgroup\\.vote\\.count|workitem\\.dispatch\\.id|subgroup\\.broadcast|subgroup\\.match\\.all|subgroup\\.match\\.any|workgroup\\.vote\\.all|workgroup\\.vote\\.any|async\\.gather\\.mask|launch\\.concurrent|subgroup\\.vote\\.all|subgroup\\.vote\\.any|subgroup\\.lane\\.id|subgroup\\.shuffle|workgroup\\.reduce|async\\.copy\\.mask|subgroup\\.reduce|workgroup\\.count|barrier\\.arrive|subgroup\\.count|workgroup\\.scan|workgroup\\.size|cluster\\.count|launch\\.config|launch\\.serial|subgroup\\.scan|subgroup\\.size|async\\.gather|barrier\\.wait|cluster\\.size|launch\\.yield|workgroup\\.id|async\\.group|subgroup\\.id|workitem\\.id|async\\.copy|async\\.wait|cluster\\.id|entry\\.decl|dispatch|barrier|assert|launch|return|decl|exit|def)\\b",
++          "match": "\\b(kernel)\\.(async\\.tensor\\.store\\.from\\.lds|async\\.cluster\\.gather\\.mask|cluster\\.workgroup\\.flat_id|async\\.tensor\\.load\\.to\\.lds|subgroup\\.broadcast\\.first|tensor\\.lds\\.descriptor|async\\.cluster\\.gather|cluster\\.workgroup\\.id|subgroup\\.active\\.mask|subgroup\\.vote\\.ballot|workgroup\\.vote\\.count|workitem\\.dispatch\\.id|subgroup\\.broadcast|subgroup\\.match\\.all|subgroup\\.match\\.any|workgroup\\.vote\\.all|workgroup\\.vote\\.any|async\\.gather\\.mask|launch\\.concurrent|subgroup\\.vote\\.all|subgroup\\.vote\\.any|subgroup\\.lane\\.id|subgroup\\.shuffle|workgroup\\.reduce|async\\.copy\\.mask|subgroup\\.reduce|workgroup\\.count|barrier\\.arrive|subgroup\\.count|workgroup\\.scan|workgroup\\.size|cluster\\.count|launch\\.config|launch\\.serial|subgroup\\.scan|subgroup\\.size|async\\.gather|barrier\\.wait|cluster\\.size|launch\\.yield|workgroup\\.id|async\\.group|subgroup\\.id|workitem\\.id|async\\.copy|async\\.wait|cluster\\.id|entry\\.decl|dispatch|priority|barrier|assert|launch|return|decl|exit|def)\\b",
+           "captures": {
+             "1": {
+               "name": "support.namespace.dialect.loom"
+diff --git a/loom/src/loom/ops/kernel/ops.h b/loom/src/loom/ops/kernel/ops.h
+--- a/loom/src/loom/ops/kernel/ops.h
++++ b/loom/src/loom/ops/kernel/ops.h
+@@ -80,7 +80,8 @@
+   LOOM_OP_KERNEL_LAUNCH_CONCURRENT = LOOM_OP_KIND(LOOM_DIALECT_KERNEL, 53),
+   LOOM_OP_KERNEL_BARRIER_ARRIVE = LOOM_OP_KIND(LOOM_DIALECT_KERNEL, 54),
+   LOOM_OP_KERNEL_BARRIER_WAIT = LOOM_OP_KIND(LOOM_DIALECT_KERNEL, 55),
+-  LOOM_OP_KERNEL_COUNT_ = 56,
++  LOOM_OP_KERNEL_PRIORITY = LOOM_OP_KIND(LOOM_DIALECT_KERNEL, 56),
++  LOOM_OP_KERNEL_COUNT_ = 57,
+ };
+ 
+ // Private symbol retention policy. Absent (0) permits ordinary DCE.
+@@ -1265,6 +1266,19 @@
+     const loom_module_t* module, const loom_op_t* op,
+     iree_diagnostic_emitter_t emitter);
+ 
++// LOOM_OP_KERNEL_PRIORITY: Set the instruction issue priority of the current subgroup relative to other subgroups resident on the same execution unit. Level 0 is the default; higher levels win issue arbitration until the next kernel.priority. The op has no memory or value effects and keeps its position relative to the surrounding target instructions, so a pair of kernel.priority ops brackets the code that should issue first.
++// kernel.priority {level = 3}
++LOOM_DEFINE_ISA(loom_kernel_priority_isa, LOOM_OP_KERNEL_PRIORITY)
++LOOM_DEFINE_ATTR_I64(loom_kernel_priority_level, 0)
++iree_status_t loom_kernel_priority_build(
++    loom_builder_t* builder,
++    int64_t level,
++    loom_location_id_t location,
++    loom_op_t** out_op);
++iree_status_t loom_kernel_priority_verify(
++    const loom_module_t* module, const loom_op_t* op,
++    iree_diagnostic_emitter_t emitter);
++
+ // Returns the vtable array for the kernel dialect.
+ const loom_op_vtable_t* const* loom_kernel_dialect_vtables(
+     iree_host_size_t* out_count);
+diff --git a/loom/src/loom/ops/kernel/verify.c b/loom/src/loom/ops/kernel/verify.c
+--- a/loom/src/loom/ops/kernel/verify.c
++++ b/loom/src/loom/ops/kernel/verify.c
+@@ -1701,6 +1701,18 @@
+   return loom_kernel_verify_group_has_uses(module, emitter, op, group_id);
+ }
+ 
++iree_status_t loom_kernel_priority_verify(const loom_module_t* module,
++                                         const loom_op_t* op,
++                                         iree_diagnostic_emitter_t emitter) {
++  (void)module;
++  int64_t level = loom_kernel_priority_level(op);
++  if (level < 0 || level > 3) {
++    return loom_kernel_emit_attribute_value_constraint(
++        emitter, op, IREE_SV("level"), level, IREE_SV("priority level 0..3"));
++  }
++  return iree_ok_status();
++}
++
+ iree_status_t loom_kernel_async_wait_verify(const loom_module_t* module,
+                                             const loom_op_t* op,
+                                             iree_diagnostic_emitter_t emitter) {
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/control_packet.c b/loom/src/loom/target/arch/amdgpu/lower/control_packet.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/control_packet.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/control_packet.c
+@@ -239,6 +239,16 @@
+       loom_type_none(), location, &op);
+ }
+ 
++iree_status_t loom_amdgpu_build_control_packet_priority(
++    loom_builder_t* builder, const loom_low_descriptor_set_t* descriptor_set,
++    uint32_t level, loom_location_id_t location) {
++  loom_op_t* op = NULL;
++  return loom_amdgpu_control_packet_build_control_op(
++      builder, descriptor_set, LOOM_AMDGPU_DESCRIPTOR_REF_S_SETPRIO,
++      IREE_SV("level"), level, /*operands=*/NULL, /*operand_count=*/0,
++      loom_type_none(), location, &op);
++}
++
+ iree_status_t loom_amdgpu_build_control_packet_trap(
+     loom_builder_t* builder, const loom_low_descriptor_set_t* descriptor_set,
+     uint32_t trap_id, loom_location_id_t location) {
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/control_packet.h b/loom/src/loom/target/arch/amdgpu/lower/control_packet.h
+--- a/loom/src/loom/target/arch/amdgpu/lower/control_packet.h
++++ b/loom/src/loom/target/arch/amdgpu/lower/control_packet.h
+@@ -56,6 +56,11 @@
+     loom_builder_t* builder, const loom_low_descriptor_set_t* descriptor_set,
+     uint32_t reason, loom_location_id_t location);
+ 
++// Emits an AMDGPU issue-priority packet for the current wave.
++iree_status_t loom_amdgpu_build_control_packet_priority(
++    loom_builder_t* builder, const loom_low_descriptor_set_t* descriptor_set,
++    uint32_t level, loom_location_id_t location);
++
+ // Emits an AMDGPU trap packet with the given target-defined trap id.
+ iree_status_t loom_amdgpu_build_control_packet_trap(
+     loom_builder_t* builder, const loom_low_descriptor_set_t* descriptor_set,
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/registry.c b/loom/src/loom/target/arch/amdgpu/lower/registry.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/registry.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/registry.c
+@@ -408,6 +408,22 @@
+   return loom_amdgpu_lower_preamble_op(context, source_op);
+ }
+ 
++static iree_status_t loom_amdgpu_select_kernel_priority_dispatch(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    const loom_amdgpu_lower_dispatch_row_t* row,
++    loom_low_lower_plan_t* out_plan) {
++  (void)row;
++  return loom_amdgpu_select_kernel_priority_plan(context, source_op, out_plan);
++}
++
++static iree_status_t loom_amdgpu_emit_kernel_priority_dispatch(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    const loom_amdgpu_lower_dispatch_row_t* row, loom_low_lower_plan_t plan) {
++  (void)row;
++  (void)plan;
++  return loom_amdgpu_lower_kernel_priority(context, source_op);
++}
++
+ static iree_status_t loom_amdgpu_select_kernel_barrier_dispatch(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+     const loom_amdgpu_lower_dispatch_row_t* row,
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/registry_tables.inl b/loom/src/loom/target/arch/amdgpu/lower/registry_tables.inl
+--- a/loom/src/loom/target/arch/amdgpu/lower/registry_tables.inl
++++ b/loom/src/loom/target/arch/amdgpu/lower/registry_tables.inl
+@@ -716,6 +716,13 @@
+                 loom_amdgpu_low_legality_verify_kernel_split_barrier,
+                 LOOM_AMDGPU_STORAGE_NONE,
+                 LOOM_AMDGPU_REPORT_KEY_KERNEL_BARRIER_STRATEGY),
++        [LOOM_AMDGPU_OP_INDEX(LOOM_OP_KERNEL_PRIORITY)] =
++            LOOM_AMDGPU_STRUCTURAL_DIRECT_STORAGE_ROW(
++                LOOM_OP_KERNEL_PRIORITY,
++                loom_amdgpu_select_kernel_priority_dispatch,
++                loom_amdgpu_emit_kernel_priority_dispatch,
++                loom_amdgpu_low_legality_verify_kernel_priority,
++                LOOM_AMDGPU_STORAGE_NONE),
+         [LOOM_AMDGPU_OP_INDEX(LOOM_OP_KERNEL_WORKITEM_ID)] =
+             LOOM_AMDGPU_STRUCTURAL_DIRECT_STORAGE_ROW(
+                 LOOM_OP_KERNEL_WORKITEM_ID,
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/sync.c b/loom/src/loom/target/arch/amdgpu/lower/sync.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/sync.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/sync.c
+@@ -8,6 +8,7 @@
+ 
+ #include "loom/ir/context.h"
+ #include "loom/ops/kernel/ops.h"
++#include "loom/target/arch/amdgpu/lower/control_packet.h"
+ #include "loom/target/arch/amdgpu/lower/emit.h"
+ #include "loom/target/arch/amdgpu/lower/legality.h"
+ #include "loom/target/arch/amdgpu/lower/system_memory.h"
+@@ -419,3 +420,43 @@
+   return loom_amdgpu_low_legality_reject(context, op,
+                                          IREE_SV("collective.packet_lowering"));
+ }
++
++iree_status_t loom_amdgpu_select_kernel_priority_plan(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    loom_low_lower_plan_t* out_plan) {
++  *out_plan = loom_low_lower_plan_empty();
++  if (!loom_kernel_priority_isa(source_op) ||
++      !loom_amdgpu_descriptor_set_has_ref(
++          loom_low_lower_context_descriptor_set(context),
++          LOOM_AMDGPU_DESCRIPTOR_REF_S_SETPRIO)) {
++    return iree_ok_status();
++  }
++  *out_plan = loom_low_lower_plan_make(source_op->kind, NULL);
++  return iree_ok_status();
++}
++
++iree_status_t loom_amdgpu_lower_kernel_priority(
++    loom_low_lower_context_t* context, const loom_op_t* source_op) {
++  return loom_amdgpu_build_control_packet_priority(
++      loom_low_lower_context_builder(context),
++      loom_low_lower_context_descriptor_set(context),
++      (uint32_t)loom_kernel_priority_level(source_op), source_op->location);
++}
++
++iree_status_t loom_amdgpu_low_legality_verify_kernel_priority(
++    const loom_target_low_legality_provider_t* provider,
++    loom_target_low_legality_context_t* context, const loom_op_t* op,
++    bool* out_handled) {
++  (void)provider;
++  *out_handled = loom_kernel_priority_isa(op);
++  if (!*out_handled) {
++    return iree_ok_status();
++  }
++  if (!loom_amdgpu_descriptor_set_has_ref(
++          loom_target_low_legality_descriptor_set(context),
++          LOOM_AMDGPU_DESCRIPTOR_REF_S_SETPRIO)) {
++    return loom_amdgpu_low_legality_reject(context, op,
++                                           IREE_SV("descriptor.s_setprio"));
++  }
++  return iree_ok_status();
++}
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/sync.h b/loom/src/loom/target/arch/amdgpu/lower/sync.h
+--- a/loom/src/loom/target/arch/amdgpu/lower/sync.h
++++ b/loom/src/loom/target/arch/amdgpu/lower/sync.h
+@@ -74,6 +74,21 @@
+     loom_target_low_legality_context_t* context, const loom_op_t* op,
+     bool* out_handled);
+ 
++// Selects the AMDGPU issue-priority lowering for kernel.priority.
++iree_status_t loom_amdgpu_select_kernel_priority_plan(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    loom_low_lower_plan_t* out_plan);
++
++// Lowers kernel.priority to one s_setprio packet.
++iree_status_t loom_amdgpu_lower_kernel_priority(
++    loom_low_lower_context_t* context, const loom_op_t* source_op);
++
++// Verifies AMDGPU support for kernel.priority.
++iree_status_t loom_amdgpu_low_legality_verify_kernel_priority(
++    const loom_target_low_legality_provider_t* provider,
++    loom_target_low_legality_context_t* context, const loom_op_t* op,
++    bool* out_handled);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif
