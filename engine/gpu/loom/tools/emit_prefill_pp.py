@@ -1649,6 +1649,11 @@ def main():
             rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
             open(rot_src[name], "w").write(gen_rot.gen_q(k, B, gen_gemm_iu4.KP, True, heads))
             geom.append((name, 0, 64, k // 1024))
+        if a4:
+            # the norm-fed sites: RMS norm + rotq in one kernel (gen_rot.gen_nq; same bits, no f16 norm round trip)
+            rot_src["normq_5120.hal"] = os.path.join(tmp, "normq_5120.loom")
+            open(rot_src["normq_5120.hal"], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP))
+            geom.append(("normq_5120.hal", 0, 16 * 5120 // 256, 1))
         with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
             fh.write(gen_rot.signs())
         geom.append(("rot", 0, 0, 0))

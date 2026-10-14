@@ -1216,6 +1216,14 @@ class LoomPrefill {
     if (!rows_per_wg || (ws && ws % (32 * split))) throw LoomError("norm.hal: workgroup size does not match norm_split");
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
     DumpNorm(wname);
+    if (a4_ && mode == NormOut::kRow && !bfp && geom_.count("normq_5120.hal")) {
+      // A4: the norm and its rotq in one kernel (gen_rot.gen_nq), one row per workgroup; the f16 norm output is not kept
+      const LoomExecutable& nq = Exe("normq_5120.hal");
+      Dispatch(nq, "yah_normq", B_, 1, 1, geom_.at("normq_5120.hal").rowgrp, 1, 1,
+               {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)},
+               0b110000);
+      return;
+    }
     std::vector<hrx_buffer_ref_t> b =
         mode == NormOut::kBoth
             ? std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
@@ -1225,17 +1233,20 @@ class LoomPrefill {
     if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
     if (rot_) {
-      // one awq per input site: the post-attention norm feeds the FFN, attn_norm qkv / gate / alpha / beta or q / k / v
       if (mode != NormOut::kRow || bfp) throw LoomError("prefill: MQ4 sets rotate only the row-major norm output");
-      const std::string pre = wname.substr(0, wname.find('.', 4) + 1);
-      const char* w = wname.find("post_attention_norm") != std::string::npos   ? "ffn_gate"
-                      : cfg_.IsFullAttention(std::stoul(wname.substr(4))) ? "attn_q"
-                                                                          : "attn_qkv";
       if (a4_)
-        RotQ(*scratch_, kHidden, pre + w + ".awq", false);
+        RotQ(*scratch_, kHidden, NormAwq(wname), false);
       else
-        Rotate(*scratch_, nullptr, kHidden, pre + w + ".awq");
+        Rotate(*scratch_, nullptr, kHidden, NormAwq(wname));
     }
+  }
+  // the awq of a norm's input site: the post-attention norm feeds the FFN, attn_norm qkv / gate / alpha / beta or q / k / v
+  std::string NormAwq(const std::string& wname) const {
+    const std::string pre = wname.substr(0, wname.find('.', 4) + 1);
+    const char* w = wname.find("post_attention_norm") != std::string::npos   ? "ffn_gate"
+                    : cfg_.IsFullAttention(std::stoul(wname.substr(4))) ? "attn_q"
+                                                                        : "attn_qkv";
+    return pre + w + ".awq";
   }
   // MQ4 sets: x (B_ rows of k f16) into the weights' basis (gen_rot): in place, or dst != nullptr (k = kInner, ssm_out):
   // the DeltaNet value heads from GGUF into HF order into dst.
