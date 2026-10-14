@@ -108,7 +108,20 @@ def _body(e, sym, K, rows, awq, heads, ty, outs):
     e("  %s1 = vector.load %sv[%a16] : view<512xf32> -> vector<16xf32>")
     if awq:
         e(f"  %aw = vector.load %av[%kk] : view<{K}xf32> -> vector<16xf32>")
-        e("  %xd = vector.divf %xf, %aw : vector<16xf32>")
+        if outs:
+            # rotq: x / awq as Markstein's q0 + (x - q0 awq) y with y = v_rcp + one Newton step, which is the IEEE 1 / awq
+            # for every normal awq (exhaustive over the mantissas): the IEEE quotient up to the sign of a zero
+            e("  %awone = scalar.constant 1.0 : f32")
+            e("  %awonev = vector.splat %awone : vector<16xf32>")
+            e("  %awr0 = vector.divf<nnan|ninf|nsz|arcp> %awonev, %aw : vector<16xf32>")
+            e("  %awn = vector.negf %aw : vector<16xf32>")
+            e("  %awer = vector.fmaf %awn, %awr0, %awonev : vector<16xf32>")
+            e("  %awy = vector.fmaf %awer, %awr0, %awr0 : vector<16xf32>")
+            e("  %awq0 = vector.mulf %xf, %awy : vector<16xf32>")
+            e("  %awrr = vector.fmaf %awq0, %awn, %xf : vector<16xf32>")
+            e("  %xd = vector.fmaf %awrr, %awy, %awq0 : vector<16xf32>")
+        else:
+            e("  %xd = vector.divf %xf, %aw : vector<16xf32>")
         e("  %xs = vector.mulf %xd, %s1 : vector<16xf32>")
     else:
         e("  %xs = vector.mulf %xf, %s1 : vector<16xf32>")
@@ -231,7 +244,12 @@ def gen_q(K, rows, span, awq=True, heads=None):
     e("  %fl8 = scalar.constant -8.0 : f32")
     e("  %fl8v = vector.splat %fl8 : vector<16xf32>")
     e("  %fh7v = vector.splat %f7 : vector<16xf32>")
-    e(f"  %am7 = scalar.divf {amax}, %f7 : f32")
+    # amax / 7 as Markstein with RN(1 / 7): the IEEE quotient (exhaustive over the mantissas)
+    e("  %y7 = scalar.constant 0.142857142857142857 : f32")
+    e("  %n7 = scalar.constant -7.0 : f32")
+    e(f"  %am7q = scalar.mulf {amax}, %y7 : f32")
+    e(f"  %am7r = scalar.fmaf %am7q, %n7, {amax} : f32")
+    e("  %am7 = scalar.fmaf %am7r, %y7, %am7q : f32")
     e("  %anz = scalar.cmpf ogt, %am7, %fz : f32")
     e("  %am7s = scf.select %anz, %am7, %fone : f32")   # all zero: any scale, q = 0
     e("  %amh = scalar.mulf %am7s, %fhalf : f32")
@@ -240,10 +258,13 @@ def gen_q(K, rows, span, awq=True, heads=None):
         e(f"  %cj{j} = scalar.constant {1.0 + j / 7.0!r} : f32")
         e(f"  %dj{j} = scalar.mulf %amh, %cj{j} : f32")
         e(f"  %djv{j} = vector.splat %dj{j} : vector<16xf32>")
-        # x / d as one divide per lane plus a Markstein step: q1 = q0 + (x - q0 d) / d rounds once, so equals divf
-        e(f"  %ij{j} = scalar.divf %fone, %dj{j} : f32")
-        e(f"  %ijv{j} = vector.splat %ij{j} : vector<16xf32>")
+        # x / d as Markstein's q0 + (x - q0 d) y: rounds once, so equals divf, given y = RN(1 / d), which v_rcp + one
+        # Newton step is for every normal d (exhaustive over the mantissas)
         e(f"  %nd{j} = scalar.negf %dj{j} : f32")
+        e(f"  %ij0{j} = scalar.divf<nnan|ninf|nsz|arcp> %fone, %dj{j} : f32")
+        e(f"  %ije{j} = scalar.fmaf %nd{j}, %ij0{j}, %fone : f32")
+        e(f"  %ij{j} = scalar.fmaf %ije{j}, %ij0{j}, %ij0{j} : f32")
+        e(f"  %ijv{j} = vector.splat %ij{j} : vector<16xf32>")
         e(f"  %ndv{j} = vector.splat %nd{j} : vector<16xf32>")
         e(f"  %q0{j} = vector.mulf %xq, %ijv{j} : vector<16xf32>")
         e(f"  %rr{j} = vector.fmaf %q0{j}, %ndv{j}, %xq : vector<16xf32>")
@@ -258,16 +279,27 @@ def gen_q(K, rows, span, awq=True, heads=None):
         errs.append(f"%ms{j}")
     e("  %msv = vector.from_elements " + ", ".join(errs) + " : vector<8xf32>")
     msr = reduce("%msv", "vector<8xf32>", "addf", "ms")
-    best, bq, bm = "%dj0", "%qc0", "%mr0"
+    best, bi, bn, bm = "%dj0", "%ij0", "%nd0", "%mr0"
     for j in range(8):
         e(f"  %mr{j} = vector.extract {msr}[{j}] : vector<8xf32> -> f32")
         if j:
             e(f"  %lt{j} = scalar.cmpf olt, %mr{j}, {bm} : f32")   # the first minimum wins, as hipfire
             e(f"  %bm{j} = scf.select %lt{j}, %mr{j}, {bm} : f32")
             e(f"  %bd{j} = scf.select %lt{j}, %dj{j}, {best} : f32")
-            e(f"  %bq{j} = scf.select %lt{j}, %qc{j}, {bq} : vector<16xf32>")
-            best, bq, bm = f"%bd{j}", f"%bq{j}", f"%bm{j}"
-    fc = bq                                                       # the winner's clamped codes
+            e(f"  %bi{j} = scf.select %lt{j}, %ij{j}, {bi} : f32")
+            e(f"  %bn{j} = scf.select %lt{j}, %nd{j}, {bn} : f32")
+            best, bi, bn, bm = f"%bd{j}", f"%bi{j}", f"%bn{j}", f"%bm{j}"
+    # the winner's clamped codes again, by its candidate pass's ops: selecting the 8 candidates' codes instead costs 112
+    # v_cndmask and keeps them all live (192 vs 96 VGPRs, +6% cycles)
+    e(f"  %wiv = vector.splat {bi} : vector<16xf32>")
+    e(f"  %wnv = vector.splat {bn} : vector<16xf32>")
+    e("  %wq0 = vector.mulf %xq, %wiv : vector<16xf32>")
+    e("  %wrr = vector.fmaf %wq0, %wnv, %xq : vector<16xf32>")
+    e("  %wqd = vector.fmaf %wrr, %wiv, %wq0 : vector<16xf32>")
+    e("  %wqr = vector.roundevenf %wqd : vector<16xf32>")
+    e("  %wql = vector.maxnumf %wqr, %fl8v : vector<16xf32>")
+    fc = "%wqc"
+    e(f"  {fc} = vector.minnumf %wql, %fh7v : vector<16xf32>")
     e("  %m15 = scalar.constant 15 : i32")
     words = []
     for w in range(2):
