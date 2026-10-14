@@ -1,0 +1,110 @@
+Loom: pack two 16-bit lanes with one v_perm_b32. vector.from_elements of f16 lanes zero-extended the low half (bfe),
+shifted the high half and or-ed them (3 VALU per register), and vector f32 -> f16 truncation zero-extended both halves
+and shift-added them (3 VALU). V_PERM_B32 with selector 0x05040100 takes bytes 0..1 of each source whatever their upper
+bits, so a pair is one instruction. iu4 gu GEMM epilogue 48 -> 16 packing VALU, f16-output kstore 96 -> 32 per tile.
+Bit-identical results.
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c b/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c
+@@ -1378,11 +1378,45 @@
+       lane_type, out_register);
+ }
+ 
++// V_PERM_B32 selector placing SRC1 bytes 0..1 in bits 0..15 and SRC0 bytes 0..1
++// in bits 16..31: two 16-bit lanes in one register whatever their upper bits.
++#define LOOM_AMDGPU_B16_PAIR_PERMUTE_SELECTOR UINT32_C(0x05040100)
++
++// Packs lanes |lane_base| (bits 0..15) and |lane_base| + 1 (bits 16..31) with one
++// V_PERM_B32 instead of clearing, shifting and or-ing the two halves.
++static iree_status_t loom_amdgpu_pack_16bit_lane_pair_with_permute(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    const loom_amdgpu_vector_from_elements_plan_t* plan,
++    const loom_low_lower_resolved_descriptor_t* permute, uint32_t lane_base,
++    loom_type_t lane_type, loom_value_id_t* out_packed) {
++  loom_value_id_t low_lane = LOOM_VALUE_ID_INVALID;
++  loom_value_id_t high_lane = LOOM_VALUE_ID_INVALID;
++  IREE_RETURN_IF_ERROR(loom_low_lower_lookup_value(
++      context, plan->payload.elements[lane_base], &low_lane));
++  IREE_RETURN_IF_ERROR(loom_low_lower_lookup_value(
++      context, plan->payload.elements[lane_base + 1u], &high_lane));
++  IREE_RETURN_IF_ERROR(loom_amdgpu_materialize_low_vgpr_b32(
++      context, source_op, low_lane, &low_lane));
++  IREE_RETURN_IF_ERROR(loom_amdgpu_materialize_low_vgpr_b32(
++      context, source_op, high_lane, &high_lane));
++  return loom_amdgpu_emit_resolved_vgpr_binary_immediate(
++      context, source_op, permute, high_lane, low_lane,
++      LOOM_AMDGPU_B16_PAIR_PERMUTE_SELECTOR, lane_type, out_packed);
++}
++
+ static iree_status_t loom_amdgpu_lower_vector_from_16bit_elements(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+     const loom_amdgpu_vector_from_elements_plan_t* plan) {
+   loom_type_t lane_type = loom_type_none();
+   IREE_RETURN_IF_ERROR(loom_amdgpu_make_vgpr_type(context, &lane_type));
++  const bool has_permute = loom_amdgpu_descriptor_set_has_ref(
++      loom_low_lower_context_descriptor_set(context),
++      LOOM_AMDGPU_DESCRIPTOR_REF_V_PERM_B32_SRC2_LIT);
++  loom_low_lower_resolved_descriptor_t permute = {0};
++  if (has_permute) {
++    IREE_RETURN_IF_ERROR(loom_amdgpu_resolve_descriptor_ref(
++        context, LOOM_AMDGPU_DESCRIPTOR_REF_V_PERM_B32_SRC2_LIT, &permute));
++  }
+ 
+   loom_value_id_t registers[LOOM_AMDGPU_MAX_SCALARIZED_32BIT_LANES];
+   for (uint32_t register_index = 0; register_index < plan->register_count;
+@@ -1398,6 +1432,13 @@
+             plan, lane_base + 1u);
+     loom_value_id_t packed = LOOM_VALUE_ID_INVALID;
+ 
++    if (has_permute && high_lane_exists && !low_lane_uses_fma_mix &&
++        !high_lane_uses_fma_mix) {
++      IREE_RETURN_IF_ERROR(loom_amdgpu_pack_16bit_lane_pair_with_permute(
++          context, source_op, plan, &permute, lane_base, lane_type, &packed));
++      registers[register_index] = packed;
++      continue;
++    }
+     if (low_lane_uses_fma_mix) {
+       if (high_lane_exists && !high_lane_uses_fma_mix) {
+         IREE_RETURN_IF_ERROR(loom_amdgpu_lower_vector_from_16bit_element_lane(
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/encoding/vector_conversion.c b/loom/src/loom/target/arch/amdgpu/lower/encoding/vector_conversion.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/encoding/vector_conversion.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/encoding/vector_conversion.c
+@@ -956,10 +956,38 @@
+     loom_value_id_t low_source, loom_type_t source_lane_type,
+     loom_type_t lane_type) {
+   loom_value_id_t packed_registers[LOOM_AMDGPU_MAX_PACKED_16BIT_FLOAT_LANES];
++  // Two converted halves pack with one V_PERM_B32 (bytes 0..1 of each, whatever
++  // their upper bits) instead of zero-extending both and shift-adding.
++  loom_low_lower_resolved_descriptor_t permute = {0};
++  bool has_permute = false;
++  IREE_RETURN_IF_ERROR(loom_amdgpu_resolve_descriptor_ref_if_present(
++      context, LOOM_AMDGPU_DESCRIPTOR_REF_V_PERM_B32_SRC2_LIT, &permute,
++      &has_permute));
+   for (uint32_t register_index = 0;
+        register_index < plan->result_register_count; ++register_index) {
+     loom_value_id_t packed = LOOM_VALUE_ID_INVALID;
+     const uint32_t lane_base = register_index * 2u;
++    if (has_permute && lane_base + 1u < plan->lane_count) {
++      loom_value_id_t halves[2] = {LOOM_VALUE_ID_INVALID,
++                                   LOOM_VALUE_ID_INVALID};
++      for (uint32_t register_lane = 0; register_lane < 2u; ++register_lane) {
++        loom_value_id_t source_lane = LOOM_VALUE_ID_INVALID;
++        IREE_RETURN_IF_ERROR(loom_amdgpu_extract_low_register_unit(
++            context, source_op, low_source, plan->source_register_count,
++            lane_base + register_lane, source_lane_type, &source_lane));
++        IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_unary(
++            context, source_op, LOOM_AMDGPU_DESCRIPTOR_REF_V_CVT_F16_F32,
++            source_lane, lane_type, &halves[register_lane]));
++        IREE_RETURN_IF_ERROR(loom_amdgpu_materialize_low_vgpr_b32(
++            context, source_op, halves[register_lane],
++            &halves[register_lane]));
++      }
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_resolved_vgpr_binary_immediate(
++          context, source_op, &permute, halves[1], halves[0],
++          UINT32_C(0x05040100), lane_type, &packed));
++      packed_registers[register_index] = packed;
++      continue;
++    }
+     for (uint32_t register_lane = 0; register_lane < 2u; ++register_lane) {
+       const uint32_t lane_index = lane_base + register_lane;
+       if (lane_index >= plan->lane_count) {

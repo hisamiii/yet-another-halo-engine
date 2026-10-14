@@ -469,6 +469,8 @@ def gu_epilogue(e, TM, FM, FN, WN, V8):
     e(f"  %gu_all = buffer.view %al[%base] : buffer -> view<{W * 4 * WN}xf32>")
     e("  %out_h = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf16>")
     e("  %negone = scalar.constant -1.0 : f32")
+    # exp(-g) as exp2(g * -log2e): what expf<afn> lowers to after the negation, in one multiply (bit-identical)
+    e("  %nl2e = scalar.constant -1.4426950408889634 : f32")
     TG.rcp_consts(e)
     e("  %one = scalar.constant 1.0 : f32")
     e("  %gu_p = index.div %wr, %c2 : index")               # 0: a gate wave, 1: an up wave
@@ -513,8 +515,8 @@ def gu_epilogue(e, TM, FM, FN, WN, V8):
                 y = f"{j}_{q}_{x}"
                 e(f"  %g_{y} = vector.extract %gu_g{j}_{q}[{x}] : vector<4xf32> -> f32")
                 e(f"  %v_{y} = vector.extract %gu_u{j}_{q}[{x}] : vector<4xf32> -> f32")
-                e(f"  %ng_{y} = scalar.mulf %g_{y}, %negone : f32")
-                e(f"  %ex_{y} = scalar.expf<afn> %ng_{y} : f32")
+                e(f"  %ng_{y} = scalar.mulf %g_{y}, %nl2e : f32")
+                e(f"  %ex_{y} = scalar.exp2f<afn> %ng_{y} : f32")
                 e(f"  %dn_{y} = scalar.addf %one, %ex_{y} : f32")
                 TG.recip1(e, f"%iv_{y}", f"%dn_{y}")
                 e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
