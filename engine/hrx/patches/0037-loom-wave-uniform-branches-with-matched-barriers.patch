@@ -1,0 +1,247 @@
+Loom: accept workgroup barriers under a subgroup-uniform region branch when every region runs the same barrier
+sequence (loops: workgroup-uniform bounds and matching bodies). Each subgroup then arrives at every barrier instance
+once whichever region it takes, the per-subgroup arrival count AMDGPU s_barrier implements. Lets one wave run its own
+loop beside the others (gen_gdn_ss9: a solver wave). A mismatched sequence still fails STRUCTURE/038.
+diff --git a/loom/src/loom/analysis/control_uniformity.h b/loom/src/loom/analysis/control_uniformity.h
+--- a/loom/src/loom/analysis/control_uniformity.h
++++ b/loom/src/loom/analysis/control_uniformity.h
+@@ -85,6 +85,23 @@
+     loom_value_fact_uniform_scope_t required_scope,
+     loom_control_uniformity_failure_t* out_failure);
+ 
++// Accepts a structured region branch whose selector is not uniform at the
++// required scope (|selector_facts| describe it). Returning true treats every
++// region of |branch_op| as executed by the whole scope, for example when each
++// region runs the same sequence of barriers.
++typedef bool (*loom_control_uniformity_accept_branch_fn_t)(
++    void* user_data, const loom_op_t* branch_op,
++    loom_value_facts_t selector_facts);
++
++// As loom_control_uniformity_prove_execution, but a region-branch ancestor
++// whose selector is insufficiently uniform is accepted when |accept_branch|
++// returns true for it.
++bool loom_control_uniformity_prove_execution_accepting(
++    const loom_control_uniformity_info_t* info, const loom_op_t* op,
++    loom_value_fact_uniform_scope_t required_scope,
++    loom_control_uniformity_accept_branch_fn_t accept_branch, void* user_data,
++    loom_control_uniformity_failure_t* out_failure);
++
+ // Proves that every entry into |block| selects one Boolean branch outcome from
+ // execution uniform at |required_scope|. The returned condition describes the
+ // entire active subset of that entry, including false-edge polarity. It need
+diff --git a/loom/src/loom/analysis/control_uniformity.c b/loom/src/loom/analysis/control_uniformity.c
+--- a/loom/src/loom/analysis/control_uniformity.c
++++ b/loom/src/loom/analysis/control_uniformity.c
+@@ -321,6 +321,16 @@
+     const loom_control_uniformity_info_t* info, const loom_op_t* op,
+     loom_value_fact_uniform_scope_t required_scope,
+     loom_control_uniformity_failure_t* out_failure) {
++  return loom_control_uniformity_prove_execution_accepting(
++      info, op, required_scope, /*accept_branch=*/NULL, /*user_data=*/NULL,
++      out_failure);
++}
++
++bool loom_control_uniformity_prove_execution_accepting(
++    const loom_control_uniformity_info_t* info, const loom_op_t* op,
++    loom_value_fact_uniform_scope_t required_scope,
++    loom_control_uniformity_accept_branch_fn_t accept_branch, void* user_data,
++    loom_control_uniformity_failure_t* out_failure) {
+   IREE_ASSERT_ARGUMENT(info);
+   IREE_ASSERT_ARGUMENT(op);
+   IREE_ASSERT(required_scope == LOOM_VALUE_FACT_UNIFORM_SCOPE_SUBGROUP ||
+@@ -350,7 +360,15 @@
+             info, ancestor_op, loom_region_branch_selector(branch),
+             LOOM_CONTROL_UNIFORMITY_SOURCE_REGION_SELECTOR, required_scope,
+             out_failure)) {
+-      return false;
++      const loom_value_id_t selector = loom_region_branch_selector(branch);
++      const loom_value_facts_t selector_facts =
++          selector == LOOM_VALUE_ID_INVALID
++              ? loom_value_facts_unknown()
++              : loom_value_fact_table_lookup(info->fact_table, selector);
++      if (!accept_branch ||
++          !accept_branch(user_data, ancestor_op, selector_facts)) {
++        return false;
++      }
+     }
+ 
+     const loom_loop_like_t loop =
+diff --git a/loom/src/loom/ops/kernel/verify.c b/loom/src/loom/ops/kernel/verify.c
+--- a/loom/src/loom/ops/kernel/verify.c
++++ b/loom/src/loom/ops/kernel/verify.c
+@@ -4,6 +4,8 @@
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
++#include <string.h>
++
+ #include "loom/analysis/control_uniformity.h"
+ #include "loom/analysis/symbol_facts.h"
+ #include "loom/error/emitter.h"
+@@ -1103,14 +1105,164 @@
+   return LOOM_VALUE_FACT_UNIFORM_SCOPE_NONE;
+ }
+ 
++// Barrier sequences of structured regions. A subgroup-uniform region branch may
++// hold workgroup barriers when every region runs the same sequence: each
++// subgroup then arrives at every barrier instance once, whichever region it
++// takes (barriers count per-subgroup arrivals, as AMDGPU s_barrier does). Loops
++// contribute their workgroup-uniform bounds and body sequence.
++#define LOOM_KERNEL_BARRIER_SIGNATURE_CAPACITY 256
++
++typedef struct loom_kernel_barrier_signature_t {
++  uint64_t tokens[LOOM_KERNEL_BARRIER_SIGNATURE_CAPACITY];
++  iree_host_size_t count;
++} loom_kernel_barrier_signature_t;
++
++typedef struct loom_kernel_barrier_branch_context_t {
++  const loom_module_t* module;
++  const loom_value_fact_table_t* fact_table;
++} loom_kernel_barrier_branch_context_t;
++
++static bool loom_kernel_barrier_signature_push(
++    loom_kernel_barrier_signature_t* signature, uint64_t token) {
++  if (signature->count >= LOOM_KERNEL_BARRIER_SIGNATURE_CAPACITY) return false;
++  signature->tokens[signature->count++] = token;
++  return true;
++}
++
++static bool loom_kernel_barrier_signature_append(
++    loom_kernel_barrier_signature_t* signature,
++    const loom_kernel_barrier_signature_t* tail) {
++  for (iree_host_size_t i = 0; i < tail->count; ++i) {
++    if (!loom_kernel_barrier_signature_push(signature, tail->tokens[i])) {
++      return false;
++    }
++  }
++  return true;
++}
++
++static bool loom_kernel_barrier_signature_equal(
++    const loom_kernel_barrier_signature_t* a,
++    const loom_kernel_barrier_signature_t* b) {
++  return a->count == b->count &&
++         memcmp(a->tokens, b->tokens, a->count * sizeof(a->tokens[0])) == 0;
++}
++
++static bool loom_kernel_barrier_op_signature(
++    const loom_kernel_barrier_branch_context_t* context, const loom_op_t* op,
++    loom_kernel_barrier_signature_t* signature);
++
++static bool loom_kernel_barrier_region_signature(
++    const loom_kernel_barrier_branch_context_t* context,
++    const loom_region_t* region, loom_kernel_barrier_signature_t* signature) {
++  if (!region || region->block_count == 0) return true;
++  const iree_host_size_t start = signature->count;
++  for (uint16_t i = 0; i < region->block_count; ++i) {
++    const loom_op_t* op = NULL;
++    loom_block_for_each_op(loom_region_const_block(region, i), op) {
++      if (!loom_kernel_barrier_op_signature(context, op, signature)) {
++        return false;
++      }
++    }
++  }
++  // Unstructured control flow: barriers only in single-block regions.
++  return region->block_count == 1 || signature->count == start;
++}
++
++static bool loom_kernel_barrier_op_signature(
++    const loom_kernel_barrier_branch_context_t* context, const loom_op_t* op,
++    loom_kernel_barrier_signature_t* signature) {
++  if (loom_kernel_barrier_isa(op)) {
++    return loom_kernel_barrier_signature_push(
++        signature, 1 | ((uint64_t)loom_kernel_barrier_scope(op) << 8));
++  }
++  if (loom_kernel_barrier_arrive_isa(op) || loom_kernel_barrier_wait_isa(op)) {
++    return false;
++  }
++  if (op->region_count == 0) return true;
++  const loom_loop_like_t loop =
++      loom_loop_like_cast(context->module, (loom_op_t*)op);
++  if (loom_loop_like_isa(loop)) {
++    loom_kernel_barrier_signature_t body = {0};
++    if (!loom_kernel_barrier_region_signature(
++            context, loom_loop_like_body(loop), &body)) {
++      return false;
++    }
++    if (body.count == 0) return true;
++    if (!loom_loop_like_has_counted_range(loop)) return false;
++    const loom_value_id_t bounds[3] = {
++        loom_loop_like_lower_bound(loop),
++        loom_loop_like_upper_bound(loop),
++        loom_loop_like_step(loop),
++    };
++    if (!loom_kernel_barrier_signature_push(signature, 2)) return false;
++    for (int i = 0; i < 3; ++i) {
++      if (bounds[i] == LOOM_VALUE_ID_INVALID ||
++          !loom_value_facts_is_uniform_at_scope(
++              loom_value_fact_table_lookup(context->fact_table, bounds[i]),
++              LOOM_VALUE_FACT_UNIFORM_SCOPE_WORKGROUP) ||
++          !loom_kernel_barrier_signature_push(signature, bounds[i])) {
++        return false;
++      }
++    }
++    return loom_kernel_barrier_signature_append(signature, &body) &&
++           loom_kernel_barrier_signature_push(signature, 3);
++  }
++  // Any other region holder (structured branches included) must run one
++  // sequence whichever of its regions executes; a branch with a single
++  // region may also skip it.
++  loom_kernel_barrier_signature_t first = {0};
++  loom_region_t** regions = loom_op_regions(op);
++  for (uint8_t i = 0; i < op->region_count; ++i) {
++    loom_kernel_barrier_signature_t current = {0};
++    if (!loom_kernel_barrier_region_signature(context, regions[i], &current)) {
++      return false;
++    }
++    if (i == 0) {
++      first = current;
++    } else if (!loom_kernel_barrier_signature_equal(&first, &current)) {
++      return false;
++    }
++  }
++  if (first.count != 0 && op->region_count == 1 &&
++      loom_region_branch_isa(
++          loom_region_branch_cast(context->module, (loom_op_t*)op))) {
++    return false;
++  }
++  return loom_kernel_barrier_signature_append(signature, &first);
++}
++
++static bool loom_kernel_accept_matched_barrier_branch(
++    void* user_data, const loom_op_t* branch_op,
++    loom_value_facts_t selector_facts) {
++  const loom_kernel_barrier_branch_context_t* context =
++      (const loom_kernel_barrier_branch_context_t*)user_data;
++  if (!loom_value_facts_is_uniform_at_scope(
++          selector_facts, LOOM_VALUE_FACT_UNIFORM_SCOPE_SUBGROUP)) {
++    return false;
++  }
++  loom_kernel_barrier_signature_t signature = {0};
++  return loom_kernel_barrier_op_signature(context, branch_op, &signature);
++}
++
+ static iree_status_t loom_kernel_verify_barrier_control(
+     const loom_module_t* module, iree_diagnostic_emitter_t emitter,
+     loom_control_uniformity_info_t* control_uniformity,
+     const loom_op_t* barrier_op,
+     loom_value_fact_uniform_scope_t required_scope) {
+   loom_control_uniformity_failure_t failure = {0};
+-  const bool proven = loom_control_uniformity_prove_execution(
+-      control_uniformity, barrier_op, required_scope, &failure);
++  loom_kernel_barrier_branch_context_t branch_context = {
++      .module = module,
++      .fact_table = control_uniformity->fact_table,
++  };
++  const bool proven =
++      required_scope == LOOM_VALUE_FACT_UNIFORM_SCOPE_WORKGROUP &&
++              loom_kernel_barrier_isa(barrier_op)
++          ? loom_control_uniformity_prove_execution_accepting(
++                control_uniformity, barrier_op, required_scope,
++                loom_kernel_accept_matched_barrier_branch, &branch_context,
++                &failure)
++          : loom_control_uniformity_prove_execution(
++                control_uniformity, barrier_op, required_scope, &failure);
+   if (!proven) {
+     return loom_kernel_emit_barrier_control_constraint(
+         module, emitter, barrier_op, required_scope, &failure);

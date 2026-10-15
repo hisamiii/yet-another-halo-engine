@@ -781,6 +781,8 @@ class LoomPrefill {
     if (dn == geom_.end() || !dn->second.rowgrp)
       throw LoomError("dispatch.txt has no rowsplit.hal row group (re-emit the set)");
     dn_rowgrp_ = dn->second.rowgrp;
+    // The DeltaNet kernel's workgroup size (gen_gdn_ss runs 9 waves); sets without the row are 256.
+    if (const auto t = geom_.find("dnthreads"); t != geom_.end()) dn_threads_ = t->second.tokens;
     const auto at = geom_.find("wmma.hal");
     if (at == geom_.end() || !at->second.rowgrp || !at->second.tokens)
       throw LoomError("dispatch.txt has no wmma.hal geometry (re-emit the set)");
@@ -2144,8 +2146,8 @@ class LoomPrefill {
       auto ba = in, bb = in;
       ba.insert(ba.end(), {st, Ref(*raw_)});
       bb.insert(bb.end(), {st, Ref(*raw2_)});
-      Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, 256, 1, 1, ba, 0b11000000000);
-      Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, 256, 1, 1, bb, 0b11000000000);
+      Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, dn_threads_, 1, 1, ba, 0b11000000000);
+      Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, dn_threads_, 1, 1, bb, 0b11000000000);
       dn_done = true;
     } else {
       Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_ / conv_tb, 1, 256, 1, 1,
@@ -2162,12 +2164,12 @@ class LoomPrefill {
       // Split (dnsplit): heads [0, a) into raw_, then [a, kTs) into raw2_. The first part's postnorm depends only on raw_,
       // so it runs beside the second part (whose few workgroups leave most slots free).
       if (dnsplit_a_) {
-        Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, 256, 1, 1,
+        Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, dn_threads_, 1, 1,
                  {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
-        Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, 256, 1, 1,
+        Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, dn_threads_, 1, 1,
                  {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw2_)});
       } else {
-        Dispatch(Exe("rowsplit.hal"), "yah_deltanet", dn_rowgrp_, kTs, 1, 256, 1, 1,
+        Dispatch(Exe("rowsplit.hal"), "yah_deltanet", dn_rowgrp_, kTs, 1, dn_threads_, 1, 1,
                  {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
       }
     }
@@ -2467,6 +2469,7 @@ class LoomPrefill {
     const auto ctb = hgeom_.find("convtb");
     const std::uint32_t conv_tb = ctb != hgeom_.end() ? ctb->second.tokens : 1;
     const std::uint32_t dn_grp = HGeom("rowsplit.hal").rowgrp;
+    const std::uint32_t dn_thr = hgeom_.count("dnthreads") ? HGeom("dnthreads").tokens : 256;
     // per token: qkv / conv f16 [10240], gate / postnorm f16 [6144], kq f32 [16][3], ab f32 [48][2], raw f32 [6144]
     const std::size_t rqkv = std::size_t{kQkv} * 2, rin = std::size_t{kInner} * 2, rkq = std::size_t{kKh} * 3 * 4,
                       rab = std::size_t{kTs} * 2 * 4, rraw = std::size_t{kInner} * 4, rts = std::size_t{kTs} * 4;
@@ -2492,9 +2495,9 @@ class LoomPrefill {
                1, 256, 1, 1,
                {Tok(*alpha_, h, rts), Tok(*beta_, h, rts), TRef(*Find(pre + "ssm_a")), TRef(*Find(pre + "ssm_dt.bias")),
                 Tok(*qkv_, h, rqkv), cs, Tok(*ab_, h, rab), Ref(*valid_)});
-      Dispatch(HExe("rowsplit_a.hal"), "yah_deltanet", dn_grp, dnsplit_a_, 1, 256, 1, 1,
+      Dispatch(HExe("rowsplit_a.hal"), "yah_deltanet", dn_grp, dnsplit_a_, 1, dn_thr, 1, 1,
                {Tok(*conv_out_, h, rqkv), Tok(*kqbuf_, h, rkq), Tok(*ab_, h, rab), st, Tok(*raw_, h, rraw)});
-      Dispatch(HExe("rowsplit_b.hal"), "yah_deltanet", dn_grp, dnsplit_b_, 1, 256, 1, 1,
+      Dispatch(HExe("rowsplit_b.hal"), "yah_deltanet", dn_grp, dnsplit_b_, 1, dn_thr, 1, 1,
                {Tok(*conv_out_, h, rqkv), Tok(*kqbuf_, h, rkq), Tok(*ab_, h, rab), st, Tok(*raw2_, h, rraw)});
       const hrx_buffer_ref_t gate = Tok(*gate_, h, rin);
       std::vector<hrx_buffer_ref_t> b{Tok(*raw_, h, rraw), TRef(*Find(pre + "ssm_norm.weight")), gate,
@@ -2599,7 +2602,7 @@ class LoomPrefill {
   std::map<std::string, Geom> geom_;
   std::map<std::string, LoomExecutable> exes_;
   std::deque<LoomBuffer> keep_;  // stable addresses
-  std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, attn_hpw_ = 0, attn_tpw_ = 0;
+  std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, dn_threads_ = 256, attn_hpw_ = 0, attn_tpw_ = 0;
   std::uint32_t dnsplit_a_ = 0, dnsplit_b_ = 0;  // DeltaNet head split (dispatch.txt "dnsplit"; 0: one dispatch)
   std::uint32_t qrot_first_ = 0;  // first chunk whose attention reads yah_qrot's rotated Q (dispatch.txt "qrot")
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed

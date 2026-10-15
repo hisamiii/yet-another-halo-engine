@@ -152,8 +152,10 @@ DNVCONV = True
 # redraw spread (0.0693-0.0695 / 2.15-2.27). Unscaled f16 failed the tail (q99.9 2.52: subnormal outputs).
 DNO16 = os.environ.get("YAH_DN_O16", "1") == "1"
 # DNSS: the dnperm parts as the state-stationary kernel (gen_gdn_ss: one workgroup per head, the state in registers, the
-# head's v-independent work once): bit-identical to gen_gdn_chunk (vconv, o16). Grid (1, heads). pp2048 (sums over 48
-# layers): part a 54.9 -> 36.1 ms; part b 27.3 -> 33.8 (8 workgroups, one per WGP: each head's serial chain, beside pnq a).
+# head's v-independent work once). Grid (1, heads) x gen_gdn_ss.THREADS (dispatch.txt "dnthreads"). pp2048 (sums over
+# 48 layers): part a 54.9 -> 36.1 ms; part b 27.3 -> 33.8 (8 workgroups, one per WGP: each head's serial chain, beside
+# pnq a). A ninth wave runs the solve beside the row waves' K S^T / Q S^T (X = T1 (K S^T), not bit-identical): part a
+# 34.5 -> 30.7 ms, part b 33.4 -> 31.0; WT2 KL 0.0671 -> 0.0683 / q99.9 2.026 -> 2.054, inside the redraw spread.
 DNSS = True
 
 
@@ -1605,6 +1607,7 @@ def main():
     dn_ss = DNSS and dn_perm and dn_vconv and DNO16 and B % 32 == 0
     # blocks per head of the DeltaNet grid (the unsplit rowsplit.hal is not dispatched with dnsplit)
     geom.append(("rowsplit.hal", 0, 1 if dn_ss else 2, 0))
+    geom.append(("dnthreads", gen_gdn_ss.THREADS if dn_ss else 256, 0, 0))
     dn_parts = []
     # A4 sets: DeltaNet part b runs the heads of whole rotq groups (gen_rot.pn_heads), so each fused postnorm + rotq part
     # (gen_pnq) reads one part's compact output; "dnperm" tells the host the parts are head sets, not ranges

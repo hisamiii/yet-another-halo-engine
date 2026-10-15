@@ -5,24 +5,26 @@ head, the state in registers.
 usage: gen_gdn_ss.py [out.loom]
 
 Same ABI as gen_gdn_chunk.gen(heads=..., vconv=True, o16=True) (bindings conv, x, conv_weights, conv_state, alpha, beta,
-ssm_a, ssm_dt, valid, state, out), grid (1, len(heads)) x 256 threads (8 wave32 waves).
+ssm_a, ssm_dt, valid, state, out), grid (1, len(heads)) x THREADS = 288 threads (9 wave32 waves; dispatch.txt
+"dnthreads").
 
 gen_gdn_chunk splits a head's 128 value rows over two workgroups, so both run the head's v-independent work (KK^T, QK^T,
 the solve, W) and stage the f16 state in LDS for the X / O1 fragment loads each chunk. Here wave w owns value rows
-16 w .. +15 over all 128 keys, as S^T [key][row]: 8 f32 accumulator tiles (tile j: keys 16 j .. +15). X = W S^T and
+16 w .. +15 over all 128 keys, as S^T [key][row]: 8 f32 accumulator tiles (tile j: keys 16 j .. +15). KS = K S^T and
 O1 = Q S^T take S^T's f16 rhs fragments straight from the accumulators (vector.fragment.repack: fptrunc, one half-wave
-exchange and one v_perm per register), and so do P Vn and the update K^T Vn'; Vn, Vn', U and O never leave the wave.
+exchange and one v_perm per register), and so do X = T1 KS, P Vn and the update K^T Vn'; KS, Vn, Vn', U and O never
+leave the wave.
 
-Per chunk:
-    P1  K, Q rows -> LDS (Kt transposed), the v conv of the 128 channels -> Vt, gates (wave 0), next chunk's loads,
-        the previous chunk's O stores
-    P2  A = KK^T (waves 0-3), P = QK^T (waves 4-7)
-    P3  T = (I + A)^-1 (wave 0), T1 = T diag(b 2^G), T2 = T diag(b)
-    P4  W = T1 Kt -> LDS (2 tiles per wave)
-    P5  per wave: X = W S^T, O1 = Q S^T, U = T2 V, Vn = U - X, Vn' = 2^(G_C - G) Vn, O = 2^G O1 + P Vn,
-        S^T <- 2^G_C S^T + K^T Vn'
-The same f32 / f16 operations as gen_gdn_chunk in the same order (the update runs as the transposed product: the same
-products and sums per element), so the output and state are bit-identical.
+Waves 0-7 (the row waves) own the value rows; wave 8 (the solver) computes the gates and the solve in a loop of its
+own, so the row waves' KS / O1 products overlap the serial solve. Each role loop runs the same 4 workgroup barriers per
+chunk under one wave-uniform branch (HRX patch 0037). Per chunk:
+    P1  rows: K, Q -> LDS (Kt transposed), the v conv of the 128 channels -> Vt, next chunk's loads, the previous
+        chunk's O stores; solver: gates -> LDS, next chunk's gate loads
+    P2  rows: A = KK^T (waves 0-3), P = QK^T (waves 4-7)
+    P3  solver: T = (I + A)^-1, T1 = T diag(b 2^G), T2 = T diag(b); rows: KS = K S^T, O1 = Q S^T
+    P5  rows: X = T1 KS, U = T2 V, Vn = U - X, Vn' = 2^(G_C - G) Vn, O = 2^G O1 + P Vn, S^T <- 2^G_C S^T + K^T Vn'
+X = T1 (K S^T) reassociates gen_gdn_chunk's (T1 K) S^T (one f16 rounding of KS instead of W): not bit-identical to it
+(output within ~half an f16 ulp, A4 KL within the redraw spread).
 """
 import sys
 
@@ -30,12 +32,13 @@ from gen_gdn_chunk import O16_EXP, TPRE
 from gen_gemm_tile import rcp_consts, recip1
 
 C, D = 32, 128
+THREADS = 288
 V8 = "vector<8xf32>"
 V4 = "vector<4xf32>"
 V16H = "vector<16xf16>"
 V8H = "vector<8xf16>"
 V4H = "vector<4xf16>"
-# LDS regions (bytes): K|Q rows (K rows become W after phase 2), Kt [key][tok], Vt [row][tok], -A^T (f32), P, T1, T2,
+# LDS regions (bytes): K|Q rows, Kt [key][tok], Vt [row][tok], -A^T (f32), P, T1, T2,
 # gates, conv weights [128][4] and conv ring x[-3..-1] [128][3] (f32)
 KQ, KT, VT, AF, PP, T1, T2, GA, CW, CS = 0, 17408, 27648, 37888, 42496, 45056, 47616, 50176, 50944, 52992
 POOL = CS + 128 * 3 * 4
@@ -58,13 +61,13 @@ def gen(heads):
     e("")
     e("kernel.def target(@gdn_w32) @yah_deltanet() {")
     e("  %unit = index.constant 1 : index")
-    e("  %c256 = index.constant 256 : index")
+    e(f"  %nthreads = index.constant {THREADS} : index")
     e(f"  %launch_heads = index.constant {nh} : index")
-    e("  kernel.launch.config workgroups(%unit, %launch_heads, %unit) workgroup_size(%c256, %unit, %unit) : index")
+    e("  kernel.launch.config workgroups(%unit, %launch_heads, %unit) workgroup_size(%nthreads, %unit, %unit) : index")
     e("} launch(%conv: buffer, %x: buffer, %cw: buffer, %cst: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, "
       "%ssm_dt: buffer, %valid: buffer, %state: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 2, 3, 4, 8, 16, 31, 32, 40, 48, 64, 127, 128, 16384):
+    for v in (0, 1, 2, 3, 4, 7, 8, 16, 31, 32, 40, 48, 64, 127, 128, 255, 16384):
         e(f"  %c{v} = index.constant {v} : index")
     e("  %zero = scalar.constant 0.0 : f32")
     e("  %one = scalar.constant 1.0 : f32")
@@ -119,8 +122,6 @@ def gen(heads):
     e(f"  %kr_r = buffer.view %pool[{o}] : buffer -> view<128x32xf16, {l_}>")      # B[key][tok] from K[tok][key]
     o = region("kt", KT)
     e(f"  %kt_w = buffer.view %pool[{o}] : buffer -> view<128x40xf16>")              # Kt[key][tok]; lhs A[key][tok]
-    l_ = lay("kt", 40)
-    e(f"  %kt_r = buffer.view %pool[{o}] : buffer -> view<32x128xf16, {l_}>")      # B[tok][key] from Kt[key][tok]
     o = region("vt", VT)
     e(f"  %vt_w = buffer.view %pool[{o}] : buffer -> view<128x40xf16>")
     l_ = lay("vt", 40)
@@ -169,13 +170,13 @@ def gen(heads):
     e("  %v_rel = index.mul %v_head, %c128 : index")
     e("  %o_rel = index.mul %h_rel, %c128 : index")
     e("  %s_head = index.mul %h, %c16384 : index")
-    # wave roles: phases 2 / 4 as gen_gdn_chunk; phase 5 value rows 16 sg .. +15
-    e("  %w4 = index.rem %sg, %c4 : index")
-    e("  %wd4 = index.div %sg, %c4 : index")
-    e("  %isw0 = index.cmp eq, %sg, %c0 : index")
+    # wave roles: wave 8 the solver; row waves: phase 2 as gen_gdn_chunk, value rows 16 sg .. +15 (the solver's
+    # row-wave values are clamped copies of wave 7's: computed, never used)
+    e("  %issv = index.cmp eq, %sg, %c8 : index")
+    e("  %sgc = index.min %sg, %c7 : index")
     e("  %isqk = index.cmp uge, %sg, %c4 : index")
     e("  %iskk = index.cmp ult, %sg, %c4 : index")
-    e("  %row0 = index.mul %sg, %c16 : index")
+    e("  %row0 = index.mul %sgc, %c16 : index")
     e("  %row = index.add %row0, %sub : index")         # accumulator column (S^T, U, Vn, O): value row
     e("  %orow = index.add %o_rel, %row : index")
 
@@ -214,18 +215,20 @@ def gen(heads):
     e("  %ab_vi = index.cast %ab_vraw : i32 to index")
     e("  %ab_vlo = index.max %ab_vi, %c1 : index")
     e("  %ab_vld = index.min %ab_vlo, %batch : index")
-    e("  %vc_t4 = index.mul %sg, %c4 : index")          # this wave's 4 tokens of the chunk
+    e("  %vc_t4 = index.mul %sgc, %c4 : index")          # this wave's 4 tokens of the chunk
     e("  %vc_p4 = index.mul %lane, %c4 : index")        # its lane's 4 channels
     e("  %vc_c = index.add %v_rel, %vc_p4 : index")
     e("  %nchunks = index.div %batch, %c32 : index")
     e("  %lastc = index.sub %nchunks, %c1 : index")
     # per-thread fetch map: token lt = tid / 8; K/Q dims (tid % 8) * 16 .. +15
-    e("  %lt = index.div %tid, %c8 : index")
-    e("  %seg8 = index.rem %tid, %c8 : index")
+    e("  %tidc = index.min %tid, %c255 : index")
+    e("  %lt = index.div %tidc, %c8 : index")
+    e("  %seg8 = index.rem %tidc, %c8 : index")
     e("  %dseg = index.mul %seg8, %c16 : index")
     e("  %qrow = index.add %lt, %c32 : index")
 
-    def fetch(cidx, p, ind):
+    def fetch_rows(cidx, p, ind):
+        """the row waves' loads of chunk cidx: K, Q (normalized f16) and the v conv taps"""
         e(f"{ind}%{p}t0 = index.mul {cidx}, %c32 : index")
         e(f"{ind}%{p}tok = index.add %{p}t0, %lt : index")
         e(f"{ind}%{p}crow = index.mul %{p}tok, %qkv_size : index")
@@ -252,13 +255,17 @@ def gen(heads):
             e(f"{ind}%{p}vo{r + 3} = index.add %{p}vr{r + 3}, %vc_c : index")
             e(f"{ind}%{p}vx{r + 3} = vector.load %x_view[%{p}vo{r + 3}] : view<[%conv_total]xf16> -> {V4H}")
             names.append(f"%{p}vx{r + 3}")
+        return names
+
+    def fetch_gates(cidx, p, ind):
+        """the solver's loads of chunk cidx: raw alpha, beta of token t0 + lane"""
+        e(f"{ind}%{p}t0 = index.mul {cidx}, %c32 : index")
         e(f"{ind}%{p}abt = index.add %{p}t0, %lane : index")
         e(f"{ind}%{p}ab0 = index.mul %{p}abt, %num_heads : index")
         e(f"{ind}%{p}ab1 = index.add %{p}ab0, %h : index")
         e(f"{ind}%{p}al = view.load %al_view[%{p}ab1] : view<[%ra_total]xf32> -> f32")
         e(f"{ind}%{p}be = view.load %be_view[%{p}ab1] : view<[%ra_total]xf32> -> f32")
-        names += [f"%{p}al", f"%{p}be"]
-        return names
+        return [f"%{p}al", f"%{p}be"]
 
     def ostore(ind, t0, acc, t, p):
         """O tile t (tokens 16 t + half + 2 i of the chunk at t0, row) -> out, f16(clamp(O 2^O16_EXP))"""
@@ -288,332 +295,344 @@ def gen(heads):
         e(f"{ind}%{nm} = vector.fragment.repack<rhs> %{nm}r shape [%k, %n] : {V16H} -> {V16H}")
         return f"%{nm}"
 
-    ftypes = [V4H] * 15 + ["f32", "f32"]
-    fnames = [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + [f"%vx{r}" for r in range(7)] + \
-        ["%al_raw", "%be_raw"]
-    pre = fetch("%c0", "f0_", "  ")
-    carried = ", ".join(f"%s{j} = {st[j]} : {V8}" for j in range(8))
-    carried += ", " + ", ".join(f"{nm} = {v} : {t}" for nm, v, t in zip(fnames, pre, ftypes))
-    carried += f", %opv0 = %zeros8 : {V8}, %opv1 = %zeros8 : {V8}"      # the previous chunk's O, stored next iteration
-    res = ", ".join(f"%sf{j}" for j in range(8)) + ", " + ", ".join(f"%ff{i}" for i in range(len(fnames)))
-    res += ", %opf0, %opf1"
-    alltypes = ", ".join([V8] * 8 + ftypes + [V8, V8])
-    e(f"  {res} = scf.for %ci = [%c0 to %nchunks step %c1]({carried}) -> ({alltypes}) {{")
-    I = "    "
-    e(f"{I}%t0 = index.mul %ci, %c32 : index")
-    # ---- phase 1: K, Q (normalized f16) -> K|Q rows, Kt; v conv -> Vt; gates
-    for nm, row in (("k", "%lt"), ("q", "%qrow")):
-        hs = [f"%{nm}v{g}" for g in range(4)]
-        for p in range(2):
-            e(f"{I}%{nm}c{p} = vector.concat<0> {hs[2 * p]}, {hs[2 * p + 1]} : {V4H}, {V4H} -> {V8H}")
-            e(f"{I}%{nm}d{p} = index.add %dseg, %c{8 * p} : index")
-            e(f"{I}vector.store %{nm}c{p}, %kq_l[{row}, %{nm}d{p}] : {V8H}, view<64x136xf16>")
-        if nm == "k":   # transposed copy Kt[key][tok]
-            for g in range(4):
-                for i in range(4):
-                    e(f"{I}%kt{g}{i}e = vector.extract {hs[g]}[{i}] : {V4H} -> f16")
-                    e(f"{I}%kt{g}{i}c = index.constant {4 * g + i} : index")
-                    e(f"{I}%kt{g}{i}r = index.add %dseg, %kt{g}{i}c : index")
-                    e(f"{I}view.store %kt{g}{i}e, %kt_w[%kt{g}{i}r, %lt] : f16, view<128x40xf16>")
-    # v conv (gen_conv_kq.conv_steps per channel: s0 .. s3 = x[t-3] .. x[t]; x[-3], x[-2], x[-1] = ring slots 1, 2, 3):
-    # lane = 4 channels, wave = 4 tokens; one b64 Vt store per channel
-    e(f"{I}%vc_f0 = index.add %ci, %sg : index")
-    e(f"{I}%vc_first = index.cmp eq, %vc_f0, %c0 : index")    # chunk 0, wave 0: tokens -3 .. -1 from the ring
-    # exp(-dot) as exp2(dot * -log2e): what expf<afn> lowers to after the negation, in one multiply (bit-identical)
-    e(f"{I}%nl2e = scalar.constant -1.4426950408889634 : f32")
-    for j in range(4):
-        e(f"{I}%vc_r{j} = index.add %vc_p4, %c{j} : index")
-        e(f"{I}%vc_w{j} = vector.load %cws[%vc_r{j}, %c0] : view<128x4xf32> -> {V4}")
-        w = []
-        for k in range(4):
-            e(f"{I}%vc_w{j}_{k} = vector.extract %vc_w{j}[{k}] : {V4} -> f32")
-            w.append(f"%vc_w{j}_{k}")
-        xs = []
-        for r in range(7):
-            e(f"{I}%vc_h{j}_{r} = vector.extract %vx{r}[{j}] : {V4H} -> f16")
-            e(f"{I}%vc_e{j}_{r} = scalar.extf %vc_h{j}_{r} : f16 to f32")
-            if r < 3:
-                e(f"{I}%vc_sc{j}_{r} = index.constant {r} : index")
-                e(f"{I}%vc_st{j}_{r} = view.load %css[%vc_r{j}, %vc_sc{j}_{r}] : view<128x3xf32> -> f32")
-                e(f"{I}%vc_x{j}_{r} = scf.select %vc_first, %vc_st{j}_{r}, %vc_e{j}_{r} : f32")
-                xs.append(f"%vc_x{j}_{r}")
-            else:
-                xs.append(f"%vc_e{j}_{r}")
-        hs = []
-        for u in range(4):
-            q = f"%vc{j}_{u}"
-            s0, s1, s2, s3 = xs[u], xs[u + 1], xs[u + 2], xs[u + 3]
-            e(f"{I}{q}d0 = scalar.mulf {s0}, {w[0]} : f32")
-            e(f"{I}{q}d1 = scalar.mulf {s1}, {w[1]} : f32")
-            e(f"{I}{q}d2 = scalar.mulf {s2}, {w[2]} : f32")
-            e(f"{I}{q}d3 = scalar.mulf {s3}, {w[3]} : f32")
-            e(f"{I}{q}sa = scalar.addf {q}d0, {q}d1 : f32")
-            e(f"{I}{q}sb = scalar.addf {q}d2, {q}d3 : f32")
-            e(f"{I}{q}dot = scalar.addf {q}sa, {q}sb : f32")
-            e(f"{I}{q}ng = scalar.mulf {q}dot, %nl2e : f32")
-            e(f"{I}{q}ex = scalar.exp2f<afn> {q}ng : f32")
-            e(f"{I}{q}dn = scalar.addf %one, {q}ex : f32")
-            recip1(e, f"{q}sg", f"{q}dn", I)    # = 1 / dn: the f16 product rounds the denormal range alike
-            e(f"{I}{q}r = scalar.mulf {q}dot, {q}sg : f32")
-            e(f"{I}{q}h = scalar.fptrunc {q}r : f32 to f16")
-            hs.append(f"{q}h")
-        e(f"{I}%vc_o{j} = vector.from_elements {', '.join(hs)} : {V4H}")
-        e(f"{I}vector.store %vc_o{j}, %vt_w[%vc_r{j}, %vc_t4] : {V4H}, view<128x40xf16>")
-    # decay: wave 0, lane = token: G2 = inclusive scan of log2 alpha (one barrier)
-    e(f"{I}scf.if %isw0 {{")
-    # yah_deltanet_prep_ab: lane = token t0 + lane of head h; padding tokens (>= valid) get (1, 0)
-    e(f"{I}  %ab_b = scalar.addf %al_raw, %ab_dt : f32")
-    e(f"{I}  %ab_20 = scalar.constant 20.0 : f32")
-    e(f"{I}  %ab_over = scalar.cmpf ogt, %ab_b, %ab_20 : f32")
-    e(f"{I}  %ab_ex = scalar.expf<afn> %ab_b : f32")
-    e(f"{I}  %ab_op = scalar.addf %one, %ab_ex : f32")
-    e(f"{I}  %ab_lg = scalar.logf<afn> %ab_op : f32")
-    e(f"{I}  %ab_sp = scf.select %ab_over, %ab_b, %ab_lg : f32")
-    e(f"{I}  %ab_sc = scalar.mulf %ab_sp, %ab_a : f32")
-    e(f"{I}  %ab_ao = scalar.expf<afn> %ab_sc : f32")
-    e(f"{I}  %ab_neg = scalar.constant -1.0 : f32")
-    e(f"{I}  %ab_nb = scalar.mulf %be_raw, %ab_neg : f32")
-    e(f"{I}  %ab_bx = scalar.expf<afn> %ab_nb : f32")
-    e(f"{I}  %ab_dn = scalar.addf %one, %ab_bx : f32")
-    e(f"{I}  %ab_bo = scalar.divf %one, %ab_dn : f32")
-    e(f"{I}  %ab_tok = index.add %t0, %lane : index")
-    e(f"{I}  %ab_real = index.cmp ult, %ab_tok, %ab_vld : index")
-    e(f"{I}  %alpha = scf.select %ab_real, %ab_ao, %one : f32")
-    e(f"{I}  %beta = scf.select %ab_real, %ab_bo, %zero : f32")
-    # alpha can underflow to 0: log2 gives -inf, -inf - -inf = NaN in the decay differences; clamp at 2^-100
-    e(f"{I}  %lg0 = scalar.log2f<afn> %alpha : f32")
-    e(f"{I}  %lgmin = scalar.constant -100.0 : f32")
-    e(f"{I}  %lg = scalar.maxnumf %lg0, %lgmin : f32")
-    e(f"{I}  %g2 = kernel.subgroup.scan<addf> %lg {{mode = inclusive, direction = forward}} : f32")
-    e(f"{I}  %c31i = scalar.constant 31 : i32")
-    e(f"{I}  %gtot = kernel.subgroup.broadcast %g2 from %c31i : f32, i32")
-    e(f"{I}  %gg = scalar.exp2f<afn> %g2 : f32")
-    e(f"{I}  %bg = scalar.mulf %beta, %gg : f32")
-    e(f"{I}  %gcd = scalar.subf %gtot, %g2 : f32")
-    e(f"{I}  %gc = scalar.exp2f<afn> %gcd : f32")
-    e(f"{I}  view.store %g2, %ga[%gaG2, %lane] : f32, view<6x32xf32>")
-    e(f"{I}  view.store %beta, %ga[%gaBETA, %lane] : f32, view<6x32xf32>")
-    e(f"{I}  view.store %gg, %ga[%gaGG, %lane] : f32, view<6x32xf32>")
-    e(f"{I}  view.store %bg, %ga[%gaBG, %lane] : f32, view<6x32xf32>")
-    e(f"{I}  view.store %gc, %ga[%gaGC, %lane] : f32, view<6x32xf32>")
-    e(f"{I}}}")
-    # next chunk's inputs (clamped): in flight during phases 2-5
-    e(f"{I}%cn0 = index.add %ci, %c1 : index")
-    e(f"{I}%cn = index.min %cn0, %lastc : index")
-    nxt = fetch("%cn", "nx_", I)
-    # the previous chunk's O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores zeros
-    # to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same addresses, in order)
-    e(f"{I}%opc0 = index.max %ci, %c1 : index")
-    e(f"{I}%opc = index.sub %opc0, %c1 : index")
-    e(f"{I}%opt0 = index.mul %opc, %c32 : index")
-    for t in range(2):
-        ostore(I, "%opt0", f"%opv{t}", t, f"ox{t}")
-    e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    # ---- phase 2: KK^T (waves 0-3) -> A (f32), QK^T (waves 4-7) -> P (f16)
-    e(f"{I}%p2t = index.rem %sg, %c4 : index")
-    e(f"{I}%p2mi = index.div %p2t, %c2 : index")
-    e(f"{I}%p2nj = index.rem %p2t, %c2 : index")
-    e(f"{I}%p2m0 = index.mul %p2mi, %c16 : index")
-    e(f"{I}%p2n0 = index.mul %p2nj, %c16 : index")
-    e(f"{I}%p2qo = scf.select %isqk, %c32, %c0 : index")
-    e(f"{I}%p2r = index.add %p2qo, %p2m0 : index")        # rows of the 64-row K|Q view
-    acc = "%zs"
-    for c in range(8):
-        e(f"{I}%p2k{c} = index.constant {16 * c} : index")
-        e(f"{I}%p2a{c} = vector.fragment.load<lhs> %kq_l[%p2r, %p2k{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
-        e(f"{I}%p2b{c} = vector.fragment.load<rhs> %kr_r[%p2k{c}, %p2n0] shape [%k, %n] : view<128x32xf16, %kr_lay> -> {V16H}")
-        e(f"{I}%p2c{c} = vector.mma %p2a{c}, %p2b{c}, {acc} : {V16H}, {V16H}, {V8}")
-        acc = f"%p2c{c}"
-    # element i: (m = p2m0 + half + 2 i, n = p2n0 + sub)
-    e(f"{I}%p2mr = index.add %p2m0, %half : index")
-    e(f"{I}%p2n = index.add %p2n0, %sub : index")
-    e(f"{I}%gn = view.load %ga[%gaG2, %p2n] : view<6x32xf32> -> f32")
-    gms, bms = [], []
-    for i in range(8):
-        e(f"{I}%p2e{i}c = index.constant {2 * i} : index")
-        e(f"{I}%p2e{i} = index.add %p2mr, %p2e{i}c : index")
-        e(f"{I}%gmx{i} = view.load %ga[%gaG2, %p2e{i}] : view<6x32xf32> -> f32")
-        e(f"{I}%bmx{i} = view.load %ga[%gaBETA, %p2e{i}] : view<6x32xf32> -> f32")
-        gms.append(f"%gmx{i}"); bms.append(f"%bmx{i}")
-    e(f"{I}%gm8 = vector.from_elements {', '.join(gms)} : {V8}")
-    e(f"{I}%bm8 = vector.from_elements {', '.join(bms)} : {V8}")
-    e(f"{I}%gn8 = vector.splat %gn : {V8}")
-    e(f"{I}%gd8 = vector.subf %gm8, %gn8 : {V8}")
-    e(f"{I}%gd8c = vector.minnumf %gd8, %zeros8 : {V8}")
-    e(f"{I}%ed8 = vector.exp2f<afn> %gd8c : {V8}")
-    e(f"{I}%sd8 = vector.mulf {acc}, %ed8 : {V8}")
-    e(f"{I}%ad8 = vector.mulf %sd8, %bm8 : {V8}")
-    # A is stored negated: the solve (one wave) takes -A[i][j] t_j terms (negf is exact)
-    e(f"{I}%adn8 = vector.negf %ad8 : {V8}")
-    e(f"{I}scf.if %iskk {{")
-    for i in range(8):
-        e(f"{I}  %am{i} = index.add %p2e{i}, %c0 : index")
-        e(f"{I}  %agt{i} = index.cmp ugt, %am{i}, %p2n : index")
-        e(f"{I}  %ae{i} = vector.extract %adn8[{i}] : {V8} -> f32")
-        e(f"{I}  %av{i} = scf.select %agt{i}, %ae{i}, %zero : f32")
-        e(f"{I}  view.store %av{i}, %a_v[%p2n, %am{i}] : f32, view<32x36xf32>")   # -A^T
-    e(f"{I}}} else {{")
-    for i in range(8):
-        e(f"{I}  %pm{i} = index.add %p2e{i}, %c0 : index")
-        e(f"{I}  %pge{i} = index.cmp uge, %pm{i}, %p2n : index")
-        e(f"{I}  %pe{i} = vector.extract %sd8[{i}] : {V8} -> f32")
-        e(f"{I}  %pv{i} = scf.select %pge{i}, %pe{i}, %zero : f32")
-        e(f"{I}  %ph{i} = scalar.fptrunc %pv{i} : f32 to f16")
-        e(f"{I}  view.store %ph{i}, %p_v[%pm{i}, %p2n] : f16, view<32x40xf16>")
-    e(f"{I}}}")
-    e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    # ---- phase 3: T = (I + A)^-1 by forward substitution, wave 0, lane = column (right-looking)
-    e(f"{I}scf.if %isw0 {{")
-    accs = []
-    for i in range(C):
-        e(f"{I}  %ti{i}c = index.constant {i} : index")
-        e(f"{I}  %tie{i} = index.cmp eq, %ti{i}c, %lane : index")
-        e(f"{I}  %td{i} = scf.select %tie{i}, %one, %zero : f32")
-        accs.append(f"%td{i}")
-    t = []
+    barrier = "kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)"
 
-    def col_loads(j):
-        for q in range((j + 1) // 4, 8):
-            e(f"{I}  %tc{j}_{q}c = index.constant {4 * q} : index")
-            e(f"{I}  %tc{j}_{q} = vector.load %a_v[%ti{j}c, %tc{j}_{q}c] : view<32x36xf32> -> {V4}")
-    for j in range(min(TPRE, C - 1)):
-        col_loads(j)
-    for j in range(C):
-        t.append(accs[j])
-        if j == C - 1:
-            continue
-        if TPRE:
-            if j + TPRE < C - 1:
-                col_loads(j + TPRE)
-            e(f"{I}  scf.schedule.fence")
-        else:
+    def solver():
+        """wave 8: the gates and the solve, a loop of its own (the same 4 barriers per chunk as the row waves);
+        its values are named %sv_*, the row loop's names live in the sibling region"""
+        v = "%sv_"
+        pre = fetch_gates("%c0", "sv_f0_", "    ")
+        e(f"    {v}ff0, {v}ff1 = scf.for {v}ci = [%c0 to %nchunks step %c1]({v}al_raw = {pre[0]} : f32, "
+          f"{v}be_raw = {pre[1]} : f32) -> (f32, f32) {{")
+        I = "      "
+        e(f"{I}{v}t0 = index.mul {v}ci, %c32 : index")
+        # yah_deltanet_prep_ab: lane = token t0 + lane of head h; padding tokens (>= valid) get (1, 0)
+        e(f"{I}{v}ab_b = scalar.addf {v}al_raw, %ab_dt : f32")
+        e(f"{I}{v}ab_20 = scalar.constant 20.0 : f32")
+        e(f"{I}{v}ab_over = scalar.cmpf ogt, {v}ab_b, {v}ab_20 : f32")
+        e(f"{I}{v}ab_ex = scalar.expf<afn> {v}ab_b : f32")
+        e(f"{I}{v}ab_op = scalar.addf %one, {v}ab_ex : f32")
+        e(f"{I}{v}ab_lg = scalar.logf<afn> {v}ab_op : f32")
+        e(f"{I}{v}ab_sp = scf.select {v}ab_over, {v}ab_b, {v}ab_lg : f32")
+        e(f"{I}{v}ab_sc = scalar.mulf {v}ab_sp, %ab_a : f32")
+        e(f"{I}{v}ab_ao = scalar.expf<afn> {v}ab_sc : f32")
+        e(f"{I}{v}ab_nb = scalar.mulf {v}be_raw, %negone : f32")
+        e(f"{I}{v}ab_bx = scalar.expf<afn> {v}ab_nb : f32")
+        e(f"{I}{v}ab_dn = scalar.addf %one, {v}ab_bx : f32")
+        e(f"{I}{v}ab_bo = scalar.divf %one, {v}ab_dn : f32")
+        e(f"{I}{v}ab_tok = index.add {v}t0, %lane : index")
+        e(f"{I}{v}ab_real = index.cmp ult, {v}ab_tok, %ab_vld : index")
+        e(f"{I}{v}alpha = scf.select {v}ab_real, {v}ab_ao, %one : f32")
+        e(f"{I}{v}beta = scf.select {v}ab_real, {v}ab_bo, %zero : f32")
+        # decay: G2 = inclusive scan of log2 alpha; alpha can underflow to 0: log2 gives -inf, -inf - -inf = NaN in the
+        # decay differences; clamp at 2^-100
+        e(f"{I}{v}lg0 = scalar.log2f<afn> {v}alpha : f32")
+        e(f"{I}{v}lgmin = scalar.constant -100.0 : f32")
+        e(f"{I}{v}lg = scalar.maxnumf {v}lg0, {v}lgmin : f32")
+        e(f"{I}{v}g2 = kernel.subgroup.scan<addf> {v}lg {{mode = inclusive, direction = forward}} : f32")
+        e(f"{I}{v}c31i = scalar.constant 31 : i32")
+        e(f"{I}{v}gtot = kernel.subgroup.broadcast {v}g2 from {v}c31i : f32, i32")
+        e(f"{I}{v}gg = scalar.exp2f<afn> {v}g2 : f32")
+        e(f"{I}{v}bg = scalar.mulf {v}beta, {v}gg : f32")
+        e(f"{I}{v}gcd = scalar.subf {v}gtot, {v}g2 : f32")
+        e(f"{I}{v}gc = scalar.exp2f<afn> {v}gcd : f32")
+        for nm, val in (("G2", "g2"), ("BETA", "beta"), ("GG", "gg"), ("BG", "bg"), ("GC", "gc")):
+            e(f"{I}view.store {v}{val}, %ga[%ga{nm}, %lane] : f32, view<6x32xf32>")
+        # next chunk's gates (clamped): in flight during phases 2-5
+        e(f"{I}{v}cn0 = index.add {v}ci, %c1 : index")
+        e(f"{I}{v}cn = index.min {v}cn0, %lastc : index")
+        nxt = fetch_gates(f"{v}cn", "sv_nx_", I)
+        e(f"{I}{barrier}")
+        e(f"{I}{barrier}")      # phase 2 (row waves)
+        # ---- phase 3: T = (I + A)^-1 by forward substitution, lane = column (right-looking)
+        accs = []
+        for i in range(C):
+            e(f"{I}{v}ti{i}c = index.constant {i} : index")
+            e(f"{I}{v}tie{i} = index.cmp eq, {v}ti{i}c, %lane : index")
+            e(f"{I}{v}td{i} = scf.select {v}tie{i}, %one, %zero : f32")
+            accs.append(f"{v}td{i}")
+        t = []
+
+        def col_loads(j):
+            for q in range((j + 1) // 4, 8):
+                e(f"{I}{v}tc{j}_{q}c = index.constant {4 * q} : index")
+                e(f"{I}{v}tc{j}_{q} = vector.load %a_v[{v}ti{j}c, {v}tc{j}_{q}c] : view<32x36xf32> -> {V4}")
+        for j in range(min(TPRE, C - 1)):
             col_loads(j)
-        for i in range(j + 1, C):
-            q = i // 4
-            e(f"{I}  %tx{j}_{i} = vector.extract %tc{j}_{q}[{i % 4}] : {V4} -> f32")
-            e(f"{I}  %tf{j}_{i} = scalar.fmaf %tx{j}_{i}, {t[j]}, {accs[i]} : f32")
-            accs[i] = f"%tf{j}_{i}"
-    e(f"{I}  %tbg = view.load %ga[%gaBG, %lane] : view<6x32xf32> -> f32")
-    e(f"{I}  %tbe = view.load %ga[%gaBETA, %lane] : view<6x32xf32> -> f32")
-    for i in range(C):
-        e(f"{I}  %tw1_{i} = scalar.mulf {t[i]}, %tbg : f32")
-        e(f"{I}  %tw2_{i} = scalar.mulf {t[i]}, %tbe : f32")
-        e(f"{I}  %th1_{i} = scalar.fptrunc %tw1_{i} : f32 to f16")
-        e(f"{I}  %th2_{i} = scalar.fptrunc %tw2_{i} : f32 to f16")
-        e(f"{I}  view.store %th1_{i}, %t1_v[%ti{i}c, %lane] : f16, view<32x40xf16>")
-        e(f"{I}  view.store %th2_{i}, %t2_v[%ti{i}c, %lane] : f16, view<32x40xf16>")
-    e(f"{I}}}")
-    e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    # ---- phase 4: W = T1 Kt (2 tiles / wave) -> rows 0-31 of the K|Q view
-    e(f"{I}%wm0 = index.mul %wd4, %c16 : index")
-    for p in range(2):
-        e(f"{I}%wn{p}c = index.constant {16 * p} : index")
-        e(f"{I}%wn{p}a = index.mul %w4, %c32 : index")
-        e(f"{I}%wnn{p} = index.add %wn{p}a, %wn{p}c : index")   # key tile 2 w4 + p
+        for j in range(C):
+            t.append(accs[j])
+            if j == C - 1:
+                continue
+            if TPRE:
+                if j + TPRE < C - 1:
+                    col_loads(j + TPRE)
+                e(f"{I}scf.schedule.fence")
+            else:
+                col_loads(j)
+            for i in range(j + 1, C):
+                q = i // 4
+                e(f"{I}{v}tx{j}_{i} = vector.extract {v}tc{j}_{q}[{i % 4}] : {V4} -> f32")
+                e(f"{I}{v}tf{j}_{i} = scalar.fmaf {v}tx{j}_{i}, {t[j]}, {accs[i]} : f32")
+                accs[i] = f"{v}tf{j}_{i}"
+        # T1 = T diag(b 2^G), T2 = T diag(b)
+        e(f"{I}{v}tbg = view.load %ga[%gaBG, %lane] : view<6x32xf32> -> f32")
+        e(f"{I}{v}tbe = view.load %ga[%gaBETA, %lane] : view<6x32xf32> -> f32")
+        for i in range(C):
+            e(f"{I}{v}tw1_{i} = scalar.mulf {t[i]}, {v}tbg : f32")
+            e(f"{I}{v}tw2_{i} = scalar.mulf {t[i]}, {v}tbe : f32")
+            e(f"{I}{v}th1_{i} = scalar.fptrunc {v}tw1_{i} : f32 to f16")
+            e(f"{I}{v}th2_{i} = scalar.fptrunc {v}tw2_{i} : f32 to f16")
+            e(f"{I}view.store {v}th1_{i}, %t1_v[{v}ti{i}c, %lane] : f16, view<32x40xf16>")
+            e(f"{I}view.store {v}th2_{i}, %t2_v[{v}ti{i}c, %lane] : f16, view<32x40xf16>")
+        e(f"{I}{barrier}")
+        e(f"{I}{barrier}")      # phase 5 (row waves)
+        e(f"{I}scf.yield {', '.join(nxt)} : f32, f32")
+        e("    }")
+
+    def rows():
+        """waves 0-7: value rows 16 sg .. +15, the state as S^T accumulators"""
+        ftypes = [V4H] * 15
+        fnames = [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + [f"%vx{r}" for r in range(7)]
+        pre = fetch_rows("%c0", "f0_", "    ")
+        carried = ", ".join(f"%s{j} = {st[j]} : {V8}" for j in range(8))
+        carried += ", " + ", ".join(f"{nm} = {x} : {t}" for nm, x, t in zip(fnames, pre, ftypes))
+        carried += f", %opv0 = %zeros8 : {V8}, %opv1 = %zeros8 : {V8}"      # the previous chunk's O, stored next iteration
+        res = ", ".join(f"%sf{j}" for j in range(8)) + ", " + ", ".join(f"%ff{i}" for i in range(len(fnames)))
+        res += ", %opf0, %opf1"
+        alltypes = ", ".join([V8] * 8 + ftypes + [V8, V8])
+        e(f"    {res} = scf.for %ci = [%c0 to %nchunks step %c1]({carried}) -> ({alltypes}) {{")
+        I = "      "
+        e(f"{I}%t0 = index.mul %ci, %c32 : index")
+        # ---- phase 1: K, Q -> K|Q rows, Kt; v conv -> Vt
+        for nm, row in (("k", "%lt"), ("q", "%qrow")):
+            hs = [f"%{nm}v{g}" for g in range(4)]
+            for p in range(2):
+                e(f"{I}%{nm}c{p} = vector.concat<0> {hs[2 * p]}, {hs[2 * p + 1]} : {V4H}, {V4H} -> {V8H}")
+                e(f"{I}%{nm}d{p} = index.add %dseg, %c{8 * p} : index")
+                e(f"{I}vector.store %{nm}c{p}, %kq_l[{row}, %{nm}d{p}] : {V8H}, view<64x136xf16>")
+            if nm == "k":   # transposed copy Kt[key][tok]
+                for g in range(4):
+                    for i in range(4):
+                        e(f"{I}%kt{g}{i}e = vector.extract {hs[g]}[{i}] : {V4H} -> f16")
+                        e(f"{I}%kt{g}{i}c = index.constant {4 * g + i} : index")
+                        e(f"{I}%kt{g}{i}r = index.add %dseg, %kt{g}{i}c : index")
+                        e(f"{I}view.store %kt{g}{i}e, %kt_w[%kt{g}{i}r, %lt] : f16, view<128x40xf16>")
+        # v conv (gen_conv_kq.conv_steps per channel: s0 .. s3 = x[t-3] .. x[t]; x[-3], x[-2], x[-1] = ring slots 1, 2, 3):
+        # lane = 4 channels, wave = 4 tokens; one b64 Vt store per channel
+        e(f"{I}%vc_f0 = index.add %ci, %sg : index")
+        e(f"{I}%vc_first = index.cmp eq, %vc_f0, %c0 : index")    # chunk 0, wave 0: tokens -3 .. -1 from the ring
+        # exp(-dot) as exp2(dot * -log2e): what expf<afn> lowers to after the negation, in one multiply (bit-identical)
+        e(f"{I}%nl2e = scalar.constant -1.4426950408889634 : f32")
+        for j in range(4):
+            e(f"{I}%vc_r{j} = index.add %vc_p4, %c{j} : index")
+            e(f"{I}%vc_w{j} = vector.load %cws[%vc_r{j}, %c0] : view<128x4xf32> -> {V4}")
+            w = []
+            for k in range(4):
+                e(f"{I}%vc_w{j}_{k} = vector.extract %vc_w{j}[{k}] : {V4} -> f32")
+                w.append(f"%vc_w{j}_{k}")
+            xs = []
+            for r in range(7):
+                e(f"{I}%vc_h{j}_{r} = vector.extract %vx{r}[{j}] : {V4H} -> f16")
+                e(f"{I}%vc_e{j}_{r} = scalar.extf %vc_h{j}_{r} : f16 to f32")
+                if r < 3:
+                    e(f"{I}%vc_sc{j}_{r} = index.constant {r} : index")
+                    e(f"{I}%vc_st{j}_{r} = view.load %css[%vc_r{j}, %vc_sc{j}_{r}] : view<128x3xf32> -> f32")
+                    e(f"{I}%vc_x{j}_{r} = scf.select %vc_first, %vc_st{j}_{r}, %vc_e{j}_{r} : f32")
+                    xs.append(f"%vc_x{j}_{r}")
+                else:
+                    xs.append(f"%vc_e{j}_{r}")
+            hs = []
+            for u in range(4):
+                q = f"%vc{j}_{u}"
+                s0, s1, s2, s3 = xs[u], xs[u + 1], xs[u + 2], xs[u + 3]
+                e(f"{I}{q}d0 = scalar.mulf {s0}, {w[0]} : f32")
+                e(f"{I}{q}d1 = scalar.mulf {s1}, {w[1]} : f32")
+                e(f"{I}{q}d2 = scalar.mulf {s2}, {w[2]} : f32")
+                e(f"{I}{q}d3 = scalar.mulf {s3}, {w[3]} : f32")
+                e(f"{I}{q}sa = scalar.addf {q}d0, {q}d1 : f32")
+                e(f"{I}{q}sb = scalar.addf {q}d2, {q}d3 : f32")
+                e(f"{I}{q}dot = scalar.addf {q}sa, {q}sb : f32")
+                e(f"{I}{q}ng = scalar.mulf {q}dot, %nl2e : f32")
+                e(f"{I}{q}ex = scalar.exp2f<afn> {q}ng : f32")
+                e(f"{I}{q}dn = scalar.addf %one, {q}ex : f32")
+                recip1(e, f"{q}sg", f"{q}dn", I)    # = 1 / dn: the f16 product rounds the denormal range alike
+                e(f"{I}{q}r = scalar.mulf {q}dot, {q}sg : f32")
+                e(f"{I}{q}h = scalar.fptrunc {q}r : f32 to f16")
+                hs.append(f"{q}h")
+            e(f"{I}%vc_o{j} = vector.from_elements {', '.join(hs)} : {V4H}")
+            e(f"{I}vector.store %vc_o{j}, %vt_w[%vc_r{j}, %vc_t4] : {V4H}, view<128x40xf16>")
+        # next chunk's inputs (clamped): in flight during phases 2-5
+        e(f"{I}%cn0 = index.add %ci, %c1 : index")
+        e(f"{I}%cn = index.min %cn0, %lastc : index")
+        nxt = fetch_rows("%cn", "nx_", I)
+        # the previous chunk's O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores zeros
+        # to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same addresses, in order)
+        e(f"{I}%opc0 = index.max %ci, %c1 : index")
+        e(f"{I}%opc = index.sub %opc0, %c1 : index")
+        e(f"{I}%opt0 = index.mul %opc, %c32 : index")
+        for t in range(2):
+            ostore(I, "%opt0", f"%opv{t}", t, f"ox{t}")
+        e(f"{I}{barrier}")
+        # ---- phase 2: KK^T (waves 0-3) -> A (f32), QK^T (waves 4-7) -> P (f16)
+        e(f"{I}%p2t = index.rem %sg, %c4 : index")
+        e(f"{I}%p2mi = index.div %p2t, %c2 : index")
+        e(f"{I}%p2nj = index.rem %p2t, %c2 : index")
+        e(f"{I}%p2m0 = index.mul %p2mi, %c16 : index")
+        e(f"{I}%p2n0 = index.mul %p2nj, %c16 : index")
+        e(f"{I}%p2qo = scf.select %isqk, %c32, %c0 : index")
+        e(f"{I}%p2r = index.add %p2qo, %p2m0 : index")        # rows of the 64-row K|Q view
         acc = "%zs"
-        for c in range(2):
-            e(f"{I}%wk{p}{c} = index.constant {16 * c} : index")
-            e(f"{I}%wa{p}{c} = vector.fragment.load<lhs> %t1_v[%wm0, %wk{p}{c}] shape [%m, %k] : view<32x40xf16> -> {V16H}")
-            e(f"{I}%wb{p}{c} = vector.fragment.load<rhs> %kt_r[%wk{p}{c}, %wnn{p}] shape [%k, %n] : view<32x128xf16, %kt_lay> -> {V16H}")
-            e(f"{I}%wc{p}{c} = vector.mma %wa{p}{c}, %wb{p}{c}, {acc} : {V16H}, {V16H}, {V8}")
-            acc = f"%wc{p}{c}"
-        e(f"{I}%wmr{p} = index.add %wm0, %half : index")
-        e(f"{I}%wcol{p} = index.add %wnn{p}, %sub : index")
+        for c in range(8):
+            e(f"{I}%p2k{c} = index.constant {16 * c} : index")
+            e(f"{I}%p2a{c} = vector.fragment.load<lhs> %kq_l[%p2r, %p2k{c}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
+            e(f"{I}%p2b{c} = vector.fragment.load<rhs> %kr_r[%p2k{c}, %p2n0] shape [%k, %n] : view<128x32xf16, %kr_lay> -> {V16H}")
+            e(f"{I}%p2c{c} = vector.mma %p2a{c}, %p2b{c}, {acc} : {V16H}, {V16H}, {V8}")
+            acc = f"%p2c{c}"
+        # element i: (m = p2m0 + half + 2 i, n = p2n0 + sub)
+        e(f"{I}%p2mr = index.add %p2m0, %half : index")
+        e(f"{I}%p2n = index.add %p2n0, %sub : index")
+        e(f"{I}%gn = view.load %ga[%gaG2, %p2n] : view<6x32xf32> -> f32")
+        gms, bms = [], []
         for i in range(8):
-            e(f"{I}%we{p}{i} = vector.extract {acc}[{i}] : {V8} -> f32")
-            e(f"{I}%weh{p}{i} = scalar.fptrunc %we{p}{i} : f32 to f16")
-            e(f"{I}%wr{p}{i}c = index.constant {2 * i} : index")
-            e(f"{I}%wr{p}{i} = index.add %wmr{p}, %wr{p}{i}c : index")
-            e(f"{I}view.store %weh{p}{i}, %kq_l[%wr{p}{i}, %wcol{p}] : f16, view<64x136xf16>")
-    e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    # ---- phase 5 (per wave, value rows 16 sg .. +15): X = W S^T, O1 = Q S^T (S^T repacked once per tile)
-    xa, oa = ["%zs", "%zs"], ["%zs", "%zs"]
-    for j in range(8):
-        b = repack(I, f"%s{j}", f"sb{j}")
-        e(f"{I}%xk{j} = index.constant {16 * j} : index")
+            e(f"{I}%p2e{i}c = index.constant {2 * i} : index")
+            e(f"{I}%p2e{i} = index.add %p2mr, %p2e{i}c : index")
+            e(f"{I}%gmx{i} = view.load %ga[%gaG2, %p2e{i}] : view<6x32xf32> -> f32")
+            e(f"{I}%bmx{i} = view.load %ga[%gaBETA, %p2e{i}] : view<6x32xf32> -> f32")
+            gms.append(f"%gmx{i}"); bms.append(f"%bmx{i}")
+        e(f"{I}%gm8 = vector.from_elements {', '.join(gms)} : {V8}")
+        e(f"{I}%bm8 = vector.from_elements {', '.join(bms)} : {V8}")
+        e(f"{I}%gn8 = vector.splat %gn : {V8}")
+        e(f"{I}%gd8 = vector.subf %gm8, %gn8 : {V8}")
+        e(f"{I}%gd8c = vector.minnumf %gd8, %zeros8 : {V8}")
+        e(f"{I}%ed8 = vector.exp2f<afn> %gd8c : {V8}")
+        e(f"{I}%sd8 = vector.mulf {acc}, %ed8 : {V8}")
+        e(f"{I}%ad8 = vector.mulf %sd8, %bm8 : {V8}")
+        # A is stored negated: the solve takes -A[i][j] t_j terms (negf is exact)
+        e(f"{I}%adn8 = vector.negf %ad8 : {V8}")
+        e(f"{I}scf.if %iskk {{")
+        for i in range(8):
+            e(f"{I}  %am{i} = index.add %p2e{i}, %c0 : index")
+            e(f"{I}  %agt{i} = index.cmp ugt, %am{i}, %p2n : index")
+            e(f"{I}  %ae{i} = vector.extract %adn8[{i}] : {V8} -> f32")
+            e(f"{I}  %av{i} = scf.select %agt{i}, %ae{i}, %zero : f32")
+            e(f"{I}  view.store %av{i}, %a_v[%p2n, %am{i}] : f32, view<32x36xf32>")   # -A^T
+        e(f"{I}}} else {{")
+        for i in range(8):
+            e(f"{I}  %pm{i} = index.add %p2e{i}, %c0 : index")
+            e(f"{I}  %pge{i} = index.cmp uge, %pm{i}, %p2n : index")
+            e(f"{I}  %pe{i} = vector.extract %sd8[{i}] : {V8} -> f32")
+            e(f"{I}  %pv{i} = scf.select %pge{i}, %pe{i}, %zero : f32")
+            e(f"{I}  %ph{i} = scalar.fptrunc %pv{i} : f32 to f16")
+            e(f"{I}  view.store %ph{i}, %p_v[%pm{i}, %p2n] : f16, view<32x40xf16>")
+        e(f"{I}}}")
+        e(f"{I}{barrier}")
+        # ---- phase 3, during the solve: KS = K S^T, O1 = Q S^T (S^T repacked once per tile)
+        for j in range(8):
+            e(f"{I}%xk{j} = index.constant {16 * j} : index")
+        ka, oa = ["%zs", "%zs"], ["%zs", "%zs"]
+        for j in range(8):
+            b = repack(I, f"%s{j}", f"sb{j}")
+            for tt in range(2):
+                e(f"{I}%xt{tt}_{j} = index.constant {16 * tt} : index")
+                e(f"{I}%xa{tt}_{j} = vector.fragment.load<lhs> %kq_l[%xt{tt}_{j}, %xk{j}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
+                e(f"{I}%xc{tt}_{j} = vector.mma %xa{tt}_{j}, {b}, {ka[tt]} : {V16H}, {V16H}, {V8}")
+                ka[tt] = f"%xc{tt}_{j}"
+                e(f"{I}%oq{tt}_{j} = index.constant {32 + 16 * tt} : index")
+                e(f"{I}%oa{tt}_{j} = vector.fragment.load<lhs> %kq_l[%oq{tt}_{j}, %xk{j}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
+                e(f"{I}%oc{tt}_{j} = vector.mma %oa{tt}_{j}, {b}, {oa[tt]} : {V16H}, {V16H}, {V8}")
+                oa[tt] = f"%oc{tt}_{j}"
+        e(f"{I}{barrier}")
+        # ---- phase 5: X = T1 KS
+        bks = [repack(I, ka[0], "bks0"), repack(I, ka[1], "bks1")]
+        for c in range(2):
+            e(f"{I}%uk{c} = index.constant {16 * c} : index")
+        xa = []
         for tt in range(2):
-            e(f"{I}%xt{tt}_{j} = index.constant {16 * tt} : index")
-            e(f"{I}%xa{tt}_{j} = vector.fragment.load<lhs> %kq_l[%xt{tt}_{j}, %xk{j}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
-            e(f"{I}%xc{tt}_{j} = vector.mma %xa{tt}_{j}, {b}, {xa[tt]} : {V16H}, {V16H}, {V8}")
-            xa[tt] = f"%xc{tt}_{j}"
-            e(f"{I}%oq{tt}_{j} = index.constant {32 + 16 * tt} : index")
-            e(f"{I}%oa{tt}_{j} = vector.fragment.load<lhs> %kq_l[%oq{tt}_{j}, %xk{j}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
-            e(f"{I}%oc{tt}_{j} = vector.mma %oa{tt}_{j}, {b}, {oa[tt]} : {V16H}, {V16H}, {V8}")
-            oa[tt] = f"%oc{tt}_{j}"
-    # U = T2 V
-    vb = []
-    for c in range(2):
-        e(f"{I}%uk{c} = index.constant {16 * c} : index")
-        e(f"{I}%ub{c} = vector.fragment.load<rhs> %vt_r[%uk{c}, %row0] shape [%k, %n] : view<32x128xf16, %vt_lay> -> {V16H}")
-        vb.append(f"%ub{c}")
-    ua = []
-    for tt in range(2):
-        acc = "%zs"
-        e(f"{I}%ut{tt} = index.constant {16 * tt} : index")
+            acc = "%zs"
+            e(f"{I}%ut{tt} = index.constant {16 * tt} : index")
+            for c in range(2):
+                e(f"{I}%xw{tt}{c} = vector.fragment.load<lhs> %t1_v[%ut{tt}, %uk{c}] shape [%m, %k] : view<32x40xf16> -> {V16H}")
+                e(f"{I}%xx{tt}{c} = vector.mma %xw{tt}{c}, {bks[c]}, {acc} : {V16H}, {V16H}, {V8}")
+                acc = f"%xx{tt}{c}"
+            xa.append(acc)
+        # U = T2 V
+        vb = []
         for c in range(2):
-            e(f"{I}%ua{tt}{c} = vector.fragment.load<lhs> %t2_v[%ut{tt}, %uk{c}] shape [%m, %k] : view<32x40xf16> -> {V16H}")
-            e(f"{I}%uc{tt}{c} = vector.mma %ua{tt}{c}, {vb[c]}, {acc} : {V16H}, {V16H}, {V8}")
-            acc = f"%uc{tt}{c}"
-        ua.append(acc)
-    # Vn = U - X, Vn' = 2^(G_C - G) Vn, O1 2^G (accumulator element i of token tile tt: token 16 tt + half + 2 i)
-    bvn, bvp, o1s = [], [], []
-    for tt in range(2):
-        gts, gcs = [], []
-        for i in range(8):
-            e(f"{I}%ux{tt}{i}c = index.constant {16 * tt + 2 * i} : index")
-            e(f"{I}%ux{tt}{i} = index.add %half, %ux{tt}{i}c : index")
-            e(f"{I}%gtx{tt}{i} = view.load %ga[%gaGG, %ux{tt}{i}] : view<6x32xf32> -> f32")
-            e(f"{I}%gcx{tt}{i} = view.load %ga[%gaGC, %ux{tt}{i}] : view<6x32xf32> -> f32")
-            gts.append(f"%gtx{tt}{i}"); gcs.append(f"%gcx{tt}{i}")
-        e(f"{I}%vn{tt} = vector.subf {ua[tt]}, {xa[tt]} : {V8}")
-        e(f"{I}%gt8_{tt} = vector.from_elements {', '.join(gts)} : {V8}")
-        e(f"{I}%o18_{tt} = vector.mulf {oa[tt]}, %gt8_{tt} : {V8}")
-        e(f"{I}%gc8_{tt} = vector.from_elements {', '.join(gcs)} : {V8}")
-        e(f"{I}%vnp{tt} = vector.mulf %vn{tt}, %gc8_{tt} : {V8}")
-        bvn.append(repack(I, f"%vn{tt}", f"bvn{tt}"))
-        bvp.append(repack(I, f"%vnp{tt}", f"bvp{tt}"))
-        o1s.append(f"%o18_{tt}")
-    # O = O1 + P Vn (stored next iteration)
-    oacc = []
-    for tt in range(2):
-        e(f"{I}%o1f{tt} = vector.fragment<init> {o1s[tt]} shape [%m, %n] : {V8}")
-        acc = f"%o1f{tt}"
-        for c in range(2):
-            e(f"{I}%pa{tt}{c} = vector.fragment.load<lhs> %p_v[%ut{tt}, %uk{c}] shape [%m, %k] : view<32x40xf16> -> {V16H}")
-            e(f"{I}%pc{tt}{c} = vector.mma %pa{tt}{c}, {bvn[c]}, {acc} : {V16H}, {V16H}, {V8}")
-            acc = f"%pc{tt}{c}"
-        oacc.append(acc)
-    # S^T <- 2^G_C S^T + K^T Vn'
-    e(f"{I}%gtot = view.load %ga[%gaGC, %c0] : view<6x32xf32> -> f32")   # 2^(G_31 - G_0)
-    e(f"{I}%gg0 = view.load %ga[%gaGG, %c0] : view<6x32xf32> -> f32")
-    e(f"{I}%gall = scalar.mulf %gtot, %gg0 : f32")                       # 2^G_31
-    e(f"{I}%gall8 = vector.splat %gall : {V8}")
-    new = []
-    for j in range(8):
-        e(f"{I}%sd{j} = vector.mulf %s{j}, %gall8 : {V8}")
-        e(f"{I}%sdf{j} = vector.fragment<init> %sd{j} shape [%m, %n] : {V8}")
-        acc = f"%sdf{j}"
-        for c in range(2):
-            e(f"{I}%ka{j}{c} = vector.fragment.load<lhs> %kt_w[%xk{j}, %uk{c}] shape [%m, %k] : view<128x40xf16> -> {V16H}")
-            e(f"{I}%kc{j}{c} = vector.mma %ka{j}{c}, {bvp[c]}, {acc} : {V16H}, {V16H}, {V8}")
-            acc = f"%kc{j}{c}"
-        new.append(acc)
-    e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    e(f"{I}scf.yield {', '.join(new + nxt + oacc)} : {alltypes}")
+            e(f"{I}%ub{c} = vector.fragment.load<rhs> %vt_r[%uk{c}, %row0] shape [%k, %n] : view<32x128xf16, %vt_lay> -> {V16H}")
+            vb.append(f"%ub{c}")
+        ua = []
+        for tt in range(2):
+            acc = "%zs"
+            for c in range(2):
+                e(f"{I}%ua{tt}{c} = vector.fragment.load<lhs> %t2_v[%ut{tt}, %uk{c}] shape [%m, %k] : view<32x40xf16> -> {V16H}")
+                e(f"{I}%uc{tt}{c} = vector.mma %ua{tt}{c}, {vb[c]}, {acc} : {V16H}, {V16H}, {V8}")
+                acc = f"%uc{tt}{c}"
+            ua.append(acc)
+        # Vn = U - X, Vn' = 2^(G_C - G) Vn, O1 2^G (accumulator element i of token tile tt: token 16 tt + half + 2 i)
+        bvn, bvp, o1s = [], [], []
+        for tt in range(2):
+            gts, gcs = [], []
+            for i in range(8):
+                e(f"{I}%ux{tt}{i}c = index.constant {16 * tt + 2 * i} : index")
+                e(f"{I}%ux{tt}{i} = index.add %half, %ux{tt}{i}c : index")
+                e(f"{I}%gtx{tt}{i} = view.load %ga[%gaGG, %ux{tt}{i}] : view<6x32xf32> -> f32")
+                e(f"{I}%gcx{tt}{i} = view.load %ga[%gaGC, %ux{tt}{i}] : view<6x32xf32> -> f32")
+                gts.append(f"%gtx{tt}{i}"); gcs.append(f"%gcx{tt}{i}")
+            e(f"{I}%vn{tt} = vector.subf {ua[tt]}, {xa[tt]} : {V8}")
+            e(f"{I}%gt8_{tt} = vector.from_elements {', '.join(gts)} : {V8}")
+            e(f"{I}%o18_{tt} = vector.mulf {oa[tt]}, %gt8_{tt} : {V8}")
+            e(f"{I}%gc8_{tt} = vector.from_elements {', '.join(gcs)} : {V8}")
+            e(f"{I}%vnp{tt} = vector.mulf %vn{tt}, %gc8_{tt} : {V8}")
+            bvn.append(repack(I, f"%vn{tt}", f"bvn{tt}"))
+            bvp.append(repack(I, f"%vnp{tt}", f"bvp{tt}"))
+            o1s.append(f"%o18_{tt}")
+        # O = O1 + P Vn (stored next iteration)
+        oacc = []
+        for tt in range(2):
+            e(f"{I}%o1f{tt} = vector.fragment<init> {o1s[tt]} shape [%m, %n] : {V8}")
+            acc = f"%o1f{tt}"
+            for c in range(2):
+                e(f"{I}%pa{tt}{c} = vector.fragment.load<lhs> %p_v[%ut{tt}, %uk{c}] shape [%m, %k] : view<32x40xf16> -> {V16H}")
+                e(f"{I}%pc{tt}{c} = vector.mma %pa{tt}{c}, {bvn[c]}, {acc} : {V16H}, {V16H}, {V8}")
+                acc = f"%pc{tt}{c}"
+            oacc.append(acc)
+        # S^T <- 2^G_C S^T + K^T Vn'
+        e(f"{I}%gtot = view.load %ga[%gaGC, %c0] : view<6x32xf32> -> f32")   # 2^(G_31 - G_0)
+        e(f"{I}%gg0 = view.load %ga[%gaGG, %c0] : view<6x32xf32> -> f32")
+        e(f"{I}%gall = scalar.mulf %gtot, %gg0 : f32")                       # 2^G_31
+        e(f"{I}%gall8 = vector.splat %gall : {V8}")
+        new = []
+        for j in range(8):
+            e(f"{I}%sd{j} = vector.mulf %s{j}, %gall8 : {V8}")
+            e(f"{I}%sdf{j} = vector.fragment<init> %sd{j} shape [%m, %n] : {V8}")
+            acc = f"%sdf{j}"
+            for c in range(2):
+                e(f"{I}%ka{j}{c} = vector.fragment.load<lhs> %kt_w[%xk{j}, %uk{c}] shape [%m, %k] : view<128x40xf16> -> {V16H}")
+                e(f"{I}%kc{j}{c} = vector.mma %ka{j}{c}, {bvp[c]}, {acc} : {V16H}, {V16H}, {V8}")
+                acc = f"%kc{j}{c}"
+            new.append(acc)
+        e(f"{I}{barrier}")
+        e(f"{I}scf.yield {', '.join(new + nxt + oacc)} : {alltypes}")
+        e("    }")
+        # the last chunk's O
+        e("    %oplast = index.mul %lastc, %c32 : index")
+        for tt in range(2):
+            ostore("    ", "%oplast", f"%opf{tt}", tt, f"ol{tt}")
+        # ---- final state
+        for j in range(8):
+            for i in range(8):
+                e(f"    %fe{j}_{i} = vector.extract %sf{j}[{i}] : {V8} -> f32")
+                e(f"    view.store %fe{j}_{i}, %state_view[%sa{j}_{i}] : f32, view<[%state_total]xf32>")
+
+    # wave-uniform role branch: every barrier inside has a matching barrier in the other region (HRX patch 0037)
+    e("  scf.if %issv {")
+    solver()
+    e("  } else {")
+    rows()
     e("  }")
-    # the last chunk's O
-    e("  %oplast = index.mul %lastc, %c32 : index")
-    for tt in range(2):
-        ostore("  ", "%oplast", f"%opf{tt}", tt, f"ol{tt}")
-    # ---- final state
-    for j in range(8):
-        for i in range(8):
-            e(f"  %fe{j}_{i} = vector.extract %sf{j}[{i}] : {V8} -> f32")
-            e(f"  view.store %fe{j}_{i}, %state_view[%sa{j}_{i}] : f32, view<[%state_total]xf32>")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
-
 
 def main():
     import gen_rot
