@@ -68,6 +68,7 @@ class LoomPrefill {
     LoadTables();
     AllocateBuffers();
     LoadExecutables();
+    WarmExecutables();
   }
 
   [[nodiscard]] std::uint32_t chunk() const { return B_; }
@@ -222,11 +223,16 @@ class LoomPrefill {
     NewGraph();
     nodes_.clear();
     const bool calibrate = !npu_on_ && calib_ && calib_->BeginChunk(n_);
+    // Layer 0 goes first in a graph of its own, so the GPU runs it while the host records the other layers. The split
+    // falls before its deferred down GEMM (the first dispatch while recording layer 1), which waits for all of the
+    // layer's last kernel anyway. The NPU split's flagged jobs and the calibration's matching keep one graph.
+    split_layer_ = !npu_on_ && !calibrate && cfg_.main_block_count() > 1 ? 1 : 0;
     df_on_ = !npu_on_ && !df_plan_.empty() && n_ > kDfMinTokens;
     df_k_ = 0;
     if (df_on_) DispatchDequant(0);
     RecordLayers(ci, hook);
     FlushKres();
+    split_layer_ = 0, split_armed_ = false;
     graph_ = nullptr;
     if (calibrate && !gpu_.profiling()) {
       try {
@@ -328,6 +334,7 @@ class LoomPrefill {
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       layer_ = l;
+      split_armed_ = split_layer_ && l == split_layer_;
       tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
       if (cfg_.IsFullAttention(l)) {
         const bool q_af = Af("gemm_kqg", pre + "attn_q.weight");
@@ -614,8 +621,9 @@ class LoomPrefill {
                 std::uint32_t sx, std::uint32_t sy, std::uint32_t sz, const std::vector<hrx_buffer_ref_t>& b,
                 std::uint64_t writes = ~std::uint64_t{0}, const std::vector<hrx_buffer_ref_t>* also_writes = nullptr,
                 std::uint64_t untracked = 0) {
+    if (split_armed_ && graph_ && !df_planning_ && !npu_planning_ && !warming_) SplitGraph();
     FlushKres();
-    if (df_planning_ || npu_planning_) return;
+    if (df_planning_ || npu_planning_ || warming_) return;
     const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
     const hrx_dispatch_config_t config = LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz);
@@ -816,6 +824,17 @@ class LoomPrefill {
     // embed.hal decodes IQ4_XS, or Q8_0 in the HFQ models' sets
     if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != (rot_ ? 8u : 23u))
       throw LoomError("prefill: token_embd: its format does not match embed.hal (re-emit the set)");
+  }
+
+  // Load every HAL chunk 0 dispatches now (a pass of the layers that dispatches nothing): a first load copies the code to
+  // the GPU, ~0.25 ms per HAL, which RunLayers would otherwise spend before the GPU starts.
+  void WarmExecutables() {
+    LoomBuffer *h = hidden_, *h2 = hidden2_, *aq = aq_, *aq2 = aq2_, *ad = ad_, *ad2 = ad2_;
+    n_ = B_, warming_ = true;
+    RecordLayers(0, {});
+    FlushKres();
+    n_ = 0, warming_ = false;
+    hidden_ = h, hidden2_ = h2, aq_ = aq, aq2_ = aq2, ad_ = ad, ad2_ = ad2;
   }
 
   // Bindings shared by every GEMM: weights, then the IQ grid / sign tables the format needs.
@@ -1722,7 +1741,8 @@ class LoomPrefill {
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), (MTiles(*t) - npu_rows / 16) / g.rowgrp, tt, 1,
              32, 1, 1, b, GemmWrites(b, f, {&out}));
   }
-  // The chunk's graph: the whole chunk is one graph, the NPU handoffs included (NpuEnqueue / NpuJoin).
+  // The chunk's graph: the whole chunk (after layer 0's, SplitGraph) is one graph, the NPU handoffs included
+  // (NpuEnqueue / NpuJoin).
   // Replacing a launched graph is safe: the queue retains its command buffers until they complete, and every buffer and
   // executable they use is this object's.
   void NewGraph() {
@@ -1733,6 +1753,14 @@ class LoomPrefill {
       g.ReadOnly(t->handle);
     graph_ = &g;
   }
+  // Launch the graph recorded so far and record the rest of the chunk into a new one, so the GPU starts while the host
+  // records. Stream order runs the new graph after the whole old one: no dependencies cross.
+  void SplitGraph() {
+    split_armed_ = false;
+    chunk_graph_->Launch();
+    NewGraph();
+  }
+
 
   // NPU handoffs are graph nodes on flag words in host memory (NpuSplit::Flags), so the host never splits the chunk.
   // NpuEnqueue: the graph stores the job's gate value to its ready word once its encoders / decoders are done (release,
@@ -2725,6 +2753,9 @@ class LoomPrefill {
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records
   std::unique_ptr<LoomGraph> chunk_graph_;
+  std::uint32_t split_layer_ = 0;  // RunLayers: SplitGraph before this layer's first dispatch (0: none)
+  bool split_armed_ = false;       // recording split_layer_: its first dispatch splits
+  bool warming_ = false;           // WarmExecutables' pass: Dispatch records nothing
   NpuSplit* npu_ = nullptr;        // EnableNpu
   bool npu_on_ = false;            // this chunk splits with the NPU
   std::uint32_t layer_ = 0;        // RecordLayers' current layer (NpuSplit::Queued::layer)
