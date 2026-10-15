@@ -1,5 +1,6 @@
 // RMSNorm of rows of 5120 f32: out[r][i] = (x[r][i] * rsqrt(sum(x[r]^2) / 5120 + eps)) * weight[i].
 // Grid: rows workgroups of one wave32; each lane takes a stride-32 slice, then a subgroup add.
+// Both loops are unrolled so the loads issue ahead (one row: 213 us rolled); the per-lane order of adds does not change.
 amdgpu.target<gfx1151> @yah_wave32 {subgroup_size = 32}
 
 config.decl @yah_rmsnorm.rows : %value: index where [range(%value, 1, 4096)]
@@ -14,6 +15,7 @@ kernel.def target(@yah_wave32) @yah_rmsnorm() {
 } launch(%x: buffer, %weight: buffer, %out: buffer) {
   %base = index.constant 0 : offset
   %c0 = index.constant 0 : index
+  %c16 = index.constant 16 : index
   %c32 = index.constant 32 : index
   %dim = index.constant 5120 : index
   %dimf = scalar.constant 5120.0 : f32
@@ -29,7 +31,7 @@ kernel.def target(@yah_wave32) @yah_rmsnorm() {
   %w_view = buffer.view %weight_noalias[%base] : buffer -> view<5120xf32>
   %out_view = buffer.view %out_noalias[%base] : buffer -> view<[%rows]x5120xf32>
 
-  %sq = scf.for %i = [%lane to %dim step %c32](%acc = %zero : f32) -> (f32) {
+  %sq = scf.for %i = [%lane to %dim step %c32](%acc = %zero : f32) -> (f32) unroll(%c16) {
     %v = view.load %x_view[%row, %i] : view<[%rows]x5120xf32> -> f32
     %p = scalar.mulf %v, %v : f32
     %next = scalar.addf %acc, %p : f32
@@ -39,7 +41,7 @@ kernel.def target(@yah_wave32) @yah_rmsnorm() {
   %mean = scalar.divf %sum, %dimf : f32
   %shifted = scalar.addf %mean, %eps : f32
   %inv = scalar.rsqrtf %shifted : f32
-  %sink = scf.for %i = [%lane to %dim step %c32](%tick = %zero : f32) -> (f32) {
+  %sink = scf.for %i = [%lane to %dim step %c32](%tick = %zero : f32) -> (f32) unroll(%c16) {
     %v2 = view.load %x_view[%row, %i] : view<[%rows]x5120xf32> -> f32
     %w = view.load %w_view[%i] : view<5120xf32> -> f32
     %n0 = scalar.mulf %v2, %inv : f32
