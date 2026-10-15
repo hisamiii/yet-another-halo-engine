@@ -2140,6 +2140,7 @@ class LoomPrefill {
     const std::string gate_split = ng ? NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)) : "";
     // conv_c: the conv reads the NPU's qkv columns straight from C ("convkq_c.hal"); the unpack writes only the conv ring
     NpuView conv_c{};
+    bool gate_late = false;
     if (!qkv_split.empty() && !gate_split.empty()) {
       // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows (one job: the same activations)
       // decoder-column sets: each matrix's activations in its decoder's k-block order
@@ -2174,7 +2175,9 @@ class LoomPrefill {
       RunKstore(pre + "ssm_alpha.weight", *alpha_);
       RunKstore(pre + "ssm_beta.weight", *beta_);
       RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af);
-      RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
+      // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
+      gate_late = geom_.count("dnvconv") != 0;
+      if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
     }
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
@@ -2185,8 +2188,7 @@ class LoomPrefill {
     const std::uint32_t conv_tb = ctb != geom_.end() ? ctb->second.tokens : 1;
     bool dn_done = false;
     // dnvconv: the conv ring update (prep_ab's ring lanes only; its alpha / beta lanes below qkv_size write ab_, which
-    // nothing reads). It waits for both DeltaNet parts (they read the ring), so it is queued after the pnq kernels: in
-    // the queue right after DeltaNet's second part, its wait held back pnq part a, which runs beside that part.
+    // nothing reads). It waits for both DeltaNet parts (they read the ring), so it is queued after the pnq kernels.
     const auto ring = [&] {
       Dispatch(Exe("prepab.hal"), "yah_deltanet_prep_ab", (kQkv + 255u) / 256u, 1, 1, 256, 1, 1,
                {Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")), TRef(*Find(pre + "ssm_dt.bias")), Ref(*qkv_), cs,
@@ -2219,6 +2221,9 @@ class LoomPrefill {
       bb.insert(bb.end(), {st, Ref(*raw2_)});
       Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, dn_threads_, 1, 1, ba, 0b11000000000);
       Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, dn_threads_, 1, 1, bb, 0b11000000000);
+      // The second part's few workgroups leave most of the GPU to the gate GEMM; pnq part a beside it was DRAM-bound and
+      // slowed it about as much, but gained less than the GEMM's whole tail and the conv's wait.
+      if (gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
       dn_done = true;
     } else {
       Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_ / conv_tb, 1, 256, 1, 1,
@@ -2258,7 +2263,7 @@ class LoomPrefill {
     if (dn_done && !pnq) throw LoomError("dispatch.txt dnvconv needs the pnq postnorm");
     if (pnq) {
       // A4: the postnorm and ssm_out's rotq in one kernel per DeltaNet part (gen_rot.gen_pnq), each reading its part's
-      // output: part a beside the second DeltaNet part
+      // output (after the gate GEMM, which runs beside the second DeltaNet part)
       const auto* nw = Find(pre + "ssm_norm.weight");
       const auto* aw = Find(pre + "ssm_out.awq");
       const Geom& ga = geom_.at("pnq_a.hal");
