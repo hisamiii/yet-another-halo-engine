@@ -54,11 +54,16 @@ OLATE = True
 # same f32 ops and rounding this kernel did on the f32 conv output, so the result is bit-identical; half the bytes,
 # and phase 1 only moves them into LDS. The f16 rows are carried raw through the prefetch.
 CONV16 = True
+O16_EXP = 8   # o16 output scale 2^8: max |O| seen 5.9 (layer 0) -> 1515, 43x below the f16 max; 2^8 to 2^12 all clear
+# the subnormal range (error vs the head RMS p99.9 ~3e-3, max ~5.5e-3, the f16 normal rounding)
 TPRE = 2   # phase 3 column loads this many steps ahead (0: at their step); 2: -5.2% (3 hits 256 VGPRs, 4 spills)
 
 
-def gen(head_base=0, launch_heads=0, heads=None, vconv=False):
-    """vconv: the v channels' conv (silu(conv1d) of the qkv GEMM's f16 output, gen_conv_kq's ops) and alpha / beta
+def gen(head_base=0, launch_heads=0, heads=None, vconv=False, o16=False):
+    """o16: O is stored as f16(clamp(O 2^O16_EXP)) (its reader gen_rot.gen_pnq(o16=True) multiplies back by
+    2^-O16_EXP, exactly): DeltaNet outputs are small (layers 1-2: 75-80% of them below the f16 normal range), the scale
+    keeps them normal, the clamp keeps an outlier finite.
+    vconv: the v channels' conv (silu(conv1d) of the qkv GEMM's f16 output, gen_conv_kq's ops) and alpha / beta
     (yah_deltanet_prep_ab's ops) are computed here, bit-identical: bindings (conv, x, conv_weights, conv_state, alpha,
     beta, ssm_a, ssm_dt, valid, state, out); conv holds only the normalized q / k (gen_conv_kq.gen(4096)), and the
     conv ring update (prep_ab) runs after both DeltaNet parts. Lane = (channel pair, wave = 4 tokens): it loads its
@@ -142,7 +147,11 @@ def gen(head_base=0, launch_heads=0, heads=None, vconv=False):
         e("  %kq_view = buffer.view %kq_na[%base] : buffer -> view<[%kq_total]xf32>")
         e("  %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>")
     e("  %state_view = buffer.view %st_na[%base] : buffer -> view<[%state_total]xf32>")
-    e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%out_total]xf32>")
+    e(f"  %out_view = buffer.view %out_na[%base] : buffer -> view<[%out_total]x{'f16' if o16 else 'f32'}>")
+    if o16:
+        e(f"  %o16_sc = scalar.constant {float(2 ** O16_EXP)!r} : f32")
+        e("  %o16_hi = scalar.constant 65504.0 : f32")
+        e("  %o16_lo = scalar.constant -65504.0 : f32")
     e(f"  %pool_bytes = index.constant {POOL_VCONV if vconv else POOL} : offset")
     e("  %pool = buffer.alloca<workgroup> align(16) %pool_bytes : buffer")
 
@@ -370,7 +379,14 @@ def gen(head_base=0, launch_heads=0, heads=None, vconv=False):
             e(f"{ind}%{p}t{i}2 = index.mul %{p}t{i}1, %inner_size : index")
             e(f"{ind}%{p}t{i}3 = index.add %{p}t{i}2, %o_rel : index")
             e(f"{ind}%{p}t{i} = index.add %{p}t{i}3, %ur_row : index")
-            e(f"{ind}view.store %{p}e{i}, %out_view[%{p}t{i}] : f32, view<[%out_total]xf32>")
+            if o16:
+                e(f"{ind}%{p}s{i} = scalar.mulf %{p}e{i}, %o16_sc : f32")
+                e(f"{ind}%{p}l{i} = scalar.minnumf<nnan> %{p}s{i}, %o16_hi : f32")
+                e(f"{ind}%{p}c{i} = scalar.maxnumf<nnan> %{p}l{i}, %o16_lo : f32")
+                e(f"{ind}%{p}h{i} = scalar.fptrunc %{p}c{i} : f32 to f16")
+                e(f"{ind}view.store %{p}h{i}, %out_view[%{p}t{i}] : f16, view<[%out_total]xf16>")
+            else:
+                e(f"{ind}view.store %{p}e{i}, %out_view[%{p}t{i}] : f32, view<[%out_total]xf32>")
     ftypes = ([] if CONV16 else ["f32", "f32"]) + [V4H if CONV16 else V4] * 10 + ["f32", "f32"]
     fnames = ([] if CONV16 else ["%inv_k", "%q_scale"]) + [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + \
         ["%vv0", "%vv1", "%alpha", "%beta"]

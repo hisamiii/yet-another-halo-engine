@@ -146,6 +146,10 @@ DNSPLIT = (40, 8)
 # (gen_gdn_chunk vconv), the conv kernel takes only the q / k heads (gen_conv_kq.gen(4096)) and prep_ab only advances
 # the conv ring, after both DeltaNet parts. Bit-identical; dispatch.txt "dnvconv <conv workgroups>".
 DNVCONV = True
+# DNO16: DeltaNet's output (the pnq input) as f16(O 2^8) in A4 dnperm sets (gen_gdn_chunk o16): not bit-exact; vs the
+# WT2 KL reference (24 chunks) mean 0.0671 / q99.9 2.026 / top-1 88.40% vs f32 0.0687 / 2.023 / 87.91%, inside the A4
+# redraw spread (0.0693-0.0695 / 2.15-2.27). Unscaled f16 failed the tail (q99.9 2.52: subnormal outputs).
+DNO16 = os.environ.get("YAH_DN_O16", "1") == "1"
 
 
 def _rewrite(text, pairs):
@@ -1603,7 +1607,7 @@ def main():
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
             if dn_perm:
                 assert len(gen_rot.pn_heads(tag)) == nh
-                open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv))
+                open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=DNO16))
             else:
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
@@ -1682,7 +1686,7 @@ def main():
                 for part in "ab":
                     name = "pnq_%s.hal" % part
                     rot_src[name] = os.path.join(tmp, "pnq_%s.loom" % part)
-                    open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part))   # gate: kstoreh
+                    open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part, o16=DNO16))   # gate: kstoreh
                     geom.append((name, 0, 64, len(gen_rot.pnq_groups(part)) // 4))
         with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
             fh.write(gen_rot.signs())

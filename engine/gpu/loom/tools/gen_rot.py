@@ -571,7 +571,7 @@ def pn_heads(part):
     return [pn_gguf(h) for g in pnq_groups(part) for h in (2 * g, 2 * g + 1)]
 
 
-def gen_pnq(rows, span, part):
+def gen_pnq(rows, span, part, o16=False):
     """yah_pnq: the DeltaNet postnorm (yah_ssm_postnorm_gate_f16 with the f16 gate: per GGUF head, inv = 1 / sqrt(sum
     raw^2 / 128 + 1e-6), out = f16((raw inv) w (g sigmoid(g)))) fused with rotq_heads (gen_q with PN_HEADS): the f16
     postnorm output never leaves the workgroup. Part p takes pnq_groups(p), whose heads are DeltaNet part p's
@@ -583,6 +583,7 @@ def gen_pnq(rows, span, part):
     raw holds only this part's heads, in HF order (pn_heads(part)), 128 values each, so a token row of raw is the part's
     groups contiguous (its DeltaNet part writes it so), and the gate is in HF head order (the kstoreh GEMM): each part
     reads contiguous rows (heads spread over 48-head rows read 3-5x slower, DRAM bank conflicts).
+    o16: raw is f16 O 2^O16_EXP (gen_gdn_chunk o16), scaled back here.
     Bindings: raw, weight [128], gate (f16), awq, signs, q, d."""
     nv, nk, hd = PN_HEADS
     r = nv // nk
@@ -612,7 +613,7 @@ def gen_pnq(rows, span, part):
     e("  " + ", ".join(f"%{n}_na" for n in names) + " = buffer.assume.noalias " + ", ".join(f"%{n}" for n in names)
       + " : " + ", ".join(["buffer"] * len(names)))
     rtotal = ng * 256 * rows
-    e(f"  %xv = buffer.view %raw_na[%base] : buffer -> view<{rtotal}xf32>")
+    e(f"  %xv = buffer.view %raw_na[%base] : buffer -> view<{rtotal}x{'f16' if o16 else 'f32'}>")
     e(f"  %wv = buffer.view %nw_na[%base] : buffer -> view<{hd}xf32>")
     e(f"  %gv = buffer.view %gate_na[%base] : buffer -> view<{total}xf16>")
     e(f"  %av = buffer.view %awq_na[%base] : buffer -> view<{K}xf32>")
@@ -661,7 +662,15 @@ def gen_pnq(rows, span, part):
     e("  %ri0 = index.add %rr0, %kl : index")
     e(f"  %rlim = index.constant {rtotal - 16} : index")
     e("  %ri = index.min %ri0, %rlim : index")   # bound proof (never clamps)
-    e(f"  %xr = vector.load %xv[%ri] : view<{rtotal}xf32> -> vector<16xf32>")
+    if o16:
+        import gen_gdn_chunk
+        e(f"  %xrh = vector.load %xv[%ri] : view<{rtotal}xf16> -> vector<16xf16>")
+        e("  %xre = vector.extf %xrh : vector<16xf16> to vector<16xf32>")
+        e(f"  %xrs = scalar.constant {2.0 ** -gen_gdn_chunk.O16_EXP!r} : f32")
+        e("  %xrsv = vector.splat %xrs : vector<16xf32>")
+        e("  %xr = vector.mulf %xre, %xrsv : vector<16xf32>")   # exact: a power of 2
+    else:
+        e(f"  %xr = vector.load %xv[%ri] : view<{rtotal}xf32> -> vector<16xf32>")
     # the workgroup's 8 heads in LDS (local head lh at lh 128, aliasing the rotation slabs: all reads end at the barrier)
     e("  %lk0 = index.mul %gl, %c256 : index")
     e("  %lk = index.add %lk0, %a16 : index")
