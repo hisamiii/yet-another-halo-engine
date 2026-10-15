@@ -17,6 +17,7 @@ import emit_prefill as E  # noqa: E402
 import gen_attn_fa  # noqa: E402
 import gen_deltanet_hip  # noqa: E402
 import gen_gdn_chunk  # noqa: E402
+import gen_gdn_ss  # noqa: E402
 import gen_conv_kq  # noqa: E402
 import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
@@ -150,6 +151,10 @@ DNVCONV = True
 # WT2 KL reference (24 chunks) mean 0.0671 / q99.9 2.026 / top-1 88.40% vs f32 0.0687 / 2.023 / 87.91%, inside the A4
 # redraw spread (0.0693-0.0695 / 2.15-2.27). Unscaled f16 failed the tail (q99.9 2.52: subnormal outputs).
 DNO16 = os.environ.get("YAH_DN_O16", "1") == "1"
+# DNSS: the dnperm parts as the state-stationary kernel (gen_gdn_ss: one workgroup per head, the state in registers, the
+# head's v-independent work once): bit-identical to gen_gdn_chunk (vconv, o16). Grid (1, heads). pp2048 (sums over 48
+# layers): part a 54.9 -> 36.1 ms; part b 27.3 -> 33.8 (8 workgroups, one per WGP: each head's serial chain, beside pnq a).
+DNSS = True
 
 
 def _rewrite(text, pairs):
@@ -1596,18 +1601,23 @@ def main():
         postnorm_base = postnorm_g16(postnorm_base)
     postnorm_src = os.path.join(tmp, "yah_ssm_postnorm.loom")
     open(postnorm_src, "w").write(postnorm_base)
-    geom.append(("rowsplit.hal", 0, 2, 0))
+    dn_perm = a4 and DNSPLIT == (40, 8)
+    dn_ss = DNSS and dn_perm and dn_vconv and DNO16 and B % 32 == 0
+    # blocks per head of the DeltaNet grid (the unsplit rowsplit.hal is not dispatched with dnsplit)
+    geom.append(("rowsplit.hal", 0, 1 if dn_ss else 2, 0))
     dn_parts = []
     # A4 sets: DeltaNet part b runs the heads of whole rotq groups (gen_rot.pn_heads), so each fused postnorm + rotq part
     # (gen_pnq) reads one part's compact output; "dnperm" tells the host the parts are head sets, not ranges
-    dn_perm = a4 and DNSPLIT == (40, 8)
     if B % 32 == 0 and DNSPLIT:
         ha, hb = DNSPLIT
         for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
             if dn_perm:
                 assert len(gen_rot.pn_heads(tag)) == nh
-                open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=DNO16))
+                if dn_ss:
+                    open(src, "w").write(gen_gdn_ss.gen(gen_rot.pn_heads(tag)))
+                else:
+                    open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=DNO16))
             else:
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
