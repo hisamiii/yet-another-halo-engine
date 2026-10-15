@@ -177,18 +177,47 @@ def gen(heads):
     e("  %row = index.add %row0, %sub : index")         # accumulator column (S^T, U, Vn, O): value row
     e("  %orow = index.add %o_rel, %row : index")
 
-    # ---- initial state: S^T tile j element i = S[row][16 j + 2 i + half]
+    # ---- initial state: S^T tile j element i = S[row][16 j + 2 i + half]; each lane loads keys 16 j + 8 half .. +7
+    # (two b128) and trades the other parity with its xor-16 partner (one shuffle per tile)
     e("  %srow = index.mul %row, %c128 : index")
     e("  %sb0 = index.add %s_head, %srow : index")
-    e("  %sbh = index.add %sb0, %half : index")
+    e("  %sb8h = index.mul %half, %c8 : index")
+    e("  %sbq = index.add %sb0, %sb8h : index")
+    e("  %shi = index.cmp eq, %half, %c1 : index")
+    e("  %ssx16 = scalar.constant 16 : i32")
+    e("  %ssx32 = scalar.constant 32 : i32")
+
+    def swap_halves(ind, p, send):
+        """the xor-16 partner's values of send (4 f32)"""
+        e(f"{ind}%{p}s4 = vector.from_elements {', '.join(send)} : {V4}")
+        e(f"{ind}%{p}p4, %{p}pv = kernel.subgroup.shuffle<xor> %{p}s4, %ssx16, %ssx32 : {V4}, i32, i32")
+        out = []
+        for k in range(4):
+            e(f"{ind}%{p}p{k} = vector.extract %{p}p4[{k}] : {V4} -> f32")
+            out.append(f"%{p}p{k}")
+        return out
     st = []
     for j in range(8):
-        els = []
-        for i in range(8):
-            e(f"  %sa{j}_{i}c = index.constant {16 * j + 2 * i} : index")
-            e(f"  %sa{j}_{i} = index.add %sbh, %sa{j}_{i}c : index")
-            e(f"  %sv{j}_{i} = view.load %state_view[%sa{j}_{i}] : view<[%state_total]xf32> -> f32")
-            els.append(f"%sv{j}_{i}")
+        e(f"  %sq{j}c = index.constant {16 * j} : index")
+        e(f"  %sq{j}a = index.add %sbq, %sq{j}c : index")
+        e(f"  %sq{j}b = index.add %sq{j}a, %c4 : index")
+        lv = []
+        for hlf in "ab":
+            e(f"  %sl{j}{hlf} = vector.load %state_view[%sq{j}{hlf}] : view<[%state_total]xf32> -> {V4}")
+            for k in range(4):
+                e(f"  %sl{j}{hlf}{k} = vector.extract %sl{j}{hlf}[{k}] : {V4} -> f32")
+                lv.append(f"%sl{j}{hlf}{k}")
+        # half 0 holds keys 0 .. 7 (keeps the even ones), half 1 keys 8 .. 15 (keeps the odd ones)
+        send = []
+        for k in range(4):
+            e(f"  %ss{j}_{k} = scf.select %shi, {lv[2 * k]}, {lv[2 * k + 1]} : f32")
+            send.append(f"%ss{j}_{k}")
+        pk = swap_halves("  ", f"si{j}", send)
+        els = [None] * 8
+        for k in range(4):
+            e(f"  %sv{j}_{k} = scf.select %shi, {pk[k]}, {lv[2 * k]} : f32")
+            e(f"  %sv{j}_{4 + k} = scf.select %shi, {lv[2 * k + 1]}, {pk[k]} : f32")
+            els[k], els[4 + k] = f"%sv{j}_{k}", f"%sv{j}_{4 + k}"
         e(f"  %si{j} = vector.from_elements {', '.join(els)} : {V8}")
         st.append(f"%si{j}")
     # ---- v conv weights and ring (channel tid < 128)
@@ -681,11 +710,25 @@ def gen(heads):
         e("    %oplast = index.mul %lastc, %c32 : index")
         for tt in range(2):
             ostore("    ", "%oplast", f"%opf{tt}", tt, f"ol{tt}")
-        # ---- final state
+        # ---- final state: the initial load's exchange in reverse, two b128 stores per tile
         for j in range(8):
+            fe = []
             for i in range(8):
                 e(f"    %fe{j}_{i} = vector.extract %sf{j}[{i}] : {V8} -> f32")
-                e(f"    view.store %fe{j}_{i}, %state_view[%sa{j}_{i}] : f32, view<[%state_total]xf32>")
+                fe.append(f"%fe{j}_{i}")
+            send = []
+            for k in range(4):
+                e(f"    %fs{j}_{k} = scf.select %shi, {fe[k]}, {fe[4 + k]} : f32")
+                send.append(f"%fs{j}_{k}")
+            pk = swap_halves("    ", f"so{j}", send)
+            ov = []
+            for k in range(4):
+                e(f"    %fo{j}_{2 * k} = scf.select %shi, {pk[k]}, {fe[k]} : f32")
+                e(f"    %fo{j}_{2 * k + 1} = scf.select %shi, {fe[4 + k]}, {pk[k]} : f32")
+                ov += [f"%fo{j}_{2 * k}", f"%fo{j}_{2 * k + 1}"]
+            for hi, hlf in enumerate("ab"):
+                e(f"    %fv{j}{hlf} = vector.from_elements {', '.join(ov[4 * hi:4 * hi + 4])} : {V4}")
+                e(f"    vector.store %fv{j}{hlf}, %state_view[%sq{j}{hlf}] : {V4}, view<[%state_total]xf32>")
 
     # wave-uniform role branch: every barrier inside has a matching barrier in the other region (HRX patch 0037)
     e("  scf.if %issv {")
