@@ -1,0 +1,20 @@
+AMDGPU: 1 MiB command-buffer blocks.
+
+A program with more than one block is replayed block by block from the host. The engine's pp2048 chunk graph
+(~980 dispatches) spilled into a second 128 KiB block, and the GPU sat idle 0.50-0.69 ms at the block boundary
+(dispatch ~886 of the chunk) in every timeline run. With one 1 MiB block the chunk graph is a single submission:
+the idle is gone, the other inter-dispatch gaps are unchanged (6.74 vs 6.77 ms per chunk).
+
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/aql_program_builder.h b/runtime/src/iree/hal/drivers/amdgpu/aql_program_builder.h
+index 74a62c132..99761568b 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/aql_program_builder.h
++++ b/runtime/src/iree/hal/drivers/amdgpu/aql_program_builder.h
+@@ -21,7 +21,7 @@ extern "C" {
+ 
+ enum {
+   // Default usable bytes per command-buffer block.
+-  IREE_HAL_AMDGPU_AQL_PROGRAM_DEFAULT_BLOCK_SIZE = 128 * 1024,
++  IREE_HAL_AMDGPU_AQL_PROGRAM_DEFAULT_BLOCK_SIZE = 1024 * 1024,
+   // Minimum usable bytes per command-buffer block.
+   IREE_HAL_AMDGPU_AQL_PROGRAM_MIN_BLOCK_SIZE = 256,
+ };
