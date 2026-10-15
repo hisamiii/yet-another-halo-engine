@@ -1,0 +1,21 @@
+Loom: a 16-bit VGPR store writes bits 0..15 of its data register only, so a payload defined by a low-half write
+(v_cvt_f16_f32 to .l and friends) is stored as it is. The store lowering cleared the upper half first with
+v_bfe_u32 x, 0, 16 for every such store. gen_gdn_ss: 168 v_bfe_u32 removed (solver loop 915 -> 849 VALU per
+chunk, row loop 1017 -> 993), bit-identical.
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c b/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
+@@ -288,10 +288,9 @@
+   const bool is_vgpr = loom_amdgpu_low_type_is_register_class(
+       context, low_type, LOOM_AMDGPU_REG_CLASS_ID_VGPR);
+   if (is_vgpr) {
+-    if (access->payload_register_count == 1 && access->packet_byte_count == 2) {
+-      return loom_amdgpu_materialize_full_low_vgpr_b32(
+-          context, source_op, low_value, out_low_value);
+-    }
++    // A 16-bit store writes bits 0..15 of its data register only: a value
++    // defined by a low-half write stores as it is, without clearing the
++    // upper half first.
+     return iree_ok_status();
+   }
+   const bool is_sgpr = loom_amdgpu_low_type_is_register_class(
