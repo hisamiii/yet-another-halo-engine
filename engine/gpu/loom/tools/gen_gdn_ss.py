@@ -39,9 +39,10 @@ V4 = "vector<4xf32>"
 V16H = "vector<16xf16>"
 V8H = "vector<8xf16>"
 V4H = "vector<4xf16>"
-# LDS regions (bytes): K|Q rows, Kt [key][tok], -A^T (f32, the solver's), P, T2 (2 buffers),
-# gates (3 buffers), conv weights [128][4] and conv ring x[-3..-1] [128][3] (f32)
-KQ, KT, AF, PP, T2, GA, CW, CS = 0, 17408, 27648, 32256, 34816, 39936, 42240, 44288
+# LDS regions (bytes): K|Q rows, Kt [key][tok] (key k at row k + k / 16: the transposed stores' 8 key segments
+# land on distinct banks), -A^T (f32, the solver's), P, T2 (2 buffers), gates (3 buffers), conv weights [128][4] and
+# conv ring x[-3..-1] [128][3] (f32)
+KQ, KT, AF, PP, T2, GA, CW, CS = 0, 17408, 28288, 32896, 35456, 40576, 42880, 44928
 POOL = CS + 128 * 3 * 4
 assert POOL <= 65536
 
@@ -121,7 +122,7 @@ def gen(heads):
     l_ = lay("kr", 136)
     e(f"  %kr_r = buffer.view %pool[{o}] : buffer -> view<128x32xf16, {l_}>")      # B[key][tok] from K[tok][key]
     o = region("kt", KT)
-    e(f"  %kt_w = buffer.view %pool[{o}] : buffer -> view<128x40xf16>")              # Kt[key][tok]; lhs A[key][tok]
+    e(f"  %kt_w = buffer.view %pool[{o}] : buffer -> view<136x40xf16>")              # Kt[key][tok]; lhs A[key][tok]
     o = region("af", AF)
     e(f"  %a_v = buffer.view %pool[{o}] : buffer -> view<32x36xf32>")
     o = region("pp", PP)
@@ -250,6 +251,7 @@ def gen(heads):
     e("  %seg8 = index.rem %tidc, %c8 : index")
     e("  %dseg = index.mul %seg8, %c16 : index")
     e("  %qrow = index.add %lt, %c32 : index")
+    e("  %kseg = index.add %dseg, %seg8 : index")         # Kt row of key dseg
 
     def fetch_rows(cidx, p, ind, kq=True):
         """the row waves' loads of chunk cidx: K, Q (normalized f16) or the v conv taps"""
@@ -531,8 +533,8 @@ def gen(heads):
                     for i in range(4):
                         e(f"{I}%kt{g}{i}e = vector.extract {hs[g]}[{i}] : {V4H} -> f16")
                         e(f"{I}%kt{g}{i}c = index.constant {4 * g + i} : index")
-                        e(f"{I}%kt{g}{i}r = index.add %dseg, %kt{g}{i}c : index")
-                        e(f"{I}view.store %kt{g}{i}e, %kt_w[%kt{g}{i}r, %lt] : f16, view<128x40xf16>")
+                        e(f"{I}%kt{g}{i}r = index.add %kseg, %kt{g}{i}c : index")
+                        e(f"{I}view.store %kt{g}{i}e, %kt_w[%kt{g}{i}r, %lt] : f16, view<136x40xf16>")
         # this chunk's v conv taps: in flight during phases 1-2, the conv runs in phase 5
         vx = fetch_rows("%ci", "v_", I, kq=False)
         # next chunk's inputs (clamped): in flight during phases 2-5
@@ -591,6 +593,7 @@ def gen(heads):
         # ---- phase 2 (all row waves): KS = K S^T, O1 = Q S^T (S^T repacked once per tile)
         for j in range(8):
             e(f"{I}%xk{j} = index.constant {16 * j} : index")
+            e(f"{I}%ktr{j} = index.constant {17 * j} : index")
         ka, oa = ["%zs", "%zs"], ["%zs", "%zs"]
         for j in range(8):
             b = repack(I, f"%s{j}", f"sb{j}")
@@ -699,7 +702,7 @@ def gen(heads):
             e(f"{I}%sdf{j} = vector.fragment<init> %sd{j} shape [%m, %n] : {V8}")
             acc = f"%sdf{j}"
             for c in range(2):
-                e(f"{I}%ka{j}{c} = vector.fragment.load<lhs> %kt_w[%xk{j}, %uk{c}] shape [%m, %k] : view<128x40xf16> -> {V16H}")
+                e(f"{I}%ka{j}{c} = vector.fragment.load<lhs> %kt_w[%ktr{j}, %uk{c}] shape [%m, %k] : view<136x40xf16> -> {V16H}")
                 e(f"{I}%kc{j}{c} = vector.mma %ka{j}{c}, {bvp[c]}, {acc} : {V16H}, {V16H}, {V8}")
                 acc = f"%kc{j}{c}"
             new.append(acc)
