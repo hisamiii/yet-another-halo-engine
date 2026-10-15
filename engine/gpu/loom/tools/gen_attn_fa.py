@@ -58,6 +58,8 @@ QDIRECT = None    # None: follow Q16
 # of its row (both 128-dim halves for the sum, its own half for the values: 16 RoPE pairs per lane half) and trades
 # subtree sums and finished fragments with its xor-16 partner. Same bits as RoPE + rope_q16; RoPE then does K / V only.
 QNORM = False
+# QG16: q and gate arrive as f16 (the kqg GEMM's f16 epilogue, emit_prefill_pp.QG16); with QNORM the prologue widens q
+QG16 = False
 QX_OFF = 0          # QNORM: LDS offset of the sums slot (set by gen)
 # PIPE2_EARLY: the QK of tile j+1 goes in before the softmax's rescale branch (its loads stay after it: a branch join
 # drains outstanding global loads)
@@ -260,10 +262,16 @@ def had64(e, pre, vecs, xors, scale):
     return out
 
 
-def qnorm_load(e, dst, view, vt, base, ks):
+def qnorm_load(e, dst, view, vt, base, ks, f16=False):
     """QNORM: the 16-dim f32 runs at base + 32 k (k in ks) as V4s; all loads issued before any use"""
     out = {}
     for k in ks:
+        if f16:   # one 32-B load, widened
+            e(f"  %{dst}{k}_a = index.add {base}, %qo{32 * k} : index")
+            e(f"  %{dst}{k}_h = vector.load {view}[%{dst}{k}_a] : view<[{vt}]xf16> -> {V16H}")
+            e(f"  %{dst}{k}_w = vector.extf %{dst}{k}_h : {V16H} to vector<16xf32>")
+            out[k] = [f"%{dst}{k}_w"]
+            continue
         for j in range(4):
             e(f"  %{dst}{k}_{j}a = index.add {base}, %qo{32 * k + 4 * j} : index")
             e(f"  %{dst}{k}_{j} = vector.load {view}[%{dst}{k}_{j}a] : view<[{vt}]xf32> -> {V4}")
@@ -274,7 +282,10 @@ def qnorm_load(e, dst, view, vt, base, ks):
 def qnorm_scalars(e, dst, vecs):
     out = []
     for j in range(16):
-        e(f"  %{dst}e{j} = vector.extract {vecs[j // 4]}[{j % 4}] : {V4} -> f32")
+        if len(vecs) == 1:
+            e(f"  %{dst}e{j} = vector.extract {vecs[0]}[{j}] : vector<16xf32> -> f32")
+        else:
+            e(f"  %{dst}e{j} = vector.extract {vecs[j // 4]}[{j % 4}] : {V4} -> f32")
         out.append(f"%{dst}e{j}")
     return out
 
@@ -303,7 +314,7 @@ def qnorm_phase1(e):
     e("  %qnb = index.add %qdb, %qh16 : index")
     for n in sorted({32 * k + 4 * j for k in range(nown) for j in range(4)}):
         e(f"  %qo{n} = index.constant {n} : index")
-    vecs = qnorm_load(e, "qxv", "%q_flat", "%qtot", "%qnb", range(nown))
+    vecs = qnorm_load(e, "qxv", "%q_flat", "%qtot", "%qnb", range(nown), QG16)
     own = [[f"%qx{k}e{j}" for j in range(16)] for k in range(nown)]
     return own, lambda: qnorm_sums(e, vecs, nown)
 
@@ -514,8 +525,8 @@ def gen():
         CAPV = "%pcap"
     e(f"  %kvtot = index.mul {CAPV}, %c1024 : index")
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
-    e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if Q16 and not QNORM else 'f32'}>")
-    e("  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
+    e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if Q16 and (not QNORM or QG16) else 'f32'}>")
+    e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if QG16 else 'f32'}>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
     # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
     # kv8a16: int8 K [token][256 dwords], f16x2 (256 s, -384 s) [token][8]
@@ -2236,6 +2247,9 @@ def gen():
         e(f"  %eo{f}b = index.add %eo{f}, %c4 : index")
 
     def gate_load(f):
+        if QG16:
+            e(f"  %eg{f}h = vector.load %g_flat[%eo{f}] : view<[%qtot]xf16> -> {V8H}")
+            return
         e(f"  %eg{f}a = vector.load %g_flat[%eo{f}] : view<[%qtot]xf32> -> {V4}")
         e(f"  %eg{f}b = vector.load %g_flat[%eo{f}b] : view<[%qtot]xf32> -> {V4}")
 
@@ -2288,7 +2302,10 @@ def gen():
             gate_batch(range(8, 16))
         if gate_each:
             gate_loads(f)
-        e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
+        if QG16:
+            e(f"  %eg{f} = vector.extf %eg{f}h : {V8H} to {V8}")
+        else:
+            e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
         e(f"  %egn{f} = vector.negf %eg{f} : {V8}")
         e(f"  %egm{f} = vector.mulf %egn{f}, %nlog2e8 : {V8}")
         e(f"  %egx{f} = vector.exp2f<afn> %egm{f} : {V8}")

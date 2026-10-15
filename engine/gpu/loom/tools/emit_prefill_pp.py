@@ -314,6 +314,9 @@ OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (1
 # 88K..126K vs the 4-workgroup kernel / the deep twin (standalone); not bit-identical (the running max moves per 32 keys).
 KT2_FROM = int(os.environ.get("YAH_KT2_FROM", "16384"))
 QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
+# QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
+QG16 = True
+QG16_ON = False   # set by main
 KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1)
 KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
 
@@ -1335,7 +1338,8 @@ def iu4_gemm(kind, mt, kb, B, outdir, hperm=None):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, out[:-4] + ".loom")
-    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, kind == "kstore" and mt in O16_MT, hperm))
+    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, (kind == "kstore" and mt in O16_MT) or (kind == "kqg" and QG16_ON),
+                                          hperm))
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, "mq4", kind, str(mt), str(kb),
                            str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP], capture_output=True, text=True)
     if gate.returncode != 0:
@@ -1373,7 +1377,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK
+    global MODEL, NPU_FFNBLK, QG16_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1397,6 +1401,7 @@ def main():
     # MQ4 (HFQ) models: A4 prefill (int4 activations, iu4 GEMMs) unless YAH_A16=1 (W4A16: f16 activations, the quality mode)
     rot = types.get("blk.0.ffn_down.weight") == 44
     a4 = rot and os.environ.get("YAH_A16") != "1"
+    QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
 
     n = 0
     df_done = set()
@@ -1513,6 +1518,9 @@ def main():
             for k in keys:
                 setattr(A, k, saved[k])
     gen_attn_fa.QNORM = QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False   # (see RoPE below)
+    gen_attn_fa.QG16 = QG16_ON
+    if QG16_ON:
+        geom.append(("qg16", 0, 0, 0))
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal

@@ -1394,9 +1394,13 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
         # row r = head*512 + half*256 + d goes to (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
         e("  %qg_tot = index.div %out_total, %c2 : index")
         e(f"  %qg_rows = index.div {orw()}, %c2 : index")
-        e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
-        e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        qt = "f16" if OUT16 else "f32"   # OUT16: q and gate stored as f16 (emit_prefill_pp.QG16), 8 rows per store
+        e(f"  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]x{qt}>")
+        e(f"  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]x{qt}>")
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
+        if OUT16:
+            e("  %qg_c8 = index.constant 8 : index")
+            e("  %qg_last8 = index.sub %qg_tot, %qg_c8 : index")
         e("  %qg_c512 = index.constant 512 : index")
         e("  %qg_c256 = index.constant 256 : index")
     else:
@@ -1470,6 +1474,17 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
                     hs.append(f"%h_{y}")
                 e(f"  %hv{j}_{q} = vector.from_elements {', '.join(hs)} : vector<4xf16>")
                 e(f"  vector.store %hv{j}_{q}, %out_h[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
+            elif qg and OUT16:
+                e(f"  %qg_h{j}_{q} = vector.fptrunc {val} : vector<4xf32> to vector<4xf16>")
+                if q % 2:
+                    e(f"  %qg_h8{j}_{q} = vector.concat<0> %qg_h{j}_{q - 1}, %qg_h{j}_{q} : vector<4xf16>, vector<4xf16> -> vector<8xf16>")
+                    e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q - 1}c : index")
+                    e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last8 : index")
+                    e(f"  scf.if %qg_isq {{")
+                    e(f"    vector.store %qg_h8{j}_{q}, %q_flat[%qg_oi{j}_{q}] : vector<8xf16>, view<[%qg_tot]xf16>")
+                    e("  } else {")
+                    e(f"    vector.store %qg_h8{j}_{q}, %g_flat[%qg_oi{j}_{q}] : vector<8xf16>, view<[%qg_tot]xf16>")
+                    e("  }")
             elif qg:
                 # always in range; the clamp states it for the bound proof
                 e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
