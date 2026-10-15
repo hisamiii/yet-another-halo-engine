@@ -373,6 +373,11 @@ KV16_ON = False   # set by main
 # with no graph barrier and the norm runs in the GEMM's tail. Same values. dispatch.txt "nqov"
 NQOV = True
 NQOV_ON = False   # set by main
+# DNOV (A4 dnvconv, with DNSPLIT (40, 8)): the qkv and gate kstores also flagged (iu4_kstoref_*, iu4_kstorehf_*), the
+# conv as convkqf and pnq part a as pnq_af waiting on their counters, so the conv runs in the qkv GEMM's tail and pnq
+# part a in the gate GEMM's. Same values. dispatch.txt "dnov"
+DNOV = True
+DNOV_ON = False   # set by main
 KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1)
 KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
 
@@ -1382,7 +1387,8 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
 
 def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False):
     """Emit the A4 GEMM (tools/gen_gemm_iu4.py) of an MQ4 tensor; return its dispatch.txt row. hperm: a kstore whose
-    output heads go to HF order (gen_gemm_iu4.gen), as "kstoreh". flag: a kres as "kresf" (NQOV)."""
+    output heads go to HF order (gen_gemm_iu4.gen), as "kstoreh". flag: the completion-counter variant, "<kind>f"
+    (NQOV, DNOV)."""
     bm, bn, _, _ = gen_gemm_iu4.tile(mt * 16)
     if kind == "gu":
         bm //= 2   # a gu workgroup stages bm rows of gate and up for bm / 2 features
@@ -1390,7 +1396,7 @@ def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False):
         raise SystemExit("iu4 GEMM %s: %d rows / %d tokens do not tile" % (kind, mt * 16, B))
     tt = B // bn
     sym = gen_gemm_iu4.sym(kind)
-    out = "iu4_%s_%d_%d.hal" % (kind + ("h" if hperm else "f" if flag else ""), mt, kb)
+    out = "iu4_%s_%d_%d.hal" % (kind + ("h" if hperm else "") + ("f" if flag else ""), mt, kb)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, out[:-4] + ".loom")
@@ -1433,7 +1439,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1459,6 +1465,8 @@ def main():
     a4 = rot and os.environ.get("YAH_A16") != "1"
     KV16_ON = KV16 and a4
     NQOV_ON = NQOV and a4
+    DNOV_ON = (DNOV and a4 and DNSPLIT == (40, 8) and DNVCONV and conv_tb_ok(B) and "qkv" not in NPU_SPLIT
+               and not EMIT_HALF)   # the dnvconv conv (dn_vconv below)
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
 
     n = 0
@@ -1485,8 +1493,12 @@ def main():
                         geom.append(iu4_gemm(k, mt, kb, B, outdir, hp))
                         if gen_gemm_iu4.group_of(k, mt * 16):   # grouped grid: the engine launches (G, tiles, row tiles / G)
                             geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
+                        # the flagged variants: the plain GEMM's geometry (dispatch.txt row) serves both
                         if k == "kres" and NQOV_ON and mt * 16 == 5120:
-                            iu4_gemm(k, mt, kb, B, outdir, flag=True)   # the kres's geometry (dispatch.txt row) serves both
+                            iu4_gemm(k, mt, kb, B, outdir, flag=True)
+                        if k == "kstore" and DNOV_ON and (hp is not None or any(
+                                t.endswith("attn_qkv.weight") for t in combos[(kind, fmt, port, mt, kb)])):
+                            iu4_gemm(k, mt, kb, B, outdir, hp, flag=True)
             n += 1
             continue
         for k in kinds:
@@ -1682,6 +1694,11 @@ def main():
             text = conv_n16(text)
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
+    assert DNOV_ON <= dn_vconv
+    convf_src = os.path.join(tmp, "yah_ssm_conv_kqf.loom")
+    if DNOV_ON:
+        open(convf_src, "w").write(gen_conv_kq.gen(4096, flag=gen_gemm_iu4.flag_count(10240)))
+        geom.append(("dnov", 0, 0, 0))
     prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
     text = open(os.path.join(E.LOOM, "yah_deltanet_prep_ab_f32.loom")).read()
     open(prepab_src, "w").write(prepab_x16(text) if 640 in O16_MT else text)
@@ -1811,6 +1828,10 @@ def main():
                     rot_src[name] = os.path.join(tmp, "pnq_%s.loom" % part)
                     open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part, o16=DNO16))   # gate: kstoreh
                     geom.append((name, 0, 64, len(gen_rot.pnq_groups(part)) // 4))
+                if DNOV_ON:   # part a waiting on the gate GEMM's counters (pnq_a.hal's geometry)
+                    rot_src["pnq_af.hal"] = os.path.join(tmp, "pnq_af.loom")
+                    open(rot_src["pnq_af.hal"], "w").write(
+                        gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "a", o16=DNO16, flag=gen_gemm_iu4.flag_count(6144)))
         with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
             fh.write(gen_rot.signs())
         geom.append(("rot", 0, 0, 0))
@@ -1870,6 +1891,9 @@ def main():
         (conv_src, "convkq.hal",
          ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
           "yah_ssm_conv_kq.num_key_heads=16"]),
+        *([(convf_src, "convkqf.hal",
+            ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
+             "yah_ssm_conv_kq.num_key_heads=16"])] if DNOV_ON else []),
         (prepab_src, "prepab.hal",
          ["yah_deltanet_prep_ab.batch=%d" % B,
           "yah_deltanet_prep_ab.qkv_size=10240",

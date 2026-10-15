@@ -58,9 +58,10 @@ def sym(kind):
 
 
 def gen(kind, M, out16=False, hperm=None, flag=False):
-    """out16: kstore stores f16 (gen_gemm_tile.OUT16). flag (kres): binding cnt after output, each lane adds 1 to
-    cnt[token tile] once its wave's stores are visible (device scope; flag_count per token tile), so a flag-waiting
-    consumer (gen_rot.gen_nq flag) can read finished token tiles while the GEMM's last workgroups still run. Kind gu: the FFN's gate and up in one GEMM, f16 silu(gate) * up
+    """out16: kstore stores f16 (gen_gemm_tile.OUT16). flag (kres, kstore): binding cnt after the outputs, i32 per token
+    tile (zero before the GEMM); each lane adds 1 to cnt[token tile] once its wave's stores are visible (device scope;
+    flag_count per token tile), so a flag-waiting consumer (gen_rot.flag_wait) can read finished token tiles while the
+    GEMM's last workgroups still run. Kind gu: the FFN's gate and up in one GEMM, f16 silu(gate) * up
     of M features; a workgroup stages BM / 2 gate rows and the same features' up rows (wave rows WM / 2 and up) and
     pairs them through LDS, so the gate never goes to memory.
     hperm (value heads, key heads): the output of weight rows 128 i.. (GGUF DeltaNet value head i) goes to HF head
@@ -77,7 +78,7 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
     s = sym(kind)
     bufs = ["weight", "aq", "ad"] + {"kstore": ["output"], "kres": ["resid", "output"], "kqg": ["output", "gate_out"],
                                      "gu": ["up", "output"]}[kind]
-    assert not flag or kind == "kres"
+    assert not flag or kind in ("kres", "kstore")
     if flag:
         bufs.append("cnt")
     WB, AB = BM * WP, BN * WP          # dwords of one staged weight / activation tile
@@ -492,10 +493,9 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
     if flag:
         # every lane, no workgroup barrier and no thread-id test (that keeps the id live and shifts the main loop's
         # registers: +0.9% vs +0.4%); same-address adds are cheap next to the stores
-        e("  %kf_n = index.mul %token_tiles, %c2 : index")
-        e("  %kf_cv = buffer.view %cnt_na[%base] : buffer -> view<[%kf_n]xi32>")
+        e("  %kf_cv = buffer.view %cnt_na[%base] : buffer -> view<[%token_tiles]xi32>")
         e("  %kf_one = scalar.constant 1 : i32")
-        e("  view.atomic.reduce<addi> %kf_one, %kf_cv[%wg_y] {ordering = release, scope = device} : i32, view<[%kf_n]xi32>")
+        e("  view.atomic.reduce<addi> %kf_one, %kf_cv[%wg_y] {ordering = release, scope = device} : i32, view<[%token_tiles]xi32>")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

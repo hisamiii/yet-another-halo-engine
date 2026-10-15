@@ -453,10 +453,38 @@ def _quant(e, total, span, LV):
     e(f"    view.store %dst, %dview[%di] : f32, view<{total // span}xf32>")
     e("  }")
 
-# Polls before a flag-waiting normq gives up (~0.2 s; a real wait is one producer workgroup, ~0.5 ms): a lost producer
-# flag costs one bound per row, not a hang or a ring timeout.
+# Polls before a flag-waiting kernel gives up (~0.2 s; a real wait is one producer workgroup, ~0.5 ms): a lost producer
+# flag costs one bound per workgroup, not a hang or a ring timeout.
 FLAG_POLLS = 200_000
 FLAG_TT = 128   # tokens of a producer token tile
+
+
+def flag_wait(e, cv, fv, tiles, need, lane, pre="fl"):
+    """A flag-waiting kernel's start: wave 0 polls the counter cv[t] (view type fv) of each token tile t in tiles (SSA
+    indices) until it reaches need (the producer's gen_gemm_iu4.flag_count; FLAG_POLLS bounds each), the other waves
+    wait at the barrier; then the workgroup acquires (device scope), so the producer's stores are visible."""
+    e(f"  %{pre}_need = scalar.constant {need} : i32")
+    e(f"  %{pre}_zero = scalar.constant 0 : i32")
+    e(f"  %{pre}_one = scalar.constant 1 : i32")
+    e(f"  %{pre}_limit = scalar.constant {FLAG_POLLS} : i32")
+    # one L2 request per round trip per workgroup, all on the counters' line
+    e(f"  %{pre}_c32 = index.constant 32 : index")
+    e(f"  %{pre}_w0 = index.cmp ult, {lane}, %{pre}_c32 : index")
+    e(f"  scf.if %{pre}_w0 {{")
+    for j, t in enumerate(tiles):
+        q = f"%{pre}{j}"
+        e(f"    {q}_n, {q}_v = scf.while({q}_i = %{pre}_zero : i32, {q}_p = %{pre}_zero : i32) -> (i32, i32) {{")
+        e(f"      {q}_x = view.atomic.load {cv}[{t}] {{ordering = acquire, scope = device}} : {fv} -> i32")
+        e(f"      {q}_early = scalar.cmpi slt, {q}_x, %{pre}_need : i32")
+        e(f"      {q}_lt = scalar.cmpi ult, {q}_i, %{pre}_limit : i32")
+        e(f"      {q}_go = scalar.andi {q}_early, {q}_lt : i1")
+        e(f"      scf.condition {q}_go, {q}_i, {q}_x : i1, i32, i32")
+        e(f"    }} do({q}_j: i32, {q}_w: i32) {{")
+        e(f"      {q}_j1 = scalar.addi {q}_j, %{pre}_one : i32")
+        e(f"      scf.yield {q}_j1, {q}_w : i32, i32")
+        e("    }")
+    e("  }")
+    e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
 
 
 def gen_nq(K, rows, span, eps=1e-6, flag=0):
@@ -465,10 +493,9 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0):
     The lanes load their 16 values into LDS; wave 0 runs gen_half_norm's per-lane chains (lane l: ((0 + x_l x_l) +
     x_{l+32} x_{l+32}) + ..., mulf then addf) and its subgroup reduction, so inv has the norm's bits; each lane then forms
     f16((x inv) w) as the norm did and runs gen_q's rotation and quantization. Bindings: x, weight, awq, signs, q, d.
-    flag (the producer's count per token tile, gen_gemm_iu4.flag_count): binding cnt after d, i32 [2 rows / FLAG_TT];
-    the row waits until cnt[token tile] reaches flag (gen_gemm_iu4.gen flag counts the producer's finished lanes, so the
-    producer runs without a graph barrier before this kernel), then counts itself in cnt[tiles + tile]; the tile's last
-    row resets both words."""
+    flag (the producer's count per token tile, gen_gemm_iu4.flag_count): binding cnt after d, i32 [rows / FLAG_TT]
+    (zero before the producer); the row waits until cnt[token tile] reaches flag (flag_wait), so the producer
+    (gen_gemm_iu4.gen flag) runs without a graph barrier before this kernel."""
     assert K % 256 == 0 and K % 32 == 0
     ng = K // 256
     nth = 16 * ng
@@ -512,30 +539,11 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0):
     e("  %lane = kernel.workitem.id<x> : index")
     e("  %row = kernel.workgroup.id<x> : index")
     if flag:
-        FV = f"view<{2 * nt}xi32>"
+        FV = f"view<{nt}xi32>"
         e(f"  %fl_tt = index.constant {FLAG_TT} : index")
         e("  %fl_tile = index.div %row, %fl_tt : index")
         e(f"  %fl_cv = buffer.view %cnt_na[%base] : buffer -> {FV}")
-        e(f"  %fl_need = scalar.constant {flag} : i32")
-        e("  %fl_zero = scalar.constant 0 : i32")
-        e("  %fl_one = scalar.constant 1 : i32")
-        e(f"  %fl_limit = scalar.constant {FLAG_POLLS} : i32")
-        # wave 0 polls (one L2 request per round trip per row, all on the counter's line); the others wait at the barrier
-        e("  %fl_c32 = index.constant 32 : index")
-        e("  %fl_w0 = index.cmp ult, %lane, %fl_c32 : index")
-        e("  scf.if %fl_w0 {")
-        e("    %fl_n, %fl_v = scf.while(%fl_i = %fl_zero : i32, %fl_p = %fl_zero : i32) -> (i32, i32) {")
-        e(f"      %fl_x = view.atomic.load %fl_cv[%fl_tile] {{ordering = acquire, scope = device}} : {FV} -> i32")
-        e("      %fl_early = scalar.cmpi slt, %fl_x, %fl_need : i32")
-        e("      %fl_lt = scalar.cmpi ult, %fl_i, %fl_limit : i32")
-        e("      %fl_go = scalar.andi %fl_early, %fl_lt : i1")
-        e("      scf.condition %fl_go, %fl_i, %fl_x : i1, i32, i32")
-        e("    } do(%fl_j: i32, %fl_w: i32) {")
-        e("      %fl_j1 = scalar.addi %fl_j, %fl_one : i32")
-        e("      scf.yield %fl_j1, %fl_w : i32, i32")
-        e("    }")
-        e("  }")
-        e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
+        flag_wait(e, "%fl_cv", FV, ["%fl_tile"], flag, "%lane")
     e("  %gl = index.div %lane, %c16 : index")
     e("  %a = index.rem %lane, %c16 : index")
     e("  %rb = index.mul %row, %ck : index")
@@ -582,19 +590,6 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0):
     e("  %xf = vector.extf %xh : vector<16xf16> to vector<16xf32>")
     _core(e, K, total, True, "f16", ("q", "d"), LV)
     _quant(e, total, span, LV)
-    if flag:
-        e("  %fl_t0 = index.cmp eq, %lane, %c0 : index")
-        e("  scf.if %fl_t0 {")
-        e(f"    %fl_nt = index.constant {nt} : index")
-        e("    %fl_dc = index.add %fl_tile, %fl_nt : index")
-        e(f"    %fl_old = view.atomic.rmw<addi> %fl_one, %fl_cv[%fl_dc] {{ordering = relaxed, scope = device}} : i32, {FV} -> i32")
-        e(f"    %fl_lastn = scalar.constant {FLAG_TT - 1} : i32")
-        e("    %fl_last = scalar.cmpi eq, %fl_old, %fl_lastn : i32")
-        e("    scf.if %fl_last {")
-        e(f"      view.atomic.store %fl_zero, %fl_cv[%fl_tile] {{ordering = relaxed, scope = device}} : i32, {FV}")
-        e(f"      view.atomic.store %fl_zero, %fl_cv[%fl_dc] {{ordering = relaxed, scope = device}} : i32, {FV}")
-        e("    }")
-        e("  }")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
@@ -625,7 +620,7 @@ def pn_heads(part):
     return [pn_gguf(h) for g in pnq_groups(part) for h in (2 * g, 2 * g + 1)]
 
 
-def gen_pnq(rows, span, part, o16=False):
+def gen_pnq(rows, span, part, o16=False, flag=0):
     """yah_pnq: the DeltaNet postnorm (yah_ssm_postnorm_gate_f16 with the f16 gate: per GGUF head, inv = 1 / sqrt(sum
     raw^2 / 128 + 1e-6), out = f16((raw inv) w (g sigmoid(g)))) fused with rotq_heads (gen_q with PN_HEADS): the f16
     postnorm output never leaves the workgroup. Part p takes pnq_groups(p), whose heads are DeltaNet part p's
@@ -638,6 +633,8 @@ def gen_pnq(rows, span, part, o16=False):
     groups contiguous (its DeltaNet part writes it so), and the gate is in HF head order (the kstoreh GEMM): each part
     reads contiguous rows (heads spread over 48-head rows read 3-5x slower, DRAM bank conflicts).
     o16: raw is f16 O 2^O16_EXP (gen_gdn_chunk o16), scaled back here.
+    flag (the gate GEMM's gen_gemm_iu4.flag_count): binding cnt after d (flag_wait on the row's token tile), so the
+    gate GEMM runs without a graph barrier before this kernel.
     Bindings: raw, weight [128], gate (f16), awq, signs, q, d."""
     nv, nk, hd = PN_HEADS
     r = nv // nk
@@ -657,7 +654,7 @@ def gen_pnq(rows, span, part, o16=False):
     e(f"  %gx = index.constant {ng // 4} : index")
     e(f"  %gy = index.constant {rows} : index")
     e("  kernel.launch.config workgroups(%gx, %gy, %u1) workgroup_size(%c64, %u1, %u1) : index")
-    names = ["raw", "nw", "gate", "awq", "sg", "q", "d"]
+    names = ["raw", "nw", "gate", "awq", "sg", "q", "d"] + (["cnt"] if flag else [])
     e("} launch(" + ", ".join(f"%{n}: buffer" for n in names) + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 8, 16, 32, 128, 256, PITCH, 16 * PITCH):
@@ -682,6 +679,12 @@ def gen_pnq(rows, span, part, o16=False):
     e("  %lane = kernel.workitem.id<x> : index")
     e("  %wx = kernel.workgroup.id<x> : index")
     e("  %row = kernel.workgroup.id<y> : index")
+    if flag:
+        FV = f"view<{rows // FLAG_TT}xi32>"
+        e(f"  %fl_tt = index.constant {FLAG_TT} : index")
+        e("  %fl_tile = index.div %row, %fl_tt : index")
+        e(f"  %fl_cv = buffer.view %cnt_na[%base] : buffer -> {FV}")
+        flag_wait(e, "%fl_cv", FV, ["%fl_tile"], flag, "%lane")
     e("  %gl = index.div %lane, %c16 : index")
     e("  %a = index.rem %lane, %c16 : index")
     e("  %rb = index.mul %row, %ck : index")
