@@ -1287,8 +1287,9 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     return (out, tile, rowgrp, tt)
 
 
-def iu4_gemm(kind, mt, kb, B, outdir):
-    """Emit the A4 GEMM (tools/gen_gemm_iu4.py) of an MQ4 tensor; return its dispatch.txt row."""
+def iu4_gemm(kind, mt, kb, B, outdir, hperm=None):
+    """Emit the A4 GEMM (tools/gen_gemm_iu4.py) of an MQ4 tensor; return its dispatch.txt row. hperm: a kstore whose
+    output heads go to HF order (gen_gemm_iu4.gen), as "kstoreh"."""
     bm, bn, _, _ = gen_gemm_iu4.tile(mt * 16)
     if kind == "gu":
         bm //= 2   # a gu workgroup stages bm rows of gate and up for bm / 2 features
@@ -1296,11 +1297,11 @@ def iu4_gemm(kind, mt, kb, B, outdir):
         raise SystemExit("iu4 GEMM %s: %d rows / %d tokens do not tile" % (kind, mt * 16, B))
     tt = B // bn
     sym = gen_gemm_iu4.sym(kind)
-    out = "iu4_%s_%d_%d.hal" % (kind, mt, kb)
+    out = "iu4_%s_%d_%d.hal" % (kind + ("h" if hperm else ""), mt, kb)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, out[:-4] + ".loom")
-    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, kind == "kstore" and mt in O16_MT))
+    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, kind == "kstore" and mt in O16_MT, hperm))
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, "mq4", kind, str(mt), str(kb),
                            str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP], capture_output=True, text=True)
     if gate.returncode != 0:
@@ -1380,9 +1381,13 @@ def main():
                 continue
             for k in (["gu"] if kind == "swiglu" else kinds):
                 if k != "kstore" or kind != "residual":
-                    geom.append(iu4_gemm(k, mt, kb, B, outdir))
-                    if gen_gemm_iu4.group_of(k, mt * 16):   # grouped grid: the engine launches (G, tiles, row tiles / G)
-                        geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
+                    # dnperm sets (DNSPLIT (40, 8)): the DeltaNet gate (attn_gate) also as kstoreh, in HF head order
+                    # for the pnq kernels
+                    gate = k == "kstore" and any(t.endswith("attn_gate.weight") for t in combos[(kind, fmt, port, mt, kb)])
+                    for hp in [None] + ([gen_rot.PN_HEADS[:2]] if gate and DNSPLIT == (40, 8) else []):
+                        geom.append(iu4_gemm(k, mt, kb, B, outdir, hp))
+                        if gen_gemm_iu4.group_of(k, mt * 16):   # grouped grid: the engine launches (G, tiles, row tiles / G)
+                            geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
             n += 1
             continue
         for k in kinds:
@@ -1580,13 +1585,22 @@ def main():
     open(postnorm_src, "w").write(postnorm_base)
     geom.append(("rowsplit.hal", 0, 2, 0))
     dn_parts = []
+    # A4 sets: DeltaNet part b runs the heads of whole rotq groups (gen_rot.pn_heads), so each fused postnorm + rotq part
+    # (gen_pnq) reads one part's compact output; "dnperm" tells the host the parts are head sets, not ranges
+    dn_perm = a4 and DNSPLIT == (40, 8)
     if B % 32 == 0 and DNSPLIT:
         ha, hb = DNSPLIT
         for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
-            open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
+            if dn_perm:
+                assert len(gen_rot.pn_heads(tag)) == nh
+                open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag)))
+            else:
+                open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
         geom.append(("dnsplit", 0, ha, hb))
+        if dn_perm:
+            geom.append(("dnperm", 0, 0, 0))
     if conv_tb:
         geom.append(("convtb", gen_conv_kq.TB, 0, 0))
 
@@ -1655,12 +1669,12 @@ def main():
             open(rot_src["normq_5120.hal"], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP))
             geom.append(("normq_5120.hal", 0, 16 * 5120 // 256, 1))
             if DNSPLIT == (40, 8):
-                # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq): part a beside DeltaNet's second part, b after it
+                # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq) per DeltaNet part (dn_perm): a beside part b, b after it
                 for part in "ab":
                     name = "pnq_%s.hal" % part
                     rot_src[name] = os.path.join(tmp, "pnq_%s.loom" % part)
-                    open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part, DNSPLIT[0]))
-                    geom.append((name, 0, 64, len(gen_rot.pnq_groups(part, DNSPLIT[0])) // 4))
+                    open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part))   # gate: kstoreh
+                    geom.append((name, 0, 64, len(gen_rot.pnq_groups(part)) // 4))
         with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
             fh.write(gen_rot.signs())
         geom.append(("rot", 0, 0, 0))
@@ -1692,7 +1706,7 @@ def main():
     postnorm_t_src = os.path.join(tmp, "yah_ssm_postnorm_tiled.loom")
     open(postnorm_t_src, "w").write(postnorm_tiled(postnorm_base))
     pn_parts = []
-    for tag, h0, nh, _ in dn_parts:
+    for tag, h0, nh, _ in ([] if dn_perm else dn_parts):
         base = postnorm_base
         for t_, txt in (("", postnorm_heads(base, h0, nh, B)), ("_t", postnorm_tiled(postnorm_heads(base, h0, nh, B)))):
             src = os.path.join(tmp, f"yah_ssm_postnorm{t_}_{tag}.loom")
@@ -1732,8 +1746,8 @@ def main():
          ["yah_ssm_postnorm_fp16.head_count=%d" % (48 * B)]),
         *[(src, f"rowsplit_{tag}.hal",
            ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
-            "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
-            "yah_deltanet.num_heads=48"]) for tag, _, _, src in dn_parts],
+            "yah_deltanet.inner_size=%d" % (128 * nh if dn_perm else 6144), "yah_deltanet.num_key_heads=16",
+            "yah_deltanet.num_heads=48"]) for tag, _, nh, src in dn_parts],
         *[(src, hal, ["yah_ssm_postnorm_fp16.head_count=%d" % (nh * B)]) for hal, src, nh in pn_parts],
         ("yah_unpack_qg_f32.loom", "unpack.hal",
          ["yah_unpack_qg.batch=%d" % B, "yah_unpack_qg.num_heads=24",

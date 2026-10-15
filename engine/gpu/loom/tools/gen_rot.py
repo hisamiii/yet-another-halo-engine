@@ -108,12 +108,26 @@ def _body(e, sym, K, rows, awq, heads, ty, outs):
     return _core(e, K, total, awq, ty, outs, LV)
 
 
-def _core(e, K, total, awq, ty, outs, LV):
-    """From the lane's 16 f32 values %xf (k = %kk + i): the awq divide, s1, both H16 passes through LDS view %lv (LV,
-    group %gl's slab at %gl 16 PITCH) and the s2 product into %r<i>; without outs the f16 / f32 store to %ov."""
+def _core_loads(e, K, awq):
+    """_core's global loads (s1, awq, s2): issued up front, they share one memory latency with the kernel's own loads
+    instead of waiting behind its barriers."""
     e("  %s1 = vector.load %sv[%a16] : view<512xf32> -> vector<16xf32>")
     if awq:
         e(f"  %aw = vector.load %av[%kk] : view<{K}xf32> -> vector<16xf32>")
+    e("  %s2b = index.add %c256, %a : index")
+    for i in range(16):
+        e(f"  %so{i} = index.constant {16 * i} : index")
+        e(f"  %s2i{i} = index.add %s2b, %so{i} : index")
+        e(f"  %s2_{i} = view.load %sv[%s2i{i}] : view<512xf32> -> f32")
+
+
+def _core(e, K, total, awq, ty, outs, LV, loaded=False):
+    """From the lane's 16 f32 values %xf (k = %kk + i): the awq divide, s1, both H16 passes through LDS view %lv (LV,
+    group %gl's slab at %gl 16 PITCH) and the s2 product into %r<i>; without outs the f16 / f32 store to %ov.
+    loaded: the kernel already ran _core_loads."""
+    if not loaded:
+        _core_loads(e, K, awq)
+    if awq:
         if outs:
             # rotq: x / awq as Markstein's q0 + (x - q0 awq) y with y = v_rcp + one Newton step, which is the IEEE 1 / awq
             # for every normal awq (exhaustive over the mantissas): the IEEE quotient up to the sign of a zero
@@ -169,11 +183,7 @@ def _core(e, K, total, awq, ty, outs, LV):
     if not outs:
         e("  %ob = index.add %rb, %gk : index")
         e("  %ob1 = index.add %ob, %a : index")
-    e("  %s2b = index.add %c256, %a : index")
     for i in range(16):
-        e(f"  %so{i} = index.constant {16 * i} : index")
-        e(f"  %s2i{i} = index.add %s2b, %so{i} : index")
-        e(f"  %s2_{i} = view.load %sv[%s2i{i}] : view<512xf32> -> f32")
         e(f"  %r{i} = scalar.mulf {o[i]}, %s2_{i} : f32")
         if outs:
             continue
@@ -539,38 +549,49 @@ def gen_nq(K, rows, span, eps=1e-6):
 PN_HEADS = (48, 16, 128)   # DeltaNet value heads, key heads, head dim (rotq_heads)
 
 
-def pnq_groups(part, split=40):
-    """The rotq groups (256 HF values = HF heads 2g, 2g + 1) of gen_pnq part "a" (every source head below split, the
-    first DeltaNet part's) and part "b" (the rest). HF head h is GGUF head (h % 3) * 16 + h / 3."""
+PN_BGROUPS = 4   # the rotq groups of DeltaNet's second part (A4 sets: its heads are pn_heads("b"))
+
+
+def pn_gguf(h):
+    """the GGUF head of HF value head h (rotq_heads order: grouped by key head)"""
     nv, nk, _ = PN_HEADS
-    r = nv // nk
-    pure = [g for g in range(nv // 2) if all((h % r) * nk + h // r < split for h in (2 * g, 2 * g + 1))]
-    return pure if part == "a" else [g for g in range(nv // 2) if g not in pure]
+    return (h % (nv // nk)) * nk + h // (nv // nk)
 
 
-def gen_pnq(rows, span, part, split=40):
+def pnq_groups(part):
+    """The rotq groups (256 HF values = HF heads 2g, 2g + 1) of gen_pnq part "b" (0 .. PN_BGROUPS - 1, after DeltaNet's
+    second part) and "a" (the rest, beside it)."""
+    ng = PN_HEADS[0] // 2
+    return list(range(PN_BGROUPS)) if part == "b" else list(range(PN_BGROUPS, ng))
+
+
+def pn_heads(part):
+    """the GGUF heads of DeltaNet part a / b in A4 sets, in HF order: the heads of pnq_groups(part), so each pnq part
+    reads one DeltaNet part's compact output"""
+    return [pn_gguf(h) for g in pnq_groups(part) for h in (2 * g, 2 * g + 1)]
+
+
+def gen_pnq(rows, span, part):
     """yah_pnq: the DeltaNet postnorm (yah_ssm_postnorm_gate_f16 with the f16 gate: per GGUF head, inv = 1 / sqrt(sum
     raw^2 / 128 + 1e-6), out = f16((raw inv) w (g sigmoid(g)))) fused with rotq_heads (gen_q with PN_HEADS): the f16
-    postnorm output never leaves the workgroup. Part "a" takes the groups whose heads all come from DeltaNet's first part
-    (raw), so it runs beside the second; part "b" the others (raw for heads below split, raw2 above). Four groups per
+    postnorm output never leaves the workgroup. Part p takes pnq_groups(p), whose heads are DeltaNet part p's
+    (pn_heads), read from that part's output raw: "a" runs beside DeltaNet's second part, "b" after it. Four groups per
     workgroup, grid (groups / 4, rows). Each lane loads its 16 raw values once into LDS; each wave runs the postnorm's
     own reduction for four of the workgroup's 8 heads from there (lane l chains raw[l + 32 j]^2 over j, then one subgroup
     sum: the postnorm's bits); each lane then forms its 16 values with the postnorm's per-element ops and runs gen_q's
     rotation and quantization.
-    Bindings: raw, [raw2 (b)], weight [128], gate (f16), awq, signs, q, d."""
+    raw holds only this part's heads, in HF order (pn_heads(part)), 128 values each, so a token row of raw is the part's
+    groups contiguous (its DeltaNet part writes it so), and the gate is in HF head order (the kstoreh GEMM): each part
+    reads contiguous rows (heads spread over 48-head rows read 3-5x slower, DRAM bank conflicts).
+    Bindings: raw, weight [128], gate (f16), awq, signs, q, d."""
     nv, nk, hd = PN_HEADS
     r = nv // nk
     K = nv * hd
-    groups = pnq_groups(part, split)
+    groups = pnq_groups(part)
     ng = len(groups)
-    assert ng % 4 == 0
-    if part == "a":
-        assert groups == list(range(13)) + [15, 18, 21]
-    else:
-        assert groups == [13 + i + i // 2 for i in range(8)]
+    assert ng % 4 == 0 and groups == list(range(groups[0], groups[0] + ng))
     total = K * rows
     LV = f"view<{4 * 16 * PITCH}xf32>"
-    two = part == "b"
     L = []
     e = L.append
     e("// GENERATED by tools/gen_rot.py gen_pnq -- edit the generator.")
@@ -581,20 +602,17 @@ def gen_pnq(rows, span, part, split=40):
     e(f"  %gx = index.constant {ng // 4} : index")
     e(f"  %gy = index.constant {rows} : index")
     e("  kernel.launch.config workgroups(%gx, %gy, %u1) workgroup_size(%c64, %u1, %u1) : index")
-    names = ["raw"] + (["raw2"] if two else []) + ["nw", "gate", "awq", "sg", "q", "d"]
+    names = ["raw", "nw", "gate", "awq", "sg", "q", "d"]
     e("} launch(" + ", ".join(f"%{n}: buffer" for n in names) + ") {")
     e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 2, 3, 8, 12, 13, 16, 32, 128, 256, PITCH, 16 * PITCH):
+    for v in (0, 1, 2, 3, 8, 16, 32, 128, 256, PITCH, 16 * PITCH):
         e(f"  %c{v} = index.constant {v} : index")
     e(f"  %ck = index.constant {K} : index")
-    e(f"  %cnk = index.constant {nk} : index")
-    e(f"  %cr = index.constant {r} : index")
-    e(f"  %csplit = index.constant {split} : index")
+    e(f"  %cg0 = index.constant {groups[0]} : index")
     e("  " + ", ".join(f"%{n}_na" for n in names) + " = buffer.assume.noalias " + ", ".join(f"%{n}" for n in names)
       + " : " + ", ".join(["buffer"] * len(names)))
-    e(f"  %xv = buffer.view %raw_na[%base] : buffer -> view<{total}xf32>")
-    if two:
-        e(f"  %xv2 = buffer.view %raw2_na[%base] : buffer -> view<{total}xf32>")
+    rtotal = ng * 256 * rows
+    e(f"  %xv = buffer.view %raw_na[%base] : buffer -> view<{rtotal}xf32>")
     e(f"  %wv = buffer.view %nw_na[%base] : buffer -> view<{hd}xf32>")
     e(f"  %gv = buffer.view %gate_na[%base] : buffer -> view<{total}xf16>")
     e(f"  %av = buffer.view %awq_na[%base] : buffer -> view<{K}xf32>")
@@ -616,53 +634,34 @@ def gen_pnq(rows, span, part, split=40):
     e("  %gx4 = index.mul %wx, %c4 : index")
 
     def group(gidx, tag):
-        """the rotq group of workgroup-local index gidx (part a: i + 2 (max(i, 12) - 12); b: 13 + i + i / 2)"""
-        if part == "a":
-            e(f"  %{tag}m = index.max {gidx}, %c12 : index")
-            e(f"  %{tag}d = index.sub %{tag}m, %c12 : index")
-            e(f"  %{tag}d2 = index.add %{tag}d, %{tag}d : index")
-            e(f"  %{tag} = index.add {gidx}, %{tag}d2 : index")
-        else:
-            e(f"  %{tag}h = index.div {gidx}, %c2 : index")
-            e(f"  %{tag}s = index.add {gidx}, %{tag}h : index")
-            e(f"  %{tag} = index.add %{tag}s, %c13 : index")
+        """the rotq group of workgroup-local index gidx"""
+        e(f"  %{tag} = index.add {gidx}, %cg0 : index")
         return f"%{tag}"
 
-    def gguf(hh, tag):
-        e(f"  %{tag}m = index.rem {hh}, %cr : index")
-        e(f"  %{tag}q = index.div {hh}, %cr : index")
-        e(f"  %{tag}0 = index.mul %{tag}m, %cnk : index")
-        e(f"  %{tag} = index.add %{tag}0, %{tag}q : index")
-        return f"%{tag}"
-    # this lane: group gl, 16 HF values k = 256 g + 16 a .. (local head lh = 2 gl + a / 8, offset ho in its GGUF head)
+    # this lane: group gl, 16 HF values k = 256 g + 16 a .. (local head lh = 2 gl + a / 8, offset ho in its head)
     e("  %gi = index.add %gx4, %gl : index")
     g = group("%gi", "g")
     e("  %gk = index.mul %g, %c256 : index")
     e("  %a16 = index.mul %a, %c16 : index")
     e("  %kk = index.add %gk, %a16 : index")
-    e("  %hh = index.div %kk, %c128 : index")
     e("  %ho = index.rem %kk, %c128 : index")
-    hg = gguf("%hh", "hg")
-    e("  %hgo = index.mul %hg, %c128 : index")
-    e("  %ki = index.add %hgo, %ho : index")
-    e("  %xi0 = index.add %rb, %ki : index")
+    e("  %xi0 = index.add %rb, %kk : index")   # the gate's HF index
     e(f"  %xlim = index.constant {total - 16} : index")
     e("  %xi = index.min %xi0, %xlim : index")   # bound proofs for the 16-wide loads (never clamps)
     e(f"  %holim = index.constant {hd - 16} : index")
     e("  %hoc = index.min %ho, %holim : index")
-    if two:
-        e("  %xlo = index.cmp ult, %hg, %csplit : index")
-        e("  %xr = scf.if %xlo -> (vector<16xf32>) {")
-        e(f"    %xr1 = vector.load %xv[%xi] : view<{total}xf32> -> vector<16xf32>")
-        e("    scf.yield %xr1 : vector<16xf32>")
-        e("  } else {")
-        e(f"    %xr2 = vector.load %xv2[%xi] : view<{total}xf32> -> vector<16xf32>")
-        e("    scf.yield %xr2 : vector<16xf32>")
-        e("  }")
-    else:
-        e(f"  %xr = vector.load %xv[%xi] : view<{total}xf32> -> vector<16xf32>")
     e(f"  %w16 = vector.load %wv[%hoc] : view<{hd}xf32> -> vector<16xf32>")
     e(f"  %gh16 = vector.load %gv[%xi] : view<{total}xf16> -> vector<16xf16>")
+    _core_loads(e, K, True)
+    e(f"  %crw = index.constant {ng * 256} : index")   # this lane's 16 values in its compact raw row
+    e("  %kl0 = index.add %gx4, %gl : index")
+    e("  %kl1 = index.mul %kl0, %c256 : index")
+    e("  %kl = index.add %kl1, %a16 : index")
+    e("  %rr0 = index.mul %row, %crw : index")
+    e("  %ri0 = index.add %rr0, %kl : index")
+    e(f"  %rlim = index.constant {rtotal - 16} : index")
+    e("  %ri = index.min %ri0, %rlim : index")   # bound proof (never clamps)
+    e(f"  %xr = vector.load %xv[%ri] : view<{rtotal}xf32> -> vector<16xf32>")
     # the workgroup's 8 heads in LDS (local head lh at lh 128, aliasing the rotation slabs: all reads end at the barrier)
     e("  %lk0 = index.mul %gl, %c256 : index")
     e("  %lk = index.add %lk0, %a16 : index")
@@ -723,7 +722,7 @@ def gen_pnq(rows, span, part, split=40):
         vals.append(f"%eh{i}")
     e("  %xh = vector.from_elements " + ", ".join(vals) + " : vector<16xf16>")
     e("  %xf = vector.extf %xh : vector<16xf16> to vector<16xf32>")
-    _core(e, K, total, True, "f16", ("q", "d"), LV)
+    _core(e, K, total, True, "f16", ("q", "d"), LV, loaded=True)
     _quant(e, total, span, LV)
     e("  kernel.return")
     e("}")

@@ -51,10 +51,13 @@ def sym(kind):
     return "yah_iu4_gemm" + {"kres": "_kres", "kqg": "_kqg", "gu": "_gu"}.get(kind, "")
 
 
-def gen(kind, M, out16=False):
+def gen(kind, M, out16=False, hperm=None):
     """out16: kstore stores f16 (gen_gemm_tile.OUT16). Kind gu: the FFN's gate and up in one GEMM, f16 silu(gate) * up
     of M features; a workgroup stages BM / 2 gate rows and the same features' up rows (wave rows WM / 2 and up) and
-    pairs them through LDS, so the gate never goes to memory."""
+    pairs them through LDS, so the gate never goes to memory.
+    hperm (value heads, key heads): the output of weight rows 128 i.. (GGUF DeltaNet value head i) goes to HF head
+    position r (i % key heads) + i / key heads (r = value / key heads), as hfq.cpp HeadOrder undoes it: a 128-row tile
+    is one head, so only the tile's store origin moves."""
     BM, BN, WM, WN = tile(M)
     GU = kind == "gu"
     BO = BM // 2 if GU else BM         # output rows of a workgroup
@@ -163,7 +166,21 @@ def gen(kind, M, out16=False):
     e(f"  %ctn = index.constant {TN} : index")
     e("  %wr_off = index.mul %wr, %ctm : index")
     e("  %wt_off = index.mul %wt, %ctn : index")
-    e("  %m_origin = index.add %wg_row, %wr_off : index")
+    if hperm:
+        nv, nk = hperm
+        assert BM == 128 and M == nv * 128 and kind == "kstore"
+        e("  %hp_c128 = index.constant 128 : index")
+        e(f"  %hp_nk = index.constant {nk} : index")
+        e(f"  %hp_r = index.constant {nv // nk} : index")
+        e("  %hp_h = index.div %wg_row, %hp_c128 : index")
+        e("  %hp_m = index.rem %hp_h, %hp_nk : index")
+        e("  %hp_d = index.div %hp_h, %hp_nk : index")
+        e("  %hp_m3 = index.mul %hp_m, %hp_r : index")
+        e("  %hp_p = index.add %hp_m3, %hp_d : index")
+        e("  %hp_row = index.mul %hp_p, %hp_c128 : index")
+        e("  %m_origin = index.add %hp_row, %wr_off : index")
+    else:
+        e("  %m_origin = index.add %wg_row, %wr_off : index")
     e("  %token_base = index.add %wtb, %wt_off : index")
     # staging map: chunk c = tid + LANES * r (16 bytes: weight row c / 4 or token c / 4, quarter c % 4 of its 64 bytes)
     nwc, nac = -(-BM * 4 // LANES), -(-BN * 4 // LANES)

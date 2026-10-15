@@ -140,6 +140,7 @@ class LoomPrefill {
     npu_ = npu;
     npu_dcol_ = geom_.count("npudcol") != 0;
     halves_ = !hgeom_.empty() && npu_dcol_;
+    if (halves_ && geom_.count("dnperm")) throw LoomError("dnperm sets have no token-half DeltaNet");
     if (halves_ && (npu_->A().size < 6 * HNpuK(5120).a || npu_->C().size < HalfC(1) + HalfCBytes()))
       throw LoomError("prefill: the NPU buffers lack the token halves' slots (build the split from npu_plan())");
     std::size_t rem = 0;
@@ -1752,7 +1753,13 @@ class LoomPrefill {
   // af: the afrag form, input normt_ (fragment-major)
   void RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false) {
     const auto* t = Find(wname);
-    if (a4_) return RunIu4("kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000);
+    if (a4_) {
+      // dnperm sets: the DeltaNet gate in HF head order (kstoreh), as the pnq kernels read it
+      const bool hp = geom_.count("dnperm") && wname.ends_with("attn_gate.weight");
+      if (hp && !geom_.count("iu4_kstoreh_" + std::to_string(MTiles(*t)) + "_" + std::to_string(t->dims[0] / 256) + ".hal"))
+        throw LoomError("dnperm sets need the kstoreh gate GEMM");
+      return RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000);
+    }
     Fmt f{};
     const std::string base = GemmHal("gemm_kstore", *t, &f);
     const std::string df = af ? "" : DfGemm("kstore", *t, f);
@@ -2140,9 +2147,13 @@ class LoomPrefill {
     // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
     const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
     const hrx_buffer_ref_t gate{gate_->handle, 0, std::size_t{B_} * kInner * 4};
-    if (a4_ && dnsplit_a_ && !out_af && geom_.count("pnq_a.hal")) {
-      // A4: the postnorm and ssm_out's rotq in one kernel per DeltaNet part (gen_rot.gen_pnq); part a reads only raw_,
-      // so it runs beside the second DeltaNet part
+    // dispatch.txt "dnperm": the DeltaNet parts run head sets (gen_rot.pn_heads) into compact outputs, which only the
+    // pnq kernels read
+    const bool pnq = a4_ && dnsplit_a_ && !out_af && geom_.count("pnq_a.hal");
+    if (pnq != (geom_.count("dnperm") != 0)) throw LoomError("the A4 pnq postnorm and dnperm go together");
+    if (pnq) {
+      // A4: the postnorm and ssm_out's rotq in one kernel per DeltaNet part (gen_rot.gen_pnq), each reading its part's
+      // output: part a beside the second DeltaNet part
       const auto* nw = Find(pre + "ssm_norm.weight");
       const auto* aw = Find(pre + "ssm_out.awq");
       const Geom& ga = geom_.at("pnq_a.hal");
@@ -2150,8 +2161,7 @@ class LoomPrefill {
       Dispatch(Exe("pnq_a.hal"), "yah_pnq", ga.tt, B_, 1, ga.rowgrp, 1, 1,
                {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b1100000);
       Dispatch(Exe("pnq_b.hal"), "yah_pnq", gb.tt, B_, 1, gb.rowgrp, 1, 1,
-               {Ref(*raw_), Ref(*raw2_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)},
-               0b11000000);
+               {Ref(*raw2_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b1100000);
       trim_row_ = tail_;
       RunResidual(pre + "ssm_out.weight", *scratch_, false, true);
       trim_row_ = kAllRows;
