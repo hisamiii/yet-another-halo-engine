@@ -27,6 +27,7 @@ products and sums per element), so the output and state are bit-identical.
 import sys
 
 from gen_gdn_chunk import O16_EXP, TPRE
+from gen_gemm_tile import rcp_consts, recip1
 
 C, D = 32, 128
 V8 = "vector<8xf32>"
@@ -68,6 +69,8 @@ def gen(heads):
     e("  %zero = scalar.constant 0.0 : f32")
     e("  %one = scalar.constant 1.0 : f32")
     e("  %zh = scalar.constant 0.0 : f16")
+    e("  %negone = scalar.constant -1.0 : f32")
+    rcp_consts(e)
     e(f"  %zeros8 = vector.constant 0.0 : {V8}")
     e("  %m = index.constant 16 : index")
     e("  %n = index.constant 16 : index")
@@ -316,7 +319,8 @@ def gen(heads):
     # lane = 4 channels, wave = 4 tokens; one b64 Vt store per channel
     e(f"{I}%vc_f0 = index.add %ci, %sg : index")
     e(f"{I}%vc_first = index.cmp eq, %vc_f0, %c0 : index")    # chunk 0, wave 0: tokens -3 .. -1 from the ring
-    e("%s%%vc_neg = scalar.constant -1.0 : f32" % I)
+    # exp(-dot) as exp2(dot * -log2e): what expf<afn> lowers to after the negation, in one multiply (bit-identical)
+    e(f"{I}%nl2e = scalar.constant -1.4426950408889634 : f32")
     for j in range(4):
         e(f"{I}%vc_r{j} = index.add %vc_p4, %c{j} : index")
         e(f"{I}%vc_w{j} = vector.load %cws[%vc_r{j}, %c0] : view<128x4xf32> -> {V4}")
@@ -346,10 +350,10 @@ def gen(heads):
             e(f"{I}{q}sa = scalar.addf {q}d0, {q}d1 : f32")
             e(f"{I}{q}sb = scalar.addf {q}d2, {q}d3 : f32")
             e(f"{I}{q}dot = scalar.addf {q}sa, {q}sb : f32")
-            e(f"{I}{q}ng = scalar.mulf {q}dot, %vc_neg : f32")
-            e(f"{I}{q}ex = scalar.expf<afn> {q}ng : f32")
+            e(f"{I}{q}ng = scalar.mulf {q}dot, %nl2e : f32")
+            e(f"{I}{q}ex = scalar.exp2f<afn> {q}ng : f32")
             e(f"{I}{q}dn = scalar.addf %one, {q}ex : f32")
-            e(f"{I}{q}sg = scalar.divf %one, {q}dn : f32")
+            recip1(e, f"{q}sg", f"{q}dn", I)    # = 1 / dn: the f16 product rounds the denormal range alike
             e(f"{I}{q}r = scalar.mulf {q}dot, {q}sg : f32")
             e(f"{I}{q}h = scalar.fptrunc {q}r : f32 to f16")
             hs.append(f"{q}h")
