@@ -1,0 +1,318 @@
+Loom: cross-block memory waits use the source alias summaries.
+
+The wait planner's cross-block memory frontier tracks pending accesses per memory space only, so the first
+global load of a block drained every store issued earlier, including stores to buffers the source declares
+noalias, and the drain also caught the block's own newer stores. gen_gdn_ss: a full s_waitcnt_vscnt 0 before
+each chunk's v conv taps behind 15 fresh O stores (3.4% of the row SIMDs' time).
+
+- Relative intervals record when their disjoint-storage identity is an entry argument of the scope function
+  (one storage value per invocation); may-alias then trusts unequal identities across evaluations too.
+- The wait planner marks a node read (write) independent when no write (read) anywhere in the function may
+  alias its dependency accesses, and skips the cross-block drain for it. Opaque counter-backed accesses
+  (no descriptor effects, volatile) keep everything conservative.
+- DS cross-lane ops (ds_swizzle) touch no memory: their read effect moves from GENERIC to NONE, keeping the
+  LGKM counter for their results; no more vscnt drain before a swizzle.
+
+gen_gdn_ss part a -2%, bit-identical.
+diff --git a/loom/src/loom/codegen/low/memory_access.h b/loom/src/loom/codegen/low/memory_access.h
+--- a/loom/src/loom/codegen/low/memory_access.h
++++ b/loom/src/loom/codegen/low/memory_access.h
+@@ -100,6 +100,10 @@
+   // One-based disjoint-storage identity within scope, or zero when unknown.
+   // Unequal nonzero identities prove disjointness only in one evaluation.
+   uint32_t disjoint_storage_ordinal;
++  // The disjoint-storage identity is an entry argument of |scope|: one storage
++  // value for every evaluation, so unequal identities prove disjointness across
++  // evaluations too.
++  bool function_invariant_storage;
+   // Participant-uniform symbolic origin, with optional periodic guarantees.
+   loom_symbolic_expr_t origin;
+   // Inclusive lower displacement over all participants and packet elements.
+diff --git a/loom/src/loom/codegen/low/memory_access.c b/loom/src/loom/codegen/low/memory_access.c
+--- a/loom/src/loom/codegen/low/memory_access.c
++++ b/loom/src/loom/codegen/low/memory_access.c
+@@ -136,10 +136,12 @@
+   }
+   const loom_low_memory_relative_interval_t* lhs = left->relative_interval;
+   const loom_low_memory_relative_interval_t* rhs = right->relative_interval;
+-  if (comparison == LOOM_LOW_MEMORY_COMPARISON_SAME_EVALUATION && lhs && rhs &&
+-      lhs->scope == rhs->scope && lhs->disjoint_storage_ordinal != 0 &&
++  if (lhs && rhs && lhs->scope == rhs->scope &&
++      lhs->disjoint_storage_ordinal != 0 &&
+       rhs->disjoint_storage_ordinal != 0 &&
+-      lhs->disjoint_storage_ordinal != rhs->disjoint_storage_ordinal) {
++      lhs->disjoint_storage_ordinal != rhs->disjoint_storage_ordinal &&
++      (comparison == LOOM_LOW_MEMORY_COMPARISON_SAME_EVALUATION ||
++       (lhs->function_invariant_storage && rhs->function_invariant_storage))) {
+     return false;
+   }
+   if (comparison == LOOM_LOW_MEMORY_COMPARISON_SAME_EVALUATION && lhs && rhs &&
+diff --git a/loom/src/loom/codegen/low/lower/lower.h b/loom/src/loom/codegen/low/lower/lower.h
+--- a/loom/src/loom/codegen/low/lower/lower.h
++++ b/loom/src/loom/codegen/low/lower/lower.h
+@@ -1112,6 +1112,12 @@
+     loom_low_lower_context_t* context, const loom_op_t* low_op,
+     uint16_t effect_ordinal, const loom_low_memory_access_summary_t* summary);
+ 
++// Returns true when |alias_scope_id| is an entry argument of the source
++// function: a storage root with one value for the whole invocation.
++bool loom_low_lower_alias_scope_is_entry_argument(
++    loom_low_lower_context_t* context,
++    loom_value_fact_alias_scope_id_t alias_scope_id);
++
+ // Records one packet whose memory effects all use |source_plan|'s address.
+ // The caller has selected actual packet geometry; additional_offset bounds
+ // runtime packet coordinates not present in the canonical source plan.
+diff --git a/loom/src/loom/codegen/low/lower/memory_effects.c b/loom/src/loom/codegen/low/lower/memory_effects.c
+--- a/loom/src/loom/codegen/low/lower/memory_effects.c
++++ b/loom/src/loom/codegen/low/lower/memory_effects.c
+@@ -17,6 +17,32 @@
+                                            low_op, effect_ordinal, summary);
+ }
+ 
++bool loom_low_lower_alias_scope_is_entry_argument(
++    loom_low_lower_context_t* context,
++    loom_value_fact_alias_scope_id_t alias_scope_id) {
++  const loom_op_t* function_op =
++      loom_low_lower_context_source_function(context).op;
++  if (alias_scope_id == LOOM_VALUE_FACT_ALIAS_SCOPE_ID_NONE ||
++      function_op == NULL || function_op->region_count == 0) {
++    return false;
++  }
++  // Kernel-like functions may carry their arguments on a later region (the
++  // launch region); any region's entry block of the function op itself counts.
++  loom_region_t** regions = loom_op_regions(function_op);
++  for (uint8_t r = 0; r < function_op->region_count; ++r) {
++    const loom_region_t* region = regions[r];
++    if (region->block_count == 0) {
++      continue;
++    }
++    for (uint16_t i = 0; i < loom_region_entry_arg_count(region); ++i) {
++      if (loom_region_entry_arg_id(region, i) == alias_scope_id) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
+ // Reduce participant-varying contributions to an envelope while retaining
+ // correlations only between workgroup-uniform values. A lane's SSA identity
+ // never licenses canceling the value observed by another lane.
+@@ -48,6 +74,9 @@
+           source_plan->alias_scope_id != LOOM_VALUE_FACT_ALIAS_SCOPE_ID_NONE
+               ? source_plan->alias_scope_id + 1u
+               : 0,
++      .function_invariant_storage =
++          loom_low_lower_alias_scope_is_entry_argument(
++              context, source_plan->alias_scope_id),
+   };
+   int64_t root_relative_byte_offset = 0;
+   if (!iree_checked_sub_i64(source_plan->static_byte_offset,
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/async.c b/loom/src/loom/target/arch/amdgpu/lower/async.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/async.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/async.c
+@@ -1171,6 +1171,9 @@
+           region->alias_scope_id != LOOM_VALUE_FACT_ALIAS_SCOPE_ID_NONE
+               ? region->alias_scope_id + 1u
+               : 0,
++      .function_invariant_storage =
++          loom_low_lower_alias_scope_is_entry_argument(context,
++                                                        region->alias_scope_id),
+   };
+   if (loom_symbolic_expr_is_constant(&region->begin_byte_offset) ||
+       loom_value_facts_is_workgroup_uniform(region->begin_byte_offset.facts)) {
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/wait_plan.c b/loom/src/loom/target/arch/amdgpu/planning/wait_plan.c
+--- a/loom/src/loom/target/arch/amdgpu/planning/wait_plan.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/wait_plan.c
+@@ -216,6 +216,9 @@
+   uint32_t* producer_nodes;
+   // Per-node memory counter and address-space classification.
+   loom_amdgpu_wait_frontier_node_t* frontier_nodes;
++  // Per-node LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_* bits, or NULL without source
++  // memory summaries.
++  uint8_t* cross_block_independence;
+   // Retained counter progress and completion facts for both wait frontiers.
+   loom_amdgpu_wait_completion_node_t* completion_nodes;
+   // Bounded cross-block wait state.
+@@ -1992,12 +1995,139 @@
+   return iree_ok_status();
+ }
+ 
++enum {
++  // No write anywhere in the function may alias this node's dependency reads.
++  LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_READ_INDEPENDENT = 1u << 0,
++  // No read anywhere in the function may alias this node's dependency writes.
++  LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_WRITE_INDEPENDENT = 1u << 1,
++};
++
++typedef struct loom_amdgpu_wait_plan_summary_use_t {
++  // Scheduled node carrying the effect.
++  uint32_t node_index;
++  // Source summary, or the conservative summary of the effect's space.
++  const loom_low_memory_access_summary_t* summary;
++} loom_amdgpu_wait_plan_summary_use_t;
++
++// The cross-block memory frontier tracks pending accesses per memory space
++// only, so a global load after a block that stored to another buffer would
++// drain every store. When the source memory summaries prove that no opposite
++// access anywhere in the function may alias a node's dependency accesses, no
++// path through the CFG makes that drain a dependency. Nodes whose memory
++// spaces come from traits (no descriptor effects, volatile) stay conservative
++// and keep every opposite access dependent.
++static iree_status_t loom_amdgpu_wait_plan_classify_cross_block_independence(
++    loom_amdgpu_wait_plan_builder_t* builder) {
++  const loom_low_schedule_table_t* schedule = builder->schedule;
++  if (schedule->memory_accesses == NULL || schedule->node_count == 0) {
++    return iree_ok_status();
++  }
++  uint8_t* effect_bits = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      builder->transient_arena, schedule->node_count, sizeof(*effect_bits),
++      (void**)&effect_bits));
++  memset(effect_bits, 0, schedule->node_count * sizeof(*effect_bits));
++  iree_host_size_t read_count = 0, write_count = 0;
++  for (iree_host_size_t i = 0; i < schedule->effect_use_count; ++i) {
++    const loom_low_schedule_effect_use_t* effect = &schedule->effect_uses[i];
++    if (!loom_amdgpu_wait_effect_is_dependency_memory(effect)) continue;
++    if (effect->kind == LOOM_LOW_EFFECT_KIND_READ) {
++      effect_bits[effect->node_index] |=
++          LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_READ_INDEPENDENT;
++      ++read_count;
++    } else if (effect->kind == LOOM_LOW_EFFECT_KIND_WRITE) {
++      effect_bits[effect->node_index] |=
++          LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_WRITE_INDEPENDENT;
++      ++write_count;
++    }
++  }
++  // Space flags not explained by descriptor effects are opaque accesses; only
++  // counter-backed ones can remain pending across a block edge.
++  bool opaque_read = false, opaque_write = false;
++  for (iree_host_size_t i = 0; i < schedule->node_count; ++i) {
++    const loom_amdgpu_wait_frontier_node_t* node = &builder->frontier_nodes[i];
++    const bool volatile_access =
++        schedule->nodes[i].descriptor != NULL &&
++        iree_any_bit_set(schedule->nodes[i].op->instance_flags,
++                         LOOM_MEMORY_ACCESS_FLAG_VOLATILE);
++    if (node->read_space_flags != 0 && node->read_counter_mask != 0 &&
++        (volatile_access ||
++         !iree_any_bit_set(effect_bits[i],
++                           LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_READ_INDEPENDENT))) {
++      opaque_read = true;
++    }
++    if (node->write_space_flags != 0 && node->write_counter_mask != 0 &&
++        (volatile_access ||
++         !iree_any_bit_set(
++             effect_bits[i],
++             LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_WRITE_INDEPENDENT))) {
++      opaque_write = true;
++    }
++  }
++  if (opaque_read && opaque_write) {
++    return iree_ok_status();
++  }
++  loom_amdgpu_wait_plan_summary_use_t* reads = NULL;
++  loom_amdgpu_wait_plan_summary_use_t* writes = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      builder->transient_arena, iree_max(read_count, 1), sizeof(*reads),
++      (void**)&reads));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      builder->transient_arena, iree_max(write_count, 1), sizeof(*writes),
++      (void**)&writes));
++  read_count = write_count = 0;
++  for (iree_host_size_t i = 0; i < schedule->effect_use_count; ++i) {
++    const loom_low_schedule_effect_use_t* effect = &schedule->effect_uses[i];
++    if (!loom_amdgpu_wait_effect_is_dependency_memory(effect)) continue;
++    const loom_low_memory_access_summary_t* summary =
++        loom_low_memory_access_map_lookup(schedule->memory_accesses,
++                                          schedule->nodes[effect->node_index].op,
++                                          effect->effect_ordinal);
++    if (summary == NULL) {
++      summary = loom_low_memory_access_summary_for_space(effect->memory_space);
++    }
++    const loom_amdgpu_wait_plan_summary_use_t use = {
++        .node_index = effect->node_index,
++        .summary = summary,
++    };
++    if (effect->kind == LOOM_LOW_EFFECT_KIND_READ) {
++      reads[read_count++] = use;
++    } else if (effect->kind == LOOM_LOW_EFFECT_KIND_WRITE) {
++      writes[write_count++] = use;
++    }
++  }
++  for (iree_host_size_t i = 0; i < schedule->node_count; ++i) {
++    if (opaque_write) {
++      effect_bits[i] &= ~LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_READ_INDEPENDENT;
++    }
++    if (opaque_read) {
++      effect_bits[i] &= ~LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_WRITE_INDEPENDENT;
++    }
++  }
++  for (iree_host_size_t r = 0; r < read_count; ++r) {
++    for (iree_host_size_t w = 0; w < write_count; ++w) {
++      if (loom_low_memory_access_summaries_may_alias(
++              reads[r].summary, writes[w].summary,
++              LOOM_LOW_MEMORY_COMPARISON_INDEPENDENT)) {
++        effect_bits[reads[r].node_index] &=
++            ~LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_READ_INDEPENDENT;
++        effect_bits[writes[w].node_index] &=
++            ~LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_WRITE_INDEPENDENT;
++      }
++    }
++  }
++  builder->cross_block_independence = effect_bits;
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_amdgpu_wait_plan_classify_nodes(
+     loom_amdgpu_wait_plan_builder_t* builder) {
+   loom_amdgpu_wait_plan_classify_hazards(builder);
+   loom_amdgpu_wait_plan_classify_effects(builder);
+   IREE_RETURN_IF_ERROR(
+       loom_amdgpu_wait_plan_finish_node_classification(builder));
++  IREE_RETURN_IF_ERROR(
++      loom_amdgpu_wait_plan_classify_cross_block_independence(builder));
+   IREE_RETURN_IF_ERROR(loom_amdgpu_wait_plan_allocate_producer_states(builder));
+   return loom_amdgpu_wait_plan_build_dependency_links(builder);
+ }
+@@ -3207,9 +3337,21 @@
+        frontier_node->write_space_flags == 0)) {
+     return iree_ok_status();
+   }
++  loom_amdgpu_wait_frontier_node_t query_node = *frontier_node;
++  if (builder->cross_block_independence != NULL) {
++    const uint8_t independence = builder->cross_block_independence[node_index];
++    if (iree_any_bit_set(independence,
++                         LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_READ_INDEPENDENT)) {
++      query_node.read_space_flags = 0;
++    }
++    if (iree_any_bit_set(independence,
++                         LOOM_AMDGPU_WAIT_PLAN_CROSS_BLOCK_WRITE_INDEPENDENT)) {
++      query_node.write_space_flags = 0;
++    }
++  }
+   const uint32_t counter_mask =
+       loom_amdgpu_wait_frontier_memory_dependency_mask(&builder->frontier,
+-                                                       frontier_node);
++                                                       &query_node);
+   if (counter_mask == 0) {
+     return iree_ok_status();
+   }
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/common.py b/loom/py/loom/target/arch/amdgpu/descriptors/common.py
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/common.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/common.py
+@@ -2568,11 +2568,12 @@
+ 
+ def _ds_crosslane_effects(width_bits: int) -> tuple[Effect, Effect]:
+     # DS cross-lane instructions retire through LGKM even though they do not
+-    # access LDS memory. Their SSA results must still wait on the LDS counter.
++    # access LDS memory. Their SSA results must still wait on the LDS counter,
++    # but they order against no memory access.
+     return (
+         Effect(
+             EffectKind.READ,
+-            memory_space=MemorySpace.GENERIC,
++            memory_space=MemorySpace.NONE,
+             flags=(EffectFlag.DEPENDENCY,),
+             counter_id=_COUNTER_LDS,
+             width_bits=width_bits,
