@@ -20,7 +20,7 @@ row waves work on chunk c it solves chunk c + 1 (T2 into T buffer (c + 1) % 2) a
 (GA buffer (c + 2) % 3) and A = K K^T (K fragments from the conv buffer), spread over the row waves' phases where
 its SIMD has issue slots to spare. Each role loop runs the same 3 workgroup barriers per chunk under one wave-uniform
 branch (HRX patch 0037). Per chunk, rows:
-    P1  K, Q -> LDS (Kt transposed), this chunk's v conv taps and next chunk's K, Q loads, the previous chunk's O stores
+    P1  K, Q -> LDS (Kt transposed), this chunk's v conv taps and next chunk's K, Q loads, the previous chunk's O stores (staged in LDS at the end of P5)
     P2  P = QK^T (waves 5-7, one lower tile each), KS = K S^T, O1 = Q S^T
     P5  V = the v conv of the wave's 16 channels in the accumulator layout, Y = V - 2^G KS, Vn = T2 Y,
         Vn' = 2^(G_C - G) Vn, O = 2^G O1 + P Vn, S^T <- 2^G_C S^T + K^T Vn'
@@ -41,9 +41,9 @@ V8H = "vector<8xf16>"
 V4H = "vector<4xf16>"
 # LDS regions (bytes): K|Q rows, Kt [key][tok] (key k at row k + k / 16: the transposed stores' 8 key segments
 # land on distinct banks), -A^T (f32, the solver's), P, T2 (2 buffers), gates (3 buffers), conv weights [128][4] and
-# conv ring x[-3..-1] [128][3] (f32)
-KQ, KT, AF, PP, T2, GA, CW, CS = 0, 17408, 28288, 32896, 35456, 40576, 42880, 44928
-POOL = CS + 128 * 3 * 4
+# conv ring x[-3..-1] [128][3] (f32), the row waves' O staging (per wave 2 tiles [16 tok][16 rows] f16)
+KQ, KT, AF, PP, T2, GA, CW, CS, OS = 0, 17408, 28288, 32896, 35456, 40576, 42880, 44928, 46464
+POOL = OS + 8 * 2 * 16 * 16 * 2
 assert POOL <= 65536
 
 
@@ -135,6 +135,8 @@ def gen(heads):
     e(f"  %cws = buffer.view %pool[{o}] : buffer -> view<128x4xf32>")
     o = region("cs", CS)
     e(f"  %css = buffer.view %pool[{o}] : buffer -> view<128x3xf32>")
+    o = region("os", OS)
+    e(f"  %os_v = buffer.view %pool[{o}] : buffer -> view<256x16xf16>")
     for i, nm in enumerate(("LG", "G2", "BETA", "BG", "GC", "GG")):
         e(f"  %ga{nm} = index.constant {i} : index")
 
@@ -177,6 +179,13 @@ def gen(heads):
     e("  %row0 = index.mul %sgc, %c16 : index")
     e("  %row = index.add %row0, %sub : index")         # accumulator column (S^T, U, Vn, O): value row
     e("  %orow = index.add %o_rel, %row : index")
+    # O staging: this wave's tiles in %os_v, this lane's token / row block of the b128 stores
+    e("  %os_w = index.mul %sgc, %c32 : index")
+    e("  %os_lr = index.div %lane, %c2 : index")
+    e("  %os_lp = index.rem %lane, %c2 : index")
+    e("  %os_lc = index.mul %os_lp, %c8 : index")
+    e("  %os_g0 = index.add %o_rel, %row0 : index")
+    e("  %os_gc = index.add %os_g0, %os_lc : index")
 
     # ---- initial state: S^T tile j element i = S[row][16 j + 2 i + half]; each lane loads keys 16 j + 8 half .. +7
     # (two b128) and trades the other parity with its xor-16 partner (one shuffle per tile)
@@ -292,20 +301,30 @@ def gen(heads):
         e(f"{ind}%{p}be = view.load %be_view[%{p}ab1] : view<[%ra_total]xf32> -> f32")
         return [f"%{p}al", f"%{p}be"]
 
-    def ostore(ind, t0, acc, t, p):
-        """O tile t (tokens 16 t + half + 2 i of the chunk at t0, row) -> out, f16(clamp(O 2^O16_EXP))"""
+    def ostage(ind, acc, t, p):
+        """O tile t (tokens 16 t + half + 2 i, row) -> this wave's staging tile [tok][row], f16(clamp(O 2^O16_EXP))"""
+        e(f"{ind}%{p}w = index.add %os_w, %c{16 * t} : index")
         for i in range(8):
             e(f"{ind}%{p}e{i} = vector.extract {acc}[{i}] : {V8} -> f32")
-            e(f"{ind}%{p}t{i}c = index.constant {16 * t + 2 * i} : index")
-            e(f"{ind}%{p}t{i}0 = index.add {t0}, %half : index")
-            e(f"{ind}%{p}t{i}1 = index.add %{p}t{i}0, %{p}t{i}c : index")
-            e(f"{ind}%{p}t{i}2 = index.mul %{p}t{i}1, %inner_size : index")
-            e(f"{ind}%{p}t{i} = index.add %{p}t{i}2, %orow : index")
             e(f"{ind}%{p}s{i} = scalar.mulf %{p}e{i}, %o16_sc : f32")
             e(f"{ind}%{p}l{i} = scalar.minnumf<nnan> %{p}s{i}, %o16_hi : f32")
             e(f"{ind}%{p}c{i} = scalar.maxnumf<nnan> %{p}l{i}, %o16_lo : f32")
             e(f"{ind}%{p}h{i} = scalar.fptrunc %{p}c{i} : f32 to f16")
-            e(f"{ind}view.store %{p}h{i}, %out_view[%{p}t{i}] : f16, view<[%out_total]xf16>")
+            e(f"{ind}%{p}r{i}c = index.constant {2 * i} : index")
+            e(f"{ind}%{p}r{i}0 = index.add %{p}w, %half : index")
+            e(f"{ind}%{p}r{i} = index.add %{p}r{i}0, %{p}r{i}c : index")
+            e(f"{ind}view.store %{p}h{i}, %os_v[%{p}r{i}, %sub] : f16, view<256x16xf16>")
+
+    def oflush(ind, t0, t, p):
+        """staged O tile t of the chunk at t0 -> out, one b128 per lane (token 16 t + lane / 2, rows 8 (lane % 2) .. +7)"""
+        e(f"{ind}%{p}w = index.add %os_w, %c{16 * t} : index")
+        e(f"{ind}%{p}q = index.add %{p}w, %os_lr : index")
+        e(f"{ind}%{p}v = vector.load %os_v[%{p}q, %os_lc] : view<256x16xf16> -> {V8H}")
+        e(f"{ind}%{p}gt0 = index.add {t0}, %os_lr : index")
+        e(f"{ind}%{p}gt1 = index.add %{p}gt0, %c{16 * t} : index")
+        e(f"{ind}%{p}gt2 = index.mul %{p}gt1, %inner_size : index")
+        e(f"{ind}%{p}gt = index.add %{p}gt2, %os_gc : index")
+        e(f"{ind}vector.store %{p}v, %out_view[%{p}gt] : {V8H}, view<[%out_total]xf16>")
 
     def repack(ind, src, nm):
         """f32 accumulator tile [m][n] -> f16 rhs fragment [k = m][n], in registers (value i in the low half of
@@ -508,10 +527,8 @@ def gen(heads):
         pre = fetch_rows("%c0", "f0_", "    ")
         carried = ", ".join(f"%s{j} = {st[j]} : {V8}" for j in range(8))
         carried += ", " + ", ".join(f"{nm} = {x} : {t}" for nm, x, t in zip(fnames, pre, ftypes))
-        carried += f", %opv0 = %zeros8 : {V8}, %opv1 = %zeros8 : {V8}"      # the previous chunk's O, stored next iteration
         res = ", ".join(f"%sf{j}" for j in range(8)) + ", " + ", ".join(f"%ff{i}" for i in range(len(fnames)))
-        res += ", %opf0, %opf1"
-        alltypes = ", ".join([V8] * 8 + ftypes + [V8, V8])
+        alltypes = ", ".join([V8] * 8 + ftypes)
         e(f"    {res} = scf.for %ci = [%c0 to %nchunks step %c1]({carried}) -> ({alltypes}) {{")
         I = "      "
         e(f"{I}%t0 = index.mul %ci, %c32 : index")
@@ -541,13 +558,14 @@ def gen(heads):
         e(f"{I}%cn0 = index.add %ci, %c1 : index")
         e(f"{I}%cn = index.min %cn0, %lastc : index")
         nxt = fetch_rows("%cn", "nx_", I)
-        # the previous chunk's O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores zeros
-        # to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same addresses, in order)
+        # the previous chunk's staged O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores
+        # the stale staging tiles to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same
+        # addresses, in order)
         e(f"{I}%opc0 = index.max %ci, %c1 : index")
         e(f"{I}%opc = index.sub %opc0, %c1 : index")
         e(f"{I}%opt0 = index.mul %opc, %c32 : index")
         for t in range(2):
-            ostore(I, "%opt0", f"%opv{t}", t, f"ox{t}")
+            oflush(I, "%opt0", t, f"ox{t}")
         e(f"{I}{barrier}")
         # ---- phase 2: P = QK^T (f16), its 3 lower tiles on waves 5-7 (the strictly upper one is zero: never computed,
         # its P Vn product skipped)
@@ -681,7 +699,7 @@ def gen(heads):
             bvn.append(repack(I, acc, f"bvn{tt}"))
             bvp.append(repack(I, f"%vnp{tt}", f"bvp{tt}"))
             o1s.append(f"%o18_{tt}")
-        # O = O1 + P Vn (stored next iteration)
+        # O = O1 + P Vn (staged now, stored next iteration)
         oacc = []
         for tt in range(2):
             e(f"{I}%o1f{tt} = vector.fragment<init> {o1s[tt]} shape [%m, %n] : {V8}")
@@ -691,6 +709,7 @@ def gen(heads):
                 e(f"{I}%pc{tt}{c} = vector.mma %pa{tt}{c}, {bvn[c]}, {acc} : {V16H}, {V16H}, {V8}")
                 acc = f"%pc{tt}{c}"
             oacc.append(acc)
+            ostage(I, acc, tt, f"os{tt}")
         # S^T <- 2^G_C S^T + K^T Vn'
         e(f"{I}%gtot = view.load %ga[%grGC, %c0] : view<18x32xf32> -> f32")   # 2^(G_31 - G_0)
         e(f"{I}%gg0 = view.load %ga[%grGG, %c0] : view<18x32xf32> -> f32")
@@ -707,12 +726,12 @@ def gen(heads):
                 acc = f"%kc{j}{c}"
             new.append(acc)
         e(f"{I}{barrier}")
-        e(f"{I}scf.yield {', '.join(new + nxt + oacc)} : {alltypes}")
+        e(f"{I}scf.yield {', '.join(new + nxt)} : {alltypes}")
         e("    }")
         # the last chunk's O
         e("    %oplast = index.mul %lastc, %c32 : index")
         for tt in range(2):
-            ostore("    ", "%oplast", f"%opf{tt}", tt, f"ol{tt}")
+            oflush("    ", "%oplast", tt, f"ol{tt}")
         # ---- final state: the initial load's exchange in reverse, two b128 stores per tile
         for j in range(8):
             fe = []
