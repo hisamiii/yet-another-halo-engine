@@ -1,0 +1,475 @@
+Loom: place loop-carried storage frames together. Values joined by same-storage relations (copies, slices, concats,
+edges) share a frame with fixed unit offsets; once a member is placed, free-location search prefers the location it
+predicts for the others, and a frame's first member starts at an aligned span that fits the whole frame. Loop header
+arguments with a predicted frame are assigned first at their acquisition point. Lane-decomposed accumulators (WMMA
+results sliced into a loop's block arguments) then keep one location around the backedge instead of copying every
+lane (gen_gdn_ss: row loop backedge 100 -> 33 v_mov).
+diff --git a/loom/src/loom/codegen/low/allocation/search.h b/loom/src/loom/codegen/low/allocation/search.h
+--- a/loom/src/loom/codegen/low/allocation/search.h
++++ b/loom/src/loom/codegen/low/allocation/search.h
+@@ -33,6 +33,36 @@
+ #endif
+ 
+ // Borrowed allocator facts used when probing physical storage.
++// Storage frames joined by same-storage placement relations. Each member keeps
++// a fixed unit offset inside its frame, so one placed member predicts the
++// location of every other member. Frames crossing a control-flow edge carry
++// values around loops: keeping their members at those offsets folds the
++// backedge copies together with the slices, concats and copies feeding them.
++typedef struct loom_low_allocation_frame_affinity_t {
++  // Number of entries in each by-ordinal table.
++  iree_host_size_t value_count;
++  // Frame representative by value ordinal, or UINT32_MAX without an interval.
++  uint32_t* roots;
++  // Unit offset of each member's first unit inside its frame.
++  int32_t* offsets;
++  // Circular member list by value ordinal.
++  uint32_t* next_members;
++  // Lowest member unit offset, indexed by representative.
++  int32_t* frame_begins;
++  // One past the highest member unit offset, indexed by representative.
++  int32_t* frame_ends;
++  // Nonzero for a representative whose multi-unit frame crosses an edge.
++  uint8_t* edge_frames;
++} loom_low_allocation_frame_affinity_t;
++
++// Builds frame affinities over |liveness| values. Relations whose offsets
++// contradict their frame, and edges forwarding one value to several
++// destinations, are left out.
++iree_status_t loom_low_allocation_frame_affinity_build(
++    const loom_liveness_analysis_t* liveness,
++    const loom_low_placement_table_t* placement, iree_arena_allocator_t* arena,
++    loom_low_allocation_frame_affinity_t* out_frames);
++
+ typedef struct loom_low_allocation_search_context_t {
+   // Module with the allocated function's local value domain acquired.
+   const loom_module_t* module;
+@@ -70,6 +100,8 @@
+   loom_low_allocation_scalar_packing_t scalar_packing;
+   // Optional retained scalar physical-domain preferences for this attempt.
+   const loom_low_allocation_physical_domains_t* physical_domains;
++  // Optional retained loop-carried frame affinities for this attempt.
++  const loom_low_allocation_frame_affinity_t* frame_affinity;
+ } loom_low_allocation_search_context_t;
+ 
+ // Reusable spill-search arrays owned by one interval-assignment attempt. Start
+diff --git a/loom/src/loom/codegen/low/allocation/search.c b/loom/src/loom/codegen/low/allocation/search.c
+--- a/loom/src/loom/codegen/low/allocation/search.c
++++ b/loom/src/loom/codegen/low/allocation/search.c
+@@ -92,6 +92,18 @@
+   loom_low_allocation_preference_query_t preferences;
+   // Best attainable tier before extending the current physical frontier.
+   uint32_t tier_limit;
++  // Location predicted by an already placed member of the value's frame.
++  uint32_t frame_base;
++  // Frame start alignment for a frame's first member, or zero.
++  uint32_t frame_alignment;
++  // Unit offset of the value inside its frame.
++  uint32_t frame_offset;
++  // Units spanned by the frame of a first member.
++  uint32_t frame_span;
++  // Interval of a first member, checked across its whole frame span.
++  const loom_liveness_interval_t* frame_interval;
++  // True when frame_base or frame_alignment applies.
++  bool has_frame;
+ } loom_low_allocation_search_location_query_t;
+ 
+ static loom_low_allocation_search_location_query_t
+@@ -124,12 +136,272 @@
+   return query;
+ }
+ 
++// A loop-carried frame member away from its predicted location costs a copy
++// per unit on the edge. It weighs like one unsatisfied structural relation. A
++// first member starts its frame, so the whole frame must fit at that start.
++static uint32_t loom_low_allocation_search_frame_penalty(
++    loom_low_allocation_search_context_t* context,
++    const loom_low_allocation_search_location_query_t* query,
++    const loom_low_allocation_assignment_t* candidate) {
++  if (!query->has_frame) {
++    return 0;
++  }
++  if (query->frame_alignment == 0) {
++    return candidate->location_base != query->frame_base;
++  }
++  if (candidate->location_base < query->frame_offset ||
++      (candidate->location_base - query->frame_offset) %
++              query->frame_alignment !=
++          0) {
++    return 1;
++  }
++  return loom_low_allocation_search_location_conflicts(
++      context, query->frame_interval, candidate->descriptor_reg_class_id,
++      candidate->location_kind, candidate->location_base - query->frame_offset,
++      query->frame_span, /*ignored_value_ids=*/NULL,
++      /*ignored_value_count=*/0, /*ignored_storage_lease_value_ids=*/NULL,
++      /*ignored_storage_lease_value_count=*/0,
++      LOOM_LOW_ALLOCATION_STORAGE_RELEASE_FORBIDDEN);
++}
++
+ static uint32_t loom_low_allocation_search_location_preference_penalty(
+-    const loom_low_allocation_search_context_t* context,
++    loom_low_allocation_search_context_t* context,
+     const loom_low_allocation_search_location_query_t* query,
+     const loom_low_allocation_assignment_t* candidate) {
+-  return loom_low_allocation_preference_penalty(
+-      context->descriptor_set, &query->preferences, candidate, NULL);
++  return iree_math_saturating_add_u32(
++      loom_low_allocation_preference_penalty(
++          context->descriptor_set, &query->preferences, candidate, NULL),
++      loom_low_allocation_search_frame_penalty(context, query, candidate));
++}
++
++// Predicts the value's location from its loop-carried frame: the location
++// implied by a placed member, or an aligned frame start for the first member.
++static void loom_low_allocation_search_prepare_frame(
++    const loom_low_allocation_search_context_t* context,
++    const loom_liveness_interval_t* interval,
++    const loom_low_allocation_assignment_t* candidate_template,
++    loom_low_allocation_search_location_query_t* query) {
++  const loom_low_allocation_frame_affinity_t* frames = context->frame_affinity;
++  if (frames == NULL || frames->roots == NULL) {
++    return;
++  }
++  const loom_value_ordinal_t ordinal = loom_module_value_ordinal_scratch_lookup(
++      context->module, interval->value_id);
++  if (ordinal >= frames->value_count) {
++    return;
++  }
++  const uint32_t root = frames->roots[ordinal];
++  if (root == UINT32_MAX || !frames->edge_frames[root]) {
++    return;
++  }
++  const int32_t offset = frames->offsets[ordinal];
++  // Frames are tuples, their lanes and copies; bound the walk regardless.
++  uint32_t member = frames->next_members[ordinal];
++  for (uint32_t step = 0; member != ordinal && step < 256;
++       ++step, member = frames->next_members[member]) {
++    const loom_low_allocation_assignment_t* assignment =
++        loom_low_allocation_assignment_map_assignment_for_value_ordinal(
++            context->assignment_map, member, NULL);
++    if (assignment == NULL ||
++        !loom_low_allocation_assignment_is_register_like(assignment) ||
++        assignment->location_kind != candidate_template->location_kind ||
++        assignment->descriptor_reg_class_id !=
++            candidate_template->descriptor_reg_class_id) {
++      continue;
++    }
++    const int64_t base = (int64_t)assignment->location_base -
++                         frames->offsets[member] + offset;
++    if (base < 0 || base > UINT32_MAX) {
++      return;
++    }
++    query->frame_base = (uint32_t)base;
++    query->has_frame = true;
++    return;
++  }
++  const uint32_t span =
++      (uint32_t)(frames->frame_ends[root] - frames->frame_begins[root]);
++  uint32_t alignment = 1;
++  while (alignment * 2 <= span && alignment < 8) {
++    alignment *= 2;
++  }
++  if (alignment == 1) {
++    return;
++  }
++  query->frame_alignment = alignment;
++  query->frame_offset = (uint32_t)(offset - frames->frame_begins[root]);
++  query->frame_span = span;
++  query->frame_interval = interval;
++  query->has_frame = true;
++}
++
++// Finds the representative of |node| and its unit offset relative to it.
++static uint32_t loom_low_allocation_frame_find(uint32_t* parents,
++                                               int32_t* deltas, uint32_t node,
++                                               int32_t* out_offset) {
++  int32_t offset = 0;
++  uint32_t root = node;
++  while (parents[root] != root) {
++    offset += deltas[root];
++    root = parents[root];
++  }
++  int32_t remaining = offset;
++  while (node != root && parents[node] != root) {
++    const uint32_t next = parents[node];
++    const int32_t delta = deltas[node];
++    parents[node] = root;
++    deltas[node] = remaining;
++    remaining -= delta;
++    node = next;
++  }
++  *out_offset = offset;
++  return root;
++}
++
++iree_status_t loom_low_allocation_frame_affinity_build(
++    const loom_liveness_analysis_t* liveness,
++    const loom_low_placement_table_t* placement, iree_arena_allocator_t* arena,
++    loom_low_allocation_frame_affinity_t* out_frames) {
++  *out_frames = (loom_low_allocation_frame_affinity_t){0};
++  if (placement == NULL || liveness->value_count == 0 ||
++      liveness->value_count >= UINT32_MAX) {
++    return iree_ok_status();
++  }
++  const iree_host_size_t count = liveness->value_count;
++  uint32_t* parents = NULL;
++  int32_t* deltas = NULL;
++  uint8_t* edge_members = NULL;
++  uint8_t* edge_source_counts = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(arena, count, sizeof(*parents),
++                                                 (void**)&parents));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(arena, count, sizeof(*deltas),
++                                                 (void**)&deltas));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, count, sizeof(*edge_members), (void**)&edge_members));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, count, sizeof(*edge_source_counts), (void**)&edge_source_counts));
++  for (iree_host_size_t i = 0; i < count; ++i) {
++    parents[i] = (uint32_t)i;
++  }
++  memset(deltas, 0, count * sizeof(*deltas));
++  memset(edge_members, 0, count * sizeof(*edge_members));
++  memset(edge_source_counts, 0, count * sizeof(*edge_source_counts));
++  // A value forwarded along several edges, such as a shared initial value,
++  // cannot sit at every destination's offset and predicts none of them.
++  for (iree_host_size_t i = 0; i < placement->relation_count; ++i) {
++    const loom_low_placement_relation_t* relation = &placement->relations[i];
++    if (loom_low_placement_cause_is_edge(relation->cause) &&
++        relation->source_ordinal < count &&
++        edge_source_counts[relation->source_ordinal] < 2) {
++      ++edge_source_counts[relation->source_ordinal];
++    }
++  }
++  for (iree_host_size_t i = 0; i < placement->relation_count; ++i) {
++    const loom_low_placement_relation_t* relation = &placement->relations[i];
++    if ((relation->kind != LOOM_LOW_PLACEMENT_RELATION_SAME_STORAGE &&
++         relation->kind != LOOM_LOW_PLACEMENT_RELATION_SUBRANGE &&
++         relation->kind != LOOM_LOW_PLACEMENT_RELATION_CONTIGUOUS_PART) ||
++        relation->result_ordinal >= count ||
++        relation->source_ordinal >= count ||
++        relation->result_ordinal == relation->source_ordinal) {
++      continue;
++    }
++    const bool is_edge = loom_low_placement_cause_is_edge(relation->cause);
++    if (is_edge && edge_source_counts[relation->source_ordinal] > 1) {
++      continue;
++    }
++    const loom_liveness_interval_t* result_interval =
++        loom_liveness_interval_for_value_ordinal(liveness,
++                                                 relation->result_ordinal);
++    const loom_liveness_interval_t* source_interval =
++        loom_liveness_interval_for_value_ordinal(liveness,
++                                                 relation->source_ordinal);
++    if (result_interval == NULL || source_interval == NULL ||
++        !loom_liveness_value_class_equal(result_interval->value_class,
++                                         source_interval->value_class)) {
++      continue;
++    }
++    // The result unit at result_unit_offset shares storage with the source
++    // unit at source_unit_offset.
++    const int32_t delta = (int32_t)relation->source_unit_offset -
++                          (int32_t)relation->result_unit_offset;
++    int32_t result_offset = 0;
++    int32_t source_offset = 0;
++    const uint32_t result_root = loom_low_allocation_frame_find(
++        parents, deltas, relation->result_ordinal, &result_offset);
++    const uint32_t source_root = loom_low_allocation_frame_find(
++        parents, deltas, relation->source_ordinal, &source_offset);
++    if (result_root == source_root) {
++      if (result_offset != source_offset + delta) {
++        continue;
++      }
++    } else {
++      parents[result_root] = source_root;
++      deltas[result_root] = source_offset + delta - result_offset;
++    }
++    if (is_edge) {
++      edge_members[relation->result_ordinal] = 1;
++    }
++  }
++
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, count, sizeof(*out_frames->roots), (void**)&out_frames->roots));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, count, sizeof(*out_frames->offsets),
++      (void**)&out_frames->offsets));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, count, sizeof(*out_frames->next_members),
++      (void**)&out_frames->next_members));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, count, sizeof(*out_frames->frame_begins),
++      (void**)&out_frames->frame_begins));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, count, sizeof(*out_frames->frame_ends),
++      (void**)&out_frames->frame_ends));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, count, sizeof(*out_frames->edge_frames),
++      (void**)&out_frames->edge_frames));
++  out_frames->value_count = count;
++  for (iree_host_size_t i = 0; i < count; ++i) {
++    out_frames->next_members[i] = (uint32_t)i;
++    out_frames->frame_begins[i] = INT32_MAX;
++    out_frames->frame_ends[i] = INT32_MIN;
++    out_frames->edge_frames[i] = 0;
++  }
++  for (iree_host_size_t i = 0; i < count; ++i) {
++    const loom_liveness_interval_t* interval =
++        loom_liveness_interval_for_value_ordinal(liveness,
++                                                 (loom_value_ordinal_t)i);
++    if (interval == NULL) {
++      out_frames->roots[i] = UINT32_MAX;
++      out_frames->offsets[i] = 0;
++      continue;
++    }
++    int32_t offset = 0;
++    const uint32_t root =
++        loom_low_allocation_frame_find(parents, deltas, (uint32_t)i, &offset);
++    out_frames->roots[i] = root;
++    out_frames->offsets[i] = offset;
++    out_frames->frame_begins[root] =
++        iree_min(out_frames->frame_begins[root], offset);
++    out_frames->frame_ends[root] = iree_max(
++        out_frames->frame_ends[root], offset + (int32_t)interval->unit_count);
++    if (edge_members[i]) {
++      out_frames->edge_frames[root] = 1;
++    }
++    if (root != i) {
++      const uint32_t next = out_frames->next_members[root];
++      out_frames->next_members[root] = (uint32_t)i;
++      out_frames->next_members[i] = next;
++    }
++  }
++  // Single-unit frames predict nothing beyond ordinary edge coalescing.
++  for (iree_host_size_t i = 0; i < count; ++i) {
++    if (out_frames->edge_frames[i] &&
++        out_frames->frame_ends[i] - out_frames->frame_begins[i] <= 1) {
++      out_frames->edge_frames[i] = 0;
++    }
++  }
++  return iree_ok_status();
+ }
+ 
+ static bool loom_low_allocation_search_hard_relation_conflicts(
+@@ -688,6 +960,10 @@
+           capacity.location_kind, /*location_base=*/0, interval->unit_count);
+   loom_low_allocation_search_location_query_t query =
+       loom_low_allocation_search_location_query(context, &candidate_template);
++  if (!uses_explicit_physical_registers) {
++    loom_low_allocation_search_prepare_frame(context, interval,
++                                             &candidate_template, &query);
++  }
+   // A word of known conflicts avoids repeated hash probes while preserving
+   // every constraint check for the remaining candidates. Bound projection
+   // work independently of function size; large active sets keep indexed probes.
+diff --git a/loom/src/loom/codegen/low/allocation/interval_assignment.c b/loom/src/loom/codegen/low/allocation/interval_assignment.c
+--- a/loom/src/loom/codegen/low/allocation/interval_assignment.c
++++ b/loom/src/loom/codegen/low/allocation/interval_assignment.c
+@@ -40,6 +40,8 @@
+   loom_low_allocation_scalar_packing_t scalar_packing;
+   // Full-scalar physical candidate preferences retained before assignment.
+   loom_low_allocation_physical_domains_t physical_domains;
++  // Loop-carried frame affinities for this attempt.
++  loom_low_allocation_frame_affinity_t frame_affinity;
+   // Reusable peer snapshots, private to this assignment attempt.
+   loom_low_allocation_preference_workspace_t preference_workspace;
+   // Reusable consumed-value query for the allocated function body.
+@@ -114,6 +116,7 @@
+       .spill_traffic_by_value_ordinal = state->spill_traffic_by_value_ordinal,
+       .scalar_packing = state->scalar_packing,
+       .physical_domains = &state->physical_domains,
++      .frame_affinity = &state->frame_affinity,
+   };
+ }
+ 
+@@ -734,6 +737,78 @@
+   return iree_ok_status();
+ }
+ 
++
++// Within one acquisition point, assigns loop header arguments whose frame has
++// an earlier member before the remaining values. Otherwise an unpredicted
++// argument can take the storage a predicted sibling inherits from its entry
++// value, displacing that sibling's whole frame.
++static iree_status_t loom_low_allocation_interval_assignment_order_frames(
++    loom_low_allocation_interval_assignment_state_t* state,
++    loom_low_allocation_interval_order_t* order) {
++  const loom_low_allocation_frame_affinity_t* frames = &state->frame_affinity;
++  if (frames->roots == NULL || order->interval_count < 2) {
++    return iree_ok_status();
++  }
++  const loom_low_allocation_interval_assignment_context_t* context =
++      state->context;
++  uint32_t* first_starts = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      state->scratch_arena, frames->value_count, sizeof(*first_starts),
++      (void**)&first_starts));
++  for (iree_host_size_t i = 0; i < frames->value_count; ++i) {
++    first_starts[i] = UINT32_MAX;
++  }
++  for (iree_host_size_t i = 0; i < frames->value_count; ++i) {
++    const uint32_t root = frames->roots[i];
++    if (root == UINT32_MAX) {
++      continue;
++    }
++    const loom_liveness_interval_t* interval =
++        loom_liveness_interval_for_value_ordinal(context->liveness,
++                                                 (loom_value_ordinal_t)i);
++    first_starts[root] = iree_min(first_starts[root], interval->start_point);
++  }
++  loom_low_allocation_interval_order_entry_t* scratch = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      state->scratch_arena, order->interval_count, sizeof(*scratch),
++      (void**)&scratch));
++  iree_host_size_t run_start = 0;
++  while (run_start < order->interval_count) {
++    const loom_low_allocation_interval_order_entry_t* first =
++        &order->intervals[run_start];
++    iree_host_size_t run_end = run_start + 1;
++    while (run_end < order->interval_count &&
++           order->intervals[run_end].acquisition_start_point ==
++               first->acquisition_start_point &&
++           order->intervals[run_end].topology_rank == first->topology_rank) {
++      ++run_end;
++    }
++    iree_host_size_t count = 0;
++    for (int pass = 0; pass < 2 && run_end - run_start > 1; ++pass) {
++      for (iree_host_size_t i = run_start; i < run_end; ++i) {
++        const loom_liveness_interval_t* interval = order->intervals[i].interval;
++        const loom_value_ordinal_t ordinal = loom_local_value_domain_ordinal(
++            context->value_domain, interval->value_id);
++        const uint32_t root =
++            ordinal < frames->value_count ? frames->roots[ordinal] : UINT32_MAX;
++        const bool predicted =
++            root != UINT32_MAX && frames->edge_frames[root] &&
++            first_starts[root] < interval->start_point &&
++            loom_value_is_block_arg(
++                loom_module_value(context->module, interval->value_id));
++        if (predicted == (pass == 0)) {
++          scratch[count++] = order->intervals[i];
++        }
++      }
++    }
++    if (count != 0) {
++      memcpy(&order->intervals[run_start], scratch, count * sizeof(*scratch));
++    }
++    run_start = run_end;
++  }
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_low_allocation_interval_assignment_assign(
+     loom_low_allocation_interval_assignment_state_t* state) {
+   const loom_low_allocation_interval_assignment_context_t* context =
+@@ -758,6 +833,11 @@
+       context->target->descriptor_set, context->liveness,
+       context->unit_liveness, context->placement, state->scratch_arena,
+       &state->physical_domains));
++  IREE_RETURN_IF_ERROR(loom_low_allocation_frame_affinity_build(
++      context->liveness, context->placement, state->scratch_arena,
++      &state->frame_affinity));
++  IREE_RETURN_IF_ERROR(
++      loom_low_allocation_interval_assignment_order_frames(state, &order));
+   if (context->search_strategy ==
+       LOOM_LOW_ALLOCATION_SEARCH_STRATEGY_FRAGMENTATION_REPAIR) {
+     IREE_RETURN_IF_ERROR(loom_low_allocation_scalar_packing_build(
