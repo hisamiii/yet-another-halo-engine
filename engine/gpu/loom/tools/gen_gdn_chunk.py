@@ -35,11 +35,16 @@ V4 = "vector<4xf32>"
 V16H = "vector<16xf16>"
 V8H = "vector<8xf16>"
 V4H = "vector<4xf16>"
+V2H = "vector<2xf16>"
 # LDS regions (bytes); Kr and Qr adjacent so one 64-row view serves both
 KR, QR, KT, VT, AF, PP, T1, T2, SS, GA = (0, 8704, 17408, 27648, 32768, 37888, 40448, 43008,
                                           45568, 62976)
 POOL = GA + 6 * 32 * 4          # LG, G2, BETA, BG, GC, GG
 assert POOL <= 65536
+# VCONV LDS: the block's 64 v channels' conv weights [64][4] and conv ring x[-3], x[-2], x[-1] [64][3] (f32)
+CW, CS = POOL, POOL + 64 * 4 * 4
+POOL_VCONV = CS + 64 * 3 * 4
+assert POOL_VCONV <= 65536
 LG, G2, BETA, BG, GC, GG = range(6)
 # OLATE: a chunk's O stores go into the next iteration, after its decay scan and next-chunk loads are issued. The
 # compiler drains every outstanding global store (s_waitcnt_vscnt 0) before the scan's ds_bpermute and before global
@@ -52,8 +57,14 @@ CONV16 = True
 TPRE = 2   # phase 3 column loads this many steps ahead (0: at their step); 2: -5.2% (3 hits 256 VGPRs, 4 spills)
 
 
-def gen(head_base=0, launch_heads=0, heads=None):
-    """launch_heads > 0: a head-range variant, grid (2, launch_heads) over heads head_base .. head_base + launch_heads - 1
+def gen(head_base=0, launch_heads=0, heads=None, vconv=False):
+    """vconv: the v channels' conv (silu(conv1d) of the qkv GEMM's f16 output, gen_conv_kq's ops) and alpha / beta
+    (yah_deltanet_prep_ab's ops) are computed here, bit-identical: bindings (conv, x, conv_weights, conv_state, alpha,
+    beta, ssm_a, ssm_dt, valid, state, out); conv holds only the normalized q / k (gen_conv_kq.gen(4096)), and the
+    conv ring update (prep_ab) runs after both DeltaNet parts. Lane = (channel pair, wave = 4 tokens): it loads its
+    channels' 4 tokens and the 3 before them (the ring before token 0, from LDS at chunk 0), one b64 Vt store per
+    channel.
+    launch_heads > 0: a head-range variant, grid (2, launch_heads) over heads head_base .. head_base + launch_heads - 1
     (buffers and strides stay those of all num_heads heads), so a layer can run as two dispatches.
     heads: instead of a range, workgroup row y runs head heads[y] (any set: each head's work is independent), and the
     output is compact: a token row holds the listed heads in list order (config inner_size = 128 len(heads))."""
@@ -81,7 +92,11 @@ def gen(head_base=0, launch_heads=0, heads=None):
         e("  kernel.launch.config workgroups(%c2, %launch_heads, %unit) workgroup_size(%c256, %unit, %unit) : index")
     else:
         e("  kernel.launch.config workgroups(%c2, %num_heads, %unit) workgroup_size(%c256, %unit, %unit) : index")
-    e("} launch(%conv: buffer, %kq: buffer, %ab: buffer, %state: buffer, %out: buffer) {")
+    if vconv:
+        e("} launch(%conv: buffer, %x: buffer, %cw: buffer, %cst: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, "
+          "%ssm_dt: buffer, %valid: buffer, %state: buffer, %out: buffer) {")
+    else:
+        e("} launch(%conv: buffer, %kq: buffer, %ab: buffer, %state: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 8, 16, 31, 32, 40, 48, 64, 128, 136, 16384):
         e(f"  %c{v} = index.constant {v} : index")
@@ -105,13 +120,30 @@ def gen(head_base=0, launch_heads=0, heads=None):
     e("  %ab_total = index.mul %ab_t0, %c2 : index")
     e("  %state_total = index.mul %num_heads, %c16384 : index")
     e("  %out_total = index.mul %batch, %inner_size : index")
-    e("  %cv_na, %kq_na, %ab_na, %st_na, %out_na = buffer.assume.noalias %conv, %kq, %ab, %state, %out : buffer, buffer, buffer, buffer, buffer")
-    e(f"  %conv_view = buffer.view %cv_na[%base] : buffer -> view<[%conv_total]x{'f16' if CONV16 else 'f32'}>")
-    e("  %kq_view = buffer.view %kq_na[%base] : buffer -> view<[%kq_total]xf32>")
-    e("  %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>")
+    if vconv:
+        assert CONV16
+        e("  %ra_total = index.mul %batch, %num_heads : index")
+        e("  %cw_total = index.mul %qkv_size, %c4 : index")
+        e("  %cv_na, %x_na, %cw_na, %cst_na, %al_na, %be_na, %sa_na, %sdt_na, %st_na, %out_na = buffer.assume.noalias %conv, "
+          "%x, %cw, %cst, %alpha, %beta, %ssm_a, %ssm_dt, %state, %out : buffer, buffer, buffer, buffer, buffer, buffer, "
+          "buffer, buffer, buffer, buffer")
+        e("  %conv_view = buffer.view %cv_na[%base] : buffer -> view<[%conv_total]xf16>")
+        e("  %x_view = buffer.view %x_na[%base] : buffer -> view<[%conv_total]xf16>")
+        e("  %cw_view = buffer.view %cw_na[%base] : buffer -> view<[%cw_total]xf32>")
+        e("  %cst_view = buffer.view %cst_na[%base] : buffer -> view<[%cw_total]xf32>")
+        e("  %al_view = buffer.view %al_na[%base] : buffer -> view<[%ra_total]xf32>")
+        e("  %be_view = buffer.view %be_na[%base] : buffer -> view<[%ra_total]xf32>")
+        e("  %sa_view = buffer.view %sa_na[%base] : buffer -> view<[%num_heads]xf32>")
+        e("  %sdt_view = buffer.view %sdt_na[%base] : buffer -> view<[%num_heads]xf32>")
+        e("  %valid_view = buffer.view %valid[%base] : buffer -> view<1xi32>")
+    else:
+        e("  %cv_na, %kq_na, %ab_na, %st_na, %out_na = buffer.assume.noalias %conv, %kq, %ab, %state, %out : buffer, buffer, buffer, buffer, buffer")
+        e(f"  %conv_view = buffer.view %cv_na[%base] : buffer -> view<[%conv_total]x{'f16' if CONV16 else 'f32'}>")
+        e("  %kq_view = buffer.view %kq_na[%base] : buffer -> view<[%kq_total]xf32>")
+        e("  %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>")
     e("  %state_view = buffer.view %st_na[%base] : buffer -> view<[%state_total]xf32>")
     e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%out_total]xf32>")
-    e(f"  %pool_bytes = index.constant {POOL} : offset")
+    e(f"  %pool_bytes = index.constant {POOL_VCONV if vconv else POOL} : offset")
     e("  %pool = buffer.alloca<workgroup> align(16) %pool_bytes : buffer")
 
     def region(name, off):
@@ -151,6 +183,11 @@ def gen(head_base=0, launch_heads=0, heads=None):
     e(f"  %vn_r = buffer.view %pool[{o}] : buffer -> view<32x64xf16, {l_}>")       # B[tok][row]
     o = region("ga", GA)
     e(f"  %ga = buffer.view %pool[{o}] : buffer -> view<6x32xf32>")
+    if vconv:
+        o = region("cw", CW)
+        e(f"  %cws = buffer.view %pool[{o}] : buffer -> view<64x4xf32>")
+        o = region("cs", CS)
+        e(f"  %css = buffer.view %pool[{o}] : buffer -> view<64x3xf32>")
     for i, nm in enumerate(("LG", "G2", "BETA", "BG", "GC", "GG")):
         e(f"  %ga{nm} = index.constant {i} : index")
 
@@ -223,6 +260,31 @@ def gen(head_base=0, launch_heads=0, heads=None):
         e(f"  %si{j}v = vector.from_elements {', '.join(els)} : {V8}")
         e(f"  %si{j} = vector.fragment<init> %si{j}v shape [%m, %n] : {V8}")
         st.append(f"%si{j}")
+    if vconv:
+        e("  %vc_c63 = index.constant 63 : index")
+        e("  %vc_cl = index.min %tid, %vc_c63 : index")      # channel tid of the block (clamped: lanes 64+ load lane 63's)
+        e("  %vc_ch = index.add %v_rel, %vc_cl : index")
+        e("  %vc_wa = index.mul %vc_ch, %c4 : index")
+        e(f"  %vc_w = vector.load %cw_view[%vc_wa] : view<[%cw_total]xf32> -> {V4}")
+        e(f"  %vc_s = vector.load %cst_view[%vc_wa] : view<[%cw_total]xf32> -> {V4}")
+        e("  %vc_own = index.cmp ult, %tid, %c64 : index")
+        e("  scf.if %vc_own {")
+        e(f"    vector.store %vc_w, %cws[%tid, %c0] : {V4}, view<64x4xf32>")
+        for j in (1, 2, 3):
+            e(f"    %vc_s{j} = vector.extract %vc_s[{j}] : {V4} -> f32")
+            e(f"    %vc_s{j}c = index.constant {j - 1} : index")
+            e(f"    view.store %vc_s{j}, %css[%tid, %vc_s{j}c] : f32, view<64x3xf32>")
+        e("  }")
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  %ab_dt = view.load %sdt_view[%h] : view<[%num_heads]xf32> -> f32")
+        e("  %ab_a = view.load %sa_view[%h] : view<[%num_heads]xf32> -> f32")
+        e("  %ab_vraw = view.load %valid_view[%c0] : view<1xi32> -> i32")
+        e("  %ab_vi = index.cast %ab_vraw : i32 to index")
+        e("  %ab_vlo = index.max %ab_vi, %c1 : index")
+        e("  %ab_vld = index.min %ab_vlo, %batch : index")
+        e("  %vc_t4 = index.mul %sg, %c4 : index")          # this wave's 4 tokens of the chunk
+        e("  %vc_p2 = index.mul %lane, %c2 : index")       # its lane's channel pair (of the block)
+        e("  %vc_c = index.add %v_rel, %vc_p2 : index")
     e("  %nchunks = index.div %batch, %c32 : index")
     e("  %lastc = index.sub %nchunks, %c1 : index")
     # per-thread fetch map: token lt = tid / 8; K/Q dims (tid % 8) * 16 .. +15; V rows (tid % 8) * 8 .. +7
@@ -257,6 +319,28 @@ def gen(head_base=0, launch_heads=0, heads=None):
                 else:
                     e(f"{ind}%{p}{nm}v{g} = vector.load %conv_view[%{p}{nm}a{g}] : view<[%conv_total]xf32> -> {V4}")
                 names.append(f"%{p}{nm}v{g}")
+        if vconv:
+            # tokens t0 + 4 wave + r, r = -3 .. 3 (r < 0 clamped at token 0; chunk 0's wave 0 takes the ring there)
+            e(f"{ind}%{p}vb = index.add %{p}t0, %vc_t4 : index")
+            for r in range(-3, 4):
+                if r < 0:
+                    e(f"{ind}%{p}vt{r + 3}m = index.max %{p}vb, %c{-r} : index")
+                    e(f"{ind}%{p}vt{r + 3} = index.sub %{p}vt{r + 3}m, %c{-r} : index")
+                elif r == 0:
+                    e(f"{ind}%{p}vt3 = index.add %{p}vb, %c0 : index")
+                else:
+                    e(f"{ind}%{p}vt{r + 3} = index.add %{p}vb, %c{r} : index")
+                e(f"{ind}%{p}vr{r + 3} = index.mul %{p}vt{r + 3}, %qkv_size : index")
+                e(f"{ind}%{p}vo{r + 3} = index.add %{p}vr{r + 3}, %vc_c : index")
+                e(f"{ind}%{p}vx{r + 3} = vector.load %x_view[%{p}vo{r + 3}] : view<[%conv_total]xf16> -> {V2H}")
+                names.append(f"%{p}vx{r + 3}")
+            e(f"{ind}%{p}abt = index.add %{p}t0, %lane : index")
+            e(f"{ind}%{p}ab0 = index.mul %{p}abt, %num_heads : index")
+            e(f"{ind}%{p}ab1 = index.add %{p}ab0, %h : index")
+            e(f"{ind}%{p}al = view.load %al_view[%{p}ab1] : view<[%ra_total]xf32> -> f32")
+            e(f"{ind}%{p}be = view.load %be_view[%{p}ab1] : view<[%ra_total]xf32> -> f32")
+            names += [f"%{p}al", f"%{p}be"]
+            return names
         e(f"{ind}%{p}va0 = index.add %{p}crow, %v_rel : index")
         e(f"{ind}%{p}va = index.add %{p}va0, %rseg : index")
         e(f"{ind}%{p}va4 = index.add %{p}va, %c4 : index")
@@ -290,6 +374,10 @@ def gen(head_base=0, launch_heads=0, heads=None):
     ftypes = ([] if CONV16 else ["f32", "f32"]) + [V4H if CONV16 else V4] * 10 + ["f32", "f32"]
     fnames = ([] if CONV16 else ["%inv_k", "%q_scale"]) + [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + \
         ["%vv0", "%vv1", "%alpha", "%beta"]
+    if vconv:
+        ftypes = [V4H] * 8 + [V2H] * 7 + ["f32", "f32"]
+        fnames = [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + [f"%vx{r}" for r in range(7)] + \
+            ["%al_raw", "%be_raw"]
     pre = fetch("%c0", "f0_", "  ")
     carried = ", ".join(f"%s{j} = {st[j]} : {V8}" for j in range(4))
     carried += ", " + ", ".join(f"{n} = {v} : {t}" for n, v, t in zip(fnames, pre, ftypes))
@@ -327,7 +415,50 @@ def gen(head_base=0, launch_heads=0, heads=None):
                     e(f"{I}%kt{g}{i}r = index.add %dseg, %kt{g}{i}c : index")
                     e(f"{I}view.store %kt{g}{i}e, %kt_w[%kt{g}{i}r, %lt] : f16, view<128x40xf16>")
     # V: thread (token lt, rows (tid % 8) * 8 .. +7) -> Vt[row][tok]
-    for p in range(2):
+    if vconv:
+        # gen_conv_kq.conv_steps per channel: s0 .. s3 = x[t-3] .. x[t]; x[-3], x[-2], x[-1] = ring slots 1, 2, 3
+        e(f"{I}%vc_f0 = index.add %ci, %sg : index")
+        e(f"{I}%vc_first = index.cmp eq, %vc_f0, %c0 : index")    # chunk 0, wave 0: tokens -3 .. -1 from the ring
+        e("%s%%vc_neg = scalar.constant -1.0 : f32" % I)
+        for j in range(2):
+            e(f"{I}%vc_r{j} = index.add %vc_p2, %c{j} : index")
+            e(f"{I}%vc_w{j} = vector.load %cws[%vc_r{j}, %c0] : view<64x4xf32> -> {V4}")
+            w = []
+            for k in range(4):
+                e(f"{I}%vc_w{j}_{k} = vector.extract %vc_w{j}[{k}] : {V4} -> f32")
+                w.append(f"%vc_w{j}_{k}")
+            xs = []
+            for r in range(7):
+                e(f"{I}%vc_h{j}_{r} = vector.extract %vx{r}[{j}] : {V2H} -> f16")
+                e(f"{I}%vc_e{j}_{r} = scalar.extf %vc_h{j}_{r} : f16 to f32")
+                if r < 3:
+                    e(f"{I}%vc_sc{j}_{r} = index.constant {r} : index")
+                    e(f"{I}%vc_st{j}_{r} = view.load %css[%vc_r{j}, %vc_sc{j}_{r}] : view<64x3xf32> -> f32")
+                    e(f"{I}%vc_x{j}_{r} = scf.select %vc_first, %vc_st{j}_{r}, %vc_e{j}_{r} : f32")
+                    xs.append(f"%vc_x{j}_{r}")
+                else:
+                    xs.append(f"%vc_e{j}_{r}")
+            hs = []
+            for u in range(4):
+                q = f"%vc{j}_{u}"
+                s0, s1, s2, s3 = xs[u], xs[u + 1], xs[u + 2], xs[u + 3]
+                e(f"{I}{q}d0 = scalar.mulf {s0}, {w[0]} : f32")
+                e(f"{I}{q}d1 = scalar.mulf {s1}, {w[1]} : f32")
+                e(f"{I}{q}d2 = scalar.mulf {s2}, {w[2]} : f32")
+                e(f"{I}{q}d3 = scalar.mulf {s3}, {w[3]} : f32")
+                e(f"{I}{q}sa = scalar.addf {q}d0, {q}d1 : f32")
+                e(f"{I}{q}sb = scalar.addf {q}d2, {q}d3 : f32")
+                e(f"{I}{q}dot = scalar.addf {q}sa, {q}sb : f32")
+                e(f"{I}{q}ng = scalar.mulf {q}dot, %vc_neg : f32")
+                e(f"{I}{q}ex = scalar.expf<afn> {q}ng : f32")
+                e(f"{I}{q}dn = scalar.addf %one, {q}ex : f32")
+                e(f"{I}{q}sg = scalar.divf %one, {q}dn : f32")
+                e(f"{I}{q}r = scalar.mulf {q}dot, {q}sg : f32")
+                e(f"{I}{q}h = scalar.fptrunc {q}r : f32 to f16")
+                hs.append(f"{q}h")
+            e(f"{I}%vc_o{j} = vector.from_elements {', '.join(hs)} : {V4H}")
+            e(f"{I}vector.store %vc_o{j}, %vt_w[%vc_r{j}, %vc_t4] : {V4H}, view<64x40xf16>")
+    for p in range(0 if vconv else 2):
         vh = f"%vv{p}" if CONV16 else f"%vh{p}"   # f16 input: already the f16 the fptrunc would give
         if not CONV16:
             e(f"{I}%vh{p} = vector.fptrunc %vv{p} : {V4} to {V4H}")
@@ -348,6 +479,25 @@ def gen(head_base=0, launch_heads=0, heads=None):
             e(f"{I}view.store %seh{j}{i}, %s_w[%ser{j}{i}, %sek{j}{i}] : f16, view<64x136xf16>")
     # decay: wave 0, lane = token: G2 = inclusive scan of log2 alpha (one barrier)
     e(f"{I}scf.if %isw0 {{")
+    if vconv:   # yah_deltanet_prep_ab: lane = token t0 + lane of head h; padding tokens (>= valid) get (1, 0)
+        e(f"{I}  %ab_b = scalar.addf %al_raw, %ab_dt : f32")
+        e(f"{I}  %ab_20 = scalar.constant 20.0 : f32")
+        e(f"{I}  %ab_over = scalar.cmpf ogt, %ab_b, %ab_20 : f32")
+        e(f"{I}  %ab_ex = scalar.expf<afn> %ab_b : f32")
+        e(f"{I}  %ab_op = scalar.addf %one, %ab_ex : f32")
+        e(f"{I}  %ab_lg = scalar.logf<afn> %ab_op : f32")
+        e(f"{I}  %ab_sp = scf.select %ab_over, %ab_b, %ab_lg : f32")
+        e(f"{I}  %ab_sc = scalar.mulf %ab_sp, %ab_a : f32")
+        e(f"{I}  %ab_ao = scalar.expf<afn> %ab_sc : f32")
+        e(f"{I}  %ab_neg = scalar.constant -1.0 : f32")
+        e(f"{I}  %ab_nb = scalar.mulf %be_raw, %ab_neg : f32")
+        e(f"{I}  %ab_bx = scalar.expf<afn> %ab_nb : f32")
+        e(f"{I}  %ab_dn = scalar.addf %one, %ab_bx : f32")
+        e(f"{I}  %ab_bo = scalar.divf %one, %ab_dn : f32")
+        e(f"{I}  %ab_tok = index.add %t0, %lane : index")
+        e(f"{I}  %ab_real = index.cmp ult, %ab_tok, %ab_vld : index")
+        e(f"{I}  %alpha = scf.select %ab_real, %ab_ao, %one : f32")
+        e(f"{I}  %beta = scf.select %ab_real, %ab_bo, %zero : f32")
     # alpha can underflow to 0 (exp of a large negative): log2 gives -inf, and -inf - -inf = NaN in the decay differences.
     # Clamp at 2^-100 (= no carry-over).
     e(f"{I}  %lg0 = scalar.log2f<afn> %alpha : f32")

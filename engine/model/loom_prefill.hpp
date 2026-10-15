@@ -2110,6 +2110,16 @@ class LoomPrefill {
     // dispatch.txt "convtb <tokens>": a workgroup per tokens (gen_conv_kq), else per token
     const auto ctb = geom_.find("convtb");
     const std::uint32_t conv_tb = ctb != geom_.end() ? ctb->second.tokens : 1;
+    bool dn_done = false;
+    // dnvconv: the conv ring update (prep_ab's ring lanes only; its alpha / beta lanes below qkv_size write ab_, which
+    // nothing reads). It waits for both DeltaNet parts (they read the ring), so it is queued after the pnq kernels: in
+    // the queue right after DeltaNet's second part, its wait held back pnq part a, which runs beside that part.
+    const auto ring = [&] {
+      Dispatch(Exe("prepab.hal"), "yah_deltanet_prep_ab", (kQkv + 255u) / 256u, 1, 1, 256, 1, 1,
+               {Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")), TRef(*Find(pre + "ssm_dt.bias")), Ref(*qkv_), cs,
+                Ref(*ab_), Ref(*valid_)},
+               0b1100000);
+    };
     if (conv_c.length) {
       const Geom& gg = geom_.at("convkq_g.hal");
       const Geom& gc = geom_.at("convkq_c.hal");
@@ -2121,29 +2131,50 @@ class LoomPrefill {
                 cs,
                 Ref(*conv_out_)},
                8);
+    } else if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {
+      // dispatch.txt "dnvconv <conv workgroups>": the conv takes only the q / k heads; DeltaNet computes the v channels'
+      // conv and alpha / beta itself (gen_gdn_chunk vconv), and prep_ab only advances the conv ring, after both parts
+      // (they read the ring before token 0)
+      if (!dnsplit_a_ || !dvc->second.tokens) throw LoomError("dispatch.txt dnvconv needs dnsplit and a conv grid");
+      Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", dvc->second.tokens, B_ / conv_tb, 1, 256, 1, 1,
+               {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
+      const std::vector<hrx_buffer_ref_t> in{Ref(*conv_out_), Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs,
+                                             Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")),
+                                             TRef(*Find(pre + "ssm_dt.bias")), Ref(*valid_)};
+      auto ba = in, bb = in;
+      ba.insert(ba.end(), {st, Ref(*raw_)});
+      bb.insert(bb.end(), {st, Ref(*raw2_)});
+      Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, 256, 1, 1, ba, 0b11000000000);
+      Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, 256, 1, 1, bb, 0b11000000000);
+      dn_done = true;
     } else {
       Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_ / conv_tb, 1, 256, 1, 1,
                {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
     }
-    // One lane index does two jobs: advance the conv ring past the real tokens (i < qkv_size; the next chunk and the
-    // decoder read it) and alpha / beta (i < B * heads). So the grid covers max() of the two.
-    const std::uint32_t prepab_tiles = (std::max<std::uint32_t>(B_ * kTs, kQkv) + 255u) / 256u;
-    Dispatch(Exe("prepab.hal"), "yah_deltanet_prep_ab", prepab_tiles, 1, 1, 256, 1, 1,
-             {Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")), TRef(*Find(pre + "ssm_dt.bias")), Ref(*qkv_), cs,
-              Ref(*ab_), Ref(*valid_)});
-    // DeltaNet grid: (blocks per head, heads) x 256, blocks per head from the "rowsplit.hal" row group.
-    // Split (dnsplit): heads [0, a) into raw_, then [a, kTs) into raw2_. The first part's postnorm depends only on raw_,
-    // so it runs beside the second part (whose few workgroups leave most slots free).
-    if (dnsplit_a_) {
-      Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, 256, 1, 1,
-               {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
-      Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, 256, 1, 1,
-               {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw2_)});
-    } else {
-      Dispatch(Exe("rowsplit.hal"), "yah_deltanet", dn_rowgrp_, kTs, 1, 256, 1, 1,
-               {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
+    if (!dn_done) {
+      // One lane index does two jobs: advance the conv ring past the real tokens (i < qkv_size; the next chunk and the
+      // decoder read it) and alpha / beta (i < B * heads). So the grid covers max() of the two.
+      const std::uint32_t prepab_tiles = (std::max<std::uint32_t>(B_ * kTs, kQkv) + 255u) / 256u;
+      Dispatch(Exe("prepab.hal"), "yah_deltanet_prep_ab", prepab_tiles, 1, 1, 256, 1, 1,
+               {Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")), TRef(*Find(pre + "ssm_dt.bias")), Ref(*qkv_), cs,
+                Ref(*ab_), Ref(*valid_)});
+      // DeltaNet grid: (blocks per head, heads) x 256, blocks per head from the "rowsplit.hal" row group.
+      // Split (dnsplit): heads [0, a) into raw_, then [a, kTs) into raw2_. The first part's postnorm depends only on raw_,
+      // so it runs beside the second part (whose few workgroups leave most slots free).
+      if (dnsplit_a_) {
+        Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, 256, 1, 1,
+                 {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
+        Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, 256, 1, 1,
+                 {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw2_)});
+      } else {
+        Dispatch(Exe("rowsplit.hal"), "yah_deltanet", dn_rowgrp_, kTs, 1, 256, 1, 1,
+                 {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
+      }
     }
-    if (tail_ == kNoRows) return;  // the recurrent state is written; nothing reads this layer's output
+    if (tail_ == kNoRows) {  // the recurrent state is written; nothing reads this layer's output
+      if (dn_done) ring();
+      return;
+    }
     // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
     const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
     const hrx_buffer_ref_t gate{gate_->handle, 0, std::size_t{B_} * kInner * 4};
@@ -2151,6 +2182,7 @@ class LoomPrefill {
     // pnq kernels read
     const bool pnq = a4_ && dnsplit_a_ && !out_af && geom_.count("pnq_a.hal");
     if (pnq != (geom_.count("dnperm") != 0)) throw LoomError("the A4 pnq postnorm and dnperm go together");
+    if (dn_done && !pnq) throw LoomError("dispatch.txt dnvconv needs the pnq postnorm");
     if (pnq) {
       // A4: the postnorm and ssm_out's rotq in one kernel per DeltaNet part (gen_rot.gen_pnq), each reading its part's
       // output: part a beside the second DeltaNet part
@@ -2162,6 +2194,7 @@ class LoomPrefill {
                {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b1100000);
       Dispatch(Exe("pnq_b.hal"), "yah_pnq", gb.tt, B_, 1, gb.rowgrp, 1, 1,
                {Ref(*raw2_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b1100000);
+      if (dn_done) ring();
       trim_row_ = tail_;
       RunResidual(pre + "ssm_out.weight", *scratch_, false, true);
       trim_row_ = kAllRows;

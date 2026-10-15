@@ -142,6 +142,11 @@ O16_MT = (640, 384)
 # the first DeltaNet part and runs beside the second (whose 16 workgroups fill 16 of 40 slots). Same math per head.
 DNSPLIT = (40, 8)
 
+# DNVCONV: A4 dnperm sets without a NPU qkv split: the v channels' conv and alpha / beta run inside DeltaNet
+# (gen_gdn_chunk vconv), the conv kernel takes only the q / k heads (gen_conv_kq.gen(4096)) and prep_ab only advances
+# the conv ring, after both DeltaNet parts. Bit-identical; dispatch.txt "dnvconv <conv workgroups>".
+DNVCONV = True
+
 
 def _rewrite(text, pairs):
     for a, b in pairs:
@@ -1565,7 +1570,11 @@ def main():
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
     conv_tb = conv_tb_ok(B)
-    if conv_tb:
+    dn_vconv = DNVCONV and conv_tb and a4 and DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT and not EMIT_HALF
+    if dn_vconv:
+        text = gen_conv_kq.gen(4096)
+        geom.append(("dnvconv", gen_conv_kq.tiles(4096), 0, 0))
+    elif conv_tb:
         text = gen_conv_kq.gen()
     else:
         text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
@@ -1594,7 +1603,7 @@ def main():
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
             if dn_perm:
                 assert len(gen_rot.pn_heads(tag)) == nh
-                open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag)))
+                open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv))
             else:
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
