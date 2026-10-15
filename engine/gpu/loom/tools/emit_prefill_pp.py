@@ -292,6 +292,21 @@ def rope_konly(text):
     return text[:i] + text[j + len("\n  }\n"):]
 
 
+def rope_kv16(text):
+    """yah_fused_qk_rope_batched reading f16 K / V (the GEMMs' f16 outputs, KV16): each load widened to f32"""
+    for b in ("k", "v"):
+        a = f"%{b}_view = buffer.view %{b}_na[%base] : buffer -> view<[%kv_elems]xf32>"
+        assert text.count(a) == 1
+        text = text.replace(a, a.replace("xf32>", "xf16>"))
+    loads = re.findall(r"(%\w+) = view\.load %([kv])_view\[(%\w+)\] : view<\[%kv_elems\]xf32> -> f32", text)
+    assert len(loads) >= 4, loads
+    for v, b, i in loads:
+        text = text.replace(f"{v} = view.load %{b}_view[{i}] : view<[%kv_elems]xf32> -> f32",
+                            f"{v}_x16 = view.load %{b}_view[{i}] : view<[%kv_elems]xf16> -> f16\n"
+                            f"      {v} = scalar.extf {v}_x16 : f16 to f32")
+    return text
+
+
 def qk_of(fmt):
     return next(qk for f, _, qk in E.FMT.values() if f == fmt)
 
@@ -317,6 +332,9 @@ QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (R
 # QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
 QG16 = True
 QG16_ON = False   # set by main
+# KV16 (A4): the K / V GEMMs (kstore, 1024 rows) store f16, RoPE widens them (rope_kv16). dispatch.txt "kv16in"
+KV16 = True
+KV16_ON = False   # set by main
 KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1)
 KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
 
@@ -1338,8 +1356,8 @@ def iu4_gemm(kind, mt, kb, B, outdir, hperm=None):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, out[:-4] + ".loom")
-    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, (kind == "kstore" and mt in O16_MT) or (kind == "kqg" and QG16_ON),
-                                          hperm))
+    out16 = (kind == "kstore" and (mt in O16_MT or (mt == 64 and KV16_ON))) or (kind == "kqg" and QG16_ON)
+    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, out16, hperm))
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, "mq4", kind, str(mt), str(kb),
                            str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP], capture_output=True, text=True)
     if gate.returncode != 0:
@@ -1377,7 +1395,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1401,6 +1419,7 @@ def main():
     # MQ4 (HFQ) models: A4 prefill (int4 activations, iu4 GEMMs) unless YAH_A16=1 (W4A16: f16 activations, the quality mode)
     rot = types.get("blk.0.ffn_down.weight") == 44
     a4 = rot and os.environ.get("YAH_A16") != "1"
+    KV16_ON = KV16 and a4
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
 
     n = 0
@@ -1675,7 +1694,9 @@ def main():
         geom.append(("rope_kpaged", 0, 0, 0))
     text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
     rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_live.loom")
-    open(rope_src, "w").write(rope_live(text))
+    open(rope_src, "w").write(rope_live(text) if not KV16_ON else rope_kv16(rope_live(text)))
+    if KV16_ON:
+        geom.append(("kv16in", 0, 0, 0))
     # QNORM: the attention takes the raw f32 q and does the head norm + RoPE + f16(q / 16) in its prologue (same bits);
     # RoPE does K / V only. dispatch.txt "qnorm"
     if gen_attn_fa.QNORM:
