@@ -78,6 +78,39 @@ def rope_kpaged(text):
     return text
 
 
+def rope_vtpage(text):
+    """rope_kpaged's V store into the paged V^T pool instead of the one-chunk scratch (what yah_vtpage did after it):
+    pool [kv head][pages * 16 tiles][256 dims][16 keys], token cur in tile ptab[cur / 256] * 16 + cur % 256 / 16,
+    key cur % 16. The same f16 values, so the same pool contents; dispatch.txt "vtrope"."""
+    def r(a, b):
+        nonlocal text
+        assert text.count(a) == 1, a[:60]
+        text = text.replace(a, b)
+    r("  %v16_view = buffer.view %v16_na[%base] : buffer -> view<[%cache16_elems]xf16>",
+      "  %v16_view = buffer.view %v16_na[%base] : buffer -> view<[%k16_elems]xf16>")
+    r("    %v_loop = scf.for ",
+      "    %vt_c16 = index.constant 16 : index\n"
+      "    %vt_c4096 = index.constant 4096 : index\n"
+      "    %vt_pt0 = index.mul %pg, %vt_c16 : index\n"
+      "    %vt_lt = index.div %pgo, %vt_c16 : index\n"
+      "    %vt_ptile = index.add %vt_pt0, %vt_lt : index\n"
+      "    %vt_kt = index.mul %pgnp, %vt_c16 : index\n"
+      "    %vt_a = index.mul %kv_h, %vt_kt : index\n"
+      "    %vt_b = index.add %vt_a, %vt_ptile : index\n"
+      "    %vt_b0 = index.mul %vt_b, %vt_c4096 : index\n"
+      "    %vt_key = index.rem %cur, %vt_c16 : index\n"
+      "    %vt_base = index.add %vt_b0, %vt_key : index\n"
+      "    %vt_last = index.sub %k16_elems, %c1 : index\n"
+      "    %v_loop = scf.for ")
+    r("      %v16_off = index.add %f16_off, %i4 : index\n",
+      "      %vt_o0 = index.mul %i4, %vt_c16 : index\n"
+      "      %vt_o1 = index.add %vt_base, %vt_o0 : index\n"
+      "      %v16_off = index.min %vt_o1, %vt_last : index\n")
+    r("view.store %vvh, %v16_view[%v16_off] : f16, view<[%cache16_elems]xf16>",
+      "view.store %vvh, %v16_view[%v16_off] : f16, view<[%k16_elems]xf16>")
+    return text
+
+
 def postnorm_tiled(text):
     """Rewrite yah_ssm_postnorm_fp16 to store fragment-major for an afrag ssm_out (gen_gemm_tile Tile.atiled over
     K = 6144 = 48 heads x 128): row (token, head) column c is k = head * 128 + c of that token."""
@@ -1694,7 +1727,14 @@ def main():
         geom.append(("rope_kpaged", 0, 0, 0))
     text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
     rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_live.loom")
-    open(rope_src, "w").write(rope_live(text) if not KV16_ON else rope_kv16(rope_live(text)))
+    text = rope_live(text)
+    if KV16_ON:
+        text = rope_kv16(text)
+    vtrope = paged_f16k and paged_f16v   # RoPE stores V^T into the paged pool: no yah_vtpage pass
+    if vtrope:
+        text = rope_vtpage(text)
+        geom.append(("vtrope", 0, 0, 0))
+    open(rope_src, "w").write(text)
     if KV16_ON:
         geom.append(("kv16in", 0, 0, 0))
     # QNORM: the attention takes the raw f32 q and does the head norm + RoPE + f16(q / 16) in its prologue (same bits);
@@ -1710,9 +1750,10 @@ def main():
         open(rope_src, "w").write(rope_q16(text))
         geom.append(("q16", 0, 0, 0))
     if paged_f16v:
-        vtpage_src = os.path.join(tmp, "yah_vtpage.loom")
-        open(vtpage_src, "w").write(gen_kvq.gen_vtpage())
-        vtrans_src = None    # replaced by the paged per-chunk transpose
+        if not vtrope:
+            vtpage_src = os.path.join(tmp, "yah_vtpage.loom")
+            open(vtpage_src, "w").write(gen_kvq.gen_vtpage())
+        vtrans_src = None    # replaced by the paged per-chunk transpose (yah_vtpage or RoPE's own store)
     if NCH > 1:
         # quantized KV: K quantizers run per chunk on cache slices (kmean on chunk 0 only), V quantizers per chunk (vq*_c<i>.hal)
         geom.append(("ctx", B, 0, T))     # chunk size, total context
@@ -1879,7 +1920,7 @@ def main():
           if kq8_on and kv_paged else []),
         *([(vtpage_src, "vtpage.hal" if c == 0 else "vtpage_c%d.hal" % c,
             ["yah_kvq.token_count=%d" % B, "yah_kvq.start_pos=%d" % (c * B), "yah_kvq.pool_rows=%d" % T])
-           for c in range(NCH)] if paged_f16v else []),
+           for c in range(NCH)] if paged_f16v and not vtrope else []),
         *([(vq8_src, "vq8.hal" if c == 0 else "vq8_c%d.hal" % c,
             ["yah_kvq.token_count=%d" % B, "yah_kvq.cache_capacity=%d" % T, "yah_kvq.start_pos=%d" % (c * B)])
            for c in range(NCH)] if vq8_on else []),

@@ -763,6 +763,8 @@ class LoomPrefill {
     rope_kpaged_ = geom_.count("rope_kpaged") != 0;
     qnorm_ = geom_.count("qnorm") != 0;
     qg16_ = geom_.count("qg16") != 0;
+    vtrope_ = geom_.count("vtrope") != 0;
+    if (vtrope_ && !(rope_kpaged_ && paged_f16v_)) throw LoomError("vtrope needs the paged fp16 K and V pools");
     if (paged_f16k_ && !rope_kpaged_) throw LoomError("paged fp16 K needs a rope_kpaged HAL set (re-emit)");
     pool_bytes_ = std::size_t{pages_} * 256 * kKvRow * 2;
     kpool_ = &Alloc(paged_f16k_ ? std::size_t{full_} * pool_bytes_ : 4);
@@ -1980,7 +1982,7 @@ class LoomPrefill {
                                          Ref(*kc32_),
                                          Ref(*vc32_),
                                          rope_kpaged_ ? kpool_l : hrx_buffer_ref_t{kv16_->handle, koff, kv16_layer_},
-                                         {kv16_->handle, voff, kv16_layer_},
+                                         vtrope_ ? vtpool_l : hrx_buffer_ref_t{kv16_->handle, voff, kv16_layer_},
                                          {eps_->handle, 0, 4}};
       if (rope_kpaged_) b.push_back(ptab_ref_);
       Dispatch(ChunkExe("rope", ci), "yah_fused_qk_rope_batched", qnorm_ ? kKvHeads : kHeads + kKvHeads, B_, 1, 256,
@@ -2019,7 +2021,7 @@ class LoomPrefill {
       b.push_back(Ref(*valid_));
       Dispatch(ChunkExe(attn_vq8_ ? "vq8" : "vq4", ci), attn_vq8_ ? "yah_vq8" : "yah_vq4", 4, (B_ + 15) / 16, 1, 256,
                1, 1, b);
-    } else if (paged_f16v_) {
+    } else if (paged_f16v_ && !vtrope_) {
       Dispatch(ChunkExe("vtpage", ci), "yah_vtpage", 32, (B_ + 31) / 32, 1, 256, 1, 1,
                {{kv16_->handle, voff, f16rows}, vtpool_l, ptab_ref_});
     } else if (vtrans_) {
@@ -2586,10 +2588,11 @@ class LoomPrefill {
                 Ref(*kc32_),
                 Ref(*vc32_),
                 kpool_l,
-                v16,
+                vtrope_ ? vtpool_l : v16,
                 {eps_->handle, 0, 4},
                 ptab_ref_});
-      Dispatch(HChunkExe("vtpage", c), "yah_vtpage", 32, (HB() + 31) / 32, 1, 256, 1, 1, {v16, vtpool_l, ptab_ref_});
+      if (!vtrope_)
+        Dispatch(HChunkExe("vtpage", c), "yah_vtpage", 32, (HB() + 31) / 32, 1, 256, 1, 1, {v16, vtpool_l, ptab_ref_});
       std::vector<hrx_buffer_ref_t> ab = {
           qnorm_ ? Tok(*q_, h, rq32) : Tok(*q16_, h, rq16), Tok(*gate_, h, rq32), kpool_l, vtpool_l,
           Tok(*scratch_, h, std::size_t{kAttn} * 2), Tok(*lse_, h, std::size_t{kHeads} * 4), ptab_ref_};
@@ -2660,6 +2663,7 @@ class LoomPrefill {
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only
   bool qg16_ = false;   // the kqg GEMM stores q and gate as f16 (only the GPU kqg path writes them so)
+  bool vtrope_ = false;  // RoPE stores V^T straight into the paged pool (no yah_vtpage pass)
   bool attn_kq4_ = false, attn_kq8_ = false, attn_vq4_ = false, attn_vq8_ = false, attn_vqt_ = false;
   bool paged_f16k_ = false, paged_f16v_ = false;
   std::size_t kv_cache_ = 0, kv16_layer_ = 0, vt_bytes_ = 0, ks_bytes_ = 0, kq_bytes_ = 0, vq_bytes_ = 0,
