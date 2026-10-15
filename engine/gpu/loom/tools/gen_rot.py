@@ -453,12 +453,22 @@ def _quant(e, total, span, LV):
     e(f"    view.store %dst, %dview[%di] : f32, view<{total // span}xf32>")
     e("  }")
 
-def gen_nq(K, rows, span, eps=1e-6):
+# Polls before a flag-waiting normq gives up (~0.2 s; a real wait is one producer workgroup, ~0.5 ms): a lost producer
+# flag costs one bound per row, not a hang or a ring timeout.
+FLAG_POLLS = 200_000
+FLAG_TT = 128   # tokens of a producer token tile
+
+
+def gen_nq(K, rows, span, eps=1e-6, flag=0):
     """yah_normq: gen_half_norm's RMS norm of f32 x rows fused with gen_q (the norm-fed A4 sites): the f16 norm output
     never leaves the workgroup. One row per workgroup of 16 K / 256 lanes, lane (gl, a) the rotation lane of group gl.
     The lanes load their 16 values into LDS; wave 0 runs gen_half_norm's per-lane chains (lane l: ((0 + x_l x_l) +
     x_{l+32} x_{l+32}) + ..., mulf then addf) and its subgroup reduction, so inv has the norm's bits; each lane then forms
-    f16((x inv) w) as the norm did and runs gen_q's rotation and quantization. Bindings: x, weight, awq, signs, q, d."""
+    f16((x inv) w) as the norm did and runs gen_q's rotation and quantization. Bindings: x, weight, awq, signs, q, d.
+    flag (the producer's count per token tile, gen_gemm_iu4.flag_count): binding cnt after d, i32 [2 rows / FLAG_TT];
+    the row waits until cnt[token tile] reaches flag (gen_gemm_iu4.gen flag counts the producer's finished lanes, so the
+    producer runs without a graph barrier before this kernel), then counts itself in cnt[tiles + tile]; the tile's last
+    row resets both words."""
     assert K % 256 == 0 and K % 32 == 0
     ng = K // 256
     nth = 16 * ng
@@ -473,13 +483,19 @@ def gen_nq(K, rows, span, eps=1e-6):
     e(f"  %cnth = index.constant {nth} : index")
     e(f"  %gy = index.constant {rows} : index")
     e("  kernel.launch.config workgroups(%gy, %u1, %u1) workgroup_size(%cnth, %u1, %u1) : index")
-    e("} launch(%x: buffer, %weight: buffer, %awq: buffer, %sg: buffer, %q: buffer, %d: buffer) {")
+    nt = rows // FLAG_TT
+    e("} launch(%x: buffer, %weight: buffer, %awq: buffer, %sg: buffer, %q: buffer, %d: buffer"
+      + (", %cnt: buffer" if flag else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 16, 32, 128, 256, PITCH, 16 * PITCH):
         e(f"  %c{v} = index.constant {v} : index")
     e(f"  %ck = index.constant {K} : index")
-    e("  %x_na, %weight_na, %awq_na, %sg_na, %q_na, %d_na = buffer.assume.noalias %x, %weight, %awq, %sg, %q, %d : "
-      "buffer, buffer, buffer, buffer, buffer, buffer")
+    if flag:
+        e("  %x_na, %weight_na, %awq_na, %sg_na, %q_na, %d_na, %cnt_na = buffer.assume.noalias %x, %weight, %awq, %sg, %q, "
+          "%d, %cnt : buffer, buffer, buffer, buffer, buffer, buffer, buffer")
+    else:
+        e("  %x_na, %weight_na, %awq_na, %sg_na, %q_na, %d_na = buffer.assume.noalias %x, %weight, %awq, %sg, %q, %d : "
+          "buffer, buffer, buffer, buffer, buffer, buffer")
     e(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{total}xf32>")
     e(f"  %wv = buffer.view %weight_na[%base] : buffer -> view<{K}xf32>")
     e(f"  %av = buffer.view %awq_na[%base] : buffer -> view<{K}xf32>")
@@ -495,6 +511,31 @@ def gen_nq(K, rows, span, eps=1e-6):
     e("  %iview = buffer.view %ilds[%base] : buffer -> view<4xf32>")
     e("  %lane = kernel.workitem.id<x> : index")
     e("  %row = kernel.workgroup.id<x> : index")
+    if flag:
+        FV = f"view<{2 * nt}xi32>"
+        e(f"  %fl_tt = index.constant {FLAG_TT} : index")
+        e("  %fl_tile = index.div %row, %fl_tt : index")
+        e(f"  %fl_cv = buffer.view %cnt_na[%base] : buffer -> {FV}")
+        e(f"  %fl_need = scalar.constant {flag} : i32")
+        e("  %fl_zero = scalar.constant 0 : i32")
+        e("  %fl_one = scalar.constant 1 : i32")
+        e(f"  %fl_limit = scalar.constant {FLAG_POLLS} : i32")
+        # wave 0 polls (one L2 request per round trip per row, all on the counter's line); the others wait at the barrier
+        e("  %fl_c32 = index.constant 32 : index")
+        e("  %fl_w0 = index.cmp ult, %lane, %fl_c32 : index")
+        e("  scf.if %fl_w0 {")
+        e("    %fl_n, %fl_v = scf.while(%fl_i = %fl_zero : i32, %fl_p = %fl_zero : i32) -> (i32, i32) {")
+        e(f"      %fl_x = view.atomic.load %fl_cv[%fl_tile] {{ordering = acquire, scope = device}} : {FV} -> i32")
+        e("      %fl_early = scalar.cmpi slt, %fl_x, %fl_need : i32")
+        e("      %fl_lt = scalar.cmpi ult, %fl_i, %fl_limit : i32")
+        e("      %fl_go = scalar.andi %fl_early, %fl_lt : i1")
+        e("      scf.condition %fl_go, %fl_i, %fl_x : i1, i32, i32")
+        e("    } do(%fl_j: i32, %fl_w: i32) {")
+        e("      %fl_j1 = scalar.addi %fl_j, %fl_one : i32")
+        e("      scf.yield %fl_j1, %fl_w : i32, i32")
+        e("    }")
+        e("  }")
+        e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
     e("  %gl = index.div %lane, %c16 : index")
     e("  %a = index.rem %lane, %c16 : index")
     e("  %rb = index.mul %row, %ck : index")
@@ -541,6 +582,19 @@ def gen_nq(K, rows, span, eps=1e-6):
     e("  %xf = vector.extf %xh : vector<16xf16> to vector<16xf32>")
     _core(e, K, total, True, "f16", ("q", "d"), LV)
     _quant(e, total, span, LV)
+    if flag:
+        e("  %fl_t0 = index.cmp eq, %lane, %c0 : index")
+        e("  scf.if %fl_t0 {")
+        e(f"    %fl_nt = index.constant {nt} : index")
+        e("    %fl_dc = index.add %fl_tile, %fl_nt : index")
+        e(f"    %fl_old = view.atomic.rmw<addi> %fl_one, %fl_cv[%fl_dc] {{ordering = relaxed, scope = device}} : i32, {FV} -> i32")
+        e(f"    %fl_lastn = scalar.constant {FLAG_TT - 1} : i32")
+        e("    %fl_last = scalar.cmpi eq, %fl_old, %fl_lastn : i32")
+        e("    scf.if %fl_last {")
+        e(f"      view.atomic.store %fl_zero, %fl_cv[%fl_tile] {{ordering = relaxed, scope = device}} : i32, {FV}")
+        e(f"      view.atomic.store %fl_zero, %fl_cv[%fl_dc] {{ordering = relaxed, scope = device}} : i32, {FV}")
+        e("    }")
+        e("  }")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

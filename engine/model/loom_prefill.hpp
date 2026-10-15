@@ -225,6 +225,7 @@ class LoomPrefill {
     df_k_ = 0;
     if (df_on_) DispatchDequant(0);
     RecordLayers(ci, hook);
+    FlushKres();
     graph_ = nullptr;
     if (calibrate && !gpu_.profiling()) {
       try {
@@ -606,16 +607,19 @@ class LoomPrefill {
   // The export's own workgroup size wins; sx is only the fallback for metadata without one.
   // writes: the bindings the kernel may write (bit i = binding i), for the graph's dependencies; by default all of them.
   // also_writes: ranges the dispatch stands for as written though it does not bind them (LoomGraph::Dispatch).
+  // untracked: bindings the kernel orders itself (LoomGraph::Dispatch).
   void Dispatch(const LoomExecutable& exe, const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
                 std::uint32_t sx, std::uint32_t sy, std::uint32_t sz, const std::vector<hrx_buffer_ref_t>& b,
-                std::uint64_t writes = ~std::uint64_t{0}, const std::vector<hrx_buffer_ref_t>* also_writes = nullptr) {
+                std::uint64_t writes = ~std::uint64_t{0}, const std::vector<hrx_buffer_ref_t>* also_writes = nullptr,
+                std::uint64_t untracked = 0) {
+    FlushKres();
     if (df_planning_ || npu_planning_) return;
     const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
     const hrx_dispatch_config_t config = LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz);
     if (graph_) {
       graph_->Dispatch(exe, ordinal, config, b.data(), b.size(), writes, df_after_.empty() ? nullptr : &df_after_,
-                       also_writes);
+                       also_writes, untracked);
       nodes_.push_back({{gx, gy, gz}, name, pending_tag_});
       pending_tag_ = -1;
     } else
@@ -652,6 +656,7 @@ class LoomPrefill {
     ksigns_ = &table("ksigns_iq2xxs.bin", 128);
     rot_ = geom_.count("rot") != 0;
     a4_ = geom_.count("a4") != 0;
+    nqov_ = a4_ && geom_.count("nqov") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
@@ -665,6 +670,13 @@ class LoomPrefill {
     scratch_ = &Alloc(B * kFfn * 2);
     if (rot_ && !a4_) rotbuf_ = &Alloc(B * kInner * 2);
     if (a4_) aq_ = &Alloc(B * kFfn / 2), ad_ = &Alloc(B * (kFfn / 128) * 4);
+    if (nqov_) {
+      // normqf's activation pair (swapped with aq_ / ad_ after each) and its kres's counters, zero between pairs
+      aq2_ = &Alloc(B * kFfn / 2), ad2_ = &Alloc(B * (kFfn / 128) * 4);
+      nqcnt_ = &Alloc((B + 127) / 128 * 2 * 4);
+      const std::vector<std::uint32_t> zero((B + 127) / 128 * 2, 0);
+      gpu_.H2D(*nqcnt_, zero.data(), zero.size() * 4);
+    }
     qkv_ = &Alloc(B * kQProj * 4);
     gate_ = &Alloc(B * kInner * 4);
     alpha_ = &Alloc(B * kTs * 4);
@@ -1224,7 +1236,26 @@ class LoomPrefill {
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
     DumpNorm(wname);
     if (a4_ && mode == NormOut::kRow && !bfp && geom_.count("normq_5120.hal")) {
-      // A4: the norm and its rotq in one kernel (gen_rot.gen_nq), one row per workgroup; the f16 norm output is not kept
+      // A4: the norm and its rotq in one kernel (gen_rot.gen_nq), one row per workgroup; the f16 norm output is not kept.
+      // nqov: right after its kres (deferred by RunResidual, untrimmed) as kresf + normqf with no graph edge between
+      // them: the rows wait on the kres's per-token-tile counters (nqcnt_), so they start in the GEMM's tail. normqf
+      // writes the other activation pair (the kres still reads aq_ / ad_), which becomes aq_ / ad_.
+      if (const PendingKres p = pending_kres_; p.t && p.out == hidden_) {
+        pending_kres_ = {};
+        const std::int64_t trim = std::exchange(trim_row_, p.trim);
+        const bool flagged = RunIu4("kres", *p.t, {p.in, p.out}, {std::size_t(p.t->dims[1]) * 4, std::size_t(p.t->dims[1]) * 4},
+                                    0b10000, nullptr, nqcnt_);
+        trim_row_ = trim;
+        if (flagged) {
+          Dispatch(Exe("normqf_5120.hal"), "yah_normq", B_, 1, 1, geom_.at("normq_5120.hal").rowgrp, 1, 1,
+                   {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))), Ref(*rot_signs_), Ref(*aq2_),
+                    Ref(*ad2_), Ref(*nqcnt_)},
+                   0b1110000, nullptr, 0b1000001);
+          std::swap(aq_, aq2_), std::swap(ad_, ad2_);
+          return;
+        }
+      }
+      FlushKres();
       const LoomExecutable& nq = Exe("normq_5120.hal");
       Dispatch(nq, "yah_normq", B_, 1, 1, geom_.at("normq_5120.hal").rowgrp, 1, 1,
                {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)},
@@ -1274,8 +1305,11 @@ class LoomPrefill {
   // A4 sets: the iu4 GEMM (gen_gemm_iu4) of kind on t over aq_ / ad_; io: the kind's bindings after them (outputs at
   // the bits of writes), row_bytes: their bytes per token.
   // t2: a second weight tensor bound after the activations (gu: up beside gate).
-  void RunIu4(const char* kind, const core::TensorInfo& t, std::initializer_list<const LoomBuffer*> io,
-              std::initializer_list<std::size_t> row_bytes, std::uint64_t writes, const core::TensorInfo* t2 = nullptr) {
+  // cnt (kres): the flagged kres (iu4_kresf_*: per-token-tile completion counters in cnt, an untracked binding) when the
+  // chunk is untrimmed; returns whether it ran flagged.
+  bool RunIu4(const char* kind, const core::TensorInfo& t, std::initializer_list<const LoomBuffer*> io,
+              std::initializer_list<std::size_t> row_bytes, std::uint64_t writes, const core::TensorInfo* t2 = nullptr,
+              const LoomBuffer* cnt = nullptr) {
     const std::size_t K = t.dims[0];
     const std::string hal = std::string("iu4_") + kind + "_" + std::to_string(MTiles(t)) + "_" + std::to_string(K / 256) + ".hal";
     const Geom g = GeomOf(hal);
@@ -1292,7 +1326,30 @@ class LoomPrefill {
       if (it->second.tokens == 0 || gx % it->second.tokens != 0) throw LoomError(hal + ": iu4grp does not divide the row tiles");
       gz = gx / it->second.tokens, gx = it->second.tokens;
     }
-    Dispatch(Exe(hal), (std::string("yah_iu4_gemm") + sfx).c_str(), gx, tt, gz, 32, 1, 1, b, writes);
+    const bool flagged = cnt && tt == g.tt;
+    if (flagged) b.push_back(Ref(*cnt));
+    const std::string exe = flagged ? std::string("iu4_") + kind + "f" + hal.substr(4 + std::strlen(kind)) : hal;
+    Dispatch(Exe(exe), (std::string("yah_iu4_gemm") + sfx).c_str(), gx, tt, gz, 32, 1, 1, b,
+             flagged ? writes | std::uint64_t{1} << (b.size() - 1) : writes, nullptr,
+             flagged ? std::uint64_t{1} << (b.size() - 1) : 0);
+    return flagged;
+  }
+  // A kres RunResidual deferred (nqov): RunNorm's normq takes it as the flagged pair, anything else runs it plain first.
+  // trim: trim_row_ when it was deferred (the GEMM runs as it would have then).
+  struct PendingKres {
+    const core::TensorInfo* t = nullptr;
+    const LoomBuffer* in = nullptr;
+    const LoomBuffer* out = nullptr;
+    std::int64_t trim = kAllRows;
+  };
+  PendingKres pending_kres_;
+  void FlushKres() {
+    if (!pending_kres_.t) return;
+    const PendingKres p = pending_kres_;
+    pending_kres_ = {};
+    const std::int64_t trim = std::exchange(trim_row_, p.trim);
+    RunIu4("kres", *p.t, {p.in, p.out}, {std::size_t(p.t->dims[1]) * 4, std::size_t(p.t->dims[1]) * 4}, 0b10000);
+    trim_row_ = trim;
   }
   // Debug (YAH_DUMP_ACT=<prefix>, YAH_DUMP_LAYERS=l0,l1,..): the row-major f16 output of each RMSNorm that feeds a GEMM
   // in those layers (n_ rows x 5120) to <prefix>_<norm weight name>.f16, from an extra norm.hal pass into its own buffer.
@@ -1764,7 +1821,8 @@ class LoomPrefill {
       const bool hp = geom_.count("dnperm") && wname.ends_with("attn_gate.weight");
       if (hp && !geom_.count("iu4_kstoreh_" + std::to_string(MTiles(*t)) + "_" + std::to_string(t->dims[0] / 256) + ".hal"))
         throw LoomError("dnperm sets need the kstoreh gate GEMM");
-      return RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000);
+      RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000);
+      return;
     }
     Fmt f{};
     const std::string base = GemmHal("gemm_kstore", *t, &f);
@@ -1839,7 +1897,9 @@ class LoomPrefill {
     const std::string awq = wname.substr(0, wname.size() - 6) + "awq";
     if (a4_) {
       if (!quantized) RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads);
-      RunIu4("kres", *t, {hidden_, hidden2_}, {std::size_t(t->dims[1]) * 4, std::size_t(t->dims[1]) * 4}, 0b10000);
+      // nqov: the next A4 normq takes it as the flagged pair (RunNorm); any other dispatch flushes it first
+      pending_kres_ = {t, hidden_, hidden2_, trim_row_};
+      if (!nqov_) FlushKres();
       std::swap(hidden_, hidden2_);
       return;
     }
@@ -2674,8 +2734,8 @@ class LoomPrefill {
   bool rot_ = false;
   LoomBuffer *rot_signs_ = nullptr, *rotbuf_ = nullptr;
   // A4 sets (dispatch.txt "a4"): int4 activations (B_ x kFfn / 2 bytes) and their scales (one per 128) for the iu4 GEMMs
-  bool a4_ = false;
-  LoomBuffer *aq_ = nullptr, *ad_ = nullptr;
+  bool a4_ = false, nqov_ = false;
+  LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *nqcnt_ = nullptr;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,

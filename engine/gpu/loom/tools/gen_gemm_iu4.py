@@ -47,12 +47,20 @@ def tile(M):
     return (128, 128, 4, 2) if M % 128 == 0 else (48, 128, 3, 2)
 
 
+def flag_count(M):
+    """What a flagged kres (gen flag) adds to a token tile's counter: one per lane of its M / BM row tiles."""
+    BM, _, WM, WN = tile(M)
+    return M // BM * WM * WN * 32
+
+
 def sym(kind):
     return "yah_iu4_gemm" + {"kres": "_kres", "kqg": "_kqg", "gu": "_gu"}.get(kind, "")
 
 
-def gen(kind, M, out16=False, hperm=None):
-    """out16: kstore stores f16 (gen_gemm_tile.OUT16). Kind gu: the FFN's gate and up in one GEMM, f16 silu(gate) * up
+def gen(kind, M, out16=False, hperm=None, flag=False):
+    """out16: kstore stores f16 (gen_gemm_tile.OUT16). flag (kres): binding cnt after output, each lane adds 1 to
+    cnt[token tile] once its wave's stores are visible (device scope; flag_count per token tile), so a flag-waiting
+    consumer (gen_rot.gen_nq flag) can read finished token tiles while the GEMM's last workgroups still run. Kind gu: the FFN's gate and up in one GEMM, f16 silu(gate) * up
     of M features; a workgroup stages BM / 2 gate rows and the same features' up rows (wave rows WM / 2 and up) and
     pairs them through LDS, so the gate never goes to memory.
     hperm (value heads, key heads): the output of weight rows 128 i.. (GGUF DeltaNet value head i) goes to HF head
@@ -69,6 +77,9 @@ def gen(kind, M, out16=False, hperm=None):
     s = sym(kind)
     bufs = ["weight", "aq", "ad"] + {"kstore": ["output"], "kres": ["resid", "output"], "kqg": ["output", "gate_out"],
                                      "gu": ["up", "output"]}[kind]
+    assert not flag or kind == "kres"
+    if flag:
+        bufs.append("cnt")
     WB, AB = BM * WP, BN * WP          # dwords of one staged weight / activation tile
     SB = 2 * (WB + AB + BM + BN)       # dwords: two each of the weight, activation, weight scale, activation scale tiles
     epi = NWAVE * (TM + TG.EPAD) * 16  # f32 of the epilogue slabs (alias the tiles)
@@ -478,6 +489,13 @@ def gen(kind, M, out16=False, hperm=None):
             TG.lds_epilogue(e, t, kind == "kres", V8, qg=kind == "kqg", col_fence=kind == "kres")
         finally:
             TG.OUT16 = False
+    if flag:
+        # every lane, no workgroup barrier and no thread-id test (that keeps the id live and shifts the main loop's
+        # registers: +0.9% vs +0.4%); same-address adds are cheap next to the stores
+        e("  %kf_n = index.mul %token_tiles, %c2 : index")
+        e("  %kf_cv = buffer.view %cnt_na[%base] : buffer -> view<[%kf_n]xi32>")
+        e("  %kf_one = scalar.constant 1 : i32")
+        e("  view.atomic.reduce<addi> %kf_one, %kf_cv[%wg_y] {ordering = release, scope = device} : i32, view<[%kf_n]xi32>")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

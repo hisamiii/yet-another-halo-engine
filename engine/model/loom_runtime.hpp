@@ -379,13 +379,16 @@ class LoomGraph {
   // dispatch that does, so the two can run together); not recorded as accesses.
   // also_writes: ranges recorded as written by this dispatch though it does not bind them (a wait that stands for
   // another engine's writes).
+  // untracked: bit i set if the kernel orders binding i itself (completion counters it waits on): no dependency, but
+  // the access is recorded, so later dispatches still order after it.
   size_t Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
                   const hrx_buffer_ref_t* bindings, size_t binding_count, uint64_t writes,
                   const std::vector<hrx_buffer_ref_t>* after = nullptr,
-                  const std::vector<hrx_buffer_ref_t>* also_writes = nullptr) {
+                  const std::vector<hrx_buffer_ref_t>* also_writes = nullptr, uint64_t untracked = 0) {
     std::vector<hrx_graph_node_t> deps;
     for (size_t i = 0; i < binding_count; ++i)
-      if (!read_only_.count(bindings[i].buffer)) Depend(bindings[i], (writes >> i) & 1, &deps);
+      if (!read_only_.count(bindings[i].buffer) && !((untracked >> i) & 1))
+        Depend(bindings[i], (writes >> i) & 1, &deps);
     if (after)
       for (const hrx_buffer_ref_t& r : *after)
         if (!read_only_.count(r.buffer)) Depend(r, false, &deps);

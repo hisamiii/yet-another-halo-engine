@@ -39,7 +39,9 @@ bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate
          "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4,
          # gen_gemm_tile.NPUADD: the NPU's down partials the engine binds, its flag words
          "npuc": next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("npuc=")), 0),
-         "done": 4, "ready": 4, "status": 4}
+         "done": 4, "ready": 4, "status": 4,
+         # gen_gemm_iu4 flag (NQOV): two counter words per token tile
+         "cnt": tt * 2 * 4}
 # A4 GEMMs (gen_gemm_iu4): int4 activations and their f32 scales, one per aspan values of a token
 aspan = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("aspan=")), 0)
 if aspan:

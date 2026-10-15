@@ -368,6 +368,11 @@ QG16_ON = False   # set by main
 # KV16 (A4): the K / V GEMMs (kstore, 1024 rows) store f16, RoPE widens them (rope_kv16). dispatch.txt "kv16in"
 KV16 = True
 KV16_ON = False   # set by main
+# NQOV (A4): every kres also as iu4_kresf_* (gen_gemm_iu4 flag: per-token-tile completion counters) and normq as
+# normqf_5120 (gen_rot.gen_nq flag: rows wait for their token tile), so the driver records the norm after its kres
+# with no graph barrier and the norm runs in the GEMM's tail. Same values. dispatch.txt "nqov"
+NQOV = True
+NQOV_ON = False   # set by main
 KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1)
 KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
 
@@ -1375,9 +1380,9 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     return (out, tile, rowgrp, tt)
 
 
-def iu4_gemm(kind, mt, kb, B, outdir, hperm=None):
+def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False):
     """Emit the A4 GEMM (tools/gen_gemm_iu4.py) of an MQ4 tensor; return its dispatch.txt row. hperm: a kstore whose
-    output heads go to HF order (gen_gemm_iu4.gen), as "kstoreh"."""
+    output heads go to HF order (gen_gemm_iu4.gen), as "kstoreh". flag: a kres as "kresf" (NQOV)."""
     bm, bn, _, _ = gen_gemm_iu4.tile(mt * 16)
     if kind == "gu":
         bm //= 2   # a gu workgroup stages bm rows of gate and up for bm / 2 features
@@ -1385,12 +1390,12 @@ def iu4_gemm(kind, mt, kb, B, outdir, hperm=None):
         raise SystemExit("iu4 GEMM %s: %d rows / %d tokens do not tile" % (kind, mt * 16, B))
     tt = B // bn
     sym = gen_gemm_iu4.sym(kind)
-    out = "iu4_%s_%d_%d.hal" % (kind + ("h" if hperm else ""), mt, kb)
+    out = "iu4_%s_%d_%d.hal" % (kind + ("h" if hperm else "f" if flag else ""), mt, kb)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, out[:-4] + ".loom")
     out16 = (kind == "kstore" and (mt in O16_MT or (mt == 64 and KV16_ON))) or (kind == "kqg" and QG16_ON)
-    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, out16, hperm))
+    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, out16, hperm, flag))
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, "mq4", kind, str(mt), str(kb),
                            str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP], capture_output=True, text=True)
     if gate.returncode != 0:
@@ -1428,7 +1433,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1453,6 +1458,7 @@ def main():
     rot = types.get("blk.0.ffn_down.weight") == 44
     a4 = rot and os.environ.get("YAH_A16") != "1"
     KV16_ON = KV16 and a4
+    NQOV_ON = NQOV and a4
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
 
     n = 0
@@ -1479,6 +1485,8 @@ def main():
                         geom.append(iu4_gemm(k, mt, kb, B, outdir, hp))
                         if gen_gemm_iu4.group_of(k, mt * 16):   # grouped grid: the engine launches (G, tiles, row tiles / G)
                             geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
+                        if k == "kres" and NQOV_ON and mt * 16 == 5120:
+                            iu4_gemm(k, mt, kb, B, outdir, flag=True)   # the kres's geometry (dispatch.txt row) serves both
             n += 1
             continue
         for k in kinds:
@@ -1790,6 +1798,12 @@ def main():
             rot_src["normq_5120.hal"] = os.path.join(tmp, "normq_5120.loom")
             open(rot_src["normq_5120.hal"], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP))
             geom.append(("normq_5120.hal", 0, 16 * 5120 // 256, 1))
+            if NQOV_ON:
+                assert gen_gemm_iu4.tile(5120)[1] == gen_rot.FLAG_TT
+                rot_src["normqf_5120.hal"] = os.path.join(tmp, "normqf_5120.loom")
+                open(rot_src["normqf_5120.hal"], "w").write(
+                    gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=gen_gemm_iu4.flag_count(5120)))
+                geom.append(("nqov", 0, 0, 0))
             if DNSPLIT == (40, 8):
                 # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq) per DeltaNet part (dn_perm): a beside part b, b after it
                 for part in "ab":
