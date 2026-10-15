@@ -761,6 +761,7 @@ class LoomPrefill {
     paged_f16v_ = kv_paged_ && !attn_vqt_;
     // "rope_kpaged": RoPE writes the fp16 K rows straight into the paged pool.
     rope_kpaged_ = geom_.count("rope_kpaged") != 0;
+    qnorm_ = geom_.count("qnorm") != 0;
     if (paged_f16k_ && !rope_kpaged_) throw LoomError("paged fp16 K needs a rope_kpaged HAL set (re-emit)");
     pool_bytes_ = std::size_t{pages_} * 256 * kKvRow * 2;
     kpool_ = &Alloc(paged_f16k_ ? std::size_t{full_} * pool_bytes_ : 4);
@@ -1979,7 +1980,8 @@ class LoomPrefill {
                                          {kv16_->handle, voff, kv16_layer_},
                                          {eps_->handle, 0, 4}};
       if (rope_kpaged_) b.push_back(ptab_ref_);
-      Dispatch(ChunkExe("rope", ci), "yah_fused_qk_rope_batched", 28, B_, 1, 256, 1, 1, b);
+      Dispatch(ChunkExe("rope", ci), "yah_fused_qk_rope_batched", qnorm_ ? kKvHeads : kHeads + kKvHeads, B_, 1, 256,
+               1, 1, b);
     }
     if (hook) hook(ai, ci, koff, voff);
     const std::size_t q8off = std::size_t{ai} * kq_bytes_;
@@ -2036,7 +2038,7 @@ class LoomPrefill {
       Dispatch(Exe("qrot.hal"), "yah_qrot", (B_ * 96 + 255) / 256, 1, 1, 256, 1, 1, {Ref(*q16_), Ref(*qr16_)});
     {
       std::vector<hrx_buffer_ref_t> b = {
-          Ref(qrot ? *qr16_ : *q16_),
+          Ref(qrot ? *qr16_ : qnorm_ ? *q_ : *q16_),
           Ref(*gate_),
           attn_kq8_     ? hrx_buffer_ref_t{kq8buf_->handle, q8off, kq_bytes_}
           : paged_f16k_ ? kpool_l
@@ -2051,6 +2053,10 @@ class LoomPrefill {
       if (attn_kq8_ && !kdeq_) b.push_back({ksbuf_->handle, ksoff, ks_bytes_});
       if (attn_vqt_ && !kdeq_) b.push_back({vqsbuf_->handle, vqsoff, vqs_bytes_});
       if (kv_paged_) b.push_back(ptab_ref_);
+      if (qnorm_) {
+        b.push_back(TRef(*Find(pre + "attn_q_norm.weight")));
+        b.push_back({eps_->handle, 0, 4});
+      }
       Dispatch(ChunkExe(o_af ? "wmma_t" : "wmma", ci), "yah_attn_wmma", (B_ + attn_tpw_ - 1) / attn_tpw_, kHeads / attn_hpw_, 1, 256, 1,
                1, b);
     }
@@ -2521,7 +2527,7 @@ class LoomPrefill {
                           bool k_af, bool v_af) {
     const std::string wq = pre + "attn_q.weight", wo = pre + "attn_output.weight";
     if (!HalvesOn() || hook || !kv_paged_ || !paged_f16k_ || !paged_f16v_ || !rope_kpaged_ || !kv16_scratch_ || kdeq_ ||
-        qr16_ || attn_kq8_ || attn_vqt_ || q16_ == q_ || DcolImage(wq, nullptr, true).empty())
+        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || DcolImage(wq, nullptr, true).empty())
       return false;
     norm_bfp_.clear();
     const std::uint32_t ai = l / cfg_.full_attention_interval;
@@ -2566,7 +2572,7 @@ class LoomPrefill {
       NpuUnpack("npu_unpack_q.hal", cq[h], {Tok(*q_, h, rq32), Tok(*gate_, h, rq32)}, 6, true);
       // V rows into the half's part of the layer's f16 V scratch, K rows straight into the paged pool
       const hrx_buffer_ref_t v16{kv16_->handle, kv16_layer_ + h * vrows, vrows};
-      Dispatch(HChunkExe("rope", c), "yah_fused_qk_rope_batched", 28, HB(), 1, 256, 1, 1,
+      Dispatch(HChunkExe("rope", c), "yah_fused_qk_rope_batched", qnorm_ ? kKvHeads : kHeads + kKvHeads, HB(), 1, 256, 1, 1,
                {Tok(*q_, h, rq32),
                 Tok(*kbuf_, h, rkv),
                 Tok(*vbuf_, h, rkv),
@@ -2581,10 +2587,15 @@ class LoomPrefill {
                 {eps_->handle, 0, 4},
                 ptab_ref_});
       Dispatch(HChunkExe("vtpage", c), "yah_vtpage", 32, (HB() + 31) / 32, 1, 256, 1, 1, {v16, vtpool_l, ptab_ref_});
+      std::vector<hrx_buffer_ref_t> ab = {
+          qnorm_ ? Tok(*q_, h, rq32) : Tok(*q16_, h, rq16), Tok(*gate_, h, rq32), kpool_l, vtpool_l,
+          Tok(*scratch_, h, std::size_t{kAttn} * 2), Tok(*lse_, h, std::size_t{kHeads} * 4), ptab_ref_};
+      if (qnorm_) {
+        ab.push_back(TRef(*Find(pre + "attn_q_norm.weight")));
+        ab.push_back({eps_->handle, 0, 4});
+      }
       Dispatch(HChunkExe(o_af ? "wmma_t" : "wmma", c), "yah_attn_wmma", (HB() + at.tokens - 1) / at.tokens,
-               kHeads / at.rowgrp, 1, 256, 1, 1,
-               {Tok(*q16_, h, rq16), Tok(*gate_, h, rq32), kpool_l, vtpool_l, Tok(*scratch_, h, std::size_t{kAttn} * 2),
-                Tok(*lse_, h, std::size_t{kHeads} * 4), ptab_ref_});
+               kHeads / at.rowgrp, 1, 256, 1, 1, ab);
       if (out_half) ojob[h] = OutHalf(wo, *scratch_, o_af, h, false, oc[h]);
     }
     if (out_half)
@@ -2644,6 +2655,7 @@ class LoomPrefill {
   std::vector<hrx_profile_dispatch_t> session_;   // dispatch timestamps of the open profile session
   std::vector<std::vector<Node>> session_chunks_;  // the graphs launched in it
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
+  bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only
   bool attn_kq4_ = false, attn_kq8_ = false, attn_vq4_ = false, attn_vq8_ = false, attn_vqt_ = false;
   bool paged_f16k_ = false, paged_f16v_ = false;
   std::size_t kv_cache_ = 0, kv16_layer_ = 0, vt_bytes_ = 0, ks_bytes_ = 0, kq_bytes_ = 0, vq_bytes_ = 0,

@@ -52,6 +52,13 @@ VSWZF = 0        # formulation of the swizzled dim (same values; the register al
 # = one 32-B load per fragment), no LDS Q stage: no prologue stores (4-way bank conflicts), barriers or drain store, and
 # the LDS high-water mark drops to the loop's (K, V, S). Same values (f16(q / 16), zero for rows past the chunk).
 QDIRECT = None    # None: follow Q16
+# QNORM (QDIRECT only): the query arrives raw (the f32 q projection) and the prologue does RoPE's Q work for its rows:
+# the head RMS norm (the sum of squares in yah_fused_qk_rope_batched's order: a balanced tree over the 256 dims), x inv
+# x weight, NeoX RoPE on dims < 64 (pairs p, p + 32), f16(q / 16). Lane half h takes the 16-dim fragments g = h (mod 2)
+# of its row (both 128-dim halves for the sum, its own half for the values: 16 RoPE pairs per lane half) and trades
+# subtree sums and finished fragments with its xor-16 partner. Same bits as RoPE + rope_q16; RoPE then does K / V only.
+QNORM = False
+QX_OFF = 0          # QNORM: LDS offset of the sums slot (set by gen)
 # PIPE2_EARLY: the QK of tile j+1 goes in before the softmax's rescale branch (its loads stay after it: a branch join
 # drains outstanding global loads)
 PIPE2_EARLY = False
@@ -253,6 +260,188 @@ def had64(e, pre, vecs, xors, scale):
     return out
 
 
+def qnorm_load(e, dst, view, vt, base, ks):
+    """QNORM: the 16-dim f32 runs at base + 32 k (k in ks) as V4s; all loads issued before any use"""
+    out = {}
+    for k in ks:
+        for j in range(4):
+            e(f"  %{dst}{k}_{j}a = index.add {base}, %qo{32 * k + 4 * j} : index")
+            e(f"  %{dst}{k}_{j} = vector.load {view}[%{dst}{k}_{j}a] : view<[{vt}]xf32> -> {V4}")
+        out[k] = [f"%{dst}{k}_{j}" for j in range(4)]
+    return out
+
+
+def qnorm_scalars(e, dst, vecs):
+    out = []
+    for j in range(16):
+        e(f"  %{dst}e{j} = vector.extract {vecs[j // 4]}[{j % 4}] : {V4} -> f32")
+        out.append(f"%{dst}e{j}")
+    return out
+
+
+def qnorm_tree(e, p, lvl):
+    """pairwise levels (RoPE's reduction order) -> the root"""
+    d = 0
+    while len(lvl) > 1:
+        nxt = []
+        for i in range(len(lvl) // 2):
+            e(f"  %{p}{d}_{i} = scalar.addf {lvl[2 * i]}, {lvl[2 * i + 1]} : f32")
+            nxt.append(f"%{p}{d}_{i}")
+        lvl, d = nxt, d + 1
+    return lvl[0]
+
+
+def qnorm_phase1(e):
+    """QNORM before the prologue barrier: issue this lane's own f32 dim loads; returns (own, sums), sums() emitting
+    (just before the barrier: the first K tile's loads go out under these) the sum of squares of its 128 (256 under
+    PAIR) head dims; without PAIR into the LDS slot for the other head-dim wave of the pair"""
+    nown = 8 if PAIR else 4    # own fragments per lane half (local fragment c = 2k + half)
+    e("  %qx16 = scalar.constant 16 : i32")
+    e("  %qx32 = scalar.constant 32 : i32")
+    e("  %qh16 = index.mul %half, %c16 : index")
+    e("  %qhis0 = index.cmp eq, %half, %c0 : index")
+    e("  %qnb = index.add %qdb, %qh16 : index")
+    for n in sorted({32 * k + 4 * j for k in range(nown) for j in range(4)}):
+        e(f"  %qo{n} = index.constant {n} : index")
+    vecs = qnorm_load(e, "qxv", "%q_flat", "%qtot", "%qnb", range(nown))
+    own = [[f"%qx{k}e{j}" for j in range(16)] for k in range(nown)]
+    return own, lambda: qnorm_sums(e, vecs, nown)
+
+
+def qnorm_sums(e, vecs, nown):
+    own = [qnorm_scalars(e, f"qx{k}", vecs[k]) for k in range(nown)]
+    s16 = []
+    for k in range(nown):
+        sq = []
+        for j, x in enumerate(own[k]):
+            e(f"  %qs{k}q{j} = scalar.mulf {x}, {x} : f32")
+            sq.append(f"%qs{k}q{j}")
+        s16.append(qnorm_tree(e, f"qs{k}l", sq))
+    # S32 of fragment pair (2k, 2k + 1) = mine + the xor-16 partner's (commutative: both lanes hold the same bits)
+    s32 = []
+    for i in range(0, nown, 4):
+        e(f"  %qsv{i} = vector.from_elements {', '.join(s16[i:i + 4])} : {V4}")
+        e(f"  %qsp{i}, %qspv{i} = kernel.subgroup.shuffle<xor> %qsv{i}, %qx16, %qx32 : {V4}, i32, i32")
+        for j in range(4):
+            e(f"  %qsp{i}_{j} = vector.extract %qsp{i}[{j}] : {V4} -> f32")
+            e(f"  %qs32_{i + j} = scalar.addf {s16[i + j]}, %qsp{i}_{j} : f32")
+            s32.append(f"%qs32_{i + j}")
+    root = qnorm_tree(e, "qsl", s32)
+    if not PAIR:   # slot [query block][head-dim half][row]
+        e(f"  %qxs_o = index.constant {QX_OFF} : offset")
+        e(f"  %qxs_view = buffer.view %pool[%qxs_o] : buffer -> view<{NQB * 2 * 16}xf32>")
+        e("  %qxs0 = index.mul %wqb, %c32 : index")
+        e("  %qxs1 = index.add %qxs0, %sub : index")
+        e("  %qxs_me = index.add %qxs1, %hd16q : index")
+        e(f"  view.store {root}, %qxs_view[%qxs_me] : f32, view<{NQB * 2 * 16}xf32>")
+    return root
+
+
+def qnorm_phase2(e, own, root):
+    """QNORM after the prologue barrier: the head sum, x inv x weight, RoPE, f16(q / 16), traded into %qdv{c}"""
+    nown = len(own)
+    e("  %qw_na, %qe_na = buffer.assume.noalias %qnw, %qeps : buffer, buffer")
+    e("  %qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>")
+    e("  %qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>")
+    e("  %qwb = index.add %hd128, %qh16 : index")
+    wv = qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", range(nown))
+    e("  %qeps_s = view.load %qe_flat[%c0] : view<[%c1]xf32> -> f32")
+    if PAIR:
+        total = root
+    else:   # S_lo + S_hi in either order
+        e("  %qxs_ot0 = index.sub %c16, %hd16q : index")
+        e("  %qxs_ot = index.add %qxs1, %qxs_ot0 : index")
+        e(f"  %qxs_other = view.load %qxs_view[%qxs_ot] : view<{NQB * 2 * 16}xf32> -> f32")
+        e(f"  %qstot = scalar.addf {root}, %qxs_other : f32")
+        total = "%qstot"
+    e("  %qhd256 = scalar.constant 256.0 : f32")
+    e(f"  %qmean = scalar.divf {total}, %qhd256 : f32")
+    e("  %qme = scalar.addf %qmean, %qeps_s : f32")
+    e("  %qinv = scalar.rsqrtf %qme : f32")
+    e("  %qsc16 = scalar.constant 0.0625 : f32")
+    nw = []
+    for k in range(nown):
+        w = qnorm_scalars(e, f"qw{k}", wv[k])
+        row = []
+        for j in range(16):
+            e(f"  %qn{k}_{j} = scalar.mulf {own[k][j]}, %qinv : f32")
+            e(f"  %qnw{k}_{j} = scalar.mulf %qn{k}_{j}, {w[j]} : f32")
+            row.append(f"%qnw{k}_{j}")
+        nw.append(row)
+
+    def f16frag(p, xs, ind="  "):
+        """f16(x / 16) of 16 dims -> two V8H"""
+        hs = []
+        for j in range(16):
+            e(f"{ind}%{p}s{j} = scalar.mulf {xs[j]}, %qsc16 : f32")
+            e(f"{ind}%{p}h{j} = scalar.fptrunc %{p}s{j} : f32 to f16")
+            hs.append(f"%{p}h{j}")
+        e(f"{ind}%{p}lo = vector.from_elements {', '.join(hs[:8])} : {V8H}")
+        e(f"{ind}%{p}hi = vector.from_elements {', '.join(hs[8:])} : {V8H}")
+        return f"%{p}lo", f"%{p}hi"
+
+    def rope(ind):
+        """fragments k = 0, 1 (dims p, p + 32 with p = 16 half + j) rotated, as f16 halves"""
+        e(f"{ind}%qrcur0 = index.add %start_pos, %qdq : index")
+        e(f"{ind}%qrcur1 = index.cast %qrcur0 : index to i32")
+        e(f"{ind}%qrcur = scalar.sitofp %qrcur1 : i32 to f32")
+        e(f"{ind}%qrtwo = scalar.constant 2.0 : f32")
+        e(f"{ind}%qrone = scalar.constant 1.0 : f32")
+        e(f"{ind}%qrdim = scalar.constant 64.0 : f32")
+        e(f"{ind}%qrtheta = scalar.constant 10000000.0 : f32")
+        r0, r1 = [], []
+        for j in range(16):
+            e(f"{ind}%qrp{j}c = index.constant {j} : index")
+            e(f"{ind}%qrp{j} = index.add %qh16, %qrp{j}c : index")
+            e(f"{ind}%qrpi{j} = index.cast %qrp{j} : index to i32")
+            e(f"{ind}%qrpf{j} = scalar.sitofp %qrpi{j} : i32 to f32")
+            e(f"{ind}%qr2p{j} = scalar.mulf %qrtwo, %qrpf{j} : f32")
+            e(f"{ind}%qrex{j} = scalar.divf %qr2p{j}, %qrdim : f32")
+            e(f"{ind}%qrif{j} = scalar.powf<afn> %qrtheta, %qrex{j} : f32")
+            e(f"{ind}%qriv{j} = scalar.divf %qrone, %qrif{j} : f32")
+            e(f"{ind}%qran{j} = scalar.mulf %qrcur, %qriv{j} : f32")
+            e(f"{ind}%qrc{j} = scalar.cosf<afn> %qran{j} : f32")
+            e(f"{ind}%qrs{j} = scalar.sinf<afn> %qran{j} : f32")
+            a, b = nw[0][j], nw[1][j]
+            e(f"{ind}%qra0_{j} = scalar.mulf {a}, %qrc{j} : f32")
+            e(f"{ind}%qra1_{j} = scalar.mulf {b}, %qrs{j} : f32")
+            e(f"{ind}%qrr0_{j} = scalar.subf %qra0_{j}, %qra1_{j} : f32")
+            e(f"{ind}%qrb0_{j} = scalar.mulf {a}, %qrs{j} : f32")
+            e(f"{ind}%qrb1_{j} = scalar.mulf {b}, %qrc{j} : f32")
+            e(f"{ind}%qrr1_{j} = scalar.addf %qrb0_{j}, %qrb1_{j} : f32")
+            r0.append(f"%qrr0_{j}")
+            r1.append(f"%qrr1_{j}")
+        return f16frag("qrf0", r0, ind) + f16frag("qrf1", r1, ind)
+
+    halves = [None, None] + [f16frag(f"qf{k}", nw[k]) for k in range(2, nown)]
+    if PAIR:   # one wave holds the whole head: always the rotated dims
+        h = rope("  ")
+    else:      # only the head-dim-0 wave of a pair holds dims < 64
+        e("  %qsg = kernel.subgroup.id : index")
+        e("  %qsgh = index.rem %qsg, %c2 : index")
+        e("  %qrot0 = index.cmp eq, %qsgh, %c0 : index")
+        e(f"  %qrh0, %qrh1, %qrh2, %qrh3 = scf.if %qrot0 -> ({V8H}, {V8H}, {V8H}, {V8H}) {{")
+        e(f"    scf.yield {', '.join(rope('    '))} : {V8H}, {V8H}, {V8H}, {V8H}")
+        e("  } else {")
+        pl = f16frag("qp0", nw[0], "    ") + f16frag("qp1", nw[1], "    ")
+        e(f"    scf.yield {', '.join(pl)} : {V8H}, {V8H}, {V8H}, {V8H}")
+        e("  }")
+        h = ("%qrh0", "%qrh1", "%qrh2", "%qrh3")
+    halves[0], halves[1] = h[0:2], h[2:4]
+    # trade finished fragments: local fragment 2k + b is mine when b == half, else the partner's
+    for k in range(nown):
+        theirs = []
+        for t, hv in enumerate(halves[k]):
+            e(f"  %qfb{k}_{t} = vector.bitcast {hv} : {V8H} to {V4}")
+            e(f"  %qfp{k}_{t}, %qfpv{k}_{t} = kernel.subgroup.shuffle<xor> %qfb{k}_{t}, %qx16, %qx32 : {V4}, i32, i32")
+            e(f"  %qfq{k}_{t} = vector.bitcast %qfp{k}_{t} : {V4} to {V8H}")
+            theirs.append(f"%qfq{k}_{t}")
+        e(f"  %qfm{k} = vector.concat<0> {halves[k][0]}, {halves[k][1]} : {V8H}, {V8H} -> {V16H}")
+        e(f"  %qft{k} = vector.concat<0> {theirs[0]}, {theirs[1]} : {V8H}, {V8H} -> {V16H}")
+        e(f"  %qdv{2 * k} = scf.select %qhis0, %qfm{k}, %qft{k} : {V16H}")
+        e(f"  %qdv{2 * k + 1} = scf.select %qhis0, %qft{k}, %qfm{k} : {V16H}")
+
+
 def gen():
     L = []
     e = L.append
@@ -286,7 +475,8 @@ def gen():
     e("  kernel.launch.config workgroups(%qblocks, %pairs, %c1) workgroup_size(%cnt, %c1, %c1) : index")
     e("} launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer"
       + (", %kscale: buffer" if KDEC else "")
-      + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "") + ") {")
+      + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "")
+      + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
         e(f"  %c{v} = index.constant {v} : index")
@@ -324,7 +514,7 @@ def gen():
         CAPV = "%pcap"
     e(f"  %kvtot = index.mul {CAPV}, %c1024 : index")
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
-    e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if Q16 else 'f32'}>")
+    e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if Q16 and not QNORM else 'f32'}>")
     e("  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
     # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
@@ -366,6 +556,10 @@ def gen():
         pool = KT2_A + 256
     if SOFT1:  # S partials (B's), then P^T 4 pairs x 512 B, alpha 256 B, row sums 256 B (x2 slots under SOFT3)
         pool = S_OFF + NT * 32 + (4096 + 768 if SOFT3 or SOFT4 else 2048 + 512)
+    global QX_OFF
+    if QNORM and not PAIR:   # QNORM: the head-dim halves' sums of squares, [query block][half][row] f32
+        QX_OFF = pool
+        pool += NQB * 2 * 16 * 4
     pool = max(pool, LDS_MIN)
     assert pool <= 65536
     e(f"  %pool_bytes = index.constant {pool} : offset")
@@ -463,6 +657,8 @@ def gen():
         e("  %isA = index.cmp eq, %hd, %c0 : index")
         e("  %isBs = index.cmp ne, %hd, %c0 : index")
     e("  %hd128 = index.mul %hd, %c128 : index")
+    if QNORM:
+        e("  %hd16q = index.mul %hd, %c16 : index")
     e("  %hd64 = index.mul %hd, %c64 : index")
     if SOFT1:   # only A reads the partner's (B's) partial
         e(f"  %pt0 = index.add %tid, %c{128 if SOFT1_MAP == 'mod' else 32} : index")
@@ -571,6 +767,7 @@ def gen():
     e("  %r_live = index.cmp ult, %r_lq, %B : index")
     e("  %r_head = index.add %head0, %wqh : index")
     qdirect = Q16 if QDIRECT is None else QDIRECT
+    qnorm_before = qnorm_after = None
     if qdirect:
         assert Q16 and (not K4 or QROT)
         e("  %qdq = index.min %r_lq, %B_1 : index")
@@ -579,19 +776,29 @@ def gen():
         e("  %qdb0 = index.add %qdrow, %qdh : index")
         e("  %qdb = index.add %qdb0, %hd128 : index")
         e(f"  %zq16x = vector.concat<0> %zh8, %zh8 : {V8H}, {V8H} -> {V16H}")
-        for c in range(16 if PAIR else 8):
-            e(f"  %qdc{c} = index.constant {16 * c} : index")
-            e(f"  %qda{c} = index.add %qdb, %qdc{c} : index")
-            e(f"  %qdv{c} = vector.load %q_flat[%qda{c}] : view<[%qtot]xf16> -> {V16H}")
-            e(f"  %qdz{c} = scf.select %r_live, %qdv{c}, %zq16x : {V16H}")
-            if PAIR:   # one 128-register bank: Q bits in wave A, zero O in wave B
-                bk = "vector<8xi32>" if PAIR_I32 else V8
-                e(f"  %qbits{c} = vector.bitcast %qdz{c} : {V16H} to {bk}")
-                if c == 0:
-                    e(f"  %bzero = vector.bitcast %zeros8 : {V8} to {bk}")
-                e(f"  %rinit{c} = scf.select %isA, %qbits{c}, %bzero : {bk}")
-            else:
-                e(f"  %qf{c} = vector.fragment<rhs> %qdz{c} shape [%k, %n] : {V16H}")
+        def qfrags():
+            for c in range(16 if PAIR else 8):
+                if not QNORM:
+                    e(f"  %qdc{c} = index.constant {16 * c} : index")
+                    e(f"  %qda{c} = index.add %qdb, %qdc{c} : index")
+                    e(f"  %qdv{c} = vector.load %q_flat[%qda{c}] : view<[%qtot]xf16> -> {V16H}")
+                e(f"  %qdz{c} = scf.select %r_live, %qdv{c}, %zq16x : {V16H}")
+                if PAIR:   # one 128-register bank: Q bits in wave A, zero O in wave B
+                    bk = "vector<8xi32>" if PAIR_I32 else V8
+                    e(f"  %qbits{c} = vector.bitcast %qdz{c} : {V16H} to {bk}")
+                    if c == 0:
+                        e(f"  %bzero = vector.bitcast %zeros8 : {V8} to {bk}")
+                    e(f"  %rinit{c} = scf.select %isA, %qbits{c}, %bzero : {bk}")
+                else:
+                    e(f"  %qf{c} = vector.fragment<rhs> %qdz{c} shape [%k, %n] : {V16H}")
+        if QNORM:   # sums before the prologue barrier (the pair's LDS slot), the fragments after it
+            assert not K4
+            qn_own, qn_sums = qnorm_phase1(e)
+            qn_root = []
+            qnorm_before = lambda: qn_root.append(qn_sums())
+            qnorm_after = lambda: (qnorm_phase2(e, qn_own, qn_root[0]), qfrags())
+        else:
+            qfrags()
     else:
         # ---- Q stage: row r = rb*16 + rr
         e("  %qr = index.div %tid, %c4 : index")
@@ -1022,7 +1229,11 @@ def gen():
         e("    %pzai = index.add %tid, %c64 : index")
         e("    view.store %one, %al_view[%pzai] : f32, view<128xf32>")
         e("  }")
+    if qnorm_before:
+        qnorm_before()
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    if qnorm_after:
+        qnorm_after()
     if PIPE2:
         e(f"  %k2_o = index.constant {K2_OFF} : offset")
         e(f"  %k_view2 = buffer.view %pool[%k2_o] : buffer -> view<{KT}x{KT_PITCH}xf16>")

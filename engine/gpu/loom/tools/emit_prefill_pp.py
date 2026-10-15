@@ -275,6 +275,23 @@ def rope_q16(text):
     return text
 
 
+def rope_konly(text):
+    """yah_fused_qk_rope_batched for K / V only (gen_attn_fa QNORM: the attention normalizes and rotates its own Q):
+    grid (num_kv_heads, batch), workgroup x = KV head."""
+    a = "  %blocks = index.add %num_heads, %num_kv_heads : index\n  kernel.launch.config workgroups(%blocks,"
+    assert text.count(a) == 1
+    text = text.replace(a, "  kernel.launch.config workgroups(%num_kv_heads,")
+    a = "  %block = kernel.workgroup.id<x> : index\n"
+    assert text.count(a) == 1
+    text = text.replace(a, "  %block0 = kernel.workgroup.id<x> : index\n  %block = index.add %block0, %num_heads : index\n")
+    a = "  %is_q = index.cmp ult, %block, %num_heads : index\n"
+    assert text.count(a) == 1
+    text = text.replace(a, "")
+    i = text.index("  scf.if %is_q {\n")
+    j = text.index("\n  }\n  %kv_h_raw = ", i)
+    return text[:i] + text[j + len("\n  }\n"):]
+
+
 def qk_of(fmt):
     return next(qk for f, _, qk in E.FMT.values() if f == fmt)
 
@@ -296,6 +313,7 @@ OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (1
 # 3 workgroups per WGP, one barrier pair / reduction / rescale vote per 32 keys; -0.8% at 16K, -1.8% at 32K, -3..-5.6% at
 # 88K..126K vs the 4-workgroup kernel / the deep twin (standalone); not bit-identical (the running max moves per 32 keys).
 KT2_FROM = int(os.environ.get("YAH_KT2_FROM", "16384"))
+QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
 KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1)
 KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
 
@@ -1494,6 +1512,7 @@ def main():
             open(alt(name), "w").write(A.gen())
             for k in keys:
                 setattr(A, k, saved[k])
+    gen_attn_fa.QNORM = QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False   # (see RoPE below)
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
@@ -1649,7 +1668,14 @@ def main():
     text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
     rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_live.loom")
     open(rope_src, "w").write(rope_live(text))
-    if gen_attn_fa.Q16:   # RoPE hands the attention f16(q / 16) (not with K4: its H256 rotates the f32 Q)
+    # QNORM: the attention takes the raw f32 q and does the head norm + RoPE + f16(q / 16) in its prologue (same bits);
+    # RoPE does K / V only. dispatch.txt "qnorm"
+    if gen_attn_fa.QNORM:
+        text = open(rope_src).read()
+        rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_konly.loom")
+        open(rope_src, "w").write(rope_konly(text))
+        geom.append(("qnorm", 0, 0, 0))
+    elif gen_attn_fa.Q16:   # RoPE hands the attention f16(q / 16) (not with K4: its H256 rotates the f32 Q)
         text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_q16.loom")
         open(rope_src, "w").write(rope_q16(text))
