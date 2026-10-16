@@ -761,6 +761,7 @@ class LoomPrefill {
     if (const auto fp = geom_.find("fpsparse"); fp != geom_.end())
       fps_on_ = true, fps_first_ = fp->second.tokens, fps_ext_ = fp->second.rowgrp, fps_ls_ = fp->second.tt;
     if (fps_on_ && !geom_.count("fpskv4")) throw LoomError("fpsparse set without fpskv4 (re-emit the set)");
+    fps_ord_ = fps_on_ && geom_.count("fpord");   // the attention's launch order (yah_fpord) after the lists in sel
     const std::uint32_t ptab_n = pages_ + fps_ext_;
     ptab_ = &Alloc(std::size_t{kv_paged_ ? ptab_n : 1} * 4);
     if (kv_paged_) {
@@ -824,7 +825,7 @@ class LoomPrefill {
       fps_mean_bytes_ = std::size_t{fps_blocks_} * kKvRow * 2;
       kfm_ = &Alloc(std::size_t{full_} * fps_mean_bytes_);
       vfm_ = &Alloc(std::size_t{full_} * fps_mean_bytes_);
-      fsel_ = &Alloc(std::size_t{B_ / 16} * 4 * fps_ls_ * 4);
+      fsel_ = &Alloc(std::size_t{B_ / 16} * 4 * (fps_ls_ + (fps_ord_ ? 1 : 0)) * 4);
     }
   }
 
@@ -2206,6 +2207,7 @@ class LoomPrefill {
       if (!qrot) throw LoomError("fpsparse needs the rotated Q (qrot) on its chunks");
       Dispatch(ChunkExe("fpsel", ci), "yah_fpsel", B_ / 16, kKvHeads, 1, 256, 1, 1,
                {Ref(*qr16_), kfm_l, Ref(*valid_), Ref(answer_ ? *valid_ : *noans_), Ref(*fsel_)});
+      if (fps_ord_) Dispatch(Exe("fpord.hal"), "yah_fpord", 1, 1, 1, 256, 1, 1, {Ref(*fsel_)});
       if (std::getenv("YAH_FPS_STATS")) FpsStats(ai, ci);
     }
     {
@@ -2901,7 +2903,7 @@ class LoomPrefill {
   std::uint32_t qrot_first_ = 0;  // first chunk whose attention reads yah_qrot's rotated Q (dispatch.txt "qrot")
   // fpsparse (gen_fpsparse): from chunk fps_first_ on; fps_ext_ pooled-row pages; fps_ls_ list dwords per (query block,
   // KV head); per attention layer the block means [fps_blocks_][1024] f16 (kfm_ K, vfm_ V)
-  bool fps_on_ = false;
+  bool fps_on_ = false, fps_ord_ = false;
   std::uint32_t fps_first_ = 0, fps_ext_ = 0, fps_ls_ = 0, fps_blocks_ = 0;
   std::size_t fps_mean_bytes_ = 0, deq_bytes_ = 0;
   LoomBuffer *kfm_ = nullptr, *vfm_ = nullptr, *fsel_ = nullptr;

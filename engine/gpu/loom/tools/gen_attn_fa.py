@@ -183,6 +183,7 @@ KT2_MIRROR = False  # KT2: odd workgroups rotate the role map (softmax VALU spre
 FPSPARSE = False
 FPS_LS = 0
 FPS_TPAD = 0
+FPS_ORD = False     # FPSPARSE: the launch order from yah_fpord (after the lists in sel): longest list first
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
 DOWHILE_MAIN = False   # the same for the head_dim-split loop (measured neutral)
 # SOFT1..4 (measured, not adopted, docs/results.md): keep the head_dim split and run the softmax in wave A only, P^T and
@@ -728,11 +729,27 @@ def gen():
         e("  %qb0 = index.div %kvr, %pkv : index")
         e("  %hp0 = index.mul %kvh_m, %pkv : index")
         e("  %hp = index.add %hp0, %pig_m : index")
+    elif FPSPARSE and FPS_ORD:   # list g = ord[wgl] (yah_fpord): query block g / 4, KV head g % 4
+        ng = MAX_TOKENS // 16 * 4
+        e(f"  %fpoo = index.constant {FPS_LS * ng} : index")
+        e(f"  %fpot = index.constant {FPS_LS * ng + ng} : index")
+        e(f"  %fpon1 = index.constant {ng - 1} : index")
+        e("  %fpov = buffer.view %sel[%base] : buffer -> view<[%fpot]xi32>")
+        e("  %fpow = index.min %wgl, %fpon1 : index")
+        e("  %fpoa = index.add %fpoo, %fpow : index")
+        e("  %fpog0 = view.load %fpov[%fpoa] : view<[%fpot]xi32> -> i32")
+        e("  %fpog1 = index.cast %fpog0 : i32 to index")
+        e("  %fpog2 = index.min %fpog1, %fpon1 : index")
+        e(f"  %fpog = index.assume %fpog2 [range(%fpog2, 0, {ng - 1})] : index")
+        e("  %hp = index.rem %fpog, %npairs : index")
+        e("  %qb = index.div %fpog, %npairs : index")
     else:
         e("  %hp = index.rem %wgl, %npairs : index")
         e("  %qb0 = index.div %wgl, %npairs : index")
     e("  %nqb1 = index.sub %nqb, %c1 : index")
-    if QB_ZIGZAG:   # launch order long, short, long, ... (the short blocks' Q / gate / O traffic spread over the run)
+    if FPSPARSE and FPS_ORD and not KVMAJOR:
+        pass
+    elif QB_ZIGZAG:   # launch order long, short, long, ... (the short blocks' Q / gate / O traffic spread over the run)
         e("  %qzh = index.div %qb0, %c2 : index")
         e("  %qzo = index.rem %qb0, %c2 : index")
         e("  %qzl = index.sub %nqb1, %qzh : index")

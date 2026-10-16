@@ -370,6 +370,7 @@ KT2_FROM = int(os.environ.get("YAH_KT2_FROM", "16384"))
 # dispatch.txt "fpsparse <first chunk> <extension pages> <list stride>"
 FPS_FROM = int(os.environ.get("YAH_FPS_FROM", "0"))
 FPS_ALPHA = float(os.environ.get("YAH_FPS_ALPHA", str(gen_fpsparse.ALPHA)))
+FPS_ORD = os.environ.get("YAH_FPS_ORD", "1") != "0"   # yah_fpord launch order (longest tile list first); 0: by query block
 QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
 # QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
 QG16 = True
@@ -1629,7 +1630,7 @@ def main():
     def write_attn(path):
         A = gen_attn_fa
         keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
-                                   + tuple(KT2_SHAPE_FLAGS) + ("FPSPARSE", "FPS_LS", "FPS_TPAD", "K4", "KDEC", "VQ4", "QROT")))
+                                   + tuple(KT2_SHAPE_FLAGS) + ("FPSPARSE", "FPS_LS", "FPS_TPAD", "FPS_ORD", "K4", "KDEC", "VQ4", "QROT")))
         saved = {k: getattr(A, k) for k in keys}
         twins = [(path, MAIN_FLAGS, None), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI), None)]
         if not A.KDEC:   # the KT2 twin (fp16 sources only)
@@ -1637,7 +1638,7 @@ def main():
                                           **(KT2_SHAPE_FLAGS if kt2_cfg == KT2_SHAPE else {})), kt2_shape))
             if fps_on and path in fps_paths:   # the block-sparse KT2 twin (the kvdeq sources), on the kv4 pools directly
                 twins.append((fps(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI, **KT2_SHAPE_FLAGS, FPSPARSE=True,
-                                              FPS_LS=fps_ls, FPS_TPAD=T, K4=True, KDEC=True, VQ4=True, QROT=True),
+                                              FPS_LS=fps_ls, FPS_TPAD=T, FPS_ORD=FPS_ORD, K4=True, KDEC=True, VQ4=True, QROT=True),
                               kt2_shape))
         for name, flags, shape in twins:
             for k, v in flags.items():
@@ -1708,6 +1709,7 @@ def main():
     fpcopyk_src = os.path.join(tmp, "yah_fpcopyk.loom")
     fpcopyv_src = os.path.join(tmp, "yah_fpcopyv.loom")
     fpsel_src = os.path.join(tmp, "yah_fpsel.loom")
+    fpord_src = os.path.join(tmp, "yah_fpord.loom")
     kdeqf_src = os.path.join(tmp, "yah_kdeq4_first.loom")
     vdeqf_src = os.path.join(tmp, "yah_vdeq4_first.loom")
     if fps_on:
@@ -1723,6 +1725,9 @@ def main():
         open(vdeqf_src, "w").write(gen_attn_fa.gen_vdeq(4, first=True))
         geom.append(("fpsparse", FPS_FROM // B, fps_ext, fps_ls))
         geom.append(("fpskv4", 0, 0, 0))
+        if FPS_ORD:   # the attention launches the tile lists longest first (yah_fpord after yah_fpsel; "fpord")
+            open(fpord_src, "w").write(gen_fpsparse.gen_fpord(T, B))
+            geom.append(("fpord", 0, 0, 0))
     geom.append(("wmma.hal", a_qt, a_hpw, (B + a_qt - 1) // a_qt))
     # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md).
     # K: int8 (yah_kq8) or H256 + asymmetric int4 (yah_kq4) after yah_kmean centres it; the attention decodes it to f16.
@@ -2061,6 +2066,7 @@ def main():
                 for src, stem, sym in ((fpcopyk_src, "fpcopyk", "yah_fpcopyk"), (fpcopyv_src, "fpcopyv", "yah_fpcopyv"))],
               *([(fpsel_src, "fpsel", ["yah_fpsel.start_pos=%d" % (c * B), "yah_fpsel.tpad=%d" % T])]
                 if c * B >= FPS_FROM else []))],
+        *([(fpord_src, "fpord.hal", ["yah_fpord.ls=%d" % fps_ls])] if fps_on and FPS_ORD else []),
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
           if vtrans_src else []),
