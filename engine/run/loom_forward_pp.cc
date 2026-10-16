@@ -13,6 +13,7 @@
 //                       YAH_ROWSTATS_STRIDE (8) or a position list in YAH_ROWSTATS_POS
 //   YAH_SLOT_SAVE=<file> [YAH_SLOT_AT=C]  save the sequence state before chunk C (default: after the last)
 //   YAH_SLOT_LOAD=<file> restore a slot and run from the chunk it covers (marginal prefill at depth)
+//   YAH_CHUNK_MS=1       print each chunk's wall time (synchronizes after every chunk)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -165,6 +166,8 @@ int main(int argc, char** argv) {
     gpu.Synchronize();
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
+    const bool chunk_ms = std::getenv("YAH_CHUNK_MS") != nullptr;
+    auto tc = t0;
     for (std::uint32_t ci = ci0; ci < n_chunks; ++ci) {
       if (slot_save && ci == slot_at) pf.SaveState(slot_save, ci);
       pf.Embed(ids.data() + std::size_t{ci} * B, ci + 1 == n_chunks ? last_n : B);
@@ -191,6 +194,13 @@ int main(int argc, char** argv) {
             WriteRowStats(rowstats, host.data() + i * kVocab, pos, nxt, idx);
           }
         }
+      }
+      if (chunk_ms) {   // per-chunk wall time (synchronizes: the next chunk's recording no longer overlaps this one)
+        gpu.Synchronize();
+        const auto tn = std::chrono::steady_clock::now();
+        std::printf("chunk=%u start=%u ms=%.1f\n", ci, ci * B, std::chrono::duration<double, std::milli>(tn - tc).count());
+        std::fflush(stdout);
+        tc = tn;
       }
     }
     gpu.Synchronize();
