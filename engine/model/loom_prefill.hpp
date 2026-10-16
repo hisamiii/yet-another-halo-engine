@@ -203,7 +203,8 @@ class LoomPrefill {
     if (flags_) gpu_.Fill(*flags_, 0);   // the chunk's completion counters (FlagSlot), in stream order before its work
     // The layers go into one graph, so kernels with no data between them (the input projections of a layer, the DeltaNet
     // gate projection and the conv / DeltaNet chain) can run at the same time.
-    if (DumpOn()) {   // YAH_DUMP_ACT: no graph, so RunNorm can synchronize and read its output back
+    // YAH_DUMP_ACT / YAH_FPS_STATS / YAH_FPS_DUMP: no graph, so the hooks can synchronize and read outputs back
+    if (DumpOn() || std::getenv("YAH_FPS_STATS") || std::getenv("YAH_FPS_DUMP")) {
       if (!df_planned_) PlanDecodeFree(ci);
       nodes_.clear();
       df_on_ = false;
@@ -511,7 +512,9 @@ class LoomPrefill {
   // Paged sets keep the whole sequence state in these (the f16 K/V buffer is per-chunk scratch there).
   [[nodiscard]] std::vector<const LoomBuffer*> StateBuffers() const {
     if (!kv_paged_ || !kv16_scratch_) throw LoomError("prefill: slots need the paged KV layout (the default set)");
-    return {ptab_, kq8buf_, ksbuf_, kmbuf_, vqbuf_, vqsbuf_, kpool_, vtpool_, conv_state_, state_};
+    std::vector<const LoomBuffer*> v = {ptab_, kq8buf_, ksbuf_, kmbuf_, vqbuf_, vqsbuf_, kpool_, vtpool_, conv_state_, state_};
+    if (fps_on_) v.insert(v.end(), {kfm_, vfm_});   // the block means (a slot of an fpsparse set)
+    return v;
   }
   struct Fmt {
     const char* name;
@@ -748,16 +751,21 @@ class LoomPrefill {
     // "kv_paged": 256-token pages, one page table per sequence (logical -> physical page, shared by all layers).
     kv_paged_ = geom_.count("kv_paged") != 0;
     pages_ = (T_ + 255) / 256;
-    ptab_ = &Alloc(std::size_t{kv_paged_ ? pages_ : 1} * 4);
+    // "fpsparse <first chunk> <pages> <list stride>" (gen_fpsparse): block-sparse attention from that chunk on. The f16
+    // pools gain <pages> pages of pooled rows (block j = key pages_ * 256 + j), mapped to themselves by the page table.
+    if (const auto fp = geom_.find("fpsparse"); fp != geom_.end())
+      fps_on_ = true, fps_first_ = fp->second.tokens, fps_ext_ = fp->second.rowgrp, fps_ls_ = fp->second.tt;
+    const std::uint32_t ptab_n = pages_ + fps_ext_;
+    ptab_ = &Alloc(std::size_t{kv_paged_ ? ptab_n : 1} * 4);
     if (kv_paged_) {
-      std::vector<std::int32_t> pages(pages_);
-      for (std::uint32_t i = 0; i < pages_; ++i) pages[i] = static_cast<std::int32_t>(i);
+      std::vector<std::int32_t> pages(ptab_n);
+      for (std::uint32_t i = 0; i < ptab_n; ++i) pages[i] = static_cast<std::int32_t>(i);
       // Attention does not clamp page table entries: validate them here.
       for (std::int32_t pg : pages)
-        if (pg < 0 || pg >= static_cast<std::int32_t>(pages_)) throw LoomError("page table entry out of range");
+        if (pg < 0 || pg >= static_cast<std::int32_t>(ptab_n)) throw LoomError("page table entry out of range");
       gpu_.H2D(*ptab_, pages.data(), pages.size() * 4);
     }
-    ptab_ref_ = {ptab_->handle, 0, std::size_t{kv_paged_ ? pages_ : 1} * 4};
+    ptab_ref_ = {ptab_->handle, 0, std::size_t{kv_paged_ ? ptab_n : 1} * 4};
     // Unpaged set with a "vtrans.hal" row: attention reads V as [kv head][16-key tile][dim][16] f16.
     vtrans_ = !kv_paged_ && geom_.count("vtrans.hal");
     vt_bytes_ = std::size_t{(T_ + 15) / 16 * 16} * kKvRow * 2;
@@ -796,8 +804,17 @@ class LoomPrefill {
     // layer to layer) and the attention runs the fp16 kernel on it, as llama.cpp's prefill flash attention does
     if (geom_.count("kvdeq")) {
       if (!attn_kq8_ || !attn_vqt_ || !kv_paged_) throw LoomError("dispatch.txt kvdeq needs the paged kv4 pools");
-      kdeq_ = &Alloc(pool_bytes_);
-      vdeq_ = &Alloc(pool_bytes_);
+      deq_bytes_ = std::size_t{pages_ + fps_ext_} * 256 * kKvRow * 2;
+      kdeq_ = &Alloc(deq_bytes_);
+      vdeq_ = &Alloc(deq_bytes_);
+    }
+    if (fps_on_) {
+      if (!kdeq_ || B_ % 128 || !qr16_) throw LoomError("fpsparse needs a kv4 kvdeq set with 128-token blocks");
+      fps_blocks_ = pages_ * 2;
+      fps_mean_bytes_ = std::size_t{fps_blocks_} * kKvRow * 2;
+      kfm_ = &Alloc(std::size_t{full_} * fps_mean_bytes_);
+      vfm_ = &Alloc(std::size_t{full_} * fps_mean_bytes_);
+      fsel_ = &Alloc(std::size_t{B_ / 16} * 4 * fps_ls_ * 4);
     }
   }
 
@@ -2160,9 +2177,24 @@ class LoomPrefill {
       Dispatch(ChunkExe(vd, ci), attn_kq4_ ? "yah_vdeq4" : "yah_vdeq8", 4 * ((rows + 15) / 16), 1, 1, 256, 1, 1,
                {{vqbuf_->handle, vqoff, vq_bytes_}, {vqsbuf_->handle, vqsoff, vqs_bytes_}, ptab_ref_, Ref(*vdeq_)});
     }
+    const hrx_buffer_ref_t kfm_l{fps_on_ ? kfm_->handle : nullptr, std::size_t{ai} * fps_mean_bytes_, fps_mean_bytes_};
+    const hrx_buffer_ref_t vfm_l{fps_on_ ? vfm_->handle : nullptr, std::size_t{ai} * fps_mean_bytes_, fps_mean_bytes_};
+    if (fps_on_) {  // block means of this chunk (and the previous one: the last layer skips non-final chunks), the pooled rows
+      const std::uint32_t bpc = B_ / 128, first = (ci ? ci - 1 : 0) * bpc, nend = (ci + 1) * bpc;
+      const std::vector<hrx_buffer_ref_t> b = {Ref(*kdeq_), Ref(*vdeq_), ptab_ref_, kfm_l, vfm_l};
+      Dispatch(ChunkExe("fpmean", ci), "yah_fpmean", nend - first, 1, 1, 256, 1, 1, b);
+      Dispatch(ChunkExe("fpcopy", ci), "yah_fpcopy", nend, 1, 1, 256, 1, 1, b);
+    }
     const bool qrot = qr16_ && ci >= qrot_first_;
     if (qrot)
       Dispatch(Exe("qrot.hal"), "yah_qrot", (B_ * 96 + 255) / 256, 1, 1, 256, 1, 1, {Ref(*q16_), Ref(*qr16_)});
+    const bool fps = fps_on_ && ci >= fps_first_;
+    if (fps) {  // the tile lists, from the rotated Q the attention reads
+      if (!qrot) throw LoomError("fpsparse needs the rotated Q (qrot) on its chunks");
+      Dispatch(ChunkExe("fpsel", ci), "yah_fpsel", B_ / 16, kKvHeads, 1, 256, 1, 1,
+               {Ref(*qr16_), kfm_l, Ref(*valid_), Ref(*fsel_)});
+      if (std::getenv("YAH_FPS_STATS")) FpsStats(ai, ci);
+    }
     {
       std::vector<hrx_buffer_ref_t> b = {
           Ref(qrot ? *qr16_ : qnorm_ ? *q_ : *q16_),
@@ -2184,15 +2216,70 @@ class LoomPrefill {
         b.push_back(TRef(*Find(pre + "attn_q_norm.weight")));
         b.push_back({eps_->handle, 0, 4});
       }
+      if (fps) b.push_back(Ref(*fsel_));
       const std::string ah = std::string(o_af ? "wmma_t" : "wmma") + (ci ? "_c" + std::to_string(ci) : std::string()) + ".hal";
       const auto ag = geom_.find(ah);
       const std::uint32_t tpw = ag != geom_.end() ? ag->second.tokens : attn_tpw_,
                           hpw = ag != geom_.end() ? ag->second.rowgrp : attn_hpw_;
       Dispatch(Exe(ah), "yah_attn_wmma", (B_ + tpw - 1) / tpw, kHeads / hpw, 1, 256, 1, 1, b);
+      if (fps_on_) FpsDump(ai, ci);
     }
     trim_row_ = tail_;
     RunResidual(pre + "attn_output.weight", *scratch_, o_af);
     trim_row_ = kAllRows;
+  }
+
+  // YAH_FPS_STATS: the layer's tile lists (synchronizes): kept prior tiles / the dense prior tiles, correction tiles per list
+  void FpsStats(std::uint32_t ai, std::uint32_t ci) {
+    gpu_.Synchronize();
+    std::vector<std::int32_t> h(std::size_t{B_ / 16} * 4 * fps_ls_);
+    gpu_.D2H(*fsel_, h.data(), h.size() * 4, 0);
+    const std::uint32_t tpad = pages_ * 256, start = ci * B_;
+    double kept = 0, prior = 0, corr = 0;
+    for (std::size_t g = 0; g < std::size_t{B_ / 16} * 4; ++g) {
+      const std::int32_t* l = h.data() + g * fps_ls_;
+      for (std::int32_t t = 0; t < l[0]; ++t) {
+        const std::uint32_t ks = static_cast<std::uint32_t>(l[2 + 2 * t]);
+        if (ks >= tpad) corr += 1;
+        else if (ks < start) kept += 1;
+      }
+      prior += start / 32;
+    }
+    std::fprintf(stderr, "fps_stats chunk=%u layer=%u kept=%.4f corr_tiles=%.1f\n", ci, ai, kept / prior,
+                 corr / (B_ / 16 * 4));
+  }
+
+  // YAH_FPS_DUMP=<prefix> YAH_FPS_DUMP_AT=<chunk>,<attention layer>: that attention call's inputs and output as raw files
+  // (<prefix>.q f16 rotated Q, .kfm block means, .kpool / .vpool the f16 pools, .sel lists, .gate f32, .out f16)
+  void FpsDump(std::uint32_t ai, std::uint32_t ci) {
+    const char* pre = std::getenv("YAH_FPS_DUMP");
+    const char* at = std::getenv("YAH_FPS_DUMP_AT");
+    if (!pre || !at) return;
+    unsigned dc = 0, da = 0;
+    // "<chunk>,all": every attention layer of the chunk, the scoring inputs only (.q .kpool .sel) as <prefix>_l<layer>.*
+    const bool all = std::sscanf(at, "%u,all", &dc) == 1 && std::strstr(at, "all");
+    if (!all && (std::sscanf(at, "%u,%u", &dc, &da) != 2 || da != ai)) return;
+    if (dc != ci) return;
+    const std::string base = all ? std::string(pre) + "_l" + std::to_string(ai) : std::string(pre);
+    gpu_.Synchronize();
+    const auto dump = [&](const char* ext, const LoomBuffer& b, std::size_t bytes, std::size_t off) {
+      std::vector<std::uint8_t> h(bytes);
+      gpu_.D2H(b, h.data(), bytes, off);
+      std::FILE* f = std::fopen((base + ext).c_str(), "wb");
+      std::fwrite(h.data(), 1, bytes, f);
+      std::fclose(f);
+    };
+    dump(".q", *qr16_, std::size_t{B_} * kAttn * 2, 0);
+    dump(".kpool", *kdeq_, deq_bytes_, 0);
+    dump(".sel", *fsel_, std::size_t{B_ / 16} * 4 * fps_ls_ * 4, 0);
+    if (all && std::getenv("YAH_FPS_DUMP_V")) dump(".vpool", *vdeq_, deq_bytes_, 0);
+    if (!all) {
+      dump(".kfm", *kfm_, fps_mean_bytes_, std::size_t{ai} * fps_mean_bytes_);
+      dump(".vpool", *vdeq_, deq_bytes_, 0);
+      dump(".gate", *gate_, std::size_t{B_} * kInner * 4, 0);
+      dump(".out", *scratch_, std::size_t{B_} * kAttn * 2, 0);
+    }
+    std::fprintf(stderr, "fps_dump chunk=%u layer=%u -> %s.*\n", ci, ai, base.c_str());
   }
 
   void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
@@ -2798,6 +2885,12 @@ class LoomPrefill {
   std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, dn_threads_ = 256, attn_hpw_ = 0, attn_tpw_ = 0;
   std::uint32_t dnsplit_a_ = 0, dnsplit_b_ = 0;  // DeltaNet head split (dispatch.txt "dnsplit"; 0: one dispatch)
   std::uint32_t qrot_first_ = 0;  // first chunk whose attention reads yah_qrot's rotated Q (dispatch.txt "qrot")
+  // fpsparse (gen_fpsparse): from chunk fps_first_ on; fps_ext_ pooled-row pages; fps_ls_ list dwords per (query block,
+  // KV head); per attention layer the block means [fps_blocks_][1024] f16 (kfm_ K, vfm_ V)
+  bool fps_on_ = false;
+  std::uint32_t fps_first_ = 0, fps_ext_ = 0, fps_ls_ = 0, fps_blocks_ = 0;
+  std::size_t fps_mean_bytes_ = 0, deq_bytes_ = 0;
+  LoomBuffer *kfm_ = nullptr, *vfm_ = nullptr, *fsel_ = nullptr;
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records
   std::unique_ptr<LoomGraph> chunk_graph_;

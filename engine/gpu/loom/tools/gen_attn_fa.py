@@ -176,6 +176,13 @@ KADDR_SR = False    # paged K loads: scalar page / tile part + loop-invariant la
 KT2_RSALL = False   # KT2, B: O x alpha every tile instead of the vote-skipped branch (bit-identical)
 SMFMA = False       # KT2: softmax exponent (s - m) log2e as one fma (not bit-identical)
 KT2_MIRROR = False  # KT2: odd workgroups rotate the role map (softmax VALU spread over the SIMDs)
+# FPSPARSE (KT2, paged): block-sparse attention (gen_fpsparse): the loop walks this workgroup's tile list (binding sel,
+# FPS_LS dwords per (query block, KV head)) instead of every tile up to the causal limit. Tiles at or past FPS_TPAD are
+# correction tiles: pooled block means (keys FPS_TPAD + j), each row kept by its bit of the tile's word with its logit
+# + log 128 (mean correction: the row stands for 128 keys), the others masked.
+FPSPARSE = False
+FPS_LS = 0
+FPS_TPAD = 0
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
 DOWHILE_MAIN = False   # the same for the head_dim-split loop (measured neutral)
 # SOFT1..4 (measured, not adopted, docs/results.md): keep the head_dim split and run the softmax in wave A only, P^T and
@@ -570,7 +577,7 @@ def gen():
     e("} launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer"
       + (", %kscale: buffer" if KDEC else "")
       + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "")
-      + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + ") {")
+      + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + (", %sel: buffer" if FPSPARSE else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
         e(f"  %c{v} = index.constant {v} : index")
@@ -821,6 +828,22 @@ def gen():
         e("  %kvh6 = index.mul %kvh, %c6 : index")
         e("  %pig2 = index.mul %pig, %c2 : index")
         e("  %head0 = index.add %kvh6, %pig2 : index")
+    if FPSPARSE:   # this workgroup's tile list: count at [lb], (ks, word) pairs from lb + 2
+        assert KT2 and PAGED and HPW == 6 and KT2_P2 and FPS_LS
+        e(f"  %fpstot = index.constant {FPS_LS * (MAX_TOKENS // 16) * 4} : index")
+        e(f"  %fpslim = index.constant {FPS_LS * (MAX_TOKENS // 16) * 4 - 1} : index")
+        e(f"  %fpls = index.constant {FPS_LS} : index")
+        e(f"  %fptpad = index.constant {FPS_TPAD} : index")
+        e("  %fpsl_na = buffer.assume.noalias %sel : buffer")
+        e("  %fpsl = buffer.view %fpsl_na[%base] : buffer -> view<[%fpstot]xi32>")
+        e("  %fpg0 = index.mul %qb, %c4 : index")
+        e("  %fpg = index.add %fpg0, %kvh : index")
+        e("  %fplb0 = index.mul %fpg, %fpls : index")
+        e("  %fplb = index.min %fplb0, %fpslim : index")
+        e("  %fpn0 = view.load %fpsl[%fplb] : view<[%fpstot]xi32> -> i32")
+        e("  %fpn1 = index.cast %fpn0 : i32 to index")
+        e("  %fpn = index.assume %fpn1 [range(%fpn1, 1, 65536)] : index")
+        e("  %fpe0 = index.add %fplb, %c2 : index")       # first pair
     e("  %kvbase = index.mul %kvh, %c256 : index")
     e("  %vhb0 = index.mul %kvh, %vtiles : index")
     e("  %vhb = index.mul %vhb0, %c4096 : index")
@@ -1081,6 +1104,20 @@ def gen():
         e(f"{ind}%{p}{tag}pr = index.mul %{p}{tag}pt, %c16 : index")
         return f"%{p}{tag}pr"
 
+    def fps_entry(tw, off, name, ind, ks=True):
+        """FPSPARSE: pair tw's ks (off 0, as an index) or word (off 1, i32) of this workgroup's list (uniform)."""
+        e(f"{ind}%{name}t2 = index.mul {tw}, %c2 : index")
+        e(f"{ind}%{name}a0 = index.add %fpe0, %{name}t2 : index")
+        e(f"{ind}%{name}a1 = index.add %{name}a0, %c{off} : index")
+        e(f"{ind}%{name}a = index.min %{name}a1, %fpslim : index")
+        w = f"%{name}" if not ks else f"%{name}w"
+        e(f"{ind}{w} = view.load %fpsl[%{name}a] : view<[%fpstot]xi32> -> i32")
+        if not ks:
+            return w
+        e(f"{ind}%{name}r = index.cast %{name}w : i32 to index")
+        e(f"{ind}%{name} = index.assume %{name}r [range(%{name}r, 0, 1048576), lt(%{name}r, {CAPV})] : index")
+        return f"%{name}"
+
     def load_k(ks, p, ind):
         if KDEC:
             nw = 2 if K4 else 4
@@ -1324,14 +1361,19 @@ def gen():
             e(f"{ind}vector.store {v}, %v_view[%{p}vr, {col}] : {V8H}, view<256x{vp}xf16>")
 
     # prologue: K(0) staged
-    k0 = load_k("%c0", "p0", "  ")
+    ks0, ks0b = "%c0", "%c16"
+    if FPSPARSE:   # the list's first tile
+        ks0 = fps_entry("%c0", 0, "fpk0", "  ")
+        e("  %fpk0b = index.add %fpk0, %c16 : index")
+        ks0b = "%fpk0b"
+    k0 = load_k(ks0, "p0", "  ")
     if PIPE2:
         k1 = load_k("%c16", "p1", "  ")
         v0 = load_v("%c0", "pv0", "  ")
-    stage_k("%c0", k0, "p0s", "  ")
+    stage_k(ks0, k0, "p0s", "  ")
     if KT2:   # K rows 16..31 of tile 0; V^T zero (B's first P.V adds 0 * V)
-        k0b = load_k("%c16", "p0b", "  ")
-        stage_k("%c16", k0b, "p0t", "  ", kv="%k_view1")
+        k0b = load_k(ks0b, "p0b", "  ")
+        stage_k(ks0b, k0b, "p0t", "  ", kv="%k_view1")
         stage_v_(["%zh8"] * 4, "%c0", "pz", "  ")
         if KT2_P2:   # slot 1 = tile -1: P^T 0, alpha 1 (one row per thread: NT = 64 NQB)
             e(f"  %c2slot = index.constant {64 * NQB} : index")
@@ -2053,16 +2095,37 @@ def gen():
             e(f"{ind}%t{t}mok8 = scalar.cmpi sge, %t{t}lim, %mc8 : i32")
             e(f"{ind}%t{t}mok = scalar.andi %t{t}mok8, %mlive : i1")
             e(f"{ind}%t{t}mallok = kernel.subgroup.vote.all %t{t}mok : i1")
-            e(f"{ind}%t{t}sm = scf.if %t{t}mallok -> ({V8}) {{")
+            cond = f"%t{t}mallok"
+            if FPSPARSE:   # correction tiles take the masked arm
+                e(f"{ind}%t{t}pass = scalar.andi %t{t}mallok, %fpnc : i1")
+                cond = f"%t{t}pass"
+            e(f"{ind}%t{t}sm = scf.if {cond} -> ({V8}) {{")
             e(f"{ind}  scf.yield {S[t]} : {V8}")
             e(f"{ind}}} else {{")
             els = []
+            if FPSPARSE:   # this lane's 8 keys: bits 16 t + 8 h .. + 7 of the word
+                e(f"{ind}  %t{t}fso = index.constant {16 * t} : index")
+                e(f"{ind}  %t{t}fs0 = index.add %h8, %t{t}fso : index")
+                e(f"{ind}  %t{t}fsi = index.cast %t{t}fs0 : index to i32")
+                e(f"{ind}  %t{t}fw = scalar.shrui %fpmw, %t{t}fsi : i32")
+                e(f"{ind}  %t{t}fone = scalar.constant 1 : i32")
+                e(f"{ind}  %t{t}fzero = scalar.constant 0 : i32")
+                e(f"{ind}  %t{t}fln = scalar.constant 4.852030263919617 : f32")
             for i in range(8):
                 e(f"{ind}  %t{t}mi{i} = scalar.constant {i} : i32")
                 e(f"{ind}  %t{t}mv{i}a = scalar.cmpi slt, %t{t}mi{i}, %t{t}lim : i32")
                 e(f"{ind}  %t{t}mv{i} = scalar.andi %t{t}mv{i}a, %r_live_i1 : i1")
                 e(f"{ind}  %t{t}se{i} = vector.extract {S[t]}[{i}] : {V8} -> f32")
-                e(f"{ind}  %t{t}sme{i} = scf.select %t{t}mv{i}, %t{t}se{i}, %ninf : f32")
+                if FPSPARSE:
+                    e(f"{ind}  %t{t}fb{i}s = scalar.shrui %t{t}fw, %t{t}mi{i} : i32")
+                    e(f"{ind}  %t{t}fb{i}a = scalar.andi %t{t}fb{i}s, %t{t}fone : i32")
+                    e(f"{ind}  %t{t}fb{i} = scalar.cmpi ne, %t{t}fb{i}a, %t{t}fzero : i32")
+                    e(f"{ind}  %t{t}fv{i} = scf.select %fpcorr, %t{t}fb{i}, %t{t}mv{i} : i1")
+                    e(f"{ind}  %t{t}fa{i} = scalar.addf %t{t}se{i}, %t{t}fln : f32")
+                    e(f"{ind}  %t{t}fx{i} = scf.select %fpcorr, %t{t}fa{i}, %t{t}se{i} : f32")
+                    e(f"{ind}  %t{t}sme{i} = scf.select %t{t}fv{i}, %t{t}fx{i}, %ninf : f32")
+                else:
+                    e(f"{ind}  %t{t}sme{i} = scf.select %t{t}mv{i}, %t{t}se{i}, %ninf : f32")
                 els.append(f"%t{t}sme{i}")
             e(f"{ind}  %t{t}smk = vector.from_elements {', '.join(els)} : {V8}")
             e(f"{ind}  scf.yield %t{t}smk : {V8}")
@@ -2240,13 +2303,19 @@ def gen():
         I = "    "
         e(f"{I}%ks16 = index.add %ks_, %c16 : index")
         e(f"{I}%ks32c = index.constant 32 : index")
-        e(f"{I}%ks32 = index.add %ks_, %ks32c : index")
+        if FPSPARSE:   # the next tile of the list
+            e(f"{I}%ks32 = index.add %fpnks, %c0 : index")
+        else:
+            e(f"{I}%ks32 = index.add %ks_, %ks32c : index")
         e(f"{I}%ks48 = index.add %ks32, %c16 : index")
         nk = load_k("%ks32", "nka", I) + load_k("%ks48", "nkb", I)
         nv = load_v("%ks_", "nva", I) + load_v("%ks16", "nvb", I)
         nb = [f"%nb{f}" for f in range(16)]
         if KT2_P2:   # A writes slot (ks / 32) % 2, B reads the other one (the previous tile's)
-            e(f"{I}%k2t = index.div %ks_, %ks32c : index")
+            if FPSPARSE:
+                e(f"{I}%k2t = index.add %fptw, %c0 : index")
+            else:
+                e(f"{I}%k2t = index.div %ks_, %ks32c : index")
             e(f"{I}%k2p = index.rem %k2t, %c2 : index")
             e(f"{I}%k2q = index.sub %c1, %k2p : index")
             e(f"{I}%k2wr = index.mul %k2p, %c2slot : index")
@@ -2338,10 +2407,23 @@ def gen():
         ct = f"{rtypes}, f32, f32" + ("" if p2 else f", {V16H}, {V16H}, f32")
         fr = "" if p2 else ", %fpc0, %fpc1, %falc"
         e(f"  %wkf, {', '.join(fb)}, %gmax, %gsum{fr} = scf.while(%ksw = %c0 : index, {init}) -> (index, {ct}) {{")
-        e("    %ks_ = index.assume %ksw [range(%ksw, 0, 1048576), lt(%ksw, %max_vis)] : index")
+        if FPSPARSE:   # %ksw: the list position
+            e("    %fptw = index.assume %ksw [range(%ksw, 0, 65536), lt(%ksw, %fpn)] : index")
+            fps_entry("%fptw", 0, "ks_", "    ")
+            e("    %fptw1 = index.add %fptw, %c1 : index")
+            fps_entry("%fptw1", 0, "fpnks", "    ")
+            fps_entry("%fptw", 1, "fpmw", "    ", ks=False)
+            e("    %fpcorr = index.cmp uge, %ks_, %fptpad : index")
+            e("    %fpnc = index.cmp ult, %ks_, %fptpad : index")
+        else:
+            e("    %ks_ = index.assume %ksw [range(%ksw, 0, 1048576), lt(%ksw, %max_vis)] : index")
         nb = body_pair2()
-        e("    %ksn = index.add %ks_, %ks32c : index")
-        e("    %kcont = index.cmp ult, %ksn, %max_vis : index")
+        if FPSPARSE:
+            e("    %ksn = index.add %fptw, %c1 : index")
+            e("    %kcont = index.cmp ult, %ksn, %fpn : index")
+        else:
+            e("    %ksn = index.add %ks_, %ks32c : index")
+            e("    %kcont = index.cmp ult, %ksn, %max_vis : index")
         e(f"    scf.condition %kcont, %ksn, {', '.join(nb)}, %qmax, %qsum{'' if p2 else ', %npc0, %npc1, %nalc'} : i1, index, {ct}")
         wargs = ", ".join(["%wk: index"] + [f"%wb{f}: {BK}" for f in range(16)] + ["%wm: f32", "%ws: f32"]
                           + ([] if p2 else [f"%wp0: {V16H}", f"%wp1: {V16H}", "%wa: f32"]))
@@ -2354,7 +2436,10 @@ def gen():
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         if p2:   # the last tile (wkf - 32) wrote slot (wkf / 32 + 1) % 2
             e("  %ks32c0 = index.constant 32 : index")
-            e("  %f2t0 = index.div %wkf, %ks32c0 : index")
+            if FPSPARSE:   # wkf = the tile count
+                e("  %f2t0 = index.add %wkf, %c0 : index")
+            else:
+                e("  %f2t0 = index.div %wkf, %ks32c0 : index")
             e("  %f2t = index.add %f2t0, %c1 : index")
             e("  %f2p = index.rem %f2t, %c2 : index")
             e("  %f2r = index.mul %f2p, %c2slot : index")
@@ -2653,10 +2738,12 @@ def gen_qrot():
     return "\n".join(L) + "\n"
 
 
-def _deq_header(e, name, sym, extra_params):
+def _deq_header(e, name, sym, extra_params, out_cap=False):
     e(f"// GENERATED by tools/gen_attn_fa.py ({name}) -- edit the generator.")
     e("amdgpu.target<gfx1151> @deq_w32 {subgroup_size = 32}")
     e(f"config.decl @{sym}.cache_capacity : %value: index where [range(%value, 1, 1048576)]")
+    if out_cap:
+        e(f"config.decl @{sym}.out_capacity : %value: index where [range(%value, 1, 1048576)]")
     e(f"config.decl @{sym}.rows : %value: index where [range(%value, 1, 1048576)]")
     e("")
     e(f"kernel.def target(@deq_w32) @{sym}() {{")
@@ -2776,7 +2863,8 @@ def gen_vdeq(bits=4):
     e = L.append
     _deq_header(e, f"gen_vdeq{bits}", sym,
                 "  %ntl0 = index.add %rows, %c15 : index\n  %ntl = index.div %ntl0, %c16 : index\n"
-                "  %th0 = index.mul %ntl, %c256 : index\n  %c4 = index.constant 4 : index\n  %th = index.mul %th0, %c4 : index")
+                "  %th0 = index.mul %ntl, %c256 : index\n  %c4 = index.constant 4 : index\n  %th = index.mul %th0, %c4 : index",
+                out_cap=True)
     e("} launch(%vq: buffer, %vs: buffer, %ptab: buffer, %out: buffer) {")
     _deq_common(e, sym)
     e("  %c4 = index.constant 4 : index")
@@ -2785,7 +2873,12 @@ def gen_vdeq(bits=4):
     e(f"  %vq4tot = index.mul %vq4tot0, %c{nw} : index")
     e("  %otl0 = index.add %cap, %c15 : index")
     e("  %otl = index.div %otl0, %c16 : index")              # logical tiles per KV head
-    e("  %otot0 = index.mul %vtiles, %c4096 : index")
+    # the f16 pool's capacity (gen_fpsparse appends pooled-row pages: a longer per-head tile stride)
+    e(f"  %ocap = config.get @{sym}.out_capacity : index")
+    e("  %onp0 = index.add %ocap, %c255 : index")
+    e("  %onp = index.div %onp0, %c256 : index")
+    e("  %ovt = index.mul %onp, %c16 : index")
+    e("  %otot0 = index.mul %ovt, %c4096 : index")
     e("  %otot = index.mul %otot0, %c4 : index")
     e("  %vq_na, %vs_na, %pt_na, %o_na = buffer.assume.noalias %vq, %vs, %ptab, %out : buffer, buffer, buffer, buffer")
     e("  %vq_flat = buffer.view %vq_na[%base] : buffer -> view<[%vq4tot]xi32>")
@@ -2834,7 +2927,8 @@ def gen_vdeq(bits=4):
     e(f"  %vss16 = vector.splat %vss : {V16H}")
     e(f"  %vsc16 = vector.splat %vsc : {V16H}")
     e(f"  %vd = vector.fmaf %vf, %vss16, %vsc16 : {V16H}")
-    e("  %oi0 = index.add %vti0, %c0 : index")   # the f16 pool tile = the int4 pool's physical tile
+    e("  %oi0a = index.mul %kvh, %ovt : index")   # the f16 pool tile = the int4 pool's physical tile (own stride)
+    e("  %oi0 = index.add %oi0a, %pt : index")
     e("  %oi1 = index.mul %oi0, %c256 : index")
     e("  %oi2 = index.add %oi1, %dim : index")
     e("  %oi = index.mul %oi2, %c16 : index")

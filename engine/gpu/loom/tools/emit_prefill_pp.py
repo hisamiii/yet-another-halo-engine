@@ -26,6 +26,7 @@ import gen_gemv  # noqa: E402
 import gen_rot  # noqa: E402
 import gen_gemm_iu4  # noqa: E402
 import gen_kvq  # noqa: E402
+import gen_fpsparse  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
 
 
@@ -361,6 +362,12 @@ OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (1
 # 3 workgroups per WGP, one barrier pair / reduction / rescale vote per 32 keys; -0.8% at 16K, -1.8% at 32K, -3..-5.6% at
 # 88K..126K vs the 4-workgroup kernel / the deep twin (standalone); not bit-identical (the running max moves per 32 keys).
 KT2_FROM = int(os.environ.get("YAH_KT2_FROM", "16384"))
+# Block-sparse prefill attention (gen_fpsparse, FlashPrefill V2) from YAH_FPS_FROM tokens of context on (0: off), kv4 paged
+# sets with the KT2 twin only. YAH_FPS_ALPHA: the block threshold (fraction of the query block's top block score).
+# The f16 pools grow by the pooled-row pages (every attention HAL and vdeq use the extended capacity).
+# dispatch.txt "fpsparse <first chunk> <extension pages> <list stride>"
+FPS_FROM = int(os.environ.get("YAH_FPS_FROM", "0"))
+FPS_ALPHA = float(os.environ.get("YAH_FPS_ALPHA", str(gen_fpsparse.ALPHA)))
 QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
 # QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
 QG16 = True
@@ -408,6 +415,10 @@ def kt2(path):
 
 def alt(path):
     return path.replace(".loom", "_alt.loom")
+
+
+def fps(path):
+    return path.replace(".loom", "_kt2fps.loom")
 
 
 ATTN_VGPR = 192   # every attention variant fits here unless the allocator rotates the O accumulators
@@ -1603,16 +1614,28 @@ def main():
 
     kt2_cfg = (a_hpw, a_qt) if EMIT_HALF else KT2_SHAPE
     kt2_shape = kt2_cfg if kt2_cfg != (a_hpw, a_qt) else None   # a shape of its own: its chunks get dispatch.txt rows
+    fps_on = bool(FPS_FROM) and kvdeq and deq_bits == 4 and kt2_cfg == KT2_SHAPE == (6, 16) and not EMIT_HALF
+    if FPS_FROM and not fps_on:
+        raise SystemExit("YAH_FPS_FROM needs a kv4 paged set with the 6x16 KT2 twin")
+    if fps_on and (B % gen_fpsparse.BLK or T % 256 or FPS_FROM % B or FPS_FROM < KT2_FROM):
+        raise SystemExit("YAH_FPS_FROM: chunk a multiple of 128, context of 256, FPS_FROM a chunk start >= KT2_FROM")
+    fps_ls = gen_fpsparse.list_stride(T, B)
+    fps_ext = gen_fpsparse.ext_pages(T)
+    cap_attn = T + 256 * fps_ext if fps_on else T    # the f16 pools' capacity (pooled-row pages appended)
+    fps_paths = set()                                # sources that get the sparse twin (set below: the kvdeq Q sources)
 
     def write_attn(path):
         A = gen_attn_fa
         keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
-                                   + tuple(KT2_SHAPE_FLAGS)))
+                                   + tuple(KT2_SHAPE_FLAGS) + ("FPSPARSE", "FPS_LS", "FPS_TPAD")))
         saved = {k: getattr(A, k) for k in keys}
         twins = [(path, MAIN_FLAGS, None), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI), None)]
         if not A.KDEC:   # the KT2 twin (fp16 sources only)
             twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI,
                                           **(KT2_SHAPE_FLAGS if kt2_cfg == KT2_SHAPE else {})), kt2_shape))
+            if fps_on and path in fps_paths:   # the block-sparse KT2 twin (the kvdeq sources)
+                twins.append((fps(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI, **KT2_SHAPE_FLAGS, FPSPARSE=True,
+                                              FPS_LS=fps_ls, FPS_TPAD=T), kt2_shape))
         for name, flags, shape in twins:
             for k, v in flags.items():
                 setattr(A, k, v)
@@ -1661,6 +1684,7 @@ def main():
         if kvdeq:   # the fp16 paged kernel (the f16 pools have the int4 pools' page layout)
             A.K4 = A.K8 = A.KDEC = A.VQ4 = A.VQ8 = False
             A.Q16 = True
+            fps_paths.update((attn_qr_src, attn_qr_t_src))
         else:
             # VSWZ_T off: with direct Q the swizzled V staging tips Loom into rotating the O accumulators at the back edge
             A.Q16 = A.QROT = True
@@ -1677,6 +1701,14 @@ def main():
         open(kdeq_src, "w").write(gen_attn_fa.gen_kdeq(deq_bits))
         open(vdeq_src, "w").write(gen_attn_fa.gen_vdeq(deq_bits))
         geom.append(("kvdeq", 0, 0, 0))
+    fpmean_src = os.path.join(tmp, "yah_fpmean.loom")
+    fpcopy_src = os.path.join(tmp, "yah_fpcopy.loom")
+    fpsel_src = os.path.join(tmp, "yah_fpsel.loom")
+    if fps_on:
+        open(fpmean_src, "w").write(gen_fpsparse.gen_fpmean())
+        open(fpcopy_src, "w").write(gen_fpsparse.gen_fpcopy())
+        open(fpsel_src, "w").write(gen_fpsparse.gen_fpsel(T, B, FPS_ALPHA))
+        geom.append(("fpsparse", FPS_FROM // B, fps_ext, fps_ls))
     geom.append(("wmma.hal", a_qt, a_hpw, (B + a_qt - 1) // a_qt))
     # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md).
     # K: int8 (yah_kq8) or H256 + asymmetric int4 (yah_kq4) after yah_kmean centres it; the attention decodes it to f16.
@@ -1925,6 +1957,8 @@ def main():
             open(src, "w").write(txt)
             pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
     def occ(path, c, use_kt2=True):   # the 3-workgroup twins: KT2 from KT2_FROM keys of context on, else PAIR from OCC3_FROM
+        if use_kt2 and fps_on and c * B >= FPS_FROM and os.path.exists(fps(path)):
+            return fps(path)
         if use_kt2 and c * B >= KT2_FROM and (c or not kt2_shape) and os.path.exists(kt2(path)):
             return kt2(path)
         return deep(path) if c * B >= OCC3_FROM else path
@@ -1984,22 +2018,32 @@ def main():
             *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)],
         *([(qrot_src, "qrot.hal", ["yah_qrot.token_count=%d" % B])] if qrot_first < NCH else []),
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c),
-           ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)])
+           ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)]
+           + (["%s.out_capacity=%d" % (sym, cap_attn)] if sym.startswith("yah_vdeq") else []))
           for c in range(NCH) if kvdeq
           for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
                                  (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
         *[(occ(attn_qr_src if c >= qrot_first else attn_src, c), "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
-            "attention_prefill.cache_capacity=%d" % T,
+            "attention_prefill.cache_capacity=%d" % cap_attn,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH)],
         *[(occ(attn_qr_t_src if c >= qrot_first else attn_t_src, c), "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
-            "attention_prefill.cache_capacity=%d" % T,
+            "attention_prefill.cache_capacity=%d" % cap_attn,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH) if af24],
+        *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c), cfg)
+          for c in range(NCH) if fps_on
+          for src, stem, cfg in (
+              (fpmean_src, "fpmean", ["yah_fpmean.capacity=%d" % T, "yah_fpmean.capx=%d" % cap_attn,
+                                      "yah_fpmean.first=%d" % (max(c - 1, 0) * B // 128), "yah_fpmean.nend=%d" % ((c + 1) * B // 128)]),
+              (fpcopy_src, "fpcopy", ["yah_fpcopy.capacity=%d" % T, "yah_fpcopy.capx=%d" % cap_attn,
+                                      "yah_fpcopy.nend=%d" % ((c + 1) * B // 128)]),
+              *([(fpsel_src, "fpsel", ["yah_fpsel.start_pos=%d" % (c * B), "yah_fpsel.tpad=%d" % T])]
+                if c * B >= FPS_FROM else []))],
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
           if vtrans_src else []),
@@ -2048,6 +2092,9 @@ def main():
         E.emit(loom, configs, outname, outdir, attn_env(loom))
         if outname.startswith("wmma") and "_kt2" in loom:   # KT2 past 240 VGPRs loses its third workgroup: use the old twin
             hal = os.path.join(outdir, outname)
+            if (hal_vgprs(hal) > KT2_VGPR or hal_spills(hal)) and "_kt2fps" in loom:
+                raise SystemExit("attention %s: the block-sparse KT2 twin has %d VGPRs, %d B spills (no dense fallback)"
+                                 % (outname, hal_vgprs(hal), hal_spills(hal)))
             if hal_vgprs(hal) > KT2_VGPR or hal_spills(hal):
                 c = int(re.search(r"_c(\d+)\.hal$", outname).group(1)) if "_c" in outname else 0
                 print("attention %s: KT2 %d VGPRs, %d B spills, re-emitted from the previous twin" % (outname, hal_vgprs(hal), hal_spills(hal)))
