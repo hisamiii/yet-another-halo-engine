@@ -2362,11 +2362,16 @@ class LoomPrefill {
       const LoomBuffer& d = gate_flagged ? *ad2_ : *ad_;
       if (pnq_ab_) {
         // raw_ untracked: part a's DeltaNet is behind the barrier before part b's, part b's done count is dn_cnt
-        if (!gate_flagged || !dn_done) throw LoomError("pnq_abf.hal needs the flagged gate GEMM and dnvconv");
+        if (!dn_done) throw LoomError("pnq_abf.hal needs dnvconv");
         const Geom& gab = geom_.at("pnq_abf.hal");
-        Dispatch(Exe("pnq_abf.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
-                 {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt, dn_cnt}, 0b1100000,
-                 nullptr, 0b110000101);
+        if (gate_flagged)
+          Dispatch(Exe("pnq_abf.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
+                   {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt, dn_cnt}, 0b1100000,
+                   nullptr, 0b110000101);
+        else   // a trimmed chunk: the gate GEMM ran unflagged, the graph orders this after it
+          Dispatch(Exe("pnq_abd.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
+                   {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), dn_cnt}, 0b1100000,
+                   nullptr, 0b10000001);
       } else if (gate_flagged)
         Dispatch(Exe("pnq_af.hal"), "yah_pnq", ga.tt, B_, 1, ga.rowgrp, 1, 1,
                  {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt}, 0b1100000, nullptr,

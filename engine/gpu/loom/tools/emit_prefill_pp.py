@@ -1882,6 +1882,11 @@ def main():
                         gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
                                         dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
                     geom.append(("pnq_abf.hal", 0, 64, len(gen_rot.pnq_groups("ab")) // 4))
+                    # a trimmed chunk's gate GEMM runs unflagged (gen_gemm_iu4 flags only full token tiles): the same
+                    # grid waiting only on DeltaNet part b, behind the gate GEMM in the graph (pnq_abf.hal's geometry)
+                    rot_src["pnq_abd.hal"] = os.path.join(tmp, "pnq_abd.loom")
+                    open(rot_src["pnq_abd.hal"], "w").write(
+                        gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
         with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
             fh.write(gen_rot.signs())
         geom.append(("rot", 0, 0, 0))
