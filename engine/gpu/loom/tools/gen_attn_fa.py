@@ -61,6 +61,13 @@ QNORM = False
 # QG16: q and gate arrive as f16 (the kqg GEMM's f16 epilogue, emit_prefill_pp.QG16); with QNORM the prologue widens q
 QG16 = False
 QX_OFF = 0          # QNORM: LDS offset of the sums slot (set by gen)
+# QNMIX (QNORM): f16(x / 16) as fptrunc(fma(x, opaque 1/16, opaque 0)), a v_fma_mix with any destination, instead of a
+# mul + v_cvt_f16_f32 (low-half writes only reach v0..v127). x / 16 is exact in f32, so the single rounding is the same.
+QNMIX = False
+# QNSTREAM (QNORM): phase 2 one fragment at a time (its weights loaded, normalized, f16, traded, then a schedule fence)
+# instead of all weights up front and all 128 f16 conversions before packing (the PAIR prologue's 255-VGPR peak).
+# Same values.
+QNSTREAM = False
 # PIPE2_EARLY: the QK of tile j+1 goes in before the softmax's rescale branch (its loads stay after it: a branch join
 # drains outstanding global loads)
 PIPE2_EARLY = False
@@ -369,7 +376,7 @@ def qnorm_phase2(e, own, root):
     e("  %qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>")
     e("  %qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>")
     e("  %qwb = index.add %hd128, %qh16 : index")
-    wv = qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", range(nown))
+    wv = {} if QNSTREAM else qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", range(nown))
     e("  %qeps_s = view.load %qe_flat[%c0] : view<[%c1]xf32> -> f32")
     if PAIR:
         total = root
@@ -384,20 +391,27 @@ def qnorm_phase2(e, own, root):
     e("  %qme = scalar.addf %qmean, %qeps_s : f32")
     e("  %qinv = scalar.rsqrtf %qme : f32")
     e("  %qsc16 = scalar.constant 0.0625 : f32")
-    nw = []
-    for k in range(nown):
+    def norm_row(k):
+        if QNSTREAM:
+            wv.update(qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", [k]))
         w = qnorm_scalars(e, f"qw{k}", wv[k])
         row = []
         for j in range(16):
             e(f"  %qn{k}_{j} = scalar.mulf {own[k][j]}, %qinv : f32")
             e(f"  %qnw{k}_{j} = scalar.mulf %qn{k}_{j}, {w[j]} : f32")
             row.append(f"%qnw{k}_{j}")
-        nw.append(row)
+        return row
+    nw = [None] * nown if QNSTREAM else [norm_row(k) for k in range(nown)]
 
     def f16frag(p, xs, ind="  "):
         """f16(x / 16) of 16 dims -> two V8H"""
         hs = []
         for j in range(16):
+            if QNMIX:
+                e(f"{ind}%{p}s{j} = scalar.fmaf {xs[j]}, %q16_o, %zero_o : f32")
+                e(f"{ind}%{p}h{j} = scalar.fptrunc %{p}s{j} : f32 to f16")
+                hs.append(f"%{p}h{j}")
+                continue
             e(f"{ind}%{p}s{j} = scalar.mulf {xs[j]}, %qsc16 : f32")
             e(f"{ind}%{p}h{j} = scalar.fptrunc %{p}s{j} : f32 to f16")
             hs.append(f"%{p}h{j}")
@@ -438,10 +452,10 @@ def qnorm_phase2(e, own, root):
             r1.append(f"%qrr1_{j}")
         return f16frag("qrf0", r0, ind) + f16frag("qrf1", r1, ind)
 
-    halves = [None, None] + [f16frag(f"qf{k}", nw[k]) for k in range(2, nown)]
-    if PAIR:   # one wave holds the whole head: always the rotated dims
-        h = rope("  ")
-    else:      # only the head-dim-0 wave of a pair holds dims < 64
+    def rope_halves():
+        if PAIR:   # one wave holds the whole head: always the rotated dims
+            return rope("  ")
+        # only the head-dim-0 wave of a pair holds dims < 64
         e("  %qsg = kernel.subgroup.id : index")
         e("  %qsgh = index.rem %qsg, %c2 : index")
         e("  %qrot0 = index.cmp eq, %qsgh, %c0 : index")
@@ -451,20 +465,37 @@ def qnorm_phase2(e, own, root):
         pl = f16frag("qp0", nw[0], "    ") + f16frag("qp1", nw[1], "    ")
         e(f"    scf.yield {', '.join(pl)} : {V8H}, {V8H}, {V8H}, {V8H}")
         e("  }")
-        h = ("%qrh0", "%qrh1", "%qrh2", "%qrh3")
-    halves[0], halves[1] = h[0:2], h[2:4]
-    # trade finished fragments: local fragment 2k + b is mine when b == half, else the partner's
-    for k in range(nown):
+        return ("%qrh0", "%qrh1", "%qrh2", "%qrh3")
+
+    def trade(k, hk):
+        """local fragment 2k + b is mine when b == half, else the partner's"""
         theirs = []
-        for t, hv in enumerate(halves[k]):
+        for t, hv in enumerate(hk):
             e(f"  %qfb{k}_{t} = vector.bitcast {hv} : {V8H} to {V4}")
             e(f"  %qfp{k}_{t}, %qfpv{k}_{t} = kernel.subgroup.shuffle<xor> %qfb{k}_{t}, %qx16, %qx32 : {V4}, i32, i32")
             e(f"  %qfq{k}_{t} = vector.bitcast %qfp{k}_{t} : {V4} to {V8H}")
             theirs.append(f"%qfq{k}_{t}")
-        e(f"  %qfm{k} = vector.concat<0> {halves[k][0]}, {halves[k][1]} : {V8H}, {V8H} -> {V16H}")
+        e(f"  %qfm{k} = vector.concat<0> {hk[0]}, {hk[1]} : {V8H}, {V8H} -> {V16H}")
         e(f"  %qft{k} = vector.concat<0> {theirs[0]}, {theirs[1]} : {V8H}, {V8H} -> {V16H}")
         e(f"  %qdv{2 * k} = scf.select %qhis0, %qfm{k}, %qft{k} : {V16H}")
         e(f"  %qdv{2 * k + 1} = scf.select %qhis0, %qft{k}, %qfm{k} : {V16H}")
+
+    if QNSTREAM:
+        nw[0], nw[1] = norm_row(0), norm_row(1)
+        h = rope_halves()
+        trade(0, h[0:2])
+        trade(1, h[2:4])
+        for k in range(2, nown):
+            e("  scf.schedule.fence")
+            nw[k] = norm_row(k)
+            trade(k, f16frag(f"qf{k}", nw[k]))
+        e("  scf.schedule.fence")
+        return
+    halves = [None, None] + [f16frag(f"qf{k}", nw[k]) for k in range(2, nown)]
+    h = rope_halves()
+    halves[0], halves[1] = h[0:2], h[2:4]
+    for k in range(nown):
+        trade(k, halves[k])
 
 
 def gen():
@@ -718,6 +749,10 @@ def gen():
     e("  %lob = scalar.ori %lz, %onebits : i32")
     e("  %one_o = scalar.bitcast %lob : i32 to f32")
     e("  %zero_o = scalar.bitcast %lz : i32 to f32")
+    if QNORM and QNMIX:
+        e("  %q16bits = scalar.constant 1031798784 : i32")   # 0x3d800000 = 1/16
+        e("  %q16b = scalar.ori %lz, %q16bits : i32")
+        e("  %q16_o = scalar.bitcast %q16b : i32 to f32")
     e("  %qs = index.mul %qb, %cqt : index")
     if HPW == 6:   # one workgroup = a whole GQA group
         e("  %kvh = index.add %hp, %c0 : index")
@@ -1962,17 +1997,33 @@ def gen():
             e(f"{ind}  %t{t}smk = vector.from_elements {', '.join(els)} : {V8}")
             e(f"{ind}  scf.yield %t{t}smk : {V8}")
             e(f"{ind}}}")
-            e(f"{ind}%t{t}tm = vector.reduce<maxnumf> %t{t}sm, %ninf : {V8}, f32")
+            if MAXNN:
+                cur = None
+                for i in range(8):
+                    e(f"{ind}%t{t}tme{i} = vector.extract %t{t}sm[{i}] : {V8} -> f32")
+                    if cur is None:
+                        cur = f"%t{t}tme0"
+                        continue
+                    e(f"{ind}%t{t}tmc{i} = scalar.maxnumf<nnan> {cur}, %t{t}tme{i} : f32")
+                    cur = f"%t{t}tmc{i}"
+                tms = cur
+            else:
+                e(f"{ind}%t{t}tm = vector.reduce<maxnumf> %t{t}sm, %ninf : {V8}, f32")
+                tms = f"%t{t}tm"
             M.append(f"%t{t}sm")
-        e(f"{ind}%tmax0 = scalar.maxnumf %t0tm, %t1tm : f32")
+            M.append(tms)
+        tm0, tm1 = M[1], M[3]
+        M = [M[0], M[2]]
+        nn = "<nnan>" if MAXNN else ""
+        e(f"{ind}%tmax0 = scalar.maxnumf{nn} {tm0}, {tm1} : f32")
         e(f"{ind}%tmi = scalar.bitcast %tmax0 : f32 to i32")
         e(f"{ind}%tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
         e(f"{ind}%tmf = scalar.bitcast %tmx : i32 to f32")
-        e(f"{ind}%tmax = scalar.maxnumf %tmax0, %tmf : f32")
+        e(f"{ind}%tmax = scalar.maxnumf{nn} %tmax0, %tmf : f32")
         e(f"{ind}%grow = scalar.cmpf ogt, %tmax, %rmax : f32")
         e(f"{ind}%anygrow = kernel.subgroup.vote.any %grow : i1")
         e(f"{ind}%rsm, %rss = scf.if %anygrow -> (f32, f32) {{")
-        e(f"{ind}  %gmx = scalar.maxnumf %rmax, %tmax : f32")
+        e(f"{ind}  %gmx = scalar.maxnumf{nn} %rmax, %tmax : f32")
         e(f"{ind}  %gpd = scalar.subf %rmax, %gmx : f32")
         e(f"{ind}  %gpdl = scalar.mulf %gpd, %log2e : f32")
         e(f"{ind}  %galpha = scalar.exp2f<afn> %gpdl : f32")
@@ -1980,7 +2031,7 @@ def gen():
         e(f"{ind}}} else {{")
         e(f"{ind}  scf.yield %rmax, %one : f32, f32")
         e(f"{ind}}}")
-        e(f"{ind}%nmax = scalar.maxnumf %rsm, %ninf : f32")
+        e(f"{ind}%nmax = scalar.maxnumf{'<nnan|ninf>' if MAXNN else ''} %rsm, %ninf : f32")
         e(f"{ind}%nmax8 = vector.splat %nmax : {V8}")
         P = []
         for t in range(2):
@@ -1994,6 +2045,9 @@ def gen():
                 cur = "%zero"
                 for i in range(4):
                     e(f"{ind}%t{t}pg{g}_{i} = vector.extract {P[t]}[{4 * g + i}] : {V8} -> f32")
+                    if SUM0 and i == 0:
+                        cur = f"%t{t}pg{g}_0"
+                        continue
                     e(f"{ind}%t{t}pa{g}_{i} = scalar.addf {cur}, %t{t}pg{g}_{i} : f32")
                     cur = f"%t{t}pa{g}_{i}"
                 parts.append(cur)

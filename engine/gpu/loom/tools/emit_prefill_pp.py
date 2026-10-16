@@ -383,7 +383,10 @@ DNOV_ON = False   # set by main
 # dispatch.txt "guov"
 GUOV = True
 GUOV_ON = False   # set by main
-KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1)
+# QNSTREAM + QNMIX: the QNORM prologue one fragment at a time (its 255-VGPR peak had pushed both role-split twins past 240,
+# so KT2 fell back and the deep twin ran 2 workgroups per WGP; 96K deep attention -13%); MAXNN + SUM0 (KT2 -1.35%)
+QN_FLAGS = dict(QNSTREAM=True, QNMIX=True, MAXNN=True, SUM0=True)
+KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1, **QN_FLAGS)
 KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
 
 
@@ -1580,14 +1583,14 @@ def main():
     # loop re-emits such a HAL from the twin (attn_guard).
     # The deep twin is also the role-split kernel (gen_attn_fa PAIR: one wave of each pair runs QK + the softmax once,
     # the other P.V; bit-identical): at 3 workgroups per WGP it needs no more than the 256 VGPRs that allows.
-    DEEP_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=2, PVF=4)
+    DEEP_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=2, PVF=4, **QN_FLAGS)
     # the 4-workgroup kernel's bit-identical VALU cuts (gen_attn_fa MAXNN, SUM0, EPI_FAST; CTX16: start_pos = c * B):
     # pp2048 attention -6.4% cycles; the deep / KT2 twins keep their tuned code
     MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0)
 
     def write_attn(path):
         A = gen_attn_fa
-        keys = ("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
+        keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)))
         saved = {k: getattr(A, k) for k in keys}
         twins = [(path, MAIN_FLAGS), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS))]
         if not A.KDEC:   # the KT2 twin (fp16 sources only)
