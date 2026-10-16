@@ -10,7 +10,7 @@ Blocks are 128 keys. Per attention layer and chunk:
               KV heads), so the attention (on the int4 pools directly) loads it like any key.
   yah_fpsel   per (16-token query block, KV head): scores the prior blocks with the pooled keys over the block's 96 query
               rows (6 heads), E_J = sum_r exp(q_r . kbar_J - M), keeps E_J >= ALPHA max E plus the sink and window
-              blocks (the answer tile, the query block holding the chunk's last live token, keeps every block, as LSE),
+              blocks (the answer tile, the query block holding the prompt's last token, keeps every block, as LSE),
               and writes the tile list: the kept blocks' 32-key tiles, the chunk's own tiles up to the causal
               limit, then correction tiles of 32 pooled rows with a bit per row (1 = a dropped candidate block, scored
               with a log 128 shift: mean correction).
@@ -329,7 +329,8 @@ def gen_fpsel(cap, B, alpha=ALPHA):
     """yah_fpsel: the tile lists (module doc). Grid (B / 16 query blocks, 4 KV heads), 256 threads (8 waves).
     Config: start_pos (the chunk's first token), tpad (pooled key base = the pool's whole-page capacity).
     Bindings: q (f16 [B][6144], q / 16 as the attention reads it), kmean (the layer's [block][1024]), valid (live tokens
-    of the chunk), sel (i32 lists).
+    of the chunk), answer (i32: the live tokens of the prompt's final chunk, whose last row is the answer; 0 on the
+    others: no answer tile), sel (i32 lists).
     Scores D[query row][block] = Q kbar^T on WMMA (f32 accumulate): wave w takes the 16-block column tiles 2p, 2p + 1
     (p = w, w + 8, ...); a lane holds block lane % 16 and rows 16 t + 2 i + lane / 16, so each block reduction is in-lane
     plus one xor-16 shuffle. Every thread builds the list: thread t owns blocks KPT t .. + KPT - 1, workgroup scans place
@@ -356,7 +357,7 @@ def gen_fpsel(cap, B, alpha=ALPHA):
     e("  %c256 = index.constant 256 : index")
     e("  %c1 = index.constant 1 : index")
     e("  kernel.launch.config workgroups(%cnq, %c4, %c1) workgroup_size(%c256, %c1, %c1) : index")
-    e("} launch(%q: buffer, %kmean: buffer, %valid: buffer, %sel: buffer) {")
+    e("} launch(%q: buffer, %kmean: buffer, %valid: buffer, %answer: buffer, %sel: buffer) {")
     e("  %base = index.constant 0 : offset")
     _consts(e, (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 128, 256, 1024, 6144))
     e("  %start_pos = config.get @yah_fpsel.start_pos : index")
@@ -379,6 +380,10 @@ def gen_fpsel(cap, B, alpha=ALPHA):
     e("  %nv1 = index.cast %nv0 : i32 to index")
     e(f"  %nvB = index.constant {B} : index")
     e("  %nv = index.min %nv1, %nvB : index")
+    e("  %an_flat = buffer.view %answer[%base] : buffer -> view<1xi32>")
+    e("  %an0 = view.load %an_flat[%c0] : view<1xi32> -> i32")
+    e("  %an1 = index.cast %an0 : i32 to index")
+    e("  %anv = index.min %an1, %nvB : index")
     e(f"  %pb = index.constant {LDS} : offset")
     e("  %pool = buffer.alloca<workgroup> align(16) %pb : buffer")
     e(f"  %qv = buffer.view %pool[%base] : buffer -> view<96x{QP}xf16>")
@@ -554,10 +559,11 @@ def gen_fpsel(cap, B, alpha=ALPHA):
     e("  %onef = scalar.constant 1.0 : f32")
     e("  %zi = scalar.constant 0 : i32")
     e("  %onei = scalar.constant 1 : i32")
-    # answer tile (as LSE): the 16-token block holding the chunk's last live token keeps every block exact
+    # answer tile (as LSE): the 16-token block holding the prompt's last token keeps every block exact
     e("  %qs16 = index.add %qs, %c16 : index")
-    e("  %anlo = index.cmp ugt, %nv, %qs : index")
-    e("  %anhi = index.cmp ule, %nv, %qs16 : index")
+    e("  %live = index.cmp ugt, %nv, %qs : index")
+    e("  %anlo = index.cmp ugt, %anv, %qs : index")
+    e("  %anhi = index.cmp ule, %anv, %qs16 : index")
     e("  %ans = scalar.andi %anlo, %anhi : i1")
     # kept blocks (this thread's KPT): flag 1.0 / 0.0 into the m array (the correction words read it)
     e("  %jt0 = index.mul %tid, %ckpt : index")
@@ -570,7 +576,7 @@ def gen_fpsel(cap, B, alpha=ALPHA):
         e(f"  {p}Jr = index.min {p}J, %nbm1 : index")
         e(f"  {p}E = view.load %sv[{p}Jr] : view<{nbm}xf32> -> f32")
         e(f"  {p}T = scalar.cmpf oge, {p}E, %thr : f32")
-        e(f"  {p}TL = scalar.andi {p}T, %anlo : i1")      # a dead query block keeps only the forced blocks
+        e(f"  {p}TL = scalar.andi {p}T, %live : i1")      # a dead query block keeps only the forced blocks
         e(f"  {p}S = index.cmp ult, {p}J, %csink : index")
         e(f"  {p}W = index.cmp uge, {p}J, %nbw : index")
         e(f"  {p}SW = scalar.ori {p}S, {p}W : i1")

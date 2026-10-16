@@ -195,9 +195,11 @@ class LoomPrefill {
   // recurrent state are still written); a row index: the tail's GEMMs run only the token tile that holds it.
   static constexpr std::int64_t kAllRows = -1, kNoRows = -2;
 
-  // Enqueue the 64 layers for chunk ci (absolute positions ci * B ..), on the hidden() rows from Embed().
-  void RunLayers(std::uint32_t ci, const KvHook& hook = {}, std::int64_t keep = kAllRows) {
+  // Enqueue the 64 layers for chunk ci (absolute positions ci * B ..), on the hidden() rows from Embed(). answer: the
+  // chunk holds the prompt's last token, whose row the caller reads (fpsparse keeps its 16-token block exact).
+  void RunLayers(std::uint32_t ci, const KvHook& hook = {}, std::int64_t keep = kAllRows, bool answer = false) {
     keep_rows_ = keep;
+    answer_ = answer;
     if (std::size_t{ci + 1} * B_ > T_) throw LoomError("prefill: chunk past the emitted context");
     if (n_ == 0) throw LoomError("prefill: RunLayers before Embed");
     if (flags_) gpu_.Fill(*flags_, 0);   // the chunk's completion counters (FlagSlot), in stream order before its work
@@ -739,6 +741,7 @@ class LoomPrefill {
     hidden2_ = &Alloc(B * kHidden * 4);
     normed_ = &Alloc(std::size_t{kHidden} * 4);
     valid_ = &Alloc(4);
+    noans_ = &Alloc(4);
     ids_ = &Alloc(B * 4);
     host_ids_.resize(B);
     const float epsv = 1.0e-6f;
@@ -747,6 +750,7 @@ class LoomPrefill {
     Zero(*state_);
     Zero(*kv16_);
     Zero(*reszero_);
+    Zero(*noans_);
 
     // "kv_paged": 256-token pages, one page table per sequence (logical -> physical page, shared by all layers).
     kv_paged_ = geom_.count("kv_paged") != 0;
@@ -2201,7 +2205,7 @@ class LoomPrefill {
     if (fps) {  // the tile lists, from the rotated Q the attention reads
       if (!qrot) throw LoomError("fpsparse needs the rotated Q (qrot) on its chunks");
       Dispatch(ChunkExe("fpsel", ci), "yah_fpsel", B_ / 16, kKvHeads, 1, 256, 1, 1,
-               {Ref(*qr16_), kfm_l, Ref(*valid_), Ref(*fsel_)});
+               {Ref(*qr16_), kfm_l, Ref(*valid_), Ref(answer_ ? *valid_ : *noans_), Ref(*fsel_)});
       if (std::getenv("YAH_FPS_STATS")) FpsStats(ai, ci);
     }
     {
@@ -2972,10 +2976,11 @@ class LoomPrefill {
              *lse_ = nullptr, *eps_ = nullptr, *ffnup_ = nullptr, *gateffn_ = nullptr, *uwstage_ = nullptr,
              *wstage_ = nullptr, *ostage_ = nullptr, *partial_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
-             *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr, *qr16_ = nullptr,
+             *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr, *noans_ = nullptr, *qr16_ = nullptr,
              *kdeq_ = nullptr, *vdeq_ = nullptr, *ids_ = nullptr,
              *normt_ = nullptr;
   std::int64_t keep_rows_ = kAllRows, tail_ = kAllRows, trim_row_ = kAllRows;
+  bool answer_ = false;
 };
 
 }  // namespace yah::model
