@@ -47,7 +47,9 @@ POOL = OS + 8 * 2 * 16 * 16 * 2
 assert POOL <= 65536
 
 
-def gen(heads):
+def gen(heads, flag=False):
+    """flag: binding cnt after out (i32, zero before); each row-wave lane adds 1 after its last stores (release), so a
+    flag-waiting consumer (gen_rot.gen_pnq "ab") sees the outputs once cnt reaches done_count(len(heads))."""
     L = []
     e = L.append
     nh = len(heads)
@@ -67,7 +69,7 @@ def gen(heads):
     e(f"  %launch_heads = index.constant {nh} : index")
     e("  kernel.launch.config workgroups(%unit, %launch_heads, %unit) workgroup_size(%nthreads, %unit, %unit) : index")
     e("} launch(%conv: buffer, %x: buffer, %cw: buffer, %cst: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, "
-      "%ssm_dt: buffer, %valid: buffer, %state: buffer, %out: buffer) {")
+      "%ssm_dt: buffer, %valid: buffer, %state: buffer, %out: buffer" + (", %cnt: buffer" if flag else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 31, 32, 40, 48, 64, 127, 128, 255, 16384):
         e(f"  %c{v} = index.constant {v} : index")
@@ -751,6 +753,10 @@ def gen(heads):
             for hi, hlf in enumerate("ab"):
                 e(f"    %fv{j}{hlf} = vector.from_elements {', '.join(ov[4 * hi:4 * hi + 4])} : {V4}")
                 e(f"    vector.store %fv{j}{hlf}, %state_view[%sq{j}{hlf}] : {V4}, view<[%state_total]xf32>")
+        if flag:
+            e("    %dn_cv = buffer.view %cnt[%base] : buffer -> view<1xi32>")
+            e("    %dn_one = scalar.constant 1 : i32")
+            e("    view.atomic.reduce<addi> %dn_one, %dn_cv[%c0] {ordering = release, scope = device} : i32, view<1xi32>")
 
     # wave-uniform role branch: every barrier inside has a matching barrier in the other region (HRX patch 0037)
     e("  scf.if %issv {")
@@ -761,6 +767,11 @@ def gen(heads):
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+def done_count(nh):
+    """gen(flag)'s count once all nh workgroups are done: one per row-wave lane"""
+    return nh * (THREADS - 32)
+
 
 def main():
     import gen_rot

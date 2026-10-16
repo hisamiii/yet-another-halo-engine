@@ -668,6 +668,7 @@ class LoomPrefill {
     a4_ = geom_.count("a4") != 0;
     nqov_ = a4_ && geom_.count("nqov") != 0;
     dnov_ = a4_ && geom_.count("dnov") != 0;
+    pnq_ab_ = dnov_ && geom_.count("pnq_abf.hal") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
@@ -2183,7 +2184,7 @@ class LoomPrefill {
     bool gate_late = false;
     // dnov: the qkv GEMM and the conv, the gate GEMM and pnq part a as flagged pairs (FlagSlot), so the conv runs in the
     // qkv GEMM's tail and pnq part a in the gate GEMM's
-    hrx_buffer_ref_t qkv_cnt{}, gate_cnt{};
+    hrx_buffer_ref_t qkv_cnt{}, gate_cnt{}, dn_cnt{};
     bool qkv_flagged = false, gate_flagged = false;
     if (!qkv_split.empty() && !gate_split.empty()) {
       // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows (one job: the same activations)
@@ -2267,10 +2268,20 @@ class LoomPrefill {
                                              Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")),
                                              TRef(*Find(pre + "ssm_dt.bias")), Ref(*valid_)};
       auto ba = in, bb = in;
-      ba.insert(ba.end(), {st, Ref(*raw_)});
-      bb.insert(bb.end(), {st, Ref(*raw2_)});
+      if (pnq_ab_) {
+        // raw_: part b's compact f16 rows, then part a's (gen_rot.gen_pnq "ab"); part b counts its finished lanes in
+        // dn_cnt, which the merged pnq waits on
+        const std::size_t b_bytes = std::size_t{B_} * geom_.at("pnq_b.hal").tt * 1024 * 2;
+        ba.insert(ba.end(), {st, {raw_->handle, b_bytes, std::size_t{B_} * geom_.at("pnq_a.hal").tt * 1024 * 2}});
+        dn_cnt = FlagSlot();
+        bb.insert(bb.end(), {st, {raw_->handle, 0, b_bytes}, dn_cnt});
+      } else {
+        ba.insert(ba.end(), {st, Ref(*raw_)});
+        bb.insert(bb.end(), {st, Ref(*raw2_)});
+      }
       Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, dn_threads_, 1, 1, ba, 0b11000000000);
-      Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, dn_threads_, 1, 1, bb, 0b11000000000);
+      Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, dn_threads_, 1, 1, bb, 0b111000000000,
+               nullptr, pnq_ab_ ? 0b100000000000 : 0);
       // The second part's few workgroups leave most of the GPU to the gate GEMM; pnq part a beside it was DRAM-bound and
       // slowed it about as much, but gained less than the GEMM's whole tail and the conv's wait.
       if (gate_late) {
@@ -2325,15 +2336,23 @@ class LoomPrefill {
       // other pair, which becomes aq_ / ad_
       const LoomBuffer& q = gate_flagged ? *aq2_ : *aq_;
       const LoomBuffer& d = gate_flagged ? *ad2_ : *ad_;
-      if (gate_flagged)
+      if (pnq_ab_) {
+        // raw_ untracked: part a's DeltaNet is behind the barrier before part b's, part b's done count is dn_cnt
+        if (!gate_flagged || !dn_done) throw LoomError("pnq_abf.hal needs the flagged gate GEMM and dnvconv");
+        const Geom& gab = geom_.at("pnq_abf.hal");
+        Dispatch(Exe("pnq_abf.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
+                 {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt, dn_cnt}, 0b1100000,
+                 nullptr, 0b110000101);
+      } else if (gate_flagged)
         Dispatch(Exe("pnq_af.hal"), "yah_pnq", ga.tt, B_, 1, ga.rowgrp, 1, 1,
                  {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt}, 0b1100000, nullptr,
                  0b10000100);
       else
         Dispatch(Exe("pnq_a.hal"), "yah_pnq", ga.tt, B_, 1, ga.rowgrp, 1, 1,
                  {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d)}, 0b1100000);
-      Dispatch(Exe("pnq_b.hal"), "yah_pnq", gb.tt, B_, 1, gb.rowgrp, 1, 1,
-               {Ref(*raw2_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d)}, 0b1100000);
+      if (!pnq_ab_)
+        Dispatch(Exe("pnq_b.hal"), "yah_pnq", gb.tt, B_, 1, gb.rowgrp, 1, 1,
+                 {Ref(*raw2_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d)}, 0b1100000);
       if (gate_flagged) std::swap(aq_, aq2_), std::swap(ad_, ad2_);
       if (dn_done) ring();
       trim_row_ = tail_;
@@ -2806,6 +2825,7 @@ class LoomPrefill {
   LoomBuffer *rot_signs_ = nullptr, *rotbuf_ = nullptr;
   // A4 sets (dispatch.txt "a4"): int4 activations (B_ x kFfn / 2 bytes) and their scales (one per 128) for the iu4 GEMMs
   bool a4_ = false, nqov_ = false, dnov_ = false;
+  bool pnq_ab_ = false;   // dispatch.txt pnq_abf.hal: one flagged pnq for both DeltaNet parts, their outputs in raw_
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
   std::size_t flag_slot_ = 0;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,

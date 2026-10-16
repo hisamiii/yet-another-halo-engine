@@ -1709,6 +1709,8 @@ def main():
     open(postnorm_src, "w").write(postnorm_base)
     dn_perm = a4 and DNSPLIT == (40, 8)
     dn_ss = DNSS and dn_perm and dn_vconv and DNO16 and B % 32 == 0
+    # one flagged pnq for both DeltaNet parts (gen_rot.gen_pnq "ab"): part b's DeltaNet counts its finished lanes
+    pnq_ab = DNOV_ON and dn_ss
     # blocks per head of the DeltaNet grid (the unsplit rowsplit.hal is not dispatched with dnsplit)
     geom.append(("rowsplit.hal", 0, 1 if dn_ss else 2, 0))
     geom.append(("dnthreads", gen_gdn_ss.THREADS if dn_ss else 256, 0, 0))
@@ -1722,7 +1724,7 @@ def main():
             if dn_perm:
                 assert len(gen_rot.pn_heads(tag)) == nh
                 if dn_ss:
-                    open(src, "w").write(gen_gdn_ss.gen(gen_rot.pn_heads(tag)))
+                    open(src, "w").write(gen_gdn_ss.gen(gen_rot.pn_heads(tag), flag=pnq_ab and tag == "b"))
                 else:
                     open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=DNO16))
             else:
@@ -1832,6 +1834,13 @@ def main():
                     rot_src["pnq_af.hal"] = os.path.join(tmp, "pnq_af.loom")
                     open(rot_src["pnq_af.hal"], "w").write(
                         gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "a", o16=DNO16, flag=gen_gemm_iu4.flag_count(6144)))
+                if pnq_ab:   # both parts in one grid (raw_: part b's compact f16 rows, then part a's), so part b no
+                    # longer dispatches behind part a's waiting workgroups
+                    rot_src["pnq_abf.hal"] = os.path.join(tmp, "pnq_abf.loom")
+                    open(rot_src["pnq_abf.hal"], "w").write(
+                        gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
+                                        dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
+                    geom.append(("pnq_abf.hal", 0, 64, len(gen_rot.pnq_groups("ab")) // 4))
         with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
             fh.write(gen_rot.signs())
         geom.append(("rot", 0, 0, 0))
