@@ -1595,6 +1595,9 @@ def main():
     # QB_ZIGZAG: the short causal blocks are mostly Q / gate / O traffic; launched last (longest first) they ran as a
     # DRAM-bound tail. Interleaved with the long ones: pp2048 attention -5.5% cycles, bit-identical, neutral at depth
     MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=True)
+    # the role-split twins too: EPI_FAST + CTX16 halve their epilogue VALU (B waves normalize all 256 dims alone);
+    # bit-identical, KT2 -1.6% at 16K, -0.5% at 32K, -0.8% at 96K
+    TWIN_EPI = dict(EPI_FAST=True, CTX16=B % 16 == 0)
 
     kt2_cfg = (a_hpw, a_qt) if EMIT_HALF else KT2_SHAPE
     kt2_shape = kt2_cfg if kt2_cfg != (a_hpw, a_qt) else None   # a shape of its own: its chunks get dispatch.txt rows
@@ -1604,10 +1607,10 @@ def main():
         keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
                                    + tuple(KT2_SHAPE_FLAGS)))
         saved = {k: getattr(A, k) for k in keys}
-        twins = [(path, MAIN_FLAGS, None), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS), None)]
+        twins = [(path, MAIN_FLAGS, None), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI), None)]
         if not A.KDEC:   # the KT2 twin (fp16 sources only)
-            twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **(KT2_SHAPE_FLAGS if kt2_cfg == KT2_SHAPE else {})),
-                          kt2_shape))
+            twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI,
+                                          **(KT2_SHAPE_FLAGS if kt2_cfg == KT2_SHAPE else {})), kt2_shape))
         for name, flags, shape in twins:
             for k, v in flags.items():
                 setattr(A, k, v)
