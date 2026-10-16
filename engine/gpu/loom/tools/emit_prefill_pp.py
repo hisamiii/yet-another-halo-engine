@@ -363,7 +363,9 @@ OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (1
 # 88K..126K vs the 4-workgroup kernel / the deep twin (standalone); not bit-identical (the running max moves per 32 keys).
 KT2_FROM = int(os.environ.get("YAH_KT2_FROM", "16384"))
 # Block-sparse prefill attention (gen_fpsparse, FlashPrefill V2) from YAH_FPS_FROM tokens of context on (0: off), kv4 paged
-# sets with the KT2 twin only. YAH_FPS_ALPHA: the block threshold (fraction of the query block's top block score).
+# sets with the KT2 twin only (its chunks take the sparse KT2 twin whatever KT2_FROM is). 32K, alpha 0.1: from 4096 vs
+# 16384 -2.5% cycles at the same quality (KL / needles / answer tile within the redraw band).
+# YAH_FPS_ALPHA: the block threshold (fraction of the query block's top block score).
 # The f16 pools grow by the pooled-row pages (every attention HAL and vdeq use the extended capacity).
 # dispatch.txt "fpsparse <first chunk> <extension pages> <list stride>"
 FPS_FROM = int(os.environ.get("YAH_FPS_FROM", "0"))
@@ -1617,8 +1619,8 @@ def main():
     fps_on = bool(FPS_FROM) and kvdeq and deq_bits == 4 and kt2_cfg == KT2_SHAPE == (6, 16) and not EMIT_HALF
     if FPS_FROM and not fps_on:
         raise SystemExit("YAH_FPS_FROM needs a kv4 paged set with the 6x16 KT2 twin")
-    if fps_on and (B % gen_fpsparse.BLK or T % 256 or FPS_FROM % B or FPS_FROM < KT2_FROM):
-        raise SystemExit("YAH_FPS_FROM: chunk a multiple of 128, context of 256, FPS_FROM a chunk start >= KT2_FROM")
+    if fps_on and (B % gen_fpsparse.BLK or T % 256 or FPS_FROM % B or FPS_FROM < B):
+        raise SystemExit("YAH_FPS_FROM: chunk a multiple of 128, context of 256, FPS_FROM a chunk start past chunk 0")
     fps_ls = gen_fpsparse.list_stride(T, B)
     fps_ext = gen_fpsparse.ext_pages(T)
     cap_attn = T + 256 * fps_ext if fps_on else T    # the f16 pools' capacity (pooled-row pages appended)
