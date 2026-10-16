@@ -161,6 +161,8 @@ KT2 = False         # PAIR: 32 keys per loop iteration (two 16-key subtiles): on
                     # registers to its next P.V. Not bit-identical (the running max moves per 32 keys).
 KT2_IL = 0          # KT2: interleaved per-subtile QK chains, a schedule fence every KT2_IL fragment pairs (0: two chains per subtile)
 KT2_BS = False      # KT2, B: P.V of subtile 0 over all output fragments, then subtile 1
+KT2_P2 = False      # KT2: two P^T / alpha slots by tile parity; B loads the previous tile's at its arm start (no carry)
+MAPS_EARLY = False  # K / V^T staging maps before the Q prologue (low registers for the loop invariants)
 KT2_VP = 40         # KT2: V^T pitch (32 keys + 8 pad)
 PLDS = False        # P^T exchange through LDS (one store, two loads; no shuffle / half selects)
 PLDS_FENCE = True
@@ -321,6 +323,33 @@ def qnorm_tree(e, p, lvl):
             nxt.append(f"%{p}{d}_{i}")
         lvl, d = nxt, d + 1
     return lvl[0]
+
+
+def staging_maps(e):
+    """Staging maps. K: item j = tid + 256nn, key = j/32, d8 = (j%32)*8, LDS row 2*(key%8) + key/8.
+    One key row per wave: coalesced global, contiguous LDS.
+    V^T: lane = dim, LDS row (dim/16)*16 + 2*(dim%8) + (dim%16)/8."""
+    e("  %vdl = index.rem %vt, %c16 : index")
+    e("  %vdb = index.sub %vt, %vdl : index")
+    e("  %vdl8 = index.rem %vdl, %c8 : index")
+    e("  %vdh = index.div %vdl, %c8 : index")
+    e("  %vdr0 = index.mul %vdl8, %c2 : index")
+    e("  %vdr1 = index.add %vdr0, %vdh : index")
+    if VSWZ and (VSWZ_T or not TILED_OUT):   # with TILED_OUT the paged build allocates 236 VGPRs (192 without)
+        e("  %vrow = index.add %vt, %c0 : index")
+    else:
+        e("  %vrow = index.add %vdb, %vdr1 : index")
+
+    for nn in range(2):
+        e(f"  %ki{nn}c = index.constant {256 * nn} : index")
+        e(f"  %ki{nn} = index.add %tid, %ki{nn}c : index")
+        e(f"  %kk{nn} = index.div %ki{nn}, %c32 : index")
+        e(f"  %kd{nn}a = index.rem %ki{nn}, %c32 : index")
+        e(f"  %kd{nn} = index.mul %kd{nn}a, %c8 : index")
+        e(f"  %kk{nn}l = index.rem %kk{nn}, %c8 : index")
+        e(f"  %kk{nn}h = index.div %kk{nn}, %c8 : index")
+        e(f"  %kk{nn}r0 = index.mul %kk{nn}l, %c2 : index")
+        e(f"  %kr{nn} = index.add %kk{nn}r0, %kk{nn}h : index")
 
 
 def qnorm_phase1(e):
@@ -604,12 +633,15 @@ def gen():
     pool = max(pool, K2_OFF + KT * KT_PITCH * 2) if PIPE2 else pool
     if PAIR:   # no S exchange: P^T slots 2 x 4 pairs x 512 B, alpha 2 x 256 B, row sums 256 B
         pool = S_OFF + 4096 + 512 + 256
-    if KT2:    # K 32 x KT_PITCH, V^T 256 x KT2_VP, one P^T slot (2 subtiles x 128 rows x 16 B), alpha 64 f32
+    global PPV, ALV
+    nsl = 2 if KT2 and KT2_P2 else 1
+    PPV, ALV = f"view<{64 * NQB * nsl}x8xf16>", f"view<{16 * NQB * nsl}xf32>"
+    if KT2:    # K 32 x KT_PITCH, V^T 256 x KT2_VP, one P^T slot (2 subtiles x 32 NQB rows x 16 B), alpha 16 NQB f32
         assert PAIR and DOWHILE and not (PAIR_MID or PAIR_LATE or PAIR_PF or KDEC or VQ4 or VQ8)
         KT2_V = 32 * KT_PITCH * 2
         KT2_P = KT2_V + 256 * KT2_VP * 2
-        KT2_A = KT2_P + 4096
-        pool = KT2_A + 256
+        KT2_A = KT2_P + 1024 * NQB * nsl
+        pool = KT2_A + 64 * NQB * nsl
     if SOFT1:  # S partials (B's), then P^T 4 pairs x 512 B, alpha 256 B, row sums 256 B (x2 slots under SOFT3)
         pool = S_OFF + NT * 32 + (4096 + 768 if SOFT3 or SOFT4 else 2048 + 512)
     global QX_OFF
@@ -649,10 +681,10 @@ def gen():
         e("  %ls_view = buffer.view %pool[%ls_o] : buffer -> view<64xf32>")
     if KT2:
         e(f"  %pp_o = index.constant {KT2_P} : offset")
-        e("  %pp_view = buffer.view %pool[%pp_o] : buffer -> view<256x8xf16>")
+        e(f"  %pp_view = buffer.view %pool[%pp_o] : buffer -> {PPV}")
         e(f"  %al_o = index.constant {KT2_A} : offset")
-        e("  %al_view = buffer.view %pool[%al_o] : buffer -> view<64xf32>")
-        e("  %ls_view = buffer.view %pool[%base] : buffer -> view<64xf32>")   # after the loop, over K
+        e(f"  %al_view = buffer.view %pool[%al_o] : buffer -> {ALV}")
+        e(f"  %ls_view = buffer.view %pool[%base] : buffer -> {ALV}")   # after the loop, over K
     elif PAIR:
         e("  %pp_view = buffer.view %pool[%s_o] : buffer -> view<256x8xf16>")
         e(f"  %al_o = index.constant {S_OFF + 4096} : offset")
@@ -691,8 +723,11 @@ def gen():
     if PAIR or SOFT1:   # the role from the subgroup id: wave-uniform to Loom, so the role branch is a scalar branch
         e("  %psg = kernel.subgroup.id : index")
     if PAIR and PAIR_MAP == "mod":
-        e("  %wqb = index.rem %psg, %c4 : index")       # query block 0..3
-        e("  %prole = index.div %psg, %c4 : index")     # 0: A (QK + softmax), 1: B (P.V)
+        cq = "%c4" if NQB == 4 else "%cnqb"
+        if NQB != 4:
+            e(f"  %cnqb = index.constant {NQB} : index")
+        e(f"  %wqb = index.rem %psg, {cq} : index")       # query block 0..NQB-1
+        e(f"  %prole = index.div %psg, {cq} : index")     # 0: A (QK + softmax), 1: B (P.V)
         e("  %hd = index.add %c0, %c0 : index")
     elif PAIR:
         e("  %wqb = index.div %psg, %c2 : index")
@@ -814,6 +849,8 @@ def gen():
         else:
             e("  %v8m = scalar.constant 66847740 : i32")        # 0x03fc03fc
         e("  %v4g = scalar.constant 1006648320 : i32")     # 0x3c003c00
+    if MAPS_EARLY:
+        staging_maps(e)
     e("  %ctx_end = index.add %start_pos, %B : index")
     e("  %qs32 = index.add %qs, %cqt : index")
     e("  %vis0 = index.add %start_pos, %qs32 : index")
@@ -956,30 +993,8 @@ def gen():
         for c in range(8):
             e(f"  %qf{c} = vector.fragment<rhs> %ql0f{c} shape [%k, %n] : {V16H}")
 
-    # Staging maps. K: item j = tid + 256nn, key = j/32, d8 = (j%32)*8, LDS row 2*(key%8) + key/8.
-    # One key row per wave: coalesced global, contiguous LDS.
-    # V^T: lane = dim, LDS row (dim/16)*16 + 2*(dim%8) + (dim%16)/8.
-    e("  %vdl = index.rem %vt, %c16 : index")
-    e("  %vdb = index.sub %vt, %vdl : index")
-    e("  %vdl8 = index.rem %vdl, %c8 : index")
-    e("  %vdh = index.div %vdl, %c8 : index")
-    e("  %vdr0 = index.mul %vdl8, %c2 : index")
-    e("  %vdr1 = index.add %vdr0, %vdh : index")
-    if VSWZ and (VSWZ_T or not TILED_OUT):   # with TILED_OUT the paged build allocates 236 VGPRs (192 without)
-        e("  %vrow = index.add %vt, %c0 : index")
-    else:
-        e("  %vrow = index.add %vdb, %vdr1 : index")
-
-    for nn in range(2):
-        e(f"  %ki{nn}c = index.constant {256 * nn} : index")
-        e(f"  %ki{nn} = index.add %tid, %ki{nn}c : index")
-        e(f"  %kk{nn} = index.div %ki{nn}, %c32 : index")
-        e(f"  %kd{nn}a = index.rem %ki{nn}, %c32 : index")
-        e(f"  %kd{nn} = index.mul %kd{nn}a, %c8 : index")
-        e(f"  %kk{nn}l = index.rem %kk{nn}, %c8 : index")
-        e(f"  %kk{nn}h = index.div %kk{nn}, %c8 : index")
-        e(f"  %kk{nn}r0 = index.mul %kk{nn}l, %c2 : index")
-        e(f"  %kr{nn} = index.add %kk{nn}r0, %kk{nn}h : index")
+    if not MAPS_EARLY:
+        staging_maps(e)
 
     if KDEC:
         # thread = (key tid/16, 16-dim chunk tid%16); LDS row 2*(key%8) + key/8
@@ -1273,6 +1288,16 @@ def gen():
         k0b = load_k("%c16", "p0b", "  ")
         stage_k("%c16", k0b, "p0t", "  ", kv="%k_view1")
         stage_v_(["%zh8"] * 4, "%c0", "pz", "  ")
+        if KT2_P2:   # slot 1 = tile -1: P^T 0, alpha 1 (one row per thread: NT = 64 NQB)
+            e(f"  %c2slot = index.constant {64 * NQB} : index")
+            e(f"  %c2al = index.constant {16 * NQB} : index")
+            e("  %p2zr = index.add %tid, %c2slot : index")
+            e(f"  vector.store %zh8, %pp_view[%p2zr, %c0] : vector<8xf16>, {PPV}")
+            e("  %p2za = index.cmp ult, %tid, %c2al : index")
+            e("  scf.if %p2za {")
+            e("    %p2zai = index.add %tid, %c2al : index")
+            e(f"    view.store %one, %al_view[%p2zai] : f32, {ALV}")
+            e("  }")
     elif SOFT1 and (SOFT2 or SOFT4):
         stage_v_(["%zh8", "%zh8"], "%c0", "pz", "  ")
         e("  %pzlo = index.cmp ult, %tid, %c128 : index")
@@ -1513,7 +1538,7 @@ def gen():
         e("  %prow_lo = index.add %pw32, %sub : index")       # B: the h0 lane's row ...
         e("  %prow_hi = index.add %prow_lo, %c16 : index")    # ... and the h1 lane's
         e("  %pa_own = index.add %pw16, %sub : index")
-        e("  %c128p = index.constant 128 : index")
+        e(f"  %c128p = index.constant {32 * NQB} : index")   # one P^T subtile slot (128 rows at NQB 4)
     if PAIR:
         rnames = [f"%rb{f}" for f in range(16)]
         BK = "vector<8xi32>" if PAIR_I32 else V8
@@ -2065,10 +2090,17 @@ def gen():
                 e(f"{ind}%t{t}pm{i} = scalar.fmaf %t{t}pe{i}, %one_o, %zero_o : f32")
                 e(f"{ind}%t{t}pt{i} = scalar.fptrunc %t{t}pm{i} : f32 to f16")
             e(f"{ind}%t{t}ph = vector.from_elements {', '.join(f'%t{t}pt{i}' for i in range(8))} : {V8H}")
+            r0 = "%prow_own"
+            if KT2_P2:
+                if not t:
+                    e(f"{ind}%t0pwr = index.add %prow_own, %k2wr : index")
+                r0 = "%t0pwr"
             if t:
-                e(f"{ind}%t1pwr = index.add %prow_own, %c128p : index")
-            e(f"{ind}vector.store %t{t}ph, %pp_view[{'%t1pwr' if t else '%prow_own'}, %c0] : {V8H}, view<256x8xf16>")
-        e(f"{ind}view.store %rss, %al_view[%pa_own] : f32, view<64xf32>")
+                e(f"{ind}%t1pwr = index.add {r0}, %c128p : index")
+            e(f"{ind}vector.store %t{t}ph, %pp_view[{'%t1pwr' if t else r0}, %c0] : {V8H}, {PPV}")
+        if KT2_P2:
+            e(f"{ind}%k2wai = index.add %pa_own, %k2wa : index")
+        e(f"{ind}view.store %rss, %al_view[{'%k2wai' if KT2_P2 else '%pa_own'}] : f32, {ALV}")
 
     def pair_pv2(pc0, pc1, alc, R, pp, ind):
         """KT2, B: rescale the O bank by alpha (pass-through first), then per output fragment the P.V MMAs of both subtiles."""
@@ -2124,6 +2156,24 @@ def gen():
                 e(f"{ind}scf.schedule.fence")
         return outs
 
+    def p2_read(rb, ab, px, ind):
+        """KT2_P2: P^T fragments of both subtiles + alpha from the slot at rows rb / alpha ab"""
+        e(f"{ind}%{px}rl = index.add %prow_lo, {rb} : index")
+        e(f"{ind}%{px}rh = index.add %prow_hi, {rb} : index")
+        out = []
+        for t in range(2):
+            if t:
+                e(f"{ind}%{px}rl1 = index.add %{px}rl, %c128p : index")
+                e(f"{ind}%{px}rh1 = index.add %{px}rh, %c128p : index")
+            rl, rh = (f"%{px}rl1", f"%{px}rh1") if t else (f"%{px}rl", f"%{px}rh")
+            e(f"{ind}%{px}t{t}lo = vector.load %pp_view[{rl}, %c0] : {PPV} -> {V8H}")
+            e(f"{ind}%{px}t{t}hi = vector.load %pp_view[{rh}, %c0] : {PPV} -> {V8H}")
+            e(f"{ind}%{px}pc{t} = vector.concat<0> %{px}t{t}lo, %{px}t{t}hi : {V8H}, {V8H} -> {V16H}")
+            out.append(f"%{px}pc{t}")
+        e(f"{ind}%{px}ai = index.add %pa_own, {ab} : index")
+        e(f"{ind}%{px}al = view.load %al_view[%{px}ai] : {ALV} -> f32")
+        return out + [f"%{px}al"]
+
     def body_pair2():
         """KT2 tile ks (32 keys). Phase 1, A: QK(ks) + softmax -> P^T / alpha; B: P.V(ks - 32) from the carried P^T / alpha
         and the V tile in LDS. Phase 2: every wave reads P^T / alpha of this tile; stage V(ks), K(ks + 32)."""
@@ -2135,6 +2185,14 @@ def gen():
         nk = load_k("%ks32", "nka", I) + load_k("%ks48", "nkb", I)
         nv = load_v("%ks_", "nva", I) + load_v("%ks16", "nvb", I)
         nb = [f"%nb{f}" for f in range(16)]
+        if KT2_P2:   # A writes slot (ks / 32) % 2, B reads the other one (the previous tile's)
+            e(f"{I}%k2t = index.div %ks_, %ks32c : index")
+            e(f"{I}%k2p = index.rem %k2t, %c2 : index")
+            e(f"{I}%k2q = index.sub %c1, %k2p : index")
+            e(f"{I}%k2wr = index.mul %k2p, %c2slot : index")
+            e(f"{I}%k2wa = index.mul %k2p, %c2al : index")
+            e(f"{I}%k2rr = index.mul %k2q, %c2slot : index")
+            e(f"{I}%k2ra = index.mul %k2q, %c2al : index")
 
         def arm_a():
             S = pair_a2(rnames, I + "  ")
@@ -2142,7 +2200,11 @@ def gen():
             e(f"{I}  scf.yield {', '.join(rnames)}, %nmax, %nsum : {rtypes}, f32, f32")
 
         def arm_b():
-            outs = pair_pv2("%pc0", "%pc1", "%alc", rnames, "bp", I + "  ")
+            if KT2_P2:
+                pt = p2_read("%k2rr", "%k2ra", "b2", I + "  ")
+                outs = pair_pv2(*pt, rnames, "bp", I + "  ")
+            else:
+                outs = pair_pv2("%pc0", "%pc1", "%alc", rnames, "bp", I + "  ")
             e(f"{I}  scf.yield {', '.join(outs)}, %rmax, %rsum : {rtypes}, f32, f32")
         e(f"{I}{', '.join(nb)}, %qmax, %qsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
         arm_a()
@@ -2150,15 +2212,16 @@ def gen():
         arm_b()
         e(f"{I}}}")
         e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        for t in range(2):
+        for t in range(0 if KT2_P2 else 2):
             if t:
                 e(f"{I}%t1rl = index.add %prow_lo, %c128p : index")
                 e(f"{I}%t1rh = index.add %prow_hi, %c128p : index")
             rl, rh = ("%t1rl", "%t1rh") if t else ("%prow_lo", "%prow_hi")
-            e(f"{I}%t{t}plo = vector.load %pp_view[{rl}, %c0] : view<256x8xf16> -> {V8H}")
-            e(f"{I}%t{t}phi = vector.load %pp_view[{rh}, %c0] : view<256x8xf16> -> {V8H}")
+            e(f"{I}%t{t}plo = vector.load %pp_view[{rl}, %c0] : {PPV} -> {V8H}")
+            e(f"{I}%t{t}phi = vector.load %pp_view[{rh}, %c0] : {PPV} -> {V8H}")
             e(f"{I}%npc{t} = vector.concat<0> %t{t}plo, %t{t}phi : {V8H}, {V8H} -> {V16H}")
-        e(f"{I}%nalc = view.load %al_view[%pa_own] : view<64xf32> -> f32")
+        if not KT2_P2:
+            e(f"{I}%nalc = view.load %al_view[%pa_own] : {ALV} -> f32")
         stage_v(nv[:2], "%c0", "stva", I)
         stage_v(nv[2:], "%c0", "stvb", I, col0=16)
         stage_k("%ks32", nk[:2], "sta", I)
@@ -2208,27 +2271,40 @@ def gen():
     if KT2:
         e(f"  %kt2z16 = vector.concat<0> %zh8, %zh8 : {V8H}, {V8H} -> {V16H}")
         init = ", ".join(f"%rb{f} = %rinit{f} : {BK}" for f in range(16)) + ", %rmax = %ninf : f32, %rsum = %zero : f32"
-        init += f", %pc0 = %kt2z16 : {V16H}, %pc1 = %kt2z16 : {V16H}, %alc = %one : f32"
+        p2 = KT2_P2
+        if not p2:
+            init += f", %pc0 = %kt2z16 : {V16H}, %pc1 = %kt2z16 : {V16H}, %alc = %one : f32"
         fb = [f"%fb{f}" for f in range(16)]
-        ct = f"{rtypes}, f32, f32, {V16H}, {V16H}, f32"
-        e(f"  %wkf, {', '.join(fb)}, %gmax, %gsum, %fpc0, %fpc1, %falc = scf.while(%ksw = %c0 : index, {init}) -> (index, {ct}) {{")
+        ct = f"{rtypes}, f32, f32" + ("" if p2 else f", {V16H}, {V16H}, f32")
+        fr = "" if p2 else ", %fpc0, %fpc1, %falc"
+        e(f"  %wkf, {', '.join(fb)}, %gmax, %gsum{fr} = scf.while(%ksw = %c0 : index, {init}) -> (index, {ct}) {{")
         e("    %ks_ = index.assume %ksw [range(%ksw, 0, 1048576), lt(%ksw, %max_vis)] : index")
         nb = body_pair2()
         e("    %ksn = index.add %ks_, %ks32c : index")
         e("    %kcont = index.cmp ult, %ksn, %max_vis : index")
-        e(f"    scf.condition %kcont, %ksn, {', '.join(nb)}, %qmax, %qsum, %npc0, %npc1, %nalc : i1, index, {ct}")
-        wargs = ", ".join(["%wk: index"] + [f"%wb{f}: {BK}" for f in range(16)] + ["%wm: f32", "%ws: f32", f"%wp0: {V16H}", f"%wp1: {V16H}", "%wa: f32"])
+        e(f"    scf.condition %kcont, %ksn, {', '.join(nb)}, %qmax, %qsum{'' if p2 else ', %npc0, %npc1, %nalc'} : i1, index, {ct}")
+        wargs = ", ".join(["%wk: index"] + [f"%wb{f}: {BK}" for f in range(16)] + ["%wm: f32", "%ws: f32"]
+                          + ([] if p2 else [f"%wp0: {V16H}", f"%wp1: {V16H}", "%wa: f32"]))
         e(f"  }} do({wargs}) {{")
-        e(f"    scf.yield %wk, {', '.join(f'%wb{f}' for f in range(16))}, %wm, %ws, %wp0, %wp1, %wa : index, {ct}")
+        e(f"    scf.yield %wk, {', '.join(f'%wb{f}' for f in range(16))}, %wm, %ws{'' if p2 else ', %wp0, %wp1, %wa'} : index, {ct}")
         e("  }")
         e("  scf.if %isA {")
-        e("    view.store %gsum, %ls_view[%pa_own] : f32, view<64xf32>")
+        e(f"    view.store %gsum, %ls_view[%pa_own] : f32, {ALV}")
         e("  }")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        outs = pair_pv2("%fpc0", "%fpc1", "%falc", fb, "fp", "  ")
+        if p2:   # the last tile (wkf - 32) wrote slot (wkf / 32 + 1) % 2
+            e("  %ks32c0 = index.constant 32 : index")
+            e("  %f2t0 = index.div %wkf, %ks32c0 : index")
+            e("  %f2t = index.add %f2t0, %c1 : index")
+            e("  %f2p = index.rem %f2t, %c2 : index")
+            e("  %f2r = index.mul %f2p, %c2slot : index")
+            e("  %f2a = index.mul %f2p, %c2al : index")
+            outs = pair_pv2(*p2_read("%f2r", "%f2a", "f2", "  "), fb, "fp", "  ")
+        else:
+            outs = pair_pv2("%fpc0", "%fpc1", "%falc", fb, "fp", "  ")
         for f in range(16):
             e(f"  %og{f} = vector.bitcast {outs[f]} : {BK} to {V8}")
-        e("  %lsum_l = view.load %ls_view[%pa_own] : view<64xf32> -> f32")
+        e(f"  %lsum_l = view.load %ls_view[%pa_own] : {ALV} -> f32")
         e("  %isB = index.cmp ne, %prole, %c0 : index")
         e("  %ewr = scalar.andi %r_live, %isB : i1")
     elif PAIR:

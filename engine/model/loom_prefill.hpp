@@ -819,6 +819,11 @@ class LoomPrefill {
     // Loom drops bounds clamps it proves from the launch contract: extra workgroups read unmapped VA and hang.
     if (at->second.tt && (B_ + attn_tpw_ - 1) / attn_tpw_ != at->second.tt)
       throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
+    // chunks whose attention has a workgroup shape of its own (the KT2 twin) carry their own row
+    for (const auto& [name, g] : geom_)
+      if (name.rfind("wmma", 0) == 0 && name.find("_c") != std::string::npos &&
+          (!g.rowgrp || !g.tokens || kHeads % g.rowgrp || (B_ + g.tokens - 1) / g.tokens != g.tt))
+        throw LoomError(name + ": its launch geometry does not fit (re-emit the set)");
     for (const char* hal : {"norm.hal", "convkq.hal", "prepab.hal", "rowsplit.hal", "postnorm.hal", "unpack.hal",
                             "gemv.hal", "rmsnorm.hal", "argmax.hal", "accum.hal", "embed.hal"})
       Exe(hal);
@@ -2179,8 +2184,11 @@ class LoomPrefill {
         b.push_back(TRef(*Find(pre + "attn_q_norm.weight")));
         b.push_back({eps_->handle, 0, 4});
       }
-      Dispatch(ChunkExe(o_af ? "wmma_t" : "wmma", ci), "yah_attn_wmma", (B_ + attn_tpw_ - 1) / attn_tpw_, kHeads / attn_hpw_, 1, 256, 1,
-               1, b);
+      const std::string ah = std::string(o_af ? "wmma_t" : "wmma") + (ci ? "_c" + std::to_string(ci) : std::string()) + ".hal";
+      const auto ag = geom_.find(ah);
+      const std::uint32_t tpw = ag != geom_.end() ? ag->second.tokens : attn_tpw_,
+                          hpw = ag != geom_.end() ? ag->second.rowgrp : attn_hpw_;
+      Dispatch(Exe(ah), "yah_attn_wmma", (B_ + tpw - 1) / tpw, kHeads / hpw, 1, 256, 1, 1, b);
     }
     trim_row_ = tail_;
     RunResidual(pre + "attn_output.weight", *scratch_, o_af);

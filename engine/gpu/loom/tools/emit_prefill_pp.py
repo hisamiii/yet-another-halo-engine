@@ -388,6 +388,12 @@ GUOV_ON = False   # set by main
 QN_FLAGS = dict(QNSTREAM=True, QNMIX=True, MAXNN=True, SUM0=True)
 KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1, **QN_FLAGS)
 KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
+# The KT2 twin's workgroup: 6 heads x 16 tokens (a whole GQA group, 12 waves, 2 workgroups per WGP) stages each K / V tile
+# once per 96 query rows instead of 64; the LDS that frees holds a second P^T / alpha slot, so B loads the previous
+# tile's P^T at its arm start instead of carrying it (KT2_P2: -16 loop-live VGPRs). Bit-identical, attention -3.1..-3.6%
+# at 16K..96K. Its chunks launch from their own dispatch.txt rows (wmma[_t]_c<i>.hal); not under YAH_EMIT_HALF.
+KT2_SHAPE = (6, 16)
+KT2_SHAPE_FLAGS = dict(KT2_P2=True, MAPS_EARLY=True)
 
 
 def deep(path):
@@ -1588,21 +1594,30 @@ def main():
     # pp2048 attention -6.4% cycles; the deep / KT2 twins keep their tuned code
     MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0)
 
+    kt2_cfg = (a_hpw, a_qt) if EMIT_HALF else KT2_SHAPE
+    kt2_shape = kt2_cfg if kt2_cfg != (a_hpw, a_qt) else None   # a shape of its own: its chunks get dispatch.txt rows
+
     def write_attn(path):
         A = gen_attn_fa
-        keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)))
+        keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
+                                   + tuple(KT2_SHAPE_FLAGS)))
         saved = {k: getattr(A, k) for k in keys}
-        twins = [(path, MAIN_FLAGS), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS))]
+        twins = [(path, MAIN_FLAGS, None), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS), None)]
         if not A.KDEC:   # the KT2 twin (fp16 sources only)
-            twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS)))
-        for name, flags in twins:
+            twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **(KT2_SHAPE_FLAGS if kt2_cfg == KT2_SHAPE else {})),
+                          kt2_shape))
+        for name, flags, shape in twins:
             for k, v in flags.items():
                 setattr(A, k, v)
+            if shape:
+                A.configure(*shape)
             open(name, "w").write(A.gen())
             A.DIAG_SWAP = False
             open(alt(name), "w").write(A.gen())
             for k in keys:
                 setattr(A, k, saved[k])
+            if shape:
+                A.configure(a_hpw, a_qt)
     gen_attn_fa.QNORM = QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False   # (see RoPE below)
     gen_attn_fa.QG16 = QG16_ON
     if QG16_ON:
@@ -1898,7 +1913,7 @@ def main():
             open(src, "w").write(txt)
             pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
     def occ(path, c, use_kt2=True):   # the 3-workgroup twins: KT2 from KT2_FROM keys of context on, else PAIR from OCC3_FROM
-        if use_kt2 and c * B >= KT2_FROM and os.path.exists(kt2(path)):
+        if use_kt2 and c * B >= KT2_FROM and (c or not kt2_shape) and os.path.exists(kt2(path)):
             return kt2(path)
         return deep(path) if c * B >= OCC3_FROM else path
     fixed = [
@@ -2016,6 +2031,7 @@ def main():
         return None
     if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)
         fixed = [f for f in fixed if f[1].startswith(("prepab", "rowsplit", "postnorm", "rope", "vtpage", "wmma"))]
+    kt2_rows = []
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
         if outname.startswith("wmma") and "_kt2" in loom:   # KT2 past 240 VGPRs loses its third workgroup: use the old twin
@@ -2025,6 +2041,8 @@ def main():
                 print("attention %s: KT2 %d VGPRs, %d B spills, re-emitted from the previous twin" % (outname, hal_vgprs(hal), hal_spills(hal)))
                 loom = occ(loom.replace("_kt2.loom", ".loom"), c, use_kt2=False)
                 E.emit(loom, configs, outname, outdir, attn_env(loom))
+        if outname.startswith("wmma") and "_kt2" in loom and kt2_shape:
+            kt2_rows.append(outname)
         if outname.startswith("wmma"):   # attn_guard (deep twins: 3 workgroups per WGP allow 256 VGPRs, never spills)
             hal = os.path.join(outdir, outname)
             limit = 256 if "_deep" in loom else KT2_VGPR if "_kt2" in loom else ATTN_VGPR
@@ -2034,6 +2052,10 @@ def main():
                 if hal_spills(hal):
                     raise SystemExit("attention %s still spills: refusing to emit a spilling attention kernel" % outname)
         n += 1
+    if kt2_rows:   # the KT2 chunks' own launch geometry (the global wmma.hal row is chunk 0's)
+        with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
+            for hal in kt2_rows:
+                fh.write("%s %d %d %d\n" % (hal, kt2_shape[1], kt2_shape[0], (B + kt2_shape[1] - 1) // kt2_shape[1]))
 
     tables = os.path.join(E.LOOM, "tables")
     for src, dst in [] if EMIT_HALF else [("grid_iq3s.bin", "grid_iq3s.bin"),
