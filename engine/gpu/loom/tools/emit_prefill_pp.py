@@ -392,8 +392,10 @@ KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granul
 # once per 96 query rows instead of 64; the LDS that frees holds a second P^T / alpha slot, so B loads the previous
 # tile's P^T at its arm start instead of carrying it (KT2_P2: -16 loop-live VGPRs). Bit-identical, attention -3.1..-3.6%
 # at 16K..96K. Its chunks launch from their own dispatch.txt rows (wmma[_t]_c<i>.hal); not under YAH_EMIT_HALF.
+# KT2_RSALL (O x alpha every tile: the skip branch's join cost 128 v_movs), KT2_MIRROR (odd workgroups mirror the roles
+# over the SIMDs) and KADDR_SR (K load address = uniform page part + loop-invariant lane part): bit-identical, -1.5..-2%.
 KT2_SHAPE = (6, 16)
-KT2_SHAPE_FLAGS = dict(KT2_P2=True, MAPS_EARLY=True)
+KT2_SHAPE_FLAGS = dict(KT2_P2=True, MAPS_EARLY=True, KT2_RSALL=True, KT2_MIRROR=True, KADDR_SR=True)
 
 
 def deep(path):

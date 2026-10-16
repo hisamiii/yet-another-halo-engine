@@ -172,6 +172,10 @@ PVF = 2             # PAIR: V fragments in flight in wave B's P.V (a schedule fe
 DOWHILE = True      # PAIR: bottom-tested loop (scf.while with the body in the condition region): the post-loop code then
                     # reads the last body outputs, not the loop-header block arguments, which Loom's linear live
                     # intervals (no lifetime holes) otherwise keep live across the whole body (PAIR: > 256 VGPRs)
+KADDR_SR = False    # paged K loads: scalar page / tile part + loop-invariant lane part (needs KCLAMP_S, 16-aligned tiles)
+KT2_RSALL = False   # KT2, B: O x alpha every tile instead of the vote-skipped branch (bit-identical)
+SMFMA = False       # KT2: softmax exponent (s - m) log2e as one fma (not bit-identical)
+KT2_MIRROR = False  # KT2: odd workgroups rotate the role map (softmax VALU spread over the SIMDs)
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
 DOWHILE_MAIN = False   # the same for the head_dim-split loop (measured neutral)
 # SOFT1..4 (measured, not adopted, docs/results.md): keep the head_dim split and run the softmax in wave A only, P^T and
@@ -351,6 +355,10 @@ def staging_maps(e):
         e(f"  %kk{nn}h = index.div %kk{nn}, %c8 : index")
         e(f"  %kk{nn}r0 = index.mul %kk{nn}l, %c2 : index")
         e(f"  %kr{nn} = index.add %kk{nn}r0, %kk{nn}h : index")
+        if KADDR_SR:   # lane part of the K load address; out-of-role lanes (kk >= 16) wrap to in-page rows
+            e(f"  %kkm{nn} = index.rem %kk{nn}, %c16 : index")
+            e(f"  %kkr{nn} = index.mul %kkm{nn}, %c1024 : index")
+            e(f"  %kla{nn} = index.add %kkr{nn}, %kd{nn} : index")
 
 
 def qnorm_phase1(e):
@@ -729,7 +737,13 @@ def gen():
     e("  %sub = index.rem %lane, %c16 : index")
     e("  %half = index.div %lane, %c16 : index")
     if PAIR or SOFT1:   # the role from the subgroup id: wave-uniform to Loom, so the role branch is a scalar branch
-        e("  %psg = kernel.subgroup.id : index")
+        e(f"  %psg{'0' if KT2_MIRROR else ''} = kernel.subgroup.id : index")
+        if KT2_MIRROR:   # odd workgroups rotate the role map by 2 waves: A waves per SIMD 2, 2, 1, 1 -> 1, 1, 2, 2
+            e("  %mrp = index.rem %wgl, %c2 : index")
+            e("  %mr2 = index.mul %mrp, %c2 : index")
+            e("  %mrs = index.add %psg0, %mr2 : index")
+            e(f"  %mrn = index.constant {2 * NQB} : index")
+            e("  %psg = index.rem %mrs, %mrn : index")
     if PAIR and PAIR_MAP == "mod":
         cq = "%c4" if NQB == 4 else "%cnqb"
         if NQB != 4:
@@ -867,6 +881,9 @@ def gen():
     e("  %cap_1 = index.sub %cache_capacity, %c1 : index")
     if KCLAMP_S:   # (only then: even an unused op perturbs the allocator)
         e("  %klast = index.sub %cache_capacity, %c16 : index")
+    if KADDR_SR:
+        e("  %kpsl0 = index.constant 15615 : index")
+        e("  %kpslim = index.sub %kvtot, %kpsl0 : index")
     # this lane's query: block wqb = (head0 + wqb%2, tokens qs + (wqb/2)*16 + sub)
     e("  %wqh = index.rem %wqb, %chpw : index")
     e("  %wqt0 = index.div %wqb, %chpw : index")
@@ -1084,6 +1101,26 @@ def gen():
         names = []
         if KCLAMP_S:   # rows past ctx_end are zeroed at staging from the unclamped key, so any in-range row will do
             e(f"{ind}%{p}ksb = index.min {ks}, %klast : index")
+        if KADDR_SR:   # ksb is 16-aligned (ks and cap - 16 are) and kk < 16: (ksb + kk) % 256 = ksb % 256 + kk
+            assert PAGED and KCLAMP_S
+            pg = page_of(f"%{p}ksb", p, ind, "k")
+            e(f"{ind}%{p}kpb = index.mul {pg}, %c256 : index")
+            e(f"{ind}%{p}kpo0 = index.rem %{p}ksb, %c256 : index")
+            e(f"{ind}%{p}kpo = index.assume %{p}kpo0 [range(%{p}kpo0, 0, 240)] : index")
+            e(f"{ind}%{p}kpr = index.add %{p}kpb, %{p}kpo : index")
+            e(f"{ind}%{p}kpm = index.mul %{p}kpr, %c1024 : index")
+            e(f"{ind}%{p}kps0 = index.add %{p}kpm, %kvbase : index")
+            # opaque uniform value: otherwise the index folder re-associates the sum into a per-lane shift chain;
+            # kps <= ((npages - 1) 256 + 240) 1024 + 768 = kvtot - 15616, and kla <= 15 1024 + 248
+            e(f"{ind}%{p}kps1 = index.cast %{p}kps0 : index to i32")
+            e(f"{ind}%{p}kps2 = kernel.subgroup.broadcast.first %{p}kps1 : i32")
+            e(f"{ind}%{p}kps3 = index.cast %{p}kps2 : i32 to index")
+            e(f"{ind}%{p}kps = index.assume %{p}kps3 [range(%{p}kps3, 0, 2147483647), lt(%{p}kps3, %kpslim)] : index")
+            for nn in range(2):
+                e(f"{ind}%{p}ka{nn} = index.add %{p}kps, %kla{nn} : index")
+                e(f"{ind}%{p}kv{nn} = vector.load %k_flat[%{p}ka{nn}] : view<[%kvtot]xf16> -> {V8H}")
+                names.append(f"%{p}kv{nn}")
+            return names
         for nn in range(2):
             e(f"{ind}%{p}kp{nn} = index.add {f'%{p}ksb' if KCLAMP_S else ks}, %kk{nn} : index")
             if PAGED and KCLAMP_S:
@@ -2067,9 +2104,16 @@ def gen():
         e(f"{ind}%nmax = scalar.maxnumf{'<nnan|ninf>' if MAXNN else ''} %rsm, %ninf : f32")
         e(f"{ind}%nmax8 = vector.splat %nmax : {V8}")
         P = []
+        if SMFMA:   # (s - m) log2e as one fma: s log2e + (-m log2e)
+            e(f"{ind}%nml = scalar.mulf %nmax, %log2e : f32")
+            e(f"{ind}%nnml = scalar.negf %nml : f32")
+            e(f"{ind}%nnml8 = vector.splat %nnml : {V8}")
         for t in range(2):
-            e(f"{ind}%t{t}pd8 = vector.subf {M[t]}, %nmax8 : {V8}")
-            e(f"{ind}%t{t}pl = vector.mulf %t{t}pd8, %log2e8 : {V8}")
+            if SMFMA:
+                e(f"{ind}%t{t}pl = vector.fmaf {M[t]}, %log2e8, %nnml8 : {V8}")
+            else:
+                e(f"{ind}%t{t}pd8 = vector.subf {M[t]}, %nmax8 : {V8}")
+                e(f"{ind}%t{t}pl = vector.mulf %t{t}pd8, %log2e8 : {V8}")
             e(f"{ind}%t{t}p = vector.exp2f<afn> %t{t}pl : {V8}")
             P.append(f"%t{t}p")
         parts = []
@@ -2120,6 +2164,11 @@ def gen():
             Rf.append(f"%{pp}rf{f}")
         ftypes = ", ".join([V8] * 16)
         sc = [f"%{pp}sc{f}" for f in range(16)]
+        if KT2_RSALL:   # x 1.0 is exact: the branch join's 16-fragment register shuffle costs more than the multiplies
+            e(f"{ind}%{pp}al8 = vector.splat {alc} : {V8}")
+            for f in range(16):
+                e(f"{ind}{sc[f]} = vector.mulf {Rf[f]}, %{pp}al8 : {V8}")
+            return pv2_mma(pp, ind, pc0, pc1, sc)
         e(f"{ind}{', '.join(sc)} = scf.if %{pp}ag -> ({ftypes}) {{")
         e(f"{ind}  scf.yield {', '.join(Rf)} : {ftypes}")
         e(f"{ind}}} else {{")
@@ -2128,6 +2177,9 @@ def gen():
             e(f"{ind}  %{pp}os{f} = vector.mulf {Rf[f]}, %{pp}al8 : {V8}")
         e(f"{ind}  scf.yield {', '.join(f'%{pp}os{f}' for f in range(16))} : {ftypes}")
         e(f"{ind}}}")
+        return pv2_mma(pp, ind, pc0, pc1, sc)
+
+    def pv2_mma(pp, ind, pc0, pc1, sc):
         e(f"{ind}%{pp}pb0 = vector.fragment<rhs> {pc0} shape [%k, %n] : {V16H}")
         e(f"{ind}%{pp}pb1 = vector.fragment<rhs> {pc1} shape [%k, %n] : {V16H}")
         e(f"{ind}%{pp}c16 = index.constant 16 : index")
