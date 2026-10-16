@@ -1581,12 +1581,15 @@ def main():
     # The deep twin is also the role-split kernel (gen_attn_fa PAIR: one wave of each pair runs QK + the softmax once,
     # the other P.V; bit-identical): at 3 workgroups per WGP it needs no more than the 256 VGPRs that allows.
     DEEP_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=2, PVF=4)
+    # the 4-workgroup kernel's bit-identical VALU cuts (gen_attn_fa MAXNN, SUM0, EPI_FAST; CTX16: start_pos = c * B):
+    # pp2048 attention -6.4% cycles; the deep / KT2 twins keep their tuned code
+    MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0)
 
     def write_attn(path):
         A = gen_attn_fa
-        keys = ("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS)
+        keys = ("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
         saved = {k: getattr(A, k) for k in keys}
-        twins = [(path, {}), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS))]
+        twins = [(path, MAIN_FLAGS), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS))]
         if not A.KDEC:   # the KT2 twin (fp16 sources only)
             twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS)))
         for name, flags in twins:

@@ -122,6 +122,20 @@ GATE_FENCE = True
 DIAG_MASK = True
 DIAG_SWAP = True    # the mask branch as 'all lanes unmasked' with the pass-through arm first (layout order)
 KCLAMP_S = True     # K tile rows clamped by one scalar min of the tile start (cap - 16), not a per-lane min
+# CTX16: start_pos and token_count are multiples of 16 (emit_prefill_pp sets it), so a tile start ks < max_vis <= ctx_end
+# has all 16 keys before ctx_end: the K staging's zero-past-ctx_end selects are dead
+CTX16 = False
+# MAXNN: the row max without the -FLT_MAX seed and with nnan (no NaN reaches it; without nnan LLVM canonicalizes both
+# operands of every maxnum, v_max x, x); the seed max folds (ninf: both arms yield a value >= -FLT_MAX). Same values.
+MAXNN = False
+SUM0 = False        # the row sum's 4-key partials start from the first p, not 0 + p (p >= 0: same values)
+# PBP: P^T's two halves by index shuffles (lane gets lane & 15 / lane | 16: ds_bpermute) instead of an xor-16 shuffle
+# and two per-lane selects. Same values; lost (+1.2% cycles: the bpermute latency).
+PBP = False
+# EPI_FAST: the epilogue's o / sum as Markstein's correction of o * RN(1 / sum) (q = o r; q + (o - q sum) r, correctly
+# rounded when r is) and the sigmoid's 1 / (1 + e) as rcp + one Newton step (gen_gemm_tile.recip1), instead of two IEEE
+# divisions per element
+EPI_FAST = False
 KVMAJOR = False     # workgroup order KV head slowest (lost: +67% at 96K, see docs/results.md)
 # PAIR: the wave pair of a query block splits by role instead of head_dim: wave A holds all of Q, runs the 16 QK MMAs
 # (two 8-MMA chains, dims 0..127 and 128..255, added as the head_dim split adds its partials) and the softmax once, and
@@ -680,6 +694,11 @@ def gen():
     e("  %tid2 = index.add %tid, %cnt : index")
     e("  %ptid2 = index.add %ptid, %cnt : index")
     e("  %h0 = index.cmp eq, %half, %c0 : index")
+    if PBP:
+        e("  %pbp_l15 = index.rem %lane, %c16 : index")
+        e("  %pbp_lo = index.cast %pbp_l15 : index to i32")
+        e("  %pbp_h16 = index.add %pbp_l15, %c16 : index")
+        e("  %pbp_hi = index.cast %pbp_h16 : index to i32")
     if PLDS:
         # P^T exchange through the partner's S-partial plane 0 (read this tile, rewritten by the partner after the tile's last
         # barrier): lane (n, h) holds keys 8h..8h+7 of column n, stores them at its own S read row ptid (= base + 16h + n)
@@ -1115,6 +1134,9 @@ def gen():
             e(f"{ind}vector.store %{p}d1, {kv}[%kdr, %kdc16b] : {V8H}, view<{KT}x{KT_PITCH}xf16>")
             return
         for nn in range(2):
+            if CTX16:
+                e(f"{ind}vector.store {cur[nn]}, {kv}[%kr{nn}, %kd{nn}] : {V8H}, view<{KT}x{KT_PITCH}xf16>")
+                continue
             e(f"{ind}%{p}sp{nn} = index.add {ks}, %kk{nn} : index")
             e(f"{ind}%{p}sl{nn} = index.cmp ult, %{p}sp{nn}, %ctx_end : index")
             e(f"{ind}%{p}sv{nn} = scf.select %{p}sl{nn}, {cur[nn]}, %zh8 : {V8H}")
@@ -1322,11 +1344,23 @@ def gen():
             else:
                 e(f"    %smask = vector.from_elements {', '.join(els)} : {V8}")
             s = "%smask"
-        e(f"    %tmax0 = vector.reduce<maxnumf> {s}, %ninf : {V8}, f32")
-        e("    %tmi = scalar.bitcast %tmax0 : f32 to i32")
-        e("    %tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
-        e("    %tmf = scalar.bitcast %tmx : i32 to f32")
-        e("    %tmax = scalar.maxnumf %tmax0, %tmf : f32")
+        if MAXNN:
+            for i in range(8):
+                e(f"    %tme{i} = vector.extract {s}[{i}] : {V8} -> f32")
+            cur = "%tme0"
+            for i in range(1, 8):
+                e(f"    %tmc{i} = scalar.maxnumf<nnan> {cur}, %tme{i} : f32")
+                cur = f"%tmc{i}"
+            e(f"    %tmi = scalar.bitcast {cur} : f32 to i32")
+            e("    %tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
+            e("    %tmf = scalar.bitcast %tmx : i32 to f32")
+            e(f"    %tmax = scalar.maxnumf<nnan> {cur}, %tmf : f32")
+        else:
+            e(f"    %tmax0 = vector.reduce<maxnumf> {s}, %ninf : {V8}, f32")
+            e("    %tmi = scalar.bitcast %tmax0 : f32 to i32")
+            e("    %tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
+            e("    %tmf = scalar.bitcast %tmx : i32 to f32")
+            e("    %tmax = scalar.maxnumf %tmax0, %tmf : f32")
         if early:
             early()
         # one wave-uniform branch: raise the max and rescale O / l only when some row needs it (FA4 conditional rescale)
@@ -1345,7 +1379,7 @@ def gen():
         else:
             otypes = ", ".join([V8] * 8 + ["f32", "f32"])
             e(f"    %rso0, %rso1, %rso2, %rso3, %rso4, %rso5, %rso6, %rso7, %rsm, %rss = scf.if %anygrow -> ({otypes}) {{")
-            e("      %gmx = scalar.maxnumf %rmax, %tmax : f32")
+            e(f"      %gmx = scalar.maxnumf{'<nnan>' if MAXNN else ''} %rmax, %tmax : f32")
             e("      %gpd = scalar.subf %rmax, %gmx : f32")
             e("      %gpdl = scalar.mulf %gpd, %log2e : f32")
             e("      %galpha = scalar.exp2f<afn> %gpdl : f32")
@@ -1359,7 +1393,8 @@ def gen():
             e("    }")
         if mid:
             mid()
-        e("    %nmax = scalar.maxnumf %rsm, %ninf : f32")
+        # MAXNN: both arms yield max(rmax, ..) >= -FLT_MAX, so with ninf LLVM folds the seed max away
+        e(f"    %nmax = scalar.maxnumf{'<nnan|ninf>' if MAXNN else ''} %rsm, %ninf : f32")
         e("    %nml = scalar.mulf %nmax, %log2e : f32")
         e("    %nnml = scalar.negf %nml : f32")
         e("    %pd = scalar.subf %rmax, %nmax : f32")
@@ -1375,6 +1410,9 @@ def gen():
             cur = "%zero"
             for i in range(4):
                 e(f"    %pg{g}_{i} = vector.extract %p[{4 * g + i}] : {V8} -> f32")
+                if SUM0 and i == 0:
+                    cur = f"%pg{g}_0"
+                    continue
                 e(f"    %pa{g}_{i} = scalar.addf {cur}, %pg{g}_{i} : f32")
                 cur = f"%pa{g}_{i}"
         e("    %pab = scalar.addf %pa0_3, %pa1_3 : f32")
@@ -1405,6 +1443,12 @@ def gen():
                 e("    scf.schedule.fence")
             e(f"    %plo = vector.load %pl_vw[%pl_l0, %c0] : view<{2 * NT}x8xf16> -> {V8H}")
             e(f"    %phi2 = vector.load %pl_vw16[%pl_l0, %c0] : view<{2 * NT}x8xf16> -> {V8H}")
+        elif PBP:   # lane l: keys 0..7 from lane l & 15 (h = 0), keys 8..15 from lane (l & 15) + 16 (h = 1)
+            e(f"    %phi = vector.bitcast %ph : {V8H} to {V4I}")
+            e(f"    %pli, %plv = kernel.subgroup.shuffle<index> %phi, %pbp_lo, %x32 : {V4I}, i32, i32")
+            e(f"    %phii, %phiv = kernel.subgroup.shuffle<index> %phi, %pbp_hi, %x32 : {V4I}, i32, i32")
+            e(f"    %plo = vector.bitcast %pli : {V4I} to {V8H}")
+            e(f"    %phi2 = vector.bitcast %phii : {V4I} to {V8H}")
         else:
             e(f"    %phi = vector.bitcast %ph : {V8H} to {V4I}")
             e(f"    %ppi, %ppv = kernel.subgroup.shuffle<xor> %phi, %x16, %x32 : {V4I}, i32, i32")
@@ -2234,6 +2278,14 @@ def gen():
     e(f"  %linv8 = vector.splat %linv : {V8}")
     e(f"  %lsum8 = vector.splat %lsum : {V8}")
     e(f"  %nlog2e8 = vector.splat %log2e : {V8}")
+    if EPI_FAST:
+        e(f"  %elr8 = vector.splat %linv0 : {V8}")
+        e("  %enls = scalar.negf %lsum : f32")
+        e(f"  %enls8 = vector.splat %enls : {V8}")
+        e("  %efmax = scalar.constant 3.4028234663852886e+38 : f32")
+        e(f"  %efmax8 = vector.splat %efmax : {V8}")
+        e("  %enone = scalar.constant -1.0 : f32")
+        e(f"  %enone8 = vector.splat %enone : {V8}")
     e("  %elc = index.min %r_lq, %B_1 : index")
     e("  %eoff0 = index.mul %elc, %c6144 : index")
     e("  %ehb = index.mul %r_head, %c256 : index")
@@ -2310,8 +2362,21 @@ def gen():
         e(f"  %egm{f} = vector.mulf %egn{f}, %nlog2e8 : {V8}")
         e(f"  %egx{f} = vector.exp2f<afn> %egm{f} : {V8}")
         e(f"  %egd{f} = vector.addf %ones8, %egx{f} : {V8}")
-        e(f"  %egr{f} = vector.divf %ones8, %egd{f} : {V8}")
-        e(f"  %eod{f} = vector.divf %og{f}, %lsum8 : {V8}")
+        if EPI_FAST:
+            # 1 / dn by rcp + one Newton step: bit-exact for dn in [1, 2^126] (gen_gemm_tile FAST_RCP); dn = inf clamps to
+            # FLT_MAX, whose tiny reciprocal times any |o| <= 65504 rounds to the same signed f16 zero as o * 0
+            e(f"  %egc{f} = vector.minnumf<nnan> %egd{f}, %efmax8 : {V8}")
+            e(f"  %egr0{f} = vector.divf<nnan|ninf|nsz|arcp> %ones8, %egc{f} : {V8}")
+            e(f"  %egnd{f} = vector.mulf %egc{f}, %enone8 : {V8}")
+            e(f"  %eger{f} = vector.fmaf %egnd{f}, %egr0{f}, %ones8 : {V8}")
+            e(f"  %egr{f} = vector.fmaf %eger{f}, %egr0{f}, %egr0{f} : {V8}")
+            # o / sum (Markstein): q = o r with r = RN(1 / sum), then q + (o - q sum) r, correctly rounded
+            e(f"  %eq{f} = vector.mulf %og{f}, %elr8 : {V8}")
+            e(f"  %eqe{f} = vector.fmaf %eq{f}, %enls8, %og{f} : {V8}")
+            e(f"  %eod{f} = vector.fmaf %eqe{f}, %elr8, %eq{f} : {V8}")
+        else:
+            e(f"  %egr{f} = vector.divf %ones8, %egd{f} : {V8}")
+            e(f"  %eod{f} = vector.divf %og{f}, %lsum8 : {V8}")
         e(f"  %eov{f} = scf.select %lpos, %eod{f}, %zeros8 : {V8}")
         e(f"  %eout{f} = vector.mulf %eov{f}, %egr{f} : {V8}")
         e(f"  scf.if {'%ewr' if PAIR else '%r_live'} {{")
