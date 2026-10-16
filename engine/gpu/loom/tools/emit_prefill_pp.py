@@ -1810,7 +1810,7 @@ def main():
         for name, (k, heads) in (("rotq_5120.hal", (5120, None)), ("rotq_6144.hal", (6144, None)),
                                  ("rotq_17408.hal", (17408, None)), ("rotq_heads.hal", (6144, (48, 16, 128)))) if a4 else ():
             rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-            open(rot_src[name], "w").write(gen_rot.gen_q(k, B, gen_gemm_iu4.KP, True, heads))
+            open(rot_src[name], "w").write(gen_rot.gen_q(k, B, gen_gemm_iu4.KP, True, heads, hot=k == 17408))
             geom.append((name, 0, 64, k // 1024))
         if a4:
             # the norm-fed sites: RMS norm + rotq in one kernel (gen_rot.gen_nq; same bits, no f16 norm round trip)
