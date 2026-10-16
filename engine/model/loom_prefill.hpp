@@ -751,10 +751,12 @@ class LoomPrefill {
     // "kv_paged": 256-token pages, one page table per sequence (logical -> physical page, shared by all layers).
     kv_paged_ = geom_.count("kv_paged") != 0;
     pages_ = (T_ + 255) / 256;
-    // "fpsparse <first chunk> <pages> <list stride>" (gen_fpsparse): block-sparse attention from that chunk on. The f16
-    // pools gain <pages> pages of pooled rows (block j = key pages_ * 256 + j), mapped to themselves by the page table.
+    // "fpsparse <first chunk> <pages> <list stride>" (gen_fpsparse): block-sparse attention from that chunk on, on the
+    // kv4 pools ("fpskv4"). They gain <pages> pages of pooled rows (block j = key pages_ * 256 + j), mapped to themselves
+    // by the page table.
     if (const auto fp = geom_.find("fpsparse"); fp != geom_.end())
       fps_on_ = true, fps_first_ = fp->second.tokens, fps_ext_ = fp->second.rowgrp, fps_ls_ = fp->second.tt;
+    if (fps_on_ && !geom_.count("fpskv4")) throw LoomError("fpsparse set without fpskv4 (re-emit the set)");
     const std::uint32_t ptab_n = pages_ + fps_ext_;
     ptab_ = &Alloc(std::size_t{kv_paged_ ? ptab_n : 1} * 4);
     if (kv_paged_) {
@@ -774,8 +776,10 @@ class LoomPrefill {
     // Per attention layer: codes [T][1024 or 512 B], scales [T][8 or 32] dwords, the channel mean of the first chunk.
     attn_kq4_ = geom_.count("attn_kq4") != 0;
     attn_kq8_ = geom_.count("attn_kq8") != 0 || attn_kq4_;
-    ks_bytes_ = std::size_t{T_} * (attn_kq4_ ? 32 : 8) * 4;
-    kq_bytes_ = attn_kq4_ ? kv_cache_ / 2 : kv_cache_;
+    // rows per layer: the context, plus the pooled rows of a fpsparse set
+    const std::size_t qrows = std::size_t{T_} + std::size_t{fps_ext_} * 256;
+    ks_bytes_ = qrows * (attn_kq4_ ? 32 : 8) * 4;
+    kq_bytes_ = qrows * (attn_kq4_ ? 512 : 1024);
     kq8buf_ = &Alloc(attn_kq8_ ? std::size_t{full_} * kq_bytes_ : 4);
     ksbuf_ = &Alloc(attn_kq8_ ? std::size_t{full_} * ks_bytes_ : 4);
     kmbuf_ = &Alloc(attn_kq8_ ? std::size_t{full_} * 4096 : 4);
@@ -783,8 +787,10 @@ class LoomPrefill {
     attn_vq4_ = geom_.count("attn_vq4") != 0;
     attn_vq8_ = geom_.count("attn_vq8") != 0;
     attn_vqt_ = attn_vq4_ || attn_vq8_;
-    vq_bytes_ = attn_vq8_ ? vt_bytes_ / 2 : vt_bytes_ / 4;
-    vqs_bytes_ = vt_bytes_ / 8;
+    // (fpsparse: the pooled rows' tiles after the 4 KV heads' context tiles)
+    const std::size_t vrows = std::size_t{(T_ + 15) / 16 * 16} + std::size_t{fps_ext_} * 256;
+    vq_bytes_ = vrows * (attn_vq8_ ? 1024 : 512);
+    vqs_bytes_ = vrows * 256;
     vqbuf_ = &Alloc(attn_vqt_ ? std::size_t{full_} * vq_bytes_ : 4);
     vqsbuf_ = &Alloc(attn_vqt_ ? std::size_t{full_} * vqs_bytes_ : 4);
     // Paged fp16 pools: per layer, K rows / V^T tiles of the whole context.
@@ -2135,7 +2141,7 @@ class LoomPrefill {
     const std::size_t f16rows = std::size_t{B_} * kKvRow * 2;    // the chunk's f16 K or V rows
     const std::size_t f16first = kv16_scratch_ ? 0 : first * kKvRow * 2;
     if (attn_kq8_) {
-      const std::size_t qrow = kq_bytes_ / T_, srow = ks_bytes_ / T_;
+      const std::size_t qrow = attn_kq4_ ? 512 : 1024, srow = attn_kq4_ ? 128 : 32;
       if (ci == 0)  // channel mean of the first chunk, kept for the later ones
         Dispatch(Exe("kmean.hal"), "yah_kmean", 4, 1, 1, 256, 1, 1,
                  {{kv16_->handle, koff, f16rows}, {kmbuf_->handle, kmoff, 4096}, Ref(*valid_)});
@@ -2168,8 +2174,9 @@ class LoomPrefill {
                {{kv16_->handle, voff, kv_cache_ * 2}, {vt16_->handle, 0, vt_bytes_}});
     }
     if (tail_ == kNoRows) return;  // K / V are written; nothing reads this layer's output
-    if (kdeq_) {  // the context so far, this chunk included, as f16 pools for the fp16 attention
-      const std::uint32_t rows = (ci + 1) * B_;
+    const bool fps = fps_on_ && ci >= fps_first_;  // the sparse attention reads the kv4 pools
+    if (kdeq_) {  // the context so far, this chunk included, as f16 pools for the fp16 attention (fps: yah_fpmean's rows only)
+      const std::uint32_t rows = (ci + 1) * B_ - (fps && ci ? (ci - 1) * B_ : 0);
       const char* kd = attn_kq4_ ? "kdeq4" : "kdeq8";
       const char* vd = attn_kq4_ ? "vdeq4" : "vdeq8";
       Dispatch(ChunkExe(kd, ci), attn_kq4_ ? "yah_kdeq4" : "yah_kdeq8", (rows * 64 + 255) / 256, 1, 1, 256, 1, 1,
@@ -2181,14 +2188,16 @@ class LoomPrefill {
     const hrx_buffer_ref_t vfm_l{fps_on_ ? vfm_->handle : nullptr, std::size_t{ai} * fps_mean_bytes_, fps_mean_bytes_};
     if (fps_on_) {  // block means of this chunk (and the previous one: the last layer skips non-final chunks), the pooled rows
       const std::uint32_t bpc = B_ / 128, first = (ci ? ci - 1 : 0) * bpc, nend = (ci + 1) * bpc;
-      const std::vector<hrx_buffer_ref_t> b = {Ref(*kdeq_), Ref(*vdeq_), ptab_ref_, kfm_l, vfm_l};
-      Dispatch(ChunkExe("fpmean", ci), "yah_fpmean", nend - first, 1, 1, 256, 1, 1, b);
-      Dispatch(ChunkExe("fpcopy", ci), "yah_fpcopy", nend, 1, 1, 256, 1, 1, b);
+      Dispatch(ChunkExe("fpmean", ci), "yah_fpmean", nend - first, 1, 1, 256, 1, 1,
+               {Ref(*kdeq_), Ref(*vdeq_), ptab_ref_, kfm_l, vfm_l});
+      Dispatch(ChunkExe("fpcopyk", ci), "yah_fpcopyk", (nend + 1) / 2, 1, 1, 256, 1, 1,
+               {kfm_l, {kq8buf_->handle, q8off, kq_bytes_}, {ksbuf_->handle, ksoff, ks_bytes_}});
+      Dispatch(ChunkExe("fpcopyv", ci), "yah_fpcopyv", 4, (nend + 15) / 16, 1, 256, 1, 1,
+               {vfm_l, {vqbuf_->handle, vqoff, vq_bytes_}, {vqsbuf_->handle, vqsoff, vqs_bytes_}});
     }
     const bool qrot = qr16_ && ci >= qrot_first_;
     if (qrot)
       Dispatch(Exe("qrot.hal"), "yah_qrot", (B_ * 96 + 255) / 256, 1, 1, 256, 1, 1, {Ref(*q16_), Ref(*qr16_)});
-    const bool fps = fps_on_ && ci >= fps_first_;
     if (fps) {  // the tile lists, from the rotated Q the attention reads
       if (!qrot) throw LoomError("fpsparse needs the rotated Q (qrot) on its chunks");
       Dispatch(ChunkExe("fpsel", ci), "yah_fpsel", B_ / 16, kKvHeads, 1, 256, 1, 1,
@@ -2208,9 +2217,10 @@ class LoomPrefill {
                         : hrx_buffer_ref_t{kv16_->handle, voff, kv_cache_ * 2},
           Ref(*scratch_),
           Ref(*lse_)};
-      if (kdeq_) b = {b[0], b[1], Ref(*kdeq_), Ref(*vdeq_), b[4], b[5]};  // the fp16 kernel's bindings
-      if (attn_kq8_ && !kdeq_) b.push_back({ksbuf_->handle, ksoff, ks_bytes_});
-      if (attn_vqt_ && !kdeq_) b.push_back({vqsbuf_->handle, vqsoff, vqs_bytes_});
+      const bool deqb = kdeq_ && !fps;
+      if (deqb) b = {b[0], b[1], Ref(*kdeq_), Ref(*vdeq_), b[4], b[5]};  // the fp16 kernel's bindings
+      if (attn_kq8_ && !deqb) b.push_back({ksbuf_->handle, ksoff, ks_bytes_});
+      if (attn_vqt_ && !deqb) b.push_back({vqsbuf_->handle, vqsoff, vqs_bytes_});
       if (kv_paged_) b.push_back(ptab_ref_);
       if (qnorm_) {
         b.push_back(TRef(*Find(pre + "attn_q_norm.weight")));

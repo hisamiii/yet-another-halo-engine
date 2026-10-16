@@ -564,6 +564,32 @@ def gen_vqt(bits):
         e(f"  %vh{j} = view.load %s_flat[%ta{j}] : view<[%stot]xf16> -> f16")
         e(f"  %v{j} = scalar.extf %vh{j} : f16 to f32")
         vals.append(f"%v{j}")
+    words = vqt_quant(e, vals, bits)
+    e("  %ti0 = index.mul %head, %tiles : index")
+    e("  %ti1 = index.add %ti0, %tile : index")
+    e("  %ti2 = index.mul %ti1, %c256 : index")
+    e("  %ti = index.add %ti2, %d : index")             # [head][tile][dim]
+    e(f"  %da0 = index.mul %ti, %c{nw} : index")
+    for w in range(nw):
+        e(f"  %daw{w}c = index.constant {w} : index")
+        e(f"  %daw{w} = index.add %da0, %daw{w}c : index")
+        e(f"  view.store {words[w]}, %d_flat[%daw{w}] : i32, view<[%dtot]xi32>")
+    vqt_stats(e, bits)
+    e("  view.store %pkd, %t_flat[%ti] : i32, view<[%ttot0]xi32>")
+    e("  kernel.return")
+    e("}")
+    return "\n".join(L) + "\n"
+
+
+def vqt_params(bits):
+    """(nw, lv, off, umax, smul, cmul) of gen_vqt"""
+    return (2, 14, 7, 14, 16.0, -23.0) if bits == 4 else (4, 254, 128, 255, 256.0, -384.0)
+
+
+def vqt_quant(e, vals, bits):
+    """gen_vqt's tile quantizer: the 16 keys' f32 values vals of this lane's channel -> the packed code dwords (returned);
+    defines %sf, %cf (the f16-rounded step and midrange) for vqt_stats"""
+    nw, lv, off, umax, smul, cmul = vqt_params(bits)
     mx, mn = vals[0], vals[0]
     for j in range(1, 16):
         e(f"  %mx{j} = scalar.maxnumf {mx}, {vals[j]} : f32")
@@ -617,15 +643,12 @@ def gen_vqt(bits):
                 e(f"  %na{w}{p} = scalar.ori {acc}, %np{w}{p} : i32")
                 acc = f"%na{w}{p}"
         words.append(acc)
-    e("  %ti0 = index.mul %head, %tiles : index")
-    e("  %ti1 = index.add %ti0, %tile : index")
-    e("  %ti2 = index.mul %ti1, %c256 : index")
-    e("  %ti = index.add %ti2, %d : index")             # [head][tile][dim]
-    e(f"  %da0 = index.mul %ti, %c{nw} : index")
-    for w in range(nw):
-        e(f"  %daw{w}c = index.constant {w} : index")
-        e(f"  %daw{w} = index.add %da0, %daw{w}c : index")
-        e(f"  view.store {words[w]}, %d_flat[%daw{w}] : i32, view<[%dtot]xi32>")
+    return words
+
+
+def vqt_stats(e, bits):
+    """gen_vqt's tile stats (S, C') as one dword %pkd"""
+    nw, lv, off, umax, smul, cmul = vqt_params(bits)
     e(f"  %rS = scalar.constant {smul} : f32")
     e(f"  %rC = scalar.constant {cmul} : f32")
     e("  %S = scalar.mulf %sf, %rS : f32")
@@ -635,10 +658,6 @@ def gen_vqt(bits):
     e("  %pk = vector.from_elements %Sh, %Cph : vector<2xf16>")
     e("  %pkw = vector.bitcast %pk : vector<2xf16> to vector<1xi32>")
     e("  %pkd = vector.extract %pkw[0] : vector<1xi32> -> i32")
-    e("  view.store %pkd, %t_flat[%ti] : i32, view<[%ttot0]xi32>")
-    e("  kernel.return")
-    e("}")
-    return "\n".join(L) + "\n"
 
 
 _gen_kq8, _gen_kq4 = gen_kq8, gen_kq4

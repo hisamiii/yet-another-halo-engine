@@ -1627,15 +1627,16 @@ def main():
     def write_attn(path):
         A = gen_attn_fa
         keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
-                                   + tuple(KT2_SHAPE_FLAGS) + ("FPSPARSE", "FPS_LS", "FPS_TPAD")))
+                                   + tuple(KT2_SHAPE_FLAGS) + ("FPSPARSE", "FPS_LS", "FPS_TPAD", "K4", "KDEC", "VQ4", "QROT")))
         saved = {k: getattr(A, k) for k in keys}
         twins = [(path, MAIN_FLAGS, None), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI), None)]
         if not A.KDEC:   # the KT2 twin (fp16 sources only)
             twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI,
                                           **(KT2_SHAPE_FLAGS if kt2_cfg == KT2_SHAPE else {})), kt2_shape))
-            if fps_on and path in fps_paths:   # the block-sparse KT2 twin (the kvdeq sources)
+            if fps_on and path in fps_paths:   # the block-sparse KT2 twin (the kvdeq sources), on the kv4 pools directly
                 twins.append((fps(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI, **KT2_SHAPE_FLAGS, FPSPARSE=True,
-                                              FPS_LS=fps_ls, FPS_TPAD=T), kt2_shape))
+                                              FPS_LS=fps_ls, FPS_TPAD=T, K4=True, KDEC=True, VQ4=True, QROT=True),
+                              kt2_shape))
         for name, flags, shape in twins:
             for k, v in flags.items():
                 setattr(A, k, v)
@@ -1702,13 +1703,24 @@ def main():
         open(vdeq_src, "w").write(gen_attn_fa.gen_vdeq(deq_bits))
         geom.append(("kvdeq", 0, 0, 0))
     fpmean_src = os.path.join(tmp, "yah_fpmean.loom")
-    fpcopy_src = os.path.join(tmp, "yah_fpcopy.loom")
+    fpcopyk_src = os.path.join(tmp, "yah_fpcopyk.loom")
+    fpcopyv_src = os.path.join(tmp, "yah_fpcopyv.loom")
     fpsel_src = os.path.join(tmp, "yah_fpsel.loom")
+    kdeqf_src = os.path.join(tmp, "yah_kdeq4_first.loom")
+    vdeqf_src = os.path.join(tmp, "yah_vdeq4_first.loom")
     if fps_on:
+        # the sparse twin reads the kv4 pools (the staging decode, as the dense kv4 kernel did): sparse tiles lose the
+        # cross-workgroup L2 reuse of the f16 pools, so the 4x smaller reads win (128K last chunk attention -23%, its
+        # kdeq / vdeq only decode the two chunks yah_fpmean reads). yah_fpcopyk / v write the pooled rows as int4 rows
+        # and V^T tiles of the kv4 pools' extension; dispatch.txt "fpskv4"
         open(fpmean_src, "w").write(gen_fpsparse.gen_fpmean())
-        open(fpcopy_src, "w").write(gen_fpsparse.gen_fpcopy())
+        open(fpcopyk_src, "w").write(gen_fpsparse.gen_fpcopyk())
+        open(fpcopyv_src, "w").write(gen_fpsparse.gen_fpcopyv())
         open(fpsel_src, "w").write(gen_fpsparse.gen_fpsel(T, B, FPS_ALPHA))
+        open(kdeqf_src, "w").write(gen_attn_fa.gen_kdeq(4, first=True))
+        open(vdeqf_src, "w").write(gen_attn_fa.gen_vdeq(4, first=True))
         geom.append(("fpsparse", FPS_FROM // B, fps_ext, fps_ls))
+        geom.append(("fpskv4", 0, 0, 0))
     geom.append(("wmma.hal", a_qt, a_hpw, (B + a_qt - 1) // a_qt))
     # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md).
     # K: int8 (yah_kq8) or H256 + asymmetric int4 (yah_kq4) after yah_kmean centres it; the attention decodes it to f16.
@@ -2019,10 +2031,12 @@ def main():
         *([(qrot_src, "qrot.hal", ["yah_qrot.token_count=%d" % B])] if qrot_first < NCH else []),
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c),
            ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)]
-           + (["%s.out_capacity=%d" % (sym, cap_attn)] if sym.startswith("yah_vdeq") else []))
+           + (["%s.out_capacity=%d" % (sym, cap_attn)] if sym.startswith("yah_vdeq") else [])
+           + (["%s.first=%d" % (sym, max(c - 1, 0) * B)] if src in (kdeqf_src, vdeqf_src) else []))
           for c in range(NCH) if kvdeq
-          for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
-                                 (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
+          for sparse in (fps_on and c * B >= FPS_FROM,)
+          for src, stem, sym in ((kdeqf_src if sparse else kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
+                                 (vdeqf_src if sparse else vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
         *[(occ(attn_qr_src if c >= qrot_first else attn_src, c), "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % cap_attn,
             "attention_prefill.token_count=%d" % B,
@@ -2040,8 +2054,9 @@ def main():
           for src, stem, cfg in (
               (fpmean_src, "fpmean", ["yah_fpmean.capacity=%d" % T, "yah_fpmean.capx=%d" % cap_attn,
                                       "yah_fpmean.first=%d" % (max(c - 1, 0) * B // 128), "yah_fpmean.nend=%d" % ((c + 1) * B // 128)]),
-              (fpcopy_src, "fpcopy", ["yah_fpcopy.capacity=%d" % T, "yah_fpcopy.capx=%d" % cap_attn,
-                                      "yah_fpcopy.nend=%d" % ((c + 1) * B // 128)]),
+              *[(src, stem, ["%s.capacity=%d" % (sym, T), "%s.capx=%d" % (sym, cap_attn),
+                             "%s.nend=%d" % (sym, (c + 1) * B // 128)])
+                for src, stem, sym in ((fpcopyk_src, "fpcopyk", "yah_fpcopyk"), (fpcopyv_src, "fpcopyv", "yah_fpcopyv"))],
               *([(fpsel_src, "fpsel", ["yah_fpsel.start_pos=%d" % (c * B), "yah_fpsel.tpad=%d" % T])]
                 if c * B >= FPS_FROM else []))],
         *([(vtrans_src, "vtrans.hal",
