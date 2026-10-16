@@ -53,6 +53,16 @@ def flag_count(M):
     return M // BM * WM * WN * 32
 
 
+GU_CHUNK = 1024   # output features per counter of a flagged gu (gen_rot.gen_q's 1024-value chunks)
+
+
+def gu_flag_count(M):
+    """What a flagged gu adds to a (chunk, token tile) counter: one per lane of the chunk's GU_CHUNK / (BM / 2) row
+    tiles."""
+    BM, _, WM, WN = tile(M)
+    return GU_CHUNK // (BM // 2) * WM * WN * 32
+
+
 def sym(kind):
     return "yah_iu4_gemm" + {"kres": "_kres", "kqg": "_kqg", "gu": "_gu"}.get(kind, "")
 
@@ -61,7 +71,8 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
     """out16: kstore stores f16 (gen_gemm_tile.OUT16). flag (kres, kstore): binding cnt after the outputs, i32 per token
     tile (zero before the GEMM); each lane adds 1 to cnt[token tile] once its wave's stores are visible (device scope;
     flag_count per token tile), so a flag-waiting consumer (gen_rot.flag_wait) can read finished token tiles while the
-    GEMM's last workgroups still run. Kind gu: the FFN's gate and up in one GEMM, f16 silu(gate) * up
+    GEMM's last workgroups still run. A flagged gu counts per (GU_CHUNK features, token tile): cnt[chunk token tiles +
+    token tile], gu_flag_count each (gen_rot.gen_q flag). Kind gu: the FFN's gate and up in one GEMM, f16 silu(gate) * up
     of M features; a workgroup stages BM / 2 gate rows and the same features' up rows (wave rows WM / 2 and up) and
     pairs them through LDS, so the gate never goes to memory.
     hperm (value heads, key heads): the output of weight rows 128 i.. (GGUF DeltaNet value head i) goes to HF head
@@ -78,7 +89,8 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
     s = sym(kind)
     bufs = ["weight", "aq", "ad"] + {"kstore": ["output"], "kres": ["resid", "output"], "kqg": ["output", "gate_out"],
                                      "gu": ["up", "output"]}[kind]
-    assert not flag or kind in ("kres", "kstore")
+    assert not flag or kind in ("kres", "kstore", "gu")
+    assert not (flag and GU) or M % GU_CHUNK == 0
     if flag:
         bufs.append("cnt")
     WB, AB = BM * WP, BN * WP          # dwords of one staged weight / activation tile
@@ -493,9 +505,19 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
     if flag:
         # every lane, no workgroup barrier and no thread-id test (that keeps the id live and shifts the main loop's
         # registers: +0.9% vs +0.4%); same-address adds are cheap next to the stores
-        e("  %kf_cv = buffer.view %cnt_na[%base] : buffer -> view<[%token_tiles]xi32>")
         e("  %kf_one = scalar.constant 1 : i32")
-        e("  view.atomic.reduce<addi> %kf_one, %kf_cv[%wg_y] {ordering = release, scope = device} : i32, view<[%token_tiles]xi32>")
+        if GU:
+            e(f"  %kf_nch = index.constant {M // GU_CHUNK} : index")
+            e("  %kf_n = index.mul %kf_nch, %token_tiles : index")
+            e(f"  %kf_rt = index.constant {GU_CHUNK // BO} : index")
+            e("  %kf_ch = index.div %wg_x, %kf_rt : index")
+            e("  %kf_i0 = index.mul %kf_ch, %token_tiles : index")
+            e("  %kf_i = index.add %kf_i0, %wg_y : index")
+            e("  %kf_cv = buffer.view %cnt_na[%base] : buffer -> view<[%kf_n]xi32>")
+            e("  view.atomic.reduce<addi> %kf_one, %kf_cv[%kf_i] {ordering = release, scope = device} : i32, view<[%kf_n]xi32>")
+        else:
+            e("  %kf_cv = buffer.view %cnt_na[%base] : buffer -> view<[%token_tiles]xi32>")
+            e("  view.atomic.reduce<addi> %kf_one, %kf_cv[%wg_y] {ordering = release, scope = device} : i32, view<[%token_tiles]xi32>")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

@@ -378,6 +378,11 @@ NQOV_ON = False   # set by main
 # part a in the gate GEMM's. Same values. dispatch.txt "dnov"
 DNOV = True
 DNOV_ON = False   # set by main
+# GUOV (A4): the gu GEMM also as iu4_guf_* (gen_gemm_iu4 flag: a counter per 1024 features and token tile) and
+# rotq_17408 as rotqf_17408 (gen_rot.gen_q flag), so the down projection's rotq runs in the gu GEMM's tail. Same values.
+# dispatch.txt "guov"
+GUOV = True
+GUOV_ON = False   # set by main
 KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1)
 KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
 
@@ -1439,7 +1444,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1465,6 +1470,7 @@ def main():
     a4 = rot and os.environ.get("YAH_A16") != "1"
     KV16_ON = KV16 and a4
     NQOV_ON = NQOV and a4
+    GUOV_ON = GUOV and a4 and not EMIT_HALF
     DNOV_ON = (DNOV and a4 and DNSPLIT == (40, 8) and DNVCONV and conv_tb_ok(B) and "qkv" not in NPU_SPLIT
                and not EMIT_HALF)   # the dnvconv conv (dn_vconv below)
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
@@ -1495,6 +1501,8 @@ def main():
                             geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
                         # the flagged variants: the plain GEMM's geometry (dispatch.txt row) serves both
                         if k == "kres" and NQOV_ON and mt * 16 == 5120:
+                            iu4_gemm(k, mt, kb, B, outdir, flag=True)
+                        if k == "gu" and GUOV_ON:
                             iu4_gemm(k, mt, kb, B, outdir, flag=True)
                         if k == "kstore" and DNOV_ON and (hp is not None or any(
                                 t.endswith("attn_qkv.weight") for t in combos[(kind, fmt, port, mt, kb)])):
@@ -1812,6 +1820,11 @@ def main():
             rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
             open(rot_src[name], "w").write(gen_rot.gen_q(k, B, gen_gemm_iu4.KP, True, heads, hot=k == 17408))
             geom.append((name, 0, 64, k // 1024))
+        if GUOV_ON:   # rotq_17408's geometry
+            rot_src["rotqf_17408.hal"] = os.path.join(tmp, "rotqf_17408.loom")
+            open(rot_src["rotqf_17408.hal"], "w").write(
+                gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None, flag=gen_gemm_iu4.gu_flag_count(17408)))
+            geom.append(("guov", 0, 0, 0))
         if a4:
             # the norm-fed sites: RMS norm + rotq in one kernel (gen_rot.gen_nq; same bits, no f16 norm round trip)
             rot_src["normq_5120.hal"] = os.path.join(tmp, "normq_5120.loom")

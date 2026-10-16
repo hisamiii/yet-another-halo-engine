@@ -669,6 +669,7 @@ class LoomPrefill {
     nqov_ = a4_ && geom_.count("nqov") != 0;
     dnov_ = a4_ && geom_.count("dnov") != 0;
     pnq_ab_ = dnov_ && geom_.count("pnq_abf.hal") != 0;
+    guov_ = a4_ && geom_.count("guov") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
@@ -682,7 +683,7 @@ class LoomPrefill {
     scratch_ = &Alloc(B * kFfn * 2);
     if (rot_ && !a4_) rotbuf_ = &Alloc(B * kInner * 2);
     if (a4_) aq_ = &Alloc(B * kFfn / 2), ad_ = &Alloc(B * (kFfn / 128) * 4);
-    if (nqov_ || dnov_) {
+    if (nqov_ || dnov_ || guov_) {
       // the flag-waiting kernels' activation pair (swapped with aq_ / ad_ after each) and their producers' counters
       aq2_ = &Alloc(B * kFfn / 2), ad2_ = &Alloc(B * (kFfn / 128) * 4);
       flags_ = &Alloc(kFlagSlots * TokenTiles128() * 4);
@@ -951,9 +952,12 @@ class LoomPrefill {
       NpuJoin();
       FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
     } else if (a4_) {
-      // one GEMM for gate and up: silu(gate) * up straight into ffnup_ (gen_gemm_iu4 gu)
+      // one GEMM for gate and up: silu(gate) * up straight into ffnup_ (gen_gemm_iu4 gu); guov: flagged (a counter per
+      // 1024 features and token tile), RunResidual's rotq waits on it
       const auto* up = Find(pre + "ffn_up.weight");
-      RunIu4("gu", *Find(pre + "ffn_gate.weight"), {ffnup_}, {std::size_t(up->dims[1]) * 2}, 0b10000, up);
+      if (guov_) gu_cnt_ = FlagSlots(kFfn / 1024);
+      gu_flagged_ = RunIu4("gu", *Find(pre + "ffn_gate.weight"), {ffnup_}, {std::size_t(up->dims[1]) * 2}, 0b10000, up,
+                           guov_ ? &gu_cnt_ : nullptr);
     } else {
       RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
       RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
@@ -1321,6 +1325,15 @@ class LoomPrefill {
   void RotQ(const LoomBuffer& x, std::uint32_t k, const std::string& awq, bool heads) {
     const std::string hal = heads ? std::string("rotq_heads.hal") : "rotq_" + std::to_string(k) + ".hal";
     const Geom& g = geom_.at(hal);
+    if (std::exchange(gu_flagged_, false)) {
+      // the flagged gu's output, x untracked: the workgroups wait on its counters, so they run in the GEMM's tail; the
+      // other activation pair (the gu still reads aq_ / ad_) becomes aq_ / ad_
+      if (&x != ffnup_ || k != kFfn || heads) throw LoomError("rotqf_17408.hal: not the flagged gu's output");
+      Dispatch(Exe("rotqf_17408.hal"), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1,
+               {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq2_), Ref(*ad2_), gu_cnt_}, 0b11000, nullptr, 0b100001);
+      std::swap(aq_, aq2_), std::swap(ad_, ad2_);
+      return;
+    }
     Dispatch(Exe(hal), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1,
              {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b11000);
   }
@@ -1358,12 +1371,15 @@ class LoomPrefill {
   }
   // Completion counters of a flagged producer and its flag-waiting consumer (gen_gemm_iu4 flag, gen_rot.flag_wait): a
   // word per 128-token tile, a slot per pair in the chunk, zeroed before the chunk (RunLayers). Both bind it untracked.
-  static constexpr std::size_t kFlagSlots = 512;
+  static constexpr std::size_t kFlagSlots = 2048;
   std::size_t TokenTiles128() const { return (B_ + 127) / 128; }
-  hrx_buffer_ref_t FlagSlot() {
-    if (flag_slot_ >= kFlagSlots) throw LoomError("prefill: out of completion-counter slots");
+  hrx_buffer_ref_t FlagSlot() { return FlagSlots(1); }
+  // k consecutive slots (a flagged gu: a counter per 1024 features and token tile)
+  hrx_buffer_ref_t FlagSlots(std::size_t k) {
+    if (flag_slot_ + k > kFlagSlots) throw LoomError("prefill: out of completion-counter slots");
     const std::size_t n = TokenTiles128() * 4;
-    return {flags_->handle, flag_slot_++ * n, n};
+    flag_slot_ += k;
+    return {flags_->handle, (flag_slot_ - k) * n, k * n};
   }
   // A kres RunResidual deferred (nqov): RunNorm's normq takes it as the flagged pair, anything else runs it plain first.
   // trim: trim_row_ when it was deferred (the GEMM runs as it would have then).
@@ -2826,6 +2842,9 @@ class LoomPrefill {
   // A4 sets (dispatch.txt "a4"): int4 activations (B_ x kFfn / 2 bytes) and their scales (one per 128) for the iu4 GEMMs
   bool a4_ = false, nqov_ = false, dnov_ = false;
   bool pnq_ab_ = false;   // dispatch.txt pnq_abf.hal: one flagged pnq for both DeltaNet parts, their outputs in raw_
+  // dispatch.txt guov: the flagged gu GEMM and its rotq (rotqf_17408); gu_flagged_: the last gu ran flagged on gu_cnt_
+  bool guov_ = false, gu_flagged_ = false;
+  hrx_buffer_ref_t gu_cnt_{};
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
   std::size_t flag_slot_ = 0;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
