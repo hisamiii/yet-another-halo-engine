@@ -1592,7 +1592,9 @@ def main():
     DEEP_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=2, PVF=4, **QN_FLAGS)
     # the 4-workgroup kernel's bit-identical VALU cuts (gen_attn_fa MAXNN, SUM0, EPI_FAST; CTX16: start_pos = c * B):
     # pp2048 attention -6.4% cycles; the deep / KT2 twins keep their tuned code
-    MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0)
+    # QB_ZIGZAG: the short causal blocks are mostly Q / gate / O traffic; launched last (longest first) they ran as a
+    # DRAM-bound tail. Interleaved with the long ones: pp2048 attention -5.5% cycles, bit-identical, neutral at depth
+    MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=True)
 
     kt2_cfg = (a_hpw, a_qt) if EMIT_HALF else KT2_SHAPE
     kt2_shape = kt2_cfg if kt2_cfg != (a_hpw, a_qt) else None   # a shape of its own: its chunks get dispatch.txt rows

@@ -172,6 +172,7 @@ PVF = 2             # PAIR: V fragments in flight in wave B's P.V (a schedule fe
 DOWHILE = True      # PAIR: bottom-tested loop (scf.while with the body in the condition region): the post-loop code then
                     # reads the last body outputs, not the loop-header block arguments, which Loom's linear live
                     # intervals (no lifetime holes) otherwise keep live across the whole body (PAIR: > 256 VGPRs)
+QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
 DOWHILE_MAIN = False   # the same for the head_dim-split loop (measured neutral)
 # SOFT1..4 (measured, not adopted, docs/results.md): keep the head_dim split and run the softmax in wave A only, P^T and
 # alpha through LDS. Bit-identical, -35% VALU, but the waiting partner raises barrier idle: +1.4..+4.4% at 126K.
@@ -714,7 +715,14 @@ def gen():
         e("  %hp = index.rem %wgl, %npairs : index")
         e("  %qb0 = index.div %wgl, %npairs : index")
     e("  %nqb1 = index.sub %nqb, %c1 : index")
-    e("  %qb = index.sub %nqb1, %qb0 : index")
+    if QB_ZIGZAG:   # launch order long, short, long, ... (the short blocks' Q / gate / O traffic spread over the run)
+        e("  %qzh = index.div %qb0, %c2 : index")
+        e("  %qzo = index.rem %qb0, %c2 : index")
+        e("  %qzl = index.sub %nqb1, %qzh : index")
+        e("  %qzodd = index.cmp ne, %qzo, %c0 : index")
+        e("  %qb = scf.select %qzodd, %qzh, %qzl : index")
+    else:
+        e("  %qb = index.sub %nqb1, %qb0 : index")
     e("  %tid = kernel.workitem.id<x> : index")
     e("  %wave = index.div %tid, %c32 : index")
     e("  %lane = index.rem %tid, %c32 : index")
