@@ -42,6 +42,10 @@ LDS_SWZ = True
 # gu epilogue: -log2e and 1.0 as lane * 0 + c (VGPRs): as a literal / inline source the silu's mul and add never pair
 # (398 -> 381 epilogue instrs, bit-identical, gu -0.1%)
 GU_EPI_VCONST = True
+# flag-waiting GEMMs: the prologue issues phase 0's weight loads before the wait (weights never depend on the producer),
+# so a workgroup launched early fetches them while it spins. Bit-identical, counters flat; pp2048 8 ABBA runs -11.5 ms
+# mean at +-10 ms run spread (expected ~1-2 ms: one first-fetch latency per call)
+WAIT_LATE = True
 GROUP = 8   # grouped workgroup order: row tiles per launch band (group_of)
 
 
@@ -198,11 +202,13 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
     e("  %tid = kernel.workitem.id<x> : index")
     e("  %wave = index.div %tid, %c32 : index")
     e("  %lane = index.rem %tid, %c32 : index")
-    if wait:
+    def flag_wait():
         import gen_rot
         WV = "view<[%token_tiles]xi32>"
         e(f"  %wf_cv = buffer.view %wcnt_na[%base] : buffer -> {WV}")
         gen_rot.flag_wait(e, "%wf_cv", WV, ["%wg_y"], wait, "%tid", "wf")
+    if wait and not WAIT_LATE:
+        flag_wait()
     e("  %l16 = index.rem %lane, %c16 : index")
     e("  %lh = index.div %lane, %c16 : index")
     e(f"  %cwn = index.constant {WN} : index")
@@ -308,8 +314,9 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
     e("  %ds_lor = index.mul %ds_t, %c4 : index")
     assume("ds_lo", 4)
 
-    def loads(pfx, kp):
-        """The global loads of phase kp into registers; returns [(kind, value, lds offset, live)]."""
+    def loads(pfx, kp, mid=None):
+        """The global loads of phase kp into registers; returns [(kind, value, lds offset, live)]. With mid: the weight
+        loads, then mid() (the prologue's flag wait), then the activation loads."""
         e(f"  %{pfx}kb = index.div {kp}, %c2 : index")
         e(f"  %{pfx}hf = index.rem {kp}, %c2 : index")
         e(f"  %{pfx}kb136 = index.mul %{pfx}kb, %c136 : index")
@@ -318,7 +325,14 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
         e(f"  %{pfx}wo = index.add %{pfx}wo0, %c8 : index")            # nibble bytes of the phase within the row
         e(f"  %{pfx}ao = index.mul {kp}, %c64 : index")                  # activation bytes of the phase within the row
         out = []
-        for nm, n in (("w", nwc), ("a", nac)):
+        order = (("w", nwc), ("ws", 0), ("mid", 0), ("a", nac), ("d", 0)) if mid else (("w", nwc), ("a", nac), ("ws", 0), ("d", 0))
+        for nm, n in order:
+            if nm == "mid":
+                mid()
+            if nm == "ws":
+                weight_scales(pfx, out)
+            if nm == "d":
+                act_scale(pfx, kp, out)
             for r in range(n):
                 p = f"%{nm}s{r}"
                 if nm == "w":
@@ -333,6 +347,9 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
                     e(f"  %{pfx}a{r}8 = vector.load %aqv[%{pfx}a{r}d] : view<[%a_bytes]xi8> -> vector<16xi8>")
                     e(f"  %{pfx}a{r} = vector.bitcast %{pfx}a{r}8 : vector<16xi8> to vector<4xi32>")
                 out.append((nm, f"%{pfx}{nm}{r}", f"{p}lo", f"{p}live"))
+        return out
+
+    def weight_scales(pfx, out):
         e(f"  %{pfx}hf4 = index.mul %{pfx}hf, %c4 : index")
         e(f"  %{pfx}sb0 = index.add %sc_gb, %{pfx}kb136 : index")
         e(f"  %{pfx}sb = index.add %{pfx}sb0, %{pfx}hf4 : index")
@@ -342,13 +359,14 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
             e(f"  %{pfx}sc{nm}h = vector.bitcast %{pfx}sc{nm}8 : vector<2xi8> to vector<1xf16>")
             e(f"  %{pfx}sc{nm} = vector.extract %{pfx}sc{nm}h[0] : vector<1xf16> -> f16")
         out.append(("s", f"%{pfx}sc", "%sc_lo", None))
+
+    def act_scale(pfx, kp, out):
         e(f"  %{pfx}kp4 = index.mul {kp}, %c4 : index")
         e(f"  %{pfx}di = index.add %ds_gb, %{pfx}kp4 : index")
         e(f"  %{pfx}dt8 = vector.load %adv[%{pfx}di] : view<[%d_bytes]xi8> -> vector<4xi8>")
         e(f"  %{pfx}dtv = vector.bitcast %{pfx}dt8 : vector<4xi8> to vector<1xf32>")
         e(f"  %{pfx}dt = vector.extract %{pfx}dtv[0] : vector<1xf32> -> f32")
         out.append(("d", f"%{pfx}dt", "%ds_lo", None))
-        return out
 
     def offsets(q, buf):
         """The byte offsets of LDS buffer buf (an index value) as %{q}wbo / abo / sbo / dbo."""
@@ -399,7 +417,7 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
                 e("  }")
 
     # prologue: phase 0 into buffer 0
-    stores("p0_", loads("p0_", "%c0"), "%c0")
+    stores("p0_", loads("p0_", "%c0", flag_wait if wait and WAIT_LATE else None), "%c0")
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     # per-lane LDS byte offsets of fragment 0 in buffer 0: weight row m0 + l16, token n0 + l16 (fragment i / j is 16 i / j
     # rows further), the weight scale slots (tile * 16 + half * 8) and this lane's token's activation scale
