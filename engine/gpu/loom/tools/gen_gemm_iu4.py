@@ -30,6 +30,9 @@ V2 = "vector<2xi32>"
 # gu silu's 1 / (1 + exp(-g)) as a bare v_rcp_f32 (1 ulp, no Newton step / inf select): an A4 redraw (kld_ref in the
 # redraw spread), gu -0.2%
 GU_BARE_RCP = True
+# gu: a fence between the A and B fragment loads of a k step: allocation then places the bank-pinned A fragments first
+# (all WMMAs 16 cyc, 237 -> 213 VGPR), gu -0.5%; kres loses with it (out +3.6%)
+GU_FRAG_FENCE = True
 GROUP = 8   # grouped workgroup order: row tiles per launch band (group_of)
 
 
@@ -409,6 +412,8 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
                 e(f"    %{q}wd{st}_{i}b = vector.load %lb[%{q}la{st}_{i}] : view<{LDSW * 4}xi8> -> vector<8xi8>")
                 e(f"    %{q}wd{st}_{i} = vector.bitcast %{q}wd{st}_{i}b : vector<8xi8> to {V2}")
                 e(f"    %{q}lhs{st}_{i} = vector.fragment<lhs> %{q}wd{st}_{i} shape [%m, %k] using {{schema = %schema : encoding<schema>}} : {V2}")
+            if GU and GU_FRAG_FENCE:
+                e("    scf.schedule.fence")
             for j in range(FN):
                 e(f"    %{q}lb{st}_{j}c = index.constant {(16 * j * WP + 2 * st) * 4} : index")
                 e(f"    %{q}lb{st}_{j} = index.add {ba['lb']}, %{q}lb{st}_{j}c : index")
