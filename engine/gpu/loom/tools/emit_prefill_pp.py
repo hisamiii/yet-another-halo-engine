@@ -226,6 +226,42 @@ def prepab_x16(text):
          "%vh = view.load %qkv_view[%src] : view<[%qkv_total]xf16> -> f16\n        %v = scalar.extf %vh : f16 to f32\n")])
 
 
+RING_WGS = (10240 + 255) // 256   # the dnvconv ring update's grid (one lane per qkv channel)
+
+
+def prepab_ring(text, dflag):
+    """yah_deltanet_prep_ab's conv ring update alone (DNRING): it waits until dcnt[0] (DeltaNet part b's counter) reaches
+    dflag, so the ring is no longer behind a graph barrier, and counts its waves in ocnt[0] (gen_rot.emit_oflag,
+    ring_flag_count), which pnq_abfr waits on. The alpha / beta lanes (their ab_ output is not read in dnvconv sets) are
+    gone with their bindings: qkv, state, valid, dcnt, ocnt."""
+    i = text.index("  %in_count = index.cmp ult, %i, %count : index")
+    j = text.index("  kernel.return", i)
+    L = []
+    gen_rot.emit_oflag(L.append, 1, "%c0", "%lane")
+    text = text[:i] + "\n".join(L) + "\n" + text[j:]
+    W = []
+    W.append("  %dcnt_na, %ocnt_na = buffer.assume.noalias %dcnt, %ocnt : buffer, buffer")
+    W.append("  %dn_cv = buffer.view %dcnt_na[%base] : buffer -> view<1xi32>")
+    gen_rot.flag_wait(W.append, "%dn_cv", "view<1xi32>", ["%c0"], dflag, "%lane", "dn")
+    return _rewrite(text, [
+        ("launch(%alpha: buffer, %beta: buffer, %ssm_a: buffer, %ssm_dt: buffer, %qkv: buffer, %state: buffer, %ab: buffer, "
+         "%valid: buffer) {", "launch(%qkv: buffer, %state: buffer, %valid: buffer, %dcnt: buffer, %ocnt: buffer) {"),
+        ("  %alpha_na, %beta_na, %a_na, %dt_na, %qkv_na, %state_na, %ab_na = buffer.assume.noalias %alpha, %beta, %ssm_a, "
+         "%ssm_dt, %qkv, %state, %ab : buffer, buffer, buffer, buffer, buffer, buffer, buffer\n",
+         "  %qkv_na, %state_na = buffer.assume.noalias %qkv, %state : buffer, buffer\n"),
+        ("  %alpha_view = buffer.view %alpha_na[%base] : buffer -> view<[%count]xf32>\n", ""),
+        ("  %beta_view = buffer.view %beta_na[%base] : buffer -> view<[%count]xf32>\n", ""),
+        ("  %a_view = buffer.view %a_na[%base] : buffer -> view<[%num_heads]xf32>\n", ""),
+        ("  %dt_view = buffer.view %dt_na[%base] : buffer -> view<[%num_heads]xf32>\n", ""),
+        ("  %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>\n", ""),
+        ("  %i = index.add %wg_base, %lane : index\n", "  %i = index.add %wg_base, %lane : index\n" + "\n".join(W) + "\n")])
+
+
+def ring_flag_count():
+    """What prepab_ring adds to its counter: one per wave of its grid."""
+    return RING_WGS * 256 // 32
+
+
 def postnorm_g16(text):
     """yah_ssm_postnorm_fp16 reading the DeltaNet z gate as the f16 output of its GEMM (O16_MT 384)."""
     return _rewrite(text, [
@@ -408,6 +444,11 @@ RQK_ON = False   # set by main
 # the norm with no graph barrier. Same values. dispatch.txt "nqw"
 NQW = True
 NQW_ON = False   # set by main
+# DNRING (A4, with DNOV's pnq_abf, RQK, NQW): the conv ring update as prepabr (prepab_ring: waits on DeltaNet part b's
+# counter, counts) before the pnq, pnq_abfr waiting on it and counting rows for ssm_out's kres (iu4_kresfw_*), so a
+# DeltaNet layer's tail and the next layer's input GEMMs need no graph barrier. Same values. dispatch.txt "dnring"
+DNRING = True
+DNRING_ON = False   # set by main
 # QNSTREAM + QNMIX: the QNORM prologue one fragment at a time (its 255-VGPR peak had pushed both role-split twins past 240,
 # so KT2 fell back and the deep twin ran 2 workgroups per WGP; 96K deep attention -13%); MAXNN + SUM0 (KT2 -1.35%)
 QN_FLAGS = dict(QNSTREAM=True, QNMIX=True, MAXNN=True, SUM0=True)
@@ -1484,7 +1525,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1818,6 +1859,7 @@ def main():
     prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
     text = open(os.path.join(E.LOOM, "yah_deltanet_prep_ab_f32.loom")).read()
     open(prepab_src, "w").write(prepab_x16(text) if 640 in O16_MT else text)
+    prepab_text = prepab_x16(text) if 640 in O16_MT else text
     postnorm_base = open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()
     if 384 in O16_MT:
         postnorm_base = postnorm_g16(postnorm_base)
@@ -1827,6 +1869,11 @@ def main():
     dn_ss = DNSS and dn_perm and dn_vconv and DNO16 and B % 32 == 0
     # one flagged pnq for both DeltaNet parts (gen_rot.gen_pnq "ab"): part b's DeltaNet counts its finished lanes
     pnq_ab = DNOV_ON and dn_ss
+    DNRING_ON = DNRING and pnq_ab and RQK_ON and NQW_ON and DNSPLIT == (40, 8)
+    prepabr_src = os.path.join(tmp, "yah_deltanet_prep_abr.loom")
+    if DNRING_ON:
+        open(prepabr_src, "w").write(prepab_ring(prepab_text, gen_gdn_ss.done_count(DNSPLIT[1])))
+        geom.append(("dnring", 0, 0, 0))
     # blocks per head of the DeltaNet grid (the unsplit rowsplit.hal is not dispatched with dnsplit)
     geom.append(("rowsplit.hal", 0, 1 if dn_ss else 2, 0))
     geom.append(("dnthreads", gen_gdn_ss.THREADS if dn_ss else 256, 0, 0))
@@ -1979,6 +2026,12 @@ def main():
                     geom.append(("pnq_abf.hal", 0, 64, len(gen_rot.pnq_groups("ab")) // 4))
                     # a trimmed chunk's gate GEMM runs unflagged (gen_gemm_iu4 flags only full token tiles): the same
                     # grid waiting only on DeltaNet part b, behind the gate GEMM in the graph (pnq_abf.hal's geometry)
+                    if DNRING_ON:   # waiting on the ring update (which waits on part b), counting for ssm_out's kres
+                        assert gen_rot.q_flag_count(6144) == 128 * len(gen_rot.pnq_groups("ab")) // 4 * 2
+                        rot_src["pnq_abfr.hal"] = os.path.join(tmp, "pnq_abfr.loom")
+                        open(rot_src["pnq_abfr.hal"], "w").write(
+                            gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
+                                            dflag=ring_flag_count(), oflag=True))
                     rot_src["pnq_abd.hal"] = os.path.join(tmp, "pnq_abd.loom")
                     open(rot_src["pnq_abd.hal"], "w").write(
                         gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
@@ -2046,6 +2099,10 @@ def main():
         *([(convf_src, "convkqf.hal",
             ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
              "yah_ssm_conv_kq.num_key_heads=16"])] if DNOV_ON else []),
+        *([(prepabr_src, "prepabr.hal",
+             ["yah_deltanet_prep_ab.batch=%d" % B,
+              "yah_deltanet_prep_ab.qkv_size=10240",
+              "yah_deltanet_prep_ab.num_heads=48"])] if DNRING_ON else []),
         (prepab_src, "prepab.hal",
          ["yah_deltanet_prep_ab.batch=%d" % B,
           "yah_deltanet_prep_ab.qkv_size=10240",

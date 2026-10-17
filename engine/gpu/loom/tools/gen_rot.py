@@ -718,7 +718,7 @@ def pn_heads(part):
     return [pn_gguf(h) for g in pnq_groups(part) for h in (2 * g, 2 * g + 1)]
 
 
-def gen_pnq(rows, span, part, o16=False, flag=0, dflag=0):
+def gen_pnq(rows, span, part, o16=False, flag=0, dflag=0, oflag=False):
     """yah_pnq: the DeltaNet postnorm (yah_ssm_postnorm_gate_f16 with the f16 gate: per GGUF head, inv = 1 / sqrt(sum
     raw^2 / 128 + 1e-6), out = f16((raw inv) w (g sigmoid(g)))) fused with rotq_heads (gen_q with PN_HEADS): the f16
     postnorm output never leaves the workgroup. Part p takes pnq_groups(p), whose heads are DeltaNet part p's
@@ -737,6 +737,8 @@ def gen_pnq(rows, span, part, o16=False, flag=0, dflag=0):
     (rows x 1024), then part a's, so part b never waits behind part a's dispatch. dflag (DeltaNet part b's
     gen_gdn_ss.done_count): binding dcnt after cnt, also waited on, so raw needs no graph barrier behind part b (which
     runs beside the gate GEMM; part a is ordered before it).
+    oflag: binding ocnt last, i32 [rows / FLAG_TT] (zero before): each wave counts itself in its row's token tile
+    (emit_oflag; "ab": gen_q's q_flag_count of the 6144 values), so the kres after it waits instead of a graph barrier.
     Bindings: raw, weight [128], gate (f16), awq, signs, q, d."""
     nv, nk, hd = PN_HEADS
     r = nv // nk
@@ -756,7 +758,8 @@ def gen_pnq(rows, span, part, o16=False, flag=0, dflag=0):
     e(f"  %gx = index.constant {ng // 4} : index")
     e(f"  %gy = index.constant {rows} : index")
     e("  kernel.launch.config workgroups(%gx, %gy, %u1) workgroup_size(%c64, %u1, %u1) : index")
-    names = ["raw", "nw", "gate", "awq", "sg", "q", "d"] + (["cnt"] if flag else []) + (["dcnt"] if dflag else [])
+    names = (["raw", "nw", "gate", "awq", "sg", "q", "d"] + (["cnt"] if flag else []) + (["dcnt"] if dflag else [])
+             + (["ocnt"] if oflag else []))
     e("} launch(" + ", ".join(f"%{n}: buffer" for n in names) + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 8, 16, 32, 128, 256, PITCH, 16 * PITCH):
@@ -911,6 +914,8 @@ def gen_pnq(rows, span, part, o16=False, flag=0, dflag=0):
     e("  %xf = vector.extf %xh : vector<16xf16> to vector<16xf32>")
     _core(e, K, total, True, "f16", ("q", "d"), LV, loaded=True)
     _quant(e, total, span, LV)
+    if oflag:
+        emit_oflag(e, rows // FLAG_TT, "%row", "%lane")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

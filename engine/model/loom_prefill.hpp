@@ -682,6 +682,7 @@ class LoomPrefill {
     nqgu_ = guov_ && geom_.count("nqgu") != 0;
     rqk_ = nqov_ && geom_.count("rqk") != 0;
     nqw_ = a4_ && geom_.count("nqw") != 0;
+    dnring_ = nqw_ && rqk_ && geom_.count("dnring") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
@@ -1957,7 +1958,8 @@ class LoomPrefill {
       const bool hp = geom_.count("dnperm") && wname.ends_with("attn_gate.weight");
       if (hp && !geom_.count("iu4_kstoreh_" + std::to_string(MTiles(*t)) + "_" + std::to_string(t->dims[0] / 256) + ".hal"))
         throw LoomError("dnperm sets need the kstoreh gate GEMM");
-      return RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000, nullptr, cnt, &iu4_wait_);
+      return RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000, nullptr, cnt, &iu4_wait_,
+                    iu4_untrack_);
     }
     Fmt f{};
     const std::string base = GemmHal("gemm_kstore", *t, &f);
@@ -1983,7 +1985,7 @@ class LoomPrefill {
     const auto* t = Find(wname);
     if (a4_) {
       RunIu4("kqg", *t, {q_, gate_}, {std::size_t(t->dims[1]) * 2, std::size_t(t->dims[1]) * 2}, 0b11000, nullptr, nullptr,
-             &iu4_wait_);
+             &iu4_wait_, iu4_untrack_);
       return true;
     }
     Fmt f{};
@@ -2028,13 +2030,16 @@ class LoomPrefill {
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
   // af: the afrag form of the fused kres GEMM (input fragment-major)
   // quantized (A4): aq_ / ad_ already hold the rotated input (gen_pnq), in is not read
-  void RunResidual(const std::string& wname, const LoomBuffer& in, bool af = false, bool quantized = false) {
+  // qcnt (quantized, dnring): the pnq's per-token-tile counters, which the kres waits on (a chained PendingKres)
+  void RunResidual(const std::string& wname, const LoomBuffer& in, bool af = false, bool quantized = false,
+                   const hrx_buffer_ref_t* qcnt = nullptr) {
     const auto* t = Find(wname);
     const bool heads = rot_ && wname.find("ssm_out") != std::string::npos;
     const std::string awq = wname.substr(0, wname.size() - 6) + "awq";
     if (a4_) {
-      hrx_buffer_ref_t rc{};
-      const bool chain = !quantized && RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads, rqk_ ? &rc : nullptr);
+      hrx_buffer_ref_t rc = qcnt ? *qcnt : hrx_buffer_ref_t{};
+      const bool chain =
+          qcnt ? true : !quantized && RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads, rqk_ ? &rc : nullptr);
       // nqov: the next A4 normq takes it as the flagged pair (RunNorm); any other dispatch flushes it first
       pending_kres_ = {t, hidden_, hidden2_, trim_row_, rc, chain};
       if (!nqov_) FlushKres();
@@ -2157,14 +2162,18 @@ class LoomPrefill {
       NpuJoin();
       NpuUnpack("npu_unpack_q.hal", c, {Ref(*q_), Ref(*gate_)}, 6);
     } else {
-      // nqw: all three wait on the norm's counters (iu4_wait_)
+      // nqw: all three wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_) gate_'s
+      // reader since the last barrier (that tail's pnq, row by row) finished each token tile before it reaches kqg:
+      // kqg's outputs untracked too
       iu4_wait_ = std::exchange(nq_cnt_, {});
+      iu4_untrack_ = std::exchange(dn_chained_, false) && iu4_wait_.buffer ? 0b11000 : 0;
       qg_fused = RunKqg(pre + "attn_q.weight", q_af);
+      iu4_untrack_ = 0;
       if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
       if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
       RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
       RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
-      iu4_wait_ = {};
+      iu4_wait_ = {}, iu4_untrack_ = 0;
     }
     if (!qg_fused)
       Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
@@ -2360,6 +2369,7 @@ class LoomPrefill {
 
   void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
     const std::uint32_t si = l - l / cfg_.full_attention_interval;
+    const bool dn_chained = std::exchange(dn_chained_, false);   // the last DeltaNet tail ran chained (dnring)
     // alpha / beta first: they read the norm's row-major copy (21 MB), which the qkv / gate GEMMs would evict from the
     // last-level cache (0.18 vs ~0.39 M cycles each)
     const bool nok = NpuOk(pre + "attn_qkv.weight") && NpuOk(pre + "attn_gate.weight");
@@ -2372,7 +2382,7 @@ class LoomPrefill {
     // dnov: the qkv GEMM and the conv, the gate GEMM and pnq part a as flagged pairs (FlagSlot), so the conv runs in the
     // qkv GEMM's tail and pnq part a in the gate GEMM's
     hrx_buffer_ref_t qkv_cnt{}, gate_cnt{}, dn_cnt{};
-    bool qkv_flagged = false, gate_flagged = false;
+    bool qkv_flagged = false, gate_flagged = false, qkv_waited = false;
     if (!qkv_split.empty() && !gate_split.empty()) {
       // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows (one job: the same activations)
       // decoder-column sets: each matrix's activations in its decoder's k-block order
@@ -2404,16 +2414,20 @@ class LoomPrefill {
       }
       NpuUnpack("npu_unpack_gate.hal", cg, {Ref(*gate_)}, 2);
     } else {
-      // nqw: alpha, beta and qkv wait on the norm's counters (iu4_wait_)
+      // nqw: alpha, beta and qkv wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_)
+      // their outputs' readers since the last barrier (that tail's DeltaNet part b and ring update) finished before its
+      // pnq and so before each token tile reaches them: untracked too
       iu4_wait_ = std::exchange(nq_cnt_, {});
+      iu4_untrack_ = dn_chained && iu4_wait_.buffer ? 0b1000 : 0;
       RunKstore(pre + "ssm_alpha.weight", *alpha_);
       RunKstore(pre + "ssm_beta.weight", *beta_);
       // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
       gate_late = geom_.count("dnvconv") != 0;
       if (dnov_ && gate_late) qkv_cnt = FlagSlot();
+      qkv_waited = iu4_wait_.buffer && iu4_untrack_;
       qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
       if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
-      iu4_wait_ = {};
+      iu4_wait_ = {}, iu4_untrack_ = 0;
     }
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
@@ -2447,10 +2461,12 @@ class LoomPrefill {
       // conv and alpha / beta itself (gen_gdn_chunk vconv), and prep_ab only advances the conv ring, after both parts
       // (they read the ring before token 0)
       if (!dnsplit_a_ || !dvc->second.tokens) throw LoomError("dispatch.txt dnvconv needs dnsplit and a conv grid");
+      // dn_chained (and a waiting qkv GEMM): conv_out_ / kqbuf_'s readers since the last barrier (the last DeltaNet tail's
+      // part b) finished before the token tiles reached the qkv GEMM: untracked too
       if (qkv_flagged)
         Dispatch(Exe("convkqf.hal"), "yah_ssm_conv_kq", dvc->second.tokens, B_ / conv_tb, 1, 256, 1, 1,
                  {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_), qkv_cnt},
-                 0b011000, nullptr, 0b100001);
+                 0b011000, nullptr, dn_chained && qkv_waited ? 0b111001 : 0b100001);
       else
         Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", dvc->second.tokens, B_ / conv_tb, 1, 256, 1, 1,
                  {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
@@ -2526,11 +2542,25 @@ class LoomPrefill {
       // other pair, which becomes aq_ / ad_
       const LoomBuffer& q = gate_flagged ? *aq2_ : *aq_;
       const LoomBuffer& d = gate_flagged ? *ad2_ : *ad_;
+      // dnring: the ring update (prepabr) waits on dn_cnt and counts in ring_cnt, the pnq waits on that and counts its rows
+      // in pq_cnt for ssm_out's kres: the whole tail runs without a graph barrier (the next layer's input GEMMs and conv
+      // leave their outputs untracked, dn_chained_)
+      const bool chained = dnring_ && pnq_ab_ && gate_flagged;
+      hrx_buffer_ref_t pq_cnt{};
       if (pnq_ab_) {
         // raw_ untracked: part a's DeltaNet is behind the barrier before part b's, part b's done count is dn_cnt
         if (!dn_done) throw LoomError("pnq_abf.hal needs dnvconv");
         const Geom& gab = geom_.at("pnq_abf.hal");
-        if (gate_flagged)
+        if (chained) {
+          // cs untracked: the DeltaNet parts read it (part b before dn_cnt is complete, part a behind part b's barrier)
+          const hrx_buffer_ref_t ring_cnt = FlagSlot();
+          pq_cnt = FlagSlot();
+          Dispatch(Exe("prepabr.hal"), "yah_deltanet_prep_ab", (kQkv + 255u) / 256u, 1, 1, 256, 1, 1,
+                   {Ref(*qkv_), cs, Ref(*valid_), dn_cnt, ring_cnt}, 0b10010, nullptr, 0b11010);
+          Dispatch(Exe("pnq_abfr.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
+                   {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt, ring_cnt, pq_cnt},
+                   0b1001100000, nullptr, 0b1110000101);
+        } else if (gate_flagged)
           Dispatch(Exe("pnq_abf.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
                    {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt, dn_cnt}, 0b1100000,
                    nullptr, 0b110000101);
@@ -2549,10 +2579,11 @@ class LoomPrefill {
         Dispatch(Exe("pnq_b.hal"), "yah_pnq", gb.tt, B_, 1, gb.rowgrp, 1, 1,
                  {Ref(*raw2_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d)}, 0b1100000);
       if (gate_flagged) std::swap(aq_, aq2_), std::swap(ad_, ad2_);
-      if (dn_done) ring();
+      if (dn_done && !chained) ring();
       trim_row_ = tail_;
-      RunResidual(pre + "ssm_out.weight", *scratch_, false, true);
+      RunResidual(pre + "ssm_out.weight", *scratch_, false, true, chained ? &pq_cnt : nullptr);
       trim_row_ = kAllRows;
+      dn_chained_ = chained;
       return;
     }
     if (dnsplit_a_) {
@@ -3041,6 +3072,10 @@ class LoomPrefill {
   // them; iu4_kstorew_*, iu4_kstorefw_*, iu4_kqgw_*)
   bool nqw_ = false;
   hrx_buffer_ref_t iu4_wait_{};
+  // iu4_untrack_: bindings the waiting input GEMMs also leave untracked (RunIu4 untrack); dnring: dn_chained_, the last
+  // DeltaNet tail ran without a graph barrier (RunDeltaNet)
+  std::uint64_t iu4_untrack_ = 0;
+  bool dnring_ = false, dn_chained_ = false;
   hrx_buffer_ref_t nq_cnt_{};
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
   std::size_t flag_slot_ = 0;
