@@ -2294,6 +2294,15 @@ class LoomPrefill {
       dump(".vpool", *vdeq_, deq_bytes_, 0);
       dump(".gate", *gate_, std::size_t{B_} * kInner * 4, 0);
       dump(".out", *scratch_, std::size_t{B_} * kAttn * 2, 0);
+      // YAH_FPS_DUMP_K4=1: the layer's int4 K / V pools, scales and the page table. The f16 pools above hold only the rows
+      // yah_fpmean read this layer (they are shared by the layers) and no pooled rows; the int4 ones are the twin's input
+      if (std::getenv("YAH_FPS_DUMP_K4")) {
+        dump(".kq4", *kq8buf_, kq_bytes_, std::size_t{ai} * kq_bytes_);
+        dump(".ks4", *ksbuf_, ks_bytes_, std::size_t{ai} * ks_bytes_);
+        dump(".ptab", *ptab_, ptab_ref_.length, 0);
+        dump(".vq4", *vqbuf_, vq_bytes_, std::size_t{ai} * vq_bytes_);
+        dump(".vs4", *vqsbuf_, vqs_bytes_, std::size_t{ai} * vqs_bytes_);
+      }
     }
     std::fprintf(stderr, "fps_dump chunk=%u layer=%u -> %s.*\n", ci, ai, base.c_str());
   }
