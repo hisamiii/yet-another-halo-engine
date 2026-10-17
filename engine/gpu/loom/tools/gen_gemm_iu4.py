@@ -39,6 +39,9 @@ GU_FRAG_FENCE = True
 # swizzle spreads a staging wave's 8 rows over both halves of every bank group (bit 3 alone: stores 3-way conflicted).
 # All iu4 GEMMs bit-identical, pp2048 GEMM cycles -1.1% (gu -1.1%, kres_down -1.2%).
 LDS_SWZ = True
+# gu epilogue: -log2e and 1.0 as lane * 0 + c (VGPRs): as a literal / inline source the silu's mul and add never pair
+# (398 -> 381 epilogue instrs, bit-identical, gu -0.1%)
+GU_EPI_VCONST = True
 GROUP = 8   # grouped workgroup order: row tiles per launch band (group_of)
 
 
@@ -610,6 +613,15 @@ def gu_epilogue(e, TM, FM, FN, WN, V8):
     if not GU_BARE_RCP:
         TG.rcp_consts(e)
     e("  %one = scalar.constant 1.0 : f32")
+    nl2e, one = "%nl2e", "%one"
+    if GU_EPI_VCONST:
+        e("  %ev_i = index.cast %lane : index to i32")
+        e("  %ev_f = scalar.sitofp %ev_i : i32 to f32")
+        e("  %ev_z = scalar.constant 0.0 : f32")
+        e("  %ev_0 = scalar.mulf %ev_f, %ev_z : f32")
+        e("  %nl2e_v = scalar.addf %ev_0, %nl2e : f32")
+        e("  %one_v = scalar.addf %ev_0, %one : f32")
+        nl2e, one = "%nl2e_v", "%one_v"
     e("  %gu_p = index.div %wr, %c2 : index")               # 0: a gate wave, 1: an up wave
     e("  %gu_wr = index.rem %wr, %c2 : index")
     e(f"  %gu_cw = index.constant {WN} : index")
@@ -652,9 +664,9 @@ def gu_epilogue(e, TM, FM, FN, WN, V8):
                 y = f"{j}_{q}_{x}"
                 e(f"  %g_{y} = vector.extract %gu_g{j}_{q}[{x}] : vector<4xf32> -> f32")
                 e(f"  %v_{y} = vector.extract %gu_u{j}_{q}[{x}] : vector<4xf32> -> f32")
-                e(f"  %ng_{y} = scalar.mulf %g_{y}, %nl2e : f32")
+                e(f"  %ng_{y} = scalar.mulf %g_{y}, {nl2e} : f32")
                 e(f"  %ex_{y} = scalar.exp2f<afn> %ng_{y} : f32")
-                e(f"  %dn_{y} = scalar.addf %one, %ex_{y} : f32")
+                e(f"  %dn_{y} = scalar.addf {one}, %ex_{y} : f32")
                 TG.recip1(e, f"%iv_{y}", f"%dn_{y}", bare=GU_BARE_RCP)
                 e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
                 e(f"  %ac_{y} = scalar.mulf %sg_{y}, %v_{y} : f32")
