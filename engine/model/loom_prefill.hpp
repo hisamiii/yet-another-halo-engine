@@ -346,11 +346,13 @@ class LoomPrefill {
         const bool q_npu = NpuRows("q") && NpuOk(pre + "attn_q.weight") && !NpuHal(KqgHal(pre + "attn_q.weight", q_af)).empty();
         if (!q_npu || !RunAttentionHalves(l, ci, pre, hook, q_af, k_af, v_af)) {
           FfnUnpackPending(-1);
+          nq_want_ = nqw_ && !q_npu;
           RunNorm(pre + "attn_norm.weight",
                   q_af && k_af && v_af   ? NormOut::kTiled
                   : q_af || k_af || v_af ? NormOut::kBoth
                                          : NormOut::kRow,
                   q_npu ? "q" : nullptr);
+          nq_want_ = false;
           RunAttention(l, ci, pre, hook, q_af, k_af, v_af);
         }
       } else {
@@ -363,8 +365,10 @@ class LoomPrefill {
                              !NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)).empty();
         if (!qkv_npu || !RunDeltaNetHalves(l, pre, qkv_af, gate_af)) {
           FfnUnpackPending(-1);
+          nq_want_ = nqw_ && !qkv_npu;
           RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow,
                   qkv_npu ? "qkv" : nullptr);
+          nq_want_ = false;
           RunDeltaNet(l, pre, qkv_af, gate_af);
         }
       }
@@ -675,6 +679,9 @@ class LoomPrefill {
     dnov_ = a4_ && geom_.count("dnov") != 0;
     pnq_ab_ = dnov_ && geom_.count("pnq_abf.hal") != 0;
     guov_ = a4_ && geom_.count("guov") != 0;
+    nqgu_ = guov_ && geom_.count("nqgu") != 0;
+    rqk_ = nqov_ && geom_.count("rqk") != 0;
+    nqw_ = a4_ && geom_.count("nqw") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
@@ -966,9 +973,11 @@ class LoomPrefill {
     const std::uint32_t nn = trim_row_ == kAllRows && FfnNpuOk(pre) ? NpuRows("ffn") : 0;
     const std::string gs = nn ? NpuHal(KstoreHal(pre + "ffn_gate.weight", gate_af)) : "";
     const std::string us = nn ? NpuHal(SwigluHal(pre + "ffn_up.weight", up_af, down_af)) : "";
+    nq_want_ = nqgu_ && nn == 0;
     RunNorm(pre + "post_attention_norm.weight",
             gate_af && up_af ? NormOut::kTiled : gate_af || up_af ? NormOut::kBoth : NormOut::kRow,
             !gs.empty() && !us.empty() ? "ffn" : nullptr);
+    nq_want_ = false;
     if (!gs.empty() && !us.empty()) {
       // the NPU's rows of gate and up; the unpack applies silu(gate) * up
       std::vector<NpuView> ag, au;
@@ -990,7 +999,9 @@ class LoomPrefill {
       const auto* up = Find(pre + "ffn_up.weight");
       if (guov_) gu_cnt_ = FlagSlots(kFfn / 1024);
       gu_flagged_ = RunIu4("gu", *Find(pre + "ffn_gate.weight"), {ffnup_}, {std::size_t(up->dims[1]) * 2}, 0b10000, up,
-                           guov_ ? &gu_cnt_ : nullptr);
+                           guov_ ? &gu_cnt_ : nullptr, &nq_cnt_);
+      gu_waited_ = gu_flagged_ && nq_cnt_.buffer;
+      nq_cnt_ = {};
     } else {
       RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
       RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
@@ -1298,27 +1309,37 @@ class LoomPrefill {
       // nqov: right after its kres (deferred by RunResidual, untrimmed) as kresf + normqf with no graph edge between
       // them: the rows wait on the kres's per-token-tile counters (FlagSlot), so they start in the GEMM's tail. normqf
       // writes the other activation pair (the kres still reads aq_ / ad_), which becomes aq_ / ad_.
+      // nq_want_ (nqgu: the FFN norm, nqw: the attention norm): the normq also counts its finished rows in nq_cnt_ for
+      // the GEMMs that wait on them
+      const bool want = std::exchange(nq_want_, false);
+      nq_cnt_ = {};
       if (const PendingKres p = pending_kres_; p.t && p.out == hidden_) {
         pending_kres_ = {};
         const hrx_buffer_ref_t cnt = FlagSlot();
         const std::int64_t trim = std::exchange(trim_row_, p.trim);
         const bool flagged = RunIu4("kres", *p.t, {p.in, p.out}, {std::size_t(p.t->dims[1]) * 4, std::size_t(p.t->dims[1]) * 4},
-                                    0b10000, nullptr, &cnt);
+                                    0b10000, nullptr, &cnt, &p.wcnt, p.chain ? 0b11000 : 0);
         trim_row_ = trim;
         if (flagged) {
-          Dispatch(Exe("normqf_5120.hal"), "yah_normq", B_, 1, 1, geom_.at("normq_5120.hal").rowgrp, 1, 1,
-                   {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))), Ref(*rot_signs_), Ref(*aq2_),
-                    Ref(*ad2_), cnt},
-                   0b0110000, nullptr, 0b1000001);
+          std::vector<hrx_buffer_ref_t> b = {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))),
+                                             Ref(*rot_signs_), Ref(*aq2_), Ref(*ad2_), cnt};
+          if (want) b.push_back(nq_cnt_ = FlagSlot());
+          // a chained kres (rqk): aq2_ / ad2_'s readers since the last barrier (the gu) finished each token tile
+          // before the rotq, the kres and so these rows: untracked too
+          const std::uint64_t pair = p.chain && p.wcnt.buffer ? 0b110000 : 0;
+          Dispatch(Exe(want ? "normqfo_5120.hal" : "normqf_5120.hal"), "yah_normq", B_, 1, 1,
+                   geom_.at("normq_5120.hal").rowgrp, 1, 1, b, want ? 0b10110000 : 0b0110000, nullptr,
+                   (want ? 0b11000001 : 0b1000001) | pair);
           std::swap(aq_, aq2_), std::swap(ad_, ad2_);
           return;
         }
       }
       FlushKres();
-      const LoomExecutable& nq = Exe("normq_5120.hal");
-      Dispatch(nq, "yah_normq", B_, 1, 1, geom_.at("normq_5120.hal").rowgrp, 1, 1,
-               {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)},
-               0b110000);
+      std::vector<hrx_buffer_ref_t> b = {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))),
+                                         Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)};
+      if (want) b.push_back(nq_cnt_ = FlagSlot());
+      Dispatch(Exe(want ? "normqo_5120.hal" : "normq_5120.hal"), "yah_normq", B_, 1, 1,
+               geom_.at("normq_5120.hal").rowgrp, 1, 1, b, want ? 0b1110000 : 0b110000, nullptr, want ? 0b1000000 : 0);
       return;
     }
     std::vector<hrx_buffer_ref_t> b =
@@ -1355,29 +1376,44 @@ class LoomPrefill {
   }
   // A4 sets: x (B_ rows of k f16) rotated and quantized into aq_ / ad_ (gen_rot.gen_q, one scale per 128 values);
   // heads: ssm_out's value heads from GGUF into HF order.
-  void RotQ(const LoomBuffer& x, std::uint32_t k, const std::string& awq, bool heads) {
+  // ocnt (rqk): counters for the kres after it (PendingKres::wcnt) when this rotq has a counting variant
+  // (rotqfo_17408, rotqo_6144), else left null. Returns whether it ran flagged after a waiting gu (PendingKres::chain).
+  bool RotQ(const LoomBuffer& x, std::uint32_t k, const std::string& awq, bool heads, hrx_buffer_ref_t* ocnt = nullptr) {
     const std::string hal = heads ? std::string("rotq_heads.hal") : "rotq_" + std::to_string(k) + ".hal";
     const Geom& g = geom_.at(hal);
     if (std::exchange(gu_flagged_, false)) {
       // the flagged gu's output, x untracked: the workgroups wait on its counters, so they run in the GEMM's tail; the
       // other activation pair (the gu still reads aq_ / ad_) becomes aq_ / ad_
+      // gu_waited_: the gu waited on its normq's counters, so no barrier since the kres that read aq2_ / ad2_ (nqov); a
+      // row's token tile of that kres finished before its normq rows, gu tiles and so these workgroups: untracked too
       if (&x != ffnup_ || k != kFfn || heads) throw LoomError("rotqf_17408.hal: not the flagged gu's output");
-      Dispatch(Exe("rotqf_17408.hal"), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1,
-               {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq2_), Ref(*ad2_), gu_cnt_}, 0b11000, nullptr, 0b100001);
+      const bool chain = std::exchange(gu_waited_, false), counts = ocnt != nullptr;
+      std::vector<hrx_buffer_ref_t> b = {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq2_), Ref(*ad2_), gu_cnt_};
+      if (counts) b.push_back(*ocnt = FlagSlot());
+      Dispatch(Exe(counts ? "rotqfo_17408.hal" : "rotqf_17408.hal"), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1, b,
+               counts ? 0b1011000 : 0b11000, nullptr, (chain ? 0b111001 : 0b100001) | (counts ? 0b1000000 : 0));
       std::swap(aq_, aq2_), std::swap(ad_, ad2_);
-      return;
+      return chain && counts;
     }
-    Dispatch(Exe(hal), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1,
-             {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b11000);
+    const std::string ohal = "rotqo_" + std::to_string(k) + ".hal";
+    const bool counts = ocnt && !heads && k == 6144;
+    std::vector<hrx_buffer_ref_t> b = {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)};
+    if (counts) b.push_back(*ocnt = FlagSlot());
+    Dispatch(Exe(counts ? ohal : hal), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1, b, counts ? 0b111000 : 0b11000,
+             nullptr, counts ? 0b100000 : 0);
+    return false;
   }
   // A4 sets: the iu4 GEMM (gen_gemm_iu4) of kind on t over aq_ / ad_; io: the kind's bindings after them (outputs at
   // the bits of writes), row_bytes: their bytes per token.
   // t2: a second weight tensor bound after the activations (gu: up beside gate).
   // cnt (kres, kstore, kstoreh): the flagged GEMM (iu4_<kind>f_*: per-token-tile completion counters in cnt, a FlagSlot,
   // untracked) when the chunk is untrimmed; returns whether it ran flagged.
+  // wcnt: the activations' producer's counters (nq_cnt_, a rotq's): untrimmed, the GEMM also waits on them
+  // (iu4_<kind>[f]w_*), aq_ / ad_ and wcnt untracked, so no graph barrier separates it from the producer; then also the
+  // bindings at the bits of untrack, which the producer's own waits order per token tile.
   bool RunIu4(const char* kind, const core::TensorInfo& t, std::initializer_list<const LoomBuffer*> io,
               std::initializer_list<std::size_t> row_bytes, std::uint64_t writes, const core::TensorInfo* t2 = nullptr,
-              const hrx_buffer_ref_t* cnt = nullptr) {
+              const hrx_buffer_ref_t* cnt = nullptr, const hrx_buffer_ref_t* wcnt = nullptr, std::uint64_t untrack = 0) {
     const std::size_t K = t.dims[0];
     const std::string hal = std::string("iu4_") + kind + "_" + std::to_string(MTiles(t)) + "_" + std::to_string(K / 256) + ".hal";
     const Geom g = GeomOf(hal);
@@ -1395,11 +1431,17 @@ class LoomPrefill {
       gz = gx / it->second.tokens, gx = it->second.tokens;
     }
     const bool flagged = cnt && tt == g.tt;
-    if (flagged) b.push_back(*cnt);
-    const std::string exe = flagged ? std::string("iu4_") + kind + "f" + hal.substr(4 + std::strlen(kind)) : hal;
-    Dispatch(Exe(exe), (std::string("yah_iu4_gemm") + sfx).c_str(), gx, tt, gz, 32, 1, 1, b,
-             flagged ? writes | std::uint64_t{1} << (b.size() - 1) : writes, nullptr,
-             flagged ? std::uint64_t{1} << (b.size() - 1) : 0);
+    const bool waits = wcnt && wcnt->buffer && tt == g.tt;
+    std::uint64_t untracked = 0;
+    if (flagged) {
+      b.push_back(*cnt);
+      writes |= std::uint64_t{1} << (b.size() - 1), untracked |= std::uint64_t{1} << (b.size() - 1);
+    }
+    if (waits) b.push_back(*wcnt), untracked |= std::uint64_t{1} << (b.size() - 1) | 0b110 | untrack;
+    const std::string exe = flagged || waits ? std::string("iu4_") + kind + (flagged ? "f" : "") + (waits ? "w" : "") +
+                                                   hal.substr(4 + std::strlen(kind))
+                                             : hal;
+    Dispatch(Exe(exe), (std::string("yah_iu4_gemm") + sfx).c_str(), gx, tt, gz, 32, 1, 1, b, writes, nullptr, untracked);
     return flagged;
   }
   // Completion counters of a flagged producer and its flag-waiting consumer (gen_gemm_iu4 flag, gen_rot.flag_wait): a
@@ -1421,6 +1463,10 @@ class LoomPrefill {
     const LoomBuffer* in = nullptr;
     const LoomBuffer* out = nullptr;
     std::int64_t trim = kAllRows;
+    // rqk: its rotq's per-token-tile counters (wcnt.buffer null: none); chain: that rotq waited on a gu that waited on
+    // its normq (RotQ), so the kres's residual input and output are ordered per token tile too
+    hrx_buffer_ref_t wcnt{};
+    bool chain = false;
   };
   PendingKres pending_kres_;
   void FlushKres() {
@@ -1911,7 +1957,7 @@ class LoomPrefill {
       const bool hp = geom_.count("dnperm") && wname.ends_with("attn_gate.weight");
       if (hp && !geom_.count("iu4_kstoreh_" + std::to_string(MTiles(*t)) + "_" + std::to_string(t->dims[0] / 256) + ".hal"))
         throw LoomError("dnperm sets need the kstoreh gate GEMM");
-      return RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000, nullptr, cnt);
+      return RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000, nullptr, cnt, &iu4_wait_);
     }
     Fmt f{};
     const std::string base = GemmHal("gemm_kstore", *t, &f);
@@ -1936,7 +1982,8 @@ class LoomPrefill {
   bool RunKqg(const std::string& wname, bool af = false) {
     const auto* t = Find(wname);
     if (a4_) {
-      RunIu4("kqg", *t, {q_, gate_}, {std::size_t(t->dims[1]) * 2, std::size_t(t->dims[1]) * 2}, 0b11000);
+      RunIu4("kqg", *t, {q_, gate_}, {std::size_t(t->dims[1]) * 2, std::size_t(t->dims[1]) * 2}, 0b11000, nullptr, nullptr,
+             &iu4_wait_);
       return true;
     }
     Fmt f{};
@@ -1986,9 +2033,10 @@ class LoomPrefill {
     const bool heads = rot_ && wname.find("ssm_out") != std::string::npos;
     const std::string awq = wname.substr(0, wname.size() - 6) + "awq";
     if (a4_) {
-      if (!quantized) RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads);
+      hrx_buffer_ref_t rc{};
+      const bool chain = !quantized && RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads, rqk_ ? &rc : nullptr);
       // nqov: the next A4 normq takes it as the flagged pair (RunNorm); any other dispatch flushes it first
-      pending_kres_ = {t, hidden_, hidden2_, trim_row_};
+      pending_kres_ = {t, hidden_, hidden2_, trim_row_, rc, chain};
       if (!nqov_) FlushKres();
       std::swap(hidden_, hidden2_);
       return;
@@ -2109,11 +2157,14 @@ class LoomPrefill {
       NpuJoin();
       NpuUnpack("npu_unpack_q.hal", c, {Ref(*q_), Ref(*gate_)}, 6);
     } else {
+      // nqw: all three wait on the norm's counters (iu4_wait_)
+      iu4_wait_ = std::exchange(nq_cnt_, {});
       qg_fused = RunKqg(pre + "attn_q.weight", q_af);
       if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
       if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
       RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
       RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
+      iu4_wait_ = {};
     }
     if (!qg_fused)
       Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
@@ -2353,6 +2404,8 @@ class LoomPrefill {
       }
       NpuUnpack("npu_unpack_gate.hal", cg, {Ref(*gate_)}, 2);
     } else {
+      // nqw: alpha, beta and qkv wait on the norm's counters (iu4_wait_)
+      iu4_wait_ = std::exchange(nq_cnt_, {});
       RunKstore(pre + "ssm_alpha.weight", *alpha_);
       RunKstore(pre + "ssm_beta.weight", *beta_);
       // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
@@ -2360,6 +2413,7 @@ class LoomPrefill {
       if (dnov_ && gate_late) qkv_cnt = FlagSlot();
       qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
       if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
+      iu4_wait_ = {};
     }
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
@@ -2976,6 +3030,18 @@ class LoomPrefill {
   // dispatch.txt guov: the flagged gu GEMM and its rotq (rotqf_17408); gu_flagged_: the last gu ran flagged on gu_cnt_
   bool guov_ = false, gu_flagged_ = false;
   hrx_buffer_ref_t gu_cnt_{};
+  // dispatch.txt nqgu: the FFN norm's normq counts its finished rows (normq[f]o_5120) in nq_cnt_ when nq_want_, and
+  // the flagged gu waits on them (iu4_gufw_*); nq_cnt_.buffer is null unless the last normq counted (nqw: the attention
+  // norm's, for iu4_wait_)
+  // gu_waited_: the last flagged gu also waited (RotQ)
+  bool nqgu_ = false, nq_want_ = false, gu_waited_ = false;
+  // dispatch.txt rqk: the deferred kres waits on its rotq's counters (rotqfo_17408 / rotqo_<k>, iu4_kresfw_*)
+  bool rqk_ = false;
+  // dispatch.txt nqw: the attention / DeltaNet input GEMMs wait on their norm's counters (iu4_wait_ = nq_cnt_ around
+  // them; iu4_kstorew_*, iu4_kstorefw_*, iu4_kqgw_*)
+  bool nqw_ = false;
+  hrx_buffer_ref_t iu4_wait_{};
+  hrx_buffer_ref_t nq_cnt_{};
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
   std::size_t flag_slot_ = 0;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,

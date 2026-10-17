@@ -393,6 +393,21 @@ DNOV_ON = False   # set by main
 # dispatch.txt "guov"
 GUOV = True
 GUOV_ON = False   # set by main
+# NQGU (A4, with NQOV and GUOV): normq also as normqo_5120 / normqfo_5120 (gen_rot.gen_nq oflag: per-token-tile counters)
+# and the flagged gu as iu4_gufw_* (gen_gemm_iu4 wait), so the driver records the gu GEMM after its norm with no graph
+# barrier and its first workgroups start in the norm's tail. Same values. dispatch.txt "nqgu"
+NQGU = True
+NQGU_ON = False   # set by main
+# RQK (A4, with NQOV): the residual rotqs also as rotqfo_17408 / rotqo_6144 (gen_rot.gen_q oflag) and the flagged kres as
+# iu4_kresfw_* (gen_gemm_iu4 wait), so the driver records the kres after its rotq with no graph barrier. Same values.
+# dispatch.txt "rqk"
+RQK = True
+RQK_ON = False   # set by main
+# NQW (A4): the attention and DeltaNet input GEMMs (kqg, kstore K / V / alpha / beta, the flagged qkv kstore) also as
+# iu4_<kind>[f]w_* (gen_gemm_iu4 wait) on the attention norm's counters (normq[f]o_5120), so the driver records them after
+# the norm with no graph barrier. Same values. dispatch.txt "nqw"
+NQW = True
+NQW_ON = False   # set by main
 # QNSTREAM + QNMIX: the QNORM prologue one fragment at a time (its 255-VGPR peak had pushed both role-split twins past 240,
 # so KT2 fell back and the deep twin ran 2 workgroups per WGP; 96K deep attention -13%); MAXNN + SUM0 (KT2 -1.35%)
 QN_FLAGS = dict(QNSTREAM=True, QNMIX=True, MAXNN=True, SUM0=True)
@@ -1415,10 +1430,10 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     return (out, tile, rowgrp, tt)
 
 
-def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False):
+def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False, wait=0):
     """Emit the A4 GEMM (tools/gen_gemm_iu4.py) of an MQ4 tensor; return its dispatch.txt row. hperm: a kstore whose
     output heads go to HF order (gen_gemm_iu4.gen), as "kstoreh". flag: the completion-counter variant, "<kind>f"
-    (NQOV, DNOV)."""
+    (NQOV, DNOV); wait: the flag-waiting variant (gen_gemm_iu4 wait), "w" after that (NQGU)."""
     bm, bn, _, _ = gen_gemm_iu4.tile(mt * 16)
     if kind == "gu":
         bm //= 2   # a gu workgroup stages bm rows of gate and up for bm / 2 features
@@ -1426,12 +1441,12 @@ def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False):
         raise SystemExit("iu4 GEMM %s: %d rows / %d tokens do not tile" % (kind, mt * 16, B))
     tt = B // bn
     sym = gen_gemm_iu4.sym(kind)
-    out = "iu4_%s_%d_%d.hal" % (kind + ("h" if hperm else "") + ("f" if flag else ""), mt, kb)
+    out = "iu4_%s_%d_%d.hal" % (kind + ("h" if hperm else "") + ("f" if flag else "") + ("w" if wait else ""), mt, kb)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, out[:-4] + ".loom")
     out16 = (kind == "kstore" and (mt in O16_MT or (mt == 64 and KV16_ON))) or (kind == "kqg" and QG16_ON)
-    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, out16, hperm, flag))
+    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, out16, hperm, flag, wait))
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, "mq4", kind, str(mt), str(kb),
                            str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP], capture_output=True, text=True)
     if gate.returncode != 0:
@@ -1469,7 +1484,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1496,6 +1511,9 @@ def main():
     KV16_ON = KV16 and a4
     NQOV_ON = NQOV and a4
     GUOV_ON = GUOV and a4 and not EMIT_HALF
+    NQGU_ON = NQGU and GUOV_ON
+    RQK_ON = RQK and NQOV_ON and GUOV_ON
+    NQW_ON = NQW and a4 and not EMIT_HALF
     DNOV_ON = (DNOV and a4 and DNSPLIT == (40, 8) and DNVCONV and conv_tb_ok(B) and "qkv" not in NPU_SPLIT
                and not EMIT_HALF)   # the dnvconv conv (dn_vconv below)
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
@@ -1527,11 +1545,22 @@ def main():
                         # the flagged variants: the plain GEMM's geometry (dispatch.txt row) serves both
                         if k == "kres" and NQOV_ON and mt * 16 == 5120:
                             iu4_gemm(k, mt, kb, B, outdir, flag=True)
+                        if k == "kres" and RQK_ON and mt * 16 == 5120 and kb * 256 in (6144, 17408):
+                            iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.q_flag_count(kb * 256))
                         if k == "gu" and GUOV_ON:
                             iu4_gemm(k, mt, kb, B, outdir, flag=True)
+                        if k == "gu" and GUOV_ON and NQGU_ON:
+                            iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.nq_flag_count(5120))
                         if k == "kstore" and DNOV_ON and (hp is not None or any(
                                 t.endswith("attn_qkv.weight") for t in combos[(kind, fmt, port, mt, kb)])):
                             iu4_gemm(k, mt, kb, B, outdir, hp, flag=True)
+                        # the attention norm's readers (kb 20: K = 5120)
+                        tn = combos[(kind, fmt, port, mt, kb)]
+                        if NQW_ON and hp is None and kb == 20 and (k == "kqg" or k == "kstore" and any(
+                                t.endswith(x) for t in tn for x in ("attn_k.weight", "attn_v.weight", "ssm_alpha.weight",
+                                                                    "ssm_beta.weight", "attn_qkv.weight"))):
+                            qkv = any(t.endswith("attn_qkv.weight") for t in tn)
+                            iu4_gemm(k, mt, kb, B, outdir, flag=qkv and DNOV_ON, wait=gen_rot.nq_flag_count(5120))
             n += 1
             continue
         for k in kinds:
@@ -1904,6 +1933,15 @@ def main():
             open(rot_src["rotqf_17408.hal"], "w").write(
                 gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None, flag=gen_gemm_iu4.gu_flag_count(17408)))
             geom.append(("guov", 0, 0, 0))
+        if RQK_ON:   # the rotq_17408 / rotq_6144 geometry
+            for name, src in (("rotqfo_17408.hal", gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None,
+                                                                  flag=gen_gemm_iu4.gu_flag_count(17408), oflag=True)),
+                              ("rotqo_6144.hal", gen_rot.gen_q(6144, B, gen_gemm_iu4.KP, True, None, oflag=True))):
+                rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
+                open(rot_src[name], "w").write(src)
+            geom.append(("rqk", 0, 0, 0))
+        if NQW_ON:
+            geom.append(("nqw", 0, 0, 0))
         if a4:
             # the norm-fed sites: RMS norm + rotq in one kernel (gen_rot.gen_nq; same bits, no f16 norm round trip)
             rot_src["normq_5120.hal"] = os.path.join(tmp, "normq_5120.loom")
@@ -1915,6 +1953,12 @@ def main():
                 open(rot_src["normqf_5120.hal"], "w").write(
                     gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=gen_gemm_iu4.flag_count(5120)))
                 geom.append(("nqov", 0, 0, 0))
+            if NQGU_ON or NQW_ON:
+                for f in (0, gen_gemm_iu4.flag_count(5120)) if NQOV_ON else (0,):
+                    name = "normq%so_5120.hal" % ("f" if f else "")
+                    rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
+                    open(rot_src[name], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=f, oflag=True))
+                geom.append(("nqgu", 0, 0, 0))
             if DNSPLIT == (40, 8):
                 # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq) per DeltaNet part (dn_perm): a beside part b, b after it
                 for part in "ab":

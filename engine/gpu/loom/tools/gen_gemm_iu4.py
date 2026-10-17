@@ -73,7 +73,7 @@ def sym(kind):
     return "yah_iu4_gemm" + {"kres": "_kres", "kqg": "_kqg", "gu": "_gu"}.get(kind, "")
 
 
-def gen(kind, M, out16=False, hperm=None, flag=False):
+def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
     """out16: kstore stores f16 (gen_gemm_tile.OUT16). flag (kres, kstore): binding cnt after the outputs, i32 per token
     tile (zero before the GEMM); each lane adds 1 to cnt[token tile] once its wave's stores are visible (device scope;
     flag_count per token tile), so a flag-waiting consumer (gen_rot.flag_wait) can read finished token tiles while the
@@ -83,7 +83,10 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
     pairs them through LDS, so the gate never goes to memory.
     hperm (value heads, key heads): the output of weight rows 128 i.. (GGUF DeltaNet value head i) goes to HF head
     position r (i % key heads) + i / key heads (r = value / key heads), as hfq.cpp HeadOrder undoes it: a 128-row tile
-    is one head, so only the tile's store origin moves."""
+    is one head, so only the tile's store origin moves.
+    wait (the producer's count per token tile, e.g. gen_rot.nq_flag_count): binding wcnt last, i32 per token tile (zero
+    before the producer); the workgroup waits until wcnt[token tile] reaches wait (gen_rot.flag_wait), so the producer
+    of aq / ad runs without a graph barrier before this GEMM."""
     BM, BN, WM, WN = tile(M)
     GU = kind == "gu"
     BO = BM // 2 if GU else BM         # output rows of a workgroup
@@ -99,6 +102,9 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
     assert not (flag and GU) or M % GU_CHUNK == 0
     if flag:
         bufs.append("cnt")
+    if wait:
+        assert BN == 128
+        bufs.append("wcnt")
     WB, AB = BM * WP, BN * WP          # dwords of one staged weight / activation tile
     SB = 2 * (WB + AB + BM + BN)       # dwords: two each of the weight, activation, weight scale, activation scale tiles
     epi = NWAVE * (TM + TG.EPAD) * 16  # f32 of the epilogue slabs (alias the tiles)
@@ -183,6 +189,11 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
     e("  %tid = kernel.workitem.id<x> : index")
     e("  %wave = index.div %tid, %c32 : index")
     e("  %lane = index.rem %tid, %c32 : index")
+    if wait:
+        import gen_rot
+        WV = "view<[%token_tiles]xi32>"
+        e(f"  %wf_cv = buffer.view %wcnt_na[%base] : buffer -> {WV}")
+        gen_rot.flag_wait(e, "%wf_cv", WV, ["%wg_y"], wait, "%tid", "wf")
     e("  %l16 = index.rem %lane, %c16 : index")
     e("  %lh = index.div %lane, %c16 : index")
     e(f"  %cwn = index.constant {WN} : index")
