@@ -1269,7 +1269,12 @@ def gen():
             nw = 2 if K4 else 4
             shifts = (6, 2, -2, -6) if K4 else (2, -6)
             e(f"{ind}%{p}qk = index.add {ks}, %kdk : index")
-            e(f"{ind}%{p}ql = index.cmp ult, %{p}qk, %ctx_end : index")
+            if FPSPARSE:   # the pooled rows (>= tpad, past ctx_end) are the correction tiles' keys: keep them
+                e(f"{ind}%{p}ql0 = index.cmp ult, %{p}qk, %ctx_end : index")
+                e(f"{ind}%{p}qlp = index.cmp uge, %{p}qk, %fptpad : index")
+                e(f"{ind}%{p}ql = scalar.ori %{p}ql0, %{p}qlp : i1")
+            else:
+                e(f"{ind}%{p}ql = index.cmp ult, %{p}qk, %ctx_end : index")
             e(f"{ind}%{p}s1 = vector.from_elements {cur[1]} : vector<1xi32>")
             e(f"{ind}%{p}sh = vector.bitcast %{p}s1 : vector<1xi32> to vector<2xf16>")
             e(f"{ind}%{p}sS = vector.extract %{p}sh[0] : vector<2xf16> -> f16")
