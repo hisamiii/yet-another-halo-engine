@@ -184,6 +184,7 @@ FPSPARSE = False
 FPS_LS = 0
 FPS_TPAD = 0
 FPS_ORD = False     # FPSPARSE: the launch order from yah_fpord (after the lists in sel): longest list first
+FPS_NG = 0          # FPSPARSE: lists in sel (chunk / 16 query blocks x 4 KV heads; MAX_TOKENS is clamped to >= 2048)
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
 DOWHILE_MAIN = False   # the same for the head_dim-split loop (measured neutral)
 # SOFT1..4 (measured, not adopted, docs/results.md): keep the head_dim split and run the softmax in wave A only, P^T and
@@ -730,7 +731,7 @@ def gen():
         e("  %hp0 = index.mul %kvh_m, %pkv : index")
         e("  %hp = index.add %hp0, %pig_m : index")
     elif FPSPARSE and FPS_ORD:   # list g = ord[wgl] (yah_fpord): query block g / 4, KV head g % 4
-        ng = MAX_TOKENS // 16 * 4
+        ng = FPS_NG
         e(f"  %fpoo = index.constant {FPS_LS * ng} : index")
         e(f"  %fpot = index.constant {FPS_LS * ng + ng} : index")
         e(f"  %fpon1 = index.constant {ng - 1} : index")
@@ -848,9 +849,9 @@ def gen():
         e("  %pig2 = index.mul %pig, %c2 : index")
         e("  %head0 = index.add %kvh6, %pig2 : index")
     if FPSPARSE:   # this workgroup's tile list: count at [lb], (ks, word) pairs from lb + 2
-        assert KT2 and PAGED and HPW == 6 and KT2_P2 and FPS_LS
-        e(f"  %fpstot = index.constant {FPS_LS * (MAX_TOKENS // 16) * 4} : index")
-        e(f"  %fpslim = index.constant {FPS_LS * (MAX_TOKENS // 16) * 4 - 1} : index")
+        assert KT2 and PAGED and HPW == 6 and KT2_P2 and FPS_LS and FPS_NG
+        e(f"  %fpstot = index.constant {FPS_LS * FPS_NG} : index")
+        e(f"  %fpslim = index.constant {FPS_LS * FPS_NG - 1} : index")
         e(f"  %fpls = index.constant {FPS_LS} : index")
         e(f"  %fptpad = index.constant {FPS_TPAD} : index")
         e("  %fpsl_na = buffer.assume.noalias %sel : buffer")

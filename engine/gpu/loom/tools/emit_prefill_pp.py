@@ -1630,7 +1630,7 @@ def main():
     def write_attn(path):
         A = gen_attn_fa
         keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
-                                   + tuple(KT2_SHAPE_FLAGS) + ("FPSPARSE", "FPS_LS", "FPS_TPAD", "FPS_ORD", "K4", "KDEC", "VQ4", "QROT")))
+                                   + tuple(KT2_SHAPE_FLAGS) + ("FPSPARSE", "FPS_LS", "FPS_TPAD", "FPS_ORD", "FPS_NG", "K4", "KDEC", "VQ4", "QROT")))
         saved = {k: getattr(A, k) for k in keys}
         twins = [(path, MAIN_FLAGS, None), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI), None)]
         if not A.KDEC:   # the KT2 twin (fp16 sources only)
@@ -1638,7 +1638,7 @@ def main():
                                           **(KT2_SHAPE_FLAGS if kt2_cfg == KT2_SHAPE else {})), kt2_shape))
             if fps_on and path in fps_paths:   # the block-sparse KT2 twin (the kvdeq sources), on the kv4 pools directly
                 twins.append((fps(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI, **KT2_SHAPE_FLAGS, FPSPARSE=True,
-                                              FPS_LS=fps_ls, FPS_TPAD=T, FPS_ORD=FPS_ORD, K4=True, KDEC=True, VQ4=True, QROT=True),
+                                              FPS_LS=fps_ls, FPS_TPAD=T, FPS_ORD=FPS_ORD, FPS_NG=B // 16 * 4, K4=True, KDEC=True, VQ4=True, QROT=True),
                               kt2_shape))
         for name, flags, shape in twins:
             for k, v in flags.items():
