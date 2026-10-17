@@ -23,7 +23,7 @@ sys.path.insert(0, HERE)
 import gen_gemm_tile as TG  # noqa: E402
 
 KP = 128        # K per phase: one weight scale group
-WP = 20         # LDS dwords per staged row: 16 of nibbles + 4 of pad (16-byte rows: aligned b128 staging stores)
+WP = 20         # LDS dwords per staged row: 16 of nibbles + 4 of pad (16-byte aligned rows)
 V8 = "vector<8xf32>"
 VI = "vector<8xi32>"
 V2 = "vector<2xi32>"
@@ -33,6 +33,12 @@ GU_BARE_RCP = True
 # gu: a fence between the A and B fragment loads of a k step: allocation then places the bank-pinned A fragments first
 # (all WMMAs 16 cyc, 237 -> 213 VGPR), gu -0.5%; kres loses with it (out +3.6%)
 GU_FRAG_FENCE = True
+# staged rows r and r + 8 share LDS banks at pitch WP (20 r mod 32 repeats every 8 rows), so a half-wave's fragment
+# ds_load_b64 of 16 rows takes 2 rounds: rows with bit 3 ^ bit 0 set store each 16-byte chunk's two 8-byte k steps
+# swapped (two b64 staging stores) and read k step st at slot st ^ 1 (a second lane base for odd k steps). Bit 0 in the
+# swizzle spreads a staging wave's 8 rows over both halves of every bank group (bit 3 alone: stores 3-way conflicted).
+# All iu4 GEMMs bit-identical, pp2048 GEMM cycles -1.1% (gu -1.1%, kres_down -1.2%).
+LDS_SWZ = True
 GROUP = 8   # grouped workgroup order: row tiles per launch band (group_of)
 
 
@@ -244,6 +250,17 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
             e(f"  {p}lr = index.mul {p}row, %c{WP} : index")
             e(f"  {p}lo0 = index.add {p}lr, {p}q4 : index")            # LDS dword within the tile
             e(f"  {p}lo = index.mul {p}lo0, %c4 : index")
+            if LDS_SWZ:
+                e(f"  {p}s80 = index.div {p}row, %c8 : index")
+                e(f"  {p}s8 = index.add {p}s80, {p}row : index")
+                e(f"  {p}s = index.rem {p}s8, %c2 : index")             # row bit 3 ^ bit 0
+                e(f"  {p}sw0 = index.mul {p}s, %c8 : index")
+                e(f"  {p}s9 = index.add {p}s8, %c1 : index")      # no index.sub in LDS bases (it stops offset folding)
+                e(f"  {p}t = index.rem {p}s9, %c2 : index")
+                e(f"  {p}sw1 = index.mul {p}t, %c8 : index")
+                for ab, sw in (("A", "sw0"), ("B", "sw1")):         # A: k step 2q of the chunk, B: 2q + 1
+                    e(f"  {p}lo{ab}r = index.add {p}lo, {p}{sw} : index")
+                    e(f"  {p}lo{ab} = index.assume {p}lo{ab}r [range({p}lo{ab}r, 0, {LDSW * 4}), mul({p}lo{ab}r, 8)] : index")
             if nm == "w":
                 if GU and r:
                     e(f"  {p}gr0 = index.add %wg_row, {p}row : index")
@@ -365,6 +382,14 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
                 e(f"  %{pfx}st{x}v = vector.from_elements {f} : vector<1xf32>")
                 e(f"  %{pfx}st{x}b = vector.bitcast %{pfx}st{x}v : vector<1xf32> to vector<4xi8>")
                 e(f"  vector.store %{pfx}st{x}b, %lb[%{pfx}st{x}] : vector<4xi8>, view<{LDSW * 4}xi8>")
+            elif LDS_SWZ:
+                e(f"  scf.if {live} {{")
+                for hh, ab in enumerate("AB"):
+                    e(f"    %{pfx}st{x}{ab} = index.add {lo}{ab}, {off} : index")
+                    e(f"    %{pfx}st{x}{ab}w = vector.slice {v}[{2 * hh}] : vector<4xi32> -> vector<2xi32>")
+                    e(f"    %{pfx}st{x}{ab}b = vector.bitcast %{pfx}st{x}{ab}w : vector<2xi32> to vector<8xi8>")
+                    e(f"    vector.store %{pfx}st{x}{ab}b, %lb[%{pfx}st{x}{ab}] : vector<8xi8>, view<{LDSW * 4}xi8>")
+                e("  }")
             else:
                 e(f"  scf.if {live} {{")
                 e(f"    vector.store {v}8, %lb[%{pfx}st{x}] : vector<16xi8>, view<{LDSW * 4}xi8>")
@@ -393,6 +418,17 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
     e(f"  %ft2 = index.mul %ft1, %c{WP} : index")
     e("  %ft0r = index.mul %ft2, %c4 : index")
     assume("ft0", 16)
+    if LDS_SWZ:
+        e("  %fsw_80 = index.div %l16, %c8 : index")
+        e("  %fsw_8 = index.add %fsw_80, %l16 : index")
+        e("  %fsw_r = index.rem %fsw_8, %c2 : index")
+        e("  %fsw_s = index.mul %fsw_r, %c8 : index")         # 8 for rows with bit 3 ^ bit 0 set
+        e("  %fsw_9 = index.add %fsw_8, %c1 : index")
+        e("  %fsw_u = index.rem %fsw_9, %c2 : index")
+        e("  %fsw_t = index.mul %fsw_u, %c8 : index")
+        for n, sw in (("fr0e", "%fsw_s"), ("fr0o", "%fsw_t"), ("ft0e", "%fsw_s"), ("ft0o", "%fsw_t")):
+            e(f"  %{n}r = index.add %{n[:3]}r, {sw} : index")
+            assume(n, 8)
     e("  %fd0r = index.mul %ft1, %c4 : index")
     assume("fd0", 4)
     e("  %schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>")
@@ -406,6 +442,13 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
     e(f"  %zfv = vector.splat %zf : {V8}")
     NA = FM * FN
 
+    def kst(st):
+        """Dword offset of k step st in a staged row (the odd-step lane base carries the swizzled 8 bytes)."""
+        return 4 * (st // 2) if LDS_SWZ else 2 * st
+
+    def sfx(st):
+        return ("o" if st % 2 else "e") if LDS_SWZ else ""
+
     def phase(q, acc, ba, mid=None):
         """The WMMAs of the phase in the LDS buffer whose lane addresses (fragment 0, k step 0) are ba[la / lb / dt /
         ws], then mid(), then the fold into acc; returns the new accumulator names."""
@@ -418,16 +461,16 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
             e(f"    %{q}dtv{j} = vector.splat %{q}dt{j} : {V8}")
         def frag_loads(st):
             for i in range(FM):
-                e(f"    %{q}la{st}_{i}c = index.constant {(16 * i * WP + 2 * st) * 4} : index")
-                e(f"    %{q}la{st}_{i} = index.add {ba['la']}, %{q}la{st}_{i}c : index")
+                e(f"    %{q}la{st}_{i}c = index.constant {(16 * i * WP + kst(st)) * 4} : index")
+                e(f"    %{q}la{st}_{i} = index.add {ba['la' + sfx(st)]}, %{q}la{st}_{i}c : index")
                 e(f"    %{q}wd{st}_{i}b = vector.load %lb[%{q}la{st}_{i}] : view<{LDSW * 4}xi8> -> vector<8xi8>")
                 e(f"    %{q}wd{st}_{i} = vector.bitcast %{q}wd{st}_{i}b : vector<8xi8> to {V2}")
                 e(f"    %{q}lhs{st}_{i} = vector.fragment<lhs> %{q}wd{st}_{i} shape [%m, %k] using {{schema = %schema : encoding<schema>}} : {V2}")
             if GU and GU_FRAG_FENCE:
                 e("    scf.schedule.fence")
             for j in range(FN):
-                e(f"    %{q}lb{st}_{j}c = index.constant {(16 * j * WP + 2 * st) * 4} : index")
-                e(f"    %{q}lb{st}_{j} = index.add {ba['lb']}, %{q}lb{st}_{j}c : index")
+                e(f"    %{q}lb{st}_{j}c = index.constant {(16 * j * WP + kst(st)) * 4} : index")
+                e(f"    %{q}lb{st}_{j} = index.add {ba['lb' + sfx(st)]}, %{q}lb{st}_{j}c : index")
                 e(f"    %{q}ad{st}_{j}b = vector.load %lb[%{q}lb{st}_{j}] : view<{LDSW * 4}xi8> -> vector<8xi8>")
                 e(f"    %{q}ad{st}_{j} = vector.bitcast %{q}ad{st}_{j}b : vector<8xi8> to {V2}")
                 e(f"    %{q}rhs{st}_{j} = vector.fragment<rhs> %{q}ad{st}_{j} shape [%k, %n] using {{schema = %schema : encoding<schema>}} : {V2}")
@@ -488,7 +531,11 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
         offsets(h + "u_", buf)
         # one base per LDS read stream; fragment, tile and k-step offsets are immediates
         b = {}
-        for n, inv, off in (("la", "%fr0", "wbo"), ("lb", "%ft0", "abo"), ("dt", "%fd0", "dbo"), ("ws", "%fs0", "sbo")):
+        streams = (("la", "%fr0", "wbo"), ("lb", "%ft0", "abo"), ("dt", "%fd0", "dbo"), ("ws", "%fs0", "sbo"))
+        if LDS_SWZ:
+            streams = (("lae", "%fr0e", "wbo"), ("lao", "%fr0o", "wbo"), ("lbe", "%ft0e", "abo"), ("lbo", "%ft0o", "abo"),
+                       ("dt", "%fd0", "dbo"), ("ws", "%fs0", "sbo"))
+        for n, inv, off in streams:
             e(f"    %{h}bi_{n} = index.add {inv}, %{h}u_{off} : index")
             b[n] = f"%{h}bi_{n}"
         acc = phase(h + "u_", acc, b, lambda: stores(h + "n_", regs, nbuf))
