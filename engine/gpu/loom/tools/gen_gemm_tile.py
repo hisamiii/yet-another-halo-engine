@@ -1353,8 +1353,12 @@ def rcp_consts(e, ind="  "):
         e(f"{ind}%rcp_zero = scalar.constant 0.0 : f32")
 
 
-def recip1(e, out, dn, ind="  "):
-    """out = 1 / dn for dn >= 1 (a sigmoid's denominator); needs %one, %negone and rcp_consts."""
+def recip1(e, out, dn, ind="  ", bare=False):
+    """out = 1 / dn for dn >= 1 (a sigmoid's denominator); needs %one, %negone and rcp_consts. bare: v_rcp_f32 alone
+    (1 ulp; rcp(inf) = 0)."""
+    if bare:
+        e(f"{ind}{out} = scalar.divf<nnan|ninf|nsz|arcp> %one, {dn} : f32")
+        return
     if not FAST_RCP:
         e(f"{ind}{out} = scalar.divf %one, {dn} : f32")
         return

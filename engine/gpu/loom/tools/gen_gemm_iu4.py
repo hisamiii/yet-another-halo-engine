@@ -27,6 +27,9 @@ WP = 20         # LDS dwords per staged row: 16 of nibbles + 4 of pad (16-byte r
 V8 = "vector<8xf32>"
 VI = "vector<8xi32>"
 V2 = "vector<2xi32>"
+# gu silu's 1 / (1 + exp(-g)) as a bare v_rcp_f32 (1 ulp, no Newton step / inf select): an A4 redraw (kld_ref in the
+# redraw spread), gu -0.2%
+GU_BARE_RCP = True
 GROUP = 8   # grouped workgroup order: row tiles per launch band (group_of)
 
 
@@ -526,7 +529,8 @@ def gen(kind, M, out16=False, hperm=None, flag=False):
 def gu_epilogue(e, TM, FM, FN, WN, V8):
     """gu: per 16-token column every wave puts its fragments in its LDS slab; then gate wave w (wave rows 0, 1) and up
     wave w + 2 WN each take half of their 32 rows: lane l, token l / 2, rows 16 (l % 2) + 8 p (p: 0 gate wave, 1 up
-    wave), 8 x f16(silu(gate) * up) per 16-byte store. The silu is lds_epilogue's swiglu (bit-identical)."""
+    wave), 8 x f16(silu(gate) * up) per 16-byte store. The silu is lds_epilogue's swiglu, with a bare rcp when
+    GU_BARE_RCP."""
     W = (TM + TG.EPAD) * 16            # f32 of a slab
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e(f"  %es_ctm = index.constant {TM + TG.EPAD} : index")
@@ -540,7 +544,8 @@ def gu_epilogue(e, TM, FM, FN, WN, V8):
     e("  %negone = scalar.constant -1.0 : f32")
     # exp(-g) as exp2(g * -log2e): what expf<afn> lowers to after the negation, in one multiply (bit-identical)
     e("  %nl2e = scalar.constant -1.4426950408889634 : f32")
-    TG.rcp_consts(e)
+    if not GU_BARE_RCP:
+        TG.rcp_consts(e)
     e("  %one = scalar.constant 1.0 : f32")
     e("  %gu_p = index.div %wr, %c2 : index")               # 0: a gate wave, 1: an up wave
     e("  %gu_wr = index.rem %wr, %c2 : index")
@@ -587,7 +592,7 @@ def gu_epilogue(e, TM, FM, FN, WN, V8):
                 e(f"  %ng_{y} = scalar.mulf %g_{y}, %nl2e : f32")
                 e(f"  %ex_{y} = scalar.exp2f<afn> %ng_{y} : f32")
                 e(f"  %dn_{y} = scalar.addf %one, %ex_{y} : f32")
-                TG.recip1(e, f"%iv_{y}", f"%dn_{y}")
+                TG.recip1(e, f"%iv_{y}", f"%dn_{y}", bare=GU_BARE_RCP)
                 e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
                 e(f"  %ac_{y} = scalar.mulf %sg_{y}, %v_{y} : f32")
                 e(f"  %h_{y} = scalar.fptrunc %ac_{y} : f32 to f16")
