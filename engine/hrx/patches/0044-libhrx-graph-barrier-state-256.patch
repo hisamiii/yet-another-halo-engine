@@ -1,0 +1,41 @@
+libhrx: graph barrier planner tracks 256 commands since the last barrier.
+
+The hazard set held 8 commands; past that it went invalid and every later dependency, however old, emitted a
+barrier. Graphs whose kernels order each other through completion counters record long barrier-free runs (a
+prefill layer's GEMM -> norm -> GEMM chain), so the first dependent command after the 8th paid a full barrier for
+an edge the run had already retired. 256 entries cover them; the overflow test follows the capacity.
+
+--- a/libhrx/src/libhrx/hrx_internal.h
++++ b/libhrx/src/libhrx/hrx_internal.h
+@@ -439,9 +439,11 @@
+ 
+ // Tracks commands recorded since the most recent graph command-buffer
+ // barrier. Exposed internally so the barrier planner can be tested without
+-// depending on backend command scheduling behavior.
++// depending on backend command scheduling behavior. Past capacity every
++// dependency counts as a hazard, so the set must hold the longest run of
++// barrier-free commands a graph records (flag-ordered kernel chains).
+ typedef struct hrx_graph_barrier_state_t {
+-  uint32_t values[8];
++  uint32_t values[256];
+   uint32_t count : 31;
+   uint32_t invalid : 1;
+ } hrx_graph_barrier_state_t;
+--- a/libhrx/src/libhrx/graph_exec_test.cc
++++ b/libhrx/src/libhrx/graph_exec_test.cc
+@@ -191,12 +191,13 @@
+ 
+ TEST_F(GraphBarrierTest, OverflowForcesConservativeDependencyBarrier) {
+   std::vector<std::unique_ptr<TestNode>> nodes;
+-  for (uint32_t i = 0; i < 9; ++i) {
++  const uint32_t capacity = IREE_ARRAYSIZE(state_.values);
++  for (uint32_t i = 0; i <= capacity; ++i) {
+     nodes.push_back(
+         std::make_unique<TestNode>(i, std::vector<hrx_graph_node_s*>{}));
+     EXPECT_FALSE(Record(*nodes.back()));
+   }
+-  TestNode consumer(9, {nodes[0]->get()});
++  TestNode consumer(capacity + 1, {nodes[0]->get()});
+   EXPECT_TRUE(Record(consumer));
+   EXPECT_EQ(command_buffer_.barrier_count, 1u);
+ }
