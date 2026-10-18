@@ -1684,7 +1684,8 @@ def main():
     # pp2048 attention -6.4% cycles; the deep / KT2 twins keep their tuned code
     # QB_ZIGZAG: the short causal blocks are mostly Q / gate / O traffic; launched last (longest first) they ran as a
     # DRAM-bound tail. Interleaved with the long ones: pp2048 attention -5.5% cycles, bit-identical, neutral at depth
-    MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=True)
+    # PV_FENCE: -16 v_mov per tile, pp2048 attention -2.3% cycles (-3% in the pipeline), bit-identical
+    MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=True, PV_FENCE=True)
     # the role-split twins too: EPI_FAST + CTX16 halve their epilogue VALU (B waves normalize all 256 dims alone);
     # bit-identical, KT2 -1.6% at 16K, -0.5% at 32K, -0.8% at 96K
     TWIN_EPI = dict(EPI_FAST=True, CTX16=B % 16 == 0)

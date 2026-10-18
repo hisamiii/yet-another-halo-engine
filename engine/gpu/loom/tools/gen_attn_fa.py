@@ -136,6 +136,9 @@ CTX16 = False
 # operands of every maxnum, v_max x, x); the seed max folds (ninf: both arms yield a value >= -FLT_MAX). Same values.
 MAXNN = False
 SUM0 = False        # the row sum's 4-key partials start from the first p, not 0 + p (p >= 0: same values)
+# PV_FENCE: a schedule fence before the P.V: the first V fragments' loads hoisted above the softmax landed in split
+# registers and cost 16 v_mov per tile into the MMA operand tuples. Same values
+PV_FENCE = False
 # PBP: P^T's two halves by index shuffles (lane gets lane & 15 / lane | 16: ds_bpermute) instead of an xor-16 shuffle
 # and two per-lane selects. Same values; lost (+1.2% cycles: the bpermute latency).
 PBP = False
@@ -1646,6 +1649,8 @@ def gen():
         e(f"    %pb0 = vector.concat<0> %plo, %phi2 : {V8H}, {V8H} -> {V16H}")
         e(f"    %pb = vector.fragment<rhs> %pb0 shape [%k, %n] : {V16H}")
         # P.V into the (conditionally) rescaled O
+        if PV_FENCE:
+            e("    scf.schedule.fence")
         e(f"    %alpha8 = vector.splat %alpha : {V8}")
         outs = []
         for f in range(8):
