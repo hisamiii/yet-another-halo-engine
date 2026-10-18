@@ -443,6 +443,11 @@ NQGU_ON = False   # set by main
 # dispatch.txt "rqk"
 RQK = True
 RQK_ON = False   # set by main
+# RQP (with RQK and GUOV): the down projection's rotq also as rotqp_17408 (gen_rot.gen_qp: RQP persistent workgroups
+# walking the token tiles in order), so the kres after it is not queued behind 34816 rotq workgroups and starts on the
+# first token tiles in the gu's tail: rotq exposure 21.3 -> 0.3 ms, gu start .. kres end 1.546 -> 1.474 gu, pp2048 ~-1.9%
+# timeline span. Same values. (P 96 / 240 lose; recorded before the gu, its LDS takes a gu workgroup per WGP: gu +44%)
+RQP = 160
 # NQW (A4): the attention and DeltaNet input GEMMs (kqg, kstore K / V / alpha / beta, the flagged qkv kstore) also as
 # iu4_<kind>[f]w_* (gen_gemm_iu4 wait) on the attention norm's counters (normq[f]o_5120), so the driver records them after
 # the norm with no graph barrier. Same values. dispatch.txt "nqw"
@@ -1997,6 +2002,11 @@ def main():
                 rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
                 open(rot_src[name], "w").write(src)
             geom.append(("rqk", 0, 0, 0))
+            if RQP and GUOV_ON and B % gen_rot.FLAG_TT == 0:
+                rot_src["rotqp_17408.hal"] = os.path.join(tmp, "rotqp_17408.loom")
+                open(rot_src["rotqp_17408.hal"], "w").write(
+                    gen_rot.gen_qp(17408, B, gen_gemm_iu4.KP, RQP, gen_gemm_iu4.gu_flag_count(17408)))
+                geom.append(("rotqp_17408.hal", RQP, 0, 0))
         if NQW_ON:
             geom.append(("nqw", 0, 0, 0))
         if a4:

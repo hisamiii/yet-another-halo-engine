@@ -681,6 +681,7 @@ class LoomPrefill {
     guov_ = a4_ && geom_.count("guov") != 0;
     nqgu_ = guov_ && geom_.count("nqgu") != 0;
     rqk_ = nqov_ && geom_.count("rqk") != 0;
+    rqp_ = rqk_ && guov_ && geom_.count("rotqp_17408.hal") != 0;
     nqw_ = a4_ && geom_.count("nqw") != 0;
     dnring_ = nqw_ && rqk_ && geom_.count("dnring") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
@@ -1391,7 +1392,10 @@ class LoomPrefill {
       const bool chain = std::exchange(gu_waited_, false), counts = ocnt != nullptr;
       std::vector<hrx_buffer_ref_t> b = {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq2_), Ref(*ad2_), gu_cnt_};
       if (counts) b.push_back(*ocnt = FlagSlot());
-      Dispatch(Exe(counts ? "rotqfo_17408.hal" : "rotqf_17408.hal"), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1, b,
+      // rqp: as persistent workgroups (rotqp_17408), so the kres after it is not queued behind 34816 rotq workgroups
+      const bool persist = counts && rqp_;
+      Dispatch(Exe(persist ? "rotqp_17408.hal" : counts ? "rotqfo_17408.hal" : "rotqf_17408.hal"), "yah_rotq256",
+               persist ? geom_.at("rotqp_17408.hal").tokens : g.tt, persist ? 1 : B_, 1, g.rowgrp, 1, 1, b,
                counts ? 0b1011000 : 0b11000, nullptr, (chain ? 0b111001 : 0b100001) | (counts ? 0b1000000 : 0));
       std::swap(aq_, aq2_), std::swap(ad_, ad2_);
       return chain && counts;
@@ -3072,6 +3076,8 @@ class LoomPrefill {
   // norm's, for iu4_wait_)
   // gu_waited_: the last flagged gu also waited (RotQ)
   bool nqgu_ = false, nq_want_ = false, gu_waited_ = false;
+  // dispatch.txt rotqp_17408.hal (rqk, guov): the flagged gu's counting rotq as persistent workgroups (RotQ)
+  bool rqp_ = false;
   // dispatch.txt rqk: the deferred kres waits on its rotq's counters (rotqfo_17408 / rotqo_<k>, iu4_kresfw_*)
   bool rqk_ = false;
   // dispatch.txt nqw: the attention / DeltaNet input GEMMs wait on their norm's counters (iu4_wait_ = nq_cnt_ around
