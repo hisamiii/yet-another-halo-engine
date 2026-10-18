@@ -2463,7 +2463,13 @@ class LoomPrefill {
       if (!dnsplit_a_ || !dvc->second.tokens) throw LoomError("dispatch.txt dnvconv needs dnsplit and a conv grid");
       // dn_chained (and a waiting qkv GEMM): conv_out_ / kqbuf_'s readers since the last barrier (the last DeltaNet tail's
       // part b) finished before the token tiles reached the qkv GEMM: untracked too
-      if (qkv_flagged)
+      // dispatch.txt "convkqp.hal <workgroups>": the flagged conv as persistent workgroups (gen_conv_kq.gen_p)
+      const auto cp = geom_.find("convkqp.hal");
+      if (qkv_flagged && cp != geom_.end())
+        Dispatch(Exe("convkqp.hal"), "yah_ssm_conv_kq_p", cp->second.tokens, 1, 1, 128, 1, 1,
+                 {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_), qkv_cnt},
+                 0b011000, nullptr, dn_chained && qkv_waited ? 0b111001 : 0b100001);
+      else if (qkv_flagged)
         Dispatch(Exe("convkqf.hal"), "yah_ssm_conv_kq", dvc->second.tokens, B_ / conv_tb, 1, 256, 1, 1,
                  {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_), qkv_cnt},
                  0b011000, nullptr, dn_chained && qkv_waited ? 0b111001 : 0b100001);

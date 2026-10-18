@@ -424,6 +424,10 @@ NQOV_ON = False   # set by main
 # part a in the gate GEMM's. Same values. dispatch.txt "dnov"
 DNOV = True
 DNOV_ON = False   # set by main
+# CONVP (with DNOV): the flagged conv as gen_conv_kq.gen_p (persistent workgroups walking (key head, token tile)
+# segments, convkqp.hal) instead of gen's grid of 16-token workgroups: conv exposure 5.3-5.5 -> 4.2 ms per pp2048.
+# Same values
+CONVP = True
 # GUOV (A4): the gu GEMM also as iu4_guf_* (gen_gemm_iu4 flag: a counter per 1024 features and token tile) and
 # rotq_17408 as rotqf_17408 (gen_rot.gen_q flag), so the down projection's rotq runs in the gu GEMM's tail. Same values.
 # dispatch.txt "guov"
@@ -1856,6 +1860,11 @@ def main():
     if DNOV_ON:
         open(convf_src, "w").write(gen_conv_kq.gen(4096, flag=gen_gemm_iu4.flag_count(10240)))
         geom.append(("dnov", 0, 0, 0))
+    convp_src = os.path.join(tmp, "yah_ssm_conv_kq_p.loom")
+    convp = CONVP and DNOV_ON and B % gen_rot.FLAG_TT == 0
+    if convp:
+        open(convp_src, "w").write(gen_conv_kq.gen_p(B))
+        geom.append(("convkqp.hal", gen_conv_kq.PG, 0, 0))
     prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
     text = open(os.path.join(E.LOOM, "yah_deltanet_prep_ab_f32.loom")).read()
     open(prepab_src, "w").write(prepab_x16(text) if 640 in O16_MT else text)
@@ -2099,6 +2108,7 @@ def main():
         *([(convf_src, "convkqf.hal",
             ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
              "yah_ssm_conv_kq.num_key_heads=16"])] if DNOV_ON else []),
+        *([(convp_src, "convkqp.hal", ["yah_ssm_conv_kq_p.items=%d" % (16 * B // gen_rot.FLAG_TT)])] if convp else []),
         *([(prepabr_src, "prepabr.hal",
              ["yah_deltanet_prep_ab.batch=%d" % B,
               "yah_deltanet_prep_ab.qkv_size=10240",
