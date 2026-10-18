@@ -46,6 +46,9 @@ GU_EPI_VCONST = True
 # so a workgroup launched early fetches them while it spins. Bit-identical, counters flat; pp2048 8 ABBA runs -11.5 ms
 # mean at +-10 ms run spread (expected ~1-2 ms: one first-fetch latency per call)
 WAIT_LATE = True
+# fold software-pipelined: tile x's fmacs one fenced stage after its sub / mul (no dependent fmac right behind its mul:
+# each s_delay_alu stall at raised priority lets another wave's 16-cycle WMMA in)
+FOLD_PIPE = True
 GROUP = 8   # grouped workgroup order: row tiles per launch band (group_of)
 
 
@@ -528,14 +531,26 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
         if mid:
             mid()       # priority is a scheduling boundary: work that should overlap the WMMAs goes before it
         e("    kernel.priority {level = 3}")
-        for i in range(FM):
-            for j in range(FN):
-                x = i * FN + j
-                e(f"    %{q}cb{x} = vector.bitcast {c[i, j]} : {VI} to {V8}")
-                e(f"    %{q}cf{x} = vector.subf %{q}cb{x}, %minvv : {V8}")
-                e(f"    %{q}sc{x} = vector.mulf %{q}ws{i}, %{q}dtv{j} : {V8}")
-                e(f"    %{q}f{x} = vector.fmaf %{q}cf{x}, %{q}sc{x}, {acc[x]} : {V8}")
-                out.append(f"%{q}f{x}")
+        def pre(x):
+            i, j = divmod(x, FN)
+            e(f"    %{q}cb{x} = vector.bitcast {c[i, j]} : {VI} to {V8}")
+            e(f"    %{q}cf{x} = vector.subf %{q}cb{x}, %minvv : {V8}")
+            e(f"    %{q}sc{x} = vector.mulf %{q}ws{i}, %{q}dtv{j} : {V8}")
+        def fin(x):
+            e(f"    %{q}f{x} = vector.fmaf %{q}cf{x}, %{q}sc{x}, {acc[x]} : {V8}")
+        if FOLD_PIPE:
+            for g in range(FM * FN + 1):
+                if g < FM * FN:
+                    pre(g)
+                if g:
+                    fin(g - 1)
+                if g < FM * FN:
+                    e("    scf.schedule.fence")
+        else:
+            for x in range(FM * FN):
+                pre(x)
+                fin(x)
+        out += [f"%{q}f{x}" for x in range(FM * FN)]
         e("    kernel.priority {level = 0}")
         return out
 
