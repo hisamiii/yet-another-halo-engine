@@ -57,7 +57,10 @@ Prefill on an HFQ model (A4, the default; `YAH_A16=1` emits W4A16): the GEMMs ru
 - Epilogues: `gen_gemm_tile.lds_epilogue` (the f32 kstore with fragment stores on the 48-row tile).
 - gu runs the FFN's gate and up as one GEMM: a workgroup stages 64 gate rows and the same features' 64 up rows (one bound tensor each), wave rows 0-1 hold the gate and 2-3 the up, and the epilogue pairs them through the LDS slabs into f16 silu(gate) x up, so the gate never goes to memory (no f32 gate buffer; bit-identical to a gate kstore + swiglu).
 
-Decode on an HFQ model: `emit_decode.py` emits the MQ4 GEMVs (`gen_gemv` "mq4": unsigned codes nibble xor 8 with bias 8) and `drot_*` (`gen_rot` on one f32 row); `decode.txt` gets `rot`, and the decoder rotates the same inputs in the same places (`LoomDecoder::Rotate`).
+Decode on an HFQ model: `emit_decode.py` emits the MQ4 GEMVs (`gen_gemv` "mq4": unsigned codes nibble xor 8 with bias 8) and `drot_*` (`gen_rot` on one f32 row); `decode.txt` gets `rot`, and the decoder rotates the same inputs in the same places (`LoomDecoder::Rotate`). Two rotation sites live inside their producers, bit-identical to the separate `drot_*` dispatches (193 fewer dispatches per step; attn_output's and ssm_out's inputs still use `drot_*`):
+
+- `normrot` (`gen_rot.gen_norm`, `drot_norm_*`): rmsnorm and the rotation of its output in one kernel. Each of the 5 workgroups reduces all of x in rmsnorm's lane order, then waves 0-1 rotate the workgroup's 1024 values.
+- `swrot` (`gv_swiglurot_*`, `gen_gemv` rot): ffn_down's input. After its stores, a SwiGLU workgroup adds 1 to its 256-row block's counter (`gen_rot.last_arriver`); the block's last workgroup (old count & 31 = 31) rotates it in place (`gen_rot.block_rot_pre` / `block_rot_post`: the awq and sign loads issue before the GEMV loop). The counters are monotonic and never reset.
 
 ## Prefill
 
@@ -267,7 +270,7 @@ A HAL set is a directory of compiled kernels plus one text file that records how
 ### Decode set: `tools/emit_decode.py <model.gguf> <dir> [max_context]`
 
 - `gv_<kind>_<fmts>_<M>_<K>.hal` and `gb_<fmts>_<Ms>_<K>.hal` (GEMVs and band GEMVs), `dattn_*` (attention), `rmsnorm`, `unpack`, `rope`, `deltanet_conv`, `embed`, `argmax`, and the IQ tables.
-- `decode.txt`: `ctx <T>`, `kv q <K bits> <V bits>` for quantized KV, `chain` (flag-chained kernels; sets without it run barriered), `rw <kind> <R> <W>` (GEMV geometry), and `grid <hal> <workgroups> 0` for every GEMV kernel.
+- `decode.txt`: `ctx <T>`, `kv q <K bits> <V bits>` for quantized KV, `chain` (flag-chained kernels; sets without it run barriered), `rot` with `normrot`, `swrot` (MQ4 rotations and where they run), `rw <kind> <R> <W>` (GEMV geometry), and `grid <hal> <workgroups> 0` for every GEMV kernel.
 - To decode after a prefill, emit the decode set with the same context as the prefill pools and the same `YAH_KV`. The driver refuses a mismatch.
 
 ### From generator to HAL

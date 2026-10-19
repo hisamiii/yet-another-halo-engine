@@ -19,6 +19,7 @@ Kinds:
 Usage (module): gen(kind, fmts, M, K, R=2, W=4) -> Loom source text.
 Bindings: weights (one per format in fmts), then the IQ tables the formats need (TABLE_ORDER), then x, then y.
 """
+import gen_rot
 import re
 import sys
 
@@ -93,7 +94,9 @@ class E:
         return nm
 
 
-def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
+def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=False):
+    """rot: y feeds an MQ4 GEMV, so rotate it in place (gen_rot.gen in place, f32: y / awq, signs, H256): the last
+    workgroup to finish each 256-row block (its monotonic counter, bindings awq, signs, cnt after y) rotates it."""
     assert kind in ("plain", "resid", "swiglu")
     assert len(fmts) == (2 if kind == "swiglu" else 1)
     assert K % 512 == 0, "K / 16 sub-blocks must split evenly over 32 lanes"
@@ -688,6 +691,9 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             b(f"  {tg}s = scalar.addf {cur}, {tg}f : f32")
             cur = f"{tg}s"
         tot.append(cur)
+    if rot:   # the rotation's awq / sign loads beside the stores (gen_rot.block_rot_pre)
+        b(f"  %rblk = index.div %wg, {e.ci(256 // rows_wg)} : index")
+        gen_rot.block_rot_pre(b, "rr", "%rblk", "%tid", M, "%rav", "%rsv")
     b(f"  %is0 = index.cmp eq, %lane, {e.ci(0)} : index")
     b("  scf.if %is0 {")
     for r in range(R):
@@ -710,6 +716,8 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
             v = f"%sw{r}"
         b(f"    view.store {v}, %yv[%orc{r}] : f32, view<{M}xf32>")
     b("  }")
+    if rot:
+        rot_tail(b, e, M, rows_wg)
     if _parts is not None:               # gen_bands: hand back the body, constants stay in e
         _parts.update(body=body, wnb=wnb, tabs=tabs)
         return None
@@ -727,6 +735,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     o(f"  %wgs = index.constant {32 * W} : index")
     o("  kernel.launch.config workgroups(%nwg, %u1, %u1) workgroup_size(%wgs, %u1, %u1) : index")
     params = [f"%w{i}: buffer" for i in range(nw)] + [f"%{t}: buffer" for t in tabs] + ["%x: buffer", "%y: buffer"]
+    params += ["%rawq: buffer", "%rsg: buffer", "%rcnt: buffer"] if rot else []
     o(f"}} launch({', '.join(params)}) {{")
     o("  %base = index.constant 0 : offset")
     names = [p.split(":")[0] for p in params]
@@ -740,6 +749,10 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
         o(f"  %t_{t} = buffer.view %{t}_na[%base] : buffer -> view<{n}x{ty}>")
     o(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{K}xf32>")
     o(f"  %yv = buffer.view %y_na[%base] : buffer -> view<{M}xf32>")
+    if rot:
+        o(f"  %rav = buffer.view %rawq_na[%base] : buffer -> view<{M}xf32>")
+        o("  %rsv = buffer.view %rsg_na[%base] : buffer -> view<512xf32>")
+        o(f"  %rcv = buffer.view %rcnt_na[%base] : buffer -> view<{M // 256}xi32>")
     if "iq4xs" in fmts:
         o("\n".join(f"  %kvu{i} = scalar.constant {v + 128 - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)))
         o("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
@@ -752,6 +765,15 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None):
     out += body
     o("}")
     return "\n".join(out) + "\n"
+
+
+def rot_tail(b, e, M, rows_wg):
+    """gen rot: the block's last workgroup (gen_rot.last_arriver) rotates it in place (gen_rot.block_rot_post)."""
+    assert M % 256 == 0 and 256 % rows_wg == 0
+    last = gen_rot.last_arriver(b, "rl", "%rcv", f"view<{M // 256}xi32>", "%rblk", 256 // rows_wg, "%tid")
+    b(f"  %rln = index.cmp ult, %tid, {e.ci(16)} : index")
+    b(f"  %rgo = scalar.andi {last}, %rln : i1")
+    gen_rot.block_rot_post(b, "rr", "%rgo", "%yv", "%yv", M)
 
 
 _SHARED = re.compile(r"%(c[iwbf]\w*|ws\w*|sv\w*|kvtu|t_\w+|xv)$")

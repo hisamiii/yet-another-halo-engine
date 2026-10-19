@@ -10,6 +10,8 @@
 //                              conv + DeltaNet in one kernel (gated norm inside), ssm_out GEMV += hidden
 //   rmsnorm -> ffn_gate|ffn_up SwiGLU GEMV -> ffn_down GEMV += hidden
 // Head: rmsnorm -> output GEMV -> argmax into a device token stream.
+// MQ4 sets (decode.txt "rot"): the GEMV inputs are rotated; "normrot" / "swrot" do it inside the norm and the
+// SwiGLU GEMV instead of separate drot_* dispatches.
 // The next step's embedding kernel (IQ4_XS token_embd) reads that stream: steps queue back to back, no host round trip.
 //
 // The recurrent state and the KV pools are external (LoomDecoderState) and use the prefill's layouts.
@@ -77,7 +79,9 @@ class LoomDecoder {
           vbits_ = w;
         }  // "kv q KB VB"
         if (k == "rot") rot_ = true;   // MQ4 model: GEMV inputs are rotated (drot_*)
-        if (k == "chain") chain_ = true;   // every kernel waits on its producer's counter (tools/gen_chain.py)
+        if (k == "chain") chain_ = true;
+        if (k == "normrot") normrot_ = true;   // rmsnorm + rotation in one kernel (drot_norm_*)
+        if (k == "swrot") swrot_ = true;       // the SwiGLU GEMV rotates its output for ffn_down (gv_swiglurot_*)   // every kernel waits on its producer's counter (tools/gen_chain.py)
       }
       const auto ok = [](std::uint32_t b) { return b == 4 || b == 8; };
       if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
@@ -112,6 +116,7 @@ class LoomDecoder {
       rot_signs_ = &Alloc(sg.size());
       gpu_.H2D(*rot_signs_, sg.data(), sg.size());
       rotx_ = &Alloc(kInner * 4);
+      if (swrot_) swcnt_ = &Alloc(kFfn / 256 * 4);   // monotonic per-block counters, never reset
     }
     logits_ = &Alloc(std::size_t{kVocab} * 4);
     sink_ = &Alloc(4);
@@ -237,8 +242,7 @@ class LoomDecoder {
     const std::uint32_t nl = cfg_.main_block_count();
     for (std::uint32_t l = 0; l < nl; ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
-      Rmsnorm(*hidden_, pre + "attn_norm.weight", *normed_);
-      Rotate(*normed_, pre + (cfg_.IsFullAttention(l) ? "attn_q" : "attn_qkv"));
+      NormRotate(*hidden_, pre + "attn_norm.weight", pre + (cfg_.IsFullAttention(l) ? "attn_q" : "attn_qkv"));
       Tr("in", l, *hidden_, kHidden);
       if (cfg_.IsFullAttention(l)) {
         const std::uint32_t ai = l / cfg_.full_attention_interval;
@@ -290,15 +294,20 @@ class LoomDecoder {
         Rotate(*ssmout_, pre + "ssm_out");
         Gemv("resid", {pre + "ssm_out.weight"}, rot_ ? *rotx_ : *ssmout_, *hidden_);
       }
-      Rmsnorm(*hidden_, pre + "post_attention_norm.weight", *normed_);
-      Rotate(*normed_, pre + "ffn_gate");
-      Gemv("swiglu", {pre + "ffn_gate.weight", pre + "ffn_up.weight"}, *normed_, *ffnact_);
+      NormRotate(*hidden_, pre + "post_attention_norm.weight", pre + "ffn_gate");
+      Gemv("swiglu", {pre + "ffn_gate.weight", pre + "ffn_up.weight"}, *normed_, *ffnact_,
+           swrot_ ? pre + "ffn_down" : std::string());
       Tr("ffnact", l, *ffnact_, kFfn);
-      Rotate(*ffnact_, pre + "ffn_down");
+      if (!swrot_) Rotate(*ffnact_, pre + "ffn_down");
       Gemv("resid", {pre + "ffn_down.weight"}, *ffnact_, *hidden_);
     }
-    Rmsnorm(*hidden_, "output_norm.weight", *normed_);
-    if (rot_) Dispatch(Load("drot_head"), kHidden / 1024, 1, 64, {Ref(*normed_), Ref(*rot_signs_)});
+    if (normrot_) {
+      Dispatch(Load("drot_norm_head"), kHidden / 1024, 1, 512, {Ref(*hidden_), TRef("output_norm.weight"),
+                                                                Ref(*rot_signs_), Ref(*normed_)});
+    } else {
+      Rmsnorm(*hidden_, "output_norm.weight", *normed_);
+      if (rot_) Dispatch(Load("drot_head"), kHidden / 1024, 1, 64, {Ref(*normed_), Ref(*rot_signs_)});
+    }
     Gemv("plain", {"output.weight"}, *normed_, *logits_);
     Tr("logits", 99, *logits_, kVocab);
     cs_cur_ = 1 - cs_cur_;
@@ -417,8 +426,10 @@ class LoomDecoder {
       gpu_.Dispatch(e, 0, LoomDevice::Config(gx, gy, 1, wg, 1, 1), nullptr, 0, b.data(), b.size());
   }
   // GEMV kernel names and weight footprints follow tools/gen_gemv.py.
-  void Gemv(const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y) {
-    std::string name = std::string("gv_") + kind;
+  // rot_w: the GEMV also rotates y for weight rot_w's GEMV (gen_gemv rot; swiglu only)
+  void Gemv(const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y,
+            const std::string& rot_w = {}) {
+    std::string name = std::string("gv_") + kind + (rot_w.empty() ? "" : "rot");
     std::uint32_t tbits = 0, M = 0, K = 0;
     std::vector<hrx_buffer_ref_t> b;
     for (const auto& w : ws) {
@@ -438,6 +449,12 @@ class LoomDecoder {
     if (x.size < std::size_t{K} * 4 || y.size < std::size_t{M} * 4) throw LoomError("GEMV operand too small: " + name);
     b.push_back({x.handle, 0, std::size_t{K} * 4});
     b.push_back({y.handle, 0, std::size_t{M} * 4});
+    if (!rot_w.empty()) {
+      if (M != kFfn) throw LoomError("gv rot: only the SwiGLU output");
+      b.push_back(TRef(rot_w + ".awq"));
+      b.push_back(Ref(*rot_signs_));
+      b.push_back(Ref(*swcnt_));
+    }
     LoomExecutable& exe = Load(name);
     auto [R, W] = Rw(kind);
     const std::uint32_t gx = M / (R * W);
@@ -501,6 +518,16 @@ class LoomDecoder {
     if (heads) b.push_back(Ref(*rotx_));
     Dispatch(Load(heads ? std::string("drot_heads") : "drot_" + std::to_string(k)), k / 1024, 1, 64, b);
   }
+  // rmsnorm(x) * weight nw into normed_, rotated for weight w's GEMV (Rotate)
+  void NormRotate(const LoomBuffer& x, const std::string& nw, const std::string& w) {
+    if (!normrot_) {
+      Rmsnorm(x, nw, *normed_);
+      Rotate(*normed_, w);
+      return;
+    }
+    Dispatch(Load("drot_norm_5120"), kHidden / 1024, 1, 512,
+             {Ref(x), TRef(nw), TRef(w + ".awq"), Ref(*rot_signs_), Ref(*normed_)});
+  }
   void Rmsnorm(const LoomBuffer& x, const std::string& w, const LoomBuffer& out) {
     Dispatch(Load("rmsnorm"), 1, 1, 512, {Ref(x), TRef(w), Ref(out)});
   }
@@ -532,6 +559,8 @@ class LoomDecoder {
   bool trace_ = false;
   bool rot_ = false;       // decode.txt "rot"
   bool chain_ = false;     // decode.txt "chain"
+  bool normrot_ = false;   // decode.txt "normrot"
+  bool swrot_ = false;     // decode.txt "swrot"
   bool sampling_ = false;  // SetSampling
   hrx_buffer_t cs_[2] = {nullptr, nullptr};  // conv state ping-pong
   int cs_cur_ = 0;
@@ -543,7 +572,7 @@ class LoomDecoder {
   LoomDecoderState st_;
   LoomBuffer *hidden_, *normed_, *qg_, *q_, *gate_, *kb_, *vb_, *aout_, *qkv_, *alpha_, *beta_, *ssmout_, *ffnact_,
       *logits_, *sink_, *sparams_, *toks_, *posarr_, *eps_, *c32a_, *c32b_, *c16a_, *c16b_, *acc_, *ml_;
-  LoomBuffer *rot_signs_ = nullptr, *rotx_ = nullptr;
+  LoomBuffer *rot_signs_ = nullptr, *rotx_ = nullptr, *swcnt_ = nullptr;
 };
 
 }  // namespace yah::model
