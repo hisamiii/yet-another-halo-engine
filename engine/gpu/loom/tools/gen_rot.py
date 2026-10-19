@@ -154,6 +154,16 @@ def _core_loads(e, K, awq):
         e(f"  %s2_{i} = view.load %sv[%s2i{i}] : view<512xf32> -> f32")
 
 
+def _awrcp(e):
+    """_core's rotq divide constants from %aw: %awn = -awq, %awy = v_rcp + one Newton step."""
+    e("  %awone = scalar.constant 1.0 : f32")
+    e("  %awonev = vector.splat %awone : vector<16xf32>")
+    e("  %awr0 = vector.divf<nnan|ninf|nsz|arcp> %awonev, %aw : vector<16xf32>")
+    e("  %awn = vector.negf %aw : vector<16xf32>")
+    e("  %awer = vector.fmaf %awn, %awr0, %awonev : vector<16xf32>")
+    e("  %awy = vector.fmaf %awer, %awr0, %awr0 : vector<16xf32>")
+
+
 def _core(e, K, total, awq, ty, outs, LV, loaded=False):
     """From the lane's 16 f32 values %xf (k = %kk + i): the awq divide, s1, both H16 passes through LDS view %lv (LV,
     group %gl's slab at %gl 16 PITCH) and the s2 product into %r<i>; without outs the f16 / f32 store to %ov.
@@ -162,14 +172,15 @@ def _core(e, K, total, awq, ty, outs, LV, loaded=False):
         _core_loads(e, K, awq)
     if awq:
         if outs:
+            if loaded == "hoist":   # %awn / %awy computed once by the caller (its chunk is loop-invariant)
+                e("  %awq0 = vector.mulf %xf, %awy : vector<16xf32>")
+                e("  %awrr = vector.fmaf %awq0, %awn, %xf : vector<16xf32>")
+                e("  %xd = vector.fmaf %awrr, %awy, %awq0 : vector<16xf32>")
+                e("  %xs = vector.mulf %xd, %s1 : vector<16xf32>")
+                return _core_tail(e, total, ty, outs, LV)
             # rotq: x / awq as Markstein's q0 + (x - q0 awq) y with y = v_rcp + one Newton step, which is the IEEE 1 / awq
             # for every normal awq (exhaustive over the mantissas): the IEEE quotient up to the sign of a zero
-            e("  %awone = scalar.constant 1.0 : f32")
-            e("  %awonev = vector.splat %awone : vector<16xf32>")
-            e("  %awr0 = vector.divf<nnan|ninf|nsz|arcp> %awonev, %aw : vector<16xf32>")
-            e("  %awn = vector.negf %aw : vector<16xf32>")
-            e("  %awer = vector.fmaf %awn, %awr0, %awonev : vector<16xf32>")
-            e("  %awy = vector.fmaf %awer, %awr0, %awr0 : vector<16xf32>")
+            _awrcp(e)
             e("  %awq0 = vector.mulf %xf, %awy : vector<16xf32>")
             e("  %awrr = vector.fmaf %awq0, %awn, %xf : vector<16xf32>")
             e("  %xd = vector.fmaf %awrr, %awy, %awq0 : vector<16xf32>")
@@ -178,6 +189,11 @@ def _core(e, K, total, awq, ty, outs, LV, loaded=False):
         e("  %xs = vector.mulf %xd, %s1 : vector<16xf32>")
     else:
         e("  %xs = vector.mulf %xf, %s1 : vector<16xf32>")
+    return _core_tail(e, total, ty, outs, LV)
+
+
+def _core_tail(e, total, ty, outs, LV):
+    """_core from the scaled values %xs."""
     v = []
     for i in range(16):
         e(f"  %p0_{i} = vector.extract %xs[{i}] : vector<16xf32> -> f32")
@@ -290,6 +306,11 @@ def gen_q(K, rows, span, awq=True, heads=None, hot=False, flag=0, oflag=False):
 QP_PRIO = 3
 
 
+# gen_qp / gen_pnqp: chunk-fastest items when P allows (the awq divide out of the item loop): pnqp (P 120) -4% cycles;
+# rotqp at P 170 / rotqop at 162 flat (138 -> 163 VGPRs), so RQP / RQOP stay 160 (not multiples: rows fastest)
+QP_CM = True
+
+
 def gen_qp(K, rows, span, P, flag, plow=False):
     """gen_q flag + oflag as P persistent workgroups (rotqp): the grid of K / 1024 x rows workgroups queues the waiting
     GEMM after it behind ~35K workgroups, so it starts only in their last wave. Each token tile's items (chunk c, row r:
@@ -299,11 +320,14 @@ def gen_qp(K, rows, span, P, flag, plow=False):
     order, so the waiting GEMM's first token tiles start in this kernel's tail. flag 0: no producer counters (gen_q
     oflag alone, a graph barrier orders the producer). Same values as gen_q.
     plow: priority 0 while a tile's counters are polled (QP_PRIO after), so polling beside a producer that runs at
-    its normal priority does not take its issue slots."""
+    its normal priority does not take its issue slots.
+    P a multiple of K / 1024: items chunk fastest (j = c + K / 1024 r), so a workgroup keeps one chunk and loads its awq
+    and reciprocal once."""
     assert rows % FLAG_TT == 0 and K % 1024 == 0
     nch, tt = K // 1024, rows // FLAG_TT
     per = nch * FLAG_TT
     assert P <= per
+    cm = QP_CM and P % nch == 0
     LV = f"view<{4 * 16 * PITCH}xf32>"
     total = K * rows
     FV = f"view<{nch * tt}xi32>"
@@ -368,10 +392,17 @@ def gen_qp(K, rows, span, P, flag, plow=False):
     e("  %of_l = index.rem %lane, %pc32 : index")
     e("  %of_l0 = index.cmp eq, %of_l, %c0 : index")
 
+    e(f"  %cnch = index.constant {nch} : index")
+
     def addr(p, j, row0):
-        """Item j (chunk j / 128, row row0 + j % 128): the lane's value index %{p}xi and awq index %{p}kk."""
-        e(f"  %{p}wx = index.div {j}, %c128 : index")
-        e(f"  %{p}r = index.rem {j}, %c128 : index")
+        """Item j (chunk j / 128, row row0 + j % 128; cm: chunk j % nch, row row0 + j / nch): the lane's value index
+        %{p}xi and awq index %{p}kk."""
+        if cm:
+            e(f"  %{p}wx = index.rem {j}, %cnch : index")
+            e(f"  %{p}r = index.div {j}, %cnch : index")
+        else:
+            e(f"  %{p}wx = index.div {j}, %c128 : index")
+            e(f"  %{p}r = index.rem {j}, %c128 : index")
         e(f"  %{p}row = index.add {row0}, %{p}r : index")
         e(f"  %{p}g0 = index.mul %{p}wx, %c4 : index")
         e(f"  %{p}g = index.add %{p}g0, %gl : index")
@@ -384,7 +415,13 @@ def gen_qp(K, rows, span, P, flag, plow=False):
 
     def load(p):
         e(f"  %{p}xh = vector.load %xv[%{p}xi] : {XV} -> vector<16xf16>")
-        e(f"  %{p}aw = vector.load %av[%{p}kk] : view<{K}xf32> -> vector<16xf32>")
+        if not cm:
+            e(f"  %{p}aw = vector.load %av[%{p}kk] : view<{K}xf32> -> vector<16xf32>")
+
+    if cm:   # the workgroup's chunk: its awq and the reciprocal (_core's Markstein divide) once
+        addr("h_", "%pw", "%c0")
+        e(f"  %aw = vector.load %av[%h_kk] : view<{K}xf32> -> vector<16xf32>")
+        _awrcp(e)
 
     e("  scf.for %ptt = [%c0 to %pct step %c1] {")
     e("  %prow0 = index.mul %ptt, %c128 : index")
@@ -416,7 +453,10 @@ def gen_qp(K, rows, span, P, flag, plow=False):
             e(f"  kernel.priority {{level = {QP_PRIO}}}")
     addr("f_", "%pw", "%prow0")
     load("f_")
-    e("  %pxe, %pae = scf.for %pj = [%pw to %pT step %pP](%pxc = %f_xh : vector<16xf16>, %aw = %f_aw : vector<16xf32>) -> (vector<16xf16>, vector<16xf32>) {")
+    if cm:
+        e("  %pxe = scf.for %pj = [%pw to %pT step %pP](%pxc = %f_xh : vector<16xf16>) -> (vector<16xf16>) {")
+    else:
+        e("  %pxe, %pae = scf.for %pj = [%pw to %pT step %pP](%pxc = %f_xh : vector<16xf16>, %aw = %f_aw : vector<16xf32>) -> (vector<16xf16>, vector<16xf32>) {")
     e("  %pj1 = index.add %pj, %pP : index")
     e("  %pjn = index.min %pj1, %pTm : index")   # the last item's prefetch: a harmless reload
     addr("n_", "%pjn", "%prow0")
@@ -424,9 +464,12 @@ def gen_qp(K, rows, span, P, flag, plow=False):
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")   # the last item's LDS reads before these writes
     addr("", "%pj", "%prow0")
     e("  %xf = vector.extf %pxc : vector<16xf16> to vector<16xf32>")
-    _core(e, K, total, True, "f16", ("q", "d"), LV, loaded=True)
+    _core(e, K, total, True, "f16", ("q", "d"), LV, loaded="hoist" if cm else True)
     _quant(e, total, span, LV)
-    e("  scf.yield %n_xh, %n_aw : vector<16xf16>, vector<16xf32>")
+    if cm:
+        e("  scf.yield %n_xh : vector<16xf16>")
+    else:
+        e("  scf.yield %n_xh, %n_aw : vector<16xf16>, vector<16xf32>")
     e("  }")
     # this workgroup's items of the tile are stored: each wave counts them (device-scope release)
     e("  %of_tile = index.add %ptt, %c0 : index")
@@ -483,11 +526,7 @@ def _quant(e, total, span, LV):
                 e(f"{ind}{p}m{k} = vector.{op} {x}, {p}f{k} : {ty}")
             x = f"{p}m{k}"
         return x
-    e("  %fm1 = scalar.constant -1.0 : f32")
-    e("  %fm1v = vector.splat %fm1 : vector<16xf32>")
-    e("  %xn = vector.mulf %xq, %fm1v : vector<16xf32>")
-    # nnan on every max / min: no NaN reaches them, and without it LLVM canonicalizes both operands (v_max x, x) first
-    e("  %xa = vector.maxnumf<nnan> %xq, %xn : vector<16xf32>")
+    e("  %xa = vector.absf %xq : vector<16xf32>")
     e("  %am0 = vector.reduce<maxnumf> %xa, %fz : vector<16xf32>, f32")
     amax = reduce("%am0", "f32", "maxnumf", "am")
     e("  %f7 = scalar.constant 7.0 : f32")
@@ -502,6 +541,18 @@ def _quant(e, total, span, LV):
     e("  %f7o = scalar.addf %oq_0, %f7 : f32")
     e("  %fl8v = vector.splat %fl8 : vector<16xf32>")
     e("  %fh7v = vector.splat %f7o : vector<16xf32>")
+    # nnan on every max / min: no NaN reaches them, and without it LLVM canonicalizes both operands (v_max x, x) first
+    # codes in the magic domain: RN(y + 1.5 2^23) = 1.5 2^23 + rne(y) for |y| < 2^22 (ties to even: 1.5 2^23 is even),
+    # two dual-issue adds instead of a single-issue v_rndne; clamped there, and its bits & 15 are the nibble
+    e("  %fmgc = scalar.constant 12582912.0 : f32")
+    e("  %fmg = scalar.addf %oq_0, %fmgc : f32")
+    e("  %fmlc = scalar.constant 12582904.0 : f32")
+    e("  %fml = scalar.addf %oq_0, %fmlc : f32")
+    e("  %fmhc = scalar.constant 12582919.0 : f32")
+    e("  %fmh = scalar.addf %oq_0, %fmhc : f32")
+    e("  %fmgv = vector.splat %fmg : vector<16xf32>")
+    e("  %fmlv = vector.splat %fml : vector<16xf32>")
+    e("  %fmhv = vector.splat %fmh : vector<16xf32>")
     # amax / 7 as Markstein with RN(1 / 7): the IEEE quotient (exhaustive over the mantissas)
     e("  %y7 = scalar.constant 0.142857142857142857 : f32")
     e("  %n7 = scalar.constant -7.0 : f32")
@@ -580,9 +631,10 @@ def _quant(e, total, span, LV):
     errs = []
     for j in QCANDS:
         e(f"  %cqr{j} = vector.mulf %xq, %ijv{j} : vector<16xf32>")
-        e(f"  %cqx{j} = vector.roundevenf %cqr{j} : vector<16xf32>")
-        e(f"  %cql{j} = vector.maxnumf<nnan> %cqx{j}, %fl8v : vector<16xf32>")
-        e(f"  %cqc{j} = vector.minnumf<nnan> %cql{j}, %fh7v : vector<16xf32>")
+        e(f"  %cqx{j} = vector.addf %cqr{j}, %fmgv : vector<16xf32>")
+        e(f"  %cql{j} = vector.maxnumf<nnan> %cqx{j}, %fmlv : vector<16xf32>")
+        e(f"  %cqm{j} = vector.minnumf<nnan> %cql{j}, %fmhv : vector<16xf32>")
+        e(f"  %cqc{j} = vector.subf %cqm{j}, %fmgv : vector<16xf32>")
         e(f"  %cer{j} = vector.fmaf %cqc{j}, %ndv{j}, %xq : vector<16xf32>")
         acc = "%fz"
         for t in range(16):
@@ -618,14 +670,16 @@ def _quant(e, total, span, LV):
         e("  %wrr = vector.fmaf %wq0, %wnv, %xq : vector<16xf32>")
         e("  %wqd = vector.fmaf %wrr, %wiv, %wq0 : vector<16xf32>")
         e("  %wqr = vector.roundevenf %wqd : vector<16xf32>")
+        e("  %wql = vector.maxnumf<nnan> %wqr, %fl8v : vector<16xf32>")
+        e("  %wqc = vector.minnumf<nnan> %wql, %fh7v : vector<16xf32>")
+        _pack(e, total, span, "%wqc", best)
     else:
         e(f"  %wiv = vector.splat {bi} : vector<16xf32>")
         e("  %wqd = vector.mulf %xq, %wiv : vector<16xf32>")
-        e("  %wqr = vector.roundevenf %wqd : vector<16xf32>")
-    e("  %wql = vector.maxnumf<nnan> %wqr, %fl8v : vector<16xf32>")
-    fc = "%wqc"
-    e(f"  {fc} = vector.minnumf<nnan> %wql, %fh7v : vector<16xf32>")
-    _pack(e, total, span, fc, best)
+        e("  %wqr = vector.addf %wqd, %fmgv : vector<16xf32>")
+        e("  %wql = vector.maxnumf<nnan> %wqr, %fmlv : vector<16xf32>")
+        e("  %wqc = vector.minnumf<nnan> %wql, %fmhv : vector<16xf32>")
+        _pack(e, total, span, "%wqc", best, magic=True)
 
 
 def _fallback(e, exact_search, x2, amax, best, bi, bn, bm, sm):
@@ -661,8 +715,9 @@ def _fallback(e, exact_search, x2, amax, best, bi, bn, bm, sm):
     return "%wd", "%wi", "%wn"
 
 
-def _pack(e, total, span, fc, best):
-    """Store the clamped codes fc (vector<16xf32>) as nibbles and the span's scale best times 2^26."""
+def _pack(e, total, span, fc, best, magic=False):
+    """Store the clamped codes fc (vector<16xf32>; magic: 1.5 2^23 + code, whose low bits are the code's two's
+    complement) as nibbles and the span's scale best times 2^26."""
     e("  %m15 = scalar.constant 15 : i32")
     words = []
     for w in range(2):
@@ -670,7 +725,10 @@ def _pack(e, total, span, fc, best):
         for j in range(8):
             i = 8 * w + j
             e(f"  %ne{i} = vector.extract {fc}[{i}] : vector<16xf32> -> f32")
-            e(f"  %ni{i} = scalar.fptosi %ne{i} : f32 to i32")
+            if magic:
+                e(f"  %ni{i} = scalar.bitcast %ne{i} : f32 to i32")
+            else:
+                e(f"  %ni{i} = scalar.fptosi %ne{i} : f32 to i32")
             e(f"  %nn{i} = scalar.andi %ni{i}, %m15 : i32")
             cur = f"%nn{i}"
             if j:
@@ -738,6 +796,11 @@ def nq_flag_count(K):
     return FLAG_TT * (16 * K // 256) // 32
 
 
+# gen_nq persist: what the row loop hoists (None, "rcp": the awq divide constants, "all": also signs and norm weights).
+# "all": normqfo 113 -> 192 VGPRs, +20% cycles beside its GEMM; "rcp": 144 VGPRs, untested.
+NQ_HOIST = None
+
+
 def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
     """yah_normq: gen_half_norm's RMS norm of f32 x rows fused with gen_q (the norm-fed A4 sites): the f16 norm output
     never leaves the workgroup. One row per workgroup of 16 K / 256 lanes, lane (gl, a) the rotation lane of group gl.
@@ -789,6 +852,22 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
     e("  %ilds = buffer.alloca<workgroup> align(16) %ib : buffer")
     e("  %iview = buffer.view %ilds[%base] : buffer -> view<4xf32>")
     e("  %lane = kernel.workitem.id<x> : index")
+
+    def kslice():
+        e("  %gl = index.div %lane, %c16 : index")
+        e("  %a = index.rem %lane, %c16 : index")
+        e("  %gk = index.mul %gl, %c256 : index")
+        e("  %a16 = index.mul %a, %c16 : index")
+        e("  %kk = index.add %gk, %a16 : index")
+    hoist = persist and NQ_HOIST
+    if hoist:   # the lane's k slice and awq divide constants once ("all": its signs and norm weights too)
+        kslice()
+        if NQ_HOIST == "all":
+            _core_loads(e, K, True)
+            e(f"  %w16 = vector.load %wv[%kk] : view<{K}xf32> -> vector<16xf32>")
+        else:
+            e(f"  %aw = vector.load %av[%kk] : view<{K}xf32> -> vector<16xf32>")
+        _awrcp(e)
     if persist:
         e("  %wg = kernel.workgroup.id<x> : index")
         e(f"  %np = index.constant {rows // persist} : index")
@@ -805,12 +884,9 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
         e("  %fl_tile = index.div %row, %fl_tt : index")
         e(f"  %fl_cv = buffer.view %cnt_na[%base] : buffer -> {FV}")
         flag_wait(e, "%fl_cv", FV, ["%fl_tile"], flag, "%lane")
-    e("  %gl = index.div %lane, %c16 : index")
-    e("  %a = index.rem %lane, %c16 : index")
+    if not hoist:
+        kslice()
     e("  %rb = index.mul %row, %ck : index")
-    e("  %gk = index.mul %gl, %c256 : index")
-    e("  %a16 = index.mul %a, %c16 : index")
-    e("  %kk = index.add %gk, %a16 : index")
     e("  %xi = index.add %rb, %kk : index")
     e(f"  %x16 = vector.load %xv[%xi] : view<{total}xf32> -> vector<16xf32>")
     e(f"  vector.store %x16, %xrow[%kk] : vector<16xf32>, view<{K}xf32>")
@@ -844,12 +920,15 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     e("  %inv = view.load %iview[%c0] : view<4xf32> -> f32")
     e("  %invv = vector.splat %inv : vector<16xf32>")
-    e(f"  %w16 = vector.load %wv[%kk] : view<{K}xf32> -> vector<16xf32>")
+    if not (hoist and NQ_HOIST == "all"):
+        e(f"  %w16 = vector.load %wv[%kk] : view<{K}xf32> -> vector<16xf32>")
     e("  %nm = vector.mulf %x16, %invv : vector<16xf32>")
     e("  %wt = vector.mulf %nm, %w16 : vector<16xf32>")
     e("  %xh = vector.fptrunc %wt : vector<16xf32> to vector<16xf16>")
     e("  %xf = vector.extf %xh : vector<16xf16> to vector<16xf32>")
-    _core(e, K, total, True, "f16", ("q", "d"), LV)
+    if hoist and NQ_HOIST != "all":
+        _core_loads(e, K, False)
+    _core(e, K, total, True, "f16", ("q", "d"), LV, loaded="hoist" if hoist else False)
     _quant(e, total, span, LV)
     if oflag:
         emit_oflag(e, nt, "%row", "%lane")
@@ -1101,7 +1180,9 @@ def gen_pnqp(rows, span, P, flag, dflag):
     workgroups queue ssm_out's kres behind them. Each token tile's items (workgroup x of gen_pnq's grid, row r: item
     j = 128 x + r) are split over the workgroups; a workgroup waits for dcnt once, polls the tile's gate counter once,
     prefetches its next item's gate and raw values while it computes the current one, then adds its item count to the tile's ocnt
-    (per wave: q_flag_count in all). Same values as gen_pnq."""
+    (per wave: q_flag_count in all). Same values as gen_pnq.
+    P a multiple of the gen_pnq grid's x: items x fastest (j = x + nx r), so a workgroup keeps one x and loads its awq
+    and reciprocal once."""
     import gen_gdn_chunk
     nv, nk, hd = PN_HEADS
     K = nv * hd
@@ -1110,8 +1191,10 @@ def gen_pnqp(rows, span, P, flag, dflag):
     nb = len(pnq_groups("b"))
     assert ng % 4 == 0 and groups == list(range(groups[0], groups[0] + ng)) and rows % FLAG_TT == 0
     tt = rows // FLAG_TT
-    per = ng // 4 * FLAG_TT
+    nx = ng // 4
+    per = nx * FLAG_TT
     assert P <= per
+    cm = QP_CM and P % nx == 0
     total = K * rows
     rtotal = ng * 256 * rows
     LV = f"view<{4 * 16 * PITCH}xf32>"
@@ -1194,10 +1277,14 @@ def gen_pnqp(rows, span, P, flag, dflag):
     e(f"  %w16 = vector.load %wv[%hoc] : view<{hd}xf32> -> vector<16xf32>")
 
     def addr(p, j, row0, loads):
-        """Item j (gen_pnq workgroup x = j / 128, row row0 + j % 128): the lane's indices (%{p}rb, %{p}kk, ..) and,
-        with loads, its gate and raw values %{p}gh16, %{p}xrh."""
-        e(f"  %{p}wx = index.div {j}, %c128 : index")
-        e(f"  %{p}r = index.rem {j}, %c128 : index")
+        """Item j (gen_pnq workgroup x = j / 128, row row0 + j % 128; cm: x = j % nx, row row0 + j / nx): the lane's
+        indices (%{p}rb, %{p}kk, ..) and, with loads, its gate and raw values %{p}gh16, %{p}xrh."""
+        if cm:
+            e(f"  %{p}wx = index.rem {j}, %cnx : index")
+            e(f"  %{p}r = index.div {j}, %cnx : index")
+        else:
+            e(f"  %{p}wx = index.div {j}, %c128 : index")
+            e(f"  %{p}r = index.rem {j}, %c128 : index")
         e(f"  %{p}row = index.add {row0}, %{p}r : index")
         e(f"  %{p}rb = index.mul %{p}row, %ck : index")
         e(f"  %{p}gx4 = index.mul %{p}wx, %c4 : index")
@@ -1224,6 +1311,11 @@ def gen_pnqp(rows, span, P, flag, dflag):
         e(f"  %{p}xrh = vector.load %xv[%{p}ri] : {RV} -> vector<16xf16>")
 
     V16H, V16F = "vector<16xf16>", "vector<16xf32>"
+    if cm:   # the workgroup's x: its awq and the reciprocal (_core's Markstein divide) once
+        e(f"  %cnx = index.constant {nx} : index")
+        addr("h_", "%qw", "%c0", False)
+        e(f"  %aw = vector.load %av[%h_kk] : view<{K}xf32> -> vector<16xf32>")
+        _awrcp(e)
     e("  scf.for %qtt = [%c0 to %qct step %c1] {")
     e("  %qrow0 = index.mul %qtt, %c128 : index")
     e("  scf.if %qw0 {")
@@ -1247,14 +1339,15 @@ def gen_pnqp(rows, span, P, flag, dflag):
     addr("n_", "%qjn", "%qrow0", True)
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")   # the last item's LDS reads before these writes
     addr("", "%qj", "%qrow0", False)
-    e(f"  %aw = vector.load %av[%kk] : view<{K}xf32> -> vector<16xf32>")   # L2-resident: not prefetched
+    if not cm:
+        e(f"  %aw = vector.load %av[%kk] : view<{K}xf32> -> vector<16xf32>")   # L2-resident: not prefetched
     e("  %xre = vector.extf %qxrh : vector<16xf16> to vector<16xf32>")
     e(f"  %xrs = scalar.constant {2.0 ** -gen_gdn_chunk.O16_EXP!r} : f32")
     e("  %xrsv = vector.splat %xrs : vector<16xf32>")
     e("  %xr = vector.mulf %xre, %xrsv : vector<16xf32>")   # exact: a power of 2
     _pn_values(e)
     e("  %xf = vector.extf %xh : vector<16xf16> to vector<16xf32>")
-    _core(e, K, total, True, "f16", ("q", "d"), LV, loaded=True)
+    _core(e, K, total, True, "f16", ("q", "d"), LV, loaded="hoist" if cm else True)
     _quant(e, total, span, LV)
     e("  scf.yield %n_xrh, %n_gh16 : " + V16H + ", " + V16H)
     e("  }")
