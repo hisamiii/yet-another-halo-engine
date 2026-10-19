@@ -797,7 +797,7 @@ def nq_flag_count(K):
 
 
 # gen_nq persist: what the row loop hoists (None, "rcp": the awq divide constants, "all": also signs and norm weights).
-# "all": normqfo 113 -> 192 VGPRs, +25% cycles beside its GEMM (matched clock); "rcp": 144 VGPRs, untested.
+# "all": normqfo 113 -> 192 VGPRs, +25% cycles beside its GEMM; "rcp": 144 VGPRs, VALU -7% but +8% cycles (matched clock).
 NQ_HOIST = None
 
 
