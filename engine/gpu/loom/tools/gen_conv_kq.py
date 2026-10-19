@@ -281,14 +281,15 @@ def conv_steps_p(e, xs, p):
         p1, p2, p3 = s3, p1, p2
 
 
-PG = 128  # gen_p workgroups: two rounds of the 256 (key head, token tile) segments
+PG = 512  # gen_p workgroups: two rounds of the 1024 (key head, PST tokens) segments at B = 2048
+PST = 64  # gen_p tokens per segment: the last token tile's walk over 32 workgroups (128 tokens: tail 78 -> 39 us)
 PTB = 4   # gen_p tokens per norm batch (LDS: PTB x 3 x 32 partials + PTB x 2 scales)
 PSB = 8   # gen_p tokens per sub-block: the next sub-block's inputs load while this one computes
 
 
-def gen_p(batch, nkh=16, qkv_dim=10240, G=PG):
+def gen_p(batch, nkh=16, qkv_dim=10240, G=PG, ST=PST):
     """yah_ssm_conv_kq_p: gen's q / k part (dnvconv: DeltaNet does the v channels) with gen's flag wait, as G
-    persistent workgroups of 128 lanes: segment (key head, 128-token tile) i + G k for workgroup i, token tile major.
+    persistent workgroups of 128 lanes: segment (key head, ST tokens) i + G k for workgroup i, token major.
     Each waits for the flagged qkv GEMM's counters (cnt, one per token tile, gen_gemm_iu4.flag_count(qkv_dim)) of its
     tile and the one before (the window's 3 tokens), then walks its tile PSB tokens at a time, the next PSB tokens'
     inputs loading meanwhile (loop-carried f16), instead of gen's workgroup launch and first loads per 16 tokens.
@@ -296,13 +297,17 @@ def gen_p(batch, nkh=16, qkv_dim=10240, G=PG):
     Lane l = q channel l and k channel l of the head: the conv as gen; the per-token sums keep gen's order (norm lane j
     sums channels 4 j .. 4 j + 3 in order, then a subgroup add): lane 4 m chains its quad with xor shuffles 1, 2, 3,
     the 32 partials meet in LDS in j order and wave u reduces token u of a PTB-token batch.
-    Bindings: as gen with flag (x, conv_weights, state, conv_out, scales, cnt)."""
+    Bindings: as gen with flag (x, conv_weights, state, conv_out, scales, cnt).
+    ST: tokens per segment (a divisor of the token tile): the last token tile is ready only at the qkv GEMM's end, and
+    its segments' serial token walk is the conv's exposed tail. Shorter segments split it over more workgroups (the
+    conv is throughput-bound in the GEMM's last band: shorter segments need more workgroups too); a segment primes its
+    window from x like a tile's first one. Same values. The config (items) is the segment count, nkh batch / ST."""
     import gen_gemm_iu4
     TT = gen_rot.FLAG_TT
-    assert batch % TT == 0 and TT % PSB == 0 and PSB % PTB == 0 and PTB <= 4
+    assert batch % TT == 0 and TT % ST == 0 and ST % PSB == 0 and PSB % PTB == 0 and PTB <= 4
     need = gen_gemm_iu4.flag_count(qkv_dim)
     tt = batch // TT
-    nseg = nkh * tt
+    nseg = nkh * (batch // ST)
     x_total = batch * qkv_dim
     w_total = qkv_dim * 4
     sc_total = batch * nkh * 3
@@ -360,10 +365,19 @@ def gen_p(batch, nkh=16, qkv_dim=10240, G=PG):
     e("  %izero = scalar.constant 0 : i32")
     e("  %ione = scalar.constant 1 : i32")
     e("  scf.for %sg = [%wgid to %cns step %cG] {")
-    e("    %tile = index.div %sg, %nkh : index")
+    if ST == TT:
+        e("    %tile = index.div %sg, %nkh : index")
+    else:
+        e("    %sti = index.div %sg, %nkh : index")
     e("    %head = index.rem %sg, %nkh : index")
-    e(f"    %ctt = index.constant {TT} : index")
-    e("    %ts = index.mul %tile, %ctt : index")
+    if ST == TT:
+        e(f"    %ctt = index.constant {TT} : index")
+        e("    %ts = index.mul %tile, %ctt : index")
+    else:
+        e(f"    %cst_ = index.constant {ST} : index")
+        e("    %ts = index.mul %sti, %cst_ : index")
+        e(f"    %ctt = index.constant {TT} : index")
+        e("    %tile = index.div %ts, %ctt : index")
     # the counters of this tile and the one before, one round trip per poll; relaxed polls (an acquire load
     # invalidates the WGP's L0 and its array's L1 at every poll), the barrier's global acquire after them
     e("    %fl_t1 = index.max %tile, %c1 : index")
@@ -390,7 +404,7 @@ def gen_p(batch, nkh=16, qkv_dim=10240, G=PG):
     e("    %qc = index.add %qc0, %lane : index")
     e(f"    %ckoff = index.constant {nkh * D} : index")
     e("    %kc = index.add %qc, %ckoff : index")
-    e("    %first = index.cmp eq, %tile, %c0 : index")
+    e("    %first = index.cmp eq, %tile, %c0 : index" if ST == TT else "    %first = index.cmp eq, %ts, %c0 : index")
     chans = (("q", "%qc"), ("k", "%kc"))
 
     def xload(p, ch, tok, nm, ind="    "):
@@ -418,7 +432,7 @@ def gen_p(batch, nkh=16, qkv_dim=10240, G=PG):
     # the sub-block loop: window (f32) and the prefetched inputs (f16) carried
     carry = [(f"%{p}pw{j}", f"%{p}pw{j}i", "f32") for p, _ in chans for j in (1, 2, 3)]
     carry += [(f"%{p}x{t}h", f"%{p}i{t}", "f16") for p, _ in chans for t in range(PSB)]
-    e(f"    %cnsb = index.constant {TT // PSB} : index")
+    e(f"    %cnsb = index.constant {ST // PSB} : index")
     e("    " + ", ".join(f"%o{i}" for i in range(len(carry))) + " = scf.for %sb = [%c0 to %cnsb step %c1]("
       + ", ".join(f"{a} = {b} : {ty}" for a, b, ty in carry) + ") -> (" + ", ".join(ty for _, _, ty in carry) + ") {")
     e(f"      %csb = index.constant {PSB} : index")
