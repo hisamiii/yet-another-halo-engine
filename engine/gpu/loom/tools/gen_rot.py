@@ -863,6 +863,71 @@ def pn_heads(part):
     return [pn_gguf(h) for g in pnq_groups(part) for h in (2 * g, 2 * g + 1)]
 
 
+def _pn_values(e):
+    """gen_pnq's postnorm of the lane's 16 raw values %xr (f32), its norm weights %w16 and gate %gh16: the workgroup's
+    8 heads through LDS (%hrow, %iview), each wave's reduction for four of them, then the per-element ops into %xh
+    (f16)."""
+    # the workgroup's 8 heads in LDS (local head lh at lh 128, aliasing the rotation slabs: all reads end at the barrier)
+    e("  %lk0 = index.mul %gl, %c256 : index")
+    e("  %lk = index.add %lk0, %a16 : index")
+    e("  vector.store %xr, %hrow[%lk] : vector<16xf32>, view<1024xf32>")
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    # the postnorm's reduction: wave w the local heads 4 w .. 4 w + 3, lane l ((0 + x_l^2) + x_{l+32}^2) + .., one
+    # subgroup sum, then its inv
+    e("  %pw = index.div %lane, %c32 : index")
+    e("  %pl = index.rem %lane, %c32 : index")
+    e("  %pzero = scalar.constant 0.0 : f32")
+    e("  %pone = scalar.constant 1.0 : f32")
+    e("  %pnegone = scalar.constant -1.0 : f32")
+    e("  %peps = scalar.constant 0.000001 : f32")
+    e("  %pinvdim = scalar.constant 0.0078125 : f32")
+    e("  %pw2 = index.add %pw, %pw : index")
+    e("  %pw4 = index.add %pw2, %pw2 : index")
+    e("  %pl0 = index.cmp eq, %pl, %c0 : index")
+    for j in range(4):
+        e(f"  %plh{j} = index.add %pw4, %c{j} : index")
+        e(f"  %pb0{j} = index.mul %plh{j}, %c128 : index")
+        e(f"  %pb{j} = index.add %pb0{j}, %pl : index")
+        acc = "%pzero"
+        for t in range(4):
+            e(f"  %po{j}_{t} = index.constant {32 * t} : index")
+            e(f"  %pa{j}_{t} = index.add %pb{j}, %po{j}_{t} : index")
+            e(f"  %pv{j}_{t} = view.load %hrow[%pa{j}_{t}] : view<1024xf32> -> f32")
+            e(f"  %pq{j}_{t} = scalar.mulf %pv{j}_{t}, %pv{j}_{t} : f32")
+            e(f"  %ps{j}_{t} = scalar.addf {acc}, %pq{j}_{t} : f32")
+            acc = f"%ps{j}_{t}"
+        e(f"  %ptot{j} = kernel.subgroup.reduce<addf> {acc} : f32")
+        e(f"  %pscl{j} = scalar.mulf %ptot{j}, %pinvdim : f32")
+        e(f"  %psh{j} = scalar.addf %pscl{j}, %peps : f32")
+        e(f"  %prt{j} = scalar.sqrtf %psh{j} : f32")
+        e(f"  %pinv{j} = scalar.divf %pone, %prt{j} : f32")
+        e("  scf.if %pl0 {")
+        e(f"    view.store %pinv{j}, %iview[%plh{j}] : f32, view<8xf32>")
+        e("  }")
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    e("  %ah = index.div %a, %c8 : index")
+    e("  %gl2 = index.add %gl, %gl : index")
+    e("  %lh = index.add %gl2, %ah : index")
+    e("  %inv = view.load %iview[%lh] : view<8xf32> -> f32")
+    vals = []
+    for i in range(16):
+        e(f"  %ev{i} = vector.extract %xr[{i}] : vector<16xf32> -> f32")
+        e(f"  %ew{i} = vector.extract %w16[{i}] : vector<16xf32> -> f32")
+        e(f"  %egh{i} = vector.extract %gh16[{i}] : vector<16xf16> -> f16")
+        e(f"  %eg{i} = scalar.extf %egh{i} : f16 to f32")
+        e(f"  %enm{i} = scalar.mulf %ev{i}, %inv : f32")
+        e(f"  %ewt{i} = scalar.mulf %enm{i}, %ew{i} : f32")
+        e(f"  %eng{i} = scalar.mulf %eg{i}, %pnegone : f32")
+        e(f"  %eex{i} = scalar.expf<afn> %eng{i} : f32")
+        e(f"  %eden{i} = scalar.addf %pone, %eex{i} : f32")
+        e(f"  %esig{i} = scalar.divf %pone, %eden{i} : f32")
+        e(f"  %egt{i} = scalar.mulf %eg{i}, %esig{i} : f32")
+        e(f"  %ers{i} = scalar.mulf %ewt{i}, %egt{i} : f32")
+        e(f"  %eh{i} = scalar.fptrunc %ers{i} : f32 to f16")
+        vals.append(f"%eh{i}")
+    e("  %xh = vector.from_elements " + ", ".join(vals) + " : vector<16xf16>")
+
+
 def gen_pnq(rows, span, part, o16=False, flag=0, dflag=0, oflag=False):
     """yah_pnq: the DeltaNet postnorm (yah_ssm_postnorm_gate_f16 with the f16 gate: per GGUF head, inv = 1 / sqrt(sum
     raw^2 / 128 + 1e-6), out = f16((raw inv) w (g sigmoid(g)))) fused with rotq_heads (gen_q with PN_HEADS): the f16
@@ -997,70 +1062,185 @@ def gen_pnq(rows, span, part, o16=False, flag=0, dflag=0, oflag=False):
         e("  %xr = vector.mulf %xre, %xrsv : vector<16xf32>")   # exact: a power of 2
     else:
         e(f"  %xr = vector.load %xv[%ri] : view<{rtotal}xf32> -> vector<16xf32>")
-    # the workgroup's 8 heads in LDS (local head lh at lh 128, aliasing the rotation slabs: all reads end at the barrier)
-    e("  %lk0 = index.mul %gl, %c256 : index")
-    e("  %lk = index.add %lk0, %a16 : index")
-    e("  vector.store %xr, %hrow[%lk] : vector<16xf32>, view<1024xf32>")
-    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    # the postnorm's reduction: wave w the local heads 4 w .. 4 w + 3, lane l ((0 + x_l^2) + x_{l+32}^2) + .., one
-    # subgroup sum, then its inv
-    e("  %pw = index.div %lane, %c32 : index")
-    e("  %pl = index.rem %lane, %c32 : index")
-    e("  %pzero = scalar.constant 0.0 : f32")
-    e("  %pone = scalar.constant 1.0 : f32")
-    e("  %pnegone = scalar.constant -1.0 : f32")
-    e("  %peps = scalar.constant 0.000001 : f32")
-    e("  %pinvdim = scalar.constant 0.0078125 : f32")
-    e("  %pw2 = index.add %pw, %pw : index")
-    e("  %pw4 = index.add %pw2, %pw2 : index")
-    e("  %pl0 = index.cmp eq, %pl, %c0 : index")
-    for j in range(4):
-        e(f"  %plh{j} = index.add %pw4, %c{j} : index")
-        e(f"  %pb0{j} = index.mul %plh{j}, %c128 : index")
-        e(f"  %pb{j} = index.add %pb0{j}, %pl : index")
-        acc = "%pzero"
-        for t in range(4):
-            e(f"  %po{j}_{t} = index.constant {32 * t} : index")
-            e(f"  %pa{j}_{t} = index.add %pb{j}, %po{j}_{t} : index")
-            e(f"  %pv{j}_{t} = view.load %hrow[%pa{j}_{t}] : view<1024xf32> -> f32")
-            e(f"  %pq{j}_{t} = scalar.mulf %pv{j}_{t}, %pv{j}_{t} : f32")
-            e(f"  %ps{j}_{t} = scalar.addf {acc}, %pq{j}_{t} : f32")
-            acc = f"%ps{j}_{t}"
-        e(f"  %ptot{j} = kernel.subgroup.reduce<addf> {acc} : f32")
-        e(f"  %pscl{j} = scalar.mulf %ptot{j}, %pinvdim : f32")
-        e(f"  %psh{j} = scalar.addf %pscl{j}, %peps : f32")
-        e(f"  %prt{j} = scalar.sqrtf %psh{j} : f32")
-        e(f"  %pinv{j} = scalar.divf %pone, %prt{j} : f32")
-        e("  scf.if %pl0 {")
-        e(f"    view.store %pinv{j}, %iview[%plh{j}] : f32, view<8xf32>")
-        e("  }")
-    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    e("  %ah = index.div %a, %c8 : index")
-    e("  %gl2 = index.add %gl, %gl : index")
-    e("  %lh = index.add %gl2, %ah : index")
-    e("  %inv = view.load %iview[%lh] : view<8xf32> -> f32")
-    vals = []
-    for i in range(16):
-        e(f"  %ev{i} = vector.extract %xr[{i}] : vector<16xf32> -> f32")
-        e(f"  %ew{i} = vector.extract %w16[{i}] : vector<16xf32> -> f32")
-        e(f"  %egh{i} = vector.extract %gh16[{i}] : vector<16xf16> -> f16")
-        e(f"  %eg{i} = scalar.extf %egh{i} : f16 to f32")
-        e(f"  %enm{i} = scalar.mulf %ev{i}, %inv : f32")
-        e(f"  %ewt{i} = scalar.mulf %enm{i}, %ew{i} : f32")
-        e(f"  %eng{i} = scalar.mulf %eg{i}, %pnegone : f32")
-        e(f"  %eex{i} = scalar.expf<afn> %eng{i} : f32")
-        e(f"  %eden{i} = scalar.addf %pone, %eex{i} : f32")
-        e(f"  %esig{i} = scalar.divf %pone, %eden{i} : f32")
-        e(f"  %egt{i} = scalar.mulf %eg{i}, %esig{i} : f32")
-        e(f"  %ers{i} = scalar.mulf %ewt{i}, %egt{i} : f32")
-        e(f"  %eh{i} = scalar.fptrunc %ers{i} : f32 to f16")
-        vals.append(f"%eh{i}")
-    e("  %xh = vector.from_elements " + ", ".join(vals) + " : vector<16xf16>")
+    _pn_values(e)
     e("  %xf = vector.extf %xh : vector<16xf16> to vector<16xf32>")
     _core(e, K, total, True, "f16", ("q", "d"), LV, loaded=True)
     _quant(e, total, span, LV)
     if oflag:
         emit_oflag(e, rows // FLAG_TT, "%row", "%lane")
+    e("  kernel.return")
+    e("}")
+    return "\n".join(L) + "\n"
+
+
+def gen_pnqp(rows, span, P, flag, dflag):
+    """gen_pnq "ab" (o16, flag, dflag, oflag) as P persistent workgroups (pnqp), like gen_qp: the grid's 12288
+    workgroups queue ssm_out's kres behind them. Each token tile's items (workgroup x of gen_pnq's grid, row r: item
+    j = 128 x + r) are split over the workgroups; a workgroup waits for dcnt once, polls the tile's gate counter once,
+    prefetches its next item's gate and raw values while it computes the current one, then adds its item count to the tile's ocnt
+    (per wave: q_flag_count in all). Same values as gen_pnq."""
+    import gen_gdn_chunk
+    nv, nk, hd = PN_HEADS
+    K = nv * hd
+    groups = pnq_groups("ab")
+    ng = len(groups)
+    nb = len(pnq_groups("b"))
+    assert ng % 4 == 0 and groups == list(range(groups[0], groups[0] + ng)) and rows % FLAG_TT == 0
+    tt = rows // FLAG_TT
+    per = ng // 4 * FLAG_TT
+    assert P <= per
+    total = K * rows
+    rtotal = ng * 256 * rows
+    LV = f"view<{4 * 16 * PITCH}xf32>"
+    OV = f"view<{tt}xi32>"
+    FV = f"view<{tt}xi32>"
+    RV = f"view<{rtotal}xf16>"
+    GV = f"view<{total}xf16>"
+    L = []
+    e = L.append
+    e("// GENERATED by tools/gen_rot.py gen_pnqp -- edit the generator.")
+    e("amdgpu.target<gfx1151> @dm32 {subgroup_size = 32}")
+    e("kernel.def target(@dm32) @yah_pnq() {")
+    e("  %u1 = index.constant 1 : index")
+    e("  %c64 = index.constant 64 : index")
+    e(f"  %gx = index.constant {P} : index")
+    e("  kernel.launch.config workgroups(%gx, %u1, %u1) workgroup_size(%c64, %u1, %u1) : index")
+    names = ["raw", "nw", "gate", "awq", "sg", "q", "d", "cnt", "dcnt", "ocnt"]
+    e("} launch(" + ", ".join(f"%{n}: buffer" for n in names) + ") {")
+    e("  %base = index.constant 0 : offset")
+    for v in (0, 1, 2, 3, 8, 16, 32, 128, 256, PITCH, 16 * PITCH):
+        e(f"  %c{v} = index.constant {v} : index")
+    e(f"  %ck = index.constant {K} : index")
+    e(f"  %cg0 = index.constant {groups[0]} : index")
+    e("  " + ", ".join(f"%{n}_na" for n in names) + " = buffer.assume.noalias " + ", ".join(f"%{n}" for n in names)
+      + " : " + ", ".join(["buffer"] * len(names)))
+    e(f"  %xv = buffer.view %raw_na[%base] : buffer -> {RV}")
+    e(f"  %wv = buffer.view %nw_na[%base] : buffer -> view<{hd}xf32>")
+    e(f"  %gv = buffer.view %gate_na[%base] : buffer -> {GV}")
+    e(f"  %av = buffer.view %awq_na[%base] : buffer -> view<{K}xf32>")
+    e("  %sv = buffer.view %sg_na[%base] : buffer -> view<512xf32>")
+    e(f"  %fl_cv = buffer.view %cnt_na[%base] : buffer -> {FV}")
+    e(f"  %of_cv = buffer.view %ocnt_na[%base] : buffer -> {OV}")
+    e(f"  %lb = index.constant {4 * 16 * PITCH * 4} : offset")
+    e("  %lds = buffer.alloca<workgroup> align(16) %lb : buffer")
+    e(f"  %lv = buffer.view %lds[%base] : buffer -> {LV}")
+    e("  %hrow = buffer.view %lds[%base] : buffer -> view<1024xf32>")
+    e("  %ib = index.constant 32 : offset")
+    e("  %ilds = buffer.alloca<workgroup> align(16) %ib : buffer")
+    e("  %iview = buffer.view %ilds[%base] : buffer -> view<8xf32>")
+    e("  %lane = kernel.workitem.id<x> : index")
+    e(f"  kernel.priority {{level = {QP_PRIO}}}")
+    e("  %dn_cv = buffer.view %dcnt_na[%base] : buffer -> view<1xi32>")
+    flag_wait(e, "%dn_cv", "view<1xi32>", ["%c0"], dflag, "%lane", "dn")
+    e("  %gl = index.div %lane, %c16 : index")
+    e("  %a = index.rem %lane, %c16 : index")
+    e("  %c4 = index.constant 4 : index")
+    e("  %a16 = index.mul %a, %c16 : index")
+    e("  %s1 = vector.load %sv[%a16] : view<512xf32> -> vector<16xf32>")
+    e("  %s2b = index.add %c256, %a : index")
+    for i in range(16):
+        e(f"  %so{i} = index.constant {16 * i} : index")
+        e(f"  %s2i{i} = index.add %s2b, %so{i} : index")
+        e(f"  %s2_{i} = view.load %sv[%s2i{i}] : view<512xf32> -> f32")
+    e("  %qw = kernel.workgroup.id<x> : index")
+    e(f"  %qP = index.constant {P} : index")
+    e(f"  %qT = index.constant {per} : index")
+    e(f"  %qTm = index.constant {per - 1} : index")
+    e(f"  %qct = index.constant {tt} : index")
+    e("  %qn0 = index.sub %qT, %qw : index")
+    e("  %qn1 = index.add %qn0, %qP : index")
+    e("  %qn2 = index.sub %qn1, %c1 : index")
+    e("  %qn = index.div %qn2, %qP : index")
+    e("  %qni = index.cast %qn : index to i32")
+    e(f"  %qneed = scalar.constant {flag} : i32")
+    e(f"  %qlimit = scalar.constant {FLAG_POLLS} : i32")
+    e("  %qzero = scalar.constant 0 : i32")
+    e("  %qone = scalar.constant 1 : i32")
+    e("  %qw0 = index.cmp ult, %lane, %c32 : index")
+    e("  %of_l = index.rem %lane, %c32 : index")
+    e("  %of_l0 = index.cmp eq, %of_l, %c0 : index")
+    e(f"  %xlim = index.constant {total - 16} : index")
+    e(f"  %holim = index.constant {hd - 16} : index")
+    e(f"  %rlim = index.constant {rtotal - 16} : index")
+    e(f"  %crwa = index.constant {(ng - 2 * nb) * 256} : index")
+    e(f"  %crwb = index.constant {nb * 256} : index")
+    e(f"  %cpbo = index.constant {(rows - 1) * nb * 256} : index")
+    # the norm weights: offset 16 a in every head (256 g + 16 a mod 128), loop-invariant
+    e("  %ho = index.rem %a16, %c128 : index")
+    e("  %hoc = index.min %ho, %holim : index")
+    e(f"  %w16 = vector.load %wv[%hoc] : view<{hd}xf32> -> vector<16xf32>")
+
+    def addr(p, j, row0, loads):
+        """Item j (gen_pnq workgroup x = j / 128, row row0 + j % 128): the lane's indices (%{p}rb, %{p}kk, ..) and,
+        with loads, its gate and raw values %{p}gh16, %{p}xrh."""
+        e(f"  %{p}wx = index.div {j}, %c128 : index")
+        e(f"  %{p}r = index.rem {j}, %c128 : index")
+        e(f"  %{p}row = index.add {row0}, %{p}r : index")
+        e(f"  %{p}rb = index.mul %{p}row, %ck : index")
+        e(f"  %{p}gx4 = index.mul %{p}wx, %c4 : index")
+        e(f"  %{p}gi = index.add %{p}gx4, %gl : index")
+        e(f"  %{p}g = index.add %{p}gi, %cg0 : index")
+        e(f"  %{p}gk = index.mul %{p}g, %c256 : index")
+        e(f"  %{p}kk = index.add %{p}gk, %a16 : index")
+        if not loads:
+            return
+        e(f"  %{p}xi0 = index.add %{p}rb, %{p}kk : index")
+        e(f"  %{p}xi = index.min %{p}xi0, %xlim : index")
+        e(f"  %{p}gh16 = vector.load %gv[%{p}xi] : {GV} -> vector<16xf16>")
+        # workgroup x 0: part b's compact row, the others part a's (gen_pnq "ab")
+        e(f"  %{p}ppa = index.min %{p}wx, %c1 : index")
+        e(f"  %{p}crwd = index.mul %{p}ppa, %crwa : index")
+        e(f"  %{p}crw = index.add %crwb, %{p}crwd : index")
+        e(f"  %{p}pbo = index.mul %{p}ppa, %cpbo : index")
+        e(f"  %{p}kl1 = index.mul %{p}gi, %c256 : index")
+        e(f"  %{p}kl = index.add %{p}kl1, %a16 : index")
+        e(f"  %{p}rr0 = index.mul %{p}row, %{p}crw : index")
+        e(f"  %{p}rr1 = index.add %{p}rr0, %{p}pbo : index")
+        e(f"  %{p}ri0 = index.add %{p}rr1, %{p}kl : index")
+        e(f"  %{p}ri = index.min %{p}ri0, %rlim : index")
+        e(f"  %{p}xrh = vector.load %xv[%{p}ri] : {RV} -> vector<16xf16>")
+
+    V16H, V16F = "vector<16xf16>", "vector<16xf32>"
+    e("  scf.for %qtt = [%c0 to %qct step %c1] {")
+    e("  %qrow0 = index.mul %qtt, %c128 : index")
+    e("  scf.if %qw0 {")
+    e("    %qfn = scf.while(%qfi = %qzero : i32) -> (i32) {")
+    e(f"      %qfx = view.atomic.load %fl_cv[%qtt] {{ordering = relaxed, scope = device}} : {FV} -> i32")
+    e("      %qfe = scalar.cmpi slt, %qfx, %qneed : i32")
+    e("      %qfl = scalar.cmpi ult, %qfi, %qlimit : i32")
+    e("      %qfg = scalar.andi %qfe, %qfl : i1")
+    e("      scf.condition %qfg, %qfi : i1, i32")
+    e("    } do(%qfj: i32) {")
+    e("      %qfj1 = scalar.addi %qfj, %qone : i32")
+    e("      scf.yield %qfj1 : i32")
+    e("    }")
+    e("  }")
+    e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
+    addr("f_", "%qw", "%qrow0", True)
+    e("  %qe0, %qe1 = scf.for %qj = [%qw to %qT step %qP](%qxrh = %f_xrh : " + V16H + ", %gh16 = %f_gh16 : " + V16H
+      + ") -> (" + V16H + ", " + V16H + ") {")
+    e("  %qj1 = index.add %qj, %qP : index")
+    e("  %qjn = index.min %qj1, %qTm : index")   # the last item's prefetch: a harmless reload
+    addr("n_", "%qjn", "%qrow0", True)
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")   # the last item's LDS reads before these writes
+    addr("", "%qj", "%qrow0", False)
+    e(f"  %aw = vector.load %av[%kk] : view<{K}xf32> -> vector<16xf32>")   # L2-resident: not prefetched
+    e("  %xre = vector.extf %qxrh : vector<16xf16> to vector<16xf32>")
+    e(f"  %xrs = scalar.constant {2.0 ** -gen_gdn_chunk.O16_EXP!r} : f32")
+    e("  %xrsv = vector.splat %xrs : vector<16xf32>")
+    e("  %xr = vector.mulf %xre, %xrsv : vector<16xf32>")   # exact: a power of 2
+    _pn_values(e)
+    e("  %xf = vector.extf %xh : vector<16xf16> to vector<16xf32>")
+    _core(e, K, total, True, "f16", ("q", "d"), LV, loaded=True)
+    _quant(e, total, span, LV)
+    e("  scf.yield %n_xrh, %n_gh16 : " + V16H + ", " + V16H)
+    e("  }")
+    # this workgroup's items of the tile are stored: each wave counts them (device-scope release)
+    e("  %of_tile = index.add %qtt, %c0 : index")
+    e("  scf.if %of_l0 {")
+    e(f"    view.atomic.reduce<addi> %qni, %of_cv[%of_tile] {{ordering = release, scope = device}} : i32, {OV}")
+    e("  }")
+    e("  }")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

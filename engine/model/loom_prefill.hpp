@@ -2567,7 +2567,11 @@ class LoomPrefill {
           pq_cnt = FlagSlot();
           Dispatch(Exe("prepabr.hal"), "yah_deltanet_prep_ab", (kQkv + 255u) / 256u, 1, 1, 256, 1, 1,
                    {Ref(*qkv_), cs, Ref(*valid_), dn_cnt, ring_cnt}, 0b10010, nullptr, 0b11010);
-          Dispatch(Exe("pnq_abfr.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
+          // pnq_abfrp: as persistent workgroups, so ssm_out's kres is not queued behind 12288 pnq workgroups
+          const auto pp = geom_.find("pnq_abfrp.hal");
+          const bool persist = pp != geom_.end();
+          Dispatch(Exe(persist ? "pnq_abfrp.hal" : "pnq_abfr.hal"), "yah_pnq", persist ? pp->second.tokens : gab.tt,
+                   persist ? 1 : B_, 1, gab.rowgrp, 1, 1,
                    {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt, ring_cnt, pq_cnt},
                    0b1001100000, nullptr, 0b1110000101);
         } else if (gate_flagged)

@@ -448,6 +448,10 @@ RQK_ON = False   # set by main
 # first token tiles in the gu's tail: rotq exposure 21.3 -> 0.3 ms, gu start .. kres end 1.546 -> 1.474 gu, pp2048 ~-1.9%
 # timeline span. Same values. (P 96 / 240 lose; recorded before the gu, its LDS takes a gu workgroup per WGP: gu +44%)
 RQP = 160
+# PNQP (with DNRING): the chained pnq also as pnq_abfrp (gen_rot.gen_pnqp: PNQP persistent workgroups walking the token
+# tiles in order), for the same reason: ssm_out's kres was queued behind its 12288 workgroups. 155 VGPRs: 6 workgroups
+# per WGP beside two kres workgroups
+PNQP = 120
 # NQW (A4): the attention and DeltaNet input GEMMs (kqg, kstore K / V / alpha / beta, the flagged qkv kstore) also as
 # iu4_<kind>[f]w_* (gen_gemm_iu4 wait) on the attention norm's counters (normq[f]o_5120), so the driver records them after
 # the norm with no graph barrier. Same values. dispatch.txt "nqw"
@@ -2052,6 +2056,11 @@ def main():
                         open(rot_src["pnq_abfr.hal"], "w").write(
                             gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
                                             dflag=ring_flag_count(), oflag=True))
+                        if PNQP and B % gen_rot.FLAG_TT == 0:
+                            rot_src["pnq_abfrp.hal"] = os.path.join(tmp, "pnq_abfrp.loom")
+                            open(rot_src["pnq_abfrp.hal"], "w").write(gen_rot.gen_pnqp(
+                                B, gen_gemm_iu4.KP, PNQP, gen_gemm_iu4.flag_count(6144), ring_flag_count()))
+                            geom.append(("pnq_abfrp.hal", PNQP, 0, 0))
                     rot_src["pnq_abd.hal"] = os.path.join(tmp, "pnq_abd.loom")
                     open(rot_src["pnq_abd.hal"], "w").write(
                         gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
