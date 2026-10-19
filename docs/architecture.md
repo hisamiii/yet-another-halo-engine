@@ -224,6 +224,7 @@ The GEMV families run at 214-236 GB/s of the 240 GB/s peak.
 `tools/gen_decode_attn.py`, split-K over pages:
 
 - `part`: one workgroup per (KV head, 256-key page), with the six query heads of the GQA group. Scores (thread = key), per-head block max and sum, p in LDS, then P.V (thread = dim). Read-ahead depth 3 on the K rows and 2 on the V^T tiles. Grid order (head, page) so the four KV heads of a page read together.
+- The last page is partial (keys up to `pos` only). Waves whose 32 keys are all past `pos` skip the scores loop (their scores are masked to -inf anyway), and P.V runs tiles 8-15 only when a visible key is there (`PV_CHUNK` 8: two pipelined loops, the second behind a guard). Both guards sit outside the pipelined loops: a branch inside one makes every join wait for all loads (`vmcnt(0)`). The adds are the same in the same order, so the output is bit-identical. `part_q` sits at 256 VGPRs and spills with either guard, so it runs every key.
 - `reduce`: one workgroup per query head, merges the pages and applies the sigmoid gate.
 - Quantized KV (`part_q`): same grid and outputs, the reduce is shared. q goes to LDS in the codes' storage order (kv4: rotated in place by an 8-stage LDS butterfly). Each key thread dequantizes its own row. The open f16 V tile is added once after the tile loop. The K channel mean is never added back: q.m is constant over keys and cancels in the softmax.
 

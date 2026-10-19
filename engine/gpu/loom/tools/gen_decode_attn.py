@@ -21,6 +21,8 @@ import sys
 KVW = 1024          # 4 kv heads x 256
 # Loom read-ahead depth on the K-row and V^T-tile loops of part (V depth 3+ spills).
 PIPE_K, PIPE_V = 3, 2
+# Decode part P.V tiles per guarded chunk (16: one loop; a partial page skips chunks past its last key)
+PV_CHUNK = 8
 NH, NKV, HD = 24, 4, 256
 G = NH // NKV       # query heads per kv head
 
@@ -108,7 +110,7 @@ def gen_part(T):
     e("  kernel.launch.config workgroups(%c4, %cnp, %u1) workgroup_size(%c256, %u1, %u1) : index")
     e("} launch(%q: buffer, %kp: buffer, %vtp: buffer, %ptab: buffer, %pos: buffer, %acc: buffer, %ml: buffer) {")
     e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 2, 4, 8, 16, 32, 256):
+    for v in (0, 1, 2, 4, 8, 12, 16, 32, 256):
         e(f"  %c{v} = index.constant {v} : index")
     e(f"  %cpg = index.constant {npg - 1} : index")
     e(f"  %ctl = index.constant {T // 16} : index")
@@ -173,7 +175,15 @@ def gen_part(T):
     inits = ", ".join(f"%sa{j} = %zv8 : vector<8xf32>" for j in range(G))
     res = ", ".join(f"%sr{j}" for j in range(G))
     e(f"  %cpk = index.constant {PIPE_K} : index")
-    e(f"  {res} = scf.for %c = [%c0 to %c32 step %c1]({inits}) -> ({', '.join(['vector<8xf32>'] * G)}) pipeline(%cpk) {{")
+    # Waves whose 32 keys are all past pos skip the dot loop (their scores are masked to -inf below). The guard is
+    # outside the loop: a branch inside a pipelined loop drains every load (vmcnt(0)) at each join.
+    e("  %nr = index.sub %n, %key0 : index")
+    e("  %w32 = index.mul %wv, %c32 : index")
+    e("  %wact = index.cmp ult, %w32, %nr : index")
+    ty8 = ", ".join(["vector<8xf32>"] * G)
+    e(f"  {res} = scf.if %wact -> ({ty8}) {{")
+    rin = ", ".join(f"%si{j}" for j in range(G))
+    e(f"  {rin} = scf.for %c = [%c0 to %c32 step %c1]({inits}) -> ({ty8}) pipeline(%cpk) {{")
     e("    %d8 = index.mul %c, %c8 : index")
     e("    %ka0 = index.add %kr, %d8 : index")
     e("    %ka = index.min %ka0, %klim : index")
@@ -187,6 +197,10 @@ def gen_part(T):
         e(f"    %sn{j} = vector.fmaf %qq{j}, %kf, %sa{j} : vector<8xf32>")
         nxt.append(f"%sn{j}")
     e(f"    scf.yield {', '.join(nxt)} : {', '.join(['vector<8xf32>'] * G)}")
+    e("  }")
+    e(f"  scf.yield {rin} : {ty8}")
+    e("  } else {")
+    e(f"  scf.yield {', '.join(['%zv8'] * G)} : {ty8}")
     e("  }")
     for j in range(G):
         e(f"  %sd{j} = vector.reduce<addf> %sr{j}, %zf : vector<8xf32>, f32")
@@ -266,29 +280,49 @@ def gen_part(T):
     e("  %vtb = index.add %vt0, %vt1 : index")
     e(f"  %vlim = index.constant {T * KVW - 16} : index")
     e("  %zv16 = vector.constant 0.0 : vector<16xf32>")
-    inits = ", ".join(f"%oa{j} = %zv16 : vector<16xf32>" for j in range(G))
-    res = ", ".join(f"%or{j}" for j in range(G))
+    ty16 = ", ".join(["vector<16xf32>"] * G)
     e(f"  %cpv = index.constant {PIPE_V} : index")
-    e(f"  {res} = scf.for %i = [%c0 to %c16 step %c1]({inits}) -> ({', '.join(['vector<16xf32>'] * G)}) pipeline(%cpv) {{")
-    e("    %ti = index.add %vtb, %i : index")
-    e("    %tr = index.mul %ti, %c256 : index")
-    e("    %td = index.add %tr, %t : index")
-    e("    %va0 = index.mul %td, %c16 : index")
-    e("    %va = index.min %va0, %vlim : index")
-    e(f"    %vh = vector.load %vtv[%va] : view<{T * KVW}xf16> -> vector<16xf16>")
-    e("    %vf = vector.extf %vh : vector<16xf16> to vector<16xf32>")
-    e("    %k16 = index.mul %i, %c16 : index")
-    nxt = []
+
+    def pv_loop(tag, lo, hi, init):
+        """the P.V loop over tiles lo .. hi - 1 from accumulators init; returns its result names"""
+        out = [f"%{tag}{j}" for j in range(G)]
+        ins = ", ".join(f"%oa{tag}{j} = {init[j]} : vector<16xf32>" for j in range(G))
+        e(f"  {', '.join(out)} = scf.for %i{tag} = [%c{lo} to %c{hi} step %c1]({ins}) -> ({ty16}) pipeline(%cpv) {{")
+        e(f"    %ti{tag} = index.add %vtb, %i{tag} : index")
+        e(f"    %tr{tag} = index.mul %ti{tag}, %c256 : index")
+        e(f"    %td{tag} = index.add %tr{tag}, %t : index")
+        e(f"    %va0{tag} = index.mul %td{tag}, %c16 : index")
+        e(f"    %va{tag} = index.min %va0{tag}, %vlim : index")
+        e(f"    %vh{tag} = vector.load %vtv[%va{tag}] : view<{T * KVW}xf16> -> vector<16xf16>")
+        e(f"    %vf{tag} = vector.extf %vh{tag} : vector<16xf16> to vector<16xf32>")
+        e(f"    %k16{tag} = index.mul %i{tag}, %c16 : index")
+        for j in range(G):
+            e(f"    %pp{tag}{j}a = index.constant {G * HD + j * HD} : index")
+            e(f"    %pp{tag}{j} = index.add %pp{tag}{j}a, %k16{tag} : index")
+            e(f"    %pv{tag}{j} = vector.load %lds[%pp{tag}{j}] : {LV} -> vector<16xf32>")
+            e(f"    %on{tag}{j} = vector.fmaf %pv{tag}{j}, %vf{tag}, %oa{tag}{j} : vector<16xf32>")
+        e(f"    scf.yield {', '.join(f'%on{tag}{j}' for j in range(G))} : {ty16}")
+        e("  }")
+        return out
+
+    if PV_CHUNK == 16:
+        out = pv_loop("f", 0, 16, ["%zv16"] * G)
+    else:   # a partial page runs only the PV_CHUNK-tile chunks that hold visible keys (p = 0 past pos); same adds
+        cur = pv_loop("c0_", 0, PV_CHUNK, ["%zv16"] * G)
+        for k in range(1, 16 // PV_CHUNK):
+            e(f"  %ch{k} = index.constant {16 * PV_CHUNK * k} : index")
+            e(f"  %cin{k} = index.cmp ult, %ch{k}, %nr : index")
+            nxt = [f"%cr{k}_{j}" for j in range(G)]
+            e(f"  {', '.join(nxt)} = scf.if %cin{k} -> ({ty16}) {{")
+            r = pv_loop(f"c{k}_", PV_CHUNK * k, PV_CHUNK * (k + 1), cur)
+            e(f"  scf.yield {', '.join(r)} : {ty16}")
+            e("  } else {")
+            e(f"  scf.yield {', '.join(cur)} : {ty16}")
+            e("  }")
+            cur = nxt
+        out = cur
     for j in range(G):
-        e(f"    %pp{j}a = index.constant {G * HD + j * HD} : index")
-        e(f"    %pp{j} = index.add %pp{j}a, %k16 : index")
-        e(f"    %pv{j} = vector.load %lds[%pp{j}] : {LV} -> vector<16xf32>")
-        e(f"    %on{j} = vector.fmaf %pv{j}, %vf, %oa{j} : vector<16xf32>")
-        nxt.append(f"%on{j}")
-    e(f"    scf.yield {', '.join(nxt)} : {', '.join(['vector<16xf32>'] * G)}")
-    e("  }")
-    for j in range(G):
-        e(f"  %ov{j} = vector.reduce<addf> %or{j}, %zf : vector<16xf32>, f32")
+        e(f"  %ov{j} = vector.reduce<addf> {out[j]}, %zf : vector<16xf32>, f32")
         e(f"  %ah{j} = index.add %qh0, %cj{j} : index")
         e(f"  %ao{j}a = index.constant {NH} : index")
         e(f"  %ao{j}b = index.mul %sc, %ao{j}a : index")
