@@ -296,6 +296,8 @@ class LoomDevice {
   // The runtime's blocking wait busy-polls a host core (ROCr); a long queued run (the prefill) opts in.
   // Off by default: on short single waits the sleep slack shows in the timing.
   void SetSleepSync(long us) { sleep_us_ = us; }
+  // Submits the queued work without waiting, so the GPU runs it while the host records more.
+  void Flush() { LoomCheck(hrx_stream_flush(stream_), "hrx_stream_flush"); }
   void Synchronize() {
     if (sleep_us_ > 0) {
       // hrx_stream_query reports complete while the stream timepoint is 0 (true for plain dispatches): poll an event.

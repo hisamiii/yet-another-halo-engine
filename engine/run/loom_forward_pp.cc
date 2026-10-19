@@ -247,7 +247,10 @@ int main(int argc, char** argv) {
       dec.SetTokens(&tok, 1, T_run);
       gpu.Synchronize();
       const auto tg = std::chrono::steady_clock::now();
-      for (std::uint32_t pos = T_run; pos + 1 < T_run + ngen; ++pos) dec.Step(pos, T_run);
+      for (std::uint32_t pos = T_run; pos + 1 < T_run + ngen; ++pos) {
+        dec.Step(pos, T_run);
+        gpu.Flush();
+      }
       gpu.Synchronize();
       const double gms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
       const std::vector<std::uint32_t> gen = dec.Tokens(T_run, T_run + ngen);

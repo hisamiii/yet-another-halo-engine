@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
     for (std::uint32_t pos = 0; pos < steps; ++pos) {
       const auto t0 = std::chrono::steady_clock::now();
       dec.Step(pos, n);
+      gpu.Flush();
       if (sync_steps) {
         gpu.Synchronize();
         if (lf) {
