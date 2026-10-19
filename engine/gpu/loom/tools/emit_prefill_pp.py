@@ -1835,7 +1835,8 @@ def main():
     NQGU_ON = NQGU and GUOV_ON
     RQK_ON = RQK and NQOV_ON and GUOV_ON
     NQW_ON = NQW and a4 and not EMIT_HALF
-    ROPEW_ON = ROPEW and NQW_ON and QNORM and B % gen_rot.FLAG_TT == 0
+    # the engine runs ropew only with fp16 paged K and V (RoPE writes both pools; quantized KV has its own staging)
+    ROPEW_ON = ROPEW and NQW_ON and QNORM and B % gen_rot.FLAG_TT == 0 and gen_kvq.kv_bits() == (16, 16) and T % 256 == 0
     DNOV_ON = (DNOV and a4 and DNSPLIT == (40, 8) and DNVCONV and conv_tb_ok(B) and "qkv" not in NPU_SPLIT
                and not EMIT_HALF)   # the dnvconv conv (dn_vconv below)
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
