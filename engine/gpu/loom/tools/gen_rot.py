@@ -306,7 +306,7 @@ def gen_q(K, rows, span, awq=True, heads=None, hot=False, flag=0, oflag=False):
 QP_PRIO = 3
 
 
-# gen_qp / gen_pnqp: chunk-fastest items when P allows (the awq divide out of the item loop): pnqp (P 120) -4% cycles;
+# gen_qp / gen_pnqp: chunk-fastest items when P allows (the awq divide out of the item loop): pnqp (P 120) VALU -5%;
 # rotqp at P 170 / rotqop at 162 flat (138 -> 163 VGPRs), so RQP / RQOP stay 160 (not multiples: rows fastest)
 QP_CM = True
 
@@ -797,7 +797,7 @@ def nq_flag_count(K):
 
 
 # gen_nq persist: what the row loop hoists (None, "rcp": the awq divide constants, "all": also signs and norm weights).
-# "all": normqfo 113 -> 192 VGPRs, +20% cycles beside its GEMM; "rcp": 144 VGPRs, untested.
+# "all": normqfo 113 -> 192 VGPRs, +25% cycles beside its GEMM (matched clock); "rcp": 144 VGPRs, untested.
 NQ_HOIST = None
 
 
