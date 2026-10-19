@@ -290,14 +290,16 @@ def gen_q(K, rows, span, awq=True, heads=None, hot=False, flag=0, oflag=False):
 QP_PRIO = 3
 
 
-def gen_qp(K, rows, span, P, flag):
+def gen_qp(K, rows, span, P, flag, plow=False):
     """gen_q flag + oflag as P persistent workgroups (rotqp): the grid of K / 1024 x rows workgroups queues the waiting
     GEMM after it behind ~35K workgroups, so it starts only in their last wave. Each token tile's items (chunk c, row r:
     1024 values) are split over the workgroups (item j = 128 c + r, workgroup w takes j = w, w + P, ..); a workgroup
     polls the tile's K / 1024 producer counters once, prefetches its next item's values while it rotates and
     quantizes the current one, then adds its item count to the tile's ocnt (per wave: q_flag_count in all). Tiles in
     order, so the waiting GEMM's first token tiles start in this kernel's tail. flag 0: no producer counters (gen_q
-    oflag alone, a graph barrier orders the producer). Same values as gen_q."""
+    oflag alone, a graph barrier orders the producer). Same values as gen_q.
+    plow: priority 0 while a tile's counters are polled (QP_PRIO after), so polling beside a producer that runs at
+    its normal priority does not take its issue slots."""
     assert rows % FLAG_TT == 0 and K % 1024 == 0
     nch, tt = K // 1024, rows // FLAG_TT
     per = nch * FLAG_TT
@@ -390,6 +392,8 @@ def gen_qp(K, rows, span, P, flag):
     # round trip per poll; relaxed polls (an acquire load invalidates the WGP's L0 and its array's L1 at every poll),
     # the barrier's global acquire after them
     if flag:
+        if plow:
+            e("  kernel.priority {level = 0}")
         e(f"  %plc = index.constant {nch - 1} : index")
         e("  %pl0 = index.min %lane, %plc : index")
         e("  %pl1 = index.mul %pl0, %pct : index")
@@ -408,6 +412,8 @@ def gen_qp(K, rows, span, P, flag):
         e("    }")
         e("  }")
         e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
+        if plow:
+            e(f"  kernel.priority {{level = {QP_PRIO}}}")
     addr("f_", "%pw", "%prow0")
     load("f_")
     e("  %pxe, %pae = scf.for %pj = [%pw to %pT step %pP](%pxc = %f_xh : vector<16xf16>, %aw = %f_aw : vector<16xf32>) -> (vector<16xf16>, vector<16xf32>) {")

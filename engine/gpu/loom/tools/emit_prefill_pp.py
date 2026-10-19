@@ -451,6 +451,11 @@ RQP = 160
 # RQOP (with RQK): the attention output's rotq also as rotqop_6144 (gen_rot.gen_qp, no producer counters: a graph
 # barrier orders it after the attention), so its kres is not queued behind its 12288 workgroups
 RQOP = 160
+# AOV (with RQOP): chunk 0's attention also as wmmaf.hal (gen_attn_fa OCNT: per (1024 features, token tile) counters)
+# and the attention-out rotq as rotqopf_6144 (gen_qp waiting on them), so no graph barrier separates the two: the rotq
+# runs in the attention's tail (polling at priority 0 beside it): attention start .. kres end -131 us per attention
+# layer. Same values. dispatch.txt "aov"
+AOV = True
 # PNQP (with DNRING): the chained pnq also as pnq_abfrp (gen_rot.gen_pnqp: PNQP persistent workgroups walking the token
 # tiles in order), for the same reason: ssm_out's kres was queued behind its 12288 workgroups. 155 VGPRs: 6 workgroups
 # per WGP beside two kres workgroups
@@ -1745,6 +1750,19 @@ def main():
         geom.append(("qg16", 0, 0, 0))
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
+    attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")
+    aov_need = 0
+    if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0 and not EMIT_HALF:   # the main twin with OCNT (and its alt)
+        A = gen_attn_fa
+        saved = {k: getattr(A, k) for k in ("DIAG_SWAP", "OCNT") + tuple(MAIN_FLAGS)}
+        for k, v in dict(MAIN_FLAGS, OCNT=True).items():
+            setattr(A, k, v)
+        open(attn_f_src, "w").write(A.gen())
+        A.DIAG_SWAP = False
+        open(alt(attn_f_src), "w").write(A.gen())
+        aov_need = A.ocnt_need()
+        for k, v in saved.items():
+            setattr(A, k, v)
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
     af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
     if EMIT_HALF:   # the whole set's (its o-projections' afrag forms)
@@ -2018,6 +2036,11 @@ def main():
                 rot_src["rotqop_6144.hal"] = os.path.join(tmp, "rotqop_6144.loom")
                 open(rot_src["rotqop_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, 0))
                 geom.append(("rotqop_6144.hal", RQOP, 0, 0))
+                if aov_need:
+                    rot_src["rotqopf_6144.hal"] = os.path.join(tmp, "rotqopf_6144.loom")
+                    open(rot_src["rotqopf_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, aov_need, plow=True))
+                    geom.append(("rotqopf_6144.hal", RQOP, 0, 0))
+                    geom.append(("aov", 0, 0, 0))
         if NQW_ON:
             geom.append(("nqw", 0, 0, 0))
         if a4:
@@ -2188,6 +2211,13 @@ def main():
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH)],
+        *([(attn_f_src, "wmmaf.hal", [
+            "attention_prefill.cache_capacity=%d" % cap_attn,
+            "attention_prefill.token_count=%d" % B,
+            "attention_prefill.start_pos=0",
+            "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
+            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and occ(attn_src, 0) == attn_src
+          and qrot_first > 0 else []),
         *[(occ(attn_qr_t_src if c >= qrot_first else attn_t_src, c), "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % cap_attn,
             "attention_prefill.token_count=%d" % B,
@@ -2243,7 +2273,7 @@ def main():
         loom = loom.replace("_alt.loom", ".loom").replace("_deep.loom", ".loom").replace("_kt2.loom", ".loom")
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
-        if loom in (attn_src, attn_t_src) and (not gen_attn_fa.KDEC or kv8deq):
+        if loom in (attn_src, attn_t_src, attn_f_src) and (not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
     if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)

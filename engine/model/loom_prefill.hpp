@@ -682,6 +682,7 @@ class LoomPrefill {
     nqgu_ = guov_ && geom_.count("nqgu") != 0;
     rqk_ = nqov_ && geom_.count("rqk") != 0;
     rqp_ = rqk_ && guov_ && geom_.count("rotqp_17408.hal") != 0;
+    aov_ = rqk_ && geom_.count("aov") != 0 && std::ifstream(dir_ + "/wmmaf.hal").good();
     nqw_ = a4_ && geom_.count("nqw") != 0;
     dnring_ = nqw_ && rqk_ && geom_.count("dnring") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
@@ -1406,6 +1407,14 @@ class LoomPrefill {
     if (counts) b.push_back(*ocnt = FlagSlot());
     // rotqop_6144: as persistent workgroups, so the kres after it is not queued behind the rotq's grid
     const std::string phal = "rotqop_" + ohal.substr(6);
+    // the flagged attention's output (x untracked): the persistent workgroups wait on its counters
+    if (const auto it = geom_.find("rotqopf_6144.hal"); std::exchange(attn_flagged_, false) && counts && &x == scratch_ &&
+                                                         it != geom_.end()) {
+      b.insert(b.begin() + 5, attn_cnt_);
+      Dispatch(Exe("rotqopf_6144.hal"), "yah_rotq256", it->second.tokens, 1, 1, g.rowgrp, 1, 1, b, 0b1011000, nullptr,
+               0b1100001);
+      return false;
+    }
     if (const auto it = geom_.find(phal); counts && it != geom_.end()) {
       Dispatch(Exe(phal), "yah_rotq256", it->second.tokens, 1, 1, g.rowgrp, 1, 1, b, 0b111000, nullptr, 0b100000);
       return false;
@@ -2307,7 +2316,11 @@ class LoomPrefill {
       const auto ag = geom_.find(ah);
       const std::uint32_t tpw = ag != geom_.end() ? ag->second.tokens : attn_tpw_,
                           hpw = ag != geom_.end() ? ag->second.rowgrp : attn_hpw_;
-      Dispatch(Exe(ah), "yah_attn_wmma", (B_ + tpw - 1) / tpw, kHeads / hpw, 1, 256, 1, 1, b);
+      // aov: the counters (untracked) for the rotq after it; wmmaf.hal is chunk 0's main kernel with them
+      attn_flagged_ = aov_ && ah == "wmma.hal" && !fps && !qrot && n_ == B_;
+      if (attn_flagged_) b.push_back(attn_cnt_ = FlagSlots(6));
+      Dispatch(Exe(attn_flagged_ ? "wmmaf.hal" : ah), "yah_attn_wmma", (B_ + tpw - 1) / tpw, kHeads / hpw, 1, 256, 1, 1,
+               b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
       if (fps_on_) FpsDump(ai, ci);
     }
     trim_row_ = tail_;
@@ -3088,6 +3101,10 @@ class LoomPrefill {
   bool nqgu_ = false, nq_want_ = false, gu_waited_ = false;
   // dispatch.txt rotqp_17408.hal (rqk, guov): the flagged gu's counting rotq as persistent workgroups (RotQ)
   bool rqp_ = false;
+  // dispatch.txt "aov": chunk 0's attention as wmmaf.hal adds to attn_cnt_ (attn_flagged_), the attention-out rotq
+  // (rotqopf_6144) waits on it without a graph barrier
+  bool aov_ = false, attn_flagged_ = false;
+  hrx_buffer_ref_t attn_cnt_{};
   // dispatch.txt rqk: the deferred kres waits on its rotq's counters (rotqfo_17408 / rotqo_<k>, iu4_kresfw_*)
   bool rqk_ = false;
   // dispatch.txt nqw: the attention / DeltaNet input GEMMs wait on their norm's counters (iu4_wait_ = nq_cnt_ around

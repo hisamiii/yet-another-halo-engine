@@ -189,6 +189,16 @@ FPS_TPAD = 0
 FPS_ORD = False     # FPSPARSE: the launch order from yah_fpord (after the lists in sel): longest list first
 FPS_NG = 0          # FPSPARSE: lists in sel (chunk / 16 query blocks x 4 KV heads; MAX_TOKENS is clamped to >= 2048)
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
+# OCNT: binding ocnt (after the others): after a workgroup barrier lane 0 adds 1 to counter c tt + t (release) for
+# 1024-feature chunk c and 128-token tile t of its output, tt = token_count / 128 (ocnt_need workgroups per counter),
+# so a flag-waiting rotq (gen_rot.gen_qp flag) runs without a graph barrier behind this kernel (every lane adding,
+# as the GEMMs do, made the kernel ~4% slower)
+OCNT = False
+
+
+def ocnt_need():
+    """The lanes adding to one OCNT counter: query blocks per 128-token tile x workgroups per 1024-feature chunk."""
+    return (128 // QT) * (1024 // (256 * HPW))
 DOWHILE_MAIN = False   # the same for the head_dim-split loop (measured neutral)
 # SOFT1..4 (measured, not adopted, docs/results.md): keep the head_dim split and run the softmax in wave A only, P^T and
 # alpha through LDS. Bit-identical, -35% VALU, but the waiting partner raises barrier idle: +1.4..+4.4% at 126K.
@@ -582,7 +592,8 @@ def gen():
     e("} launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer"
       + (", %kscale: buffer" if KDEC else "")
       + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "")
-      + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + (", %sel: buffer" if FPSPARSE else "") + ") {")
+      + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + (", %sel: buffer" if FPSPARSE else "")
+      + (", %ocnt: buffer" if OCNT else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
         e(f"  %c{v} = index.constant {v} : index")
@@ -620,6 +631,8 @@ def gen():
         CAPV = "%pcap"
     e(f"  %kvtot = index.mul {CAPV}, %c1024 : index")
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
+    if OCNT:   # without it the atomic may alias every input: their scalar loads become vector loads, the code shifts
+        e("  %oc_na = buffer.assume.noalias %ocnt : buffer")
     e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if Q16 and (not QNORM or QG16) else 'f32'}>")
     e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if QG16 else 'f32'}>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
@@ -2705,6 +2718,26 @@ def gen():
             tiled_addr(f)
         e(f"    %eoh{f} = vector.fptrunc %eout{f} : {V8} to {V8H}")
         e(f"    vector.store %eoh{f}, %o_flat[%{'eto' if TILED_OUT else 'eo'}{f}] : {V8H}, view<[%qtot]xf16>")
+        e("  }")
+    if OCNT:
+        assert not TILED_OUT and 128 % QT == 0 and 1024 % (256 * HPW) == 0
+        e(f"  %oc_qpt = index.constant {128 // QT} : index")
+        e(f"  %oc_ppc = index.constant {1024 // (256 * HPW)} : index")
+        e("  %oc_t = index.div %qb, %oc_qpt : index")
+        e("  %oc_c = index.div %hp, %oc_ppc : index")
+        e("  %oc_tt = index.div %B, %c128 : index")
+        e("  %oc_i0 = index.mul %oc_c, %oc_tt : index")
+        e("  %oc_i = index.add %oc_i0, %oc_t : index")
+        e("  %oc_nc = index.div %npairs, %oc_ppc : index")
+        e("  %oc_n = index.mul %oc_nc, %oc_tt : index")
+        e("  %oc_one = scalar.constant 1 : i32")
+        e("  %oc_v = buffer.view %oc_na[%base] : buffer -> view<[%oc_n]xi32>")
+        # every wave's O stores before lane 0's add; release only: an acquiring barrier marks global memory as
+        # interfered, so every input's scalar loads would become vector loads (the whole kernel's code shifts)
+        e("  kernel.barrier<global> scope(workgroup) ordering(release)")
+        e("  %oc_l0 = index.cmp eq, %tid, %c0 : index")
+        e("  scf.if %oc_l0 {")
+        e("    view.atomic.reduce<addi> %oc_one, %oc_v[%oc_i] {ordering = release, scope = device} : i32, view<[%oc_n]xi32>")
         e("  }")
     e("  kernel.return")
     e("}")
