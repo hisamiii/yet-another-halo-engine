@@ -1404,6 +1404,12 @@ class LoomPrefill {
     const bool counts = ocnt && !heads && k == 6144;
     std::vector<hrx_buffer_ref_t> b = {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)};
     if (counts) b.push_back(*ocnt = FlagSlot());
+    // rotqop_6144: as persistent workgroups, so the kres after it is not queued behind the rotq's grid
+    const std::string phal = "rotqop_" + ohal.substr(6);
+    if (const auto it = geom_.find(phal); counts && it != geom_.end()) {
+      Dispatch(Exe(phal), "yah_rotq256", it->second.tokens, 1, 1, g.rowgrp, 1, 1, b, 0b111000, nullptr, 0b100000);
+      return false;
+    }
     Dispatch(Exe(counts ? ohal : hal), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1, b, counts ? 0b111000 : 0b11000,
              nullptr, counts ? 0b100000 : 0);
     return false;

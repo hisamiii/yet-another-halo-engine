@@ -448,6 +448,9 @@ RQK_ON = False   # set by main
 # first token tiles in the gu's tail: rotq exposure 21.3 -> 0.3 ms, gu start .. kres end 1.546 -> 1.474 gu, pp2048 ~-1.9%
 # timeline span. Same values. (P 96 / 240 lose; recorded before the gu, its LDS takes a gu workgroup per WGP: gu +44%)
 RQP = 160
+# RQOP (with RQK): the attention output's rotq also as rotqop_6144 (gen_rot.gen_qp, no producer counters: a graph
+# barrier orders it after the attention), so its kres is not queued behind its 12288 workgroups
+RQOP = 160
 # PNQP (with DNRING): the chained pnq also as pnq_abfrp (gen_rot.gen_pnqp: PNQP persistent workgroups walking the token
 # tiles in order), for the same reason: ssm_out's kres was queued behind its 12288 workgroups. 155 VGPRs: 6 workgroups
 # per WGP beside two kres workgroups
@@ -2011,6 +2014,10 @@ def main():
                 open(rot_src["rotqp_17408.hal"], "w").write(
                     gen_rot.gen_qp(17408, B, gen_gemm_iu4.KP, RQP, gen_gemm_iu4.gu_flag_count(17408)))
                 geom.append(("rotqp_17408.hal", RQP, 0, 0))
+            if RQOP and B % gen_rot.FLAG_TT == 0:
+                rot_src["rotqop_6144.hal"] = os.path.join(tmp, "rotqop_6144.loom")
+                open(rot_src["rotqop_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, 0))
+                geom.append(("rotqop_6144.hal", RQOP, 0, 0))
         if NQW_ON:
             geom.append(("nqw", 0, 0, 0))
         if a4:

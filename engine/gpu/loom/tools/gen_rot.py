@@ -296,7 +296,8 @@ def gen_qp(K, rows, span, P, flag):
     1024 values) are split over the workgroups (item j = 128 c + r, workgroup w takes j = w, w + P, ..); a workgroup
     polls the tile's K / 1024 producer counters once, prefetches its next item's values while it rotates and
     quantizes the current one, then adds its item count to the tile's ocnt (per wave: q_flag_count in all). Tiles in
-    order, so the waiting GEMM's first token tiles start in this kernel's tail. Same values as gen_q."""
+    order, so the waiting GEMM's first token tiles start in this kernel's tail. flag 0: no producer counters (gen_q
+    oflag alone, a graph barrier orders the producer). Same values as gen_q."""
     assert rows % FLAG_TT == 0 and K % 1024 == 0
     nch, tt = K // 1024, rows // FLAG_TT
     per = nch * FLAG_TT
@@ -315,7 +316,7 @@ def gen_qp(K, rows, span, P, flag):
     e("  %c64 = index.constant 64 : index")
     e(f"  %gx = index.constant {P} : index")
     e("  kernel.launch.config workgroups(%gx, %u1, %u1) workgroup_size(%c64, %u1, %u1) : index")
-    names = ["src", "awq", "sg", "q", "d", "cnt", "ocnt"]
+    names = ["src", "awq", "sg", "q", "d"] + (["cnt"] if flag else []) + ["ocnt"]
     e("} launch(" + ", ".join(f"%{n}: buffer" for n in names) + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 16, 128, 256, PITCH, 16 * PITCH):
@@ -326,7 +327,8 @@ def gen_qp(K, rows, span, P, flag):
     e(f"  %xv = buffer.view %src_na[%base] : buffer -> {XV}")
     e(f"  %av = buffer.view %awq_na[%base] : buffer -> view<{K}xf32>")
     e("  %sv = buffer.view %sg_na[%base] : buffer -> view<512xf32>")
-    e(f"  %fl_cv = buffer.view %cnt_na[%base] : buffer -> {FV}")
+    if flag:
+        e(f"  %fl_cv = buffer.view %cnt_na[%base] : buffer -> {FV}")
     e(f"  %of_cv = buffer.view %ocnt_na[%base] : buffer -> {OV}")
     e(f"  %lb = index.constant {4 * 16 * PITCH * 4} : offset")
     e("  %lds = buffer.alloca<workgroup> align(16) %lb : buffer")
@@ -387,24 +389,25 @@ def gen_qp(K, rows, span, P, flag):
     # the tile's producer counters (chunk c's at c tt + tile), lane c of wave 0 polls chunk min(c, nch - 1)'s: one
     # round trip per poll; relaxed polls (an acquire load invalidates the WGP's L0 and its array's L1 at every poll),
     # the barrier's global acquire after them
-    e(f"  %plc = index.constant {nch - 1} : index")
-    e("  %pl0 = index.min %lane, %plc : index")
-    e("  %pl1 = index.mul %pl0, %pct : index")
-    e("  %plk = index.add %pl1, %ptt : index")
-    e("  scf.if %pw0 {")
-    e("    %pfn = scf.while(%pfi = %pzero : i32) -> (i32) {")
-    e(f"      %pfx = view.atomic.load %fl_cv[%plk] {{ordering = relaxed, scope = device}} : {FV} -> i32")
-    e("      %pfe = scalar.cmpi slt, %pfx, %pneed : i32")
-    e("      %pfa = kernel.subgroup.vote.any %pfe : i1")
-    e("      %pfl = scalar.cmpi ult, %pfi, %plimit : i32")
-    e("      %pfg = scalar.andi %pfa, %pfl : i1")
-    e("      scf.condition %pfg, %pfi : i1, i32")
-    e("    } do(%pfj: i32) {")
-    e("      %pfj1 = scalar.addi %pfj, %pone : i32")
-    e("      scf.yield %pfj1 : i32")
-    e("    }")
-    e("  }")
-    e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
+    if flag:
+        e(f"  %plc = index.constant {nch - 1} : index")
+        e("  %pl0 = index.min %lane, %plc : index")
+        e("  %pl1 = index.mul %pl0, %pct : index")
+        e("  %plk = index.add %pl1, %ptt : index")
+        e("  scf.if %pw0 {")
+        e("    %pfn = scf.while(%pfi = %pzero : i32) -> (i32) {")
+        e(f"      %pfx = view.atomic.load %fl_cv[%plk] {{ordering = relaxed, scope = device}} : {FV} -> i32")
+        e("      %pfe = scalar.cmpi slt, %pfx, %pneed : i32")
+        e("      %pfa = kernel.subgroup.vote.any %pfe : i1")
+        e("      %pfl = scalar.cmpi ult, %pfi, %plimit : i32")
+        e("      %pfg = scalar.andi %pfa, %pfl : i1")
+        e("      scf.condition %pfg, %pfi : i1, i32")
+        e("    } do(%pfj: i32) {")
+        e("      %pfj1 = scalar.addi %pfj, %pone : i32")
+        e("      scf.yield %pfj1 : i32")
+        e("    }")
+        e("  }")
+        e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
     addr("f_", "%pw", "%prow0")
     load("f_")
     e("  %pxe, %pae = scf.for %pj = [%pw to %pT step %pP](%pxc = %f_xh : vector<16xf16>, %aw = %f_aw : vector<16xf32>) -> (vector<16xf16>, vector<16xf32>) {")
