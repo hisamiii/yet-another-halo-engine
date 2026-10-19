@@ -711,6 +711,9 @@ ROPEW = True
 # ROPEKV (QNORM, KV16, vtrope): RoPE as rope_kv (wave-per-head K, coalesced V^T tiles), grid (3 * batch / 4).
 # Same values. dispatch.txt "ropekv"
 ROPEKV = True
+# NQP: the flag-counting normq (normq[f]o: its GEMM waits on the counters) as NQP persistent workgroups (gen_nq persist),
+# so the waiting GEMM is dispatched while the rows run. Same values. dispatch.txt "nqp <NQP>"
+NQP = 64
 ROPEW_ON = False   # set by main
 # PNQP (with DNRING): the chained pnq also as pnq_abfrp (gen_rot.gen_pnqp: PNQP persistent workgroups walking the token
 # tiles in order), for the same reason: ssm_out's kres was queued behind its 12288 workgroups. 155 VGPRs: 6 workgroups
@@ -2327,8 +2330,11 @@ def main():
                 for f in (0, gen_gemm_iu4.flag_count(5120)) if NQOV_ON else (0,):
                     name = "normq%so_5120.hal" % ("f" if f else "")
                     rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-                    open(rot_src[name], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=f, oflag=True))
+                    open(rot_src[name], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=f, oflag=True,
+                                                                  persist=NQP if B % NQP == 0 else 0))
                 geom.append(("nqgu", 0, 0, 0))
+                if NQP and B % NQP == 0:
+                    geom.append(("nqp", NQP, 0, 0))
             if DNSPLIT == (40, 8):
                 # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq) per DeltaNet part (dn_perm): a beside part b, b after it
                 for part in "ab":

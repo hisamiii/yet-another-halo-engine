@@ -685,6 +685,7 @@ class LoomPrefill {
     aov_ = rqk_ && geom_.count("aov") != 0 && std::ifstream(dir_ + "/wmmaf.hal").good();
     ropew_ = geom_.count("ropew") != 0;
     ropekv_ = geom_.count("ropekv") != 0;
+    if (const auto it = geom_.find("nqp"); it != geom_.end()) nqp_ = it->second.tokens;
     nqw_ = a4_ && geom_.count("nqw") != 0;
     dnring_ = nqw_ && rqk_ && geom_.count("dnring") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
@@ -1332,7 +1333,7 @@ class LoomPrefill {
           // a chained kres (rqk): aq2_ / ad2_'s readers since the last barrier (the gu) finished each token tile
           // before the rotq, the kres and so these rows: untracked too
           const std::uint64_t pair = p.chain && p.wcnt.buffer ? 0b110000 : 0;
-          Dispatch(Exe(want ? "normqfo_5120.hal" : "normqf_5120.hal"), "yah_normq", B_, 1, 1,
+          Dispatch(Exe(want ? "normqfo_5120.hal" : "normqf_5120.hal"), "yah_normq", want && nqp_ ? nqp_ : B_, 1, 1,
                    geom_.at("normq_5120.hal").rowgrp, 1, 1, b, want ? 0b10110000 : 0b0110000, nullptr,
                    (want ? 0b11000001 : 0b1000001) | pair);
           std::swap(aq_, aq2_), std::swap(ad_, ad2_);
@@ -1343,7 +1344,7 @@ class LoomPrefill {
       std::vector<hrx_buffer_ref_t> b = {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))),
                                          Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)};
       if (want) b.push_back(nq_cnt_ = FlagSlot());
-      Dispatch(Exe(want ? "normqo_5120.hal" : "normq_5120.hal"), "yah_normq", B_, 1, 1,
+      Dispatch(Exe(want ? "normqo_5120.hal" : "normq_5120.hal"), "yah_normq", want && nqp_ ? nqp_ : B_, 1, 1,
                geom_.at("normq_5120.hal").rowgrp, 1, 1, b, want ? 0b1110000 : 0b110000, nullptr, want ? 0b1000000 : 0);
       return;
     }
@@ -3117,6 +3118,8 @@ class LoomPrefill {
   bool aov_ = false, attn_flagged_ = false;
   // dispatch.txt "ropew": the attention's k / v GEMMs flagged (kv_cnt_), RoPE (ropew) waits on them
   bool ropew_ = false, kv_flagged_ = false, ropekv_ = false;
+  // dispatch.txt "nqp": the flag-counting normq (normq[f]o) runs as nqp_ persistent workgroups
+  std::uint32_t nqp_ = 0;
   hrx_buffer_ref_t kv_cnt_[2]{};
   hrx_buffer_ref_t attn_cnt_{};
   // dispatch.txt rqk: the deferred kres waits on its rotq's counters (rotqfo_17408 / rotqo_<k>, iu4_kresfw_*)

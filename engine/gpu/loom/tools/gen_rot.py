@@ -738,7 +738,7 @@ def nq_flag_count(K):
     return FLAG_TT * (16 * K // 256) // 32
 
 
-def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False):
+def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
     """yah_normq: gen_half_norm's RMS norm of f32 x rows fused with gen_q (the norm-fed A4 sites): the f16 norm output
     never leaves the workgroup. One row per workgroup of 16 K / 256 lanes, lane (gl, a) the rotation lane of group gl.
     The lanes load their 16 values into LDS; wave 0 runs gen_half_norm's per-lane chains (lane l: ((0 + x_l x_l) +
@@ -748,8 +748,10 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False):
     (zero before the producer); the row waits until cnt[token tile] reaches flag (flag_wait), so the producer
     (gen_gemm_iu4.gen flag) runs without a graph barrier before this kernel.
     oflag: binding ocnt after them, i32 [rows / FLAG_TT] (zero before), nq_flag_count per token tile (emit_oflag), so a
-    flag-waiting GEMM (gen_gemm_iu4.gen wait) runs without a graph barrier after this kernel."""
-    assert K % 256 == 0 and K % 32 == 0 and (not oflag or rows % FLAG_TT == 0)
+    flag-waiting GEMM (gen_gemm_iu4.gen wait) runs without a graph barrier after this kernel.
+    persist: grid (persist) instead of (rows), workgroup g does rows g, g + persist, ... in order: all workgroups are
+    dispatched at once, so the queue reaches the flag-waiting GEMM behind it while the rows still run."""
+    assert K % 256 == 0 and K % 32 == 0 and (not oflag or rows % FLAG_TT == 0) and (not persist or rows % persist == 0)
     ng = K // 256
     nth = 16 * ng
     total = K * rows
@@ -761,7 +763,7 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False):
     e("kernel.def target(@dm32) @yah_normq() {")
     e("  %u1 = index.constant 1 : index")
     e(f"  %cnth = index.constant {nth} : index")
-    e(f"  %gy = index.constant {rows} : index")
+    e(f"  %gy = index.constant {persist or rows} : index")
     e("  kernel.launch.config workgroups(%gy, %u1, %u1) workgroup_size(%cnth, %u1, %u1) : index")
     nt = rows // FLAG_TT
     e("} launch(%x: buffer, %weight: buffer, %awq: buffer, %sg: buffer, %q: buffer, %d: buffer"
@@ -787,7 +789,16 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False):
     e("  %ilds = buffer.alloca<workgroup> align(16) %ib : buffer")
     e("  %iview = buffer.view %ilds[%base] : buffer -> view<4xf32>")
     e("  %lane = kernel.workitem.id<x> : index")
-    e("  %row = kernel.workgroup.id<x> : index")
+    if persist:
+        e("  %wg = kernel.workgroup.id<x> : index")
+        e(f"  %np = index.constant {rows // persist} : index")
+        e(f"  %cp = index.constant {persist} : index")
+        e("  scf.for %it = [%c0 to %np step %c1] {")
+        e("  %row0 = index.mul %it, %cp : index")
+        e("  %row1 = index.add %row0, %wg : index")
+        e(f"  %row = index.assume %row1 [range(%row1, 0, {rows - 1})] : index")
+    else:
+        e("  %row = kernel.workgroup.id<x> : index")
     if flag:
         FV = f"view<{nt}xi32>"
         e(f"  %fl_tt = index.constant {FLAG_TT} : index")
@@ -842,6 +853,9 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False):
     _quant(e, total, span, LV)
     if oflag:
         emit_oflag(e, nt, "%row", "%lane")
+    if persist:   # the next row reuses the LDS
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  }")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
