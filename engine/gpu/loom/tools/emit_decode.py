@@ -201,10 +201,10 @@ def main():
     if rot:
         for name, args in (("drot_5120", (5120, 1)), ("drot_6144", (6144, 1)), ("drot_17408", (17408, 1)),
                            ("drot_heads", (6144, 1, True, (48, 16, 128))), ("drot_head", (5120, 1, False))):
-            emit_src(gen_rot.gen(*args, ty="f32"), name, outdir)
+            emit_src(gen_rot.gen(*args, ty="f32", early=CHAIN), name, outdir)
         # rmsnorm + rotation in one kernel at the norm sites (decode.txt "normrot")
-        emit_src(gen_rot.gen_norm(5120), "drot_norm_5120", outdir)
-        emit_src(gen_rot.gen_norm(5120, awq=False), "drot_norm_head", outdir)
+        emit_src(gen_rot.gen_norm(5120, early=CHAIN), "drot_norm_5120", outdir)
+        emit_src(gen_rot.gen_norm(5120, awq=False, early=CHAIN), "drot_norm_head", outdir)
         open(os.path.join(outdir, "rot_signs.bin"), "wb").write(gen_rot.signs())
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-p sampling into the token stream
