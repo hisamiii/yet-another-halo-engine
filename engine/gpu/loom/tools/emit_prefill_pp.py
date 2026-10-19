@@ -362,6 +362,254 @@ def rope_konly(text):
     return text[:i] + text[j + len("\n  }\n"):]
 
 
+def rope_wait(text, need):
+    """rope_konly polling its token tile's k and v GEMM counters (bindings kcnt, vcnt after the others; gen_gemm_iu4
+    flag: need each) before any load: wave 0 polls relaxed, the barrier's global acquire after it."""
+    a = "%ptab: buffer) {"
+    assert text.count(a) == 1
+    text = text.replace(a, "%ptab: buffer, %kcnt: buffer, %vcnt: buffer) {")
+    a = "  %tid = kernel.workitem.id<x> : index\n"
+    assert text.count(a) == 1
+    poll = [
+        "  %rw_c32 = index.constant 32 : index",
+        "  %rw_c128 = index.constant 128 : index",
+        "  %rw_c127 = index.constant 127 : index",
+        "  %rw_b = config.get @yah_fused_qk_rope_batched.batch : index",
+        "  %rw_b1 = index.add %rw_b, %rw_c127 : index",
+        "  %rw_tt = index.div %rw_b1, %rw_c128 : index",
+        "  %rw_t = index.div %bi, %rw_c128 : index",
+        "  %rw_kna, %rw_vna = buffer.assume.noalias %kcnt, %vcnt : buffer, buffer",
+        "  %rw_kv = buffer.view %rw_kna[%base] : buffer -> view<[%rw_tt]xi32>",
+        "  %rw_vv = buffer.view %rw_vna[%base] : buffer -> view<[%rw_tt]xi32>",
+        "  %rw_w0 = index.cmp ult, %tid, %rw_c32 : index",
+        f"  %rw_need = scalar.constant {need} : i32",
+        f"  %rw_lim = scalar.constant {gen_rot.FLAG_POLLS} : i32",
+        "  %rw_z = scalar.constant 0 : i32",
+        "  %rw_one = scalar.constant 1 : i32",
+        "  scf.if %rw_w0 {",
+        "    %rw_n = scf.while(%rw_i = %rw_z : i32) -> (i32) {",
+        "      %rw_x = view.atomic.load %rw_kv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32",
+        "      %rw_y = view.atomic.load %rw_vv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32",
+        "      %rw_m = scalar.minsi %rw_x, %rw_y : i32",
+        "      %rw_e = scalar.cmpi slt, %rw_m, %rw_need : i32",
+        "      %rw_l = scalar.cmpi ult, %rw_i, %rw_lim : i32",
+        "      %rw_g = scalar.andi %rw_e, %rw_l : i1",
+        "      scf.condition %rw_g, %rw_i : i1, i32",
+        "    } do(%rw_j: i32) {",
+        "      %rw_j1 = scalar.addi %rw_j, %rw_one : i32",
+        "      scf.yield %rw_j1 : i32",
+        "    }",
+        "  }",
+        "  kernel.barrier<global> scope(workgroup) ordering(acquire)",
+    ]
+    return text.replace(a, a + "\n".join(poll) + "\n")
+
+
+def rope_kv(text, need=None):
+    """rope_konly (KV16 + vtrope) rewritten wave-per-head: K workgroups (x < batch / 2) normalize, rotate and store 8
+    (token, KV head) rows, one per wave; V workgroups (batch / 4 more) store one KV head of a 16-token tile as V^T,
+    lane = dim, one 32 B row per lane. Same ops and sum order as the workgroup reduce (per-32 subgroup reduces, then
+    the 8 partials as a cluster-8 tree), so the same bits. need: wait for the k / v GEMM counters (rope_wait)."""
+    S = "@yah_fused_qk_rope_batched"
+    L = [text[:text.index("kernel.def ")]]
+    e = L.append
+    e(f"kernel.def target(@yah_wave32) {S}() {{")
+    e("  %unit = index.constant 1 : index")
+    e(f"  %batch = config.get {S}.batch : index")
+    e("  %kw0 = index.constant 2 : index")
+    e("  %kwg = index.div %batch, %kw0 : index")
+    e("  %vw0 = index.constant 4 : index")
+    e("  %vwg = index.div %batch, %vw0 : index")
+    e("  %nwg = index.add %kwg, %vwg : index")
+    e("  %c256 = index.constant 256 : index")
+    e("  kernel.launch.config workgroups(%nwg, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index")
+    e("} launch(%q: buffer, %k: buffer, %v: buffer, %q_weight: buffer, %k_weight: buffer, %q_out: buffer, %k_out: buffer, "
+      "%k_cache: buffer, %v_cache: buffer, %k_cache_f16: buffer, %v_cache_f16: buffer, %eps_buf: buffer, %ptab: buffer"
+      + (", %kcnt: buffer, %vcnt: buffer" if need else "") + ") {")
+    e("  %base = index.constant 0 : offset")
+    for v in (0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 255, 256, 1024, 4096):
+        e(f"  %c{v} = index.constant {v} : index")
+    e("  %two = scalar.constant 2.0 : f32")
+    e("  %one = scalar.constant 1.0 : f32")
+    for n in ("start_pos", "batch", "max_context", "kv_elems", "k16_elems"):
+        e(f"  %{n} = config.get {S}.{n} : index")
+    e(f"  %theta = config.get {S}.theta : f32")
+    e("  %head_dimf = scalar.constant 256.0 : f32")
+    e("  %rotary_dimf = scalar.constant 64.0 : f32")
+    e("  %k_na, %v_na, %kw_na, %k16_na, %v16_na, %eps_na, %pt_na = buffer.assume.noalias %k, %v, %k_weight, "
+      "%k_cache_f16, %v_cache_f16, %eps_buf, %ptab : buffer, buffer, buffer, buffer, buffer, buffer, buffer")
+    e("  %k_view = buffer.view %k_na[%base] : buffer -> view<[%kv_elems]xf16>")
+    e("  %v_view = buffer.view %v_na[%base] : buffer -> view<[%kv_elems]xf16>")
+    e("  %kw_view = buffer.view %kw_na[%base] : buffer -> view<[%c256]xf32>")
+    e("  %k16_view = buffer.view %k16_na[%base] : buffer -> view<[%k16_elems]xf16>")
+    e("  %v16_view = buffer.view %v16_na[%base] : buffer -> view<[%k16_elems]xf16>")
+    e("  %eps_view = buffer.view %eps_na[%base] : buffer -> view<[%c1]xf32>")
+    e("  %pgrows = index.div %k16_elems, %c1024 : index")
+    e("  %pgn0 = index.add %pgrows, %c255 : index")
+    e("  %pgnp = index.div %pgn0, %c256 : index")
+    e("  %pglp1 = index.sub %pgnp, %c1 : index")
+    e("  %pt_view = buffer.view %pt_na[%base] : buffer -> view<[%pgnp]xi32>")
+    e("  %ctx_m1 = index.sub %max_context, %c1 : index")
+    e("  %kwg = index.div %batch, %c2 : index")
+    e("  %wg = kernel.workgroup.id<x> : index")
+    e("  %tid = kernel.workitem.id<x> : index")
+    e("  %lane = index.rem %tid, %c32 : index")
+    e("  %wave = index.div %tid, %c32 : index")
+    e("  %is_kw = index.cmp ult, %wg, %kwg : index")
+    e("  %vg0 = index.sub %wg, %kwg : index")
+    e("  %vg = index.max %vg0, %c0 : index")
+    # the workgroup's first chunk-local token: K 2 per workgroup (waves 0-3, 4-7), V 16 (4 KV heads per tile)
+    e("  %kt0 = index.mul %wg, %c2 : index")
+    e("  %vtl = index.div %vg, %c4 : index")
+    e("  %vt0 = index.mul %vtl, %c16 : index")
+    e("  %bt = scf.select %is_kw, %kt0, %vt0 : index")
+    if need:
+        e("  %rw_tt0 = index.add %batch, %c128 : index")
+        e("  %rw_tt1 = index.sub %rw_tt0, %c1 : index")
+        e("  %rw_tt = index.div %rw_tt1, %c128 : index")
+        e("  %rw_t = index.div %bt, %c128 : index")
+        e("  %rw_kna, %rw_vna = buffer.assume.noalias %kcnt, %vcnt : buffer, buffer")
+        e("  %rw_kv = buffer.view %rw_kna[%base] : buffer -> view<[%rw_tt]xi32>")
+        e("  %rw_vv = buffer.view %rw_vna[%base] : buffer -> view<[%rw_tt]xi32>")
+        e("  %rw_w0 = index.cmp ult, %tid, %c32 : index")
+        e(f"  %rw_need = scalar.constant {need} : i32")
+        e(f"  %rw_lim = scalar.constant {gen_rot.FLAG_POLLS} : i32")
+        e("  %rw_z = scalar.constant 0 : i32")
+        e("  %rw_one = scalar.constant 1 : i32")
+        e("  scf.if %rw_w0 {")
+        e("    %rw_n = scf.while(%rw_i = %rw_z : i32) -> (i32) {")
+        e("      %rw_x = view.atomic.load %rw_kv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32")
+        e("      %rw_y = view.atomic.load %rw_vv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32")
+        e("      %rw_m = scf.select %is_kw, %rw_x, %rw_y : i32")
+        e("      %rw_e = scalar.cmpi slt, %rw_m, %rw_need : i32")
+        e("      %rw_l = scalar.cmpi ult, %rw_i, %rw_lim : i32")
+        e("      %rw_g = scalar.andi %rw_e, %rw_l : i1")
+        e("      scf.condition %rw_g, %rw_i : i1, i32")
+        e("    } do(%rw_j: i32) {")
+        e("      %rw_j1 = scalar.addi %rw_j, %rw_one : i32")
+        e("      scf.yield %rw_j1 : i32")
+        e("    }")
+        e("  }")
+        e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
+    e("  scf.if %is_kw {")
+    e("    %kh = index.rem %wave, %c4 : index")
+    e("    %kwt = index.div %wave, %c4 : index")
+    e("    %bi = index.add %kt0, %kwt : index")
+    e("    %eps = view.load %eps_view[%c0] : view<[%c1]xf32> -> f32")
+    e("    %cur_raw = index.add %start_pos, %bi : index")
+    e("    %cur = index.min %cur_raw, %ctx_m1 : index")
+    e("    %pglp = index.div %cur, %c256 : index")
+    e("    %pglpc = index.min %pglp, %pglp1 : index")
+    e("    %pgv = view.load %pt_view[%pglpc] : view<[%pgnp]xi32> -> i32")
+    e("    %pgu = index.cast %pgv : i32 to index")
+    e("    %pgz = index.max %pgu, %c0 : index")
+    e("    %pg = index.min %pgz, %pglp1 : index")
+    e("    %pgb = index.mul %pg, %c256 : index")
+    e("    %pgo = index.rem %cur, %c256 : index")
+    e("    %krow = index.add %pgb, %pgo : index")
+    e("    %cur_i = index.cast %cur : index to i32")
+    e("    %curf = scalar.sitofp %cur_i : i32 to f32")
+    e("    %bkw = index.mul %bi, %c1024 : index")
+    e("    %hbkq = index.mul %kh, %c256 : index")
+    e("    %hbk = index.add %bkw, %hbkq : index")
+    e("    %src = index.add %hbk, %lane : index")
+    for j in range(8):
+        e(f"    %xo{j} = index.add %src, %c{32 * j} : index")
+        e(f"    %x{j}h = view.load %k_view[%xo{j}] : view<[%kv_elems]xf16> -> f16")
+        e(f"    %x{j} = scalar.extf %x{j}h : f16 to f32")
+        e(f"    %sq{j} = scalar.mulf %x{j}, %x{j} : f32")
+        e(f"    %ps{j} = kernel.subgroup.reduce<addf> %sq{j} : f32")
+    e("    %l8 = index.rem %lane, %c8 : index")
+    for j in range(1, 8):
+        e(f"    %lj{j}c = index.constant {j} : index")
+        e(f"    %lj{j} = index.cmp eq, %l8, %lj{j}c : index")
+        e(f"    %pv{j} = scf.select %lj{j}, %ps{j}, {'%ps0' if j == 1 else '%%pv%d' % (j - 1)} : f32")
+    e("    %total_k = kernel.subgroup.reduce<addf> %pv7 {cluster_size = 8} : f32")
+    e("    %mean_k = scalar.divf %total_k, %head_dimf : f32")
+    e("    %me_k = scalar.addf %mean_k, %eps : f32")
+    e("    %inv_k = scalar.rsqrtf %me_k : f32")
+    e("    %k16_pre = index.mul %krow, %c1024 : index")
+    e("    %k16_raw = index.add %k16_pre, %hbkq : index")
+    e("    %k16_max = index.sub %k16_elems, %c256 : index")
+    e("    %k16_base = index.min %k16_raw, %k16_max : index")
+    e("    %p3b = index.add %lane, %c32 : index")
+    e("    %kw0 = view.load %kw_view[%lane] : view<[%c256]xf32> -> f32")
+    e("    %kw1 = view.load %kw_view[%p3b] : view<[%c256]xf32> -> f32")
+    e("    %kn0 = scalar.mulf %x0, %inv_k : f32")
+    e("    %kn0w = scalar.mulf %kn0, %kw0 : f32")
+    e("    %kn1 = scalar.mulf %x1, %inv_k : f32")
+    e("    %kn1w = scalar.mulf %kn1, %kw1 : f32")
+    e("    %p3i = index.cast %lane : index to i32")
+    e("    %p3if = scalar.sitofp %p3i : i32 to f32")
+    e("    %twop3 = scalar.mulf %two, %p3if : f32")
+    e("    %expo3 = scalar.divf %twop3, %rotary_dimf : f32")
+    e("    %invfreq3 = scalar.powf<afn> %theta, %expo3 : f32")
+    e("    %inv3 = scalar.divf %one, %invfreq3 : f32")
+    e("    %angle3 = scalar.mulf %curf, %inv3 : f32")
+    e("    %cv3 = scalar.cosf<afn> %angle3 : f32")
+    e("    %sv3 = scalar.sinf<afn> %angle3 : f32")
+    e("    %ka = scalar.mulf %kn0w, %cv3 : f32")
+    e("    %kb = scalar.mulf %kn1w, %sv3 : f32")
+    e("    %kr0 = scalar.subf %ka, %kb : f32")
+    e("    %kc2 = scalar.mulf %kn0w, %sv3 : f32")
+    e("    %kd = scalar.mulf %kn1w, %cv3 : f32")
+    e("    %kr1 = scalar.addf %kc2, %kd : f32")
+    e("    %ko0 = index.add %k16_base, %lane : index")
+    e("    %ko1 = index.add %k16_base, %p3b : index")
+    e("    %kr0h = scalar.fptrunc %kr0 : f32 to f16")
+    e("    %kr1h = scalar.fptrunc %kr1 : f32 to f16")
+    e("    view.store %kr0h, %k16_view[%ko0] : f16, view<[%k16_elems]xf16>")
+    e("    view.store %kr1h, %k16_view[%ko1] : f16, view<[%k16_elems]xf16>")
+    for j in range(2, 8):
+        e(f"    %i3_{j} = index.add %lane, %c{32 * j} : index")
+        e(f"    %w3_{j} = view.load %kw_view[%i3_{j}] : view<[%c256]xf32> -> f32")
+        e(f"    %n3_{j} = scalar.mulf %x{j}, %inv_k : f32")
+        e(f"    %n3w{j} = scalar.mulf %n3_{j}, %w3_{j} : f32")
+        e(f"    %ko3_{j} = index.add %k16_base, %i3_{j} : index")
+        e(f"    %n3h{j} = scalar.fptrunc %n3w{j} : f32 to f16")
+        e(f"    view.store %n3h{j}, %k16_view[%ko3_{j}] : f16, view<[%k16_elems]xf16>")
+    e("  } else {")
+    # V^T tile: [kv head][pool tiles][256 dims][16 keys], pool tile = ptab page * 16 + tile in page
+    e("    %vh = index.rem %vg, %c4 : index")
+    e("    %cur0r = index.add %start_pos, %vt0 : index")
+    e("    %cur0 = index.min %cur0r, %ctx_m1 : index")
+    e("    %vpglp = index.div %cur0, %c256 : index")
+    e("    %vpglpc = index.min %vpglp, %pglp1 : index")
+    e("    %vpgv = view.load %pt_view[%vpglpc] : view<[%pgnp]xi32> -> i32")
+    e("    %vpgu = index.cast %vpgv : i32 to index")
+    e("    %vpgz = index.max %vpgu, %c0 : index")
+    e("    %vpg = index.min %vpgz, %pglp1 : index")
+    e("    %vpgo = index.rem %cur0, %c256 : index")
+    e("    %vt_pt0 = index.mul %vpg, %c16 : index")
+    e("    %vt_lt = index.div %vpgo, %c16 : index")
+    e("    %vt_ptile = index.add %vt_pt0, %vt_lt : index")
+    e("    %vt_kt = index.mul %pgnp, %c16 : index")
+    e("    %vt_a = index.mul %vh, %vt_kt : index")
+    e("    %vt_b = index.add %vt_a, %vt_ptile : index")
+    e("    %vt_b0 = index.mul %vt_b, %c4096 : index")
+    e("    %vt_o0 = index.mul %tid, %c16 : index")
+    e("    %vt_o = index.add %vt_b0, %vt_o0 : index")
+    e("    %vt_m = index.sub %k16_elems, %c16 : index")
+    e("    %vt_d = index.min %vt_o, %vt_m : index")
+    e("    %vrow0 = index.mul %vt0, %c1024 : index")
+    e("    %vhd = index.mul %vh, %c256 : index")
+    e("    %vs0 = index.add %vrow0, %vhd : index")
+    e("    %vs = index.add %vs0, %tid : index")
+    for kk in range(16):
+        e(f"    %vk{kk}c = index.constant {kk * 1024} : index")
+        e(f"    %vk{kk}o = index.add %vs, %vk{kk}c : index")
+        e(f"    %vk{kk} = view.load %v_view[%vk{kk}o] : view<[%kv_elems]xf16> -> f16")
+    for h in range(2):
+        e(f"    %vq{h} = vector.from_elements {', '.join('%%vk%d' % (8 * h + i) for i in range(8))} : vector<8xf16>")
+    e("    %vt_d8 = index.add %vt_d, %c8 : index")
+    e("    vector.store %vq0, %v16_view[%vt_d] : vector<8xf16>, view<[%k16_elems]xf16>")
+    e("    vector.store %vq1, %v16_view[%vt_d8] : vector<8xf16>, view<[%k16_elems]xf16>")
+    e("  }")
+    e("  kernel.return")
+    e("}")
+    return "\n".join(L) + "\n"
+
+
 def rope_kv16(text):
     """yah_fused_qk_rope_batched reading f16 K / V (the GEMMs' f16 outputs, KV16): each load widened to f32"""
     for b in ("k", "v"):
@@ -456,6 +704,14 @@ RQOP = 160
 # runs in the attention's tail (polling at priority 0 beside it): attention start .. kres end -131 us per attention
 # layer. Same values. dispatch.txt "aov"
 AOV = True
+# ROPEW (with NQW and QNORM): the attention's k / v GEMMs also as iu4_kstorefw_* (per-token-tile counters) and RoPE as
+# ropew[_c<i>].hal (rope_wait: a workgroup polls its token tile's k and v counters), so no graph barrier separates
+# them: RoPE runs in the v GEMM's tail. Same values. dispatch.txt "ropew"
+ROPEW = True
+# ROPEKV (QNORM, KV16, vtrope): RoPE as rope_kv (wave-per-head K, coalesced V^T tiles), grid (3 * batch / 4).
+# Same values. dispatch.txt "ropekv"
+ROPEKV = True
+ROPEW_ON = False   # set by main
 # PNQP (with DNRING): the chained pnq also as pnq_abfrp (gen_rot.gen_pnqp: PNQP persistent workgroups walking the token
 # tiles in order), for the same reason: ssm_out's kres was queued behind its 12288 workgroups. 155 VGPRs: 6 workgroups
 # per WGP beside two kres workgroups
@@ -1546,7 +1802,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
@@ -1576,6 +1832,7 @@ def main():
     NQGU_ON = NQGU and GUOV_ON
     RQK_ON = RQK and NQOV_ON and GUOV_ON
     NQW_ON = NQW and a4 and not EMIT_HALF
+    ROPEW_ON = ROPEW and NQW_ON and QNORM and B % gen_rot.FLAG_TT == 0
     DNOV_ON = (DNOV and a4 and DNSPLIT == (40, 8) and DNVCONV and conv_tb_ok(B) and "qkv" not in NPU_SPLIT
                and not EMIT_HALF)   # the dnvconv conv (dn_vconv below)
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
@@ -1622,7 +1879,10 @@ def main():
                                 t.endswith(x) for t in tn for x in ("attn_k.weight", "attn_v.weight", "ssm_alpha.weight",
                                                                     "ssm_beta.weight", "attn_qkv.weight"))):
                             qkv = any(t.endswith("attn_qkv.weight") for t in tn)
+                            kv = ROPEW_ON and k == "kstore" and any(t.endswith(("attn_k.weight", "attn_v.weight")) for t in tn)
                             iu4_gemm(k, mt, kb, B, outdir, flag=qkv and DNOV_ON, wait=gen_rot.nq_flag_count(5120))
+                            if kv:   # ropew: also flagged (the plain one serves chunks without ropew)
+                                iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.nq_flag_count(5120))
             n += 1
             continue
         for k in kinds:
@@ -1951,6 +2211,7 @@ def main():
     paged_f16k = kv_paged and not kq8_on
     paged_f16v = kv_paged and not (vq4_on or vq8_on)
     rope_src = "yah_fused_qk_rope_batched_f32.loom"
+    ropew_src = os.path.join(tmp, "yah_fused_qk_rope_batched_wait.loom")
     if paged_f16k:   # RoPE writes K rows straight into the paged pool
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_kpaged.loom")
         open(rope_src, "w").write(rope_kpaged(open(os.path.join(E.LOOM, "yah_fused_qk_rope_batched_f32.loom")).read()))
@@ -1972,8 +2233,16 @@ def main():
     if gen_attn_fa.QNORM:
         text = open(rope_src).read()
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_konly.loom")
-        open(rope_src, "w").write(rope_konly(text))
+        konly = rope_konly(text)
+        kv = ROPEKV and KV16_ON and vtrope and B % 16 == 0
+        open(rope_src, "w").write(rope_kv(konly) if kv else konly)
         geom.append(("qnorm", 0, 0, 0))
+        if kv:
+            geom.append(("ropekv", 0, 0, 0))
+        if ROPEW_ON:
+            need = gen_gemm_iu4.flag_count(1024)
+            open(ropew_src, "w").write(rope_kv(konly, need) if kv else rope_wait(konly, need))
+            geom.append(("ropew", 0, 0, 0))
     elif gen_attn_fa.Q16:   # RoPE hands the attention f16(q / 16) (not with K4: its H256 rotates the f32 Q)
         text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_q16.loom")
@@ -2181,7 +2450,7 @@ def main():
         ("yah_unpack_qg_f32.loom", "unpack.hal",
          ["yah_unpack_qg.batch=%d" % B, "yah_unpack_qg.num_heads=24",
           "yah_unpack_qg.head_dim=256"]),
-        *[(rope_src, "rope.hal" if c == 0 else "rope_c%d.hal" % c, [
+        *[(src_, stem_ + ".hal" if c == 0 else stem_ + "_c%d.hal" % c, [
             "yah_fused_qk_rope_batched.start_pos=%d" % (c * B),
             "yah_fused_qk_rope_batched.batch=%d" % B,
             "yah_fused_qk_rope_batched.layer_idx=0",
@@ -2195,7 +2464,8 @@ def main():
             "yah_fused_qk_rope_batched.cache32_elems=%d" % KC,
             "yah_fused_qk_rope_batched.cache16_elems=%d" % (1024 * B if kv16_scratch else KC),
             *(["yah_fused_qk_rope_batched.cache_start=%d" % (c * B)] if kv16_scratch else []),
-            *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)],
+            *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)
+          for src_, stem_ in ((rope_src, "rope"),) + (((ropew_src, "ropew"),) if ROPEW_ON and gen_attn_fa.QNORM else ())],
         *([(qrot_src, "qrot.hal", ["yah_qrot.token_count=%d" % B])] if qrot_first < NCH else []),
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c),
            ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)]

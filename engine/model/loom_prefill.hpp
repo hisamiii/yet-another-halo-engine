@@ -683,6 +683,8 @@ class LoomPrefill {
     rqk_ = nqov_ && geom_.count("rqk") != 0;
     rqp_ = rqk_ && guov_ && geom_.count("rotqp_17408.hal") != 0;
     aov_ = rqk_ && geom_.count("aov") != 0 && std::ifstream(dir_ + "/wmmaf.hal").good();
+    ropew_ = geom_.count("ropew") != 0;
+    ropekv_ = geom_.count("ropekv") != 0;
     nqw_ = a4_ && geom_.count("nqw") != 0;
     dnring_ = nqw_ && rqk_ && geom_.count("dnring") != 0;
     if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
@@ -2190,8 +2192,12 @@ class LoomPrefill {
       iu4_untrack_ = 0;
       if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
       if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
-      RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
-      RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
+      // ropew: k / v flagged (per-token-tile counters), RoPE polls them instead of a graph barrier. Not when RoPE ends
+      // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
+      const bool rw = ropew_ && qnorm_ && n_ == B_ && tail_ != kNoRows;
+      if (rw) kv_cnt_[0] = FlagSlot(), kv_cnt_[1] = FlagSlot();
+      kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
+      kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
       iu4_wait_ = {}, iu4_untrack_ = 0;
     }
     if (!qg_fused)
@@ -2214,8 +2220,13 @@ class LoomPrefill {
                                          vtrope_ ? vtpool_l : hrx_buffer_ref_t{kv16_->handle, voff, kv16_layer_},
                                          {eps_->handle, 0, 4}};
       if (rope_kpaged_) b.push_back(ptab_ref_);
-      Dispatch(ChunkExe("rope", ci), "yah_fused_qk_rope_batched", qnorm_ ? kKvHeads : kHeads + kKvHeads, B_, 1, 256,
-               1, 1, b);
+      // ropew: the k-only RoPE reads k / v (untracked: it waits on their counters) and writes only the pools; its q /
+      // q_out / k_out bindings are unused
+      const bool rw = std::exchange(kv_flagged_, false) && rope_kpaged_ && vtrope_;
+      if (rw) b.push_back(kv_cnt_[0]), b.push_back(kv_cnt_[1]);
+      Dispatch(ChunkExe(rw ? "ropew" : "rope", ci), "yah_fused_qk_rope_batched",
+               ropekv_ ? 3 * B_ / 4 : qnorm_ ? kKvHeads : kHeads + kKvHeads, ropekv_ ? 1 : B_, 1, 256, 1, 1, b,
+               rw ? 0b11000000000 : ~std::uint64_t{0}, nullptr, rw ? 0b110000001100111 : 0);
     }
     if (hook) hook(ai, ci, koff, voff);
     const std::size_t q8off = std::size_t{ai} * kq_bytes_;
@@ -3104,6 +3115,9 @@ class LoomPrefill {
   // dispatch.txt "aov": chunk 0's attention as wmmaf.hal adds to attn_cnt_ (attn_flagged_), the attention-out rotq
   // (rotqopf_6144) waits on it without a graph barrier
   bool aov_ = false, attn_flagged_ = false;
+  // dispatch.txt "ropew": the attention's k / v GEMMs flagged (kv_cnt_), RoPE (ropew) waits on them
+  bool ropew_ = false, kv_flagged_ = false, ropekv_ = false;
+  hrx_buffer_ref_t kv_cnt_[2]{};
   hrx_buffer_ref_t attn_cnt_{};
   // dispatch.txt rqk: the deferred kres waits on its rotq's counters (rotqfo_17408 / rotqo_<k>, iu4_kresfw_*)
   bool rqk_ = false;
