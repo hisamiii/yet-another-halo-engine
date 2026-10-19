@@ -16,7 +16,8 @@ usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, m
   unpack, rope, argmax           hand-written kernels in loom/*.loom.
                                  rope's own cache write goes to a one-row dummy (max_context=1); dattn_kvappend writes the pools.
   grid_*.bin, ksigns_iq2xs.bin   the IQ tables (loom/tables)
-  decode.txt                     "ctx <max_context>", GEMV geometry and grids
+  decode.txt                     "ctx <max_context>", GEMV geometry and grids; "chain": the kernels are flag-chained
+                                 (tools/gen_chain.py: extra counter binding and wait / signal constants)
 """
 import json
 import os
@@ -30,6 +31,7 @@ EMIT = os.path.join(LOOM, "emit_hal.py")
 sys.path.insert(0, HERE)
 import emit_prefill as EP  # noqa: E402  (GGUF tensor table)
 import gen_decode_attn as DA  # noqa: E402
+import gen_chain  # noqa: E402
 import gen_decode_misc as DM  # noqa: E402
 import gen_gemv as GV  # noqa: E402
 import gen_kvq  # noqa: E402
@@ -40,6 +42,10 @@ NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
 RW = {k: (2, 4) for k in ("plain", "resid", "swiglu", "bands")}
 # The tuner's table (tune_table.py) may override them: {"rw": {"bands": [4, 4], ...}}. Every row is still reduced over
 # the 32 lanes of one wave, so R and W change no result bits.
+
+
+# Every kernel waits on its producer's counter instead of a queue barrier (gen_chain.py; decode.txt "chain").
+CHAIN = True
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):
@@ -53,6 +59,10 @@ def emit_src(text, name, outdir, configs=("nop=0",)):
 def emit_file(path, name, outdir, configs):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
+    if CHAIN:
+        src = os.path.join(tmp, name + ".chain.loom")
+        open(src, "w").write(gen_chain.chain(open(path).read()))
+        path = src
     r = subprocess.run([sys.executable, EMIT, path, tmp] + list(configs), capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit("emit failed for %s:\n%s%s" % (path, r.stdout[-3000:], r.stderr[-3000:]))
@@ -184,7 +194,7 @@ def main():
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\n" if rot else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
+        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\n" if rot else "") + ("chain - 0 0\n" if CHAIN else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + the decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))

@@ -188,6 +188,19 @@ Token halves (`LoomPrefill::RunDeltaNetHalves` / `RunAttentionHalves`, decoder-c
 
 Head: `rmsnorm`, `gv_plain` output (Q6_K, 248320 rows), `argmax`. The argmax writes the next token id into a device token stream; the next step's `embed` kernel (IQ4_XS row) reads it. Positions come from a device array. So steps are enqueued back to back and the host waits only after the prompt and at the end.
 
+Each step is submitted as soon as it is recorded (`LoomDevice::Flush`), so the GPU runs one step while the host records the next.
+
+### Flag-chained dispatch
+
+A stream dispatch ends with an ordering barrier: the next kernel cannot launch until the previous one has drained (~4 us per boundary, 773 dispatches per step). With decode.txt `chain` (the default, `tools/gen_chain.py`) every decode kernel instead waits on its producer's counter:
+
+- `gen_chain.chain` adds a counter buffer and three i32 push constants (wait slot, target count, own slot) to a 1-D kernel. Wave 0 polls the wait slot (acquire, device scope) until `(count - target) >= 0` as i32, then a workgroup barrier releases the other waves. At the end, lane 0 of every wave adds 1 to its own slot (release, device scope).
+- The host (`LoomDevice::ChainDispatch`) keeps a shadow of the 1024 monotonic counters: each dispatch waits on the previous dispatch's slot for its full count (workgroups x waves) and signals the next slot. Slot 0 is never signaled. kvappend and vappend share one slot (join): they write disjoint caches.
+- Workgroups launch in order, so a waiting workgroup never blocks its producer. Every dispatch waits on the one before it, so the order is still linear (no write-after-read hazards).
+- Any other stream op (copies, fills, graph launches) records the ordering barrier first (`LoomDevice::Order`).
+
+Logits are byte-identical to the barriered step, which is ~1.3 ms slower. Consumers launch during the producer's tail but wait for its last workgroup, so the GEMVs' DRAM ramp at the start of each kernel stays exposed (~2.6 ms per step in total).
+
 ### GEMV design
 
 `tools/gen_gemv.py`, one kernel per (kind, formats, rows, K). The arithmetic is HIP's sub-16 decode: a row is cut into 16-element sub-blocks; each decodes to 16 small unsigned integers, a scale and an offset, and the lane accumulates `scale * dot(q, x) - offset * sum(x)`.
@@ -254,7 +267,7 @@ A HAL set is a directory of compiled kernels plus one text file that records how
 ### Decode set: `tools/emit_decode.py <model.gguf> <dir> [max_context]`
 
 - `gv_<kind>_<fmts>_<M>_<K>.hal` and `gb_<fmts>_<Ms>_<K>.hal` (GEMVs and band GEMVs), `dattn_*` (attention), `rmsnorm`, `unpack`, `rope`, `deltanet_conv`, `embed`, `argmax`, and the IQ tables.
-- `decode.txt`: `ctx <T>`, `kv q <K bits> <V bits>` for quantized KV, `rw <kind> <R> <W>` (GEMV geometry), and `grid <hal> <workgroups> 0` for every GEMV kernel.
+- `decode.txt`: `ctx <T>`, `kv q <K bits> <V bits>` for quantized KV, `chain` (flag-chained kernels; sets without it run barriered), `rw <kind> <R> <W>` (GEMV geometry), and `grid <hal> <workgroups> 0` for every GEMV kernel.
 - To decode after a prefill, emit the decode set with the same context as the prefill pools and the same `YAH_KV`. The driver refuses a mismatch.
 
 ### From generator to HAL

@@ -77,6 +77,7 @@ class LoomDecoder {
           vbits_ = w;
         }  // "kv q KB VB"
         if (k == "rot") rot_ = true;   // MQ4 model: GEMV inputs are rotated (drot_*)
+        if (k == "chain") chain_ = true;   // every kernel waits on its producer's counter (tools/gen_chain.py)
       }
       const auto ok = [](std::uint32_t b) { return b == 4 || b == 8; };
       if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
@@ -249,9 +250,9 @@ class LoomDecoder {
         if (quant()) {
           Dispatch(Load("dattn_kappend_q"), 1, 1, 128,
                    {Ref(*kb_), st_.km[ai], st_.kq[ai], st_.ks[ai], st_.ptab, dposr});
-          gpu_.NoBarrierNext();  // independent of the K append
+          if (!chain_) gpu_.NoBarrierNext();  // independent of the K append
           Dispatch(Load("dattn_vappend_q"), kKvHeads, 1, 256,
-                   {Ref(*vb_), vopen_[ai], st_.vq[ai], st_.vs[ai], st_.ptab, dposr});
+                   {Ref(*vb_), vopen_[ai], st_.vq[ai], st_.vs[ai], st_.ptab, dposr}, true);
           Dispatch(Load("dattn_part_q"), kKvHeads, pos / 256 + 1, 256,
                    {Ref(*q_), st_.kq[ai], st_.ks[ai], st_.vq[ai], st_.vs[ai], vopen_[ai], st_.ptab, dposr, Ref(*acc_),
                     Ref(*ml_)});
@@ -403,13 +404,17 @@ class LoomDecoder {
   }
   // Workgroup size and binding count must match the compiled export.
   // Example: argmax is a 1024-lane kernel; with 32 lanes its per-wave LDS slots stay unwritten and it returns garbage.
+  // join: a chained kernel that runs beside the previous one (same producer).
   void Dispatch(LoomExecutable& e, std::uint32_t gx, std::uint32_t gy, std::uint32_t wg,
-                const std::vector<hrx_buffer_ref_t>& b) {
+                const std::vector<hrx_buffer_ref_t>& b, bool join = false) {
     const std::uint32_t cw = e.WorkgroupSize(0), cb = e.BindingCount(0);
-    if ((cw && cw != wg) || (cb && cb != b.size()))
+    if ((cw && cw != wg) || (cb && cb != b.size() + chain_))
       throw LoomError("dispatch mismatch: workgroup " + std::to_string(wg) + " vs compiled " + std::to_string(cw) +
                       ", bindings " + std::to_string(b.size()) + " vs " + std::to_string(cb));
-    gpu_.Dispatch(e, 0, LoomDevice::Config(gx, gy, 1, wg, 1, 1), nullptr, 0, b.data(), b.size());
+    if (chain_)
+      gpu_.ChainDispatch(e, LoomDevice::Config(gx, gy, 1, wg, 1, 1), b, join);
+    else
+      gpu_.Dispatch(e, 0, LoomDevice::Config(gx, gy, 1, wg, 1, 1), nullptr, 0, b.data(), b.size());
   }
   // GEMV kernel names and weight footprints follow tools/gen_gemv.py.
   void Gemv(const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y) {
@@ -526,6 +531,7 @@ class LoomDecoder {
   std::vector<hrx_buffer_ref_t> vopen_;  // quantized V: each layer's open tile, [1024][16] f16
   bool trace_ = false;
   bool rot_ = false;       // decode.txt "rot"
+  bool chain_ = false;     // decode.txt "chain"
   bool sampling_ = false;  // SetSampling
   hrx_buffer_t cs_[2] = {nullptr, nullptr};  // conv state ping-pong
   int cs_cur_ = 0;

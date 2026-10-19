@@ -232,6 +232,7 @@ class LoomDevice {
     return buffer;
   }
   void Copy(const hrx_buffer_ref_t& src, const hrx_buffer_ref_t& dst) {
+    Order();
     LoomCheck(hrx_stream_copy_buffer(stream_, src.buffer, src.offset, dst.buffer, dst.offset, src.length),
               "hrx_stream_copy_buffer");
   }
@@ -252,10 +253,12 @@ class LoomDevice {
 
   // Fill the whole buffer with a 32-bit pattern, in stream order.
   void Fill(const LoomBuffer& buffer, uint32_t pattern) {
+    Order();
     LoomCheck(hrx_stream_fill_buffer(stream_, buffer.handle, 0, buffer.size, &pattern, 4), "hrx_stream_fill_buffer");
   }
   // An event after the work queued so far (submitting it); Wait blocks until the GPU has run that work.
   LoomEvent Mark() {
+    Order();
     LoomEvent e;
     LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_DISABLE_TIMING, &e.handle), "hrx_event_create");
     LoomCheck(hrx_event_record(e.handle, stream_), "hrx_event_record");
@@ -264,6 +267,7 @@ class LoomDevice {
   void Wait(const LoomEvent& e) { LoomCheck(hrx_event_synchronize(e.handle), "hrx_event_synchronize"); }
   // Host data into the buffer in stream order (copied now; at most 64 KB).
   void Update(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
+    Order();
     LoomCheck(hrx_stream_update_buffer(stream_, host, bytes, buffer.handle, offset), "hrx_stream_update_buffer");
   }
   void H2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
@@ -275,6 +279,44 @@ class LoomDevice {
 
   void Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
                 const void* constants, size_t constants_size, const hrx_buffer_ref_t* bindings, size_t binding_count) {
+    Order();
+    DispatchRaw(executable, ordinal, config, constants, constants_size, bindings, binding_count);
+  }
+
+  // Flag-chained dispatch (tools/gen_chain.py kernels, bindings + the counter buffer, constants wait slot, need,
+  // own slot): the kernel waits on the previous chained dispatch's counter instead of a queue barrier, so it launches
+  // while its producer drains. join: run beside the previous dispatch instead (same producer, same counter slot).
+  void ChainDispatch(const LoomExecutable& executable, const hrx_dispatch_config_t& config,
+                     std::vector<hrx_buffer_ref_t> bindings, bool join = false) {
+    if (!chain_cnt_.handle) {
+      chain_cnt_ = Allocate(kChainSlots * 4);
+      std::vector<uint32_t> z(kChainSlots, 0);
+      H2D(chain_cnt_, z.data(), z.size() * 4);
+      chain_shadow_.assign(kChainSlots, 0);
+    }
+    if (!join) {
+      chain_wait_ = chain_slot_;
+      chain_need_ = chain_shadow_[chain_slot_];
+      chain_slot_ = chain_slot_ % (kChainSlots - 1) + 1;   // slot 0 is never signaled: a chain start waits on it
+    }
+    const uint32_t waves = (config.workgroup_size[0] + 31) / 32;
+    chain_shadow_[chain_slot_] += config.workgroup_count[0] * config.workgroup_count[1] * config.workgroup_count[2] * waves;
+    bindings.push_back({chain_cnt_.handle, 0, chain_cnt_.size});
+    const uint32_t c[3] = {chain_wait_, chain_need_, chain_slot_};
+    next_flags_ = 1u << 2;
+    DispatchRaw(executable, 0, config, c, sizeof c, bindings.data(), bindings.size());
+    chain_open_ = no_barrier_ok_;
+  }
+  // Orders what follows after every chained dispatch so far, and starts a new chain.
+  void Order() {
+    if (chain_open_) LoomCheck(hrx_stream_execution_barrier(stream_), "hrx_stream_execution_barrier");
+    chain_open_ = false;
+    chain_slot_ = 0;
+  }
+
+ private:
+  void DispatchRaw(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
+                   const void* constants, size_t constants_size, const hrx_buffer_ref_t* bindings, size_t binding_count) {
     const uint32_t flags = no_barrier_ok_ ? next_flags_ : 0;
     next_flags_ = 0;
     hrx_status_t status = hrx_stream_dispatch(stream_, executable.handle, ordinal, &config, constants, constants_size,
@@ -289,6 +331,7 @@ class LoomDevice {
     LoomCheck(status, "hrx_stream_dispatch");
   }
 
+ public:
   // The next Dispatch may overlap the one after it (no trailing ordering barrier). Needs the local libhrx flag
   // HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER (bit 2, not upstream); on stock HRX dispatches stay ordered.
   void NoBarrierNext() { next_flags_ = 1u << 2; }
@@ -319,7 +362,10 @@ class LoomDevice {
     LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_NONE, &event.handle), "hrx_event_create");
     return event;
   }
-  void Record(LoomEvent& event) { LoomCheck(hrx_event_record(event.handle, stream_), "hrx_event_record"); }
+  void Record(LoomEvent& event) {
+    Order();
+    LoomCheck(hrx_event_record(event.handle, stream_), "hrx_event_record");
+  }
   float Elapsed(LoomEvent& start, LoomEvent& stop) {
     float ms = 0.0f;
     LoomCheck(hrx_event_elapsed_time(start.handle, stop.handle, &ms), "hrx_event_elapsed_time");
@@ -344,6 +390,11 @@ class LoomDevice {
   hrx_stream_t stream_ = nullptr;
   uint32_t next_flags_ = 0;
   bool no_barrier_ok_ = true;
+  static constexpr uint32_t kChainSlots = 1024;   // gen_chain.CHAIN_SLOTS
+  LoomBuffer chain_cnt_;
+  std::vector<uint32_t> chain_shadow_;   // what each counter reads once the chained dispatches so far have run
+  uint32_t chain_slot_ = 0, chain_wait_ = 0, chain_need_ = 0;
+  bool chain_open_ = false;   // the last dispatch has no trailing barrier
   long sleep_us_ = 0;
   bool initialized_ = false;
   bool profiling_ = false;
@@ -445,6 +496,7 @@ class LoomGraph {
   // Queues the graph on the device stream, after everything queued before (instantiates it first if needed).
   void Launch() {
     Instantiate();
+    gpu_.Order();
     LoomCheck(hrx_graph_exec_launch(exec_, gpu_.stream()), "hrx_graph_exec_launch");
   }
 
