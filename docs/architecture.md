@@ -204,6 +204,9 @@ A stream dispatch ends with an ordering barrier: the next kernel cannot launch u
 
 Logits are byte-identical to the barriered step, which is ~1.3 ms slower. Consumers launch during the producer's tail but wait for its last workgroup, so the GEMVs' DRAM ramp at the start of each kernel stays exposed (~2.6 ms per step in total).
 
+- Peeled GEMV start (`emit_decode.PEEL`, `gen_gemv` peel): a chained GEMV runs its first K iteration before the loop, split by dataflow at a `// chain.wait` marker. The weight loads and their decode, which do not read x, issue before the wait, and the x loads and the accumulation come after it, so the first weights arrive during the producer's tail. Band GEMVs have one marker per band branch (`gen_chain` gives each its own wait). The ops are the same, so the output is bit-identical.
+- Greedy argmax in the output GEMV (decode.txt `amax`, `gv_plainam_*`, `gen_gemv.amax_tail`): each workgroup reduces its rows' keys (order-preserving bits of the logit, then the inverted row, as a u64; NaN and +-inf skipped, -0 as +0) through LDS and takes one atomic max. The last workgroup by count swaps the key and the count back to 0 and stores the row as the token. This matches `yah_argmax_f32` (ties keep the lowest index) without its single-workgroup pass over the logits. Sampled steps still run the output GEMV without it and then `gen_sample`.
+
 ### GEMV design
 
 `tools/gen_gemv.py`, one kernel per (kind, formats, rows, K). The arithmetic is HIP's sub-16 decode: a row is cut into 16-element sub-blocks; each decodes to 16 small unsigned integers, a scale and an offset, and the lane accumulates `scale * dot(q, x) - offset * sum(x)`.
@@ -270,7 +273,7 @@ A HAL set is a directory of compiled kernels plus one text file that records how
 ### Decode set: `tools/emit_decode.py <model.gguf> <dir> [max_context]`
 
 - `gv_<kind>_<fmts>_<M>_<K>.hal` and `gb_<fmts>_<Ms>_<K>.hal` (GEMVs and band GEMVs), `dattn_*` (attention), `rmsnorm`, `unpack`, `rope`, `deltanet_conv`, `embed`, `argmax`, and the IQ tables.
-- `decode.txt`: `ctx <T>`, `kv q <K bits> <V bits>` for quantized KV, `chain` (flag-chained kernels; sets without it run barriered), `rot` with `normrot`, `swrot` (MQ4 rotations and where they run), `rw <kind> <R> <W>` (GEMV geometry), and `grid <hal> <workgroups> 0` for every GEMV kernel.
+- `decode.txt`: `ctx <T>`, `kv q <K bits> <V bits>` for quantized KV, `chain` (flag-chained kernels; sets without it run barriered), `rot` with `normrot`, `swrot` (MQ4 rotations and where they run), `amax` (argmax in the output GEMV), `rw <kind> <R> <W>` (GEMV geometry), and `grid <hal> <workgroups> 0` for every GEMV kernel.
 - To decode after a prefill, emit the decode set with the same context as the prefill pools and the same `YAH_KV`. The driver refuses a mismatch.
 
 ### From generator to HAL

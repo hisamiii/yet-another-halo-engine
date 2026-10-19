@@ -9,7 +9,7 @@
 //           -> recurrent:      attn_qkv / attn_gate / ssm_alpha / ssm_beta GEMV,
 //                              conv + DeltaNet in one kernel (gated norm inside), ssm_out GEMV += hidden
 //   rmsnorm -> ffn_gate|ffn_up SwiGLU GEMV -> ffn_down GEMV += hidden
-// Head: rmsnorm -> output GEMV -> argmax into a device token stream.
+// Head: rmsnorm -> output GEMV -> argmax into a device token stream (decode.txt "amax": inside the output GEMV).
 // MQ4 sets (decode.txt "rot"): the GEMV inputs are rotated; "normrot" / "swrot" do it inside the norm and the
 // SwiGLU GEMV instead of separate drot_* dispatches.
 // The next step's embedding kernel (IQ4_XS token_embd) reads that stream: steps queue back to back, no host round trip.
@@ -79,9 +79,10 @@ class LoomDecoder {
           vbits_ = w;
         }  // "kv q KB VB"
         if (k == "rot") rot_ = true;   // MQ4 model: GEMV inputs are rotated (drot_*)
-        if (k == "chain") chain_ = true;
+        if (k == "chain") chain_ = true;       // every kernel waits on its producer's counter (tools/gen_chain.py)
         if (k == "normrot") normrot_ = true;   // rmsnorm + rotation in one kernel (drot_norm_*)
-        if (k == "swrot") swrot_ = true;       // the SwiGLU GEMV rotates its output for ffn_down (gv_swiglurot_*)   // every kernel waits on its producer's counter (tools/gen_chain.py)
+        if (k == "swrot") swrot_ = true;       // the SwiGLU GEMV rotates its output for ffn_down (gv_swiglurot_*)
+        if (k == "amax") amax_ = true;         // the output GEMV takes the greedy argmax (gv_plainam_*)
       }
       const auto ok = [](std::uint32_t b) { return b == 4 || b == 8; };
       if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
@@ -119,6 +120,7 @@ class LoomDecoder {
       if (swrot_) swcnt_ = &Alloc(kFfn / 256 * 4);   // monotonic per-block counters, never reset
     }
     logits_ = &Alloc(std::size_t{kVocab} * 4);
+    if (amax_) amaxk_ = &Alloc(16);   // u64 max key + i32 workgroup count, both back to 0 after each step
     sink_ = &Alloc(4);
     sparams_ = &Alloc(16);
     toks_ = &Alloc((std::size_t{T_} + 1) * 4);
@@ -308,13 +310,15 @@ class LoomDecoder {
       Rmsnorm(*hidden_, "output_norm.weight", *normed_);
       if (rot_) Dispatch(Load("drot_head"), kHidden / 1024, 1, 64, {Ref(*normed_), Ref(*rot_signs_)});
     }
-    Gemv("plain", {"output.weight"}, *normed_, *logits_);
+    const bool sample = sampling_ && pos + 1 >= keep_from;
+    const hrx_buffer_ref_t tok = pos + 1 >= keep_from ? TokenRef(pos + 1) : Ref(*sink_);
+    Gemv("plain", {"output.weight"}, *normed_, *logits_, {}, amax_ && !sample ? &tok : nullptr);
     Tr("logits", 99, *logits_, kVocab);
     cs_cur_ = 1 - cs_cur_;
-    if (sampling_ && pos + 1 >= keep_from)
+    if (sample)
       Sample(Ref(*logits_), pos, TokenRef(pos + 1));
-    else
-      Dispatch(Load("argmax"), 1, 1, 1024, {Ref(*logits_), pos + 1 >= keep_from ? TokenRef(pos + 1) : Ref(*sink_)});
+    else if (!amax_)
+      Dispatch(Load("argmax"), 1, 1, 1024, {Ref(*logits_), tok});
   }
 
   // From now on the steps whose token is kept sample it (gen_decode_misc.gen_sample: softmax(logits / t) cut to its
@@ -427,9 +431,10 @@ class LoomDecoder {
   }
   // GEMV kernel names and weight footprints follow tools/gen_gemv.py.
   // rot_w: the GEMV also rotates y for weight rot_w's GEMV (gen_gemv rot; swiglu only)
+  // rot_w: the SwiGLU output rotated for that weight (gv_swiglurot_*); tok: the argmax of y stored there (gv_plainam_*).
   void Gemv(const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y,
-            const std::string& rot_w = {}) {
-    std::string name = std::string("gv_") + kind + (rot_w.empty() ? "" : "rot");
+            const std::string& rot_w = {}, const hrx_buffer_ref_t* tok = nullptr) {
+    std::string name = std::string("gv_") + kind + (rot_w.empty() ? "" : "rot") + (tok ? "am" : "");
     std::uint32_t tbits = 0, M = 0, K = 0;
     std::vector<hrx_buffer_ref_t> b;
     for (const auto& w : ws) {
@@ -454,6 +459,10 @@ class LoomDecoder {
       b.push_back(TRef(rot_w + ".awq"));
       b.push_back(Ref(*rot_signs_));
       b.push_back(Ref(*swcnt_));
+    }
+    if (tok) {
+      b.push_back(Ref(*amaxk_));
+      b.push_back(*tok);
     }
     LoomExecutable& exe = Load(name);
     auto [R, W] = Rw(kind);
@@ -561,6 +570,7 @@ class LoomDecoder {
   bool chain_ = false;     // decode.txt "chain"
   bool normrot_ = false;   // decode.txt "normrot"
   bool swrot_ = false;     // decode.txt "swrot"
+  bool amax_ = false;      // decode.txt "amax"
   bool sampling_ = false;  // SetSampling
   hrx_buffer_t cs_[2] = {nullptr, nullptr};  // conv state ping-pong
   int cs_cur_ = 0;
@@ -571,7 +581,7 @@ class LoomDecoder {
   std::vector<hrx_buffer_ref_t> tabs_;
   LoomDecoderState st_;
   LoomBuffer *hidden_, *normed_, *qg_, *q_, *gate_, *kb_, *vb_, *aout_, *qkv_, *alpha_, *beta_, *ssmout_, *ffnact_,
-      *logits_, *sink_, *sparams_, *toks_, *posarr_, *eps_, *c32a_, *c32b_, *c16a_, *c16b_, *acc_, *ml_;
+      *logits_, *amaxk_ = nullptr, *sink_, *sparams_, *toks_, *posarr_, *eps_, *c32a_, *c32b_, *c16a_, *c16b_, *acc_, *ml_;
   LoomBuffer *rot_signs_ = nullptr, *rotx_ = nullptr, *swcnt_ = nullptr;
 };
 

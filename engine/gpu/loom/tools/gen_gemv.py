@@ -82,7 +82,7 @@ class E:
         return n
 
     def cs(self, v, ty="i32"):  # scalar constant
-        t = {"i32": "w", "i8": "b", "f32": "f"}[ty]
+        t = {"i32": "w", "i8": "b", "f32": "f", "i64": "q"}[ty]
         nm = f"%c{t}{str(v).replace('-', 'm').replace('.', 'p')}"
         self.consts[nm] = f"  {nm} = scalar.constant {v} : {ty}"
         return nm
@@ -94,9 +94,12 @@ class E:
         return nm
 
 
-def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=False):
+def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=False, peel=0, amax=False):
     """rot: y feeds an MQ4 GEMV, so rotate it in place (gen_rot.gen in place, f32: y / awq, signs, H256): the last
-    workgroup to finish each 256-row block (its monotonic counter, bindings awq, signs, cnt after y) rotates it."""
+    workgroup to finish each 256-row block (its monotonic counter, bindings awq, signs, cnt after y) rotates it.
+    amax (plain): also the argmax of y into a token (bindings ak: u64 key + i32 counter, tok: i32 after y; amax_tail).
+    peel: the first peel K iterations run before the loop, their weight loads and decode (which do not read x) ahead
+    of a "// chain.wait" marker (gen_chain puts the producer wait there), the x part after it (the same ops)."""
     assert kind in ("plain", "resid", "swiglu")
     assert len(fmts) == (2 if kind == "swiglu" else 1)
     assert K % 512 == 0, "K / 16 sub-blocks must split evenly over 32 lanes"
@@ -679,6 +682,8 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             nxt.append(f"%{p}n")
     b(f"    scf.yield {', '.join(nxt)} : {', '.join(['f32'] * len(accs))}")
     b("  }")
+    if peel:
+        peel_loop(body, e, res, accs, inits, nxt, peel)
     # butterfly reduction over the 32 lanes: xor 16, 8, 4, 2, 1
     tot = []
     for j in range(len(accs)):
@@ -718,6 +723,9 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
     b("  }")
     if rot:
         rot_tail(b, e, M, rows_wg)
+    if amax:
+        assert kind == "plain"
+        amax_tail(b, e, M, R, W, tot)
     if _parts is not None:               # gen_bands: hand back the body, constants stay in e
         _parts.update(body=body, wnb=wnb, tabs=tabs)
         return None
@@ -736,6 +744,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
     o("  kernel.launch.config workgroups(%nwg, %u1, %u1) workgroup_size(%wgs, %u1, %u1) : index")
     params = [f"%w{i}: buffer" for i in range(nw)] + [f"%{t}: buffer" for t in tabs] + ["%x: buffer", "%y: buffer"]
     params += ["%rawq: buffer", "%rsg: buffer", "%rcnt: buffer"] if rot else []
+    params += ["%ak: buffer", "%atok: buffer"] if amax else []
     o(f"}} launch({', '.join(params)}) {{")
     o("  %base = index.constant 0 : offset")
     names = [p.split(":")[0] for p in params]
@@ -749,6 +758,10 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
         o(f"  %t_{t} = buffer.view %{t}_na[%base] : buffer -> view<{n}x{ty}>")
     o(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{K}xf32>")
     o(f"  %yv = buffer.view %y_na[%base] : buffer -> view<{M}xf32>")
+    if amax:
+        o("  %akv = buffer.view %ak_na[%base] : buffer -> view<2xi64>")
+        o("  %acv = buffer.view %ak_na[%base] : buffer -> view<4xi32>")
+        o("  %atv = buffer.view %atok_na[%base] : buffer -> view<1xi32>")
     if rot:
         o(f"  %rav = buffer.view %rawq_na[%base] : buffer -> view<{M}xf32>")
         o("  %rsv = buffer.view %rsg_na[%base] : buffer -> view<512xf32>")
@@ -767,6 +780,118 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
     return "\n".join(out) + "\n"
 
 
+def peel_loop(body, e, res, accs, inits, nxt, peel):
+    """gen peel: copies of the loop body for t = 0 .. peel - 1 before the loop, split by dataflow: lines that read x
+    (the %xv loads and everything after them, the accumulators) go after the chain.wait marker."""
+    fi = next(i for i, l in enumerate(body) if l.startswith(f"  {', '.join(res)} = scf.for %t = "))
+    yi = next(i for i in range(fi, len(body)) if body[i].strip().startswith("scf.yield"))
+    inner = body[fi + 1:yi]
+    defre = re.compile(r"^\s*(%\w+(?:\s*,\s*%\w+)*)\s*=")
+
+    def outs(l):
+        m = defre.match(l)
+        return set(n.strip() for n in m.group(1).split(",")) if m else set()
+
+    defs = set().union(*(outs(l) for l in inner))
+    pre, post, prev = [], [], ["%zf"] * len(accs)
+    for k in range(peel):
+        ren = {n: f"{n}_p{k}" for n in defs}
+        ren["%t"] = e.ci(k)
+        ren.update(dict(zip(accs, prev)))
+        dep = set(prev) - {"%zf"} | {"%xv"} | set(accs)
+        early, late = [], []
+        for l in inner:
+            out = outs(l)
+            nl = re.sub(r"%\w+", lambda mm: ren.get(mm.group(0), mm.group(0)), l).replace("    ", "  ", 1)
+            if (set(re.findall(r"%\w+", l)) - out) & dep:
+                dep |= out
+                late.append(nl)
+            else:
+                early.append(nl)
+        pre += early
+        post += late
+        prev = [ren[n] for n in nxt]
+    loop = body[fi].replace(f"[{e.ci(0)} to", f"[{e.ci(peel)} to").replace(
+        f"({inits})", "(" + ", ".join(f"{a} = {v} : f32" for a, v in zip(accs, prev)) + ")")
+    body[fi:fi + 1] = pre + ["  // chain.wait"] + post + [loop]
+
+
+def amax_tail(b, e, M, R, W, tot):
+    """gen amax: yah_argmax_f32's result (NaN and +-inf skipped, ties keep the lowest index, -0 = +0) without its pass.
+    Each row's key is (order-preserving bits of y, ~row) as a u64 (skipped rows 0); the wave max goes through LDS to
+    tid 0, which takes an atomic max into ak[0] and counts the workgroup in ak[2]. The last workgroup swaps the key
+    back to 0, resets the count and stores the key's row (M if every row was skipped) to tok[0]."""
+    b(f"  %akl = index.constant {8 * W} : offset")
+    b("  %akp = buffer.alloca<workgroup> align(16) %akl : buffer")
+    b(f"  %akw = buffer.view %akp[%base] : buffer -> view<{W}xi64>")
+    b("  %amlo = scalar.constant -3.0000000000000001e+38 : f32")   # yah_argmax_f32's bounds
+    b("  %amhi = scalar.constant 3.0000000000000001e+38 : f32")
+    keys = []
+    for r in range(R):
+        p = f"%am{r}"
+        b(f"  {p}lo = scalar.cmpf oge, {tot[r]}, %amlo : f32")
+        b(f"  {p}hi = scalar.cmpf ole, {tot[r]}, %amhi : f32")
+        b(f"  {p}ok = scalar.andi {p}lo, {p}hi : i1")
+        b(f"  {p}b = scalar.bitcast {tot[r]} : f32 to i32")
+        b(f"  {p}s = scalar.shrsi {p}b, {e.cs(31)} : i32")
+        b(f"  {p}m = scalar.ori {p}s, {e.cs(-2147483648)} : i32")
+        b(f"  {p}u0 = scalar.xori {p}b, {p}m : i32")             # negative: ~bits, else bits | sign
+        b(f"  {p}nz = scalar.cmpi eq, {p}u0, {e.cs(2147483647)} : i32")   # -0 sorts as +0
+        b(f"  {p}u = scf.if {p}nz -> (i32) {{")
+        b(f"    scf.yield {e.cs(-2147483648)} : i32")
+        b("  } else {")
+        b(f"    scf.yield {p}u0 : i32")
+        b("  }")
+        b(f"  {p}hw = scalar.extui {p}u : i32 to i64")
+        b(f"  {p}h = scalar.shli {p}hw, {e.cs(32, 'i64')} : i64")
+        b(f"  {p}row = index.add %row0, {e.ci(r)} : index")
+        b(f"  {p}ri = index.cast {p}row : index to i32")
+        b(f"  {p}rn = scalar.xori {p}ri, {e.cs(-1)} : i32")
+        b(f"  {p}lw = scalar.extui {p}rn : i32 to i64")
+        b(f"  {p}k0 = scalar.ori {p}h, {p}lw : i64")
+        b(f"  {p}k = scf.if {p}ok -> (i64) {{")
+        b(f"    scf.yield {p}k0 : i64")
+        b("  } else {")
+        b(f"    scf.yield {e.cs(0, 'i64')} : i64")
+        b("  }")
+        keys.append(f"{p}k")
+    wk = keys[0]
+    for i, k in enumerate(keys[1:]):
+        b(f"  %amw{i} = scalar.maxui {wk}, {k} : i64")
+        wk = f"%amw{i}"
+    b("  scf.if %is0 {")
+    b(f"    view.store {wk}, %akw[%wave] : i64, view<{W}xi64>")
+    b("  }")
+    b("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    b(f"  %amt0 = index.cmp eq, %tid, {e.ci(0)} : index")
+    b("  scf.if %amt0 {")
+    gk = None
+    for w in range(W):
+        b(f"    %amg{w} = view.load %akw[{e.ci(w)}] : view<{W}xi64> -> i64")
+        if gk:
+            b(f"    %amx{w} = scalar.maxui {gk}, %amg{w} : i64")
+            gk = f"%amx{w}"
+        else:
+            gk = f"%amg{w}"
+    b(f"    view.atomic.reduce<maxui> {gk}, %akv[{e.ci(0)}] {{ordering = relaxed, scope = device}} : i64, view<2xi64>")
+    b(f"    %amo = view.atomic.rmw<addi> {e.cs(1)}, %acv[{e.ci(2)}] {{ordering = acq_rel, scope = device}} : i32, view<4xi32> -> i32")
+    b(f"    %amlast = scalar.cmpi eq, %amo, {e.cs(M // (R * W) - 1)} : i32")
+    b("    scf.if %amlast {")
+    b(f"      %amk = view.atomic.rmw<xchgi> {e.cs(0, 'i64')}, %akv[{e.ci(0)}] {{ordering = acq_rel, scope = device}} : i64, view<2xi64> -> i64")
+    b(f"      %amc = view.atomic.rmw<xchgi> {e.cs(0)}, %acv[{e.ci(2)}] {{ordering = relaxed, scope = device}} : i32, view<4xi32> -> i32")
+    b("      %amkl = scalar.trunci %amk : i64 to i32")
+    b(f"      %amr = scalar.xori %amkl, {e.cs(-1)} : i32")
+    b(f"      %amnone = scalar.cmpi eq, %amk, {e.cs(0, 'i64')} : i64")
+    b("      %amtok = scf.if %amnone -> (i32) {")
+    b(f"        scf.yield {e.cs(M)} : i32")
+    b("      } else {")
+    b("        scf.yield %amr : i32")
+    b("      }")
+    b(f"      view.store %amtok, %atv[{e.ci(0)}] : i32, view<1xi32>")
+    b("    }")
+    b("  }")
+
+
 def rot_tail(b, e, M, rows_wg):
     """gen rot: the block's last workgroup (gen_rot.last_arriver) rotates it in place (gen_rot.block_rot_post)."""
     assert M % 256 == 0 and 256 % rows_wg == 0
@@ -779,7 +904,7 @@ def rot_tail(b, e, M, rows_wg):
 _SHARED = re.compile(r"%(c[iwbf]\w*|ws\w*|sv\w*|kvtu|t_\w+|xv)$")
 
 
-def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv"):
+def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv", peel=0):
     """Several plain GEMVs over one input in one dispatch; workgroup ranges map to bands.
 
     Band b is fmts[b] with Ms[b] rows, written to its own output.
@@ -792,7 +917,7 @@ def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv"):
     for bi, (f, M) in enumerate(zip(fmts, Ms)):
         assert M % rows_wg == 0, (f, M)
         parts = {}
-        gen("plain", [f], M, K, R, W, _e=e, _parts=parts)
+        gen("plain", [f], M, K, R, W, _e=e, _parts=parts, peel=peel)
         pre = f"b{bi}_"
         def ren(m):
             nm = m.group(0)

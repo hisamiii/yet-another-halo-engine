@@ -46,6 +46,10 @@ RW = {k: (2, 4) for k in ("plain", "resid", "swiglu", "bands")}
 
 # Every kernel waits on its producer's counter instead of a queue barrier (gen_chain.py; decode.txt "chain").
 CHAIN = True
+# Chained GEMVs load and decode their first PEEL K iterations' weights before the wait (gen_gemv peel).
+PEEL = 1
+# The output GEMV also takes the greedy argmax (gen_gemv amax, decode.txt "amax"), instead of the argmax kernel.
+AMAX = True
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):
@@ -153,17 +157,23 @@ def main():
     # Exact launch grid of every GEMV kernel; the decoder refuses any other.
     # Loom may drop row clamps it proves redundant for this grid, so a larger grid reads out of bounds and can hang the GPU.
     grids = {}
+    vocab = next(int(d[1]) for nm, d, _ in EP.parse(model) if nm == "output.weight")
     for name, (kind, fmts, M, K) in sorted(gs.items()):
         R, W = RW[kind]
-        emit_src(GV.gen(kind, fmts, M, K, R, W), name, outdir)
+        peel = PEEL if CHAIN else 0
+        emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel), name, outdir)
         grids[name] = M // GV.rows_per_wg(R, W)
         if rot and kind == "swiglu":   # also rotating its output for ffn_down (decode.txt "swrot")
             rname = name.replace("gv_swiglu_", "gv_swiglurot_")
-            emit_src(GV.gen(kind, fmts, M, K, R, W, rot=True), rname, outdir)
+            emit_src(GV.gen(kind, fmts, M, K, R, W, rot=True, peel=peel), rname, outdir)
             grids[rname] = grids[name]
+        if AMAX and CHAIN and kind == "plain" and M == vocab:   # the output GEMV
+            aname = name.replace("gv_plain_", "gv_plainam_")
+            emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, amax=True), aname, outdir)
+            grids[aname] = grids[name]
     bs = bands_set(model)
     for name, (fmts, Ms, K) in sorted(bs.items()):
-        emit_src(GV.gen_bands(fmts, Ms, K, *RW["bands"]), name, outdir)
+        emit_src(GV.gen_bands(fmts, Ms, K, *RW["bands"], peel=PEEL if CHAIN else 0), name, outdir)
         grids[name] = sum(Ms) // GV.rows_per_wg(*RW["bands"])
     for which in ("kvappend", "part", "reduce"):
         emit_src(DA.gen(which, T), "dattn_" + which, outdir)
@@ -201,7 +211,7 @@ def main():
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\nnormrot - 0 0\nswrot - 0 0\n" if rot else "") + ("chain - 0 0\n" if CHAIN else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
+        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\nnormrot - 0 0\nswrot - 0 0\n" if rot else "") + ("chain - 0 0\n" if CHAIN else "") + ("amax - 0 0\n" if AMAX and CHAIN else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + the decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))

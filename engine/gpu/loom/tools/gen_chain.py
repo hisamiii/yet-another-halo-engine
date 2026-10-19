@@ -26,6 +26,10 @@ def chain(src):
     sig = lines[li[0]]
     assert sig.endswith(") {")
     lines[li[0]] = sig[:-3] + ", %ch_cnt: buffer, %ch_ws: i32, %ch_need: i32, %ch_ss: i32) {"
+    # gen_gemv peel: the wait goes at its "// chain.wait" markers (one per band branch), after the work that does not
+    # read the producer
+    wi = [i for i, l in enumerate(lines) if l.strip() == "// chain.wait"]
+    assert all(li[0] < w < ri[0] for w in wi)
     CV = f"view<{CHAIN_SLOTS}xi32>"
     pro = [
         "  %ch_base = index.constant 0 : offset",
@@ -67,5 +71,15 @@ def chain(src):
         f"  view.atomic.reduce<addi> %ch_one, %ch_cv[%ch_ssi] {{ordering = release, scope = device}} : i32, {CV}",
         "}",
     ]
-    out = lines[: li[0] + 1] + pro + wait + lines[li[0] + 1: ri[0]] + [ind + l for l in epi] + lines[ri[0]:]
+    body = lines[li[0] + 1: ri[0]]
+    local = (set(re.findall(r"%ch_\w+", "\n".join(wait))) - set(re.findall(r"(%ch_\w+) =", "\n".join(pro)))
+             - {"%ch_cnt", "%ch_ws", "%ch_need", "%ch_ss"})
+    for n, w in reversed(list(enumerate(wi))):   # each marker's wait with its own local names
+        k = w - li[0] - 1
+        mine = [re.sub(r"%ch_\w+", lambda m: m.group(0).replace("%ch_", f"%ch{n}_") if m.group(0) in local else m.group(0), l)
+                for l in wait] if len(wi) > 1 else wait
+        body = body[:k] + mine + body[k + 1:]
+    if not wi:
+        body = wait + body
+    out = lines[: li[0] + 1] + pro + body + [ind + l for l in epi] + lines[ri[0]:]
     return "\n".join(out)
