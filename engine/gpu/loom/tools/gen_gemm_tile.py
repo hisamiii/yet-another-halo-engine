@@ -16,8 +16,6 @@ from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import gen_bfp16_encode as GE  # noqa: E402
-import gen_npu_gemm as GN  # noqa: E402
 import gen_gemm_decode as G  # noqa: E402
 
 # Default workgroup: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).

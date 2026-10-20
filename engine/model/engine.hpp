@@ -10,8 +10,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -24,7 +22,6 @@
 #include "core/tokenizer.hpp"
 #include "model/generator.hpp"
 #include "model/loom_decoder.hpp"
-#include "model/loom_npu.hpp"
 #include "model/loom_prefill.hpp"
 #include "model/loom_runtime.hpp"
 
@@ -36,7 +33,6 @@ class Engine : public TextGenerator {
     std::string model;        // GGUF path
     std::string prefill_hal;  // emit_prefill_pp.py set (chunked, paged)
     std::string decode_hal;   // emit_decode.py set with the prefill's context and YAH_KV
-    bool npu = false;         // the NPU computes the trailing rows of the prefill set's split GEMMs (YAH_NPU_SPLIT)
   };
   // How the tokens after the last whole chunk are run.
   enum class Tail { kAuto, kChunk, kDecode };
@@ -46,7 +42,7 @@ class Engine : public TextGenerator {
       : gguf_(core::Gguf::OpenResident(o.model)),
         cfg_(core::Qwen35Config::FromGguf(gguf_)),
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
-        weights_(gpu_, gguf_, o.npu),
+        weights_(gpu_, gguf_),
         prefill_(gpu_, gguf_, cfg_, o.prefill_hal, weights_),
         decoder_(gpu_, gguf_, cfg_, o.decode_hal, weights_) {
     if (decoder_.context() != prefill_.pool_rows())
@@ -55,14 +51,6 @@ class Engine : public TextGenerator {
     if (decoder_.kv_bits() != prefill_.kv_bits())
       throw LoomError("engine: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
     gpu_.SetSleepSync(200);
-    if (o.npu) {
-      const NpuPlan plan = prefill_.npu_plan();
-      if (plan.a_bytes == 0) throw LoomError("engine: --npu needs a prefill set emitted with YAH_NPU_SPLIT");
-      npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
-      prefill_.EnableNpu(npu_.get());
-    }
-    // Prefill calibration while serving (model/prefill_calib.hpp) is shelved: it converged too slowly to pay off yet.
-    // To resume: prefill_.EnableCalibration(CalibrationPath(o.prefill_hal)) and emit sets with the calibration menu.
     logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
     seed_ = gpu_.Allocate(8);
     const void* th = nullptr;
@@ -123,7 +111,6 @@ class Engine : public TextGenerator {
         Track(chunk_ms_, (std::chrono::steady_clock::now() - tp) / shares, true);
       }
     }
-    prefill_.Collect();
     // Every token, greedy or sampled (LoomDecoder::SetSampling), is picked on the GPU into the decoder's token stream,
     // which the next step reads, so the steps run kAhead ahead of the token the host reads; made[i] marks the copy of
     // the host's next token + i into tokens_host_. At most kAhead steps past a stop run for nothing.
@@ -189,27 +176,6 @@ class Engine : public TextGenerator {
   }
   // A chunk of n real tokens costs about this share of a full one: the GEMMs (~92% of a full chunk) run whole 256-token
   // tiles, everything else runs the whole chunk.
-  // The prefill calibration's state file: $XDG_CACHE_HOME/yah (else ~/.cache/yah), one per emitted set (its
-  // dispatch.txt contents and time; a re-emit starts over). "" when there is no cache directory.
-  static std::string CalibrationPath(const std::string& set) {
-    namespace fs = std::filesystem;
-    const char* xdg = std::getenv("XDG_CACHE_HOME");
-    const char* home = std::getenv("HOME");
-    if (!(xdg && *xdg) && !(home && *home)) return "";
-    const fs::path dir = (xdg && *xdg) ? fs::path(xdg) / "yah" : fs::path(home) / ".cache" / "yah";
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) return "";
-    std::ifstream f(set + "/dispatch.txt", std::ios::binary);
-    std::string text((std::istreambuf_iterator<char>(f)), {});
-    text += std::to_string(fs::last_write_time(set + "/dispatch.txt", ec).time_since_epoch().count());
-    std::uint64_t h = 1469598103934665603ull;
-    for (unsigned char c : text) h = (h ^ c) * 1099511628211ull;
-    char name[40];
-    std::snprintf(name, sizeof name, "calib-%016llx.txt", static_cast<unsigned long long>(h));
-    return (dir / name).string();
-  }
-
   double ChunkShare(std::uint32_t n) const {
     const std::uint32_t B = prefill_.chunk(), tiles = (n + 255) / 256 * 256;
     return 0.08 + 0.92 * std::min(1.0, double(tiles) / B);
@@ -227,7 +193,6 @@ class Engine : public TextGenerator {
   LoomWeights weights_;
   LoomPrefill prefill_;
   LoomDecoder decoder_;
-  std::unique_ptr<LoomNpuSplit> npu_;  // Options::npu; the prefill keeps a pointer
   LoomBuffer logits_, seed_;
   LoomBuffer tokens_mirror_;                    // host-local copy of the decoder's token stream (MarkToken)
   const std::uint32_t* tokens_host_ = nullptr;  // its mapping

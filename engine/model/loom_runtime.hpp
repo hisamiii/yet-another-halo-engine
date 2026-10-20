@@ -236,21 +236,6 @@ class LoomDevice {
     LoomCheck(hrx_stream_copy_buffer(stream_, src.buffer, src.offset, dst.buffer, dst.offset, src.length),
               "hrx_stream_copy_buffer");
   }
-  // Import an external host pointer (e.g. a GGUF mmap window) as an HRX buffer.
-  // The caller must keep the mapping alive while the buffer is in use.
-  [[nodiscard]] LoomBuffer Import(void* host_ptr, size_t bytes) {
-    LoomBuffer buffer;
-    buffer.size = bytes;
-    hrx_buffer_params_t params = {};
-    params.type = HRX_MEMORY_TYPE_DEVICE_VISIBLE;
-    params.access = HRX_MEMORY_ACCESS_READ;
-    params.usage = HRX_BUFFER_USAGE_DEFAULT;
-    params.queue_affinity = 0;
-    LoomCheck(hrx_allocator_import_buffer(hrx_device_allocator(device_), params, host_ptr, bytes, &buffer.handle),
-              "hrx_allocator_import_buffer");
-    return buffer;
-  }
-
   // Fill the whole buffer with a 32-bit pattern, in stream order.
   void Fill(const LoomBuffer& buffer, uint32_t pattern) {
     Order();
@@ -536,17 +521,10 @@ class LoomGraph {
 
 // The model's tensor data on the GPU; Ref(t) binds a tensor. By default it is copied into device-local buffers of about
 // 1 GiB cut at tensor boundaries, each host range released right after its copy (RAM holds one copy of the model):
-// the GPU reads imported host pages snooped, ~6% more GEMM cycles. in_place: the host region imported once (the NPU
-// split also reads the weights through host pointers); the import needs a page-aligned start, hence a delta inside it.
+// the GPU reads imported host pages snooped, ~6% more GEMM cycles.
 class LoomWeights {
  public:
-  LoomWeights(LoomDevice& gpu, core::Gguf& gguf, bool in_place = false) {
-    if (in_place) {
-      const uintptr_t base = reinterpret_cast<uintptr_t>(gguf.tensor_data_base()), start = base & ~uintptr_t{4095};
-      LoomBuffer buffer = gpu.Import(reinterpret_cast<void*>(start), gguf.tensor_data_size() + base - start);
-      chunks_.push_back({0, base - start, std::move(buffer)});
-      return;
-    }
+  LoomWeights(LoomDevice& gpu, core::Gguf& gguf) {
     constexpr size_t kChunk = size_t{1} << 30;
     constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
     std::vector<std::pair<size_t, size_t>> spans;
@@ -559,14 +537,14 @@ class LoomWeights {
       LoomBuffer buffer = gpu.Allocate(end - begin + kPad);
       gpu.H2D(buffer, gguf.tensor_data_base() + begin, end - begin);
       gguf.ReleaseData(begin, end - begin);
-      chunks_.push_back({begin, 0, std::move(buffer)});
+      chunks_.push_back({begin, std::move(buffer)});
     }
   }
   [[nodiscard]] hrx_buffer_ref_t Ref(const core::TensorInfo& t) const {
     const size_t off = static_cast<size_t>(t.offset);
     const auto it = std::upper_bound(chunks_.begin(), chunks_.end(), off,
                                      [](size_t o, const Chunk& c) { return o < c.begin; }) - 1;
-    return {it->buffer.handle, it->delta + off - it->begin, static_cast<size_t>(t.bytes)};
+    return {it->buffer.handle, off - it->begin, static_cast<size_t>(t.bytes)};
   }
   template <typename F>
   void ForEachBuffer(F&& f) const {
@@ -575,8 +553,7 @@ class LoomWeights {
 
  private:
   struct Chunk {
-    size_t begin;  // tensor-data offset of the buffer's first byte (in_place: 0)
-    size_t delta;  // in_place: the region's offset inside the import
+    size_t begin;  // tensor-data offset of the buffer's first byte
     LoomBuffer buffer;
   };
   std::vector<Chunk> chunks_;

@@ -29,7 +29,6 @@
 #include "core/config.hpp"
 #include "core/gguf.hpp"
 #include "model/loom_decoder.hpp"
-#include "model/loom_npu.hpp"
 #include "model/loom_prefill.hpp"
 #include "model/loom_runtime.hpp"
 
@@ -100,21 +99,8 @@ int main(int argc, char** argv) {
     LoomDevice gpu;
     // The layers queue ~950 dispatches and wait once: the runtime wait would busy-poll a host core the whole time.
     gpu.SetSleepSync(200);
-    // YAH_NPU=1: the NPU computes the trailing rows of the set's split GEMMs (a set emitted with YAH_NPU_SPLIT).
-    const char* npu_env = std::getenv("YAH_NPU");
-    const bool npu_on = npu_env && std::string(npu_env) == "1";
-    LoomWeights weights(gpu, gguf, npu_on);
+    LoomWeights weights(gpu, gguf);
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
-    std::unique_ptr<yah::model::LoomNpuSplit> npu;
-    if (npu_on) {
-      const auto plan = pf.npu_plan();
-      if (plan.a_bytes == 0) {
-        std::fprintf(stderr, "YAH_NPU=1: the set has no NPU split (emit it with YAH_NPU_SPLIT)\n");
-        return 2;
-      }
-      npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
-      pf.EnableNpu(npu.get());
-    }
     const std::uint32_t B = pf.chunk(), T_run = want ? want : B;
     if (T_run == 0 || T_run > pf.context()) {
       std::fprintf(stderr, "tokens=%u must be at most the context %u\n", T_run, pf.context());
@@ -209,7 +195,6 @@ int main(int argc, char** argv) {
     if (rowstats) std::fclose(rowstats);
     const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
-    if (npu) npu->Report(stdout);
 
     {
       std::vector<float> out(std::size_t{B} * LoomPrefill::kHidden);

@@ -5,7 +5,7 @@
 #   engine/hrx-env.sh --check     verify the install and print what resolves
 #   engine/hrx-env.sh --fetch     download and extract the pinned packages
 #
-# HRX is an alternative HIP runtime (libhrx.so plus a compatible libamdhip64.so) with an XDNA/NPU HAL driver.
+# HRX is an alternative HIP runtime (libhrx.so plus a compatible libamdhip64.so).
 # Selecting it is an environment change only: /opt/rocm is not touched and ROCm stays usable in another shell.
 #
 # PINNED: the AMD ROCm Core SDK 10.0.0 release (ROCm 7.14.x). Do not use TheRock nightlies.

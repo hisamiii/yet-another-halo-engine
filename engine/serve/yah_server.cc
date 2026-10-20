@@ -24,9 +24,8 @@ using namespace yah::serve;
 
 int Usage() {
   std::fprintf(stderr,
-               "usage: yah_server --model <gguf> --prefill <hal set> --decode <hal set> [--npu] [--host 127.0.0.1] "
+               "usage: yah_server --model <gguf> --prefill <hal set> --decode <hal set> [--host 127.0.0.1] "
                "[--port 8080]\n"
-               "       --npu: the NPU computes part of the prefill's GEMMs (a set emitted with YAH_NPU_SPLIT)\n"
                "       yah_server --model <gguf> --fake [--host ...] [--port ...]   canned replies, no GPU\n");
   return 2;
 }
@@ -150,14 +149,12 @@ class Server {
 int main(int argc, char** argv) {
   std::string model, prefill, decode, host = "127.0.0.1";
   int port = 8080;
-  bool fake = false, npu = false;
+  bool fake = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const bool has_value = i + 1 < argc;
     if (arg == "--fake") {
       fake = true;
-    } else if (arg == "--npu") {
-      npu = true;
     } else if (arg == "--model" && has_value) {
       model = argv[++i];
     } else if (arg == "--prefill" && has_value) {
@@ -183,7 +180,6 @@ int main(int argc, char** argv) {
       options.model = model;
       options.prefill_hal = prefill;
       options.decode_hal = decode;
-      options.npu = npu;
       generator = std::make_unique<yah::model::Engine>(options);
     }
     Server server(*generator);

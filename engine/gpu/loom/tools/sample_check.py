@@ -17,7 +17,10 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import bfp16_check as B  # noqa: E402
+ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
+EMIT = os.path.join(HERE, "..", "emit_hal.py")
+HALRUN = os.path.join(ROOT, "engine", "build", "hal_run")
+GPURUN = os.path.join(ROOT, "engine", "run", "gpu_run.sh")
 import gen_decode_misc as DM  # noqa: E402
 
 V = 248320
@@ -85,7 +88,7 @@ def main():
     os.makedirs(work, exist_ok=True)
     src = os.path.join(work, "sample.loom")
     open(src, "w").write(DM.gen_sample(V))
-    r = subprocess.run([sys.executable, B.EMIT, src, os.path.join(work, "sample"), "nop=0"], capture_output=True,
+    r = subprocess.run([sys.executable, EMIT, src, os.path.join(work, "sample"), "nop=0"], capture_output=True,
                        text=True)
     if r.returncode:
         sys.exit(f"emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
@@ -110,7 +113,7 @@ def main():
             with open(pf, "ab") as f:
                 np.array([seed & M32, seed >> 32], np.uint32).tofile(f)
             np.array([pos], np.int32).tofile(sf)
-            cmd = [B.GPURUN, "sample", "--", B.HALRUN, model_path, hal, "1", "1024", f"{V * 4},16,4,4", f"f:{lf}",
+            cmd = [GPURUN, "sample", "--", HALRUN, model_path, hal, "1", "1024", f"{V * 4},16,4,4", f"f:{lf}",
                    f"f:{pf}", f"f:{sf}", f"o:4:{of}"]
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if "hal_run: ok" not in r.stdout:
