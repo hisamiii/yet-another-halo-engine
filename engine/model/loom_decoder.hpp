@@ -83,6 +83,7 @@ class LoomDecoder {
         if (k == "normrot") normrot_ = true;   // rmsnorm + rotation in one kernel (drot_norm_*)
         if (k == "swrot") swrot_ = true;       // the SwiGLU GEMV rotates its output for ffn_down (gv_swiglurot_*)
         if (k == "amax") amax_ = true;         // the output GEMV takes the greedy argmax (gv_plainam_*)
+        if (k == "latestate") late_ = true;    // the DeltaNet stores its state after its chain signal
       }
       const auto ok = [](std::uint32_t b) { return b == 4 || b == 8; };
       if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
@@ -238,6 +239,9 @@ class LoomDecoder {
       throw LoomError("decoder: quantized KV steps must be contiguous from a 16-key tile boundary");
     next_pos_ = pos + 1;
     cur_pos_ = pos;
+    // "latestate": no chained consumer orders the DeltaNet's state stores (gen_decode_misc LATE_STATE), so the step
+    // starts after every dispatch so far completed, the previous step's state stores with them.
+    if (late_) gpu_.Order();
     const hrx_buffer_ref_t dposr{posarr_->handle, std::size_t{pos} * 4, 4};
     Dispatch(Load("embed"), 1, 1, kHidden / 16,
              {TRef("token_embd.weight"), {toks_->handle, std::size_t{pos} * 4, 4}, Ref(*hidden_)});
@@ -571,6 +575,7 @@ class LoomDecoder {
   bool normrot_ = false;   // decode.txt "normrot"
   bool swrot_ = false;     // decode.txt "swrot"
   bool amax_ = false;      // decode.txt "amax"
+  bool late_ = false;      // decode.txt "latestate"
   bool sampling_ = false;  // SetSampling
   hrx_buffer_t cs_[2] = {nullptr, nullptr};  // conv state ping-pong
   int cs_cur_ = 0;

@@ -71,6 +71,15 @@ def gen_rmsnorm(D=5120, eps=1e-6, NT=512):
     return "\n".join(L) + "\n"
 
 
+# The recurrent state's stores do not allocate in the MALL (gfx11 dlc, HRX 0045): the next token reads it long after
+# 48 layers' states (~150 MB) went by, and a dirty copy in the MALL was flushed during the next SwiGLU GEMV's weight
+# stream (+18 us in each DeltaNet layer's GEMV). With slc glc too (non_temporal) the stores do not help the GEMV more.
+NT_STATE = " {cache_scope = device, cache_temporal = regular_non_temporal}"
+# The state stores after the output and gen_chain's signal: only the next token's DeltaNet reads the state, after the
+# host's per-step sync, so the chained consumer does not wait for them to drain.
+LATE_STATE = True
+
+
 def gen_deltanet(NH=48, NKH=16, D=128):
     """One gated DeltaNet decode step, one 512-lane workgroup per value head.
 
@@ -302,7 +311,8 @@ def gen_deltanet(NH=48, NKH=16, D=128):
     o = "%zf"
     for c in range(8):
         e(f"  %Sn{c} = vector.fmaf %ds, %K{c}, %Sa{c} : vector<4xf32>")
-        e(f"  vector.store %Sn{c}, %sv[%sa{c}] : vector<4xf32>, view<{SN}xf32>")
+        if not LATE_STATE:
+            e(f"  vector.store %Sn{c}, %sv[%sa{c}]{NT_STATE} : vector<4xf32>, view<{SN}xf32>")
         e(f"  %qa{c}0 = index.constant {D + 4 * c} : index")
         e(f"  %qa{c} = index.add %qa{c}0, %p32 : index")
         e(f"  %Q{c} = vector.load %lv[%qa{c}] : {LV} -> vector<4xf32>")
@@ -349,6 +359,10 @@ def gen_deltanet(NH=48, NKH=16, D=128):
     e("    %y = scalar.mulf %y1, %silu : f32")
     e(f"    view.store %y, %ov[%gi] : f32, view<{NH * D}xf32>")
     e("  }")
+    if LATE_STATE:
+        e("  // chain.signal")
+        for c in range(8):
+            e(f"  vector.store %Sn{c}, %sv[%sa{c}]{NT_STATE} : vector<4xf32>, view<{SN}xf32>")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

@@ -4,7 +4,8 @@
 chain(src) adds three i32 launch arguments and one buffer to a 1-D Loom kernel:
   %ch_cnt   i32 [CHAIN_SLOTS] counters (zero at allocation, only ever incremented)
   %ch_ws    the slot to wait on, %ch_need its target value (absolute; the host keeps a shadow of every slot)
-  %ch_ss    the slot this kernel signals: lane 0 of every wave adds 1 once its stores are visible (device scope)
+  %ch_ss    the slot this kernel signals: lane 0 of every wave adds 1 once its stores are visible (device scope),
+            at the end or at a top-level "// chain.signal" marker (stores after it are not ordered for the consumer)
 Wave 0 polls cnt[ws] until (cnt - need) >= 0 as i32 (wrap-safe), the other waves wait at the barrier, then the
 workgroup acquires (device scope). The host dispatches chained kernels without the ordering barrier; the queue
 launches workgroups in order, so a waiting workgroup never blocks its producer.
@@ -81,5 +82,10 @@ def chain(src):
         body = body[:k] + mine + body[k + 1:]
     if not wi:
         body = wait + body
-    out = lines[: li[0] + 1] + pro + body + [ind + l for l in epi] + lines[ri[0]:]
+    si = [i for i, l in enumerate(body) if l.strip() == "// chain.signal"]
+    assert len(si) <= 1
+    if si:   # the signal before the stores no consumer of this dispatch reads
+        sind = body[si[0]][: len(body[si[0]]) - len(body[si[0]].lstrip())]
+        body = body[:si[0]] + [sind + l for l in epi] + body[si[0] + 1:]
+    out = lines[: li[0] + 1] + pro + body + ([] if si else [ind + l for l in epi]) + lines[ri[0]:]
     return "\n".join(out)

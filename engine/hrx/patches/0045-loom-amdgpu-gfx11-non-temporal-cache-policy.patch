@@ -1,0 +1,137 @@
+Loom: gfx11 vector memory ops encode the non-temporal cache policies as GLC / SLC / DLC.
+
+The gfx11 cache-policy row accepted only "regular", so a non_temporal hint was dropped. It now takes
+non_temporal, non_temporal_regular and regular_non_temporal for plain loads and stores: the near caches (L0 / L1 / L2)
+take the hint as SLC (L2 stream) plus GLC on stores (L0 / L1 miss-evict), the outer one (MALL) as DLC (no
+allocation); non_temporal is both, like LLVM's gfx11 nontemporal. Atomics keep their own coherence bits.
+
+Decode's DeltaNet stores its recurrent state with regular_non_temporal (DLC): a write-back copy in the MALL was
+flushed during the next SwiGLU GEMV's weight stream (+18 us in each DeltaNet layer's GEMV). Kernels without a cache
+hint are unchanged (every other decode / prefill HAL byte-identical).
+diff --git a/loom/py/loom/target/arch/amdgpu/target_info.py b/loom/py/loom/target/arch/amdgpu/target_info.py
+index 53a4c439d..3645ca4a9 100644
+--- a/loom/py/loom/target/arch/amdgpu/target_info.py
++++ b/loom/py/loom/target/arch/amdgpu/target_info.py
+@@ -247,10 +247,16 @@ AMDGPU_MEMORY_ORDERING_MODELS = (
+ AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_SCOPE = "scope"
+ AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_TH = "th"
+ AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_NT = "nt"
++AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_GLC = "glc"
++AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_SLC = "slc"
++AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_DLC = "dlc"
+ AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTRS = (
+     AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_SCOPE,
+     AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_TH,
+     AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_NT,
++    AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_GLC,
++    AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_SLC,
++    AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_DLC,
+ )
+ 
+ AMDGPU_PROCESSOR_SCHEDULING_VALU_TRANS_USE_DEPCTR = 1 << 0
+@@ -976,7 +982,14 @@ AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ENCODING_INFOS: tuple[
+         encoding=AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ENCODING_GFX11_GLC_SLC_DLC,
+         selected_key="memory_cache_policy.gfx11_glc_slc_dlc",
+         cache_scopes=("device",),
+-        cache_temporals=("regular",),
++        # near = L0/L1/L2 (stores GLC, SLC: L2 stream), outer = MALL (DLC: no allocation); non_temporal is LLVM's gfx11
++        # nontemporal (both)
++        cache_temporals=("regular", "non_temporal", "non_temporal_regular", "regular_non_temporal"),
++        attrs=(
++            AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_GLC,
++            AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_SLC,
++            AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ATTR_DLC,
++        ),
+     ),
+     AmdgpuVectorMemoryCachePolicyEncodingInfo(
+         encoding=AMDGPU_VECTOR_MEMORY_CACHE_POLICY_ENCODING_GFX12_NV_SCOPE_TH,
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/memory.h b/loom/src/loom/target/arch/amdgpu/lower/memory.h
+index 56ebccdf0..1572926db 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/memory.h
++++ b/loom/src/loom/target/arch/amdgpu/lower/memory.h
+@@ -129,6 +129,9 @@ typedef uint32_t loom_amdgpu_memory_cache_policy_attr_flags_t;
+ #define LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_SCOPE ((uint32_t)1u << 0)
+ #define LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_TH ((uint32_t)1u << 1)
+ #define LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_NT ((uint32_t)1u << 2)
++#define LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_GLC ((uint32_t)1u << 3)
++#define LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_SLC ((uint32_t)1u << 4)
++#define LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_DLC ((uint32_t)1u << 5)
+ 
+ typedef struct loom_amdgpu_memory_cache_policy_attrs_t {
+   // Encoded attribute bits present for the selected descriptor-set encoding.
+@@ -139,6 +142,10 @@ typedef struct loom_amdgpu_memory_cache_policy_attrs_t {
+   int64_t th;
+   // NT immediate value for GFX950 vector memory packets.
+   int64_t nt;
++  // GLC / SLC / DLC immediate values for GFX11 vector memory packets (non_temporal).
++  int64_t glc;
++  int64_t slc;
++  int64_t dlc;
+ } loom_amdgpu_memory_cache_policy_attrs_t;
+ 
+ // Result of resolving an advisory source cache policy for a descriptor set.
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/memory_cache.c b/loom/src/loom/target/arch/amdgpu/lower/memory_cache.c
+index a552562bd..72b4e16ef 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/memory_cache.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/memory_cache.c
+@@ -215,6 +215,31 @@ loom_amdgpu_memory_cache_policy_resolve(
+     out_attrs->flags |= LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_NT;
+     out_attrs->nt = 1;
+   }
++  // GFX11: the near caches (L0 / L1 / L2) take the non-temporal hint as SLC (L2 stream) plus GLC on stores (L0 / L1
++  // miss-evict), the outer one (MALL) as DLC (no allocation); non_temporal is both, LLVM's nontemporal. Only plain
++  // loads and stores: atomics carry their own coherence bits.
++  const uint8_t temporal = policy->cache_temporal;
++  const bool near_nt = temporal == LOOM_CACHE_TEMPORAL_NON_TEMPORAL ||
++                       temporal == LOOM_CACHE_TEMPORAL_NON_TEMPORAL_REGULAR;
++  const bool outer_nt = temporal == LOOM_CACHE_TEMPORAL_NON_TEMPORAL ||
++                        temporal == LOOM_CACHE_TEMPORAL_REGULAR_NON_TEMPORAL;
++  if ((near_nt || outer_nt) &&
++      (access->source.operation_kind == LOOM_MEMORY_ACCESS_OPERATION_LOAD ||
++       access->source.operation_kind == LOOM_MEMORY_ACCESS_OPERATION_STORE)) {
++    if (near_nt && iree_any_bit_set(row->attr_flags, LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_SLC)) {
++      out_attrs->flags |= LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_SLC;
++      out_attrs->slc = 1;
++    }
++    if (outer_nt && iree_any_bit_set(row->attr_flags, LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_DLC)) {
++      out_attrs->flags |= LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_DLC;
++      out_attrs->dlc = 1;
++    }
++    if (near_nt && iree_any_bit_set(row->attr_flags, LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_GLC) &&
++        access->source.operation_kind == LOOM_MEMORY_ACCESS_OPERATION_STORE) {
++      out_attrs->flags |= LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_GLC;
++      out_attrs->glc = 1;
++    }
++  }
+   return LOOM_AMDGPU_MEMORY_CACHE_POLICY_RESOLUTION_ENCODED;
+ }
+ 
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c b/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
+index f5a5ed931..9c6632d2c 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/memory_emit.c
+@@ -853,6 +853,24 @@ static const loom_amdgpu_memory_cache_attr_field_t
+             .value_offset =
+                 offsetof(loom_amdgpu_memory_cache_policy_attrs_t, nt),
+         },
++        {
++            .flag = LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_GLC,
++            .name = {.data = "glc", .size = 3},
++            .value_offset =
++                offsetof(loom_amdgpu_memory_cache_policy_attrs_t, glc),
++        },
++        {
++            .flag = LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_SLC,
++            .name = {.data = "slc", .size = 3},
++            .value_offset =
++                offsetof(loom_amdgpu_memory_cache_policy_attrs_t, slc),
++        },
++        {
++            .flag = LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_DLC,
++            .name = {.data = "dlc", .size = 3},
++            .value_offset =
++                offsetof(loom_amdgpu_memory_cache_policy_attrs_t, dlc),
++        },
+ };
+ 
+ static int64_t loom_amdgpu_memory_cache_attr_field_value(
