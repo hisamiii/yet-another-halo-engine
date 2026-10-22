@@ -3,7 +3,7 @@
 
 usage: gen_gdn_chunk.py [out.loom]
 
-Same ABI and math as tools/gen_deltanet_hip.py (yah_deltanet).
+Same ABI and math as the per-token yah_deltanet kernel it replaced.
 With k_hat = inv_k k and q_hat = q_scale q (yah_deltanet_prep_kq), and value head h reading key head h mod 16:
 
     S_t = a_t S_{t-1} + b_t (v_t - a_t S_{t-1} k_hat_t) k_hat_t^T,  o_t = S_t q_hat_t
@@ -49,7 +49,6 @@ LG, G2, BETA, BG, GC, GG = range(6)
 # OLATE: a chunk's O stores go into the next iteration, after its decay scan and next-chunk loads are issued. The
 # compiler drains every outstanding global store (s_waitcnt_vscnt 0) before the scan's ds_bpermute and before global
 # loads (no alias tracking), so stores at the chunk end stalled wave 0, the critical wave, at the next chunk's start.
-OLATE = True
 # CONV16: the conv hands over f16 K, Q, V with K and Q already normalized: f16(k * inv_k), f16(q * q_scale), f16(v), the
 # same f32 ops and rounding this kernel did on the f32 conv output, so the result is bit-identical; half the bytes,
 # and phase 1 only moves them into LDS. The f16 rows are carried raw through the prefetch.
@@ -399,10 +398,9 @@ def gen(head_base=0, launch_heads=0, heads=None, vconv=False, o16=False):
     carried += ", " + ", ".join(f"{n} = {v} : {t}" for n, v, t in zip(fnames, pre, ftypes))
     res = ", ".join(f"%sf{j}" for j in range(4)) + ", " + ", ".join(f"%ff{i}" for i in range(len(fnames)))
     alltypes = ", ".join([V8] * 4 + ftypes)
-    if OLATE:   # the previous chunk's O (8 f32 per lane), stored next iteration
-        carried += f", %opv = %zeros8 : {V8}"
-        res += ", %opf"
-        alltypes += f", {V8}"
+    carried += f", %opv = %zeros8 : {V8}"
+    res += ", %opf"
+    alltypes += f", {V8}"
     e(f"  {res} = scf.for %ci = [%c0 to %nchunks step %c1]({carried}) -> ({alltypes}) {{")
     I = "    "
     e(f"{I}%t0 = index.mul %ci, %c32 : index")
@@ -536,13 +534,12 @@ def gen(head_base=0, launch_heads=0, heads=None, vconv=False, o16=False):
     e(f"{I}%cn0 = index.add %ci, %c1 : index")
     e(f"{I}%cn = index.min %cn0, %lastc : index")
     nxt = fetch("%cn", "nx_", I)
-    if OLATE:
-        # the previous chunk's O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores
-        # zeros to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same addresses, in order)
-        e(f"{I}%opc0 = index.max %ci, %c1 : index")
-        e(f"{I}%opc = index.sub %opc0, %c1 : index")
-        e(f"{I}%opt0 = index.mul %opc, %c32 : index")
-        ostore(I, "%opt0", "%opv", "ox")
+    # the previous chunk's O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores
+    # zeros to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same addresses, in order)
+    e(f"{I}%opc0 = index.max %ci, %c1 : index")
+    e(f"{I}%opc = index.sub %opc0, %c1 : index")
+    e(f"{I}%opt0 = index.mul %opc, %c32 : index")
+    ostore(I, "%opt0", "%opv", "ox")
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     # ---- phase 2: KK^T (waves 0-3) -> A (f32), QK^T (waves 4-7) -> P (f16)
     e(f"{I}%p2t = index.rem %sg, %c4 : index")
@@ -720,8 +717,6 @@ def gen(head_base=0, launch_heads=0, heads=None, vconv=False, o16=False):
         e(f"{I}%pc{c} = vector.mma %pa{c}, %pb{c}, {acc} : {V16H}, {V16H}, {V8}")
         acc = f"%pc{c}"
     oacc = acc
-    if not OLATE:
-        ostore(I, "%t0", acc, "o")
     # S <- 2^G_C S + Vn'^T K
     e(f"{I}%gtot = view.load %ga[%gaGC, %c0] : view<6x32xf32> -> f32")   # 2^(G_31 - G_0)
     e(f"{I}%gg0 = view.load %ga[%gaGG, %c0] : view<6x32xf32> -> f32")
@@ -742,11 +737,10 @@ def gen(head_base=0, launch_heads=0, heads=None, vconv=False, o16=False):
             acc = f"%ukc{j}{c}"
         new.append(acc)
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    e(f"{I}scf.yield {', '.join(new + nxt + ([oacc] if OLATE else []))} : {alltypes}")
+    e(f"{I}scf.yield {', '.join(new + nxt + (([oacc])))} : {alltypes}")
     e("  }")
-    if OLATE:   # the last chunk's O
-        e("  %oplast = index.mul %lastc, %c32 : index")
-        ostore("  ", "%oplast", "%opf", "ol")
+    e("  %oplast = index.mul %lastc, %c32 : index")
+    ostore("  ", "%oplast", "%opf", "ol")
     # ---- final state
     for j in range(4):
         for i in range(8):

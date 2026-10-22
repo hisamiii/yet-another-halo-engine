@@ -141,9 +141,7 @@ struct LoomExecutable {
     }
     return 0;
   }
-  // How many buffers this export's dispatch binds. The GEMM family is not uniform:
-  // IQ grid formats bind (weight, grid, [ksigns], input, wstage, ostage, out): 7 for iq3xxs/iq2xxs/iq2xs, 6 for iq3s.
-  // Every other format binds (weight, input, wstage, ostage, out) = 5.
+  // How many buffers this export's dispatch binds.
   [[nodiscard]] uint32_t BindingCount(uint32_t ordinal) const {
     if (ordinal < infos.size()) return infos[ordinal].binding_count;
     return 0;

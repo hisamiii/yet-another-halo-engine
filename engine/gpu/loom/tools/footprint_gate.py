@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked] [ostride=<rows>]
-[kfull=<k_blocks of the whole row>] [npuc=<bytes>] [aspan=<K per activation scale>]
+"""footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked]
+[aspan=<K per activation scale>]
 
 Compile the source under the exact config and read each root's declared byte envelope from the compile report.
 Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for that root.
@@ -11,35 +11,20 @@ import atexit, os, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import loom_preflight as lp
-QB = {"q4k": (256, 144), "q5k": (256, 176), "q6k": (256, 210), "q3k": (256, 110), "q2k": (256, 84),
-      "iq4xs": (256, 136), "iq3s": (256, 110), "iq3xxs": (256, 98), "iq2xxs": (256, 66), "iq2xs": (256, 74),
-      "q8_0": (32, 34), "iq4nl": (32, 18), "f16": (256, 512), "mq4": (256, 136)}
+QB = {"mq4": (256, 136)}   # elements, bytes per block
 src, sym, fmt, kind, mt, kb, tt = sys.argv[1:8]
 mt, kb, tt = int(mt), int(kb), int(tt)
 B = int(sys.argv[8]) if len(sys.argv) > 8 else 2048
 # masked: the kernel declares its token count (config "tokens") and the last token tile is partial
-# ostride: a column-split kstore / kres (gen_gemm_tile.OSTRIDE) on the full <rows>-row output (and residual)
-# mixed ffn "<gate fmt>:<up fmt>": the weight binding holds both tensors
-fmts = fmt.split(":")
-qk, bpb = QB[fmts[0]]
+qk, bpb = QB[fmt]
 M, K = mt * 16, kb * qk
-MO = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("ostride=")), M)
-# kfull: a K window (dequant chunk, gen_gemm_tile.DQ_BFP / KWIN) reading kb of each <kfull>-block weight row (and input row)
-KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")), kb)
-# a split ffn reads the full gate tensor's rows before the up rows
-wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
-bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate": B * MO * 4,
-         "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn", "gu") else 4),
+wbytes = M * kb * bpb
+bound = {"weight": wbytes, "input": B * kb * qk * 2, "resid": B * M * 4, "gate": B * M * 4,
+         "output": B * M * (2 if kind in ("swiglu", "kqg", "gu") else 4),
          # A4 gu (gen_gemm_iu4): the up tensor beside the gate tensor in "weight"
          "up": wbytes,
-         "gate_out": B * MO * 2,
-         # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
-         "grid": max({"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(f, 0) for f in fmts),
-         "ksigns": 128,
+         "gate_out": B * M * 2,
          "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4,
-         # gen_gemm_tile.NPUADD: the NPU's down partials the engine binds, its flag words
-         "npuc": next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("npuc=")), 0),
-         "done": 4, "ready": 4, "status": 4,
          # gen_gemm_iu4 flag: a counter word per token tile (gu: per 1024 features and token tile)
          "cnt": tt * 4 * (M // 1024 if kind == "gu" else 1), "wcnt": tt * 4}
 # A4 GEMMs (gen_gemm_iu4): int4 activations and their f32 scales, one per aspan values of a token
@@ -49,7 +34,7 @@ if aspan:
 sys.path.insert(0, os.path.dirname(HERE))
 import hrx_paths  # noqa: E402
 e = hrx_paths.env()
-# per-call temporaries: emits may run in parallel (engine/tune)
+# per-call temporaries: emits may run in parallel
 tmp = tempfile.mkdtemp(prefix="footprint_gate_")
 atexit.register(shutil.rmtree, tmp, True)
 rep = os.path.join(tmp, "report.json")

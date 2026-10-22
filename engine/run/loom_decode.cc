@@ -1,6 +1,6 @@
 // loom_decode: single-token decode on Loom through HRX (engine/model/loom_decoder.hpp).
 //
-// usage: loom_decode <model.gguf> <hal_dir> --ids "1 2 3" [--gen N] [--logits FILE]
+// usage: loom_decode <model> <hal_dir> --ids "1 2 3" [--gen N] [--logits FILE]
 //
 // The prompt goes through the decode path one token at a time (positions 0..n-1), then N tokens are generated greedily.
 // HAL set: tools/emit_decode.py. Steps queue back to back.
@@ -25,7 +25,7 @@ using namespace yah::model;  // NOLINT(google-build-using-namespace)
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(stderr, "usage: loom_decode <model.gguf> <hal_dir> --ids \"1 2\" [--gen N] [--logits FILE]\n");
+    std::fprintf(stderr, "usage: loom_decode <model> <hal_dir> --ids \"1 2\" [--gen N] [--logits FILE]\n");
     return 2;
   }
   const std::string model = argv[1], dir = argv[2];

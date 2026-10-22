@@ -1,7 +1,7 @@
 // hal_run: dispatches one HAL once with bindings from GGUF tensors and files, then writes the output bindings to files.
 // A correctness harness for generated kernels (e.g. gen_gemv.py decode GEMVs) against an external numpy oracle.
 //
-// usage: hal_run <model.gguf> <hal> <gx[,gy[,gz]]> <wg_size> <min_sizes> <binding>...
+// usage: hal_run <model> <hal> <gx[,gy[,gz]]> <wg_size> <min_sizes> <binding>...
 //   min_sizes  comma-separated byte sizes, one per binding: the kernel's declared footprint (gen_gemv.footprint).
 //              A smaller binding stops the run before dispatch (exit 3): a read past an allocation hangs this GPU.
 //   binding    t:<tensor>          a GGUF tensor, copied to the device (exact bytes)
@@ -36,7 +36,7 @@ std::vector<char> ReadAll(const std::string& path) {
 
 int main(int argc, char** argv) {
   if (argc < 7) {
-    std::fprintf(stderr, "usage: hal_run <model.gguf> <hal> <gx> <wg_size> <min_sizes> <binding>...\n");
+    std::fprintf(stderr, "usage: hal_run <model> <hal> <gx> <wg_size> <min_sizes> <binding>...\n");
     return 2;
   }
   try {

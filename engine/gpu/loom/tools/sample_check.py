@@ -2,7 +2,7 @@
 """The decode sampler (gen_decode_misc.gen_sample) against a numpy model of it, and the model against the exact top-p
 distribution the host sampler drew from.
 
-usage: sample_check.py <model.gguf> <workdir> [draws]
+usage: sample_check.py <model> <workdir> [draws]
 
 The model repeats the kernel's steps (nucleus threshold by binary search, the counter hash, Gumbel-max) in float64, so
 the GPU must return its token for every (T, top_p, seed, pos) case (the kernel's exp / log are approximate, so a

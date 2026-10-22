@@ -89,17 +89,10 @@ class LoomDecoder {
       if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
     }
     const std::uint32_t npg = T_ / 256;
-    // embed decodes IQ4_XS, or Q8_0 in the HFQ models' sets
-    if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != (rot_ ? 8u : 23u))
+    if (!rot_) throw LoomError("decoder: not an MQ4 set (the GGUF model path is gone since tag pre-cleanup-2026-10-20)");
+    // embed decodes Q8_0
+    if (Find("token_embd.weight")->type != core::GgmlType::kQ8_0)
       throw LoomError("token_embd: its format does not match the decode set's embed (re-emit)");
-    const char* tnames[5] = {"grid_iq3s.bin", "grid_iq3xxs.bin", "grid_iq2xxs.bin", "grid_iq2xs.bin",
-                             "ksigns_iq2xs.bin"};
-    for (const char* tn : tnames) {
-      const auto data = ReadAll(dir_ + "/" + tn);
-      LoomBuffer& b = Alloc(data.size());
-      gpu_.H2D(b, data.data(), data.size());
-      tabs_.push_back({b.handle, 0, data.size()});
-    }
     hidden_ = &Alloc(kHidden * 4);
     normed_ = &Alloc(kHidden * 4);
     qg_ = &Alloc(kQProj * 4);
@@ -113,13 +106,13 @@ class LoomDecoder {
     beta_ = &Alloc(kTs * 4);
     ssmout_ = &Alloc(kInner * 4);
     ffnact_ = &Alloc(kFfn * 4);
-    if (rot_) {
+    {
       const auto sg = ReadAll(dir_ + "/rot_signs.bin");
       rot_signs_ = &Alloc(sg.size());
       gpu_.H2D(*rot_signs_, sg.data(), sg.size());
-      rotx_ = &Alloc(kInner * 4);
-      if (swrot_) swcnt_ = &Alloc(kFfn / 256 * 4);   // monotonic per-block counters, never reset
     }
+    rotx_ = &Alloc(kInner * 4);
+    if (swrot_) swcnt_ = &Alloc(kFfn / 256 * 4);   // monotonic per-block counters, never reset
     logits_ = &Alloc(std::size_t{kVocab} * 4);
     if (amax_) amaxk_ = &Alloc(16);   // u64 max key + i32 workgroup count, both back to 0 after each step
     sink_ = &Alloc(4);
@@ -298,7 +291,7 @@ class LoomDecoder {
                   Ref(*ssmout_)});
         Tr("ssm", l, *ssmout_, kInner);
         Rotate(*ssmout_, pre + "ssm_out");
-        Gemv("resid", {pre + "ssm_out.weight"}, rot_ ? *rotx_ : *ssmout_, *hidden_);
+        Gemv("resid", {pre + "ssm_out.weight"}, *rotx_, *hidden_);
       }
       NormRotate(*hidden_, pre + "post_attention_norm.weight", pre + "ffn_gate");
       Gemv("swiglu", {pre + "ffn_gate.weight", pre + "ffn_up.weight"}, *normed_, *ffnact_,
@@ -312,7 +305,7 @@ class LoomDecoder {
                                                                 Ref(*rot_signs_), Ref(*normed_)});
     } else {
       Rmsnorm(*hidden_, "output_norm.weight", *normed_);
-      if (rot_) Dispatch(Load("drot_head"), kHidden / 1024, 1, 64, {Ref(*normed_), Ref(*rot_signs_)});
+      Dispatch(Load("drot_head"), kHidden / 1024, 1, 64, {Ref(*normed_), Ref(*rot_signs_)});
     }
     const bool sample = sampling_ && pos + 1 >= keep_from;
     const hrx_buffer_ref_t tok = pos + 1 >= keep_from ? TokenRef(pos + 1) : Ref(*sink_);
@@ -345,54 +338,6 @@ class LoomDecoder {
   }
 
  private:
-  struct Fmt {
-    const char* name;
-    std::uint32_t qk, bb, tables;
-  };
-  // GGML type -> GEMV name, block elements, block bytes, table bits.
-  // Table bits follow gen_gemv.TABLE_ORDER: grid_iq3s, grid_iq3xxs, grid_iq2xxs, grid_iq2xs, ksigns.
-  static bool FmtOf(std::uint32_t type, Fmt* f) {
-    switch (type) {
-      case 8:
-        *f = {"q8_0", 32, 34, 0};
-        return true;
-      case 10:
-        *f = {"q2k", 256, 84, 0};
-        return true;
-      case 11:
-        *f = {"q3k", 256, 110, 0};
-        return true;
-      case 12:
-        *f = {"q4k", 256, 144, 0};
-        return true;
-      case 13:
-        *f = {"q5k", 256, 176, 0};
-        return true;
-      case 14:
-        *f = {"q6k", 256, 210, 0};
-        return true;
-      case 16:
-        *f = {"iq2xxs", 256, 66, 4 | 16};
-        return true;
-      case 17:
-        *f = {"iq2xs", 256, 74, 8 | 16};
-        return true;
-      case 18:
-        *f = {"iq3xxs", 256, 98, 2 | 16};
-        return true;
-      case 21:
-        *f = {"iq3s", 256, 110, 1};
-        return true;
-      case 23:
-        *f = {"iq4xs", 256, 136, 0};
-        return true;
-      case 44:
-        *f = {"mq4", 256, 136, 0};
-        return true;
-      default:
-        return false;
-    }
-  }
   static std::vector<char> ReadAll(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw LoomError("cannot open " + path);
@@ -408,6 +353,13 @@ class LoomDecoder {
   const core::TensorInfo* Find(const std::string& n) const {
     const auto* t = gguf_.Find(n);
     if (!t) throw LoomError("tensor not found: " + n);
+    return t;
+  }
+  // A GEMV weight: MQ4G256 (136 B per 256), footprint checked.
+  const core::TensorInfo* Mq4(const std::string& n) const {
+    const auto* t = Find(n);
+    if (t->type != core::GgmlType::kMQ4G256 || t->bytes != std::uint64_t(t->dims[0]) / 256 * 136 * t->dims[1])
+      throw LoomError("decoder: " + n + " is not an MQ4 weight of its shape");
     return t;
   }
   hrx_buffer_ref_t TRef(const std::string& n) const {
@@ -439,22 +391,16 @@ class LoomDecoder {
   void Gemv(const char* kind, const std::vector<std::string>& ws, const LoomBuffer& x, const LoomBuffer& y,
             const std::string& rot_w = {}, const hrx_buffer_ref_t* tok = nullptr) {
     std::string name = std::string("gv_") + kind + (rot_w.empty() ? "" : "rot") + (tok ? "am" : "");
-    std::uint32_t tbits = 0, M = 0, K = 0;
+    std::uint32_t M = 0, K = 0;
     std::vector<hrx_buffer_ref_t> b;
     for (const auto& w : ws) {
-      const auto* t = Find(w);
-      Fmt f{};
-      if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) throw LoomError("no GEMV format for " + w);
+      const auto* t = Mq4(w);
       K = static_cast<std::uint32_t>(t->dims[0]);
       M = static_cast<std::uint32_t>(t->dims[1]);
-      if (t->bytes != std::uint64_t{K} / f.qk * f.bb * M) throw LoomError("footprint mismatch on " + w);
-      name += std::string("_") + f.name;
-      tbits |= f.tables;
+      name += "_mq4";
       b.push_back(TRef(w));
     }
     name += "_" + std::to_string(M) + "_" + std::to_string(K);
-    for (int i = 0; i < 5; ++i)
-      if (tbits & (1u << i)) b.push_back(tabs_[i]);
     if (x.size < std::size_t{K} * 4 || y.size < std::size_t{M} * 4) throw LoomError("GEMV operand too small: " + name);
     b.push_back({x.handle, 0, std::size_t{K} * 4});
     b.push_back({y.handle, 0, std::size_t{M} * 4});
@@ -477,26 +423,20 @@ class LoomDecoder {
   // A layer's input projections of normed_: one band-fused GEMV (gen_gemv gen_bands).
   void Project(const std::vector<std::string>& ws, const std::vector<LoomBuffer*>& ys) {
     std::string fn, mn;
-    std::uint32_t tbits = 0, K = 0, rows = 0;
+    std::uint32_t K = 0, rows = 0;
     std::vector<hrx_buffer_ref_t> b;
     for (std::size_t i = 0; i < ws.size(); ++i) {
-      const auto* t = Find(ws[i]);
-      Fmt f{};
-      if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) throw LoomError("no GEMV format for " + ws[i]);
+      const auto* t = Mq4(ws[i]);
       const std::uint32_t k = static_cast<std::uint32_t>(t->dims[0]), M = static_cast<std::uint32_t>(t->dims[1]);
       if (i && k != K) throw LoomError("bands need one K");
       K = k;
-      if (t->bytes != std::uint64_t{K} / f.qk * f.bb * M) throw LoomError("footprint mismatch on " + ws[i]);
       if (M % (Rw("bands").first * Rw("bands").second) || ys[i]->size < std::size_t{M} * 4)
         throw LoomError("band output: " + ws[i]);
-      fn += std::string("_") + f.name;
+      fn += "_mq4";
       mn += "_" + std::to_string(M);
-      tbits |= f.tables;
       rows += M;
       b.push_back(TRef(ws[i]));
     }
-    for (int i = 0; i < 5; ++i)
-      if (tbits & (1u << i)) b.push_back(tabs_[i]);
     b.push_back({normed_->handle, 0, std::size_t{K} * 4});
     for (std::size_t i = 0; i < ws.size(); ++i) {
       const auto* t = Find(ws[i]);
@@ -520,10 +460,9 @@ class LoomDecoder {
       throw LoomError("grid mismatch for " + name + ": " + std::to_string(gx) + " vs compiled " +
                       std::to_string(it->second));
   }
-  // MQ4 sets: x (the f32 input of weight w's GEMV, "<pre><w>") into the weights' basis with w's awq: in place, or
+  // x (the f32 input of weight w's GEMV, "<pre><w>") into the weights' basis with w's awq: in place, or
   // for ssm_out from GGUF into HF value-head order into rotx_.
   void Rotate(const LoomBuffer& x, const std::string& w) {
-    if (!rot_) return;
     const auto* t = Find(w + ".weight");
     const std::uint32_t k = static_cast<std::uint32_t>(t->dims[0]);
     const bool heads = w.find("ssm_out") != std::string::npos;
@@ -583,7 +522,6 @@ class LoomDecoder {
   std::map<std::string, LoomExecutable> exes_;
   std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> rw_;
   std::map<std::string, std::uint32_t> grid_;
-  std::vector<hrx_buffer_ref_t> tabs_;
   LoomDecoderState st_;
   LoomBuffer *hidden_, *normed_, *qg_, *q_, *gate_, *kb_, *vb_, *aout_, *qkv_, *alpha_, *beta_, *ssmout_, *ffnact_,
       *logits_, *amaxk_ = nullptr, *sink_, *sparams_, *toks_, *posarr_, *eps_, *c32a_, *c32b_, *c16a_, *c16b_, *acc_, *ml_;

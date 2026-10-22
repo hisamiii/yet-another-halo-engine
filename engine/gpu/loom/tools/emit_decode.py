@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emit every HAL the Loom single-token decode forward needs for a shard.
 
-usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, multiple of 256)
+usage: emit_decode.py <model> <outdir> [max_context]       (default 4096, multiple of 256)
 
   gb_<fmts>_<Ms>_<K>.hal         tools/gen_gemv.py gen_bands: a layer's input projections in one dispatch (the decoder's default)
   gv_<kind>_<fmts>_<M>_<K>.hal   tools/gen_gemv.py, one per distinct (kind, formats, shape) on the shard:
@@ -15,7 +15,6 @@ usage: emit_decode.py <model.gguf> <outdir> [max_context]       (default 4096, m
   drot_*, rot_signs.bin          MQ4 models only: tools/gen_rot.py on the f32 GEMV inputs (decode.txt "rot")
   unpack, rope, argmax           hand-written kernels in loom/*.loom.
                                  rope's own cache write goes to a one-row dummy (max_context=1); dattn_kvappend writes the pools.
-  grid_*.bin, ksigns_iq2xs.bin   the IQ tables (loom/tables)
   decode.txt                     "ctx <max_context>", GEMV geometry and grids; "chain": the kernels are flag-chained
                                  (tools/gen_chain.py: extra counter binding and wait / signal constants)
 """
@@ -40,16 +39,12 @@ import gen_rot  # noqa: E402
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
 # rows per wave R and waves per workgroup W per GEMV kind; recorded in decode.txt ("rw kind R W")
 RW = {k: (2, 4) for k in ("plain", "resid", "swiglu", "bands")}
-# The tuner's table (tune_table.py) may override them: {"rw": {"bands": [4, 4], ...}}. Every row is still reduced over
-# the 32 lanes of one wave, so R and W change no result bits.
 
 
 # Every kernel waits on its producer's counter instead of a queue barrier (gen_chain.py; decode.txt "chain").
-CHAIN = True
 # Chained GEMVs load and decode their first PEEL K iterations' weights before the wait (gen_gemv peel).
 PEEL = 1
 # The output GEMV also takes the greedy argmax (gen_gemv amax, decode.txt "amax"), instead of the argmax kernel.
-AMAX = True
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):
@@ -63,10 +58,9 @@ def emit_src(text, name, outdir, configs=("nop=0",)):
 def emit_file(path, name, outdir, configs):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
-    if CHAIN:
-        src = os.path.join(tmp, name + ".chain.loom")
-        open(src, "w").write(gen_chain.chain(open(path).read()))
-        path = src
+    src = os.path.join(tmp, name + ".chain.loom")
+    open(src, "w").write(gen_chain.chain(open(path).read()))
+    path = src
     r = subprocess.run([sys.executable, EMIT, path, tmp] + list(configs), capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit("emit failed for %s:\n%s%s" % (path, r.stdout[-3000:], r.stderr[-3000:]))
@@ -145,8 +139,6 @@ def gemv_set(model):
 
 def main():
     model, outdir = sys.argv[1], sys.argv[2]
-    import tune_table
-    RW.update({k: tuple(v) for k, v in tune_table.load(model).get("rw", {}).items()})
     T = int(sys.argv[3]) if len(sys.argv) > 3 else 4096
     if T % 256:
         raise SystemExit("max_context must be a multiple of 256")
@@ -160,20 +152,20 @@ def main():
     vocab = next(int(d[1]) for nm, d, _ in EP.parse(model) if nm == "output.weight")
     for name, (kind, fmts, M, K) in sorted(gs.items()):
         R, W = RW[kind]
-        peel = PEEL if CHAIN else 0
+        peel = (PEEL)
         emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel), name, outdir)
         grids[name] = M // GV.rows_per_wg(R, W)
         if rot and kind == "swiglu":   # also rotating its output for ffn_down (decode.txt "swrot")
             rname = name.replace("gv_swiglu_", "gv_swiglurot_")
             emit_src(GV.gen(kind, fmts, M, K, R, W, rot=True, peel=peel), rname, outdir)
             grids[rname] = grids[name]
-        if AMAX and CHAIN and kind == "plain" and M == vocab:   # the output GEMV
+        if ((kind == "plain") and (M == vocab)):   # the output GEMV
             aname = name.replace("gv_plain_", "gv_plainam_")
             emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, amax=True), aname, outdir)
             grids[aname] = grids[name]
     bs = bands_set(model)
     for name, (fmts, Ms, K) in sorted(bs.items()):
-        emit_src(GV.gen_bands(fmts, Ms, K, *RW["bands"], peel=PEEL if CHAIN else 0), name, outdir)
+        emit_src(GV.gen_bands(fmts, Ms, K, *RW["bands"], peel=(PEEL)), name, outdir)
         grids[name] = sum(Ms) // GV.rows_per_wg(*RW["bands"])
     for which in ("kvappend", "part", "reduce"):
         emit_src(DA.gen(which, T), "dattn_" + which, outdir)
@@ -194,24 +186,22 @@ def main():
         "yah_fused_qk_rope.cache32_elems=%d" % (NUM_KV * HEAD_DIM),
         "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
     emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # also runs the decode conv
-    # token_embd row from the device token stream (Q8_0 in HFQ models)
-    emit_src(DM.gen_embed_q8_0() if types["token_embd.weight"] == 8 else DM.gen_embed_iq4xs(), "embed", outdir)
+    # token_embd row (Q8_0) from the device token stream
+    emit_src(DM.gen_embed_q8_0(), "embed", outdir)
     # MQ4 GEMVs read x in the weights' rotated basis: in place per input site, ssm_out's input gathered into HF head
     # order, the head's without awq
     if rot:
         for name, args in (("drot_5120", (5120, 1)), ("drot_6144", (6144, 1)), ("drot_17408", (17408, 1)),
                            ("drot_heads", (6144, 1, True, (48, 16, 128))), ("drot_head", (5120, 1, False))):
-            emit_src(gen_rot.gen(*args, ty="f32", early=CHAIN), name, outdir)
+            emit_src(gen_rot.gen(*args, ty="f32", early=True), name, outdir)
         # rmsnorm + rotation in one kernel at the norm sites (decode.txt "normrot")
-        emit_src(gen_rot.gen_norm(5120, early=CHAIN), "drot_norm_5120", outdir)
-        emit_src(gen_rot.gen_norm(5120, awq=False, early=CHAIN), "drot_norm_head", outdir)
+        emit_src(gen_rot.gen_norm(5120, early=True), "drot_norm_5120", outdir)
+        emit_src(gen_rot.gen_norm(5120, awq=False, early=True), "drot_norm_head", outdir)
         open(os.path.join(outdir, "rot_signs.bin"), "wb").write(gen_rot.signs())
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-p sampling into the token stream
-    for f in os.listdir(os.path.join(LOOM, "tables")):
-        shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\nnormrot - 0 0\nswrot - 0 0\n" if rot else "") + ("chain - 0 0\n" if CHAIN else "") + ("amax - 0 0\n" if AMAX and CHAIN else "") + ("latestate - 0 0\n" if CHAIN and DM.LATE_STATE else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
+        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\nnormrot - 0 0\nswrot - 0 0\n" if rot else "") + (("chain - 0 0\n")) + (("amax - 0 0\n")) + ("latestate - 0 0\n" if DM.LATE_STATE else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + the decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))

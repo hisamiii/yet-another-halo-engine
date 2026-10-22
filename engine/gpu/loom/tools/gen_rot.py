@@ -536,7 +536,6 @@ QP_PRIO = 3
 
 # gen_qp / gen_pnqp: chunk-fastest items when P allows (the awq divide out of the item loop): pnqp (P 120) VALU -5%;
 # rotqp at P 170 / rotqop at 162 flat (138 -> 163 VGPRs), so RQP / RQOP stay 160 (not multiples: rows fastest)
-QP_CM = True
 
 
 def gen_qp(K, rows, span, P, flag, plow=False):
@@ -555,7 +554,7 @@ def gen_qp(K, rows, span, P, flag, plow=False):
     nch, tt = K // 1024, rows // FLAG_TT
     per = nch * FLAG_TT
     assert P <= per
-    cm = QP_CM and P % nch == 0
+    cm = (P % nch == 0)
     LV = f"view<{4 * 16 * PITCH}xf32>"
     total = K * rows
     FV = f"view<{nch * tt}xi32>"
@@ -710,18 +709,16 @@ def gen_qp(K, rows, span, P, flag, plow=False):
     return "\n".join(L) + "\n"
 
 
-# The scale candidates searched (j of d = (amax / 7)(1 + j / 7) / 2). hipfire's 0 .. 7 keep its exact search (the fast
-# search with a bound-checked exact fallback); any other set runs the fast search alone: its winner is the first minimum
-# of the fast errors, codes clamp(rne(x RN(1 / d))). 3 .. 6: j 0 .. 2 and 7 win ~1% of spans (MSE x1.0004 on Gaussian
-# spans, the same scale as 0 .. 7 in 98.9% of real ones), half the search's VALU. The exact search's scf.if with results
-# also miscompiled at 4 candidates (all-zero codes).
+# The scale candidates searched (j of d = (amax / 7)(1 + j / 7) / 2), by the fast search: its winner is the first
+# minimum of the fast errors, codes clamp(rne(x RN(1 / d))). 3 .. 6 instead of hipfire's 0 .. 7: j 0 .. 2 and 7 win ~1%
+# of spans (MSE x1.0004 on Gaussian spans, the same scale as 0 .. 7 in 98.9% of real ones), half the search's VALU.
+# hipfire's 0 .. 7 with its exact search behind a bound-checked fallback is on tag pre-cleanup-2026-10-20.
 QCANDS = (3, 4, 5, 6)
 
 
 def _quant(e, total, span, LV):
     """gen_q's int4 quantization of %r<i> (after _core): q nibbles and the span's scale times 2^26."""
     nc = len(QCANDS)
-    exact = QCANDS == tuple(range(8))
     nl = span // 16    # lanes per span
     # back through LDS so each lane holds 16 contiguous values: [gl][i][a] is k = 256 g + 16 i + a, which this lane
     # read itself (no other lane touches it), then lane (gl, a) reads its row a
@@ -804,58 +801,7 @@ def _quant(e, total, span, LV):
         e(f"  %ijv{j} = vector.splat %ij{j} : vector<16xf32>")
         e(f"  %ndv{j} = vector.splat %nd{j} : vector<16xf32>")
 
-    def exact_search():
-        """hipfire's search: per candidate the exact codes clamp(rne(x / d)), errors x - RN(q d) squared, summed in
-        order; the first minimum wins. Returns the winner's d, RN(1 / d), -d."""
-        errs = []
-        for j in QCANDS:
-            e(f"    %q0{j} = vector.mulf %xq, %ijv{j} : vector<16xf32>")
-            e(f"    %rr{j} = vector.fmaf %q0{j}, %ndv{j}, %xq : vector<16xf32>")
-            e(f"    %qd{j} = vector.fmaf %rr{j}, %ijv{j}, %q0{j} : vector<16xf32>")
-            e(f"    %qr{j} = vector.roundevenf %qd{j} : vector<16xf32>")
-            e(f"    %ql{j} = vector.maxnumf<nnan> %qr{j}, %fl8v : vector<16xf32>")
-            e(f"    %qc{j} = vector.minnumf<nnan> %ql{j}, %fh7v : vector<16xf32>")
-            e(f"    %qm{j} = vector.mulf %qc{j}, %djv{j} : vector<16xf32>")
-            e(f"    %er{j} = vector.subf %xq, %qm{j} : vector<16xf32>")
-            e(f"    %e2{j} = vector.mulf %er{j}, %er{j} : vector<16xf32>")
-            # vector.reduce's chain ((0 + e0) + e1) + .. without the 0 + (e0 = er^2 is never -0): an unpaired literal add
-            acc = f"%e2{j}_0"
-            e(f"    {acc} = vector.extract %e2{j}[0] : vector<16xf32> -> f32")
-            for t in range(1, 16):
-                e(f"    %e2{j}_{t} = vector.extract %e2{j}[{t}] : vector<16xf32> -> f32")
-                nxt = f"%ms{j}" if t == 15 else f"%es{j}_{t}"
-                e(f"    {nxt} = scalar.addf {acc}, %e2{j}_{t} : f32")
-                acc = nxt
-            errs.append(f"%ms{j}")
-        e("    %msv = vector.from_elements " + ", ".join(errs) + f" : vector<{nc}xf32>")
-        msr = reduce("%msv", f"vector<{nc}xf32>", "addf", "ms", "    ")
-        j0 = QCANDS[0]
-        best, bi, bn, bm = f"%dj{j0}", f"%ij{j0}", f"%nd{j0}", f"%mr{j0}"
-        for n, j in enumerate(QCANDS):
-            e(f"    %mr{j} = vector.extract {msr}[{n}] : vector<{nc}xf32> -> f32")
-            if n:
-                e(f"    %lt{j} = scalar.cmpf olt, %mr{j}, {bm} : f32")   # the first minimum wins, as hipfire
-                e(f"    %bm{j} = scf.select %lt{j}, %mr{j}, {bm} : f32")
-                e(f"    %bd{j} = scf.select %lt{j}, %dj{j}, {best} : f32")
-                e(f"    %bi{j} = scf.select %lt{j}, %ij{j}, {bi} : f32")
-                e(f"    %bn{j} = scf.select %lt{j}, %nd{j}, {bn} : f32")
-                best, bi, bn, bm = f"%bd{j}", f"%bi{j}", f"%bn{j}", f"%bm{j}"
-        return best, bi, bn
-
-    # The fast search: codes clamp(rne(x RN(1 / d))), errors fma(-q, d, x), squares accumulated by fma. Against the
-    # exact search, per candidate: the error terms and sums move by <= u (2 sqrt(X2 E) + 261 E) + u^2 X2 (u = 2^-24,
-    # X2 = sum x^2, Cauchy-Schwarz), and a code can differ only where x / d is within 2^-19 of a half-integer, where
-    # both codes' squared errors are ~d^2 / 4 and differ by <= 2^-18 d^2: <= 2^-15.9 E. So with
-    # B(E) = 2^-14 E + 2^-21 sqrt(X2 E) + 2^-46 X2 + 2^-115, a best E' (first minimum) below every other E' - B by
-    # more than its own B is the exact search's winner. Otherwise (near ties; amax in (0, 2^-30)) the whole wave runs
-    # the exact search; amax = 0 gives all E = 0 in both, winner 0.
-    if exact:
-        acc = "%fz"
-        for t in range(16):
-            e(f"  %xx{t} = vector.extract %xq[{t}] : vector<16xf32> -> f32")
-            e(f"  %x2c{t} = scalar.fmaf %xx{t}, %xx{t}, {acc} : f32")
-            acc = f"%x2c{t}"
-        x2 = reduce(acc, "f32", "addf", "x2")
+    # The fast search: codes clamp(rne(x RN(1 / d))), errors fma(-q, d, x), squares accumulated by fma.
     errs = []
     for j in QCANDS:
         e(f"  %cqr{j} = vector.mulf %xq, %ijv{j} : vector<16xf32>")
@@ -880,67 +826,17 @@ def _quant(e, total, span, LV):
         e(f"  %cmr{j} = vector.extract {msr}[{n}] : vector<{nc}xf32> -> f32")
         if n:
             e(f"  %clt{j} = scalar.cmpf olt, %cmr{j}, {bm} : f32")
-            if exact:
-                e(f"  %csn{j} = scalar.minnumf<nnan> {sm}, %cmr{j} : f32")
-                e(f"  %csm{j} = scf.select %clt{j}, {bm}, %csn{j} : f32")   # the runner-up: ties land here
             e(f"  %cbm{j} = scf.select %clt{j}, %cmr{j}, {bm} : f32")
             e(f"  %cbd{j} = scf.select %clt{j}, %dj{j}, {best} : f32")
             e(f"  %cbi{j} = scf.select %clt{j}, %ij{j}, {bi} : f32")
             e(f"  %cbn{j} = scf.select %clt{j}, %nd{j}, {bn} : f32")
             best, bi, bn, bm, sm = f"%cbd{j}", f"%cbi{j}", f"%cbn{j}", f"%cbm{j}", f"%csm{j}"
-    if exact:
-        best, bi, bn = _fallback(e, exact_search, x2, amax, best, bi, bn, bm, sm)
-        # the winner's clamped codes again, by its candidate pass's ops: selecting the 8 candidates' codes instead costs
-        # 112 v_cndmask and keeps them all live (192 vs 96 VGPRs, +6% cycles)
-        e(f"  %wiv = vector.splat {bi} : vector<16xf32>")
-        e(f"  %wnv = vector.splat {bn} : vector<16xf32>")
-        e("  %wq0 = vector.mulf %xq, %wiv : vector<16xf32>")
-        e("  %wrr = vector.fmaf %wq0, %wnv, %xq : vector<16xf32>")
-        e("  %wqd = vector.fmaf %wrr, %wiv, %wq0 : vector<16xf32>")
-        e("  %wqr = vector.roundevenf %wqd : vector<16xf32>")
-        e("  %wql = vector.maxnumf<nnan> %wqr, %fl8v : vector<16xf32>")
-        e("  %wqc = vector.minnumf<nnan> %wql, %fh7v : vector<16xf32>")
-        _pack(e, total, span, "%wqc", best)
-    else:
-        e(f"  %wiv = vector.splat {bi} : vector<16xf32>")
-        e("  %wqd = vector.mulf %xq, %wiv : vector<16xf32>")
-        e("  %wqr = vector.addf %wqd, %fmgv : vector<16xf32>")
-        e("  %wql = vector.maxnumf<nnan> %wqr, %fmlv : vector<16xf32>")
-        e("  %wqc = vector.minnumf<nnan> %wql, %fmhv : vector<16xf32>")
-        _pack(e, total, span, "%wqc", best, magic=True)
-
-
-def _fallback(e, exact_search, x2, amax, best, bi, bn, bm, sm):
-    """The fast search's bound check: near ties run the exact search (see _quant); returns the winner's d, RN(1 / d), -d."""
-    e("  %bk14 = scalar.constant 6.103515625e-05 : f32")   # 2^-14
-    e("  %bk21 = scalar.constant 4.76837158203125e-07 : f32")   # 2^-21
-    e("  %bk46 = scalar.constant 1.4210854715202004e-14 : f32")   # 2^-46
-    e("  %bk115 = scalar.constant 2.407412430484045e-35 : f32")   # 2^-115
-    for nm, v in (("bb", bm), ("bs", sm)):
-        e(f"  %{nm}p = scalar.mulf {x2}, {v} : f32")
-        e(f"  %{nm}r = scalar.sqrtf %{nm}p : f32")
-        e(f"  %{nm}1 = scalar.mulf {v}, %bk14 : f32")
-        e(f"  %{nm}2 = scalar.fmaf %{nm}r, %bk21, %{nm}1 : f32")
-        e(f"  %{nm}3 = scalar.fmaf {x2}, %bk46, %{nm}2 : f32")
-        e(f"  %{nm} = scalar.addf %{nm}3, %bk115 : f32")
-    e(f"  %bhi = scalar.addf {bm}, %bb : f32")
-    e(f"  %slo = scalar.subf {sm}, %bs : f32")
-    e("  %cok = scalar.cmpf ogt, %slo, %bhi : f32")
-    e("  %cbad0 = scf.select %cok, %fz, %fone : f32")
-    e("  %ctiny = scalar.constant 9.313225746154785e-10 : f32")   # 2^-30
-    e(f"  %catn = scalar.cmpf olt, {amax}, %ctiny : f32")
-    e("  %cbad1 = scf.select %catn, %fone, %cbad0 : f32")
-    e(f"  %caz = scalar.cmpf oeq, {amax}, %fz : f32")
-    e("  %cbad = scf.select %caz, %fz, %cbad1 : f32")
-    e("  %cnbad = kernel.subgroup.reduce<addf> %cbad : f32")
-    e("  %canyb = scalar.cmpf ogt, %cnbad, %fz : f32")
-    e("  %wd, %wi, %wn = scf.if %canyb -> (f32, f32, f32) {")
-    xb = exact_search()
-    e(f"    scf.yield {xb[0]}, {xb[1]}, {xb[2]} : f32, f32, f32")
-    e("  } else {")
-    e(f"    scf.yield {best}, {bi}, {bn} : f32, f32, f32")
-    e("  }")
-    return "%wd", "%wi", "%wn"
+    e(f"  %wiv = vector.splat {bi} : vector<16xf32>")
+    e("  %wqd = vector.mulf %xq, %wiv : vector<16xf32>")
+    e("  %wqr = vector.addf %wqd, %fmgv : vector<16xf32>")
+    e("  %wql = vector.maxnumf<nnan> %wqr, %fmlv : vector<16xf32>")
+    e("  %wqc = vector.minnumf<nnan> %wql, %fmhv : vector<16xf32>")
+    _pack(e, total, span, "%wqc", best, magic=True)
 
 
 def _pack(e, total, span, fc, best, magic=False):
@@ -1422,7 +1318,7 @@ def gen_pnqp(rows, span, P, flag, dflag):
     nx = ng // 4
     per = nx * FLAG_TT
     assert P <= per
-    cm = QP_CM and P % nx == 0
+    cm = (P % nx == 0)
     total = K * rows
     rtotal = ng * 256 * rows
     LV = f"view<{4 * 16 * PITCH}xf32>"

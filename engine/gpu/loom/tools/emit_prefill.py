@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
-"""Helpers for the HAL emitters (emit_prefill_pp.py, emit_decode.py): the GGUF tensor table, the format map and emit().
+"""Helpers for the HAL emitters (emit_prefill_pp.py, emit_decode.py): the model's tensor table, the format map and emit().
 
 Naming convention, so the C++ driver needs no manifest:
   <outdir>/gemm_<kind>_<fmt>_<m_tiles>_<k_blocks>.hal
   <outdir>/<fixed>.hal   for the non-GEMM kernels
 """
-import os, re, struct, subprocess, sys
+import os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOOM = os.path.abspath(os.path.join(HERE, ".."))
 EMIT = os.path.join(LOOM, "emit_hal.py")
 
-# ggml type -> (short name, short name, qk)
-FMT = {
-    12: ("q4k", "q4k", 256), 13: ("q5k", "q5k", 256), 14: ("q6k", "q6k", 256),
-    11: ("q3k", "q3k", 256), 23: ("iq4xs", "iq4xs", 256), 21: ("iq3s", "iq3s", 256),
-    18: ("iq3xxs", "iq3xxs", 256), 20: ("iq4nl", "iq4nl", 32),
-    17: ("iq2xs", "iq2xs", 256), 8: ("q8_0", "q8_0", 32),
-    16: ("iq2xxs", "iq2xxs", 256), 10: ("q2k", "q2k", 256),
-    44: ("mq4", "mq4", 256),   # hipfire MQ4G256 (HFQ models; not a ggml type)
-}
+# tensor type -> (short name, short name, qk); the GEMMs and GEMVs run only MQ4 (the GGUF formats went with the GGUF
+# model path, tag pre-cleanup-2026-10-20)
+FMT = {44: ("mq4", "mq4", 256)}   # hipfire MQ4G256 (HFQ models; not a ggml type)
 KSTORE = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight",
           "ssm_beta.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
           "ffn_gate.weight"}
@@ -28,35 +22,12 @@ SWIGLU = {"ffn_up.weight"}
 
 
 def parse(model):
-    """Return [(name, dims, ggml type)] for every tensor of a GGUF file, or of an HFQ one as the engine sees it."""
-    f = open(model, "rb")
-    if f.read(4) == b"HFQM":
-        dump = os.path.join(LOOM, "..", "..", "build", "yah-dump")
-        out = subprocess.run([dump, model, "--table"], capture_output=True, text=True, check=True).stdout
-        return [(p[0], [int(d) for d in p[2:]], int(p[1])) for p in (ln.split() for ln in out.splitlines())]
-    f.seek(8)
-    nt, nkv = struct.unpack("<QQ", f.read(16))
-    SIZ = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
-    def rd():
-        n = struct.unpack("<Q", f.read(8))[0]; return f.read(n).decode("utf-8", "replace")
-    def skip(t):
-        if t == 8: rd()
-        elif t == 9:
-            et = struct.unpack("<I", f.read(4))[0]; n = struct.unpack("<Q", f.read(8))[0]
-            if et == 8:
-                for _ in range(n): rd()
-            else: f.seek(SIZ[et] * n, 1)
-        else: f.seek(SIZ[t], 1)
-    for _ in range(nkv):
-        rd(); t = struct.unpack("<I", f.read(4))[0]; skip(t)
-    rows = []
-    for _ in range(nt):
-        nm = rd(); nd = struct.unpack("<I", f.read(4))[0]
-        dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
-        ty = struct.unpack("<I", f.read(4))[0]
-        f.read(8)
-        rows.append((nm, dims, ty))
-    return rows
+    """Return [(name, dims, type)] for every tensor of an HFQ model as the engine sees it (yah-dump --table)."""
+    if open(model, "rb").read(4) != b"HFQM":
+        raise SystemExit("%s: not an HFQ model (the GGUF model path is gone since tag pre-cleanup-2026-10-20)" % model)
+    dump = os.path.join(LOOM, "..", "..", "build", "yah-dump")
+    out = subprocess.run([dump, model, "--table"], capture_output=True, text=True, check=True).stdout
+    return [(p[0], [int(d) for d in p[2:]], int(p[1])) for p in (ln.split() for ln in out.splitlines())]
 
 
 def sym_of(loomfile):

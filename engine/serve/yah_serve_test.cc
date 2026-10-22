@@ -2,7 +2,7 @@
 // 1. The C++ chat template against renders frozen from the GGUF's Jinja template (testdata/chat_template_cases.json).
 // 2. yah_server --fake over HTTP: the Responses API object and stream shapes, errors, and client disconnect.
 //
-// usage: yah_serve_test <model.gguf> [yah_server]   (default: yah_server next to this binary)
+// usage: yah_serve_test <model> [yah_server]   (default: yah_server next to this binary)
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -764,7 +764,7 @@ class Tester {
 
 int main(int argc, char** argv) {
   if (argc < 2 || argc > 3) {
-    std::fprintf(stderr, "usage: yah_serve_test <model.gguf> [yah_server]\n");
+    std::fprintf(stderr, "usage: yah_serve_test <model> [yah_server]\n");
     return 2;
   }
   const std::filesystem::path dir = std::filesystem::read_symlink("/proc/self/exe").parent_path();

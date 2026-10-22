@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # GPU generation gate: 20 greedy tokens from a fixed prompt must equal the recorded reference, token for token.
 #
-# Usage: generate_gate.sh <model.gguf> [hal-dir]
+# Usage: generate_gate.sh <model> [hal-dir]
 set -euo pipefail
-model="${1:?usage: generate_gate.sh <model.gguf> [hal-dir]}"
+model="${1:?usage: generate_gate.sh <model> [hal-dir]}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 bin="$root/engine/build/loom_decode"
 hal="${2:-${YAH_HAL:-$root/engine/hal}}"

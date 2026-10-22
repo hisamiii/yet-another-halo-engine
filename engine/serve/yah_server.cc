@@ -24,9 +24,9 @@ using namespace yah::serve;
 
 int Usage() {
   std::fprintf(stderr,
-               "usage: yah_server --model <gguf> --prefill <hal set> --decode <hal set> [--host 127.0.0.1] "
+               "usage: yah_server --model <model> --prefill <hal set> --decode <hal set> [--host 127.0.0.1] "
                "[--port 8080]\n"
-               "       yah_server --model <gguf> --fake [--host ...] [--port ...]   canned replies, no GPU\n");
+               "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n");
   return 2;
 }
 

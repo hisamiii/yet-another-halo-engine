@@ -1,6 +1,6 @@
 // loom_forward_pp: the Loom prefill on HRX (model/loom_prefill.hpp) as a command-line tool.
 //
-// usage: loom_forward_pp <model.gguf> <haldir> <out-prefix> [tokens] [ids-file]
+// usage: loom_forward_pp <model> <haldir> <out-prefix> [tokens] [ids-file]
 // outputs: <out-prefix>.logits (vocab f32, last token) and <out-prefix>.hidden (B x 5120 f32, token major, last chunk;
 //          rows past a partial chunk's tokens are padding)
 // tokens: any count up to the set's context; the last chunk may be partial (masked prefill, as the Engine runs it).
@@ -86,7 +86,7 @@ void WriteRowStats(FILE* f, const float* lg, std::uint32_t pos, std::int32_t nxt
 
 int main(int argc, char** argv) {
   if (argc < 4) {
-    std::fprintf(stderr, "usage: loom_forward_pp <model.gguf> <haldir> <out-prefix> [tokens] [ids-file]\n");
+    std::fprintf(stderr, "usage: loom_forward_pp <model> <haldir> <out-prefix> [tokens] [ids-file]\n");
     return 2;
   }
   const std::string prefix = argv[3];

@@ -7,19 +7,17 @@ The driver runs T / B chunks and carries the DeltaNet and conv states. YAH_KV se
 dispatch.txt has one row per HAL, "<hal> <tokens per workgroup> <row groups> <token_tiles>", plus mode marker rows.
 HAL names follow emit_prefill.py.
 
-usage: emit_prefill_pp.py <model.gguf> <outdir> [tokens]   (default 2048 tokens)
+usage: emit_prefill_pp.py <model> <outdir> [tokens]   (default 2048 tokens; an HFQ MQ4 model)
 """
-import dataclasses, functools, json, os, re, subprocess, sys, shutil
+import dataclasses, os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import emit_prefill as E  # noqa: E402
 import gen_attn_fa  # noqa: E402
-import gen_deltanet_hip  # noqa: E402
 import gen_gdn_chunk  # noqa: E402
 import gen_gdn_ss  # noqa: E402
 import gen_conv_kq  # noqa: E402
-import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
 import gen_decode_misc  # noqa: E402
 import gen_gemv  # noqa: E402
@@ -111,38 +109,6 @@ def rope_vtpage(text):
     return text
 
 
-def postnorm_tiled(text):
-    """Rewrite yah_ssm_postnorm_fp16 to store fragment-major for an afrag ssm_out (gen_gemm_tile Tile.atiled over
-    K = 6144 = 48 heads x 128): row (token, head) column c is k = head * 128 + c of that token."""
-    def r(a, b):
-        nonlocal text
-        assert text.count(a) == 1, a[:60]
-        text = text.replace(a, b)
-    r("  %c128 = index.constant 128 : index\n",
-      "  %c128 = index.constant 128 : index\n"
-      "  %pt16 = index.constant 16 : index\n"
-      "  %pt48 = index.constant 48 : index\n"
-      "  %pt256 = index.constant 256 : index\n"
-      "  %pt384 = index.constant 384 : index\n")
-    r("      view.store %half, %out_view[%off2] : f16, view<[%io_total]xf16>\n",
-      "      %pt_tok = index.div %head, %pt48 : index\n"
-      "      %pt_hh = index.rem %head, %pt48 : index\n"
-      "      %pt_k0 = index.mul %pt_hh, %c128 : index\n"
-      "      %pt_k = index.add %pt_k0, %column : index\n"
-      "      %pt_tt = index.div %pt_tok, %pt16 : index\n"
-      "      %pt_tr = index.rem %pt_tok, %pt16 : index\n"
-      "      %pt_kt = index.div %pt_k, %pt16 : index\n"
-      "      %pt_kr = index.rem %pt_k, %pt16 : index\n"
-      "      %pt_a = index.mul %pt_tt, %pt384 : index\n"
-      "      %pt_b = index.add %pt_a, %pt_kt : index\n"
-      "      %pt_c = index.mul %pt_b, %pt256 : index\n"
-      "      %pt_d = index.mul %pt_tr, %pt16 : index\n"
-      "      %pt_e = index.add %pt_c, %pt_d : index\n"
-      "      %pt_off = index.add %pt_e, %pt_kr : index\n"
-      "      view.store %half, %out_view[%pt_off] : f16, view<[%io_total]xf16>\n")
-    return text
-
-
 def postnorm_heads(text, h0, nh, B):
     """Restrict yah_ssm_postnorm_fp16 to heads h0 .. h0 + nh - 1 (config head_count = B * nh rows): row r is token r / nh,
     head h0 + r % nh, i.e. flat row (r / nh) * 48 + h0 + r % nh of the full [B][48][128] buffers. Same math per row."""
@@ -179,17 +145,14 @@ DNSPLIT = (40, 8)
 # DNVCONV: A4 dnperm sets without a NPU qkv split: the v channels' conv and alpha / beta run inside DeltaNet
 # (gen_gdn_chunk vconv), the conv kernel takes only the q / k heads (gen_conv_kq.gen(4096)) and prep_ab only advances
 # the conv ring, after both DeltaNet parts. Bit-identical; dispatch.txt "dnvconv <conv workgroups>".
-DNVCONV = True
 # DNO16: DeltaNet's output (the pnq input) as f16(O 2^8) in A4 dnperm sets (gen_gdn_chunk o16): not bit-exact; vs the
 # WT2 KL reference (24 chunks) mean 0.0671 / q99.9 2.026 / top-1 88.40% vs f32 0.0687 / 2.023 / 87.91%, inside the A4
 # redraw spread (0.0693-0.0695 / 2.15-2.27). Unscaled f16 failed the tail (q99.9 2.52: subnormal outputs).
-DNO16 = os.environ.get("YAH_DN_O16", "1") == "1"
 # DNSS: the dnperm parts as the state-stationary kernel (gen_gdn_ss: one workgroup per head, the state in registers, the
 # head's v-independent work once). Grid (1, heads) x gen_gdn_ss.THREADS (dispatch.txt "dnthreads"). pp2048 (sums over
 # 48 layers): part a 54.9 -> 36.1 ms; part b 27.3 -> 33.8 (8 workgroups, one per WGP: each head's serial chain, beside
 # pnq a). A ninth wave runs the solve beside the row waves' K S^T / Q S^T (X = T1 (K S^T), not bit-identical): part a
 # 34.5 -> 30.7 ms, part b 33.4 -> 31.0; WT2 KL 0.0671 -> 0.0683 / q99.9 2.026 -> 2.054, inside the redraw spread.
-DNSS = True
 
 
 def _rewrite(text, pairs):
@@ -201,19 +164,7 @@ def _rewrite(text, pairs):
 
 def conv_tb_ok(B):
     """The f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup applies."""
-    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and B % 32 == 0 and gen_gdn_chunk.CONV16
-
-
-def conv_x16(text):
-    """yah_ssm_conv_kq reading the qkv GEMM's f16 output (O16_MT 640): each tap widened back to f32 at its load."""
-    pairs = [("%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf32>",
-              "%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf16>")]
-    for v in ("s3", "x1", "x2", "x3"):
-        off = "%s3_off" if v == "s3" else f"%{v}_off"
-        pairs.append((f"    %{v} = view.load %x_view[{off}] : view<[%x_total]xf32> -> f32\n",
-                      f"    %{v}h = view.load %x_view[{off}] : view<[%x_total]xf16> -> f16\n"
-                      f"    %{v} = scalar.extf %{v}h : f16 to f32\n"))
-    return _rewrite(text, pairs)
+    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and gen_gdn_chunk.CONV16
 
 
 def prepab_x16(text):
@@ -270,48 +221,6 @@ def postnorm_g16(text):
          "%gh = view.load %gate_view[%off2] : view<[%io_total]xf16> -> f16\n      %g = scalar.extf %gh : f16 to f32\n")])
 
 
-def conv_n16(text):
-    """yah_ssm_conv_kq handing DeltaNet (gen_gdn_chunk CONV16) its f16 inputs: conv_out holds f16(v) for the v channels and
-    f16(k * inv_k), f16(q * q_scale) for the q / k channels, the f32 products and rounding DeltaNet did itself on the f32
-    conv_out, so the result is bit-identical. Lane 0 of a q / k workgroup also leaves inv_k / q_scale in LDS for the others."""
-    def rep(a, b):
-        nonlocal text
-        assert text.count(a) == 1, a
-        text = text.replace(a, b)
-    rep("%out_view = buffer.view %out_noalias[%base] : buffer -> view<[%x_total]xf32>",
-        "%out_view = buffer.view %out_noalias[%base] : buffer -> view<[%x_total]xf16>")
-    rep("%kq_bytes = index.constant 1024 : offset", "%kq_bytes = index.constant 1040 : offset")
-    text = text.replace("view<256xf32>", "view<258xf32>")
-    rep("    view.store %result, %out_view[%s3_off] : f32, view<[%x_total]xf32>\n", """    %is_v = index.cmp uge, %wg, %nkh : index
-    scf.if %is_v {
-      %result_h = scalar.fptrunc %result : f32 to f16
-      view.store %result_h, %out_view[%s3_off] : f16, view<[%x_total]xf16>
-    }
-""")
-    rep("        view.store %kq_all, %scales_view[%o2] : f32, view<[%scale_total]xf32>\n      }\n    }\n  }\n", """        view.store %kq_all, %scales_view[%o2] : f32, view<[%scale_total]xf32>
-        %ks_slot = index.constant 256 : index
-        %qs_slot = index.constant 257 : index
-        view.store %inv_k, %kq_lds[%ks_slot] : f32, view<258xf32>
-        view.store %q_scaled, %kq_lds[%qs_slot] : f32, view<258xf32>
-      }
-    }
-    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    %ks_at = index.constant 256 : index
-    %qs_at = index.constant 257 : index
-    %ks = view.load %kq_lds[%ks_at] : view<258xf32> -> f32
-    %qs = view.load %kq_lds[%qs_at] : view<258xf32> -> f32
-    %own_scale = scf.select %lane_hi, %ks, %qs : f32
-    %own = view.load %kq_lds[%lane] : view<258xf32> -> f32
-    %own_n = scalar.mulf %own, %own_scale : f32
-    %own_h = scalar.fptrunc %own_n : f32 to f16
-    %own_row = index.mul %t, %qkv_dim : index
-    %own_off = index.add %own_row, %c : index
-    view.store %own_h, %out_view[%own_off] : f16, view<[%x_total]xf16>
-  }
-""")
-    return text
-
-
 NORM_SPLIT = 2
 
 
@@ -327,21 +236,6 @@ def rope_live(text):
         out.append(line)
     assert n >= 5, n
     return "\n".join(out)
-
-
-def rope_q16(text):
-    """yah_fused_qk_rope_batched storing Q as f16(q * 0.0625): the attention's own Q scale and rounding (gen_attn_fa
-    Q16), done where Q is produced (half the Q bytes written and read; the same bits)."""
-    a = "%qo_view = buffer.view %qo_na[%base] : buffer -> view<[%q_elems]xf32>"
-    assert text.count(a) == 1
-    text = text.replace(a, a.replace("xf32>", "xf16>") + "\n  %qsc16 = scalar.constant 0.0625 : f32")
-    stores = re.findall(r"view\.store (%\w+), %qo_view\[(%\w+)\] : f32, view<\[%q_elems\]xf32>", text)
-    assert len(stores) == 3, stores
-    for v, i in stores:
-        text = text.replace(f"view.store {v}, %qo_view[{i}] : f32, view<[%q_elems]xf32>",
-                            f"%{v[1:]}q16s = scalar.mulf {v}, %qsc16 : f32\n      %{v[1:]}q16h = scalar.fptrunc %{v[1:]}q16s : f32 to f16\n"
-                            f"      view.store %{v[1:]}q16h, %qo_view[{i}] : f16, view<[%q_elems]xf16>")
-    return text
 
 
 def rope_konly(text):
@@ -361,54 +255,12 @@ def rope_konly(text):
     return text[:i] + text[j + len("\n  }\n"):]
 
 
-def rope_wait(text, need):
-    """rope_konly polling its token tile's k and v GEMM counters (bindings kcnt, vcnt after the others; gen_gemm_iu4
-    flag: need each) before any load: wave 0 polls relaxed, the barrier's global acquire after it."""
-    a = "%ptab: buffer) {"
-    assert text.count(a) == 1
-    text = text.replace(a, "%ptab: buffer, %kcnt: buffer, %vcnt: buffer) {")
-    a = "  %tid = kernel.workitem.id<x> : index\n"
-    assert text.count(a) == 1
-    poll = [
-        "  %rw_c32 = index.constant 32 : index",
-        "  %rw_c128 = index.constant 128 : index",
-        "  %rw_c127 = index.constant 127 : index",
-        "  %rw_b = config.get @yah_fused_qk_rope_batched.batch : index",
-        "  %rw_b1 = index.add %rw_b, %rw_c127 : index",
-        "  %rw_tt = index.div %rw_b1, %rw_c128 : index",
-        "  %rw_t = index.div %bi, %rw_c128 : index",
-        "  %rw_kna, %rw_vna = buffer.assume.noalias %kcnt, %vcnt : buffer, buffer",
-        "  %rw_kv = buffer.view %rw_kna[%base] : buffer -> view<[%rw_tt]xi32>",
-        "  %rw_vv = buffer.view %rw_vna[%base] : buffer -> view<[%rw_tt]xi32>",
-        "  %rw_w0 = index.cmp ult, %tid, %rw_c32 : index",
-        f"  %rw_need = scalar.constant {need} : i32",
-        f"  %rw_lim = scalar.constant {gen_rot.FLAG_POLLS} : i32",
-        "  %rw_z = scalar.constant 0 : i32",
-        "  %rw_one = scalar.constant 1 : i32",
-        "  scf.if %rw_w0 {",
-        "    %rw_n = scf.while(%rw_i = %rw_z : i32) -> (i32) {",
-        "      %rw_x = view.atomic.load %rw_kv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32",
-        "      %rw_y = view.atomic.load %rw_vv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32",
-        "      %rw_m = scalar.minsi %rw_x, %rw_y : i32",
-        "      %rw_e = scalar.cmpi slt, %rw_m, %rw_need : i32",
-        "      %rw_l = scalar.cmpi ult, %rw_i, %rw_lim : i32",
-        "      %rw_g = scalar.andi %rw_e, %rw_l : i1",
-        "      scf.condition %rw_g, %rw_i : i1, i32",
-        "    } do(%rw_j: i32) {",
-        "      %rw_j1 = scalar.addi %rw_j, %rw_one : i32",
-        "      scf.yield %rw_j1 : i32",
-        "    }",
-        "  }",
-        "  kernel.barrier<global> scope(workgroup) ordering(acquire)",
-    ]
-    return text.replace(a, a + "\n".join(poll) + "\n")
-
-
 def rope_kv(text, need=None):
     """rope_konly (KV16 + vtrope) rewritten wave-per-head: K workgroups (x < batch / 2) normalize, rotate and store 8
     (token, KV head) rows, one per wave; V workgroups (batch / 4 more) store one KV head of a 16-token tile as V^T,
     lane = dim, one 32 B row per lane. Same ops and sum order as the workgroup reduce (per-32 subgroup reduces, then
-    the 8 partials as a cluster-8 tree), so the same bits. need: wait for the k / v GEMM counters (rope_wait)."""
+    the 8 partials as a cluster-8 tree), so the same bits. need: wait for the k / v GEMM counters (gen_gemm_iu4 flag:
+    need each) before any load (ropew)."""
     S = "@yah_fused_qk_rope_batched"
     L = [text[:text.index("kernel.def ")]]
     e = L.append
@@ -624,10 +476,6 @@ def rope_kv16(text):
     return text
 
 
-def qk_of(fmt):
-    return next(qk for f, _, qk in E.FMT.values() if f == fmt)
-
-
 def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
     """Emit the tile GEMM (tools/gen_gemm_tile.py) of this shape and kind; return its dispatch.txt row, or None."""
     r = tile_kstore(fmt, mt, kb, B, out, outdir, kind)
@@ -644,51 +492,42 @@ OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (1
 # From KT2_FROM keys of context on (fp16 attention), a chunk runs the 32-key-tile role-split kernel (gen_attn_fa KT2):
 # 3 workgroups per WGP, one barrier pair / reduction / rescale vote per 32 keys; -0.8% at 16K, -1.8% at 32K, -3..-5.6% at
 # 88K..126K vs the 4-workgroup kernel / the deep twin (standalone); not bit-identical (the running max moves per 32 keys).
-KT2_FROM = int(os.environ.get("YAH_KT2_FROM", "16384"))
+KT2_FROM = 16384
 # Block-sparse prefill attention (gen_fpsparse, FlashPrefill V2) from YAH_FPS_FROM tokens of context on (0: off), kv4 paged
 # sets with the KT2 twin only (its chunks take the sparse KT2 twin whatever KT2_FROM is). 32K, alpha 0.1: from 4096 vs
 # 16384 -2.5% cycles at the same quality (KL / needles / answer tile within the redraw band).
-# YAH_FPS_ALPHA: the block threshold (fraction of the query block's top block score).
 # The f16 pools grow by the pooled-row pages (every attention HAL and vdeq use the extended capacity).
 # dispatch.txt "fpsparse <first chunk> <extension pages> <list stride>"
 FPS_FROM = int(os.environ.get("YAH_FPS_FROM", "0"))
-FPS_ALPHA = float(os.environ.get("YAH_FPS_ALPHA", str(gen_fpsparse.ALPHA)))
-FPS_ORD = os.environ.get("YAH_FPS_ORD", "1") != "0"   # yah_fpord launch order (longest tile list first); 0: by query block
+FPS_ORD = True   # yah_fpord launch order (longest tile list first)
 QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
 # QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
 QG16 = True
 QG16_ON = False   # set by main
 # KV16 (A4): the K / V GEMMs (kstore, 1024 rows) store f16, RoPE widens them (rope_kv16). dispatch.txt "kv16in"
-KV16 = True
 KV16_ON = False   # set by main
 # NQOV (A4): every kres also as iu4_kresf_* (gen_gemm_iu4 flag: per-token-tile completion counters) and normq as
 # normqf_5120 (gen_rot.gen_nq flag: rows wait for their token tile), so the driver records the norm after its kres
 # with no graph barrier and the norm runs in the GEMM's tail. Same values. dispatch.txt "nqov"
-NQOV = True
 NQOV_ON = False   # set by main
 # DNOV (A4 dnvconv, with DNSPLIT (40, 8)): the qkv and gate kstores also flagged (iu4_kstoref_*, iu4_kstorehf_*), the
 # conv as convkqf and pnq part a as pnq_af waiting on their counters, so the conv runs in the qkv GEMM's tail and pnq
 # part a in the gate GEMM's. Same values. dispatch.txt "dnov"
-DNOV = True
 DNOV_ON = False   # set by main
 # CONVP (with DNOV): the flagged conv as gen_conv_kq.gen_p (persistent workgroups walking (key head, token tile)
 # segments, convkqp.hal) instead of gen's grid of 16-token workgroups: conv exposure 5.3-5.5 -> 4.2 ms per pp2048
 # (64-token segments over 512 workgroups: -> ~1.9 ms). Same values
-CONVP = True
 # GUOV (A4): the gu GEMM also as iu4_guf_* (gen_gemm_iu4 flag: a counter per 1024 features and token tile) and
 # rotq_17408 as rotqf_17408 (gen_rot.gen_q flag), so the down projection's rotq runs in the gu GEMM's tail. Same values.
 # dispatch.txt "guov"
-GUOV = True
 GUOV_ON = False   # set by main
 # NQGU (A4, with NQOV and GUOV): normq also as normqo_5120 / normqfo_5120 (gen_rot.gen_nq oflag: per-token-tile counters)
 # and the flagged gu as iu4_gufw_* (gen_gemm_iu4 wait), so the driver records the gu GEMM after its norm with no graph
 # barrier and its first workgroups start in the norm's tail. Same values. dispatch.txt "nqgu"
-NQGU = True
 NQGU_ON = False   # set by main
 # RQK (A4, with NQOV): the residual rotqs also as rotqfo_17408 / rotqo_6144 (gen_rot.gen_q oflag) and the flagged kres as
 # iu4_kresfw_* (gen_gemm_iu4 wait), so the driver records the kres after its rotq with no graph barrier. Same values.
 # dispatch.txt "rqk"
-RQK = True
 RQK_ON = False   # set by main
 # RQP (with RQK and GUOV): the down projection's rotq also as rotqp_17408 (gen_rot.gen_qp: RQP persistent workgroups
 # walking the token tiles in order), so the kres after it is not queued behind 34816 rotq workgroups and starts on the
@@ -702,14 +541,11 @@ RQOP = 160
 # and the attention-out rotq as rotqopf_6144 (gen_qp waiting on them), so no graph barrier separates the two: the rotq
 # runs in the attention's tail (polling at priority 0 beside it): attention start .. kres end -131 us per attention
 # layer. Same values. dispatch.txt "aov"
-AOV = True
 # ROPEW (with NQW and QNORM): the attention's k / v GEMMs also as iu4_kstorefw_* (per-token-tile counters) and RoPE as
-# ropew[_c<i>].hal (rope_wait: a workgroup polls its token tile's k and v counters), so no graph barrier separates
+# ropew[_c<i>].hal (rope_kv need: a workgroup polls its token tile's k and v counters), so no graph barrier separates
 # them: RoPE runs in the v GEMM's tail. Same values. dispatch.txt "ropew"
-ROPEW = True
 # ROPEKV (QNORM, KV16, vtrope): RoPE as rope_kv (wave-per-head K, coalesced V^T tiles), grid (3 * batch / 4).
 # Same values. dispatch.txt "ropekv"
-ROPEKV = True
 # NQP: the flag-counting normq (normq[f]o: its GEMM waits on the counters) as NQP persistent workgroups (gen_nq persist),
 # so the waiting GEMM is dispatched while the rows run. Same values. dispatch.txt "nqp <NQP>"
 NQP = 64
@@ -721,12 +557,10 @@ PNQP = 120
 # NQW (A4): the attention and DeltaNet input GEMMs (kqg, kstore K / V / alpha / beta, the flagged qkv kstore) also as
 # iu4_<kind>[f]w_* (gen_gemm_iu4 wait) on the attention norm's counters (normq[f]o_5120), so the driver records them after
 # the norm with no graph barrier. Same values. dispatch.txt "nqw"
-NQW = True
 NQW_ON = False   # set by main
 # DNRING (A4, with DNOV's pnq_abf, RQK, NQW): the conv ring update as prepabr (prepab_ring: waits on DeltaNet part b's
 # counter, counts) before the pnq, pnq_abfr waiting on it and counting rows for ssm_out's kres (iu4_kresfw_*), so a
 # DeltaNet layer's tail and the next layer's input GEMMs need no graph barrier. Same values. dispatch.txt "dnring"
-DNRING = True
 DNRING_ON = False   # set by main
 # QNSTREAM + QNMIX: the QNORM prologue one fragment at a time (its 255-VGPR peak had pushed both role-split twins past 240,
 # so KT2 fell back and the deep twin ran 2 workgroups per WGP; 96K deep attention -13%); MAXNN + SUM0 (KT2 -1.35%)
@@ -763,32 +597,18 @@ ATTN_VGPR = 192   # every attention variant fits here unless the allocator rotat
 
 
 def hal_vgprs(hal):
-    notes = subprocess.run(["/opt/rocm/llvm/bin/llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
+    notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
     m = re.search(r"\.vgpr_count:\s*(\d+)", notes)
     return int(m.group(1)) if m else 0
 
 
 def hal_spills(hal):
-    notes = subprocess.run(["/opt/rocm/llvm/bin/llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
+    notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
     m = re.search(r"\.private_segment_fixed_size:\s*(\d+)", notes)
     return int(m.group(1)) if m else 0
 
 
 QROT_FROM = 12288   # kv4: the first context position whose chunk rotates Q in its own kernel (see the attention)
-MODEL = None  # set by main(): tiles() reads this model's table
-
-
-@functools.cache
-def tiles():
-    """The autotuner's table for MODEL (tune_table.py: YAH_TILES or engine/tune/tables/<model>.json):
-    {"tiles": {hal: knobs}, "variants": {hal: [knobs incl. "bn", ...]}, "pick": {hal: {max tokens: bn}},
-     "norm": {...}, "rw": {...}}. A flat {hal: knobs, ...} file is read as its "tiles"."""
-    import tune_table
-    t = tune_table.load(MODEL) if MODEL else {}
-    if "tiles" not in t:
-        t = {"tiles": {k: v for k, v in t.items() if k.startswith("gemm_")},
-             **{k: v for k, v in t.items() if not k.startswith("gemm_")}}
-    return t
 
 
 # Narrower token tiles for chunks with few real tokens; the driver picks one per chunk (LoomPrefill::PickGemm).
@@ -798,18 +618,14 @@ NARROW = ((128, 2), (64, 2))
 
 
 
-
 def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
-    """Emit "<hal>.t<BN>.hal" for each narrow token tile of this GEMM (the tuner's "variants", else NARROW on the
-    default tile), plus the tuner's per-bucket choices as "pick:<hal>:<max tokens> <max tokens> <bn> 0" rows."""
+    """Emit "<hal>.t<BN>.hal" for each NARROW token tile of this GEMM."""
     import gen_gemm_tile as TG
-    if fmt not in TILE_FMTS or mt < 4:
+    if mt < 4:
         return []
-    base, rows = TG.default_tile(fmt, kind, kb), []
-    full = dataclasses.replace(base, **tiles()["tiles"].get(out[:-4], {}))
-    tuned = tiles().get("variants", {}).get(out[:-4])
-    for knobs in (tuned if tuned is not None else [{"bn": bn, "wn": wn} for bn, wn in NARROW]):
-        t = dataclasses.replace(base, **knobs)
+    full, rows = TG.default_tile(fmt, kind, kb), []
+    for bn, wn in NARROW:
+        t = dataclasses.replace(full, bn=bn, wn=wn)
         bn = t.bn
         try:
             TG.check(t)
@@ -822,164 +638,6 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
                       t.rowgrp, masked)
         if r:
             rows.append(r)
-    for maxtok, bn in sorted(tiles().get("pick", {}).get(out[:-4], {}).items(), key=lambda kv: int(kv[0])):
-        rows.append(("pick:%s:%s" % (out, maxtok), int(maxtok), int(bn), 0))
-    return rows
-
-
-# Formats the tile GEMM (tools/gen_gemm_tile.py) is verified bit-identical on in the pp2048 pipeline.
-TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "q3k", "q8_0", "mq4")
-
-
-# Activations-from-global GEMMs (gen_gemm_tile Tile.afrag): "<hal>.af.hal" reads a fragment-major input (Tile.atiled; the
-# FFN norm "norm_t.hal" and the swiglu "<hal>.af.to.hal" write it). 512-token tiles, only the decoded weights in LDS.
-# Same values as the GEMM. YAH_AFRAG=0 leaves them out.
-AFRAG = os.environ.get("YAH_AFRAG", "1") != "0"
-AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, stg_minwg=0,
-               tallepi=True, ecoal=True, esr=32)
-AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
-# IQ3_S: step 1's B prefetch issued with step 0's, before the decode; otherwise the allocator copies one of its fragments
-# right after its load, which drains vmcnt(0) once per phase (IQ4_XS: 200 VGPRs with it, fused IQ3_S ffn: 216)
-AF_PIPE3 = dict(AF_PIPE, b0early=2)
-AF_KQ = dict(rhs_outer=False, rhs_fence=0)   # K-quants without B prefetch (Q6_K: 208 VGPRs with it)
-# Q4_K / Q3_K / Q5_K with the B prefetch: their decoders came down to 184-192 VGPRs (Q4DFMA, Q3_FMIX), so it fits now:
-# -3.6..-4.0% clock-free (Q4_K swiglu -5.6%, kstore 64 -5.5%)
-AF_KQP = dict(AF_KQ, **AF_PIPE, lhs_stream=4)
-# The GEMMs with an afrag form and their knobs on top of AF_TILE; clock-free vs the GEMM (one round each, 2026-10-03).
-# The best lhs_stream depends on the decoder's register allocation: IQ3_XXS kstore without it waits vmcnt(0) twice per
-# phase on the step-1 B prefetch. Q3_K: the prefetch needs 208 VGPRs (one workgroup per WGP). IQ3_XXS: lhs_stream=1 with
-# the gen_gemm_decode.IQ3_SGTAB sign table (deeper A streaming splits the A-fragment tuples at the 192-VGPR tier: 8 copies
-# per k step); alone it is neutral, with the table -0.7..-1.0% (one process A/B 2026-10-04). Not the fused ffn: its
-# fragment-major-output form loses +1.3% with the table although its loop drops 32 VALU; nor swiglu (same, +1.3% in pp2048).
-# IQ3_S (256-entry table of the block's sign bytes): kres 320x68 -0.7%, kqg -1.0%, kstore 384 -0.5%; kstore 1088 / 640
-# +0.5 / +0.2% and the fragment-major ffn / swiglu +0.7 / +2.2% keep the spread.
-# f16p (IQ3 decode bytes as f16 subnormal pairs, one v_perm for the odd bytes; -11..-15 loop VALU): IQ3_S kstore 1088 /
-# kres 320x68 / kqg / swiglu -0.25..-0.55%, fused ffn IQ3_XXS / IQ3_S -0.35%; IQ3_XXS kstore / kqg neutral, kres +1.8% (not).
-# gaddr (IQ3 grid / sign-table lookups at pre-scaled byte offsets on byte views of the LDS tables: IQ3_XXS -15, IQ3_S
-# -17..-23 loop VALU; one process A/B 2026-10-04): IQ3_XXS kstore -0.3..-0.8%, kqg -0.25%, kres -0.6..-1.2%, swiglu -0.7%;
-# IQ3_S kstore 640 / kqg -0.25..-0.3%, kres -0.8..-1.0%. Not: IQ3_S kstore 384 (200-208 VGPRs at every lhs_stream, +12%),
-# IQ3_S kstore 1088 / swiglu and both fused ffn (neutral).
-# f16s (IQ3 signed f16 subnormal pairs: two v_perm per grid word instead of sign xor / add + pair split, fma addend +0;
-# IQ3_XXS loop VALU 156 -> 114; one process A/B 2026-10-04): IQ3_XXS kstore / kqg -1.2..-1.5% (lhs_stream=3), kres -0.85%
-# (wlate=False: 188 VGPRs, else 200-208), swiglu -0.4%, fused ffn -1.0% (no sign table); IQ3_S kstore -0.8..-1.5%,
-# kqg -1%, kres -0.7..-1.7%, fused ffn -0.5%. Not: IQ3_S swiglu (+0.2..+25%).
-# tallepi (kstore / kres): the LDS epilogue in 16-row slabs; the fragment stores cost the K = 6144 kres 15%.
-AF = {
-    ("iq3s", "kstore", 1088, 20): dict(AF_PIPE3, lhs_stream=2, f16p=True, f16s=True, sgtab=True),  # -9.1%
-    ("iq4xs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                 # -12.9%
-    ("iq3xxs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -11.3%
-    ("q3k", "kstore", 1088, 20): dict(AF_KQP),                                  # -7.2%
-    ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE3, lhs_stream=2, swepi=False, f16p=True),     # -11.6%
-    ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
-    ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False, gaddr=True, f16s=True),  # -12.1%
-    ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, f16p=True, gaddr=True, f16s=True,
-                                    persist=dict(b0early=True, lhs_stream=2)),               # -8.6%
-    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -10.4%
-    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
-                                      persist=True),                                         # -8.2%
-    ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
-    ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
-    # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
-    ("iq3s", "kres", 320, 24): dict(AF_PIPE3, gaddr=True, f16s=True, sgtab=True,
-                                    persist=dict(b0early=True, lhs_stream=2)),               # -8.8%
-    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
-                                      persist=True),                                         # -8.5%
-    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -8.8%
-    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),             # -5.3%
-    # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
-    ("iq3s", "kstore", 640, 20): dict(AF_PIPE3, lhs_stream=3, gaddr=True, f16s=True),       # -9.6%
-    ("iq4xs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=2),                  # -10.3%
-    ("iq3xxs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -11.4%
-    ("q4k", "kstore", 640, 20): dict(AF_KQP),                                   # -7.4%
-    ("q3k", "kstore", 640, 20): dict(AF_KQP),                                   # -7.7%
-    ("iq3s", "kstore", 384, 20): dict(AF_PIPE3, lhs_stream=3, sgtab=True, f16s=True),       # -9.4%
-    ("iq4xs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=2),                  # -9.9%
-    ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -10.9%
-    ("q4k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.0%
-    ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
-    ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
-    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
-    # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
-    ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, lhs_stream=1, sgtab=True, f16p=True, gaddr=True, f16s=True),  # -8.4%
-    ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
-    ("iq3xxs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -9.3%
-    ("q4k", "kqg", 768, 20): dict(AF_KQP),                                      # -6.7%
-    ("q3k", "kqg", 768, 20): dict(AF_KQP),                                      # -5.0%
-    ("q5k", "kqg", 768, 20): dict(AF_KQP, ksl=True),                            # -10.8%
-    ("iq4xs", "kstore", 64, 20): dict(AF_PIPE),                                 # -15.7%
-    ("q4k", "kstore", 64, 20): dict(AF_KQP),                                    # -16.0%
-    ("q5k", "kstore", 64, 20): dict(AF_KQP, ksl=True),                          # -10.4%
-    ("q6k", "kstore", 64, 20): dict(AF_KQ, ksl=True, wlate=True),               # -10.2% (208 VGPRs: 32 workgroups anyway)
-    # IQ2: the grid / sign lookups leave no room for B prefetch (bpre 1-2: 208-216 VGPRs, one workgroup per WGP)
-    ("iq2xxs", "kstore", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),   # -19.3%
-    ("iq2xxs", "swiglu", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),   # -16.6%
-    ("iq2xs", "kstore", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),    # -18.4%
-}
-
-
-# Fused ffn_gate + ffn_up (gen_gemm_tile kind "ffn"): one afrag GEMM writes f16(silu(gate) * up) for layers whose gate
-# and up share a format (the driver binds both tensors as one: the GGUF stores ffn_up right after ffn_gate). Same
-# values as kstore + swiglu. vs the two afrag GEMMs, clock-free (2026-10-03, fast reciprocal in both): IQ3_S -3.5%,
-# IQ4_XS -0.9%, IQ3_XXS -3.1%.
-AF_FFN = {
-    "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True, f16s=True),
-    "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False),
-    # IQ3_XXS: f16s without a sign table (-1.0%; with the packed sgtw=1 table +0.9..+1.6%, which itself had been -0.5%
-    # over the plain f16p form; the two-word table +1.3%: LDS bank conflicts 13.9 -> 23.8 M cycles, LDS issue waits +62%)
-    "iq3xxs": dict(AF_PIPE, lhs_stream=1, swepi=False, f16p=True, gaddr=True, f16s=True),
-}
-
-
-def ffn_fused(rows, B, outdir):
-    """Emit "gemm_ffn_<fmt>_<mt>_<kb>.af.hal" / ".af.to.hal" for each AF_FFN format some layer uses for both its gate
-    and up; return the dispatch.txt rows."""
-    import gen_gemm_tile as TG
-    if not AFRAG or B % AF_TILE["bn"]:
-        return []
-    by = {}
-    for nm, dims, ty in rows:
-        parts = nm.split(".")
-        if len(parts) > 2 and parts[0] == "blk" and parts[2] in ("ffn_gate", "ffn_up") and E.FMT.get(ty):
-            by.setdefault(parts[1], {})[parts[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
-    out = []
-    for fmt, mt, kb in sorted({l["ffn_gate"] for l in by.values() if l.get("ffn_gate") == l.get("ffn_up")}):
-        if fmt not in AF_FFN:
-            continue
-        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
-        for suffix, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
-            TG.check(tt)
-            r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, fmt, mt, kb, B,
-                          "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, suffix), outdir, "ffn", tt.rowgrp)
-            if r:
-                out.append(r)
-    return out
-
-
-def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
-    """Emit "<hal>.af.hal" (and for swiglu "<hal>.af.to.hal", fragment-major output) if this GEMM has an afrag form."""
-    import gen_gemm_tile as TG
-    knobs = AF.get((fmt, kind, mt, kb))
-    if not AFRAG or knobs is None or B % AF_TILE["bn"]:
-        return []
-    knobs = dict(knobs)
-    persist = knobs.pop("persist", False)
-    t = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **knobs)
-    rows = []
-    for suffix, tt in [(".af.hal", t)] + ([(".af.to.hal", dataclasses.replace(t, tout=True))] if kind == "swiglu" else []):
-        TG.check(tt)
-        r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, fmt, mt, kb, B, out[:-4] + suffix, outdir, kind,
-                      tt.rowgrp)
-        if r:
-            rows.append(r)
-    if persist and kind == "kres" and B // t.bn > 1 and 2 * kb >= gen_kres_persist.SLICES:
-        # the persistent kres (gen_kres_persist): grid y = 1, each workgroup runs every token tile of its row block
-        # persist: True, or a dict of knobs for the persistent variant (its slice loads need registers: IQ3_S drops b0early 2)
-        pt = dataclasses.replace(t, **persist) if isinstance(persist, dict) else t
-        text = gen_kres_persist.persist(TG.gen(fmt, "kres", pt, False),
-                                        TG.gen(fmt, "kstore", dataclasses.replace(pt, respre=0), False), B // t.bn)
-        r = _emit_gen(lambda f, k: text, t.bn, fmt, mt, kb, B, out[:-4] + ".af.p.hal", outdir, kind, t.rowgrp)
-        if r:
-            rows.append(r)
     return rows
 
 
@@ -987,11 +645,7 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     """Emit the tile GEMM (tools/gen_gemm_tile.py) for this shape if it covers it; return its dispatch.txt row, else None.
     geom=(BM, BN, WM, WN) overrides the workgroup geometry for this one kernel."""
     import gen_gemm_tile as TG
-    if fmt not in TILE_FMTS:
-        return None
     t = TG.default_tile(fmt, kind, kb, geom)
-    if not geom and out[:-4] in tiles()["tiles"]:
-        t = dataclasses.replace(t, **tiles()["tiles"][out[:-4]])
     if mt % t.rowgrp:
         return None
     # a token tile that does not divide the chunk: the last tile is masked (gen_gemm_tile.gen masked=)
@@ -1010,7 +664,7 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     with open(src, "w") as fh:
         fh.write(gen(fmt, kind))
-    sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
+    sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg"}.get(kind, ""))
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     import subprocess
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
@@ -1071,15 +725,13 @@ def gemm_combos(rows):
 
 
 def gemm_kinds(kind, mt):
-    """HAL kinds emitted for a combo, in order; the driver runs the last one (kres over kstore, kqg over kstore)."""
-    return {"kstore": ["kstore"] + (["kqg"] if mt == 768 else []), "residual": ["kstore", "kres"],
-            "swiglu": ["swiglu"]}[kind]
+    """HAL kinds emitted for a combo: the attention q projection (768 row tiles) as kqg, the residual ones as kres."""
+    return {"kstore": ["kqg" if mt == 768 else "kstore"], "residual": ["kres"], "swiglu": ["swiglu"]}[kind]
 
 
 def main():
-    global MODEL, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
+    global QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
     model, outdir = sys.argv[1], sys.argv[2]
-    MODEL = model
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
     # GEMM tokens per workgroup of the hand-written sources
     TILE = 64
@@ -1099,17 +751,18 @@ def main():
     combos = gemm_combos(rows)
     types = {nm: ty for nm, _, ty in rows}
     # MQ4 (HFQ) models: A4 prefill (int4 activations, iu4 GEMMs) unless YAH_A16=1 (W4A16: f16 activations, the quality mode)
-    rot = types.get("blk.0.ffn_down.weight") == 44
-    a4 = rot and os.environ.get("YAH_A16") != "1"
-    KV16_ON = KV16 and a4
-    NQOV_ON = NQOV and a4
-    GUOV_ON = GUOV and a4
-    NQGU_ON = NQGU and GUOV_ON
-    RQK_ON = RQK and NQOV_ON and GUOV_ON
-    NQW_ON = NQW and a4
+    if types.get("blk.0.ffn_down.weight") != 44 or types.get("output.weight") != 44 or types["token_embd.weight"] != 8:
+        raise SystemExit("emit_prefill_pp: not an MQ4 model (the GGUF model path is gone since tag pre-cleanup-2026-10-20)")
+    a4 = os.environ.get("YAH_A16") != "1"
+    KV16_ON = a4
+    NQOV_ON = a4
+    GUOV_ON = a4
+    NQGU_ON = GUOV_ON
+    RQK_ON = (NQOV_ON and GUOV_ON)
+    NQW_ON = a4
     # the engine runs ropew only with fp16 paged K and V (RoPE writes both pools; quantized KV has its own staging)
-    ROPEW_ON = ROPEW and NQW_ON and QNORM and B % gen_rot.FLAG_TT == 0 and gen_kvq.kv_bits() == (16, 16) and T % 256 == 0
-    DNOV_ON = DNOV and a4 and DNSPLIT == (40, 8) and DNVCONV and conv_tb_ok(B)   # the dnvconv conv (dn_vconv below)
+    ROPEW_ON = (NQW_ON and QNORM and (B % gen_rot.FLAG_TT == 0) and (gen_kvq.kv_bits() == (16, 16)) and (T % 256 == 0))
+    DNOV_ON = (a4 and (DNSPLIT == (40, 8)) and conv_tb_ok(B))   # the dnvconv conv (dn_vconv below)
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
 
     n = 0
@@ -1119,41 +772,40 @@ def main():
         # A residual projection gets a kstore and the fused-residual kres; the attention q projection (12288 rows =
         # 24 heads x [q | gate]) also gets kqg, which stores q and gate unpacked. The driver prefers kres and kqg.
         kinds = gemm_kinds(kind, mt)
-        if a4 and fmt == "mq4":
+        if a4:
             # A4: the FFN's gate and up run as one gu GEMM (on the up combo); the gate tensors need no kstore
             if all(t.endswith("ffn_gate.weight") for t in combos[(kind, fmt, port, mt, kb)]):
                 continue
             for k in (["gu"] if kind == "swiglu" else kinds):
-                if k != "kstore" or kind != "residual":
-                    # dnperm sets (DNSPLIT (40, 8)): the DeltaNet gate (attn_gate) also as kstoreh, in HF head order
-                    # for the pnq kernels
-                    gate = k == "kstore" and any(t.endswith("attn_gate.weight") for t in combos[(kind, fmt, port, mt, kb)])
-                    for hp in [None] + ([gen_rot.PN_HEADS[:2]] if gate and DNSPLIT == (40, 8) else []):
-                        geom.append(iu4_gemm(k, mt, kb, B, outdir, hp))
-                        if gen_gemm_iu4.group_of(k, mt * 16):   # grouped grid: the engine launches (G, tiles, row tiles / G)
-                            geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
-                        # the flagged variants: the plain GEMM's geometry (dispatch.txt row) serves both
-                        if k == "kres" and NQOV_ON and mt * 16 == 5120:
-                            iu4_gemm(k, mt, kb, B, outdir, flag=True)
-                        if k == "kres" and RQK_ON and mt * 16 == 5120 and kb * 256 in (6144, 17408):
-                            iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.q_flag_count(kb * 256))
-                        if k == "gu" and GUOV_ON:
-                            iu4_gemm(k, mt, kb, B, outdir, flag=True)
-                        if k == "gu" and GUOV_ON and NQGU_ON:
+                # dnperm sets (DNSPLIT (40, 8)): the DeltaNet gate (attn_gate) also as kstoreh, in HF head order
+                # for the pnq kernels
+                gate = k == "kstore" and any(t.endswith("attn_gate.weight") for t in combos[(kind, fmt, port, mt, kb)])
+                for hp in [None] + ([gen_rot.PN_HEADS[:2]] if gate and DNSPLIT == (40, 8) else []):
+                    geom.append(iu4_gemm(k, mt, kb, B, outdir, hp))
+                    if gen_gemm_iu4.group_of(k, mt * 16):   # grouped grid: the engine launches (G, tiles, row tiles / G)
+                        geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
+                    # the flagged variants: the plain GEMM's geometry (dispatch.txt row) serves both
+                    if k == "kres" and NQOV_ON and mt * 16 == 5120:
+                        iu4_gemm(k, mt, kb, B, outdir, flag=True)
+                    if k == "kres" and RQK_ON and mt * 16 == 5120 and kb * 256 in (6144, 17408):
+                        iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.q_flag_count(kb * 256))
+                    if k == "gu" and GUOV_ON:
+                        iu4_gemm(k, mt, kb, B, outdir, flag=True)
+                    if k == "gu" and GUOV_ON and NQGU_ON:
+                        iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.nq_flag_count(5120))
+                    if k == "kstore" and DNOV_ON and (hp is not None or any(
+                            t.endswith("attn_qkv.weight") for t in combos[(kind, fmt, port, mt, kb)])):
+                        iu4_gemm(k, mt, kb, B, outdir, hp, flag=True)
+                    # the attention norm's readers (kb 20: K = 5120)
+                    tn = combos[(kind, fmt, port, mt, kb)]
+                    if NQW_ON and hp is None and kb == 20 and (k == "kqg" or k == "kstore" and any(
+                            t.endswith(x) for t in tn for x in ("attn_k.weight", "attn_v.weight", "ssm_alpha.weight",
+                                                                "ssm_beta.weight", "attn_qkv.weight"))):
+                        qkv = any(t.endswith("attn_qkv.weight") for t in tn)
+                        kv = ROPEW_ON and k == "kstore" and any(t.endswith(("attn_k.weight", "attn_v.weight")) for t in tn)
+                        iu4_gemm(k, mt, kb, B, outdir, flag=qkv and DNOV_ON, wait=gen_rot.nq_flag_count(5120))
+                        if kv:   # ropew: also flagged (the plain one serves chunks without ropew)
                             iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.nq_flag_count(5120))
-                        if k == "kstore" and DNOV_ON and (hp is not None or any(
-                                t.endswith("attn_qkv.weight") for t in combos[(kind, fmt, port, mt, kb)])):
-                            iu4_gemm(k, mt, kb, B, outdir, hp, flag=True)
-                        # the attention norm's readers (kb 20: K = 5120)
-                        tn = combos[(kind, fmt, port, mt, kb)]
-                        if NQW_ON and hp is None and kb == 20 and (k == "kqg" or k == "kstore" and any(
-                                t.endswith(x) for t in tn for x in ("attn_k.weight", "attn_v.weight", "ssm_alpha.weight",
-                                                                    "ssm_beta.weight", "attn_qkv.weight"))):
-                            qkv = any(t.endswith("attn_qkv.weight") for t in tn)
-                            kv = ROPEW_ON and k == "kstore" and any(t.endswith(("attn_k.weight", "attn_v.weight")) for t in tn)
-                            iu4_gemm(k, mt, kb, B, outdir, flag=qkv and DNOV_ON, wait=gen_rot.nq_flag_count(5120))
-                            if kv:   # ropew: also flagged (the plain one serves chunks without ropew)
-                                iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.nq_flag_count(5120))
             n += 1
             continue
         for k in kinds:
@@ -1162,18 +814,9 @@ def main():
                 geom.append(r)
                 if T > B:  # chunked sets: their last chunk may be short; a one-pass set always runs all B tokens
                     geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k))
-                geom.extend(afrag_variants(fmt, mt, kb, B, name(k), outdir, k))
-            elif k == "kstore" and fmt == "q2k":
-                # Q2_K has no tile decoder; its only tensors here are the 48-row ssm_alpha / ssm_beta.
-                sym = E.sym_of("yah_ffn_gemm_q2k_f32.loom")
-                E.emit("yah_ffn_gemm_q2k_f32.loom", ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
-                                                     "%s.token_tiles=%d" % (sym, TT)], name(k), outdir)
-                geom.append((name(k), TILE, 1, TT))
-            elif k == kinds[0]:
-                raise SystemExit("no GEMM kernel for %s %s (%d rows, K = %d)" % (fmt, k, mt * 16, kb * qk_of(fmt)))
+            else:
+                raise SystemExit("no GEMM kernel for %s %s (%d rows, K = %d)" % (fmt, k, mt * 16, kb * 256))
         n += 1
-
-    geom.extend(ffn_fused(rows, B, outdir))
 
     # Attention: tools/gen_attn_fa.py, 32 tokens x 2 heads per workgroup; reads V^T (vtrans.hal, or the paged / quantized pools).
     # KV paging (256-token pages) needs a context that is a multiple of 256; otherwise the caches stay contiguous.
@@ -1182,9 +825,8 @@ def main():
         print("KV paging off: needs the context to be a multiple of 256")
     gen_attn_fa.PAGED = gen_kvq.PAGED = kv_paged
     gen_attn_fa.MAX_TOKENS = max(B, 2048)
-    # YAH_ATTN_SHAPE=<heads>x<tokens>: attention workgroup shape. 6 x 16 (a whole GQA group: each K / V tile staged once for
-    # its 6 heads) is bit-identical to 2 x 32, pp2048 attention -4.9%, pp8192 even
-    a_hpw, a_qt = map(int, os.environ.get("YAH_ATTN_SHAPE", "2x32").split("x"))
+    # the attention workgroup: 2 heads x 32 tokens (the KT2 twin takes 6 x 16, KT2_SHAPE)
+    a_hpw, a_qt = 2, 32
     gen_attn_fa.configure(a_hpw, a_qt)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
@@ -1263,7 +905,7 @@ def main():
     write_attn(attn_src)
     attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")
     aov_need = 0
-    if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0:   # the main twin with OCNT (and its alt)
+    if (a4 and RQOP and (B % gen_rot.FLAG_TT == 0)):   # the main twin with OCNT (and its alt)
         A = gen_attn_fa
         saved = {k: getattr(A, k) for k in ("DIAG_SWAP", "OCNT") + tuple(MAIN_FLAGS)}
         for k, v in dict(MAIN_FLAGS, OCNT=True).items():
@@ -1274,13 +916,6 @@ def main():
         aov_need = A.ocnt_need()
         for k, v in saved.items():
             setattr(A, k, v)
-    # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
-    af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
-    attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
-    if af24:
-        gen_attn_fa.TILED_OUT = True
-        write_attn(attn_t_src)
-        gen_attn_fa.TILED_OUT = False
     A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = kv_flags
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
@@ -1290,27 +925,20 @@ def main():
     # kv4 under kvdeq: Q rotated from chunk 0 (its K is H256-rotated)
     qrot_first = 0 if kvdeq and deq_bits == 4 else -(-QROT_FROM // B) if gen_attn_fa.K4 and kv_paged and NCH > 1 else NCH
     attn_qr_src = os.path.join(tmp, "yah_attn_hip_qr.loom")
-    attn_qr_t_src = os.path.join(tmp, "yah_attn_hip_qr_t.loom")
     qrot_src = os.path.join(tmp, "yah_qrot.loom")
     kdeq_src = os.path.join(tmp, "yah_kdeq%d.loom" % deq_bits)
     vdeq_src = os.path.join(tmp, "yah_vdeq%d.loom" % deq_bits)
     if qrot_first < NCH:
         A = gen_attn_fa
-        saved = (A.Q16, A.QROT, A.VSWZ_T, A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8)
+        saved = (A.Q16, A.QROT, A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8)
         if kvdeq:   # the fp16 paged kernel (the f16 pools have the int4 pools' page layout)
             A.K4 = A.K8 = A.KDEC = A.VQ4 = A.VQ8 = False
             A.Q16 = True
-            fps_paths.update((attn_qr_src, attn_qr_t_src))
+            fps_paths.add(attn_qr_src)
         else:
-            # VSWZ_T off: with direct Q the swizzled V staging tips Loom into rotating the O accumulators at the back edge
             A.Q16 = A.QROT = True
-            A.VSWZ_T = False
         write_attn(attn_qr_src)
-        if af24:
-            A.TILED_OUT = True
-            write_attn(attn_qr_t_src)
-            A.TILED_OUT = False
-        A.Q16, A.QROT, A.VSWZ_T, A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = saved
+        A.Q16, A.QROT, A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = saved
         open(qrot_src, "w").write(A.gen_qrot())
         geom.append(("qrot", qrot_first, 0, 0))
     if kvdeq:
@@ -1332,7 +960,7 @@ def main():
         open(fpmean_src, "w").write(gen_fpsparse.gen_fpmean())
         open(fpcopyk_src, "w").write(gen_fpsparse.gen_fpcopyk())
         open(fpcopyv_src, "w").write(gen_fpsparse.gen_fpcopyv())
-        open(fpsel_src, "w").write(gen_fpsparse.gen_fpsel(T, B, FPS_ALPHA))
+        open(fpsel_src, "w").write(gen_fpsparse.gen_fpsel(T, B, gen_fpsparse.ALPHA))
         open(kdeqf_src, "w").write(gen_attn_fa.gen_kdeq(4, first=True))
         open(vdeqf_src, "w").write(gen_attn_fa.gen_vdeq(4, first=True))
         geom.append(("fpsparse", FPS_FROM // B, fps_ext, fps_ls))
@@ -1371,26 +999,19 @@ def main():
     geom.append(("attn_f16out", 0, 0, 0))
     geom.append(("vtrans.hal", 0, 0, 0))
 
-    # DeltaNet: chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py), f16 WMMA inputs.
+    # DeltaNet: chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py), f16 WMMA inputs (B is a multiple of 64).
     # Its grid (2, heads) is recorded as rowsplit.hal's row group.
-    # It needs B % 32 == 0; else the recurrent kernel (tools/gen_deltanet_hip.py, same ABI and grid).
     dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
-    open(dn_src, "w").write(gen_gdn_chunk.gen() if B % 32 == 0 else gen_deltanet_hip.gen())
-    # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
+    open(dn_src, "w").write(gen_gdn_chunk.gen())
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
     conv_tb = conv_tb_ok(B)
-    dn_vconv = DNVCONV and conv_tb and a4 and DNSPLIT == (40, 8)
+    assert conv_tb
+    dn_vconv = (conv_tb and a4 and (DNSPLIT == (40, 8)))
     if dn_vconv:
         text = gen_conv_kq.gen(4096)
         geom.append(("dnvconv", gen_conv_kq.tiles(4096), 0, 0))
-    elif conv_tb:
-        text = gen_conv_kq.gen()
     else:
-        text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
-        if 640 in O16_MT:
-            text = conv_x16(text)
-        if B % 32 == 0 and gen_gdn_chunk.CONV16:
-            text = conv_n16(text)
+        text = gen_conv_kq.gen()
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
     assert DNOV_ON <= dn_vconv
@@ -1399,7 +1020,7 @@ def main():
         open(convf_src, "w").write(gen_conv_kq.gen(4096, flag=gen_gemm_iu4.flag_count(10240)))
         geom.append(("dnov", 0, 0, 0))
     convp_src = os.path.join(tmp, "yah_ssm_conv_kq_p.loom")
-    convp = CONVP and DNOV_ON and B % gen_rot.FLAG_TT == 0
+    convp = (DNOV_ON and (B % gen_rot.FLAG_TT == 0))
     if convp:
         open(convp_src, "w").write(gen_conv_kq.gen_p(B))
         geom.append(("convkqp.hal", gen_conv_kq.PG, 0, 0))
@@ -1413,10 +1034,10 @@ def main():
     postnorm_src = os.path.join(tmp, "yah_ssm_postnorm.loom")
     open(postnorm_src, "w").write(postnorm_base)
     dn_perm = a4 and DNSPLIT == (40, 8)
-    dn_ss = DNSS and dn_perm and dn_vconv and DNO16 and B % 32 == 0
+    dn_ss = (dn_perm and dn_vconv)
     # one flagged pnq for both DeltaNet parts (gen_rot.gen_pnq "ab"): part b's DeltaNet counts its finished lanes
     pnq_ab = DNOV_ON and dn_ss
-    DNRING_ON = DNRING and pnq_ab and RQK_ON and NQW_ON and DNSPLIT == (40, 8)
+    DNRING_ON = (pnq_ab and RQK_ON and NQW_ON and (DNSPLIT == (40, 8)))
     prepabr_src = os.path.join(tmp, "yah_deltanet_prep_abr.loom")
     if DNRING_ON:
         open(prepabr_src, "w").write(prepab_ring(prepab_text, gen_gdn_ss.done_count(DNSPLIT[1])))
@@ -1427,7 +1048,7 @@ def main():
     dn_parts = []
     # A4 sets: DeltaNet part b runs the heads of whole rotq groups (gen_rot.pn_heads), so each fused postnorm + rotq part
     # (gen_pnq) reads one part's compact output; "dnperm" tells the host the parts are head sets, not ranges
-    if B % 32 == 0 and DNSPLIT:
+    if DNSPLIT:
         ha, hb = DNSPLIT
         for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
@@ -1436,7 +1057,7 @@ def main():
                 if dn_ss:
                     open(src, "w").write(gen_gdn_ss.gen(gen_rot.pn_heads(tag), flag=pnq_ab and tag == "b"))
                 else:
-                    open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=DNO16))
+                    open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=True))
             else:
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
@@ -1481,20 +1102,15 @@ def main():
         text = open(rope_src).read()
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_konly.loom")
         konly = rope_konly(text)
-        kv = ROPEKV and KV16_ON and vtrope and B % 16 == 0
+        kv = (KV16_ON and vtrope and (B % 16 == 0))
         open(rope_src, "w").write(rope_kv(konly) if kv else konly)
         geom.append(("qnorm", 0, 0, 0))
         if kv:
             geom.append(("ropekv", 0, 0, 0))
         if ROPEW_ON:
-            need = gen_gemm_iu4.flag_count(1024)
-            open(ropew_src, "w").write(rope_kv(konly, need) if kv else rope_wait(konly, need))
+            assert kv
+            open(ropew_src, "w").write(rope_kv(konly, gen_gemm_iu4.flag_count(1024)))
             geom.append(("ropew", 0, 0, 0))
-    elif gen_attn_fa.Q16:   # RoPE hands the attention f16(q / 16) (not with K4: its H256 rotates the f32 Q)
-        text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
-        rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_q16.loom")
-        open(rope_src, "w").write(rope_q16(text))
-        geom.append(("q16", 0, 0, 0))
     if paged_f16v:
         if not vtrope:
             vtpage_src = os.path.join(tmp, "yah_vtpage.loom")
@@ -1506,11 +1122,10 @@ def main():
     # Each row over NORM_SPLIT waves (gen_half_norm.gen_split: the same per-lane chain order, so the same bits):
     # 0.383 -> 0.299 ms per call at 2048 rows (latency-bound -> ~214 GB/s). The driver reads the split from dispatch.txt.
     geom.append(("norm_split", 0, NORM_SPLIT, 0))
-    # The chunk's token_embd rows from its token ids on the GPU (gen_decode_misc.gen_embed_iq4xs, one workgroup per row),
-    # so the host stages ids and never waits between chunks.
+    # The chunk's token_embd rows (Q8_0) from its token ids on the GPU (gen_decode_misc.gen_embed_q8_0, one workgroup per
+    # row), so the host stages ids and never waits between chunks.
     embed_src = os.path.join(tmp, "yah_embed.loom")
-    q8_embed = types["token_embd.weight"] == 8   # HFQ models
-    open(embed_src, "w").write(gen_decode_misc.gen_embed_q8_0(rows=B) if q8_embed else gen_decode_misc.gen_embed_iq4xs(rows=B))
+    open(embed_src, "w").write(gen_decode_misc.gen_embed_q8_0(rows=B))
     geom.append(("embed.hal", 1, 5120 // 16, B))   # one token per workgroup
     # MQ4 GEMMs read their input in the weights' rotated basis (gen_rot): the driver rotates each GEMM input site in place,
     # the DeltaNet postnorm's out of place (dst in HF head order); the head's f32 norm row without awq.
@@ -1518,138 +1133,124 @@ def main():
     # rows "<hal> 0 <lanes> <workgroups>"). Per-token scales for the norm-fed sites and 512-value spans for the others cost
     # WT2 KL 0.064 vs 0.051 (2 chunks; p99.9 2.08 vs 1.01).
     rot_src = {}
-    if rot:
-        rots = [("rot_head.hal", (5120, 1, False, None, "f32"))]
-        if not a4:
-            rots += [("rot_5120.hal", (5120, B)), ("rot_6144.hal", (6144, B)), ("rot_17408.hal", (17408, B)),
-                     ("rot_heads.hal", (6144, B, True, (48, 16, 128)))]
-        for name, args in rots:
+    rots = [("rot_head.hal", (5120, 1, False, None, "f32"))]
+    if not a4:
+        rots += [("rot_5120.hal", (5120, B)), ("rot_6144.hal", (6144, B)), ("rot_17408.hal", (17408, B)),
+                 ("rot_heads.hal", (6144, B, True, (48, 16, 128)))]
+    for name, args in rots:
+        rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
+        open(rot_src[name], "w").write(gen_rot.gen(*args))
+    for name, (k, heads) in (("rotq_5120.hal", (5120, None)), ("rotq_6144.hal", (6144, None)),
+                             ("rotq_17408.hal", (17408, None)), ("rotq_heads.hal", (6144, (48, 16, 128)))) if a4 else ():
+        rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
+        open(rot_src[name], "w").write(gen_rot.gen_q(k, B, gen_gemm_iu4.KP, True, heads, hot=k == 17408))
+        geom.append((name, 0, 64, k // 1024))
+    if GUOV_ON:   # rotq_17408's geometry
+        rot_src["rotqf_17408.hal"] = os.path.join(tmp, "rotqf_17408.loom")
+        open(rot_src["rotqf_17408.hal"], "w").write(
+            gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None, flag=gen_gemm_iu4.gu_flag_count(17408)))
+        geom.append(("guov", 0, 0, 0))
+    if RQK_ON:   # the rotq_17408 / rotq_6144 geometry
+        for name, src in (("rotqfo_17408.hal", gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None,
+                                                              flag=gen_gemm_iu4.gu_flag_count(17408), oflag=True)),
+                          ("rotqo_6144.hal", gen_rot.gen_q(6144, B, gen_gemm_iu4.KP, True, None, oflag=True))):
             rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-            open(rot_src[name], "w").write(gen_rot.gen(*args))
-        for name, (k, heads) in (("rotq_5120.hal", (5120, None)), ("rotq_6144.hal", (6144, None)),
-                                 ("rotq_17408.hal", (17408, None)), ("rotq_heads.hal", (6144, (48, 16, 128)))) if a4 else ():
-            rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-            open(rot_src[name], "w").write(gen_rot.gen_q(k, B, gen_gemm_iu4.KP, True, heads, hot=k == 17408))
-            geom.append((name, 0, 64, k // 1024))
-        if GUOV_ON:   # rotq_17408's geometry
-            rot_src["rotqf_17408.hal"] = os.path.join(tmp, "rotqf_17408.loom")
-            open(rot_src["rotqf_17408.hal"], "w").write(
-                gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None, flag=gen_gemm_iu4.gu_flag_count(17408)))
-            geom.append(("guov", 0, 0, 0))
-        if RQK_ON:   # the rotq_17408 / rotq_6144 geometry
-            for name, src in (("rotqfo_17408.hal", gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None,
-                                                                  flag=gen_gemm_iu4.gu_flag_count(17408), oflag=True)),
-                              ("rotqo_6144.hal", gen_rot.gen_q(6144, B, gen_gemm_iu4.KP, True, None, oflag=True))):
+            open(rot_src[name], "w").write(src)
+        geom.append(("rqk", 0, 0, 0))
+        if RQP and GUOV_ON and B % gen_rot.FLAG_TT == 0:
+            rot_src["rotqp_17408.hal"] = os.path.join(tmp, "rotqp_17408.loom")
+            open(rot_src["rotqp_17408.hal"], "w").write(
+                gen_rot.gen_qp(17408, B, gen_gemm_iu4.KP, RQP, gen_gemm_iu4.gu_flag_count(17408)))
+            geom.append(("rotqp_17408.hal", RQP, 0, 0))
+        if RQOP and B % gen_rot.FLAG_TT == 0:
+            rot_src["rotqop_6144.hal"] = os.path.join(tmp, "rotqop_6144.loom")
+            open(rot_src["rotqop_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, 0))
+            geom.append(("rotqop_6144.hal", RQOP, 0, 0))
+            if aov_need:
+                rot_src["rotqopf_6144.hal"] = os.path.join(tmp, "rotqopf_6144.loom")
+                open(rot_src["rotqopf_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, aov_need, plow=True))
+                geom.append(("rotqopf_6144.hal", RQOP, 0, 0))
+                geom.append(("aov", 0, 0, 0))
+    if NQW_ON:
+        geom.append(("nqw", 0, 0, 0))
+    if a4:
+        # the norm-fed sites: RMS norm + rotq in one kernel (gen_rot.gen_nq; same bits, no f16 norm round trip)
+        rot_src["normq_5120.hal"] = os.path.join(tmp, "normq_5120.loom")
+        open(rot_src["normq_5120.hal"], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP))
+        geom.append(("normq_5120.hal", 0, 16 * 5120 // 256, 1))
+        if NQOV_ON:
+            assert gen_gemm_iu4.tile(5120)[1] == gen_rot.FLAG_TT
+            rot_src["normqf_5120.hal"] = os.path.join(tmp, "normqf_5120.loom")
+            open(rot_src["normqf_5120.hal"], "w").write(
+                gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=gen_gemm_iu4.flag_count(5120)))
+            geom.append(("nqov", 0, 0, 0))
+        if NQGU_ON or NQW_ON:
+            for f in (0, gen_gemm_iu4.flag_count(5120)) if NQOV_ON else (0,):
+                name = "normq%so_5120.hal" % ("f" if f else "")
                 rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-                open(rot_src[name], "w").write(src)
-            geom.append(("rqk", 0, 0, 0))
-            if RQP and GUOV_ON and B % gen_rot.FLAG_TT == 0:
-                rot_src["rotqp_17408.hal"] = os.path.join(tmp, "rotqp_17408.loom")
-                open(rot_src["rotqp_17408.hal"], "w").write(
-                    gen_rot.gen_qp(17408, B, gen_gemm_iu4.KP, RQP, gen_gemm_iu4.gu_flag_count(17408)))
-                geom.append(("rotqp_17408.hal", RQP, 0, 0))
-            if RQOP and B % gen_rot.FLAG_TT == 0:
-                rot_src["rotqop_6144.hal"] = os.path.join(tmp, "rotqop_6144.loom")
-                open(rot_src["rotqop_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, 0))
-                geom.append(("rotqop_6144.hal", RQOP, 0, 0))
-                if aov_need:
-                    rot_src["rotqopf_6144.hal"] = os.path.join(tmp, "rotqopf_6144.loom")
-                    open(rot_src["rotqopf_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, aov_need, plow=True))
-                    geom.append(("rotqopf_6144.hal", RQOP, 0, 0))
-                    geom.append(("aov", 0, 0, 0))
-        if NQW_ON:
-            geom.append(("nqw", 0, 0, 0))
-        if a4:
-            # the norm-fed sites: RMS norm + rotq in one kernel (gen_rot.gen_nq; same bits, no f16 norm round trip)
-            rot_src["normq_5120.hal"] = os.path.join(tmp, "normq_5120.loom")
-            open(rot_src["normq_5120.hal"], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP))
-            geom.append(("normq_5120.hal", 0, 16 * 5120 // 256, 1))
-            if NQOV_ON:
-                assert gen_gemm_iu4.tile(5120)[1] == gen_rot.FLAG_TT
-                rot_src["normqf_5120.hal"] = os.path.join(tmp, "normqf_5120.loom")
-                open(rot_src["normqf_5120.hal"], "w").write(
-                    gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=gen_gemm_iu4.flag_count(5120)))
-                geom.append(("nqov", 0, 0, 0))
-            if NQGU_ON or NQW_ON:
-                for f in (0, gen_gemm_iu4.flag_count(5120)) if NQOV_ON else (0,):
-                    name = "normq%so_5120.hal" % ("f" if f else "")
-                    rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-                    open(rot_src[name], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=f, oflag=True,
-                                                                  persist=NQP if B % NQP == 0 else 0))
-                geom.append(("nqgu", 0, 0, 0))
-                if NQP and B % NQP == 0:
-                    geom.append(("nqp", NQP, 0, 0))
-            if DNSPLIT == (40, 8):
-                # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq) per DeltaNet part (dn_perm): a beside part b, b after it
-                for part in "ab":
-                    name = "pnq_%s.hal" % part
-                    rot_src[name] = os.path.join(tmp, "pnq_%s.loom" % part)
-                    open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part, o16=DNO16))   # gate: kstoreh
-                    geom.append((name, 0, 64, len(gen_rot.pnq_groups(part)) // 4))
-                if DNOV_ON:   # part a waiting on the gate GEMM's counters (pnq_a.hal's geometry)
-                    rot_src["pnq_af.hal"] = os.path.join(tmp, "pnq_af.loom")
-                    open(rot_src["pnq_af.hal"], "w").write(
-                        gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "a", o16=DNO16, flag=gen_gemm_iu4.flag_count(6144)))
-                if pnq_ab:   # both parts in one grid (raw_: part b's compact f16 rows, then part a's), so part b no
-                    # longer dispatches behind part a's waiting workgroups
-                    rot_src["pnq_abf.hal"] = os.path.join(tmp, "pnq_abf.loom")
-                    open(rot_src["pnq_abf.hal"], "w").write(
+                open(rot_src[name], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=f, oflag=True,
+                                                              persist=NQP if B % NQP == 0 else 0))
+            geom.append(("nqgu", 0, 0, 0))
+            if NQP and B % NQP == 0:
+                geom.append(("nqp", NQP, 0, 0))
+        if DNSPLIT == (40, 8):
+            # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq) per DeltaNet part (dn_perm): a beside part b, b after it
+            for part in "ab":
+                name = "pnq_%s.hal" % part
+                rot_src[name] = os.path.join(tmp, "pnq_%s.loom" % part)
+                open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part, o16=True))   # gate: kstoreh
+                geom.append((name, 0, 64, len(gen_rot.pnq_groups(part)) // 4))
+            if DNOV_ON:   # part a waiting on the gate GEMM's counters (pnq_a.hal's geometry)
+                rot_src["pnq_af.hal"] = os.path.join(tmp, "pnq_af.loom")
+                open(rot_src["pnq_af.hal"], "w").write(
+                    gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "a", o16=True, flag=gen_gemm_iu4.flag_count(6144)))
+            if pnq_ab:   # both parts in one grid (raw_: part b's compact f16 rows, then part a's), so part b no
+                # longer dispatches behind part a's waiting workgroups
+                rot_src["pnq_abf.hal"] = os.path.join(tmp, "pnq_abf.loom")
+                open(rot_src["pnq_abf.hal"], "w").write(
+                    gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
+                                    dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
+                geom.append(("pnq_abf.hal", 0, 64, len(gen_rot.pnq_groups("ab")) // 4))
+                # a trimmed chunk's gate GEMM runs unflagged (gen_gemm_iu4 flags only full token tiles): the same
+                # grid waiting only on DeltaNet part b, behind the gate GEMM in the graph (pnq_abf.hal's geometry)
+                if DNRING_ON:   # waiting on the ring update (which waits on part b), counting for ssm_out's kres
+                    assert gen_rot.q_flag_count(6144) == 128 * len(gen_rot.pnq_groups("ab")) // 4 * 2
+                    rot_src["pnq_abfr.hal"] = os.path.join(tmp, "pnq_abfr.loom")
+                    open(rot_src["pnq_abfr.hal"], "w").write(
                         gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
-                                        dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
-                    geom.append(("pnq_abf.hal", 0, 64, len(gen_rot.pnq_groups("ab")) // 4))
-                    # a trimmed chunk's gate GEMM runs unflagged (gen_gemm_iu4 flags only full token tiles): the same
-                    # grid waiting only on DeltaNet part b, behind the gate GEMM in the graph (pnq_abf.hal's geometry)
-                    if DNRING_ON:   # waiting on the ring update (which waits on part b), counting for ssm_out's kres
-                        assert gen_rot.q_flag_count(6144) == 128 * len(gen_rot.pnq_groups("ab")) // 4 * 2
-                        rot_src["pnq_abfr.hal"] = os.path.join(tmp, "pnq_abfr.loom")
-                        open(rot_src["pnq_abfr.hal"], "w").write(
-                            gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
-                                            dflag=ring_flag_count(), oflag=True))
-                        if PNQP and B % gen_rot.FLAG_TT == 0:
-                            rot_src["pnq_abfrp.hal"] = os.path.join(tmp, "pnq_abfrp.loom")
-                            open(rot_src["pnq_abfrp.hal"], "w").write(gen_rot.gen_pnqp(
-                                B, gen_gemm_iu4.KP, PNQP, gen_gemm_iu4.flag_count(6144), ring_flag_count()))
-                            geom.append(("pnq_abfrp.hal", PNQP, 0, 0))
-                    rot_src["pnq_abd.hal"] = os.path.join(tmp, "pnq_abd.loom")
-                    open(rot_src["pnq_abd.hal"], "w").write(
-                        gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
-        with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
-            fh.write(gen_rot.signs())
-        geom.append(("rot", 0, 0, 0))
-        if a4:
-            geom.append(("a4", 0, 0, 0))
-    # the output head: the tile-free GEMV (gen_gemv) for MQ4, rows per workgroup / lanes / workgroups in its row
-    head_src = None
-    if types["output.weight"] == 44:
-        head_src = os.path.join(tmp, "yah_gemv_head.loom")
-        open(head_src, "w").write(gen_gemv.gen("plain", ["mq4"], 248320, 5120))
-        geom.append(("gemv.hal", gen_gemv.rows_per_wg(), 32 * 4, 248320 // gen_gemv.rows_per_wg()))
+                                        dflag=ring_flag_count(), oflag=True))
+                    if PNQP and B % gen_rot.FLAG_TT == 0:
+                        rot_src["pnq_abfrp.hal"] = os.path.join(tmp, "pnq_abfrp.loom")
+                        open(rot_src["pnq_abfrp.hal"], "w").write(gen_rot.gen_pnqp(
+                            B, gen_gemm_iu4.KP, PNQP, gen_gemm_iu4.flag_count(6144), ring_flag_count()))
+                        geom.append(("pnq_abfrp.hal", PNQP, 0, 0))
+                rot_src["pnq_abd.hal"] = os.path.join(tmp, "pnq_abd.loom")
+                open(rot_src["pnq_abd.hal"], "w").write(
+                    gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
+    with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
+        fh.write(gen_rot.signs())
+    geom.append(("rot", 0, 0, 0))
+    if a4:
+        geom.append(("a4", 0, 0, 0))
+    # the output head: the tile-free GEMV (gen_gemv), rows per workgroup / lanes / workgroups in its row
+    head_src = os.path.join(tmp, "yah_gemv_head.loom")
+    open(head_src, "w").write(gen_gemv.gen("plain", ["mq4"], 248320, 5120))
+    geom.append(("gemv.hal", gen_gemv.rows_per_wg(), 32 * 4, 248320 // gen_gemv.rows_per_wg()))
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
             fh.write("%s %d %d %d\n" % (hal, tk, rg, tt))
 
     # The output norm (tools/gen_half_norm.py): fully unrolled, all loads issued up front.
     norm_src = os.path.join(tmp, "yah_half_norm_unrolled.loom")
-    # 4 rows (waves) per workgroup: 46.1 -> 41.9 ms per pp2048 vs one row per workgroup. The tuner's table may set it
-    # ({"norm": {"wpr": 2}}); the driver derives the grid from the kernel's workgroup size.
+    # 4 rows (waves) per workgroup: 46.1 -> 41.9 ms per pp2048 vs one row per workgroup; the driver derives the grid from
+    # the kernel's workgroup size.
     open(norm_src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT))
-    # the FFN norm for afrag GEMMs: the same values, stored fragment-major
-    normt_src = os.path.join(tmp, "yah_half_norm_tiled.loom")
-    open(normt_src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True))
-    any_af = any(h.endswith(".af.hal") for h, *_ in geom)
-    # attn_norm where some of its GEMMs are afrag (DeltaNet alpha / beta never): both layouts in one pass
-    normrt_src = os.path.join(tmp, "yah_half_norm_both.loom")
-    open(normrt_src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled="both"))
-    # the DeltaNet postnorm, fragment-major for an afrag ssm_out
-    postnorm_t_src = os.path.join(tmp, "yah_ssm_postnorm_tiled.loom")
-    open(postnorm_t_src, "w").write(postnorm_tiled(postnorm_base))
     pn_parts = []
     for tag, h0, nh, _ in ([] if dn_perm else dn_parts):
         base = postnorm_base
-        for t_, txt in (("", postnorm_heads(base, h0, nh, B)), ("_t", postnorm_tiled(postnorm_heads(base, h0, nh, B)))):
-            src = os.path.join(tmp, f"yah_ssm_postnorm{t_}_{tag}.loom")
-            open(src, "w").write(txt)
-            pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
+        src = os.path.join(tmp, f"yah_ssm_postnorm_{tag}.loom")
+        open(src, "w").write(postnorm_heads(base, h0, nh, B))
+        pn_parts.append((f"postnorm_{tag}.hal", src, nh))
     def occ(path, c, use_kt2=True):   # the 3-workgroup twins: KT2 from KT2_FROM keys of context on, else PAIR from OCC3_FROM
         if use_kt2 and fps_on and c * B >= FPS_FROM and os.path.exists(fps(path)):
             return fps(path)
@@ -1658,18 +1259,9 @@ def main():
         return deep(path) if c * B >= OCC3_FROM else path
     fixed = [
         (embed_src, "embed.hal", ["nop=0"]),
-        ("yah_residual_add_1d_f32.loom", "accum.hal",
-         ["yah_residual_1d.dim=%d" % (5120 * B)]),
         (norm_src, "norm.hal",
          ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
           "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"]),
-        *([(normt_src, "norm_t.hal",
-            ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
-             "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"])] if any_af else []),
-        *([(normrt_src, "norm_rt.hal",
-            ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
-             "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"])] if any_af else []),
-        *([(postnorm_t_src, "postnorm_t.hal", ["yah_ssm_postnorm_fp16.head_count=%d" % (48 * B)])] if af24 else []),
         # the conv with the q / k L2 norm (prep_kq) fused in
         (conv_src, "convkq.hal",
          ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
@@ -1697,9 +1289,6 @@ def main():
             "yah_deltanet.inner_size=%d" % (128 * nh if dn_perm else 6144), "yah_deltanet.num_key_heads=16",
             "yah_deltanet.num_heads=48"]) for tag, _, nh, src in dn_parts],
         *[(src, hal, ["yah_ssm_postnorm_fp16.head_count=%d" % (nh * B)]) for hal, src, nh in pn_parts],
-        ("yah_unpack_qg_f32.loom", "unpack.hal",
-         ["yah_unpack_qg.batch=%d" % B, "yah_unpack_qg.num_heads=24",
-          "yah_unpack_qg.head_dim=256"]),
         *[(src_, stem_ + ".hal" if c == 0 else stem_ + "_c%d.hal" % c, [
             "yah_fused_qk_rope_batched.start_pos=%d" % (c * B),
             "yah_fused_qk_rope_batched.batch=%d" % B,
@@ -1738,12 +1327,6 @@ def main():
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and occ(attn_src, 0) == attn_src
           and qrot_first > 0 else []),
-        *[(occ(attn_qr_t_src if c >= qrot_first else attn_t_src, c), "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
-            "attention_prefill.cache_capacity=%d" % cap_attn,
-            "attention_prefill.token_count=%d" % B,
-            "attention_prefill.start_pos=%d" % (c * B),
-            "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
-            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH) if af24],
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c), cfg)
           for c in range(NCH) if fps_on
           for src, stem, cfg in (
@@ -1779,21 +1362,20 @@ def main():
         *([(vseed_src, "vseed.hal", ["yah_kvq.token_count=%d" % B])] if (vq8_on or vq4_on) else []),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",
          ["yah_rmsnorm.rows=1", "yah_rmsnorm.eps=1e-06"]),
-        *([(head_src, "gemv.hal", ["nop=0"])] if head_src else [("yah_gemv_q6k_f32.loom", "gemv.hal",
-          ["yah_gemv_q6k.m_rows=248320", "yah_gemv_q6k.k_blocks=20"])]),
+        (head_src, "gemv.hal", ["nop=0"]),
         *[(src, name, ["nop=0"]) for name, src in rot_src.items()],
         ("yah_argmax_f32.loom", "argmax.hal", ["yah_argmax.vocab=248320"]),
     ]
     # Loom low-level LICM (HRX patch 0011) for the attention kernels where it wins: it hoists the fragment loads'
     # per-lane LDS address math out of the key loop (fp16 -1..-2%; kv4 QROT -0.5% with one extra live register); the
-    # kv4 staged-Q build loses 11% and the afrag GEMMs 5-20%, so they compile without it
+    # kv4 staged-Q build loses 11%, so it compiles without it
     def attn_env(loom):
         if "_kt2" in loom:   # KT2 (fp16 sources only): hoisting capped at 6 new loop-live units (240 VGPRs)
             return {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "6"}
         loom = loom.replace("_alt.loom", ".loom").replace("_deep.loom", ".loom").replace("_kt2.loom", ".loom")
-        if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
+        if loom == attn_qr_src:   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
-        if loom in (attn_src, attn_t_src, attn_f_src) and (not gen_attn_fa.KDEC or kv8deq):
+        if loom in (attn_src, attn_f_src) and (not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
     kt2_rows = []
@@ -1825,13 +1407,6 @@ def main():
             for hal in kt2_rows:
                 fh.write("%s %d %d %d\n" % (hal, kt2_shape[1], kt2_shape[0], (B + kt2_shape[1] - 1) // kt2_shape[1]))
 
-    tables = os.path.join(E.LOOM, "tables")
-    for src, dst in [("grid_iq3s.bin", "grid_iq3s.bin"),
-                     ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
-                     ("grid_iq2xxs.bin", "grid_iq2xxs.bin"),
-                     ("grid_iq2xs.bin", "grid_iq2xs.bin"),
-                     ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")]:
-        shutil.copy(os.path.join(tables, src), os.path.join(outdir, dst))
     print("emitted %d GEMM + fixed prefill HALs for B=%d (tile=%d, token_tiles=%d)"
           % (n, B, TILE, TT))
 

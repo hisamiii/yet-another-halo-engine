@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # M0 gate: the full 64-block text path must emit the recorded greedy next token for each prompt of a fixed set.
 #
-# Usage: m0_gate.sh <model.gguf> [hal-dir]
+# Usage: m0_gate.sh <model> [hal-dir]
 set -euo pipefail
-model="${1:?usage: m0_gate.sh <model.gguf> [hal-dir]}"
+model="${1:?usage: m0_gate.sh <model> [hal-dir]}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 bin="$root/engine/build/loom_decode"
 hal="${2:-${YAH_HAL:-$root/engine/hal}}"

@@ -8,7 +8,7 @@
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: yah-weights <model.gguf>\n");
+    std::fprintf(stderr, "usage: yah-weights <model>\n");
     return 2;
   }
   try {
