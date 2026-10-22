@@ -315,6 +315,8 @@ void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
   ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
 }
 
+Gguf Gguf::OpenIndex(const std::string& path) { return IsHfq(path) ? OpenHfq(path, false, false) : Open(path); }
+
 Gguf Gguf::OpenResident(const std::string& path) {
   if (IsHfq(path)) return OpenHfq(path, true);
   Gguf g = Open(path);

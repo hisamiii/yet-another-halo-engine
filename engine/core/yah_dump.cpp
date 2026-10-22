@@ -9,10 +9,10 @@
 
 int main(int argc, char** argv) {
   if (argc < 2 || (argc == 3 && std::strcmp(argv[2], "--table") != 0) || argc > 3) {
-    std::fprintf(stderr, "usage: yah-dump <model.gguf | model.hfq> [--table]\n");
+    std::fprintf(stderr, "usage: yah-dump <model> [--table]\n");
     return 2;
   }
-  auto gguf = yah::core::Gguf::Open(argv[1]);
+  auto gguf = argc == 3 ? yah::core::Gguf::OpenIndex(argv[1]) : yah::core::Gguf::Open(argv[1]);
   if (argc == 3) {
     // one line per tensor as the engine sees it: name, type id, dims (GGUF order); the emitter reads HFQ models with it
     for (const auto& t : gguf.tensors()) {

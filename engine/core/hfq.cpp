@@ -272,7 +272,7 @@ void Permute(std::uint8_t* p, std::size_t block, const std::vector<std::uint32_t
 
 }  // namespace
 
-Gguf Gguf::OpenHfq(const std::string& path, bool lock) {
+Gguf Gguf::OpenHfq(const std::string& path, bool lock, bool weights) {
   Gguf g;
   g.fd_ = ::open(path.c_str(), O_RDONLY);
   if (g.fd_ < 0) throw std::runtime_error("hfq: cannot open " + path);
@@ -365,17 +365,18 @@ Gguf Gguf::OpenHfq(const std::string& path, bool lock) {
     jobs.push_back(std::move(j));
   }
 
-  constexpr std::size_t kHuge = std::size_t{2} << 20;
-  const std::size_t bytes = (file + extra + kHuge - 1) & ~(kHuge - 1);
-  std::uint8_t* base = Reserve(bytes, path);
-  g.base_ = base, g.map_bytes_ = bytes, g.size_ = file + extra;
+  g.size_ = file + extra;
   g.version_ = 3;
   g.data_offset_ = h.data_off;
-  g.ReadAll(base, file, path);
+  constexpr std::size_t kHuge = std::size_t{2} << 20;
+  const std::size_t bytes = (file + extra + kHuge - 1) & ~(kHuge - 1);
+  std::uint8_t* base = weights ? Reserve(bytes, path) : nullptr;
+  g.base_ = base, g.map_bytes_ = weights ? bytes : 0;
+  if (weights) g.ReadAll(base, file, path);
   ::close(g.fd_);
   g.fd_ = -1;
 
-  std::uint8_t* data = base + h.data_off;
+  std::uint8_t* data = weights ? base + h.data_off : nullptr;
   std::atomic<std::size_t> next{0};
   const auto work = [&] {
     for (std::size_t i; (i = next.fetch_add(1)) < jobs.size();) {
@@ -420,7 +421,7 @@ Gguf Gguf::OpenHfq(const std::string& path, bool lock) {
   };
   std::vector<std::thread> pool;
   const unsigned threads = std::max(1U, std::min(16U, std::thread::hardware_concurrency()));
-  for (unsigned i = 0; i < threads; ++i) pool.emplace_back(work);
+  for (unsigned i = 0; weights && i < threads; ++i) pool.emplace_back(work);
   for (auto& th : pool) th.join();
 
   g.tensors_.reserve(jobs.size());

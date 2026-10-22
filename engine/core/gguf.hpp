@@ -80,6 +80,8 @@ class Gguf {
   // device that pins it for writing shares these pages (no copy-on-write copies). Needs RLIMIT_MEMLOCK (a warning
   // when the kernel refuses the lock).
   static Gguf OpenResident(const std::string& path);
+  // Names, types, dims and metadata only, as the engine sees them: the weights are not read, Data() is unusable.
+  static Gguf OpenIndex(const std::string& path);
   Gguf(Gguf&& other) noexcept;
   Gguf& operator=(Gguf&& other) noexcept;
   Gguf(const Gguf&) = delete;
@@ -107,7 +109,7 @@ class Gguf {
  private:
   Gguf() = default;
   void Close();
-  static Gguf OpenHfq(const std::string& path, bool lock);
+  static Gguf OpenHfq(const std::string& path, bool lock, bool weights = true);
   // 2 MB aligned anonymous memory of at least `bytes` (a multiple of 2 MB) for a resident copy.
   static std::uint8_t* Reserve(std::size_t bytes, const std::string& path);
   void ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) const;
