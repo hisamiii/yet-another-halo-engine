@@ -21,7 +21,7 @@ TAG="$1"; shift 2
 # Refuse a driver binary older than its source: cmake --build does not build these, engine/build_hrx.sh does.
 # A stale driver can launch a new HAL on an old grid; Loom drops clamps for the compiled grid, so it reads out of bounds.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-for pair in "loom_forward_pp:engine/run/loom_forward_pp.cc" "hal_bench:engine/run/hal_bench.cc"; do
+for pair in "loom_forward_pp:engine/run/loom_forward_pp.cc" "loom_decode:engine/run/loom_decode.cc"; do
   bin="${pair%%:*}"; src="$ROOT/${pair#*:}"
   for arg in "$@"; do
     case "$arg" in

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds the HRX-native runners (loom_forward_pp, loom_decode, hal_bench, hal_run) without HIP or hipcc.
+# Builds the HRX-native runners (loom_forward_pp, loom_decode, hal_run) without HIP or hipcc.
 #
 #   engine/build_hrx.sh                 build libyah_core, the core tools, the runners and the serving binaries
-#   engine/build_hrx.sh <model.gguf>    also emit the decode HAL set into engine/hal
+#   engine/build_hrx.sh <model>         also emit the decode HAL set into engine/hal
 #   engine/build_hrx.sh <model> <dir>   emit into <dir>
 #
 # HRX comes from $YAH_HRX (default external/hrx: the pinned revision plus engine/hrx/patches, made by
@@ -28,10 +28,6 @@ cmake -S "$root/engine" -B "$root/engine/build" -DCMAKE_BUILD_TYPE=Release -DCMA
     -DCMAKE_CXX_FLAGS_RELEASE="${cxxflags[*]:1}" >/dev/null
 cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # The runners below are not CMake targets. Build them here so a stale binary never runs against a new HAL set.
-# Single-kernel timing harness.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
-    -o "$root/engine/build/hal_bench" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
 # Prefill driver.
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_forward_pp.cc" \
     -o "$root/engine/build/loom_forward_pp" "$root/engine/build/libyah_core.a" \
@@ -40,11 +36,7 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
     -o "$root/engine/build/loom_decode" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
-# Tile-GEMM variant bench for the autotuner (engine/tune).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/gemm_bench.cc" \
-    -o "$root/engine/build/gemm_bench" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
-# One-dispatch correctness harness for generated kernels (tools/gemv_check.py).
+# One-dispatch correctness harness for generated kernels (the tools/*_check.py oracles).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
     -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
@@ -65,4 +57,4 @@ if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"
 fi
-echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_bench,gemm_bench,hal_run,yah_server,yah_chat,yah_serve_test}"
+echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,yah_server,yah_chat,yah_serve_test}"

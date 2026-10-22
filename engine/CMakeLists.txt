@@ -31,5 +31,4 @@ target_link_libraries(yah-tokenize PRIVATE yah_core)
 add_executable(yah-weights model/yah_weights.cpp)
 target_link_libraries(yah-weights PRIVATE yah_core)
 
-# The HRX-native runners (loom_forward_pp prefill, loom_decode decode, hal_bench,
-# hal_run) are built by engine/build_hrx.sh against the HRX runtime library.
+# The HRX-native runners (loom_forward_pp prefill, loom_decode decode, hal_run) are built by engine/build_hrx.sh against the HRX runtime library.
