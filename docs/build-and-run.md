@@ -215,7 +215,7 @@ Rules:
 4. Clamp a vector load by its own width: `min(addr, N - width)`. A clamp copied from a 4-wide load onto a 2-wide load shifts the last element.
 5. Never bind a buffer smaller than the kernel's declared footprint. The prefill emitter runs `tools/footprint_gate.py`; `hal_run` checks declared sizes; `tools/loom_preflight.py` checks the compile report's footprint against the bindings.
 6. Rebuild drivers with `engine/build_hrx.sh` after every source change, and do not edit `engine/run/*.cc` during a measuring round (`gpu_run.sh` will then refuse the remaining runs).
-7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
+7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-logs/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
 8. Never free memory the GPU may still touch: a GPU read of a freed page hangs the shader and MES.
 
 After a hang and reboot, read the previous boot's kernel log:
