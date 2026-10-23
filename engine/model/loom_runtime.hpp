@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -162,7 +161,6 @@ class LoomDevice {
   LoomDevice(const LoomDevice&) = delete;
   LoomDevice& operator=(const LoomDevice&) = delete;
   ~LoomDevice() {
-    if (profiling_) hrx_device_profile_dispatches_end(device_);
     if (stream_) hrx_stream_release(stream_);
     // device_ is borrowed (hrx_gpu_device_get does not retain it); hrx_gpu_shutdown releases it.
     // Do not release it here: that clears the device early and HRX_PROFILE_FILE gets no dispatch events or session_end.
@@ -171,21 +169,6 @@ class LoomDevice {
 
   [[nodiscard]] hrx_device_t device() const { return device_; }
 
-  // Device timestamps of completed dispatches (HRX patch 0006). ProfileFlush / ProfileEnd hand the dispatches
-  // completed so far to the sink, with the count of records the device dropped; Synchronize first to get them all.
-  using DispatchSink = std::function<void(const hrx_profile_dispatch_t*, size_t, uint64_t)>;
-  void ProfileBegin(DispatchSink sink) {
-    sink_ = std::move(sink);
-    LoomCheck(hrx_device_profile_dispatches_begin(device_, &LoomDevice::OnDispatches, this),
-              "hrx_device_profile_dispatches_begin");
-    profiling_ = true;
-  }
-  void ProfileFlush() { LoomCheck(hrx_device_profile_dispatches_flush(device_), "hrx_device_profile_dispatches_flush"); }
-  void ProfileEnd() {
-    profiling_ = false;
-    LoomCheck(hrx_device_profile_dispatches_end(device_), "hrx_device_profile_dispatches_end");
-  }
-  [[nodiscard]] bool profiling() const { return profiling_; }
   [[nodiscard]] hrx_stream_t stream() const { return stream_; }
 
   [[nodiscard]] LoomExecutable Load(const std::string& path, const char* target_key = "gfx1151") {
@@ -380,13 +363,6 @@ class LoomDevice {
   bool chain_open_ = false;   // the last dispatch has no trailing barrier
   long sleep_us_ = 0;
   bool initialized_ = false;
-  bool profiling_ = false;
-  DispatchSink sink_;
-
-  static void OnDispatches(void* user, const hrx_profile_dispatch_t* events, size_t count, uint64_t dropped) {
-    auto* self = static_cast<LoomDevice*>(user);
-    if (self->sink_) self->sink_(events, count, dropped);
-  }
 };
 
 // Records dispatches into one HRX graph and launches it on the device stream. Each dispatch waits only for what it
@@ -448,25 +424,6 @@ class LoomGraph {
       for (const hrx_buffer_ref_t& r : *also_writes) accesses_[r.buffer].push_back({r.offset, r.length, true, node});
     grids_.push_back({config.workgroup_count[0], config.workgroup_count[1], config.workgroup_count[2]});
     return grids_.size() - 1;
-  }
-  // Stores value to target (4 bytes) after everything that wrote reads (HRX patch 0015). With release + system scope the
-  // command processor makes every earlier write visible to the host and other devices first. writes: ranges recorded as
-  // written by the store (another engine writes them once it sees the value).
-  void AtomicStore(const hrx_buffer_ref_t& target, uint32_t value, uint32_t flags,
-                   const std::vector<hrx_buffer_ref_t>& reads, const std::vector<hrx_buffer_ref_t>& writes) {
-    std::vector<hrx_graph_node_t> deps;
-    Depend(target, true, &deps);
-    for (const hrx_buffer_ref_t& r : reads) Depend(r, false, &deps);
-    for (const hrx_buffer_ref_t& r : writes) Depend(r, true, &deps);
-    Unique(&deps);
-    hrx_graph_atomic_store_node_attrs_t attrs{};
-    attrs.target = target, attrs.value = value, attrs.flags = flags;
-    hrx_graph_node_t node = nullptr;
-    LoomCheck(hrx_graph_add_atomic_store_node(graph_, deps.data(), deps.size(), &attrs, &node),
-              "hrx_graph_add_atomic_store_node");
-    accesses_[target.buffer].push_back({target.offset, target.length, true, node});
-    for (const hrx_buffer_ref_t& r : reads) accesses_[r.buffer].push_back({r.offset, r.length, false, node});
-    for (const hrx_buffer_ref_t& r : writes) accesses_[r.buffer].push_back({r.offset, r.length, true, node});
   }
   // The workgroup count node i was recorded with.
   [[nodiscard]] const std::array<uint32_t, 3>& Grid(size_t i) const { return grids_[i]; }
