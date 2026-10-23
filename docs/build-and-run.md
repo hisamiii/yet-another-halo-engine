@@ -7,8 +7,8 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 - HRX / Loom: the revision pinned in `engine/hrx/PIN` plus the patches in `engine/hrx/patches/`. `engine/hrx/bootstrap.sh` clones it into `external/hrx` (gitignored; `YAH_HRX` overrides, and a symlink to an existing checkout works), checks out the pin, applies the patches and builds what the engine uses: `libhrx` and its HIP binding, `iree-run-loom`, `loom-compile`, `iree-profile`. `engine/hrx/bootstrap.sh --check` verifies the checkout; `engine/build_hrx.sh` refuses anything else.
 - The official ROCm Core SDK 10.0.0 runtime packages, extracted (no system install) by `engine/hrx-env.sh --fetch` into `external/rocm10` (`YAH_ROCM` overrides). Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
 - `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`; `/opt/rocm` stays usable. The Python emitters find the same paths through `engine/gpu/loom/hrx_paths.py`.
-- The model: `~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf`.
-- Python 3 with numpy for the emitters. The checkers also need llama.cpp's `gguf-py` on `PYTHONPATH`; use an OpenBLAS numpy (`/home/q/yah-scratch/venv/bin/python`), the system numpy is ~100x slower for the gate tools.
+- The model: hipfire's MQ4G256 HFQ file of Qwen3.8 27B, `~/Downloads/qwen3.8-27b.mq4-xts` (15 GB, read into resident memory by every driver). The GGUF / IQ4_XS path is gone; tag `pre-cleanup-2026-10-20` has it.
+- Python 3 with numpy for the emitters and checkers. Use an OpenBLAS numpy (`/home/q/yah-scratch/venv/bin/python`) for the gate tools; the system numpy is ~100x slower there.
 
 ### HRX patches
 
@@ -21,22 +21,30 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0003-profile-counters-mode` | `HRX_PROFILE_MODE=counters` with `HRX_PROFILE_COUNTERS`: per-dispatch PMC such as `SQ_BUSY_CYCLES`, plus the gfx11 GL2C counters |
 | `0004-loom-profile-function-filter` | `LOOM_PROFILE_FUNCTION=<glob>` for executable traces in the Loom HAL benchmark tool |
 | `0005-gfx1151-f16-wmma-operand-placement` | the f16 WMMA spreads its operands over the register banks (upstream does it for bf16 only): prefill GEMM cycles -2.6% |
-| `0006-dispatch-timestamps-callback` | dispatch device timestamps to an in-process callback (`hrx_device_profile_dispatches_*`), used by the shelved prefill calibration |
+| `0006-dispatch-timestamps-callback` | dispatch device timestamps to an in-process callback (`hrx_device_profile_dispatches_*`); its user, the prefill calibration, is gone (tag `pre-cleanup-2026-10-20`) |
 | `0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
-| `0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later (8 `v_mov` + a load wait per k phase in afrag GEMMs); bit-identical, enables the IQ3_S sign chain |
-| `0009-loom-omit-dead-fma-mix-seeds` | after allocation, drops the `v_mov_b32 0` that seeds an f16 pair built by `v_fma_mixlo` + `v_fma_mixhi` (no bit of it is ever read), keeping the schedule and registers; afrag kstore cycles -1.0%, bit-identical |
-| `0013-xdna-npu-cascade-gemm-compiler` | Loom AIE2P / XDNA pieces of the NPU cascade GEMM: memory-tile staging, replay and multicast, shared panels, cascade link timing, `worker.accumulate`, leaf-synchronized channels (`constrain.leaf_sync`), replay rings re-armed by the control program, `LOOM_EXP_*` placement and packing knobs (`LOOM_EXP_LS_SEND_PITCH`: leaf-synchronized send-ring slots n records apart, each sending its leading record); NPU-only code paths (GPU emits byte-identical) |
-| `0014-xdna-continuation-invocation` | `iree_hal_amd_xdna_executable_query_continuation`: the control-only repeat invocation (no tile setup), ~545 -> ~150 us fixed cost per NPU call |
-| `0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8-byte store recorded in a graph's command buffer (no partition break); with release + system scope the command processor makes every earlier write visible to the host and other devices first. The NPU prefill's "inputs ready" flags (one graph per chunk) |
-| `0016-loom-xdna-npu-side-gate` | Loom AIE2P: an NPU job waits for a flag in memory itself (no host relay): core stream channels (`constrain.core_stream`, the core's own stream port), request-driven polls through a shim lock (`constrain.request`), a gate the control program waits for before moving any data and a done record queued after the outputs (`constrain.gate`, `constrain.signal`; streamed plans get `[gate \| done]` invocations), worker storage zeroed at setup; router fix: through a memory tile a route keeps its channel. Ungated images byte-identical |
-| `0017-loom-xdna-gated-call-invocations` | gated plans that are not streamed (one replay group: the NPU GEMM with final outputs) publish [call \| gate \| done] as separate invocations, so a job of calls runs as [gate][call]...[call][done] with one gate; existing images byte-identical |
-| `0028-loom-xdna-deferred-conflicting-rodata` | Loom AIE2P: read-only data with bank conflicts that would share a bank with a placed peer is placed after the channel rings, in a bank without one (the grid decoders' grid and sign tables; placed at once, the table left an activation ring no room) |
-| `0029-loom-xdna-top-aligned-programs` | Loom AIE2P: every core program ends at the top of program memory behind a 16-byte startup jump at address 0, so images that share a code tail (the GEMM loop after a format's decoder) hold it at the same addresses and an image switch rewrites less program memory |
-| `0030-loom-amdgpu-tied-fmac` | Loom AMDGPU: an f32 fma whose addend dies there becomes the tied `v_fmac_f32`, which VOPD pairs (`v_dual_fmac_f32`); bit-identical. A splat addend keeps the VOP3 form (its lanes may share one register). The iu4 GEMM fold: 31 fewer VALU issue slots per phase |
-| `0031-loom-amdgpu-matrix-bank-allocation` | Loom: register allocation also tries a first fit that sees instruction operand preferences (matrix operand banks), grouped across whole-value copies and edges, and keeps it only without spills and without a lower residency tier; final numbering alone cannot move storage. Adds the gfx1151 iu4 WMMA qualification; bit-identical |
-| `0032-loom-kernel-priority` | Loom: `kernel.priority {level = N}` sets the current subgroup's issue priority; AMDGPU lowers it to `s_setprio` as an ordered execution barrier, so a pair brackets the instructions between them. Used around the iu4 GEMM fold; bit-identical |
-| `0033-loom-amdgpu-iu4-inline-seed-subrev` | Loom: an iu4 WMMA accumulator splat of the i32 bits of 1/(2 pi) selects the inline-source form (`.acc_inv_2pi`, beside `.acc_zero`); `x - c` with an inline f32 `c` selects `v_subrev_f32` with `c` in src0, and VOPD pairs it. The iu4 GEMM fold converts its integers with one paired subtract; bit-identical |
-| `0034-loom-amdgpu-inline-accumulator-bank-placement` | Loom: the inline-accumulator iu4 WMMA forms (`.acc_zero`, `.acc_inv_2pi`) get their own gfx1151 placement preference (A and B in different VGPR banks), beside 0031's register-accumulator rule; bit-identical |
+| `0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later; bit-identical |
+| `0009-loom-omit-dead-fma-mix-seeds` | after allocation, drops the `v_mov_b32 0` that seeds an f16 pair built by `v_fma_mixlo` + `v_fma_mixhi`, keeping the schedule and registers; bit-identical |
+| `0010-loom-vopd-trans-window-lookahead` | VOPD pairs inside TRANS-result windows when a lookahead finds no read that relies on the distance: prefill attention and SwiGLU epilogues -0.1..-0.25% cycles, bit-identical |
+| `0011-loom-low-licm` | loop-invariant code motion for low CFGs, only with `LOOM_EXP_LICM=1` (the emitter sets it for the fp16 and kv4 prefill attention): -1.0% at pp2048, -2.15% at 32K, bit-identical |
+| `0012-loom-slice-alias-coalescing` | concats of consecutive slices fold, and slice coalescing ignores dead exact-storage aliases: attention loop 29 -> 21 moves, -0.8..-2.3% attention, bit-identical |
+| `0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8-byte store recorded in a graph's command buffer (no partition break); written for the NPU split (branch `npu`), unused on main |
+| `0030-loom-amdgpu-tied-fmac` | an f32 fma whose addend dies there becomes the tied `v_fmac_f32`, which VOPD pairs; the iu4 GEMM fold: 31 fewer VALU issue slots per phase, bit-identical |
+| `0031-loom-amdgpu-matrix-bank-allocation` | register allocation also tries a first fit that sees instruction operand preferences (matrix operand banks), kept only without spills and without a lower residency tier; adds the gfx1151 iu4 WMMA qualification; bit-identical |
+| `0032-loom-kernel-priority` | `kernel.priority {level = N}` lowers to `s_setprio` as an ordered execution barrier; used around the iu4 GEMM fold; bit-identical |
+| `0033-loom-amdgpu-iu4-inline-seed-subrev` | an iu4 WMMA accumulator splat of the bits of 1/(2 pi) selects the inline-source form; `x - c` with an inline `c` selects `v_subrev_f32`, which VOPD pairs; bit-identical |
+| `0034-loom-amdgpu-inline-accumulator-bank-placement` | the inline-accumulator iu4 WMMA forms get their own gfx1151 placement preference (A and B in different VGPR banks); bit-identical |
+| `0035-loom-amdgpu-valu-source-bank-placement` | VALU instructions prefer pairwise different source banks (two reads of one bank issue in 2.5 cycles): GEMM fold bank conflicts 21 -> 4, pp2048 GEMM cycles -0.7%, bit-identical |
+| `0036-loom-amdgpu-pack-16bit-pairs-with-perm` | two 16-bit lanes pack with one `v_perm_b32` instead of 3 VALU: iu4 gu epilogue 48 -> 16 packing VALU, bit-identical |
+| `0037-loom-wave-uniform-branches-with-matched-barriers` | workgroup barriers under a subgroup-uniform branch are accepted when every region runs the same barrier sequence: one wave runs its own loop (`gen_gdn_ss`'s solver wave) |
+| `0038-loom-loop-carried-frame-placement` | loop-carried storage frames are placed together, so lane-decomposed accumulators keep one location around the backedge (`gen_gdn_ss` row loop 100 -> 33 `v_mov`) |
+| `0039-loom-amdgpu-repack-reads-constructing-lanes` | a result -> rhs b16 fragment repack reads the constructing lanes directly: 8 fewer VALU per repacked tile, bit-identical |
+| `0040-loom-amdgpu-b16-store-takes-low-half-def` | a 16-bit store of a low-half definition skips the `v_bfe_u32` that cleared the upper half: 168 VALU fewer in `gen_gdn_ss`, bit-identical |
+| `0041-loom-amdgpu-cross-block-memory-waits-use-alias-summaries` | cross-block memory waits use the source's alias summaries (no `vscnt 0` drain for noalias buffers), and `ds_swizzle` touches no memory |
+| `0042-amdgpu-one-mib-command-buffer-blocks` | 1 MiB command-buffer blocks: a pp2048 chunk graph is one submission, no 0.5-0.7 ms idle at a block boundary |
+| `0043-loom-amdgpu-xor16-shuffle-via-permlanex16` | wave32 xor-16 shuffles lower to `v_permlanex16_b32` instead of `ds_swizzle`: attention softmax exchanges -1.1..-3%, bit-identical |
+| `0044-libhrx-graph-barrier-state-256` | the graph barrier planner tracks 256 commands since the last barrier (was 8), so completion-counter chains do not pay a full barrier for retired edges |
+| `0045-loom-amdgpu-gfx11-non-temporal-cache-policy` | gfx11 non-temporal hints encode as GLC / SLC / DLC; decode's DeltaNet state store skips the MALL (+18 us per DeltaNet layer before) |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
@@ -46,19 +54,7 @@ These are upstream candidates; do not push them to HRX without the owner's agree
 engine/build_hrx.sh
 ```
 
-It builds `libyah_core`, the core tools (`yah-tokenize`, `yah-dump`, `yah-weights`), the drivers `loom_forward_pp`, `loom_decode`, `hal_run`, `hal_bench`, the GPU / NPU split harness `npu_split_run` and the server `yah_server` into `engine/build/`. It compiles with clang (`CXX=` overrides), `-O3 -march=native -ffp-contract=off`. Always use this script: `cmake --build engine/build` does not build the drivers and prints nothing, and a stale driver with a new HAL set launches the wrong grid. `gpu_run.sh` refuses a driver binary older than its source.
-
-`engine/build_loomhip.sh` builds `engine/build/loomhip` (needs hipcc), which runs one Loom hsaco through HIP for rocprofv3.
-
-## Autotune
-
-```
-engine/tune/tune.py <model.gguf>        # ~7 min; writes engine/tune/tables/<model>.json
-```
-
-It tunes every tile GEMM the driver runs (42 for this model) at five token counts (64, 128, 256, 512, 2048): it enumerates the legal tiles (token tile, waves along tokens, KSUB, decode-ahead), compiles them in parallel through the emitter (footprint gate included, spilling tiles dropped), measures clock-free cycles on the model's real weights with `engine/build/gemm_bench` (rotating through each shape's tensors so weights stream from DRAM as in the pipeline), then re-measures the best few (successive halving). Every candidate's output must hash the same as the default tile's. The table holds the full-chunk tile per GEMM, up to two narrower variants and the measured best variant per token bucket. The emitters use the model's table automatically (`YAH_TILES=<file>` picks another, `YAH_TILES=` none); `LoomPrefill::PickGemm` follows its per-bucket picks. Tuning changes no result bits: re-emit, then check the GPU references.
-
-Calibration while serving is built but shelved (architecture.md, Prefill calibration while serving).
+It builds `libyah_core`, the core tools (`yah-tokenize`, `yah-dump`, `yah-weights`), the drivers `loom_forward_pp`, `loom_decode`, `hal_run`, the server `yah_server`, the chat client `yah_chat` and `yah_serve_test` into `engine/build/`. It compiles with clang (`CXX=` overrides), `-O3 -march=native -ffp-contract=off`. Always use this script: `cmake --build engine/build` does not build the drivers and prints nothing, and a stale driver with a new HAL set launches the wrong grid. `gpu_run.sh` refuses a driver binary older than its source.
 
 ## Emit HAL sets
 
@@ -66,18 +62,17 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 
 | set | command |
 |---|---|
-| prefill, one pass of B tokens | `python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (B must be a multiple of 256) |
-| prefill, chunked, context T | `YAH_CTX=32768 python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (chunk 2048, pools for 32768 tokens; T a multiple of B) |
+| prefill, one pass of B tokens (A4) | `python3 tools/emit_prefill_pp.py <model> <dir> 2048` (B a multiple of 256; int4 activations on the iu4 WMMA) |
+| prefill, W4A16 (the quality mode) | add `YAH_A16=1` (f16 activations, the tile GEMM) |
+| prefill, chunked, context T | `YAH_CTX=32768 python3 tools/emit_prefill_pp.py <model> <dir> 2048` (chunk 2048, pools for 32768 tokens; T a multiple of B) |
 | prefill with kv8a16 / kv4a16 | add `YAH_KV=kv8` or `YAH_KV=kv4` (or mixed `k8v4`, `k4v8`; `k8` / `v4` alone quantize one side, prefill only) |
-| prefill with the NPU column split | add `YAH_NPU_SPLIT=qkv=4480,gate=2560,q=5120,out=2560,down=2560,ffn=7680` (NPU rows per site, multiples of 640, q of 2560; any subset; see `emit_prefill_pp.npu_split`); run `loom_forward_pp` with `YAH_NPU=1` (full 2048-token chunks; AC power and `power_dpm_force_performance_level=high`, see results.md) |
-| prefill with the NPU FFN block | `YAH_NPU_DCOL=1 YAH_NPU_FFNBLK=7168` (with `YAH_NPU_SPLIT` sites other than ffn; architecture.md) |
-| prefill with fused NPU decode | `YAH_NPU_FUSE=1` with `YAH_NPU_SPLIT` (multiples of 512): 8 GEMM columns of 512-row calls, each core decodes its own raw rows (IQ4_XS, IQ3_S, IQ3_XXS, Q3_K, Q4_K; a tensor of another format stays on the GPU in its layer); add `YAH_NPU_FFNBLK=<F>` (F a multiple of 1024) for the NPU FFN block on layers whose gate and up share a format and down has one of IQ4_XS, IQ3_XXS, IQ3_S (2048 balances today); a separate pass after the NPU job adds the NPU's partials to the GPU's down, `YAH_NPU_FFNRES=1` adds them in its residual epilogue instead (slower while the NPU is the late one); `YAH_NPU_SPLIT` may be left out (sites on the GPU); `qkv=5120,gate=3072,q=6144,out=2560` with F 8192 splits every large GEMM about in half (NPU-bound today); with qkv / q / out sites the emit also writes `<dir>/h`, the set at half the chunk that the token halves run (architecture.md) |
-| prefill on the HFQ model (A4) | `python3 tools/emit_prefill_pp.py ~/Downloads/qwen3.8-27b.mq4-xts <dir> 2048` (one pass; int4 activations on the iu4 WMMA; the GGUF-only knobs above do not apply yet; the model's tensor table comes from `engine/build/yah-dump --table`) |
-| prefill on the HFQ model (W4A16, the quality mode) | add `YAH_A16=1` (f16 activations) |
-| decode | `python3 tools/emit_decode.py <gguf> <dir> <max_context>` (multiple of 256, default 4096) |
+| prefill with block-sparse attention | add `YAH_FPS_FROM=<P>` to a chunked kv4 set: chunks from token P on run FlashPrefill (architecture.md) |
+| decode | `python3 tools/emit_decode.py <model> <dir> <max_context>` (multiple of 256, default 4096) |
 | decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
 
-`engine/build_hrx.sh <gguf> [dir]` also emits a decode set (default `engine/hal`), which the end-to-end gates use.
+The emitters read the model's tensor table from `engine/build/yah-dump --table` (headers only, no weights), so build first. `YAH_EMIT_KEEP=<dir>` keeps each specialized Loom source for `loom-compile --compile-report`.
+
+`engine/build_hrx.sh <model> [dir]` also emits a decode set (default `engine/hal`), which the end-to-end gates use.
 
 Big sets belong in `~/yah-scratch` or `/home/q/yah-hal-*`, not in the repo.
 
@@ -88,17 +83,17 @@ Every GPU job goes through `engine/run/gpu_run.sh <tag> -- <command>` (see GPU s
 Prefill:
 
 ```
-engine/run/gpu_run.sh pp -- engine/build/loom_forward_pp <gguf> <set> <out-prefix> 2048 <ids-file>
+engine/run/gpu_run.sh pp -- engine/build/loom_forward_pp <model> <set> <out-prefix> 2048 <ids-file>
 ```
 
-- `<ids-file>`: whitespace-separated token ids. A short file is repeated to the token count. Make one with `engine/build/yah-tokenize <gguf> --stdin`.
+- `<ids-file>`: whitespace-separated token ids. A short file is repeated to the token count. Make one with `engine/build/yah-tokenize <model> --stdin`.
 - The token count must equal the set's B, or for a chunked set be a multiple of the chunk up to T.
 - Prints `layers_ms=` (the 64-layer loop, wall clock) and `argmax=`. Writes `<prefix>.logits` (last token, f32) and `<prefix>.hidden` (final hidden, f32, token-major).
 
 Prefill then decode:
 
 ```
-YAH_GEN=64 YAH_DECODE_HAL=<decode set> engine/run/gpu_run.sh gen -- engine/build/loom_forward_pp <gguf> <chunked set> <out-prefix> 8192 <ids-file>
+YAH_GEN=64 YAH_DECODE_HAL=<decode set> engine/run/gpu_run.sh gen -- engine/build/loom_forward_pp <model> <chunked set> <out-prefix> 8192 <ids-file>
 ```
 
 - The prefill set must be paged (the default) and leave room: prompt + generated tokens <= T.
@@ -107,7 +102,7 @@ YAH_GEN=64 YAH_DECODE_HAL=<decode set> engine/run/gpu_run.sh gen -- engine/build
 Standalone decode (the prompt goes through the decode path one token at a time):
 
 ```
-engine/run/gpu_run.sh dec -- engine/build/loom_decode <gguf> <decode set> --ids "760 6511 314 9338 369" --gen 64
+engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids "760 6511 314 9338 369" --gen 64
 ```
 
 `--logits FILE` appends every step's logits (f32) for an external KL check.
@@ -118,15 +113,13 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <gguf> <decode set> --ids 
 
 ```
 cd engine/gpu/loom
-YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <gguf> /home/q/yah-hal-serve 2048
-YAH_KV=kv8 python3 tools/emit_decode.py <gguf> /home/q/yah-hal-serve-dec 32768
+YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <model> /home/q/yah-hal-serve 2048
+YAH_KV=kv8 python3 tools/emit_decode.py <model> /home/q/yah-hal-serve-dec 32768
 cd -
 source engine/hrx-env.sh
-engine/run/gpu_run.sh serve -- engine/build/yah_server --model <gguf> --prefill /home/q/yah-hal-serve --decode /home/q/yah-hal-serve-dec [--host 127.0.0.1] [--port 8080]
-engine/build/yah_server --model <gguf> --fake    # canned replies, CPU only: for clients and API tests
+engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill /home/q/yah-hal-serve --decode /home/q/yah-hal-serve-dec [--host 127.0.0.1] [--port 8080]
+engine/build/yah_server --model <model> --fake    # canned replies, CPU only: for clients and API tests
 ```
-
-With `--npu` the NPU computes part of every full prefill chunk's large GEMMs, as `YAH_NPU=1` does for `loom_forward_pp`: emit the prefill set with `YAH_NPU_SPLIT` as well (Emit HAL sets above). It needs the GPU performance level pinned high (`echo high | doas tee /sys/class/drm/card1/device/power_dpm_force_performance_level`; fabric / memory clock switches corrupt NPU outputs, results.md) and refuses to start otherwise. Partial chunks and decode run on the GPU alone.
 
 A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). Decode runs two steps ahead of the host: each step picks its token on the GPU (argmax, or for `temperature` > 0 `yah_dec_sample`: softmax at T cut to the top-p nucleus, an exact draw by Gumbel-max, ~1 ms) into the token stream the next step reads, and the host only reads the tokens (a host-mapped copy) to stream them and stop. A given seed draws other tokens than the earlier host sampler did; the distribution is the same. `loom_forward_pp` takes any token count the same way.
 
@@ -162,12 +155,12 @@ for event in client.responses.create(model="qwen", input="Hi", stream=True):
 | accepted and ignored | `store`, `metadata` (echoed), `user`, `service_tier`, `parallel_tool_calls`, and default values of `tool_choice`, `text`, `truncation` |
 | not supported (400) | tools, `previous_response_id` and stored responses, images and files, structured output, logprobs |
 
-All system and developer messages merge into one system message at the start. The chat template is a C++ port of the GGUF's Jinja template for this subset.
+All system and developer messages merge into one system message at the start. The chat template is a C++ port of the model's Jinja template for this subset.
 
 Tests (no GPU; source `engine/hrx-env.sh` first, `yah_server` links libhrx):
 
 ```
-engine/build/yah_serve_test <gguf> [yah_server]   # chat template golden, then yah_server --fake over HTTP
+engine/build/yah_serve_test <model> [yah_server]   # chat template golden, then yah_server --fake over HTTP
 ```
 
 It checks the C++ chat template byte for byte against `engine/serve/testdata/chat_template_cases.json`, then starts `yah_server --fake` on a free port and checks the response object and stream event shapes (the required fields of the openai SDK models), event order, deltas, `max_output_tokens`, the 400 error objects and client disconnect. The fixture was frozen from jinja2 on 2026-10-02 against the GGUF's template; regenerating it is not supported in-tree.
@@ -176,19 +169,18 @@ It checks the C++ chat template byte for byte against `engine/serve/testdata/cha
 
 | tool | what it checks | when |
 |---|---|---|
-| hidden md5 of `<prefix>.hidden` | bit identity of the whole forward. References (default set, `ids2048` / `ids8192` prompts): pp2048 `ac36332b6b5092a4`, pp8192 `963b7396625e2333` | every exact rewrite |
+| hidden md5 of `<prefix>.hidden` | bit identity of the whole forward: record the reference of the set before an exact rewrite (`ids2048` / `ids8192` prompts) | every exact rewrite |
 | `cmp` of every emitted HAL | byte identity of an emit | every refactor or cleanup of a generator |
-| `tools/gemv_check.py <gguf> <work> [kind ...]` | every decode GEMV (format, K) against a float64 gguf-py oracle through `hal_run` | GEMV changes |
-| `tools/dattn_check.py <gguf> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
-| `tools/sample_check.py <gguf> <work> [draws]` | the decode sampler against a numpy model of it (token for token), the model against the exact top-p distribution | sampler changes |
-| `tools/dattn_q_check.py <gguf> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
+| `tools/dattn_check.py <model> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
+| `tools/sample_check.py <model> <work> [draws]` | the decode sampler against a numpy model of it (token for token), the model against the exact top-p distribution | sampler changes |
+| `tools/dattn_q_check.py <model> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
 | `engine/run/gate/kld_ref.py <model> <set> <ref.bin> <workdir> [chunks]` | KL vs the BF16 model: hipfire's HFKLDR reference (24 wikitext-2 chunks of 2048, top-256 log-probs of positions 1024..2046; `~/yah-scratch/w4/kld/qwen3.8-27b.ref_wt2.bin`), one pp2048 per chunk, scored as hipfire's `eval_hipfire` scores; prints mean / p99 / p99.9 / max KL, top-1, PPL | HFQ model numerics |
 | `engine/run/gate/` (`gate_run.sh`, `accgate2.py`) | tiered accuracy gate on wikitext windows, all-position logits (`YAH_LOGITS_FROM`): T1 rounding level, T2 quantization level. See `engine/run/gate/README.md` | any numerics change |
 | `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `YAH_ROWSTATS` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |
-| `engine/tests/m0_gate.sh <gguf> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
-| `engine/tests/generate_gate.sh <gguf> [set]` | 20 greedy tokens equal the reference | after any change, cheap |
+| `engine/tests/m0_gate.sh <model> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
+| `engine/tests/generate_gate.sh <model> [set]` | 20 greedy tokens equal the reference | after any change, cheap |
 
-`hal_run` (`engine/build/hal_run`) dispatches one HAL once with bindings from GGUF tensors or files and writes outputs to files. It refuses any binding smaller than the size you declare. The checkers use it; use it for any new kernel oracle.
+`hal_run` (`engine/build/hal_run`) dispatches one HAL once with bindings from model tensors or files and writes outputs to files. It refuses any binding smaller than the size you declare. The checkers use it; use it for any new kernel oracle.
 
 Gate notes:
 
@@ -201,13 +193,12 @@ Gate notes:
 | question | tool |
 |---|---|
 | device time per dispatch in the real pipeline | `HRX_PROFILE_FILE=p.irpf HRX_PROFILE_MODE=dispatch <driver ...>`, then `external/hrx/build/cmake/runtime/src/iree/tools/iree-profile/iree-profile dispatch --dispatch_events --format=jsonl p.irpf`. Costs ~1%. |
-| cycles per dispatch (clock-free) | `HRX_PROFILE_MODE=counters HRX_PROFILE_COUNTERS=SQ_BUSY_CYCLES`, then `iree-profile counter --format=jsonl --counter_samples`. Needs TheRock's `libhsa-amd-aqlprofile64` (`/var/lib/lemonade/.cache/lemonade/bin/therock/gfx1151-7.13.0/lib`) first on `LD_LIBRARY_PATH`. Inflates dispatch gaps ~4x. |
+| cycles per dispatch (clock-free) | `HRX_PROFILE_MODE=counters HRX_PROFILE_COUNTERS=SQ_BUSY_CYCLES`, then `iree-profile counter --format=jsonl --counter_samples`. Needs a TheRock `libhsa-amd-aqlprofile64` first on `LD_LIBRARY_PATH` (the copy used so far lived under `/var/lib/lemonade`, now removed; `/opt/rocm/lib` has one, not yet tried with HRX). Inflates dispatch gaps ~4x. |
 | registers, spills, residency, schedule | `loom-compile k.loom --root=@k --target=amdgpu:gfx1151 --format=amdgpu-hsaco --output=k.hsaco --compile-report=details --compile-report-output=k.json`, then `PYTHONPATH=external/hrx/loom/py python3 -m loom.tools.compile_report show\|suggest\|diff k.json`. Run `suggest --include-experimental` before hand-tuning. `allocation.materialized_spill_*` shows real spills even when `spill_count` is 0. |
 | instruction counts | `llvm-objdump -d --mcpu=gfx1151` on the hsaco (a `.hal` embeds the ELF from the first `\x7fELF`). Run it with `env -u LD_LIBRARY_PATH`. |
-| PMC, occupancy, per-wave ATT | rocprofv3 cannot see HRX dispatches. Run the kernel through `engine/build/loomhip <hsaco> <kernel> <gx> <gy> <block_x> <iters> <buf>...` under `rocprofv3 --pmc "A B C"` (one space-separated list) or `--att --att-library-path <TheRock lib>`. ~400 gfx1151 counters (`SQ_INST_CYCLES_VALU`, `SQ_WAIT_BARRIER`, `SPI_RA_*`) need `ROCPROFILER_METRICS_PATH` pointed at a copy of rocprof-compute's `sdk_config.yaml` renamed `config.yaml`. |
+| PMC, occupancy, per-wave ATT | rocprofv3 cannot see HRX dispatches. The `loomhip` harness that ran one Loom hsaco through HIP under `rocprofv3 --pmc` / `--att` is on tag `pre-cleanup-2026-10-20`. |
 | clocks, temperature, throttling | gpu_metrics v3 (`/sys/class/drm/card1/device/gpu_metrics`), the ryzen_smu PM table, `z13ctl status` for the APU temperature. See hardware.md. |
 
-- loomhip buffer lists must match the kernel's launch signature in order and count; loomhip refuses a count that disagrees with the kernel argument size, but cannot check order. Run it through `gpu_run.sh`.
 - ATT stretches the tile GEMM ~1.5x. Use it for shares and attribution, never for absolute idle time; check resource claims with PMC.
 - After an ablation, check that the ablated kernel's ISA still contains the work: the compiler deletes loads whose data is never used.
 - PC sampling and RGP for compute do not work on this box.
@@ -222,13 +213,10 @@ Rules:
 2. LDS data written by other threads needs a workgroup barrier before the first read, prologues included. (A page table in LDS read before its barrier hung the GPU.)
 3. Clamp or validate every index read from memory before it addresses a buffer. The host validates page tables; cache writers clamp page indices into the pool.
 4. Clamp a vector load by its own width: `min(addr, N - width)`. A clamp copied from a 4-wide load onto a 2-wide load shifts the last element.
-5. Never bind a buffer smaller than the kernel's declared footprint. The prefill emitter runs `tools/footprint_gate.py`; `hal_run` checks declared sizes; `tools/safe_bench.py` and `tools/loom_preflight.py` check the compile report's footprint against the bindings.
+5. Never bind a buffer smaller than the kernel's declared footprint. The prefill emitter runs `tools/footprint_gate.py`; `hal_run` checks declared sizes; `tools/loom_preflight.py` checks the compile report's footprint against the bindings.
 6. Rebuild drivers with `engine/build_hrx.sh` after every source change, and do not edit `engine/run/*.cc` during a measuring round (`gpu_run.sh` will then refuse the remaining runs).
 7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
-8. A launched chunk graph waits on NPU done words (~2 s bound each). Never leave it waiting on jobs that will not run: when queueing them fails, release the waits (`NpuSplit::Release`); a failed wait sets a sticky status that ends every later wait at once. A graph of ~250 unreleased waits (before the sticky status) spun for minutes, starved the display ring and needed a reset. Test new NPU host paths CPU-driven first (no GPU kernels), then end to end.
-
-9. New NPU work goes through the safe tools first: the kernels' oracle checks (`split_gemm_check.py`, `npu_rem_check.py` with `REM_LEAD`, `npu_unpack_check.py` with `UNP_DUP`, footprint gates), then the NPU host path CPU-driven: `YAH_NPU_CPU=1 loom_forward_pp ...` records the chunk, launches no GPU work, stores each job's ready word from the host and reports the first job that stalls or fails. Only then end to end. For a stall: `YAH_NPU_CPU_JOBS=list` prints the chunk's jobs, `YAH_NPU_CPU_JOBS=a-b,c-d` runs only those (keep whole family runs: the gate values count per run) to bisect image transitions; `YAH_NPU_CPU_STALL_CMD="python3 tools/npu_aie_status.py > stall.txt"` dumps every column's DMA / core / lock state while the stalled context lives, `YAH_NPU_CPU_HOLD=<job>` runs the command with that job parked at its gate (the healthy reference) and `YAH_NPU_CPU_DONE_CMD` after the last job.
-10. Never free memory the GPU or the NPU may still touch. `~LoomNpu` waits for the GPU, then destroys the NPU context, then frees the shared pages; a failed `Enqueue` waits for the launched graph before it throws. With the IOMMU in passthrough an NPU write to a freed page lands in whatever the kernel reused it for; a GPU read of a freed page hangs the shader and MES.
+8. Never free memory the GPU may still touch: a GPU read of a freed page hangs the shader and MES.
 
 After a hang and reboot, read the previous boot's kernel log:
 
