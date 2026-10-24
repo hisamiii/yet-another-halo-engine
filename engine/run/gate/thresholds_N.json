@@ -1,6 +1,6 @@
 {
  "tier": "N",
- "note": "quality-neutral bar (user, 2026-10-05): mean KL <= 2e-6, p99.9 <= 2e-4, 0 top-1 flips, |ln PPL ratio| <= 1e-4 on all 16 windows, against the golden of the current default (~/yah-scratch/golden4); cumulative: gate every candidate together with what already shipped. Calibration: today's engine vs the Oct 1 engine on 12 windows is mean KL 1.95e-6, p99.9 1.8e-4, 0 flips (two legitimate engine versions); 4-window tails undersample p99.9",
+ "note": "quality-neutral bar (user, 2026-10-05): mean KL <= 2e-6, p99.9 <= 2e-4, 0 top-1 flips, |ln PPL ratio| <= 1e-4 on all 16 windows, against the golden of the current default (~/Development/Scratch/golden4); cumulative: gate every candidate together with what already shipped. Calibration: today's engine vs the Oct 1 engine on 12 windows is mean KL 1.95e-6, p99.9 1.8e-4, 0 flips (two legitimate engine versions); 4-window tails undersample p99.9",
  "windows": [
   "00",
   "01",
