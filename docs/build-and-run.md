@@ -71,7 +71,7 @@ The emitters read the model's tensor table from `engine/build/yah-dump --table` 
 
 `engine/build_hrx.sh <model> [dir]` also emits a decode set (default `engine/hal`), which the end-to-end gates use.
 
-Big sets belong in `~/yah-scratch` or `/home/q/yah-hal-*`, not in the repo.
+Big sets belong in `~/yah-scratch` (HAL sets under `~/yah-scratch/hal/`), not in the repo.
 
 ## Run
 
@@ -110,11 +110,11 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids
 
 ```
 cd engine/gpu/loom
-YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <model> /home/q/yah-hal-serve 2048
-YAH_KV=kv8 python3 tools/emit_decode.py <model> /home/q/yah-hal-serve-dec 32768
+YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <model> /home/q/yah-scratch/hal/yah-hal-serve 2048
+YAH_KV=kv8 python3 tools/emit_decode.py <model> /home/q/yah-scratch/hal/yah-hal-serve-dec 32768
 cd -
 source engine/hrx-env.sh
-engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill /home/q/yah-hal-serve --decode /home/q/yah-hal-serve-dec [--host 127.0.0.1] [--port 8080]
+engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill /home/q/yah-scratch/hal/yah-hal-serve --decode /home/q/yah-scratch/hal/yah-hal-serve-dec [--host 127.0.0.1] [--port 8080]
 engine/build/yah_server --model <model> --fake    # canned replies, CPU only: for clients and API tests
 ```
 
