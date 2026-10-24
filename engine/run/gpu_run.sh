@@ -2,7 +2,7 @@
 # Run a GPU command with the kernel log captured on both sides.
 #
 # usage: gpu_run.sh <tag> -- <command...>
-#   env: YAH_GPU_LOG_DIR   where to write the log (default /home/q/yah-scratch/gpu-logs)
+#   env: YAH_GPU_LOG_DIR   where to write the log (default /home/q/Development/Scratch/gpu-logs)
 #
 # A bad dispatch on this target does not fail in-process: an access past an allocation hangs with no page fault.
 # Then gfx_0.1.0 times out, MES stops answering msg=RESET, the GPU reset fails and the machine goes down.
@@ -11,7 +11,7 @@
 #   doas journalctl -k -b -1 --no-pager | grep -iE 'amdgpu|timeout|reset|MES'
 set -uo pipefail
 
-LOGDIR="${YAH_GPU_LOG_DIR:-/home/q/yah-scratch/gpu-logs}"
+LOGDIR="${YAH_GPU_LOG_DIR:-/home/q/Development/Scratch/gpu-logs}"
 if [ "$#" -lt 3 ] || [ "$2" != "--" ]; then
   echo "usage: gpu_run.sh <tag> -- <command...>" >&2
   exit 2

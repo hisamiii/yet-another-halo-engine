@@ -60,7 +60,7 @@ Docs live in `docs/`: `architecture.md`, `build-and-run.md`, `results.md` (resul
 
 ### Local scratchpads
 
-`notes/` in the repo root is gitignored: use it for lab notebooks, TODOs, raw logs and session notes. Big experiment output goes to `~/yah-scratch/<topic>` (delete large outputs after use). Promote only distilled, still-true findings into `docs/`.
+`notes/` in the repo root is gitignored: use it for lab notebooks, TODOs, raw logs and session notes. Big experiment output goes to `~/Development/Scratch/<topic>` (delete large outputs after use). Promote only distilled, still-true findings into `docs/`.
 
 ## Measuring
 

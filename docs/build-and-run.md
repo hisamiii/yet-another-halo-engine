@@ -4,11 +4,11 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 
 ## Prerequisites
 
-- HRX / Loom: the revision pinned in `engine/hrx/PIN` plus the patches in `engine/hrx/patches/`. `engine/hrx/bootstrap.sh` clones it into `external/hrx` (gitignored; `YAH_HRX` overrides, and a symlink to an existing checkout works), checks out the pin, applies the patches and builds what the engine uses: `libhrx` and its HIP binding, `iree-run-loom`, `loom-compile`, `iree-profile`. `engine/hrx/bootstrap.sh --check` verifies the checkout; `engine/build_hrx.sh` refuses anything else. On this box `main` builds against `/home/q/src/hrx-gpu` (the pin plus main's patches; `external/hrx` links there) and branch `npu` against `/home/q/src/hrx` (the pin plus every patch of that branch, the NPU ones 0013-0029 included); point `external/hrx` at the one matching the branch you build.
+- HRX / Loom: the revision pinned in `engine/hrx/PIN` plus the patches in `engine/hrx/patches/`. `engine/hrx/bootstrap.sh` clones it into `external/hrx` (gitignored; `YAH_HRX` overrides, and a symlink to an existing checkout works), checks out the pin, applies the patches and builds what the engine uses: `libhrx` and its HIP binding, `iree-run-loom`, `loom-compile`, `iree-profile`. `engine/hrx/bootstrap.sh --check` verifies the checkout; `engine/build_hrx.sh` refuses anything else. On this box `main` builds against `/home/q/Development/Projects/hrx-gpu` (the pin plus main's patches; `external/hrx` links there) and branch `npu` against `/home/q/Development/Projects/hrx` (the pin plus every patch of that branch, the NPU ones 0013-0029 included); point `external/hrx` at the one matching the branch you build.
 - The official ROCm Core SDK 10.0.0 runtime packages, extracted (no system install) by `engine/hrx-env.sh --fetch` into `external/rocm10` (`YAH_ROCM` overrides). Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
 - `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`; `/opt/rocm` stays usable. The Python emitters find the same paths through `engine/gpu/loom/hrx_paths.py`.
 - The model: hipfire's MQ4G256 HFQ file of Qwen3.8 27B, `~/Downloads/qwen3.8-27b.mq4-xts` (15 GB, read into resident memory by every driver). The GGUF / IQ4_XS path is gone; tag `pre-cleanup-2026-10-20` has it.
-- Python 3 with numpy for the emitters and checkers. Use an OpenBLAS numpy (`/home/q/yah-scratch/venv/bin/python`) for the gate tools; the system numpy is ~100x slower there.
+- Python 3 with numpy for the emitters and checkers. Use an OpenBLAS numpy (`/home/q/Development/Scratch/venv/bin/python`) for the gate tools; the system numpy is ~100x slower there.
 
 ### HRX patches
 
@@ -71,7 +71,7 @@ The emitters read the model's tensor table from `engine/build/yah-dump --table` 
 
 `engine/build_hrx.sh <model> [dir]` also emits a decode set (default `engine/hal`), which the end-to-end gates use.
 
-Big sets belong in `~/yah-scratch` (HAL sets under `~/yah-scratch/hal/`), not in the repo.
+Big sets belong in `~/Development/Scratch` (HAL sets under `~/Development/Scratch/hal/`), not in the repo.
 
 ## Run
 
@@ -110,11 +110,11 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids
 
 ```
 cd engine/gpu/loom
-YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <model> /home/q/yah-scratch/hal/yah-hal-serve 2048
-YAH_KV=kv8 python3 tools/emit_decode.py <model> /home/q/yah-scratch/hal/yah-hal-serve-dec 32768
+YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <model> /home/q/Development/Scratch/hal/yah-hal-serve 2048
+YAH_KV=kv8 python3 tools/emit_decode.py <model> /home/q/Development/Scratch/hal/yah-hal-serve-dec 32768
 cd -
 source engine/hrx-env.sh
-engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill /home/q/yah-scratch/hal/yah-hal-serve --decode /home/q/yah-scratch/hal/yah-hal-serve-dec [--host 127.0.0.1] [--port 8080]
+engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill /home/q/Development/Scratch/hal/yah-hal-serve --decode /home/q/Development/Scratch/hal/yah-hal-serve-dec [--host 127.0.0.1] [--port 8080]
 engine/build/yah_server --model <model> --fake    # canned replies, CPU only: for clients and API tests
 ```
 
@@ -171,7 +171,7 @@ It checks the C++ chat template byte for byte against `engine/serve/testdata/cha
 | `tools/dattn_check.py <model> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
 | `tools/sample_check.py <model> <work> [draws]` | the decode sampler against a numpy model of it (token for token), the model against the exact top-p distribution | sampler changes |
 | `tools/dattn_q_check.py <model> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
-| `engine/run/gate/kld_ref.py <model> <set> <ref.bin> <workdir> [chunks]` | KL vs the BF16 model: hipfire's HFKLDR reference (24 wikitext-2 chunks of 2048, top-256 log-probs of positions 1024..2046; `~/yah-scratch/w4/kld/qwen3.8-27b.ref_wt2.bin`), one pp2048 per chunk, scored as hipfire's `eval_hipfire` scores; prints mean / p99 / p99.9 / max KL, top-1, PPL | HFQ model numerics |
+| `engine/run/gate/kld_ref.py <model> <set> <ref.bin> <workdir> [chunks]` | KL vs the BF16 model: hipfire's HFKLDR reference (24 wikitext-2 chunks of 2048, top-256 log-probs of positions 1024..2046; `~/Development/Scratch/w4/kld/qwen3.8-27b.ref_wt2.bin`), one pp2048 per chunk, scored as hipfire's `eval_hipfire` scores; prints mean / p99 / p99.9 / max KL, top-1, PPL | HFQ model numerics |
 | `engine/run/gate/` (`gate_run.sh`, `accgate2.py`) | tiered accuracy gate on wikitext windows, all-position logits (`YAH_LOGITS_FROM`): T1 rounding level, T2 quantization level. See `engine/run/gate/README.md` | any numerics change |
 | `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `YAH_ROWSTATS` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |
 | `engine/tests/m0_gate.sh <model> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
@@ -212,7 +212,7 @@ Rules:
 4. Clamp a vector load by its own width: `min(addr, N - width)`. A clamp copied from a 4-wide load onto a 2-wide load shifts the last element.
 5. Never bind a buffer smaller than the kernel's declared footprint. The prefill emitter runs `tools/footprint_gate.py`; `hal_run` checks declared sizes; `tools/loom_preflight.py` checks the compile report's footprint against the bindings.
 6. Rebuild drivers with `engine/build_hrx.sh` after every source change, and do not edit `engine/run/*.cc` during a measuring round (`gpu_run.sh` will then refuse the remaining runs).
-7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-logs/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
+7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/Development/Scratch/gpu-logs/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
 8. Never free memory the GPU may still touch: a GPU read of a freed page hangs the shader and MES.
 
 After a hang and reboot, read the previous boot's kernel log:
