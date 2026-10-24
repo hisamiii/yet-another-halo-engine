@@ -2,8 +2,8 @@
 # gate_run.sh <hal set> <outdir>: Loom pp2048 on frozen corpus windows (corpus/ids2048_wNN.txt, WINDOWS="00 01 ...").
 # Writes logits for positions FROM..2047 (default 1536) to <outdir>/wNN.{all_logits,logits,hidden}.
 # Correctness runs only: no timing, no gaps.
-set_dir=$1; out=$2; shift 2; FROM=${FROM:-1536}; C=${CORPUS:-/home/q/yet-another-halo-engine/engine/run/gate/corpus}
-mkdir -p $out; E=/home/q/yet-another-halo-engine
+set_dir=$1; out=$2; shift 2; FROM=${FROM:-1536}; E=$(cd "$(dirname "$0")/../../.." && pwd); C=${CORPUS:-$E/engine/run/gate/corpus}
+mkdir -p $out
 cd $E; set +u; set --; source engine/hrx-env.sh >/dev/null
 # Long windows (L0 = corpus/ids8192_w0.txt) run 8192 tokens on SET8K (an 8192-token HAL set), positions FROM_L..8191.
 for w in ${WINDOWS:-00 01 02 03}; do
