@@ -443,6 +443,17 @@ class LoomNpu {
   void EnqueueGated(std::vector<GatedJob> jobs, bool fresh = false) {
     CheckHealth();
     const auto t0 = std::chrono::steady_clock::now();
+    {
+      // Idle past the device's autosuspend delay, the NPU may have been powered down: the array kept nothing, so the
+      // next setups write whole programs (as after a failure)
+      std::lock_guard<std::mutex> lock(mu_);
+      if (retired_ == submitted_ && active_.time_since_epoch().count() && t0 - active_ > suspend_after_) {
+        resident_ = nullptr;
+        resident_dec_ = -1;
+        program_lost_ = true;
+        ++epoch_;
+      }
+    }
     const Kernel* k = jobs[0].calls[0]->k;
     const void* family = k->family ? k->family : k->image_key;
     bool resident = false;
@@ -883,6 +894,7 @@ class LoomNpu {
       {
         std::lock_guard<std::mutex> lock(mu_);
         ++retired_;
+        active_ = std::chrono::steady_clock::now();
       }
       retired_cv_.notify_all();
     }
@@ -1120,6 +1132,19 @@ class LoomNpu {
   CommandStats commands_;                  // under mu_
   std::mutex mu_;
   std::uint64_t submitted_ = 0, retired_ = 0;  // commands; under mu_
+  std::chrono::steady_clock::time_point active_{};   // the last command's retirement; under mu_
+  // How long the NPU may sit idle before runtime PM may power it down (amdxdna's autosuspend, 5 s by default), with a
+  // margin; "on" (no runtime PM): never
+  const std::chrono::milliseconds suspend_after_ = SuspendAfter();
+  static std::chrono::milliseconds SuspendAfter() {
+    const std::string dir = "/sys/class/accel/accel0/device/power/";
+    std::ifstream c(dir + "control"), d(dir + "autosuspend_delay_ms");
+    std::string control;
+    long delay = 0;
+    if (c >> control && control == "on") return std::chrono::hours(24 * 365);
+    if (!(d >> delay) || delay <= 0) return std::chrono::milliseconds(500);
+    return std::chrono::milliseconds(delay * 3 / 4);
+  }
   std::condition_variable retired_cv_;
   bool stop_ = false;
   std::string failure_;

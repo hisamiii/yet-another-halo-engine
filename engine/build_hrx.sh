@@ -30,8 +30,8 @@ cmake -S "$root/engine" -B "$root/engine/build" -DCMAKE_BUILD_TYPE=Release -DCMA
     -DCMAKE_CXX_FLAGS_RELEASE="${cxxflags[*]:1}" -DCMAKE_EXE_LINKER_FLAGS="${YAH_LDFLAGS:-}" >/dev/null
 cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # The runners below are not CMake targets. Build them here so a stale binary never runs against a new HAL set.
-# NPU (libamdf + the xdna loader, static from an HRX build with the xdna targets, engine/hrx/bootstrap.sh): the prefill
-# driver's NPU FFN block (YAH_NPU=1). Without them the driver is GPU-only.
+# NPU (libamdf + the xdna loader, static from an HRX build with the xdna targets, engine/hrx/bootstrap.sh): the NPU FFN
+# block of the prefill driver (YAH_NPU=1) and the server (--npu). Without them both are GPU-only.
 npu_flags=() npu_libs=()
 if [ -f "$H/libamdf/libamdf_static.a" ]; then
   for a in experimental/xdna/libiree_experimental_xdna_amdf_status.a experimental/xdna/libiree_experimental_xdna_executable.a \
@@ -66,16 +66,16 @@ fi
     -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # The Responses API server (engine/serve).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" "${npu_flags[@]}" \
     "$root/engine/serve/yah_server.cc" "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
     "$root/engine/serve/chat_completions.cpp" \
     "$root/engine/third_party/httplib/httplib.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+    "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # GPU test of the engine's multi-turn reuse.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/tests/engine_reuse.cc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/tests/engine_reuse.cc" \
     -o "$root/engine/build/engine_reuse" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+    "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"

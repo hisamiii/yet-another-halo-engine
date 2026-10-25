@@ -29,6 +29,14 @@
 #include "model/loom_decoder.hpp"
 #include "model/loom_prefill.hpp"
 #include "model/loom_runtime.hpp"
+#ifdef YAH_WITH_NPU
+#include <sys/resource.h>
+#include <unistd.h>
+
+#include <fstream>
+
+#include "model/loom_npu.hpp"
+#endif
 
 namespace yah::model {
 
@@ -38,6 +46,11 @@ class Engine : public TextGenerator {
     std::string model;        // GGUF path
     std::string prefill_hal;  // emit_prefill_pp.py set (chunked, paged)
     std::string decode_hal;   // emit_decode.py set with the prefill's context and YAH_KV
+    // The NPU runs the FFN block of a prefill set that has one (tools/emit_npu_ffn.py), its down weights from
+    // npu_down (tools/npu_down_pack.py; default <prefill_hal>/npu_down.bin). Off, or not ready (NpuProblem), the
+    // GPU runs everything.
+    bool npu = false;
+    std::string npu_down;
   };
   // How the tokens after the last whole chunk are run.
   enum class Tail { kAuto, kChunk, kDecode };
@@ -69,7 +82,12 @@ class Engine : public TextGenerator {
     tokens_host_ = static_cast<const std::uint32_t*>(th);
     const core::MetadataValue* name = gguf_.Meta("general.name");
     name_ = name && !name->s.empty() ? name->s : "qwen3.8-27b";
+    if (o.npu) StartNpu(o);
   }
+  ~Engine() override { gpu_.Synchronize(); }   // (the graphs wait on NPU words: none may run past npu_)
+
+  // Why the NPU block is off ("" when it runs).
+  [[nodiscard]] const std::string& npu_status() const { return npu_status_; }
 
   [[nodiscard]] const core::Tokenizer& tokenizer() const override { return tokenizer_; }
   [[nodiscard]] std::uint32_t context() const override { return prefill_.context(); }
@@ -141,6 +159,23 @@ class Engine : public TextGenerator {
     for (std::uint32_t c = from / B; c < chunks; ++c) {
       const std::uint32_t valid = std::min(B, n - c * B);
       shares += ChunkShare(valid);
+      // Two full chunks with no snapshot between them run as a pair (the NPU block of one beside the other's layer)
+      if (prefill_.pairs() && c + 1 < chunks && n >= (c + 2) * B && !(at_prefill > from && (c + 1) * B == at_prefill)) {
+        const bool head1 = c + 2 == chunks && (tail_chunk || tail == 0);
+        shares += 2 * ChunkShare(B);
+        for (std::uint32_t p = 0; p < 2; ++p)
+          prefill_.SelectChunk(p), prefill_.Embed(prompt.data() + std::size_t{c + p} * B, B);
+        prefill_.RunPair(c, LoomPrefill::kNoRows, head1 ? std::int64_t{B} - 1 : LoomPrefill::kNoRows, head1);
+        if (head1) prefill_.SelectChunk(1), prefill_.Head(B - 1, Ref(logits_));
+        prefill_.SelectChunk(0);
+        if (at_prefill > from && (c + 2) * B == at_prefill) Save(xs, at_prefill, prefill_.conv_state());
+        if (c + 2 == chunks) {
+          gpu_.Synchronize();
+          Track(chunk_ms_, (std::chrono::steady_clock::now() - tp) / shares, true);
+        }
+        ++c;
+        continue;
+      }
       prefill_.Embed(prompt.data() + std::size_t{c} * B, valid);
       LoomPrefill::KvHook hook;
       if (valid % 16 && decoder_.kv_bits().second != 16) {
@@ -222,6 +257,43 @@ class Engine : public TextGenerator {
   }
 
   static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
+  void StartNpu(const Options& o) {
+#ifdef YAH_WITH_NPU
+    npu_status_ = NpuProblem();
+    if (npu_status_.empty()) {
+      prefill_.EnablePairs();
+      const NpuPlan plan = prefill_.npu_plan();
+      if (!plan.a_bytes) {
+        npu_status_ = "the prefill set has no NPU FFN block (tools/emit_npu_ffn.py)";
+      } else {
+        npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
+        prefill_.EnableNpu(npu_.get(), o.npu_down.empty() ? o.prefill_hal + "/npu_down.bin" : o.npu_down);
+      }
+    }
+#else
+    (void)o;
+    npu_status_ = "this build has no NPU support (build against an HRX with the xdna targets)";
+#endif
+  }
+#ifdef YAH_WITH_NPU
+  // What keeps the NPU from running here, or "". Fabric DPM switches corrupt the NPU's outputs, so the GPU's DPM level
+  // must be pinned; the NPU's buffers are locked pages.
+  static std::string NpuProblem() {
+    if (::access("/dev/accel/accel0", R_OK | W_OK) != 0) return "no NPU device (/dev/accel/accel0, amdxdna)";
+    rlimit rl{};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0 || rl.rlim_cur != RLIM_INFINITY)
+      return "the memlock limit is not unlimited (ulimit -l unlimited, or prlimit --memlock=unlimited:unlimited)";
+    for (int card = 0; card < 8; ++card) {
+      std::ifstream f("/sys/class/drm/card" + std::to_string(card) + "/device/power_dpm_force_performance_level");
+      std::string level;
+      if (f >> level)
+        return level == "high" ? "" :
+               "the GPU's DPM level is " + level + ", not high (echo high | sudo tee /sys/class/drm/card" +
+                   std::to_string(card) + "/device/power_dpm_force_performance_level; auto restores it)";
+    }
+    return "no amdgpu DPM control found";
+  }
+#endif
   // The prefill slot sits this many tokens short of the prompt's end: the next turn's history replaces the assistant
   // header's tail (<think> and the like).
   static constexpr std::uint32_t kMargin = 32;
@@ -267,6 +339,10 @@ class Engine : public TextGenerator {
   LoomWeights weights_;
   LoomPrefill prefill_;
   LoomDecoder decoder_;
+#ifdef YAH_WITH_NPU
+  std::unique_ptr<LoomNpuSplit> npu_;   // (destroyed before the prefill that points at it)
+#endif
+  std::string npu_status_ = "off";
   LoomBuffer logits_, seed_;
   LoomBuffer tokens_mirror_;                    // host-local copy of the decoder's token stream (MarkToken)
   const std::uint32_t* tokens_host_ = nullptr;  // its mapping

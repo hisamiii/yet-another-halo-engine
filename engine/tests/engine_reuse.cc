@@ -50,11 +50,20 @@ void Check(bool ok, const std::string& what) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 4) {
-    std::fprintf(stderr, "usage: engine_reuse <model> <prefill set> <decode set>\n");
+  if (argc != 4 && !(argc == 5 && std::string(argv[4]) == "--npu")) {
+    std::fprintf(stderr, "usage: engine_reuse <model> <prefill set> <decode set> [--npu]\n");
     return 2;
   }
-  Engine e({argv[1], argv[2], argv[3]});
+  Engine::Options options{argv[1], argv[2], argv[3]};
+  options.npu = argc == 5;
+  Engine e(options);
+  if (options.npu) {
+    if (!e.npu_status().empty()) {
+      std::fprintf(stderr, "engine_reuse: npu off: %s\n", e.npu_status().c_str());
+      return 1;
+    }
+    std::printf("npu on\n");
+  }
   const auto& tok = e.tokenizer();
   std::uint32_t cached = 0;
 

@@ -221,7 +221,8 @@ class LoomPrefill {
     // gate projection and the conv / DeltaNet chain) can run at the same time.
     // NPU FFN block: full chunks only, its handoffs graph nodes on flag words (NpuEnqueue / NpuJoin); the jobs are
     // queued once the chunk's one graph launched
-    npu_on_ = npu_ && n_ == B_;
+    // (with pairs, a lone full chunk runs without the NPU too: alone, its layers would wait for the NPU's block)
+    npu_on_ = npu_ && n_ == B_ && !pairs_;
     if (npu_on_) npu_->BeginChunk();
     flagged_.clear(), job_c_.clear();
     npu_cleared_ = npu_joined_ = 0;

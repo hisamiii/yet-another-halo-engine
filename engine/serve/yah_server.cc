@@ -34,9 +34,11 @@ using namespace yah::serve;
 int Usage() {
   std::fprintf(stderr,
                "usage: yah_server --model <model> [--prefill <hal set> --decode <hal set>] [--host 127.0.0.1] "
-               "[--port 8080]\n"
+               "[--port 8080] [--npu [--npu-down <pack>]]\n"
                "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
-               "In a release bundle the HAL sets default to the bundle's hal/prefill and hal/decode.\n");
+               "In a release bundle the HAL sets default to the bundle's hal/prefill and hal/decode.\n"
+               "--npu: the NPU runs the prefill set's FFN block (a set from tools/emit_npu_ffn.py), its down pack from\n"
+               "<prefill>/npu_down.bin unless --npu-down; without what it needs the GPU runs everything.\n");
   return 2;
 }
 
@@ -207,7 +209,8 @@ class Server {
 int main(int argc, char** argv) {
   std::string model, prefill, decode, host = "127.0.0.1";
   int port = 8080;
-  bool fake = false;
+  bool fake = false, npu = false;
+  std::string npu_down;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const bool has_value = i + 1 < argc;
@@ -219,6 +222,10 @@ int main(int argc, char** argv) {
       prefill = argv[++i];
     } else if (arg == "--decode" && has_value) {
       decode = argv[++i];
+    } else if (arg == "--npu") {
+      npu = true;
+    } else if (arg == "--npu-down" && has_value) {
+      npu_down = argv[++i];
     } else if (arg == "--host" && has_value) {
       host = argv[++i];
     } else if (arg == "--port" && has_value) {
@@ -247,7 +254,14 @@ int main(int argc, char** argv) {
       options.model = model;
       options.prefill_hal = prefill;
       options.decode_hal = decode;
-      generator = std::make_unique<yah::model::Engine>(options);
+      options.npu = npu;
+      options.npu_down = npu_down;
+      auto engine = std::make_unique<yah::model::Engine>(options);
+      if (npu) {
+        const std::string& why = engine->npu_status();
+        std::fprintf(stderr, "yah_server: npu %s%s\n", why.empty() ? "on" : "off: ", why.c_str());
+      }
+      generator = std::move(engine);
 #endif
     }
     Server server(*generator);
