@@ -854,6 +854,12 @@ class Tester {
     r = Chat({{"model", "m"}, {"messages", {{{"role", "user"}, {"content", "Hi"}}}}, {"max_tokens", 5}}, where);
     CheckEq(r["choices"][0]["finish_reason"], "length", where + ": finish_reason");
     CheckEq(r["usage"]["completion_tokens"], 5, where + ": completion_tokens");
+    CheckEq(r["timings"]["predicted_n"], 5, where + ": timings.predicted_n");
+    CheckEq(r["timings"]["prompt_n"], r["usage"]["prompt_tokens"], where + ": timings.prompt_n");
+    Check(r["timings"]["prompt_ms"].is_number() && r["timings"]["predicted_per_second"].is_number(), where + ": timings");
+    r = Chat({{"model", "m"}, {"messages", {{{"role", "user"}, {"content", "Hi"}}}}, {"max_tokens", 5}, {"ignore_eos", true}},
+             where);
+    CheckEq(r["usage"]["completion_tokens"], 5, "chat: ignore_eos: completion_tokens");
     r = Chat({{"model", "m"}, {"messages", {{{"role", "user"}, {"content", "Hi"}}}}, {"max_completion_tokens", 3}}, where);
     CheckEq(r["usage"]["completion_tokens"], 3, "chat: max_completion_tokens 3: completion_tokens");
   }

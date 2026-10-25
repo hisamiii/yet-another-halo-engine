@@ -70,7 +70,7 @@ ChatRequest ParseChatRequest(const Json& body) {
       "model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p",
       "presence_penalty", "frequency_penalty", "repetition_penalty", "repeat_last_n", "stop", "seed", "stream",
       "stream_options", "reasoning_effort", "chat_template_kwargs", "n", "user", "store", "metadata", "service_tier",
-      "parallel_tool_calls", "prompt_cache_key", "safety_identifier"};
+      "parallel_tool_calls", "prompt_cache_key", "safety_identifier", "ignore_eos"};
   // clang-format on
   for (const auto& [key, value] : body.items()) {
     if (kAccepted.contains(key) || IsEmptyValue(value) || IsDefaultValue(key, value)) continue;
@@ -149,6 +149,10 @@ ChatRequest ParseChatRequest(const Json& body) {
     if (!stream->is_boolean()) throw ApiError(400, "'stream' must be a boolean.", "stream");
     request.stream = stream->get<bool>();
   }
+  if (const Json* ignore = Field(body, "ignore_eos")) {
+    if (!ignore->is_boolean()) throw ApiError(400, "'ignore_eos' must be a boolean.", "ignore_eos");
+    request.ignore_eos = ignore->get<bool>();
+  }
   if (const Json* options = Field(body, "stream_options")) {
     if (!options->is_object()) throw ApiError(400, "'stream_options' must be an object.", "stream_options");
     if (const Json* usage = Field(*options, "include_usage")) {
@@ -211,6 +215,7 @@ bool ChatStream::EmitChunk(Json delta, const Json& finish_reason, const Json* us
     chunk["choices"] = Json::array(
         {{{"index", 0}, {"delta", std::move(delta)}, {"logprobs", nullptr}, {"finish_reason", finish_reason}}});
     if (request_.include_usage) chunk["usage"] = nullptr;
+    if (!finish_reason.is_null()) chunk["timings"] = timings_;
   }
   alive_ = emit_(Sse(chunk));
   return alive_;
@@ -246,6 +251,7 @@ bool ChatStream::Finish(const model::GenerateResult& result) {
             {"total_tokens", result.prompt_tokens + result.generated_tokens},
             {"prompt_tokens_details", {{"cached_tokens", result.cached_tokens}}},
             {"completion_tokens_details", {{"reasoning_tokens", parser_.reasoning_tokens()}}}};
+  timings_ = Timings(result);
   EmitChunk(Json::object(), finish_reason_);
   if (request_.include_usage) EmitChunk(nullptr, nullptr, &usage_);
   if (emit_ && alive_) alive_ = emit_("data: [DONE]\n\n");
@@ -267,7 +273,20 @@ Json ChatStream::Response() const {
           {"model", request_.model},
           {"choices",
            Json::array({{{"index", 0}, {"message", message}, {"logprobs", nullptr}, {"finish_reason", finish_reason_}}})},
-          {"usage", usage_}};
+          {"usage", usage_},
+          {"timings", timings_}};
+}
+
+Json Timings(const model::GenerateResult& result) {
+  const std::uint32_t prompt_n = result.prompt_tokens - result.cached_tokens;
+  const std::uint32_t steps = result.generated_tokens > 1 ? result.generated_tokens - 1 : 0;
+  return {{"cache_n", result.cached_tokens},
+          {"prompt_n", prompt_n},
+          {"prompt_ms", result.prefill_ms},
+          {"prompt_per_second", result.prefill_ms > 0.0 ? prompt_n * 1000.0 / result.prefill_ms : 0.0},
+          {"predicted_n", result.generated_tokens},
+          {"predicted_ms", result.decode_ms},
+          {"predicted_per_second", result.decode_ms > 0.0 ? steps * 1000.0 / result.decode_ms : 0.0}};
 }
 
 }  // namespace yah::serve

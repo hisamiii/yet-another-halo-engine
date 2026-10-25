@@ -26,7 +26,12 @@ struct ChatRequest {
   std::vector<std::string> stop;
   bool stream = false;
   bool include_usage = false;  // stream_options.include_usage
+  bool ignore_eos = false;     // llama.cpp's and vLLM's: generate max_tokens tokens past the end of turn (benchmarks)
 };
+
+// llama.cpp's timings object: prompt_n tokens prefilled (the cached ones are cache_n) in prompt_ms, to the first token;
+// predicted_n generated, the 2nd to the last in predicted_ms.
+[[nodiscard]] Json Timings(const model::GenerateResult& result);
 
 // Defaults are Qwen3.8's recommended sampling (temperature 0.6, top_p 0.95, top_k 20). Throws ApiError for bad or
 // unsupported input.
@@ -77,7 +82,7 @@ class ChatStream {
   std::int64_t created_;
   std::string reasoning_, answer_;
   std::string finish_reason_;
-  Json usage_;
+  Json usage_, timings_;
   bool alive_ = true;
 };
 

@@ -82,8 +82,9 @@ class Server {
     try {
       const ChatRequest request = ParseChatRequest(ParseBody(req));
       std::vector<TokenId> prompt;
-      const GenerateParams params =
+      GenerateParams params =
           Prepare(request.messages, request.chat, request.max_tokens, request.sampling, "messages", "max_tokens", &prompt);
+      if (request.ignore_eos) params.stop_ids.clear();
       Serve<ChatStream>(request, request.stream, prompt, params, res);
     } catch (const ApiError& error) {
       res.status = error.status;
@@ -188,9 +189,10 @@ class Server {
       throw;
     }
     stream.Finish(result);
-    const double tok_s = result.decode_ms > 0.0 ? result.generated_tokens * 1000.0 / result.decode_ms : 0.0;
-    std::fprintf(stderr, "yah_server: %s prompt=%u output=%u prefill_ms=%.1f decode_tok_s=%.1f finish=%s\n",
-                 stream.id().c_str(), result.prompt_tokens, result.generated_tokens, result.prefill_ms, tok_s,
+    const double tok_s = Timings(result)["predicted_per_second"].get<double>();
+    std::fprintf(stderr, "yah_server: %s prompt=%u cached=%u output=%u prefill_ms=%.1f decode_tok_s=%.1f finish=%s\n",
+                 stream.id().c_str(), result.prompt_tokens, result.cached_tokens, result.generated_tokens,
+                 result.prefill_ms, tok_s,
                  stream.client_alive() ? result.finish_reason.c_str() : "cancelled");
   }
 

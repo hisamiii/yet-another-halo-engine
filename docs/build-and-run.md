@@ -151,7 +151,7 @@ for chunk in client.chat.completions.create(model="qwen", messages=[{"role": "us
 | input | a string, or a list of `system` / `developer` / `user` / `assistant` messages with string or text-part content; `reasoning` items from earlier output; `instructions` |
 | reasoning | `reasoning.effort`: `none` / `minimal` (thinking off), `low`, `medium`, `high` (default, the template's `xhigh`). The thinking text comes back as a `reasoning` output item with `reasoning_text` content |
 | sampling | `temperature` (default 0.6), `top_p` (default 0.95), top-k 20, `max_output_tokens` (default: the rest of the context; prompt + max must fit) |
-| chat completions | `messages` as above; `max_completion_tokens` or `max_tokens`; `temperature`, `top_p`, `top_k` (default 20; 0 or -1: off), `min_p`, `presence_penalty`, `frequency_penalty` (-2..2), `repetition_penalty`, `repeat_last_n` (default 64, up to 1024), `seed`, `stop` (a string or up to 16), `stream` with `stream_options.include_usage`; `reasoning_effort` or `chat_template_kwargs.enable_thinking`. Reasoning comes back as `reasoning_content`. `n` must be 1 |
+| chat completions | `messages` as above; `max_completion_tokens` or `max_tokens`; `temperature`, `top_p`, `top_k` (default 20; 0 or -1: off), `min_p`, `presence_penalty`, `frequency_penalty` (-2..2), `repetition_penalty`, `repeat_last_n` (default 64, up to 1024), `seed`, `stop` (a string or up to 16), `stream` with `stream_options.include_usage`; `reasoning_effort` or `chat_template_kwargs.enable_thinking`; `ignore_eos` (benchmarks). Reasoning comes back as `reasoning_content`, and llama.cpp's `timings` object (prefill and decode ms and tokens/s) comes with the response or the stream's last chunk. `n` must be 1 |
 | accepted and ignored | `store`, `metadata` (echoed), `user`, `service_tier`, `parallel_tool_calls`, and default values of `tool_choice`, `text`, `truncation` |
 | not supported (400) | tools, `previous_response_id` and stored responses, images and files, structured output, logprobs |
 
@@ -251,6 +251,8 @@ doas journalctl -k -b -1 --no-pager | grep -iE 'amdgpu|ring .*timeout|reset|MES'
 `/tmp` is wiped by the reboot; keep logs elsewhere.
 
 ## Measuring
+
+End to end, as a client sees it: `engine/bench/bench.py --url http://127.0.0.1:8080 [--lengths 512,2048,8192,16384,30000] [--gen 128] [--json out.json]`. One greedy request per prompt length (random nonce first, so no cache serves it; `ignore_eos`, so every run decodes `--gen` tokens), prefill and decode tokens/s from the server's `timings`. It follows the rules below: it waits for Tctl <= 55 C, then 15 s or 30 s, before each run. Pointed at llama.cpp's `llama-server` it measures that the same way.
 
 - One round per candidate. No interleaving, no ABBA, no repeats, no clock pinning.
 - Before each timed run, cool the APU to <= 55 C (`z13ctl status`), then wait 1 s (single kernels), 15 s (pp2048) or 30 s (pp8192 and longer).
