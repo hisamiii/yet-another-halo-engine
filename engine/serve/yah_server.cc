@@ -35,14 +35,15 @@ namespace http = yah::serve::http;
 int Usage() {
   std::fprintf(stderr,
                "usage: yah_server --model <model> [--prefill <hal set> --decode <hal set>] [--host 127.0.0.1] "
-               "[--port 8080] [--npu [--npu-down <pack>]] [--draft mtp|off [--draft-len N]]\n"
+               "[--port 8080] [--npu [--npu-down <pack>]] [--draft mtp|off [--draft-len N]] [--no-reuse]\n"
                "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
                "In a release bundle the HAL sets default to the bundle's hal/prefill and hal/decode.\n"
                "--npu: the NPU runs the prefill set's FFN block (a set from tools/emit_npu_ffn.py), its down pack from\n"
                "<prefill>/npu_down.bin unless --npu-down; without what it needs the GPU runs everything.\n"
                "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
                "blk.N.nextn.*) and verifying with the decode set's verify GEMVs; --draft-len N fixes the draft length\n"
-               "(default: adapts to the acceptance).\n");
+               "(default: adapts to the acceptance).\n"
+               "--no-reuse: every request prefills from scratch (no multi-turn cache).\n");
   return 2;
 }
 
@@ -209,7 +210,7 @@ class Server {
 int main(int argc, char** argv) {
   std::string model, prefill, decode, host = "127.0.0.1";
   int port = 8080;
-  bool fake = false, npu = false;
+  bool fake = false, npu = false, reuse = true;
   std::string npu_down, draft = "off";
   std::uint32_t draft_len = 0;
   for (int i = 1; i < argc; ++i) {
@@ -223,6 +224,8 @@ int main(int argc, char** argv) {
       prefill = argv[++i];
     } else if (arg == "--decode" && has_value) {
       decode = argv[++i];
+    } else if (arg == "--no-reuse") {
+      reuse = false;
     } else if (arg == "--npu") {
       npu = true;
     } else if (arg == "--npu-down" && has_value) {
@@ -262,6 +265,7 @@ int main(int argc, char** argv) {
       options.npu = npu;
       options.npu_down = npu_down;
       options.draft = draft;
+      options.reuse = reuse;
       options.draft_len = draft_len;
       auto engine = std::make_unique<yah::model::Engine>(options);
       if (npu) {

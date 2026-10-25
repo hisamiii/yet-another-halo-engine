@@ -134,7 +134,7 @@ A set emitted with `YAH_CTX=T` runs every kernel at the chunk size B but sizes t
 
 A prompt that ends inside a chunk runs a partial last chunk. The GEMMs launch only the token tiles that hold real tokens, and chunked sets carry each GEMM also with narrower token tiles (`LoomPrefill::PickGemm` takes the variant with the fewest padded token rows weighted by its cost per row); every other kernel runs the whole chunk over padding rows, which are zero-filled at allocation and so always finite. `yah_deltanet_prep_ab` and the DeltaNet read the real token count from a device scalar: padding tokens get decay 1 and update 0, so they leave the DeltaNet state unchanged, and the conv ring advances only past the real tokens. Attention is causal, so the real tokens never see the padding, and decode overwrites the padding's KV rows before reading them. The KV quantizers also read the real token count: `yah_kmean` averages K over the real rows only and `yah_vq8` / `yah_vq4` repeat the last real row into a partial 16-key tile. With quantized V, `yah_vseed` copies the real V rows of the last, partial 16-key tile into the decoder's open tile.
 
-Slots: `SaveState` / `LoadState` write and read the sequence state after some chunks (KV pools, page table, conv rings, DeltaNet states) raw, for a prefill of the same set (`YAH_SLOT_SAVE` / `YAH_SLOT_LOAD` / `YAH_SLOT_AT` in `loom_forward_pp`): profiling at depth without re-running the prefix.
+Slots: `SaveState` / `LoadState` write and read the sequence state after some chunks (KV pools, page table, conv rings, DeltaNet states) raw, for a prefill of the same set (`--slot-save` / `--slot-load` / `--slot-at` in `loom_forward_pp`): profiling at depth without re-running the prefix.
 
 ## Engine
 
@@ -142,7 +142,7 @@ Slots: `SaveState` / `LoadState` write and read the sequence state after some ch
 
 ## Decode
 
-`engine/model/loom_decoder.hpp` (`LoomDecoder`) is the single-token step. `loom_decode` feeds a prompt through it one token at a time; `loom_forward_pp` with `YAH_GEN` runs it after a prefill, on the prefill's KV pools and recurrent state. Decode reads 13.63 GB of weights per token (every MQ4 tensor, one embedding row), so it is a bandwidth problem: the floor is ~58.1 ms at 240 GB/s with the DeltaNet state traffic, and the step runs at 96% of it (results.md).
+`engine/model/loom_decoder.hpp` (`LoomDecoder`) is the single-token step. `loom_decode` feeds a prompt through it one token at a time; `loom_forward_pp --gen` runs it after a prefill, on the prefill's KV pools and recurrent state. Decode reads 13.63 GB of weights per token (every MQ4 tensor, one embedding row), so it is a bandwidth problem: the floor is ~58.1 ms at 240 GB/s with the DeltaNet state traffic, and the step runs at 96% of it (results.md).
 
 ### Step, per layer
 

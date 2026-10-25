@@ -56,6 +56,7 @@ class Engine : public TextGenerator {
     // 0 adapts it to the acceptance (up to the verify width - 1).
     std::string draft = "off";
     std::uint32_t draft_len = 0;
+    bool reuse = true;   // keep the last sequence's KV and state snapshots for a prompt that extends it
   };
   // How the tokens after the last whole chunk are run.
   enum class Tail { kAuto, kChunk, kDecode };
@@ -78,7 +79,7 @@ class Engine : public TextGenerator {
     gpu_.SetSleepSync(200);
     logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
     seed_ = gpu_.Allocate(8);
-    reuse_ = !prefill_.fpsparse() && !std::getenv("YAH_NO_REUSE");
+    reuse_ = o.reuse && !prefill_.fpsparse();
     if (reuse_)
       for (Snapshot& s : snaps_) {
         s.conv = gpu_.Allocate(prefill_.conv_state().length);

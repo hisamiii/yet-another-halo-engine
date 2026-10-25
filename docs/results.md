@@ -46,7 +46,7 @@ A prompt that ends inside a chunk (chunked 32K set, fp16 KV, `layers_ms`; the la
 
 Through `yah_server` (kv8 serve sets): an 18-token prompt prefills in 0.42 s (0.63 s before the narrow tiles), a 621-token one in 1.33 s (both were ~3.1 s with padded chunks).
 
-Decode, greedy, ms per generated token (mean over 63 steps after the prompt; `loom_forward_pp` with `YAH_GEN=64`, prefill sets as above):
+Decode, greedy, ms per generated token (mean over 63 steps after the prompt; `loom_forward_pp --gen 64`, prefill sets as above):
 
 | context | fp16 KV | kv8a16 | kv4a16 | HIP | measured |
 |---|---:|---:|---:|---:|---|

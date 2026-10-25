@@ -67,14 +67,6 @@ class LoomPrefill {
     WarmExecutables();
   }
 
-  ~LoomPrefill() { StopNpuTrace(); }
-  // Ends YAH_NPU_TRACE's thread (its file then holds what it saw): before the NpuSplit goes away.
-  void StopNpuTrace() {
-    trace_stop_ = true;
-    if (npu_trace_.joinable()) npu_trace_.join();
-    trace_stop_ = false;
-  }
-
   [[nodiscard]] std::uint32_t chunk() const { return B_; }
   [[nodiscard]] std::uint32_t context() const { return T_; }
   [[nodiscard]] bool paged() const { return kv_paged_; }
@@ -274,36 +266,6 @@ class LoomPrefill {
     LaunchChunk();
   }
 
-  // YAH_NPU_TRACE=<file> (a diagnostic): a host thread polls the chunk's jobs' words and writes, per job, the ms from the
-  // launch to its ready store (the GPU released it) and to its done word (the NPU finished it).
-  void TraceNpu(const std::vector<NpuSplit::Queued>& jobs, std::string file) {
-    StopNpuTrace();
-    npu_trace_ = std::thread([this, jobs, file] {
-      using clk = std::chrono::steady_clock;
-      const auto t0 = clk::now();
-      const auto ms = [&] { return std::chrono::duration<double, std::milli>(clk::now() - t0).count(); };
-      std::vector<double> ready(jobs.size(), -1), done(jobs.size(), -1);
-      for (std::size_t i = 0; i < jobs.size() && !trace_stop_;) {
-        for (std::size_t k = i; k < std::min(jobs.size(), i + 8); ++k) {
-          const NpuSplit::Job& w = jobs[k].words;
-          if (ready[k] < 0 && npu_->Word(w.ready) == w.gate) ready[k] = ms();
-          // (a join clears both words: a ready word read back zero means a done the loop missed)
-          if (done[k] < 0 && ((npu_->Word(w.done) & 0x7fffffffu) >= w.gate || (ready[k] >= 0 && npu_->Word(w.ready) == 0)))
-            done[k] = ms();
-        }
-        while (i < jobs.size() && done[i] >= 0) {
-          if (ready[i] < 0) ready[i] = done[i];
-          ++i;
-        }
-      }
-      if (FILE* f = std::fopen(file.c_str(), "w")) {
-        for (std::size_t k = 0; k < jobs.size(); ++k)
-          std::fprintf(f, "%zu %s %u %.3f %.3f\n", k, jobs[k].tag.c_str(), jobs[k].layer, ready[k], done[k]);
-        std::fclose(f);
-      }
-    });
-  }
-
   // The recorded chunk's graph to the GPU, its NPU jobs to the NPU.
   void LaunchChunk() {
     graph_ = nullptr;
@@ -319,7 +281,6 @@ class LoomPrefill {
     // GPU's share of the block alone (the NPU's partials are garbage)
     if (std::getenv("YAH_NPU_FAKE")) jobs.clear();
     chunk_graph_->Launch();
-    if (const char* tf = std::getenv("YAH_NPU_TRACE"); tf && !jobs.empty()) TraceNpu(jobs, tf);
     if (!jobs.empty()) {
       try {
         npu_->Enqueue(jobs);   // on a failure it releases the graph's waits for the jobs left
@@ -914,10 +875,8 @@ class LoomPrefill {
     const hrx_buffer_ref_t a = {npu_->A().handle, ab, bs.a};
     Dispatch(Exe("npu_enc_act.hal"), "yah_bfp16_encode_act", geom_.at("npu_enc_act.hal").tt, 1, 1, 256, 1, 1,
              {Ref(*npu_xo_), a}, 0b10);
-    // YAH_NPU_ONLY=sw / dn (YAH_NPU_CPU tests): only that image's jobs
-    const char* only = std::getenv("YAH_NPU_ONLY");
-    if (!only || std::strcmp(only, "dn")) NpuEnqueue(std::move(csw), "ffnsw", a, {npu_->C().handle, cb, doff});
-    for (std::size_t ci = 0; ci < parts.size() && (!only || std::strcmp(only, "sw")); ++ci)
+    NpuEnqueue(std::move(csw), "ffnsw", a, {npu_->C().handle, cb, doff});
+    for (std::size_t ci = 0; ci < parts.size(); ++ci)
       NpuEnqueue(std::move(cdn[ci]), DnImage(parts[ci].second), a,
                  {npu_->C().handle, cb + doff + ci * kDownCalls * cp, kDownCalls * cp});
     // the GPU's features: gate / up over the first G, their rotq (down's awq), down over that K window into hidden2
@@ -998,7 +957,7 @@ class LoomPrefill {
       if ((d & 0x7fffffffu) < w.gate || (d & 0x80000000u)) {
         std::fprintf(stderr, "npu cpu-driven: job %zu (%s, layer %u) stalled or failed: done %08x gate %08x\n", i,
                      jobs[i].tag.c_str(), jobs[i].layer, d, w.gate);
-        // YAH_NPU_CPU_STALL_CMD: run while the context lives (e.g. tools/npu_aie_status.py)
+        // YAH_NPU_CPU_STALL_CMD: run while the context lives (tools/npu_aie_status.py)
         if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) (void)!std::system(cmd);
         for (std::uint32_t k = w.ready; k <= w.done + 16; ++k)
           if (const std::uint32_t v = npu_->HostLoad(k); v != before[k - w.ready])
@@ -1699,8 +1658,6 @@ class LoomPrefill {
   ChunkState other_;
   std::uint32_t par_ = 0;
   static constexpr std::size_t kNoJoin = ~std::size_t{0};
-  std::thread npu_trace_;   // YAH_NPU_TRACE
-  std::atomic<bool> trace_stop_{false};
   std::size_t join_[2] = {kNoJoin, kNoJoin};
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only

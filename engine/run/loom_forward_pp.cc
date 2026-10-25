@@ -1,21 +1,23 @@
 // loom_forward_pp: the Loom prefill on HRX (model/loom_prefill.hpp) as a command-line tool.
 //
-// usage: loom_forward_pp <model> <haldir> <out-prefix> [tokens] [ids-file]
+// usage: loom_forward_pp <model> <haldir> <out-prefix> <tokens> <ids-file> [options]
 // outputs: <out-prefix>.logits (vocab f32, last token) and <out-prefix>.hidden (B x 5120 f32, token major, last chunk;
 //          rows past a partial chunk's tokens are padding)
 // tokens: any count up to the set's context; the last chunk may be partial (masked prefill, as the Engine runs it).
 // A short ids file is repeated to the token count.
 //
-// env:
-//   YAH_GEN=N, YAH_DECODE_HAL=<emit_decode.py set>  N greedy tokens after the prompt (the prefill's argmax first)
-//   YAH_LOGITS_FROM=P   f32 logits of positions P..tokens-1 into <out-prefix>.all_logits (engine/run/gate)
-//   YAH_ROWSTATS=<file> compact per-position logit statistics (engine/run/kvq/gate2.py); YAH_ROWSTATS_FROM (1024),
-//                       YAH_ROWSTATS_STRIDE (8) or a position list in YAH_ROWSTATS_POS
-//   YAH_SLOT_SAVE=<file> [YAH_SLOT_AT=C]  save the sequence state before chunk C (default: after the last)
-//   YAH_SLOT_LOAD=<file> restore a slot and run from the chunk it covers (marginal prefill at depth)
-//   YAH_CHUNK_MS=1       print each chunk's wall time (synchronizes after every chunk)
-//   YAH_PAIRS=1          full chunks two at a time, layer by layer (LoomPrefill::RunPair: the NPU block of one chunk
+// options:
+//   --gen N --decode <emit_decode.py set>  N greedy tokens after the prompt (the prefill's argmax first)
+//   --logits-from P     f32 logits of positions P..tokens-1 into <out-prefix>.all_logits (engine/run/gate)
+//   --rowstats <file>   compact per-position logit statistics (engine/run/kvq/gate2.py) at --rowstats-from (1024)
+//                       every --rowstats-stride (8), or at the positions listed in --rowstats-pos <file>
+//   --slot-save <file> [--slot-at C]  save the sequence state before chunk C (default: after the last)
+//   --slot-load <file>  restore a slot and run from the chunk it covers (marginal prefill at depth)
+//   --chunk-ms          print each chunk's wall time (synchronizes after every chunk)
+//   --pairs             full chunks two at a time, layer by layer (LoomPrefill::RunPair: the NPU block of one chunk
 //                       runs while the GPU runs the other's layer)
+//   --npu --npu-down <pack>  the NPU runs the set's FFN block (tools/emit_npu_ffn.py), its dense down weights from
+//                       the pack (tools/npu_down_pack.py)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -87,11 +89,43 @@ void WriteRowStats(FILE* f, const float* lg, std::uint32_t pos, std::int32_t nxt
     std::fwrite(&lg[idx[k]], 4, 1, f);
   }
 }
+struct Options {
+  std::uint32_t gen = 0, slot_at = ~0u, rowstats_from = 1024, rowstats_stride = 8;
+  std::int64_t logits_from = -1;
+  std::string decode, rowstats, rowstats_pos, slot_save, slot_load, npu_down;
+  bool chunk_ms = false, pairs = false, npu = false;
+};
+
+bool ParseOptions(int argc, char** argv, Options* o) {
+  for (int i = 6; i < argc; ++i) {
+    const std::string a = argv[i];
+    const bool v = i + 1 < argc;
+    const auto num = [&] { return static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10)); };
+    if (a == "--gen" && v) o->gen = num();
+    else if (a == "--decode" && v) o->decode = argv[++i];
+    else if (a == "--logits-from" && v) o->logits_from = num();
+    else if (a == "--rowstats" && v) o->rowstats = argv[++i];
+    else if (a == "--rowstats-from" && v) o->rowstats_from = num();
+    else if (a == "--rowstats-stride" && v) o->rowstats_stride = std::max(1u, num());
+    else if (a == "--rowstats-pos" && v) o->rowstats_pos = argv[++i];
+    else if (a == "--slot-save" && v) o->slot_save = argv[++i];
+    else if (a == "--slot-at" && v) o->slot_at = num();
+    else if (a == "--slot-load" && v) o->slot_load = argv[++i];
+    else if (a == "--chunk-ms") o->chunk_ms = true;
+    else if (a == "--pairs") o->pairs = true;
+    else if (a == "--npu") o->npu = true;
+    else if (a == "--npu-down" && v) o->npu_down = argv[++i];
+    else return std::fprintf(stderr, "loom_forward_pp: unknown option %s\n", a.c_str()), false;
+  }
+  return true;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 6) {
-    std::fprintf(stderr, "usage: loom_forward_pp <model> <haldir> <out-prefix> <tokens> <ids-file>\n");
+  Options opt;
+  if (argc < 6 || !ParseOptions(argc, argv, &opt)) {
+    std::fprintf(stderr, "usage: loom_forward_pp <model> <haldir> <out-prefix> <tokens> <ids-file> [options]"
+                         " (see the source's header)\n");
     return 2;
   }
   const std::string prefix = argv[3];
@@ -106,22 +140,20 @@ int main(int argc, char** argv) {
     gpu.SetSleepSync(200);
     LoomWeights weights(gpu, gguf);
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
-    if (std::getenv("YAH_PAIRS")) pf.EnablePairs();
+    if (opt.pairs) pf.EnablePairs();
 #ifdef YAH_WITH_NPU
-    // YAH_NPU=1: the NPU runs the set's FFN block (tools/emit_npu_ffn.py), its dense down weights from YAH_NPU_DOWN
-    // (tools/npu_down_pack.py).
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
-    if (const char* e = std::getenv("YAH_NPU"); e && std::string(e) == "1") {
+    if (opt.npu) {
       const auto plan = pf.npu_plan();
-      const char* down = std::getenv("YAH_NPU_DOWN");
-      if (plan.a_bytes == 0 || !down) {
-        std::fprintf(stderr, "YAH_NPU=1: needs a set with the NPU FFN block (emit_npu_ffn.py) and YAH_NPU_DOWN\n");
+      if (plan.a_bytes == 0 || opt.npu_down.empty()) {
+        std::fprintf(stderr, "--npu: needs a set with the NPU FFN block (emit_npu_ffn.py) and --npu-down\n");
         return 2;
       }
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
-      const char* nl = std::getenv("YAH_NPU_LAYERS");   // (a test: only the first that many layers)
-      pf.EnableNpu(npu.get(), down, nl ? static_cast<std::uint32_t>(std::strtoul(nl, nullptr, 10)) : ~0u);
+      pf.EnableNpu(npu.get(), opt.npu_down);
     }
+#else
+    if (opt.npu) throw LoomError("--npu: this build has no NPU support");
 #endif
     const std::uint32_t B = pf.chunk(), T_run = want ? want : B;
     if (T_run == 0 || T_run > pf.context()) {
@@ -133,25 +165,23 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loom_forward_pp: tokens=%u chunk=%u context=%u\n", T_run, B, pf.context());
 
     std::uint32_t logits_from = T_run;
-    if (const char* lf = std::getenv("YAH_LOGITS_FROM")) {
-      logits_from = static_cast<std::uint32_t>(std::atoi(lf));
-      if (logits_from >= T_run) throw LoomError("YAH_LOGITS_FROM must be below the token count");
+    if (opt.logits_from >= 0) {
+      logits_from = static_cast<std::uint32_t>(opt.logits_from);
+      if (logits_from >= T_run) throw LoomError("--logits-from must be below the token count");
     }
     LoomBuffer every = gpu.Allocate(std::size_t{T_run - logits_from + (logits_from == T_run)} * kVocab * 4);
     FILE* rowstats = nullptr;
     std::vector<char> rs_want(pf.context(), 0);
-    if (const char* rf = std::getenv("YAH_ROWSTATS")) {
-      rowstats = OpenOut(rf);
-      if (const char* pfile = std::getenv("YAH_ROWSTATS_POS")) {
-        std::ifstream pfs(pfile);
+    if (!opt.rowstats.empty()) {
+      rowstats = OpenOut(opt.rowstats);
+      if (!opt.rowstats_pos.empty()) {
+        std::ifstream pfs(opt.rowstats_pos);
+        if (!pfs) throw LoomError("cannot read " + opt.rowstats_pos);
         std::uint32_t pp;
         while (pfs >> pp)
           if (pp < pf.context()) rs_want[pp] = 1;
       } else {
-        const char* rs_from = std::getenv("YAH_ROWSTATS_FROM");
-        const char* rs_stride = std::getenv("YAH_ROWSTATS_STRIDE");
-        const std::uint32_t from = rs_from ? std::atoi(rs_from) : 1024, stride = rs_stride ? std::atoi(rs_stride) : 8;
-        for (std::uint32_t pp = from; pp < pf.context(); pp += stride) rs_want[pp] = 1;
+        for (std::uint32_t pp = opt.rowstats_from; pp < pf.context(); pp += opt.rowstats_stride) rs_want[pp] = 1;
       }
     }
     std::uint32_t rs_max = 1;  // rows per chunk
@@ -160,26 +190,27 @@ int main(int argc, char** argv) {
           rs_max, std::count(rs_want.begin() + std::size_t{c} * B, rs_want.begin() + std::size_t{c + 1} * B, 1));
     LoomBuffer rsbuf = gpu.Allocate(std::size_t{rs_max} * kVocab * 4);
 
-    // Slots (LoomPrefill::SaveState): YAH_SLOT_SAVE=<file> writes the state before chunk YAH_SLOT_AT (default: after the
-    // last chunk); YAH_SLOT_LOAD=<file> restores it and runs from the chunk it covers, so layers_ms is the marginal time.
+    // Slots (LoomPrefill::SaveState): --slot-save writes the state before chunk --slot-at (default: after the last
+    // chunk); --slot-load restores it and runs from the chunk it covers, so layers_ms is the marginal time.
     std::uint32_t ci0 = 0;
-    if (const char* sl = std::getenv("YAH_SLOT_LOAD")) {
-      ci0 = pf.LoadState(sl);
+    if (!opt.slot_load.empty()) {
+      ci0 = pf.LoadState(opt.slot_load);
       if (ci0 >= n_chunks) throw LoomError("the slot covers every chunk of this run");
-      std::fprintf(stderr, "loom_forward_pp: slot %s covers %u chunks; running from token %u\n", sl, ci0, ci0 * B);
+      std::fprintf(stderr, "loom_forward_pp: slot %s covers %u chunks; running from token %u\n", opt.slot_load.c_str(),
+                   ci0, ci0 * B);
     }
-    const char* slot_save = std::getenv("YAH_SLOT_SAVE");
-    const std::uint32_t slot_at = std::getenv("YAH_SLOT_AT") ? std::atoi(std::getenv("YAH_SLOT_AT")) : n_chunks;
+    const char* slot_save = opt.slot_save.empty() ? nullptr : opt.slot_save.c_str();
+    const std::uint32_t slot_at = std::min(opt.slot_at, n_chunks);
 
     gpu.Synchronize();
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
-    const bool chunk_ms = std::getenv("YAH_CHUNK_MS") != nullptr;
+    const bool chunk_ms = opt.chunk_ms;
     auto tc = t0;
     for (std::uint32_t ci = ci0; ci < n_chunks; ++ci) {
-      // YAH_PAIRS=1: two full chunks at a time (LoomPrefill::RunPair)
+      // --pairs: two full chunks at a time (LoomPrefill::RunPair)
       if (pf.pairs() && ci + 1 < n_chunks && (ci + 2 < n_chunks || last_n == B)) {
-        if (rowstats || slot_save) throw LoomError("YAH_PAIRS runs without YAH_ROWSTATS / YAH_SLOT_SAVE");
+        if (rowstats || slot_save) throw LoomError("--pairs runs without --rowstats / --slot-save");
         const auto keep = [&](std::uint32_t c) {
           return logits_from < std::min((c + 1) * B, T_run) ? LoomPrefill::kAllRows
                  : c + 1 == n_chunks                        ? std::int64_t{last_n} - 1
@@ -232,7 +263,6 @@ int main(int argc, char** argv) {
       }
     }
     gpu.Synchronize();
-    pf.StopNpuTrace();
     if (slot_save && slot_at >= n_chunks) pf.SaveState(slot_save, n_chunks);
     if (rowstats) std::fclose(rowstats);
     const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -262,17 +292,16 @@ int main(int argc, char** argv) {
     std::fclose(fl);
     std::printf("argmax=%u\n", tok);
 
-    if (const char* gv = std::getenv("YAH_GEN"); gv && std::atoi(gv) > 0) {
-      const std::uint32_t ngen = static_cast<std::uint32_t>(std::atoi(gv));
-      const char* ddir = std::getenv("YAH_DECODE_HAL");
-      if (!ddir) throw LoomError("YAH_GEN needs YAH_DECODE_HAL (tools/emit_decode.py set)");
-      if (T_run + ngen - 1 > pf.context()) throw LoomError("YAH_GEN: prompt + gen exceeds the emitted context");
-      LoomDecoder dec(gpu, gguf, cfg, ddir, weights);
+    if (opt.gen > 0) {
+      const std::uint32_t ngen = opt.gen;
+      if (opt.decode.empty()) throw LoomError("--gen needs --decode (a tools/emit_decode.py set)");
+      if (T_run + ngen - 1 > pf.context()) throw LoomError("--gen: prompt + gen exceeds the emitted context");
+      LoomDecoder dec(gpu, gguf, cfg, opt.decode, weights);
       if (dec.context() != pf.pool_rows())
-        throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) + " != prefill pool rows " +
+        throw LoomError("--gen: decode set context " + std::to_string(dec.context()) + " != prefill pool rows " +
                         std::to_string(pf.pool_rows()));
       if (dec.kv_bits() != pf.kv_bits())
-        throw LoomError("YAH_GEN: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
+        throw LoomError("--gen: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
       dec.Bind(pf.DecoderState());
       dec.SetTokens(&tok, 1, T_run);
       gpu.Synchronize();

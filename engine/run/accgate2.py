@@ -2,7 +2,7 @@
 """Multi-window, all-position correctness gate: candidate logits vs golden logits.
 
 Inputs are directories of per-window f32 logits of the scored positions, `wNN.all_logits` (rows = positions FROM..2047, vocab-major rows).
-loom_forward_pp writes them with YAH_LOGITS_FROM=FROM (gate/gate_run.sh).
+loom_forward_pp writes them with --logits-from FROM (gate/gate_run.sh).
 The token ids of each window (corpus/ids2048_wNN.txt) give the next-token targets for NLL.
 
   accgate2.py stats     <golden_dir> <cand_dir> [--windows 00,01,...]

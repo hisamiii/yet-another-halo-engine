@@ -616,8 +616,8 @@ class LoomNpu {
   };
   static constexpr std::size_t kArenaBytes = 8u << 20, kCommandAlign = 32768;
   // command arenas: the NPU's command memory holds 64 MB per process, 7 arenas and a little (5 starved 2048-token
-  // chunk pairs: the host waited 4 s for arenas at pp8192); YAH_NPU_ARENAS overrides
-  const std::size_t kArenas = std::getenv("YAH_NPU_ARENAS") ? std::strtoul(std::getenv("YAH_NPU_ARENAS"), nullptr, 10) : 7;
+  // chunk pairs: the host waited 4 s for arenas at pp8192)
+  static constexpr std::size_t kArenas = 7;
   static const std::uint8_t* CommandBytes(const Kernel& k, const amdf_xdna_kernel_command_t& c) {
     for (const auto& st : k.storage)
       if (st.memory == c.memory) return static_cast<const std::uint8_t*>(st.mapping.data) + (c.byte_offset - st.memory_byte_offset);
@@ -1333,10 +1333,6 @@ class LoomNpuSplit : public NpuSplit {
         const std::size_t per = plan_.dcol ? kDcolJobsPerCommand : kJobsPerCommand;
         for (std::size_t i = queued + command.size(); i < jobs.size() && command.size() < per; ++i) {
           if (!command.empty() && calls + jobs[i].calls.size() > kCallsPerCommand) break;
-          // YAH_NPU_SPLITFAM (test): a command per family run, its setup in full with YAH_NPU_FULLSETUP
-          if (!command.empty() && std::getenv("YAH_NPU_SPLITFAM") &&
-              LoomNpu::FamilyOf(calls_.at(jobs[i].calls[0]).k) != LoomNpu::FamilyOf(command[0].calls[0]->k))
-            break;
           // the NPU waits for the GPU between jobs: a command over many layers can outlast the 2000 ms limit
           if (!command.empty() && jobs[i].layer >= jobs[queued].layer + kLayersPerCommand) break;
           LoomNpu::GatedJob g;
@@ -1348,7 +1344,6 @@ class LoomNpuSplit : public NpuSplit {
           command.push_back(std::move(g));
         }
         const std::size_t n = command.size();
-        if (std::getenv("YAH_NPU_FULLSETUP")) npu_.ForgetProgram();
         npu_.EnqueueGated(std::move(command), fresh_);
         fresh_ = false;
         queued += n;

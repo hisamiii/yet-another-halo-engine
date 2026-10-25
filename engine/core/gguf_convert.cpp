@@ -8,6 +8,7 @@
 // ffn_gate's .awq (the NPU FFN block reads gate through up rows in one view).
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -225,19 +226,22 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights, bool lock) {
   std::vector<std::thread> pool;
   const unsigned threads = std::max(1U, std::thread::hardware_concurrency());
   for (unsigned i = 0; i < threads; ++i) pool.emplace_back(run);
+  // progress: one line rewritten on a terminal, a line per quarter in a log
+  const bool tty = ::isatty(2) != 0;
   for (int pct = -1; convert;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const int now = static_cast<int>(done * 100 / std::max<std::uint64_t>(1, work));
-    if (now != pct) std::fprintf(stderr, "\rgguf: %d%%", pct = now);
+    if (tty && now != pct) std::fprintf(stderr, "\rgguf: converting, %d%%", pct = now);
+    if (!tty && now / 25 != pct / 25 && now < 100) std::fprintf(stderr, "gguf: converting, %d%%\n", pct = now);
     if (done == work || failed) break;
   }
   for (auto& th : pool) th.join();
   if (failed) {
-    if (convert) std::fprintf(stderr, "\n");
+    if (convert && tty) std::fprintf(stderr, "\n");
     throw std::runtime_error(failure);
   }
   if (convert)
-    std::fprintf(stderr, "\rgguf: converted in %.1f s\n",
+    std::fprintf(stderr, "%sgguf: converted in %.1f s\n", tty ? "\r" : "",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   if (lock && ::mlock(g.base_, bytes) != 0)
     std::fprintf(stderr,

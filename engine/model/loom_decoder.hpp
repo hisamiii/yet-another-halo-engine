@@ -15,7 +15,7 @@
 // The next step's embedding kernel (IQ4_XS token_embd) reads that stream: steps queue back to back, no host round trip.
 //
 // The recurrent state and the KV pools are external (LoomDecoderState) and use the prefill's layouts.
-// Use OwnState() for a prompt fed through decode, or bind the prefill's state (loom_forward_pp with YAH_GEN).
+// Use OwnState() for a prompt fed through decode, or bind the prefill's state (loom_forward_pp --gen).
 // Quantized KV: each layer's open 16-key V tile stays f16 until its 16th key arrives.
 // So a bound state must start on a 16-key tile boundary (prefill runs are whole chunks).
 #ifndef YAH_MODEL_LOOM_DECODER_HPP_
@@ -137,7 +137,6 @@ class LoomDecoder {
     std::vector<std::int32_t> pv(T_);
     for (std::uint32_t i = 0; i < T_; ++i) pv[i] = static_cast<std::int32_t>(i);
     gpu_.H2D(*posarr_, pv.data(), pv.size() * 4);
-    trace_ = std::getenv("YAH_DEC_TRACE") != nullptr;
     Load("sample");    // now, not in the first sampled request (a set emitted before sampling stops here)
     Load("penalty");
   }
@@ -240,7 +239,6 @@ class LoomDecoder {
     if (quant() && pos % 16 && pos != next_pos_)
       throw LoomError("decoder: quantized KV steps must be contiguous from a 16-key tile boundary");
     next_pos_ = pos + 1;
-    cur_pos_ = pos;
     // "latestate": no chained consumer orders the DeltaNet's state stores (gen_decode_misc LATE_STATE), so the step
     // starts after every dispatch so far completed, the previous step's state stores with them.
     if (late_) gpu_.Order();
@@ -251,7 +249,6 @@ class LoomDecoder {
     for (std::uint32_t l = 0; l < nl; ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       NormRotate(*hidden_, pre + "attn_norm.weight", pre + (cfg_.IsFullAttention(l) ? "attn_q" : "attn_qkv"));
-      Tr("in", l, *hidden_, kHidden);
       if (cfg_.IsFullAttention(l)) {
         const std::uint32_t ai = l / cfg_.full_attention_interval;
         Project({pre + "attn_q.weight", pre + "attn_k.weight", pre + "attn_v.weight"}, {qg_, kb_, vb_});
@@ -275,7 +272,6 @@ class LoomDecoder {
                    {Ref(*q_), st_.kpool[ai], st_.vtpool[ai], st_.ptab, dposr, Ref(*acc_), Ref(*ml_)});
         }
         Dispatch(Load("dattn_reduce"), kHeads, 1, 256, {Ref(*acc_), Ref(*ml_), Ref(*gate_), dposr, Ref(*aout_)});
-        Tr("attn", l, *aout_, kAttn);
         Rotate(*aout_, pre + "attn_output");
         Gemv("resid", {pre + "attn_output.weight"}, *aout_, *hidden_);
       } else {
@@ -298,14 +294,12 @@ class LoomDecoder {
                   TRef(pre + "ssm_norm.weight"),
                   Ref(*gate_),
                   Ref(*ssmout_)});
-        Tr("ssm", l, *ssmout_, kInner);
         Rotate(*ssmout_, pre + "ssm_out");
         Gemv("resid", {pre + "ssm_out.weight"}, *rotx_, *hidden_);
       }
       NormRotate(*hidden_, pre + "post_attention_norm.weight", pre + "ffn_gate");
       Gemv("swiglu", {pre + "ffn_gate.weight", pre + "ffn_up.weight"}, *normed_, *ffnact_,
            swrot_ ? pre + "ffn_down" : std::string());
-      Tr("ffnact", l, *ffnact_, kFfn);
       if (!swrot_) Rotate(*ffnact_, pre + "ffn_down");
       Gemv("resid", {pre + "ffn_down.weight"}, *ffnact_, *hidden_);
     }
@@ -320,7 +314,6 @@ class LoomDecoder {
     const bool penalize = penalized_ && pos + 1 >= keep_from;
     const hrx_buffer_ref_t tok = pos + 1 >= keep_from ? TokenRef(pos + 1) : Ref(*sink_);
     Gemv("plain", {"output.weight"}, *normed_, *logits_, {}, amax_ && !sample && !penalize ? &tok : nullptr);
-    Tr("logits", 99, *logits_, kVocab);
     cs_cur_ = 1 - cs_cur_;
     if (penalize) Penalize(Ref(*logits_), pos);
     if (sample)
@@ -360,7 +353,6 @@ class LoomDecoder {
     if (!hid_n_) AllocVerify();
     vpos_ = pos, vn_ = n;
     next_pos_ = pos + n;
-    cur_pos_ = pos;
     if (late_) gpu_.Order();
     // a token past a 16-key boundary refills the open V tiles: keep them for a rollback (Accept)
     vcross_ = quant() && pos / 16 != (pos + n - 1) / 16;
@@ -765,22 +757,6 @@ class LoomDecoder {
       dring_.push_back(&Alloc(std::size_t{recurrent_layers()} * kStateElems * 4));
     if (quant()) vopen_save_ = &Alloc(std::size_t{full_layers()} * vopen_[0].length);
   }
-  // YAH_DEC_TRACE=1: at step 0, sync after every stage and print max |x| and the NaN count.
-  void Tr(const char* what, std::uint32_t l, const LoomBuffer& b, std::size_t n) {
-    if (!trace_ || cur_pos_ != 0) return;
-    gpu_.Synchronize();
-    std::vector<float> h(n);
-    gpu_.D2H(b, h.data(), n * 4);
-    double mx = 0;
-    std::size_t nan = 0;
-    for (float v : h) {
-      if (v != v)
-        ++nan;
-      else
-        mx = std::max(mx, static_cast<double>(std::fabs(v)));
-    }
-    std::fprintf(stderr, "trace l%-2u %-10s max %.4g nan %zu\n", l, what, mx, nan);
-  }
 
   LoomDevice& gpu_;
   const core::Gguf& gguf_;
@@ -788,9 +764,8 @@ class LoomDecoder {
   std::string dir_;
   const LoomWeights& weights_;
   static constexpr std::uint32_t kAnyTile = 0xffffffffu;
-  std::uint32_t T_ = 0, cur_pos_ = 0, kbits_ = 16, vbits_ = 16, next_pos_ = kAnyTile;
+  std::uint32_t T_ = 0, kbits_ = 16, vbits_ = 16, next_pos_ = kAnyTile;
   std::vector<hrx_buffer_ref_t> vopen_;  // quantized V: each layer's open tile, [1024][16] f16
-  bool trace_ = false;
   bool rot_ = false;       // decode.txt "rot"
   bool chain_ = false;     // decode.txt "chain"
   bool normrot_ = false;   // decode.txt "normrot"

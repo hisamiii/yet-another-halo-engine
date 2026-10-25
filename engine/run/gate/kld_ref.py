@@ -2,7 +2,7 @@
 """kld_ref.py <model> <hal set> <ref.bin> <workdir> [chunks]: KL divergence of the engine vs a BF16 reference.
 
 ref.bin is hipfire's HFKLDR v1 (eval_hipfire --ref): per 2048-token chunk the BF16 model's top-256 log-probs and the
-residual mass of positions 1024..2046. Each chunk runs as one fresh loom_forward_pp pp2048 (YAH_LOGITS_FROM=1024),
+residual mass of positions 1024..2046. Each chunk runs as one fresh loom_forward_pp pp2048 (--logits-from 1024),
 scored as eval_hipfire scores (prefill mode): KL over the reference's top 256 plus the residual-mass term.
 Writes <workdir>/tokens.bin (per position: f64 KL, u8 top-1 match) and prints mean / p99 / p99.9 / max / top-1 / PPL.
 Correctness runs only: no timing.
@@ -55,15 +55,15 @@ def main():
     n_ctx, vocab, tokens, blocks = read_ref(refp)
     chunks = int(sys.argv[5]) if len(sys.argv) > 5 else len(tokens)
     os.makedirs(work, exist_ok=True)
-    env = dict(os.environ, YAH_LOGITS_FROM=str(n_ctx // 2))
     kls, matches, nlls = [], [], []
     for c in range(chunks):
         ids = os.path.join(work, "ids.txt")
         open(ids, "w").write(" ".join(map(str, tokens[c])) + "\n")
         prefix = os.path.join(work, "c%02d" % c)
         cmd = ["bash", "-c", 'a=("$@"); set --; source engine/hrx-env.sh >/dev/null; exec "${a[@]}"', "-", "engine/run/gpu_run.sh", "kld",
-               "--", "engine/build/loom_forward_pp", model, hal, prefix, str(n_ctx), ids]
-        r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
+               "--", "engine/build/loom_forward_pp", model, hal, prefix, str(n_ctx), ids,
+               "--logits-from", str(n_ctx // 2)]
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode or "all_logits" not in r.stdout:
             raise SystemExit("chunk %d failed:\n%s%s" % (c, r.stdout[-1500:], r.stderr[-1500:]))
         n = blocks.shape[1]

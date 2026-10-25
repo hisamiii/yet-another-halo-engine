@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the row stats (loom_forward_pp YAH_ROWSTATS) of a candidate KV codec with the fp16-KV reference.
+"""Compare the row stats (loom_forward_pp --rowstats) of a candidate KV codec with the fp16-KV reference.
 
 Results are per context-position bin, with block-bootstrap confidence intervals across documents.
 
