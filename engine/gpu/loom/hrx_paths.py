@@ -11,7 +11,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 HRX = os.environ.get("YAH_LOOM_HOME") or os.environ.get("YAH_HRX") or os.path.join(ROOT, "external", "hrx")
 BUILD = os.environ.get("YAH_HRX_BUILD") or os.path.join(HRX, "build", "cmake")
 ROCM = os.environ.get("YAH_ROCM") or os.path.join(ROOT, "external", "rocm10")
-LIBHSA = os.path.join(ROCM, "x_runtime/opt/rocm/core-10.0/lib")
+PREFIX = os.path.join(ROCM, "root/opt/rocm/core-10.0")   # every package extracted into one prefix (engine/hrx-env.sh)
+LIBHSA = os.path.join(PREFIX, "lib")
 
 IREE_RUN_LOOM = os.path.join(BUILD, "loom/src/loom/tools/iree-run-loom/iree-run-loom")
 LOOM_COMPILE = os.path.join(BUILD, "loom/src/loom/tools/loom-compile/loom-compile")
@@ -22,8 +23,7 @@ def env():
     e = dict(os.environ)
     e["IREE_HAL_AMDGPU_LIBHSA_PATH"] = LIBHSA
     libs = [os.path.join(BUILD, "libhrx/src/binding/hip"), os.path.join(BUILD, "libhrx/src/libhrx"), LIBHSA,
-            os.path.join(ROCM, "x_llvm/opt/rocm/core-10.0/lib/llvm/lib"),
-            os.path.join(ROCM, "x_sysdeps/opt/rocm/core-10.0/lib/rocm_sysdeps/lib"), "/opt/rocm/lib"]
+            os.path.join(PREFIX, "lib/llvm/lib"), os.path.join(PREFIX, "lib/rocm_sysdeps/lib")]
     if e.get("LD_LIBRARY_PATH"):
         libs.append(e["LD_LIBRARY_PATH"])
     e["LD_LIBRARY_PATH"] = ":".join(libs)

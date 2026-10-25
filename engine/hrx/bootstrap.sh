@@ -105,7 +105,12 @@ done
 
 # ROCm's clang builds the AMDGPU device code; the same toolchain builds the host side. Dependencies, including the HSA
 # headers, are HRX's pinned copies: a system ROCm's headers can be older than the runtime HRX was written against.
-rocm="${ROCM_PATH:-/opt/rocm}"
+# The toolchain is ROCm 10's llvm package from engine/hrx-env.sh --fetch (the /opt/rocm layout); no system ROCm needed.
+rocm="${ROCM_PATH:-${YAH_ROCM:-$root/external/rocm10}/root/opt/rocm/core-10.0}"
+if [ ! -x "$rocm/llvm/bin/clang" ] || [ ! -d "$rocm/amdgcn/bitcode" ]; then
+  echo "hrx: no ROCm toolchain at $rocm (llvm/bin/clang, amdgcn/bitcode): run engine/hrx-env.sh --fetch" >&2
+  exit 1
+fi
 cc="${CC:-$rocm/llvm/bin/clang}"
 cxx="${CXX:-$rocm/llvm/bin/clang++}"
 build="$hrx/build/cmake"
