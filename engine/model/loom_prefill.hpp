@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -66,6 +67,14 @@ class LoomPrefill {
     WarmExecutables();
   }
 
+  ~LoomPrefill() { StopNpuTrace(); }
+  // Ends YAH_NPU_TRACE's thread (its file then holds what it saw): before the NpuSplit goes away.
+  void StopNpuTrace() {
+    trace_stop_ = true;
+    if (npu_trace_.joinable()) npu_trace_.join();
+    trace_stop_ = false;
+  }
+
   [[nodiscard]] std::uint32_t chunk() const { return B_; }
   [[nodiscard]] std::uint32_t context() const { return T_; }
   [[nodiscard]] bool paged() const { return kv_paged_; }
@@ -74,6 +83,29 @@ class LoomPrefill {
     return {attn_kq4_ ? 4u : attn_kq8_ ? 8u : 16u, attn_vq4_ ? 4u : attn_vq8_ ? 8u : 16u};
   }
   LoomBuffer& hidden() { return *hidden_; }
+
+  // Chunk pairs (RunPair): two full chunks recorded layer by layer, so the NPU's FFN block of one runs while the GPU
+  // runs the other's layer. Each chunk of a pair has its own residual rows, ids and NPU A / C half; SelectChunk(p)
+  // picks the one Embed, Head and hidden() see. Before npu_plan() / EnableNpu.
+  void EnablePairs() {
+    if (pairs_) return;
+    pairs_ = true;
+    other_ = {&Alloc(std::size_t{B_} * kHidden * 4), &Alloc(std::size_t{B_} * kHidden * 4), &Alloc(std::size_t{B_} * 4),
+              &Alloc(4)};
+    // a chained DeltaNet tail leaves its outputs to the next layer of its chunk untracked: the other chunk's layer
+    // runs between them here
+    dnring_ = false;
+  }
+  [[nodiscard]] bool pairs() const { return pairs_; }
+  void SelectChunk(std::uint32_t p) {
+    if (p > 1 || (p && !pairs_)) throw LoomError("prefill: no such chunk of a pair");
+    if (p == par_) return;
+    FlushKres();
+    std::swap(hidden_, other_.hidden), std::swap(hidden2_, other_.hidden2), std::swap(ids_, other_.ids);
+    std::swap(valid_, other_.valid), std::swap(n_, other_.n), std::swap(keep_rows_, other_.keep);
+    std::swap(answer_, other_.answer);
+    par_ = p;
+  }
 
   // Zero the recurrent state before a new sequence. KV rows need no reset: attention reads only keys <= the query.
   void Reset() {
@@ -100,7 +132,8 @@ class LoomPrefill {
     const NpuBytes sw = NpuBytesOf("npubytes_ffnsw");
     p.a_bytes = sw.a, p.w_bytes = sw.w;   // (W: the images' panel binding, not read)
     for (const auto& [p0, passes] : FfnParts()) p.w_bytes = std::max(p.w_bytes, NpuBytesOf(DnImage(passes, "npubytes_")).w);
-    p.c_bytes = FfnDownOff() + FfnParts().size() * kDownCalls * DownC();
+    p.c_bytes = NpuCBytes();
+    if (pairs_) p.a_bytes *= 2, p.c_bytes *= 2;   // a half per chunk of a pair
     p.dcol = p.gfirst = true;
     const Geom& g = geom_.at("npugate");
     p.gate_calls = g.rowgrp, p.gate_record = g.tt;
@@ -141,8 +174,11 @@ class LoomPrefill {
     // image's storage and patches it, milliseconds per call.
     LoomBuffer *h = hidden_, *h2 = hidden2_, *aq = aq_, *aq2 = aq2_, *ad = ad_, *ad2 = ad2_;
     n_ = B_, warming_ = true, npu_on_ = true, npu_planning_ = true;
-    RecordLayers(0, {});
-    FlushKres();
+    for (par_ = 0; par_ < (pairs_ ? 2u : 1u); ++par_) {   // (pairs: each chunk's half of A and C)
+      RecordLayers(0, {});
+      FlushKres();
+    }
+    par_ = 0;
     npu_->EndBinding();
     n_ = 0, warming_ = false, npu_on_ = false, npu_planning_ = false;
     hidden_ = h, hidden2_ = h2, aq_ = aq, aq2_ = aq2, ad_ = ad, ad2_ = ad2;
@@ -197,6 +233,78 @@ class LoomPrefill {
     RecordLayers(ci, hook);
     FlushKres();
     split_layer_ = 0, split_armed_ = false;
+    LaunchChunk();
+  }
+
+  // Chunks ci and ci + 1, both full and staged (SelectChunk, Embed), recorded layer by layer: chunk 0's layer l, then
+  // chunk 1's. A chunk's NPU join and unpack of layer l go before its layer l + 1, after the other chunk's layer l, so
+  // the NPU's block of one chunk runs while the GPU runs the other's. keep / answer: per chunk, as RunLayers'.
+  void RunPair(std::uint32_t ci, std::int64_t keep0, std::int64_t keep1, bool answer1) {
+    if (!pairs_) throw LoomError("prefill: RunPair without EnablePairs");
+    if (std::size_t{ci + 2} * B_ > T_) throw LoomError("prefill: chunk past the emitted context");
+    SelectChunk(1);
+    keep_rows_ = keep1, answer_ = answer1;
+    const bool full1 = n_ == B_;
+    SelectChunk(0);
+    keep_rows_ = keep0, answer_ = false;
+    if (n_ != B_ || !full1) throw LoomError("prefill: RunPair needs two full chunks");
+    if (flags_) gpu_.Fill(*flags_, 0);
+    npu_on_ = npu_ != nullptr;
+    if (npu_on_) npu_->BeginChunk();
+    flagged_.clear(), job_c_.clear();
+    npu_cleared_ = npu_joined_ = 0;
+    join_[0] = join_[1] = kNoJoin;
+    NewGraph();
+    split_layer_ = 0;
+    flag_slot_ = 0;
+    for (std::uint32_t p = 0; p < 2; ++p) {
+      SelectChunk(p);
+      Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
+               {TRef(*Find("token_embd.weight")), Ref(*ids_), Ref(*hidden_)}, 4);
+    }
+    for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l)
+      for (std::uint32_t p = 0; p < 2; ++p) {
+        SelectChunk(p);
+        JoinFfn();
+        RecordLayer(l, ci + p, {});
+      }
+    for (std::uint32_t p = 0; p < 2; ++p) SelectChunk(p), JoinFfn();
+    FlushKres();
+    LaunchChunk();
+  }
+
+  // YAH_NPU_TRACE=<file> (a diagnostic): a host thread polls the chunk's jobs' words and writes, per job, the ms from the
+  // launch to its ready store (the GPU released it) and to its done word (the NPU finished it).
+  void TraceNpu(const std::vector<NpuSplit::Queued>& jobs, std::string file) {
+    StopNpuTrace();
+    npu_trace_ = std::thread([this, jobs, file] {
+      using clk = std::chrono::steady_clock;
+      const auto t0 = clk::now();
+      const auto ms = [&] { return std::chrono::duration<double, std::milli>(clk::now() - t0).count(); };
+      std::vector<double> ready(jobs.size(), -1), done(jobs.size(), -1);
+      for (std::size_t i = 0; i < jobs.size() && !trace_stop_;) {
+        for (std::size_t k = i; k < std::min(jobs.size(), i + 8); ++k) {
+          const NpuSplit::Job& w = jobs[k].words;
+          if (ready[k] < 0 && npu_->Word(w.ready) == w.gate) ready[k] = ms();
+          // (a join clears both words: a ready word read back zero means a done the loop missed)
+          if (done[k] < 0 && ((npu_->Word(w.done) & 0x7fffffffu) >= w.gate || (ready[k] >= 0 && npu_->Word(w.ready) == 0)))
+            done[k] = ms();
+        }
+        while (i < jobs.size() && done[i] >= 0) {
+          if (ready[i] < 0) ready[i] = done[i];
+          ++i;
+        }
+      }
+      if (FILE* f = std::fopen(file.c_str(), "w")) {
+        for (std::size_t k = 0; k < jobs.size(); ++k)
+          std::fprintf(f, "%zu %s %u %.3f %.3f\n", k, jobs[k].tag.c_str(), jobs[k].layer, ready[k], done[k]);
+        std::fclose(f);
+      }
+    });
+  }
+
+  // The recorded chunk's graph to the GPU, its NPU jobs to the NPU.
+  void LaunchChunk() {
     graph_ = nullptr;
     std::vector<NpuSplit::Queued> jobs;
     jobs.swap(flagged_);
@@ -206,7 +314,11 @@ class LoomPrefill {
       NpuCpuDriven(jobs);
       return;
     }
+    // YAH_NPU_FAKE=1 (a timing test): the NPU runs nothing and the graph does not wait for it, so the run takes the
+    // GPU's share of the block alone (the NPU's partials are garbage)
+    if (std::getenv("YAH_NPU_FAKE")) jobs.clear();
     chunk_graph_->Launch();
+    if (const char* tf = std::getenv("YAH_NPU_TRACE"); tf && !jobs.empty()) TraceNpu(jobs, tf);
     if (!jobs.empty()) {
       try {
         npu_->Enqueue(jobs);   // on a failure it releases the graph's waits for the jobs left
@@ -222,23 +334,22 @@ class LoomPrefill {
     flag_slot_ = 0;
     Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
              {TRef(*Find("token_embd.weight")), Ref(*ids_), Ref(*hidden_)}, 4);
-    for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
-      const std::string pre = "blk." + std::to_string(l) + ".";
-      split_armed_ = split_layer_ && l == split_layer_;
-      npu_layer_ = l;
-      tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
-      if (cfg_.IsFullAttention(l)) {
-        nq_want_ = nqw_;
-        RunNorm(pre + "attn_norm.weight");
-        nq_want_ = false;
-        RunAttention(l, ci, pre, hook);
-      } else {
-        nq_want_ = nqw_;
-        RunNorm(pre + "attn_norm.weight");
-        nq_want_ = false;
-        RunDeltaNet(l, pre);
-      }
-      if (tail_ == kNoRows) continue;
+    for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) RecordLayer(l, ci, hook);
+    JoinFfn();
+  }
+  void RecordLayer(std::uint32_t l, std::uint32_t ci, const KvHook& hook) {
+    const std::string pre = "blk." + std::to_string(l) + ".";
+    split_armed_ = split_layer_ && l == split_layer_;
+    npu_layer_ = l;
+    tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
+    nq_want_ = nqw_;
+    RunNorm(pre + "attn_norm.weight");
+    nq_want_ = false;
+    if (cfg_.IsFullAttention(l))
+      RunAttention(l, ci, pre, hook);
+    else
+      RunDeltaNet(l, pre);
+    if (tail_ != kNoRows) {
       trim_row_ = tail_;
       RunFfn(pre);
       trim_row_ = kAllRows;
@@ -768,14 +879,15 @@ class LoomPrefill {
       throw LoomError("prefill: " + pre + "ffn_up does not follow ffn_gate as the NPU block's image expects");
     const hrx_buffer_ref_t gate = TRef(*tg);
     const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
+    const std::size_t ab = par_ * bs.a, cb = par_ * NpuCBytes();   // this chunk's half of A / C (pairs)
     if (npu_planning_) npu_->ShareGpu(gate.buffer, weights_.ChunkOf(*tg).size);
     // gate / up: F / 256 calls, call j's raw rows its 256 gate rows through its up rows (and a page the decoder may
     // prefetch); its H records at k-block 32 j (gen_npu_gemm swcol 32)
     std::vector<std::uint32_t> csw;
     for (std::uint32_t j = 0; j < F / 256; ++j)
-      csw.push_back(npu_->BindRaw(dir_ + "/npu_ffnsw.xdna", {0, bs.a},
+      csw.push_back(npu_->BindRaw(dir_ + "/npu_ffnsw.xdna", {ab, bs.a},
                                   {gate.buffer, gate.offset + (G + 256 * j) * rb, dgu + 256 * rb + 4096},
-                                  {(j / 4) * kHRec + (j % 4) * 32 * 144, bs.c}, "ffnsw"));
+                                  {cb + (j / 4) * kHRec + (j % 4) * 32 * 144, bs.c}, "ffnsw"));
     // down: per K part, kDownCalls calls of 512 rows of the down pack ([layer][row][F / 256 blocks]); a call's raw
     // view from its first row's part through a decoder record past its last row's
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
@@ -786,10 +898,10 @@ class LoomPrefill {
       if (bd.c != cp) throw LoomError("prefill: the FFN block's down parts differ in C bytes");
       for (std::uint32_t r = 0; r < kDownCalls; ++r)
         cdn[ci].push_back(npu_->BindRaw(
-            dir_ + "/npu_" + DnImage(passes) + ".xdna", {p0 * kHRec, bd.a, true},
+            dir_ + "/npu_" + DnImage(passes) + ".xdna", {cb + p0 * kHRec, bd.a, true},
             {npu_down_->handle, std::size_t{layer} * down_layer_ + std::size_t{r} * kDownRows * rbd + std::size_t{4} * p0 * 136,
              (kDownRows - 1) * rbd + std::size_t{4} * passes * 136 + kRecordRow},
-            {doff + (ci * kDownCalls + r) * cp, cp}, DnImage(passes)));
+            {cb + doff + (ci * kDownCalls + r) * cp, cp}, DnImage(passes)));
     }
     // the FFN norm's normq also writes the rotated rows in the decoder's positions, encoded into A for gate / up
     FlushKres();
@@ -798,15 +910,15 @@ class LoomPrefill {
              {Ref(*hidden_), TRef(*Find(nw)), TRef(*Find(NormAwq(nw))), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_),
               Ref(*npu_xo_)},
              0b1110000);
-    const hrx_buffer_ref_t a = {npu_->A().handle, 0, bs.a};
+    const hrx_buffer_ref_t a = {npu_->A().handle, ab, bs.a};
     Dispatch(Exe("npu_enc_act.hal"), "yah_bfp16_encode_act", geom_.at("npu_enc_act.hal").tt, 1, 1, 256, 1, 1,
              {Ref(*npu_xo_), a}, 0b10);
     // YAH_NPU_ONLY=sw / dn (YAH_NPU_CPU tests): only that image's jobs
     const char* only = std::getenv("YAH_NPU_ONLY");
-    if (!only || std::strcmp(only, "dn")) NpuEnqueue(std::move(csw), "ffnsw", a, {npu_->C().handle, 0, doff});
+    if (!only || std::strcmp(only, "dn")) NpuEnqueue(std::move(csw), "ffnsw", a, {npu_->C().handle, cb, doff});
     for (std::size_t ci = 0; ci < parts.size() && (!only || std::strcmp(only, "sw")); ++ci)
       NpuEnqueue(std::move(cdn[ci]), DnImage(parts[ci].second), a,
-                 {npu_->C().handle, doff + ci * kDownCalls * cp, kDownCalls * cp});
+                 {npu_->C().handle, cb + doff + ci * kDownCalls * cp, kDownCalls * cp});
     // the GPU's features: gate / up over the first G, their rotq (down's awq), down over that K window into hidden2
     const std::string gu = "iu4_gu_" + std::to_string(G / 16) + "_20.hal";
     DispatchIu4(gu, "_gu", G / 16, {TRef(*tg), Ref(*aq_), Ref(*ad_), TRef(*tu), Ref(*ffnup_)}, 0b10000);
@@ -815,13 +927,22 @@ class LoomPrefill {
              {Ref(*ffnup_), TRef(*Find(pre + "ffn_down.awq")), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b11000);
     DispatchIu4("iu4_kresk_320_" + std::to_string(G / 256) + ".hal", "_kres", kHidden / 16,
                 {TRef(*td), Ref(*aq_), Ref(*ad_), Ref(*hidden_), Ref(*hidden2_)}, 0b10000);
-    // hidden = hidden2 + the NPU's partials, once its last job is done
-    NpuJoin();
-    const Geom& gn = geom_.at("npu_unpack_ffn.hal");
-    Dispatch(Exe("npu_unpack_ffn.hal"), "yah_npu_unpack", gn.tokens, 1, 1, gn.rowgrp, 1, 1,
-             {{npu_->C().handle, doff, parts.size() * kDownCalls * cp}, Ref(*hidden2_), Ref(*hidden_)}, 0b100);
+    // hidden = hidden2 + the NPU's partials, once its last job is done: now, or (pairs) before the chunk's next layer
+    if (!npu_planning_) join_[par_] = flagged_.size() - 1;
+    if (!pairs_) JoinFfn();
     return true;
   }
+  // The selected chunk's pending FFN block: wait for its last NPU job, then hidden = hidden2 + the NPU's partials.
+  void JoinFfn() {
+    const std::size_t job = std::exchange(join_[par_], kNoJoin);
+    if (job == kNoJoin) return;
+    NpuJoin(job);
+    const std::size_t cb = par_ * NpuCBytes(), doff = FfnDownOff();
+    const Geom& gn = geom_.at("npu_unpack_ffn.hal");
+    Dispatch(Exe("npu_unpack_ffn.hal"), "yah_npu_unpack", gn.tokens, 1, 1, gn.rowgrp, 1, 1,
+             {{npu_->C().handle, cb + doff, NpuCBytes() - doff}, Ref(*hidden2_), Ref(*hidden_)}, 0b100);
+  }
+  std::size_t NpuCBytes() const { return FfnDownOff() + FfnParts().size() * kDownCalls * DownC(); }
   // An iu4 GEMM of the block at its own row count (RunIu4 names the HAL from the tensor's): grid (G, token tiles,
   // row tiles / G) with its iu4grp row, else (row tiles, token tiles).
   void DispatchIu4(const std::string& hal, const char* sfx, std::uint32_t mtiles, const std::vector<hrx_buffer_ref_t>& b,
@@ -876,7 +997,7 @@ class LoomPrefill {
         std::fprintf(stderr, "npu cpu-driven: job %zu (%s, layer %u) stalled or failed: done %08x gate %08x\n", i,
                      jobs[i].tag.c_str(), jobs[i].layer, d, w.gate);
         // YAH_NPU_CPU_STALL_CMD: run while the context lives (e.g. tools/npu_aie_status.py)
-        if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);
+        if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) (void)!std::system(cmd);
         for (std::uint32_t k = w.ready; k <= w.done + 16; ++k)
           if (const std::uint32_t v = npu_->HostLoad(k); v != before[k - w.ready])
             std::fprintf(stderr, "  word +%u: %08x -> %08x\n", k - w.ready, before[k - w.ready], v);
@@ -886,14 +1007,14 @@ class LoomPrefill {
     }
     std::fprintf(stderr, "npu cpu-driven: %zu jobs done\n", jobs.size());
   }
-  void NpuJoin() {
+  void NpuJoin(std::size_t job) {
     if (npu_planning_) return;
-    const std::size_t job = flagged_.size() - 1;
-    const NpuSplit::Queued& j = flagged_[job];
+    const NpuSplit::Queued& j = flagged_.at(job);
     std::vector<hrx_buffer_ref_t> side = {Ref(npu_->A())};
     for (std::size_t i = npu_joined_; i <= job; ++i) side.push_back(job_c_[i]);
-    Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
-             {FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &side);
+    if (!std::getenv("YAH_NPU_FAKE"))
+      Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
+               {FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &side);
     npu_joined_ = job + 1;
     // the gate counts jobs per chunk: the joined jobs' words read zero again before the next chunk reuses them
     for (; npu_cleared_ <= job; ++npu_cleared_)
@@ -1060,8 +1181,8 @@ class LoomPrefill {
     return flagged;
   }
   // Completion counters of a flagged producer and its flag-waiting consumer (gen_gemm_iu4 flag, gen_rot.flag_wait): a
-  // word per 128-token tile, a slot per pair in the chunk, zeroed before the chunk (RunLayers). Both bind it untracked.
-  static constexpr std::size_t kFlagSlots = 2048;
+  // word per 128-token tile, a slot per pair in the chunk, zeroed before the chunk (RunLayers; a pair: both chunks). Both bind it untracked.
+  static constexpr std::size_t kFlagSlots = 4096;
   std::size_t TokenTiles128() const { return (B_ + 127) / 128; }
   hrx_buffer_ref_t FlagSlot() { return FlagSlots(1); }
   // k consecutive slots (a flagged gu: a counter per 1024 features and token tile)
@@ -1561,6 +1682,21 @@ class LoomPrefill {
   std::size_t down_layer_ = 0;     // the down pack's bytes per layer
   std::uint32_t npu_layer_ = 0;    // the layer being recorded (NpuSplit::Queued::layer)
   std::uint32_t npu_layers_ = 0;   // the layers that run the block (EnableNpu)
+  // pairs (EnablePairs): the other chunk's buffers and state (SelectChunk swaps them in), the selected chunk, and each
+  // chunk's FFN block job to join before its next layer (kNoJoin: none)
+  struct ChunkState {
+    LoomBuffer *hidden = nullptr, *hidden2 = nullptr, *ids = nullptr, *valid = nullptr;
+    std::uint32_t n = 0;
+    std::int64_t keep = -1;
+    bool answer = false;
+  };
+  bool pairs_ = false;
+  ChunkState other_;
+  std::uint32_t par_ = 0;
+  static constexpr std::size_t kNoJoin = ~std::size_t{0};
+  std::thread npu_trace_;   // YAH_NPU_TRACE
+  std::atomic<bool> trace_stop_{false};
+  std::size_t join_[2] = {kNoJoin, kNoJoin};
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only
   bool qg16_ = false;   // the kqg GEMM stores q and gate as f16 (only the GPU kqg path writes them so)

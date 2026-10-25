@@ -14,6 +14,8 @@
 //   YAH_SLOT_SAVE=<file> [YAH_SLOT_AT=C]  save the sequence state before chunk C (default: after the last)
 //   YAH_SLOT_LOAD=<file> restore a slot and run from the chunk it covers (marginal prefill at depth)
 //   YAH_CHUNK_MS=1       print each chunk's wall time (synchronizes after every chunk)
+//   YAH_PAIRS=1          full chunks two at a time, layer by layer (LoomPrefill::RunPair: the NPU block of one chunk
+//                       runs while the GPU runs the other's layer)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -104,6 +106,7 @@ int main(int argc, char** argv) {
     gpu.SetSleepSync(200);
     LoomWeights weights(gpu, gguf);
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
+    if (std::getenv("YAH_PAIRS")) pf.EnablePairs();
 #ifdef YAH_WITH_NPU
     // YAH_NPU=1: the NPU runs the set's FFN block (tools/emit_npu_ffn.py), its dense down weights from YAH_NPU_DOWN
     // (tools/npu_down_pack.py).
@@ -174,6 +177,25 @@ int main(int argc, char** argv) {
     const bool chunk_ms = std::getenv("YAH_CHUNK_MS") != nullptr;
     auto tc = t0;
     for (std::uint32_t ci = ci0; ci < n_chunks; ++ci) {
+      // YAH_PAIRS=1: two full chunks at a time (LoomPrefill::RunPair)
+      if (pf.pairs() && ci + 1 < n_chunks && (ci + 2 < n_chunks || last_n == B)) {
+        if (rowstats || slot_save) throw LoomError("YAH_PAIRS runs without YAH_ROWSTATS / YAH_SLOT_SAVE");
+        const auto keep = [&](std::uint32_t c) {
+          return logits_from < std::min((c + 1) * B, T_run) ? LoomPrefill::kAllRows
+                 : c + 1 == n_chunks                        ? std::int64_t{last_n} - 1
+                                                            : LoomPrefill::kNoRows;
+        };
+        for (std::uint32_t p = 0; p < 2; ++p) pf.SelectChunk(p), pf.Embed(ids.data() + std::size_t{ci + p} * B, B);
+        pf.RunPair(ci, keep(ci), keep(ci + 1), ci + 2 == n_chunks);
+        for (std::uint32_t p = 0; p < 2; ++p) {
+          pf.SelectChunk(p);
+          const std::uint32_t c = ci + p;
+          for (std::uint32_t ra = std::max(logits_from, c * B); ra < std::min((c + 1) * B, T_run); ++ra)
+            pf.Head(ra - c * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});
+        }
+        ++ci;
+        continue;
+      }
       if (slot_save && ci == slot_at) pf.SaveState(slot_save, ci);
       pf.Embed(ids.data() + std::size_t{ci} * B, ci + 1 == n_chunks ? last_n : B);
       // the last layer's tail only for the rows read below: every row for logits_from / rowstats, else the last row
@@ -210,6 +232,7 @@ int main(int argc, char** argv) {
       }
     }
     gpu.Synchronize();
+    pf.StopNpuTrace();
     if (slot_save && slot_at >= n_chunks) pf.SaveState(slot_save, n_chunks);
     if (rowstats) std::fclose(rowstats);
     const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
