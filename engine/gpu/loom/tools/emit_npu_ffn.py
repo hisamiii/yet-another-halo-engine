@@ -39,10 +39,12 @@ import subprocess  # noqa: E402
 
 FFN, HID = 17408, 5120
 KS = (36, 36, 36, 20)       # k-blocks per pass and K-slice row (K = 1024 per pass)
-# YAH_NPU_DFR=1: gate / up with its M blocks' epilogue deferred into the next block's passes (gen_npu_gemm dfr): the
-# short tail slice frees the room for it, so gate / up and its activation stream take this split
-DFR = os.environ.get("YAH_NPU_DFR") == "1"
+# gate / up with its M blocks' epilogue deferred into the next block's passes (gen_npu_gemm dfr; -7.6%, the same
+# sums): the short tail slice frees the room for it, so gate / up and its activation stream take this split.
+# YAH_NPU_DFR=0: without
+DFR = os.environ.get("YAH_NPU_DFR", "1") == "1"
 KS_SW = (40, 40, 40, 8) if DFR else KS
+KS_DN = (36, 32, 32, 28)    # down (kchain: slice ends at multiples of 4): -3% over KS
 COLS, NP = 8, 4             # NPU columns, 16-row slabs per column: 512 rows a call
 TARGET = "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11"
 
@@ -67,7 +69,7 @@ def dn_cfg(B, F, passes):
     """Down decodes its IQ4_XS rows (npu_down_pack.py) itself: the same gate layout as gate / up's (gwest), so the two
     images switch inside a command (a dense image's setup leaves column 2's gate routes of gate / up's in place: the
     array hangs)."""
-    return N.Config(COLS, B // 64, KS, passes, mu=1, gate=N.GATE_SUPPLY, gwest=1, ghelp=1, gfirst=1, fuse=2, kraw=F,
+    return N.Config(COLS, B // 64, KS_DN, passes, mu=1, gate=N.GATE_SUPPLY, gwest=1, ghelp=1, gfirst=1, fuse=2, kraw=F,
                     ain="h", hpass=F // 1024, fmt="IQ4_XS", kchain=1, hcap=2, gtail=1)
 
 
