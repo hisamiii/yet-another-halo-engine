@@ -41,8 +41,10 @@ import gen_kvq  # noqa: E402
 import gen_rot  # noqa: E402
 
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
-# rows per wave R and waves per workgroup W per GEMV kind; recorded in decode.txt ("rw kind R W")
-RW = {k: (2, 4) for k in ("plain", "resid", "swiglu", "bands")}
+# rows per wave R and waves per workgroup W per GEMV kind; recorded in decode.txt ("rw kind R W"). Each wave reads all
+# of x for its rows, so the verify GEMVs (VERIFY tokens of x) want more rows per wave: R 4 for plain / resid takes 14%
+# off a 4-token verify with the steps unchanged (2026-10-26, gfx1151); SwiGLU's two weights spill at R 4 with 4 tokens.
+RW = {"plain": (4, 4), "resid": (4, 4), "swiglu": (2, 4), "bands": (2, 4)}
 
 
 # Every kernel waits on its producer's counter instead of a queue barrier (gen_chain.py; decode.txt "chain").
@@ -70,6 +72,24 @@ def emit_file(path, name, outdir, configs):
     if r.returncode != 0:
         raise SystemExit("emit failed for %s:\n%s%s" % (path, r.stdout[-3000:], r.stderr[-3000:]))
     shutil.copy(r.stdout.strip().splitlines()[0], os.path.join(outdir, name + ".hal"))
+    spill = private_segment(os.path.join(outdir, name + ".hal"))
+    if spill:   # scratch the runtime may not set up, and slow if it does
+        raise SystemExit("emit_decode: %s spills %d B of registers to scratch (fewer rows per wave?)" % (name, spill))
+
+
+def private_segment(hal):
+    """The kernel's .private_segment_fixed_size from its code object's msgpack metadata (0: no scratch)."""
+    d = open(hal, "rb").read()
+    at = d.find(b"\xbb.private_segment_fixed_size")   # (a 27-byte msgpack string)
+    if at < 0:
+        raise SystemExit("emit_decode: no kernel metadata in " + hal)
+    v = d[at + 28]
+    if v < 0x80:
+        return v
+    if v in (0xcc, 0xcd, 0xce):
+        n = {0xcc: 1, 0xcd: 2, 0xce: 4}[v]
+        return int.from_bytes(d[at + 29:at + 29 + n], "big")
+    raise SystemExit("emit_decode: unreadable private segment size in " + hal)
 
 
 def kv_bits():
@@ -169,7 +189,7 @@ def main():
             emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, amax=True), aname, outdir)
             grids[aname] = grids[name]
     for name, (kind, fmts, M, K) in sorted(gs.items()):   # the verify GEMVs: no peel, no fused epilogues
-        R, W = RW[kind]   # (R = 1 halves the accumulators but runs slower: fewer loads in flight per wave)
+        R, W = RW[kind]   # (R = 1 halves the accumulators but runs slower: more x reads per weight row)
         emit_src(GV.gen(kind, fmts, M, K, R, W, T=VERIFY), name + "_t%d" % VERIFY, outdir)
         grids[name + "_t%d" % VERIFY] = M // GV.rows_per_wg(R, W)
     eh = [(d, ty) for nm, d, ty in EP.parse(model) if nm.endswith(".nextn.eh_proj.weight")]
