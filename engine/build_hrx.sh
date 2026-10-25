@@ -46,15 +46,8 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
     "$root/engine/third_party/httplib/httplib.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
-# Terminal chat client for yah_server.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_chat.cc" \
-    "$root/engine/third_party/httplib/httplib.cpp" -o "$root/engine/build/yah_chat" -lpthread
-# Serving tests: the chat template golden and yah_server --fake over HTTP. No GPU, no libhrx.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_serve_test.cc" \
-    "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
-    "$root/engine/third_party/httplib/httplib.cpp" -o "$root/engine/build/yah_serve_test" -lpthread
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"
 fi
-echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,yah_server,yah_chat,yah_serve_test}"
+echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,yah_server} (and the CMake targets)"

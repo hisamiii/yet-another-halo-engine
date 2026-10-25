@@ -51,7 +51,7 @@ These are upstream candidates; do not push them to HRX without the owner's agree
 engine/build_hrx.sh
 ```
 
-It builds `libyah_core`, the core tools (`yah-tokenize`, `yah-dump`, `yah-weights`), the drivers `loom_forward_pp`, `loom_decode`, `hal_run`, the server `yah_server`, the chat client `yah_chat` and `yah_serve_test` into `engine/build/`. It compiles with clang (`CXX=` overrides), `-O3 -march=native -ffp-contract=off`. Always use this script: `cmake --build engine/build` does not build the drivers and prints nothing, and a stale driver with a new HAL set launches the wrong grid. `gpu_run.sh` refuses a driver binary older than its source.
+It builds `libyah_core`, the core tools (`yah-tokenize`, `yah-dump`, `yah-weights`), the drivers `loom_forward_pp`, `loom_decode`, `hal_run`, the server `yah_server`, and the CMake targets that need no GPU (`yah_server_fake`, the chat client `yah_chat`, `yah_serve_test`) into `engine/build/`. It compiles with clang (`CXX=` overrides), `-O3 -march=native -ffp-contract=off`. Always use this script: `cmake --build engine/build` does not build the drivers and prints nothing, and a stale driver with a new HAL set launches the wrong grid. `gpu_run.sh` refuses a driver binary older than its source.
 
 ## Emit HAL sets
 
@@ -154,11 +154,13 @@ for event in client.responses.create(model="qwen", input="Hi", stream=True):
 
 All system and developer messages merge into one system message at the start. The chat template is a C++ port of the model's Jinja template for this subset.
 
-Tests (no GPU; source `engine/hrx-env.sh` first, `yah_server` links libhrx):
+Tests (no GPU):
 
 ```
-engine/build/yah_serve_test <model> [yah_server]   # chat template golden, then yah_server --fake over HTTP
+engine/build/yah_serve_test <model> engine/build/yah_server_fake   # chat template golden, then --fake over HTTP
 ```
+
+`yah_server_fake` is `yah_server` built without the engine (`YAH_SERVE_FAKE_ONLY`): only `--fake`, no libhrx. The default server is `yah_server` next to the test, which links libhrx: source `engine/hrx-env.sh` first. `--fake` reads only the tokenizer, so `<model>` can be the tokenizer-only cut `python3 engine/tests/make_tokenizer_fixture.py <model path or URL> <out.hfq>` makes (~14 MB; from a URL it fetches only the metadata ranges). `engine/tests/verify_tokenizer.py --model` takes it too. The CPU CI (`.github/workflows/cpu.yml`) runs both on that cut once the repository variable `YAH_MODEL_URL` names the model's download URL; without it the job only builds.
 
 It checks the C++ chat template byte for byte against `engine/serve/testdata/chat_template_cases.json`, then starts `yah_server --fake` on a free port and checks the response object and stream event shapes (the required fields of the openai SDK models), event order, deltas, `max_output_tokens`, the 400 error objects and client disconnect. The fixture was frozen from jinja2 on 2026-10-02 against the GGUF's template; regenerating it is not supported in-tree.
 

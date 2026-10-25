@@ -1,0 +1,46 @@
+# CPU-only checks: the core and serving build, the tokenizer goldens, yah_server_fake over HTTP. No GPU, no HRX.
+# The tests read the tokenizer from the model's metadata: set the repository variable YAH_MODEL_URL to the model file's
+# download URL (Hugging Face resolve link) and engine/tests/make_tokenizer_fixture.py fetches only that part (~14 MB).
+# Without the variable the job only builds.
+name: cpu
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-14 libicu-dev
+
+      - name: build
+        run: |
+          cmake -S engine -B engine/build -G Ninja -DCMAKE_CXX_COMPILER=g++-14
+          cmake --build engine/build
+
+      - name: tokenizer fixture (cache)
+        if: vars.YAH_MODEL_URL != ''
+        id: fixture
+        uses: actions/cache@v4
+        with:
+          path: fixture.hfq
+          key: fixture-${{ hashFiles('engine/tests/make_tokenizer_fixture.py') }}-${{ vars.YAH_MODEL_URL }}
+
+      - name: tokenizer fixture
+        if: vars.YAH_MODEL_URL != '' && steps.fixture.outputs.cache-hit != 'true'
+        run: python3 engine/tests/make_tokenizer_fixture.py "${{ vars.YAH_MODEL_URL }}" fixture.hfq
+
+      - name: tokenizer goldens
+        if: vars.YAH_MODEL_URL != ''
+        run: python3 engine/tests/verify_tokenizer.py --model fixture.hfq
+
+      - name: serving tests
+        if: vars.YAH_MODEL_URL != ''
+        run: engine/build/yah_serve_test fixture.hfq engine/build/yah_server_fake

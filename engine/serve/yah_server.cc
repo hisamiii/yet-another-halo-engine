@@ -1,4 +1,5 @@
 // yah_server: the OpenAI Responses API (POST /v1/responses) over one TextGenerator, one generation at a time.
+// Built with YAH_SERVE_FAKE_ONLY (the CMake target yah_server_fake) it has only --fake: no Engine, no HRX, no GPU.
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -8,7 +9,9 @@
 #include <vector>
 
 #include "httplib/httplib.h"
+#ifndef YAH_SERVE_FAKE_ONLY
 #include "model/engine.hpp"
+#endif
 #include "model/generator.hpp"
 #include "serve/chat_template.hpp"
 #include "serve/fake_generator.hpp"
@@ -176,11 +179,15 @@ int main(int argc, char** argv) {
     if (fake) {
       generator = std::make_unique<FakeGenerator>(model);
     } else {
+#ifdef YAH_SERVE_FAKE_ONLY
+      throw std::runtime_error("built without the GPU engine: only --fake");
+#else
       yah::model::Engine::Options options;
       options.model = model;
       options.prefill_hal = prefill;
       options.decode_hal = decode;
       generator = std::make_unique<yah::model::Engine>(options);
+#endif
     }
     Server server(*generator);
     httplib::Server http;

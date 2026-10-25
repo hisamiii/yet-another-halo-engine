@@ -31,4 +31,16 @@ target_link_libraries(yah-tokenize PRIVATE yah_core)
 add_executable(yah-weights model/yah_weights.cpp)
 target_link_libraries(yah-weights PRIVATE yah_core)
 
-# The HRX-native runners (loom_forward_pp prefill, loom_decode decode, hal_run) are built by engine/build_hrx.sh against the HRX runtime library.
+# Serving without the GPU: yah_server_fake (yah_server with only --fake), the yah_serve_test HTTP tests, the yah_chat client.
+add_library(yah_httplib STATIC third_party/httplib/httplib.cpp)
+target_include_directories(yah_httplib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_link_libraries(yah_httplib PUBLIC Threads::Threads)
+add_executable(yah_server_fake serve/yah_server.cc serve/chat_template.cpp serve/responses.cpp)
+target_compile_definitions(yah_server_fake PRIVATE YAH_SERVE_FAKE_ONLY)
+target_link_libraries(yah_server_fake PRIVATE yah_core yah_httplib)
+add_executable(yah_serve_test serve/yah_serve_test.cc serve/chat_template.cpp serve/responses.cpp)
+target_link_libraries(yah_serve_test PRIVATE yah_httplib)
+add_executable(yah_chat serve/yah_chat.cc)
+target_link_libraries(yah_chat PRIVATE yah_httplib)
+
+# The HRX-native runners (loom_forward_pp prefill, loom_decode decode, hal_run) and yah_server are built by engine/build_hrx.sh against the HRX runtime library.

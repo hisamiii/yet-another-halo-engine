@@ -25,7 +25,7 @@ class FakeGenerator : public model::TextGenerator {
   static constexpr std::uint32_t kContext = 4096;
 
   explicit FakeGenerator(const std::string& gguf_path)
-      : gguf_(core::Gguf::Open(gguf_path)),
+      : gguf_(core::Gguf::OpenIndex(gguf_path)),   // the tokenizer only: a metadata-only file serves (tests/make_tokenizer_fixture.py)
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
         name_(std::filesystem::path(gguf_path).stem().string()) {}
 
