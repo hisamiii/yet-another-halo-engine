@@ -39,6 +39,10 @@ import subprocess  # noqa: E402
 
 FFN, HID = 17408, 5120
 KS = (36, 36, 36, 20)       # k-blocks per pass and K-slice row (K = 1024 per pass)
+# YAH_NPU_DFR=1: gate / up with its M blocks' epilogue deferred into the next block's passes (gen_npu_gemm dfr): the
+# short tail slice frees the room for it, so gate / up and its activation stream take this split
+DFR = os.environ.get("YAH_NPU_DFR") == "1"
+KS_SW = (40, 40, 40, 8) if DFR else KS
 COLS, NP = 8, 4             # NPU columns, 16-row slabs per column: 512 rows a call
 TARGET = "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11"
 
@@ -55,8 +59,8 @@ def parts(F):
 
 def sw_cfg(B, F, dgu):
     """H in down's decoder order (IQ4_XS: P4)."""
-    return N.Config(COLS, B // 64, KS, 5, mu=1, gate=N.GATE_SUPPLY, gwest=1, ghelp=1, gfirst=1, fuse=2, swiglu=True,
-                    dgu=dgu, swcol=32, hpass=F // 1024, hord="P4", fmt="MQ4")
+    return N.Config(COLS, B // 64, KS_SW, 5, mu=1, gate=N.GATE_SUPPLY, gwest=1, ghelp=1, gfirst=1, fuse=2, swiglu=True,
+                    dgu=dgu, swcol=32, hpass=F // 1024, hord="P4", fmt="MQ4", dfr=int(DFR))
 
 
 def dn_cfg(B, F, passes):
@@ -107,10 +111,10 @@ def main():
     groups, perm = GE.GROUPS, GE.ACT_PERM
     GE.GROUPS, GE.ACT_PERM = (5,), "p4"
     try:
-        loom("npu_enc_act.hal", GE.gen("act", B, list(KS), 5))
+        loom("npu_enc_act.hal", GE.gen("act", B, list(KS_SW), 5))
     finally:
         GE.GROUPS, GE.ACT_PERM = groups, perm
-    rows.append(("npu_enc_act.hal", GE.WG, 0, (B // 8) * 5 * sum(KS) // GE.WG))
+    rows.append(("npu_enc_act.hal", GE.WG, 0, (B // 8) * 5 * sum(KS_SW) // GE.WG))
     rows.append(P.iu4_gemm("gu", G // 16, HID // 256, B, outdir))
     rows.append(("iu4grp_" + rows[-1][0], gen_gemm_iu4.group_of("gu", G), 0, 0))
     loom("rotq_%d.hal" % G, gen_rot.gen_q(G, B, gen_gemm_iu4.KP, True, None))

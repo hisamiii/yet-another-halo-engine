@@ -982,6 +982,7 @@ class LoomPrefill {
       std::thread& t;
       ~Join() { t.join(); }
     } join{enq};
+    std::map<std::string, std::pair<double, unsigned>> fam;   // per image family: ms, jobs
     for (std::size_t i = 0; i < jobs.size(); ++i) {
       const NpuSplit::Job& w = jobs[i].words;
       std::vector<std::uint32_t> before;   // the job's gate slots, to report which words its calls changed
@@ -1004,8 +1005,11 @@ class LoomPrefill {
         return;
       }
       if (i < 6) std::fprintf(stderr, "npu cpu-driven: job %zu (%s) done in %.2f ms\n", i, jobs[i].tag.c_str(), ms);
+      if (i >= 6) fam[jobs[i].tag].first += ms, ++fam[jobs[i].tag].second;
     }
     std::fprintf(stderr, "npu cpu-driven: %zu jobs done\n", jobs.size());
+    for (const auto& [tag, t] : fam)   // (past the first 6: the image loads)
+      std::fprintf(stderr, "npu cpu-driven: %s mean %.3f ms over %u jobs\n", tag.c_str(), t.first / t.second, t.second);
   }
   void NpuJoin(std::size_t job) {
     if (npu_planning_) return;
