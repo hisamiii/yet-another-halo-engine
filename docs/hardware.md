@@ -136,4 +136,4 @@ HRX counters, rocprofv3, ATT and what does not work (PC sampling, RGP) are liste
 
 ## NPU (XDNA2)
 
-The NPU compute tile and data movement measurements (2026-10-07..12) are in this file on branch `npu`, with the parked NPU prefill split.
+The NPU compute tile and data movement measurements (2026-10-07..12) are in this file on branch `npu`, with the earlier NPU prefill split (every large GEMM split by output columns, the IQ4_XS model).

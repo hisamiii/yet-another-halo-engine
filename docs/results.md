@@ -11,6 +11,15 @@ MQ4 HFQ, default sets (A4 prefill, fp16 KV), 2026-10-22, cooled ABBA round (tag 
 | pp2048 `layers_ms` | 1466.3 / 1474.4 ms | 1407.6 / 1434.9 ms | ~1420-1450 tok/s |
 | decode, 64 tokens after a 5-token prompt, `decode_ms` | 60.76 / 60.86 ms | 60.85 / 60.94 ms | the profiled step is 60.30 ms, 96% of the ~58.1 ms floor (see "Decode floor" below) |
 
+2026-10-25 / 26, not cooled (the GPU DPM pinned high for the NPU; plain decode drifted 13.6-15.9 t/s between prompts):
+
+| what | result | note |
+|---|---|---|
+| UD-Q4_K_M GGUF converted at load, `kld_ref.py` (24 chunks) | mean KL 0.0997, p99 0.971, top-1 85.84%, PPL 6.709 | the HFQ A4 path: 0.0687; the conversion re-quantizes Q4_K / Q6_K rows to MQ4G256 |
+| A4 prefill, pp2048, NPU FFN block (F 5120, chunk pairs) | 1200 ms (~1707 tok/s) | the GPU alone on the same set 1365 ms; through the server pp8500 1449 tok/s with `--npu`, 1301 without (+11%) |
+| speculative decode, `--draft mtp`, Q4_K_M GGUF, 32K kv8 (`spec_engine`, greedy) | code 15.9 -> 24.3 t/s, facts (1673-token prompt) 13.6 -> 22.0, raw text 13.7 -> 17.0, prose 14.4 -> 13.7; over all four 14.4 -> 18.3 | outputs equal to plain decode token for token; accepted drafts per round 2.10 / 2.52 / 1.69 / 0.99 |
+| verify cost, HFQ, 4K kv8 set (`spec_check --time`, synced) | step 61.6 ms, verify of 1 / 2 / 3 / 4 drafts 75.2 / 80.4 / 85.1 / 89.7 ms, MTP draft ~4 ms | R 2 rows per wave before: 88.7 / 94.0 / 101.9 / 103.9 ms |
+
 The IQ4_XS tables below are history: same engine design, the removed GGUF formats.
 
 Prefill, default set (FA attention, chunked DeltaNet, paged KV; HRX pin a02a5ab94 with engine/hrx/patches), `layers_ms`:

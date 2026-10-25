@@ -1,10 +1,10 @@
 # Architecture
 
-The engine runs one model (Qwen3.8-27B as hipfire's MQ4 file, `qwen3.8-27b.mq4-xts`) on one GPU (Strix Halo, gfx1151). Every kernel is written in Loom and compiled for the exact shapes of this model. Python generators write the Loom source, `emit_hal.py` compiles it to an HRX HAL executable, and two small C++ drivers dispatch the HAL sets through the HRX native API. There is no general tensor runtime: the layer loop is hand-written.
+The engine runs one model (Qwen3.8-27B as hipfire's MQ4 file, `qwen3.8-27b.mq4-xts`, or a llama.cpp GGUF of it converted at load) on one GPU (Strix Halo, gfx1151), with the prefill's FFN block optionally shared with the NPU. Every kernel is written in Loom and compiled for the exact shapes of this model. Python generators write the Loom source, `emit_hal.py` compiles it to an HRX HAL executable, and two small C++ drivers dispatch the HAL sets through the HRX native API. There is no general tensor runtime: the layer loop is hand-written.
 
 This page describes the model, the prefill pipeline, the decode step, the data layouts and the HAL sets. Numbers are in [results.md](results.md), measured hardware facts in [hardware.md](hardware.md).
 
-Until 2026-10-20 the engine also ran the IQ4_XS GGUF model (11 quant formats, tile GEMMs with per-format decoders, afrag GEMMs, a tuner) and split prefill GEMMs with the NPU. Both are gone from main; the tag `pre-cleanup-2026-10-20` has the GGUF path and branch `npu` the NPU work.
+Until 2026-10-20 the engine also ran the IQ4_XS GGUF model natively (11 quant formats, tile GEMMs with per-format decoders, afrag GEMMs, a tuner) and split every large prefill GEMM with the NPU; the tag `pre-cleanup-2026-10-20` has that path and branch `npu` the NPU history. Since 2026-10-25 a GGUF loads by conversion to the MQ4 layout instead (Loading), and the NPU takes part of the A4 prefill's FFN (Engine).
 
 ## The model
 
@@ -12,7 +12,7 @@ Qwen3.8-27B is a hybrid: every 4th layer is full (softmax) attention, the others
 
 | item | value |
 |---|---|
-| layers | 64 main layers (the file has no MTP layer) |
+| layers | 64 main layers; GGUFs from unsloth add the MTP layer as `blk.64.nextn.*` (`nextn_predict_layers` 1: one full-attention block behind `eh_proj` 10240 -> 5120, sharing the output head) |
 | full-attention layers | 16: layers 3, 7, 11, ..., 63 (`(l + 1) % 4 == 0`) |
 | Gated DeltaNet layers | 48 |
 | hidden | 5120 |
@@ -36,7 +36,9 @@ MQ4G256 is symmetric int4 with one f16 scale per 128 weights, 136 bytes per 256.
 | norms | f32, 1 + w as GGUF stores them (DeltaNet `ssm_norm` as is) |
 | `ssm_a`, `ssm_dt`, `ssm_conv1d`, AWQ scales | f32 (`ssm_a` = -exp(A_log)), placed after the file's bytes in the same import |
 
-`ssm_out` keeps the HF value-head order on its input axis: a head permutation does not commute with the rotation, so its input is written in HF head order. The tensors are then copied into device-local HRX buffers of about 1 GiB cut at tensor boundaries (`LoomWeights`), each host range released right after its copy: RAM holds one copy of the model. A mapped file does not work: reclaim and compaction scan its page-cache folios, and every scan of a GPU-imported page evicts all of the process's GPU queues (hardware.md).
+`ssm_out` keeps the HF value-head order on its input axis: a head permutation does not commute with the rotation, so its input is written in HF head order. A GGUF (`engine/core/gguf_convert.cpp`) already has the names, dims, norms and DeltaNet head order; its projections are dequantized (`engine/core/gguf_quant.cpp`, the common GGML formats), rotated and re-quantized to MQ4G256 with all-ones AWQ scales on every core (~22 s for Q4_K_M), the embedding becomes Q8_0, the small tensors f32, and `ssm_out`'s columns are permuted to HF head order. The re-quantization costs accuracy over the HFQ file: UD-Q4_K_M converted scores mean KL 0.0997, top-1 85.8% (the HFQ A4 path 0.0687; results.md).
+
+The tensors are then copied into device-local HRX buffers of about 1 GiB cut at tensor boundaries (`LoomWeights`), each host range released right after its copy: RAM holds one copy of the model. A mapped file does not work: reclaim and compaction scan its page-cache folios, and every scan of a GPU-imported page evicts all of the process's GPU queues (hardware.md).
 
 ## Prefill
 
@@ -138,11 +140,17 @@ Slots: `SaveState` / `LoadState` write and read the sequence state after some ch
 
 ## Engine
 
-`engine/model/engine.hpp` (`Engine`) loads the model, a chunked prefill set and a decode set once and serves `Generate(prompt, params, on_token)` calls one at a time (the `TextGenerator` interface in `engine/model/generator.hpp`; the server in `engine/serve/` talks only to that). Per request: reset the recurrent state, prefill the whole chunks, finish the tail with a partial chunk or with decode steps (whichever its measured costs say is cheaper), then decode. Greedy takes the argmax on the GPU; temperature / top_p sample on the GPU too (`gen_sample`).
+`engine/model/engine.hpp` (`Engine`) loads the model, a chunked prefill set and a decode set once and serves `Generate(prompt, params, on_token)` calls one at a time (the `TextGenerator` interface in `engine/model/generator.hpp`; the server in `engine/serve/` talks only to that). Per request: reset the recurrent state, prefill the whole chunks, finish the tail with a partial chunk or with decode steps (whichever its measured costs say is cheaper), then decode. Greedy takes the argmax on the GPU; temperature / top_p sample on the GPU too (`gen_sample`). With `draft mtp`, greedy requests decode speculatively (`Engine::Speculate`, Decode below). With the NPU (`LoomNpuSplit`, `engine/model/loom_npu.hpp`), whole 2048-token chunks run two at a time layer by layer, and the NPU computes the last F of the 17408 FFN features of each layer (F 5120 in the serve set: its gate / up with SwiGLU on MQ4 rows decoded on its cores, then down over those features from re-packed IQ4_XS rows) while the GPU runs the rest; the GPU waits on the NPU's done words in memory, and the host only queues the NPU's commands.
 
 ## Decode
 
 `engine/model/loom_decoder.hpp` (`LoomDecoder`) is the single-token step. `loom_decode` feeds a prompt through it one token at a time; `loom_forward_pp --gen` runs it after a prefill, on the prefill's KV pools and recurrent state. Decode reads 13.63 GB of weights per token (every MQ4 tensor, one embedding row), so it is a bandwidth problem: the floor is ~58.1 ms at 240 GB/s with the DeltaNet state traffic, and the step runs at 96% of it (results.md).
+
+### Speculative decode
+
+`LoomDecoder::Verify(pos, n)` runs n + 1 tokens (the last accepted token and n drafts, up to 4) through the layers at once: the projections as T-token GEMVs (`gen_gemv` T, one pass over the weights for all tokens; R 4 rows per wave for plain / residual GEMVs, where each wave re-reads x for its rows), every other kernel (norms, conv, DeltaNet, attention, append) once per token exactly as `Step` runs it, so each token's logits are bit-identical to a step's. `Accept(m)` keeps the first m + 1 tokens and restores the recurrent state of the last kept one: the conv state is a ring of T buffers (the verify writes token t's state to slot t), the DeltaNet states are copied to one of T - 1 ring slots after each token but the last, and with quantized KV the open 16-key V tile is snapshotted before the verify and refilled when a rejected token crossed a tile. Rejected keys past the accepted position are simply overwritten later.
+
+The drafter is the MTP layer (`MtpBegin`, `Draft`): rmsnorm(embed(token)) and rmsnorm(h) (h the main stack's output-normed hidden) concatenated, `eh_proj`, one full-attention block with its own f16 KV pool (draft positions), `shared_head_norm` and the shared output head. Its hidden chains into the next draft. A draft costs ~4 ms; a verify of 1 / 2 / 3 / 4 drafts 75 / 80 / 85 / 90 ms against a 62 ms step (synced, the HFQ model, 4K set). `Engine::Speculate` picks each round's draft length k to maximize E(k) / cost(k), E(k) = 1 + p + .. + p^k with p a decayed acceptance rate and cost(k) an average of the measured round times; k = 0 is a plain step (preceded by one draft, which keeps the MTP KV whole and keeps p measured).
 
 ### Step, per layer
 
