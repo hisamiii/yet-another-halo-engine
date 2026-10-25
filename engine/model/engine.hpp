@@ -51,10 +51,17 @@ class Engine : public TextGenerator {
     // GPU runs everything.
     bool npu = false;
     std::string npu_down;
+    // Speculative decoding of greedy requests: "mtp" drafts with the model's MTP layer (a GGUF with blk.<n>.nextn.*)
+    // and verifies with the decode set's T-token GEMVs (emit_decode.py VERIFY); "off". draft_len: tokens per draft,
+    // 0 adapts it to the acceptance (up to the verify width - 1).
+    std::string draft = "off";
+    std::uint32_t draft_len = 0;
   };
   // How the tokens after the last whole chunk are run.
   enum class Tail { kAuto, kChunk, kDecode };
   void set_tail(Tail t) { tail_ = t; }
+  // Speculative decoding for the next requests, if Options::draft set it up (draft_status() empty).
+  void set_draft(bool on) { draft_on_ = on; }
 
   explicit Engine(const Options& o)
       : gguf_(core::Gguf::OpenResident(o.model)),
@@ -83,9 +90,22 @@ class Engine : public TextGenerator {
     const core::MetadataValue* name = gguf_.Meta("general.name");
     name_ = name && !name->s.empty() ? name->s : "qwen3.8-27b";
     if (o.npu) StartNpu(o);
+    if (o.draft == "mtp") {
+      if (!decoder_.has_mtp())
+        draft_status_ = "the model has no MTP layer (a GGUF with blk.N.nextn.*) or the decode set no MTP kernels";
+      else if (decoder_.verify_tokens() < 2)
+        draft_status_ = "the decode set has no verify GEMVs (emit_decode.py VERIFY)";
+      else
+        draft_status_.clear(), draft_len_ = std::min(o.draft_len ? o.draft_len : 0xffu, decoder_.verify_tokens() - 1),
+        draft_auto_ = o.draft_len == 0;
+    } else if (o.draft != "off") {
+      throw LoomError("engine: unknown draft mode " + o.draft + " (mtp, off)");
+    }
   }
   ~Engine() override { gpu_.Synchronize(); }   // (the graphs wait on NPU words: none may run past npu_)
 
+  // Why speculative decoding is off ("" when it runs, "off" when not asked for).
+  [[nodiscard]] const std::string& draft_status() const { return draft_status_; }
   // Why the NPU block is off ("" when it runs).
   [[nodiscard]] const std::string& npu_status() const { return npu_status_; }
 
@@ -216,6 +236,13 @@ class Engine : public TextGenerator {
     std::deque<LoomEvent> made;
     made.push_back(MarkToken(n));
     auto t1 = std::chrono::steady_clock::now();
+    if (draft_status_.empty() && draft_on_ && greedy && !decoder_.penalized()) {
+      gpu_.Wait(made.front());
+      if (tail_steps) Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
+      r.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      Speculate(r, n, params, on_token, ys);
+      return r;
+    }
 
     // Decode: report each token, then run the step that consumes it.
     r.finish_reason = "length";
@@ -297,6 +324,70 @@ class Engine : public TextGenerator {
   // The prefill slot sits this many tokens short of the prompt's end: the next turn's history replaces the assistant
   // header's tail (<think> and the like).
   static constexpr std::uint32_t kMargin = 32;
+  // Greedy decode by draft and verify rounds (Options::draft). Token n (toks[n]) is known. A plain step at n gives
+  // the first draft its hidden state; each round then drafts k tokens with the MTP layer after token q (into the
+  // token stream), verifies q and the drafts in one pass, keeps the drafts up to the first the model disagrees with
+  // and the model's own token after them (the next round's q). A verify never runs past a chunk boundary, so the
+  // decode slot (Save) lands on one. Auto draft length: one more after a fully kept draft, else the kept count + 1.
+  void Speculate(GenerateResult& r, std::uint32_t n, const GenerateParams& params,
+                 const std::function<bool(core::TokenId)>& on_token, int ys) {
+    const auto t1 = std::chrono::steady_clock::now();
+    const std::uint32_t B = prefill_.chunk(), T = decoder_.context(), limit = n + params.max_tokens;
+    r.finish_reason = "length";
+    // false: stop here (a stop id, on_token, or max_tokens)
+    const auto report = [&](core::TokenId tok) {
+      if (tok >= LoomDecoder::kVocab) throw LoomError("decoder: token id out of range: " + std::to_string(tok));
+      seq_.push_back(tok);
+      if (std::find(params.stop_ids.begin(), params.stop_ids.end(), tok) != params.stop_ids.end()) {
+        r.finish_reason = "stop";
+        return false;
+      }
+      ++r.generated_tokens;
+      if (!on_token(tok)) {
+        r.finish_reason = "stop";
+        return false;
+      }
+      return r.generated_tokens < params.max_tokens;
+    };
+    core::TokenId cur = __atomic_load_n(&tokens_host_[n], __ATOMIC_ACQUIRE);
+    if (report(cur) && n + 1 < limit && n + 1 < T) {
+      decoder_.Step(n, n);
+      if (reuse_ && (n + 1) % B == 0) Save(ys, n + 1, decoder_.conv_state());
+      decoder_.MtpBegin();
+      decoder_.MtpHidden(decoder_.MainHidden());
+      std::uint32_t q = n + 1, k = draft_len_;
+      gpu_.Synchronize();
+      cur = decoder_.Tokens(q, q + 1)[0];
+      while (report(cur) && q + 1 < limit && q + 1 < T) {
+        // k drafts, at most to the chunk boundary, the token budget and the context
+        const std::uint32_t edge = std::min({(q / B + 1) * B, limit, T});
+        const std::uint32_t kk = std::min(k, edge - q - 1);
+        for (std::uint32_t j = 0; j < kk; ++j) decoder_.Draft(q + j, q + j - (n + 1));
+        decoder_.Verify(q, kk + 1);
+        gpu_.Synchronize();
+        const std::vector<std::uint32_t> got = decoder_.VerifyResult(kk + 1);
+        const std::vector<std::uint32_t> draft = kk ? decoder_.Tokens(q + 1, q + kk + 1) : std::vector<std::uint32_t>{};
+        std::uint32_t m = 0;
+        while (m < kk && draft[m] == got[m]) ++m;
+        decoder_.Accept(m);
+        decoder_.SetTokens(&got[m], 1, q + m + 1);
+        if (reuse_ && (q + m + 1) % B == 0) Save(ys, q + m + 1, decoder_.conv_state());
+        decoder_.MtpHidden(decoder_.VerifyHidden(m));
+        r.drafted += kk, r.accepted += m;
+        bool more = true;
+        for (std::uint32_t i = 0; i < m && more; ++i) more = report(draft[i]);
+        if (!more) break;
+        if (draft_auto_) k = m == kk ? std::min(draft_len_, k + 1) : m + 1;
+        q += m + 1;
+        cur = got[m];
+      }
+    }
+    gpu_.Synchronize();
+    r.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    for (Snapshot& s : snaps_)
+      if (s.at > seq_.size()) s.at = 0;
+  }
+
   // The recurrent state at sequence position at (0: empty); the KV rows below it stay in the pools.
   struct Snapshot {
     LoomBuffer conv, delta;
@@ -343,6 +434,9 @@ class Engine : public TextGenerator {
   std::unique_ptr<LoomNpuSplit> npu_;   // (destroyed before the prefill that points at it)
 #endif
   std::string npu_status_ = "off";
+  std::string draft_status_ = "off";
+  std::uint32_t draft_len_ = 0;   // the draft length cap (auto) or the fixed length
+  bool draft_auto_ = false, draft_on_ = true;
   LoomBuffer logits_, seed_;
   LoomBuffer tokens_mirror_;                    // host-local copy of the decoder's token stream (MarkToken)
   const std::uint32_t* tokens_host_ = nullptr;  // its mapping

@@ -43,6 +43,7 @@ struct GenerateResult {
   std::string finish_reason;           // "stop" (stop id or on_token returned false) or "length"
   double prefill_ms = 0.0;
   double decode_ms = 0.0;
+  std::uint32_t drafted = 0, accepted = 0;  // speculative decoding: draft tokens verified, and those kept
 };
 
 class TextGenerator {

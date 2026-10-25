@@ -76,8 +76,16 @@ fi
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/tests/engine_reuse.cc" \
     -o "$root/engine/build/engine_reuse" "$root/engine/build/libyah_core.a" \
     "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+# GPU test of speculative decoding through the engine (spec == plain).
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/tests/spec_engine.cc" \
+    -o "$root/engine/build/spec_engine" "$root/engine/build/libyah_core.a" \
+    "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+# GPU test of the speculative verify against plain decode steps.
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/tests/spec_check.cc" \
+    -o "$root/engine/build/spec_check" "$root/engine/build/libyah_core.a" \
+    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"
 fi
-echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,yah_server,engine_reuse} (and the CMake targets)"
+echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,yah_server,engine_reuse,spec_check,spec_engine} (and the CMake targets)"

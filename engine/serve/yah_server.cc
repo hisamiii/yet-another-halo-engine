@@ -34,11 +34,14 @@ using namespace yah::serve;
 int Usage() {
   std::fprintf(stderr,
                "usage: yah_server --model <model> [--prefill <hal set> --decode <hal set>] [--host 127.0.0.1] "
-               "[--port 8080] [--npu [--npu-down <pack>]]\n"
+               "[--port 8080] [--npu [--npu-down <pack>]] [--draft mtp|off [--draft-len N]]\n"
                "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
                "In a release bundle the HAL sets default to the bundle's hal/prefill and hal/decode.\n"
                "--npu: the NPU runs the prefill set's FFN block (a set from tools/emit_npu_ffn.py), its down pack from\n"
-               "<prefill>/npu_down.bin unless --npu-down; without what it needs the GPU runs everything.\n");
+               "<prefill>/npu_down.bin unless --npu-down; without what it needs the GPU runs everything.\n"
+               "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
+               "blk.N.nextn.*) and verifying with the decode set's verify GEMVs; --draft-len N fixes the draft length\n"
+               "(default: adapts to the acceptance).\n");
   return 2;
 }
 
@@ -192,9 +195,11 @@ class Server {
     }
     stream.Finish(result);
     const double tok_s = Timings(result)["predicted_per_second"].get<double>();
-    std::fprintf(stderr, "yah_server: %s prompt=%u cached=%u output=%u prefill_ms=%.1f decode_tok_s=%.1f finish=%s\n",
+    std::fprintf(stderr,
+                 "yah_server: %s prompt=%u cached=%u output=%u prefill_ms=%.1f decode_tok_s=%.1f accepted=%u/%u "
+                 "finish=%s\n",
                  stream.id().c_str(), result.prompt_tokens, result.cached_tokens, result.generated_tokens,
-                 result.prefill_ms, tok_s,
+                 result.prefill_ms, tok_s, result.accepted, result.drafted,
                  stream.client_alive() ? result.finish_reason.c_str() : "cancelled");
   }
 
@@ -210,7 +215,8 @@ int main(int argc, char** argv) {
   std::string model, prefill, decode, host = "127.0.0.1";
   int port = 8080;
   bool fake = false, npu = false;
-  std::string npu_down;
+  std::string npu_down, draft = "off";
+  std::uint32_t draft_len = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const bool has_value = i + 1 < argc;
@@ -226,6 +232,10 @@ int main(int argc, char** argv) {
       npu = true;
     } else if (arg == "--npu-down" && has_value) {
       npu_down = argv[++i];
+    } else if (arg == "--draft" && has_value) {
+      draft = argv[++i];
+    } else if (arg == "--draft-len" && has_value) {
+      draft_len = static_cast<std::uint32_t>(std::atoi(argv[++i]));
     } else if (arg == "--host" && has_value) {
       host = argv[++i];
     } else if (arg == "--port" && has_value) {
@@ -256,10 +266,16 @@ int main(int argc, char** argv) {
       options.decode_hal = decode;
       options.npu = npu;
       options.npu_down = npu_down;
+      options.draft = draft;
+      options.draft_len = draft_len;
       auto engine = std::make_unique<yah::model::Engine>(options);
       if (npu) {
         const std::string& why = engine->npu_status();
         std::fprintf(stderr, "yah_server: npu %s%s\n", why.empty() ? "on" : "off: ", why.c_str());
+      }
+      if (draft != "off") {
+        const std::string& why = engine->draft_status();
+        std::fprintf(stderr, "yah_server: draft %s %s%s\n", draft.c_str(), why.empty() ? "on" : "off: ", why.c_str());
       }
       generator = std::move(engine);
 #endif
