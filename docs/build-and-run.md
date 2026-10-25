@@ -116,6 +116,8 @@ engine/build/yah_server --model <model> --fake    # canned replies, CPU only: fo
 
 A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). Decode runs two steps ahead of the host: each step picks its token on the GPU (argmax, or for `temperature` > 0 `yah_dec_sample`: softmax at T cut by top-k, then top-p, then min-p, an exact draw by Gumbel-max; 0.84 ms with top_k 20, 1.0 ms with top-k off) into the token stream the next step reads, and the host only reads the tokens (a host-mapped copy) to stream them and stop. A given seed draws other tokens than the earlier host sampler did; the distribution is the same. With penalties, `yah_dec_penalty` first adjusts the logits from the last `repeat_last_n` tokens of the stream (prompt included, up to 1024) the way llama.cpp does, and the argmax then runs as its own kernel. `loom_forward_pp` takes any token count the same way.
 
+Multi-turn chats reuse the cache. The engine keeps the token sequence of the last request (prompt and output) and two snapshots of the recurrent state (conv rings and DeltaNet states, 159 MB each): one at the last 2048-token chunk boundary 32 tokens short of the prompt's end, one at the last boundary the decode crossed. A prompt that starts with that sequence resumes at the deepest snapshot inside the shared prefix: the KV rows below it are still in the pools, so only the rest runs (a 9.3K-token follow-up: 1.7 s to the first token instead of 10 s). The first slot serves the usual follow-up, whose history ends at the old assistant header (thinking turns drop their reasoning there); the second serves a history that keeps the whole output. From the first slot the result is bit-identical to a fresh prefill; from the second it is the continued run's (the tokens past the old prompt were decode steps, not a prefill chunk, so a greedy reply can take another near-tie). `usage.prompt_tokens_details.cached_tokens` (`input_tokens_details` for Responses) reports the reused tokens. `YAH_NO_REUSE=1` turns it off.
+
 For quick tests, `engine/build/yah_chat` is a terminal chat client: it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply. Commands: `/reset`, `/effort E`, `/temp T`, `/max N`, `/system TEXT`, `/quit`; Ctrl-C stops a reply.
 
 ```
@@ -159,6 +161,12 @@ Tests (no GPU):
 
 ```
 engine/build/yah_serve_test <model> engine/build/yah_server_fake   # chat template golden, then --fake over HTTP
+```
+
+GPU test of the reuse (bit-exact continuation from the decode slot, reused = fresh from the prefill slot; ~2 min):
+
+```
+engine/run/gpu_run.sh reuse -- engine/build/engine_reuse <model> <prefill set> <decode set>
 ```
 
 `yah_server_fake` is `yah_server` built without the engine (`YAH_SERVE_FAKE_ONLY`): only `--fake`, no libhrx. The default server is `yah_server` next to the test, which links libhrx: source `engine/hrx-env.sh` first. `--fake` reads only the tokenizer, so `<model>` can be the tokenizer-only cut `python3 engine/tests/make_tokenizer_fixture.py <model path or URL> <out.hfq>` makes (~14 MB; from a URL it fetches only the metadata ranges). `engine/tests/verify_tokenizer.py --model` takes it too. The CPU CI (`.github/workflows/cpu.yml`) runs both on that cut once the repository variable `YAH_MODEL_URL` names the model's download URL; without it the job only builds.

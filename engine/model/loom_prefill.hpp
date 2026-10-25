@@ -76,6 +76,11 @@ class LoomPrefill {
     Zero(*conv_state_);
     Zero(*state_);
   }
+  // The recurrent state (conv rings, DeltaNet states) that chunks carry forward and DecoderState() hands on.
+  [[nodiscard]] hrx_buffer_ref_t conv_state() const { return Ref(*conv_state_); }
+  [[nodiscard]] hrx_buffer_ref_t delta_state() const { return Ref(*state_); }
+  // fpsparse sets keep block means that a resumed sequence would not rebuild.
+  [[nodiscard]] bool fpsparse() const { return fps_on_; }
 
   // Stage ids[0..n) for the next RunLayers, whose first kernel (yah_embed) writes their token_embd rows into hidden().
   // n < B pads the chunk with the last token.

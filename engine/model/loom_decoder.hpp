@@ -148,6 +148,10 @@ class LoomDecoder {
   [[nodiscard]] hrx_buffer_ref_t OpenTile(std::uint32_t ai) const { return vopen_.at(ai); }
   // The next Step may start at pos even inside a tile: the open tiles hold that tile's earlier keys (seeded).
   void ResumeAt(std::uint32_t pos) { next_pos_ = pos; }
+  // The conv state the next step reads (the ping-pong buffer the last step wrote); the DeltaNet state is in place.
+  [[nodiscard]] hrx_buffer_ref_t conv_state() const {
+    return {cs_[cs_cur_], 0, std::size_t{recurrent_layers()} * kConvState * 4};
+  }
   // Quantized pool bytes per layer (gen_kvq.py layouts).
   std::size_t KqBytes() const { return std::size_t{T_} * (kbits_ == 4 ? 512 : 1024); }
   std::size_t KsBytes() const { return std::size_t{T_} * (kbits_ == 4 ? 128 : 32); }

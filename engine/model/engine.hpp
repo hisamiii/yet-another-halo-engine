@@ -2,6 +2,11 @@
 // Generate() calls one at a time: prefill the prompt in chunks, then decode.
 // A prompt that ends inside a chunk finishes either with a padded (masked) chunk or with decode steps, whichever the
 // measured costs say is faster for its tail.
+// Multi-turn reuse: a prompt that starts with the previous request's tokens (prompt and output) resumes at the last
+// chunk boundary of that shared prefix whose recurrent state a snapshot slot holds; the KV rows below it are still in
+// the pools. One slot is taken in the prefill just short of the prompt's end (a thinking turn's history drops its
+// reasoning, so the next prompt leaves this one's tokens at its assistant header), the other at the last boundary the
+// decode crossed (a no-think turn's history keeps its answer). YAH_NO_REUSE=1 turns it off.
 #ifndef YAH_MODEL_ENGINE_HPP_
 #define YAH_MODEL_ENGINE_HPP_
 
@@ -53,6 +58,12 @@ class Engine : public TextGenerator {
     gpu_.SetSleepSync(200);
     logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
     seed_ = gpu_.Allocate(8);
+    reuse_ = !prefill_.fpsparse() && !std::getenv("YAH_NO_REUSE");
+    if (reuse_)
+      for (Snapshot& s : snaps_) {
+        s.conv = gpu_.Allocate(prefill_.conv_state().length);
+        s.delta = gpu_.Allocate(prefill_.delta_state().length);
+      }
     const void* th = nullptr;
     tokens_mirror_ = gpu_.AllocateHost((std::size_t{decoder_.context()} + 1) * 4, &th);
     tokens_host_ = static_cast<const std::uint32_t*>(th);
@@ -66,12 +77,24 @@ class Engine : public TextGenerator {
 
   GenerateResult Generate(const std::vector<core::TokenId>& prompt, const GenerateParams& params,
                           const std::function<bool(core::TokenId)>& on_token) override {
-    const auto t0 = std::chrono::steady_clock::now();
-    const std::uint32_t n = static_cast<std::uint32_t>(prompt.size());
+    const std::size_t n = prompt.size();
     if (n == 0) throw LoomError("engine: empty prompt");
     for (core::TokenId id : prompt)
       if (id >= LoomPrefill::kVocab) throw LoomError("engine: token id outside the vocabulary");
     if (std::uint64_t{n} + params.max_tokens > context()) throw LoomError("engine: prompt + max_tokens exceeds context");
+    try {
+      return Run(prompt, params, on_token);
+    } catch (...) {
+      Forget();   // the pools and slots may hold a half-run sequence
+      throw;
+    }
+  }
+
+ private:
+  GenerateResult Run(const std::vector<core::TokenId>& prompt, const GenerateParams& params,
+                     const std::function<bool(core::TokenId)>& on_token) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint32_t n = static_cast<std::uint32_t>(prompt.size());
     GenerateResult r;
     r.prompt_tokens = n;
     const std::uint64_t seed =
@@ -84,18 +107,38 @@ class Engine : public TextGenerator {
       gpu_.Synchronize();
       decoder_.SetTokens(prompt.data(), n, 0);
     }
+    // Reuse: the slot with the deepest boundary inside the prefix shared with the cached sequence (below n: the last
+    // prompt token must run for its logits). Slots past the shared prefix hold another sequence's state.
+    const std::uint32_t B = prefill_.chunk(), full = n / B * B, tail = n - full;
+    std::uint32_t shared = 0;
+    while (shared < seq_.size() && shared < n && seq_[shared] == prompt[shared]) ++shared;
+    int src = -1;
+    for (int i = 0; i < 2; ++i) {
+      if (snaps_[i].at > shared) snaps_[i].at = 0;
+      if (snaps_[i].at && snaps_[i].at < n && (src < 0 || snaps_[i].at > snaps_[src].at)) src = i;
+    }
+    const std::uint32_t from = src >= 0 ? snaps_[src].at : 0;
+    r.cached_tokens = from;
+    seq_.assign(prompt.begin(), prompt.end());
+    // The prefill slot: the last boundary kMargin tokens short of the prompt's end. The decode slot is the other one.
+    const std::uint32_t at_prefill = reuse_ && n > kMargin ? (n - kMargin) / B * B : 0;
+    const int xs = src < 0 ? 0 : at_prefill <= from ? src : 1 - src, ys = 1 - xs;
+    if (src >= 0) {
+      gpu_.Copy(Ref(snaps_[src].conv), prefill_.conv_state());
+      gpu_.Copy(Ref(snaps_[src].delta), prefill_.delta_state());
+    } else {
+      prefill_.Reset();
+    }
+    decoder_.Bind(prefill_.DecoderState());
     // Prompt: whole chunks through the prefill; the tail as one more partial chunk or through decode steps, whichever
     // the measured costs say is cheaper (a partial chunk runs only the GEMM token tiles that hold its tokens).
-    prefill_.Reset();
-    decoder_.Bind(prefill_.DecoderState());
-    const std::uint32_t B = prefill_.chunk(), full = n / B * B, tail = n - full;
     const bool tail_chunk =
         tail && (tail_ == Tail::kChunk || (tail_ == Tail::kAuto && tail * step_ms_ > chunk_ms_ * ChunkShare(tail)));
     const std::uint32_t chunks = full / B + (tail_chunk ? 1 : 0);
     // The host queues every chunk without waiting: one chunk costs the whole prefill's time over its chunks' shares.
     const auto tp = std::chrono::steady_clock::now();
     double shares = 0.0;
-    for (std::uint32_t c = 0; c < chunks; ++c) {
+    for (std::uint32_t c = from / B; c < chunks; ++c) {
       const std::uint32_t valid = std::min(B, n - c * B);
       shares += ChunkShare(valid);
       prefill_.Embed(prompt.data() + std::size_t{c} * B, valid);
@@ -112,6 +155,7 @@ class Engine : public TextGenerator {
       const bool head = c + 1 == chunks && (tail_chunk || tail == 0);
       prefill_.RunLayers(c, hook, head ? std::int64_t{valid} - 1 : LoomPrefill::kNoRows, head);
       if (c + 1 == chunks && (tail_chunk || tail == 0)) prefill_.Head(valid - 1, Ref(logits_));
+      if (at_prefill > from && (c + 1) * B == at_prefill) Save(xs, at_prefill, prefill_.conv_state());
       if (c + 1 == chunks) {
         gpu_.Synchronize();
         Track(chunk_ms_, (std::chrono::steady_clock::now() - tp) / shares, true);
@@ -144,6 +188,7 @@ class Engine : public TextGenerator {
     for (std::uint32_t pos = n;; ++pos) {
       for (; queued < pos + kAhead && queued + 1 < n + params.max_tokens && queued < decoder_.context(); ++queued) {
         decoder_.Step(queued, n);
+        if (reuse_ && (queued + 1) % B == 0) Save(ys, queued + 1, decoder_.conv_state());
         made.push_back(MarkToken(queued + 1));
       }
       if (made.empty()) throw LoomError("decoder: position past the set's context");
@@ -151,6 +196,7 @@ class Engine : public TextGenerator {
       made.pop_front();
       const core::TokenId tok = __atomic_load_n(&tokens_host_[pos], __ATOMIC_ACQUIRE);
       if (tok >= LoomDecoder::kVocab) throw LoomError("decoder: token id out of range: " + std::to_string(tok));
+      seq_.push_back(tok);   // the step at pos + 1, if queued, consumed it
       if (pos == n) {   // the first token: the prompt's time ends here
         if (tail_steps) Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
         t1 = std::chrono::steady_clock::now();
@@ -168,12 +214,33 @@ class Engine : public TextGenerator {
       if (r.generated_tokens >= params.max_tokens) break;
     }
     r.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    // A slot the steps queued past the stop wrote covers tokens the host never read.
+    for (Snapshot& s : snaps_)
+      if (s.at > seq_.size()) s.at = 0;
     if (r.generated_tokens > 1) step_ms_ = 0.8 * step_ms_ + 0.2 * r.decode_ms / (r.generated_tokens - 1);
     return r;
   }
 
- private:
   static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
+  // The prefill slot sits this many tokens short of the prompt's end: the next turn's history replaces the assistant
+  // header's tail (<think> and the like).
+  static constexpr std::uint32_t kMargin = 32;
+  // The recurrent state at sequence position at (0: empty); the KV rows below it stay in the pools.
+  struct Snapshot {
+    LoomBuffer conv, delta;
+    std::uint32_t at = 0;
+  };
+  // Snapshot the recurrent state in stream order (after the work queued so far): conv from the given buffer, the
+  // DeltaNet state from the prefill's in-place one.
+  void Save(int slot, std::uint32_t at, const hrx_buffer_ref_t& conv) {
+    gpu_.Copy(conv, Ref(snaps_[slot].conv));
+    gpu_.Copy(prefill_.delta_state(), Ref(snaps_[slot].delta));
+    snaps_[slot].at = at;
+  }
+  void Forget() {
+    seq_.clear();
+    for (Snapshot& s : snaps_) s.at = 0;
+  }
   // Decode steps queued ahead of the token the host reads: the next step is queued while the current one runs.
   static constexpr std::uint32_t kAhead = 2;
   // Copies token pos of the decoder's stream to tokens_host_ and marks it.
@@ -204,6 +271,9 @@ class Engine : public TextGenerator {
   LoomBuffer tokens_mirror_;                    // host-local copy of the decoder's token stream (MarkToken)
   const std::uint32_t* tokens_host_ = nullptr;  // its mapping
   Tail tail_ = Tail::kAuto;
+  bool reuse_ = false;
+  Snapshot snaps_[2];
+  std::vector<core::TokenId> seq_;   // the tokens the pools and slots were computed from (prompt, then the output read)
   double chunk_ms_ = 3100.0, step_ms_ = 62.0;  // prefill chunk and decode step costs (pp2048, short context)
   std::string name_;
 };

@@ -47,8 +47,12 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
     "$root/engine/third_party/httplib/httplib.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
+# GPU test of the engine's multi-turn reuse.
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/tests/engine_reuse.cc" \
+    -o "$root/engine/build/engine_reuse" "$root/engine/build/libyah_core.a" \
+    -L"$libhrx" -lhrx -licuuc -lpthread
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"
 fi
-echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,yah_server} (and the CMake targets)"
+echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,yah_server,engine_reuse} (and the CMake targets)"

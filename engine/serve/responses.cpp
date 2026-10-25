@@ -333,7 +333,7 @@ bool ResponseStream::Finish(const model::GenerateResult& result) {
   status_ = result.finish_reason == "length" ? "incomplete" : "completed";
   if (message_open_) CloseMessage();
   usage_ = {{"input_tokens", result.prompt_tokens},
-            {"input_tokens_details", {{"cached_tokens", 0}, {"cache_write_tokens", 0}}},
+            {"input_tokens_details", {{"cached_tokens", result.cached_tokens}, {"cache_write_tokens", 0}}},
             {"output_tokens", result.generated_tokens},
             {"output_tokens_details", {{"reasoning_tokens", parser_.reasoning_tokens()}}},
             {"total_tokens", result.prompt_tokens + result.generated_tokens}};
