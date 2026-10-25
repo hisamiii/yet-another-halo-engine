@@ -18,39 +18,41 @@ libhrx="$H/libhrx/src/libhrx"
 
 # Host code: clang, -O3 -march=native. -ffp-contract=off keeps host float results the same as
 # without FMA, so outputs stay bit-identical across compilers and flags.
+# Release builds (engine/release/build.sh) set CXX, YAH_MARCH (znver5: every gfx1151 host) and YAH_LDFLAGS.
 CXX="${CXX:-clang++}"
-cxxflags=(-std=c++20 -O3 -march=native -ffp-contract=off)
+cxxflags=(-std=c++20 -O3 -march="${YAH_MARCH:-native}" -ffp-contract=off)
+read -ra ldflags <<< "${YAH_LDFLAGS:-}"
 cache="$root/engine/build/CMakeCache.txt"
 if [ -f "$cache" ] && ! grep -q "^CMAKE_CXX_COMPILER:[A-Z]*=$(command -v "$CXX")$" "$cache"; then
   rm -rf "$cache" "$root/engine/build/CMakeFiles"  # the compiler changed: CMake needs a fresh configure
 fi
 cmake -S "$root/engine" -B "$root/engine/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$(command -v "$CXX")" \
-    -DCMAKE_CXX_FLAGS_RELEASE="${cxxflags[*]:1}" >/dev/null
+    -DCMAKE_CXX_FLAGS_RELEASE="${cxxflags[*]:1}" -DCMAKE_EXE_LINKER_FLAGS="${YAH_LDFLAGS:-}" >/dev/null
 cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # The runners below are not CMake targets. Build them here so a stale binary never runs against a new HAL set.
 # Prefill driver.
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_forward_pp.cc" \
     -o "$root/engine/build/loom_forward_pp" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
+    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # Decode driver (tools/emit_decode.py sets).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
     -o "$root/engine/build/loom_decode" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
+    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # One-dispatch correctness harness for generated kernels (the tools/*_check.py oracles).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
     -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
+    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # The Responses API server (engine/serve).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" \
     "$root/engine/serve/yah_server.cc" "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
     "$root/engine/serve/chat_completions.cpp" \
     "$root/engine/third_party/httplib/httplib.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
+    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # GPU test of the engine's multi-turn reuse.
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/tests/engine_reuse.cc" \
     -o "$root/engine/build/engine_reuse" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
+    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"

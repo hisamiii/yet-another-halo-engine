@@ -1,6 +1,8 @@
 // yah_server: the OpenAI Responses API (POST /v1/responses) and Chat Completions API (POST /v1/chat/completions)
 // over one TextGenerator, one generation at a time.
 // Built with YAH_SERVE_FAKE_ONLY (the CMake target yah_server_fake) it has only --fake: no Engine, no HRX, no GPU.
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -31,11 +33,22 @@ using namespace yah::serve;
 
 int Usage() {
   std::fprintf(stderr,
-               "usage: yah_server --model <model> --prefill <hal set> --decode <hal set> [--host 127.0.0.1] "
+               "usage: yah_server --model <model> [--prefill <hal set> --decode <hal set>] [--host 127.0.0.1] "
                "[--port 8080]\n"
-               "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n");
+               "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
+               "In a release bundle the HAL sets default to the bundle's hal/prefill and hal/decode.\n");
   return 2;
 }
+
+// The release bundle (engine/release/bundle.sh): bin/yah_server beside lib/ (libhrx, the HSA runtime) and hal/.
+std::string BundleDir() {
+  char path[4096];
+  const ssize_t n = ::readlink("/proc/self/exe", path, sizeof path - 1);
+  if (n <= 0) return {};
+  const std::string exe(path, static_cast<std::size_t>(n));
+  return exe.substr(0, exe.rfind('/')) + "/..";
+}
+bool Exists(const std::string& path) { return ::access(path.c_str(), R_OK) == 0; }
 
 class Server {
  public:
@@ -212,6 +225,12 @@ int main(int argc, char** argv) {
       return Usage();
     }
   }
+  const std::string bundle = BundleDir();
+  if (!fake && prefill.empty() && Exists(bundle + "/hal/prefill/dispatch.txt")) prefill = bundle + "/hal/prefill";
+  if (!fake && decode.empty() && Exists(bundle + "/hal/decode/decode.txt")) decode = bundle + "/hal/decode";
+  // libhrx loads the HSA runtime from this directory: the bundle's own copy unless the caller picked one.
+  if (!std::getenv("IREE_HAL_AMDGPU_LIBHSA_PATH") && Exists(bundle + "/lib/libhsa-runtime64.so.1"))
+    ::setenv("IREE_HAL_AMDGPU_LIBHSA_PATH", (bundle + "/lib").c_str(), 1);
   if (model.empty() || (!fake && (prefill.empty() || decode.empty()))) return Usage();
 
   try {

@@ -124,9 +124,11 @@ if [ ! -f "$build/CMakeCache.txt" ]; then
     -DLOOM_BUILD=ON -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults
 fi
 # What the engine uses: the runtime, its HIP binding, the HAL emitter, the compiler (compile reports) and the profiler.
-ninja -C "$build" libhrx/src/libhrx/libhrx.so libhrx/src/binding/hip/libamdhip64.so \
+# YAH_HRX_TARGETS overrides the list (a release build needs only libhrx/src/libhrx/libhrx.so).
+read -ra targets <<< "${YAH_HRX_TARGETS:-libhrx/src/libhrx/libhrx.so libhrx/src/binding/hip/libamdhip64.so \
   loom/src/loom/tools/iree-run-loom/iree-run-loom loom/src/loom/tools/loom-compile/loom-compile \
-  runtime/src/iree/tools/iree-profile/iree-profile
+  runtime/src/iree/tools/iree-profile/iree-profile}"
+ninja -C "$build" ${YAH_HRX_JOBS:+-j"$YAH_HRX_JOBS"} "${targets[@]}"
 status=0
 check || status=$?
 drop_expected

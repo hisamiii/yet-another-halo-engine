@@ -1,0 +1,44 @@
+# Release binaries: engine/release/build.sh on Ubuntu 24.04 (glibc 2.39, the oldest the bundle runs on) builds libhrx at
+# the pin, the serving binaries and their bundle without HAL sets, uploaded as an artifact (a tarball: artifacts drop
+# file modes). The HAL sets go in on a gfx1151 box, which also runs the smoke test (docs/build-and-run.md, Release).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: version in the bundle's name
+        required: true
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-14 libicu-dev patchelf \
+            libdrm2 libelf1t64 libnuma1 zlib1g libzstd1 liblzma5 libbz2-1.0
+
+      - name: ROCm packages (cache)
+        uses: actions/cache@v6
+        with:
+          path: external/rocm10/*.deb
+          key: rocm10-${{ hashFiles('engine/hrx-env.sh') }}
+
+      - name: build
+        run: engine/release/build.sh "$VERSION" out
+
+      - name: tarball
+        run: tar -C out -cJf "yah-$VERSION-gfx1151-nohal.tar.xz" "yah-$VERSION-gfx1151"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yah-${{ env.VERSION }}-gfx1151-nohal
+          path: yah-${{ env.VERSION }}-gfx1151-nohal.tar.xz

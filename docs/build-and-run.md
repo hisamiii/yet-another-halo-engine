@@ -173,6 +173,22 @@ engine/run/gpu_run.sh reuse -- engine/build/engine_reuse <model> <prefill set> <
 
 It checks the C++ chat template byte for byte against `engine/serve/testdata/chat_template_cases.json`, then starts `yah_server --fake` on a free port and checks the response object and stream event shapes (the required fields of the openai SDK models), event order, deltas, `max_output_tokens`, the 400 error objects and client disconnect. The fixture was frozen from jinja2 on 2026-10-02 against the GGUF's template; regenerating it is not supported in-tree.
 
+## Release
+
+A release is one tarball, `yah-<version>-gfx1151.tar.xz`. It holds `yah_server` and `yah_chat`, every library they load (libhrx, ICU, the ROCm 10 HSA runtime and its sysdeps; RPATH `$ORIGIN/../lib`), the 32K kv8 HAL sets and the licenses. It needs glibc 2.39 and no ROCm or root. `yah_server` takes the HAL sets from the bundle's `hal/` and the HSA runtime from its `lib/` when the options and `IREE_HAL_AMDGPU_LIBHSA_PATH` don't name others; `engine/release/README.md` is the bundle's README.
+
+1. CI (`.github/workflows/release.yml`, on a `v*` tag or by hand with a version) runs `engine/release/build.sh` on Ubuntu 24.04. It builds libhrx at the pin, then the binaries with g++-14, `-march=znver5` and static libstdc++, and bundles them without HAL sets (artifact `yah-<version>-gfx1151-nohal`).
+2. On a gfx1151 box: emit the serve sets (Serving above), add them, run the smoke test, pack:
+
+```
+gh run download <run id> -n yah-<version>-gfx1151-nohal && tar -xJf yah-<version>-gfx1151-nohal.tar.xz
+python3 engine/release/bundle.py hal yah-<version>-gfx1151 <prefill set> <decode set>
+python3 engine/release/smoke.py yah-<version>-gfx1151 <model>     # ~2 min on the GPU
+python3 engine/release/bundle.py pack yah-<version>-gfx1151       # checks it is self-contained, then the tarball
+```
+
+`smoke.py` starts the bundle's server with only `HOME` and `PATH` set: chat completions plain and streamed, Responses, sampling with penalties, cache reuse on a follow-up. `bundle.py pack` checks every ELF in the bundle resolves its libraries inside it with a clean environment and prints the glibc it needs.
+
 ## Correctness
 
 | tool | what it checks | when |
