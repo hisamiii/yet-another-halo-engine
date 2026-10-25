@@ -16,17 +16,20 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "httplib/httplib.h"
 #include "serve/chat_template.hpp"
 #include "serve/fake_generator.hpp"
+#include "serve/http.hpp"
 #include "serve/responses.hpp"
 
 namespace {
+
+namespace http = yah::serve::http;
 
 using namespace yah::serve;
 
@@ -53,7 +56,7 @@ void CheckEq(const Json& got, const Json& want, const std::string& what) {
 int CheckChatTemplate(const std::filesystem::path& fixture, int* total) {
   std::ifstream in(fixture);
   if (!in) throw Failure("cannot open " + fixture.string());
-  const Json cases = Json::parse(in);
+  const Json cases = Json::parse(std::string(std::istreambuf_iterator<char>(in), {}));
   *total = static_cast<int>(cases.size());
   int passed = 0;
   for (const Json& c : cases) {
@@ -391,9 +394,9 @@ class Tester {
   };
 
   Reply Request(const std::string& method, const std::string& path, const std::string& body = "") {
-    httplib::Result res = method == "GET" ? client_.Get(path) : client_.Post(path, body, "application/json");
-    Check(static_cast<bool>(res), method + " " + path + ": " + httplib::to_string(res.error()));
-    return {res->status, res->get_header_value("Content-Type"), res->body};
+    const http::Result res = method == "GET" ? client_.Get(path) : client_.Post(path, body, "application/json");
+    Check(static_cast<bool>(res), method + " " + path + ": " + http::ToString(res.error));
+    return {res.status, res.Header("Content-Type"), res.body};
   }
 
   // POST /v1/responses that must succeed: checks the raw JSON against the SDK's Response model.
@@ -952,15 +955,15 @@ class Tester {
   void Disconnect(ServerProcess& server) {
     std::string received;
     int events = 0;
-    const httplib::Result res =
-        client_.Post("/v1/responses", httplib::Headers(), Dump({{"model", "m"}, {"input", "Hi"}, {"stream", true}}),
-                     "application/json", [&](const char* data, std::size_t n) {
+    const http::Result res =
+        client_.Post("/v1/responses", Dump({{"model", "m"}, {"input", "Hi"}, {"stream", true}}), "application/json", {},
+                     [&](const char* data, std::size_t n) {
                        received.append(data, n);
                        events = 0;
                        for (std::size_t p = 0; (p = received.find("\n\n", p)) != std::string::npos; p += 2) ++events;
                        return events < 4;
                      });
-    Check(!res && res.error() == httplib::Error::Canceled, "disconnect: the request was not cancelled");
+    Check(!res && res.error == http::Result::Error::kCanceled, "disconnect: the request was not cancelled");
     Check(received.starts_with("event: response.created\n"), "disconnect: not a stream: " + received.substr(0, 200));
     // Requests run one at a time, so the cancelled one has logged by the time this one returns.
     CheckFull(Create({{"model", "m"}, {"input", "Hi"}}, "after disconnect"), "high", "after disconnect");
@@ -968,7 +971,7 @@ class Tester {
           "disconnect: the server did not log finish=cancelled");
   }
 
-  httplib::Client client_;
+  http::Client client_;
 };
 
 }  // namespace
@@ -997,11 +1000,11 @@ int main(int argc, char** argv) {
   const int port = FreePort();
   ServerProcess server(exe, model, port);
   try {
-    httplib::Client health("127.0.0.1", port);
+    http::Client health("127.0.0.1", port);
     bool up = false;
     for (int i = 0; i < 300 && !up && !server.Exited(); ++i) {
-      const httplib::Result res = health.Get("/health");
-      up = res && res->status == 200;
+      const http::Result res = health.Get("/health");
+      up = res && res.status == 200;
       if (!up) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (!up) throw Failure("yah_server did not come up on port " + std::to_string(port));

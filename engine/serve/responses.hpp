@@ -12,12 +12,12 @@
 #include <vector>
 
 #include "model/generator.hpp"
-#include "nlohmann/json.hpp"
 #include "serve/chat_template.hpp"
+#include "core/json.hpp"
 
 namespace yah::serve {
 
-using Json = nlohmann::ordered_json;
+using core::Json;
 
 // Serializes with invalid UTF-8 replaced by U+FFFD instead of throwing.
 [[nodiscard]] std::string Dump(const Json& value);

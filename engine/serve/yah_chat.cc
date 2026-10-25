@@ -14,12 +14,12 @@
 #include <string>
 #include <vector>
 
-#include "httplib/httplib.h"
-#include "nlohmann/json.hpp"
+#include "serve/http.hpp"
+#include "core/json.hpp"
 
 namespace {
 
-using Json = nlohmann::ordered_json;
+using yah::core::Json;
 using Clock = std::chrono::steady_clock;
 
 constexpr const char* kDim = "\033[2m";
@@ -81,7 +81,7 @@ struct Turn {
   std::string error;
 };
 
-Turn Send(httplib::Client& client, const Json& body) {
+Turn Send(yah::serve::http::Client& client, const Json& body) {
   Turn turn;
   SseParser sse;
   std::string raw;  // the body, for error replies
@@ -102,8 +102,8 @@ Turn Send(httplib::Client& client, const Json& body) {
       turn.final = d["response"];
     }
   };
-  const httplib::Headers headers = {{"Accept", "text/event-stream"}};
-  auto res = client.Post("/v1/responses", headers, body.dump(), "application/json", [&](const char* data, size_t n) {
+  const yah::serve::http::Headers headers = {{"Accept", "text/event-stream"}};
+  auto res = client.Post("/v1/responses", body.dump(), "application/json", headers, [&](const char* data, size_t n) {
     if (raw.size() < 65536) raw.append(data, n);
     try {
       sse.Feed(data, n, on_event);
@@ -116,10 +116,10 @@ Turn Send(httplib::Client& client, const Json& body) {
   if (in_reasoning) std::fputs(kReset, stdout);
   if (g_interrupted.load()) {
     turn.error = "interrupted";
-  } else if (!res) {
-    turn.error = "cannot reach the server: " + httplib::to_string(res.error());
-  } else if (res->status != 200) {
-    turn.error = "error " + std::to_string(res->status) + ": " + raw;
+  } else if (!res && turn.error.empty()) {
+    turn.error = "cannot reach the server: " + std::string(yah::serve::http::ToString(res.error));
+  } else if (res && res.status != 200) {
+    turn.error = "error " + std::to_string(res.status) + ": " + raw;
   } else if (!turn.final && turn.error.empty()) {
     turn.error = "the stream ended without a final response";
   }
@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
       return Usage();
     }
   }
-  httplib::Client client(o.url);
+  yah::serve::http::Client client(o.url);
   client.set_read_timeout(3600);  // a long reasoning reply can stream for minutes
   // No SA_RESTART: Ctrl-C at the prompt makes getline fail, so the client exits; during a reply it stops the reply.
   struct sigaction sa = {};

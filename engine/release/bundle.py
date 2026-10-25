@@ -13,7 +13,7 @@ The bundle:
   lib/        libhrx, ICU, the HSA runtime with librocprofiler-register and the ROCm sysdeps it loads (in
               lib/rocm_sysdeps/lib, where the HSA runtime's own RPATH looks)
   hal/        prefill/ and decode/ (yah_server's defaults)
-  licenses/   this repository's, HRX's, cpp-httplib's, the ROCm parts', ICU's and the sysdeps' (--licenses: extra files)
+  licenses/   this repository's, HRX's, the ROCm parts', ICU's and the sysdeps' (--licenses: extra files)
   README.md   engine/release/README.md
 
 build must run where the binaries were built: it copies the libraries they resolve there (ldd), so build them on the
@@ -109,7 +109,6 @@ def build(out, version, licenses):
     lic = os.path.join(b, "licenses")
     os.makedirs(lic)
     for src, name in ((os.path.join(ROOT, "LICENSE"), "yah.txt"), (os.path.join(ROOT, "external", "hrx", "LICENSE"), "hrx.txt"),
-                      (os.path.join(ROOT, "engine", "third_party", "httplib", "LICENSE"), "cpp-httplib.txt"),
                       (os.path.join(rocm_prefix(), "share", "doc", "rocprofiler-register", "LICENSE.md"),
                        "rocprofiler-register.md")):
         shutil.copy(src, os.path.join(lic, name))

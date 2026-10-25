@@ -66,10 +66,10 @@ fi
     -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # The Responses API server (engine/serve).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" "${npu_flags[@]}" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" \
     "$root/engine/serve/yah_server.cc" "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
     "$root/engine/serve/chat_completions.cpp" \
-    "$root/engine/third_party/httplib/httplib.cpp" \
+    "$root/engine/serve/http.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
     "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # GPU test of the engine's multi-turn reuse.

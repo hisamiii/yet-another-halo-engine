@@ -19,12 +19,10 @@
 #include <vector>
 
 #include "core/gguf.hpp"
-#include "nlohmann/json.hpp"
+#include "core/json.hpp"
 
 namespace yah::core {
 namespace {
-
-using Json = nlohmann::json;
 
 constexpr std::uint32_t kOverlayFlag = 0x80000000U;
 constexpr std::uint8_t kQtF16 = 1, kQtQ8_0 = 3, kQtMQ4 = 44;
@@ -115,15 +113,15 @@ std::map<std::string, MetadataValue> Metadata(const Json& meta) {
   const Json gen = Sub(meta, "generation_config");
   std::map<std::string, MetadataValue> m;
   const std::string a = "qwen35.";
-  const std::uint32_t head_dim = t["head_dim"];
+  const auto head_dim = t["head_dim"].get<std::uint32_t>();
   m["general.architecture"] = Str("qwen35");
   m["general.name"] = Str("Qwen3.8 27B");
-  m[a + "block_count"] = UInt(t["num_hidden_layers"]);
-  m[a + "context_length"] = UInt(t["max_position_embeddings"]);
-  m[a + "embedding_length"] = UInt(t["hidden_size"]);
-  m[a + "feed_forward_length"] = UInt(t["intermediate_size"]);
-  m[a + "attention.head_count"] = UInt(t["num_attention_heads"]);
-  m[a + "attention.head_count_kv"] = UInt(t["num_key_value_heads"]);
+  m[a + "block_count"] = UInt(t["num_hidden_layers"].get<std::uint64_t>());
+  m[a + "context_length"] = UInt(t["max_position_embeddings"].get<std::uint64_t>());
+  m[a + "embedding_length"] = UInt(t["hidden_size"].get<std::uint64_t>());
+  m[a + "feed_forward_length"] = UInt(t["intermediate_size"].get<std::uint64_t>());
+  m[a + "attention.head_count"] = UInt(t["num_attention_heads"].get<std::uint64_t>());
+  m[a + "attention.head_count_kv"] = UInt(t["num_key_value_heads"].get<std::uint64_t>());
   m[a + "attention.key_length"] = UInt(head_dim);
   m[a + "attention.value_length"] = UInt(head_dim);
   m[a + "attention.layer_norm_rms_epsilon"] = Float(static_cast<float>(t["rms_norm_eps"].get<double>()));
@@ -131,28 +129,28 @@ std::map<std::string, MetadataValue> Metadata(const Json& meta) {
   m[a + "rope.dimension_count"] =
       UInt(static_cast<std::uint64_t>(head_dim * rope["partial_rotary_factor"].get<double>()));
   m[a + "rope.freq_base"] = Float(static_cast<float>(rope["rope_theta"].get<double>()));
-  m[a + "full_attention_interval"] = UInt(t["full_attention_interval"]);
+  m[a + "full_attention_interval"] = UInt(t["full_attention_interval"].get<std::uint64_t>());
   m[a + "nextn_predict_layers"] = UInt(0);  // the container has no MTP tensors
-  m[a + "ssm.conv_kernel"] = UInt(t["linear_conv_kernel_dim"]);
-  m[a + "ssm.state_size"] = UInt(t["linear_key_head_dim"]);
-  m[a + "ssm.group_count"] = UInt(t["linear_num_key_heads"]);
-  m[a + "ssm.time_step_rank"] = UInt(t["linear_num_value_heads"]);
+  m[a + "ssm.conv_kernel"] = UInt(t["linear_conv_kernel_dim"].get<std::uint64_t>());
+  m[a + "ssm.state_size"] = UInt(t["linear_key_head_dim"].get<std::uint64_t>());
+  m[a + "ssm.group_count"] = UInt(t["linear_num_key_heads"].get<std::uint64_t>());
+  m[a + "ssm.time_step_rank"] = UInt(t["linear_num_value_heads"].get<std::uint64_t>());
   m[a + "ssm.inner_size"] =
       UInt(t["linear_value_head_dim"].get<std::uint64_t>() * t["linear_num_value_heads"].get<std::uint64_t>());
 
   // Tokenizer as the GGUF converter writes it: vocab + added tokens (special: control 3, else user-defined 4), the
   // ids in neither are [PAD<id>] (unused 5).
-  const std::size_t n = t["vocab_size"];
+  const auto n = t["vocab_size"].get<std::size_t>();
   std::vector<MetadataValue> tokens(n), types(n);
   std::vector<bool> seen(n);
   for (const auto& [s, id] : tok["model"]["vocab"].items()) {
-    const std::size_t i = id;
+    const auto i = id.get<std::size_t>();
     tokens[i] = Str(s), types[i] = Int(1), seen[i] = true;
   }
   std::map<std::string, std::uint32_t> added;
   for (const Json& at : tok["added_tokens"]) {
-    const std::size_t i = at["id"];
-    const std::string content = at["content"];
+    const auto i = at["id"].get<std::size_t>();
+    const auto content = at["content"].get<std::string>();
     tokens[i] = Str(content), types[i] = Int(at["special"].get<bool>() ? 3 : 4), seen[i] = true;
     added[content] = static_cast<std::uint32_t>(i);
   }
@@ -164,7 +162,7 @@ std::map<std::string, MetadataValue> Metadata(const Json& meta) {
     merges.push_back(
         Str(mg.is_string() ? mg.get<std::string>() : mg[0].get<std::string>() + " " + mg[1].get<std::string>()));
   const auto id_of = [&](const Json& v) -> std::uint32_t {
-    if (v.is_number()) return v;
+    if (v.is_number()) return v.get<std::uint32_t>();
     const auto it = added.find(v.get<std::string>());
     if (it == added.end()) throw std::runtime_error("hfq: unknown special token " + v.get<std::string>());
     return it->second;
@@ -293,7 +291,7 @@ Gguf Gguf::OpenHfq(const std::string& path, bool lock, bool weights) {
   if (::pread(g.fd_, head.data(), head.size(), static_cast<off_t>(h.meta_off)) != static_cast<ssize_t>(head.size()))
     throw std::runtime_error("hfq: truncated metadata");
   const std::size_t meta_end = JsonEnd(head);
-  const Json meta = Json::parse(head.begin(), head.begin() + static_cast<std::ptrdiff_t>(meta_end));
+  const Json meta = Json::parse(std::string_view(head).substr(0, meta_end));
   if (meta.value("mq4v2.symmetric", 0) != 1) throw std::runtime_error("hfq: only symmetric MQ4G256V2 is supported");
   g.meta_ = Metadata(meta);
 
@@ -333,8 +331,10 @@ Gguf Gguf::OpenHfq(const std::string& path, bool lock, bool weights) {
 
   const Json cfg = Sub(meta, "config");
   const Json& tcfg = cfg.contains("text_config") ? cfg["text_config"] : cfg;
-  const std::uint32_t key_heads = tcfg["linear_num_key_heads"], key_dim = tcfg["linear_key_head_dim"];
-  const std::uint32_t value_heads = tcfg["linear_num_value_heads"], value_dim = tcfg["linear_value_head_dim"];
+  const auto key_heads = tcfg["linear_num_key_heads"].get<std::uint32_t>(),
+             key_dim = tcfg["linear_key_head_dim"].get<std::uint32_t>();
+  const auto value_heads = tcfg["linear_num_value_heads"].get<std::uint32_t>(),
+             value_dim = tcfg["linear_value_head_dim"].get<std::uint32_t>();
   const std::vector<std::uint32_t> order = HeadOrder(value_heads, key_heads);
 
   // Layout: the file as is, then the converted (f32) tensors, 256 B aligned.

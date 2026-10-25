@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 
-#include "httplib/httplib.h"
 #ifndef YAH_SERVE_FAKE_ONLY
 #include "model/engine.hpp"
 #endif
@@ -20,6 +19,7 @@
 #include "serve/chat_completions.hpp"
 #include "serve/chat_template.hpp"
 #include "serve/fake_generator.hpp"
+#include "serve/http.hpp"
 #include "serve/responses.hpp"
 
 namespace {
@@ -30,6 +30,7 @@ using yah::model::GenerateResult;
 using yah::model::SamplingParams;
 using yah::model::TextGenerator;
 using namespace yah::serve;
+namespace http = yah::serve::http;
 
 int Usage() {
   std::fprintf(stderr,
@@ -65,7 +66,7 @@ class Server {
     created_ = std::time(nullptr);
   }
 
-  void Responses(const httplib::Request& req, httplib::Response& res) {
+  void Responses(const http::Request& req, http::Response& res) {
     try {
       const ResponseRequest request = ParseResponseRequest(ParseBody(req));
       SamplingParams sampling;
@@ -79,11 +80,11 @@ class Server {
       Serve<ResponseStream>(request, request.stream, prompt, params, res);
     } catch (const ApiError& error) {
       res.status = error.status;
-      res.set_content(Dump(ErrorBody(error)), "application/json");
+      res.Set(Dump(ErrorBody(error)), "application/json");
     }
   }
 
-  void ChatCompletions(const httplib::Request& req, httplib::Response& res) {
+  void ChatCompletions(const http::Request& req, http::Response& res) {
     try {
       const ChatRequest request = ParseChatRequest(ParseBody(req));
       std::vector<TokenId> prompt;
@@ -93,18 +94,18 @@ class Server {
       Serve<ChatStream>(request, request.stream, prompt, params, res);
     } catch (const ApiError& error) {
       res.status = error.status;
-      res.set_content(Dump(ErrorBody(error)), "application/json");
+      res.Set(Dump(ErrorBody(error)), "application/json");
     }
   }
 
-  void Models(const httplib::Request&, httplib::Response& res) {
+  void Models(const http::Request&, http::Response& res) {
     const Json model = {
         {"id", generator_.model_name()}, {"object", "model"}, {"created", created_}, {"owned_by", "yah"}};
-    res.set_content(Dump({{"object", "list"}, {"data", Json::array({model})}}), "application/json");
+    res.Set(Dump({{"object", "list"}, {"data", Json::array({model})}}), "application/json");
   }
 
  private:
-  static Json ParseBody(const httplib::Request& req) {
+  static Json ParseBody(const http::Request& req) {
     try {
       return Json::parse(req.body);
     } catch (const Json::parse_error& error) {
@@ -148,33 +149,27 @@ class Server {
   // One generation as a JSON body or, with stream, as server-sent events. S: ResponseStream or ChatStream.
   template <class S, class Request>
   void Serve(const Request& request, bool stream, const std::vector<TokenId>& prompt, const GenerateParams& params,
-             httplib::Response& res) {
+             http::Response& res) {
     if (!stream) {
       S s(request, nullptr);
       Run(s, prompt, params);
-      res.set_content(Dump(s.Response()), "application/json");
+      res.Set(Dump(s.Response()), "application/json");
       return;
     }
-    res.set_header("Cache-Control", "no-cache");
-    auto provider = [this, request, prompt, params](std::size_t, httplib::DataSink& sink) {
-      Stream<S>(request, prompt, params, sink);
-      return true;
-    };
-    res.set_chunked_content_provider("text/event-stream", provider);
+    res.headers.emplace_back("Cache-Control", "no-cache");
+    res.content_type = "text/event-stream";
+    res.stream = [this, request, prompt, params](http::Sink& sink) { Stream<S>(request, prompt, params, sink); };
   }
 
   template <class S, class Request>
   void Stream(const Request& request, const std::vector<TokenId>& prompt, const GenerateParams& params,
-              httplib::DataSink& sink) {
-    S stream(request, [&sink](const std::string& event) {
-      return sink.is_writable() && sink.write(event.data(), event.size());
-    });
+              http::Sink& sink) {
+    S stream(request, [&sink](const std::string& event) { return sink.Alive() && sink.Write(event); });
     try {
       Run(stream, prompt, params);
     } catch (const std::exception& error) {
       stream.Fail(error.what());
     }
-    sink.done();
   }
 
   template <class S>
@@ -281,35 +276,23 @@ int main(int argc, char** argv) {
 #endif
     }
     Server server(*generator);
-    httplib::Server http;
-    http.Post("/v1/responses",
-              [&](const httplib::Request& req, httplib::Response& res) { server.Responses(req, res); });
-    http.Post("/v1/chat/completions",
-              [&](const httplib::Request& req, httplib::Response& res) { server.ChatCompletions(req, res); });
-    http.Get("/v1/models", [&](const httplib::Request& req, httplib::Response& res) { server.Models(req, res); });
-    http.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-      res.set_content(R"({"status":"ok"})", "application/json");
-    });
-    http.set_error_handler([](const httplib::Request&, httplib::Response& res) {
-      if (!res.body.empty()) return httplib::Server::HandlerResponse::Unhandled;
+    http::Server web;
+    web.Post("/v1/responses", [&](const http::Request& req, http::Response& res) { server.Responses(req, res); });
+    web.Post("/v1/chat/completions",
+             [&](const http::Request& req, http::Response& res) { server.ChatCompletions(req, res); });
+    web.Get("/v1/models", [&](const http::Request& req, http::Response& res) { server.Models(req, res); });
+    web.Get("/health", [](const http::Request&, http::Response& res) { res.Set(R"({"status":"ok"})", "application/json"); });
+    web.on_error = [](http::Response& res) {
       const ApiError error(res.status, res.status == 404 ? "Not found." : "HTTP error " + std::to_string(res.status));
-      res.set_content(Dump(ErrorBody(error)), "application/json");
-      return httplib::Server::HandlerResponse::Handled;
-    });
-    http.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
-      std::string message = "internal error";
-      try {
-        std::rethrow_exception(ep);
-      } catch (const std::exception& error) {
-        message = error.what();
-      } catch (...) {
-      }
+      res.Set(Dump(ErrorBody(error)), "application/json");
+    };
+    web.on_exception = [](http::Response& res, const std::string& message) {
       res.status = 500;
-      res.set_content(Dump(ErrorBody(ApiError(500, message, "", "server_error", "server_error"))), "application/json");
-    });
+      res.Set(Dump(ErrorBody(ApiError(500, message, "", "server_error", "server_error"))), "application/json");
+    };
     std::fprintf(stderr, "yah_server: %s%s on http://%s:%d\n", generator->model_name().c_str(), fake ? " (fake)" : "",
                  host.c_str(), port);
-    if (!http.listen(host, port)) {
+    if (!web.Listen(host, port)) {
       std::fprintf(stderr, "yah_server: cannot listen on %s:%d\n", host.c_str(), port);
       return 1;
     }
