@@ -16,6 +16,7 @@ LIBHSA = os.path.join(PREFIX, "lib")
 
 IREE_RUN_LOOM = os.path.join(BUILD, "loom/src/loom/tools/iree-run-loom/iree-run-loom")
 LOOM_COMPILE = os.path.join(BUILD, "loom/src/loom/tools/loom-compile/loom-compile")
+XDNA_RUN = os.path.join(BUILD, "experimental/xdna/iree-xdna-run")   # the NPU runner (an HRX built with the XDNA flags)
 
 
 def env():

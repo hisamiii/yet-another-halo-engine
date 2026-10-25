@@ -121,13 +121,15 @@ if [ ! -f "$build/CMakeCache.txt" ]; then
     -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_HAL_DRIVER_TASK=ON \
     -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_SAMPLES=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
     -DLIBHRX_BUILD=ON -DLIBHRX_BUILD_HIP_BINDING=ON -DLIBHRX_BUILD_CTS=OFF \
-    -DLOOM_BUILD=ON -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults
+    -DLOOM_BUILD=ON -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults \
+    -DAMDF_BUILD=ON -DAMDF_FAMILY_XDNA=ON -DLOOM_TARGET_XDNA=ON -DLOOM_TARGET_ARCH_XDNA=ON -DLOOM_EMIT_XDNA=ON
 fi
-# What the engine uses: the runtime, its HIP binding, the HAL emitter, the compiler (compile reports) and the profiler.
+# What the engine uses: the runtime, its HIP binding, the HAL emitter, the compiler (compile reports), the profiler,
+# and the NPU runner (tools/npu_gemm_check.py).
 # YAH_HRX_TARGETS overrides the list (a release build needs only libhrx/src/libhrx/libhrx.so).
 read -ra targets <<< "${YAH_HRX_TARGETS:-libhrx/src/libhrx/libhrx.so libhrx/src/binding/hip/libamdhip64.so \
   loom/src/loom/tools/iree-run-loom/iree-run-loom loom/src/loom/tools/loom-compile/loom-compile \
-  runtime/src/iree/tools/iree-profile/iree-profile}"
+  runtime/src/iree/tools/iree-profile/iree-profile experimental/xdna/iree-xdna-run}"
 ninja -C "$build" ${YAH_HRX_JOBS:+-j"$YAH_HRX_JOBS"} "${targets[@]}"
 status=0
 check || status=$?
