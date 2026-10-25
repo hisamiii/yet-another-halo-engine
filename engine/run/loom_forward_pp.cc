@@ -101,21 +101,36 @@ bool ParseOptions(int argc, char** argv, Options* o) {
     const std::string a = argv[i];
     const bool v = i + 1 < argc;
     const auto num = [&] { return static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10)); };
-    if (a == "--gen" && v) o->gen = num();
-    else if (a == "--decode" && v) o->decode = argv[++i];
-    else if (a == "--logits-from" && v) o->logits_from = num();
-    else if (a == "--rowstats" && v) o->rowstats = argv[++i];
-    else if (a == "--rowstats-from" && v) o->rowstats_from = num();
-    else if (a == "--rowstats-stride" && v) o->rowstats_stride = std::max(1u, num());
-    else if (a == "--rowstats-pos" && v) o->rowstats_pos = argv[++i];
-    else if (a == "--slot-save" && v) o->slot_save = argv[++i];
-    else if (a == "--slot-at" && v) o->slot_at = num();
-    else if (a == "--slot-load" && v) o->slot_load = argv[++i];
-    else if (a == "--chunk-ms") o->chunk_ms = true;
-    else if (a == "--pairs") o->pairs = true;
-    else if (a == "--npu") o->npu = true;
-    else if (a == "--npu-down" && v) o->npu_down = argv[++i];
-    else return std::fprintf(stderr, "loom_forward_pp: unknown option %s\n", a.c_str()), false;
+    if (a == "--gen" && v)
+      o->gen = num();
+    else if (a == "--decode" && v)
+      o->decode = argv[++i];
+    else if (a == "--logits-from" && v)
+      o->logits_from = num();
+    else if (a == "--rowstats" && v)
+      o->rowstats = argv[++i];
+    else if (a == "--rowstats-from" && v)
+      o->rowstats_from = num();
+    else if (a == "--rowstats-stride" && v)
+      o->rowstats_stride = std::max(1u, num());
+    else if (a == "--rowstats-pos" && v)
+      o->rowstats_pos = argv[++i];
+    else if (a == "--slot-save" && v)
+      o->slot_save = argv[++i];
+    else if (a == "--slot-at" && v)
+      o->slot_at = num();
+    else if (a == "--slot-load" && v)
+      o->slot_load = argv[++i];
+    else if (a == "--chunk-ms")
+      o->chunk_ms = true;
+    else if (a == "--pairs")
+      o->pairs = true;
+    else if (a == "--npu")
+      o->npu = true;
+    else if (a == "--npu-down" && v)
+      o->npu_down = argv[++i];
+    else
+      return std::fprintf(stderr, "loom_forward_pp: unknown option %s\n", a.c_str()), false;
   }
   return true;
 }
@@ -124,8 +139,9 @@ bool ParseOptions(int argc, char** argv, Options* o) {
 int main(int argc, char** argv) {
   Options opt;
   if (argc < 6 || !ParseOptions(argc, argv, &opt)) {
-    std::fprintf(stderr, "usage: loom_forward_pp <model> <haldir> <out-prefix> <tokens> <ids-file> [options]"
-                         " (see the source's header)\n");
+    std::fprintf(stderr,
+                 "usage: loom_forward_pp <model> <haldir> <out-prefix> <tokens> <ids-file> [options]"
+                 " (see the source's header)\n");
     return 2;
   }
   const std::string prefix = argv[3];

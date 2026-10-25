@@ -33,7 +33,7 @@ struct Item {
   TensorInfo dst;
   const TensorInfo* src;  // null for kOnes
   Kind kind;
-  bool heads = false;     // ssm_out: columns from GGUF to HF value-head order
+  bool heads = false;  // ssm_out: columns from GGUF to HF value-head order
 };
 
 // GGUF value head i is HF head order[i] (core/hfq.cpp HeadOrder): GGUF tiles the value heads over the key heads.
@@ -53,8 +53,8 @@ Heads HeadsOf(const Gguf& g) {
 }
 
 bool IsProjection(const TensorInfo& t) {
-  static const char* const kSites[] = {"attn_q",   "attn_k",    "attn_v",  "attn_output", "attn_qkv",
-                                       "attn_gate", "ssm_alpha", "ssm_beta", "ssm_out",     "ffn_gate",
+  static const char* const kSites[] = {"attn_q",    "attn_k",    "attn_v",       "attn_output", "attn_qkv",
+                                       "attn_gate", "ssm_alpha", "ssm_beta",     "ssm_out",     "ffn_gate",
                                        "ffn_up",    "ffn_down",  "nextn.eh_proj"};
   if (t.dims.size() != 2) return false;
   if (t.name == "output.weight") return true;
@@ -202,7 +202,8 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights, bool lock) {
                   std::memcpy(x, row.data(), k * 4);
                 }
               }
-              for (std::uint64_t r = 0; r < j.r1 - j.r0; ++r) QuantizeMq4Row(buf.data() + r * k, k, out + r * k / 256 * 136);
+              for (std::uint64_t r = 0; r < j.r1 - j.r0; ++r)
+                QuantizeMq4Row(buf.data() + r * k, k, out + r * k / 256 * 136);
             }
             break;
         }

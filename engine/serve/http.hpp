@@ -22,8 +22,8 @@ using Headers = std::vector<std::pair<std::string, std::string>>;
 [[nodiscard]] std::string HeaderValue(const Headers& headers, std::string_view name);
 
 struct Request {
-  std::string method, path, query, body;   // path without the query; query without the '?'
-  Headers headers;                         // names in lower case
+  std::string method, path, query, body;  // path without the query; query without the '?'
+  Headers headers;                        // names in lower case
   [[nodiscard]] std::string Header(std::string_view name) const { return HeaderValue(headers, name); }
 };
 
@@ -77,7 +77,7 @@ struct Result {
   Error error = Error::kNone;
   int status = 0;
   Headers headers;
-  std::string body;   // empty when a receiver took it
+  std::string body;  // empty when a receiver took it
   explicit operator bool() const { return error == Error::kNone; }
   [[nodiscard]] std::string Header(std::string_view name) const { return HeaderValue(headers, name); }
 };
@@ -86,7 +86,7 @@ struct Result {
 class Client {
  public:
   Client(std::string host, int port) : host_(std::move(host)), port_(port) {}
-  explicit Client(const std::string& url);   // http://host[:port] (port 80 by default)
+  explicit Client(const std::string& url);  // http://host[:port] (port 80 by default)
   void set_read_timeout(int seconds) { read_timeout_ = seconds; }
   Result Get(const std::string& path, const Headers& headers = {});
   // receiver: the body as it arrives (then not kept in Result::body); return false to cancel (Error::kCanceled).

@@ -42,19 +42,19 @@ class Json {
   };
 
   Json() = default;
-  Json(std::nullptr_t) {}  // NOLINT(google-explicit-constructor)
+  Json(std::nullptr_t) {}                      // NOLINT(google-explicit-constructor)
   Json(bool b) : kind_(Kind::kBool), b_(b) {}  // NOLINT(google-explicit-constructor)
   template <class T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>, int> = 0>
   Json(T i)  // NOLINT(google-explicit-constructor)
       : kind_(Kind::kInt), u_(std::is_unsigned_v<T> && i > T(INT64_MAX)), i_(static_cast<std::int64_t>(i)) {}
   template <class T, std::enable_if_t<std::is_floating_point_v<T>, int> = 0>
   Json(T d) : kind_(Kind::kDouble), d_(static_cast<double>(d)) {}  // NOLINT(google-explicit-constructor)
-  Json(const char* s) : kind_(Kind::kString), s_(s) {}            // NOLINT(google-explicit-constructor)
+  Json(const char* s) : kind_(Kind::kString), s_(s) {}             // NOLINT(google-explicit-constructor)
   Json(std::string s) : kind_(Kind::kString), s_(std::move(s)) {}  // NOLINT(google-explicit-constructor)
-  Json(std::string_view s) : kind_(Kind::kString), s_(s) {}       // NOLINT(google-explicit-constructor)
+  Json(std::string_view s) : kind_(Kind::kString), s_(s) {}        // NOLINT(google-explicit-constructor)
   template <class T>
   Json(const std::vector<T>& v) : kind_(Kind::kArray), a_(v.begin(), v.end()) {}  // NOLINT(google-explicit-constructor)
-  Json(std::initializer_list<Json> list) {  // NOLINT(google-explicit-constructor)
+  Json(std::initializer_list<Json> list) {                                        // NOLINT(google-explicit-constructor)
     bool pairs = true;
     for (const Json& j : list) pairs = pairs && j.kind_ == Kind::kArray && j.a_.size() == 2 && j.a_[0].is_string();
     if (pairs) {
@@ -194,8 +194,10 @@ class Json {
     J& operator*() const { return a_ ? *a_ : o_->second; }
     J* operator->() const { return &**this; }
     Iter& operator++() {
-      if (a_) ++a_;
-      else ++o_;
+      if (a_)
+        ++a_;
+      else
+        ++o_;
       return *this;
     }
     bool operator==(const Iter& b) const { return a_ == b.a_ && o_ == b.o_; }
@@ -233,12 +235,18 @@ class Json {
     }
     if (a.kind_ != b.kind_) return false;
     switch (a.kind_) {
-      case Kind::kNull: return true;
-      case Kind::kBool: return a.b_ == b.b_;
-      case Kind::kString: return a.s_ == b.s_;
-      case Kind::kArray: return a.a_ == b.a_;
-      case Kind::kObject: return a.o_ == b.o_;
-      default: return false;
+      case Kind::kNull:
+        return true;
+      case Kind::kBool:
+        return a.b_ == b.b_;
+      case Kind::kString:
+        return a.s_ == b.s_;
+      case Kind::kArray:
+        return a.a_ == b.a_;
+      case Kind::kObject:
+        return a.o_ == b.o_;
+      default:
+        return false;
     }
   }
   friend bool operator!=(const Json& a, const Json& b) { return !(a == b); }
@@ -323,14 +331,36 @@ class Json {
     for (std::size_t i = 0; i < s.size();) {
       const auto c = static_cast<unsigned char>(s[i]);
       switch (c) {
-        case '"': out += "\\\""; ++i; continue;
-        case '\\': out += "\\\\"; ++i; continue;
-        case '\b': out += "\\b"; ++i; continue;
-        case '\f': out += "\\f"; ++i; continue;
-        case '\n': out += "\\n"; ++i; continue;
-        case '\r': out += "\\r"; ++i; continue;
-        case '\t': out += "\\t"; ++i; continue;
-        default: break;
+        case '"':
+          out += "\\\"";
+          ++i;
+          continue;
+        case '\\':
+          out += "\\\\";
+          ++i;
+          continue;
+        case '\b':
+          out += "\\b";
+          ++i;
+          continue;
+        case '\f':
+          out += "\\f";
+          ++i;
+          continue;
+        case '\n':
+          out += "\\n";
+          ++i;
+          continue;
+        case '\r':
+          out += "\\r";
+          ++i;
+          continue;
+        case '\t':
+          out += "\\t";
+          ++i;
+          continue;
+        default:
+          break;
       }
       if (c < 0x20) {
         Hex4(out, c), ++i;
@@ -340,18 +370,22 @@ class Json {
       const std::size_t n = Utf8Length(s, i, &skip);
       if (!n) {
         if (on_bad == error_handler_t::strict) throw type_error("json: invalid UTF-8 in a string");
-        if (ascii) out += "\\ufffd";
-        else out += "\xEF\xBF\xBD";
+        if (ascii)
+          out += "\\ufffd";
+        else
+          out += "\xEF\xBF\xBD";
         i += skip;
         continue;
       }
       if (ascii && n > 1) {
         const auto b = [&](std::size_t k) { return static_cast<unsigned>(static_cast<unsigned char>(s[i + k])); };
-        unsigned u = n == 2 ? (b(0) & 0x1F) << 6 | (b(1) & 0x3F)
-                   : n == 3 ? (b(0) & 0x0F) << 12 | (b(1) & 0x3F) << 6 | (b(2) & 0x3F)
-                            : (b(0) & 0x07) << 18 | (b(1) & 0x3F) << 12 | (b(2) & 0x3F) << 6 | (b(3) & 0x3F);
-        if (u >= 0x10000) u -= 0x10000, Hex4(out, 0xD800 + (u >> 10)), Hex4(out, 0xDC00 + (u & 0x3FF));
-        else Hex4(out, u);
+        unsigned u = n == 2   ? (b(0) & 0x1F) << 6 | (b(1) & 0x3F)
+                     : n == 3 ? (b(0) & 0x0F) << 12 | (b(1) & 0x3F) << 6 | (b(2) & 0x3F)
+                              : (b(0) & 0x07) << 18 | (b(1) & 0x3F) << 12 | (b(2) & 0x3F) << 6 | (b(3) & 0x3F);
+        if (u >= 0x10000)
+          u -= 0x10000, Hex4(out, 0xD800 + (u >> 10)), Hex4(out, 0xDC00 + (u & 0x3FF));
+        else
+          Hex4(out, u);
       } else {
         out.append(s.substr(i, n));
       }
@@ -384,7 +418,8 @@ class Json {
     if (k <= n && n <= 15) {
       out += digits, out.append(static_cast<std::size_t>(n - k), '0'), out += ".0";
     } else if (0 < n && n <= 15) {
-      out += digits.substr(0, static_cast<std::size_t>(n)), out += '.', out += digits.substr(static_cast<std::size_t>(n));
+      out += digits.substr(0, static_cast<std::size_t>(n)), out += '.',
+          out += digits.substr(static_cast<std::size_t>(n));
     } else if (-4 < n && n <= 0) {
       out += "0.", out.append(static_cast<std::size_t>(-n), '0'), out += digits;
     } else {
@@ -402,11 +437,21 @@ class Json {
       out.append(static_cast<std::size_t>(indent) * static_cast<std::size_t>(d), c);
     };
     switch (kind_) {
-      case Kind::kNull: out += "null"; break;
-      case Kind::kBool: out += b_ ? "true" : "false"; break;
-      case Kind::kInt: out += u_ ? std::to_string(static_cast<std::uint64_t>(i_)) : std::to_string(i_); break;
-      case Kind::kDouble: WriteDouble(out, d_); break;
-      case Kind::kString: WriteString(out, s_, ascii, on_bad); break;
+      case Kind::kNull:
+        out += "null";
+        break;
+      case Kind::kBool:
+        out += b_ ? "true" : "false";
+        break;
+      case Kind::kInt:
+        out += u_ ? std::to_string(static_cast<std::uint64_t>(i_)) : std::to_string(i_);
+        break;
+      case Kind::kDouble:
+        WriteDouble(out, d_);
+        break;
+      case Kind::kString:
+        WriteString(out, s_, ascii, on_bad);
+        break;
       case Kind::kArray:
         out += '[';
         for (std::size_t k = 0; k < a_.size(); ++k) {
@@ -476,13 +521,23 @@ class Json {
       if (depth > kMaxDepth) Fail("nesting too deep");
       if (at >= s.size()) Fail("unexpected end of input");
       switch (s[at]) {
-        case '{': return ParseObject(depth);
-        case '[': return ParseArray(depth);
-        case '"': return Json(String());
-        case 't': Word("true"); return Json(true);
-        case 'f': Word("false"); return Json(false);
-        case 'n': Word("null"); return Json();
-        default: return Number();
+        case '{':
+          return ParseObject(depth);
+        case '[':
+          return ParseArray(depth);
+        case '"':
+          return Json(String());
+        case 't':
+          Word("true");
+          return Json(true);
+        case 'f':
+          Word("false");
+          return Json(false);
+        case 'n':
+          Word("null");
+          return Json();
+        default:
+          return Number();
       }
     }
     Json ParseObject(int depth) {
@@ -522,7 +577,10 @@ class Json {
       unsigned u = 0;
       for (int k = 0; k < 4; ++k) {
         const char c = s[at++];
-        const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        const int d = c >= '0' && c <= '9'   ? c - '0'
+                      : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                      : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                                             : -1;
         if (d < 0) Fail("a 4-digit \\u escape expected");
         u = u * 16 + static_cast<unsigned>(d);
       }
@@ -553,14 +611,30 @@ class Json {
           if (++at >= s.size()) Fail("unterminated string");
           const char e = s[at++];
           switch (e) {
-            case '"': out += '"'; break;
-            case '\\': out += '\\'; break;
-            case '/': out += '/'; break;
-            case 'b': out += '\b'; break;
-            case 'f': out += '\f'; break;
-            case 'n': out += '\n'; break;
-            case 'r': out += '\r'; break;
-            case 't': out += '\t'; break;
+            case '"':
+              out += '"';
+              break;
+            case '\\':
+              out += '\\';
+              break;
+            case '/':
+              out += '/';
+              break;
+            case 'b':
+              out += '\b';
+              break;
+            case 'f':
+              out += '\f';
+              break;
+            case 'n':
+              out += '\n';
+              break;
+            case 'r':
+              out += '\r';
+              break;
+            case 't':
+              out += '\t';
+              break;
             case 'u': {
               unsigned u = Hex();
               if (u >= 0xD800 && u <= 0xDBFF) {
@@ -575,7 +649,8 @@ class Json {
               Utf8(out, u);
               break;
             }
-            default: Fail("an invalid escape");
+            default:
+              Fail("an invalid escape");
           }
           continue;
         }
@@ -593,8 +668,10 @@ class Json {
         return at - d;
       };
       Eat('-');
-      if (at < s.size() && s[at] == '0') ++at;
-      else if (!digits()) Fail("invalid number");
+      if (at < s.size() && s[at] == '0')
+        ++at;
+      else if (!digits())
+        Fail("invalid number");
       bool integer = true;
       if (Eat('.')) {
         integer = false;
@@ -621,7 +698,7 @@ class Json {
 
   Kind kind_ = Kind::kNull;
   bool b_ = false;
-  bool u_ = false;   // an integer past INT64_MAX, held as its uint64 bits
+  bool u_ = false;  // an integer past INT64_MAX, held as its uint64 bits
   std::int64_t i_ = 0;
   double d_ = 0;
   std::string s_;

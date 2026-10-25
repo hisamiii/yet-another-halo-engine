@@ -1132,7 +1132,7 @@ class LoomNpu {
   CommandStats commands_;                  // under mu_
   std::mutex mu_;
   std::uint64_t submitted_ = 0, retired_ = 0;  // commands; under mu_
-  std::chrono::steady_clock::time_point active_{};   // the last command's retirement; under mu_
+  std::chrono::steady_clock::time_point active_{};  // the last command's retirement; under mu_
   // How long the NPU may sit idle before runtime PM may power it down (amdxdna's autosuspend, 5 s by default), with a
   // margin; "on" (no runtime PM): never
   const std::chrono::milliseconds suspend_after_ = SuspendAfter();

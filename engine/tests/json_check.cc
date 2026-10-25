@@ -39,9 +39,31 @@ int main() {
   Round(" {\"b\" : [ 1 , {\"a\":null} ], \"a\": true } ", "{\"b\":[1,{\"a\":null}],\"a\":true}");
   Round("{\"k\":1,\"j\":2,\"k\":3}", "{\"k\":3,\"j\":2}");
   Round("\"\\u0001\\t\\\"\"", "\"\\u0001\\t\\\"\"");
-  for (const char* m : {"", "{", "[1,]", "{\"a\":}", "01", "1.", "-", "1e", "\"\\x\"", "\"\x01\"", "\"\\ud800\"",
-                        "\"\\udc00\"", "\"\xff\"", "\"\xc0\xaf\"", "\"\xed\xa0\x80\"", "[1 2]", "nul", "{\"a\" 1}", "1 2",
-                        "+1", ".5", "{\"a\":1,}", "\"\\u12g4\"", "\"abc", "1e400"}) {
+  for (const char* m : {"",
+                        "{",
+                        "[1,]",
+                        "{\"a\":}",
+                        "01",
+                        "1.",
+                        "-",
+                        "1e",
+                        "\"\\x\"",
+                        "\"\x01\"",
+                        "\"\\ud800\"",
+                        "\"\\udc00\"",
+                        "\"\xff\"",
+                        "\"\xc0\xaf\"",
+                        "\"\xed\xa0\x80\"",
+                        "[1 2]",
+                        "nul",
+                        "{\"a\" 1}",
+                        "1 2",
+                        "+1",
+                        ".5",
+                        "{\"a\":1,}",
+                        "\"\\u12g4\"",
+                        "\"abc",
+                        "1e400"}) {
     bool threw = false;
     try {
       (void)Json::parse(m);
@@ -52,13 +74,16 @@ int main() {
   }
   const auto replaced = [](const char* s) { return Json(s).dump(-1, ' ', false, Json::error_handler_t::replace); };
   const std::string r = "\xef\xbf\xbd";
-  Expect(replaced("ok\xff" "x") == "\"ok" + r + "x\"", "replace a bad byte");
+  Expect(replaced("ok\xff"
+                  "x") == "\"ok" + r + "x\"",
+         "replace a bad byte");
   Expect(replaced("\xe2\x82") == "\"" + r + "\"", "replace a truncated sequence once");
   Expect(replaced("\xed\xa0\x80z") == "\"" + r + r + r + "z\"", "replace a surrogate's bytes");
   Expect(replaced("\xc0\xaf") == "\"" + r + r + "\"", "replace an overlong form");
   const Json j = {{"a", 1}, {"b", {1, 2}}, {"c", {{"d", nullptr}}}};
   Expect(j.dump() == "{\"a\":1,\"b\":[1,2],\"c\":{\"d\":null}}", "brace lists: " + j.dump());
-  Expect(j.dump(2) == "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ],\n  \"c\": {\n    \"d\": null\n  }\n}", "indent 2");
+  Expect(j.dump(2) == "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ],\n  \"c\": {\n    \"d\": null\n  }\n}",
+         "indent 2");
   Expect(Json(1) == Json(1.0) && Json(1) != Json("1") && j["b"][1] == 2 && j.value("a", 0) == 1 &&
              j.value("zz", "d") == "d" && j["c"]["missing"].is_null() && !j.contains("zz"),
          "access and comparison");

@@ -376,7 +376,7 @@ class LoomDecoder {
                    R(nrm_n_, i, kHidden));
       if (full) {
         const std::uint32_t ai = l / cfg_.full_attention_interval;
-        const LoomBuffer* vs = vsave_[ai];   // this layer's V rows, kept for a refill (Accept)
+        const LoomBuffer* vs = vsave_[ai];  // this layer's V rows, kept for a refill (Accept)
         GemvT("plain", {pre + "attn_q.weight"}, *nrm_n_, *qg_n_);
         GemvT("plain", {pre + "attn_k.weight"}, *nrm_n_, *k_n_);
         GemvT("plain", {pre + "attn_v.weight"}, *nrm_n_, *vs);
@@ -395,11 +395,13 @@ class LoomDecoder {
                      {Ref(*q_), st_.kq[ai], st_.ks[ai], st_.vq[ai], st_.vs[ai], vopen_[ai], st_.ptab, dpos(i),
                       Ref(*acc_), Ref(*ml_)});
           } else {
-            Dispatch(Load("dattn_kvappend"), kKvHeads, 1, 256, {kb, vb, st_.kpool[ai], st_.vtpool[ai], st_.ptab, dpos(i)});
+            Dispatch(Load("dattn_kvappend"), kKvHeads, 1, 256,
+                     {kb, vb, st_.kpool[ai], st_.vtpool[ai], st_.ptab, dpos(i)});
             Dispatch(Load("dattn_part"), kKvHeads, (pos + i) / 256 + 1, 256,
                      {Ref(*q_), st_.kpool[ai], st_.vtpool[ai], st_.ptab, dpos(i), Ref(*acc_), Ref(*ml_)});
           }
-          Dispatch(Load("dattn_reduce"), kHeads, 1, 256, {Ref(*acc_), Ref(*ml_), Ref(*gate_), dpos(i), R(ao_n_, i, kAttn)});
+          Dispatch(Load("dattn_reduce"), kHeads, 1, 256,
+                   {Ref(*acc_), Ref(*ml_), Ref(*gate_), dpos(i), R(ao_n_, i, kAttn)});
           Rotate(R(ao_n_, i, kAttn), pre + "attn_output", {});
         }
         GemvT("resid", {pre + "attn_output.weight"}, *ao_n_, *hid_n_);
@@ -414,9 +416,17 @@ class LoomDecoder {
         for (std::uint32_t i = 0; i < n; ++i) {
           // conv state: ring slot i (slot 0 the current one) to slot i + 1
           Dispatch(Load("deltanet_conv"), kHeadsV, 1, 512,
-                   {R(qkv_n_, i, kQkv), TRef(pre + "ssm_conv1d.weight"), {ConvRing(i), co, cb}, {ConvRing(i + 1), co, cb},
-                    {st_.dstate, so, sb}, R(alpha_n_, i, kTs), R(beta_n_, i, kTs), TRef(pre + "ssm_a"),
-                    TRef(pre + "ssm_dt.bias"), TRef(pre + "ssm_norm.weight"), R(gate_n_, i, kAttn),
+                   {R(qkv_n_, i, kQkv),
+                    TRef(pre + "ssm_conv1d.weight"),
+                    {ConvRing(i), co, cb},
+                    {ConvRing(i + 1), co, cb},
+                    {st_.dstate, so, sb},
+                    R(alpha_n_, i, kTs),
+                    R(beta_n_, i, kTs),
+                    TRef(pre + "ssm_a"),
+                    TRef(pre + "ssm_dt.bias"),
+                    TRef(pre + "ssm_norm.weight"),
+                    R(gate_n_, i, kAttn),
                     R(so_n_, i, kInner)});
           if (i + 1 < n) gpu_.Copy({st_.dstate, so, sb}, {dring_[i]->handle, so, sb});
           Rotate(R(so_n_, i, kInner), pre + "ssm_out", R(rx_n_, i, kInner));
@@ -434,7 +444,8 @@ class LoomDecoder {
         Dispatch(Load("drot_norm_head"), kHidden / 1024, 1, 512,
                  {R(hid_n_, i, kHidden), TRef("output_norm.weight"), Ref(*rot_signs_), R(nrm_n_, i, kHidden)});
       } else {
-        Dispatch(Load("rmsnorm"), 1, 1, 512, {R(hid_n_, i, kHidden), TRef("output_norm.weight"), R(nrm_n_, i, kHidden)});
+        Dispatch(Load("rmsnorm"), 1, 1, 512,
+                 {R(hid_n_, i, kHidden), TRef("output_norm.weight"), R(nrm_n_, i, kHidden)});
         Dispatch(Load("drot_head"), kHidden / 1024, 1, 64, {R(nrm_n_, i, kHidden), Ref(*rot_signs_)});
       }
     }
@@ -466,7 +477,8 @@ class LoomDecoder {
     const hrx_buffer_ref_t dposr{posarr_->handle, std::size_t{v} * 4, 4};
     Dispatch(Load("embed"), 1, 1, kHidden / 16,
              {TRef("token_embd.weight"), {toks_->handle, std::size_t{q} * 4, 4}, Ref(*normed_)});
-    Dispatch(Load("rmsnorm"), 1, 1, 512, {Ref(*normed_), TRef(pre + "nextn.enorm.weight"), Slice(*cat_, 0, kHidden * 4)});
+    Dispatch(Load("rmsnorm"), 1, 1, 512,
+             {Ref(*normed_), TRef(pre + "nextn.enorm.weight"), Slice(*cat_, 0, kHidden * 4)});
     Dispatch(Load("rmsnorm"), 1, 1, 512, {Ref(*mh_), TRef(pre + "nextn.hnorm.weight"), Slice(*cat_, 1, kHidden * 4)});
     Rotate(Ref(*cat_), pre + "nextn.eh_proj", {});
     Gemv("plain", {pre + "nextn.eh_proj.weight"}, *cat_, *mx_);
@@ -476,7 +488,8 @@ class LoomDecoder {
     Dispatch(Load("rope"), kHeads + kKvHeads, 1, 256,
              {Ref(*q_), Ref(*kb_), Ref(*vb_), TRef(pre + "attn_q_norm.weight"), TRef(pre + "attn_k_norm.weight"),
               Ref(*q_), Ref(*kb_), Ref(*c32a_), Ref(*c32b_), Ref(*c16a_), Ref(*c16b_), dposr, Ref(*eps_)});
-    Dispatch(Load("dattn_kvappend"), kKvHeads, 1, 256, {Ref(*kb_), Ref(*vb_), Ref(*mtp_k_), Ref(*mtp_v_), Ref(*mtp_pt_), dposr});
+    Dispatch(Load("dattn_kvappend"), kKvHeads, 1, 256,
+             {Ref(*kb_), Ref(*vb_), Ref(*mtp_k_), Ref(*mtp_v_), Ref(*mtp_pt_), dposr});
     Dispatch(Load("dattn_part"), kKvHeads, v / 256 + 1, 256,
              {Ref(*q_), Ref(*mtp_k_), Ref(*mtp_v_), Ref(*mtp_pt_), dposr, Ref(*acc_), Ref(*ml_)});
     Dispatch(Load("dattn_reduce"), kHeads, 1, 256, {Ref(*acc_), Ref(*ml_), Ref(*gate_), dposr, Ref(*aout_)});
@@ -504,7 +517,8 @@ class LoomDecoder {
   void Accept(std::uint32_t m) {
     if (m >= vn_) throw LoomError("decoder: accept past the verified tokens");
     const std::uint32_t nf = full_layers(), nr = recurrent_layers();
-    gpu_.Copy({ConvRing(m + 1), 0, std::size_t{nr} * kConvState * 4}, {cs_[cs_cur_], 0, std::size_t{nr} * kConvState * 4});
+    gpu_.Copy({ConvRing(m + 1), 0, std::size_t{nr} * kConvState * 4},
+              {cs_[cs_cur_], 0, std::size_t{nr} * kConvState * 4});
     if (m + 1 < vn_) {
       gpu_.Copy(Ref(*dring_[m]), {st_.dstate, 0, std::size_t{nr} * kStateElems * 4});
       // the open V tiles: a rejected token past a tile boundary started a new tile over the accepted tokens' one
@@ -512,10 +526,14 @@ class LoomDecoder {
         for (std::uint32_t ai = 0; ai < nf; ++ai) {
           gpu_.Copy(Slice(*vopen_save_, ai, vopen_[ai].length), vopen_[ai]);
           for (std::uint32_t i = 0; i <= m; ++i)
-            if ((vpos_ + i) / 16 == (vpos_ + m) / 16)   // the accepted tokens of the tile left open
+            if ((vpos_ + i) / 16 == (vpos_ + m) / 16)  // the accepted tokens of the tile left open
               Dispatch(Load("dattn_vappend_q"), kKvHeads, 1, 256,
-                       {{vsave_[ai]->handle, std::size_t{i} * kKv * 4, kKv * 4}, vopen_[ai], st_.vq[ai], st_.vs[ai],
-                        st_.ptab, {posarr_->handle, std::size_t{vpos_ + i} * 4, 4}});
+                       {{vsave_[ai]->handle, std::size_t{i} * kKv * 4, kKv * 4},
+                        vopen_[ai],
+                        st_.vq[ai],
+                        st_.vs[ai],
+                        st_.ptab,
+                        {posarr_->handle, std::size_t{vpos_ + i} * 4, 4}});
         }
       }
     }
@@ -777,9 +795,9 @@ class LoomDecoder {
   // Verify: its tokens, the state rings, and per-token buffers ([vt_][...])
   std::uint32_t vpos_ = 0, vn_ = 0;
   bool vcross_ = false;
-  LoomBuffer *hid_n_ = nullptr, *nrm_n_ = nullptr, *qg_n_ = nullptr, *k_n_ = nullptr, *ao_n_ = nullptr, *qkv_n_ = nullptr,
-             *gate_n_ = nullptr, *alpha_n_ = nullptr, *beta_n_ = nullptr, *so_n_ = nullptr, *rx_n_ = nullptr,
-             *act_n_ = nullptr, *lg_n_ = nullptr, *vtok_ = nullptr, *vopen_save_ = nullptr;
+  LoomBuffer *hid_n_ = nullptr, *nrm_n_ = nullptr, *qg_n_ = nullptr, *k_n_ = nullptr, *ao_n_ = nullptr,
+             *qkv_n_ = nullptr, *gate_n_ = nullptr, *alpha_n_ = nullptr, *beta_n_ = nullptr, *so_n_ = nullptr,
+             *rx_n_ = nullptr, *act_n_ = nullptr, *lg_n_ = nullptr, *vtok_ = nullptr, *vopen_save_ = nullptr;
   std::vector<LoomBuffer*> vsave_, cring_, dring_;
   // MTP: its fp16 K / V^T pools and page table, the concatenated input, its residual stream, the next hidden input
   LoomBuffer *mtp_k_ = nullptr, *mtp_v_ = nullptr, *mtp_pt_ = nullptr, *cat_ = nullptr, *mx_ = nullptr, *mh_ = nullptr;

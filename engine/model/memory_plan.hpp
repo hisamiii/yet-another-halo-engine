@@ -28,7 +28,8 @@ struct MemoryPlan {
 
   // model: the model file; decode_hal: its decode set (context and KV format); npu_down: the NPU's down pack, empty
   // without the NPU; mtp: drafting with the MTP layer.
-  static MemoryPlan For(const std::string& model, const std::string& decode_hal, const std::string& npu_down, bool mtp) {
+  static MemoryPlan For(const std::string& model, const std::string& decode_hal, const std::string& npu_down,
+                        bool mtp) {
     std::ifstream f(decode_hal + "/decode.txt");
     if (!f) throw LoomError("cannot read " + decode_hal + "/decode.txt");
     std::uint32_t context = 0, kb = 16, vb = 16;
@@ -65,8 +66,7 @@ struct MemoryPlan {
   [[nodiscard]] std::string Describe() const {
     char s[200];
     std::snprintf(s, sizeof s, "needs ~%.1f GB (weights %.1f, buffers %.1f at %u context), %.1f GB available",
-                  double(need()) / kGB, double(weights) / kGB, double(buffers) / kGB, context,
-                  double(available) / kGB);
+                  double(need()) / kGB, double(weights) / kGB, double(buffers) / kGB, context, double(available) / kGB);
     return s;
   }
 
@@ -79,13 +79,12 @@ struct MemoryPlan {
       if (key == "MemAvailable:") return kb * 1024;
       f.ignore(64, '\n');
     }
-    return ~0ull;   // (no /proc: do not refuse)
+    return ~0ull;  // (no /proc: do not refuse)
   }
 
  private:
   // kFixed: the chunk-sized buffers, state snapshots, the host side (~1.1 GB resident) and HRX's own memory
-  static constexpr std::uint64_t kFixed = 3600ull << 20, kScratchPerToken = 19500, kMtpPerToken = 4096,
-                                 kNpuFixed = 0;
+  static constexpr std::uint64_t kFixed = 3600ull << 20, kScratchPerToken = 19500, kMtpPerToken = 4096, kNpuFixed = 0;
 };
 
 }  // namespace yah::model

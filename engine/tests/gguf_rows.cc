@@ -60,8 +60,9 @@ int main(int argc, char** argv) {
       std::printf("%zu tensors, %.2f GiB in %.1f s\n", g.tensors().size(), g.tensor_data_size() / 1073741824.0,
                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     } else {
-      std::fprintf(stderr, "usage: gguf_rows dequant <type> <blocks> <out> | mq4 <rows.f32> <k> <out> | "
-                           "tensor <model> <name> <rows> <out> | load <model>\n");
+      std::fprintf(stderr,
+                   "usage: gguf_rows dequant <type> <blocks> <out> | mq4 <rows.f32> <k> <out> | "
+                   "tensor <model> <name> <rows> <out> | load <model>\n");
       return 2;
     }
   } catch (const std::exception& e) {

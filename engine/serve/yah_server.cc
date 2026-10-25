@@ -36,20 +36,21 @@ using namespace yah::serve;
 namespace http = yah::serve::http;
 
 int Usage() {
-  std::fprintf(stderr,
-               "usage: yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080]\n"
-               "                  [--draft mtp|off [--draft-len N]] [--npu [--npu-down <pack>]] [--no-reuse]\n"
-               "                  [--prefill <hal set> --decode <hal set>]\n"
-               "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
-               "--ctx: the context in tokens (a multiple of 2048); --kv: the KV cache format, fp16, kv8, kv4, k8v4 or\n"
-               "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
-               "~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use. --prefill / --decode name sets instead.\n"
-               "--npu: the NPU runs the prefill set's FFN block (a set from tools/emit_npu_ffn.py), its down pack from\n"
-               "<prefill>/npu_down.bin unless --npu-down; without what it needs the GPU runs everything.\n"
-               "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
-               "blk.N.nextn.*) and verifying with the decode set's verify GEMVs; --draft-len N fixes the draft length\n"
-               "(default: adapts to the acceptance).\n"
-               "--no-reuse: every request prefills from scratch (no multi-turn cache).\n");
+  std::fprintf(
+      stderr,
+      "usage: yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080]\n"
+      "                  [--draft mtp|off [--draft-len N]] [--npu [--npu-down <pack>]] [--no-reuse]\n"
+      "                  [--prefill <hal set> --decode <hal set>]\n"
+      "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
+      "--ctx: the context in tokens (a multiple of 2048); --kv: the KV cache format, fp16, kv8, kv4, k8v4 or\n"
+      "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
+      "~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use. --prefill / --decode name sets instead.\n"
+      "--npu: the NPU runs the prefill set's FFN block (a set from tools/emit_npu_ffn.py), its down pack from\n"
+      "<prefill>/npu_down.bin unless --npu-down; without what it needs the GPU runs everything.\n"
+      "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
+      "blk.N.nextn.*) and verifying with the decode set's verify GEMVs; --draft-len N fixes the draft length\n"
+      "(default: adapts to the acceptance).\n"
+      "--no-reuse: every request prefills from scratch (no multi-turn cache).\n");
   return 2;
 }
 
@@ -71,14 +72,19 @@ std::pair<std::string, std::string> HalSets(const std::string& root, const std::
                                             const std::string& kv) {
   const auto cfg = yah::core::Qwen35Config::FromGguf(yah::core::Gguf::OpenIndex(model));
   const std::string name = std::to_string(ctx) + "-" + kv, dec = cfg.nextn_predict_layers ? "decode-mtp" : "decode";
-  const auto decode_of = [&](const std::string& b) { return b + (Exists(b + "/decode-mtp/decode.txt") ? "/decode-mtp" : "/decode"); };
-  if (const std::string b = root + "/hal/" + name; Exists(b + "/prefill/dispatch.txt")) return {b + "/prefill", decode_of(b)};
+  const auto decode_of = [&](const std::string& b) {
+    return b + (Exists(b + "/decode-mtp/decode.txt") ? "/decode-mtp" : "/decode");
+  };
+  if (const std::string b = root + "/hal/" + name; Exists(b + "/prefill/dispatch.txt"))
+    return {b + "/prefill", decode_of(b)};
   const std::string tools = root + "/gpu/loom";
   if (!Exists(tools + "/tools/emit_decode.py"))
-    throw std::runtime_error("no HAL sets for " + name + " in " + root + "/hal (--ctx / --kv pick one of the bundle's)");
+    throw std::runtime_error("no HAL sets for " + name + " in " + root +
+                             "/hal (--ctx / --kv pick one of the bundle's)");
   const char* xdg = std::getenv("XDG_CACHE_HOME");
   const char* home = std::getenv("HOME");
-  const std::string dir = (xdg && *xdg ? std::string(xdg) : std::string(home ? home : ".") + "/.cache") + "/yah/hal/" + name;
+  const std::string dir =
+      (xdg && *xdg ? std::string(xdg) : std::string(home ? home : ".") + "/.cache") + "/yah/hal/" + name;
   const auto emit = [&](const std::string& sub, const std::string& marker, const std::string& command,
                         const std::string& last) {
     const std::string out = dir + "/" + sub;
@@ -96,7 +102,8 @@ std::pair<std::string, std::string> HalSets(const std::string& root, const std::
     std::filesystem::remove(part + ".log");
   };
   emit("prefill", "dispatch.txt", "YAH_CTX=" + std::to_string(ctx) + " python3 tools/emit_prefill_pp.py", "2048");
-  if (!Exists(dir + "/decode-mtp/decode.txt")) emit(dec, "decode.txt", "python3 tools/emit_decode.py", std::to_string(ctx));
+  if (!Exists(dir + "/decode-mtp/decode.txt"))
+    emit(dec, "decode.txt", "python3 tools/emit_decode.py", std::to_string(ctx));
   return {dir + "/prefill", decode_of(dir)};
 }
 #endif
@@ -347,7 +354,8 @@ int main(int argc, char** argv) {
     web.Post("/v1/chat/completions",
              [&](const http::Request& req, http::Response& res) { server.ChatCompletions(req, res); });
     web.Get("/v1/models", [&](const http::Request& req, http::Response& res) { server.Models(req, res); });
-    web.Get("/health", [](const http::Request&, http::Response& res) { res.Set(R"({"status":"ok"})", "application/json"); });
+    web.Get("/health",
+            [](const http::Request&, http::Response& res) { res.Set(R"({"status":"ok"})", "application/json"); });
     web.on_error = [](http::Response& res) {
       const ApiError error(res.status, res.status == 404 ? "Not found." : "HTTP error " + std::to_string(res.status));
       res.Set(Dump(ErrorBody(error)), "application/json");

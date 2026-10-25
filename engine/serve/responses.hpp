@@ -11,9 +11,9 @@
 #include <string_view>
 #include <vector>
 
+#include "core/json.hpp"
 #include "model/generator.hpp"
 #include "serve/chat_template.hpp"
-#include "core/json.hpp"
 
 namespace yah::serve {
 

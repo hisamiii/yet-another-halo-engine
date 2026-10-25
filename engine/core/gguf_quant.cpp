@@ -244,6 +244,7 @@ void IQ3_S(const std::uint8_t* b, float* y) {
 
 using Block = void (*)(const std::uint8_t*, float*);
 Block BlockFn(GgmlType t) {
+  // clang-format off
   switch (t) {
     case GgmlType::kQ4_0: return Q4_0;
     case GgmlType::kQ4_1: return Q4_1;
@@ -263,6 +264,7 @@ Block BlockFn(GgmlType t) {
     case GgmlType::kIQ4_XS: return IQ4_XS;
     default: return nullptr;
   }
+  // clang-format on
 }
 
 // In place over 256 values: the natural-order Walsh-Hadamard transform, unnormalized.
@@ -369,7 +371,8 @@ void QuantizeQ8_0(const float* x, std::uint64_t n, std::uint8_t* dst) {
     const float d = amax / 127.0F, inv = d > 0 ? 1.0F / d : 0.0F;
     const std::uint16_t hd = ToHalf(d);
     std::memcpy(dst, &hd, 2);
-    for (int i = 0; i < 32; ++i) dst[2 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(std::lround(x[i] * inv)));
+    for (int i = 0; i < 32; ++i)
+      dst[2 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(std::lround(x[i] * inv)));
   }
 }
 

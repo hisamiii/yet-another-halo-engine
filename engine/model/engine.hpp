@@ -57,7 +57,7 @@ class Engine : public TextGenerator {
     // 0 adapts it to the acceptance (up to the verify width - 1).
     std::string draft = "off";
     std::uint32_t draft_len = 0;
-    bool reuse = true;   // keep the last sequence's KV and state snapshots for a prompt that extends it
+    bool reuse = true;  // keep the last sequence's KV and state snapshots for a prompt that extends it
   };
   // How the tokens after the last whole chunk are run.
   enum class Tail { kAuto, kChunk, kDecode };
@@ -105,7 +105,7 @@ class Engine : public TextGenerator {
         draft_status_ = "the decode set's verify width is past " + std::to_string(LoomDecoder::kMaxVerify);
       else
         draft_status_.clear(), draft_len_ = std::min(o.draft_len ? o.draft_len : 0xffu, decoder_.verify_tokens() - 1),
-        draft_auto_ = o.draft_len == 0;
+                               draft_auto_ = o.draft_len == 0;
     } else if (o.draft != "off") {
       throw LoomError("engine: unknown draft mode " + o.draft + " (mtp, off)");
     }
@@ -119,7 +119,7 @@ class Engine : public TextGenerator {
                   double(plan_.need()) / MemoryPlan::kGB);
     return s;
   }
-  ~Engine() override { gpu_.Synchronize(); }   // (the graphs wait on NPU words: none may run past npu_)
+  ~Engine() override { gpu_.Synchronize(); }  // (the graphs wait on NPU words: none may run past npu_)
 
   // Why speculative decoding is off ("" when it runs, "off" when not asked for).
   [[nodiscard]] const std::string& draft_status() const { return draft_status_; }
@@ -331,9 +331,10 @@ class Engine : public TextGenerator {
       std::ifstream f("/sys/class/drm/card" + std::to_string(card) + "/device/power_dpm_force_performance_level");
       std::string level;
       if (f >> level)
-        return level == "high" ? "" :
-               "the GPU's DPM level is " + level + ", not high (echo high | sudo tee /sys/class/drm/card" +
-                   std::to_string(card) + "/device/power_dpm_force_performance_level; auto restores it)";
+        return level == "high"
+                   ? ""
+                   : "the GPU's DPM level is " + level + ", not high (echo high | sudo tee /sys/class/drm/card" +
+                         std::to_string(card) + "/device/power_dpm_force_performance_level; auto restores it)";
     }
     return "no amdgpu DPM control found";
   }
@@ -383,7 +384,7 @@ class Engine : public TextGenerator {
         const std::uint32_t edge = std::min({(q / B + 1) * B, limit, T});
         const std::uint32_t kmax = std::min(draft_len_, edge - q - 1);
         const std::uint32_t k = draft_auto_ ? DraftLength(kmax) : kmax;
-        const std::uint32_t v = q - (n + 1);   // the MTP layer's position
+        const std::uint32_t v = q - (n + 1);  // the MTP layer's position
         const auto t0 = std::chrono::steady_clock::now();
         std::uint32_t m = 0, tested = 1;
         bool more = true;
@@ -394,7 +395,7 @@ class Engine : public TextGenerator {
           decoder_.MtpHidden(decoder_.MainHidden());
           gpu_.Synchronize();
           cur = decoder_.Tokens(q + 1, q + 2)[0];
-          m = __atomic_load_n(guess_host_, __ATOMIC_ACQUIRE) == cur ? 1 : 0;   // (scored, not kept)
+          m = __atomic_load_n(guess_host_, __ATOMIC_ACQUIRE) == cur ? 1 : 0;  // (scored, not kept)
           if (reuse_ && (q + 1) % B == 0) Save(ys, q + 1, decoder_.conv_state());
           q += 1;
         } else {
@@ -493,7 +494,7 @@ class Engine : public TextGenerator {
   LoomPrefill prefill_;
   LoomDecoder decoder_;
 #ifdef YAH_WITH_NPU
-  std::unique_ptr<LoomNpuSplit> npu_;   // (destroyed before the prefill that points at it)
+  std::unique_ptr<LoomNpuSplit> npu_;  // (destroyed before the prefill that points at it)
 #endif
   std::string npu_status_ = "off";
   std::string draft_status_ = "off";
@@ -501,9 +502,9 @@ class Engine : public TextGenerator {
   // (priors: a step 62 ms, a draft 4 ms, a verify 85 ms + 5 ms a token; measured on gfx1151, refined as it runs)
   double accept_n_ = 3.0, accept_d_ = 5.0;
   double round_ms_[LoomDecoder::kMaxVerify] = {66.0, 98.0, 107.0, 116.0, 125.0, 134.0, 143.0, 152.0};
-  LoomBuffer guess_;                     // the MTP layer's guess on a plain step (Speculate)
+  LoomBuffer guess_;  // the MTP layer's guess on a plain step (Speculate)
   const std::uint32_t* guess_host_ = nullptr;
-  std::uint32_t draft_len_ = 0;   // the draft length cap (auto) or the fixed length
+  std::uint32_t draft_len_ = 0;  // the draft length cap (auto) or the fixed length
   bool draft_auto_ = false, draft_on_ = true;
   LoomBuffer logits_, seed_;
   LoomBuffer tokens_mirror_;                    // host-local copy of the decoder's token stream (MarkToken)

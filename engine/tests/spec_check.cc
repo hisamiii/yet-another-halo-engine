@@ -6,10 +6,10 @@
 // and the output must be the reference. --time: then the cost of a step, a verify of 1 .. T tokens and an MTP draft
 // (each synced, the median of 9).
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
     while (out.size() < gen) {
       const std::uint32_t k = std::min<std::uint32_t>(T - 1, gen - 1 - static_cast<std::uint32_t>(out.size()));
       std::vector<std::uint32_t> draft(ref.begin() + out.size(), ref.begin() + out.size() + k);
-      const std::uint32_t wrong = round++ % T;   // a wrong draft at this index (none if past the draft)
+      const std::uint32_t wrong = round++ % T;  // a wrong draft at this index (none if past the draft)
       if (wrong < k) draft[wrong] = (draft[wrong] + 1) % V;
       if (k) dec.SetTokens(draft.data(), k, pos + 1);
       dec.Verify(pos, k + 1);
@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
       const std::vector<std::uint32_t> g = dec.VerifyResult(k + 1);
       std::uint32_t m = 0;
       while (m < k && draft[m] == g[m]) ++m;
-      for (std::uint32_t i = 0; i <= m; ++i) {   // the kept tokens' logits against the reference's
+      for (std::uint32_t i = 0; i <= m; ++i) {  // the kept tokens' logits against the reference's
         dec.CopyVerifyLogits(i, lg.data());
         const std::size_t at = out.size() + i;
         if (at < gen && std::memcmp(lg.data(), ref_logits.data() + at * V, std::size_t{V} * 4) != 0) {
@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
       dec.Accept(m);
       for (std::uint32_t i = 0; i < m; ++i) out.push_back(draft[i]);
       out.push_back(g[m]);
-      dec.SetTokens(&g[m], 1, pos + m + 1);   // (the next round's first token)
+      dec.SetTokens(&g[m], 1, pos + m + 1);  // (the next round's first token)
       pos += m + 1;
       accepted += m, ++counts[m];
     }

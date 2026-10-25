@@ -20,10 +20,10 @@
 namespace yah::serve::http {
 namespace {
 
-constexpr std::size_t kMaxHead = 64 * 1024;            // request line and headers
-constexpr std::size_t kMaxBody = 256 * 1024 * 1024;    // a request body
+constexpr std::size_t kMaxHead = 64 * 1024;          // request line and headers
+constexpr std::size_t kMaxBody = 256 * 1024 * 1024;  // a request body
 constexpr int kMaxConnections = 256;
-constexpr int kIdleSeconds = 60;                       // a keep-alive connection waiting for its next request
+constexpr int kIdleSeconds = 60;  // a keep-alive connection waiting for its next request
 
 std::string Lower(std::string_view s) {
   std::string out(s);
@@ -35,7 +35,7 @@ std::string_view Trim(std::string_view s) {
   while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.remove_suffix(1);
   return s;
 }
-bool HasToken(std::string_view list, std::string_view token) {   // a comma-separated header value, any case
+bool HasToken(std::string_view list, std::string_view token) {  // a comma-separated header value, any case
   const std::string l = Lower(list), t = Lower(token);
   for (std::size_t at = 0; at <= l.size();) {
     const std::size_t end = std::min(l.find(',', at), l.size());
@@ -157,23 +157,40 @@ bool ReadChunked(Reader& in, std::size_t max, const std::function<bool(const cha
 
 const char* Reason(int status) {
   switch (status) {
-    case 100: return "Continue";
-    case 200: return "OK";
-    case 204: return "No Content";
-    case 400: return "Bad Request";
-    case 401: return "Unauthorized";
-    case 403: return "Forbidden";
-    case 404: return "Not Found";
-    case 405: return "Method Not Allowed";
-    case 408: return "Request Timeout";
-    case 413: return "Content Too Large";
-    case 422: return "Unprocessable Content";
-    case 429: return "Too Many Requests";
-    case 431: return "Request Header Fields Too Large";
-    case 500: return "Internal Server Error";
-    case 501: return "Not Implemented";
-    case 503: return "Service Unavailable";
-    default: return status < 400 ? "OK" : "Error";
+    case 100:
+      return "Continue";
+    case 200:
+      return "OK";
+    case 204:
+      return "No Content";
+    case 400:
+      return "Bad Request";
+    case 401:
+      return "Unauthorized";
+    case 403:
+      return "Forbidden";
+    case 404:
+      return "Not Found";
+    case 405:
+      return "Method Not Allowed";
+    case 408:
+      return "Request Timeout";
+    case 413:
+      return "Content Too Large";
+    case 422:
+      return "Unprocessable Content";
+    case 429:
+      return "Too Many Requests";
+    case 431:
+      return "Request Header Fields Too Large";
+    case 500:
+      return "Internal Server Error";
+    case 501:
+      return "Not Implemented";
+    case 503:
+      return "Service Unavailable";
+    default:
+      return status < 400 ? "OK" : "Error";
   }
 }
 
@@ -241,7 +258,7 @@ bool Server::Listen(const std::string& host, int port) {
     const int c = ::accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
     if (c < 0) {
       if (errno == EINTR || errno == ECONNABORTED || errno == EMFILE || errno == ENFILE) continue;
-      break;   // Stop() shut the socket down
+      break;  // Stop() shut the socket down
     }
     if (connections_ >= kMaxConnections) {
       ::close(c);
@@ -265,7 +282,7 @@ void Server::Stop() {
 
 void Server::Serve(int fd) {
   const int one = 1;
-  ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);   // events go out as written
+  ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // events go out as written
   Reader in(fd);
   const auto fail = [&](int status) {
     const std::string r = "HTTP/1.1 " + std::to_string(status) + " " + Reason(status) +
@@ -275,7 +292,7 @@ void Server::Serve(int fd) {
   for (;;) {
     SetTimeout(fd, kIdleSeconds);
     std::string line;
-    do {   // (empty lines before a request are allowed)
+    do {  // (empty lines before a request are allowed)
       if (!in.Line(&line, kMaxHead)) return;
     } while (line.empty());
     SetTimeout(fd, 30);
@@ -286,7 +303,7 @@ void Server::Serve(int fd) {
     std::string target = line.substr(s1 + 1, s2 - s1 - 1);
     const std::string version = line.substr(s2 + 1);
     if (version != "HTTP/1.1" && version != "HTTP/1.0") return fail(400);
-    if (target.rfind("http://", 0) == 0) {   // absolute form
+    if (target.rfind("http://", 0) == 0) {  // absolute form
       const std::size_t slash = target.find('/', 7);
       target = slash == std::string::npos ? "/" : target.substr(slash);
     }
@@ -296,8 +313,7 @@ void Server::Serve(int fd) {
     std::size_t budget = kMaxHead;
     if (!ReadHeaders(in, &req.headers, &budget)) return fail(431);
     const std::string connection = req.Header("connection");
-    const bool keep_alive =
-        version == "HTTP/1.1" ? !HasToken(connection, "close") : HasToken(connection, "keep-alive");
+    const bool keep_alive = version == "HTTP/1.1" ? !HasToken(connection, "close") : HasToken(connection, "keep-alive");
     // the body
     const std::string te = req.Header("transfer-encoding"), cl = req.Header("content-length");
     const bool chunked = !te.empty();
@@ -321,7 +337,7 @@ void Server::Serve(int fd) {
 
 void Server::Respond(int fd, const Request& req, bool keep_alive, bool* ok) {
   Response res;
-  if (req.method == "OPTIONS") {   // a CORS preflight
+  if (req.method == "OPTIONS") {  // a CORS preflight
     res.status = 204;
     res.headers = {{"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
                    {"Access-Control-Allow-Headers", req.Header("access-control-request-headers").empty()
@@ -360,7 +376,7 @@ void Server::Respond(int fd, const Request& req, bool keep_alive, bool* ok) {
     try {
       res.stream(sink);
     } catch (...) {
-      return void(*ok = false);   // the stream cannot carry an error status any more: drop the connection
+      return void(*ok = false);  // the stream cannot carry an error status any more: drop the connection
     }
     *ok = sink.ok() && SendAll(fd, "0\r\n\r\n");
     return;
@@ -373,11 +389,16 @@ void Server::Respond(int fd, const Request& req, bool keep_alive, bool* ok) {
 
 const char* ToString(Result::Error e) {
   switch (e) {
-    case Result::Error::kNone: return "Success";
-    case Result::Error::kConnect: return "Could not establish connection";
-    case Result::Error::kWrite: return "Failed to write connection";
-    case Result::Error::kRead: return "Failed to read connection";
-    case Result::Error::kCanceled: return "Connection handling canceled";
+    case Result::Error::kNone:
+      return "Success";
+    case Result::Error::kConnect:
+      return "Could not establish connection";
+    case Result::Error::kWrite:
+      return "Failed to write connection";
+    case Result::Error::kRead:
+      return "Failed to read connection";
+    case Result::Error::kCanceled:
+      return "Connection handling canceled";
   }
   return "Unknown";
 }
@@ -396,7 +417,9 @@ Client::Client(const std::string& url) {
   if (host_.size() > 2 && host_.front() == '[' && host_.back() == ']') host_ = host_.substr(1, host_.size() - 2);
 }
 
-Result Client::Get(const std::string& path, const Headers& headers) { return Send("GET", path, "", "", headers, {}); }
+Result Client::Get(const std::string& path, const Headers& headers) {
+  return Send("GET", path, "", "", headers, {});
+}
 
 Result Client::Post(const std::string& path, const std::string& body, const std::string& content_type,
                     const Headers& headers, const std::function<bool(const char*, std::size_t)>& receiver) {
@@ -428,8 +451,8 @@ Result Client::Send(const std::string& method, const std::string& path, const st
     ~Closer() { ::close(fd); }
   } closer{fd};
   SetTimeout(fd, read_timeout_);
-  std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + host_ + ":" + std::to_string(port_) +
-                    "\r\nConnection: close\r\n";
+  std::string req =
+      method + " " + path + " HTTP/1.1\r\nHost: " + host_ + ":" + std::to_string(port_) + "\r\nConnection: close\r\n";
   for (const auto& [k, v] : headers) req += k + ": " + v + "\r\n";
   if (method == "POST") {
     if (!content_type.empty()) req += "Content-Type: " + content_type + "\r\n";
@@ -442,7 +465,7 @@ Result Client::Send(const std::string& method, const std::string& path, const st
   }
   Reader in(fd);
   std::string line;
-  do {   // (interim 1xx responses skipped)
+  do {  // (interim 1xx responses skipped)
     r.headers.clear();
     std::size_t budget = kMaxHead;
     if (!in.Line(&line, kMaxHead) || line.size() < 12 || line.rfind("HTTP/1.", 0) != 0 ||
@@ -461,12 +484,18 @@ Result Client::Send(const std::string& method, const std::string& path, const st
   const std::string te = r.Header("transfer-encoding"), cl = r.Header("content-length");
   std::size_t length = 0;
   bool read_ok = false;
-  if (method == "HEAD" || r.status == 204 || r.status == 304) read_ok = true;
-  else if (HasToken(te, "chunked")) read_ok = ReadChunked(in, SIZE_MAX, out);
-  else if (!cl.empty()) read_ok = ParseSize(cl, &length) && in.Bytes(length, out);
-  else read_ok = in.Rest(out);
-  if (canceled) r.error = Result::Error::kCanceled;
-  else if (!read_ok) r.error = Result::Error::kRead;
+  if (method == "HEAD" || r.status == 204 || r.status == 304)
+    read_ok = true;
+  else if (HasToken(te, "chunked"))
+    read_ok = ReadChunked(in, SIZE_MAX, out);
+  else if (!cl.empty())
+    read_ok = ParseSize(cl, &length) && in.Bytes(length, out);
+  else
+    read_ok = in.Rest(out);
+  if (canceled)
+    r.error = Result::Error::kCanceled;
+  else if (!read_ok)
+    r.error = Result::Error::kRead;
   return r;
 }
 
