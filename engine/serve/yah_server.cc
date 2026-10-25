@@ -53,6 +53,7 @@ class Server {
       SamplingParams sampling;
       sampling.temperature = static_cast<float>(request.temperature);
       sampling.top_p = static_cast<float>(request.top_p);
+      sampling.top_k = 20;   // Qwen3.8's recommended top_k, as /v1/chat/completions defaults to
       std::vector<TokenId> prompt;
       const GenerateParams params =
           Prepare(request.messages, request.chat, request.max_output_tokens, sampling, "input", "max_output_tokens",

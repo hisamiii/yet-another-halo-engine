@@ -199,7 +199,8 @@ def main():
         emit_src(gen_rot.gen_norm(5120, awq=False, early=True), "drot_norm_head", outdir)
         open(os.path.join(outdir, "rot_signs.bin"), "wb").write(gen_rot.signs())
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
-    emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-p sampling into the token stream
+    emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-k / top-p / min-p sampling into the token stream
+    emit_src(DM.gen_penalty(T=T), "penalty", outdir)     # repetition / frequency / presence penalties on the logits
     open(os.path.join(outdir, "decode.txt"), "w").write(
         "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\nnormrot - 0 0\nswrot - 0 0\n" if rot else "") + (("chain - 0 0\n")) + (("amax - 0 0\n")) + ("latestate - 0 0\n" if DM.LATE_STATE else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))

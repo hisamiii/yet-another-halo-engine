@@ -11,7 +11,8 @@
 
 namespace yah::model {
 
-// llama.cpp's sampler chain: penalties on the logits, then top-k, top-p and min-p, then the draw at temperature.
+// Penalties on the logits, then softmax at temperature cut by top-k, top-p and min-p in that order (vLLM's and
+// transformers' order), then an exact draw. All on the GPU (gen_decode_misc gen_penalty, gen_sample).
 struct SamplingParams {
   float temperature = 0.0f;  // 0: greedy (argmax on the GPU)
   float top_p = 1.0f;

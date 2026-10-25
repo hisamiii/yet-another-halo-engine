@@ -102,7 +102,7 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids
 
 ## Serving
 
-`engine/build/yah_server` serves the model over the OpenAI Responses API. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and `YAH_KV`. The default is 32K context with kv8a16 KV:
+`engine/build/yah_server` serves the model over the OpenAI Responses and Chat Completions APIs. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and `YAH_KV`. The default is 32K context with kv8a16 KV:
 
 ```
 cd engine/gpu/loom
@@ -114,7 +114,7 @@ engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill
 engine/build/yah_server --model <model> --fake    # canned replies, CPU only: for clients and API tests
 ```
 
-A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). Decode runs two steps ahead of the host: each step picks its token on the GPU (argmax, or for `temperature` > 0 `yah_dec_sample`: softmax at T cut to the top-p nucleus, an exact draw by Gumbel-max, ~1 ms) into the token stream the next step reads, and the host only reads the tokens (a host-mapped copy) to stream them and stop. A given seed draws other tokens than the earlier host sampler did; the distribution is the same. `loom_forward_pp` takes any token count the same way.
+A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). Decode runs two steps ahead of the host: each step picks its token on the GPU (argmax, or for `temperature` > 0 `yah_dec_sample`: softmax at T cut by top-k, then top-p, then min-p, an exact draw by Gumbel-max; 0.84 ms with top_k 20, 1.0 ms with top-k off) into the token stream the next step reads, and the host only reads the tokens (a host-mapped copy) to stream them and stop. A given seed draws other tokens than the earlier host sampler did; the distribution is the same. With penalties, `yah_dec_penalty` first adjusts the logits from the last `repeat_last_n` tokens of the stream (prompt included, up to 1024) the way llama.cpp does, and the argmax then runs as its own kernel. `loom_forward_pp` takes any token count the same way.
 
 For quick tests, `engine/build/yah_chat` is a terminal chat client: it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply. Commands: `/reset`, `/effort E`, `/temp T`, `/max N`, `/system TEXT`, `/quit`; Ctrl-C stops a reply.
 
@@ -137,14 +137,19 @@ print(r.output_text)
 for event in client.responses.create(model="qwen", input="Hi", stream=True):
     if event.type == "response.output_text.delta":
         print(event.delta, end="", flush=True)
+for chunk in client.chat.completions.create(model="qwen", messages=[{"role": "user", "content": "Hi"}], stream=True,
+                                            reasoning_effort="none"):
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
 | | |
 |---|---|
-| endpoints | `POST /v1/responses` (plain and `stream: true` SSE), `GET /v1/models`, `GET /health` |
+| endpoints | `POST /v1/responses` and `POST /v1/chat/completions` (plain and `stream: true` SSE), `GET /v1/models`, `GET /health` |
 | input | a string, or a list of `system` / `developer` / `user` / `assistant` messages with string or text-part content; `reasoning` items from earlier output; `instructions` |
 | reasoning | `reasoning.effort`: `none` / `minimal` (thinking off), `low`, `medium`, `high` (default, the template's `xhigh`). The thinking text comes back as a `reasoning` output item with `reasoning_text` content |
-| sampling | `temperature` (default 0.6), `top_p` (default 0.95), `max_output_tokens` (default: the rest of the context; prompt + max must fit) |
+| sampling | `temperature` (default 0.6), `top_p` (default 0.95), top-k 20, `max_output_tokens` (default: the rest of the context; prompt + max must fit) |
+| chat completions | `messages` as above; `max_completion_tokens` or `max_tokens`; `temperature`, `top_p`, `top_k` (default 20; 0 or -1: off), `min_p`, `presence_penalty`, `frequency_penalty` (-2..2), `repetition_penalty`, `repeat_last_n` (default 64, up to 1024), `seed`, `stop` (a string or up to 16), `stream` with `stream_options.include_usage`; `reasoning_effort` or `chat_template_kwargs.enable_thinking`. Reasoning comes back as `reasoning_content`. `n` must be 1 |
 | accepted and ignored | `store`, `metadata` (echoed), `user`, `service_tier`, `parallel_tool_calls`, and default values of `tool_choice`, `text`, `truncation` |
 | not supported (400) | tools, `previous_response_id` and stored responses, images and files, structured output, logprobs |
 

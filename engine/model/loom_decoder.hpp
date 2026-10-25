@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "model/generator.hpp"
 #include "core/config.hpp"
 #include "core/gguf.hpp"
 #include "model/loom_runtime.hpp"
@@ -116,7 +117,8 @@ class LoomDecoder {
     logits_ = &Alloc(std::size_t{kVocab} * 4);
     if (amax_) amaxk_ = &Alloc(16);   // u64 max key + i32 workgroup count, both back to 0 after each step
     sink_ = &Alloc(4);
-    sparams_ = &Alloc(16);
+    sparams_ = &Alloc(32);
+    pparams_ = &Alloc(16);
     toks_ = &Alloc((std::size_t{T_} + 1) * 4);
     posarr_ = &Alloc(std::size_t{T_} * 4);
     eps_ = &Alloc(4);
@@ -134,7 +136,8 @@ class LoomDecoder {
     for (std::uint32_t i = 0; i < T_; ++i) pv[i] = static_cast<std::int32_t>(i);
     gpu_.H2D(*posarr_, pv.data(), pv.size() * 4);
     trace_ = std::getenv("YAH_DEC_TRACE") != nullptr;
-    Load("sample");   // now, not in the first sampled request (a set emitted before sampling stops here)
+    Load("sample");    // now, not in the first sampled request (a set emitted before sampling stops here)
+    Load("penalty");
   }
 
   [[nodiscard]] std::uint32_t context() const { return T_; }
@@ -308,27 +311,46 @@ class LoomDecoder {
       Dispatch(Load("drot_head"), kHidden / 1024, 1, 64, {Ref(*normed_), Ref(*rot_signs_)});
     }
     const bool sample = sampling_ && pos + 1 >= keep_from;
+    const bool penalize = penalized_ && pos + 1 >= keep_from;
     const hrx_buffer_ref_t tok = pos + 1 >= keep_from ? TokenRef(pos + 1) : Ref(*sink_);
-    Gemv("plain", {"output.weight"}, *normed_, *logits_, {}, amax_ && !sample ? &tok : nullptr);
+    Gemv("plain", {"output.weight"}, *normed_, *logits_, {}, amax_ && !sample && !penalize ? &tok : nullptr);
     Tr("logits", 99, *logits_, kVocab);
     cs_cur_ = 1 - cs_cur_;
+    if (penalize) Penalize(Ref(*logits_), pos);
     if (sample)
       Sample(Ref(*logits_), pos, TokenRef(pos + 1));
-    else if (!amax_)
+    else if (!amax_ || penalize)
       Dispatch(Load("argmax"), 1, 1, 1024, {Ref(*logits_), tok});
   }
 
-  // From now on the steps whose token is kept sample it (gen_decode_misc.gen_sample: softmax(logits / t) cut to its
-  // top_p nucleus, an exact draw seeded by seed and the step's position) instead of taking the argmax; t <= 0: argmax.
-  // In stream order, so a run of steps queued before keeps its mode.
-  void SetSampling(float t, float top_p, std::uint64_t seed) {
-    sampling_ = t > 0.0f;
+  // From now on the steps whose token is kept sample it (gen_decode_misc.gen_sample: softmax(logits / t) cut by top_k,
+  // top_p and min_p, an exact draw seeded by seed and the step's position) instead of taking the argmax; t <= 0:
+  // argmax. With penalties (gen_penalty) the logits first get them from the token stream, which must hold the prompt
+  // (SetTokens). In stream order, so a run of steps queued before keeps its mode.
+  void SetSampling(const SamplingParams& s, std::uint64_t seed) {
+    penalized_ = s.penalized();
+    if (penalized_) {
+      std::uint32_t q[4];
+      std::memcpy(&q[0], &s.presence_penalty, 4), std::memcpy(&q[1], &s.frequency_penalty, 4);
+      std::memcpy(&q[2], &s.repetition_penalty, 4);
+      q[3] = s.penalty_last_n;
+      gpu_.Update(*pparams_, q, sizeof q);
+    }
+    sampling_ = s.temperature > 0.0f;
     if (!sampling_) return;
-    Load("sample");
-    std::uint32_t p[4];
-    std::memcpy(&p[0], &t, 4), std::memcpy(&p[1], &top_p, 4);
+    std::uint32_t p[8] = {};
+    std::memcpy(&p[0], &s.temperature, 4), std::memcpy(&p[1], &s.top_p, 4);
     p[2] = static_cast<std::uint32_t>(seed), p[3] = static_cast<std::uint32_t>(seed >> 32);
+    p[4] = s.top_k;
+    std::memcpy(&p[5], &s.min_p, 4);
     gpu_.Update(*sparams_, p, sizeof p);
+  }
+  [[nodiscard]] bool penalized() const { return penalized_; }
+  // The penalties (SetSampling) on logits produced by the step at position at, from toks[at + 1 - last_n .. at].
+  void Penalize(const hrx_buffer_ref_t& logits, std::uint32_t at) {
+    if (at >= T_) throw LoomError("decoder: position past the set's context");
+    Dispatch(Load("penalty"), 1, 1, 1024,
+             {logits, Ref(*toks_), Ref(*pparams_), {posarr_->handle, std::size_t{at} * 4, 4}});
   }
   // Samples a token from logits (SetSampling's parameters) into dst; at: the position of the step that produced the
   // logits (the draw's counter).
@@ -516,6 +538,7 @@ class LoomDecoder {
   bool amax_ = false;      // decode.txt "amax"
   bool late_ = false;      // decode.txt "latestate"
   bool sampling_ = false;  // SetSampling
+  bool penalized_ = false;
   hrx_buffer_t cs_[2] = {nullptr, nullptr};  // conv state ping-pong
   int cs_cur_ = 0;
   std::deque<LoomBuffer> keep_;  // deque: Alloc hands out references that must stay valid
@@ -524,7 +547,7 @@ class LoomDecoder {
   std::map<std::string, std::uint32_t> grid_;
   LoomDecoderState st_;
   LoomBuffer *hidden_, *normed_, *qg_, *q_, *gate_, *kb_, *vb_, *aout_, *qkv_, *alpha_, *beta_, *ssmout_, *ffnact_,
-      *logits_, *amaxk_ = nullptr, *sink_, *sparams_, *toks_, *posarr_, *eps_, *c32a_, *c32b_, *c16a_, *c16b_, *acc_, *ml_;
+      *logits_, *amaxk_ = nullptr, *sink_, *sparams_, *pparams_, *toks_, *posarr_, *eps_, *c32a_, *c32b_, *c16a_, *c16b_, *acc_, *ml_;
   LoomBuffer *rot_signs_ = nullptr, *rotx_ = nullptr, *swcnt_ = nullptr;
 };
 

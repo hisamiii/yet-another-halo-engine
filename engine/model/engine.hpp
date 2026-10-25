@@ -78,6 +78,12 @@ class Engine : public TextGenerator {
         params.sampling.seed ? params.sampling.seed : static_cast<std::uint64_t>(t0.time_since_epoch().count());
     const bool greedy = params.sampling.temperature <= 0.0f;
 
+    if (params.sampling.penalized()) {
+      // The penalty window reads the prompt from the decoder's token stream. A host write: the steps the last request
+      // queued past its stop must not land after it.
+      gpu_.Synchronize();
+      decoder_.SetTokens(prompt.data(), n, 0);
+    }
     // Prompt: whole chunks through the prefill; the tail as one more partial chunk or through decode steps, whichever
     // the measured costs say is cheaper (a partial chunk runs only the GEMM token tiles that hold its tokens).
     prefill_.Reset();
@@ -114,7 +120,7 @@ class Engine : public TextGenerator {
     // Every token, greedy or sampled (LoomDecoder::SetSampling), is picked on the GPU into the decoder's token stream,
     // which the next step reads, so the steps run kAhead ahead of the token the host reads; made[i] marks the copy of
     // the host's next token + i into tokens_host_. At most kAhead steps past a stop run for nothing.
-    decoder_.SetSampling(params.sampling.temperature, params.sampling.top_p, seed);
+    decoder_.SetSampling(params.sampling, seed);
     const bool tail_steps = tail && !tail_chunk;
     const auto ts = std::chrono::steady_clock::now();
     if (tail_steps) {
@@ -122,6 +128,7 @@ class Engine : public TextGenerator {
       for (std::uint32_t pos = full; pos < n; ++pos) decoder_.Step(pos, n);   // the last one picks token n
     } else {
       decoder_.ResumeAt(n);
+      if (decoder_.penalized()) decoder_.Penalize(Ref(logits_), n - 1);
       if (greedy)
         prefill_.Argmax(Ref(logits_), decoder_.TokenRef(n));
       else
