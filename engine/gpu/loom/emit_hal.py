@@ -64,22 +64,13 @@ def main():
     # a per-call directory: emits may run in parallel (engine/tune)
     tmpdir = tempfile.mkdtemp(prefix="emit_hal_")
     rewritten = os.path.join(tmpdir, stem + "_emit.loom")
-    # YAH_LOOM_TARGET selects the compile target: default gfx1151 (1536-VGPR file, granule 24).
-    # gfx11-generic models the 1024-VGPR RDNA3 parts.
-    tgt = os.environ.get("YAH_LOOM_TARGET", "gfx1151")
-    text = "\n".join(out) + "\n"
-    if tgt != "gfx1151":
-        text = text.replace("amdgpu.target<gfx1151>", "amdgpu.target<%s>" % tgt)
     with open(rewritten, "w") as f:
-        f.write(text)
-    # YAH_EMIT_KEEP=<dir>: keep the specialized source (for loom-compile --compile-report)
-    if os.environ.get("YAH_EMIT_KEEP"):
-        shutil.copy(rewritten, os.environ["YAH_EMIT_KEEP"])
+        f.write("\n".join(out) + "\n")
 
     hal_path = os.path.join(outdir, stem + ".hal")
     target = os.path.join(outdir, stem + ".hsaco")
     cmd = [hrx_paths.IREE_RUN_LOOM,
-           rewritten, "--device=amdgpu", "--target=amdgpu:" + tgt,
+           rewritten, "--device=amdgpu", "--target=amdgpu:gfx1151",
            "--emit-only", "--emit-hal-executable=" + hal_path,
            "--emit-target-artifact=" + target]
     result = subprocess.run(cmd, env=hrx_paths.env(), capture_output=True, text=True)

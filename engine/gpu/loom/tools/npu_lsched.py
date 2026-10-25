@@ -7,34 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import hrx_paths
 sys.path.insert(0, os.path.join(hrx_paths.HRX, "loom", "py"))
 _MODEL = None
-_RES = None
-
-
-def resources():
-    """mnemonic -> [(resource, cycle offset, cycles, required)] from the AIE2P itineraries (LLVM scoreboard rule:
-    required stages conflict with required and reserved bookings, reserved stages only with required ones)."""
-    global _RES
-    if _RES is None:
-        import loom.target.arch.amd.xdna.aie2p.core_schedule_data as SD
-        from loom.target.arch.amd.xdna.aie2p.core_descriptors import AIE2P_CORE_DESCRIPTOR_SET as S
-        its = {it.name.lower(): it for it in SD.CORE_SCHEDULE_TABLE.itineraries}
-        ds = getattr(S, "descriptors", None) or S
-        r = {}
-        for d in ds:
-            mn = d.asm_forms[0].mnemonic
-            if mn in r or "volatile" in d.key:
-                continue
-            parts = str(getattr(d, "schedule_class", "") or "").split(".")
-            it = its.get(parts[4]) if len(parts) > 4 else None
-            out, t = [], 0
-            for st in (it.stages if it else ()):
-                for res in st.resources:
-                    if res != "EMPTY_FU" and st.cycles:
-                        out.append((res, t, st.cycles, st.kind.name == "REQUIRED"))
-                t += st.cycles if st.time_increment == -1 else st.time_increment
-            r[mn] = out
-        _RES = r
-    return _RES
+LAT = {"vshuffle": 3}   # result-ready stage overrides ("mnemonic" or "prefix*"): the packer's shuffle spacing (520 -> 505 bundles)
 BLOCK = None   # set to a Counter to count why active streams' head ops wait
 TRACE = None   # set to [] to record (cycle, stream, op) of the next schedule() calls
 
@@ -57,10 +30,7 @@ def model():
             ready = tuple(o.ready_stage for o in d.operands if o.role.name == "RESULT") or (1,)
             reads = [ops[n].read_stage if n in ops else 1 for n in f.operands]
             m[f.mnemonic] = (slot, ready, reads)
-        # LS_LAT="mnemonic=ready,...": override result-ready stages (latency experiments)
-        import os
-        for item in filter(None, os.environ.get("LS_LAT", "").split(",")):
-            k_, v_ = item.split("=")
+        for k_, v_ in LAT.items():
             for mn in list(m):
                 if mn == k_ or mn.startswith(k_ + "*") or (k_.endswith("*") and mn.startswith(k_[:-1])):
                     m[mn] = (m[mn][0], (int(v_),) + m[mn][1][1:], m[mn][2])
@@ -126,11 +96,6 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
     At most `window` streams are active at a time (bounds register pressure); full: VEC_FULL / ACC_FULL units.
     Returns the op list."""
     M = model()
-    RES = resources() if os.environ.get("LS_RES", "0") == "1" else {}
-    req, rsv = set(), set()     # scoreboard: (cycle, resource) booked by required / reserved stages
-    # Loom orders a load after an earlier store (may-alias local memory): >= ST2LD cycles later (measured 4)
-    st2ld = int(os.environ.get("LS_ST2LD", "0"))
-    last_store = [-100]
     n = len(streams)
     tails = tails or [[] for _ in range(n)]
     seqs = [list(s) + list(t) for s, t in zip(streams, tails)]
@@ -227,20 +192,8 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
                 free = mn.startswith(FREE) or mn == ""
                 info = M.get(mn, ("none", (1,), []))
                 slot = "free" if free else info[0]
-                # gathers (vldb.4x*) issue in the ldb slot but book load unit A's address port (DM_ADA, itinerary
-                # II_VLDB_4x32_*): no vlda in the same bundle
-                extra = ("lda",) if mn.startswith("vldb.4x") and os.environ.get("LS_GX", "0") == "1" else ()
-                if not free and (used.get(slot, 0) >= 1 or any(used.get(x_, 0) for x_ in extra)):
+                if not free and used.get(slot, 0) >= 1:
                     if BLOCK is not None: BLOCK[f"slot {slot}"] += 1
-                    continue
-                is_load = mn.startswith(("vlda", "vldb", "lda"))
-                is_store = mn.startswith(("vst", "st"))
-                if is_load and cyc < last_store[0] + st2ld:
-                    if BLOCK is not None: BLOCK["store->load"] += 1
-                    continue
-                book = [] if free else [(cyc + o + j, r_, need) for r_, o, c_, need in RES.get(mn, ()) for j in range(c_)]
-                if any(((c_, r_) in req or (need and (c_, r_) in rsv)) for c_, r_, need in book):
-                    if BLOCK is not None: BLOCK[f"res {mn}"] += 1
                     continue
                 ok = True
                 for k, u in enumerate(uses):
@@ -289,12 +242,6 @@ def schedule(streams, window=4, tails=None, budget=None, hard=(24, 20, 3), ext=(
                     TRACE.append((cyc, i, op.strip()[:60]))
                 if not free:
                     used[slot] = used.get(slot, 0) + 1
-                    for x_ in extra:
-                        used[x_] = used.get(x_, 0) + 1
-                    for c_, r_, need in book:
-                        (req if need else rsv).add((c_, r_))
-                if is_store:
-                    last_store[0] = cyc
                 for j, d in enumerate(defs):
                     # calibrated: accumulating vec-slot ops (MAC / f32 add) feed any consumer ~9 cycles later
                     rd = info[1][min(j, len(info[1]) - 1)]
