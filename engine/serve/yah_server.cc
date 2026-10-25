@@ -1,10 +1,12 @@
-// yah_server: the OpenAI Responses API (POST /v1/responses) over one TextGenerator, one generation at a time.
+// yah_server: the OpenAI Responses API (POST /v1/responses) and Chat Completions API (POST /v1/chat/completions)
+// over one TextGenerator, one generation at a time.
 // Built with YAH_SERVE_FAKE_ONLY (the CMake target yah_server_fake) it has only --fake: no Engine, no HRX, no GPU.
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,6 +15,7 @@
 #include "model/engine.hpp"
 #endif
 #include "model/generator.hpp"
+#include "serve/chat_completions.hpp"
 #include "serve/chat_template.hpp"
 #include "serve/fake_generator.hpp"
 #include "serve/responses.hpp"
@@ -22,6 +25,7 @@ namespace {
 using yah::core::TokenId;
 using yah::model::GenerateParams;
 using yah::model::GenerateResult;
+using yah::model::SamplingParams;
 using yah::model::TextGenerator;
 using namespace yah::serve;
 
@@ -45,54 +49,28 @@ class Server {
 
   void Responses(const httplib::Request& req, httplib::Response& res) {
     try {
-      Json body;
-      try {
-        body = Json::parse(req.body);
-      } catch (const Json::parse_error& error) {
-        throw ApiError(400, std::string("Invalid JSON body: ") + error.what());
-      }
-      const ResponseRequest request = ParseResponseRequest(body);
-      std::string text;
-      try {
-        text = RenderChat(request.messages, request.chat);
-      } catch (const std::invalid_argument& error) {
-        throw ApiError(400, error.what(), "input");
-      }
-      const std::vector<TokenId> prompt = generator_.tokenizer().Encode(text);
+      const ResponseRequest request = ParseResponseRequest(ParseBody(req));
+      SamplingParams sampling;
+      sampling.temperature = static_cast<float>(request.temperature);
+      sampling.top_p = static_cast<float>(request.top_p);
+      std::vector<TokenId> prompt;
+      const GenerateParams params =
+          Prepare(request.messages, request.chat, request.max_output_tokens, sampling, "input", "max_output_tokens",
+                  &prompt);
+      Serve<ResponseStream>(request, request.stream, prompt, params, res);
+    } catch (const ApiError& error) {
+      res.status = error.status;
+      res.set_content(Dump(ErrorBody(error)), "application/json");
+    }
+  }
 
-      const std::uint32_t context = generator_.context();
-      const auto prompt_tokens = static_cast<std::uint32_t>(prompt.size());
-      GenerateParams params;
-      params.stop_ids = stop_ids_;
-      params.sampling.temperature = static_cast<float>(request.temperature);
-      params.sampling.top_p = static_cast<float>(request.top_p);
-      if (prompt_tokens >= context) {
-        throw ApiError(400,
-                       "The input has " + std::to_string(prompt_tokens) + " tokens; the context is " +
-                           std::to_string(context) + ".",
-                       "input", "context_length_exceeded");
-      }
-      params.max_tokens = request.max_output_tokens.value_or(context - prompt_tokens);
-      if (params.max_tokens > context - prompt_tokens) {
-        throw ApiError(400,
-                       "input (" + std::to_string(prompt_tokens) + " tokens) + max_output_tokens (" +
-                           std::to_string(params.max_tokens) + ") exceeds the context of " + std::to_string(context) +
-                           " tokens.",
-                       "max_output_tokens", "context_length_exceeded");
-      }
-
-      if (!request.stream) {
-        ResponseStream stream(request, nullptr);
-        Run(stream, prompt, params);
-        res.set_content(Dump(stream.Response()), "application/json");
-        return;
-      }
-      res.set_header("Cache-Control", "no-cache");
-      auto provider = [this, request, prompt, params](std::size_t, httplib::DataSink& sink) {
-        Stream(request, prompt, params, sink);
-        return true;
-      };
-      res.set_chunked_content_provider("text/event-stream", provider);
+  void ChatCompletions(const httplib::Request& req, httplib::Response& res) {
+    try {
+      const ChatRequest request = ParseChatRequest(ParseBody(req));
+      std::vector<TokenId> prompt;
+      const GenerateParams params =
+          Prepare(request.messages, request.chat, request.max_tokens, request.sampling, "messages", "max_tokens", &prompt);
+      Serve<ChatStream>(request, request.stream, prompt, params, res);
     } catch (const ApiError& error) {
       res.status = error.status;
       res.set_content(Dump(ErrorBody(error)), "application/json");
@@ -106,9 +84,69 @@ class Server {
   }
 
  private:
-  void Stream(const ResponseRequest& request, const std::vector<TokenId>& prompt, const GenerateParams& params,
+  static Json ParseBody(const httplib::Request& req) {
+    try {
+      return Json::parse(req.body);
+    } catch (const Json::parse_error& error) {
+      throw ApiError(400, std::string("Invalid JSON body: ") + error.what());
+    }
+  }
+
+  // The prompt tokens and the generation limits of a chat; ApiError (400) past the context.
+  GenerateParams Prepare(const std::vector<ChatMessage>& messages, const ChatOptions& chat,
+                         std::optional<std::uint32_t> max_tokens, const SamplingParams& sampling,
+                         const char* input_param, const char* max_param, std::vector<TokenId>* prompt) {
+    std::string text;
+    try {
+      text = RenderChat(messages, chat);
+    } catch (const std::invalid_argument& error) {
+      throw ApiError(400, error.what(), input_param);
+    }
+    *prompt = generator_.tokenizer().Encode(text);
+    const std::uint32_t context = generator_.context();
+    const auto prompt_tokens = static_cast<std::uint32_t>(prompt->size());
+    GenerateParams params;
+    params.stop_ids = stop_ids_;
+    params.sampling = sampling;
+    if (prompt_tokens >= context) {
+      throw ApiError(400,
+                     "The input has " + std::to_string(prompt_tokens) + " tokens; the context is " +
+                         std::to_string(context) + ".",
+                     input_param, "context_length_exceeded");
+    }
+    params.max_tokens = max_tokens.value_or(context - prompt_tokens);
+    if (params.max_tokens > context - prompt_tokens) {
+      throw ApiError(400,
+                     std::string(input_param) + " (" + std::to_string(prompt_tokens) + " tokens) + " + max_param +
+                         " (" + std::to_string(params.max_tokens) + ") exceeds the context of " +
+                         std::to_string(context) + " tokens.",
+                     max_param, "context_length_exceeded");
+    }
+    return params;
+  }
+
+  // One generation as a JSON body or, with stream, as server-sent events. S: ResponseStream or ChatStream.
+  template <class S, class Request>
+  void Serve(const Request& request, bool stream, const std::vector<TokenId>& prompt, const GenerateParams& params,
+             httplib::Response& res) {
+    if (!stream) {
+      S s(request, nullptr);
+      Run(s, prompt, params);
+      res.set_content(Dump(s.Response()), "application/json");
+      return;
+    }
+    res.set_header("Cache-Control", "no-cache");
+    auto provider = [this, request, prompt, params](std::size_t, httplib::DataSink& sink) {
+      Stream<S>(request, prompt, params, sink);
+      return true;
+    };
+    res.set_chunked_content_provider("text/event-stream", provider);
+  }
+
+  template <class S, class Request>
+  void Stream(const Request& request, const std::vector<TokenId>& prompt, const GenerateParams& params,
               httplib::DataSink& sink) {
-    ResponseStream stream(request, [&sink](const std::string& event) {
+    S stream(request, [&sink](const std::string& event) {
       return sink.is_writable() && sink.write(event.data(), event.size());
     });
     try {
@@ -119,7 +157,8 @@ class Server {
     sink.done();
   }
 
-  void Run(ResponseStream& stream, const std::vector<TokenId>& prompt, const GenerateParams& params) {
+  template <class S>
+  void Run(S& stream, const std::vector<TokenId>& prompt, const GenerateParams& params) {
     std::lock_guard lock(mutex_);
     GenerateResult result;
     result.prompt_tokens = static_cast<std::uint32_t>(prompt.size());
@@ -193,6 +232,8 @@ int main(int argc, char** argv) {
     httplib::Server http;
     http.Post("/v1/responses",
               [&](const httplib::Request& req, httplib::Response& res) { server.Responses(req, res); });
+    http.Post("/v1/chat/completions",
+              [&](const httplib::Request& req, httplib::Response& res) { server.ChatCompletions(req, res); });
     http.Get("/v1/models", [&](const httplib::Request& req, httplib::Response& res) { server.Models(req, res); });
     http.Get("/health", [](const httplib::Request&, httplib::Response& res) {
       res.set_content(R"({"status":"ok"})", "application/json");

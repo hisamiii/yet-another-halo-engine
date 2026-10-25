@@ -22,6 +22,18 @@ using Json = nlohmann::ordered_json;
 // Serializes with invalid UTF-8 replaced by U+FFFD instead of throwing.
 [[nodiscard]] std::string Dump(const Json& value);
 
+// Request helpers shared by the endpoints.
+[[nodiscard]] std::string RandomId(const char* prefix);
+// Length of the longest prefix of s that does not end inside a UTF-8 sequence.
+[[nodiscard]] std::size_t CompleteUtf8(std::string_view s);
+// The member, or nullptr when it is missing or null.
+[[nodiscard]] const Json* Field(const Json& object, const char* key);
+[[nodiscard]] bool IsEmptyValue(const Json& v);
+// Fields we do not implement but that are harmless at these values.
+[[nodiscard]] bool IsDefaultValue(const std::string& key, const Json& v);
+// The number at key, fallback when missing; throws ApiError outside [lo, hi].
+[[nodiscard]] double Number(const Json& body, const char* key, double fallback, double lo, double hi);
+
 // An OpenAI-style error: an HTTP status and the fields of {"error": {...}}.
 struct ApiError : std::runtime_error {
   ApiError(int status, const std::string& message, std::string param = "", std::string code = "",

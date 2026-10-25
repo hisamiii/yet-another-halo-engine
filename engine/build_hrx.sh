@@ -43,6 +43,7 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # The Responses API server (engine/serve).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" \
     "$root/engine/serve/yah_server.cc" "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
+    "$root/engine/serve/chat_completions.cpp" \
     "$root/engine/third_party/httplib/httplib.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread

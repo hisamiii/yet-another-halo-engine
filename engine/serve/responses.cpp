@@ -12,14 +12,6 @@ namespace {
 
 constexpr std::string_view kThinkEnd = "</think>";
 
-std::string RandomId(const char* prefix) {
-  thread_local std::mt19937_64 rng(std::random_device{}());
-  char buf[40];
-  std::snprintf(buf, sizeof(buf), "%016llx%016llx", static_cast<unsigned long long>(rng()),
-                static_cast<unsigned long long>(rng()));
-  return std::string(prefix) + buf;
-}
-
 // llama.cpp's string_strip whitespace.
 bool IsSpace(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
@@ -33,52 +25,6 @@ std::string StripSpace(std::string_view s, bool leading) {
     while (begin < end && IsSpace(s[begin])) ++begin;
   }
   return std::string(s.substr(begin, end - begin));
-}
-
-// Length of the longest prefix of s that does not end inside a UTF-8 sequence.
-std::size_t CompleteUtf8(std::string_view s) {
-  const std::size_t n = s.size();
-  for (std::size_t back = 1; back <= 4 && back <= n; ++back) {
-    const auto b = static_cast<unsigned char>(s[n - back]);
-    if ((b & 0xC0) == 0x80) continue;
-    const std::size_t len = (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : (b >> 3) == 0x1E ? 4 : 1;
-    return len > back ? n - back : n;
-  }
-  return n;
-}
-
-const Json* Field(const Json& object, const char* key) {
-  const auto it = object.find(key);
-  if (it == object.end() || it->is_null()) return nullptr;
-  return &*it;
-}
-
-bool IsEmptyValue(const Json& v) {
-  return v.is_null() || (v.is_string() && v.get_ref<const std::string&>().empty()) ||
-         ((v.is_array() || v.is_object()) && v.empty());
-}
-
-// Fields we do not implement but that are harmless at these values.
-bool IsDefaultValue(const std::string& key, const Json& v) {
-  if (key == "tool_choice") return v == "auto" || v == "none";
-  if (key == "truncation") return v == "disabled";
-  if (key == "background") return v == false;
-  if (key == "top_logprobs") return v == 0;
-  if (key == "text") return v == Json{{"format", {{"type", "text"}}}};
-  return false;
-}
-
-double Number(const Json& body, const char* key, double fallback, double lo, double hi) {
-  const Json* v = Field(body, key);
-  if (v == nullptr) return fallback;
-  if (!v->is_number()) throw ApiError(400, std::string("Invalid type for '") + key + "': expected a number.", key);
-  const double x = v->get<double>();
-  if (x < lo || x > hi) {
-    char msg[128];
-    std::snprintf(msg, sizeof(msg), "Invalid value for '%s': must be between %g and %g.", key, lo, hi);
-    throw ApiError(400, msg, key, "invalid_value");
-  }
-  return x;
 }
 
 std::vector<ChatMessage> ParseInput(const Json& input) {
@@ -124,6 +70,58 @@ std::vector<ChatMessage> ParseInput(const Json& input) {
 }
 
 }  // namespace
+
+std::string RandomId(const char* prefix) {
+  thread_local std::mt19937_64 rng(std::random_device{}());
+  char buf[40];
+  std::snprintf(buf, sizeof(buf), "%016llx%016llx", static_cast<unsigned long long>(rng()),
+                static_cast<unsigned long long>(rng()));
+  return std::string(prefix) + buf;
+}
+
+std::size_t CompleteUtf8(std::string_view s) {
+  const std::size_t n = s.size();
+  for (std::size_t back = 1; back <= 4 && back <= n; ++back) {
+    const auto b = static_cast<unsigned char>(s[n - back]);
+    if ((b & 0xC0) == 0x80) continue;
+    const std::size_t len = (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : (b >> 3) == 0x1E ? 4 : 1;
+    return len > back ? n - back : n;
+  }
+  return n;
+}
+
+const Json* Field(const Json& object, const char* key) {
+  const auto it = object.find(key);
+  if (it == object.end() || it->is_null()) return nullptr;
+  return &*it;
+}
+
+bool IsEmptyValue(const Json& v) {
+  return v.is_null() || (v.is_string() && v.get_ref<const std::string&>().empty()) ||
+         ((v.is_array() || v.is_object()) && v.empty());
+}
+
+bool IsDefaultValue(const std::string& key, const Json& v) {
+  if (key == "tool_choice") return v == "auto" || v == "none";
+  if (key == "truncation") return v == "disabled";
+  if (key == "background") return v == false;
+  if (key == "top_logprobs") return v == 0;
+  if (key == "text") return v == Json{{"format", {{"type", "text"}}}};
+  return false;
+}
+
+double Number(const Json& body, const char* key, double fallback, double lo, double hi) {
+  const Json* v = Field(body, key);
+  if (v == nullptr) return fallback;
+  if (!v->is_number()) throw ApiError(400, std::string("Invalid type for '") + key + "': expected a number.", key);
+  const double x = v->get<double>();
+  if (x < lo || x > hi) {
+    char msg[128];
+    std::snprintf(msg, sizeof(msg), "Invalid value for '%s': must be between %g and %g.", key, lo, hi);
+    throw ApiError(400, msg, key, "invalid_value");
+  }
+  return x;
+}
 
 std::string Dump(const Json& value) {
   return value.dump(-1, ' ', false, Json::error_handler_t::replace);

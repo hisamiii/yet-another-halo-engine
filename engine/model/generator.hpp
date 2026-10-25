@@ -11,10 +11,22 @@
 
 namespace yah::model {
 
+// llama.cpp's sampler chain: penalties on the logits, then top-k, top-p and min-p, then the draw at temperature.
 struct SamplingParams {
   float temperature = 0.0f;  // 0: greedy (argmax on the GPU)
   float top_p = 1.0f;
+  std::uint32_t top_k = 0;  // 0: off
+  float min_p = 0.0f;       // keep tokens with p >= min_p * p_max; 0: off
+  // Over the last penalty_last_n tokens (prompt and output): logit -= presence (once) + frequency * count, and
+  // repetition divides a positive logit and multiplies a negative one (1: off). They apply to greedy decoding too.
+  float presence_penalty = 0.0f;
+  float frequency_penalty = 0.0f;
+  float repetition_penalty = 1.0f;
+  std::uint32_t penalty_last_n = 64;
   std::uint64_t seed = 0;  // 0: seed from the clock
+  [[nodiscard]] bool penalized() const {
+    return penalty_last_n > 0 && (presence_penalty != 0.0f || frequency_penalty != 0.0f || repetition_penalty != 1.0f);
+  }
 };
 
 struct GenerateParams {
@@ -25,6 +37,7 @@ struct GenerateParams {
 
 struct GenerateResult {
   std::uint32_t prompt_tokens = 0;
+  std::uint32_t cached_tokens = 0;     // prompt tokens whose KV and state came from the previous request
   std::uint32_t generated_tokens = 0;  // tokens passed to on_token
   std::string finish_reason;           // "stop" (stop id or on_token returned false) or "length"
   double prefill_ms = 0.0;

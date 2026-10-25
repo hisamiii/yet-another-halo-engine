@@ -1,6 +1,7 @@
 // yah_serve_test: tests engine/serve without a GPU.
 // 1. The C++ chat template against renders frozen from the GGUF's Jinja template (testdata/chat_template_cases.json).
 // 2. yah_server --fake over HTTP: the Responses API object and stream shapes, errors, and client disconnect.
+// 3. The Chat Completions API: the chat.completion and chunk shapes, stop strings, limits and errors.
 //
 // usage: yah_serve_test <model> [yah_server]   (default: yah_server next to this binary)
 #include <netinet/in.h>
@@ -376,6 +377,10 @@ class Tester {
     MaxOutputTokens();
     Errors();
     Disconnect(server);
+    ChatBasic();
+    ChatStreaming();
+    ChatStop();
+    ChatErrors();
   }
 
  private:
@@ -671,9 +676,10 @@ class Tester {
   }
 
   // A 400 with the OpenAI error object. An empty param or code is not checked.
-  void Bad(const std::string& body, const std::string& param = "", const std::string& code = "") {
-    const std::string where = "error case " + body.substr(0, 120);
-    const Reply reply = Request("POST", "/v1/responses", body);
+  void Bad(const std::string& body, const std::string& param = "", const std::string& code = "",
+           const std::string& path = "/v1/responses") {
+    const std::string where = path + " error case " + body.substr(0, 120);
+    const Reply reply = Request("POST", path, body);
     Check(reply.status == 400, where + ": status " + std::to_string(reply.status) + ": " + reply.body);
     const Json data = Json::parse(reply.body);
     Check(data.is_object() && data.size() == 1 && data.contains("error"), where + ": body " + reply.body);
@@ -737,6 +743,205 @@ class Tester {
     Check(err["message"].is_string() && !err["message"].get<std::string>().empty(), "GET /v1/nothing: " + missing.body);
   }
 
+  // Chat Completions. Shapes: the required fields of the SDK's ChatCompletion and ChatCompletionChunk models.
+  static void CheckChatUsage(const Json& u, const std::string& where) {
+    Check(u.is_object(), where + ": usage " + Dump(u));
+    for (const char* key : {"prompt_tokens", "completion_tokens", "total_tokens"}) Required(u, where + ".usage", key, Kind::kInteger);
+    CheckEq(u["total_tokens"], u["prompt_tokens"].get<int>() + u["completion_tokens"].get<int>(), where + ": total_tokens");
+    const int reasoning = u["completion_tokens_details"]["reasoning_tokens"].get<int>();
+    Check(reasoning >= 0 && reasoning <= u["completion_tokens"].get<int>(), where + ": reasoning_tokens " + Dump(u));
+  }
+
+  Json Chat(Json body, const std::string& where) {
+    const Reply reply = Request("POST", "/v1/chat/completions", Dump(body));
+    Check(reply.status == 200, where + ": status " + std::to_string(reply.status) + ": " + reply.body);
+    Json r = Json::parse(reply.body);
+    Required(r, where, "id", Kind::kString);
+    Required(r, where, "created", Kind::kInteger);
+    Required(r, where, "model", Kind::kString);
+    CheckEq(r["object"], "chat.completion", where + ": object");
+    Check(r["id"].get<std::string>().starts_with("chatcmpl-"), where + ": id " + Dump(r["id"]));
+    Check(r["choices"].is_array() && r["choices"].size() == 1, where + ": choices " + Dump(r["choices"]));
+    const Json& c = r["choices"][0];
+    CheckEq(c["index"], 0, where + ": choices[0].index");
+    OneOf(c, where + ".choices[0]", "finish_reason", {"stop", "length"});
+    CheckEq(c["message"]["role"], "assistant", where + ": message.role");
+    Required(c["message"], where + ".message", "content", Kind::kString);
+    CheckChatUsage(r["usage"], where);
+    return r;
+  }
+
+  // The chunk stream: "data: {chunk}" blocks, then "data: [DONE]". Returns the chunks.
+  std::vector<Json> ChatChunks(Json body, const std::string& where) {
+    body["stream"] = true;
+    const Reply reply = Request("POST", "/v1/chat/completions", Dump(body));
+    Check(reply.status == 200, where + ": status " + std::to_string(reply.status) + ": " + reply.body);
+    Check(reply.content_type.starts_with("text/event-stream"), where + ": content type " + reply.content_type);
+    std::vector<Json> chunks;
+    bool done = false;
+    for (std::size_t pos = 0; pos < reply.body.size();) {
+      const std::size_t end = reply.body.find("\n\n", pos);
+      Check(end != std::string::npos && !done, where + ": bad SSE framing at byte " + std::to_string(pos));
+      const std::string block = reply.body.substr(pos, end - pos);
+      pos = end + 2;
+      Check(block.starts_with("data: "), where + ": bad SSE block: " + block);
+      if (block == "data: [DONE]") {
+        done = true;
+        continue;
+      }
+      const Json e = Json::parse(block.substr(6));
+      const std::string at = where + " chunk " + std::to_string(chunks.size());
+      CheckEq(e["object"], "chat.completion.chunk", at + ": object");
+      Required(e, at, "id", Kind::kString);
+      Required(e, at, "created", Kind::kInteger);
+      Check(e["choices"].is_array(), at + ": choices");
+      for (const Json& c : e["choices"]) {
+        Check(c["delta"].is_object(), at + ": delta");
+        for (const char* key : {"content", "reasoning_content"}) {
+          if (!c["delta"].contains(key)) continue;
+          const std::string d = c["delta"][key].get<std::string>();
+          Check(ValidUtf8(d) && d.find("\xEF\xBF\xBD") == std::string::npos, at + ": delta splits UTF-8: " + Dump(d));
+        }
+      }
+      if (!chunks.empty()) CheckEq(e["id"], chunks.front()["id"], at + ": id changes inside the stream");
+      chunks.push_back(e);
+    }
+    Check(done, where + ": no [DONE]");
+    Check(!chunks.empty(), where + ": no chunks");
+    return chunks;
+  }
+
+  // What a client accumulates from the chunks: {content, reasoning_content, finish_reason}.
+  static Json Accumulate(const std::vector<Json>& chunks, const std::string& where) {
+    std::string content, reasoning;
+    Json finish = nullptr;
+    CheckEq(chunks.front()["choices"][0]["delta"]["role"], "assistant", where + ": first delta role");
+    for (const Json& e : chunks) {
+      for (const Json& c : e["choices"]) {
+        Check(finish.is_null(), where + ": a chunk after the finish_reason");
+        if (c["delta"].contains("content")) content += c["delta"]["content"].get<std::string>();
+        if (c["delta"].contains("reasoning_content")) reasoning += c["delta"]["reasoning_content"].get<std::string>();
+        finish = c["finish_reason"];
+      }
+    }
+    return {{"content", content}, {"reasoning_content", reasoning}, {"finish_reason", finish}};
+  }
+
+  void ChatBasic() {
+    std::string where = "chat: thinking on";
+    Json r = Chat({{"model", "m"}, {"messages", {{{"role", "user"}, {"content", "Hi"}}}}}, where);
+    CheckEq(r["model"], "m", where + ": model");
+    CheckEq(r["choices"][0]["message"]["content"], kAnswer, where + ": content");
+    CheckEq(r["choices"][0]["message"]["reasoning_content"], kReasoning, where + ": reasoning_content");
+    CheckEq(r["choices"][0]["finish_reason"], "stop", where + ": finish_reason");
+    for (const Json off : {Json{{"reasoning_effort", "none"}}, Json{{"chat_template_kwargs", {{"enable_thinking", false}}}}}) {
+      where = "chat: thinking off via " + Dump(off);
+      Json b = {{"model", "m"},
+                {"messages",
+                 {{{"role", "system"}, {"content", "Be brief."}},
+                  {{"role", "user"}, {"content", {{{"type", "text"}, {"text", "Hi"}}}}},
+                  {{"role", "assistant"}, {"content", "Hello"}, {"reasoning_content", "greeting"}},
+                  {{"role", "user"}, {"content", "Again"}}}},
+                {"temperature", 0.2}, {"top_k", -1}, {"min_p", 0.05}, {"presence_penalty", 1.5}, {"seed", 7},
+                {"logprobs", false}, {"response_format", {{"type", "text"}}}, {"n", 1}};
+      for (const auto& [key, value] : off.items()) b[key] = value;
+      r = Chat(b, where);
+      CheckEq(r["choices"][0]["message"]["content"], kAnswer, where + ": content");
+      Check(!r["choices"][0]["message"].contains("reasoning_content"), where + ": reasoning_content present");
+      CheckEq(r["usage"]["completion_tokens_details"]["reasoning_tokens"], 0, where + ": reasoning_tokens");
+    }
+    where = "chat: max_tokens 5";
+    r = Chat({{"model", "m"}, {"messages", {{{"role", "user"}, {"content", "Hi"}}}}, {"max_tokens", 5}}, where);
+    CheckEq(r["choices"][0]["finish_reason"], "length", where + ": finish_reason");
+    CheckEq(r["usage"]["completion_tokens"], 5, where + ": completion_tokens");
+    r = Chat({{"model", "m"}, {"messages", {{{"role", "user"}, {"content", "Hi"}}}}, {"max_completion_tokens", 3}}, where);
+    CheckEq(r["usage"]["completion_tokens"], 3, "chat: max_completion_tokens 3: completion_tokens");
+  }
+
+  void ChatStreaming() {
+    const Json messages = {{{"role", "user"}, {"content", "Hi"}}};
+    std::string where = "chat stream";
+    std::vector<Json> chunks = ChatChunks({{"model", "m"}, {"messages", messages}}, where);
+    CheckEq(Accumulate(chunks, where), {{"content", kAnswer}, {"reasoning_content", kReasoning}, {"finish_reason", "stop"}},
+            where);
+    Check(!chunks.back().contains("usage"), where + ": usage without include_usage");
+    where = "chat stream include_usage";
+    chunks = ChatChunks({{"model", "m"}, {"messages", messages}, {"stream_options", {{"include_usage", true}}}}, where);
+    const Json last = chunks.back();
+    chunks.pop_back();
+    CheckEq(last["choices"], Json::array(), where + ": usage chunk choices");
+    CheckChatUsage(last["usage"], where);
+    for (const Json& e : chunks) CheckEq(e["usage"], nullptr, where + ": usage on a content chunk");
+    CheckEq(Accumulate(chunks, where)["content"], kAnswer, where + ": content");
+    where = "chat stream max_tokens 4";
+    chunks = ChatChunks({{"model", "m"}, {"messages", messages}, {"max_tokens", 4}}, where);
+    CheckEq(Accumulate(chunks, where)["finish_reason"], "length", where + ": finish_reason");
+  }
+
+  void ChatStop() {
+    const Json messages = {{{"role", "user"}, {"content", "Hi"}}};
+    const std::string answer = kAnswer, reasoning = kReasoning;
+    // stop strings at the start, the middle (across token boundaries) and the end of the answer, inside the
+    // reasoning, and one that never occurs; each streamed and not.
+    for (const std::string stop : {std::string("Hello"), std::string("is a fa"), std::string("caf\xC3\xA9."),
+                                   std::string("canned"), std::string("zzz")}) {
+      const std::string where = "chat stop " + Dump(stop);
+      Json want;
+      const std::size_t in_reasoning = reasoning.find(stop), in_answer = answer.find(stop);
+      if (in_reasoning != std::string::npos) {
+        std::string cut = reasoning.substr(0, in_reasoning);   // the parser trims the reasoning's trailing space
+        while (!cut.empty() && cut.back() == ' ') cut.pop_back();
+        want = {{"content", ""}, {"reasoning_content", cut}, {"finish_reason", "stop"}};
+      } else {
+        want = {{"content", answer.substr(0, in_answer)}, {"reasoning_content", reasoning}, {"finish_reason", "stop"}};
+      }
+      Json body = {{"model", "m"}, {"messages", messages}, {"stop", Json::array({"qqq", stop})}};
+      Json r = Chat(body, where);
+      const Json& m = r["choices"][0]["message"];
+      CheckEq(Json{{"content", m["content"]},
+                   {"reasoning_content", m.value("reasoning_content", "")},
+                   {"finish_reason", r["choices"][0]["finish_reason"]}},
+              want, where);
+      CheckEq(Accumulate(ChatChunks(body, where + " (stream)"), where + " (stream)"), want, where + " (stream)");
+    }
+    // A plain string stop, and a stop with max_tokens before it: the limit wins.
+    Json r = Chat({{"model", "m"}, {"messages", messages}, {"stop", "fake"}}, "chat stop string");
+    CheckEq(r["choices"][0]["message"]["content"], answer.substr(0, answer.find("fake")), "chat stop string: content");
+    r = Chat({{"model", "m"}, {"messages", messages}, {"stop", "fake"}, {"max_tokens", 3}}, "chat stop after the limit");
+    CheckEq(r["choices"][0]["finish_reason"], "length", "chat stop after the limit: finish_reason");
+  }
+
+  void ChatErrors() {
+    const std::string path = "/v1/chat/completions";
+    const auto body = [](const Json& extra) {
+      Json b = {{"model", "m"}, {"messages", {{{"role", "user"}, {"content", "Hi"}}}}};
+      for (const auto& [key, value] : extra.items()) b[key] = value;
+      return Dump(b);
+    };
+    Bad(R"({"messages": [{"role": "user", "content": "Hi"}]})", "model", "", path);
+    Bad(R"({"model": "m"})", "messages", "", path);
+    Bad(R"({"model": "m", "messages": []})", "messages", "", path);
+    Bad(R"({"model": "m", "messages": [{"role": "tool", "content": "x"}]})", "messages[0].role", "", path);
+    Bad(R"({"model": "m", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]})",
+        "messages[0].content[0].type", "", path);
+    Bad(body({{"tools", Json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}})}}), "tools",
+        "unsupported_parameter", path);
+    Bad(body({{"n", 2}}), "n", "", path);
+    Bad(body({{"logprobs", true}}), "logprobs", "", path);
+    Bad(body({{"temperature", 3}}), "temperature", "invalid_value", path);
+    Bad(body({{"top_k", "x"}}), "top_k", "", path);
+    Bad(body({{"min_p", 2}}), "min_p", "", path);
+    Bad(body({{"presence_penalty", 3}}), "presence_penalty", "", path);
+    Bad(body({{"repeat_last_n", 100000}}), "repeat_last_n", "", path);
+    Bad(body({{"seed", 1.5}}), "seed", "", path);
+    Bad(body({{"stop", Json::array({1})}}), "stop", "", path);
+    Bad(body({{"reasoning_effort", "huge"}}), "reasoning_effort", "invalid_value", path);
+    Bad(body({{"chat_template_kwargs", {{"foo", 1}}}}), "chat_template_kwargs", "", path);
+    Bad(body({{"max_tokens", 0}}), "max_tokens", "", path);
+    Bad(body({{"max_tokens", 100000}}), "max_tokens", "context_length_exceeded", path);
+    Bad("{not json", "", "", path);
+  }
+
   // A client that leaves mid-stream stops the generation; the server keeps serving.
   void Disconnect(ServerProcess& server) {
     std::string received;
@@ -795,7 +1000,7 @@ int main(int argc, char** argv) {
     }
     if (!up) throw Failure("yah_server did not come up on port " + std::to_string(port));
     Tester(port).Run(server);
-    std::printf("responses: %d checks passed\n", g_checks);
+    std::printf("responses and chat completions: %d checks passed\n", g_checks);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL responses: %s\n--- yah_server log ---\n%s", e.what(), server.Log().c_str());
     failed = true;
