@@ -6,10 +6,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #ifndef YAH_SERVE_FAKE_ONLY
@@ -34,10 +37,13 @@ namespace http = yah::serve::http;
 
 int Usage() {
   std::fprintf(stderr,
-               "usage: yah_server --model <model> [--prefill <hal set> --decode <hal set>] [--host 127.0.0.1] "
-               "[--port 8080] [--npu [--npu-down <pack>]] [--draft mtp|off [--draft-len N]] [--no-reuse]\n"
+               "usage: yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080]\n"
+               "                  [--draft mtp|off [--draft-len N]] [--npu [--npu-down <pack>]] [--no-reuse]\n"
+               "                  [--prefill <hal set> --decode <hal set>]\n"
                "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
-               "In a release bundle the HAL sets default to the bundle's hal/prefill and hal/decode.\n"
+               "--ctx: the context in tokens (a multiple of 2048); --kv: the KV cache format, fp16, kv8, kv4, k8v4 or\n"
+               "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
+               "~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use. --prefill / --decode name sets instead.\n"
                "--npu: the NPU runs the prefill set's FFN block (a set from tools/emit_npu_ffn.py), its down pack from\n"
                "<prefill>/npu_down.bin unless --npu-down; without what it needs the GPU runs everything.\n"
                "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
@@ -56,6 +62,44 @@ std::string BundleDir() {
   return exe.substr(0, exe.rfind('/')) + "/..";
 }
 bool Exists(const std::string& path) { return ::access(path.c_str(), R_OK) == 0; }
+
+#ifndef YAH_SERVE_FAKE_ONLY
+// The HAL sets for a context and KV format when the command line names none: a bundle's hal/<ctx>-<kv>/, else (a
+// source tree, root = engine/) ~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use (the Python emitters).
+// A decode set emitted from a model with the MTP layer has its kernels too (decode-mtp/): it serves any model.
+std::pair<std::string, std::string> HalSets(const std::string& root, const std::string& model, std::uint32_t ctx,
+                                            const std::string& kv) {
+  const auto cfg = yah::core::Qwen35Config::FromGguf(yah::core::Gguf::OpenIndex(model));
+  const std::string name = std::to_string(ctx) + "-" + kv, dec = cfg.nextn_predict_layers ? "decode-mtp" : "decode";
+  const auto decode_of = [&](const std::string& b) { return b + (Exists(b + "/decode-mtp/decode.txt") ? "/decode-mtp" : "/decode"); };
+  if (const std::string b = root + "/hal/" + name; Exists(b + "/prefill/dispatch.txt")) return {b + "/prefill", decode_of(b)};
+  const std::string tools = root + "/gpu/loom";
+  if (!Exists(tools + "/tools/emit_decode.py"))
+    throw std::runtime_error("no HAL sets for " + name + " in " + root + "/hal (--ctx / --kv pick one of the bundle's)");
+  const char* xdg = std::getenv("XDG_CACHE_HOME");
+  const char* home = std::getenv("HOME");
+  const std::string dir = (xdg && *xdg ? std::string(xdg) : std::string(home ? home : ".") + "/.cache") + "/yah/hal/" + name;
+  const auto emit = [&](const std::string& sub, const std::string& marker, const std::string& command,
+                        const std::string& last) {
+    const std::string out = dir + "/" + sub;
+    if (Exists(out + "/" + marker)) return;
+    std::fprintf(stderr, "yah_server: emitting the %s set for %s into %s (once, about 20 s)\n", sub.c_str(),
+                 name.c_str(), out.c_str());
+    const std::string part = out + ".part";
+    std::filesystem::remove_all(part);
+    std::filesystem::create_directories(dir);
+    const std::string cmd = "cd '" + tools + "' && YAH_KV=" + kv + " " + command + " '" + model + "' '" + part + "' " +
+                            last + " > '" + part + ".log' 2>&1";
+    if (std::system(cmd.c_str()) != 0 || !Exists(part + "/" + marker))
+      throw std::runtime_error("emitting the " + sub + " set failed; see " + part + ".log");
+    std::filesystem::rename(part, out);
+    std::filesystem::remove(part + ".log");
+  };
+  emit("prefill", "dispatch.txt", "YAH_CTX=" + std::to_string(ctx) + " python3 tools/emit_prefill_pp.py", "2048");
+  if (!Exists(dir + "/decode-mtp/decode.txt")) emit(dec, "decode.txt", "python3 tools/emit_decode.py", std::to_string(ctx));
+  return {dir + "/prefill", decode_of(dir)};
+}
+#endif
 
 class Server {
  public:
@@ -211,8 +255,8 @@ int main(int argc, char** argv) {
   std::string model, prefill, decode, host = "127.0.0.1";
   int port = 8080;
   bool fake = false, npu = false, reuse = true;
-  std::string npu_down, draft = "off";
-  std::uint32_t draft_len = 0;
+  std::string npu_down, draft = "off", kv = "kv8";
+  std::uint32_t draft_len = 0, ctx = 32768;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const bool has_value = i + 1 < argc;
@@ -224,6 +268,10 @@ int main(int argc, char** argv) {
       prefill = argv[++i];
     } else if (arg == "--decode" && has_value) {
       decode = argv[++i];
+    } else if (arg == "--ctx" && has_value) {
+      ctx = static_cast<std::uint32_t>(std::atoi(argv[++i]));
+    } else if (arg == "--kv" && has_value) {
+      kv = argv[++i];
     } else if (arg == "--no-reuse") {
       reuse = false;
     } else if (arg == "--npu") {
@@ -243,14 +291,27 @@ int main(int argc, char** argv) {
     }
   }
   const std::string bundle = BundleDir();
-  if (!fake && prefill.empty() && Exists(bundle + "/hal/prefill/dispatch.txt")) prefill = bundle + "/hal/prefill";
-  if (!fake && decode.empty() && Exists(bundle + "/hal/decode/decode.txt")) decode = bundle + "/hal/decode";
   // libhrx loads the HSA runtime from this directory: the bundle's own copy unless the caller picked one.
   if (!std::getenv("IREE_HAL_AMDGPU_LIBHSA_PATH") && Exists(bundle + "/lib/libhsa-runtime64.so.1"))
     ::setenv("IREE_HAL_AMDGPU_LIBHSA_PATH", (bundle + "/lib").c_str(), 1);
-  if (model.empty() || (!fake && (prefill.empty() || decode.empty()))) return Usage();
+  if (model.empty() || prefill.empty() != decode.empty()) return Usage();
+  if (ctx == 0 || ctx % 2048 || (kv != "fp16" && kv != "kv8" && kv != "kv4" && kv != "k8v4" && kv != "k4v8")) {
+    std::fprintf(stderr, "yah_server: --ctx must be a multiple of 2048 and --kv one of fp16, kv8, kv4, k8v4, k4v8\n");
+    return 2;
+  }
 
   try {
+#ifndef YAH_SERVE_FAKE_ONLY
+    if (!fake && prefill.empty()) {
+      // the memory check before the sets are looked for (and maybe emitted); the Engine checks again with them
+      const std::uint32_t kb = kv == "fp16" ? 16 : kv == "kv4" || kv == "k4v8" ? 4 : 8;
+      const std::uint32_t vb = kv == "fp16" ? 16 : kv == "kv4" || kv == "k8v4" ? 4 : 8;
+      if (const auto plan = yah::model::MemoryPlan::For(model, ctx, kb, vb, "", draft == "mtp"); !plan.fits())
+        throw std::runtime_error("not enough memory: " + plan.Describe() +
+                                 "; close other programs, or try a smaller --ctx or --kv kv4");
+      std::tie(prefill, decode) = HalSets(bundle, model, ctx, kv);
+    }
+#endif
     std::unique_ptr<TextGenerator> generator;
     if (fake) {
       generator = std::make_unique<FakeGenerator>(model);
@@ -268,6 +329,7 @@ int main(int argc, char** argv) {
       options.reuse = reuse;
       options.draft_len = draft_len;
       auto engine = std::make_unique<yah::model::Engine>(options);
+      std::fprintf(stderr, "yah_server: %s\n", engine->memory_report().c_str());
       if (npu) {
         const std::string& why = engine->npu_status();
         std::fprintf(stderr, "yah_server: npu %s%s\n", why.empty() ? "on" : "off: ", why.c_str());

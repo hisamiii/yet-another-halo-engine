@@ -36,7 +36,7 @@ The server takes:
 
 Reasoning effort: `reasoning_effort` for chat completions, `reasoning.effort` for responses. Sampling: `temperature`, `top_p`, `top_k`, `min_p`, the presence, frequency and repetition penalties, `seed` and `stop`. A follow-up turn reuses the earlier turns' cache.
 
-The HAL sets in `hal/` give 32K tokens of context, with an 8-bit KV cache. One request runs at a time; others wait.
+The HAL sets in `hal/` give 32K tokens of context, with an 8-bit KV cache (`hal/32768-kv8/`; `--ctx` / `--kv` pick another pair a bundle holds). One request runs at a time; others wait.
 
 ## If something is off
 

@@ -102,18 +102,16 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids
 
 ## Serving
 
-`engine/build/yah_server` serves the model over the OpenAI Responses and Chat Completions APIs. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and `YAH_KV`. The default is 32K context with kv8a16 KV:
+`engine/build/yah_server` serves the model over the OpenAI Responses and Chat Completions APIs. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and KV format. `--ctx` (default 32768, a multiple of 2048) and `--kv` (default `kv8`; `fp16`, `kv4`, `k8v4`, `k4v8`) pick them: a release bundle's `hal/<ctx>-<kv>/`, or in a source tree `~/.cache/yah/hal/<ctx>-<kv>/` (`XDG_CACHE_HOME`), emitted there on first use (~20 s). The prefill sets are the same for the HFQ and any GGUF; a decode set emitted from a model with the MTP layer adds its kernels (`decode-mtp/`) and serves either. `--prefill` / `--decode` name sets instead (an NPU set: `tools/emit_npu_ffn.py` on a prefill set, made for one model file).
 
 ```
-cd engine/gpu/loom
-YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <model> <prefill set> 2048
-YAH_KV=kv8 python3 tools/emit_decode.py <model> <decode set> 32768
-cd -
 source engine/hrx-env.sh
-engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill <prefill set> --decode <decode set> [--host 127.0.0.1] [--port 8080] \
-  [--draft mtp [--draft-len N]] [--npu [--npu-down <pack>]] [--no-reuse]
+engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080] \
+  [--draft mtp [--draft-len N]] [--npu [--npu-down <pack>]] [--no-reuse] [--prefill <set> --decode <set>]
 engine/build/yah_server --model <model> --fake    # canned replies, CPU only: for clients and API tests
 ```
+
+Before it loads anything the server estimates the memory it will take (the weights from the tensor table, the context's KV pools and scratch, a measured fixed part; `engine/model/memory_plan.hpp`) and refuses to start when that and a 1.5 GB reserve exceed `MemAvailable`: on the APU the GPU's buffers are system RAM, and an engine that does not fit makes the OOM killer end other programs. At 32K kv8 with MTP it takes ~20.5 GB (15.2 GB of weights for the Q4_K_M GGUF), at 8K ~19.3 GB. The log's `loaded in` line gives the load time and the GPU buffers.
 
 A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). Decode runs two steps ahead of the host: each step picks its token on the GPU (argmax, or for `temperature` > 0 `yah_dec_sample`: softmax at T cut by top-k, then top-p, then min-p, an exact draw by Gumbel-max; 0.84 ms with top_k 20, 1.0 ms with top-k off) into the token stream the next step reads, and the host only reads the tokens (a host-mapped copy) to stream them and stop. A given seed draws other tokens than the earlier host sampler did; the distribution is the same. With penalties, `yah_dec_penalty` first adjusts the logits from the last `repeat_last_n` tokens of the stream (prompt included, up to 1024) the way llama.cpp does, and the argmax then runs as its own kernel. `loom_forward_pp` takes any token count the same way.
 

@@ -50,6 +50,7 @@ int main(int argc, char** argv) {
   try {
     Engine e(o);
     if (!e.draft_status().empty()) throw std::runtime_error("draft off: " + e.draft_status());
+    std::printf("engine: %s\n", e.memory_report().c_str());
     const auto& tok = e.tokenizer();
     const auto chat = [&](const std::string& user) {
       return tok.Encode("<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
@@ -91,6 +92,7 @@ int main(int argc, char** argv) {
     }
     std::printf("%s spec == plain on %zu prompts; decode %.1f -> %.1f t/s\n", bad ? "FAIL" : "ok  ", cases.size(),
                 plain_n / plain_ms * 1000, spec_n / spec_ms * 1000);
+    std::printf("engine: after the prompts %s\n", e.memory_report().c_str());
     return bad ? 1 : 0;
   } catch (const std::exception& err) {
     std::fprintf(stderr, "spec_engine: %s\n", err.what());

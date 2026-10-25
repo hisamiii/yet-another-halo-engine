@@ -29,6 +29,7 @@
 #include "model/loom_decoder.hpp"
 #include "model/loom_prefill.hpp"
 #include "model/loom_runtime.hpp"
+#include "model/memory_plan.hpp"
 #ifdef YAH_WITH_NPU
 #include <sys/resource.h>
 #include <unistd.h>
@@ -65,7 +66,9 @@ class Engine : public TextGenerator {
   void set_draft(bool on) { draft_on_ = on; }
 
   explicit Engine(const Options& o)
-      : gguf_(core::Gguf::OpenResident(o.model)),
+      : t0_(std::chrono::steady_clock::now()),
+        plan_(Plan(o)),
+        gguf_(core::Gguf::OpenResident(o.model)),
         cfg_(core::Qwen35Config::FromGguf(gguf_)),
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
         weights_(gpu_, gguf_),
@@ -106,6 +109,15 @@ class Engine : public TextGenerator {
     } else if (o.draft != "off") {
       throw LoomError("engine: unknown draft mode " + o.draft + " (mtp, off)");
     }
+    load_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count();
+  }
+  // The memory estimate (checked before the load) and what the GPU holds: a line for the log.
+  [[nodiscard]] std::string memory_report() const {
+    char s[160];
+    std::snprintf(s, sizeof s, "loaded in %.1f s, %.1f GB in GPU buffers (weights %.1f; estimated %.1f)", load_s_,
+                  double(gpu_.allocated()) / MemoryPlan::kGB, double(plan_.weights) / MemoryPlan::kGB,
+                  double(plan_.need()) / MemoryPlan::kGB);
+    return s;
   }
   ~Engine() override { gpu_.Synchronize(); }   // (the graphs wait on NPU words: none may run past npu_)
 
@@ -461,6 +473,18 @@ class Engine : public TextGenerator {
     if (synced) est = 0.8 * est + 0.2 * std::chrono::duration<double, std::milli>(elapsed).count();
   }
 
+  static MemoryPlan Plan(const Options& o) {
+    const std::string down = !o.npu ? "" : o.npu_down.empty() ? o.prefill_hal + "/npu_down.bin" : o.npu_down;
+    MemoryPlan p = MemoryPlan::For(o.model, o.decode_hal, down, o.draft == "mtp");
+    if (!p.fits())
+      throw LoomError("engine: not enough memory: " + p.Describe() +
+                      "; close other programs, or use sets with a smaller context or KV format");
+    return p;
+  }
+
+  std::chrono::steady_clock::time_point t0_;
+  MemoryPlan plan_;
+  double load_s_ = 0;
   core::Gguf gguf_;
   core::Qwen35Config cfg_;
   core::Tokenizer tokenizer_;

@@ -161,6 +161,8 @@ class LoomDevice {
   }
   LoomDevice(const LoomDevice&) = delete;
   LoomDevice& operator=(const LoomDevice&) = delete;
+  // Bytes of every buffer allocated so far (freed ones included).
+  [[nodiscard]] size_t allocated() const { return allocated_; }
   ~LoomDevice() {
     if (stream_) hrx_stream_release(stream_);
     // device_ is borrowed (hrx_gpu_device_get does not retain it); hrx_gpu_shutdown releases it.
@@ -191,6 +193,7 @@ class LoomDevice {
   [[nodiscard]] LoomBuffer Allocate(size_t bytes) {
     LoomBuffer buffer;
     buffer.size = bytes;
+    allocated_ += bytes;
     LoomCheck(
         hrx_buffer_allocate(stream_, bytes, HRX_MEMORY_TYPE_DEVICE_LOCAL, HRX_BUFFER_USAGE_DEFAULT, &buffer.handle),
         "hrx_buffer_allocate");
@@ -202,6 +205,7 @@ class LoomDevice {
   [[nodiscard]] LoomBuffer AllocateHost(size_t bytes, const void** host) {
     LoomBuffer buffer;
     buffer.size = bytes;
+    allocated_ += bytes;
     const hrx_buffer_usage_t usage =
         HRX_BUFFER_USAGE_TRANSFER | HRX_BUFFER_USAGE_MAPPING_SCOPED | HRX_BUFFER_USAGE_MAPPING_PERSISTENT;
     LoomCheck(hrx_buffer_allocate(stream_, bytes, HRX_MEMORY_TYPE_HOST_LOCAL | HRX_MEMORY_TYPE_HOST_COHERENT, usage,
@@ -355,6 +359,7 @@ class LoomDevice {
  private:
   hrx_device_t device_ = nullptr;
   hrx_stream_t stream_ = nullptr;
+  size_t allocated_ = 0;
   uint32_t next_flags_ = 0;
   bool no_barrier_ok_ = true;
   static constexpr uint32_t kChainSlots = 1024;   // gen_chain.CHAIN_SLOTS

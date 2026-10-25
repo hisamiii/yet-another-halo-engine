@@ -4,7 +4,8 @@
 usage: bundle.py build <out dir> <version> [--licenses <dir>]
            from the built tree (engine/build_hrx.sh): <out dir>/yah-<version>-gfx1151/ without hal/
        bundle.py hal <bundle dir> <prefill set> <decode set>
-           add the HAL sets (validated on a gfx1151 box) as hal/prefill and hal/decode
+           add a HAL set pair (validated on a gfx1151 box) as hal/<ctx>-<kv>/ (its decode set's context and KV
+           format: yah_server --ctx / --kv); run it once per pair
        bundle.py pack <bundle dir>
            check the bundle, then <bundle dir>.tar.xz beside it
 
@@ -12,7 +13,7 @@ The bundle:
   bin/        yah_server, yah_chat (RPATH $ORIGIN/../lib)
   lib/        libhrx, ICU, the HSA runtime with librocprofiler-register and the ROCm sysdeps it loads (in
               lib/rocm_sysdeps/lib, where the HSA runtime's own RPATH looks)
-  hal/        prefill/ and decode/ (yah_server's defaults)
+  hal/        <ctx>-<kv>/prefill and decode/ (decode-mtp/: with the MTP layer's kernels); 32768-kv8 is the default
   licenses/   this repository's, HRX's, the ROCm parts', ICU's and the sysdeps' (--licenses: extra files)
   README.md   engine/release/README.md
 
@@ -118,11 +119,26 @@ def build(out, version, licenses):
     print(b)
 
 
+def set_name(decode):
+    """(<ctx>-<kv>, decode dir name) from a decode set's decode.txt."""
+    ctx, kv, mtp = None, "fp16", False
+    for line in open(os.path.join(decode, "decode.txt")):
+        f = line.split()
+        if f[:1] == ["ctx"]:
+            ctx = int(f[1])
+        if f[:2] == ["kv", "q"]:
+            kv = {("8", "8"): "kv8", ("4", "4"): "kv4", ("8", "4"): "k8v4", ("4", "8"): "k4v8"}[(f[2], f[3])]
+        mtp |= f[:1] == ["mtp"]
+    return f"{ctx}-{kv}", "decode-mtp" if mtp else "decode"
+
+
 def hal(b, prefill, decode):
     for src, name, marker in ((prefill, "prefill", "dispatch.txt"), (decode, "decode", "decode.txt")):
         if not os.path.isfile(os.path.join(src, marker)):
             sys.exit(f"bundle: {src} is not a {name} set (no {marker})")
-        dst = os.path.join(b, "hal", name)
+    pair, dec = set_name(decode)
+    for src, name in ((prefill, "prefill"), (decode, dec)):
+        dst = os.path.join(b, "hal", pair, name)
         if os.path.exists(dst):
             sys.exit(f"bundle: {dst} exists")
         shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".emit_tmp", "*.log"))
@@ -145,7 +161,7 @@ def pack(b):
                     bad.append(f"{os.path.relpath(p, b)}: {soname} not found")
                 elif not SYSTEM.match(soname) and not os.path.realpath(path).startswith(b + os.sep):
                     bad.append(f"{os.path.relpath(p, b)}: {soname} from {path}")
-    for need in ("hal/prefill/dispatch.txt", "hal/decode/decode.txt", "bin/yah_server", "lib/libhsa-runtime64.so.1"):
+    for need in ("hal/32768-kv8/prefill/dispatch.txt", "bin/yah_server", "lib/libhsa-runtime64.so.1"):
         if not os.path.exists(os.path.join(b, need)):
             bad.append(f"missing {need}")
     if bad:
