@@ -31,7 +31,7 @@ cmake -S "$root/engine" -B "$root/engine/build" -DCMAKE_BUILD_TYPE=Release -DCMA
 cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # The runners below are not CMake targets. Build them here so a stale binary never runs against a new HAL set.
 # NPU (libamdf + the xdna loader, static from an HRX build with the xdna targets, engine/hrx/bootstrap.sh): the NPU FFN
-# block of the prefill driver (YAH_NPU=1) and the server (--npu). Without them both are GPU-only.
+# block of the prefill driver and the server (--npu). Without them both are GPU-only.
 npu_flags=() npu_libs=()
 if [ -f "$H/libamdf/libamdf_static.a" ]; then
   for a in experimental/xdna/libiree_experimental_xdna_amdf_status.a experimental/xdna/libiree_experimental_xdna_executable.a \

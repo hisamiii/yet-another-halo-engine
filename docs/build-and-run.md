@@ -4,7 +4,7 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 
 ## Prerequisites
 
-- HRX / Loom: the revision pinned in `engine/hrx/PIN` plus the patches in `engine/hrx/patches/`. `engine/hrx/bootstrap.sh` clones it into `external/hrx` (gitignored; `YAH_HRX` overrides, and a symlink to an existing checkout works), checks out the pin, applies the patches and builds what the engine uses: `libhrx` and its HIP binding, `iree-run-loom`, `loom-compile`, `iree-profile`. `engine/hrx/bootstrap.sh --check` verifies the checkout; `engine/build_hrx.sh` refuses anything else. On this box `main` builds against `/home/q/Development/Projects/hrx-gpu` (the pin plus main's patches; `external/hrx` links there) and branch `npu` against `/home/q/Development/Projects/hrx` (the pin plus every patch of that branch, the NPU ones 0013-0029 included); point `external/hrx` at the one matching the branch you build.
+- HRX / Loom: the revision pinned in `engine/hrx/PIN` plus the patches in `engine/hrx/patches/`. `engine/hrx/bootstrap.sh` clones it into `external/hrx` (gitignored; `YAH_HRX` overrides, and a symlink to an existing checkout works), checks out the pin, applies the patches and builds what the engine uses: `libhrx` and its HIP binding, `iree-run-loom`, `loom-compile`, `iree-profile`. `engine/hrx/bootstrap.sh --check` verifies the checkout; `engine/build_hrx.sh` refuses anything else. On this box `main` builds against `/home/q/Development/Projects/hrx-npu` (the pin plus every patch here, the NPU ones 0013-0029 included; `external/hrx` links there) and branch `npu` against `/home/q/Development/Projects/hrx` (that branch's patch set); point `external/hrx` at the one matching the branch you build. Without HRX's XDNA targets the build is GPU-only (`--npu` off).
 - The official ROCm Core SDK 10.0.0 packages (runtime, sysdeps, llvm, base, profiler-base), extracted into one prefix (no system install) by `engine/hrx-env.sh --fetch` under `external/rocm10/root` (`YAH_ROCM` overrides). They hold both the GPU runtime and the toolchain the bootstrap builds HRX with; no system ROCm is needed. Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
 - `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`. The Python emitters find the same paths through `engine/gpu/loom/hrx_paths.py`.
 - The model: hipfire's MQ4G256 HFQ file of Qwen3.8 27B, `~/Downloads/qwen3.8-27b.mq4-xts` (15 GB, read into resident memory by every driver), or a llama.cpp GGUF of it (any of Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K .. Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, F16, BF16, F32 per tensor), whose projections are re-quantized to MQ4G256 at load (~22 s on 16 cores; architecture.md). Only a GGUF with the MTP layer (`blk.64.nextn.*`, e.g. unsloth's) can draft for speculative decoding. The HAL sets are emitted from the model they run with.
@@ -24,6 +24,23 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0010-loom-vopd-trans-window-lookahead` | VOPD pairs inside TRANS-result windows when a lookahead finds no read that relies on the distance: prefill attention and SwiGLU epilogues -0.1..-0.25% cycles, bit-identical |
 | `0011-loom-low-licm` | loop-invariant code motion for low CFGs, only with `LOOM_EXP_LICM=1` (the emitter sets it for the fp16 and kv4 prefill attention): -1.0% at pp2048, -2.15% at 32K, bit-identical |
 | `0012-loom-slice-alias-coalescing` | concats of consecutive slices fold, and slice coalescing ignores dead exact-storage aliases: attention loop 29 -> 21 moves, -0.8..-2.3% attention, bit-identical |
+| `0013-xdna-npu-cascade-gemm-compiler` | the Loom AIE2P compiler pieces of the NPU cascade GEMM: memory-tile staging, replay and multicast |
+| `0014-xdna-continuation-invocation` | the XDNA loader resolves an entry's control-only continuation (`iree_hal_amd_xdna_executable_query_continuation`) |
+| `0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8 byte store in a graph (the GPU releases NPU jobs and clears their words) |
+| `0016-loom-xdna-npu-side-gate` | an NPU job waits for a flag in memory itself, so the GPU and the NPU sync without the host |
+| `0017-loom-xdna-gated-call-invocations` | the NPU-side gate for plans that are not streamed (one replay group) |
+| `0018-loom-xdna-npu-decoder-column` | array descriptors and bindings for the decoder column (`gen_npu_gemm` dcol 2: weight rows decoded on the cores) |
+| `0019-loom-xdna-npu-ffn-block` | array plan, binding (axis chains) and route changes for the NPU FFN block |
+| `0020-loom-xdna-npu-fused-fill` | GEMM workers fill their own memory-tile panels, so weights can be decoded on the way in |
+| `0021-loom-xdna-pack-low` | low bank packing of read-only leaf data and wide ring records (opt-in `LOOM_EXP_PACK_LOW=1`) |
+| `0022-loom-xdna-intake` | intake channels (`constrain.intake`): a staged binding read in panels |
+| `0023-loom-xdna-core-stream-dma` | core-to-core streams own no DMA |
+| `0024-loom-xdna-core-stream-schedule` | scalar core stream transfers schedule like the cascade |
+| `0025-loom-xdna-east-neighbor-intake-depths` | two array fixes for the gate placement that frees the gate column's fill (`gen_npu_gemm` gwest) |
+| `0026-loom-xdna-leaf-sync-addresses` | two array fixes for leaf-synchronized channels (`gen_npu_gemm` ghelp) |
+| `0027-loom-xdna-drain-lock-requests` | a setup fix for images of other layouts sharing a context (`LOOM_EXP_ROUTE_RESET`) |
+| `0028-loom-xdna-deferred-conflicting-rodata` | the planner defers read-only data with bank conflicts (`conflicts([...])`) |
+| `0029-loom-xdna-top-aligned-programs` | core programs end at the top of program memory, behind a 16-byte startup jump |
 | `0030-loom-amdgpu-tied-fmac` | an f32 fma whose addend dies there becomes the tied `v_fmac_f32`, which VOPD pairs; the iu4 GEMM fold: 31 fewer VALU issue slots per phase, bit-identical |
 | `0031-loom-amdgpu-matrix-bank-allocation` | register allocation also tries a first fit that sees instruction operand preferences (matrix operand banks), kept only without spills and without a lower residency tier; adds the gfx1151 iu4 WMMA qualification; bit-identical |
 | `0032-loom-kernel-priority` | `kernel.priority {level = N}` lowers to `s_setprio` as an ordered execution barrier; used around the iu4 GEMM fold; bit-identical |
