@@ -21,8 +21,6 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0003-profile-counters-mode` | `HRX_PROFILE_MODE=counters` with `HRX_PROFILE_COUNTERS`: per-dispatch PMC such as `SQ_BUSY_CYCLES`, plus the gfx11 GL2C counters |
 | `0005-gfx1151-f16-wmma-operand-placement` | the f16 WMMA spreads its operands over the register banks (upstream does it for bf16 only): prefill GEMM cycles -2.6% |
 | `0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
-| `0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later; bit-identical |
-| `0009-loom-omit-dead-fma-mix-seeds` | after allocation, drops the `v_mov_b32 0` that seeds an f16 pair built by `v_fma_mixlo` + `v_fma_mixhi`, keeping the schedule and registers; bit-identical |
 | `0010-loom-vopd-trans-window-lookahead` | VOPD pairs inside TRANS-result windows when a lookahead finds no read that relies on the distance: prefill attention and SwiGLU epilogues -0.1..-0.25% cycles, bit-identical |
 | `0011-loom-low-licm` | loop-invariant code motion for low CFGs, only with `LOOM_EXP_LICM=1` (the emitter sets it for the fp16 and kv4 prefill attention): -1.0% at pp2048, -2.15% at 32K, bit-identical |
 | `0012-loom-slice-alias-coalescing` | concats of consecutive slices fold, and slice coalescing ignores dead exact-storage aliases: attention loop 29 -> 21 moves, -0.8..-2.3% attention, bit-identical |
@@ -38,9 +36,7 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0039-loom-amdgpu-repack-reads-constructing-lanes` | a result -> rhs b16 fragment repack reads the constructing lanes directly: 8 fewer VALU per repacked tile, bit-identical |
 | `0040-loom-amdgpu-b16-store-takes-low-half-def` | a 16-bit store of a low-half definition skips the `v_bfe_u32` that cleared the upper half: 168 VALU fewer in `gen_gdn_ss`, bit-identical |
 | `0041-loom-amdgpu-cross-block-memory-waits-use-alias-summaries` | cross-block memory waits use the source's alias summaries (no `vscnt 0` drain for noalias buffers), and `ds_swizzle` touches no memory |
-| `0042-amdgpu-one-mib-command-buffer-blocks` | 1 MiB command-buffer blocks: a pp2048 chunk graph is one submission, no 0.5-0.7 ms idle at a block boundary |
 | `0043-loom-amdgpu-xor16-shuffle-via-permlanex16` | wave32 xor-16 shuffles lower to `v_permlanex16_b32` instead of `ds_swizzle`: attention softmax exchanges -1.1..-3%, bit-identical |
-| `0044-libhrx-graph-barrier-state-256` | the graph barrier planner tracks 256 commands since the last barrier (was 8), so completion-counter chains do not pay a full barrier for retired edges |
 | `0045-loom-amdgpu-gfx11-non-temporal-cache-policy` | gfx11 non-temporal hints encode as GLC / SLC / DLC; decode's DeltaNet state store skips the MALL (+18 us per DeltaNet layer before) |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
