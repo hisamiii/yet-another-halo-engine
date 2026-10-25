@@ -439,7 +439,10 @@ Gguf Gguf::OpenHfq(const std::string& path, bool lock, bool weights) {
     g.tensors_.push_back(std::move(info));
   }
   if (lock && ::mlock(base, bytes) != 0)
-    std::fprintf(stderr, "hfq: cannot lock the model in memory (RLIMIT_MEMLOCK)\n");
+    std::fprintf(stderr,
+                 "hfq: cannot lock the model in memory (RLIMIT_MEMLOCK); it may be paged out under memory "
+                 "pressure. To lock it: a line '<user> - memlock unlimited' in /etc/security/limits.d/, then log in "
+                 "again\n");
   return g;
 }
 

@@ -329,7 +329,11 @@ Gguf Gguf::OpenResident(const std::string& path) {
     ::munmap(p, bytes);
     throw;
   }
-  if (::mlock(p, bytes) != 0) std::fprintf(stderr, "gguf: cannot lock the model in memory (RLIMIT_MEMLOCK)\n");
+  if (::mlock(p, bytes) != 0)
+    std::fprintf(stderr,
+                 "gguf: cannot lock the model in memory (RLIMIT_MEMLOCK); it may be paged out under memory "
+                 "pressure. To lock it: a line '<user> - memlock unlimited' in /etc/security/limits.d/, then log in "
+                 "again\n");
   ::munmap(g.base_, g.map_bytes_);
   g.base_ = p, g.map_bytes_ = bytes;
   return g;
