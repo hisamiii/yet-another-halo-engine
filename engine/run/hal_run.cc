@@ -4,7 +4,8 @@
 // usage: hal_run <model> <hal> <gx[,gy[,gz]]> <wg_size> <min_sizes> <binding>...
 //   min_sizes  comma-separated byte sizes, one per binding: the kernel's declared footprint (gen_gemv.footprint).
 //              A smaller binding stops the run before dispatch (exit 3): a read past an allocation hangs this GPU.
-//   binding    t:<tensor>          a GGUF tensor, copied to the device (exact bytes)
+//   binding    t:<tensor>          a GGUF tensor, copied to the device (exact bytes); the model is opened (mapped, not
+//                                  read whole) only for these, so kernels without t: bindings take any path as <model>
 //              f:<file>            a device buffer initialized from the file
 //              o:<bytes>:<file>    a zeroed device buffer, written to <file> after the run
 //              io:<in>:<out>       initialized from <in>, written to <out> after the run
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <iterator>
 #include <sstream>
 #include <string>
@@ -40,7 +42,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto gguf = yah::core::Gguf::OpenResident(argv[1]);
+    std::optional<yah::core::Gguf> gguf;
     const std::string hal = argv[2];
     const uint32_t gx = static_cast<uint32_t>(std::atoi(argv[3]));  // "gx", "gx,gy" or "gx,gy,gz"
     const char* comma = std::strchr(argv[3], ',');
@@ -68,12 +70,13 @@ int main(int argc, char** argv) {
       const std::string spec = argv[6 + i];
       size_t size = 0;
       if (spec.rfind("t:", 0) == 0) {
-        const auto* t = gguf.Find(spec.substr(2));
+        if (!gguf) gguf.emplace(yah::core::Gguf::Open(argv[1]));
+        const auto* t = gguf->Find(spec.substr(2));
         if (!t) throw LoomError("tensor not found: " + spec.substr(2));
         size = static_cast<size_t>(t->bytes);
         // a device copy, as LoomWeights binds the model (64 KiB past it stay mapped)
         owned.push_back(gpu.Allocate(size + (size_t{64} << 10)));
-        gpu.H2D(owned.back(), gguf.Data(*t), size);
+        gpu.H2D(owned.back(), gguf->Data(*t), size);
         refs.push_back({owned.back().handle, 0, size});
       } else if (spec.rfind("f:", 0) == 0 || spec.rfind("io:", 0) == 0) {
         const bool io = spec[0] == 'i';
