@@ -750,9 +750,10 @@ def main():
     rows = E.parse(model)
     combos = gemm_combos(rows)
     types = {nm: ty for nm, _, ty in rows}
-    # MQ4 (HFQ) models: A4 prefill (int4 activations, iu4 GEMMs) unless YAH_A16=1 (W4A16: f16 activations, the quality mode)
+    # MQ4 weights (HFQ, or GGUF converted at load): A4 prefill (int4 activations, iu4 GEMMs) unless YAH_A16=1 (W4A16: f16
+    # activations, the quality mode)
     if types.get("blk.0.ffn_down.weight") != 44 or types.get("output.weight") != 44 or types["token_embd.weight"] != 8:
-        raise SystemExit("emit_prefill_pp: not an MQ4 model (the GGUF model path is gone since tag pre-cleanup-2026-10-20)")
+        raise SystemExit("emit_prefill_pp: the model's weights are not MQ4G256 as yah-dump --table shows them")
     a4 = os.environ.get("YAH_A16") != "1"
     KV16_ON = a4
     NQOV_ON = a4

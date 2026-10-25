@@ -71,6 +71,7 @@ struct MetadataValue {
 
 // A read-only, mmapped GGUF file. Weight bytes are not copied: Data() points into the mapping.
 // An HFQ container (hipfire, core/hfq.cpp) opens as the GGUF the engine reads: GGUF names, dims and metadata.
+// OpenResident and OpenIndex present a GGUF model converted the same way (core/gguf_convert.cpp).
 class Gguf {
  public:
   static Gguf Open(const std::string& path);
@@ -110,6 +111,8 @@ class Gguf {
   Gguf() = default;
   void Close();
   static Gguf OpenHfq(const std::string& path, bool lock, bool weights = true);
+  // A GGUF with the projections converted to MQ4G256 (core/gguf_convert.cpp); weights false: the table only.
+  static Gguf OpenConverted(const std::string& path, bool weights, bool lock);
   // 2 MB aligned anonymous memory of at least `bytes` (a multiple of 2 MB) for a resident copy.
   static std::uint8_t* Reserve(std::size_t bytes, const std::string& path);
   void ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) const;

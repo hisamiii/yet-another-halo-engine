@@ -11,9 +11,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LOOM = os.path.abspath(os.path.join(HERE, ".."))
 EMIT = os.path.join(LOOM, "emit_hal.py")
 
-# tensor type -> (short name, short name, qk); the GEMMs and GEMVs run only MQ4 (the GGUF formats went with the GGUF
-# model path, tag pre-cleanup-2026-10-20)
-FMT = {44: ("mq4", "mq4", 256)}   # hipfire MQ4G256 (HFQ models; not a ggml type)
+# tensor type -> (short name, short name, qk); the GEMMs and GEMVs run only MQ4 (GGUF models convert to it at load; the
+# per-format GGUF kernels are on tag pre-cleanup-2026-10-20)
+FMT = {44: ("mq4", "mq4", 256)}   # hipfire MQ4G256 (not a ggml type)
 KSTORE = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight",
           "ssm_beta.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
           "ffn_gate.weight"}
@@ -22,9 +22,8 @@ SWIGLU = {"ffn_up.weight"}
 
 
 def parse(model):
-    """Return [(name, dims, type)] for every tensor of an HFQ model as the engine sees it (yah-dump --table)."""
-    if open(model, "rb").read(4) != b"HFQM":
-        raise SystemExit("%s: not an HFQ model (the GGUF model path is gone since tag pre-cleanup-2026-10-20)" % model)
+    """Return [(name, dims, type)] for every tensor of a model as the engine sees it (yah-dump --table): an HFQ model,
+    or a GGUF one with its projections converted to MQ4G256 at load (core/gguf_convert.cpp)."""
     dump = os.path.join(LOOM, "..", "..", "build", "yah-dump")
     out = subprocess.run([dump, model, "--table"], capture_output=True, text=True, check=True).stdout
     return [(p[0], [int(d) for d in p[2:]], int(p[1])) for p in (ln.split() for ln in out.splitlines())]

@@ -581,7 +581,7 @@ class LoomPrefill {
       return b;
     };
     if (!geom_.count("rot"))
-      throw LoomError("prefill: not an MQ4 set (the GGUF model path is gone since tag pre-cleanup-2026-10-20)");
+      throw LoomError("prefill: not an MQ4 set (an emit_prefill_pp.py set from before 2026-10-20?)");
     a4_ = geom_.count("a4") != 0;
     nqov_ = a4_ && geom_.count("nqov") != 0;
     dnov_ = a4_ && geom_.count("dnov") != 0;

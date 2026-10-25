@@ -11,7 +11,7 @@ endif()
 find_package(ICU COMPONENTS uc REQUIRED)
 
 find_package(Threads REQUIRED)
-add_library(yah_core STATIC core/gguf.cpp core/hfq.cpp core/config.cpp core/tokenizer.cpp model/weights.cpp)
+add_library(yah_core STATIC core/gguf.cpp core/gguf_convert.cpp core/gguf_quant.cpp core/hfq.cpp core/config.cpp core/tokenizer.cpp model/weights.cpp)
 target_include_directories(yah_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(yah_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_link_libraries(yah_core PUBLIC ICU::uc Threads::Threads)
@@ -26,6 +26,10 @@ target_link_libraries(yah-dump PRIVATE yah_core)
 # verification step for the tokenizer is the HF golden hash fixture.
 add_executable(yah-tokenize core/yah_tokenize.cpp)
 target_link_libraries(yah-tokenize PRIVATE yah_core)
+
+# gguf_rows: the GGUF conversion's dequantizers and MQ4 quantizer on files (tests/gguf_check.py).
+add_executable(gguf_rows tests/gguf_rows.cc)
+target_link_libraries(gguf_rows PRIVATE yah_core)
 
 # yah-weights: resolve and validate the typed weight table the layer loop needs.
 add_executable(yah-weights model/yah_weights.cpp)

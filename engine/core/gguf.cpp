@@ -315,28 +315,12 @@ void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
   ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
 }
 
-Gguf Gguf::OpenIndex(const std::string& path) { return IsHfq(path) ? OpenHfq(path, false, false) : Open(path); }
+Gguf Gguf::OpenIndex(const std::string& path) {
+  return IsHfq(path) ? OpenHfq(path, false, false) : OpenConverted(path, false, false);
+}
 
 Gguf Gguf::OpenResident(const std::string& path) {
-  if (IsHfq(path)) return OpenHfq(path, true);
-  Gguf g = Open(path);
-  constexpr std::size_t kHuge = std::size_t{2} << 20;
-  const std::size_t bytes = (g.size_ + kHuge - 1) & ~(kHuge - 1);
-  std::uint8_t* p = Reserve(bytes, path);
-  try {
-    g.ReadAll(p, g.size_, path);
-  } catch (...) {
-    ::munmap(p, bytes);
-    throw;
-  }
-  if (::mlock(p, bytes) != 0)
-    std::fprintf(stderr,
-                 "gguf: cannot lock the model in memory (RLIMIT_MEMLOCK); it may be paged out under memory "
-                 "pressure. To lock it: a line '<user> - memlock unlimited' in /etc/security/limits.d/, then log in "
-                 "again\n");
-  ::munmap(g.base_, g.map_bytes_);
-  g.base_ = p, g.map_bytes_ = bytes;
-  return g;
+  return IsHfq(path) ? OpenHfq(path, true) : OpenConverted(path, true, true);
 }
 
 }  // namespace yah::core
