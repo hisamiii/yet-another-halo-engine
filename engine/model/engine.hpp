@@ -87,6 +87,8 @@ class Engine : public TextGenerator {
     const void* th = nullptr;
     tokens_mirror_ = gpu_.AllocateHost((std::size_t{decoder_.context()} + 1) * 4, &th);
     tokens_host_ = static_cast<const std::uint32_t*>(th);
+    guess_ = gpu_.AllocateHost(4, &th);
+    guess_host_ = static_cast<const std::uint32_t*>(th);
     const core::MetadataValue* name = gguf_.Meta("general.name");
     name_ = name && !name->s.empty() ? name->s : "qwen3.8-27b";
     if (o.npu) StartNpu(o);
@@ -95,6 +97,8 @@ class Engine : public TextGenerator {
         draft_status_ = "the model has no MTP layer (a GGUF with blk.N.nextn.*) or the decode set no MTP kernels";
       else if (decoder_.verify_tokens() < 2)
         draft_status_ = "the decode set has no verify GEMVs (emit_decode.py VERIFY)";
+      else if (decoder_.verify_tokens() > LoomDecoder::kMaxVerify)
+        draft_status_ = "the decode set's verify width is past " + std::to_string(LoomDecoder::kMaxVerify);
       else
         draft_status_.clear(), draft_len_ = std::min(o.draft_len ? o.draft_len : 0xffu, decoder_.verify_tokens() - 1),
         draft_auto_ = o.draft_len == 0;
@@ -328,7 +332,10 @@ class Engine : public TextGenerator {
   // the first draft its hidden state; each round then drafts k tokens with the MTP layer after token q (into the
   // token stream), verifies q and the drafts in one pass, keeps the drafts up to the first the model disagrees with
   // and the model's own token after them (the next round's q). A verify never runs past a chunk boundary, so the
-  // decode slot (Save) lands on one. Auto draft length: one more after a fully kept draft, else the kept count + 1.
+  // decode slot (Save) lands on one. k = 0 is a plain step, after an MTP draft that keeps the MTP layer's KV whole
+  // and whose guess still measures the acceptance.
+  // Draft length (auto): the k with the most tokens per ms, E(k) / cost(k), E(k) = 1 + p + .. + p^k for the measured
+  // acceptance p of a draft token, cost(k) the measured time of a round with k drafts.
   void Speculate(GenerateResult& r, std::uint32_t n, const GenerateParams& params,
                  const std::function<bool(core::TokenId)>& on_token, int ys) {
     const auto t1 = std::chrono::steady_clock::now();
@@ -355,37 +362,67 @@ class Engine : public TextGenerator {
       if (reuse_ && (n + 1) % B == 0) Save(ys, n + 1, decoder_.conv_state());
       decoder_.MtpBegin();
       decoder_.MtpHidden(decoder_.MainHidden());
-      std::uint32_t q = n + 1, k = draft_len_;
+      std::uint32_t q = n + 1;
       gpu_.Synchronize();
       cur = decoder_.Tokens(q, q + 1)[0];
       while (report(cur) && q + 1 < limit && q + 1 < T) {
         // k drafts, at most to the chunk boundary, the token budget and the context
         const std::uint32_t edge = std::min({(q / B + 1) * B, limit, T});
-        const std::uint32_t kk = std::min(k, edge - q - 1);
-        for (std::uint32_t j = 0; j < kk; ++j) decoder_.Draft(q + j, q + j - (n + 1));
-        decoder_.Verify(q, kk + 1);
-        gpu_.Synchronize();
-        const std::vector<std::uint32_t> got = decoder_.VerifyResult(kk + 1);
-        const std::vector<std::uint32_t> draft = kk ? decoder_.Tokens(q + 1, q + kk + 1) : std::vector<std::uint32_t>{};
-        std::uint32_t m = 0;
-        while (m < kk && draft[m] == got[m]) ++m;
-        decoder_.Accept(m);
-        decoder_.SetTokens(&got[m], 1, q + m + 1);
-        if (reuse_ && (q + m + 1) % B == 0) Save(ys, q + m + 1, decoder_.conv_state());
-        decoder_.MtpHidden(decoder_.VerifyHidden(m));
-        r.drafted += kk, r.accepted += m;
+        const std::uint32_t kmax = std::min(draft_len_, edge - q - 1);
+        const std::uint32_t k = draft_auto_ ? DraftLength(kmax) : kmax;
+        const std::uint32_t v = q - (n + 1);   // the MTP layer's position
+        const auto t0 = std::chrono::steady_clock::now();
+        std::uint32_t m = 0, tested = 1;
         bool more = true;
-        for (std::uint32_t i = 0; i < m && more; ++i) more = report(draft[i]);
+        if (k == 0) {
+          decoder_.Draft(q, v);
+          gpu_.Copy(decoder_.TokenRef(q + 1), Ref(guess_));
+          decoder_.Step(q, q);
+          decoder_.MtpHidden(decoder_.MainHidden());
+          gpu_.Synchronize();
+          cur = decoder_.Tokens(q + 1, q + 2)[0];
+          m = __atomic_load_n(guess_host_, __ATOMIC_ACQUIRE) == cur ? 1 : 0;   // (scored, not kept)
+          if (reuse_ && (q + 1) % B == 0) Save(ys, q + 1, decoder_.conv_state());
+          q += 1;
+        } else {
+          for (std::uint32_t j = 0; j < k; ++j) decoder_.Draft(q + j, v + j);
+          decoder_.Verify(q, k + 1);
+          gpu_.Synchronize();
+          const std::vector<std::uint32_t> got = decoder_.VerifyResult(k + 1);
+          const std::vector<std::uint32_t> draft = decoder_.Tokens(q + 1, q + k + 1);
+          while (m < k && draft[m] == got[m]) ++m;
+          tested = std::min(m + 1, k);
+          decoder_.Accept(m);
+          decoder_.SetTokens(&got[m], 1, q + m + 1);
+          if (reuse_ && (q + m + 1) % B == 0) Save(ys, q + m + 1, decoder_.conv_state());
+          decoder_.MtpHidden(decoder_.VerifyHidden(m));
+          r.drafted += k, r.accepted += m;
+          for (std::uint32_t i = 0; i < m && more; ++i) more = report(draft[i]);
+          q += m + 1;
+          cur = got[m];
+        }
+        // the acceptance and this round's cost (synced: the round's GPU work included)
+        accept_n_ = 0.95 * accept_n_ + m, accept_d_ = 0.95 * accept_d_ + tested;
+        Track(round_ms_[k], std::chrono::steady_clock::now() - t0, true);
         if (!more) break;
-        if (draft_auto_) k = m == kk ? std::min(draft_len_, k + 1) : m + 1;
-        q += m + 1;
-        cur = got[m];
       }
     }
     gpu_.Synchronize();
     r.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     for (Snapshot& s : snaps_)
       if (s.at > seq_.size()) s.at = 0;
+  }
+  // The draft length up to kmax with the most expected tokens per ms (Speculate).
+  [[nodiscard]] std::uint32_t DraftLength(std::uint32_t kmax) const {
+    const double p = std::clamp(accept_n_ / accept_d_, 0.0, 0.99);
+    std::uint32_t best = 0;
+    double best_rate = 0.0, e = 0.0, pk = 1.0;
+    for (std::uint32_t k = 0; k <= kmax; ++k, pk *= p) {
+      e += pk;
+      const double rate = e / round_ms_[k];
+      if (rate > best_rate) best = k, best_rate = rate;
+    }
+    return best;
   }
 
   // The recurrent state at sequence position at (0: empty); the KV rows below it stay in the pools.
@@ -435,6 +472,12 @@ class Engine : public TextGenerator {
 #endif
   std::string npu_status_ = "off";
   std::string draft_status_ = "off";
+  // Speculate's measurements: the decayed accepted / scored draft tokens, the time of a round by draft length
+  // (priors: a step 62 ms, a draft 4 ms, a verify 85 ms + 5 ms a token; measured on gfx1151, refined as it runs)
+  double accept_n_ = 3.0, accept_d_ = 5.0;
+  double round_ms_[LoomDecoder::kMaxVerify] = {66.0, 98.0, 107.0, 116.0, 125.0, 134.0, 143.0, 152.0};
+  LoomBuffer guess_;                     // the MTP layer's guess on a plain step (Speculate)
+  const std::uint32_t* guess_host_ = nullptr;
   std::uint32_t draft_len_ = 0;   // the draft length cap (auto) or the fixed length
   bool draft_auto_ = false, draft_on_ = true;
   LoomBuffer logits_, seed_;

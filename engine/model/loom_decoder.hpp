@@ -336,6 +336,7 @@ class LoomDecoder {
   // ping-pong through a ring, the DeltaNet state after each token but the last is copied to a ring slot, and a
   // quantized V open tile a rejected token may have moved past is restored and refilled. Greedy only.
   [[nodiscard]] std::uint32_t verify_tokens() const { return vt_; }
+  static constexpr std::uint32_t kMaxVerify = 8;
   [[nodiscard]] hrx_buffer_ref_t VerifyTokens() const { return Ref(*vtok_); }
   // The greedy tokens of the last Verify (synchronous read).
   std::vector<std::uint32_t> VerifyResult(std::uint32_t n) {

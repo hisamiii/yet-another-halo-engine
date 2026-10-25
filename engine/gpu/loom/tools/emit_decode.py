@@ -169,7 +169,7 @@ def main():
             emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, amax=True), aname, outdir)
             grids[aname] = grids[name]
     for name, (kind, fmts, M, K) in sorted(gs.items()):   # the verify GEMVs: no peel, no fused epilogues
-        R, W = RW[kind]
+        R, W = RW[kind]   # (R = 1 halves the accumulators but runs slower: fewer loads in flight per wave)
         emit_src(GV.gen(kind, fmts, M, K, R, W, T=VERIFY), name + "_t%d" % VERIFY, outdir)
         grids[name + "_t%d" % VERIFY] = M // GV.rows_per_wg(R, W)
     eh = [(d, ty) for nm, d, ty in EP.parse(model) if nm.endswith(".nextn.eh_proj.weight")]

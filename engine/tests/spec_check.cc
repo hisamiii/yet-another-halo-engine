@@ -1,13 +1,15 @@
 // The speculative verify against plain decode steps (LoomDecoder::Verify / Accept), on a decode set with "verify":
-//   spec_check <model> <decode set> [gen]
+//   spec_check <model> <decode set> [gen] [--time]
 // A greedy reference of gen tokens after a fixed prompt (decode steps, logits kept), then the same through verify
 // rounds whose drafts are the reference's tokens with one wrong per round at a rotating index, so every accept count
 // 0 .. T - 1 and the rollbacks behind it come up. Every verified token's logits must equal the reference's bit for bit
-// and the output must be the reference.
+// and the output must be the reference. --time: then the cost of a step, a verify of 1 .. T tokens and an MTP draft
+// (each synced, the median of 9).
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -21,11 +23,12 @@
 using namespace yah::model;  // NOLINT(google-build-using-namespace)
 
 int main(int argc, char** argv) {
-  if (argc < 3 || argc > 4) {
-    std::fprintf(stderr, "usage: spec_check <model> <decode set> [gen]\n");
+  if (argc < 3 || argc > 5) {
+    std::fprintf(stderr, "usage: spec_check <model> <decode set> [gen] [--time]\n");
     return 2;
   }
   const std::uint32_t gen = argc > 3 ? static_cast<std::uint32_t>(std::atoi(argv[3])) : 96;
+  const bool timing = argc > 4 && std::string(argv[4]) == "--time";
   try {
     auto gguf = yah::core::Gguf::OpenResident(argv[1]);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
@@ -96,6 +99,33 @@ int main(int argc, char** argv) {
     std::printf("\n%s  output = reference for %u of %u tokens\n", same == gen ? "ok  " : "FAIL", same, gen);
     std::printf("%s  verified logits bit-identical (%u differ)\n", mismatched ? "FAIL" : "ok  ", mismatched);
     std::printf("reference: %s\n", tok.Decode(ref).c_str());
+    if (timing) {
+      const auto ms = [&](auto&& f) {
+        std::vector<double> t;
+        for (int r = 0; r < 9; ++r) {
+          gpu.Synchronize();
+          const auto t0 = std::chrono::steady_clock::now();
+          f();
+          gpu.Synchronize();
+          t.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        std::sort(t.begin(), t.end());
+        return t[4];
+      };
+      std::printf("step %.2f ms\n", ms([&] { dec.Step(pos, 0), ++pos; }));
+      for (std::uint32_t k = 1; k <= T; ++k)
+        std::printf("verify %u: %.2f ms\n", k, ms([&] {
+                      dec.Verify(pos, k);
+                      dec.Accept(k - 1);
+                      pos += k;
+                    }));
+      if (dec.has_mtp()) {
+        dec.MtpBegin();
+        dec.MtpHidden(dec.MainHidden());
+        std::uint32_t v = 0;
+        std::printf("mtp draft %.2f ms\n", ms([&] { dec.Draft(pos + v, v), ++v; }));
+      }
+    }
     return same == gen && !mismatched ? 0 : 1;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "spec_check: %s\n", e.what());
