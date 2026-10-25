@@ -572,6 +572,7 @@ class LoomNpu {
   // Host involvement: command bytes, the host's waits for a free arena, the NPU's idle time with no command queued.
   struct CommandStats {
     std::size_t commands = 0, bytes = 0, arena_waits = 0, replayed = 0;
+    std::size_t setup_bytes = 0, swap_bytes = 0, setups = 0, swaps = 0;   // family setups, decoder swaps
     double busy_ms = 0, max_ms = 0, arena_wait_ms = 0, idle_ms = 0;
   };
   CommandStats Commands() {
@@ -602,7 +603,10 @@ class LoomNpu {
     std::size_t used = 0;
     std::uint64_t last = 0;   // the last command built into it (its submission count)
   };
-  static constexpr std::size_t kArenaBytes = 8u << 20, kCommandAlign = 32768, kArenas = 5;
+  static constexpr std::size_t kArenaBytes = 8u << 20, kCommandAlign = 32768;
+  // command arenas: the NPU's command memory holds 64 MB per process, 7 arenas and a little (5 starved 2048-token
+  // chunk pairs: the host waited 4 s for arenas at pp8192); YAH_NPU_ARENAS overrides
+  const std::size_t kArenas = std::getenv("YAH_NPU_ARENAS") ? std::strtoul(std::getenv("YAH_NPU_ARENAS"), nullptr, 10) : 7;
   static const std::uint8_t* CommandBytes(const Kernel& k, const amdf_xdna_kernel_command_t& c) {
     for (const auto& st : k.storage)
       if (st.memory == c.memory) return static_cast<const std::uint8_t*>(st.mapping.data) + (c.byte_offset - st.memory_byte_offset);
@@ -722,6 +726,7 @@ class LoomNpu {
   Fused FusedCommand(const std::vector<std::vector<const Call*>>& runs, int dec, const void* fam) {
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
+    std::size_t setup = 0, swap = 0, setups = 0, swaps = 0;
     auto append_raw = [&](const std::uint8_t* src, std::size_t length) {
       std::uint32_t n = 0, size = 0;
       std::memcpy(&n, src + 8, 4), std::memcpy(&size, src + 12, 4);
@@ -735,7 +740,9 @@ class LoomNpu {
       int queued = 0, since = 0;
       if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
         if (k0->setup.empty()) throw LoomError("npu: a job switches image families without a setup");
+        const std::size_t b0 = bytes.size();
         append(DeltaSetup(k0->setup.data(), k0->setup.size()));
+        setup += bytes.size() - b0, ++setups;
         fam = FamilyOf(k0), dec = k0->dec;
       }
       append(calls[0]->gate);
@@ -748,7 +755,9 @@ class LoomNpu {
         const Call& c = *calls[i];
         if (c.k->swap && c.k->dec != dec) {
           for (; queued > 0; --queued) append(calls[i - 1]->wait);
+          const std::size_t b0 = bytes.size();
           append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length));
+          swap += bytes.size() - b0, ++swaps;
           dec = c.k->dec, since = 0;
         }
         append(since == 0 ? c.lead : c.push[since & 1]);
@@ -786,6 +795,7 @@ class LoomNpu {
       std::lock_guard<std::mutex> lock(mu_);
       a.last = submitted_ + 1;   // the command about to be submitted (EnqueueGated)
       commands_.bytes += size;
+      commands_.setup_bytes += setup, commands_.swap_bytes += swap, commands_.setups += setups, commands_.swaps += swaps;
     }
     std::memcpy(static_cast<std::uint8_t*>(a.storage.mapping.data) + a.used, bytes.data(), size);
     YAH_AMDF(api_->host_mapping_cache_control(a.map, AMDF_HOST_CACHE_OPERATION_FLUSH, a.used, size),
@@ -1061,11 +1071,11 @@ class LoomNpu {
     ci.byte_length = (req.byte_length + g - 1) / g * g;
     ci.minimum_alignment = p.allocation.minimum_alignment;
     ci.accesses = &access;
-    storage_bytes_ += ci.byte_length;   // the NPU's command memory is small (~64 MB per process): report the total
-    ++storage_count_;
     YAH_AMDF(api_->memory_create(scope, &ci, &out->memory),
-             ("memory_create(storage) " + std::to_string(storage_count_) + " storages, " +
-              std::to_string(storage_bytes_ >> 10) + " KB with this one").c_str());
+             ("memory_create(storage) " + std::to_string(storage_count_ + 1) + " storages, " +
+              std::to_string((storage_bytes_ + ci.byte_length) >> 10) + " KB with this one").c_str());
+    storage_bytes_ += ci.byte_length;   // the NPU's command memory is small: the total, for the message above
+    ++storage_count_;
     storage_size_[out->memory] = ci.byte_length;
     YAH_AMDF(api_->memory_query_address(out->memory, 0, kind, &out->device_address), "memory_query_address(storage)");
     amdf_memory_map_info_t mi{};
@@ -1278,7 +1288,7 @@ class LoomNpuSplit : public NpuSplit {
     const bool repeat = chunk && plan_.dcol && npu_.Epoch() == prev_epoch_ && SameJobs(jobs, prev_jobs_);
     if (chunk) prev_epoch_ = npu_.Epoch(), prev_jobs_ = jobs;
     const bool replay = repeat && !script_.commands.empty() && SameJobs(jobs, script_jobs_);
-    const bool record = repeat && !replay;
+    const bool record = repeat && !replay && !no_script_;
     try {
       npu_.CheckHealth();
       if (Word(kFlagStatus)) throw LoomError("npu: a GPU wait for the NPU failed");
@@ -1319,8 +1329,14 @@ class LoomNpuSplit : public NpuSplit {
         queued += n;
       }
       if (record && npu_.Epoch() == prev_epoch_) {
-        npu_.Seal(script_);
-        script_jobs_ = jobs;
+        try {
+          npu_.Seal(script_);
+          script_jobs_ = jobs;
+        } catch (const LoomError&) {   // past the NPU's command memory (long chunk pairs): no replay this run
+          npu_.Record(nullptr);
+          script_ = LoomNpu::Script{};   // (unsealed: no storage yet)
+          no_script_ = true;
+        }
       } else if (record) {   // the recording's own setups forgot program state
         npu_.Record(nullptr), npu_.Free(script_);
       }
@@ -1343,6 +1359,8 @@ class LoomNpuSplit : public NpuSplit {
                  c.busy_ms, c.max_ms);
     std::fprintf(f, "npu: %.1f MB of commands, host waits for a free arena %zu (%.1f ms), NPU idle with none queued %.1f ms\n",
                  c.bytes / 1e6, c.arena_waits, c.arena_wait_ms, c.idle_ms);
+    std::fprintf(f, "npu: %zu family setups %.1f MB, %zu decoder swaps %.1f MB\n", c.setups, c.setup_bytes / 1e6, c.swaps,
+                 c.swap_bytes / 1e6);
     if (c.replayed) std::fprintf(f, "npu: %zu commands replayed\n", c.replayed);
   }
 
@@ -1389,6 +1407,7 @@ class LoomNpuSplit : public NpuSplit {
   std::vector<Queued> prev_jobs_, script_jobs_;
   std::uint64_t prev_epoch_ = 0;
   LoomNpu::Script script_;
+  bool no_script_ = false;   // a Seal found no storage
   static bool SameJobs(const std::vector<Queued>& a, const std::vector<Queued>& b) {
     return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](const Queued& x, const Queued& y) {
       return x.calls == y.calls && x.tag == y.tag && x.layer == y.layer && x.words.ready == y.words.ready &&
