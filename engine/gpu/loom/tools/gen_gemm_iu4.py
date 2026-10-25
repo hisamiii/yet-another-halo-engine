@@ -83,7 +83,7 @@ def sym(kind):
     return "yah_iu4_gemm" + {"kres": "_kres", "kqg": "_kqg", "gu": "_gu"}.get(kind, "")
 
 
-def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
+def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
     """out16: kstore stores f16 (gen_gemm_tile.OUT16). flag (kres, kstore): binding cnt after the outputs, i32 per token
     tile (zero before the GEMM); each lane adds 1 to cnt[token tile] once its wave's stores are visible (device scope;
     flag_count per token tile), so a flag-waiting consumer (gen_rot.flag_wait) can read finished token tiles while the
@@ -96,7 +96,9 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
     is one head, so only the tile's store origin moves.
     wait (the producer's count per token tile, e.g. gen_rot.nq_flag_count): binding wcnt last, i32 per token tile (zero
     before the producer); the workgroup waits until wcnt[token tile] reaches wait (gen_rot.flag_wait), so the producer
-    of aq / ad runs without a graph barrier before this GEMM."""
+    of aq / ad runs without a graph barrier before this GEMM.
+    kpitch: the weight rows' 256-blocks when the GEMM reads only the first k_blocks of each (a K window: the GPU's
+    features of the NPU split's ffn_down), else k_blocks."""
     BM, BN, WM, WN = tile(M)
     GU = kind == "gu"
     BO = BM // 2 if GU else BM         # output rows of a workgroup
@@ -166,7 +168,10 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0):
     e("  %ktot = index.mul %k_blocks, %c256 : index")
     e("  %kphases = index.mul %k_blocks, %c2 : index")
     e("  %plast = index.sub %kphases, %c1 : index")
-    e("  %bpr = index.mul %k_blocks, %c136 : index")              # weight bytes per row
+    if kpitch:
+        e(f"  %bpr = index.constant {kpitch * 136} : index")           # weight bytes per row (a K window of them)
+    else:
+        e("  %bpr = index.mul %k_blocks, %c136 : index")              # weight bytes per row
     e("  %w_bytes = index.mul %m_rows, %bpr : index")
     e("  %w_dw = index.div %w_bytes, %c4 : index")
     e("  %w_h = index.div %w_bytes, %c2 : index")

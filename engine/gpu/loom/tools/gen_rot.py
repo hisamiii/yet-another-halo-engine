@@ -925,7 +925,7 @@ def nq_flag_count(K):
 NQ_HOIST = None
 
 
-def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
+def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0, xo=False):
     """yah_normq: gen_half_norm's RMS norm of f32 x rows fused with gen_q (the norm-fed A4 sites): the f16 norm output
     never leaves the workgroup. One row per workgroup of 16 K / 256 lanes, lane (gl, a) the rotation lane of group gl.
     The lanes load their 16 values into LDS; wave 0 runs gen_half_norm's per-lane chains (lane l: ((0 + x_l x_l) +
@@ -937,7 +937,9 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
     oflag: binding ocnt after them, i32 [rows / FLAG_TT] (zero before), nq_flag_count per token tile (emit_oflag), so a
     flag-waiting GEMM (gen_gemm_iu4.gen wait) runs without a graph barrier after this kernel.
     persist: grid (persist) instead of (rows), workgroup g does rows g, g + persist, ... in order: all workgroups are
-    dispatched at once, so the queue reaches the flag-waiting GEMM behind it while the rows still run."""
+    dispatched at once, so the queue reaches the flag-waiting GEMM behind it while the rows still run.
+    xo: binding xo after d, f16 [rows][K]: the rotated row (before quantization) in the NPU MQ4 decoder's positions
+    (gen_npu_dec.MQ4_ELEM: per 32 values the even ones, then the odd), the NPU's activations (yah_bfp16_encode_act)."""
     assert K % 256 == 0 and K % 32 == 0 and (not oflag or rows % FLAG_TT == 0) and (not persist or rows % persist == 0)
     ng = K // 256
     nth = 16 * ng
@@ -954,12 +956,12 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
     e("  kernel.launch.config workgroups(%gy, %u1, %u1) workgroup_size(%cnth, %u1, %u1) : index")
     nt = rows // FLAG_TT
     e("} launch(%x: buffer, %weight: buffer, %awq: buffer, %sg: buffer, %q: buffer, %d: buffer"
-      + (", %cnt: buffer" if flag else "") + (", %ocnt: buffer" if oflag else "") + ") {")
+      + (", %xo: buffer" if xo else "") + (", %cnt: buffer" if flag else "") + (", %ocnt: buffer" if oflag else "") + ") {")
     e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 16, 32, 128, 256, PITCH, 16 * PITCH):
+    for v in (0, 1) + ((2,) if xo else ()) + (16, 32, 128, 256, PITCH, 16 * PITCH):
         e(f"  %c{v} = index.constant {v} : index")
     e(f"  %ck = index.constant {K} : index")
-    nb = ["x", "weight", "awq", "sg", "q", "d"] + (["cnt"] if flag else []) + (["ocnt"] if oflag else [])
+    nb = ["x", "weight", "awq", "sg", "q", "d"] + (["xo"] if xo else []) + (["cnt"] if flag else []) + (["ocnt"] if oflag else [])
     e("  " + ", ".join(f"%{b}_na" for b in nb) + " = buffer.assume.noalias " + ", ".join(f"%{b}" for b in nb)
       + " : " + ", ".join(["buffer"] * len(nb)))
     e(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{total}xf32>")
@@ -1053,6 +1055,19 @@ def gen_nq(K, rows, span, eps=1e-6, flag=0, oflag=False, persist=0):
     if hoist and NQ_HOIST != "all":
         _core_loads(e, K, False)
     _core(e, K, total, True, "f16", ("q", "d"), LV, loaded="hoist" if hoist else False)
+    if xo:   # %r<i> is k = 256 gl + 16 i + a: position 256 gl + 32 (i / 2) + 8 (i % 2) + a / 2 + 16 (a % 2)
+        e(f"  %xov = buffer.view %xo_na[%base] : buffer -> view<{total}xf16>")
+        e("  %xo_ah = index.div %a, %c2 : index")
+        e("  %xo_ar = index.rem %a, %c2 : index")
+        e("  %xo_ap = index.mul %xo_ar, %c16 : index")
+        e("  %xo_b0 = index.add %rb, %gk : index")
+        e("  %xo_b1 = index.add %xo_b0, %xo_ah : index")
+        e("  %xo_b = index.add %xo_b1, %xo_ap : index")
+        for i in range(16):
+            e(f"  %xo_c{i} = index.constant {32 * (i // 2) + 8 * (i % 2)} : index")
+            e(f"  %xo_i{i} = index.add %xo_b, %xo_c{i} : index")
+            e(f"  %xo_h{i} = scalar.fptrunc %r{i} : f32 to f16")
+            e(f"  view.store %xo_h{i}, %xov[%xo_i{i}] : f16, view<{total}xf16>")
     _quant(e, total, span, LV)
     if oflag:
         emit_oflag(e, nt, "%row", "%lane")

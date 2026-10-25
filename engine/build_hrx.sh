@@ -30,10 +30,33 @@ cmake -S "$root/engine" -B "$root/engine/build" -DCMAKE_BUILD_TYPE=Release -DCMA
     -DCMAKE_CXX_FLAGS_RELEASE="${cxxflags[*]:1}" -DCMAKE_EXE_LINKER_FLAGS="${YAH_LDFLAGS:-}" >/dev/null
 cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # The runners below are not CMake targets. Build them here so a stale binary never runs against a new HAL set.
+# NPU (libamdf + the xdna loader, static from an HRX build with the xdna targets, engine/hrx/bootstrap.sh): the prefill
+# driver's NPU FFN block (YAH_NPU=1). Without them the driver is GPU-only.
+npu_flags=() npu_libs=()
+if [ -f "$H/libamdf/libamdf_static.a" ]; then
+  for a in experimental/xdna/libiree_experimental_xdna_amdf_status.a experimental/xdna/libiree_experimental_xdna_executable.a \
+           libamdf/libamdf_static.a runtime/src/iree/hal/drivers/amd/xdna/image/aie2p/libiree_hal_drivers_amd_xdna_image_aie2p_npu2.a \
+           runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_image.a \
+           runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_validation.a \
+           runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_directory.a \
+           runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_tables.a \
+           runtime/src/iree/schemas/libiree_schemas_xdna_executable.a runtime/src/iree/hal/libiree_hal_hal.a \
+           runtime/src/iree/io/libiree_io_file_handle.a runtime/src/iree/async/libiree_async_async.a \
+           runtime/src/iree/base/threading/libiree_base_threading_threading.a \
+           runtime/src/iree/base/internal/libiree_base_internal_memory.a runtime/src/iree/hal/memory/libiree_hal_memory_asan.a \
+           runtime/src/iree/hal/utils/libiree_hal_utils_platform_topology.a \
+           runtime/src/iree/base/internal/libiree_base_internal_sysfs.a runtime/src/iree/base/internal/libiree_base_internal_path.a \
+           runtime/src/iree/base/internal/libiree_base_internal_time.a runtime/src/iree/base/libiree_base_base.a; do
+    npu_libs+=("$H/$a")
+  done
+  npu_flags=(-DYAH_WITH_NPU -I"$YAH_HRX" -I"$YAH_HRX/runtime/src" -I"$H/runtime/src" -I"$YAH_HRX/libamdf/include" -I"$H"
+             -isystem "$H/_deps/linux_uapi/include" -DIREE_ALLOCATOR_SYSTEM_CTL=iree_allocator_libc_ctl)
+  npu_libs=(-Wl,--start-group "${npu_libs[@]}" -Wl,--end-group -lm -ldl)
+fi
 # Prefill driver.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_forward_pp.cc" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/loom_forward_pp.cc" \
     -o "$root/engine/build/loom_forward_pp" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+    "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # Decode driver (tools/emit_decode.py sets).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
     -o "$root/engine/build/loom_decode" "$root/engine/build/libyah_core.a" \

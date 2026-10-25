@@ -29,6 +29,9 @@
 #include "core/config.hpp"
 #include "core/gguf.hpp"
 #include "model/loom_decoder.hpp"
+#ifdef YAH_WITH_NPU
+#include "model/loom_npu.hpp"
+#endif
 #include "model/loom_prefill.hpp"
 #include "model/loom_runtime.hpp"
 
@@ -101,6 +104,22 @@ int main(int argc, char** argv) {
     gpu.SetSleepSync(200);
     LoomWeights weights(gpu, gguf);
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
+#ifdef YAH_WITH_NPU
+    // YAH_NPU=1: the NPU runs the set's FFN block (tools/emit_npu_ffn.py), its dense down weights from YAH_NPU_DOWN
+    // (tools/npu_down_pack.py).
+    std::unique_ptr<yah::model::LoomNpuSplit> npu;
+    if (const char* e = std::getenv("YAH_NPU"); e && std::string(e) == "1") {
+      const auto plan = pf.npu_plan();
+      const char* down = std::getenv("YAH_NPU_DOWN");
+      if (plan.a_bytes == 0 || !down) {
+        std::fprintf(stderr, "YAH_NPU=1: needs a set with the NPU FFN block (emit_npu_ffn.py) and YAH_NPU_DOWN\n");
+        return 2;
+      }
+      npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
+      const char* nl = std::getenv("YAH_NPU_LAYERS");   // (a test: only the first that many layers)
+      pf.EnableNpu(npu.get(), down, nl ? static_cast<std::uint32_t>(std::strtoul(nl, nullptr, 10)) : ~0u);
+    }
+#endif
     const std::uint32_t B = pf.chunk(), T_run = want ? want : B;
     if (T_run == 0 || T_run > pf.context()) {
       std::fprintf(stderr, "tokens=%u must be at most the context %u\n", T_run, pf.context());
@@ -195,6 +214,9 @@ int main(int argc, char** argv) {
     if (rowstats) std::fclose(rowstats);
     const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
+#ifdef YAH_WITH_NPU
+    if (npu) npu->Report(stdout);
+#endif
 
     {
       std::vector<float> out(std::size_t{B} * LoomPrefill::kHidden);

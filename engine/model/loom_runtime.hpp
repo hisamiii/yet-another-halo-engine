@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <string>
 #include <thread>
 #include <utility>
@@ -425,6 +426,25 @@ class LoomGraph {
     grids_.push_back({config.workgroup_count[0], config.workgroup_count[1], config.workgroup_count[2]});
     return grids_.size() - 1;
   }
+  // Stores value to target (4 bytes) after everything that wrote reads (HRX patch 0015). With release + system scope the
+  // command processor makes every earlier write visible to the host and other devices first. writes: ranges recorded as
+  // written by the store (another engine writes them once it sees the value).
+  void AtomicStore(const hrx_buffer_ref_t& target, uint32_t value, uint32_t flags,
+                   const std::vector<hrx_buffer_ref_t>& reads, const std::vector<hrx_buffer_ref_t>& writes) {
+    std::vector<hrx_graph_node_t> deps;
+    Depend(target, true, &deps);
+    for (const hrx_buffer_ref_t& r : reads) Depend(r, false, &deps);
+    for (const hrx_buffer_ref_t& r : writes) Depend(r, true, &deps);
+    Unique(&deps);
+    hrx_graph_atomic_store_node_attrs_t attrs{};
+    attrs.target = target, attrs.value = value, attrs.flags = flags;
+    hrx_graph_node_t node = nullptr;
+    LoomCheck(hrx_graph_add_atomic_store_node(graph_, deps.data(), deps.size(), &attrs, &node),
+              "hrx_graph_add_atomic_store_node");
+    accesses_[target.buffer].push_back({target.offset, target.length, true, node});
+    for (const hrx_buffer_ref_t& r : reads) accesses_[r.buffer].push_back({r.offset, r.length, false, node});
+    for (const hrx_buffer_ref_t& r : writes) accesses_[r.buffer].push_back({r.offset, r.length, true, node});
+  }
   // The workgroup count node i was recorded with.
   [[nodiscard]] const std::array<uint32_t, 3>& Grid(size_t i) const { return grids_[i]; }
   [[nodiscard]] size_t size() const { return grids_.size(); }
@@ -482,13 +502,20 @@ class LoomWeights {
   LoomWeights(LoomDevice& gpu, core::Gguf& gguf) {
     constexpr size_t kChunk = size_t{1} << 30;
     constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
-    std::vector<std::pair<size_t, size_t>> spans;
-    for (const auto& t : gguf.tensors()) spans.emplace_back(t.offset, t.offset + t.bytes);
+    // (begin, end, glued): a layer's ffn_gate, its awq, ffn_up and its awq stay in one buffer (the NPU FFN block reads
+    // a gate row through its up row in one view, LoomPrefill::RunFfnBlock)
+    std::vector<std::tuple<size_t, size_t, bool>> spans;
+    for (const auto& t : gguf.tensors()) {
+      const bool glued = t.name.ends_with("ffn_gate.awq") || t.name.ends_with("ffn_up.weight") ||
+                         t.name.ends_with("ffn_up.awq");
+      spans.emplace_back(t.offset, t.offset + t.bytes, glued);
+    }
     std::sort(spans.begin(), spans.end());
     for (size_t i = 0; i < spans.size();) {
-      const size_t begin = spans[i].first;
-      size_t end = spans[i].second;
-      for (++i; i < spans.size() && spans[i].second - begin <= kChunk; ++i) end = std::max(end, spans[i].second);
+      const size_t begin = std::get<0>(spans[i]);
+      size_t end = std::get<1>(spans[i]);
+      for (++i; i < spans.size() && (std::get<1>(spans[i]) - begin <= kChunk || std::get<2>(spans[i])); ++i)
+        end = std::max(end, std::get<1>(spans[i]));
       LoomBuffer buffer = gpu.Allocate(end - begin + kPad);
       gpu.H2D(buffer, gguf.tensor_data_base() + begin, end - begin);
       gguf.ReleaseData(begin, end - begin);
@@ -504,6 +531,12 @@ class LoomWeights {
   template <typename F>
   void ForEachBuffer(F&& f) const {
     for (const Chunk& c : chunks_) f(c.buffer.handle);
+  }
+  // The whole device buffer holding tensor t (the NPU shares it, NpuSplit::ShareGpu).
+  [[nodiscard]] const LoomBuffer& ChunkOf(const core::TensorInfo& t) const {
+    const size_t off = static_cast<size_t>(t.offset);
+    return (std::upper_bound(chunks_.begin(), chunks_.end(), off,
+                             [](size_t o, const Chunk& c) { return o < c.begin; }) - 1)->buffer;
   }
 
  private:

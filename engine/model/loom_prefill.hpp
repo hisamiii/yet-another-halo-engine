@@ -12,8 +12,10 @@
 #define YAH_MODEL_LOOM_PREFILL_HPP_
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -22,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -29,6 +32,7 @@
 #include "core/gguf.hpp"
 #include "model/loom_decoder.hpp"
 #include "model/loom_runtime.hpp"
+#include "model/npu_split.hpp"
 
 namespace yah::model {
 
@@ -82,6 +86,68 @@ class LoomPrefill {
   // fpsparse sets keep block means that a resumed sequence would not rebuild.
   [[nodiscard]] bool fpsparse() const { return fps_on_; }
 
+  // The NPU FFN block (npu.txt, tools/emit_npu_ffn.py): the NPU owns the FFN's last F features of every layer. Its
+  // gate / up calls (npu_ffnsw.xdna, F / 256 of them: call j's column c takes features G + 256 j + 32 c + [0, 32) of the
+  // G = 17408 - F the GPU leaves, gate rows and up rows decoded on the NPU from the weight chunks) write H =
+  // bfp16(silu(gate) up) into C, [M block][pass][16-token slab][128 k-blocks]; its down calls (npu_ffndn<passes>.xdna,
+  // per K part of F, kDownCalls calls of 512 rows) read H and decode IQ4_XS rows (tools/npu_down_pack.py: down's rows
+  // unrotated, its awq folded in, re-quantized) and write their partials after H. The GPU runs gate / up and down over the first G features
+  // into hidden2, then npu_unpack_ffn.hal adds the NPU's partials into hidden.
+  // npu_plan: the sizes LoomNpuSplit needs (a_bytes 0: the set has no block).
+  [[nodiscard]] NpuPlan npu_plan() const {
+    NpuPlan p;
+    if (!FfnF()) return p;
+    const NpuBytes sw = NpuBytesOf("npubytes_ffnsw");
+    p.a_bytes = sw.a, p.w_bytes = sw.w;   // (W: the images' panel binding, not read)
+    for (const auto& [p0, passes] : FfnParts()) p.w_bytes = std::max(p.w_bytes, NpuBytesOf(DnImage(passes, "npubytes_")).w);
+    p.c_bytes = FfnDownOff() + FfnParts().size() * kDownCalls * DownC();
+    p.dcol = p.gfirst = true;
+    const Geom& g = geom_.at("npugate");
+    p.gate_calls = g.rowgrp, p.gate_record = g.tt;
+    return p;
+  }
+  // Full chunks run the block from now on. npu (built from npu_plan()) outlives this object; down: the set's down pack.
+  // layers: only the first that many layers (a test's smaller footprint: their down weights alone are uploaded).
+  void EnableNpu(NpuSplit* npu, const std::string& down, std::uint32_t layers = ~0u) {
+    if (!npu || !FfnF() || !a4_) throw LoomError("prefill: the set has no NPU FFN block (tools/emit_npu_ffn.py)");
+    npu_ = npu;
+    down_layer_ = std::size_t{kHidden} * DownRowBytes();
+    npu_layers_ = std::min(layers, cfg_.main_block_count());
+    const std::size_t file = down_layer_ * cfg_.main_block_count(), bytes = down_layer_ * npu_layers_;
+    FILE* f = std::fopen(down.c_str(), "rb");
+    if (!f) throw LoomError("cannot open " + down);
+    std::fseek(f, 0, SEEK_END);
+    const auto size = static_cast<std::size_t>(std::ftell(f));
+    std::fseek(f, 0, SEEK_SET);
+    if (size < bytes || size % down_layer_ || size > file) {
+      std::fclose(f);
+      throw LoomError(down + ": not this set's down pack (" + std::to_string(file) + " bytes, npu_down_pack.py)");
+    }
+    npu_down_ = &Alloc(bytes + 4096);   // (the last call's raw view runs a decoder record past its rows)
+    std::vector<std::uint8_t> piece(std::size_t{256} << 20);
+    for (std::size_t o = 0; o < bytes;) {
+      const std::size_t n = std::min(piece.size(), bytes - o);
+      if (std::fread(piece.data(), 1, n, f) != n) {
+        std::fclose(f);
+        throw LoomError("short read: " + down);
+      }
+      gpu_.H2D(*npu_down_, piece.data(), n, o);
+      o += n;
+    }
+    std::fclose(f);
+    npu_->ShareGpu(npu_down_->handle, npu_down_->size);
+    npu_xo_ = &Alloc(std::size_t{B_} * kHidden * 2);
+    // Bind every NPU call of a full chunk now (a pass of the layers that dispatches nothing): a first bind loads the
+    // image's storage and patches it, milliseconds per call.
+    LoomBuffer *h = hidden_, *h2 = hidden2_, *aq = aq_, *aq2 = aq2_, *ad = ad_, *ad2 = ad2_;
+    n_ = B_, warming_ = true, npu_on_ = true, npu_planning_ = true;
+    RecordLayers(0, {});
+    FlushKres();
+    npu_->EndBinding();
+    n_ = 0, warming_ = false, npu_on_ = false, npu_planning_ = false;
+    hidden_ = h, hidden2_ = h2, aq_ = aq, aq2_ = aq2, ad_ = ad, ad2_ = ad2;
+  }
+
   // Stage ids[0..n) for the next RunLayers, whose first kernel (yah_embed) writes their token_embd rows into hidden().
   // n < B pads the chunk with the last token.
   // The GEMMs (~92% of the time) run only the token tiles that hold real tokens; every other kernel runs
@@ -117,16 +183,38 @@ class LoomPrefill {
     if (flags_) gpu_.Fill(*flags_, 0);   // the chunk's completion counters (FlagSlot), in stream order before its work
     // The layers go into one graph, so kernels with no data between them (the input projections of a layer, the DeltaNet
     // gate projection and the conv / DeltaNet chain) can run at the same time.
+    // NPU FFN block: full chunks only, its handoffs graph nodes on flag words (NpuEnqueue / NpuJoin); the jobs are
+    // queued once the chunk's one graph launched
+    npu_on_ = npu_ && n_ == B_;
+    if (npu_on_) npu_->BeginChunk();
+    flagged_.clear(), job_c_.clear();
+    npu_cleared_ = npu_joined_ = 0;
     NewGraph();
     // Layer 0 goes first in a graph of its own, so the GPU runs it while the host records the other layers. The split
     // falls before its deferred down GEMM (the first dispatch while recording layer 1), which waits for all of the
     // layer's last kernel anyway.
-    split_layer_ = cfg_.main_block_count() > 1 ? 1 : 0;
+    split_layer_ = !npu_on_ && cfg_.main_block_count() > 1 ? 1 : 0;
     RecordLayers(ci, hook);
     FlushKres();
     split_layer_ = 0, split_armed_ = false;
     graph_ = nullptr;
+    std::vector<NpuSplit::Queued> jobs;
+    jobs.swap(flagged_);
+    // YAH_NPU_CPU=1 (a safe test of the NPU side): the host stands in for the GPU, which runs nothing; it stores each
+    // job's ready word, waits up to 1 s for its done word and reports the first job that stalls or fails
+    if (!jobs.empty() && std::getenv("YAH_NPU_CPU")) {
+      NpuCpuDriven(jobs);
+      return;
+    }
     chunk_graph_->Launch();
+    if (!jobs.empty()) {
+      try {
+        npu_->Enqueue(jobs);   // on a failure it releases the graph's waits for the jobs left
+      } catch (...) {
+        gpu_.Synchronize();   // the graph reads NPU buffers: it must end before anyone frees them
+        throw;
+      }
+    }
   }
 
   // The 64 layers of chunk ci, in dispatch order.
@@ -137,6 +225,7 @@ class LoomPrefill {
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       split_armed_ = split_layer_ && l == split_layer_;
+      npu_layer_ = l;
       tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
       if (cfg_.IsFullAttention(l)) {
         nq_want_ = nqw_;
@@ -273,6 +362,8 @@ class LoomPrefill {
     std::string name;
     Geom g{};
     while (f >> name >> g.tokens >> g.rowgrp >> g.tt) geom_[name] = g;
+    std::ifstream n(dir_ + "/npu.txt");   // the NPU FFN block's rows (tools/emit_npu_ffn.py), if the set has it
+    while (n >> name >> g.tokens >> g.rowgrp >> g.tt) geom_[name] = g;
   }
   // Refuses a HAL emitted for another token count: it would compute a silent subset.
   Geom GeomOf(const std::string& hal) const {
@@ -611,6 +702,7 @@ class LoomPrefill {
 
   // The FFN: norm, gate, swiglu (up), down.
   void RunFfn(const std::string& pre) {
+    if (RunFfnBlock(pre)) return;
     nq_want_ = nqgu_;
     RunNorm(pre + "post_attention_norm.weight");
     nq_want_ = false;
@@ -628,6 +720,185 @@ class LoomPrefill {
       RunSwiglu(pre + "ffn_up.weight");
     }
     RunResidual(pre + "ffn_down.weight", *ffnup_);
+  }
+
+  // The NPU FFN block (npu_plan). npu.txt: "npuffn <F> <B> <K parts>", "npubytes_<image> <a> <w> <c>" (binding bytes),
+  // "npudgu <bytes from a gate row to its up row>", "npugate <supply> <calls> <record>" and the GPU kernels' rows.
+  static constexpr std::uint32_t kDownCalls = 10, kDownRows = 512;   // down calls per K part, rows per call
+  static constexpr std::size_t kHRec = 4 * 128 * 144;   // H bytes per (M block, pass): [slab 4][k-block 128][144]
+  struct NpuBytes {
+    std::size_t a, w, c;
+  };
+  NpuBytes NpuBytesOf(const std::string& name) const {
+    const Geom& g = geom_.at(name);
+    return {g.tokens, g.rowgrp, g.tt};
+  }
+  std::uint32_t FfnF() const {
+    const auto it = geom_.find("npuffn");
+    return it == geom_.end() ? 0 : it->second.tokens;
+  }
+  // (first pass, passes) of down's K parts over F features: the fewest parts of at most 5 passes, sizes balanced
+  // (emit_npu_ffn.parts)
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> FfnParts() const {
+    const std::uint32_t P = FfnF() / 1024, n = (P + 4) / 5;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> parts;
+    for (std::uint32_t i = 0, p0 = 0; i < n; ++i) {
+      parts.push_back({p0, P / n + (i < P % n)});
+      p0 += parts.back().second;
+    }
+    return parts;
+  }
+  static std::string DnImage(std::uint32_t passes, const char* pre = "") { return pre + std::string("ffndn") + std::to_string(passes); }
+  // H's bytes in C (from 0), then down's partials from FfnDownOff().
+  std::size_t FfnDownOff() const { return (std::size_t{B_ / 64} * (FfnF() / 1024) * kHRec + 4095) / 4096 * 4096; }
+  std::size_t DownC() const { return NpuBytesOf(DnImage(FfnParts()[0].second, "npubytes_")).c; }
+  std::size_t DownRowBytes() const { return std::size_t{FfnF()} / 256 * 136; }   // a down pack row (IQ4_XS)
+  static constexpr std::size_t kRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
+
+  bool RunFfnBlock(const std::string& pre) {
+    if (!npu_on_ || trim_row_ != kAllRows || npu_layer_ >= npu_layers_) return false;
+    const auto* tg = Find(pre + "ffn_gate.weight");
+    const auto* tu = Find(pre + "ffn_up.weight");
+    const auto* td = Find(pre + "ffn_down.weight");
+    const std::uint32_t F = FfnF(), G = kFfn - F, layer = static_cast<std::uint32_t>(std::stoul(pre.substr(4)));
+    const auto parts = FfnParts();
+    const std::size_t rb = kHidden / 256 * 136, dgu = static_cast<std::size_t>(tu->offset - tg->offset);
+    if (dgu != geom_.at("npudgu").tokens ||
+        &weights_.ChunkOf(*tg) != &weights_.ChunkOf(*tu))
+      throw LoomError("prefill: " + pre + "ffn_up does not follow ffn_gate as the NPU block's image expects");
+    const hrx_buffer_ref_t gate = TRef(*tg);
+    const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
+    if (npu_planning_) npu_->ShareGpu(gate.buffer, weights_.ChunkOf(*tg).size);
+    // gate / up: F / 256 calls, call j's raw rows its 256 gate rows through its up rows (and a page the decoder may
+    // prefetch); its H records at k-block 32 j (gen_npu_gemm swcol 32)
+    std::vector<std::uint32_t> csw;
+    for (std::uint32_t j = 0; j < F / 256; ++j)
+      csw.push_back(npu_->BindRaw(dir_ + "/npu_ffnsw.xdna", {0, bs.a},
+                                  {gate.buffer, gate.offset + (G + 256 * j) * rb, dgu + 256 * rb + 4096},
+                                  {(j / 4) * kHRec + (j % 4) * 32 * 144, bs.c}, "ffnsw"));
+    // down: per K part, kDownCalls calls of 512 rows of the down pack ([layer][row][F / 256 blocks]); a call's raw
+    // view from its first row's part through a decoder record past its last row's
+    std::vector<std::vector<std::uint32_t>> cdn(parts.size());
+    const std::size_t doff = FfnDownOff(), cp = DownC(), rbd = DownRowBytes();
+    for (std::size_t ci = 0; ci < parts.size(); ++ci) {
+      const auto [p0, passes] = parts[ci];
+      const NpuBytes bd = NpuBytesOf(DnImage(passes, "npubytes_"));
+      if (bd.c != cp) throw LoomError("prefill: the FFN block's down parts differ in C bytes");
+      for (std::uint32_t r = 0; r < kDownCalls; ++r)
+        cdn[ci].push_back(npu_->BindRaw(
+            dir_ + "/npu_" + DnImage(passes) + ".xdna", {p0 * kHRec, bd.a, true},
+            {npu_down_->handle, std::size_t{layer} * down_layer_ + std::size_t{r} * kDownRows * rbd + std::size_t{4} * p0 * 136,
+             (kDownRows - 1) * rbd + std::size_t{4} * passes * 136 + kRecordRow},
+            {doff + (ci * kDownCalls + r) * cp, cp}, DnImage(passes)));
+    }
+    // the FFN norm's normq also writes the rotated rows in the decoder's positions, encoded into A for gate / up
+    FlushKres();
+    const std::string nw = pre + "post_attention_norm.weight";
+    Dispatch(Exe("normqx_5120.hal"), "yah_normq", B_, 1, 1, geom_.at("normqx_5120.hal").rowgrp, 1, 1,
+             {Ref(*hidden_), TRef(*Find(nw)), TRef(*Find(NormAwq(nw))), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_),
+              Ref(*npu_xo_)},
+             0b1110000);
+    const hrx_buffer_ref_t a = {npu_->A().handle, 0, bs.a};
+    Dispatch(Exe("npu_enc_act.hal"), "yah_bfp16_encode_act", geom_.at("npu_enc_act.hal").tt, 1, 1, 256, 1, 1,
+             {Ref(*npu_xo_), a}, 0b10);
+    // YAH_NPU_ONLY=sw / dn (YAH_NPU_CPU tests): only that image's jobs
+    const char* only = std::getenv("YAH_NPU_ONLY");
+    if (!only || std::strcmp(only, "dn")) NpuEnqueue(std::move(csw), "ffnsw", a, {npu_->C().handle, 0, doff});
+    for (std::size_t ci = 0; ci < parts.size() && (!only || std::strcmp(only, "sw")); ++ci)
+      NpuEnqueue(std::move(cdn[ci]), DnImage(parts[ci].second), a,
+                 {npu_->C().handle, doff + ci * kDownCalls * cp, kDownCalls * cp});
+    // the GPU's features: gate / up over the first G, their rotq (down's awq), down over that K window into hidden2
+    const std::string gu = "iu4_gu_" + std::to_string(G / 16) + "_20.hal";
+    DispatchIu4(gu, "_gu", G / 16, {TRef(*tg), Ref(*aq_), Ref(*ad_), TRef(*tu), Ref(*ffnup_)}, 0b10000);
+    const std::string rq = "rotq_" + std::to_string(G) + ".hal";
+    Dispatch(Exe(rq), "yah_rotq256", geom_.at(rq).tt, B_, 1, geom_.at(rq).rowgrp, 1, 1,
+             {Ref(*ffnup_), TRef(*Find(pre + "ffn_down.awq")), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)}, 0b11000);
+    DispatchIu4("iu4_kresk_320_" + std::to_string(G / 256) + ".hal", "_kres", kHidden / 16,
+                {TRef(*td), Ref(*aq_), Ref(*ad_), Ref(*hidden_), Ref(*hidden2_)}, 0b10000);
+    // hidden = hidden2 + the NPU's partials, once its last job is done
+    NpuJoin();
+    const Geom& gn = geom_.at("npu_unpack_ffn.hal");
+    Dispatch(Exe("npu_unpack_ffn.hal"), "yah_npu_unpack", gn.tokens, 1, 1, gn.rowgrp, 1, 1,
+             {{npu_->C().handle, doff, parts.size() * kDownCalls * cp}, Ref(*hidden2_), Ref(*hidden_)}, 0b100);
+    return true;
+  }
+  // An iu4 GEMM of the block at its own row count (RunIu4 names the HAL from the tensor's): grid (G, token tiles,
+  // row tiles / G) with its iu4grp row, else (row tiles, token tiles).
+  void DispatchIu4(const std::string& hal, const char* sfx, std::uint32_t mtiles, const std::vector<hrx_buffer_ref_t>& b,
+                   std::uint64_t writes) {
+    const Geom g = GeomOf(hal);
+    std::uint32_t gx = mtiles / g.rowgrp, gz = 1;
+    if (const auto it = geom_.find("iu4grp_" + hal); it != geom_.end()) {
+      if (it->second.tokens == 0 || gx % it->second.tokens != 0) throw LoomError(hal + ": iu4grp does not divide the row tiles");
+      gz = gx / it->second.tokens, gx = it->second.tokens;
+    }
+    Dispatch(Exe(hal), (std::string("yah_iu4_gemm") + sfx).c_str(), gx, g.tt, gz, 32, 1, 1, b, writes);
+  }
+  // NPU handoffs are graph nodes on flag words in host memory (NpuSplit::Flags), so the host never splits the chunk.
+  // NpuEnqueue: the graph stores the job's gate value to its ready word once a is written and every earlier reader of
+  // c is done (release, system scope: a reaches memory first); the NPU waits for it itself. NpuJoin: yah_npu_flag_wait
+  // polls the last job's done word; it stands for the NPU's reads of A and writes of C, so what reads C (the unpack) or
+  // writes A (the next layer's encoder) orders after it. The jobs are queued right after the chunk graph launches.
+  hrx_buffer_ref_t FlagWord(std::uint32_t w) const { return {npu_->Flags()->handle, std::size_t{w} * 4, 4}; }
+  void NpuEnqueue(std::vector<std::uint32_t> calls, std::string tag, const hrx_buffer_ref_t& a,
+                  const hrx_buffer_ref_t& c) {
+    if (npu_planning_) return;
+    const NpuSplit::Job words = npu_->NewJob(calls);
+    graph_->AtomicStore(FlagWord(words.ready), words.gate, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE, {a},
+                        {c});
+    flagged_.push_back({std::move(calls), std::move(tag), words, npu_layer_});
+    job_c_.push_back(c);
+  }
+  void NpuCpuDriven(const std::vector<NpuSplit::Queued>& jobs) {
+    std::thread enq([&] {   // it blocks while the NPU's queue is full; the NPU waits for the stores below
+      try {
+        npu_->Enqueue(jobs);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "npu cpu-driven: enqueue: %s\n", e.what());
+      }
+    });
+    struct Join {
+      std::thread& t;
+      ~Join() { t.join(); }
+    } join{enq};
+    for (std::size_t i = 0; i < jobs.size(); ++i) {
+      const NpuSplit::Job& w = jobs[i].words;
+      std::vector<std::uint32_t> before;   // the job's gate slots, to report which words its calls changed
+      for (std::uint32_t k = w.ready; k <= w.done + 16; ++k) before.push_back(npu_->HostLoad(k));
+      npu_->HostStore(w.ready, w.gate);
+      const auto t0 = std::chrono::steady_clock::now();
+      std::uint32_t d = 0;
+      while (((d = npu_->HostLoad(w.done)) & 0x7fffffffu) < w.gate)
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1)) break;
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      npu_->HostStore(w.ready, 0), npu_->HostStore(w.done, 0);   // as NpuJoin's stores do
+      if ((d & 0x7fffffffu) < w.gate || (d & 0x80000000u)) {
+        std::fprintf(stderr, "npu cpu-driven: job %zu (%s, layer %u) stalled or failed: done %08x gate %08x\n", i,
+                     jobs[i].tag.c_str(), jobs[i].layer, d, w.gate);
+        // YAH_NPU_CPU_STALL_CMD: run while the context lives (e.g. tools/npu_aie_status.py)
+        if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);
+        for (std::uint32_t k = w.ready; k <= w.done + 16; ++k)
+          if (const std::uint32_t v = npu_->HostLoad(k); v != before[k - w.ready])
+            std::fprintf(stderr, "  word +%u: %08x -> %08x\n", k - w.ready, before[k - w.ready], v);
+        return;
+      }
+      if (i < 6) std::fprintf(stderr, "npu cpu-driven: job %zu (%s) done in %.2f ms\n", i, jobs[i].tag.c_str(), ms);
+    }
+    std::fprintf(stderr, "npu cpu-driven: %zu jobs done\n", jobs.size());
+  }
+  void NpuJoin() {
+    if (npu_planning_) return;
+    const std::size_t job = flagged_.size() - 1;
+    const NpuSplit::Queued& j = flagged_[job];
+    std::vector<hrx_buffer_ref_t> side = {Ref(npu_->A())};
+    for (std::size_t i = npu_joined_; i <= job; ++i) side.push_back(job_c_[i]);
+    Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
+             {FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &side);
+    npu_joined_ = job + 1;
+    // the gate counts jobs per chunk: the joined jobs' words read zero again before the next chunk reuses them
+    for (; npu_cleared_ <= job; ++npu_cleared_)
+      for (const std::uint32_t w : {flagged_[npu_cleared_].words.ready, flagged_[npu_cleared_].words.done})
+        graph_->AtomicStore(FlagWord(w), 0, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE, {}, {});
   }
 
   // The RMSNorm of hidden() rows into scratch_ (f16), rotated into the weights' basis (A4: and quantized into aq_ / ad_).
@@ -1279,6 +1550,17 @@ class LoomPrefill {
   std::uint32_t split_layer_ = 0;  // RunLayers: SplitGraph before this layer's first dispatch (0: none)
   bool split_armed_ = false;       // recording split_layer_: its first dispatch splits
   bool warming_ = false;           // WarmExecutables' pass: Dispatch records nothing
+  // The NPU FFN block (EnableNpu, RunFfnBlock)
+  NpuSplit* npu_ = nullptr;
+  bool npu_on_ = false;            // this chunk runs it (full chunks)
+  bool npu_planning_ = false;      // EnableNpu's binding pass: binds the calls, enqueues nothing
+  std::vector<NpuSplit::Queued> flagged_;   // the chunk's jobs, in NpuEnqueue order
+  std::vector<hrx_buffer_ref_t> job_c_;     // each job's C range (NpuJoin orders on it)
+  std::size_t npu_cleared_ = 0, npu_joined_ = 0;   // jobs whose flag words NpuJoin cleared / waited for
+  LoomBuffer *npu_down_ = nullptr, *npu_xo_ = nullptr;   // the down pack; normqx's rows in the decoder's positions
+  std::size_t down_layer_ = 0;     // the down pack's bytes per layer
+  std::uint32_t npu_layer_ = 0;    // the layer being recorded (NpuSplit::Queued::layer)
+  std::uint32_t npu_layers_ = 0;   // the layers that run the block (EnableNpu)
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only
   bool qg16_ = false;   // the kqg GEMM stores q and gate as f16 (only the GPU kqg path writes them so)
