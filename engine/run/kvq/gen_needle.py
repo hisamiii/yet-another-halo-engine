@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Multi-key retrieval prompts for gate v2 tier C.
 
-  gen_needle.py <book .ids.raw> <length> <seed> <out prefix>
+  gen_needle.py <model> <book .ids.raw> <length> <seed> <out prefix>
 
 Builds a sequence of exactly <length> tokens: book text (token slices of a tokenized book) with NKEYS facts at depths 5%..95%:
     "\\nThe access code of agent Falcon-17 is 4829173.\\n"
@@ -24,8 +24,8 @@ import sys
 
 import numpy as np
 
-TOK = "/var/lib/lemonade/.cache/lemonade/bin/llamacpp/rocm-stable/llama-tokenize"
-MODEL = "/home/q/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf"
+TOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build", "yah-tokenize")
+MODEL = None   # argv[1]
 NKEYS = int(os.environ.get("KVQ_NKEYS", "32"))
 NQ = int(os.environ.get("KVQ_NQ", "8"))
 NUPD = int(os.environ.get("KVQ_NUPD", "0"))
@@ -35,14 +35,14 @@ _cache = {}
 
 def tok(text):
     if text not in _cache:
-        out = subprocess.run([TOK, "-m", MODEL, "-p", text, "--ids", "--no-bos", "--log-disable"],
-                             capture_output=True, text=True, check=True).stdout
-        _cache[text] = json.loads(out.strip().splitlines()[-1])
+        out = subprocess.run([TOK, MODEL, "--stdin"], input=text, capture_output=True, text=True, check=True).stdout
+        _cache[text] = [int(t) for t in out.splitlines()[1].split()]   # count=N, then the ids
     return _cache[text]
 
 
 def main():
-    book, L, seed, prefix = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+    global MODEL
+    MODEL, book, L, seed, prefix = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
     rng = np.random.default_rng(seed)
     hay = json.loads(open(book).read())[2000:]
     names = ["Falcon", "Falcon", "Heron", "Heron"]          # shared prefixes: near-duplicate keys

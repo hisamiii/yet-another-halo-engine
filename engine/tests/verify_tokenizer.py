@@ -20,8 +20,7 @@ ROOT = HERE.parents[1]
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--model", default="/home/q/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf")
+    parser.add_argument("--model", required=True, help="the HFQ model file")
     parser.add_argument(
         "--binary", default=str(ROOT / "engine" / "build" / "yah-tokenize"))
     parser.add_argument("--goldens", default=str(HERE / "tokenizer_goldens.json"))

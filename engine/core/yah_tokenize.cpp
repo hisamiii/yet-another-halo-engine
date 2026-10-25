@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto gguf = yah::core::Gguf::Open(argv[1]);
+    auto gguf = yah::core::Gguf::OpenIndex(argv[1]);   // the tokenizer lives in the metadata
     const auto config = yah::core::TokenizerConfig::FromGguf(gguf);
     const auto tokenizer = yah::core::Tokenizer::FromGguf(gguf, config);
     yah::core::TokenizerOptions options;

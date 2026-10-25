@@ -85,13 +85,13 @@ void WriteRowStats(FILE* f, const float* lg, std::uint32_t pos, std::int32_t nxt
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 4) {
-    std::fprintf(stderr, "usage: loom_forward_pp <model> <haldir> <out-prefix> [tokens] [ids-file]\n");
+  if (argc < 6) {
+    std::fprintf(stderr, "usage: loom_forward_pp <model> <haldir> <out-prefix> <tokens> <ids-file>\n");
     return 2;
   }
   const std::string prefix = argv[3];
-  const std::uint32_t want = argc > 4 ? std::strtoul(argv[4], nullptr, 10) : 2048;
-  const char* ids_path = argc > 5 ? argv[5] : "/home/q/Development/Scratch/ids2048.txt";
+  const std::uint32_t want = std::strtoul(argv[4], nullptr, 10);
+  const char* ids_path = argv[5];
   try {
     auto gguf = yah::core::Gguf::OpenResident(argv[1]);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);

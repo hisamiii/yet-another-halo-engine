@@ -8,7 +8,7 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 - The official ROCm Core SDK 10.0.0 runtime packages, extracted (no system install) by `engine/hrx-env.sh --fetch` into `external/rocm10` (`YAH_ROCM` overrides). Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
 - `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`; `/opt/rocm` stays usable. The Python emitters find the same paths through `engine/gpu/loom/hrx_paths.py`.
 - The model: hipfire's MQ4G256 HFQ file of Qwen3.8 27B, `~/Downloads/qwen3.8-27b.mq4-xts` (15 GB, read into resident memory by every driver). The GGUF / IQ4_XS path is gone; tag `pre-cleanup-2026-10-20` has it.
-- Python 3 with numpy for the emitters and checkers. Use an OpenBLAS numpy (`/home/q/Development/Scratch/venv/bin/python`) for the gate tools; the system numpy is ~100x slower there.
+- Python 3. The emitters need only the standard library; the checkers and gate tools need numpy, and an OpenBLAS-backed one (a venv) is ~100x faster there than a reference-BLAS build.
 
 ### HRX patches
 
@@ -110,11 +110,11 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids
 
 ```
 cd engine/gpu/loom
-YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <model> /home/q/Development/Scratch/hal/yah-hal-serve 2048
-YAH_KV=kv8 python3 tools/emit_decode.py <model> /home/q/Development/Scratch/hal/yah-hal-serve-dec 32768
+YAH_CTX=32768 YAH_KV=kv8 python3 tools/emit_prefill_pp.py <model> <prefill set> 2048
+YAH_KV=kv8 python3 tools/emit_decode.py <model> <decode set> 32768
 cd -
 source engine/hrx-env.sh
-engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill /home/q/Development/Scratch/hal/yah-hal-serve --decode /home/q/Development/Scratch/hal/yah-hal-serve-dec [--host 127.0.0.1] [--port 8080]
+engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> --prefill <prefill set> --decode <decode set> [--host 127.0.0.1] [--port 8080]
 engine/build/yah_server --model <model> --fake    # canned replies, CPU only: for clients and API tests
 ```
 
