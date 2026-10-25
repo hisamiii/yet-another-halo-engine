@@ -31,7 +31,7 @@ lic="$out/licenses"
 mkdir -p "$lic"
 curl -sfL --max-time 120 -o "$lic/rocr-runtime.txt" \
   https://raw.githubusercontent.com/ROCm/ROCR-Runtime/rocm-7.0.0/LICENSE.txt
-for pkg in libdrm2 libelf1t64 libnuma1 zlib1g libzstd1 liblzma5 libbz2-1.0 "libicu$(dpkg -l 'libicu[0-9]*' | awk '/^ii/ { sub(/^libicu/, "", $2); sub(/:.*/, "", $2); print $2; exit }')"; do
+for pkg in libdrm2 libelf1t64 libnuma1 zlib1g libzstd1 liblzma5 libbz2-1.0 "libicu$(ldd "$root/engine/build/yah_server" | sed -n 's/.*libicuuc\.so\.\([0-9]*\) .*/\1/p')"; do
   cp "/usr/share/doc/$pkg/copyright" "$lic/$pkg.txt"
 done
 python3 "$root/engine/release/bundle.py" build "$out" "$version" --licenses "$lic"
