@@ -425,6 +425,7 @@ class LoomPrefill {
       case 17: *out = {"iq2xs", 256}; return true;
       case 8: *out = {"q8_0", 32}; return true;
       case 16: *out = {"iq2xxs", 256}; return true;
+      case 22: *out = {"iq2s", 256}; return true;
       case 10: *out = {"q2k", 256}; return true;
       case 44: *out = {"mq4", 256}; return true;
       default: return false;
@@ -557,6 +558,7 @@ class LoomPrefill {
     grid_iq3xxs_ = &table("grid_iq3xxs.bin", 256 * 4);
     grid_iq2xxs_ = &table("grid_iq2xxs.bin", 512 * 4);
     grid_iq2xs_ = &table("grid_iq2xs.bin", 1024 * 4);
+    grid_iq2s_ = &table("grid_iq2s.bin", 2048 * 4);
     ksigns_ = &table("ksigns_iq2xxs.bin", 128);
     rot_ = geom_.count("rot") != 0;
     a4_ = geom_.count("a4") != 0;
@@ -782,6 +784,7 @@ class LoomPrefill {
     if (n == "iq3xxs") b.push_back(Ref(*grid_iq3xxs_));
     if (n == "iq2xxs") b.push_back(Ref(*grid_iq2xxs_));
     if (n == "iq2xs") b.push_back(Ref(*grid_iq2xs_));
+    if (n == "iq2s") b.push_back(Ref(*grid_iq2s_));
     // The IQ3_XXS and IQ2 sign tables are the same 128 bytes.
     if (n == "iq3xxs" || n == "iq2xxs" || n == "iq2xs") b.push_back(Ref(*ksigns_));
     return b;
@@ -1169,7 +1172,7 @@ class LoomPrefill {
     chunk_graph_ = std::make_unique<LoomGraph>(gpu_);
     LoomGraph& g = *chunk_graph_;
     weights_.ForEachBuffer([&](hrx_buffer_t h) { g.ReadOnly(h); });
-    for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
+    for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, grid_iq2s_, ksigns_, eps_, reszero_})
       g.ReadOnly(t->handle);
     graph_ = &g;
   }
@@ -1754,7 +1757,7 @@ class LoomPrefill {
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
   std::size_t flag_slot_ = 0;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
-             *ksigns_ = nullptr;
+             *grid_iq2s_ = nullptr, *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
              *gate_ = nullptr, *alpha_ = nullptr, *beta_ = nullptr, *q_ = nullptr, *q16_ = nullptr, *kbuf_ = nullptr,
              *vbuf_ = nullptr, *raw_ = nullptr, *raw2_ = nullptr, *conv_out_ = nullptr, *kqbuf_ = nullptr, *ab_ = nullptr,

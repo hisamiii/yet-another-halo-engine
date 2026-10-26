@@ -208,7 +208,7 @@ def configure(fmt, t):
     G.IQ3_SGTAB_W = t.sgtw
     G.IQ3_F16S = t.f16s
     # IQ2: the same word path and sign chain (IQ2_W): -5.6% clock-free
-    G.IQ2_W = fmt in ("iq2xxs", "iq2xs")
+    G.IQ2_W = fmt in ("iq2xxs", "iq2xs", "iq2s")
     if G.IQ2_W:
         G.VDEC_W = G.IQ3_U8F = G.VDECW_FR = G.IQ3_SGN2 = True
     G.Q4FMIX = t.q4fmix

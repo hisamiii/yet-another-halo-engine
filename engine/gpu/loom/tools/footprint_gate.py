@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import loom_preflight as lp
 QB = {"q4k": (256, 144), "q5k": (256, 176), "q6k": (256, 210), "q3k": (256, 110), "q2k": (256, 84),
-      "iq4xs": (256, 136), "iq3s": (256, 110), "iq3xxs": (256, 98), "iq2xxs": (256, 66), "iq2xs": (256, 74),
+      "iq4xs": (256, 136), "iq3s": (256, 110), "iq3xxs": (256, 98), "iq2xxs": (256, 66), "iq2xs": (256, 74), "iq2s": (256, 82),
       "q8_0": (32, 34), "iq4nl": (32, 18), "f16": (256, 512), "mq4": (256, 136)}
 src, sym, fmt, kind, mt, kb, tt = sys.argv[1:8]
 mt, kb, tt = int(mt), int(kb), int(tt)
@@ -34,7 +34,7 @@ bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate
          "up": wbytes,
          "gate_out": B * MO * 2,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
-         "grid": max({"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(f, 0) for f in fmts),
+         "grid": max({"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096, "iq2s": 8192}.get(f, 0) for f in fmts),
          "ksigns": 128,
          "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4,
          # gen_gemm_tile.NPUADD: the NPU's down partials the engine binds, its flag words
