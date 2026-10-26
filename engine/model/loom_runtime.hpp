@@ -151,11 +151,13 @@ struct LoomExecutable {
 class LoomDevice {
  public:
   LoomDevice() {
-    LoomCheck(hrx_gpu_initialize(0), "hrx_gpu_initialize");
+    LoomCheck(hrx_gpu_initialize(0),
+              "hrx_gpu_initialize (the GPU runtime did not start: is /dev/kfd there and is the user in the render "
+              "group?)");
     initialized_ = true;
     if (!hrx_status_is_ok(hrx_gpu_device_get(0, &device_))) {
       hrx_gpu_shutdown();
-      throw LoomError("hrx_gpu_device_get");
+      throw LoomError("hrx_gpu_device_get: no GPU (the engine needs a gfx1151, Strix Halo, with the amdgpu driver)");
     }
     LoomCheck(hrx_stream_create(device_, 0, &stream_), "hrx_stream_create");
   }

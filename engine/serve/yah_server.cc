@@ -256,6 +256,26 @@ class Server {
   std::int64_t created_ = 0;
 };
 
+// The model file, checked before anything loads, with what to pass instead. The kernels are made for Qwen3.8-27B.
+void CheckModel(const std::string& model) {
+  std::string why;
+  try {
+    const yah::core::Gguf index = yah::core::Gguf::OpenIndex(model);
+    const auto* arch = index.Meta("general.architecture");
+    if (arch == nullptr || arch->kind != yah::core::MetadataValue::Kind::kString || arch->s != "qwen35") {
+      why = "not a Qwen3.8 model (architecture " + (arch != nullptr ? arch->s : std::string("missing")) + ")";
+    } else if (const auto cfg = yah::core::Qwen35Config::FromGguf(index); cfg.embedding_length != 5120) {
+      why = "a Qwen3.8 of another size (hidden " + std::to_string(cfg.embedding_length) + ")";
+    }
+  } catch (const std::exception& error) {
+    why = error.what();
+  }
+  if (!why.empty()) {
+    throw std::runtime_error(model + ": " + why +
+                             ". --model takes Qwen3.8-27B as a GGUF (Q4_K_M, Q8_0, IQ4_XS, ...) or the HFQ (.mq4-xts)");
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -308,6 +328,7 @@ int main(int argc, char** argv) {
   }
 
   try {
+    CheckModel(model);
 #ifndef YAH_SERVE_FAKE_ONLY
     if (!fake && prefill.empty()) {
       // the memory check before the sets are looked for (and maybe emitted); the Engine checks again with them
@@ -320,6 +341,7 @@ int main(int argc, char** argv) {
     }
 #endif
     std::unique_ptr<TextGenerator> generator;
+    std::string features;  // for the ready line: what is on
     if (fake) {
       generator = std::make_unique<FakeGenerator>(model);
     } else {
@@ -345,6 +367,8 @@ int main(int argc, char** argv) {
         const std::string& why = engine->draft_status();
         std::fprintf(stderr, "yah_server: draft %s %s%s\n", draft.c_str(), why.empty() ? "on" : "off: ", why.c_str());
       }
+      if (draft != "off" && engine->draft_status().empty()) features += ", draft " + draft;
+      if (npu && engine->npu_status().empty()) features += ", npu";
       generator = std::move(engine);
 #endif
     }
@@ -364,8 +388,8 @@ int main(int argc, char** argv) {
       res.status = 500;
       res.Set(Dump(ErrorBody(ApiError(500, message, "", "server_error", "server_error"))), "application/json");
     };
-    std::fprintf(stderr, "yah_server: %s%s on http://%s:%d\n", generator->model_name().c_str(), fake ? " (fake)" : "",
-                 host.c_str(), port);
+    std::fprintf(stderr, "yah_server: ready: %s%s, context %u%s, on http://%s:%d\n", generator->model_name().c_str(),
+                 fake ? " (fake)" : "", generator->context(), features.c_str(), host.c_str(), port);
     if (!web.Listen(host, port)) {
       std::fprintf(stderr, "yah_server: cannot listen on %s:%d\n", host.c_str(), port);
       return 1;

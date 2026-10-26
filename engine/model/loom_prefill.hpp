@@ -431,7 +431,7 @@ class LoomPrefill {
 
   void LoadDispatch() {
     std::ifstream f(dir_ + "/dispatch.txt");
-    if (!f) throw LoomError("cannot open " + dir_ + "/dispatch.txt");
+    if (!f) throw LoomError("cannot open " + dir_ + "/dispatch.txt: not a prefill set (tools/emit_prefill_pp.py)");
     std::string name;
     Geom g{};
     while (f >> name >> g.tokens >> g.rowgrp >> g.tt) geom_[name] = g;

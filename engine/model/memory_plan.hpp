@@ -31,7 +31,7 @@ struct MemoryPlan {
   static MemoryPlan For(const std::string& model, const std::string& decode_hal, const std::string& npu_down,
                         bool mtp) {
     std::ifstream f(decode_hal + "/decode.txt");
-    if (!f) throw LoomError("cannot read " + decode_hal + "/decode.txt");
+    if (!f) throw LoomError("cannot read " + decode_hal + "/decode.txt: not a decode set (tools/emit_decode.py)");
     std::uint32_t context = 0, kb = 16, vb = 16;
     for (std::string line; std::getline(f, line);) {
       std::istringstream in(line);
