@@ -978,6 +978,7 @@ AF = {
                                       persist=True),                                         # -8.2%
     ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
     ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
+    ("q3k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),
     # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
     ("iq3s", "kres", 320, 24): dict(AF_PIPE3, gaddr=True, f16s=True, sgtab=True,
                                     persist=dict(b0early=True, lhs_stream=2)),               # -8.8%
