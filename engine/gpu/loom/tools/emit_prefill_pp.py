@@ -1117,7 +1117,7 @@ NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
 FUSE_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q4k")
 FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs")   # the fused FFN block's gate / up (NP 4 images:
 # room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream)
-FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k")
+FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k", "q3k")
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4")}
@@ -1561,7 +1561,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
           and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in dfmts]
     # gate and up of two formats: column pairs (gen_npu_gemm ufmt; fused sets: F features like the others)
     pfmts, pdfmts, PF = (fmts, dfmts, F) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS, FFNBLK_PAIR)
-    pairs = [l for l in by.values() if l.get("ffn_gate") and l.get("ffn_up") and l["ffn_gate"][0] != l["ffn_up"][0]
+    # (also one format without a fused GPU gate / up: its gate kstore and up swiglu, like a pair's)
+    pairs = [l for l in by.values() if l.get("ffn_gate") and l.get("ffn_up")
+             and (l["ffn_gate"][0] != l["ffn_up"][0] or l["ffn_gate"][0] not in AF_FFN)
              and l["ffn_gate"][1:] == l["ffn_up"][1:] and l["ffn_gate"][0] in pfmts and l["ffn_up"][0] in pfmts
              and l.get("ffn_down", ("",))[0] in pdfmts]
     jobs = []

@@ -1089,18 +1089,19 @@ class LoomPrefill {
     const auto* tg = Find(pre + "ffn_gate.weight");
     const auto* tu = Find(pre + "ffn_up.weight");
     const auto* td = Find(pre + "ffn_down.weight");
-    // gate and up of one format: one image (its columns compute both); else column pairs (gen_npu_gemm ufmt)
-    const bool pair = tg->type != tu->type;
-    if (tg->dims != tu->dims || (!pair && tu->offset != tg->offset + tg->bytes) || (pair && !geom_.count("npuffnpair")))
-      return false;
     Fmt f{}, fu{}, fd{};
     if (!FmtOf(static_cast<std::uint32_t>(tg->type), &f) || !FmtOf(static_cast<std::uint32_t>(tu->type), &fu) ||
         !FmtOf(static_cast<std::uint32_t>(td->type), &fd))
       return false;
+    // gate and up of one format with a fused GPU gate / up: one image (its columns compute both); else column pairs
+    // (gen_npu_gemm ufmt)
+    const std::string hal = tg->type == tu->type ? AfHal(GemmHal("gemm_ffn", *tg, &f), ".af.to.hal") : "";
+    const bool pair = hal.empty();
+    if (tg->dims != tu->dims || (!pair && tu->offset != tg->offset + tg->bytes) || (pair && !geom_.count("npuffnpair")))
+      return false;
     const std::uint32_t F = pair ? geom_.at("npuffnpair").tokens : ffnblk_, M = static_cast<std::uint32_t>(tg->dims[1]);
     // the GPU's features: the fused ffn's split, or (pairs) gate kstore + up swiglu splits, fragment-major into ffnup_
-    const std::string hal = pair ? "" : AfHal(GemmHal("gemm_ffn", *tg, &f), ".af.to.hal");
-    const std::string sh = pair ? "" : hal.empty() ? "" : NpuHal(hal);
+    const std::string sh = pair ? "" : NpuHal(hal);
     const std::string gs = pair ? NpuHal(KstoreHal(pre + "ffn_gate.weight", true)) : "";
     const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
     const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
