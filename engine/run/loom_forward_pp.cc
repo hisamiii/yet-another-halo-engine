@@ -33,6 +33,7 @@
 #include "core/gguf.hpp"
 #include "model/loom_decoder.hpp"
 #ifdef YAH_WITH_NPU
+#include "model/dpm_pin.hpp"
 #include "model/loom_npu.hpp"
 #endif
 #include "model/loom_prefill.hpp"
@@ -155,11 +156,16 @@ int main(int argc, char** argv) {
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
     if (opt.pairs) pf.EnablePairs();
 #ifdef YAH_WITH_NPU
+    yah::model::DpmPin dpm;  // (the level restored after the NPU stops)
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
     if (opt.npu) {
       const auto plan = pf.npu_plan();
       if (plan.a_bytes == 0) {
         std::fprintf(stderr, "--npu: needs a set with the NPU FFN block (emit_npu_ffn.py)\n");
+        return 2;
+      }
+      if (const std::string why = dpm.Pin(); !why.empty()) {
+        std::fprintf(stderr, "--npu: %s\n", why.c_str());
         return 2;
       }
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);

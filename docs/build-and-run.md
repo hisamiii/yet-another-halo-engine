@@ -212,7 +212,7 @@ A release is one tarball, `yah-<version>-gfx1151.tar.xz`. It holds `yah_server` 
 gh run download <run id> -n yah-<version>-gfx1151-nohal && tar -xJf yah-<version>-gfx1151-nohal.tar.xz
 python3 engine/release/bundle.py hal yah-<version>-gfx1151 <prefill set> <decode set> --npu <NPU prefill set>
 python3 engine/release/smoke.py yah-<version>-gfx1151 <model>     # ~2 min on the GPU
-python3 engine/release/smoke.py yah-<version>-gfx1151 <model> --npu   # the NPU set (memlock, DPM high)
+python3 engine/release/smoke.py yah-<version>-gfx1151 <model> --npu   # the NPU set (memlock; the DPM level is pinned)
 python3 engine/release/bundle.py pack yah-<version>-gfx1151       # checks it is self-contained, then the tarball
 ```
 

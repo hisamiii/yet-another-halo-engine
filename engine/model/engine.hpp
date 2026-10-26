@@ -34,8 +34,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
-#include <fstream>
-
+#include "model/dpm_pin.hpp"
 #include "model/loom_npu.hpp"
 #endif
 
@@ -307,7 +306,7 @@ class Engine : public TextGenerator {
       const NpuPlan plan = prefill_.npu_plan();
       if (!plan.a_bytes) {
         npu_status_ = "the prefill set has no NPU FFN block (tools/emit_npu_ffn.py)";
-      } else {
+      } else if (npu_status_ = dpm_.Pin(); npu_status_.empty()) {
         npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
         prefill_.EnableNpu(npu_.get());
       }
@@ -318,23 +317,14 @@ class Engine : public TextGenerator {
 #endif
   }
 #ifdef YAH_WITH_NPU
-  // What keeps the NPU from running here, or "". Fabric DPM switches corrupt the NPU's outputs, so the GPU's DPM level
-  // must be pinned; the NPU's buffers are locked pages.
+  // What keeps the NPU from running here, or "" (the NPU's buffers are locked pages). The GPU's DPM level is pinned
+  // after these pass (DpmPin).
   static std::string NpuProblem() {
     if (::access("/dev/accel/accel0", R_OK | W_OK) != 0) return "no NPU device (/dev/accel/accel0, amdxdna)";
     rlimit rl{};
     if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0 || rl.rlim_cur != RLIM_INFINITY)
       return "the memlock limit is not unlimited (ulimit -l unlimited, or prlimit --memlock=unlimited:unlimited)";
-    for (int card = 0; card < 8; ++card) {
-      std::ifstream f("/sys/class/drm/card" + std::to_string(card) + "/device/power_dpm_force_performance_level");
-      std::string level;
-      if (f >> level)
-        return level == "high"
-                   ? ""
-                   : "the GPU's DPM level is " + level + ", not high (echo high | sudo tee /sys/class/drm/card" +
-                         std::to_string(card) + "/device/power_dpm_force_performance_level; auto restores it)";
-    }
-    return "no amdgpu DPM control found";
+    return "";
   }
 #endif
   // The prefill slot sits this many tokens short of the prompt's end: the next turn's history replaces the assistant
@@ -491,6 +481,7 @@ class Engine : public TextGenerator {
   LoomPrefill prefill_;
   LoomDecoder decoder_;
 #ifdef YAH_WITH_NPU
+  DpmPin dpm_;                         // (the level restored after the NPU stops)
   std::unique_ptr<LoomNpuSplit> npu_;  // (destroyed before the prefill that points at it)
 #endif
   std::string npu_status_ = "off";
