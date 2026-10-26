@@ -1504,7 +1504,7 @@ class LoomPrefill {
                 Ref(*ab_), Ref(*valid_)},
                0b1100000);
     };
-    if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {    } else if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {
+    if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {
       // dispatch.txt "dnvconv <conv workgroups>": the conv takes only the q / k heads; DeltaNet computes the v channels'
       // conv and alpha / beta itself (gen_gdn_chunk vconv), and prep_ab only advances the conv ring, after both parts
       // (they read the ring before token 0)
