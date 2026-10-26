@@ -2375,11 +2375,12 @@ def main():
         geom.append(("rot", 0, 0, 0))
         if a4:
             geom.append(("a4", 0, 0, 0))
-    # the output head: the tile-free GEMV (gen_gemv) for MQ4, rows per workgroup / lanes / workgroups in its row
-    head_src = None
-    if types["output.weight"] == 44:
+    # the output head: the tile-free GEMV (gen_gemv) for MQ4 or any table-free format but Q6_K (yah_gemv_q6k_f32),
+    # rows per workgroup / lanes / workgroups in its row
+    head_src, head_fmt = None, gen_gemv.GGML.get(types["output.weight"])
+    if head_fmt not in ("q6k", None) and not gen_gemv.tables_for([head_fmt]):
         head_src = os.path.join(tmp, "yah_gemv_head.loom")
-        open(head_src, "w").write(gen_gemv.gen("plain", ["mq4"], 248320, 5120))
+        open(head_src, "w").write(gen_gemv.gen("plain", [head_fmt], 248320, 5120))
         geom.append(("gemv.hal", gen_gemv.rows_per_wg(), 32 * 4, 248320 // gen_gemv.rows_per_wg()))
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
