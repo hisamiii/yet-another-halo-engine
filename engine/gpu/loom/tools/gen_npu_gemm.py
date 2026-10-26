@@ -71,7 +71,7 @@ class Config:
     hpass: int = 0        # H as [M block][pass hpass][16-token slab][128 k-blocks] (the FFN block's swiglu output, down's
                           # input): swiglu (cols = hpass): column c writes pass c; ain "h": records [M block][pass, slab]
     swcol: int = 0        # swiglu dcol 2: raw rows between columns' first gate rows (0: TN / 2)
-    gord: str = "P4"      # dcol 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural)
+    gord: str = "P4"      # dcol 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural; "GF": Q4_K in P4)
     hord: str = ""        # swiglu: H in the down decoder's k-block order: "P4" ((0, 2, 1, 3) per 4 k-blocks: IQ4_XS's
                           # and the P4 grid decoders'), "Q4K" ((0, 4, 1, 5, 2, 6, 3, 7) per 8: Q4_K's; a call's 4 gate
                           # k-blocks (one format) are then slabs 32 rows apart, the caller steps call j's rows by
@@ -1364,7 +1364,7 @@ def fuse_scratch(cfg, cov):
         if (out + nsb * 2 * D.OUT_B <= sp2 and sp2 + D.SCR2_B <= in_ and in_ + 16 * D.RECROW <= ring
                 and sp + D.SCR_B <= out):
             return FZ_RAW_COMPACT
-        if D.Q5:   # packed (no tables, 704 B record rows): A, two raw records, B, the output
+        if D.GF:   # packed (no tables): A, two raw records, B, the output
             in_ = -(-D.SCR_B // 64) * 64
             sp2 = in_ + 2 * 16 * D.RECROW
             out = -(-(sp2 + D.SCR2_B) // 64) * 64
