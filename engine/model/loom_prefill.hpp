@@ -290,6 +290,7 @@ class LoomPrefill {
         std::thread& t;
         ~Join() { t.join(); }
       } join{enq};
+      std::map<std::string, double> family_ms;
       for (std::size_t i = 0; i < jobs.size(); ++i) {
         const NpuSplit::Job& w = jobs[i].words;
         std::vector<std::uint32_t> before;   // the job's gate slots, to report which words its calls changed
@@ -306,6 +307,10 @@ class LoomPrefill {
           if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1)) break;
         }
         npu_->HostStore(w.ready, 0), npu_->HostStore(w.done, 0);   // as NpuJoin's stores do
+        // the job's time from its ready store to its done word (its command's setup and image switch included)
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "npu cpu-driven: job %zu %s %.3f ms\n", i, jobs[i].tag.c_str(), ms);
+        family_ms[jobs[i].tag] += ms;
         if ((d & 0x7fffffffu) < w.gate || (d & 0x80000000u)) {
           std::fprintf(stderr, "npu cpu-driven: job %zu (%s) stalled or failed: done %08x gate %08x\n", i,
                        jobs[i].tag.c_str(), d, w.gate);
@@ -317,6 +322,7 @@ class LoomPrefill {
         }
       }
       std::fprintf(stderr, "npu cpu-driven: %zu jobs done\n", jobs.size());
+      for (const auto& [tag, ms] : family_ms) std::fprintf(stderr, "npu cpu-driven: %-8s %8.1f ms\n", tag.c_str(), ms);
       if (const char* cmd = std::getenv("YAH_NPU_CPU_DONE_CMD")) std::system(cmd);
       return;
     }
