@@ -1196,9 +1196,10 @@ def npu_rem(site):
 
 def npu_rem_tile(fmt, kbw, kbt, kind="kstore"):
     """The K remainder's tile (gen_gemm_tile.KWIN, kbw of kbt blocks): the afrag kstore (or kres) with the knobs of the
-    format's K = kbt * 256 kres (emit_prefill_pp.AF; its residual and persistence knobs dropped)."""
+    format's K = kbt * 256 kres (emit_prefill_pp.AF; its residual and persistence knobs dropped), the plain afrag
+    tile (straight-line k steps, as afrag needs) for a format with no tuned kres."""
     import gen_gemm_tile as TG
-    knobs = dict(AF.get((fmt, "kres", 320, kbt)) or AF[(fmt, "kres", 320, 24)])
+    knobs = dict(AF.get((fmt, "kres", 320, kbt)) or AF.get((fmt, "kres", 320, 24)) or dict(ksl=True))
     knobs.pop("persist", None)
     knobs["respre"] = 0
     return dataclasses.replace(TG.default_tile(fmt, kind, kbw), **AF_TILE, **knobs)
