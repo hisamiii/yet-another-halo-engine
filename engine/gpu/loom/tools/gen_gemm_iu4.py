@@ -29,20 +29,26 @@ VI = "vector<8xi32>"
 V2 = "vector<2xi32>"
 # gu silu's 1 / (1 + exp(-g)) as a bare v_rcp_f32 (1 ulp, no Newton step / inf select): an A4 redraw (kld_ref in the
 # redraw spread), gu -0.2%
+GU_BARE_RCP = True
 # gu: a fence between the A and B fragment loads of a k step: allocation then places the bank-pinned A fragments first
 # (all WMMAs 16 cyc, 237 -> 213 VGPR), gu -0.5%; kres loses with it (out +3.6%)
+GU_FRAG_FENCE = True
 # staged rows r and r + 8 share LDS banks at pitch WP (20 r mod 32 repeats every 8 rows), so a half-wave's fragment
 # ds_load_b64 of 16 rows takes 2 rounds: rows with bit 3 ^ bit 0 set store each 16-byte chunk's two 8-byte k steps
 # swapped (two b64 staging stores) and read k step st at slot st ^ 1 (a second lane base for odd k steps). Bit 0 in the
 # swizzle spreads a staging wave's 8 rows over both halves of every bank group (bit 3 alone: stores 3-way conflicted).
 # All iu4 GEMMs bit-identical, pp2048 GEMM cycles -1.1% (gu -1.1%, kres_down -1.2%).
+LDS_SWZ = True
 # gu epilogue: -log2e and 1.0 as lane * 0 + c (VGPRs): as a literal / inline source the silu's mul and add never pair
 # (398 -> 381 epilogue instrs, bit-identical, gu -0.1%)
+GU_EPI_VCONST = True
 # flag-waiting GEMMs: the prologue issues phase 0's weight loads before the wait (weights never depend on the producer),
 # so a workgroup launched early fetches them while it spins. Bit-identical, counters flat; pp2048 8 ABBA runs -11.5 ms
 # mean at +-10 ms run spread (expected ~1-2 ms: one first-fetch latency per call)
+WAIT_LATE = True
 # fold software-pipelined: tile x's fmacs one fenced stage after its sub / mul (no dependent fmac right behind its mul:
 # each s_delay_alu stall at raised priority lets another wave's 16-cycle WMMA in)
+FOLD_PIPE = True
 GROUP = 8   # grouped workgroup order: row tiles per launch band (group_of)
 
 
@@ -209,6 +215,8 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
         WV = "view<[%token_tiles]xi32>"
         e(f"  %wf_cv = buffer.view %wcnt_na[%base] : buffer -> {WV}")
         gen_rot.flag_wait(e, "%wf_cv", WV, ["%wg_y"], wait, "%tid", "wf")
+    if wait and not WAIT_LATE:
+        flag_wait()
     e("  %l16 = index.rem %lane, %c16 : index")
     e("  %lh = index.div %lane, %c16 : index")
     e(f"  %cwn = index.constant {WN} : index")
@@ -259,16 +267,17 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
             e(f"  {p}lr = index.mul {p}row, %c{WP} : index")
             e(f"  {p}lo0 = index.add {p}lr, {p}q4 : index")            # LDS dword within the tile
             e(f"  {p}lo = index.mul {p}lo0, %c4 : index")
-            e(f"  {p}s80 = index.div {p}row, %c8 : index")
-            e(f"  {p}s8 = index.add {p}s80, {p}row : index")
-            e(f"  {p}s = index.rem {p}s8, %c2 : index")             # row bit 3 ^ bit 0
-            e(f"  {p}sw0 = index.mul {p}s, %c8 : index")
-            e(f"  {p}s9 = index.add {p}s8, %c1 : index")      # no index.sub in LDS bases (it stops offset folding)
-            e(f"  {p}t = index.rem {p}s9, %c2 : index")
-            e(f"  {p}sw1 = index.mul {p}t, %c8 : index")
-            for ab, sw in (("A", "sw0"), ("B", "sw1")):         # A: k step 2q of the chunk, B: 2q + 1
-                e(f"  {p}lo{ab}r = index.add {p}lo, {p}{sw} : index")
-                e(f"  {p}lo{ab} = index.assume {p}lo{ab}r [range({p}lo{ab}r, 0, {LDSW * 4}), mul({p}lo{ab}r, 8)] : index")
+            if LDS_SWZ:
+                e(f"  {p}s80 = index.div {p}row, %c8 : index")
+                e(f"  {p}s8 = index.add {p}s80, {p}row : index")
+                e(f"  {p}s = index.rem {p}s8, %c2 : index")             # row bit 3 ^ bit 0
+                e(f"  {p}sw0 = index.mul {p}s, %c8 : index")
+                e(f"  {p}s9 = index.add {p}s8, %c1 : index")      # no index.sub in LDS bases (it stops offset folding)
+                e(f"  {p}t = index.rem {p}s9, %c2 : index")
+                e(f"  {p}sw1 = index.mul {p}t, %c8 : index")
+                for ab, sw in (("A", "sw0"), ("B", "sw1")):         # A: k step 2q of the chunk, B: 2q + 1
+                    e(f"  {p}lo{ab}r = index.add {p}lo, {p}{sw} : index")
+                    e(f"  {p}lo{ab} = index.assume {p}lo{ab}r [range({p}lo{ab}r, 0, {LDSW * 4}), mul({p}lo{ab}r, 8)] : index")
             if nm == "w":
                 if GU and r:
                     e(f"  {p}gr0 = index.add %wg_row, {p}row : index")
@@ -402,7 +411,7 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
                 e(f"  %{pfx}st{x}v = vector.from_elements {f} : vector<1xf32>")
                 e(f"  %{pfx}st{x}b = vector.bitcast %{pfx}st{x}v : vector<1xf32> to vector<4xi8>")
                 e(f"  vector.store %{pfx}st{x}b, %lb[%{pfx}st{x}] : vector<4xi8>, view<{LDSW * 4}xi8>")
-            else:
+            elif LDS_SWZ:
                 e(f"  scf.if {live} {{")
                 for hh, ab in enumerate("AB"):
                     e(f"    %{pfx}st{x}{ab} = index.add {lo}{ab}, {off} : index")
@@ -410,9 +419,13 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
                     e(f"    %{pfx}st{x}{ab}b = vector.bitcast %{pfx}st{x}{ab}w : vector<2xi32> to vector<8xi8>")
                     e(f"    vector.store %{pfx}st{x}{ab}b, %lb[%{pfx}st{x}{ab}] : vector<8xi8>, view<{LDSW * 4}xi8>")
                 e("  }")
+            else:
+                e(f"  scf.if {live} {{")
+                e(f"    vector.store {v}8, %lb[%{pfx}st{x}] : vector<16xi8>, view<{LDSW * 4}xi8>")
+                e("  }")
 
     # prologue: phase 0 into buffer 0
-    stores("p0_", loads("p0_", "%c0", flag_wait if wait else None), "%c0")
+    stores("p0_", loads("p0_", "%c0", flag_wait if wait and WAIT_LATE else None), "%c0")
     e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     # per-lane LDS byte offsets of fragment 0 in buffer 0: weight row m0 + l16, token n0 + l16 (fragment i / j is 16 i / j
     # rows further), the weight scale slots (tile * 16 + half * 8) and this lane's token's activation scale
@@ -434,16 +447,17 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
     e(f"  %ft2 = index.mul %ft1, %c{WP} : index")
     e("  %ft0r = index.mul %ft2, %c4 : index")
     assume("ft0", 16)
-    e("  %fsw_80 = index.div %l16, %c8 : index")
-    e("  %fsw_8 = index.add %fsw_80, %l16 : index")
-    e("  %fsw_r = index.rem %fsw_8, %c2 : index")
-    e("  %fsw_s = index.mul %fsw_r, %c8 : index")         # 8 for rows with bit 3 ^ bit 0 set
-    e("  %fsw_9 = index.add %fsw_8, %c1 : index")
-    e("  %fsw_u = index.rem %fsw_9, %c2 : index")
-    e("  %fsw_t = index.mul %fsw_u, %c8 : index")
-    for n, sw in (("fr0e", "%fsw_s"), ("fr0o", "%fsw_t"), ("ft0e", "%fsw_s"), ("ft0o", "%fsw_t")):
-        e(f"  %{n}r = index.add %{n[:3]}r, {sw} : index")
-        assume(n, 8)
+    if LDS_SWZ:
+        e("  %fsw_80 = index.div %l16, %c8 : index")
+        e("  %fsw_8 = index.add %fsw_80, %l16 : index")
+        e("  %fsw_r = index.rem %fsw_8, %c2 : index")
+        e("  %fsw_s = index.mul %fsw_r, %c8 : index")         # 8 for rows with bit 3 ^ bit 0 set
+        e("  %fsw_9 = index.add %fsw_8, %c1 : index")
+        e("  %fsw_u = index.rem %fsw_9, %c2 : index")
+        e("  %fsw_t = index.mul %fsw_u, %c8 : index")
+        for n, sw in (("fr0e", "%fsw_s"), ("fr0o", "%fsw_t"), ("ft0e", "%fsw_s"), ("ft0o", "%fsw_t")):
+            e(f"  %{n}r = index.add %{n[:3]}r, {sw} : index")
+            assume(n, 8)
     e("  %fd0r = index.mul %ft1, %c4 : index")
     assume("fd0", 4)
     e("  %schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>")
@@ -459,10 +473,10 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
 
     def kst(st):
         """Dword offset of k step st in a staged row (the odd-step lane base carries the swizzled 8 bytes)."""
-        return (4 * (st // 2))
+        return 4 * (st // 2) if LDS_SWZ else 2 * st
 
     def sfx(st):
-        return ("o" if st % 2 else "e")
+        return ("o" if st % 2 else "e") if LDS_SWZ else ""
 
     def phase(q, acc, ba, mid=None):
         """The WMMAs of the phase in the LDS buffer whose lane addresses (fragment 0, k step 0) are ba[la / lb / dt /
@@ -481,7 +495,7 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
                 e(f"    %{q}wd{st}_{i}b = vector.load %lb[%{q}la{st}_{i}] : view<{LDSW * 4}xi8> -> vector<8xi8>")
                 e(f"    %{q}wd{st}_{i} = vector.bitcast %{q}wd{st}_{i}b : vector<8xi8> to {V2}")
                 e(f"    %{q}lhs{st}_{i} = vector.fragment<lhs> %{q}wd{st}_{i} shape [%m, %k] using {{schema = %schema : encoding<schema>}} : {V2}")
-            if GU:
+            if GU and GU_FRAG_FENCE:
                 e("    scf.schedule.fence")
             for j in range(FN):
                 e(f"    %{q}lb{st}_{j}c = index.constant {(16 * j * WP + kst(st)) * 4} : index")
@@ -529,13 +543,18 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
             e(f"    %{q}sc{x} = vector.mulf %{q}ws{i}, %{q}dtv{j} : {V8}")
         def fin(x):
             e(f"    %{q}f{x} = vector.fmaf %{q}cf{x}, %{q}sc{x}, {acc[x]} : {V8}")
-        for g in range(FM * FN + 1):
-            if g < FM * FN:
-                pre(g)
-            if g:
-                fin(g - 1)
-            if g < FM * FN:
-                e("    scf.schedule.fence")
+        if FOLD_PIPE:
+            for g in range(FM * FN + 1):
+                if g < FM * FN:
+                    pre(g)
+                if g:
+                    fin(g - 1)
+                if g < FM * FN:
+                    e("    scf.schedule.fence")
+        else:
+            for x in range(FM * FN):
+                pre(x)
+                fin(x)
         out += [f"%{q}f{x}" for x in range(FM * FN)]
         e("    kernel.priority {level = 0}")
         return out
@@ -554,8 +573,9 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
         # one base per LDS read stream; fragment, tile and k-step offsets are immediates
         b = {}
         streams = (("la", "%fr0", "wbo"), ("lb", "%ft0", "abo"), ("dt", "%fd0", "dbo"), ("ws", "%fs0", "sbo"))
-        streams = (("lae", "%fr0e", "wbo"), ("lao", "%fr0o", "wbo"), ("lbe", "%ft0e", "abo"), ("lbo", "%ft0o", "abo"),
-                   ("dt", "%fd0", "dbo"), ("ws", "%fs0", "sbo"))
+        if LDS_SWZ:
+            streams = (("lae", "%fr0e", "wbo"), ("lao", "%fr0o", "wbo"), ("lbe", "%ft0e", "abo"), ("lbo", "%ft0o", "abo"),
+                       ("dt", "%fd0", "dbo"), ("ws", "%fs0", "sbo"))
         for n, inv, off in streams:
             e(f"    %{h}bi_{n} = index.add {inv}, %{h}u_{off} : index")
             b[n] = f"%{h}bi_{n}"
@@ -584,7 +604,7 @@ def gen(kind, M, out16=False, hperm=None, flag=False, wait=0, kpitch=0):
                 e(f"  %ot{i}_{j} = index.add %token_base, %ft{j}c : index")
                 e(f"  vector.fragment.store<result> %acc{i * FN + j}, %out_t_view[%or{i}_{j}, %ot{i}_{j}] shape [%m, %n] : {V8}, {OV}")
     else:
-        TG.OUT16 = out16
+        TG.OUT16, TG.OSTRIDE = out16, 0
         try:
             TG.lds_epilogue(e, t, kind == "kres", V8, qg=kind == "kqg", col_fence=kind == "kres")
         finally:
@@ -628,15 +648,18 @@ def gu_epilogue(e, TM, FM, FN, WN, V8):
     e("  %negone = scalar.constant -1.0 : f32")
     # exp(-g) as exp2(g * -log2e): what expf<afn> lowers to after the negation, in one multiply (bit-identical)
     e("  %nl2e = scalar.constant -1.4426950408889634 : f32")
+    if not GU_BARE_RCP:
+        TG.rcp_consts(e)
     e("  %one = scalar.constant 1.0 : f32")
     nl2e, one = "%nl2e", "%one"
-    e("  %ev_i = index.cast %lane : index to i32")
-    e("  %ev_f = scalar.sitofp %ev_i : i32 to f32")
-    e("  %ev_z = scalar.constant 0.0 : f32")
-    e("  %ev_0 = scalar.mulf %ev_f, %ev_z : f32")
-    e("  %nl2e_v = scalar.addf %ev_0, %nl2e : f32")
-    e("  %one_v = scalar.addf %ev_0, %one : f32")
-    nl2e, one = "%nl2e_v", "%one_v"
+    if GU_EPI_VCONST:
+        e("  %ev_i = index.cast %lane : index to i32")
+        e("  %ev_f = scalar.sitofp %ev_i : i32 to f32")
+        e("  %ev_z = scalar.constant 0.0 : f32")
+        e("  %ev_0 = scalar.mulf %ev_f, %ev_z : f32")
+        e("  %nl2e_v = scalar.addf %ev_0, %nl2e : f32")
+        e("  %one_v = scalar.addf %ev_0, %one : f32")
+        nl2e, one = "%nl2e_v", "%one_v"
     e("  %gu_p = index.div %wr, %c2 : index")               # 0: a gate wave, 1: an up wave
     e("  %gu_wr = index.rem %wr, %c2 : index")
     e(f"  %gu_cw = index.constant {WN} : index")
@@ -682,7 +705,7 @@ def gu_epilogue(e, TM, FM, FN, WN, V8):
                 e(f"  %ng_{y} = scalar.mulf %g_{y}, {nl2e} : f32")
                 e(f"  %ex_{y} = scalar.exp2f<afn> %ng_{y} : f32")
                 e(f"  %dn_{y} = scalar.addf {one}, %ex_{y} : f32")
-                TG.recip1(e, f"%iv_{y}", f"%dn_{y}", bare=True)
+                TG.recip1(e, f"%iv_{y}", f"%dn_{y}", bare=GU_BARE_RCP)
                 e(f"  %sg_{y} = scalar.mulf %g_{y}, %iv_{y} : f32")
                 e(f"  %ac_{y} = scalar.mulf %sg_{y}, %v_{y} : f32")
                 e(f"  %h_{y} = scalar.fptrunc %ac_{y} : f32 to f16")

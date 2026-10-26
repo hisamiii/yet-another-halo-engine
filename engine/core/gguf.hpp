@@ -80,9 +80,10 @@ class Gguf {
   // scan of an imported page evicts all of the process's GPU queues for 0.03-3 s. The memory is writable, so a
   // device that pins it for writing shares these pages (no copy-on-write copies). Needs RLIMIT_MEMLOCK (a warning
   // when the kernel refuses the lock).
-  static Gguf OpenResident(const std::string& path);
+  // native (a GGUF): its projections as they are, for the native sets (core/gguf_convert.cpp).
+  static Gguf OpenResident(const std::string& path, bool native = false);
   // Names, types, dims and metadata only, as the engine sees them: the weights are not read, Data() is unusable.
-  static Gguf OpenIndex(const std::string& path);
+  static Gguf OpenIndex(const std::string& path, bool native = false);
   Gguf(Gguf&& other) noexcept;
   Gguf& operator=(Gguf&& other) noexcept;
   Gguf(const Gguf&) = delete;
@@ -112,7 +113,7 @@ class Gguf {
   void Close();
   static Gguf OpenHfq(const std::string& path, bool lock, bool weights = true);
   // A GGUF with the projections converted to MQ4G256 (core/gguf_convert.cpp); weights false: the table only.
-  static Gguf OpenConverted(const std::string& path, bool weights, bool lock);
+  static Gguf OpenConverted(const std::string& path, bool weights, bool lock, bool native);
   // 2 MB aligned anonymous memory of at least `bytes` (a multiple of 2 MB) for a resident copy.
   static std::uint8_t* Reserve(std::size_t bytes, const std::string& path);
   void ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) const;

@@ -3,7 +3,7 @@
 
 The reference is a numpy model of the prefill's kv8a16 / kv4a16 formats (gen_kvq.py), with a scrambled page table.
 
-usage: dattn_q_check.py <model> <workdir> <bits 8|4|kb,vb> [T] [pos]
+usage: dattn_q_check.py <model.gguf> <workdir> <bits 8|4|kb,vb> [T] [pos]
 (the model is only opened by hal_run; no tensor is bound)
 """
 import os

@@ -146,7 +146,14 @@ int main(int argc, char** argv) {
   const std::uint32_t want = std::strtoul(argv[4], nullptr, 10);
   const char* ids_path = argv[5];
   try {
-    auto gguf = yah::core::Gguf::OpenResident(argv[1]);
+    // a native set (emit_prefill_pp.py YAH_NATIVE=1) runs the GGUF's own formats
+    const bool native = [&] {
+      std::ifstream f(std::string(argv[2]) + "/dispatch.txt");
+      for (std::string row; std::getline(f, row);)
+        if (row.rfind("native ", 0) == 0) return true;
+      return false;
+    }();
+    auto gguf = yah::core::Gguf::OpenResident(argv[1], native);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
     std::vector<std::uint32_t> ids = ParseIds(ids_path);
     LoomDevice gpu;

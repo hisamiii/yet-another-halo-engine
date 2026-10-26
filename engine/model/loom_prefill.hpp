@@ -264,13 +264,26 @@ class LoomPrefill {
     split_armed_ = split_layer_ && l == split_layer_;
     npu_layer_ = l;
     tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
-    nq_want_ = nqw_;
-    RunNorm(pre + "attn_norm.weight");
-    nq_want_ = false;
-    if (cfg_.IsFullAttention(l))
-      RunAttention(l, ci, pre, hook);
-    else
-      RunDeltaNet(l, pre);
+    if (cfg_.IsFullAttention(l)) {
+      const bool q_af = Af("gemm_kqg", pre + "attn_q.weight");
+      const bool k_af = Af("gemm_kstore", pre + "attn_k.weight");
+      const bool v_af = Af("gemm_kstore", pre + "attn_v.weight");
+      nq_want_ = nqw_;
+      RunNorm(pre + "attn_norm.weight",
+              q_af && k_af && v_af   ? NormOut::kTiled
+              : q_af || k_af || v_af ? NormOut::kBoth
+                                     : NormOut::kRow);
+      nq_want_ = false;
+      RunAttention(l, ci, pre, hook, q_af, k_af, v_af);
+    } else {
+      // afrag qkv / gate read the fragment-major copy; alpha / beta keep the row-major one
+      const bool qkv_af = Af("gemm_kstore", pre + "attn_qkv.weight");
+      const bool gate_af = Af("gemm_kstore", pre + "attn_gate.weight");
+      nq_want_ = nqw_;
+      RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow);
+      nq_want_ = false;
+      RunDeltaNet(l, pre, qkv_af, gate_af);
+    }
     if (tail_ != kNoRows) {
       trim_row_ = tail_;
       RunFfn(pre);
@@ -286,10 +299,14 @@ class LoomPrefill {
     const auto* ow = Find("output.weight");
     Dispatch(Exe("rmsnorm.hal"), "yah_rmsnorm", 1, 1, 1, 32, 1, 1,
              {{hidden_->handle, std::size_t{row} * kHidden * 4, std::size_t{kHidden} * 4}, TRef(*onw), Ref(*normed_)});
-    // the f32 norm row into the weights' basis (no awq), then gen_gemv's tile-free GEMV
-    Dispatch(Exe("rot_head.hal"), "yah_rot256", kHidden / 1024, 1, 1, 64, 1, 1, {Ref(*normed_), Ref(*rot_signs_)});
-    const Geom& g = geom_.at("gemv.hal");   // (rows per workgroup, lanes, workgroups)
-    Dispatch(Exe("gemv.hal"), "yah_gemv", g.tt, 1, 1, g.rowgrp, 1, 1, {TRef(*ow), Ref(*normed_), dst});
+    if (rot_) {
+      // MQ4 head: the f32 norm row into the weights' basis (no awq), then gen_gemv's tile-free GEMV
+      Dispatch(Exe("rot_head.hal"), "yah_rot256", kHidden / 1024, 1, 1, 64, 1, 1, {Ref(*normed_), Ref(*rot_signs_)});
+      const Geom& g = geom_.at("gemv.hal");   // (rows per workgroup, lanes, workgroups)
+      Dispatch(Exe("gemv.hal"), "yah_gemv", g.tt, 1, 1, g.rowgrp, 1, 1, {TRef(*ow), Ref(*normed_), dst});
+      return;
+    }
+    Dispatch(Exe("gemv.hal"), "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, {TRef(*ow), Ref(*normed_), dst});
   }
   // Argmax of kVocab f32 logits into dst (one u32).
   void Argmax(const hrx_buffer_ref_t& logits, const hrx_buffer_ref_t& dst) {
@@ -380,6 +397,28 @@ class LoomPrefill {
     std::vector<const LoomBuffer*> v = {ptab_, kq8buf_, ksbuf_, kmbuf_, vqbuf_, vqsbuf_, kpool_, vtpool_, conv_state_, state_};
     if (fps_on_) v.insert(v.end(), {kfm_, vfm_});   // the block means (a slot of an fpsparse set)
     return v;
+  }
+  struct Fmt {
+    const char* name;
+    std::uint32_t qk;
+  };
+  static bool FmtOf(std::uint32_t type, Fmt* out) {
+    switch (type) {
+      case 12: *out = {"q4k", 256}; return true;
+      case 13: *out = {"q5k", 256}; return true;
+      case 14: *out = {"q6k", 256}; return true;
+      case 11: *out = {"q3k", 256}; return true;
+      case 23: *out = {"iq4xs", 256}; return true;
+      case 21: *out = {"iq3s", 256}; return true;
+      case 18: *out = {"iq3xxs", 256}; return true;
+      case 20: *out = {"iq4nl", 32}; return true;
+      case 17: *out = {"iq2xs", 256}; return true;
+      case 8: *out = {"q8_0", 32}; return true;
+      case 16: *out = {"iq2xxs", 256}; return true;
+      case 10: *out = {"q2k", 256}; return true;
+      case 44: *out = {"mq4", 256}; return true;
+      default: return false;
+    }
   }
   // dispatch.txt: "<hal> <tokens per workgroup> <16-row tiles per workgroup> <token tiles>" per HAL.
   // Read grids from here; never mirror the emitter's arithmetic: a wrong grid silently skips rows.
@@ -480,12 +519,15 @@ class LoomPrefill {
     else
       gpu_.Dispatch(exe, ordinal, config, nullptr, 0, b.data(), b.size());
   }
-  // A GEMM writes only its outputs.
-  std::uint64_t GemmWrites(const std::vector<hrx_buffer_ref_t>& b, std::initializer_list<const LoomBuffer*> outs) const {
+  // A GEMM writes only its outputs; the hand-written Q2_K GEMM also stages its accumulators in ostage.
+  std::uint64_t GemmWrites(const std::vector<hrx_buffer_ref_t>& b, const Fmt& f,
+                           std::initializer_list<const LoomBuffer*> outs) const {
     std::uint64_t m = 0;
-    for (std::size_t i = 0; i < b.size(); ++i)
+    for (std::size_t i = 0; i < b.size(); ++i) {
       for (const LoomBuffer* o : outs)
         if (b[i].buffer == o->handle) m |= std::uint64_t{1} << i;
+      if (std::string(f.name) == "q2k" && b[i].buffer == ostage_->handle) m |= std::uint64_t{1} << i;
+    }
     return m;
   }
   // A per-chunk HAL: chunk 0 is "<stem>.hal", chunk c "<stem>_c<c>.hal" (start_pos is compiled in).
@@ -501,8 +543,12 @@ class LoomPrefill {
       gpu_.H2D(b, v.data(), bytes);
       return b;
     };
-    if (!geom_.count("rot"))
-      throw LoomError("prefill: not an MQ4 set (an emit_prefill_pp.py set from before 2026-10-20?)");
+    grid_iq3s_ = &table("grid_iq3s.bin", 512 * 4);
+    grid_iq3xxs_ = &table("grid_iq3xxs.bin", 256 * 4);
+    grid_iq2xxs_ = &table("grid_iq2xxs.bin", 512 * 4);
+    grid_iq2xs_ = &table("grid_iq2xs.bin", 1024 * 4);
+    ksigns_ = &table("ksigns_iq2xxs.bin", 128);
+    rot_ = geom_.count("rot") != 0;
     a4_ = geom_.count("a4") != 0;
     nqov_ = a4_ && geom_.count("nqov") != 0;
     dnov_ = a4_ && geom_.count("dnov") != 0;
@@ -517,7 +563,7 @@ class LoomPrefill {
     if (const auto it = geom_.find("nqp"); it != geom_.end()) nqp_ = it->second.tokens;
     nqw_ = a4_ && geom_.count("nqw") != 0;
     dnring_ = nqw_ && rqk_ && geom_.count("dnring") != 0;
-    rot_signs_ = &table("rot_signs.bin", 512 * 4);
+    if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
   void AllocateBuffers() {
@@ -528,7 +574,7 @@ class LoomPrefill {
     reszero_ = &Alloc(B * kHidden * 4);
     sumout_ = &Alloc(B * kHidden * 4);
     scratch_ = &Alloc(B * kFfn * 2);
-    if (!a4_) rotbuf_ = &Alloc(B * kInner * 2);
+    if (rot_ && !a4_) rotbuf_ = &Alloc(B * kInner * 2);
     if (a4_) aq_ = &Alloc(B * kFfn / 2), ad_ = &Alloc(B * (kFfn / 128) * 4);
     if (nqov_ || dnov_ || guov_) {
       // the flag-waiting kernels' activation pair (swapped with aq_ / ad_ after each) and their producers' counters
@@ -569,12 +615,17 @@ class LoomPrefill {
     lse_ = &Alloc(B * kHeads * 4);
     eps_ = &Alloc(4);
     ffnup_ = &Alloc(B * kFfn * 2);
+    // the FFN norm's fragment-major copy for the afrag GEMMs (norm_t.hal), only in sets that have them
+    bool any_af = false;
+    for (const auto& [name, g] : geom_) any_af = any_af || name.size() > 7 && name.compare(name.size() - 7, 7, ".af.hal") == 0;
+    if (any_af) normt_ = &Alloc(B * kHidden * 2);
     if (!a4_) gateffn_ = &Alloc(B * kFfn * 4);   // A4's gu GEMM keeps the gate in LDS
     // Per-workgroup weight staging (ABI only: the tile GEMMs stage in LDS) and epilogue scratch sized for the widest
     // GEMM, which the compiler declares over the whole [m_rows][tokens] tile.
     uwstage_ = &Alloc(std::size_t{kFfn} * 16 * 2);
     wstage_ = &Alloc(std::size_t{kFfn} * 16 * 2);
     ostage_ = &Alloc(std::size_t{kFfn} * B * 4);
+    partial_ = &Alloc(B * kHidden * 4);
     hidden2_ = &Alloc(B * kHidden * 4);
     normed_ = &Alloc(std::size_t{kHidden} * 4);
     valid_ = &Alloc(4);
@@ -689,11 +740,11 @@ class LoomPrefill {
       if (name.rfind("wmma", 0) == 0 && name.find("_c") != std::string::npos &&
           (!g.rowgrp || !g.tokens || kHeads % g.rowgrp || (B_ + g.tokens - 1) / g.tokens != g.tt))
         throw LoomError(name + ": its launch geometry does not fit (re-emit the set)");
-    for (const char* hal : {"norm.hal", "convkq.hal", "prepab.hal", "rowsplit.hal", "postnorm.hal", "gemv.hal",
-                            "rmsnorm.hal", "argmax.hal", "embed.hal"})
+    for (const char* hal : {"norm.hal", "convkq.hal", "prepab.hal", "rowsplit.hal", "postnorm.hal", "unpack.hal",
+                            "gemv.hal", "rmsnorm.hal", "argmax.hal", "accum.hal", "embed.hal"})
       Exe(hal);
     GeomOf("embed.hal");   // one token per workgroup: refuses a set emitted for another chunk size
-    // embed.hal decodes Q8_0
+    // embed.hal decodes Q8_0 (core/gguf_convert.cpp makes a GGUF's token_embd Q8_0)
     if (Find("token_embd.weight")->type != core::GgmlType::kQ8_0)
       throw LoomError("prefill: token_embd: its format does not match embed.hal (re-emit the set)");
   }
@@ -709,17 +760,47 @@ class LoomPrefill {
     hidden_ = h, hidden2_ = h2, aq_ = aq, aq2_ = aq2, ad_ = ad, ad2_ = ad2;
   }
 
-  // HAL name "<kind>_mq4_<m_tiles>_<k_blocks>.hal" of the tile GEMM on tensor t.
-  std::string GemmHal(const char* kind, const core::TensorInfo& t) const {
-    if (t.type != core::GgmlType::kMQ4G256) throw LoomError(std::string("prefill: ") + kind + ": the weights are not MQ4");
-    return std::string(kind) + "_mq4_" + std::to_string(t.dims[1] / 16) + "_" + std::to_string(t.dims[0] / 256) + ".hal";
+  // Bindings shared by every GEMM: weights, then the IQ grid / sign tables the format needs.
+  std::vector<hrx_buffer_ref_t> GemmWeights(const core::TensorInfo& t, const Fmt& f) const {
+    std::vector<hrx_buffer_ref_t> b = {TRef(t)};
+    const std::string n = f.name;
+    if (n == "iq3s") b.push_back(Ref(*grid_iq3s_));
+    if (n == "iq3xxs") b.push_back(Ref(*grid_iq3xxs_));
+    if (n == "iq2xxs") b.push_back(Ref(*grid_iq2xxs_));
+    if (n == "iq2xs") b.push_back(Ref(*grid_iq2xs_));
+    // The IQ3_XXS and IQ2 sign tables are the same 128 bytes.
+    if (n == "iq3xxs" || n == "iq2xxs" || n == "iq2xs") b.push_back(Ref(*ksigns_));
+    return b;
+  }
+  // HAL name "<kind>_<fmt>_<m_tiles>_<k_blocks>.hal" of the GEMM on tensor t.
+  std::string GemmHal(const char* kind, const core::TensorInfo& t, Fmt* f) const {
+    if (!FmtOf(static_cast<std::uint32_t>(t.type), f)) throw LoomError(std::string("no GEMM format for ") + kind);
+    const std::uint32_t mt = static_cast<std::uint32_t>(t.dims[1] / 16);
+    const std::uint32_t kb = static_cast<std::uint32_t>(t.dims[0] / f->qk);
+    return std::string(kind) + "_" + f->name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
   }
   std::uint32_t MTiles(const core::TensorInfo& t) const { return static_cast<std::uint32_t>(t.dims[1] / 16); }
   // The GEMM variant for this chunk's real tokens: the set may carry "<hal>.t128.hal" / ".t64.hal" with narrower token
   // tiles. Pick the least (padded token rows x cost per row); a narrow tile pads less but costs more per row (measured:
   // x1.12 at 128 tokens, x1.6 at 64). Every variant computes the same values.
+  // A tuned set (engine/tune) carries the measured choice instead: "pick:<hal>:<max tokens>" rows map a token bucket to
+  // the token tile to use; chunks above the largest bucket take the full tile.
   std::string PickGemm(const std::string& hal) {
     const std::string stem = hal.substr(0, hal.size() - 4);
+    const std::string prefix = "pick:" + hal + ":";
+    bool tuned = false;
+    std::uint32_t bucket = ~0u, bn = 0;
+    for (auto it = geom_.lower_bound(prefix); it != geom_.end() && it->first.compare(0, prefix.size(), prefix) == 0;
+         ++it) {
+      tuned = true;
+      if (it->second.tokens >= n_ && it->second.tokens < bucket) bucket = it->second.tokens, bn = it->second.rowgrp;
+    }
+    if (tuned) {
+      const auto full = geom_.find(hal);
+      if (bn == 0 || (full != geom_.end() && bn == full->second.tokens)) return hal;
+      const std::string v = stem + ".t" + std::to_string(bn) + ".hal";
+      return geom_.count(v) ? v : hal;
+    }
     std::string best = hal;
     double best_cost = 1e30;
     for (const std::string& h : {hal, stem + ".t128.hal", stem + ".t64.hal"}) {
@@ -733,11 +814,39 @@ class LoomPrefill {
     return best;
   }
 
-  // The FFN: norm, gate, swiglu (up), down.
+  // The afrag form of a GEMM HAL ("<hal>.af.hal" / ".af.to.hal", emit_prefill_pp.py afrag_variants), or "".
+  std::string AfHal(const std::string& hal, const char* suffix = ".af.hal") const {
+    const std::string v = hal.substr(0, hal.size() - 4) + suffix;
+    return geom_.count(v) ? v : "";
+  }
+  // The FFN: norm, gate, swiglu (up), down. A GEMM with an afrag form reads its input fragment-major: the norm writes
+  // that layout into normt_ for gate / up (and the plain one into scratch_ if one of them has no afrag form), the swiglu
+  // writes it into ffnup_ for down when both have afrag forms.
+  // afrag GEMMs take 512-token tiles: a short chunk pads more with them than with the narrow tiles PickGemm would take
+  // (300 tokens: 384 rows at x1.12, +2.4% with afrag). They run when their padded rows at ~0.93 the cost per row (their
+  // clock-free gain) cost no more than the best of the full and the set's narrow tiles, PickGemm's untuned weights.
+  bool AfChunk() const {
+    const auto padded = [&](std::uint32_t bn) { return static_cast<double>((n_ + bn - 1) / bn * bn); };
+    double best = padded(256);
+    if (std::any_of(geom_.begin(), geom_.end(),
+                    [](const auto& g) { return g.first.find(".t128.hal") != std::string::npos; }))
+      best = std::min({best, padded(128) * 1.12, padded(64) * 1.6});
+    return padded(512) * 0.93 <= best;
+  }
+  // Whether the GEMM of this kind on tensor wname runs its afrag form in this chunk.
+  bool Af(const char* kind, const std::string& wname) const {
+    Fmt f{};
+    return AfChunk() && !AfHal(GemmHal(kind, *Find(wname), &f)).empty();
+  }
   void RunFfn(const std::string& pre) {
     if (RunFfnBlock(pre)) return;
+    if (RunFfnFused(pre)) return;
+    const bool gate_af = Af("gemm_kstore", pre + "ffn_gate.weight");
+    const bool up_af = Af("gemm_swiglu", pre + "ffn_up.weight");
+    const bool down_af = up_af && Af("gemm_kres", pre + "ffn_down.weight");
     nq_want_ = nqgu_;
-    RunNorm(pre + "post_attention_norm.weight");
+    RunNorm(pre + "post_attention_norm.weight",
+            gate_af && up_af ? NormOut::kTiled : gate_af || up_af ? NormOut::kBoth : NormOut::kRow);
     nq_want_ = false;
     if (a4_) {
       // one GEMM for gate and up: silu(gate) * up straight into ffnup_ (gen_gemm_iu4 gu); guov: flagged (a counter per
@@ -749,10 +858,10 @@ class LoomPrefill {
       gu_waited_ = gu_flagged_ && nq_cnt_.buffer;
       nq_cnt_ = {};
     } else {
-      RunKstore(pre + "ffn_gate.weight", *gateffn_);
-      RunSwiglu(pre + "ffn_up.weight");
+      RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
+      RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
     }
-    RunResidual(pre + "ffn_down.weight", *ffnup_);
+    RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
   }
 
   // The NPU FFN block (npu_plan). npu.txt: "npuffn <F> <B> <K parts>", "npubytes_<image> <a> <w> <c>" (binding bytes),
@@ -799,17 +908,47 @@ class LoomPrefill {
   void NpuCpuDriven(const std::vector<NpuSplit::Queued>& jobs);
   void NpuJoin(std::size_t job);
 
-  // The RMSNorm of hidden() rows into scratch_ (f16), rotated into the weights' basis (A4: and quantized into aq_ / ad_).
-  void RunNorm(const std::string& wname) {
+  // kRow: f16 row-major into scratch_; kTiled: fragment-major into normt_ (afrag GEMMs); kBoth: both, one pass.
+  enum class NormOut { kRow, kTiled, kBoth };
+  // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): both of one
+  // format and ffn_up stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r).
+  // It writes f16(silu(gate) * up) into ffnup_, fragment-major when ffn_down is afrag too. Returns false if not taken.
+  bool RunFfnFused(const std::string& pre) {
+    if (!AfChunk()) return false;
+    const auto* tg = Find(pre + "ffn_gate.weight");
+    const auto* tu = Find(pre + "ffn_up.weight");
+    if (tg->type != tu->type || tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
+    Fmt f{};
+    const std::string base = GemmHal("gemm_ffn", *tg, &f);
+    const bool down_af = Af("gemm_kres", pre + "ffn_down.weight");
+    const std::string hal = AfHal(base, down_af ? ".af.to.hal" : ".af.hal");
+    if (hal.empty()) return false;
+    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled);
+    const Geom g = GeomOf(hal);
+    auto b = GemmWeights(*tg, f);
+    b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
+    const std::size_t first = b.size();
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
+    const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(tg->dims[1]) * 2}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1, 1,
+             b, GemmWrites(b, f, {ffnup_}));
+    RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
+    return true;
+  }
+
+  // The RMSNorm of hidden() rows into scratch_ (f16; afrag: fragment-major into normt_), MQ4 sets: rotated into the
+  // weights' basis (A4: and quantized into aq_ / ad_).
+  void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow) {
     // A row takes `split` waves (dispatch.txt norm_split, else 1); a workgroup of w waves takes w / split rows.
-    const LoomExecutable& exe = Exe("norm.hal");
+    const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
+    const LoomExecutable& exe = Exe(hal + ".hal");
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const auto ns = geom_.find("norm_split");
     const std::uint32_t split = ns != geom_.end() && ns->second.rowgrp ? ns->second.rowgrp : 1;
     const std::uint32_t rows_per_wg = ws ? ws / 32 / split : 1;
     if (!rows_per_wg || (ws && ws % (32 * split))) throw LoomError("norm.hal: workgroup size does not match norm_split");
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
-    if (a4_ && geom_.count("normq_5120.hal")) {
+    if (a4_ && mode == NormOut::kRow && geom_.count("normq_5120.hal")) {
       // A4: the norm and its rotq in one kernel (gen_rot.gen_nq), one row per workgroup; the f16 norm output is not kept.
       // nqov: right after its kres (deferred by RunResidual, untrimmed) as kresf + normqf with no graph edge between
       // them: the rows wait on the kres's per-token-tile counters (FlagSlot), so they start in the GEMM's tail. normqf
@@ -847,12 +986,20 @@ class LoomPrefill {
                geom_.at("normq_5120.hal").rowgrp, 1, 1, b, want ? 0b1110000 : 0b110000, nullptr, want ? 0b1000000 : 0);
       return;
     }
-    Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1,
-             {Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_), Ref(*scratch_)});
-    if (a4_)
-      RotQ(*scratch_, kHidden, NormAwq(wname), false);
-    else
-      Rotate(*scratch_, nullptr, kHidden, NormAwq(wname));
+    std::vector<hrx_buffer_ref_t> b =
+        mode == NormOut::kBoth
+            ? std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
+                                            Ref(*scratch_), Ref(*normt_)}
+            : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
+                                            Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)};
+    Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
+    if (rot_) {
+      if (mode != NormOut::kRow) throw LoomError("prefill: MQ4 sets rotate only the row-major norm output");
+      if (a4_)
+        RotQ(*scratch_, kHidden, NormAwq(wname), false);
+      else
+        Rotate(*scratch_, nullptr, kHidden, NormAwq(wname));
+    }
   }
   // the awq of a norm's input site: the post-attention norm feeds the FFN, attn_norm qkv / gate / alpha / beta or q / k / v
   std::string NormAwq(const std::string& wname) const {
@@ -998,7 +1145,7 @@ class LoomPrefill {
     chunk_graph_ = std::make_unique<LoomGraph>(gpu_);
     LoomGraph& g = *chunk_graph_;
     weights_.ForEachBuffer([&](hrx_buffer_t h) { g.ReadOnly(h); });
-    for (const LoomBuffer* t : {eps_, reszero_})
+    for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
       g.ReadOnly(t->handle);
     graph_ = &g;
   }
@@ -1010,9 +1157,9 @@ class LoomPrefill {
     NewGraph();
   }
 
-  // The tile GEMMs (W4A16) read scratch_; A4 runs the iu4 GEMMs on aq_ / ad_ (RunIu4).
+  // af: the afrag form, input normt_ (fragment-major)
   // cnt (A4): run the flagged GEMM on these counters if it can (RunIu4); returns whether it did.
-  bool RunKstore(const std::string& wname, const LoomBuffer& out, const hrx_buffer_ref_t* cnt = nullptr) {
+  bool RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false, const hrx_buffer_ref_t* cnt = nullptr) {
     const auto* t = Find(wname);
     if (a4_) {
       // dnperm sets: the DeltaNet gate in HF head order (kstoreh), as the pnq kernels read it
@@ -1022,43 +1169,69 @@ class LoomPrefill {
       return RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000, nullptr, cnt, &iu4_wait_,
                     iu4_untrack_);
     }
-    const std::string hal = PickGemm(GemmHal("gemm_kstore", *t));
+    Fmt f{};
+    const std::string base = GemmHal("gemm_kstore", *t, &f);
+    const std::string hal = af ? AfHal(base) : PickGemm(base);
     const Geom g = GeomOf(hal);
-    std::vector<hrx_buffer_ref_t> b = {TRef(*t), Ref(*scratch_), Ref(*wstage_), Ref(*ostage_), Ref(out)};
-    const std::uint32_t tt = Trim(b, 1, {std::size_t(t->dims[0]) * 2, 0, 0, std::size_t(t->dims[1]) * 4}, g);
-    Dispatch(Exe(hal), "yah_ffn_gemm_mq4", MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, {&out}));
+    auto b = GemmWeights(*t, f);
+    const std::size_t first = b.size();
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_})
+      b.push_back(Ref(*x));
+    b.push_back(Ref(out));
+    const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, 0, 0, std::size_t(t->dims[1]) * 4}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b,
+             GemmWrites(b, f, {&out}));
     return false;
   }
   // The attention q projection with the q / gate unpack fused in (rows = heads x [256 q | 256 gate]).
-  void RunKqg(const std::string& wname) {
+  // Returns false if the set has no such HAL; the caller then runs kstore + yah_unpack_qg.
+  // af: the afrag form, input normt_ (fragment-major)
+  bool RunKqg(const std::string& wname, bool af = false) {
     const auto* t = Find(wname);
     if (a4_) {
       RunIu4("kqg", *t, {q_, gate_}, {std::size_t(t->dims[1]) * 2, std::size_t(t->dims[1]) * 2}, 0b11000, nullptr, nullptr,
              &iu4_wait_, iu4_untrack_);
-      return;
+      return true;
     }
-    const std::string hal = PickGemm(GemmHal("gemm_kqg", *t));
+    Fmt f{};
+    if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) return false;
+    std::string hal = GemmHal("gemm_kqg", *t, &f);
+    if (!geom_.count(hal)) return false;
+    hal = af ? AfHal(hal) : PickGemm(hal);
     const Geom g = GeomOf(hal);
-    const std::vector<hrx_buffer_ref_t> b = {TRef(*t), Ref(*scratch_), Ref(*wstage_), Ref(*ostage_), Ref(*q_), Ref(*gate_)};
-    Dispatch(Exe(hal), "yah_ffn_gemm_mq4_kqg", MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b,
-             GemmWrites(b, {q_, gate_}));
+    auto b = GemmWeights(*t, f);
+    for (const LoomBuffer* x :
+         std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_, q_, gate_})
+      b.push_back(Ref(*x));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_kqg").c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {q_, gate_}));
+    return true;
   }
-  void RunSwiglu(const std::string& wname) {
+  // af: the afrag form, input normt_; tout: its output fragment-major (for an afrag down projection)
+  void RunSwiglu(const std::string& wname, bool af = false, bool tout = false) {
     const auto* t = Find(wname);
-    const std::string hal = PickGemm(GemmHal("gemm_swiglu", *t));
+    Fmt f{};
+    const std::string base = GemmHal("gemm_swiglu", *t, &f);
+    const std::string hal = af ? AfHal(base, tout ? ".af.to.hal" : ".af.hal") : PickGemm(base);
+    if (hal.empty()) throw LoomError(base + ": the set lacks its afrag form");
     const Geom g = GeomOf(hal);
-    std::vector<hrx_buffer_ref_t> b = {TRef(*t), Ref(*scratch_), Ref(*gateffn_), Ref(*uwstage_), Ref(*ostage_), Ref(*ffnup_)};
+    auto b = GemmWeights(*t, f);
+    const std::size_t first = b.size();
+    for (const LoomBuffer* x :
+         std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, gateffn_, uwstage_, ostage_, ffnup_})
+      b.push_back(Ref(*x));
     const std::size_t M = t->dims[1];
-    const std::uint32_t tt = Trim(b, 1, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 2}, g);
-    Dispatch(Exe(hal), "yah_ffn_gemm_mq4_swiglu", MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, {ffnup_}));
+    const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 2}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(), MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
   }
-  // hidden += W input: the kres GEMM writes hidden + W input into hidden2, then the two hidden buffers swap.
+  // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
+  // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
+  // af: the afrag form of the fused kres GEMM (input fragment-major)
   // quantized (A4): aq_ / ad_ already hold the rotated input (gen_pnq), in is not read
   // qcnt (quantized, dnring): the pnq's per-token-tile counters, which the kres waits on (a chained PendingKres)
-  void RunResidual(const std::string& wname, const LoomBuffer& in, bool quantized = false,
+  void RunResidual(const std::string& wname, const LoomBuffer& in, bool af = false, bool quantized = false,
                    const hrx_buffer_ref_t* qcnt = nullptr) {
     const auto* t = Find(wname);
-    const bool heads = wname.find("ssm_out") != std::string::npos;
+    const bool heads = rot_ && wname.find("ssm_out") != std::string::npos;
     const std::string awq = wname.substr(0, wname.size() - 6) + "awq";
     if (a4_) {
       hrx_buffer_ref_t rc = qcnt ? *qcnt : hrx_buffer_ref_t{};
@@ -1070,34 +1243,62 @@ class LoomPrefill {
       std::swap(hidden_, hidden2_);
       return;
     }
-    Rotate(in, heads ? rotbuf_ : nullptr, static_cast<std::uint32_t>(t->dims[0]), awq);
-    const std::string hal = PickGemm(GemmHal("gemm_kres", *t));
+    if (rot_) Rotate(in, heads ? rotbuf_ : nullptr, static_cast<std::uint32_t>(t->dims[0]), awq);
+    const LoomBuffer& input = heads ? *rotbuf_ : in;
+    Fmt f{};
+    const std::string fused0 = GemmHal("gemm_kres", *t, &f);
+    if (geom_.count(fused0)) {
+      const std::string fused = af ? AfHal(fused0) : PickGemm(fused0);
+      const Geom g = GeomOf(fused);
+      auto b = GemmWeights(*t, f);
+      const std::size_t first = b.size();
+      for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, hidden_, wstage_, ostage_, hidden2_}) b.push_back(Ref(*x));
+      const std::size_t M = t->dims[1];
+      const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 4}, g);
+      // the persistent kres (".af.p.hal": each workgroup runs every token tile of its row block, grid y = 1) unless trimmed
+      const std::string pers = af ? AfHal(fused0, ".af.p.hal") : "";
+      const bool use_p = !pers.empty() && tt == g.tt;
+      Dispatch(Exe(use_p ? pers : fused), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(),
+               MTiles(*t) / g.rowgrp, use_p ? 1 : tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+      std::swap(hidden_, hidden2_);
+      return;
+    }
+    const std::string base = GemmHal("gemm_kstore", *t, &f);
+    const std::string hal = PickGemm(base);
     const Geom g = GeomOf(hal);
-    std::vector<hrx_buffer_ref_t> b = {TRef(*t), Ref(heads ? *rotbuf_ : in), Ref(*hidden_), Ref(*wstage_), Ref(*ostage_),
-                                       Ref(*hidden2_)};
-    const std::size_t M = t->dims[1];
-    const std::uint32_t tt = Trim(b, 1, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 4}, g);
-    Dispatch(Exe(hal), "yah_ffn_gemm_mq4_kres", MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, {hidden2_}));
+    auto b = GemmWeights(*t, f);
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_, partial_}) b.push_back(Ref(*x));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {partial_}));
+    const std::size_t n = std::size_t{B_} * kHidden;
+    Dispatch(Exe("accum.hal"), "yah_residual_1d", static_cast<std::uint32_t>(n / 256), 1, 1, 256, 1, 1,
+             {Ref(*hidden_), {partial_->handle, 0, n * 4}, Ref(*hidden2_)});
     std::swap(hidden_, hidden2_);
   }
 
-  void RunAttention(std::uint32_t l, std::uint32_t ci, const std::string& pre, const KvHook& hook) {
+  void RunAttention(std::uint32_t l, std::uint32_t ci, const std::string& pre, const KvHook& hook, bool q_af, bool k_af,
+                    bool v_af) {
     const std::uint32_t ai = l / cfg_.full_attention_interval;
     if (ai >= full_) throw LoomError("full-attention layer index past the KV slot count");
+    // an afrag o-projection reads the attention output fragment-major (wmma_t)
+    const bool o_af = Af("gemm_kres", pre + "attn_output.weight");
     // nqw: all three wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_) gate_'s
     // reader since the last barrier (that tail's pnq, row by row) finished each token tile before it reaches kqg:
     // kqg's outputs untracked too
     iu4_wait_ = std::exchange(nq_cnt_, {});
     iu4_untrack_ = std::exchange(dn_chained_, false) && iu4_wait_.buffer ? 0b11000 : 0;
-    RunKqg(pre + "attn_q.weight");
+    const bool qg_fused = RunKqg(pre + "attn_q.weight", q_af);
     iu4_untrack_ = 0;
+    if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
+    if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
     // ropew: k / v flagged (per-token-tile counters), RoPE polls them instead of a graph barrier. Not when RoPE ends
     // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
     const bool rw = ropew_ && qnorm_ && n_ == B_ && tail_ != kNoRows;
     if (rw) kv_cnt_[0] = FlagSlot(), kv_cnt_[1] = FlagSlot();
-    kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, rw ? &kv_cnt_[0] : nullptr);
-    kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
+    kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
+    kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
     iu4_wait_ = {}, iu4_untrack_ = 0;
+    if (!qg_fused)
+      Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
     const std::size_t koff = kv16_scratch_ ? 0 : std::size_t{ai} * kv_cache_ * 2;
     const std::size_t voff = kv16_scratch_ ? kv16_layer_ : std::size_t{full_} * kv_cache_ * 2 + koff;
     const hrx_buffer_ref_t kpool_l{kpool_->handle, std::size_t{ai} * pool_bytes_, pool_bytes_};
@@ -1218,7 +1419,7 @@ class LoomPrefill {
         b.push_back({eps_->handle, 0, 4});
       }
       if (fps) b.push_back(Ref(*fsel_));
-      const std::string ah = std::string("wmma") + (ci ? "_c" + std::to_string(ci) : std::string()) + ".hal";
+      const std::string ah = std::string(o_af ? "wmma_t" : "wmma") + (ci ? "_c" + std::to_string(ci) : std::string()) + ".hal";
       const auto ag = geom_.find(ah);
       const std::uint32_t tpw = ag != geom_.end() ? ag->second.tokens : attn_tpw_,
                           hpw = ag != geom_.end() ? ag->second.rowgrp : attn_hpw_;
@@ -1229,12 +1430,12 @@ class LoomPrefill {
                b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
     }
     trim_row_ = tail_;
-    RunResidual(pre + "attn_output.weight", *scratch_);
+    RunResidual(pre + "attn_output.weight", *scratch_, o_af);
     trim_row_ = kAllRows;
   }
 
 
-  void RunDeltaNet(std::uint32_t l, const std::string& pre) {
+  void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
     const std::uint32_t si = l - l / cfg_.full_attention_interval;
     const bool dn_chained = std::exchange(dn_chained_, false);   // the last DeltaNet tail ran chained (dnring)
     // alpha / beta first: they read the norm's row-major copy (21 MB), which the qkv / gate GEMMs would evict from the
@@ -1254,8 +1455,8 @@ class LoomPrefill {
     const bool gate_late = geom_.count("dnvconv") != 0;
     if (dnov_ && gate_late) qkv_cnt = FlagSlot();
     qkv_waited = iu4_wait_.buffer && iu4_untrack_;
-    qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_cnt.buffer ? &qkv_cnt : nullptr);
-    if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_);
+    qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
+    if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
     iu4_wait_ = {}, iu4_untrack_ = 0;
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
@@ -1273,7 +1474,7 @@ class LoomPrefill {
                 Ref(*ab_), Ref(*valid_)},
                0b1100000);
     };
-    if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {
+    if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {    } else if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {
       // dispatch.txt "dnvconv <conv workgroups>": the conv takes only the q / k heads; DeltaNet computes the v channels'
       // conv and alpha / beta itself (gen_gdn_chunk vconv), and prep_ab only advances the conv ring, after both parts
       // (they read the ring before token 0)
@@ -1315,7 +1516,7 @@ class LoomPrefill {
       // slowed it about as much, but gained less than the GEMM's whole tail and the conv's wait.
       if (gate_late) {
         if (dnov_) gate_cnt = FlagSlot();
-        gate_flagged = RunKstore(pre + "attn_gate.weight", *gate_, gate_cnt.buffer ? &gate_cnt : nullptr);
+        gate_flagged = RunKstore(pre + "attn_gate.weight", *gate_, gate_af, gate_cnt.buffer ? &gate_cnt : nullptr);
       }
       dn_done = true;
     } else {
@@ -1346,10 +1547,12 @@ class LoomPrefill {
       if (dn_done) ring();
       return;
     }
+    // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
+    const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
     const hrx_buffer_ref_t gate{gate_->handle, 0, std::size_t{B_} * kInner * 4};
     // dispatch.txt "dnperm": the DeltaNet parts run head sets (gen_rot.pn_heads) into compact outputs, which only the
     // pnq kernels read
-    const bool pnq = a4_ && dnsplit_a_ && geom_.count("pnq_a.hal");
+    const bool pnq = a4_ && dnsplit_a_ && !out_af && geom_.count("pnq_a.hal");
     if (pnq != (geom_.count("dnperm") != 0)) throw LoomError("the A4 pnq postnorm and dnperm go together");
     if (dn_done && !pnq) throw LoomError("dispatch.txt dnvconv needs the pnq postnorm");
     if (pnq) {
@@ -1406,22 +1609,23 @@ class LoomPrefill {
       if (gate_flagged) std::swap(aq_, aq2_), std::swap(ad_, ad2_);
       if (dn_done && !chained) ring();
       trim_row_ = tail_;
-      RunResidual(pre + "ssm_out.weight", *scratch_, true, chained ? &pq_cnt : nullptr);
+      RunResidual(pre + "ssm_out.weight", *scratch_, false, true, chained ? &pq_cnt : nullptr);
       trim_row_ = kAllRows;
       dn_chained_ = chained;
       return;
     }
     if (dnsplit_a_) {
-      Dispatch(Exe("postnorm_a.hal"), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1,
+      const std::string pn = out_af ? "postnorm_t" : "postnorm";
+      Dispatch(Exe(pn + "_a.hal"), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1,
                {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
-      Dispatch(Exe("postnorm_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1,
+      Dispatch(Exe(pn + "_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1,
                {Ref(*raw2_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
     } else {
-      Dispatch(Exe("postnorm.hal"), "yah_ssm_postnorm_fp16", 6 * B_, 1, 1, 256, 1, 1,
+      Dispatch(Exe(out_af ? "postnorm_t.hal" : "postnorm.hal"), "yah_ssm_postnorm_fp16", 6 * B_, 1, 1, 256, 1, 1,
                {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
     }
     trim_row_ = tail_;
-    RunResidual(pre + "ssm_out.weight", *scratch_);
+    RunResidual(pre + "ssm_out.weight", *scratch_, out_af);
     trim_row_ = kAllRows;
   }
 
@@ -1483,6 +1687,7 @@ class LoomPrefill {
   hrx_buffer_ref_t ptab_ref_{};
   std::vector<std::uint32_t> host_ids_;  // Embed's staging
   // MQ4 sets ("rot"): the rotation signs (gen_rot.signs) and ssm_out's input in HF head order
+  bool rot_ = false;
   LoomBuffer *rot_signs_ = nullptr, *rotbuf_ = nullptr;
   // A4 sets (dispatch.txt "a4"): int4 activations (B_ x kFfn / 2 bytes) and their scales (one per 128) for the iu4 GEMMs
   bool a4_ = false, nqov_ = false, dnov_ = false;
@@ -1519,15 +1724,18 @@ class LoomPrefill {
   hrx_buffer_ref_t nq_cnt_{};
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
   std::size_t flag_slot_ = 0;
+  LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
+             *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
              *gate_ = nullptr, *alpha_ = nullptr, *beta_ = nullptr, *q_ = nullptr, *q16_ = nullptr, *kbuf_ = nullptr,
              *vbuf_ = nullptr, *raw_ = nullptr, *raw2_ = nullptr, *conv_out_ = nullptr, *kqbuf_ = nullptr, *ab_ = nullptr,
              *conv_state_ = nullptr, *state_ = nullptr, *kv16_ = nullptr, *kc32_ = nullptr, *vc32_ = nullptr,
              *lse_ = nullptr, *eps_ = nullptr, *ffnup_ = nullptr, *gateffn_ = nullptr, *uwstage_ = nullptr,
-             *wstage_ = nullptr, *ostage_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
+             *wstage_ = nullptr, *ostage_ = nullptr, *partial_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
              *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr, *noans_ = nullptr, *qr16_ = nullptr,
-             *kdeq_ = nullptr, *vdeq_ = nullptr, *ids_ = nullptr;
+             *kdeq_ = nullptr, *vdeq_ = nullptr, *ids_ = nullptr,
+             *normt_ = nullptr;
   std::int64_t keep_rows_ = kAllRows, tail_ = kAllRows, trim_row_ = kAllRows;
   bool answer_ = false;
 };

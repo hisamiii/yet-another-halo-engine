@@ -6,6 +6,8 @@
 // permuted from GGUF order here. The tensor layout matches the
 // HFQ's where the sets depend on it: a layer's ffn_up starts ffn_gate's bytes plus the HFQ's f16 gate awq after it
 // (the NPU FFN block's image reads gate through up rows in one view, at that stride).
+// Native (a set from emit_prefill_pp.py YAH_NATIVE=1, which runs the GGUF's own formats unrotated): the projections
+// keep their bytes, without awq, ssm_out in GGUF order and ffn_up right after ffn_gate; token_embd still becomes Q8_0.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -64,7 +66,7 @@ bool IsProjection(const TensorInfo& t) {
   return std::any_of(std::begin(kSites), std::end(kSites), [&](const char* s) { return site == s; });
 }
 
-std::vector<Item> Plan(const Gguf& src, std::uint64_t* total) {
+std::vector<Item> Plan(const Gguf& src, std::uint64_t* total, bool native) {
   std::map<std::string, const TensorInfo*> by_name;
   for (const auto& t : src.tensors()) by_name[t.name] = &t;
   std::vector<Item> items;
@@ -93,6 +95,7 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total) {
       throw std::runtime_error(std::string("gguf: tensor type ") + TypeName(t.type) + " of " + t.name +
                                " is not supported (F32, F16, BF16, Q4_0 .. Q8_0, Q2_K .. Q6_K, IQ2_XXS, IQ2_XS, "
                                "IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS are)");
+    if (native) return add(&t, t.name, t.dims, t.type, Kind::kCopy);
     add(&t, t.name, t.dims, GgmlType::kMQ4G256, t.type == GgmlType::kMQ4G256 ? Kind::kCopy : Kind::kMq4);
     items.back().heads = t.name.ends_with(".ssm_out.weight") && items.back().kind == Kind::kMq4;
     if (awq && t.name != "output.weight") awq_of(t);
@@ -106,7 +109,9 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total) {
                           ? by_name.find(t.name.substr(0, t.name.size() - 15) + "ffn_up.weight")
                           : by_name.end();
       projection(t, up == by_name.end());
-      if (up != by_name.end()) {
+      if (up != by_name.end() && native) {
+        projection(*up->second, false);
+      } else if (up != by_name.end()) {
         off += (t.dims[0] * 2 + 255) / 256 * 256;  // where the HFQ keeps the f16 gate awq
         projection(*up->second, true);
         awq_of(t);
@@ -125,10 +130,10 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total) {
 
 }  // namespace
 
-Gguf Gguf::OpenConverted(const std::string& path, bool weights, bool lock) {
+Gguf Gguf::OpenConverted(const std::string& path, bool weights, bool lock, bool native) {
   Gguf src = Open(path);
   std::uint64_t total = 0;
-  std::vector<Item> items = Plan(src, &total);
+  std::vector<Item> items = Plan(src, &total, native);
   const Heads heads = HeadsOf(src);
   for (const Item& it : items)
     if (it.heads && (!heads.dim || it.dst.dims[0] != std::uint64_t{heads.value} * heads.dim))
@@ -162,7 +167,10 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights, bool lock) {
     convert = convert || it.kind == Kind::kMq4 || it.kind == Kind::kQ8_0;
   }
   const auto t0 = std::chrono::steady_clock::now();
-  if (convert) std::fprintf(stderr, "gguf: %s: converting the weights to MQ4 for the GPU kernels\n", path.c_str());
+  if (convert)
+    std::fprintf(stderr, "gguf: %s: %s\n", path.c_str(),
+                 native ? "loading the weights natively (token_embd to Q8_0)"
+                        : "converting the weights to MQ4 for the GPU kernels");
   std::atomic<std::size_t> next{0};
   std::atomic<std::uint64_t> done{0};
   std::atomic<bool> failed{false};

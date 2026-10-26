@@ -315,12 +315,12 @@ void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
   ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
 }
 
-Gguf Gguf::OpenIndex(const std::string& path) {
-  return IsHfq(path) ? OpenHfq(path, false, false) : OpenConverted(path, false, false);
+Gguf Gguf::OpenIndex(const std::string& path, bool native) {
+  return IsHfq(path) ? OpenHfq(path, false, false) : OpenConverted(path, false, false, native);
 }
 
-Gguf Gguf::OpenResident(const std::string& path) {
-  return IsHfq(path) ? OpenHfq(path, true) : OpenConverted(path, true, true);
+Gguf Gguf::OpenResident(const std::string& path, bool native) {
+  return IsHfq(path) ? OpenHfq(path, true) : OpenConverted(path, true, true, native);
 }
 
 }  // namespace yah::core
