@@ -1312,8 +1312,15 @@ class LoomNpuSplit : public NpuSplit {
     const bool chunk = fresh_;
     const bool repeat = chunk && plan_.dcol && npu_.Epoch() == prev_epoch_ && SameJobs(jobs, prev_jobs_);
     if (chunk) prev_epoch_ = npu_.Epoch(), prev_jobs_ = jobs;
-    const bool replay = repeat && !script_.commands.empty() && SameJobs(jobs, script_jobs_);
-    const bool record = repeat && !replay && !no_script_;
+    // a job kLayersPerCommand or more layers after the one before (a native set's sparse NPU layers): its command is
+    // submitted once the GPU stored its ready word, else the NPU's wait for it can outlast the gate's poll supply
+    const auto far = [&](std::size_t i) {
+      return jobs[i].layer >= (i ? jobs[i - 1].layer : 0) + kLayersPerCommand;
+    };
+    bool gaps = false;
+    for (std::size_t i = 0; i < jobs.size(); ++i) gaps = gaps || far(i);
+    const bool replay = repeat && !gaps && !script_.commands.empty() && SameJobs(jobs, script_jobs_);
+    const bool record = repeat && !gaps && !replay && !no_script_;
     try {
       npu_.CheckHealth();
       if (Word(kFlagStatus)) throw LoomError("npu: a GPU wait for the NPU failed");
@@ -1334,7 +1341,7 @@ class LoomNpuSplit : public NpuSplit {
         for (std::size_t i = queued + command.size(); i < jobs.size() && command.size() < per; ++i) {
           if (!command.empty() && calls + jobs[i].calls.size() > kCallsPerCommand) break;
           // the NPU waits for the GPU between jobs: a command over many layers can outlast the 2000 ms limit
-          if (!command.empty() && jobs[i].layer >= jobs[queued].layer + kLayersPerCommand) break;
+          if (!command.empty() && (jobs[i].layer >= jobs[queued].layer + kLayersPerCommand || far(i))) break;
           LoomNpu::GatedJob g;
           for (const std::uint32_t id : jobs[i].calls) g.calls.push_back(&calls_.at(id));
           g.done = static_cast<volatile std::uint32_t*>(flags_.host) + jobs[i].words.done;
@@ -1344,6 +1351,7 @@ class LoomNpuSplit : public NpuSplit {
           command.push_back(std::move(g));
         }
         const std::size_t n = command.size();
+        if (far(queued)) WaitReady(jobs[queued].words);
         npu_.EnqueueGated(std::move(command), fresh_);
         fresh_ = false;
         queued += n;
@@ -1366,6 +1374,15 @@ class LoomNpuSplit : public NpuSplit {
       for (std::size_t i = queued; i < jobs.size(); ++i)
         HostStore(jobs[i].words.done, jobs[i].words.gate | kGateFailed);
       throw;
+    }
+  }
+  // Until the GPU stored the job's ready word (a failed GPU wait, or 10 s: a failure).
+  void WaitReady(const Job& w) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (HostLoad(w.ready) != w.gate) {
+      if (Word(kFlagStatus) || std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10))
+        throw LoomError("npu: the GPU never released a job (ready word " + std::to_string(w.ready) + ")");
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
   }
   // One line per job tag (jobs, calls), then the commands (LoomNpu::CommandStats).
