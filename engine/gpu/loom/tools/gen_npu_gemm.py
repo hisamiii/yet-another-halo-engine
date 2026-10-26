@@ -71,11 +71,8 @@ class Config:
     hpass: int = 0        # H as [M block][pass hpass][16-token slab][128 k-blocks] (the FFN block's swiglu output, down's
                           # input): swiglu (cols = hpass): column c writes pass c; ain "h": records [M block][pass, slab]
     swcol: int = 0        # swiglu dcol 2: raw rows between columns' first gate rows (0: TN / 2)
-    gord: str = "P4"      # dcol 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural)
-    hord: str = ""        # swiglu: H in the down decoder's k-block order: "P4" ((0, 2, 1, 3) per 4 k-blocks: IQ4_XS's
-                          # and the P4 grid decoders'), "Q4K" ((0, 4, 1, 5, 2, 6, 3, 7) per 8: Q4_K's; a call's 4 gate
-                          # k-blocks (one format) are then slabs 32 rows apart, the caller steps call j's rows by
-                          # 64 (j / 2) + 16 (j % 2)), "": natural
+    hord: str = ""        # swiglu: H in the down decoder's k-block order: "P4" ((0, 2, 1, 3) per 4 k-blocks: IQ4_XS's),
+                          # "": natural
     ufmt: str = ""        # swiglu dcol 2 column pairs (cols 6): columns 0-2 compute gate rows (fmt), 3-5 the same features'
                           # up rows (ufmt); gate tail u streams its C segment (bf16) to up tail u + 3 (core stream)
     fuse: int = 0       # 1: every GEMM core fills its own weight panel slice at each replay group's first firing
@@ -153,12 +150,11 @@ GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
 _LEAVES = {}
 
 
-def decoder(fmt, gord="P4"):
-    """gen_npu_dec for fmt (its constants follow DQ_FMT and DQ_GORD at import)."""
+def decoder(fmt):
+    """gen_npu_dec for fmt (its constants follow DQ_FMT at import)."""
     import gen_npu_dec
-    if gen_npu_dec.FMT != fmt or os.environ.get("DQ_GORD", "P4") != gord:
+    if gen_npu_dec.FMT != fmt:
         os.environ["DQ_FMT"] = fmt
-        os.environ["DQ_GORD"] = gord
         gen_npu_dec = importlib.reload(gen_npu_dec)
     return gen_npu_dec
 
@@ -499,7 +495,7 @@ def array_program(L, cfg):
         if cfg.dcol:
             e(f"  constrain.fill %chw{c}_0, %chf{c}")
     if cfg.rawdma and cfg.fuse == 2:   # each filler's raw ring in its W ring (fuse_raw_ring), records [16 rows][RECROW bytes]
-        D = decoder(cfg.fmt, cfg.gord)
+        D = decoder(cfg.fmt)
         e(f"  %firows = constant.u32 16 : reg<aie2p.array.scalar : index>")
         e(f"  %fipitch = constant.u32 {D.RECROW} : reg<aie2p.array.scalar : index>")
         for c in range(cols):
@@ -655,7 +651,7 @@ def fill_inputs(e, cfg, panel):
         cmap = fill_map(cfg)[0]
         for c in range(cfg.cols):
             f, j, fmt = cmap[c]
-            D = decoder(fmt, cfg.gord)
+            D = decoder(fmt)
             RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * D.BLK // 4   # row stride in words
             RW = D.ROWB // 4                                  # record row words (fixed for every format)
             if cfg.ufmt:   # gate column u / up column u: rows swcol u .. of its own binding
@@ -667,7 +663,7 @@ def fill_inputs(e, cfg, panel):
                 assert cfg.dgu % 4 == 0 and NS_ % 2 == 0
                 e(f"  %fo{c} = constant.u64 {c * (cfg.swcol or TN // 2) * RS * 4} : reg<aie2p.array.offset : offset>")
                 e(f"  %fi_all{c} = sender %rwb, 0 : reg<aie2p.array.sender : tile<{P_}x2x{NS_ // 2}x16x{RW}xi32, "
-                  f"#encoding.layout.strided<strides=[{D.BLK}, {cfg.dgu // 4}, {(32 if cfg.hord == 'Q4K' else 16) * RS}, "
+                  f"#encoding.layout.strided<strides=[{D.BLK}, {cfg.dgu // 4}, {16 * RS}, "
                   f"{RS}, 1]>>>")
             else:
                 e(f"  %fo{c} = constant.u64 {c * TN * RS * 4} : reg<aie2p.array.offset : offset>")
@@ -913,14 +909,13 @@ def fuse_record(cfg, cov):
 
 
 FUSE_SB = 4   # fuse 2: super-blocks per row of a unit (a pass: 1024 k)
-FUSE_FMTS = ("IQ4_XS", "MQ4", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K")   # fuse 2 decoders (cfg.fmt, in
-# cfg.gord's k-block order; program and data memory decide which fit an image: gen_npu_dec sizes)
+FUSE_FMTS = ("IQ4_XS", "MQ4")   # fuse 2 decoders (cfg.fmt; program and data memory decide which fit an image)
 
 
 def fuse_blk(cfg):
     """fuse 2: bytes per super-block of cfg.fmt."""
     assert cfg.fmt in FUSE_FMTS, cfg.fmt
-    return decoder(cfg.fmt, cfg.gord).BLK
+    return decoder(cfg.fmt).BLK
 
 
 def fuse_unit_raw(cfg):
@@ -990,12 +985,11 @@ def fuse_channels(e, cfg, panel):
     elif cfg.fuse == 2:   # raw rows [N][kraw / 256][136]: per column, per (pass, slab) unit [16 rows][4 super-blocks]
         BLK = fuse_blk(cfg)
         RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * BLK // 4   # row stride in words
-        if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on; Q4K:
-            # its 2 slabs 32 rows apart (fuse_rows)
-            assert cfg.dgu % 4 == 0 and NP % 2 == 0 and cfg.hord in ("", "P4", "Q4K")
+        if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on
+            assert cfg.dgu % 4 == 0 and NP % 2 == 0 and cfg.hord in ("", "P4")
             e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x2x{NP // 2}x16x{uw // 16}xi32, "
               f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {cfg.dgu // 4}, "
-              f"{(32 if cfg.hord == 'Q4K' else 16) * RS}, {RS}, 1]>>>")
+              f"{16 * RS}, {RS}, 1]>>>")
         else:
             e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x{NP}x16x{uw // 16}xi32, "
               f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {16 * RS}, {RS}, 1]>>>")
@@ -1016,9 +1010,8 @@ def fuse_channels(e, cfg, panel):
             RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * fuse_blk(cc) // 4
             e(f"  %fro{c} = constant.u64 {c // 2 * cfg.swcol * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all{c % 2}, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
-        elif cfg.fuse == 2:   # column c: rows TN c .. (swiglu: gate rows swcol c ..; Q4K: 64 (c / 2) + 16 (c % 2) ..)
-            r0 = (64 * (c // 2) + 16 * (c % 2) if cfg.swiglu and cfg.hord == "Q4K" else
-                  c * (cfg.swcol if cfg.swiglu else TN))
+        elif cfg.fuse == 2:   # column c: rows TN c .. (swiglu: gate rows swcol c ..)
+            r0 = c * (cfg.swcol if cfg.swiglu else TN)
             e(f"  %fro{c} = constant.u64 {r0 * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
         else:
@@ -1351,7 +1344,7 @@ def fuse_raw_ring(cfg, cov):
 
 def fuse_scratch(cfg, cov):
     """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt)
     _, _, _, nsb = fuse_span(cfg, cov)
     ring = 2 * NP * slab(cfg.ks[cov[-1]]) - 2047   # (the scratch starts at the ring's first 2048-aligned byte)
     if cfg.rawdma:
@@ -1388,7 +1381,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     until this panel's drain, which starts after the last record). Unit index and count live in private storage
     (the decoder needs every register)."""
     e = L.append
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt)
     hrow = cov[0] if helper == "H" else None           # (the helper's row, listed first: the filler copies its records)
     K = (helper or "").startswith("K")
     dcov = tuple(j for j in cov if j != hrow) if not K else (cov[0],)
@@ -1415,7 +1408,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     e("^fzdq(%fzN: reg<aie2p.er>):")
     e("  %fzpD = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  st %fzN, %fzpD, 12")                       # the units left
-    tonce = not (D.GRID or D.Q3K) and (helper != "M" or bool(cfg.htab))
+    tonce = helper != "M" or bool(cfg.htab)
     if tonce:                                       # the decoder's table: built by the fill's first unit
         e("  %fzT0 = mova.i32 0")
         e("  %fzTs = mov.address-to-scalar %fzpD")
@@ -3002,8 +2995,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
             V1, V2 = "reg<aie2p.vec256>", "reg<aie2p.vec256 x2>"
             M1, M2, M4 = "reg<aie2p.mbms>", "reg<aie2p.mbms x2>", "reg<aie2p.mbms x4>"
             ER = "reg<aie2p.er>"
-            if unit:   # push u = 2 mp + (t's place in DFR_T): (j, i, r) = (u >> 2, u >> 1 & 1, u & 1), in P4 / Q4K order
-                # (one format: both per two slabs): slab i, half j, the gate block at 1024 (mp & 1) + 256 (mp >> 1) +
+            if unit:   # push u = 2 mp + (t's place in DFR_T): (j, i, r) = (u >> 2, u >> 1 & 1, u & 1), in P4 order
+                # (per two slabs): slab i, half j, the gate block at 1024 (mp & 1) + 256 (mp >> 1) +
                 # 512 r + 512 (jloop's gate block address)
                 assert cfg.hord and NP == 4 and not pair
                 e(f"  {p}ua = and %mp, %one")
@@ -3178,17 +3171,13 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False, helpe
                 for j in range(lo, hi) if not one else ():
                     for i in range(2):
                         # gate rows: slab j, half i (sub-tiles at 256 i, 512 + 256 i); up: NP / 2 slabs on. The record
-                        # takes the 8-feature blocks 2 j + i in loop order; P4 (and Q4K's 4 gate k-blocks of one
-                        # format, its slabs 32 rows apart): per two slabs blocks 0, 2, 1, 3, so (j, i) stand for slab
-                        # (j & ~1) | i, half j & 1; Q4K over 4 slabs (pairs): blocks 0, 4, 1, 5, 2, 6, 3, 7, slab
-                        # (j >> 1) + 2 i, half j & 1 (2 slab: the slab offsets take half the step)
+                        # takes the 8-feature blocks 2 j + i in loop order; P4: per two slabs blocks 0, 2, 1, 3, so
+                        # (j, i) stand for slab (j & ~1) | i, half j & 1
                         qq = f"{q}u{j}{i}"
-                        jj, ii, jstep = j, i, 1
-                        if cfg.hord == "Q4K" and pair:
-                            jj, ii, jstep = (j & ~1) + 4 * i, j & 1, 2
-                        elif cfg.hord:
+                        jj, ii = j, i
+                        if cfg.hord:
                             jj, ii = (j & ~1) + i, j & 1
-                        go = 1024 // jstep * jj + 256 * ii + 512
+                        go = 1024 * jj + 256 * ii + 512
                         e(f"  {qq}gk = mov.i32 {go}")
                         e(f"  {qq}gib = add.rr {p}ss, {qq}gk")
                         if pair:   # the slab is up (up tail) or gate (gate tail) rows; the gate buffer's block (j, i):
@@ -3565,9 +3554,6 @@ def gen(cfg):
     if cfg.swiglu:
         L.append(silu_rodata())
     if cfg.fuse:   # every worker's leaf, once (worker_leaf)
-        if cfg.fuse == 2:   # the inlined decoders' tables (grid formats)
-            for cc in [cfg] + ([colcfg(cfg, 1)] if fpair(cfg) else []):
-                L.extend(decoder(cc.fmt, cc.gord).inline_rodata(dec_tag(cc)))
         seen = set()
         used = {worker_leaf(cfg, c, r)[0] for c in range(cfg.cols) for r in range(len(cfg.ks))}
         for c in [-1] + list(range(cfg.cols)):   # (-1: an ordinary column first: head, mid, mid_l, tail)
@@ -3595,9 +3581,9 @@ def gen(cfg):
     if cfg.dcol:
         for n, fmt in sorted(set(fill_map(cfg)[1])):
             if cfg.dcol == 2:
-                key = (fmt, cfg.gord, n, fill_name(cfg, n, fmt))
+                key = (fmt, n, fill_name(cfg, n, fmt))
                 if key not in _LEAVES:   # scheduled in Python (gen_npu_dec, npu_lsched): once per process
-                    _LEAVES[key] = decoder(fmt, cfg.gord).leaf(fill_name(cfg, n, fmt), n)
+                    _LEAVES[key] = decoder(fmt).leaf(fill_name(cfg, n, fmt), n)
                 L.append(_LEAVES[key])
                 L.append("")
             else:
