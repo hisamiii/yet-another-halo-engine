@@ -231,6 +231,7 @@ python3 engine/release/bundle.py pack yah-<version>-gfx1151       # checks it is
 | `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `--rowstats` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |
 | `engine/tests/m0_gate.sh <model> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
 | `engine/tests/generate_gate.sh <model> [set]` | 20 greedy tokens equal the reference | after any change, cheap |
+| `engine/tests/npu_gate.py <model> <prefill set> [down pack]` | the NPU FFN block runs and matches the GPU alone on a pp4096 pair schedule: top-1 and KL of the last 64 positions, the last chunk's hidden states (loose: catches a hang, a fallback or wrong NPU output; ~25 s) | NPU, prefill or HRX changes |
 
 `hal_run` (`engine/build/hal_run`) dispatches one HAL once with bindings from model tensors or files and writes outputs to files. It refuses any binding smaller than the size you declare. The checkers use it; use it for any new kernel oracle.
 
