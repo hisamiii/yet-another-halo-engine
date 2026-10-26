@@ -79,7 +79,8 @@ HS = 512                       # half regions now hold only the scale-path tempo
 STATE, KVS = HR + 2 * HS, HR + 2 * HS + 64
 SCR_B = KVS + (128 if Q5 else 64)   # storage A (2048-aligned: the table)
 GAS, PARTSS, GT2 = 0, 4096, 5120
-QHS = GT2 + 8192 + 64           # Q5_K: the qh fields [record][group][half][chunk][row][8 B]
+# Q5_K: one table copy (8 KB: its gathers take the bank-clash stall); the qh fields [record][group][half][chunk][row][8 B]
+QHS = GT2 + 64
 # storage B (gather addresses, T parts, the table's second copy (not the grid formats': theirs is rodata); +64: gathers
 # read a + 32)
 SCR2_B = QHS + 2048 if Q5 else GT2 + (0 if GRID else 2048) + 64
@@ -387,7 +388,8 @@ def leaf(name="dec", nports=1):
             e(f"{h1} = slice {r_}[1] : {V2} -> {V1}")
             # two copies in different banks (storages A and B): a gather (vldb.4x32) costs one stall cycle unless its
             # address lanes 0 / 2 and 1 / 3 hit different banks (measured, gbench.py) -> lanes 4 q + 2, 4 q + 3 use copy 2
-            for pg in (pa_, pb_) if m is None else (P(e, b_, o_ + 128 * m) for b_, o_ in (("%spa", GT), ("%spb", GT2))):
+            pgs = (pa_, pb_) if m is None else [P(e, b_, o_ + 128 * m) for b_, o_ in (("%spa", GT), ("%spb", GT2))]
+            for pg in pgs[:1] if Q5 else pgs:
                 for blk, hv_ in ((0, h0), (1, h1)):
                     for half in range(2):
                         e(f"vst.256.i16x16 {hv_}, {pg}, {64 * blk + 32 * half}")
@@ -1140,54 +1142,61 @@ def leaf(name="dec", nports=1):
         e(f"%hq = add.rr %jin, {k(16)}")             # (704 B rows: every row's realignment is the same)
         e(f"%hsh = and %hq, {k(63)}")
         e(f"%hal = and %hq, {k(-64)}")
-        hstreams = []
-        for hh in range(2):
-            vs = []
-            for r in range(4):                      # rows r, r + 4: loaded and merged (butterfly stage 1) in one stream
-                x = e.stream()
-                hstreams.append(x)
-                hd2 = []
-                for row in (8 * hh + r, 8 * hh + r + 4):
-                    hp, ha, hb, hq, hs1, hd = (x.t(n) for n in ("hp", "ha", "hb", "hq", "hs", "hd"))
-                    x(f"{hp} = add.rr %hal, {k(ROWB * row)}" if row else f"{hp} = or %hal, {k(0)}")
-                    ph = Pr(x, hp)
-                    x(f"{ha} = vlda.512.i8x64 {ph}, 0")
-                    x(f"{hb} = vlda.512.i8x64 {ph}, 64")
-                    x(f"{hq} = vshift {ha}, {hb}, %hsh")
-                    x(f"{hs1} = slice {hq}[0] : {V2} -> {V1}")
-                    x(f"{hd} = concat({hs1}, {hs1}) : ({V1}, {V1}) -> {V2}")   # [qh | qh]
-                    hd2.append(hd)
-                a_ = x.t("tq")
-                x(f"{a_} = vshuffle {hd2[0]}, {hd2[1]}, {k(14)}")
-                vs.append(a_)
+        hh_, _ = loop_begin("ql", 2)               # per half (rolled: program memory)
+        e(f"%qlo = mul {hh_}, {k(8 * ROWB)}")
+        e("%qla = add.rr %hal, %qlo")
+        e(f"%qlq = mul {hh_}, {k(256)}")
+        e(f"%qlb = add.rr %spb, {k(QHS)}")
+        e("%qlc = add.rr %qlb, %qlq")
+        hstreams, vs = [], []
+        for r in range(4):                          # rows r, r + 4: loaded and merged (butterfly stage 1) in one stream
             x = e.stream()
             hstreams.append(x)
-            for d in (2, 1):                        # (stage 1's outputs 4-7 hold the rows' second halves: pruned)
-                out = list(vs)
-                for i in range(4):
-                    jj = i ^ d
-                    if i < jj:
-                        a_, b_ = x.t("tq"), x.t("tq")
-                        x(f"{a_} = vshuffle {vs[i]}, {vs[jj]}, {k(14)}")
-                        x(f"{b_} = vshuffle {vs[i]}, {vs[jj]}, {k(15)}")
-                        out[i], out[jj] = a_, b_
-                vs = out
-            mc = x.t("hc")
-            x(f"{mc} = vbcst.8 {k(0xC0)}")
-            ts, n_ = list(vs[:4]), 0
-            for r_s, q_s in ((1, 1), (1, 0), (0, 1), (0, 0)):
-                pq = P(x, "%spb", QHS + 1024 * r_s + 512 * q_s + 256 * hh)
-                while n_ < 6 - 4 * r_s - 2 * q_s:
-                    for c in range(4):
-                        d_ = x.t("hd")
-                        x(f"{d_} = vadd.8 {ts[c]}, {ts[c]}")
-                        ts[c] = d_
-                    n_ += 1
+            hd2 = []
+            for row in (r, r + 4):
+                hp, ha, hb, hq, hs1, hd = (x.t(n) for n in ("hp", "ha", "hb", "hq", "hs", "hd"))
+                x(f"{hp} = add.rr %qla, {k(ROWB * row)}" if row else f"{hp} = or %qla, {k(0)}")
+                ph = Pr(x, hp)
+                x(f"{ha} = vlda.512.i8x64 {ph}, 0")
+                x(f"{hb} = vlda.512.i8x64 {ph}, 64")
+                x(f"{hq} = vshift {ha}, {hb}, %hsh")
+                x(f"{hs1} = slice {hq}[0] : {V2} -> {V1}")
+                x(f"{hd} = concat({hs1}, {hs1}) : ({V1}, {V1}) -> {V2}")   # [qh | qh]
+                hd2.append(hd)
+            a_ = x.t("tq")
+            x(f"{a_} = vshuffle {hd2[0]}, {hd2[1]}, {k(14)}")
+            vs.append(a_)
+        x = e.stream()
+        hstreams.append(x)
+        for d in (2, 1):                            # (stage 1's outputs 4-7 hold the rows' second halves: pruned)
+            out = list(vs)
+            for i in range(4):
+                jj = i ^ d
+                if i < jj:
+                    a_, b_ = x.t("tq"), x.t("tq")
+                    x(f"{a_} = vshuffle {vs[i]}, {vs[jj]}, {k(14)}")
+                    x(f"{b_} = vshuffle {vs[i]}, {vs[jj]}, {k(15)}")
+                    out[i], out[jj] = a_, b_
+            vs = out
+        # record r, group q: bits s, s + 1 (s = 4 r + 2 q) to bits 6, 7 by 6 - s doublings, masked; at
+        # QHS + 1024 r + 512 q + 256 h + 64 c
+        mc = x.t("hc")
+        x(f"{mc} = vbcst.8 {k(0xC0)}")
+        ts, n_ = list(vs[:4]), 0
+        for r_s, q_s in ((1, 1), (1, 0), (0, 1), (0, 0)):
+            pq = P(x, "%qlc", 1024 * r_s + 512 * q_s)
+            while n_ < 6 - 4 * r_s - 2 * q_s:
                 for c in range(4):
-                    m_ = x.t("hm")
-                    x(f"{m_} = vband {ts[c]}, {mc}")
-                    x(f"vst.512.i8x64 {m_}, {pq}, {64 * c}")
+                    d_ = x.t("hd")
+                    x(f"{d_} = vadd.8 {ts[c]}, {ts[c]}")
+                    ts[c] = d_
+                n_ += 1
+            for c in range(4):
+                m_ = x.t("hm")
+                x(f"{m_} = vband {ts[c]}, {mc}")
+                x(f"vst.512.i8x64 {m_}, {pq}, {64 * c}")
         run(hstreams, 2)
+        loop_end("ql")
     r_, (rp0,) = loop_begin("rl", rn or 2, [("%pp0", "reg<aie2p.ep>")], start=rs)
     # -- record r: qs rows of both halves realigned (vshift) and transposed for chunks 8 r .. 8 r + 7, then their 64
     # gather addresses each (GT + 8 b = (b + (GT >> 3)) << 3) at GAS + 1024 (local sub-block) + 512 h + 256 cc
@@ -1568,7 +1577,7 @@ def leaf(name="dec", nports=1):
         e("%gtv1 = vbcst.32 %spa")
         e(f"%gt2s = add.rr %spb, {k(GT2)}")
         e("%gtv2 = vbcst.32 %gt2s")
-        e(f"%gtv = vshuffle %gtv1, %gtv2, {k(14)}" if os.environ.get("DQ_GT2", "1") == "1" else "%gtv = vbor %gtv1, %gtv1")   # u32 lanes A A B B ...
+        e(f"%gtv = vshuffle %gtv1, %gtv2, {k(14)}" if os.environ.get("DQ_GT2", "1") == "1" and not Q5 else "%gtv = vbor %gtv1, %gtv1")   # u32 lanes A A B B ...
         for q in range(4):
             e(f"%gta{q} = vmov.vector512.to.accumulator512 %gtv")
         e(f"%gtacc = concat(%gta0, %gta1, %gta2, %gta3) : ({M1}, {M1}, {M1}, {M1}) -> {M4}")
@@ -1639,7 +1648,7 @@ def leaf(name="dec", nports=1):
                     q1 = x.t("ga")
                     x(f"{q1} = slice {a_}[{q2}] : {M4} -> {M1}")
                     x(f"vst.acc {q1}, {pg}, {256 * (i % 2) + 64 * q2 - 512}")
-        run(qstreams, int(os.environ.get("DQ_QWIN", "2" if Q5 else "6")))   # (Q5_K: + 64 qh lanes a stream)
+        run(qstreams, int(os.environ.get("DQ_QWIN", "6")))
     e(f"%qp0a = add.rr %spb, {k(GAS + 512)}")           # GA of local sub-block 0, +512 (offsets -512 .. 448)
     e("%qp0 = mov.scalar-to-address %qp0a")
     rq = "%qp0"
