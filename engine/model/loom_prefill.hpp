@@ -271,10 +271,10 @@ class LoomPrefill {
           for (std::size_t i = 0; i < jobs.size(); ++i) std::fprintf(stderr, "npu cpu-driven: job %zu %s\n", i, jobs[i].tag.c_str());
         std::vector<NpuSplit::Queued> kept;
         std::size_t a = 0, b = 0;
-        for (int n = 0; std::sscanf(r, "%zu-%zu%n", &a, &b, &n) == 2 && a <= b && b < jobs.size(); r += n) {
+        for (int n = 0; std::sscanf(r, "%zu-%zu%n", &a, &b, &n) == 2 && a <= b && b < jobs.size(); ++r) {
           kept.insert(kept.end(), jobs.begin() + a, jobs.begin() + b + 1);
-          if (r[n] != ',') break;
-          ++r;
+          r += n;
+          if (*r != ',') break;
         }
         jobs.swap(kept);
         for (const auto& q : jobs) std::fprintf(stderr, "npu cpu-driven: keep %s gate %08x\n", q.tag.c_str(), q.words.gate);
