@@ -159,7 +159,11 @@ int main(int argc, char** argv) {
     LoomDevice gpu;
     // The layers queue ~950 dispatches and wait once: the runtime wait would busy-poll a host core the whole time.
     gpu.SetSleepSync(200);
-    LoomWeights weights(gpu, gguf);
+    // a native set's prefill reads neither the MTP layer nor token_embd's device copy (Embed stages its rows)
+    const std::string mtp = "blk." + std::to_string(cfg.main_block_count()) + ".";
+    LoomWeights weights(gpu, gguf, [&](const std::string& n) {
+      return native && (n == "token_embd.weight" || n.starts_with(mtp));
+    });
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
     if (opt.pairs) pf.EnablePairs();
 #ifdef YAH_WITH_NPU

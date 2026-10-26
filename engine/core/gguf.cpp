@@ -165,6 +165,8 @@ Gguf& Gguf::operator=(Gguf&& other) noexcept {
     data_offset_ = other.data_offset_;
     tensors_ = std::move(other.tensors_);
     meta_ = std::move(other.meta_);
+    fill_ = std::move(other.fill_);
+    rows_ = std::move(other.rows_);
     other.base_ = nullptr;
     other.size_ = 0;
     other.map_bytes_ = 0;
@@ -317,6 +319,12 @@ void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
 
 Gguf Gguf::OpenIndex(const std::string& path, bool native) {
   return IsHfq(path) ? OpenHfq(path, false, false) : OpenConverted(path, false, false, native);
+}
+
+void Gguf::Rows(const TensorInfo& t, const std::uint32_t* rows, std::size_t n, std::uint8_t* out) const {
+  if (rows_ && rows_(t, rows, n, out)) return;
+  const std::size_t rb = t.bytes / (t.elements / t.dims[0]);
+  for (std::size_t i = 0; i < n; ++i) std::memcpy(out + i * rb, Data(t) + std::size_t{rows[i]} * rb, rb);
 }
 
 Gguf Gguf::OpenResident(const std::string& path, bool native) {

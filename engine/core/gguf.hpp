@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -107,6 +108,14 @@ class Gguf {
   // Drops the host pages wholly inside [offset, offset + bytes) of the tensor-data region, once a device holds its own
   // copy: Data() then reads zeros (resident) or the file again (mapped) there.
   void ReleaseData(std::size_t offset, std::size_t bytes);
+  // Before a device copies [offset, offset + bytes) of the tensor-data region: a native resident copy is filled range
+  // by range in offset order (OpenResident native), so the host never holds all of it; otherwise nothing to do.
+  void Prepare(std::size_t offset, std::size_t bytes) {
+    if (fill_) fill_(offset, bytes);
+  }
+  // Rows of a 2-D tensor (as tensors() describes it) into out, rows[i] at i: from the copy, or for a native resident
+  // copy's tensor no device took (never Prepared) straight from the file.
+  void Rows(const TensorInfo& t, const std::uint32_t* rows, std::size_t n, std::uint8_t* out) const;
 
  private:
   Gguf() = default;
@@ -126,6 +135,9 @@ class Gguf {
   std::uint64_t data_offset_{0};
   std::vector<TensorInfo> tensors_;
   std::map<std::string, MetadataValue> meta_;
+  std::function<void(std::size_t, std::size_t)> fill_;   // Prepare's filler (a native resident copy)
+  // Rows' reader for a native resident copy: (tensor, rows, n, out), false if the tensor is filled (read the copy)
+  std::function<bool(const TensorInfo&, const std::uint32_t*, std::size_t, std::uint8_t*)> rows_;
 };
 
 }  // namespace yah::core

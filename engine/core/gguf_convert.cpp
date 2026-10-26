@@ -18,7 +18,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -131,129 +133,188 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total, bool native) {
 }  // namespace
 
 Gguf Gguf::OpenConverted(const std::string& path, bool weights, bool lock, bool native) {
-  Gguf src = Open(path);
+  // the converter's state: the source mapping and its jobs (row ranges of about 32 MB of f32 rows), in copy order
+  struct Job {
+    const Item* item;
+    std::uint64_t r0, r1;
+  };
+  struct State {
+    Gguf src;
+    std::vector<Item> items;
+    Heads heads;
+    std::vector<Job> jobs;
+    std::uint8_t* base = nullptr;
+    std::size_t next = 0;   // a lazy fill: jobs [0, next) are done
+  };
+  auto st = std::make_shared<State>();
+  st->src = Open(path);
   std::uint64_t total = 0;
-  std::vector<Item> items = Plan(src, &total, native);
-  const Heads heads = HeadsOf(src);
-  for (const Item& it : items)
-    if (it.heads && (!heads.dim || it.dst.dims[0] != std::uint64_t{heads.value} * heads.dim))
+  st->items = Plan(st->src, &total, native);
+  st->heads = HeadsOf(st->src);
+  for (const Item& it : st->items)
+    if (it.heads && (!st->heads.dim || it.dst.dims[0] != std::uint64_t{st->heads.value} * st->heads.dim))
       throw std::runtime_error("gguf: " + it.dst.name + " does not match the ssm head metadata");
   Gguf g;
   g.version_ = 3;
   g.data_offset_ = 0;
   g.size_ = total;
-  g.meta_ = src.meta_;
-  for (const Item& it : items) g.tensors_.push_back(it.dst);
+  g.meta_ = st->src.meta_;
+  for (const Item& it : st->items) g.tensors_.push_back(it.dst);
   if (!weights) return g;
 
   constexpr std::size_t kHuge = std::size_t{2} << 20;
   const std::size_t bytes = (total + kHuge - 1) & ~(kHuge - 1);
   g.base_ = Reserve(bytes, path), g.map_bytes_ = bytes;
-  ::madvise(src.base_, src.size_, MADV_SEQUENTIAL);
-
-  // jobs: row ranges of about 32 MB of f32 rows
-  struct Job {
-    const Item* item;
-    std::uint64_t r0, r1;
-  };
-  std::vector<Job> jobs;
-  std::uint64_t work = 0;
+  st->base = g.base_;
+  ::madvise(st->src.base_, st->src.size_, MADV_SEQUENTIAL);
   bool convert = false;
-  for (const Item& it : items) {
+  for (const Item& it : st->items) {
     const std::uint64_t k = it.dst.dims[0], rows = it.dst.elements / k;
     const std::uint64_t step = std::max<std::uint64_t>(1, (std::uint64_t{8} << 20) / k);
-    for (std::uint64_t r = 0; r < rows; r += step) jobs.push_back({&it, r, std::min(rows, r + step)});
-    work += it.dst.bytes;
+    for (std::uint64_t r = 0; r < rows; r += step) st->jobs.push_back({&it, r, std::min(rows, r + step)});
     convert = convert || it.kind == Kind::kMq4 || it.kind == Kind::kQ8_0;
+  }
+  // jobs [j0, j1) on every core; progress: one line rewritten on a terminal, a line per quarter in a log
+  const auto run = [](State& s, std::size_t j0, std::size_t j1, bool progress) {
+    std::uint64_t work = 0;
+    for (std::size_t i = j0; i < j1; ++i) {
+      const TensorInfo& d = s.jobs[i].item->dst;
+      work += (s.jobs[i].r1 - s.jobs[i].r0) * d.dims[0] / BlockElements(d.type) * BlockBytes(d.type);
+    }
+    std::atomic<std::size_t> next{j0};
+    std::atomic<std::uint64_t> done{0};
+    std::atomic<bool> failed{false};
+    std::string failure;
+    const auto worker = [&] {
+      std::vector<float> buf, row;
+      try {
+        for (std::size_t i; !failed && (i = next.fetch_add(1)) < j1;) {
+          const Job& j = s.jobs[i];
+          const TensorInfo& d = j.item->dst;
+          const std::uint64_t k = d.dims[0], n = (j.r1 - j.r0) * k;
+          std::uint8_t* out = s.base + d.offset + j.r0 * k / BlockElements(d.type) * BlockBytes(d.type);
+          const std::uint8_t* in = nullptr;
+          if (j.item->src) {
+            const TensorInfo& t = *j.item->src;
+            in = s.src.Data(t) + j.r0 * k / BlockElements(t.type) * BlockBytes(t.type);
+          }
+          switch (j.item->kind) {
+            case Kind::kCopy:
+              std::memcpy(out, in, n / BlockElements(d.type) * BlockBytes(d.type));
+              break;
+            case Kind::kOnes:
+              std::fill_n(reinterpret_cast<float*>(out), n, 1.0F);
+              break;
+            case Kind::kF32:
+              Dequantize(j.item->src->type, in, reinterpret_cast<float*>(out), n);
+              break;
+            case Kind::kQ8_0:
+            case Kind::kMq4:
+              buf.resize(n);
+              Dequantize(j.item->src->type, in, buf.data(), n);
+              if (j.item->kind == Kind::kQ8_0) {
+                QuantizeQ8_0(buf.data(), n, out);
+              } else {
+                if (j.item->heads) {
+                  row.resize(k);
+                  for (std::uint64_t r = 0; r < j.r1 - j.r0; ++r) {
+                    float* x = buf.data() + r * k;
+                    for (std::uint32_t h = 0; h < s.heads.value; ++h)
+                      std::memcpy(row.data() + std::size_t{s.heads.Hf(h)} * s.heads.dim,
+                                  x + std::size_t{h} * s.heads.dim, s.heads.dim * 4);
+                    std::memcpy(x, row.data(), k * 4);
+                  }
+                }
+                for (std::uint64_t r = 0; r < j.r1 - j.r0; ++r)
+                  QuantizeMq4Row(buf.data() + r * k, k, out + r * k / 256 * 136);
+              }
+              break;
+          }
+          done += n / BlockElements(d.type) * BlockBytes(d.type);
+          if (in) {
+            // the source pages are read once: drop them as we go (a GGUF and its converted copy may not both fit)
+            const std::size_t len = n / BlockElements(j.item->src->type) * BlockBytes(j.item->src->type);
+            const auto lo = (reinterpret_cast<std::uintptr_t>(in) + 4095) & ~std::uintptr_t{4095};
+            const auto hi = (reinterpret_cast<std::uintptr_t>(in) + len) & ~std::uintptr_t{4095};
+            if (hi > lo) {
+              ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
+              ::posix_fadvise(s.src.fd_, static_cast<off_t>(lo - reinterpret_cast<std::uintptr_t>(s.src.base_)),
+                              static_cast<off_t>(hi - lo), POSIX_FADV_DONTNEED);
+            }
+          }
+        }
+      } catch (const std::exception& e) {
+        if (!failed.exchange(true)) failure = e.what();
+      }
+    };
+    std::vector<std::thread> pool;
+    const unsigned threads = std::max(1U, std::thread::hardware_concurrency());
+    for (unsigned i = 0; i < threads; ++i) pool.emplace_back(worker);
+    const bool tty = ::isatty(2) != 0;
+    for (int pct = -1; progress;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      const int now = static_cast<int>(done * 100 / std::max<std::uint64_t>(1, work));
+      if (tty && now != pct) std::fprintf(stderr, "\rgguf: converting, %d%%", pct = now);
+      if (!tty && now / 25 != pct / 25 && now < 100) std::fprintf(stderr, "gguf: converting, %d%%\n", pct = now);
+      if (done == work || failed) break;
+    }
+    for (auto& th : pool) th.join();
+    if (failed) {
+      if (progress && tty) std::fprintf(stderr, "\n");
+      throw std::runtime_error(failure);
+    }
+    return tty;
+  };
+  if (native) {
+    // filled range by range as the device upload reads it (Prepare), each range's host pages dropped after (the
+    // uploader's ReleaseData): the host never holds the whole copy next to the device's
+    std::fprintf(stderr, "gguf: %s: loading the weights natively (token_embd to Q8_0)\n", path.c_str());
+    for (std::size_t i = 1; i < st->jobs.size(); ++i)
+      if (st->jobs[i].item->dst.offset < st->jobs[i - 1].item->dst.offset)
+        throw std::runtime_error("gguf: the native copy's tensors are out of order");
+    // rows from the source (Rows: a tensor the device skipped, never filled)
+    g.rows_ = [st](const TensorInfo& t, const std::uint32_t* rows, std::size_t n, std::uint8_t* out) {
+      const Item* it = nullptr;
+      for (const Item& i : st->items)
+        if (i.dst.name == t.name) it = &i;
+      if (!it || !it->src) return false;
+      const TensorInfo& s = *it->src;
+      const std::uint64_t k = s.dims[0];
+      const std::size_t sb = k / BlockElements(s.type) * BlockBytes(s.type), db = k / BlockElements(t.type) * BlockBytes(t.type);
+      std::vector<float> buf(k);
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t* in = st->src.Data(s) + std::size_t{rows[i]} * sb;
+        if (it->kind == Kind::kCopy) {
+          std::memcpy(out + i * db, in, db);
+        } else if (it->kind == Kind::kQ8_0) {
+          Dequantize(s.type, in, buf.data(), k);
+          QuantizeQ8_0(buf.data(), k, out + i * db);
+        } else {
+          throw std::runtime_error("gguf: Rows of " + t.name + " from the source: not a copy or Q8_0 item");
+        }
+      }
+      return true;
+    };
+    // the jobs overlapping the range run; those wholly before it are skipped (tensors the device does not take)
+    g.fill_ = [st, run](std::size_t offset, std::size_t len) {
+      const auto range = [&](const Job& j) {
+        const TensorInfo& d = j.item->dst;
+        const std::uint64_t rb = d.dims[0] / BlockElements(d.type) * BlockBytes(d.type);
+        return std::pair{d.offset + j.r0 * rb, d.offset + j.r1 * rb};
+      };
+      std::size_t j0 = st->next;
+      while (j0 < st->jobs.size() && range(st->jobs[j0]).second <= offset) ++j0;
+      std::size_t j1 = j0;
+      while (j1 < st->jobs.size() && range(st->jobs[j1]).first < offset + len) ++j1;
+      if (j1 > j0) run(*st, j0, j1, false);
+      st->next = j1;
+    };
+    return g;
   }
   const auto t0 = std::chrono::steady_clock::now();
   if (convert)
-    std::fprintf(stderr, "gguf: %s: %s\n", path.c_str(),
-                 native ? "loading the weights natively (token_embd to Q8_0)"
-                        : "converting the weights to MQ4 for the GPU kernels");
-  std::atomic<std::size_t> next{0};
-  std::atomic<std::uint64_t> done{0};
-  std::atomic<bool> failed{false};
-  std::string failure;
-  const auto run = [&] {
-    std::vector<float> buf, row;
-    try {
-      for (std::size_t i; !failed && (i = next.fetch_add(1)) < jobs.size();) {
-        const Job& j = jobs[i];
-        const TensorInfo& d = j.item->dst;
-        const std::uint64_t k = d.dims[0], n = (j.r1 - j.r0) * k;
-        std::uint8_t* out = g.base_ + d.offset + j.r0 * k / BlockElements(d.type) * BlockBytes(d.type);
-        const std::uint8_t* in = nullptr;
-        if (j.item->src) {
-          const TensorInfo& s = *j.item->src;
-          in = src.Data(s) + j.r0 * k / BlockElements(s.type) * BlockBytes(s.type);
-        }
-        switch (j.item->kind) {
-          case Kind::kCopy:
-            std::memcpy(out, in, n / BlockElements(d.type) * BlockBytes(d.type));
-            break;
-          case Kind::kOnes:
-            std::fill_n(reinterpret_cast<float*>(out), n, 1.0F);
-            break;
-          case Kind::kF32:
-            Dequantize(j.item->src->type, in, reinterpret_cast<float*>(out), n);
-            break;
-          case Kind::kQ8_0:
-          case Kind::kMq4:
-            buf.resize(n);
-            Dequantize(j.item->src->type, in, buf.data(), n);
-            if (j.item->kind == Kind::kQ8_0) {
-              QuantizeQ8_0(buf.data(), n, out);
-            } else {
-              if (j.item->heads) {
-                row.resize(k);
-                for (std::uint64_t r = 0; r < j.r1 - j.r0; ++r) {
-                  float* x = buf.data() + r * k;
-                  for (std::uint32_t i = 0; i < heads.value; ++i)
-                    std::memcpy(row.data() + std::size_t{heads.Hf(i)} * heads.dim, x + std::size_t{i} * heads.dim,
-                                heads.dim * 4);
-                  std::memcpy(x, row.data(), k * 4);
-                }
-              }
-              for (std::uint64_t r = 0; r < j.r1 - j.r0; ++r)
-                QuantizeMq4Row(buf.data() + r * k, k, out + r * k / 256 * 136);
-            }
-            break;
-        }
-        done += n / BlockElements(d.type) * BlockBytes(d.type);
-        if (in) {
-          // the source pages are read once: drop them as we go (a GGUF and its converted copy may not both fit)
-          const std::size_t len = n / BlockElements(j.item->src->type) * BlockBytes(j.item->src->type);
-          const auto lo = (reinterpret_cast<std::uintptr_t>(in) + 4095) & ~std::uintptr_t{4095};
-          const auto hi = (reinterpret_cast<std::uintptr_t>(in) + len) & ~std::uintptr_t{4095};
-          if (hi > lo) {
-            ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
-            ::posix_fadvise(src.fd_, static_cast<off_t>(lo - reinterpret_cast<std::uintptr_t>(src.base_)),
-                            static_cast<off_t>(hi - lo), POSIX_FADV_DONTNEED);
-          }
-        }
-      }
-    } catch (const std::exception& e) {
-      if (!failed.exchange(true)) failure = e.what();
-    }
-  };
-  std::vector<std::thread> pool;
-  const unsigned threads = std::max(1U, std::thread::hardware_concurrency());
-  for (unsigned i = 0; i < threads; ++i) pool.emplace_back(run);
-  // progress: one line rewritten on a terminal, a line per quarter in a log
-  const bool tty = ::isatty(2) != 0;
-  for (int pct = -1; convert;) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    const int now = static_cast<int>(done * 100 / std::max<std::uint64_t>(1, work));
-    if (tty && now != pct) std::fprintf(stderr, "\rgguf: converting, %d%%", pct = now);
-    if (!tty && now / 25 != pct / 25 && now < 100) std::fprintf(stderr, "gguf: converting, %d%%\n", pct = now);
-    if (done == work || failed) break;
-  }
-  for (auto& th : pool) th.join();
-  if (failed) {
-    if (convert && tty) std::fprintf(stderr, "\n");
-    throw std::runtime_error(failure);
-  }
+    std::fprintf(stderr, "gguf: %s: converting the weights to MQ4 for the GPU kernels\n", path.c_str());
+  const bool tty = run(*st, 0, st->jobs.size(), convert);
   if (convert)
     std::fprintf(stderr, "%sgguf: converted in %.1f s\n", tty ? "\r" : "",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());

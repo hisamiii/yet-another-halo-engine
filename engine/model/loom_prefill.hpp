@@ -84,7 +84,7 @@ class LoomPrefill {
     if (pairs_) return;
     pairs_ = true;
     other_ = {&Alloc(std::size_t{B_} * kHidden * 4), &Alloc(std::size_t{B_} * kHidden * 4), &Alloc(std::size_t{B_} * 4),
-              &Alloc(4)};
+              &Alloc(4), embed_rows_ ? &Alloc(host_rows_[0].size()) : nullptr};
     // a chained DeltaNet tail leaves its outputs to the next layer of its chunk untracked: the other chunk's layer
     // runs between them here
     dnring_ = false;
@@ -96,7 +96,7 @@ class LoomPrefill {
     FlushKres();
     std::swap(hidden_, other_.hidden), std::swap(hidden2_, other_.hidden2), std::swap(ids_, other_.ids);
     std::swap(valid_, other_.valid), std::swap(n_, other_.n), std::swap(keep_rows_, other_.keep);
-    std::swap(answer_, other_.answer);
+    std::swap(answer_, other_.answer), std::swap(embed_rows_, other_.rows);
     par_ = p;
   }
 
@@ -151,6 +151,14 @@ class LoomPrefill {
       host_ids_[t] = ids[std::min(t, n - 1)];
       if (host_ids_[t] >= kVocab)
         throw LoomError("token id " + std::to_string(host_ids_[t]) + " is outside the vocabulary");
+    }
+    if (embed_rows_) {   // token_embd stays on the host: the chunk's rows staged, the embed reads row t for token t
+      // (the slot's staging is rewritten once its last copy landed: the GPU a whole chunk behind the host waits here)
+      std::vector<std::uint8_t>& rows = host_rows_[par_];
+      LoomDevice::WaitFor(rows_copied_[par_]);
+      gguf_.Rows(*Find("token_embd.weight"), host_ids_.data(), B_, rows.data());
+      rows_copied_[par_] = gpu_.StreamH2D(*embed_rows_, rows.data(), rows.size());
+      for (std::uint32_t t = 0; t < B_; ++t) host_ids_[t] = t;
     }
     gpu_.Update(*ids_, host_ids_.data(), host_ids_.size() * 4);
     const std::int32_t valid = static_cast<std::int32_t>(n);
@@ -215,7 +223,7 @@ class LoomPrefill {
     for (std::uint32_t p = 0; p < 2; ++p) {
       SelectChunk(p);
       Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
-               {TRef(*Find("token_embd.weight")), Ref(*ids_), Ref(*hidden_)}, 4);
+               {EmbedTable(), Ref(*ids_), Ref(*hidden_)}, 4);
     }
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l)
       for (std::uint32_t p = 0; p < 2; ++p) {
@@ -257,7 +265,7 @@ class LoomPrefill {
   void RecordLayers(std::uint32_t ci, const KvHook& hook) {
     flag_slot_ = 0;
     Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
-             {TRef(*Find("token_embd.weight")), Ref(*ids_), Ref(*hidden_)}, 4);
+             {EmbedTable(), Ref(*ids_), Ref(*hidden_)}, 4);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) RecordLayer(l, ci, hook);
     JoinFfn();
   }
@@ -634,6 +642,10 @@ class LoomPrefill {
     noans_ = &Alloc(4);
     ids_ = &Alloc(B * 4);
     host_ids_.resize(B);
+    if (const core::TensorInfo& e = *Find("token_embd.weight"); !weights_.Has(e)) {
+      for (auto& r : host_rows_) r.resize(std::size_t{B} * (e.bytes / e.dims[1]));
+      embed_rows_ = &Alloc(host_rows_[0].size());
+    }
     const float epsv = 1.0e-6f;
     gpu_.H2D(*eps_, &epsv, 4);
     Zero(*conv_state_);
@@ -1678,7 +1690,7 @@ class LoomPrefill {
   // pairs (EnablePairs): the other chunk's buffers and state (SelectChunk swaps them in), the selected chunk, and each
   // chunk's FFN block job to join before its next layer (kNoJoin: none)
   struct ChunkState {
-    LoomBuffer *hidden = nullptr, *hidden2 = nullptr, *ids = nullptr, *valid = nullptr;
+    LoomBuffer *hidden = nullptr, *hidden2 = nullptr, *ids = nullptr, *valid = nullptr, *rows = nullptr;
     std::uint32_t n = 0;
     std::int64_t keep = -1;
     bool answer = false;
@@ -1698,6 +1710,11 @@ class LoomPrefill {
               vqs_bytes_ = 0, pool_bytes_ = 0;
   hrx_buffer_ref_t ptab_ref_{};
   std::vector<std::uint32_t> host_ids_;  // Embed's staging
+  // token_embd off the device (LoomWeights skip): the chunk's rows, staged by Embed (per chunk of a pair)
+  LoomBuffer* embed_rows_ = nullptr;
+  std::vector<std::uint8_t> host_rows_[2];       // per chunk of a pair (par_)
+  hrx_timeline_point_t rows_copied_[2] = {};     // when each one's last copy landed
+  hrx_buffer_ref_t EmbedTable() const { return embed_rows_ ? Ref(*embed_rows_) : TRef(*Find("token_embd.weight")); }
   // MQ4 sets ("rot"): the rotation signs (gen_rot.signs) and ssm_out's input in HF head order
   bool rot_ = false;
   LoomBuffer *rot_signs_ = nullptr, *rotbuf_ = nullptr;

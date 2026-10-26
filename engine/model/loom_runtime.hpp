@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -244,6 +245,17 @@ class LoomDevice {
   void Update(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
     Order();
     LoomCheck(hrx_stream_update_buffer(stream_, host, bytes, buffer.handle, offset), "hrx_stream_update_buffer");
+  }
+  // host into buffer after the stream's prior work; host stays unmodified until the returned point (WaitFor)
+  hrx_timeline_point_t StreamH2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
+    Order();
+    LoomCheck(hrx_stream_copy_h2d(stream_, host, buffer.handle, offset, bytes), "hrx_stream_copy_h2d");
+    hrx_timeline_point_t p{};
+    LoomCheck(hrx_stream_get_timeline_position(stream_, &p), "hrx_stream_get_timeline_position");
+    return p;
+  }
+  static void WaitFor(const hrx_timeline_point_t& p) {
+    if (p.semaphore) LoomCheck(hrx_semaphore_wait(p.semaphore, p.value, UINT64_MAX), "hrx_semaphore_wait");
   }
   void H2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
     LoomCheck(hrx_synchronous_h2d(device_, host, buffer.handle, offset, bytes), "hrx_synchronous_h2d");
@@ -511,13 +523,18 @@ class LoomGraph {
 // the GPU reads imported host pages snooped, ~6% more GEMM cycles.
 class LoomWeights {
  public:
-  LoomWeights(LoomDevice& gpu, core::Gguf& gguf) {
+  // skip: tensors the device never reads (not uploaded; Has() false, Ref() refuses them).
+  LoomWeights(LoomDevice& gpu, core::Gguf& gguf, const std::function<bool(const std::string&)>& skip = {}) {
     constexpr size_t kChunk = size_t{1} << 30;
     constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
     // (begin, end, glued): a layer's ffn_gate, its awq, ffn_up and its awq stay in one buffer (the NPU FFN block reads
     // a gate row through its up row in one view, LoomPrefill::RunFfnBlock)
     std::vector<std::tuple<size_t, size_t, bool>> spans;
     for (const auto& t : gguf.tensors()) {
+      if (skip && skip(t.name)) {
+        skipped_.push_back(t.name);
+        continue;
+      }
       const bool glued = t.name.ends_with("ffn_gate.awq") || t.name.ends_with("ffn_up.weight") ||
                          t.name.ends_with("ffn_up.awq");
       spans.emplace_back(t.offset, t.offset + t.bytes, glued);
@@ -529,34 +546,41 @@ class LoomWeights {
       for (++i; i < spans.size() && (std::get<1>(spans[i]) - begin <= kChunk || std::get<2>(spans[i])); ++i)
         end = std::max(end, std::get<1>(spans[i]));
       LoomBuffer buffer = gpu.Allocate(end - begin + kPad);
+      gguf.Prepare(begin, end - begin);
       gpu.H2D(buffer, gguf.tensor_data_base() + begin, end - begin);
       gguf.ReleaseData(begin, end - begin);
-      chunks_.push_back({begin, std::move(buffer)});
+      chunks_.push_back({begin, end, std::move(buffer)});
     }
   }
+  [[nodiscard]] bool Has(const core::TensorInfo& t) const {
+    return std::find(skipped_.begin(), skipped_.end(), t.name) == skipped_.end();
+  }
   [[nodiscard]] hrx_buffer_ref_t Ref(const core::TensorInfo& t) const {
-    const size_t off = static_cast<size_t>(t.offset);
-    const auto it = std::upper_bound(chunks_.begin(), chunks_.end(), off,
-                                     [](size_t o, const Chunk& c) { return o < c.begin; }) - 1;
-    return {it->buffer.handle, off - it->begin, static_cast<size_t>(t.bytes)};
+    const Chunk& c = ChunkHolding(t);
+    return {c.buffer.handle, static_cast<size_t>(t.offset) - c.begin, static_cast<size_t>(t.bytes)};
   }
   template <typename F>
   void ForEachBuffer(F&& f) const {
     for (const Chunk& c : chunks_) f(c.buffer.handle);
   }
   // The whole device buffer holding tensor t (the NPU shares it, NpuSplit::ShareGpu).
-  [[nodiscard]] const LoomBuffer& ChunkOf(const core::TensorInfo& t) const {
-    const size_t off = static_cast<size_t>(t.offset);
-    return (std::upper_bound(chunks_.begin(), chunks_.end(), off,
-                             [](size_t o, const Chunk& c) { return o < c.begin; }) - 1)->buffer;
-  }
+  [[nodiscard]] const LoomBuffer& ChunkOf(const core::TensorInfo& t) const { return ChunkHolding(t).buffer; }
 
  private:
   struct Chunk {
-    size_t begin;  // tensor-data offset of the buffer's first byte
+    size_t begin, end;  // the tensor-data range the buffer holds
     LoomBuffer buffer;
   };
+  const Chunk& ChunkHolding(const core::TensorInfo& t) const {
+    const size_t off = static_cast<size_t>(t.offset);
+    const auto it = std::upper_bound(chunks_.begin(), chunks_.end(), off,
+                                     [](size_t o, const Chunk& c) { return o < c.begin; });
+    if (it == chunks_.begin() || off + t.bytes > (it - 1)->end || !Has(t))
+      throw LoomError("weights: " + t.name + " is not on the device");
+    return *(it - 1);
+  }
   std::vector<Chunk> chunks_;
+  std::vector<std::string> skipped_;
 };
 
 }  // namespace yah::model
