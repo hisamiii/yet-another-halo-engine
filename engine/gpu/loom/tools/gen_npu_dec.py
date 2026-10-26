@@ -1503,7 +1503,7 @@ def leaf(name="dec", nports=1):
 
         def rowv(x, nm_, row):
             pa_, va, vb, q = x.t("pa"), x.t("va"), x.t("vb"), x.t("q")
-            x(f"{pa_} = add.rr %q5a{nm_}, {k(ROWB * row)}" if row else f"{pa_} = or %q5a{nm_}, {k(0)}")
+            x(f"{pa_} = add.rr %q5A{nm_}, {k(ROWB * row)}" if row else f"{pa_} = or %q5A{nm_}, {k(0)}")
             pv = Pr(x, pa_)
             x(f"{va} = vlda.512.i8x64 {pv}, 0")
             x(f"{vb} = vlda.512.i8x64 {pv}, 64")
@@ -1534,58 +1534,66 @@ def leaf(name="dec", nports=1):
                 nv = x.t("nv")
                 x(f"{nv} = vshuffle {us[0]}, {us[1]}, {md}")
                 x(f"vst.512.i8x64 {nv}, {pn}, {off}")
-        for hh in range(2):
-            vs = []
-            for r in range(4):                      # qh: rows r, r + 4 as [qh | qh] merged in one stream (butterfly
-                x = e.stream()                      # stage 1's outputs 4-7 would hold the rows' second halves: pruned)
-                qstreams.append(x)
-                hd2 = []
-                for row in (r, r + 4):
-                    hs1, hd = x.t("hs"), x.t("hd")
-                    x(f"{hs1} = slice {rowv(x, 'h', 8 * hh + row)}[0] : {V2} -> {V1}")
-                    x(f"{hd} = concat({hs1}, {hs1}) : ({V1}, {V1}) -> {V2}")
-                    hd2.append(hd)
-                a_ = x.t("tq")
-                x(f"{a_} = vshuffle {hd2[0]}, {hd2[1]}, {k(14)}")
-                vs.append(a_)
+        hv_, _ = loop_begin("q5l", 2)             # the halves in a loop (program memory): half hv_'s rows and NIB
+        e(f"%q5o = mul {hv_}, {k(8 * ROWB)}")
+        for nm_ in ("q", "h"):
+            e(f"%q5A{nm_} = add.rr %q5a{nm_}, %q5o")
+        e(f"%q5m = mul {hv_}, {k(1024)}")
+        e("%q5n = add.rr %spb, %q5m")
+        e(f"%q5u = mul {hv_}, {k(256)}")
+        e("%q5t = add.rr %spb, %q5u")
+        vs = []
+        for r in range(4):                      # qh: rows r, r + 4 as [qh | qh] merged in one stream (butterfly
+            x = e.stream()                      # stage 1's outputs 4-7 would hold the rows' second halves: pruned)
+            qstreams.append(x)
+            hd2 = []
+            for row in (r, r + 4):
+                hs1, hd = x.t("hs"), x.t("hd")
+                x(f"{hs1} = slice {rowv(x, 'h', row)}[0] : {V2} -> {V1}")
+                x(f"{hd} = concat({hs1}, {hs1}) : ({V1}, {V1}) -> {V2}")
+                hd2.append(hd)
+            a_ = x.t("tq")
+            x(f"{a_} = vshuffle {hd2[0]}, {hd2[1]}, {k(14)}")
+            vs.append(a_)
+        x = e.stream()
+        qstreams.append(x)
+        vs = butterfly(x, vs, (2, 1))
+        pt_ = P(x, "%q5t", NIB + 2048 + 512)
+        for c in range(4):
+            unpack(x, vs[c], [(r_, 64 * c - 512)], pt_)
+        rws = []
+        for r in range(8):
             x = e.stream()
             qstreams.append(x)
-            vs = butterfly(x, vs, (2, 1))
-            pt_ = P(x, "%spb", NIB + 2048 + 256 * hh + 512)
-            for c in range(4):
-                unpack(x, vs[c], [(r_, 64 * c - 512)], pt_)
-            rws = []
-            for r in range(8):
-                x = e.stream()
-                qstreams.append(x)
-                rws.append(rowv(x, "q", 8 * hh + r))
-            x = e.stream()
-            qstreams.append(x)
-            vs = butterfly(x, rws, (4, 2, 1))
-            pn = P(x, "%spb", NIB + 1024 * hh + 512)
-            pt_ = P(x, "%spb", NIB + 2048 + 256 * hh + 512)
-            for c in range(8):                      # chunk c = 4 g + kk: sub-blocks jl = 2 g (lo), 2 g + 1 (hi)
-                us = []
-                for hf_ in range(2):
-                    sl_, u_ = x.t("ns"), x.t("nu")
-                    x(f"{sl_} = slice {vs[c]}[{hf_}] : {V2} -> {V1}")
-                    x(f"{u_} = vunpack.u4.to.u8x64 {sl_}")
-                    us.append(u_)
-                nh = x.t("nh")
-                x(f"{nh} = vlda.512.i8x64 {pt_}, {64 * (c % 4) - 512}")
-                for n_, md in enumerate((m0c, m1c)):
-                    jl = 2 * (c // 4) + n_
-                    nv, b2, hm_, v_ = x.t("nv"), x.t("b8"), x.t("hm"), x.t("v")
-                    x(f"{nv} = vshuffle {us[0]}, {us[1]}, {md}")
-                    x(f"{b2} = vbcst.8 {k(1 << jl)}")
-                    x(f"{hm_} = vband {nh}, {b2}")
-                    for _ in range(4 - jl):                 # bit jl -> bit 4
-                        d_ = x.t("hd")
-                        x(f"{d_} = vadd.8 {hm_}, {hm_}")
-                        hm_ = d_
-                    x(f"{v_} = vbor {nv}, {hm_}")
-                    x(f"vst.512.i8x64 {v_}, {pn}, {64 * (4 * jl + c % 4) - 512}")
+            rws.append(rowv(x, "q", r))
+        x = e.stream()
+        qstreams.append(x)
+        vs = butterfly(x, rws, (4, 2, 1))
+        pn = P(x, "%q5n", NIB + 512)
+        pt_ = P(x, "%q5t", NIB + 2048 + 512)
+        for c in range(8):                      # chunk c = 4 g + kk: sub-blocks jl = 2 g (lo), 2 g + 1 (hi)
+            us = []
+            for hf_ in range(2):
+                sl_, u_ = x.t("ns"), x.t("nu")
+                x(f"{sl_} = slice {vs[c]}[{hf_}] : {V2} -> {V1}")
+                x(f"{u_} = vunpack.u4.to.u8x64 {sl_}")
+                us.append(u_)
+            nh = x.t("nh")
+            x(f"{nh} = vlda.512.i8x64 {pt_}, {64 * (c % 4) - 512}")
+            for n_, md in enumerate((m0c, m1c)):
+                jl = 2 * (c // 4) + n_
+                nv, b2, hm_, v_ = x.t("nv"), x.t("b8"), x.t("hm"), x.t("v")
+                x(f"{nv} = vshuffle {us[0]}, {us[1]}, {md}")
+                x(f"{b2} = vbcst.8 {k(1 << jl)}")
+                x(f"{hm_} = vband {nh}, {b2}")
+                for _ in range(4 - jl):                 # bit jl -> bit 4
+                    d_ = x.t("hd")
+                    x(f"{d_} = vadd.8 {hm_}, {hm_}")
+                    hm_ = d_
+                x(f"{v_} = vbor {nv}, {hm_}")
+                x(f"vst.512.i8x64 {v_}, {pn}, {64 * (4 * jl + c % 4) - 512}")
         run(qstreams, int(os.environ.get("DQ_QWIN", "1")))
+        loop_end("q5l")
     else:
         e(f"%r64 = mul {r_}, {k(64)}")
         # 544 = 32 (mod 64): a row's qs realignment depends only on its parity: aligned bases and shifts of rows 0 / 1
