@@ -913,7 +913,7 @@ def fuse_record(cfg, cov):
 
 
 FUSE_SB = 4   # fuse 2: super-blocks per row of a unit (a pass: 1024 k)
-FUSE_FMTS = ("IQ4_XS", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K")   # fuse 2 decoders (cfg.fmt, in
+FUSE_FMTS = ("IQ4_XS", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K", "Q5_K")   # fuse 2 decoders (cfg.fmt, in
 # cfg.gord's k-block order; program and data memory decide which fit an image: gen_npu_dec sizes)
 
 
@@ -1344,9 +1344,10 @@ FZ_RAW_COMPACT = 0, 28992, 21760, 3264   # rawdma, 4 super-blocks a row: one raw
 
 def fuse_raw_ring(cfg, cov):
     """rawdma: (byte offset from the W ring's first 2048-aligned byte, records) of the filler's raw ring: two
-    [16][RECROW] records where the decoder output allows (FZ_RAW), else one (FZ_RAW_COMPACT)."""
+    [16][RECROW] records where the decoder output allows (FZ_RAW, Q5_K's packed layout), else one."""
+    D = decoder(cfg.fmt, cfg.gord)
     sp, in_, sp2, out = fuse_scratch(cfg, cov)
-    return in_, (2 if (sp, in_, sp2, out) == FZ_RAW else 1)
+    return in_, (2 if sp2 - in_ >= 2 * 16 * D.RECROW else 1)
 
 
 def fuse_scratch(cfg, cov):
@@ -1356,17 +1357,23 @@ def fuse_scratch(cfg, cov):
     ring = 2 * NP * slab(cfg.ks[cov[-1]]) - 2047   # (the scratch starts at the ring's first 2048-aligned byte)
     if cfg.rawdma:
         sp, in_, sp2, out = FZ_RAW
-        if out + nsb * 2 * D.OUT_B <= ring:
-            assert sp + D.SCR_B <= in_ and in_ + 2 * 16 * D.RECROW <= sp2 and sp2 + D.SCR2_B <= out
+        if (out + nsb * 2 * D.OUT_B <= ring and sp + D.SCR_B <= in_ and in_ + 2 * 16 * D.RECROW <= sp2
+                and sp2 + D.SCR2_B <= out):
             return FZ_RAW
         sp, in_, sp2, out = FZ_RAW_COMPACT
-        if out + nsb * 2 * D.OUT_B <= sp2 and sp2 + D.SCR2_B <= in_ and in_ + 16 * D.RECROW <= ring:
+        if (out + nsb * 2 * D.OUT_B <= sp2 and sp2 + D.SCR2_B <= in_ and in_ + 16 * D.RECROW <= ring
+                and sp + D.SCR_B <= out):
             return FZ_RAW_COMPACT
+        if D.Q5:   # packed (no tables, 704 B record rows): A, two raw records, B, the output
+            in_ = -(-D.SCR_B // 64) * 64
+            sp2 = in_ + 2 * 16 * D.RECROW
+            out = -(-(sp2 + D.SCR2_B) // 64) * 64
+            if out + nsb * 2 * D.OUT_B <= ring:
+                return sp, in_, sp2, out
         # tight (thelp's short rings): the output, one raw record, then storage B at least 16 KB past A (a bank apart)
-        out = 3264
+        out = max(3264, -(-D.SCR_B // 64) * 64)
         in_ = -(-(out + nsb * 2 * D.OUT_B) // 64) * 64
         sp2 = max(in_ + 16 * D.RECROW, 16384)
-        assert sp + D.SCR_B <= out, (nsb, ring)
         if sp2 + D.SCR2_B > ring:   # (kchain's tail at 20 k-blocks: storage B in private storage, FZ_SP2_OWN)
             assert cfg.kchain and in_ + 16 * D.RECROW <= ring, (nsb, ring)
             sp2 = FZ_SP2_OWN

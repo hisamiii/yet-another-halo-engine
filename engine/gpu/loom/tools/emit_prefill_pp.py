@@ -1117,10 +1117,10 @@ NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
 FUSE_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q4k")
 FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs")   # the fused FFN block's gate / up (NP 4 images:
 # room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream)
-FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k", "q3k")
+FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k", "q3k", "q5k")
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
-             "iq2xs": ("IQ2_XS", "p4")}
+             "iq2xs": ("IQ2_XS", "p4"), "q5k": ("Q5_K", "p4")}
 NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
 # the fused FFN block's gate / up of the formats whose filler cores hold 40 k-block slices (IQ3_S's head A ring does not
 # place): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
@@ -1129,7 +1129,7 @@ NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs"), (40, 40, 40, 8)
 # the fused site and down images of the formats whose four cores each decode one super-block of every unit (gen_npu_gemm
 # kchain), the gate's waiter and relay on tails (gtail: rows 1 decode); the grid formats' helper rings after the A rings
 # (hlate: their tables leave the mids no contiguous A ring otherwise)
-NPU_KCHAIN_FMTS = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs")
+NPU_KCHAIN_FMTS = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "q5k")
 KCHAIN = lambda fmt: dict(kchain=1, hcap=2, gtail=1, hlate=int(fmt in ("iq3s", "iq3xxs"))) if fmt in NPU_KCHAIN_FMTS else {}
 # the decoder-column images' setups run no call (gen_npu_gemm gfirst: the gate waits at a job's first firing), so an
 # image switch inside a command costs no dummy call; dispatch.txt "npugfirst"

@@ -1078,8 +1078,8 @@ class LoomPrefill {
   std::size_t FfnBlkH() const { return std::size_t{B_ / 64} * (FfnBlkF() / 1024) * 4 * 128 * 144; }
   std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
   static int DecoderId(const char* fmt) {
-    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k", "iq2xxs", "iq2xs"};
-    for (int i = 0; i < 7; ++i)
+    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k", "iq2xxs", "iq2xs", "q5k"};
+    for (int i = 0; i < 8; ++i)
       if (std::strcmp(kDecoders[i], fmt) == 0) return i;
     return -1;
   }
@@ -1208,7 +1208,7 @@ class LoomPrefill {
         cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", SwapOf(dn[ci]), DecoderId(fd.name),
                                         {std::size_t{p0} * 4 * 128 * 144, bd.a, true},
                                         base + td->offset + r0 * rbd + k0 * blkd,
-                                        (rows - 1) * rbd + 16 * blkd + kDcolRecordRow,
+                                        (rows - 1) * rbd + 16 * blkd + RecordRow(fd.name),
                                         {doff + (ci * calls + r) * cp, cp}, fam));
       }
     }
@@ -3090,6 +3090,7 @@ class LoomPrefill {
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
   bool npu_dcol_ = false;          // the set's NPU decodes raw weight rows itself (dispatch.txt "npudcol")
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
+  static std::size_t RecordRow(const char* fmt) { return std::strcmp(fmt, "q5k") == 0 ? 704 : kDcolRecordRow; }
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
   std::size_t npu_cleared_ = 0;    // flagged_ jobs whose flag words NpuJoin cleared
   std::size_t npu_joined_ = 0;     // flagged_ jobs an NpuJoin waited for (in order)
