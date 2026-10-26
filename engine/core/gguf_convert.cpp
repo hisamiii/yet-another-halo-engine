@@ -95,7 +95,7 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total, bool native) {
     if (t.dims[0] % 256) throw std::runtime_error("gguf: " + t.name + " rows are not a multiple of 256 long");
     if (!CanDequantize(t.type))
       throw std::runtime_error(std::string("gguf: tensor type ") + TypeName(t.type) + " of " + t.name +
-                               " is not supported (F32, F16, BF16, Q4_0 .. Q8_0, Q2_K .. Q6_K, IQ2_XXS, IQ2_XS, "
+                               " is not supported (F32, F16, BF16, Q4_0 .. Q8_0, Q2_K .. Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, "
                                "IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS are)");
     if (native) return add(&t, t.name, t.dims, t.type, Kind::kCopy);
     add(&t, t.name, t.dims, GgmlType::kMQ4G256, t.type == GgmlType::kMQ4G256 ? Kind::kCopy : Kind::kMq4);

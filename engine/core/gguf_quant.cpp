@@ -203,6 +203,20 @@ void IQ2_XS(const std::uint8_t* b, float* y) {
     }
   }
 }
+void IQ2_S(const std::uint8_t* b, float* y) {
+  const float d = Half(b);
+  const std::uint8_t* qs = b + 2;
+  const std::uint8_t* signs = b + 34;
+  const std::uint8_t* qh = b + 66;
+  const std::uint8_t* sc = b + 74;
+  for (int ib = 0; ib < 8; ++ib, qs += 4, signs += 4) {
+    const float db[2] = {d * (0.5F + (sc[ib] & 0xF)) * 0.25F, d * (0.5F + (sc[ib] >> 4)) * 0.25F};
+    for (int l = 0; l < 4; ++l, y += 8) {
+      const std::uint64_t g = kIq2sGrid[qs[l] | ((qh[ib] << (8 - 2 * l)) & 0x300)];
+      for (int j = 0; j < 8; ++j) y[j] = db[l / 2] * static_cast<float>((g >> 8 * j) & 0xFF) * Sign(signs[l], j);
+    }
+  }
+}
 void IQ3_XXS(const std::uint8_t* b, float* y) {
   const float d = Half(b);
   const std::uint8_t* qs = b + 2;
@@ -258,6 +272,7 @@ Block BlockFn(GgmlType t) {
     case GgmlType::kQ6_K: return Q6_K;
     case GgmlType::kIQ2_XXS: return IQ2_XXS;
     case GgmlType::kIQ2_XS: return IQ2_XS;
+    case GgmlType::kIQ2_S: return IQ2_S;
     case GgmlType::kIQ3_XXS: return IQ3_XXS;
     case GgmlType::kIQ3_S: return IQ3_S;
     case GgmlType::kIQ4_NL: return IQ4_NL;
