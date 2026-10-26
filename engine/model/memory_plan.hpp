@@ -5,7 +5,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -26,10 +25,9 @@ struct MemoryPlan {
   [[nodiscard]] std::uint64_t need() const { return weights + buffers; }
   [[nodiscard]] bool fits() const { return need() + kReserve <= available; }
 
-  // model: the model file; decode_hal: its decode set (context and KV format); npu_down: the NPU's down pack, empty
-  // without the NPU; mtp: drafting with the MTP layer.
-  static MemoryPlan For(const std::string& model, const std::string& decode_hal, const std::string& npu_down,
-                        bool mtp) {
+  // model: the model file; decode_hal: its decode set (context and KV format); npu_set: the prefill set the NPU runs
+  // the FFN block of, empty without the NPU; mtp: drafting with the MTP layer.
+  static MemoryPlan For(const std::string& model, const std::string& decode_hal, const std::string& npu_set, bool mtp) {
     std::ifstream f(decode_hal + "/decode.txt");
     if (!f) throw LoomError("cannot read " + decode_hal + "/decode.txt: not a decode set (tools/emit_decode.py)");
     std::uint32_t context = 0, kb = 16, vb = 16;
@@ -40,11 +38,11 @@ struct MemoryPlan {
       if (key == "ctx") in >> context;
       if (key == "kv") in >> kind >> kb >> vb;
     }
-    return For(model, context, kb, vb, npu_down, mtp);
+    return For(model, context, kb, vb, npu_set, mtp);
   }
   // The same for a context and KV bits (K, V: 16, 8 or 4) before the sets exist.
   static MemoryPlan For(const std::string& model, std::uint32_t context, std::uint32_t kb, std::uint32_t vb,
-                        const std::string& npu_down, bool mtp) {
+                        const std::string& npu_set, bool mtp) {
     MemoryPlan p;
     p.context = context;
     const core::Gguf index = core::Gguf::OpenIndex(model);
@@ -54,10 +52,12 @@ struct MemoryPlan {
     // format's bits plus scales), f32 / f16 attention scratch and the MTP layer's f16 KV.
     const std::uint64_t kv = 16ull * 1024 * (kb + vb) / 8 * 33 / 32;
     p.buffers = kFixed + std::uint64_t{p.context} * (kv + kScratchPerToken + (mtp ? kMtpPerToken : 0));
-    if (!npu_down.empty()) {
-      std::error_code ec;
-      const auto down = std::filesystem::file_size(npu_down, ec);
-      p.buffers += (ec ? 0 : down) + kNpuFixed;
+    if (!npu_set.empty()) {  // the down pack: 64 layers of 5120 IQ4_XS rows over the NPU's F features (npu.txt)
+      std::ifstream n(npu_set + "/npu.txt");
+      std::string key;
+      std::uint64_t F = 0;
+      n >> key >> F;
+      p.buffers += (key == "npuffn" ? 64ull * 5120 * F / 256 * 136 : 0) + kNpuFixed;
     }
     p.available = Available();
     return p;

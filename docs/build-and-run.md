@@ -124,7 +124,7 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids
 ```
 source engine/hrx-env.sh
 engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080] \
-  [--draft mtp [--draft-len N]] [--npu [--npu-down <pack>]] [--no-reuse] [--prefill <set> --decode <set>]
+  [--draft mtp [--draft-len N]] [--npu] [--no-reuse] [--prefill <set> --decode <set>]
 engine/build/yah_server --model <model> --fake    # canned replies, CPU only: for clients and API tests
 ```
 
@@ -136,7 +136,7 @@ Multi-turn chats reuse the cache. The engine keeps the token sequence of the las
 
 Speculative decoding: `--draft mtp` drafts with the model's MTP layer (a GGUF that has it) and verifies the draft and the next token in one pass of the decode set's 4-token GEMVs; every other kernel runs once per token as in a step, so a greedy output is the same token for token as without drafting. A rejected token rolls back the conv rings, the DeltaNet states (one ring slot per verified token) and the open KV tile. The draft length follows the acceptance: each round picks the length with the most expected tokens per ms (from a decayed acceptance rate and the measured round times), down to plain steps where drafting does not pay. `--draft-len N` fixes it. On the Q4_K_M GGUF at 32K kv8 (`spec_engine`): code 15.9 -> 24.3 t/s, a long factual prompt 13.6 -> 22.0, free prose 14.4 -> 13.7 (the acceptance is low there). Sampled requests (temperature > 0) decode without drafts. The request log line carries `accepted=<accepted>/<drafted>`.
 
-The NPU: `--npu` runs the prefill set's FFN block on the XDNA2 NPU (a set with `tools/emit_npu_ffn.py` run on it; its down pack `<prefill>/npu_down.bin` from `tools/npu_down_pack.py`, or `--npu-down`). It needs an unlimited memlock limit and falls back to the GPU alone without what it needs. Long prompts gain (pp8500: +11%); prompts shorter than two chunks do not (the pair schedule needs two).
+The NPU: `--npu` runs the prefill set's FFN block on the XDNA2 NPU (a set with `tools/emit_npu_ffn.py` run on it). Its down rows are packed from the loaded model at start (re-quantized to IQ4_XS, ~3 s, `engine/model/npu_down_pack.hpp`), so the HFQ and a GGUF both work. It needs an unlimited memlock limit and falls back to the GPU alone without what it needs. Long prompts gain (pp8500: +11%); prompts shorter than two chunks do not (the pair schedule needs two).
 
 For quick tests, `engine/build/yah_chat` is a terminal chat client: it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply. Commands: `/reset`, `/effort E`, `/temp T`, `/max N`, `/system TEXT`, `/quit`; Ctrl-C stops a reply.
 
@@ -231,7 +231,7 @@ python3 engine/release/bundle.py pack yah-<version>-gfx1151       # checks it is
 | `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `--rowstats` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |
 | `engine/tests/m0_gate.sh <model> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
 | `engine/tests/generate_gate.sh <model> [set]` | 20 greedy tokens equal the reference | after any change, cheap |
-| `engine/tests/npu_gate.py <model> <prefill set> [down pack]` | the NPU FFN block runs and matches the GPU alone on a pp4096 pair schedule: top-1 and KL of the last 64 positions, the last chunk's hidden states (loose: catches a hang, a fallback or wrong NPU output; ~25 s) | NPU, prefill or HRX changes |
+| `engine/tests/npu_gate.py <model> <prefill set>` | the NPU FFN block runs and matches the GPU alone on a pp4096 pair schedule: top-1 and KL of the last 64 positions, the last chunk's hidden states (loose: catches a hang, a fallback or wrong NPU output; ~25 s) | NPU, prefill or HRX changes |
 
 `hal_run` (`engine/build/hal_run`) dispatches one HAL once with bindings from model tensors or files and writes outputs to files. It refuses any binding smaller than the size you declare. The checkers use it; use it for any new kernel oracle.
 

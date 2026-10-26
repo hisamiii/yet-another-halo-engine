@@ -4,8 +4,8 @@
 // the names, dims, norms (1 + w), DeltaNet head order and metadata the engine expects, but for ssm_out's columns: the
 // engine gathers its input back into HF value-head order (rot_heads), as the HFQ stores ssm_out, so they are
 // permuted from GGUF order here. The tensor layout matches the
-// HFQ's where the sets depend on it: each projection's .awq right after it, and a layer's ffn_up right after
-// ffn_gate's .awq (the NPU FFN block reads gate through up rows in one view).
+// HFQ's where the sets depend on it: a layer's ffn_up starts ffn_gate's bytes plus the HFQ's f16 gate awq after it
+// (the NPU FFN block's image reads gate through up rows in one view, at that stride).
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -81,7 +81,13 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total) {
     off += (it.dst.bytes + 255) / 256 * 256;
     items.push_back(std::move(it));
   };
-  const auto projection = [&](const TensorInfo& t) {
+  const auto awq_of = [&](const TensorInfo& t) {
+    const std::string awq = t.name.substr(0, t.name.size() - 7) + ".awq";
+    const auto it = by_name.find(awq);
+    add(it == by_name.end() ? nullptr : it->second, awq, {t.dims[0]}, GgmlType::kF32,
+        it == by_name.end() ? Kind::kOnes : Kind::kCopy);
+  };
+  const auto projection = [&](const TensorInfo& t, bool awq) {
     if (t.dims[0] % 256) throw std::runtime_error("gguf: " + t.name + " rows are not a multiple of 256 long");
     if (!CanDequantize(t.type))
       throw std::runtime_error(std::string("gguf: tensor type ") + TypeName(t.type) + " of " + t.name +
@@ -89,22 +95,21 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total) {
                                "IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS are)");
     add(&t, t.name, t.dims, GgmlType::kMQ4G256, t.type == GgmlType::kMQ4G256 ? Kind::kCopy : Kind::kMq4);
     items.back().heads = t.name.ends_with(".ssm_out.weight") && items.back().kind == Kind::kMq4;
-    if (t.name != "output.weight") {
-      const std::string awq = t.name.substr(0, t.name.size() - 7) + ".awq";
-      const auto it = by_name.find(awq);
-      add(it == by_name.end() ? nullptr : it->second, awq, {t.dims[0]}, GgmlType::kF32,
-          it == by_name.end() ? Kind::kOnes : Kind::kCopy);
-    }
+    if (awq && t.name != "output.weight") awq_of(t);
   };
   for (const auto& t : src.tensors()) {
     if (t.name.ends_with(".awq")) continue;  // with its projection
     if (t.name.ends_with("ffn_up.weight") && by_name.contains(t.name.substr(0, t.name.size() - 13) + "ffn_gate.weight"))
       continue;  // after ffn_gate
     if (IsProjection(t)) {
-      projection(t);
-      if (t.name.ends_with("ffn_gate.weight")) {
-        const auto up = by_name.find(t.name.substr(0, t.name.size() - 15) + "ffn_up.weight");
-        if (up != by_name.end()) projection(*up->second);
+      const auto up = t.name.ends_with("ffn_gate.weight")
+                          ? by_name.find(t.name.substr(0, t.name.size() - 15) + "ffn_up.weight")
+                          : by_name.end();
+      projection(t, up == by_name.end());
+      if (up != by_name.end()) {
+        off += (t.dims[0] * 2 + 255) / 256 * 256;  // where the HFQ keeps the f16 gate awq
+        projection(*up->second, true);
+        awq_of(t);
       }
     } else if (t.name == "token_embd.weight") {
       if (!CanDequantize(t.type)) throw std::runtime_error(std::string("gguf: token_embd type ") + TypeName(t.type));

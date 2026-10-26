@@ -16,7 +16,7 @@ NPU images (gen_npu_gemm, gated):
   npu_ffnsw.xdna      gate / up + swiglu, MQ4 rows decoded on the cores (fuse 2), F / 256 calls: call j's column c
                       takes features 17408 - F + 256 j + 32 c + [0, 32); H = bfp16(silu(gate) up) into C
   npu_ffndn<p>.xdna   down from H over a K part of p passes (1024 features each), IQ4_XS rows decoded on the cores: the
-                      rows with the rotation and down's awq folded in, re-quantized (npu_down_pack.py), 10 calls of 512
+                      rows with the rotation and down's awq folded in, re-quantized (npu_down_pack.hpp), 10 calls of 512
 npu.txt: "npuffn <F> <B> <K parts>", "npugate <supply> <calls> <record>", "npubytes_<image> a w c",
 "npudgu <bytes from a gate row to its up row>", then the GPU kernels' geometry rows (dispatch.txt's format).
 """
@@ -63,7 +63,7 @@ def sw_cfg(B, F, dgu):
 
 
 def dn_cfg(B, F, passes):
-    """Down decodes its IQ4_XS rows (npu_down_pack.py) itself: the same gate layout as gate / up's (gwest), so the two
+    """Down decodes its IQ4_XS rows (model/npu_down_pack.hpp) itself: the same gate layout as gate / up's (gwest), so the two
     images switch inside a command (a dense image's setup leaves column 2's gate routes of gate / up's in place: the
     array hangs)."""
     return N.Config(COLS, B // 64, KS_DN, passes, mu=1, gate=N.GATE_SUPPLY, gwest=1, ghelp=1, gfirst=1, fuse=2, kraw=F,

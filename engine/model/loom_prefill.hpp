@@ -12,9 +12,9 @@
 #define YAH_MODEL_LOOM_PREFILL_HPP_
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +33,7 @@
 #include "core/gguf.hpp"
 #include "model/loom_decoder.hpp"
 #include "model/loom_runtime.hpp"
+#include "model/npu_down_pack.hpp"
 #include "model/npu_split.hpp"
 
 namespace yah::model {
@@ -114,7 +115,7 @@ class LoomPrefill {
   // gate / up calls (npu_ffnsw.xdna, F / 256 of them: call j's column c takes features G + 256 j + 32 c + [0, 32) of the
   // G = 17408 - F the GPU leaves, gate rows and up rows decoded on the NPU from the weight chunks) write H =
   // bfp16(silu(gate) up) into C, [M block][pass][16-token slab][128 k-blocks]; its down calls (npu_ffndn<passes>.xdna,
-  // per K part of F, kDownCalls calls of 512 rows) read H and decode IQ4_XS rows (tools/npu_down_pack.py: down's rows
+  // per K part of F, kDownCalls calls of 512 rows) read H and decode IQ4_XS rows (npu_down_pack.hpp: down's rows
   // unrotated, its awq folded in, re-quantized) and write their partials after H. The GPU runs gate / up and down over the first G features
   // into hidden2, then npu_unpack_ffn.hal adds the NPU's partials into hidden.
   // npu_plan: the sizes LoomNpuSplit needs (a_bytes 0: the set has no block).
@@ -131,9 +132,9 @@ class LoomPrefill {
     p.gate_calls = g.rowgrp, p.gate_record = g.tt;
     return p;
   }
-  // Full chunks run the block from now on. npu (built from npu_plan()) outlives this object; down: the set's down pack.
-  // layers: only the first that many layers (a test's smaller footprint: their down weights alone are uploaded).
-  void EnableNpu(NpuSplit* npu, const std::string& down, std::uint32_t layers = ~0u);
+  // Full chunks run the block from now on. npu (built from npu_plan()) outlives this object. Packs down's rows for the
+  // NPU (~3 s). layers: only the first that many layers (a test's smaller footprint: their down rows alone are packed).
+  void EnableNpu(NpuSplit* npu, std::uint32_t layers = ~0u);
 
   // Stage ids[0..n) for the next RunLayers, whose first kernel (yah_embed) writes their token_embd rows into hidden().
   // n < B pads the chunk with the last token.

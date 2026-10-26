@@ -16,8 +16,7 @@
 //   --chunk-ms          print each chunk's wall time (synchronizes after every chunk)
 //   --pairs             full chunks two at a time, layer by layer (LoomPrefill::RunPair: the NPU block of one chunk
 //                       runs while the GPU runs the other's layer)
-//   --npu --npu-down <pack>  the NPU runs the set's FFN block (tools/emit_npu_ffn.py), its dense down weights from
-//                       the pack (tools/npu_down_pack.py)
+//   --npu               the NPU runs the set's FFN block (tools/emit_npu_ffn.py)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -92,7 +91,7 @@ void WriteRowStats(FILE* f, const float* lg, std::uint32_t pos, std::int32_t nxt
 struct Options {
   std::uint32_t gen = 0, slot_at = ~0u, rowstats_from = 1024, rowstats_stride = 8;
   std::int64_t logits_from = -1;
-  std::string decode, rowstats, rowstats_pos, slot_save, slot_load, npu_down;
+  std::string decode, rowstats, rowstats_pos, slot_save, slot_load;
   bool chunk_ms = false, pairs = false, npu = false;
 };
 
@@ -127,8 +126,6 @@ bool ParseOptions(int argc, char** argv, Options* o) {
       o->pairs = true;
     else if (a == "--npu")
       o->npu = true;
-    else if (a == "--npu-down" && v)
-      o->npu_down = argv[++i];
     else
       return std::fprintf(stderr, "loom_forward_pp: unknown option %s\n", a.c_str()), false;
   }
@@ -161,12 +158,12 @@ int main(int argc, char** argv) {
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
     if (opt.npu) {
       const auto plan = pf.npu_plan();
-      if (plan.a_bytes == 0 || opt.npu_down.empty()) {
-        std::fprintf(stderr, "--npu: needs a set with the NPU FFN block (emit_npu_ffn.py) and --npu-down\n");
+      if (plan.a_bytes == 0) {
+        std::fprintf(stderr, "--npu: needs a set with the NPU FFN block (emit_npu_ffn.py)\n");
         return 2;
       }
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
-      pf.EnableNpu(npu.get(), opt.npu_down);
+      pf.EnableNpu(npu.get());
     }
 #else
     if (opt.npu) throw LoomError("--npu: this build has no NPU support");

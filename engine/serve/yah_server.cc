@@ -36,21 +36,20 @@ using namespace yah::serve;
 namespace http = yah::serve::http;
 
 int Usage() {
-  std::fprintf(
-      stderr,
-      "usage: yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080]\n"
-      "                  [--draft mtp|off [--draft-len N]] [--npu [--npu-down <pack>]] [--no-reuse]\n"
-      "                  [--prefill <hal set> --decode <hal set>]\n"
-      "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
-      "--ctx: the context in tokens (a multiple of 2048); --kv: the KV cache format, fp16, kv8, kv4, k8v4 or\n"
-      "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
-      "~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use. --prefill / --decode name sets instead.\n"
-      "--npu: the NPU runs the prefill set's FFN block (a set from tools/emit_npu_ffn.py), its down pack from\n"
-      "<prefill>/npu_down.bin unless --npu-down; without what it needs the GPU runs everything.\n"
-      "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
-      "blk.N.nextn.*) and verifying with the decode set's verify GEMVs; --draft-len N fixes the draft length\n"
-      "(default: adapts to the acceptance).\n"
-      "--no-reuse: every request prefills from scratch (no multi-turn cache).\n");
+  std::fprintf(stderr,
+               "usage: yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080]\n"
+               "                  [--draft mtp|off [--draft-len N]] [--npu] [--no-reuse]\n"
+               "                  [--prefill <hal set> --decode <hal set>]\n"
+               "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
+               "--ctx: the context in tokens (a multiple of 2048); --kv: the KV cache format, fp16, kv8, kv4, k8v4 or\n"
+               "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
+               "~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use. --prefill / --decode name sets instead.\n"
+               "--npu: the NPU runs the prefill set's FFN block (a set from tools/emit_npu_ffn.py); without what it\n"
+               "needs the GPU runs everything.\n"
+               "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
+               "blk.N.nextn.*) and verifying with the decode set's verify GEMVs; --draft-len N fixes the draft length\n"
+               "(default: adapts to the acceptance).\n"
+               "--no-reuse: every request prefills from scratch (no multi-turn cache).\n");
   return 2;
 }
 
@@ -282,7 +281,7 @@ int main(int argc, char** argv) {
   std::string model, prefill, decode, host = "127.0.0.1";
   int port = 8080;
   bool fake = false, npu = false, reuse = true;
-  std::string npu_down, draft = "off", kv = "kv8";
+  std::string draft = "off", kv = "kv8";
   std::uint32_t draft_len = 0, ctx = 32768;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -303,8 +302,6 @@ int main(int argc, char** argv) {
       reuse = false;
     } else if (arg == "--npu") {
       npu = true;
-    } else if (arg == "--npu-down" && has_value) {
-      npu_down = argv[++i];
     } else if (arg == "--draft" && has_value) {
       draft = argv[++i];
     } else if (arg == "--draft-len" && has_value) {
@@ -353,7 +350,6 @@ int main(int argc, char** argv) {
       options.prefill_hal = prefill;
       options.decode_hal = decode;
       options.npu = npu;
-      options.npu_down = npu_down;
       options.draft = draft;
       options.reuse = reuse;
       options.draft_len = draft_len;

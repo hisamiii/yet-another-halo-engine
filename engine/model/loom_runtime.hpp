@@ -249,6 +249,9 @@ class LoomDevice {
   void D2H(const LoomBuffer& buffer, void* host, size_t bytes, size_t offset = 0) {
     LoomCheck(hrx_synchronous_d2h(device_, buffer.handle, offset, host, bytes), "hrx_synchronous_d2h");
   }
+  void D2H(const hrx_buffer_ref_t& ref, void* host) {
+    LoomCheck(hrx_synchronous_d2h(device_, ref.buffer, ref.offset, host, ref.length), "hrx_synchronous_d2h");
+  }
 
   void Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
                 const void* constants, size_t constants_size, const hrx_buffer_ref_t* bindings, size_t binding_count) {

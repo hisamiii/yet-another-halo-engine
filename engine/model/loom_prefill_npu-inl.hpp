@@ -5,33 +5,28 @@
 
 namespace yah::model {
 
-inline void LoomPrefill::EnableNpu(NpuSplit* npu, const std::string& down, std::uint32_t layers) {
+inline void LoomPrefill::EnableNpu(NpuSplit* npu, std::uint32_t layers) {
   if (!npu || !FfnF() || !a4_) throw LoomError("prefill: the set has no NPU FFN block (tools/emit_npu_ffn.py)");
   npu_ = npu;
   down_layer_ = std::size_t{kHidden} * DownRowBytes();
   npu_layers_ = std::min(layers, cfg_.main_block_count());
-  const std::size_t file = down_layer_ * cfg_.main_block_count(), bytes = down_layer_ * npu_layers_;
-  FILE* f = std::fopen(down.c_str(), "rb");
-  if (!f) throw LoomError("cannot open " + down);
-  std::fseek(f, 0, SEEK_END);
-  const auto size = static_cast<std::size_t>(std::ftell(f));
-  std::fseek(f, 0, SEEK_SET);
-  if (size < bytes || size % down_layer_ || size > file) {
-    std::fclose(f);
-    throw LoomError(down + ": not this set's down pack (" + std::to_string(file) + " bytes, npu_down_pack.py)");
+  // (+ 4096: the last call's raw view runs a decoder record past its rows)
+  npu_down_ = &Alloc(down_layer_ * npu_layers_ + 4096);
+  // the down pack from the loaded weights (npu_down_pack.hpp), so the NPU's rows are this model's whatever its file
+  std::vector<float> signs(512), awq(kFfn);
+  ReadFile(dir_ + "/rot_signs.bin", signs.data(), signs.size() * 4);
+  const std::size_t rb = std::size_t{kFfn} / 256 * NpuDownPack::kBlock, G = kFfn - FfnF();
+  std::vector<std::uint8_t> rows(std::size_t{kHidden} * rb), pack(down_layer_);
+  for (std::uint32_t l = 0; l < npu_layers_; ++l) {
+    const std::string pre = "blk." + std::to_string(l) + ".";
+    const core::TensorInfo &w = *Find(pre + "ffn_down.weight"), &a = *Find(pre + "ffn_down.awq");
+    if (w.bytes != rows.size() || a.bytes != awq.size() * 4) throw LoomError("prefill: " + w.name + " is not MQ4G256");
+    gpu_.D2H(TRef(w), rows.data());
+    gpu_.D2H(TRef(a), awq.data());
+    NpuDownPack::Rows(rows.data() + G / 256 * NpuDownPack::kBlock, rb, kHidden, FfnF(), awq.data() + G, signs.data(),
+                      pack.data());
+    gpu_.H2D(*npu_down_, pack.data(), pack.size(), std::size_t{l} * down_layer_);
   }
-  npu_down_ = &Alloc(bytes + 4096);  // (the last call's raw view runs a decoder record past its rows)
-  std::vector<std::uint8_t> piece(std::size_t{256} << 20);
-  for (std::size_t o = 0; o < bytes;) {
-    const std::size_t n = std::min(piece.size(), bytes - o);
-    if (std::fread(piece.data(), 1, n, f) != n) {
-      std::fclose(f);
-      throw LoomError("short read: " + down);
-    }
-    gpu_.H2D(*npu_down_, piece.data(), n, o);
-    o += n;
-  }
-  std::fclose(f);
   npu_->ShareGpu(npu_down_->handle, npu_down_->size);
   npu_xo_ = &Alloc(std::size_t{B_} * kHidden * 2);
   // Bind every NPU call of a full chunk now (a pass of the layers that dispatches nothing): a first bind loads the

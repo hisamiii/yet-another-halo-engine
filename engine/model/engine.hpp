@@ -47,11 +47,9 @@ class Engine : public TextGenerator {
     std::string model;        // GGUF path
     std::string prefill_hal;  // emit_prefill_pp.py set (chunked, paged)
     std::string decode_hal;   // emit_decode.py set with the prefill's context and YAH_KV
-    // The NPU runs the FFN block of a prefill set that has one (tools/emit_npu_ffn.py), its down weights from
-    // npu_down (tools/npu_down_pack.py; default <prefill_hal>/npu_down.bin). Off, or not ready (NpuProblem), the
-    // GPU runs everything.
+    // The NPU runs the FFN block of a prefill set that has one (tools/emit_npu_ffn.py). Off, or not ready
+    // (NpuProblem), the GPU runs everything.
     bool npu = false;
-    std::string npu_down;
     // Speculative decoding of greedy requests: "mtp" drafts with the model's MTP layer (a GGUF with blk.<n>.nextn.*)
     // and verifies with the decode set's T-token GEMVs (emit_decode.py VERIFY); "off". draft_len: tokens per draft,
     // 0 adapts it to the acceptance (up to the verify width - 1).
@@ -311,7 +309,7 @@ class Engine : public TextGenerator {
         npu_status_ = "the prefill set has no NPU FFN block (tools/emit_npu_ffn.py)";
       } else {
         npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
-        prefill_.EnableNpu(npu_.get(), o.npu_down.empty() ? o.prefill_hal + "/npu_down.bin" : o.npu_down);
+        prefill_.EnableNpu(npu_.get());
       }
     }
 #else
@@ -475,8 +473,7 @@ class Engine : public TextGenerator {
   }
 
   static MemoryPlan Plan(const Options& o) {
-    const std::string down = !o.npu ? "" : o.npu_down.empty() ? o.prefill_hal + "/npu_down.bin" : o.npu_down;
-    MemoryPlan p = MemoryPlan::For(o.model, o.decode_hal, down, o.draft == "mtp");
+    MemoryPlan p = MemoryPlan::For(o.model, o.decode_hal, o.npu ? o.prefill_hal : "", o.draft == "mtp");
     if (!p.fits())
       throw LoomError("engine: not enough memory: " + p.Describe() +
                       "; close other programs, or use sets with a smaller context or KV format");

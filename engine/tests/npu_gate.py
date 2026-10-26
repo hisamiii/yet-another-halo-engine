@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""npu_gate.py <model> <prefill set> [down pack] [workdir]: the NPU FFN block's smoke test.
+"""npu_gate.py <model> <prefill set> [workdir]: the NPU FFN block's smoke test.
 
 Runs the same 4096-token prompt (two chunks, the pair schedule) through loom_forward_pp twice, on the GPU alone and
 with --npu, and checks that the NPU ran its jobs without a failed wait and that its output is the model's: the last 64
 positions' top-1 tokens and KL against the GPU run, and the last chunk's hidden states. The NPU path is not
 bit-identical to the GPU's (bfp16 activations, IQ4_XS down rows): the bounds catch a hang, a fallback, or missing or
 garbage NPU output, not a quality change (that is kld_ref.py's job: engine/run/gate). Needs numpy, an unlimited memlock
-limit and a build with NPU support (engine/build_hrx.sh). The down pack defaults to <prefill set>/npu_down.bin.
+limit and a build with NPU support (engine/build_hrx.sh).
 Run it as a GPU job: engine/run/gpu_run.sh npugate -- engine/tests/npu_gate.py ...
 """
 import os
@@ -21,7 +21,7 @@ import numpy as np
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 TOKENS, TAIL, HID = 4096, 64, 5120
 # GPU vs NPU on this prompt (serve-pp1024, MQ4 HFQ): top-1 1.000, KL 0.0014, cos 0.960; an all-zero down pack (the
-# NPU's features dropped from every layer): 0.984, 0.0132, 0.837
+# NPU's features dropped from every layer, measured with a pack file): 0.984, 0.0132, 0.837
 TOP1_MIN, KL_MAX, COS_MIN = 0.95, 0.005, 0.93
 
 
@@ -42,17 +42,15 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     model, hal = sys.argv[1], sys.argv[2]
-    down = sys.argv[3] if len(sys.argv) > 3 else os.path.join(hal, "npu_down.bin")
-    work = sys.argv[4] if len(sys.argv) > 4 else os.path.join(os.path.expanduser("~"), "Development", "Scratch",
+    work = sys.argv[3] if len(sys.argv) > 3 else os.path.join(os.path.expanduser("~"), "Development", "Scratch",
                                                               "npu-gate")
     if resource.getrlimit(resource.RLIMIT_MEMLOCK)[0] != resource.RLIM_INFINITY:
         sys.exit("npu_gate: the NPU needs an unlimited memlock limit (prlimit --pid $$ --memlock=unlimited:unlimited)")
-    for f in (os.path.join(hal, "npu.txt"), down):
-        if not os.path.exists(f):
-            sys.exit("npu_gate: no %s (tools/emit_npu_ffn.py, tools/npu_down_pack.py)" % f)
+    if not os.path.exists(os.path.join(hal, "npu.txt")):
+        sys.exit("npu_gate: %s has no NPU FFN block (tools/emit_npu_ffn.py)" % hal)
     os.makedirs(work, exist_ok=True)
     run(model, hal, os.path.join(work, "gpu"), [])
-    out = run(model, hal, os.path.join(work, "npu"), ["--npu", "--npu-down", down])
+    out = run(model, hal, os.path.join(work, "npu"), ["--npu"])
 
     fails = []
     jobs = sum(int(m) for m in re.findall(r"npu: \S+\s+(\d+) jobs", out))
