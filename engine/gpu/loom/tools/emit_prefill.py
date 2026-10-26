@@ -5,7 +5,7 @@ Naming convention, so the C++ driver needs no manifest:
   <outdir>/gemm_<kind>_<fmt>_<m_tiles>_<k_blocks>.hal
   <outdir>/<fixed>.hal   for the non-GEMM kernels
 """
-import os, re, struct, subprocess, sys
+import json, os, re, struct, subprocess, sys, tempfile, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOOM = os.path.abspath(os.path.join(HERE, ".."))
@@ -72,8 +72,9 @@ def emit(loomfile, configs, outname, outdir, env=None):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(LOOM, loomfile)
+    keep = tempfile.mkdtemp(prefix="emit_keep_", dir=tmp)   # the specialized source, for its envelopes
     r = subprocess.run([sys.executable, EMIT, src, tmp] + configs,
-                       capture_output=True, text=True, env={**os.environ, **env} if env else None)
+                       capture_output=True, text=True, env={**os.environ, **(env or {}), "YAH_EMIT_KEEP": keep})
     if r.returncode != 0:
         # stderr first: it holds the compiler diagnostics; stdout is progress output.
         log = os.path.join("/tmp", "emit_fail_" + os.path.basename(outname) + ".log")
@@ -87,4 +88,60 @@ def emit(loomfile, configs, outname, outdir, env=None):
     hal = r.stdout.strip().splitlines()[-1]
     dst = os.path.join(outdir, outname)
     subprocess.run(["cp", hal, dst], check=True)
+    envelopes(os.path.join(keep, os.listdir(keep)[0]), dst + ".fp")
+    shutil.rmtree(keep, True)
     return dst
+
+
+# Roots whose envelope is not a bound on what the kernel touches, so their .fp line is left out: <kernel>.<root>: why.
+UNBOUNDED = {
+    # its ring loads run under i < qkv_size (ISA: after the s_and_saveexec on that compare), but the analysis bounds
+    # them by the grid's alpha / beta lanes: 10x the state view
+    "yah_deltanet_prep_ab.state": "guarded loads",
+}
+
+
+def envelopes(src, fp):
+    """Write <hal>.fp: "<argument> <bytes> <root>" per root of the HAL's one kernel, the bytes it may touch through that
+    binding over its compiled grid ("grid <x> <y> <z>"; a dispatch of fewer workgroups touches that share). engine/run/hrx_dry.c checks every view the engine binds
+    against it: a view shorter than its kernel's envelope reads unmapped VA, and the ring hangs. A module of several
+    kernels gets none (hrx_dry lists it unchecked)."""
+    sys.path.insert(0, LOOM)
+    import hrx_paths
+    with tempfile.TemporaryDirectory(prefix="emit_fp_") as t:
+        rep = os.path.join(t, "report.json")
+        r = subprocess.run([hrx_paths.LOOM_COMPILE, src, "--target=amdgpu:gfx1151", "--format=amdgpu-hsaco",
+                            "--output=" + os.path.join(t, "k.hsaco"), "--compile-report=details",
+                            "--compile-report-output=" + rep], env=hrx_paths.env(), capture_output=True, text=True)
+        found, grid = [], None
+
+        def walk(node):
+            if isinstance(node, dict):
+                roots = node.get("roots")
+                if isinstance(roots, list) and roots and all(isinstance(x, dict) and "interval_envelope" in x for x in roots):
+                    found.append(roots)
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        if r.returncode == 0:
+            report = json.load(open(rep))
+            walk(report)
+            grid = (report.get("workload") or {}).get("workgroup_count")
+    if len(found) != 1:
+        if os.path.exists(fp):
+            os.remove(fp)
+        return
+    rows = {}
+    for x in found[0]:
+        a, b = x.get("source_root_argument_index"), (x.get("interval_envelope") or {}).get("byte_count")
+        if "%s.%s" % (x.get("function"), x.get("source_root")) in UNBOUNDED:
+            continue
+        if a is not None and b is not None and b >= rows.get(a, (0,))[0]:
+            rows[a] = (b, x.get("source_root") or "?")
+    with open(fp, "w") as fh:
+        if grid:
+            fh.write("grid %d %d %d\n" % (grid["x"], grid["y"], grid["z"]))
+        fh.writelines("%d %d %s\n" % (a, b, n) for a, (b, n) in sorted(rows.items()))
