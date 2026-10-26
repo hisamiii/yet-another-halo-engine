@@ -1231,6 +1231,88 @@ def iq2xs_setup():
             + _stage_table("ksigns", "%ksigns_na", 128, "i8", 1))
 
 
+def iq2s_loads(p, blk, gb):
+    """block_iq2_s (82 B): d f16 @0, qs[32] grid code low bytes @2, signs[32] @34, qh[8] @66, scales[8] @74.
+    Group g (32 elements) reads codes qs[4g..4g+3], signs[4g..4g+3], qh[g] and scale byte g."""
+    L = []
+    e = L.append
+    vals = []
+    _ldd(e, p, blk)
+    vals.append((f"%{p}dh", "f16"))
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}g4_{u} = scalar.shli %{p}g{u}, %c2i : i32")
+        e(f"    %{p}qo{u} = scalar.addi {blk}, %{p}g4_{u} : i32")
+        e(f"    %{p}qo2_{u} = scalar.addi %{p}qo{u}, %c2i : i32")
+        _ldv(e, p, f"qs{u}", f"%{p}qo2_{u}", 4)
+        vals.append((f"%{p}qs{u}", "vector<4xi8>"))
+        e(f"    %{p}so2_{u} = scalar.addi %{p}qo{u}, %c34i_2s : i32")
+        _ldv(e, p, f"sg{u}", f"%{p}so2_{u}", 4)
+        vals.append((f"%{p}sg{u}", "vector<4xi8>"))
+        e(f"    %{p}ho{u} = scalar.addi {blk}, %{p}g{u} : i32")
+        e(f"    %{p}ho2_{u} = scalar.addi %{p}ho{u}, %c66i : i32")
+        _ld8(e, p, f"qh{u}", f"%{p}ho2_{u}")
+        vals.append((f"%{p}qh{u}", "i8"))
+        e(f"    %{p}co2_{u} = scalar.addi %{p}ho{u}, %c74i : i32")
+        _ld8(e, p, f"sc{u}", f"%{p}co2_{u}")
+        vals.append((f"%{p}sc{u}", "i8"))
+    return L, vals
+
+
+def iq2s_compute(v, gb):
+    """IQ2_S decode in ggml's dequantize_row_iq2_s order, 8 elements per code l (elements 8l..8l+7 of the group):
+      idx = qs[4g+l] | ((qh[g] >> 2l) & 3) << 8, gw = grid words (2 idx, 2 idx + 1), s = bits of signs[4g+l],
+      mag = (g ^ -s) + s, nib = scales[g] low nibble for l < 2, high for l >= 2,
+      value = (d * ((f32(nib) + 0.5) * 0.25)) * f32(mag)"""
+    L = []
+    e = L.append
+    it = iter(v)
+    dh = next(it)
+    e(f"    %d = scalar.extf {dh} : f16 to f32")
+    for u in range(GPL):
+        qs = next(it); sg = next(it); qh = next(it); sc = next(it)
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %scb{u} = scalar.extui {sc} : i8 to i32")
+        e(f"    %qhb{u} = scalar.extui {qh} : i8 to i32")
+        for hv in (0, 1):
+            if hv:
+                e(f"    %nb{hv}_{u}0 = scalar.shrui %scb{u}, %c4i : i32")
+            else:
+                e(f"    %nb{hv}_{u}0 = scalar.andi %scb{u}, %c15i : i32")
+            e(f"    %nbf{hv}_{u} = scalar.sitofp %nb{hv}_{u}0 : i32 to f32")
+            e(f"    %hp{hv}_{u} = scalar.addf %nbf{hv}_{u}, %fhalf : f32")
+            e(f"    %hq{hv}_{u} = scalar.mulf %hp{hv}_{u}, %fquarter : f32")
+            e(f"    %dsc{hv}_{u} = scalar.mulf %d, %hq{hv}_{u} : f32")
+            e(f"    %dsc_v8_{hv}_{u} = vector.splat %dsc{hv}_{u} : vector<8xf32>")
+        _col_of(e, u)
+        for l in range(4):
+            t = f"{u}_{l}"
+            e(f"    %cd8_{t} = vector.extract {qs}[{l}] : vector<4xi8> -> i8")
+            e(f"    %cdl_{t} = scalar.extui %cd8_{t} : i8 to i32")
+            e(f"    %hb_{t} = scalar.bitfield.extractu %qhb{u} {{offset = {2 * l}, width = 2}} : i32 -> i32")
+            e(f"    %hb8_{t} = scalar.shli %hb_{t}, %c8i_2s : i32")
+            e(f"    %gi_{t} = scalar.ori %cdl_{t}, %hb8_{t} : i32")
+            e(f"    %w0_{t} = scalar.shli %gi_{t}, %c1i : i32")
+            e(f"    %w1_{t} = scalar.addi %w0_{t}, %c1i : i32")
+            for w in (0, 1):
+                e(f"    %wx{w}_{t} = index.cast %w{w}_{t} : i32 to index")
+                e(f"    %wc{w}_{t} = index.assume %wx{w}_{t} [range(%wx{w}_{t}, 0, 2047)] : index")
+                e(f"    %gw{w}_{t} = view.load %grid_view[%wc{w}_{t}] : view<2048xi32> -> i32")
+            e(f"    %ks8_{t} = vector.extract {sg}[{l}] : vector<4xi8> -> i8")
+            _vdec_pair(e, t, f"%gw0_{t}", f"%gw1_{t}", f"%ks8_{t}", f"%dsc_v8_{l // 2}_{u}", f"%col{u}", u, l,
+                       f"%dsc{l // 2}_{u}" if IQ2_W else None)
+    return L
+
+
+def iq2s_setup():
+    return (["  %c14i_vdw = scalar.constant 14 : i32", "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
+             "  %fhalf = scalar.constant 0.5 : f32", "  %fquarter = scalar.constant 0.25 : f32",
+             "  %c34i_2s = scalar.constant 34 : i32", "  %c8i_2s = scalar.constant 8 : i32",
+             "  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32",
+             "  %vdw_ff = scalar.constant 255 : i32"]
+            + _stage_table("grid", "%grid_na", 2048, "i32", 4))
+
+
 def iq2xxs_setup():
     return (["  %c14i_vdw = scalar.constant 14 : i32", "  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32", "  %vdw_ff = scalar.constant 255 : i32",
              "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
@@ -1372,6 +1454,51 @@ def q8_0_compute(v, gb):
         for half, q, col in (("lo", qa, f"%col{u}"), ("hi", qb, f"%colh{u}")):
             t = f"{half}{u}"
             e(f"    %qf_{t} = vector.sitofp {q} : vector<16xi8> to vector<16xf32>")
+            e(f"    %vv_{t} = vector.mulf %dv{u}, %qf_{t} : vector<16xf32>")
+            e(f"    %hv_{t} = vector.fptrunc %vv_{t} : vector<16xf32> to vector<16xf16>")
+            e(f"    vector.store %hv_{t}, %wl_view[%drow, {col}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+    return L
+
+
+def iq4nl_loads(p, blk, gb):
+    """IQ4_NL in 256-element super-blocks of 8 blocks (144 B): group g is block g, d f16 at 18g, qs[16] at 18g + 2."""
+    L = []
+    e = L.append
+    vals = []
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}g18_{u} = scalar.muli %{p}g{u}, %c18i : i32")
+        e(f"    %{p}bo{u} = scalar.addi {blk}, %{p}g18_{u} : i32")
+        e(f"    %{p}dh_i{u} = scalar.shrui %{p}bo{u}, %c1i : i32")
+        e(f"    %{p}dx{u} = index.cast %{p}dh_i{u} : i32 to index")
+        e(f"    %{p}dl{u} = index.max %{p}dx{u}, %c0 : index")
+        e(f"    %{p}dc{u} = index.min %{p}dl{u}, %w_half_last : index")
+        e(f"    %{p}dh{u} = view.load %w_f16_view[%{p}dc{u}] : view<[%w_halfs]xf16> -> f16")
+        e(f"    %{p}qa{u} = scalar.addi %{p}bo{u}, %c2i : i32")
+        _ldv(e, p, f"qa_v{u}", f"%{p}qa{u}", 16)
+        vals += [(f"%{p}dh{u}", "f16"), (f"%{p}qa_v{u}", "vector<16xi8>")]
+    return L, vals
+
+
+def iq4nl_compute(v, gb):
+    """IQ4_NL decode in the .loom kernel's op order: element w of a block, L = w % 16:
+    nib = w < 16 ? qs[L] & 15 : qs[L] >> 4, value = d * kvalues[nib] (exact in f32)."""
+    L = []
+    e = L.append
+    it = iter(v)
+    for u in range(GPL):
+        dh = next(it); q = next(it)
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        e(f"    %d{u} = scalar.extf {dh} : f16 to f32")
+        e(f"    %dv{u} = vector.splat %d{u} : vector<16xf32>")
+        _col_of(e, u)
+        e(f"    %colh{u} = index.add %col{u}, %c16 : index")
+        e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
+        e(f"    %nhi{u} = vector.shrui {q}, %s4v : vector<16xi8>")
+        for half, col in (("lo", f"%col{u}"), ("hi", f"%colh{u}")):
+            t = f"{half}{u}"
+            e(f"    %cv_{t} = vector.table.lookup %kvt[%n{half}{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+            e(f"    %qf_{t} = vector.sitofp %cv_{t} : vector<16xi8> to vector<16xf32>")
             e(f"    %vv_{t} = vector.mulf %dv{u}, %qf_{t} : vector<16xf32>")
             e(f"    %hv_{t} = vector.fptrunc %vv_{t} : vector<16xf32> to vector<16xf16>")
             e(f"    vector.store %hv_{t}, %wl_view[%drow, {col}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
@@ -1715,6 +1842,8 @@ FMTS = {
                                           lambda v, g: q4k_compute(v, g, q5=True)),
                 extra=[], setup=q4k_setup),
     "q8_0": dict(bb=272, kdiv=8, ksub=64, decode=(q8_0_loads, q8_0_compute), extra=[], setup=lambda: []),
+    # IQ4_NL: IQ4_XS's codebook with one f16 scale per 32 values, 8 blocks (144 B) per super-block
+    "iq4nl": dict(bb=144, kdiv=8, ksub=64, decode=(iq4nl_loads, iq4nl_compute), extra=[], setup=iq4xs_setup),
     # probe only: pre-dequantized f16 weights, decode-free
     "f16": dict(bb=512, ksub=64, decode=(f16_loads, f16_compute), extra=[], setup=lambda: []),
     # hipfire MQ4G256V2 (HFQ models): scale per 128, signed nibbles
@@ -1723,6 +1852,7 @@ FMTS = {
     "q3k": dict(bb=110, ksub=64, decode=(q3k_loads, q3k_compute), extra=[], setup=q3k_setup),
     "iq2xxs": dict(bb=66, ksub=64, decode=(iq2xxs_loads, iq2xxs_compute), extra=["grid", "ksigns"], setup=iq2xxs_setup),
     "iq2xs": dict(bb=74, ksub=64, decode=(iq2xs_loads, iq2xs_compute), extra=["grid", "ksigns"], setup=iq2xs_setup),
+    "iq2s": dict(bb=82, ksub=64, decode=(iq2s_loads, iq2s_compute), extra=["grid"], setup=iq2s_setup),
     "iq3xxs": dict(bb=98, ksub=64, decode=(iq3xxs_loads, iq3xxs_compute), extra=["grid", "ksigns"], setup=iq3xxs_setup),
 }
 

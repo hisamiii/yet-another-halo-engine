@@ -895,7 +895,7 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
 
 
 # Formats the tile GEMM (tools/gen_gemm_tile.py) is verified bit-identical on in the pp2048 pipeline.
-TILE_FMTS = ("iq3s", "iq4xs", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "q3k", "q8_0", "mq4")
+TILE_FMTS = ("iq3s", "iq4xs", "iq4nl", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "iq2s", "q3k", "q8_0", "mq4")
 
 
 def decode_free(fmt, mt, kb, B, kind, outdir, done):
@@ -2589,6 +2589,7 @@ def main():
                      ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
                      ("grid_iq2xxs.bin", "grid_iq2xxs.bin"),
                      ("grid_iq2xs.bin", "grid_iq2xs.bin"),
+                     ("grid_iq2s.bin", "grid_iq2s.bin"),
                      ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")]:
         shutil.copy(os.path.join(tables, src), os.path.join(outdir, dst))
     print("emitted %d GEMM + fixed prefill HALs for B=%d (tile=%d, token_tiles=%d)"
