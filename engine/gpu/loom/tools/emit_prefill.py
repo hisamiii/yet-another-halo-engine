@@ -100,6 +100,8 @@ UNBOUNDED = {
     # its ring loads run under i < qkv_size (ISA: after the s_and_saveexec on that compare), but the analysis bounds
     # them by the grid's alpha / beta lanes: 10x the state view
     "yah_deltanet_prep_ab.state": "guarded loads",
+    # its row is the token id: the host checks ids against the vocabulary, a staged chunk reads rows 0..B-1
+    "yah_embed.w": "data-dependent rows",
 }
 
 

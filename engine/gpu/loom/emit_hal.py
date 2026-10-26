@@ -66,6 +66,9 @@ def main():
     rewritten = os.path.join(tmpdir, stem + "_emit.loom")
     with open(rewritten, "w") as f:
         f.write("\n".join(out) + "\n")
+    # YAH_EMIT_KEEP=<dir>: keep the specialized source (for loom-compile --compile-report)
+    if os.environ.get("YAH_EMIT_KEEP"):
+        shutil.copy(rewritten, os.environ["YAH_EMIT_KEEP"])
 
     hal_path = os.path.join(outdir, stem + ".hal")
     target = os.path.join(outdir, stem + ".hsaco")
