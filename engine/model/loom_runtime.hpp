@@ -546,8 +546,17 @@ class LoomWeights {
     }
     constexpr size_t kChunk = size_t{1} << 30;
     constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
+    // a layer's ffn_gate and the ffn_up right after it are one span: the fused gate + up GEMM binds both as one view
+    static const std::string kGate = ".ffn_gate.weight", kUp = ".ffn_up.weight";
     std::vector<std::pair<size_t, size_t>> spans;
-    for (const auto& t : gguf.tensors()) spans.emplace_back(t.offset, t.offset + t.bytes);
+    for (const auto& t : gguf.tensors()) {
+      const core::TensorInfo* pair = nullptr;   // gate: its up; up: its gate
+      if (t.name.ends_with(kGate)) pair = gguf.Find(t.name.substr(0, t.name.size() - kGate.size()) + kUp);
+      if (t.name.ends_with(kUp)) pair = gguf.Find(t.name.substr(0, t.name.size() - kUp.size()) + kGate);
+      if (t.name.ends_with(kUp) && pair && pair->offset + pair->bytes == t.offset) continue;   // (in its gate's span)
+      const bool joined = t.name.ends_with(kGate) && pair && pair->offset == t.offset + t.bytes;
+      spans.emplace_back(t.offset, joined ? pair->offset + pair->bytes : t.offset + t.bytes);
+    }
     std::sort(spans.begin(), spans.end());
     for (size_t i = 0; i < spans.size();) {
       const size_t begin = spans[i].first;
