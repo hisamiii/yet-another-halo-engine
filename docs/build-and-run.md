@@ -136,7 +136,7 @@ Multi-turn chats reuse the cache. The engine keeps the token sequence of the las
 
 Speculative decoding: `--draft mtp` drafts with the model's MTP layer (a GGUF that has it) and verifies the draft and the next token in one pass of the decode set's 4-token GEMVs; every other kernel runs once per token as in a step, so a greedy output is the same token for token as without drafting. A rejected token rolls back the conv rings, the DeltaNet states (one ring slot per verified token) and the open KV tile. The draft length follows the acceptance: each round picks the length with the most expected tokens per ms (from a decayed acceptance rate and the measured round times), down to plain steps where drafting does not pay. `--draft-len N` fixes it. On the Q4_K_M GGUF at 32K kv8 (`spec_engine`): code 15.9 -> 24.3 t/s, a long factual prompt 13.6 -> 22.0, free prose 14.4 -> 13.7 (the acceptance is low there). Sampled requests (temperature > 0) decode without drafts. The request log line carries `accepted=<accepted>/<drafted>`.
 
-The NPU: `--npu` runs the prefill set's FFN block on the XDNA2 NPU (a set with `tools/emit_npu_ffn.py` run on it). Its down rows are packed from the loaded model at start (re-quantized to IQ4_XS, ~3 s, `engine/model/npu_down_pack.hpp`), so the HFQ and a GGUF both work. It needs an unlimited memlock limit and falls back to the GPU alone without what it needs. Long prompts gain (pp8500: +11%); prompts shorter than two chunks do not (the pair schedule needs two).
+The NPU: `--npu` runs the prefill set's FFN block on the XDNA2 NPU. It takes the prefill set that has the block: a bundle's `hal/<ctx>-<kv>/prefill-npu/`, in a source tree `~/.cache/yah/hal/<ctx>-<kv>/prefill-npu/` (emitted on first use, about a minute: 1024-token chunks, then `tools/emit_npu_ffn.py <model> <set> 1024 5120`), or a `--prefill` set with `emit_npu_ffn.py` run on it. Without `--npu` the 2048-token set runs (GPU alone it is 4-8% faster than the 1024 one). Its down rows are packed from the loaded model at start (re-quantized to IQ4_XS, ~3 s, `engine/model/npu_down_pack.hpp`), so the HFQ and a GGUF both work. It needs an unlimited memlock limit and falls back to the GPU alone without what it needs. Long prompts gain (pp8500: +11%); prompts shorter than two chunks do not (the pair schedule needs two).
 
 For quick tests, `engine/build/yah_chat` is a terminal chat client: it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply. Commands: `/reset`, `/effort E`, `/temp T`, `/max N`, `/system TEXT`, `/quit`; Ctrl-C stops a reply.
 
@@ -203,19 +203,20 @@ It checks the C++ chat template byte for byte against `engine/serve/testdata/cha
 
 ## Release
 
-A release is one tarball, `yah-<version>-gfx1151.tar.xz`. It holds `yah_server` and `yah_chat`, every library they load (libhrx, ICU, the ROCm 10 HSA runtime and its sysdeps; RPATH `$ORIGIN/../lib`), the 32K kv8 HAL sets and the licenses. It needs glibc 2.39 and no ROCm or root. `yah_server` takes the HAL sets from the bundle's `hal/` and the HSA runtime from its `lib/` when the options and `IREE_HAL_AMDGPU_LIBHSA_PATH` don't name others; `engine/release/README.md` is the bundle's README.
+A release is one tarball, `yah-<version>-gfx1151.tar.xz`. It holds `yah_server` and `yah_chat`, every library they load (libhrx, ICU, the ROCm 10 HSA runtime and its sysdeps; RPATH `$ORIGIN/../lib`), the 32K kv8 HAL sets (with the NPU prefill set) and the licenses. It needs glibc 2.39 and no ROCm or root. `yah_server` takes the HAL sets from the bundle's `hal/` and the HSA runtime from its `lib/` when the options and `IREE_HAL_AMDGPU_LIBHSA_PATH` don't name others; `engine/release/README.md` is the bundle's README.
 
 1. CI (`.github/workflows/release.yml`, on a `v*` tag or by hand with a version) runs `engine/release/build.sh` on Ubuntu 24.04. It builds libhrx at the pin, then the binaries with g++-14, `-march=znver5` and static libstdc++, and bundles them without HAL sets (artifact `yah-<version>-gfx1151-nohal`).
 2. On a gfx1151 box: emit the serve sets (Serving above), add them, run the smoke test, pack:
 
 ```
 gh run download <run id> -n yah-<version>-gfx1151-nohal && tar -xJf yah-<version>-gfx1151-nohal.tar.xz
-python3 engine/release/bundle.py hal yah-<version>-gfx1151 <prefill set> <decode set>
+python3 engine/release/bundle.py hal yah-<version>-gfx1151 <prefill set> <decode set> --npu <NPU prefill set>
 python3 engine/release/smoke.py yah-<version>-gfx1151 <model>     # ~2 min on the GPU
+python3 engine/release/smoke.py yah-<version>-gfx1151 <model> --npu   # the NPU set (memlock, DPM high)
 python3 engine/release/bundle.py pack yah-<version>-gfx1151       # checks it is self-contained, then the tarball
 ```
 
-`smoke.py` starts the bundle's server with only `HOME` and `PATH` set: chat completions plain and streamed, Responses, sampling with penalties, cache reuse on a follow-up. `bundle.py pack` checks every ELF in the bundle resolves its libraries inside it with a clean environment and prints the glibc it needs.
+`smoke.py` starts the bundle's server with only `HOME` and `PATH` set: chat completions plain and streamed, Responses, sampling with penalties, a function tool through both APIs, cache reuse on a follow-up; `--npu`: the NPU on and an answer from deep in a two-chunk prompt. `bundle.py pack` checks every ELF in the bundle resolves its libraries inside it with a clean environment and prints the glibc it needs.
 
 ## Correctness
 

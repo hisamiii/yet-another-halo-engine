@@ -3,9 +3,9 @@
 
 usage: bundle.py build <out dir> <version> [--licenses <dir>]
            from the built tree (engine/build_hrx.sh): <out dir>/yah-<version>-gfx1151/ without hal/
-       bundle.py hal <bundle dir> <prefill set> <decode set>
+       bundle.py hal <bundle dir> <prefill set> <decode set> [--npu <prefill set with the NPU block>]
            add a HAL set pair (validated on a gfx1151 box) as hal/<ctx>-<kv>/ (its decode set's context and KV
-           format: yah_server --ctx / --kv); run it once per pair
+           format: yah_server --ctx / --kv), and the set yah_server --npu runs (prefill-npu/); once per pair
        bundle.py pack <bundle dir>
            check the bundle, then <bundle dir>.tar.xz beside it
 
@@ -13,7 +13,8 @@ The bundle:
   bin/        yah_server, yah_chat (RPATH $ORIGIN/../lib)
   lib/        libhrx, ICU, the HSA runtime with librocprofiler-register and the ROCm sysdeps it loads (in
               lib/rocm_sysdeps/lib, where the HSA runtime's own RPATH looks)
-  hal/        <ctx>-<kv>/prefill and decode/ (decode-mtp/: with the MTP layer's kernels); 32768-kv8 is the default
+  hal/        <ctx>-<kv>/prefill and decode/ (decode-mtp/: with the MTP layer's kernels), prefill-npu/
+              (emit_npu_ffn.py); 32768-kv8 is the default
   licenses/   this repository's, HRX's, the ROCm parts', ICU's and the sysdeps' (--licenses: extra files)
   README.md   engine/release/README.md
 
@@ -132,12 +133,14 @@ def set_name(decode):
     return f"{ctx}-{kv}", "decode-mtp" if mtp else "decode"
 
 
-def hal(b, prefill, decode):
-    for src, name, marker in ((prefill, "prefill", "dispatch.txt"), (decode, "decode", "decode.txt")):
-        if not os.path.isfile(os.path.join(src, marker)):
+def hal(b, prefill, decode, npu=None):
+    for src, name, marker in ((prefill, "prefill", "dispatch.txt"), (decode, "decode", "decode.txt"),
+                              (npu, "NPU prefill", "npu.txt")):
+        if src and not os.path.isfile(os.path.join(src, marker)):
             sys.exit(f"bundle: {src} is not a {name} set (no {marker})")
     pair, dec = set_name(decode)
-    for src, name in ((prefill, "prefill"), (decode, dec)):
+    sets = [(prefill, "prefill"), (decode, dec)] + ([(npu, "prefill-npu")] if npu else [])
+    for src, name in sets:
         dst = os.path.join(b, "hal", pair, name)
         if os.path.exists(dst):
             sys.exit(f"bundle: {dst} exists")
@@ -177,8 +180,8 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["build"] and len(a) in (3, 5) and (len(a) == 3 or a[3] == "--licenses"):
         build(os.path.abspath(a[1]), a[2], a[4] if len(a) == 5 else None)
-    elif a[:1] == ["hal"] and len(a) == 4:
-        hal(*a[1:])
+    elif a[:1] == ["hal"] and (len(a) == 4 or len(a) == 6 and a[4] == "--npu"):
+        hal(a[1], a[2], a[3], a[5] if len(a) == 6 else None)
     elif a[:1] == ["pack"] and len(a) == 2:
         pack(a[1])
     else:

@@ -38,6 +38,15 @@ Reasoning effort: `reasoning_effort` for chat completions, `reasoning.effort` fo
 
 The HAL sets in `hal/` give 32K tokens of context, with an 8-bit KV cache (`hal/32768-kv8/`; `--ctx` / `--kv` pick another pair a bundle holds). One request runs at a time; others wait.
 
+## The NPU
+
+`--npu` runs part of each layer's FFN on the XDNA2 NPU during prompt processing: long prompts (two chunks, 4096 tokens or more) get about 10% faster. It needs:
+- the `amdxdna` driver, with read and write access to `/dev/accel/accel0`
+- an unlimited memlock limit (`<user> - memlock unlimited` in `/etc/security/limits.d/90-yah.conf`, then log in again)
+- the GPU's DPM level pinned to `high`: `echo high | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level` (`auto` restores it). Clock switches while the NPU runs corrupt its outputs.
+
+Without one of them the server says why (`yah_server: npu off: ...`) and runs on the GPU alone. The start takes about 3 s longer: the NPU's down weights are packed from the model.
+
 ## If something is off
 
 - `hfq: cannot lock the model in memory (RLIMIT_MEMLOCK)` is a warning: the model stays mapped but may be paged out under memory pressure. To lock it, raise the memlock limit, for example a line `<user> - memlock unlimited` in `/etc/security/limits.d/90-yah.conf`, then log in again.
