@@ -52,12 +52,15 @@ struct MemoryPlan {
     // format's bits plus scales), f32 / f16 attention scratch and the MTP layer's f16 KV.
     const std::uint64_t kv = 16ull * 1024 * (kb + vb) / 8 * 33 / 32;
     p.buffers = kFixed + std::uint64_t{p.context} * (kv + kScratchPerToken + (mtp ? kMtpPerToken : 0));
-    if (!npu_set.empty()) {  // the down pack: 64 layers of 5120 IQ4_XS rows over the NPU's F features (npu.txt)
+    if (!npu_set.empty()) {  // the down pack: 64 layers of 5120 IQ4_XS rows over the NPU's F features (npu.txt; none
+                             // in a native set, whose NPU reads the model's rows)
       std::ifstream n(npu_set + "/npu.txt");
-      std::string key;
+      std::string key, rest;
       std::uint64_t F = 0;
+      bool native = false;
       n >> key >> F;
-      p.buffers += (key == "npuffn" ? 64ull * 5120 * F / 256 * 136 : 0) + kNpuFixed;
+      while (n >> rest) native |= rest == "npunative";
+      p.buffers += (key == "npuffn" && !native ? 64ull * 5120 * F / 256 * 136 : 0) + kNpuFixed;
     }
     p.available = Available();
     return p;

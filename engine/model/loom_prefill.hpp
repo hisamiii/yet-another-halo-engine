@@ -122,9 +122,11 @@ class LoomPrefill {
   [[nodiscard]] NpuPlan npu_plan() const {
     NpuPlan p;
     if (!FfnF()) return p;
-    const NpuBytes sw = NpuBytesOf("npubytes_ffnsw");
-    p.a_bytes = sw.a, p.w_bytes = sw.w;   // (W: the images' panel binding, not read)
-    for (const auto& [p0, passes] : FfnParts()) p.w_bytes = std::max(p.w_bytes, NpuBytesOf(DnImage(passes, "npubytes_")).w);
+    for (const auto& [name, g] : geom_)   // (W: the images' panel binding, not read)
+      if (name.rfind("npubytes_", 0) == 0) {
+        if (name.rfind("npubytes_ffnsw", 0) == 0) p.a_bytes = std::max(p.a_bytes, std::size_t{g.tokens});
+        p.w_bytes = std::max(p.w_bytes, std::size_t{g.rowgrp});
+      }
     p.c_bytes = NpuCBytes();
     if (pairs_) p.a_bytes *= 2, p.c_bytes *= 2;   // a half per chunk of a pair
     p.dcol = p.gfirst = true;
@@ -885,11 +887,21 @@ class LoomPrefill {
   static std::string DnImage(std::uint32_t passes, const char* pre = "") { return pre + std::string("ffndn") + std::to_string(passes); }
   // H's bytes in C (from 0), then down's partials from FfnDownOff().
   std::size_t FfnDownOff() const { return (std::size_t{B_ / 64} * (FfnF() / 1024) * kHRec + 4095) / 4096 * 4096; }
-  std::size_t DownC() const { return NpuBytesOf(DnImage(FfnParts()[0].second, "npubytes_")).c; }
+  // (native sets: "<image>_<fmt>" rows, alike in C bytes)
+  std::size_t DownC() const {
+    const std::string pre = DnImage(FfnParts()[0].second, "npubytes_");
+    const auto it = geom_.lower_bound(pre);
+    if (it == geom_.end() || it->first.compare(0, pre.size(), pre) != 0) throw LoomError("npu.txt has no " + pre + " row");
+    return it->second.tt;
+  }
   std::size_t DownRowBytes() const { return std::size_t{FfnF()} / 256 * 136; }   // a down pack row (IQ4_XS)
   static constexpr std::size_t kRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
 
   bool RunFfnBlock(const std::string& pre);
+  bool RunFfnBlockNative(const std::string& pre);
+  // down's rows for the NPU of an MQ4 set (npu_down_pack.hpp), into npu_down_
+  void PackDown();
+  bool NpuNative() const { return geom_.count("npunative") != 0; }
   // The selected chunk's pending FFN block: wait for its last NPU job, then hidden = hidden2 + the NPU's partials.
   void JoinFfn();
   std::size_t NpuCBytes() const { return FfnDownOff() + FfnParts().size() * kDownCalls * DownC(); }

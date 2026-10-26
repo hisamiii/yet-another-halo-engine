@@ -83,10 +83,121 @@ def compile_npu(cfg, groups, name, outdir):
     return tuple(N.stream_bytes(cfg))
 
 
+# A native set (a GGUF's own formats, emit_prefill_pp YAH_NATIVE): the NPU decoders per role (gen_npu_dec DQ_FMT). Gate
+# and up of one format and the decoder's activation order (IQ4_XS's P4); down any of DN_FMTS, H in its k-block order.
+SW_FMTS = {"iq4xs": "IQ4_XS"}
+DN_FMTS = {"iq4xs": "IQ4_XS", "q4k": "Q4_K", "iq3s": "IQ3_S"}
+BLK = {"iq4xs": 136, "q4k": 144, "iq3s": 110}
+
+
+def hord(dfmt):
+    return "Q4K" if dfmt == "q4k" else "P4"
+
+
+def dn_native(B, F, passes, dfmt):
+    """Down from H over a K part, the GGUF's own rows (kraw: the whole row) decoded on the cores. IQ4_XS: dn_cfg's
+    k-slices; the others the old engine's (36, 36, 36, 20), grid formats with their helper rings late."""
+    if dfmt == "iq4xs":
+        return N.Config(COLS, B // 64, KS_DN, passes, mu=1, gate=N.GATE_SUPPLY, gwest=1, ghelp=1, gfirst=1, fuse=2,
+                        kraw=FFN, ain="h", hpass=F // 1024, fmt="IQ4_XS", kchain=1, hcap=2, gtail=1)
+    return N.Config(COLS, B // 64, (36, 36, 36, 20), passes, mu=1, gate=N.GATE_SUPPLY, gwest=1, ghelp=1, gfirst=1,
+                    fuse=2, kraw=FFN, ain="h", hpass=F // 1024, fmt=DN_FMTS[dfmt], kchain=1, hcap=2, gtail=1,
+                    hlate=int(dfmt == "iq3s"))
+
+
+def native(model, outdir, B, F):
+    """The NPU FFN block of a native set: the layers whose gate / up and down formats have decoders run it (npu.txt
+    "npulayer_<layer> 1 0 0"); its images "npu_ffnsw_<fmt>_<hord>" and "npu_ffndn<passes>_<fmt>"; the GPU's share the
+    fused ffn over the first G features (".npu.hal": OSTRIDE) and down's residual GEMM over that K window
+    ("gemm_kresw_<fmt>_<G / 256>.hal": KWIN)."""
+    import dataclasses
+    import gen_gemm_tile as TG
+    G = FFN - F
+    by = {}
+    for nm, dims, ty in E.parse(model):
+        p = nm.split(".")
+        if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up", "ffn_down") and dims[-1] in (FFN, HID):
+            by.setdefault(int(p[1]), {})[p[2]] = E.FMT[ty][0]
+    ok = {l: f for l, f in by.items() if len(f) == 3 and f["ffn_gate"] == f["ffn_up"] in SW_FMTS
+          and f["ffn_down"] in DN_FMTS}
+    if not ok:
+        sys.exit("emit_npu_ffn: no layer of %s has NPU decoders for its FFN formats" % model)
+    tmp = os.path.join(outdir, ".emit_tmp")
+    os.makedirs(tmp, exist_ok=True)
+    rows = [("npuffn", F, B, len(parts(F))), ("npugate", N.GATE_SUPPLY, N.GATE_CALLS, N.GATE_RECORD), ("npunative", 1, 0, 0)]
+    rows += [("npulayer_%d" % l, 1, 0, 0) for l in sorted(ok)]
+
+    def loom(name, text, configs=("nop=0",)):
+        src = os.path.join(tmp, name[:-4] + ".loom")
+        open(src, "w").write(text)
+        E.emit(src, list(configs), name, outdir)
+    # ---- GPU: the encoder (from the norm's row-major output), the GPU's gate / up and down, the unpack, the flag wait
+    groups, perm = GE.GROUPS, GE.ACT_PERM
+    GE.GROUPS, GE.ACT_PERM = (5,), "p4"
+    try:
+        loom("npu_enc_act.hal", GE.gen("act", B, list(KS_SW), 5))
+    finally:
+        GE.GROUPS, GE.ACT_PERM = groups, perm
+    rows.append(("npu_enc_act.hal", GE.WG, 0, (B // 8) * 5 * sum(KS_SW) // GE.WG))
+    for fmt in sorted({f["ffn_gate"] for f in ok.values()}):
+        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", HID // 256), **P.AF_TILE, **P.AF_FFN[fmt], ffn=True,
+                                tout=True)
+        TG.check(t)
+        TG.OSTRIDE = FFN
+        try:
+            rows.append(P._emit_gen(lambda f, k: TG.gen(f, k, t, False), t.bn, fmt, G // 16, HID // 256, B,
+                                    "gemm_ffn_%s_%d_%d.npu.hal" % (fmt, FFN // 16, HID // 256), outdir, "ffn",
+                                    t.rowgrp, ostride=FFN))
+        finally:
+            TG.OSTRIDE = 0
+    for fmt in sorted({f["ffn_down"] for f in ok.values()}):
+        knobs = dict(P.AF[(fmt, "kres", HID // 16, FFN // 256)])
+        knobs.pop("persist", None)
+        knobs["respre"] = 0
+        t = dataclasses.replace(TG.default_tile(fmt, "kres", G // 256), **P.AF_TILE, **knobs)
+        TG.check(t)
+        TG.KWIN = (0, FFN // 256)
+        try:
+            rows.append(P._emit_gen(lambda f, k: TG.gen(f, k, t, False), t.bn, fmt, HID // 16, G // 256, B,
+                                    "gemm_kresw_%s_%d.hal" % (fmt, G // 256), outdir, "kres", t.rowgrp,
+                                    kfull=FFN // 256))
+        finally:
+            TG.KWIN = None
+    calls = HID // (COLS * 64)
+    cg = GU.CG
+    GU.CG = 1
+    try:
+        with N.np_override(NP):
+            loom("npu_unpack_ffn.hal", GU.gen(B, calls * COLS, HID, 0, resid=True, parts=len(parts(F))))
+            nj, wg = N.TN // 8, GU.wg(calls * COLS)
+    finally:
+        GU.CG = cg
+    rows.append(("npu_unpack_ffn.hal", B * calls * COLS * nj // wg, wg, 0))
+    loom("npu_flag_wait.hal", GU.gen_flag_wait())
+    rows.append(("npu_flag_wait.hal", 1, 32, 0))
+    # ---- NPU
+    with N.np_override(NP):
+        for fmt, ho in sorted({(f["ffn_gate"], hord(f["ffn_down"])) for f in ok.values()}):
+            cfg = dataclasses.replace(sw_cfg(B, F, FFN * (HID // 256) * BLK[fmt]), hord=ho, fmt=SW_FMTS[fmt])
+            name = "ffnsw_%s_%s" % (fmt, ho.lower())
+            rows.append(("npubytes_" + name,) + compile_npu(cfg, (5,), "npu_" + name, outdir))
+        for fmt in sorted({f["ffn_down"] for f in ok.values()}):
+            for passes in sorted({p for _, p in parts(F)}):
+                name = "ffndn%d_%s" % (passes, fmt)
+                rows.append(("npubytes_" + name,) + compile_npu(dn_native(B, F, passes, fmt), (passes,), "npu_" + name,
+                                                                outdir))
+    with open(os.path.join(outdir, "npu.txt"), "w") as fh:
+        for r in rows:
+            fh.write(" ".join(str(v) for v in r) + "\n")
+    print(f"npu ffn block F={F} B={B} (native): layers {sorted(ok)}, {len(rows)} rows in {outdir}/npu.txt")
+
+
 def main():
     model, outdir, B = sys.argv[1], sys.argv[2], int(sys.argv[3])
     F = int(sys.argv[4]) if len(sys.argv) > 4 else 8192
     assert F % 1024 == 0 and 0 < F < FFN and (FFN - F) % 256 == 0 and B % 64 == 0
+    if any(ln.startswith("native ") for ln in open(os.path.join(outdir, "dispatch.txt"))):
+        return native(model, outdir, B, F)
     G = FFN - F
     # up's rows follow gate's by its MQ4 bytes and the HFQ's f16 gate awq (a GGUF is converted to that layout;
     # LoomPrefill checks every layer's)

@@ -999,7 +999,9 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
-def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False):
+def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, kfull=0):
+    """ostride: a GEMM over the leading mt * 16 rows of an ostride-row output (gen_gemm_tile.OSTRIDE, the NPU FFN block's
+    GPU share); kfull: a K window's whole-row k_blocks (gen_gemm_tile.KWIN)."""
     if B % tile and not masked:
         return None
     import gen_gemm_tile as _TG
@@ -1014,7 +1016,8 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     import subprocess
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
-                           kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []),
+                           kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []) +
+                          (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else []),
                           capture_output=True, text=True)
     if gate.returncode != 0:
         raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
