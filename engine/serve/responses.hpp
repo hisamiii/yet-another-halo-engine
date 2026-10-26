@@ -104,6 +104,32 @@ class OutputParser {
   std::uint32_t reasoning_tokens_ = 0;
 };
 
+// Splits answer text into content and the calls of the template's tool format (<tool_call>, <function=name>,
+// <parameter=key> value </parameter>, ..., </function>, </tool_call>), each call once it is complete. Holds back what
+// may begin a call and the whitespace before it. A value is JSON where the tool's schema does not make it a string
+// and it parses.
+class ToolCallParser {
+ public:
+  struct Chunk {
+    std::string content;
+    std::vector<ToolCall> calls;
+  };
+
+  explicit ToolCallParser(Json tools) : tools_(std::move(tools)) {}
+  Chunk Feed(std::string_view text);
+  // An unfinished call goes out as text.
+  Chunk Finish();
+
+ private:
+  [[nodiscard]] bool Parse(std::string_view block, ToolCall* call) const;
+  [[nodiscard]] Json Value(const std::string& function, const std::string& key, std::string_view text) const;
+
+  Json tools_;
+  std::string held_;
+  bool in_call_ = false;
+  bool called_ = false;
+};
+
 // One /v1/responses generation. Builds the response object and, when emit is set, the stream events.
 // emit gets each event already framed as SSE and returns false when the client is gone.
 class ResponseStream {

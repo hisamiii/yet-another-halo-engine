@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "serve/chat_completions.hpp"
 #include "serve/chat_template.hpp"
 #include "serve/fake_generator.hpp"
 #include "serve/http.hpp"
@@ -62,16 +63,11 @@ int CheckChatTemplate(const std::filesystem::path& fixture, int* total) {
   for (const Json& c : cases) {
     std::string got, error;
     try {
-      std::vector<ChatMessage> messages;
-      for (const Json& m : c.at("messages")) {
-        messages.push_back({m.at("role").get<std::string>(),
-                            ContentText(m.contains("content") ? m["content"] : Json(nullptr), "content"),
-                            m.value("reasoning_content", std::string())});
-      }
-      ChatOptions options;
-      options.effort = ParseEffort(c.at("effort").get<std::string>());
-      options.add_generation_prompt = c.at("add_generation_prompt").get<bool>();
-      got = RenderChat(messages, options);
+      ChatRequest request = ParseChatRequest(
+          {{"model", "m"}, {"messages", c.at("messages")}, {"tools", c.value("tools", Json::array())}});
+      request.chat.effort = ParseEffort(c.at("effort").get<std::string>());
+      request.chat.add_generation_prompt = c.at("add_generation_prompt").get<bool>();
+      got = RenderChat(request.messages, request.chat);
     } catch (const std::exception& e) {
       error = e.what();
     }
@@ -384,6 +380,7 @@ class Tester {
     ChatStreaming();
     ChatStop();
     ChatErrors();
+    ChatTools();
   }
 
  private:
@@ -767,7 +764,7 @@ class Tester {
     Check(r["choices"].is_array() && r["choices"].size() == 1, where + ": choices " + Dump(r["choices"]));
     const Json& c = r["choices"][0];
     CheckEq(c["index"], 0, where + ": choices[0].index");
-    OneOf(c, where + ".choices[0]", "finish_reason", {"stop", "length"});
+    OneOf(c, where + ".choices[0]", "finish_reason", {"stop", "length", "tool_calls"});
     CheckEq(c["message"]["role"], "assistant", where + ": message.role");
     Required(c["message"], where + ".message", "content", Kind::kString);
     CheckChatUsage(r["usage"], where);
@@ -920,6 +917,55 @@ class Tester {
     CheckEq(r["choices"][0]["finish_reason"], "length", "chat stop after the limit: finish_reason");
   }
 
+  void ChatTools() {
+    const Json tools =
+        Json::array({{{"type", "function"},
+                      {"function",
+                       {{"name", "get_weather"},
+                        {"parameters",
+                         {{"type", "object"},
+                          {"properties", {{"city", {{"type", "string"}}}, {"days", {{"type", "integer"}}}}}}}}}}});
+    const Json messages = {{{"role", "user"}, {"content", "Weather in Paris?"}}};
+    const Json args = {{"city", "Paris"}, {"days", 3}};
+    std::string where = "chat tools";
+    Json r = Chat({{"model", "m"}, {"messages", messages}, {"tools", tools}}, where);
+    const Json& m = r["choices"][0]["message"];
+    CheckEq(m["content"], "Let me look.", where + ": content");
+    CheckEq(r["choices"][0]["finish_reason"], "tool_calls", where + ": finish_reason");
+    Check(m["tool_calls"].size() == 1, where + ": one call");
+    const Json& call = m["tool_calls"][0];
+    Check(call["id"].get<std::string>().starts_with("call_"), where + ": id");
+    CheckEq(call["type"], "function", where + ": type");
+    CheckEq(call["function"]["name"], "get_weather", where + ": name");
+    CheckEq(Json::parse(call["function"]["arguments"].get<std::string>()), args, where + ": arguments");
+
+    where = "chat tools stream";
+    std::vector<Json> chunks = ChatChunks({{"model", "m"}, {"messages", messages}, {"tools", tools}}, where);
+    CheckEq(Accumulate(chunks, where)["content"], "Let me look.", where + ": content");
+    Json calls = Json::array();
+    for (const Json& e : chunks) {
+      for (const Json& c : e["choices"]) {
+        if (c["delta"].contains("tool_calls")) calls.push_back(c["delta"]["tool_calls"][0]);
+      }
+    }
+    Check(calls.size() == 1, where + ": one tool_calls delta");
+    CheckEq(calls[0]["index"], 0, where + ": index");
+    CheckEq(calls[0]["function"]["name"], "get_weather", where + ": name");
+    CheckEq(Json::parse(calls[0]["function"]["arguments"].get<std::string>()), args, where + ": arguments");
+    CheckEq(chunks.back()["choices"][0]["finish_reason"], "tool_calls", where + ": finish_reason");
+
+    // The call and its result sent back; tool_choice none hides the tools.
+    Json history = messages;
+    history.push_back({{"role", "assistant"}, {"content", nullptr}, {"tool_calls", Json::array({call})}});
+    history.push_back({{"role", "tool"}, {"tool_call_id", call["id"]}, {"content", "18 C, sunny"}});
+    r = Chat({{"model", "m"}, {"messages", history}, {"tools", tools}}, "chat tools history");
+    CheckEq(r["choices"][0]["finish_reason"], "tool_calls", "chat tools history: finish_reason");
+    r = Chat({{"model", "m"}, {"messages", history}, {"tools", tools}, {"tool_choice", "none"}},
+             "chat tool_choice none");
+    CheckEq(r["choices"][0]["message"]["content"], kAnswer, "chat tool_choice none: content");
+    Check(!r["choices"][0]["message"].contains("tool_calls"), "chat tool_choice none: no tool_calls");
+  }
+
   void ChatErrors() {
     const std::string path = "/v1/chat/completions";
     const auto body = [](const Json& extra) {
@@ -930,11 +976,18 @@ class Tester {
     Bad(R"({"messages": [{"role": "user", "content": "Hi"}]})", "model", "", path);
     Bad(R"({"model": "m"})", "messages", "", path);
     Bad(R"({"model": "m", "messages": []})", "messages", "", path);
-    Bad(R"({"model": "m", "messages": [{"role": "tool", "content": "x"}]})", "messages[0].role", "", path);
+    Bad(R"({"model": "m", "messages": [{"role": "robot", "content": "x"}]})", "messages[0].role", "", path);
     Bad(R"({"model": "m", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]})",
         "messages[0].content[0].type", "", path);
-    Bad(body({{"tools", Json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}})}}), "tools",
-        "unsupported_parameter", path);
+    Bad(body({{"tools", Json::array({{{"type", "web_search"}}})}}), "tools[0].type", "unsupported_value", path);
+    Bad(body({{"tools", Json::array({{{"type", "function"}, {"function", Json::object()}}})}}),
+        "tools[0].function.name", "", path);
+    Bad(body({{"tool_choice", "required"}}), "tool_choice", "unsupported_value", path);
+    Bad(R"({"model": "m", "messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "tool_calls": )"
+        R"([{"function": {"name": "f", "arguments": "{oops"}}]}]})",
+        "messages[1].tool_calls[0].function.arguments", "", path);
+    Bad(R"({"model": "m", "messages": [{"role": "user", "content": "Hi", "tool_calls": [{"function": {"name": "f"}}]}]})",
+        "messages[0].tool_calls", "", path);
     Bad(body({{"n", 2}}), "n", "", path);
     Bad(body({{"logprobs", true}}), "logprobs", "", path);
     Bad(body({{"temperature", 3}}), "temperature", "invalid_value", path);
@@ -988,9 +1041,11 @@ int main(int argc, char** argv) {
 
   try {
     int total = 0;
-    const int passed = CheckChatTemplate(dir / "../serve/testdata/chat_template_cases.json", &total);
-    std::printf("chat template: %d/%d\n", passed, total);
-    failed = passed != total;
+    for (const char* fixture : {"chat_template_cases.json", "chat_template_tool_cases.json"}) {
+      const int passed = CheckChatTemplate(dir / "../serve/testdata" / fixture, &total);
+      std::printf("chat template %s: %d/%d\n", fixture, passed, total);
+      failed = failed || passed != total;
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL chat template: %s\n", e.what());
     failed = true;

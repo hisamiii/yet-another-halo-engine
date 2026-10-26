@@ -10,6 +10,36 @@ namespace {
 // The largest penalty window; penalty_last_n beyond it is refused.
 constexpr std::int64_t kMaxPenaltyWindow = 1024;
 
+// An assistant message's tool call. Arguments come as a JSON string (OpenAI) or an object.
+ToolCall ParseToolCall(const Json& item, const std::string& param) {
+  const Json* function = item.is_object() ? Field(item, "function") : nullptr;
+  if (function == nullptr || !function->is_object()) throw ApiError(400, "A tool call needs a 'function'.", param);
+  ToolCall call;
+  const Json* name = Field(*function, "name");
+  if (name == nullptr || !name->is_string() || name->get<std::string>().empty()) {
+    throw ApiError(400, "Tool call is missing a function name.", param + ".function.name");
+  }
+  call.name = name->get<std::string>();
+  if (const Json* id = Field(item, "id"); id != nullptr && id->is_string()) call.id = id->get<std::string>();
+  call.arguments = Json::object();
+  if (const Json* args = Field(*function, "arguments")) {
+    Json parsed = *args;
+    if (args->is_string()) {
+      const std::string text = TrimPy(args->get<std::string>());
+      try {
+        parsed = text.empty() ? Json::object() : Json::parse(text);
+      } catch (const Json::parse_error&) {
+        parsed = nullptr;
+      }
+    }
+    if (!parsed.is_object()) {
+      throw ApiError(400, "Tool call arguments must be a JSON object.", param + ".function.arguments");
+    }
+    call.arguments = std::move(parsed);
+  }
+  return call;
+}
+
 std::vector<ChatMessage> ParseMessages(const Json& messages) {
   if (!messages.is_array() || messages.empty()) {
     throw ApiError(400, "'messages' must be a non-empty array.", "messages");
@@ -22,12 +52,16 @@ std::vector<ChatMessage> ParseMessages(const Json& messages) {
     const Json* role = Field(item, "role");
     if (role == nullptr || !role->is_string()) throw ApiError(400, "Message needs a 'role'.", param + ".role");
     ChatMessage m{role->get<std::string>(), "", ""};
-    if (m.role != "user" && m.role != "assistant" && m.role != "system" && m.role != "developer") {
-      throw ApiError(400, "Unsupported role '" + m.role + "'; tools are not supported.", param + ".role",
-                     "invalid_value");
+    if (m.role != "user" && m.role != "assistant" && m.role != "system" && m.role != "developer" && m.role != "tool") {
+      throw ApiError(400, "Unsupported role '" + m.role + "'.", param + ".role", "invalid_value");
     }
     if (const Json* calls = Field(item, "tool_calls"); calls != nullptr && !IsEmptyValue(*calls)) {
-      throw ApiError(400, "Tool calls are not supported.", param + ".tool_calls", "unsupported_parameter");
+      if (m.role != "assistant" || !calls->is_array()) {
+        throw ApiError(400, "'tool_calls' must be an array, on an assistant message.", param + ".tool_calls");
+      }
+      for (std::size_t c = 0; c < calls->size(); ++c) {
+        m.tool_calls.push_back(ParseToolCall((*calls)[c], param + ".tool_calls[" + std::to_string(c) + "]"));
+      }
     }
     m.content = ContentText(item.contains("content") ? item["content"] : Json(nullptr), param + ".content");
     if (m.role == "assistant") {
@@ -70,7 +104,7 @@ ChatRequest ParseChatRequest(const Json& body) {
       "model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p",
       "presence_penalty", "frequency_penalty", "repetition_penalty", "repeat_last_n", "stop", "seed", "stream",
       "stream_options", "reasoning_effort", "chat_template_kwargs", "n", "user", "store", "metadata", "service_tier",
-      "parallel_tool_calls", "prompt_cache_key", "safety_identifier", "ignore_eos"};
+      "parallel_tool_calls", "prompt_cache_key", "safety_identifier", "ignore_eos", "tools", "tool_choice"};
   // clang-format on
   for (const auto& [key, value] : body.items()) {
     if (kAccepted.contains(key) || IsEmptyValue(value) || IsDefaultValue(key, value)) continue;
@@ -86,6 +120,33 @@ ChatRequest ParseChatRequest(const Json& body) {
   const Json* messages = Field(body, "messages");
   if (messages == nullptr) throw ApiError(400, "Missing required parameter: 'messages'.", "messages");
   request.messages = ParseMessages(*messages);
+
+  if (const Json* tools = Field(body, "tools")) {
+    if (!tools->is_array()) throw ApiError(400, "'tools' must be an array.", "tools");
+    for (std::size_t i = 0; i < tools->size(); ++i) {
+      const Json& tool = (*tools)[i];
+      const std::string param = "tools[" + std::to_string(i) + "]";
+      const Json* type = tool.is_object() ? Field(tool, "type") : nullptr;
+      if (type == nullptr || *type != Json("function")) {
+        throw ApiError(400, "Only function tools are supported.", param + ".type", "unsupported_value");
+      }
+      const Json* function = Field(tool, "function");
+      const Json* name = function != nullptr && function->is_object() ? Field(*function, "name") : nullptr;
+      if (name == nullptr || !name->is_string() || name->get<std::string>().empty()) {
+        throw ApiError(400, "A tool needs a 'function' with a 'name'.", param + ".function.name");
+      }
+    }
+    request.chat.tools = *tools;
+  }
+  if (const Json* choice = Field(body, "tool_choice")) {
+    // none: the model is not told of the tools.
+    if (*choice == Json("none")) {
+      request.chat.tools = Json::array();
+    } else if (*choice != Json("auto")) {
+      throw ApiError(400, "Only 'auto' and 'none' are supported for 'tool_choice'.", "tool_choice",
+                     "unsupported_value");
+    }
+  }
 
   if (const Json* effort = Field(body, "reasoning_effort")) {
     if (!effort->is_string()) throw ApiError(400, "'reasoning_effort' must be a string.", "reasoning_effort");
@@ -201,6 +262,7 @@ ChatStream::ChatStream(const ChatRequest& request, std::function<bool(const std:
       emit_(std::move(emit)),
       stop_(request.stop),
       parser_(request.chat.effort != ReasoningEffort::kNone),
+      tool_parser_(request.chat.tools.empty() ? std::nullopt : std::optional<ToolCallParser>(request.chat.tools)),
       id_(RandomId("chatcmpl-")),
       created_(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
                    .count()) {}
@@ -236,16 +298,42 @@ void ChatStream::Apply(const OutputParser::Chunk& chunk) {
     reasoning_ += chunk.reasoning;
     EmitChunk({{"reasoning_content", chunk.reasoning}}, nullptr);
   }
-  if (!chunk.answer.empty()) {
-    answer_ += chunk.answer;
-    EmitChunk({{"content", chunk.answer}}, nullptr);
+  if (!tool_parser_) {
+    Content(chunk.answer);
+  } else if (!chunk.answer.empty()) {
+    ApplyTools(tool_parser_->Feed(chunk.answer));
   }
+}
+
+void ChatStream::Content(const std::string& text) {
+  if (text.empty()) return;
+  answer_ += text;
+  EmitChunk({{"content", text}}, nullptr);
+}
+
+void ChatStream::ApplyTools(ToolCallParser::Chunk chunk) {
+  Content(chunk.content);
+  for (ToolCall& call : chunk.calls) {
+    Json delta = {{"index", calls_.size()}};
+    Json object = CallObject(call);
+    for (auto& [key, value] : object.items()) delta[key] = std::move(value);
+    EmitChunk({{"tool_calls", Json::array({std::move(delta)})}}, nullptr);
+    calls_.push_back(std::move(call));
+  }
+}
+
+Json ChatStream::CallObject(const ToolCall& call) {
+  return {
+      {"id", call.id}, {"type", "function"}, {"function", {{"name", call.name}, {"arguments", Dump(call.arguments)}}}};
 }
 
 bool ChatStream::Finish(const model::GenerateResult& result) {
   if (const std::string tail = stop_.Finish(); !tail.empty()) Apply(parser_.Feed(tail));
   Apply(parser_.Finish());
-  finish_reason_ = result.finish_reason == "length" && !stop_.stopped() ? "length" : "stop";
+  if (tool_parser_) ApplyTools(tool_parser_->Finish());
+  finish_reason_ = !calls_.empty()                                        ? "tool_calls"
+                   : result.finish_reason == "length" && !stop_.stopped() ? "length"
+                                                                          : "stop";
   usage_ = {{"prompt_tokens", result.prompt_tokens},
             {"completion_tokens", result.generated_tokens},
             {"total_tokens", result.prompt_tokens + result.generated_tokens},
@@ -265,8 +353,14 @@ void ChatStream::Fail(const std::string& message) {
 }
 
 Json ChatStream::Response() const {
-  Json message = {{"role", "assistant"}, {"content", answer_}, {"refusal", nullptr}};
+  Json message = {{"role", "assistant"},
+                  {"content", answer_.empty() && !calls_.empty() ? Json(nullptr) : Json(answer_)},
+                  {"refusal", nullptr}};
   if (!reasoning_.empty()) message["reasoning_content"] = reasoning_;
+  if (!calls_.empty()) {
+    message["tool_calls"] = Json::array();
+    for (const ToolCall& call : calls_) message["tool_calls"].push_back(CallObject(call));
+  }
   return {{"id", id_},
           {"object", "chat.completion"},
           {"created", created_},

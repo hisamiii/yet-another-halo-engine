@@ -1,6 +1,7 @@
 // The OpenAI Chat Completions API (POST /v1/chat/completions) on top of model::TextGenerator: request parsing, stop
 // strings, and the chat.completion object and its chat.completion.chunk stream.
-// Reasoning goes out as reasoning_content (llama.cpp's and vLLM's field), the answer as content.
+// Reasoning goes out as reasoning_content (llama.cpp's and vLLM's field), the answer as content, and with tools the
+// model's calls as tool_calls, each in one chunk once it is complete.
 #ifndef YAH_SERVE_CHAT_COMPLETIONS_HPP_
 #define YAH_SERVE_CHAT_COMPLETIONS_HPP_
 
@@ -73,11 +74,16 @@ class ChatStream {
  private:
   bool EmitChunk(Json delta, const Json& finish_reason, const Json* usage = nullptr);
   void Apply(const OutputParser::Chunk& chunk);
+  void Content(const std::string& text);
+  void ApplyTools(ToolCallParser::Chunk chunk);
+  static Json CallObject(const ToolCall& call);
 
   const ChatRequest& request_;
   std::function<bool(const std::string&)> emit_;
   StopMatcher stop_;
   OutputParser parser_;
+  std::optional<ToolCallParser> tool_parser_;  // with tools
+  std::vector<ToolCall> calls_;
   std::string id_;
   std::int64_t created_;
   std::string reasoning_, answer_;

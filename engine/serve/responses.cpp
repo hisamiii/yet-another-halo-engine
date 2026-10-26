@@ -297,6 +297,136 @@ void OutputParser::EmitAnswer(std::string_view text, Chunk* chunk) {
   chunk->answer += text;
 }
 
+namespace {
+
+constexpr std::string_view kCallOpen = "<tool_call>", kCallClose = "</tool_call>";
+
+bool IsAsciiSpace(char c) {
+  return c == ' ' || c == '\n' || c == '\t' || c == '\r';
+}
+
+}  // namespace
+
+ToolCallParser::Chunk ToolCallParser::Feed(std::string_view text) {
+  Chunk chunk;
+  held_ += text;
+  for (;;) {
+    if (in_call_) {
+      const std::size_t end = held_.find(kCallClose);
+      if (end == std::string::npos) return chunk;
+      const std::string block = held_.substr(0, end);
+      ToolCall call;
+      if (Parse(block, &call)) {
+        chunk.calls.push_back(std::move(call));
+        called_ = true;
+      } else {
+        chunk.content += std::string(kCallOpen) + block + std::string(kCallClose);
+      }
+      held_.erase(0, end + kCallClose.size());
+      in_call_ = false;
+      continue;
+    }
+    // Text goes out up to a call or a tail that may begin one, less the whitespace before either.
+    std::size_t keep = held_.size();
+    const std::size_t open = held_.find(kCallOpen);
+    if (open != std::string::npos) {
+      keep = open;
+    } else {
+      for (std::size_t n = std::min(kCallOpen.size() - 1, held_.size()); n > 0; --n) {
+        if (held_.compare(held_.size() - n, n, kCallOpen, 0, n) == 0) {
+          keep = held_.size() - n;
+          break;
+        }
+      }
+    }
+    std::size_t cut = keep;
+    while (cut > 0 && IsAsciiSpace(held_[cut - 1])) --cut;
+    chunk.content += held_.substr(0, cut);
+    if (open == std::string::npos) {
+      held_.erase(0, cut);
+      return chunk;
+    }
+    held_.erase(0, open + kCallOpen.size());
+    in_call_ = true;
+  }
+}
+
+ToolCallParser::Chunk ToolCallParser::Finish() {
+  Chunk chunk;
+  if (in_call_) {
+    chunk.content = std::string(kCallOpen) + held_;
+  } else if (!called_ || !TrimPy(held_).empty()) {
+    chunk.content = held_;
+  }
+  held_.clear();
+  in_call_ = false;
+  return chunk;
+}
+
+bool ToolCallParser::Parse(std::string_view block, ToolCall* call) const {
+  constexpr std::string_view kFunction = "<function=", kFunctionEnd = "</function>";
+  constexpr std::string_view kParameter = "<parameter=", kParameterEnd = "</parameter>";
+  std::size_t at = block.find(kFunction);
+  if (at == std::string_view::npos) return false;
+  at += kFunction.size();
+  const std::size_t name_end = block.find('>', at);
+  if (name_end == std::string_view::npos) return false;
+  call->name = TrimPy(block.substr(at, name_end - at));
+  if (call->name.empty()) return false;
+  call->id = RandomId("call_");
+  call->arguments = Json::object();
+  const std::size_t body_end = std::min(block.find(kFunctionEnd, name_end), block.size());
+  for (at = name_end + 1;;) {
+    const std::size_t p = block.find(kParameter, at);
+    if (p == std::string_view::npos || p >= body_end) break;
+    const std::size_t key_at = p + kParameter.size();
+    const std::size_t key_end = block.find('>', key_at);
+    if (key_end == std::string_view::npos || key_end > body_end) return false;
+    // A value ends at its </parameter>, or where the next parameter or the function's end shows it was not closed.
+    const std::size_t value_at = key_end + 1;
+    const std::size_t value_end =
+        std::min({block.find(kParameterEnd, value_at), block.find(kParameter, value_at), body_end});
+    std::string_view value = block.substr(value_at, value_end - value_at);
+    if (value.starts_with('\n')) value.remove_prefix(1);
+    if (value.ends_with('\n')) value.remove_suffix(1);
+    const std::string key = TrimPy(block.substr(key_at, key_end - key_at));
+    call->arguments[key] = Value(call->name, key, value);
+    at = block.compare(value_end, kParameterEnd.size(), kParameterEnd) == 0 ? value_end + kParameterEnd.size()
+                                                                            : value_end;
+  }
+  return true;
+}
+
+Json ToolCallParser::Value(const std::string& function, const std::string& key, std::string_view text) const {
+  // Strings unless the schema gives the parameter a type that is not string (an undeclared one stays a string).
+  bool string = true;
+  for (const Json& tool : tools_) {
+    const Json* f = Field(tool, "function");
+    if (f == nullptr || f->value("name", std::string()) != function) continue;
+    const Json* params = Field(*f, "parameters");
+    const Json* props = params != nullptr ? Field(*params, "properties") : nullptr;
+    const Json* schema = props != nullptr ? Field(*props, key.c_str()) : nullptr;
+    if (schema == nullptr) break;
+    const Json* type = Field(*schema, "type");
+    if (type == nullptr) {
+      string = false;
+    } else if (type->is_string()) {
+      string = type->get<std::string>() == "string";
+    } else if (type->is_array()) {
+      string = false;
+      for (const Json& t : *type) string = string || t == Json("string");
+    }
+    break;
+  }
+  if (!string) {
+    try {
+      return Json::parse(text);
+    } catch (const Json::parse_error&) {
+    }
+  }
+  return Json(std::string(text));
+}
+
 ResponseStream::ResponseStream(const ResponseRequest& request, std::function<bool(const std::string&)> emit)
     : request_(request),
       emit_(std::move(emit)),

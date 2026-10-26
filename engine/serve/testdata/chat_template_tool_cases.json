@@ -1,0 +1,430 @@
+[
+ {
+  "name": "tools, user",
+  "effort": "high",
+  "add_generation_prompt": true,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"metric\": {\"type\": \"boolean\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools, system, effort none",
+  "effort": "none",
+  "add_generation_prompt": true,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search <docs> & \"notes\"\nfor a query. Gr\u00fc\u00dfe, \u6771\u4eac",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "tags": {
+        "type": "array"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"metric\": {\"type\": \"boolean\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search <docs> & \\\"notes\\\"\\nfor a query. Gr\u00fc\u00dfe, \u6771\u4eac\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"number\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe brief.<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "tools, effort low",
+  "effort": "low",
+  "add_generation_prompt": true,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search <docs> & \"notes\"\nfor a query. Gr\u00fc\u00dfe, \u6771\u4eac",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "tags": {
+        "type": "array"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "description": "The time.",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Search for cats"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search <docs> & \\\"notes\\\"\\nfor a query. Gr\u00fc\u00dfe, \u6771\u4eac\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"number\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\"}}}}}\n{\"type\": \"function\", \"function\": {\"name\": \"now\", \"description\": \"The time.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nSearch for cats<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "one call and its result",
+  "effort": "high",
+  "add_generation_prompt": true,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Need the tool.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "days": 3,
+        "metric": true
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp\": 18}"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"metric\": {\"type\": \"boolean\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nNeed the tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=metric>\ntrue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 18}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "text, two calls, two results, answer, follow-up",
+  "effort": "medium",
+  "add_generation_prompt": true,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search <docs> & \"notes\"\nfor a query. Gr\u00fc\u00dfe, \u6771\u4eac",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "tags": {
+        "type": "array"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You search."
+   },
+   {
+    "role": "user",
+    "content": "Find two things"
+   },
+   {
+    "role": "assistant",
+    "content": "Searching now.",
+    "tool_calls": [
+     {
+      "id": "call_a",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "query": "a \"b\"\nc",
+        "limit": 0.5,
+        "filters": {
+         "lang": "en",
+         "years": [
+          2020,
+          2021
+         ]
+        },
+        "tags": [
+         "x",
+         "\u00fc"
+        ]
+       }
+      }
+     },
+     {
+      "id": "call_b",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "query": "tiny",
+        "limit": 1e-05
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_a",
+    "content": "first"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_b",
+    "content": "second"
+   },
+   {
+    "role": "assistant",
+    "content": "Both found."
+   },
+   {
+    "role": "user",
+    "content": "Thanks, and big numbers?"
+   }
+  ],
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search <docs> & \\\"notes\\\"\\nfor a query. Gr\u00fc\u00dfe, \u6771\u4eac\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"number\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou search.<|im_end|>\n<|im_start|>user\nFind two things<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nSearching now.\n\n<tool_call>\n<function=search>\n<parameter=query>\na \"b\"\nc\n</parameter>\n<parameter=limit>\n0.5\n</parameter>\n<parameter=filters>\n{\"lang\": \"en\", \"years\": [2020, 2021]}\n</parameter>\n<parameter=tags>\n[\"x\", \"\u00fc\"]\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=search>\n<parameter=query>\ntiny\n</parameter>\n<parameter=limit>\n1e-05\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nfirst\n</tool_response>\n<tool_response>\nsecond\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nBoth found.<|im_end|>\n<|im_start|>user\nThanks, and big numbers?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "call without arguments, tool last, no generation prompt",
+  "effort": "high",
+  "add_generation_prompt": false,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "description": "The time.",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "What time is it?"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "now",
+       "arguments": {}
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "12:00"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"now\", \"description\": \"The time.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat time is it?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=now>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n"
+ },
+ {
+  "name": "numbers",
+  "effort": "high",
+  "add_generation_prompt": true,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search <docs> & \"notes\"\nfor a query. Gr\u00fc\u00dfe, \u6771\u4eac",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "tags": {
+        "type": "array"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "n"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "limit": 1e+16,
+        "query": "q",
+        "filters": {
+         "a": 100.0,
+         "b": -2.5e-07,
+         "c": 123456789012
+        }
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "ok"
+   },
+   {
+    "role": "user",
+    "content": "<tool_response>\nmore\n</tool_response>"
+   }
+  ],
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search <docs> & \\\"notes\\\"\\nfor a query. Gr\u00fc\u00dfe, \u6771\u4eac\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"number\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nn<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=search>\n<parameter=limit>\n1e+16\n</parameter>\n<parameter=query>\nq\n</parameter>\n<parameter=filters>\n{\"a\": 100.0, \"b\": -2.5e-07, \"c\": 123456789012}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>user\n<tool_response>\nmore\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]
