@@ -3532,18 +3532,21 @@ def silu_kofs():
 
 
 def silu_rodata():
-    import numpy as np
-    x = (np.arange(SL_LO, SL_HI + 1, dtype=np.uint32) << 16).view(np.float32).astype(np.float64)
-    t = (1 / (1 + np.exp(x))).astype(np.float32)
-    u = t.view(np.uint32).astype(np.uint64)
-    tb = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
-    tb[t < np.float32(2.0 ** -126)] = 0                 # no denormals (the core flushes them)
-    blk = np.zeros((len(tb) + 15) // 16 * 16, np.uint16)
-    blk[:len(tb)] = tb
-    blk = blk.reshape(-1, 16)
-    pay = np.concatenate([np.stack([blk, blk], 1).reshape(-1), np.zeros(32, np.uint16)])
-    pay = np.concatenate([pay, np.zeros(-len(pay) % 32, np.uint16)] + [np.full(32, k, np.uint16) for k in SL_K])
-    return f'global.rodata.def @silu_t = align(64) bytes("{pay.view(np.uint8).tobytes().hex()}")'
+    f32 = lambda bits: struct.unpack("<f", struct.pack("<I", bits))[0]   # noqa: E731
+    tb = []
+    for i in range(SL_LO, SL_HI + 1):   # sigmoid(-x) of every bf16 x in range, rounded to f32, then to bf16 (RNE)
+        t = struct.unpack("<f", struct.pack("<f", 1 / (1 + math.exp(f32(i << 16)))))[0]
+        u = struct.unpack("<I", struct.pack("<f", t))[0]
+        tb.append(0 if t < 2.0 ** -126 else (u + 0x7FFF + ((u >> 16) & 1)) >> 16)   # no denormals (the core flushes them)
+    tb += [0] * (-len(tb) % 16)
+    pay = []
+    for r in range(0, len(tb), 16):   # each 16-value block twice
+        pay += tb[r:r + 16] * 2
+    pay += [0] * 32
+    pay += [0] * (-len(pay) % 32)
+    for k in SL_K:
+        pay += [k] * 32
+    return f'global.rodata.def @silu_t = align(64) bytes("{struct.pack("<%dH" % len(pay), *pay).hex()}")'
 
 
 def gen(cfg):

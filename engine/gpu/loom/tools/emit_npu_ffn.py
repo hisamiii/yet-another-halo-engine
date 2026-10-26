@@ -33,7 +33,6 @@ import gen_gemm_iu4  # noqa: E402
 import gen_npu_gemm as N  # noqa: E402
 import gen_npu_unpack as GU  # noqa: E402
 import gen_rot  # noqa: E402
-import hfq_index  # noqa: E402
 import hrx_paths  # noqa: E402
 import subprocess  # noqa: E402
 
@@ -89,12 +88,9 @@ def main():
     F = int(sys.argv[4]) if len(sys.argv) > 4 else 8192
     assert F % 1024 == 0 and 0 < F < FFN and (FFN - F) % 256 == 0 and B % 64 == 0
     G = FFN - F
-    idx = {e[0]: e for e in hfq_index.read(model)}
-    gate, up = (idx["model.language_model.layers.0.mlp.%s_proj.weight" % n] for n in ("gate", "up"))
-    dgu = up[3] - gate[3]
-    for l in range(64):   # every layer: up the same distance after gate (one image for all)
-        g, u = (idx["model.language_model.layers.%d.mlp.%s_proj.weight" % (l, n)] for n in ("gate", "up"))
-        assert u[3] - g[3] == dgu and g[1] == u[1] == 44
+    # up's rows follow gate's by its MQ4 bytes and the HFQ's f16 gate awq (a GGUF is converted to that layout;
+    # LoomPrefill checks every layer's)
+    dgu = FFN * (HID // 256) * 136 + HID * 2
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     rows = [("npuffn", F, B, len(parts(F))), ("npugate", N.GATE_SUPPLY, N.GATE_CALLS, N.GATE_RECORD),

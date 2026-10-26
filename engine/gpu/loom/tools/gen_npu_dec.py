@@ -13,7 +13,6 @@ the IQ4_XS scale path into the half's TB), then 8 sub-block iterations of 4 chun
 the low-nibble fragments are pushed in order, the high-nibble accumulators parked and pushed after them.
 """
 import os, subprocess, sys
-import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, ".."))
@@ -809,7 +808,7 @@ low.func.def public retain target<amd.xdna.aie2p.array>(@array_target) abi(array
 
 
 # panel position -> k-block within a pass: per sub-block of 4, (0, 2, 1, 3)
-KPERM = np.array([4 * (p // 4) + (0, 2, 1, 3)[p % 4] for p in range(128)])
+KPERM = [4 * (p // 4) + (0, 2, 1, 3)[p % 4] for p in range(128)]
 
 
 def oracle(raw):
@@ -823,6 +822,7 @@ def oracle(raw):
 
 def weights(raw):
     """raw [rows][super-blocks][BLK] -> the decoder's f32 weights [rows][super-blocks][256] (its exact op order)."""
+    import numpy as np
     if MQ4:                                           # w = scale (K half) x signed code, at IQ4_XS's positions
         d = np.stack([raw[..., 0:2].copy().view(np.float16)[..., 0], raw[..., 4:6].copy().view(np.float16)[..., 0]],
                      -1).astype(np.float64)
@@ -835,6 +835,7 @@ def weights(raw):
 
 
 def main():
+    import numpy as np
     work = sys.argv[1]
     units = 25
     nports = int(sys.argv[3]) if len(sys.argv) > 3 else 1

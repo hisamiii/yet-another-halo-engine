@@ -117,7 +117,7 @@ def main():
     sa, sw, sc = N.stream_bytes(cfg)
     a_in = a
     if fuse == 2:   # the decoders emit each pass's k-blocks in panel order (gen_npu_dec.KPERM): A follows
-        kperm = np.concatenate([128 * p + D.KPERM for p in range(passes)])
+        kperm = np.concatenate([128 * p + np.array(D.KPERM) for p in range(passes)])
         a_in = a.reshape(M, K // 8, 8)[:, kperm].reshape(M, K)
     ra, _ = B.reference(a_in, "act", M, list(ks), passes, 64, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)

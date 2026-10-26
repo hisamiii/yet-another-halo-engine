@@ -126,7 +126,7 @@ def main():
         xr = rotate(x, awq["gate"])
         # the decoder's positions: element 32 s + MQ4_ELEM[p] at position 32 s + p, then its k-block order per pass
         perm = (32 * np.arange(HID // 32)[:, None] + np.array(D.MQ4_ELEM)[None, :]).reshape(-1)
-        kperm = np.concatenate([128 * p + D.KPERM for p in range(5)])
+        kperm = np.concatenate([128 * p + np.array(D.KPERM) for p in range(5)])
         a_in = xr[:, perm].reshape(TOKENS, HID // 8, 8)[:, kperm].reshape(TOKENS, HID)
         ra, _ = B.reference(a_in, "act", TOKENS, list(KS), 5, 64, True)
         assert ra.size == sa
