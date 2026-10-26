@@ -764,13 +764,13 @@ ATTN_VGPR = 192   # every attention variant fits here unless the allocator rotat
 
 
 def hal_vgprs(hal):
-    notes = subprocess.run(["/opt/rocm/llvm/bin/llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
+    notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
     m = re.search(r"\.vgpr_count:\s*(\d+)", notes)
     return int(m.group(1)) if m else 0
 
 
 def hal_spills(hal):
-    notes = subprocess.run(["/opt/rocm/llvm/bin/llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
+    notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
     m = re.search(r"\.private_segment_fixed_size:\s*(\d+)", notes)
     return int(m.group(1)) if m else 0
 

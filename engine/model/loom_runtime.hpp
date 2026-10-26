@@ -150,6 +150,17 @@ struct LoomExecutable {
   }
 };
 
+// The dispatch-timestamp record of HRX patch 0006 (hrx_runtime.h there).
+typedef struct hrx_profile_dispatch_t {
+  uint64_t command_buffer_id;
+  uint64_t executable_id;
+  uint32_t command_index;
+  uint32_t function_ordinal;
+  uint32_t workgroup_count[3];
+  uint64_t start_tick;
+  uint64_t end_tick;
+} hrx_profile_dispatch_t;
+
 class LoomDevice {
  public:
   LoomDevice() {
@@ -164,7 +175,6 @@ class LoomDevice {
   LoomDevice(const LoomDevice&) = delete;
   LoomDevice& operator=(const LoomDevice&) = delete;
   ~LoomDevice() {
-    if (profiling_) hrx_device_profile_dispatches_end(device_);
     if (stream_) hrx_stream_release(stream_);
     // device_ is borrowed (hrx_gpu_device_get does not retain it); hrx_gpu_shutdown releases it.
     // Do not release it here: that clears the device early and HRX_PROFILE_FILE gets no dispatch events or session_end.
@@ -173,20 +183,12 @@ class LoomDevice {
 
   [[nodiscard]] hrx_device_t device() const { return device_; }
 
-  // Device timestamps of completed dispatches (HRX patch 0006). ProfileFlush / ProfileEnd hand the dispatches
-  // completed so far to the sink, with the count of records the device dropped; Synchronize first to get them all.
+  // Device timestamps of completed dispatches: HRX patch 0006, not in main's patch set (this tree builds against it), so
+  // a session fails to begin and the prefill's calibration stays off.
   using DispatchSink = std::function<void(const hrx_profile_dispatch_t*, size_t, uint64_t)>;
-  void ProfileBegin(DispatchSink sink) {
-    sink_ = std::move(sink);
-    LoomCheck(hrx_device_profile_dispatches_begin(device_, &LoomDevice::OnDispatches, this),
-              "hrx_device_profile_dispatches_begin");
-    profiling_ = true;
-  }
-  void ProfileFlush() { LoomCheck(hrx_device_profile_dispatches_flush(device_), "hrx_device_profile_dispatches_flush"); }
-  void ProfileEnd() {
-    profiling_ = false;
-    LoomCheck(hrx_device_profile_dispatches_end(device_), "hrx_device_profile_dispatches_end");
-  }
+  void ProfileBegin(DispatchSink) { throw LoomError("dispatch timestamps: this HRX has no patch 0006"); }
+  void ProfileFlush() {}
+  void ProfileEnd() { profiling_ = false; }
   [[nodiscard]] bool profiling() const { return profiling_; }
   [[nodiscard]] hrx_stream_t stream() const { return stream_; }
 
@@ -398,12 +400,7 @@ class LoomDevice {
   long sleep_us_ = 0;
   bool initialized_ = false;
   bool profiling_ = false;
-  DispatchSink sink_;
 
-  static void OnDispatches(void* user, const hrx_profile_dispatch_t* events, size_t count, uint64_t dropped) {
-    auto* self = static_cast<LoomDevice*>(user);
-    if (self->sink_) self->sink_(events, count, dropped);
-  }
 };
 
 // Records dispatches into one HRX graph and launches it on the device stream. Each dispatch waits only for what it

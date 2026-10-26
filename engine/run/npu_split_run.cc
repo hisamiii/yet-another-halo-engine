@@ -204,9 +204,9 @@ int main(int argc, char** argv) {
     // Device timestamps are 100 MHz ticks.
     LoomExecutable full = gpu.Load(plan["full_hal"]);
     const int rounds = static_cast<int>(num("iters"));
-    std::vector<hrx_profile_dispatch_t> events;
+    std::vector<yah::model::hrx_profile_dispatch_t> events;
     std::vector<double> npu_ms;
-    gpu.ProfileBegin([&](const hrx_profile_dispatch_t* e, size_t n, std::uint64_t) { events.insert(events.end(), e, e + n); });
+    gpu.ProfileBegin([&](const yah::model::hrx_profile_dispatch_t* e, size_t n, std::uint64_t) { events.insert(events.end(), e, e + n); });
     const auto full_bindings = split_bindings();
     for (int r = 0; r < rounds; ++r) {
       run_split();
@@ -225,7 +225,7 @@ int main(int argc, char** argv) {
     };
     std::vector<double> stage[5], span;
     for (int r = 0; r < rounds; ++r) {
-      std::vector<hrx_profile_dispatch_t> e(events.begin() + r * 6, events.begin() + (r + 1) * 6);
+      std::vector<yah::model::hrx_profile_dispatch_t> e(events.begin() + r * 6, events.begin() + (r + 1) * 6);
       std::sort(e.begin(), e.end(), [](const auto& a, const auto& b) { return a.start_tick < b.start_tick; });
       stage[4].push_back((e[5].end_tick - e[5].start_tick) / 100.0);
       std::uint64_t first = UINT64_MAX, last = 0;

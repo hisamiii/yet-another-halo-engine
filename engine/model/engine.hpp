@@ -202,7 +202,7 @@ class Engine : public TextGenerator {
     if (ec) return "";
     std::ifstream f(set + "/dispatch.txt", std::ios::binary);
     std::string text((std::istreambuf_iterator<char>(f)), {});
-    text += std::to_string(fs::last_write_time(set + "/dispatch.txt", ec).time_since_epoch().count());
+    text += std::to_string(static_cast<long long>(fs::last_write_time(set + "/dispatch.txt", ec).time_since_epoch().count()));
     std::uint64_t h = 1469598103934665603ull;
     for (unsigned char c : text) h = (h ^ c) * 1099511628211ull;
     char name[40];
