@@ -70,7 +70,7 @@ def main():
     os.makedirs(work, exist_ok=True)
     wq = None
     if fuse == 2:   # real rows of fmt (NPU_GGUF): the panels are decoded on the cores; W's value is the decoder's
-        D = N.decoder(fmt)
+        D = N.decoder(fmt, cfg.gord)
         KR = kraw or K
         if fmt == "MQ4":   # NPU_HFQ's first [>= Nn, KR] MQ4 tensor, nibbles signed as the engine's loader stores them
             import hfq_index

@@ -161,6 +161,25 @@ def bf16_bits(v):
     return struct.unpack("<I", struct.pack("<f", v))[0] >> 16
 
 
+def q4k_fields(blk):
+    """blk [..., 144] u8 -> d, dmin (f64), sc, m [..., 8], q [..., 256] (llama.cpp layout)."""
+    import numpy as np
+    d = blk[..., 0:2].copy().view(np.float16)[..., 0].astype(np.float64)
+    dm = blk[..., 2:4].copy().view(np.float16)[..., 0].astype(np.float64)
+    s = blk[..., 4:16].astype(np.int64)
+    sc = np.zeros(blk.shape[:-1] + (8,), np.int64)
+    mn = np.zeros_like(sc)
+    for j in range(4):
+        sc[..., j] = s[..., j] & 63
+        mn[..., j] = s[..., j + 4] & 63
+    for j in range(4, 8):
+        sc[..., j] = (s[..., j + 4] & 15) | ((s[..., j - 4] >> 6) << 4)
+        mn[..., j] = (s[..., j + 4] >> 4) | ((s[..., j] >> 6) << 4)
+    qs = blk[..., 16:144].astype(np.int64).reshape(blk.shape[:-1] + (4, 32))
+    q = np.concatenate([np.stack([qs[..., j, :] & 15, qs[..., j, :] >> 4], -2) for j in range(4)], -2)
+    return d, dm, sc, mn, q.reshape(blk.shape[:-1] + (256,))
+
+
 def iq4xs_fields(blk):
     """blk [..., 136] u8 -> d (f64), ls [..., 8], q [..., 256] (llama.cpp block_iq4_xs)."""
     import numpy as np
