@@ -33,6 +33,7 @@
 
 #include "core/config.hpp"
 #include "core/gguf.hpp"
+#include "core/gguf_quant.hpp"
 #include "model/loom_decoder.hpp"
 #include "model/loom_runtime.hpp"
 #include "model/npu_split.hpp"
@@ -185,6 +186,16 @@ class LoomPrefill {
         throw LoomError("token id " + std::to_string(host_ids_[t]) + " is outside the vocabulary");
     }
     gpu_.Update(*ids_, host_ids_.data(), host_ids_.size() * 4);
+    if (!embed_rows_.empty()) {   // token_embd in a format embed.hal does not read: its rows in f32 into hidden()
+      // (the staging is rewritten once its last copy landed)
+      const core::TensorInfo& e = *Find("token_embd.weight");
+      const std::size_t rb = static_cast<std::size_t>(e.bytes) / e.dims[1];
+      LoomDevice::WaitFor(rows_copied_);
+      for (std::uint32_t t = 0; t < B_; ++t)
+        core::Dequantize(e.type, gguf_.tensor_data_base() + e.offset + host_ids_[t] * rb, &embed_rows_[std::size_t{t} * kHidden],
+                         kHidden);
+      rows_copied_ = gpu_.StreamH2D(*hidden_, embed_rows_.data(), embed_rows_.size() * 4);
+    }
     const std::int32_t valid = static_cast<std::int32_t>(n);
     gpu_.Update(*valid_, &valid, 4);
     n_ = n;
@@ -332,8 +343,9 @@ class LoomPrefill {
   // The 64 layers of chunk ci, in dispatch order.
   void RecordLayers(std::uint32_t ci, const KvHook& hook) {
     flag_slot_ = 0;
-    Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
-             {TRef(*Find("token_embd.weight")), Ref(*ids_), Ref(*hidden_)}, 4);
+    if (embed_rows_.empty())
+      Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
+               {TRef(*Find("token_embd.weight")), Ref(*ids_), Ref(*hidden_)}, 4);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       layer_ = l;
@@ -870,8 +882,11 @@ class LoomPrefill {
       Exe(hal);
     GeomOf("embed.hal");   // one token per workgroup: refuses a set emitted for another chunk size
     // embed.hal decodes IQ4_XS, or Q8_0 in the HFQ models' sets
-    if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != (rot_ ? 8u : 23u))
-      throw LoomError("prefill: token_embd: its format does not match embed.hal (re-emit the set)");
+    // (another format: Embed dequantizes the chunk's rows on the host)
+    if (const core::TensorInfo& e = *Find("token_embd.weight"); static_cast<std::uint32_t>(e.type) != (rot_ ? 8u : 23u)) {
+      if (!core::CanDequantize(e.type)) throw LoomError("prefill: token_embd: no decoder for its format");
+      embed_rows_.resize(std::size_t{B_} * kHidden);
+    }
   }
 
   // Load every HAL chunk 0 dispatches now (a pass of the layers that dispatches nothing): a first load copies the code to
@@ -3135,7 +3150,9 @@ class LoomPrefill {
   hrx_buffer_ref_t nq_cnt_{};
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
   std::size_t flag_slot_ = 0;
-  LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
+  std::vector<float> embed_rows_;          // host-side embed (Embed): the chunk's token_embd rows
+  hrx_timeline_point_t rows_copied_ = {};  // when their last copy landed
+  LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr, *grid_iq2s_ = nullptr,
              *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
              *gate_ = nullptr, *alpha_ = nullptr, *beta_ = nullptr, *q_ = nullptr, *q16_ = nullptr, *kbuf_ = nullptr,

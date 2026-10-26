@@ -272,6 +272,17 @@ class LoomDevice {
     Order();
     LoomCheck(hrx_stream_update_buffer(stream_, host, bytes, buffer.handle, offset), "hrx_stream_update_buffer");
   }
+  // host into buffer after the stream's prior work; host stays unmodified until the returned point (WaitFor)
+  hrx_timeline_point_t StreamH2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
+    Order();
+    LoomCheck(hrx_stream_copy_h2d(stream_, host, buffer.handle, offset, bytes), "hrx_stream_copy_h2d");
+    hrx_timeline_point_t p{};
+    LoomCheck(hrx_stream_get_timeline_position(stream_, &p), "hrx_stream_get_timeline_position");
+    return p;
+  }
+  static void WaitFor(const hrx_timeline_point_t& p) {
+    if (p.semaphore) LoomCheck(hrx_semaphore_wait(p.semaphore, p.value, UINT64_MAX), "hrx_semaphore_wait");
+  }
   void H2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
     LoomCheck(hrx_synchronous_h2d(device_, host, buffer.handle, offset, bytes), "hrx_synchronous_h2d");
   }
@@ -564,7 +575,12 @@ class LoomWeights {
       for (++i; i < spans.size() && spans[i].second - begin <= kChunk; ++i) end = std::max(end, spans[i].second);
       LoomBuffer buffer = gpu.Allocate(end - begin + kPad);
       gpu.H2D(buffer, gguf.tensor_data_base() + begin, end - begin);
-      gguf.ReleaseData(begin, end - begin);
+      // (token_embd's rows stay on the host: a set whose embed.hal does not read its format embeds on the host)
+      const core::TensorInfo* te = gguf.Find("token_embd.weight");
+      const size_t e0 = te ? std::clamp<size_t>(te->offset, begin, end) : end;
+      const size_t e1 = te ? std::clamp<size_t>(te->offset + te->bytes, begin, end) : end;
+      gguf.ReleaseData(begin, e0 - begin);
+      gguf.ReleaseData(e1, end - e1);
       chunks_.push_back({begin, 0, std::move(buffer)});
     }
   }

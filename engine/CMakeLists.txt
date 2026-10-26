@@ -11,7 +11,7 @@ endif()
 find_package(ICU COMPONENTS uc REQUIRED)
 
 find_package(Threads REQUIRED)
-add_library(yah_core STATIC core/gguf.cpp core/hfq.cpp core/config.cpp core/tokenizer.cpp model/weights.cpp)
+add_library(yah_core STATIC core/gguf.cpp core/gguf_quant.cpp core/hfq.cpp core/config.cpp core/tokenizer.cpp model/weights.cpp)
 target_include_directories(yah_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(yah_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_link_libraries(yah_core PUBLIC ICU::uc Threads::Threads)
