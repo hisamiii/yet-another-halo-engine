@@ -227,6 +227,11 @@ void CheckItemShape(const Json& item, const std::string& where) {
       Required(part, at, "text", Kind::kString);
       CheckEq(part["type"], "reasoning_text", at + ".type");
     }
+  } else if (item["type"] == "function_call") {
+    Required(item, where, "arguments", Kind::kString);
+    Required(item, where, "call_id", Kind::kString);
+    Required(item, where, "name", Kind::kString);
+    OneOf(item, where, "status", {"in_progress", "completed", "incomplete"});
   } else {
     Check(false, where + ".type is unexpected: " + Dump(item["type"]));
   }
@@ -311,6 +316,14 @@ void CheckEventShape(const Json& e, const std::string& where) {
     return;
   }
   Required(e, at, "item_id", Kind::kString);
+  if (type == "response.function_call_arguments.delta") {
+    Required(e, at, "delta", Kind::kString);
+    return;
+  }
+  if (type == "response.function_call_arguments.done") {
+    Required(e, at, "arguments", Kind::kString);
+    return;
+  }
   Required(e, at, "content_index", Kind::kInteger);
   if (type == "response.content_part.added" || type == "response.content_part.done") {
     Required(e, at, "part", Kind::kObject);
@@ -381,6 +394,7 @@ class Tester {
     ChatStop();
     ChatErrors();
     ChatTools();
+    ResponseTools();
   }
 
  private:
@@ -701,16 +715,19 @@ class Tester {
       for (const auto& [key, value] : extra.items()) b[key] = value;
       return Dump(b);
     };
-    const Json tools = Json::array({{{"type", "function"}, {"name", "f"}}});
-    Bad(body({{"tools", tools}}), "tools", "unsupported_parameter");
+    Bad(body({{"tools", Json::array({{{"type", "web_search"}}})}}), "tools[0].type", "unsupported_value");
+    Bad(body({{"tools", Json::array({{{"type", "function"}}})}}), "tools[0].name");
     Bad(body({{"previous_response_id", "resp_1"}}), "previous_response_id");
-    Bad(body({{"tool_choice", "required"}}), "tool_choice");
+    Bad(body({{"tool_choice", "required"}}), "tool_choice", "unsupported_value");
     Bad("{not json");
     Bad("[1, 2]");
     Bad(R"({"input": "Hi"})", "model");
     Bad(R"({"model": "m"})", "input");
     Bad(R"({"model": "m", "input": []})", "input");
-    Bad(R"({"model": "m", "input": [{"type": "function_call", "name": "f"}]})", "input[0].type");
+    Bad(R"({"model": "m", "input": [{"type": "function_call"}]})", "input[0].name");
+    Bad(R"({"model": "m", "input": [{"type": "function_call", "name": "f", "arguments": "[1]"}]})",
+        "input[0].arguments");
+    Bad(R"({"model": "m", "input": [{"type": "computer_call"}]})", "input[0].type");
     Bad(R"({"model": "m", "input": [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]})",
         "input[0].content[0].type");
     Bad(R"({"model": "m", "input": [{"role": "tool", "content": "x"}]})", "input[0].role");
@@ -722,10 +739,6 @@ class Tester {
     std::string long_input;
     for (int i = 0; i < 5000; ++i) long_input += "hello ";
     Bad(Dump({{"model", "m"}, {"input", long_input}}), "input", "context_length_exceeded");
-    // What the SDK sends for tools with parameters.
-    const Json sdk_tools = Json::array({{{"type", "function"}, {"name", "f"}, {"parameters", Json::object()}}});
-    Bad(body({{"tools", sdk_tools}}), "tools");
-
     // Unsupported fields at default or empty values are accepted.
     const Reply ok = Request("POST", "/v1/responses",
                              body({{"tools", Json::array()},
@@ -964,6 +977,62 @@ class Tester {
              "chat tool_choice none");
     CheckEq(r["choices"][0]["message"]["content"], kAnswer, "chat tool_choice none: content");
     Check(!r["choices"][0]["message"].contains("tool_calls"), "chat tool_choice none: no tool_calls");
+  }
+
+  void ResponseTools() {
+    const Json tools = Json::array(
+        {{{"type", "function"},
+          {"name", "get_weather"},
+          {"description", "Current weather."},
+          {"parameters",
+           {{"type", "object"}, {"properties", {{"city", {{"type", "string"}}}, {"days", {{"type", "integer"}}}}}}},
+          {"strict", false}}});
+    const Json args = {{"city", "Paris"}, {"days", 3}};
+    std::string where = "responses tools";
+    Json r = Create({{"model", "m"}, {"input", "Weather in Paris?"}, {"tools", tools}}, where);
+    CheckEq(r["status"], "completed", where + ": status");
+    CheckEq(r["tools"], tools, where + ": tools echo");
+    Check(r["output"].size() == 3, where + ": reasoning, message, call: " + Dump(r["output"]));
+    CheckEq(OutputText(r), "Let me look.", where + ": output_text");
+    const Json call = r["output"][2];
+    CheckEq(call["type"], "function_call", where + ": type");
+    CheckEq(call["name"], "get_weather", where + ": name");
+    Check(call["call_id"].get<std::string>().starts_with("call_"), where + ": call_id");
+    Check(call["id"].get<std::string>().starts_with("fc_"), where + ": id");
+    CheckEq(Json::parse(call["arguments"].get<std::string>()), args, where + ": arguments");
+
+    where = "responses tools stream";
+    const std::vector<Json> events = Stream({{"model", "m"}, {"input", "Weather in Paris?"}, {"tools", tools}}, where);
+    const Json types = Squash(events);
+    const Json tail = {"response.output_item.done",
+                       "response.output_item.added",
+                       "response.function_call_arguments.delta",
+                       "response.function_call_arguments.done",
+                       "response.output_item.done",
+                       "response.completed"};
+    Check(types.size() > tail.size(), where + ": events");
+    for (std::size_t i = 0; i < tail.size(); ++i) {
+      CheckEq(types[types.size() - tail.size() + i], tail[i], where + ": event order " + Dump(types));
+    }
+    const Json& final = events.back()["response"];
+    CheckEq(final["output"][2]["name"], "get_weather", where + ": final call");
+    for (const Json& e : events) {
+      if (e["type"] == "response.function_call_arguments.done") {
+        CheckEq(Json::parse(e["arguments"].get<std::string>()), args, where + ": arguments");
+        CheckEq(e["output_index"], 2, where + ": output_index");
+      }
+    }
+
+    // The output sent back with the call's result; tool_choice none hides the tools.
+    Json input = Json::array({{{"role", "user"}, {"content", "Weather in Paris?"}}});
+    for (const Json& item : r["output"]) input.push_back(item);
+    input.push_back({{"type", "function_call_output"}, {"call_id", call["call_id"]}, {"output", "18 C"}});
+    r = Create({{"model", "m"}, {"input", input}, {"tools", tools}}, "responses tools history");
+    CheckEq(r["output"].back()["type"], "function_call", "responses tools history: a call");
+    r = Create({{"model", "m"}, {"input", input}, {"tools", tools}, {"tool_choice", "none"}},
+               "responses tool_choice none");
+    CheckEq(OutputText(r), kAnswer, "responses tool_choice none: output_text");
+    CheckEq(r["output"].back()["type"], "message", "responses tool_choice none: no call");
   }
 
   void ChatErrors() {

@@ -65,6 +65,8 @@ struct ResponseRequest {
   double temperature = 0.6;
   double top_p = 0.95;
   bool stream = false;
+  Json tools = Json::array();  // as given, for the echo (chat.tools has them in the template's shape)
+  std::string tool_choice = "auto";
 };
 
 // none and minimal: thinking off. high, xhigh and max: the template's xhigh. Throws ApiError for other values.
@@ -146,8 +148,17 @@ class ResponseStream {
   [[nodiscard]] bool client_alive() const { return alive_; }
 
  private:
+  struct CallItem {
+    std::string id;  // the item's; call.id is its call_id
+    ToolCall call;
+    int index;
+  };
+
   bool Emit(const std::string& type, Json event);
   void Apply(const OutputParser::Chunk& chunk);
+  void AnswerText(const std::string& text);
+  void ApplyTools(ToolCallParser::Chunk chunk);
+  static Json FunctionCallItem(const CallItem& item, bool done);
   void OpenReasoning();
   void CloseReasoning();
   void OpenMessage();
@@ -160,6 +171,8 @@ class ResponseStream {
   const ResponseRequest& request_;
   std::function<bool(const std::string&)> emit_;
   OutputParser parser_;
+  std::optional<ToolCallParser> tool_parser_;  // with tools
+  std::vector<CallItem> calls_;
   std::string id_, reasoning_id_, message_id_;
   std::int64_t created_at_;
   std::uint32_t sequence_ = 0;

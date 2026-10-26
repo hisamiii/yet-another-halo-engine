@@ -34,6 +34,7 @@ std::vector<ChatMessage> ParseInput(const Json& input) {
   }
   std::vector<ChatMessage> messages;
   std::string reasoning;  // from reasoning items, for the next assistant message
+  bool assistant_last = false;  // a function_call joins the assistant message before it
   for (std::size_t i = 0; i < input.size(); ++i) {
     const Json& item = input[i];
     const std::string param = "input[" + std::to_string(i) + "]";
@@ -52,6 +53,41 @@ std::vector<ChatMessage> ParseInput(const Json& input) {
       }
       continue;
     }
+    if (kind == "function_call") {
+      ToolCall call;
+      const Json* name = Field(item, "name");
+      if (name == nullptr || !name->is_string() || name->get<std::string>().empty()) {
+        throw ApiError(400, "A function_call needs a 'name'.", param + ".name");
+      }
+      call.name = name->get<std::string>();
+      if (const Json* id = Field(item, "call_id"); id != nullptr && id->is_string()) call.id = id->get<std::string>();
+      call.arguments = Json::object();
+      if (const Json* args = Field(item, "arguments")) {
+        try {
+          if (!args->is_string()) throw Json::parse_error("json: not a string");
+          const std::string text = TrimPy(args->get<std::string>());
+          if (!text.empty()) call.arguments = Json::parse(text);
+        } catch (const Json::parse_error&) {
+          call.arguments = nullptr;
+        }
+        if (!call.arguments.is_object()) {
+          throw ApiError(400, "'arguments' must be a JSON object in a string.", param + ".arguments");
+        }
+      }
+      if (!assistant_last) {
+        messages.push_back({"assistant", "", std::move(reasoning)});
+        reasoning.clear();
+      }
+      messages.back().tool_calls.push_back(std::move(call));
+      assistant_last = true;
+      continue;
+    }
+    if (kind == "function_call_output") {
+      const Json* output = Field(item, "output");
+      messages.push_back({"tool", output != nullptr ? ContentText(*output, param + ".output") : "", ""});
+      assistant_last = false;
+      continue;
+    }
     if (kind != "message") {
       throw ApiError(400, "Unsupported input item type '" + kind + "'.", param + ".type", "unsupported_parameter");
     }
@@ -64,6 +100,7 @@ std::vector<ChatMessage> ParseInput(const Json& input) {
     m.content = ContentText(item.contains("content") ? item["content"] : Json(nullptr), param + ".content");
     if (m.role == "assistant") m.reasoning = std::move(reasoning);
     reasoning.clear();
+    assistant_last = m.role == "assistant";
     messages.push_back(std::move(m));
   }
   return messages;
@@ -172,7 +209,7 @@ ResponseRequest ParseResponseRequest(const Json& body) {
   static const std::set<std::string> kAccepted = {
       "model", "input", "instructions", "max_output_tokens", "temperature", "top_p", "reasoning", "stream", "store",
       "metadata", "user", "service_tier", "safety_identifier", "prompt_cache_key", "stream_options",
-      "parallel_tool_calls"};
+      "parallel_tool_calls", "tools", "tool_choice"};
   // clang-format on
   for (const auto& [key, value] : body.items()) {
     if (kAccepted.contains(key) || IsEmptyValue(value) || IsDefaultValue(key, value)) continue;
@@ -193,6 +230,38 @@ ResponseRequest ParseResponseRequest(const Json& body) {
   const Json* input = Field(body, "input");
   if (input == nullptr) throw ApiError(400, "Missing required parameter: 'input'.", "input");
   for (ChatMessage& m : ParseInput(*input)) request.messages.push_back(std::move(m));
+
+  // Function tools, given to the template in the Chat Completions shape the model was trained on.
+  if (const Json* tools = Field(body, "tools")) {
+    if (!tools->is_array()) throw ApiError(400, "'tools' must be an array.", "tools");
+    for (std::size_t i = 0; i < tools->size(); ++i) {
+      const Json& tool = (*tools)[i];
+      const std::string param = "tools[" + std::to_string(i) + "]";
+      const Json* type = tool.is_object() ? Field(tool, "type") : nullptr;
+      if (type == nullptr || *type != Json("function")) {
+        throw ApiError(400, "Only function tools are supported.", param + ".type", "unsupported_value");
+      }
+      const Json* name = Field(tool, "name");
+      if (name == nullptr || !name->is_string() || name->get<std::string>().empty()) {
+        throw ApiError(400, "A function tool needs a 'name'.", param + ".name");
+      }
+      Json function = {{"name", *name}};
+      for (const char* key : {"description", "parameters"}) {
+        if (const Json* v = Field(tool, key)) function[key] = *v;
+      }
+      request.chat.tools.push_back({{"type", "function"}, {"function", std::move(function)}});
+    }
+    request.tools = *tools;
+  }
+  if (const Json* choice = Field(body, "tool_choice")) {
+    if (*choice == Json("none")) {
+      request.chat.tools = Json::array();  // the model is not told of the tools
+      request.tool_choice = "none";
+    } else if (*choice != Json("auto")) {
+      throw ApiError(400, "Only 'auto' and 'none' are supported for 'tool_choice'.", "tool_choice",
+                     "unsupported_value");
+    }
+  }
 
   request.effort = "high";
   if (const Json* reasoning = Field(body, "reasoning")) {
@@ -431,6 +500,7 @@ ResponseStream::ResponseStream(const ResponseRequest& request, std::function<boo
     : request_(request),
       emit_(std::move(emit)),
       parser_(request.chat.effort != ReasoningEffort::kNone),
+      tool_parser_(request.chat.tools.empty() ? std::nullopt : std::optional<ToolCallParser>(request.chat.tools)),
       id_(RandomId("resp_")),
       reasoning_id_(RandomId("rs_")),
       message_id_(RandomId("msg_")),
@@ -448,7 +518,7 @@ bool ResponseStream::Emit(const std::string& type, Json event) {
 bool ResponseStream::Start() {
   Emit("response.created", {{"response", ResponseObject("in_progress")}});
   Emit("response.in_progress", {{"response", ResponseObject("in_progress")}});
-  if (!parser_.in_reasoning()) OpenMessage();
+  if (!parser_.in_reasoning() && !tool_parser_) OpenMessage();
   return alive_;
 }
 
@@ -459,8 +529,11 @@ bool ResponseStream::OnToken(std::string_view bytes) {
 
 bool ResponseStream::Finish(const model::GenerateResult& result) {
   Apply(parser_.Finish());
+  if (tool_parser_) ApplyTools(tool_parser_->Finish());
   if (reasoning_open_) CloseReasoning();
-  status_ = result.finish_reason == "length" ? "incomplete" : "completed";
+  status_ = result.finish_reason == "length" && calls_.empty() ? "incomplete" : "completed";
+  if (tool_parser_ && message_index_ < 0 && calls_.empty() && status_ == "completed")
+    OpenMessage();  // a reply without calls ends in a message, as without tools
   if (message_open_) CloseMessage();
   usage_ = {{"input_tokens", result.prompt_tokens},
             {"input_tokens_details", {{"cached_tokens", result.cached_tokens}, {"cache_write_tokens", 0}}},
@@ -486,17 +559,51 @@ void ResponseStream::Apply(const OutputParser::Chunk& chunk) {
   }
   if (chunk.reasoning_ended) {
     if (reasoning_open_) CloseReasoning();
-    OpenMessage();
+    if (!tool_parser_) OpenMessage();
   }
-  if (!chunk.answer.empty()) {
-    if (!message_open_) OpenMessage();
-    answer_ += chunk.answer;
-    Emit("response.output_text.delta", {{"item_id", message_id_},
-                                        {"output_index", message_index_},
-                                        {"content_index", 0},
-                                        {"delta", chunk.answer},
-                                        {"logprobs", Json::array()}});
+  if (!tool_parser_) {
+    AnswerText(chunk.answer);
+  } else if (!chunk.answer.empty()) {
+    ApplyTools(tool_parser_->Feed(chunk.answer));
   }
+}
+
+void ResponseStream::AnswerText(const std::string& text) {
+  if (text.empty()) return;
+  if (!message_open_) OpenMessage();
+  answer_ += text;
+  Emit("response.output_text.delta", {{"item_id", message_id_},
+                                      {"output_index", message_index_},
+                                      {"content_index", 0},
+                                      {"delta", text},
+                                      {"logprobs", Json::array()}});
+}
+
+void ResponseStream::ApplyTools(ToolCallParser::Chunk chunk) {
+  // Text after a call (the template asks for none) has no message left to go to and is dropped.
+  if (calls_.empty()) AnswerText(chunk.content);
+  for (ToolCall& call : chunk.calls) {
+    if (message_open_) CloseMessage();
+    const int index = (reasoning_index_ >= 0) + (message_index_ >= 0) + static_cast<int>(calls_.size());
+    calls_.push_back({RandomId("fc_"), std::move(call), index});
+    const CallItem& item = calls_.back();
+    const std::string arguments = Dump(item.call.arguments);
+    Emit("response.output_item.added", {{"output_index", index}, {"item", FunctionCallItem(item, false)}});
+    Emit("response.function_call_arguments.delta",
+         {{"item_id", item.id}, {"output_index", index}, {"delta", arguments}});
+    Emit("response.function_call_arguments.done",
+         {{"item_id", item.id}, {"output_index", index}, {"arguments", arguments}});
+    Emit("response.output_item.done", {{"output_index", index}, {"item", FunctionCallItem(item, true)}});
+  }
+}
+
+Json ResponseStream::FunctionCallItem(const CallItem& item, bool done) {
+  return {{"id", item.id},
+          {"type", "function_call"},
+          {"status", done ? "completed" : "in_progress"},
+          {"arguments", done ? Dump(item.call.arguments) : ""},
+          {"call_id", item.call.id},
+          {"name", item.call.name}};
 }
 
 void ResponseStream::OpenReasoning() {
@@ -562,7 +669,9 @@ Json ResponseStream::ReasoningItem() const {
 Json ResponseStream::MessageItem() const {
   return {{"id", message_id_},
           {"type", "message"},
-          {"status", message_open_ ? "in_progress" : status_},
+          {"status", message_open_              ? "in_progress"
+                     : status_ == "in_progress" ? "completed"
+                                                : status_},
           {"role", "assistant"},
           {"content", Json::array({OutputText(answer_)})}};
 }
@@ -571,6 +680,7 @@ Json ResponseStream::ResponseObject(const std::string& status) const {
   Json output = Json::array();
   if (reasoning_index_ >= 0) output.push_back(ReasoningItem());
   if (message_index_ >= 0) output.push_back(MessageItem());
+  for (const CallItem& item : calls_) output.push_back(FunctionCallItem(item, true));
   return {{"id", id_},
           {"object", "response"},
           {"created_at", created_at_},
@@ -589,8 +699,8 @@ Json ResponseStream::ResponseObject(const std::string& status) const {
           {"store", false},
           {"temperature", request_.temperature},
           {"text", {{"format", {{"type", "text"}}}}},
-          {"tool_choice", "auto"},
-          {"tools", Json::array()},
+          {"tool_choice", request_.tool_choice},
+          {"tools", request_.tools},
           {"top_p", request_.top_p},
           {"truncation", "disabled"},
           {"usage", usage_},

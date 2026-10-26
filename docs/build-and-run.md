@@ -168,12 +168,13 @@ for chunk in client.chat.completions.create(model="qwen", messages=[{"role": "us
 | | |
 |---|---|
 | endpoints | `POST /v1/responses` and `POST /v1/chat/completions` (plain and `stream: true` SSE), `GET /v1/models`, `GET /health` |
-| input | a string, or a list of `system` / `developer` / `user` / `assistant` messages with string or text-part content; `reasoning` items from earlier output; `instructions` |
+| input | a string, or a list of `system` / `developer` / `user` / `assistant` messages with string or text-part content; `reasoning`, `function_call` and `function_call_output` items from earlier turns; `instructions` |
 | reasoning | `reasoning.effort`: `none` / `minimal` (thinking off), `low`, `medium`, `high` (default, the template's `xhigh`). The thinking text comes back as a `reasoning` output item with `reasoning_text` content |
+| tools | `tools` (function tools) with `tool_choice` `auto` or `none`. The model's calls come back as `function_call` output items (streamed with `response.function_call_arguments.delta` / `.done`, each call whole), their arguments typed by the tool's schema |
 | sampling | `temperature` (default 0.6), `top_p` (default 0.95), top-k 20, `max_output_tokens` (default: the rest of the context; prompt + max must fit) |
 | chat completions | `messages` as above; `max_completion_tokens` or `max_tokens`; `temperature`, `top_p`, `top_k` (default 20; 0 or -1: off), `min_p`, `presence_penalty`, `frequency_penalty` (-2..2), `repetition_penalty`, `repeat_last_n` (default 64, up to 1024), `seed`, `stop` (a string or up to 16), `stream` with `stream_options.include_usage`; `reasoning_effort` or `chat_template_kwargs.enable_thinking`; `ignore_eos` (benchmarks); `tools` (function tools) with `tool_choice` `auto` or `none`, and `assistant` `tool_calls` and `tool` messages in the history. Reasoning comes back as `reasoning_content`, and llama.cpp's `timings` object (prefill and decode ms and tokens/s) comes with the response or the stream's last chunk. The model's calls come back as `tool_calls` (finish reason `tool_calls`; streamed, each call whole in one chunk), their arguments typed by the tool's schema. `n` must be 1 |
 | accepted and ignored | `store`, `metadata` (echoed), `user`, `service_tier`, `parallel_tool_calls`, and default values of `tool_choice`, `text`, `truncation` (Responses) |
-| not supported (400) | tools on `/v1/responses`, `tool_choice` `required` or a named function, `previous_response_id` and stored responses, images and files, structured output, logprobs |
+| not supported (400) | tools other than functions, `tool_choice` `required` or a named function, `previous_response_id` and stored responses, images and files, structured output, logprobs |
 
 All system and developer messages merge into one system message at the start. The chat template is a C++ port of the model's Jinja template for this subset.
 
