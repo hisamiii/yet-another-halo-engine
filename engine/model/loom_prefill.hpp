@@ -1163,8 +1163,8 @@ class LoomPrefill {
         const std::size_t r0 = f0 + 256 * j;
         csw.push_back(npu_->BindRawPair(
             sw + ".xdna", SwapOf(sw), 16 + 8 * DecoderId(f.name) + DecoderId(fu.name), ag,
-            base + tg->offset + r0 * rb, 255 * rb + 16 * blk + kDcolRecordRow,
-            base + tu->offset + r0 * rbu, 255 * rbu + 16 * blku + kDcolRecordRow,
+            base + tg->offset + r0 * rb, 255 * rb + 16 * blk + RecordRow(f.name),
+            base + tu->offset + r0 * rbu, 255 * rbu + 16 * blku + RecordRow(fu.name),
             {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, 4 * (B_ / 64) * 4 * 1152,
             "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
       }
@@ -1174,8 +1174,8 @@ class LoomPrefill {
         const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);
         csw.push_back(npu_->BindRawPair(
             sw + ".xdna", SwapOf(sw), 16 + 8 * DecoderId(f.name) + DecoderId(fu.name), ag,
-            base + tg->offset + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + kDcolRecordRow,
-            base + tu->offset + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + kDcolRecordRow,
+            base + tg->offset + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + RecordRow(f.name),
+            base + tu->offset + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + RecordRow(fu.name),
             {(j / 16) * 4 * 128 * 144 + (j % 16) * 8 * 144, bs.c}, 3 * (B_ / 64) * 4 * 1152,
             "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
       }
@@ -1184,7 +1184,8 @@ class LoomPrefill {
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 256; ++j)
         csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
-                                    base + tg->offset + (f0 + 256 * j) * rb, dgu + 255 * rb + 16 * blk + kDcolRecordRow,
+                                    base + tg->offset + (f0 + 256 * j) * rb,
+                                    dgu + 255 * rb + 16 * blk + RecordRow(f.name),
                                     {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, "ffnsw" + hord));
     } else {   // 32 calls of 224 features: call j's column c takes features 8 (128 c + 4 j) + [0, 32); Q4_K's order
                // (gen_npu_gemm hord): its two 16-row slabs 32 rows apart from 64 (j / 2) + 16 (j % 2)
@@ -1192,7 +1193,8 @@ class LoomPrefill {
       for (std::uint32_t j = 0; j < F / 224; ++j)
         csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
                                     base + tg->offset + (f0 + (q4k ? 64 * (j / 2) + 16 * (j % 2) : 32 * j)) * rb,
-                                    dgu + (6 * 1024 + (q4k ? 47 : 31)) * rb + 16 * blk + kDcolRecordRow, {4 * j * 144, bs.c},
+                                    dgu + (6 * 1024 + (q4k ? 47 : 31)) * rb + 16 * blk + RecordRow(f.name),
+                                    {4 * j * 144, bs.c},
                                     "ffnsw" + hord));
     }
     // down: per K part, FfnBlkCalls() calls of FfnBlkRows() rows (a last one ending at the last row)

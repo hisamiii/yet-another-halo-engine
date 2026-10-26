@@ -979,6 +979,8 @@ AF = {
     ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
     ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
     ("q3k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),
+    ("q5k", "kstore", 1088, 20): dict(AF_KQP, ksl=True),
+    ("q5k", "swiglu", 1088, 20): dict(AF_KQP, ksl=True, swepi=False),
     # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
     ("iq3s", "kres", 320, 24): dict(AF_PIPE3, gaddr=True, f16s=True, sgtab=True,
                                     persist=dict(b0early=True, lhs_stream=2)),               # -8.8%
@@ -1115,8 +1117,9 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
 NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
 FUSE_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q4k")
-FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs")   # the fused FFN block's gate / up (NP 4 images:
-# room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream)
+FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q5k", "q4k")   # the fused FFN block's gate / up (NP
+# 4 images: room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream: Q4_K only
+# in pairs, a P4 H through its gather-free decoder, gord GF)
 FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k", "q3k", "q5k")
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
@@ -1639,7 +1642,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         name = "npu_ffnsp_%s_%s%s" % (gf, uf, hord and "_" + hord.lower())
         if NPU_FUSE:   # pair u: gate column 2 u, up column 2 u + 1, features 256 j + 64 u + [0, 64) of call j
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, swiglu=True,
-                                   pnbr=1, swcol=64, hpass=F // 1024, hord=hord, fmt=DCOL_FMTS[gf][0], ufmt=DCOL_FMTS[uf][0]),
+                                   pnbr=1, swcol=64, hpass=F // 1024, hord=hord, fmt=DCOL_FMTS[gf][0], ufmt=DCOL_FMTS[uf][0],
+                                   gord="GF" if "q4k" in (gf, uf) and hord == "P4" else "P4"),
                          name, None, (4, True)))
             continue
         jobs.append((GN.Config(6, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[gf][0],
