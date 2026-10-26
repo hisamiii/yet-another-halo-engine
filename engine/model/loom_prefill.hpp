@@ -309,13 +309,16 @@ class LoomPrefill {
     const auto* ow = Find("output.weight");
     Dispatch(Exe("rmsnorm.hal"), "yah_rmsnorm", 1, 1, 1, 32, 1, 1,
              {{hidden_->handle, std::size_t{row} * kHidden * 4, std::size_t{kHidden} * 4}, TRef(*onw), Ref(*normed_)});
-    if (rot_) {
-      // MQ4 head: the f32 norm row into the weights' basis (no awq), then gen_gemv's tile-free GEMV
+    // MQ4 head: the f32 norm row into the weights' basis (no awq) first
+    if (rot_)
       Dispatch(Exe("rot_head.hal"), "yah_rot256", kHidden / 1024, 1, 1, 64, 1, 1, {Ref(*normed_), Ref(*rot_signs_)});
+    if (geom_.count("gemv.hal")) {   // gen_gemv's tile-free GEMV (a head that is not Q6_K)
       const Geom& g = geom_.at("gemv.hal");   // (rows per workgroup, lanes, workgroups)
       Dispatch(Exe("gemv.hal"), "yah_gemv", g.tt, 1, 1, g.rowgrp, 1, 1, {TRef(*ow), Ref(*normed_), dst});
       return;
     }
+    if (ow->type != core::GgmlType::kQ6_K)
+      throw LoomError("output.weight is not Q6_K, and the set has no gemv.hal row for its head");
     Dispatch(Exe("gemv.hal"), "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, {TRef(*ow), Ref(*normed_), dst});
   }
   // Argmax of kVocab f32 logits into dst (one u32).

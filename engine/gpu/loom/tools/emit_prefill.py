@@ -30,7 +30,8 @@ SWIGLU = {"ffn_up.weight"}
 def parse(model):
     """Return [(name, dims, type)] for every tensor of a model as the engine sees it: an HFQ model or a GGUF one with
     its projections converted to MQ4G256 at load (yah-dump --table, core/gguf_convert.cpp), or with YAH_NATIVE=1 a
-    GGUF's own tensors (only token_embd converted, to Q8_0: the embed kernel's format)."""
+    GGUF's own tensors (token_embd converted to Q8_0, the embed kernel's format, and an output.weight that is not Q6_K,
+    for gen_gemv's head)."""
     f = open(model, "rb")
     if f.read(4) == b"HFQM" or os.environ.get("YAH_NATIVE") != "1":
         dump = os.path.join(LOOM, "..", "..", "build", "yah-dump")
@@ -57,7 +58,8 @@ def parse(model):
         dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
         ty = struct.unpack("<I", f.read(4))[0]
         f.read(8)
-        rows.append((nm, dims, 8 if nm == "token_embd.weight" else ty))
+        q8 = nm == "token_embd.weight" or (nm == "output.weight" and ty not in (8, 14))
+        rows.append((nm, dims, 8 if q8 else ty))
     return rows
 
 

@@ -7,7 +7,8 @@
 // HFQ's where the sets depend on it: a layer's ffn_up starts ffn_gate's bytes plus the HFQ's f16 gate awq after it
 // (the NPU FFN block's image reads gate through up rows in one view, at that stride).
 // Native (a set from emit_prefill_pp.py YAH_NATIVE=1, which runs the GGUF's own formats unrotated): the projections
-// keep their bytes, without awq, ssm_out in GGUF order and ffn_up right after ffn_gate; token_embd still becomes Q8_0.
+// keep their bytes, without awq, ssm_out in GGUF order and ffn_up right after ffn_gate; token_embd still becomes Q8_0,
+// and so does an output.weight that is not Q6_K.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -97,6 +98,9 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total, bool native) {
       throw std::runtime_error(std::string("gguf: tensor type ") + TypeName(t.type) + " of " + t.name +
                                " is not supported (F32, F16, BF16, Q4_0 .. Q8_0, Q2_K .. Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, "
                                "IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS are)");
+    // the head GEMVs read Q6_K (yah_gemv_q6k) and Q8_0 (gen_gemv): a native head of another format becomes Q8_0
+    if (native && t.name == "output.weight" && t.type != GgmlType::kQ6_K && t.type != GgmlType::kQ8_0)
+      return add(&t, t.name, t.dims, GgmlType::kQ8_0, Kind::kQ8_0);
     if (native) return add(&t, t.name, t.dims, t.type, Kind::kCopy);
     add(&t, t.name, t.dims, GgmlType::kMQ4G256, t.type == GgmlType::kMQ4G256 ? Kind::kCopy : Kind::kMq4);
     items.back().heads = t.name.ends_with(".ssm_out.weight") && items.back().kind == Kind::kMq4;

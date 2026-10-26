@@ -1629,11 +1629,12 @@ def main():
             geom.append(("a4", 0, 0, 0))
     else:
         geom.append(("native", 0, 0, 0))   # the engine loads the GGUF as it is (core/gguf_convert.cpp native)
-    # the output head: the tile-free GEMV (gen_gemv) for MQ4, rows per workgroup / lanes / workgroups in its row
-    head_src = None
-    if types["output.weight"] == 44:
+    # the output head: the tile-free GEMV (gen_gemv) for MQ4 or Q8_0 (a native GGUF's head that is not Q6_K, which
+    # yah_gemv_q6k_f32 reads), rows per workgroup / lanes / workgroups in its row
+    head_src, head_fmt = None, gen_gemv.GGML.get(types["output.weight"])
+    if head_fmt:
         head_src = os.path.join(tmp, "yah_gemv_head.loom")
-        open(head_src, "w").write(gen_gemv.gen("plain", ["mq4"], 248320, 5120))
+        open(head_src, "w").write(gen_gemv.gen("plain", [head_fmt], 248320, 5120))
         geom.append(("gemv.hal", gen_gemv.rows_per_wg(), 32 * 4, 248320 // gen_gemv.rows_per_wg()))
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
