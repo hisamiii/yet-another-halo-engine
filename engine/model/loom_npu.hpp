@@ -26,6 +26,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "amdf/amdf.h"
@@ -127,6 +128,7 @@ class LoomNpu {
     if (hsa) export_dmabuf_ = reinterpret_cast<ExportFn>(dlsym(hsa, "hsa_amd_portable_export_dmabuf"));
     if (!export_dmabuf_) throw LoomError("npu: hsa_amd_portable_export_dmabuf not found");
     reaper_ = std::thread([this] { Reaper(); });
+    packets_ = &CreateShared(kPacketBytes, true);   // here: allocating it later would wait for the GPU mid-forward
   }
   LoomNpu(const LoomNpu&) = delete;
   LoomNpu& operator=(const LoomNpu&) = delete;
@@ -609,7 +611,12 @@ class LoomNpu {
   // order (zero-filled storages, registers, DMA waits: state the kernels change at run time). Setups are ~0.5 MB,
   // 2/3 of it core programs, and images that follow each other share most of their code. Loom images load data memory
   // only as read-only sections (PROGBITS) and zero-filled storages (NOBITS: all-zero blocks), one block per section.
-  std::vector<std::uint8_t> DeltaSetup(const std::uint8_t* src, std::size_t length) {
+  //
+  // Program words go to the core tiles by control packets (when `packets`, family setups): each 16-byte aligned 4-word
+  // chunk a packet [control header, 4 words] that shim MM2S0 streams up lane 5 (no image uses it) to the tile's
+  // TILE_CONTROL port. The microcontroller writes ~0.7 GB/s; the shim DMAs stream the packets while it runs the rest
+  // of the setup. See ControlPackets.
+  std::vector<std::uint8_t> DeltaSetup(const std::uint8_t* src, std::size_t length, bool packets) {
     if (program_lost_.exchange(false)) program_.Forget();
     std::uint32_t n = 0, size = 0;
     std::memcpy(&n, src + 8, 4), std::memcpy(&size, src + 12, 4);
@@ -618,6 +625,7 @@ class LoomNpu {
     std::uint32_t ops = 0;
     std::vector<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>> rodata(program_.rodata.size());
     std::vector<std::uint8_t> touched(program_.rodata.size());
+    PacketSetup ps;
     for (std::size_t o = 16; o < size;) {
       std::uint32_t len = 0, addr = 0;
       switch (src[o]) {   // libamdf transaction 0.1 operations (Loom's xdna_product.c)
@@ -630,6 +638,10 @@ class LoomNpu {
       if (len < 16 || o + len > size) throw LoomError("npu: setup operation outside its command");
       std::memcpy(&addr, src + o + 8, 4);
       const std::uint32_t col = addr >> 25, row = (addr >> 20) & 31, off = addr & 0xFFFFF;
+      if (packets && col < ProgramState::kCols && ps.Take(src + o, len, col, row, off, out, ops)) {
+        o += len;
+        continue;
+      }
       const bool core = col < ProgramState::kCols && row >= 2 && row < 2 + ProgramState::kRows;
       const std::size_t t = core ? col * ProgramState::kRows + row - 2 : 0;
       if (core) touched[t] = 1;
@@ -667,26 +679,276 @@ class LoomNpu {
         std::uint32_t end = i + 1;
         for (std::uint32_t j = end; j < words && j < end + 32; ++j)
           if (differs(j)) end = j + 1;
-        const std::uint32_t bl = 16 + 4 * (end - i), at = addr + 4 * i;
-        const std::size_t h = out.size();
-        out.insert(out.end(), src + o, src + o + 16);
-        std::memcpy(&out[h + 8], &at, 4), std::memcpy(&out[h + 12], &bl, 4);
-        out.insert(out.end(), w + 4 * i, w + 4 * end);
+        auto write = [&](std::uint32_t i0, std::uint32_t i1) {
+          if (i0 == i1) return;
+          const std::uint32_t bl = 16 + 4 * (i1 - i0), at = addr + 4 * i0;
+          const std::size_t h = out.size();
+          out.insert(out.end(), src + o, src + o + 16);
+          std::memcpy(&out[h + 8], &at, 4), std::memcpy(&out[h + 12], &bl, 4);
+          out.insert(out.end(), w + 4 * i0, w + 4 * i1);
+          ++ops;
+        };
+        std::uint32_t ia = i;   // the aligned chunks by packet, the ends by write
+        while (ia < end && (addr + 4 * ia) % 16) ++ia;
+        const std::uint32_t ie = ia + (end - ia) / 4 * 4;
+        if (packets && ie - ia >= 8) {
+          write(i, ia), write(ie, end);
+          auto& st = ps.stream[col * ProgramState::kRows + row - 2];
+          for (std::uint32_t j = ia; j < ie; j += 4) {
+            std::uint32_t hdr = ((addr + 4 * j) & 0xFFFFF) | 3u << 20;   // write, 4 beats
+            if (!(__builtin_popcount(hdr) & 1)) hdr |= 1u << 31;          // odd parity
+            st.push_back(hdr);
+            st.resize(st.size() + 4);
+            std::memcpy(&st[st.size() - 4], w + 4 * j, 16);
+          }
+        } else {
+          write(i, end);
+        }
         for (std::uint32_t j = i; j < end; ++j) {
           std::memcpy(&program_.word[base + j], w + 4 * j, 4);
           program_.known[base + j] = 1;
         }
-        ++ops, i = end;
+        i = end;
       }
       o += len;
     }
     for (std::size_t t = 0; t < touched.size(); ++t)
       if (touched[t]) program_.rodata[t] = std::move(rodata[t]);
+    if (packets) ControlPackets(ps, out, ops);
     const std::uint32_t bytes = static_cast<std::uint32_t>(out.size());
     std::memcpy(&out[8], &ops, 4), std::memcpy(&out[12], &bytes, 4);
     return out;
   }
+  // DeltaSetup's control packets: lane 5 is MM2S0 -> shim north 5 -> memtile south 5 / north 5 -> core south 5, up
+  // the column; each core tile takes the packets of its row (packet id) to TILE_CONTROL and passes the rest north.
+  // The control port takes one 4-word write per packet: a BD repeat per packet, its iteration stepping the 5-word
+  // packets, 64 at most (the iteration wrap). Setup operations that would cut the lane or the token route while the
+  // packets stream (switch zero-clears) skip those registers, and the image's own routes up from MM2S0 wait for the
+  // packets' end.
+  struct PacketSetup {
+    std::vector<std::vector<std::uint32_t>> stream =   // per core tile: packets [header, 4 words]
+        std::vector<std::vector<std::uint32_t>>(ProgramState::kCols * ProgramState::kRows);
+    std::array<std::array<std::uint32_t, 0xC0>, ProgramState::kCols> shim{};   // the image's shim switch (0x3F000)
+    std::vector<std::uint8_t> hoist, deferred;   // operations copied to the front, moved behind the packets
+    std::uint32_t hoist_ops = 0, deferred_ops = 0;
+    static bool Kept(std::uint32_t row, std::uint32_t off) {   // the lane's and the token route's registers
+      if (row == 0) return off == 0x3F008 || off == 0x3F044 || off == 0x3F200;   // M2, M17, S0 slot 0
+      if (row == 1) return off == 0xB0040 || off == 0xB0130;                     // M16, S12
+      return off == 0x3F00C || off == 0x3F048 || off == 0x3F128 || (off >= 0x3F2A0 && off < 0x3F2B0);   // M3 M18 S10
+    }
+    // Records and reorders one setup operation; true if it took it (written to out or deferred).
+    bool Take(const std::uint8_t* op, std::uint32_t len, std::uint32_t col, std::uint32_t row, std::uint32_t off,
+              std::vector<std::uint8_t>& out, std::uint32_t& ops) {
+      std::uint32_t v = 0;
+      if (op[0] == 0) std::memcpy(&v, op + 16, 4);
+      if (row == 0 && (op[0] == 0 || op[0] == 1) && off >= 0x3F000 && off < 0x3F300) {
+        const std::uint32_t nw = op[0] == 0 ? 1 : (len - 16) / 4;
+        for (std::uint32_t q = 0; q < nw && off + 4 * q < 0x3F300; ++q)
+          std::memcpy(&shim[col][(off - 0x3F000) / 4 + q], op + 16 + 4 * q, 4);
+      }
+      // the shim mux / demux, MM2S0's slave port and the token route, ahead of the packets (the first setup's array
+      // has none of them)
+      if (row == 0 && ((op[0] == 3 && (off == 0x1F000 || off == 0x1F004)) ||
+                       (op[0] == 0 && (off == 0x3F008 || off == 0x3F100 || off == 0x3F200 || off == 0x3F114))))
+        hoist.insert(hoist.end(), op, op + len), ++hoist_ops;
+      if (row == 0 && op[0] == 0 && off < 0x3F058 && off >= 0x3F000 && v == 0x80000005) {   // a route up from MM2S0
+        deferred.insert(deferred.end(), op, op + len), ++deferred_ops;
+        return true;
+      }
+      if (op[0] != 1 || row > 1 + ProgramState::kRows || off < 0x3F000 || (row == 1 && off < 0xB0000)) return false;
+      const std::uint32_t nw = (len - 16) / 4;
+      bool cut = false;
+      for (std::uint32_t q = 0; q < nw && !cut; ++q) cut = Kept(row, off + 4 * q);
+      if (!cut) return false;
+      for (std::uint32_t q = 0; q < nw;) {   // the block without the kept registers
+        if (Kept(row, off + 4 * q)) {
+          ++q;
+          continue;
+        }
+        std::uint32_t e = q + 1;
+        while (e < nw && !Kept(row, off + 4 * e)) ++e;
+        std::uint32_t a = 0;
+        std::memcpy(&a, op + 8, 4);
+        const std::uint32_t at = a + 4 * q, bl = 16 + 4 * (e - q);
+        const std::size_t h = out.size();
+        out.insert(out.end(), op, op + 16);
+        std::memcpy(&out[h + 8], &at, 4), std::memcpy(&out[h + 12], &bl, 4);
+        out.insert(out.end(), op + 16 + 4 * q, op + 16 + 4 * e);
+        ++ops, q = e;
+      }
+      return true;
+    }
+  };
+  static constexpr std::size_t kPacketBytes = 32u << 20;
+  // The device address of a packet stream in the packet store, 0 when it is full. Streams are stored once by content:
+  // a forward repeats the same image switches, and a recorded script replays its packets by address.
+  std::uint64_t StorePackets(const std::vector<std::uint32_t>& st) {
+    const std::size_t bytes = 4 * st.size();
+    std::string key(reinterpret_cast<const char*>(st.data()), bytes);
+    if (const auto it = packet_index_.find(key); it != packet_index_.end()) return it->second;
+    if (packets_used_ + bytes > packets_->bytes) return 0;
+    auto* dst = static_cast<std::uint8_t*>(packets_->host) + packets_used_;
+    std::memcpy(dst, st.data(), bytes);
+    for (std::size_t q = 0; q < bytes; q += 64) _mm_clflush(dst + q);   // the NPU's reads do not snoop the CPU caches
+    _mm_mfence();
+    std::uint64_t da = 0;
+    YAH_AMDF(api_->memory_query_address(packets_->native, 0, AMDF_MEMORY_ADDRESS_XDNA_DMA, &da), "packet address");
+    da += packets_used_;
+    packets_used_ += (bytes + 63) / 64 * 64;
+    packet_index_.emplace(std::move(key), da);
+    return da;
+  }
+  // DeltaSetup's setup out with its packet streams: the lane and the first batch of packets after the leading core
+  // disables, a batch per stretch of the setup (each ends with a one-shot task, the only one with a token: a repeated
+  // task issues one per repeat), the lane down and the deferred routes before the trailing core enables.
+  void ControlPackets(PacketSetup& ps, std::vector<std::uint8_t>& out, std::uint32_t& ops) {
+    using PS = ProgramState;
+    std::vector<std::uint8_t> seq;
+    std::uint32_t n = 0;
+    auto w32 = [&](std::uint32_t a, std::uint32_t v) {
+      std::uint8_t op[24] = {};
+      const std::uint32_t sz = 24;
+      std::memcpy(op + 8, &a, 4), std::memcpy(op + 16, &v, 4), std::memcpy(op + 20, &sz, 4);
+      seq.insert(seq.end(), op, op + 24), ++n;
+    };
+    auto blk = [&](std::uint32_t a, std::initializer_list<std::uint32_t> v) {
+      std::uint8_t op[16] = {1};
+      const std::uint32_t sz = static_cast<std::uint32_t>(16 + 4 * v.size()), loc = (a >> 20 & 31) << 8 | a >> 25;
+      std::memcpy(op + 4, &loc, 4), std::memcpy(op + 8, &a, 4), std::memcpy(op + 12, &sz, 4);
+      seq.insert(seq.end(), op, op + 16);
+      for (const std::uint32_t x : v) seq.insert(seq.end(), reinterpret_cast<const std::uint8_t*>(&x),
+                                                 reinterpret_cast<const std::uint8_t*>(&x) + 4);
+      ++n;
+    };
+    auto tile = [](std::uint32_t c, std::uint32_t r) { return c << 25 | r << 20; };
+    struct Block {
+      std::uint32_t row, n;
+      std::uint64_t da;
+    };
+    std::array<std::vector<Block>, PS::kCols> blocks;
+    std::array<std::uint32_t, PS::kCols> top{};   // rows on the lane
+    for (std::uint32_t c = 0; c < PS::kCols; ++c)
+      for (std::uint32_t r = 0; r < PS::kRows; ++r) {
+        const auto& st = ps.stream[c * PS::kRows + r];
+        if (st.empty()) continue;
+        if (const std::uint64_t da = StorePackets(st)) {
+          for (std::size_t k = 0; k < st.size() / 5; k += 64)
+            blocks[c].push_back({r + 2, static_cast<std::uint32_t>(std::min<std::size_t>(64, st.size() / 5 - k)),
+                                 da + 20 * k});
+          top[c] = r + 1;
+          continue;
+        }
+        for (std::size_t k = 0; k < st.size(); k += 5)   // the store is full: written by the microcontroller
+          blk(tile(c, r + 2) | (st[k] & 0xFFFFF), {st[k + 1], st[k + 2], st[k + 3], st[k + 4]});
+      }
+    const std::vector<std::uint8_t> fallback = std::move(seq);
+    const std::uint32_t fallback_ops = n;
+    seq.clear(), n = 0;
+    std::size_t batches = 0;
+    for (const auto& b : blocks) batches = std::max(batches, (b.size() + 2) / 3);
+    // the leading core disables and the trailing core enables (maskwrites of 0x32000)
+    std::vector<std::size_t> at;
+    std::size_t lead = 16, tail = out.size();
+    bool other = false;
+    for (std::size_t q = 16; q < out.size();) {
+      std::uint32_t a = 0, len = out[q] == 0 ? 24 : out[q] == 3 ? 28 : 0;
+      std::memcpy(&a, &out[q + 8], 4);
+      if (out[q] == 1) std::memcpy(&len, &out[q + 12], 4);
+      else if (!len) std::memcpy(&len, &out[q + 4], 4);
+      const bool enable = (out[q] == 0 || out[q] == 3) && (a & 0xFFFFF) == 0x32000;
+      if (!enable) other = true, tail = out.size();
+      else if (!other) lead = q + len;
+      else if (tail == out.size()) tail = q;
+      at.push_back(q);
+      q += len;
+    }
+    std::vector<std::uint8_t> res(out.begin(), out.begin() + lead);
+    auto flush = [&] { res.insert(res.end(), seq.begin(), seq.end()), ops += n, seq.clear(), n = 0; };
+    auto batch = [&](std::size_t b) {
+      for (std::uint32_t c = 0; c < PS::kCols; ++c) {
+        const std::size_t b0 = 3 * b, b1 = std::min(blocks[c].size(), b0 + 3);
+        for (std::size_t k = b0; k < b1; ++k) {
+          const Block& bl = blocks[c][k];
+          const auto bd = static_cast<std::uint32_t>(k - b0);
+          // 5 words a repeat, packet id = row; iteration step 5 words, wrap n (both encoded minus one)
+          blk(tile(c, 0) | 0x1D000 + 0x20 * bd,
+              {5, static_cast<std::uint32_t>(bl.da),
+               static_cast<std::uint32_t>(bl.da >> 32 & 0xFFFF) | 1u << 30 | bl.row << 19, 0, 0xC0000000, 0x02000000,
+               bl.n > 1 ? (bl.n - 1) << 20 | 4 : 0, 1u << 25});
+          w32(tile(c, 0) | 0x1D214, (bl.n - 1) << 16 | bd);
+        }
+        if (b1 > b0) {   // the one-shot: the last packet again
+          const Block& bl = blocks[c][b1 - 1];
+          const std::uint64_t la = bl.da + 20 * (bl.n - 1);
+          blk(tile(c, 0) | 0x1D060, {5, static_cast<std::uint32_t>(la),
+                                     static_cast<std::uint32_t>(la >> 32 & 0xFFFF) | 1u << 30 | bl.row << 19, 0,
+                                     0xC0000000, 0x02000000, 0, 1u << 25});
+          w32(tile(c, 0) | 0x1D214, 0x80000003);
+        }
+      }
+    };
+    auto wait = [&](std::size_t b) {
+      for (std::uint32_t c = 0; c < PS::kCols; ++c) {
+        if (blocks[c].size() <= 3 * b) continue;
+        std::uint8_t op[16] = {128};
+        const std::uint32_t sz = 16, w2 = 1 | c << 16, w3 = 1u << 8 | 1u << 16;   // MM2S0 of shim (c, 0)
+        std::memcpy(op + 4, &sz, 4), std::memcpy(op + 8, &w2, 4), std::memcpy(op + 12, &w3, 4);
+        seq.insert(seq.end(), op, op + 16), ++n;
+      }
+    };
+    if (batches) {
+      res.insert(res.end(), ps.hoist.begin(), ps.hoist.end()), ops += ps.hoist_ops;
+      for (std::uint32_t c = 0; c < PS::kCols; ++c) {
+        if (!top[c]) continue;
+        for (std::uint32_t m = 0; m < 22; ++m)
+          if (ps.shim[c][m] == 0x80000005) w32(tile(c, 0) | 0x3F000 + 4 * m, 0);
+        w32(tile(c, 0) | 0x3F044, 0x80000005);                                // M17 <- S5 (MM2S0)
+        w32(tile(c, 1) | 0xB0130, 0x80000000), w32(tile(c, 1) | 0xB0040, 0x8000000C);   // S12, M16 <- S12
+        for (std::uint32_t r = 0; r < top[c]; ++r) {
+          const std::uint32_t t = tile(c, r + 2);
+          w32(t | 0x3F128, 0xC0000000);   // S10 by packets: own row to arbiter 0 msel 0, rows above msel 1
+          for (std::uint32_t k = 0; r + k < PS::kRows; ++k)
+            w32(t | 0x3F2A0 + 4 * k, (r + 2 + k) << 24 | 0x1F << 16 | 1u << 8 | (k ? 1u << 4 : 0));
+          w32(t | 0x3F00C, 0xC0000008);
+          if (r + 1 < top[c]) w32(t | 0x3F048, 0xC0000010);
+        }
+      }
+      batch(0);
+      flush();
+    }
+    std::size_t from = lead;
+    for (std::size_t b = 1; b < batches; ++b) {   // evenly through the setup
+      const std::size_t target = lead + (tail - lead) * b / batches;
+      const auto it = std::lower_bound(at.begin(), at.end(), std::max(target, from));
+      const std::size_t cut = it == at.end() ? tail : std::min(*it, tail);
+      res.insert(res.end(), out.begin() + from, out.begin() + cut);
+      from = cut;
+      wait(b - 1), batch(b), flush();
+    }
+    res.insert(res.end(), out.begin() + from, out.begin() + tail);
+    if (batches) {
+      wait(batches - 1);
+      for (std::uint32_t c = 0; c < PS::kCols; ++c) {
+        if (!top[c]) continue;
+        w32(tile(c, 0) | 0x3F044, 0);
+        w32(tile(c, 1) | 0xB0040, 0), w32(tile(c, 1) | 0xB0130, 0);
+        for (std::uint32_t r = 0; r < top[c]; ++r) {
+          const std::uint32_t t = tile(c, r + 2);
+          w32(t | 0x3F00C, 0), w32(t | 0x3F048, 0), w32(t | 0x3F128, 0);
+          for (std::uint32_t k = 0; k < 4; ++k) w32(t | 0x3F2A0 + 4 * k, 0);
+        }
+      }
+      flush();
+    }
+    res.insert(res.end(), fallback.begin(), fallback.end()), ops += fallback_ops;
+    res.insert(res.end(), ps.deferred.begin(), ps.deferred.end()), ops += ps.deferred_ops;
+    res.insert(res.end(), out.begin() + tail, out.end());
+    out = std::move(res);
+  }
   ProgramState program_;
+  Shared* packets_ = nullptr;   // the packet store (StorePackets)
+  std::size_t packets_used_ = 0;
+  std::unordered_map<std::string, std::uint64_t> packet_index_;
   std::atomic<bool> program_lost_{false};
   std::atomic<std::uint64_t> epoch_{0};   // Epoch
   Script* recording_ = nullptr;           // Record
@@ -711,7 +973,7 @@ class LoomNpu {
       int queued = 0, since = 0;
       if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
         if (k0->setup.empty()) throw LoomError("npu: a job switches image families without a setup");
-        append(DeltaSetup(k0->setup.data(), k0->setup.size()));
+        append(DeltaSetup(k0->setup.data(), k0->setup.size(), true));
         fam = FamilyOf(k0), dec = k0->dec;
       }
       append(calls[0]->gate);
@@ -726,7 +988,8 @@ class LoomNpu {
         const Call& c = *calls[i];
         if (c.k->swap && c.k->dec != dec) {
           for (; queued > 0; --queued) append(calls[i - 1]->wait);
-          append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length));
+          // mid-job (a gate's tasks live on columns 1-2): no packets
+          append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length, false));
           dec = c.k->dec, since = 0;
         }
         append(since == 0 ? c.lead : c.push[since & 1]);
