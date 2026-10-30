@@ -501,14 +501,13 @@ def array_program(L, cfg):
         if cfg.dcol:
             e(f"  constrain.fill %chw{c}_0, %chf{c}")
     if cfg.rawdma:   # each filler's raw ring in its W ring (fuse_raw_ring), records [16 rows][RECROW bytes]
-        D = decoder(cfg.fmt, cfg.gord)
         e(f"  %firows = constant.u32 16 : reg<aie2p.array.scalar : index>")
-        e(f"  %fipitch = constant.u32 {D.RECROW} : reg<aie2p.array.scalar : index>")
-        for c in range(cols):
+        for c in range(cols):   # (column pairs: each column's format's record rows, BFP's are longer)
+            e(f"  %fipitch{c} = constant.u32 {decoder(colcfg(cfg, c).fmt, cfg.gord).RECROW} : reg<aie2p.array.scalar : index>")
             for r in dict.fromkeys(list(fuse_cover(cfg, c)) + list(fuse_helpers(cfg, c))):
                 cov = fuse_dcov(cfg, c, r)
                 e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(colcfg(cfg, c), cov)[0]} : reg<aie2p.array.scalar : index>")
-                e(f"  constrain.intake %chr{c}_{r}, %chw{c}_{r}, %fioff{c}_{r}, %firows, %fipitch")
+                e(f"  constrain.intake %chr{c}_{r}, %chw{c}_{r}, %fioff{c}_{r}, %firows, %fipitch{c}")
     if cfg.dcol:
         fill_inputs(e, cfg, panel)
     # activations: one stream per row, one slab per record, multicast along the row (first branch rotates)
@@ -915,7 +914,7 @@ def fuse_record(cfg, cov):
 
 
 FUSE_SB = 4   # fuse 2: super-blocks per row of a unit (a pass: 1024 k)
-FUSE_FMTS = ("IQ4_XS", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K", "Q5_K")   # fuse 2 decoders (cfg.fmt, in
+FUSE_FMTS = ("IQ4_XS", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K", "Q5_K", "BFP")   # fuse 2 decoders (cfg.fmt, in
 # cfg.gord's k-block order; program and data memory decide which fit an image: gen_npu_dec sizes)
 
 
@@ -1478,7 +1477,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     else:
         raw_stream_unit(e, D, RW, inb)
     if s0:   # the decoder reads this row's super-blocks
-        e(f"  %fzo_ins = mov.i32 {D.BLK * s0}")
+        e(f"  %fzo_ins = mov.i32 {(2 * D.OUT_B if D.BFP else D.BLK) * s0}")   # (BFP: the record is in output layout)
         e(f"  %fzinS = add.rr {inb}, %fzo_ins")
         inb = "%fzinS"
     for nm in ("sp", "in", "sp2", "out"):

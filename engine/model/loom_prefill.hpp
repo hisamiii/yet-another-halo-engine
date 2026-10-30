@@ -11,6 +11,8 @@
 #ifndef YAH_MODEL_LOOM_PREFILL_HPP_
 #define YAH_MODEL_LOOM_PREFILL_HPP_
 
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -1125,8 +1127,8 @@ class LoomPrefill {
   std::size_t FfnBlkH() const { return std::size_t{B_ / 64} * (FfnBlkF() / 1024) * 4 * 128 * 144; }
   std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
   static int DecoderId(const char* fmt) {
-    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k", "iq2xxs", "iq2xs", "q5k"};
-    for (int i = 0; i < 8; ++i)
+    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k", "iq2xxs", "iq2xs", "q5k", "iq2s"};
+    for (int i = 0; i < 9; ++i)
       if (std::strcmp(kDecoders[i], fmt) == 0) return i;
     return -1;
   }
@@ -1186,20 +1188,25 @@ class LoomPrefill {
       RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk");
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
-    const std::size_t rb = static_cast<std::size_t>(tg->bytes) / M, blk = rb * 256 / tg->dims[0];
-    const std::size_t rbu = static_cast<std::size_t>(tu->bytes) / M, blku = rbu * 256 / tu->dims[0];
-    const std::size_t rbd = static_cast<std::size_t>(td->bytes) / td->dims[1], blkd = rbd * 256 / td->dims[0];
+    const bool bg = !std::strcmp(f.name, "iq2s"), bu = !std::strcmp(fu.name, "iq2s"), bd = !std::strcmp(fd.name, "iq2s");
+    const std::size_t blk = bg ? kBfpBlock : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
+    const std::size_t blku = bu ? kBfpBlock : tu->bytes / M * 256 / tu->dims[0], rbu = blku * tu->dims[0] / 256;
+    const std::size_t blkd = bd ? kBfpBlock : td->bytes / td->dims[1] * 256 / td->dims[0], rbd = blkd * td->dims[0] / 256;
     const std::size_t f0 = M - F, dgu = static_cast<std::size_t>(tg->bytes);
+    const std::size_t Nd = static_cast<std::size_t>(td->dims[1]);
+    const std::uint8_t* pg = bg ? BfpRows(pre + "ffn_gate.weight", M * rb) : base + tg->offset;
+    const std::uint8_t* pu = bu ? BfpRows(pre + "ffn_up.weight", M * rbu) : base + tu->offset;
+    const std::uint8_t* pd = bd ? BfpRows(pre + "ffn_down.weight", Nd * rbd) : base + td->offset;
     if (npu_planning_) {   // the NPU's gate / up rows (one range when up follows gate), all of down
       const std::size_t end = gguf_.tensor_data_size();
       if (pair) {
-        npu_->RegisterRaw(base + tg->offset + f0 * rb, std::min(tg->offset + M * rb + 4096, end) - (tg->offset + f0 * rb));
-        npu_->RegisterRaw(base + tu->offset + f0 * rbu, std::min(tu->offset + M * rbu + 4096, end) - (tu->offset + f0 * rbu));
+        npu_->RegisterRaw(pg + f0 * rb, bg ? (M - f0) * rb + 8192 : std::min(tg->offset + M * rb + 4096, end) - (tg->offset + f0 * rb));
+        npu_->RegisterRaw(pu + f0 * rbu, bu ? (M - f0) * rbu + 8192 : std::min(tu->offset + M * rbu + 4096, end) - (tu->offset + f0 * rbu));
       } else {
         const std::size_t a = tg->offset + f0 * rb;
         npu_->RegisterRaw(base + a, std::min(tu->offset + M * rb + 4096, end) - a);
       }
-      npu_->RegisterRaw(base + td->offset, std::min<std::size_t>(td->bytes + 4096, end - td->offset));
+      npu_->RegisterRaw(pd, bd ? Nd * rbd + 8192 : std::min<std::size_t>(td->bytes + 4096, end - td->offset));
     }
     std::vector<std::uint32_t> csw;
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
@@ -1209,9 +1216,9 @@ class LoomPrefill {
       for (std::uint32_t j = 0; j < F / 256; ++j) {
         const std::size_t r0 = f0 + 256 * j;
         csw.push_back(npu_->BindRawPair(
-            sw + ".xdna", SwapOf(sw), 16 + 8 * DecoderId(f.name) + DecoderId(fu.name), ag,
-            base + tg->offset + r0 * rb, 255 * rb + 16 * blk + RecordRow(f.name),
-            base + tu->offset + r0 * rbu, 255 * rbu + 16 * blku + RecordRow(fu.name),
+            sw + ".xdna", SwapOf(sw), 16 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            pg + r0 * rb, 255 * rb + 16 * blk + RecordRow(f.name),
+            pu + r0 * rbu, 255 * rbu + 16 * blku + RecordRow(fu.name),
             {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, 4 * (B_ / 64) * 4 * 1152,
             "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
       }
@@ -1220,9 +1227,9 @@ class LoomPrefill {
       for (std::uint32_t j = 0; j < F / 192; ++j) {
         const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);
         csw.push_back(npu_->BindRawPair(
-            sw + ".xdna", SwapOf(sw), 16 + 8 * DecoderId(f.name) + DecoderId(fu.name), ag,
-            base + tg->offset + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + RecordRow(f.name),
-            base + tu->offset + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + RecordRow(fu.name),
+            sw + ".xdna", SwapOf(sw), 16 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            pg + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + RecordRow(f.name),
+            pu + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + RecordRow(fu.name),
             {(j / 16) * 4 * 128 * 144 + (j % 16) * 8 * 144, bs.c}, 3 * (B_ / 64) * 4 * 1152,
             "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
       }
@@ -1231,7 +1238,7 @@ class LoomPrefill {
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 256; ++j)
         csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
-                                    base + tg->offset + (f0 + 256 * j) * rb,
+                                    pg + (f0 + 256 * j) * rb,
                                     dgu + 255 * rb + 16 * blk + RecordRow(f.name),
                                     {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, "ffnsw" + hord));
     } else {   // 32 calls of 224 features: call j's column c takes features 8 (128 c + 4 j) + [0, 32); Q4_K's order
@@ -1239,7 +1246,7 @@ class LoomPrefill {
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 224; ++j)
         csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
-                                    base + tg->offset + (f0 + (q4k ? 64 * (j / 2) + 16 * (j % 2) : 32 * j)) * rb,
+                                    pg + (f0 + (q4k ? 64 * (j / 2) + 16 * (j % 2) : 32 * j)) * rb,
                                     dgu + (6 * 1024 + (q4k ? 47 : 31)) * rb + 16 * blk + RecordRow(f.name),
                                     {4 * j * 144, bs.c},
                                     "ffnsw" + hord));
@@ -1256,7 +1263,7 @@ class LoomPrefill {
         const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + 4 * p0;
         cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", SwapOf(dn[ci]), DecoderId(fd.name),
                                         {std::size_t{p0} * 4 * 128 * 144, bd.a, true},
-                                        base + td->offset + r0 * rbd + k0 * blkd,
+                                        pd + r0 * rbd + k0 * blkd,
                                         (rows - 1) * rbd + 16 * blkd + RecordRow(fd.name),
                                         {doff + (ci * calls + r) * cp, cp}, fam));
       }
@@ -3156,7 +3163,30 @@ class LoomPrefill {
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
   bool npu_dcol_ = false;          // the set's NPU decodes raw weight rows itself (dispatch.txt "npudcol")
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
-  static std::size_t RecordRow(const char* fmt) { return std::strcmp(fmt, "q5k") == 0 ? 704 : kDcolRecordRow; }
+  static std::size_t RecordRow(const char* fmt) {
+    return std::strcmp(fmt, "q5k") == 0 ? 704 : std::strcmp(fmt, "iq2s") == 0 ? 1152 : kDcolRecordRow;
+  }
+  // IQ2_S FFN tensors have no NPU decoder: the emitter wrote their rows pre-decoded (emit_prefill_pp.bfp_rows,
+  // npu_bfp_<name>.bin: the decoder records' bfp16 fragments, 288 bytes per 256 weights), read once into resident
+  // writable memory like the model (RegisterRaw pins it; + 8192 bytes of over-read slack)
+  static constexpr std::size_t kBfpBlock = 288;
+  const std::uint8_t* BfpRows(const std::string& name, std::size_t bytes) {
+    if (const auto it = bfp_.find(name); it != bfp_.end()) return it->second;
+    const std::string path = dir_ + "/npu_bfp_" + name + ".bin";
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw LoomError("cannot open " + path);
+    void* p = ::mmap(nullptr, bytes + 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) throw LoomError("prefill: no memory for " + path);
+    for (std::size_t done = 0; done < bytes;) {
+      const ssize_t n = ::pread(fd, static_cast<char*>(p) + done, bytes - done, static_cast<off_t>(done));
+      if (n <= 0) throw LoomError("prefill: short read of " + path);
+      done += static_cast<std::size_t>(n);
+    }
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    ::close(fd);
+    return bfp_[name] = static_cast<std::uint8_t*>(p);
+  }
+  std::map<std::string, std::uint8_t*> bfp_;
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
   std::size_t npu_cleared_ = 0;    // flagged_ jobs whose flag words NpuJoin cleared
   std::size_t npu_joined_ = 0;     // flagged_ jobs an NpuJoin waited for (in order)

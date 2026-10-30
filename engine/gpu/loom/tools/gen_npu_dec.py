@@ -29,9 +29,9 @@ def grid_table(name, n):
 
 FMT = os.environ.get("DQ_FMT", "IQ4_XS")
 BLK = {"IQ4_XS": 136, "Q4_K": 144, "Q5_K": 176, "IQ3_S": 110, "IQ3_XXS": 98, "IQ2_XXS": 66, "IQ2_XS": 74,
-       "Q3_K": 110}[FMT]   # bytes per super-block
+       "Q3_K": 110, "BFP": 288}[FMT]   # bytes per super-block
 HBY = {"IQ4_XS": 8, "Q4_K": 16, "Q5_K": 48, "IQ3_S": 2, "IQ3_XXS": 2, "IQ2_XXS": 2, "IQ2_XS": 2,
-       "Q3_K": 0}[FMT]        # header bytes before qs
+       "Q3_K": 0, "BFP": 0}[FMT]        # header bytes before qs
 GRID = FMT in ("IQ3_S", "IQ3_XXS", "IQ2_XXS", "IQ2_XS")   # grid formats: gathers of 4-value grid pieces + sign masks (rodata)
 # grid and sign tables in different banks, each gather's address lanes 0, 1 at one and 2, 3 at the other (no bank stall)
 GMIX = GRID and FMT != "IQ2_XS"
@@ -73,7 +73,10 @@ GF = Q5 or Q4G                  # gather-free K-quants (no table)
 Q4L = FMT in ("Q4_K", "Q5_K")   # Q4_K's header and scale path
 HROLL = os.environ.get("DQ_HROLL", "1") == "1"   # Q3_K, IQ2_XS, IQ2_XXS inlined: the scale prep rolled (program memory)
 GORD = os.environ.get("DQ_GORD", "P4")       # Q3_K pushes any k-block order: "P4", "N" or "PK" (Q4_K's, for its pairs)
-RECROW = 704 if Q5 else 576     # record row bytes, the same for every format but Q5_K (Q4_K's 4 x 144): switches
+# BFP: rows pre-decoded on the host (engine RegisterBfp, emit_prefill_pp bfp_rows): a unit's record is already the
+# decoder's output ([kb 128 in KPERM order][h 2] bfp16 fragments, its 16 rows of 1152 bytes), the leaf only copies it
+BFP = FMT == "BFP"
+RECROW = 1152 if BFP else 704 if Q5 else 576     # record row bytes, the same for every format but Q5_K (Q4_K's 4 x 144): switches
                                 # between formats then re-program only the decoder tiles (the staging buffers stay
                                 # identical)
 ROWB = RECROW if os.environ.get("DQ_FIXREC", "1") == "1" else 4 * BLK   # a row's 4 super-blocks (+ ignored tail)
@@ -88,6 +91,8 @@ GAS, PARTSS, GT2 = 0, 4096, 5120
 # storage B (gather addresses, T parts, the table's second copy (not the grid formats': theirs is rodata); +64: gathers
 # read a + 32; Q5_K: NIB and the parts)
 SCR2_B = PARTSS + 1024 if GF else GT2 + (0 if GRID else 2048) + 64
+if BFP:
+    SCR_B = SCR2_B = 64
 TABV, BASEV = [TAB], ["%sp"]
 KV = I.KV if FMT == "IQ4_XS" else [float(v) for v in range(16)]
 OUTCAP = 2
@@ -2172,6 +2177,8 @@ def leaf_inline(nsb, name="inl", vroll=False, tonce=True, rec=None):
     lines (not renamed; the caller prefixes its values and labels). Grid formats gather from module rodata
     (inline_rodata(name), defined once by the caller's module). rec: (first, end) of the records 2 j + r to decode
     (the others are left as they are)."""
+    if BFP:
+        return bfp_copy(nsb, rec)
     INLINE[0], VROLL[0], TONCE[0], RREC[0] = nsb, vroll, tonce, rec
     try:
         txt = leaf(name, 1)
@@ -2185,6 +2192,24 @@ def leaf_inline(nsb, name="inl", vroll=False, tonce=True, rec=None):
             continue
         out.append(ln)
     return out
+
+
+def bfp_copy(nsb, rec):
+    """BFP: the input record's output records (rec, else all 2 nsb; 2304 bytes each, at the same offsets: the record is
+    the output's layout) copied from %in to %out, 256 bytes a step."""
+    r0, r1 = rec or (0, 2 * nsb)
+    ep, er = "reg<aie2p.ep>", "reg<aie2p.er>"
+    L = [f"%bi0 = padda %in, {OUT_B * r0}" if r0 else f"%bi0 = copy %in : {ep} -> {ep}",
+         f"%bo0 = padda %out, {OUT_B * r0}" if r0 else f"%bo0 = copy %out : {ep} -> {ep}",
+         "%bk0 = mova.i32 0", f"%bn = mov.i32 {(r1 - r0) * OUT_B // 256}",
+         f"low.br ^bl(%bi0: {ep}, %bo0: {ep}, %bk0: {er})",
+         f"^bl(%bi: {ep}, %bo: {ep}, %bk: {er}):",
+         "%bm = lt %bk, %bn", f"low.cond_br %bm, ^bb, ^bx : {er}", "^bb:"]
+    L += [f"%bv{i} = vlda.256.i32x8 %bi, {32 * i}" for i in range(8)]
+    L += [f"vst.256.i32x8 %bv{i}, %bo, {32 * i}" for i in range(8)]
+    L += ["%bi1 = padda %bi, 256", "%bo1 = padda %bo, 256", "%bk1 = add %bk, 1",
+          f"low.br ^bl(%bi1: {ep}, %bo1: {ep}, %bk1: {er})", "^bx:"]
+    return [ln if ln.startswith("^") else "  " + ln for ln in L]
 
 
 def inline_rodata(name="inl"):
