@@ -13,6 +13,8 @@
 
 namespace yah::model {
 
+class NpuProf;
+
 // Sizes of the GPU buffers shared with the NPU and the gate protocol of the set's NPU image (LoomPrefill::npu_plan).
 struct NpuPlan {
   std::size_t a_bytes = 0, w_bytes = 0, c_bytes = 0;  // encoded activations, encoded weight panels, f32 C panels
@@ -92,6 +94,8 @@ class NpuSplit {
   // A flag word from / to the host (CPU-driven tests: the host stands in for the GPU's stores and waits).
   virtual void HostStore(std::uint32_t word, std::uint32_t value) = 0;
   virtual std::uint32_t HostLoad(std::uint32_t word) = 0;
+  // The performance counters of CPU-driven runs (YAH_NPU_PROF), or null.
+  virtual NpuProf* Prof() { return nullptr; }
 };
 
 }  // namespace yah::model

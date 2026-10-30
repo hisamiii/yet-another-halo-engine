@@ -36,6 +36,7 @@
 #include "core/gguf_quant.hpp"
 #include "model/loom_decoder.hpp"
 #include "model/loom_runtime.hpp"
+#include "model/npu_prof.hpp"
 #include "model/npu_split.hpp"
 #include "model/prefill_calib.hpp"
 
@@ -291,6 +292,8 @@ class LoomPrefill {
         ~Join() { t.join(); }
       } join{enq};
       std::map<std::string, double> family_ms;
+      NpuProf* const prof = npu_->Prof();
+      std::vector<double> job_ms;
       for (std::size_t i = 0; i < jobs.size(); ++i) {
         const NpuSplit::Job& w = jobs[i].words;
         std::vector<std::uint32_t> before;   // the job's gate slots, to report which words its calls changed
@@ -310,6 +313,7 @@ class LoomPrefill {
         // the job's time from its ready store to its done word (its command's setup and image switch included)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "npu cpu-driven: job %zu %s %.3f ms\n", i, jobs[i].tag.c_str(), ms);
+        job_ms.push_back(ms);
         family_ms[jobs[i].tag] += ms;
         if ((d & 0x7fffffffu) < w.gate || (d & 0x80000000u)) {
           std::fprintf(stderr, "npu cpu-driven: job %zu (%s) stalled or failed: done %08x gate %08x\n", i,
@@ -322,6 +326,15 @@ class LoomPrefill {
         }
       }
       std::fprintf(stderr, "npu cpu-driven: %zu jobs done\n", jobs.size());
+      if (prof) {   // one line per job: its counters (NpuProf::Finish order), for tools/npu_prof.py
+        const std::vector<std::uint32_t> v = prof->Finish(jobs.size());
+        std::fprintf(stderr, "npu prof: events %s\n", std::getenv("YAH_NPU_PROF"));
+        for (std::size_t i = 0; i < jobs.size(); ++i) {
+          std::fprintf(stderr, "npu prof: job %zu %s %.3f", i, jobs[i].tag.c_str(), job_ms[i]);
+          for (std::uint32_t k = 0; k < NpuProf::kValues; ++k) std::fprintf(stderr, " %u", v[i * NpuProf::kValues + k]);
+          std::fprintf(stderr, "\n");
+        }
+      }
       for (const auto& [tag, ms] : family_ms) std::fprintf(stderr, "npu cpu-driven: %-8s %8.1f ms\n", tag.c_str(), ms);
       if (const char* cmd = std::getenv("YAH_NPU_CPU_DONE_CMD")) std::system(cmd);
       return;

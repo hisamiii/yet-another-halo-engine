@@ -35,6 +35,7 @@
 #include "iree/base/byte_sequence.h"
 #include "iree/hal/drivers/amd/xdna/image/aie2p/npu2.h"
 #include "model/loom_runtime.hpp"
+#include "model/npu_prof.hpp"
 #include "model/npu_split.hpp"
 
 namespace yah::model {
@@ -549,6 +550,7 @@ class LoomNpu {
   // NPU time of the last retired command (CommandStats).
   [[nodiscard]] double LastCommandMs() const { return last_command_ms_.load(); }
   // Throws if a command failed.
+  NpuProf* Prof() { return prof_.get(); }
   void CheckHealth() {
     std::lock_guard<std::mutex> lock(mu_);
     if (!failure_.empty()) throw LoomError(failure_);
@@ -699,6 +701,10 @@ class LoomNpu {
       ops += n;
     };
     auto append = [&](const std::vector<std::uint8_t>& b) { append_raw(b.data(), b.size()); };
+    auto append_ops = [&](const std::vector<std::uint8_t>& b, std::uint32_t n) {
+      bytes.insert(bytes.end(), b.begin(), b.end());
+      ops += n;
+    };
     for (const auto& calls : runs) {
       int queued = 0, since = 0;
       if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
@@ -707,9 +713,11 @@ class LoomNpu {
         fam = FamilyOf(k0), dec = k0->dec;
       }
       append(calls[0]->gate);
+      if (prof_) append_ops(prof_->Setup(), prof_->SetupOps());
       if (!calls[0]->k->streamed) {
         for (const Call* c : calls) append(c->call);
         append(calls.back()->done);
+        if (prof_) append_ops(prof_->Read(), 1);
         continue;
       }
       for (std::size_t i = 0; i < calls.size(); ++i) {
@@ -725,6 +733,7 @@ class LoomNpu {
       }
       for (; queued > 0; --queued) append(calls.back()->wait);
       append(calls.back()->done);
+      if (prof_) append_ops(prof_->Read(), 1);
     }
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
@@ -965,6 +974,14 @@ class LoomNpu {
     qi.structure_size = sizeof(qi);
     qi.queue_family_ordinal = family;
     YAH_AMDF(xdna_->kernel_queue_create(context_, &qi, &queue_), "xdna.kernel_queue_create");
+    if (const char* spec = std::getenv("YAH_NPU_PROF")) {
+      prof_ = std::make_unique<NpuProf>(spec);
+      amdf_xdna_context_info_t info{};
+      info.type = AMDF_STRUCTURE_TYPE_XDNA_CONTEXT_INFO;
+      info.structure_size = sizeof(info);
+      YAH_AMDF(xdna_->context_query_info(context_, &info), "xdna.context_query_info");
+      prof_->Attach(static_cast<std::uint32_t>(info.id.words[1]));   // Linux DRM: the context's handle, low word
+    }
   }
 
   iree_hal_amd_xdna_image_t* Image(const std::string& path) {
@@ -1058,6 +1075,7 @@ class LoomNpu {
   amdf_endpoint_t* endpoint_ = nullptr;
   amdf_device_t* device_ = nullptr;
   amdf_xdna_context_t* context_ = nullptr;
+  std::unique_ptr<NpuProf> prof_;
   amdf_kernel_queue_t* queue_ = nullptr;
   amdf_memory_device_access_t access_{};
   amdf_memory_profile_t profile_{};
@@ -1222,6 +1240,7 @@ class LoomNpuSplit : public NpuSplit {
     __builtin_ia32_clflush(const_cast<std::uint32_t*>(w));
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
   }
+  NpuProf* Prof() override { return npu_.Prof(); }
   std::uint32_t HostLoad(std::uint32_t word) override {
     auto* w = static_cast<volatile std::uint32_t*>(flags_.host) + word;
     __builtin_ia32_clflush(const_cast<std::uint32_t*>(w));

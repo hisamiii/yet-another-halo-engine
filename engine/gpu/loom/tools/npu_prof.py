@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Per-family AIE counter shares from a YAH_NPU_PROF run (model/npu_prof.hpp): each counter's cycles as a share of the
+TRUE counter's (event 1, the core cycles between a job's gate and its counters' read), per core row and per column.
+
+npu_prof.py <run log> [family]   (with a family: the full column x row grid of each counter)
+
+The log holds "npu prof: events c0,c1,c2,c3/m0,m1" and one "npu prof: job <i> <family> <ms> <values>" line per job,
+values per core tile (columns 0-7, rows 2-5, column-major): the core module's four counters, the memory module's two.
+Event ids (AIE2P): core 1 TRUE, 23 memory stall, 24 stream stall, 25 cascade stall, 26 lock stall, 28 active,
+37 vector instruction, 38 load, 39 store, 20 / 21 PC in range 0-1 / 2-3; memory module 31 / 32 S2MM 0 / 1 stalled on
+a lock, 33 MM2S 0 stalled on a lock, 35 / 36 S2MM 0 / 1 starved of stream data, 37 MM2S 0 backpressure."""
+import collections, sys
+
+COLS, ROWS, REGS = 8, 4, 6
+NAMES = {1: "true", 20: "pc01", 21: "pc23", 23: "memstall", 24: "strmstall", 25: "cascstall", 26: "lockstall",
+         28: "active", 37: "vector", 38: "load", 39: "store"}
+MNAMES = {23: "s2mm0bd", 24: "s2mm1bd", 31: "s2mm0lock", 32: "s2mm1lock", 33: "mm2s0lock", 35: "s2mm0starve",
+          36: "s2mm1starve", 37: "mm2s0bp"}
+
+
+def load(path):
+    events, fam = None, collections.defaultdict(lambda: [0.0, 0, [0] * (COLS * ROWS * REGS)])
+    for line in open(path):
+        if line.startswith("npu prof: events"):
+            c, m = line.split()[3].split("/")
+            events = [int(x) for x in c.split(",")] + [int(x) for x in m.split(",")]
+        elif line.startswith("npu prof: job"):
+            f = line.split()
+            acc = fam[f[4]]
+            acc[0] += float(f[5])
+            acc[1] += 1
+            for k, v in enumerate(f[6:]):
+                acc[2][k] += int(v)
+    names = [NAMES.get(e, f"c{e}") for e in events[:4]] + [MNAMES.get(e, f"m{e}") for e in events[4:]]
+    return events, names, fam
+
+
+def main():
+    events, names, fam = load(sys.argv[1])
+    t = events.index(1)   # the TRUE counter normalizes the others
+    tile = lambda v, c, r, k: v[(c * ROWS + r) * REGS + k]
+    print(f"{'family':8s} {'jobs':>4s} {'ms':>7s} {'Mcyc/col':>8s}  per row 2-5: " + " | ".join(names[k] for k in range(REGS) if k != t))
+    for name, (ms, jobs, v) in sorted(fam.items()):
+        cyc = sum(tile(v, c, r, t) for c in range(COLS) for r in range(ROWS)) / (COLS * ROWS)
+        rows = []
+        for k in range(REGS):
+            if k == t:
+                continue
+            share = [sum(tile(v, c, r, k) for c in range(COLS)) / max(1, sum(tile(v, c, r, t) for c in range(COLS)))
+                     for r in range(ROWS)]
+            rows.append(" ".join(f"{100 * s:3.0f}" for s in share))
+        print(f"{name:8s} {jobs:4d} {ms:7.1f} {cyc / 1e6:8.1f}  " + " | ".join(rows))
+    if len(sys.argv) > 2:
+        ms, jobs, v = fam[sys.argv[2]]
+        for k in range(REGS):
+            print(f"\n{names[k]} (% of true; rows 2-5 down, columns 0-7 across)" if k != t else
+                  f"\n{names[k]} (Mcycles)")
+            for r in range(ROWS):
+                vals = [tile(v, c, r, k) / (1e6 if k == t else max(1, tile(v, c, r, t)) / 100) for c in range(COLS)]
+                print(f"  r{r + 2} " + " ".join(f"{x:6.1f}" for x in vals))
+
+
+if __name__ == "__main__":
+    main()
