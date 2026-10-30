@@ -1,0 +1,76 @@
+libamdf: fault in an imported dma-buf's mapping at attach.
+
+Since Linux 7.4 (amdxdna df4d535206) mmap of an imported BO no longer faults its pages in; the kernel leaves that to
+the submit-time populate, which uses hmm_range_fault and rejects the exporter's VM_PFNMAP | VM_IO mapping (KFD / TTM
+dma-bufs). The NPU then walks not-present ptes through SVA: AMD-Vi IO_PAGE_FAULTs and an all-NaN prefill. A BO list
+does not help (duplicate imports share one resv: EALREADY; populate: EFAULT), so the attach reads one byte per page
+from the CPU (ttm_bo_vm_fault installs the ptes), imports only. Older kernels prefault in mmap: the reads find them.
+diff --git a/libamdf/src/xdna/umd/drm/buffer.c b/libamdf/src/xdna/umd/drm/buffer.c
+index 56f7b66fd1..9d8e317d34 100644
+--- a/libamdf/src/xdna/umd/drm/buffer.c
++++ b/libamdf/src/xdna/umd/drm/buffer.c
+@@ -54,6 +54,7 @@ amdf_status_t amdf_linux_xdna_buffer_import_dma_buf(
+   *out_buffer = (amdf_linux_xdna_buffer_t){
+       .handle = create.handle,
+       .type = AMDXDNA_BO_SHARE,
++      .imported = true,
+       .byte_length = byte_length,
+   };
+   return AMDF_STATUS_OK;
+@@ -173,6 +174,17 @@ amdf_status_t amdf_linux_xdna_buffer_attach(
+       buffer->host_pointer = mapping;
+       return AMDF_STATUS_OK;
+     }
++    if (buffer->imported) {
++      // Since Linux 7.4 (amdxdna df4d535206) mmap no longer faults an
++      // imported dma-buf in, and the submit-time populate (hmm_range_fault)
++      // rejects the exporter's PFN mapping (TTM), so a BO list cannot replace
++      // this. The NPU walks this VA through SVA: fault every page in from the
++      // CPU now. On older kernels the pages are present and nothing faults.
++      for (size_t offset = 0; offset < buffer->byte_length;
++           offset += page_size) {
++        (void)*(volatile const uint8_t*)((const uint8_t*)mapping + offset);
++      }
++    }
+     // mmap establishes SVA; the pre-mmap query does not yet have its address.
+     if (ioctl(descriptor, DRM_IOCTL_AMDXDNA_GET_BO_INFO, &info) != 0) {
+       return amdf_linux_error(errno);
+diff --git a/libamdf/src/xdna/umd/drm/buffer.h b/libamdf/src/xdna/umd/drm/buffer.h
+index ecf6622d21..704228866f 100644
+--- a/libamdf/src/xdna/umd/drm/buffer.h
++++ b/libamdf/src/xdna/umd/drm/buffer.h
+@@ -7,6 +7,7 @@
+ #ifndef AMDF_SRC_XDNA_UMD_DRM_BUFFER_H_
+ #define AMDF_SRC_XDNA_UMD_DRM_BUFFER_H_
+ 
++#include <stdbool.h>
+ #include <stddef.h>
+ 
+ #include "amdf/amdf.h"
+@@ -19,6 +20,9 @@ typedef struct amdf_linux_xdna_buffer_t {
+   uint32_t handle;
+   // Native `AMDXDNA_BO_*` allocation type fixed by creation.
+   uint32_t type;
++  // Imported from another driver's dma-buf (its mapping is faulted in at
++  // attach; see amdf_linux_xdna_buffer_attach).
++  bool imported;
+   // Allocation extent in bytes, rounded to the native page size.
+   size_t byte_length;
+   // Stable device address; zero for CPU-only KMQ command buffers.
+diff --git a/libamdf/src/xdna/umd/drm/kernel_queue.c b/libamdf/src/xdna/umd/drm/kernel_queue.c
+index c89ed586e8..b70390cb59 100644
+--- a/libamdf/src/xdna/umd/drm/kernel_queue.c
++++ b/libamdf/src/xdna/umd/drm/kernel_queue.c
+@@ -138,8 +138,10 @@ static amdf_status_t amdf_linux_xdna_command_submit(
+       .hwctx = context->handle,
+       .type = AMDXDNA_CMD_SUBMIT_EXEC_BUF,
+       .cmd_handles = packet->handle,
+-      // Backing is resident for its allocation lifetime. Only the command BO
+-      // identifies this native submission; indirect data has no BO list.
++      // Backing is resident for its allocation lifetime (imported dma-bufs:
++      // faulted in at attach, as the kernel populates no PFN mapping). Only
++      // the command BO identifies this native submission; indirect data has
++      // no BO list.
+       .args = 0,
+       .cmd_count = 1,
+       .arg_count = 0,
