@@ -409,7 +409,7 @@ class LoomPrefill {
         const bool k_af = Af("gemm_kstore", pre + "attn_k.weight");
         const bool v_af = Af("gemm_kstore", pre + "attn_v.weight");
         const bool q_npu = NpuRows("q") && NpuOk(pre + "attn_q.weight") && !NpuHal(KqgHal(pre + "attn_q.weight", q_af)).empty();
-        if (!q_npu || !RunAttentionHalves(l, ci, pre, hook, q_af, k_af, v_af)) {
+        if (!RunAttentionHalves(l, ci, pre, hook, q_af, k_af, v_af, q_npu)) {
           FfnUnpackPending(-1);
           nq_want_ = nqw_ && !q_npu;
           RunNorm(pre + "attn_norm.weight",
@@ -3029,12 +3029,13 @@ class LoomPrefill {
     return true;
   }
   // An attention layer by halves (the NPU's q heads, and out's rows when HalfOutOk; the paged fp16 KV only); false: run
-  // it whole.
+  // it whole. q_npu false (q's format has no NPU decoder): q all the GPU's, the layer split by halves for out alone.
   bool RunAttentionHalves(std::uint32_t l, std::uint32_t ci, const std::string& pre, const KvHook& hook, bool q_af,
-                          bool k_af, bool v_af) {
+                          bool k_af, bool v_af, bool q_npu) {
     const std::string wq = pre + "attn_q.weight", wo = pre + "attn_output.weight";
     if (!HalvesOn() || hook || !kv_paged_ || !paged_f16k_ || !paged_f16v_ || !rope_kpaged_ || !kv16_scratch_ || kdeq_ ||
-        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || qg16_ || DcolImage(wq, nullptr, true).empty())
+        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || qg16_ ||
+        (q_npu ? DcolImage(wq, nullptr, true).empty() : !HalfOutOk(wo, Af("gemm_kres", wo))))
       return false;
     norm_bfp_.clear();
     const std::uint32_t ai = l / cfg_.full_attention_interval;
@@ -3042,7 +3043,7 @@ class LoomPrefill {
     const std::uint32_t nq = NpuRows("q");
     const bool o_af = Af("gemm_kres", wo), out_half = HalfOutOk(wo, o_af);
     const bool tiled = q_af && k_af && v_af, pk = NpuPk(wq);
-    const auto rq = NpuRawRows("q", wq, nq);
+    const auto rq = q_npu ? NpuRawRows("q", wq, nq) : std::vector<std::vector<NpuView>>{};
     std::uint32_t job[2] = {};
     NpuView cq[2];
     for (int h = 0; h < 2; ++h) {
@@ -3052,6 +3053,7 @@ class LoomPrefill {
                : q_af || k_af || v_af ? NormOut::kBoth
                                       : NormOut::kRow,
                h);
+      if (!q_npu) continue;
       const NpuView a = HalfA(false, h, pk);
       if (pk)
         HalfEncode(std::string("npu_enc_5120") + (tiled ? "_t" : "") + "_pk.hal", tiled ? *normt_ : *scratch_,
@@ -3062,7 +3064,12 @@ class LoomPrefill {
       job[h] = NpuEnqueue(std::move(calls), "q", {{AView(a)}, CView(cq[h])});
     }
     // the GPU's q heads, k and v of the whole chunk (as RunAttention)
-    RunKqgSplit(wq, q_af, NpuHal(KqgHal(wq, q_af)), nq);
+    if (q_npu) {
+      RunKqgSplit(wq, q_af, NpuHal(KqgHal(wq, q_af)), nq);
+    } else if (!RunKqg(wq, q_af)) {   // (as RunAttention: no kqg GEMM for its format)
+      RunKstore(wq, *qkv_);
+      Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
+    }
     RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
     RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
     const hrx_buffer_ref_t kpool_l{kpool_->handle, std::size_t{ai} * pool_bytes_, pool_bytes_};
@@ -3075,8 +3082,10 @@ class LoomPrefill {
     NpuView oc[2];
     for (int h = 0; h < 2; ++h) {
       const std::uint32_t c = 2 * ci + h;  // the half set's chunk
-      NpuJoin(job[h]);
-      NpuUnpack("npu_unpack_q.hal", cq[h], {Tok(*q_, h, rq32), Tok(*gate_, h, rq32)}, 6, true);
+      if (q_npu) {
+        NpuJoin(job[h]);
+        NpuUnpack("npu_unpack_q.hal", cq[h], {Tok(*q_, h, rq32), Tok(*gate_, h, rq32)}, 6, true);
+      }
       // V rows into the half's part of the layer's f16 V scratch, K rows straight into the paged pool
       const hrx_buffer_ref_t v16{kv16_->handle, kv16_layer_ + h * vrows, vrows};
       Dispatch(HChunkExe("rope", c), "yah_fused_qk_rope_batched", qnorm_ ? kKvHeads : kHeads + kKvHeads, HB(), 1, 256, 1, 1,
