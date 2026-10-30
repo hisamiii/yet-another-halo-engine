@@ -129,11 +129,13 @@ class Config:
 # (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
 # (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * GATE_CALLS (jobs count from 1 after the
 # setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), at a pace of
-# GP0 + GPS * max(0, polls - GFAST) delay iterations (~7.7 ns each in the engine). A poll sees ready ~17 polls after the
-# GPU stored it (the reads run that far behind; pp2048 fit, and host-stamped flag records show the read itself is fresh),
-# so a wait costs ~17 paces: a constant pace through the waits the sets have (every layer has NPU work: up to ~15 ms;
-# 896 polls of ~0.04 ms) keeps that ~0.65 ms (0.31 ms paces cost ~5 ms per waiting job, 0.66 s of pp2048), where
-# backing off from the start cost 4-17 ms per job, growing with the gap. The last 128 polls back off, so the supply still
+# GP0 + GPR * max(0, polls - GRAMP) + GPS * max(0, polls - GFAST) delay iterations (~7.7 ns each in the engine). A poll
+# sees ready ~17 polls after the GPU stored it (the reads run that far behind; pp2048 fit, and host-stamped flag records
+# show the read itself is fresh), so a wait costs ~17 paces: a constant pace through the waits of layers with NPU work
+# (up to ~15 ms; 512 polls of ~0.04 ms) keeps that ~0.65 ms (0.31 ms paces cost ~5 ms per waiting job, 0.66 s of
+# pp2048), where backing off from the start cost 4-17 ms per job, growing with the gap. A gentle ramp then covers the
+# waits across a GPU-only FFN (UD-IQ4_XS layers 0, 14-17: ~45 ms, ~5 ms late; at a constant pace into the back-off,
+# layer 15's out saw ready ~40 ms late). The last 128 polls back off, so the supply still
 # lasts ~1.25 s (the tick stream takes one record per poll; 1024 is the most the shim's descriptors chain). It hands
 # [seq, status, polls, ncalls] to the mid over a leaf-synchronized neighbor channel and ticks / reads out the rest of the supply GB records per
 # firing of the next job. The mid emits go and done (constrain.signal + constrain.gate): the control program's gate
@@ -143,7 +145,7 @@ class Config:
 # N calls is N * nb * passes firings, and before the first gated job (state zero) it is one call: the setup call's.
 # Config.gfirst moves a job's wait and relay to its first firing (gate_first; the end of a firing only counts and
 # drains, gate_count): state zero is then at the gate, so the setup runs no call (LOOM_EXP_SETUP_ONLY).
-GP0, GPS, GFAST, GB = 5000, 19000, 896, 8
+GP0, GPR, GRAMP, GPS, GFAST, GB = 5000, 200, 512, 16000, 896, 8
 # The protocol the host follows (dispatch.txt "npugate <GATE_SUPPLY> <GATE_CALLS> <GATE_RECORD>"): a job's gate value is
 # sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
 # binding. GATE_FAILED in done: the head gave up (the host sets it too for a failed command; gen_npu_unpack.GATED_LOOP).
@@ -2062,6 +2064,20 @@ def gate_parked(e):
     e("  %gn1 = mov.scalar-to-address %gnpl")
 
 
+def gate_pace(e, p, pn1, out):
+    """out = the pace after pn1 polls: GP0 + GPR * max(0, pn1 - GRAMP) + GPS * max(0, pn1 - GFAST) (p: name prefix)."""
+    for t, lim, k in (("r", GRAMP, GPR), ("b", GFAST, GPS)):
+        e(f"  {p}{t}l = {imm32(lim)} {lim}")
+        e(f"  {p}{t}s = lt {p}{t}l, {pn1}")
+        e(f"  {p}{t}o = sub {pn1}, {p}{t}l")
+        e(f"  {p}{t}m = mul {p}{t}o, {p}{t}s")
+        e(f"  {p}{t}k = mov.i32 {k}")
+        e(f"  {p}{t}g = mul {p}{t}m, {p}{t}k")
+    e(f"  {p}0 = mov.i32 {GP0}")
+    e(f"  {p}r = add.rr {p}0, {p}rg")
+    e(f"  {out} = add.rr {p}r, {p}bg")
+
+
 def imm32(v):
     """The constant op for v: mova.i32 (4 bytes, load slot) where its 11-bit immediate holds v, else mov.i32."""
     return "mova.i32" if -1024 <= v < 1024 else "mov.i32"
@@ -2161,9 +2177,6 @@ def gate_epilogue(L, cfg, gate, parked=False):
         e(f"  %g64 = mov.i32 {GATE_CALLS}")
         e("  %gexp = mul %gnext, %g64")   # ready = sequence * GATE_CALLS + calls
         e(f"  %gsup = mov.i32 {S}")
-        e(f"  %gfast = mov.i32 {GFAST}")
-        e(f"  %gp0 = mov.i32 {GP0}")
-        e(f"  %gps = mov.i32 {GPS}")
         e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
         e("^gp(%gpn: reg<aie2p.er>, %gnc0: reg<aie2p.er>):")
         e("  %gpo = lt %gpn, %gsup")
@@ -2180,11 +2193,7 @@ def gate_epilogue(L, cfg, gate, parked=False):
         e("  %glate = lt %grdy, %gexp")
         e("  low.cond_br %glate, ^gpace, ^gopen : reg<aie2p.er>")
         e("^gpace:")
-        e("  %gslow = lt %gfast, %gpn1")
-        e("  %gover = sub %gpn1, %gfast")
-        e("  %govs = mul %gover, %gslow")
-        e("  %ggrow = mul %govs, %gps")
-        e("  %gpace = add.rr %gp0, %ggrow")
+        gate_pace(e, "%gv", "%gpn1", "%gpace")
         e("  low.br ^gw(%g0: reg<aie2p.er>, %gpace: reg<aie2p.er>, %gpn1: reg<aie2p.er>, %g0: reg<aie2p.er>)")
         e("^gw(%gwi: reg<aie2p.er>, %gwl: reg<aie2p.er>, %gwp: reg<aie2p.er>, %gwc: reg<aie2p.er>):")
         e("  %gwm = lt %gwi, %gwl")
@@ -2280,7 +2289,7 @@ def gate_first(e, cfg, gate, gn):
         e("  low.br ^gfgo")
         e("^gfgo:")
         return
-    # the waiter: ready >= the last job's + GATE_CALLS; poll, then spin the pace (GP0 + GPS * max(0, polls - GFAST))
+    # the waiter: ready >= the last job's + GATE_CALLS; poll, then spin the pace (gate_pace)
     e(f"  %gf64 = mova.i32 {GATE_CALLS}")
     if compact:
         e("  %gfE = lda %gsp0, 16")
@@ -2308,14 +2317,7 @@ def gate_first(e, cfg, gate, gn):
     e(f"  %gfsl = {imm32(S - 1)} {S - 1}")
     e("  %gfquit = lt %gfsl, %gfpn1")   # (pn + 1 >= S)
     e("  %gfwait = lt %gfquit, %gflate")
-    e(f"  %gffast = {imm32(GFAST)} {GFAST}")
-    e("  %gfslow = lt %gffast, %gfpn1")
-    e("  %gfover = sub %gfpn1, %gffast")
-    e("  %gfovs = mul %gfover, %gfslow")
-    e(f"  %gfps = mov.i32 {GPS}")
-    e("  %gfgrow = mul %gfovs, %gfps")
-    e(f"  %gfp0 = mov.i32 {GP0}")
-    e("  %gfpace = add.rr %gfgrow, %gfp0")
+    gate_pace(e, "%gfv", "%gfpn1", "%gfpace")
     e("  low.cond_br %gfwait, ^gfpgo, ^gfhand : reg<aie2p.er>")
     e("^gfpgo:")
     e("  low.br ^gfp(%gfpn1: reg<aie2p.er>, %gfpace: reg<aie2p.er>)")
@@ -2523,7 +2525,7 @@ def waiter_epilogue(e, S, parked, nbr):
     e("  st %gm, %gsp, 12")
     e("  return")
     e("^gend:")
-    # the wait for ready >= the last job's + GATE_CALLS: poll, then spin the pace (GP0 + GPS * max(0, polls - GFAST))
+    # the wait for ready >= the last job's + GATE_CALLS: poll, then spin the pace (gate_pace)
     e(f"  %g64 = mova.i32 {GATE_CALLS}")
     e("  %gexp = add.rr %gE, %g64")
     e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
@@ -2544,14 +2546,7 @@ def waiter_epilogue(e, S, parked, nbr):
     e(f"  %gsl = mova.i32 {S - 1}")
     e("  %gquit = lt %gsl, %gpn1")                # (pn + 1 >= S; pn and pw die before the back edge's values)
     e("  %gwait = lt %gquit, %glate")
-    e(f"  %gfast = {imm32(GFAST)} {GFAST}")
-    e("  %gslow = lt.select %gfast, %gpn1")
-    e("  %gover = sub %gpn1, %gfast")
-    e("  %govs = sel.nez %gover, %gpw, %gslow")   # (%gpw: 0 here)
-    e(f"  %gps = mov.i32 {GPS}")
-    e("  %ggrow = mul %govs, %gps")
-    e(f"  %gp0 = mov.i32 {GP0}")
-    e("  %gpace = add.rr %ggrow, %gp0")
+    gate_pace(e, "%gv", "%gpn1", "%gpace")
     e("  low.cond_br %gwait, ^gpgo, ^ghand : reg<aie2p.er>")
     e("^gpgo:")
     e("  low.br ^gp(%gpn1: reg<aie2p.er>, %gpace: reg<aie2p.er>)")
