@@ -1,6 +1,6 @@
 // YAH_NPU_PROF (CPU-driven runs, YAH_NPU_CPU=1): per-job AIE performance counters of every core tile.
-// The fused command (LoomNpuSplit::FusedCommand) carries Setup() after each job's gate, so counting starts once the
-// job's ready word lands, and Read() after its done; the firmware appends the READ_REGS values to a debug buffer
+// The fused command (LoomNpuSplit::FusedCommand) carries Setup(image) after each job's gate, so counting starts once
+// the job's ready word lands, and Read() after its done; the firmware appends the READ_REGS values to a debug buffer
 // attached to the context, which the host reads once the last job is done (Finish).
 // Spec "c0,c1,c2,c3/m0,m1": the core module's four counters' events and the memory module's two (AIE2P event ids:
 // tools/npu_prof.py, which sums them per family); each counter counts the cycles its event is set. Its cost is in the
@@ -16,8 +16,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -31,18 +33,12 @@ class NpuProf {
   static constexpr std::uint32_t kTiles = kCols * kRows, kValues = kTiles * kRegs;
 
   explicit NpuProf(const char* spec) {
-    unsigned c[kCore] = {}, m[kMem] = {};
-    if (std::sscanf(spec, "%u,%u,%u,%u/%u,%u", &c[0], &c[1], &c[2], &c[3], &m[0], &m[1]) != 6)
+    if (std::sscanf(spec, "%u,%u,%u,%u/%u,%u", &c_[0], &c_[1], &c_[2], &c_[3], &m_[0], &m_[1]) != 6)
       throw LoomError(std::string("YAH_NPU_PROF: want c0,c1,c2,c3/m0,m1 event ids, got ") + spec);
-    auto ctl = [](unsigned a, unsigned b) { return (a & 127) | (a & 127) << 8 | (b & 127) << 16 | (b & 127) << 24; };
     std::vector<std::uint32_t> addr;   // the counters READ_REGS reads, per tile
     for (std::uint32_t col = 0; col < kCols; ++col)
       for (std::uint32_t row = kRow0; row < kRow0 + kRows; ++row) {
         const std::uint32_t t = col << 25 | row << 20;
-        Write(t + 0x31500, 0), Write(t + 0x31504, 0), Write(t + 0x11000, 0);   // stop
-        for (std::uint32_t r = 0; r < kCore; ++r) Write(t + 0x31520 + 4 * r, 0);
-        for (std::uint32_t r = 0; r < kMem; ++r) Write(t + 0x11020 + 4 * r, 0);
-        Write(t + 0x31500, ctl(c[0], c[1])), Write(t + 0x31504, ctl(c[2], c[3])), Write(t + 0x11000, ctl(m[0], m[1]));
         for (std::uint32_t r = 0; r < kCore; ++r) addr.push_back(t + 0x31520 + 4 * r);
         for (std::uint32_t r = 0; r < kMem; ++r) addr.push_back(t + 0x11020 + 4 * r);
       }
@@ -69,15 +65,44 @@ class NpuProf {
         char path[64], link[64] = {};
         std::snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
         if (readlink(path, link, sizeof(link) - 1) > 0 && !std::strncmp(link, "/dev/accel/", 11))
-          if (!TryAttach(std::atoi(e->d_name), ctx)) errors += std::string(" fd ") + e->d_name + ": " + std::strerror(errno);
+          if (!TryAttach(std::atoi(e->d_name), ctx))
+            errors += std::string(" fd ") + e->d_name + ": " + std::strerror(errno);
       }
       closedir(d);
     }
     if (!map_) throw LoomError("npu prof: no debug buffer for context " + std::to_string(ctx) + errors);
   }
 
-  const std::vector<std::uint8_t>& Setup() const { return setup_; }
-  std::uint32_t SetupOps() const { return setup_ops_; }
+  // The counters' setup for a job of this image: stop, zero, the image's PC events, start. YAH_NPU_PROF_PC names a
+  // directory of "<image name>.pc" files (emit_prefill_pp with LOOM_DIAG_PC=1), lines "col row pc0 pc1 pc2 pc3": the
+  // program addresses of a core's PC events (events 20 / 21: the PC in [pc0, pc1) / [pc2, pc3)); 0 or no file: none.
+  const std::vector<std::uint8_t>& Setup(const std::string& image) {
+    std::vector<std::uint8_t>& ops = setup_[image];
+    if (!ops.empty()) return ops;
+    std::uint32_t pc[kCols][kRows][4] = {};
+    if (const char* dir = std::getenv("YAH_NPU_PROF_PC")) {
+      std::string name = image.substr(image.rfind('/') + 1);
+      if (std::FILE* f = std::fopen((dir + ("/" + name.substr(0, name.rfind('.')) + ".pc")).c_str(), "r")) {
+        for (unsigned col, row, a[4]; std::fscanf(f, "%u %u %u %u %u %u", &col, &row, &a[0], &a[1], &a[2], &a[3]) == 6;)
+          if (col < kCols && row >= kRow0 && row < kRow0 + kRows)
+            for (int r = 0; r < 4; ++r) pc[col][row - kRow0][r] = a[r] ? 1u << 31 | a[r] : 0;   // bit 31: valid
+        std::fclose(f);
+      }
+    }
+    auto ctl = [](unsigned a, unsigned b) { return (a & 127) | (a & 127) << 8 | (b & 127) << 16 | (b & 127) << 24; };
+    for (std::uint32_t col = 0; col < kCols; ++col)
+      for (std::uint32_t row = kRow0; row < kRow0 + kRows; ++row) {
+        const std::uint32_t t = col << 25 | row << 20;
+        Write(ops, t + 0x31500, 0), Write(ops, t + 0x31504, 0), Write(ops, t + 0x11000, 0);   // stop
+        for (std::uint32_t r = 0; r < kCore; ++r) Write(ops, t + 0x31520 + 4 * r, 0);
+        for (std::uint32_t r = 0; r < kMem; ++r) Write(ops, t + 0x11020 + 4 * r, 0);
+        for (std::uint32_t r = 0; r < 4; ++r) Write(ops, t + 0x32020 + 4 * r, pc[col][row - kRow0][r]);
+        Write(ops, t + 0x31500, ctl(c_[0], c_[1])), Write(ops, t + 0x31504, ctl(c_[2], c_[3]));
+        Write(ops, t + 0x11000, ctl(m_[0], m_[1]));
+      }
+    return ops;
+  }
+  static constexpr std::uint32_t SetupOps() { return kTiles * (3 + kCore + kMem + 4 + 3); }
   const std::vector<std::uint8_t>& Read() const { return read_; }
 
   // After the last job's done: the firmware's log of every job's READ_REGS, kValues words per job in job order
@@ -120,15 +145,16 @@ class NpuProf {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
   }
   // WRITE32: {op 0, pad[7]}, u64 address (low word), u32 value, u32 size 24
-  void Write(std::uint32_t address, std::uint32_t value) {
+  static void Write(std::vector<std::uint8_t>& ops, std::uint32_t address, std::uint32_t value) {
     std::uint8_t op[24] = {};
     Put(op + 8, address), Put(op + 16, value), Put(op + 20, std::uint32_t{24});
-    setup_.insert(setup_.end(), op, op + 24);
-    ++setup_ops_;
+    ops.insert(ops.end(), op, op + 24);
   }
 
-  std::vector<std::uint8_t> setup_, read_;
-  std::uint32_t setup_ops_ = 0, bo_ = 0;
+  unsigned c_[kCore] = {}, m_[kMem] = {};
+  std::map<std::string, std::vector<std::uint8_t>> setup_;   // per image
+  std::vector<std::uint8_t> read_;
+  std::uint32_t bo_ = 0;
   int fd_ = -1;
   volatile std::uint32_t* map_ = nullptr;
 };

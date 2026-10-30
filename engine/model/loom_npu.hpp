@@ -75,6 +75,7 @@ class LoomNpu {
   // One loaded instance of an image with its bindings and native command storage.
   struct Kernel {
     const void* image_key = nullptr;
+    std::string path;
     iree_hal_amd_xdna_image_t* image = nullptr;
     uint32_t entry_ordinal = 0;
     // Decoder-column images (gen_npu_gemm dcol 2) share all array state but their decoder tiles: family names the set
@@ -262,6 +263,7 @@ class LoomNpu {
       throw LoomError("npu: " + path + " has no gate (re-emit it)");
     auto k = std::make_unique<Kernel>();
     k->image_key = image;
+    k->path = path;
     k->image = image;
     k->entry_ordinal = entry_ordinal;
     k->streamed = rec.invocation_count == 7;
@@ -713,7 +715,7 @@ class LoomNpu {
         fam = FamilyOf(k0), dec = k0->dec;
       }
       append(calls[0]->gate);
-      if (prof_) append_ops(prof_->Setup(), prof_->SetupOps());
+      if (prof_) append_ops(prof_->Setup(calls[0]->k->path), prof_->SetupOps());
       if (!calls[0]->k->streamed) {
         for (const Call* c : calls) append(c->call);
         append(calls.back()->done);

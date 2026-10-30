@@ -28,6 +28,7 @@ import gen_gemm_iu4  # noqa: E402
 import gen_kvq  # noqa: E402
 import gen_fpsparse  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
+import npu_prof  # noqa: E402
 
 
 def rope_kpaged(text):
@@ -1515,10 +1516,14 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
 
     def compile_one(b):
         cfg, name, src, env = b
-        return subprocess.run([hrx_paths.LOOM_COMPILE, src, "--root=@" + cfg.entry,
-                               "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
-                               "--output=" + os.path.join(outdir, name + ".xdna")], capture_output=True, text=True,
-                              env=env)
+        r = subprocess.run([hrx_paths.LOOM_COMPILE, src, "--root=@" + cfg.entry,
+                            "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
+                            "--output=" + os.path.join(outdir, name + ".xdna")], capture_output=True, text=True,
+                           env=env)
+        if os.environ.get("LOOM_DIAG_PC") and not r.returncode:   # the image's PC ranges for YAH_NPU_PROF_PC
+            open(os.path.join(outdir, name + ".pc"), "w").write(
+                "\n".join(npu_prof.pc_ranges(src, r.stderr.splitlines())) + "\n")
+        return r
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         rs = list(ex.map(compile_one, [source(*j) for j in jobs]))
         # ghelp's helper (a decoder plus the gate's waiter) can exceed the core's program memory: that image with
