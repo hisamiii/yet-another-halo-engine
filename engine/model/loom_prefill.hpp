@@ -145,6 +145,19 @@ class LoomPrefill {
     for (const auto& [tag, n] : per_tag)
       std::fprintf(f, "npu wait: %-8s %llu polls\n", tag.c_str(), static_cast<unsigned long long>(n));
   }
+  // YAH_NPU_PROF in a GPU + NPU run: after it, the first NPU chunk's per-job counters as CPU-driven runs print them
+  // (tools/npu_prof.py; no per-job host time: 0).
+  void ReportNpuProf() {
+    NpuProf* const prof = npu_ ? npu_->Prof() : nullptr;
+    if (!prof || prof_tags_.empty()) return;
+    const std::vector<std::uint32_t> v = prof->Finish(prof_tags_.size());
+    std::fprintf(stderr, "npu prof: events %s\n", std::getenv("YAH_NPU_PROF"));
+    for (std::size_t i = 0; i < prof_tags_.size(); ++i) {
+      std::fprintf(stderr, "npu prof: job %zu %s 0", i, prof_tags_[i].c_str());
+      for (std::uint32_t k = 0; k < NpuProf::kValues; ++k) std::fprintf(stderr, " %u", v[i * NpuProf::kValues + k]);
+      std::fprintf(stderr, "\n");
+    }
+  }
   // Split the set's NPU sites of full chunks with the NPU from now on: it computes their trailing npusplit rows.
   // npu (built from npu_plan()) outlives this object.
   void EnableNpu(NpuSplit* npu) {
@@ -360,6 +373,8 @@ class LoomPrefill {
     }
     chunk_graph_->Launch();
     jobs.swap(flagged_);
+    if (npu_->Prof() && !jobs.empty() && prof_tags_.empty())   // the first NPU chunk's jobs (ReportNpuProf)
+      for (const auto& q : jobs) prof_tags_.push_back(q.tag);
     if (!jobs.empty()) {
       try {
         npu_->Enqueue(jobs);   // on a failure it releases the graph's waits for the jobs left
@@ -3207,6 +3222,7 @@ class LoomPrefill {
   static constexpr std::size_t kWaitLogSlots = 65536;
   LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
   std::vector<std::string> waitlog_tag_;   // each slot's layer and job tag
+  std::vector<std::string> prof_tags_;     // YAH_NPU_PROF: the first NPU chunk's job tags (ReportNpuProf)
   std::size_t flag_slot_ = 0;
   std::vector<float> embed_rows_;          // host-side embed (Embed): the chunk's token_embd rows
   hrx_timeline_point_t rows_copied_ = {};  // when their last copy landed

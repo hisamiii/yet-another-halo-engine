@@ -211,6 +211,7 @@ int main(int argc, char** argv) {
     std::printf("layers_ms=%.1f\n", layer_ms);
     if (npu) npu->Report(stdout);
     pf.ReportWaitLog(stdout);
+    pf.ReportNpuProf();
 
     {
       std::vector<float> out(std::size_t{B} * LoomPrefill::kHidden);

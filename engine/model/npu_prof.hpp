@@ -1,4 +1,5 @@
-// YAH_NPU_PROF (CPU-driven runs, YAH_NPU_CPU=1): per-job AIE performance counters of every core tile.
+// YAH_NPU_PROF (CPU-driven runs, YAH_NPU_CPU=1, or GPU + NPU runs: LoomPrefill::ReportNpuProf): per-job AIE
+// performance counters of every core tile.
 // The fused command (LoomNpuSplit::FusedCommand) carries Setup(image) after each job's gate, so counting starts once
 // the job's ready word lands, and Read() after its done; the firmware appends the READ_REGS values to a debug buffer
 // attached to the context, which the host reads once the last job is done (Finish).
