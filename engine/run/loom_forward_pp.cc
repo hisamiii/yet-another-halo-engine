@@ -210,6 +210,7 @@ int main(int argc, char** argv) {
     const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
     if (npu) npu->Report(stdout);
+    pf.ReportWaitLog(stdout);
 
     {
       std::vector<float> out(std::size_t{B} * LoomPrefill::kHidden);

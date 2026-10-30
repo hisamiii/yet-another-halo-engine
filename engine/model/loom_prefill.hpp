@@ -131,6 +131,20 @@ class LoomPrefill {
       p.gate_calls = it->second.rowgrp, p.gate_record = it->second.tt;
     return p;
   }
+  // YAH_NPU_WAITLOG: after the run, one line per GPU wait for an NPU job (layer, the job's tag, polls of its done word,
+  // ~0.2 us each) and the polls per tag. Waits inside a GEMM epilogue (NPUADD) are not logged.
+  void ReportWaitLog(std::FILE* f) {
+    if (!waitlog_) return;
+    std::vector<std::uint32_t> polls(waitlog_tag_.size());
+    gpu_.D2H(*waitlog_, polls.data(), polls.size() * 4);
+    std::map<std::string, std::uint64_t> per_tag;
+    for (std::size_t i = 0; i < polls.size(); ++i) {
+      std::fprintf(f, "npu wait: %zu %s %u\n", i, waitlog_tag_[i].c_str(), polls[i]);
+      per_tag[waitlog_tag_[i].substr(waitlog_tag_[i].find(' ') + 1)] += polls[i];
+    }
+    for (const auto& [tag, n] : per_tag)
+      std::fprintf(f, "npu wait: %-8s %llu polls\n", tag.c_str(), static_cast<unsigned long long>(n));
+  }
   // Split the set's NPU sites of full chunks with the NPU from now on: it computes their trailing npusplit rows.
   // npu (built from npu_plan()) outlives this object.
   void EnableNpu(NpuSplit* npu) {
@@ -151,6 +165,11 @@ class LoomPrefill {
       if (NpuRem(site)) rem = std::max<std::size_t>(rem, std::size_t{B_} * rows * 4);
     if (rem) npurem_ = &Alloc(rem);
     if (ffnblk_ && geom_.count("npu_unpack_ffnblk.hal")) ffnrem_ = &Alloc(std::size_t{B_} * kHidden * 4);   // (npuffnrem)
+    if (std::getenv("YAH_NPU_WAITLOG")) {
+      if (!geom_.count("npu_flag_wait_log.hal"))
+        throw LoomError("YAH_NPU_WAITLOG: the set has no npu_flag_wait_log.hal (re-emit it)");
+      waitlog_ = &Alloc(kWaitLogSlots * 4);
+    }
     // Bind every NPU call of a full chunk now (a pass of the layers that dispatches nothing): a first bind loads the
     // image's storage and patches it, milliseconds per call.
     LoomBuffer *h = hidden_, *h2 = hidden2_;
@@ -1973,8 +1992,16 @@ class LoomPrefill {
   // Queue the GPU work that runs beside job (default: the last enqueued one) before this.
   void NpuJoin(std::int64_t job = -1) {
     if (npu_planning_) return;
-    const NpuWait w = NpuJoinBegin(job);
-    Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 4, &w.npu_side);
+    NpuWait w = NpuJoinBegin(job);
+    if (waitlog_) {   // YAH_NPU_WAITLOG: the wait's poll count to its own slot (ReportWaitLog)
+      const NpuSplit::Queued& q = flagged_.at(job < 0 ? flagged_.size() - 1 : static_cast<std::size_t>(job));
+      if (waitlog_tag_.size() == kWaitLogSlots) throw LoomError("YAH_NPU_WAITLOG: more waits than log slots");
+      w.words.push_back({waitlog_->handle, waitlog_tag_.size() * 4, 4});
+      waitlog_tag_.push_back(std::to_string(q.layer) + " " + q.tag);
+      Dispatch(Exe("npu_flag_wait_log.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 12, &w.npu_side);
+    } else {
+      Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 4, &w.npu_side);
+    }
     NpuJoinEnd(job);
   }
   // NpuJoin's parts around the dispatch that waits for the last enqueued job (yah_npu_flag_wait, or a GEMM whose
@@ -3177,6 +3204,9 @@ class LoomPrefill {
   bool dnring_ = false, dn_chained_ = false;
   hrx_buffer_ref_t nq_cnt_{};
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
+  static constexpr std::size_t kWaitLogSlots = 65536;
+  LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
+  std::vector<std::string> waitlog_tag_;   // each slot's layer and job tag
   std::size_t flag_slot_ = 0;
   std::vector<float> embed_rows_;          // host-side embed (Embed): the chunk's token_embd rows
   hrx_timeline_point_t rows_copied_ = {};  // when their last copy landed

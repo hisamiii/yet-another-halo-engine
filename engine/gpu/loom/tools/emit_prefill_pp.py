@@ -1461,6 +1461,10 @@ def npu_split(rows, combos, B, outdir):
     open(src, "w").write(GU.gen_flag_wait())
     E.emit(src, ["nop=0"], "npu_flag_wait.hal", outdir)
     out.append(("npu_flag_wait.hal", 1, 32, 0))
+    src = os.path.join(tmp, "npu_flag_wait_log.loom")   # the same wait, logging its poll count (YAH_NPU_WAITLOG)
+    open(src, "w").write(GU.gen_flag_wait(log=True))
+    E.emit(src, ["nop=0"], "npu_flag_wait_log.hal", outdir)
+    out.append(("npu_flag_wait_log.hal", 1, 32, 0))
     out.append(("npugate", GN.GATE_SUPPLY, GN.GATE_CALLS, GN.GATE_RECORD))
     if NPU_DCOL:
         extra = npu_ffnblk(rows, B, tmp, outdir, out, split, variants) if NPU_FFNBLK else []
