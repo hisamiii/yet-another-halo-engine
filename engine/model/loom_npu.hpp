@@ -1548,7 +1548,7 @@ class LoomNpuSplit : public NpuSplit {
     const bool repeat = chunk && plan_.dcol && npu_.Epoch() == prev_epoch_ && SameJobs(jobs, prev_jobs_);
     if (chunk) prev_epoch_ = npu_.Epoch(), prev_jobs_ = jobs;
     const bool replay = repeat && !script_.commands.empty() && SameJobs(jobs, script_jobs_);
-    const bool record = repeat && !replay;
+    const bool record = repeat && !replay && !no_script_;
     try {
       npu_.CheckHealth();
       if (Word(kFlagStatus)) throw LoomError("npu: a GPU wait for the NPU failed");
@@ -1584,8 +1584,13 @@ class LoomNpuSplit : public NpuSplit {
         queued += n;
       }
       if (record && npu_.Epoch() == prev_epoch_) {
-        npu_.Seal(script_);
-        script_jobs_ = jobs;
+        try {
+          npu_.Seal(script_);
+          script_jobs_ = jobs;
+        } catch (const LoomError&) {   // a chunk's script (~94 MB) past the NPU's command memory: issue every chunk anew
+          npu_.Record(nullptr), npu_.Free(script_);
+          no_script_ = true;
+        }
       } else if (record) {   // the recording's own setups forgot program state
         npu_.Record(nullptr), npu_.Free(script_);
       }
@@ -1654,6 +1659,7 @@ class LoomNpuSplit : public NpuSplit {
   std::vector<Queued> prev_jobs_, script_jobs_;
   std::uint64_t prev_epoch_ = 0;
   LoomNpu::Script script_;
+  bool no_script_ = false;   // the script did not fit in command memory: no recording from then on
   static bool SameJobs(const std::vector<Queued>& a, const std::vector<Queued>& b) {
     return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](const Queued& x, const Queued& y) {
       return x.calls == y.calls && x.tag == y.tag && x.layer == y.layer && x.words.ready == y.words.ready &&
