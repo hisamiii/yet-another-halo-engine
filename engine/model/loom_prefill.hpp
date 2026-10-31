@@ -1217,13 +1217,17 @@ class LoomPrefill {
     const auto ix4_rows = [&](const std::string& kind, std::size_t rbx) {
       return HostRows("npu_ix4_" + pre + kind + ".bin", M * rbx, {{f0 * rbx, F * rbx}});
     };
-    const std::uint8_t* pg = bmix ? HostRows("npu_bfp_" + pre + "ffn_gate_up.bin", 2 * M * rb,
-                                             {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}})
+    // a combined gate / up copy: the NPU's gate rows and up rows, M rows apart (the images' dgu); the up rows between
+    // them (the GPU's) are in the range registered for the NPU, which pins its pages: one aliased page run
+    const auto gate_up = [&](const std::string& file) {
+      auto* p = const_cast<std::uint8_t*>(HostRows(file, 2 * M * rb, {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}}));
+      AliasHole(p + M * rb, f0 * rb);
+      return p;
+    };
+    const std::uint8_t* pg = bmix ? gate_up("npu_bfp_" + pre + "ffn_gate_up.bin")
                              : bg ? BfpRows(pre + "ffn_gate.weight", M * rb)
                              : !xg ? base + tg->offset
-                             : npair ? ix4_rows("ffn_gate", rb)
-                                    : HostRows("npu_ix4_" + pre + "ffn_gate_up.bin", 2 * M * rb,
-                                               {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}});
+                             : npair ? ix4_rows("ffn_gate", rb) : gate_up("npu_ix4_" + pre + "ffn_gate_up.bin");
     const std::uint8_t* pu = bmix ? pg + M * rb
                              : bu ? BfpRows(pre + "ffn_up.weight", M * rbu)
                              : !xu ? base + tu->offset
@@ -3242,6 +3246,22 @@ class LoomPrefill {
     ::close(fd);
     return bfp_[file] = static_cast<std::uint8_t*>(p);
   }
+  // Back the whole pages of [p, p + bytes), which nothing reads, with one shared 2 MB page run (alias_fd_): pinning
+  // them (a range registered for the NPU) then takes no memory of its own
+  void AliasHole(std::uint8_t* p, std::size_t bytes) {
+    constexpr std::uintptr_t kPage = 4096;
+    constexpr std::size_t kRun = std::size_t{2} << 20;
+    std::uintptr_t a = (reinterpret_cast<std::uintptr_t>(p) + kPage - 1) & ~(kPage - 1);
+    const std::uintptr_t e = (reinterpret_cast<std::uintptr_t>(p) + bytes) & ~(kPage - 1);
+    if (alias_fd_ < 0 && ((alias_fd_ = ::memfd_create("yah-alias", MFD_CLOEXEC)) < 0 || ::ftruncate(alias_fd_, kRun) != 0))
+      throw LoomError("prefill: no memfd for the aliased pages");
+    for (std::size_t n; a < e; a += n) {
+      n = std::min<std::size_t>(kRun, e - a);
+      if (::mmap(reinterpret_cast<void*>(a), n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, alias_fd_, 0) == MAP_FAILED)
+        throw LoomError("prefill: cannot alias unread pages");
+    }
+  }
+  int alias_fd_ = -1;
   const std::uint8_t* BfpRows(const std::string& name, std::size_t bytes) {
     return HostRows("npu_bfp_" + name + ".bin", bytes, {{0, bytes}});
   }
