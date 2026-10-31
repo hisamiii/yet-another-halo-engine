@@ -2232,8 +2232,13 @@ def bfp_copy(nsb, rec):
     the output's layout) copied from %in to %out, 256 bytes a step."""
     r0, r1 = rec or (0, 2 * nsb)
     ep, er = "reg<aie2p.ep>", "reg<aie2p.er>"
-    L = [f"%bi0 = padda %in, {OUT_B * r0}" if r0 else f"%bi0 = copy %in : {ep} -> {ep}",
-         f"%bo0 = padda %out, {OUT_B * r0}" if r0 else f"%bo0 = copy %out : {ep} -> {ep}",
+    def skip(dst, src):   # src + OUT_B r0 (padda immediates reach 448: a chain of steps)
+        if not r0:
+            return [f"%{dst}0 = copy %{src} : {ep} -> {ep}"]
+        steps = [448] * (OUT_B * r0 // 448) + ([OUT_B * r0 % 448] if OUT_B * r0 % 448 else [])
+        names = [f"%{dst}s{i}" for i in range(len(steps) - 1)] + [f"%{dst}0"]
+        return [f"{n} = padda {p}, {st}" for n, p, st in zip(names, [f"%{src}"] + names[:-1], steps)]
+    L = skip("bi", "in") + skip("bo", "out") + [
          "%bk0 = mova.i32 0", f"%bn = mov.i32 {(r1 - r0) * OUT_B // 256}",
          f"low.br ^bl(%bi0: {ep}, %bo0: {ep}, %bk0: {er})",
          f"^bl(%bi: {ep}, %bo: {ep}, %bk: {er}):",

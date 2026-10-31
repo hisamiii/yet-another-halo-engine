@@ -1146,6 +1146,9 @@ class LoomPrefill {
     // (gen_npu_gemm ufmt)
     const std::string hal = tg->type == tu->type ? AfHal(GemmHal("gemm_ffn", *tg, &f), ".af.to.hal") : "";
     const bool pair = hal.empty();
+    // (bmix: a pair whose NPU rows the emitter pre-decoded, emit_prefill_pp NPU_BFPSW: one BFP image like a single
+    // format's, "npu_ffnsw_bfp<hord>", on npu_bfp_<pre>ffn_gate_up.bin)
+    const bool bmix = pair && geom_.count("npuffnbx_" + std::string(f.name) + "_" + fu.name) != 0;
     if (tg->dims != tu->dims || (!pair && tu->offset != tg->offset + tg->bytes) || (pair && !geom_.count("npuffnpair")))
       return false;
     const std::uint32_t F = pair ? geom_.at("npuffnpair").tokens : ffnblk_, M = static_cast<std::uint32_t>(tg->dims[1]);
@@ -1165,8 +1168,8 @@ class LoomPrefill {
     // (mix: a pair whose formats share a decoder, emit_prefill_pp mixed: the GPU's side a pair's, the NPU's one image like
     // a single format's, "npu_ffnsw_<gate>_<up>")
     const std::string mixed = dir_ + "/npu_ffnsw_" + f.name + "_" + fu.name + hord;
-    const bool mix = pair && ::access((mixed + ".xdna").c_str(), R_OK) == 0, npair = pair && !mix;
-    const std::string sw = mix ? mixed : dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name)) +
+    const bool mix = bmix || (pair && ::access((mixed + ".xdna").c_str(), R_OK) == 0), npair = pair && !mix;
+    const std::string sw = bmix ? dir_ + "/npu_ffnsw_bfp" + hord : mix ? mixed : dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name)) +
                            hord;
     const auto parts = FfnBlkParts(F);
     std::vector<std::string> dn;
@@ -1193,30 +1196,36 @@ class LoomPrefill {
       RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk");
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
-    const bool bg = !std::strcmp(f.name, "iq2s"), bu = !std::strcmp(fu.name, "iq2s"), bd = !std::strcmp(fd.name, "iq2s");
+    const bool bg = bmix || !std::strcmp(f.name, "iq2s"), bu = bmix || !std::strcmp(fu.name, "iq2s"),
+               bd = !std::strcmp(fd.name, "iq2s");
     // (npuffnix4: IQ3_S / IQ3_XXS gate / up rows transcoded to IQ4_XS blocks, the NPU's rows only)
     const bool ix4 = geom_.count("npuffnix4") != 0;
     const auto tx = [&](const Fmt& x) { return ix4 && (!std::strcmp(x.name, "iq3s") || !std::strcmp(x.name, "iq3xxs")); };
     // (a mixed pair of one untranscoded format, emit_prefill_pp SAME_SW_FMTS: up follows gate in the GGUF, like a
     // single format's)
-    const bool xmix = mix && (tx(f) || tx(fu));
-    if (mix && !xmix && (std::strcmp(f.name, fu.name) || tu->offset != tg->offset + tg->bytes))
+    const bool xmix = mix && !bmix && (tx(f) || tx(fu));
+    if (mix && !bmix && !xmix && (std::strcmp(f.name, fu.name) || tu->offset != tg->offset + tg->bytes))
       throw LoomError("prefill: " + pre + " mixed image without transcoded or contiguous rows");
-    const bool xg = xmix || tx(f), xu = xmix || tx(fu);
+    const bool xg = !bmix && (xmix || tx(f)), xu = !bmix && (xmix || tx(fu));
+    // (the decoder binding the NPU's gate / up rows: bmix's BFP, iq2s's)
+    const char* const gdec = bmix ? "iq2s" : f.name;
     const std::size_t blk = bg ? kBfpBlock : xg ? kIx4Block : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
     const std::size_t blku = bu ? kBfpBlock : xu ? kIx4Block : tu->bytes / M * 256 / tu->dims[0], rbu = blku * tu->dims[0] / 256;
     const std::size_t blkd = bd ? kBfpBlock : td->bytes / td->dims[1] * 256 / td->dims[0], rbd = blkd * td->dims[0] / 256;
-    const std::size_t f0 = M - F, dgu = xg ? M * rb : static_cast<std::size_t>(tg->bytes);
+    const std::size_t f0 = M - F, dgu = xg || bmix ? M * rb : static_cast<std::size_t>(tg->bytes);
     const std::size_t Nd = static_cast<std::size_t>(td->dims[1]);
     const auto ix4_rows = [&](const std::string& kind, std::size_t rbx) {
       return HostRows("npu_ix4_" + pre + kind + ".bin", M * rbx, {{f0 * rbx, F * rbx}});
     };
-    const std::uint8_t* pg = bg ? BfpRows(pre + "ffn_gate.weight", M * rb)
+    const std::uint8_t* pg = bmix ? HostRows("npu_bfp_" + pre + "ffn_gate_up.bin", 2 * M * rb,
+                                             {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}})
+                             : bg ? BfpRows(pre + "ffn_gate.weight", M * rb)
                              : !xg ? base + tg->offset
                              : npair ? ix4_rows("ffn_gate", rb)
                                     : HostRows("npu_ix4_" + pre + "ffn_gate_up.bin", 2 * M * rb,
                                                {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}});
-    const std::uint8_t* pu = bu ? BfpRows(pre + "ffn_up.weight", M * rbu)
+    const std::uint8_t* pu = bmix ? pg + M * rb
+                             : bu ? BfpRows(pre + "ffn_up.weight", M * rbu)
                              : !xu ? base + tu->offset
                              : npair ? ix4_rows("ffn_up", rbu) : pg + M * rb;
     const std::uint8_t* pd = bd ? BfpRows(pre + "ffn_down.weight", Nd * rbd) : base + td->offset;
@@ -1225,7 +1234,7 @@ class LoomPrefill {
       if (npair) {
         npu_->RegisterRaw(pg + f0 * rb, bg || xg ? (M - f0) * rb + 8192 : std::min(tg->offset + M * rb + 4096, end) - (tg->offset + f0 * rb));
         npu_->RegisterRaw(pu + f0 * rbu, bu || xu ? (M - f0) * rbu + 8192 : std::min(tu->offset + M * rbu + 4096, end) - (tu->offset + f0 * rbu));
-      } else if (xg) {
+      } else if (xg || bmix) {
         npu_->RegisterRaw(pg + f0 * rb, 2 * M * rb - f0 * rb + 8192);
       } else {
         const std::size_t a = tg->offset + f0 * rb;
@@ -1262,9 +1271,9 @@ class LoomPrefill {
                                   // at H k-blocks 32 j + 4 c .. (gen_npu_gemm swcol 32)
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 256; ++j)
-        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), mix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(f.name), ag,
+        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), mix && !bmix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(gdec), ag,
                                     pg + (f0 + 256 * j) * rb,
-                                    dgu + 255 * rb + 16 * blk + RecordRow(f.name),
+                                    dgu + 255 * rb + 16 * blk + RecordRow(gdec),
                                     {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, "ffnsw" + hord));
     } else {   // 32 calls of 224 features: call j's column c takes features 8 (128 c + 4 j) + [0, 32); Q4_K's order
                // (gen_npu_gemm hord): its two 16-row slabs 32 rows apart from 64 (j / 2) + 16 (j % 2)
