@@ -193,6 +193,7 @@ def loom_env(cfg, swap=False):
         env["LOOM_EXP_PARTITION_COLUMNS"] = "8"
     if (cfg.dcol == 2 or cfg.fuse == 2) and not swap:   # other layouts share the context: routes must not outlive them
         env["LOOM_EXP_ROUTE_RESET"] = "1"
+        env["LOOM_EXP_DRAIN_USED"] = "1"   # (HRX patch 0048: the stale-request drain raises only the image's locks)
     if swap or (cfg.gate and cfg.gfirst):
         env["LOOM_EXP_SETUP_ONLY"] = "1"
     if swap:
