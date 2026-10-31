@@ -1488,7 +1488,7 @@ def npu_split(rows, combos, B, outdir):
                 E.emit(src, cfg, hal, outdir)
             out.append(("npu_unpack_qkv_tail.hal", n // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))   # 8 tokens x n / 8 items
             out.append(("convkq_g.hal", gen_conv_kq.tiles(N - n), 256, 0))
-            out.append(("convkq_c.hal", n // gen_conv_kq.CW, gen_conv_kq.CW, B // gen_conv_kq.TC))
+            out.append(("convkq_c.hal", n // gen_conv_kq.cw(n), gen_conv_kq.cw(n), B // gen_conv_kq.TC))
         out.append(("npusplit_" + site, n, 0, 0))
     # one graph per chunk: the GPU waits for each NPU job on a flag word (gen_npu_unpack.gen_flag_wait)
     src = os.path.join(tmp, "npu_flag_wait.loom")
