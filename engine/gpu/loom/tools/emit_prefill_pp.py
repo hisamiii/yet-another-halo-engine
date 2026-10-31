@@ -896,7 +896,7 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
 
 
 # Formats the tile GEMM (tools/gen_gemm_tile.py) is verified bit-identical on in the pp2048 pipeline.
-TILE_FMTS = ("iq3s", "iq4xs", "iq4nl", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "iq2s", "q3k", "q8_0", "mq4")
+TILE_FMTS = ("iq3s", "iq4xs", "iq4nl", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "iq2s", "q3k", "q8_0", "mq4", "q2k")
 
 
 def decode_free(fmt, mt, kb, B, kind, outdir, done):
