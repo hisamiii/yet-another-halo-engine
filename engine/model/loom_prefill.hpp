@@ -1162,7 +1162,11 @@ class LoomPrefill {
     // P4 but Q4_K's)
     const bool q4k = std::strcmp(fd.name, "q4k") == 0;
     const std::string hord = q4k ? "_q4k" : std::strcmp(fd.name, "iq4xs") == 0 || FfnBlkFused() ? "_p4" : "";
-    const std::string sw = dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name)) +
+    // (mix: a pair whose formats share a decoder, emit_prefill_pp mixed: the GPU's side a pair's, the NPU's one image like
+    // a single format's, "npu_ffnsw_<gate>_<up>")
+    const std::string mixed = dir_ + "/npu_ffnsw_" + f.name + "_" + fu.name + hord;
+    const bool mix = pair && ::access((mixed + ".xdna").c_str(), R_OK) == 0, npair = pair && !mix;
+    const std::string sw = mix ? mixed : dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name)) +
                            hord;
     const auto parts = FfnBlkParts(F);
     std::vector<std::string> dn;
@@ -1178,7 +1182,8 @@ class LoomPrefill {
       return false;
     // the norm also writes gate / up's activations (one replay group: that stream layout; "npuffndfr_<fmt>": the
     // deferred-epilogue image's K split, emit_prefill_pp NPU_DFR_KS)
-    const bool dfr = !pair && geom_.count("npuffndfr_" + std::string(f.name));
+    const bool dfr = mix ? geom_.count("npuffndfr_" + std::string(f.name) + "_" + fu.name) != 0
+                         : !pair && geom_.count("npuffndfr_" + std::string(f.name));
     if (dfr && ::access((dir_ + "/norm_t_bfp_g1s.hal").c_str(), R_OK)) return false;
     if (norm) {
       *norm = dfr ? "norm_t_bfp_g1s" : "norm_t_bfp_g1";
@@ -1192,7 +1197,7 @@ class LoomPrefill {
     // (npuffnix4: IQ3_S / IQ3_XXS gate / up rows transcoded to IQ4_XS blocks, the NPU's rows only)
     const bool ix4 = geom_.count("npuffnix4") != 0;
     const auto tx = [&](const Fmt& x) { return ix4 && (!std::strcmp(x.name, "iq3s") || !std::strcmp(x.name, "iq3xxs")); };
-    const bool xg = tx(f), xu = tx(fu);
+    const bool xg = mix || tx(f), xu = mix || tx(fu);
     const std::size_t blk = bg ? kBfpBlock : xg ? kIx4Block : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
     const std::size_t blku = bu ? kBfpBlock : xu ? kIx4Block : tu->bytes / M * 256 / tu->dims[0], rbu = blku * tu->dims[0] / 256;
     const std::size_t blkd = bd ? kBfpBlock : td->bytes / td->dims[1] * 256 / td->dims[0], rbd = blkd * td->dims[0] / 256;
@@ -1203,16 +1208,16 @@ class LoomPrefill {
     };
     const std::uint8_t* pg = bg ? BfpRows(pre + "ffn_gate.weight", M * rb)
                              : !xg ? base + tg->offset
-                             : pair ? ix4_rows("ffn_gate", rb)
+                             : npair ? ix4_rows("ffn_gate", rb)
                                     : HostRows("npu_ix4_" + pre + "ffn_gate_up.bin", 2 * M * rb,
                                                {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}});
     const std::uint8_t* pu = bu ? BfpRows(pre + "ffn_up.weight", M * rbu)
                              : !xu ? base + tu->offset
-                             : pair ? ix4_rows("ffn_up", rbu) : pg + M * rb;
+                             : npair ? ix4_rows("ffn_up", rbu) : pg + M * rb;
     const std::uint8_t* pd = bd ? BfpRows(pre + "ffn_down.weight", Nd * rbd) : base + td->offset;
     if (npu_planning_) {   // the NPU's gate / up rows (one range when up follows gate), all of down
       const std::size_t end = gguf_.tensor_data_size();
-      if (pair) {
+      if (npair) {
         npu_->RegisterRaw(pg + f0 * rb, bg || xg ? (M - f0) * rb + 8192 : std::min(tg->offset + M * rb + 4096, end) - (tg->offset + f0 * rb));
         npu_->RegisterRaw(pu + f0 * rbu, bu || xu ? (M - f0) * rbu + 8192 : std::min(tu->offset + M * rbu + 4096, end) - (tu->offset + f0 * rbu));
       } else if (xg) {
@@ -1225,7 +1230,7 @@ class LoomPrefill {
     }
     std::vector<std::uint32_t> csw;
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
-    if (pair && FfnBlkFused()) {   // F / 256 calls: call j's pair u (gate column 2 u, up column 2 u + 1) takes features
+    if (npair && FfnBlkFused()) {   // F / 256 calls: call j's pair u (gate column 2 u, up column 2 u + 1) takes features
                                    // 256 j + 64 u + [0, 64), its records at H k-blocks 32 j + 8 u .. (gen_npu_gemm swcol 64)
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsp");
       for (std::uint32_t j = 0; j < F / 256; ++j) {
@@ -1237,7 +1242,7 @@ class LoomPrefill {
             {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, 4 * (B_ / 64) * 4 * 1152,
             "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
       }
-    } else if (pair) {   // 32 calls of 192 features: call j's up column u writes passes 2 u + j / 16, k-blocks 8 (j % 16) ..
+    } else if (npair) {   // 32 calls of 192 features: call j's up column u writes passes 2 u + j / 16, k-blocks 8 (j % 16) ..
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsp");
       for (std::uint32_t j = 0; j < F / 192; ++j) {
         const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);
@@ -1252,7 +1257,7 @@ class LoomPrefill {
                                   // at H k-blocks 32 j + 4 c .. (gen_npu_gemm swcol 32)
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 256; ++j)
-        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
+        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), mix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(f.name), ag,
                                     pg + (f0 + 256 * j) * rb,
                                     dgu + 255 * rb + 16 * blk + RecordRow(f.name),
                                     {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, "ffnsw" + hord));
@@ -1283,7 +1288,7 @@ class LoomPrefill {
                                         {doff + (ci * calls + r) * cp, cp}, fam));
       }
     }
-    NpuEnqueue(std::move(csw), pair ? "ffnsp" : "ffnsw");
+    NpuEnqueue(std::move(csw), npair ? "ffnsp" : "ffnsw");
     for (std::size_t ci = 0; ci < parts.size(); ++ci) NpuEnqueue(std::move(cdn[ci]), "ffndn" + std::to_string(parts[ci].second));
     if (pair) {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);

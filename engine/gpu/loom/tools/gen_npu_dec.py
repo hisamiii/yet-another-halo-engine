@@ -34,6 +34,9 @@ KVX = {"IQ4_XO": [float(2 * u - 15) for u in range(16)],
        "IQ4_XX": [-15.5, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15.5]}
 IX4_SRC = {"IQ4_XO": "IQ3_S", "IQ4_XX": "IQ3_XXS"}
 FMT = "IQ4_XS" if FMT0 in KVX else FMT0
+# DQ_KV2 (IQ4_XS and its aliases, inlined): a second kvalues table (that alias' / IQ4_XS's) after the first, gathered
+# from by every unit whose index in its fill is 2 or 3 mod 4 (a swiglu column's up slabs: gen_npu_gemm Config.kv2)
+KV2 = (KVX.get(os.environ["DQ_KV2"]) or I.KV) if os.environ.get("DQ_KV2") and FMT == "IQ4_XS" else None
 BLK = {"IQ4_XS": 136, "Q4_K": 144, "Q5_K": 176, "IQ3_S": 110, "IQ3_XXS": 98, "IQ2_XXS": 66, "IQ2_XS": 74,
        "Q3_K": 110, "BFP": 288}[FMT]   # bytes per super-block
 HBY = {"IQ4_XS": 8, "Q4_K": 16, "Q5_K": 48, "IQ3_S": 2, "IQ3_XXS": 2, "IQ2_XXS": 2, "IQ2_XS": 2,
@@ -88,15 +91,15 @@ RECROW = 1152 if BFP else 704 if Q5 else 576     # record row bytes, the same fo
 ROWB = RECROW if os.environ.get("DQ_FIXREC", "1") == "1" else 4 * BLK   # a row's 4 super-blocks (+ ignored tail)
 IN_B, NF = 16 * ROWB, 64
 OUT_B = 32 * 72                 # one output record (half a super-block: 4 sub-blocks)
-GT, HR = 0, 0 if GF else 2048   # table (GF: none); half regions at HR + h HS
+GT, HR = 0, 0 if GF else 4096 if KV2 else 2048   # table(s) (GF: none); half regions at HR + h HS
 HDR, SCM, HB, TAB, PARTS, TB, QT = 0, 64, 192, 256, 384, 896, 2944
 HS = 512                       # half regions now hold only the scale-path temporaries (HDR .. PARTS)
 STATE, KVS = HR + 2 * HS, HR + 2 * HS + 64
-SCR_B = KVS + 64                # storage A (2048-aligned: the table)
+SCR_B = KVS + (128 if KV2 else 64)   # storage A (2048-aligned: the table); KV2: its KV words to KVS + 96
 GAS, PARTSS, GT2 = 0, 4096, 5120
 # storage B (gather addresses, T parts, the table's second copy (not the grid formats': theirs is rodata); +64: gathers
 # read a + 32; Q5_K: NIB and the parts)
-SCR2_B = PARTSS + 1024 if GF else GT2 + (0 if GRID else 2048) + 64
+SCR2_B = PARTSS + 1024 if GF else GT2 + (0 if GRID else 4096 if KV2 else 2048) + 64
 if BFP:
     SCR_B = SCR2_B = 64
 TABV, BASEV = [TAB], ["%sp"]
@@ -389,18 +392,19 @@ def leaf(name="dec", nports=1):
             e(f"%tx = xor %tflag, {k(0x5A5A1234)}")          # private storage starts undefined: a magic marks the table
             e(f"low.cond_br %tx, ^{tb_}, ^{tdone} : reg<aie2p.er>")
         e.L.append(f"^{tb_}:")
-        for i in range(8):
-            w_ = (I.bf16_bits(KV[2 * i + 1]) << 16) | I.bf16_bits(KV[2 * i])
+        kvs = KV + 2 * (KV2 or [])   # (KV2 at +32: %kvv's lanes 16-31, and at +64: a 64-byte aligned load)
+        for i in range(len(kvs) // 2):
+            w_ = (I.bf16_bits(kvs[2 * i + 1]) << 16) | I.bf16_bits(kvs[2 * i])
             pp = P(e, "%spa", KVS + 4 * i)
             e(f"%kw{i} = mov.i32 {w_ - (1 << 32) if w_ >= 1 << 31 else w_}")
             e(f"st %kw{i}, {pp}, 0")
         pk = P(e, "%spa", KVS)
         e(f"%kvv = vlda.512.bf16x32 {pk}, 0")
 
-        def tline(m, kb, pa_, pb_):
+        def tline(m, kb, pa_, pb_, kvv="%kvv"):
             sp_, r_, h0, h1 = e.t("ks"), e.t("kr"), e.t("kh"), e.t("kh")
             e(f"{sp_} = vbcst.16 {kb}")
-            e(f"{r_} = vshuffle %kvv, {sp_}, {m18}")
+            e(f"{r_} = vshuffle {kvv}, {sp_}, {m18}")
             e(f"{h0} = slice {r_}[0] : {V2} -> {V1}")
             e(f"{h1} = slice {r_}[1] : {V2} -> {V1}")
             # two copies in different banks (storages A and B): a gather (vldb.4x32) costs one stall cycle unless its
@@ -414,14 +418,21 @@ def leaf(name="dec", nports=1):
             e(f"%tlb0 = add.rr %spb, {k(GT2)}")
             e(f"low.br ^tlh({k(0)}: reg<aie2p.er>, %tla0: reg<aie2p.er>, %tlb0: reg<aie2p.er>)")
             e.L.append("^tlh(%tl_i: reg<aie2p.er>, %tla: reg<aie2p.er>, %tlb: reg<aie2p.er>):")
-            e(f"%tl_m = lt %tl_i, {k(16)}")
+            e(f"%tl_m = lt %tl_i, {k(32 if KV2 else 16)}")
             e("low.cond_br %tl_m, ^tlb, ^tlx : reg<aie2p.er>")
             e.L.append("^tlb:")
             e.L.append("// LOOP-BEGIN")
             e("%tlkb = vextract.16.reg %kvv, %tl_i")       # (not a load: the KV words were just stored)
             e("%tlpa = mov.scalar-to-address %tla")
             e("%tlpb = mov.scalar-to-address %tlb")
-            tline(None, "%tlkb", "%tlpa", "%tlpb")
+            if KV2:   # line i of table i // 16: its values from the KV words at KVS + 64 (i // 16)
+                e(f"%tlq = lshl %tl_i, {k(-4)}")
+                e(f"%tlq5 = lshl %tlq, {k(6)}")
+                e(f"%tlkq = add.rr %spa, %tlq5")
+                e(f"%tlkr = add.rr %tlkq, {k(KVS)}")
+                e("%tlkp = mov.scalar-to-address %tlkr")
+                e("%kvl = vlda.512.bf16x32 %tlkp, 0")
+            tline(None, "%tlkb", "%tlpa", "%tlpb", "%kvl" if KV2 else "%kvv")
             e(f"%tla1 = add.rr %tla, {k(128)}")
             e(f"%tlb1 = add.rr %tlb, {k(128)}")
             e("%tl_n = add %tl_i, 1")
@@ -435,6 +446,7 @@ def leaf(name="dec", nports=1):
                 e("%tfqr = mov.scalar-to-address %tfqt")
                 e(f"st {k(1)}, %tfqr, 0")
         else:
+            assert not KV2, "DQ_KV2: inlined decoders only"
             for m in range(16):
                 e(f"%kb{m} = mov.i32 {I.bf16_bits(KV[m])}")
                 tline(m, f"%kb{m}", None, None)
@@ -1624,8 +1636,23 @@ def leaf(name="dec", nports=1):
             e(f"%al{par} = and %qs{par}, {k(-64)}")
             e(f"%ar{par} = add.rr %al{par}, %r64")
         # the table base in 32 accumulator lanes: addresses = (b << 3) + GT on the MAC slot (vadd.acc.integer mode 0)
-        e("%gtv1 = vbcst.32 %spa")
-        e(f"%gt2s = add.rr %spb, {k(GT2)}")
+        if KV2 and not INLINE[0]:   # (standalone check, DQ_TROLL=1: DQ_TSEL picks the table for every unit)
+            e(f"%tsel = mov.i32 {int(os.environ.get('DQ_TSEL', '2048'))}")
+        elif KV2:   # units 2, 3 mod 4 of the fill (units left %fzs [12] = 1, 2 mod 4): the second table, 2048 on
+            e("%tsp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+            e("%tsu = lda %tsp, 12")
+            e("%tsu1 = add %tsu, 1")
+            e(f"%tsu2 = lshl %tsu1, {k(-1)}")
+            e(f"%tsu3 = and %tsu2, {k(1)}")
+            e(f"%tsel = lshl %tsu3, {k(11)}")
+        if KV2:
+            e("%gt1s = add.rr %spa, %tsel")
+            e("%gtv1 = vbcst.32 %gt1s")
+            e(f"%gt2t = add.rr %spb, {k(GT2)}")
+            e("%gt2s = add.rr %gt2t, %tsel")
+        else:
+            e("%gtv1 = vbcst.32 %spa")
+            e(f"%gt2s = add.rr %spb, {k(GT2)}")
         e("%gtv2 = vbcst.32 %gt2s")
         e(f"%gtv = vshuffle %gtv1, %gtv2, {k(14)}" if os.environ.get("DQ_GT2", "1") == "1" else "%gtv = vbor %gtv1, %gtv1")   # u32 lanes A A B B ...
         for q in range(4):
@@ -2537,6 +2564,9 @@ def main():
     if r.returncode:
         sys.exit("run failed\n" + r.stdout[-1500:] + r.stderr[-1500:])
     got = np.fromfile(f"{work}/out.bin", np.uint8).reshape(nports, 5, 5, 128, 2, 72)
+    global KV
+    if KV2 and os.environ.get("DQ_TSEL", "2048") != "0":   # every unit gathered from the second table
+        KV = KV2
     ref = np.stack([oracle(raw[80 * p:80 * p + 80]) for p in range(nports)])
     bad = np.any(got != ref, axis=-1)
     print(f"fragments differing: {int(bad.sum())} of {bad.size}")

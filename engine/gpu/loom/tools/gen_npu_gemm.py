@@ -119,6 +119,8 @@ class Config:
                         # their addressing are unchanged); the call's last block runs it whole on its last pass
     dfi: int = 1        # dfr: the deferred push inline (no branch: a firing without a deferred segment pushes into a
                         # dummy buffer), so no branch delay / quiescence splits the push tile
+    kv2: str = ""       # swiglu fuse 2 (gen_npu_dec DQ_KV2): fmt an IQ4_XS alias, the up slabs' rows in kv2's kvalues (an
+                        # IQ4_XS alias too: IQ3_S / IQ3_XXS gate / up of one layer in different formats run like one)
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
                         # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
                         # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
@@ -155,12 +157,13 @@ GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
 _LEAVES = {}
 
 
-def decoder(fmt, gord="P4"):
-    """gen_npu_dec for fmt (its constants follow DQ_FMT and DQ_GORD at import)."""
+def decoder(fmt, gord="P4", kv2=""):
+    """gen_npu_dec for fmt (its constants follow DQ_FMT, DQ_GORD and DQ_KV2 at import)."""
     import gen_npu_dec
-    if gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord:
+    if gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord or os.environ.get("DQ_KV2", "") != kv2:
         os.environ["DQ_FMT"] = fmt
         os.environ["DQ_GORD"] = gord
+        os.environ["DQ_KV2"] = kv2
         gen_npu_dec = importlib.reload(gen_npu_dec)
     return gen_npu_dec
 
@@ -921,7 +924,7 @@ FUSE_FMTS = ("IQ4_XS", "IQ4_XO", "IQ4_XX", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS"
 def fuse_blk(cfg):
     """fuse 2: bytes per super-block of cfg.fmt."""
     assert cfg.fmt in FUSE_FMTS, cfg.fmt
-    return decoder(cfg.fmt, cfg.gord).BLK
+    return decoder(cfg.fmt, cfg.gord, cfg.kv2).BLK
 
 
 def fuse_unit_raw(cfg):
@@ -1346,14 +1349,14 @@ FZ_RAW_COMPACT = 0, 28992, 21760, 3264   # rawdma, 4 super-blocks a row: one raw
 def fuse_raw_ring(cfg, cov):
     """rawdma: (byte offset from the W ring's first 2048-aligned byte, records) of the filler's raw ring: two
     [16][RECROW] records where the decoder output allows (FZ_RAW, Q5_K's packed layout), else one."""
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt, cfg.gord, cfg.kv2)
     sp, in_, sp2, out = fuse_scratch(cfg, cov)
     return in_, (2 if sp2 - in_ >= 2 * 16 * D.RECROW else 1)
 
 
 def fuse_scratch(cfg, cov):
     """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt, cfg.gord, cfg.kv2)
     _, _, _, nsb = fuse_span(cfg, cov)
     ring = 2 * NP * slab(cfg.ks[cov[-1]]) - 2047   # (the scratch starts at the ring's first 2048-aligned byte)
     if cfg.rawdma:
@@ -1396,7 +1399,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     until this panel's drain, which starts after the last record). Unit index and count live in private storage
     (the decoder needs every register)."""
     e = L.append
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt, cfg.gord, cfg.kv2)
     hrow = cov[0] if helper == "H" else None           # (the helper's row, listed first: the filler copies its records)
     K = (helper or "").startswith("K")
     dcov = tuple(j for j in cov if j != hrow) if not K else (cov[0],)

@@ -1139,6 +1139,7 @@ NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs"), (40, 40, 40, 8)
 # IQ4_XX): no grid tables, so IQ3_S's fillers also hold the deferred epilogue's 40 k-block slices
 NPU_IX4 = os.environ.get("YAH_NPU_IX4", "1") == "1"
 IX4_FMTS = {"iq3s": "IQ4_XO", "iq3xxs": "IQ4_XX"} if NPU_IX4 else {}
+IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX") if NPU_IX4 else ()
 if NPU_IX4:
     NPU_DFR_FMTS += ("iq3s",)
 
@@ -1622,6 +1623,7 @@ def ix4_files(layers, sw, F, outdir):
         if not kinds:
             continue
         files = [(pre + "ffn_gate_up", ["ffn_gate", "ffn_up"])] if pre in sw else [(pre + k, [k]) for k in kinds]
+        # (an sw file's IQ4_XS tensor: its rows as they are)
         for name, ks in files:
             path = os.path.join(outdir, "npu_ix4_%s.bin" % name)
             K = int(ts[pre + ks[0] + ".weight"].shape[0])
@@ -1632,6 +1634,9 @@ def ix4_files(layers, sw, F, outdir):
                     t = ts[pre + k + ".weight"]
                     src, N = t.tensor_type.name, int(t.shape[1])
                     raw = np.asarray(t.data).view(np.uint8).reshape(N, K // 256, -1)
+                    if src == "IQ4_XS":
+                        f.write(raw[N - F:].tobytes())
+                        continue
                     D = GN.decoder({"IQ3_S": "IQ4_XO", "IQ3_XXS": "IQ4_XX"}[src])
                     for r0 in range(N - F, N, 512):
                         f.write(D.ix4_rows(raw[r0:r0 + 512], src).tobytes())
@@ -1668,10 +1673,13 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
              and l.get("ffn_down", ("",))[0] in pdfmts]
     bfp_rows({"blk.%s.%s.weight" % (n, kd) for n, l in by.items() if l in ok + pairs
               for kd in ("ffn_gate", "ffn_up", "ffn_down") if l.get(kd, ("",))[0] == "iq2s"}, outdir)
+    # pairs whose gate and up both take IQ4_XS's decoder (YAH_NPU_IX4): one image like a single format's, its up slabs
+    # gathering from their own kvalues table (gen_npu_gemm kv2), with the deferred epilogue ("npu_ffnsw_<gate>_<up>")
+    mixed = [l for l in pairs if NPU_FUSE and {gu_fmt(l[kd][0]) for kd in ("ffn_gate", "ffn_up")} <= set(IX4_FAMILY)]
     if NPU_IX4:   # sw layers: gate and up in one file (the image's dgu); pairs: per tensor; the NPU's rows only
         ix4_files({"blk.%s." % n: [kd for kd in ("ffn_gate", "ffn_up") if l[kd][0] in IX4_FMTS]
                    for n, l in by.items() if l in ok + pairs},
-                  {"blk.%s." % n for n, l in by.items() if l in ok}, F, outdir)
+                  {"blk.%s." % n for n, l in by.items() if l in ok + mixed}, F, outdir)
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
         hords = sorted({hord_of(l["ffn_down"][0]) for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
@@ -1743,6 +1751,13 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), PF)
         variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), PF)
         name = "npu_ffnsp_%s_%s%s" % (gf, uf, hord and "_" + hord.lower())
+        if NPU_FUSE and {gu_fmt(gf), gu_fmt(uf)} <= set(IX4_FAMILY):   # (mixed)
+            blk = GN.decoder(gu_fmt(gf)).BLK
+            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_DFR_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1,
+                                   fuse=2, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024, hord=hord,
+                                   fmt=gu_fmt(gf), kv2=gu_fmt(uf), dfr=1),
+                         "npu_ffnsw_%s_%s%s" % (gf, uf, hord and "_" + hord.lower()), None, 4))
+            continue
         if NPU_FUSE:   # pair u: gate column 2 u, up column 2 u + 1, features 256 j + 64 u + [0, 64) of call j
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, swiglu=True,
                                    pnbr=1, swcol=64, hpass=F // 1024, hord=hord, fmt=gu_fmt(gf), ufmt=gu_fmt(uf),
@@ -1795,6 +1810,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             out.append(("npuffndfr_" + fmt, 1, 0, 0))
     if NPU_IX4:
         out.append(("npuffnix4", 1, 0, 0))
+    for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in mixed}):
+        out.append(("npuffndfr_%s_%s" % (gf, uf), 1, 0, 0))
     out.append(("npuffnblk", F, 256 if NPU_FUSE else 224, rows))   # F, gate / up features per call, down rows
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):
