@@ -1764,14 +1764,27 @@ class LoomPrefill {
   // ("npu_dcol_<fmt>_<K>.xdna"; "" for other formats: that site stays on the GPU in that layer). dec: the format's
   // decoder id (the images' swaps).
   std::string DcolImage(const std::string& wname, int* dec = nullptr, bool half = false) const {
-    Fmt f{};
-    if (!FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f)) return "";
-    const int id = DecoderId(f.name);
+    const char* const name = SiteDec(wname);
+    if (!name) return "";
+    const int id = DecoderId(name);
     if (id < 0) return "";
     if (dec) *dec = id;
     const std::string path =
-        (half ? hdir_ : dir_) + "/npu_dcol_" + f.name + "_" + std::to_string(Find(wname)->dims[0]) + ".xdna";
+        (half ? hdir_ : dir_) + "/npu_dcol_" + name + "_" + std::to_string(Find(wname)->dims[0]) + ".xdna";
     return ::access(path.c_str(), R_OK) == 0 ? path : "";
+  }
+  // A site tensor whose NPU rows the emitter pre-decoded (emit_prefill_pp NPU_BFPSITE: npu_bfp_<wname>.bin, the
+  // BFP decoder's rows: IQ2_S's).
+  bool SiteBfp(const std::string& wname) const { return geom_.count("npusitebx_" + wname) != 0; }
+  // The decoder binding wname's NPU rows (its format's, else BFP's), nullptr if none.
+  const char* SiteDec(const std::string& wname) const {
+    Fmt f{};
+    if (SiteBfp(wname)) return "iq2s";
+    return FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f) ? f.name : nullptr;
+  }
+  // The base of NpuRawRows' offsets: the model's tensor data, or a pre-decoded site's rows (NpuRawRows read them).
+  const std::uint8_t* RawBase(const std::string& wname) const {
+    return SiteBfp(wname) ? bfp_.at("npu_bfp_" + wname + ".bin") : gguf_.tensor_data_base();
   }
   // The NPU can take wname's rows (a decoder-column set needs its format's decoder).
   bool NpuOk(const std::string& wname) const { return !npu_dcol_ || !DcolImage(wname).empty(); }
@@ -1864,15 +1877,19 @@ class LoomPrefill {
   // planning pass registers the rows (and the last records' over-read) with the NPU.
   std::vector<std::vector<NpuView>> NpuRawRows(const std::string& site, const std::string& wname, std::uint32_t rows) {
     const auto* t = Find(wname);
-    const std::size_t K = t->dims[0], M = t->dims[1], row_bytes = static_cast<std::size_t>(t->bytes) / M;
-    const std::size_t blk = row_bytes * 256 / K, first = t->offset + (M - rows) * row_bytes;
+    const bool bx = SiteBfp(wname);
+    const std::size_t K = t->dims[0], M = t->dims[1];
+    const std::size_t row_bytes = bx ? K / 256 * kBfpBlock : static_cast<std::size_t>(t->bytes) / M;
+    const std::size_t blk = row_bytes * 256 / K, first = (bx ? 0 : t->offset) + (M - rows) * row_bytes;
     const std::size_t cr = NpuCallRows();
-    Fmt f{};
-    if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) throw LoomError("prefill: no NPU format for " + wname);
-    const std::size_t extent = (cr - 1) * row_bytes + 16 * blk + RecordRow(f.name);   // gen_npu_gemm.fill_inputs
+    const char* const dec = SiteDec(wname);
+    if (!dec) throw LoomError("prefill: no NPU format for " + wname);
+    const std::size_t extent = (cr - 1) * row_bytes + 16 * blk + RecordRow(dec);   // gen_npu_gemm.fill_inputs
+    if (bx) HostRows("npu_bfp_" + wname + ".bin", M * row_bytes, {{first, rows * row_bytes}});
     if (npu_planning_) {
-      const std::size_t end = std::min(first + rows * row_bytes + 4096, gguf_.tensor_data_size());
-      npu_->RegisterRaw(gguf_.tensor_data_base() + first, end - first);
+      const std::size_t end = bx ? first + rows * row_bytes + 8192
+                                 : std::min(first + rows * row_bytes + 4096, gguf_.tensor_data_size());
+      npu_->RegisterRaw(RawBase(wname) + first, end - first);
     }
     std::vector<std::vector<NpuView>> views;
     for (const auto& [k0, Kc] : NpuChunks(site)) {
@@ -1892,9 +1909,7 @@ class LoomPrefill {
     int dec = -1;
     std::string swap;
     if (npu_dcol_) {
-      Fmt f{};
-      FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f);
-      swap = (half ? hdir_ : dir_) + "/npu_dcol_" + f.name + ".swap.xdna";
+      swap = (half ? hdir_ : dir_) + "/npu_dcol_" + SiteDec(wname) + ".swap.xdna";
       if (::access(swap.c_str(), R_OK) != 0) swap.clear();   // fused sets (YAH_NPU_FUSE): no decoder tiles to swap
     }
     for (std::size_t c = 0; c < chunks.size(); ++c) {
@@ -1905,7 +1920,7 @@ class LoomPrefill {
         // fused sets: each image its own family (a family change runs the image's setup; a swap would splice a whole
         // image's first call, which stalls the array)
         calls.push_back(npu_dcol_ ? npu_->BindRaw(image, swap.empty() ? image : swap, dec, a[c],
-                                                  gguf_.tensor_data_base() + wv.offset,
+                                                  RawBase(wname) + wv.offset,
                                                   wv.length, {c_off, cp}, swap.empty() ? image : "dcol")
                                   : npu_->Bind(image, a[c], wv, {c_off, cp}));
         c_off += cp;

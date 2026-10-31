@@ -1146,6 +1146,10 @@ if NPU_IX4:
 # npu_bfp_<prefix>ffn_gate_up.bin), one BFP image like a single format's with the deferred epilogue
 # ("npu_ffnsw_bfp_<hord>", dispatch rows "npuffnbx_<gate>_<up>") instead of column pairs
 NPU_BFPSW = os.environ.get("YAH_NPU_BFPSW", "1") == "1"
+# YAH_NPU_BFPSITE (default 1): site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU
+# rows pre-decoded (bfp_site_rows: npu_bfp_<tensor>.bin), on the BFP site image ("npu_dcol_iq2s_<K>", dispatch rows
+# "npusitebx_<tensor>")
+NPU_BFPSITE = os.environ.get("YAH_NPU_BFPSITE", "1") == "1"
 # pairs of one format (no fused GPU gate / up) whose decoder holds the deferred epilogue's slices: the NPU's side one
 # image like a single format's, on the GGUF rows (Q3_K's leaf exceeds the program memory at 40 / 8; Q5_K's decode
 # runs slower than the BFP image's stream: BFP with NPU_BFPSW)
@@ -1336,10 +1340,10 @@ def npu_split(rows, combos, B, outdir):
         out.append((name, TG.dq_wgs(nn // 16, kbc, dt, fmt), dt.lanes, 0))
 
     done = set()
-    dcol_images = set()
+    dcol_images, bsites = set(), set()
     for kind, fmt, port, mt, kb in sorted(combos):
         for site, (skind, smt, skb) in NPU_SITES.items():
-            if site not in NPU_SPLIT or mt != smt or kb != skb or fmt not in TILE_FMTS:
+            if site not in NPU_SPLIT or mt != smt or kb * qk_of(fmt) != skb * 256 or fmt not in TILE_FMTS:
                 continue
             nn = NPU_SPLIT[site]
             if site == "ffn":   # the gate kstore and the up swiglu of each format (the fused ffn below)
@@ -1363,6 +1367,9 @@ def npu_split(rows, combos, B, outdir):
                 if NPU_DCOL:
                     if fmt in (FUSE_FMTS if NPU_FUSE else DCOL_FMTS):
                         dcol_images.add((fmt, kb * 256))
+                    elif NPU_FUSE and NPU_BFPSITE and chunk is None and skind != "kres":   # (BFP site rows)
+                        dcol_images.add(("iq2s", skb * 256))
+                        bsites.update((t, nn) for t in combos[(kind, fmt, port, mt, kb)])
                     continue
                 if (fmt, mt, kb, chunk) not in done:
                     done.add((fmt, mt, kb, chunk))
@@ -1494,6 +1501,8 @@ def npu_split(rows, combos, B, outdir):
     out.append(("npu_flag_wait_log.hal", 1, 32, 0))
     out.append(("npugate", GN.GATE_SUPPLY, GN.GATE_CALLS, GN.GATE_RECORD))
     if NPU_DCOL:
+        bfp_site_rows(bsites, outdir)
+        out.extend(("npusitebx_" + t, 1, 0, 0) for t, _ in sorted(bsites))
         extra = npu_ffnblk(rows, B, tmp, outdir, out, split, variants) if NPU_FFNBLK else []
         out.extend(npu_dcol_images(dcol_images, B, tmp, outdir, extra))
         GE.ACT_PERM = None
@@ -1629,6 +1638,29 @@ def bfp_units(w, kperm):
     w = w.reshape(n // 16, 2, 8, K // 1024, 128, 8).transpose(0, 3, 4, 1, 2, 5)[:, :, kperm]
     units = Q.bfp_hw(w.reshape(-1, 8, 8)).reshape(n // 16, K // 1024, 16, 1152)
     return units.transpose(0, 2, 1, 3).tobytes()
+
+
+def bfp_site_rows(sites, outdir):
+    """YAH_NPU_BFPSITE: the site tensors (name, NPU rows) of formats without an NPU decoder, their last rows (the NPU's)
+    dequantized exactly (gguf quants) as BFP rows (bfp_units) to npu_bfp_<name>.bin."""
+    import gguf
+    import numpy as np
+    from gguf import quants
+    kperm = GN.decoder("BFP").KPERM
+    ts = {t.name: t for t in gguf.GGUFReader(MODEL).tensors}
+    for name, nn in sorted(sites):
+        t = ts[name]
+        K, N = int(t.shape[0]), int(t.shape[1])
+        path = os.path.join(outdir, "npu_bfp_%s.bin" % name)
+        if os.path.exists(path) and os.path.getsize(path) == nn * K // 256 * 288:
+            continue
+        raw = np.asarray(t.data).view(np.uint8).reshape(N, -1)
+        with open(path + ".tmp", "wb") as f:
+            for r0 in range(N - nn, N, 512):
+                w = quants.dequantize(raw[r0:r0 + 512], t.tensor_type).astype(np.float32)
+                f.write(bfp_units(w.reshape(-1, K // 256, 256), kperm))
+        os.replace(path + ".tmp", path)
+        print("bfp site rows: %s (%d rows) -> %s" % (name, nn, path))
 
 
 def bfp_pair_rows(layers, F, outdir):
