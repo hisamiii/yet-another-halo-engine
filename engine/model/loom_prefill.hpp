@@ -375,7 +375,7 @@ class LoomPrefill {
     }
     chunk_graph_->Launch();
     jobs.swap(flagged_);
-    if (npu_->Prof() && !jobs.empty() && prof_tags_.empty())   // the first NPU chunk's jobs (ReportNpuProf)
+    if (npu_ && npu_->Prof() && !jobs.empty() && prof_tags_.empty())   // the first NPU chunk's jobs (ReportNpuProf)
       for (const auto& q : jobs) prof_tags_.push_back(q.tag);
     if (!jobs.empty()) {
       try {
