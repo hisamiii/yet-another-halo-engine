@@ -93,6 +93,9 @@ int main(int argc, char** argv) {
   const std::string prefix = argv[3];
   const std::uint32_t want = argc > 4 ? std::strtoul(argv[4], nullptr, 10) : 2048;
   const char* ids_path = argc > 5 ? argv[5] : "/home/q/yah-scratch/ids2048.txt";
+  // A bench run holds ~18.4 GB of the ~31 GB the OS sees (plus GTT): if memory runs out, the OOM killer takes this
+  // process, not the desktop's apps
+  if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) std::fputs("1000", f), std::fclose(f);
   try {
     auto gguf = yah::core::Gguf::OpenResident(argv[1]);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
