@@ -1752,11 +1752,9 @@ class LoomPrefill {
   std::string DcolImage(const std::string& wname, int* dec = nullptr, bool half = false) const {
     Fmt f{};
     if (!FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f)) return "";
-    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k", "iq2xxs", "iq2xs"};
-    const auto it = std::find_if(std::begin(kDecoders), std::end(kDecoders),
-                                 [&](const char* d) { return std::strcmp(d, f.name) == 0; });
-    if (it == std::end(kDecoders)) return "";
-    if (dec) *dec = static_cast<int>(it - std::begin(kDecoders));
+    const int id = DecoderId(f.name);
+    if (id < 0) return "";
+    if (dec) *dec = id;
     const std::string path =
         (half ? hdir_ : dir_) + "/npu_dcol_" + f.name + "_" + std::to_string(Find(wname)->dims[0]) + ".xdna";
     return ::access(path.c_str(), R_OK) == 0 ? path : "";
@@ -1855,7 +1853,9 @@ class LoomPrefill {
     const std::size_t K = t->dims[0], M = t->dims[1], row_bytes = static_cast<std::size_t>(t->bytes) / M;
     const std::size_t blk = row_bytes * 256 / K, first = t->offset + (M - rows) * row_bytes;
     const std::size_t cr = NpuCallRows();
-    const std::size_t extent = (cr - 1) * row_bytes + 16 * blk + kDcolRecordRow;   // gen_npu_gemm.fill_inputs
+    Fmt f{};
+    if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) throw LoomError("prefill: no NPU format for " + wname);
+    const std::size_t extent = (cr - 1) * row_bytes + 16 * blk + RecordRow(f.name);   // gen_npu_gemm.fill_inputs
     if (npu_planning_) {
       const std::size_t end = std::min(first + rows * row_bytes + 4096, gguf_.tensor_data_size());
       npu_->RegisterRaw(gguf_.tensor_data_base() + first, end - first);

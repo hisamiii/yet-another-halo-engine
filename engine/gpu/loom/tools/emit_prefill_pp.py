@@ -1120,7 +1120,7 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 # 512-row calls (site rows multiples of 512; NP 5 images no longer fit the grid decoders' raw rings), one replay group.
 NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
 NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
-FUSE_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q4k")
+FUSE_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q4k", "q5k")
 FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q5k", "q4k", "iq2s")   # the fused FFN block's gate / up (NP
 # 4 images: room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream: Q4_K only
 # in pairs, a P4 H through its gather-free decoder, gord GF)
