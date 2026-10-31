@@ -1189,19 +1189,34 @@ class LoomPrefill {
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
     const bool bg = !std::strcmp(f.name, "iq2s"), bu = !std::strcmp(fu.name, "iq2s"), bd = !std::strcmp(fd.name, "iq2s");
-    const std::size_t blk = bg ? kBfpBlock : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
-    const std::size_t blku = bu ? kBfpBlock : tu->bytes / M * 256 / tu->dims[0], rbu = blku * tu->dims[0] / 256;
+    // (npuffnix4: IQ3_S / IQ3_XXS gate / up rows transcoded to IQ4_XS blocks, the NPU's rows only)
+    const bool ix4 = geom_.count("npuffnix4") != 0;
+    const auto tx = [&](const Fmt& x) { return ix4 && (!std::strcmp(x.name, "iq3s") || !std::strcmp(x.name, "iq3xxs")); };
+    const bool xg = tx(f), xu = tx(fu);
+    const std::size_t blk = bg ? kBfpBlock : xg ? kIx4Block : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
+    const std::size_t blku = bu ? kBfpBlock : xu ? kIx4Block : tu->bytes / M * 256 / tu->dims[0], rbu = blku * tu->dims[0] / 256;
     const std::size_t blkd = bd ? kBfpBlock : td->bytes / td->dims[1] * 256 / td->dims[0], rbd = blkd * td->dims[0] / 256;
-    const std::size_t f0 = M - F, dgu = static_cast<std::size_t>(tg->bytes);
+    const std::size_t f0 = M - F, dgu = xg ? M * rb : static_cast<std::size_t>(tg->bytes);
     const std::size_t Nd = static_cast<std::size_t>(td->dims[1]);
-    const std::uint8_t* pg = bg ? BfpRows(pre + "ffn_gate.weight", M * rb) : base + tg->offset;
-    const std::uint8_t* pu = bu ? BfpRows(pre + "ffn_up.weight", M * rbu) : base + tu->offset;
+    const auto ix4_rows = [&](const std::string& kind, std::size_t rbx) {
+      return HostRows("npu_ix4_" + pre + kind + ".bin", M * rbx, {{f0 * rbx, F * rbx}});
+    };
+    const std::uint8_t* pg = bg ? BfpRows(pre + "ffn_gate.weight", M * rb)
+                             : !xg ? base + tg->offset
+                             : pair ? ix4_rows("ffn_gate", rb)
+                                    : HostRows("npu_ix4_" + pre + "ffn_gate_up.bin", 2 * M * rb,
+                                               {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}});
+    const std::uint8_t* pu = bu ? BfpRows(pre + "ffn_up.weight", M * rbu)
+                             : !xu ? base + tu->offset
+                             : pair ? ix4_rows("ffn_up", rbu) : pg + M * rb;
     const std::uint8_t* pd = bd ? BfpRows(pre + "ffn_down.weight", Nd * rbd) : base + td->offset;
     if (npu_planning_) {   // the NPU's gate / up rows (one range when up follows gate), all of down
       const std::size_t end = gguf_.tensor_data_size();
       if (pair) {
-        npu_->RegisterRaw(pg + f0 * rb, bg ? (M - f0) * rb + 8192 : std::min(tg->offset + M * rb + 4096, end) - (tg->offset + f0 * rb));
-        npu_->RegisterRaw(pu + f0 * rbu, bu ? (M - f0) * rbu + 8192 : std::min(tu->offset + M * rbu + 4096, end) - (tu->offset + f0 * rbu));
+        npu_->RegisterRaw(pg + f0 * rb, bg || xg ? (M - f0) * rb + 8192 : std::min(tg->offset + M * rb + 4096, end) - (tg->offset + f0 * rb));
+        npu_->RegisterRaw(pu + f0 * rbu, bu || xu ? (M - f0) * rbu + 8192 : std::min(tu->offset + M * rbu + 4096, end) - (tu->offset + f0 * rbu));
+      } else if (xg) {
+        npu_->RegisterRaw(pg + f0 * rb, 2 * M * rb - f0 * rb + 8192);
       } else {
         const std::size_t a = tg->offset + f0 * rb;
         npu_->RegisterRaw(base + a, std::min(tu->offset + M * rb + 4096, end) - a);
@@ -3169,22 +3184,32 @@ class LoomPrefill {
   // IQ2_S FFN tensors have no NPU decoder: the emitter wrote their rows pre-decoded (emit_prefill_pp.bfp_rows,
   // npu_bfp_<name>.bin: the decoder records' bfp16 fragments, 288 bytes per 256 weights), read once into resident
   // writable memory like the model (RegisterRaw pins it; + 8192 bytes of over-read slack)
-  static constexpr std::size_t kBfpBlock = 288;
-  const std::uint8_t* BfpRows(const std::string& name, std::size_t bytes) {
-    if (const auto it = bfp_.find(name); it != bfp_.end()) return it->second;
-    const std::string path = dir_ + "/npu_bfp_" + name + ".bin";
+  static constexpr std::size_t kBfpBlock = 288, kIx4Block = 136;
+  // Host-side NPU rows (emit_prefill_pp bfp_rows / ix4_files): file's bytes in order into the spans (offset, bytes) of
+  // a buffer of bytes (+ 8 KB the records over-read; pages outside the spans are never touched), kept for the run
+  const std::uint8_t* HostRows(const std::string& file, std::size_t bytes,
+                               const std::vector<std::pair<std::size_t, std::size_t>>& spans) {
+    if (const auto it = bfp_.find(file); it != bfp_.end()) return it->second;
+    const std::string path = dir_ + "/" + file;
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw LoomError("cannot open " + path);
     void* p = ::mmap(nullptr, bytes + 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw LoomError("prefill: no memory for " + path);
-    for (std::size_t done = 0; done < bytes;) {
-      const ssize_t n = ::pread(fd, static_cast<char*>(p) + done, bytes - done, static_cast<off_t>(done));
-      if (n <= 0) throw LoomError("prefill: short read of " + path);
-      done += static_cast<std::size_t>(n);
+    std::size_t at = 0;
+    for (const auto& [o, len] : spans) {
+      for (std::size_t done = 0; done < len;) {
+        const ssize_t n = ::pread(fd, static_cast<char*>(p) + o + done, len - done, static_cast<off_t>(at + done));
+        if (n <= 0) throw LoomError("prefill: short read of " + path);
+        done += static_cast<std::size_t>(n);
+      }
+      at += len;
     }
     ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     ::close(fd);
-    return bfp_[name] = static_cast<std::uint8_t*>(p);
+    return bfp_[file] = static_cast<std::uint8_t*>(p);
+  }
+  const std::uint8_t* BfpRows(const std::string& name, std::size_t bytes) {
+    return HostRows("npu_bfp_" + name + ".bin", bytes, {{0, bytes}});
   }
   std::map<std::string, std::uint8_t*> bfp_;
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)

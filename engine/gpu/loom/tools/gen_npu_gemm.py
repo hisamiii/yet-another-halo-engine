@@ -158,7 +158,7 @@ _LEAVES = {}
 def decoder(fmt, gord="P4"):
     """gen_npu_dec for fmt (its constants follow DQ_FMT and DQ_GORD at import)."""
     import gen_npu_dec
-    if gen_npu_dec.FMT != fmt or os.environ.get("DQ_GORD", "P4") != gord:
+    if gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord:
         os.environ["DQ_FMT"] = fmt
         os.environ["DQ_GORD"] = gord
         gen_npu_dec = importlib.reload(gen_npu_dec)
@@ -914,7 +914,7 @@ def fuse_record(cfg, cov):
 
 
 FUSE_SB = 4   # fuse 2: super-blocks per row of a unit (a pass: 1024 k)
-FUSE_FMTS = ("IQ4_XS", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K", "Q5_K", "BFP")   # fuse 2 decoders (cfg.fmt, in
+FUSE_FMTS = ("IQ4_XS", "IQ4_XO", "IQ4_XX", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K", "Q5_K", "BFP")   # fuse 2 decoders (cfg.fmt, in
 # cfg.gord's k-block order; program and data memory decide which fit an image: gen_npu_dec sizes)
 
 

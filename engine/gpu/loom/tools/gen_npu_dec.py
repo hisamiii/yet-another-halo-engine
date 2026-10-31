@@ -27,7 +27,13 @@ TABLES = os.path.join(HERE, "..", "tables")   # the GPU's grid tables (u8 [entry
 def grid_table(name, n):
     return np.fromfile(os.path.join(TABLES, name), np.uint8).reshape(n, 4).astype(np.float64)
 
-FMT = os.environ.get("DQ_FMT", "IQ4_XS")
+FMT0 = os.environ.get("DQ_FMT", "IQ4_XS")
+# IQ4_XO / IQ4_XX: IQ3_S / IQ3_XXS rows transcoded on the host to IQ4_XS blocks with the same f32 weights (ix4_rows: ls =
+# 33 + 2 s, the nibble indexes the signed grid values over d (1 + 2 s)); IQ4_XS's decoder with these kvalues
+KVX = {"IQ4_XO": [float(2 * u - 15) for u in range(16)],
+       "IQ4_XX": [-15.5, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15.5]}
+IX4_SRC = {"IQ4_XO": "IQ3_S", "IQ4_XX": "IQ3_XXS"}
+FMT = "IQ4_XS" if FMT0 in KVX else FMT0
 BLK = {"IQ4_XS": 136, "Q4_K": 144, "Q5_K": 176, "IQ3_S": 110, "IQ3_XXS": 98, "IQ2_XXS": 66, "IQ2_XS": 74,
        "Q3_K": 110, "BFP": 288}[FMT]   # bytes per super-block
 HBY = {"IQ4_XS": 8, "Q4_K": 16, "Q5_K": 48, "IQ3_S": 2, "IQ3_XXS": 2, "IQ2_XXS": 2, "IQ2_XS": 2,
@@ -94,7 +100,7 @@ SCR2_B = PARTSS + 1024 if GF else GT2 + (0 if GRID else 2048) + 64
 if BFP:
     SCR_B = SCR2_B = 64
 TABV, BASEV = [TAB], ["%sp"]
-KV = I.KV if FMT == "IQ4_XS" else [float(v) for v in range(16)]
+KV = KVX.get(FMT0, I.KV) if FMT == "IQ4_XS" else [float(v) for v in range(16)]
 OUTCAP = 2
 INLINE = [0]                    # leaf_inline: super-blocks per input record (0: a standalone leaf)
 VROLL = [False]                 # leaf_inline: the scale halves rolled whatever the format (program memory)
@@ -2450,6 +2456,48 @@ def weights(raw):
     return w
 
 
+def ix4_rows(raw, src):
+    """raw [..., BLK of src] IQ3_S / IQ3_XXS super-blocks -> [..., 136] IQ4_XS blocks whose weights under KVX's table
+    (IQ4_XO / IQ4_XX) are the source's, bit for bit: ls = 33 + 2 s, q the index of the signed grid value (/ 4: IQ3_XXS)."""
+    raw = np.asarray(raw, np.uint8)
+    sh = raw.shape[:-1]
+    if src == "IQ3_S":
+        grid = grid_table("grid_iq3s.bin", 512).astype(np.int64)
+        qs, qh = raw[..., 2:66].astype(np.int64), raw[..., 66:74].astype(np.int64)
+        sg, scb = raw[..., 74:106].astype(np.int64), raw[..., 106:110].astype(np.int64)
+        s = np.stack([(scb[..., i // 2] >> (4 * (i % 2))) & 15 for i in range(8)], -1)
+        hb = np.stack([(qh[..., n // 8] >> (n % 8)) & 1 for n in range(64)], -1)
+        g = grid[qs | (hb << 8)].reshape(sh + (256,))
+        neg = np.stack([(sg[..., v // 8] >> (v % 8)) & 1 for v in range(256)], -1)
+        m = (g - 1) // 2                                   # odd 1 .. 15 -> 0 .. 7
+        assert np.all(g % 2 == 1) and np.all(g <= 15)
+    else:
+        grid = grid_table("grid_iq3xxs.bin", 256).astype(np.int64)
+        qs = raw[..., 2:66].astype(np.int64)
+        aux = raw[..., 66:98].copy().view(np.uint32).astype(np.int64)
+        s = aux >> 28
+        f = np.stack([(aux >> (7 * l)) & 127 for l in range(4)], -1)
+        par = np.zeros_like(f)
+        for b in range(7):
+            par ^= (f >> b) & 1
+        ks = f | (par << 7)
+        neg = np.stack([(ks[..., v // 32, (v // 8) % 4] >> (v % 8)) & 1 for v in range(256)], -1)
+        g = grid[qs].reshape(sh + (256,))
+        m = np.searchsorted(np.array([4, 12, 20, 28, 36, 44, 52, 62]), g)
+        assert np.all(np.array([4, 12, 20, 28, 36, 44, 52, 62])[m] == g)
+    q = np.where(neg == 1, 7 - m, 8 + m)
+    ls = 33 + 2 * s
+    out = np.zeros(sh + (136,), np.uint8)
+    out[..., 0:2] = raw[..., 0:2]
+    hi = sum(((ls[..., j] >> 4) & 3) << (2 * j) for j in range(8))
+    out[..., 2], out[..., 3] = hi & 255, hi >> 8
+    for i in range(4):
+        out[..., 4 + i] = (ls[..., 2 * i] & 15) | ((ls[..., 2 * i + 1] & 15) << 4)
+    q = q.reshape(sh + (8, 2, 16))
+    out[..., 8:] = (q[..., 0, :] | (q[..., 1, :] << 4)).reshape(sh + (128,))
+    return out
+
+
 def main():
     work = sys.argv[1]
     units = 25
@@ -2471,9 +2519,16 @@ def main():
         return
     import gguf   # llama.cpp's gguf-py on PYTHONPATH
     rd = gguf.GGUFReader(sys.argv[2])
-    t = next(x for x in rd.tensors if x.tensor_type.name == FMT and len(x.shape) == 2 and int(x.shape[0]) == 5120
+    sfmt = IX4_SRC.get(FMT0, FMT)
+    t = next(x for x in rd.tensors if x.tensor_type.name == sfmt and len(x.shape) == 2 and int(x.shape[0]) == 5120
              and int(x.shape[1]) >= 1024)
-    raw = np.asarray(t.data).view(np.uint8).reshape(-1, 20, BLK)[160:160 + 80 * nports].copy()   # 80 rows per port
+    rows = np.asarray(t.data).view(np.uint8).reshape(int(t.shape[1]), -1)[160:160 + 80 * nports]   # 80 rows per port
+    raw = rows.reshape(len(rows), 20, -1).copy()
+    if FMT0 in IX4_SRC:   # the transcoded rows' weights are the source's, bit for bit
+        raw = ix4_rows(raw, sfmt)
+        ref = gguf.quants.dequantize(rows, gguf.GGMLQuantizationType[sfmt]).reshape(raw.shape[:-1] + (256,))
+        print("transcoded weights bit-identical:",
+              np.array_equal(weights(raw).view(np.uint32), ref.astype(np.float32).view(np.uint32)))
     np.concatenate([raw.reshape(-1), np.zeros(1024, np.uint8)]).tofile(f"{work}/in.bin")   # + slack: records over-read
     np.zeros(nports * 8 * units * OUT_B, np.uint8).tofile(f"{work}/o0.bin")
     r = subprocess.run([hrx_paths.XDNA_RUN, "--columns=1", f"--image={work}/p.xdna", "--entry=probe", "--binding_memory=system",
