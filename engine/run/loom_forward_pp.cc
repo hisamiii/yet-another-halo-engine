@@ -117,6 +117,10 @@ int main(int argc, char** argv) {
       }
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
       pf.EnableNpu(npu.get());
+      // full chunks only: every split GEMM leaves the NPU's rows to the NPU, so the model rows its copies replace go
+      if (want && want % pf.chunk() == 0)
+        std::fprintf(stderr, "loom_forward_pp: released %.2f GB of model rows the NPU reads from its copies\n",
+                     weights.DropUnread(gpu, gguf, pf.npu_only()) / 1e9);
     }
     const std::uint32_t B = pf.chunk(), T_run = want ? want : B;
     if (T_run == 0 || T_run > pf.context()) {

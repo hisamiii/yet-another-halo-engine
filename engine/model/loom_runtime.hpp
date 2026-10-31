@@ -17,6 +17,9 @@
 #include <utility>
 #include <vector>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "core/gguf.hpp"
 #include "hrx_runtime.h"
 
@@ -542,6 +545,27 @@ class LoomGraph {
   std::vector<std::array<uint32_t, 3>> grids_;
 };
 
+// Back the whole pages of [p, p + bytes), which nothing reads, with one shared 2 MB page run: pinning them (an import
+// or an NPU registration of a range around them pins every page) then takes no memory of its own. lock: mlocked like
+// the model they replace (Gguf::OpenResident: reclaim would move pages under the GPU's import)
+inline void AliasUnread(std::uint8_t* p, std::size_t bytes, bool lock) {
+  constexpr std::uintptr_t kPage = 4096;
+  constexpr std::size_t kRun = std::size_t{2} << 20;
+  static const int fd = [] {
+    const int f = ::memfd_create("yah-unread", MFD_CLOEXEC);
+    if (f < 0 || ::ftruncate(f, kRun) != 0) throw LoomError("no memfd for the unread pages");
+    return f;
+  }();
+  std::uintptr_t a = (reinterpret_cast<std::uintptr_t>(p) + kPage - 1) & ~(kPage - 1);
+  const std::uintptr_t e = (reinterpret_cast<std::uintptr_t>(p) + bytes) & ~(kPage - 1);
+  for (std::size_t n; a < e; a += n) {
+    n = std::min<std::size_t>(kRun, e - a);
+    void* q = ::mmap(reinterpret_cast<void*>(a), n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (q == MAP_FAILED) throw LoomError("cannot alias unread pages");
+    if (lock) ::mlock(q, n);
+  }
+}
+
 // The model's tensor data on the GPU; Ref(t) binds a tensor. By default it is copied into device-local buffers of about
 // 1 GiB cut at tensor boundaries, each host range released right after its copy (RAM holds one copy of the model):
 // the GPU reads imported host pages snooped, ~6% more GEMM cycles. in_place: the host region imported once (the NPU
@@ -553,6 +577,7 @@ class LoomWeights {
       const uintptr_t base = reinterpret_cast<uintptr_t>(gguf.tensor_data_base()), start = base & ~uintptr_t{4095};
       LoomBuffer buffer = gpu.Import(reinterpret_cast<void*>(start), gguf.tensor_data_size() + base - start);
       chunks_.push_back({0, base - start, std::move(buffer)});
+      in_place_ = true;
       return;
     }
     constexpr size_t kChunk = size_t{1} << 30;
@@ -584,6 +609,23 @@ class LoomWeights {
       chunks_.push_back({begin, 0, std::move(buffer)});
     }
   }
+  // in_place, the device idle and no recorded graph left: give the import back, alias spans (tensor-data offsets) nobody
+  // reads (AliasUnread) and import the region again, so their pages go (the import pins every page of its range).
+  // Returns the bytes freed.
+  std::size_t DropUnread(LoomDevice& gpu, core::Gguf& gguf, const std::vector<std::pair<size_t, size_t>>& spans) {
+    if (!in_place_ || spans.empty()) return 0;
+    gpu.Synchronize();
+    const size_t bytes = chunks_[0].buffer.size;
+    auto* start = const_cast<std::uint8_t*>(gguf.tensor_data_base()) - chunks_[0].delta;
+    chunks_[0].buffer.reset();
+    std::size_t freed = 0;
+    for (const auto& [o, n] : spans) {
+      AliasUnread(start + chunks_[0].delta + o, n, true);
+      freed += n;
+    }
+    chunks_[0].buffer = gpu.Import(start, bytes);
+    return freed;
+  }
   [[nodiscard]] hrx_buffer_ref_t Ref(const core::TensorInfo& t) const {
     const size_t off = static_cast<size_t>(t.offset);
     const auto it = std::upper_bound(chunks_.begin(), chunks_.end(), off,
@@ -602,6 +644,7 @@ class LoomWeights {
     LoomBuffer buffer;
   };
   std::vector<Chunk> chunks_;
+  bool in_place_ = false;
 };
 
 }  // namespace yah::model

@@ -87,6 +87,9 @@ class LoomPrefill {
   // Buffer sizes of the NPU column split this set carries (dispatch.txt "npusplit_<site>", "npubytes_<K>"); zero: none.
   // A job is the NPU work behind one cut: the DeltaNet qkv + gate, or one other site; the buffers fit the largest
   // (W twice).
+  // After EnableNpu: the model rows only the NPU reads (from its own copies, NpuOnly). Only a GEMM over all rows reads
+  // them otherwise, which an unsplit (partial) chunk or decode runs: LoomWeights::DropUnread for full chunks only.
+  [[nodiscard]] const std::vector<std::pair<std::size_t, std::size_t>>& npu_only() const { return npu_only_; }
   [[nodiscard]] NpuPlan npu_plan() const {
     NpuPlan p = WholePlan();
     if (!hgeom_.empty() && p.dcol) {  // token halves: their A slots and C regions (HalfA, HalfC)
@@ -1221,7 +1224,7 @@ class LoomPrefill {
     // them (the GPU's) are in the range registered for the NPU, which pins its pages: one aliased page run
     const auto gate_up = [&](const std::string& file) {
       auto* p = const_cast<std::uint8_t*>(HostRows(file, 2 * M * rb, {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}}));
-      AliasHole(p + M * rb, f0 * rb);
+      AliasUnread(p + M * rb, f0 * rb, false);
       return p;
     };
     const std::uint8_t* pg = bmix ? gate_up("npu_bfp_" + pre + "ffn_gate_up.bin")
@@ -1245,6 +1248,8 @@ class LoomPrefill {
         npu_->RegisterRaw(base + a, std::min(tu->offset + M * rb + 4096, end) - a);
       }
       npu_->RegisterRaw(pd, bd ? Nd * rbd + 8192 : std::min<std::size_t>(td->bytes + 4096, end - td->offset));
+      if (bg || xg) NpuOnly(tg->offset + f0 * (tg->bytes / M), F * (tg->bytes / M));
+      if (bu || xu) NpuOnly(tu->offset + f0 * (tu->bytes / M), F * (tu->bytes / M));
     }
     std::vector<std::uint32_t> csw;
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
@@ -1894,6 +1899,7 @@ class LoomPrefill {
       const std::size_t end = bx ? first + rows * row_bytes + 8192
                                  : std::min(first + rows * row_bytes + 4096, gguf_.tensor_data_size());
       npu_->RegisterRaw(RawBase(wname) + first, end - first);
+      if (bx) NpuOnly(t->offset + (M - rows) * (t->bytes / M), rows * (t->bytes / M));
     }
     std::vector<std::vector<NpuView>> views;
     for (const auto& [k0, Kc] : NpuChunks(site)) {
@@ -3246,26 +3252,16 @@ class LoomPrefill {
     ::close(fd);
     return bfp_[file] = static_cast<std::uint8_t*>(p);
   }
-  // Back the whole pages of [p, p + bytes), which nothing reads, with one shared 2 MB page run (alias_fd_): pinning
-  // them (a range registered for the NPU) then takes no memory of its own
-  void AliasHole(std::uint8_t* p, std::size_t bytes) {
-    constexpr std::uintptr_t kPage = 4096;
-    constexpr std::size_t kRun = std::size_t{2} << 20;
-    std::uintptr_t a = (reinterpret_cast<std::uintptr_t>(p) + kPage - 1) & ~(kPage - 1);
-    const std::uintptr_t e = (reinterpret_cast<std::uintptr_t>(p) + bytes) & ~(kPage - 1);
-    if (alias_fd_ < 0 && ((alias_fd_ = ::memfd_create("yah-alias", MFD_CLOEXEC)) < 0 || ::ftruncate(alias_fd_, kRun) != 0))
-      throw LoomError("prefill: no memfd for the aliased pages");
-    for (std::size_t n; a < e; a += n) {
-      n = std::min<std::size_t>(kRun, e - a);
-      if (::mmap(reinterpret_cast<void*>(a), n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, alias_fd_, 0) == MAP_FAILED)
-        throw LoomError("prefill: cannot alias unread pages");
-    }
-  }
-  int alias_fd_ = -1;
   const std::uint8_t* BfpRows(const std::string& name, std::size_t bytes) {
     return HostRows("npu_bfp_" + name + ".bin", bytes, {{0, bytes}});
   }
   std::map<std::string, std::uint8_t*> bfp_;
+  // The planning pass's model rows the NPU reads from its own copies (BFP / IX4 rows: tensor-data offset, bytes), not
+  // the last layer's (its tail runs on the kept row's token tile, over all rows: Trim)
+  void NpuOnly(std::size_t offset, std::size_t bytes) {
+    if (layer_ + 1 != cfg_.main_block_count()) npu_only_.emplace_back(offset, bytes);
+  }
+  std::vector<std::pair<std::size_t, std::size_t>> npu_only_;
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
   std::size_t npu_cleared_ = 0;    // flagged_ jobs whose flag words NpuJoin cleared
   std::size_t npu_joined_ = 0;     // flagged_ jobs an NpuJoin waited for (in order)
