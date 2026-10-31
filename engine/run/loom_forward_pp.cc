@@ -8,6 +8,7 @@
 //
 // env:
 //   YAH_GEN=N, YAH_DECODE_HAL=<emit_decode.py set>  N greedy tokens after the prompt (the prefill's argmax first)
+//   YAH_GEN_SPLIT=S                                 also sync every S steps and print that slice's tok/s
 //   YAH_LOGITS_FROM=P   f32 logits of positions P..tokens-1 into <out-prefix>.all_logits (engine/run/gate)
 //   YAH_ROWSTATS=<file> compact per-position logit statistics (engine/run/kvq/gate2.py); YAH_ROWSTATS_FROM (1024),
 //                       YAH_ROWSTATS_STRIDE (8) or a position list in YAH_ROWSTATS_POS
@@ -256,9 +257,20 @@ int main(int argc, char** argv) {
       dec.SetTokens(&tok, 1, T_run);
       gpu.Synchronize();
       const auto tg = std::chrono::steady_clock::now();
+      const char* sp = std::getenv("YAH_GEN_SPLIT");   // N: sync every N steps and print that slice's tok/s
+      const std::uint32_t split = sp ? static_cast<std::uint32_t>(std::atoi(sp)) : 0;
+      auto ts = tg;
       for (std::uint32_t pos = T_run; pos + 1 < T_run + ngen; ++pos) {
         dec.Step(pos, T_run);
         gpu.Flush();
+        if (split && (pos + 1 - T_run) % split == 0) {
+          gpu.Synchronize();
+          const auto now = std::chrono::steady_clock::now();
+          std::printf("gen_split pos=%u tok_s=%.2f\n", pos + 1,
+                      1000.0 * split / std::chrono::duration<double, std::milli>(now - ts).count());
+          std::fflush(stdout);
+          ts = now;
+        }
       }
       gpu.Synchronize();
       const double gms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
