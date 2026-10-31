@@ -1197,7 +1197,12 @@ class LoomPrefill {
     // (npuffnix4: IQ3_S / IQ3_XXS gate / up rows transcoded to IQ4_XS blocks, the NPU's rows only)
     const bool ix4 = geom_.count("npuffnix4") != 0;
     const auto tx = [&](const Fmt& x) { return ix4 && (!std::strcmp(x.name, "iq3s") || !std::strcmp(x.name, "iq3xxs")); };
-    const bool xg = mix || tx(f), xu = mix || tx(fu);
+    // (a mixed pair of one untranscoded format, emit_prefill_pp SAME_SW_FMTS: up follows gate in the GGUF, like a
+    // single format's)
+    const bool xmix = mix && (tx(f) || tx(fu));
+    if (mix && !xmix && (std::strcmp(f.name, fu.name) || tu->offset != tg->offset + tg->bytes))
+      throw LoomError("prefill: " + pre + " mixed image without transcoded or contiguous rows");
+    const bool xg = xmix || tx(f), xu = xmix || tx(fu);
     const std::size_t blk = bg ? kBfpBlock : xg ? kIx4Block : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
     const std::size_t blku = bu ? kBfpBlock : xu ? kIx4Block : tu->bytes / M * 256 / tu->dims[0], rbu = blku * tu->dims[0] / 256;
     const std::size_t blkd = bd ? kBfpBlock : td->bytes / td->dims[1] * 256 / td->dims[0], rbd = blkd * td->dims[0] / 256;
