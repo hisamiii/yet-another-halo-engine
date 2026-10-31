@@ -809,8 +809,9 @@ class LoomPrefill {
     kv16_scratch_ = geom_.count("kv16_scratch") != 0;
     kv16_layer_ = kv16_scratch_ ? B * kKvRow * 2 : kv_cache_ * 2;
     kv16_ = &Alloc(kv16_scratch_ ? 2 * kv16_layer_ : std::size_t{2} * full_ * kv_cache_ * 2);
-    kc32_ = &Alloc(kv_cache_ * 4);
-    vc32_ = &Alloc(kv_cache_ * 4);
+    // the RoPE kernel's f32 K / V cache copies: bound, never stored (emit_prefill_pp.rope_live), so no context-sized pair
+    kc32_ = &Alloc(4);
+    vc32_ = &Alloc(4);
     lse_ = &Alloc(B * kHeads * 4);
     eps_ = &Alloc(4);
     ffnup_ = &Alloc(B * kFfn * 2);
