@@ -1140,15 +1140,16 @@ NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs"), (40, 40, 40, 8)
 NPU_IX4 = os.environ.get("YAH_NPU_IX4", "1") == "1"
 IX4_FMTS = {"iq3s": "IQ4_XO", "iq3xxs": "IQ4_XX"} if NPU_IX4 else {}
 IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX") if NPU_IX4 else ()
-# pairs of one format (no fused GPU gate / up) whose decoder holds the deferred epilogue's slices: the NPU's side one
-# image like a single format's, on the GGUF rows (Q3_K's leaf exceeds the program memory at 40 / 8)
-SAME_SW_FMTS = ("q5k",) if NPU_IX4 else ()
 if NPU_IX4:
     NPU_DFR_FMTS += ("iq3s",)
 # YAH_NPU_BFPSW (default 1): the other pairs' gate / up rows (the NPU's) pre-decoded to bfp16 (bfp_pair_rows:
 # npu_bfp_<prefix>ffn_gate_up.bin), one BFP image like a single format's with the deferred epilogue
 # ("npu_ffnsw_bfp_<hord>", dispatch rows "npuffnbx_<gate>_<up>") instead of column pairs
 NPU_BFPSW = os.environ.get("YAH_NPU_BFPSW", "1") == "1"
+# pairs of one format (no fused GPU gate / up) whose decoder holds the deferred epilogue's slices: the NPU's side one
+# image like a single format's, on the GGUF rows (Q3_K's leaf exceeds the program memory at 40 / 8; Q5_K's decode
+# runs slower than the BFP image's stream: BFP with NPU_BFPSW)
+SAME_SW_FMTS = ("q5k",) if NPU_IX4 and not NPU_BFPSW else ()
 
 
 def gu_fmt(fmt):
