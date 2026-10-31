@@ -195,7 +195,8 @@ def main():
         "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
     emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # also runs the decode conv
     # token_embd row from the device token stream (Q8_0 in HFQ models)
-    emit_src(DM.gen_embed_q8_0() if types["token_embd.weight"] == 8 else DM.gen_embed_iq4xs(), "embed", outdir)
+    et = types["token_embd.weight"]
+    emit_src(DM.gen_embed_q8_0() if et == 8 else DM.gen_embed_q3k() if et == 11 else DM.gen_embed_iq4xs(), "embed", outdir)
     # MQ4 GEMVs read x in the weights' rotated basis: in place per input site, ssm_out's input gathered into HF head
     # order, the head's without awq
     if rot:

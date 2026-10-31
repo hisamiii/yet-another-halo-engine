@@ -37,16 +37,18 @@ FMT = {
     "iq3xxs": (256, 98, ("grid_iq3xxs", "ksigns")),
     "iq2xxs": (256, 66, ("grid_iq2xxs", "ksigns")),
     "iq2xs": (256, 74, ("grid_iq2xs", "ksigns")),
+    "iq2s": (256, 82, ("grid_iq2s",)),
+    "iq4nl": (32, 18, ()),
 }
 # table: (element type, elements); files in the HAL dir (emit_prefill writes them)
 TABLES = {"grid_iq3s": ("i32", 512), "grid_iq3xxs": ("i32", 256), "grid_iq2xxs": ("i32", 512),
-          "grid_iq2xs": ("i32", 1024), "ksigns": ("i8", 128)}
-TABLE_ORDER = ["grid_iq3s", "grid_iq3xxs", "grid_iq2xxs", "grid_iq2xs", "ksigns"]
+          "grid_iq2xs": ("i32", 1024), "ksigns": ("i8", 128), "grid_iq2s": ("i32", 2048)}
+TABLE_ORDER = ["grid_iq3s", "grid_iq3xxs", "grid_iq2xxs", "grid_iq2xs", "ksigns", "grid_iq2s"]
 IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
 # Loom read-ahead depth of the sub-block loop: 2 is the fastest on the full decode (none and 3 are slower).
 PIPE = 2
 GGML = {8: "q8_0", 10: "q2k", 11: "q3k", 12: "q4k", 13: "q5k", 14: "q6k", 16: "iq2xxs", 17: "iq2xs",
-        18: "iq3xxs", 21: "iq3s", 23: "iq4xs", 44: "mq4"}
+        18: "iq3xxs", 20: "iq4nl", 21: "iq3s", 22: "iq2s", 23: "iq4xs", 44: "mq4"}
 
 
 def rows_per_wg(R=2, W=4):
@@ -116,12 +118,19 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
         """Emit lane constants for format f (prefix p) into body; return a dict."""
         qk, bb, _ = FMT[f]
         S = {}
-        if qk == 32:     # q8_0: block = sb / 2 = lane / 2 + 16 t; half = lane % 2
+        if qk == 32:     # q8_0, iq4nl: block = sb / 2 = lane / 2 + 16 t; half = lane % 2
             b(f"  %{p}lb = index.div %lane, {e.ci(2)} : index")
             b(f"  %{p}lboff = index.mul %{p}lb, {e.ci(bb)} : index")
             b(f"  %{p}hlf = index.rem %lane, {e.ci(2)} : index")
-            b(f"  %{p}qo0 = index.mul %{p}hlf, {e.ci(16)} : index")
-            b(f"  %{p}qo = index.add %{p}qo0, {e.ci(2)} : index")
+            if f == "iq4nl":   # qs[0..16) at 2: half 0 the low nibbles, half 1 the high ones
+                b(f"  %{p}qo = index.add {e.ci(0)}, {e.ci(2)} : index")
+                b(f"  %{p}hlfi = index.cast %{p}hlf : index to i32")
+                b(f"  %{p}shi = scalar.shli %{p}hlfi, {e.cs(2)} : i32")
+                b(f"  %{p}shvw = vector.splat %{p}shi : vector<4xi32>")
+                S["sh"] = f"%{p}shvw"
+            else:
+                b(f"  %{p}qo0 = index.mul %{p}hlf, {e.ci(16)} : index")
+                b(f"  %{p}qo = index.add %{p}qo0, {e.ci(2)} : index")
             S["tstep"] = 16 * bb
             return S
         # 256-element blocks: block = lane / 16 + 2 t, sb32 = (lane / 2) % 8, hlf = lane % 2
@@ -241,7 +250,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             b(f"  %{p}qo = index.add %{p}qb2, {e.ci(8)} : index")
             b(f"  %{p}s4 = index.div %{p}s32, {e.ci(4)} : index")
             b(f"  %{p}so = index.mul %{p}s4, {e.ci(4)} : index")
-        elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs"):
+        elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs", "iq2s"):
             # sign of element j: bit (j % 8) of sign byte l = 2 * hlf + j / 8
             b(f"  %{p}l0 = index.mul %{p}hlf, {e.ci(2)} : index")                # l of the first eight
             if f == "iq3s":
@@ -276,6 +285,21 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
                 b(f"  %{p}ao = index.add %{p}ax0, {e.ci(6)} : index")             # high u32 = bytes[4..8)
                 b(f"  %{p}qb1 = index.add %{p}ax0, %{p}l0 : index")
                 b(f"  %{p}qo = index.add %{p}qb1, {e.ci(2)} : index")             # bytes[l], bytes[l + 1]
+            elif f == "iq2s":
+                # qs[4 ib32 + l] at 2, signs[4 ib32 + l] at 34, qh[ib32] at 66, scales[ib32] at 74
+                b(f"  %{p}qb0 = index.mul %{p}s32, {e.ci(4)} : index")
+                b(f"  %{p}qb1 = index.add %{p}qb0, %{p}l0 : index")
+                b(f"  %{p}qo = index.add %{p}qb1, {e.ci(2)} : index")
+                b(f"  %{p}sgo = index.add %{p}qb1, {e.ci(34)} : index")
+                b(f"  %{p}ho = index.add %{p}s32, {e.ci(66)} : index")
+                b(f"  %{p}so = index.add %{p}s32, {e.ci(74)} : index")
+                b(f"  %{p}sls = scalar.shli %{p}hlfi, {e.cs(2)} : i32")
+                # grid index l: qs[l] | (qh << (8 - 2l)) & 0x300
+                b(f"  %{p}l0i = index.cast %{p}l0 : index to i32")
+                for qq in (0, 1):
+                    b(f"  %{p}l2x{qq} = scalar.addi %{p}l0i, {e.cs(qq)} : i32")
+                    b(f"  %{p}l2y{qq} = scalar.shli %{p}l2x{qq}, {e.cs(1)} : i32")
+                    b(f"  %{p}qsA{qq} = scalar.subi {e.cs(8)}, %{p}l2y{qq} : i32")
             else:  # iq2xs
                 b(f"  %{p}qb0 = index.mul %{p}s32, {e.ci(8)} : index")
                 b(f"  %{p}qb1 = index.mul %{p}l0, {e.ci(2)} : index")
@@ -501,6 +525,17 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             d = ld_d(hv, nh, boff, 0, p, "d")
             b(f"    %{p}scale0 = scalar.mulf {d}, %{p}scf : f32")
             scale = f"%{p}scale0"
+        elif f == "iq4nl":
+            b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
+            raw = tow(p, ld(wv, nb, f"%{p}qa", p, "qr", 16), "qw")
+            sh = wop(p, "qs", "shrui", raw, S["sh"])
+            nibw = wop(p, "nw", "andi", sh, wspl(0x0F0F0F0F))
+            nib0 = tob(p, nibw, "nb0")
+            b(f"    %{p}nb = vector.andi {nib0}, {e.splat8(15)} : vector<16xi8>")
+            b(f"    %{p}q = vector.table.lookup %kvtu[%{p}nb] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+            q = f"%{p}q"
+            bias = 128
+            scale = ld_d(hv, nh, boff, 0, p, "d")
         elif f == "mq4":
             # signed nibbles (the HFQ loader's code - 8) ^ 8 = the unsigned codes; byte j holds elements 2j (low), 2j + 1
             b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
@@ -522,7 +557,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             bias = 8
             b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
             scale = ld_d(hv, nh, f"%{p}sa", 0, p, "d")
-        elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs"):
+        elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs", "iq2s"):
             (gw, s0, s1), scale = decode_grid(f, S, p, wv, hv, nb, boff, lp)
             q = signed_grid(p, gw, s0, s1)
             bias = 64
@@ -624,6 +659,41 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
                 b(f"    %{p}ksx{li} = index.cast %{p}ks{li}i : i32 to index")
                 sg.append(ld_u8("%t_ksigns", 128, f"%{p}ksx{li}", p, f"ks{li}"))
             b(f"    %{p}gw = vector.from_elements " + ", ".join(words) + " : vector<4xi32>")
+            q = (f"%{p}gw", sg[0], sg[1])
+            b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
+            sb_ = ld_u8(wv, nb, f"%{p}sa", p, "scb")
+            b(f"    %{p}nw = scalar.shrui {sb_}, %{lp}sls : i32")
+            b(f"    %{p}nib = scalar.andi %{p}nw, {e.cs(15)} : i32")
+            b(f"    %{p}nf = scalar.uitofp %{p}nib : i32 to f32")
+            b(f"    %{p}nh = scalar.addf %{p}nf, {e.cs(0.5, 'f32')} : f32")
+            d = ld_d(hv, nh, boff, 0, p, "d")
+            b(f"    %{p}dn = scalar.mulf {d}, %{p}nh : f32")
+            b(f"    %{p}scale = scalar.mulf %{p}dn, {e.cs(0.25, 'f32')} : f32")
+            return q, f"%{p}scale"
+        if f == "iq2s":
+            b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
+            qv = ld(wv, nb, f"%{p}qa", p, "qv", 2)                       # qs[4 ib32 + l], l = l0, l0 + 1
+            b(f"    %{p}hqa = index.add {boff}, %{lp}ho : index")
+            qh = ld_u8(wv, nb, f"%{p}hqa", p, "qh")
+            words = []
+            for qq in (0, 1):
+                b(f"    %{p}qi8_{qq} = vector.extract {qv}[{qq}] : vector<2xi8> -> i8")
+                b(f"    %{p}qi_{qq} = scalar.extui %{p}qi8_{qq} : i8 to i32")
+                b(f"    %{p}qhs_{qq} = scalar.shli {qh}, %{lp}qsA{qq} : i32")
+                b(f"    %{p}qhb_{qq} = scalar.andi %{p}qhs_{qq}, {e.cs(768)} : i32")
+                b(f"    %{p}gi_{qq} = scalar.ori %{p}qi_{qq}, %{p}qhb_{qq} : i32")
+                b(f"    %{p}gx_{qq} = index.cast %{p}gi_{qq} : i32 to index")
+                b(f"    %{p}gx2_{qq} = index.mul %{p}gx_{qq}, {e.ci(2)} : index")   # 8-byte grid entry
+                w2 = ld("%t_grid_iq2s", 2048, f"%{p}gx2_{qq}", p, f"g{qq}", 2, "i32")
+                for h in (0, 1):
+                    b(f"    %{p}g{qq}_{h} = vector.extract {w2}[{h}] : vector<2xi32> -> i32")
+                    words.append(f"%{p}g{qq}_{h}")
+            b(f"    %{p}gw = vector.from_elements " + ", ".join(words) + " : vector<4xi32>")
+            sg = []
+            for qq in (0, 1):
+                b(f"    %{p}sga{qq} = index.add {boff}, %{lp}sgo : index")
+                b(f"    %{p}sgb{qq} = index.add %{p}sga{qq}, {e.ci(qq)} : index")
+                sg.append(ld_u8(wv, nb, f"%{p}sgb{qq}", p, f"sgn{qq}"))
             q = (f"%{p}gw", sg[0], sg[1])
             b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
             sb_ = ld_u8(wv, nb, f"%{p}sa", p, "scb")
@@ -766,7 +836,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
         o(f"  %rav = buffer.view %rawq_na[%base] : buffer -> view<{M}xf32>")
         o("  %rsv = buffer.view %rsg_na[%base] : buffer -> view<512xf32>")
         o(f"  %rcv = buffer.view %rcnt_na[%base] : buffer -> view<{M // 256}xi32>")
-    if "iq4xs" in fmts:
+    if "iq4xs" in fmts or "iq4nl" in fmts:
         o("\n".join(f"  %kvu{i} = scalar.constant {v + 128 - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)))
         o("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
     for k in sorted(e.consts, key=lambda n: (not n.startswith("%c"), n)):
@@ -956,7 +1026,7 @@ def gen_bands(fmts, Ms, K, R=2, W=4, name="yah_gemv", peel=0):
         ty, n = TABLES[t]
         o(f"  %t_{t} = buffer.view %{t}_na[%base] : buffer -> view<{n}x{ty}>")
     o(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{K}xf32>")
-    if "iq4xs" in fmts:
+    if "iq4xs" in fmts or "iq4nl" in fmts:
         o("\n".join(f"  %kvu{i} = scalar.constant {v + 128 - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)))
         o("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
     for k in sorted(e.consts, key=lambda n: (not n.startswith("%c"), n)):

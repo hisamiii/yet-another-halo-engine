@@ -28,9 +28,9 @@ HALRUN = os.path.join(ROOT, "engine", "build", "hal_run")
 GPURUN = os.path.join(ROOT, "engine", "run", "gpu_run.sh")
 ONLY = os.environ.get("GEMV_ONLY", "")             # regex on the case tag
 BENCH = int(os.environ.get("GEMV_BENCH", "0"))   # N: also time N dispatches per kernel
-TABLE_DIR = os.environ.get("YAH_TABLE_DIR", "/home/q/yah-hal-p71")
+TABLE_DIR = os.environ.get("YAH_TABLE_DIR", os.path.join(HERE, "..", "tables"))
 TABLE_FILE = {"grid_iq3s": "grid_iq3s.bin", "grid_iq3xxs": "grid_iq3xxs.bin", "grid_iq2xxs": "grid_iq2xxs.bin",
-              "grid_iq2xs": "grid_iq2xs.bin", "ksigns": "ksigns_iq2xxs.bin"}
+              "grid_iq2xs": "grid_iq2xs.bin", "ksigns": "ksigns_iq2xs.bin", "grid_iq2s": "grid_iq2s.bin"}
 
 
 def run_kernel(model, work, tag, kind, fmts, M, K, tensors, x, y0=None, R=2, W=4):

@@ -181,6 +181,8 @@ Token halves (`LoomPrefill::RunDeltaNetHalves` / `RunAttentionHalves`, decoder-c
 
 `engine/model/loom_decoder.hpp` (`LoomDecoder`) is the single-token step. `loom_decode` feeds a prompt through it one token at a time; `loom_forward_pp` with `YAH_GEN` runs it after a prefill, on the prefill's KV pools and recurrent state. Decode reads all 12.40 GB of weights (token_embd excluded) once per token, so it is a bandwidth problem: the target is 240 GB/s.
 
+The GEMVs (`gen_gemv`) decode Q8_0, Q2_K-Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MQ4; `embed` (`gen_decode_misc`) reads an IQ4_XS, Q3_K (the Unsloth UD quants) or Q8_0 token_embd.
+
 ### Step, per layer
 
 1. `rmsnorm` (512 lanes).

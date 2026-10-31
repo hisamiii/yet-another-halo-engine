@@ -12,7 +12,7 @@
 // Head: rmsnorm -> output GEMV -> argmax into a device token stream (decode.txt "amax": inside the output GEMV).
 // MQ4 sets (decode.txt "rot"): the GEMV inputs are rotated; "normrot" / "swrot" do it inside the norm and the
 // SwiGLU GEMV instead of separate drot_* dispatches.
-// The next step's embedding kernel (IQ4_XS token_embd) reads that stream: steps queue back to back, no host round trip.
+// The next step's embedding kernel (IQ4_XS, Q3_K or Q8_0 token_embd) reads that stream: steps queue back to back, no host round trip.
 //
 // The recurrent state and the KV pools are external (LoomDecoderState) and use the prefill's layouts.
 // Use OwnState() for a prompt fed through decode, or bind the prefill's state (loom_forward_pp with YAH_GEN).
@@ -89,11 +89,11 @@ class LoomDecoder {
       if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
     }
     const std::uint32_t npg = T_ / 256;
-    // embed decodes IQ4_XS, or Q8_0 in the HFQ models' sets
-    if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != (rot_ ? 8u : 23u))
+    // embed decodes IQ4_XS, Q3_K (the UD quants), or Q8_0 in the HFQ models' sets
+    if (const auto et = static_cast<std::uint32_t>(Find("token_embd.weight")->type); et != (rot_ ? 8u : 23u) && et != 11u)
       throw LoomError("token_embd: its format does not match the decode set's embed (re-emit)");
-    const char* tnames[5] = {"grid_iq3s.bin", "grid_iq3xxs.bin", "grid_iq2xxs.bin", "grid_iq2xs.bin",
-                             "ksigns_iq2xs.bin"};
+    const char* tnames[6] = {"grid_iq3s.bin", "grid_iq3xxs.bin", "grid_iq2xxs.bin", "grid_iq2xs.bin",
+                             "ksigns_iq2xs.bin", "grid_iq2s.bin"};
     for (const char* tn : tnames) {
       const auto data = ReadAll(dir_ + "/" + tn);
       LoomBuffer& b = Alloc(data.size());
@@ -350,7 +350,7 @@ class LoomDecoder {
     std::uint32_t qk, bb, tables;
   };
   // GGML type -> GEMV name, block elements, block bytes, table bits.
-  // Table bits follow gen_gemv.TABLE_ORDER: grid_iq3s, grid_iq3xxs, grid_iq2xxs, grid_iq2xs, ksigns.
+  // Table bits follow gen_gemv.TABLE_ORDER: grid_iq3s, grid_iq3xxs, grid_iq2xxs, grid_iq2xs, ksigns, grid_iq2s.
   static bool FmtOf(std::uint32_t type, Fmt* f) {
     switch (type) {
       case 8:
@@ -380,8 +380,14 @@ class LoomDecoder {
       case 18:
         *f = {"iq3xxs", 256, 98, 2 | 16};
         return true;
+      case 20:
+        *f = {"iq4nl", 32, 18, 0};
+        return true;
       case 21:
         *f = {"iq3s", 256, 110, 1};
+        return true;
+      case 22:
+        *f = {"iq2s", 256, 82, 32};
         return true;
       case 23:
         *f = {"iq4xs", 256, 136, 0};
@@ -453,7 +459,7 @@ class LoomDecoder {
       b.push_back(TRef(w));
     }
     name += "_" + std::to_string(M) + "_" + std::to_string(K);
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 6; ++i)
       if (tbits & (1u << i)) b.push_back(tabs_[i]);
     if (x.size < std::size_t{K} * 4 || y.size < std::size_t{M} * 4) throw LoomError("GEMV operand too small: " + name);
     b.push_back({x.handle, 0, std::size_t{K} * 4});
@@ -495,7 +501,7 @@ class LoomDecoder {
       rows += M;
       b.push_back(TRef(ws[i]));
     }
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 6; ++i)
       if (tbits & (1u << i)) b.push_back(tabs_[i]);
     b.push_back({normed_->handle, 0, std::size_t{K} * 4});
     for (std::size_t i = 0; i < ws.size(); ++i) {
