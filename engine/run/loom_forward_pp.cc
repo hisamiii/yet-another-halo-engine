@@ -97,18 +97,35 @@ int main(int argc, char** argv) {
   // A bench run holds ~18.4 GB of the ~31 GB the OS sees (plus GTT): if memory runs out, the OOM killer takes this
   // process, not the desktop's apps
   if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) std::fputs("1000", f), std::fclose(f);
+  // YAH_LOAD_TIMES=1: print each load phase's time
+  const bool times = std::getenv("YAH_LOAD_TIMES") != nullptr;
+  const auto epoch_ms = [] {
+    return std::chrono::duration<double, std::milli>(std::chrono::system_clock::now().time_since_epoch()).count();
+  };
+  if (times) std::fprintf(stderr, "load: main at %.0f\n", epoch_ms());
+  auto lt = std::chrono::steady_clock::now();
+  const auto lap = [&](const char* what) {
+    const auto n = std::chrono::steady_clock::now();
+    if (times)
+      std::fprintf(stderr, "load: %-12s %7.1f ms\n", what, std::chrono::duration<double, std::milli>(n - lt).count());
+    lt = n;
+  };
   try {
     auto gguf = yah::core::Gguf::OpenResident(argv[1]);
+    lap("model");
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
     std::vector<std::uint32_t> ids = ParseIds(ids_path);
     LoomDevice gpu;
+    lap("device");
     // The layers queue ~950 dispatches and wait once: the runtime wait would busy-poll a host core the whole time.
     gpu.SetSleepSync(200);
     // YAH_NPU=1: the NPU computes the trailing rows of the set's split GEMMs (a set emitted with YAH_NPU_SPLIT).
     const char* npu_env = std::getenv("YAH_NPU");
     const bool npu_on = npu_env && std::string(npu_env) == "1";
     LoomWeights weights(gpu, gguf, npu_on);
+    lap("weights");
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
+    lap("prefill set");
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
     if (npu_on) {
       const auto plan = pf.npu_plan();
@@ -117,11 +134,14 @@ int main(int argc, char** argv) {
         return 2;
       }
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
+      lap("npu split");
       pf.EnableNpu(npu.get());
+      lap("npu enable");
       // full chunks only: every split GEMM leaves the NPU's rows to the NPU, so the model rows its copies replace go
       if (want && want % pf.chunk() == 0)
         std::fprintf(stderr, "loom_forward_pp: released %.2f GB of model rows the NPU reads from its copies\n",
                      weights.DropUnread(gpu, gguf, pf.npu_only()) / 1e9);
+      lap("npu drop");
     }
     const std::uint32_t B = pf.chunk(), T_run = want ? want : B;
     if (T_run == 0 || T_run > pf.context()) {
@@ -172,6 +192,7 @@ int main(int argc, char** argv) {
     const std::uint32_t slot_at = std::getenv("YAH_SLOT_AT") ? std::atoi(std::getenv("YAH_SLOT_AT")) : n_chunks;
 
     gpu.Synchronize();
+    lap("pre-run");
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
     const bool chunk_ms = std::getenv("YAH_CHUNK_MS") != nullptr;
@@ -292,6 +313,8 @@ int main(int argc, char** argv) {
       std::fclose(fa);
       std::printf("all_logits rows=%zu from=%u\n", rows, logits_from);
     }
+    lap("run + out");
+    if (times) std::fprintf(stderr, "load: return at %.0f\n", epoch_ms());
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "loom_forward_pp: %s\n", error.what());

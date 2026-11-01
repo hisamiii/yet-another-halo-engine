@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -320,7 +322,17 @@ void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
 
 Gguf Gguf::OpenResident(const std::string& path) {
   if (IsHfq(path)) return OpenHfq(path, true);
+  // YAH_LOAD_TIMES=1: print each load phase's time
+  const bool times = std::getenv("YAH_LOAD_TIMES") != nullptr;
+  auto t = std::chrono::steady_clock::now();
+  const auto lap = [&](const char* what) {
+    const auto n = std::chrono::steady_clock::now();
+    if (times)
+      std::fprintf(stderr, "load: %-12s %7.1f ms\n", what, std::chrono::duration<double, std::milli>(n - t).count());
+    t = n;
+  };
   Gguf g = Open(path);
+  lap("gguf open");
   constexpr std::size_t kHuge = std::size_t{2} << 20;
   const std::size_t bytes = (g.size_ + kHuge - 1) & ~(kHuge - 1);
   std::uint8_t* p = Reserve(bytes, path);
@@ -330,7 +342,9 @@ Gguf Gguf::OpenResident(const std::string& path) {
     ::munmap(p, bytes);
     throw;
   }
+  lap("gguf read");
   if (::mlock(p, bytes) != 0) std::fprintf(stderr, "gguf: cannot lock the model in memory (RLIMIT_MEMLOCK)\n");
+  lap("gguf mlock");
   ::munmap(g.base_, g.map_bytes_);
   g.base_ = p, g.map_bytes_ = bytes;
   return g;
