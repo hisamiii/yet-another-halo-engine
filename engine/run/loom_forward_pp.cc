@@ -111,8 +111,9 @@ int main(int argc, char** argv) {
     lt = n;
   };
   try {
-    auto gguf = yah::core::Gguf::OpenResident(argv[1]);
-    lap("model");
+    // The model reads in the background while the device, the set and the NPU calls are set up (none reads the bytes)
+    auto gguf = yah::core::Gguf::OpenStreaming(argv[1]);
+    lap("model open");
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
     std::vector<std::uint32_t> ids = ParseIds(ids_path);
     LoomDevice gpu;
@@ -137,10 +138,16 @@ int main(int argc, char** argv) {
       lap("npu split");
       pf.EnableNpu(npu.get());
       lap("npu enable");
-      // full chunks only: every split GEMM leaves the NPU's rows to the NPU, so the model rows its copies replace go
-      if (want && want % pf.chunk() == 0)
-        std::fprintf(stderr, "loom_forward_pp: released %.2f GB of model rows the NPU reads from its copies\n",
-                     weights.DropUnread(gpu, gguf, pf.npu_only()) / 1e9);
+    }
+    // full chunks only: every split GEMM leaves the NPU's rows to the NPU, so the model rows its copies replace are
+    // neither read (the rest of the background read skips them) nor kept
+    const bool drop = npu && want && want % pf.chunk() == 0;
+    if (drop) gguf.SkipRead(pf.npu_only());
+    gguf.WaitReadAll();
+    lap("model read");
+    if (drop) {
+      std::fprintf(stderr, "loom_forward_pp: released %.2f GB of model rows the NPU reads from its copies\n",
+                   weights.DropUnread(gpu, gguf, pf.npu_only()) / 1e9);
       lap("npu drop");
     }
     const std::uint32_t B = pf.chunk(), T_run = want ? want : B;

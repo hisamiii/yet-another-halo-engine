@@ -6,6 +6,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -152,6 +156,22 @@ std::uint32_t BlockBytes(GgmlType type) {
   return type == GgmlType::kMQ4G256 ? 136 : kTraits[static_cast<std::size_t>(type)].bytes;
 }
 
+struct Gguf::Reader {
+  struct Job {   // ReadAlso: a file's consecutive bytes into spans of dst
+    std::string path;
+    std::uint8_t* dst;
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+  };
+  std::mutex m;
+  mutable std::condition_variable cv;
+  std::size_t done = 0;   // model file bytes read or skipped from the start
+  std::vector<std::pair<std::size_t, std::size_t>> skip;   // model file offsets [begin, end), sorted
+  std::deque<Job> jobs;
+  bool closed = false, stop = false, failed = false;
+  std::string error;
+  std::thread thread;
+};
+
 Gguf::Gguf(Gguf&& other) noexcept {
   *this = std::move(other);
 }
@@ -167,6 +187,7 @@ Gguf& Gguf::operator=(Gguf&& other) noexcept {
     data_offset_ = other.data_offset_;
     tensors_ = std::move(other.tensors_);
     meta_ = std::move(other.meta_);
+    reader_ = std::move(other.reader_);
     other.base_ = nullptr;
     other.size_ = 0;
     other.map_bytes_ = 0;
@@ -180,6 +201,15 @@ Gguf::~Gguf() {
 }
 
 void Gguf::Close() {
+  if (reader_) {   // (an unfinished background read: stop it before its memory goes)
+    {
+      std::lock_guard<std::mutex> l(reader_->m);
+      reader_->stop = true;
+      reader_->cv.notify_all();
+    }
+    reader_->thread.join();
+    reader_.reset();
+  }
   if (base_ != nullptr) {
     ::munmap(base_, map_bytes_);
     base_ = nullptr;
@@ -318,6 +348,140 @@ void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
   if (hi <= lo) return;
   ::munlock(reinterpret_cast<void*>(lo), hi - lo);
   ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
+}
+
+Gguf Gguf::OpenStreaming(const std::string& path) {
+  if (IsHfq(path)) return OpenHfq(path, true);
+  Gguf g = Open(path);
+  constexpr std::size_t kHuge = std::size_t{2} << 20;
+  const std::size_t bytes = (g.size_ + kHuge - 1) & ~(kHuge - 1);
+  std::uint8_t* p = Reserve(bytes, path);
+  ::munmap(g.base_, g.map_bytes_);
+  g.base_ = p, g.map_bytes_ = bytes;
+  g.StartRead();
+  return g;
+}
+
+namespace {
+
+// pread [at, at + len) of fd into dst; false on an error or a short file
+bool ReadSpan(int fd, std::uint8_t* dst, std::size_t len, std::size_t at) {
+  for (std::size_t done = 0; done < len;) {
+    const ssize_t n = ::pread(fd, dst + done, len - done, static_cast<off_t>(at + done));
+    if (n <= 0) return false;
+    done += static_cast<std::size_t>(n);
+  }
+  return true;
+}
+
+// a file's bytes are read once into memory that keeps them: drop its cached pages (ReadAll)
+void ReadFileJob(const std::string& path, std::uint8_t* dst,
+                 const std::vector<std::pair<std::size_t, std::size_t>>& spans) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) throw std::runtime_error("cannot open " + path);
+  std::size_t at = 0;
+  for (const auto& [o, len] : spans) {
+    if (!ReadSpan(fd, dst + o, len, at)) {
+      ::close(fd);
+      throw std::runtime_error("short read of " + path);
+    }
+    at += len;
+  }
+  ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+  ::close(fd);
+}
+
+}  // namespace
+
+void Gguf::StartRead() {
+  reader_ = std::make_shared<Reader>();
+  // One thread reads everything, in 64 MB steps of the model (fine-grained progress for the waiters at the disk's
+  // speed): queued file jobs go first, so the setup that queues them and names the spans to skip runs early.
+  reader_->thread = std::thread([r = reader_.get(), fd = fd_, p = base_, size = size_] {
+    constexpr std::size_t kStep = std::size_t{64} << 20;
+    std::size_t off = 0;
+    std::unique_lock<std::mutex> l(r->m);
+    try {
+      for (;;) {
+        if (r->stop) return;
+        if (!r->jobs.empty()) {
+          Reader::Job job = std::move(r->jobs.front());
+          r->jobs.pop_front();
+          l.unlock();
+          ReadFileJob(job.path, job.dst, job.spans);
+          l.lock();
+          continue;
+        }
+        if (off >= size) {
+          r->done = size;
+          r->cv.notify_all();
+          if (r->closed) return;
+          r->cv.wait(l, [&] { return r->stop || r->closed || !r->jobs.empty(); });
+          continue;
+        }
+        std::size_t end = std::min(off + kStep, size);
+        for (const auto& [b, e] : r->skip) {
+          if (b <= off && off < e) off = std::min(e, size);   // (sorted: a span starting at the new off is next)
+          else if (off < b) end = std::min(end, b);
+        }
+        if (off >= end) {
+          r->done = off;
+          r->cv.notify_all();
+          continue;
+        }
+        l.unlock();
+        if (!ReadSpan(fd, p + off, end - off, off)) throw std::runtime_error("gguf: background read failed");
+        ::posix_fadvise(fd, static_cast<off_t>(off), static_cast<off_t>(end - off), POSIX_FADV_DONTNEED);
+        // locked step by step as OpenResident locks the whole: a range a device copied and released (ReleaseData) must
+        // stay released, and one lock of the whole at the end would fault every released page back in
+        ::mlock(p + off, end - off);
+        l.lock();
+        r->done = off = end;
+        r->cv.notify_all();
+      }
+    } catch (const std::exception& e) {
+      if (!l.owns_lock()) l.lock();
+      r->failed = true, r->error = e.what();
+      r->cv.notify_all();
+    }
+  });
+}
+
+void Gguf::WaitRead(std::size_t end) const {
+  if (!reader_) return;
+  const std::size_t want = std::min<std::size_t>(data_offset_ + end, size_);
+  std::unique_lock<std::mutex> l(reader_->m);
+  reader_->cv.wait(l, [&] { return reader_->done >= want || reader_->failed; });
+  if (reader_->failed) throw std::runtime_error(reader_->error);
+}
+
+void Gguf::WaitReadAll() {
+  if (!reader_) return;
+  {
+    std::lock_guard<std::mutex> l(reader_->m);
+    reader_->closed = true;
+    reader_->cv.notify_all();
+  }
+  reader_->thread.join();
+  const bool failed = reader_->failed;
+  const std::string error = reader_->error;
+  reader_.reset();
+  if (failed) throw std::runtime_error(error);
+}
+
+void Gguf::SkipRead(const std::vector<std::pair<std::size_t, std::size_t>>& spans) const {
+  if (!reader_) return;
+  std::lock_guard<std::mutex> l(reader_->m);
+  for (const auto& [o, n] : spans) reader_->skip.emplace_back(data_offset_ + o, data_offset_ + o + n);
+  std::sort(reader_->skip.begin(), reader_->skip.end());
+}
+
+void Gguf::ReadAlso(const std::string& path, std::uint8_t* dst,
+                    const std::vector<std::pair<std::size_t, std::size_t>>& spans) const {
+  if (!reader_) return ReadFileJob(path, dst, spans);
+  std::lock_guard<std::mutex> l(reader_->m);
+  reader_->jobs.push_back({path, dst, spans});
+  reader_->cv.notify_all();
 }
 
 Gguf Gguf::OpenResident(const std::string& path) {

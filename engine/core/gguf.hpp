@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yah::core {
@@ -80,6 +82,19 @@ class Gguf {
   // device that pins it for writing shares these pages (no copy-on-write copies). Needs RLIMIT_MEMLOCK (a warning
   // when the kernel refuses the lock).
   static Gguf OpenResident(const std::string& path);
+  // OpenResident with the read on a background thread, so setup that needs only the metadata, or imports, pins or
+  // points into the memory without reading it, overlaps the disk. Each read step is locked as it lands (OpenResident
+  // locks the whole). WaitRead(end): the tensor data before `end` is read (skipped spans count as read); WaitReadAll:
+  // the whole file and every ReadAlso is. Readers of the bytes wait first; no device reads them before WaitReadAll.
+  static Gguf OpenStreaming(const std::string& path);
+  void WaitRead(std::size_t end) const;
+  void WaitReadAll();
+  // Tensor-data spans (offset, bytes) nothing will read: the background read skips the parts it has not reached.
+  void SkipRead(const std::vector<std::pair<std::size_t, std::size_t>>& spans) const;
+  // Another file's consecutive bytes into the spans (offset in dst, bytes) of dst, on the background read ahead of the
+  // model's unread rest (WaitReadAll waits for it too); without one, read now.
+  void ReadAlso(const std::string& path, std::uint8_t* dst,
+                const std::vector<std::pair<std::size_t, std::size_t>>& spans) const;
   Gguf(Gguf&& other) noexcept;
   Gguf& operator=(Gguf&& other) noexcept;
   Gguf(const Gguf&) = delete;
@@ -111,6 +126,8 @@ class Gguf {
   // 2 MB aligned anonymous memory of at least `bytes` (a multiple of 2 MB) for a resident copy.
   static std::uint8_t* Reserve(std::size_t bytes, const std::string& path);
   void ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) const;
+  struct Reader;   // OpenStreaming's background read
+  void StartRead();
 
   std::uint8_t* base_{nullptr};
   std::size_t size_{0};
@@ -120,6 +137,7 @@ class Gguf {
   std::uint64_t data_offset_{0};
   std::vector<TensorInfo> tensors_;
   std::map<std::string, MetadataValue> meta_;
+  std::shared_ptr<Reader> reader_;
 };
 
 }  // namespace yah::core

@@ -3236,21 +3236,10 @@ class LoomPrefill {
                                const std::vector<std::pair<std::size_t, std::size_t>>& spans) {
     if (const auto it = bfp_.find(file); it != bfp_.end()) return it->second;
     const std::string path = dir_ + "/" + file;
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) throw LoomError("cannot open " + path);
     void* p = ::mmap(nullptr, bytes + 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw LoomError("prefill: no memory for " + path);
-    std::size_t at = 0;
-    for (const auto& [o, len] : spans) {
-      for (std::size_t done = 0; done < len;) {
-        const ssize_t n = ::pread(fd, static_cast<char*>(p) + o + done, len - done, static_cast<off_t>(at + done));
-        if (n <= 0) throw LoomError("prefill: short read of " + path);
-        done += static_cast<std::size_t>(n);
-      }
-      at += len;
-    }
-    ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-    ::close(fd);
+    // (on the model's background read when it streams: the NPU only registers these pages before the run)
+    gguf_.ReadAlso(path, static_cast<std::uint8_t*>(p), spans);
     return bfp_[file] = static_cast<std::uint8_t*>(p);
   }
   const std::uint8_t* BfpRows(const std::string& name, std::size_t bytes) {

@@ -599,6 +599,7 @@ class LoomWeights {
       size_t end = spans[i].second;
       for (++i; i < spans.size() && spans[i].second - begin <= kChunk; ++i) end = std::max(end, spans[i].second);
       LoomBuffer buffer = gpu.Allocate(end - begin + kPad);
+      gguf.WaitRead(end);   // (Gguf::OpenStreaming: each copy follows the read)
       gpu.H2D(buffer, gguf.tensor_data_base() + begin, end - begin);
       // (token_embd's rows stay on the host: a set whose embed.hal does not read its format embeds on the host)
       const core::TensorInfo* te = gguf.Find("token_embd.weight");
