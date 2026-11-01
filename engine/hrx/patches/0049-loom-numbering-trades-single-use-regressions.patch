@@ -1,0 +1,82 @@
+Loom: final register numbering accepts a lower total preference cost even when a single use gets worse. With the
+register file packed (an IQ4_XS fused ffn at 192/192 VGPRs, where 0031's instruction-aware first fit loses the 192 tier
+and is dropped) every bank-improving block permutation also moves some VALU operand, so the per-use veto left all 128
+WMMAs with A, B and C in one bank (score 393 -> 393; now 278). Bit-identical results, VGPR counts unchanged in every
+GEMM HAL; pp2048 GPU-only SQ cycles -0.3% (iq3s swiglu / iq3xxs kres -2.5%, iq3s kstore -1.7%; iq4xs kres +0.5%).
+--- a/loom/src/loom/codegen/low/allocation/numbering.c
++++ b/loom/src/loom/codegen/low/allocation/numbering.c
+@@ -68,8 +68,6 @@
+   uint32_t* incidences;
+   // Original concatenated unit per binding, or UINT32_MAX outside the search.
+   uint32_t* locations;
+-  // Original costs bounding every accepted preference use.
+-  uint32_t* limits;
+   // Accepted per-use costs.
+   uint32_t* scores;
+   // Trial per-use costs.
+@@ -82,8 +80,6 @@
+   uint32_t affected_count;
+   // Number of trial components violating their retained domain.
+   uint32_t illegal_blocks;
+-  // Number of trial uses exceeding their original cost.
+-  uint32_t regressing_uses;
+   // Largest retained location period minus one, bounding moved run widths.
+   uint32_t maximum_move_width;
+   // Accepted weighted objective, summed without per-use saturation overflow.
+@@ -471,8 +467,7 @@
+       ++state->offsets[block + 1];
+       state->blocks[block].period_mask |= period_mask;
+     }
+-    state->scores[i] = state->limits[i] =
+-        loom_low_numbering_score_use(state, i, state->bases);
++    state->scores[i] = loom_low_numbering_score_use(state, i, state->bases);
+     state->score += state->scores[i];
+   }
+   for (uint32_t i = 0; i < state->block_count; ++i) {
+@@ -538,8 +533,6 @@
+         loom_low_numbering_score_use(state, use_index, state->trial_bases);
+     state->trial_scores[use_index] = after;
+     state->trial_score = state->trial_score - before + after;
+-    state->regressing_uses -= before > state->limits[use_index];
+-    state->regressing_uses += after > state->limits[use_index];
+   }
+ }
+ 
+@@ -573,7 +566,7 @@
+                  use_count * sizeof(uint32_t));
+           state->work += block_count + use_count;
+           state->trial_score = state->score;
+-          state->illegal_blocks = state->regressing_uses = 0;
++          state->illegal_blocks = 0;
+           const uint32_t distance = direction == 0 ? begin : block_count - end;
+           for (uint32_t step = 0;
+                step < distance && state->work < state->work_limit; ++step) {
+@@ -598,7 +591,9 @@
+                     &state->blocks[crossed], state->trial_bases[crossed])) {
+               break;
+             }
+-            if (state->illegal_blocks != 0 || state->regressing_uses != 0) {
++            // A lower total may worsen single uses: in a packed register file
++            // every bank-improving permutation also moves some other operand.
++            if (state->illegal_blocks != 0) {
+               continue;
+             }
+             const uint32_t destination =
+@@ -771,7 +766,7 @@
+   }
+   const uint64_t word_count = (uint64_t)state.extent * 6 + 1 +
+                               (uint64_t)preferences->binding_count * 2 +
+-                              (uint64_t)preferences->use_count * 5;
++                              (uint64_t)preferences->use_count * 4;
+   const uint64_t workspace_size =
+       (uint64_t)state.extent * sizeof(*state.blocks) +
+       word_count * sizeof(uint32_t);
+@@ -801,8 +796,6 @@
+   cursor += preferences->binding_count;
+   state.locations = cursor;
+   cursor += preferences->binding_count;
+-  state.limits = cursor;
+-  cursor += preferences->use_count;
+   state.scores = cursor;
+   cursor += preferences->use_count;
+   state.trial_scores = cursor;
