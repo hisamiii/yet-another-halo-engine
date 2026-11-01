@@ -105,6 +105,10 @@ class Tile:
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
     ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
                                # (the weight binding spans ffn_gate and the ffn_up right after it: up row r is row m_rows + r)
+    epiord: str = ""           # ffn epilogue order "<silu>_<g>_<j>": silu of all fragments up front (fwd / rev) or each
+                               # right before its store (lazy), stores over row groups g and token columns j forward (gf / jf)
+                               # or reversed (gr / jr); "" = fwd_gf_jf. Same ops, but the order steers the register allocator:
+                               # with every WMMA's A, B and C starting in one VGPR bank (% 4) the kernel runs ~3% slower
     tallepi: bool = False      # afrag kstore / kres: the LDS epilogue in 16-row slabs in the weight tile (else fragment stores)
     tout: bool = False         # swiglu: store the output fragment-major (atiled layout over K = rows) for an afrag consumer
     stg_minwg: int = STG_MINWG  # smallest grid that staggers (afrag: every grid; lockstep costs it 6-9%)
@@ -1685,22 +1689,28 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
     e("  %negone = scalar.constant -1.0 : f32")
     rcp_consts(e)
     e("  %one = scalar.constant 1.0 : f32")
-    for i in range(FG):
-        for j in range(FN):
-            g, u = i * FN + j, (i + FG) * FN + j
-            xs = []
-            for x in range(8):
-                y = f"{i}_{j}_{x}"
-                e(f"  %fg_{y} = vector.extract %acc{g}[{x}] : {V8} -> f32")
-                e(f"  %fu_{y} = vector.extract %acc{u}[{x}] : {V8} -> f32")
-                e(f"  %fng_{y} = scalar.mulf %fg_{y}, %negone : f32")
-                e(f"  %fex_{y} = scalar.expf<afn> %fng_{y} : f32")
-                e(f"  %fdn_{y} = scalar.addf %one, %fex_{y} : f32")
-                recip1(e, f"%fiv_{y}", f"%fdn_{y}")
-                e(f"  %fsg_{y} = scalar.mulf %fg_{y}, %fiv_{y} : f32")
-                e(f"  %fac_{y} = scalar.mulf %fsg_{y}, %fu_{y} : f32")
-                xs.append(f"%fac_{y}")
-            e(f"  %fo{i}_{j} = vector.from_elements {', '.join(xs)} : {V8}")
+
+    def silu(i, j):
+        g, u = i * FN + j, (i + FG) * FN + j
+        xs = []
+        for x in range(8):
+            y = f"{i}_{j}_{x}"
+            e(f"  %fg_{y} = vector.extract %acc{g}[{x}] : {V8} -> f32")
+            e(f"  %fu_{y} = vector.extract %acc{u}[{x}] : {V8} -> f32")
+            e(f"  %fng_{y} = scalar.mulf %fg_{y}, %negone : f32")
+            e(f"  %fex_{y} = scalar.expf<afn> %fng_{y} : f32")
+            e(f"  %fdn_{y} = scalar.addf %one, %fex_{y} : f32")
+            recip1(e, f"%fiv_{y}", f"%fdn_{y}")
+            e(f"  %fsg_{y} = scalar.mulf %fg_{y}, %fiv_{y} : f32")
+            e(f"  %fac_{y} = scalar.mulf %fsg_{y}, %fu_{y} : f32")
+            xs.append(f"%fac_{y}")
+        e(f"  %fo{i}_{j} = vector.from_elements {', '.join(xs)} : {V8}")
+
+    pre, gr, jr = (t.epiord or "fwd_gf_jf").split("_")
+    if pre != "lazy":
+        order = [(i, j) for i in range(FG) for j in range(FN)]
+        for i, j in (order if pre == "fwd" else reversed(order)):
+            silu(i, j)
     e(f"  %et_cs = index.constant {sr + EPAD} : index")
     e("  %et_lay = encoding.layout.strided [%c1, %et_cs] : encoding<layout>")
     e(f"  %et_wb = index.constant {(sr + EPAD) * 16 * 4} : index")
@@ -1719,11 +1729,13 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
     e("  %et_rowb = index.add %m_origin, %et_h : index")
     if t.tout:
         e(f"  %et_mt = index.div {orw()}, %c16 : index")
-    for g in range(FG):
+    for g in (reversed(range(FG)) if gr == "gr" else range(FG)):
         e(f"  %et_gr{g} = index.constant {g * sr} : index")
         e(f"  %et_row{g} = index.add %et_rowb, %et_gr{g} : index")
-        for j in range(FN):
+        for j in (reversed(range(FN)) if jr == "jr" else range(FN)):
             q0 = f"{g}_{j}"
+            if pre == "lazy":
+                silu(g, j)
             e("  scf.schedule.fence")
             e(f"  vector.fragment.store<result> %fo{g}_{j}, %et_view[%c0, %c0] shape [%m, %n] : {V8}, view<{sr}x16xf32, %et_lay>")
             e(f"  %et_tc{q0} = index.constant {16 * j} : index")
