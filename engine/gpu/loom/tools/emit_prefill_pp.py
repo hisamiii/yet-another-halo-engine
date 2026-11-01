@@ -1029,8 +1029,9 @@ AF = {
 # IQ4_XS -0.9%, IQ3_XXS -3.1%.
 AF_FFN = {
     "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True, f16s=True),
-    # IQ4_XS: the default epilogue order left every WMMA's A, B and C in VGPR bank 0 (-3.3%, bit-identical)
-    "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False, epiord="rev_gf_jr"),
+    # IQ4_XS: the order steers the hot loop's WMMA banks (with HRX 0049 numbering): rev_gf_jf leaves A, B, C + 1 and
+    # C in distinct banks (-2.2% vs rev_gf_jr; the default order shared banks, +3%), bit-identical
+    "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False, epiord="rev_gf_jf"),
     # IQ3_XXS: f16s without a sign table (-1.0%; with the packed sgtw=1 table +0.9..+1.6%, which itself had been -0.5%
     # over the plain f16p form; the two-word table +1.3%: LDS bank conflicts 13.9 -> 23.8 M cycles, LDS issue waits +62%)
     "iq3xxs": dict(AF_PIPE, lhs_stream=1, swepi=False, f16p=True, gaddr=True, f16s=True),
