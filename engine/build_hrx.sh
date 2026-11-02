@@ -28,8 +28,11 @@ cmake -S "$root/engine" -B "$root/engine/build" -DCMAKE_BUILD_TYPE=Release -DCMA
     -DCMAKE_CXX_FLAGS_RELEASE="${cxxflags[*]:1}" >/dev/null
 cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # The runners below are not CMake targets. Build them here so a stale binary never runs against a new HAL set.
+# They compile in parallel (bg); the wait below fails the build if any of them fails.
+pids=()
+bg() { "$@" & pids+=($!); }
 # Single-kernel timing harness.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
     -o "$root/engine/build/hal_bench" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # NPU (libamdf + the xdna loader, static from the HRX build): the prefill driver's NPU split (YAH_NPU), its harness and
@@ -54,38 +57,39 @@ for a in experimental/xdna/libiree_experimental_xdna_amdf_status.a experimental/
 done
 npu_flags=("${npu_inc[@]}" -DIREE_ALLOCATOR_SYSTEM_CTL=iree_allocator_libc_ctl)
 # Prefill driver.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/loom_forward_pp.cc" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/loom_forward_pp.cc" \
     -o "$root/engine/build/loom_forward_pp" "$root/engine/build/libyah_core.a" \
     -Wl,--start-group "${npu_libs[@]}" -Wl,--end-group -L"$libhrx" -lhrx -licuuc -lpthread -lm -ldl
 # Decode driver (tools/emit_decode.py sets).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
     -o "$root/engine/build/loom_decode" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # Tile-GEMM variant bench for the autotuner (engine/tune).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/gemm_bench.cc" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/gemm_bench.cc" \
     -o "$root/engine/build/gemm_bench" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # One-dispatch correctness harness for generated kernels (tools/gemv_check.py).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
     -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
 # GPU / NPU split harness (tools/npu_split_check.py).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" \
     "$root/engine/run/npu_split_run.cc" -o "$root/engine/build/npu_split_run" "$root/engine/build/libyah_core.a" \
     -Wl,--start-group "${npu_libs[@]}" -Wl,--end-group -L"$libhrx" -lhrx -licuuc -lpthread -lm -ldl
 # The Responses API server (engine/serve).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" "${npu_flags[@]}" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" "${npu_flags[@]}" \
     "$root/engine/serve/yah_server.cc" "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
     "$root/engine/third_party/httplib/httplib.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
     -Wl,--start-group "${npu_libs[@]}" -Wl,--end-group -L"$libhrx" -lhrx -licuuc -lpthread -lm -ldl
 # Terminal chat client for yah_server.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_chat.cc" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_chat.cc" \
     "$root/engine/third_party/httplib/httplib.cpp" -o "$root/engine/build/yah_chat" -lpthread
 # Serving tests: the chat template golden and yah_server --fake over HTTP. No GPU, no libhrx.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_serve_test.cc" \
+bg "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_serve_test.cc" \
     "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
     "$root/engine/third_party/httplib/httplib.cpp" -o "$root/engine/build/yah_serve_test" -lpthread
+for p in "${pids[@]}"; do wait "$p"; done
 if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"
