@@ -41,6 +41,13 @@ IQ4_SC4 = True
 # Q3_F16S (Q3_K): quants as signed f16 subnormal pairs (see q3k_compute): loop VALU 281 -> 230; one process A/B
 # kstore -0.55..-0.99%, kqg -0.14%
 Q3_F16S = True
+# Q6DFMA: Q6_K's (d * sc) * q then fptrunc as fptrunc(fma(d * sc, q, -0.0)) per element (v_fma_mix; adding -0.0 keeps
+# every value and zero sign)
+Q6DFMA = True
+# Q6W: Q6_K's 6-bit quants assembled on 32-bit words (i8 vector shifts / masks lower byte by byte: 216 v_and in the
+# kstore loop) and read as 6-bit signed fields of cd ^ 0x20 (= cd - 32). With Q6DFMA kstore 64 loop VALU 669 -> 226,
+# bit-identical; pp2048 counters flat (the Q6_K riders were not decode-bound)
+Q6W = True
 IQ3_F16S = False   # set per tile (gen_gemm_tile Tile.f16s), see _vdec_pair_f16s
 IQ3_GADDR = False             # set per tile (gen_gemm_tile Tile.gaddr), see the grid / sign lookups in iq3*_compute
 IQ3_F16P_PERM = True          # the odd-byte pair as one v_perm (vector.shuffle with a zero word) instead of shift + and
@@ -1401,6 +1408,9 @@ def q6k_compute(v, gb):
         e(f"    %qhs8_{u} = scalar.trunci %qhs{u} : i32 to i8")
         e(f"    %qlsv{u} = vector.splat %qls8_{u} : vector<16xi8>")
         e(f"    %qhsv{u} = vector.splat %qhs8_{u} : vector<16xi8>")
+        if Q6W:
+            e(f"    %q6lsw{u} = vector.splat %qls{u} : vector<4xi32>")
+            e(f"    %q6hsw{u} = vector.splat %qhs{u} : vector<4xi32>")
         _col_of(e, u)
         e(f"    %colh{u} = index.add %col{u}, %c16 : index")
         for half, ql, qh, sc, col in (("lo", qla, qha, sa, f"%col{u}"), ("hi", qlb, qhb, sb, f"%colh{u}")):
@@ -1408,22 +1418,57 @@ def q6k_compute(v, gb):
             e(f"    %scf_{t} = scalar.sitofp {sc} : i8 to f32")
             e(f"    %dsc_{t} = scalar.mulf %d, %scf_{t} : f32")
             e(f"    %dsv_{t} = vector.splat %dsc_{t} : vector<16xf32>")
-            e(f"    %l0_{t} = vector.shrui {ql}, %qlsv{u} : vector<16xi8>")
-            e(f"    %l_{t} = vector.andi %l0_{t}, %m15v : vector<16xi8>")
-            e(f"    %h0_{t} = vector.shrui {qh}, %qhsv{u} : vector<16xi8>")
-            e(f"    %h1_{t} = vector.andi %h0_{t}, %m3v : vector<16xi8>")
-            e(f"    %h4_{t} = vector.shli %h1_{t}, %s4v : vector<16xi8>")
-            e(f"    %cd_{t} = vector.ori %l_{t}, %h4_{t} : vector<16xi8>")
-            e(f"    %bs_{t} = vector.subi %cd_{t}, %m32v : vector<16xi8>")
-            e(f"    %bf_{t} = vector.sitofp %bs_{t} : vector<16xi8> to vector<16xf32>")
-            e(f"    %vv_{t} = vector.mulf %dsv_{t}, %bf_{t} : vector<16xf32>")
-            e(f"    %hv_{t} = vector.fptrunc %vv_{t} : vector<16xf32> to vector<16xf16>")
+            if Q6W:
+                # on 32-bit words: cd = (ql >> qls) & 0x0f | ((qh >> qhs) & 3) << 4 per byte, x = cd ^ 0x20: bits 0..5 of
+                # each byte are cd - 32 as a 6-bit signed field (one v_bfe_i32 each)
+                e(f"    %q6lw_{t} = vector.bitcast {ql} : vector<16xi8> to vector<4xi32>")
+                e(f"    %q6hw_{t} = vector.bitcast {qh} : vector<16xi8> to vector<4xi32>")
+                e(f"    %q6ls_{t} = vector.shrui %q6lw_{t}, %q6lsw{u} : vector<4xi32>")
+                e(f"    %q6l_{t} = vector.andi %q6ls_{t}, %q6m0f : vector<4xi32>")
+                e(f"    %q6hs_{t} = vector.shrui %q6hw_{t}, %q6hsw{u} : vector<4xi32>")
+                e(f"    %q6h_{t} = vector.andi %q6hs_{t}, %q6m03 : vector<4xi32>")
+                e(f"    %q6h4_{t} = vector.shli %q6h_{t}, %q6s4w : vector<4xi32>")
+                e(f"    %q6cd_{t} = vector.ori %q6l_{t}, %q6h4_{t} : vector<4xi32>")
+                e(f"    %q6x_{t} = vector.xori %q6cd_{t}, %q6m20 : vector<4xi32>")
+                fs = []
+                for j in range(16):
+                    w, b = divmod(j, 4)
+                    if b == 0:
+                        e(f"    %q6xw_{t}_{w} = vector.extract %q6x_{t}[{w}] : vector<4xi32> -> i32")
+                    e(f"    %q6b_{t}_{j} = scalar.bitfield.extracts %q6xw_{t}_{w} {{offset = {8 * b}, width = 6}} : i32 -> i32")
+                    e(f"    %q6f_{t}_{j} = scalar.sitofp %q6b_{t}_{j} : i32 to f32")
+                    fs.append(f"%q6f_{t}_{j}")
+                e(f"    %bf_{t} = vector.from_elements {', '.join(fs)} : vector<16xf32>")
+            else:
+                e(f"    %l0_{t} = vector.shrui {ql}, %qlsv{u} : vector<16xi8>")
+                e(f"    %l_{t} = vector.andi %l0_{t}, %m15v : vector<16xi8>")
+                e(f"    %h0_{t} = vector.shrui {qh}, %qhsv{u} : vector<16xi8>")
+                e(f"    %h1_{t} = vector.andi %h0_{t}, %m3v : vector<16xi8>")
+                e(f"    %h4_{t} = vector.shli %h1_{t}, %s4v : vector<16xi8>")
+                e(f"    %cd_{t} = vector.ori %l_{t}, %h4_{t} : vector<16xi8>")
+                e(f"    %bs_{t} = vector.subi %cd_{t}, %m32v : vector<16xi8>")
+                e(f"    %bf_{t} = vector.sitofp %bs_{t} : vector<16xi8> to vector<16xf32>")
+            if Q6DFMA:
+                hs = []
+                for j in range(16):
+                    e(f"    %q6e_{t}_{j} = vector.extract %bf_{t}[{j}] : vector<16xf32> -> f32")
+                    e(f"    %q6m_{t}_{j} = scalar.fmaf %dsc_{t}, %q6e_{t}_{j}, %q6cm0f : f32")
+                    e(f"    %q6h_{t}_{j} = scalar.fptrunc %q6m_{t}_{j} : f32 to f16")
+                    hs.append(f"%q6h_{t}_{j}")
+                e(f"    %hv_{t} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
+            else:
+                e(f"    %vv_{t} = vector.mulf %dsv_{t}, %bf_{t} : vector<16xf32>")
+                e(f"    %hv_{t} = vector.fptrunc %vv_{t} : vector<16xf32> to vector<16xf16>")
             e(f"    vector.store %hv_{t}, %wl_view[%drow, {col}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
     return L
 
 
 def q6k_setup():
-    return ["  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8",
+    return ["  %q6cm0f = scalar.constant -0.0 : f32", "  %q6k0f = scalar.constant 252645135 : i32",
+            "  %q6m0f = vector.splat %q6k0f : vector<4xi32>", "  %q6k03 = scalar.constant 50529027 : i32",
+            "  %q6m03 = vector.splat %q6k03 : vector<4xi32>", "  %q6k20 = scalar.constant 538976288 : i32",
+            "  %q6m20 = vector.splat %q6k20 : vector<4xi32>", "  %q6k4 = scalar.constant 4 : i32",
+            "  %q6s4w = vector.splat %q6k4 : vector<4xi32>", "  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8",
             "  %c3b = scalar.constant 3 : i8", "  %c32b = scalar.constant 32 : i8",
             "  %m15v = vector.splat %c15b : vector<16xi8>", "  %s4v = vector.splat %c4b : vector<16xi8>",
             "  %m3v = vector.splat %c3b : vector<16xi8>", "  %m32v = vector.splat %c32b : vector<16xi8>"]
