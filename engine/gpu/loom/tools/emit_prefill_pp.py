@@ -765,12 +765,14 @@ ATTN_VGPR = 192   # every attention variant fits here unless the allocator rotat
 
 
 def hal_vgprs(hal):
+    E.wait(hal)
     notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
     m = re.search(r"\.vgpr_count:\s*(\d+)", notes)
     return int(m.group(1)) if m else 0
 
 
 def hal_spills(hal):
+    E.wait(hal)
     notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
     m = re.search(r"\.private_segment_fixed_size:\s*(\d+)", notes)
     return int(m.group(1)) if m else 0
@@ -818,6 +820,7 @@ def calibration_menu(model, outdir, B):
     import tune
     if B != tune.CHUNK:
         return []
+    E.wait()
     work = tempfile.mkdtemp(prefix="yah-menu-")
     kernels = [k for k in tune.inventory(model) if os.path.exists(os.path.join(outdir, k.hal + ".hal"))]
     todo = []
@@ -2077,6 +2080,7 @@ def main():
     global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
+    E.ASYNC = True
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
     # GEMM tokens per workgroup of the hand-written sources
     TILE = 64
@@ -2862,6 +2866,7 @@ def main():
                      ("grid_iq2s.bin", "grid_iq2s.bin"),
                      ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")]:
         shutil.copy(os.path.join(tables, src), os.path.join(outdir, dst))
+    E.wait()
     print("emitted %d GEMM + fixed prefill HALs for B=%d (tile=%d, token_tiles=%d)"
           % (n, B, TILE, TT))
     if npu_halves(B) and not EMIT_HALF:
