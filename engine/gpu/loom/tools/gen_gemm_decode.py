@@ -64,6 +64,12 @@ Q4_F16P = False
 # (exact; FP16 denormals are on) for 3 ops per 4 values instead of a v_cvt_f32_ubyteN each; narrowed as
 # fptrunc(fma(dsc * 2^24, c * 2^-24, -128 * dsc)): the scaled dsc is exact, so the fma sees the same exact product.
 F16PAIR = True
+# IQ4_NL: the codebook times d through IQ4_XS's v_fma_mix path (_iq4_f16; d * kvalue is exact in f32 either way, so
+# both round once to f16: bit-identical) instead of sitofp, mul, fptrunc per element
+IQ4NL_MIX = True
+# Q2_K: fptrunc(fma(d * sc, q, -dmin * m)) per element (v_fma_mix, as Q4DFMA) instead of vector mul, sub, fptrunc;
+# d * sc * q is exact in f32 (11 + 4 + 2 bits), so the fma rounds where the sub did
+Q2DFMA = True
 # Q4_SEL (Q4_K / Q5_K): the scale / min unpack as both forms + select instead of a divergent scf.if (same integers)
 Q4_SEL = True
 # Q3_FMIX (Q3_K): narrow dsc * q as fptrunc(fma(dsc, q, -0.0)) instead of fptrunc(dsc * q): d * sc * q has <= 19 significant
@@ -213,49 +219,7 @@ def iq4xs_compute(v, gb):
         e(f"    %dsc_v{u} = vector.splat %dsc{u} : vector<16xf32>")
         e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
         e(f"    %nhi{u} = vector.shrui {q}, %s4v : vector<16xi8>")
-        # The codebook +128 as unsigned bytes: uitofp of a byte is one v_cvt_f32_ubyteN.
-        # fptrunc(fma(s, u, -128*s)) = fptrunc((u-128)*s) exactly (<= 24 significant bits): bit-identical.
-        # The bias rides v_fma_mix's f32 addend (no literal).
-        for part in ("lo", "hi"):
-            e(f"    %cu{part}{u} = vector.table.lookup %kvtu[%n{part}{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
-            if F16PAIR:
-                e(f"    %cuw{part}{u} = vector.bitcast %cu{part}{u} : vector<16xi8> to vector<4xi32>")
-                for w in range(4):
-                    tw = f"{part}{u}_{w}"
-                    # bytes 0 / 2 and 1 / 3 in the low bits of the two halves: f16 subnormals c * 2^-24 (exact)
-                    e(f"    %cw{tw} = vector.extract %cuw{part}{u}[{w}] : vector<4xi32> -> i32")
-                    e(f"    %cwe{tw} = scalar.andi %cw{tw}, %fpm00ff : i32")
-                    if IQ4_PERM:   # bytes 1 / 3 with zero high bytes: one v_perm_b32 (shuffle with a zero word)
-                        e(f"    %cwz{tw} = vector.from_elements %cw{tw}, %c0i : vector<2xi32>")
-                        e(f"    %cwb{tw} = vector.bitcast %cwz{tw} : vector<2xi32> to vector<8xi8>")
-                        e(f"    %cwq{tw} = vector.shuffle<[1, 4, 3, 4, 4, 4, 4, 4]> %cwb{tw} : vector<8xi8>")
-                        e(f"    %cwr{tw} = vector.bitcast %cwq{tw} : vector<8xi8> to vector<2xi32>")
-                        e(f"    %cwo{tw} = vector.extract %cwr{tw}[0] : vector<2xi32> -> i32")
-                    else:
-                        e(f"    %cws{tw} = scalar.shrui %cw{tw}, %c8i_fp : i32")
-                        e(f"    %cwo{tw} = scalar.andi %cws{tw}, %fpm00ff : i32")
-                    for hh, src in ((0, f"%cwe{tw}"), (1, f"%cwo{tw}")):
-                        e(f"    %cwv{tw}_{hh} = vector.from_elements {src} : vector<1xi32>")
-                        e(f"    %cwh{tw}_{hh} = vector.bitcast %cwv{tw}_{hh} : vector<1xi32> to vector<2xf16>")
-            else:
-                e(f"    %fu{part}{u} = vector.uitofp %cu{part}{u} : vector<16xi8> to vector<16xf32>")
-        e(f"    %nb{u} = scalar.mulf %dsc{u}, %cm128f_iq : f32")
-        if F16PAIR:
-            e(f"    %dsc24_{u} = scalar.mulf %dsc{u}, %c2p24f_iq : f32")
-        # scalar form: fptrunc(fma) pairs feeding from_elements select as v_fma_mix{lo,hi}_f16
-        for part in ("lo", "hi"):
-            hs = []
-            for j in range(16):
-                if F16PAIR:
-                    w, b = divmod(j, 4)
-                    e(f"    %yh{part}{u}_{j} = vector.extract %cwh{part}{u}_{w}_{b % 2}[{b // 2}] : vector<2xf16> -> f16")
-                    e(f"    %y{part}{u}_{j} = scalar.extf %yh{part}{u}_{j} : f16 to f32")
-                else:
-                    e(f"    %y{part}{u}_{j} = vector.extract %fu{part}{u}[{j}] : vector<16xf32> -> f32")
-                e(f"    %m{part}{u}_{j} = scalar.fmaf {'%dsc24_' if F16PAIR else '%dsc'}{u}, %y{part}{u}_{j}, %nb{u} : f32")
-                e(f"    %t{part}{u}_{j} = scalar.fptrunc %m{part}{u}_{j} : f32 to f16")
-                hs.append(f"%t{part}{u}_{j}")
-            e(f"    %h{part}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
+        _iq4_f16(e, u, f"%dsc{u}")
         e(f"    %col_i{u} = scalar.shli %gl{u}, %c5i : i32")
         e(f"    %col_x{u} = index.cast %col_i{u} : i32 to index")
         e(f"    %col_l{u} = index.max %col_x{u}, %c0 : index")
@@ -264,6 +228,54 @@ def iq4xs_compute(v, gb):
         e(f"    vector.store %hlo{u}, %wl_view[%drow, %col{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
         e(f"    vector.store %hhi{u}, %wl_view[%drow, %colh{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
     return L
+
+
+def _iq4_f16(e, u, dsc):
+    """The 4-bit codebook values of nibble vectors %nlo{u} / %nhi{u} times the f32 scale dsc (an SSA name) as
+    %hlo{u} / %hhi{u} (vector<16xf16>), one v_fma_mix each (IQ4_XS, IQ4_NL)."""
+    # The codebook +128 as unsigned bytes: uitofp of a byte is one v_cvt_f32_ubyteN.
+    # fptrunc(fma(s, u, -128*s)) = fptrunc((u-128)*s) exactly (<= 24 significant bits): bit-identical.
+    # The bias rides v_fma_mix's f32 addend (no literal).
+    for part in ("lo", "hi"):
+        e(f"    %cu{part}{u} = vector.table.lookup %kvtu[%n{part}{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
+        if F16PAIR:
+            e(f"    %cuw{part}{u} = vector.bitcast %cu{part}{u} : vector<16xi8> to vector<4xi32>")
+            for w in range(4):
+                tw = f"{part}{u}_{w}"
+                # bytes 0 / 2 and 1 / 3 in the low bits of the two halves: f16 subnormals c * 2^-24 (exact)
+                e(f"    %cw{tw} = vector.extract %cuw{part}{u}[{w}] : vector<4xi32> -> i32")
+                e(f"    %cwe{tw} = scalar.andi %cw{tw}, %fpm00ff : i32")
+                if IQ4_PERM:   # bytes 1 / 3 with zero high bytes: one v_perm_b32 (shuffle with a zero word)
+                    e(f"    %cwz{tw} = vector.from_elements %cw{tw}, %c0i : vector<2xi32>")
+                    e(f"    %cwb{tw} = vector.bitcast %cwz{tw} : vector<2xi32> to vector<8xi8>")
+                    e(f"    %cwq{tw} = vector.shuffle<[1, 4, 3, 4, 4, 4, 4, 4]> %cwb{tw} : vector<8xi8>")
+                    e(f"    %cwr{tw} = vector.bitcast %cwq{tw} : vector<8xi8> to vector<2xi32>")
+                    e(f"    %cwo{tw} = vector.extract %cwr{tw}[0] : vector<2xi32> -> i32")
+                else:
+                    e(f"    %cws{tw} = scalar.shrui %cw{tw}, %c8i_fp : i32")
+                    e(f"    %cwo{tw} = scalar.andi %cws{tw}, %fpm00ff : i32")
+                for hh, src in ((0, f"%cwe{tw}"), (1, f"%cwo{tw}")):
+                    e(f"    %cwv{tw}_{hh} = vector.from_elements {src} : vector<1xi32>")
+                    e(f"    %cwh{tw}_{hh} = vector.bitcast %cwv{tw}_{hh} : vector<1xi32> to vector<2xf16>")
+        else:
+            e(f"    %fu{part}{u} = vector.uitofp %cu{part}{u} : vector<16xi8> to vector<16xf32>")
+    e(f"    %nb{u} = scalar.mulf {dsc}, %cm128f_iq : f32")
+    if F16PAIR:
+        e(f"    %dsc24_{u} = scalar.mulf {dsc}, %c2p24f_iq : f32")
+    # scalar form: fptrunc(fma) pairs feeding from_elements select as v_fma_mix{lo,hi}_f16
+    for part in ("lo", "hi"):
+        hs = []
+        for j in range(16):
+            if F16PAIR:
+                w, b = divmod(j, 4)
+                e(f"    %yh{part}{u}_{j} = vector.extract %cwh{part}{u}_{w}_{b % 2}[{b // 2}] : vector<2xf16> -> f16")
+                e(f"    %y{part}{u}_{j} = scalar.extf %yh{part}{u}_{j} : f16 to f32")
+            else:
+                e(f"    %y{part}{u}_{j} = vector.extract %fu{part}{u}[{j}] : vector<16xf32> -> f32")
+            e(f"    %m{part}{u}_{j} = scalar.fmaf {'%dsc24_' + str(u) if F16PAIR else dsc}, %y{part}{u}_{j}, %nb{u} : f32")
+            e(f"    %t{part}{u}_{j} = scalar.fptrunc %m{part}{u}_{j} : f32 to f16")
+            hs.append(f"%t{part}{u}_{j}")
+        e(f"    %h{part}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
 
 
 def _ld8(e, p, name, off):
@@ -1495,6 +1507,11 @@ def iq4nl_compute(v, gb):
         e(f"    %colh{u} = index.add %col{u}, %c16 : index")
         e(f"    %nlo{u} = vector.andi {q}, %m15v : vector<16xi8>")
         e(f"    %nhi{u} = vector.shrui {q}, %s4v : vector<16xi8>")
+        if IQ4NL_MIX:
+            _iq4_f16(e, u, f"%d{u}")
+            e(f"    vector.store %hlo{u}, %wl_view[%drow, %col{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+            e(f"    vector.store %hhi{u}, %wl_view[%drow, %colh{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+            continue
         for half, col in (("lo", f"%col{u}"), ("hi", f"%colh{u}")):
             t = f"{half}{u}"
             e(f"    %cv_{t} = vector.table.lookup %kvt[%n{half}{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
@@ -1704,9 +1721,19 @@ def q2k_compute(v, gb):
             e(f"    %q2ml{t} = scalar.mulf %q2dm, %q2m4f{t} : f32")
             e(f"    %q2dv{t} = vector.splat %q2dl{t} : vector<16xf32>")
             e(f"    %q2mv{t} = vector.splat %q2ml{t} : vector<16xf32>")
-            e(f"    %q2p{t} = vector.mulf %q2dv{t}, %q2qf{t} : vector<16xf32>")
-            e(f"    %q2v{t} = vector.subf %q2p{t}, %q2mv{t} : vector<16xf32>")
-            e(f"    %q2h{t} = vector.fptrunc %q2v{t} : vector<16xf32> to vector<16xf16>")
+            if Q2DFMA:
+                e(f"    %q2nm{t} = scalar.negf %q2ml{t} : f32")
+                hs = []
+                for j in range(16):
+                    e(f"    %q2e{t}_{j} = vector.extract %q2qf{t}[{j}] : vector<16xf32> -> f32")
+                    e(f"    %q2f{t}_{j} = scalar.fmaf %q2dl{t}, %q2e{t}_{j}, %q2nm{t} : f32")
+                    e(f"    %q2t{t}_{j} = scalar.fptrunc %q2f{t}_{j} : f32 to f16")
+                    hs.append(f"%q2t{t}_{j}")
+                e(f"    %q2h{t} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
+            else:
+                e(f"    %q2p{t} = vector.mulf %q2dv{t}, %q2qf{t} : vector<16xf32>")
+                e(f"    %q2v{t} = vector.subf %q2p{t}, %q2mv{t} : vector<16xf32>")
+                e(f"    %q2h{t} = vector.fptrunc %q2v{t} : vector<16xf32> to vector<16xf16>")
             e(f"    vector.store %q2h{t}, %wl_view[%drow, {col}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
     return L
 
