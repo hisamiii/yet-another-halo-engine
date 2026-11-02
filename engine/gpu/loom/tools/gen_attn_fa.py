@@ -1641,19 +1641,30 @@ def gen():
             e(f"    %s0 = vector.addf {acc}, %spart : {V8}")
         s = "%s0"
         if tail:
-            # key 8*half + i visible iff < lim = min(r_abs + 1, ctx_end) - ks - 8*half
-            e("    %lim0 = index.add %r_abs, %c1 : index")
-            e("    %lim1 = index.min %lim0, %ctx_end : index")
-            e("    %h8 = index.mul %half, %c8 : index")
-            e("    %kh = index.add %ks_, %h8 : index")
-            e("    %limi = index.cast %lim1 : index to i32")
-            e("    %khi = index.cast %kh : index to i32")
-            e("    %lim = scalar.subi %limi, %khi : i32")
+            def limit(ind):   # key 8*half + i visible iff < lim = min(r_abs + 1, ctx_end) - ks - 8*half
+                e(f"{ind}%lim0 = index.add %r_abs, %c1 : index")
+                e(f"{ind}%lim1 = index.min %lim0, %ctx_end : index")
+                e(f"{ind}%h8 = index.mul %half, %c8 : index")
+                e(f"{ind}%kh = index.add %ks_, %h8 : index")
+                e(f"{ind}%limi = index.cast %lim1 : index to i32")
+                e(f"{ind}%khi = index.cast %kh : index to i32")
+                e(f"{ind}%lim = scalar.subi %limi, %khi : i32")
+            r2m = R2P and DIAG_MASK and DIAG_SWAP   # R2P: the pass test on the wave's uniform bound (%r2mlb, pre-loop)
+            if not r2m:
+                limit("    ")
             ind = "    "
             if DIAG_MASK:
                 # some lane has a key at or past its limit (lim < 8) or a dead row
                 e("    %mc8 = scalar.constant 8 : i32")
-                if DIAG_SWAP:   # no lane has a key at or past its limit and no dead row: the scores pass through
+                if r2m:   # min over live lanes of (lim + ks) - ks >= 8, no dead row: exactly the vote below
+                    e("    %mksi = index.cast %ks_ : index to i32")
+                    e("    %mrem = scalar.subi %r2mlb, %mksi : i32")
+                    e("    %mallok = scalar.cmpi sge, %mrem, %mc8 : i32")
+                    e(f"    %smask = scf.if %mallok -> ({V8}) {{")
+                    e(f"      scf.yield %s0 : {V8}")
+                    e("    } else {")
+                    limit("      ")
+                elif DIAG_SWAP:   # no lane has a key at or past its limit and no dead row: the scores pass through
                     e("    %mok8 = scalar.cmpi sge, %lim, %mc8 : i32")
                     e("    %mlive = index.cmp ult, %r_lq, %B : index")
                     e("    %mok = scalar.andi %mok8, %mlive : i1")
@@ -1689,10 +1700,20 @@ def gen():
         if MAXNN:
             for i in range(8):
                 e(f"    %tme{i} = vector.extract {s}[{i}] : {V8} -> f32")
-            cur = "%tme0"
-            for i in range(1, 8):
-                e(f"    %tmc{i} = scalar.maxnumf<nnan> {cur}, %tme{i} : f32")
-                cur = f"%tmc{i}"
+            if R2P:   # a tree (max is exact in any order): pairs of independent maxes can dual-issue
+                lv = [f"%tme{i}" for i in range(8)]
+                while len(lv) > 1:
+                    nx = []
+                    for a, b in zip(lv[::2], lv[1::2]):
+                        e(f"    %tmt{len(lv)}_{len(nx)} = scalar.maxnumf<nnan> {a}, {b} : f32")
+                        nx.append(f"%tmt{len(lv)}_{len(nx)}")
+                    lv = nx
+                cur = lv[0]
+            else:
+                cur = "%tme0"
+                for i in range(1, 8):
+                    e(f"    %tmc{i} = scalar.maxnumf<nnan> {cur}, %tme{i} : f32")
+                    cur = f"%tmc{i}"
             e(f"    %tmi = scalar.bitcast {cur} : f32 to i32")
             e("    %tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
             e("    %tmf = scalar.bitcast %tmx : i32 to f32")
@@ -1839,32 +1860,31 @@ def gen():
         rtypes = ", ".join([BK] * 16)
 
     def r2p_pv(rows, alb, R, pp, ind):
-        """R2P, P.V wave: rescale the bank (0..7: own head, 8..15: the other) by each head's alpha of that tile unless
-        every one is 1 (x 1.0 is exact), both heads' P^T from the slot, then 8 V^T fragments of this head-dim half, each
-        feeding both heads' MMAs. Returns the new bank names."""
+        """R2P, P.V wave: rescale each head's half of the bank (0..7: own head, 8..15: the other) by its alpha of that
+        tile unless all its rows' are 1 (x 1.0 is exact), both heads' P^T from the slot, then 8 V^T fragments of this
+        head-dim half, each feeding both heads' MMAs. Returns the new bank names."""
         e(f"{ind}%{pp}ai = index.add {alb}, %pa_own : index")
         e(f"{ind}%{pp}al = view.load %al_view[%{pp}ai] : view<128xf32> -> f32")
         e(f"{ind}%{pp}aio = index.add {alb}, %pa_oth : index")
         e(f"{ind}%{pp}alo = view.load %al_view[%{pp}aio] : view<128xf32> -> f32")
-        e(f"{ind}%{pp}gr0 = scalar.cmpf oeq, %{pp}al, %one : f32")
-        e(f"{ind}%{pp}gr1 = scalar.cmpf oeq, %{pp}alo, %one : f32")
-        e(f"{ind}%{pp}gr = scalar.andi %{pp}gr0, %{pp}gr1 : i1")
-        e(f"{ind}%{pp}ag = kernel.subgroup.vote.all %{pp}gr : i1")
         Rf = []
         for f in range(16):
             e(f"{ind}%{pp}rf{f} = vector.bitcast {R[f]} : {BK} to {V8}")
             Rf.append(f"%{pp}rf{f}")
-        ftypes = ", ".join([V8] * 16)
+        ftypes = ", ".join([V8] * 8)
         sc = [f"%{pp}sc{f}" for f in range(16)]
-        e(f"{ind}{', '.join(sc)} = scf.if %{pp}ag -> ({ftypes}) {{")
-        e(f"{ind}  scf.yield {', '.join(Rf)} : {ftypes}")
-        e(f"{ind}}} else {{")
-        e(f"{ind}  %{pp}al8 = vector.splat %{pp}al : {V8}")
-        e(f"{ind}  %{pp}alo8 = vector.splat %{pp}alo : {V8}")
-        for f in range(16):
-            e(f"{ind}  %{pp}os{f} = vector.mulf {Rf[f]}, %{pp}{'al8' if f < 8 else 'alo8'} : {V8}")
-        e(f"{ind}  scf.yield {', '.join(f'%{pp}os{f}' for f in range(16))} : {ftypes}")
-        e(f"{ind}}}")
+        for t, a in enumerate((f"%{pp}al", f"%{pp}alo")):   # per head: its fragments only when its rows' max grew
+            e(f"{ind}%{pp}gr{t} = scalar.cmpf oeq, {a}, %one : f32")
+            e(f"{ind}%{pp}ag{t} = kernel.subgroup.vote.all %{pp}gr{t} : i1")
+            fs = range(8 * t, 8 * t + 8)
+            e(f"{ind}{', '.join(sc[f] for f in fs)} = scf.if %{pp}ag{t} -> ({ftypes}) {{")
+            e(f"{ind}  scf.yield {', '.join(Rf[f] for f in fs)} : {ftypes}")
+            e(f"{ind}}} else {{")
+            e(f"{ind}  %{pp}al8_{t} = vector.splat {a} : {V8}")
+            for f in fs:
+                e(f"{ind}  %{pp}os{f} = vector.mulf {Rf[f]}, %{pp}al8_{t} : {V8}")
+            e(f"{ind}  scf.yield {', '.join(f'%{pp}os{f}' for f in fs)} : {ftypes}")
+            e(f"{ind}}}")
         pbs = []
         for t, (lo, hi) in enumerate((("%prow_lo", "%prow_hi"), ("%prow_lo_o", "%prow_hi_o"))):
             e(f"{ind}%{pp}rl{t} = index.add {rows}, {lo} : index")
@@ -2776,6 +2796,17 @@ def gen():
         e("  %isB = index.cmp ne, %prole, %c0 : index")
         e("  %ewr = scalar.andi %r_live, %isB : i1")
     elif R2P:
+        if DIAG_MASK and DIAG_SWAP:   # the softmax mask test's wave-uniform terms
+            e("  %r2ml0 = index.add %r_abs, %c1 : index")
+            e("  %r2ml1 = index.min %r2ml0, %ctx_end : index")
+            e("  %r2mh8 = index.mul %half, %c8 : index")
+            e("  %r2mli = index.cast %r2ml1 : index to i32")
+            e("  %r2mhi = index.cast %r2mh8 : index to i32")
+            e("  %r2mll0 = scalar.subi %r2mli, %r2mhi : i32")
+            e("  %r2mneg = scalar.constant -1073741824 : i32")   # a dead row never passes
+            e("  %r2mll = scf.select %r_live, %r2mll0, %r2mneg : i32")
+            e("  %r2mlr = kernel.subgroup.reduce<minsi> %r2mll : i32")
+            e("  %r2mlb = kernel.subgroup.broadcast.first %r2mlr : i32")   # (scalar: the per-tile test is SALU)
         init = ", ".join(f"%rb{f} = %rinit{f} : {BK}" for f in range(16)) + ", %rmax = %ninf : f32, %rsum = %zero : f32"
         fb = [f"%fb{f}" for f in range(16)]
         e(f"  %wkf, {', '.join(fb)}, %gmax, %gsum = scf.while(%ksw = %c0 : index, {init}) -> (index, {rtypes}, f32, f32) {{")
@@ -2802,12 +2833,14 @@ def gen():
         e("  %lpar = index.rem %ltl, %c2 : index")
         e("  %lrows = index.mul %lpar, %c128p : index")
         e("  %lal = index.mul %lpar, %c64 : index")
-        outs = r2p_pv("%lrows", "%lal", fb, "fp", "  ")   # every wave: no merge (QK waves' results are never stored)
+        e("  %isB = index.cmp ne, %prole, %c0 : index")
+        # every wave: no merge (the QK waves' results are never stored). The epilogue in the P.V waves only (scf.if
+        # %isB around it) measured +3.5% at 8K with an identical loop: not understood
+        outs = r2p_pv("%lrows", "%lal", fb, "fp", "  ")
         for f in range(16):
             e(f"  %og{f} = vector.bitcast {outs[f]} : {BK} to {V8}")
         e("  %lsum_l = view.load %ls_view[%pa_own] : view<64xf32> -> f32")
         e("  %lsum_lo = view.load %ls_view[%pa_oth] : view<64xf32> -> f32")
-        e("  %isB = index.cmp ne, %prole, %c0 : index")
         e("  %ewr = scalar.andi %r_live, %isB : i1")
     elif PAIR:
         init = ", ".join(f"%rb{f} = %rinit{f} : {BK}" for f in range(16)) + ", %rmax = %ninf : f32, %rsum = %zero : f32"
