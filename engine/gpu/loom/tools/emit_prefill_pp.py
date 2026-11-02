@@ -1028,7 +1028,8 @@ AF = {
 # values as kstore + swiglu. vs the two afrag GEMMs, clock-free (2026-10-03, fast reciprocal in both): IQ3_S -3.5%,
 # IQ4_XS -0.9%, IQ3_XXS -3.1%.
 AF_FFN = {
-    "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True, f16s=True),
+    # IQ3_S: rev_gf_jf (HRX 0051 compiler) WMMA bank rank 1.16 -> 0.38, -2.2% (.to), bit-identical
+    "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True, f16s=True, epiord="rev_gf_jf"),
     # IQ4_XS: the order steers the hot loop's WMMA banks (with HRX 0049 numbering): rev_gf_jf leaves A, B, C + 1 and
     # C in distinct banks (-2.2% vs rev_gf_jr; the default order shared banks, +3%), bit-identical
     "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False, epiord="rev_gf_jf"),
