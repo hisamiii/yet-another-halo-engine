@@ -945,6 +945,9 @@ AF_KQ = dict(rhs_outer=False, rhs_fence=0)   # K-quants without B prefetch (Q6_K
 # Q4_K / Q3_K / Q5_K with the B prefetch: their decoders came down to 184-192 VGPRs (Q4DFMA, Q3_FMIX), so it fits now:
 # -3.6..-4.0% clock-free (Q4_K swiglu -5.6%, kstore 64 -5.5%)
 AF_KQP = dict(AF_KQ, **AF_PIPE, lhs_stream=4)
+# No B prefetch (bpre 0, no b0early, lhs_stream 0): under HRX 0051 the prefetching forms sit at 192 VGPRs with
+# shared WMMA banks; without it 179-187 VGPRs, rank 0 (11-02, clock-free, bit-identical; fused ffn AF_FFN too)
+AF_NOPRE = dict(AF_PIPE, bpre=0, b0early=False, lhs_stream=0)
 # The GEMMs with an afrag form and their knobs on top of AF_TILE; clock-free vs the GEMM (one round each, 2026-10-03).
 # The best lhs_stream depends on the decoder's register allocation: IQ3_XXS kstore without it waits vmcnt(0) twice per
 # phase on the step-1 B prefetch. Q3_K: the prefetch needs 208 VGPRs (one workgroup per WGP). IQ3_XXS: lhs_stream=1 with
@@ -990,13 +993,13 @@ AF = {
     ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=dict(pslice="top_top")), # -8.8%
     ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),             # -5.3%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
-    ("iq3s", "kstore", 640, 20): dict(AF_PIPE3, lhs_stream=3, gaddr=True, f16s=True),       # -9.6%
-    ("iq4xs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=2),                  # -10.3%
+    ("iq3s", "kstore", 640, 20): dict(AF_NOPRE, gaddr=True, f16s=True),          # -9.6%; no prefetch -1.5%
+    ("iq4xs", "kstore", 640, 20): dict(AF_NOPRE),                               # -10.3%; no prefetch -1.1%
     ("iq3xxs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -11.4%
-    ("q4k", "kstore", 640, 20): dict(AF_KQP),                                   # -7.4%
+    ("q4k", "kstore", 640, 20): dict(AF_KQP, bpre=0, b0early=False, lhs_stream=1),  # -7.4%; no prefetch -1.1%
     ("q3k", "kstore", 640, 20): dict(AF_KQP),                                   # -7.7%
     ("iq3s", "kstore", 384, 20): dict(AF_PIPE3, lhs_stream=3, sgtab=True, f16s=True),       # -9.4%
-    ("iq4xs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=2),                  # -9.9%
+    ("iq4xs", "kstore", 384, 20): dict(AF_NOPRE),                               # -9.9%; no prefetch -1.2%
     ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -10.9%
     ("q4k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.0%
     ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
