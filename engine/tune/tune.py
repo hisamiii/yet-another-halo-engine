@@ -148,6 +148,9 @@ def compile_one(args):
     k, t, d = args
     masked = CHUNK % t.bn != 0
     try:
+        # the source is generated here, before _emit_gen sets OUT16 for it: set it as _emit_gen does (else a kstore of
+        # emit_prefill_pp.O16_MT rows gets the previous compile's output type)
+        TG.OUT16 = k.kind == "kstore" and k.mt in EP.O16_MT
         src = TG.gen(k.fmt, k.kind, t, masked)
         os.makedirs(d, exist_ok=True)
         with open(os.devnull, "w") as null:
