@@ -1020,6 +1020,10 @@ AF = {
     ("q4k", "kqg", 768, 20): dict(AF_KQP),                                      # -6.7%
     ("q3k", "kqg", 768, 20): dict(AF_KQP),                                      # -5.0%
     ("q5k", "kqg", 768, 20): dict(AF_KQP, ksl=True),                            # -10.8%
+    # 11-02, the q of the two layers in these formats (tiled 96 x 8 at 69-72% of the floor): Q2_K without B prefetch
+    # -19.0% (with it -13.4%); IQ4_NL (32-element blocks) spills without it, lhs_stream 4 -17.7%
+    ("q2k", "kqg", 768, 20): dict(AF_KQ, ksl=True),
+    ("iq4nl", "kqg", 768, 160): dict(ksl=True, wlate=True, b0early=True, lhs_stream=4),
     ("iq4xs", "kstore", 64, 20): dict(AF_PIPE),                                 # -15.7%
     ("q4k", "kstore", 64, 20): dict(AF_KQP),                                    # -16.0%
     ("q5k", "kstore", 64, 20): dict(AF_KQP, ksl=True),                          # -10.4%
@@ -1070,6 +1074,8 @@ AF_FFN_MIX = {
     # swiglu knobs -4.5% (without B prefetch -4.0%)
     ("iq3xxs", "iq3s"): dict(AF_FFN["iq3xxs"], **AF_MIX),
     ("iq3xxs", "iq2s"): dict(AF_FFN["iq3xxs"], **AF_MIX),
+    # 11-02 sweep (epilogue orders, lhs_stream, wlate; all bit-identical): gemm_bench had lhs_stream 1 at 1-3% better for
+    # iq2s:iq3xxs / iq2xs:iq3s / iq3s:q3k, but in pp2048 counters none moved past the single-call noise (+-0.4 Mcyc)
     ("iq2s", "iq3xxs"): dict(AF[("iq2s", "swiglu", 1088, 20)], **AF_MIX),
     ("iq2xs", "iq2s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **AF_MIX),
     ("iq2xs", "iq3s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **AF_MIX),
