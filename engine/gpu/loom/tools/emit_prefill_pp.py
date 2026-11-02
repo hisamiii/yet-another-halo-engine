@@ -1005,6 +1005,11 @@ AF = {
     ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
     ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
+    # 11-02: the down kres of the formats that had no afrag form (tiled 256-token kernels at 69-82% of the floor)
+    ("q5k", "kres", 320, 68): dict(AF_KQP, ksl=True, respre=1, persist=True),
+    ("q3k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),
+    ("q3k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),
+    ("iq2s", "kres", 320, 68): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2, respre=1, persist=True),
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
     ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, lhs_stream=1, sgtab=True, f16p=True, gaddr=True, f16s=True),  # -8.4%
     ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
