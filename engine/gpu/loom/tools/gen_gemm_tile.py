@@ -628,9 +628,17 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e(f"  %grt{i} = index.add %wtb, %gr{i} : index")
             e(f"  %grp{i} = index.mul %grt{i}, %apitch : index")
             e(f"  %gro{i} = index.add %grp{i}, %gc{i} : index")
-    L.extend(F["setup"]())
+    setup = F["setup"]()
+    L.extend(setup)
     if MX:
-        L.extend(as_up(lambda: Fu["setup"]()))
+        # both setups may define the same constants (IQ4_XS and Q4_K: the nibble masks): one definition each
+        have = {l.split("=")[0].strip(): l.strip() for l in setup if l.lstrip().startswith("%")}
+        for l in as_up(lambda: Fu["setup"]()):
+            n = l.split("=")[0].strip()
+            if n in have:
+                assert have[n] == l.strip(), (n, have[n], l)
+                continue
+            L.append(l)
     if dq:
         # the setup's LDS tables visible, then this workgroup's phase (wg_y) decoded into the LDS tile as the GEMM does it
         e("  %z8s = scalar.constant 0 : i8")

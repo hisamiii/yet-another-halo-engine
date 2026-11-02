@@ -1039,10 +1039,16 @@ AF_FFN = {
 }
 # Mixed-format fused gate + up ((gate fmt, up fmt): gen_gemm_tile fmt "<gate>:<up>", "gemm_ffn_<gate>_<up>_<mt>_<kb>"):
 # each wave loads its own format's weights at its decode (ffn_inload) and no B prefetch, the only forms within the
-# 192-VGPR tier. vs the gate kstore + up swiglu pair (clock-free, layer 6): -1.4%, outputs bit-identical. GPU only (the
-# driver keeps the pair while the ffn site has NPU rows).
+# 192-VGPR tier; base knobs the gate format's AF_FFN entry, else its swiglu's. vs the gate kstore + up swiglu pair
+# (clock-free): iq3s:iq4xs -1.4%, iq4xs:q4k -3.0%, q3k:iq3s -2.6%, iq3s:q3k -1.0%, iq4xs:iq3s -1.0%, outputs
+# bit-identical. GPU only (the driver keeps the pair while the ffn site has NPU rows).
+AF_MIX = dict(ffn_inload=True, bpre=0, b0early=False, lhs_stream=0)
 AF_FFN_MIX = {
-    ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], ffn_inload=True, bpre=0, b0early=False, lhs_stream=0),
+    ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], **AF_MIX),
+    ("iq4xs", "q4k"): dict(AF_FFN["iq4xs"], **AF_MIX),
+    ("q3k", "iq3s"): dict(AF[("q3k", "swiglu", 1088, 20)], **AF_MIX),
+    ("iq3s", "q3k"): dict(AF_FFN["iq3s"], **AF_MIX),
+    ("iq4xs", "iq3s"): dict(AF_FFN["iq4xs"], **AF_MIX),
 }
 
 
