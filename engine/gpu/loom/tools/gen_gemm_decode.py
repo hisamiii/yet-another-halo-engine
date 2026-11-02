@@ -41,6 +41,11 @@ IQ4_SC4 = True
 # Q3_F16S (Q3_K): quants as signed f16 subnormal pairs (see q3k_compute): loop VALU 281 -> 230; one process A/B
 # kstore -0.55..-0.99%, kqg -0.14%
 Q3_F16S = True
+# Q3_NOMUL (with Q3_F16S): nb * 3 as nb | nb << 1 instead of a quarter-rate v_mul_lo_u32: pp2048 counter medians
+# (3 runs) every Q3_K row -0.1 M cycles (down 89.8 -> 90.2% of the floor) though loop VALU 601 -> 621. (The unsigned
+# quant 0..7 with the -4 bias in v_fma_mix's addend, as IQ4_XS, drops more ops but makes quant 0 under a negative scale
+# +0: see Q3_FMIX; gate N KL 1.51e-6, not bit-identical.)
+Q3_NOMUL = True
 # Q6DFMA: Q6_K's (d * sc) * q then fptrunc as fptrunc(fma(d * sc, q, -0.0)) per element (v_fma_mix; adding -0.0 keeps
 # every value and zero sign)
 Q6DFMA = True
@@ -1908,7 +1913,11 @@ def q3k_compute(v, gb):
                 e(f"    %q3bw{t} = vector.shrui %q3hw{t}, %q3bsw{u} : vector<4xi32>")
                 e(f"    %q3bit{t} = vector.andi %q3bw{t}, %q3m1w : vector<4xi32>")
                 e(f"    %q3nb{t} = vector.xori %q3bit{t}, %q3m1w : vector<4xi32>")
-                e(f"    %q3n3{t} = vector.muli %q3nb{t}, %q3c3w : vector<4xi32>")   # bytes 0 / 3, no carries
+                if Q3_NOMUL:   # nb * 3 as nb | nb << 1 (bits 0 / 1 of each byte): two full-rate ops for v_mul_lo_u32
+                    e(f"    %q3n2{t} = vector.shli %q3nb{t}, %q3m1s : vector<4xi32>")
+                    e(f"    %q3n3{t} = vector.ori %q3nb{t}, %q3n2{t} : vector<4xi32>")
+                else:
+                    e(f"    %q3n3{t} = vector.muli %q3nb{t}, %q3c3w : vector<4xi32>")   # bytes 0 / 3, no carries
                 e(f"    %q3mx{t} = vector.xori %q3low{t}, %q3n3{t} : vector<4xi32>")
                 e(f"    %q3magw{t} = vector.addi %q3mx{t}, %q3nb{t} : vector<4xi32>")
                 e(f"    %q3sgnw{t} = vector.shli %q3nb{t}, %q3c7w : vector<4xi32>")
@@ -1987,7 +1996,8 @@ def q3k_compute(v, gb):
 def q3k_setup():
     f16s = ["  %q3c24f = scalar.constant 16777216.0 : f32", "  %q3c3i_w = scalar.constant 3 : i32",
             "  %q3c3w = vector.splat %q3c3i_w : vector<4xi32>", "  %q3c7i_w = scalar.constant 7 : i32",
-            "  %q3c7w = vector.splat %q3c7i_w : vector<4xi32>"]
+            "  %q3c7w = vector.splat %q3c7i_w : vector<4xi32>", "  %q3c1i_s = scalar.constant 1 : i32",
+            "  %q3m1s = vector.splat %q3c1i_s : vector<4xi32>"]
     return (f16s if Q3_F16S else []) + ["  %q3cm0f = scalar.constant -0.0 : f32", "  %q3c54i = scalar.constant 54 : i32", "  %q3c96i = scalar.constant 96 : i32",
             "  %q3c3b = scalar.constant 3 : i8", "  %q3c1b = scalar.constant 1 : i8",
             "  %q3c2b = scalar.constant 2 : i8", "  %q3c4b = scalar.constant 4 : i8",
