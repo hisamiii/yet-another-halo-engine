@@ -1173,15 +1173,18 @@ def kst2(rows, B, outdir):
 SEG = os.environ.get("YAH_SEG", "1") == "1"
 SEG_SMALL = dict(ksl=True, bm=48, tallepi=False, ecoal=False)   # the 48-row afrag tile (fragment-store epilogue)
 SEG_VGPR_TIER = 192   # 1536 / 8 waves: two 16-wave workgroups per WGP
+# riders' knobs when the segmented GEMM would cross the tier: each A fragment loaded just before its MMAs, one step
+# ahead (kstore 64 VGPRs: Q4_K 192 -> 179, Q5_K 192 -> 187, Q6_K 208 -> 192; 64-row riders fit too but ran at 85%)
+SEG_RIDER_LIGHT = dict(lhs_stream=1)
 
 
-def _seg_tile(fmt, kind, mt, kb, small):
+def _seg_tile(fmt, kind, mt, kb, small, light=None):
     import gen_gemm_tile as TG
     d = TG.default_tile(fmt, kind, kb)
     if small:   # the format's own K step (AF_TILE's 128 is for the 256-element formats)
         return dataclasses.replace(d, **dict(AF_TILE, **SEG_SMALL, ksub=d.ksub))
     knobs = {k: v for k, v in AF.get((fmt, kind, mt, kb), {}).items() if k != "persist"}
-    return dataclasses.replace(d, **dict(AF_TILE, **knobs))
+    return dataclasses.replace(d, **dict(AF_TILE, **dict(knobs, **(light or {}))))
 
 
 def seg_gemms(rows, B, outdir):
@@ -1206,10 +1209,12 @@ def seg_gemms(rows, B, outdir):
             jobs.add(((q, "kqg", False), (k, "kstore", False), (v, "kstore", False)))
     out, big = [], {}
     tt = B // AF_TILE["bn"]
-    for segs in sorted(jobs):
+
+    def build(segs, light=None):
+        """Emit one segmented GEMM; return its dispatch.txt row."""
         texts = []
-        for (fmt, mt, kb), kind, small in segs:
-            t = _seg_tile(fmt, kind, mt, kb, small)
+        for i, ((fmt, mt, kb), kind, small) in enumerate(segs):
+            t = _seg_tile(fmt, kind, mt, kb, small, light if i and not small else None)
             TG.check(t)
             TG.OUT16 = kind == "kstore" and mt in O16_MT
             try:
@@ -1228,19 +1233,21 @@ def seg_gemms(rows, B, outdir):
         src = os.path.join(tmp, name[:-4] + ".loom")
         open(src, "w").write(text)
         E.emit(src, [], name, outdir)
-        out.append((name, AF_TILE["bn"], groups, tt))
-        (fmt, mt, kb), kind, _ = segs[0]
-        big[name] = os.path.join(outdir, "gemm_%s_%s_%d_%d.af.hal" % (kind, fmt, mt, kb))
+        return name, AF_TILE["bn"], groups, tt
+
     # one VGPR tier: over 192 a WGP holds one 16-wave workgroup instead of two. A segmented GEMM the riders push over
     # it while the large GEMM alone fits loses more than it saves (11-02: IQ4_NL kqg + K-quant k / v 200, Q6_K v 204:
-    # +0.3..+1.5 M cycles per layer); those layers keep the separate GEMMs
-    keep = []
-    for r in out:
-        if hal_vgprs(os.path.join(outdir, r[0])) > SEG_VGPR_TIER >= hal_vgprs(big[r[0]]):
+    # +0.3..+1.5 M cycles per layer): those retry with SEG_RIDER_LIGHT riders, else keep the separate GEMMs
+    for segs in sorted(jobs):
+        (fmt, mt, kb), kind, _ = segs[0]
+        big = hal_vgprs(os.path.join(outdir, "gemm_%s_%s_%d_%d.af.hal" % (kind, fmt, mt, kb)))
+        for light in (None, SEG_RIDER_LIGHT):
+            r = build(segs, light)
+            if hal_vgprs(os.path.join(outdir, r[0])) <= SEG_VGPR_TIER or big > SEG_VGPR_TIER:
+                out.append(r)
+                break
             os.remove(os.path.join(outdir, r[0]))
-            continue
-        keep.append(r)
-    return keep
+    return out
 
 
 # The out projections' (K = 6144) start stagger: the second workgroup per WGP waits this many barriers (gen_gemm_tile
