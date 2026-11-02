@@ -1038,7 +1038,8 @@ AF = {
     ("q5k", "kqg", 768, 20): dict(AF_KQP, ksl=True),                            # -10.8%
     # 11-02, the q of the two layers in these formats (tiled 96 x 8 at 69-72% of the floor): Q2_K without B prefetch
     # -19.0% (with it -13.4%); IQ4_NL (32-element blocks) spills without it, lhs_stream 4 -17.7%
-    ("q2k", "kqg", 768, 20): dict(AF_KQ, ksl=True),
+    # Q2_K with the B prefetch since its fptrunc(fma) decode (Q2DFMA, 187 -> 192 VGPRs): attention seg -0.15 M cycles
+    ("q2k", "kqg", 768, 20): dict(AF_KQP, ksl=True),
     ("iq4nl", "kqg", 768, 160): dict(ksl=True, wlate=True, b0early=True, lhs_stream=4),
     ("iq4xs", "kstore", 64, 20): dict(AF_PIPE),                                 # -15.7%
     ("q4k", "kstore", 64, 20): dict(AF_KQP),                                    # -16.0%
