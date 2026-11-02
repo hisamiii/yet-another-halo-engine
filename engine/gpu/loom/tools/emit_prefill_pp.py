@@ -2010,16 +2010,11 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
         if kind == "dequant":
             sym = "yah_dequant_" + fmt
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
-    import subprocess
-    gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
-                           kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else [])
-                          + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else [])
-                          + (["npuc=%d" % npuc] if npuc else []),
-                          capture_output=True, text=True)
-    if gate.returncode != 0:
-        raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
+    gate = [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []) \
+        + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else []) \
+        + (["npuc=%d" % npuc] if npuc else [])
     E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)]
-           + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir)
+           + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir, gate=gate)
     return (out, tile, rowgrp, tt)
 
 
@@ -2040,11 +2035,8 @@ def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False, wait=0):
     src = os.path.join(tmp, out[:-4] + ".loom")
     out16 = (kind == "kstore" and (mt in O16_MT or (mt == 64 and KV16_ON))) or (kind == "kqg" and QG16_ON)
     open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, out16, hperm, flag, wait))
-    gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, "mq4", kind, str(mt), str(kb),
-                           str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP], capture_output=True, text=True)
-    if gate.returncode != 0:
-        raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
-    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)], out, outdir)
+    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)], out, outdir,
+           gate=[sym, "mq4", kind, str(mt), str(kb), str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP])
     return (out, bn, bm // 16, tt)
 
 

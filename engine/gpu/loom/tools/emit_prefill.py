@@ -74,9 +74,10 @@ JOBS = int(os.environ.get("YAH_EMIT_JOBS", "16"))
 _pool, _pending, _latest, _lock, _lc = None, {}, {}, threading.Lock(), None
 
 
-def emit(loomfile, configs, outname, outdir, env=None):
+def emit(loomfile, configs, outname, outdir, env=None, gate=None):
     """Compile one Loom source (relative to engine/gpu/loom, or absolute) at one config to <outdir>/<outname>, and its
     envelopes to <outname>.fp. env: extra environment for this compile (per-kernel compiler options, e.g. LOOM_EXP_LICM).
+    gate: footprint_gate.py's arguments after the source, run first (a refusal fails the emit; a pass is cached).
     The source is read now, so the caller may overwrite it once this returns."""
     global _pool, _lc
     sys.path.insert(0, LOOM)
@@ -85,7 +86,8 @@ def emit(loomfile, configs, outname, outdir, env=None):
         _lc = hashlib.sha256(open(hrx_paths.LOOM_COMPILE, "rb").read()).hexdigest()
     ce = {**hrx_paths.env(), **(env or {})}
     tgt = ce.get("YAH_LOOM_TARGET", "gfx1151")
-    text, _ = emit_hal.specialize(open(os.path.join(LOOM, loomfile)).read(),
+    raw = open(os.path.join(LOOM, loomfile)).read()
+    text, _ = emit_hal.specialize(raw,
                                   {k.lstrip("@"): v for k, _, v in (c.partition("=") for c in configs)}, tgt)
     loomenv = sorted((k, v) for k, v in ce.items() if k.startswith("LOOM_"))
     key = hashlib.sha256(repr((text, tgt, loomenv, _lc, sorted(UNBOUNDED.items()))).encode()).hexdigest()
@@ -95,7 +97,7 @@ def emit(loomfile, configs, outname, outdir, env=None):
         _latest[dst] = seq = _latest.get(dst, 0) + 1
         if _pool is None:
             _pool = ThreadPoolExecutor(JOBS)
-        _pending.setdefault(dst, []).append(_pool.submit(_build, loomfile, text, tgt, ce, key, dst, seq))
+        _pending.setdefault(dst, []).append(_pool.submit(_build, loomfile, text, tgt, ce, key, dst, seq, gate and (raw, gate)))
     if not ASYNC:
         wait(dst)
     return dst
@@ -117,8 +119,31 @@ def wait(dst=None):
         raise SystemExit(str(err))
 
 
-def _build(loomfile, text, tgt, ce, key, dst, seq):
+def _gate(loomfile, raw, args, ce):
+    """footprint_gate.py on the source as written: raises with its verdict unless it passes."""
+    key = hashlib.sha256(repr((raw, args, _lc, [open(os.path.join(HERE, f)).read() for f in GATE_CODE])).encode()).hexdigest()
+    ok = os.path.join(CACHE, key + ".gate")
+    if CACHE != "0" and os.path.exists(ok):
+        return
+    with tempfile.TemporaryDirectory(prefix="emit_gate_") as t:
+        src = os.path.join(t, os.path.basename(loomfile))
+        open(src, "w").write(raw)
+        r = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src] + args, env=ce,
+                           capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("footprint gate refused %s: %s" % (loomfile, (r.stdout + r.stderr).strip()[-400:]))
+    if CACHE != "0":
+        os.makedirs(CACHE, exist_ok=True)
+        open(ok, "w").write(r.stdout)
+
+
+GATE_CODE = ("footprint_gate.py", "loom_preflight.py")
+
+
+def _build(loomfile, text, tgt, ce, key, dst, seq, gate):
     import hrx_paths
+    if gate:
+        _gate(loomfile, gate[0], gate[1], ce)
     hal, meta = os.path.join(CACHE, key + ".hal"), os.path.join(CACHE, key + ".json")
     if CACHE == "0" or not os.path.exists(meta):
         with tempfile.TemporaryDirectory(prefix="emit_") as t:
