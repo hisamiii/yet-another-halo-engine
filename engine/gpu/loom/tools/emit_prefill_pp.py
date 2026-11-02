@@ -1130,6 +1130,41 @@ def ffn_fused(rows, B, outdir):
     return out
 
 
+# KST2: each layer's ssm_alpha + ssm_beta (one format, stored back to back) in one kstore, "gemm_kst2_<fmt>_<mt>_<kb>.hal"
+# (mt of one tensor; the engine takes it when the two are adjacent), 48-row tiles over both tensors' rows, rows of beta
+# to the second output (gen_gemm_tile.SPLIT2). gemm_bench 11-02: 0.111 vs 0.157 Mcyc for the two 48-row kstores (the
+# merged rows at the old 16-row tile 0.144: the tile, not the shared input, wins); pp2048 counters 20.2 -> 15.5 Mcyc.
+# Same values.
+KST2 = os.environ.get("YAH_KST2", "1") == "1"
+KST2_GEOM = (48, 64, 3, 2)
+
+
+def kst2(rows, B, outdir):
+    """Emit the KST2 GEMMs for the (fmt, mt, kb) of every layer whose ssm_alpha and ssm_beta match; dispatch.txt rows."""
+    import gen_gemm_tile as TG
+    by = {}
+    for nm, dims, ty in rows:
+        parts = nm.split(".")
+        if len(parts) > 2 and parts[0] == "blk" and parts[2] in ("ssm_alpha", "ssm_beta") and E.FMT.get(ty):
+            by.setdefault(parts[1], {})[parts[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
+    out = []
+    for fmt, mt, kb in sorted({l["ssm_alpha"] for l in by.values() if l.get("ssm_alpha") == l.get("ssm_beta")}):
+        if fmt not in TILE_FMTS or B % KST2_GEOM[1]:
+            continue
+        t = TG.default_tile(fmt, "kstore", kb, KST2_GEOM)
+        if mt % t.rowgrp:   # a workgroup's rows must lie in one tensor
+            continue
+        TG.SPLIT2 = True
+        try:
+            r = _emit_gen(lambda f, k: TG.gen(f, "kstore", t, False), t.bn, fmt, 2 * mt, kb, B,
+                          "gemm_kst2_%s_%d_%d.hal" % (fmt, mt, kb), outdir, "kst2", t.rowgrp)
+        finally:
+            TG.SPLIT2 = False
+        if r:
+            out.append(r)
+    return out
+
+
 def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     """Emit "<hal>.af.hal" (and for swiglu "<hal>.af.to.hal", fragment-major output) if this GEMM has an afrag form."""
     import gen_gemm_tile as TG
@@ -2197,6 +2232,8 @@ def main():
 
     if not EMIT_HALF:
         geom.extend(ffn_fused(rows, B, outdir))
+        if KST2 and not a4:
+            geom.extend(kst2(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
         import gen_bfp16_encode as GE
         import gen_npu_unpack as GU

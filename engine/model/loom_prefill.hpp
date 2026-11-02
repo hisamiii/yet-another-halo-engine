@@ -2166,6 +2166,32 @@ class LoomPrefill {
     if (!df.empty()) DfNext();
     return false;
   }
+  // ssm_alpha and ssm_beta: in one kstore when the set has "gemm_kst2_<fmt>_<mt>_<kb>.hal" (emit_prefill_pp KST2) and the
+  // tensors are of one format and stored back to back (one weight binding spans both; rows of beta go to beta_), else
+  // two kstores.
+  void RunAlphaBeta(const std::string& pre) {
+    const auto* ta = Find(pre + "ssm_alpha.weight");
+    const auto* tb = Find(pre + "ssm_beta.weight");
+    Fmt f{};
+    const std::string hal = a4_ || ta->type != tb->type || ta->dims != tb->dims || tb->offset != ta->offset + ta->bytes
+                                ? "" : GemmHal("gemm_kst2", *ta, &f);
+    if (hal.empty() || !geom_.count(hal)) {
+      RunKstore(pre + "ssm_alpha.weight", *alpha_);
+      RunKstore(pre + "ssm_beta.weight", *beta_);
+      return;
+    }
+    const Geom g = GeomOf(hal);
+    auto b = GemmWeights(*ta, f);
+    b[0].length = static_cast<std::size_t>(ta->bytes + tb->bytes);
+    const std::size_t first = b.size();
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, alpha_, beta_})
+      b.push_back(Ref(*x));
+    const std::size_t rb = std::size_t(ta->dims[1]) * 4;
+    const std::uint32_t tt = Trim(b, first, {std::size_t(ta->dims[0]) * 2, 0, 0, rb, rb}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), 2 * MTiles(*ta) / g.rowgrp, tt, 1, 32, 1, 1, b,
+             GemmWrites(b, f, {alpha_, beta_}));
+  }
+
   // The attention q projection with the q / gate unpack fused in (rows = heads x [256 q | 256 gate]).
   // Returns false if the set has no such HAL; the caller then runs kstore + yah_unpack_qg.
   // af: the afrag form, input normt_ (fragment-major)
@@ -2602,8 +2628,7 @@ class LoomPrefill {
         NpuEnqueue(std::exchange(calls, {}), "qkv");
       const NpuView cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
       NpuEnqueue(std::move(calls), "qkv");
-      RunKstore(pre + "ssm_alpha.weight", *alpha_);
-      RunKstore(pre + "ssm_beta.weight", *beta_);
+      RunAlphaBeta(pre);
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
       RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, ng);
       NpuJoin();
@@ -2620,8 +2645,7 @@ class LoomPrefill {
       // pnq and so before each token tile reaches them: untracked too
       iu4_wait_ = std::exchange(nq_cnt_, {});
       iu4_untrack_ = dn_chained && iu4_wait_.buffer ? 0b1000 : 0;
-      RunKstore(pre + "ssm_alpha.weight", *alpha_);
-      RunKstore(pre + "ssm_beta.weight", *beta_);
+      RunAlphaBeta(pre);
       // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
       gate_late = geom_.count("dnvconv") != 0;
       if (dnov_ && gate_late) qkv_cnt = FlagSlot();
@@ -3052,8 +3076,7 @@ class LoomPrefill {
       }
     }
     // the GPU's rows of the whole chunk (as RunDeltaNet)
-    RunKstore(pre + "ssm_alpha.weight", *alpha_);
-    RunKstore(pre + "ssm_beta.weight", *beta_);
+    RunAlphaBeta(pre);
     RunKstoreSplit(wq, *qkv_, qkv_af, NpuHal(KstoreHal(wq, qkv_af)), nq);
     RunKstoreSplit(wg, *gate_, gate_af, NpuHal(KstoreHal(wg, gate_af)), ng);
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};

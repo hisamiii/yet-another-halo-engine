@@ -30,10 +30,12 @@ KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")
 wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
 GRID = {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096, "iq2s": 8192}
 bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate": B * MO * 4,
-         "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn", "gu") else 4),
+         "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn", "gu") else 4) // (2 if kind == "kst2" else 1),
          # A4 gu (gen_gemm_iu4): the up tensor beside the gate tensor in "weight"
          "up": wbytes,
          "gate_out": B * MO * 2,
+         # kst2 (gen_gemm_tile.SPLIT2): each output holds half the rows
+         "out2": B * M // 2 * 4,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
          # a mixed ffn with two grids: the gate's as "grid", the up's as "gridu" (gen_gemm_tile), else the one grid
          "grid": next((GRID[f] for f in fmts if f in GRID), 0),

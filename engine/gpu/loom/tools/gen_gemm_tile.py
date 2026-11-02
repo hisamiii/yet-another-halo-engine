@@ -256,6 +256,10 @@ DQ_WGS = 20
 # the tile count of a fragment-major output, for ffn the gate rows before the up rows, for kqg twice the q / gate row
 # stride (whole heads split). kstore / kres / swiglu / ffn / kqg.
 OSTRIDE = 0
+# Two tensors of one shape and format back to back in the weight binding (emit_prefill_pp KST2: ssm_alpha + ssm_beta),
+# one kstore over both: rows [0, m_rows / 2) go to output, the rest to out2, each [tokens][m_rows / 2]. A wave's rows
+# must lie in one half (the emitter checks the tile); the default fragment-store epilogue only.
+SPLIT2 = False
 
 
 # NPU weights (emit_prefill_pp NPU_SPLIT): with DQ_BFP = (ks, passes), the dequant kind writes the NPU's BFP16 weight
@@ -336,8 +340,10 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     ff = kind == "ffn"
     assert ff == t.ffn, "kind ffn needs Tile.ffn"
     bufs = (["weight"] + F["extra"] + (extra_u if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
-            + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
+            + ["wstage", "ostage", "output"] + (["out2"] if SPLIT2 else []) + (["gate_out"] if qg else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
     assert not NPUADD or (kr and KWIN and t.tallepi and t.ecoal and not masked and not t.respre)
+    assert not SPLIT2 or (kind == "kstore" and not (OSTRIDE or MX or masked or AFRAG or t.tallepi or t.tm == 32 or OUT16)), \
+        "SPLIT2: a plain tiled f32 kstore with the default fragment-store epilogue"
     sym = (f"yah_ffn_gemm_{fmt}" + (f"_{fmt_up}" if MX else "") + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
            + ("_ffn" if ff else ""))
     if dq:
@@ -1254,6 +1260,11 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
+    if SPLIT2:
+        _split2_epilogue(e, t, V8)
+        e("  kernel.return")
+        e("}")
+        return "\n".join(L) + "\n"
     e(f"  %out_layout = encoding.layout.strided [%c1, {orw()}] : encoding<layout>")
     e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
     if kr:
@@ -1274,6 +1285,30 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def _split2_epilogue(e, t, V8):
+    """SPLIT2: the default fragment stores, into output (first half of the rows) or out2 (second half, rows - half)."""
+    FM, FN = t.tm // 16, t.tn // 16
+    e("  %k2_rows = index.div %m_rows, %c2 : index")
+    e("  %k2_layout = encoding.layout.strided [%c1, %k2_rows] : encoding<layout>")
+    vt = f"view<[%k2_rows]x[%tokens]xf32, %k2_layout>"
+    e(f"  %k2_lo = buffer.view %output_na[%base] : buffer -> {vt}")
+    e(f"  %k2_hi = buffer.view %out2_na[%base] : buffer -> {vt}")
+    for j in range(FN):
+        e(f"  %ot{j} = index.add %token_base, %c{16 * j} : index")
+    e("  %k2_up = index.cmp uge, %m_origin, %k2_rows : index")
+    e("  scf.if %k2_up {")
+    e("  %k2_org = index.sub %m_origin, %k2_rows : index")
+    for side, org, view in (("h", "%k2_org", "%k2_hi"), ("l", "%m_origin", "%k2_lo")):
+        if side == "l":
+            e("  } else {")
+        for i in range(FM):
+            e(f"  %or{side}{i} = index.add {org}, %c{16 * i} : index")
+        for i in range(FM):
+            for j in range(FN):
+                e(f"  vector.fragment.store<result> %acc{i * FN + j}, {view}[%or{side}{i}, %ot{j}] shape [%m, %n] : {V8}, {vt}")
+    e("  }")
 
 
 def npu_wait(e):
