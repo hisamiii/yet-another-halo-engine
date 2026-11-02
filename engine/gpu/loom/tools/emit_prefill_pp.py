@@ -1010,7 +1010,7 @@ AF = {
     ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
                                       persist=dict(pslice="b0_a1")),                         # -8.5%
     ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=dict(pslice="top_top")), # -8.8%
-    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),             # -5.3%
+    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True, pslice="top_top"),   # -5.3%; top_top 89.6 -> 90.5% of floor
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
     ("iq3s", "kstore", 640, 20): dict(AF_NOPRE, gaddr=True, f16s=True),          # -9.6%; no prefetch -1.5%
     ("iq4xs", "kstore", 640, 20): dict(AF_NOPRE),                               # -10.3%; no prefetch -1.1%
@@ -1023,12 +1023,13 @@ AF = {
     ("q4k", "kstore", 384, 20): dict(AF_KQP, bpre=0, b0early=False, lhs_stream=1),  # -6.0%; no prefetch -0.9%
     ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
-    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
+    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True, pslice="top_top"),   # -4.6%; top_top 88.3 -> 89.2%
     # 11-02: the down kres of the formats that had no afrag form (tiled 256-token kernels at 69-82% of the floor)
     ("q5k", "kres", 320, 68): dict(AF_KQP, ksl=True, respre=1, persist=True),
     ("q3k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),
     ("q3k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),
-    ("iq2s", "kres", 320, 68): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2, respre=1, persist=True),
+    ("iq2s", "kres", 320, 68): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2, respre=1, persist=True,
+                                    pslice="top_top"),
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
     ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, lhs_stream=1, sgtab=True, f16p=True, gaddr=True, f16s=True),  # -8.4%
     ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
