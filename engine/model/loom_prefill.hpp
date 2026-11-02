@@ -2166,6 +2166,48 @@ class LoomPrefill {
     if (!df.empty()) DfNext();
     return false;
   }
+  // A segmented GEMM (emit_prefill_pp SEG, gen_segcat): one dispatch over the tiled norm output in which each part (the
+  // large GEMM first) has its own weights, format and outputs; "seg_<kind>_<fmt>_<mt>_<kb>__..". dispatch.txt gives
+  // the grid x (all parts' row groups) in the rowgrp column. Returns false if the set lacks it or for a trimmed chunk.
+  struct SegPart {
+    const char* kind;
+    std::string tensor;
+    std::vector<const LoomBuffer*> outs;
+  };
+  bool RunSeg(const std::vector<SegPart>& parts) {
+    if (a4_ || trim_row_ >= 0 || !AfChunk()) return false;
+    std::string hal = "seg";
+    std::vector<std::pair<const core::TensorInfo*, Fmt>> ts;
+    for (const SegPart& p : parts) {
+      const auto* t = Find(p.tensor);
+      Fmt f{};
+      const std::string h = GemmHal(p.kind, *t, &f);   // "gemm_<kind>_<fmt>_<mt>_<kb>.hal"
+      hal += (ts.empty() ? "_" : "__") + h.substr(std::strlen("gemm_"), h.size() - std::strlen("gemm_") - 4);
+      ts.push_back({t, f});
+    }
+    hal += ".hal";
+    const auto g = geom_.find(hal);
+    if (g == geom_.end()) return false;
+    std::vector<hrx_buffer_ref_t> b;
+    std::uint64_t writes = 0;
+    std::size_t ostage = 0;   // the one ostage binding (part 0's): Q2_K writes it (GemmWrites)
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      const auto w = GemmWeights(*ts[i].first, ts[i].second);
+      b.insert(b.end(), w.begin(), w.end());
+      if (i == 0) {
+        for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_}) b.push_back(Ref(*x));
+        ostage = b.size() - 1;
+      }
+      for (const LoomBuffer* o : parts[i].outs) {
+        writes |= std::uint64_t{1} << b.size();
+        b.push_back(Ref(*o));
+      }
+      if (std::string(ts[i].second.name) == "q2k") writes |= std::uint64_t{1} << ostage;
+    }
+    Dispatch(Exe(hal), "yah_seg", g->second.rowgrp, TokenTiles(g->second), 1, 512, 1, 1, b, writes);
+    return true;
+  }
+
   // ssm_alpha and ssm_beta: in one kstore when the set has "gemm_kst2_<fmt>_<mt>_<kb>.hal" (emit_prefill_pp KST2) and the
   // tensors are of one format and stored back to back (one weight binding spans both; rows of beta go to beta_), else
   // two kstores.
@@ -2381,7 +2423,11 @@ class LoomPrefill {
       // kqg's outputs untracked too
       iu4_wait_ = std::exchange(nq_cnt_, {});
       iu4_untrack_ = std::exchange(dn_chained_, false) && iu4_wait_.buffer ? 0b11000 : 0;
-      qg_fused = RunKqg(pre + "attn_q.weight", q_af);
+      // seg: k and v ride in the kqg GEMM's dispatch (f16 sets)
+      const bool seg = q_af && k_af && v_af && RunSeg({{"gemm_kqg", pre + "attn_q.weight", {q_, gate_}},
+                                                       {"gemm_kstore", pre + "attn_k.weight", {kbuf_}},
+                                                       {"gemm_kstore", pre + "attn_v.weight", {vbuf_}}});
+      qg_fused = seg || RunKqg(pre + "attn_q.weight", q_af);
       iu4_untrack_ = 0;
       if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
       if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
@@ -2389,8 +2435,13 @@ class LoomPrefill {
       // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
       const bool rw = ropew_ && qnorm_ && n_ == B_ && tail_ != kNoRows;
       if (rw) kv_cnt_[0] = FlagSlot(), kv_cnt_[1] = FlagSlot();
-      kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
-      kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
+      if (seg && rw) throw LoomError("seg k / v: no RoPE flags (ropew is A4)");
+      if (!seg) {
+        kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
+        kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
+      } else {
+        kv_flagged_ = false;
+      }
       iu4_wait_ = {}, iu4_untrack_ = 0;
     }
     if (!qg_fused)
@@ -2645,12 +2696,16 @@ class LoomPrefill {
       // pnq and so before each token tile reaches them: untracked too
       iu4_wait_ = std::exchange(nq_cnt_, {});
       iu4_untrack_ = dn_chained && iu4_wait_.buffer ? 0b1000 : 0;
-      RunAlphaBeta(pre);
+      // seg: alpha and beta ride in the qkv GEMM's dispatch (f16 sets)
+      const bool seg = qkv_af && RunSeg({{"gemm_kstore", pre + "attn_qkv.weight", {qkv_}},
+                                         {"gemm_kstore", pre + "ssm_alpha.weight", {alpha_}},
+                                         {"gemm_kstore", pre + "ssm_beta.weight", {beta_}}});
+      if (!seg) RunAlphaBeta(pre);
       // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
       gate_late = geom_.count("dnvconv") != 0;
       if (dnov_ && gate_late) qkv_cnt = FlagSlot();
       qkv_waited = iu4_wait_.buffer && iu4_untrack_;
-      qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
+      if (!seg) qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
       if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
       iu4_wait_ = {}, iu4_untrack_ = 0;
     }

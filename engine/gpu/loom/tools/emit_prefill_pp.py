@@ -1165,6 +1165,84 @@ def kst2(rows, B, outdir):
     return out
 
 
+# SEG: segmented GEMMs (gen_segcat): a layer's small GEMMs over the same activations ride in the large one's dispatch,
+# each with its own weights, format, row tile and output. DeltaNet: attn_qkv + ssm_alpha + ssm_beta (48-row segments);
+# attention: the q + gate kqg + attn_k + attn_v (their afrag tiles; k and v are not adjacent and often of two formats).
+# "seg_<kind>_<fmt>_<mt>_<kb>__..." per segment, the large GEMM first; dispatch.txt "<hal> <tile> <groups> <tt>": the
+# grid x (all segments' row groups) in the rowgrp column. Same values.
+SEG = os.environ.get("YAH_SEG", "1") == "1"
+SEG_SMALL = dict(ksl=True, bm=48, tallepi=False, ecoal=False)   # the 48-row afrag tile (fragment-store epilogue)
+SEG_VGPR_TIER = 192   # 1536 / 8 waves: two 16-wave workgroups per WGP
+
+
+def _seg_tile(fmt, kind, mt, kb, small):
+    import gen_gemm_tile as TG
+    d = TG.default_tile(fmt, kind, kb)
+    if small:   # the format's own K step (AF_TILE's 128 is for the 256-element formats)
+        return dataclasses.replace(d, **dict(AF_TILE, **SEG_SMALL, ksub=d.ksub))
+    knobs = {k: v for k, v in AF.get((fmt, kind, mt, kb), {}).items() if k != "persist"}
+    return dataclasses.replace(d, **dict(AF_TILE, **knobs))
+
+
+def seg_gemms(rows, B, outdir):
+    """Emit the SEG GEMMs some layer can use; return their dispatch.txt rows."""
+    import gen_gemm_tile as TG
+    import gen_segcat
+    import hrx_paths
+    if not (AFRAG and B % AF_TILE["bn"] == 0):
+        return []
+    by = {}
+    for nm, dims, ty in rows:
+        parts = nm.split(".")
+        if len(parts) > 2 and parts[0] == "blk" and E.FMT.get(ty):
+            by.setdefault(parts[1], {})[parts[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
+    jobs = set()
+    for l in by.values():
+        q, a, b = l.get("attn_qkv"), l.get("ssm_alpha"), l.get("ssm_beta")
+        if q and a and b and (q[0], "kstore", q[1], q[2]) in AF and a[0] in TILE_FMTS and b[0] in TILE_FMTS:
+            jobs.add(((q, "kstore", False), (a, "kstore", True), (b, "kstore", True)))
+        q, k, v = l.get("attn_q"), l.get("attn_k"), l.get("attn_v")
+        if q and k and v and (q[0], "kqg", q[1], q[2]) in AF and all((x[0], "kstore", x[1], x[2]) in AF for x in (k, v)):
+            jobs.add(((q, "kqg", False), (k, "kstore", False), (v, "kstore", False)))
+    out, big = [], {}
+    tt = B // AF_TILE["bn"]
+    for segs in sorted(jobs):
+        texts = []
+        for (fmt, mt, kb), kind, small in segs:
+            t = _seg_tile(fmt, kind, mt, kb, small)
+            TG.check(t)
+            TG.OUT16 = kind == "kstore" and mt in O16_MT
+            try:
+                raw = TG.gen(fmt, kind, t, False)
+            finally:
+                TG.OUT16 = False
+            sym = "yah_ffn_gemm_%s%s" % (fmt, {"kqg": "_kqg"}.get(kind, ""))
+            # each segment's body is unchanged in the spliced kernel but for names: its own footprint gate covers it
+            E._gate("seg_%s_%s_%d_%d" % (kind, fmt, mt, kb), raw, [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)],
+                    hrx_paths.env())
+            texts.append((raw, (mt, kb, tt)))
+        name = "seg_" + "__".join("%s_%s_%d_%d" % (kind, fmt, mt, kb) for (fmt, mt, kb), kind, _ in segs) + ".hal"
+        text, groups = gen_segcat.segcat("yah_seg", texts)
+        tmp = os.path.join(outdir, ".emit_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        src = os.path.join(tmp, name[:-4] + ".loom")
+        open(src, "w").write(text)
+        E.emit(src, [], name, outdir)
+        out.append((name, AF_TILE["bn"], groups, tt))
+        (fmt, mt, kb), kind, _ = segs[0]
+        big[name] = os.path.join(outdir, "gemm_%s_%s_%d_%d.af.hal" % (kind, fmt, mt, kb))
+    # one VGPR tier: over 192 a WGP holds one 16-wave workgroup instead of two. A segmented GEMM the riders push over
+    # it while the large GEMM alone fits loses more than it saves (11-02: IQ4_NL kqg + K-quant k / v 200, Q6_K v 204:
+    # +0.3..+1.5 M cycles per layer); those layers keep the separate GEMMs
+    keep = []
+    for r in out:
+        if hal_vgprs(os.path.join(outdir, r[0])) > SEG_VGPR_TIER >= hal_vgprs(big[r[0]]):
+            os.remove(os.path.join(outdir, r[0]))
+            continue
+        keep.append(r)
+    return keep
+
+
 def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     """Emit "<hal>.af.hal" (and for swiglu "<hal>.af.to.hal", fragment-major output) if this GEMM has an afrag form."""
     import gen_gemm_tile as TG
@@ -2234,6 +2312,8 @@ def main():
         geom.extend(ffn_fused(rows, B, outdir))
         if KST2 and not a4:
             geom.extend(kst2(rows, B, outdir))
+        if SEG and not a4:
+            geom.extend(seg_gemms(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
         import gen_bfp16_encode as GE
         import gen_npu_unpack as GU
