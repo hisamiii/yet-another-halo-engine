@@ -1372,16 +1372,25 @@ class LoomPrefill {
   }
   // kRow: f16 row-major into scratch_; kTiled: fragment-major into normt_ (afrag GEMMs); kBoth: both, one pass.
   enum class NormOut { kRow, kTiled, kBoth };
-  // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): both of one
-  // format and ffn_up stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r).
+  // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): ffn_up
+  // stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r). Gate and up of one
+  // format, or a mixed pair "gemm_ffn_<gate>_<up>_.." (AF_FFN_MIX), which binds the gate format's tables, then the up
+  // format's; mixed pairs have no NPU split, so they run only while the ffn site has no NPU rows.
   // It writes f16(silu(gate) * up) into ffnup_, fragment-major when ffn_down is afrag too. Returns false if not taken.
   bool RunFfnFused(const std::string& pre) {
     if (!AfChunk()) return false;
     const auto* tg = Find(pre + "ffn_gate.weight");
     const auto* tu = Find(pre + "ffn_up.weight");
-    if (tg->type != tu->type || tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
-    Fmt f{};
-    const std::string base = GemmHal("gemm_ffn", *tg, &f);
+    if (tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
+    const bool mixed = tg->type != tu->type;
+    if (mixed && NpuRows("ffn")) return false;
+    Fmt f{}, fu{};
+    std::string base = GemmHal("gemm_ffn", *tg, &f);
+    if (mixed) {   // "gemm_ffn_<gate>_<mt>_<kb>.hal" -> "gemm_ffn_<gate>_<up>_<mt>_<kb>.hal"
+      GemmHal("gemm_ffn", *tu, &fu);
+      base.insert(std::strlen("gemm_ffn_") + std::strlen(f.name), "_" + std::string(fu.name));
+    }
+    const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (mixed ? "_" + std::string(fu.name) : "") + "_ffn";
     const bool down_af = Af("gemm_kres", pre + "ffn_down.weight");
     const std::string hal = AfHal(base, down_af ? ".af.to.hal" : ".af.hal");
     if (hal.empty()) return false;
@@ -1390,6 +1399,10 @@ class LoomPrefill {
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*tg, f);
     b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
+    if (mixed) {
+      const auto bu = GemmWeights(*tu, fu);
+      b.insert(b.end(), bu.begin() + 1, bu.end());
+    }
     const std::size_t first = b.size();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
     const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(tg->dims[1]) * 2}, g);
@@ -1406,13 +1419,12 @@ class LoomPrefill {
       const NpuView cg = NpuCalls("ffn", ag, wg, c_off, calls, pre + "ffn_gate.weight");
       const NpuView cu = NpuCalls("ffn", au, wu, c_off, calls, pre + "ffn_up.weight");
       NpuEnqueue(std::move(calls), "ffn");
-      Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(),
-               (MTiles(*tg) - nn / 16) / GeomOf(sh).rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+      Dispatch(Exe(sh), sym.c_str(), (MTiles(*tg) - nn / 16) / GeomOf(sh).rowgrp, tt, 1, 32, 1, 1, b,
+               GemmWrites(b, f, {ffnup_}));
       NpuJoin();
       FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
     } else {
-      Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1,
-               1, b, GemmWrites(b, f, {ffnup_}));
+      Dispatch(Exe(hal), sym.c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
     }
     RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
     return true;

@@ -1037,11 +1037,18 @@ AF_FFN = {
     # over the plain f16p form; the two-word table +1.3%: LDS bank conflicts 13.9 -> 23.8 M cycles, LDS issue waits +62%)
     "iq3xxs": dict(AF_PIPE, lhs_stream=1, swepi=False, f16p=True, gaddr=True, f16s=True),
 }
+# Mixed-format fused gate + up ((gate fmt, up fmt): gen_gemm_tile fmt "<gate>:<up>", "gemm_ffn_<gate>_<up>_<mt>_<kb>"):
+# each wave loads its own format's weights at its decode (ffn_inload) and no B prefetch, the only forms within the
+# 192-VGPR tier. vs the gate kstore + up swiglu pair (clock-free, layer 6): -1.4%, outputs bit-identical. GPU only (the
+# driver keeps the pair while the ffn site has NPU rows).
+AF_FFN_MIX = {
+    ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], ffn_inload=True, bpre=0, b0early=False, lhs_stream=0),
+}
 
 
 def ffn_fused(rows, B, outdir):
     """Emit "gemm_ffn_<fmt>_<mt>_<kb>.af.hal" / ".af.to.hal" for each AF_FFN format some layer uses for both its gate
-    and up; return the dispatch.txt rows."""
+    and up, and "gemm_ffn_<gate>_<up>_.." for each AF_FFN_MIX pair some layer has; return the dispatch.txt rows."""
     import gen_gemm_tile as TG
     if not AFRAG or B % AF_TILE["bn"]:
         return []
@@ -1051,14 +1058,19 @@ def ffn_fused(rows, B, outdir):
         if len(parts) > 2 and parts[0] == "blk" and parts[2] in ("ffn_gate", "ffn_up") and E.FMT.get(ty):
             by.setdefault(parts[1], {})[parts[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
     out = []
-    for fmt, mt, kb in sorted({l["ffn_gate"] for l in by.values() if l.get("ffn_gate") == l.get("ffn_up")}):
-        if fmt not in AF_FFN:
-            continue
-        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
+    jobs = {(fmt, fmt, mt, kb) for fmt, mt, kb in (l["ffn_gate"] for l in by.values() if l.get("ffn_gate") == l.get("ffn_up"))
+            if fmt in AF_FFN}
+    jobs |= {(g[0], u[0], g[1], g[2]) for g, u in ((l.get("ffn_gate"), l.get("ffn_up")) for l in by.values())
+             if g and u and g[1:] == u[1:] and (g[0], u[0]) in AF_FFN_MIX}
+    for fmt, fmt_up, mt, kb in sorted(jobs):
+        knobs = AF_FFN[fmt] if fmt == fmt_up else AF_FFN_MIX[(fmt, fmt_up)]
+        name = fmt if fmt == fmt_up else fmt + "_" + fmt_up
+        gfmt = fmt if fmt == fmt_up else fmt + ":" + fmt_up
+        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **knobs, ffn=True)
         for suffix, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
             TG.check(tt)
-            r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, fmt, mt, kb, B,
-                          "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, suffix), outdir, "ffn", tt.rowgrp)
+            r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, gfmt, mt, kb, B,
+                          "gemm_ffn_%s_%d_%d%s" % (name, mt, kb, suffix), outdir, "ffn", tt.rowgrp)
             if r:
                 out.append(r)
     return out
