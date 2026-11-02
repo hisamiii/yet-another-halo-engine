@@ -1001,7 +1001,7 @@ AF = {
     ("iq3s", "kstore", 384, 20): dict(AF_PIPE3, lhs_stream=3, sgtab=True, f16s=True),       # -9.4%
     ("iq4xs", "kstore", 384, 20): dict(AF_NOPRE),                               # -9.9%; no prefetch -1.2%
     ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -10.9%
-    ("q4k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.0%
+    ("q4k", "kstore", 384, 20): dict(AF_KQP, bpre=0, b0early=False, lhs_stream=1),  # -6.0%; no prefetch -0.9%
     ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
     ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
