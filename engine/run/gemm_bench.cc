@@ -135,16 +135,19 @@ int main(int argc, char** argv) {
         const std::size_t c = j.tensor.rfind(':');
         file_w = ReadFile(j.tensor.substr(5, c - 5));
         m_rows = static_cast<std::uint32_t>(std::stoul(j.tensor.substr(c + 1)));
-      } else if (j.kind == "ffn" && j.tensor.find('+') != std::string::npos) {
-        // "<gate>+<up>": a mixed-format fused gate / up GEMM's one binding, the two tensors back to back
+      } else if (j.tensor.find('+') != std::string::npos) {
+        // "<a>+<b>": the two tensors back to back in one binding: a mixed-format fused gate / up GEMM (ffn: rows of
+        // one), or one GEMM over both tensors' rows (other kinds, e.g. ssm_alpha+ssm_beta)
         const std::size_t c = j.tensor.find('+');
         const auto* g = gguf.Find(j.tensor.substr(0, c));
         const auto* u = gguf.Find(j.tensor.substr(c + 1));
-        if (!g || !u || g->dims[1] != u->dims[1]) throw LoomError("ffn pair not found or of different rows: " + j.tensor);
+        const bool ffn = j.kind == "ffn";
+        if (!g || !u || (ffn && g->dims[1] != u->dims[1]) || g->dims[0] != u->dims[0])
+          throw LoomError("tensor pair not found or of different shapes: " + j.tensor);
         file_w.resize(g->bytes + u->bytes);
         std::memcpy(file_w.data(), gguf.Data(*g), g->bytes);
         std::memcpy(file_w.data() + g->bytes, gguf.Data(*u), u->bytes);
-        m_rows = static_cast<std::uint32_t>(g->dims[1]);
+        m_rows = static_cast<std::uint32_t>(ffn ? g->dims[1] : g->dims[1] + u->dims[1]);
         tiled_dims0 = static_cast<std::uint32_t>(g->dims[0]);
       } else {
         for (std::size_t a = 0, b; a <= j.tensor.size(); a = b + 1) {
