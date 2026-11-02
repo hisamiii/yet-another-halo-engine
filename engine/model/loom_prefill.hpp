@@ -1374,8 +1374,9 @@ class LoomPrefill {
   enum class NormOut { kRow, kTiled, kBoth };
   // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): ffn_up
   // stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r). Gate and up of one
-  // format, or a mixed pair "gemm_ffn_<gate>_<up>_.." (AF_FFN_MIX), which binds the gate format's tables, then the up
-  // format's; mixed pairs have no NPU split, so they run only while the ffn site has no NPU rows.
+  // format, or a pair "gemm_ffn_<gate>_<up>_.." (AF_FFN_MIX: mixed formats, which bind the gate format's tables, then
+  // the up format's, or one format without an NPU split); pairs have no NPU split, so they run only while the ffn site
+  // has no NPU rows.
   // It writes f16(silu(gate) * up) into ffnup_, fragment-major when ffn_down is afrag too. Returns false if not taken.
   bool RunFfnFused(const std::string& pre) {
     if (!AfChunk()) return false;
@@ -1383,17 +1384,19 @@ class LoomPrefill {
     const auto* tu = Find(pre + "ffn_up.weight");
     if (tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
     const bool mixed = tg->type != tu->type;
-    if (mixed && NpuRows("ffn")) return false;
     Fmt f{}, fu{};
     std::string base = GemmHal("gemm_ffn", *tg, &f);
-    if (mixed) {   // "gemm_ffn_<gate>_<mt>_<kb>.hal" -> "gemm_ffn_<gate>_<up>_<mt>_<kb>.hal"
-      GemmHal("gemm_ffn", *tu, &fu);
-      base.insert(std::strlen("gemm_ffn_") + std::strlen(f.name), "_" + std::string(fu.name));
-    }
-    const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (mixed ? "_" + std::string(fu.name) : "") + "_ffn";
+    GemmHal("gemm_ffn", *tu, &fu);
     const bool down_af = Af("gemm_kres", pre + "ffn_down.weight");
-    const std::string hal = AfHal(base, down_af ? ".af.to.hal" : ".af.hal");
+    const char* sfx = down_af ? ".af.to.hal" : ".af.hal";
+    std::string hal = mixed ? "" : AfHal(base, sfx);
+    if (hal.empty()) {   // "gemm_ffn_<gate>_<mt>_<kb>.hal" -> "gemm_ffn_<gate>_<up>_<mt>_<kb>.hal"
+      if (NpuRows("ffn")) return false;
+      base.insert(std::strlen("gemm_ffn_") + std::strlen(f.name), "_" + std::string(fu.name));
+      hal = AfHal(base, sfx);
+    }
     if (hal.empty()) return false;
+    const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (mixed ? "_" + std::string(fu.name) : "") + "_ffn";
     RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled,
             trim_row_ == kAllRows && FfnNpuOk(pre) && NpuRows("ffn") && !NpuHal(hal).empty() ? "ffn" : nullptr);
     const Geom g = GeomOf(hal);

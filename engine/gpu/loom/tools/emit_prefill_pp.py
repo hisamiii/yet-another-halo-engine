@@ -1042,6 +1042,8 @@ AF_FFN = {
 # 192-VGPR tier; base knobs the gate format's AF_FFN entry, else its swiglu's. vs the gate kstore + up swiglu pair
 # (clock-free): iq3s:iq4xs -1.4%, iq4xs:q4k -3.0%, q3k:iq3s -2.6%, iq3s:q3k -1.0%, iq4xs:iq3s -1.0%, outputs
 # bit-identical. GPU only (the driver keeps the pair while the ffn site has NPU rows).
+# A pair of one format (no AF_FFN entry, so no NPU split): "gemm_ffn_<fmt>_<fmt>_..", the format's swiglu knobs without
+# B prefetch: q5k -3.5%, q3k -3.8% (the prefetching forms rank 1.0 WMMA banks, -1.2..-1.4%).
 AF_MIX = dict(ffn_inload=True, bpre=0, b0early=False, lhs_stream=0)
 AF_FFN_MIX = {
     ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], **AF_MIX),
@@ -1049,6 +1051,8 @@ AF_FFN_MIX = {
     ("q3k", "iq3s"): dict(AF[("q3k", "swiglu", 1088, 20)], **AF_MIX),
     ("iq3s", "q3k"): dict(AF_FFN["iq3s"], **AF_MIX),
     ("iq4xs", "iq3s"): dict(AF_FFN["iq4xs"], **AF_MIX),
+    ("q5k", "q5k"): dict(AF[("q5k", "swiglu", 1088, 20)], bpre=0, b0early=False, lhs_stream=0),
+    ("q3k", "q3k"): dict(AF[("q3k", "swiglu", 1088, 20)], bpre=0, b0early=False, lhs_stream=0),
 }
 
 
@@ -1069,8 +1073,9 @@ def ffn_fused(rows, B, outdir):
     jobs |= {(g[0], u[0], g[1], g[2]) for g, u in ((l.get("ffn_gate"), l.get("ffn_up")) for l in by.values())
              if g and u and g[1:] == u[1:] and (g[0], u[0]) in AF_FFN_MIX}
     for fmt, fmt_up, mt, kb in sorted(jobs):
-        knobs = AF_FFN[fmt] if fmt == fmt_up else AF_FFN_MIX[(fmt, fmt_up)]
-        name = fmt if fmt == fmt_up else fmt + "_" + fmt_up
+        pair = (fmt, fmt_up) in AF_FFN_MIX
+        knobs = AF_FFN_MIX[(fmt, fmt_up)] if pair else AF_FFN[fmt]
+        name = fmt + "_" + fmt_up if pair else fmt
         gfmt = fmt if fmt == fmt_up else fmt + ":" + fmt_up
         t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **knobs, ffn=True)
         for suffix, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
