@@ -1029,10 +1029,11 @@ AF = {
 # IQ4_XS -0.9%, IQ3_XXS -3.1%.
 AF_FFN = {
     # IQ3_S: rev_gf_jf (HRX 0051 compiler) WMMA bank rank 1.16 -> 0.38, -2.2% (.to), bit-identical
-    "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True, f16s=True, epiord="rev_gf_jf"),
+    # IQ3_S / IQ4_XS: no B prefetch (bpre 0, no b0early, lhs_stream 0; 11-02, HRX 0051): -0.7% / -1.1% (rank 0)
+    "iq3s": dict(AF_PIPE, swepi=False, f16p=True, f16s=True, epiord="rev_gf_jf", bpre=0, b0early=False, lhs_stream=0),
     # IQ4_XS: the order steers the hot loop's WMMA banks (with HRX 0049 numbering): rev_gf_jf leaves A, B, C + 1 and
     # C in distinct banks (-2.2% vs rev_gf_jr; the default order shared banks, +3%), bit-identical
-    "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False, epiord="rev_gf_jf"),
+    "iq4xs": dict(AF_PIPE, swepi=False, epiord="rev_gf_jf", bpre=0, b0early=False, lhs_stream=0),
     # IQ3_XXS: f16s without a sign table (-1.0%; with the packed sgtw=1 table +0.9..+1.6%, which itself had been -0.5%
     # over the plain f16p form; the two-word table +1.3%: LDS bank conflicts 13.9 -> 23.8 M cycles, LDS issue waits +62%)
     "iq3xxs": dict(AF_PIPE, lhs_stream=1, swepi=False, f16p=True, gaddr=True, f16s=True),
