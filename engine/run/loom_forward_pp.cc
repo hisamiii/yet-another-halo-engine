@@ -15,6 +15,8 @@
 //   YAH_SLOT_SAVE=<file> [YAH_SLOT_AT=C]  save the sequence state before chunk C (default: after the last)
 //   YAH_SLOT_LOAD=<file> restore a slot and run from the chunk it covers (marginal prefill at depth)
 //   YAH_CHUNK_MS=1       print each chunk's wall time (synchronizes after every chunk)
+//   YAH_WINDOWS=<file>   one "<ids-file> <out-prefix>" per line, each a prefill of its own in turn in this process (the
+//                        recurrent state zeroed between them; the arguments' ids file and prefix are unused)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -115,7 +117,14 @@ int main(int argc, char** argv) {
     auto gguf = yah::core::Gguf::OpenStreaming(argv[1]);
     lap("model open");
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
-    std::vector<std::uint32_t> ids = ParseIds(ids_path);
+    std::vector<std::pair<std::string, std::string>> runs = {{ids_path, prefix}};
+    if (const char* wf = std::getenv("YAH_WINDOWS")) {
+      runs.clear();
+      std::ifstream wfs(wf);
+      std::string a, b;
+      while (wfs >> a >> b) runs.emplace_back(a, b);
+      if (runs.empty()) throw LoomError("YAH_WINDOWS: no windows");
+    }
     LoomDevice gpu;
     lap("device");
     // The layers queue ~950 dispatches and wait once: the runtime wait would busy-poll a host core the whole time.
@@ -155,7 +164,6 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "tokens=%u must be at most the context %u\n", T_run, pf.context());
       return 2;
     }
-    for (std::size_t i = ids.size(), n = ids.size(); i < T_run; ++i) ids.push_back(ids[i % n]);
     const std::uint32_t n_chunks = (T_run + B - 1) / B, last_n = T_run - (n_chunks - 1) * B;
     std::fprintf(stderr, "loom_forward_pp: tokens=%u chunk=%u context=%u\n", T_run, B, pf.context());
 
@@ -198,127 +206,136 @@ int main(int argc, char** argv) {
     const char* slot_save = std::getenv("YAH_SLOT_SAVE");
     const std::uint32_t slot_at = std::getenv("YAH_SLOT_AT") ? std::atoi(std::getenv("YAH_SLOT_AT")) : n_chunks;
 
-    gpu.Synchronize();
-    lap("pre-run");
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<std::uint32_t> idx(kVocab);
-    const bool chunk_ms = std::getenv("YAH_CHUNK_MS") != nullptr;
-    auto tc = t0;
-    for (std::uint32_t ci = ci0; ci < n_chunks; ++ci) {
-      if (slot_save && ci == slot_at) pf.SaveState(slot_save, ci);
-      pf.Embed(ids.data() + std::size_t{ci} * B, ci + 1 == n_chunks ? last_n : B);
-      // the last layer's tail only for the rows read below: every row for logits_from / rowstats, else the last row
-      const bool rows = rowstats || logits_from < std::min((ci + 1) * B, T_run);
-      pf.RunLayers(ci, {}, rows ? LoomPrefill::kAllRows
-                       : ci + 1 == n_chunks ? std::int64_t{last_n} - 1
-                                            : LoomPrefill::kNoRows,
-                   ci + 1 == n_chunks);
-      for (std::uint32_t ra = std::max(logits_from, ci * B); ra < std::min((ci + 1) * B, T_run); ++ra)
-        pf.Head(ra - ci * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});
-      if (rowstats) {
-        std::vector<std::uint32_t> rows;
-        for (std::uint32_t r = 0; r < (ci + 1 == n_chunks ? last_n : B); ++r)
-          if (rs_want[std::size_t{ci} * B + r]) rows.push_back(r);
-        for (std::size_t i = 0; i < rows.size(); ++i)
-          pf.Head(rows[i], {rsbuf.handle, i * kVocab * 4, std::size_t{kVocab} * 4});
-        if (!rows.empty()) {
-          gpu.Synchronize();
-          std::vector<float> host(rows.size() * kVocab);
-          gpu.D2H(rsbuf, host.data(), host.size() * 4, 0);
-          for (std::size_t i = 0; i < rows.size(); ++i) {
-            const std::uint32_t pos = ci * B + rows[i];
-            const std::int32_t nxt = pos + 1 < T_run ? static_cast<std::int32_t>(ids[pos + 1]) : -1;
-            WriteRowStats(rowstats, host.data() + i * kVocab, pos, nxt, idx);
+    if (runs.size() > 1 && (ci0 || slot_save || rowstats || std::getenv("YAH_GEN")))
+      throw LoomError("YAH_WINDOWS runs plain prefills only");
+    for (std::size_t wi = 0; wi < runs.size(); ++wi) {
+      const std::string& out_prefix = runs[wi].second;
+      std::vector<std::uint32_t> ids = ParseIds(runs[wi].first.c_str());
+      for (std::size_t i = ids.size(), n = ids.size(); i < T_run; ++i) ids.push_back(ids[i % n]);
+      if (wi) pf.Reset();
+      if (runs.size() > 1) std::printf("window=%s\n", out_prefix.c_str());
+      gpu.Synchronize();
+      lap("pre-run");
+      const auto t0 = std::chrono::steady_clock::now();
+      std::vector<std::uint32_t> idx(kVocab);
+      const bool chunk_ms = std::getenv("YAH_CHUNK_MS") != nullptr;
+      auto tc = t0;
+      for (std::uint32_t ci = ci0; ci < n_chunks; ++ci) {
+        if (slot_save && ci == slot_at) pf.SaveState(slot_save, ci);
+        pf.Embed(ids.data() + std::size_t{ci} * B, ci + 1 == n_chunks ? last_n : B);
+        // the last layer's tail only for the rows read below: every row for logits_from / rowstats, else the last row
+        const bool rows = rowstats || logits_from < std::min((ci + 1) * B, T_run);
+        pf.RunLayers(ci, {}, rows ? LoomPrefill::kAllRows
+                         : ci + 1 == n_chunks ? std::int64_t{last_n} - 1
+                                              : LoomPrefill::kNoRows,
+                     ci + 1 == n_chunks);
+        for (std::uint32_t ra = std::max(logits_from, ci * B); ra < std::min((ci + 1) * B, T_run); ++ra)
+          pf.Head(ra - ci * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});
+        if (rowstats) {
+          std::vector<std::uint32_t> rows;
+          for (std::uint32_t r = 0; r < (ci + 1 == n_chunks ? last_n : B); ++r)
+            if (rs_want[std::size_t{ci} * B + r]) rows.push_back(r);
+          for (std::size_t i = 0; i < rows.size(); ++i)
+            pf.Head(rows[i], {rsbuf.handle, i * kVocab * 4, std::size_t{kVocab} * 4});
+          if (!rows.empty()) {
+            gpu.Synchronize();
+            std::vector<float> host(rows.size() * kVocab);
+            gpu.D2H(rsbuf, host.data(), host.size() * 4, 0);
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+              const std::uint32_t pos = ci * B + rows[i];
+              const std::int32_t nxt = pos + 1 < T_run ? static_cast<std::int32_t>(ids[pos + 1]) : -1;
+              WriteRowStats(rowstats, host.data() + i * kVocab, pos, nxt, idx);
+            }
           }
         }
-      }
-      if (chunk_ms) {   // per-chunk wall time (synchronizes: the next chunk's recording no longer overlaps this one)
-        gpu.Synchronize();
-        const auto tn = std::chrono::steady_clock::now();
-        std::printf("chunk=%u start=%u ms=%.1f\n", ci, ci * B, std::chrono::duration<double, std::milli>(tn - tc).count());
-        std::fflush(stdout);
-        tc = tn;
-      }
-    }
-    gpu.Synchronize();
-    if (slot_save && slot_at >= n_chunks) pf.SaveState(slot_save, n_chunks);
-    if (rowstats) std::fclose(rowstats);
-    const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("layers_ms=%.1f\n", layer_ms);
-    if (npu) npu->Report(stdout);
-    pf.ReportWaitLog(stdout);
-    pf.ReportNpuProf();
-
-    {
-      std::vector<float> out(std::size_t{B} * LoomPrefill::kHidden);
-      gpu.D2H(pf.hidden(), out.data(), out.size() * 4, 0);
-      FILE* fo = OpenOut(prefix + ".hidden");
-      std::fwrite(out.data(), 4, out.size(), fo);
-      std::fclose(fo);
-    }
-    LoomBuffer logits = gpu.Allocate(std::size_t{kVocab} * 4);
-    LoomBuffer token = gpu.Allocate(4);
-    pf.Head(last_n - 1, {logits.handle, 0, logits.size});
-    pf.Argmax({logits.handle, 0, logits.size}, {token.handle, 0, 4});
-    gpu.Synchronize();
-    std::uint32_t tok = 0;
-    gpu.D2H(token, &tok, 4, 0);
-    std::vector<float> logit_host(kVocab);
-    gpu.D2H(logits, logit_host.data(), logit_host.size() * 4, 0);
-    FILE* fl = OpenOut(prefix + ".logits");
-    std::fwrite(logit_host.data(), 4, logit_host.size(), fl);
-    std::fclose(fl);
-    std::printf("argmax=%u\n", tok);
-
-    if (const char* gv = std::getenv("YAH_GEN"); gv && std::atoi(gv) > 0) {
-      const std::uint32_t ngen = static_cast<std::uint32_t>(std::atoi(gv));
-      const char* ddir = std::getenv("YAH_DECODE_HAL");
-      if (!ddir) throw LoomError("YAH_GEN needs YAH_DECODE_HAL (tools/emit_decode.py set)");
-      if (T_run + ngen - 1 > pf.context()) throw LoomError("YAH_GEN: prompt + gen exceeds the emitted context");
-      LoomDecoder dec(gpu, gguf, cfg, ddir, weights);
-      if (dec.context() != pf.pool_rows())
-        throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) + " != prefill pool rows " +
-                        std::to_string(pf.pool_rows()));
-      if (dec.kv_bits() != pf.kv_bits())
-        throw LoomError("YAH_GEN: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
-      dec.Bind(pf.DecoderState());
-      dec.SetTokens(&tok, 1, T_run);
-      gpu.Synchronize();
-      const auto tg = std::chrono::steady_clock::now();
-      const char* sp = std::getenv("YAH_GEN_SPLIT");   // N: sync every N steps and print that slice's tok/s
-      const std::uint32_t split = sp ? static_cast<std::uint32_t>(std::atoi(sp)) : 0;
-      auto ts = tg;
-      for (std::uint32_t pos = T_run; pos + 1 < T_run + ngen; ++pos) {
-        dec.Step(pos, T_run);
-        gpu.Flush();
-        if (split && (pos + 1 - T_run) % split == 0) {
+        if (chunk_ms) {   // per-chunk wall time (synchronizes: the next chunk's recording no longer overlaps this one)
           gpu.Synchronize();
-          const auto now = std::chrono::steady_clock::now();
-          std::printf("gen_split pos=%u tok_s=%.2f\n", pos + 1,
-                      1000.0 * split / std::chrono::duration<double, std::milli>(now - ts).count());
+          const auto tn = std::chrono::steady_clock::now();
+          std::printf("chunk=%u start=%u ms=%.1f\n", ci, ci * B, std::chrono::duration<double, std::milli>(tn - tc).count());
           std::fflush(stdout);
-          ts = now;
+          tc = tn;
         }
       }
       gpu.Synchronize();
-      const double gms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
-      const std::vector<std::uint32_t> gen = dec.Tokens(T_run, T_run + ngen);
-      std::printf("generated_ids=");
-      for (std::size_t i = 0; i < gen.size(); ++i) std::printf("%u%s", gen[i], i + 1 == gen.size() ? "" : " ");
-      std::printf("\n");
-      if (ngen > 1)
-        std::printf("decode_ms=%.2f decode_tok_s=%.2f (context %u)\n", gms / (ngen - 1), 1000.0 * (ngen - 1) / gms,
-                    T_run);
-    }
+      if (slot_save && slot_at >= n_chunks) pf.SaveState(slot_save, n_chunks);
+      if (rowstats) std::fclose(rowstats);
+      const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      std::printf("layers_ms=%.1f\n", layer_ms);
+      if (npu) npu->Report(stdout);
+      pf.ReportWaitLog(stdout);
+      pf.ReportNpuProf();
 
-    if (logits_from < T_run) {
-      const std::size_t rows = T_run - logits_from;
-      std::vector<float> host(rows * kVocab);
-      gpu.D2H(every, host.data(), host.size() * 4, 0);
-      FILE* fa = OpenOut(prefix + ".all_logits");
-      std::fwrite(host.data(), 4, host.size(), fa);
-      std::fclose(fa);
-      std::printf("all_logits rows=%zu from=%u\n", rows, logits_from);
+      {
+        std::vector<float> out(std::size_t{B} * LoomPrefill::kHidden);
+        gpu.D2H(pf.hidden(), out.data(), out.size() * 4, 0);
+        FILE* fo = OpenOut(out_prefix + ".hidden");
+        std::fwrite(out.data(), 4, out.size(), fo);
+        std::fclose(fo);
+      }
+      LoomBuffer logits = gpu.Allocate(std::size_t{kVocab} * 4);
+      LoomBuffer token = gpu.Allocate(4);
+      pf.Head(last_n - 1, {logits.handle, 0, logits.size});
+      pf.Argmax({logits.handle, 0, logits.size}, {token.handle, 0, 4});
+      gpu.Synchronize();
+      std::uint32_t tok = 0;
+      gpu.D2H(token, &tok, 4, 0);
+      std::vector<float> logit_host(kVocab);
+      gpu.D2H(logits, logit_host.data(), logit_host.size() * 4, 0);
+      FILE* fl = OpenOut(out_prefix + ".logits");
+      std::fwrite(logit_host.data(), 4, logit_host.size(), fl);
+      std::fclose(fl);
+      std::printf("argmax=%u\n", tok);
+
+      if (const char* gv = std::getenv("YAH_GEN"); gv && std::atoi(gv) > 0) {
+        const std::uint32_t ngen = static_cast<std::uint32_t>(std::atoi(gv));
+        const char* ddir = std::getenv("YAH_DECODE_HAL");
+        if (!ddir) throw LoomError("YAH_GEN needs YAH_DECODE_HAL (tools/emit_decode.py set)");
+        if (T_run + ngen - 1 > pf.context()) throw LoomError("YAH_GEN: prompt + gen exceeds the emitted context");
+        LoomDecoder dec(gpu, gguf, cfg, ddir, weights);
+        if (dec.context() != pf.pool_rows())
+          throw LoomError("YAH_GEN: decode set context " + std::to_string(dec.context()) + " != prefill pool rows " +
+                          std::to_string(pf.pool_rows()));
+        if (dec.kv_bits() != pf.kv_bits())
+          throw LoomError("YAH_GEN: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
+        dec.Bind(pf.DecoderState());
+        dec.SetTokens(&tok, 1, T_run);
+        gpu.Synchronize();
+        const auto tg = std::chrono::steady_clock::now();
+        const char* sp = std::getenv("YAH_GEN_SPLIT");   // N: sync every N steps and print that slice's tok/s
+        const std::uint32_t split = sp ? static_cast<std::uint32_t>(std::atoi(sp)) : 0;
+        auto ts = tg;
+        for (std::uint32_t pos = T_run; pos + 1 < T_run + ngen; ++pos) {
+          dec.Step(pos, T_run);
+          gpu.Flush();
+          if (split && (pos + 1 - T_run) % split == 0) {
+            gpu.Synchronize();
+            const auto now = std::chrono::steady_clock::now();
+            std::printf("gen_split pos=%u tok_s=%.2f\n", pos + 1,
+                        1000.0 * split / std::chrono::duration<double, std::milli>(now - ts).count());
+            std::fflush(stdout);
+            ts = now;
+          }
+        }
+        gpu.Synchronize();
+        const double gms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
+        const std::vector<std::uint32_t> gen = dec.Tokens(T_run, T_run + ngen);
+        std::printf("generated_ids=");
+        for (std::size_t i = 0; i < gen.size(); ++i) std::printf("%u%s", gen[i], i + 1 == gen.size() ? "" : " ");
+        std::printf("\n");
+        if (ngen > 1)
+          std::printf("decode_ms=%.2f decode_tok_s=%.2f (context %u)\n", gms / (ngen - 1), 1000.0 * (ngen - 1) / gms,
+                      T_run);
+      }
+
+      if (logits_from < T_run) {
+        const std::size_t rows = T_run - logits_from;
+        std::vector<float> host(rows * kVocab);
+        gpu.D2H(every, host.data(), host.size() * 4, 0);
+        FILE* fa = OpenOut(out_prefix + ".all_logits");
+        std::fwrite(host.data(), 4, host.size(), fa);
+        std::fclose(fa);
+        std::printf("all_logits rows=%zu from=%u\n", rows, logits_from);
+      }
     }
     lap("run + out");
     if (times) std::fprintf(stderr, "load: return at %.0f\n", epoch_ms());
