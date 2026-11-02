@@ -10,6 +10,7 @@ The next phase's weight bytes and activation rows load into registers during thi
 Many waves per SIMD hide the load latency that the wave64 shared kernel (about 2 waves per SIMD) leaves exposed.
 """
 import os
+import re
 import sys
 import dataclasses
 from dataclasses import dataclass
@@ -304,13 +305,24 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         bbu, (loads_u, compute_u) = Fu["bb"], Fu["decode"]
         du = default_tile(fmt_up, "swiglu", 20)
         tu = dataclasses.replace(t, w3=du.w3, q4fmix=du.q4fmix)
-        if set(F["extra"]) & set(Fu["extra"]):
-            raise ValueError(f"{fmt}:{fmt_up}: both formats need the same table binding")
+        # both formats with lookup tables: the up's tables (bindings, LDS copies, sign table) get a "u" suffix; a pair with
+        # one table keeps the plain names (and its kernel unchanged)
+        TU2 = bool(set(F["extra"]) & set(Fu["extra"]))
+        extra_u = [x + "u" for x in Fu["extra"]] if TU2 else Fu["extra"]
+
+        def ren(x):
+            if not TU2:
+                return x
+            if isinstance(x, str):
+                return re.sub(r"%(grid|ksigns|sgt)_", r"%\1u_", x)
+            if isinstance(x, (list, tuple)):
+                return type(x)(ren(y) for y in x)
+            return x
 
         def as_up(fn):
             configure(fmt_up, tu)
             try:
-                return fn()
+                return ren(fn())
             finally:
                 configure(fmt, t)
     kr = kind == "kres"
@@ -323,7 +335,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     # ffn: ffn_gate and ffn_up (same format) in one GEMM, out = f16(silu(gate) * up), the swiglu GEMM's scalar ops
     ff = kind == "ffn"
     assert ff == t.ffn, "kind ffn needs Tile.ffn"
-    bufs = (["weight"] + F["extra"] + (Fu["extra"] if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
+    bufs = (["weight"] + F["extra"] + (extra_u if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
             + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
     assert not NPUADD or (kr and KWIN and t.tallepi and t.ecoal and not masked and not t.respre)
     sym = (f"yah_ffn_gemm_{fmt}" + (f"_{fmt_up}" if MX else "") + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")

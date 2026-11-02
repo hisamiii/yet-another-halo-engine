@@ -1062,6 +1062,15 @@ AF_FFN_MIX = {
     ("iq4xs", "iq3s"): dict(AF_FFN["iq4xs"], **AF_MIX),
     ("q5k", "q5k"): dict(AF[("q5k", "swiglu", 1088, 20)], bpre=0, b0early=False, lhs_stream=0),
     ("q3k", "q3k"): dict(AF[("q3k", "swiglu", 1088, 20)], bpre=0, b0early=False, lhs_stream=0),
+    # both formats with lookup tables (the up's bind as gridu / ksignsu, 11-02): iq3xxs:iq3s -1.3%, iq3xxs:iq2s -3.7%,
+    # iq2s:iq3xxs -2.8%, iq2xs:iq2s -4.1%, iq2xs:iq3s -1.9% (IQ2_XS: a gate only, its kstore knobs); iq2s:iq2s with its
+    # swiglu knobs -4.5% (without B prefetch -4.0%)
+    ("iq3xxs", "iq3s"): dict(AF_FFN["iq3xxs"], **AF_MIX),
+    ("iq3xxs", "iq2s"): dict(AF_FFN["iq3xxs"], **AF_MIX),
+    ("iq2s", "iq3xxs"): dict(AF[("iq2s", "swiglu", 1088, 20)], **AF_MIX),
+    ("iq2xs", "iq2s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **AF_MIX),
+    ("iq2xs", "iq3s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **AF_MIX),
+    ("iq2s", "iq2s"): dict(AF[("iq2s", "swiglu", 1088, 20)]),
 }
 
 

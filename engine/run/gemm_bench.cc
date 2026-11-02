@@ -174,21 +174,27 @@ int main(int argc, char** argv) {
         }
         weight_names = j.tensor + j.kind;
       }
-      LoomBuffer grid;
-      // a mixed ffn ("<gate>:<up>") binds the grid of whichever of its formats has one (the generator allows only one)
-      std::string gfmt = j.fmt;
-      for (std::size_t a = 0, b; a <= j.fmt.size(); a = b + 1) {
+      LoomBuffer grid, gridu;
+      // a mixed ffn ("<gate>:<up>") binds the gate format's grid as "grid" and the up format's as "grid" when the gate has
+      // none, else as "gridu"
+      std::string gfmt, ufmt;
+      const auto has_grid = [](const std::string& f) {
+        return f == "iq3s" || f == "iq3xxs" || f == "iq2xxs" || f == "iq2xs" || f == "iq2s";
+      };
+      for (std::size_t a = 0, b, i = 0; a <= j.fmt.size(); a = b + 1, ++i) {
         b = j.fmt.find(':', a);
         if (b == std::string::npos) b = j.fmt.size();
         const std::string f = j.fmt.substr(a, b - a);
-        if (f == "iq3s" || f == "iq3xxs" || f == "iq2xxs" || f == "iq2xs") gfmt = f;
+        if (has_grid(f)) (i == 0 || gfmt.empty() ? gfmt : ufmt) = f;
       }
-      const bool needs_grid = gfmt == "iq3s" || gfmt == "iq3xxs" || gfmt == "iq2xxs" || gfmt == "iq2xs";
-      if (needs_grid) {
-        const auto g = ReadFile(tables + "/grid_" + gfmt + ".bin");
-        grid = gpu.Allocate(g.size());
-        gpu.H2D(grid, g.data(), g.size());
-      }
+      const auto load_grid = [&](LoomBuffer& g, const std::string& f) {
+        const auto d = ReadFile(tables + "/grid_" + f + ".bin");
+        g = gpu.Allocate(d.size());
+        gpu.H2D(g, d.data(), d.size());
+      };
+      const bool needs_grid = !gfmt.empty();
+      if (needs_grid) load_grid(grid, gfmt);
+      if (!ufmt.empty()) load_grid(gridu, ufmt);
       const std::uint32_t k_dim = ts.empty() ? tiled_dims0 : static_cast<std::uint32_t>(ts[0]->dims[0]);
       if (std::find(j.roles.begin(), j.roles.end(), "input_tiled") != j.roles.end() && tiled_k != k_dim) {
         if (!k_dim || k_dim % 16) throw LoomError(j.hal + ": input_tiled needs a GGUF weight with K % 16 == 0");
@@ -205,6 +211,8 @@ int main(int argc, char** argv) {
         const LoomBuffer* x = r == "weight"    ? &weights[0]
                               : r == "grid"    ? (needs_grid ? &grid : nullptr)
                               : r == "ksigns"  ? &ksigns
+                              : r == "gridu"   ? (ufmt.empty() ? nullptr : &gridu)
+                              : r == "ksignsu" ? &ksigns
                               : r == "input"   ? &input
                               : r == "input_tiled" ? &input_tiled
                               : r == "gate"    ? &gate

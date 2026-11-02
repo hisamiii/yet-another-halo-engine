@@ -132,7 +132,7 @@ def tables(work):
     table_dir = os.path.join(work, "tables")
     os.makedirs(table_dir, exist_ok=True)
     for src, dst in (("grid_iq3s.bin", "grid_iq3s.bin"), ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
-                     ("grid_iq2xxs.bin", "grid_iq2xxs.bin"), ("grid_iq2xs.bin", "grid_iq2xs.bin"),
+                     ("grid_iq2xxs.bin", "grid_iq2xxs.bin"), ("grid_iq2xs.bin", "grid_iq2xs.bin"), ("grid_iq2s.bin", "grid_iq2s.bin"),
                      ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")):
         shutil.copy(os.path.join(E.LOOM, "tables", src), os.path.join(table_dir, dst))
     return table_dir
