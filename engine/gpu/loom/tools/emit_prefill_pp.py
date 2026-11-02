@@ -1090,11 +1090,11 @@ AF_FFN_MIX = {
     # swiglu knobs -4.5% (without B prefetch -4.0%)
     ("iq3xxs", "iq3s"): dict(AF_FFN["iq3xxs"], **AF_MIX),
     ("iq3xxs", "iq2s"): dict(AF_FFN["iq3xxs"], **AF_MIX),
-    # 11-02 sweep (epilogue orders, lhs_stream, wlate; all bit-identical): gemm_bench had lhs_stream 1 at 1-3% better for
-    # iq2s:iq3xxs / iq2xs:iq3s / iq3s:q3k, but in pp2048 counters none moved past the single-call noise (+-0.4 Mcyc)
-    ("iq2s", "iq3xxs"): dict(AF[("iq2s", "swiglu", 1088, 20)], **AF_MIX),
-    ("iq2xs", "iq2s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **AF_MIX),
-    ("iq2xs", "iq3s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **AF_MIX),
+    # lhs_stream 1 (each A fragment just before its MMAs; 176 VGPRs): pp2048 counters, 3 runs each, -0.5 M cycles per
+    # call (-1.2%) for these three, bit-identical; iq3s:q3k +0.5% with it (gemm_bench had all four 1-3% better)
+    ("iq2s", "iq3xxs"): dict(AF[("iq2s", "swiglu", 1088, 20)], **dict(AF_MIX, lhs_stream=1)),
+    ("iq2xs", "iq2s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **dict(AF_MIX, lhs_stream=1)),
+    ("iq2xs", "iq3s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **dict(AF_MIX, lhs_stream=1)),
     ("iq2s", "iq2s"): dict(AF[("iq2s", "swiglu", 1088, 20)]),
 }
 
