@@ -26,7 +26,7 @@ V = 248320
 FROM = int(os.environ.get("FROM", "1536"))
 TIE = float(os.environ.get("TIE", "0.1"))
 CORPUS = os.environ.get("CORPUS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate", "corpus"))
-CHUNK = 32
+CHUNK = int(os.environ.get("CHUNK", "8"))   # rows per step: the row sums do not depend on it
 # Long windows "L<n>": corpus/ids8192_w<n>.txt, run on an 8192-token HAL set.
 # Scored from FROM_L (default 7680: 512 positions, as in the 2048 windows).
 FROM_L = int(os.environ.get("FROM_L", "7680"))
@@ -89,7 +89,10 @@ def windows_arg(argv):
 
 
 def run(gdir, cdir, ws):
-    return summarize([window_stats(gdir, cdir, w) for w in ws])
+    # one process per window (JOBS at a time, ~0.1 GB each): the windows are independent, map keeps their order
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(max(1, min(len(ws), int(os.environ.get("JOBS", "16"))))) as ex:
+        return summarize(list(ex.map(window_stats, [gdir] * len(ws), [cdir] * len(ws), ws)))
 
 
 def main():
