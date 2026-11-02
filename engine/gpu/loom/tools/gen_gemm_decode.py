@@ -46,6 +46,32 @@ Q3_F16S = True
 # quant 0..7 with the -4 bias in v_fma_mix's addend, as IQ4_XS, drops more ops but makes quant 0 under a negative scale
 # +0: see Q3_FMIX; gate N KL 1.51e-6, not bit-identical.)
 Q3_NOMUL = True
+# Q3_LUT (with Q3_F16S): |quant| and its sign byte by two runtime-selector v_perm_b32 byte lookups on u = low | bit << 2
+# (8-entry tables: |u - 4| and 0x80 for u < 4) through a Low helper (lowdefs), instead of the xor / or / add chain:
+# the same bytes, 2 VALU fewer per word. Set per tile (gen_gemm_tile.configure: afrag tiles)
+Q3_LUT = True
+Q3_LUT_DEF = [
+    "amdgpu.target<gfx11-generic> @yah_q3k_lut_target",
+    "low.func.def target<amdgpu.gfx11.generic.core>(@yah_q3k_lut_target) @yah_q3k_lut(%u: reg<amdgpu.vgpr x4>)"
+    " -> (reg<amdgpu.vgpr x4>, reg<amdgpu.vgpr x4>) asm {",
+    "  %mlo = s_mov_b32 16909060",      # bytes 4 3 2 1: u = 0..3 -> 4 - u
+    "  %mhi = s_mov_b32 50462976",      # bytes 0 1 2 3: u = 4..7 -> u - 4
+    "  %slo = s_mov_b32 2155905152",    # 0x80808080: negative for u < 4
+    "  %shi = s_mov_b32 0"]
+for _i in range(4):
+    Q3_LUT_DEF += [f"  %u{_i} = slice %u[{_i}] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>",
+                   f"  %m{_i} = v_perm_b32 %mhi, %mlo, %u{_i}",
+                   f"  %s{_i} = v_perm_b32 %shi, %slo, %u{_i}"]
+Q3_LUT_DEF += ["  %m = concat(%m0, %m1, %m2, %m3) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>)"
+               " -> reg<amdgpu.vgpr x4>",
+               "  %s = concat(%s0, %s1, %s2, %s3) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>)"
+               " -> reg<amdgpu.vgpr x4>",
+               "  return %m, %s", "}", ""]
+
+
+def lowdefs(fmts):
+    """Module-level Low helpers the decoders of fmts invoke (emitted after the kernel's target)."""
+    return list(Q3_LUT_DEF) if "q3k" in fmts and Q3_F16S and Q3_LUT else []
 # Q6DFMA: Q6_K's (d * sc) * q then fptrunc as fptrunc(fma(d * sc, q, -0.0)) per element (v_fma_mix; adding -0.0 keeps
 # every value and zero sign)
 Q6DFMA = True
@@ -1912,15 +1938,23 @@ def q3k_compute(v, gb):
                 e(f"    %q3low{t} = vector.andi %q3lw{t}, %q3m3w : vector<4xi32>")
                 e(f"    %q3bw{t} = vector.shrui %q3hw{t}, %q3bsw{u} : vector<4xi32>")
                 e(f"    %q3bit{t} = vector.andi %q3bw{t}, %q3m1w : vector<4xi32>")
-                e(f"    %q3nb{t} = vector.xori %q3bit{t}, %q3m1w : vector<4xi32>")
-                if Q3_NOMUL:   # nb * 3 as nb | nb << 1 (bits 0 / 1 of each byte): two full-rate ops for v_mul_lo_u32
+                if Q3_LUT:
+                    e(f"    %q3b2{t} = vector.shli %q3bit{t}, %q3c2w : vector<4xi32>")
+                    e(f"    %q3u{t} = vector.ori %q3low{t}, %q3b2{t} : vector<4xi32>")
+                    e(f"    %q3magw{t}, %q3sgnw{t} = low.invoke @yah_q3k_lut(%q3u{t}) : (vector<4xi32>) -> (vector<4xi32>, vector<4xi32>)")
+                else:
+                    e(f"    %q3nb{t} = vector.xori %q3bit{t}, %q3m1w : vector<4xi32>")
+                if Q3_LUT:
+                    pass
+                elif Q3_NOMUL:   # nb * 3 as nb | nb << 1 (bits 0 / 1 of each byte): two full-rate ops for v_mul_lo_u32
                     e(f"    %q3n2{t} = vector.shli %q3nb{t}, %q3m1s : vector<4xi32>")
                     e(f"    %q3n3{t} = vector.ori %q3nb{t}, %q3n2{t} : vector<4xi32>")
                 else:
                     e(f"    %q3n3{t} = vector.muli %q3nb{t}, %q3c3w : vector<4xi32>")   # bytes 0 / 3, no carries
-                e(f"    %q3mx{t} = vector.xori %q3low{t}, %q3n3{t} : vector<4xi32>")
-                e(f"    %q3magw{t} = vector.addi %q3mx{t}, %q3nb{t} : vector<4xi32>")
-                e(f"    %q3sgnw{t} = vector.shli %q3nb{t}, %q3c7w : vector<4xi32>")
+                if not Q3_LUT:
+                    e(f"    %q3mx{t} = vector.xori %q3low{t}, %q3n3{t} : vector<4xi32>")
+                    e(f"    %q3magw{t} = vector.addi %q3mx{t}, %q3nb{t} : vector<4xi32>")
+                    e(f"    %q3sgnw{t} = vector.shli %q3nb{t}, %q3c7w : vector<4xi32>")
                 e(f"    %q3l8{t} = scalar.addi {lo8}, %c0i : i32")
                 e(f"    %q3l4s{t} = scalar.shrui %q3l8{t}, %q3s4{u} : i32")
                 e(f"    %q3l4{t} = scalar.andi %q3l4s{t}, %c15i : i32")
@@ -1997,7 +2031,8 @@ def q3k_setup():
     f16s = ["  %q3c24f = scalar.constant 16777216.0 : f32", "  %q3c3i_w = scalar.constant 3 : i32",
             "  %q3c3w = vector.splat %q3c3i_w : vector<4xi32>", "  %q3c7i_w = scalar.constant 7 : i32",
             "  %q3c7w = vector.splat %q3c7i_w : vector<4xi32>", "  %q3c1i_s = scalar.constant 1 : i32",
-            "  %q3m1s = vector.splat %q3c1i_s : vector<4xi32>"]
+            "  %q3m1s = vector.splat %q3c1i_s : vector<4xi32>", "  %q3c2i_w = scalar.constant 2 : i32",
+            "  %q3c2w = vector.splat %q3c2i_w : vector<4xi32>"]
     return (f16s if Q3_F16S else []) + ["  %q3cm0f = scalar.constant -0.0 : f32", "  %q3c54i = scalar.constant 54 : i32", "  %q3c96i = scalar.constant 96 : i32",
             "  %q3c3b = scalar.constant 3 : i8", "  %q3c1b = scalar.constant 1 : i8",
             "  %q3c2b = scalar.constant 2 : i8", "  %q3c4b = scalar.constant 4 : i8",

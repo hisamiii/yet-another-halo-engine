@@ -29,12 +29,33 @@ def _parts(text):
     return L[:idef], sym, binds, body
 
 
+def _items(hdr):
+    """A kernel header's module-level items: target declarations and whole low.func.def blocks (comments dropped)."""
+    out, cur = [], None
+    for l in hdr:
+        if cur is not None:
+            cur.append(l)
+            if l == "}":
+                out.append("\n".join(cur)); cur = None
+        elif l.startswith("low.func.def "):
+            cur = [l]
+        elif l.startswith("amdgpu.target"):
+            out.append(l)
+    return out
+
+
 def segcat(sym, segs, wgs=512):
     out_binds, bodies, lds, groups = [], [], {}, []
     head = None
     for i, (text, (mt, kb, tt)) in enumerate(segs):
         hdr, ssym, binds, body = _parts(text)
-        head = head or [l for l in hdr if not l.startswith("config.decl")]
+        if head is None:
+            head = [l for l in hdr if not l.startswith("config.decl")]
+        else:   # a later segment's targets and Low helpers (gen_gemm_decode.lowdefs) the merged kernel lacks
+            have = "\n".join(head)
+            for item in _items(hdr):
+                if item not in have:
+                    head += item.split("\n")
         cfg = {"m_tiles": mt, "k_blocks": kb, "token_tiles": tt}
         body = [re.sub(r"config\.get @%s\.(\w+) : index" % ssym, lambda m: "index.constant %d : index" % cfg[m.group(1)], l)
                 for l in body]
