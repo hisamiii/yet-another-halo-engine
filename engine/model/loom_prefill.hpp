@@ -2737,7 +2737,7 @@ class LoomPrefill {
     // pnq kernels read
     const bool pnq = a4_ && dnsplit_a_ && !out_af && geom_.count("pnq_a.hal");
     if (pnq != (geom_.count("dnperm") != 0)) throw LoomError("the A4 pnq postnorm and dnperm go together");
-    if (dn_done && !pnq) throw LoomError("dispatch.txt dnvconv needs the pnq postnorm");
+    // dnvconv without pnq (f16 sets, gen_gdn_ss natural): the plain postnorm parts, then the conv ring update
     if (pnq) {
       // A4: the postnorm and ssm_out's rotq in one kernel per DeltaNet part (gen_rot.gen_pnq), each reading its part's
       // output (after the gate GEMM, which runs beside the second DeltaNet part)
@@ -2812,6 +2812,7 @@ class LoomPrefill {
       Dispatch(Exe(out_af ? "postnorm_t.hal" : "postnorm.hal"), "yah_ssm_postnorm_fp16", 6 * B_, 1, 1, 256, 1, 1,
                {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
     }
+    if (dn_done) ring();
     trim_row_ = tail_;
     RunResidual(pre + "ssm_out.weight", *scratch_, out_af);
     trim_row_ = kAllRows;

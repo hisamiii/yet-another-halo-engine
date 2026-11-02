@@ -192,6 +192,12 @@ DNO16 = os.environ.get("YAH_DN_O16", "1") == "1"
 # pnq a). A ninth wave runs the solve beside the row waves' K S^T / Q S^T (X = T1 (K S^T), not bit-identical): part a
 # 34.5 -> 30.7 ms, part b 33.4 -> 31.0; WT2 KL 0.0671 -> 0.0683 / q99.9 2.026 -> 2.054, inside the redraw spread.
 DNSS = True
+# DNSS_NAT: f16 (non-A4) sets with the state-stationary DeltaNet too: the v conv inside it (DNVCONV's path), head ranges,
+# its O as f32 at the heads' own columns (gen_gdn_ss natural), read by the plain postnorm parts. Sets whose NPU takes
+# qkv rows keep gen_gdn_chunk (the v conv needs every qkv column). Gate N mean KL 1.06e-6 (vs the f32 recurrent
+# reference 1.53e-6, gen_gdn_chunk 1.08e-6); pp2048 GPU only -0.97% (11-02: DeltaNet alone 66 -> 34 ms, conv 18 -> 9,
+# the postnorm loses its overlap 14 -> 24). Fusing the postnorm into part a passed the gate but doubled part a.
+DNSS_NAT = os.environ.get("YAH_DNSS_NAT", "1") == "1"
 
 
 def _rewrite(text, pairs):
@@ -201,9 +207,19 @@ def _rewrite(text, pairs):
     return text
 
 
+# DN_REC: the f32 recurrent DeltaNet (gen_deltanet_hip) at any B, as the B % 32 != 0 sets have it: an accuracy reference
+# for DeltaNet changes (engine/run/gate), not a production set
+DN_REC = os.environ.get("YAH_DN_REC", "0") == "1"
+
+
+def dn32(B):
+    """The chunked DeltaNet (and its f16 conv hand-off) applies."""
+    return B % 32 == 0 and not DN_REC
+
+
 def conv_tb_ok(B):
     """The f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup applies."""
-    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and B % 32 == 0 and gen_gdn_chunk.CONV16
+    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and dn32(B) and gen_gdn_chunk.CONV16
 
 
 def conv_x16(text):
@@ -2403,11 +2419,12 @@ def main():
     # Its grid (2, heads) is recorded as rowsplit.hal's row group.
     # It needs B % 32 == 0; else the recurrent kernel (tools/gen_deltanet_hip.py, same ABI and grid).
     dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
-    open(dn_src, "w").write(gen_gdn_chunk.gen() if B % 32 == 0 else gen_deltanet_hip.gen())
+    open(dn_src, "w").write(gen_gdn_chunk.gen() if dn32(B) else gen_deltanet_hip.gen())
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
     conv_tb = conv_tb_ok(B)
-    dn_vconv = DNVCONV and conv_tb and a4 and DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT and not EMIT_HALF
+    dn_vconv = (DNVCONV and conv_tb and (a4 or (DNSS_NAT and B % 32 == 0)) and DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT
+                and not EMIT_HALF)
     if dn_vconv:
         text = gen_conv_kq.gen(4096)
         geom.append(("dnvconv", gen_conv_kq.tiles(4096), 0, 0))
@@ -2417,7 +2434,7 @@ def main():
         text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
         if 640 in O16_MT:
             text = conv_x16(text)
-        if B % 32 == 0 and gen_gdn_chunk.CONV16:
+        if dn32(B) and gen_gdn_chunk.CONV16:
             text = conv_n16(text)
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
@@ -2442,6 +2459,8 @@ def main():
     open(postnorm_src, "w").write(postnorm_base)
     dn_perm = a4 and DNSPLIT == (40, 8)
     dn_ss = DNSS and dn_perm and dn_vconv and DNO16 and B % 32 == 0
+    dn_nat = not a4 and dn_vconv   # DNSS_NAT
+    dn_ss = dn_ss or dn_nat
     # one flagged pnq for both DeltaNet parts (gen_rot.gen_pnq "ab"): part b's DeltaNet counts its finished lanes
     pnq_ab = DNOV_ON and dn_ss
     DNRING_ON = DNRING and pnq_ab and RQK_ON and NQW_ON and DNSPLIT == (40, 8)
@@ -2455,7 +2474,7 @@ def main():
     dn_parts = []
     # A4 sets: DeltaNet part b runs the heads of whole rotq groups (gen_rot.pn_heads), so each fused postnorm + rotq part
     # (gen_pnq) reads one part's compact output; "dnperm" tells the host the parts are head sets, not ranges
-    if B % 32 == 0 and DNSPLIT:
+    if dn32(B) and DNSPLIT:
         ha, hb = DNSPLIT
         for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
@@ -2465,6 +2484,8 @@ def main():
                     open(src, "w").write(gen_gdn_ss.gen(gen_rot.pn_heads(tag), flag=pnq_ab and tag == "b"))
                 else:
                     open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=DNO16))
+            elif dn_nat:
+                open(src, "w").write(gen_gdn_ss.gen(list(range(h0, h0 + nh)), natural=True))
             else:
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
