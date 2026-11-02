@@ -69,9 +69,28 @@ Q3_LUT_DEF += ["  %m = concat(%m0, %m1, %m2, %m3) : (reg<amdgpu.vgpr>, reg<amdgp
                "  return %m, %s", "}", ""]
 
 
+# Q5_ROT: Q5_K's fifth bits by one rotate, v_alignbit_b32(qh, qh, g + 28) (bit g of every byte to bit 4, either
+# direction), and one v_and_or_b32 into the nibbles, instead of shift / and / shift / or: the same bytes, 2 VALU fewer
+# per word (HRX patch 0052 gives Low both instructions). Set per tile like Q3_LUT
+Q5_ROT = True
+Q5_ROT_DEF = [
+    "amdgpu.target<gfx11-generic> @yah_q5k_rot_target",
+    "low.func.def target<amdgpu.gfx11.generic.core>(@yah_q5k_rot_target) @yah_q5k_rot(%qh: reg<amdgpu.vgpr x4>,"
+    " %sh: reg<amdgpu.vgpr>, %nib: reg<amdgpu.vgpr x4>) -> (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>,"
+    " reg<amdgpu.vgpr>) asm {",
+    "  %bit4 = s_mov_b32 269488144"]     # 0x10101010
+for _i in range(4):
+    Q5_ROT_DEF += [f"  %qh{_i} = slice %qh[{_i}] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>",
+                   f"  %nib{_i} = slice %nib[{_i}] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>",
+                   f"  %r{_i} = v_alignbit_b32 %qh{_i}, %qh{_i}, %sh",
+                   f"  %n{_i} = v_and_or_b32 %r{_i}, %bit4, %nib{_i}"]
+Q5_ROT_DEF += ["  return %n0, %n1, %n2, %n3", "}", ""]
+
+
 def lowdefs(fmts):
     """Module-level Low helpers the decoders of fmts invoke (emitted after the kernel's target)."""
-    return list(Q3_LUT_DEF) if "q3k" in fmts and Q3_F16S and Q3_LUT else []
+    return ((list(Q3_LUT_DEF) if "q3k" in fmts and Q3_F16S and Q3_LUT else [])
+            + (list(Q5_ROT_DEF) if "q5k" in fmts and Q5_ROT else []))
 # Q6DFMA: Q6_K's (d * sc) * q then fptrunc as fptrunc(fma(d * sc, q, -0.0)) per element (v_fma_mix; adding -0.0 keeps
 # every value and zero sign)
 Q6DFMA = True
@@ -1035,6 +1054,8 @@ def q4k_compute(v, gb, q5=False):
             # fifth bit: quant = nibble + ((qh[lane] >> g) & 1) * 16
             e(f"    %g8_{u} = scalar.trunci %g{u} : i32 to i8")
             e(f"    %g8v_{u} = vector.splat %g8_{u} : vector<16xi8>")
+            if Q5_ROT:
+                e(f"    %g28_{u} = scalar.addi %g{u}, %q5c28 : i32")
         # nibbles on whole 32-bit words, (w >> s) & 0x0f0f0f0f: per-byte i8 shifts and masks lower element by element
         if rt:
             e(f"    %gshw{u} = vector.splat %gsh{u} : vector<4xi32>")
@@ -1049,11 +1070,21 @@ def q4k_compute(v, gb, q5=False):
             if q5:
                 # the fifth bit on words too: ((qh >> g) & 0x01010101) << 4, ORed in (the bits do not overlap, so OR is the add)
                 e(f"    %hw{half}{u} = vector.bitcast {qh} : vector<16xi8> to vector<4xi32>")
-                e(f"    %hgw{half}{u} = vector.splat %g{u} : vector<4xi32>")
-                e(f"    %hs{half}{u} = vector.shrui %hw{half}{u}, %hgw{half}{u} : vector<4xi32>")
-                e(f"    %hb{half}{u} = vector.andi %hs{half}{u}, %m014 : vector<4xi32>")
-                e(f"    %h16{half}{u} = vector.shli %hb{half}{u}, %s44 : vector<4xi32>")
-                e(f"    %n5w{half}{u} = vector.ori %qwm{half}{u}, %h16{half}{u} : vector<4xi32>")
+                if Q5_ROT:
+                    # one-element vector results: an i32 result maps to an SGPR in a seg rider, which the helper refuses
+                    vs = [f"%n5v{half}{u}_{w}" for w in range(4)]
+                    ws = [f"%n5x{half}{u}_{w}" for w in range(4)]
+                    e(f"    {', '.join(vs)} = low.invoke @yah_q5k_rot(%hw{half}{u}, %g28_{u}, %qwm{half}{u}) : "
+                      "(vector<4xi32>, i32, vector<4xi32>) -> (vector<1xi32>, vector<1xi32>, vector<1xi32>, vector<1xi32>)")
+                    for v_, w_ in zip(vs, ws):
+                        e(f"    {w_} = vector.extract {v_}[0] : vector<1xi32> -> i32")
+                    e(f"    %n5w{half}{u} = vector.from_elements {', '.join(ws)} : vector<4xi32>")
+                else:
+                    e(f"    %hgw{half}{u} = vector.splat %g{u} : vector<4xi32>")
+                    e(f"    %hs{half}{u} = vector.shrui %hw{half}{u}, %hgw{half}{u} : vector<4xi32>")
+                    e(f"    %hb{half}{u} = vector.andi %hs{half}{u}, %m014 : vector<4xi32>")
+                    e(f"    %h16{half}{u} = vector.shli %hb{half}{u}, %s44 : vector<4xi32>")
+                    e(f"    %n5w{half}{u} = vector.ori %qwm{half}{u}, %h16{half}{u} : vector<4xi32>")
                 e(f"    %n5{half}{u} = vector.bitcast %n5w{half}{u} : vector<4xi32> to vector<16xi8>")
                 src = f"%n5{half}{u}"
             if Q4_F16P and Q4FMIX and Q4DFMA:
@@ -1131,7 +1162,7 @@ def q4k_setup():
             "  %q4sh0 = scalar.constant 0 : i32", "  %q4sh4 = scalar.constant 4 : i32",
             "  %c16i_q = scalar.constant 16 : i32", "  %c255i_q = scalar.constant 255 : i32",
             "  %c014 = scalar.constant 16843009 : i32", "  %m014 = vector.splat %c014 : vector<4xi32>",
-            "  %s44 = vector.splat %q4sh4 : vector<4xi32>",
+            "  %s44 = vector.splat %q4sh4 : vector<4xi32>", "  %q5c28 = scalar.constant 28 : i32",
             "  %q4m1 = scalar.constant -1 : i32", "  %q4one_b = scalar.constant 1065353216 : i32"]
 
 

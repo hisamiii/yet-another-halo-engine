@@ -217,7 +217,8 @@ def configure(fmt, t):
     G.IQ3_GADDR = t.gaddr
     G.IQ3_SGTAB_W = t.sgtw
     G.IQ3_F16S = t.f16s
-    G.Q3_LUT = t.afrag   # (and not swiglu, gen): two LDS tiles that fit 64 KB only overlapped, which a Low call prevents
+    G.Q3_LUT = G.Q5_ROT = t.afrag   # (and not swiglu, gen): two LDS tiles that fit 64 KB only overlapped, which a
+    # Low call prevents
     # IQ2: the same word path and sign chain (IQ2_W): -5.6% clock-free
     G.IQ2_W = fmt in ("iq2xxs", "iq2xs", "iq2s")
     if G.IQ2_W:
@@ -244,7 +245,7 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
     if fmt_up is not None and (kind != "ffn" or fmt_up == fmt):
         raise ValueError("a gate:up format pair is for kind ffn with two formats")
     configure(fmt, t)
-    G.Q3_LUT = G.Q3_LUT and kind != "swiglu"
+    G.Q3_LUT, G.Q5_ROT = G.Q3_LUT and kind != "swiglu", G.Q5_ROT and kind != "swiglu"
     return _gen(fmt, kind, t, masked, fmt_up)
 
 
