@@ -51,7 +51,8 @@ def emit(work, tag, fmt, kind, t, mt, kb, tt, ostride, out16=False, persist=None
     try:
         if persist is not None:
             text = gen_kres_persist.persist(TG.gen(fmt, "kres", persist, False),
-                                            TG.gen(fmt, "kstore", dataclasses.replace(persist, respre=0), False), ntiles)
+                                            TG.gen(fmt, "kstore", dataclasses.replace(persist, respre=0), False), ntiles,
+                                            place=persist.pslice)
         else:
             text = TG.gen(fmt, kind, t)
     finally:

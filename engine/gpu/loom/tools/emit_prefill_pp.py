@@ -974,9 +974,9 @@ AF = {
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False, gaddr=True, f16s=True),  # -12.1%
     ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, f16p=True, gaddr=True, f16s=True,
                                     persist=dict(b0early=True, lhs_stream=2)),               # -8.6%
-    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -10.4%
+    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=dict(pslice="top_top")), # -10.4%
     ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
-                                      persist=True),                                         # -8.2%
+                                      persist=dict(pslice="b0_a1")),                         # -8.2%
     ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
     ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
     ("q3k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),
@@ -986,8 +986,8 @@ AF = {
     ("iq3s", "kres", 320, 24): dict(AF_PIPE3, gaddr=True, f16s=True, sgtab=True,
                                     persist=dict(b0early=True, lhs_stream=2)),               # -8.8%
     ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
-                                      persist=True),                                         # -8.5%
-    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -8.8%
+                                      persist=dict(pslice="b0_a1")),                         # -8.5%
+    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=dict(pslice="top_top")), # -8.8%
     ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),             # -5.3%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
     ("iq3s", "kstore", 640, 20): dict(AF_PIPE3, lhs_stream=3, gaddr=True, f16s=True),       # -9.6%
@@ -1084,7 +1084,8 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
         # persist: True, or a dict of knobs for the persistent variant (its slice loads need registers: IQ3_S drops b0early 2)
         pt = dataclasses.replace(t, **persist) if isinstance(persist, dict) else t
         text = gen_kres_persist.persist(TG.gen(fmt, "kres", pt, False),
-                                        TG.gen(fmt, "kstore", dataclasses.replace(pt, respre=0), False), B // t.bn)
+                                        TG.gen(fmt, "kstore", dataclasses.replace(pt, respre=0), False), B // t.bn,
+                                        place=pt.pslice)
         r = _emit_gen(lambda f, k: text, t.bn, fmt, mt, kb, B, out[:-4] + ".af.p.hal", outdir, kind, t.rowgrp)
         if r:
             rows.append(r)
@@ -1290,7 +1291,7 @@ def npu_split(rows, combos, B, outdir):
         if persist is not None:
             gen = lambda f, k: gen_kres_persist.persist(TG.gen(f, "kres", persist, False),
                                                        TG.gen(f, "kstore", dataclasses.replace(persist, respre=0), False),
-                                                       tokens // tf.bn)
+                                                       tokens // tf.bn, place=persist.pslice)
         else:
             gen = lambda f, k: TG.gen(f, k, tf, False)
         try:

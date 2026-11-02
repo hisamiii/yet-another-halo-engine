@@ -102,6 +102,9 @@ class Tile:
                                # (gen_gemm_decode.IQ3_GADDR; -15..-23 loop VALU)
     esr: int = 16              # tall epilogue slab rows (32 with ecoal: 8 lanes per token, full 128-byte rows per access)
     respre: int = 0            # kres tall epilogue: issue each slab group's residual loads this many groups ahead (0: at use)
+    pslice: str = ""           # persistent kres (gen_kres_persist): where each K-loop phase issues the previous tile's slice
+                               # "<loads>_<add+store>" (top / b0 after barrier 0 / b1 before barrier 1 / a1 after it);
+                               # "" = b0_b1. Same values; it steers the register allocator's WMMA banks
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
     ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
                                # (the weight binding spans ffn_gate and the ffn_up right after it: up row r is row m_rows + r)
