@@ -1243,6 +1243,12 @@ def seg_gemms(rows, B, outdir):
     return keep
 
 
+# The out projections' (K = 6144) start stagger: the second workgroup per WGP waits this many barriers (gen_gemm_tile
+# STAGGER, default 8000). 11-02 pp2048 counters, out kres M cycles (iq4xs / q4k per call / q5k): 8000 252.6 / 7.06 / 86.0,
+# 4000 250.8 / 7.03 / 85.8, 2000 250.6 / 7.01 / 85.3, 1000 251.5 / 7.04 / 85.8, 0 253.2 / 7.07 / 86.5. Same values.
+OUT_KRES_STAGGER = 2000
+
+
 def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     """Emit "<hal>.af.hal" (and for swiglu "<hal>.af.to.hal", fragment-major output) if this GEMM has an afrag form."""
     import gen_gemm_tile as TG
@@ -1250,6 +1256,8 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     if not AFRAG or knobs is None or B % AF_TILE["bn"]:
         return []
     knobs = dict(knobs)
+    if kind == "kres" and kb == 24:
+        knobs.setdefault("stagger", OUT_KRES_STAGGER)
     persist = knobs.pop("persist", False)
     t = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **knobs)
     rows = []
