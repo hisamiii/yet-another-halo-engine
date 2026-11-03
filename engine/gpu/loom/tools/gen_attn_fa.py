@@ -165,6 +165,7 @@ R2P = False
 R2P_QKF = 1         # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
 R2P_PVF = 1         # R2P: the same for the V^T fragments
 R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
+R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 PAIR_MAP = "mod"    # "mod": pair = waves (p, p + 4), one A and one B per SIMD; "adj": (2p, 2p + 1)
 PAIR_LATE = True    # PAIR: K / V staging loads in phase 2 (fewer VGPRs, but their latency is exposed: off when deployed)
 PAIR_BFIRST = False # PAIR: the P.V (B) arm first in the role branch
@@ -1728,7 +1729,13 @@ def gen():
         if early:
             early()
         # one wave-uniform branch: raise the max and rescale O / l only when some row needs it (FA4 conditional rescale)
-        e("    %grow = scalar.cmpf ogt, %tmax, %rmax : f32")
+        if R2P and R2P_LAZY:   # the max is raised only past rmax + R2P_LAZY: p up to e^R2P_LAZY (f16 has room), O
+            # and l carry the same stale scale, which the epilogue's O / l cancels (rounding points move: gate N)
+            e(f"    %lzth = scalar.constant {R2P_LAZY} : f32")
+            e("    %tmlz = scalar.subf %tmax, %lzth : f32")
+            e("    %grow = scalar.cmpf ogt, %tmlz, %rmax : f32")
+        else:
+            e("    %grow = scalar.cmpf ogt, %tmax, %rmax : f32")
         e("    %anygrow = kernel.subgroup.vote.any %grow : i1")
         if pair_slot is not None:   # O lives in wave B: only the max and alpha here
             e("    %rsm, %rss = scf.if %anygrow -> (f32, f32) {")
