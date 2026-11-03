@@ -62,6 +62,9 @@ def layout(text, path):
         if PQUEUE not in text:
             sys.exit(f"refused {path}: its queue is not 264 i32")
         text = text.replace(", %pqueue: buffer)", ")")
+    # an f16 gate view (gen_attn_fa R2P_GSIG16) covers half the f32 gate allocation: size it as the f32 one
+    text = text.replace("%g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf16>",
+                        "%g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
     for name, lines in LAYOUTS.items():
         if all(x in text for x in lines):
             break

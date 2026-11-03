@@ -1559,6 +1559,65 @@ def recip1(e, out, dn, ind="  ", bare=False):
     e(f"{ind}{out} = scf.select {out}_if, %rcp_zero, {out}_r1 : f32")
 
 
+# KQG_GSIG=16: the kqg GEMM writes sigmoid(gate) as f16 (=32: as f32, bit-identical to the attention's own) (attention gen_attn_fa R2P_GSIG16 reads it: no exp / reciprocal
+# in the attention epilogue, half the gate bytes). The attention's EPI_FAST sigmoid ops, then one f16 rounding
+KQG_GSIG = os.environ.get("KQG_GSIG", "")   # "16" / "32": sigmoid(gate) stored as f16 / f32
+KQG_GSIG16 = KQG_GSIG in ("16", "u16")   # u16: round(s * 65535) as unorm16 bits in the f16 gate buffer
+KQG_QH = os.environ.get("KQG_QH", "0") == "1"   # diag: q rounded to f16, stored as f32 (the precision of an f16 q)
+
+
+def gsig16_consts(e):
+    e("  %qs_one4 = vector.constant 1.0 : vector<4xf32>")
+    e("  %qs_neg4 = vector.constant -1.0 : vector<4xf32>")
+    e("  %qs_l2e4 = vector.constant 1.4426950408889634 : vector<4xf32>")
+    e("  %qs_fmax4 = vector.constant 3.4028234663852886e+38 : vector<4xf32>")
+    if KQG_GSIG in ("32u", "u16"):
+        e("  %qs_u16 = vector.constant 65535.0 : vector<4xf32>")
+        e("  %qs_iu16 = vector.constant 1.5259021896696422e-05 : vector<4xf32>")
+        e("  %qs_mag = vector.constant 12582912.0 : vector<4xf32>")
+        e("  %qs_m23 = vector.constant 8388608.0 : vector<4xf32>")
+
+
+def gsig16(e, y, val, ind):
+    """sigmoid(val) as attention's EPI_FAST computes it (exp2 of -x log2e, rcp + one Newton step), rounded to f16"""
+    e(f"{ind}%qs_n{y} = vector.negf {val} : vector<4xf32>")
+    e(f"{ind}%qs_m{y} = vector.mulf %qs_n{y}, %qs_l2e4 : vector<4xf32>")
+    e(f"{ind}%qs_x{y} = vector.exp2f<afn> %qs_m{y} : vector<4xf32>")
+    e(f"{ind}%qs_d{y} = vector.addf %qs_one4, %qs_x{y} : vector<4xf32>")
+    e(f"{ind}%qs_c{y} = vector.minnumf<nnan> %qs_d{y}, %qs_fmax4 : vector<4xf32>")
+    e(f"{ind}%qs_r0{y} = vector.divf<nnan|ninf|nsz|arcp> %qs_one4, %qs_c{y} : vector<4xf32>")
+    e(f"{ind}%qs_nd{y} = vector.mulf %qs_c{y}, %qs_neg4 : vector<4xf32>")
+    e(f"{ind}%qs_er{y} = vector.fmaf %qs_nd{y}, %qs_r0{y}, %qs_one4 : vector<4xf32>")
+    e(f"{ind}%qs_r{y} = vector.fmaf %qs_er{y}, %qs_r0{y}, %qs_r0{y} : vector<4xf32>")
+    if KQG_GSIG == "32h":   # diag: f16 rounding, stored as f32 (the precision of =16 alone)
+        e(f"{ind}%qs_hh{y} = vector.fptrunc %qs_r{y} : vector<4xf32> to vector<4xf16>")
+        e(f"{ind}%qs_hr{y} = vector.extf %qs_hh{y} : vector<4xf16> to vector<4xf32>")
+        return f"%qs_hr{y}"
+    if KQG_GSIG == "32u":   # diag: unorm16 rounding (round(s * 65535) / 65535), stored as f32
+        e(f"{ind}%qs_ut{y} = vector.mulf %qs_r{y}, %qs_u16 : vector<4xf32>")
+        e(f"{ind}%qs_ua{y} = vector.addf %qs_ut{y}, %qs_mag : vector<4xf32>")
+        e(f"{ind}%qs_ur{y} = vector.subf %qs_ua{y}, %qs_mag : vector<4xf32>")
+        e(f"{ind}%qs_uq{y} = vector.mulf %qs_ur{y}, %qs_iu16 : vector<4xf32>")
+        return f"%qs_uq{y}"
+    if KQG_GSIG == "u16":   # t + 2^23 holds round(t) in its low 16 bits (exact: t <= 65535); keep the low halves
+        e(f"{ind}%qs_ut{y} = vector.mulf %qs_r{y}, %qs_u16 : vector<4xf32>")
+        e(f"{ind}%qs_ua{y} = vector.addf %qs_ut{y}, %qs_m23 : vector<4xf32>")
+        e(f"{ind}%qs_ub{y} = vector.bitcast %qs_ua{y} : vector<4xf32> to vector<8xf16>")
+        e(f"{ind}%qs_h{y}, %qs_hx{y} = vector.deinterleave<0> %qs_ub{y} : vector<8xf16> -> vector<4xf16>, vector<4xf16>")
+        return f"%qs_h{y}"
+    if not KQG_GSIG16:
+        return f"%qs_r{y}"
+    e(f"{ind}%qs_h{y} = vector.fptrunc %qs_r{y} : vector<4xf32> to vector<4xf16>")
+    return f"%qs_h{y}"
+
+def qh(e, y, val):
+    """KQG_QH diag: q rounded to f16 and widened back"""
+    if not KQG_QH:
+        return val
+    e(f"    %qh_h{y} = vector.fptrunc {val} : vector<4xf32> to vector<4xf16>")
+    e(f"    %qh_r{y} = vector.extf %qh_h{y} : vector<4xf16> to vector<4xf32>")
+    return f"%qh_r{y}"
+
 def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False):
     """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
@@ -1589,7 +1648,10 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
         e(f"  %qg_rows = index.div {orw()}, %c2 : index")
         qt = "f16" if OUT16 else "f32"   # OUT16: q and gate stored as f16 (emit_prefill_pp.QG16), 8 rows per store
         e(f"  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]x{qt}>")
-        e(f"  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]x{qt}>")
+        assert not (KQG_GSIG and OUT16)
+        e(f"  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]x{'f16' if KQG_GSIG16 else qt}>")
+        if KQG_GSIG:
+            gsig16_consts(e)
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
         if OUT16:
             e("  %qg_c8 = index.constant 8 : index")
@@ -1683,9 +1745,12 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
                 e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
                 e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
                 e(f"  scf.if %qg_isq {{")
-                e(f"    vector.store {val}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e(f"    vector.store {qh(e, f'{j}_{q}', val)}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  } else {")
-                e(f"    vector.store {val}, %g_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                if KQG_GSIG:
+                    e(f"    vector.store {gsig16(e, f'{j}_{q}', val, '    ')}, %g_flat[%qg_oi{j}_{q}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
+                else:
+                    e(f"    vector.store {val}, %g_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  }")
             else:
                 if OUT16 and not kr:   # f16 output (emit_prefill_pp.O16_MT: consumers read f16)
@@ -1718,7 +1783,9 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         e("  %qg_tot = index.div %out_total, %c2 : index")
         e(f"  %qg_rows = index.div {orw()}, %c2 : index")
         e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
-        e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        e(f"  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
+        if KQG_GSIG:
+            gsig16_consts(e)
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
         e("  %qg_c512 = index.constant 512 : index")
         e("  %qg_c256 = index.constant 256 : index")
@@ -1847,9 +1914,12 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     # always in range; the clamp states it for the bound proof
                     e(f"  %qg_oi{y} = index.min %et_oi{y}, %qg_last4 : index")
                     e(f"  scf.if %qg_isq{g} {{")
-                    e(f"    vector.store {val}, %q_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                    e(f"    vector.store {qh(e, y, val)}, %q_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
                     e("  } else {")
-                    e(f"    vector.store {val}, %g_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                    if KQG_GSIG:
+                        e(f"    vector.store {gsig16(e, y, val, '    ')}, %g_flat[%qg_oi{y}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
+                    else:
+                        e(f"    vector.store {val}, %g_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
                     e("  }")
                 else:
                     if OUT16 and not kr:   # f16 output (emit_prefill_pp.O16_MT: consumers read f16)
@@ -1977,7 +2047,9 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
         e("  %qg_tot = index.div %out_total, %c2 : index")
         e(f"  %qg_rows = index.div {orw()}, %c2 : index")
         e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
-        e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
+        e(f"  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
+        if KQG_GSIG:
+            gsig16_consts(e)
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
         e("  %qg_c512 = index.constant 512 : index")
         e("  %qg_c256 = index.constant 256 : index")
@@ -2071,9 +2143,12 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
                 e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
                 e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
                 e(f"  scf.if %qg_isq {{")
-                e(f"    vector.store {val}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e(f"    vector.store {qh(e, f'{j}_{q}', val)}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  } else {")
-                e(f"    vector.store {val}, %g_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                if KQG_GSIG:
+                    e(f"    vector.store {gsig16(e, f'{j}_{q}', val, '    ')}, %g_flat[%qg_oi{j}_{q}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
+                else:
+                    e(f"    vector.store {val}, %g_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  }")
             else:
                 if OUT16 and not kr:   # f16 output (emit_prefill_pp.O16_MT: consumers read f16)
