@@ -105,6 +105,7 @@ def main():
     ap.add_argument("--reps", type=int, default=10)
     ap.add_argument("--depths", default="0,8192")
     ap.add_argument("--tag", default=os.path.expanduser("~/yah-scratch/attn_bench"))
+    ap.add_argument("--inputs", help="real Q / K / V: <prefix>.q, .kpool, .vpool (loom_prefill YAH_FPS_DUMP), one depth")
     ap.add_argument("variants", nargs="+")
     a = ap.parse_args()
     depths = [int(d) for d in a.depths.split(",")]
@@ -125,6 +126,13 @@ def main():
         sys.exit("variants of one run must share a buffer layout (f32 Q or f16 Q)")
     for depth in depths:
         bufs = buffers(variants[0][4], depth)
+        if a.inputs:
+            for i, ext in ((0, ".q"), (2, ".kpool"), (3, ".vpool")):
+                want = int(bufs[i].split(":")[1])
+                got = os.path.getsize(a.inputs + ext)
+                if got != want:
+                    sys.exit(f"refused {a.inputs + ext}: {got} bytes, the kernel reads {want}")
+                bufs[i] = "f:" + a.inputs + ext
         hals = []
         for name, src, text, env, _ in variants:
             gx, gy = grid(text)

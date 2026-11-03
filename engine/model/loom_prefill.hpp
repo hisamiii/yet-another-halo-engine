@@ -2580,7 +2580,7 @@ class LoomPrefill {
       Dispatch(Exe(ahx), "yah_attn_wmma", pg != geom_.end() ? pg->second.tokens : (B_ + tpw - 1) / tpw,
                pg != geom_.end() ? 1 : kHeads / hpw, 1, 256, 1, 1,
                b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
-      if (fps_on_) FpsDump(ai, ci);
+      if (fps_on_ || (kdeq_ && qr16_)) FpsDump(ai, ci);
     }
     trim_row_ = tail_;
     RunResidual(pre + "attn_output.weight", *scratch_, o_af);
@@ -2608,6 +2608,7 @@ class LoomPrefill {
   }
 
   // YAH_FPS_DUMP=<prefix> YAH_FPS_DUMP_AT=<chunk>,<attention layer>: that attention call's inputs and output as raw files
+  // (any kv4 dequant set; .kfm and .sel only with the sparse twin; tools/attn_bench.py --inputs reads them)
   // (<prefix>.q f16 rotated Q, .kfm block means, .kpool / .vpool the f16 pools, .sel lists, .gate f32, .out f16)
   void FpsDump(std::uint32_t ai, std::uint32_t ci) {
     const char* pre = std::getenv("YAH_FPS_DUMP");
@@ -2629,10 +2630,10 @@ class LoomPrefill {
     };
     dump(".q", *qr16_, std::size_t{B_} * kAttn * 2, 0);
     dump(".kpool", *kdeq_, deq_bytes_, 0);
-    dump(".sel", *fsel_, std::size_t{B_ / 16} * 4 * fps_ls_ * 4, 0);
+    if (fsel_) dump(".sel", *fsel_, std::size_t{B_ / 16} * 4 * fps_ls_ * 4, 0);
     if (all && std::getenv("YAH_FPS_DUMP_V")) dump(".vpool", *vdeq_, deq_bytes_, 0);
     if (!all) {
-      dump(".kfm", *kfm_, fps_mean_bytes_, std::size_t{ai} * fps_mean_bytes_);
+      if (kfm_) dump(".kfm", *kfm_, fps_mean_bytes_, std::size_t{ai} * fps_mean_bytes_);
       dump(".vpool", *vdeq_, deq_bytes_, 0);
       dump(".gate", *gate_, std::size_t{B_} * kInner * 4, 0);
       dump(".out", *scratch_, std::size_t{B_} * kAttn * 2, 0);

@@ -165,6 +165,11 @@ int main(int argc, char** argv) {
     uint64_t fnv = 1469598103934665603ull;
     for (uint8_t b : back) fnv = (fnv ^ b) * 1099511628211ull;
     std::printf("first %zu %016llx\n", k, static_cast<unsigned long long>(fnv));
+    if (const char* dir = std::getenv("ATTN_BENCH_DUMP")) {   // the first dispatch's output, as <dir>/out<k>.bin
+      FILE* fp = std::fopen((std::string(dir) + "/out" + std::to_string(k) + ".bin").c_str(), "wb");
+      if (!fp || std::fwrite(back.data(), 1, back.size(), fp) != back.size()) return 2;
+      std::fclose(fp);
+    }
   }
   for (int r = 0; r < iters; ++r)
     for (Hal& h : hals) {
