@@ -996,7 +996,9 @@ AF = {
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False, gaddr=True, f16s=True),  # -12.1%
     ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, f16p=True, gaddr=True, f16s=True,
                                     persist=dict(b0early=True, lhs_stream=2)),               # -8.6%
-    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=dict(pslice="top_top")), # -10.4%
+    # lhs_stream 1 (was 4) since HRX 0051: bank cost 1.0 -> 0.4%, 190 VGPRs; pp2048 counters 3 runs (11-03),
+    # bit-identical: down -0.66% (92.8 -> 93.4%), out -0.32%
+    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, respre=1, persist=dict(pslice="top_top")), # -10.4%
     ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
                                       persist=dict(pslice="b0_a1")),                         # -8.2%
     ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True, lhs_stream=1),   # -10.4%; lhs_stream 1: see q5k 24
@@ -1009,7 +1011,7 @@ AF = {
                                     persist=dict(b0early=True, lhs_stream=2)),               # -8.8%
     ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
                                       persist=dict(pslice="b0_a1")),                         # -8.5%
-    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=dict(pslice="top_top")), # -8.8%
+    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, respre=1, persist=dict(pslice="top_top")), # -8.8%; ls 1: see 68
     ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # -5.3%; top_top 89.6 -> 90.5%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
     ("iq3s", "kstore", 640, 20): dict(AF_NOPRE, gaddr=True, f16s=True),          # -9.6%; no prefetch -1.5%
