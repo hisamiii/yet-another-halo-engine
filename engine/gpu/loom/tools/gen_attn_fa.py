@@ -168,6 +168,13 @@ PAIR = False
 R2P = False
 R2P_QKF = int(os.environ.get("R2P_QKF", "1"))   # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
 R2P_PVF = int(os.environ.get("R2P_PVF", "1"))   # R2P: the same for the V^T fragments
+# R2P_PVDB: the P.V wave's V^T fragments double buffered in a fenced order (load f + 1, then fragment f's MMAs), so
+# a fragment load never waits for the MMAs reading the previous one (the ATT trace: a single buffer leaves each wave
+# ~35 ticks of register reuse + a 42-tick LDS round trip between MMA pairs). Same arithmetic
+R2P_PVDB = os.environ.get("R2P_PVDB", "0") == "1"
+# R2P_PRIO: the QK waves' issue priority (kernel.priority, 1..3) from barrier A to barrier B: the softmax chain is the
+# tile's critical path and loses issue slots to other waves' MMA bursts (ATT trace). 0: off
+R2P_PRIO = int(os.environ.get("R2P_PRIO", "0"))
 R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
 R2P_PVB = os.environ.get("R2P_PVB", "1") == "1"   # R2P, P.V: P^T / alpha loads through byte views, loop-invariant lane
                     # byte address + the slot's uniform byte offset (1 v_add per base; a row index costs 3 per load)
@@ -2090,19 +2097,30 @@ def gen():
             e(f"{ind}%{pp}pb{t} = vector.fragment<rhs> %{pp}pb0{t} shape [%k, %n] : {V16H}")
             pbs.append(f"%{pp}pb{t}")
         outs = [None] * 16
-        for f in range(8):
+
+        def vload(f):
             e(f"{ind}%{pp}vr{f}c = index.constant {16 * f} : index")
             e(f"{ind}%{pp}vr{f} = index.add %hd128, %{pp}vr{f}c : index")
+            e(f"{ind}%{pp}vf{f} = vector.fragment.load<lhs> %v_view[%{pp}vr{f}, %c0] shape [%m, %k] : view<256x{VT_PITCH}xf16> -> {V16H}")
+        if R2P_PVDB:
+            assert "halfv" not in R2P_DIAG
+            vload(0)
+            e(f"{ind}scf.schedule.fence")
+        for f in range(8):
             vc = f - 1 if "halfv" in R2P_DIAG and f % 2 else f
-            if vc == f:
-                e(f"{ind}%{pp}vf{f} = vector.fragment.load<lhs> %v_view[%{pp}vr{f}, %c0] shape [%m, %k] : view<256x{VT_PITCH}xf16> -> {V16H}")
+            if R2P_PVDB:
+                if f < 7:
+                    vload(f + 1)
+                    e(f"{ind}scf.schedule.fence")
+            elif vc == f:
+                vload(f)
             for t in range(2):
                 o = 8 * t + f
                 e(f"{ind}%{pp}oi{o} = vector.fragment<init> {sc[o]} shape [%m, %n] : {V8}")
                 e(f"{ind}%{pp}nx{o} = vector.mma %{pp}vf{vc}, {pbs[t]}, %{pp}oi{o} : {V16H}, {V16H}, {V8}")
                 e(f"{ind}%{pp}nxi{o} = vector.bitcast %{pp}nx{o} : {V8} to {BK}")
                 outs[o] = f"%{pp}nxi{o}"
-            if f < 7 and (f + 1) % R2P_PVF == 0:
+            if f < 7 and (R2P_PVDB or (f + 1) % R2P_PVF == 0):
                 e(f"{ind}scf.schedule.fence")
         return outs
 
@@ -2164,11 +2182,15 @@ def gen():
             e(f"{J}vector.store %xst1, %xs_view[%xso_r1, %c0] : {V4}, view<256x4xf32>")
             if not R2P_DIAG & {"nobar", "nobara"}:
                 e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            if R2P_PRIO:
+                e(f"{J}kernel.priority {{level = {R2P_PRIO}}}")
             e(f"{J}%spa = vector.load %xs_view[%xsm_r0, %c0] : view<256x4xf32> -> {V4}")
             e(f"{J}%spb = vector.load %xs_view[%xsm_r1, %c0] : view<256x4xf32> -> {V4}")
             e(f"{J}%spart = vector.concat<0> %spa, %spb : {V4}, {V4} -> {V8}")
             e(f"{J}%s0 = vector.addf {own}, %spart : {V8}")
         emit_softmax_pv(None, True, pair_slot=("%slot_rows", "%slot_al"))
+        if R2P_PRIO:
+            e(f"{J}kernel.priority {{level = 0}}")
         if not R2P_DIAG & {"nobar", "nobarb"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e(f"{J}scf.yield {', '.join(rnames)}, %nmax, %nsum : {rtypes}, f32, f32")
