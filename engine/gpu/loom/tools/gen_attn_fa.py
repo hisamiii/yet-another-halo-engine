@@ -588,9 +588,13 @@ def qnorm_phase2(e, own, root):
                 e(f"{ind}%qrex{j} = scalar.divf %qr2p{j}, %qrdim : f32")
                 e(f"{ind}%qrif{j} = scalar.powf<afn> %qrtheta, %qrex{j} : f32")
                 e(f"{ind}%qriv{j} = scalar.divf %qrone, %qrif{j} : f32")
-            e(f"{ind}%qran{j} = scalar.mulf %qrcur, %qriv{j} : f32")
-            e(f"{ind}%qrc{j} = scalar.cosf<afn> %qran{j} : f32")
-            e(f"{ind}%qrs{j} = scalar.sinf<afn> %qran{j} : f32")
+            if "norope" in R2P_DIAG:   # diag: no rotation (cos 1, sin 0); the angle math above is dead
+                e(f"{ind}%qrc{j} = scalar.constant 1.0 : f32")
+                e(f"{ind}%qrs{j} = scalar.constant 0.0 : f32")
+            else:
+                e(f"{ind}%qran{j} = scalar.mulf %qrcur, %qriv{j} : f32")
+                e(f"{ind}%qrc{j} = scalar.cosf<afn> %qran{j} : f32")
+                e(f"{ind}%qrs{j} = scalar.sinf<afn> %qran{j} : f32")
             a, b = nw[0][j], nw[1][j]
             e(f"{ind}%qra0_{j} = scalar.mulf {a}, %qrc{j} : f32")
             e(f"{ind}%qra1_{j} = scalar.mulf {b}, %qrs{j} : f32")
@@ -871,7 +875,11 @@ def gen():
         e("  %npairs = index.div %nh_, %chpw : index")
         e("  %tpq = index.add %B, %cqt1 : index")
         e("  %nqb = index.div %tpq, %cqt : index")
-        e("  %pun = index.mul %nqb, %npairs : index")              # units
+        e("  %pun0 = index.mul %nqb, %npairs : index")
+        if "halfunits" in R2P_DIAG:   # diag (with unilen): half the units, each twice as long
+            e("  %pun = index.div %pun0, %c2 : index")
+        else:
+            e("  %pun = index.add %pun0, %c0 : index")              # units
         e(f"  %pP = index.constant {PERSIST} : index")
         e(f"  %pP1 = index.constant {PERSIST - 1} : index")
         e("  %prn0 = index.add %pun, %pP1 : index")
@@ -1163,7 +1171,14 @@ def gen():
     e("  %ctx_end = index.add %start_pos, %B : index")
     e("  %qs32 = index.add %qs, %cqt : index")
     e("  %vis0 = index.add %start_pos, %qs32 : index")
-    e("  %max_vis = index.min %ctx_end, %vis0 : index")
+    if "unilen" in R2P_DIAG:   # diag: every unit start_pos + (B + QT) / 2 keys (16-aligned): the causal total, uniform
+        e("  %ulv0 = index.add %B, %cqt : index")
+        e("  %ulv1 = index.div %ulv0, %c32 : index")
+        e(f"  %ulv2 = index.mul %ulv1, %c{32 if 'halfunits' in R2P_DIAG else 16} : index")   # halfunits: twice as long
+        e("  %ulv3 = index.add %start_pos, %ulv2 : index")
+        e("  %max_vis = index.min %ctx_end, %ulv3 : index")
+    else:
+        e("  %max_vis = index.min %ctx_end, %vis0 : index")
     e("  %B_1 = index.sub %B, %c1 : index")
     e("  %cap_1 = index.sub %cache_capacity, %c1 : index")
     if KCLAMP_S:   # (only then: even an unused op perturbs the allocator)
@@ -3444,6 +3459,8 @@ def gen():
         L[body + 1:body + 1] = mv
     e("  kernel.return")
     e("}")
+    if "noallbar" in R2P_DIAG:   # diag: no workgroup barriers anywhere (races: wrong values)
+        L = [ln for ln in L if "kernel.barrier<workgroup>" not in ln]
     return "\n".join(L) + "\n"
 
 
