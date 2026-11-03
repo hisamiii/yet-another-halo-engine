@@ -1979,6 +1979,43 @@ def gen():
             for i, x in enumerate(ends):
                 e(f"    %spad{i} = vector.addf {s if i == 0 else f'%spad{i - 1}'}, {x} : {V8}")
             s = f"%spad{len(ends) - 1}"
+        xq = [int(k[2:]) for k in R2P_DIAG if k.startswith("xq")]
+        if xq:   # diag: xqN = N extra V8 exp2 ops in 4 chains (shallow: more independent exps than xpad)
+            ends = []
+            for k in range(4):
+                cur = s
+                if k:
+                    e(f"    %xqk{k} = scalar.constant {k}.25 : f32")
+                    e(f"    %xqc{k} = vector.splat %xqk{k} : {V8}")
+                    e(f"    %xqs{k} = vector.addf {s}, %xqc{k} : {V8}")
+                    cur = f"%xqs{k}"
+                for j in range(xq[0] // 4):
+                    e(f"    %xq{k}_{j} = vector.exp2f<afn> {cur} : {V8}")
+                    cur = f"%xq{k}_{j}"
+                ends.append(cur)
+            for i, x in enumerate(ends):
+                e(f"    %sxq{i} = vector.addf {s if i == 0 else f'%sxq{i - 1}'}, {x} : {V8}")
+            s = f"%sxq{len(ends) - 1}"
+        sp = [int(k[4:]) for k in R2P_DIAG if k.startswith("spad")]
+        if sp:   # diag: spadN = N extra scalar index ops (4 chains of mul / add on runtime values), one select of s
+            ends = []
+            for k in range(4):
+                e(f"    %spk{k} = index.constant {k + 3} : index")
+                e(f"    %sp{k}_0 = index.add %ks_, %spk{k} : index")
+                for j in range(1, sp[0] // 4):
+                    op, b = ("index.max", "%start_pos") if j % 2 else ("index.add", "%B")
+                    e(f"    %sp{k}_{j} = {op} %sp{k}_{j - 1}, {b} : index")
+                ends.append(f"%sp{k}_{sp[0] // 4 - 1}")
+            cur = ends[0]
+            for i, x in enumerate(ends[1:]):
+                e(f"    %spx{i} = index.add {cur}, {x} : index")
+                cur = f"%spx{i}"
+            e(f"    %spm0 = index.constant 1024 : index")
+            e(f"    %spr = index.rem {cur}, %spm0 : index")
+            e(f"    %spm1 = index.constant 5 : index")
+            e(f"    %spcnd = index.cmp eq, %spr, %spm1 : index")
+            e(f"    %ssp = scf.select %spcnd, %zeros8, {s} : {V8}")
+            s = "%ssp"
         if "nosoft" in R2P_DIAG:   # p = s: no subtract / scale / exp (two free bitcasts)
             e(f"    %pdi = vector.bitcast {s} : {V8} to vector<8xi32>")
             e(f"    %p = vector.bitcast %pdi : vector<8xi32> to {V8}")
