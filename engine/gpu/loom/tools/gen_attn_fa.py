@@ -180,10 +180,12 @@ R2P_PEEL = os.environ.get("R2P_PEEL", "1") == "1"   # R2P: tile 0 peeled off the
 # one loop with a role branch per tile: the QK loop carries only max / sum (Q is loop-invariant), the P.V loop only
 # the O banks; no per-tile role join. The roles join once per unit, before the last tile's P.V
 R2P_SPLIT = os.environ.get("R2P_SPLIT", "1") == "1"
-# R2P_GSIG=16: the gate arrives as f16 sigmoid(gate) (=32: f32 sigmoid, bit-identical) (the kqg GEMM's epilogue would apply it): the epilogue loads half
-# the bytes and only multiplies (no exp / reciprocal). Same offsets as the f32 gate, in f16 elements
-R2P_GSIG = os.environ.get("R2P_GSIG", "")   # "16" / "32"
-R2P_GSIG16 = R2P_GSIG in ("16", "u16")   # u16: unorm16 bits (gen_gemm_tile KQG_GSIG=u16), decoded exactly
+# GSIG: the gate arrives as sigmoid(gate), applied by the kqg GEMM's epilogue (gen_gemm_tile KQG_GSIG; the emitter
+# sets both): "u16" round(s * 65535) as unorm16 bits in the f16 gate buffer (gate N: KL 1.07e-6, half the gate bytes, no
+# exp / reciprocal here; depth 0 +2.2% of floor), "16" f16 (fails gate N), "32" f32 (bit-identical). Same offsets as
+# the f32 gate, in f16 elements for u16 / 16
+GSIG = os.environ.get("GSIG", "")
+GSIG16 = GSIG in ("16", "u16")
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
 # R2P_GATEPF=D (R2P_EPIG): the whole epilogue under one store guard and each gate fragment loaded D fragments ahead of
 # its use (a schedule fence after it). With a guard per fragment, each join drains vmcnt(0): the 16 gate loads ran one
@@ -692,7 +694,7 @@ def gen():
     if OCNT:   # without it the atomic may alias every input: their scalar loads become vector loads, the code shifts
         e("  %oc_na = buffer.assume.noalias %ocnt : buffer")
     e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if Q16 and (not QNORM or QG16) else 'f32'}>")
-    e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if QG16 or R2P_GSIG16 and R2P else 'f32'}>")
+    e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if QG16 or GSIG16 else 'f32'}>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
     # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
     # kv8a16: int8 K [token][256 dwords], f16x2 (256 s, -384 s) [token][8]
@@ -2662,11 +2664,25 @@ def gen():
         e(f"  %eo{f}b = index.add %eo{f}, %c4 : index")
 
     def gate_load(f):
-        if QG16 or R2P_GSIG16 and R2P:
+        if QG16 or GSIG16:
             e(f"  %eg{f}h = vector.load %g_flat[%eo{f}] : view<[%qtot]xf16> -> {V8H}")
             return
         e(f"  %eg{f}a = vector.load %g_flat[%eo{f}] : view<[%qtot]xf32> -> {V4}")
         e(f"  %eg{f}b = vector.load %g_flat[%eo{f}b] : view<[%qtot]xf32> -> {V4}")
+
+    def gsig_decode(f):
+        """GSIG: %eg{f} = the loaded gate fragment's sigmoid as f32"""
+        if GSIG == "u16":   # u | 0x4B00 << 16 = 2^23 + u; fma(2^23 + u, c, -2^23 c) = round(u c), c = f32(1 / 65535)
+            e(f"  %egk{f} = vector.constant 14.0 : {V8H}")
+            e(f"  %egc{f} = vector.constant 1.5259021893143654e-05 : {V8}")
+            e(f"  %egd{f} = vector.constant -128.001953125 : {V8}")
+            e(f"  %egi{f} = vector.interleave<0> %eg{f}h, %egk{f} : {V8H}, {V8H} -> vector<16xf16>")
+            e(f"  %egx{f} = vector.bitcast %egi{f} : vector<16xf16> to {V8}")
+            e(f"  %eg{f} = vector.fmaf %egx{f}, %egc{f}, %egd{f} : {V8}")
+        elif GSIG16:
+            e(f"  %eg{f} = vector.extf %eg{f}h : {V8H} to {V8}")
+        else:
+            e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
 
     def gate_loads(f):
         gate_addr(f)
@@ -2737,24 +2753,24 @@ def gen():
             gate_loads(f)
         if "noepi" in R2P_DIAG:   # diag: no gate loads or epilogue math, raw O stored (wrong output)
             e(f"  %eout{f} = vector.addf %og{f}, %zeros8 : {V8}")
-        elif R2P_GSIG and R2P:   # o / sum (Markstein, as EPI_FAST) times the ready sigmoid
+        elif GSIG and R2P:   # o / sum (Markstein, as EPI_FAST) times the ready sigmoid
             assert EPI_FAST and PRO_FAST
             bs = "_o" if f >= 8 else ""
-            if R2P_GSIG == "u16":   # u | 0x4B00 << 16 = 2^23 + u; fma(2^23 + u, c, -2^23 c) = round(u c), c = f32(1 / 65535)
-                e(f"  %egk{f} = vector.constant 14.0 : {V8H}")
-                e(f"  %egc{f} = vector.constant 1.5259021893143654e-05 : {V8}")
-                e(f"  %egd{f} = vector.constant -128.001953125 : {V8}")
-                e(f"  %egi{f} = vector.interleave<0> %eg{f}h, %egk{f} : {V8H}, {V8H} -> vector<16xf16>")
-                e(f"  %egx{f} = vector.bitcast %egi{f} : vector<16xf16> to {V8}")
-                e(f"  %eg{f} = vector.fmaf %egx{f}, %egc{f}, %egd{f} : {V8}")
-            elif R2P_GSIG16:
-                e(f"  %eg{f} = vector.extf %eg{f}h : {V8H} to {V8}")
-            else:
-                e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
+            gsig_decode(f)
             e(f"  %eq{f} = vector.mulf %og{f}, %elr8{bs} : {V8}")
             e(f"  %eqe{f} = vector.fmaf %eq{f}, %enls8{bs}, %og{f} : {V8}")
             e(f"  %eod{f} = vector.fmaf %eqe{f}, %elr8{bs}, %eq{f} : {V8}")
             e(f"  %eout{f} = vector.mulf %eod{f}, %eg{f} : {V8}")
+        elif GSIG:   # the head_dim split kernel: o / sum (as below) times the ready sigmoid
+            gsig_decode(f)
+            if EPI_FAST:
+                e(f"  %eq{f} = vector.mulf %og{f}, %elr8 : {V8}")
+                e(f"  %eqe{f} = vector.fmaf %eq{f}, %enls8, %og{f} : {V8}")
+                e(f"  %eod{f} = vector.fmaf %eqe{f}, %elr8, %eq{f} : {V8}")
+            else:
+                e(f"  %eod{f} = vector.divf %og{f}, %lsum8 : {V8}")
+            e(f"  %eov{f} = scf.select %lpos, %eod{f}, %zeros8 : {V8}")
+            e(f"  %eout{f} = vector.mulf %eov{f}, %eg{f} : {V8}")
         elif "nogate" in R2P_DIAG and R2P and EPI_FAST:   # diag: o / sum without the gate (loads, sigmoid moved out)
             bs = "_o" if f >= 8 else ""
             e(f"  %eq{f} = vector.mulf %og{f}, %elr8{bs} : {V8}")

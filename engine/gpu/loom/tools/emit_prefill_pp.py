@@ -658,6 +658,14 @@ QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (R
 # QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
 QG16 = True
 QG16_ON = False   # set by main
+# GSIG (YAH_GSIG, default u16; 0: off): the kqg GEMM's epilogue applies the gate's sigmoid and stores it as unorm16
+# bits ("u16", gen_gemm_tile KQG_GSIG), the attention multiplies (gen_attn_fa GSIG): half the gate bytes, no exp /
+# reciprocal in the attention epilogue. Gate N (KL 1.07e-6); attention busiest SQ 71.6 -> 73.8% of floor at depth 0,
+# +0.2 at 8K, even at 64K; pp2048 attention -3.1%, kqg -0.3% (half the stores). Only where the kqg GEMM writes every
+# gate row: not with the NPU's q rows, f16 q / gate (QG16) or half sets. dispatch.txt "gsig"
+GSIG = os.environ.get("YAH_GSIG", "u16")
+GSIG = "" if GSIG == "0" else GSIG
+GSIG_ON = False   # set by main
 # KV16 (A4): the K / V GEMMs (kstore, 1024 rows) store f16, RoPE widens them (rope_kv16). dispatch.txt "kv16in"
 KV16 = True
 KV16_ON = False   # set by main
@@ -2193,7 +2201,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, GSIG_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     E.ASYNC = True
@@ -2229,6 +2237,13 @@ def main():
     DNOV_ON = (DNOV and a4 and DNSPLIT == (40, 8) and DNVCONV and conv_tb_ok(B) and "qkv" not in NPU_SPLIT
                and not EMIT_HALF)   # the dnvconv conv (dn_vconv below)
     QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
+    GSIG_ON = bool(GSIG) and not (QG16_ON or EMIT_HALF or "q" in NPU_SPLIT)
+    if GSIG_ON:
+        import gen_gemm_tile
+        assert GSIG in ("u16", "16", "32"), GSIG
+        gen_gemm_tile.KQG_GSIG, gen_gemm_tile.KQG_GSIG16 = GSIG, GSIG in ("16", "u16")
+        gen_attn_fa.GSIG, gen_attn_fa.GSIG16 = GSIG, GSIG in ("16", "u16")
+        os.environ["KQG_GSIG"] = os.environ["GSIG"] = GSIG   # (the calibration menu's worker processes)
 
     n = 0
     df_done = set()
@@ -2392,6 +2407,8 @@ def main():
     gen_attn_fa.QG16 = QG16_ON
     if QG16_ON:
         geom.append(("qg16", 0, 0, 0))
+    if GSIG_ON:
+        geom.append(("gsig", 0, 0, 0))
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
     attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")

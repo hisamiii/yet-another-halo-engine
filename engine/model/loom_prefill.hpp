@@ -882,6 +882,7 @@ class LoomPrefill {
     rope_kpaged_ = geom_.count("rope_kpaged") != 0;
     qnorm_ = geom_.count("qnorm") != 0;
     qg16_ = geom_.count("qg16") != 0;
+    gsig_ = geom_.count("gsig") != 0;
     vtrope_ = geom_.count("vtrope") != 0;
     if (vtrope_ && !(rope_kpaged_ && paged_f16v_)) throw LoomError("vtrope needs the paged fp16 K and V pools");
     if (paged_f16k_ && !rope_kpaged_) throw LoomError("paged fp16 K needs a rope_kpaged HAL set (re-emit)");
@@ -2383,6 +2384,7 @@ class LoomPrefill {
     const std::string qs = nq ? NpuHal(KqgHal(pre + "attn_q.weight", q_af)) : "";
     bool qg_fused = !qs.empty();
     if (qg16_ && qg_fused) throw LoomError("f16 q / gate (qg16) needs the GPU kqg GEMM, not the NPU's");
+    if (gsig_ && qg_fused) throw LoomError("the kqg GEMM's sigmoid gate (gsig) needs the GPU kqg GEMM, not the NPU's");
     if (qg_fused) {
       // the NPU's heads of q (whole heads of 512 rows [256 q | 256 gate]) beside the GPU's heads and k / v;
       // the norm wrote the row-major input unless q, k and v are all afrag
@@ -2411,6 +2413,7 @@ class LoomPrefill {
       qg_fused = seg || RunKqg(pre + "attn_q.weight", q_af);
       iu4_untrack_ = 0;
       if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
+      if (gsig_ && !qg_fused) throw LoomError("the sigmoid gate (gsig) needs the kqg GEMM");
       if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
       // ropew: k / v flagged (per-token-tile counters), RoPE polls them instead of a graph barrier. Not when RoPE ends
       // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
@@ -3143,7 +3146,7 @@ class LoomPrefill {
                           bool k_af, bool v_af, bool q_npu) {
     const std::string wq = pre + "attn_q.weight", wo = pre + "attn_output.weight";
     if (!HalvesOn() || hook || !kv_paged_ || !paged_f16k_ || !paged_f16v_ || !rope_kpaged_ || !kv16_scratch_ || kdeq_ ||
-        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || qg16_ ||
+        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || qg16_ || gsig_ ||
         (q_npu ? DcolImage(wq, nullptr, true).empty() : !HalfOutOk(wo, Af("gemm_kres", wo))))
       return false;
     norm_bfp_.clear();
@@ -3318,6 +3321,7 @@ class LoomPrefill {
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only
   bool qg16_ = false;   // the kqg GEMM stores q and gate as f16 (only the GPU kqg path writes them so)
+  bool gsig_ = false;   // the kqg GEMM stores the gate's sigmoid (unorm16 bits by default; only the GPU kqg path)
   bool vtrope_ = false;  // RoPE stores V^T straight into the paged pool (no yah_vtpage pass)
   bool attn_kq4_ = false, attn_kq8_ = false, attn_vq4_ = false, attn_vq8_ = false, attn_vqt_ = false;
   bool paged_f16k_ = false, paged_f16v_ = false;
