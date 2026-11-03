@@ -52,8 +52,16 @@ LAYOUTS = {
 }
 
 
+PQUEUE = "%pqv = buffer.view %pq_na[%base] : buffer -> view<264xi32>"
+
+
 def layout(text, path):
-    """The layout whose size formulas all appear in the source; refuse the source otherwise."""
+    """The layout whose size formulas all appear in the source; refuse the source otherwise. A queued persistent kernel
+    (gen_attn_fa PERSIST_DYN) binds one more buffer, its 264-word queue, after the others."""
+    if ", %pqueue: buffer)" in text:
+        if PQUEUE not in text:
+            sys.exit(f"refused {path}: its queue is not 264 i32")
+        text = text.replace(", %pqueue: buffer)", ")")
     for name, lines in LAYOUTS.items():
         if all(x in text for x in lines):
             break
@@ -126,6 +134,8 @@ def main():
         sys.exit("variants of one run must share a buffer layout (f32 Q or f16 Q)")
     for depth in depths:
         bufs = buffers(variants[0][4], depth)
+        if any(", %pqueue: buffer)" in v[2] for v in variants):
+            bufs.append("z:1056")
         if a.inputs:
             for i, ext in ((0, ".q"), (2, ".kpool"), (3, ".vpool")):
                 want = int(bufs[i].split(":")[1])
@@ -140,7 +150,7 @@ def main():
         prof = os.path.join(a.tag, "run.irpf")
         if os.path.exists(prof):
             os.remove(prof)
-        env = dict(os.environ, YAH_HRX=hrx_paths.HRX, CQ_MEM_GB="6", YAH_NPU="0", HRX_PROFILE_MODE="counters",
+        env = dict(os.environ, **({"ATTN_BENCH_ZERO": str(len(bufs) - 1)} if bufs[-1] == "z:1056" else {}), YAH_HRX=hrx_paths.HRX, CQ_MEM_GB="6", YAH_NPU="0", HRX_PROFILE_MODE="counters",
                    HRX_PROFILE_COUNTERS="SQ_BUSY_CYCLES", HRX_PROFILE_FILE=prof)
         cmd = ["bash", "-c", f"set +u; a=(\"$@\"); set --; source {ROOT}/engine/hrx-env.sh >/dev/null 2>&1; exec \"${{a[@]}}\"", "x",
                f"{ROOT}/engine/run/gpu_run.sh", "gpuonly", "--", f"{ROOT}/engine/build/attn_bench", str(a.reps),

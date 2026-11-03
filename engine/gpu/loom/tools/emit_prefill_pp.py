@@ -2417,6 +2417,12 @@ def main():
     # 8K busiest SQ 78.9 -> 81.1% of floor (clean grid 81.3%), bit-identical
     if persist and os.environ.get("YAH_ATTN_PREV") == "1":
         MAIN_FLAGS.update(QB_ZIGZAG=False, PERSIST_REV=True)
+    # YAH_ATTN_PDYN=1 (with PERSIST): the slots take their units from an atomic queue (gen_attn_fa PERSIST_DYN), bit-identical;
+    # standalone wall vs the grid kernel: tie to 8K, -2% at 16K, -5% at 64K, -11% at 126K. dispatch.txt "persist_<hal>
+    # <slots> 1 1": the driver binds a zeroed queue after the others
+    pdyn = bool(persist) and os.environ.get("YAH_ATTN_PDYN") == "1"
+    if pdyn:
+        MAIN_FLAGS.update(QB_ZIGZAG=False, PERSIST_DYN=True)
 
     kt2_cfg = (a_hpw, a_qt) if EMIT_HALF else KT2_SHAPE
     kt2_shape = kt2_cfg if kt2_cfg != (a_hpw, a_qt) else None   # a shape of its own: its chunks get dispatch.txt rows
@@ -3044,7 +3050,7 @@ def main():
     if persist_rows:   # the persistent attention HALs launch persist workgroups on x only
         with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
             for hal in persist_rows:
-                fh.write("persist_%s %d 1 0\n" % (hal, persist))
+                fh.write("persist_%s %d 1 %d\n" % (hal, persist, pdyn))
     if kt2_rows:   # the KT2 chunks' own launch geometry (the global wmma.hal row is chunk 0's)
         with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
             for hal in kt2_rows:

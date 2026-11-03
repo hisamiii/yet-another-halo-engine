@@ -789,6 +789,10 @@ class LoomPrefill {
     q16_ = geom_.count("q16") ? &Alloc(B * kAttn * 2) : q_;
     // kv4 sets at depth (dispatch.txt "qrot <first chunk>"): yah_qrot writes the H256-rotated f16 Q here for the attention
     if (const auto qr = geom_.find("qrot"); qr != geom_.end()) qr16_ = &Alloc(B * kAttn * 2), qrot_first_ = qr->second.tokens;
+    // queued persistent attention (dispatch.txt "persist_<hal> <slots> 1 1"): a 1056-byte unit queue per attention layer
+    // (gen_attn_fa PQ_WORDS), zero between calls (the kernel's last fetch resets its counter)
+    for (const auto& [name, g] : geom_)
+      if (name.rfind("persist_", 0) == 0 && g.tt && !pqueue_) pqueue_ = &Alloc(kPqueueSlots * 2048), gpu_.Fill(*pqueue_, 0);
     kbuf_ = &Alloc(B * kKv * 4);
     vbuf_ = &Alloc(B * kKv * 4);
     raw_ = &Alloc(B * kInner * 4);
@@ -2577,6 +2581,10 @@ class LoomPrefill {
       // a persistent attention HAL (dispatch.txt "persist_<hal> <slots>") runs <slots> workgroups over all the units
       const std::string ahx = attn_flagged_ ? "wmmaf.hal" : ah;
       const auto pg = geom_.find("persist_" + ahx);
+      if (pg != geom_.end() && pg->second.tt) {
+        if (ai >= kPqueueSlots) throw LoomError("prefill: more attention layers than queue counters");
+        b.push_back({pqueue_->handle, std::size_t{ai} * 2048, 1056});
+      }
       Dispatch(Exe(ahx), "yah_attn_wmma", pg != geom_.end() ? pg->second.tokens : (B_ + tpw - 1) / tpw,
                pg != geom_.end() ? 1 : kHeads / hpw, 1, 256, 1, 1,
                b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
@@ -3305,6 +3313,8 @@ class LoomPrefill {
   std::uint32_t fps_first_ = 0, fps_ext_ = 0, fps_ls_ = 0, fps_blocks_ = 0;
   std::size_t fps_mean_bytes_ = 0, deq_bytes_ = 0;
   LoomBuffer *kfm_ = nullptr, *vfm_ = nullptr, *fsel_ = nullptr;
+  static constexpr std::uint32_t kPqueueSlots = 64;
+  LoomBuffer* pqueue_ = nullptr;
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records
   std::unique_ptr<LoomGraph> chunk_graph_;

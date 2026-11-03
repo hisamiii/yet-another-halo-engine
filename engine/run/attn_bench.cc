@@ -8,6 +8,8 @@
 //        c:<count>:<value>    f32 constant
 //        p:<pages>            i32 identity page table
 //   <out>: the binding whose bytes are hashed after each HAL's first dispatch (default 4, the attention output)
+// A HAL that binds fewer buffers gets the first ones. ATTN_BENCH_ZERO=<i>: buffer i must be all zero after the run
+// (a self-resetting work queue counter).
 //
 // Do not compute the buffer sizes by hand: run this through tools/attn_bench.py, which derives them from the kernel's
 // configs. An access past an allocation does not fault on this target: the shader hangs and the box resets.
@@ -122,7 +124,7 @@ int main(int argc, char** argv) {
   struct Hal {
     std::string path;
     LoomExecutable exe;
-    uint32_t ordinal = 0, gx = 0, gy = 0;
+    uint32_t ordinal = 0, gx = 0, gy = 0, nb = 0;
     int out = 4;
     std::vector<double> ms;
   };
@@ -143,11 +145,12 @@ int main(int argc, char** argv) {
     h.exe = gpu.Load(h.path);
     h.ordinal = h.exe.OrdinalOrZero(h.exe.names.empty() ? "" : h.exe.names[0]);
     const uint32_t nb = h.exe.BindingCount(h.ordinal);
-    if (nb != static_cast<uint32_t>(nbuf) || !h.gx || !h.gy || h.out < 0 || h.out >= nbuf) {
+    if (nb > static_cast<uint32_t>(nbuf) || nb == 0 || !h.gx || !h.gy || h.out < 0 || h.out >= static_cast<int>(nb)) {
       std::fprintf(stderr, "attn_bench: REFUSING %s: export binds %u buffers, %d given (grid %ux%u, out %d)\n",
                    h.path.c_str(), nb, nbuf, h.gx, h.gy, h.out);
       return 3;
     }
+    h.nb = nb;
     hals.push_back(std::move(h));
   }
   std::vector<hrx_buffer_ref_t> refs;
@@ -159,7 +162,7 @@ int main(int argc, char** argv) {
     gpu.H2D(bufs[h.out], zero.data(), zero.size());
     const uint32_t ws = h.exe.WorkgroupSize(h.ordinal);
     gpu.Dispatch(h.exe, h.ordinal, LoomDevice::Config(h.gx, h.gy, 1, ws ? ws : 256, 1, 1), nullptr, 0, refs.data(),
-                 refs.size());
+                 h.nb);
     gpu.Synchronize();
     gpu.D2H(bufs[h.out], back.data(), back.size());
     uint64_t fnv = 1469598103934665603ull;
@@ -176,10 +179,19 @@ int main(int argc, char** argv) {
       const uint32_t ws = h.exe.WorkgroupSize(h.ordinal);
       const auto t0 = std::chrono::steady_clock::now();
       gpu.Dispatch(h.exe, h.ordinal, LoomDevice::Config(h.gx, h.gy, 1, ws ? ws : 256, 1, 1), nullptr, 0, refs.data(),
-                   refs.size());
+                   h.nb);
       gpu.Synchronize();
       h.ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
+  if (const char* z = std::getenv("ATTN_BENCH_ZERO")) {
+    const int i = atoi(z);
+    if (i < 0 || i >= nbuf) return 2;
+    std::vector<uint8_t> back(sizes[i]);
+    gpu.D2H(bufs[i], back.data(), back.size());
+    const bool zero = std::all_of(back.begin(), back.end(), [](uint8_t b) { return b == 0; });
+    std::printf("zero %d %s\n", i, zero ? "ok" : "NOT ZERO");
+    if (!zero) return 4;
+  }
   for (size_t k = 0; k < hals.size(); ++k) {
     auto v = hals[k].ms;
     std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
