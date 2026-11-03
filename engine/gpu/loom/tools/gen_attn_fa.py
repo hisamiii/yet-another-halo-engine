@@ -175,7 +175,8 @@ R2P_PEEL = os.environ.get("R2P_PEEL", "1") == "1"   # R2P: tile 0 peeled off the
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
 # R2P_DIAG (diagnostics only, wrong results, never deployed): comma list of LDS ablations: nox (no S partial exchange,
 # s = own + other head's partial), halfk / halfv (odd K / V^T fragments reuse the even one's registers); nobar (no
-# barriers in the R2P tile loop: races, no waits); nosoft (p = s, no subtract / scale / exp)
+# barriers in the R2P tile loop: races, no waits); nosoft (p = s, no subtract / scale / exp);
+# nosum (no row sum)
 R2P_DIAG = set(filter(None, os.environ.get("R2P_DIAG", "").split(",")))
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 PAIR_MAP = "mod"    # "mod": pair = waves (p, p + 4), one A and one B per SIMD; "adj": (2p, 2p + 1)
@@ -1912,7 +1913,7 @@ def gen():
             e(f"    %pl = vector.mulf %pd8, {'%r2l2e8' if R2P else '%log2e8'} : {V8}")
             e(f"    %p = vector.exp2f<afn> %pl : {V8}")
         # keys 8h..8h+3 and 8h+4..8h+7: HIP's 4-lane segments
-        for g in range(2):
+        for g in range(2 if "nosum" not in R2P_DIAG else 0):
             cur = "%zero"
             for i in range(4):
                 e(f"    %pg{g}_{i} = vector.extract %p[{4 * g + i}] : {V8} -> f32")
@@ -1921,12 +1922,15 @@ def gen():
                     continue
                 e(f"    %pa{g}_{i} = scalar.addf {cur}, %pg{g}_{i} : f32")
                 cur = f"%pa{g}_{i}"
-        e("    %pab = scalar.addf %pa0_3, %pa1_3 : f32")
-        e("    %pabi = scalar.bitcast %pab : f32 to i32")
-        e("    %pcdi, %pcdv = kernel.subgroup.shuffle<xor> %pabi, %x16, %x32 : i32, i32, i32")
-        e("    %pcd = scalar.bitcast %pcdi : i32 to f32")
-        e("    %psum = scalar.addf %pab, %pcd : f32")
-        e("    %nsum = scalar.fmaf %rsum, %rss, %psum : f32")
+        if "nosum" in R2P_DIAG:   # no row sum this tile (the carried sum only rescaled)
+            e("    %nsum = scalar.fmaf %rsum, %rss, %rsum : f32")
+        else:
+            e("    %pab = scalar.addf %pa0_3, %pa1_3 : f32")
+            e("    %pabi = scalar.bitcast %pab : f32 to i32")
+            e("    %pcdi, %pcdv = kernel.subgroup.shuffle<xor> %pabi, %x16, %x32 : i32, i32, i32")
+            e("    %pcd = scalar.bitcast %pcdi : i32 to f32")
+            e("    %psum = scalar.addf %pab, %pcd : f32")
+            e("    %nsum = scalar.fmaf %rsum, %rss, %psum : f32")
         # P^T as the B operand: keys 0..7 from the h=0 lane, 8..15 from h=1.
         # f16(p) as fptrunc(fma(p, 1, 0)) with an opaque 1 and 0, which selects v_fma_mix (as Q4FMIX in the GEMMs).
         # v_cvt_f16_f32 results must sit in v0..v127, where Q^T and O live: each conversion evicts a Q^T fragment to scratch.
