@@ -151,6 +151,9 @@ EPI_FAST = False
 # for normal results), RoPE's 1 / theta^e (in [1, 1e14]) as EPI_FAST's rcp + one Newton step. With R2P the epilogue
 # also drops the per-element sum > 0 select: every stored row is live and sees its own key, so its sum is >= 1
 PRO_FAST = False
+# R2P_EPI_LITE: the R2P epilogue (EPI_FAST, PRO_FAST) as o * RN(1 / sum) * rcp(1 + e): no Newton step, no Markstein
+# correction (within ~1 f32 ulp before the f16 store; not bit-exact)
+R2P_EPI_LITE = os.environ.get("R2P_EPI_LITE", "0") == "1"
 KVMAJOR = False     # workgroup order KV head slowest (lost: +67% at 96K, see docs/results.md)
 # PAIR: the wave pair of a query block splits by role instead of head_dim: wave A holds all of Q, runs the 16 QK MMAs
 # (two 8-MMA chains, dims 0..127 and 128..255, added as the head_dim split adds its partials) and the softmax once, and
@@ -3368,7 +3371,12 @@ def gen():
         e("  %enone = scalar.constant -1.0 : f32")
         e(f"  %enone8 = vector.splat %enone : {V8}")
     e("  %elc = index.min %r_lq, %B_1 : index")
-    e("  %eoff0 = index.mul %elc, %c6144 : index")
+    if "gatehot" in R2P_DIAG:   # diag: gate rows read from the first 64-row block (cache hot)
+        e("  %ghot64 = index.constant 64 : index")
+        e("  %elch = index.rem %elc, %ghot64 : index")
+        e("  %eoff0 = index.mul %elch, %c6144 : index")
+    else:
+        e("  %eoff0 = index.mul %elc, %c6144 : index")
     e("  %ehb = index.mul %r_head, %c256 : index")
     e("  %eoff1 = index.add %eoff0, %ehb : index")
     e("  %eh8 = index.mul %half, %c8 : index")
@@ -3470,7 +3478,11 @@ def gen():
             e(f"  %egx{f} = vector.exp2f<afn> %egm{f} : {V8}")
             e(f"  %egd{f} = vector.addf %ones8, %egx{f} : {V8}")
             bs = "_o" if R2P and f >= 8 else ""
-            if EPI_FAST:
+            if R2P_EPI_LITE:
+                assert R2P and EPI_FAST and PRO_FAST
+                e(f"  %egr{f} = vector.divf<nnan|nsz|arcp> %ones8, %egd{f} : {V8}")
+                e(f"  %eod{f} = vector.mulf %og{f}, %elr8{bs} : {V8}")
+            elif EPI_FAST:
                 # 1 / dn by rcp + one Newton step: bit-exact for dn in [1, 2^126] (gen_gemm_tile FAST_RCP); dn = inf clamps to
                 # FLT_MAX, whose tiny reciprocal times any |o| <= 65504 rounds to the same signed f16 zero as o * 0
                 e(f"  %egc{f} = vector.minnumf<nnan> %egd{f}, %efmax8 : {V8}")
