@@ -999,7 +999,7 @@ AF = {
     ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=dict(pslice="top_top")), # -10.4%
     ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
                                       persist=dict(pslice="b0_a1")),                         # -8.2%
-    ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
+    ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True, lhs_stream=1),   # -10.4%; lhs_stream 1: see q5k 24
     ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
     ("q3k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),
     ("q5k", "kstore", 1088, 20): dict(AF_KQP, ksl=True),
@@ -1010,7 +1010,7 @@ AF = {
     ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
                                       persist=dict(pslice="b0_a1")),                         # -8.5%
     ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=dict(pslice="top_top")), # -8.8%
-    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True, pslice="top_top"),   # -5.3%; top_top 89.6 -> 90.5% of floor
+    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # -5.3%; top_top 89.6 -> 90.5%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
     ("iq3s", "kstore", 640, 20): dict(AF_NOPRE, gaddr=True, f16s=True),          # -9.6%; no prefetch -1.5%
     ("iq4xs", "kstore", 640, 20): dict(AF_NOPRE),                               # -10.3%; no prefetch -1.1%
@@ -1023,11 +1023,14 @@ AF = {
     ("q4k", "kstore", 384, 20): dict(AF_KQP, bpre=0, b0early=False, lhs_stream=1),  # -6.0%; no prefetch -0.9%
     ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
-    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True, pslice="top_top"),   # -4.6%; top_top 88.3 -> 89.2%
+    # K-quant kres lhs_stream 1 (each A fragment just before its MMAs) since HRX 0051: WMMA bank cost 1.2-1.8% -> 0.1-0.5%,
+    # 187-192 VGPRs; pp2048 counters 3 runs (11-03), bit-identical: q5k out -1.2% (89.3 -> 90.4%), q5k down -1.8%, q4k
+    # out -0.9%, q4k down -1.1%, q3k down -0.9%
+    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # -4.6%; top_top 88.3 -> 89.2%
     # 11-02: the down kres of the formats that had no afrag form (tiled 256-token kernels at 69-82% of the floor)
-    ("q5k", "kres", 320, 68): dict(AF_KQP, ksl=True, respre=1, persist=True),
-    ("q3k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True, pslice="top_top"),   # top_top 90.9 -> 91.4%
-    ("q3k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True, pslice="top_top"),   # top_top 88.6 -> 89.1%
+    ("q5k", "kres", 320, 68): dict(AF_KQP, ksl=True, respre=1, persist=True, lhs_stream=1),
+    ("q3k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # top_top 90.9 -> 91.4%
+    ("q3k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # top_top 88.6 -> 89.1%
     ("iq2s", "kres", 320, 68): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2, respre=1, persist=True,
                                     pslice="top_top"),
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
