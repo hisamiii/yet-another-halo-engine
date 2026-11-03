@@ -169,6 +169,8 @@ R2P = False
 R2P_QKF = 1         # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
 R2P_PVF = 1         # R2P: the same for the V^T fragments
 R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
+R2P_PVB = os.environ.get("R2P_PVB", "1") == "1"   # R2P, P.V: P^T / alpha loads through byte views, loop-invariant lane
+                    # byte address + the slot's uniform byte offset (1 v_add per base; a row index costs 3 per load)
 R2P_PEEL = os.environ.get("R2P_PEEL", "1") == "1"   # R2P: tile 0 peeled off the loop without the P.V of tile -1
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
@@ -1997,6 +1999,18 @@ def gen():
         e("  %prow_lo_o = index.add %pw32o, %sub : index")   # P.V: the other head's P^T rows
         e("  %prow_hi_o = index.add %prow_lo_o, %c16 : index")
         e("  %pa_oth = index.add %pw16o, %sub : index")
+        if R2P_PVB:
+            e("  %pvb16 = index.constant 16 : index")
+            e("  %pvb4 = index.constant 4 : index")
+            e("  %ppb_view = buffer.view %pool[%pp_o] : buffer -> view<4096xi8>")
+            # the h1 lanes' rows (16 rows = 256 B past the h0 lanes'): the same lane address, the view base an immediate
+            e(f"  %pph_o = index.constant {S_OFF + 4096 + 256} : offset")
+            e("  %pph_view = buffer.view %pool[%pph_o] : buffer -> view<3840xi8>")
+            e("  %alb_view = buffer.view %pool[%al_o] : buffer -> view<512xi8>")
+            e("  %pvb_lo = index.mul %prow_lo, %pvb16 : index")
+            e("  %pvb_lo_o = index.mul %prow_lo_o, %pvb16 : index")
+            e("  %pab_own = index.mul %pa_own, %pvb4 : index")
+            e("  %pab_oth = index.mul %pa_oth, %pvb4 : index")
         e("  %xso_r0 = index.add %pw32o, %lane : index")     # QK: the other head's partial (plane 0 / 1 rows) ...
         e("  %xso_r1 = index.add %xso_r0, %c128 : index")
         e("  %xsm_r0 = index.add %pw32, %lane : index")      # ... and the partner's of the own head
@@ -2010,10 +2024,19 @@ def gen():
         """R2P, P.V wave: rescale each head's half of the bank (0..7: own head, 8..15: the other) by its alpha of that
         tile unless all its rows' are 1 (x 1.0 is exact), both heads' P^T from the slot, then 8 V^T fragments of this
         head-dim half, each feeding both heads' MMAs. Returns the new bank names."""
-        e(f"{ind}%{pp}ai = index.add {alb}, %pa_own : index")
-        e(f"{ind}%{pp}al = view.load %al_view[%{pp}ai] : view<128xf32> -> f32")
-        e(f"{ind}%{pp}aio = index.add {alb}, %pa_oth : index")
-        e(f"{ind}%{pp}alo = view.load %al_view[%{pp}aio] : view<128xf32> -> f32")
+        if R2P_PVB:
+            e(f"{ind}%{pp}rb = index.mul {rows}, %pvb16 : index")
+            e(f"{ind}%{pp}ab = index.mul {alb}, %pvb4 : index")
+            for nm, base in (("al", "%pab_own"), ("alo", "%pab_oth")):
+                e(f"{ind}%{pp}{nm}a = index.add {base}, %{pp}ab : index")
+                e(f"{ind}%{pp}{nm}v = vector.load %alb_view[%{pp}{nm}a] : view<512xi8> -> vector<4xi8>")
+                e(f"{ind}%{pp}{nm}w = vector.bitcast %{pp}{nm}v : vector<4xi8> to vector<1xf32>")
+                e(f"{ind}%{pp}{nm} = vector.extract %{pp}{nm}w[0] : vector<1xf32> -> f32")
+        else:
+            e(f"{ind}%{pp}ai = index.add {alb}, %pa_own : index")
+            e(f"{ind}%{pp}al = view.load %al_view[%{pp}ai] : view<128xf32> -> f32")
+            e(f"{ind}%{pp}aio = index.add {alb}, %pa_oth : index")
+            e(f"{ind}%{pp}alo = view.load %al_view[%{pp}aio] : view<128xf32> -> f32")
         Rf = []
         for f in range(16):
             e(f"{ind}%{pp}rf{f} = vector.bitcast {R[f]} : {BK} to {V8}")
@@ -2034,6 +2057,16 @@ def gen():
             e(f"{ind}}}")
         pbs = []
         for t, (lo, hi) in enumerate((("%prow_lo", "%prow_hi"), ("%prow_lo_o", "%prow_hi_o"))):
+            if R2P_PVB:
+                e(f"{ind}%{pp}rl{t} = index.add {('%pvb_lo', '%pvb_lo_o')[t]}, %{pp}rb : index")
+                e(f"{ind}%{pp}rlb{t} = vector.load %ppb_view[%{pp}rl{t}] : view<4096xi8> -> vector<16xi8>")
+                e(f"{ind}%{pp}rhb{t} = vector.load %pph_view[%{pp}rl{t}] : view<3840xi8> -> vector<16xi8>")
+                e(f"{ind}%{pp}plo{t} = vector.bitcast %{pp}rlb{t} : vector<16xi8> to {V8H}")
+                e(f"{ind}%{pp}phi{t} = vector.bitcast %{pp}rhb{t} : vector<16xi8> to {V8H}")
+                e(f"{ind}%{pp}pb0{t} = vector.concat<0> %{pp}plo{t}, %{pp}phi{t} : {V8H}, {V8H} -> {V16H}")
+                e(f"{ind}%{pp}pb{t} = vector.fragment<rhs> %{pp}pb0{t} shape [%k, %n] : {V16H}")
+                pbs.append(f"%{pp}pb{t}")
+                continue
             e(f"{ind}%{pp}rl{t} = index.add {rows}, {lo} : index")
             e(f"{ind}%{pp}rh{t} = index.add {rows}, {hi} : index")
             e(f"{ind}%{pp}plo{t} = vector.load %pp_view[%{pp}rl{t}, %c0] : view<256x8xf16> -> {V8H}")
