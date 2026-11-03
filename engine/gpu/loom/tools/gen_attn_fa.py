@@ -165,6 +165,7 @@ R2P = False
 R2P_QKF = 1         # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
 R2P_PVF = 1         # R2P: the same for the V^T fragments
 R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
+R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 PAIR_MAP = "mod"    # "mod": pair = waves (p, p + 4), one A and one B per SIMD; "adj": (2p, 2p + 1)
 PAIR_LATE = True    # PAIR: K / V staging loads in phase 2 (fewer VGPRs, but their latency is exposed: off when deployed)
@@ -3051,9 +3052,12 @@ def gen():
         o = "_o" if R2P and f >= 8 else ""
         e(f"    %eto{f}c = index.constant {256 * (f % 8 if R2P else f)} : index")
         e(f"    %eto{f} = index.add %etbase{o}, %eto{f}c : index")
+    epig = R2P and R2P_EPIG   # the whole fragment (gate loads, math, store) under the store guard: QK waves skip it
     for f in range(NFR):
         if f == 8:
             gate_batch(range(8, 16))
+        if epig:
+            e("  scf.if %ewr {")
         if gate_each:
             gate_loads(f)
         if QG16:
@@ -3082,7 +3086,8 @@ def gen():
             e(f"  %eod{f} = vector.divf %og{f}, %lsum8{bs} : {V8}")
         e(f"  %eov{f} = scf.select %lpos{bs}, %eod{f}, %zeros8 : {V8}")
         e(f"  %eout{f} = vector.mulf %eov{f}, %egr{f} : {V8}")
-        e(f"  scf.if {'%ewr' if PAIR or R2P else '%r_live'} {{")
+        if not epig:
+            e(f"  scf.if {'%ewr' if PAIR or R2P else '%r_live'} {{")
         if TILED_OUT:
             tiled_addr(f)
         e(f"    %eoh{f} = vector.fptrunc %eout{f} : {V8} to {V8H}")
