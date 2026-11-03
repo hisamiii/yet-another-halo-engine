@@ -169,6 +169,7 @@ R2P = False
 R2P_QKF = 1         # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
 R2P_PVF = 1         # R2P: the same for the V^T fragments
 R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
+R2P_PEEL = os.environ.get("R2P_PEEL", "1") == "1"   # R2P: tile 0 peeled off the loop without the P.V of tile -1
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 PAIR_MAP = "mod"    # "mod": pair = waves (p, p + 4), one A and one B per SIMD; "adj": (2p, 2p + 1)
@@ -1968,7 +1969,7 @@ def gen():
                 e(f"{ind}scf.schedule.fence")
         return acc
 
-    def body_r2p():
+    def body_r2p(first=False):
         """R2P tile ks, one role branch holding both phases (and both barriers: every wave meets each once).
         QK waves: QK(ks), the other head's partial to LDS | barrier A | K(ks + 16) loads, own S = own + partner partial,
         softmax -> P^T / alpha slot ks % 2 | barrier B.
@@ -2008,7 +2009,7 @@ def gen():
         stage_v(nv, "%c0", "stv", J)
         e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         stage_k("%ks16", nk, "st", J)
-        outs = r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J)
+        outs = rnames if first else r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J)   # R2P_PEEL: no P.V(-1)
         e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e(f"{J}scf.yield {', '.join(outs)}, %rmax, %rsum : {rtypes}, f32, f32")
         e(f"{I}}}")
@@ -2852,7 +2853,27 @@ def gen():
             e("  %r2mlb = kernel.subgroup.broadcast.first %r2mlr : i32")   # (scalar: the per-tile test is SALU)
         init = ", ".join(f"%rb{f} = %rinit{f} : {BK}" for f in range(16)) + ", %rmax = %ninf : f32, %rsum = %zero : f32"
         fb = [f"%fb{f}" for f in range(16)]
-        e(f"  %wkf, {', '.join(fb)}, %gmax, %gsum = scf.while(%ksw = %c0 : index, {init}) -> (index, {rtypes}, f32, f32) {{")
+        k0 = "%c0"
+        if R2P_PEEL:   # tile 0 before the loop, without the P.V of tile -1 (P = 0: 16 MMAs of nothing per workgroup)
+            i0 = len(L)
+            body_r2p(first=True)
+            sub = {"%ks_": "%c0", "%rmax": "%ninf", "%rsum": "%zero"}
+            sub.update({f"%rb{f}": f"%rinit{f}" for f in range(16)})
+            defs = set()
+            for ln in L[i0:]:
+                if " = " in ln:
+                    defs.update(re.findall(r"%[A-Za-z0-9_.]+", ln.split(" = ")[0]))
+            sub.update({d: d + "_p0" for d in defs})
+            tok = re.compile(r"%[A-Za-z0-9_.]+")
+            L[i0:] = [tok.sub(lambda m: sub.get(m.group(0), m.group(0)), ln) for ln in L[i0:]]
+            init = ", ".join(f"%rb{f} = %nb{f}_p0 : {BK}" for f in range(16)) + ", %rmax = %qmax_p0 : f32, %rsum = %qsum_p0 : f32"
+            k0 = "%c16"
+            e("  %pmore = index.cmp ult, %c16, %max_vis : index")
+            e(f"  %wkf, {', '.join(fb)}, %gmax, %gsum = scf.if %pmore -> (index, {rtypes}, f32, f32) {{")
+            res = f"%wkfL, {', '.join(f + 'L' for f in fb)}, %gmaxL, %gsumL"
+        else:
+            res = f"%wkf, {', '.join(fb)}, %gmax, %gsum"
+        e(f"  {res} = scf.while(%ksw = {k0} : index, {init}) -> (index, {rtypes}, f32, f32) {{")
         e("    %ks_ = index.assume %ksw [range(%ksw, 0, 1048576), lt(%ksw, %max_vis)] : index")
         nb = body_r2p()
         e(f"    %ksn = index.add %ks_, %c{KT} : index")
@@ -2862,6 +2883,11 @@ def gen():
         e(f"  }} do({wargs}) {{")
         e(f"    scf.yield %wk, {', '.join(f'%wb{f}' for f in range(16))}, %wm, %ws : index, {rtypes}, f32, f32")
         e("  }")
+        if R2P_PEEL:
+            e(f"  scf.yield {res} : index, {rtypes}, f32, f32")
+            e("  } else {")
+            e(f"  scf.yield %c16, {', '.join(f'%nb{f}_p0' for f in range(16))}, %qmax_p0, %qsum_p0 : index, {rtypes}, f32, f32")
+            e("  }")
         e("  scf.if %isA {")
         e("    view.store %gsum, %ls_view[%pa_own] : f32, view<64xf32>")
         e("  }")
