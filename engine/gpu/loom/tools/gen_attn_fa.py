@@ -1956,6 +1956,29 @@ def gen():
         e("    %alpha = scalar.exp2f<afn> %pdl : f32")
         e(f"    %nnml8 = vector.splat %nnml : {V8}")
         e(f"    %nmax8 = vector.splat %nmax : {V8}")
+        pad = {k[:4]: int(k[4:]) for k in R2P_DIAG if k[:4] in ("vpad", "xpad")}
+        if pad:   # diag: vpadN = N extra V8 mul ops (4 chains), xpadN = N extra V8 exp2 ops (2 chains), fed into s
+            ends = []
+            nv, nx = pad.get("vpad", 0), pad.get("xpad", 0)
+            for k in range(4 if nv else 0):
+                e(f"    %vpk{k} = scalar.constant {k + 1}.5 : f32")
+                e(f"    %vpc{k} = vector.splat %vpk{k} : {V8}")
+                e(f"    %vp{k}_0 = vector.addf {s}, %vpc{k} : {V8}")
+                for j in range(1, nv // 4):
+                    e(f"    %vp{k}_{j} = vector.mulf %vp{k}_{j - 1}, {s} : {V8}")
+                ends.append(f"%vp{k}_{nv // 4 - 1}")
+            for k in range(2 if nx else 0):
+                cur = s
+                for j in range(nx // 2):
+                    e(f"    %xp{k}_{j} = vector.exp2f<afn> {cur} : {V8}")
+                    cur = f"%xp{k}_{j}"
+                    if j == 0 and k == 1:   # the second chain starts from a different value
+                        e(f"    %xpo = vector.addf %xp1_0, {s} : {V8}")
+                        cur = "%xpo"
+                ends.append(cur)
+            for i, x in enumerate(ends):
+                e(f"    %spad{i} = vector.addf {s if i == 0 else f'%spad{i - 1}'}, {x} : {V8}")
+            s = f"%spad{len(ends) - 1}"
         if "nosoft" in R2P_DIAG:   # p = s: no subtract / scale / exp (two free bitcasts)
             e(f"    %pdi = vector.bitcast {s} : {V8} to vector<8xi32>")
             e(f"    %p = vector.bitcast %pdi : vector<8xi32> to {V8}")
@@ -2121,6 +2144,21 @@ def gen():
                 e(f"{ind}  %{pp}os{f} = vector.mulf {Rf[f]}, %{pp}al8_{t} : {V8}")
             e(f"{ind}  scf.yield {', '.join(f'%{pp}os{f}' for f in fs)} : {ftypes}")
             e(f"{ind}}}")
+        pvp = [int(k[5:]) for k in R2P_DIAG if k.startswith("pvpad")]
+        if pvp:   # diag: pvpadN = N extra V8 mul ops (4 chains) on fragment 0's accumulator, in the P.V wave
+            ends = []
+            for k in range(4):
+                e(f"{ind}%{pp}vpk{k} = scalar.constant {k + 1}.5 : f32")
+                e(f"{ind}%{pp}vpc{k} = vector.splat %{pp}vpk{k} : {V8}")
+                e(f"{ind}%{pp}vp{k}_0 = vector.addf {sc[0]}, %{pp}vpc{k} : {V8}")
+                for j in range(1, pvp[0] // 4):
+                    e(f"{ind}%{pp}vp{k}_{j} = vector.mulf %{pp}vp{k}_{j - 1}, {sc[0]} : {V8}")
+                ends.append(f"%{pp}vp{k}_{pvp[0] // 4 - 1}")
+            cur = sc[0]
+            for i, x in enumerate(ends):
+                e(f"{ind}%{pp}spv{i} = vector.addf {cur}, {x} : {V8}")
+                cur = f"%{pp}spv{i}"
+            sc[0] = cur
         pbs = []
         for t, (lo, hi) in enumerate((("%prow_lo", "%prow_hi"), ("%prow_lo_o", "%prow_hi_o"))):
             if R2P_PVB:
