@@ -1421,6 +1421,8 @@ def gen():
 
     def page_of(start, p, ind, tag):
         """Physical page of the (uniform) tile start; start is already clamped."""
+        if "page0" in R2P_DIAG:   # diag: every tile on physical page 0 (no page-table load; wrong rows, in bounds)
+            return "%c0"
         e(f"{ind}%{p}{tag}lp = index.div {start}, %c256 : index")
         e(f"{ind}%{p}{tag}pg0 = view.load %pt_flat[%{p}{tag}lp] : view<[%npages]xi32> -> i32")
         e(f"{ind}%{p}{tag}pgr = index.cast %{p}{tag}pg0 : i32 to index")
@@ -2320,12 +2322,21 @@ def gen():
         e(f"{J}%vks = index.sub %vks1, %c16 : index")
         nostg = "nostg" in R2P_DIAG   # (diag nostg: no K / V loads or staging stores in the loop: stale tiles)
         if not nostg:
-            nv = ["%zh8"] * 4 if "novl" in R2P_DIAG else load_v("%vks", "nv", J)   # (diag novl: V staged as zeros)
-            nk = load_k("%ks16", "nk", J)
-            stage_v(nv, "%c0", "stv", J)
+            lv, lk = "%vks", "%ks16"
+            if "kvhot" in R2P_DIAG:   # diag: K / V loads from the first 64 rows (tile start min 48) (cache-hot; staging keys unchanged)
+                e(f"{J}%kvh64 = index.constant 48 : index")
+                e(f"{J}%vksh = index.min %vks, %kvh64 : index")
+                e(f"{J}%ks16h = index.min %ks16, %kvh64 : index")
+                lv, lk = "%vksh", "%ks16h"
+            nv = ["%zh8"] * 4 if R2P_DIAG & {"novl", "nostv"} else load_v(lv, "nv", J)   # (diag novl: V staged as zeros)
+            nk = ["%zh8"] * NKS() if R2P_DIAG & {"nokl", "nostk"} else load_k(lk, "nk", J)   # (diag nokl: K staged as zeros)
+            if "nostv" not in R2P_DIAG:   # (diag nostv / nostk: no V / K loads or LDS stores: stale tiles)
+                stage_v(nv, "%c0", "stv", J)
+            if "kstA" in R2P_DIAG:   # diag: K stored in phase A, before barrier A (races the QK reads: wrong values)
+                stage_k("%ks16", nk, "st", J)
         if not R2P_DIAG & {"nobar", "nobara"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        if not nostg:
+        if not nostg and not R2P_DIAG & {"nostk", "kstA"}:
             stage_k("%ks16", nk, "st", J)
         outs = rnames if first else r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J)   # R2P_PEEL: no P.V(-1)
         if not R2P_DIAG & {"nobar", "nobarb"}:
