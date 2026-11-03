@@ -2228,12 +2228,15 @@ def gen():
         e(f"{I}}} else {{")
         e(f"{J}%vks1 = index.max %ks_, %c16 : index")
         e(f"{J}%vks = index.sub %vks1, %c16 : index")
-        nv = ["%zh8"] * 4 if "novl" in R2P_DIAG else load_v("%vks", "nv", J)   # (diag novl: V staged as zeros, no V loads)
-        nk = load_k("%ks16", "nk", J)
-        stage_v(nv, "%c0", "stv", J)
+        nostg = "nostg" in R2P_DIAG   # (diag nostg: no K / V loads or staging stores in the loop: stale tiles)
+        if not nostg:
+            nv = ["%zh8"] * 4 if "novl" in R2P_DIAG else load_v("%vks", "nv", J)   # (diag novl: V staged as zeros)
+            nk = load_k("%ks16", "nk", J)
+            stage_v(nv, "%c0", "stv", J)
         if not R2P_DIAG & {"nobar", "nobara"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        stage_k("%ks16", nk, "st", J)
+        if not nostg:
+            stage_k("%ks16", nk, "st", J)
         outs = rnames if first else r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J)   # R2P_PEEL: no P.V(-1)
         if not R2P_DIAG & {"nobar", "nobarb"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")

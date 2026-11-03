@@ -149,6 +149,9 @@ def main():
         hals = []
         for name, src, text, env, _ in variants:
             gx, gy = grid(text)
+            if "HAL" in env:   # a prebuilt code object for this one depth (e.g. a regperm rewrite of the compiled one)
+                hals.append(f"{env['HAL']}@{gx},{gy}")
+                continue
             hals.append(f"{compile_hal(src, text, env, depth, a.tag)}@{gx},{gy}")
         prof = os.path.join(a.tag, "run.irpf")
         if os.path.exists(prof):
