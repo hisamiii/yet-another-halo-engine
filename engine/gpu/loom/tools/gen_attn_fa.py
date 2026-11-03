@@ -176,7 +176,8 @@ R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in
 # R2P_DIAG (diagnostics only, wrong results, never deployed): comma list of LDS ablations: nox (no S partial exchange,
 # s = own + other head's partial), halfk / halfv (odd K / V^T fragments reuse the even one's registers); nobar (no
 # barriers in the R2P tile loop: races, no waits); nosoft (p = s, no subtract / scale / exp);
-# nosum (no row sum)
+# nosum (no row sum); chain4 (4 QK accumulator chains of 4); occ3 (LDS
+# floor for 3 workgroups per WGP)
 R2P_DIAG = set(filter(None, os.environ.get("R2P_DIAG", "").split(",")))
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 PAIR_MAP = "mod"    # "mod": pair = waves (p, p + 4), one A and one B per SIMD; "adj": (2p, 2p + 1)
@@ -793,6 +794,8 @@ def gen():
         QX_OFF = pool
         pool += NQB * 2 * 16 * 4
     pool = max(pool, LDS_MIN)
+    if "occ3" in R2P_DIAG:   # (diag: the 3-workgroup LDS floor, to separate occupancy from other effects)
+        pool = max(pool, 33792)
     assert pool <= 65536
     e(f"  %pool_bytes = index.constant {pool} : offset")
     e("  %pool = buffer.alloca<workgroup> align(16) %pool_bytes : buffer")
@@ -2110,7 +2113,8 @@ def gen():
             e(f"{ind}%qb16_{c} = vector.bitcast {R[c]} : {BK} to {V16H}")
             e(f"{ind}%qf{c} = vector.fragment<rhs> %qb16_{c} shape [%k, %n] : {V16H}")
         e(f"{ind}%r2z = vector.fragment<init> %zeros8 shape [%m, %n] : {V8}")
-        acc = ["%r2z", "%r2z"]
+        ch4 = "chain4" in R2P_DIAG   # 4 chains: per head, even and odd K fragments, summed at the end (sum order moves)
+        acc = ["%r2z"] * (4 if ch4 else 2)
         for c in range(8):
             e(f"{ind}%kfc{c}c = index.constant {16 * c} : index")
             e(f"{ind}%kfc{c} = index.add %hd128, %kfc{c}c : index")
@@ -2118,10 +2122,15 @@ def gen():
             if kc == c:
                 e(f"{ind}%kf{c} = vector.fragment.load<lhs> %k_view[%c0, %kfc{c}] shape [%m, %k] : view<{KT}x{KT_PITCH}xf16> -> {V16H}")
             for t in range(2):
-                e(f"{ind}%sa{t}_{c} = vector.mma %kf{kc}, %qf{8 * t + c}, {acc[t]} : {V16H}, {V16H}, {V8}")
-                acc[t] = f"%sa{t}_{c}"
+                a = 2 * t + c % 2 if ch4 else t
+                e(f"{ind}%sa{t}_{c} = vector.mma %kf{kc}, %qf{8 * t + c}, {acc[a]} : {V16H}, {V16H}, {V8}")
+                acc[a] = f"%sa{t}_{c}"
             if c < 7 and (c + 1) % R2P_QKF == 0:
                 e(f"{ind}scf.schedule.fence")
+        if ch4:
+            for t in range(2):
+                e(f"{ind}%sc4_{t} = vector.addf {acc[2 * t]}, {acc[2 * t + 1]} : {V8}")
+            return [f"%sc4_{t}" for t in range(2)]
         return acc
 
     def body_r2p(first=False):
