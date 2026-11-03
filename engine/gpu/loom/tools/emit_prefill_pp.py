@@ -2404,11 +2404,19 @@ def main():
     # PV_FENCE: -16 v_mov per tile, pp2048 attention -2.3% cycles (-3% in the pipeline), bit-identical
     # R2P: the reuse-2 role split (half the LDS fragment reads, no duplicated softmax), bit-identical: pp2048 attention
     # -7.3% cycles (62.8 -> 67.6% of floor), 8K -9.6% (71.6 -> 79.3%). YAH_ATTN_R2P=0: the head_dim split
-    MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=True, PV_FENCE=True,
+    # YAH_ATTN_PERSIST=<slots> (gen_attn_fa PERSIST): the main twin (and its alt) as a persistent kernel of that many
+    # workgroups running a snake schedule of whole units, bit-identical; dispatch.txt "persist_<hal> <slots> 1 0" rows.
+    # Not the OCNT twin (wmmaf.hal: its counters feed a concurrent consumer) nor half sets.
+    persist = 0 if EMIT_HALF else int(os.environ.get("YAH_ATTN_PERSIST", "0"))
+    MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=not persist, PERSIST=persist, PV_FENCE=True,
                       R2P=os.environ.get("YAH_ATTN_R2P", "1") != "0", PRO_FAST=os.environ.get("YAH_ATTN_PROF", "1") != "0")
     # the role-split twins too: EPI_FAST + CTX16 halve their epilogue VALU (B waves normalize all 256 dims alone);
     # bit-identical, KT2 -1.6% at 16K, -0.5% at 32K, -0.8% at 96K
     TWIN_EPI = dict(EPI_FAST=True, CTX16=B % 16 == 0)
+    # YAH_ATTN_PREV=1 (with PERSIST): half the slots run their snake rounds in reverse (gen_attn_fa PERSIST_REV):
+    # 8K busiest SQ 78.9 -> 81.1% of floor (clean grid 81.3%), bit-identical
+    if persist and os.environ.get("YAH_ATTN_PREV") == "1":
+        MAIN_FLAGS.update(QB_ZIGZAG=False, PERSIST_REV=True)
 
     kt2_cfg = (a_hpw, a_qt) if EMIT_HALF else KT2_SHAPE
     kt2_shape = kt2_cfg if kt2_cfg != (a_hpw, a_qt) else None   # a shape of its own: its chunks get dispatch.txt rows
@@ -2461,7 +2469,7 @@ def main():
     if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0 and not EMIT_HALF:   # the main twin with OCNT (and its alt)
         A = gen_attn_fa
         saved = {k: getattr(A, k) for k in ("DIAG_SWAP", "OCNT") + tuple(MAIN_FLAGS)}
-        for k, v in dict(MAIN_FLAGS, OCNT=True).items():
+        for k, v in dict(MAIN_FLAGS, OCNT=True, PERSIST=0, QB_ZIGZAG=True).items():
             setattr(A, k, v)
         open(attn_f_src, "w").write(A.gen())
         A.DIAG_SWAP = False
@@ -3004,6 +3012,7 @@ def main():
     if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)
         fixed = [f for f in fixed if f[1].startswith(("prepab", "rowsplit", "postnorm", "rope", "vtpage", "wmma"))]
     kt2_rows = []
+    persist_rows = []
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
         if outname.startswith("wmma") and "_kt2" in loom:   # KT2 past 240 VGPRs loses its third workgroup: use the old twin
@@ -3026,7 +3035,14 @@ def main():
                 E.emit(alt(loom), configs, outname, outdir, attn_env(loom))
                 if hal_spills(hal):
                     raise SystemExit("attention %s still spills: refusing to emit a spilling attention kernel" % outname)
+        if outname.startswith("wmma") and persist and outname != "wmmaf.hal" and not any(
+                t in loom for t in ("_deep", "_kt2")):
+            persist_rows.append(outname)
         n += 1
+    if persist_rows:   # the persistent attention HALs launch persist workgroups on x only
+        with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
+            for hal in persist_rows:
+                fh.write("persist_%s %d 1 0\n" % (hal, persist))
     if kt2_rows:   # the KT2 chunks' own launch geometry (the global wmma.hal row is chunk 0's)
         with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
             for hal in kt2_rows:

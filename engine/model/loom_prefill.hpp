@@ -2574,7 +2574,11 @@ class LoomPrefill {
       // aov: the counters (untracked) for the rotq after it; wmmaf.hal is chunk 0's main kernel with them
       attn_flagged_ = aov_ && ah == "wmma.hal" && !fps && !qrot && n_ == B_;
       if (attn_flagged_) b.push_back(attn_cnt_ = FlagSlots(6));
-      Dispatch(Exe(attn_flagged_ ? "wmmaf.hal" : ah), "yah_attn_wmma", (B_ + tpw - 1) / tpw, kHeads / hpw, 1, 256, 1, 1,
+      // a persistent attention HAL (dispatch.txt "persist_<hal> <slots>") runs <slots> workgroups over all the units
+      const std::string ahx = attn_flagged_ ? "wmmaf.hal" : ah;
+      const auto pg = geom_.find("persist_" + ahx);
+      Dispatch(Exe(ahx), "yah_attn_wmma", pg != geom_.end() ? pg->second.tokens : (B_ + tpw - 1) / tpw,
+               pg != geom_.end() ? 1 : kHeads / hpw, 1, 256, 1, 1,
                b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
       if (fps_on_) FpsDump(ai, ci);
     }

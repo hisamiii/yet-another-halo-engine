@@ -208,6 +208,15 @@ FPS_TPAD = 0
 FPS_ORD = False     # FPSPARSE: the launch order from yah_fpord (after the lists in sel): longest list first
 FPS_NG = 0          # FPSPARSE: lists in sel (chunk / 16 query blocks x 4 KV heads; MAX_TOKENS is clamped to >= 2048)
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
+# PERSIST = P > 0: P workgroups (one per slot: 20 WGPs x 4) each run a list of units (query block, head pair) in a
+# loop: the units sorted longest first (QB_ZIGZAG: in its long, short, ... order), dealt round by round, the
+# direction alternating (snake). Per-unit code as before (bit-identical); the last partial round of whole units no
+# longer idles slots behind a launch order.
+PERSIST = 0
+# PERSIST_REV (with PERSIST): slots 20-39 and 60-79 (WGP s % 20's second and fourth) run their snake rounds last to
+# first: the same units per slot (the snake's balance), but every WGP runs short units beside long ones throughout,
+# so the short units' Q / gate / O traffic overlaps compute instead of forming a DRAM-bound tail
+PERSIST_REV = False
 # OCNT: binding ocnt (after the others): after a workgroup barrier lane 0 adds 1 to counter c tt + t (release) for
 # 1024-feature chunk c and 128-token tile t of its output, tt = token_count / 128 (ocnt_need workgroups per counter),
 # so a flag-waiting rotq (gen_rot.gen_qp flag) runs without a graph barrier behind this kernel (every lane adding,
@@ -636,7 +645,12 @@ def gen():
     e("  %pairs = index.div %nh, %chpw : index")
     e("  %tp = index.add %token_count, %cqt1 : index")
     e("  %qblocks = index.div %tp, %cqt : index")
-    e("  kernel.launch.config workgroups(%qblocks, %pairs, %c1) workgroup_size(%cnt, %c1, %c1) : index")
+    if PERSIST:
+        assert not (KVMAJOR or FPSPARSE or OCNT or KT2_MIRROR or (PERSIST_REV and QB_ZIGZAG))
+        e(f"  %cpst = index.constant {PERSIST} : index")
+        e("  kernel.launch.config workgroups(%cpst, %c1, %c1) workgroup_size(%cnt, %c1, %c1) : index")
+    else:
+        e("  kernel.launch.config workgroups(%qblocks, %pairs, %c1) workgroup_size(%cnt, %c1, %c1) : index")
     e("} launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer"
       + (", %kscale: buffer" if KDEC else "")
       + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "")
@@ -791,14 +805,48 @@ def gen():
         e(f"  %ls_o = index.constant {S_OFF + 4608} : offset")
         e("  %ls_view = buffer.view %pool[%ls_o] : buffer -> view<64xf32>")
     # ids: head pair fastest, longest query blocks first
-    e("  %wgx = kernel.workgroup.id<x> : index")
-    e("  %wgy = kernel.workgroup.id<y> : index")
-    e("  %nh_ = config.get @attention_prefill.num_heads : index")
-    e("  %npairs = index.div %nh_, %chpw : index")
-    e("  %tpq = index.add %B, %cqt1 : index")
-    e("  %nqb = index.div %tpq, %cqt : index")
-    e("  %wgl0 = index.mul %wgy, %nqb : index")
-    e("  %wgl = index.add %wgl0, %wgx : index")
+    if PERSIST:
+        e("  %nh_ = config.get @attention_prefill.num_heads : index")
+        e("  %npairs = index.div %nh_, %chpw : index")
+        e("  %tpq = index.add %B, %cqt1 : index")
+        e("  %nqb = index.div %tpq, %cqt : index")
+        e("  %pun = index.mul %nqb, %npairs : index")              # units
+        e(f"  %pP = index.constant {PERSIST} : index")
+        e(f"  %pP1 = index.constant {PERSIST - 1} : index")
+        e("  %prn0 = index.add %pun, %pP1 : index")
+        e("  %prn = index.div %prn0, %pP : index")                 # rounds
+        e("  %pslot = kernel.workgroup.id<x> : index")
+        e("  %pslotr = index.sub %pP1, %pslot : index")
+        e("  scf.for %pr = [%c0 to %prn step %c1] {")
+        if PERSIST_REV:   # odd groups of 20 slots: round prn - 1 - pr
+            e("  %pc20 = index.constant 20 : index")
+            e("  %pgr = index.div %pslot, %pc20 : index")
+            e("  %pgp = index.rem %pgr, %c2 : index")
+            e("  %pgo = index.cmp ne, %pgp, %c0 : index")
+            e("  %prn1 = index.sub %prn, %c1 : index")
+            e("  %prr = index.sub %prn1, %pr : index")
+            e("  %prx = scf.select %pgo, %prr, %pr : index")
+        else:
+            e("  %prx = index.add %pr, %c0 : index")
+        e("  %prp = index.rem %prx, %c2 : index")
+        e("  %prev = index.cmp eq, %prp, %c0 : index")
+        e("  %psl = scf.select %prev, %pslot, %pslotr : index")    # snake: odd rounds deal the slots in reverse
+        e("  %prb = index.mul %prx, %pP : index")
+        e("  %wglp = index.add %prb, %psl : index")
+        e("  %pval = index.cmp ult, %wglp, %pun : index")
+        e("  scf.if %pval {")
+        # the previous unit's LDS readers (epilogue row sums, P^T / V^T slots) are done before this unit stages
+        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        e("  %wgl = index.assume %wglp [range(%wglp, 0, 1048576), lt(%wglp, %pun)] : index")
+    else:
+        e("  %wgx = kernel.workgroup.id<x> : index")
+        e("  %wgy = kernel.workgroup.id<y> : index")
+        e("  %nh_ = config.get @attention_prefill.num_heads : index")
+        e("  %npairs = index.div %nh_, %chpw : index")
+        e("  %tpq = index.add %B, %cqt1 : index")
+        e("  %nqb = index.div %tpq, %cqt : index")
+        e("  %wgl0 = index.mul %wgy, %nqb : index")
+        e("  %wgl = index.add %wgl0, %wgx : index")
     if KVMAJOR:   # KV head slowest: co-resident workgroups stream the same K / V (one KV head's pairs fastest)
         e("  %nkvh_ = config.get @attention_prefill.num_kv_heads : index")
         e("  %pkv = index.div %npairs, %nkvh_ : index")
@@ -3159,6 +3207,24 @@ def gen():
         e("  scf.if %oc_l0 {")
         e("    view.atomic.reduce<addi> %oc_one, %oc_v[%oc_i] {ordering = release, scope = device} : i32, view<[%oc_n]xi32>")
         e("  }")
+    if PERSIST:
+        e("  }")   # scf.if %pval
+        e("  }")   # scf.for %pr
+        # constants defined before the unit loop stay live across all of it (Loom does not rematerialize them there):
+        # float / vector constants that nothing before the loop uses move to the top of the unit body
+        top = next(i for i, ln in enumerate(L) if ln.startswith("} launch("))
+        body = next(i for i, ln in enumerate(L) if "kernel.barrier" in ln and i > L.index("  scf.if %pval {"))
+        tok = re.compile(r"%[A-Za-z0-9_.]+")
+        moved = []
+        for i in range(top + 1, L.index("  scf.if %pval {")):
+            m = re.match(r"\s*(%[A-Za-z0-9_.]+) = (scalar\.constant .*: f(16|32)|vector\.constant |vector\.splat )", L[i])
+            if m and not any(m.group(1) in tok.findall(x.split(" = ", 1)[-1]) for x in L[i + 1:L.index("  scf.if %pval {")]):
+                moved.append(i)
+        mv = [L[i] for i in moved]
+        for i in reversed(moved):
+            del L[i]
+        body = next(i for i, ln in enumerate(L) if "kernel.barrier" in ln and i > L.index("  scf.if %pval {"))
+        L[body + 1:body + 1] = mv
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
