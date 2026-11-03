@@ -2407,7 +2407,12 @@ def main():
     # YAH_ATTN_PERSIST=<slots> (gen_attn_fa PERSIST): the main twin (and its alt) as a persistent kernel of that many
     # workgroups running a snake schedule of whole units, bit-identical; dispatch.txt "persist_<hal> <slots> 1 0" rows.
     # Not the OCNT twin (wmmaf.hal: its counters feed a concurrent consumer) nor half sets.
-    persist = 0 if EMIT_HALF else int(os.environ.get("YAH_ATTN_PERSIST", "0"))
+    # YAH_ATTN_ONE=1: one attention kernel at every depth, the queued persistent kernel (= YAH_ATTN_PERSIST=80
+    # YAH_ATTN_PDYN=1) for every chunk, no 3-workgroup (deep / KT2) twins
+    one = not EMIT_HALF and os.environ.get("YAH_ATTN_ONE") == "1"
+    if one and FPS_FROM:
+        raise SystemExit("YAH_ATTN_ONE: the block-sparse attention needs the KT2 twin")
+    persist = 0 if EMIT_HALF else 80 if one else int(os.environ.get("YAH_ATTN_PERSIST", "0"))
     MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=not persist, PERSIST=persist, PV_FENCE=True,
                       R2P=os.environ.get("YAH_ATTN_R2P", "1") != "0", PRO_FAST=os.environ.get("YAH_ATTN_PROF", "1") != "0")
     # the role-split twins too: EPI_FAST + CTX16 halve their epilogue VALU (B waves normalize all 256 dims alone);
@@ -2420,7 +2425,7 @@ def main():
     # YAH_ATTN_PDYN=1 (with PERSIST): the slots take their units from an atomic queue (gen_attn_fa PERSIST_DYN), bit-identical;
     # standalone wall vs the grid kernel: tie to 8K, -2% at 16K, -5% at 64K, -11% at 126K. dispatch.txt "persist_<hal>
     # <slots> 1 1": the driver binds a zeroed queue after the others
-    pdyn = bool(persist) and os.environ.get("YAH_ATTN_PDYN") == "1"
+    pdyn = bool(persist) and (one or os.environ.get("YAH_ATTN_PDYN") == "1")
     if pdyn:
         MAIN_FLAGS.update(QB_ZIGZAG=False, PERSIST_DYN=True)
 
@@ -2872,6 +2877,8 @@ def main():
             open(src, "w").write(txt)
             pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
     def occ(path, c, use_kt2=True):   # the 3-workgroup twins: KT2 from KT2_FROM keys of context on, else PAIR from OCC3_FROM
+        if one:
+            return path
         if use_kt2 and fps_on and c * B >= FPS_FROM and os.path.exists(fps(path)):
             return fps(path)
         if use_kt2 and c * B >= KT2_FROM and (c or not kt2_shape) and os.path.exists(kt2(path)):
