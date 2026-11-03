@@ -176,7 +176,7 @@ R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in
 # R2P_DIAG (diagnostics only, wrong results, never deployed): comma list of LDS ablations: nox (no S partial exchange,
 # s = own + other head's partial), halfk / halfv (odd K / V^T fragments reuse the even one's registers); nobar (no
 # barriers in the R2P tile loop: races, no waits); nosoft (p = s, no subtract / scale / exp);
-# nosum (no row sum); chain4 (4 QK accumulator chains of 4); occ3 (LDS
+# nosum (no row sum); nobara / nobarb (only barrier A / B); chain4 (4 QK accumulator chains of 4); occ3 (LDS
 # floor for 3 workgroups per WGP)
 R2P_DIAG = set(filter(None, os.environ.get("R2P_DIAG", "").split(",")))
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
@@ -2154,7 +2154,7 @@ def gen():
         e(f"{I}{', '.join(nb)}, %qmax, %qsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
         own, oth = r2p_qk(rnames, J)
         if "nox" in R2P_DIAG:
-            if "nobar" not in R2P_DIAG:
+            if not R2P_DIAG & {"nobar", "nobara"}:
                 e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
             e(f"{J}%s0 = vector.addf {own}, {oth} : {V8}")
         else:
@@ -2162,14 +2162,14 @@ def gen():
             e(f"{J}%xst1 = vector.slice {oth}[4] : {V8} -> {V4}")
             e(f"{J}vector.store %xst0, %xs_view[%xso_r0, %c0] : {V4}, view<256x4xf32>")
             e(f"{J}vector.store %xst1, %xs_view[%xso_r1, %c0] : {V4}, view<256x4xf32>")
-            if "nobar" not in R2P_DIAG:
+            if not R2P_DIAG & {"nobar", "nobara"}:
                 e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
             e(f"{J}%spa = vector.load %xs_view[%xsm_r0, %c0] : view<256x4xf32> -> {V4}")
             e(f"{J}%spb = vector.load %xs_view[%xsm_r1, %c0] : view<256x4xf32> -> {V4}")
             e(f"{J}%spart = vector.concat<0> %spa, %spb : {V4}, {V4} -> {V8}")
             e(f"{J}%s0 = vector.addf {own}, %spart : {V8}")
         emit_softmax_pv(None, True, pair_slot=("%slot_rows", "%slot_al"))
-        if "nobar" not in R2P_DIAG:
+        if not R2P_DIAG & {"nobar", "nobarb"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e(f"{J}scf.yield {', '.join(rnames)}, %nmax, %nsum : {rtypes}, f32, f32")
         e(f"{I}}} else {{")
@@ -2178,11 +2178,11 @@ def gen():
         nv = ["%zh8"] * 4 if "novl" in R2P_DIAG else load_v("%vks", "nv", J)   # (diag novl: V staged as zeros, no V loads)
         nk = load_k("%ks16", "nk", J)
         stage_v(nv, "%c0", "stv", J)
-        if "nobar" not in R2P_DIAG:
+        if not R2P_DIAG & {"nobar", "nobara"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         stage_k("%ks16", nk, "st", J)
         outs = rnames if first else r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J)   # R2P_PEEL: no P.V(-1)
-        if "nobar" not in R2P_DIAG:
+        if not R2P_DIAG & {"nobar", "nobarb"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e(f"{J}scf.yield {', '.join(outs)}, %rmax, %rsum : {rtypes}, f32, f32")
         e(f"{I}}}")
