@@ -2434,6 +2434,9 @@ def main():
                 A.configure(*shape)
             open(name, "w").write(A.gen())
             A.DIAG_SWAP = False
+            # R2P has no form without DIAG_SWAP's uniform mask test (its per-lane vote does not lower): its fallback is
+            # the head_dim split kernel R2P replaced (192 VGPRs; R2P_LAZY's rounding is R2P's own, so gate N, not exact)
+            A.R2P = False
             open(alt(name), "w").write(A.gen())
             for k in keys:
                 setattr(A, k, saved[k])
