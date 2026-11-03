@@ -1152,7 +1152,11 @@ def gen():
 
         def qfrags():
             if R2P:
-                assert QNORM
+                if not QNORM:   # pre-rotated f16 Q (qrot): the fragments of the wave's QNORM block, loaded as is
+                    for c in range(8):
+                        e(f"  %qdc{c} = index.constant {16 * c} : index")
+                        e(f"  %qda{c} = index.add %qdbn, %qdc{c} : index")
+                        e(f"  %qdv{c} = vector.load %q_flat[%qda{c}] : view<[%qtot]xf16> -> {V16H}")
                 return qfrags_r2p()
             for c in range(16 if PAIR else 8):
                 if not QNORM:

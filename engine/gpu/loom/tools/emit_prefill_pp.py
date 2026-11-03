@@ -2446,7 +2446,7 @@ def main():
         for name, flags, shape in twins:
             for k, v in flags.items():
                 setattr(A, k, v)
-            if A.KDEC or not A.QNORM:   # R2P has no in-kernel KV decode and needs the attention's own Q norm (not qrot's Q)
+            if A.KDEC:   # R2P has no in-kernel KV decode
                 A.R2P = False
             if shape:
                 A.configure(*shape)
