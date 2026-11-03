@@ -1,0 +1,473 @@
+Loom: address realization for loops without an exact header-tested recurrence (runtime bound, bottom-tested exit).
+Such loops get a realization domain with no induction and an estimated trip count for costs only (the alternating
+LDS bank still needs an exact induction) and may offer from any uniform body block; exact loops keep the latch rule.
+Global loads whose loop-varying terms are all uniform move them out of the vector address: the descriptor carries the
+uniform invariant terms plus the largest-stride varying term, the rest go to the packet's scalar offset, and the
+lane terms become one hoisted vector component. R2P attention: paged K/V staging loads become buffer loads with
+SALU-built descriptors; 8K 753.9 -> 742.6 Mcyc, 16K 2910.8 -> 2872.4; bit-identical results.
+diff --git a/loom/src/loom/codegen/low/lower/realization.c b/loom/src/loom/codegen/low/lower/realization.c
+--- a/loom/src/loom/codegen/low/lower/realization.c
++++ b/loom/src/loom/codegen/low/lower/realization.c
+@@ -123,7 +123,7 @@ static bool loom_low_lower_realization_loop_domain(
+   const loom_cfg_natural_loop_t* loop = &cfg->loops.loops[loop_index];
+   const loom_value_fact_induction_t* induction = &cfg->inductions[loop_index];
+   if (loop->entries.count != 1 || loop->backedges.count != 1 ||
+-      loop->exits.count != 1 || induction->value == LOOM_VALUE_ID_INVALID) {
++      loop->exits.count != 1) {
+     return false;
+   }
+   const loom_cfg_edge_info_t* entry =
+@@ -134,7 +134,6 @@ static bool loom_low_lower_realization_loop_domain(
+       &cfg->graph.edges[loop->exits.unique_index];
+   if (!loom_cfg_br_isa(entry->terminator) ||
+       !loom_cfg_br_isa(backedge->terminator) ||
+-      exit->source_block_index != loop->header_index ||
+       exit->selector_value_id == LOOM_VALUE_ID_INVALID ||
+       !loom_value_facts_is_subgroup_uniform(loom_value_fact_table_lookup(
+           context->lowering.fact_table, exit->selector_value_id)) ||
+@@ -144,6 +143,18 @@ static bool loom_low_lower_realization_loop_domain(
+           cfg->control, backedge->source_block_index))) {
+     return false;
+   }
++  *out_loop = (loom_low_lower_realization_loop_t){
++      .header = cfg->graph.blocks[loop->header_index].block,
++      .entry = entry->terminator,
++      .backedge = backedge->terminator,
++      .trip_count = LOOM_LOW_LOWER_REALIZATION_ESTIMATED_TRIP_COUNT,
++  };
++  // Runtime bounds and bottom-tested exits still give one uniform iteration
++  // domain. Only an exact header-tested recurrence publishes its induction.
++  if (induction->value == LOOM_VALUE_ID_INVALID ||
++      exit->source_block_index != loop->header_index) {
++    return true;
++  }
+   const loom_loop_recurrence_facts_t recurrence =
+       loom_value_fact_induction_facts(context->lowering.fact_table,
+                                       context->module, induction);
+@@ -162,18 +173,13 @@ static bool loom_low_lower_realization_loop_domain(
+                                        induction->step),
+           &step) ||
+       step <= 0) {
+-    return false;
++    return true;
+   }
+-  *out_loop = (loom_low_lower_realization_loop_t){
+-      .header = cfg->graph.blocks[loop->header_index].block,
+-      .entry = entry->terminator,
+-      .backedge = backedge->terminator,
+-      .induction = induction,
+-      .initial_value = initial_value,
+-      .step = step,
+-      .exit_value = exit_value,
+-      .trip_count = recurrence.trip_count,
+-  };
++  out_loop->induction = induction;
++  out_loop->initial_value = initial_value;
++  out_loop->step = step;
++  out_loop->exit_value = exit_value;
++  out_loop->trip_count = recurrence.trip_count;
+   return true;
+ }
+ 
+@@ -220,7 +226,11 @@ iree_status_t loom_low_lower_realization_offer(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+     const loom_low_lower_realization_loop_t* loop,
+     const loom_low_lower_realization_offer_t* offer) {
+-  if (source_op->parent_block != loop->backedge->parent_block) {
++  // Exact loops keep the latch-block domain their offers were measured with.
++  // A loop without an exact recurrence (runtime-bounded or bottom-tested) may
++  // offer from any uniform block of its body.
++  if (loop->induction != NULL &&
++      source_op->parent_block != loop->backedge->parent_block) {
+     return iree_ok_status();
+   }
+   loom_low_lower_realizations_t* state =
+diff --git a/loom/src/loom/codegen/low/lower/realization.h b/loom/src/loom/codegen/low/lower/realization.h
+--- a/loom/src/loom/codegen/low/lower/realization.h
++++ b/loom/src/loom/codegen/low/lower/realization.h
+@@ -41,10 +41,14 @@ typedef struct loom_low_lower_realization_input_t {
+   } value;
+ } loom_low_lower_realization_input_t;
+ 
++// Cost-model trip estimate for loops whose trip count is a runtime value.
++#define LOOM_LOW_LOWER_REALIZATION_ESTIMATED_TRIP_COUNT 16
++
+ // Retained uniform loop domain admitting complete, lane-valid edge payloads.
+ // Entry and backedge are dedicated unconditional edges; the sole exit is a
+-// uniform header test. This is a realization candidate domain, not a source
+-// program restriction. Other loops retain their ordinary direct lowering.
++// uniform test in the header or the body. This is a realization candidate
++// domain, not a source program restriction. Other loops retain their ordinary
++// direct lowering.
+ typedef struct loom_low_lower_realization_loop_t {
+   // Source header defining the supplemental carried values.
+   const loom_block_t* header;
+@@ -52,15 +56,17 @@ typedef struct loom_low_lower_realization_loop_t {
+   const loom_op_t* entry;
+   // Dedicated backedge, executed once per body iteration.
+   const loom_op_t* backedge;
+-  // Borrowed induction equation owned by the retained CFG facts.
++  // Borrowed induction equation owned by the retained CFG facts, or NULL when
++  // the loop has no exact header-tested recurrence.
+   const loom_value_fact_induction_t* induction;
+-  // Exact source-integer initial value.
++  // Exact source-integer initial value when induction is present.
+   int64_t initial_value;
+-  // Exact positive source-integer increment.
++  // Exact positive source-integer increment when induction is present.
+   int64_t step;
+-  // Exact source-integer exit value, including zero-trip loops.
++  // Exact source-integer exit value when induction is present.
+   int64_t exit_value;
+-  // Exact number of body executions.
++  // Exact number of body executions when induction is present, otherwise
++  // LOOM_LOW_LOWER_REALIZATION_ESTIMATED_TRIP_COUNT for cost estimates only.
+   uint64_t trip_count;
+ } loom_low_lower_realization_loop_t;
+ 
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/address_realization.c b/loom/src/loom/target/arch/amdgpu/lower/address_realization.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/address_realization.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/address_realization.c
+@@ -65,7 +65,8 @@ static bool loom_amdgpu_address_alternating_bank(
+   const uint16_t all_terms =
+       (uint16_t)((1u << source->dynamic_term_count) - 1u);
+   const uint16_t periodic_mask = all_terms & (uint16_t)~invariant_mask;
+-  if (periodic_mask == 0 || (periodic_mask & (periodic_mask - 1u)) != 0 ||
++  if (loop->induction == NULL || periodic_mask == 0 ||
++      (periodic_mask & (periodic_mask - 1u)) != 0 ||
+       loop->initial_value < 0 || !(loop->step & 1)) {
+     return false;
+   }
+@@ -219,8 +220,8 @@ static iree_status_t loom_amdgpu_request_address_component(
+ }
+ 
+ typedef struct loom_amdgpu_scalar_offset_t {
+-  // Canonical uniform source contribution, or NULL for a constant offset.
+-  const loom_low_source_memory_dynamic_term_t* term;
++  // Canonical uniform source contributions; empty for a constant offset.
++  loom_amdgpu_memory_dynamic_term_sequence_t terms;
+   // Constant bytes added to the dynamic contribution.
+   uint32_t static_byte_offset;
+ } loom_amdgpu_scalar_offset_t;
+@@ -231,38 +232,50 @@ static iree_status_t loom_amdgpu_initialize_scalar_offset(
+     loom_value_id_t* out_value) {
+   (void)carried_value;
+   const loom_amdgpu_scalar_offset_t* offset = data;
+-  const loom_amdgpu_memory_dynamic_term_sequence_t terms = {
+-      .terms = {offset->term},
+-      .kinds = {LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_SOFFSET},
+-      .count = offset->term ? 1 : 0,
+-  };
+   return loom_amdgpu_emit_sgpr_byte_offset_terms(
+-      context, source_op, &terms, offset->static_byte_offset, out_value);
++      context, source_op, &offset->terms, offset->static_byte_offset,
++      out_value);
+ }
+ 
++// Requests the uniform byte sum of the source terms selected by |term_mask|.
+ static iree_status_t loom_amdgpu_request_scalar_offset(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+-    const loom_low_source_memory_dynamic_term_t* term,
++    const loom_low_source_memory_access_plan_t* source, uint16_t term_mask,
+     uint32_t static_byte_offset,
+     const loom_low_lower_realization_t** out_realization) {
+-  const int64_t key[] = {term ? term->byte_stride : 0, static_byte_offset};
+-  const loom_low_lower_realization_input_t input = {
+-      .kind = LOOM_LOW_LOWER_REALIZATION_INPUT_SOURCE,
+-      .value.identity = term ? term->index : LOOM_VALUE_ID_INVALID,
+-  };
++  int64_t key[LOOM_LOW_SOURCE_MEMORY_DYNAMIC_TERM_CAPACITY + 1];
++  memset(key, 0, sizeof(key));
++  loom_low_lower_realization_input_t
++      inputs[LOOM_LOW_SOURCE_MEMORY_DYNAMIC_TERM_CAPACITY];
+   loom_amdgpu_scalar_offset_t* offset = NULL;
+   IREE_RETURN_IF_ERROR(loom_low_lower_allocate_plan_data(
+       context, sizeof(*offset), (void**)&offset));
+   *offset = (loom_amdgpu_scalar_offset_t){
+-      .term = term, .static_byte_offset = static_byte_offset};
++      .static_byte_offset = static_byte_offset};
++  for (uint8_t i = 0; source && i < source->dynamic_term_count; ++i) {
++    if (!(term_mask & (1u << i))) {
++      continue;
++    }
++    const loom_low_source_memory_dynamic_term_t* term =
++        &source->dynamic_terms[i];
++    inputs[offset->terms.count] = (loom_low_lower_realization_input_t){
++        .kind = LOOM_LOW_LOWER_REALIZATION_INPUT_SOURCE,
++        .value.identity = term->index,
++    };
++    key[offset->terms.count] = term->byte_stride;
++    offset->terms.terms[offset->terms.count] = term;
++    offset->terms.kinds[offset->terms.count++] =
++        LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_SOFFSET;
++  }
++  key[LOOM_LOW_SOURCE_MEMORY_DYNAMIC_TERM_CAPACITY] = static_byte_offset;
+   loom_type_t scalar_type = loom_type_none();
+   IREE_RETURN_IF_ERROR(loom_amdgpu_make_sgpr_type(context, &scalar_type));
+   const loom_low_lower_realization_recipe_t recipe = {
+       .type = scalar_type,
+       .id = LOOM_AMDGPU_ADDRESS_REALIZATION_SCALAR_OFFSET,
+       .key = iree_make_const_byte_span(key, sizeof(key)),
+-      .inputs = &input,
+-      .input_count = term ? 1 : 0,
++      .inputs = inputs,
++      .input_count = offset->terms.count,
+       .initialize = loom_amdgpu_initialize_scalar_offset,
+       .data = offset,
+   };
+@@ -336,7 +349,7 @@ static iree_status_t loom_amdgpu_initialize_descriptor_offset(
+ 
+ static iree_status_t loom_amdgpu_request_offset_descriptor(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+-    const loom_low_source_memory_access_plan_t* source, uint8_t varying_index,
++    const loom_low_source_memory_access_plan_t* source, uint16_t scalar_mask,
+     const loom_low_lower_realization_t** out_realization) {
+   loom_type_t descriptor_type = loom_type_none();
+   IREE_RETURN_IF_ERROR(
+@@ -362,11 +375,9 @@ static iree_status_t loom_amdgpu_request_offset_descriptor(
+   if (root == NULL) {
+     return iree_ok_status();
+   }
+-  const loom_low_source_memory_dynamic_term_t* term =
+-      &source->dynamic_terms[varying_index];
+   const loom_low_lower_realization_t* byte_offset = NULL;
+   IREE_RETURN_IF_ERROR(loom_amdgpu_request_scalar_offset(
+-      context, source_op, term, 0, &byte_offset));
++      context, source_op, source, scalar_mask, 0, &byte_offset));
+   if (byte_offset == NULL) {
+     return iree_ok_status();
+   }
+@@ -405,8 +416,10 @@ typedef struct loom_amdgpu_global_address_replacement_t {
+   uint32_t scalar_byte_offset;
+   // Canonical terms belonging to the invariant vector component.
+   uint16_t invariant_mask;
+-  // Sole uniform loop-varying source term.
+-  uint8_t varying_index;
++  // Uniform source terms summed into the descriptor byte offset.
++  uint16_t scalar_mask;
++  // Uniform source terms summed into this packet's scalar offset operand.
++  uint16_t soffset_mask;
+ } loom_amdgpu_global_address_replacement_t;
+ 
+ static iree_status_t loom_amdgpu_apply_global_address_realizations(
+@@ -429,12 +442,12 @@ static iree_status_t loom_amdgpu_apply_global_address_realizations(
+     return iree_ok_status();
+   }
+   IREE_RETURN_IF_ERROR(loom_amdgpu_request_offset_descriptor(
+-      context, source_op, source, replacement->varying_index,
++      context, source_op, source, replacement->scalar_mask,
+       &candidate.realization.descriptor));
+   if (candidate.realization.descriptor != NULL) {
+     IREE_RETURN_IF_ERROR(loom_amdgpu_request_scalar_offset(
+-        context, source_op, NULL, candidate.scalar_byte_offset,
+-        &candidate.realization.soffset));
++        context, source_op, source, replacement->soffset_mask,
++        candidate.scalar_byte_offset, &candidate.realization.soffset));
+     *replacement->access = candidate;
+   }
+   return iree_ok_status();
+@@ -479,48 +492,96 @@ static iree_status_t loom_amdgpu_prepare_global_address_realizations(
+       extent <= 0 || extent > UINT32_MAX) {
+     return iree_ok_status();
+   }
+-  const uint16_t invariant_mask =
++  uint16_t invariant_mask =
+       loom_low_lower_source_memory_invariant_terms(context);
+-  const uint16_t varying_mask =
+-      (uint16_t)((1u << source->dynamic_term_count) - 1u) &
+-      (uint16_t)~invariant_mask;
+-  uint64_t invariant_maximum = 0;
+-  if (invariant_mask == 0 || varying_mask == 0 ||
+-      (varying_mask & (varying_mask - 1u)) != 0 ||
+-      !loom_amdgpu_address_invariant_bound(source, invariant_mask,
+-                                           &invariant_maximum)) {
+-    return iree_ok_status();
+-  }
+-  // The setup estimate covers a single retained invariant term and its byte
+-  // conversion. Larger sums need a shared source realization, not an assumed
+-  // cheap reconstruction of arbitrary canonical expressions.
+-  if ((invariant_mask & (invariant_mask - 1u)) != 0 &&
+-      (access->retained_component_kind !=
+-           LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_VADDR ||
+-       source->retained_component.term_mask != invariant_mask)) {
+-    return iree_ok_status();
+-  }
++  const uint16_t all_terms =
++      (uint16_t)((1u << source->dynamic_term_count) - 1u);
++  const uint16_t varying_mask = all_terms & (uint16_t)~invariant_mask;
+   for (uint8_t i = 0; i < source->dynamic_term_count; ++i) {
+     if (access->dynamic_term_kinds[i] !=
+         LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_VADDR) {
+       return iree_ok_status();
+     }
+   }
+-  const uint8_t varying_index =
+-      (uint8_t)iree_math_count_trailing_zeros_u32(varying_mask);
+-  const loom_low_source_memory_dynamic_term_t* term =
+-      &source->dynamic_terms[varying_index];
+-  int64_t varying_maximum = 0;
+-  if (term->source != LOOM_LOW_SOURCE_MEMORY_DYNAMIC_INDEX_SOURCE_VALUE ||
+-      term->stride_value_count != 0 || term->byte_stride <= 0 ||
+-      term->byte_stride > UINT32_MAX ||
+-      !loom_value_facts_is_subgroup_uniform(
+-          loom_value_fact_table_lookup(facts, term->index)) ||
+-      !loom_value_facts_as_non_negative_i64_maximum(term->byte_facts,
+-                                                    &varying_maximum) ||
+-      varying_maximum > extent) {
++  // Uniform source terms can move from the vector address into the
++  // descriptor byte offset, where they are scalar arithmetic.
++  uint16_t uniform_mask = 0;
++  uint64_t uniform_maximum = 0;
++  for (uint8_t i = 0; i < source->dynamic_term_count; ++i) {
++    const loom_low_source_memory_dynamic_term_t* term =
++        &source->dynamic_terms[i];
++    int64_t term_maximum = 0;
++    if (term->source != LOOM_LOW_SOURCE_MEMORY_DYNAMIC_INDEX_SOURCE_VALUE ||
++        term->stride_value_count != 0 || term->byte_stride <= 0 ||
++        term->byte_stride > UINT32_MAX ||
++        !loom_value_facts_is_subgroup_uniform(
++            loom_value_fact_table_lookup(facts, term->index)) ||
++        !loom_value_facts_as_non_negative_i64_maximum(term->byte_facts,
++                                                      &term_maximum)) {
++      continue;
++    }
++    uniform_mask |= (uint16_t)(1u << i);
++    // Saturates far above any accepted extent.
++    uniform_maximum = iree_min(uniform_maximum + (uint64_t)term_maximum,
++                               (uint64_t)INT64_MAX);
++  }
++  if (varying_mask == 0 || (varying_mask & ~uniform_mask) != 0) {
+     return iree_ok_status();
+   }
++  uint16_t scalar_mask = varying_mask;
++  uint16_t soffset_mask = 0;
++  uint64_t invariant_maximum = 0;
++  uint64_t scalar_maximum = 0;
++  // The single-term setup estimate covers one retained invariant term and its
++  // byte conversion. Larger sums need a shared source realization, not an
++  // assumed cheap reconstruction of arbitrary canonical expressions.
++  const bool single_term =
++      invariant_mask != 0 && (varying_mask & (varying_mask - 1u)) == 0 &&
++      loom_amdgpu_address_invariant_bound(source, invariant_mask,
++                                          &invariant_maximum) &&
++      ((invariant_mask & (invariant_mask - 1u)) == 0 ||
++       (access->retained_component_kind ==
++            LOOM_AMDGPU_MEMORY_DYNAMIC_INDEX_VADDR &&
++        source->retained_component.term_mask == invariant_mask));
++  if (single_term) {
++    if (!loom_amdgpu_address_invariant_bound(source, scalar_mask,
++                                             &scalar_maximum)) {
++      return iree_ok_status();
++    }
++  } else {
++    // Otherwise the vector component keeps only the lane-varying invariant
++    // terms, built once outside the loop. The descriptor carries the uniform
++    // invariant terms and the loop-varying term with the largest stride (a
++    // page or block base, typically shared by neighboring packets); the other
++    // uniform terms become each packet's scalar offset operand, so neighbors
++    // share one descriptor update.
++    uint8_t base_index = 0;
++    for (uint8_t i = 0; i < source->dynamic_term_count; ++i) {
++      if ((varying_mask & (1u << i)) &&
++          (!(varying_mask & (1u << base_index)) ||
++           source->dynamic_terms[i].byte_stride >
++               source->dynamic_terms[base_index].byte_stride)) {
++        base_index = i;
++      }
++    }
++    scalar_mask = (uint16_t)((uniform_mask & invariant_mask) |
++                             (1u << base_index));
++    soffset_mask = uniform_mask & (uint16_t)~scalar_mask;
++    invariant_mask = all_terms & (uint16_t)~uniform_mask;
++    scalar_maximum = uniform_maximum;
++    if (invariant_mask == 0 ||
++        !loom_amdgpu_address_invariant_bound(source, invariant_mask,
++                                             &invariant_maximum)) {
++      return iree_ok_status();
++    }
++  }
++  uint64_t soffset_maximum = 0;
++  if (scalar_maximum > (uint64_t)extent ||
++      !loom_amdgpu_address_invariant_bound(source, soffset_mask,
++                                           &soffset_maximum)) {
++    return iree_ok_status();
++  }
++  const int64_t varying_maximum = (int64_t)scalar_maximum;
+   const uint16_t root_argument =
+       loom_low_lower_source_memory_root_argument_index(context, source);
+   if (root_argument == UINT16_MAX) {
+@@ -551,6 +612,9 @@ static iree_status_t loom_amdgpu_prepare_global_address_realizations(
+       !loom_amdgpu_memory_cache_policy_can_lower(descriptor_set, &candidate)) {
+     return iree_ok_status();
+   }
++  if (soffset_maximum + candidate.scalar_byte_offset > UINT32_MAX) {
++    return iree_ok_status();
++  }
+   loom_amdgpu_global_address_replacement_t* replacement = NULL;
+   IREE_RETURN_IF_ERROR(loom_low_lower_allocate_plan_data(
+       context, sizeof(*replacement), (void**)&replacement));
+@@ -560,23 +624,56 @@ static iree_status_t loom_amdgpu_prepare_global_address_realizations(
+       .immediate_offset = candidate.immediate_offset,
+       .scalar_byte_offset = candidate.scalar_byte_offset,
+       .invariant_mask = invariant_mask,
+-      .varying_index = varying_index,
++      .scalar_mask = scalar_mask,
++      .soffset_mask = soffset_mask,
+   };
+-  const uint64_t key[] = {source->view_value_id, term->index,
+-                          (uint64_t)term->byte_stride};
++  uint64_t key[1 + 2 * LOOM_LOW_SOURCE_MEMORY_DYNAMIC_TERM_CAPACITY];
++  memset(key, 0, sizeof(key));
++  key[0] = source->view_value_id;
++  uint8_t scalar_count = 0;
++  uint64_t removed_key = access->scalar_byte_offset;
++  for (uint8_t i = 0; i < source->dynamic_term_count; ++i) {
++    if (scalar_mask & (1u << i)) {
++      key[1 + 2 * scalar_count] = source->dynamic_terms[i].index;
++      key[2 + 2 * scalar_count] =
++          (uint64_t)source->dynamic_terms[i].byte_stride;
++      ++scalar_count;
++    }
++    if (!single_term) {
++      removed_key = removed_key * 1099511628211ull ^
++                    ((uint64_t)source->dynamic_terms[i].index << 32 |
++                     (uint32_t)source->dynamic_terms[i].byte_stride);
++    }
++  }
++  const iree_host_size_t key_length =
++      single_term ? 3 * sizeof(uint64_t)
++                  : (1 + 2 * scalar_count) * sizeof(uint64_t);
+   // Each distinct biased SADDR costs a full-width add/carry pair. The shared
+   // SRD costs an add/carry pair, extent subtraction and uniform byte scaling
+   // per iteration. Root setup and each packet's invariant conversion/constant
+-  // are charged separately; vector arithmetic savings receive no credit.
++  // are charged separately; a single-term packet gets no vector arithmetic
++  // credit. A uniform split counts in half-issue units (scalar 1, vector 2):
++  // it removes each distinct packet's broadcast, shift-add and byte scaling
++  // from the vector address, while the uniform term sum is scalar in both
++  // forms. Scalar issue runs beside the co-resident waves' vector work.
+   // These are issue-cost estimates, not guarantees about final allocation.
++  const uint32_t soffset_terms =
++      (uint32_t)iree_math_count_ones_u32(soffset_mask);
++  const uint32_t split_credit = soffset_terms < 3 ? 6 - 2 * soffset_terms : 0;
++  const uint32_t vector_terms =
++      (uint32_t)iree_math_count_ones_u32(invariant_mask);
++  const uint32_t packet_setup_cost =
++      2 + (candidate.scalar_byte_offset != 0) +
++      (single_term ? 0 : 2 * (vector_terms - 1));
+   const loom_low_lower_realization_offer_t offer = {
+       .id = LOOM_AMDGPU_ADDRESS_REALIZATION_DESCRIPTOR_OFFSET,
+-      .key = iree_make_const_byte_span(key, sizeof(key)),
++      .key = iree_make_const_byte_span(key, key_length),
+       .group_setup_cost = 6,
+       .group_iteration_cost = 4,
+-      .removed_key = access->scalar_byte_offset,
+-      .removed_iteration_cost = access->scalar_byte_offset ? 2 : 0,
+-      .setup_cost = 2 + (candidate.scalar_byte_offset != 0),
++      .removed_key = removed_key,
++      .removed_iteration_cost = (access->scalar_byte_offset ? 2 : 0) +
++                                (single_term ? 0 : split_credit),
++      .setup_cost = single_term ? packet_setup_cost : 2 * packet_setup_cost,
+       .apply = loom_amdgpu_apply_global_address_realizations,
+       .data = replacement,
+   };
