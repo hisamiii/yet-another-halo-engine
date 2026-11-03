@@ -4,7 +4,8 @@ attn_bench process under HRX counters, print busiest-SQ and mean-SQ cycles per c
 
   attn_bench.py [--reps N] [--depths 0,8192,...] [--tag DIR] <name>=<source.loom>[,ENV=VAL...] ...
 
-A depth is the chunk's start_pos (the chunk is token_count 2048 queries; cache_capacity = depth + 2048). The buffer sizes
+A depth is the chunk's start_pos (the chunk is token_count 2048 queries; cache_capacity = depth + 2048, or --cap T for
+every depth, as the engine's chunk HALs: cache_capacity = the whole context, which moves the allocation). The buffer sizes
 come from the kernel's own size formulas, checked line by line in the source: a source with other formulas is refused.
 Example: attn_bench.py --depths 0,8192,32768 clean=oset/l53f/.emit_tmp/yah_attn_hip.loom pers=oset/x8pr/.emit_tmp/yah_attn_hip.loom
 """
@@ -75,8 +76,8 @@ def layout(text, path):
     return name
 
 
-def buffers(lay, depth):
-    npages = (depth + B + 255) // 256
+def buffers(lay, cap):
+    npages = (cap + 255) // 256
     pcap = npages * 256
     vpitch = (pcap + 15) // 16 * 16
     q = f"s:{B * 6144 * 4}:1" if lay == "f32q" else f"h:{B * 6144 * 2}:1"
@@ -95,8 +96,7 @@ def grid(text):
     return (B + qt - 1) // qt, HEADS // hpw
 
 
-def compile_hal(src, text, env, depth, outdir):
-    cap = depth + B
+def compile_hal(src, text, env, depth, outdir, cap):
     configs = [f"cache_capacity={cap}", f"token_count={B}", f"start_pos={depth}", f"num_heads={HEADS}",
                f"num_kv_heads={KV_HEADS}", f"head_dim={HD}", f"gqa={HEADS // KV_HEADS}"]
     key = hashlib.sha1((text + json.dumps(sorted(env.items())) + ",".join(configs)).encode()).hexdigest()[:16]
@@ -115,6 +115,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reps", type=int, default=10)
     ap.add_argument("--depths", default="0,8192")
+    ap.add_argument("--cap", type=int, default=0, help="cache_capacity for every depth (default depth + 2048)")
     ap.add_argument("--tag", default=os.path.expanduser("~/yah-scratch/attn_bench"))
     ap.add_argument("--inputs", help="real Q / K / V: <prefix>.q, .kpool, .vpool (loom_prefill YAH_ATTN_DUMP), one depth")
     ap.add_argument("--counters", default="", help="more HRX counters (e.g. SQ_INSTS_VALU,SQ_WAVES): per-call totals")
@@ -139,7 +140,10 @@ def main():
     if len({v[4] for v in variants}) > 1:
         sys.exit("variants of one run must share a buffer layout (f32 Q or f16 Q)")
     for depth in depths:
-        bufs = buffers(variants[0][4], depth)
+        cap = a.cap or depth + B
+        if depth + B > cap:
+            sys.exit(f"depth {depth} + {B} queries past --cap {cap}")
+        bufs = buffers(variants[0][4], cap)
         if any(", %pqueue: buffer)" in v[2] for v in variants):
             bufs.append("z:1056")
         if a.inputs:
@@ -155,7 +159,7 @@ def main():
             if "HAL" in env:   # a prebuilt code object for this one depth (e.g. a regperm rewrite of the compiled one)
                 hals.append(f"{env['HAL']}@{gx},{gy}")
                 continue
-            hals.append(f"{compile_hal(src, text, env, depth, a.tag)}@{gx},{gy}")
+            hals.append(f"{compile_hal(src, text, env, depth, a.tag, cap)}@{gx},{gy}")
         prof = os.path.join(a.tag, "run.irpf")
         if os.path.exists(prof):
             os.remove(prof)
