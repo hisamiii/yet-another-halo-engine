@@ -173,6 +173,10 @@ R2P_PVB = os.environ.get("R2P_PVB", "1") == "1"   # R2P, P.V: P^T / alpha loads 
                     # byte address + the slot's uniform byte offset (1 v_add per base; a row index costs 3 per load)
 R2P_PEEL = os.environ.get("R2P_PEEL", "1") == "1"   # R2P: tile 0 peeled off the loop without the P.V of tile -1
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
+# R2P_DIAG (diagnostics only, wrong results, never deployed): comma list of LDS ablations: nox (no S partial exchange,
+# s = own + other head's partial), halfk / halfv (odd K / V^T fragments reuse the even one's registers); nobar (no
+# barriers in the R2P tile loop: races, no waits); nosoft (p = s, no subtract / scale / exp)
+R2P_DIAG = set(filter(None, os.environ.get("R2P_DIAG", "").split(",")))
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 PAIR_MAP = "mod"    # "mod": pair = waves (p, p + 4), one A and one B per SIMD; "adj": (2p, 2p + 1)
 PAIR_LATE = True    # PAIR: K / V staging loads in phase 2 (fewer VGPRs, but their latency is exposed: off when deployed)
@@ -1900,9 +1904,13 @@ def gen():
         e("    %alpha = scalar.exp2f<afn> %pdl : f32")
         e(f"    %nnml8 = vector.splat %nnml : {V8}")
         e(f"    %nmax8 = vector.splat %nmax : {V8}")
-        e(f"    %pd8 = vector.subf {s}, %nmax8 : {V8}")
-        e(f"    %pl = vector.mulf %pd8, {'%r2l2e8' if R2P else '%log2e8'} : {V8}")
-        e(f"    %p = vector.exp2f<afn> %pl : {V8}")
+        if "nosoft" in R2P_DIAG:   # p = s: no subtract / scale / exp (two free bitcasts)
+            e(f"    %pdi = vector.bitcast {s} : {V8} to vector<8xi32>")
+            e(f"    %p = vector.bitcast %pdi : vector<8xi32> to {V8}")
+        else:
+            e(f"    %pd8 = vector.subf {s}, %nmax8 : {V8}")
+            e(f"    %pl = vector.mulf %pd8, {'%r2l2e8' if R2P else '%log2e8'} : {V8}")
+            e(f"    %p = vector.exp2f<afn> %pl : {V8}")
         # keys 8h..8h+3 and 8h+4..8h+7: HIP's 4-lane segments
         for g in range(2):
             cur = "%zero"
@@ -2078,11 +2086,13 @@ def gen():
         for f in range(8):
             e(f"{ind}%{pp}vr{f}c = index.constant {16 * f} : index")
             e(f"{ind}%{pp}vr{f} = index.add %hd128, %{pp}vr{f}c : index")
-            e(f"{ind}%{pp}vf{f} = vector.fragment.load<lhs> %v_view[%{pp}vr{f}, %c0] shape [%m, %k] : view<256x{VT_PITCH}xf16> -> {V16H}")
+            vc = f - 1 if "halfv" in R2P_DIAG and f % 2 else f
+            if vc == f:
+                e(f"{ind}%{pp}vf{f} = vector.fragment.load<lhs> %v_view[%{pp}vr{f}, %c0] shape [%m, %k] : view<256x{VT_PITCH}xf16> -> {V16H}")
             for t in range(2):
                 o = 8 * t + f
                 e(f"{ind}%{pp}oi{o} = vector.fragment<init> {sc[o]} shape [%m, %n] : {V8}")
-                e(f"{ind}%{pp}nx{o} = vector.mma %{pp}vf{f}, {pbs[t]}, %{pp}oi{o} : {V16H}, {V16H}, {V8}")
+                e(f"{ind}%{pp}nx{o} = vector.mma %{pp}vf{vc}, {pbs[t]}, %{pp}oi{o} : {V16H}, {V16H}, {V8}")
                 e(f"{ind}%{pp}nxi{o} = vector.bitcast %{pp}nx{o} : {V8} to {BK}")
                 outs[o] = f"%{pp}nxi{o}"
             if f < 7 and (f + 1) % R2P_PVF == 0:
@@ -2100,9 +2110,11 @@ def gen():
         for c in range(8):
             e(f"{ind}%kfc{c}c = index.constant {16 * c} : index")
             e(f"{ind}%kfc{c} = index.add %hd128, %kfc{c}c : index")
-            e(f"{ind}%kf{c} = vector.fragment.load<lhs> %k_view[%c0, %kfc{c}] shape [%m, %k] : view<{KT}x{KT_PITCH}xf16> -> {V16H}")
+            kc = c - 1 if "halfk" in R2P_DIAG and c % 2 else c
+            if kc == c:
+                e(f"{ind}%kf{c} = vector.fragment.load<lhs> %k_view[%c0, %kfc{c}] shape [%m, %k] : view<{KT}x{KT_PITCH}xf16> -> {V16H}")
             for t in range(2):
-                e(f"{ind}%sa{t}_{c} = vector.mma %kf{c}, %qf{8 * t + c}, {acc[t]} : {V16H}, {V16H}, {V8}")
+                e(f"{ind}%sa{t}_{c} = vector.mma %kf{kc}, %qf{8 * t + c}, {acc[t]} : {V16H}, {V16H}, {V8}")
                 acc[t] = f"%sa{t}_{c}"
             if c < 7 and (c + 1) % R2P_QKF == 0:
                 e(f"{ind}scf.schedule.fence")
@@ -2128,17 +2140,24 @@ def gen():
         J = I + "  "
         e(f"{I}{', '.join(nb)}, %qmax, %qsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
         own, oth = r2p_qk(rnames, J)
-        e(f"{J}%xst0 = vector.slice {oth}[0] : {V8} -> {V4}")
-        e(f"{J}%xst1 = vector.slice {oth}[4] : {V8} -> {V4}")
-        e(f"{J}vector.store %xst0, %xs_view[%xso_r0, %c0] : {V4}, view<256x4xf32>")
-        e(f"{J}vector.store %xst1, %xs_view[%xso_r1, %c0] : {V4}, view<256x4xf32>")
-        e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        e(f"{J}%spa = vector.load %xs_view[%xsm_r0, %c0] : view<256x4xf32> -> {V4}")
-        e(f"{J}%spb = vector.load %xs_view[%xsm_r1, %c0] : view<256x4xf32> -> {V4}")
-        e(f"{J}%spart = vector.concat<0> %spa, %spb : {V4}, {V4} -> {V8}")
-        e(f"{J}%s0 = vector.addf {own}, %spart : {V8}")
+        if "nox" in R2P_DIAG:
+            if "nobar" not in R2P_DIAG:
+                e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            e(f"{J}%s0 = vector.addf {own}, {oth} : {V8}")
+        else:
+            e(f"{J}%xst0 = vector.slice {oth}[0] : {V8} -> {V4}")
+            e(f"{J}%xst1 = vector.slice {oth}[4] : {V8} -> {V4}")
+            e(f"{J}vector.store %xst0, %xs_view[%xso_r0, %c0] : {V4}, view<256x4xf32>")
+            e(f"{J}vector.store %xst1, %xs_view[%xso_r1, %c0] : {V4}, view<256x4xf32>")
+            if "nobar" not in R2P_DIAG:
+                e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            e(f"{J}%spa = vector.load %xs_view[%xsm_r0, %c0] : view<256x4xf32> -> {V4}")
+            e(f"{J}%spb = vector.load %xs_view[%xsm_r1, %c0] : view<256x4xf32> -> {V4}")
+            e(f"{J}%spart = vector.concat<0> %spa, %spb : {V4}, {V4} -> {V8}")
+            e(f"{J}%s0 = vector.addf {own}, %spart : {V8}")
         emit_softmax_pv(None, True, pair_slot=("%slot_rows", "%slot_al"))
-        e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if "nobar" not in R2P_DIAG:
+            e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e(f"{J}scf.yield {', '.join(rnames)}, %nmax, %nsum : {rtypes}, f32, f32")
         e(f"{I}}} else {{")
         e(f"{J}%vks1 = index.max %ks_, %c16 : index")
@@ -2146,10 +2165,12 @@ def gen():
         nv = load_v("%vks", "nv", J)
         nk = load_k("%ks16", "nk", J)
         stage_v(nv, "%c0", "stv", J)
-        e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if "nobar" not in R2P_DIAG:
+            e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         stage_k("%ks16", nk, "st", J)
         outs = rnames if first else r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J)   # R2P_PEEL: no P.V(-1)
-        e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if "nobar" not in R2P_DIAG:
+            e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e(f"{J}scf.yield {', '.join(outs)}, %rmax, %rsum : {rtypes}, f32, f32")
         e(f"{I}}}")
         return nb
