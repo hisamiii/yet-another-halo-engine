@@ -26,7 +26,6 @@ import gen_gemv  # noqa: E402
 import gen_rot  # noqa: E402
 import gen_gemm_iu4  # noqa: E402
 import gen_kvq  # noqa: E402
-import gen_fpsparse  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
 import npu_prof  # noqa: E402
 
@@ -655,23 +654,6 @@ def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
     return r
 
 
-OCC3_FROM = 86016   # first context position whose chunk's attention runs 3 workgroups per WGP (see emit: write_attn)
-OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (128 KB / 4 < 33 KB)
-
-
-# From KT2_FROM keys of context on (fp16 attention), a chunk runs the 32-key-tile role-split kernel (gen_attn_fa KT2):
-# 3 workgroups per WGP, one barrier pair / reduction / rescale vote per 32 keys; -0.8% at 16K, -1.8% at 32K, -3..-5.6% at
-# 88K..126K vs the 4-workgroup kernel / the deep twin (standalone); not bit-identical (the running max moves per 32 keys).
-KT2_FROM = int(os.environ.get("YAH_KT2_FROM", "16384"))
-# Block-sparse prefill attention (gen_fpsparse, FlashPrefill V2) from YAH_FPS_FROM tokens of context on (0: off), kv4 paged
-# sets with the KT2 twin only (its chunks take the sparse KT2 twin whatever KT2_FROM is). 32K, alpha 0.1: from 4096 vs
-# 16384 -2.5% cycles at the same quality (KL / needles / answer tile within the redraw band).
-# YAH_FPS_ALPHA: the block threshold (fraction of the query block's top block score).
-# The f16 pools grow by the pooled-row pages (every attention HAL and vdeq use the extended capacity).
-# dispatch.txt "fpsparse <first chunk> <extension pages> <list stride>"
-FPS_FROM = int(os.environ.get("YAH_FPS_FROM", "0"))
-FPS_ALPHA = float(os.environ.get("YAH_FPS_ALPHA", str(gen_fpsparse.ALPHA)))
-FPS_ORD = os.environ.get("YAH_FPS_ORD", "1") != "0"   # yah_fpord launch order (longest tile list first); 0: by query block
 QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
 # QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
 QG16 = True
@@ -746,35 +728,6 @@ NQW_ON = False   # set by main
 # DeltaNet layer's tail and the next layer's input GEMMs need no graph barrier. Same values. dispatch.txt "dnring"
 DNRING = True
 DNRING_ON = False   # set by main
-# QNSTREAM + QNMIX: the QNORM prologue one fragment at a time (its 255-VGPR peak had pushed both role-split twins past 240,
-# so KT2 fell back and the deep twin ran 2 workgroups per WGP; 96K deep attention -13%); MAXNN + SUM0 (KT2 -1.35%)
-QN_FLAGS = dict(QNSTREAM=True, QNMIX=True, MAXNN=True, SUM0=True)
-KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1, **QN_FLAGS)
-KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
-# The KT2 twin's workgroup: 6 heads x 16 tokens (a whole GQA group, 12 waves, 2 workgroups per WGP) stages each K / V tile
-# once per 96 query rows instead of 64; the LDS that frees holds a second P^T / alpha slot, so B loads the previous
-# tile's P^T at its arm start instead of carrying it (KT2_P2: -16 loop-live VGPRs). Bit-identical, attention -3.1..-3.6%
-# at 16K..96K. Its chunks launch from their own dispatch.txt rows (wmma[_t]_c<i>.hal); not under YAH_EMIT_HALF.
-# KT2_RSALL (O x alpha every tile: the skip branch's join cost 128 v_movs), KT2_MIRROR (odd workgroups mirror the roles
-# over the SIMDs) and KADDR_SR (K load address = uniform page part + loop-invariant lane part): bit-identical, -1.5..-2%.
-KT2_SHAPE = (6, 16)
-KT2_SHAPE_FLAGS = dict(KT2_P2=True, MAPS_EARLY=True, KT2_RSALL=True, KT2_MIRROR=True, KADDR_SR=True)
-
-
-def deep(path):
-    return path.replace(".loom", "_deep.loom")
-
-
-def kt2(path):
-    return path.replace(".loom", "_kt2.loom")
-
-
-def alt(path):
-    return path.replace(".loom", "_alt.loom")
-
-
-def fps(path):
-    return path.replace(".loom", "_kt2fps.loom")
 
 
 ATTN_VGPR = 192   # every attention variant fits here unless the allocator rotates the O accumulators
@@ -2388,89 +2341,43 @@ def main():
     kv_flags = (A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8)
     if kv8deq:   # the main sources are the fp16 paged kernel
         A.K8 = A.KDEC = A.VQ8 = False
-    # From OCC3_FROM keys of context on, a chunk's attention runs 3 workgroups per WGP (an LDS floor of 33 KB) instead of
-    # 4: past ~84K the 4-workgroup kernel falls off a cache cliff (73% -> 60% of the WMMA floor at 126K; 3 workgroups
-    # hold ~70% at every depth, but lose ~5% up to 80K). Each attention source has a "_deep" twin for those chunks.
-    # Each source also gets a "_alt" twin without DIAG_SWAP: Loom's allocator can land a variant in its O-accumulator
-    # back-edge rotation (the 8 O tuples one placement off the P.V results: ~128 loop moves, 200+ VGPRs); the emit
-    # loop re-emits such a HAL from the twin (attn_guard).
-    # The deep twin is also the role-split kernel (gen_attn_fa PAIR: one wave of each pair runs QK + the softmax once,
-    # the other P.V; bit-identical): at 3 workgroups per WGP it needs no more than the 256 VGPRs that allows.
-    DEEP_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=2, PVF=4, **QN_FLAGS)
     # the 4-workgroup kernel's bit-identical VALU cuts (gen_attn_fa MAXNN, SUM0, EPI_FAST; CTX16: start_pos = c * B):
-    # pp2048 attention -6.4% cycles; the deep / KT2 twins keep their tuned code
+    # pp2048 attention -6.4% cycles
     # QB_ZIGZAG: the short causal blocks are mostly Q / gate / O traffic; launched last (longest first) they ran as a
     # DRAM-bound tail. Interleaved with the long ones: pp2048 attention -5.5% cycles, bit-identical, neutral at depth
     # PV_FENCE: -16 v_mov per tile, pp2048 attention -2.3% cycles (-3% in the pipeline), bit-identical
     # R2P: the reuse-2 role split (half the LDS fragment reads, no duplicated softmax), bit-identical: pp2048 attention
     # -7.3% cycles (62.8 -> 67.6% of floor), 8K -9.6% (71.6 -> 79.3%). YAH_ATTN_R2P=0: the head_dim split
-    # YAH_ATTN_PERSIST=<slots> (gen_attn_fa PERSIST): the main twin (and its alt) as a persistent kernel of that many
-    # workgroups running a snake schedule of whole units, bit-identical; dispatch.txt "persist_<hal> <slots> 1 0" rows.
-    # Not the OCNT twin (wmmaf.hal: its counters feed a concurrent consumer) nor half sets.
-    # YAH_ATTN_ONE=1: one attention kernel at every depth, the queued persistent kernel (= YAH_ATTN_PERSIST=80
-    # YAH_ATTN_PDYN=1) for every chunk, no 3-workgroup (deep / KT2) twins
-    one = not EMIT_HALF and os.environ.get("YAH_ATTN_ONE") == "1"
-    if one and FPS_FROM:
-        raise SystemExit("YAH_ATTN_ONE: the block-sparse attention needs the KT2 twin")
-    persist = 0 if EMIT_HALF else 80 if one else int(os.environ.get("YAH_ATTN_PERSIST", "0"))
+    # One attention kernel at every depth: the persistent kernel (gen_attn_fa PERSIST, YAH_ATTN_PERSIST=<slots>, 80; 0:
+    # the grid kernel), workgroups running whole units, bit-identical; dispatch.txt "persist_<hal> <slots> 1 <dyn>" rows.
+    # Busiest SQ % of floor 11-03: 82.7 / 85.4 / 85.8 / 85.8 at 16K / 32K / 96K / 124K, where the 3-workgroup twins it
+    # replaced (KT2, PAIR "deep") ran 75-77 / 73. Not the OCNT kernel (wmmaf.hal: its counters feed a concurrent
+    # consumer) nor half sets (the grid kernel: 85.0% to 96K, 73.2% at 124K).
+    persist = 0 if EMIT_HALF else int(os.environ.get("YAH_ATTN_PERSIST", "80"))
     MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=not persist, PERSIST=persist, PV_FENCE=True,
                       R2P=os.environ.get("YAH_ATTN_R2P", "1") != "0", PRO_FAST=os.environ.get("YAH_ATTN_PROF", "1") != "0")
-    # the role-split twins too: EPI_FAST + CTX16 halve their epilogue VALU (B waves normalize all 256 dims alone);
-    # bit-identical, KT2 -1.6% at 16K, -0.5% at 32K, -0.8% at 96K
-    TWIN_EPI = dict(EPI_FAST=True, CTX16=B % 16 == 0)
     # YAH_ATTN_PREV=1 (with PERSIST): half the slots run their snake rounds in reverse (gen_attn_fa PERSIST_REV):
     # 8K busiest SQ 78.9 -> 81.1% of floor (clean grid 81.3%), bit-identical
     if persist and os.environ.get("YAH_ATTN_PREV") == "1":
         MAIN_FLAGS.update(QB_ZIGZAG=False, PERSIST_REV=True)
-    # YAH_ATTN_PDYN=1 (with PERSIST): the slots take their units from an atomic queue (gen_attn_fa PERSIST_DYN), bit-identical;
+    # YAH_ATTN_PDYN (default 1, with PERSIST): the slots take their units from an atomic queue (gen_attn_fa PERSIST_DYN), bit-identical;
     # standalone wall vs the grid kernel: tie to 8K, -2% at 16K, -5% at 64K, -11% at 126K. dispatch.txt "persist_<hal>
     # <slots> 1 1": the driver binds a zeroed queue after the others
-    pdyn = bool(persist) and (one or os.environ.get("YAH_ATTN_PDYN") == "1")
+    pdyn = bool(persist) and os.environ.get("YAH_ATTN_PDYN", "1") == "1"
     if pdyn:
         MAIN_FLAGS.update(QB_ZIGZAG=False, PERSIST_DYN=True)
 
-    kt2_cfg = (a_hpw, a_qt) if EMIT_HALF else KT2_SHAPE
-    kt2_shape = kt2_cfg if kt2_cfg != (a_hpw, a_qt) else None   # a shape of its own: its chunks get dispatch.txt rows
-    fps_on = bool(FPS_FROM) and kvdeq and deq_bits == 4 and kt2_cfg == KT2_SHAPE == (6, 16) and not EMIT_HALF
-    if FPS_FROM and not fps_on:
-        raise SystemExit("YAH_FPS_FROM needs a kv4 paged set with the 6x16 KT2 twin")
-    if fps_on and (B % gen_fpsparse.BLK or T % 256 or FPS_FROM % B or FPS_FROM < B):
-        raise SystemExit("YAH_FPS_FROM: chunk a multiple of 128, context of 256, FPS_FROM a chunk start past chunk 0")
-    fps_ls = gen_fpsparse.list_stride(T, B)
-    fps_ext = gen_fpsparse.ext_pages(T)
-    cap_attn = T + 256 * fps_ext if fps_on else T    # the f16 pools' capacity (pooled-row pages appended)
-    fps_paths = set()                                # sources that get the sparse twin (set below: the kvdeq Q sources)
 
     def write_attn(path):
         A = gen_attn_fa
-        keys = tuple(dict.fromkeys(("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS) + tuple(MAIN_FLAGS)
-                                   + tuple(KT2_SHAPE_FLAGS) + ("FPSPARSE", "FPS_LS", "FPS_TPAD", "FPS_ORD", "FPS_NG", "K4", "KDEC", "VQ4", "QROT")))
-        saved = {k: getattr(A, k) for k in keys}
-        twins = [(path, MAIN_FLAGS, None), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI), None)]
-        if not A.KDEC:   # the KT2 twin (fp16 sources only)
-            twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI,
-                                          **(KT2_SHAPE_FLAGS if kt2_cfg == KT2_SHAPE else {})), kt2_shape))
-            if fps_on and path in fps_paths:   # the block-sparse KT2 twin (the kvdeq sources), on the kv4 pools directly
-                twins.append((fps(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS, **TWIN_EPI, **KT2_SHAPE_FLAGS, FPSPARSE=True,
-                                              FPS_LS=fps_ls, FPS_TPAD=T, FPS_ORD=FPS_ORD, FPS_NG=B // 16 * 4, K4=True, KDEC=True, VQ4=True, QROT=True),
-                              kt2_shape))
-        for name, flags, shape in twins:
-            for k, v in flags.items():
-                setattr(A, k, v)
-            if A.KDEC:   # R2P has no in-kernel KV decode
-                A.R2P = False
-            if shape:
-                A.configure(*shape)
-            open(name, "w").write(A.gen())
-            A.DIAG_SWAP = False
-            # R2P has no form without DIAG_SWAP's uniform mask test (its per-lane vote does not lower): its fallback is
-            # the head_dim split kernel R2P replaced (192 VGPRs; R2P_LAZY's rounding is R2P's own, so gate N, not exact)
+        saved = {k: getattr(A, k) for k in MAIN_FLAGS}
+        for k, v in MAIN_FLAGS.items():
+            setattr(A, k, v)
+        if A.KDEC:   # R2P has no in-kernel KV decode
             A.R2P = False
-            open(alt(name), "w").write(A.gen())
-            for k in keys:
-                setattr(A, k, saved[k])
-            if shape:
-                A.configure(a_hpw, a_qt)
+        open(path, "w").write(A.gen())
+        for k, v in saved.items():
+            setattr(A, k, v)
     gen_attn_fa.QNORM = QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False   # (see RoPE below)
     gen_attn_fa.QG16 = QG16_ON
     if QG16_ON:
@@ -2479,14 +2386,12 @@ def main():
     write_attn(attn_src)
     attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")
     aov_need = 0
-    if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0 and not EMIT_HALF:   # the main twin with OCNT (and its alt)
+    if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0 and not EMIT_HALF:   # the main kernel with OCNT
         A = gen_attn_fa
-        saved = {k: getattr(A, k) for k in ("DIAG_SWAP", "OCNT") + tuple(MAIN_FLAGS)}
+        saved = {k: getattr(A, k) for k in ("OCNT",) + tuple(MAIN_FLAGS)}
         for k, v in dict(MAIN_FLAGS, OCNT=True, PERSIST=0, QB_ZIGZAG=True).items():
             setattr(A, k, v)
         open(attn_f_src, "w").write(A.gen())
-        A.DIAG_SWAP = False
-        open(alt(attn_f_src), "w").write(A.gen())
         aov_need = A.ocnt_need()
         for k, v in saved.items():
             setattr(A, k, v)
@@ -2520,7 +2425,6 @@ def main():
         if kvdeq:   # the fp16 paged kernel (the f16 pools have the int4 pools' page layout)
             A.K4 = A.K8 = A.KDEC = A.VQ4 = A.VQ8 = False
             A.Q16 = True
-            fps_paths.update((attn_qr_src, attn_qr_t_src))
         else:
             # VSWZ_T off: with direct Q the swizzled V staging tips Loom into rotating the O accumulators at the back edge
             A.Q16 = A.QROT = True
@@ -2537,29 +2441,6 @@ def main():
         open(kdeq_src, "w").write(gen_attn_fa.gen_kdeq(deq_bits))
         open(vdeq_src, "w").write(gen_attn_fa.gen_vdeq(deq_bits))
         geom.append(("kvdeq", 0, 0, 0))
-    fpmean_src = os.path.join(tmp, "yah_fpmean.loom")
-    fpcopyk_src = os.path.join(tmp, "yah_fpcopyk.loom")
-    fpcopyv_src = os.path.join(tmp, "yah_fpcopyv.loom")
-    fpsel_src = os.path.join(tmp, "yah_fpsel.loom")
-    fpord_src = os.path.join(tmp, "yah_fpord.loom")
-    kdeqf_src = os.path.join(tmp, "yah_kdeq4_first.loom")
-    vdeqf_src = os.path.join(tmp, "yah_vdeq4_first.loom")
-    if fps_on:
-        # the sparse twin reads the kv4 pools (the staging decode, as the dense kv4 kernel did): sparse tiles lose the
-        # cross-workgroup L2 reuse of the f16 pools, so the 4x smaller reads win (128K last chunk attention -23%, its
-        # kdeq / vdeq only decode the two chunks yah_fpmean reads). yah_fpcopyk / v write the pooled rows as int4 rows
-        # and V^T tiles of the kv4 pools' extension; dispatch.txt "fpskv4"
-        open(fpmean_src, "w").write(gen_fpsparse.gen_fpmean())
-        open(fpcopyk_src, "w").write(gen_fpsparse.gen_fpcopyk())
-        open(fpcopyv_src, "w").write(gen_fpsparse.gen_fpcopyv())
-        open(fpsel_src, "w").write(gen_fpsparse.gen_fpsel(T, B, FPS_ALPHA))
-        open(kdeqf_src, "w").write(gen_attn_fa.gen_kdeq(4, first=True))
-        open(vdeqf_src, "w").write(gen_attn_fa.gen_vdeq(4, first=True))
-        geom.append(("fpsparse", FPS_FROM // B, fps_ext, fps_ls))
-        geom.append(("fpskv4", 0, 0, 0))
-        if FPS_ORD:   # the attention launches the tile lists longest first (yah_fpord after yah_fpsel; "fpord")
-            open(fpord_src, "w").write(gen_fpsparse.gen_fpord(T, B))
-            geom.append(("fpord", 0, 0, 0))
     geom.append(("wmma.hal", a_qt, a_hpw, (B + a_qt - 1) // a_qt))
     # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md).
     # K: int8 (yah_kq8) or H256 + asymmetric int4 (yah_kq4) after yah_kmean centres it; the attention decodes it to f16.
@@ -2876,14 +2757,6 @@ def main():
             src = os.path.join(tmp, f"yah_ssm_postnorm{t_}_{tag}.loom")
             open(src, "w").write(txt)
             pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
-    def occ(path, c, use_kt2=True):   # the 3-workgroup twins: KT2 from KT2_FROM keys of context on, else PAIR from OCC3_FROM
-        if one:
-            return path
-        if use_kt2 and fps_on and c * B >= FPS_FROM and os.path.exists(fps(path)):
-            return fps(path)
-        if use_kt2 and c * B >= KT2_FROM and (c or not kt2_shape) and os.path.exists(kt2(path)):
-            return kt2(path)
-        return deep(path) if c * B >= OCC3_FROM else path
     fixed = [
         (embed_src, "embed.hal", ["nop=0"]),
         ("yah_residual_add_1d_f32.loom", "accum.hal",
@@ -2947,42 +2820,29 @@ def main():
         *([(qrot_src, "qrot.hal", ["yah_qrot.token_count=%d" % B])] if qrot_first < NCH else []),
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c),
            ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)]
-           + (["%s.out_capacity=%d" % (sym, cap_attn)] if sym.startswith("yah_vdeq") else [])
-           + (["%s.first=%d" % (sym, max(c - 1, 0) * B)] if src in (kdeqf_src, vdeqf_src) else []))
+           + (["%s.out_capacity=%d" % (sym, T)] if sym.startswith("yah_vdeq") else [])
+           )
           for c in range(NCH) if kvdeq
-          for sparse in (fps_on and c * B >= FPS_FROM,)
-          for src, stem, sym in ((kdeqf_src if sparse else kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
-                                 (vdeqf_src if sparse else vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
-        *[(occ(attn_qr_src if c >= qrot_first else attn_src, c), "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
-            "attention_prefill.cache_capacity=%d" % cap_attn,
+          for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
+                                 (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
+        *[(attn_qr_src if c >= qrot_first else attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
+            "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH)],
         *([(attn_f_src, "wmmaf.hal", [
-            "attention_prefill.cache_capacity=%d" % cap_attn,
+            "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=0",
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
-            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and occ(attn_src, 0) == attn_src
-          and qrot_first > 0 else []),
-        *[(occ(attn_qr_t_src if c >= qrot_first else attn_t_src, c), "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
-            "attention_prefill.cache_capacity=%d" % cap_attn,
+            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and qrot_first > 0 else []),
+        *[(attn_qr_t_src if c >= qrot_first else attn_t_src, "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
+            "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH) if af24],
-        *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c), cfg)
-          for c in range(NCH) if fps_on
-          for src, stem, cfg in (
-              (fpmean_src, "fpmean", ["yah_fpmean.capacity=%d" % T, "yah_fpmean.capx=%d" % cap_attn,
-                                      "yah_fpmean.first=%d" % (max(c - 1, 0) * B // 128), "yah_fpmean.nend=%d" % ((c + 1) * B // 128)]),
-              *[(src, stem, ["%s.capacity=%d" % (sym, T), "%s.capx=%d" % (sym, cap_attn),
-                             "%s.nend=%d" % (sym, (c + 1) * B // 128)])
-                for src, stem, sym in ((fpcopyk_src, "fpcopyk", "yah_fpcopyk"), (fpcopyv_src, "fpcopyv", "yah_fpcopyv"))],
-              *([(fpsel_src, "fpsel", ["yah_fpsel.start_pos=%d" % (c * B), "yah_fpsel.tpad=%d" % T])]
-                if c * B >= FPS_FROM else []))],
-        *([(fpord_src, "fpord.hal", ["yah_fpord.ls=%d" % fps_ls])] if fps_on and FPS_ORD else []),
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
           if vtrans_src else []),
@@ -3016,9 +2876,6 @@ def main():
     # per-lane LDS address math out of the key loop (fp16 -1..-2%; kv4 QROT -0.5% with one extra live register); the
     # kv4 staged-Q build loses 11% and the afrag GEMMs 5-20%, so they compile without it
     def attn_env(loom):
-        if "_kt2" in loom:   # KT2 (fp16 sources only): hoisting capped at 6 new loop-live units (240 VGPRs)
-            return {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "6"}
-        loom = loom.replace("_alt.loom", ".loom").replace("_deep.loom", ".loom").replace("_kt2.loom", ".loom")
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
         if loom in (attn_src, attn_t_src, attn_f_src) and (not gen_attn_fa.KDEC or kv8deq):
@@ -3026,42 +2883,22 @@ def main():
         return None
     if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)
         fixed = [f for f in fixed if f[1].startswith(("prepab", "rowsplit", "postnorm", "rope", "vtpage", "wmma"))]
-    kt2_rows = []
     persist_rows = []
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
-        if outname.startswith("wmma") and "_kt2" in loom:   # KT2 past 240 VGPRs loses its third workgroup: use the old twin
+        if outname.startswith("wmma"):   # attn_guard: Loom's allocator can land a variant in its O-accumulator back-edge
+            # rotation (the 8 O tuples one placement off the P.V results: ~128 loop moves, 200+ VGPRs)
             hal = os.path.join(outdir, outname)
-            if (hal_vgprs(hal) > KT2_VGPR or hal_spills(hal)) and "_kt2fps" in loom:
-                raise SystemExit("attention %s: the block-sparse KT2 twin has %d VGPRs, %d B spills (no dense fallback)"
-                                 % (outname, hal_vgprs(hal), hal_spills(hal)))
-            if hal_vgprs(hal) > KT2_VGPR or hal_spills(hal):
-                c = int(re.search(r"_c(\d+)\.hal$", outname).group(1)) if "_c" in outname else 0
-                print("attention %s: KT2 %d VGPRs, %d B spills, re-emitted from the previous twin" % (outname, hal_vgprs(hal), hal_spills(hal)))
-                loom = occ(loom.replace("_kt2.loom", ".loom"), c, use_kt2=False)
-                E.emit(loom, configs, outname, outdir, attn_env(loom))
-        if outname.startswith("wmma") and "_kt2" in loom and kt2_shape:
-            kt2_rows.append(outname)
-        if outname.startswith("wmma"):   # attn_guard (deep twins: 3 workgroups per WGP allow 256 VGPRs, never spills)
-            hal = os.path.join(outdir, outname)
-            limit = 256 if "_deep" in loom else KT2_VGPR if "_kt2" in loom else ATTN_VGPR
-            if hal_vgprs(hal) > limit or hal_spills(hal):
-                print("attention %s: %d VGPRs, %d B spills, re-emitted without DIAG_SWAP" % (outname, hal_vgprs(hal), hal_spills(hal)))
-                E.emit(alt(loom), configs, outname, outdir, attn_env(loom))
-                if hal_spills(hal):
-                    raise SystemExit("attention %s still spills: refusing to emit a spilling attention kernel" % outname)
-        if outname.startswith("wmma") and persist and outname != "wmmaf.hal" and not any(
-                t in loom for t in ("_deep", "_kt2")):
+            if hal_vgprs(hal) > ATTN_VGPR or hal_spills(hal):
+                raise SystemExit("attention %s: %d VGPRs (over %d), %d B spills: refusing to emit it"
+                                 % (outname, hal_vgprs(hal), ATTN_VGPR, hal_spills(hal)))
+        if outname.startswith("wmma") and persist and outname != "wmmaf.hal":
             persist_rows.append(outname)
         n += 1
     if persist_rows:   # the persistent attention HALs launch persist workgroups on x only
         with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
             for hal in persist_rows:
                 fh.write("persist_%s %d 1 %d\n" % (hal, persist, pdyn))
-    if kt2_rows:   # the KT2 chunks' own launch geometry (the global wmma.hal row is chunk 0's)
-        with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
-            for hal in kt2_rows:
-                fh.write("%s %d %d %d\n" % (hal, kt2_shape[1], kt2_shape[0], (B + kt2_shape[1] - 1) // kt2_shape[1]))
 
     tables = os.path.join(E.LOOM, "tables")
     for src, dst in [] if EMIT_HALF else [("grid_iq3s.bin", "grid_iq3s.bin"),

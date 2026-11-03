@@ -116,7 +116,7 @@ def main():
     ap.add_argument("--reps", type=int, default=10)
     ap.add_argument("--depths", default="0,8192")
     ap.add_argument("--tag", default=os.path.expanduser("~/yah-scratch/attn_bench"))
-    ap.add_argument("--inputs", help="real Q / K / V: <prefix>.q, .kpool, .vpool (loom_prefill YAH_FPS_DUMP), one depth")
+    ap.add_argument("--inputs", help="real Q / K / V: <prefix>.q, .kpool, .vpool (loom_prefill YAH_ATTN_DUMP), one depth")
     ap.add_argument("--counters", default="", help="more HRX counters (e.g. SQ_INSTS_VALU,SQ_WAVES): per-call totals")
     ap.add_argument("--att", action="store_true", help="HRX ATT thread trace (one rep): decoded to <tag>/att_<depth>.txt")
     ap.add_argument("variants", nargs="+")
