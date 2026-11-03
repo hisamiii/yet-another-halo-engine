@@ -178,6 +178,10 @@ R2P_PRIO = int(os.environ.get("R2P_PRIO", "0"))
 # R2P_PRIOQ: the same for the QK waves' MMA section (tile start to barrier A): the per-workgroup critical path is
 # QK MMAs -> softmax, and the P.V waves' MMAs (beside the softmax, off it) compete for the same WMMA pipe
 R2P_PRIOQ = int(os.environ.get("R2P_PRIOQ", "0"))
+# R2P_TPRIO: issue priority N (1..3) from the epilogue through the next unit's prologue, 0 from the tile loop on: a
+# transitioning wave's dependent VALU chain otherwise waits behind the other workgroups' WMMAs on its SIMD (ATT trace:
+# ~20 K ticks of epilogue for ~300 instructions). 0: off
+R2P_TPRIO = int(os.environ.get("R2P_TPRIO", "0"))
 R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
 R2P_PVB = os.environ.get("R2P_PVB", "1") == "1"   # R2P, P.V: P^T / alpha loads through byte views, loop-invariant lane
                     # byte address + the slot's uniform byte offset (1 v_add per base; a row index costs 3 per load)
@@ -3077,6 +3081,8 @@ def gen():
             res = f"%wkfL, {', '.join(f + 'L' for f in fb)}, %gmaxL, %gsumL"
         else:
             res = f"%wkf, {', '.join(fb)}, %gmax, %gsum"
+        if R2P_TPRIO:
+            e("  kernel.priority {level = 0}")
         e(f"  {res} = scf.while(%ksw = {k0} : index, {init}) -> (index, {rtypes}, f32, f32) {{")
         e("    %ks_ = index.assume %ksw [range(%ksw, 0, 1048576), lt(%ksw, %max_vis)] : index")
         nb = body_r2p()
@@ -3210,6 +3216,8 @@ def gen():
 
     if PERSIST and PERSIST_DYN:   # the next unit's atomic before the epilogue's stores, its latency under the epilogue
         persist_issue("n")
+    if R2P and R2P_TPRIO:
+        e(f"  kernel.priority {{level = {R2P_TPRIO}}}")
     # ---- epilogue: o / sum * sigmoid(gate); lane writes dims 8h..8h+7 of each 16
     e(f"  %lsum = scalar.addf {'%lsum_l' if PAIR or SOFT1 or R2P else '%gsum'}, %zero : f32")   # already the full row sum
     for bs in ("", "_o") if R2P else ("",):   # R2P: fragments 8..15 are the other head's (row sum %lsum_lo)
@@ -3317,37 +3325,42 @@ def gen():
             if f + gpf < NFR:
                 gate_loads(f + gpf)
                 e("  scf.schedule.fence")
+        elif gate_each and "noepi" in R2P_DIAG:
+            gate_addr(f)
         elif gate_each:
             gate_loads(f)
-        if QG16:
-            e(f"  %eg{f} = vector.extf %eg{f}h : {V8H} to {V8}")
+        if "noepi" in R2P_DIAG:   # diag: no gate loads or epilogue math, raw O stored (wrong output)
+            e(f"  %eout{f} = vector.addf %og{f}, %zeros8 : {V8}")
         else:
-            e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
-        e(f"  %egn{f} = vector.negf %eg{f} : {V8}")
-        e(f"  %egm{f} = vector.mulf %egn{f}, %nlog2e8 : {V8}")
-        e(f"  %egx{f} = vector.exp2f<afn> %egm{f} : {V8}")
-        e(f"  %egd{f} = vector.addf %ones8, %egx{f} : {V8}")
-        bs = "_o" if R2P and f >= 8 else ""
-        if EPI_FAST:
-            # 1 / dn by rcp + one Newton step: bit-exact for dn in [1, 2^126] (gen_gemm_tile FAST_RCP); dn = inf clamps to
-            # FLT_MAX, whose tiny reciprocal times any |o| <= 65504 rounds to the same signed f16 zero as o * 0
-            e(f"  %egc{f} = vector.minnumf<nnan> %egd{f}, %efmax8 : {V8}")
-            e(f"  %egr0{f} = vector.divf<nnan|ninf|nsz|arcp> %ones8, %egc{f} : {V8}")
-            e(f"  %egnd{f} = vector.mulf %egc{f}, %enone8 : {V8}")
-            e(f"  %eger{f} = vector.fmaf %egnd{f}, %egr0{f}, %ones8 : {V8}")
-            e(f"  %egr{f} = vector.fmaf %eger{f}, %egr0{f}, %egr0{f} : {V8}")
-            # o / sum (Markstein): q = o r with r = RN(1 / sum), then q + (o - q sum) r, correctly rounded
-            e(f"  %eq{f} = vector.mulf %og{f}, %elr8{bs} : {V8}")
-            e(f"  %eqe{f} = vector.fmaf %eq{f}, %enls8{bs}, %og{f} : {V8}")
-            e(f"  %eod{f} = vector.fmaf %eqe{f}, %elr8{bs}, %eq{f} : {V8}")
-        else:
-            e(f"  %egr{f} = vector.divf %ones8, %egd{f} : {V8}")
-            e(f"  %eod{f} = vector.divf %og{f}, %lsum8{bs} : {V8}")
-        if PRO_FAST and R2P and EPI_FAST:   # stored rows have sum >= 1
-            e(f"  %eout{f} = vector.mulf %eod{f}, %egr{f} : {V8}")
-        else:
-            e(f"  %eov{f} = scf.select %lpos{bs}, %eod{f}, %zeros8 : {V8}")
-            e(f"  %eout{f} = vector.mulf %eov{f}, %egr{f} : {V8}")
+            if QG16:
+                e(f"  %eg{f} = vector.extf %eg{f}h : {V8H} to {V8}")
+            else:
+                e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
+            e(f"  %egn{f} = vector.negf %eg{f} : {V8}")
+            e(f"  %egm{f} = vector.mulf %egn{f}, %nlog2e8 : {V8}")
+            e(f"  %egx{f} = vector.exp2f<afn> %egm{f} : {V8}")
+            e(f"  %egd{f} = vector.addf %ones8, %egx{f} : {V8}")
+            bs = "_o" if R2P and f >= 8 else ""
+            if EPI_FAST:
+                # 1 / dn by rcp + one Newton step: bit-exact for dn in [1, 2^126] (gen_gemm_tile FAST_RCP); dn = inf clamps to
+                # FLT_MAX, whose tiny reciprocal times any |o| <= 65504 rounds to the same signed f16 zero as o * 0
+                e(f"  %egc{f} = vector.minnumf<nnan> %egd{f}, %efmax8 : {V8}")
+                e(f"  %egr0{f} = vector.divf<nnan|ninf|nsz|arcp> %ones8, %egc{f} : {V8}")
+                e(f"  %egnd{f} = vector.mulf %egc{f}, %enone8 : {V8}")
+                e(f"  %eger{f} = vector.fmaf %egnd{f}, %egr0{f}, %ones8 : {V8}")
+                e(f"  %egr{f} = vector.fmaf %eger{f}, %egr0{f}, %egr0{f} : {V8}")
+                # o / sum (Markstein): q = o r with r = RN(1 / sum), then q + (o - q sum) r, correctly rounded
+                e(f"  %eq{f} = vector.mulf %og{f}, %elr8{bs} : {V8}")
+                e(f"  %eqe{f} = vector.fmaf %eq{f}, %enls8{bs}, %og{f} : {V8}")
+                e(f"  %eod{f} = vector.fmaf %eqe{f}, %elr8{bs}, %eq{f} : {V8}")
+            else:
+                e(f"  %egr{f} = vector.divf %ones8, %egd{f} : {V8}")
+                e(f"  %eod{f} = vector.divf %og{f}, %lsum8{bs} : {V8}")
+            if PRO_FAST and R2P and EPI_FAST:   # stored rows have sum >= 1
+                e(f"  %eout{f} = vector.mulf %eod{f}, %egr{f} : {V8}")
+            else:
+                e(f"  %eov{f} = scf.select %lpos{bs}, %eod{f}, %zeros8 : {V8}")
+                e(f"  %eout{f} = vector.mulf %eov{f}, %egr{f} : {V8}")
         if not epig:
             e(f"  scf.if {'%ewr' if PAIR or R2P else '%r_live'} {{")
         if TILED_OUT:
