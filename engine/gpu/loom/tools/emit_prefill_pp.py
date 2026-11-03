@@ -994,8 +994,9 @@ AF = {
     ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE3, lhs_stream=2, swepi=False, f16p=True),     # -11.6%
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False, gaddr=True, f16s=True),  # -12.1%
+    # persistent lhs_stream 1 (was 2): bank cost 0.6 -> 0.1%, 191 VGPRs; down -0.4% (92.6 -> 93.0%), bit-identical (11-03)
     ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, f16p=True, gaddr=True, f16s=True,
-                                    persist=dict(b0early=True, lhs_stream=2)),               # -8.6%
+                                    persist=dict(b0early=True, lhs_stream=1)),               # -8.6%
     # lhs_stream 1 (was 4) since HRX 0051: bank cost 1.0 -> 0.4%, 190 VGPRs; pp2048 counters 3 runs (11-03),
     # bit-identical: down -0.66% (92.8 -> 93.4%), out -0.32%
     ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, respre=1, persist=dict(pslice="top_top")), # -10.4%
