@@ -1079,24 +1079,31 @@ AF_FFN = {
 # A pair of one format (no AF_FFN entry, so no NPU split): "gemm_ffn_<fmt>_<fmt>_..", the format's swiglu knobs without
 # B prefetch: q5k -3.5%, q3k -3.8% (the prefetching forms rank 1.0 WMMA banks, -1.2..-1.4%).
 AF_MIX = dict(ffn_inload=True, bpre=0, b0early=False, lhs_stream=0)
+# ffn_sel: every lane loads both formats' slots at a role-selected address, carried like a one-format prefetch (the
+# in-decode loads waited on DRAM each phase); lhs_stream 1 keeps it within the 192-VGPR tier. pp2048 counters, 3 runs
+# (11-03), bit-identical: iq3xxs:iq3s -1.6%, iq2xs:iq3s -1.5%, iq2s:iq3xxs -1.3%, iq4xs:iq3s -1.0%, iq3xxs:iq2s -0.8%,
+# iq3s:iq4xs -0.6%, q3k:iq3s -0.3%, GEMMs -0.13%; iq2xs:iq2s +1.7% (keeps the in-decode loads)
+AF_SEL = dict(ffn_sel=True, bpre=0, b0early=False, lhs_stream=1)
+if __import__("os").environ.get("YAH_FFN_SEL", "1") == "0":
+    AF_SEL = AF_MIX
 AF_FFN_MIX = {
-    ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], **AF_MIX),
-    ("iq4xs", "q4k"): dict(AF_FFN["iq4xs"], **AF_MIX),
-    ("q3k", "iq3s"): dict(AF[("q3k", "swiglu", 1088, 20)], **AF_MIX),
-    ("iq3s", "q3k"): dict(AF_FFN["iq3s"], **AF_MIX),
-    ("iq4xs", "iq3s"): dict(AF_FFN["iq4xs"], **AF_MIX),
+    ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], **AF_SEL),
+    ("iq4xs", "q4k"): dict(AF_FFN["iq4xs"], **AF_SEL),
+    ("q3k", "iq3s"): dict(AF[("q3k", "swiglu", 1088, 20)], **AF_SEL),
+    ("iq3s", "q3k"): dict(AF_FFN["iq3s"], **AF_SEL),
+    ("iq4xs", "iq3s"): dict(AF_FFN["iq4xs"], **AF_SEL),
     ("q5k", "q5k"): dict(AF[("q5k", "swiglu", 1088, 20)], bpre=0, b0early=False, lhs_stream=0),
     ("q3k", "q3k"): dict(AF[("q3k", "swiglu", 1088, 20)], bpre=0, b0early=False, lhs_stream=0),
     # both formats with lookup tables (the up's bind as gridu / ksignsu, 11-02): iq3xxs:iq3s -1.3%, iq3xxs:iq2s -3.7%,
     # iq2s:iq3xxs -2.8%, iq2xs:iq2s -4.1%, iq2xs:iq3s -1.9% (IQ2_XS: a gate only, its kstore knobs); iq2s:iq2s with its
     # swiglu knobs -4.5% (without B prefetch -4.0%)
-    ("iq3xxs", "iq3s"): dict(AF_FFN["iq3xxs"], **AF_MIX),
-    ("iq3xxs", "iq2s"): dict(AF_FFN["iq3xxs"], **AF_MIX),
+    ("iq3xxs", "iq3s"): dict(AF_FFN["iq3xxs"], **AF_SEL),
+    ("iq3xxs", "iq2s"): dict(AF_FFN["iq3xxs"], **AF_SEL),
     # lhs_stream 1 (each A fragment just before its MMAs; 176 VGPRs): pp2048 counters, 3 runs each, -0.5 M cycles per
     # call (-1.2%) for these three, bit-identical; iq3s:q3k +0.5% with it (gemm_bench had all four 1-3% better)
-    ("iq2s", "iq3xxs"): dict(AF[("iq2s", "swiglu", 1088, 20)], **dict(AF_MIX, lhs_stream=1)),
-    ("iq2xs", "iq2s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **dict(AF_MIX, lhs_stream=1)),
-    ("iq2xs", "iq3s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **dict(AF_MIX, lhs_stream=1)),
+    ("iq2s", "iq3xxs"): dict(AF[("iq2s", "swiglu", 1088, 20)], **AF_SEL),
+    ("iq2xs", "iq2s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **dict(AF_MIX, lhs_stream=1)),   # ffn_sel +1.7%
+    ("iq2xs", "iq3s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **AF_SEL),
     ("iq2s", "iq2s"): dict(AF[("iq2s", "swiglu", 1088, 20)]),
 }
 

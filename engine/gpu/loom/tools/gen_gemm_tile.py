@@ -112,6 +112,7 @@ class Tile:
                                # "<loads>_<add+store>" (top / b0 after barrier 0 / b1 before barrier 1 / a1 after it);
                                # "" = b0_b1. Same values; it steers the register allocator's WMMA banks
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
+    ffn_sel: bool = False      # mixed ffn: one carried load per slot at a role-selected address (see sel_loads)
     ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
                                # (the weight binding spans ffn_gate and the ffn_up right after it: up row r is row m_rows + r)
     epiord: str = ""           # ffn epilogue order "<silu>_<g>_<j>": silu of all fragments up front (fwd / rev) or each
@@ -156,6 +157,12 @@ class Tile:
 
 # set per emitted shape by emit_prefill_pp._emit_gen (O16_MT): kstore outputs stored as f16 for f16 consumers
 OUT16 = False
+
+def _nbytes(ty):
+    """N of a vector<Nxi8> type, else 0"""
+    m = re.fullmatch(r"vector<(\d+)xi8>", ty)
+    return int(m.group(1)) if m else 0
+
 
 def default_tile(fmt, kind, kb, geom=None):
     """The shipped Tile for fmt / kind at k_blocks kb; geom=(BM, BN, WM, WN) overrides the geometry (16-row tiles)."""
@@ -338,6 +345,77 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
                 return ren(fn())
             finally:
                 configure(fmt, t)
+
+        def sel_loads(p, blk_g, blk_u, gb):
+            """ffn_sel: both formats' weight loads for one phase as one load per slot, every lane the same loads, so the
+            values carry like a one-format prefetch (a load in the role branch drains vmcnt(0) at its join). A byte-view
+            up load and a gate one no wider share a slot: index = the lane's role's, the gate's read widened to the up's
+            width (the up tensor follows the gate tensor in the binding: a widened gate read stays inside it), clamped
+            to w_bytes - width like the plain loads. Other loads keep their own slot (the other role loads the same
+            address: a wasted but valid load). Returns (lines, slots [(name, type)], gate map, up map); a map entry per
+            loaded value: (slot, its type)."""
+            Lg, vg = loads(p + "g_", blk_g, gb)
+            Lu, vu = as_up(lambda: loads_u(p + "u_", blk_u, gb))
+            rx = re.compile(r"^\s*(%\S+) = (?:vector|view)\.load (%\w+)\[(%\S+)\] : \S+ -> (\S+)$")
+
+            def parse(Ls):
+                body, lds = [], {}
+                for ln in Ls:
+                    m = rx.match(ln)
+                    if m:
+                        lds[m.group(1)] = (m.group(2), m.group(3), m.group(4), ln)
+                    else:
+                        body.append(ln)
+                return body, lds
+            bg, lg = parse(Lg)
+            bu, lu = parse(Lu)
+            assert set(lg) == {n for n, _ in vg} and set(lu) == {n for n, _ in vu}, "sel_loads: a value not a plain load"
+            out = bg + bu
+            gv = sorted((n for n, _ in vg if lg[n][0] == "%w_view" and _nbytes(lg[n][2])), key=lambda n: -_nbytes(lg[n][2]))
+            slots, gmap, umap, used = [], {}, {}, set()
+            for nu, tyu in vu:
+                vw, idx, ty, ln = lu[nu]
+                w = _nbytes(ty)
+                cand = [g for g in gv if g not in used and _nbytes(lg[g][2]) <= w] if vw == "%w_view" and w else []
+                if cand:
+                    g = cand[0]
+                    used.add(g)
+                    sn = f"%{p}s{len(slots)}"
+                    out.append(f"    {sn}_i0 = scf.select %ff_up, {idx}, {lg[g][1]} : index")
+                    out.append(f"    {sn}_i = index.min {sn}_i0, %w_lim{w} : index")
+                    out.append(f"    {sn} = vector.load %w_view[{sn}_i] : view<[%w_bytes]xi8> -> {ty}")
+                    umap[nu], gmap[g] = (len(slots), ty), (len(slots), lg[g][2])
+                    slots.append((sn, ty))
+                    continue
+                out.append(ln)
+                umap[nu] = (len(slots), tyu)
+                slots.append((nu, tyu))
+            for ng, tyg in vg:
+                if ng not in gmap:
+                    out.append(lg[ng][3])
+                    gmap[ng] = (len(slots), tyg)
+                    slots.append((ng, tyg))
+            return out, slots, [gmap[n] for n, _ in vg], [umap[n] for n, _ in vu]
+
+        def sel_vals(sn, stypes, smap, tag):
+            """ffn_sel: one role's loaded values from the unpacked slot names (a narrower value: the slot's prefix)"""
+            names = []
+            for i, (si, ty) in enumerate(smap):
+                src, sty = sn[si], stypes[si]
+                if ty == sty:
+                    names.append(src)
+                    continue
+                n, w = _nbytes(ty), _nbytes(sty)
+                assert n and w and n % 4 == 0 and w % 4 == 0, (ty, sty)
+                e(f"    %{tag}w{i} = vector.bitcast {src} : {sty} to vector<{w // 4}xi32>")
+                ws = []
+                for j in range(n // 4):
+                    e(f"    %{tag}e{i}_{j} = vector.extract %{tag}w{i}[{j}] : vector<{w // 4}xi32> -> i32")
+                    ws.append(f"%{tag}e{i}_{j}")
+                e(f"    %{tag}v{i} = vector.from_elements {', '.join(ws)} : vector<{n // 4}xi32>")
+                e(f"    %{tag}x{i} = vector.bitcast %{tag}v{i} : vector<{n // 4}xi32> to {ty}")
+                names.append(f"%{tag}x{i}")
+            return names
     kr = kind == "kres"
     sw = kind == "swiglu"
     # kqg: the attention q projection (rows = heads x [256 q | 256 gate]) writes q and gate to [tokens][heads*256] buffers.
@@ -954,6 +1032,10 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     if MX and t.ffn_inload:
         del L[len(L) - len(L0):]   # no prefetch: the decode loads (in place: e appends to L)
         wv0 = []
+    elif MX and t.ffn_sel:
+        del L[len(L) - len(L0):]
+        Ls0, wv0, sel_gm, sel_um = sel_loads("pfs_", "%row_off_i", "%row_off_u", "%gl_i")
+        L.extend(Ls0)
     elif MX:
         L0u, wv0u = as_up(lambda: loads_u("pfu_", "%row_off_u", "%gl_i"))
         L.extend(L0u)
@@ -1054,12 +1136,20 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             Lcg, vcg = loads("cg_", "%blk_cg", "%gb_i")
             L.extend(Lcg)
             names = [n for n, _ in vcg]
+        elif MX and t.ffn_sel:
+            sn = G.unpack_vals(e, cur_w, orig0)
+            stypes = [ty for _, ty in orig0]
+            e("    scf.if %ff_up {")
+            names_u = sel_vals(sn, stypes, sel_um, "su")
+            L.extend(as_up(lambda: compute_u(names_u, "%gb_i")))
+            e("    } else {")
+            names = sel_vals(sn, stypes, sel_gm, "sg")
         elif MX:
             e("    scf.if %ff_up {")
             names_u = G.unpack_vals(e, cur_wu, orig0u)
             L.extend(as_up(lambda: compute_u(names_u, "%gb_i")))
             e("    } else {")
-        if not (MX and t.ffn_inload):
+        if not (MX and (t.ffn_inload or t.ffn_sel)):
             names = G.unpack_vals(e, cur_w, orig0)
         L.extend(compute(names, "%gb_i"))
         if MX:
@@ -1105,9 +1195,15 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e("    }")
             nxt = [(f"%nxw{x}", ty) for x, (_, ty) in enumerate(cur_w)]
         else:
-            L.extend(Ln if not (MX and t.ffn_inload) else [])
-            nxt = G.pack_vals(e, nxt, "n") if not (MX and t.ffn_inload) else []
-            if MX and not t.ffn_inload:
+            L.extend(Ln if not (MX and (t.ffn_inload or t.ffn_sel)) else [])
+            nxt = G.pack_vals(e, nxt, "n") if not (MX and (t.ffn_inload or t.ffn_sel)) else []
+            if MX and t.ffn_sel:
+                e("    %blk_off0n_u = scalar.muli %kb_ni, %cbbu_i : i32")
+                e("    %blk_n_u = scalar.addi %row_off_u, %blk_off0n_u : i32")
+                Lns, nxs, _, _ = sel_loads("nxs_", "%blk_n", "%blk_n_u", "%gb_n")
+                L.extend(Lns)
+                nxt = G.pack_vals(e, nxs, "n")
+            elif MX and not t.ffn_inload:
                 e("    %blk_off0n_u = scalar.muli %kb_ni, %cbbu_i : i32")
                 e("    %blk_n_u = scalar.addi %row_off_u, %blk_off0n_u : i32")
                 Lnu, nxtu = as_up(lambda: loads_u("nxu_", "%blk_n_u", "%gb_n"))
