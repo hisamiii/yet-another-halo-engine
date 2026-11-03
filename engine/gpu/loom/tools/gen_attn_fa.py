@@ -189,6 +189,10 @@ R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
 R2P_PVB = os.environ.get("R2P_PVB", "1") == "1"   # R2P, P.V: P^T / alpha loads through byte views, loop-invariant lane
                     # byte address + the slot's uniform byte offset (1 v_add per base; a row index costs 3 per load)
 R2P_PEEL = os.environ.get("R2P_PEEL", "1") == "1"   # R2P: tile 0 peeled off the loop without the P.V of tile -1
+# R2P_SPLIT: one loop per role under a top-level role branch (same trip count, 2 barriers per tile each), instead of
+# one loop with a role branch per tile: the QK loop carries only max / sum (Q is loop-invariant), the P.V loop only
+# the O banks; no per-tile role join. The roles join once per unit, before the last tile's P.V
+R2P_SPLIT = os.environ.get("R2P_SPLIT", "1") == "1"
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
 # R2P_GATEPF=D (R2P_EPIG): the whole epilogue under one store guard and each gate fragment loaded D fragments ahead of
 # its use (a schedule fence after it). With a guard per fragment, each join drains vmcnt(0): the 16 gate loads ran one
@@ -2288,7 +2292,7 @@ def gen():
             return [f"%sc4_{t}" for t in range(2)]
         return acc
 
-    def body_r2p(first=False):
+    def body_r2p(first=False, role=None):
         """R2P tile ks, one role branch holding both phases (and both barriers: every wave meets each once).
         QK waves: QK(ks), the other head's partial to LDS | barrier A | K(ks + 16) loads, own S = own + partner partial,
         softmax -> P^T / alpha slot ks % 2 | barrier B.
@@ -2306,7 +2310,10 @@ def gen():
         e(f"{I}%prev_al = index.mul %kpar1, %c64 : index")
         nb = [f"%nb{f}" for f in range(16)]
         J = I + "  "
-        e(f"{I}{', '.join(nb)}, %qmax, %qsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
+        if role is None:
+            e(f"{I}{', '.join(nb)}, %qmax, %qsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
+        if role == "B":
+            return body_r2p_pv(first, I, J)
         if R2P_PRIOQ:
             e(f"{J}kernel.priority {{level = {R2P_PRIOQ}}}")
         own, oth = r2p_qk(rnames, J)
@@ -2332,8 +2339,17 @@ def gen():
             e(f"{J}kernel.priority {{level = 0}}")
         if not R2P_DIAG & {"nobar", "nobarb"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if role == "A":
+            return ["%nmax", "%nsum"]
         e(f"{J}scf.yield {', '.join(rnames)}, %nmax, %nsum : {rtypes}, f32, f32")
         e(f"{I}}} else {{")
+        outs = body_r2p_pv(first, I, J)
+        e(f"{J}scf.yield {', '.join(outs)}, %rmax, %rsum : {rtypes}, f32, f32")
+        e(f"{I}}}")
+        return nb
+
+    def body_r2p_pv(first, I, J):
+        """body_r2p's P.V-wave half. Returns the O bank names."""
         e(f"{J}%vks1 = index.max %ks_, %c16 : index")
         e(f"{J}%vks = index.sub %vks1, %c16 : index")
         nostg = "nostg" in R2P_DIAG   # (diag nostg: no K / V loads or staging stores in the loop: stale tiles)
@@ -2357,9 +2373,7 @@ def gen():
         outs = rnames if first else r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J)   # R2P_PEEL: no P.V(-1)
         if not R2P_DIAG & {"nobar", "nobarb"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        e(f"{J}scf.yield {', '.join(outs)}, %rmax, %rsum : {rtypes}, f32, f32")
-        e(f"{I}}}")
-        return nb
+        return outs
 
     def pair_pv(slot_rows, slot_al, R, pp, ind, mid_cb=None):
         """B: rescale the O bank by A's alpha of that tile (only when some row's max grew, as the A-side branch did),
@@ -3200,7 +3214,76 @@ def gen():
         init = ", ".join(f"%rb{f} = %rinit{f} : {BK}" for f in range(16)) + ", %rmax = %ninf : f32, %rsum = %zero : f32"
         fb = [f"%fb{f}" for f in range(16)]
         k0 = "%c0"
-        if R2P_PEEL:   # tile 0 before the loop, without the P.V of tile -1 (P = 0: 16 MMAs of nothing per workgroup)
+        tok = re.compile(r"%[A-Za-z0-9_.]+")
+
+        def renamed(i0, sub, suffix):
+            """Rename every value defined in L[i0:] with suffix and apply sub (in place)."""
+            sub = dict(sub)
+            defs = set()
+            for ln in L[i0:]:
+                if " = " in ln:
+                    defs.update(re.findall(r"%[A-Za-z0-9_.]+", ln.split(" = ")[0]))
+            sub.update({d: d + suffix for d in defs if d not in sub})
+            L[i0:] = [tok.sub(lambda m: sub.get(m.group(0), m.group(0)), ln) for ln in L[i0:]]
+            return sub
+
+        if R2P_SPLIT:   # (R2P_SPLIT=0 for the R2P_TPRIO / R2P_PRIO / R2P_PRIOQ / unpeeled diags)
+            assert R2P_PEEL and not (R2P_TPRIO or R2P_PRIOQ or R2P_PRIO)
+            qb = {f"%rb{f}": f"%rinit{f}" for f in range(16)}   # QK waves: Q, loop-invariant
+            e(f"  {', '.join(fb)}, %gmax, %gsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
+            # QK role: tile 0, then tiles 16.. (2 barriers each)
+            i0 = len(L)
+            q0 = body_r2p(first=True, role="A")
+            sm = renamed(i0, {**qb, "%ks_": "%c0", "%rmax": "%ninf", "%rsum": "%zero"}, "_qa0")
+            q0 = [sm.get(x, x) for x in q0]
+            e("  %pmore_qa = index.cmp ult, %c16, %max_vis : index")
+            e("  %gmax_qa, %gsum_qa = scf.if %pmore_qa -> (f32, f32) {")
+            e(f"  %wkf_qa, %gmaxL_qa, %gsumL_qa = scf.while(%ksw_qa = %c16 : index, %rmax_qa = {q0[0]} : f32, %rsum_qa = {q0[1]} : f32) -> (index, f32, f32) {{")
+            i0 = len(L)
+            e("    %ks_ = index.assume %ksw_qa [range(%ksw_qa, 0, 1048576), lt(%ksw_qa, %max_vis)] : index")
+            q1 = body_r2p(role="A")
+            e(f"    %ksn = index.add %ks_, %c{KT} : index")
+            e("    %kcont = index.cmp ult, %ksn, %max_vis : index")
+            e(f"    scf.condition %kcont, %ksn, {q1[0]}, {q1[1]} : i1, index, f32, f32")
+            renamed(i0, {**qb, "%rmax": "%rmax_qa", "%rsum": "%rsum_qa", "%ksw_qa": "%ksw_qa"}, "_qa")
+            e("  } do(%wk_qa: index, %wm_qa: f32, %ws_qa: f32) {")
+            e("    scf.yield %wk_qa, %wm_qa, %ws_qa : index, f32, f32")
+            e("  }")
+            e("  scf.yield %gmaxL_qa, %gsumL_qa : f32, f32")
+            e("  } else {")
+            e(f"  scf.yield {q0[0]}, {q0[1]} : f32, f32")
+            e("  }")
+            e(f"  scf.yield {', '.join(f'%rinit{f}' for f in range(16))}, %gmax_qa, %gsum_qa : {rtypes}, f32, f32")
+            e("  } else {")
+            # P.V role: tile 0 (staging only), then tiles 16..
+            i0 = len(L)
+            p0 = body_r2p(first=True, role="B")
+            sm = renamed(i0, {**{f"%rb{f}": f"%rinit{f}" for f in range(16)}, "%ks_": "%c0"}, "_pv0")
+            p0 = [sm.get(x, x) for x in p0]
+            e("  %pmore_pv = index.cmp ult, %c16, %max_vis : index")
+            pl = [f"%fbL{f}_pv" for f in range(16)]
+            pr = [f"%fbR{f}_pv" for f in range(16)]
+            e(f"  {', '.join(pr)} = scf.if %pmore_pv -> ({rtypes}) {{")
+            pinit = ", ".join(f"%rb{f}_pvc = {p0[f]} : {BK}" for f in range(16))
+            e(f"  %wkf_pv, {', '.join(pl)} = scf.while(%ksw_pv = %c16 : index, {pinit}) -> (index, {rtypes}) {{")
+            i0 = len(L)
+            e("    %ks_ = index.assume %ksw_pv [range(%ksw_pv, 0, 1048576), lt(%ksw_pv, %max_vis)] : index")
+            p1 = body_r2p(role="B")
+            e(f"    %ksn = index.add %ks_, %c{KT} : index")
+            e("    %kcont = index.cmp ult, %ksn, %max_vis : index")
+            e(f"    scf.condition %kcont, %ksn, {', '.join(p1)} : i1, index, {rtypes}")
+            renamed(i0, {**{f"%rb{f}": f"%rb{f}_pvc" for f in range(16)}, "%ksw_pv": "%ksw_pv"}, "_pv")
+            wargs = ", ".join(["%wk_pv: index"] + [f"%wb{f}_pv: {BK}" for f in range(16)])
+            e(f"  }} do({wargs}) {{")
+            e(f"    scf.yield %wk_pv, {', '.join(f'%wb{f}_pv' for f in range(16))} : index, {rtypes}")
+            e("  }")
+            e(f"  scf.yield {', '.join(pl)} : {rtypes}")
+            e("  } else {")
+            e(f"  scf.yield {', '.join(p0)} : {rtypes}")
+            e("  }")
+            e(f"  scf.yield {', '.join(pr)}, %ninf, %zero : {rtypes}, f32, f32")
+            e("  }")
+        elif R2P_PEEL:   # tile 0 before the loop, without the P.V of tile -1 (P = 0: 16 MMAs of nothing per workgroup)
             i0 = len(L)
             body_r2p(first=True)
             sub = {"%ks_": "%c0", "%rmax": "%ninf", "%rsum": "%zero"}
@@ -3219,23 +3302,24 @@ def gen():
             res = f"%wkfL, {', '.join(f + 'L' for f in fb)}, %gmaxL, %gsumL"
         else:
             res = f"%wkf, {', '.join(fb)}, %gmax, %gsum"
-        if R2P_TPRIO:
-            e("  kernel.priority {level = 0}")
-        e(f"  {res} = scf.while(%ksw = {k0} : index, {init}) -> (index, {rtypes}, f32, f32) {{")
-        e("    %ks_ = index.assume %ksw [range(%ksw, 0, 1048576), lt(%ksw, %max_vis)] : index")
-        nb = body_r2p()
-        e(f"    %ksn = index.add %ks_, %c{KT} : index")
-        e("    %kcont = index.cmp ult, %ksn, %max_vis : index")
-        e(f"    scf.condition %kcont, %ksn, {', '.join(nb)}, %qmax, %qsum : i1, index, {rtypes}, f32, f32")
-        wargs = ", ".join([f"%wk: index"] + [f"%wb{f}: {BK}" for f in range(16)] + ["%wm: f32", "%ws: f32"])
-        e(f"  }} do({wargs}) {{")
-        e(f"    scf.yield %wk, {', '.join(f'%wb{f}' for f in range(16))}, %wm, %ws : index, {rtypes}, f32, f32")
-        e("  }")
-        if R2P_PEEL:
-            e(f"  scf.yield {res} : index, {rtypes}, f32, f32")
-            e("  } else {")
-            e(f"  scf.yield %c16, {', '.join(f'%nb{f}_p0' for f in range(16))}, %qmax_p0, %qsum_p0 : index, {rtypes}, f32, f32")
+        if not R2P_SPLIT:
+            if R2P_TPRIO:
+                e("  kernel.priority {level = 0}")
+            e(f"  {res} = scf.while(%ksw = {k0} : index, {init}) -> (index, {rtypes}, f32, f32) {{")
+            e("    %ks_ = index.assume %ksw [range(%ksw, 0, 1048576), lt(%ksw, %max_vis)] : index")
+            nb = body_r2p()
+            e(f"    %ksn = index.add %ks_, %c{KT} : index")
+            e("    %kcont = index.cmp ult, %ksn, %max_vis : index")
+            e(f"    scf.condition %kcont, %ksn, {', '.join(nb)}, %qmax, %qsum : i1, index, {rtypes}, f32, f32")
+            wargs = ", ".join([f"%wk: index"] + [f"%wb{f}: {BK}" for f in range(16)] + ["%wm: f32", "%ws: f32"])
+            e(f"  }} do({wargs}) {{")
+            e(f"    scf.yield %wk, {', '.join(f'%wb{f}' for f in range(16))}, %wm, %ws : index, {rtypes}, f32, f32")
             e("  }")
+            if R2P_PEEL:
+                e(f"  scf.yield {res} : index, {rtypes}, f32, f32")
+                e("  } else {")
+                e(f"  scf.yield %c16, {', '.join(f'%nb{f}_p0' for f in range(16))}, %qmax_p0, %qsum_p0 : index, {rtypes}, f32, f32")
+                e("  }")
         e("  scf.if %isA {")
         e("    view.store %gsum, %ls_view[%pa_own] : f32, view<64xf32>")
         e("  }")
