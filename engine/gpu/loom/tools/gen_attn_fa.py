@@ -204,7 +204,7 @@ R2P_STEER = os.environ.get("R2P_STEER", "1") == "1"
 # R2P_GATEPF=D (R2P_EPIG): the whole epilogue under one store guard and each gate fragment loaded D fragments ahead of
 # its use (a schedule fence after it). With a guard per fragment, each join drains vmcnt(0): the 16 gate loads ran one
 # after another, ~14 K ticks per unit of the P.V waves' epilogue (ATT trace). 0: a guard per fragment. Same arithmetic
-R2P_GATEPF = int(os.environ.get("R2P_GATEPF", "0"))
+R2P_GATEPF = int(os.environ.get("R2P_GATEPF", "1"))
 # R2P_DIAG (diagnostics only, wrong results, never deployed): comma list of LDS ablations: nox (no S partial exchange,
 # s = own + other head's partial), halfk / halfv (odd K / V^T fragments reuse the even one's registers); nobar (no
 # barriers in the R2P tile loop: races, no waits); nosoft (p = s, no subtract / scale / exp);
