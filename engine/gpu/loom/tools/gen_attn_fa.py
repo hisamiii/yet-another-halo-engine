@@ -162,6 +162,11 @@ R2P_PVF = int(os.environ.get("R2P_PVF", "1"))   # R2P: the same for the V^T frag
 # a fragment load never waits for the MMAs reading the previous one (the ATT trace: a single buffer leaves each wave
 # ~35 ticks of register reuse + a 42-tick LDS round trip between MMA pairs). Same arithmetic
 R2P_PVDB = os.environ.get("R2P_PVDB", "0") == "1"
+# R2P_KPOS: where the P.V wave stores K(ks + 16) in phase B: "p" (default) after its P^T loads, "" right after barrier A
+# (ahead of them in the in-order LDS queue: the first P.V MMA waited for the K stores), "0".."7" after V^T fragment f's
+# MMAs (from "1": 203 VGPRs). "p": busiest SQ +0.6 / +0.1 / +0.4..0.9 at 64K / 8K / 0, bit-identical; with it the
+# softmax shows in the loop (nosoft +2.0 at 8K and 64K, was ~0)
+R2P_KPOS = os.environ.get("R2P_KPOS", "p")
 # R2P_PRIO: the QK waves' issue priority (kernel.priority, 1..3) from barrier A to barrier B: the softmax chain is the
 # tile's critical path and loses issue slots to other waves' MMA bursts (ATT trace). 0: off
 R2P_PRIO = int(os.environ.get("R2P_PRIO", "0"))
@@ -187,6 +192,8 @@ R2P_SPLIT = os.environ.get("R2P_SPLIT", "1") == "1"
 GSIG = os.environ.get("GSIG", "")
 GSIG16 = GSIG in ("16", "u16")
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
+# R2P_LASTB: the last tile's P.V in the P.V waves only (the QK waves' 16 MMAs of it were discarded, beside the real ones)
+R2P_LASTB = os.environ.get("R2P_LASTB", "0") == "1"
 # R2P_GATEPF=D (R2P_EPIG): the whole epilogue under one store guard and each gate fragment loaded D fragments ahead of
 # its use (a schedule fence after it). With a guard per fragment, each join drains vmcnt(0): the 16 gate loads ran one
 # after another, ~14 K ticks per unit of the P.V waves' epilogue (ATT trace). 0: a guard per fragment. Same arithmetic
@@ -1894,7 +1901,7 @@ def gen():
         BK = "vector<8xi32>" if R2P else V8
         rtypes = ", ".join([BK] * 16)
 
-    def r2p_pv(rows, alb, R, pp, ind):
+    def r2p_pv(rows, alb, R, pp, ind, hook=None):
         """R2P, P.V wave: rescale each head's half of the bank (0..7: own head, 8..15: the other) by its alpha of that
         tile unless all its rows' are 1 (x 1.0 is exact), both heads' P^T from the slot, then 8 V^T fragments of this
         head-dim half, each feeding both heads' MMAs. Returns the new bank names."""
@@ -1963,6 +1970,8 @@ def gen():
             e(f"{ind}%{pp}pb0{t} = vector.concat<0> %{pp}plo{t}, %{pp}phi{t} : {V8H}, {V8H} -> {V16H}")
             e(f"{ind}%{pp}pb{t} = vector.fragment<rhs> %{pp}pb0{t} shape [%k, %n] : {V16H}")
             pbs.append(f"%{pp}pb{t}")
+        if hook:
+            hook("p")
         outs = [None] * 16
 
         def vload(f):
@@ -1990,6 +1999,8 @@ def gen():
                 e(f"{ind}%{pp}nx{o} = vector.mma {vfr}, {pbs[t]}, %{pp}oi{o} : {V16H}, {V16H}, {V8}")
                 e(f"{ind}%{pp}nxi{o} = vector.bitcast %{pp}nx{o} : {V8} to {BK}")
                 outs[o] = f"%{pp}nxi{o}"
+            if hook:
+                hook(str(f))
             if f < 7 and (R2P_PVDB or (f + 1) % R2P_PVF == 0):
                 e(f"{ind}scf.schedule.fence")
         return outs
@@ -2101,9 +2112,11 @@ def gen():
                 stage_k("%ks16", nk, "st", J)
         if not R2P_DIAG & {"nobar", "nobara"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        if not nostg and not R2P_DIAG & {"nostk", "kstA"}:
+        kst = not nostg and not R2P_DIAG & {"nostk", "kstA"}
+        if kst and (first or not R2P_KPOS):
             stage_k("%ks16", nk, "st", J)
-        outs = rnames if first else r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J)   # R2P_PEEL: no P.V(-1)
+        hook = (lambda at: stage_k("%ks16", nk, "st", J) if at == R2P_KPOS else None) if kst and R2P_KPOS else None
+        outs = rnames if first else r2p_pv("%prev_rows", "%prev_al", rnames, "bp", J, hook)   # R2P_PEEL: no P.V(-1)
         if not R2P_DIAG & {"nobar", "nobarb"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         return outs
@@ -2549,7 +2562,17 @@ def gen():
         e("  %isB = index.cmp ne, %prole, %c0 : index")
         # every wave: no merge (the QK waves' results are never stored). The epilogue in the P.V waves only (scf.if
         # %isB around it) measured +3.5% at 8K with an identical loop: not understood
-        outs = r2p_pv("%lrows", "%lal", fb, "fp", "  ")
+        if R2P_LASTB:
+            pvo = [f"%fpo{f}" for f in range(16)]
+            e(f"  {', '.join(pvo)} = scf.if %isB -> ({rtypes}) {{")
+            outs = r2p_pv("%lrows", "%lal", fb, "fp", "    ")
+            e(f"    scf.yield {', '.join(outs)} : {rtypes}")
+            e("  } else {")
+            e(f"    scf.yield {', '.join(fb)} : {rtypes}")
+            e("  }")
+            outs = pvo
+        else:
+            outs = r2p_pv("%lrows", "%lal", fb, "fp", "  ")
         for f in range(16):
             e(f"  %og{f} = vector.bitcast {outs[f]} : {BK} to {V8}")
         e("  %lsum_l = view.load %ls_view[%pa_own] : view<64xf32> -> f32")

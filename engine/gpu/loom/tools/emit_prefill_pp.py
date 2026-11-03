@@ -2411,6 +2411,9 @@ def main():
         geom.append(("gsig", 0, 0, 0))
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
+    if os.environ.get("YAH_ATTN_SRC_ONLY"):   # (dev loop: this attention source only, no set)
+        shutil.copyfile(attn_src, os.environ["YAH_ATTN_SRC_ONLY"])
+        os._exit(0)
     attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")
     aov_need = 0
     if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0 and not EMIT_HALF:   # the main kernel with OCNT

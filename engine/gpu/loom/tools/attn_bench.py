@@ -102,7 +102,7 @@ def compile_hal(src, text, env, depth, outdir):
     key = hashlib.sha1((text + json.dumps(sorted(env.items())) + ",".join(configs)).encode()).hexdigest()[:16]
     out = os.path.join(outdir, f"{key}.hal")
     if not os.path.exists(out):
-        cmd = [hrx_paths.LOOM_COMPILE, src, "--root=@yah_attn_wmma", "--target=amdgpu:gfx1151", "--format=amdgpu-hsaco",
+        cmd = [env.get("LOOM_BIN") or hrx_paths.LOOM_COMPILE, src, "--root=@yah_attn_wmma", "--target=amdgpu:gfx1151", "--format=amdgpu-hsaco",
                "--output=" + out + ".tmp"] + ["--config=attention_prefill." + c for c in configs]
         r = subprocess.run(cmd, env=dict(hrx_paths.env(), **env), capture_output=True, text=True)
         if r.returncode:
