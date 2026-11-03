@@ -652,6 +652,7 @@ def gen():
     L = []
     e = L.append
     PVAL_LINE = "  %pnext = scf.if %pval -> (index) {" if PERSIST_DYN else "  scf.if %pval {"
+    punq = "%punq" if "tailfill" in R2P_DIAG and PERSIST_DYN else "%pun"   # the queue's bound
 
     def persist_issue(t):
         """PERSIST_DYN: every lane's atomic add, %pq<t>o: lane 0 adds 1 to the counter (word 0), the others add 0 to a word
@@ -877,8 +878,6 @@ def gen():
         e("  %prn = index.div %prn0, %pP : index")                 # rounds
         if "tailfill" in R2P_DIAG and PERSIST_DYN:   # diag: the queue runs whole rounds, ids past the units wrap (same stores)
             e("  %punq = index.mul %prn, %pP : index")
-        else:
-            e("  %punq = index.add %pun, %c0 : index")
         e("  %pslot = kernel.workgroup.id<x> : index")
         e("  %pslotr = index.sub %pP1, %pslot : index")
     if PERSIST and PERSIST_DYN:
@@ -886,7 +885,7 @@ def gen():
         e(f"  %pqv = buffer.view %pq_na[%base] : buffer -> view<{PQ_WORDS}xi32>")
         e("  %pq_one = scalar.constant 1 : i32")
         e("  %pq_zero = scalar.constant 0 : i32")
-        e("  %pql0 = index.add %punq, %pP1 : index")
+        e(f"  %pql0 = index.add {punq}, %pP1 : index")
         e("  %pq_last = index.cast %pql0 : index to i32")
         persist_issue("i")
         persist_finish("i")
@@ -911,7 +910,7 @@ def gen():
         e("  %prb = index.mul %prx, %pP : index")
         e("  %wglp = index.add %prb, %psl : index")
     if PERSIST:
-        e("  %pval = index.cmp ult, %wglp, %punq : index")
+        e(f"  %pval = index.cmp ult, %wglp, {punq} : index")
         e(PVAL_LINE)
         # the previous unit's LDS readers (epilogue row sums, P^T / V^T slots) are done before this unit stages
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
@@ -1948,7 +1947,10 @@ def gen():
         else:
             e(f"    %pd8 = vector.subf {s}, %nmax8 : {V8}")
             e(f"    %pl = vector.mulf %pd8, {'%r2l2e8' if R2P else '%log2e8'} : {V8}")
-            e(f"    %p = vector.exp2f<afn> %pl : {V8}")
+            if "noexp" in R2P_DIAG:   # diag: p = the exponent itself (no exp2; wrong values, same max / rescale path)
+                e(f"    %p = vector.addf %pl, %zeros8 : {V8}")
+            else:
+                e(f"    %p = vector.exp2f<afn> %pl : {V8}")
         # keys 8h..8h+3 and 8h+4..8h+7: HIP's 4-lane segments
         for g in range(2 if "nosum" not in R2P_DIAG else 0):
             cur = "%zero"
@@ -3411,9 +3413,9 @@ def gen():
         persist_finish("n")
         e("  scf.yield %pqnu : index")
         e("  } else {")
-        e("  scf.yield %punq : index")
+        e(f"  scf.yield {punq} : index")
         e("  }")
-        e("  %pcont = index.cmp ult, %pnext, %punq : index")
+        e(f"  %pcont = index.cmp ult, %pnext, {punq} : index")
         e("  scf.condition %pcont, %pnext : i1, index")
         e("  } do(%pw: index) {")
         e("  scf.yield %pw : index")
