@@ -2175,7 +2175,7 @@ def gen():
         e(f"{I}}} else {{")
         e(f"{J}%vks1 = index.max %ks_, %c16 : index")
         e(f"{J}%vks = index.sub %vks1, %c16 : index")
-        nv = load_v("%vks", "nv", J)
+        nv = ["%zh8"] * 4 if "novl" in R2P_DIAG else load_v("%vks", "nv", J)   # (diag novl: V staged as zeros, no V loads)
         nk = load_k("%ks16", "nk", J)
         stage_v(nv, "%c0", "stv", J)
         if "nobar" not in R2P_DIAG:
