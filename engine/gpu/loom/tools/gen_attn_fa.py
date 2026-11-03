@@ -2235,10 +2235,13 @@ def gen():
                     e(f"{ind}scf.schedule.fence")
             elif vc == f:
                 vload(f)
+            if "dblv" in R2P_DIAG:   # diag: the second head's MMA from its own fragment load (cols + 8, in the pad)
+                e(f"{ind}%{pp}vf{f}b = vector.fragment.load<lhs> %v_view[%{pp}vr{f}, %c8] shape [%m, %k] : view<256x{VT_PITCH}xf16> -> {V16H}")
             for t in range(2):
                 o = 8 * t + f
+                vfr = f"%{pp}vf{f}b" if t and "dblv" in R2P_DIAG else f"%{pp}vf{vc}"
                 e(f"{ind}%{pp}oi{o} = vector.fragment<init> {sc[o]} shape [%m, %n] : {V8}")
-                e(f"{ind}%{pp}nx{o} = vector.mma %{pp}vf{vc}, {pbs[t]}, %{pp}oi{o} : {V16H}, {V16H}, {V8}")
+                e(f"{ind}%{pp}nx{o} = vector.mma {vfr}, {pbs[t]}, %{pp}oi{o} : {V16H}, {V16H}, {V8}")
                 e(f"{ind}%{pp}nxi{o} = vector.bitcast %{pp}nx{o} : {V8} to {BK}")
                 outs[o] = f"%{pp}nxi{o}"
             if f < 7 and (R2P_PVDB or (f + 1) % R2P_PVF == 0):
@@ -2260,9 +2263,13 @@ def gen():
             kc = c - 1 if "halfk" in R2P_DIAG and c % 2 else c
             if kc == c:
                 e(f"{ind}%kf{c} = vector.fragment.load<lhs> %k_view[%c0, %kfc{c}] shape [%m, %k] : view<{KT}x{KT_PITCH}xf16> -> {V16H}")
+            if "dblk" in R2P_DIAG:   # diag: the second head's MMA from its own fragment load (cols + 8, in the pad)
+                e(f"{ind}%kfc{c}b = index.add %kfc{c}, %c8 : index")
+                e(f"{ind}%kf{c}b = vector.fragment.load<lhs> %k_view[%c0, %kfc{c}b] shape [%m, %k] : view<{KT}x{KT_PITCH}xf16> -> {V16H}")
             for t in range(2):
                 a = 2 * t + c % 2 if ch4 else t
-                e(f"{ind}%sa{t}_{c} = vector.mma %kf{kc}, %qf{8 * t + c}, {acc[a]} : {V16H}, {V16H}, {V8}")
+                kfr = f"%kf{c}b" if t and "dblk" in R2P_DIAG else f"%kf{kc}"
+                e(f"{ind}%sa{t}_{c} = vector.mma {kfr}, %qf{8 * t + c}, {acc[a]} : {V16H}, {V16H}, {V8}")
                 acc[a] = f"%sa{t}_{c}"
             if c < 7 and (c + 1) % R2P_QKF == 0:
                 e(f"{ind}scf.schedule.fence")
