@@ -175,11 +175,18 @@ R2P_PVDB = os.environ.get("R2P_PVDB", "0") == "1"
 # R2P_PRIO: the QK waves' issue priority (kernel.priority, 1..3) from barrier A to barrier B: the softmax chain is the
 # tile's critical path and loses issue slots to other waves' MMA bursts (ATT trace). 0: off
 R2P_PRIO = int(os.environ.get("R2P_PRIO", "0"))
+# R2P_PRIOQ: the same for the QK waves' MMA section (tile start to barrier A): the per-workgroup critical path is
+# QK MMAs -> softmax, and the P.V waves' MMAs (beside the softmax, off it) compete for the same WMMA pipe
+R2P_PRIOQ = int(os.environ.get("R2P_PRIOQ", "0"))
 R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
 R2P_PVB = os.environ.get("R2P_PVB", "1") == "1"   # R2P, P.V: P^T / alpha loads through byte views, loop-invariant lane
                     # byte address + the slot's uniform byte offset (1 v_add per base; a row index costs 3 per load)
 R2P_PEEL = os.environ.get("R2P_PEEL", "1") == "1"   # R2P: tile 0 peeled off the loop without the P.V of tile -1
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
+# R2P_GATEPF=D (R2P_EPIG): the whole epilogue under one store guard and each gate fragment loaded D fragments ahead of
+# its use (a schedule fence after it). With a guard per fragment, each join drains vmcnt(0): the 16 gate loads ran one
+# after another, ~14 K ticks per unit of the P.V waves' epilogue (ATT trace). 0: a guard per fragment. Same arithmetic
+R2P_GATEPF = int(os.environ.get("R2P_GATEPF", "0"))
 # R2P_DIAG (diagnostics only, wrong results, never deployed): comma list of LDS ablations: nox (no S partial exchange,
 # s = own + other head's partial), halfk / halfv (odd K / V^T fragments reuse the even one's registers); nobar (no
 # barriers in the R2P tile loop: races, no waits); nosoft (p = s, no subtract / scale / exp);
@@ -2170,6 +2177,8 @@ def gen():
         nb = [f"%nb{f}" for f in range(16)]
         J = I + "  "
         e(f"{I}{', '.join(nb)}, %qmax, %qsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
+        if R2P_PRIOQ:
+            e(f"{J}kernel.priority {{level = {R2P_PRIOQ}}}")
         own, oth = r2p_qk(rnames, J)
         if "nox" in R2P_DIAG:
             if not R2P_DIAG & {"nobar", "nobara"}:
@@ -2182,7 +2191,7 @@ def gen():
             e(f"{J}vector.store %xst1, %xs_view[%xso_r1, %c0] : {V4}, view<256x4xf32>")
             if not R2P_DIAG & {"nobar", "nobara"}:
                 e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-            if R2P_PRIO:
+            if R2P_PRIO or R2P_PRIOQ:
                 e(f"{J}kernel.priority {{level = {R2P_PRIO}}}")
             e(f"{J}%spa = vector.load %xs_view[%xsm_r0, %c0] : view<256x4xf32> -> {V4}")
             e(f"{J}%spb = vector.load %xs_view[%xsm_r1, %c0] : view<256x4xf32> -> {V4}")
@@ -3293,12 +3302,22 @@ def gen():
         e(f"    %eto{f}c = index.constant {256 * (f % 8 if R2P else f)} : index")
         e(f"    %eto{f} = index.add %etbase{o}, %eto{f}c : index")
     epig = R2P and R2P_EPIG   # the whole fragment (gate loads, math, store) under the store guard: QK waves skip it
+    gpf = R2P_GATEPF if epig else 0
+    if gpf:
+        e("  scf.if %ewr {")
+        for f in range(min(gpf, NFR)):
+            gate_loads(f)
+        e("  scf.schedule.fence")
     for f in range(NFR):
         if f == 8:
             gate_batch(range(8, 16))
-        if epig:
+        if epig and not gpf:
             e("  scf.if %ewr {")
-        if gate_each:
+        if gpf:
+            if f + gpf < NFR:
+                gate_loads(f + gpf)
+                e("  scf.schedule.fence")
+        elif gate_each:
             gate_loads(f)
         if QG16:
             e(f"  %eg{f} = vector.extf %eg{f}h : {V8H} to {V8}")
@@ -3335,6 +3354,9 @@ def gen():
             tiled_addr(f)
         e(f"    %eoh{f} = vector.fptrunc %eout{f} : {V8} to {V8H}")
         e(f"    vector.store %eoh{f}, %o_flat[%{'eto' if TILED_OUT else 'eo'}{f}] : {V8H}, view<[%qtot]xf16>")
+        if not gpf:
+            e("  }")
+    if gpf:
         e("  }")
     if OCNT:
         assert not TILED_OUT and 128 % QT == 0 and 1024 % (256 * HPW) == 0
