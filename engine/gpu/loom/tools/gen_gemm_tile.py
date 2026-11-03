@@ -21,6 +21,11 @@ import gen_bfp16_encode as GE  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
 import gen_gemm_decode as G  # noqa: E402
 
+# Mixed gate:up pairs whose decode waves are swizzled so each SIMD holds both roles (gate/up by wave bit 2, not bit 1):
+# bit-identical, clock-free iq3s:iq4xs -0.7%, iq3xxs:iq3s -0.8%, iq3s:q3k -1.7% (11-03); other pairs flat or worse
+# (iq2xs:iq3s +3%), so the wave-to-SIMD split is not the whole story there
+MX_SWZ_PAIRS = {("iq3s", "iq4xs"), ("iq3xxs", "iq3s"), ("iq3s", "q3k"), ("iq4xs", "iq3s")}
+
 # Default workgroup: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).
 # 256 x 256 does not fit: 64 KB of tiles plus the IQ grid table in LDS is over gfx11's 64 KB per workgroup.
 WS = 32
@@ -307,6 +312,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     # switches from its own default tile); every lane loads its row of both (no branch around the loads: a branch drains
     # vmcnt(0) at its join) and carries both, each wave decodes the one its rows are
     MX = fmt_up is not None
+    MX_SWZ = (fmt, fmt_up) in MX_SWZ_PAIRS if os.environ.get("YAH_MX_SWZ", "1") == "1" else False
     if MX:
         Fu = G.FMTS[fmt_up]
         bbu, (loads_u, compute_u) = Fu["bb"], Fu["decode"]
@@ -578,8 +584,29 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e("  %wtb = index.mul %wg_y, %cwtok : index")
     e("  %token_base = index.add %wtb, %wt_off : index")
     # decode lane map: lane tid decodes weight row tid % BM, group slot tid / BM of the phase; slots >= GPP idle
-    e(f"  %l64 = index.rem %tid, %c{BM} : index")
-    e(f"  %slot = index.div %tid, %c{BM} : index")
+    if MX and MX_SWZ and BM == 128 and t.wm * t.wn == 16:
+        # wave w = (b3 b2 b1 b0): role (gate / up) = b2, 32-row block = b0, group slot = 2 b3 + b1, so every SIMD holds
+        # gate and up waves whether it takes w % 4 or (w / 8, w % 2): the two decoders' VALU no longer split by SIMD
+        e("  %mxw = index.div %tid, %c32 : index")
+        e("  %mxl = index.rem %tid, %c32 : index")
+        e("  %mxc2 = index.constant 2 : index")
+        e("  %mxc4 = index.constant 4 : index")
+        e("  %mxc8 = index.constant 8 : index")
+        e("  %mxb0 = index.rem %mxw, %mxc2 : index")
+        e("  %mxw1 = index.div %mxw, %mxc2 : index")
+        e("  %mxb1 = index.rem %mxw1, %mxc2 : index")
+        e("  %mxw2 = index.div %mxw, %mxc4 : index")
+        e("  %mxb2 = index.rem %mxw2, %mxc2 : index")
+        e("  %mxb3 = index.div %mxw, %mxc8 : index")
+        e("  %mxr0 = index.mul %mxb2, %c64 : index")
+        e("  %mxr1 = index.mul %mxb0, %c32 : index")
+        e("  %mxr2 = index.add %mxr0, %mxr1 : index")
+        e("  %l64 = index.add %mxr2, %mxl : index")
+        e("  %mxs0 = index.mul %mxb3, %mxc2 : index")
+        e("  %slot = index.add %mxs0, %mxb1 : index")
+    else:
+        e(f"  %l64 = index.rem %tid, %c{BM} : index")
+        e(f"  %slot = index.div %tid, %c{BM} : index")
     e(f"  %drow = index.min %l64, %c{BM - 1} : index")
     e("  %drow_i = index.cast %drow : index to i32")
     e("  %wg_row_i = index.cast %wg_row : index to i32")
