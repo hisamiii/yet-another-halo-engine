@@ -147,6 +147,10 @@ PBP = False
 # rounded when r is) and the sigmoid's 1 / (1 + e) as rcp + one Newton step (gen_gemm_tile.recip1), instead of two IEEE
 # divisions per element
 EPI_FAST = False
+# PRO_FAST: the prologue's divisions without IEEE division sequences, same bits: x / 64 and x / 256 as x * 2^-k (exact
+# for normal results), RoPE's 1 / theta^e (in [1, 1e14]) as EPI_FAST's rcp + one Newton step. With R2P the epilogue
+# also drops the per-element sum > 0 select: every stored row is live and sees its own key, so its sum is >= 1
+PRO_FAST = False
 KVMAJOR = False     # workgroup order KV head slowest (lost: +67% at 96K, see docs/results.md)
 # PAIR: the wave pair of a query block splits by role instead of head_dim: wave A holds all of Q, runs the 16 QK MMAs
 # (two 8-MMA chains, dims 0..127 and 128..255, added as the head_dim split adds its partials) and the softmax once, and
@@ -477,7 +481,11 @@ def qnorm_phase2(e, own, root):
         e(f"  %qstot = scalar.addf {root}, %qxs_other : f32")
         total = "%qstot"
     e("  %qhd256 = scalar.constant 256.0 : f32")
-    e(f"  %qmean = scalar.divf {total}, %qhd256 : f32")
+    if PRO_FAST:
+        e("  %qhd256i = scalar.constant 0.00390625 : f32")
+        e(f"  %qmean = scalar.mulf {total}, %qhd256i : f32")
+    else:
+        e(f"  %qmean = scalar.divf {total}, %qhd256 : f32")
     e("  %qme = scalar.addf %qmean, %qeps_s : f32")
     e("  %qinv = scalar.rsqrtf %qme : f32")
     e("  %qsc16 = scalar.constant 0.0625 : f32")
@@ -525,9 +533,18 @@ def qnorm_phase2(e, own, root):
             e(f"{ind}%qrpi{j} = index.cast %qrp{j} : index to i32")
             e(f"{ind}%qrpf{j} = scalar.sitofp %qrpi{j} : i32 to f32")
             e(f"{ind}%qr2p{j} = scalar.mulf %qrtwo, %qrpf{j} : f32")
-            e(f"{ind}%qrex{j} = scalar.divf %qr2p{j}, %qrdim : f32")
-            e(f"{ind}%qrif{j} = scalar.powf<afn> %qrtheta, %qrex{j} : f32")
-            e(f"{ind}%qriv{j} = scalar.divf %qrone, %qrif{j} : f32")
+            if PRO_FAST:
+                e(f"{ind}%qrdimi{j} = scalar.constant 0.015625 : f32")
+                e(f"{ind}%qrex{j} = scalar.mulf %qr2p{j}, %qrdimi{j} : f32")
+                e(f"{ind}%qrif{j} = scalar.powf<afn> %qrtheta, %qrex{j} : f32")
+                e(f"{ind}%qrr0{j} = scalar.divf<nnan|ninf|nsz|arcp> %qrone, %qrif{j} : f32")
+                e(f"{ind}%qrnd{j} = scalar.negf %qrif{j} : f32")
+                e(f"{ind}%qrer{j} = scalar.fmaf %qrnd{j}, %qrr0{j}, %qrone : f32")
+                e(f"{ind}%qriv{j} = scalar.fmaf %qrer{j}, %qrr0{j}, %qrr0{j} : f32")
+            else:
+                e(f"{ind}%qrex{j} = scalar.divf %qr2p{j}, %qrdim : f32")
+                e(f"{ind}%qrif{j} = scalar.powf<afn> %qrtheta, %qrex{j} : f32")
+                e(f"{ind}%qriv{j} = scalar.divf %qrone, %qrif{j} : f32")
             e(f"{ind}%qran{j} = scalar.mulf %qrcur, %qriv{j} : f32")
             e(f"{ind}%qrc{j} = scalar.cosf<afn> %qran{j} : f32")
             e(f"{ind}%qrs{j} = scalar.sinf<afn> %qran{j} : f32")
@@ -3084,8 +3101,11 @@ def gen():
         else:
             e(f"  %egr{f} = vector.divf %ones8, %egd{f} : {V8}")
             e(f"  %eod{f} = vector.divf %og{f}, %lsum8{bs} : {V8}")
-        e(f"  %eov{f} = scf.select %lpos{bs}, %eod{f}, %zeros8 : {V8}")
-        e(f"  %eout{f} = vector.mulf %eov{f}, %egr{f} : {V8}")
+        if PRO_FAST and R2P and EPI_FAST:   # stored rows have sum >= 1
+            e(f"  %eout{f} = vector.mulf %eod{f}, %egr{f} : {V8}")
+        else:
+            e(f"  %eov{f} = scf.select %lpos{bs}, %eod{f}, %zeros8 : {V8}")
+            e(f"  %eout{f} = vector.mulf %eov{f}, %egr{f} : {V8}")
         if not epig:
             e(f"  scf.if {'%ewr' if PAIR or R2P else '%r_live'} {{")
         if TILED_OUT:
