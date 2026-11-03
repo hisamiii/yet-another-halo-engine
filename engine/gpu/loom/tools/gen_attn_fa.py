@@ -193,7 +193,14 @@ GSIG = os.environ.get("GSIG", "")
 GSIG16 = GSIG in ("16", "u16")
 R2P_EPIG = os.environ.get("R2P_EPIG", "1") == "1"   # R2P: epilogue math only in the storing (P.V) waves
 # R2P_LASTB: the last tile's P.V in the P.V waves only (the QK waves' 16 MMAs of it were discarded, beside the real ones)
-R2P_LASTB = os.environ.get("R2P_LASTB", "0") == "1"
+R2P_LASTB = os.environ.get("R2P_LASTB", "1") == "1"
+# R2P_STEER (PERSIST_DYN R2P, register allocation steering, same arithmetic): the next unit's queue atomic before the
+# tile loops (its fetch after them) and one VGPR word carried through the unit loop (tid & an opaque zero, added to the
+# next unit's Q row). With R2P_LASTB (all three: no pair or single one is enough) Loom's allocation gives both tile
+# loops' WMMAs distinct VGPR banks ({A, B, C, C+1} % 4) in every engine chunk HAL surveyed (249 of 249 at contexts
+# 2K..256K, floor/c/rsurvey.py + cover.py; the old default shared banks in ~95% of them: -0.5..-1.3 pts at 4K..64K).
+# Steering is by survey, not by design: re-run it after any change to this kernel
+R2P_STEER = os.environ.get("R2P_STEER", "1") == "1"
 # R2P_GATEPF=D (R2P_EPIG): the whole epilogue under one store guard and each gate fragment loaded D fragments ahead of
 # its use (a schedule fence after it). With a guard per fragment, each join drains vmcnt(0): the 16 gate loads ran one
 # after another, ~14 K ticks per unit of the P.V waves' epilogue (ATT trace). 0: a guard per fragment. Same arithmetic
@@ -597,7 +604,9 @@ def qnorm_phase2(e, own, root):
 def gen():
     L = []
     e = L.append
-    PVAL_LINE = "  %pnext = scf.if %pval -> (index) {" if PERSIST_DYN else "  scf.if %pval {"
+    STEER = PERSIST and PERSIST_DYN and R2P and R2P_STEER
+    PVAL_LINE = ("  %pnext, %pwn = scf.if %pval -> (index, i32) {" if STEER else
+                 "  %pnext = scf.if %pval -> (index) {" if PERSIST_DYN else "  scf.if %pval {")
     punq = "%punq" if "tailfill" in R2P_DIAG and PERSIST_DYN else "%pun"   # the queue's bound
 
     def persist_issue(t):
@@ -810,7 +819,12 @@ def gen():
         e("  %pq_last = index.cast %pql0 : index to i32")
         persist_issue("i")
         persist_finish("i")
-        e("  %pfin = scf.while(%pcur = %pqiu : index) -> (index) {")
+        if STEER:   # the steering word (R2P_STEER) and its opaque zero
+            e(f"  %pwz0 = view.load %pqv[%c2] : view<{PQ_WORDS}xi32> -> i32")   # (queue word 2: always zero)
+            e("  %pwi = scalar.constant 0 : i32")
+            e("  %pfin, %pwf = scf.while(%pcur = %pqiu : index, %pwc = %pwi : i32) -> (index, i32) {")
+        else:
+            e("  %pfin = scf.while(%pcur = %pqiu : index) -> (index) {")
         e("  %wglp = index.add %pcur, %c0 : index")
     elif PERSIST:
         e("  scf.for %pr = [%c0 to %prn step %c1] {")
@@ -1033,7 +1047,13 @@ def gen():
     qnorm_before = qnorm_after = None
     if qdirect:
         assert Q16 and (not K4 or QROT)
-        e("  %qdq = index.min %r_lq, %B_1 : index")
+        if STEER:
+            e("  %pwca = index.cast %pwc : i32 to index")
+            e("  %pwq = index.assume %pwca [range(%pwca, 0, 256)] : index")
+            e("  %r_lqw = index.add %r_lq, %pwq : index")
+            e("  %qdq = index.min %r_lqw, %B_1 : index")
+        else:
+            e("  %qdq = index.min %r_lq, %B_1 : index")
         if "qhot" in R2P_DIAG:   # diag: Q rows read from the first 64-row block (cache hot), RoPE positions unchanged
             e("  %qhot64 = index.constant 64 : index")
             e("  %qdqh = index.rem %qdq, %qhot64 : index")
@@ -2421,6 +2441,8 @@ def gen():
             e(f"    scf.yield {', '.join(outs)}, %nmax, %nsum : {types}")
         e("  }")
 
+    if STEER:
+        persist_issue("n")
     if R2P:
         # log2e x opaque 1 (exact): as a literal it keeps the exponent multiplies from pairing (VOPD)
         e("  %r2l2e = scalar.mulf %log2e, %one_o : f32")
@@ -2545,6 +2567,8 @@ def gen():
                 e("  } else {")
                 e(f"  scf.yield %c16, {', '.join(f'%nb{f}_p0' for f in range(16))}, %qmax_p0, %qsum_p0 : index, {rtypes}, f32, f32")
                 e("  }")
+        if STEER:
+            persist_finish("n")
         e("  scf.if %isA {")
         e("    view.store %gsum, %ls_view[%pa_own] : f32, view<64xf32>")
         e("  }")
@@ -2554,6 +2578,9 @@ def gen():
         e("  %ltl = index.sub %ltl1, %c1 : index")
         e("  %lks = index.mul %ltl, %c16 : index")
         lv = load_v("%lks", "lv", "  ")
+        if STEER:
+            e("  %pwti = index.cast %tid : index to i32")
+            e("  %pws = scalar.andi %pwti, %pwz0 : i32")
         stage_v(lv, "%c0", "lsv", "  ")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         e("  %lpar = index.rem %ltl, %c2 : index")
@@ -2634,7 +2661,7 @@ def gen():
             e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
             e("  %lsum_l = view.load %ls_view[%pa_own] : view<64xf32> -> f32")
 
-    if PERSIST and PERSIST_DYN:   # the next unit's atomic before the epilogue's stores, its latency under the epilogue
+    if PERSIST and PERSIST_DYN and not STEER:   # the next unit's atomic before the epilogue's stores
         persist_issue("n")
     if R2P and R2P_TPRIO:
         e(f"  kernel.priority {{level = {R2P_TPRIO}}}")
@@ -2864,15 +2891,17 @@ def gen():
         e("    view.atomic.reduce<addi> %oc_one, %oc_v[%oc_i] {ordering = release, scope = device} : i32, view<[%oc_n]xi32>")
         e("  }")
     if PERSIST and PERSIST_DYN:
-        persist_finish("n")
-        e("  scf.yield %pqnu : index")
+        if not STEER:
+            persist_finish("n")
+        w, wt = (", %pws", ", i32") if STEER else ("", "")
+        e(f"  scf.yield %pqnu{w} : index{wt}")
         e("  } else {")
-        e(f"  scf.yield {punq} : index")
+        e(f"  scf.yield {punq}{', %pwc' if STEER else ''} : index{wt}")
         e("  }")
         e(f"  %pcont = index.cmp ult, %pnext, {punq} : index")
-        e("  scf.condition %pcont, %pnext : i1, index")
-        e("  } do(%pw: index) {")
-        e("  scf.yield %pw : index")
+        e(f"  scf.condition %pcont, %pnext{', %pwn' if STEER else ''} : i1, index{wt}")
+        e(f"  }} do(%pw: index{', %pwd: i32' if STEER else ''}) {{")
+        e(f"  scf.yield %pw{', %pwd' if STEER else ''} : index{wt}")
         e("  }")
     elif PERSIST:
         e("  }")   # scf.if %pval
