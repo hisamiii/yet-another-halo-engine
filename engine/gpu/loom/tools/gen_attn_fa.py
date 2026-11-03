@@ -162,8 +162,9 @@ PAIR = False
 # barrier, phase 2 softmax || K(ks + 16) stored + P.V(ks - 16), barrier. Half the LDS fragment reads of the head_dim
 # split, no duplicated softmax, 191 VGPRs (4 workgroups per WGP). The main kernel's arithmetic (bit-identical). DOWHILE.
 R2P = False
-R2P_QKF = 1         # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each)
+R2P_QKF = 1         # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
 R2P_PVF = 1         # R2P: the same for the V^T fragments
+R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
 PAIR_MAP = "mod"    # "mod": pair = waves (p, p + 4), one A and one B per SIMD; "adj": (2p, 2p + 1)
 PAIR_LATE = True    # PAIR: K / V staging loads in phase 2 (fewer VGPRs, but their latency is exposed: off when deployed)
 PAIR_BFIRST = False # PAIR: the P.V (B) arm first in the role branch
@@ -1766,7 +1767,7 @@ def gen():
         e(f"    %nnml8 = vector.splat %nnml : {V8}")
         e(f"    %nmax8 = vector.splat %nmax : {V8}")
         e(f"    %pd8 = vector.subf {s}, %nmax8 : {V8}")
-        e(f"    %pl = vector.mulf %pd8, %log2e8 : {V8}")
+        e(f"    %pl = vector.mulf %pd8, {'%r2l2e8' if R2P else '%log2e8'} : {V8}")
         e(f"    %p = vector.exp2f<afn> %pl : {V8}")
         # keys 8h..8h+3 and 8h+4..8h+7: HIP's 4-lane segments
         for g in range(2):
@@ -1792,6 +1793,20 @@ def gen():
             e(f"    %pm{i} = scalar.fmaf %pe{i}, %one_o, %zero_o : f32")
             e(f"    %pt{i} = scalar.fptrunc %pm{i} : f32 to f16")
         e(f"    %ph = vector.from_elements {', '.join(f'%pt{i}' for i in range(8))} : {V8H}")
+        if pair_slot is not None and R2P and R2P_PSB:
+            # the slot by a uniform branch on the tile parity: each arm's addresses are loop-invariant + an immediate
+            # (as a runtime row index Loom rebuilds them every tile: v_mov of the parity, 2 lshl_add, 2 lshl)
+            e("    %psl0 = index.cmp eq, %kpar, %c0 : index")
+            e("    scf.if %psl0 {")
+            e(f"      vector.store %ph, %pp_view[%prow_own, %c0] : {V8H}, view<256x8xf16>")
+            e("      view.store %rss, %al_view[%pa_own] : f32, view<128xf32>")
+            e("    } else {")
+            e("      %pwr1 = index.add %prow_own, %c128p : index")
+            e("      %pwa1 = index.add %pa_own, %c64 : index")
+            e(f"      vector.store %ph, %pp_view[%pwr1, %c0] : {V8H}, view<256x8xf16>")
+            e("      view.store %rss, %al_view[%pwa1] : f32, view<128xf32>")
+            e("    }")
+            return None
         if pair_slot is not None:
             rows, alb = pair_slot
             e(f"    %pwr = index.add {rows}, %prow_own : index")
@@ -2796,6 +2811,9 @@ def gen():
         e("  %isB = index.cmp ne, %prole, %c0 : index")
         e("  %ewr = scalar.andi %r_live, %isB : i1")
     elif R2P:
+        # log2e x opaque 1 (exact): as a literal it keeps the exponent multiplies from pairing (VOPD)
+        e("  %r2l2e = scalar.mulf %log2e, %one_o : f32")
+        e(f"  %r2l2e8 = vector.splat %r2l2e : {V8}")
         if DIAG_MASK and DIAG_SWAP:   # the softmax mask test's wave-uniform terms
             e("  %r2ml0 = index.add %r_abs, %c1 : index")
             e("  %r2ml1 = index.min %r2ml0, %ctx_end : index")
