@@ -875,6 +875,10 @@ def gen():
         e(f"  %pP1 = index.constant {PERSIST - 1} : index")
         e("  %prn0 = index.add %pun, %pP1 : index")
         e("  %prn = index.div %prn0, %pP : index")                 # rounds
+        if "tailfill" in R2P_DIAG and PERSIST_DYN:   # diag: the queue runs whole rounds, ids past the units wrap (same stores)
+            e("  %punq = index.mul %prn, %pP : index")
+        else:
+            e("  %punq = index.add %pun, %c0 : index")
         e("  %pslot = kernel.workgroup.id<x> : index")
         e("  %pslotr = index.sub %pP1, %pslot : index")
     if PERSIST and PERSIST_DYN:
@@ -882,7 +886,7 @@ def gen():
         e(f"  %pqv = buffer.view %pq_na[%base] : buffer -> view<{PQ_WORDS}xi32>")
         e("  %pq_one = scalar.constant 1 : i32")
         e("  %pq_zero = scalar.constant 0 : i32")
-        e("  %pql0 = index.add %pun, %pP1 : index")
+        e("  %pql0 = index.add %punq, %pP1 : index")
         e("  %pq_last = index.cast %pql0 : index to i32")
         persist_issue("i")
         persist_finish("i")
@@ -907,11 +911,15 @@ def gen():
         e("  %prb = index.mul %prx, %pP : index")
         e("  %wglp = index.add %prb, %psl : index")
     if PERSIST:
-        e("  %pval = index.cmp ult, %wglp, %pun : index")
+        e("  %pval = index.cmp ult, %wglp, %punq : index")
         e(PVAL_LINE)
         # the previous unit's LDS readers (epilogue row sums, P^T / V^T slots) are done before this unit stages
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        e("  %wgl = index.assume %wglp [range(%wglp, 0, 1048576), lt(%wglp, %pun)] : index")
+        if "tailfill" in R2P_DIAG and PERSIST_DYN:
+            e("  %wglw = index.rem %wglp, %pun : index")
+            e("  %wgl = index.assume %wglw [range(%wglw, 0, 1048576), lt(%wglw, %pun)] : index")
+        else:
+            e("  %wgl = index.assume %wglp [range(%wglp, 0, 1048576), lt(%wglp, %pun)] : index")
     else:
         e("  %wgx = kernel.workgroup.id<x> : index")
         e("  %wgy = kernel.workgroup.id<y> : index")
@@ -1178,7 +1186,12 @@ def gen():
     if qdirect:
         assert Q16 and (not K4 or QROT)
         e("  %qdq = index.min %r_lq, %B_1 : index")
-        e("  %qdrow = index.mul %qdq, %c6144 : index")
+        if "qhot" in R2P_DIAG:   # diag: Q rows read from the first 64-row block (cache hot), RoPE positions unchanged
+            e("  %qhot64 = index.constant 64 : index")
+            e("  %qdqh = index.rem %qdq, %qhot64 : index")
+            e("  %qdrow = index.mul %qdqh, %c6144 : index")
+        else:
+            e("  %qdrow = index.mul %qdq, %c6144 : index")
         e("  %qdh = index.mul %r_head, %c256 : index")
         e("  %qdb0 = index.add %qdrow, %qdh : index")
         e("  %qdb = index.add %qdb0, %hd128 : index")
@@ -1814,7 +1827,10 @@ def gen():
                 if r2m:   # min over live lanes of (lim + ks) - ks >= 8, no dead row: exactly the vote below
                     e("    %mksi = index.cast %ks_ : index to i32")
                     e("    %mrem = scalar.subi %r2mlb, %mksi : i32")
-                    e("    %mallok = scalar.cmpi sge, %mrem, %mc8 : i32")
+                    if "nomask" in R2P_DIAG:   # diag: never mask (diagonal / context-end scores pass through)
+                        e("    %mallok = index.cmp eq, %c0, %c0 : index")
+                    else:
+                        e("    %mallok = scalar.cmpi sge, %mrem, %mc8 : i32")
                     e(f"    %smask = scf.if %mallok -> ({V8}) {{")
                     e(f"      scf.yield %s0 : {V8}")
                     e("    } else {")
@@ -3395,9 +3411,9 @@ def gen():
         persist_finish("n")
         e("  scf.yield %pqnu : index")
         e("  } else {")
-        e("  scf.yield %pun : index")
+        e("  scf.yield %punq : index")
         e("  }")
-        e("  %pcont = index.cmp ult, %pnext, %pun : index")
+        e("  %pcont = index.cmp ult, %pnext, %punq : index")
         e("  scf.condition %pcont, %pnext : i1, index")
         e("  } do(%pw: index) {")
         e("  scf.yield %pw : index")
