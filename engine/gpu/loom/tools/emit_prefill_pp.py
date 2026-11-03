@@ -1045,7 +1045,9 @@ AF = {
     ("iq4xs", "kstore", 64, 20): dict(AF_PIPE),                                 # -15.7%
     ("q4k", "kstore", 64, 20): dict(AF_KQP),                                    # -16.0%
     ("q5k", "kstore", 64, 20): dict(AF_KQP, ksl=True),                          # -10.4%
-    ("q6k", "kstore", 64, 20): dict(AF_KQ, ksl=True, wlate=True),               # -10.2% (208 VGPRs: 32 workgroups anyway)
+    # B prefetch (AF_KQP) since it fits the 192 tier (it was 208 VGPRs): the attention segs with a Q6_K v rider (layers
+    # 23, 63) 16.34 / 16.37 -> 16.14 / 16.17 Mcyc per call (-1.2%, 89.7 -> 90.8% of floor), bit-identical (11-03)
+    ("q6k", "kstore", 64, 20): dict(AF_KQP, ksl=True),
     # IQ2: the grid / sign lookups leave no room for B prefetch (bpre 1-2: 208-216 VGPRs, one workgroup per WGP)
     ("iq2xxs", "kstore", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),   # -19.3%
     ("iq2xxs", "swiglu", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),   # -16.6%
