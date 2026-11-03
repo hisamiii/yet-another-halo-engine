@@ -114,6 +114,7 @@ def main():
     ap.add_argument("--depths", default="0,8192")
     ap.add_argument("--tag", default=os.path.expanduser("~/yah-scratch/attn_bench"))
     ap.add_argument("--inputs", help="real Q / K / V: <prefix>.q, .kpool, .vpool (loom_prefill YAH_FPS_DUMP), one depth")
+    ap.add_argument("--counters", default="", help="more HRX counters (e.g. SQ_INSTS_VALU,SQ_WAVES): per-call totals")
     ap.add_argument("variants", nargs="+")
     a = ap.parse_args()
     depths = [int(d) for d in a.depths.split(",")]
@@ -130,6 +131,7 @@ def main():
         env.update(e.split("=", 1) for e in envs)
         variants.append((name, src, text, env, lay))
     report = []
+    extra = [c for c in a.counters.split(",") if c]
     if len({v[4] for v in variants}) > 1:
         sys.exit("variants of one run must share a buffer layout (f32 Q or f16 Q)")
     for depth in depths:
@@ -151,7 +153,7 @@ def main():
         if os.path.exists(prof):
             os.remove(prof)
         env = dict(os.environ, **({"ATTN_BENCH_ZERO": str(len(bufs) - 1)} if bufs[-1] == "z:1056" else {}), YAH_HRX=hrx_paths.HRX, CQ_MEM_GB="6", YAH_NPU="0", HRX_PROFILE_MODE="counters",
-                   HRX_PROFILE_COUNTERS="SQ_BUSY_CYCLES", HRX_PROFILE_FILE=prof)
+                   HRX_PROFILE_COUNTERS=",".join(["SQ_BUSY_CYCLES"] + extra), HRX_PROFILE_FILE=prof)
         cmd = ["bash", "-c", f"set +u; a=(\"$@\"); set --; source {ROOT}/engine/hrx-env.sh >/dev/null 2>&1; exec \"${{a[@]}}\"", "x",
                f"{ROOT}/engine/run/gpu_run.sh", "gpuonly", "--", f"{ROOT}/engine/build/attn_bench", str(a.reps),
                str(len(bufs))] + bufs + hals
@@ -160,13 +162,15 @@ def main():
         if r.returncode or len(firsts) != len(hals):
             sys.exit(f"attn_bench failed at depth {depth}:\n" + (r.stdout + r.stderr)[-2000:])
         tool = os.path.join(hrx_paths.BUILD, "runtime/src/iree/tools/iree-profile/iree-profile")
-        samples = {}
+        samples, totals = {}, {}
         for line in subprocess.run([tool, "counter", "--format=jsonl", "--counter_samples", prof],
                                    capture_output=True, text=True).stdout.splitlines():
             d = json.loads(line)
             if d.get("type") == "counter_sample" and d["counter"] == "SQ_BUSY_CYCLES":
                 v = d.get("values") or [d["value"]]
                 samples[d["dispatch_event_id"]] = (sum(v) / len(v), max(v), d.get("duration_ticks", 0))
+            elif d.get("type") == "counter_sample" and d["counter"] in extra:
+                totals[d["dispatch_event_id"], d["counter"]] = sum(d.get("values") or [d["value"]])
         ids = sorted(samples)
         n = len(hals)
         if len(ids) != n * (1 + a.reps):
@@ -179,7 +183,9 @@ def main():
             us = statistics.median(x[2] for x in rows) / 100
             report.append((depth, name, firsts[k][1], mean, mx, us, floor))
             print(f"depth {depth:6d} {name:12s} hash {firsts[k][1]}  busiest SQ {mx / 1e6:8.3f} Mcyc ({100 * floor / mx:5.1f}% "
-                  f"of floor)  mean SQ {mean / 1e6:8.3f} ({100 * floor / mean:5.1f}%)  wall {us:9.1f} us", flush=True)
+                  f"of floor)  mean SQ {mean / 1e6:8.3f} ({100 * floor / mean:5.1f}%)  wall {us:9.1f} us" +
+                  "".join(f"  {c} {statistics.median(totals[ids[n + r * n + k], c] for r in range(a.reps)):.4g}"
+                          for c in extra), flush=True)
         os.remove(prof)
     return report
 
