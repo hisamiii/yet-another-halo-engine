@@ -1,0 +1,20 @@
+libhrx: HRX_PROFILE_FILTER=<glob> sets the profiling capture filter to the executable functions whose names match,
+which executable (ATT) trace capture requires. Diagnostics only.
+--- a/libhrx/src/libhrx/runtime.c
++++ b/libhrx/src/libhrx/runtime.c
+@@ -684,6 +684,15 @@
+     options.counter_set_count = 1;
+     options.counter_sets = &counter_set;
+   }
++  // HRX_PROFILE_FILTER=<glob>: profile only executable functions whose names
++  // match (executable traces require a filter).
++  const char* filter_env = getenv("HRX_PROFILE_FILTER");
++  if (filter_env && filter_env[0]) {
++    options.capture_filter.flags =
++        IREE_HAL_PROFILE_CAPTURE_FILTER_FLAG_EXECUTABLE_FUNCTION_PATTERN;
++    options.capture_filter.executable_function_pattern =
++        iree_make_cstring_view(filter_env);
++  }
+   iree_status_t status =
+       iree_hal_device_profiling_begin(device->hal_device, &options);
+   if (iree_status_is_ok(status)) {

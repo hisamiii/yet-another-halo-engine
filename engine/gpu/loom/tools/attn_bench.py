@@ -115,6 +115,7 @@ def main():
     ap.add_argument("--tag", default=os.path.expanduser("~/yah-scratch/attn_bench"))
     ap.add_argument("--inputs", help="real Q / K / V: <prefix>.q, .kpool, .vpool (loom_prefill YAH_FPS_DUMP), one depth")
     ap.add_argument("--counters", default="", help="more HRX counters (e.g. SQ_INSTS_VALU,SQ_WAVES): per-call totals")
+    ap.add_argument("--att", action="store_true", help="HRX ATT thread trace (one rep): decoded to <tag>/att_<depth>.txt")
     ap.add_argument("variants", nargs="+")
     a = ap.parse_args()
     depths = [int(d) for d in a.depths.split(",")]
@@ -154,6 +155,9 @@ def main():
             os.remove(prof)
         env = dict(os.environ, **({"ATTN_BENCH_ZERO": str(len(bufs) - 1)} if bufs[-1] == "z:1056" else {}), YAH_HRX=hrx_paths.HRX, CQ_MEM_GB="6", YAH_NPU="0", HRX_PROFILE_MODE="counters",
                    HRX_PROFILE_COUNTERS=",".join(["SQ_BUSY_CYCLES"] + extra), HRX_PROFILE_FILE=prof)
+        if a.att:
+            env.update(HRX_PROFILE_MODE="executable", HRX_PROFILE_FILTER="yah_attn*")
+            env.pop("HRX_PROFILE_COUNTERS")
         cmd = ["bash", "-c", f"set +u; a=(\"$@\"); set --; source {ROOT}/engine/hrx-env.sh >/dev/null 2>&1; exec \"${{a[@]}}\"", "x",
                f"{ROOT}/engine/run/gpu_run.sh", "gpuonly", "--", f"{ROOT}/engine/build/attn_bench", str(a.reps),
                str(len(bufs))] + bufs + hals
@@ -162,6 +166,12 @@ def main():
         if r.returncode or len(firsts) != len(hals):
             sys.exit(f"attn_bench failed at depth {depth}:\n" + (r.stdout + r.stderr)[-2000:])
         tool = os.path.join(hrx_paths.BUILD, "runtime/src/iree/tools/iree-profile/iree-profile")
+        if a.att:   # decode and keep the trace text; no counters in this mode
+            out = os.path.join(a.tag, f"att_{depth}.txt")
+            d = subprocess.run([tool, "att", "--format=text", prof], capture_output=True, text=True)
+            open(out, "w").write(d.stdout + d.stderr)
+            print(f"depth {depth}: ATT rc {d.returncode}, {len(d.stdout)} bytes -> {out}", flush=True)
+            continue
         samples, totals = {}, {}
         for line in subprocess.run([tool, "counter", "--format=jsonl", "--counter_samples", prof],
                                    capture_output=True, text=True).stdout.splitlines():

@@ -166,8 +166,8 @@ PAIR = False
 # barrier, phase 2 softmax || K(ks + 16) stored + P.V(ks - 16), barrier. Half the LDS fragment reads of the head_dim
 # split, no duplicated softmax, 191 VGPRs (4 workgroups per WGP). The main kernel's arithmetic (bit-identical). DOWHILE.
 R2P = False
-R2P_QKF = 1         # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
-R2P_PVF = 1         # R2P: the same for the V^T fragments
+R2P_QKF = int(os.environ.get("R2P_QKF", "1"))   # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
+R2P_PVF = int(os.environ.get("R2P_PVF", "1"))   # R2P: the same for the V^T fragments
 R2P_PSB = True      # R2P: P^T / alpha slot stores under a parity branch
 R2P_PVB = os.environ.get("R2P_PVB", "1") == "1"   # R2P, P.V: P^T / alpha loads through byte views, loop-invariant lane
                     # byte address + the slot's uniform byte offset (1 v_add per base; a row index costs 3 per load)
