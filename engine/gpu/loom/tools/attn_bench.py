@@ -23,32 +23,55 @@ import hrx_paths  # noqa: E402
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../.."))
 B, HEADS, KV_HEADS, HD = 2048, 24, 4, 256
 FLOOR_MACS_PER_CYCLE = 10240   # 40 CUs x 2 SIMDs x one 16x16x16 f16 WMMA (4096 MACs) per 32 cycles
-# The kernel's buffer size formulas this harness knows how to size (fp16 paged K / V^T, f32 Q / gate, q-norm weight).
-SIZE_LINES = [
-    "launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer, %ptab: buffer, %qnw: buffer, %qeps: buffer)",
+# The kernels' buffer size formulas this harness knows how to size: fp16 paged K / V^T, f32 gate, and either f32 Q with the
+# q-norm weight + eps (the main kernel) or rotated f16 Q (the "_qr" kernels kv4 runs on its dequantized f16 pools).
+COMMON = [
     "%qtot = index.mul %B, %c6144 : index",
     "%npages = index.div %npg0, %c256 : index",
     "%pcap = index.mul %npages, %c256 : index",
     "%kvtot = index.mul %pcap, %c1024 : index",
     "%vpitch = index.mul %vtiles, %c16 : index",
     "%vtot = index.mul %vpitch, %c1024 : index",
-    "%q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf32>",
     "%g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>",
     "%o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>",
     "%k_flat = buffer.view %k_na[%base] : buffer -> view<[%kvtot]xf16>",
     "%v_flat = buffer.view %v_na[%base] : buffer -> view<[%vtot]xf16>",
     "%pt_flat = buffer.view %pt_na[%base] : buffer -> view<[%npages]xi32>",
-    "%qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>",
-    "%qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>",
 ]
+LAYOUTS = {
+    "f32q": COMMON + [
+        "launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer, %ptab: buffer, %qnw: buffer, %qeps: buffer)",
+        "%q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf32>",
+        "%qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>",
+        "%qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>",
+    ],
+    "f16q": COMMON + [
+        "launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer, %ptab: buffer)",
+        "%q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf16>",
+    ],
+}
 
 
-def check_source(text, path):
-    missing = [s for s in SIZE_LINES if s not in text]
-    if missing:
-        sys.exit(f"refused {path}: its buffer size formulas differ from the harness's:\n  " + "\n  ".join(missing))
+def layout(text, path):
+    """The layout whose size formulas all appear in the source; refuse the source otherwise."""
+    for name, lines in LAYOUTS.items():
+        if all(x in text for x in lines):
+            break
+    else:
+        sys.exit(f"refused {path}: its buffer size formulas match no harness layout")
     if re.search(r"%lse\w* = buffer\.view", text) or re.search(r"view\.store [^\n]*%lse", text):
         sys.exit(f"refused {path}: it writes lse; size it in the harness first")
+    return name
+
+
+def buffers(lay, depth):
+    npages = (depth + B + 255) // 256
+    pcap = npages * 256
+    vpitch = (pcap + 15) // 16 * 16
+    q = f"s:{B * 6144 * 4}:1" if lay == "f32q" else f"h:{B * 6144 * 2}:1"
+    bufs = [q, f"s:{B * 6144 * 4}:2", f"h:{pcap * 1024 * 2}:3", f"h:{vpitch * 1024 * 2}:4", f"z:{B * 6144 * 2}",
+            f"z:{B * HEADS * 4}", f"p:{npages}"]
+    return bufs + (["c:256:1.0", "c:1:0.000001"] if lay == "f32q" else [])
 
 
 def grid(text):
@@ -93,20 +116,17 @@ def main():
         name, spec = v.split("=", 1)
         src, *envs = spec.split(",")
         text = open(src).read()
-        check_source(text, src)
+        lay = layout(text, src)
         env = {"LOOM_EXP_LICM": "1", **({"LOOM_EXP_LICM_MAX_LIVE": "6"} if "_kt2" in src else {})}
         env.update(e.split("=", 1) for e in envs)
-        variants.append((name, src, text, env))
+        variants.append((name, src, text, env, lay))
     report = []
+    if len({v[4] for v in variants}) > 1:
+        sys.exit("variants of one run must share a buffer layout (f32 Q or f16 Q)")
     for depth in depths:
-        cap = depth + B
-        npages = (cap + 255) // 256
-        pcap = npages * 256
-        vpitch = (pcap + 15) // 16 * 16
-        bufs = [f"s:{B * 6144 * 4}:1", f"s:{B * 6144 * 4}:2", f"h:{pcap * 1024 * 2}:3", f"h:{vpitch * 1024 * 2}:4",
-                f"z:{B * 6144 * 2}", f"z:{B * HEADS * 4}", f"p:{npages}", "c:256:1.0", "c:1:0.000001"]
+        bufs = buffers(variants[0][4], depth)
         hals = []
-        for name, src, text, env in variants:
+        for name, src, text, env, _ in variants:
             gx, gy = grid(text)
             hals.append(f"{compile_hal(src, text, env, depth, a.tag)}@{gx},{gy}")
         prof = os.path.join(a.tag, "run.irpf")
