@@ -62,6 +62,7 @@ QNORM = False
 # QG16: q and gate arrive as f16 (the kqg GEMM's f16 epilogue, emit_prefill_pp.QG16); with QNORM the prologue widens q
 QG16 = False
 QX_OFF = 0          # QNORM: LDS offset of the sums slot (set by gen)
+QW_OFF = 0          # R2P_QPF: LDS offset of the norm weights (set by gen)
 # PIPE2_EARLY: the QK of tile j+1 goes in before the softmax's rescale branch (its loads stay after it: a branch join
 # drains outstanding global loads)
 PIPE2_EARLY = False
@@ -222,6 +223,27 @@ R2P_GATEPF = int(os.environ.get("R2P_GATEPF", "1"))
 # nosum (no row sum); nobara / nobarb (only barrier A / B); chain4 (4 QK accumulator chains of 4); occ3 (LDS
 # floor for 3 workgroups per WGP)
 R2P_DIAG = set(filter(None, os.environ.get("R2P_DIAG", "").split(",")))
+# R2P_QPF (R2P_K2 QNORM PERSIST_DYN STEER): the next unit's Q prologue in the QK waves' tail, under the P.V waves' last
+# P.V and epilogue (the QK waves sat at the next unit's first barrier: ~14 % of the depth-0 wave time was the Q prologue,
+# ATT trace). The tail stages the next unit's K(0), loads both head blocks' raw f32 Q (this wave's head-dim half) and
+# stores their sums of squares (K slot 1: idle until the P.V waves stage K(1) after tile 0's barrier A); the raw Q rides
+# the unit loop. The unit top: phase 2 of both blocks in the QK waves only (own sums read back), no halves exchange.
+R2P_QPF = os.environ.get("R2P_QPF", "0") == "1"
+# (R2P_QPF moves 64 VGPRs of Q state across the unit loop: 200..240 VGPRs, spills; the tile loops' own peak is ~191)
+# R2P_QTOUCH (QNORM PERSIST_DYN STEER): in the tail, the QK waves (idle: the P.V waves run the last P.V and epilogue)
+# touch every 128-B line of the next unit's f32 Q rows (8 b32 loads a lane, folded into one LDS word) so the unit
+# top's Q loads hit L2: ~8 K ticks of their wait per unit were DRAM misses (ATT trace, depth 0)
+R2P_QTOUCH = os.environ.get("R2P_QTOUCH", "0") == "1"
+# R2P_SUMLATE: the QK wave's row sum after its P^T store (the sum is next tile's; the store feeds barrier B)
+R2P_SUMLATE = os.environ.get("R2P_SUMLATE", "0") == "1"
+# R2P_PST4: P^T stored as 4 dwords (f16 pairs): the converts' halves need no copy into a b128 tuple (4 v_mov + nop)
+R2P_PST4 = os.environ.get("R2P_PST4", "0") == "1"
+# R2P_QSPLIT (QNORM): the kqg GEMM did the Q head norm's per-element part. The q buffer (f32-sized) holds f16 q at the
+# f32 q's indices (= f16(q w / 16); dims 0..63 unused), the raw f32 rotary dims [token][head][64] at byte B * 12288,
+# and f32 sums of q^2 per 16-dim group [token][head][16] at B * 18432 (ends at B * 19968 <= the f32 q's B * 24576):
+# one f16 rounding per element, as the attention's own. The attention RoPEs dims 0..63 (f32), and the norm's 1 / rms scales S (r log2e in place of log2e).
+R2P_QSPLIT = os.environ.get("R2P_QSPLIT", "0") == "1"
+R2P_QPFW = os.environ.get("R2P_QPFW", "0") == "1"   # R2P_QPF: the norm weights from an LDS copy (+1 KB: a 32 KB pool)
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
 # PERSIST = P > 0: P workgroups (one per slot: 20 WGPs x 4) each run a list of units (query block, head pair) in a
@@ -466,9 +488,51 @@ def qnorm_phase1(e):
     e("  %qnb = index.add %qdb, %qh16 : index")
     for n in sorted({32 * k + 4 * j for k in range(nown) for j in range(4)}):
         e(f"  %qo{n} = index.constant {n} : index")
-    vecs = qnorm_load(e, "qxv", "%q_flat", "%qtot", "%qnb", range(nown), QG16)
+    if R2P_QSPLIT:
+        return qsplit_phase1(e, nown), lambda: None
+    vecs = qnorm_load(e, "qxv", "%q_flat", "%qtot", "%qnb", range(nown), QG16 or "q16" in R2P_DIAG)
     own = [[f"%qx{k}e{j}" for j in range(16)] for k in range(nown)]
     return own, lambda: qnorm_sums(e, vecs, nown)
+
+
+def qsplit_phase1(e, nown):
+    """R2P_QSPLIT: the block's final f16 halves (two V8H per local fragment), the raw f32 rotary dims of fragments 0
+    and 1 (used by the head-dim-0 waves only), and the lane's query's sums of squares (its own head for QK waves)"""
+    e("  %qsp_c4 = index.constant 4 : index")
+    e("  %qsp_c128 = index.constant 128 : index")
+    e("  %qsp_c8 = index.constant 8 : index")
+    halves = []
+    for k in range(nown):
+        e(f"  %qsa{k} = index.add %qnb, %qo{32 * k} : index")
+        e(f"  %qsb{k} = index.add %qsa{k}, %qsp_c8 : index")
+        e(f"  %qslo{k} = vector.load %q_flat[%qsa{k}] : view<[%qtot]xf16> -> {V8H}")
+        e(f"  %qshi{k} = vector.load %q_flat[%qsb{k}] : view<[%qtot]xf16> -> {V8H}")
+        halves.append((f"%qslo{k}", f"%qshi{k}"))
+    e("  %qsph = scf.select %isA, %r_head, %r_head_o : index")   # the block's head (as %qdbn)
+    e("  %qsp_c1536b = index.constant 1536 : index")
+    e("  %qsp_c64 = index.constant 64 : index")
+    e("  %qsp_c48b = index.constant 384 : index")
+    e("  %qsp_c2 = index.constant 16 : index")
+    e("  %qrt = index.mul %qdq, %qsp_c1536b : index")
+    e("  %qrh = index.mul %qsph, %qsp_c64 : index")
+    e("  %qrbase1 = index.add %qrt, %qrh : index")    # (token * 24 + head) * 64
+    e("  %qrbase = index.add %qrbase1, %qh16 : index")
+    rot = []
+    for k in range(2):
+        vs = []
+        for j in range(4):
+            e(f"  %qrx{k}_{j}a = index.add %qrbase, %qo{32 * k + 4 * j} : index")
+            e(f"  %qrx{k}_{j} = vector.load %qr_flat[%qrx{k}_{j}a] : view<[%qrtot]xf32> -> {V4}")
+            vs.append(f"%qrx{k}_{j}")
+        rot.append(vs)
+    e("  %qst = index.mul %qdq, %qsp_c48b : index")
+    e("  %qsh = index.mul %qsph, %qsp_c2 : index")
+    e("  %qsbase = index.add %qst, %qsh : index")   # (token * 24 + head) * 16
+    for x in range(4):
+        e(f"  %qsbc{x} = index.constant {4 * x} : index")
+        e(f"  %qsbase{x} = index.add %qsbase, %qsbc{x} : index")
+        e(f"  %qssl{x} = vector.load %qs_flat[%qsbase{x}] : view<[%qsstot]xf32> -> {V4}")
+    return halves, rot
 
 
 def qnorm_sums(e, vecs, nown):
@@ -499,15 +563,11 @@ def qnorm_sums(e, vecs, nown):
     return root
 
 
-def qnorm_phase2(e, own, root):
-    """QNORM after the prologue barrier: the head sum, x inv x weight, RoPE, f16(q / 16), traded into %qdv{c}"""
-    nown = len(own)
-    e("  %qw_na, %qe_na = buffer.assume.noalias %qnw, %qeps : buffer, buffer")
-    e("  %qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>")
-    e("  %qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>")
-    e("  %qwb = index.add %hd128, %qh16 : index")
-    wv = qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", range(nown))
-    e("  %qeps_s = view.load %qe_flat[%c0] : view<[%c1]xf32> -> f32")
+QN_NW = []   # (qnorm_phase2_norm's normed x weight rows, read back by qnorm_phase2)
+
+
+def qnorm_phase2_norm(e, own, root, wv, nown):
+    """QNORM: the head sum of squares, x inv x weight (the f16 conversion and RoPE follow in qnorm_phase2)"""
     e("  %qxs_ot0 = index.sub %c16, %hd16q : index")
     e("  %qxs_ot = index.add %qxs1, %qxs_ot0 : index")
     e(f"  %qxs_other = view.load %qxs_view[%qxs_ot] : view<{NQB * 2 * 16}xf32> -> f32")
@@ -530,7 +590,27 @@ def qnorm_phase2(e, own, root):
             e(f"  %qnw{k}_{j} = scalar.mulf %qn{k}_{j}, {w[j]} : f32")
             row.append(f"%qnw{k}_{j}")
         return row
-    nw = ([norm_row(k) for k in range(nown)])
+    QN_NW[:] = [[None] * nown if R2P_QPF else ([norm_row(k) for k in range(nown)]), norm_row]
+
+
+def qnorm_phase2(e, own, root):
+    """QNORM after the prologue barrier: the head sum, x inv x weight, RoPE, f16(q / 16), traded into %qdv{c}"""
+    if R2P_QSPLIT:
+        nown = len(own[0])
+    else:
+        nown = len(own)
+    e("  %qw_na, %qe_na = buffer.assume.noalias %qnw, %qeps : buffer, buffer")
+    e("  %qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>")
+    e("  %qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>")
+    e("  %qwb = index.add %hd128, %qh16 : index")
+    wv = {} if R2P_QPF else qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", range(2 if R2P_QSPLIT else nown))
+    e("  %qeps_s = view.load %qe_flat[%c0] : view<[%c1]xf32> -> f32")
+    if R2P_QSPLIT:
+        qs_nw, qs_halves = qsplit_phase2(e, own, wv)
+    else:
+        qs_nw = qs_halves = None
+        qnorm_phase2_norm(e, own, root, wv, nown)
+    nw = qs_nw + [None] * (nown - 2) if R2P_QSPLIT else QN_NW[0]
 
     def f16frag(p, xs, ind="  "):
         """f16(x / 16) of 16 dims -> two V8H"""
@@ -597,7 +677,8 @@ def qnorm_phase2(e, own, root):
         e(f"  %qrh0, %qrh1, %qrh2, %qrh3 = scf.if %qrot0 -> ({V8H}, {V8H}, {V8H}, {V8H}) {{")
         e(f"    scf.yield {', '.join(rope('    '))} : {V8H}, {V8H}, {V8H}, {V8H}")
         e("  } else {")
-        pl = f16frag("qp0", nw[0], "    ") + f16frag("qp1", nw[1], "    ")
+        pl = (list(qs_halves[0]) + list(qs_halves[1]) if R2P_QSPLIT else
+              f16frag("qp0", nw[0], "    ") + f16frag("qp1", nw[1], "    "))
         e(f"    scf.yield {', '.join(pl)} : {V8H}, {V8H}, {V8H}, {V8H}")
         e("  }")
         return ("%qrh0", "%qrh1", "%qrh2", "%qrh3")
@@ -615,11 +696,62 @@ def qnorm_phase2(e, own, root):
         e(f"  %qdv{2 * k} = scf.select %qhis0, %qfm{k}, %qft{k} : {V16H}")
         e(f"  %qdv{2 * k + 1} = scf.select %qhis0, %qft{k}, %qfm{k} : {V16H}")
 
-    halves = [None, None] + [f16frag(f"qf{k}", nw[k]) for k in range(2, nown)]
+    if R2P_QPF:   # one 16-dim group at a time, its Q and weights reloaded (the tail's VGPR peak: the sums' loads die)
+        own = list(own)
+
+        def grp(k):
+            wv.update(qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", [k]))
+            ov = qnorm_load(e, "qy", "%q_flat", "%qtot", "%qnb", [k])
+            own[k] = qnorm_scalars(e, f"qy{k}", ov[k])
+            nw[k] = QN_NW[1](k)
+        halves = [None] * nown
+        for k in range(2, nown):
+            grp(k)
+            halves[k] = f16frag(f"qf{k}", nw[k])
+            e("  scf.schedule.fence")
+        grp(0)
+        grp(1)
+    else:
+        halves = [None, None] + ([qs_halves[k] for k in range(2, nown)] if R2P_QSPLIT else
+                                 [f16frag(f"qf{k}", nw[k]) for k in range(2, nown)])
     h = rope_halves()
     halves[0], halves[1] = h[0:2], h[2:4]
     for k in range(nown):
         trade(k, halves[k])
+
+
+def qsplit_phase2(e, own, wv):
+    """R2P_QSPLIT after the prologue barrier: r log2e from the sums (%qsl2e), and q w of the rotary dims (fragments 0
+    and 1; RoPE'd by the head-dim-0 waves only); returns (those two rows, the loaded halves)"""
+    halves, rot = own
+    e(f"  %qssv = vector.addf %qssl0, %qssl1 : {V4}")
+    e(f"  %qssw = vector.addf %qssl2, %qssl3 : {V4}")
+    e(f"  %qssa = vector.addf %qssv, %qssw : {V4}")
+    for x in range(4):
+        e(f"  %qss{x} = vector.extract %qssa[{x}] : {V4} -> f32")
+    e("  %qss01 = scalar.addf %qss0, %qss1 : f32")
+    e("  %qss23 = scalar.addf %qss2, %qss3 : f32")
+    e("  %qstot = scalar.addf %qss01, %qss23 : f32")
+    e("  %qhd256i = scalar.constant 0.00390625 : f32")
+    e("  %qmean = scalar.mulf %qstot, %qhd256i : f32")
+    e("  %qme = scalar.addf %qmean, %qeps_s : f32")
+    e("  %qinv = scalar.rsqrtf %qme : f32")
+    e("  %qsl2e = scalar.mulf %qinv, %log2e : f32")
+    if R2P_LAZY:   # the lazy rescale threshold in S' = S / r units: R2P_LAZY rms (= R2P_LAZY / r), or p outgrows f16
+        e("  %qsrms = scalar.mulf %qme, %qinv : f32")
+        e(f"  %qslzc = scalar.constant {R2P_LAZY} : f32")
+        e("  %qslzth = scalar.mulf %qsrms, %qslzc : f32")
+    e("  %qsc16 = scalar.constant 0.0625 : f32")
+    nw = []
+    for k in range(2):
+        xs = qnorm_scalars(e, f"qrx{k}", rot[k])
+        w = qnorm_scalars(e, f"qw{k}", wv[k])
+        row = []
+        for j in range(16):
+            e(f"  %qnw{k}_{j} = scalar.mulf {xs[j]}, {w[j]} : f32")
+            row.append(f"%qnw{k}_{j}")
+        nw.append(row)
+    return nw, halves
 
 
 VT_BYTES = 0   # R2P_K2: the V^T region: keys 0..7 of rows 0..255 (16 B each), then keys 8..15
@@ -632,6 +764,283 @@ def k2_layout():
     V_OFF = 2 * 16 * KT_PITCH * 2
     VT_BYTES = 32 * 256
     S_OFF = V_OFF + VT_BYTES   # R2P_K2: P^T slots (S plane 0), then S plane 1, alpha
+
+
+TOKR = re.compile(r"%[A-Za-z0-9_.]+")
+
+
+def _defs(ln):
+    m = re.match(r"\s*(%[A-Za-z0-9_.]+(?:, %[A-Za-z0-9_.]+)*) = ", ln)
+    return TOKR.findall(m.group(1)) if m else []
+
+
+def _uses(ln):
+    return TOKR.findall(ln.split(" = ", 1)[1] if _defs(ln) else ln)
+
+
+def _ren(ln, mp):
+    return TOKR.sub(lambda m: mp.get(m.group(0), m.group(0)), ln)
+
+
+def slice_copy(L, lo, hi, virt, roots, sfx):
+    """virt's lines plus the flat defs in L[lo:hi] they need that depend on a root, renamed (sfx), roots substituted"""
+    flat = lambda l: l.startswith("  %") and not l.startswith("   ") and not l.rstrip().endswith("{")
+    dl = {}
+    for i in range(lo, hi):
+        for d in _defs(L[i]):
+            dl[d] = i if flat(L[i]) else -1
+    vdefs = {d for ln in virt for d in _defs(ln)}
+    need, seen, dep = [], set(), {}
+
+    def rooted(n):
+        if n in roots:
+            return True
+        if n not in dl or dl[n] < 0:
+            return False
+        if n not in dep:
+            dep[n] = False
+            dep[n] = any(rooted(u) for u in _uses(L[dl[n]]))
+        return dep[n]
+
+    def pull(n):
+        if n in seen or n in vdefs or n in roots or n not in dl or not rooted(n):
+            return
+        seen.add(n)
+        assert dl[n] >= 0, f"slice: {n} is defined by a region op"
+        for u in _uses(L[dl[n]]):
+            pull(u)
+        need.append(dl[n])
+    for ln in virt:
+        for u in _uses(ln):
+            pull(u)
+    mp = dict(roots)
+    for i in sorted(set(need)):
+        for d in _defs(L[i]):
+            mp[d] = d + sfx
+    for ln in virt:
+        for d in _defs(ln):
+            mp[d] = d + sfx
+    return [_ren("  " + L[i].strip(), mp) for i in sorted(set(need))] + [_ren(ln, mp) for ln in virt]
+
+
+def qtouch_pass(L, pval_line):
+    """R2P_QTOUCH: the QK waves' tail touches the next unit's Q lines (see R2P_QTOUCH)"""
+    i_pv = L.index(pval_line)
+    i_top = next(i for i in range(i_pv, len(L)) if L[i].startswith("  %wgl = index.assume %wglp"))
+    i_sb = next(i for i in range(i_top, len(L)) if "kernel.barrier<workgroup>" in L[i])
+    i_y = next(i for i in range(i_sb, len(L)) if L[i].startswith("  scf.yield %pqnu, %pws"))
+    v = ["  %qtl = index.rem %tid, %c32 : index", "  %qth = index.div %qtl, %c16 : index",
+         "  %qth16 = index.mul %qth, %c16 : index"]   # (recomputed: the unit top's lane terms would live across the loops)
+    for t, qdb in (("a", "%qdb"), ("b", "%qdbo")):
+        v.append(f"  %qtb_{t} = index.add {qdb}, %qth16 : index")
+        for k in range(4):
+            v.append(f"  %qta{k}_{t} = index.add %qtb_{t}, %qo{32 * k} : index")
+            v.append(f"  %qtv{k}_{t} = view.load %q_flat[%qta{k}_{t}] : view<[%qtot]xf32> -> f32")
+    xs = [f"%qtv{k}_{t}" for t in "ab" for k in range(4)]
+    acc = xs[0]
+    for j, x in enumerate(xs[1:]):
+        v.append(f"  %qtm{j} = scalar.maxnumf {acc}, {x} : f32")
+        acc = f"%qtm{j}"
+    v.append(f"  %qtw_o = index.constant {16 * KT_PITCH * 2} : offset")   # K slot 1: idle from the last V tile to tile 0's barrier A
+    v.append("  %qtw_view = buffer.view %pool[%qtw_o] : buffer -> view<256xf32>")
+    v.append(f"  view.store {acc}, %qtw_view[%tid] : f32, view<256xf32>")
+    body = slice_copy(L, i_pv + 1, i_sb, v, {"%wglp": "%qtu", "%pwc": "%pws"}, "_t")
+    tail = ["  %qtc1 = index.sub %pun, %c1 : index", "  %qtu = index.min %pqnu, %qtc1 : index", "  scf.if %isA {"]
+    tail += ["  " + ln for ln in body] + ["  }"]
+    at = os.environ.get("R2P_QTAT", "y")   # (placement: y = after the epilogue, b = after the last V tile's barrier)
+    if at == "b":
+        i_lv = next(i for i in range(i_sb, i_y) if L[i].startswith("  %lsvvsx3 = "))
+        i_y = next(i for i in range(i_lv, i_y) if "kernel.barrier<workgroup>" in L[i]) + 1
+    return L[:i_y] + tail + L[i_y:]
+
+
+def qpf_pass(L, pval_line):
+    """R2P_QPF: the unit's Q prologue (K(0) stage, both head blocks' norm / RoPE / f16 fragments) in the previous
+    unit's tail, in the QK waves; the fragments ride the unit loop as %rinit (see R2P_QPF)."""
+    V8I = "vector<8xi32>"
+
+    def find(pred, start=0):
+        return next(i for i in range(start, len(L)) if pred(L[i]))
+    i_wh = find(lambda l: "= scf.while(%pcur" in l)
+    i_pv = L.index(pval_line)
+    i_top = find(lambda l: l.startswith("  %wgl = index.assume %wglp"), i_pv)
+    i_st = find(lambda l: "view.store" in l and "%qxs_view[%qxs_me]" in l, i_top)
+    i_sb = i_st + 1
+    assert "kernel.barrier<workgroup>" in L[i_sb]
+    i_e0 = find(lambda l: l.startswith("  %qx0e0 = vector.extract"), i_top)
+    i_q0 = find(lambda l: l.startswith("  %qdz0 = scf.select %r_live"), i_sb)
+    i_xb1 = find(lambda l: "kernel.barrier" in l, i_q0)
+    i_xb2 = find(lambda l: "kernel.barrier" in l, i_xb1 + 1)
+    i_y = find(lambda l: l.startswith("  scf.yield %pqnu, %pws"), i_xb2)
+    assert all("kernel.barrier" not in L[i] for i in range(i_top, i_sb))
+    flat = lambda l: l.startswith("  %") and not l.startswith("   ") and not l.rstrip().endswith("{")
+    dl = {}   # the unit top's defs before the sums barrier: name -> line (-1: a region op's)
+    for i in range(i_pv + 1, i_sb):
+        for d in _defs(L[i]):
+            dl[d] = i if flat(L[i]) else -1
+    rawl = [i for i in range(i_top, i_e0) if re.match(r"  %qxv\d+_\d+ = vector\.load %q_flat", L[i])]
+    raw = [_defs(L[i])[0] for i in rawl]
+    kld = [i for i in range(i_top, i_e0) if re.match(r"  %p0kv\d+ = vector\.load", L[i])]
+    kst = [i for i in range(i_top, i_e0) if re.match(r"  vector\.store %p0kv\d+, %k_view", L[i])]
+    assert len(raw) == 16 and len(kld) == 4 and len(kst) == 4, (len(raw), len(kld), len(kst))
+    S = [i for i in range(i_e0, i_st) if not re.match(r"  %qxs(_o|_view|0|1|_me) = ", L[i])]   # sums, no slot
+    p2 = list(range(i_sb + 1, i_q0))
+    ib = next(i for i in p2 if L[i].startswith("  %bzero = "))
+    root_ln = next(L[i] for i in p2 if L[i].startswith("  %qstot = scalar.addf"))
+    root = TOKR.findall(root_ln.split(" = ", 1)[1])[0]
+    p2 = [i for i in p2 if i != ib and not re.match(r"  %qxs_(ot0|ot|other) = ", L[i])]
+    i_tr = next(i for i in p2 if L[i].startswith("  %qfb0_0 = vector.bitcast"))
+    p2t = [i for i in p2 if i >= i_tr]   # the halves trade (xor 16): at the unit top, from the compact halves
+    p2 = [i for i in p2 if i < i_tr]
+    cpt = [TOKR.findall(L[i].split(" = ", 1)[1])[0] for i in p2t if re.match(r"  %qfb\d+_\d+ = vector\.bitcast", L[i])]
+    assert len(cpt) == 8
+    cone = [dl["%qnb"]] + [dl[u] for i in rawl for u in _uses(L[i]) if u.startswith("%qxv")] + rawl
+    cone_d = {d for i in cone for d in _defs(L[i])}
+    S_d = {d for i in S for d in _defs(L[i])}
+    p2_d = {d for i in p2 for d in _defs(L[i])}
+
+    def blk(t, qdb, wq):
+        """block t: the other head-dim half's row sums (the partner wave's tree, its addresses), then this half's
+        loads, sums, phase 2 and fragments; names suffixed t"""
+        o = [f"  %qdbt_{t} = index.sub %{qdb}, %hd128 : index", f"  %qdbx_{t} = index.add %qdbt_{t}, %hd128o : index"]
+        mo = {d: d + f"_{t}o" for d in cone_d | S_d}
+        mo["%qdbn"] = f"%qdbx_{t}"
+        o += [_ren(L[i], mo) for i in cone + S]
+        o.append("  scf.schedule.fence")   # (each stage's loads after the previous stage: VGPR peak)
+        mm = {d: d + f"_{t}" for d in cone_d | S_d | p2_d}
+        mm["%qdbn"], mm["%wqn"] = f"%{qdb}", f"%{wq}"
+        o += [_ren(L[i], mm) for i in cone + S]
+        mm["%qxs_other"] = root + f"_{t}o"
+        o += [_ren(L[i], mm) for i in p2]
+        o.append("  scf.schedule.fence")
+        return o
+    virt = [L[i] for i in kld + kst] + ["  scf.schedule.fence", "  %hd128o = index.sub %c128, %hd128 : index"]
+    virt += blk("a", "qdb", "wqb") + blk("b", "qdbo", "wqbo")
+    yv = [c + "_a" for c in cpt] + [c + "_b" for c in cpt]
+    ts16 = ", ".join([V8I] * 16)
+    V8H = "vector<8xf16>"
+    th16 = ", ".join([V8H] * 16)
+
+    def instance(roots, sfx, alldeps, lds_w, other=None):
+        vdefs = {d for ln in virt for d in _defs(ln)}
+        need, seen, dep_root = [], set(), {}
+
+        def rooted(n):
+            if n in roots:
+                return True
+            if n not in dl or dl[n] < 0:
+                return False
+            if n not in dep_root:
+                dep_root[n] = False
+                dep_root[n] = any(rooted(u) for u in _uses(L[dl[n]]))
+            return dep_root[n]
+
+        def pull(n):
+            if n in seen or n in vdefs or n in roots or n not in dl:
+                return
+            seen.add(n)
+            if not (alldeps or rooted(n)):
+                return
+            assert dl[n] >= 0, f"qpf: {n} is defined by a region op"
+            for u in _uses(L[dl[n]]):
+                pull(u)
+            need.append(dl[n])
+        vl = virt
+        if lds_w:   # the weights from the LDS copy
+            wl = re.compile(r"vector\.load %qw_flat_[ab]\[(.*)\] : view<\[%c256\]xf32>")
+            vl = [wl.sub(r"vector.load %qwl_view[\1] : view<256xf32>", ln) for ln in virt]
+        for ln in vl:
+            for u in _uses(ln):
+                pull(u)
+        pull("%isA")
+        mp = dict(roots)
+        for i in sorted(set(need)):
+            for d in _defs(L[i]):
+                mp[d] = d + sfx
+        for ln in vl:
+            for d in _defs(ln):
+                mp[d] = d + sfx
+        res = [f"%qpr{sfx}{k}" for k in range(16)]
+        o = ["  " + L[i].strip() for i in sorted(set(need))]
+        o = [_ren(ln, mp) for ln in o]
+        o.append(f"  {', '.join(res)} = scf.if {mp.get('%isA', '%isA')} -> ({th16}) {{")
+        o += ["  " + _ren(ln, mp) for ln in vl]
+        o.append(f"    scf.yield {', '.join(mp[y] for y in yv)} : {th16}")
+        o.append("  } else {")
+        if other:   # the P.V waves: halves of values live here anyway (a zero constant would live across the loops)
+            for k in range(16):
+                o.append(f"    %qpo{k} = vector.bitcast {other[k // 2]} : {V8I} to vector<16xf16>")
+                o.append(f"    %qps{k} = vector.slice %qpo{k}[{8 * (k % 2)}] : vector<16xf16> -> {V8H}")
+            o.append(f"    scf.yield {', '.join(f'%qps{k}' for k in range(16))} : {th16}")
+        else:
+            o.append(f"    scf.yield {', '.join(['%qpzh'] * 16)} : {th16}")
+        o.append("  }")
+        return o, res
+
+    # the tail's lane terms from tid % 128 (= tid in the QK waves) + an opaque loop-variant zero (queue word 2 & the
+    # fetched id): else loop-invariant code motion hoists them out of the unit loop, live across the tile loops
+    tail, resn = instance({"%wglp": "%qpfu", "%pwc": "%pws", "%tid": "%qtidv"}, "_n", False, R2P_QPFW,
+                          [f"%fpo{k}" for k in range(8)])
+    tail = ["  %qpfc1 = index.sub %pun, %c1 : index", "  %qpfu = index.min %pqnu, %qpfc1 : index",
+            "  %qpzs = scalar.andi %pqns, %pwz0 : i32", "  %qpzx = index.cast %qpzs : i32 to index",
+            "  %qtidv0 = index.add %tidr, %qpzx : index",
+            "  %qtidv = index.assume %qtidv0 [range(%qtidv0, 0, 128)] : index"] + tail
+    pro, resi = instance({"%wglp": "%qpfi", "%pwc": "%pwi"}, "_i", True, R2P_QPFW)
+    wcp = ["  %qpwt = kernel.workitem.id<x> : index",
+           "  %qpw_flat = buffer.view %qnw[%base] : buffer -> view<[%c256]xf32>",
+           "  %qpwv = view.load %qpw_flat[%qpwt] : view<[%c256]xf32> -> f32",
+           f"  %qwl_o = index.constant {QW_OFF} : offset",
+           "  %qwl_view = buffer.view %pool[%qwl_o] : buffer -> view<256xf32>",
+           "  view.store %qpwv, %qwl_view[%qpwt] : f32, view<256xf32>",
+           "  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)"]   # (all waves, once)
+    pro = ["  %qpzh = vector.constant 0.0 : vector<8xf16>"] + (wcp if R2P_QPFW else []) + [
+           "  %qpfc1i = index.sub %pun, %c1 : index", "  %qpfi = index.min %pqiu, %qpfc1i : index"] + pro
+    drop = set(rawl + kld + kst + list(range(i_e0, i_sb + 1)) + list(range(i_sb + 1, i_xb2 + 1)))
+    car = [f"%qcp{k}" for k in range(16)]
+    newtop = [L[ib], "  %qw_na, %qe_na = buffer.assume.noalias %qnw, %qeps : buffer, buffer",   # (harness layout)
+              "  %qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>",
+              "  %qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>",
+              f"  {', '.join(f'%rinit{c}' for c in range(16))} = scf.if %isA -> ({ts16}) {{"]
+    for bi, t in enumerate("ab"):
+        tm = {d: d + f"_{t}" for i in p2t for d in _defs(L[i])}
+        tm.update({c: car[8 * bi + k] for k, c in enumerate(cpt)})
+        newtop += ["  " + _ren(L[i], tm) for i in p2t]
+        for c in range(8):
+            newtop.append(f"    %qdz{c}_{t} = scf.select %r_live, %qdv{c}_{t}, %zq16x : vector<16xf16>")
+            newtop.append(f"    %qbits{c}_{t} = vector.bitcast %qdz{c}_{t} : vector<16xf16> to {V8I}")
+    newtop += [f"    scf.yield {', '.join([f'%qbits{c}_a' for c in range(8)] + [f'%qbits{c}_b' for c in range(8)])} : {ts16}",
+               "  } else {", f"    scf.yield {', '.join(['%bzero'] * 16)} : {ts16}", "  }"]
+    pq = [f"%pqx{k}" for k in range(16)]
+    pd = [f"%pqd{k}" for k in range(16)]
+    out = []
+    for i, ln in enumerate(L):
+        if i == i_wh:
+            out += pro
+            assert ln == "  %pfin, %pwf = scf.while(%pcur = %pqiu : index, %pwc = %pwi : i32) -> (index, i32) {", ln
+            args = ", ".join(f"{c} = {r} : {V8H}" for c, r in zip(car, resi))
+            fins = ", ".join(f"%qpf{k}" for k in range(16))
+            ln = f"  %pfin, %pwf, {fins} = scf.while(%pcur = %pqiu : index, %pwc = %pwi : i32, {args}) -> (index, i32, {th16}) {{"
+        elif i == i_pv:
+            assert ln == "  %pnext, %pwn = scf.if %pval -> (index, i32) {", ln
+            ln = f"  %pnext, %pwn, {', '.join(pq)} = scf.if %pval -> (index, i32, {th16}) {{"
+        elif i in drop:
+            if i == i_xb2:
+                out += newtop
+            continue
+        elif i == i_y:
+            out += tail
+            assert ln == "  scf.yield %pqnu, %pws : index, i32", ln
+            ln = f"  scf.yield %pqnu, %pws, {', '.join(resn)} : index, i32, {th16}"
+        elif ln == "  scf.yield %pun, %pwc : index, i32":
+            ln = f"  scf.yield %pun, %pwc, {', '.join(car)} : index, i32, {th16}"   # (exits: no unit)
+        elif ln == "  scf.condition %pcont, %pnext, %pwn : i1, index, i32":
+            ln = f"  scf.condition %pcont, %pnext, %pwn, {', '.join(pq)} : i1, index, i32, {th16}"
+        elif ln == "  } do(%pw: index, %pwd: i32) {":
+            ln = f"  }} do(%pw: index, %pwd: i32, {', '.join(f'{d}: {V8H}' for d in pd)}) {{"
+        elif ln == "  scf.yield %pw, %pwd : index, i32":
+            ln = f"  scf.yield %pw, %pwd, {', '.join(pd)} : index, i32, {th16}"
+        out.append(ln)
+    return out
 
 
 def gen():
@@ -751,7 +1160,22 @@ def gen():
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
     if OCNT:   # without it the atomic may alias every input: their scalar loads become vector loads, the code shifts
         e("  %oc_na = buffer.assume.noalias %ocnt : buffer")
-    e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if Q16 and (not QNORM or QG16) else 'f32'}>")
+    # (diag q16: f16 q only, the gate as configured: the Q bytes' share of the prologue; wrong values)
+    q16 = Q16 and (not QNORM or QG16 or "q16" in R2P_DIAG or R2P_QSPLIT)
+    e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if q16 else 'f32'}>")
+    if R2P_QSPLIT:
+        e("  %qsp_c1536 = index.constant 1536 : index")
+        e("  %qsp_c48 = index.constant 384 : index")
+        e("  %qsp_c12288 = index.constant 12288 : index")
+        e("  %qsp_c18432 = index.constant 18432 : index")
+        e("  %qrtot = index.mul %B, %qsp_c1536 : index")
+        e("  %qsstot = index.mul %B, %qsp_c48 : index")
+        e("  %qrb_oi = index.mul %B, %qsp_c12288 : index")
+        e("  %qrb_o = index.cast %qrb_oi : index to offset")
+        e("  %qss_oi = index.mul %B, %qsp_c18432 : index")
+        e("  %qss_o = index.cast %qss_oi : index to offset")
+        e("  %qr_flat = buffer.view %q_na[%qrb_o] : buffer -> view<[%qrtot]xf32>")
+        e("  %qs_flat = buffer.view %q_na[%qss_o] : buffer -> view<[%qsstot]xf32>")
     e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if QG16 or GSIG16 else 'f32'}>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
     # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
@@ -796,6 +1220,11 @@ def gen():
     if SOFT1:  # S partials (B's), then P^T 4 pairs x 512 B, alpha 256 B, row sums 256 B (x2 slots under SOFT3)
         pool = S_OFF + NT * 32 + (4096 + 768 if SOFT3 or SOFT4 else 2048 + 512)
     global QX_OFF
+    global QW_OFF
+    if QNORM and R2P and R2P_QPF and R2P_QPFW:   # the norm weights' LDS copy (256 f32). (A pool of 32 KB costs occupancy: the
+        # compiler's VGPR budget rises past 192 at once)
+        QW_OFF = pool
+        pool += 1024
     if QNORM and R2P:
         QX_OFF = S_OFF + 4096
     elif QNORM:   # QNORM: the head-dim halves' sums of squares, [query block][half][row] f32
@@ -1686,6 +2115,7 @@ def gen():
         """Softmax of this tile (own partial acc + the partner's from LDS) and P.V; returns the O accumulators.
         mid(): emitted right after the rescale branch (the pipelined QK of the next tile and its loads).
         pair_slot (the QK role): %s0 is the full S; P^T and alpha go to that LDS slot (rows, alpha base); no P.V."""
+        L2E = "%r2l2e" if R2P and R2P_QSPLIT else "%log2e"   # (QSPLIT: S is unscaled; r log2e scales it)
         if pair_slot is None:
             e(f"    %spa = vector.load %s_view[%ptid, %c0] : view<{2 * NT}x4xf32> -> {V4}")
             e(f"    %spb = vector.load %s_view[%ptid2, %c0] : view<{2 * NT}x4xf32> -> {V4}")
@@ -1784,8 +2214,11 @@ def gen():
         # one wave-uniform branch: raise the max and rescale O / l only when some row needs it (FA4 conditional rescale)
         if R2P and R2P_LAZY:   # the max is raised only past rmax + R2P_LAZY: p up to e^R2P_LAZY (f16 has room), O
             # and l carry the same stale scale, which the epilogue's O / l cancels (rounding points move: gate N)
-            e(f"    %lzth = scalar.constant {R2P_LAZY} : f32")
-            e("    %tmlz = scalar.subf %tmax, %lzth : f32")
+            if R2P_QSPLIT:
+                e("    %tmlz = scalar.subf %tmax, %qslzth : f32")
+            else:
+                e(f"    %lzth = scalar.constant {R2P_LAZY} : f32")
+                e("    %tmlz = scalar.subf %tmax, %lzth : f32")
             e("    %grow = scalar.cmpf ogt, %tmlz, %rmax : f32")
         else:
             e("    %grow = scalar.cmpf ogt, %tmax, %rmax : f32")
@@ -1794,7 +2227,7 @@ def gen():
             e("    %rsm, %rss = scf.if %anygrow -> (f32, f32) {")
             e("      %gmx = scalar.maxnumf %rmax, %tmax : f32")
             e("      %gpd = scalar.subf %rmax, %gmx : f32")
-            e("      %gpdl = scalar.mulf %gpd, %log2e : f32")
+            e(f"      %gpdl = scalar.mulf %gpd, {L2E} : f32")
             e("      %galpha = scalar.exp2f<afn> %gpdl : f32")
             e("      scf.yield %gmx, %galpha : f32, f32")
             e("    } else {")
@@ -1805,7 +2238,7 @@ def gen():
             e(f"    %rso0, %rso1, %rso2, %rso3, %rso4, %rso5, %rso6, %rso7, %rsm, %rss = scf.if %anygrow -> ({otypes}) {{")
             e(f"      %gmx = scalar.maxnumf{'<nnan>' if MAXNN else ''} %rmax, %tmax : f32")
             e("      %gpd = scalar.subf %rmax, %gmx : f32")
-            e("      %gpdl = scalar.mulf %gpd, %log2e : f32")
+            e(f"      %gpdl = scalar.mulf %gpd, {L2E} : f32")
             e("      %galpha = scalar.exp2f<afn> %gpdl : f32")
             e(f"      %galpha8 = vector.splat %galpha : {V8}")
             for f in range(8):
@@ -1819,10 +2252,10 @@ def gen():
             mid()
         # MAXNN: both arms yield max(rmax, ..) >= -FLT_MAX, so with ninf LLVM folds the seed max away
         e(f"    %nmax = scalar.maxnumf{'<nnan|ninf>' if MAXNN else ''} %rsm, %ninf : f32")
-        e("    %nml = scalar.mulf %nmax, %log2e : f32")
+        e(f"    %nml = scalar.mulf %nmax, {L2E} : f32")
         e("    %nnml = scalar.negf %nml : f32")
         e("    %pd = scalar.subf %rmax, %nmax : f32")
-        e("    %pdl = scalar.mulf %pd, %log2e : f32")
+        e(f"    %pdl = scalar.mulf %pd, {L2E} : f32")
         e("    %alpha = scalar.exp2f<afn> %pdl : f32")
         e(f"    %nnml8 = vector.splat %nnml : {V8}")
         e(f"    %nmax8 = vector.splat %nmax : {V8}")
@@ -1891,51 +2324,73 @@ def gen():
             e(f"    %p = vector.bitcast %pdi : vector<8xi32> to {V8}")
         else:
             e(f"    %pd8 = vector.subf {s}, %nmax8 : {V8}")
-            e(f"    %pl = vector.mulf %pd8, {'%r2l2e8' if R2P else '%log2e8'} : {V8}")
+            if "nol2e" in R2P_DIAG:   # diag: no log2e multiply (p = exp2(s - m): wrong values)
+                e(f"    %pl = vector.addf %pd8, %zeros8 : {V8}")
+            else:
+                e(f"    %pl = vector.mulf %pd8, {'%r2l2e8' if R2P else '%log2e8'} : {V8}")
             if "noexp" in R2P_DIAG:   # diag: p = the exponent itself (no exp2; wrong values, same max / rescale path)
                 e(f"    %p = vector.addf %pl, %zeros8 : {V8}")
             else:
                 e(f"    %p = vector.exp2f<afn> %pl : {V8}")
-        # keys 8h..8h+3 and 8h+4..8h+7: HIP's 4-lane segments
-        for g in range(2 if "nosum" not in R2P_DIAG else 0):
-            cur = "%zero"
-            for i in range(4):
-                e(f"    %pg{g}_{i} = vector.extract %p[{4 * g + i}] : {V8} -> f32")
-                if SUM0 and i == 0:
-                    cur = f"%pg{g}_0"
-                    continue
-                e(f"    %pa{g}_{i} = scalar.addf {cur}, %pg{g}_{i} : f32")
-                cur = f"%pa{g}_{i}"
-        if "nosum" in R2P_DIAG:   # no row sum this tile (the carried sum only rescaled)
-            e("    %nsum = scalar.fmaf %rsum, %rss, %rsum : f32")
-        else:
-            e("    %pab = scalar.addf %pa0_3, %pa1_3 : f32")
-            e("    %pabi = scalar.bitcast %pab : f32 to i32")
-            e("    %pcdi, %pcdv = kernel.subgroup.shuffle<xor> %pabi, %x16, %x32 : i32, i32, i32")
-            e("    %pcd = scalar.bitcast %pcdi : i32 to f32")
-            e("    %psum = scalar.addf %pab, %pcd : f32")
-            e("    %nsum = scalar.fmaf %rsum, %rss, %psum : f32")
+        def emit_sum():
+            # keys 8h..8h+3 and 8h+4..8h+7: HIP's 4-lane segments
+            for g in range(2 if "nosum" not in R2P_DIAG else 0):
+                cur = "%zero"
+                for i in range(4):
+                    e(f"    %pg{g}_{i} = vector.extract %p[{4 * g + i}] : {V8} -> f32")
+                    if SUM0 and i == 0:
+                        cur = f"%pg{g}_0"
+                        continue
+                    e(f"    %pa{g}_{i} = scalar.addf {cur}, %pg{g}_{i} : f32")
+                    cur = f"%pa{g}_{i}"
+            if "nosum" in R2P_DIAG:   # no row sum this tile (the carried sum only rescaled)
+                e("    %nsum = scalar.fmaf %rsum, %rss, %rsum : f32")
+            else:
+                e("    %pab = scalar.addf %pa0_3, %pa1_3 : f32")
+                e("    %pabi = scalar.bitcast %pab : f32 to i32")
+                e("    %pcdi, %pcdv = kernel.subgroup.shuffle<xor> %pabi, %x16, %x32 : i32, i32, i32")
+                e("    %pcd = scalar.bitcast %pcdi : i32 to f32")
+                e("    %psum = scalar.addf %pab, %pcd : f32")
+                e("    %nsum = scalar.fmaf %rsum, %rss, %psum : f32")
+        sum_late = R2P_SUMLATE and pair_slot is not None and R2P and R2P_PSB
+        if not sum_late:
+            emit_sum()
         # P^T as the B operand: keys 0..7 from the h=0 lane, 8..15 from h=1.
         # f16(p) as fptrunc(fma(p, 1, 0)) with an opaque 1 and 0, which selects v_fma_mix (as Q4FMIX in the GEMMs).
         # v_cvt_f16_f32 results must sit in v0..v127, where Q^T and O live: each conversion evicts a Q^T fragment to scratch.
-        for i in range(8):
-            e(f"    %pe{i} = vector.extract %p[{i}] : {V8} -> f32")
-            e(f"    %pm{i} = scalar.fmaf %pe{i}, %one_o, %zero_o : f32")
-            e(f"    %pt{i} = scalar.fptrunc %pm{i} : f32 to f16")
-        e(f"    %ph = vector.from_elements {', '.join(f'%pt{i}' for i in range(8))} : {V8H}")
+        if "nocvt" in R2P_DIAG:   # diag: P^T bits = 4 of the f32 p, no conversion (wrong values)
+            for i in range(4):
+                e(f"    %pe{i} = vector.extract %p[{i}] : {V8} -> f32")
+            e("    %pv4 = vector.from_elements %pe0, %pe1, %pe2, %pe3 : vector<4xf32>")
+            e(f"    %ph = vector.bitcast %pv4 : vector<4xf32> to {V8H}")
+        else:
+            for i in range(8):
+                e(f"    %pe{i} = vector.extract %p[{i}] : {V8} -> f32")
+                e(f"    %pm{i} = scalar.fmaf %pe{i}, %one_o, %zero_o : f32")
+                e(f"    %pt{i} = scalar.fptrunc %pm{i} : f32 to f16")
+            e(f"    %ph = vector.from_elements {', '.join(f'%pt{i}' for i in range(8))} : {V8H}")
+            for k in range(4 if R2P_PST4 else 0):
+                e(f"    %phw{k} = vector.from_elements %pt{2 * k}, %pt{2 * k + 1} : vector<2xf16>")
+        pst = lambda r: ([f"      vector.store %phw{k}, %pp_view[{r}, %c{2 * k}] : vector<2xf16>, view<256x8xf16>"
+                          for k in range(4)] if R2P_PST4 and "nocvt" not in R2P_DIAG else
+                         [f"      vector.store %ph, %pp_view[{r}, %c0] : {V8H}, view<256x8xf16>"])
         if pair_slot is not None and R2P and R2P_PSB:
             # the slot by a uniform branch on the tile parity: each arm's addresses are loop-invariant + an immediate
             # (as a runtime row index Loom rebuilds them every tile: v_mov of the parity, 2 lshl_add, 2 lshl)
             e("    %psl0 = index.cmp eq, %kpar, %c0 : index")
             e("    scf.if %psl0 {")
-            e(f"      vector.store %ph, %pp_view[%prow_own, %c0] : {V8H}, view<256x8xf16>")
+            for ln in pst("%prow_own"):
+                e(ln)
             e("      view.store %rss, %al_view[%pa_own] : f32, view<128xf32>")
             e("    } else {")
             e("      %pwr1 = index.add %prow_own, %c128p : index")
             e("      %pwa1 = index.add %pa_own, %c64 : index")
-            e(f"      vector.store %ph, %pp_view[%pwr1, %c0] : {V8H}, view<256x8xf16>")
+            for ln in pst("%pwr1"):
+                e(ln)
             e("      view.store %rss, %al_view[%pwa1] : f32, view<128xf32>")
             e("    }")
+            if sum_late:
+                emit_sum()
             return None
         if pair_slot is not None:
             rows, alb = pair_slot
@@ -2593,7 +3048,7 @@ def gen():
         persist_issue("n")
     if R2P:
         # log2e x opaque 1 (exact): as a literal it keeps the exponent multiplies from pairing (VOPD)
-        e("  %r2l2e = scalar.mulf %log2e, %one_o : f32")
+        e(f"  %r2l2e = scalar.mulf {'%qsl2e' if R2P_QSPLIT else '%log2e'}, %one_o : f32")
         e(f"  %r2l2e8 = vector.splat %r2l2e : {V8}")
         if DIAG_MASK and DIAG_SWAP:   # the softmax mask test's wave-uniform terms
             e("  %r2ml0 = index.add %r_abs, %c1 : index")
@@ -3117,6 +3572,12 @@ def gen():
             del L[i]
         body = next(i for i, ln in enumerate(L) if "kernel.barrier" in ln and i > L.index(PVAL_LINE))
         L[body + 1:body + 1] = mv
+    if R2P_QPF:
+        assert QNORM and STEER and R2P_K2
+        L[:] = qpf_pass(L, PVAL_LINE)
+    if R2P_QTOUCH:
+        assert QNORM and STEER and R2P_K2 and not R2P_QPF
+        L[:] = qtouch_pass(L, PVAL_LINE)
     e("  kernel.return")
     e("}")
     if "noallbar" in R2P_DIAG:   # diag: no workgroup barriers anywhere (races: wrong values)

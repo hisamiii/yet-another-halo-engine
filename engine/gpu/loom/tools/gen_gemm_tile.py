@@ -427,7 +427,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     ff = kind == "ffn"
     assert ff == t.ffn, "kind ffn needs Tile.ffn"
     bufs = (["weight"] + F["extra"] + (extra_u if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
-            + ["wstage", "ostage", "output"] + (["out2"] if SPLIT2 else []) + (["gate_out"] if qg else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
+            + ["wstage", "ostage", "output"] + (["out2"] if SPLIT2 else []) + (["gate_out"] if qg else []) + (["qnw"] if qg and KQG_QSPLIT else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
     assert not NPUADD or (kr and KWIN and t.tallepi and t.ecoal and not masked and not t.respre)
     assert not SPLIT2 or (kind == "kstore" and not (OSTRIDE or MX or masked or AFRAG or t.tallepi or t.tm == 32 or OUT16)), \
         "SPLIT2: a plain tiled f32 kstore with the default fragment-store epilogue"
@@ -1563,6 +1563,13 @@ def recip1(e, out, dn, ind="  ", bare=False):
 # in the attention epilogue, half the gate bytes). The attention's EPI_FAST sigmoid ops, then one f16 rounding
 KQG_GSIG = os.environ.get("KQG_GSIG", "")   # "16" / "32": sigmoid(gate) stored as f16 / f32
 KQG_GSIG16 = KQG_GSIG in ("16", "u16")   # u16: round(s * 65535) as unorm16 bits in the f16 gate buffer
+# KQG_QSPLIT (gen_attn_fa R2P_QSPLIT): q stored as f16(q w / 16) at the f32 q's indices (w: the q head-norm weight,
+# binding qnw), the raw f32 rotary dims 0..63 at byte tokens * 12288 ([token][head][64]), and per lane its 16 rows'
+# sum of q^2 at tokens * 18432 ([token][head][16], 16-row group g = 2 (d / 32) + the lane's half; no cross-lane
+# shuffle); the attention applies the norm's 1 / rms to S
+KQG_QSPLIT = os.environ.get("KQG_QSPLIT", "0") == "1"
+KQG_QSPLIT_DIAG = os.environ.get("KQG_QSPLIT_DIAG", "")   # diags (wrong values, timing only): "now" no w load, "nosum"
+# no sums, "norot" no rotary stores
 KQG_QH = os.environ.get("KQG_QH", "0") == "1"   # diag: q rounded to f16, stored as f32 (the precision of an f16 q)
 
 
@@ -1618,6 +1625,102 @@ def qh(e, y, val):
     e(f"    %qh_r{y} = vector.extf %qh_h{y} : vector<4xf16> to vector<4xf32>")
     return f"%qh_r{y}"
 
+def qsplit_views(e):
+    """KQG_QSPLIT: f16 q (the f32 q's indices), rotary f32 and sums regions of the output, the norm weight"""
+    e("  %qs_h = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf16>")
+    e("  %qs_c1536 = index.constant 1536 : index")
+    e("  %qs_c64 = index.constant 64 : index")
+    e("  %qs_c8 = index.constant 8 : index")
+    e("  %qs_c32 = index.constant 32 : index")
+    e("  %qs_c12288 = index.constant 12288 : index")
+    e("  %qs_c18432 = index.constant 18432 : index")
+    e("  %qs_c384 = index.constant 384 : index")
+    e("  %qs_c16 = index.constant 16 : index")
+    e("  %qs_rtot = index.mul %tokens, %qs_c1536 : index")
+    e("  %qs_stot = index.mul %tokens, %qs_c384 : index")
+    e("  %qs_rbi = index.mul %tokens, %qs_c12288 : index")
+    e("  %qs_rbo = index.cast %qs_rbi : index to offset")
+    e("  %qs_sbi = index.mul %tokens, %qs_c18432 : index")
+    e("  %qs_sbo = index.cast %qs_sbi : index to offset")
+    e("  %qs_rot = buffer.view %output_na[%qs_rbo] : buffer -> view<[%qs_rtot]xf32>")
+    e("  %qs_ss = buffer.view %output_na[%qs_sbo] : buffer -> view<[%qs_stot]xf32>")
+    e("  %qs_c256 = index.constant 256 : index")
+    e("  %qs_c252 = index.constant 252 : index")
+    e("  %qs_wv = buffer.view %qnw_na[%base] : buffer -> view<[%qs_c256]xf32>")
+    e("  %qs_x1 = scalar.constant 1 : i32")
+    e("  %qs_x32 = scalar.constant 32 : i32")
+    e("  %qs_s16 = scalar.constant 0.0625 : f32")
+    e("  %qs_s16v = vector.splat %qs_s16 : vector<4xf32>")
+    if "norot" in KQG_QSPLIT_DIAG:
+        e("  %false_qs = index.cmp ult, %qs_c64, %qs_c8 : index")
+
+
+def qsplit_lane(e):
+    """KQG_QSPLIT: this lane's rotary flag and region bases (token-free parts)"""
+    e("  %qs_isrot = index.cmp ult, %qg_d, %qs_c64 : index")
+    e("  %qs_dr = index.rem %qg_d, %qs_c64 : index")   # (= d on the rotary lanes, which alone store)
+    e("  %qs_hh = index.mul %qg_head, %qs_c64 : index")
+    e("  %qs_rcol = index.add %qs_hh, %qs_dr : index")
+    e("  %qs_g0 = index.div %qg_d, %qs_c32 : index")
+    e("  %qs_g1 = index.mul %qs_g0, %c2 : index")
+    e("  %qs_g = index.add %qs_g1, %es_h0 : index")   # the lane's 16-row group 0..15
+    e("  %qs_sh = index.mul %qg_head, %qs_c16 : index")
+    e("  %qs_scol = index.add %qs_sh, %qs_g : index")
+
+
+def qsplit_sums(e, j, tka):
+    """KQG_QSPLIT: the lane's 16 squares' sum, stored by every q lane (its own 16-row group)"""
+    if "nosum" in KQG_QSPLIT_DIAG:
+        return
+    for x in range(4):
+        e(f"  %qse{j}_{x} = vector.extract %qsa{j}_3[{x}] : vector<4xf32> -> f32")
+    e(f"  %qsb{j}_0 = scalar.addf %qse{j}_0, %qse{j}_1 : f32")
+    e(f"  %qsb{j}_1 = scalar.addf %qse{j}_2, %qse{j}_3 : f32")
+    e(f"  %qsl{j} = scalar.addf %qsb{j}_0, %qsb{j}_1 : f32")
+    e(f"  %qsst{j} = index.mul {tka}, %qs_c384 : index")   # (token * 24 + head) * 16 + group
+    e(f"  %qssi{j} = index.add %qsst{j}, %qs_scol : index")
+    e(f"  scf.if %qg_isq {{")
+    e(f"    view.store %qsl{j}, %qs_ss[%qssi{j}] : f32, view<[%qs_stot]xf32>")
+    e("  }")
+
+
+def qsplit_sq(e, j, n, val):
+    """KQG_QSPLIT: the running sum of q^2 over a lane's 16 rows of a 32-row group (n: its 4-row chunk 0..3)"""
+    if n == 0:
+        e(f"  %qsa{j}_0 = vector.mulf {val}, {val} : vector<4xf32>")
+    else:
+        e(f"  %qsq{j}_{n} = vector.mulf {val}, {val} : vector<4xf32>")
+        e(f"  %qsa{j}_{n} = vector.addf %qsa{j}_{n - 1}, %qsq{j}_{n} : vector<4xf32>")
+
+
+def qsplit_w(e, y, d, c):
+    """KQG_QSPLIT: w / 16 for rows d + c .. + 3, loaded at its use (hoisted, 16 VGPRs live through the epilogue)"""
+    if "now" in KQG_QSPLIT_DIAG:
+        e(f"    %qsw{y} = vector.splat %qs_s16 : vector<4xf32>")
+        return
+    e(f"    %qswc{y} = index.constant {c} : index")
+    e(f"    %qswb{y} = index.add {d}, %qswc{y} : index")
+    e(f"    %qswa{y} = index.min %qswb{y}, %qs_c252 : index")   # (d + c <= 252 already)
+    e(f"    %qswl{y} = vector.load %qs_wv[%qswa{y}] : view<[%qs_c256]xf32> -> vector<4xf32>")
+    e(f"    %qsw{y} = vector.mulf %qswl{y}, %qs_s16v : vector<4xf32>")   # (exact: a power of two)
+
+
+def qsplit_tall_sums(e, g, j, tka):
+    """KQG_QSPLIT, tall epilogue: on odd g the lane's 16 squares of slabs g - 1, g (its own 16-row group), stored"""
+    if g % 2 == 0 or "nosum" in KQG_QSPLIT_DIAG:
+        return
+    for x in range(4):
+        e(f"  %qse{g}_{j}_{x} = vector.extract %qsa{g // 2}_{j}_3[{x}] : vector<4xf32> -> f32")
+    e(f"  %qsc{g}_{j}_0 = scalar.addf %qse{g}_{j}_0, %qse{g}_{j}_1 : f32")
+    e(f"  %qsc{g}_{j}_1 = scalar.addf %qse{g}_{j}_2, %qse{g}_{j}_3 : f32")
+    e(f"  %qsl{g}_{j} = scalar.addf %qsc{g}_{j}_0, %qsc{g}_{j}_1 : f32")
+    e(f"  %qsst{g}_{j} = index.mul {tka}, %qs_c384 : index")   # (token * 24 + head) * 16 + group
+    e(f"  %qssi{g}_{j} = index.add %qsst{g}_{j}, %qs_scol{g} : index")
+    e(f"  scf.if %qg_isq{g} {{")
+    e(f"    view.store %qsl{g}_{j}, %qs_ss[%qssi{g}_{j}] : f32, view<[%qs_stot]xf32>")
+    e("  }")
+
+
 def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False):
     """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
@@ -1653,6 +1756,8 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
         if KQG_GSIG:
             gsig16_consts(e)
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
+        if KQG_QSPLIT:
+            qsplit_views(e)
         if OUT16:
             e("  %qg_c8 = index.constant 8 : index")
             e("  %qg_last8 = index.sub %qg_tot, %qg_c8 : index")
@@ -1679,6 +1784,8 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
         e("  %qg_hb = index.mul %qg_head, %qg_c256 : index")
         e("  %qg_col = index.add %qg_hb, %qg_d : index")
         e("  %qg_isq = index.cmp eq, %qg_half, %c0 : index")
+        if KQG_QSPLIT:
+            qsplit_lane(e)
     for j in range(FN):
         if col_fence and j:
             e("  scf.schedule.fence")
@@ -1698,6 +1805,9 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
         if qg:
             e(f"  %qg_tm{j} = index.mul {es_tka}, %qg_rows : index")
             e(f"  %qg_ob{j} = index.add %qg_tm{j}, %qg_col : index")
+            if KQG_QSPLIT:
+                e(f"  %qsrt{j} = index.mul {es_tka}, %qs_c1536 : index")
+                e(f"  %qsrb{j} = index.add %qsrt{j}, %qs_rcol : index")
         if masked:
             # this lane's token past the last valid one: no residual / gate load, no store
             e(f"  %es_ok{j} = index.cmp ult, %es_tk{j}, %tokens : index")
@@ -1729,6 +1839,25 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
                     hs.append(f"%h_{y}")
                 e(f"  %hv{j}_{q} = vector.from_elements {', '.join(hs)} : vector<4xf16>")
                 e(f"  vector.store %hv{j}_{q}, %out_h[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
+            elif qg and KQG_QSPLIT:
+                assert not masked and not OUT16 and KQG_GSIG16
+                e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
+                e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
+                qsplit_sq(e, f"{j}", q, val)
+                e(f"  scf.if %qg_isq {{")
+                qsplit_w(e, f"{j}_{q}", "%qg_d", 4 * q)
+                e(f"    %qsy{j}_{q} = vector.mulf {val}, %qsw{j}_{q} : vector<4xf32>")
+                e(f"    %qsh{j}_{q} = vector.fptrunc %qsy{j}_{q} : vector<4xf32> to vector<4xf16>")
+                e(f"    vector.store %qsh{j}_{q}, %qs_h[%qg_oi{j}_{q}] : vector<4xf16>, view<[%qg_tot]xf16>")
+                e("    scf.if %qs_isrot {")
+                e(f"      %qsr{j}_{q} = index.add %qsrb{j}, %es_q{j}_{q}c : index")
+                e(f"      vector.store {val}, %qs_rot[%qsr{j}_{q}] : vector<4xf32>, view<[%qs_rtot]xf32>")
+                e("    }")
+                e("  } else {")
+                e(f"    vector.store {gsig16(e, f'{j}_{q}', val, '    ')}, %g_flat[%qg_oi{j}_{q}] : vector<4xf16>, view<[%qg_tot]xf16>")
+                e("  }")
+                if q == 3:
+                    qsplit_sums(e, j, es_tka)
             elif qg and OUT16:
                 e(f"  %qg_h{j}_{q} = vector.fptrunc {val} : vector<4xf32> to vector<4xf16>")
                 if q % 2:
@@ -1787,6 +1916,9 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         if KQG_GSIG:
             gsig16_consts(e)
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
+        if KQG_QSPLIT:
+            assert not masked and KQG_GSIG16 and sr == 16
+            qsplit_views(e)
         e("  %qg_c512 = index.constant 512 : index")
         e("  %qg_c256 = index.constant 256 : index")
     else:
@@ -1872,6 +2004,16 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
             e(f"  %qg_hb{g} = index.mul %qg_head{g}, %qg_c256 : index")
             e(f"  %qg_col{g} = index.add %qg_hb{g}, %qg_d{g} : index")
             e(f"  %qg_isq{g} = index.cmp eq, %qg_half{g}, %c0 : index")
+            if KQG_QSPLIT:   # this slab's rows of the lane: rotary flag, region columns
+                e(f"  %qs_isrot{g} = index.cmp ult, %qg_d{g}, %qs_c64 : index")
+                e(f"  %qs_dr{g} = index.rem %qg_d{g}, %qs_c64 : index")   # (= d where rotary: only those store)
+                e(f"  %qs_hh{g} = index.mul %qg_head{g}, %qs_c64 : index")
+                e(f"  %qs_rcol{g} = index.add %qs_hh{g}, %qs_dr{g} : index")
+                e(f"  %qs_g0{g} = index.div %qg_d{g}, %qs_c32 : index")
+                e(f"  %qs_g1{g} = index.mul %qs_g0{g}, %c2 : index")
+                e(f"  %qs_g{g} = index.add %qs_g1{g}, %et_h0 : index")   # the lane's 16-row group (slabs 2p, 2p + 1)
+                e(f"  %qs_sh{g} = index.mul %qg_head{g}, %qs_c16 : index")
+                e(f"  %qs_scol{g} = index.add %qs_sh{g}, %qs_g{g} : index")
         for j in range(FN):
             q0 = f"{g}_{j}"
             if kr:
@@ -1890,6 +2032,9 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
             if qg:
                 e(f"  %et_tm{q0} = index.mul {tka}, %qg_rows : index")
                 e(f"  %et_ob{q0} = index.add %et_tm{q0}, %qg_col{g} : index")
+                if KQG_QSPLIT:
+                    e(f"  %qsrt{q0} = index.mul {tka}, %qs_c1536 : index")
+                    e(f"  %qsrb{q0} = index.add %qsrt{q0}, %qs_rcol{g} : index")
             else:
                 e(f"  %et_tm{q0} = index.mul {tka}, {orw()} : index")
                 e(f"  %et_ob{q0} = index.add %et_tm{q0}, %et_row{g} : index")
@@ -1910,7 +2055,24 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                 if NPUADD:   # access q: token + tpa q (coalesced), rows et_row{g} .. + 3
                     e(f"  %nt{y} = index.add {tka}, %et_qk{y} : index")
                     val = npu_add(e, y, f"%nt{y}", f"%et_row{g}", val)
-                if qg:
+                if qg and KQG_QSPLIT:
+                    e(f"  %qg_oi{y} = index.min %et_oi{y}, %qg_last4 : index")
+                    qsplit_sq(e, f"{g // 2}_{j}", 2 * (g % 2) + q, val)   # (a 32-row group: slabs g - g % 2, + 1)
+                    e(f"  scf.if %qg_isq{g} {{")
+                    qsplit_w(e, y, f"%qg_d{g}", 4 * q)
+                    e(f"    %qsy{y} = vector.mulf {val}, %qsw{y} : vector<4xf32>")
+                    e(f"    %qsh{y} = vector.fptrunc %qsy{y} : vector<4xf32> to vector<4xf16>")
+                    e(f"    vector.store %qsh{y}, %qs_h[%qg_oi{y}] : vector<4xf16>, view<[%qg_tot]xf16>")
+                    e(f"    scf.if %qs_isrot{g} {{") if "norot" not in KQG_QSPLIT_DIAG else e("    scf.if %false_qs {")
+                    e(f"      %qsr{y} = index.add %qsrb{q0}, %et_q{y}c : index")
+                    e(f"      vector.store {val}, %qs_rot[%qsr{y}] : vector<4xf32>, view<[%qs_rtot]xf32>")
+                    e("    }")
+                    e("  } else {")
+                    e(f"    vector.store {gsig16(e, y, val, '    ')}, %g_flat[%qg_oi{y}] : vector<4xf16>, view<[%qg_tot]xf16>")
+                    e("  }")
+                    if q == 1:
+                        qsplit_tall_sums(e, g, j, tka)
+                elif qg:
                     # always in range; the clamp states it for the bound proof
                     e(f"  %qg_oi{y} = index.min %et_oi{y}, %qg_last4 : index")
                     e(f"  scf.if %qg_isq{g} {{")
@@ -2022,6 +2184,7 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
 
 
 def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
+    assert not (qg and KQG_QSPLIT), "KQG_QSPLIT: the TM = 32 LDS epilogue only"
     """lds_epilogue with the swiglu gate loads issued SW_GATE_AHEAD columns before use (same values).
     Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.

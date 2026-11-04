@@ -883,6 +883,7 @@ class LoomPrefill {
     qnorm_ = geom_.count("qnorm") != 0;
     qg16_ = geom_.count("qg16") != 0;
     gsig_ = geom_.count("gsig") != 0;
+    qsplit_ = geom_.count("qsplit") != 0;
     vtrope_ = geom_.count("vtrope") != 0;
     if (vtrope_ && !(rope_kpaged_ && paged_f16v_)) throw LoomError("vtrope needs the paged fp16 K and V pools");
     if (paged_f16k_ && !rope_kpaged_) throw LoomError("paged fp16 K needs a rope_kpaged HAL set (re-emit)");
@@ -2156,6 +2157,13 @@ class LoomPrefill {
     std::string tensor;
     std::vector<const LoomBuffer*> outs;
   };
+  // qsplit: the q head-norm weight beside a layer's attn_q.weight
+  static std::string QNormName(const std::string& wq) {
+    const std::string suf = "attn_q.weight";
+    if (wq.size() < suf.size() || wq.compare(wq.size() - suf.size(), suf.size(), suf) != 0)
+      throw LoomError("qsplit: not an attn_q weight: " + wq);
+    return wq.substr(0, wq.size() - suf.size()) + "attn_q_norm.weight";
+  }
   bool RunSeg(const std::vector<SegPart>& parts) {
     if (a4_ || trim_row_ >= 0 || !AfChunk()) return false;
     std::string hal = "seg";
@@ -2184,6 +2192,7 @@ class LoomPrefill {
         writes |= std::uint64_t{1} << b.size();
         b.push_back(Ref(*o));
       }
+      if (qsplit_ && std::string(parts[i].kind) == "gemm_kqg") b.push_back(TRef(*Find(QNormName(parts[i].tensor))));
       if (std::string(ts[i].second.name) == "q2k") writes |= std::uint64_t{1} << ostage;
     }
     Dispatch(Exe(hal), "yah_seg", g->second.rowgrp, TokenTiles(g->second), 1, 512, 1, 1, b, writes);
@@ -2237,6 +2246,7 @@ class LoomPrefill {
     for (const LoomBuffer* x :
          std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_, q_, gate_})
       b.push_back(Ref(*x));
+    if (qsplit_) b.push_back(TRef(*Find(QNormName(wname))));
     if (!df.empty()) DfAhead(b);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(df.empty() ? f.name : "f16") + "_kqg").c_str(),
              MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {q_, gate_}));
@@ -2385,6 +2395,7 @@ class LoomPrefill {
     bool qg_fused = !qs.empty();
     if (qg16_ && qg_fused) throw LoomError("f16 q / gate (qg16) needs the GPU kqg GEMM, not the NPU's");
     if (gsig_ && qg_fused) throw LoomError("the kqg GEMM's sigmoid gate (gsig) needs the GPU kqg GEMM, not the NPU's");
+    if (qsplit_ && qg_fused) throw LoomError("the kqg GEMM's split q norm (qsplit) needs the GPU kqg GEMM, not the NPU's");
     if (qg_fused) {
       // the NPU's heads of q (whole heads of 512 rows [256 q | 256 gate]) beside the GPU's heads and k / v;
       // the norm wrote the row-major input unless q, k and v are all afrag
@@ -2414,6 +2425,7 @@ class LoomPrefill {
       iu4_untrack_ = 0;
       if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
       if (gsig_ && !qg_fused) throw LoomError("the sigmoid gate (gsig) needs the kqg GEMM");
+      if (qsplit_ && !qg_fused) throw LoomError("the split q norm (qsplit) needs the kqg GEMM");
       if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
       // ropew: k / v flagged (per-token-tile counters), RoPE polls them instead of a graph barrier. Not when RoPE ends
       // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
@@ -2548,7 +2560,7 @@ class LoomPrefill {
       Dispatch(Exe(ahx), "yah_attn_wmma", pg != geom_.end() ? pg->second.tokens : (B_ + tpw - 1) / tpw,
                pg != geom_.end() ? 1 : kHeads / hpw, 1, 256, 1, 1,
                b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
-      if (kdeq_ && qr16_) AttnDump(ai, ci);
+      if ((kdeq_ && qr16_) || std::getenv("YAH_ATTN_DUMP_QF")) AttnDump(ai, ci);
     }
     trim_row_ = tail_;
     RunResidual(pre + "attn_output.weight", *scratch_, o_af);
@@ -2576,6 +2588,13 @@ class LoomPrefill {
       std::fwrite(h.data(), 1, bytes, f);
       std::fclose(f);
     };
+    // YAH_ATTN_DUMP_QF=1: the whole f32-sized q buffer (raw q under qnorm; qsplit's f16 q, rotary dims and sums), and
+    // without the kv4 dequant pools only it and the output
+    if (std::getenv("YAH_ATTN_DUMP_QF")) dump(".qf", *q_, std::size_t{B_} * kAttn * 4, 0);
+    if (!kdeq_ || !qr16_) {
+      dump(".out", *scratch_, std::size_t{B_} * kAttn * 2, 0);
+      return;
+    }
     dump(".q", *qr16_, std::size_t{B_} * kAttn * 2, 0);
     dump(".kpool", *kdeq_, deq_bytes_, 0);
     if (all && std::getenv("YAH_ATTN_DUMP_V")) dump(".vpool", *vdeq_, deq_bytes_, 0);
@@ -3146,7 +3165,7 @@ class LoomPrefill {
                           bool k_af, bool v_af, bool q_npu) {
     const std::string wq = pre + "attn_q.weight", wo = pre + "attn_output.weight";
     if (!HalvesOn() || hook || !kv_paged_ || !paged_f16k_ || !paged_f16v_ || !rope_kpaged_ || !kv16_scratch_ || kdeq_ ||
-        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || qg16_ || gsig_ ||
+        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || qg16_ || gsig_ || qsplit_ ||
         (q_npu ? DcolImage(wq, nullptr, true).empty() : !HalfOutOk(wo, Af("gemm_kres", wo))))
       return false;
     norm_bfp_.clear();
@@ -3322,6 +3341,7 @@ class LoomPrefill {
   bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only
   bool qg16_ = false;   // the kqg GEMM stores q and gate as f16 (only the GPU kqg path writes them so)
   bool gsig_ = false;   // the kqg GEMM stores the gate's sigmoid (unorm16 bits by default; only the GPU kqg path)
+  bool qsplit_ = false;   // the kqg GEMM stores f16 q w / 16 + rotary dims + sums of q^2 (binds the q norm weight)
   bool vtrope_ = false;  // RoPE stores V^T straight into the paged pool (no yah_vtpage pass)
   bool attn_kq4_ = false, attn_kq8_ = false, attn_vq4_ = false, attn_vq8_ = false, attn_vqt_ = false;
   bool paged_f16k_ = false, paged_f16v_ = false;

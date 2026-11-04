@@ -34,6 +34,8 @@ bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate
          # A4 gu (gen_gemm_iu4): the up tensor beside the gate tensor in "weight"
          "up": wbytes,
          "gate_out": B * MO * 2,
+         # gen_gemm_tile KQG_QSPLIT: the q head-norm weight (256 f32)
+         "qnw": 1024,
          # kst2 (gen_gemm_tile.SPLIT2): each output holds half the rows
          "out2": B * M // 2 * 4,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words

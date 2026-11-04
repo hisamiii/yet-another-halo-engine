@@ -654,7 +654,7 @@ def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
     return r
 
 
-QNORM = True   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
+QNORM = os.environ.get("YAH_QNORM", "1") == "1"   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
 # QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
 QG16 = True
 QG16_ON = False   # set by main
@@ -665,6 +665,15 @@ QG16_ON = False   # set by main
 # gate row: not with the NPU's q rows, f16 q / gate (QG16) or half sets. dispatch.txt "gsig"
 GSIG = os.environ.get("YAH_GSIG", "u16")
 GSIG = "" if GSIG == "0" else GSIG
+# QSPLIT (YAH_QSPLIT=1; with the u16 gate, GPU q rows): the kqg GEMM stores q as f16(q w / 16) plus the raw rotary dims
+# and per-32-dim sums of q^2 (gen_gemm_tile KQG_QSPLIT); the attention RoPEs, and scales S by the norm's 1 / rms
+# (gen_attn_fa R2P_QSPLIT). dispatch.txt "qsplit" (the engine binds the q norm weight to the kqg GEMM)
+QSPLIT = os.environ.get("YAH_QSPLIT", "1") == "1"
+QSPLIT_ON = False   # set by main
+# YAH_ATTN_C0SEED=k: chunk 0's attention HAL from the source reordered by srcseed seed k (0: as emitted). Chunk 0
+# (start_pos 0) and the deeper chunks want different orders for clean WMMA banks (rsurvey); 29 cleans QSPLIT's chunk 0
+# (+0.8 points busiest SQ at depth 0). Any attention source change needs a new sweep (srcseed + rsurvey).
+ATTN_C0SEED = os.environ.get("YAH_ATTN_C0SEED")
 GSIG_ON = False   # set by main
 # KV16 (A4): the K / V GEMMs (kstore, 1024 rows) store f16, RoPE widens them (rope_kv16). dispatch.txt "kv16in"
 KV16 = True
@@ -2201,7 +2210,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, GSIG_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
+    global MODEL, NPU_FFNBLK, QG16_ON, GSIG_ON, QSPLIT_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     E.ASYNC = True
@@ -2244,6 +2253,11 @@ def main():
         gen_gemm_tile.KQG_GSIG, gen_gemm_tile.KQG_GSIG16 = GSIG, GSIG in ("16", "u16")
         gen_attn_fa.GSIG, gen_attn_fa.GSIG16 = GSIG, GSIG in ("16", "u16")
         os.environ["KQG_GSIG"] = os.environ["GSIG"] = GSIG   # (the calibration menu's worker processes)
+    QSPLIT_ON = QSPLIT and GSIG_ON and GSIG in ("16", "u16") and QNORM and gen_attn_fa.Q16 and not a4
+    if QSPLIT_ON:
+        import gen_gemm_tile
+        gen_gemm_tile.KQG_QSPLIT = gen_attn_fa.R2P_QSPLIT = True
+        os.environ["KQG_QSPLIT"] = os.environ["R2P_QSPLIT"] = "1"
 
     n = 0
     df_done = set()
@@ -2409,11 +2423,19 @@ def main():
         geom.append(("qg16", 0, 0, 0))
     if GSIG_ON:
         geom.append(("gsig", 0, 0, 0))
+    if QSPLIT_ON:
+        geom.append(("qsplit", 0, 0, 0))
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
     if os.environ.get("YAH_ATTN_SRC_ONLY"):   # (dev loop: this attention source only, no set)
         shutil.copyfile(attn_src, os.environ["YAH_ATTN_SRC_ONLY"])
         os._exit(0)
+    import srcseed
+    c0seed = int(ATTN_C0SEED) if ATTN_C0SEED is not None else 29 if QSPLIT_ON else 0
+    attn_c0_src = attn_src
+    if c0seed:
+        attn_c0_src = os.path.join(tmp, "yah_attn_hip_c0.loom")
+        open(attn_c0_src, "w").write(srcseed.seed_order(open(attn_src).read(), c0seed))
     attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")
     aov_need = 0
     if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0 and not EMIT_HALF:   # the main kernel with OCNT
@@ -2432,10 +2454,14 @@ def main():
             AF.get((fmt, "kres", mt, kb)) is not None for kind, fmt, port, mt, kb in combos
             if kind == "residual" and (mt, kb) == (320, 24))
     attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
+    attn_t_c0_src = attn_t_src
     if af24:
         gen_attn_fa.TILED_OUT = True
         write_attn(attn_t_src)
         gen_attn_fa.TILED_OUT = False
+        if c0seed:   # (the same seed cleans the fragment-major source's chunk 0)
+            attn_t_c0_src = os.path.join(tmp, "yah_attn_hip_t_c0.loom")
+            open(attn_t_c0_src, "w").write(srcseed.seed_order(open(attn_t_src).read(), c0seed))
     A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = kv_flags
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
@@ -2444,6 +2470,8 @@ def main():
     # 1.5 M cycles break even at ~8K). dispatch.txt "qrot <first chunk>"; the driver rotates q into its own f16 buffer.
     # kv4 under kvdeq: Q rotated from chunk 0 (its K is H256-rotated)
     qrot_first = 0 if kvdeq and deq_bits == 4 else -(-QROT_FROM // B) if gen_attn_fa.K4 and kv_paged and NCH > 1 else NCH
+    if QSPLIT_ON and qrot_first < NCH:   # (the Q rotation kernel and its attention read the f32 q)
+        sys.exit("YAH_QSPLIT: not with the Q rotation kernel (kv4 past QROT_FROM, kvdeq); set YAH_QSPLIT=0")
     attn_qr_src = os.path.join(tmp, "yah_attn_hip_qr.loom")
     attn_qr_t_src = os.path.join(tmp, "yah_attn_hip_qr_t.loom")
     qrot_src = os.path.join(tmp, "yah_qrot.loom")
@@ -2855,7 +2883,7 @@ def main():
           for c in range(NCH) if kvdeq
           for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
                                  (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
-        *[(attn_qr_src if c >= qrot_first else attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
+        *[(attn_qr_src if c >= qrot_first else attn_c0_src if c == 0 else attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
@@ -2867,7 +2895,8 @@ def main():
             "attention_prefill.start_pos=0",
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and qrot_first > 0 else []),
-        *[(attn_qr_t_src if c >= qrot_first else attn_t_src, "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
+        *[(attn_qr_t_src if c >= qrot_first else attn_t_c0_src if c == 0 else attn_t_src,
+           "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
@@ -2908,7 +2937,7 @@ def main():
     def attn_env(loom):
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
-        if loom in (attn_src, attn_t_src, attn_f_src) and (not gen_attn_fa.KDEC or kv8deq):
+        if loom in (attn_src, attn_t_src, attn_f_src, attn_c0_src, attn_t_c0_src) and (not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
     if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)
