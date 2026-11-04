@@ -1134,7 +1134,16 @@ def gen():
                     e(f"  %qdv{c} = vector.load %q_flat[%qda{c}] : view<[%qtot]xf16> -> {V16H}")
                 e(f"  %qdz{c} = scf.select %r_live, %qdv{c}, %zq16x : {V16H}")
                 e(f"  %qf{c} = vector.fragment<rhs> %qdz{c} shape [%k, %n] : {V16H}")
-        if QNORM and R2P:   # the main kernel's per-block prologue on this wave's QNORM block
+        if QNORM and R2P and "noq" in R2P_DIAG:   # diag: no per-unit Q prep (loads, norm, RoPE, exchange): Q = 0
+            def qzero():   # opaque zeros (the queue's zero words 1 + 8c .. 8 + 8c, c < 16: words <= 128 < 264)
+                e("  %qw_na, %qe_na = buffer.assume.noalias %qnw, %qeps : buffer, buffer")   # unused (harness layout)
+                e("  %qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>")
+                e("  %qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>")
+                for c in range(16):
+                    e(f"  %qzw{c} = index.constant {1 + 8 * c} : index")
+                    e(f"  %rinit{c} = vector.load %pqv[%qzw{c}] : view<{PQ_WORDS}xi32> -> vector<8xi32>")
+            qnorm_after = qzero
+        elif QNORM and R2P:   # the main kernel's per-block prologue on this wave's QNORM block
             assert not K4
             en = lambda ln: e(re.sub(r"%qdb\b", "%qdbn", re.sub(r"%wqb\b", "%wqn", ln)))
             qn_own, qn_sums = qnorm_phase1(en)
