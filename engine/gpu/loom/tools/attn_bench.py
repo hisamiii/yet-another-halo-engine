@@ -66,6 +66,10 @@ def layout(text, path):
     # an f16 gate view (gen_attn_fa R2P_GSIG16) covers half the f32 gate allocation: size it as the f32 one
     text = text.replace("%g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf16>",
                         "%g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
+    # an f16 q view beside the q-norm buffers (gen_attn_fa diag q16) covers half the f32 q allocation: size it as f32
+    if "%qnw: buffer" in text:
+        text = text.replace("%q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf16>",
+                            "%q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]xf32>")
     for name, lines in LAYOUTS.items():
         if all(x in text for x in lines):
             break
@@ -117,7 +121,9 @@ def main():
     ap.add_argument("--depths", default="0,8192")
     ap.add_argument("--cap", type=int, default=0, help="cache_capacity for every depth (default depth + 2048)")
     ap.add_argument("--tag", default=os.path.expanduser("~/yah-scratch/attn_bench"))
+    ap.add_argument("--sq", action="store_true", help="also print each variant's sorted per-SQ busy cycles")
     ap.add_argument("--inputs", help="real Q / K / V: <prefix>.q, .kpool, .vpool (loom_prefill YAH_ATTN_DUMP), one depth")
+    ap.add_argument("--qin", help="the Q buffer only, from this file (K / V filled as usual): any depth")
     ap.add_argument("--counters", default="", help="more HRX counters (e.g. SQ_INSTS_VALU,SQ_WAVES): per-call totals")
     ap.add_argument("--att", action="store_true", help="HRX ATT thread trace (one rep): decoded to <tag>/att_<depth>.txt")
     ap.add_argument("variants", nargs="+")
@@ -153,6 +159,11 @@ def main():
                 if got != want:
                     sys.exit(f"refused {a.inputs + ext}: {got} bytes, the kernel reads {want}")
                 bufs[i] = "f:" + a.inputs + ext
+        if a.qin:
+            want = int(bufs[0].split(":")[1])
+            if os.path.getsize(a.qin) != want:
+                sys.exit(f"refused {a.qin}: {os.path.getsize(a.qin)} bytes, the kernel reads {want}")
+            bufs[0] = "f:" + a.qin
         hals = []
         for name, src, text, env, _ in variants:
             gx, gy = grid(text)
@@ -188,7 +199,7 @@ def main():
             d = json.loads(line)
             if d.get("type") == "counter_sample" and d["counter"] == "SQ_BUSY_CYCLES":
                 v = d.get("values") or [d["value"]]
-                samples[d["dispatch_event_id"]] = (sum(v) / len(v), max(v), d.get("duration_ticks", 0))
+                samples[d["dispatch_event_id"]] = (sum(v) / len(v), max(v), d.get("duration_ticks", 0), sorted(v))
             elif d.get("type") == "counter_sample" and d["counter"] in extra:
                 totals[d["dispatch_event_id"], d["counter"]] = sum(d.get("values") or [d["value"]])
         ids = sorted(samples)
@@ -206,6 +217,9 @@ def main():
                   f"of floor)  mean SQ {mean / 1e6:8.3f} ({100 * floor / mean:5.1f}%)  wall {us:9.1f} us" +
                   "".join(f"  {c} {statistics.median(totals[ids[n + r * n + k], c] for r in range(a.reps)):.4g}"
                           for c in extra), flush=True)
+            if a.sq:   # the per-SQ busy cycles of the median-max rep, sorted (Mcyc)
+                r = sorted(rows, key=lambda x: x[1])[len(rows) // 2]
+                print(f"  sq {name}: " + " ".join(f"{x / 1e6:.2f}" for x in r[3]), flush=True)
         os.remove(prof)
     return report
 
