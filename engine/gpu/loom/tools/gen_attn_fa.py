@@ -243,6 +243,9 @@ R2P_PST4 = os.environ.get("R2P_PST4", "0") == "1"
 # and f32 sums of q^2 per 16-dim group [token][head][16] at B * 18432 (ends at B * 19968 <= the f32 q's B * 24576):
 # one f16 rounding per element, as the attention's own. The attention RoPEs dims 0..63 (f32), and the norm's 1 / rms scales S (r log2e in place of log2e).
 R2P_QSPLIT = os.environ.get("R2P_QSPLIT", "0") == "1"
+# R2P_QROT16 (R2P_QSPLIT): RoPE from the f16 halves (f16(q w / 16) x 16) instead of the raw f32 rotary dims and the
+# norm weights: 16 of the unit's 52 KB of Q reads gone, a second rounding on the 64 rotary dims (gate N)
+R2P_QROT16 = os.environ.get("R2P_QROT16", "0") == "1"
 R2P_QPFW = os.environ.get("R2P_QPFW", "0") == "1"   # R2P_QPF: the norm weights from an LDS copy (+1 KB: a 32 KB pool)
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
@@ -519,7 +522,7 @@ def qsplit_phase1(e, nown):
     e("  %qrbase1 = index.add %qrt, %qrh : index")    # (token * 24 + head) * 64
     e("  %qrbase = index.add %qrbase1, %qh16 : index")
     rot = []
-    for k in range(2):
+    for k in range(0 if R2P_QROT16 else 2):
         vs = []
         for j in range(4):
             e(f"  %qrx{k}_{j}a = index.add %qrbase, %qo{32 * k + 4 * j} : index")
@@ -604,7 +607,7 @@ def qnorm_phase2(e, own, root):
     e("  %qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>")
     e("  %qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>")
     e("  %qwb = index.add %hd128, %qh16 : index")
-    wv = {} if R2P_QPF else qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", range(2 if R2P_QSPLIT else nown))
+    wv = {} if R2P_QPF or R2P_QROT16 else qnorm_load(e, "qwv", "%qw_flat", "%c256", "%qwb", range(2 if R2P_QSPLIT else nown))
     e("  %qeps_s = view.load %qe_flat[%c0] : view<[%c1]xf32> -> f32")
     if R2P_QSPLIT:
         qs_nw, qs_halves = qsplit_phase2(e, own, wv)
@@ -744,6 +747,17 @@ def qsplit_phase2(e, own, wv):
         e("  %qslzth = scalar.mulf %qsrms, %qslzc : f32")
     e("  %qsc16 = scalar.constant 0.0625 : f32")
     nw = []
+    if R2P_QROT16:   # q w = f32(f16(q w / 16)) x 16 (exact scaling)
+        e("  %qr16c = scalar.constant 16.0 : f32")
+        for k in range(2):
+            row = []
+            for j in range(16):
+                e(f"  %qrh{k}_{j} = vector.extract {halves[k][j // 8]}[{j % 8}] : {V8H} -> f16")
+                e(f"  %qrf{k}_{j} = scalar.extf %qrh{k}_{j} : f16 to f32")
+                e(f"  %qnw{k}_{j} = scalar.mulf %qrf{k}_{j}, %qr16c : f32")
+                row.append(f"%qnw{k}_{j}")
+            nw.append(row)
+        return nw, halves
     for k in range(2):
         xs = qnorm_scalars(e, f"qrx{k}", rot[k])
         w = qnorm_scalars(e, f"qw{k}", wv[k])

@@ -674,6 +674,9 @@ QSPLIT_ON = False   # set by main
 # (start_pos 0) and the deeper chunks want different orders for clean WMMA banks (rsurvey); 29 cleans QSPLIT's chunk 0
 # (+0.8 points busiest SQ at depth 0). Any attention source change needs a new sweep (srcseed + rsurvey).
 ATTN_C0SEED = os.environ.get("YAH_ATTN_C0SEED")
+# YAH_ATTN_C0ROT16 (QSPLIT, default on): chunk 0's attention RoPEs the f16 halves (gen_attn_fa R2P_QROT16): +1.2..1.8
+# points busiest SQ at depth 0 (gate N, kl_mean 1.7e-6); deeper chunks keep the f32 rotary dims (dirty banks at depth)
+ATTN_C0ROT16 = os.environ.get("YAH_ATTN_C0ROT16", "1") == "1"
 GSIG_ON = False   # set by main
 # KV16 (A4): the K / V GEMMs (kstore, 1024 rows) store f16, RoPE widens them (rope_kv16). dispatch.txt "kv16in"
 KV16 = True
@@ -2432,10 +2435,19 @@ def main():
         os._exit(0)
     import srcseed
     c0seed = int(ATTN_C0SEED) if ATTN_C0SEED is not None else 29 if QSPLIT_ON else 0
-    attn_c0_src = attn_src
-    if c0seed:
-        attn_c0_src = os.path.join(tmp, "yah_attn_hip_c0.loom")
-        open(attn_c0_src, "w").write(srcseed.seed_order(open(attn_src).read(), c0seed))
+    c0rot16 = QSPLIT_ON and ATTN_C0ROT16
+
+    def write_c0(src, path):   # chunk 0's twin of an attention source (c0rot16 regenerates it)
+        if c0rot16:
+            gen_attn_fa.R2P_QROT16 = True
+            write_attn(path)
+            gen_attn_fa.R2P_QROT16 = False
+            src = path
+        if c0seed:
+            text = srcseed.seed_order(open(src).read(), c0seed)
+            open(path, "w").write(text)
+        return path if c0seed or c0rot16 else src
+    attn_c0_src = write_c0(attn_src, os.path.join(tmp, "yah_attn_hip_c0.loom"))
     attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")
     aov_need = 0
     if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0 and not EMIT_HALF:   # the main kernel with OCNT
@@ -2458,10 +2470,8 @@ def main():
     if af24:
         gen_attn_fa.TILED_OUT = True
         write_attn(attn_t_src)
+        attn_t_c0_src = write_c0(attn_t_src, os.path.join(tmp, "yah_attn_hip_t_c0.loom"))
         gen_attn_fa.TILED_OUT = False
-        if c0seed:   # (the same seed cleans the fragment-major source's chunk 0)
-            attn_t_c0_src = os.path.join(tmp, "yah_attn_hip_t_c0.loom")
-            open(attn_t_c0_src, "w").write(srcseed.seed_order(open(attn_t_src).read(), c0seed))
     A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = kv_flags
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
