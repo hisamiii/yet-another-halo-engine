@@ -1637,6 +1637,9 @@ def gen():
                 for c in range(16):
                     e(f"  %qzw{c} = index.constant {1 + 8 * c} : index")
                     e(f"  %rinit{c} = vector.load %pqv[%qzw{c}] : view<{PQ_WORDS}xi32> -> vector<8xi32>")
+                if R2P_QSPLIT:   # (r = 1)
+                    e("  %qsl2e = scalar.constant 1.4426950408889634 : f32")
+                    e(f"  %qslzth = scalar.constant {R2P_LAZY} : f32")
             qnorm_after = qzero
         elif QNORM and R2P:   # the main kernel's per-block prologue on this wave's QNORM block
             assert not K4
