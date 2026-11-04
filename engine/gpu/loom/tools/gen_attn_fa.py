@@ -258,10 +258,11 @@ PERSIST_REV = False
 # PERSIST_DYN (with PERSIST): binding pqueue (after the others), PQ_WORDS i32 (word 0 the counter), zero at launch: each
 # slot takes its next unit from it with an atomic add, after its last unit one fetch past the end, so a launch makes
 # exactly units + P fetches; the one that returns units + P - 1 is the last and resets the counter to zero. Units go
-# long, short, long, ... (QB_ZIGZAG's order) for start_pos < PDYN_ZZ_BELOW, else longest first.
+# long, short, long, ... (QB_ZIGZAG's order) for start_pos < PDYN_ZZ_BELOW, else longest first (busiest SQ, QSPLIT:
+# zigzag wins at 2K..6K by 2.0..0.8 points, longest first at 8K / 12K by 1.0 / 1.25).
 PERSIST_DYN = False
 PQ_WORDS = 264      # PERSIST_DYN: the counter and 256 lanes' zero words (1056 B)
-PDYN_ZZ_BELOW = 16384
+PDYN_ZZ_BELOW = int(os.environ.get("R2P_ZZ_BELOW", "8192"))
 # OCNT: binding ocnt (after the others): after a workgroup barrier lane 0 adds 1 to counter c tt + t (release) for
 # 1024-feature chunk c and 128-token tile t of its output, tt = token_count / 128 (ocnt_need workgroups per counter),
 # so a flag-waiting rotq (gen_rot.gen_qp flag) runs without a graph barrier behind this kernel (every lane adding,
