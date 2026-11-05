@@ -80,13 +80,13 @@ def layout(text, path):
     return name
 
 
-def buffers(lay, cap):
+def buffers(lay, cap, wrap=0):
     npages = (cap + 255) // 256
     pcap = npages * 256
     vpitch = (pcap + 15) // 16 * 16
     q = f"s:{B * 6144 * 4}:1" if lay == "f32q" else f"h:{B * 6144 * 2}:1"
     bufs = [q, f"s:{B * 6144 * 4}:2", f"h:{pcap * 1024 * 2}:3", f"h:{vpitch * 1024 * 2}:4", f"z:{B * 6144 * 2}",
-            f"z:{B * HEADS * 4}", f"p:{npages}"]
+            f"z:{B * HEADS * 4}", f"p:{npages}" + (f":{wrap}" if wrap else "")]
     return bufs + (["c:256:1.0", "c:1:0.000001"] if lay == "f32q" else [])
 
 
@@ -121,6 +121,7 @@ def main():
     ap.add_argument("--depths", default="0,8192")
     ap.add_argument("--cap", type=int, default=0, help="cache_capacity for every depth (default depth + 2048)")
     ap.add_argument("--tag", default=os.path.expanduser("~/yah-scratch/attn_bench"))
+    ap.add_argument("--wrap", type=int, default=0, help="page table maps page j to j %% WRAP (K / V reads stay in WRAP pages)")
     ap.add_argument("--sq", action="store_true", help="also print each variant's sorted per-SQ busy cycles")
     ap.add_argument("--inputs", help="real Q / K / V: <prefix>.q, .kpool, .vpool (loom_prefill YAH_ATTN_DUMP), one depth")
     ap.add_argument("--qin", help="the Q buffer only, from this file (K / V filled as usual): any depth")
@@ -149,7 +150,7 @@ def main():
         cap = a.cap or depth + B
         if depth + B > cap:
             sys.exit(f"depth {depth} + {B} queries past --cap {cap}")
-        bufs = buffers(variants[0][4], cap)
+        bufs = buffers(variants[0][4], cap, a.wrap)
         if any(", %pqueue: buffer)" in v[2] for v in variants):
             bufs.append("z:1056")
         if a.inputs:

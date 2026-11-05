@@ -6,7 +6,7 @@
 //        h:<bytes>:<seed>     f16 in [-1, 1)
 //        s:<bytes>:<seed>     f32 in [-1, 1)
 //        c:<count>:<value>    f32 constant
-//        p:<pages>            i32 identity page table
+//        p:<pages>[:<window>] i32 identity page table (window: page j -> j % window, the K / V reads stay in window pages)
 //   <out>: the binding whose bytes are hashed after each HAL's first dispatch (default 4, the attention output)
 // A HAL that binds fewer buffers gets the first ones. ATTN_BENCH_ZERO=<i>: buffer i must be all zero after the run
 // (a self-resetting work queue counter).
@@ -102,11 +102,16 @@ int main(int argc, char** argv) {
       const float v = strtof(f[2].c_str(), nullptr);
       host.resize(n * 4);
       for (size_t j = 0; j < n; ++j) std::memcpy(&host[4 * j], &v, 4);
-    } else if (f[0] == "p" && f.size() == 2) {
+    } else if (f[0] == "p" && (f.size() == 2 || f.size() == 3)) {
       const size_t n = strtoull(f[1].c_str(), nullptr, 10);
+      const size_t w = f.size() == 3 ? strtoull(f[2].c_str(), nullptr, 10) : n;   // p:<pages>:<window>: page j -> j % window
+      if (w < 1 || w > n) {
+        std::fprintf(stderr, "attn_bench: bad page window %s\n", argv[3 + i]);
+        return 2;
+      }
       host.resize(n * 4);
       for (size_t j = 0; j < n; ++j) {
-        const int32_t v = static_cast<int32_t>(j);
+        const int32_t v = static_cast<int32_t>(j % w);
         std::memcpy(&host[4 * j], &v, 4);
       }
     } else {
