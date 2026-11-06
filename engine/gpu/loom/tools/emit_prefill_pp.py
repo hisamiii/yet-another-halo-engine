@@ -2389,7 +2389,7 @@ def main():
     # Busiest SQ % of floor 11-03: 82.7 / 85.4 / 85.8 / 85.8 at 16K / 32K / 96K / 124K, where the 3-workgroup twins it
     # replaced (KT2, PAIR "deep") ran 75-77 / 73. Not the OCNT kernel (wmmaf.hal: its counters feed a concurrent
     # consumer) nor half sets (the grid kernel: 85.0% to 96K, 73.2% at 124K).
-    persist = 0 if EMIT_HALF else int(os.environ.get("YAH_ATTN_PERSIST", "80"))
+    persist = 0 if EMIT_HALF else int(os.environ.get("YAH_ATTN_PERSIST", str(320 // gen_attn_fa.NQB)))   # 20 WGPs x 4 (2x64: x 2)
     MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=not persist, PERSIST=persist, PV_FENCE=True,
                       R2P=os.environ.get("YAH_ATTN_R2P", "1") != "0", PRO_FAST=os.environ.get("YAH_ATTN_PROF", "1") != "0")
     # YAH_ATTN_PREV=1 (with PERSIST): half the slots run their snake rounds in reverse (gen_attn_fa PERSIST_REV):
@@ -2472,6 +2472,24 @@ def main():
         write_attn(attn_t_src)
         attn_t_c0_src = write_c0(attn_t_src, os.path.join(tmp, "yah_attn_hip_t_c0.loom"))
         gen_attn_fa.TILED_OUT = False
+    # YAH_ATTN_W64=<chunk>: chunks from <chunk> on run the 2 x 64 R2P kernel (half the K / V staging per MMA, bit-identical).
+    # Its 16-wave workgroups run 2 per WGP and phase-lock: it wins only at depth.
+    w64_from = int(os.environ.get("YAH_ATTN_W64", "0")) or NCH
+    attn64_src = attn64_t_src = None
+    persist64 = persist // 2
+    if w64_from < NCH:
+        assert MAIN_FLAGS["R2P"] and persist and (a_hpw, a_qt) == (2, 32) and w64_from >= 1
+        gen_attn_fa.configure(2, 64)
+        MAIN_FLAGS["PERSIST"] = persist64
+        attn64_src = os.path.join(tmp, "yah_attn_hip64.loom")
+        write_attn(attn64_src)
+        if af24:
+            attn64_t_src = os.path.join(tmp, "yah_attn_hip64_t.loom")
+            gen_attn_fa.TILED_OUT = True
+            write_attn(attn64_t_src)
+            gen_attn_fa.TILED_OUT = False
+        MAIN_FLAGS["PERSIST"] = persist
+        gen_attn_fa.configure(a_hpw, a_qt)
     A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = kv_flags
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
@@ -2893,7 +2911,8 @@ def main():
           for c in range(NCH) if kvdeq
           for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
                                  (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
-        *[(attn_qr_src if c >= qrot_first else attn_c0_src if c == 0 else attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
+        *[(attn_qr_src if c >= qrot_first else attn_c0_src if c == 0 else attn64_src if c >= w64_from else attn_src,
+           "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
@@ -2905,7 +2924,7 @@ def main():
             "attention_prefill.start_pos=0",
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and qrot_first > 0 else []),
-        *[(attn_qr_t_src if c >= qrot_first else attn_t_c0_src if c == 0 else attn_t_src,
+        *[(attn_qr_t_src if c >= qrot_first else attn_t_c0_src if c == 0 else attn64_t_src if c >= w64_from else attn_t_src,
            "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
@@ -2947,7 +2966,8 @@ def main():
     def attn_env(loom):
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
-        if loom in (attn_src, attn_t_src, attn_f_src, attn_c0_src, attn_t_c0_src) and (not gen_attn_fa.KDEC or kv8deq):
+        if loom in (attn_src, attn_t_src, attn_f_src, attn_c0_src, attn_t_c0_src, attn64_src, attn64_t_src) and (
+                not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
     if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)
@@ -2968,12 +2988,12 @@ def main():
             if hal_vgprs(hal) > ATTN_VGPR:   # (3 workgroups per WGP instead of 4)
                 print("attention %s: %d VGPRs, over %d" % (outname, hal_vgprs(hal), ATTN_VGPR))
         if outname.startswith("wmma") and persist and outname != "wmmaf.hal":
-            persist_rows.append(outname)
+            persist_rows.append((outname, persist64 if loom in (attn64_src, attn64_t_src) else persist))
         n += 1
     if persist_rows:   # the persistent attention HALs launch persist workgroups on x only
         with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
-            for hal in persist_rows:
-                fh.write("persist_%s %d 1 %d\n" % (hal, persist, pdyn))
+            for hal, slots in persist_rows:
+                fh.write("persist_%s %d 1 %d\n" % (hal, slots, pdyn))
 
     tables = os.path.join(E.LOOM, "tables")
     for src, dst in [] if EMIT_HALF else [("grid_iq3s.bin", "grid_iq3s.bin"),
