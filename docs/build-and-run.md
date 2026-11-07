@@ -8,7 +8,7 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 - The official ROCm Core SDK 10.0.0 runtime packages, extracted (no system install) by `engine/hrx-env.sh --fetch` into `external/rocm10` (`YAH_ROCM` overrides). Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
 - `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`; `/opt/rocm` stays usable. The Python emitters find the same paths through `engine/gpu/loom/hrx_paths.py`.
 - The model: `~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf`.
-- Python 3 with numpy for the emitters. The checkers also need llama.cpp's `gguf-py` on `PYTHONPATH`; use an OpenBLAS numpy (`/home/q/yah-scratch/venv/bin/python`), the system numpy is ~100x slower for the gate tools.
+- Python 3 with numpy for the emitters. The checkers also need llama.cpp's `gguf-py` on `PYTHONPATH`; use an OpenBLAS numpy (`/home/q/Development/Scratch/venv/bin/python`), the system numpy is ~100x slower for the gate tools.
 
 ### HRX patches
 
@@ -79,7 +79,7 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 
 `engine/build_hrx.sh <gguf> [dir]` also emits a decode set (default `engine/hal`), which the end-to-end gates use.
 
-Big sets belong in `~/yah-scratch` or `/home/q/yah-hal-*`, not in the repo.
+Big sets belong in `~/Development/Scratch` or `/home/q/yah-hal-*`, not in the repo.
 
 ## Run
 
@@ -182,7 +182,7 @@ It checks the C++ chat template byte for byte against `engine/serve/testdata/cha
 | `tools/dattn_check.py <gguf> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
 | `tools/sample_check.py <gguf> <work> [draws]` | the decode sampler against a numpy model of it (token for token), the model against the exact top-p distribution | sampler changes |
 | `tools/dattn_q_check.py <gguf> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
-| `engine/run/gate/kld_ref.py <model> <set> <ref.bin> <workdir> [chunks]` | KL vs the BF16 model: hipfire's HFKLDR reference (24 wikitext-2 chunks of 2048, top-256 log-probs of positions 1024..2046; `~/yah-scratch/w4/kld/qwen3.8-27b.ref_wt2.bin`), one pp2048 per chunk, scored as hipfire's `eval_hipfire` scores; prints mean / p99 / p99.9 / max KL, top-1, PPL | HFQ model numerics |
+| `engine/run/gate/kld_ref.py <model> <set> <ref.bin> <workdir> [chunks]` | KL vs the BF16 model: hipfire's HFKLDR reference (24 wikitext-2 chunks of 2048, top-256 log-probs of positions 1024..2046; `~/Development/Scratch/w4/kld/qwen3.8-27b.ref_wt2.bin`), one pp2048 per chunk, scored as hipfire's `eval_hipfire` scores; prints mean / p99 / p99.9 / max KL, top-1, PPL | HFQ model numerics |
 | `engine/run/gate/` (`gate_run.sh`, `accgate2.py`) | tiered accuracy gate on wikitext windows, all-position logits (`YAH_LOGITS_FROM`): T1 rounding level, T2 quantization level. See `engine/run/gate/README.md` | any numerics change |
 | `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `YAH_ROWSTATS` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |
 | `engine/tests/m0_gate.sh <gguf> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
@@ -224,7 +224,7 @@ Rules:
 4. Clamp a vector load by its own width: `min(addr, N - width)`. A clamp copied from a 4-wide load onto a 2-wide load shifts the last element.
 5. Never bind a buffer smaller than the kernel's declared footprint. The prefill emitter runs `tools/footprint_gate.py`; `hal_run` checks declared sizes; `tools/safe_bench.py` and `tools/loom_preflight.py` check the compile report's footprint against the bindings.
 6. Rebuild drivers with `engine/build_hrx.sh` after every source change, and do not edit `engine/run/*.cc` during a measuring round (`gpu_run.sh` will then refuse the remaining runs).
-7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
+7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/Development/Scratch/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
 8. A launched chunk graph waits on NPU done words (~2 s bound each). Never leave it waiting on jobs that will not run: when queueing them fails, release the waits (`NpuSplit::Release`); a failed wait sets a sticky status that ends every later wait at once. A graph of ~250 unreleased waits (before the sticky status) spun for minutes, starved the display ring and needed a reset. Test new NPU host paths CPU-driven first (no GPU kernels), then end to end.
 
 9. New NPU work goes through the safe tools first: the kernels' oracle checks (`split_gemm_check.py`, `npu_rem_check.py` with `REM_LEAD`, `npu_unpack_check.py` with `UNP_DUP`, footprint gates), then the NPU host path CPU-driven: `YAH_NPU_CPU=1 loom_forward_pp ...` records the chunk, launches no GPU work, stores each job's ready word from the host and reports the first job that stalls or fails. Only then end to end. For a stall: `YAH_NPU_CPU_JOBS=list` prints the chunk's jobs, `YAH_NPU_CPU_JOBS=a-b,c-d` runs only those (keep whole family runs: the gate values count per run) to bisect image transitions; `YAH_NPU_CPU_STALL_CMD="python3 tools/npu_aie_status.py > stall.txt"` dumps every column's DMA / core / lock state while the stalled context lives, `YAH_NPU_CPU_HOLD=<job>` runs the command with that job parked at its gate (the healthy reference) and `YAH_NPU_CPU_DONE_CMD` after the last job.
