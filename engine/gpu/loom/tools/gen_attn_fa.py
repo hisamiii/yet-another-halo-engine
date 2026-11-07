@@ -175,10 +175,6 @@ KRAW_RD_STEP = int(_krs) if _krs else None
 R2P = False
 R2P_QKF = int(os.environ.get("R2P_QKF", "1"))   # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
 R2P_PVF = int(os.environ.get("R2P_PVF", "1"))   # R2P: the same for the V^T fragments
-# R2P_PVDB: the P.V wave's V^T fragments double buffered in a fenced order (load f + 1, then fragment f's MMAs), so
-# a fragment load never waits for the MMAs reading the previous one (the ATT trace: a single buffer leaves each wave
-# ~35 ticks of register reuse + a 42-tick LDS round trip between MMA pairs). Same arithmetic
-R2P_PVDB = os.environ.get("R2P_PVDB", "0") == "1"
 # R2P_KPOS: where the P.V wave stores K(ks + 16) in phase B: "p" (default) after its P^T loads, "" right after barrier A
 # (ahead of them in the in-order LDS queue: the first P.V MMA waited for the K stores), "0".."7" after V^T fragment f's
 # MMAs (from "1": 203 VGPRs). "p": busiest SQ +0.6 / +0.1 / +0.4..0.9 at 64K / 8K / 0, bit-identical; with it the
@@ -3054,17 +3050,9 @@ def gen():
                 e(f"{ind}%{pp}vf{f} = vector.fragment<lhs> %{pp}vc{f} shape [%m, %k] : {V16H}")
                 return
             e(f"{ind}%{pp}vf{f} = vector.fragment.load<lhs> %v_view[%{pp}vr{f}, %c0] shape [%m, %k] : view<256x{VT_PITCH}xf16> -> {V16H}")
-        if R2P_PVDB:
-            assert "halfv" not in R2P_DIAG
-            vload(0)
-            e(f"{ind}scf.schedule.fence")
         for f in range(8):
             vc = f - 1 if "halfv" in R2P_DIAG and f % 2 else f
-            if R2P_PVDB:
-                if f < 7:
-                    vload(f + 1)
-                    e(f"{ind}scf.schedule.fence")
-            elif vc == f:
+            if vc == f:
                 vload(f)
             if "dblv" in R2P_DIAG:   # diag: the second head's MMA from its own fragment load (cols + 8, in the pad)
                 e(f"{ind}%{pp}vf{f}b = vector.fragment.load<lhs> %v_view[%{pp}vr{f}, %c8] shape [%m, %k] : view<256x{VT_PITCH}xf16> -> {V16H}")
@@ -3077,7 +3065,7 @@ def gen():
                 outs[o] = f"%{pp}nxi{o}"
             if hook:
                 hook(str(f))
-            if f < 7 and (R2P_PVDB or (f + 1) % R2P_PVF == 0):
+            if f < 7 and (f + 1) % R2P_PVF == 0:
                 e(f"{ind}scf.schedule.fence")
         return outs
 
