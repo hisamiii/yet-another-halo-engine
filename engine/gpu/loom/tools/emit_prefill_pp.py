@@ -2477,6 +2477,16 @@ def main():
     w64_from = int(os.environ.get("YAH_ATTN_W64", "0")) or NCH
     attn64_src = attn64_t_src = None
     persist64 = persist // 2
+    # YAH_ATTN_KVG64=g: the 2 x 64 kernels (and their key split) deal units g KV heads at a time (gen_attn_fa ATTN_KVG,
+    # L2 reuse at depth, energy); the 2 x 32 and chunk-0 kernels keep the default order (KVG costs them busiest SQ:
+    # -1.7 at depth 0, -1.4 at 8K, bit-identical).
+    kvg_main, kvg64 = gen_attn_fa.KVG, int(os.environ.get("YAH_ATTN_KVG64", str(gen_attn_fa.KVG)))
+    gen_attn_fa.KVG = kvg64
+    # YAH_ATTN_QFOLD64=0|1|2: the 2 x 64 kernels fold r log2e into Q (gen_attn_fa R2P_QFOLD mode). mode 2 is the default
+    # with YAH_ATTN_KVG64 (kv8 gpuk8v: 64K busiest SQ 88.0 -> 88.3, 126K slot KL 3.0e-7, 0 flips); mode 1 and the 2 x 32
+    # kernel lose (WMMA bank rank 14-16: 64K -1.2, 8K -1.7..-2.3)
+    qfold_main = gen_attn_fa.R2P_QFOLD
+    gen_attn_fa.R2P_QFOLD = int(os.environ.get("YAH_ATTN_QFOLD64", "2" if os.environ.get("YAH_ATTN_KVG64") else str(qfold_main)))
     if w64_from < NCH:
         assert MAIN_FLAGS["R2P"] and persist and (a_hpw, a_qt) == (2, 32) and w64_from >= 1
         gen_attn_fa.configure(2, 64)
@@ -2490,6 +2500,45 @@ def main():
             gen_attn_fa.TILED_OUT = False
         MAIN_FLAGS["PERSIST"] = persist
         gen_attn_fa.configure(a_hpw, a_qt)
+    # YAH_ATTN_KSPLIT=<chunk>: from that 2 x 64 chunk on, the tail units (units % slots) run as 5 key pieces in a
+    # two-kernel split: wmma[_t]_c<c>.hal stores the pieces' f32 partials (gen_attn_fa R2P_DIAG ksstore), then
+    # wmmak[_t]_c<c>.hal merges them in piece order and writes the tail units' output (ksmerge). Busiest SQ -5.7% at
+    # 126K (balanced rounds), not bit-identical. dispatch.txt "ksplit_<hal> <partial floats> 0 0": the driver binds a
+    # partials buffer after the queue and runs the merge after the attention. (ATTN_KSPLIT alone, the one-kernel split
+    # with a cross-workgroup merge, hung the GPU: refused)
+    if gen_attn_fa.KSPLIT:
+        sys.exit("ATTN_KSPLIT: the one-kernel split hangs the GPU; use YAH_ATTN_KSPLIT=<chunk>")
+    ks_from = int(os.environ.get("YAH_ATTN_KSPLIT", "0")) or NCH
+    attn64ks_src = attn64ks_t_src = attn64km_src = attn64km_t_src = None
+    ks_floats = 0
+    if ks_from < NCH:
+        assert w64_from <= ks_from and pdyn and not EMIT_HALF
+        gen_attn_fa.configure(2, 64)
+        MAIN_FLAGS["PERSIST"] = persist64
+        gen_attn_fa.KSPLIT = 5
+        for diag, stem in (("ksstore", "ks"), ("ksmerge", "km")):
+            gen_attn_fa.R2P_DIAG.add(diag)
+            p = os.path.join(tmp, "yah_attn_hip64%s.loom" % stem)
+            write_attn(p)
+            pt = None
+            if af24:
+                pt = os.path.join(tmp, "yah_attn_hip64%s_t.loom" % stem)
+                gen_attn_fa.TILED_OUT = True
+                write_attn(pt)
+                gen_attn_fa.TILED_OUT = False
+            gen_attn_fa.R2P_DIAG.discard(diag)
+            if stem == "ks":
+                attn64ks_src, attn64ks_t_src = p, pt
+            else:
+                attn64km_src, attn64km_t_src = p, pt
+        p0, gen_attn_fa.PERSIST = gen_attn_fa.PERSIST, persist64   # write_attn applies MAIN_FLAGS only while it generates
+        ks_floats = gen_attn_fa.ksplit_floats()
+        gen_attn_fa.PERSIST = p0
+        gen_attn_fa.KSPLIT = 0
+        MAIN_FLAGS["PERSIST"] = persist
+        gen_attn_fa.configure(a_hpw, a_qt)
+    gen_attn_fa.KVG = kvg_main
+    gen_attn_fa.R2P_QFOLD = qfold_main
     A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = kv_flags
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
@@ -2524,9 +2573,14 @@ def main():
         open(qrot_src, "w").write(A.gen_qrot())
         geom.append(("qrot", qrot_first, 0, 0))
     if kvdeq:
-        open(kdeq_src, "w").write(gen_attn_fa.gen_kdeq(deq_bits))
+        # ATTN_KRAW=1 (env, read by gen_attn_fa): kdeq8 writes the raw codes and the kscale buffer the attention scales
+        # its partials by (dispatch.txt "kraw")
+        assert not gen_attn_fa.KRAW or deq_bits == 8
+        open(kdeq_src, "w").write(gen_attn_fa.gen_kdeq(deq_bits, raw=gen_attn_fa.KRAW, khalf=gen_attn_fa.KH))
         open(vdeq_src, "w").write(gen_attn_fa.gen_vdeq(deq_bits))
         geom.append(("kvdeq", 0, 0, 0))
+        if gen_attn_fa.KRAW:
+            geom.append(("kraw", 0, 0, 0))
     geom.append(("wmma.hal", a_qt, a_hpw, (B + a_qt - 1) // a_qt))
     # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md).
     # K: int8 (yah_kq8) or H256 + asymmetric int4 (yah_kq4) after yah_kmean centres it; the attention decodes it to f16.
@@ -2911,7 +2965,8 @@ def main():
           for c in range(NCH) if kvdeq
           for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
                                  (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
-        *[(attn_qr_src if c >= qrot_first else attn_c0_src if c == 0 else attn64_src if c >= w64_from else attn_src,
+        *[(attn_qr_src if c >= qrot_first else attn_c0_src if c == 0 else attn64ks_src if c >= ks_from
+           else attn64_src if c >= w64_from else attn_src,
            "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
@@ -2924,13 +2979,21 @@ def main():
             "attention_prefill.start_pos=0",
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and qrot_first > 0 else []),
-        *[(attn_qr_t_src if c >= qrot_first else attn_t_c0_src if c == 0 else attn64_t_src if c >= w64_from else attn_t_src,
+        *[(attn_qr_t_src if c >= qrot_first else attn_t_c0_src if c == 0 else attn64ks_t_src if c >= ks_from
+           else attn64_t_src if c >= w64_from else attn_t_src,
            "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH) if af24],
+        *[(src_, "%s_c%d.hal" % (stem_, c), [   # (YAH_ATTN_KSPLIT: the merge kernels)
+            "attention_prefill.cache_capacity=%d" % T,
+            "attention_prefill.token_count=%d" % B,
+            "attention_prefill.start_pos=%d" % (c * B),
+            "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
+            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(ks_from, NCH)
+          for src_, stem_ in ((attn64km_src, "wmmak"),) + (((attn64km_t_src, "wmmak_t"),) if af24 else ())],
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
           if vtrans_src else []),
@@ -2966,13 +3029,14 @@ def main():
     def attn_env(loom):
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
-        if loom in (attn_src, attn_t_src, attn_f_src, attn_c0_src, attn_t_c0_src, attn64_src, attn64_t_src) and (
+        if loom in (attn_src, attn_t_src, attn_f_src, attn_c0_src, attn_t_c0_src, attn64_src, attn64_t_src,
+                    attn64ks_src, attn64ks_t_src, attn64km_src, attn64km_t_src) and loom is not None and (
                 not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
     if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)
         fixed = [f for f in fixed if f[1].startswith(("prepab", "rowsplit", "postnorm", "rope", "vtpage", "wmma"))]
-    persist_rows = []
+    persist_rows, ks_rows = [], []
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
         if outname.startswith("wmma"):   # attn_guard: Loom's allocator can land a variant in its O-accumulator back-edge
@@ -2988,12 +3052,17 @@ def main():
             if hal_vgprs(hal) > ATTN_VGPR:   # (3 workgroups per WGP instead of 4)
                 print("attention %s: %d VGPRs, over %d" % (outname, hal_vgprs(hal), ATTN_VGPR))
         if outname.startswith("wmma") and persist and outname != "wmmaf.hal":
-            persist_rows.append((outname, persist64 if loom in (attn64_src, attn64_t_src) else persist))
+            persist_rows.append((outname, persist64 if loom in (attn64_src, attn64_t_src, attn64ks_src, attn64ks_t_src,
+                                                                attn64km_src, attn64km_t_src) else persist))
+            if loom in (attn64ks_src, attn64ks_t_src):
+                ks_rows.append(outname)
         n += 1
     if persist_rows:   # the persistent attention HALs launch persist workgroups on x only
         with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
             for hal, slots in persist_rows:
                 fh.write("persist_%s %d 1 %d\n" % (hal, slots, pdyn))
+            for hal in ks_rows:
+                fh.write("ksplit_%s %d 0 0\n" % (hal, ks_floats))
 
     tables = os.path.join(E.LOOM, "tables")
     for src, dst in [] if EMIT_HALF else [("grid_iq3s.bin", "grid_iq3s.bin"),

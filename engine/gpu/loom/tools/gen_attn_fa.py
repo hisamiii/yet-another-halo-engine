@@ -149,6 +149,22 @@ PRO_FAST = False
 # correction (within ~1 f32 ulp before the f16 store; not bit-exact)
 R2P_EPI_LITE = os.environ.get("R2P_EPI_LITE", "0") == "1"
 KVMAJOR = False     # workgroup order KV head slowest (lost: +67% at 96K, see docs/results.md)
+# ATTN_KVG=g (diag, PERSIST_DYN): the queue deals units g KV heads at a time (heads interleaved, then pairs, then query
+# blocks), so the 40 slots share fewer K / V streams in L2; per-unit math unchanged (bit-identical)
+KVG = int(os.environ.get("ATTN_KVG", "0"))
+# ATTN_KRAW (R2P, paged f16 pools, kv8 sets): the K pool holds the raw codes u - 128 (exact f16 integers: few mantissa
+# bits, cheaper WMMA operands) and binding kscale their scales s, f16 [KV head][128-dim half][pool row]. Each QK wave's
+# partials span one half: the P.V waves stage the tile's scales (f32) into LDS beside K; after its chain the wave scales
+# the partner's partial by its half's s before the exchange and forms S = fma(own, s, partner's) after it. Exact
+# products; not bit-identical to the f16 s (u - 128) pool (no rounding of K).
+KRAW = os.environ.get("ATTN_KRAW", "0") == "1"
+# ATTN_KHALF=1 (with ATTN_KRAW=1): kdeq8 writes each row's larger-scale half as the exact codes u - 128 and the other
+# half as f16((u - 128) s / s_big), kscale s_big (both halves); attention forms S = (own + partner's) s_big after
+# barrier A (no exchange-side work) and folds the old (S - m) r log2e into fma(S, r log2e, -m r log2e).
+KH = os.environ.get("ATTN_KHALF", "0") == "1"
+assert not KH or KRAW
+_krs = os.environ.get("ATTN_KRAW_STEP", "")   # KRAW: the QK chain step after which the scales are read ("" = after it)
+KRAW_RD_STEP = int(_krs) if _krs else None
 # R2P: reuse-2 role split (8 waves = 2 groups of 2 query blocks x (2 QK waves + 2 P.V waves), each group = the 2 heads of
 # one 16-row query half). A QK wave holds Q of both heads for its head-dim half: each K fragment feeds 2 MMAs, the
 # other head's partial goes to its QK partner through LDS, and it runs the softmax of its own head once (P^T / alpha to
@@ -247,6 +263,10 @@ R2P_QSPLIT = os.environ.get("R2P_QSPLIT", "0") == "1"
 # norm weights: 16 of the unit's 52 KB of Q reads gone, a second rounding on the 64 rotary dims (gate N)
 R2P_QROT16 = os.environ.get("R2P_QROT16", "0") == "1"
 R2P_QPFW = os.environ.get("R2P_QPFW", "0") == "1"   # R2P_QPF: the norm weights from an LDS copy (+1 KB: a 32 KB pool)
+# R2P_QFOLD (R2P_QSPLIT): the traded Q fragments are scaled once per unit by f16(r log2e), so S is in log2 units and
+# the softmax drops its per-element scale (8 muls / tile) and the scalar log2e muls (gate N: one more f16 rounding of Q)
+R2P_QFOLD = int(os.environ.get("R2P_QFOLD", "0"))   # 1: at the dead-row select; 2: each wave scales its own halves
+# before the trade (the RoPE ones in f32, folded into the 0.0625)
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
 # PERSIST = P > 0: P workgroups (one per slot: 20 WGPs x 4) each run a list of units (query block, head pair) in a
@@ -265,6 +285,18 @@ PERSIST_REV = False
 # zigzag wins at 2K..6K by 2.0..0.8 points, longest first at 8K / 12K by 1.0 / 1.25).
 PERSIST_DYN = False
 PQ_WORDS = 264      # PERSIST_DYN: the counter and 256 lanes' zero words (1056 B)
+# ATTN_KSPLIT=K (R2P_SPLIT PERSIST_DYN): the last partial round's units (units % P, the tail) run as K key pieces each
+# (32-key aligned, piece-major after the whole units in the queue), so every slot ends with the same work. Binding
+# ksplit (after pqueue): 64 monotonic i32 counters, then per piece and P.V lane 132 f32: O (16 fragments), the row sums
+# and maxes x log2e of both heads. The K-th arriver of a unit merges the K partials in piece order and runs the epilogue
+# (deterministic, not bit-identical: gate N). Off below start_pos KSPLIT_MIN (pieces of short units)
+KSPLIT = int(os.environ.get("ATTN_KSPLIT", "0"))
+KSPLIT_MIN = 4096
+
+
+def ksplit_floats():
+    """The ksplit binding's partials (f32) after its 64 counters: (P - 1) K pieces of 32 NQB P.V lanes x 132"""
+    return (PERSIST - 1) * KSPLIT * 32 * NQB * 132
 PDYN_ZZ_BELOW = int(os.environ.get("R2P_ZZ_BELOW", "8192"))
 # OCNT: binding ocnt (after the others): after a workgroup barrier lane 0 adds 1 to counter c tt + t (release) for
 # 1024-feature chunk c and 128-token tile t of its output, tt = token_count / 128 (ocnt_need workgroups per counter),
@@ -760,11 +792,27 @@ def qsplit_phase2(e, own, wv):
     e("  %qme = scalar.addf %qmean, %qeps_s : f32")
     e("  %qinv = scalar.rsqrtf %qme : f32")
     e("  %qsl2e = scalar.mulf %qinv, %log2e : f32")
-    if R2P_LAZY:   # the lazy rescale threshold in S' = S / r units: R2P_LAZY rms (= R2P_LAZY / r), or p outgrows f16
+    if R2P_LAZY and R2P_QFOLD:   # S in log2 units: R2P_LAZY nats = R2P_LAZY log2e
+        e(f"  %qslzth = scalar.constant {R2P_LAZY * 1.4426950408889634} : f32")
+    elif R2P_LAZY:   # the lazy rescale threshold in S' = S / r units: R2P_LAZY rms (= R2P_LAZY / r), or p outgrows f16
         e("  %qsrms = scalar.mulf %qme, %qinv : f32")
         e(f"  %qslzc = scalar.constant {R2P_LAZY} : f32")
         e("  %qslzth = scalar.mulf %qsrms, %qslzc : f32")
-    e("  %qsc16 = scalar.constant 0.0625 : f32")
+    if R2P_QFOLD == 2:   # f16(q w / 16) x f16(r log2e) for the halves loaded before the barrier; RoPE ones fold in f32
+        e("  %qsc16b = scalar.constant 0.0625 : f32")
+        e("  %qsc16 = scalar.mulf %qsc16b, %qsl2e : f32")
+        e("  %qfl2h = scalar.fptrunc %qsl2e : f32 to f16")
+        e(f"  %qfl2v8 = vector.splat %qfl2h : {V8H}")
+        sh = []
+        for k, hk in enumerate(halves):
+            row = []
+            for t, hv in enumerate(hk):
+                e(f"  %qsf{k}_{t} = vector.mulf {hv}, %qfl2v8 : {V8H}")
+                row.append(f"%qsf{k}_{t}")
+            sh.append(row)
+        halves = sh
+    else:
+        e("  %qsc16 = scalar.constant 0.0625 : f32")
     nw = []
     if R2P_QROT16:   # q w = f32(f16(q w / 16)) x 16 (exact scaling)
         e("  %qr16c = scalar.constant 16.0 : f32")
@@ -1087,12 +1135,161 @@ def gen():
         for i in range(R2P_VPAD):
             e(f"  %vpf{i} = scalar.bitcast %vpv{i} : i32 to f32")
             e(f"  %lsum_l{i + 1 if i + 1 < R2P_VPAD else ''} = scalar.addf %lsum_l{i}, %vpf{i} : f32")
+    def ksplit_merge(i0):
+        """KS, after the last P.V: the unit's O / row sums (defined from L[i0] on) are renamed to its partial; a piece
+        stores its partial (P.V lanes), takes its arrival, and the K-th arriver loads all K in piece order and merges:
+        M = max m_i, f_i = 2^(m_i - M), O = sum f_i O_i, l = sum f_i l_i (m: row max x log2e, so f is the softmax's own
+        exponent base). %kpwr: this workgroup writes the unit's output (a whole unit, or the merging piece)."""
+        tk = re.compile(r"%(og\d+|lsum_lo|lsum_l)(?![A-Za-z0-9_])")
+        L[i0:] = [tk.sub(lambda m: "%k_" + m.group(1), ln) for ln in L[i0:]]
+        K = KSPLIT
+        R = 32 * NQB * 132   # one piece's floats
+        rt = f"{', '.join([V8] * 16)}, f32, f32"
+        e(f"  %lm_own = view.load %lm_view[%pa_own] : view<{16 * NQB}xf32> -> f32")
+        e(f"  %lm_oth = view.load %lm_view[%pa_oth] : view<{16 * NQB}xf32> -> f32")
+        outs = [f"%og{f}" for f in range(16)] + ["%lsum_l", "%lsum_lo", "%kpwr"]
+        own = [f"%k_og{f}" for f in range(16)] + ["%k_lsum_l", "%k_lsum_lo"]
+        if "ksnoep" in R2P_DIAG:   # diag (compile bisect): the pieces' epilogue as a whole unit's (wrong results)
+            for f in range(16):
+                e(f"  %og{f} = vector.bitcast %k_og{f} : {V8} to {V8}")
+            e("  %lsum_l = scalar.addf %k_lsum_l, %zero : f32")
+            e("  %lsum_lo = scalar.addf %k_lsum_lo, %zero : f32")
+            e("  %kpwr = index.cmp eq, %c0, %c0 : index")
+            return
+        e(f"  {', '.join(outs)} = scf.if %kpis -> ({rt}, i1) {{")
+        e(f"    %kpvt0 = index.rem %tid, %c{32 * NQB} : index")   # the P.V lane (QK lanes: an alias, never stored)
+        e("    %kpr0 = index.mul %kpvt0, %c132k : index")
+        e(f"    %kprp = index.constant {R} : index")
+        e("    %kprq = index.mul %kpq, %kprp : index")
+        e("    %kpr = index.add %kprq, %kpr0 : index")
+        ksm = "ksmerge" in R2P_DIAG
+        if not ksm:   # kernel 2 stores no partial of its own (its dummy range is unused)
+            e("    scf.if %isB {")
+            for f in range(16):
+                e(f"      %kpa{f} = index.add %kpr, %c{8 * f}k : index")
+                e(f"      vector.store %k_og{f}, %kspv[%kpa{f}] : {V8}, view<{ksplit_floats()}xf32>")
+            for i, v in enumerate(("%k_lsum_l", "%k_lsum_lo", "%lm_own", "%lm_oth")):
+                e(f"      %kpa{16 + i} = index.add %kpr, %c{128 + i}k : index")
+                e(f"      view.store {v}, %kspv[%kpa{16 + i}] : f32, view<{ksplit_floats()}xf32>")
+            e("    }")
+        if "ksstore" in R2P_DIAG:   # two-kernel split, kernel 1: a piece stores its partial and writes no output (no
+            # arrival, no barrier, no atomic: a separate merge kernel reads the partials after this launch)
+            e("    %kpzu = index.cast %wglp : index to i32")
+            e("    %kpzi = scalar.andi %pwz0, %kpzu : i32")
+            e("    %kpzf = scalar.bitcast %kpzi : i32 to f32")
+            e(f"    %kpz8 = vector.splat %kpzf : {V8}")
+            e("    %kpwf = index.cmp ne, %c0, %c0 : index")
+            e(f"    scf.yield {', '.join(['%kpz8'] * 16 + ['%one', '%one'])}, %kpwf : {rt}, i1")
+            e("  } else {")
+            e("    %kpwt = index.cmp eq, %c0, %c0 : index")
+            e(f"    scf.yield {', '.join(own)}, %kpwt : {rt}, i1")
+            e("  }")
+            return
+        if ksm:   # kernel 2: kernel 1's stores are complete (the launch boundary), this workgroup's P.V waves merge.
+            # Only them: a QK lane aliases a P.V lane's record (tid % 256), and its merged stores over piece 0 raced the
+            # P.V wave's loads of it (fragments merged twice, per wave and fragment; measured on the chain run)
+            e("    %kplast = scalar.andi %isB, %isB : i1")
+        # gen_rot.last_arriver: release barrier, lane 0's device add (monotonic: last when old % K == K - 1), acquire
+        if not ksm:
+            e("    kernel.barrier<global> scope(workgroup) ordering(acq_rel)")
+            e("    %kpfb = index.constant 4 : offset")
+            e("    %kpfp = buffer.alloca<workgroup> align(4) %kpfb : buffer")
+            e("    %kpfv = buffer.view %kpfp[%base] : buffer -> view<1xi32>")
+            e("    %kpt0 = index.cmp eq, %tid, %c0 : index")
+            e("    scf.if %kpt0 {")
+            e("      %kpone = scalar.constant 1 : i32")
+            e("      %kpold = view.atomic.rmw<addi> %kpone, %kscv[%kpt] {ordering = acq_rel, scope = device} : i32, view<64xi32> -> i32")
+            e(f"      %kpkk = scalar.constant {K} : i32")
+            e("      %kpm = scalar.remui %kpold, %kpkk : i32")
+            e("      view.store %kpm, %kpfv[%c0] : i32, view<1xi32>")
+            e("    }")
+            e("    kernel.barrier<global> scope(workgroup) ordering(acquire)")
+            e("    %kpmv = view.load %kpfv[%c0] : view<1xi32> -> i32")
+            e(f"    %kpkl = scalar.constant {K - 1} : i32")
+            e("    %kplast = scalar.cmpi eq, %kpmv, %kpkl : i32")
+        if "ksnolast" in R2P_DIAG:   # diag (compile bisect): stores + arrival, no merge
+            e(f"    scf.yield {', '.join(['%zeros8'] * 16 + ['%one', '%one'])}, %kplast : {rt}, i1")
+            e("  } else {")
+            e("    %kpwt = index.cmp eq, %c0, %c0 : index")
+            e(f"    scf.yield {', '.join(own)}, %kpwt : {rt}, i1")
+            e("  }")
+            return
+        e(f"    {', '.join(o + 'm' for o in outs[:18])} = scf.if %kplast -> ({rt}) {{")
+        # piece i of tail unit t: q = i x tail + t
+        for i in range(K):
+            e(f"      %kqi{i} = index.constant {i} : index")
+            e(f"      %kqx{i} = index.mul %kqi{i}, %kstd : index")
+            e(f"      %kqq{i} = index.add %kqx{i}, %kpt : index")
+            e(f"      %kqb{i} = index.mul %kqq{i}, %kprp : index")
+            e(f"      %kqr{i} = index.add %kqb{i}, %kpr0 : index")
+            for j, nm in enumerate(("l", "lo", "m", "mo")):
+                e(f"      %kqa{nm}{i} = index.add %kqr{i}, %c{128 + j}k : index")
+                e(f"      %kq{nm}{i} = view.load %kspv[%kqa{nm}{i}] : view<{ksplit_floats()}xf32> -> f32")
+        fac = {}
+        for nm, ln in (("m", "l"), ("mo", "lo")):
+            cur = f"%kq{nm}0"
+            for i in range(1, K):
+                e(f"      %kqM{nm}{i} = scalar.maxnumf {cur}, %kq{nm}{i} : f32")
+                cur = f"%kqM{nm}{i}"
+            fs = []
+            for i in range(K):
+                e(f"      %kqd{nm}{i} = scalar.subf %kq{nm}{i}, {cur} : f32")
+                e(f"      %kqf{nm}{i} = scalar.exp2f<afn> %kqd{nm}{i} : f32")
+                fs.append(f"%kqf{nm}{i}")
+            e(f"      %kqs{ln}0 = scalar.mulf %kq{ln}0, {fs[0]} : f32")
+            for i in range(1, K):
+                e(f"      %kqs{ln}{i} = scalar.fmaf %kq{ln}{i}, {fs[i]}, %kqs{ln}{i - 1} : f32")
+            fac[nm] = fs
+        # streamed: one fragment at a time in scalar f32 (no factor splats), the merged fragment over piece 0's
+        # (this lane's own record: same-lane store then load), then all 16 reloaded for the epilogue
+        for f in range(16):
+            fv = fac["m" if f < 8 else "mo"]
+            for i in range(K):
+                e(f"      %kqo{f}a{i} = index.add %kqr{i}, %c{8 * f}k : index")
+                e(f"      %kqo{f}v{i} = vector.load %kspv[%kqo{f}a{i}] : view<{ksplit_floats()}xf32> -> {V8}")
+            els = []
+            for x in range(8):
+                for i in range(K):
+                    e(f"      %kqe{f}_{x}_{i} = vector.extract %kqo{f}v{i}[{x}] : {V8} -> f32")
+                e(f"      %kqt{f}_{x}_0 = scalar.mulf %kqe{f}_{x}_0, {fv[0]} : f32")
+                for i in range(1, K):
+                    e(f"      %kqt{f}_{x}_{i} = scalar.fmaf %kqe{f}_{x}_{i}, {fv[i]}, %kqt{f}_{x}_{i - 1} : f32")
+                els.append(f"%kqt{f}_{x}_{K - 1}")
+            e(f"      %kqw{f} = vector.from_elements {', '.join(els)} : {V8}")
+            e(f"      vector.store %kqw{f}, %kspv[%kqo{f}a0] : {V8}, view<{ksplit_floats()}xf32>")
+            e("      scf.schedule.fence")
+        res = []
+        for f in range(16):
+            e(f"      %kqg{f} = vector.load %kspv[%kqo{f}a0] : view<{ksplit_floats()}xf32> -> {V8}")
+            res.append(f"%kqg{f}")
+        res += [f"%kqsl{K - 1}", f"%kqslo{K - 1}"]
+        e(f"      scf.yield {', '.join(res)} : {rt}")
+        e("    } else {")   # not the last: never written (zeros, so the own partial is dead after its stores)
+        # an opaque unit-variant zero (queue word 2 & the unit id), not %zeros8: sharing that constant with the QK
+        # MMAs' zero init kept one 8-VGPR zero live across the tile loops (211 VGPRs)
+        e("      %kpzu = index.cast %wglp : index to i32")
+        e("      %kpzi = scalar.andi %pwz0, %kpzu : i32")
+        e("      %kpzf = scalar.bitcast %kpzi : i32 to f32")
+        e(f"      %kpz8 = vector.splat %kpzf : {V8}")
+        e(f"      scf.yield {', '.join(['%kpz8'] * 16 + ['%one', '%one'])} : {rt}")
+        e("    }")
+        e("    %kptrue = index.cmp eq, %c0, %c0 : index")
+        e(f"    %kpwm = scalar.andi %kplast, %kptrue : i1")
+        e(f"    scf.yield {', '.join(o + 'm' for o in outs[:18])}, %kpwm : {rt}, i1")
+        e("  } else {")
+        e("    %kpwt = index.cmp eq, %c0, %c0 : index")
+        e(f"    scf.yield {', '.join(own)}, %kpwt : {rt}, i1")
+        e("  }")
+
     if R2P and R2P_K2:
         k2_layout()
     STEER = PERSIST and PERSIST_DYN and R2P and R2P_STEER
+    KS = bool(KSPLIT and R2P and PERSIST and PERSIST_DYN)
+    if KS:
+        assert STEER and R2P_SPLIT and R2P_PEEL and not (R2P_QPF or KRAW or SOFT1 or "tailfill" in R2P_DIAG)
     PVAL_LINE = ("  %pnext, %pwn = scf.if %pval -> (index, i32) {" if STEER else
                  "  %pnext = scf.if %pval -> (index) {" if PERSIST_DYN else "  scf.if %pval {")
-    punq = "%punq" if "tailfill" in R2P_DIAG and PERSIST_DYN else "%pun"   # the queue's bound
+    punq = "%punq" if ("tailfill" in R2P_DIAG and PERSIST_DYN) or KS else "%pun"   # the queue's bound
 
     def persist_issue(t):
         """PERSIST_DYN: every lane's atomic add, %pq<t>o: lane 0 adds 1 to the counter (word 0), the others add 0 to a word
@@ -1146,7 +1343,7 @@ def gen():
     e("  %tp = index.add %token_count, %cqt1 : index")
     e("  %qblocks = index.div %tp, %cqt : index")
     if PERSIST:
-        assert not (KVMAJOR or OCNT or (PERSIST_REV and QB_ZIGZAG))
+        assert not (KVMAJOR or OCNT or (PERSIST_REV and QB_ZIGZAG)) and (PERSIST_DYN or not KVG)
         assert not (PERSIST_DYN and (PERSIST_REV or QB_ZIGZAG))
         e(f"  %cpst = index.constant {PERSIST} : index")
         e("  kernel.launch.config workgroups(%cpst, %c1, %c1) workgroup_size(%cnt, %c1, %c1) : index")
@@ -1155,8 +1352,9 @@ def gen():
     e("} launch(%query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %lse: buffer"
       + (", %kscale: buffer" if KDEC else "")
       + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "")
-      + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + ("")
-      + (", %ocnt: buffer" if OCNT else "") + (", %pqueue: buffer" if PERSIST and PERSIST_DYN else "") + ") {")
+      + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + (", %kscale: buffer" if KRAW else "")
+      + (", %ocnt: buffer" if OCNT else "") + (", %pqueue: buffer" if PERSIST and PERSIST_DYN else "")
+      + (", %ksplit: buffer" if KS else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
         e(f"  %c{v} = index.constant {v} : index")
@@ -1196,6 +1394,11 @@ def gen():
         e("  %pcap = index.mul %npages, %c256 : index")       # pool rows: whole pages
         CAPV = "%pcap"
     e(f"  %kvtot = index.mul {CAPV}, %c1024 : index")
+    if KRAW:
+        assert R2P and PAGED and QNORM
+        e("  %ksc_na = buffer.assume.noalias %kscale : buffer")
+        e("  %kscn = index.mul %pcap, %c8 : index")
+        e("  %ksc_view = buffer.view %ksc_na[%base] : buffer -> view<[%kscn]xf16>")
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
     if OCNT:   # without it the atomic may alias every input: their scalar loads become vector loads, the code shifts
         e("  %oc_na = buffer.assume.noalias %ocnt : buffer")
@@ -1217,6 +1420,10 @@ def gen():
         e("  %qs_flat = buffer.view %q_na[%qss_o] : buffer -> view<[%qsstot]xf32>")
     e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if QG16 or GSIG16 else 'f32'}>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
+    if "stamp" in R2P_DIAG:   # diag: progress records in the gate buffer (wrong gate; see the QK loop)
+        e("  %st_v = buffer.view %g_na[%base] : buffer -> view<262144xi32>")
+        e("  %c1024st = index.constant 1024 : index")
+        e("  %c3st = index.constant 3 : index")
     # kv4a16: int4 K [token][128 dwords], f16x2 (16 s, lo - 16 s) [token][32]
     # kv8a16: int8 K [token][256 dwords], f16x2 (256 s, -384 s) [token][8]
     if KDEC:
@@ -1274,12 +1481,21 @@ def gen():
     elif QNORM:   # QNORM: the head-dim halves' sums of squares, [query block][half][row] f32
         QX_OFF = pool
         pool += NQB * 2 * 16 * 4
+    global KSL_OFF
+    if KRAW:   # the K scales' LDS slots: [K slot][128-dim half][16 keys] f32 (as K, staged a tile ahead)
+        KSL_OFF = (pool + 15) // 16 * 16
+        pool = KSL_OFF + 256
     if "occ3" in R2P_DIAG:   # (diag: the 3-workgroup LDS floor, to separate occupancy from other effects)
         pool = max(pool, 33792)
     assert pool <= 65536
     e(f"  %pool_bytes = index.constant {pool} : offset")
     e("  %pool = buffer.alloca<workgroup> align(16) %pool_bytes : buffer")
     e(f"  %qs_view = buffer.view %pool[%base] : buffer -> view<{NQB * 16}x{Q_PITCH}xf16>")
+    if KRAW:
+        e(f"  %ksl_o = index.constant {KSL_OFF} : offset")
+        e("  %ksl_view = buffer.view %pool[%ksl_o] : buffer -> view<64xf32>")
+        e("  %ksl_o2 = index.constant " + str(KSL_OFF + 128) + " : offset")   # KH: the slots' second copy (a separate
+        e("  %ksl_view2 = buffer.view %pool[%ksl_o2] : buffer -> view<32xf32>")    # load after barrier A, not CSEd)
     e(f"  %q_lay = encoding.layout.strided [1, {Q_PITCH}] : encoding<layout>")
     e(f"  %q_fr = buffer.view %pool[%base] : buffer -> view<256x{NQB * 16}xf16, %q_lay>")
     e(f"  %k_o = index.constant {K_OFF} : offset")
@@ -1308,6 +1524,8 @@ def gen():
         e(f"  %al_view = buffer.view %pool[%al_o] : buffer -> view<{32 * NQB}xf32>")
         e(f"  %ls_o = index.constant {S_OFF + 1024 * NQB} : offset")
         e(f"  %ls_view = buffer.view %pool[%ls_o] : buffer -> view<{16 * NQB}xf32>")
+        if KS:   # the row maxes x log2e for the merge: the K slot (idle from the last tile's barrier B to the next unit)
+            e(f"  %lm_view = buffer.view %pool[%base] : buffer -> view<{16 * NQB}xf32>")
         e(f"  %k2_view = buffer.view %pool[%k_o] : buffer -> view<32x{KT_PITCH}xf16>")
         e(f"  %xsp0_view = buffer.view %pool[%pp_o] : buffer -> view<{32 * NQB}x4xf32>")   # S plane 0 in P^T slot 0 / 1
         e(f"  %xsp1_o = index.constant {S_OFF + 512 * NQB} : offset")
@@ -1337,8 +1555,28 @@ def gen():
         e("  %prn = index.div %prn0, %pP : index")                 # rounds
         if "tailfill" in R2P_DIAG and PERSIST_DYN:   # diag: the queue runs whole rounds, ids past the units wrap (same stores)
             e("  %punq = index.mul %prn, %pP : index")
+        if KS:   # ids < %ksw: whole units; then %kst tail units x KSPLIT pieces, piece-major
+            e("  %kst0 = index.rem %pun, %pP : index")
+            e(f"  %ksmin = index.constant {KSPLIT_MIN} : index")
+            e("  %kson = index.cmp uge, %start_pos, %ksmin : index")
+            e("  %kst = scf.select %kson, %kst0, %c0 : index")
+            e("  %ksw = index.sub %pun, %kst : index")
+            e(f"  %kskc = index.constant {KSPLIT} : index")
+            e("  %kspn = index.mul %kst, %kskc : index")
+            if "ksmerge" in R2P_DIAG:   # two-kernel split, kernel 2: the queue hands out the tail units only
+                e("  %punq = index.add %kst, %c0 : index")
+            else:
+                e("  %punq = index.add %ksw, %kspn : index")
+            e("  %kstd = index.max %kst, %c1 : index")
         e("  %pslot = kernel.workgroup.id<x> : index")
         e("  %pslotr = index.sub %pP1, %pslot : index")
+    if KS:
+        e("  %ks_na = buffer.assume.noalias %ksplit : buffer")
+        e("  %kscv = buffer.view %ks_na[%base] : buffer -> view<64xi32>")
+        e("  %ksp_o = index.constant 256 : offset")
+        e(f"  %kspv = buffer.view %ks_na[%ksp_o] : buffer -> view<{ksplit_floats()}xf32>")
+        for v in sorted({132, 128, 129, 130, 131} | {8 * f for f in range(16)}):
+            e(f"  %c{v}k = index.constant {v} : index")
     if PERSIST and PERSIST_DYN:
         e("  %pq_na = buffer.assume.noalias %pqueue : buffer")   # else the atomic may alias every input (vector loads)
         e(f"  %pqv = buffer.view %pq_na[%base] : buffer -> view<{PQ_WORDS}xi32>")
@@ -1381,6 +1619,19 @@ def gen():
         if "tailfill" in R2P_DIAG and PERSIST_DYN:
             e("  %wglw = index.rem %wglp, %pun : index")
             e("  %wgl = index.assume %wglw [range(%wglw, 0, 1048576), lt(%wglw, %pun)] : index")
+        elif KS:   # a piece: tail unit %kpt (id %ksw + %kpt), key piece %kpj
+            if "ksmerge" in R2P_DIAG:   # kernel 2: id t = tail unit t's merge (piece 0's slot, every id a piece)
+                e("  %kpis = index.cmp ult, %wglp, %punq : index")
+                e("  %kpq = index.add %wglp, %c0 : index")
+            else:
+                e("  %kpis = index.cmp uge, %wglp, %ksw : index")
+                e("  %kpc = index.max %wglp, %ksw : index")
+                e("  %kpq = index.sub %kpc, %ksw : index")
+            e("  %kpj = index.div %kpq, %kstd : index")
+            e("  %kpt = index.rem %kpq, %kstd : index")
+            e("  %kpu = index.add %ksw, %kpt : index")
+            e("  %wglk = scf.select %kpis, %kpu, %wglp : index")
+            e("  %wgl = index.assume %wglk [range(%wglk, 0, 1048576), lt(%wglk, %pun)] : index")
         else:
             e("  %wgl = index.assume %wglp [range(%wglp, 0, 1048576), lt(%wglp, %pun)] : index")
     else:
@@ -1392,7 +1643,23 @@ def gen():
         e("  %nqb = index.div %tpq, %cqt : index")
         e("  %wgl0 = index.mul %wgy, %nqb : index")
         e("  %wgl = index.add %wgl0, %wgx : index")
-    if KVMAJOR:   # KV head slowest: co-resident workgroups stream the same K / V (one KV head's pairs fastest)
+    if KVG:
+        e("  %nkvh_ = config.get @attention_prefill.num_kv_heads : index")
+        e("  %pkv = index.div %npairs, %nkvh_ : index")
+        e(f"  %kvg = index.constant {KVG} : index")
+        e("  %kvblk0 = index.mul %pkv, %nqb : index")
+        e("  %kvblk = index.mul %kvblk0, %kvg : index")
+        e("  %kvgi = index.div %wgl, %kvblk : index")
+        e("  %kvr0 = index.rem %wgl, %kvblk : index")
+        e("  %kvin = index.rem %kvr0, %kvg : index")
+        e("  %kvr = index.div %kvr0, %kvg : index")
+        e("  %kvhb = index.mul %kvgi, %kvg : index")
+        e("  %kvh_m = index.add %kvhb, %kvin : index")
+        e("  %pig_m = index.rem %kvr, %pkv : index")
+        e("  %qb0 = index.div %kvr, %pkv : index")
+        e("  %hp0 = index.mul %kvh_m, %pkv : index")
+        e("  %hp = index.add %hp0, %pig_m : index")
+    elif KVMAJOR:   # KV head slowest: co-resident workgroups stream the same K / V (one KV head's pairs fastest)
         e("  %nkvh_ = config.get @attention_prefill.num_kv_heads : index")
         e("  %pkv = index.div %npairs, %nkvh_ : index")
         e("  %kvblk = index.mul %pkv, %nqb : index")
@@ -1505,6 +1772,30 @@ def gen():
         e("  %pig2 = index.mul %pig, %c2 : index")
         e("  %head0 = index.add %kvh6, %pig2 : index")
     e("  %kvbase = index.mul %kvh, %c256 : index")
+    if KRAW:   # this lane's scale run: [kvh][hd][pool row] + its 8 keys (8 half)
+        e("  %ksc0 = index.mul %kvh, %c2 : index")
+        e("  %ksc1 = index.add %ksc0, %hd : index")
+        e("  %ksc2 = index.mul %ksc1, %pcap : index")
+        e("  %ksc3 = index.mul %half, %c8 : index")
+        e("  %kscb = index.add %ksc2, %ksc3 : index")
+        e("  %kslo0 = index.mul %hd, %c16 : index")      # QK lanes: [slot][hd][8 half] own, [slot][1 - hd][8 half]
+        e("  %kslo = index.add %kslo0, %ksc3 : index")
+        e("  %kslp0 = index.sub %c16, %kslo0 : index")
+        e("  %kslp = index.add %kslp0, %ksc3 : index")
+        e(f"  %kstj = index.rem %tid, %c{2 if KH else 4} : index")       # stager item j < 4: half j / 2, keys 8 (j % 2)
+        e("  %kstd = index.div %kstj, %c2 : index")   # (KH: j < 2, half 0 = s_big)
+        e("  %kstk0 = index.rem %kstj, %c2 : index")
+        e("  %kstk = index.mul %kstk0, %c8 : index")
+        e("  %kstg0 = index.mul %kvh, %c2 : index")
+        e("  %kstg1 = index.add %kstg0, %kstd : index")
+        e("  %kstg2 = index.mul %kstg1, %pcap : index")
+        e("  %kstg = index.add %kstg2, %kstk : index")
+        e("  %kstl0 = index.mul %kstd, %c16 : index")   # (KH: slots of 16)
+        e("  %kstl = index.add %kstl0, %kstk : index")
+        e("  %kscp0 = index.sub %c1, %hd : index")   # the partner wave's half
+        e("  %kscp1 = index.add %ksc0, %kscp0 : index")
+        e("  %kscp2 = index.mul %kscp1, %pcap : index")
+        e("  %kscbp = index.add %kscp2, %ksc3 : index")
     e("  %vhb0 = index.mul %kvh, %vtiles : index")
     e("  %vhb = index.mul %vhb0, %c4096 : index")
     # V staging: lane = dim, the last 256 threads (K: the first 256)
@@ -1566,10 +1857,41 @@ def gen():
         e(f"  %ulv2 = index.mul %ulv1, %c{32 if 'halfunits' in R2P_DIAG else 16} : index")   # halfunits: twice as long
         e("  %ulv3 = index.add %start_pos, %ulv2 : index")
         e("  %max_vis = index.min %ctx_end, %ulv3 : index")
+    elif KS:   # a piece: 32-key pairs [T j / K, T (j + 1) / K) of the unit's T
+        e("  %max_visu = index.min %ctx_end, %vis0 : index")
+        e("  %kvt0 = index.add %max_visu, %c31 : index")
+        e("  %kvt = index.div %kvt0, %c32 : index")
+        e("  %kvl0 = index.mul %kvt, %kpj : index")
+        e("  %kvl1 = index.div %kvl0, %kskc : index")
+        e("  %kvlo = index.mul %kvl1, %c32 : index")
+        e("  %kpj1 = index.add %kpj, %c1 : index")
+        e("  %kvh0 = index.mul %kvt, %kpj1 : index")
+        e("  %kvh1 = index.div %kvh0, %kskc : index")
+        e("  %kvh2 = index.mul %kvh1, %c32 : index")
+        e("  %kvhi = index.min %kvh2, %max_visu : index")
+        if "ksk0" in R2P_DIAG:   # diag (compile bisect): every unit from key 0
+            e("  %kbeg = index.add %c0, %c0 : index")
+        else:
+            e("  %kbeg = scf.select %kpis, %kvlo, %c0 : index")
+        if "ksmv" in R2P_DIAG:   # diag (compile bisect): every unit to its end
+            e("  %max_vis = index.add %max_visu, %c0 : index")
+        else:   # (stated: with both piece ends opaque the allocation spilled, 254 VGPRs; either one alone 187)
+            if "ksmerge" in R2P_DIAG:   # kernel 2: a dummy two-tile range (keys 0..31, piece 0's start), its O unused
+                e("  %max_vis0 = scf.select %kpis, %c32, %max_visu : index")
+            else:
+                e("  %max_vis0 = scf.select %kpis, %kvhi, %max_visu : index")
+            e("  %max_visu1 = index.add %max_visu, %c1 : index")
+            e("  %max_vis = index.assume %max_vis0 [range(%max_vis0, 1, 1048576), lt(%max_vis0, %max_visu1)] : index")
+        # every piece has >= 32 floor(T / K) >= 32 keys (T >= 128 from KSPLIT_MIN on), a whole unit >= 17: stated so the
+        # tile loops' one-tile branch folds as at tile 0 (left opaque, its join tipped the allocation into spills)
+        e("  %kbeg16a = index.add %kbeg, %c16 : index")
+        e("  %kbeg16 = index.assume %kbeg16a [range(%kbeg16a, 16, 1048576), lt(%kbeg16a, %max_vis)] : index")
     else:
         e("  %max_vis = index.min %ctx_end, %vis0 : index")
     e("  %B_1 = index.sub %B, %c1 : index")
     e("  %cap_1 = index.sub %cache_capacity, %c1 : index")
+    if KRAW:
+        e("  %cap_16 = index.sub %cache_capacity, %c16 : index")
     if KCLAMP_S:   # (only then: even an unused op perturbs the allocator)
         e("  %klast = index.sub %cache_capacity, %c16 : index")
     # this lane's query: block wqb = (head0 + wqb%2, tokens qs + (wqb/2)*16 + sub)
@@ -1631,8 +1953,16 @@ def gen():
             e("  %qxlo = index.cmp ult, %lane, %c16 : index")
             e("  %qxst = index.cmp ne, %prole, %c0 : index")
             e("  %qxst1 = scalar.andi %qxst, %qxlo : i1")
+            if R2P_QFOLD == 1:   # Q x f16(r log2e) of the head this wave prepared, 0 for a dead row (the select's job)
+                e("  %qfz = scalar.constant 0.0 : f32")
+                e("  %qfl2 = scf.select %r_live, %qsl2e, %qfz : f32")
+                e("  %qfl2h = scalar.fptrunc %qfl2 : f32 to f16")
+                e(f"  %qfl2v = vector.splat %qfl2h : {V16H}")
             for c in range(8):
-                e(f"  %qdz{c} = scf.select %r_live, %qdv{c}, %zq16x : {V16H}")
+                if R2P_QFOLD == 1:
+                    e(f"  %qdz{c} = vector.mulf %qdv{c}, %qfl2v : {V16H}")
+                else:
+                    e(f"  %qdz{c} = scf.select %r_live, %qdv{c}, %zq16x : {V16H}")
                 e(f"  %qbits{c} = vector.bitcast %qdz{c} : {V16H} to {bk}")
                 e(f"  %rinit{c} = scf.select %isA, %qbits{c}, %bzero : {bk}")
             e("  scf.if %qxst1 {")
@@ -1684,6 +2014,64 @@ def gen():
                     e("  %qsl2e = scalar.constant 1.4426950408889634 : f32")
                     e(f"  %qslzth = scalar.constant {R2P_LAZY} : f32")
             qnorm_after = qzero
+        elif QNORM and R2P and R2P_QSPLIT and R2P_DIAG & {"qdirect", "qdirz"} and not R2P_QFOLD:
+            # diag (Q-from-kqg bound): QK waves load their head's 16 fragments straight from the f16 store (dims 0..63
+            # unroped: wrong values, in bounds), P.V waves none; sums and r log2e as QSPLIT; no RoPE, trade, exchange
+            e("  %qsp_c384 = index.constant 384 : index")
+            e("  %qsp_c16 = index.constant 16 : index")
+            e("  %qst = index.mul %qdq, %qsp_c384 : index")
+            e("  %qsh = index.mul %r_head, %qsp_c16 : index")
+            e("  %qsbase = index.add %qst, %qsh : index")   # (token * 24 + head) * 16
+            for x in range(4):
+                e(f"  %qsbc{x} = index.constant {4 * x} : index")
+                e(f"  %qsbase{x} = index.add %qsbase, %qsbc{x} : index")
+                e(f"  %qssl{x} = vector.load %qs_flat[%qsbase{x}] : view<[%qsstot]xf32> -> {V4}")
+            tys = ", ".join([V16H] * 16)
+            e(f"  {', '.join(f'%qdv{c}' for c in range(16))} = scf.if %isA -> ({tys}) {{")
+            for c in range(16):
+                e(f"    %qdc{c} = index.constant {16 * c} : index")
+                e(f"    %qda{c} = index.add %qdb0, %qdc{c} : index")
+                e(f"    %qdl{c} = vector.load %q_flat[%qda{c}] : view<[%qtot]xf16> -> {V16H}")
+            e(f"    scf.yield {', '.join(f'%qdl{c}' for c in range(16))} : {tys}")
+            e("  } else {")
+            e(f"    scf.yield {', '.join(['%zq16x'] * 16)} : {tys}")
+            e("  }")
+
+            def qdir_after():
+                e("  %qw_na, %qe_na = buffer.assume.noalias %qnw, %qeps : buffer, buffer")
+                e("  %qw_flat = buffer.view %qw_na[%base] : buffer -> view<[%c256]xf32>")
+                e("  %qe_flat = buffer.view %qe_na[%base] : buffer -> view<[%c1]xf32>")
+                e("  %qeps_s = view.load %qe_flat[%c0] : view<[%c1]xf32> -> f32")
+                e(f"  %qssv = vector.addf %qssl0, %qssl1 : {V4}")
+                e(f"  %qssw = vector.addf %qssl2, %qssl3 : {V4}")
+                e(f"  %qssa = vector.addf %qssv, %qssw : {V4}")
+                for x in range(4):
+                    e(f"  %qss{x} = vector.extract %qssa[{x}] : {V4} -> f32")
+                e("  %qss01 = scalar.addf %qss0, %qss1 : f32")
+                e("  %qss23 = scalar.addf %qss2, %qss3 : f32")
+                e("  %qstot = scalar.addf %qss01, %qss23 : f32")
+                e("  %qhd256i = scalar.constant 0.00390625 : f32")
+                e("  %qmean = scalar.mulf %qstot, %qhd256i : f32")
+                e("  %qme = scalar.addf %qmean, %qeps_s : f32")
+                e("  %qinv = scalar.rsqrtf %qme : f32")
+                e("  %qsl2e = scalar.mulf %qinv, %log2e : f32")
+                if R2P_LAZY:
+                    e("  %qsrms = scalar.mulf %qme, %qinv : f32")
+                    e(f"  %qslzc = scalar.constant {R2P_LAZY} : f32")
+                    e("  %qslzth = scalar.mulf %qsrms, %qslzc : f32")
+                qlv = "%r_live"
+                if "qdirz" in R2P_DIAG:   # diag: the loaded Q dropped for zeros (opaque: queue word 1 is 0), as noq's Q
+                    e("  %qzw = vector.load %pqv[%c1] : view<{PQ_WORDS}xi32> -> vector<8xi32>".replace("{PQ_WORDS}", str(PQ_WORDS)))
+                    e("  %qzw0 = vector.extract %qzw[0] : vector<8xi32> -> i32")
+                    e("  %qzm = vector.splat %qzw0 : vector<8xi32>")
+                for c in range(16):
+                    e(f"  %qdz{c} = scf.select {qlv}, %qdv{c}, %zq16x : {V16H}")
+                    if "qdirz" in R2P_DIAG:
+                        e(f"  %qdzb{c} = vector.bitcast %qdz{c} : {V16H} to vector<8xi32>")
+                        e(f"  %rinit{c} = vector.andi %qdzb{c}, %qzm : vector<8xi32>")
+                        continue
+                    e(f"  %rinit{c} = vector.bitcast %qdz{c} : {V16H} to vector<8xi32>")
+            qnorm_after = qdir_after
         elif QNORM and R2P:   # the main kernel's per-block prologue on this wave's QNORM block
             assert not K4
             en = lambda ln: e(re.sub(r"%qdb\b", "%qdbn", re.sub(r"%wqb\b", "%wqn", ln)))
@@ -1951,6 +2339,26 @@ def gen():
         e("  %kstg = index.cmp ult, %sgid, %c8 : index")
         e("  %vstg = index.cmp uge, %sgid, %vsg0 : index")
 
+    def stage_ks(ks, slot32, cond, p, ind):
+        """KRAW: lanes with cond stage tile ks's K scales (item %kstj) into LDS slot slot32 / 32 (cond None: every lane,
+        the same values to the same addresses: no divergent region, which the 2x32 config's lowering rejects here)."""
+        e(f"{ind}scf.if {cond} {{" if cond else f"{ind}scf.schedule.fence")
+        e(f"{ind}  %{p}kk = index.min {ks}, %cap_16 : index")   # (a 16-key run past cap - 16 would leave the buffer)
+        pg = page_of(f"%{p}kk", p, ind + "  ", "ks")
+        e(f"{ind}  %{p}pb = index.mul {pg}, %c256 : index")
+        e(f"{ind}  %{p}po = index.rem %{p}kk, %c256 : index")
+        e(f"{ind}  %{p}pr = index.add %{p}pb, %{p}po : index")
+        e(f"{ind}  %{p}gi0 = index.add %kstg, %{p}pr : index")
+        e(f"{ind}  %{p}gi = index.assume %{p}gi0 [range(%{p}gi0, 0, 1073741824), lt(%{p}gi0, %kscn)] : index")
+        e(f"{ind}  %{p}sv = vector.load %ksc_view[%{p}gi] : view<[%kscn]xf16> -> {V8H}")
+        e(f"{ind}  %{p}sf = vector.extf %{p}sv : {V8H} to {V8}")
+        e(f"{ind}  %{p}li = index.add {slot32}, %kstl : index")
+        e(f"{ind}  vector.store %{p}sf, %ksl_view[%{p}li] : {V8}, view<64xf32>")
+        if KH:
+            e(f"{ind}  vector.store %{p}sf, %ksl_view2[%{p}li] : {V8}, view<32xf32>")
+        if cond:
+            e(f"{ind}}}")
+
     def stage_k(ks, cur, p, ind, kv="%k_view", roff=None):
         if NT == 256 or R2P:
             return stage_k_(ks, cur, p, ind, kv, roff)
@@ -2112,12 +2520,14 @@ def gen():
             e(f"{ind}vector.store {v}, %v_view[%{p}vr, {col}] : {V8H}, view<256x{vp}xf16>")
 
     # prologue: K(0) staged
-    ks0, ks0b = "%c0", "%c16"
+    ks0, ks0b = ("%kbeg", "%kbeg16") if KS else ("%c0", "%c16")
     k0 = load_k(ks0, "p0", "  ")
     if PIPE2:
         k1 = load_k("%c16", "p1", "  ")
         v0 = load_v("%c0", "pv0", "  ")
     stage_k(ks0, k0, "p0s", "  ")
+    if KRAW:
+        stage_ks(ks0, "%c0", None, "kp0", "  ")
     if SOFT1 and (SOFT2 or SOFT4):
         stage_v_(["%zh8", "%zh8"], "%c0", "pz", "  ")
         e("  %pzlo = index.cmp ult, %tid, %c128 : index")
@@ -2176,6 +2586,12 @@ def gen():
         mid(): emitted right after the rescale branch (the pipelined QK of the next tile and its loads).
         pair_slot (the QK role): %s0 is the full S; P^T and alpha go to that LDS slot (rows, alpha base); no P.V."""
         L2E = "%r2l2e" if R2P and R2P_QSPLIT else "%log2e"   # (QSPLIT: S is unscaled; r log2e scales it)
+        fold = R2P and R2P_QSPLIT and R2P_QFOLD   # S already in log2 units: no scale op
+        def l2mul(d, x, ind):
+            if fold:
+                return x
+            e(f"{ind}{d} = scalar.mulf {x}, {L2E} : f32")
+            return d
         if pair_slot is None:
             e(f"    %spa = vector.load %s_view[%ptid, %c0] : view<{2 * NT}x4xf32> -> {V4}")
             e(f"    %spb = vector.load %s_view[%ptid2, %c0] : view<{2 * NT}x4xf32> -> {V4}")
@@ -2246,7 +2662,7 @@ def gen():
             for i in range(8):
                 e(f"    %tme{i} = vector.extract {s}[{i}] : {V8} -> f32")
             if R2P:   # a tree (max is exact in any order): pairs of independent maxes can dual-issue
-                lv = [f"%tme{i}" for i in range(8)]
+                lv = [f"%tme{i}" for i in range(8)] if "nomax" not in R2P_DIAG else ["%tme0"]   # (diag nomax: element 0)
                 while len(lv) > 1:
                     nx = []
                     for a, b in zip(lv[::2], lv[1::2]):
@@ -2264,7 +2680,10 @@ def gen():
             e("    %tmf = scalar.bitcast %tmx : i32 to f32")
             e(f"    %tmax = scalar.maxnumf<nnan> {cur}, %tmf : f32")
         else:
-            e(f"    %tmax0 = vector.reduce<maxnumf> {s}, %ninf : {V8}, f32")
+            if "nomax" in R2P_DIAG:   # diag: the row max of element 0 only (no reduce; wrong values)
+                e(f"    %tmax0 = vector.extract {s}[0] : {V8} -> f32")
+            else:
+                e(f"    %tmax0 = vector.reduce<maxnumf> {s}, %ninf : {V8}, f32")
             e("    %tmi = scalar.bitcast %tmax0 : f32 to i32")
             e("    %tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
             e("    %tmf = scalar.bitcast %tmx : i32 to f32")
@@ -2279,7 +2698,12 @@ def gen():
             else:
                 e(f"    %lzth = scalar.constant {R2P_LAZY} : f32")
                 e("    %tmlz = scalar.subf %tmax, %lzth : f32")
-            e("    %grow = scalar.cmpf ogt, %tmlz, %rmax : f32")
+            if "nogrow" in R2P_DIAG:   # diag: the max never raised past the first (opaque: rmax + 1e30; wrong values)
+                e("    %grbig = scalar.constant 1.0e30 : f32")
+                e("    %grth = scalar.addf %rmax, %grbig : f32")
+                e("    %grow = scalar.cmpf ogt, %tmlz, %grth : f32")
+            else:
+                e("    %grow = scalar.cmpf ogt, %tmlz, %rmax : f32")
         else:
             e("    %grow = scalar.cmpf ogt, %tmax, %rmax : f32")
         e("    %anygrow = kernel.subgroup.vote.any %grow : i1")
@@ -2287,8 +2711,7 @@ def gen():
             e("    %rsm, %rss = scf.if %anygrow -> (f32, f32) {")
             e("      %gmx = scalar.maxnumf %rmax, %tmax : f32")
             e("      %gpd = scalar.subf %rmax, %gmx : f32")
-            e(f"      %gpdl = scalar.mulf %gpd, {L2E} : f32")
-            e("      %galpha = scalar.exp2f<afn> %gpdl : f32")
+            e(f"      %galpha = scalar.exp2f<afn> {l2mul('%gpdl', '%gpd', '      ')} : f32")
             e("      scf.yield %gmx, %galpha : f32, f32")
             e("    } else {")
             e("      scf.yield %rmax, %one : f32, f32")
@@ -2298,8 +2721,7 @@ def gen():
             e(f"    %rso0, %rso1, %rso2, %rso3, %rso4, %rso5, %rso6, %rso7, %rsm, %rss = scf.if %anygrow -> ({otypes}) {{")
             e(f"      %gmx = scalar.maxnumf{'<nnan>' if MAXNN else ''} %rmax, %tmax : f32")
             e("      %gpd = scalar.subf %rmax, %gmx : f32")
-            e(f"      %gpdl = scalar.mulf %gpd, {L2E} : f32")
-            e("      %galpha = scalar.exp2f<afn> %gpdl : f32")
+            e(f"      %galpha = scalar.exp2f<afn> {l2mul('%gpdl', '%gpd', '      ')} : f32")
             e(f"      %galpha8 = vector.splat %galpha : {V8}")
             for f in range(8):
                 e(f"      %gos{f} = vector.mulf %o{f}, %galpha8 : {V8}")
@@ -2312,11 +2734,9 @@ def gen():
             mid()
         # MAXNN: both arms yield max(rmax, ..) >= -FLT_MAX, so with ninf LLVM folds the seed max away
         e(f"    %nmax = scalar.maxnumf{'<nnan|ninf>' if MAXNN else ''} %rsm, %ninf : f32")
-        e(f"    %nml = scalar.mulf %nmax, {L2E} : f32")
-        e("    %nnml = scalar.negf %nml : f32")
+        e(f"    %nnml = scalar.negf {l2mul('%nml', '%nmax', '    ')} : f32")
         e("    %pd = scalar.subf %rmax, %nmax : f32")
-        e(f"    %pdl = scalar.mulf %pd, {L2E} : f32")
-        e("    %alpha = scalar.exp2f<afn> %pdl : f32")
+        e(f"    %alpha = scalar.exp2f<afn> {l2mul('%pdl', '%pd', '    ')} : f32")
         e(f"    %nnml8 = vector.splat %nnml : {V8}")
         e(f"    %nmax8 = vector.splat %nmax : {V8}")
         pad = {k[:4]: int(k[4:]) for k in R2P_DIAG if k[:4] in ("vpad", "xpad")}
@@ -2382,10 +2802,21 @@ def gen():
         if "nosoft" in R2P_DIAG:   # p = s: no subtract / scale / exp (two free bitcasts)
             e(f"    %pdi = vector.bitcast {s} : {V8} to vector<8xi32>")
             e(f"    %p = vector.bitcast %pdi : vector<8xi32> to {V8}")
+        elif "nosub" in R2P_DIAG:   # diag: p = exp2(s) (no subtract / scale: the bound of log2e-in-Q + C = -m; wrong values)
+            e(f"    %p = vector.exp2f<afn> {s} : {V8}")
         else:
             e(f"    %pd8 = vector.subf {s}, %nmax8 : {V8}")
             if "nol2e" in R2P_DIAG:   # diag: no log2e multiply (p = exp2(s - m): wrong values)
                 e(f"    %pl = vector.addf %pd8, %zeros8 : {V8}")
+            elif "nomul" in R2P_DIAG:   # diag: p = exp2(s - m), no scale op at all (the schedule of r log2e folded into Q)
+                e(f"    %pli8 = vector.bitcast %pd8 : {V8} to vector<8xi32>")
+                e(f"    %pl = vector.bitcast %pli8 : vector<8xi32> to {V8}")
+            elif KH and R2P and "khfma" in R2P_DIAG:   # (diag khfma: one fma for sub + mul: v_fma_f32 has no VOPD form,
+                # so 8 single issues for 4 dual subs, and it breaks the adds' / maxes' pairing: +5% cycles)
+                e(f"    %pl = vector.fmaf {s}, %r2l2e8, %nnml8 : {V8}")
+            elif fold:
+                e(f"    %pli8 = vector.bitcast %pd8 : {V8} to vector<8xi32>")
+                e(f"    %pl = vector.bitcast %pli8 : vector<8xi32> to {V8}")
             else:
                 e(f"    %pl = vector.mulf %pd8, {'%r2l2e8' if R2P else '%log2e8'} : {V8}")
             if "noexp" in R2P_DIAG:   # diag: p = the exponent itself (no exp2; wrong values, same max / rescale path)
@@ -2666,6 +3097,8 @@ def gen():
                 kfr = f"%kf{c}b" if t and "dblk" in R2P_DIAG else f"%kf{kc}"
                 e(f"{ind}%sa{t}_{c} = vector.mma {kfr}, %qf{8 * t + c}, {acc[a]} : {V16H}, {V16H}, {V8}")
                 acc[a] = f"%sa{t}_{c}"
+            if CHAIN_HOOK[0] is not None:
+                CHAIN_HOOK[0](c)
             if c < 7 and (c + 1) % R2P_QKF == 0:
                 e(f"{ind}scf.schedule.fence")
         if ch4:
@@ -2675,6 +3108,7 @@ def gen():
         return acc
 
     UNR_PAR = [None]
+    CHAIN_HOOK = [None]   # called after each K step's MMAs (KRAW: the scale reads, so they overlap the last steps)
 
     def body_r2p(first=False, role=None):
         """R2P tile ks, one role branch holding both phases (and both barriers: every wave meets each once).
@@ -2707,7 +3141,33 @@ def gen():
             return body_r2p_pv(first, I, J)
         if R2P_PRIOQ:
             e(f"{J}kernel.priority {{level = {R2P_PRIOQ}}}")
+        assert not (KRAW and "nox" in R2P_DIAG)
+        kry = "kry" in R2P_DIAG   # (diag kry: no pre-scale; both halves' scales read and applied after barrier A)
+
+        def kr_loads(t, bases=("%kslo",), view="%ksl_view", vt="view<64xf32>"):   # f32 scales of the lane's 8 keys, from slot kpar (as %krh{t}, %krh{t+1})
+            sl = f"%krsl{t}"
+            e(f"{J}{sl} = index.mul %kpar, %c{16 if KH else 32} : index")
+            for t, base in enumerate(bases, t):
+                e(f"{J}%kri{t} = index.add {sl}, {base} : index")
+                if "krconst" in R2P_DIAG:   # diag: the scales' VALU without their loads (s = the lane's tile parity + 1)
+                    e(f"{J}%krc{t}i = index.add %kpar, %c1 : index")
+                    e(f"{J}%krc{t}c = index.cast %krc{t}i : index to i32")
+                    e(f"{J}%krc{t}f = scalar.sitofp %krc{t}c : i32 to f32")
+                    e(f"{J}%krh{t} = vector.splat %krc{t}f : {V8}")
+                else:
+                    e(f"{J}%krh{t} = vector.load {view}[%kri{t}] : {vt} -> {V8}")
+        krc = KRAW_RD_STEP if KRAW and not kry and not KH else None
+        if krc is not None:
+            CHAIN_HOOK[0] = lambda c: kr_loads(0) if c == krc else None
         own, oth = r2p_qk(rnames, J)
+        CHAIN_HOOK[0] = None
+        if KRAW and not kry and not KH:   # the partner's partial leaves scaled (same keys, same half: this half's s), so the softmax-critical
+            # section after barrier A keeps 4 dual ops: S = fma(own, s, partner's) for the old own + partner's
+            e(f"{J}scf.schedule.fence")
+            if krc is None:
+                kr_loads(0)
+            e(f"{J}%othk = vector.mulf {oth}, %krh0 : {V8}")
+            oth = "%othk"
         if "nox" in R2P_DIAG:
             if not R2P_DIAG & {"nobar", "nobara"}:
                 e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
@@ -2725,6 +3185,11 @@ def gen():
                 e(f"{J}  vector.store %xst0, %xs_view[%xso_r0s, %c0] : {V4}, {xv}")
                 e(f"{J}}}")
                 e(f"{J}vector.store %xst1, %xs_view[%xso_r1, %c0] : {V4}, {xv}")
+                if KH and "khpre" in R2P_DIAG:   # after the partner's partial left: s_big and own s_big in the
+                    # barrier-A wait (S = fmac(partner's, s_big, own s_big) after it: the base's op count there)
+                    e(f"{J}scf.schedule.fence")   # (else the read hoists above the stores: 203 VGPRs)
+                    kr_loads(1, ("%ksc3",))
+                    e(f"{J}%ownk = vector.mulf {own}, %krh1 : {V8}")
             else:
                 e(f"{J}vector.store %xst0, %xs_view[%xso_r0, %c0] : {V4}, view<256x4xf32>")
                 e(f"{J}vector.store %xst1, %xs_view[%xso_r1, %c0] : {V4}, view<256x4xf32>")
@@ -2732,6 +3197,15 @@ def gen():
                 e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
             if R2P_PRIO or R2P_PRIOQ:
                 e(f"{J}kernel.priority {{level = {R2P_PRIO}}}")
+            if KH and "khpre" not in R2P_DIAG:   # (s_big read after barrier A, beside the partials'; diag khpre: own x s_big in the barrier-A wait, -2.4% cycles worse)
+                kr_loads(1, ("%ksc3",))
+            elif KH and "khlive" not in R2P_DIAG:   # read again (live across the barrier: 203 VGPRs; diag khlive)
+                kr_loads(2, ("%ksc3",), "%ksl_view2", "view<32xf32>")
+            elif kry:
+                kr_loads(2, ("%kslp",))
+            elif KRAW and "krre" in R2P_DIAG:   # (diag krre: read again after barrier A: its post-barrier LDS burst
+                # (every wave's partials at once) is bandwidth-bound: +2 b128 per lane cost ~50 ticks per tile)
+                kr_loads(1)
             if R2P_K2:   # plane 0 from the tile's slot under the parity branch, one view per slot (immediate offsets: a
                 # runtime row puts 3 dependent VALU between barrier A and the softmax: -2.2 at 8K, -4.3 at 64K)
                 xv = f"view<{96 * NQB}x4xf32>"
@@ -2748,7 +3222,24 @@ def gen():
                 e(f"{J}%spa = vector.load %xs_view[%xsm_r0, %c0] : view<256x4xf32> -> {V4}")
                 e(f"{J}%spb = vector.load %xs_view[%xsm_r1, %c0] : view<256x4xf32> -> {V4}")
             e(f"{J}%spart = vector.concat<0> %spa, %spb : {V4}, {V4} -> {V8}")
-            e(f"{J}%s0 = vector.addf {own}, %spart : {V8}")
+            if KH and "khpre" not in R2P_DIAG and "khfmac" in R2P_DIAG:   # (diag khfmac: partner's x s, then fmac own)
+                e(f"{J}%s0a = vector.mulf %spart, %krh1 : {V8}")
+                e(f"{J}%s0 = vector.fmaf {own}, %krh1, %s0a : {V8}")
+            elif KH and "khpre" not in R2P_DIAG:
+                e(f"{J}%s0a = vector.addf {own}, %spart : {V8}")
+                e(f"{J}%s0 = vector.mulf %s0a, %krh1 : {V8}")
+            elif KH:
+                e(f"{J}%s0 = vector.fmaf %spart, {'%krh1' if 'khlive' in R2P_DIAG else '%krh2'}, %ownk : {V8}")
+            elif KRAW:
+                if kry:   # the partner's half first, then (fenced: one 8-VGPR scale live) this half's
+                    e(f"{J}%sprt = vector.mulf %spart, %krh2 : {V8}")
+                    e(f"{J}scf.schedule.fence")
+                    kr_loads(1)
+                    e(f"{J}%s0 = vector.fmaf {own}, %krh1, %sprt : {V8}")
+                else:
+                    e(f"{J}%s0 = vector.fmaf {own}, {'%krh1' if 'krre' in R2P_DIAG else '%krh0'}, %spart : {V8}")
+            else:
+                e(f"{J}%s0 = vector.addf {own}, %spart : {V8}")
         emit_softmax_pv(None, True, pair_slot=("%slot_rows", "%slot_al"))
         if R2P_PRIO:
             e(f"{J}kernel.priority {{level = 0}}")
@@ -2791,6 +3282,12 @@ def gen():
         if not nostg:
             if R2P_K2 and "k2late" not in R2P_DIAG:   # (diag k2late: after barrier A, as with one slot)
                 k2_store()
+            if KRAW and "nokst" not in R2P_DIAG:   # P.V wave 0's lanes 0..3 (diag nokst: no scale staging: stale)
+                assert R2P_K2 and "k2late" not in R2P_DIAG
+                e(f"{J}%kspl = index.rem %tid, %c{32 * NQB} : index")
+                e(f"{J}%kspc = index.cmp ult, %kspl, %c{2 if KH else 4} : index")
+                e(f"{J}%ksps = index.mul %kpar1, %c{16 if KH else 32} : index")
+                stage_ks("%ks16", "%ksps", "%kspc", "ksp", J)
         if not R2P_DIAG & {"nobar", "nobara"}:
             e(f"{J}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         if not nostg and R2P_K2 and "k2late" in R2P_DIAG:
@@ -3143,12 +3640,16 @@ def gen():
             e(f"  {', '.join(fb)}, %gmax, %gsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
             # QK role: tile 0, then tiles 16.. (2 barriers each)
             i0 = len(L)
+            if KS:   # pieces start 32-key aligned: the peeled tile's parity is 0, as at tile 0 (keeps its branches folded)
+                UNR_PAR[0] = 0
             q0 = body_r2p(first=True, role="A")
-            sm = renamed(i0, {**qb, "%ks_": "%c0", "%rmax": "%ninf", "%rsum": "%zero"}, "_qa0")
+            if KS:
+                UNR_PAR[0] = None
+            sm = renamed(i0, {**qb, "%ks_": ks0, "%rmax": "%ninf", "%rsum": "%zero"}, "_qa0")
             q0 = [sm.get(x, x) for x in q0]
-            e("  %pmore_qa = index.cmp ult, %c16, %max_vis : index")
+            e(f"  %pmore_qa = index.cmp ult, {ks0b}, %max_vis : index")
             e("  %gmax_qa, %gsum_qa = scf.if %pmore_qa -> (f32, f32) {")
-            e(f"  %wkf_qa, %gmaxL_qa, %gsumL_qa = scf.while(%ksw_qa = %c16 : index, %rmax_qa = {q0[0]} : f32, %rsum_qa = {q0[1]} : f32) -> (index, f32, f32) {{")
+            e(f"  %wkf_qa, %gmaxL_qa, %gsumL_qa = scf.while(%ksw_qa = {ks0b} : index, %rmax_qa = {q0[0]} : f32, %rsum_qa = {q0[1]} : f32) -> (index, f32, f32) {{")
             i0 = len(L)
             e("    %ks_ = index.assume %ksw_qa [range(%ksw_qa, 0, 1048576), lt(%ksw_qa, %max_vis)] : index")
             if "q" in R2P_UNR:   # tiles 1, 3, .. (odd: parity 1), then the even one after it when there is one
@@ -3175,6 +3676,32 @@ def gen():
                 e("    scf.condition %kcont_qa, %ksn_qa, %rmax2_qa, %rsum2_qa : i1, index, f32, f32")
             else:
                 q1 = body_r2p(role="A")
+                if "stamp" in R2P_DIAG:   # diag: every 64 tiles lane 0 takes a ticket (queue word 260) and records
+                    # (unit, key, slot, 1) at ticket x 4 of the gate buffer: a global order of tile progress (co-reader drift)
+                    e("    %stm = index.rem %ks_, %c1024st : index")
+                    e("    %stz = index.cmp eq, %stm, %c0 : index")
+                    e("    %stl = index.cmp eq, %tid, %c0 : index")
+                    e("    %stx = scalar.andi %stz, %stl : i1")
+                    e("    scf.if %stx {")
+                    e("      %stw = index.constant 260 : index")
+                    e("      %stt = view.atomic.rmw<addi> %pq_one, %pqv[%stw] {ordering = relaxed, scope = device} : i32, view<264xi32> -> i32")
+                    e("      %stmk = scalar.constant 65535 : i32")
+                    e("      %stt16 = scalar.andi %stt, %stmk : i32")
+                    e("      %sti0 = index.cast %stt16 : i32 to index")
+                    e("      %sti1 = index.assume %sti0 [range(%sti0, 0, 65536)] : index")
+                    e("      %stc4 = index.constant 4 : index")
+                    e("      %sti = index.mul %sti1, %stc4 : index")
+                    e("      %sti_1 = index.add %sti, %c1 : index")
+                    e("      %sti_2 = index.add %sti, %c2 : index")
+                    e("      %sti_3 = index.add %sti, %c3st : index")
+                    e("      %stu = index.cast %wgl : index to i32")
+                    e("      %stks = index.cast %ks_ : index to i32")
+                    e("      %stsl = index.cast %pslot : index to i32")
+                    e("      view.store %stu, %st_v[%sti] : i32, view<262144xi32>")
+                    e("      view.store %stks, %st_v[%sti_1] : i32, view<262144xi32>")
+                    e("      view.store %stsl, %st_v[%sti_2] : i32, view<262144xi32>")
+                    e("      view.store %pq_one, %st_v[%sti_3] : i32, view<262144xi32>")
+                    e("    }")
                 e(f"    %ksn = index.add %ks_, %c{KT} : index")
                 e("    %kcont = index.cmp ult, %ksn, %max_vis : index")
                 e(f"    scf.condition %kcont, %ksn, {q1[0]}, {q1[1]} : i1, index, f32, f32")
@@ -3190,15 +3717,19 @@ def gen():
             e("  } else {")
             # P.V role: tile 0 (staging only), then tiles 16..
             i0 = len(L)
+            if KS:   # pieces start 32-key aligned: the peeled tile's parity is 0, as at tile 0 (keeps its branches folded)
+                UNR_PAR[0] = 0
             p0 = body_r2p(first=True, role="B")
-            sm = renamed(i0, {**{f"%rb{f}": f"%rinit{f}" for f in range(16)}, "%ks_": "%c0"}, "_pv0")
+            if KS:
+                UNR_PAR[0] = None
+            sm = renamed(i0, {**{f"%rb{f}": f"%rinit{f}" for f in range(16)}, "%ks_": ks0}, "_pv0")
             p0 = [sm.get(x, x) for x in p0]
-            e("  %pmore_pv = index.cmp ult, %c16, %max_vis : index")
+            e(f"  %pmore_pv = index.cmp ult, {ks0b}, %max_vis : index")
             pl = [f"%fbL{f}_pv" for f in range(16)]
             pr = [f"%fbR{f}_pv" for f in range(16)]
             e(f"  {', '.join(pr)} = scf.if %pmore_pv -> ({rtypes}) {{")
             pinit = ", ".join(f"%rb{f}_pvc = {p0[f]} : {BK}" for f in range(16))
-            e(f"  %wkf_pv, {', '.join(pl)} = scf.while(%ksw_pv = %c16 : index, {pinit}) -> (index, {rtypes}) {{")
+            e(f"  %wkf_pv, {', '.join(pl)} = scf.while(%ksw_pv = {ks0b} : index, {pinit}) -> (index, {rtypes}) {{")
             i0 = len(L)
             e("    %ks_ = index.assume %ksw_pv [range(%ksw_pv, 0, 1048576), lt(%ksw_pv, %max_vis)] : index")
             if "p" in R2P_UNR:
@@ -3281,6 +3812,12 @@ def gen():
             persist_finish("n")
         e("  scf.if %isA {")
         e(f"    view.store %gsum, %ls_view[%pa_own] : f32, view<{16 * NQB}xf32>")
+        if KS:
+            if R2P_QSPLIT and R2P_QFOLD:   # the max is in log2 units already
+                e(f"    view.store %gmax, %lm_view[%pa_own] : f32, view<{16 * NQB}xf32>")
+            else:
+                e(f"    %gmcl = scalar.mulf %gmax, {'%r2l2e' if R2P_QSPLIT else '%log2e'} : f32")
+                e(f"    view.store %gmcl, %lm_view[%pa_own] : f32, view<{16 * NQB}xf32>")
         e("  }")
         # the last tile: its V (P.V waves read it after the barrier), its P^T / alpha in slot (tiles - 1) % 2
         e("  %ltl0 = index.add %max_vis, %c15 : index")
@@ -3310,11 +3847,17 @@ def gen():
             outs = pvo
         else:
             outs = r2p_pv("%lrows", "%lal", fb, "fp", "  ")
+        i0 = len(L)
         for f in range(16):
             e(f"  %og{f} = vector.bitcast {outs[f]} : {BK} to {V8}")
         lsum_load()
         e(f"  %lsum_lo = view.load %ls_view[%pa_oth] : view<{16 * NQB}xf32> -> f32")
-        e("  %ewr = scalar.andi %r_live, %isB : i1")
+        if KS:
+            ksplit_merge(i0)
+            e("  %ewr0 = scalar.andi %r_live, %isB : i1")
+            e("  %ewr = scalar.andi %ewr0, %kpwr : i1")
+        else:
+            e("  %ewr = scalar.andi %r_live, %isB : i1")
     elif PIPE2:
         # prologue part 2: QK(0) -> own S partial (carried), store it, stage V(0) and K(1) (second buffer)
         s0 = emit_qk("%k_view", "p0q", "  ")
@@ -3752,19 +4295,21 @@ def _deq_common(e, sym):
     e("  %g = index.add %g0, %tid : index")
 
 
-def gen_kdeq(bits=4):
+def gen_kdeq(bits=4, raw=False, khalf=False):
     """yah_kdeq4 (kv4 prefill): the paged int4 K pool -> the paged f16 K pool [physical row][1024] (rows 0..rows-1), with the
     attention's own staging decode (stage_k_ K4: nibble pairs to f16 1 + u/16, one packed fma with the row group's
     (16 s, lo - 16 s)), so the fp16 attention reading it computes what the kv4 attention did. Thread: (row, KV head,
-    16-dim chunk). Bindings: kq (i32), kscale (i32), ptab, out (f16)."""
-    assert bits in (4, 8)
+    16-dim chunk). Bindings: kq (i32), kscale (i32), ptab, out (f16).
+    raw (kv8, the attention's ATTN_KRAW): out holds u - 128 exactly and binding kso (f16 [KV head][128-dim half][pool
+    row], f16) the scale s = (256 s) / 256 of each row half."""
+    assert bits in (4, 8) and not (raw and bits != 8) and not (khalf and not raw)
     sym = f"yah_kdeq{bits}"
     nw = 2 if bits == 4 else 4                  # dwords per 16-dim chunk
     rw, sw = (128, 32) if bits == 4 else (256, 8)   # code / scale dwords per row
     L = []
     e = L.append
     _deq_header(e, f"gen_kdeq{bits}", sym, "  %th = index.mul %rows, %c64 : index")
-    e("} launch(%kq: buffer, %ks: buffer, %ptab: buffer, %out: buffer) {")
+    e("} launch(%kq: buffer, %ks: buffer, %ptab: buffer, %out: buffer" + (", %kso: buffer" if raw else "") + ") {")
     _deq_common(e, sym)
     if bits == 8:
         e("  %c4 = index.constant 4 : index")
@@ -3816,17 +4361,63 @@ def gen_kdeq(bits=4):
             ws.append(f"%g{d}{k}")
     e(f"  %pk = vector.from_elements {', '.join(ws)} : vector<8xi32>")
     e(f"  %pf = vector.bitcast %pk : vector<8xi32> to {V16H}")
-    e(f"  %S16 = vector.splat %sS : {V16H}")
-    e(f"  %C16 = vector.splat %sC : {V16H}")
-    e(f"  %dk = vector.fmaf %pf, %S16, %C16 : {V16H}")
+    if raw:   # (1 + u / 256) 256 - 384 = u - 128, exact
+        e("  %rS = scalar.constant 256.0 : f16")
+        e("  %rC = scalar.constant -384.0 : f16")
+        e(f"  %S16 = vector.splat %rS : {V16H}")
+        e(f"  %C16 = vector.splat %rC : {V16H}")
+    else:
+        e(f"  %S16 = vector.splat %sS : {V16H}")
+        e(f"  %C16 = vector.splat %sC : {V16H}")
+    e(f"  %dk0 = vector.fmaf %pf, %S16, %C16 : {V16H}")
+    dk = "%dk0"
+    if khalf:   # the other half's (256 s', ..) pair; r = s / max(s, s') (exactly 1 on the larger half)
+        e("  %c1h = index.constant 1 : index")
+        e("  %soh = index.sub %c1h, %sc2 : index")    # the other half (kv8: dword sr + 2 h + half)
+        e("  %sao = index.add %sr, %sh8 : index")
+        e("  %sao3 = index.add %sao, %soh : index")
+        e("  %svo = view.load %ks_flat[%sao3] : view<[%kstot]xi32> -> i32")
+        e("  %so1 = vector.from_elements %svo : vector<1xi32>")
+        e("  %soo = vector.bitcast %so1 : vector<1xi32> to vector<2xf16>")
+        e("  %sSo = vector.extract %soo[0] : vector<2xf16> -> f16")
+        e("  %sbig = scalar.maxnumf %sS, %sSo : f16")
+        e("  %sSf = scalar.extf %sS : f16 to f32")
+        e("  %sbf = scalar.extf %sbig : f16 to f32")
+        e("  %one32 = scalar.constant 1.0 : f32")
+        e("  %rq = scalar.divf %sSf, %sbf : f32")
+        e("  %isbig = scalar.cmpf oeq, %sS, %sbig : f16")
+        e("  %rr = scf.select %isbig, %one32, %rq : f32")
+        e("  %dkf = vector.extf %dk0 : " + V16H + " to vector<16xf32>")
+        e("  %rr16 = vector.splat %rr : vector<16xf32>")
+        e("  %dkr = vector.mulf %dkf, %rr16 : vector<16xf32>")
+        e("  %dk = vector.fptrunc %dkr : vector<16xf32> to " + V16H)
+        dk = "%dk"
     e("  %orr = index.mul %pr, %c1024 : index")   # the f16 pool row = the int4 pool's physical row
     e("  %oh = index.mul %h, %c256 : index")
     e("  %oc = index.mul %ch, %c16 : index")
     e("  %oa0 = index.add %orr, %oh : index")
     e("  %oa = index.add %oa0, %oc : index")
     e("  scf.if %live {")
-    e(f"    vector.store %dk, %o_flat[%oa] : {V16H}, view<[%otot]xf16>")
+    e(f"    vector.store {dk}, %o_flat[%oa] : {V16H}, view<[%otot]xf16>")
     e("  }")
+    if raw:   # the half's first chunk stores s at [h][half][pool row]
+        e("  %c8r = index.constant 8 : index")
+        e("  %rsn = index.mul %pcap, %c8r : index")
+        e("  %rs_na = buffer.assume.noalias %kso : buffer")
+        e("  %rs_flat = buffer.view %rs_na[%base] : buffer -> view<[%rsn]xf16>")
+        e("  %rhf = index.div %ch, %c8r : index")
+        e("  %rcm = index.rem %ch, %c8r : index")
+        e("  %rc0 = index.cmp eq, %rcm, %c0 : index")
+        e("  %rw = scalar.andi %live, %rc0 : i1")
+        e("  %ri0 = index.mul %h, %c2 : index")
+        e("  %ri1 = index.add %ri0, %rhf : index")
+        e("  %ri2 = index.mul %ri1, %pcap : index")
+        e("  %ri = index.add %ri2, %pr : index")
+        e("  %r256 = scalar.constant 0.00390625 : f16")
+        e(f"  %rs = scalar.mulf {'%sbig' if khalf else '%sS'}, %r256 : f16")
+        e("  scf.if %rw {")
+        e("    view.store %rs, %rs_flat[%ri] : f16, view<[%rsn]xf16>")
+        e("  }")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"

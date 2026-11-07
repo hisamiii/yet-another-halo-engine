@@ -789,6 +789,11 @@ class LoomPrefill {
     // (gen_attn_fa PQ_WORDS), zero between calls (the kernel's last fetch resets its counter)
     for (const auto& [name, g] : geom_)
       if (name.rfind("persist_", 0) == 0 && g.tt && !pqueue_) pqueue_ = &Alloc(kPqueueSlots * 2048), gpu_.Fill(*pqueue_, 0);
+    // two-kernel key-split tail (dispatch.txt "ksplit_<hal> <partial floats> 0 0"): one partials buffer for every
+    // attention call (each call's merge runs right after it), 64 i32 counters (unused) then the f32 partials
+    for (const auto& [name, g] : geom_)
+      if (name.rfind("ksplit_", 0) == 0) ksplit_bytes_ = std::max<std::size_t>(ksplit_bytes_, 256 + std::size_t{4} * g.tokens);
+    if (ksplit_bytes_) ksplit_ = &Alloc(ksplit_bytes_), gpu_.Fill(*ksplit_, 0);
     kbuf_ = &Alloc(B * kKv * 4);
     vbuf_ = &Alloc(B * kKv * 4);
     raw_ = &Alloc(B * kInner * 4);
@@ -897,6 +902,8 @@ class LoomPrefill {
       deq_bytes_ = std::size_t{pages_} * 256 * kKvRow * 2;
       kdeq_ = &Alloc(deq_bytes_);
       vdeq_ = &Alloc(deq_bytes_);
+      // dispatch.txt "kraw": kdeq8 writes the raw codes and their scales, f16 [KV head][128-dim half][pool row]
+      if (geom_.count("kraw") != 0) kscale_ = &Alloc(std::size_t{pages_} * 256 * 8 * 2);
     }
   }
 
@@ -2514,7 +2521,10 @@ class LoomPrefill {
       const char* kd = attn_kq4_ ? "kdeq4" : "kdeq8";
       const char* vd = attn_kq4_ ? "vdeq4" : "vdeq8";
       Dispatch(ChunkExe(kd, ci), attn_kq4_ ? "yah_kdeq4" : "yah_kdeq8", (rows * 64 + 255) / 256, 1, 1, 256, 1, 1,
-               {{kq8buf_->handle, q8off, kq_bytes_}, {ksbuf_->handle, ksoff, ks_bytes_}, ptab_ref_, Ref(*kdeq_)});
+               kscale_ ? std::vector<hrx_buffer_ref_t>{{kq8buf_->handle, q8off, kq_bytes_}, {ksbuf_->handle, ksoff, ks_bytes_},
+                                                       ptab_ref_, Ref(*kdeq_), Ref(*kscale_)}
+                       : std::vector<hrx_buffer_ref_t>{{kq8buf_->handle, q8off, kq_bytes_}, {ksbuf_->handle, ksoff, ks_bytes_},
+                                                       ptab_ref_, Ref(*kdeq_)});
       Dispatch(ChunkExe(vd, ci), attn_kq4_ ? "yah_vdeq4" : "yah_vdeq8", 4 * ((rows + 15) / 16), 1, 1, 256, 1, 1,
                {{vqbuf_->handle, vqoff, vq_bytes_}, {vqsbuf_->handle, vqsoff, vqs_bytes_}, ptab_ref_, Ref(*vdeq_)});
     }
@@ -2543,6 +2553,7 @@ class LoomPrefill {
         b.push_back(TRef(*Find(pre + "attn_q_norm.weight")));
         b.push_back({eps_->handle, 0, 4});
       }
+      if (deqb && kscale_) b.push_back(Ref(*kscale_));
       const std::string ah = std::string(o_af ? "wmma_t" : "wmma") + (ci ? "_c" + std::to_string(ci) : std::string()) + ".hal";
       const auto ag = geom_.find(ah);
       const std::uint32_t tpw = ag != geom_.end() ? ag->second.tokens : attn_tpw_,
@@ -2557,9 +2568,22 @@ class LoomPrefill {
         if (ai >= kPqueueSlots) throw LoomError("prefill: more attention layers than queue counters");
         b.push_back({pqueue_->handle, std::size_t{ai} * 2048, 1056});
       }
+      // the key-split tail: kernel 1 (this HAL) stores the tail pieces' partials, the merge "wmmak<rest>" writes their output
+      const bool ks = geom_.count("ksplit_" + ahx) != 0;
+      if (ks) {
+        if (attn_flagged_ || pg == geom_.end() || !pg->second.tt || !ksplit_)
+          throw LoomError("prefill: ksplit_" + ahx + " without its queue");
+        b.push_back({ksplit_->handle, 0, ksplit_bytes_});
+      }
       Dispatch(Exe(ahx), "yah_attn_wmma", pg != geom_.end() ? pg->second.tokens : (B_ + tpw - 1) / tpw,
                pg != geom_.end() ? 1 : kHeads / hpw, 1, 256, 1, 1,
                b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
+      if (ks) {
+        const std::string mh = "wmmak" + ahx.substr(4);
+        const auto mg = geom_.find("persist_" + mh);
+        if (mg == geom_.end() || !mg->second.tt) throw LoomError("prefill: no persist_" + mh);
+        Dispatch(Exe(mh), "yah_attn_wmma", mg->second.tokens, 1, 1, 256, 1, 1, b);
+      }
       if ((kdeq_ && qr16_) || std::getenv("YAH_ATTN_DUMP_QF")) AttnDump(ai, ci);
     }
     trim_row_ = tail_;
@@ -2569,7 +2593,7 @@ class LoomPrefill {
 
   // YAH_ATTN_DUMP=<prefix> YAH_ATTN_DUMP_AT=<chunk>,<attention layer>: that attention call's inputs and output as raw
   // files (any kv4 dequant set; tools/attn_bench.py --inputs reads them)
-  // (<prefix>.q f16 rotated Q, .kpool / .vpool the f16 pools, .gate f32, .out f16)
+  // (<prefix>.q f16 rotated Q or a qnorm set's whole q buffer, .kpool / .vpool the f16 pools, .gate f32, .out f16)
   void AttnDump(std::uint32_t ai, std::uint32_t ci) {
     const char* pre = std::getenv("YAH_ATTN_DUMP");
     const char* at = std::getenv("YAH_ATTN_DUMP_AT");
@@ -2591,12 +2615,15 @@ class LoomPrefill {
     // YAH_ATTN_DUMP_QF=1: the whole f32-sized q buffer (raw q under qnorm; qsplit's f16 q, rotary dims and sums), and
     // without the kv4 dequant pools only it and the output
     if (std::getenv("YAH_ATTN_DUMP_QF")) dump(".qf", *q_, std::size_t{B_} * kAttn * 4, 0);
-    if (!kdeq_ || !qr16_) {
+    if (!kdeq_ || !(qr16_ || qnorm_)) {
       dump(".out", *scratch_, std::size_t{B_} * kAttn * 2, 0);
       return;
     }
-    dump(".q", *qr16_, std::size_t{B_} * kAttn * 2, 0);
+    // a qnorm set binds the whole f32-sized q buffer (split-norm f16 q, rotary dims and sums)
+    if (qr16_) dump(".q", *qr16_, std::size_t{B_} * kAttn * 2, 0);
+    else dump(".q", *q_, std::size_t{B_} * kAttn * 4, 0);
     dump(".kpool", *kdeq_, deq_bytes_, 0);
+    if (kscale_) dump(".kscale", *kscale_, std::size_t{pages_} * 256 * 8 * 2, 0);
     if (all && std::getenv("YAH_ATTN_DUMP_V")) dump(".vpool", *vdeq_, deq_bytes_, 0);
     if (!all) {
       dump(".vpool", *vdeq_, deq_bytes_, 0);
@@ -3267,6 +3294,8 @@ class LoomPrefill {
   std::size_t deq_bytes_ = 0;
   static constexpr std::uint32_t kPqueueSlots = 64;
   LoomBuffer* pqueue_ = nullptr;
+  LoomBuffer* ksplit_ = nullptr;  // the key-split tail's partials (dispatch.txt "ksplit_<hal>")
+  std::size_t ksplit_bytes_ = 0;
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records
   std::unique_ptr<LoomGraph> chunk_graph_;
@@ -3403,7 +3432,7 @@ class LoomPrefill {
              *wstage_ = nullptr, *ostage_ = nullptr, *partial_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
              *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr, *qr16_ = nullptr,
-             *kdeq_ = nullptr, *vdeq_ = nullptr, *ids_ = nullptr,
+             *kdeq_ = nullptr, *vdeq_ = nullptr, *kscale_ = nullptr, *ids_ = nullptr,
              *normt_ = nullptr;
   std::int64_t keep_rows_ = kAllRows, tail_ = kAllRows, trim_row_ = kAllRows;
 };
