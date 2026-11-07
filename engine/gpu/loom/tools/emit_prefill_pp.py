@@ -2487,6 +2487,10 @@ def main():
     # kernel lose (WMMA bank rank 14-16: 64K -1.2, 8K -1.7..-2.3)
     qfold_main = gen_attn_fa.R2P_QFOLD
     gen_attn_fa.R2P_QFOLD = int(os.environ.get("YAH_ATTN_QFOLD64", "2" if os.environ.get("YAH_ATTN_KVG64") else str(qfold_main)))
+    # YAH_ATTN_PCHK64=0|1: the 2 x 64 kernels test the lazy rescale on each lane's 8-key max (gen_attn_fa R2P_PCHK,
+    # bit-identical): 64K busiest SQ 88.3 -> 88.9; the 2 x 32 kernel keeps the row max (8K: mean +0.0, one SQ slower)
+    pchk_main = gen_attn_fa.R2P_PCHK
+    gen_attn_fa.R2P_PCHK = os.environ.get("YAH_ATTN_PCHK64", "1") == "1"
     if w64_from < NCH:
         assert MAIN_FLAGS["R2P"] and persist and (a_hpw, a_qt) == (2, 32) and w64_from >= 1
         gen_attn_fa.configure(2, 64)
@@ -2539,6 +2543,7 @@ def main():
         gen_attn_fa.configure(a_hpw, a_qt)
     gen_attn_fa.KVG = kvg_main
     gen_attn_fa.R2P_QFOLD = qfold_main
+    gen_attn_fa.R2P_PCHK = pchk_main
     A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = kv_flags
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())

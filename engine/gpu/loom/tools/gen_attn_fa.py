@@ -268,6 +268,10 @@ R2P_QPFW = os.environ.get("R2P_QPFW", "0") == "1"   # R2P_QPF: the norm weights 
 R2P_QFOLD = int(os.environ.get("R2P_QFOLD", "0"))   # 1: at the dead-row select; 2: each wave scales its own halves
 # before the trade (the RoPE ones in f32, folded into the 0.0625)
 R2P_LAZY = float(os.environ.get("R2P_LAZY", "5"))   # R2P: lazy rescale threshold in nats (0: exact, bit-identical)
+# R2P_PCHK (R2P_LAZY, the QK role): the grow test on each lane's 8-key max (fl(x - th) is monotone, so some lane's
+# fl(max8 - th) > rmax iff fl(row max - th) > rmax: the same decision, bit-identical); the cross-half permute and max
+# run only in the grow arm
+R2P_PCHK = os.environ.get("R2P_PCHK", "0") == "1"
 QB_ZIGZAG = False   # query blocks launch long, short, long, ... instead of longest first
 # PERSIST = P > 0: P workgroups (one per slot: 20 WGPs x 4) each run a list of units (query block, head pair) in a
 # loop: the units sorted longest first (QB_ZIGZAG: in its long, short, ... order), dealt round by round, the
@@ -2675,29 +2679,31 @@ def gen():
                 for i in range(1, 8):
                     e(f"    %tmc{i} = scalar.maxnumf<nnan> {cur}, %tme{i} : f32")
                     cur = f"%tmc{i}"
-            e(f"    %tmi = scalar.bitcast {cur} : f32 to i32")
-            e("    %tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
-            e("    %tmf = scalar.bitcast %tmx : i32 to f32")
-            e(f"    %tmax = scalar.maxnumf<nnan> {cur}, %tmf : f32")
+            tm0 = cur
         else:
             if "nomax" in R2P_DIAG:   # diag: the row max of element 0 only (no reduce; wrong values)
                 e(f"    %tmax0 = vector.extract {s}[0] : {V8} -> f32")
             else:
                 e(f"    %tmax0 = vector.reduce<maxnumf> {s}, %ninf : {V8}, f32")
-            e("    %tmi = scalar.bitcast %tmax0 : f32 to i32")
-            e("    %tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
-            e("    %tmf = scalar.bitcast %tmx : i32 to f32")
-            e("    %tmax = scalar.maxnumf %tmax0, %tmf : f32")
+            tm0 = "%tmax0"
+        def full_max(ind):   # the row max: this lane's 8 keys and the other half's (lane ^ 16)
+            e(f"{ind}%tmi = scalar.bitcast {tm0} : f32 to i32")
+            e(f"{ind}%tmx, %tmv = kernel.subgroup.shuffle<xor> %tmi, %x16, %x32 : i32, i32, i32")
+            e(f"{ind}%tmf = scalar.bitcast %tmx : i32 to f32")
+            e(f"{ind}%tmax = scalar.maxnumf{'<nnan>' if MAXNN else ''} {tm0}, %tmf : f32")
+        pchk = R2P_PCHK and R2P and R2P_LAZY and pair_slot is not None
+        if not pchk:
+            full_max("    ")
         if early:
             early()
         # one wave-uniform branch: raise the max and rescale O / l only when some row needs it (FA4 conditional rescale)
         if R2P and R2P_LAZY:   # the max is raised only past rmax + R2P_LAZY: p up to e^R2P_LAZY (f16 has room), O
             # and l carry the same stale scale, which the epilogue's O / l cancels (rounding points move: gate N)
             if R2P_QSPLIT:
-                e("    %tmlz = scalar.subf %tmax, %qslzth : f32")
+                e(f"    %tmlz = scalar.subf {tm0 if pchk else '%tmax'}, %qslzth : f32")
             else:
                 e(f"    %lzth = scalar.constant {R2P_LAZY} : f32")
-                e("    %tmlz = scalar.subf %tmax, %lzth : f32")
+                e(f"    %tmlz = scalar.subf {tm0 if pchk else '%tmax'}, %lzth : f32")
             if "nogrow" in R2P_DIAG:   # diag: the max never raised past the first (opaque: rmax + 1e30; wrong values)
                 e("    %grbig = scalar.constant 1.0e30 : f32")
                 e("    %grth = scalar.addf %rmax, %grbig : f32")
@@ -2708,7 +2714,10 @@ def gen():
             e("    %grow = scalar.cmpf ogt, %tmax, %rmax : f32")
         e("    %anygrow = kernel.subgroup.vote.any %grow : i1")
         if pair_slot is not None:   # O lives in wave B: only the max and alpha here
-            e("    %rsm, %rss = scf.if %anygrow -> (f32, f32) {")
+            # (PCHK: no max of the result with -FLT_MAX: both arms yield >= rmax >= -FLT_MAX, so it is the identity)
+            e(f"    {'%nmax' if pchk else '%rsm'}, %rss = scf.if %anygrow -> (f32, f32) {{")
+            if pchk:
+                full_max("      ")
             e("      %gmx = scalar.maxnumf %rmax, %tmax : f32")
             e("      %gpd = scalar.subf %rmax, %gmx : f32")
             e(f"      %galpha = scalar.exp2f<afn> {l2mul('%gpdl', '%gpd', '      ')} : f32")
@@ -2733,7 +2742,8 @@ def gen():
         if mid:
             mid()
         # MAXNN: both arms yield max(rmax, ..) >= -FLT_MAX, so with ninf LLVM folds the seed max away
-        e(f"    %nmax = scalar.maxnumf{'<nnan|ninf>' if MAXNN else ''} %rsm, %ninf : f32")
+        if not pchk:
+            e(f"    %nmax = scalar.maxnumf{'<nnan|ninf>' if MAXNN else ''} %rsm, %ninf : f32")
         e(f"    %nnml = scalar.negf {l2mul('%nml', '%nmax', '    ')} : f32")
         e("    %pd = scalar.subf %rmax, %nmax : f32")
         e(f"    %alpha = scalar.exp2f<afn> {l2mul('%pdl', '%pd', '    ')} : f32")
@@ -2960,10 +2970,11 @@ def gen():
         """R2P, P.V wave: rescale each head's half of the bank (0..7: own head, 8..15: the other) by its alpha of that
         tile unless all its rows' are 1 (x 1.0 is exact), both heads' P^T from the slot, then 8 V^T fragments of this
         head-dim half, each feeding both heads' MMAs. Returns the new bank names."""
+        nopvck = "nopvck" in R2P_DIAG   # diag: no alpha loads / check / rescale in the P.V wave (wrong if a max grows)
         if R2P_PVB:
             e(f"{ind}%{pp}rb = index.mul {rows}, %pvb16 : index")
             e(f"{ind}%{pp}ab = index.mul {alb}, %pvb4 : index")
-            for nm, base in (("al", "%pab_own"), ("alo", "%pab_oth")):
+            for nm, base in (() if nopvck else (("al", "%pab_own"), ("alo", "%pab_oth"))):
                 e(f"{ind}%{pp}{nm}a = index.add {base}, %{pp}ab : index")
                 e(f"{ind}%{pp}{nm}v = vector.load %alb_view[%{pp}{nm}a] : view<{128 * NQB}xi8> -> vector<4xi8>")
                 e(f"{ind}%{pp}{nm}w = vector.bitcast %{pp}{nm}v : vector<4xi8> to vector<1xf32>")
@@ -2979,7 +2990,9 @@ def gen():
             Rf.append(f"%{pp}rf{f}")
         ftypes = ", ".join([V8] * 8)
         sc = [f"%{pp}sc{f}" for f in range(16)]
-        for t, a in enumerate((f"%{pp}al", f"%{pp}alo")):   # per head: its fragments only when its rows' max grew
+        if nopvck:
+            sc = list(Rf)
+        for t, a in enumerate(() if nopvck else (f"%{pp}al", f"%{pp}alo")):   # per head: only when its rows' max grew
             e(f"{ind}%{pp}gr{t} = scalar.cmpf oeq, {a}, %one : f32")
             e(f"{ind}%{pp}ag{t} = kernel.subgroup.vote.all %{pp}gr{t} : i1")
             fs = range(8 * t, 8 * t + 8)
