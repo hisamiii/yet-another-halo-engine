@@ -59,10 +59,19 @@ PQUEUE = "%pqv = buffer.view %pq_na[%base] : buffer -> view<264xi32>"
 def layout(text, path):
     """The layout whose size formulas all appear in the source; refuse the source otherwise. A queued persistent kernel
     (gen_attn_fa PERSIST_DYN) binds one more buffer, its 264-word queue, after the others."""
+    if ", %ksplit: buffer)" in text:   # gen_attn_fa KSPLIT: counters + partials, after the queue
+        if ", %pqueue: buffer, %ksplit: buffer)" not in text:
+            sys.exit(f"refused {path}: ksplit without its queue")
+        text = text.replace(", %ksplit: buffer)", ")")
     if ", %pqueue: buffer)" in text:
         if PQUEUE not in text:
             sys.exit(f"refused {path}: its queue is not 264 i32")
         text = text.replace(", %pqueue: buffer)", ")")
+    kraw = ", %kscale: buffer" in text   # gen_attn_fa KRAW: f16 K scales [4][2][pcap] after qeps (layout suffix +kraw)
+    if kraw:
+        if "%kscn = index.mul %pcap, %c8 : index" not in text:
+            sys.exit(f"refused {path}: its kscale view is not pcap x 8 f16")
+        text = text.replace(", %kscale: buffer", "")
     # an f16 gate view (gen_attn_fa R2P_GSIG16) covers half the f32 gate allocation: size it as the f32 one
     text = text.replace("%g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf16>",
                         "%g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]xf32>")
@@ -77,17 +86,19 @@ def layout(text, path):
         sys.exit(f"refused {path}: its buffer size formulas match no harness layout")
     if re.search(r"%lse\w* = buffer\.view", text) or re.search(r"view\.store [^\n]*%lse", text):
         sys.exit(f"refused {path}: it writes lse; size it in the harness first")
-    return name
+    return name + ("+kraw" if kraw else "")
 
 
 def buffers(lay, cap, wrap=0):
     npages = (cap + 255) // 256
     pcap = npages * 256
     vpitch = (pcap + 15) // 16 * 16
+    kraw = lay.endswith("+kraw")
+    lay = lay.removesuffix("+kraw")
     q = f"s:{B * 6144 * 4}:1" if lay == "f32q" else f"h:{B * 6144 * 2}:1"
     bufs = [q, f"s:{B * 6144 * 4}:2", f"h:{pcap * 1024 * 2}:3", f"h:{vpitch * 1024 * 2}:4", f"z:{B * 6144 * 2}",
             f"z:{B * HEADS * 4}", f"p:{npages}" + (f":{wrap}" if wrap else "")]
-    return bufs + (["c:256:1.0", "c:1:0.000001"] if lay == "f32q" else [])
+    return bufs + (["c:256:1.0", "c:1:0.000001"] if lay == "f32q" else []) + ([f"h:{pcap * 16}:5"] if kraw else [])
 
 
 def grid(text):
@@ -110,7 +121,7 @@ def compile_hal(src, text, env, depth, outdir, cap):
                "--output=" + out + ".tmp"] + ["--config=attention_prefill." + c for c in configs]
         r = subprocess.run(cmd, env=dict(hrx_paths.env(), **env), capture_output=True, text=True)
         if r.returncode:
-            sys.exit(f"compile failed: {src} depth {depth}\n{r.stderr[-2000:]}")
+            sys.exit(f"compile failed: {src} depth {depth}\n{r.stderr[:3000]}")
         os.replace(out + ".tmp", out)
     return out
 
@@ -151,8 +162,13 @@ def main():
         if depth + B > cap:
             sys.exit(f"depth {depth} + {B} queries past --cap {cap}")
         bufs = buffers(variants[0][4], cap, a.wrap)
-        if any(", %pqueue: buffer)" in v[2] for v in variants):
+        if any(", %pqueue: buffer" in v[2] for v in variants):
             bufs.append("z:1056")
+        ksn = {int(m) for v in variants for m in re.findall(r"%kspv = buffer.view %ks_na\[%ksp_o\] : buffer -> view<(\d+)xf32>", v[2])}
+        if ksn:   # one size (the largest); it is the last binding, so a variant without it binds the buffers before it
+            if not all(", %pqueue: buffer, %ksplit: buffer)" in v[2] or ", %pqueue: buffer)" in v[2] for v in variants):
+                sys.exit("variants of a ksplit run must bind the queue, then ksplit or nothing")
+            bufs.append(f"z:{256 + 4 * max(ksn)}")
         if a.inputs:
             for i, ext in ((0, ".q"), (2, ".kpool"), (3, ".vpool")):
                 want = int(bufs[i].split(":")[1])
@@ -160,6 +176,13 @@ def main():
                 if got != want:
                     sys.exit(f"refused {a.inputs + ext}: {got} bytes, the kernel reads {want}")
                 bufs[i] = "f:" + a.inputs + ext
+            # a qnorm set's dump: the gate (f32) and, when written, the layer's q norm weight (in place of 1.0)
+            for i, ext in ((1, ".gate"), (7, ".qnw"), (9, ".kscale")):
+                if i < len(bufs) and os.path.exists(a.inputs + ext) and not bufs[i].startswith("z:"):
+                    want = int(bufs[i].split(":")[1]) * (4 if bufs[i].startswith("c:") else 1)
+                    if os.path.getsize(a.inputs + ext) != want:
+                        sys.exit(f"refused {a.inputs + ext}: {os.path.getsize(a.inputs + ext)} bytes, the kernel reads {want}")
+                    bufs[i] = "f:" + a.inputs + ext
         if a.qin:
             want = int(bufs[0].split(":")[1])
             if os.path.getsize(a.qin) != want:
@@ -169,13 +192,13 @@ def main():
         for name, src, text, env, _ in variants:
             gx, gy = grid(text)
             if "HAL" in env:   # a prebuilt code object for this one depth (e.g. a regperm rewrite of the compiled one)
-                hals.append(f"{env['HAL']}@{gx},{gy}")
+                hals.append(f"{env['HAL']}@{gx},{gy}" + (f",{os.environ['ATB_OUT']}" if os.environ.get("ATB_OUT") else ""))
                 continue
-            hals.append(f"{compile_hal(src, text, env, depth, a.tag, cap)}@{gx},{gy}")
+            hals.append(f"{compile_hal(src, text, env, depth, a.tag, cap)}@{gx},{gy}" + (f",{os.environ['ATB_OUT']}" if os.environ.get("ATB_OUT") else ""))
         prof = os.path.join(a.tag, "run.irpf")
         if os.path.exists(prof):
             os.remove(prof)
-        env = dict(os.environ, **({"ATTN_BENCH_ZERO": str(len(bufs) - 1)} if bufs[-1] == "z:1056" else {}), YAH_HRX=hrx_paths.HRX, CQ_MEM_GB="6", YAH_NPU="0", HRX_PROFILE_MODE="counters",
+        env = dict(os.environ, **({"ATTN_BENCH_ZERO": str(len(bufs) - 1)} if bufs[-1] == "z:1056" and not os.environ.get("ATB_NOZERO") else {}), YAH_HRX=hrx_paths.HRX, CQ_MEM_GB="6", YAH_NPU="0", HRX_PROFILE_MODE="counters",
                    HRX_PROFILE_COUNTERS=",".join(["SQ_BUSY_CYCLES"] + extra), HRX_PROFILE_FILE=prof)
         if a.att:
             env.update(HRX_PROFILE_MODE="executable", HRX_PROFILE_FILTER="yah_attn*")
@@ -185,6 +208,8 @@ def main():
                str(len(bufs))] + bufs + hals
         r = subprocess.run(cmd, env=env, capture_output=True, text=True)
         firsts = re.findall(r"^first (\d+) ([0-9a-f]{16})$", r.stdout, re.M)
+        if os.environ.get("ATB_DEBUG"):   # the binary's own lines (host ms per HAL, first-dispatch hashes)
+            print(r.stdout.strip() + "\n" + r.stderr.strip()[-6000:], flush=True)
         if r.returncode or len(firsts) != len(hals):
             sys.exit(f"attn_bench failed at depth {depth}:\n" + (r.stdout + r.stderr)[-2000:])
         tool = os.path.join(hrx_paths.BUILD, "runtime/src/iree/tools/iree-profile/iree-profile")

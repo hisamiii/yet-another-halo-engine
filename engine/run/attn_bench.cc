@@ -10,6 +10,7 @@
 //   <out>: the binding whose bytes are hashed after each HAL's first dispatch (default 4, the attention output)
 // A HAL that binds fewer buffers gets the first ones. ATTN_BENCH_ZERO=<i>: buffer i must be all zero after the run
 // (a self-resetting work queue counter).
+// ATTN_BENCH_CHAIN=1: only HAL 0's output is zeroed before its first dispatch (HAL k > 0 reads what HAL k - 1 wrote).
 //
 // Do not compute the buffer sizes by hand: run this through tools/attn_bench.py, which derives them from the kernel's
 // configs. An access past an allocation does not fault on this target: the shader hangs and the box resets.
@@ -164,7 +165,7 @@ int main(int argc, char** argv) {
   for (size_t k = 0; k < hals.size(); ++k) {
     Hal& h = hals[k];
     std::vector<uint8_t> zero(sizes[h.out], 0), back(sizes[h.out]);
-    gpu.H2D(bufs[h.out], zero.data(), zero.size());
+    if (k == 0 || !std::getenv("ATTN_BENCH_CHAIN")) gpu.H2D(bufs[h.out], zero.data(), zero.size());
     const uint32_t ws = h.exe.WorkgroupSize(h.ordinal);
     gpu.Dispatch(h.exe, h.ordinal, LoomDevice::Config(h.gx, h.gy, 1, ws ? ws : 256, 1, 1), nullptr, 0, refs.data(),
                  h.nb);
