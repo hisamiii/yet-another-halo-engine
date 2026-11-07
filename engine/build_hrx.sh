@@ -65,6 +65,10 @@ fi
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
     -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+# Attention HALs timed interleaved under HRX counters (tools/attn_bench.py).
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/attn_bench.cc" \
+    -o "$root/engine/build/attn_bench" "$root/engine/build/libyah_core.a" \
+    -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 # The Responses API server (engine/serve).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" \
     "$root/engine/serve/yah_server.cc" "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
@@ -88,4 +92,4 @@ if [ "$#" -ge 1 ]; then
   hal="${2:-$root/engine/hal}"
   python3 "$root/engine/gpu/loom/tools/emit_decode.py" "$1" "$hal"
 fi
-echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,yah_server,engine_reuse,spec_check,spec_engine} (and the CMake targets)"
+echo "built $root/engine/build/{loom_forward_pp,loom_decode,hal_run,attn_bench,yah_server,engine_reuse,spec_check,spec_engine} (and the CMake targets)"

@@ -79,7 +79,7 @@ class Engine : public TextGenerator {
     gpu_.SetSleepSync(200);
     logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
     seed_ = gpu_.Allocate(8);
-    reuse_ = o.reuse && !prefill_.fpsparse();
+    reuse_ = o.reuse;
     if (reuse_)
       for (Snapshot& s : snaps_) {
         s.conv = gpu_.Allocate(prefill_.conv_state().length);
@@ -199,7 +199,7 @@ class Engine : public TextGenerator {
         shares += 2 * ChunkShare(B);
         for (std::uint32_t p = 0; p < 2; ++p)
           prefill_.SelectChunk(p), prefill_.Embed(prompt.data() + std::size_t{c + p} * B, B);
-        prefill_.RunPair(c, LoomPrefill::kNoRows, head1 ? std::int64_t{B} - 1 : LoomPrefill::kNoRows, head1);
+        prefill_.RunPair(c, LoomPrefill::kNoRows, head1 ? std::int64_t{B} - 1 : LoomPrefill::kNoRows);
         if (head1) prefill_.SelectChunk(1), prefill_.Head(B - 1, Ref(logits_));
         prefill_.SelectChunk(0);
         if (at_prefill > from && (c + 2) * B == at_prefill) Save(xs, at_prefill, prefill_.conv_state());
@@ -222,7 +222,7 @@ class Engine : public TextGenerator {
       }
       // only the last chunk's last row is read (Head), and only when the prompt ends in it
       const bool head = c + 1 == chunks && (tail_chunk || tail == 0);
-      prefill_.RunLayers(c, hook, head ? std::int64_t{valid} - 1 : LoomPrefill::kNoRows, head);
+      prefill_.RunLayers(c, hook, head ? std::int64_t{valid} - 1 : LoomPrefill::kNoRows);
       if (c + 1 == chunks && (tail_chunk || tail == 0)) prefill_.Head(valid - 1, Ref(logits_));
       if (at_prefill > from && (c + 1) * B == at_prefill) Save(xs, at_prefill, prefill_.conv_state());
       if (c + 1 == chunks) {

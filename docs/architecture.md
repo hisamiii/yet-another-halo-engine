@@ -120,8 +120,6 @@ The W4A16 mode runs `yah_half_norm` and `yah_rot256` (`gen_rot.gen`, in place) w
 
 It is not bit-identical to a HIP-order kernel; the accuracy gate accepted it (build-and-run.md).
 
-Block-sparse long-context attention (`YAH_FPS_FROM=<chunk>`, FlashPrefill V2 style, `tools/gen_fpsparse.py`; kv4 sets): from that chunk on, `yah_fpmean` keeps per-128-key block means of K and V, `yah_fpsel` picks the key blocks each 16-query tile attends to from the rotated q against the block means, and the attention runs only those (plus the diagonal and the answer tile of the final chunk exact). Off by default.
-
 ### Gated DeltaNet
 
 `tools/gen_gdn_chunk.py`: the chunked WY form (chunk C = 32 tokens). A workgroup takes 64 value rows of one head, 8 waves; the state stays in f32 WMMA accumulators and the matmul inputs are f16. Gating is in log space; log2(alpha) is clamped at -100 because alpha underflows to 0 deep in the model. Output error vs the exact recurrence is ~2e-4 relative; end-to-end KLD ~3e-6.

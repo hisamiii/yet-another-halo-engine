@@ -91,7 +91,6 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 | prefill, W4A16 (the quality mode) | add `YAH_A16=1` (f16 activations, the tile GEMM) |
 | prefill, chunked, context T | `YAH_CTX=32768 python3 tools/emit_prefill_pp.py <model> <dir> 2048` (chunk 2048, pools for 32768 tokens; T a multiple of B) |
 | prefill with kv8a16 / kv4a16 | add `YAH_KV=kv8` or `YAH_KV=kv4` (or mixed `k8v4`, `k4v8`; `k8` / `v4` alone quantize one side, prefill only) |
-| prefill with block-sparse attention | add `YAH_FPS_FROM=<P>` to a chunked kv4 set: chunks from token P on run FlashPrefill (architecture.md) |
 | decode | `python3 tools/emit_decode.py <model> <dir> <max_context>` (multiple of 256, default 4096) |
 | decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
 

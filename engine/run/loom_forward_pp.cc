@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
                                                             : LoomPrefill::kNoRows;
         };
         for (std::uint32_t p = 0; p < 2; ++p) pf.SelectChunk(p), pf.Embed(ids.data() + std::size_t{ci + p} * B, B);
-        pf.RunPair(ci, keep(ci), keep(ci + 1), ci + 2 == n_chunks);
+        pf.RunPair(ci, keep(ci), keep(ci + 1));
         for (std::uint32_t p = 0; p < 2; ++p) {
           pf.SelectChunk(p);
           const std::uint32_t c = ci + p;
@@ -263,8 +263,7 @@ int main(int argc, char** argv) {
       const bool rows = rowstats || logits_from < std::min((ci + 1) * B, T_run);
       pf.RunLayers(ci, {}, rows ? LoomPrefill::kAllRows
                        : ci + 1 == n_chunks ? std::int64_t{last_n} - 1
-                                            : LoomPrefill::kNoRows,
-                   ci + 1 == n_chunks);
+                                            : LoomPrefill::kNoRows);
       for (std::uint32_t ra = std::max(logits_from, ci * B); ra < std::min((ci + 1) * B, T_run); ++ra)
         pf.Head(ra - ci * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});
       if (rowstats) {

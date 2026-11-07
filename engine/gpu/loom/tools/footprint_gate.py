@@ -33,6 +33,8 @@ bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate
          # A4 gu (gen_gemm_iu4): the up tensor beside the gate tensor in "weight"
          "up": wbytes,
          "gate_out": B * MO * 2,
+         # gen_gemm_tile KQG_QSPLIT: the q head-norm weight (256 f32)
+         "qnw": 1024,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
          "grid": max({"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096, "iq2s": 8192}.get(f, 0) for f in fmts),
          "ksigns": 128,
