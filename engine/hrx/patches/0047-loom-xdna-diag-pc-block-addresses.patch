@@ -1,0 +1,64 @@
+loom: LOOM_DIAG_PC prints each AIE2P leaf's block offsets and where its code lands.
+
+Diagnostic only (stderr, off by default): "PCBLOCKS <function> <code bytes> <offset per source block>" from the leaf
+emitter, "PCTEXT <col> <row> <section> <program offset> <bytes>" from the product writer. A core's PC is the program
+offset plus the block offset; yah's PC-range counters (model/npu_prof.hpp, tools/npu_prof.py) read these to split a
+leaf's cycles between its regions (fill decode, GEMM loop).
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/leaf_object.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/leaf_object.c
+index 66ab9f3..5cd315a 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/leaf_object.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/leaf_object.c
+@@ -6,6 +6,9 @@
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/emit/leaf_object.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
++
+ #include <string.h>
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/emit/relocation.h"
+@@ -283,6 +286,15 @@ iree_status_t loom_aie2p_leaf_object_emit(
+   }
+ 
+   const iree_string_view_t function_name = plan->function_name;
++  // DIAG LOOM_DIAG_PC: each leaf's source-order block byte offsets (PC-range counters, yah model/npu_prof.hpp).
++  if (getenv("LOOM_DIAG_PC")) {
++    fprintf(stderr, "PCBLOCKS %.*s %u", (int)function_name.size, function_name.data,
++            (unsigned)plan->encoded_byte_length);
++    for (iree_host_size_t i = 0; i < plan->block_count; ++i) {
++      fprintf(stderr, " %u", plan->block_byte_offsets[i]);
++    }
++    fprintf(stderr, "\n");
++  }
+   iree_string_view_t code_section_name;
+   iree_string_view_t entry_symbol_name;
+   IREE_RETURN_IF_ERROR(loom_aie2p_leaf_object_copy_code_name(
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
+index ac3f8a1..83be846 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
+@@ -4,6 +4,7 @@
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
++#include <stdio.h>
+ #include <stdlib.h>
+ #include "loom/target/arch/amd/xdna/aie2p/emit/xdna_product.h"
+ 
+@@ -643,6 +644,15 @@ static void loom_aie2p_xdna_emit_entry(
+             ((uint32_t)tile->coordinate.column << family->column_shift) |
+             ((uint32_t)tile->coordinate.row << family->row_shift) |
+             local_address;
++        // DIAG LOOM_DIAG_PC: where each tile's code lands (PC = program offset).
++        if (getenv("LOOM_DIAG_PC") &&
++            placement->memory_space == LOOM_XDNA_MEMORY_SPACE_PROGRAM) {
++          fprintf(stderr, "PCTEXT %u %u %.*s %u %u\n",
++                  (unsigned)tile->coordinate.column,
++                  (unsigned)tile->coordinate.row, (int)section->name.size,
++                  section->name.data, (unsigned)placement->owner_offset,
++                  (unsigned)section->contents.data_length);
++        }
+         loom_aie2p_xdna_native_block_header(
+             family, address, LOOM_AIE2P_NATIVE_HEADER_SIZE + payload_size,
+             source + source_offset);

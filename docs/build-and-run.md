@@ -21,6 +21,8 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0003-profile-counters-mode` | `HRX_PROFILE_MODE=counters` with `HRX_PROFILE_COUNTERS`: per-dispatch PMC such as `SQ_BUSY_CYCLES`, plus the gfx11 GL2C counters |
 | `0005-gfx1151-f16-wmma-operand-placement` | the f16 WMMA spreads its operands over the register banks (upstream does it for bf16 only): prefill GEMM cycles -2.6% |
 | `0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
+| `0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later (8 `v_mov` + a load wait per k phase in afrag GEMMs); bit-identical, enables the IQ3_S sign chain |
+| `0009-loom-omit-dead-fma-mix-seeds` | after allocation, drops the `v_mov_b32 0` that seeds an f16 pair built by `v_fma_mixlo` + `v_fma_mixhi` (no bit of it is ever read), keeping the schedule and registers; afrag kstore cycles -1.0%, bit-identical |
 | `0010-loom-vopd-trans-window-lookahead` | VOPD pairs inside TRANS-result windows when a lookahead finds no read that relies on the distance: prefill attention and SwiGLU epilogues -0.1..-0.25% cycles, bit-identical |
 | `0011-loom-low-licm` | loop-invariant code motion for low CFGs, only with `LOOM_EXP_LICM=1` (the emitter sets it for the fp16 and kv4 prefill attention): -1.0% at pp2048, -2.15% at 32K, bit-identical |
 | `0012-loom-slice-alias-coalescing` | concats of consecutive slices fold, and slice coalescing ignores dead exact-storage aliases: attention loop 29 -> 21 moves, -0.8..-2.3% attention, bit-identical |
@@ -53,8 +55,21 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0039-loom-amdgpu-repack-reads-constructing-lanes` | a result -> rhs b16 fragment repack reads the constructing lanes directly: 8 fewer VALU per repacked tile, bit-identical |
 | `0040-loom-amdgpu-b16-store-takes-low-half-def` | a 16-bit store of a low-half definition skips the `v_bfe_u32` that cleared the upper half: 168 VALU fewer in `gen_gdn_ss`, bit-identical |
 | `0041-loom-amdgpu-cross-block-memory-waits-use-alias-summaries` | cross-block memory waits use the source's alias summaries (no `vscnt 0` drain for noalias buffers), and `ds_swizzle` touches no memory |
+| `0042-amdgpu-one-mib-command-buffer-blocks` | 1 MiB command-buffer blocks: the pp2048 chunk graph (~980 dispatches) is one submission, no 0.5-0.7 ms host replay gap at a 128 KiB block boundary |
 | `0043-loom-amdgpu-xor16-shuffle-via-permlanex16` | wave32 xor-16 shuffles lower to `v_permlanex16_b32` instead of `ds_swizzle`: attention softmax exchanges -1.1..-3%, bit-identical |
+| `0044-libhrx-graph-barrier-state-256` | the graph barrier planner tracks 256 commands since the last barrier (was 8): no full barrier for an edge a barrier-free run already retired |
 | `0045-loom-amdgpu-gfx11-non-temporal-cache-policy` | gfx11 non-temporal hints encode as GLC / SLC / DLC; decode's DeltaNet state store skips the MALL (+18 us per DeltaNet layer before) |
+| `0046-libamdf-fault-in-imported-dma-bufs-at-attach` | the NPU attach faults in an imported dma-buf's pages (Linux 7.4 stopped prefaulting them at mmap: IO page faults and an all-NaN NPU prefill) |
+| `0047-loom-xdna-diag-pc-block-addresses` | `LOOM_DIAG_PC` prints each AIE2P leaf's block offsets and code placement (diagnostic, for PC-range NPU counters) |
+| `0048-loom-xdna-drain-used-locks` | `LOOM_EXP_DRAIN_USED` drains only the locks an image initializes (~400 instead of 1024 writes per setup) |
+| `0049-loom-numbering-trades-single-use-regressions` | final register numbering accepts a lower total preference cost even when one use gets worse, so packed 192-VGPR kernels still get clean WMMA banks; bit-identical |
+| `0050-loom-amdgpu-matrix-bank-weight` | gfx1151 WMMA operand-bank ranks weigh twice a VALU source-bank pair in numbering and 0031's allocation; bit-identical |
+| `0051-loom-amdgpu-u4-table-lookup` | cheaper u4 byte-table lookups (`v_bfi_b32` merge selector, masked / shifted indices read directly): IQ4_XS decode loop 154 -> 138 VALU per 128 WMMA; bit-identical |
+| `0052-loom-amdgpu-alignbit-and-or-descriptors` | `v_alignbit_b32` and `v_and_or_b32` descriptors, so Low helpers can author them (Q5_K fifth bits: 2 VALU per word); bit-identical |
+| `0053-loom-realization-runtime-loops-uniform-split` | address realization for runtime-bounded, bottom-tested loops, and uniform loop-varying terms move out of the vector address (attention K / V staging becomes buffer loads); bit-identical |
+| `0054-profile-gfx11-sq-wait-lds-counters` | gfx11 SQ wait and LDS counters for `HRX_PROFILE_COUNTERS` (`SQ_WAIT_INST_LDS`, `SQC_LDS_BANK_CONFLICT`, ...); diagnostics only |
+| `0055-libhrx-profile-function-filter` | `HRX_PROFILE_FILTER=<glob>` limits profiling capture to matching functions, which ATT capture needs; diagnostics only |
+| `0056-profile-att-raw-wave-dump` | `IREE_PROFILE_ATT_DUMP=<file>` writes every decoded ATT wave as raw records for per-SIMD timelines; diagnostics only |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 

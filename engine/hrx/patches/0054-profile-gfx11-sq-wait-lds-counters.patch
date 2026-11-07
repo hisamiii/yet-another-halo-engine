@@ -1,0 +1,149 @@
+HRX profiling: gfx11 SQ wait and LDS counters (SQ_WAVE_CYCLES, SQ_WAIT_ANY, SQ_WAIT_INST_ANY, SQ_WAIT_INST_LDS,
+SQ_INSTS_SALU, SQ_INSTS_LDS, SQC_LDS_BANK_CONFLICT, SQC_LDS_IDX_ACTIVE), event ids from ROCm rocprofiler-sdk
+basic_counters.xml <gfx11>. Diagnostics only: no kernel or runtime behavior changes.
+--- a/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
+@@ -149,6 +149,134 @@
+                 },
+         },
+         {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ_WAVE_CYCLES"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "Wave-cycles of resident waves (each cycle adds the live wave count)."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_CYCLES,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_SQ,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 24,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ_WAIT_ANY"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "Wave-cycles spent waiting for anything."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_CYCLES,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_SQ,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 35,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ_WAIT_INST_ANY"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "Cycles spent waiting for any instruction issue."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_CYCLES,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_SQ,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 26,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ_WAIT_INST_LDS"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "Cycles spent waiting for LDS instruction issue."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_CYCLES,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_SQ,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 29,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ_INSTS_SALU"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "SALU instructions issued."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_COUNT,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_SQ,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 58,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ_INSTS_LDS"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "LDS indexed instructions issued."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_COUNT,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_SQ,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 57,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQC_LDS_BANK_CONFLICT"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "Cycles LDS is stalled by bank conflicts."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_CYCLES,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_SQ,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 256,
++                },
++        },
++        {
++            .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQC_LDS_IDX_ACTIVE"),
++            .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
++            .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
++                "Cycles LDS is used for indexed operations."),
++            .unit = IREE_HAL_PROFILE_COUNTER_UNIT_CYCLES,
++            .block_name_id = IREE_HAL_AMDGPU_AQLPROFILE_BLOCK_NAME_SQ,
++            .event_ids =
++                {
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX9] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX90A] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX940] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX10] = IREE_HAL_AMDGPU_PROFILE_COUNTER_UNSUPPORTED,
++                    [IREE_HAL_AMDGPU_PROFILE_COUNTER_FAMILY_GFX11] = 261,
++                },
++        },
++        {
+             .name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ_INSTS_VMEM_RD"),
+             .block_name = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV("SQ"),
+             .description = IREE_HAL_AMDGPU_PROFILE_COUNTER_SV(
+@@ -521,6 +649,8 @@
+ 
+ static const char iree_hal_amdgpu_profile_counter_supported_names_data[] =
+     "SQ_WAVES, SQ_WAVES_EQ_64, SQ_BUSY_CYCLES, SQ_INSTS_VALU, "
++    "SQ_WAVE_CYCLES, SQ_WAIT_ANY, SQ_WAIT_INST_ANY, SQ_WAIT_INST_LDS, "
++    "SQ_INSTS_SALU, SQ_INSTS_LDS, SQC_LDS_BANK_CONFLICT, SQC_LDS_IDX_ACTIVE, "
+     "SQ_INSTS_VMEM_RD, SQ_INSTS_VMEM_WR, "
+     "TA_BUFFER_READ_WAVEFRONTS, TA_BUFFER_WRITE_WAVEFRONTS, "
+     "TCC_EA0_RDREQ, TCC_EA0_RDREQ_32B, TCC_EA0_WRREQ, "

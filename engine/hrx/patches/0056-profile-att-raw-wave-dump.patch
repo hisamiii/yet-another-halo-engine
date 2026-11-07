@@ -1,0 +1,71 @@
+iree-profile att: IREE_PROFILE_ATT_DUMP=<file> appends every decoded wave (ids, begin/end, per-instruction time,
+duration, stall, category, pc) as raw records, for per-SIMD timeline analysis. Diagnostics only.
+--- a/runtime/src/iree/tooling/profile/att/decode.c
++++ b/runtime/src/iree/tooling/profile/att/decode.c
+@@ -6,6 +6,9 @@
+ 
+ #include "iree/tooling/profile/att/decode.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
++
+ #include <inttypes.h>
+ #include <stddef.h>
+ #include <stdint.h>
+@@ -138,6 +141,44 @@
+   return 0;
+ }
+ 
++// IREE_PROFILE_ATT_DUMP=<file>: appends every decoded wave as a raw record, a header
++// {u8 cu, simd, wave_id, pad; u32 pad; i64 begin, end; u64 count} then |count|
++// {i64 time; i32 duration; u32 stall; u32 category; u32 pad; u64 pc} (all little endian).
++static FILE* iree_profile_att_dump_file(void) {
++  static FILE* file = NULL;
++  static bool opened = false;
++  if (!opened) {
++    opened = true;
++    const char* path = getenv("IREE_PROFILE_ATT_DUMP");
++    if (path && path[0]) file = fopen(path, "ab");
++  }
++  return file;
++}
++
++static void iree_profile_att_dump_wave(
++    FILE* file, const iree_profile_att_rocprofiler_wave_t* wave) {
++  uint8_t header_ids[8] = {wave->cu, wave->simd, wave->wave_id, 0, 0, 0, 0, 0};
++  int64_t times[2] = {wave->begin_time, wave->end_time};
++  uint64_t count = wave->instructions_size;
++  fwrite(header_ids, 1, sizeof(header_ids), file);
++  fwrite(times, sizeof(times[0]), 2, file);
++  fwrite(&count, sizeof(count), 1, file);
++  for (uint64_t i = 0; i < count; ++i) {
++    const iree_profile_att_rocprofiler_instruction_t* instruction =
++        &wave->instructions_array[i];
++    struct {
++      int64_t time;
++      int32_t duration;
++      uint32_t stall;
++      uint32_t category;
++      uint32_t pad;
++      uint64_t pc;
++    } record = {instruction->time, instruction->duration, instruction->stall,
++                instruction->category, 0, instruction->pc.address};
++    fwrite(&record, sizeof(record), 1, file);
++  }
++}
++
+ static void iree_profile_att_decode_callback(
+     iree_profile_att_rocprofiler_record_type_t record_type, void* trace_events,
+     uint64_t trace_event_count, void* user_data) {
+@@ -162,9 +203,11 @@
+       iree_profile_att_rocprofiler_wave_t* waves =
+           (iree_profile_att_rocprofiler_wave_t*)trace_events;
+       decoded_trace->wave_count += trace_event_count;
++      FILE* dump_file = iree_profile_att_dump_file();
+       for (uint64_t wave_index = 0; wave_index < trace_event_count;
+            ++wave_index) {
+         const iree_profile_att_rocprofiler_wave_t* wave = &waves[wave_index];
++        if (dump_file) iree_profile_att_dump_wave(dump_file, wave);
+         for (uint64_t instruction_index = 0;
+              instruction_index < wave->instructions_size; ++instruction_index) {
+           const iree_profile_att_rocprofiler_instruction_t* instruction =

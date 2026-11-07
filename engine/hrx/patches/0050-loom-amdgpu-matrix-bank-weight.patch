@@ -1,0 +1,31 @@
+Loom: weigh gfx1151 WMMA operand-bank ranks twice a VALU source-bank pair. With 0049's numbering trades and equal
+weights, the packed (192-VGPR) afrag kres GEMMs gave up WMMA ranks for VALU pairs (IQ4_XS kres +0.5%). Weight 2 in
+the matrix clauses (numbering and 0031's instruction-aware allocation): kres mean WMMA rank IQ4_XS .af.p 0.81 -> 0.68,
+.af 0.75 -> 0.41, Q4_K .af 0.78 -> 0.41, IQ3 .af.p ~0.4 -> 0.2; VGPR counts unchanged, fused ffn / swiglu unchanged.
+Bit-identical results; pp2048 GPU-only SQ cycles -0.2% (IQ4_XS kres -1.0%).
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/placement.c b/loom/src/loom/target/arch/amdgpu/planning/placement.c
+--- a/loom/src/loom/target/arch/amdgpu/planning/placement.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/placement.c
+@@ -12,6 +12,9 @@
+ // minus one. Factoring it into flat clauses also gives its exact partial
+ // minimum when locations are unknown or operands have mandatory identity.
+ // This is a placement cost, not an instruction legality or hardware latency.
++// Weight 2 per rank against 1 per VALU source-bank pair: with equal weights,
++// numbering in a packed register file traded WMMA ranks for VALU pairs, and
++// the GEMM ran slower.
+ static const loom_low_placement_value_ref_t kMatrixValues[] = {
+     {0, LOOM_LOW_PLACEMENT_VALUE_OPERAND, 0},
+     {0, LOOM_LOW_PLACEMENT_VALUE_OPERAND, 1},
+@@ -29,9 +32,9 @@
+     {0, 2, 0, 1, 1, LOOM_LOW_PLACEMENT_RELATION_DIFFERENT_MASKED_LOCATION, 3},
+ };
+ static const loom_low_placement_clause_t kMatrixClauses[] = {
+-    {0, 5, 1, LOOM_LOW_PLACEMENT_CLAUSE_ANY},
+-    {5, 2, 1, LOOM_LOW_PLACEMENT_CLAUSE_ALL},
+-    {7, 2, 1, LOOM_LOW_PLACEMENT_CLAUSE_ALL},
++    {0, 5, 2, LOOM_LOW_PLACEMENT_CLAUSE_ANY},
++    {5, 2, 2, LOOM_LOW_PLACEMENT_CLAUSE_ALL},
++    {7, 2, 2, LOOM_LOW_PLACEMENT_CLAUSE_ALL},
+ };
+ // Inline-accumulator forms: one rank when A and B share a bank modulo four.
+ static const loom_low_placement_value_ref_t kInlineMatrixValues[] = {

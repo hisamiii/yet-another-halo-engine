@@ -1,0 +1,44 @@
+loom: LOOM_EXP_DRAIN_USED raises only the locks an image initializes
+
+Under LOOM_EXP_ROUTE_RESET the drain raised every core and memory tile lock (1024 write32s a setup). A stale request
+steals a token only from a lock that later receives one, and an image initializes every lock it gives tokens to, so
+raising those drains every request that could matter: ~400 writes a setup.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -2410,6 +2410,35 @@
+     columns = iree_max(columns,
+                        (uint16_t)(plan->worker_plans[i].coordinate.column + 1));
+   }
++  // LOOM_EXP_DRAIN_USED=1: raise only the locks this image initializes. A
++  // stale request steals a token only from a lock that receives one, and every
++  // image initializes each lock it gives tokens to, so its own raise drains it.
++  const char* used_spec = getenv("LOOM_EXP_DRAIN_USED");
++  if (used_spec && atoi(used_spec) != 0) {
++    for (iree_host_size_t i = 0; i < plan->lock_count; ++i) {
++      const loom_aie2p_array_lock_plan_t* lock = &plan->locks[i];
++      bool seen = false;
++      for (iree_host_size_t j = 0; j < i && !seen; ++j) {
++        seen = plan->locks[j].coordinate.column == lock->coordinate.column &&
++               plan->locks[j].coordinate.row == lock->coordinate.row &&
++               plan->locks[j].lock_id == lock->lock_id;
++      }
++      const loom_xdna_tile_facts_t* tile =
++          loom_xdna_array_tile_facts(family, lock->coordinate);
++      if (seen || !tile || (tile->kind != LOOM_XDNA_TILE_KIND_COMPUTE &&
++                            tile->kind != LOOM_XDNA_TILE_KIND_MEMORY)) {
++        continue;
++      }
++      const loom_aie2p_array_lock_plan_t raised = {
++          .coordinate = lock->coordinate,
++          .lock_id = lock->lock_id,
++          .initial_value = tile->lock_value_maximum,
++      };
++      IREE_RETURN_IF_ERROR(loom_aie2p_program_append_lock_initialization(
++          builder, &builder->array, &raised));
++    }
++    return iree_ok_status();
++  }
+   for (uint16_t column = 0; column < columns; ++column) {
+     for (uint16_t row = 0; row < family->row_count; ++row) {
+       const loom_xdna_tile_coordinate_t coordinate = {.column = column,

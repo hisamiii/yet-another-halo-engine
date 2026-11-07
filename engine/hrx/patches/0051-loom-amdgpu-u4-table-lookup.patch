@@ -1,0 +1,139 @@
+Loom: cheaper AMDGPU u4 byte-table lookups (vector.table.lookup of a 16-entry i8 table, 3 permutes per register).
+The merge selector (byte i + 4 * index bit 3) is now index >> 1 and one v_bfi_b32 over the base selector in an SGPR
+instead of and + shift + or, and an index made by masking a byte vector with 15 or shifting it right by 4 is read from
+that vector directly (one whole-register shift for the latter): the lookup only reads bits 0..3 of each index byte.
+IQ4_XS decode loop VALU 154 -> 138 per 128 WMMA; bit-identical results; pp2048 GPU-only SQ cycles ~-0.26%
+(IQ4_XS swiglu -3.6% incl. a bank reshuffle, kqg -0.6%, ffn -0.4%, kres -0.2%, kstore flat: its banks got worse).
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/table.c b/loom/src/loom/target/arch/amdgpu/lower/table.c
+--- a/loom/src/loom/target/arch/amdgpu/lower/table.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/table.c
+@@ -717,19 +717,27 @@
+       &lane_type, 1, /*tied_results=*/NULL, /*tied_result_count=*/0,
+       source_op->location, &high_lookup_op));
+ 
+-  loom_value_id_t high_table_bits = LOOM_VALUE_ID_INVALID;
+-  IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_binary_immediate(
+-      context, source_op, LOOM_AMDGPU_DESCRIPTOR_REF_V_AND_B32_LIT,
+-      index_register, UINT32_C(0x08080808), lane_type, &high_table_bits));
+-  loom_value_id_t high_table_selector_offset = LOOM_VALUE_ID_INVALID;
++  // Merge selector byte i is i + 4 * (index bit 3): the index shifted right
++  // by one has bit 3 at bit 2, and one BFI keeps only that bit over the base
++  // selector (no base bit lies under the mask). Like the low selector it reads
++  // only bits 0..3 of each index byte.
++  loom_value_id_t shifted_index = LOOM_VALUE_ID_INVALID;
+   IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_shift(
+       context, source_op, LOOM_AMDGPU_DESCRIPTOR_REF_V_LSHRREV_B32_LIT, 1,
+-      high_table_bits, lane_type, &high_table_selector_offset));
++      index_register, lane_type, &shifted_index));
++  loom_type_t base_type = loom_type_none();
++  IREE_RETURN_IF_ERROR(loom_amdgpu_make_sgpr_type(context, &base_type));
++  loom_value_id_t base_selector = LOOM_VALUE_ID_INVALID;
++  IREE_RETURN_IF_ERROR(loom_amdgpu_emit_const_u32(
++      context, source_op, LOOM_AMDGPU_DESCRIPTOR_REF_S_MOV_B32,
++      UINT32_C(0x03020100), base_type, &base_selector));
++  loom_low_lower_resolved_descriptor_t merge_bfi = {0};
++  IREE_RETURN_IF_ERROR(loom_amdgpu_resolve_descriptor_ref(
++      context, LOOM_AMDGPU_DESCRIPTOR_REF_V_BFI_B32_SRC0_LIT, &merge_bfi));
+   loom_value_id_t merge_selector = LOOM_VALUE_ID_INVALID;
+-  IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_binary_immediate(
+-      context, source_op, LOOM_AMDGPU_DESCRIPTOR_REF_V_OR_B32_LIT,
+-      high_table_selector_offset, UINT32_C(0x03020100), lane_type,
+-      &merge_selector));
++  IREE_RETURN_IF_ERROR(loom_amdgpu_emit_resolved_vgpr_binary_immediate(
++      context, source_op, &merge_bfi, shifted_index, base_selector,
++      UINT32_C(0x04040404), lane_type, &merge_selector));
+ 
+   const loom_value_id_t merge_operands[3] = {
+       loom_value_slice_get(loom_low_op_results(high_lookup_op), 0),
+@@ -744,6 +752,63 @@
+       &merge_op));
+   *out_result_register = loom_value_slice_get(loom_low_op_results(merge_op), 0);
+   return iree_ok_status();
++}
++
++// Whether every lane of value_id is known to equal expected.
++static bool loom_amdgpu_table_lookup_lanes_equal(
++    const loom_value_fact_table_t* fact_table, loom_value_id_t value_id,
++    int64_t expected) {
++  if (fact_table == NULL) {
++    return false;
++  }
++  const loom_value_facts_t facts =
++      loom_value_fact_table_lookup(fact_table, value_id);
++  loom_value_fact_uniform_element_t uniform = {0};
++  int64_t value = 0;
++  return loom_value_facts_query_uniform_element(&fact_table->context, facts,
++                                                &uniform) &&
++         loom_amdgpu_value_facts_as_exact_non_negative_i64(uniform.element,
++                                                           &value) &&
++         value == expected;
++}
++
++// The u4 lookup reads only bits 0..3 of each index byte, so an index made by
++// masking a byte vector with 15, or by shifting it right by 4, can be read from
++// that vector directly (shifted by 4 as whole registers in the second case):
++// the bits it brings into 4..7 of each byte are never read.
++static bool loom_amdgpu_table_lookup_u4_raw_indices(
++    const loom_module_t* module, const loom_value_fact_table_t* fact_table,
++    loom_value_id_t indices,
++    loom_value_id_t* out_source, uint32_t* out_shift) {
++  const loom_value_t* value = loom_module_value(module, indices);
++  if (loom_value_is_block_arg(value)) {
++    return false;
++  }
++  const loom_op_t* op = loom_value_def_op(value);
++  if (!op) {
++    return false;
++  }
++  loom_value_id_t source = LOOM_VALUE_ID_INVALID;
++  uint32_t shift = 0;
++  if (loom_vector_andi_isa(op) &&
++      loom_amdgpu_table_lookup_lanes_equal(fact_table,
++                                           loom_vector_andi_rhs(op), 15)) {
++    source = loom_vector_andi_lhs(op);
++  } else if (loom_vector_shrui_isa(op) &&
++             loom_amdgpu_table_lookup_lanes_equal(
++                 fact_table, loom_vector_shrui_rhs(op), 4)) {
++    source = loom_vector_shrui_lhs(op);
++    shift = 4;
++  } else {
++    return false;
++  }
++  if (!loom_type_equal(loom_module_value_type(module, source),
++                       loom_module_value_type(module, indices))) {
++    return false;
++  }
++  *out_source = source;
++  *out_shift = shift;
++  return true;
+ }
+ 
+ static iree_status_t loom_amdgpu_lower_vector_table_lookup_packed_i8(
+@@ -767,12 +832,27 @@
+   // Matching byte index and result shapes occupy the same register count.
+   // Each permute only reads the selector byte for its output byte, so unused
+   // high bytes in a partial final register remain unspecified independently.
++  loom_value_id_t raw_source = LOOM_VALUE_ID_INVALID;
++  uint32_t raw_shift = 0;
++  if (plan->strategy ==
++          LOOM_AMDGPU_TABLE_LOOKUP_STRATEGY_PACKED_I8_U4_PERMUTE &&
++      loom_amdgpu_table_lookup_u4_raw_indices(
++          module, loom_low_lower_context_fact_table(context), plan->indices,
++          &raw_source, &raw_shift)) {
++    IREE_RETURN_IF_ERROR(
++        loom_low_lower_lookup_value(context, raw_source, &low_indices));
++  }
+   loom_value_id_t result_registers[LOOM_AMDGPU_MAX_PACKED_32BIT_REGISTERS];
+   for (uint32_t i = 0; i < plan->index_register_count; ++i) {
+     loom_value_id_t index_register = LOOM_VALUE_ID_INVALID;
+     IREE_RETURN_IF_ERROR(loom_amdgpu_extract_low_register_unit(
+         context, source_op, low_indices, plan->index_register_count, i,
+         index_lane_type, &index_register));
++    if (raw_shift != 0) {
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vgpr_shift(
++          context, source_op, LOOM_AMDGPU_DESCRIPTOR_REF_V_LSHRREV_B32_LIT,
++          raw_shift, index_register, lane_type, &index_register));
++    }
+     if (plan->strategy == LOOM_AMDGPU_TABLE_LOOKUP_STRATEGY_PACKED_I8_PERMUTE) {
+       loom_value_id_t operands[3] = {table_registers[0], table_registers[0],
+                                      index_register};
