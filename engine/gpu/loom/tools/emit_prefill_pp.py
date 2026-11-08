@@ -756,12 +756,14 @@ ATTN_VGPR = 192   # every attention variant fits here unless the allocator rotat
 
 
 def hal_vgprs(hal):
+    E.wait(hal)
     notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
     m = re.search(r"\.vgpr_count:\s*(\d+)", notes)
     return int(m.group(1)) if m else 0
 
 
 def hal_spills(hal):
+    E.wait(hal)
     notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
     m = re.search(r"\.private_segment_fixed_size:\s*(\d+)", notes)
     return int(m.group(1)) if m else 0
@@ -1113,7 +1115,8 @@ def seg_gemms(rows, B, outdir):
                 TG.OUT16 = False
             sym = "yah_ffn_gemm_%s%s" % (fmt, {"kqg": "_kqg"}.get(kind, ""))
             # each segment's body is unchanged in the spliced kernel but for names: its own footprint gate covers it
-            _footprint("seg_%s_%s_%d_%d" % (kind, fmt, mt, kb), raw, [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)], outdir)
+            E._gate("seg_%s_%s_%d_%d" % (kind, fmt, mt, kb), raw, [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)],
+                    hrx_paths.env())
             texts.append((raw, (mt, kb, tt)))
         name = "seg_" + "__".join("%s_%s_%d_%d" % (kind, fmt, mt, kb) for (fmt, mt, kb), kind, _ in segs) + ".hal"
         text, groups = gen_segcat.segcat("yah_seg", texts)
@@ -1192,19 +1195,6 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
-def _footprint(name, raw, args, outdir):
-    """footprint_gate.py on a kernel source as written (a segment of a spliced kernel): exits with its verdict unless it
-    passes."""
-    import subprocess
-    tmp = os.path.join(outdir, ".emit_tmp")
-    os.makedirs(tmp, exist_ok=True)
-    src = os.path.join(tmp, name + ".loom")
-    open(src, "w").write(raw)
-    r = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src] + args, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise SystemExit("footprint gate refused %s: %s" % (name, (r.stdout + r.stderr).strip()[-400:]))
-
-
 def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, kfull=0):
     """ostride: a GEMM over the leading mt * 16 rows of an ostride-row output (gen_gemm_tile.OSTRIDE, the NPU FFN block's
     GPU share); kfull: a K window's whole-row k_blocks (gen_gemm_tile.KWIN)."""
@@ -1220,15 +1210,10 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
         fh.write(gen(fmt, kind))
     sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
-    import subprocess
-    gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
-                           kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []) +
-                          (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else []),
-                          capture_output=True, text=True)
-    if gate.returncode != 0:
-        raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
+    gate = [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []) \
+        + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else [])
     E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)]
-           + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir)
+           + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir, gate=gate)
     return (out, tile, rowgrp, tt)
 
 
@@ -1249,11 +1234,8 @@ def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False, wait=0):
     src = os.path.join(tmp, out[:-4] + ".loom")
     out16 = (kind == "kstore" and (mt in O16_MT or (mt == 64 and KV16_ON))) or (kind == "kqg" and QG16_ON)
     open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, out16, hperm, flag, wait))
-    gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, "mq4", kind, str(mt), str(kb),
-                           str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP], capture_output=True, text=True)
-    if gate.returncode != 0:
-        raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
-    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)], out, outdir)
+    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)], out, outdir,
+           gate=[sym, "mq4", kind, str(mt), str(kb), str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP])
     return (out, bn, bm // 16, tt)
 
 
@@ -1289,6 +1271,7 @@ def main():
     global MODEL, QG16_ON, GSIG_ON, QSPLIT_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
+    E.ASYNC = True
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
     # GEMM tokens per workgroup of the hand-written sources
     TILE = 64
@@ -2125,6 +2108,7 @@ def main():
                      ("grid_iq2s.bin", "grid_iq2s.bin"),
                      ("ksigns_iq2xs.bin", "ksigns_iq2xxs.bin")]:
         shutil.copy(os.path.join(tables, src), os.path.join(outdir, dst))
+    E.wait()
     print("emitted %d GEMM + fixed prefill HALs for B=%d (tile=%d, token_tiles=%d)"
           % (n, B, TILE, TT))
 

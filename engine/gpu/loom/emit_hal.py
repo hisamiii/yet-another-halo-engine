@@ -3,9 +3,9 @@
 
 usage: emit_hal.py <file.loom> <outdir> [symbol=value ...]
 
-iree-run-loom can emit a HAL executable (--emit-only --emit-hal-executable) but has no --config flag.
-So this tool rewrites each `config.get @symbol` to a constant, drops its config.decl, and lets iree-run-loom emit without a dispatch.
-The kernel is built for exactly the given config. Prints the .hal path.
+This tool rewrites each `config.get @symbol` to a constant, drops its config.decl, and compiles with loom-compile (no
+device: the HAL executable of one kernel is its hsaco). The kernel is built for exactly the given config. Prints the .hal
+path.
 """
 import os
 import re
@@ -18,20 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hrx_paths  # noqa: E402
 
 
-def main():
-    if len(sys.argv) < 3:
-        sys.stderr.write(__doc__)
-        return 2
-    source, outdir = sys.argv[1], sys.argv[2]
-    bindings = {}
-    for arg in sys.argv[3:]:
-        key, _, value = arg.partition("=")
-        if not _:
-            sys.stderr.write("bad config binding: %s\n" % arg)
-            return 2
-        bindings[key.lstrip("@")] = value
-
-    lines = open(source).read().split("\n")
+def specialize(text, bindings, tgt="gfx1151"):
+    """The source with each bound `config.get` a constant and its config.decl dropped, for target tgt. Returns
+    (text, the bindings no config.get used)."""
+    lines = text.split("\n")
     out = []
     used = set()
     get_re = re.compile(
@@ -54,7 +44,26 @@ def main():
             used.add(symbol)
         else:
             out.append(line)
-    missing = set(bindings) - used
+    text = "\n".join(out) + "\n"
+    if tgt != "gfx1151":
+        text = text.replace("amdgpu.target<gfx1151>", "amdgpu.target<%s>" % tgt)
+    return text, set(bindings) - used
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.stderr.write(__doc__)
+        return 2
+    source, outdir = sys.argv[1], sys.argv[2]
+    bindings = {}
+    for arg in sys.argv[3:]:
+        key, _, value = arg.partition("=")
+        if not _:
+            sys.stderr.write("bad config binding: %s\n" % arg)
+            return 2
+        bindings[key.lstrip("@")] = value
+
+    text, missing = specialize(open(source).read(), bindings, os.environ.get("YAH_LOOM_TARGET", "gfx1151"))
     if missing:
         sys.stderr.write("unused config bindings (symbol not in module): %s\n" %
                          ", ".join(sorted(missing)))
@@ -64,24 +73,22 @@ def main():
     # a per-call directory: emits may run in parallel (engine/tune)
     tmpdir = tempfile.mkdtemp(prefix="emit_hal_")
     rewritten = os.path.join(tmpdir, stem + "_emit.loom")
+    # YAH_LOOM_TARGET selects the compile target: default gfx1151 (1536-VGPR file, granule 24).
+    # gfx11-generic models the 1024-VGPR RDNA3 parts.
+    tgt = os.environ.get("YAH_LOOM_TARGET", "gfx1151")
     with open(rewritten, "w") as f:
-        f.write("\n".join(out) + "\n")
+        f.write(text)
     # YAH_EMIT_KEEP=<dir>: keep the specialized source (for loom-compile --compile-report)
     if os.environ.get("YAH_EMIT_KEEP"):
         shutil.copy(rewritten, os.environ["YAH_EMIT_KEEP"])
 
     hal_path = os.path.join(outdir, stem + ".hal")
     target = os.path.join(outdir, stem + ".hsaco")
-    cmd = [hrx_paths.IREE_RUN_LOOM,
-           rewritten, "--device=amdgpu", "--target=amdgpu:gfx1151",
-           "--emit-only", "--emit-hal-executable=" + hal_path,
-           "--emit-target-artifact=" + target]
-    # a module with Low helper functions beside its kernel: name the one kernel as the entry
-    kernels = re.findall(r"^\s*kernel\.def\b[^\n]*?@(\w+)\(", "\n".join(out), re.M)
-    if len(kernels) == 1:
-        cmd.append("--function=" + kernels[0])
+    cmd = [hrx_paths.LOOM_COMPILE, rewritten, "--target=amdgpu:" + tgt, "--format=amdgpu-hsaco", "--output=" + hal_path]
     result = subprocess.run(cmd, env=hrx_paths.env(), capture_output=True, text=True)
     shutil.rmtree(tmpdir, ignore_errors=True)
+    if result.returncode == 0 and os.path.exists(hal_path):
+        shutil.copy(hal_path, target)
     if result.returncode != 0 or not os.path.exists(hal_path):
         # write the whole diagnostic: the first error is at the head, and a tail cut drops it
         sys.stderr.write(result.stderr)
