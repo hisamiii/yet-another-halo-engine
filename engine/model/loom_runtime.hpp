@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <map>
@@ -540,17 +542,35 @@ class LoomWeights {
       spans.emplace_back(t.offset, t.offset + t.bytes, glued);
     }
     std::sort(spans.begin(), spans.end());
+    std::vector<std::pair<size_t, size_t>> ranges;   // one device buffer each
     for (size_t i = 0; i < spans.size();) {
       const size_t begin = std::get<0>(spans[i]);
       size_t end = std::get<1>(spans[i]);
       for (++i; i < spans.size() && (std::get<1>(spans[i]) - begin <= kChunk || std::get<2>(spans[i])); ++i)
         end = std::max(end, std::get<1>(spans[i]));
-      LoomBuffer buffer = gpu.Allocate(end - begin + kPad);
-      gguf.Prepare(begin, end - begin);
-      gpu.H2D(buffer, gguf.tensor_data_base() + begin, end - begin);
-      gguf.ReleaseData(begin, end - begin);
-      chunks_.push_back({begin, end, std::move(buffer)});
+      ranges.emplace_back(begin, end - begin);
     }
+    // YAH_LOAD_TIMES=1: each upload step's total (fill: until the host copy of the range is there)
+    double ms[4] = {};
+    auto t = std::chrono::steady_clock::now();
+    const auto step = [&](int i) {
+      const auto n = std::chrono::steady_clock::now();
+      ms[i] += std::chrono::duration<double, std::milli>(n - t).count(), t = n;
+    };
+    for (const auto& [begin, bytes] : ranges) {
+      LoomBuffer buffer = gpu.Allocate(bytes + kPad);
+      step(0);
+      gguf.Prepare(begin, bytes);
+      step(1);
+      gpu.H2D(buffer, gguf.tensor_data_base() + begin, bytes);
+      step(2);
+      gguf.ReleaseData(begin, bytes);
+      step(3);
+      chunks_.push_back({begin, begin + bytes, std::move(buffer)});
+    }
+    if (std::getenv("YAH_LOAD_TIMES"))
+      std::fprintf(stderr, "load: weights in %zu buffers: allocate %.1f, fill %.1f, h2d %.1f, release %.1f ms\n",
+                   chunks_.size(), ms[0], ms[1], ms[2], ms[3]);
   }
   [[nodiscard]] bool Has(const core::TensorInfo& t) const {
     return std::find(skipped_.begin(), skipped_.end(), t.name) == skipped_.end();

@@ -147,6 +147,15 @@ int main(int argc, char** argv) {
   const char* ids_path = argv[5];
   // A bench run holds most of the machine's memory: if it runs out, the OOM killer takes this process, not the desktop
   if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) std::fputs("1000", f), std::fclose(f);
+  // YAH_LOAD_TIMES=1: print each load phase's time
+  const bool times = std::getenv("YAH_LOAD_TIMES") != nullptr;
+  auto lt = std::chrono::steady_clock::now();
+  const auto lap = [&](const char* what) {
+    const auto n = std::chrono::steady_clock::now();
+    if (times)
+      std::fprintf(stderr, "load: %-12s %7.1f ms\n", what, std::chrono::duration<double, std::milli>(n - lt).count());
+    lt = n;
+  };
   try {
     // a native set (emit_prefill_pp.py YAH_NATIVE=1) runs the GGUF's own formats
     const bool native = [&] {
@@ -155,10 +164,13 @@ int main(int argc, char** argv) {
         if (row.rfind("native ", 0) == 0) return true;
       return false;
     }();
+    lap("set kind");
     auto gguf = yah::core::Gguf::OpenResident(argv[1], native);
+    lap("model");
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
     std::vector<std::uint32_t> ids = ParseIds(ids_path);
     LoomDevice gpu;
+    lap("device");
     // The layers queue ~950 dispatches and wait once: the runtime wait would busy-poll a host core the whole time.
     gpu.SetSleepSync(200);
     // a native set's prefill reads neither the MTP layer nor token_embd's device copy (Embed stages its rows)
@@ -166,7 +178,9 @@ int main(int argc, char** argv) {
     LoomWeights weights(gpu, gguf, [&](const std::string& n) {
       return native && (n == "token_embd.weight" || n.starts_with(mtp));
     });
+    lap("weights");
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
+    lap("prefill set");
     if (opt.pairs) pf.EnablePairs();
 #ifdef YAH_WITH_NPU
     yah::model::DpmPin dpm;  // (the level restored after the NPU stops)
@@ -235,6 +249,7 @@ int main(int argc, char** argv) {
     const std::uint32_t slot_at = std::min(opt.slot_at, n_chunks);
 
     gpu.Synchronize();
+    lap("pre-run");
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
     const bool chunk_ms = opt.chunk_ms;
