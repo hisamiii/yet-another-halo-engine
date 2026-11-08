@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""kld_ref.py <model> <hal set> <ref.bin> <workdir> [chunks]: KL divergence of the engine vs a BF16 reference.
+"""kld_ref.py <model> <hal set> <ref.bin> <workdir> [chunks|all [driver options]]: KL divergence of the engine vs
+a BF16 reference (driver options: loom_forward_pp's, e.g. --npu).
 
 ref.bin is hipfire's HFKLDR v1 (eval_hipfire --ref): per 2048-token chunk the BF16 model's top-256 log-probs and the
 residual mass of positions 1024..2046. Each chunk runs as one fresh loom_forward_pp pp2048 (--logits-from 1024),
@@ -53,7 +54,8 @@ def main():
         raise SystemExit(__doc__)
     model, hal, refp, work = sys.argv[1:5]
     n_ctx, vocab, tokens, blocks = read_ref(refp)
-    chunks = int(sys.argv[5]) if len(sys.argv) > 5 else len(tokens)
+    chunks = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] != "all" else len(tokens)
+    extra = sys.argv[6:]   # e.g. --npu
     os.makedirs(work, exist_ok=True)
     kls, matches, nlls = [], [], []
     for c in range(chunks):
@@ -62,7 +64,7 @@ def main():
         prefix = os.path.join(work, "c%02d" % c)
         cmd = ["bash", "-c", 'a=("$@"); set --; source engine/hrx-env.sh >/dev/null; exec "${a[@]}"', "-", "engine/run/gpu_run.sh", "kld",
                "--", "engine/build/loom_forward_pp", model, hal, prefix, str(n_ctx), ids,
-               "--logits-from", str(n_ctx // 2)]
+               "--logits-from", str(n_ctx // 2)] + extra
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode or "all_logits" not in r.stdout:
             raise SystemExit("chunk %d failed:\n%s%s" % (c, r.stdout[-1500:], r.stderr[-1500:]))
