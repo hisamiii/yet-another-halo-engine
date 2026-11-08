@@ -185,6 +185,8 @@ Logits are byte-identical to the barriered step. On top of the chain:
 
 `tools/gen_gemv.py`, one kernel per (kind, rows, K), MQ4 rows (unsigned codes: nibble xor 8 with bias 8, one scale per 128).
 
+A native GGUF set (`emit_decode.py` with `YAH_NATIVE=1`) runs the GGUF's own formats unrotated instead: Q8_0, Q2_K-Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, the IQ grids bound after the weights; token_embd is Q8_0 (converted at load), and there are no verify GEMVs or MTP layer.
+
 - Decode on 32-bit words (`vector<4xi32>`), never on `vector<16xi8>`, which Loom lowers byte by byte.
 - Two rows per wave share each x load; 4 waves per workgroup (R x W = 2 x 4, decode.txt `rw`).
 - `pipeline(2)` read-ahead on the block loop; butterfly reduce over the wave.

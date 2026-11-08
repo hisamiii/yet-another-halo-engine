@@ -19,6 +19,7 @@ usage: emit_decode.py <model> <outdir> [max_context]       (default 4096, multip
                                  (LoomDecoder::Verify; decode.txt "verify - VERIFY 0")
   gv_plain_mq4_5120_10240.hal    models with an MTP layer (blk.<n>.nextn.*): its eh_proj and its input rotation
   drot_10240.hal                 (drot_10240; decode.txt "mtp")
+  grid_*.bin, ksigns_iq2xs.bin   YAH_NATIVE=1 (a GGUF's own formats): the IQ tables (loom/tables); no verify GEMVs, no MTP
   decode.txt                     "ctx <max_context>", GEMV geometry and grids; "chain": the kernels are flag-chained
                                  (tools/gen_chain.py: extra counter binding and wait / signal constants)
 """
@@ -188,12 +189,12 @@ def main():
             aname = name.replace("gv_plain_", "gv_plainam_")
             emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, amax=True), aname, outdir)
             grids[aname] = grids[name]
-    for name, (kind, fmts, M, K) in sorted(gs.items()):   # the verify GEMVs: no peel, no fused epilogues
+    for name, (kind, fmts, M, K) in sorted(gs.items() if rot else ()):   # the verify GEMVs: no peel, no fused epilogues
         R, W = RW[kind]   # (R = 1 halves the accumulators but runs slower: more x reads per weight row)
         emit_src(GV.gen(kind, fmts, M, K, R, W, T=VERIFY), name + "_t%d" % VERIFY, outdir)
         grids[name + "_t%d" % VERIFY] = M // GV.rows_per_wg(R, W)
     eh = [(d, ty) for nm, d, ty in EP.parse(model) if nm.endswith(".nextn.eh_proj.weight")]
-    if eh:   # the MTP layer's input projection (embedding and hidden concatenated)
+    if eh and rot:   # the MTP layer's input projection (embedding and hidden concatenated)
         (K, M), ty = (int(eh[0][0][0]), int(eh[0][0][1])), eh[0][1]
         name = gemv_name("plain", [GV.GGML[ty]], M, K)
         emit_src(GV.gen("plain", [GV.GGML[ty]], M, K, *RW["plain"], peel=PEEL), name, outdir)
@@ -238,9 +239,12 @@ def main():
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-k / top-p / min-p sampling into the token stream
     emit_src(DM.gen_penalty(T=T), "penalty", outdir)     # repetition / frequency / presence penalties on the logits
+    if not rot:   # the GEMVs of the IQ formats read their grids
+        for f in os.listdir(os.path.join(LOOM, "tables")):
+            shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
         "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\nnormrot - 0 0\nswrot - 0 0\n" if rot else "") + (("chain - 0 0\n")) + (("amax - 0 0\n")) + ("latestate - 0 0\n" if DM.LATE_STATE else "") +
-        "verify - %d 0\n" % VERIFY + ("mtp - 0 0\n" if eh else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
+        ("verify - %d 0\n" % VERIFY if rot else "") + ("mtp - 0 0\n" if eh and rot else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + the decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))
