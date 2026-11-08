@@ -189,6 +189,12 @@ DNO16 = os.environ.get("YAH_DN_O16", "1") == "1"
 # pnq a). A ninth wave runs the solve beside the row waves' K S^T / Q S^T (X = T1 (K S^T), not bit-identical): part a
 # 34.5 -> 30.7 ms, part b 33.4 -> 31.0; WT2 KL 0.0671 -> 0.0683 / q99.9 2.026 -> 2.054, inside the redraw spread.
 DNSS = True
+# DNSS_NAT: f16 (non-A4) sets with the state-stationary DeltaNet too: the v conv inside it (DNVCONV's path), head ranges,
+# its O as f32 at the heads' own columns (gen_gdn_ss natural), read by the plain postnorm parts. Sets whose NPU takes
+# qkv rows keep gen_gdn_chunk (the v conv needs every qkv column). Gate N mean KL 1.06e-6 (vs the f32 recurrent
+# reference 1.53e-6, gen_gdn_chunk 1.08e-6); pp2048 GPU only -0.97% (11-02: DeltaNet alone 66 -> 34 ms, conv 18 -> 9,
+# the postnorm loses its overlap 14 -> 24). Fusing the postnorm into part a passed the gate but doubled part a.
+DNSS_NAT = os.environ.get("YAH_DNSS_NAT", "1") == "1"
 
 
 def _rewrite(text, pairs):
@@ -198,9 +204,19 @@ def _rewrite(text, pairs):
     return text
 
 
+# DN_REC: the f32 recurrent DeltaNet (gen_deltanet_hip) at any B, as the B % 32 != 0 sets have it: an accuracy reference
+# for DeltaNet changes (engine/run/gate), not a production set
+DN_REC = os.environ.get("YAH_DN_REC", "0") == "1"
+
+
+def dn32(B):
+    """The chunked DeltaNet (and its f16 conv hand-off) applies."""
+    return B % 32 == 0 and not DN_REC
+
+
 def conv_tb_ok(B):
     """The f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup applies."""
-    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and B % 32 == 0 and gen_gdn_chunk.CONV16
+    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and dn32(B) and gen_gdn_chunk.CONV16
 
 
 def conv_x16(text):
@@ -818,6 +834,9 @@ AF_KQ = dict(rhs_outer=False, rhs_fence=0)   # K-quants without B prefetch (Q6_K
 # Q4_K / Q3_K / Q5_K with the B prefetch: their decoders came down to 184-192 VGPRs (Q4DFMA, Q3_FMIX), so it fits now:
 # -3.6..-4.0% clock-free (Q4_K swiglu -5.6%, kstore 64 -5.5%)
 AF_KQP = dict(AF_KQ, **AF_PIPE, lhs_stream=4)
+# No B prefetch (bpre 0, no b0early, lhs_stream 0): under HRX 0051 the prefetching forms sit at 192 VGPRs with
+# shared WMMA banks; without it 179-187 VGPRs, rank 0 (11-02, clock-free, bit-identical; fused ffn AF_FFN too)
+AF_NOPRE = dict(AF_PIPE, bpre=0, b0early=False, lhs_stream=0)
 # The GEMMs with an afrag form and their knobs on top of AF_TILE; clock-free vs the GEMM (one round each, 2026-10-03).
 # The best lhs_stream depends on the decoder's register allocation: IQ3_XXS kstore without it waits vmcnt(0) twice per
 # phase on the step-1 B prefetch. Q3_K: the prefetch needs 208 VGPRs (one workgroup per WGP). IQ3_XXS: lhs_stream=1 with
@@ -845,33 +864,50 @@ AF = {
     ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE3, lhs_stream=2, swepi=False, f16p=True),     # -11.6%
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False, gaddr=True, f16s=True),  # -12.1%
+    # persistent lhs_stream 1 (was 2): bank cost 0.6 -> 0.1%, 191 VGPRs; down -0.4% (92.6 -> 93.0%), bit-identical (11-03)
     ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, f16p=True, gaddr=True, f16s=True,
-                                    persist=dict(b0early=True, lhs_stream=2)),               # -8.6%
-    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -10.4%
+                                    persist=dict(b0early=True, lhs_stream=1)),               # -8.6%
+    # lhs_stream 1 (was 4) since HRX 0051: bank cost 1.0 -> 0.4%, 190 VGPRs; pp2048 counters 3 runs (11-03),
+    # bit-identical: down -0.66% (92.8 -> 93.4%), out -0.32%
+    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, respre=1, persist=dict(pslice="top_top")), # -10.4%
     ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
-                                      persist=True),                                         # -8.2%
-    ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
+                                      persist=dict(pslice="b0_a1")),                         # -8.2%
+    ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True, lhs_stream=1),   # -10.4%; lhs_stream 1: see q5k 24
     ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
+    ("q3k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),
+    ("q5k", "kstore", 1088, 20): dict(AF_KQP, ksl=True),
+    ("q5k", "swiglu", 1088, 20): dict(AF_KQP, ksl=True, swepi=False),
+    ("iq2s", "kstore", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),
+    ("iq2s", "swiglu", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),
     # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
     ("iq3s", "kres", 320, 24): dict(AF_PIPE3, gaddr=True, f16s=True, sgtab=True,
                                     persist=dict(b0early=True, lhs_stream=2)),               # -8.8%
     ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, f16s=True, wlate=False, respre=1,
-                                      persist=True),                                         # -8.5%
-    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -8.8%
-    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),             # -5.3%
+                                      persist=dict(pslice="b0_a1")),                         # -8.5%
+    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, respre=1, persist=dict(pslice="top_top")), # -8.8%; ls 1: see 68
+    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # -5.3%; top_top 89.6 -> 90.5%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
-    ("iq3s", "kstore", 640, 20): dict(AF_PIPE3, lhs_stream=3, gaddr=True, f16s=True),       # -9.6%
-    ("iq4xs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=2),                  # -10.3%
+    ("iq3s", "kstore", 640, 20): dict(AF_NOPRE, gaddr=True, f16s=True),          # -9.6%; no prefetch -1.5%
+    ("iq4xs", "kstore", 640, 20): dict(AF_NOPRE),                               # -10.3%; no prefetch -1.1%
     ("iq3xxs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -11.4%
-    ("q4k", "kstore", 640, 20): dict(AF_KQP),                                   # -7.4%
+    ("q4k", "kstore", 640, 20): dict(AF_KQP, bpre=0, b0early=False, lhs_stream=1),  # -7.4%; no prefetch -1.1%
     ("q3k", "kstore", 640, 20): dict(AF_KQP),                                   # -7.7%
     ("iq3s", "kstore", 384, 20): dict(AF_PIPE3, lhs_stream=3, sgtab=True, f16s=True),       # -9.4%
-    ("iq4xs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=2),                  # -9.9%
+    ("iq4xs", "kstore", 384, 20): dict(AF_NOPRE),                               # -9.9%; no prefetch -1.2%
     ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=3, sgtab=True, gaddr=True, f16s=True),  # -10.9%
-    ("q4k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.0%
+    ("q4k", "kstore", 384, 20): dict(AF_KQP, bpre=0, b0early=False, lhs_stream=1),  # -6.0%; no prefetch -0.9%
     ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
-    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
+    # K-quant kres lhs_stream 1 (each A fragment just before its MMAs) since HRX 0051: WMMA bank cost 1.2-1.8% -> 0.1-0.5%,
+    # 187-192 VGPRs; pp2048 counters 3 runs (11-03), bit-identical: q5k out -1.2% (89.3 -> 90.4%), q5k down -1.8%, q4k
+    # out -0.9%, q4k down -1.1%, q3k down -0.9%
+    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # -4.6%; top_top 88.3 -> 89.2%
+    # 11-02: the down kres of the formats that had no afrag form (tiled 256-token kernels at 69-82% of the floor)
+    ("q5k", "kres", 320, 68): dict(AF_KQP, ksl=True, respre=1, persist=True, lhs_stream=1),
+    ("q3k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # top_top 90.9 -> 91.4%
+    ("q3k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True, pslice="top_top", lhs_stream=1),   # top_top 88.6 -> 89.1%
+    ("iq2s", "kres", 320, 68): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2, respre=1, persist=True,
+                                    pslice="top_top"),
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
     ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, lhs_stream=1, sgtab=True, f16p=True, gaddr=True, f16s=True),  # -8.4%
     ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
@@ -879,10 +915,17 @@ AF = {
     ("q4k", "kqg", 768, 20): dict(AF_KQP),                                      # -6.7%
     ("q3k", "kqg", 768, 20): dict(AF_KQP),                                      # -5.0%
     ("q5k", "kqg", 768, 20): dict(AF_KQP, ksl=True),                            # -10.8%
+    # 11-02, the q of the two layers in these formats (tiled 96 x 8 at 69-72% of the floor): Q2_K without B prefetch
+    # -19.0% (with it -13.4%); IQ4_NL (32-element blocks) spills without it, lhs_stream 4 -17.7%
+    # Q2_K with the B prefetch since its fptrunc(fma) decode (Q2DFMA, 187 -> 192 VGPRs): attention seg -0.15 M cycles
+    ("q2k", "kqg", 768, 20): dict(AF_KQP, ksl=True),
+    ("iq4nl", "kqg", 768, 160): dict(ksl=True, wlate=True, b0early=True, lhs_stream=4),
     ("iq4xs", "kstore", 64, 20): dict(AF_PIPE),                                 # -15.7%
     ("q4k", "kstore", 64, 20): dict(AF_KQP),                                    # -16.0%
     ("q5k", "kstore", 64, 20): dict(AF_KQP, ksl=True),                          # -10.4%
-    ("q6k", "kstore", 64, 20): dict(AF_KQ, ksl=True, wlate=True),               # -10.2% (208 VGPRs: 32 workgroups anyway)
+    # B prefetch (AF_KQP) since it fits the 192 tier (it was 208 VGPRs): the attention segs with a Q6_K v rider (layers
+    # 23, 63) 16.34 / 16.37 -> 16.14 / 16.17 Mcyc per call (-1.2%, 89.7 -> 90.8% of floor), bit-identical (11-03)
+    ("q6k", "kstore", 64, 20): dict(AF_KQP, ksl=True),
     # IQ2: the grid / sign lookups leave no room for B prefetch (bpre 1-2: 208-216 VGPRs, one workgroup per WGP)
     ("iq2xxs", "kstore", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),   # -19.3%
     ("iq2xxs", "swiglu", 1088, 20): dict(ksl=True, wlate=True, b0early=True, lhs_stream=2),   # -16.6%
@@ -895,17 +938,56 @@ AF = {
 # values as kstore + swiglu. vs the two afrag GEMMs, clock-free (2026-10-03, fast reciprocal in both): IQ3_S -3.5%,
 # IQ4_XS -0.9%, IQ3_XXS -3.1%.
 AF_FFN = {
-    "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True, f16s=True),
-    "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False),
+    # IQ3_S: rev_gf_jf (HRX 0051 compiler) WMMA bank rank 1.16 -> 0.38, -2.2% (.to), bit-identical
+    # IQ3_S / IQ4_XS: no B prefetch (bpre 0, no b0early, lhs_stream 0; 11-02, HRX 0051): -0.7% / -1.1% (rank 0)
+    "iq3s": dict(AF_PIPE, swepi=False, f16p=True, f16s=True, epiord="rev_gf_jf", bpre=0, b0early=False, lhs_stream=0),
+    # IQ4_XS: the order steers the hot loop's WMMA banks (with HRX 0049 numbering): rev_gf_jf leaves A, B, C + 1 and
+    # C in distinct banks (-2.2% vs rev_gf_jr; the default order shared banks, +3%), bit-identical
+    "iq4xs": dict(AF_PIPE, swepi=False, epiord="rev_gf_jf", bpre=0, b0early=False, lhs_stream=0),
     # IQ3_XXS: f16s without a sign table (-1.0%; with the packed sgtw=1 table +0.9..+1.6%, which itself had been -0.5%
     # over the plain f16p form; the two-word table +1.3%: LDS bank conflicts 13.9 -> 23.8 M cycles, LDS issue waits +62%)
     "iq3xxs": dict(AF_PIPE, lhs_stream=1, swepi=False, f16p=True, gaddr=True, f16s=True),
+}
+# Mixed-format fused gate + up ((gate fmt, up fmt): gen_gemm_tile fmt "<gate>:<up>", "gemm_ffn_<gate>_<up>_<mt>_<kb>"):
+# each wave loads its own format's weights at its decode (ffn_inload) and no B prefetch, the only forms within the
+# 192-VGPR tier; base knobs the gate format's AF_FFN entry, else its swiglu's. vs the gate kstore + up swiglu pair
+# (clock-free): iq3s:iq4xs -1.4%, iq4xs:q4k -3.0%, q3k:iq3s -2.6%, iq3s:q3k -1.0%, iq4xs:iq3s -1.0%, outputs
+# bit-identical. GPU only (the driver keeps the pair while the ffn site has NPU rows).
+# A pair of one format (no AF_FFN entry, so no NPU split): "gemm_ffn_<fmt>_<fmt>_..", the format's swiglu knobs without
+# B prefetch: q5k -3.5%, q3k -3.8% (the prefetching forms rank 1.0 WMMA banks, -1.2..-1.4%).
+AF_MIX = dict(ffn_inload=True, bpre=0, b0early=False, lhs_stream=0)
+# ffn_sel: every lane loads both formats' slots at a role-selected address, carried like a one-format prefetch (the
+# in-decode loads waited on DRAM each phase); lhs_stream 1 keeps it within the 192-VGPR tier. pp2048 counters, 3 runs
+# (11-03), bit-identical: iq3xxs:iq3s -1.6%, iq2xs:iq3s -1.5%, iq2s:iq3xxs -1.3%, iq4xs:iq3s -1.0%, iq3xxs:iq2s -0.8%,
+# iq3s:iq4xs -0.6%, q3k:iq3s -0.3%, GEMMs -0.13%; iq2xs:iq2s +1.7% (keeps the in-decode loads)
+AF_SEL = dict(ffn_sel=True, bpre=0, b0early=False, lhs_stream=1)
+if __import__("os").environ.get("YAH_FFN_SEL", "1") == "0":
+    AF_SEL = AF_MIX
+AF_FFN_MIX = {
+    ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], **AF_SEL),
+    ("iq4xs", "q4k"): dict(AF_FFN["iq4xs"], **AF_SEL),
+    ("q3k", "iq3s"): dict(AF[("q3k", "swiglu", 1088, 20)], **AF_SEL),
+    ("iq3s", "q3k"): dict(AF_FFN["iq3s"], **AF_SEL),
+    ("iq4xs", "iq3s"): dict(AF_FFN["iq4xs"], **AF_SEL),
+    ("q5k", "q5k"): dict(AF[("q5k", "swiglu", 1088, 20)], bpre=0, b0early=False, lhs_stream=0),
+    ("q3k", "q3k"): dict(AF[("q3k", "swiglu", 1088, 20)], bpre=0, b0early=False, lhs_stream=0),
+    # both formats with lookup tables (the up's bind as gridu / ksignsu, 11-02): iq3xxs:iq3s -1.3%, iq3xxs:iq2s -3.7%,
+    # iq2s:iq3xxs -2.8%, iq2xs:iq2s -4.1%, iq2xs:iq3s -1.9% (IQ2_XS: a gate only, its kstore knobs); iq2s:iq2s with its
+    # swiglu knobs -4.5% (without B prefetch -4.0%)
+    ("iq3xxs", "iq3s"): dict(AF_FFN["iq3xxs"], **AF_SEL),
+    ("iq3xxs", "iq2s"): dict(AF_FFN["iq3xxs"], **AF_SEL),
+    # lhs_stream 1 (each A fragment just before its MMAs; 176 VGPRs): pp2048 counters, 3 runs each, -0.5 M cycles per
+    # call (-1.2%) for these three, bit-identical; iq3s:q3k +0.5% with it (gemm_bench had all four 1-3% better)
+    ("iq2s", "iq3xxs"): dict(AF[("iq2s", "swiglu", 1088, 20)], **AF_SEL),
+    ("iq2xs", "iq2s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **dict(AF_MIX, lhs_stream=1)),   # ffn_sel +1.7%
+    ("iq2xs", "iq3s"): dict(AF[("iq2xs", "kstore", 1088, 20)], **AF_SEL),
+    ("iq2s", "iq2s"): dict(AF[("iq2s", "swiglu", 1088, 20)]),
 }
 
 
 def ffn_fused(rows, B, outdir):
     """Emit "gemm_ffn_<fmt>_<mt>_<kb>.af.hal" / ".af.to.hal" for each AF_FFN format some layer uses for both its gate
-    and up; return the dispatch.txt rows."""
+    and up, and "gemm_ffn_<gate>_<up>_.." for each AF_FFN_MIX pair some layer has; return the dispatch.txt rows."""
     import gen_gemm_tile as TG
     if not AFRAG or B % AF_TILE["bn"]:
         return []
@@ -915,17 +997,148 @@ def ffn_fused(rows, B, outdir):
         if len(parts) > 2 and parts[0] == "blk" and parts[2] in ("ffn_gate", "ffn_up") and E.FMT.get(ty):
             by.setdefault(parts[1], {})[parts[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
     out = []
-    for fmt, mt, kb in sorted({l["ffn_gate"] for l in by.values() if l.get("ffn_gate") == l.get("ffn_up")}):
-        if fmt not in AF_FFN:
-            continue
-        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
+    jobs = {(fmt, fmt, mt, kb) for fmt, mt, kb in (l["ffn_gate"] for l in by.values() if l.get("ffn_gate") == l.get("ffn_up"))
+            if fmt in AF_FFN}
+    jobs |= {(g[0], u[0], g[1], g[2]) for g, u in ((l.get("ffn_gate"), l.get("ffn_up")) for l in by.values())
+             if g and u and g[1:] == u[1:] and (g[0], u[0]) in AF_FFN_MIX}
+    for fmt, fmt_up, mt, kb in sorted(jobs):
+        pair = (fmt, fmt_up) in AF_FFN_MIX
+        knobs = AF_FFN_MIX[(fmt, fmt_up)] if pair else AF_FFN[fmt]
+        name = fmt + "_" + fmt_up if pair else fmt
+        gfmt = fmt if fmt == fmt_up else fmt + ":" + fmt_up
+        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **knobs, ffn=True)
         for suffix, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
             TG.check(tt)
-            r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, fmt, mt, kb, B,
-                          "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, suffix), outdir, "ffn", tt.rowgrp)
+            r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, gfmt, mt, kb, B,
+                          "gemm_ffn_%s_%d_%d%s" % (name, mt, kb, suffix), outdir, "ffn", tt.rowgrp)
             if r:
                 out.append(r)
     return out
+
+
+# KST2: each layer's ssm_alpha + ssm_beta (one format, stored back to back) in one kstore, "gemm_kst2_<fmt>_<mt>_<kb>.hal"
+# (mt of one tensor; the engine takes it when the two are adjacent), 48-row tiles over both tensors' rows, rows of beta
+# to the second output (gen_gemm_tile.SPLIT2). gemm_bench 11-02: 0.111 vs 0.157 Mcyc for the two 48-row kstores (the
+# merged rows at the old 16-row tile 0.144: the tile, not the shared input, wins); pp2048 counters 20.2 -> 15.5 Mcyc.
+# Same values.
+KST2 = os.environ.get("YAH_KST2", "1") == "1"
+KST2_GEOM = (48, 64, 3, 2)
+
+
+def kst2(rows, B, outdir):
+    """Emit the KST2 GEMMs for the (fmt, mt, kb) of every layer whose ssm_alpha and ssm_beta match; dispatch.txt rows."""
+    import gen_gemm_tile as TG
+    by = {}
+    for nm, dims, ty in rows:
+        parts = nm.split(".")
+        if len(parts) > 2 and parts[0] == "blk" and parts[2] in ("ssm_alpha", "ssm_beta") and E.FMT.get(ty):
+            by.setdefault(parts[1], {})[parts[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
+    out = []
+    for fmt, mt, kb in sorted({l["ssm_alpha"] for l in by.values() if l.get("ssm_alpha") == l.get("ssm_beta")}):
+        if fmt not in TILE_FMTS or B % KST2_GEOM[1]:
+            continue
+        t = TG.default_tile(fmt, "kstore", kb, KST2_GEOM)
+        if mt % t.rowgrp:   # a workgroup's rows must lie in one tensor
+            continue
+        TG.SPLIT2 = True
+        try:
+            r = _emit_gen(lambda f, k: TG.gen(f, "kstore", t, False), t.bn, fmt, 2 * mt, kb, B,
+                          "gemm_kst2_%s_%d_%d.hal" % (fmt, mt, kb), outdir, "kst2", t.rowgrp)
+        finally:
+            TG.SPLIT2 = False
+        if r:
+            out.append(r)
+    return out
+
+
+# SEG: segmented GEMMs (gen_segcat): a layer's small GEMMs over the same activations ride in the large one's dispatch,
+# each with its own weights, format, row tile and output. DeltaNet: attn_qkv + ssm_alpha + ssm_beta (48-row segments);
+# attention: the q + gate kqg + attn_k + attn_v (their afrag tiles; k and v are not adjacent and often of two formats).
+# "seg_<kind>_<fmt>_<mt>_<kb>__..." per segment, the large GEMM first; dispatch.txt "<hal> <tile> <groups> <tt>": the
+# grid x (all segments' row groups) in the rowgrp column. Same values.
+SEG = os.environ.get("YAH_SEG", "1") == "1"
+SEG_SMALL = dict(ksl=True, bm=48, tallepi=False, ecoal=False)   # the 48-row afrag tile (fragment-store epilogue)
+SEG_VGPR_TIER = 192   # 1536 / 8 waves: two 16-wave workgroups per WGP
+# riders' knobs when the segmented GEMM would cross the tier: each A fragment loaded just before its MMAs, one step
+# ahead (kstore 64 VGPRs: Q4_K 192 -> 179, Q5_K 192 -> 187, Q6_K 208 -> 192; 64-row riders fit too but ran at 85%)
+SEG_RIDER_LIGHT = dict(lhs_stream=1)
+
+
+def _seg_tile(fmt, kind, mt, kb, small, light=None):
+    import gen_gemm_tile as TG
+    d = TG.default_tile(fmt, kind, kb)
+    if small:   # the format's own K step (AF_TILE's 128 is for the 256-element formats)
+        return dataclasses.replace(d, **dict(AF_TILE, **SEG_SMALL, ksub=d.ksub))
+    knobs = {k: v for k, v in AF.get((fmt, kind, mt, kb), {}).items() if k != "persist"}
+    return dataclasses.replace(d, **dict(AF_TILE, **dict(knobs, **(light or {}))))
+
+
+def seg_gemms(rows, B, outdir):
+    """Emit the SEG GEMMs some layer can use; return their dispatch.txt rows."""
+    import gen_gemm_tile as TG
+    import gen_segcat
+    import hrx_paths
+    if not (AFRAG and B % AF_TILE["bn"] == 0):
+        return []
+    by = {}
+    for nm, dims, ty in rows:
+        parts = nm.split(".")
+        if len(parts) > 2 and parts[0] == "blk" and E.FMT.get(ty):
+            by.setdefault(parts[1], {})[parts[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
+    jobs = set()
+    for l in by.values():
+        q, a, b = l.get("attn_qkv"), l.get("ssm_alpha"), l.get("ssm_beta")
+        if q and a and b and (q[0], "kstore", q[1], q[2]) in AF and a[0] in TILE_FMTS and b[0] in TILE_FMTS:
+            jobs.add(((q, "kstore", False), (a, "kstore", True), (b, "kstore", True)))
+        q, k, v = l.get("attn_q"), l.get("attn_k"), l.get("attn_v")
+        if q and k and v and (q[0], "kqg", q[1], q[2]) in AF and all((x[0], "kstore", x[1], x[2]) in AF for x in (k, v)):
+            jobs.add(((q, "kqg", False), (k, "kstore", False), (v, "kstore", False)))
+    out, big = [], {}
+    tt = B // AF_TILE["bn"]
+
+    def build(segs, light=None):
+        """Emit one segmented GEMM; return its dispatch.txt row."""
+        texts = []
+        for i, ((fmt, mt, kb), kind, small) in enumerate(segs):
+            t = _seg_tile(fmt, kind, mt, kb, small, light if i and not small else None)
+            TG.check(t)
+            TG.OUT16 = kind == "kstore" and mt in O16_MT
+            try:
+                raw = TG.gen(fmt, kind, t, False)
+            finally:
+                TG.OUT16 = False
+            sym = "yah_ffn_gemm_%s%s" % (fmt, {"kqg": "_kqg"}.get(kind, ""))
+            # each segment's body is unchanged in the spliced kernel but for names: its own footprint gate covers it
+            _footprint("seg_%s_%s_%d_%d" % (kind, fmt, mt, kb), raw, [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)], outdir)
+            texts.append((raw, (mt, kb, tt)))
+        name = "seg_" + "__".join("%s_%s_%d_%d" % (kind, fmt, mt, kb) for (fmt, mt, kb), kind, _ in segs) + ".hal"
+        text, groups = gen_segcat.segcat("yah_seg", texts)
+        tmp = os.path.join(outdir, ".emit_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        src = os.path.join(tmp, name[:-4] + ".loom")
+        open(src, "w").write(text)
+        E.emit(src, [], name, outdir)
+        return name, AF_TILE["bn"], groups, tt
+
+    # one VGPR tier: over 192 a WGP holds one 16-wave workgroup instead of two. A segmented GEMM the riders push over
+    # it while the large GEMM alone fits loses more than it saves (11-02: IQ4_NL kqg + K-quant k / v 200, Q6_K v 204:
+    # +0.3..+1.5 M cycles per layer): those retry with SEG_RIDER_LIGHT riders, else keep the separate GEMMs
+    for segs in sorted(jobs):
+        (fmt, mt, kb), kind, _ = segs[0]
+        big = hal_vgprs(os.path.join(outdir, "gemm_%s_%s_%d_%d.af.hal" % (kind, fmt, mt, kb)))
+        for light in (None, SEG_RIDER_LIGHT):
+            r = build(segs, light)
+            if hal_vgprs(os.path.join(outdir, r[0])) <= SEG_VGPR_TIER or big > SEG_VGPR_TIER:
+                out.append(r)
+                break
+            os.remove(os.path.join(outdir, r[0]))
+    return out
+
+
+# The out projections' (K = 6144) start stagger: the second workgroup per WGP waits this many barriers (gen_gemm_tile
+# STAGGER, default 8000). 11-02 pp2048 counters, out kres M cycles (iq4xs / q4k per call / q5k): 8000 252.6 / 7.06 / 86.0,
+# 4000 250.8 / 7.03 / 85.8, 2000 250.6 / 7.01 / 85.3, 1000 251.5 / 7.04 / 85.8, 0 253.2 / 7.07 / 86.5. Same values.
+OUT_KRES_STAGGER = 2000
 
 
 def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
@@ -935,6 +1148,8 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     if not AFRAG or knobs is None or B % AF_TILE["bn"]:
         return []
     knobs = dict(knobs)
+    if kind == "kres" and kb == 24:
+        knobs.setdefault("stagger", OUT_KRES_STAGGER)
     persist = knobs.pop("persist", False)
     t = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **knobs)
     rows = []
@@ -949,7 +1164,8 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
         # persist: True, or a dict of knobs for the persistent variant (its slice loads need registers: IQ3_S drops b0early 2)
         pt = dataclasses.replace(t, **persist) if isinstance(persist, dict) else t
         text = gen_kres_persist.persist(TG.gen(fmt, "kres", pt, False),
-                                        TG.gen(fmt, "kstore", dataclasses.replace(pt, respre=0), False), B // t.bn)
+                                        TG.gen(fmt, "kstore", dataclasses.replace(pt, respre=0), False), B // t.bn,
+                                        place=pt.pslice)
         r = _emit_gen(lambda f, k: text, t.bn, fmt, mt, kb, B, out[:-4] + ".af.p.hal", outdir, kind, t.rowgrp)
         if r:
             rows.append(r)
@@ -972,6 +1188,19 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
+def _footprint(name, raw, args, outdir):
+    """footprint_gate.py on a kernel source as written (a segment of a spliced kernel): exits with its verdict unless it
+    passes."""
+    import subprocess
+    tmp = os.path.join(outdir, ".emit_tmp")
+    os.makedirs(tmp, exist_ok=True)
+    src = os.path.join(tmp, name + ".loom")
+    open(src, "w").write(raw)
+    r = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src] + args, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit("footprint gate refused %s: %s" % (name, (r.stdout + r.stderr).strip()[-400:]))
+
+
 def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, kfull=0):
     """ostride: a GEMM over the leading mt * 16 rows of an ostride-row output (gen_gemm_tile.OSTRIDE, the NPU FFN block's
     GPU share); kfull: a K window's whole-row k_blocks (gen_gemm_tile.KWIN)."""
@@ -985,7 +1214,7 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     with open(src, "w") as fh:
         fh.write(gen(fmt, kind))
-    sym = "yah_ffn_gemm_%s%s" % (fmt, {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
+    sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     import subprocess
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
@@ -1167,6 +1396,10 @@ def main():
         n += 1
 
     geom.extend(ffn_fused(rows, B, outdir))
+    if KST2 and not a4:
+        geom.extend(kst2(rows, B, outdir))
+    if SEG and not a4:
+        geom.extend(seg_gemms(rows, B, outdir))
 
     # Attention: tools/gen_attn_fa.py, 32 tokens x 2 heads per workgroup; reads V^T (vtrans.hal, or the paged / quantized pools).
     # KV paging (256-token pages) needs a context that is a multiple of 256; otherwise the caches stay contiguous.
@@ -1426,11 +1659,11 @@ def main():
     # Its grid (2, heads) is recorded as rowsplit.hal's row group.
     # It needs B % 32 == 0; else the recurrent kernel (tools/gen_deltanet_hip.py, same ABI and grid).
     dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
-    open(dn_src, "w").write(gen_gdn_chunk.gen() if B % 32 == 0 else gen_deltanet_hip.gen())
+    open(dn_src, "w").write(gen_gdn_chunk.gen() if dn32(B) else gen_deltanet_hip.gen())
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
     conv_tb = conv_tb_ok(B)
-    dn_vconv = DNVCONV and conv_tb and a4 and DNSPLIT == (40, 8)
+    dn_vconv = DNVCONV and conv_tb and (a4 or (DNSS_NAT and B % 32 == 0)) and DNSPLIT == (40, 8)
     if dn_vconv:
         text = gen_conv_kq.gen(4096)
         geom.append(("dnvconv", gen_conv_kq.tiles(4096), 0, 0))
@@ -1440,7 +1673,7 @@ def main():
         text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
         if 640 in O16_MT:
             text = conv_x16(text)
-        if B % 32 == 0 and gen_gdn_chunk.CONV16:
+        if dn32(B) and gen_gdn_chunk.CONV16:
             text = conv_n16(text)
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
@@ -1465,6 +1698,8 @@ def main():
     open(postnorm_src, "w").write(postnorm_base)
     dn_perm = a4 and DNSPLIT == (40, 8)
     dn_ss = DNSS and dn_perm and dn_vconv and DNO16 and B % 32 == 0
+    dn_nat = not a4 and dn_vconv   # DNSS_NAT
+    dn_ss = dn_ss or dn_nat
     # one flagged pnq for both DeltaNet parts (gen_rot.gen_pnq "ab"): part b's DeltaNet counts its finished lanes
     pnq_ab = DNOV_ON and dn_ss
     DNRING_ON = DNRING and pnq_ab and RQK_ON and NQW_ON and DNSPLIT == (40, 8)
@@ -1478,7 +1713,7 @@ def main():
     dn_parts = []
     # A4 sets: DeltaNet part b runs the heads of whole rotq groups (gen_rot.pn_heads), so each fused postnorm + rotq part
     # (gen_pnq) reads one part's compact output; "dnperm" tells the host the parts are head sets, not ranges
-    if B % 32 == 0 and DNSPLIT:
+    if dn32(B) and DNSPLIT:
         ha, hb = DNSPLIT
         for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
@@ -1488,6 +1723,8 @@ def main():
                     open(src, "w").write(gen_gdn_ss.gen(gen_rot.pn_heads(tag), flag=pnq_ab and tag == "b"))
                 else:
                     open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=DNO16))
+            elif dn_nat:
+                open(src, "w").write(gen_gdn_ss.gen(list(range(h0, h0 + nh)), natural=True))
             else:
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))

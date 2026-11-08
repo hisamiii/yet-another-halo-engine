@@ -628,8 +628,9 @@ class LoomPrefill {
     kv16_scratch_ = geom_.count("kv16_scratch") != 0;
     kv16_layer_ = kv16_scratch_ ? B * kKvRow * 2 : kv_cache_ * 2;
     kv16_ = &Alloc(kv16_scratch_ ? 2 * kv16_layer_ : std::size_t{2} * full_ * kv_cache_ * 2);
-    kc32_ = &Alloc(kv_cache_ * 4);
-    vc32_ = &Alloc(kv_cache_ * 4);
+    // the RoPE kernel's f32 K / V cache copies: bound, never stored (emit_prefill_pp.rope_live), so no context-sized pair
+    kc32_ = &Alloc(4);
+    vc32_ = &Alloc(4);
     lse_ = &Alloc(B * kHeads * 4);
     eps_ = &Alloc(4);
     ffnup_ = &Alloc(B * kFfn * 2);
@@ -928,28 +929,41 @@ class LoomPrefill {
 
   // kRow: f16 row-major into scratch_; kTiled: fragment-major into normt_ (afrag GEMMs); kBoth: both, one pass.
   enum class NormOut { kRow, kTiled, kBoth };
-  // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): both of one
-  // format and ffn_up stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r).
+  // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): ffn_up
+  // stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r). Gate and up of one
+  // format, or a pair "gemm_ffn_<gate>_<up>_.." (AF_FFN_MIX: mixed formats, which bind the gate format's tables, then
+  // the up format's, or one format without a single-format fused GEMM).
   // It writes f16(silu(gate) * up) into ffnup_, fragment-major when ffn_down is afrag too. Returns false if not taken.
   bool RunFfnFused(const std::string& pre) {
     if (!AfChunk()) return false;
     const auto* tg = Find(pre + "ffn_gate.weight");
     const auto* tu = Find(pre + "ffn_up.weight");
-    if (tg->type != tu->type || tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
-    Fmt f{};
-    const std::string base = GemmHal("gemm_ffn", *tg, &f);
+    if (tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
+    const bool mixed = tg->type != tu->type;
+    Fmt f{}, fu{};
+    std::string base = GemmHal("gemm_ffn", *tg, &f);
+    GemmHal("gemm_ffn", *tu, &fu);
     const bool down_af = Af("gemm_kres", pre + "ffn_down.weight");
-    const std::string hal = AfHal(base, down_af ? ".af.to.hal" : ".af.hal");
+    const char* sfx = down_af ? ".af.to.hal" : ".af.hal";
+    std::string hal = mixed ? "" : AfHal(base, sfx);
+    if (hal.empty()) {   // "gemm_ffn_<gate>_<mt>_<kb>.hal" -> "gemm_ffn_<gate>_<up>_<mt>_<kb>.hal"
+      base.insert(std::strlen("gemm_ffn_") + std::strlen(f.name), "_" + std::string(fu.name));
+      hal = AfHal(base, sfx);
+    }
     if (hal.empty()) return false;
+    const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (mixed ? "_" + std::string(fu.name) : "") + "_ffn";
     RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled);
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*tg, f);
     b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
+    if (mixed) {
+      const auto bu = GemmWeights(*tu, fu);
+      b.insert(b.end(), bu.begin() + 1, bu.end());
+    }
     const std::size_t first = b.size();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
     const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(tg->dims[1]) * 2}, g);
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1, 1,
-             b, GemmWrites(b, f, {ffnup_}));
+    Dispatch(Exe(hal), sym.c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
     RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
     return true;
   }
@@ -1208,6 +1222,74 @@ class LoomPrefill {
       throw LoomError("qsplit: not an attn_q weight: " + wq);
     return wq.substr(0, wq.size() - suf.size()) + "attn_q_norm.weight";
   }
+  // A segmented GEMM (emit_prefill_pp SEG, gen_segcat): one dispatch over the tiled norm output in which each part (the
+  // large GEMM first) has its own weights, format and outputs; "seg_<kind>_<fmt>_<mt>_<kb>__..". dispatch.txt gives
+  // the grid x (all parts' row groups) in the rowgrp column. Returns false if the set lacks it or for a trimmed chunk.
+  struct SegPart {
+    const char* kind;
+    std::string tensor;
+    std::vector<const LoomBuffer*> outs;
+  };
+  bool RunSeg(const std::vector<SegPart>& parts) {
+    if (a4_ || trim_row_ >= 0 || !AfChunk()) return false;
+    std::string hal = "seg";
+    std::vector<std::pair<const core::TensorInfo*, Fmt>> ts;
+    for (const SegPart& p : parts) {
+      const auto* t = Find(p.tensor);
+      Fmt f{};
+      const std::string h = GemmHal(p.kind, *t, &f);   // "gemm_<kind>_<fmt>_<mt>_<kb>.hal"
+      hal += (ts.empty() ? "_" : "__") + h.substr(std::strlen("gemm_"), h.size() - std::strlen("gemm_") - 4);
+      ts.push_back({t, f});
+    }
+    hal += ".hal";
+    const auto g = geom_.find(hal);
+    if (g == geom_.end()) return false;
+    std::vector<hrx_buffer_ref_t> b;
+    std::uint64_t writes = 0;
+    std::size_t ostage = 0;   // the one ostage binding (part 0's): Q2_K writes it (GemmWrites)
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      const auto w = GemmWeights(*ts[i].first, ts[i].second);
+      b.insert(b.end(), w.begin(), w.end());
+      if (i == 0) {
+        for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_}) b.push_back(Ref(*x));
+        ostage = b.size() - 1;
+      }
+      for (const LoomBuffer* o : parts[i].outs) {
+        writes |= std::uint64_t{1} << b.size();
+        b.push_back(Ref(*o));
+      }
+      if (qsplit_ && std::string(parts[i].kind) == "gemm_kqg") b.push_back(TRef(*Find(QNormName(parts[i].tensor))));
+      if (std::string(ts[i].second.name) == "q2k") writes |= std::uint64_t{1} << ostage;
+    }
+    Dispatch(Exe(hal), "yah_seg", g->second.rowgrp, TokenTiles(g->second), 1, 512, 1, 1, b, writes);
+    return true;
+  }
+
+  // ssm_alpha and ssm_beta: in one kstore when the set has "gemm_kst2_<fmt>_<mt>_<kb>.hal" (emit_prefill_pp KST2) and the
+  // tensors are of one format and stored back to back (one weight binding spans both; rows of beta go to beta_), else
+  // two kstores.
+  void RunAlphaBeta(const std::string& pre) {
+    const auto* ta = Find(pre + "ssm_alpha.weight");
+    const auto* tb = Find(pre + "ssm_beta.weight");
+    Fmt f{};
+    const std::string hal = a4_ || ta->type != tb->type || ta->dims != tb->dims || tb->offset != ta->offset + ta->bytes
+                                ? "" : GemmHal("gemm_kst2", *ta, &f);
+    if (hal.empty() || !geom_.count(hal)) {
+      RunKstore(pre + "ssm_alpha.weight", *alpha_);
+      RunKstore(pre + "ssm_beta.weight", *beta_);
+      return;
+    }
+    const Geom g = GeomOf(hal);
+    auto b = GemmWeights(*ta, f);
+    b[0].length = static_cast<std::size_t>(ta->bytes + tb->bytes);
+    const std::size_t first = b.size();
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, alpha_, beta_})
+      b.push_back(Ref(*x));
+    const std::size_t rb = std::size_t(ta->dims[1]) * 4;
+    const std::uint32_t tt = Trim(b, first, {std::size_t(ta->dims[0]) * 2, 0, 0, rb, rb}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), 2 * MTiles(*ta) / g.rowgrp, tt, 1, 32, 1, 1, b,
+             GemmWrites(b, f, {alpha_, beta_}));
+  }
 
   // The attention q projection with the q / gate unpack fused in (rows = heads x [256 q | 256 gate]).
   // Returns false if the set has no such HAL; the caller then runs kstore + yah_unpack_qg.
@@ -1313,7 +1395,11 @@ class LoomPrefill {
     // kqg's outputs untracked too
     iu4_wait_ = std::exchange(nq_cnt_, {});
     iu4_untrack_ = std::exchange(dn_chained_, false) && iu4_wait_.buffer ? 0b11000 : 0;
-    const bool qg_fused = RunKqg(pre + "attn_q.weight", q_af);
+    // seg: k and v ride in the kqg GEMM's dispatch (f16 sets)
+    const bool seg = q_af && k_af && v_af && RunSeg({{"gemm_kqg", pre + "attn_q.weight", {q_, gate_}},
+                                                     {"gemm_kstore", pre + "attn_k.weight", {kbuf_}},
+                                                     {"gemm_kstore", pre + "attn_v.weight", {vbuf_}}});
+    const bool qg_fused = seg || RunKqg(pre + "attn_q.weight", q_af);
     iu4_untrack_ = 0;
     if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
     if (gsig_ && !qg_fused) throw LoomError("the sigmoid gate (gsig) needs the kqg GEMM");
@@ -1323,8 +1409,13 @@ class LoomPrefill {
     // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
     const bool rw = ropew_ && qnorm_ && n_ == B_ && tail_ != kNoRows;
     if (rw) kv_cnt_[0] = FlagSlot(), kv_cnt_[1] = FlagSlot();
-    kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
-    kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
+    if (seg && rw) throw LoomError("seg k / v: no RoPE flags (ropew is A4)");
+    if (!seg) {
+      kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
+      kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
+    } else {
+      kv_flagged_ = false;
+    }
     iu4_wait_ = {}, iu4_untrack_ = 0;
     if (!qg_fused)
       Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
@@ -1484,13 +1575,16 @@ class LoomPrefill {
     // pnq and so before each token tile reaches them: untracked too
     iu4_wait_ = std::exchange(nq_cnt_, {});
     iu4_untrack_ = dn_chained && iu4_wait_.buffer ? 0b1000 : 0;
-    RunKstore(pre + "ssm_alpha.weight", *alpha_);
-    RunKstore(pre + "ssm_beta.weight", *beta_);
+    // seg: alpha and beta ride in the qkv GEMM's dispatch (f16 sets)
+    const bool seg = qkv_af && RunSeg({{"gemm_kstore", pre + "attn_qkv.weight", {qkv_}},
+                                       {"gemm_kstore", pre + "ssm_alpha.weight", {alpha_}},
+                                       {"gemm_kstore", pre + "ssm_beta.weight", {beta_}}});
+    if (!seg) RunAlphaBeta(pre);
     // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
     const bool gate_late = geom_.count("dnvconv") != 0;
     if (dnov_ && gate_late) qkv_cnt = FlagSlot();
     qkv_waited = iu4_wait_.buffer && iu4_untrack_;
-    qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
+    if (!seg) qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
     if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
     iu4_wait_ = {}, iu4_untrack_ = 0;
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
@@ -1589,7 +1683,7 @@ class LoomPrefill {
     // pnq kernels read
     const bool pnq = a4_ && dnsplit_a_ && !out_af && geom_.count("pnq_a.hal");
     if (pnq != (geom_.count("dnperm") != 0)) throw LoomError("the A4 pnq postnorm and dnperm go together");
-    if (dn_done && !pnq) throw LoomError("dispatch.txt dnvconv needs the pnq postnorm");
+    // dnvconv without pnq (f16 sets, gen_gdn_ss natural): the plain postnorm parts, then the conv ring update
     if (pnq) {
       // A4: the postnorm and ssm_out's rotq in one kernel per DeltaNet part (gen_rot.gen_pnq), each reading its part's
       // output (after the gate GEMM, which runs beside the second DeltaNet part)
@@ -1659,6 +1753,7 @@ class LoomPrefill {
       Dispatch(Exe(out_af ? "postnorm_t.hal" : "postnorm.hal"), "yah_ssm_postnorm_fp16", 6 * B_, 1, 1, 256, 1, 1,
                {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
     }
+    if (dn_done) ring();
     trim_row_ = tail_;
     RunResidual(pre + "ssm_out.weight", *scratch_, out_af);
     trim_row_ = kAllRows;

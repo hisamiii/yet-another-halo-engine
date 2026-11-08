@@ -10,6 +10,7 @@ The next phase's weight bytes and activation rows load into registers during thi
 Many waves per SIMD hide the load latency that the wave64 shared kernel (about 2 waves per SIMD) leaves exposed.
 """
 import os
+import re
 import sys
 import dataclasses
 from dataclasses import dataclass
@@ -17,6 +18,11 @@ from dataclasses import dataclass
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gen_gemm_decode as G  # noqa: E402
+
+# Mixed gate:up pairs whose decode waves are swizzled so each SIMD holds both roles (gate/up by wave bit 2, not bit 1):
+# bit-identical, clock-free iq3s:iq4xs -0.7%, iq3xxs:iq3s -0.8%, iq3s:q3k -1.7% (11-03); other pairs flat or worse
+# (iq2xs:iq3s +3%), so the wave-to-SIMD split is not the whole story there
+MX_SWZ_PAIRS = {("iq3s", "iq4xs"), ("iq3xxs", "iq3s"), ("iq3s", "q3k"), ("iq4xs", "iq3s")}
 
 # Default workgroup: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).
 # 256 x 256 does not fit: 64 KB of tiles plus the IQ grid table in LDS is over gfx11's 64 KB per workgroup.
@@ -100,9 +106,17 @@ class Tile:
                                # (gen_gemm_decode.IQ3_GADDR; -15..-23 loop VALU)
     esr: int = 16              # tall epilogue slab rows (32 with ecoal: 8 lanes per token, full 128-byte rows per access)
     respre: int = 0            # kres tall epilogue: issue each slab group's residual loads this many groups ahead (0: at use)
+    pslice: str = ""           # persistent kres (gen_kres_persist): where each K-loop phase issues the previous tile's slice
+                               # "<loads>_<add+store>" (top / b0 after barrier 0 / b1 before barrier 1 / a1 after it);
+                               # "" = b0_b1. Same values; it steers the register allocator's WMMA banks
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
+    ffn_sel: bool = False      # mixed ffn: one carried load per slot at a role-selected address (see sel_loads)
     ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
                                # (the weight binding spans ffn_gate and the ffn_up right after it: up row r is row m_rows + r)
+    epiord: str = ""           # ffn epilogue order "<silu>_<g>_<j>": silu of all fragments up front (fwd / rev) or each
+                               # right before its store (lazy), stores over row groups g and token columns j forward (gf / jf)
+                               # or reversed (gr / jr); "" = fwd_gf_jf. Same ops, but the order steers the register allocator:
+                               # with every WMMA's A, B and C starting in one VGPR bank (% 4) the kernel runs ~3% slower
     tallepi: bool = False      # afrag kstore / kres: the LDS epilogue in 16-row slabs in the weight tile (else fragment stores)
     tout: bool = False         # swiglu: store the output fragment-major (atiled layout over K = rows) for an afrag consumer
     stg_minwg: int = STG_MINWG  # smallest grid that staggers (afrag: every grid; lockstep costs it 6-9%)
@@ -141,6 +155,12 @@ class Tile:
 
 # set per emitted shape by emit_prefill_pp._emit_gen (O16_MT): kstore outputs stored as f16 for f16 consumers
 OUT16 = False
+
+def _nbytes(ty):
+    """N of a vector<Nxi8> type, else 0"""
+    m = re.fullmatch(r"vector<(\d+)xi8>", ty)
+    return int(m.group(1)) if m else 0
+
 
 def default_tile(fmt, kind, kb, geom=None):
     """The shipped Tile for fmt / kind at k_blocks kb; geom=(BM, BN, WM, WN) overrides the geometry (16-row tiles)."""
@@ -207,6 +227,8 @@ def configure(fmt, t):
     G.IQ3_GADDR = t.gaddr
     G.IQ3_SGTAB_W = t.sgtw
     G.IQ3_F16S = t.f16s
+    G.Q3_LUT = G.Q5_ROT = t.afrag   # (and not swiglu, gen): two LDS tiles that fit 64 KB only overlapped, which a
+    # Low call prevents
     # IQ2: the same word path and sign chain (IQ2_W): -5.6% clock-free
     G.IQ2_W = fmt in ("iq2xxs", "iq2xs", "iq2s")
     if G.IQ2_W:
@@ -233,6 +255,7 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
     if fmt_up is not None and (kind != "ffn" or fmt_up == fmt):
         raise ValueError("a gate:up format pair is for kind ffn with two formats")
     configure(fmt, t)
+    G.Q3_LUT, G.Q5_ROT = G.Q3_LUT and kind != "swiglu", G.Q5_ROT and kind != "swiglu"
     return _gen(fmt, kind, t, masked, fmt_up)
 
 
@@ -246,6 +269,10 @@ DQ_WGS = 20
 # the tile count of a fragment-major output, for ffn the gate rows before the up rows, for kqg twice the q / gate row
 # stride (whole heads split). kstore / kres / swiglu / ffn / kqg.
 OSTRIDE = 0
+# Two tensors of one shape and format back to back in the weight binding (emit_prefill_pp KST2: ssm_alpha + ssm_beta),
+# one kstore over both: rows [0, m_rows / 2) go to output, the rest to out2, each [tokens][m_rows / 2]. A wave's rows
+# must lie in one half (the emitter checks the tile); the default fragment-store epilogue only.
+SPLIT2 = False
 
 
 # NPU weights (emit_prefill_pp NPU_SPLIT): with DQ_BFP = (ks, passes), the dequant kind writes the NPU's BFP16 weight
@@ -290,20 +317,103 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     # switches from its own default tile); every lane loads its row of both (no branch around the loads: a branch drains
     # vmcnt(0) at its join) and carries both, each wave decodes the one its rows are
     MX = fmt_up is not None
+    MX_SWZ = (fmt, fmt_up) in MX_SWZ_PAIRS if os.environ.get("YAH_MX_SWZ", "1") == "1" else False
     if MX:
         Fu = G.FMTS[fmt_up]
         bbu, (loads_u, compute_u) = Fu["bb"], Fu["decode"]
         du = default_tile(fmt_up, "swiglu", 20)
         tu = dataclasses.replace(t, w3=du.w3, q4fmix=du.q4fmix)
-        if set(F["extra"]) & set(Fu["extra"]):
-            raise ValueError(f"{fmt}:{fmt_up}: both formats need the same table binding")
+        # both formats with lookup tables: the up's tables (bindings, LDS copies, sign table) get a "u" suffix; a pair with
+        # one table keeps the plain names (and its kernel unchanged)
+        TU2 = bool(set(F["extra"]) & set(Fu["extra"]))
+        extra_u = [x + "u" for x in Fu["extra"]] if TU2 else Fu["extra"]
+
+        def ren(x):
+            if not TU2:
+                return x
+            if isinstance(x, str):
+                return re.sub(r"%(grid|ksigns|sgt)_", r"%\1u_", x)
+            if isinstance(x, (list, tuple)):
+                return type(x)(ren(y) for y in x)
+            return x
 
         def as_up(fn):
             configure(fmt_up, tu)
             try:
-                return fn()
+                return ren(fn())
             finally:
                 configure(fmt, t)
+
+        def sel_loads(p, blk_g, blk_u, gb):
+            """ffn_sel: both formats' weight loads for one phase as one load per slot, every lane the same loads, so the
+            values carry like a one-format prefetch (a load in the role branch drains vmcnt(0) at its join). A byte-view
+            up load and a gate one no wider share a slot: index = the lane's role's, the gate's read widened to the up's
+            width (the up tensor follows the gate tensor in the binding: a widened gate read stays inside it), clamped
+            to w_bytes - width like the plain loads. Other loads keep their own slot (the other role loads the same
+            address: a wasted but valid load). Returns (lines, slots [(name, type)], gate map, up map); a map entry per
+            loaded value: (slot, its type)."""
+            Lg, vg = loads(p + "g_", blk_g, gb)
+            Lu, vu = as_up(lambda: loads_u(p + "u_", blk_u, gb))
+            rx = re.compile(r"^\s*(%\S+) = (?:vector|view)\.load (%\w+)\[(%\S+)\] : \S+ -> (\S+)$")
+
+            def parse(Ls):
+                body, lds = [], {}
+                for ln in Ls:
+                    m = rx.match(ln)
+                    if m:
+                        lds[m.group(1)] = (m.group(2), m.group(3), m.group(4), ln)
+                    else:
+                        body.append(ln)
+                return body, lds
+            bg, lg = parse(Lg)
+            bu, lu = parse(Lu)
+            assert set(lg) == {n for n, _ in vg} and set(lu) == {n for n, _ in vu}, "sel_loads: a value not a plain load"
+            out = bg + bu
+            gv = sorted((n for n, _ in vg if lg[n][0] == "%w_view" and _nbytes(lg[n][2])), key=lambda n: -_nbytes(lg[n][2]))
+            slots, gmap, umap, used = [], {}, {}, set()
+            for nu, tyu in vu:
+                vw, idx, ty, ln = lu[nu]
+                w = _nbytes(ty)
+                cand = [g for g in gv if g not in used and _nbytes(lg[g][2]) <= w] if vw == "%w_view" and w else []
+                if cand:
+                    g = cand[0]
+                    used.add(g)
+                    sn = f"%{p}s{len(slots)}"
+                    out.append(f"    {sn}_i0 = scf.select %ff_up, {idx}, {lg[g][1]} : index")
+                    out.append(f"    {sn}_i = index.min {sn}_i0, %w_lim{w} : index")
+                    out.append(f"    {sn} = vector.load %w_view[{sn}_i] : view<[%w_bytes]xi8> -> {ty}")
+                    umap[nu], gmap[g] = (len(slots), ty), (len(slots), lg[g][2])
+                    slots.append((sn, ty))
+                    continue
+                out.append(ln)
+                umap[nu] = (len(slots), tyu)
+                slots.append((nu, tyu))
+            for ng, tyg in vg:
+                if ng not in gmap:
+                    out.append(lg[ng][3])
+                    gmap[ng] = (len(slots), tyg)
+                    slots.append((ng, tyg))
+            return out, slots, [gmap[n] for n, _ in vg], [umap[n] for n, _ in vu]
+
+        def sel_vals(sn, stypes, smap, tag):
+            """ffn_sel: one role's loaded values from the unpacked slot names (a narrower value: the slot's prefix)"""
+            names = []
+            for i, (si, ty) in enumerate(smap):
+                src, sty = sn[si], stypes[si]
+                if ty == sty:
+                    names.append(src)
+                    continue
+                n, w = _nbytes(ty), _nbytes(sty)
+                assert n and w and n % 4 == 0 and w % 4 == 0, (ty, sty)
+                e(f"    %{tag}w{i} = vector.bitcast {src} : {sty} to vector<{w // 4}xi32>")
+                ws = []
+                for j in range(n // 4):
+                    e(f"    %{tag}e{i}_{j} = vector.extract %{tag}w{i}[{j}] : vector<{w // 4}xi32> -> i32")
+                    ws.append(f"%{tag}e{i}_{j}")
+                e(f"    %{tag}v{i} = vector.from_elements {', '.join(ws)} : vector<{n // 4}xi32>")
+                e(f"    %{tag}x{i} = vector.bitcast %{tag}v{i} : vector<{n // 4}xi32> to {ty}")
+                names.append(f"%{tag}x{i}")
+            return names
     kr = kind == "kres"
     sw = kind == "swiglu"
     # kqg: the attention q projection (rows = heads x [256 q | 256 gate]) writes q and gate to [tokens][heads*256] buffers.
@@ -314,9 +424,11 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     # ffn: ffn_gate and ffn_up (same format) in one GEMM, out = f16(silu(gate) * up), the swiglu GEMM's scalar ops
     ff = kind == "ffn"
     assert ff == t.ffn, "kind ffn needs Tile.ffn"
-    bufs = (["weight"] + F["extra"] + (Fu["extra"] if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
-            + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []) + (["qnw"] if qg and KQG_QSPLIT else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
+    bufs = (["weight"] + F["extra"] + (extra_u if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
+            + ["wstage", "ostage", "output"] + (["out2"] if SPLIT2 else []) + (["gate_out"] if qg else []) + (["qnw"] if qg and KQG_QSPLIT else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
     assert not NPUADD or (kr and KWIN and t.tallepi and t.ecoal and not masked and not t.respre)
+    assert not SPLIT2 or (kind == "kstore" and not (OSTRIDE or MX or masked or AFRAG or t.tallepi or t.tm == 32 or OUT16)), \
+        "SPLIT2: a plain tiled f32 kstore with the default fragment-store epilogue"
     sym = (f"yah_ffn_gemm_{fmt}" + (f"_{fmt_up}" if MX else "") + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
            + ("_ffn" if ff else ""))
     if dq:
@@ -342,6 +454,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e("// decoded weights and staged activations both in LDS. See the generator.")
     e(f"amdgpu.target<gfx1151> @yah_tile_w32 {{subgroup_size = {WS}}}")
     e("")
+    L += G.lowdefs({fmt, fmt_up})
     for c in ("m_tiles", "k_blocks", "token_tiles") + (("tokens",) if masked else ()):
         e(f"config.decl @{sym}.{c} : %value: index where [range(%value, 1, 4096)]")
     e("")
@@ -547,8 +660,29 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e("  %wtb = index.mul %wg_y, %cwtok : index")
     e("  %token_base = index.add %wtb, %wt_off : index")
     # decode lane map: lane tid decodes weight row tid % BM, group slot tid / BM of the phase; slots >= GPP idle
-    e(f"  %l64 = index.rem %tid, %c{BM} : index")
-    e(f"  %slot = index.div %tid, %c{BM} : index")
+    if MX and MX_SWZ and BM == 128 and t.wm * t.wn == 16:
+        # wave w = (b3 b2 b1 b0): role (gate / up) = b2, 32-row block = b0, group slot = 2 b3 + b1, so every SIMD holds
+        # gate and up waves whether it takes w % 4 or (w / 8, w % 2): the two decoders' VALU no longer split by SIMD
+        e("  %mxw = index.div %tid, %c32 : index")
+        e("  %mxl = index.rem %tid, %c32 : index")
+        e("  %mxc2 = index.constant 2 : index")
+        e("  %mxc4 = index.constant 4 : index")
+        e("  %mxc8 = index.constant 8 : index")
+        e("  %mxb0 = index.rem %mxw, %mxc2 : index")
+        e("  %mxw1 = index.div %mxw, %mxc2 : index")
+        e("  %mxb1 = index.rem %mxw1, %mxc2 : index")
+        e("  %mxw2 = index.div %mxw, %mxc4 : index")
+        e("  %mxb2 = index.rem %mxw2, %mxc2 : index")
+        e("  %mxb3 = index.div %mxw, %mxc8 : index")
+        e("  %mxr0 = index.mul %mxb2, %c64 : index")
+        e("  %mxr1 = index.mul %mxb0, %c32 : index")
+        e("  %mxr2 = index.add %mxr0, %mxr1 : index")
+        e("  %l64 = index.add %mxr2, %mxl : index")
+        e("  %mxs0 = index.mul %mxb3, %mxc2 : index")
+        e("  %slot = index.add %mxs0, %mxb1 : index")
+    else:
+        e(f"  %l64 = index.rem %tid, %c{BM} : index")
+        e(f"  %slot = index.div %tid, %c{BM} : index")
     e(f"  %drow = index.min %l64, %c{BM - 1} : index")
     e("  %drow_i = index.cast %drow : index to i32")
     e("  %wg_row_i = index.cast %wg_row : index to i32")
@@ -619,9 +753,17 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e(f"  %grt{i} = index.add %wtb, %gr{i} : index")
             e(f"  %grp{i} = index.mul %grt{i}, %apitch : index")
             e(f"  %gro{i} = index.add %grp{i}, %gc{i} : index")
-    L.extend(F["setup"]())
+    setup = F["setup"]()
+    L.extend(setup)
     if MX:
-        L.extend(as_up(lambda: Fu["setup"]()))
+        # both setups may define the same constants (IQ4_XS and Q4_K: the nibble masks): one definition each
+        have = {l.split("=")[0].strip(): l.strip() for l in setup if l.lstrip().startswith("%")}
+        for l in as_up(lambda: Fu["setup"]()):
+            n = l.split("=")[0].strip()
+            if n in have:
+                assert have[n] == l.strip(), (n, have[n], l)
+                continue
+            L.append(l)
     if dq:
         # the setup's LDS tables visible, then this workgroup's phase (wg_y) decoded into the LDS tile as the GEMM does it
         e("  %z8s = scalar.constant 0 : i8")
@@ -888,6 +1030,10 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     if MX and t.ffn_inload:
         del L[len(L) - len(L0):]   # no prefetch: the decode loads (in place: e appends to L)
         wv0 = []
+    elif MX and t.ffn_sel:
+        del L[len(L) - len(L0):]
+        Ls0, wv0, sel_gm, sel_um = sel_loads("pfs_", "%row_off_i", "%row_off_u", "%gl_i")
+        L.extend(Ls0)
     elif MX:
         L0u, wv0u = as_up(lambda: loads_u("pfu_", "%row_off_u", "%gl_i"))
         L.extend(L0u)
@@ -988,12 +1134,20 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             Lcg, vcg = loads("cg_", "%blk_cg", "%gb_i")
             L.extend(Lcg)
             names = [n for n, _ in vcg]
+        elif MX and t.ffn_sel:
+            sn = G.unpack_vals(e, cur_w, orig0)
+            stypes = [ty for _, ty in orig0]
+            e("    scf.if %ff_up {")
+            names_u = sel_vals(sn, stypes, sel_um, "su")
+            L.extend(as_up(lambda: compute_u(names_u, "%gb_i")))
+            e("    } else {")
+            names = sel_vals(sn, stypes, sel_gm, "sg")
         elif MX:
             e("    scf.if %ff_up {")
             names_u = G.unpack_vals(e, cur_wu, orig0u)
             L.extend(as_up(lambda: compute_u(names_u, "%gb_i")))
             e("    } else {")
-        if not (MX and t.ffn_inload):
+        if not (MX and (t.ffn_inload or t.ffn_sel)):
             names = G.unpack_vals(e, cur_w, orig0)
         L.extend(compute(names, "%gb_i"))
         if MX:
@@ -1039,9 +1193,15 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e("    }")
             nxt = [(f"%nxw{x}", ty) for x, (_, ty) in enumerate(cur_w)]
         else:
-            L.extend(Ln if not (MX and t.ffn_inload) else [])
-            nxt = G.pack_vals(e, nxt, "n") if not (MX and t.ffn_inload) else []
-            if MX and not t.ffn_inload:
+            L.extend(Ln if not (MX and (t.ffn_inload or t.ffn_sel)) else [])
+            nxt = G.pack_vals(e, nxt, "n") if not (MX and (t.ffn_inload or t.ffn_sel)) else []
+            if MX and t.ffn_sel:
+                e("    %blk_off0n_u = scalar.muli %kb_ni, %cbbu_i : i32")
+                e("    %blk_n_u = scalar.addi %row_off_u, %blk_off0n_u : i32")
+                Lns, nxs, _, _ = sel_loads("nxs_", "%blk_n", "%blk_n_u", "%gb_n")
+                L.extend(Lns)
+                nxt = G.pack_vals(e, nxs, "n")
+            elif MX and not t.ffn_inload:
                 e("    %blk_off0n_u = scalar.muli %kb_ni, %cbbu_i : i32")
                 e("    %blk_n_u = scalar.addi %row_off_u, %blk_off0n_u : i32")
                 Lnu, nxtu = as_up(lambda: loads_u("nxu_", "%blk_n_u", "%gb_n"))
@@ -1225,6 +1385,11 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
+    if SPLIT2:
+        _split2_epilogue(e, t, V8)
+        e("  kernel.return")
+        e("}")
+        return "\n".join(L) + "\n"
     e(f"  %out_layout = encoding.layout.strided [%c1, {orw()}] : encoding<layout>")
     e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
     if kr:
@@ -1245,6 +1410,30 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def _split2_epilogue(e, t, V8):
+    """SPLIT2: the default fragment stores, into output (first half of the rows) or out2 (second half, rows - half)."""
+    FM, FN = t.tm // 16, t.tn // 16
+    e("  %k2_rows = index.div %m_rows, %c2 : index")
+    e("  %k2_layout = encoding.layout.strided [%c1, %k2_rows] : encoding<layout>")
+    vt = f"view<[%k2_rows]x[%tokens]xf32, %k2_layout>"
+    e(f"  %k2_lo = buffer.view %output_na[%base] : buffer -> {vt}")
+    e(f"  %k2_hi = buffer.view %out2_na[%base] : buffer -> {vt}")
+    for j in range(FN):
+        e(f"  %ot{j} = index.add %token_base, %c{16 * j} : index")
+    e("  %k2_up = index.cmp uge, %m_origin, %k2_rows : index")
+    e("  scf.if %k2_up {")
+    e("  %k2_org = index.sub %m_origin, %k2_rows : index")
+    for side, org, view in (("h", "%k2_org", "%k2_hi"), ("l", "%m_origin", "%k2_lo")):
+        if side == "l":
+            e("  } else {")
+        for i in range(FM):
+            e(f"  %or{side}{i} = index.add {org}, %c{16 * i} : index")
+        for i in range(FM):
+            for j in range(FN):
+                e(f"  vector.fragment.store<result> %acc{i * FN + j}, {view}[%or{side}{i}, %ot{j}] shape [%m, %n] : {V8}, {vt}")
+    e("  }")
 
 
 def npu_wait(e):
@@ -1915,22 +2104,28 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
     e("  %negone = scalar.constant -1.0 : f32")
     rcp_consts(e)
     e("  %one = scalar.constant 1.0 : f32")
-    for i in range(FG):
-        for j in range(FN):
-            g, u = i * FN + j, (i + FG) * FN + j
-            xs = []
-            for x in range(8):
-                y = f"{i}_{j}_{x}"
-                e(f"  %fg_{y} = vector.extract %acc{g}[{x}] : {V8} -> f32")
-                e(f"  %fu_{y} = vector.extract %acc{u}[{x}] : {V8} -> f32")
-                e(f"  %fng_{y} = scalar.mulf %fg_{y}, %negone : f32")
-                e(f"  %fex_{y} = scalar.expf<afn> %fng_{y} : f32")
-                e(f"  %fdn_{y} = scalar.addf %one, %fex_{y} : f32")
-                recip1(e, f"%fiv_{y}", f"%fdn_{y}")
-                e(f"  %fsg_{y} = scalar.mulf %fg_{y}, %fiv_{y} : f32")
-                e(f"  %fac_{y} = scalar.mulf %fsg_{y}, %fu_{y} : f32")
-                xs.append(f"%fac_{y}")
-            e(f"  %fo{i}_{j} = vector.from_elements {', '.join(xs)} : {V8}")
+
+    def silu(i, j):
+        g, u = i * FN + j, (i + FG) * FN + j
+        xs = []
+        for x in range(8):
+            y = f"{i}_{j}_{x}"
+            e(f"  %fg_{y} = vector.extract %acc{g}[{x}] : {V8} -> f32")
+            e(f"  %fu_{y} = vector.extract %acc{u}[{x}] : {V8} -> f32")
+            e(f"  %fng_{y} = scalar.mulf %fg_{y}, %negone : f32")
+            e(f"  %fex_{y} = scalar.expf<afn> %fng_{y} : f32")
+            e(f"  %fdn_{y} = scalar.addf %one, %fex_{y} : f32")
+            recip1(e, f"%fiv_{y}", f"%fdn_{y}")
+            e(f"  %fsg_{y} = scalar.mulf %fg_{y}, %fiv_{y} : f32")
+            e(f"  %fac_{y} = scalar.mulf %fsg_{y}, %fu_{y} : f32")
+            xs.append(f"%fac_{y}")
+        e(f"  %fo{i}_{j} = vector.from_elements {', '.join(xs)} : {V8}")
+
+    pre, gr, jr = (t.epiord or "fwd_gf_jf").split("_")
+    if pre != "lazy":
+        order = [(i, j) for i in range(FG) for j in range(FN)]
+        for i, j in (order if pre == "fwd" else reversed(order)):
+            silu(i, j)
     e(f"  %et_cs = index.constant {sr + EPAD} : index")
     e("  %et_lay = encoding.layout.strided [%c1, %et_cs] : encoding<layout>")
     e(f"  %et_wb = index.constant {(sr + EPAD) * 16 * 4} : index")
@@ -1949,11 +2144,13 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
     e("  %et_rowb = index.add %m_origin, %et_h : index")
     if t.tout:
         e(f"  %et_mt = index.div {orw()}, %c16 : index")
-    for g in range(FG):
+    for g in (reversed(range(FG)) if gr == "gr" else range(FG)):
         e(f"  %et_gr{g} = index.constant {g * sr} : index")
         e(f"  %et_row{g} = index.add %et_rowb, %et_gr{g} : index")
-        for j in range(FN):
+        for j in (reversed(range(FN)) if jr == "jr" else range(FN)):
             q0 = f"{g}_{j}"
+            if pre == "lazy":
+                silu(g, j)
             e("  scf.schedule.fence")
             e(f"  vector.fragment.store<result> %fo{g}_{j}, %et_view[%c0, %c0] shape [%m, %n] : {V8}, view<{sr}x16xf32, %et_lay>")
             e(f"  %et_tc{q0} = index.constant {16 * j} : index")

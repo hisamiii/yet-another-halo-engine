@@ -57,7 +57,7 @@ def _rename(lines, names, suffix):
     return [NAME.sub(sub, l) for l in lines]
 
 
-def persist(kres_text, kstore_text, ntiles, lanes=512, bn=512, bm=128):
+def persist(kres_text, kstore_text, ntiles, lanes=512, bn=512, bm=128, place=""):
     L = kres_text.rstrip("\n").split("\n")
     # the token stride of output / residual: a column-split kres (gen_gemm_tile.OSTRIDE) defines %o_rows
     orows = "%o_rows" if any(l.strip().startswith("%o_rows = ") for l in L) else "%m_rows"
@@ -121,7 +121,12 @@ def persist(kres_text, kstore_text, ntiles, lanes=512, bn=512, bm=128):
                           f"  %psa_p = vector.load %ps_out[{off}] : view<[%out_total]xf32> -> vector<4xf32>"]
             fin = [f"  %psa_s = vector.addf %psa_r, %psa_p : vector<4xf32>",
                    f"  vector.store %psa_s, %ps_out[{off}] : vector<4xf32>, view<[%out_total]xf32>"]
-            body_a = body[:b0 + 1] + ["  " + l for l in loads] + body[b0 + 1:b1] + ["  " + l for l in fin] + body[b1:]
+            # place "<loads>_<add+store>" (gen_gemm_tile.Tile.pslice): body positions top / b0 (after barrier 0) /
+            # b1 (before barrier 1) / a1 (after barrier 1)
+            pos = {"top": 0, "b0": b0 + 1, "b1": b1, "a1": b1 + 1}
+            il, ifin = (pos[x] for x in (place or "b0_b1").split("_"))
+            assert il <= ifin, place
+            body_a = body[:il] + ["  " + l for l in loads] + body[il:ifin] + ["  " + l for l in fin] + body[ifin:]
             part_a = [hdr_a] + body_a + [close]
             # part B: phases [32, kphases), iter args from part A
             iters = re.findall(r"(%[\w]+) = ([^,()]+?) : ", hdr.split("](", 1)[1])

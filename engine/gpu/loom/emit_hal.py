@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emit an HRX-loadable HAL executable for a Loom kernel at a fixed config.
 
-usage: emit_hal.py <file.loom> <outdir> <symbol=value> [symbol=value ...]
+usage: emit_hal.py <file.loom> <outdir> [symbol=value ...]
 
 iree-run-loom can emit a HAL executable (--emit-only --emit-hal-executable) but has no --config flag.
 So this tool rewrites each `config.get @symbol` to a constant, drops its config.decl, and lets iree-run-loom emit without a dispatch.
@@ -19,7 +19,7 @@ import hrx_paths  # noqa: E402
 
 
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3:
         sys.stderr.write(__doc__)
         return 2
     source, outdir = sys.argv[1], sys.argv[2]
@@ -76,6 +76,10 @@ def main():
            rewritten, "--device=amdgpu", "--target=amdgpu:gfx1151",
            "--emit-only", "--emit-hal-executable=" + hal_path,
            "--emit-target-artifact=" + target]
+    # a module with Low helper functions beside its kernel: name the one kernel as the entry
+    kernels = re.findall(r"^\s*kernel\.def\b[^\n]*?@(\w+)\(", "\n".join(out), re.M)
+    if len(kernels) == 1:
+        cmd.append("--function=" + kernels[0])
     result = subprocess.run(cmd, env=hrx_paths.env(), capture_output=True, text=True)
     shutil.rmtree(tmpdir, ignore_errors=True)
     if result.returncode != 0 or not os.path.exists(hal_path):
