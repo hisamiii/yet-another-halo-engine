@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yah::core {
@@ -113,6 +114,12 @@ class Gguf {
   void Prepare(std::size_t offset, std::size_t bytes) {
     if (fill_) fill_(offset, bytes);
   }
+  // The ranges (offset, bytes) a device will Prepare, ascending, before the first: a native resident copy then fills
+  // them on a background thread (the file read straight into the copy) at most one range ahead of Prepare, so the read
+  // overlaps the uploads; otherwise nothing to do.
+  void Stream(std::vector<std::pair<std::size_t, std::size_t>> ranges) {
+    if (stream_) stream_(std::move(ranges));
+  }
   // Rows of a 2-D tensor (as tensors() describes it) into out, rows[i] at i: from the copy, or for a native resident
   // copy's tensor no device took (never Prepared) straight from the file.
   void Rows(const TensorInfo& t, const std::uint32_t* rows, std::size_t n, std::uint8_t* out) const;
@@ -136,6 +143,7 @@ class Gguf {
   std::vector<TensorInfo> tensors_;
   std::map<std::string, MetadataValue> meta_;
   std::function<void(std::size_t, std::size_t)> fill_;   // Prepare's filler (a native resident copy)
+  std::function<void(std::vector<std::pair<std::size_t, std::size_t>>)> stream_;   // Stream's (the same copy)
   // Rows' reader for a native resident copy: (tensor, rows, n, out), false if the tensor is filled (read the copy)
   std::function<bool(const TensorInfo&, const std::uint32_t*, std::size_t, std::uint8_t*)> rows_;
 };

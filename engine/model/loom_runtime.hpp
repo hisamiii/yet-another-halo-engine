@@ -550,6 +550,7 @@ class LoomWeights {
         end = std::max(end, std::get<1>(spans[i]));
       ranges.emplace_back(begin, end - begin);
     }
+    gguf.Stream(ranges);   // (a native copy reads the next range while this one uploads)
     // YAH_LOAD_TIMES=1: each upload step's total (fill: until the host copy of the range is there)
     double ms[4] = {};
     auto t = std::chrono::steady_clock::now();

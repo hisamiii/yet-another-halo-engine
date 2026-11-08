@@ -166,6 +166,7 @@ Gguf& Gguf::operator=(Gguf&& other) noexcept {
     tensors_ = std::move(other.tensors_);
     meta_ = std::move(other.meta_);
     fill_ = std::move(other.fill_);
+    stream_ = std::move(other.stream_);
     rows_ = std::move(other.rows_);
     other.base_ = nullptr;
     other.size_ = 0;
@@ -180,6 +181,8 @@ Gguf::~Gguf() {
 }
 
 void Gguf::Close() {
+  // (first: the last holder of a native copy's filler joins its background read, which writes into base_)
+  fill_ = nullptr, stream_ = nullptr, rows_ = nullptr;
   if (base_ != nullptr) {
     ::munmap(base_, map_bytes_);
     base_ = nullptr;

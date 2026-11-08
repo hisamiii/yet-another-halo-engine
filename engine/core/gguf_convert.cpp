@@ -16,14 +16,18 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/gguf.hpp"
@@ -149,6 +153,22 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights, bool lock, bool 
     std::vector<Job> jobs;
     std::uint8_t* base = nullptr;
     std::size_t next = 0;   // a lazy fill: jobs [0, next) are done
+    // a streamed fill (Stream): the ranges, how many the reader filled and Prepare handed out, the reader's failure
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    std::size_t filled = 0, handed = 0;
+    bool stop = false;
+    std::string error;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::thread reader;
+    ~State() {
+      {
+        const std::lock_guard<std::mutex> l(mu);
+        stop = true;
+      }
+      cv.notify_all();
+      if (reader.joinable()) reader.join();
+    }
   };
   auto st = std::make_shared<State>();
   st->src = Open(path);
@@ -299,13 +319,95 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights, bool lock, bool 
       }
       return true;
     };
-    // the jobs overlapping the range run; those wholly before it are skipped (tensors the device does not take)
-    g.fill_ = [st, run](std::size_t offset, std::size_t len) {
-      const auto range = [&](const Job& j) {
-        const TensorInfo& d = j.item->dst;
-        const std::uint64_t rb = d.dims[0] / BlockElements(d.type) * BlockBytes(d.type);
-        return std::pair{d.offset + j.r0 * rb, d.offset + j.r1 * rb};
-      };
+    // a job's bytes in the copy (dst) and in the file (src)
+    const auto range = [](const Job& j) {
+      const TensorInfo& d = j.item->dst;
+      const std::uint64_t rb = d.dims[0] / BlockElements(d.type) * BlockBytes(d.type);
+      return std::pair{d.offset + j.r0 * rb, d.offset + j.r1 * rb};
+    };
+    const auto src_range = [](const State& s, const Job& j) {
+      const TensorInfo& t = *j.item->src;
+      const std::uint64_t rb = t.dims[0] / BlockElements(t.type) * BlockBytes(t.type);
+      const std::size_t at = s.src.data_offset_ + t.offset;
+      return std::pair{at + j.r0 * rb, at + j.r1 * rb};
+    };
+    // Stream: the reader fills range k once Prepare handed out range k - 1 (the host holds at most the range in upload
+    // and the next). Copies are read from the file straight into the copy, contiguous jobs in one read, each read's
+    // cached pages dropped (as ReadAll); the other jobs convert as the lazy fill does.
+    g.stream_ = [st, run, range, src_range](std::vector<std::pair<std::size_t, std::size_t>> ranges) {
+      State& s = *st;
+      if (s.reader.joinable() || !s.ranges.empty()) throw std::runtime_error("gguf: Stream called twice");
+      s.ranges = std::move(ranges);
+      ::posix_fadvise(s.src.fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+      s.reader = std::thread([&s, run, range, src_range] {
+        try {
+          std::size_t j = 0;
+          for (std::size_t k = 0; k < s.ranges.size(); ++k) {
+            {
+              std::unique_lock<std::mutex> l(s.mu);
+              s.cv.wait(l, [&] { return s.stop || s.handed >= k; });
+              if (s.stop) return;
+            }
+            const auto [offset, len] = s.ranges[k];
+            while (j < s.jobs.size() && range(s.jobs[j]).second <= offset) ++j;
+            std::size_t j1 = j;
+            while (j1 < s.jobs.size() && range(s.jobs[j1]).first < offset + len) ++j1;
+            for (std::size_t i = j; i < j1;) {
+              if (s.jobs[i].item->kind != Kind::kCopy || !s.jobs[i].item->src) {
+                std::size_t e = i + 1;
+                while (e < j1 && (s.jobs[e].item->kind != Kind::kCopy || !s.jobs[e].item->src)) ++e;
+                run(s, i, e, false);
+                i = e;
+                continue;
+              }
+              auto [d0, d1] = range(s.jobs[i]);
+              auto [f0, f1] = src_range(s, s.jobs[i]);
+              for (++i; i < j1 && s.jobs[i].item->kind == Kind::kCopy && s.jobs[i].item->src && d1 - d0 < (std::size_t{256} << 20);
+                   ++i) {
+                const auto [e0, e1] = range(s.jobs[i]);
+                const auto [g0, g1] = src_range(s, s.jobs[i]);
+                if (e0 != d1 || g0 != f1) break;
+                d1 = e1, f1 = g1;
+              }
+              for (std::size_t done = 0; done < d1 - d0;) {
+                const ssize_t n = ::pread(s.src.fd_, s.base + d0 + done, d1 - d0 - done, static_cast<off_t>(f0 + done));
+                if (n <= 0) throw std::runtime_error("gguf: read failed in the streamed fill");
+                done += static_cast<std::size_t>(n);
+              }
+              ::posix_fadvise(s.src.fd_, static_cast<off_t>(f0), static_cast<off_t>(f1 - f0), POSIX_FADV_DONTNEED);
+            }
+            j = j1;
+            {
+              const std::lock_guard<std::mutex> l(s.mu);
+              s.filled = k + 1;
+            }
+            s.cv.notify_all();
+          }
+        } catch (const std::exception& e) {
+          {
+            const std::lock_guard<std::mutex> l(s.mu);
+            s.error = e.what();
+          }
+          s.cv.notify_all();
+        }
+      });
+    };
+    // streamed: wait for the reader's range (Prepare takes the ranges in Stream's order); else the jobs overlapping the
+    // range run here, those wholly before it skipped (tensors the device does not take)
+    g.fill_ = [st, run, range](std::size_t offset, std::size_t len) {
+      if (!st->ranges.empty()) {
+        State& s = *st;
+        std::unique_lock<std::mutex> l(s.mu);
+        const std::size_t k = s.handed;
+        if (k >= s.ranges.size() || s.ranges[k] != std::pair{offset, len})
+          throw std::runtime_error("gguf: Prepare out of the streamed order");
+        s.cv.wait(l, [&] { return s.filled > k || !s.error.empty(); });
+        if (!s.error.empty()) throw std::runtime_error(s.error);
+        s.handed = k + 1;
+        l.unlock();
+        s.cv.notify_all();
+        return;
+      }
       std::size_t j0 = st->next;
       while (j0 < st->jobs.size() && range(st->jobs[j0]).second <= offset) ++j0;
       std::size_t j1 = j0;
