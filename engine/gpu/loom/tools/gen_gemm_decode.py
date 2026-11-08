@@ -1621,6 +1621,105 @@ def iq4xs_setup():
     return L
 
 
+def q2k_loads(p, blk, gb):
+    """block_q2_K (84 B): scales[16] @0 (scale low nibble, min high nibble per 16 elements), qs[64] @16, d f16 @80,
+    dmin f16 @82. Group g, half = g/4, sp = g%4: element h16*16 + j reads bits 2sp, 2sp+1 of qs[32*half + 16*h16 + j]
+    with scales[2g + h16] (Q3_K's qs layout)."""
+    L = []
+    e = L.append
+    vals = []
+    _ldv(e, p, "q2sc", blk, 16)
+    e(f"    %{p}q2h_o = scalar.addi {blk}, %q2c68i : i32")
+    _ldv(e, p, "q2hdr", f"%{p}q2h_o", 16)
+    vals += [(f"%{p}q2sc", "vector<16xi8>"), (f"%{p}q2hdr", "vector<16xi8>")]
+    for u in range(GPL):
+        e(f"    %{p}g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %{p}hf{u} = scalar.shrui %{p}g{u}, %q2c2i : i32")
+        e(f"    %{p}hf32_{u} = scalar.shli %{p}hf{u}, %q2c5i : i32")
+        e(f"    %{p}qo{u} = scalar.addi {blk}, %{p}hf32_{u} : i32")
+        e(f"    %{p}qa_o{u} = scalar.addi %{p}qo{u}, %q2c16i : i32")
+        e(f"    %{p}qb_o{u} = scalar.addi %{p}qo{u}, %q2c32i : i32")
+        _ldv(e, p, f"qa{u}", f"%{p}qa_o{u}", 16)
+        _ldv(e, p, f"qb{u}", f"%{p}qb_o{u}", 16)
+        vals += [(f"%{p}qa{u}", "vector<16xi8>"), (f"%{p}qb{u}", "vector<16xi8>")]
+    return L, vals
+
+
+def q2k_compute(v, gb):
+    """Q2_K element decode in ggml's dequantize_row_q2_K order:
+      q = (qs >> 2sp) & 3, value = (d * f32(sc & 15)) * f32(q) - dmin * f32(sc >> 4)"""
+    L = []
+    e = L.append
+    it = iter(v)
+    sc = next(it); hdr = next(it)
+    # window bytes 68..83: word 3 = d | dmin << 16
+    e(f"    %q2hw = vector.bitcast {hdr} : vector<16xi8> to vector<4xi32>")
+    e("    %q2hw3 = vector.extract %q2hw[3] : vector<4xi32> -> i32")
+    e("    %q2d16 = scalar.trunci %q2hw3 : i32 to i16")
+    e("    %q2m0 = scalar.shrui %q2hw3, %q2c16i : i32")
+    e("    %q2m16 = scalar.trunci %q2m0 : i32 to i16")
+    e("    %q2dh = scalar.bitcast %q2d16 : i16 to f16")
+    e("    %q2mh = scalar.bitcast %q2m16 : i16 to f16")
+    e("    %q2d = scalar.extf %q2dh : f16 to f32")
+    e("    %q2dm = scalar.extf %q2mh : f16 to f32")
+    e(f"    %q2sw = vector.bitcast {sc} : vector<16xi8> to vector<4xi32>")
+    for w in range(4):
+        e(f"    %q2sw{w} = vector.extract %q2sw[{w}] : vector<4xi32> -> i32")
+    for u in range(GPL):
+        qa = next(it); qb = next(it)
+        e(f"    %q2g{u} = scalar.addi {gb}, %c{u}i : i32")
+        e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
+        # scales[2g], [2g + 1]: word g >> 1, its low (g even) or high 16 bits
+        e(f"    %q2gw{u} = scalar.shrui %q2g{u}, %q2c1i : i32")
+        e(f"    %q2z{u} = scalar.cmpi eq, %q2gw{u}, %q2c0i : i32")
+        e(f"    %q2o{u} = scalar.cmpi eq, %q2gw{u}, %q2c1i : i32")
+        e(f"    %q2t{u} = scalar.cmpi eq, %q2gw{u}, %q2c2i : i32")
+        e(f"    %q2s23_{u} = scf.select %q2t{u}, %q2sw2, %q2sw3 : i32")
+        e(f"    %q2s123_{u} = scf.select %q2o{u}, %q2sw1, %q2s23_{u} : i32")
+        e(f"    %q2wd{u} = scf.select %q2z{u}, %q2sw0, %q2s123_{u} : i32")
+        e(f"    %q2g1_{u} = scalar.andi %q2g{u}, %q2c1i : i32")
+        e(f"    %q2odd{u} = scalar.cmpi eq, %q2g1_{u}, %q2c1i : i32")
+        e(f"    %q2wh{u} = scalar.shrui %q2wd{u}, %q2c16i : i32")
+        e(f"    %q2pr{u} = scf.select %q2odd{u}, %q2wh{u}, %q2wd{u} : i32")
+        e(f"    %q2sa{u} = scalar.andi %q2pr{u}, %q2c255i : i32")
+        e(f"    %q2sb0_{u} = scalar.shrui %q2pr{u}, %q2c8i : i32")
+        e(f"    %q2sb{u} = scalar.andi %q2sb0_{u}, %q2c255i : i32")
+        e(f"    %q2sp{u} = scalar.andi %q2g{u}, %q2c3i : i32")
+        e(f"    %q2ls{u} = scalar.shli %q2sp{u}, %q2c1i : i32")
+        e(f"    %q2lsw{u} = vector.splat %q2ls{u} : vector<4xi32>")
+        _col_of(e, u)
+        e(f"    %colh{u} = index.add %col{u}, %c16 : index")
+        for hn, q, sb, col in (("lo", qa, f"%q2sa{u}", f"%col{u}"), ("hi", qb, f"%q2sb{u}", f"%colh{u}")):
+            t = f"{hn}{u}"
+            e(f"    %q2qw{t} = vector.bitcast {q} : vector<16xi8> to vector<4xi32>")
+            e(f"    %q2lw{t} = vector.shrui %q2qw{t}, %q2lsw{u} : vector<4xi32>")
+            e(f"    %q2low{t} = vector.andi %q2lw{t}, %q2m3w : vector<4xi32>")
+            e(f"    %q2qn{t} = vector.bitcast %q2low{t} : vector<4xi32> to vector<16xi8>")
+            e(f"    %q2qf{t} = vector.uitofp %q2qn{t} : vector<16xi8> to vector<16xf32>")
+            e(f"    %q2s4{t} = scalar.andi {sb}, %q2c15i : i32")
+            e(f"    %q2m4{t} = scalar.shrui {sb}, %q2c4i : i32")
+            e(f"    %q2s4f{t} = scalar.sitofp %q2s4{t} : i32 to f32")
+            e(f"    %q2m4f{t} = scalar.sitofp %q2m4{t} : i32 to f32")
+            e(f"    %q2dl{t} = scalar.mulf %q2d, %q2s4f{t} : f32")
+            e(f"    %q2ml{t} = scalar.mulf %q2dm, %q2m4f{t} : f32")
+            e(f"    %q2dv{t} = vector.splat %q2dl{t} : vector<16xf32>")
+            e(f"    %q2mv{t} = vector.splat %q2ml{t} : vector<16xf32>")
+            e(f"    %q2p{t} = vector.mulf %q2dv{t}, %q2qf{t} : vector<16xf32>")
+            e(f"    %q2v{t} = vector.subf %q2p{t}, %q2mv{t} : vector<16xf32>")
+            e(f"    %q2h{t} = vector.fptrunc %q2v{t} : vector<16xf32> to vector<16xf16>")
+            e(f"    vector.store %q2h{t}, %wl_view[%drow, {col}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
+    return L
+
+
+def q2k_setup():
+    return ["  %q2c0i = scalar.constant 0 : i32", "  %q2c1i = scalar.constant 1 : i32", "  %q2c2i = scalar.constant 2 : i32",
+            "  %q2c3i = scalar.constant 3 : i32", "  %q2c4i = scalar.constant 4 : i32", "  %q2c5i = scalar.constant 5 : i32",
+            "  %q2c8i = scalar.constant 8 : i32", "  %q2c15i = scalar.constant 15 : i32",
+            "  %q2c16i = scalar.constant 16 : i32", "  %q2c32i = scalar.constant 32 : i32",
+            "  %q2c68i = scalar.constant 68 : i32", "  %q2c255i = scalar.constant 255 : i32",
+            "  %q2k3 = scalar.constant 50529027 : i32", "  %q2m3w = vector.splat %q2k3 : vector<4xi32>"]
+
+
 def q3k_loads(p, blk, gb):
     """block_q3_K (110 B): hmask[32] @0, qs[64] @32, scales[12] @96, d f16 @108.
     Group g, half = g/4, sp = g%4: element h16*16 + j reads bits 2sp, 2sp+1 of qs[32*half + 16*h16 + j], bit g of hmask[16*h16 + j].
@@ -1850,6 +1949,7 @@ FMTS = {
     "mq4": dict(bb=136, ksub=64, decode=(mq4_loads, mq4_compute), extra=[], setup=mq4_setup),
     "q6k": dict(bb=210, ksub=64, decode=(q6k_loads, q6k_compute), extra=[], setup=q6k_setup),
     "q3k": dict(bb=110, ksub=64, decode=(q3k_loads, q3k_compute), extra=[], setup=q3k_setup),
+    "q2k": dict(bb=84, ksub=64, decode=(q2k_loads, q2k_compute), extra=[], setup=q2k_setup),
     "iq2xxs": dict(bb=66, ksub=64, decode=(iq2xxs_loads, iq2xxs_compute), extra=["grid", "ksigns"], setup=iq2xxs_setup),
     "iq2xs": dict(bb=74, ksub=64, decode=(iq2xs_loads, iq2xs_compute), extra=["grid", "ksigns"], setup=iq2xs_setup),
     "iq2s": dict(bb=82, ksub=64, decode=(iq2s_loads, iq2s_compute), extra=["grid"], setup=iq2s_setup),
