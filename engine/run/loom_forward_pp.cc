@@ -145,6 +145,8 @@ int main(int argc, char** argv) {
   const std::string prefix = argv[3];
   const std::uint32_t want = std::strtoul(argv[4], nullptr, 10);
   const char* ids_path = argv[5];
+  // A bench run holds most of the machine's memory: if it runs out, the OOM killer takes this process, not the desktop
+  if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) std::fputs("1000", f), std::fclose(f);
   try {
     // a native set (emit_prefill_pp.py YAH_NATIVE=1) runs the GGUF's own formats
     const bool native = [&] {
