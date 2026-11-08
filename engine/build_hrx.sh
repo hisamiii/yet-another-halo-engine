@@ -69,6 +69,12 @@ fi
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/attn_bench.cc" \
     -o "$root/engine/build/attn_bench" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+# GPU / NPU split of one GEMM (tools/npu_split_check.py); NPU builds only.
+if [ ${#npu_flags[@]} -gt 0 ]; then
+  "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/npu_split_run.cc" \
+      -o "$root/engine/build/npu_split_run" "$root/engine/build/libyah_core.a" \
+      "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+fi
 # The Responses API server (engine/serve).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" \
     "$root/engine/serve/yah_server.cc" "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \

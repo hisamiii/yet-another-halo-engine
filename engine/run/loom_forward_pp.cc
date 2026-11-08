@@ -14,9 +14,7 @@
 //   --slot-save <file> [--slot-at C]  save the sequence state before chunk C (default: after the last)
 //   --slot-load <file>  restore a slot and run from the chunk it covers (marginal prefill at depth)
 //   --chunk-ms          print each chunk's wall time (synchronizes after every chunk)
-//   --pairs             full chunks two at a time, layer by layer (LoomPrefill::RunPair: the NPU block of one chunk
-//                       runs while the GPU runs the other's layer)
-//   --npu               the NPU runs the set's FFN block (tools/emit_npu_ffn.py)
+//   --npu               the NPU computes the trailing rows of the set's split GEMMs (emit_prefill_pp.py YAH_NPU_SPLIT)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -93,7 +91,7 @@ struct Options {
   std::uint32_t gen = 0, slot_at = ~0u, rowstats_from = 1024, rowstats_stride = 8;
   std::int64_t logits_from = -1;
   std::string decode, rowstats, rowstats_pos, slot_save, slot_load;
-  bool chunk_ms = false, pairs = false, npu = false;
+  bool chunk_ms = false, npu = false;
 };
 
 bool ParseOptions(int argc, char** argv, Options* o) {
@@ -123,8 +121,6 @@ bool ParseOptions(int argc, char** argv, Options* o) {
       o->slot_load = argv[++i];
     else if (a == "--chunk-ms")
       o->chunk_ms = true;
-    else if (a == "--pairs")
-      o->pairs = true;
     else if (a == "--npu")
       o->npu = true;
     else
@@ -176,20 +172,23 @@ int main(int argc, char** argv) {
     // a native set's prefill reads neither the MTP layer nor token_embd's device copy (Embed stages its rows); the
     // decode's embed kernel reads token_embd's
     const std::string mtp = "blk." + std::to_string(cfg.main_block_count()) + ".";
-    LoomWeights weights(gpu, gguf, [&](const std::string& n) {
-      return native && ((n == "token_embd.weight" && opt.gen == 0) || n.starts_with(mtp));
-    });
+    // --npu: the GPU reads the resident copy in place (the NPU reads its rows through host pointers)
+    LoomWeights weights(
+        gpu, gguf,
+        [&](const std::string& n) {
+          return native && ((n == "token_embd.weight" && opt.gen == 0) || n.starts_with(mtp));
+        },
+        opt.npu);
     lap("weights");
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
     lap("prefill set");
-    if (opt.pairs) pf.EnablePairs();
 #ifdef YAH_WITH_NPU
     yah::model::DpmPin dpm;  // (the level restored after the NPU stops)
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
     if (opt.npu) {
       const auto plan = pf.npu_plan();
       if (plan.a_bytes == 0) {
-        std::fprintf(stderr, "--npu: needs a set with the NPU FFN block (emit_npu_ffn.py)\n");
+        std::fprintf(stderr, "--npu: needs a set with the NPU split (emit_prefill_pp.py YAH_NPU_SPLIT)\n");
         return 2;
       }
       if (const std::string why = dpm.Pin(); !why.empty()) {
@@ -198,6 +197,12 @@ int main(int argc, char** argv) {
       }
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
       pf.EnableNpu(npu.get());
+      lap("npu enable");
+      // full chunks only: every split GEMM leaves the NPU's rows to the NPU, so the model rows its own copies replace
+      // (pre-decoded / transcoded rows) are not kept
+      if (want && want % pf.chunk() == 0)
+        std::fprintf(stderr, "loom_forward_pp: released %.2f GB of model rows the NPU reads from its copies\n",
+                     weights.DropUnread(gpu, gguf, pf.npu_only()) / 1e9);
     }
 #else
     if (opt.npu) throw LoomError("--npu: this build has no NPU support");
@@ -256,25 +261,6 @@ int main(int argc, char** argv) {
     const bool chunk_ms = opt.chunk_ms;
     auto tc = t0;
     for (std::uint32_t ci = ci0; ci < n_chunks; ++ci) {
-      // --pairs: two full chunks at a time (LoomPrefill::RunPair)
-      if (pf.pairs() && ci + 1 < n_chunks && (ci + 2 < n_chunks || last_n == B)) {
-        if (rowstats || slot_save) throw LoomError("--pairs runs without --rowstats / --slot-save");
-        const auto keep = [&](std::uint32_t c) {
-          return logits_from < std::min((c + 1) * B, T_run) ? LoomPrefill::kAllRows
-                 : c + 1 == n_chunks                        ? std::int64_t{last_n} - 1
-                                                            : LoomPrefill::kNoRows;
-        };
-        for (std::uint32_t p = 0; p < 2; ++p) pf.SelectChunk(p), pf.Embed(ids.data() + std::size_t{ci + p} * B, B);
-        pf.RunPair(ci, keep(ci), keep(ci + 1));
-        for (std::uint32_t p = 0; p < 2; ++p) {
-          pf.SelectChunk(p);
-          const std::uint32_t c = ci + p;
-          for (std::uint32_t ra = std::max(logits_from, c * B); ra < std::min((c + 1) * B, T_run); ++ra)
-            pf.Head(ra - c * B, {every.handle, std::size_t{ra - logits_from} * kVocab * 4, std::size_t{kVocab} * 4});
-        }
-        ++ci;
-        continue;
-      }
       if (slot_save && ci == slot_at) pf.SaveState(slot_save, ci);
       pf.Embed(ids.data() + std::size_t{ci} * B, ci + 1 == n_chunks ? last_n : B);
       // the last layer's tail only for the rows read below: every row for logits_from / rowstats, else the last row
@@ -316,6 +302,8 @@ int main(int argc, char** argv) {
     std::printf("layers_ms=%.1f\n", layer_ms);
 #ifdef YAH_WITH_NPU
     if (npu) npu->Report(stdout);
+    pf.ReportWaitLog(stdout);
+    pf.ReportNpuProf();
 #endif
 
     {

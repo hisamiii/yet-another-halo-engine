@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -25,8 +26,8 @@ struct MemoryPlan {
   [[nodiscard]] std::uint64_t need() const { return weights + buffers; }
   [[nodiscard]] bool fits() const { return need() + kReserve <= available; }
 
-  // model: the model file; decode_hal: its decode set (context and KV format); npu_set: the prefill set the NPU runs
-  // the FFN block of, empty without the NPU; mtp: drafting with the MTP layer.
+  // model: the model file; decode_hal: its decode set (context and KV format); npu_set: the prefill set whose NPU split
+  // runs, empty without the NPU; mtp: drafting with the MTP layer.
   static MemoryPlan For(const std::string& model, const std::string& decode_hal, const std::string& npu_set, bool mtp) {
     std::ifstream f(decode_hal + "/decode.txt");
     if (!f) throw LoomError("cannot read " + decode_hal + "/decode.txt: not a decode set (tools/emit_decode.py)");
@@ -52,15 +53,13 @@ struct MemoryPlan {
     // format's bits plus scales), f32 / f16 attention scratch and the MTP layer's f16 KV.
     const std::uint64_t kv = 16ull * 1024 * (kb + vb) / 8 * 33 / 32;
     p.buffers = kFixed + std::uint64_t{p.context} * (kv + kScratchPerToken + (mtp ? kMtpPerToken : 0));
-    if (!npu_set.empty()) {  // the down pack: 64 layers of 5120 IQ4_XS rows over the NPU's F features (npu.txt; none
-                             // in a native set, whose NPU reads the model's rows)
-      std::ifstream n(npu_set + "/npu.txt");
-      std::string key, rest;
-      std::uint64_t F = 0;
-      bool native = false;
-      n >> key >> F;
-      while (n >> rest) native |= rest == "npunative";
-      p.buffers += (key == "npuffn" && !native ? 64ull * 5120 * F / 256 * 136 : 0) + kNpuFixed;
+    if (!npu_set.empty()) {  // the NPU's own rows, read into memory (pre-decoded and transcoded: npu_bfp_*, npu_ix4_*)
+      std::error_code ec;
+      for (const auto& e : std::filesystem::directory_iterator(npu_set, ec)) {
+        const std::string n = e.path().filename().string();
+        if (n.starts_with("npu_bfp_") || n.starts_with("npu_ix4_")) p.buffers += e.file_size(ec);
+      }
+      p.buffers += kNpuFixed;
     }
     p.available = Available();
     return p;

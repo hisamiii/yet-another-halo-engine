@@ -11,6 +11,13 @@
 #ifndef YAH_MODEL_LOOM_PREFILL_HPP_
 #define YAH_MODEL_LOOM_PREFILL_HPP_
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <thread>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -26,14 +33,16 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "core/config.hpp"
 #include "core/gguf.hpp"
+#include "core/gguf_quant.hpp"
 #include "model/loom_decoder.hpp"
 #include "model/loom_runtime.hpp"
-#include "model/npu_down_pack.hpp"
+#include "model/npu_prof.hpp"
 #include "model/npu_split.hpp"
 
 namespace yah::model {
@@ -60,6 +69,7 @@ class LoomPrefill {
       T_ = it->second.tt;
     }
     if (B_ == 0) throw LoomError("prefill: a one-pass set needs the token count");
+    LoadHalves();
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l)
       if (cfg_.IsFullAttention(l)) ++full_;
     LoadTables();
@@ -77,27 +87,123 @@ class LoomPrefill {
   }
   LoomBuffer& hidden() { return *hidden_; }
 
-  // Chunk pairs (RunPair): two full chunks recorded layer by layer, so the NPU's FFN block of one runs while the GPU
-  // runs the other's layer. Each chunk of a pair has its own residual rows, ids and NPU A / C half; SelectChunk(p)
-  // picks the one Embed, Head and hidden() see. Before npu_plan() / EnableNpu.
-  void EnablePairs() {
-    if (pairs_) return;
-    pairs_ = true;
-    other_ = {&Alloc(std::size_t{B_} * kHidden * 4), &Alloc(std::size_t{B_} * kHidden * 4), &Alloc(std::size_t{B_} * 4),
-              &Alloc(4), embed_rows_ ? &Alloc(host_rows_[0].size()) : nullptr};
-    // a chained DeltaNet tail leaves its outputs to the next layer of its chunk untracked: the other chunk's layer
-    // runs between them here
-    dnring_ = false;
+  // Buffer sizes of the NPU column split this set carries (dispatch.txt "npusplit_<site>", "npubytes_<K>"); zero: none.
+  // A job is the NPU work behind one cut: the DeltaNet qkv + gate, or one other site; the buffers fit the largest
+  // (W twice).
+  // After EnableNpu: the model rows only the NPU reads (from its own copies, NpuOnly). Only a GEMM over all rows reads
+  // them otherwise, which an unsplit (partial) chunk or decode runs: LoomWeights::DropUnread for full chunks only.
+  [[nodiscard]] const std::vector<std::pair<std::size_t, std::size_t>>& npu_only() const { return npu_only_; }
+  [[nodiscard]] NpuPlan npu_plan() const {
+    NpuPlan p = WholePlan();
+    if (!hgeom_.empty() && p.dcol) {  // token halves: their A slots and C regions (HalfA, HalfC)
+      p.a_bytes = std::max(p.a_bytes, 6 * HNpuK(5120).a);
+      p.c_bytes = std::max(p.c_bytes, HalfC(1) + HalfCBytes());
+    }
+    return p;
   }
-  [[nodiscard]] bool pairs() const { return pairs_; }
-  void SelectChunk(std::uint32_t p) {
-    if (p > 1 || (p && !pairs_)) throw LoomError("prefill: no such chunk of a pair");
-    if (p == par_) return;
-    FlushKres();
-    std::swap(hidden_, other_.hidden), std::swap(hidden2_, other_.hidden2), std::swap(ids_, other_.ids);
-    std::swap(valid_, other_.valid), std::swap(n_, other_.n), std::swap(keep_rows_, other_.keep);
-    std::swap(embed_rows_, other_.rows);
-    par_ = p;
+  // The NPU buffers of the whole-chunk jobs.
+  [[nodiscard]] NpuPlan WholePlan() const {
+    NpuPlan p;
+    const auto need = [&](const std::string& site) {
+      const auto it = geom_.find("npusplit_" + site);
+      NpuPlan q;
+      if (it == geom_.end()) return q;
+      const std::size_t calls = it->second.tokens / NpuCallRows(), mats = site == "ffn" ? 2 : 1;
+      for (const auto& [k0, K] : NpuChunks(site)) {
+        const NpuBytes nb = NpuK(K);
+        q.a_bytes += nb.a, q.w_bytes += mats * calls * nb.w, q.c_bytes += mats * calls * nb.c;
+      }
+      return q;
+    };
+    const NpuPlan qkv = need("qkv"), gate = need("gate");
+    for (const NpuPlan& q : {NpuPlan{std::max(qkv.a_bytes, gate.a_bytes), qkv.w_bytes + gate.w_bytes,
+                                     qkv.c_bytes + gate.c_bytes},
+                             need("q"), need("out"), need("down"), need("ffn")})
+      p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.w_bytes = std::max(p.w_bytes, q.w_bytes),
+      p.c_bytes = std::max(p.c_bytes, q.c_bytes);
+    p.w_bytes *= 2;   // two slots: a job's weights are decoded while the previous job runs (NpuDecode)
+    if (FfnBlkF()) {   // the FFN block: gate / up's activations; H and down's partials in C
+      p.a_bytes = std::max(p.a_bytes, NpuK(5120).a);
+      const auto parts = FfnBlkParts(FfnBlkF());
+      p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls() *
+                                                         NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c);
+    }
+    p.dcol = geom_.count("npudcol") != 0;
+    p.gfirst = geom_.count("npugfirst") != 0;
+    if (p.dcol) {
+      // the NPU decodes raw rows: W is one call's unread panel binding; A holds the p4 stream, then the pk one (Q4_K)
+      p.w_bytes = NpuK(5120).w;
+      p.a_bytes *= 2;
+    }
+    if (const auto it = geom_.find("npugate"); it != geom_.end())
+      p.gate_calls = it->second.rowgrp, p.gate_record = it->second.tt;
+    return p;
+  }
+  // YAH_NPU_WAITLOG: after the run, one line per GPU wait for an NPU job (layer, the job's tag, polls of its done word,
+  // ~0.2 us each) and the polls per tag. Waits inside a GEMM epilogue (NPUADD) are not logged.
+  void ReportWaitLog(std::FILE* f) {
+    if (!waitlog_) return;
+    std::vector<std::uint32_t> polls(waitlog_tag_.size());
+    gpu_.D2H(*waitlog_, polls.data(), polls.size() * 4);
+    std::map<std::string, std::uint64_t> per_tag;
+    for (std::size_t i = 0; i < polls.size(); ++i) {
+      std::fprintf(f, "npu wait: %zu %s %u\n", i, waitlog_tag_[i].c_str(), polls[i]);
+      per_tag[waitlog_tag_[i].substr(waitlog_tag_[i].find(' ') + 1)] += polls[i];
+    }
+    for (const auto& [tag, n] : per_tag)
+      std::fprintf(f, "npu wait: %-8s %llu polls\n", tag.c_str(), static_cast<unsigned long long>(n));
+  }
+  // YAH_NPU_PROF in a GPU + NPU run: after it, the first NPU chunk's per-job counters as CPU-driven runs print them
+  // (tools/npu_prof.py; no per-job host time: 0).
+  void ReportNpuProf() {
+    NpuProf* const prof = npu_ ? npu_->Prof() : nullptr;
+    if (!prof || prof_tags_.empty()) return;
+    const std::vector<std::uint32_t> v = prof->Finish(prof_tags_.size());
+    std::fprintf(stderr, "npu prof: events %s\n", std::getenv("YAH_NPU_PROF"));
+    for (std::size_t i = 0; i < prof_tags_.size(); ++i) {
+      std::fprintf(stderr, "npu prof: job %zu %s 0", i, prof_tags_[i].c_str());
+      for (std::uint32_t k = 0; k < NpuProf::kValues; ++k) std::fprintf(stderr, " %u", v[i * NpuProf::kValues + k]);
+      std::fprintf(stderr, "\n");
+    }
+  }
+  // Split the set's NPU sites of full chunks with the NPU from now on: it computes their trailing npusplit rows.
+  // npu (built from npu_plan()) outlives this object.
+  void EnableNpu(NpuSplit* npu) {
+    for (const auto& [name, g] : geom_)
+      if (name.rfind("npusplit_", 0) == 0) npu_rows_[name.substr(9)] = g.tokens;
+    ffnblk_ = FfnBlkF();
+    if (!npu || (npu_rows_.empty() && !ffnblk_)) throw LoomError("prefill: the set has no NPU split");
+    if (!geom_.count("npu_flag_wait.hal") || !geom_.count("npugate"))
+      throw LoomError("prefill: the set has no gated NPU handoffs (npu_flag_wait.hal, npugate; re-emit it)");
+    npu_ = npu;
+    npu_dcol_ = geom_.count("npudcol") != 0;
+    halves_ = !hgeom_.empty() && npu_dcol_;
+    if (halves_ && geom_.count("dnperm")) throw LoomError("dnperm sets have no token-half DeltaNet");
+    if (halves_ && (npu_->A().size < 6 * HNpuK(5120).a || npu_->C().size < HalfC(1) + HalfCBytes()))
+      throw LoomError("prefill: the NPU buffers lack the token halves' slots (build the split from npu_plan())");
+    std::size_t rem = 0;
+    for (const auto& [site, rows] : npu_rows_)
+      if (NpuRem(site)) rem = std::max<std::size_t>(rem, std::size_t{B_} * rows * 4);
+    if (rem) npurem_ = &Alloc(rem);
+    if (ffnblk_ && geom_.count("npu_unpack_ffnblk.hal")) ffnrem_ = &Alloc(std::size_t{B_} * kHidden * 4);   // (npuffnrem)
+    if (std::getenv("YAH_NPU_WAITLOG")) {
+      if (!geom_.count("npu_flag_wait_log.hal"))
+        throw LoomError("YAH_NPU_WAITLOG: the set has no npu_flag_wait_log.hal (re-emit it)");
+      waitlog_ = &Alloc(kWaitLogSlots * 4);
+    }
+    // Bind every NPU call of a full chunk now (a pass of the layers that dispatches nothing): a first bind loads the
+    // image's storage and patches it, milliseconds per call.
+    LoomBuffer *h = hidden_, *h2 = hidden2_;
+    const std::uint32_t n = n_;
+    n_ = B_, npu_on_ = true, npu_planning_ = true;
+    planned_dq_.clear();
+    npu_job_ = 0;
+    NewGraph();
+    RecordLayers(0, {});
+    npu_->EndBinding();
+    chunk_graph_.reset();
+    graph_ = nullptr, n_ = n, npu_on_ = false, npu_planning_ = false;
+    hidden_ = h, hidden2_ = h2;
   }
 
   // Zero the recurrent state before a new sequence. KV rows need no reset: attention reads only keys <= the query.
@@ -108,33 +214,6 @@ class LoomPrefill {
   // The recurrent state (conv rings, DeltaNet states) that chunks carry forward and DecoderState() hands on.
   [[nodiscard]] hrx_buffer_ref_t conv_state() const { return Ref(*conv_state_); }
   [[nodiscard]] hrx_buffer_ref_t delta_state() const { return Ref(*state_); }
-
-  // The NPU FFN block (npu.txt, tools/emit_npu_ffn.py): the NPU owns the FFN's last F features of every layer. Its
-  // gate / up calls (npu_ffnsw.xdna, F / 256 of them: call j's column c takes features G + 256 j + 32 c + [0, 32) of the
-  // G = 17408 - F the GPU leaves, gate rows and up rows decoded on the NPU from the weight chunks) write H =
-  // bfp16(silu(gate) up) into C, [M block][pass][16-token slab][128 k-blocks]; its down calls (npu_ffndn<passes>.xdna,
-  // per K part of F, kDownCalls calls of 512 rows) read H and decode IQ4_XS rows (npu_down_pack.hpp: down's rows
-  // unrotated, its awq folded in, re-quantized) and write their partials after H. The GPU runs gate / up and down over the first G features
-  // into hidden2, then npu_unpack_ffn.hal adds the NPU's partials into hidden.
-  // npu_plan: the sizes LoomNpuSplit needs (a_bytes 0: the set has no block).
-  [[nodiscard]] NpuPlan npu_plan() const {
-    NpuPlan p;
-    if (!FfnF()) return p;
-    for (const auto& [name, g] : geom_)   // (W: the images' panel binding, not read)
-      if (name.rfind("npubytes_", 0) == 0) {
-        if (name.rfind("npubytes_ffnsw", 0) == 0) p.a_bytes = std::max(p.a_bytes, std::size_t{g.tokens});
-        p.w_bytes = std::max(p.w_bytes, std::size_t{g.rowgrp});
-      }
-    p.c_bytes = NpuCBytes();
-    if (pairs_) p.a_bytes *= 2, p.c_bytes *= 2;   // a half per chunk of a pair
-    p.dcol = p.gfirst = true;
-    const Geom& g = geom_.at("npugate");
-    p.gate_calls = g.rowgrp, p.gate_record = g.tt;
-    return p;
-  }
-  // Full chunks run the block from now on. npu (built from npu_plan()) outlives this object. Packs down's rows for the
-  // NPU (~3 s). layers: only the first that many layers (a test's smaller footprint: their down rows alone are packed).
-  void EnableNpu(NpuSplit* npu, std::uint32_t layers = ~0u);
 
   // Stage ids[0..n) for the next RunLayers, whose first kernel (yah_embed) writes their token_embd rows into hidden().
   // n < B pads the chunk with the last token.
@@ -152,10 +231,10 @@ class LoomPrefill {
     }
     if (embed_rows_) {   // token_embd stays on the host: the chunk's rows staged, the embed reads row t for token t
       // (the slot's staging is rewritten once its last copy landed: the GPU a whole chunk behind the host waits here)
-      std::vector<std::uint8_t>& rows = host_rows_[par_];
-      LoomDevice::WaitFor(rows_copied_[par_]);
+      std::vector<std::uint8_t>& rows = host_rows_;
+      LoomDevice::WaitFor(rows_copied_);
       gguf_.Rows(*Find("token_embd.weight"), host_ids_.data(), B_, rows.data());
-      rows_copied_[par_] = gpu_.StreamH2D(*embed_rows_, rows.data(), rows.size());
+      rows_copied_ = gpu_.StreamH2D(*embed_rows_, rows.data(), rows.size());
       for (std::uint32_t t = 0; t < B_; ++t) host_ids_[t] = t;
     }
     gpu_.Update(*ids_, host_ids_.data(), host_ids_.size() * 4);
@@ -177,17 +256,18 @@ class LoomPrefill {
     if (flags_) gpu_.Fill(*flags_, 0);   // the chunk's completion counters (FlagSlot), in stream order before its work
     // The layers go into one graph, so kernels with no data between them (the input projections of a layer, the DeltaNet
     // gate projection and the conv / DeltaNet chain) can run at the same time.
-    // NPU FFN block: full chunks only, its handoffs graph nodes on flag words (NpuEnqueue / NpuJoin); the jobs are
-    // queued once the chunk's one graph launched
-    // (with pairs, a lone full chunk runs without the NPU too: alone, its layers would wait for the NPU's block)
-    npu_on_ = npu_ && n_ == B_ && !pairs_;
+    // NPU split: full chunks only, its handoffs graph nodes on flag words (NpuEnqueue / NpuJoin)
+    npu_on_ = npu_ && n_ == B_;
     if (npu_on_) npu_->BeginChunk();
-    flagged_.clear(), job_c_.clear();
-    npu_cleared_ = npu_joined_ = 0;
+    flagged_.clear();
+    predecoded_.clear();
+    npu_job_ = 0, npu_cleared_ = 0, npu_joined_ = 0;
+    job_side_.clear();
+    ffn_pending_ = {};
     NewGraph();
     // Layer 0 goes first in a graph of its own, so the GPU runs it while the host records the other layers. The split
     // falls before its deferred down GEMM (the first dispatch while recording layer 1), which waits for all of the
-    // layer's last kernel anyway.
+    // layer's last kernel anyway. The NPU split's flagged jobs keep one graph.
     split_layer_ = !npu_on_ && cfg_.main_block_count() > 1 ? 1 : 0;
     RecordLayers(ci, hook);
     FlushKres();
@@ -195,58 +275,91 @@ class LoomPrefill {
     LaunchChunk();
   }
 
-  // Chunks ci and ci + 1, both full and staged (SelectChunk, Embed), recorded layer by layer: chunk 0's layer l, then
-  // chunk 1's. A chunk's NPU join and unpack of layer l go before its layer l + 1, after the other chunk's layer l, so
-  // the NPU's block of one chunk runs while the GPU runs the other's. keep: per chunk, as RunLayers'.
-  void RunPair(std::uint32_t ci, std::int64_t keep0, std::int64_t keep1) {
-    if (!pairs_) throw LoomError("prefill: RunPair without EnablePairs");
-    if (std::size_t{ci + 2} * B_ > T_) throw LoomError("prefill: chunk past the emitted context");
-    SelectChunk(1);
-    keep_rows_ = keep1;
-    const bool full1 = n_ == B_;
-    SelectChunk(0);
-    keep_rows_ = keep0;
-    if (n_ != B_ || !full1) throw LoomError("prefill: RunPair needs two full chunks");
-    if (flags_) gpu_.Fill(*flags_, 0);
-    npu_on_ = npu_ != nullptr;
-    if (npu_on_) npu_->BeginChunk();
-    flagged_.clear(), job_c_.clear();
-    npu_cleared_ = npu_joined_ = 0;
-    join_[0] = join_[1] = kNoJoin;
-    NewGraph();
-    split_layer_ = 0;
-    flag_slot_ = 0;
-    for (std::uint32_t p = 0; p < 2; ++p) {
-      SelectChunk(p);
-      Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
-               {EmbedTable(), Ref(*ids_), Ref(*hidden_)}, 4);
-    }
-    for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l)
-      for (std::uint32_t p = 0; p < 2; ++p) {
-        SelectChunk(p);
-        JoinFfn();
-        RecordLayer(l, ci + p, {});
-      }
-    for (std::uint32_t p = 0; p < 2; ++p) SelectChunk(p), JoinFfn();
-    FlushKres();
-    LaunchChunk();
-  }
-
   // The recorded chunk's graph to the GPU, its NPU jobs to the NPU.
   void LaunchChunk() {
     graph_ = nullptr;
     std::vector<NpuSplit::Queued> jobs;
-    jobs.swap(flagged_);
-    // YAH_NPU_CPU=1 (a safe test of the NPU side): the host stands in for the GPU, which runs nothing; it stores each
-    // job's ready word, waits up to 1 s for its done word and reports the first job that stalls or fails
-    if (!jobs.empty() && std::getenv("YAH_NPU_CPU")) {
-      NpuCpuDriven(jobs);
+    // YAH_NPU_CPU=1 (safe test of the NPU host path): the host stands in for the GPU, which runs nothing; it stores
+    // each job's ready word, waits up to 1 s for its done word and reports the first job that stalls or fails
+    if (npu_on_ && std::getenv("YAH_NPU_CPU")) {
+      jobs.swap(flagged_);
+      graph_ = nullptr;
+      if (const char* r = std::getenv("YAH_NPU_CPU_JOBS")) {   // "a-b,c-d": only these jobs (whole family runs)
+        if (!std::strcmp(r, "list"))
+          for (std::size_t i = 0; i < jobs.size(); ++i) std::fprintf(stderr, "npu cpu-driven: job %zu %s\n", i, jobs[i].tag.c_str());
+        std::vector<NpuSplit::Queued> kept;
+        std::size_t a = 0, b = 0;
+        for (int n = 0; std::sscanf(r, "%zu-%zu%n", &a, &b, &n) == 2 && a <= b && b < jobs.size(); ++r) {
+          kept.insert(kept.end(), jobs.begin() + a, jobs.begin() + b + 1);
+          r += n;
+          if (*r != ',') break;
+        }
+        jobs.swap(kept);
+        for (const auto& q : jobs) std::fprintf(stderr, "npu cpu-driven: keep %s gate %08x\n", q.tag.c_str(), q.words.gate);
+      }
+      std::thread enq([&] {   // it blocks while the NPU's queue is full, the NPU waits for the stores below
+        try {
+          npu_->Enqueue(jobs);
+        } catch (const std::exception& e) {
+          std::fprintf(stderr, "npu cpu-driven: enqueue: %s\n", e.what());
+        }
+      });
+      struct Join {
+        std::thread& t;
+        ~Join() { t.join(); }
+      } join{enq};
+      std::map<std::string, double> family_ms;
+      NpuProf* const prof = npu_->Prof();
+      std::vector<double> job_ms;
+      for (std::size_t i = 0; i < jobs.size(); ++i) {
+        const NpuSplit::Job& w = jobs[i].words;
+        std::vector<std::uint32_t> before;   // the job's gate slots, to report which words its calls changed
+        for (std::uint32_t k = w.ready; k <= w.done + 16; ++k) before.push_back(npu_->HostLoad(k));
+        if (const char* h = std::getenv("YAH_NPU_CPU_HOLD"); h && std::strtoul(h, nullptr, 10) == i) {
+          // the job parked at its gate (its setup done): the stall command sees the array waiting
+          std::this_thread::sleep_for(std::chrono::milliseconds(300));
+          if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);
+        }
+        npu_->HostStore(w.ready, w.gate);
+        const auto t0 = std::chrono::steady_clock::now();
+        std::uint32_t d = 0;
+        while (((d = npu_->HostLoad(w.done)) & 0x7fffffffu) < w.gate) {
+          if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1)) break;
+        }
+        npu_->HostStore(w.ready, 0), npu_->HostStore(w.done, 0);   // as NpuJoin's stores do
+        // the job's time from its ready store to its done word (its command's setup and image switch included)
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "npu cpu-driven: job %zu %s %.3f ms\n", i, jobs[i].tag.c_str(), ms);
+        job_ms.push_back(ms);
+        family_ms[jobs[i].tag] += ms;
+        if ((d & 0x7fffffffu) < w.gate || (d & 0x80000000u)) {
+          std::fprintf(stderr, "npu cpu-driven: job %zu (%s) stalled or failed: done %08x gate %08x\n", i,
+                       jobs[i].tag.c_str(), d, w.gate);
+          if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);   // e.g. an AIE status dump
+          for (std::uint32_t k = w.ready; k <= w.done + 16; ++k)
+            if (const std::uint32_t v = npu_->HostLoad(k); v != before[k - w.ready])
+              std::fprintf(stderr, "  word +%u: %08x -> %08x\n", k - w.ready, before[k - w.ready], v);
+          return;
+        }
+      }
+      std::fprintf(stderr, "npu cpu-driven: %zu jobs done\n", jobs.size());
+      if (prof) {   // one line per job: its counters (NpuProf::Finish order), for tools/npu_prof.py
+        const std::vector<std::uint32_t> v = prof->Finish(jobs.size());
+        std::fprintf(stderr, "npu prof: events %s\n", std::getenv("YAH_NPU_PROF"));
+        for (std::size_t i = 0; i < jobs.size(); ++i) {
+          std::fprintf(stderr, "npu prof: job %zu %s %.3f", i, jobs[i].tag.c_str(), job_ms[i]);
+          for (std::uint32_t k = 0; k < NpuProf::kValues; ++k) std::fprintf(stderr, " %u", v[i * NpuProf::kValues + k]);
+          std::fprintf(stderr, "\n");
+        }
+      }
+      for (const auto& [tag, ms] : family_ms) std::fprintf(stderr, "npu cpu-driven: %-8s %8.1f ms\n", tag.c_str(), ms);
+      if (const char* cmd = std::getenv("YAH_NPU_CPU_DONE_CMD")) std::system(cmd);
       return;
     }
-    // YAH_NPU_FAKE=1 (a timing test): the NPU runs nothing and the graph does not wait for it, so the run takes the
-    // GPU's share of the block alone (the NPU's partials are garbage)
-    if (std::getenv("YAH_NPU_FAKE")) jobs.clear();
     chunk_graph_->Launch();
+    jobs.swap(flagged_);
+    if (npu_ && npu_->Prof() && !jobs.empty() && prof_tags_.empty())   // the first NPU chunk's jobs (ReportNpuProf)
+      for (const auto& q : jobs) prof_tags_.push_back(q.tag);
     if (!jobs.empty()) {
       try {
         npu_->Enqueue(jobs);   // on a failure it releases the graph's waits for the jobs left
@@ -263,32 +376,45 @@ class LoomPrefill {
     Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
              {EmbedTable(), Ref(*ids_), Ref(*hidden_)}, 4);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) RecordLayer(l, ci, hook);
-    JoinFfn();
+    FfnUnpackPending(-1);
   }
   void RecordLayer(std::uint32_t l, std::uint32_t ci, const KvHook& hook) {
     const std::string pre = "blk." + std::to_string(l) + ".";
     split_armed_ = split_layer_ && l == split_layer_;
-    npu_layer_ = l;
+    layer_ = l;
     tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
     if (cfg_.IsFullAttention(l)) {
       const bool q_af = Af("gemm_kqg", pre + "attn_q.weight");
       const bool k_af = Af("gemm_kstore", pre + "attn_k.weight");
       const bool v_af = Af("gemm_kstore", pre + "attn_v.weight");
-      nq_want_ = nqw_;
-      RunNorm(pre + "attn_norm.weight",
-              q_af && k_af && v_af   ? NormOut::kTiled
-              : q_af || k_af || v_af ? NormOut::kBoth
-                                     : NormOut::kRow);
-      nq_want_ = false;
-      RunAttention(l, ci, pre, hook, q_af, k_af, v_af);
+      const bool q_npu = NpuRows("q") && NpuOk(pre + "attn_q.weight") && !NpuHal(KqgHal(pre + "attn_q.weight", q_af)).empty();
+      if (!RunAttentionHalves(l, ci, pre, hook, q_af, k_af, v_af, q_npu)) {
+        FfnUnpackPending(-1);
+        nq_want_ = nqw_ && !q_npu;
+        RunNorm(pre + "attn_norm.weight",
+                q_af && k_af && v_af   ? NormOut::kTiled
+                : q_af || k_af || v_af ? NormOut::kBoth
+                                       : NormOut::kRow,
+                q_npu ? "q" : nullptr);
+        nq_want_ = false;
+        RunAttention(l, ci, pre, hook, q_af, k_af, v_af);
+      }
     } else {
       // afrag qkv / gate read the fragment-major copy; alpha / beta keep the row-major one
       const bool qkv_af = Af("gemm_kstore", pre + "attn_qkv.weight");
       const bool gate_af = Af("gemm_kstore", pre + "attn_gate.weight");
-      nq_want_ = nqw_;
-      RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow);
-      nq_want_ = false;
-      RunDeltaNet(l, pre, qkv_af, gate_af);
+      const bool qkv_npu = NpuRows("qkv") && NpuRows("gate") && NpuOk(pre + "attn_qkv.weight") &&
+                           NpuOk(pre + "attn_gate.weight") &&
+                           !NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)).empty() &&
+                           !NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)).empty();
+      if (!qkv_npu || !RunDeltaNetHalves(l, pre, qkv_af, gate_af)) {
+        FfnUnpackPending(-1);
+        nq_want_ = nqw_ && !qkv_npu;
+        RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow,
+                qkv_npu ? "qkv" : nullptr);
+        nq_want_ = false;
+        RunDeltaNet(l, pre, qkv_af, gate_af);
+      }
     }
     if (tail_ != kNoRows) {
       trim_row_ = tail_;
@@ -297,6 +423,7 @@ class LoomPrefill {
     }
     tail_ = kAllRows;
   }
+
 
 
   // Final norm + output head of hidden() row `row` (this chunk) into dst (kVocab f32).
@@ -442,8 +569,6 @@ class LoomPrefill {
     std::string name;
     Geom g{};
     while (f >> name >> g.tokens >> g.rowgrp >> g.tt) geom_[name] = g;
-    std::ifstream n(dir_ + "/npu.txt");   // the NPU FFN block's rows (tools/emit_npu_ffn.py), if the set has it
-    while (n >> name >> g.tokens >> g.rowgrp >> g.tt) geom_[name] = g;
   }
   // Refuses a HAL emitted for another token count: it would compute a silent subset.
   Geom GeomOf(const std::string& hal) const {
@@ -516,9 +641,9 @@ class LoomPrefill {
                 std::uint32_t sx, std::uint32_t sy, std::uint32_t sz, const std::vector<hrx_buffer_ref_t>& b,
                 std::uint64_t writes = ~std::uint64_t{0}, const std::vector<hrx_buffer_ref_t>* also_writes = nullptr,
                 std::uint64_t untracked = 0) {
-    if (split_armed_ && graph_ && !warming_) SplitGraph();
+    if (split_armed_ && graph_ && !npu_planning_ && !warming_) SplitGraph();
     FlushKres();
-    if (warming_) return;
+    if (npu_planning_ || warming_) return;
     const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
     const hrx_dispatch_config_t config = LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz);
@@ -651,8 +776,8 @@ class LoomPrefill {
     ids_ = &Alloc(B * 4);
     host_ids_.resize(B);
     if (const core::TensorInfo& e = *Find("token_embd.weight"); !weights_.Has(e)) {
-      for (auto& r : host_rows_) r.resize(std::size_t{B} * (e.bytes / e.dims[1]));
-      embed_rows_ = &Alloc(host_rows_[0].size());
+      host_rows_.resize(std::size_t{B} * (e.bytes / e.dims[1]));
+      embed_rows_ = &Alloc(host_rows_.size());
     }
     const float epsv = 1.0e-6f;
     gpu_.H2D(*eps_, &epsv, 4);
@@ -849,15 +974,35 @@ class LoomPrefill {
   }
   void RunFfn(const std::string& pre) {
     if (RunFfnBlock(pre)) return;
+    if (ffn_normed_) throw LoomError("prefill: the token halves normed an FFN that does not run as the FFN block");
     if (RunFfnFused(pre)) return;
     const bool gate_af = Af("gemm_kstore", pre + "ffn_gate.weight");
     const bool up_af = Af("gemm_swiglu", pre + "ffn_up.weight");
     const bool down_af = up_af && Af("gemm_kres", pre + "ffn_down.weight");
-    nq_want_ = nqgu_;
+    const std::uint32_t nn = trim_row_ == kAllRows && FfnNpuOk(pre) ? NpuRows("ffn") : 0;
+    const std::string gs = nn ? NpuHal(KstoreHal(pre + "ffn_gate.weight", gate_af)) : "";
+    const std::string us = nn ? NpuHal(SwigluHal(pre + "ffn_up.weight", up_af, down_af)) : "";
+    nq_want_ = nqgu_ && nn == 0;
     RunNorm(pre + "post_attention_norm.weight",
-            gate_af && up_af ? NormOut::kTiled : gate_af || up_af ? NormOut::kBoth : NormOut::kRow);
+            gate_af && up_af ? NormOut::kTiled : gate_af || up_af ? NormOut::kBoth : NormOut::kRow,
+            !gs.empty() && !us.empty() ? "ffn" : nullptr);
     nq_want_ = false;
-    if (a4_) {
+    if (!gs.empty() && !us.empty()) {
+      // the NPU's rows of gate and up; the unpack applies silu(gate) * up
+      std::vector<NpuView> ag, au;
+      FfnEncode(pre, gate_af && up_af ? *normt_ : *scratch_, gate_af && up_af, ag, au);
+      std::size_t w_off = 0, c_off = 0;
+      const auto wg = NpuDecode("ffn", pre + "ffn_gate.weight", nn, w_off);
+      const auto wu = NpuDecode("ffn", pre + "ffn_up.weight", nn, w_off);
+      std::vector<std::uint32_t> calls;
+      const NpuView cg = NpuCalls("ffn", ag, wg, c_off, calls, pre + "ffn_gate.weight");
+      const NpuView cu = NpuCalls("ffn", au, wu, c_off, calls, pre + "ffn_up.weight");
+      NpuEnqueue(std::move(calls), "ffn");
+      RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, gate_af, gs, nn);
+      RunSwigluSplit(pre + "ffn_up.weight", up_af, us, nn);
+      NpuJoin();
+      FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
+    } else if (a4_) {
       // one GEMM for gate and up: silu(gate) * up straight into ffnup_ (gen_gemm_iu4 gu); guov: flagged (a counter per
       // 1024 features and token tile), RunResidual's rotq waits on it
       const auto* up = Find(pre + "ffn_up.weight");
@@ -873,66 +1018,289 @@ class LoomPrefill {
     RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
   }
 
-  // The NPU FFN block (npu_plan). npu.txt: "npuffn <F> <B> <K parts>", "npubytes_<image> <a> <w> <c>" (binding bytes),
-  // "npudgu <bytes from a gate row to its up row>", "npugate <supply> <calls> <record>" and the GPU kernels' rows.
-  static constexpr std::uint32_t kDownCalls = 10, kDownRows = 512;   // down calls per K part, rows per call
-  static constexpr std::size_t kHRec = 4 * 128 * 144;   // H bytes per (M block, pass): [slab 4][k-block 128][144]
-  struct NpuBytes {
-    std::size_t a, w, c;
-  };
-  NpuBytes NpuBytesOf(const std::string& name) const {
-    const Geom& g = geom_.at(name);
-    return {g.tokens, g.rowgrp, g.tt};
-  }
-  std::uint32_t FfnF() const {
-    const auto it = geom_.find("npuffn");
+  // The NPU's FFN block (dispatch.txt "npuffnblk <F>", emit_prefill_pp NPU_FFNBLK): the NPU owns the FFN's last F
+  // features. Its gate / up calls (npu_ffnsw_<fmt>.xdna; decoder-column sets: 224 features a call, call j's column c
+  // takes features 8 (128 c + 4 j) + [0, 32) of F; fused sets: 256, column c features 256 j + 32 c + [0, 32); gate rows
+  // and the up rows one gate tensor further, straight from the model) write H = bfp16(silu(gate) * up) into C, [M block]
+  // [pass][16-token slab][128 k-blocks]; its down calls (npu_ffndn<passes>_<fmt>.xdna, per K part of F (FfnBlkParts),
+  // 560 / 640 rows each, a last 560-row call overlapping the one before) read H and write their partials after it. Each
+  // is a job of one image family. The GPU runs the other features (the fused ffn's split) and down over them
+  // (npuffnrem_<fmt>.hal, f32), then npu_unpack_ffnblk.hal writes hidden + that + the partials. Returns false if the
+  // layer does not qualify.
+  std::uint32_t FfnBlkF() const {
+    const auto it = geom_.find("npuffnblk");
     return it == geom_.end() ? 0 : it->second.tokens;
   }
-  // (first pass, passes) of down's K parts over F features: the fewest parts of at most 5 passes, sizes balanced
-  // (emit_npu_ffn.parts)
-  std::vector<std::pair<std::uint32_t, std::uint32_t>> FfnParts() const;
-  static std::string DnImage(std::uint32_t passes, const char* pre = "") { return pre + std::string("ffndn") + std::to_string(passes); }
-  // H's bytes in C (from 0), then down's partials from FfnDownOff().
-  std::size_t FfnDownOff() const { return (std::size_t{B_ / 64} * (FfnF() / 1024) * kHRec + 4095) / 4096 * 4096; }
-  // (native sets: "<image>_<fmt>" rows, alike in C bytes)
-  std::size_t DownC() const {
-    const std::string pre = DnImage(FfnParts()[0].second, "npubytes_");
-    const auto it = geom_.lower_bound(pre);
-    if (it == geom_.end() || it->first.compare(0, pre.size(), pre) != 0) throw LoomError("npu.txt has no " + pre + " row");
-    return it->second.tt;
+  // dispatch.txt "npuffnblk <F> <gate / up features a call> <down rows a call>" (0: a decoder-column set's 224, 560)
+  bool FfnBlkFused() const { return geom_.at("npuffnblk").rowgrp == 256; }
+  std::uint32_t FfnBlkRows() const { return geom_.at("npuffnblk").tt ? geom_.at("npuffnblk").tt : 560; }
+  std::uint32_t FfnBlkCalls() const { return (kHidden + FfnBlkRows() - 1) / FfnBlkRows(); }   // down calls per K part
+  // (first pass, passes) of down's K parts over F features: the fewest parts of at most 5 passes (a fused panel holds a
+  // part), sizes balanced (emit_prefill_pp ffnblk_parts)
+  static std::vector<std::pair<std::uint32_t, std::uint32_t>> FfnBlkParts(std::uint32_t F) {
+    const std::uint32_t P = F / 1024, n = (P + 4) / 5;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> parts;
+    for (std::uint32_t i = 0, p0 = 0; i < n; ++i) {
+      parts.push_back({p0, P / n + (i < P % n)});
+      p0 += parts.back().second;
+    }
+    return parts;
   }
-  std::size_t DownRowBytes() const { return std::size_t{FfnF()} / 256 * 136; }   // a down pack row (IQ4_XS)
-  static constexpr std::size_t kRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
+  // An image's decoder swap image, the image itself where there is none (fused sets)
+  static std::string SwapOf(const std::string& image) {
+    const std::string swap = image + ".swap.xdna";
+    return ::access(swap.c_str(), R_OK) == 0 ? swap : image + ".xdna";
+  }
+  // H's bytes in C (from 0), then down's partials from FfnBlkDown().
+  std::size_t FfnBlkH() const { return std::size_t{B_ / 64} * (FfnBlkF() / 1024) * 4 * 128 * 144; }
+  std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
+  static int DecoderId(const char* fmt) {
+    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k", "iq2xxs", "iq2xs", "q5k", "iq2s"};
+    for (int i = 0; i < 9; ++i)
+      if (std::strcmp(kDecoders[i], fmt) == 0) return i;
+    return -1;
+  }
+  // With norm (the token halves' probe): only whether the layer runs the block and its norm HAL stem; dispatches nothing.
+  bool RunFfnBlock(const std::string& pre, const char** norm = nullptr) {
+    if (!ffnblk_ || !npu_on_ || trim_row_ != kAllRows || !AfChunk()) return false;
+    const auto* tg = Find(pre + "ffn_gate.weight");
+    const auto* tu = Find(pre + "ffn_up.weight");
+    const auto* td = Find(pre + "ffn_down.weight");
+    Fmt f{}, fu{}, fd{};
+    if (!FmtOf(static_cast<std::uint32_t>(tg->type), &f) || !FmtOf(static_cast<std::uint32_t>(tu->type), &fu) ||
+        !FmtOf(static_cast<std::uint32_t>(td->type), &fd))
+      return false;
+    // gate and up of one format with a fused GPU gate / up: one image (its columns compute both); else column pairs
+    // (gen_npu_gemm ufmt)
+    const std::string hal = tg->type == tu->type ? AfHal(GemmHal("gemm_ffn", *tg, &f), ".af.to.hal") : "";
+    const bool pair = hal.empty();
+    // (bmix: a pair whose NPU rows the emitter pre-decoded, emit_prefill_pp NPU_BFPSW: one BFP image like a single
+    // format's, "npu_ffnsw_bfp<hord>", on npu_bfp_<pre>ffn_gate_up.bin)
+    const bool bmix = pair && geom_.count("npuffnbx_" + std::string(f.name) + "_" + fu.name) != 0;
+    if (tg->dims != tu->dims || (!pair && tu->offset != tg->offset + tg->bytes) || (pair && !geom_.count("npuffnpair")))
+      return false;
+    const std::uint32_t F = pair ? geom_.at("npuffnpair").tokens : ffnblk_, M = static_cast<std::uint32_t>(tg->dims[1]);
+    // the GPU's features: the fused ffn's split, or (pairs) gate kstore + up swiglu splits, fragment-major into ffnup_
+    const std::string sh = pair ? "" : NpuHal(hal);
+    const std::string gs = pair ? NpuHal(KstoreHal(pre + "ffn_gate.weight", true)) : "";
+    const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
+    const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
+    // the GPU's down over its features: f32 for npu_unpack_ffnblk, or (fused sets) the residual GEMM adding the NPU's
+    const std::string tail = std::string(fd.name) + "_" + std::to_string(kbw) + ".hal";
+    const bool res = geom_.count("npuffnres_" + tail) != 0;
+    const std::string rem = (res ? "npuffnres_" : "npuffnrem_") + tail;
+    // gate / up write H in the down decoder's k-block order (emit_prefill_pp FFNBLK_HORD: IQ4_XS's P4, Q4_K's; fused sets
+    // P4 but Q4_K's)
+    const bool q4k = std::strcmp(fd.name, "q4k") == 0;
+    const std::string hord = q4k ? "_q4k" : std::strcmp(fd.name, "iq4xs") == 0 || FfnBlkFused() ? "_p4" : "";
+    // (mix: a pair whose formats share a decoder, emit_prefill_pp mixed: the GPU's side a pair's, the NPU's one image like
+    // a single format's, "npu_ffnsw_<gate>_<up>")
+    const std::string mixed = dir_ + "/npu_ffnsw_" + f.name + "_" + fu.name + hord;
+    const bool mix = bmix || (pair && ::access((mixed + ".xdna").c_str(), R_OK) == 0), npair = pair && !mix;
+    const std::string sw = bmix ? dir_ + "/npu_ffnsw_bfp" + hord : mix ? mixed : dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name)) +
+                           hord;
+    const auto parts = FfnBlkParts(F);
+    std::vector<std::string> dn;
+    for (const auto& [p0, passes] : parts) {
+      dn.push_back(dir_ + "/npu_ffndn" + std::to_string(passes) + "_" + fd.name);
+      if (::access((dn.back() + ".xdna").c_str(), R_OK)) return false;
+    }
+    if ((pair ? gs.empty() || us.empty() || !Af("gemm_kstore", pre + "ffn_gate.weight") ||
+                    !Af("gemm_swiglu", pre + "ffn_up.weight")
+              : sh.empty()) ||
+        !geom_.count(rem) || ::access((dir_ + "/norm_t_bfp_g1.hal").c_str(), R_OK) ||
+        ::access((sw + ".xdna").c_str(), R_OK))
+      return false;
+    // the norm also writes gate / up's activations (one replay group: that stream layout; "npuffndfr_<fmt>": the
+    // deferred-epilogue image's K split, emit_prefill_pp NPU_DFR_KS)
+    const bool dfr = mix ? geom_.count("npuffndfr_" + std::string(f.name) + "_" + fu.name) != 0
+                         : !pair && geom_.count("npuffndfr_" + std::string(f.name));
+    if (dfr && ::access((dir_ + "/norm_t_bfp_g1s.hal").c_str(), R_OK)) return false;
+    if (norm) {
+      *norm = dfr ? "norm_t_bfp_g1s" : "norm_t_bfp_g1";
+      return true;
+    }
+    if (!std::exchange(ffn_normed_, false))  // (the token halves ran it: FfnHalfNorm)
+      RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk");
+    const NpuView ag{0, NpuK(5120).a};
+    const std::uint8_t* base = gguf_.tensor_data_base();
+    const bool bg = bmix || !std::strcmp(f.name, "iq2s"), bu = bmix || !std::strcmp(fu.name, "iq2s"),
+               bd = !std::strcmp(fd.name, "iq2s");
+    // (npuffnix4: IQ3_S / IQ3_XXS gate / up rows transcoded to IQ4_XS blocks, the NPU's rows only)
+    const bool ix4 = geom_.count("npuffnix4") != 0;
+    const auto tx = [&](const Fmt& x) { return ix4 && (!std::strcmp(x.name, "iq3s") || !std::strcmp(x.name, "iq3xxs")); };
+    // (a mixed pair of one untranscoded format, emit_prefill_pp SAME_SW_FMTS: up follows gate in the GGUF, like a
+    // single format's)
+    const bool xmix = mix && !bmix && (tx(f) || tx(fu));
+    if (mix && !bmix && !xmix && (std::strcmp(f.name, fu.name) || tu->offset != tg->offset + tg->bytes))
+      throw LoomError("prefill: " + pre + " mixed image without transcoded or contiguous rows");
+    const bool xg = !bmix && (xmix || tx(f)), xu = !bmix && (xmix || tx(fu));
+    // (the decoder binding the NPU's gate / up rows: bmix's BFP, iq2s's)
+    const char* const gdec = bmix ? "iq2s" : f.name;
+    const std::size_t blk = bg ? kBfpBlock : xg ? kIx4Block : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
+    const std::size_t blku = bu ? kBfpBlock : xu ? kIx4Block : tu->bytes / M * 256 / tu->dims[0], rbu = blku * tu->dims[0] / 256;
+    const std::size_t blkd = bd ? kBfpBlock : td->bytes / td->dims[1] * 256 / td->dims[0], rbd = blkd * td->dims[0] / 256;
+    const std::size_t f0 = M - F, dgu = xg || bmix ? M * rb : static_cast<std::size_t>(tg->bytes);
+    const std::size_t Nd = static_cast<std::size_t>(td->dims[1]);
+    const auto ix4_rows = [&](const std::string& kind, std::size_t rbx) {
+      return HostRows("npu_ix4_" + pre + kind + ".bin", M * rbx, {{f0 * rbx, F * rbx}});
+    };
+    // a combined gate / up copy: the NPU's gate rows and up rows, M rows apart (the images' dgu); the up rows between
+    // them (the GPU's) are in the range registered for the NPU, which pins its pages: one aliased page run
+    const auto gate_up = [&](const std::string& file) {
+      auto* p = const_cast<std::uint8_t*>(HostRows(file, 2 * M * rb, {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}}));
+      AliasUnread(p + M * rb, f0 * rb, false);
+      return p;
+    };
+    const std::uint8_t* pg = bmix ? gate_up("npu_bfp_" + pre + "ffn_gate_up.bin")
+                             : bg ? BfpRows(pre + "ffn_gate.weight", M * rb)
+                             : !xg ? base + tg->offset
+                             : npair ? ix4_rows("ffn_gate", rb) : gate_up("npu_ix4_" + pre + "ffn_gate_up.bin");
+    const std::uint8_t* pu = bmix ? pg + M * rb
+                             : bu ? BfpRows(pre + "ffn_up.weight", M * rbu)
+                             : !xu ? base + tu->offset
+                             : npair ? ix4_rows("ffn_up", rbu) : pg + M * rb;
+    const std::uint8_t* pd = bd ? BfpRows(pre + "ffn_down.weight", Nd * rbd) : base + td->offset;
+    if (npu_planning_) {   // the NPU's gate / up rows (one range when up follows gate), all of down
+      const std::size_t end = gguf_.tensor_data_size();
+      if (npair) {
+        npu_->RegisterRaw(pg + f0 * rb, bg || xg ? (M - f0) * rb + 8192 : std::min(tg->offset + M * rb + 4096, end) - (tg->offset + f0 * rb));
+        npu_->RegisterRaw(pu + f0 * rbu, bu || xu ? (M - f0) * rbu + 8192 : std::min(tu->offset + M * rbu + 4096, end) - (tu->offset + f0 * rbu));
+      } else if (xg || bmix) {
+        npu_->RegisterRaw(pg + f0 * rb, 2 * M * rb - f0 * rb + 8192);
+      } else {
+        const std::size_t a = tg->offset + f0 * rb;
+        npu_->RegisterRaw(base + a, std::min(tu->offset + M * rb + 4096, end) - a);
+      }
+      npu_->RegisterRaw(pd, bd ? Nd * rbd + 8192 : std::min<std::size_t>(td->bytes + 4096, end - td->offset));
+      if (bg || xg) NpuOnly(tg->offset + f0 * (tg->bytes / M), F * (tg->bytes / M));
+      if (bu || xu) NpuOnly(tu->offset + f0 * (tu->bytes / M), F * (tu->bytes / M));
+    }
+    std::vector<std::uint32_t> csw;
+    std::vector<std::vector<std::uint32_t>> cdn(parts.size());
+    if (npair && FfnBlkFused()) {   // F / 256 calls: call j's pair u (gate column 2 u, up column 2 u + 1) takes features
+                                   // 256 j + 64 u + [0, 64), its records at H k-blocks 32 j + 8 u .. (gen_npu_gemm swcol 64)
+      const NpuBytes bs = NpuBytesOf("npubytes_ffnsp");
+      for (std::uint32_t j = 0; j < F / 256; ++j) {
+        const std::size_t r0 = f0 + 256 * j;
+        csw.push_back(npu_->BindRawPair(
+            sw + ".xdna", SwapOf(sw), 16 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            pg + r0 * rb, 255 * rb + 16 * blk + RecordRow(f.name),
+            pu + r0 * rbu, 255 * rbu + 16 * blku + RecordRow(fu.name),
+            {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, 4 * (B_ / 64) * 4 * 1152,
+            "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
+      }
+    } else if (npair) {   // 32 calls of 192 features: call j's up column u writes passes 2 u + j / 16, k-blocks 8 (j % 16) ..
+      const NpuBytes bs = NpuBytesOf("npubytes_ffnsp");
+      for (std::uint32_t j = 0; j < F / 192; ++j) {
+        const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);
+        csw.push_back(npu_->BindRawPair(
+            sw + ".xdna", SwapOf(sw), 16 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            pg + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + RecordRow(f.name),
+            pu + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + RecordRow(fu.name),
+            {(j / 16) * 4 * 128 * 144 + (j % 16) * 8 * 144, bs.c}, 3 * (B_ / 64) * 4 * 1152,
+            "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
+      }
+    } else if (FfnBlkFused()) {   // F / 256 calls: call j's column c takes features 256 j + 32 c + [0, 32), its records
+                                  // at H k-blocks 32 j + 4 c .. (gen_npu_gemm swcol 32)
+      const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
+      for (std::uint32_t j = 0; j < F / 256; ++j)
+        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), mix && !bmix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(gdec), ag,
+                                    pg + (f0 + 256 * j) * rb,
+                                    dgu + 255 * rb + 16 * blk + RecordRow(gdec),
+                                    {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, "ffnsw" + hord));
+    } else {   // 32 calls of 224 features: call j's column c takes features 8 (128 c + 4 j) + [0, 32); Q4_K's order
+               // (gen_npu_gemm hord): its two 16-row slabs 32 rows apart from 64 (j / 2) + 16 (j % 2)
+      const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
+      for (std::uint32_t j = 0; j < F / 224; ++j)
+        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
+                                    pg + (f0 + (q4k ? 64 * (j / 2) + 16 * (j % 2) : 32 * j)) * rb,
+                                    dgu + (6 * 1024 + (q4k ? 47 : 31)) * rb + 16 * blk + RecordRow(f.name),
+                                    {4 * j * 144, bs.c},
+                                    "ffnsw" + hord));
+    }
+    // down: per K part, FfnBlkCalls() calls of FfnBlkRows() rows (a last one ending at the last row)
+    const std::uint32_t rows = FfnBlkRows(), calls = FfnBlkCalls();
+    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c;
+    for (std::size_t ci = 0; ci < parts.size(); ++ci) {
+      const auto [p0, passes] = parts[ci];
+      const std::string fam = "ffndn" + std::to_string(passes);
+      const NpuBytes bd = NpuBytesOf("npubytes_" + fam);
+      if (bd.c != cp) throw LoomError("prefill: the FFN block's down parts differ in C bytes");
+      for (std::uint32_t r = 0; r < calls; ++r) {
+        const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + 4 * p0;
+        cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", SwapOf(dn[ci]), DecoderId(fd.name),
+                                        {std::size_t{p0} * 4 * 128 * 144, bd.a, true},
+                                        pd + r0 * rbd + k0 * blkd,
+                                        (rows - 1) * rbd + 16 * blkd + RecordRow(fd.name),
+                                        {doff + (ci * calls + r) * cp, cp}, fam));
+      }
+    }
+    NpuEnqueue(std::move(csw), npair ? "ffnsp" : "ffnsw");
+    for (std::size_t ci = 0; ci < parts.size(); ++ci) NpuEnqueue(std::move(cdn[ci]), "ffndn" + std::to_string(parts[ci].second));
+    if (pair) {
+      RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
+      RunSwigluSplit(pre + "ffn_up.weight", true, us, F);
+    } else {
+      const Geom g = GeomOf(hal);
+      auto b = GemmWeights(*tg, f);
+      b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
+      const std::size_t first = b.size();
+      for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
+      const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
+      Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(sh).rowgrp, tt, 1,
+               32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    }
+    if (res) {   // down over them as the residual GEMM, its epilogue adding the NPU's partials once the job is done
+      const Geom& gr = geom_.at(rem);
+      auto r = GemmWeights(*td, fd);
+      for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{ffnup_, hidden_, wstage_, ostage_, hidden2_})
+        r.push_back(Ref(*x));
+      const std::size_t out = r.size() - 1;
+      r.push_back({npu_->C().handle, doff, parts.size() * calls * cp});
+      if (!npu_planning_) {
+        const NpuWait w = NpuJoinBegin();
+        r.insert(r.end(), w.words.begin(), w.words.end());
+        Dispatch(Exe(rem), ("yah_ffn_gemm_" + std::string(fd.name) + "_kres").c_str(), MTiles(*td) / gr.rowgrp, gr.tt,
+                 1, 32, 1, 1, r, (std::uint64_t{1} << out) | (std::uint64_t{1} << (r.size() - 1)), &w.npu_side);
+        NpuJoinEnd();
+      }
+      std::swap(hidden_, hidden2_);
+      return true;
+    }
+    // down over them: f32 [tokens][5120]
+    const Geom& gr = geom_.at(rem);
+    auto r = GemmWeights(*td, fd);
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{ffnup_, wstage_, ostage_}) r.push_back(Ref(*x));
+    r.push_back({ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4});
+    Dispatch(Exe(rem), ("yah_ffn_gemm_" + std::string(fd.name)).c_str(), MTiles(*td) / gr.rowgrp, gr.tt, 1, 32, 1, 1, r,
+             std::uint64_t{1} << (r.size() - 1));
+    NpuJoin();
+    // with token halves the next layer runs it, per half (FfnUnpackPending)
+    ffn_pending_ = {{doff, parts.size() * calls * cp}, hidden_, hidden2_};
+    if (!halves_ || !geom_.count("npu_unpack_ffnblk_h1.hal")) FfnUnpackPending(-1);
+    std::swap(hidden_, hidden2_);
+    return true;
+  }
 
-  bool RunFfnBlock(const std::string& pre);
-  bool RunFfnBlockNative(const std::string& pre);
-  // down's rows for the NPU of an MQ4 set (npu_down_pack.hpp), into npu_down_
-  void PackDown();
-  bool NpuNative() const { return geom_.count("npunative") != 0; }
-  // The selected chunk's pending FFN block: wait for its last NPU job, then hidden = hidden2 + the NPU's partials.
-  void JoinFfn();
-  std::size_t NpuCBytes() const { return FfnDownOff() + FfnParts().size() * kDownCalls * DownC(); }
-  // An iu4 GEMM of the block at its own row count (RunIu4 names the HAL from the tensor's): grid (G, token tiles,
-  // row tiles / G) with its iu4grp row, else (row tiles, token tiles).
-  void DispatchIu4(const std::string& hal, const char* sfx, std::uint32_t mtiles,
-                   const std::vector<hrx_buffer_ref_t>& b, std::uint64_t writes);
-  // NPU handoffs are graph nodes on flag words in host memory (NpuSplit::Flags), so the host never splits the chunk.
-  // NpuEnqueue: the graph stores the job's gate value to its ready word once a is written and every earlier reader of
-  // c is done (release, system scope: a reaches memory first); the NPU waits for it itself. NpuJoin: yah_npu_flag_wait
-  // polls the last job's done word; it stands for the NPU's reads of A and writes of C, so what reads C (the unpack) or
-  // writes A (the next layer's encoder) orders after it. The jobs are queued right after the chunk graph launches.
-  hrx_buffer_ref_t FlagWord(std::uint32_t w) const { return {npu_->Flags()->handle, std::size_t{w} * 4, 4}; }
-  void NpuEnqueue(std::vector<std::uint32_t> calls, std::string tag, const hrx_buffer_ref_t& a,
-                  const hrx_buffer_ref_t& c);
-  void NpuCpuDriven(const std::vector<NpuSplit::Queued>& jobs);
-  void NpuJoin(std::size_t job);
-
+  // The ffn site's NPU rows need both matrices on the NPU (the unpack applies silu(gate) * up).
+  bool FfnNpuOk(const std::string& pre) const { return NpuOk(pre + "ffn_gate.weight") && NpuOk(pre + "ffn_up.weight"); }
+  // The ffn site's activations for gate (ag) and up (au), each in its decoder's k-block order.
+  void FfnEncode(const std::string& pre, const LoomBuffer& input, bool tiled, std::vector<NpuView>& ag,
+                 std::vector<NpuView>& au) {
+    const bool kg = NpuPk(pre + "ffn_gate.weight"), ku = NpuPk(pre + "ffn_up.weight");
+    std::vector<NpuView> a4, ak;
+    if (!kg || !ku) a4 = NpuEncode("ffn", input, tiled);
+    if (kg || ku) ak = NpuEncode("ffn", input, tiled, true);
+    ag = kg ? ak : a4, au = ku ? ak : a4;
+  }
   // kRow: f16 row-major into scratch_; kTiled: fragment-major into normt_ (afrag GEMMs); kBoth: both, one pass.
   enum class NormOut { kRow, kTiled, kBoth };
   // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): ffn_up
   // stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r). Gate and up of one
   // format, or a pair "gemm_ffn_<gate>_<up>_.." (AF_FFN_MIX: mixed formats, which bind the gate format's tables, then
-  // the up format's, or one format without a single-format fused GEMM).
+  // the up format's, or one format without an NPU split); pairs have no NPU split, so they run only while the ffn site
+  // has no NPU rows.
   // It writes f16(silu(gate) * up) into ffnup_, fragment-major when ffn_down is afrag too. Returns false if not taken.
   bool RunFfnFused(const std::string& pre) {
     if (!AfChunk()) return false;
@@ -947,12 +1315,14 @@ class LoomPrefill {
     const char* sfx = down_af ? ".af.to.hal" : ".af.hal";
     std::string hal = mixed ? "" : AfHal(base, sfx);
     if (hal.empty()) {   // "gemm_ffn_<gate>_<mt>_<kb>.hal" -> "gemm_ffn_<gate>_<up>_<mt>_<kb>.hal"
+      if (NpuRows("ffn")) return false;
       base.insert(std::strlen("gemm_ffn_") + std::strlen(f.name), "_" + std::string(fu.name));
       hal = AfHal(base, sfx);
     }
     if (hal.empty()) return false;
     const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (mixed ? "_" + std::string(fu.name) : "") + "_ffn";
-    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled);
+    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled,
+            trim_row_ == kAllRows && FfnNpuOk(pre) && NpuRows("ffn") && !NpuHal(hal).empty() ? "ffn" : nullptr);
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*tg, f);
     b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
@@ -963,24 +1333,51 @@ class LoomPrefill {
     const std::size_t first = b.size();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
     const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(tg->dims[1]) * 2}, g);
-    Dispatch(Exe(hal), sym.c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    const std::uint32_t nn = tt == g.tt && FfnNpuOk(pre) ? NpuRows("ffn") : 0;
+    const std::string sh = nn ? NpuHal(hal) : "";
+    if (!sh.empty()) {
+      // the NPU's rows of gate and up (the weights' last rows of each tensor); the unpack applies silu(gate) * up
+      std::vector<NpuView> ag, au;
+      FfnEncode(pre, *normt_, true, ag, au);
+      std::size_t w_off = 0, c_off = 0;
+      const auto wg = NpuDecode("ffn", pre + "ffn_gate.weight", nn, w_off);
+      const auto wu = NpuDecode("ffn", pre + "ffn_up.weight", nn, w_off);
+      std::vector<std::uint32_t> calls;
+      const NpuView cg = NpuCalls("ffn", ag, wg, c_off, calls, pre + "ffn_gate.weight");
+      const NpuView cu = NpuCalls("ffn", au, wu, c_off, calls, pre + "ffn_up.weight");
+      NpuEnqueue(std::move(calls), "ffn");
+      Dispatch(Exe(sh), sym.c_str(), (MTiles(*tg) - nn / 16) / GeomOf(sh).rowgrp, tt, 1, 32, 1, 1, b,
+               GemmWrites(b, f, {ffnup_}));
+      NpuJoin();
+      FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
+    } else {
+      Dispatch(Exe(hal), sym.c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    }
     RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
     return true;
   }
 
   // The RMSNorm of hidden() rows into scratch_ (f16; afrag: fragment-major into normt_), MQ4 sets: rotated into the
-  // weights' basis (A4: and quantized into aq_ / ad_).
-  void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow) {
+  // weights' basis (A4: and quantized into aq_ / ad_). npu_site: the NPU split of a K = 5120 site reads this norm's
+  // output; with "npunormbfp" in the set the norm also writes its BFP16 input into A ("<norm>_bfp.hal") and
+  // NpuEncode(npu_site) skips the encoder.
+  void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow, const char* npu_site = nullptr) {
     // A row takes `split` waves (dispatch.txt norm_split, else 1); a workgroup of w waves takes w / split rows.
+    // npu_site "ffnblk": the FFN block's one-replay-group stream (RunFfnBlock, fragment-major output only); "ffnblk_s":
+    // in the deferred-epilogue images' K split
+    const bool g1s = npu_site && std::strcmp(npu_site, "ffnblk_s") == 0;
+    const bool g1 = g1s || (npu_site && std::strcmp(npu_site, "ffnblk") == 0);
+    const bool bfp = npu_site && (g1 || geom_.count("npunormbfp"));
+    norm_bfp_ = bfp && !g1 ? npu_site : "";
     const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
-    const LoomExecutable& exe = Exe(hal + ".hal");
+    const LoomExecutable& exe = Exe(g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1.hal" : hal + (bfp ? "_bfp.hal" : ".hal"));
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const auto ns = geom_.find("norm_split");
     const std::uint32_t split = ns != geom_.end() && ns->second.rowgrp ? ns->second.rowgrp : 1;
     const std::uint32_t rows_per_wg = ws ? ws / 32 / split : 1;
     if (!rows_per_wg || (ws && ws % (32 * split))) throw LoomError("norm.hal: workgroup size does not match norm_split");
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
-    if (a4_ && mode == NormOut::kRow && geom_.count("normq_5120.hal")) {
+    if (a4_ && mode == NormOut::kRow && !bfp && geom_.count("normq_5120.hal")) {
       // A4: the norm and its rotq in one kernel (gen_rot.gen_nq), one row per workgroup; the f16 norm output is not kept.
       // nqov: right after its kres (deferred by RunResidual, untrimmed) as kresf + normqf with no graph edge between
       // them: the rows wait on the kres's per-token-tile counters (FlagSlot), so they start in the GEMM's tail. normqf
@@ -1024,9 +1421,10 @@ class LoomPrefill {
                                             Ref(*scratch_), Ref(*normt_)}
             : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
                                             Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)};
+    if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
     if (rot_) {
-      if (mode != NormOut::kRow) throw LoomError("prefill: MQ4 sets rotate only the row-major norm output");
+      if (mode != NormOut::kRow || bfp) throw LoomError("prefill: MQ4 sets rotate only the row-major norm output");
       if (a4_)
         RotQ(*scratch_, kHidden, NormAwq(wname), false);
       else
@@ -1170,7 +1568,284 @@ class LoomPrefill {
     trim_row_ = trim;
   }
 
-  // The chunk's graph: the whole chunk (after layer 0's, SplitGraph) is one graph.
+  // NPU column split (EnableNpu, emit_prefill_pp.npu_split). A site's NPU rows in this chunk (0: GPU only).
+  std::uint32_t NpuRows(const char* site) const {
+    const auto it = npu_rows_.find(site);
+    return npu_on_ && it != npu_rows_.end() ? it->second : 0;
+  }
+  // (k offset, K) of a site's NPU calls: one K, or down's 6 + 6 + 5 passes of K = 17408 (its weight panel does not fit
+  // a memory tile).
+  // The NPU runs one image (K = 5120 per call; an image switch costs ~0.55 ms): a site's K in chunks of 5120, the rest
+  // of K (out: 1024, down: 2048) on the GPU ("npurem_<site>_<fmt>.hal"), added by the unpack.
+  static std::uint32_t NpuSiteK(const std::string& site) { return site == "down" ? 17408 : site == "out" ? 6144 : 5120; }
+  static std::vector<std::pair<std::uint32_t, std::uint32_t>> NpuChunks(const std::string& site) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> v;
+    for (std::uint32_t k = 0; k + 5120 <= NpuSiteK(site); k += 5120) v.push_back({k, 5120});
+    return v;
+  }
+  static std::uint32_t NpuRem(const std::string& site) { return NpuSiteK(site) % 5120; }
+  // Chunked sites name their encoders and decoders per chunk ("_c<i>").
+  static bool NpuChunked(const std::string& site) { return NpuChunks(site).size() > 1 || NpuRem(site) != 0; }
+  // Bytes per NPU call of a K (dispatch.txt "npubytes_<K>": activations of the chunk, a weight panel, a C panel).
+  struct NpuBytes {
+    std::size_t a, w, c;
+  };
+  NpuBytes NpuBytesOf(const std::string& name) const {
+    const Geom& g = geom_.at(name);
+    return {g.tokens, g.rowgrp, g.tt};
+  }
+  NpuBytes NpuK(std::uint32_t K) const {
+    const Geom& g = geom_.at("npubytes_" + std::to_string(K));
+    return {g.tokens, g.rowgrp, g.tt};
+  }
+  // Output rows per NPU call (dispatch.txt "npurows": 8 columns of gen_npu_gemm.TN).
+  std::uint32_t NpuCallRows() const { return geom_.at("npurows").tokens; }
+  // The GPU's share of GEMM HAL hal ("<hal>.npu.hal": its leading rows at the full stride), or "".
+  std::string NpuHal(const std::string& hal) const {
+    const std::string v = hal.empty() ? "" : hal.substr(0, hal.size() - 4) + ".npu.hal";
+    return geom_.count(v) ? v : "";
+  }
+  // The kstore HAL a GEMM on wname runs (afrag form with af).
+  std::string KstoreHal(const std::string& wname, bool af) const {
+    Fmt f{};
+    const std::string base = GemmHal("gemm_kstore", *Find(wname), &f);
+    return af ? AfHal(base) : base;
+  }
+  // Decoder-column sets ("npudcol"): the NPU decodes a tensor of a format with a decoder itself, from its raw rows
+  // ("npu_dcol_<fmt>_<K>.xdna"; "" for other formats: that site stays on the GPU in that layer). dec: the format's
+  // decoder id (the images' swaps).
+  std::string DcolImage(const std::string& wname, int* dec = nullptr, bool half = false) const {
+    const char* const name = SiteDec(wname);
+    if (!name) return "";
+    const int id = DecoderId(name);
+    if (id < 0) return "";
+    if (dec) *dec = id;
+    const std::string path =
+        (half ? hdir_ : dir_) + "/npu_dcol_" + name + "_" + std::to_string(Find(wname)->dims[0]) + ".xdna";
+    return ::access(path.c_str(), R_OK) == 0 ? path : "";
+  }
+  // A site tensor whose NPU rows the emitter pre-decoded (emit_prefill_pp NPU_BFPSITE: npu_bfp_<wname>.bin, the
+  // BFP decoder's rows: IQ2_S's).
+  bool SiteBfp(const std::string& wname) const { return geom_.count("npusitebx_" + wname) != 0; }
+  // The decoder binding wname's NPU rows (its format's, else BFP's), nullptr if none.
+  const char* SiteDec(const std::string& wname) const {
+    Fmt f{};
+    if (SiteBfp(wname)) return "iq2s";
+    return FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f) ? f.name : nullptr;
+  }
+  // The base of NpuRawRows' offsets: the model's tensor data, or a pre-decoded site's rows (NpuRawRows read them).
+  const std::uint8_t* RawBase(const std::string& wname) const {
+    return SiteBfp(wname) ? bfp_.at("npu_bfp_" + wname + ".bin") : gguf_.tensor_data_base();
+  }
+  // The NPU can take wname's rows (a decoder-column set needs its format's decoder).
+  bool NpuOk(const std::string& wname) const { return !npu_dcol_ || !DcolImage(wname).empty(); }
+  // wname's decoder pushes Q4_K's k-block order (the activations' "pk" stream, NpuEncode pk).
+  bool NpuPk(const std::string& wname) const {
+    Fmt f{};
+    return npu_dcol_ && FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f) && std::strcmp(f.name, "q4k") == 0;
+  }
+  // input (row-major, or fragment-major with tiled) encoded into A for each of the site's K chunks; their A views.
+  // pk (decoder-column sets): the Q4_K k-block order ("_pk" encoders, A's second half; the fused writers write the
+  // p4 order of the other decoders).
+  std::vector<NpuView> NpuEncode(const std::string& site, const LoomBuffer& input, bool tiled, bool pk = false) {
+    const auto chunks = NpuChunks(site);
+    // down after an ffn unpack that wrote its columns (FfnUnpack): only each chunk's columns before them
+    const bool from_ffn = site == "down" && ffn_bfp_ && !pk;
+    ffn_bfp_ = false;
+    // a K = 5120 site after a norm that wrote its input (RunNorm npu_site)
+    const bool from_norm = norm_bfp_ == site && !pk;
+    norm_bfp_.clear();
+    const std::uint32_t ffn_cols = from_ffn ? geom_.at("npuffnbfp").tokens : NpuSiteK(site);
+    std::vector<NpuView> views;
+    std::size_t off = pk ? npu_->A().size / 2 : 0;
+    for (std::size_t c = 0; c < chunks.size(); ++c) {
+      const std::size_t bytes = NpuK(chunks[c].second).a;
+      const auto [k0, K] = chunks[c];
+      const std::uint32_t cover = ffn_cols > k0 ? std::min(K, ffn_cols - k0) : 0;
+      if (cover && !from_norm) {
+        const std::string hal = "npu_enc_" + std::to_string(NpuSiteK(site)) + (NpuChunked(site) ? "_c" + std::to_string(c) : "") +
+                                (cover < K ? "p" : "") + (tiled ? "_t" : "") + (pk ? "_pk" : "") + ".hal";
+        const Geom& g = geom_.at(hal);
+        Dispatch(Exe(hal), "yah_bfp16_encode_act", g.tokens, 1, 1, g.rowgrp, 1, 1,
+                 {Ref(input), {npu_->A().handle, off, bytes}}, 2);
+      }
+      views.push_back({off, bytes});
+      off += bytes;
+    }
+    return views;
+  }
+  // The ffn site's unpack: f16(silu(gate) * up) into ffnup_ (fragment-major for an afrag down). With "npuffnbfp" (down
+  // split too) it also writes down's BFP16 input for the ffn's NPU columns into A at down's chunk offsets, and
+  // NpuEncode("down") encodes only the columns before them.
+  void FfnUnpack(bool tiled, NpuView c) {
+    std::vector<hrx_buffer_ref_t> rest = {Ref(*ffnup_)};
+    std::uint64_t writes = 2;
+    ffn_bfp_ = geom_.count("npuffnbfp") && NpuRows("down");
+    if (ffn_bfp_) {
+      std::size_t bytes = 0;
+      for (const auto& [k0, K] : NpuChunks("down")) bytes += NpuK(K).a;
+      rest.push_back({npu_->A().handle, 0, bytes});
+      writes |= 4;
+    }
+    NpuUnpack(tiled ? "npu_unpack_ffn_t.hal" : "npu_unpack_ffn.hal", c, rest, writes);
+  }
+  // The NPU's rows of wname (its last rows) decoded straight into W panels from w_off within this job's W slot
+  // ("dqbfp_<fmt>_<mt>_<kb>[_c<i>]", dispatch.txt: <workgroups> <workgroup size>); the W views per chunk and call.
+  // The decode reads only weights, so it is recorded into the previous job's GPU segment, where it runs beside that
+  // segment's GEMM while the NPU works; the two slots alternate per job.
+  std::vector<std::vector<NpuView>> NpuDecode(const std::string& site, const std::string& wname, std::uint32_t rows,
+                                              std::size_t& w_off) {
+    if (npu_dcol_) return NpuRawRows(site, wname, rows);
+    const std::size_t slot = (npu_job_ % 2) * (npu_->W().size / 2);
+    const auto* t = Find(wname);
+    Fmt f{};
+    const std::string base = GemmHal("gemm_kstore", *t, &f);
+    const auto chunks = NpuChunks(site);
+    const std::size_t row_bytes = static_cast<std::size_t>(t->bytes) / static_cast<std::size_t>(t->dims[1]);
+    std::vector<std::vector<NpuView>> views;
+    for (std::size_t c = 0; c < chunks.size(); ++c) {
+      const std::string dq = "dqbfp" + base.substr(std::strlen("gemm_kstore"), base.size() - std::strlen("gemm_kstore") - 4) +
+                             (NpuChunked(site) ? "_c" + std::to_string(c) : "") + ".hal";
+      const Geom& g = geom_.at(dq);
+      const std::size_t panel = NpuK(chunks[c].second).w, calls = rows / NpuCallRows();
+      auto b = GemmWeights(*t, f);
+      b[0].offset += (static_cast<std::size_t>(t->dims[1]) - rows) * row_bytes;
+      b[0].length = std::size_t{rows} * row_bytes;
+      b.push_back({npu_->W().handle, slot + w_off, calls * panel});
+      PlannedDecode d{dq, "yah_dequant_" + std::string(f.name) + "_bfp16", g.tokens, g.rowgrp, b};
+      if (npu_planning_) planned_dq_.resize(npu_job_ + 1), planned_dq_[npu_job_].push_back(d);
+      // the previous job's NpuJoin dispatched it already, unless the plan differs here (the last layer's trimmed tail)
+      if (!Predecoded(d))
+        Dispatch(Exe(dq), d.name.c_str(), d.gx, 1, 1, d.wg, 1, 1, d.b, std::uint64_t{1} << (b.size() - 1));
+      views.emplace_back();
+      for (std::size_t p = 0; p < calls; ++p) views.back().push_back({slot + w_off + p * panel, panel});
+      w_off += calls * panel;
+    }
+    return views;
+  }
+  // Decoder-column sets: the NPU's rows of wname (its last rows) as raw GGUF bytes, per chunk and call (offsets from the
+  // tensor data base). A call reads, per row and pass, one record of 4 super-blocks from the chunk's first k; the
+  // planning pass registers the rows (and the last records' over-read) with the NPU.
+  std::vector<std::vector<NpuView>> NpuRawRows(const std::string& site, const std::string& wname, std::uint32_t rows) {
+    const auto* t = Find(wname);
+    const bool bx = SiteBfp(wname);
+    const std::size_t K = t->dims[0], M = t->dims[1];
+    const std::size_t row_bytes = bx ? K / 256 * kBfpBlock : static_cast<std::size_t>(t->bytes) / M;
+    const std::size_t blk = row_bytes * 256 / K, first = (bx ? 0 : t->offset) + (M - rows) * row_bytes;
+    const std::size_t cr = NpuCallRows();
+    const char* const dec = SiteDec(wname);
+    if (!dec) throw LoomError("prefill: no NPU format for " + wname);
+    const std::size_t extent = (cr - 1) * row_bytes + 16 * blk + RecordRow(dec);   // gen_npu_gemm.fill_inputs
+    if (bx) HostRows("npu_bfp_" + wname + ".bin", M * row_bytes, {{first, rows * row_bytes}});
+    if (npu_planning_) {
+      const std::size_t end = bx ? first + rows * row_bytes + 8192
+                                 : std::min(first + rows * row_bytes + 4096, gguf_.tensor_data_size());
+      npu_->RegisterRaw(RawBase(wname) + first, end - first);
+      if (bx) NpuOnly(t->offset + (M - rows) * (t->bytes / M), rows * (t->bytes / M));
+    }
+    std::vector<std::vector<NpuView>> views;
+    for (const auto& [k0, Kc] : NpuChunks(site)) {
+      views.emplace_back();
+      for (std::size_t p = 0; p < rows / cr; ++p)
+        views.back().push_back({first + p * cr * row_bytes + k0 / 256 * blk, extent});
+    }
+    return views;
+  }
+  // The NPU calls of one matrix: per chunk, per NpuCallRows() rows; C panels from c_off, chunk-major (the unpack sums the chunks).
+  // Returns the C view they fill. Decoder-column sets: wname's image, its raw rows w (NpuRawRows). half: the half set's
+  // image (token halves).
+  NpuView NpuCalls(const std::string& site, const std::vector<NpuView>& a, const std::vector<std::vector<NpuView>>& w,
+                   std::size_t& c_off, std::vector<std::uint32_t>& calls, const std::string& wname, bool half = false) {
+    const auto chunks = NpuChunks(site);
+    const std::size_t start = c_off;
+    int dec = -1;
+    std::string swap;
+    if (npu_dcol_) {
+      swap = (half ? hdir_ : dir_) + "/npu_dcol_" + SiteDec(wname) + ".swap.xdna";
+      if (::access(swap.c_str(), R_OK) != 0) swap.clear();   // fused sets (YAH_NPU_FUSE): no decoder tiles to swap
+    }
+    for (std::size_t c = 0; c < chunks.size(); ++c) {
+      const std::string image =
+          npu_dcol_ ? DcolImage(wname, &dec, half) : dir_ + "/npu_gemm_" + std::to_string(chunks[c].second) + ".xdna";
+      const std::size_t cp = half ? HNpuK(chunks[c].second).c : NpuK(chunks[c].second).c;
+      for (const NpuView& wv : w[c]) {
+        // fused sets: each image its own family (a family change runs the image's setup; a swap would splice a whole
+        // image's first call, which stalls the array)
+        calls.push_back(npu_dcol_ ? npu_->BindRaw(image, swap.empty() ? image : swap, dec, a[c],
+                                                  RawBase(wname) + wv.offset,
+                                                  wv.length, {c_off, cp}, swap.empty() ? image : "dcol")
+                                  : npu_->Bind(image, a[c], wv, {c_off, cp}));
+        c_off += cp;
+      }
+    }
+    return {start, c_off - start};
+  }
+  // npu_unpack_<site>: C view c, then bindings (writes: the mask over all bindings, C at bit 0). half: the half set's.
+  void NpuUnpack(const std::string& hal, NpuView c, std::vector<hrx_buffer_ref_t> rest, std::uint64_t writes,
+                 bool half = false) {
+    const Geom& g = half ? HGeom(hal) : geom_.at(hal);
+    rest.insert(rest.begin(), {npu_->C().handle, c.offset, c.length});
+    Dispatch(half ? HExe(hal) : Exe(hal), "yah_npu_unpack", g.tokens, 1, 1, g.rowgrp, 1, 1, rest, writes);
+  }
+  // The swiglu HAL a GEMM on wname runs (afrag form with af, fragment-major output with tout).
+  std::string SwigluHal(const std::string& wname, bool af, bool tout) const {
+    Fmt f{};
+    const std::string base = GemmHal("gemm_swiglu", *Find(wname), &f);
+    return af ? AfHal(base, tout ? ".af.to.hal" : ".af.hal") : base;
+  }
+  // The kqg HAL a GEMM on wname runs (afrag form with af), "" if the set has none.
+  std::string KqgHal(const std::string& wname, bool af) const {
+    Fmt f{};
+    if (!FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f)) return "";
+    const std::string base = GemmHal("gemm_kqg", *Find(wname), &f);
+    return !geom_.count(base) ? "" : af ? AfHal(base) : base;
+  }
+  // The GPU's rows of the swiglu GEMM on wname (hal: the split HAL), its gate input and output at the full stride.
+  void RunSwigluSplit(const std::string& wname, bool af, const std::string& hal, std::uint32_t npu_rows) {
+    const auto* t = Find(wname);
+    Fmt f{};
+    GemmHal("gemm_swiglu", *t, &f);
+    const Geom g = GeomOf(hal);
+    auto b = GemmWeights(*t, f);
+    const std::size_t first = b.size();
+    for (const LoomBuffer* x :
+         std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, gateffn_, uwstage_, ostage_, ffnup_})
+      b.push_back(Ref(*x));
+    const std::size_t M = t->dims[1];
+    const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 2}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(), (MTiles(*t) - npu_rows / 16) / g.rowgrp,
+             tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+  }
+  // The GPU's heads of the attention q projection (hal: the split kqg HAL) into q_ / gate_ at the full stride.
+  void RunKqgSplit(const std::string& wname, bool af, const std::string& hal, std::uint32_t npu_rows) {
+    const auto* t = Find(wname);
+    Fmt f{};
+    GemmHal("gemm_kqg", *t, &f);
+    const Geom g = GeomOf(hal);
+    auto b = GemmWeights(*t, f);
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_, q_, gate_})
+      b.push_back(Ref(*x));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_kqg").c_str(), (MTiles(*t) - npu_rows / 16) / g.rowgrp,
+             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {q_, gate_}));
+  }
+  // The GPU's rows [0, rows - npu_rows) of kstore wname (hal: the split HAL); out keeps the full row stride.
+  void RunKstoreSplit(const std::string& wname, const LoomBuffer& out, bool af, const std::string& hal,
+                      std::uint32_t npu_rows) {
+    const auto* t = Find(wname);
+    Fmt f{};
+    GemmHal("gemm_kstore", *t, &f);
+    const Geom g = GeomOf(hal);
+    auto b = GemmWeights(*t, f);
+    const std::size_t first = b.size();
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_})
+      b.push_back(Ref(*x));
+    b.push_back(Ref(out));
+    const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, 0, 0, std::size_t(t->dims[1]) * 4}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), (MTiles(*t) - npu_rows / 16) / g.rowgrp, tt, 1,
+             32, 1, 1, b, GemmWrites(b, f, {&out}));
+  }
+  // The chunk's graph: the whole chunk (after layer 0's, SplitGraph) is one graph, the NPU handoffs included
+  // (NpuEnqueue / NpuJoin).
   // Replacing a launched graph is safe: the queue retains its command buffers until they complete, and every buffer and
   // executable they use is this object's.
   void NewGraph() {
@@ -1187,6 +1862,105 @@ class LoomPrefill {
     split_armed_ = false;
     chunk_graph_->Launch();
     NewGraph();
+  }
+
+
+  // NPU handoffs are graph nodes on flag words in host memory (NpuSplit::Flags), so the host never splits the chunk.
+  // NpuEnqueue: the graph stores the job's gate value to its ready word once its encoders / decoders are done (release,
+  // system scope: A and W reach memory first); the NPU waits for it itself. NpuJoin: yah_npu_flag_wait polls the done
+  // word; it stands for the NPU's reads of A / W and writes of C, so the unpacks and the next job's encoders and
+  // decoders order after it. The jobs are queued right after the chunk graph launches.
+  // A weight decode of the planning pass (EnableNpu), dispatched early in one-graph mode.
+  struct PlannedDecode {
+    std::string hal, name;
+    std::uint32_t gx, wg;
+    std::vector<hrx_buffer_ref_t> b;
+    bool operator==(const PlannedDecode& o) const {
+      if (hal != o.hal || gx != o.gx || wg != o.wg || b.size() != o.b.size()) return false;
+      for (std::size_t i = 0; i < b.size(); ++i)
+        if (b[i].buffer != o.b[i].buffer || b[i].offset != o.b[i].offset || b[i].length != o.b[i].length) return false;
+      return true;
+    }
+  };
+  bool Predecoded(const PlannedDecode& d) const {
+    return std::find(predecoded_.begin(), predecoded_.end(), d) != predecoded_.end();
+  }
+  // Job j's half of W (NpuDecode alternates them): the next job's decode must not wait for this job's NPU work.
+  hrx_buffer_ref_t WSlot(std::uint32_t job) const {
+    const std::size_t half = npu_->W().size / 2;
+    return {npu_->W().handle, (job % 2) * half, half};
+  }
+  hrx_buffer_ref_t FlagWord(std::uint32_t w) const { return {npu_->Flags()->handle, std::size_t{w} * 4, 4}; }
+  hrx_buffer_ref_t AView(NpuView v) const { return {npu_->A().handle, v.offset, v.length}; }
+  hrx_buffer_ref_t CView(NpuView v) const { return {npu_->C().handle, v.offset, v.length}; }
+  // A job's NPU side: the A ranges it reads and the C range it writes (empty a: all of A and C).
+  struct NpuSide {
+    std::vector<hrx_buffer_ref_t> a;
+    hrx_buffer_ref_t c;
+  };
+  // The job's calls; tag names it in the NPU stats. Returns its index in this chunk (NpuJoin).
+  std::uint32_t NpuEnqueue(std::vector<std::uint32_t> calls, std::string tag, NpuSide side = {}) {
+    const std::uint32_t job = npu_job_++;
+    if (npu_planning_) return job;
+    if (side.a.empty()) side = {{Ref(npu_->A())}, Ref(npu_->C())};
+    const NpuSplit::Job words = npu_->NewJob(calls);
+    std::vector<hrx_buffer_ref_t> in = side.a;
+    if (!npu_dcol_) in.push_back(WSlot(job));
+    graph_->AtomicStore(FlagWord(words.ready), words.gate, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE, in,
+                        {side.c});
+    flagged_.push_back({std::move(calls), std::move(tag), words, layer_});
+    job_side_.push_back(std::move(side));
+    return job;
+  }
+  // Queue the GPU work that runs beside job (default: the last enqueued one) before this.
+  void NpuJoin(std::int64_t job = -1) {
+    if (npu_planning_) return;
+    NpuWait w = NpuJoinBegin(job);
+    if (waitlog_) {   // YAH_NPU_WAITLOG: the wait's poll count to its own slot (ReportWaitLog)
+      const NpuSplit::Queued& q = flagged_.at(job < 0 ? flagged_.size() - 1 : static_cast<std::size_t>(job));
+      if (waitlog_tag_.size() == kWaitLogSlots) throw LoomError("YAH_NPU_WAITLOG: more waits than log slots");
+      w.words.push_back({waitlog_->handle, waitlog_tag_.size() * 4, 4});
+      waitlog_tag_.push_back(std::to_string(q.layer) + " " + q.tag);
+      Dispatch(Exe("npu_flag_wait_log.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 12, &w.npu_side);
+    } else {
+      Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 4, &w.npu_side);
+    }
+    NpuJoinEnd(job);
+  }
+  // NpuJoin's parts around the dispatch that waits for the last enqueued job (yah_npu_flag_wait, or a GEMM whose
+  // epilogue waits: gen_gemm_tile.NPUADD): the next job's weight decodes, then what that dispatch binds (the job's flag
+  // words done, ready, status; status is written) and orders (the NPU-side buffers, as also-writes).
+  struct NpuWait {
+    std::vector<hrx_buffer_ref_t> words, npu_side;
+  };
+  // The wait stands for the NPU work of every job up to job not joined before (the NPU runs them in order).
+  NpuWait NpuJoinBegin(std::int64_t job_or_last = -1) {
+    const auto job = static_cast<std::uint32_t>(job_or_last < 0 ? flagged_.size() - 1 : job_or_last);
+    // the next job's weight decodes run beside this job's GPU work
+    predecoded_.clear();
+    if (job + 1 < planned_dq_.size())
+      for (const PlannedDecode& d : planned_dq_[job + 1]) {
+        Dispatch(Exe(d.hal), d.name.c_str(), d.gx, 1, 1, d.wg, 1, 1, d.b, std::uint64_t{1} << (d.b.size() - 1));
+        predecoded_.push_back(d);
+      }
+    const NpuSplit::Queued& j = flagged_.at(job);
+    NpuWait w{{FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, {}};
+    for (std::size_t i = npu_joined_; i <= job; ++i) {
+      w.npu_side.insert(w.npu_side.end(), job_side_[i].a.begin(), job_side_[i].a.end());
+      if (!npu_dcol_) w.npu_side.push_back(WSlot(static_cast<std::uint32_t>(i)));
+      w.npu_side.push_back(job_side_[i].c);
+    }
+    return w;
+  }
+  void NpuJoinEnd(std::int64_t job_or_last = -1) {
+    const std::size_t job = job_or_last < 0 ? flagged_.size() - 1 : static_cast<std::size_t>(job_or_last);
+    npu_joined_ = std::max(npu_joined_, job + 1);
+    // decoder-column sets count jobs per chunk: the joined jobs' words read zero again before the next chunk reuses them
+    // (only the joined ones: a later job may still be waiting at its gate)
+    if (npu_dcol_)
+      for (; npu_cleared_ <= job; ++npu_cleared_)
+        for (const std::uint32_t w : {flagged_[npu_cleared_].words.ready, flagged_[npu_cleared_].words.done})
+          graph_->AtomicStore(FlagWord(w), 0, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE, {}, {});
   }
 
   // af: the afrag form, input normt_ (fragment-major)
@@ -1211,8 +1985,8 @@ class LoomPrefill {
       b.push_back(Ref(*x));
     b.push_back(Ref(out));
     const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, 0, 0, std::size_t(t->dims[1]) * 4}, g);
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b,
-             GemmWrites(b, f, {&out}));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp,
+             tt, 1, 32, 1, 1, b, GemmWrites(b, f, {&out}));
     return false;
   }
   // qsplit: the q head-norm weight beside a layer's attn_q.weight
@@ -1330,7 +2104,8 @@ class LoomPrefill {
       b.push_back(Ref(*x));
     const std::size_t M = t->dims[1];
     const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 2}, g);
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(), MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_swiglu").c_str(),
+             MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
   }
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
@@ -1367,6 +2142,57 @@ class LoomPrefill {
       // the persistent kres (".af.p.hal": each workgroup runs every token tile of its row block, grid y = 1) unless trimmed
       const std::string pers = af ? AfHal(fused0, ".af.p.hal") : "";
       const bool use_p = !pers.empty() && tt == g.tt;
+      // NPU split (sites "out": ssm_out / attn_output, "down": ffn_down) of untrimmed chunks
+      const char* site = wname.find("ffn_down") != std::string::npos ? "down" : "out";
+      const std::uint32_t nn = tt == g.tt && NpuOk(wname) ? NpuRows(site) : 0;
+      // The persistent kres runs one workgroup per row block (one per CU unsplit), so the split uses the tiled form.
+      const std::string sh = nn ? NpuHal(fused) : "";
+      if (!sh.empty()) {
+        const auto a = NpuEncode(site, input, af, NpuPk(wname));
+        std::size_t w_off = 0, c_off = 0;
+        const auto w = NpuDecode(site, wname, nn, w_off);
+        std::vector<std::uint32_t> calls;
+        const NpuView c = NpuCalls(site, a, w, c_off, calls, wname);
+        NpuEnqueue(std::move(calls), site);
+        const Geom gs = GeomOf(sh);
+        const std::string kname = std::string("yah_ffn_gemm_") + f.name + "_kres";
+        const std::uint32_t blocks = (MTiles(*t) - nn / 16) / gs.rowgrp;
+        // The persistent kres (one workgroup per row block) over all but the last token tile, the tiled kres on that
+        // tile beside it (disjoint token ranges: the graph runs them together on the CUs the row blocks leave idle).
+        const std::string p3 = fused0.substr(0, fused0.size() - 4) + ".af.p3.npu.hal";   // NPU split only
+        if (af && geom_.count(p3) && tt == g.tt) {
+          const std::size_t T = tt - 1;
+          const std::size_t tile = B_ / tt;
+          // per-token bytes of input, residual and output (bindings first, first + 1, first + 4)
+          const std::size_t stride[] = {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 4};
+          auto part = [&](std::size_t tok0, std::size_t ntok) {
+            auto r = b;
+            for (std::size_t i = 0; i < 5; ++i)
+              if (stride[i]) r[first + i].offset += tok0 * stride[i], r[first + i].length = ntok * stride[i];
+            return r;
+          };
+          const auto b0 = part(0, T * tile), b1 = part(T * tile, tile);
+          Dispatch(Exe(p3), kname.c_str(), blocks, 1, 1, 32, 1, 1, b0, GemmWrites(b0, f, {hidden2_}));
+          Dispatch(Exe(sh), kname.c_str(), blocks, 1, 1, 32, 1, 1, b1, GemmWrites(b1, f, {hidden2_}));
+        } else {
+          Dispatch(Exe(sh), kname.c_str(), blocks, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+        }
+        // the rest of K for the NPU's rows (its last nn weight rows), beside the GPU's rows: f32 [tokens][nn]
+        const std::string rh = "npurem_" + std::string(site) + "_" + f.name + ".hal";
+        const Geom& gr = geom_.at(rh);
+        const std::size_t row_bytes = static_cast<std::size_t>(t->bytes) / M;
+        auto rb = GemmWeights(*t, f);
+        rb[0].offset += (M - nn) * row_bytes, rb[0].length = std::size_t{nn} * row_bytes;
+        for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_}) rb.push_back(Ref(*x));
+        rb.push_back({npurem_->handle, 0, std::size_t{B_} * nn * 4});
+        Dispatch(Exe(rh), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), nn / 16 / gr.rowgrp, gr.tt, 1, 32, 1, 1, rb,
+                 std::uint64_t{1} << (rb.size() - 1));
+        NpuJoin();
+        NpuUnpack(std::string("npu_unpack_") + site + ".hal", c,
+                  {Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * nn * 4}, Ref(*hidden2_)}, 8);
+        std::swap(hidden_, hidden2_);
+        return;
+      }
       Dispatch(Exe(use_p ? pers : fused), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(),
                MTiles(*t) / g.rowgrp, use_p ? 1 : tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
       std::swap(hidden_, hidden2_);
@@ -1377,7 +2203,8 @@ class LoomPrefill {
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*t, f);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_, partial_}) b.push_back(Ref(*x));
-    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp, TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {partial_}));
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp,
+             TokenTiles(g), 1, 32, 1, 1, b, GemmWrites(b, f, {partial_}));
     const std::size_t n = std::size_t{B_} * kHidden;
     Dispatch(Exe("accum.hal"), "yah_residual_1d", static_cast<std::uint32_t>(n / 256), 1, 1, 256, 1, 1,
              {Ref(*hidden_), {partial_->handle, 0, n * 4}, Ref(*hidden2_)});
@@ -1390,33 +2217,56 @@ class LoomPrefill {
     if (ai >= full_) throw LoomError("full-attention layer index past the KV slot count");
     // an afrag o-projection reads the attention output fragment-major (wmma_t)
     const bool o_af = Af("gemm_kres", pre + "attn_output.weight");
-    // nqw: all three wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_) gate_'s
-    // reader since the last barrier (that tail's pnq, row by row) finished each token tile before it reaches kqg:
-    // kqg's outputs untracked too
-    iu4_wait_ = std::exchange(nq_cnt_, {});
-    iu4_untrack_ = std::exchange(dn_chained_, false) && iu4_wait_.buffer ? 0b11000 : 0;
-    // seg: k and v ride in the kqg GEMM's dispatch (f16 sets)
-    const bool seg = q_af && k_af && v_af && RunSeg({{"gemm_kqg", pre + "attn_q.weight", {q_, gate_}},
-                                                     {"gemm_kstore", pre + "attn_k.weight", {kbuf_}},
-                                                     {"gemm_kstore", pre + "attn_v.weight", {vbuf_}}});
-    const bool qg_fused = seg || RunKqg(pre + "attn_q.weight", q_af);
-    iu4_untrack_ = 0;
-    if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
-    if (gsig_ && !qg_fused) throw LoomError("the sigmoid gate (gsig) needs the kqg GEMM");
-    if (qsplit_ && !qg_fused) throw LoomError("the split q norm (qsplit) needs the kqg GEMM");
-    if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
-    // ropew: k / v flagged (per-token-tile counters), RoPE polls them instead of a graph barrier. Not when RoPE ends
-    // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
-    const bool rw = ropew_ && qnorm_ && n_ == B_ && tail_ != kNoRows;
-    if (rw) kv_cnt_[0] = FlagSlot(), kv_cnt_[1] = FlagSlot();
-    if (seg && rw) throw LoomError("seg k / v: no RoPE flags (ropew is A4)");
-    if (!seg) {
-      kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
-      kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
+    const std::uint32_t nq = NpuOk(pre + "attn_q.weight") ? NpuRows("q") : 0;   // (a format without a decoder: GPU)
+    const std::string qs = nq ? NpuHal(KqgHal(pre + "attn_q.weight", q_af)) : "";
+    bool qg_fused = !qs.empty();
+    if (qg16_ && qg_fused) throw LoomError("f16 q / gate (qg16) needs the GPU kqg GEMM, not the NPU's");
+    if (gsig_ && qg_fused) throw LoomError("the kqg GEMM's sigmoid gate (gsig) needs the GPU kqg GEMM, not the NPU's");
+    if (qsplit_ && qg_fused) throw LoomError("the kqg GEMM's split q norm (qsplit) needs the GPU kqg GEMM, not the NPU's");
+    if (qg_fused) {
+      // the NPU's heads of q (whole heads of 512 rows [256 q | 256 gate]) beside the GPU's heads and k / v;
+      // the norm wrote the row-major input unless q, k and v are all afrag
+      const bool tiled = q_af && k_af && v_af;
+      const auto a = NpuEncode("q", tiled ? *normt_ : *scratch_, tiled, NpuPk(pre + "attn_q.weight"));
+      std::size_t w_off = 0, c_off = 0;
+      const auto w = NpuDecode("q", pre + "attn_q.weight", nq, w_off);
+      std::vector<std::uint32_t> calls;
+      const NpuView c = NpuCalls("q", a, w, c_off, calls, pre + "attn_q.weight");
+      NpuEnqueue(std::move(calls), "q");
+      RunKqgSplit(pre + "attn_q.weight", q_af, qs, nq);
+      RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
+      RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
+      NpuJoin();
+      NpuUnpack("npu_unpack_q.hal", c, {Ref(*q_), Ref(*gate_)}, 6);
     } else {
-      kv_flagged_ = false;
+      // nqw: all three wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_) gate_'s
+      // reader since the last barrier (that tail's pnq, row by row) finished each token tile before it reaches kqg:
+      // kqg's outputs untracked too
+      iu4_wait_ = std::exchange(nq_cnt_, {});
+      iu4_untrack_ = std::exchange(dn_chained_, false) && iu4_wait_.buffer ? 0b11000 : 0;
+      // seg: k and v ride in the kqg GEMM's dispatch (f16 sets)
+      const bool seg = q_af && k_af && v_af && RunSeg({{"gemm_kqg", pre + "attn_q.weight", {q_, gate_}},
+                                                       {"gemm_kstore", pre + "attn_k.weight", {kbuf_}},
+                                                       {"gemm_kstore", pre + "attn_v.weight", {vbuf_}}});
+      qg_fused = seg || RunKqg(pre + "attn_q.weight", q_af);
+      iu4_untrack_ = 0;
+      if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
+      if (gsig_ && !qg_fused) throw LoomError("the sigmoid gate (gsig) needs the kqg GEMM");
+      if (qsplit_ && !qg_fused) throw LoomError("the split q norm (qsplit) needs the kqg GEMM");
+      if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
+      // ropew: k / v flagged (per-token-tile counters), RoPE polls them instead of a graph barrier. Not when RoPE ends
+      // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
+      const bool rw = ropew_ && qnorm_ && n_ == B_ && tail_ != kNoRows;
+      if (rw) kv_cnt_[0] = FlagSlot(), kv_cnt_[1] = FlagSlot();
+      if (seg && rw) throw LoomError("seg k / v: no RoPE flags (ropew is A4)");
+      if (!seg) {
+        kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
+        kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
+      } else {
+        kv_flagged_ = false;
+      }
+      iu4_wait_ = {}, iu4_untrack_ = 0;
     }
-    iu4_wait_ = {}, iu4_untrack_ = 0;
     if (!qg_fused)
       Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
     const std::size_t koff = kv16_scratch_ ? 0 : std::size_t{ai} * kv_cache_ * 2;
@@ -1566,27 +2416,65 @@ class LoomPrefill {
     const bool dn_chained = std::exchange(dn_chained_, false);   // the last DeltaNet tail ran chained (dnring)
     // alpha / beta first: they read the norm's row-major copy (21 MB), which the qkv / gate GEMMs would evict from the
     // last-level cache (0.18 vs ~0.39 M cycles each)
+    const bool nok = NpuOk(pre + "attn_qkv.weight") && NpuOk(pre + "attn_gate.weight");
+    const std::uint32_t nq = nok ? NpuRows("qkv") : 0, ng = nok ? NpuRows("gate") : 0;
+    const std::string qkv_split = nq ? NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)) : "";
+    const std::string gate_split = ng ? NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)) : "";
+    // conv_c: the conv reads the NPU's qkv columns straight from C ("convkq_c.hal"); the unpack writes only the conv ring
+    NpuView conv_c{};
+    bool gate_late = false;
     // dnov: the qkv GEMM and the conv, the gate GEMM and pnq part a as flagged pairs (FlagSlot), so the conv runs in the
     // qkv GEMM's tail and pnq part a in the gate GEMM's
     hrx_buffer_ref_t qkv_cnt{}, gate_cnt{}, dn_cnt{};
     bool qkv_flagged = false, gate_flagged = false, qkv_waited = false;
-    // nqw: alpha, beta and qkv wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_)
-    // their outputs' readers since the last barrier (that tail's DeltaNet part b and ring update) finished before its
-    // pnq and so before each token tile reaches them: untracked too
-    iu4_wait_ = std::exchange(nq_cnt_, {});
-    iu4_untrack_ = dn_chained && iu4_wait_.buffer ? 0b1000 : 0;
-    // seg: alpha and beta ride in the qkv GEMM's dispatch (f16 sets)
-    const bool seg = qkv_af && RunSeg({{"gemm_kstore", pre + "attn_qkv.weight", {qkv_}},
-                                       {"gemm_kstore", pre + "ssm_alpha.weight", {alpha_}},
-                                       {"gemm_kstore", pre + "ssm_beta.weight", {beta_}}});
-    if (!seg) RunAlphaBeta(pre);
-    // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
-    const bool gate_late = geom_.count("dnvconv") != 0;
-    if (dnov_ && gate_late) qkv_cnt = FlagSlot();
-    qkv_waited = iu4_wait_.buffer && iu4_untrack_;
-    if (!seg) qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
-    if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
-    iu4_wait_ = {}, iu4_untrack_ = 0;
+    if (!qkv_split.empty() && !gate_split.empty()) {
+      // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows (one job: the same activations)
+      // decoder-column sets: each matrix's activations in its decoder's k-block order
+      const bool kq = NpuPk(pre + "attn_qkv.weight"), kg = NpuPk(pre + "attn_gate.weight");
+      std::vector<NpuView> a4, ak;
+      if (!kq || !kg) a4 = NpuEncode("qkv", *scratch_, false);
+      if (kq || kg) ak = NpuEncode("qkv", *scratch_, false, true);
+      std::size_t w_off = 0, c_off = 0;
+      const auto wq = NpuDecode("qkv", pre + "attn_qkv.weight", nq, w_off);
+      const auto wg = NpuDecode("gate", pre + "attn_gate.weight", ng, w_off);
+      std::vector<std::uint32_t> calls;
+      const NpuView cq = NpuCalls("qkv", kq ? ak : a4, wq, c_off, calls, pre + "attn_qkv.weight");
+      // fused sets: a job runs one image (one family: NpuCalls)
+      if (npu_dcol_ && DcolImage(pre + "attn_qkv.weight") != DcolImage(pre + "attn_gate.weight") &&
+          ::access((dir_ + "/npu_dcol_iq4xs.swap.xdna").c_str(), R_OK) != 0)
+        NpuEnqueue(std::exchange(calls, {}), "qkv");
+      const NpuView cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
+      NpuEnqueue(std::move(calls), "qkv");
+      RunAlphaBeta(pre);
+      RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
+      RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, ng);
+      NpuJoin();
+      if (geom_.count("convkq_c.hal")) {
+        conv_c = cq;
+        NpuUnpack("npu_unpack_qkv_tail.hal", cq, {Ref(*qkv_)}, 2);
+      } else {
+        NpuUnpack("npu_unpack_qkv.hal", cq, {Ref(*qkv_)}, 2);
+      }
+      NpuUnpack("npu_unpack_gate.hal", cg, {Ref(*gate_)}, 2);
+    } else {
+      // nqw: alpha, beta and qkv wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_)
+      // their outputs' readers since the last barrier (that tail's DeltaNet part b and ring update) finished before its
+      // pnq and so before each token tile reaches them: untracked too
+      iu4_wait_ = std::exchange(nq_cnt_, {});
+      iu4_untrack_ = dn_chained && iu4_wait_.buffer ? 0b1000 : 0;
+      // seg: alpha and beta ride in the qkv GEMM's dispatch (f16 sets)
+      const bool seg = qkv_af && RunSeg({{"gemm_kstore", pre + "attn_qkv.weight", {qkv_}},
+                                         {"gemm_kstore", pre + "ssm_alpha.weight", {alpha_}},
+                                         {"gemm_kstore", pre + "ssm_beta.weight", {beta_}}});
+      if (!seg) RunAlphaBeta(pre);
+      // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
+      gate_late = geom_.count("dnvconv") != 0;
+      if (dnov_ && gate_late) qkv_cnt = FlagSlot();
+      qkv_waited = iu4_wait_.buffer && iu4_untrack_;
+      if (!seg) qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
+      if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
+      iu4_wait_ = {}, iu4_untrack_ = 0;
+    }
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
                               std::size_t{kTs} * kState * kState * 4};
@@ -1603,7 +2491,18 @@ class LoomPrefill {
                 Ref(*ab_), Ref(*valid_)},
                0b1100000);
     };
-    if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {
+    if (conv_c.length) {
+      const Geom& gg = geom_.at("convkq_g.hal");
+      const Geom& gc = geom_.at("convkq_c.hal");
+      Dispatch(Exe("convkq_g.hal"), "yah_ssm_conv_kq", gg.tokens, B_ / conv_tb, 1, 256, 1, 1,
+               {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
+      Dispatch(Exe("convkq_c.hal"), "yah_ssm_conv_kq_c", gc.tokens, gc.tt, 1, gc.rowgrp, 1, 1,
+               {{npu_->C().handle, conv_c.offset, conv_c.length},
+                TRef(*Find(pre + "ssm_conv1d.weight")),
+                cs,
+                Ref(*conv_out_)},
+               8);
+    } else if (const auto dvc = geom_.find("dnvconv"); dvc != geom_.end()) {
       // dispatch.txt "dnvconv <conv workgroups>": the conv takes only the q / k heads; DeltaNet computes the v channels'
       // conv and alpha / beta itself (gen_gdn_chunk vconv), and prep_ab only advances the conv ring, after both parts
       // (they read the ring before token 0)
@@ -1745,8 +2644,13 @@ class LoomPrefill {
     }
     if (dnsplit_a_) {
       const std::string pn = out_af ? "postnorm_t" : "postnorm";
-      Dispatch(Exe(pn + "_a.hal"), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1,
-               {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
+      // heads [0, a) are ssm_out's NPU K chunk: with "npupostnormbfp" this part also writes the NPU's input into A and
+      // NpuEncode("out") skips the encoder (RunResidual splits only full chunks; an unused A costs nothing)
+      const bool bfp = geom_.count("npupostnormbfp") && NpuRows("out") && trim_row_ == kAllRows && tail_ == kAllRows;
+      norm_bfp_ = bfp ? "out" : "";
+      std::vector<hrx_buffer_ref_t> b{Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)};
+      if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
+      Dispatch(Exe(pn + (bfp ? "_a_bfp.hal" : "_a.hal")), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1, b);
       Dispatch(Exe(pn + "_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1,
                {Ref(*raw2_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
     } else {
@@ -1757,6 +2661,392 @@ class LoomPrefill {
     trim_row_ = tail_;
     RunResidual(pre + "ssm_out.weight", *scratch_, out_af);
     trim_row_ = kAllRows;
+  }
+
+  // ---- Token halves ----
+  // A layer's qkv / q and out sites run per half of the chunk, so the NPU computes half 1 while the GPU runs half 0's DeltaNet / attention chain.
+  // GPU order: C0 C1 (FFN unpack, attn norm, job) | GPU rows of qkv / q (whole chunk) | A0 o0 A1 o1 (chain, out job, GPU out rows) | B0 B1 (out unpack, FFN norm).
+  // Half h runs the kernels of "<dir>/h" (the set at half the chunk) on token views from h * B / 2; half 1 continues the conv ring, DeltaNet state and KV pools like a next chunk.
+  // HalfA / HalfC: no GPU kernel reads a job's C range between its ready store and its join (the graph orders it only after the store), nor writes an A range the NPU still reads.
+  std::uint32_t HB() const { return B_ / 2; }
+  // Half h's rows of a token-major buffer (row_bytes per token; fragment-major layouts group 16 tokens, so the same).
+  hrx_buffer_ref_t Tok(const LoomBuffer& b, int h, std::size_t row_bytes) const {
+    return {b.handle, std::size_t(h) * HB() * row_bytes, std::size_t{HB()} * row_bytes};
+  }
+  void LoadHalves() {
+    std::ifstream f(dir_ + "/h/dispatch.txt");
+    if (!f) return;
+    std::string name;
+    Geom g{};
+    while (f >> name >> g.tokens >> g.rowgrp >> g.tt) hgeom_[name] = g;
+    const auto c = hgeom_.find("ctx");
+    if (c == hgeom_.end() || 2 * c->second.tokens != B_ || c->second.tt != T_)
+      throw LoomError(dir_ + "/h is not this set at half the chunk (re-emit the set)");
+    hdir_ = dir_ + "/h";
+  }
+  const Geom& HGeom(const std::string& hal) const {
+    const auto it = hgeom_.find(hal);
+    if (it == hgeom_.end()) throw LoomError("h/dispatch.txt has no row for " + hal);
+    return it->second;
+  }
+  // A GEMM HAL of the half set; refuses one emitted for another token count.
+  Geom HGeomOf(const std::string& hal) const {
+    const Geom g = HGeom(hal);
+    if (g.tokens == 0 || g.rowgrp == 0 || (HB() + g.tokens - 1) / g.tokens != g.tt)
+      throw LoomError("h/" + hal + ": emitted for another token count");
+    return g;
+  }
+  LoomExecutable& HExe(const std::string& hal) { return Exe("h/" + hal); }
+  LoomExecutable& HChunkExe(const std::string& stem, std::uint32_t c) {
+    return HExe(stem + (c ? "_c" + std::to_string(c) : std::string()) + ".hal");
+  }
+  NpuBytes HNpuK(std::uint32_t K) const {
+    const Geom& g = HGeom("npubytes_" + std::to_string(K));
+    return {g.tokens, g.rowgrp, g.tt};
+  }
+  bool HalvesOn() const { return halves_ && npu_on_ && n_ == B_ && tail_ == kAllRows && trim_row_ == kAllRows; }
+  // Half h's A slot of a K = 5120 stream (S bytes): the attn norm's (in: qkv, gate, q) or the out site's, pk: the Q4_K
+  // order. out's half-0 slots reuse the in ones (half 0's in jobs are joined first); its half-1 slots lie past the FFN
+  // block's whole-chunk stream [0, 2 S), which the FFN norm halves write while the NPU still reads out's half 1.
+  NpuView HalfA(bool out, int h, bool pk) const {
+    const std::size_t s = HNpuK(5120).a;
+    return {(out && h ? 4 + pk : 2 * pk + (out ? 0 : h)) * s, s};
+  }
+  // A half job's calls of a site.
+  std::size_t HalfCalls(const char* site) const {
+    const auto it = geom_.find(std::string("npusplit_") + site);
+    return it == geom_.end() ? 0 : it->second.tokens / NpuCallRows() * NpuChunks(site).size();
+  }
+  std::size_t HalfCBytes() const {
+    return std::max({HalfCalls("qkv") + HalfCalls("gate"), HalfCalls("q"), HalfCalls("out")}) * HNpuK(5120).c;
+  }
+  // Half h's C region (its in and out jobs: out's half-h job runs once that half's in job is unpacked). Half 0's from 0:
+  // the FFN block's H, which no GPU kernel reads (its down partials after it are still read by the next layer's half-1
+  // unpack while half 0's jobs run); half 1's after every whole-chunk region.
+  std::size_t HalfC(int h) const {
+    const std::size_t whole = WholePlan().c_bytes, need = HalfCBytes();
+    const std::size_t c0 = !FfnBlkF() || need <= FfnBlkDown() ? 0 : (whole + 4095) / 4096 * 4096;
+    return h == 0 ? c0 : (std::max(whole, c0 + need) + 4095) / 4096 * 4096;
+  }
+  // Rows per workgroup of a norm HAL (its workgroup size over dispatch.txt norm_split waves a row).
+  std::uint32_t NormRowsPerWg(const LoomExecutable& exe) const {
+    const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
+    const auto ns = geom_.find("norm_split");
+    const std::uint32_t split = ns != geom_.end() && ns->second.rowgrp ? ns->second.rowgrp : 1;
+    const std::uint32_t rows = ws ? ws / 32 / split : 1;
+    if (!rows || (ws && ws % (32 * split)) || HB() % rows) throw LoomError("norm: workgroup size does not fit a half");
+    return rows;
+  }
+  // The FFN block's unpack the last layer deferred (RunFfnBlock): half h's tokens, or (h < 0) all of them.
+  void FfnUnpackPending(int h) {
+    if (!ffn_pending_.in) return;
+    const std::size_t r = std::size_t{kHidden} * 4;
+    if (h < 0)
+      NpuUnpack("npu_unpack_ffnblk.hal", ffn_pending_.c,
+                {Ref(*ffn_pending_.in), {ffnrem_->handle, 0, B_ * r}, Ref(*ffn_pending_.out)}, 8);
+    else
+      NpuUnpack("npu_unpack_ffnblk_h" + std::to_string(h) + ".hal", ffn_pending_.c,
+                {Tok(*ffn_pending_.in, h, r), Tok(*ffnrem_, h, r), Tok(*ffn_pending_.out, h, r)}, 8);
+    if (h != 0) ffn_pending_ = {};
+  }
+  // C_h's attn norm over half h, with its NPU stream into half h's in slot (the half set's "<norm>_bfp.hal").
+  void HalfNorm(const std::string& wname, NormOut mode, int h) {
+    LoomExecutable& exe = HExe(mode == NormOut::kTiled  ? "norm_t_bfp.hal"
+                               : mode == NormOut::kBoth ? "norm_rt_bfp.hal"
+                                                        : "norm_bfp.hal");
+    const std::size_t r = std::size_t{kHidden} * 4, r16 = std::size_t{kHidden} * 2;
+    std::vector<hrx_buffer_ref_t> b{Tok(*hidden_, h, r), Tok(*reszero_, h, r), TRef(*Find(wname)), Tok(*sumout_, h, r),
+                                    Tok(mode == NormOut::kTiled ? *normt_ : *scratch_, h, r16)};
+    if (mode == NormOut::kBoth) b.push_back(Tok(*normt_, h, r16));
+    b.push_back(AView(HalfA(false, h, false)));
+    Dispatch(exe, "yah_half_norm", HB() / NormRowsPerWg(exe), 1, 1, 32, 1, 1, b);
+  }
+  // B_h's FFN block norm over half h into the whole chunk's stream ("<stem>_h<h>.hal"); x: the layer's new hidden.
+  void FfnHalfNorm(const std::string& pre, const char* stem, const LoomBuffer& x, int h) {
+    LoomExecutable& exe = Exe(std::string(stem) + "_h" + std::to_string(h) + ".hal");
+    const std::size_t r = std::size_t{kHidden} * 4, r16 = std::size_t{kHidden} * 2;
+    Dispatch(exe, "yah_half_norm", HB() / NormRowsPerWg(exe), 1, 1, 32, 1, 1,
+             {Tok(x, h, r),
+              Tok(*reszero_, h, r),
+              TRef(*Find(pre + "post_attention_norm.weight")),
+              Tok(*sumout_, h, r),
+              Tok(*normt_, h, r16),
+              {npu_->A().handle, 0, NpuK(5120).a}});
+  }
+  // Half h's NPU stream ("npu_enc_*" of the half set) from input's half h rows into slot a.
+  void HalfEncode(const std::string& hal, const LoomBuffer& input, std::size_t row_bytes, int h, NpuView a) {
+    const Geom& g = HGeom(hal);
+    Dispatch(HExe(hal), "yah_bfp16_encode_act", g.tokens, 1, 1, g.rowgrp, 1, 1, {Tok(input, h, row_bytes), AView(a)},
+             2);
+  }
+  // The out site (ssm_out / attn_output wname; af: its afrag form) splits by halves: an NPU decoder for its format and
+  // the half set's split HALs.
+  bool HalfOutOk(const std::string& wname, bool af) const {
+    if (!NpuOk(wname) || !NpuRows("out") || DcolImage(wname, nullptr, true).empty()) return false;
+    Fmt f{};
+    const std::string fused0 = GemmHal("gemm_kres", *Find(wname), &f);
+    const std::string fused = af ? AfHal(fused0) : fused0;
+    return geom_.count(fused0) && !fused.empty() && hgeom_.count(fused.substr(0, fused.size() - 4) + ".npu.hal") &&
+           hgeom_.count("npurem_out_" + std::string(f.name) + ".hal") && hgeom_.count("npu_unpack_out.hal");
+  }
+  // o_h: half h of the out site on input (row-major, or fragment-major with af): its NPU job on half h's out slot
+  // (from_norm: the postnorm wrote the p4 stream; else the half encoder), the GPU's rows (the kres split) and the rest of
+  // K of the NPU's rows. Returns the job; c: its C.
+  std::uint32_t OutHalf(const std::string& wname, const LoomBuffer& input, bool af, int h, bool from_norm, NpuView& c) {
+    const auto* t = Find(wname);
+    Fmt f{};
+    const std::string fused0 = GemmHal("gemm_kres", *t, &f);
+    const std::string fused = af ? AfHal(fused0) : fused0;
+    const std::string sh = fused.substr(0, fused.size() - 4) + ".npu.hal";
+    const std::uint32_t nn = NpuRows("out");
+    const std::size_t M = t->dims[1], K = t->dims[0], row_bytes = static_cast<std::size_t>(t->bytes) / M;
+    const bool pk = NpuPk(wname);
+    const NpuView a = HalfA(true, h, pk);
+    if (pk || !from_norm)
+      HalfEncode(std::string("npu_enc_6144_c0") + (af ? "_t" : "") + (pk ? "_pk" : "") + ".hal", input, K * 2, h, a);
+    std::size_t c_off = HalfC(h);
+    std::vector<std::uint32_t> calls;
+    c = NpuCalls("out", {a}, NpuRawRows("out", wname, nn), c_off, calls, wname, true);
+    const std::uint32_t job = NpuEnqueue(std::move(calls), "out", {{AView(a)}, CView(c)});
+    const Geom gs = HGeomOf(sh);
+    auto b = GemmWeights(*t, f);
+    for (const hrx_buffer_ref_t& x :
+         {Tok(input, h, K * 2), Tok(*hidden_, h, M * 4), Ref(*wstage_), Ref(*ostage_), Tok(*hidden2_, h, M * 4)})
+      b.push_back(x);
+    Dispatch(HExe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_kres").c_str(), (MTiles(*t) - nn / 16) / gs.rowgrp,
+             gs.tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+    const std::string rh = "npurem_out_" + std::string(f.name) + ".hal";
+    const Geom gr = HGeomOf(rh);
+    auto rb = GemmWeights(*t, f);
+    rb[0].offset += (M - nn) * row_bytes, rb[0].length = std::size_t{nn} * row_bytes;
+    for (const hrx_buffer_ref_t& x :
+         {Tok(input, h, K * 2), Ref(*wstage_), Ref(*ostage_), Tok(*npurem_, h, std::size_t{nn} * 4)})
+      rb.push_back(x);
+    Dispatch(HExe(rh), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), nn / 16 / gr.rowgrp, gr.tt, 1, 32, 1, 1, rb,
+             std::uint64_t{1} << (rb.size() - 1));
+    return job;
+  }
+  // B0 B1: out's unpack per half (hidden2 = hidden + the NPU's columns + their K remainder) and, when the layer's FFN is
+  // the NPU's FFN block, its norm over that half (RunFfnBlock then skips it); then the hidden buffers swap.
+  void OutHalvesEnd(const std::string& pre, const std::string& wname, const std::uint32_t (&job)[2],
+                    const NpuView (&c)[2]) {
+    const char* norm = nullptr;
+    const bool ffn = RunFfnBlock(pre, &norm) && ::access((dir_ + "/" + norm + "_h1.hal").c_str(), R_OK) == 0;
+    const std::size_t M = Find(wname)->dims[1], nn = NpuRows("out");
+    for (int h = 0; h < 2; ++h) {
+      NpuJoin(job[h]);
+      NpuUnpack("npu_unpack_out.hal", c[h],
+                {Tok(*hidden_, h, M * 4), Tok(*npurem_, h, nn * 4), Tok(*hidden2_, h, M * 4)}, 8, true);
+      if (ffn) FfnHalfNorm(pre, norm, *hidden2_, h);
+    }
+    ffn_normed_ = ffn;
+    std::swap(hidden_, hidden2_);
+  }
+  // A DeltaNet layer by halves (the NPU's qkv / gate rows, and out's when HalfOutOk); false: run it whole.
+  bool RunDeltaNetHalves(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
+    const std::string wq = pre + "attn_qkv.weight", wg = pre + "attn_gate.weight", wo = pre + "ssm_out.weight";
+    if (!HalvesOn() || !dnsplit_a_ || !geom_.count("convkq_c.hal") || DcolImage(wq, nullptr, true).empty() ||
+        DcolImage(wg, nullptr, true).empty())
+      return false;
+    norm_bfp_.clear();
+    const std::uint32_t si = l - l / cfg_.full_attention_interval;
+    const std::uint32_t nq = NpuRows("qkv"), ng = NpuRows("gate");
+    const bool out_af = Af("gemm_kres", wo), out_half = HalfOutOk(wo, out_af);
+    const bool bfp = out_half && hgeom_.count("npupostnormbfp");  // the postnorm writes out's p4 stream
+    const bool kq = NpuPk(wq), kg = NpuPk(wg);
+    // fused sets: a job runs one image; with two, half 1 runs gate first (the array keeps half 0's last image)
+    const bool two = DcolImage(wq, nullptr, true) != DcolImage(wg, nullptr, true) &&
+                     ::access((hdir_ + "/npu_dcol_iq4xs.swap.xdna").c_str(), R_OK) != 0;
+    const auto rq = NpuRawRows("qkv", wq, nq), rg = NpuRawRows("gate", wg, ng);
+    // with two images gate runs whole between qkv's halves (one switch and one fill less than its halves): its own A
+    // stream in out's half-1 slots (free until A_1) and C past half 0's region (dead past C_1's FFN unpack)
+    const std::string genc = std::string("npu_enc_5120") + (kg ? "_pk" : "") + ".hal";
+    const NpuView ga{4 * HNpuK(5120).a, NpuK(5120).a};
+    const std::size_t gc0 = (HalfC(0) + HalfCBytes() + 4095) / 4096 * 4096;
+    const bool gwhole = two && ga.length == 2 * HNpuK(5120).a && geom_.count(genc) && !DcolImage(wg).empty() &&
+                        gc0 + HalfCalls("gate") * NpuK(5120).c <= HalfC(1);
+    std::uint32_t job[2] = {}, gjob = 0;
+    NpuView cq[2], cg[2];
+    for (int h = 0; h < 2; ++h) {
+      FfnUnpackPending(h);
+      HalfNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow, h);
+      const NpuView a4 = HalfA(false, h, false), ak = HalfA(false, h, true);
+      if (kq || (kg && !gwhole)) HalfEncode("npu_enc_5120_pk.hal", *scratch_, std::size_t{kHidden} * 2, h, ak);
+      if (gwhole && h == 1) {
+        const Geom& g = geom_.at(genc);
+        Dispatch(Exe(genc), "yah_bfp16_encode_act", g.tokens, 1, 1, g.rowgrp, 1, 1, {Ref(*scratch_), AView(ga)}, 2);
+        std::size_t c_off = gc0;
+        std::vector<std::uint32_t> calls;
+        cg[0] = NpuCalls("gate", {ga}, rg, c_off, calls, wg);
+        gjob = NpuEnqueue(std::move(calls), "qkv", {{AView(ga)}, CView(cg[0])});
+      }
+      std::size_t c_off = HalfC(h);
+      std::vector<std::uint32_t> calls;
+      const auto add = [&](bool qkv) {  // one matrix's calls (and job, with two images)
+        const std::size_t c0 = c_off;
+        const NpuView a = (qkv ? kq : kg) ? ak : a4;
+        (qkv ? cq : cg)[h] = NpuCalls(qkv ? "qkv" : "gate", {a}, qkv ? rq : rg, c_off, calls, qkv ? wq : wg, true);
+        if (two) job[h] = NpuEnqueue(std::exchange(calls, {}), "qkv", {{AView(a)}, CView({c0, c_off - c0})});
+      };
+      add(h == 0 || gwhole);
+      if (!gwhole) add(h != 0);
+      if (!two) {
+        std::vector<hrx_buffer_ref_t> as{AView(kq ? ak : a4)};
+        if (kq != kg) as.push_back(AView(kg ? ak : a4));
+        job[h] = NpuEnqueue(std::move(calls), "qkv", {as, CView({HalfC(h), c_off - HalfC(h)})});
+      }
+    }
+    // the GPU's rows of the whole chunk (as RunDeltaNet)
+    RunAlphaBeta(pre);
+    RunKstoreSplit(wq, *qkv_, qkv_af, NpuHal(KstoreHal(wq, qkv_af)), nq);
+    RunKstoreSplit(wg, *gate_, gate_af, NpuHal(KstoreHal(wg, gate_af)), ng);
+    const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
+    const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
+                              std::size_t{kTs} * kState * kState * 4};
+    const auto* w1d = Find(pre + "ssm_conv1d.weight");
+    const Geom& gg = HGeom("convkq_g.hal");
+    const Geom& gc = HGeom("convkq_c.hal");
+    const auto ctb = hgeom_.find("convtb");
+    const std::uint32_t conv_tb = ctb != hgeom_.end() ? ctb->second.tokens : 1;
+    const std::uint32_t dn_grp = HGeom("rowsplit.hal").rowgrp;
+    const std::uint32_t dn_thr = hgeom_.count("dnthreads") ? HGeom("dnthreads").tokens : 256;
+    // per token: qkv / conv f16 [10240], gate / postnorm f16 [6144], kq f32 [16][3], ab f32 [48][2], raw f32 [6144]
+    const std::size_t rqkv = std::size_t{kQkv} * 2, rin = std::size_t{kInner} * 2, rkq = std::size_t{kKh} * 3 * 4,
+                      rab = std::size_t{kTs} * 2 * 4, rraw = std::size_t{kInner} * 4, rts = std::size_t{kTs} * 4;
+    const std::string pn = out_af ? "postnorm_t" : "postnorm";
+    std::uint32_t ojob[2] = {};
+    NpuView oc[2];
+    for (int h = 0; h < 2; ++h) {
+      NpuJoin(job[h]);
+      // the conv reads the NPU's v channels from C; the unpack writes the conv ring's tokens (prep_ab reads them)
+      NpuUnpack("npu_unpack_qkv_tail.hal", cq[h], {Tok(*qkv_, h, rqkv)}, 2, true);
+      if (!gwhole) {
+        NpuUnpack("npu_unpack_gate.hal", cg[h], {Tok(*gate_, h, rin)}, 2, true);
+      } else if (h == 0) {
+        NpuJoin(gjob);
+        NpuUnpack("npu_unpack_gate.hal", cg[0], {Ref(*gate_)}, 2);
+      }
+      Dispatch(HExe("convkq_g.hal"), "yah_ssm_conv_kq", gg.tokens, HB() / conv_tb, 1, 256, 1, 1,
+               {Tok(*qkv_, h, rqkv), TRef(*w1d), cs, Tok(*conv_out_, h, rqkv), Tok(*kqbuf_, h, rkq)});
+      Dispatch(HExe("convkq_c.hal"), "yah_ssm_conv_kq_c", gc.tokens, gc.tt, 1, gc.rowgrp, 1, 1,
+               {CView(cq[h]), TRef(*w1d), cs, Tok(*conv_out_, h, rqkv)}, 8);
+      // (prep_ab clamps valid to its half)
+      Dispatch(HExe("prepab.hal"), "yah_deltanet_prep_ab", (std::max<std::uint32_t>(HB() * kTs, kQkv) + 255u) / 256u, 1,
+               1, 256, 1, 1,
+               {Tok(*alpha_, h, rts), Tok(*beta_, h, rts), TRef(*Find(pre + "ssm_a")), TRef(*Find(pre + "ssm_dt.bias")),
+                Tok(*qkv_, h, rqkv), cs, Tok(*ab_, h, rab), Ref(*valid_)});
+      Dispatch(HExe("rowsplit_a.hal"), "yah_deltanet", dn_grp, dnsplit_a_, 1, dn_thr, 1, 1,
+               {Tok(*conv_out_, h, rqkv), Tok(*kqbuf_, h, rkq), Tok(*ab_, h, rab), st, Tok(*raw_, h, rraw)});
+      Dispatch(HExe("rowsplit_b.hal"), "yah_deltanet", dn_grp, dnsplit_b_, 1, dn_thr, 1, 1,
+               {Tok(*conv_out_, h, rqkv), Tok(*kqbuf_, h, rkq), Tok(*ab_, h, rab), st, Tok(*raw2_, h, rraw)});
+      const hrx_buffer_ref_t gate = Tok(*gate_, h, rin);
+      std::vector<hrx_buffer_ref_t> b{Tok(*raw_, h, rraw), TRef(*Find(pre + "ssm_norm.weight")), gate,
+                                      Tok(*scratch_, h, rin)};
+      if (bfp) b.push_back(AView(HalfA(true, h, false)));
+      Dispatch(HExe(pn + (bfp ? "_a_bfp.hal" : "_a.hal")), "yah_ssm_postnorm_fp16", dnsplit_a_ * HB() / 8, 1, 1, 256, 1,
+               1, b);
+      Dispatch(HExe(pn + "_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * HB() / 8, 1, 1, 256, 1, 1,
+               {Tok(*raw2_, h, rraw), TRef(*Find(pre + "ssm_norm.weight")), gate, Tok(*scratch_, h, rin)});
+      if (out_half) ojob[h] = OutHalf(wo, *scratch_, out_af, h, bfp, oc[h]);
+    }
+    if (out_half)
+      OutHalvesEnd(pre, wo, ojob, oc);
+    else
+      RunResidual(wo, *scratch_, out_af);
+    return true;
+  }
+  // An attention layer by halves (the NPU's q heads, and out's rows when HalfOutOk; the paged fp16 KV only); false: run
+  // it whole. q_npu false (q's format has no NPU decoder): q all the GPU's, the layer split by halves for out alone.
+  bool RunAttentionHalves(std::uint32_t l, std::uint32_t ci, const std::string& pre, const KvHook& hook, bool q_af,
+                          bool k_af, bool v_af, bool q_npu) {
+    const std::string wq = pre + "attn_q.weight", wo = pre + "attn_output.weight";
+    if (!HalvesOn() || hook || !kv_paged_ || !paged_f16k_ || !paged_f16v_ || !rope_kpaged_ || !kv16_scratch_ || kdeq_ ||
+        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || qg16_ || gsig_ || qsplit_ ||
+        (q_npu ? DcolImage(wq, nullptr, true).empty() : !HalfOutOk(wo, Af("gemm_kres", wo))))
+      return false;
+    norm_bfp_.clear();
+    const std::uint32_t ai = l / cfg_.full_attention_interval;
+    if (ai >= full_) throw LoomError("full-attention layer index past the KV slot count");
+    const std::uint32_t nq = NpuRows("q");
+    const bool o_af = Af("gemm_kres", wo), out_half = HalfOutOk(wo, o_af);
+    const bool tiled = q_af && k_af && v_af, pk = NpuPk(wq);
+    const auto rq = q_npu ? NpuRawRows("q", wq, nq) : std::vector<std::vector<NpuView>>{};
+    std::uint32_t job[2] = {};
+    NpuView cq[2];
+    for (int h = 0; h < 2; ++h) {
+      FfnUnpackPending(h);
+      HalfNorm(pre + "attn_norm.weight",
+               tiled                  ? NormOut::kTiled
+               : q_af || k_af || v_af ? NormOut::kBoth
+                                      : NormOut::kRow,
+               h);
+      if (!q_npu) continue;
+      const NpuView a = HalfA(false, h, pk);
+      if (pk)
+        HalfEncode(std::string("npu_enc_5120") + (tiled ? "_t" : "") + "_pk.hal", tiled ? *normt_ : *scratch_,
+                   std::size_t{kHidden} * 2, h, a);
+      std::size_t c_off = HalfC(h);
+      std::vector<std::uint32_t> calls;
+      cq[h] = NpuCalls("q", {a}, rq, c_off, calls, wq, true);
+      job[h] = NpuEnqueue(std::move(calls), "q", {{AView(a)}, CView(cq[h])});
+    }
+    // the GPU's q heads, k and v of the whole chunk (as RunAttention)
+    if (q_npu) {
+      RunKqgSplit(wq, q_af, NpuHal(KqgHal(wq, q_af)), nq);
+    } else if (!RunKqg(wq, q_af)) {   // (as RunAttention: no kqg GEMM for its format)
+      RunKstore(wq, *qkv_);
+      Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
+    }
+    RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
+    RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
+    const hrx_buffer_ref_t kpool_l{kpool_->handle, std::size_t{ai} * pool_bytes_, pool_bytes_};
+    const hrx_buffer_ref_t vtpool_l{vtpool_->handle, std::size_t{ai} * pool_bytes_, pool_bytes_};
+    // per token: q / gate f32 [6144], q16 f16 [6144] (q16 sets), k / v f32 [1024], output f16 [6144], lse f32 [24]
+    const std::size_t rq32 = std::size_t{kAttn} * 4, rq16 = std::size_t{kAttn} * 2, rkv = std::size_t{kKv} * 4,
+                      vrows = std::size_t{HB()} * kKvRow * 2;
+    const Geom& at = HGeom("wmma.hal");
+    std::uint32_t ojob[2] = {};
+    NpuView oc[2];
+    for (int h = 0; h < 2; ++h) {
+      const std::uint32_t c = 2 * ci + h;  // the half set's chunk
+      if (q_npu) {
+        NpuJoin(job[h]);
+        NpuUnpack("npu_unpack_q.hal", cq[h], {Tok(*q_, h, rq32), Tok(*gate_, h, rq32)}, 6, true);
+      }
+      // V rows into the half's part of the layer's f16 V scratch, K rows straight into the paged pool
+      const hrx_buffer_ref_t v16{kv16_->handle, kv16_layer_ + h * vrows, vrows};
+      Dispatch(HChunkExe("rope", c), "yah_fused_qk_rope_batched", qnorm_ ? kKvHeads : kHeads + kKvHeads, HB(), 1, 256, 1, 1,
+               {Tok(*q_, h, rq32),
+                Tok(*kbuf_, h, rkv),
+                Tok(*vbuf_, h, rkv),
+                TRef(*Find(pre + "attn_q_norm.weight")),
+                TRef(*Find(pre + "attn_k_norm.weight")),
+                Tok(*q16_, h, rq16),
+                Tok(*kbuf_, h, rkv),
+                Ref(*kc32_),
+                Ref(*vc32_),
+                kpool_l,
+                vtrope_ ? vtpool_l : v16,
+                {eps_->handle, 0, 4},
+                ptab_ref_});
+      if (!vtrope_)
+        Dispatch(HChunkExe("vtpage", c), "yah_vtpage", 32, (HB() + 31) / 32, 1, 256, 1, 1, {v16, vtpool_l, ptab_ref_});
+      std::vector<hrx_buffer_ref_t> ab = {
+          qnorm_ ? Tok(*q_, h, rq32) : Tok(*q16_, h, rq16), Tok(*gate_, h, rq32), kpool_l, vtpool_l,
+          Tok(*scratch_, h, std::size_t{kAttn} * 2), Tok(*lse_, h, std::size_t{kHeads} * 4), ptab_ref_};
+      if (qnorm_) {
+        ab.push_back(TRef(*Find(pre + "attn_q_norm.weight")));
+        ab.push_back({eps_->handle, 0, 4});
+      }
+      Dispatch(HChunkExe(o_af ? "wmma_t" : "wmma", c), "yah_attn_wmma", (HB() + at.tokens - 1) / at.tokens,
+               kHeads / at.rowgrp, 1, 256, 1, 1, ab);
+      if (out_half) ojob[h] = OutHalf(wo, *scratch_, o_af, h, false, oc[h]);
+    }
+    if (out_half)
+      OutHalvesEnd(pre, wo, ojob, oc);
+    else
+      RunResidual(wo, *scratch_, o_af);
+    return true;
   }
 
   LoomDevice& gpu_;
@@ -1781,29 +3071,77 @@ class LoomPrefill {
   std::uint32_t split_layer_ = 0;  // RunLayers: SplitGraph before this layer's first dispatch (0: none)
   bool split_armed_ = false;       // recording split_layer_: its first dispatch splits
   bool warming_ = false;           // WarmExecutables' pass: Dispatch records nothing
-  // The NPU FFN block (EnableNpu, RunFfnBlock)
-  NpuSplit* npu_ = nullptr;
-  bool npu_on_ = false;            // this chunk runs it (full chunks)
-  bool npu_planning_ = false;      // EnableNpu's binding pass: binds the calls, enqueues nothing
-  std::vector<NpuSplit::Queued> flagged_;   // the chunk's jobs, in NpuEnqueue order
-  std::vector<hrx_buffer_ref_t> job_c_;     // each job's C range (NpuJoin orders on it)
-  std::size_t npu_cleared_ = 0, npu_joined_ = 0;   // jobs whose flag words NpuJoin cleared / waited for
-  LoomBuffer *npu_down_ = nullptr, *npu_xo_ = nullptr;   // the down pack; normqx's rows in the decoder's positions
-  std::size_t down_layer_ = 0;     // the down pack's bytes per layer
-  std::uint32_t npu_layer_ = 0;    // the layer being recorded (NpuSplit::Queued::layer)
-  std::uint32_t npu_layers_ = 0;   // the layers that run the block (EnableNpu)
-  // pairs (EnablePairs): the other chunk's buffers and state (SelectChunk swaps them in), the selected chunk, and each
-  // chunk's FFN block job to join before its next layer (kNoJoin: none)
-  struct ChunkState {
-    LoomBuffer *hidden = nullptr, *hidden2 = nullptr, *ids = nullptr, *valid = nullptr, *rows = nullptr;
-    std::uint32_t n = 0;
-    std::int64_t keep = -1;
-  };
-  bool pairs_ = false;
-  ChunkState other_;
-  std::uint32_t par_ = 0;
-  static constexpr std::size_t kNoJoin = ~std::size_t{0};
-  std::size_t join_[2] = {kNoJoin, kNoJoin};
+  NpuSplit* npu_ = nullptr;        // EnableNpu
+  bool npu_on_ = false;            // this chunk splits with the NPU
+  std::uint32_t layer_ = 0;        // RecordLayers' current layer (NpuSplit::Queued::layer)
+  bool npu_planning_ = false;      // EnableNpu's binding pass: Dispatch records nothing
+  LoomBuffer* npurem_ = nullptr;   // the GPU's K remainder of the NPU's out / down rows (f32 [tokens][rows])
+  std::uint32_t ffnblk_ = 0;       // the NPU's FFN block features (dispatch.txt "npuffnblk"; RunFfnBlock), 0: none
+  LoomBuffer* ffnrem_ = nullptr;   // its GPU down over the other features (f32 [tokens][5120])
+  bool ffn_bfp_ = false;           // the last ffn unpack wrote down's BFP16 input for its columns (FfnUnpack)
+  std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
+  bool npu_dcol_ = false;          // the set's NPU decodes raw weight rows itself (dispatch.txt "npudcol")
+  static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
+  static std::size_t RecordRow(const char* fmt) {
+    return std::strcmp(fmt, "q5k") == 0 ? 704 : std::strcmp(fmt, "iq2s") == 0 ? 1152 : kDcolRecordRow;
+  }
+  // IQ2_S FFN tensors have no NPU decoder: the emitter wrote their rows pre-decoded (emit_prefill_pp.bfp_rows,
+  // npu_bfp_<name>.bin: the decoder records' bfp16 fragments, 288 bytes per 256 weights), read once into resident
+  // writable memory like the model (RegisterRaw pins it; + 8192 bytes of over-read slack)
+  static constexpr std::size_t kBfpBlock = 288, kIx4Block = 136;
+  // Host-side NPU rows (emit_prefill_pp bfp_rows / ix4_files): file's bytes in order into the spans (offset, bytes) of
+  // a buffer of bytes (+ 8 KB the records over-read; pages outside the spans are never touched), kept for the run
+  const std::uint8_t* HostRows(const std::string& file, std::size_t bytes,
+                               const std::vector<std::pair<std::size_t, std::size_t>>& spans) {
+    if (const auto it = bfp_.find(file); it != bfp_.end()) return it->second;
+    const std::string path = dir_ + "/" + file;
+    void* p = ::mmap(nullptr, bytes + 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) throw LoomError("prefill: no memory for " + path);
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) throw LoomError("prefill: cannot open " + path);
+    std::size_t at = 0;   // the file's bytes in order, span after span
+    for (const auto& [off, n] : spans) {
+      for (std::size_t done = 0; done < n;) {
+        const ::ssize_t r = ::pread(fd, static_cast<std::uint8_t*>(p) + off + done, n - done, static_cast<off_t>(at + done));
+        if (r <= 0) {
+          ::close(fd);
+          throw LoomError("prefill: short read of " + path);
+        }
+        done += static_cast<std::size_t>(r);
+      }
+      at += n;
+    }
+    ::close(fd);
+    return bfp_[file] = static_cast<std::uint8_t*>(p);
+  }
+  const std::uint8_t* BfpRows(const std::string& name, std::size_t bytes) {
+    return HostRows("npu_bfp_" + name + ".bin", bytes, {{0, bytes}});
+  }
+  std::map<std::string, std::uint8_t*> bfp_;
+  // The planning pass's model rows the NPU reads from its own copies (BFP / IX4 rows: tensor-data offset, bytes), not
+  // the last layer's (its tail runs on the kept row's token tile, over all rows: Trim)
+  void NpuOnly(std::size_t offset, std::size_t bytes) {
+    if (layer_ + 1 != cfg_.main_block_count()) npu_only_.emplace_back(offset, bytes);
+  }
+  std::vector<std::pair<std::size_t, std::size_t>> npu_only_;
+  std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
+  std::size_t npu_cleared_ = 0;    // flagged_ jobs whose flag words NpuJoin cleared
+  std::size_t npu_joined_ = 0;     // flagged_ jobs an NpuJoin waited for (in order)
+  std::vector<NpuSide> job_side_;  // per flagged_ job: its A / C ranges (NpuEnqueue)
+  std::vector<NpuSplit::Queued> flagged_;  // this chunk's NPU jobs (index = job), queued after the launch
+  std::vector<std::vector<PlannedDecode>> planned_dq_;  // per job: its weight decodes (planning pass)
+  std::vector<PlannedDecode> predecoded_;               // the next job's, dispatched at the last Join
+  std::map<std::string, std::uint32_t> npu_rows_;  // NPU rows per site (dispatch.txt "npusplit_<site>")
+  // Token halves (LoadHalves): the half set's directory and dispatch.txt, whether this chunk's NPU layers use them
+  std::string hdir_;
+  std::map<std::string, Geom> hgeom_;
+  bool halves_ = false;
+  // the FFN block's unpack the next layer runs (RunFfnBlock: per half, or whole)
+  struct FfnPending {
+    NpuView c;
+    LoomBuffer *in = nullptr, *out = nullptr;
+  } ffn_pending_;
+  bool ffn_normed_ = false;  // the halves ran the next FFN block's norm (OutHalvesEnd)
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only
   bool qg16_ = false;   // the kqg GEMM stores q and gate as f16 (only the GPU kqg path writes them so)
@@ -1818,8 +3156,8 @@ class LoomPrefill {
   std::vector<std::uint32_t> host_ids_;  // Embed's staging
   // token_embd off the device (LoomWeights skip): the chunk's rows, staged by Embed (per chunk of a pair)
   LoomBuffer* embed_rows_ = nullptr;
-  std::vector<std::uint8_t> host_rows_[2];       // per chunk of a pair (par_)
-  hrx_timeline_point_t rows_copied_[2] = {};     // when each one's last copy landed
+  std::vector<std::uint8_t> host_rows_;          // the chunk's staged token_embd rows
+  hrx_timeline_point_t rows_copied_ = {};        // when their last copy landed
   hrx_buffer_ref_t EmbedTable() const { return embed_rows_ ? Ref(*embed_rows_) : TRef(*Find("token_embd.weight")); }
   // MQ4 sets ("rot"): the rotation signs (gen_rot.signs) and ssm_out's input in HF head order
   bool rot_ = false;
@@ -1858,6 +3196,10 @@ class LoomPrefill {
   bool dnring_ = false, dn_chained_ = false;
   hrx_buffer_ref_t nq_cnt_{};
   LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
+  static constexpr std::size_t kWaitLogSlots = 65536;
+  LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
+  std::vector<std::string> waitlog_tag_;   // each slot's layer and job tag
+  std::vector<std::string> prof_tags_;     // YAH_NPU_PROF: the first NPU chunk's job tags (ReportNpuProf)
   std::size_t flag_slot_ = 0;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *grid_iq2s_ = nullptr, *ksigns_ = nullptr;
@@ -1876,6 +3218,5 @@ class LoomPrefill {
 
 }  // namespace yah::model
 
-#include "model/loom_prefill_npu-inl.hpp"
 
 #endif  // YAH_MODEL_LOOM_PREFILL_HPP_

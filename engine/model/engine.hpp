@@ -46,8 +46,8 @@ class Engine : public TextGenerator {
     std::string model;        // GGUF path
     std::string prefill_hal;  // emit_prefill_pp.py set (chunked, paged)
     std::string decode_hal;   // emit_decode.py set with the prefill's context and YAH_KV
-    // The NPU runs the FFN block of a prefill set that has one (tools/emit_npu_ffn.py). Off, or not ready
-    // (NpuProblem), the GPU runs everything.
+    // The NPU computes the trailing rows of the split GEMMs of a prefill set that has an NPU split
+    // (emit_prefill_pp.py YAH_NPU_SPLIT). Off, or not ready (NpuProblem), the GPU runs everything.
     bool npu = false;
     // Speculative decoding of greedy requests: "mtp" drafts with the model's MTP layer (a GGUF with blk.<n>.nextn.*)
     // and verifies with the decode set's T-token GEMVs (emit_decode.py VERIFY); "off". draft_len: tokens per draft,
@@ -68,7 +68,7 @@ class Engine : public TextGenerator {
         gguf_(core::Gguf::OpenResident(o.model)),
         cfg_(core::Qwen35Config::FromGguf(gguf_)),
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
-        weights_(gpu_, gguf_),
+        weights_(gpu_, gguf_, {}, NpuInPlace(o)),
         prefill_(gpu_, gguf_, cfg_, o.prefill_hal, weights_),
         decoder_(gpu_, gguf_, cfg_, o.decode_hal, weights_) {
     if (decoder_.context() != prefill_.pool_rows())
@@ -193,23 +193,6 @@ class Engine : public TextGenerator {
     for (std::uint32_t c = from / B; c < chunks; ++c) {
       const std::uint32_t valid = std::min(B, n - c * B);
       shares += ChunkShare(valid);
-      // Two full chunks with no snapshot between them run as a pair (the NPU block of one beside the other's layer)
-      if (prefill_.pairs() && c + 1 < chunks && n >= (c + 2) * B && !(at_prefill > from && (c + 1) * B == at_prefill)) {
-        const bool head1 = c + 2 == chunks && (tail_chunk || tail == 0);
-        shares += 2 * ChunkShare(B);
-        for (std::uint32_t p = 0; p < 2; ++p)
-          prefill_.SelectChunk(p), prefill_.Embed(prompt.data() + std::size_t{c + p} * B, B);
-        prefill_.RunPair(c, LoomPrefill::kNoRows, head1 ? std::int64_t{B} - 1 : LoomPrefill::kNoRows);
-        if (head1) prefill_.SelectChunk(1), prefill_.Head(B - 1, Ref(logits_));
-        prefill_.SelectChunk(0);
-        if (at_prefill > from && (c + 2) * B == at_prefill) Save(xs, at_prefill, prefill_.conv_state());
-        if (c + 2 == chunks) {
-          gpu_.Synchronize();
-          Track(chunk_ms_, (std::chrono::steady_clock::now() - tp) / shares, true);
-        }
-        ++c;
-        continue;
-      }
       prefill_.Embed(prompt.data() + std::size_t{c} * B, valid);
       LoomPrefill::KvHook hook;
       if (valid % 16 && decoder_.kv_bits().second != 16) {
@@ -302,10 +285,9 @@ class Engine : public TextGenerator {
 #ifdef YAH_WITH_NPU
     npu_status_ = NpuProblem();
     if (npu_status_.empty()) {
-      prefill_.EnablePairs();
       const NpuPlan plan = prefill_.npu_plan();
       if (!plan.a_bytes) {
-        npu_status_ = "the prefill set has no NPU FFN block (tools/emit_npu_ffn.py)";
+        npu_status_ = "the prefill set has no NPU split (emit_prefill_pp.py YAH_NPU_SPLIT)";
       } else if (npu_status_ = dpm_.Pin(); npu_status_.empty()) {
         npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
         prefill_.EnableNpu(npu_.get());
@@ -314,6 +296,16 @@ class Engine : public TextGenerator {
 #else
     (void)o;
     npu_status_ = "this build has no NPU support (build against an HRX with the xdna targets)";
+#endif
+  }
+  // --npu with the NPU ready: the GPU reads the model's resident copy in place (LoomWeights in_place: the NPU reads
+  // its rows through host pointers)
+  static bool NpuInPlace(const Options& o) {
+#ifdef YAH_WITH_NPU
+    return o.npu && NpuProblem().empty();
+#else
+    (void)o;
+    return false;
 #endif
   }
 #ifdef YAH_WITH_NPU

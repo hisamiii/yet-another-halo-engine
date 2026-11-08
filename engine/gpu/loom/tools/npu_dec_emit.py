@@ -1,6 +1,6 @@
 """Shared pieces of the NPU weight decoders (gen_npu_dec): the low-asm emitter with independent op streams, register
 type names, bf16 / bfp16 reference conversions and the llama.cpp block field parsers the oracles use."""
-import struct
+import numpy as np
 
 V1, V2, V4 = "reg<aie2p.vec256>", "reg<aie2p.vec256 x2>", "reg<aie2p.vec256 x4>"
 M1, M2, M4 = "reg<aie2p.mbms>", "reg<aie2p.mbms x2>", "reg<aie2p.mbms x4>"
@@ -136,7 +136,6 @@ class Emit:
 
 def bfp_hw(w):
     """w [n][8 rows][8] f32 -> [n][72] bytes: E = exp(max|x|), +1 if a rounded mantissa leaves int8; subnormals flush."""
-    import numpy as np
     w = np.where(np.abs(w) < np.float32(2.0 ** -126), np.float32(0), w)
     amax = np.abs(w).max(2)
     E = ((amax.view(np.uint32) >> 23) & 255).astype(np.int64)
@@ -151,19 +150,17 @@ def bfp_hw(w):
 
 def bf16_rne(x):
     """f32 -> nearest-even bf16, as f32."""
-    import numpy as np
     u = np.asarray(x, np.float32).view(np.uint32).astype(np.uint64)
     u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
     return u.astype(np.uint32).view(np.float32)
 
 
 def bf16_bits(v):
-    return struct.unpack("<I", struct.pack("<f", v))[0] >> 16
+    return int(np.float32(v).view(np.uint32)) >> 16
 
 
 def q4k_fields(blk):
     """blk [..., 144] u8 -> d, dmin (f64), sc, m [..., 8], q [..., 256] (llama.cpp layout)."""
-    import numpy as np
     d = blk[..., 0:2].copy().view(np.float16)[..., 0].astype(np.float64)
     dm = blk[..., 2:4].copy().view(np.float16)[..., 0].astype(np.float64)
     s = blk[..., 4:16].astype(np.int64)
@@ -182,7 +179,6 @@ def q4k_fields(blk):
 
 def iq4xs_fields(blk):
     """blk [..., 136] u8 -> d (f64), ls [..., 8], q [..., 256] (llama.cpp block_iq4_xs)."""
-    import numpy as np
     d = blk[..., 0:2].copy().view(np.float16)[..., 0].astype(np.float64)
     sh = blk[..., 2].astype(np.int64) | (blk[..., 3].astype(np.int64) << 8)
     sl = blk[..., 4:8].astype(np.int64)

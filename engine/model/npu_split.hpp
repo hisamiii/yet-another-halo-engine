@@ -1,4 +1,4 @@
-// NpuSplit: what LoomPrefill needs from the NPU for its FFN block (npu.txt, tools/emit_npu_ffn.py).
+// NpuSplit: what LoomPrefill needs from the NPU for the column-split GEMMs (dispatch.txt "npusplit_<site>").
 // The implementation (LoomNpuSplit in model/loom_npu.hpp) links libamdf and the HRX xdna loader; this header does not.
 #ifndef YAH_MODEL_NPU_SPLIT_HPP_
 #define YAH_MODEL_NPU_SPLIT_HPP_
@@ -12,6 +12,8 @@
 #include "model/loom_runtime.hpp"
 
 namespace yah::model {
+
+class NpuProf;
 
 // Sizes of the GPU buffers shared with the NPU and the gate protocol of the set's NPU image (LoomPrefill::npu_plan).
 struct NpuPlan {
@@ -41,13 +43,21 @@ class NpuSplit {
   [[nodiscard]] virtual const LoomBuffer& C() const = 0;
   // One call of the NPU GEMM image at path on these views (cold: loads and binds; the same arguments return the same id).
   virtual std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) = 0;
-  // A GPU buffer the NPU reads (a weight chunk, the FFN block's dense down weights), shared once before any bind.
-  virtual void ShareGpu(hrx_buffer_t buffer, std::size_t bytes) = 0;
-  // One call of an image of family that decodes raw weight rows itself (gen_npu_gemm fuse 2): raw is a range of a
-  // shared GPU buffer. A job's calls are one family; where a job's family differs from the array's, the command first
-  // runs the image's setup (the images of a command share one gate layout: a switch keeps the gate's routes).
-  virtual std::uint32_t BindRaw(const std::string& image, NpuView a, const hrx_buffer_ref_t& raw, NpuView c,
-                                const std::string& family) = 0;
+  // Decoder-column sets (NpuPlan::dcol): the NPU reads raw weight rows from the model's own mapping.
+  // RegisterRaw makes the pages holding [p, p + bytes) readable by the NPU (once per range, before any work).
+  // BindRaw is one call of a decoder-column image whose raw rows are [raw, raw + raw_bytes) of a registered range;
+  // swap is the image that re-programs only the decoder tiles for its format, dec that format's id. family names the
+  // images that differ only in their decoder tiles (swaps switch between them); a job's images are one family, and
+  // where a job's family differs from the array's, the command first runs the image's setup ("<image>.setup.xdna").
+  virtual void RegisterRaw(const void* p, std::size_t bytes) = 0;
+  virtual std::uint32_t BindRaw(const std::string& image, const std::string& swap, int dec, NpuView a,
+                                const void* raw, std::size_t raw_bytes, NpuView c,
+                                const std::string& family = "dcol") = 0;
+  // A column-pair image (gate rows of one format, up rows of another): two raw ranges, and junk_bytes for the gate
+  // columns' C records, which nothing reads.
+  virtual std::uint32_t BindRawPair(const std::string& image, const std::string& swap, int dec, NpuView a,
+                                    const void* gate, std::size_t gate_bytes, const void* up, std::size_t up_bytes,
+                                    NpuView c, std::size_t junk_bytes, const std::string& family) = 0;
   // Handoffs are 32-bit words in host memory (Flags(): their GPU view), with no host between the GPU and the NPU.
   // The graph stores a job's gate value to its ready word once the job's inputs are written (release, system scope).
   // The NPU image waits for it (gen_npu_gemm GATE), runs the calls and writes the value to the job's done word.
@@ -84,6 +94,8 @@ class NpuSplit {
   // A flag word from / to the host (CPU-driven tests: the host stands in for the GPU's stores and waits).
   virtual void HostStore(std::uint32_t word, std::uint32_t value) = 0;
   virtual std::uint32_t HostLoad(std::uint32_t word) = 0;
+  // The performance counters of CPU-driven runs (YAH_NPU_PROF), or null.
+  virtual NpuProf* Prof() { return nullptr; }
 };
 
 }  // namespace yah::model

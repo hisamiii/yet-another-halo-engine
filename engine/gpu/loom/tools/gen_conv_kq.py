@@ -554,6 +554,11 @@ CW = 160   # gen_c lanes per workgroup: two NPU columns of gen_npu_gemm.TN
 TC = 32    # gen_c tokens per workgroup
 
 
+def cw(n):
+    """gen_c's lanes per workgroup for n channels: CW, else 128 (n not a multiple of 160, e.g. a 4096-channel split)."""
+    return CW if n % CW == 0 else 128
+
+
 def gen_c(first, cols, batch, qkv_dim=10240):
     """yah_ssm_conv_kq_c: the conv for the v channels first .. first + cols * TN - 1 of a NPU qkv split, its input
     read straight from the NPU's C. Bit-identical to the f16 unpack (gen_npu_unpack) + gen.
@@ -565,6 +570,7 @@ def gen_c(first, cols, batch, qkv_dim=10240):
     import gen_npu_gemm as GN
     import gen_npu_unpack as GU
     n = cols * GN.TN
+    CW = cw(n)
     assert n % CW == 0 and batch % TC == 0 and first >= 4096   # v channels only
     nwords = batch * n * GU.CG // 2
     rows = TC + 8   # LDS rows: tokens t0 - 8 .. t0 + TC - 1

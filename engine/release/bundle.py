@@ -3,7 +3,7 @@
 
 usage: bundle.py build <out dir> <version> [--licenses <dir>]
            from the built tree (engine/build_hrx.sh): <out dir>/yah-<version>-gfx1151/ without hal/
-       bundle.py hal <bundle dir> <prefill set> <decode set> [--npu <prefill set with the NPU block>]
+       bundle.py hal <bundle dir> <prefill set> <decode set> [--npu <prefill set with the NPU split>]
            add a HAL set pair (validated on a gfx1151 box) as hal/<ctx>-<kv>/ (its decode set's context and KV
            format: yah_server --ctx / --kv), and the set yah_server --npu runs (prefill-npu/); once per pair
        bundle.py pack <bundle dir>
@@ -14,7 +14,7 @@ The bundle:
   lib/        libhrx, ICU, the HSA runtime with librocprofiler-register and the ROCm sysdeps it loads (in
               lib/rocm_sysdeps/lib, where the HSA runtime's own RPATH looks)
   hal/        <ctx>-<kv>/prefill and decode/ (decode-mtp/: with the MTP layer's kernels), prefill-npu/
-              (emit_npu_ffn.py); 32768-kv8 is the default
+              (emit_prefill_pp.py YAH_NPU_SPLIT); 32768-kv8 is the default
   licenses/   this repository's, HRX's, the ROCm parts', ICU's and the sysdeps' (--licenses: extra files)
   README.md   engine/release/README.md
 
@@ -135,7 +135,7 @@ def set_name(decode):
 
 def hal(b, prefill, decode, npu=None):
     for src, name, marker in ((prefill, "prefill", "dispatch.txt"), (decode, "decode", "decode.txt"),
-                              (npu, "NPU prefill", "npu.txt")):
+                              (npu, "NPU prefill", "dispatch.txt")):
         if src and not os.path.isfile(os.path.join(src, marker)):
             sys.exit(f"bundle: {src} is not a {name} set (no {marker})")
     pair, dec = set_name(decode)

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""npu_gate.py <model> <prefill set> [workdir]: the NPU FFN block's smoke test.
+"""npu_gate.py <model> <prefill set> [workdir [tokens]]: the NPU split's smoke test.
 
-Runs the same 4096-token prompt (two chunks, the pair schedule) through loom_forward_pp twice, on the GPU alone and
-with --npu, and checks that the NPU ran its jobs without a failed wait and that its output is the model's: the last 64
-positions' top-1 tokens and KL against the GPU run, and the last chunk's hidden states. The NPU path is not
-bit-identical to the GPU's (bfp16 activations, IQ4_XS down rows): the bounds catch a hang, a fallback, or missing or
-garbage NPU output, not a quality change (that is kld_ref.py's job: engine/run/gate). Needs numpy, an unlimited memlock
+Runs the same prompt (tokens, default 2048: whole chunks, at most the set's context) through loom_forward_pp twice,
+on the GPU alone and with --npu, and checks that the NPU ran its jobs without a failed wait and that its output is the
+model's: the last 64 positions' top-1 tokens and KL against the GPU run, and the last chunk's hidden states. The NPU
+path is not bit-identical to the GPU's (bfp16 activations, pre-decoded or transcoded rows): the bounds catch a hang, a
+fallback, or missing or garbage NPU output, not a quality change (that is kld_ref.py's job: engine/run/gate). Needs numpy, an unlimited memlock
 limit and a build with NPU support (engine/build_hrx.sh).
 Run it as a GPU job: engine/run/gpu_run.sh npugate -- engine/tests/npu_gate.py ...
 """
@@ -19,16 +19,16 @@ import time
 import numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-TOKENS, TAIL, HID = 4096, 64, 5120
+TAIL, HID = 64, 5120
 # GPU vs NPU on this prompt (serve-pp1024, MQ4 HFQ): top-1 1.000, KL 0.0014, cos 0.960; an all-zero down pack (the
 # NPU's features dropped from every layer, measured with a pack file): 0.984, 0.0132, 0.837
 TOP1_MIN, KL_MAX, COS_MIN = 0.95, 0.005, 0.93
 
 
-def run(model, hal, prefix, npu_args):
-    cmd = [os.path.join(ROOT, "engine", "build", "loom_forward_pp"), model, hal, prefix, str(TOKENS),
-           os.path.join(ROOT, "engine", "run", "gate", "corpus", "ids2048_w00.txt"), "--pairs",
-           "--logits-from", str(TOKENS - TAIL)] + npu_args
+def run(model, hal, prefix, tokens, npu_args):
+    cmd = [os.path.join(ROOT, "engine", "build", "loom_forward_pp"), model, hal, prefix, str(tokens),
+           os.path.join(ROOT, "engine", "run", "gate", "corpus", "ids2048_w00.txt"),
+           "--logits-from", str(tokens - TAIL)] + npu_args
     t = time.time()
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if p.returncode:
@@ -44,13 +44,15 @@ def main():
     model, hal = sys.argv[1], sys.argv[2]
     work = sys.argv[3] if len(sys.argv) > 3 else os.path.join(os.path.expanduser("~"), "Development", "Scratch",
                                                               "npu-gate")
+    tokens = int(sys.argv[4]) if len(sys.argv) > 4 else 2048
     if resource.getrlimit(resource.RLIMIT_MEMLOCK)[0] != resource.RLIM_INFINITY:
         sys.exit("npu_gate: the NPU needs an unlimited memlock limit (prlimit --pid $$ --memlock=unlimited:unlimited)")
-    if not os.path.exists(os.path.join(hal, "npu.txt")):
-        sys.exit("npu_gate: %s has no NPU FFN block (tools/emit_npu_ffn.py)" % hal)
+    with open(os.path.join(hal, "dispatch.txt")) as f:
+        if not any(row.startswith("npusplit_") for row in f):
+            sys.exit("npu_gate: %s has no NPU split (emit_prefill_pp.py YAH_NPU_SPLIT)" % hal)
     os.makedirs(work, exist_ok=True)
-    run(model, hal, os.path.join(work, "gpu"), [])
-    out = run(model, hal, os.path.join(work, "npu"), ["--npu"])
+    run(model, hal, os.path.join(work, "gpu"), tokens, [])
+    out = run(model, hal, os.path.join(work, "npu"), tokens, ["--npu"])
 
     fails = []
     jobs = sum(int(m) for m in re.findall(r"npu: \S+\s+(\d+) jobs", out))

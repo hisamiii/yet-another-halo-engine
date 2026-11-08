@@ -45,8 +45,8 @@ int Usage() {
                "--ctx: the context in tokens (a multiple of 2048); --kv: the KV cache format, fp16, kv8, kv4, k8v4 or\n"
                "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
                "~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use. --prefill / --decode name sets instead.\n"
-               "--npu: the NPU runs part of the prefill's FFN, with the prefill set that has the NPU block\n"
-               "(prefill-npu/ beside prefill/, or --prefill a set from tools/emit_npu_ffn.py); without what it\n"
+               "--npu: the NPU computes part of the prefill's GEMMs, with a prefill set that has the NPU split\n"
+               "(prefill-npu/ beside prefill/, or --prefill a set emitted with YAH_NPU_SPLIT); without what it\n"
                "needs the GPU runs everything.\n"
                "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
                "blk.N.nextn.*) and verifying with the decode set's verify GEMVs; --draft-len N fixes the draft length\n"
@@ -69,8 +69,8 @@ bool Exists(const std::string& path) { return ::access(path.c_str(), R_OK) == 0;
 // The HAL sets for a context and KV format when the command line names none: a bundle's hal/<ctx>-<kv>/, else (a
 // source tree, root = engine/) ~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use (the Python emitters).
 // A decode set emitted from a model with the MTP layer has its kernels too (decode-mtp/): it serves any model.
-// npu: the prefill set with the NPU FFN block (prefill-npu/: 1024-token chunks, the NPU's last 5120 FFN features),
-// a bundle's plain prefill/ when it has none (the engine then says the NPU is off and why).
+// npu: the prefill set with the NPU split (prefill-npu/, emit_prefill_pp.py YAH_NPU_SPLIT: not emitted here), the plain
+// prefill/ when there is none (the engine then says the NPU is off and why).
 std::pair<std::string, std::string> HalSets(const std::string& root, const std::string& model, std::uint32_t ctx,
                                             const std::string& kv, bool npu) {
   const auto cfg = yah::core::Qwen35Config::FromGguf(yah::core::Gguf::OpenIndex(model));
@@ -79,7 +79,7 @@ std::pair<std::string, std::string> HalSets(const std::string& root, const std::
     return b + (Exists(b + "/decode-mtp/decode.txt") ? "/decode-mtp" : "/decode");
   };
   if (const std::string b = root + "/hal/" + name; Exists(b + "/prefill/dispatch.txt"))
-    return {b + (npu && Exists(b + "/prefill-npu/npu.txt") ? "/prefill-npu" : "/prefill"), decode_of(b)};
+    return {b + (npu && Exists(b + "/prefill-npu/dispatch.txt") ? "/prefill-npu" : "/prefill"), decode_of(b)};
   const std::string tools = root + "/gpu/loom";
   if (!Exists(tools + "/tools/emit_decode.py"))
     throw std::runtime_error("no HAL sets for " + name + " in " + root +
@@ -107,13 +107,10 @@ std::pair<std::string, std::string> HalSets(const std::string& root, const std::
     std::filesystem::remove(part + ".log");
   };
   const std::string pp = "YAH_CTX=" + std::to_string(ctx) + " python3 tools/emit_prefill_pp.py";
-  if (npu)
-    emit("prefill-npu", "npu.txt", {{pp, "1024"}, {"python3 tools/emit_npu_ffn.py", "1024 5120"}});
-  else
-    emit("prefill", "dispatch.txt", {{pp, "2048"}});
+  emit("prefill", "dispatch.txt", {{pp, "2048"}});
   if (!Exists(dir + "/decode-mtp/decode.txt"))
     emit(dec, "decode.txt", {{"python3 tools/emit_decode.py", std::to_string(ctx)}});
-  return {dir + (npu ? "/prefill-npu" : "/prefill"), decode_of(dir)};
+  return {dir + (npu && Exists(dir + "/prefill-npu/dispatch.txt") ? "/prefill-npu" : "/prefill"), decode_of(dir)};
 }
 #endif
 

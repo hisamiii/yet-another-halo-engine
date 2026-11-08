@@ -71,7 +71,7 @@ class Config:
     hpass: int = 0        # H as [M block][pass hpass][16-token slab][128 k-blocks] (the FFN block's swiglu output, down's
                           # input): swiglu (cols = hpass): column c writes pass c; ain "h": records [M block][pass, slab]
     swcol: int = 0        # swiglu dcol 2: raw rows between columns' first gate rows (0: TN / 2)
-    gord: str = "P4"      # dcol 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural)
+    gord: str = "P4"      # dcol 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural; "GF": Q4_K in P4)
     hord: str = ""        # swiglu: H in the down decoder's k-block order: "P4" ((0, 2, 1, 3) per 4 k-blocks: IQ4_XS's
                           # and the P4 grid decoders'), "Q4K" ((0, 4, 1, 5, 2, 6, 3, 7) per 8: Q4_K's; a call's 4 gate
                           # k-blocks (one format) are then slabs 32 rows apart, the caller steps call j's rows by
@@ -119,6 +119,8 @@ class Config:
                         # their addressing are unchanged); the call's last block runs it whole on its last pass
     dfi: int = 1        # dfr: the deferred push inline (no branch: a firing without a deferred segment pushes into a
                         # dummy buffer), so no branch delay / quiescence splits the push tile
+    kv2: str = ""       # swiglu fuse 2 (gen_npu_dec DQ_KV2): fmt an IQ4_XS alias, the up slabs' rows in kv2's kvalues (an
+                        # IQ4_XS alias too: IQ3_S / IQ3_XXS gate / up of one layer in different formats run like one)
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
                         # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
                         # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
@@ -129,11 +131,13 @@ class Config:
 # (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
 # (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * GATE_CALLS (jobs count from 1 after the
 # setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), at a pace of
-# GP0 + GPS * max(0, polls - GFAST) delay iterations (~7.7 ns each in the engine). A poll sees ready ~17 polls after the
-# GPU stored it (the reads run that far behind; pp2048 fit, and host-stamped flag records show the read itself is fresh),
-# so a wait costs ~17 paces: a constant pace through the waits the sets have (every layer has NPU work: up to ~15 ms;
-# 896 polls of ~0.04 ms) keeps that ~0.65 ms (0.31 ms paces cost ~5 ms per waiting job, 0.66 s of pp2048), where
-# backing off from the start cost 4-17 ms per job, growing with the gap. The last 128 polls back off, so the supply still
+# GP0 + GPR * max(0, polls - GRAMP) + GPS * max(0, polls - GFAST) delay iterations (~7.7 ns each in the engine). A poll
+# sees ready ~17 polls after the GPU stored it (the reads run that far behind; pp2048 fit, and host-stamped flag records
+# show the read itself is fresh), so a wait costs ~17 paces: a constant pace through the waits of layers with NPU work
+# (up to ~15 ms; 512 polls of ~0.04 ms) keeps that ~0.65 ms (0.31 ms paces cost ~5 ms per waiting job, 0.66 s of
+# pp2048), where backing off from the start cost 4-17 ms per job, growing with the gap. A gentle ramp then covers the
+# waits across a GPU-only FFN (UD-IQ4_XS layers 0, 14-17: ~45 ms, ~5 ms late; at a constant pace into the back-off,
+# layer 15's out saw ready ~40 ms late). The last 128 polls back off, so the supply still
 # lasts ~1.25 s (the tick stream takes one record per poll; 1024 is the most the shim's descriptors chain). It hands
 # [seq, status, polls, ncalls] to the mid over a leaf-synchronized neighbor channel and ticks / reads out the rest of the supply GB records per
 # firing of the next job. The mid emits go and done (constrain.signal + constrain.gate): the control program's gate
@@ -143,7 +147,7 @@ class Config:
 # N calls is N * nb * passes firings, and before the first gated job (state zero) it is one call: the setup call's.
 # Config.gfirst moves a job's wait and relay to its first firing (gate_first; the end of a firing only counts and
 # drains, gate_count): state zero is then at the gate, so the setup runs no call (LOOM_EXP_SETUP_ONLY).
-GP0, GPS, GFAST, GB = 5000, 19000, 896, 8
+GP0, GPR, GRAMP, GPS, GFAST, GB = 5000, 200, 512, 16000, 896, 8
 # The protocol the host follows (dispatch.txt "npugate <GATE_SUPPLY> <GATE_CALLS> <GATE_RECORD>"): a job's gate value is
 # sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
 # binding. GATE_FAILED in done: the head gave up (the host sets it too for a failed command; gen_npu_unpack.GATED_LOOP).
@@ -153,12 +157,13 @@ GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
 _LEAVES = {}
 
 
-def decoder(fmt, gord="P4"):
-    """gen_npu_dec for fmt (its constants follow DQ_FMT and DQ_GORD at import)."""
+def decoder(fmt, gord="P4", kv2=""):
+    """gen_npu_dec for fmt (its constants follow DQ_FMT, DQ_GORD and DQ_KV2 at import)."""
     import gen_npu_dec
-    if gen_npu_dec.FMT != fmt or os.environ.get("DQ_GORD", "P4") != gord:
+    if gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord or os.environ.get("DQ_KV2", "") != kv2:
         os.environ["DQ_FMT"] = fmt
         os.environ["DQ_GORD"] = gord
+        os.environ["DQ_KV2"] = kv2
         gen_npu_dec = importlib.reload(gen_npu_dec)
     return gen_npu_dec
 
@@ -188,6 +193,7 @@ def loom_env(cfg, swap=False):
         env["LOOM_EXP_PARTITION_COLUMNS"] = "8"
     if (cfg.dcol == 2 or cfg.fuse == 2) and not swap:   # other layouts share the context: routes must not outlive them
         env["LOOM_EXP_ROUTE_RESET"] = "1"
+        env["LOOM_EXP_DRAIN_USED"] = "1"   # (HRX patch 0048: the stale-request drain raises only the image's locks)
     if swap or (cfg.gate and cfg.gfirst):
         env["LOOM_EXP_SETUP_ONLY"] = "1"
     if swap:
@@ -498,15 +504,14 @@ def array_program(L, cfg):
                 e(f"  constrain.fill %chw{c}_{r}, %chd{c}_{f}")
         if cfg.dcol:
             e(f"  constrain.fill %chw{c}_0, %chf{c}")
-    if cfg.rawdma and cfg.fuse == 2:   # each filler's raw ring in its W ring (fuse_raw_ring), records [16 rows][RECROW bytes]
-        D = decoder(cfg.fmt, cfg.gord)
+    if cfg.rawdma:   # each filler's raw ring in its W ring (fuse_raw_ring), records [16 rows][RECROW bytes]
         e(f"  %firows = constant.u32 16 : reg<aie2p.array.scalar : index>")
-        e(f"  %fipitch = constant.u32 {D.RECROW} : reg<aie2p.array.scalar : index>")
-        for c in range(cols):
+        for c in range(cols):   # (column pairs: each column's format's record rows, BFP's are longer)
+            e(f"  %fipitch{c} = constant.u32 {decoder(colcfg(cfg, c).fmt, cfg.gord).RECROW} : reg<aie2p.array.scalar : index>")
             for r in dict.fromkeys(list(fuse_cover(cfg, c)) + list(fuse_helpers(cfg, c))):
                 cov = fuse_dcov(cfg, c, r)
                 e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(colcfg(cfg, c), cov)[0]} : reg<aie2p.array.scalar : index>")
-                e(f"  constrain.intake %chr{c}_{r}, %chw{c}_{r}, %fioff{c}_{r}, %firows, %fipitch")
+                e(f"  constrain.intake %chr{c}_{r}, %chw{c}_{r}, %fioff{c}_{r}, %firows, %fipitch{c}")
     if cfg.dcol:
         fill_inputs(e, cfg, panel)
     # activations: one stream per row, one slab per record, multicast along the row (first branch rotates)
@@ -913,14 +918,14 @@ def fuse_record(cfg, cov):
 
 
 FUSE_SB = 4   # fuse 2: super-blocks per row of a unit (a pass: 1024 k)
-FUSE_FMTS = ("IQ4_XS", "MQ4", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K")   # fuse 2 decoders (cfg.fmt, in
+FUSE_FMTS = ("IQ4_XS", "IQ4_XO", "IQ4_XX", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q4_K", "Q5_K", "BFP")   # fuse 2 decoders (cfg.fmt, in
 # cfg.gord's k-block order; program and data memory decide which fit an image: gen_npu_dec sizes)
 
 
 def fuse_blk(cfg):
     """fuse 2: bytes per super-block of cfg.fmt."""
     assert cfg.fmt in FUSE_FMTS, cfg.fmt
-    return decoder(cfg.fmt, cfg.gord).BLK
+    return decoder(cfg.fmt, cfg.gord, cfg.kv2).BLK
 
 
 def fuse_unit_raw(cfg):
@@ -1344,29 +1349,36 @@ FZ_RAW_COMPACT = 0, 28992, 21760, 3264   # rawdma, 4 super-blocks a row: one raw
 
 def fuse_raw_ring(cfg, cov):
     """rawdma: (byte offset from the W ring's first 2048-aligned byte, records) of the filler's raw ring: two
-    [16][RECROW] records where the decoder output allows (FZ_RAW), else one (FZ_RAW_COMPACT)."""
+    [16][RECROW] records where the decoder output allows (FZ_RAW, Q5_K's packed layout), else one."""
+    D = decoder(cfg.fmt, cfg.gord, cfg.kv2)
     sp, in_, sp2, out = fuse_scratch(cfg, cov)
-    return in_, (2 if (sp, in_, sp2, out) == FZ_RAW else 1)
+    return in_, (2 if sp2 - in_ >= 2 * 16 * D.RECROW else 1)
 
 
 def fuse_scratch(cfg, cov):
     """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt, cfg.gord, cfg.kv2)
     _, _, _, nsb = fuse_span(cfg, cov)
     ring = 2 * NP * slab(cfg.ks[cov[-1]]) - 2047   # (the scratch starts at the ring's first 2048-aligned byte)
     if cfg.rawdma:
         sp, in_, sp2, out = FZ_RAW
-        if out + nsb * 2 * D.OUT_B <= ring:
-            assert sp + D.SCR_B <= in_ and in_ + 2 * 16 * D.RECROW <= sp2 and sp2 + D.SCR2_B <= out
+        if (out + nsb * 2 * D.OUT_B <= ring and sp + D.SCR_B <= in_ and in_ + 2 * 16 * D.RECROW <= sp2
+                and sp2 + D.SCR2_B <= out):
             return FZ_RAW
         sp, in_, sp2, out = FZ_RAW_COMPACT
-        if out + nsb * 2 * D.OUT_B <= sp2 and sp2 + D.SCR2_B <= in_ and in_ + 16 * D.RECROW <= ring:
+        if (out + nsb * 2 * D.OUT_B <= sp2 and sp2 + D.SCR2_B <= in_ and in_ + 16 * D.RECROW <= ring
+                and sp + D.SCR_B <= out):
             return FZ_RAW_COMPACT
+        if D.GF:   # packed (no tables): A, two raw records, B, the output
+            in_ = -(-D.SCR_B // 64) * 64
+            sp2 = in_ + 2 * 16 * D.RECROW
+            out = -(-(sp2 + D.SCR2_B) // 64) * 64
+            if out + nsb * 2 * D.OUT_B <= ring:
+                return sp, in_, sp2, out
         # tight (thelp's short rings): the output, one raw record, then storage B at least 16 KB past A (a bank apart)
-        out = 3264
+        out = max(3264, -(-D.SCR_B // 64) * 64)
         in_ = -(-(out + nsb * 2 * D.OUT_B) // 64) * 64
         sp2 = max(in_ + 16 * D.RECROW, 16384)
-        assert sp + D.SCR_B <= out, (nsb, ring)
         if sp2 + D.SCR2_B > ring:   # (kchain's tail at 20 k-blocks: storage B in private storage, FZ_SP2_OWN)
             assert cfg.kchain and in_ + 16 * D.RECROW <= ring, (nsb, ring)
             sp2 = FZ_SP2_OWN
@@ -1388,7 +1400,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     until this panel's drain, which starts after the last record). Unit index and count live in private storage
     (the decoder needs every register)."""
     e = L.append
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt, cfg.gord, cfg.kv2)
     hrow = cov[0] if helper == "H" else None           # (the helper's row, listed first: the filler copies its records)
     K = (helper or "").startswith("K")
     dcov = tuple(j for j in cov if j != hrow) if not K else (cov[0],)
@@ -1469,7 +1481,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     else:
         raw_stream_unit(e, D, RW, inb)
     if s0:   # the decoder reads this row's super-blocks
-        e(f"  %fzo_ins = mov.i32 {D.BLK * s0}")
+        e(f"  %fzo_ins = mov.i32 {(2 * D.OUT_B if D.BFP else D.BLK) * s0}")   # (BFP: the record is in output layout)
         e(f"  %fzinS = add.rr {inb}, %fzo_ins")
         inb = "%fzinS"
     for nm in ("sp", "in", "sp2", "out"):
@@ -2055,6 +2067,20 @@ def gate_parked(e):
     e("  %gn1 = mov.scalar-to-address %gnpl")
 
 
+def gate_pace(e, p, pn1, out):
+    """out = the pace after pn1 polls: GP0 + GPR * max(0, pn1 - GRAMP) + GPS * max(0, pn1 - GFAST) (p: name prefix)."""
+    for t, lim, k in (("r", GRAMP, GPR), ("b", GFAST, GPS)):
+        e(f"  {p}{t}l = {imm32(lim)} {lim}")
+        e(f"  {p}{t}s = lt {p}{t}l, {pn1}")
+        e(f"  {p}{t}o = sub {pn1}, {p}{t}l")
+        e(f"  {p}{t}m = mul {p}{t}o, {p}{t}s")
+        e(f"  {p}{t}k = mov.i32 {k}")
+        e(f"  {p}{t}g = mul {p}{t}m, {p}{t}k")
+    e(f"  {p}0 = mov.i32 {GP0}")
+    e(f"  {p}r = add.rr {p}0, {p}rg")
+    e(f"  {out} = add.rr {p}r, {p}bg")
+
+
 def imm32(v):
     """The constant op for v: mova.i32 (4 bytes, load slot) where its 11-bit immediate holds v, else mov.i32."""
     return "mova.i32" if -1024 <= v < 1024 else "mov.i32"
@@ -2154,9 +2180,6 @@ def gate_epilogue(L, cfg, gate, parked=False):
         e(f"  %g64 = mov.i32 {GATE_CALLS}")
         e("  %gexp = mul %gnext, %g64")   # ready = sequence * GATE_CALLS + calls
         e(f"  %gsup = mov.i32 {S}")
-        e(f"  %gfast = mov.i32 {GFAST}")
-        e(f"  %gp0 = mov.i32 {GP0}")
-        e(f"  %gps = mov.i32 {GPS}")
         e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
         e("^gp(%gpn: reg<aie2p.er>, %gnc0: reg<aie2p.er>):")
         e("  %gpo = lt %gpn, %gsup")
@@ -2173,11 +2196,7 @@ def gate_epilogue(L, cfg, gate, parked=False):
         e("  %glate = lt %grdy, %gexp")
         e("  low.cond_br %glate, ^gpace, ^gopen : reg<aie2p.er>")
         e("^gpace:")
-        e("  %gslow = lt %gfast, %gpn1")
-        e("  %gover = sub %gpn1, %gfast")
-        e("  %govs = mul %gover, %gslow")
-        e("  %ggrow = mul %govs, %gps")
-        e("  %gpace = add.rr %gp0, %ggrow")
+        gate_pace(e, "%gv", "%gpn1", "%gpace")
         e("  low.br ^gw(%g0: reg<aie2p.er>, %gpace: reg<aie2p.er>, %gpn1: reg<aie2p.er>, %g0: reg<aie2p.er>)")
         e("^gw(%gwi: reg<aie2p.er>, %gwl: reg<aie2p.er>, %gwp: reg<aie2p.er>, %gwc: reg<aie2p.er>):")
         e("  %gwm = lt %gwi, %gwl")
@@ -2273,7 +2292,7 @@ def gate_first(e, cfg, gate, gn):
         e("  low.br ^gfgo")
         e("^gfgo:")
         return
-    # the waiter: ready >= the last job's + GATE_CALLS; poll, then spin the pace (GP0 + GPS * max(0, polls - GFAST))
+    # the waiter: ready >= the last job's + GATE_CALLS; poll, then spin the pace (gate_pace)
     e(f"  %gf64 = mova.i32 {GATE_CALLS}")
     if compact:
         e("  %gfE = lda %gsp0, 16")
@@ -2301,14 +2320,7 @@ def gate_first(e, cfg, gate, gn):
     e(f"  %gfsl = {imm32(S - 1)} {S - 1}")
     e("  %gfquit = lt %gfsl, %gfpn1")   # (pn + 1 >= S)
     e("  %gfwait = lt %gfquit, %gflate")
-    e(f"  %gffast = {imm32(GFAST)} {GFAST}")
-    e("  %gfslow = lt %gffast, %gfpn1")
-    e("  %gfover = sub %gfpn1, %gffast")
-    e("  %gfovs = mul %gfover, %gfslow")
-    e(f"  %gfps = mov.i32 {GPS}")
-    e("  %gfgrow = mul %gfovs, %gfps")
-    e(f"  %gfp0 = mov.i32 {GP0}")
-    e("  %gfpace = add.rr %gfgrow, %gfp0")
+    gate_pace(e, "%gfv", "%gfpn1", "%gfpace")
     e("  low.cond_br %gfwait, ^gfpgo, ^gfhand : reg<aie2p.er>")
     e("^gfpgo:")
     e("  low.br ^gfp(%gfpn1: reg<aie2p.er>, %gfpace: reg<aie2p.er>)")
@@ -2516,7 +2528,7 @@ def waiter_epilogue(e, S, parked, nbr):
     e("  st %gm, %gsp, 12")
     e("  return")
     e("^gend:")
-    # the wait for ready >= the last job's + GATE_CALLS: poll, then spin the pace (GP0 + GPS * max(0, polls - GFAST))
+    # the wait for ready >= the last job's + GATE_CALLS: poll, then spin the pace (gate_pace)
     e(f"  %g64 = mova.i32 {GATE_CALLS}")
     e("  %gexp = add.rr %gE, %g64")
     e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
@@ -2537,14 +2549,7 @@ def waiter_epilogue(e, S, parked, nbr):
     e(f"  %gsl = mova.i32 {S - 1}")
     e("  %gquit = lt %gsl, %gpn1")                # (pn + 1 >= S; pn and pw die before the back edge's values)
     e("  %gwait = lt %gquit, %glate")
-    e(f"  %gfast = {imm32(GFAST)} {GFAST}")
-    e("  %gslow = lt.select %gfast, %gpn1")
-    e("  %gover = sub %gpn1, %gfast")
-    e("  %govs = sel.nez %gover, %gpw, %gslow")   # (%gpw: 0 here)
-    e(f"  %gps = mov.i32 {GPS}")
-    e("  %ggrow = mul %govs, %gps")
-    e(f"  %gp0 = mov.i32 {GP0}")
-    e("  %gpace = add.rr %ggrow, %gp0")
+    gate_pace(e, "%gv", "%gpn1", "%gpace")
     e("  low.cond_br %gwait, ^gpgo, ^ghand : reg<aie2p.er>")
     e("^gpgo:")
     e("  low.br ^gp(%gpn1: reg<aie2p.er>, %gpace: reg<aie2p.er>)")
@@ -3543,21 +3548,18 @@ def silu_kofs():
 
 
 def silu_rodata():
-    f32 = lambda bits: struct.unpack("<f", struct.pack("<I", bits))[0]   # noqa: E731
-    tb = []
-    for i in range(SL_LO, SL_HI + 1):   # sigmoid(-x) of every bf16 x in range, rounded to f32, then to bf16 (RNE)
-        t = struct.unpack("<f", struct.pack("<f", 1 / (1 + math.exp(f32(i << 16)))))[0]
-        u = struct.unpack("<I", struct.pack("<f", t))[0]
-        tb.append(0 if t < 2.0 ** -126 else (u + 0x7FFF + ((u >> 16) & 1)) >> 16)   # no denormals (the core flushes them)
-    tb += [0] * (-len(tb) % 16)
-    pay = []
-    for r in range(0, len(tb), 16):   # each 16-value block twice
-        pay += tb[r:r + 16] * 2
-    pay += [0] * 32
-    pay += [0] * (-len(pay) % 32)
-    for k in SL_K:
-        pay += [k] * 32
-    return f'global.rodata.def @silu_t = align(64) bytes("{struct.pack("<%dH" % len(pay), *pay).hex()}")'
+    import numpy as np
+    x = (np.arange(SL_LO, SL_HI + 1, dtype=np.uint32) << 16).view(np.float32).astype(np.float64)
+    t = (1 / (1 + np.exp(x))).astype(np.float32)
+    u = t.view(np.uint32).astype(np.uint64)
+    tb = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+    tb[t < np.float32(2.0 ** -126)] = 0                 # no denormals (the core flushes them)
+    blk = np.zeros((len(tb) + 15) // 16 * 16, np.uint16)
+    blk[:len(tb)] = tb
+    blk = blk.reshape(-1, 16)
+    pay = np.concatenate([np.stack([blk, blk], 1).reshape(-1), np.zeros(32, np.uint16)])
+    pay = np.concatenate([pay, np.zeros(-len(pay) % 32, np.uint16)] + [np.full(32, k, np.uint16) for k in SL_K])
+    return f'global.rodata.def @silu_t = align(64) bytes("{pay.view(np.uint8).tobytes().hex()}")'
 
 
 def gen(cfg):

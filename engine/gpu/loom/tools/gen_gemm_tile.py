@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import gen_bfp16_encode as GE  # noqa: E402
+import gen_npu_gemm as GN  # noqa: E402
 import gen_gemm_decode as G  # noqa: E402
 
 # Mixed gate:up pairs whose decode waves are swizzled so each SIMD holds both roles (gate/up by wave bit 2, not bit 1):

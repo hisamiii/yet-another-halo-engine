@@ -54,9 +54,6 @@ def main():
     if len(sys.argv) < 6:
         sys.exit(__doc__)
     work, cols, nb = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-    if os.environ.get("NPU_NP"):   # 16-row slabs per column (production: 4, 64 rows; the generator's default 5)
-        N.NP = int(os.environ["NPU_NP"])
-        N.TN = 16 * N.NP
     ks, passes = tuple(int(v) for v in sys.argv[4].split(",")), int(sys.argv[5])
     # NPU_MU=1: one M slab per iteration (2-slot activation ring); NPU_FUSE=1: the GEMM cores fill their panels
     mu, fuse = int(os.environ.get("NPU_MU", "2")), int(os.environ.get("NPU_FUSE", "0"))
@@ -70,24 +67,15 @@ def main():
     os.makedirs(work, exist_ok=True)
     wq = None
     if fuse == 2:   # real rows of fmt (NPU_GGUF): the panels are decoded on the cores; W's value is the decoder's
+        sys.path.insert(0, os.path.expanduser("~/llama.cpp/gguf-py"))
+        import gguf
         D = N.decoder(fmt, cfg.gord)
+        rd = gguf.GGUFReader(os.path.expanduser(os.environ.get(
+            "NPU_GGUF", "~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf")))
         KR = kraw or K
-        if fmt == "MQ4":   # NPU_HFQ's first [>= Nn, KR] MQ4 tensor, nibbles signed as the engine's loader stores them
-            import hfq_index
-            hp = os.path.expanduser(os.environ.get("NPU_HFQ", "~/Downloads/qwen3.8-27b.mq4-xts"))
-            t = next(x for x in hfq_index.read(hp) if x[1] == 44 and x[2][1] == KR and x[2][0] >= Nn)
-            wraw = hfq_index.mq4_rows(hp, t, slice(0, Nn))
-        elif os.environ.get("NPU_RAW") == "random":   # random rows, each block's leading f16 scale set to 0.02
-            wraw = np.random.default_rng(5).integers(0, 256, (Nn, KR // 256, D.BLK), dtype=np.uint8)
-            wraw[:, :, :2] = np.frombuffer(np.float16(0.02).tobytes(), np.uint8)
-        else:
-            sys.path.insert(0, os.path.expanduser("~/llama.cpp/gguf-py"))
-            import gguf
-            rd = gguf.GGUFReader(os.path.expanduser(os.environ.get(
-                "NPU_GGUF", "~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf")))
-            t = next(x for x in rd.tensors if x.tensor_type.name == fmt and len(x.shape) == 2
-                     and int(x.shape[0]) == KR and int(x.shape[1]) >= Nn)
-            wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
+        t = next(x for x in rd.tensors if x.tensor_type.name == fmt and len(x.shape) == 2
+                 and int(x.shape[0]) == KR and int(x.shape[1]) >= Nn)
+        wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
         wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32
         frag = wf.reshape(Nn // 8, 8, K // 8, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
         bb = D.Q.bfp_hw(frag).reshape(-1, 8, 9)                    # per row [E][8 mantissas]
@@ -117,7 +105,7 @@ def main():
     sa, sw, sc = N.stream_bytes(cfg)
     a_in = a
     if fuse == 2:   # the decoders emit each pass's k-blocks in panel order (gen_npu_dec.KPERM): A follows
-        kperm = np.concatenate([128 * p + np.array(D.KPERM) for p in range(passes)])
+        kperm = np.concatenate([128 * p + D.KPERM for p in range(passes)])
         a_in = a.reshape(M, K // 8, 8)[:, kperm].reshape(M, K)
     ra, _ = B.reference(a_in, "act", M, list(ks), passes, 64, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
