@@ -2141,6 +2141,11 @@ def main():
     if not rot and os.environ.get("YAH_NATIVE") != "1":
         raise SystemExit("emit_prefill_pp: not MQ4 weights; a GGUF loaded natively needs YAH_NATIVE=1")
     a4 = rot and os.environ.get("YAH_A16") != "1"
+    # R2P_LAZY (gen_attn_fa: lazy rescale threshold, nats) 5 on native and A16 sets, as the npu branch: 2 x 32 busiest
+    # SQ +0.8 at 126K on real kv8 inputs, native kld_ref 0.0164 = exact. A4 keeps the exact kernel (kld_ref 0.0675 ->
+    # 0.0692, npu_gate over its limit)
+    if "R2P_LAZY" not in os.environ:
+        gen_attn_fa.R2P_LAZY = 0.0 if a4 else 5.0
     KV16_ON = a4
     NQOV_ON = a4
     GUOV_ON = a4 and not EMIT_HALF
