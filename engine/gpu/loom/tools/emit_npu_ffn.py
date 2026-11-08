@@ -197,6 +197,7 @@ def main():
     F = int(sys.argv[4]) if len(sys.argv) > 4 else 8192
     assert F % 1024 == 0 and 0 < F < FFN and (FFN - F) % 256 == 0 and B % 64 == 0
     if any(ln.startswith("native ") for ln in open(os.path.join(outdir, "dispatch.txt"))):
+        os.environ["YAH_NATIVE"] = "1"   # the set's own formats (emit_prefill.parse)
         return native(model, outdir, B, F)
     G = FFN - F
     # up's rows follow gate's by its MQ4 bytes and the HFQ's f16 gate awq (a GGUF is converted to that layout;
