@@ -2329,6 +2329,12 @@ def main():
         geom.append(("gsig", 0, 0, 0))
     if QSPLIT_ON:
         geom.append(("qsplit", 0, 0, 0))
+    # YAH_ATTN_KDB=0|1: the 2 x 32 R2P kernels double buffer the QK waves' K fragments (gen_attn_fa R2P_KDB) with the
+    # lane values recomputed per role branch (R2P_RELANE), so Loom's bank-aware allocation fits 192 VGPRs: tiled kernel
+    # 2K..16K mean SQ +0.3..0.8, busiest +0.1..0.7, bit-identical (8K gate window logits equal). Chunk 0 and the 2 x 64
+    # kernels keep the single buffer (depth 0 -0.4 / tiled -2.5, 64K -0.2)
+    kdb_main = bool(MAIN_FLAGS["R2P"] and persist) and os.environ.get("YAH_ATTN_KDB", "1") == "1"
+    gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = kdb_main
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
     if os.environ.get("YAH_ATTN_SRC_ONLY"):   # (dev loop: this attention source only, no set)
@@ -2338,16 +2344,22 @@ def main():
     c0seed = int(ATTN_C0SEED) if ATTN_C0SEED is not None else 29 if QSPLIT_ON else 0
     c0rot16 = QSPLIT_ON and ATTN_C0ROT16
 
-    def write_c0(src, path):   # chunk 0's twin of an attention source (c0rot16 regenerates it)
+    def write_c0(src, path):   # chunk 0's twin of an attention source (c0rot16 / kdb regenerate it)
+        kdb = gen_attn_fa.R2P_KDB   # (chunk 0 keeps the single K buffer: depth 0 busiest SQ -0.4, tiled -2.5)
+        gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = False
         if c0rot16:
             gen_attn_fa.R2P_QROT16 = True
             write_attn(path)
             gen_attn_fa.R2P_QROT16 = False
             src = path
+        elif kdb:
+            write_attn(path)
+            src = path
+        gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = kdb
         if c0seed:
             text = srcseed.seed_order(open(src).read(), c0seed)
             open(path, "w").write(text)
-        return path if c0seed or c0rot16 else src
+        return path if c0seed or c0rot16 or kdb else src
     attn_c0_src = write_c0(attn_src, os.path.join(tmp, "yah_attn_hip_c0.loom"))
     attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")
     aov_need = 0
@@ -2375,6 +2387,7 @@ def main():
         gen_attn_fa.TILED_OUT = False
     # YAH_ATTN_W64=<chunk>: chunks from <chunk> on run the 2 x 64 R2P kernel (half the K / V staging per MMA, bit-identical).
     # Its 16-wave workgroups run 2 per WGP and phase-lock: it wins only at depth.
+    gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = False
     w64_from = int(os.environ.get("YAH_ATTN_W64", "0")) or NCH
     attn64_src = attn64_t_src = None
     persist64 = persist // 2

@@ -175,6 +175,15 @@ KRAW_RD_STEP = int(_krs) if _krs else None
 R2P = False
 R2P_QKF = int(os.environ.get("R2P_QKF", "1"))   # R2P: a schedule fence every R2P_QKF K fragments (2 MMAs each; 2 -> 198 VGPRs, 3 WGs: +6.8%)
 R2P_PVF = int(os.environ.get("R2P_PVF", "1"))   # R2P: the same for the V^T fragments
+# R2P_KDB: the QK wave's K fragments double buffered in a fenced order (load c + 1, then fragment c's MMAs), so a
+# fragment load never waits for the MMAs reading the previous one. Same arithmetic. It fits 192 VGPRs with Loom's
+# bank-aware allocation only under R2P_RELANE (else 198-200, 7 waves). 2 x 32 at 8K / 16K busiest SQ +0.5..0.8 / +0.7,
+# 2 x 64 at 64K -0.2. (The P.V twin, double buffered V^T, moves the LDS latency onto the QK waves: in-order LDS queue.)
+R2P_KDB = os.environ.get("R2P_KDB", "0") == "1"
+# R2P_RELANE: recompute the unit prologue's per-lane values (pure index / scalar math on the workitem id) at the start of
+# each R2P role branch and of the epilogue, rooted on tid + (queue word 2 & unit id) so code motion cannot merge them
+# back: lane values then live only where they are used (the QK loop carried 13 VGPRs it never read). Same arithmetic
+R2P_RELANE = os.environ.get("R2P_RELANE", "0") == "1"
 # R2P_KPOS: where the P.V wave stores K(ks + 16) in phase B: "p" (default) after its P^T loads, "" right after barrier A
 # (ahead of them in the in-order LDS queue: the first P.V MMA waited for the K stores), "0".."7" after V^T fragment f's
 # MMAs (from "1": 203 VGPRs). "p": busiest SQ +0.6 / +0.1 / +0.4..0.9 at 64K / 8K / 0, bit-identical; with it the
@@ -3083,12 +3092,28 @@ def gen():
     def r2p_qk_chain(ind, kv, krow="%c0"):
         ch4 = "chain4" in R2P_DIAG   # 4 chains: per head, even and odd K fragments, summed at the end (sum order moves)
         acc = ["%r2z"] * (4 if ch4 else 2)
-        for c in range(8):
+        kvt = f"view<{32 if kv == '%k2_view' else KT}x{KT_PITCH}xf16>"
+
+        kdb = R2P_KDB and R2P_RELANE and PERSIST and PERSIST_DYN   # (fits 192 VGPRs only with the relane pass)
+
+        def kload(c):
             e(f"{ind}%kfc{c}c = index.constant {16 * c} : index")
             e(f"{ind}%kfc{c} = index.add %hd128, %kfc{c}c : index")
+            e(f"{ind}%kf{c} = vector.fragment.load<lhs> {kv}[{krow}, %kfc{c}] shape [%m, %k] : {kvt} -> {V16H}")
+        if kdb:
+            assert not ch4 and "halfk" not in R2P_DIAG and "dblk" not in R2P_DIAG
+            kload(0)
+            e(f"{ind}scf.schedule.fence")
+        for c in range(8):
             kc = c - 1 if "halfk" in R2P_DIAG and c % 2 else c
-            if kc == c:
-                kvt = f"view<{32 if kv == '%k2_view' else KT}x{KT_PITCH}xf16>"
+            if kdb:
+                if c < 7:
+                    kload(c + 1)
+                    e(f"{ind}scf.schedule.fence")
+            else:
+                e(f"{ind}%kfc{c}c = index.constant {16 * c} : index")
+                e(f"{ind}%kfc{c} = index.add %hd128, %kfc{c}c : index")
+            if kc == c and not kdb:
                 e(f"{ind}%kf{c} = vector.fragment.load<lhs> {kv}[{krow}, %kfc{c}] shape [%m, %k] : {kvt} -> {V16H}")
             if "dblk" in R2P_DIAG:   # diag: the second head's MMA from its own fragment load (cols + 8, in the pad)
                 e(f"{ind}%kfc{c}b = index.add %kfc{c}, %c8 : index")
@@ -3100,7 +3125,7 @@ def gen():
                 acc[a] = f"%sa{t}_{c}"
             if CHAIN_HOOK[0] is not None:
                 CHAIN_HOOK[0](c)
-            if c < 7 and (c + 1) % R2P_QKF == 0:
+            if c < 7 and (kdb or (c + 1) % R2P_QKF == 0):
                 e(f"{ind}scf.schedule.fence")
         if ch4:
             for t in range(2):
@@ -4186,7 +4211,68 @@ def gen():
     e("}")
     if "noallbar" in R2P_DIAG:   # diag: no workgroup barriers anywhere (races: wrong values)
         L = [ln for ln in L if "kernel.barrier<workgroup>" not in ln]
+    if R2P and R2P_RELANE and PERSIST and PERSIST_DYN:
+        L = relane_pass(L)
     return "\n".join(L) + "\n"
+
+
+RELANE_PURE = ("index.add", "index.sub", "index.mul", "index.div", "index.rem", "index.cast", "index.cmp", "index.min",
+               "index.max", "index.assume", "index.constant", "scalar.andi", "scalar.ori", "scalar.xori", "scalar.addi",
+               "scalar.subi", "scalar.muli", "scalar.shli", "scalar.shrui", "scalar.shrsi", "scalar.cast",
+               "scalar.bitcast", "scf.select", "scalar.cmpi", "scalar.constant", "scalar.mulf", "scalar.addf",
+               "scalar.subf", "vector.splat")
+
+
+def relane_pass(L):
+    """R2P_RELANE: the unit prologue's per-lane values (pure ops depending on %tid, defined in the role split's block
+    before it) are recomputed at the start of the QK branch, the P.V branch and the epilogue (the rest of that block),
+    rooted on tid + (queue word 2 & unit id); uses inside each region read its copies."""
+    tok = re.compile(r"%[A-Za-z0-9_.]+")
+    dep = [0] * (len(L) + 1)
+    for i, ln in enumerate(L):
+        dep[i + 1] = dep[i] + ln.count("{") - ln.count("}")
+    rs = next(i for i, ln in enumerate(L) if re.search(r"%gmax, %gsum = scf\.if %isA -> ", ln))
+    D = dep[rs]
+    rel = next(i for i in range(rs + 1, len(L)) if dep[i] == D + 1 and L[i].strip() == "} else {")
+    rclose = next(i for i in range(rel + 1, len(L)) if dep[i + 1] == D)
+    blk = max(i for i in range(rs) if dep[i] < D)              # the line opening the enclosing block
+    bend = next(i for i in range(rclose + 1, len(L)) if dep[i + 1] < D)
+    defs, order = {}, []
+    for i in range(blk + 1, rs):
+        ln = L[i]
+        if dep[i] == D and " = " in ln and "{" not in ln:
+            lhs, rhs = ln.split(" = ", 1)
+            names = tok.findall(lhs)
+            if len(names) == 1:
+                defs[names[0]] = (i, rhs.split()[0] if rhs.split() else "", set(tok.findall(rhs)))
+                order.append(names[0])
+    lane = {"%tid"}
+    for n in order:
+        if n != "%tid" and defs[n][1] in RELANE_PURE and defs[n][2] & lane:
+            lane.add(n)
+    lane.discard("%tid")
+    ins = {}
+    for R, (a, b) in {"qk": (rs + 1, rel), "pv": (rel + 1, rclose), "ep": (rclose + 1, bend)}.items():
+        need, todo = set(), [n for i in range(a, b) for n in tok.findall(L[i]) if n in lane]
+        while todo:
+            n = todo.pop()
+            if n not in need:
+                need.add(n)
+                todo += [o for o in defs[n][2] if o in lane]
+        sfx = "_rl" + R
+        sub = {n: n + sfx for n in need}
+        sub["%tid"] = "%tid" + sfx
+        pro = [f"  %rlzu{sfx} = index.cast %wglp : index to i32", f"  %rlzi{sfx} = scalar.andi %pwz0, %rlzu{sfx} : i32",
+               f"  %rlz{sfx} = index.cast %rlzi{sfx} : i32 to index", f"  %tid{sfx} = index.add %tid, %rlz{sfx} : index"]
+        pro += [tok.sub(lambda m: sub.get(m.group(0), m.group(0)), L[defs[n][0]]) for n in order if n in need]
+        for i in range(a, b):
+            L[i] = tok.sub(lambda m: sub[m.group(0)] if m.group(0) in need else m.group(0), L[i])
+        ins[a] = pro
+    out = []
+    for i, ln in enumerate(L):
+        out += ins.get(i, [])
+        out.append(ln)
+    return out
 
 
 def gen_qrot():
