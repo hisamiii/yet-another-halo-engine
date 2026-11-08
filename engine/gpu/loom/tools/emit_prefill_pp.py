@@ -748,6 +748,10 @@ DNRING = True
 DNRING_ON = False   # set by main
 
 
+def alt(path):
+    return path.replace(".loom", "_alt.loom")
+
+
 ATTN_VGPR = 192   # every attention variant fits here unless the allocator rotates the O accumulators
 
 
@@ -1460,6 +1464,12 @@ def main():
         if A.KDEC:   # R2P has no in-kernel KV decode
             A.R2P = False
         open(path, "w").write(A.gen())
+        if not A.R2P:   # the head_dim split kernel's "_alt" twin without DIAG_SWAP (attn_guard)
+            saved["DIAG_SWAP"] = A.DIAG_SWAP
+            A.DIAG_SWAP = False
+            open(alt(path), "w").write(A.gen())
+        elif os.path.exists(alt(path)):   # (a stale twin from an older emit into this directory)
+            os.remove(alt(path))
         for k, v in saved.items():
             setattr(A, k, v)
     gen_attn_fa.QNORM = QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False   # (see RoPE below)
@@ -2083,11 +2093,17 @@ def main():
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
         if outname.startswith("wmma"):   # attn_guard: Loom's allocator can land a variant in its O-accumulator back-edge
-            # rotation (the 8 O tuples one placement off the P.V results: ~128 loop moves, 200+ VGPRs)
+            # rotation (the 8 O tuples one placement off the P.V results: ~128 loop moves, 200+ VGPRs); the head_dim
+            # split kernel then comes from its twin without DIAG_SWAP (R2P has no such form and has never needed one)
             hal = os.path.join(outdir, outname)
-            if hal_vgprs(hal) > ATTN_VGPR or hal_spills(hal):
-                raise SystemExit("attention %s: %d VGPRs (over %d), %d B spills: refusing to emit it"
-                                 % (outname, hal_vgprs(hal), ATTN_VGPR, hal_spills(hal)))
+            if (hal_vgprs(hal) > ATTN_VGPR or hal_spills(hal)) and os.path.exists(alt(loom)):
+                print("attention %s: %d VGPRs, %d B spills, re-emitted without DIAG_SWAP" % (outname, hal_vgprs(hal), hal_spills(hal)))
+                E.emit(alt(loom), configs, outname, outdir, attn_env(loom))
+            if hal_spills(hal):
+                raise SystemExit("attention %s: %d B spills: refusing to emit a spilling attention kernel"
+                                 % (outname, hal_spills(hal)))
+            if hal_vgprs(hal) > ATTN_VGPR:   # (3 workgroups per WGP instead of 4)
+                print("attention %s: %d VGPRs, over %d" % (outname, hal_vgprs(hal), ATTN_VGPR))
         if outname.startswith("wmma") and persist and outname != "wmmaf.hal":
             persist_rows.append((outname, persist64 if loom in (attn64_src, attn64_t_src, attn64ks_src, attn64ks_t_src,
                                                                 attn64km_src, attn64km_t_src) else persist))
