@@ -304,6 +304,9 @@ void Gguf::ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) c
     const ssize_t n =
         ::pread(fd_, p + off, std::min<std::size_t>(size - off, std::size_t{1} << 30), static_cast<off_t>(off));
     if (n <= 0) throw std::runtime_error("gguf: read failed: " + path);
+    // The copy is the model's only host image: drop the file's cached pages as they are read, or the two images fill
+    // a 30 GB machine and reclaim and compaction run on through the forward pass (stalling the GPU queues).
+    ::posix_fadvise(fd_, static_cast<off_t>(off), n, POSIX_FADV_DONTNEED);
     off += static_cast<std::size_t>(n);
   }
 }
