@@ -257,8 +257,6 @@ R2P_QPF = os.environ.get("R2P_QPF", "0") == "1"
 R2P_QTOUCH = os.environ.get("R2P_QTOUCH", "0") == "1"
 # R2P_SUMLATE: the QK wave's row sum after its P^T store (the sum is next tile's; the store feeds barrier B)
 R2P_SUMLATE = os.environ.get("R2P_SUMLATE", "0") == "1"
-# R2P_PST4: P^T stored as 4 dwords (f16 pairs): the converts' halves need no copy into a b128 tuple (4 v_mov + nop)
-R2P_PST4 = os.environ.get("R2P_PST4", "0") == "1"
 # R2P_QSPLIT (QNORM): the kqg GEMM did the Q head norm's per-element part. The q buffer (f32-sized) holds f16 q at the
 # f32 q's indices (= f16(q w / 16); dims 0..63 unused), the raw f32 rotary dims [token][head][64] at byte B * 12288,
 # and f32 sums of q^2 per 16-dim group [token][head][16] at B * 18432 (ends at B * 19968 <= the f32 q's B * 24576):
@@ -2875,11 +2873,7 @@ def gen():
                 e(f"    %pm{i} = scalar.fmaf %pe{i}, %one_o, %zero_o : f32")
                 e(f"    %pt{i} = scalar.fptrunc %pm{i} : f32 to f16")
             e(f"    %ph = vector.from_elements {', '.join(f'%pt{i}' for i in range(8))} : {V8H}")
-            for k in range(4 if R2P_PST4 else 0):
-                e(f"    %phw{k} = vector.from_elements %pt{2 * k}, %pt{2 * k + 1} : vector<2xf16>")
-        pst = lambda r: ([f"      vector.store %phw{k}, %pp_view[{r}, %c{2 * k}] : vector<2xf16>, view<{64 * NQB}x8xf16>"
-                          for k in range(4)] if R2P_PST4 and "nocvt" not in R2P_DIAG else
-                         [f"      vector.store %ph, %pp_view[{r}, %c0] : {V8H}, view<{64 * NQB}x8xf16>"])
+        pst = lambda r: [f"      vector.store %ph, %pp_view[{r}, %c0] : {V8H}, view<{64 * NQB}x8xf16>"]
         if pair_slot is not None and R2P and R2P_PSB:
             # the slot by a uniform branch on the tile parity: each arm's addresses are loop-invariant + an immediate
             # (as a runtime row index Loom rebuilds them every tile: v_mov of the parity, 2 lshl_add, 2 lshl)
