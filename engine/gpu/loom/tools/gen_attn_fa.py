@@ -255,8 +255,6 @@ R2P_QPF = os.environ.get("R2P_QPF", "0") == "1"
 # touch every 128-B line of the next unit's f32 Q rows (8 b32 loads a lane, folded into one LDS word) so the unit
 # top's Q loads hit L2: ~8 K ticks of their wait per unit were DRAM misses (ATT trace, depth 0)
 R2P_QTOUCH = os.environ.get("R2P_QTOUCH", "0") == "1"
-# R2P_SUMLATE: the QK wave's row sum after its P^T store (the sum is next tile's; the store feeds barrier B)
-R2P_SUMLATE = os.environ.get("R2P_SUMLATE", "0") == "1"
 # R2P_QSPLIT (QNORM): the kqg GEMM did the Q head norm's per-element part. The q buffer (f32-sized) holds f16 q at the
 # f32 q's indices (= f16(q w / 16); dims 0..63 unused), the raw f32 rotary dims [token][head][64] at byte B * 12288,
 # and f32 sums of q^2 per 16-dim group [token][head][16] at B * 18432 (ends at B * 19968 <= the f32 q's B * 24576):
@@ -2856,9 +2854,7 @@ def gen():
                 e("    %pcd = scalar.bitcast %pcdi : i32 to f32")
                 e("    %psum = scalar.addf %pab, %pcd : f32")
                 e("    %nsum = scalar.fmaf %rsum, %rss, %psum : f32")
-        sum_late = R2P_SUMLATE and pair_slot is not None and R2P and R2P_PSB
-        if not sum_late:
-            emit_sum()
+        emit_sum()
         # P^T as the B operand: keys 0..7 from the h=0 lane, 8..15 from h=1.
         # f16(p) as fptrunc(fma(p, 1, 0)) with an opaque 1 and 0, which selects v_fma_mix (as Q4FMIX in the GEMMs).
         # v_cvt_f16_f32 results must sit in v0..v127, where Q^T and O live: each conversion evicts a Q^T fragment to scratch.
@@ -2889,8 +2885,6 @@ def gen():
                 e(ln)
             e(f"      view.store %rss, %al_view[%pwa1] : f32, view<{32 * NQB}xf32>")
             e("    }")
-            if sum_late:
-                emit_sum()
             return None
         if pair_slot is not None:
             rows, alb = pair_slot
