@@ -2434,8 +2434,13 @@ def main():
         gen_attn_fa.configure(2, 64)
         MAIN_FLAGS["PERSIST"] = persist64
         gen_attn_fa.KSPLIT = 5
+        # YAH_ATTN_PRIO64=0|1: the key-split store kernels raise the QK waves' issue priority in their MMA section
+        # (gen_attn_fa R2P_PRIOQ 1) on the relane pass: busiest SQ -0.5% at 16K..126K, bit-identical (alone each <= -0.15%)
+        prio64 = os.environ.get("YAH_ATTN_PRIO64", "1") == "1"
         for diag, stem in (("ksstore", "ks"), ("ksmerge", "km")):
             gen_attn_fa.R2P_DIAG.add(diag)
+            gen_attn_fa.R2P_RELANE = prio64 and stem == "ks"
+            gen_attn_fa.R2P_PRIOQ = 1 if prio64 and stem == "ks" else 0
             p = os.path.join(tmp, "yah_attn_hip64%s.loom" % stem)
             write_attn(p)
             pt = None
@@ -2445,6 +2450,7 @@ def main():
                 write_attn(pt)
                 gen_attn_fa.TILED_OUT = False
             gen_attn_fa.R2P_DIAG.discard(diag)
+            gen_attn_fa.R2P_RELANE, gen_attn_fa.R2P_PRIOQ = False, 0
             if stem == "ks":
                 attn64ks_src, attn64ks_t_src = p, pt
             else:

@@ -3660,8 +3660,9 @@ def gen():
             L[i0:] = [tok.sub(lambda m: sub.get(m.group(0), m.group(0)), ln) for ln in L[i0:]]
             return sub
 
-        if R2P_SPLIT:   # (R2P_SPLIT=0 for the R2P_TPRIO / R2P_PRIO / R2P_PRIOQ / unpeeled diags)
-            assert R2P_PEEL and not (R2P_TPRIO or R2P_PRIOQ or R2P_PRIO)
+        if R2P_SPLIT:   # (R2P_SPLIT=0 for the R2P_TPRIO / unpeeled diags)
+            assert R2P_PEEL and not R2P_TPRIO
+            prio_any = R2P_PRIOQ or R2P_PRIO
             qb = {f"%rb{f}": f"%rinit{f}" for f in range(16)}   # QK waves: Q, loop-invariant
             e(f"  {', '.join(fb)}, %gmax, %gsum = scf.if %isA -> ({rtypes}, f32, f32) {{")
             # QK role: tile 0, then tiles 16.. (2 barriers each)
@@ -3739,6 +3740,8 @@ def gen():
             e("  } else {")
             e(f"  scf.yield {q0[0]}, {q0[1]} : f32, f32")
             e("  }")
+            if prio_any:   # (the epilogue at priority 0)
+                e("  kernel.priority {level = 0}")
             e(f"  scf.yield {', '.join(f'%rinit{f}' for f in range(16))}, %gmax_qa, %gsum_qa : {rtypes}, f32, f32")
             e("  } else {")
             # P.V role: tile 0 (staging only), then tiles 16..
@@ -3795,6 +3798,8 @@ def gen():
             e("  } else {")
             e(f"  scf.yield {', '.join(p0)} : {rtypes}")
             e("  }")
+            if prio_any:
+                e("  kernel.priority {level = 0}")
             e(f"  scf.yield {', '.join(pr)}, %ninf, %zero : {rtypes}, f32, f32")
             e("  }")
         elif R2P_PEEL:   # tile 0 before the loop, without the P.V of tile -1 (P = 0: 16 MMAs of nothing per workgroup)
