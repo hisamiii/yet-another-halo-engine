@@ -1,0 +1,203 @@
+Loom: a concat result may share registers with an already placed concat or slice result when every shared unit holds
+the same producer's unit (followed back through concat and slice relations) and neither value is written in place
+before the other dies. Before, two views built from the same loads (an AIE2P accumulator quad used whole and as two
+halves) counted as conflicting values, so allocation failed or copied. Byte-identical on every set the engine emits
+(pp2048, 128K context, native, decode, native with the NPU split); the Scratch NPU attention kernel needs it to load
+each S block once (with the CSE and concat reservation changes, not yet patches).
+diff --git a/loom/src/loom/codegen/low/allocation/coalescing.c b/loom/src/loom/codegen/low/allocation/coalescing.c
+index 1e8a5da038..d436ebe673 100644
+--- a/loom/src/loom/codegen/low/allocation/coalescing.c
++++ b/loom/src/loom/codegen/low/allocation/coalescing.c
+@@ -821,6 +821,172 @@ loom_low_allocation_coalescing_assign_edge_destination_interval(
+       context, interval, relation, out_assigned);
+ }
+ 
++// Most same-content views one concat result may share registers with.
++#define LOOM_LOW_ALLOCATION_COALESCING_MAX_SAME_CONTENT_VIEWS 8
++
++// Concat and slice results that view the same producers' units.
++// Follows low.concat / low.slice relations from |ordinal|'s unit |unit| back to
++// the producer that defines the unit's contents.
++static void loom_low_allocation_coalescing_view_root(
++    const loom_low_placement_table_t* placement, loom_value_ordinal_t ordinal,
++    uint32_t unit, loom_value_ordinal_t* out_ordinal, uint32_t* out_unit) {
++  for (int depth = 0; depth < 16; ++depth) {
++    const loom_low_placement_relation_range_t range =
++        loom_low_placement_relation_range_for_value_ordinal(placement, ordinal);
++    bool found = false;
++    for (uint32_t i = 0; i < range.count && !found; ++i) {
++      const loom_low_placement_relation_t* r =
++          &placement->relations[range.start + i];
++      if ((r->cause != LOOM_LOW_PLACEMENT_CAUSE_LOW_CONCAT &&
++           r->cause != LOOM_LOW_PLACEMENT_CAUSE_LOW_SLICE) ||
++          r->result_ordinal != ordinal ||
++          !loom_low_placement_relation_can_alias(r) ||
++          unit < r->result_unit_offset ||
++          unit - r->result_unit_offset >= r->unit_count) {
++        continue;
++      }
++      unit = r->source_unit_offset + (unit - r->result_unit_offset);
++      ordinal = r->source_ordinal;
++      found = true;
++    }
++    if (!found) {
++      break;
++    }
++  }
++  *out_ordinal = ordinal;
++  *out_unit = unit;
++}
++
++// Returns whether a tied (in-place) write into |ordinal|'s storage happens
++// before |other| is dead.
++static bool loom_low_allocation_coalescing_tied_write_before_end(
++    loom_low_allocation_coalescing_context_t* context,
++    loom_value_ordinal_t ordinal, const loom_liveness_interval_t* other) {
++  const loom_low_placement_relation_range_t range =
++      loom_low_placement_relation_range_for_source_value_ordinal(
++          context->placement, ordinal);
++  for (uint32_t i = 0; i < range.count; ++i) {
++    const loom_low_placement_relation_t* r =
++        &context->placement
++             ->relations[context->placement->relation_indices_by_source_ordinal
++                             [range.start + i]];
++    if (r->cause != LOOM_LOW_PLACEMENT_CAUSE_TIED_RESULT) {
++      continue;
++    }
++    const loom_liveness_interval_t* t =
++        loom_liveness_interval_for_value_ordinal(context->liveness,
++                                                 r->result_ordinal);
++    if (!t || t->start_point < other->end_point) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Returns whether |b| (assigned) occupies a subrange of |a| at the candidate
++// location (or |a| a subrange of |b|) with identical contents in every unit.
++static bool loom_low_allocation_coalescing_same_content_view(
++    loom_low_allocation_coalescing_context_t* context,
++    loom_value_ordinal_t a_ordinal, const loom_low_allocation_assignment_t* a,
++    loom_value_ordinal_t b_ordinal, const loom_low_allocation_assignment_t* b) {
++  const loom_low_descriptor_set_t* ds = context->search_context->descriptor_set;
++  for (int swap = 0; swap < 2; ++swap) {
++    const loom_low_allocation_assignment_t* big = swap ? b : a;
++    const loom_low_allocation_assignment_t* small = swap ? a : b;
++    const loom_value_ordinal_t big_ordinal = swap ? b_ordinal : a_ordinal;
++    const loom_value_ordinal_t small_ordinal = swap ? a_ordinal : b_ordinal;
++    if (small->location_count > big->location_count) {
++      continue;
++    }
++    for (uint32_t k = 0; k + small->location_count <= big->location_count;
++         ++k) {
++      if (!loom_low_allocation_storage_assignment_subranges_equal(
++              ds, big, k, small, 0, small->location_count)) {
++        continue;
++      }
++      bool same = true;
++      for (uint32_t i = 0; i < small->location_count && same; ++i) {
++        loom_value_ordinal_t ro0, ro1;
++        uint32_t ru0, ru1;
++        loom_low_allocation_coalescing_view_root(
++            context->placement, big_ordinal, k + i, &ro0, &ru0);
++        loom_low_allocation_coalescing_view_root(context->placement,
++                                                 small_ordinal, i, &ro1, &ru1);
++        same = ro0 == ro1 && ru0 == ru1 && ro0 != big_ordinal &&
++               ro1 != small_ordinal;
++      }
++      if (same) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++// Appends to |ignored_value_ids| every assigned concat/slice result that shares
++// a source with the concat result |result_ordinal| and is a same-content view
++// of |result_assignment|: such values may share registers with it, because
++// every shared unit holds the same producer unit. Values with an in-place write
++// into either storage before the other dies are left out.
++static iree_status_t loom_low_allocation_coalescing_append_same_content_views(
++    loom_low_allocation_coalescing_context_t* context,
++    const loom_liveness_interval_t* interval,
++    loom_value_ordinal_t result_ordinal,
++    const loom_low_placement_relation_range_t* range,
++    const loom_low_allocation_assignment_t* result_assignment,
++    loom_value_id_t* ignored_value_ids, uint16_t ignored_value_capacity,
++    uint16_t* ignored_value_count) {
++  for (uint32_t i = 0; i < range->count; ++i) {
++    const loom_low_placement_relation_t* relation =
++        &context->placement->relations[range->start + i];
++    if (relation->cause != LOOM_LOW_PLACEMENT_CAUSE_LOW_CONCAT) {
++      continue;
++    }
++    const loom_low_placement_relation_range_t users =
++        loom_low_placement_relation_range_for_source_value_ordinal(
++            context->placement, relation->source_ordinal);
++    for (uint32_t j = 0; j < users.count; ++j) {
++      const loom_low_placement_relation_t* user =
++          &context->placement->relations
++               [context->placement
++                    ->relation_indices_by_source_ordinal[users.start + j]];
++      if ((user->cause != LOOM_LOW_PLACEMENT_CAUSE_LOW_CONCAT &&
++           user->cause != LOOM_LOW_PLACEMENT_CAUSE_LOW_SLICE) ||
++          !loom_low_placement_relation_can_alias(user) ||
++          user->result_ordinal == result_ordinal) {
++        continue;
++      }
++      const loom_low_allocation_assignment_t* other =
++          loom_low_allocation_coalescing_current_assignment_for_value_ordinal(
++              context, user->result_ordinal);
++      if (!other || !loom_low_allocation_assignment_is_register_like(other) ||
++          other->location_kind != result_assignment->location_kind) {
++        continue;
++      }
++      const loom_liveness_interval_t* other_interval =
++          loom_liveness_interval_for_value_ordinal(context->liveness,
++                                                   user->result_ordinal);
++      if (!other_interval ||
++          !loom_low_allocation_coalescing_same_content_view(
++              context, result_ordinal, result_assignment, user->result_ordinal,
++              other) ||
++          loom_low_allocation_coalescing_tied_write_before_end(
++              context, result_ordinal, other_interval) ||
++          loom_low_allocation_coalescing_tied_write_before_end(
++              context, user->result_ordinal, interval)) {
++        continue;
++      }
++      if (*ignored_value_count < ignored_value_capacity) {
++        IREE_RETURN_IF_ERROR(
++            loom_low_allocation_coalescing_append_unique_value_id(
++                ignored_value_ids, ignored_value_capacity, ignored_value_count,
++                other->value_id));
++      }
++    }
++  }
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_low_allocation_coalescing_assign_concat_interval(
+     loom_low_allocation_coalescing_context_t* context,
+     const loom_liveness_interval_t* interval,
+@@ -860,7 +1026,8 @@ static iree_status_t loom_low_allocation_coalescing_assign_concat_interval(
+                             "uint16_t");
+   }
+   const uint16_t ignored_value_capacity =
+-      concat_source_count + (uint16_t)edge_source_range.count;
++      concat_source_count + (uint16_t)edge_source_range.count +
++      LOOM_LOW_ALLOCATION_COALESCING_MAX_SAME_CONTENT_VIEWS;
+   loom_value_id_t inline_ignored_value_ids[8];
+   loom_value_id_t* ignored_value_ids = inline_ignored_value_ids;
+   if (ignored_value_capacity > IREE_ARRAYSIZE(inline_ignored_value_ids)) {
+@@ -928,6 +1095,9 @@ static iree_status_t loom_low_allocation_coalescing_assign_concat_interval(
+     }
+   }
+   const uint16_t ignored_storage_lease_value_count = ignored_value_count;
++  IREE_RETURN_IF_ERROR(loom_low_allocation_coalescing_append_same_content_views(
++      context, interval, result_ordinal, range, &result_assignment,
++      ignored_value_ids, ignored_value_capacity, &ignored_value_count));
+   for (uint32_t i = 0; i < edge_source_range.count; ++i) {
+     const uint32_t relation_index =
+         context->placement
