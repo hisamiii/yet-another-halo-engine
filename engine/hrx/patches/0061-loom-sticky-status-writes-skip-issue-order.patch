@@ -1,0 +1,36 @@
+Loom: the physical issuer orders sticky status writes (OR-accumulating flags such as srFPFlags) like ordinary
+writes, though the schedule graph already treats them as commutative; a softmax MAC waited 4 cycles on an earlier FP op's flag
+write. GPU sets byte-identical; changes the NPU split's 27 images (NPU gate: pp2048 window 00 bit-identical);
+NPU attention one core 680.4 -> 672.4 cycles a body, O exact.
+diff --git a/loom/src/loom/codegen/low/schedule/physical_issue.c b/loom/src/loom/codegen/low/schedule/physical_issue.c
+index b3d0e91116..c08f4b13fb 100644
+--- a/loom/src/loom/codegen/low/schedule/physical_issue.c
++++ b/loom/src/loom/codegen/low/schedule/physical_issue.c
+@@ -130,6 +130,11 @@ bool loom_low_physical_issue_group_fits(
+         for (uint16_t c = 0; c < consumer->operand_count; ++c) {
+           const loom_low_operand_t* rhs =
+               &descriptor_set->operands[consumer->operand_start + c];
++          if (iree_all_bits_set(
++                  lhs->flags & rhs->flags,
++                  LOOM_LOW_OPERAND_FLAG_COMMUTATIVE_STATE_UPDATE)) {
++            continue;
++          }
+           if (!loom_low_physical_events_require_separation(
+                   descriptor_set, lhs->read_event_id, rhs->write_event_id) &&
+               !loom_low_physical_events_require_separation(
+@@ -163,6 +168,15 @@ uint32_t loom_low_physical_issue_register_ready_cycle(
+       const loom_low_operand_t* operand =
+           &descriptor_set->operands[descriptor->operand_start + j];
+       const uint16_t physical_register = instructions[i].physical_registers[j];
++      // Sticky status writes accumulate (OR) into their register, so they
++      // need no order among themselves; reads still wait for every write.
++      if (iree_any_bit_set(operand->flags,
++                           LOOM_LOW_OPERAND_FLAG_COMMUTATIVE_STATE_UPDATE)) {
++        cycle = iree_max(cycle, loom_low_schedule_event_frontier_query(
++                                    &issue->events, physical_register,
++                                    operand->read_event_id));
++        continue;
++      }
+       cycle = iree_max(cycle, loom_low_schedule_event_frontier_query(
+                                   &issue->events, physical_register,
+                                   operand->read_event_id));
