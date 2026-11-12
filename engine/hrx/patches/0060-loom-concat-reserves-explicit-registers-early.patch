@@ -1,0 +1,23 @@
+Loom: a concat whose result lives in explicit physical registers (AIE2P) is reserved from its earliest unit's start
+with per-unit start points, as fragmented tied-source assemblies already are: a whole register cannot be split, so a
+piece placed before the reservation forces copies of the others. GPU sets byte-identical; changes 15 of the NPU
+split's 27 images (NPU gate: pp2048 split window 00 bit-identical,
+hidden / logits / all_logits md5 equal).
+diff --git a/loom/src/loom/codegen/low/allocation/concat_reservation.c b/loom/src/loom/codegen/low/allocation/concat_reservation.c
+index d204683816..f7377199de 100644
+--- a/loom/src/loom/codegen/low/allocation/concat_reservation.c
++++ b/loom/src/loom/codegen/low/allocation/concat_reservation.c
+@@ -573,7 +573,13 @@ iree_status_t loom_low_allocation_concat_reservation_find(
+       loom_low_allocation_unit_liveness_start_points_for_value_ordinal(
+           context->unit_liveness, context->liveness, relation->result_ordinal);
+   IREE_ASSERT(result_unit_start_points != NULL);
++  // Explicit physical register results are reserved from their first unit's
++  // start with per-unit start points: a whole register cannot be split, so a
++  // piece placed before the reservation would force a copy of the others.
+   const bool has_fragmented_tied_source_assembly =
++      loom_low_reg_class_uses_explicit_physical_registers(
++          &context->descriptor_set
++               ->reg_classes[capacity.descriptor_reg_class_id]) ||
+       loom_low_allocation_concat_reservation_has_fragmented_tied_source_assembly(
+           context, result_range, result_unit_start_points);
+   // Scalar sources can cheaply reserve a future aggregate, and packet-local
