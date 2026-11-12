@@ -1,0 +1,71 @@
+Loom: low CSE keeps a duplicate producer whose results only feed low.concat pieces when one of those concats also
+consumes the existing producer's result and the concat's result lives in explicit physical registers (AIE2P). Merging
+them made the concat take one value as two pieces, which only a register copy can satisfy (48 vmov.256 + 19
+vmov.accumulator512 a body in the Scratch NPU attention kernel). GPU sets byte-identical; changes 17 of the NPU split's
+27 images (NPU gate: pp2048 split window 00 bit-identical,
+hidden / logits / all_logits md5 equal).
+diff --git a/loom/src/loom/codegen/low/transforms/cse.c b/loom/src/loom/codegen/low/transforms/cse.c
+index 887b3fa1fc..dc2ecd97ab 100644
+--- a/loom/src/loom/codegen/low/transforms/cse.c
++++ b/loom/src/loom/codegen/low/transforms/cse.c
+@@ -132,6 +132,48 @@ static loom_low_cse_packet_identity_t loom_low_cse_observe_packet(
+   return identity;
+ }
+ 
++// Returns whether |op| only feeds low.concat pieces and one of those concats
++// also consumes |existing|'s result. Replacing |op| by |existing| would then
++// make that concat consume one value as two pieces, and a value has one storage
++// location, so the concat could only be satisfied by a register copy. Keeping
++// the duplicate producer lets each piece be defined directly into its part of
++// the result. Duplicates with other users are still replaced, so CSE keeps
++// merging the computations downstream of them. Only concats whose result lives
++// in explicit physical registers count: there a copy is a whole register move,
++// and the pieces of one register come from separate producers.
++static bool loom_low_cse_duplicates_concat_piece(
++    const loom_module_t* module,
++    const loom_low_descriptor_set_t* descriptor_set, const loom_op_t* op,
++    const loom_op_t* existing) {
++  const loom_low_register_type_resolver_t resolver = {
++      .descriptor_set = descriptor_set,
++  };
++  bool shares_concat = false;
++  for (uint16_t r = 0; r < op->result_count; ++r) {
++    const loom_value_t* value = loom_op_result_value(module, op, r);
++    const loom_use_t* use = NULL;
++    loom_value_for_each_use(value, use) {
++      const loom_op_t* user = loom_use_user_op(*use);
++      if (user->kind != LOOM_OP_LOW_CONCAT ||
++          !loom_low_register_type_resolver_has_class_flags(
++              &resolver,
++              loom_module_value_type(module, loom_op_const_results(user)[0]),
++              LOOM_LOW_REG_CLASS_FLAG_EXPLICIT_PHYSICAL_REGISTERS)) {
++        return false;
++      }
++      const loom_value_id_t* operands = loom_op_const_operands(user);
++      for (uint16_t i = 0; i < user->operand_count; ++i) {
++        for (uint16_t k = 0; k < existing->result_count; ++k) {
++          if (operands[i] == loom_op_const_results(existing)[k]) {
++            shares_concat = true;
++          }
++        }
++      }
++    }
++  }
++  return shares_concat;
++}
++
+ static iree_status_t loom_low_cse_region(
+     loom_pass_t* pass, loom_module_t* module, loom_region_t* region,
+     const loom_low_descriptor_set_t* descriptor_set,
+@@ -213,6 +255,11 @@ static iree_status_t loom_low_cse_region(
+     }
+     loom_expression_entry_t* existing =
+         loom_expression_scope_find(&cursor, candidate.hash, flags);
++    if (existing && existing->epoch >= minimum_epoch &&
++        loom_low_cse_duplicates_concat_piece(module, descriptor_set, cursor.op,
++                                             existing->op)) {
++      continue;  // keep the duplicate producer; |existing| stays the entry
++    }
+     if (existing && existing->epoch >= minimum_epoch) {
+       status = loom_expression_replace(module, cursor.op, existing->op);
+       if (iree_status_is_ok(status)) {
