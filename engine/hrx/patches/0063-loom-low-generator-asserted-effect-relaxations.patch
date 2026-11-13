@@ -1,0 +1,389 @@
+Loom: opt-in effect-order relaxations for hand-scheduled AIE2P bodies whose generator proves them
+(LOOM_EXP_NOALIAS_ACC=2 vector loads vs stores, LOOM_EXP_NOWAR_ACC=1 accumulator stores vs loads,
+LOOM_EXP_LOCK_ACQREL=6 lock acquire / release ordering). Unset: every order kept, emits byte-identical.
+diff --git a/loom/src/loom/codegen/low/schedule/effect_dependencies.c b/loom/src/loom/codegen/low/schedule/effect_dependencies.c
+--- a/loom/src/loom/codegen/low/schedule/effect_dependencies.c
++++ b/loom/src/loom/codegen/low/schedule/effect_dependencies.c
+@@ -6,6 +6,7 @@
+ 
+ #include "loom/codegen/low/schedule/effect_dependencies.h"
+ 
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "loom/codegen/low/schedule/graph.h"
+@@ -26,8 +27,79 @@ typedef struct loom_low_schedule_effect_frontier_t {
+   // Last write cutoff used to retire canonical descriptor-only reads in each
+   // normalized memory space. Zero cannot precede an earlier node.
+   uint32_t read_retirement_nodes[LOOM_LOW_MEMORY_SPACE_WASM_MEMORY + 1];
++  // Generator-asserted relaxations (loom_low_schedule_effect_relaxations_t):
++  // per-node vector access classes, indexed by scheduler node ordinal.
++  uint8_t* node_vector_classes;
++  // Vector access class of the node whose effects are being noted.
++  uint8_t current_vector_class;
++  // LOOM_EXP_LOCK_ACQREL: the last lock op (lock ops keep their source order),
++  // the last release (later releases follow the accesses after it), the last
++  // acquire (later shared-data accesses follow it), and the shared-data
++  // accesses since that acquire (the next acquire follows them).
++  uint32_t last_lock_node;
++  uint32_t last_release_node;
++  uint32_t guard_node;
++  uint32_t guarded_nodes[512];
++  uint32_t guarded_count;
+ } loom_low_schedule_effect_frontier_t;
+ 
++// EXPERIMENT (opt-in, generator-asserted): effect-order relaxations for
++// hand-scheduled AIE2P kernels whose generator proves the facts below. Hand
++// written Low carries no alias facts, so the default keeps every order.
++//   LOOM_EXP_NOALIAS_ACC=2: a vector load (vld*) does not wait for earlier
++//     vector stores (vst*): no store in the kernel's hoist window writes a
++//     block that a later load reads.
++//   LOOM_EXP_NOWAR_ACC=1: an accumulator store (vst.acc*) does not wait for
++//     earlier vector loads (vld*): every real write-after-read pair is also a
++//     data dependency.
++//   LOOM_EXP_LOCK_ACQREL=6: lock acquires and releases order only what they
++//     guard instead of fencing every access: a release follows the accesses
++//     since the previous release, an acquire is anchored behind the latest
++//     access before it and follows the shared-data accesses (FIFO fills,
++//     vst.512) since the previous acquire, and later shared-data accesses
++//     follow the acquire. Other ordered ops become full fences.
++typedef struct loom_low_schedule_effect_relaxations_t {
++  bool vector_noalias;
++  bool accumulator_nowar;
++  bool lock_acqrel;
++} loom_low_schedule_effect_relaxations_t;
++
++enum {
++  LOOM_LOW_SCHEDULE_VECTOR_LOAD = 1u << 0,
++  LOOM_LOW_SCHEDULE_VECTOR_STORE = 1u << 1,
++  LOOM_LOW_SCHEDULE_ACCUMULATOR_STORE = 1u << 2,
++  LOOM_LOW_SCHEDULE_SHARED_DATA_ACCESS = 1u << 3,
++};
++
++static loom_low_schedule_effect_relaxations_t
++loom_low_schedule_effect_relaxations(void) {
++  static int initialized = 0;
++  static loom_low_schedule_effect_relaxations_t relaxations;
++  if (!initialized) {
++    const char* noalias = getenv("LOOM_EXP_NOALIAS_ACC");
++    const char* nowar = getenv("LOOM_EXP_NOWAR_ACC");
++    const char* acqrel = getenv("LOOM_EXP_LOCK_ACQREL");
++    relaxations.vector_noalias = noalias && strcmp(noalias, "2") == 0;
++    relaxations.accumulator_nowar = nowar && strcmp(nowar, "1") == 0;
++    relaxations.lock_acqrel = acqrel && strcmp(acqrel, "6") == 0;
++    initialized = 1;
++  }
++  return relaxations;
++}
++
++static bool loom_low_schedule_relaxations_enabled(void) {
++  const loom_low_schedule_effect_relaxations_t r =
++      loom_low_schedule_effect_relaxations();
++  return r.vector_noalias || r.accumulator_nowar || r.lock_acqrel;
++}
++
++static uint8_t loom_low_schedule_node_vector_class(
++    const loom_low_schedule_effect_frontier_t* frontier, uint32_t node_index) {
++  return frontier->node_vector_classes
++             ? frontier->node_vector_classes[node_index]
++             : 0;
++}
++
+ static loom_low_schedule_dependency_endpoint_t
+ loom_low_schedule_effect_endpoint(uint16_t effect_ordinal,
+                                   uint16_t timing_event_id) {
+@@ -119,16 +191,22 @@ static void loom_low_schedule_effect_frontier_reset(
+   frontier->ordered_endpoint = loom_low_schedule_dependency_endpoint_none();
+   frontier->read_count = 0;
+   frontier->write_count = 0;
++  frontier->current_vector_class = 0;
++  frontier->last_lock_node = LOOM_LOW_SCHEDULE_NODE_NONE;
++  frontier->last_release_node = LOOM_LOW_SCHEDULE_NODE_NONE;
++  frontier->guard_node = LOOM_LOW_SCHEDULE_NODE_NONE;
++  frontier->guarded_count = 0;
+   memset(frontier->read_retirement_nodes, 0,
+          sizeof(frontier->read_retirement_nodes));
+ }
+ 
+ static void loom_low_schedule_effect_frontier_initialize(
+-    loom_low_schedule_build_state_t* state,
++    loom_low_schedule_build_state_t* state, uint8_t* node_vector_classes,
+     loom_low_schedule_effect_frontier_t* out_frontier) {
+   *out_frontier = (loom_low_schedule_effect_frontier_t){
+       .reads = state->effect_read_entries,
+       .writes = state->effect_write_entries,
++      .node_vector_classes = node_vector_classes,
+   };
+   loom_low_schedule_effect_frontier_reset(out_frontier);
+ }
+@@ -172,6 +250,41 @@ static iree_host_size_t loom_low_schedule_effect_frontier_retire_completed(
+   return retained_count;
+ }
+ 
++// Adds node_index behind every read and write the frontier holds after
++// cut_node (all of them when cut_node is none).
++static iree_status_t loom_low_schedule_effect_frontier_follow_accesses(
++    loom_low_schedule_build_state_t* state,
++    loom_low_schedule_effect_frontier_t* frontier, uint32_t node_index,
++    uint32_t cut_node,
++    loom_low_schedule_dependency_endpoint_t consumer_endpoint) {
++  for (iree_host_size_t i = 0; i < frontier->write_count; ++i) {
++    const loom_low_schedule_effect_frontier_entry_t* write =
++        &frontier->writes[i];
++    if (cut_node != LOOM_LOW_SCHEDULE_NODE_NONE &&
++        write->node_index <= cut_node) {
++      continue;
++    }
++    IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
++        state, write->node_index, node_index,
++        LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
++        loom_low_schedule_effect_frontier_entry_endpoint(write),
++        consumer_endpoint));
++  }
++  for (iree_host_size_t i = 0; i < frontier->read_count; ++i) {
++    const loom_low_schedule_effect_frontier_entry_t* read = &frontier->reads[i];
++    if (cut_node != LOOM_LOW_SCHEDULE_NODE_NONE &&
++        read->node_index <= cut_node) {
++      continue;
++    }
++    IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
++        state, read->node_index, node_index,
++        LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
++        loom_low_schedule_effect_frontier_entry_endpoint(read),
++        consumer_endpoint));
++  }
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_low_schedule_effect_frontier_note_read(
+     loom_low_schedule_build_state_t* state,
+     loom_low_schedule_effect_frontier_t* frontier, uint32_t node_index,
+@@ -189,6 +302,11 @@ static iree_status_t loom_low_schedule_effect_frontier_note_read(
+             LOOM_LOW_MEMORY_COMPARISON_SAME_EVALUATION)) {
+       continue;
+     }
++    if ((frontier->current_vector_class & LOOM_LOW_SCHEDULE_VECTOR_LOAD) &&
++        (loom_low_schedule_node_vector_class(frontier, write->node_index) &
++         LOOM_LOW_SCHEDULE_VECTOR_STORE)) {
++      continue;  // LOOM_EXP_NOALIAS_ACC
++    }
+     IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
+         state, write->node_index, node_index,
+         LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
+@@ -250,6 +368,12 @@ static iree_status_t loom_low_schedule_effect_frontier_note_write(
+             LOOM_LOW_MEMORY_COMPARISON_SAME_EVALUATION)) {
+       continue;
+     }
++    if ((frontier->current_vector_class &
++         LOOM_LOW_SCHEDULE_ACCUMULATOR_STORE) &&
++        (loom_low_schedule_node_vector_class(frontier, read->node_index) &
++         LOOM_LOW_SCHEDULE_VECTOR_LOAD)) {
++      continue;  // LOOM_EXP_NOWAR_ACC
++    }
+     IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
+         state, read->node_index, node_index,
+         LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
+@@ -281,6 +405,24 @@ static iree_status_t loom_low_schedule_effect_frontier_note_ordered(
+     loom_low_schedule_dependency_endpoint_t producer_endpoint) {
+   IREE_RETURN_IF_ERROR(loom_low_schedule_effect_frontier_depend_on_ordered(
+       state, frontier, node_index, consumer_endpoint));
++  if (frontier->last_lock_node != LOOM_LOW_SCHEDULE_NODE_NONE) {
++    // LOOM_EXP_LOCK_ACQREL: lock ops no longer fence, so another ordered op
++    // follows the last lock op and every access since the last release.
++    if (frontier->last_lock_node != frontier->ordered_node) {
++      IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
++          state, frontier->last_lock_node, node_index,
++          LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
++          loom_low_schedule_dependency_endpoint_none(), consumer_endpoint));
++    }
++    IREE_RETURN_IF_ERROR(loom_low_schedule_effect_frontier_follow_accesses(
++        state, frontier, node_index, frontier->last_release_node,
++        consumer_endpoint));
++    frontier->last_lock_node = node_index;
++    frontier->last_release_node = node_index;
++    frontier->ordered_node = node_index;
++    frontier->ordered_endpoint = producer_endpoint;
++    return iree_ok_status();
++  }
+   // Earlier ordered nodes already carry source order for their predecessors.
+   // Keep the memory frontier separately: ordering a counter or barrier does
+   // not establish completion of every memory access that precedes it.
+@@ -315,6 +457,94 @@ static iree_status_t loom_low_schedule_effect_frontier_note_ordered(
+   return iree_ok_status();
+ }
+ 
++// LOOM_EXP_LOCK_ACQREL: one lock acquire or release (see
++// loom_low_schedule_effect_relaxations_t).
++static iree_status_t loom_low_schedule_effect_frontier_note_lock(
++    loom_low_schedule_build_state_t* state,
++    loom_low_schedule_effect_frontier_t* frontier, uint32_t node_index,
++    bool is_release,
++    loom_low_schedule_dependency_endpoint_t consumer_endpoint) {
++  IREE_RETURN_IF_ERROR(loom_low_schedule_effect_frontier_depend_on_ordered(
++      state, frontier, node_index, consumer_endpoint));
++  if (frontier->last_lock_node != LOOM_LOW_SCHEDULE_NODE_NONE &&
++      frontier->last_lock_node != frontier->ordered_node) {
++    IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
++        state, frontier->last_lock_node, node_index,
++        LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
++        loom_low_schedule_dependency_endpoint_none(), consumer_endpoint));
++  }
++  frontier->last_lock_node = node_index;
++  if (is_release) {
++    IREE_RETURN_IF_ERROR(loom_low_schedule_effect_frontier_follow_accesses(
++        state, frontier, node_index, frontier->last_release_node,
++        consumer_endpoint));
++    frontier->last_release_node = node_index;
++    return iree_ok_status();
++  }
++  // An acquire stays behind the latest access before it in source order.
++  const loom_low_schedule_effect_frontier_entry_t* last = NULL;
++  for (iree_host_size_t i = 0; i < frontier->write_count; ++i) {
++    if (!last || frontier->writes[i].node_index > last->node_index) {
++      last = &frontier->writes[i];
++    }
++  }
++  for (iree_host_size_t i = 0; i < frontier->read_count; ++i) {
++    if (!last || frontier->reads[i].node_index > last->node_index) {
++      last = &frontier->reads[i];
++    }
++  }
++  if (last) {
++    IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
++        state, last->node_index, node_index,
++        LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
++        loom_low_schedule_effect_frontier_entry_endpoint(last),
++        consumer_endpoint));
++  }
++  for (uint32_t i = 0; i < frontier->guarded_count; ++i) {
++    IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
++        state, frontier->guarded_nodes[i], node_index,
++        LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
++        loom_low_schedule_dependency_endpoint_none(), consumer_endpoint));
++  }
++  frontier->guarded_count = 0;
++  frontier->guard_node = node_index;
++  return iree_ok_status();
++}
++
++// The vector access classes the relaxations key on, from the mnemonic.
++static uint8_t loom_low_schedule_descriptor_vector_class(
++    iree_string_view_t mnemonic,
++    loom_low_schedule_effect_relaxations_t relaxations) {
++  uint8_t vector_class = 0;
++  if (iree_string_view_starts_with(mnemonic, IREE_SV("vld"))) {
++    vector_class |= LOOM_LOW_SCHEDULE_VECTOR_LOAD;
++  }
++  if (iree_string_view_starts_with(mnemonic, IREE_SV("vst"))) {
++    vector_class |= LOOM_LOW_SCHEDULE_VECTOR_STORE;
++  }
++  if (iree_string_view_starts_with(mnemonic, IREE_SV("vst.acc"))) {
++    vector_class |= LOOM_LOW_SCHEDULE_ACCUMULATOR_STORE;
++  }
++  if (iree_string_view_starts_with(mnemonic, IREE_SV("vlda.fill")) ||
++      iree_string_view_starts_with(mnemonic, IREE_SV("vldb.fill")) ||
++      iree_string_view_starts_with(mnemonic, IREE_SV("vst.512"))) {
++    vector_class |= LOOM_LOW_SCHEDULE_SHARED_DATA_ACCESS;
++  }
++  if (!relaxations.vector_noalias) {
++    vector_class &= (uint8_t)~LOOM_LOW_SCHEDULE_VECTOR_STORE;
++  }
++  if (!relaxations.vector_noalias && !relaxations.accumulator_nowar) {
++    vector_class &= (uint8_t)~LOOM_LOW_SCHEDULE_VECTOR_LOAD;
++  }
++  if (!relaxations.accumulator_nowar) {
++    vector_class &= (uint8_t)~LOOM_LOW_SCHEDULE_ACCUMULATOR_STORE;
++  }
++  if (!relaxations.lock_acqrel) {
++    vector_class &= (uint8_t)~LOOM_LOW_SCHEDULE_SHARED_DATA_ACCESS;
++  }
++  return vector_class;
++}
++
+ static iree_status_t loom_low_schedule_note_descriptor_effects(
+     loom_low_schedule_build_state_t* state,
+     loom_low_schedule_effect_frontier_t* frontier, uint32_t node_index,
+@@ -324,11 +554,53 @@ static iree_status_t loom_low_schedule_note_descriptor_effects(
+   }
+   const loom_low_descriptor_set_t* descriptor_set =
+       state->target.descriptor_set;
++  const loom_low_schedule_effect_relaxations_t relaxations =
++      loom_low_schedule_effect_relaxations();
++  if (frontier->node_vector_classes) {
++    const iree_string_view_t mnemonic = loom_low_descriptor_set_string(
++        descriptor_set, descriptor->mnemonic_string_ref);
++    const uint8_t vector_class =
++        loom_low_schedule_descriptor_vector_class(mnemonic, relaxations);
++    frontier->node_vector_classes[node_index] = vector_class;
++    frontier->current_vector_class =
++        vector_class & (uint8_t)(LOOM_LOW_SCHEDULE_VECTOR_LOAD |
++                                 LOOM_LOW_SCHEDULE_ACCUMULATOR_STORE);
++    if (!relaxations.vector_noalias) {
++      frontier->current_vector_class &= (uint8_t)~LOOM_LOW_SCHEDULE_VECTOR_LOAD;
++    }
++    if (vector_class & LOOM_LOW_SCHEDULE_SHARED_DATA_ACCESS) {
++      if (frontier->guarded_count < IREE_ARRAYSIZE(frontier->guarded_nodes)) {
++        frontier->guarded_nodes[frontier->guarded_count++] = node_index;
++      }
++      if (frontier->guard_node != LOOM_LOW_SCHEDULE_NODE_NONE) {
++        IREE_RETURN_IF_ERROR(loom_low_schedule_add_dependency(
++            state, frontier->guard_node, node_index,
++            LOOM_LOW_SCHEDULE_DEPENDENCY_EFFECT, LOOM_LOW_ID_NONE,
++            loom_low_schedule_dependency_endpoint_none(),
++            loom_low_schedule_dependency_endpoint_none()));
++      }
++    }
++  }
+   for (uint16_t i = 0; i < descriptor->effect_count; ++i) {
+     const loom_low_effect_t* effect =
+         &descriptor_set->effects[descriptor->effect_start + i];
+     if (loom_low_schedule_effect_orders_memory(
+             effect, state->nodes[node_index].op->instance_flags)) {
++      if (relaxations.lock_acqrel &&
++          effect->kind == LOOM_LOW_EFFECT_KIND_BARRIER) {
++        const iree_string_view_t mnemonic = loom_low_descriptor_set_string(
++            descriptor_set, descriptor->mnemonic_string_ref);
++        const bool is_acquire =
++            iree_string_view_starts_with(mnemonic, IREE_SV("acq"));
++        const bool is_release =
++            iree_string_view_starts_with(mnemonic, IREE_SV("rel"));
++        if (is_acquire || is_release) {
++          IREE_RETURN_IF_ERROR(loom_low_schedule_effect_frontier_note_lock(
++              state, frontier, node_index, is_release,
++              loom_low_schedule_effect_endpoint(i, effect->consumer_event_id)));
++          break;
++        }
++      }
+       IREE_RETURN_IF_ERROR(loom_low_schedule_effect_frontier_note_ordered(
+           state, frontier, node_index,
+           loom_low_schedule_effect_endpoint(i, effect->consumer_event_id),
+@@ -629,11 +901,28 @@ iree_status_t loom_low_schedule_build_effect_dependencies(
+     memset(visit_epochs, 0, state->body->block_count * sizeof(*visit_epochs));
+   }
+ 
++  uint8_t* node_vector_classes = NULL;
++  if (loom_low_schedule_relaxations_enabled()) {
++    iree_host_size_t node_count = 0;
++    for (uint16_t i = 0; i < state->body->block_count; ++i) {
++      node_count =
++          iree_max(node_count, (iree_host_size_t)state->blocks[i].node_start +
++                                   state->blocks[i].node_count);
++    }
++    if (node_count != 0) {
++      IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++          state->scratch_arena, node_count, sizeof(*node_vector_classes),
++          (void**)&node_vector_classes));
++      memset(node_vector_classes, 0, node_count * sizeof(*node_vector_classes));
++    }
++  }
++
+   uint32_t visit_epoch = 0;
+   for (uint16_t block_index = 0; block_index < state->body->block_count;
+        ++block_index) {
+     loom_low_schedule_effect_frontier_t frontier;
+-    loom_low_schedule_effect_frontier_initialize(state, &frontier);
++    loom_low_schedule_effect_frontier_initialize(state, node_vector_classes,
++                                                 &frontier);
+     const loom_low_schedule_block_t* block = &state->blocks[block_index];
+     const uint32_t node_end = block->node_start + block->node_count;
+     for (uint32_t node_index = block->node_start; node_index < node_end;
