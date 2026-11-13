@@ -262,8 +262,9 @@ def emit_perm(e, kbi, perm, p="", ind="    ", forward=False):
     return f"%{p}pkb"
 
 
-def emit_encode(e, load, frag, ov, nout, p="", ind="    "):
-    """Encode one fragment: load(r) emits row r's 8 halves (vector<8xf16>) and returns its name; 72 bytes go to ov at frag."""
+def emit_encode(e, load, frag, ov, nout, p="", ind="    ", src="f16", norms=False):
+    """Encode one fragment: load(r) emits row r's 8 values (vector<8xf16>, or vector<8xf32> with src "f32") and returns
+    its name; 72 bytes go to ov at frag. norms: returns each row's sum of squares of the encoded values (f32)."""
     def x(line):
         e(ind + line)
     x(f"%{p}zero = scalar.constant 0.0 : f32")
@@ -273,13 +274,18 @@ def emit_encode(e, load, frag, ov, nout, p="", ind="    "):
     x(f"%{p}i0 = scalar.constant 0 : i32")
     x(f"%{p}fmin = scalar.constant -128.0 : f32")
     x(f"%{p}fmax = scalar.constant 127.0 : f32")
-    byts = []
+    byts, sums = [], []
+    if norms:
+        x(f"%{p}i6 = scalar.constant 6 : i32")
     for r in range(8):
         xh = load(r)
-        x(f"%{p}xf{r} = vector.extf {xh} : vector<8xf16> to vector<8xf32>")
+        xf = xh
+        if src == "f16":
+            x(f"%{p}xf{r} = vector.extf {xh} : vector<8xf16> to vector<8xf32>")
+            xf = f"%{p}xf{r}"
         vals = []
         for i in range(8):
-            x(f"%{p}v{r}_{i} = vector.extract %{p}xf{r}[{i}] : vector<8xf32> -> f32")
+            x(f"%{p}v{r}_{i} = vector.extract {xf}[{i}] : vector<8xf32> -> f32")
             x(f"%{p}a{r}_{i} = scalar.absf %{p}v{r}_{i} : f32")
             vals.append(f"%{p}v{r}_{i}")
         cur = f"%{p}a{r}_0"
@@ -304,11 +310,26 @@ def emit_encode(e, load, frag, ov, nout, p="", ind="    "):
             x(f"%{p}t{r}_{i} = scalar.fptosi %{p}c{r}_{i} : f32 to i32")
             x(f"%{p}m{r}_{i} = scalar.trunci %{p}t{r}_{i} : i32 to i8")
             byts.append(f"%{p}m{r}_{i}")
+        if norms:   # sum of m^2 (exact), x 2^(E - 133) twice (0 for an all-zero block)
+            cur = None
+            for i in range(8):
+                x(f"%{p}q{r}_{i} = scalar.mulf %{p}c{r}_{i}, %{p}c{r}_{i} : f32")
+                if cur:
+                    x(f"%{p}qs{r}_{i} = scalar.addf {cur}, %{p}q{r}_{i} : f32")
+                cur = f"%{p}qs{r}_{i}" if cur else f"%{p}q{r}_{i}"
+            x(f"%{p}pe{r} = scalar.subi %{p}E{r}, %{p}i6 : i32")
+            x(f"%{p}pb{r} = scalar.shli %{p}pe{r}, %{p}i23 : i32")
+            x(f"%{p}pq{r} = scalar.bitcast %{p}pb{r} : i32 to f32")
+            x(f"%{p}p{r} = scf.select %{p}z{r}, %{p}zero, %{p}pq{r} : f32")
+            x(f"%{p}ns{r} = scalar.mulf {cur}, %{p}p{r} : f32")
+            x(f"%{p}nr{r} = scalar.mulf %{p}ns{r}, %{p}p{r} : f32")
+            sums.append(f"%{p}nr{r}")
     for j in range(9):   # 72 bytes = 9 aligned 8-byte stores
         x(f"%{p}w{j} = vector.from_elements {', '.join(byts[8 * j:8 * j + 8])} : vector<8xi8>")
         x(f"%{p}wo{j} = index.constant {8 * j} : index")
         x(f"%{p}wa{j} = index.add {frag}, %{p}wo{j} : index")
         x(f"vector.store %{p}w{j}, {ov}[%{p}wa{j}] : vector<8xi8>, view<[{nout}]xi8>")
+    return sums
 
 
 def main():

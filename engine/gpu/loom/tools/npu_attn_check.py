@@ -2,7 +2,8 @@
 """Check gen_npu_attn.py on the NPU: O and l bit for bit against a CPU emulation of the core arithmetic, the time a body,
 and with --real the normalized output against a float64 softmax(q k / 16) v of a real attention dump.
 
-usage: npu_attn_check.py <workdir> <mc> <nb> [--image built.xdna --built-nb N] [--real <dump prefix> [--kv-head g]] [--seed s]
+usage: npu_attn_check.py <workdir> <mc> <nb> [--image built.xdna --built-nb N] [--real <dump prefix> [--kv-head g]]
+                        [--inputs <npz from npu_attn_encode_check.py>] [--seed s]
 
 Records (what the GPU encoder must produce; bfp16ebs8 fragments = 8 rows x [exponent byte, 8 int8 mantissas], value
 m 2^(E - 133), one exponent a row of 8):
@@ -68,9 +69,12 @@ def bfp(x):
 
 
 def encode(x):
-    """[n, 8, 8] -> (m [n, 8, 8], e [n, 8])"""
-    bl = bfp(np.ascontiguousarray(x, f32).reshape(-1))
-    return np.stack([m for E, m in bl]).reshape(-1, 8, 8), np.array([E for E, m in bl], np.int64).reshape(-1, 8)
+    """[n, 8, 8] -> (m [n, 8, 8], e [n, 8]) as the GPU encoder writes inputs (gen_bfp16_encode: f32 x, E the exponent
+    field of the row max, m = clamp(roundeven(x 2^(133 - E)), -128, 127), all zero for E = 0)"""
+    x = np.ascontiguousarray(x, f32).reshape(-1, 8, 8)
+    e = ((np.abs(x).view(np.uint32) >> 23) & 0xFF).max(2).astype(np.int64)
+    sc = np.where(e > 0, np.exp2(133.0 - e), 0.0)[..., None]
+    return np.clip(np.rint(x.astype(np.float64) * sc), -128, 127).astype(np.int64), e
 
 
 def decode(m, e):
@@ -256,6 +260,7 @@ def main():
     ap.add_argument("--built-nb", type=int, help="the nb --image was built for (patched down to nb)")
     ap.add_argument("--real", help="a real attention dump prefix")
     ap.add_argument("--kv-head", type=int, default=0)
+    ap.add_argument("--inputs", help="the GPU encoder's records (npu_attn_encode_check.py)")
     ap.add_argument("--seed", type=int, default=1)
     a = ap.parse_args()
     W, mc, nb = a.workdir, a.mc, a.nb
@@ -267,7 +272,14 @@ def main():
     else:
         open(f"{W}/p.loom", "w").write(G.emit(mc, nb))
         G.compile_xdna(f"{W}/p.loom", f"{W}/p.xdna")
-    inp = real_inputs(a.real, 2 * mc, nb, a.kv_head) if a.real else random_inputs(2 * mc, nb, a.seed)
+    if a.inputs:
+        z = {k: v.astype(np.int64) if v.dtype.kind in "iu" else v for k, v in np.load(a.inputs).items()}
+        inp = dict(Qs=list(zip(z["Qm"], z["Qe"])), Cs=list(z["C"]), K=list(zip(z["Km"], z["Ke"])),
+                   V=list(zip(z["Vm"], z["Ve"])), ref=list(z["ref"]))
+    elif a.real:
+        inp = real_inputs(a.real, 2 * mc, nb, a.kv_head)
+    else:
+        inp = random_inputs(2 * mc, nb, a.seed)
     args = [hrx_paths.XDNA_RUN, f"--columns={max(2, min(8, mc))}", f"--image={W}/p.xdna", "--entry=probe",
             "--binding_memory=system", "--invocation_count=1"]
     for s, b in enumerate(streams(inp, mc, nb, nb_built)):
@@ -295,11 +307,11 @@ def main():
             bad += ob + lb
             per.append(((t1 - t0) & 0xFFFFFFFF) / nb)
             msg = f"  core {w}: {per[-1]:.1f} cycles a body, O misses {ob} of {O.size}, l misses {lb} of 64"
-            if a.real:
+            if "ref" in inp:
                 er = np.abs(unpack(O, l) - inp["ref"][w])
                 errs.append(er)
                 msg += f"; vs f64 mean |err| {er.mean():.2e} max {er.max():.2e}"
-            if ob or lb or a.real:
+            if ob or lb or "ref" in inp:
                 print(msg)
     print(f"mc={mc} nb={nb}: {2 * mc} cores, a body min {min(per):.1f} mean {sum(per) / len(per):.1f} max {max(per):.1f}; "
           f"misses {bad}" + (f"; real vs f64 mean |err| {np.mean(errs):.3e} max {np.max(errs):.3e}" if errs else ""))
