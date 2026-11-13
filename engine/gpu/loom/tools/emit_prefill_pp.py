@@ -2437,10 +2437,14 @@ def main():
         # YAH_ATTN_PRIO64=0|1: the key-split store kernels raise the QK waves' issue priority in their MMA section
         # (gen_attn_fa R2P_PRIOQ 1) on the relane pass: busiest SQ -0.5% at 16K..126K, bit-identical (alone each <= -0.15%)
         prio64 = os.environ.get("YAH_ATTN_PRIO64", "1") == "1"
-        for diag, stem in (("ksstore", "ks"), ("ksmerge", "km")):
+        # YAH_NPU_ATTN=n (with YAH_ATTN_KSPLIT): the pair's NPU twins yah_attn_hip64{ks,km}n.loom (gen_attn_fa NPU_KV n:
+        # the last n KV heads' units shared with the NPU attention)
+        npu_kv = int(os.environ.get("YAH_NPU_ATTN", "0"))
+        for diag, stem in (("ksstore", "ks"), ("ksmerge", "km")) + ((("ksstore", "ksn"), ("ksmerge", "kmn")) if npu_kv else ()):
+            gen_attn_fa.NPU_KV = npu_kv if stem.endswith("n") else 0
             gen_attn_fa.R2P_DIAG.add(diag)
-            gen_attn_fa.R2P_RELANE = prio64 and stem == "ks"
-            gen_attn_fa.R2P_PRIOQ = 1 if prio64 and stem == "ks" else 0
+            gen_attn_fa.R2P_RELANE = prio64 and stem.startswith("ks")
+            gen_attn_fa.R2P_PRIOQ = 1 if prio64 and stem.startswith("ks") else 0
             p = os.path.join(tmp, "yah_attn_hip64%s.loom" % stem)
             write_attn(p)
             pt = None
@@ -2451,9 +2455,10 @@ def main():
                 gen_attn_fa.TILED_OUT = False
             gen_attn_fa.R2P_DIAG.discard(diag)
             gen_attn_fa.R2P_RELANE, gen_attn_fa.R2P_PRIOQ = False, 0
+            gen_attn_fa.NPU_KV = 0
             if stem == "ks":
                 attn64ks_src, attn64ks_t_src = p, pt
-            else:
+            elif stem == "km":
                 attn64km_src, attn64km_t_src = p, pt
         p0, gen_attn_fa.PERSIST = gen_attn_fa.PERSIST, persist64   # write_attn applies MAIN_FLAGS only while it generates
         ks_floats = gen_attn_fa.ksplit_floats()

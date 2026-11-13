@@ -299,9 +299,31 @@ KSPLIT = int(os.environ.get("ATTN_KSPLIT", "0"))
 KSPLIT_MIN = 4096
 
 
+# NPU_KV=n (KSPLIT, ksstore / ksmerge, KVG 0): the last n KV heads' units are shared with the NPU attention
+# (gen_npu_attn: whole KV heads, keys [32, k_lo), k_lo = 512 floor(start_pos / 512)). Kernel 1 runs one piece per NPU
+# unit over keys [k_lo, causal end) after the tail pieces (its partial in the slot after theirs); kernel 2 merges NPU
+# units after the tail units: its two-tile range (keys 0 .. 31) is the sink piece, merged with kernel 1's piece and the
+# NPU's (O, the l block x 2^-63 and the max 128 - C of each row) before the epilogue. Bindings npuo (the NPU calls'
+# outputs: call c = 3 x KV head + pair, then 256-token block, of the NPU's KV heads) and npuq (their V payloads, for C)
+# after ksplit, kernel 2 only. Not bit-identical: the NPU piece is bfp16.
+NPU_KV = 0
+NPU_MC, NPU_MCF, NPU_OB, NPU_REC = 16, 17, 34816, 4608   # gen_npu_attn: pairs a call, payload slots, a pair's output, a slot
+
+
+def npu_units():
+    """the NPU units at MAX_TOKENS: query blocks x 3 pairs a KV head x NPU_KV"""
+    return (MAX_TOKENS + QT - 1) // QT * 3 * NPU_KV
+
+
+def npu_calls():
+    """the NPU calls of a chunk at MAX_TOKENS (256 tokens x 2 heads each)"""
+    return 3 * NPU_KV * MAX_TOKENS // 256
+
+
 def ksplit_floats():
-    """The ksplit binding's partials (f32) after its 64 counters: (P - 1) K pieces of 32 NQB P.V lanes x 132"""
-    return (PERSIST - 1) * KSPLIT * 32 * NQB * 132
+    """The ksplit binding's partials (f32) after its 64 counters: (P - 1) K pieces and the NPU units' pieces of 32 NQB
+    P.V lanes x 132"""
+    return ((PERSIST - 1) * KSPLIT + npu_units()) * 32 * NQB * 132
 PDYN_ZZ_BELOW = int(os.environ.get("R2P_ZZ_BELOW", "8192"))
 # OCNT: binding ocnt (after the others): after a workgroup barrier lane 0 adds 1 to counter c tt + t (release) for
 # 1024-feature chunk c and 128-token tile t of its output, tt = token_count / 128 (ocnt_need workgroups per counter),
@@ -1140,6 +1162,101 @@ def gen():
         for i in range(R2P_VPAD):
             e(f"  %vpf{i} = scalar.bitcast %vpv{i} : i32 to f32")
             e(f"  %lsum_l{i + 1 if i + 1 < R2P_VPAD else ''} = scalar.addf %lsum_l{i}, %vpf{i} : f32")
+    def npu_merge():
+        """NPU_KV, kernel 2, a P.V lane of an NPU unit: own = the sink piece (%k_og, %k_lsum_l / _lo, %lm_own / _oth),
+        kernel 1's piece from slot %kpns, the NPU's from its call's outputs and payloads; per head (own: fragments 0-7,
+        other: 8-15) M = max m, f = 2^(m - M), O = sum f O, l = sum f l (the NPU's m = 128 - C, l = its l block x 2^63).
+        O streams over kernel 1's record (this lane's own); yields that record's first float and the two l."""
+        x = lambda t: e("        " + t)
+        x("%nrb0 = index.mul %kpns, %kprp : index")
+        x("%nrb = index.add %nrb0, %kpr0 : index")
+        for j, nm in enumerate(("l", "lo", "m", "mo")):
+            x(f"%nkpa{nm} = index.add %nrb, %c{128 + j}k : index")
+            x(f"%nkp{nm} = view.load %kspv[%nkpa{nm}] : view<{ksplit_floats()}xf32> -> f32")
+        # the NPU core of (token, head): call (hp - npairs_g) (B / 256) + t / 256, pair (t % 256) / 16, half head - head0
+        x("%ncb = index.div %B, %c256 : index")
+        x("%nhp = index.sub %hp, %npairs_g : index")
+        x("%nc0 = index.mul %nhp, %ncb : index")
+        x("%ntb = index.div %r_lq, %c256 : index")
+        x("%nc = index.add %nc0, %ntb : index")
+        x("%nt256 = index.rem %r_lq, %c256 : index")
+        x("%nps = index.div %nt256, %c16 : index")
+        x("%nrbp = index.div %sub, %c8 : index")
+        x("%nri = index.rem %sub, %c8 : index")
+        x(f"%nc16 = index.constant {NPU_MC} : index")
+        x("%ncp0 = index.mul %nc, %nc16 : index")
+        x("%ncp = index.add %ncp0, %nps : index")
+        x(f"%nob = index.constant {NPU_OB // 4} : index")
+        x(f"%nobh = index.constant {NPU_OB // 8} : index")
+        x("%nco = index.mul %ncp, %nob : index")
+        x("%nri8 = index.mul %nri, %c8 : index")
+        x("%nrb64 = index.mul %nrbp, %c64 : index")
+        x("%nrow = index.add %nri8, %nrb64 : index")            # the row's offset in a [rbp][8][8] block
+        x("%nh128 = index.mul %half, %c128 : index")
+        x("%nrowh = index.add %nrow, %nh128 : index")           # + dp 128 (dp = the lane half)
+        x("%nhd8 = index.mul %hd, %c8 : index")
+        x(f"%nqs = index.constant {2 * NPU_MCF * NPU_REC // 4} : index")
+        x(f"%nqh = index.constant {NPU_MCF * NPU_REC // 4} : index")
+        x(f"%nqr = index.constant {NPU_REC // 4} : index")
+        x("%nq0 = index.mul %nc, %nqs : index")
+        x("%nq1 = index.mul %nps, %nqr : index")
+        x("%nq2 = index.add %nq0, %nq1 : index")
+        x("%nq3 = index.add %nq2, %nrow : index")
+        x("%nri4 = index.mul %nrbp, %c4 : index")
+        x("%nl0 = index.add %nri8, %nri4 : index")
+        x("%nlo = index.constant 4256 : index")                 # 16384 + 640 bytes: the l block
+        x("%nl1 = index.add %nl0, %nlo : index")
+        x("%nhdo = index.sub %c1, %hd : index")
+        res, ls = [], []
+        for side, hh, ms, lsn, mk, lk, fr in (("o", "%hd", "%lm_own", "%k_lsum_l", "%nkpm", "%nkpl", range(8)),
+                                              ("t", "%nhdo", "%lm_oth", "%k_lsum_lo", "%nkpmo", "%nkplo", range(8, 16))):
+            x(f"%nb{side}0 = index.mul {hh}, %nobh : index")
+            x(f"%nb{side} = index.add %nco, %nb{side}0 : index")        # the core's first f32
+            x(f"%nq{side}0 = index.mul {hh}, %nqh : index")
+            x(f"%nq{side} = index.add %nq3, %nq{side}0 : index")
+            x(f"%nC{side} = view.load %npqv[%nq{side}] : view<{npu_calls() * 2 * NPU_MCF * NPU_REC // 4}xf32> -> f32")
+            x(f"%nl{side}a = index.add %nb{side}, %nl1 : index")
+            x(f"%nL{side} = view.load %npov[%nl{side}a] : view<{npu_calls() * NPU_MC * NPU_OB // 4}xf32> -> f32")
+            x(f"%n128{side} = scalar.constant 128.0 : f32")
+            x(f"%nm{side} = scalar.subf %n128{side}, %nC{side} : f32")
+            x(f"%nM{side}0 = scalar.maxnumf {ms}, {mk} : f32")
+            x(f"%nM{side} = scalar.maxnumf %nM{side}0, %nm{side} : f32")
+            fs = []
+            for k, m in (("s", ms), ("k", mk), ("n", f"%nm{side}")):
+                x(f"%nd{side}{k} = scalar.subf {m}, %nM{side} : f32")
+                x(f"%nf{side}{k} = scalar.exp2f<afn> %nd{side}{k} : f32")
+                fs.append(f"%nf{side}{k}")
+            x(f"%n63{side} = scalar.constant 63.0 : f32")
+            x(f"%nd{side}l = scalar.addf %nd{side}n, %n63{side} : f32")
+            x(f"%nf{side}l = scalar.exp2f<afn> %nd{side}l : f32")
+            x(f"%nls{side}0 = scalar.mulf {lsn}, {fs[0]} : f32")
+            x(f"%nls{side}1 = scalar.fmaf {lk}, {fs[1]}, %nls{side}0 : f32")
+            x(f"%nls{side} = scalar.fmaf %nL{side}, %nf{side}l, %nls{side}1 : f32")
+            ls.append(f"%nls{side}")
+            for f in fr:
+                x(f"%nka{f} = index.add %nrb, %c{8 * f}k : index")
+                x(f"%nkv{f} = vector.load %kspv[%nka{f}] : view<{ksplit_floats()}xf32> -> {V8}")
+                x(f"%nrp{f}c = index.constant {256 * (f % 8)} : index")
+                x(f"%nrp{f}0 = index.mul %nhd8, %c256 : index")
+                x(f"%nrp{f}1 = index.add %nrp{f}0, %nrp{f}c : index")
+                x(f"%nrp{f}2 = index.add %nrp{f}1, %nrowh : index")
+                x(f"%nna{f} = index.add %nb{side}, %nrp{f}2 : index")
+                x(f"%nnv{f} = vector.load %npov[%nna{f}] : view<{npu_calls() * NPU_MC * NPU_OB // 4}xf32> -> {V8}")
+                els = []
+                for i in range(8):
+                    x(f"%nes{f}_{i} = vector.extract %k_og{f}[{i}] : {V8} -> f32")
+                    x(f"%nek{f}_{i} = vector.extract %nkv{f}[{i}] : {V8} -> f32")
+                    x(f"%nen{f}_{i} = vector.extract %nnv{f}[{i}] : {V8} -> f32")
+                    x(f"%net{f}_{i}a = scalar.mulf %nes{f}_{i}, {fs[0]} : f32")
+                    x(f"%net{f}_{i}b = scalar.fmaf %nek{f}_{i}, {fs[1]}, %net{f}_{i}a : f32")
+                    x(f"%net{f}_{i} = scalar.fmaf %nen{f}_{i}, {fs[2]}, %net{f}_{i}b : f32")
+                    els.append(f"%net{f}_{i}")
+                # streamed as ksplit_merge: the merged fragment over kernel 1's (this lane's own record), then reloaded
+                x(f"%nog{f} = vector.from_elements {', '.join(els)} : {V8}")
+                x(f"vector.store %nog{f}, %kspv[%nka{f}] : {V8}, view<{ksplit_floats()}xf32>")
+                x("scf.schedule.fence")
+        x(f"scf.yield %nrb, {', '.join(ls)} : index, f32, f32")
+
     def ksplit_merge(i0):
         """KS, after the last P.V: the unit's O / row sums (defined from L[i0] on) are renamed to its partial; a piece
         stores its partial (P.V lanes), takes its arrival, and the K-th arriver loads all K in piece order and merges:
@@ -1220,6 +1337,11 @@ def gen():
             e("  }")
             return
         e(f"    {', '.join(o + 'm' for o in outs[:18])} = scf.if %kplast -> ({rt}) {{")
+        if NPU:   # an NPU unit: the sink (this kernel's own partial), kernel 1's piece and the NPU's. Both merges
+            # yield their merged record's first float and the l (16 fragments a branch: two copies live at the join)
+            e("      %nmb, %lsum_ln, %lsum_lon = scf.if %kpn -> (index, f32, f32) {")
+            npu_merge()
+            e("      } else {")
         # piece i of tail unit t: q = i x tail + t
         for i in range(K):
             e(f"      %kqi{i} = index.constant {i} : index")
@@ -1264,11 +1386,20 @@ def gen():
             e(f"      vector.store %kqw{f}, %kspv[%kqo{f}a0] : {V8}, view<{ksplit_floats()}xf32>")
             e("      scf.schedule.fence")
         res = []
-        for f in range(16):
-            e(f"      %kqg{f} = vector.load %kspv[%kqo{f}a0] : view<{ksplit_floats()}xf32> -> {V8}")
-            res.append(f"%kqg{f}")
-        res += [f"%kqsl{K - 1}", f"%kqslo{K - 1}"]
-        e(f"      scf.yield {', '.join(res)} : {rt}")
+        if NPU:
+            e(f"      scf.yield %kqr0, %kqsl{K - 1}, %kqslo{K - 1} : index, f32, f32")
+            e("      }")
+            for f in range(16):
+                e(f"      %nma{f} = index.add %nmb, %c{8 * f}k : index")
+                e(f"      %nmg{f} = vector.load %kspv[%nma{f}] : view<{ksplit_floats()}xf32> -> {V8}")
+                res.append(f"%nmg{f}")
+            e(f"      scf.yield {', '.join(res)}, %lsum_ln, %lsum_lon : {rt}")
+        else:
+            for f in range(16):
+                e(f"      %kqg{f} = vector.load %kspv[%kqo{f}a0] : view<{ksplit_floats()}xf32> -> {V8}")
+                res.append(f"%kqg{f}")
+            res += [f"%kqsl{K - 1}", f"%kqslo{K - 1}"]
+            e(f"      scf.yield {', '.join(res)} : {rt}")
         e("    } else {")   # not the last: never written (zeros, so the own partial is dead after its stores)
         # an opaque unit-variant zero (queue word 2 & the unit id), not %zeros8: sharing that constant with the QK
         # MMAs' zero init kept one 8-VGPR zero live across the tile loops (211 VGPRs)
@@ -1292,6 +1423,10 @@ def gen():
     KS = bool(KSPLIT and R2P and PERSIST and PERSIST_DYN)
     if KS:
         assert STEER and R2P_SPLIT and R2P_PEEL and not (R2P_QPF or KRAW or SOFT1 or "tailfill" in R2P_DIAG)
+    NPU = bool(NPU_KV)
+    ksm2 = "ksmerge" in R2P_DIAG
+    if NPU:
+        assert KS and not KVG and NQB == 8 and ("ksstore" in R2P_DIAG or ksm2) and not (KDEC or VQ4 or VQ8)
     PVAL_LINE = ("  %pnext, %pwn = scf.if %pval -> (index, i32) {" if STEER else
                  "  %pnext = scf.if %pval -> (index) {" if PERSIST_DYN else "  scf.if %pval {")
     punq = "%punq" if ("tailfill" in R2P_DIAG and PERSIST_DYN) or KS else "%pun"   # the queue's bound
@@ -1359,7 +1494,7 @@ def gen():
       + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "")
       + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + (", %kscale: buffer" if KRAW else "")
       + (", %ocnt: buffer" if OCNT else "") + (", %pqueue: buffer" if PERSIST and PERSIST_DYN else "")
-      + (", %ksplit: buffer" if KS else "") + ") {")
+      + (", %ksplit: buffer" if KS else "") + (", %npuo: buffer, %npuq: buffer" if NPU and ksm2 else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
         e(f"  %c{v} = index.constant {v} : index")
@@ -1552,6 +1687,14 @@ def gen():
         e("  %pun0 = index.mul %nqb, %npairs : index")
         if "halfunits" in R2P_DIAG:   # diag (with unilen): half the units, each twice as long
             e("  %pun = index.div %pun0, %c2 : index")
+        elif NPU:   # the GPU's units: the pairs of the KV heads before the NPU's; the NPU units' ids follow them
+            e("  %nkvn = config.get @attention_prefill.num_kv_heads : index")
+            e("  %pkvn = index.div %npairs, %nkvn : index")
+            e(f"  %cnkv = index.constant {NPU_KV} : index")
+            e("  %npn = index.mul %pkvn, %cnkv : index")              # NPU pairs
+            e("  %npairs_g = index.sub %npairs, %npn : index")
+            e("  %pun = index.mul %nqb, %npairs_g : index")           # GPU units
+            e("  %nun = index.mul %nqb, %npn : index")                # NPU units
         else:
             e("  %pun = index.add %pun0, %c0 : index")              # units
         e(f"  %pP = index.constant {PERSIST} : index")
@@ -1568,8 +1711,13 @@ def gen():
             e("  %ksw = index.sub %pun, %kst : index")
             e(f"  %kskc = index.constant {KSPLIT} : index")
             e("  %kspn = index.mul %kst, %kskc : index")
-            if "ksmerge" in R2P_DIAG:   # two-kernel split, kernel 2: the queue hands out the tail units only
+            if "ksmerge" in R2P_DIAG and NPU:   # kernel 2: the tail units' merges, then the NPU units'
+                e("  %punq = index.add %kst, %nun : index")
+            elif "ksmerge" in R2P_DIAG:   # two-kernel split, kernel 2: the queue hands out the tail units only
                 e("  %punq = index.add %kst, %c0 : index")
+            elif NPU:   # kernel 1: whole units, tail pieces, then one piece per NPU unit
+                e("  %punq0 = index.add %ksw, %kspn : index")
+                e("  %punq = index.add %punq0, %nun : index")
             else:
                 e("  %punq = index.add %ksw, %kspn : index")
             e("  %kstd = index.max %kst, %c1 : index")
@@ -1582,6 +1730,10 @@ def gen():
         e(f"  %kspv = buffer.view %ks_na[%ksp_o] : buffer -> view<{ksplit_floats()}xf32>")
         for v in sorted({132, 128, 129, 130, 131} | {8 * f for f in range(16)}):
             e(f"  %c{v}k = index.constant {v} : index")
+        if NPU and "ksmerge" in R2P_DIAG:
+            e("  %npo_na, %npq_na = buffer.assume.noalias %npuo, %npuq : buffer, buffer")
+            e(f"  %npov = buffer.view %npo_na[%base] : buffer -> view<{npu_calls() * NPU_MC * NPU_OB // 4}xf32>")
+            e(f"  %npqv = buffer.view %npq_na[%base] : buffer -> view<{npu_calls() * 2 * NPU_MCF * NPU_REC // 4}xf32>")
     if PERSIST and PERSIST_DYN:
         e("  %pq_na = buffer.assume.noalias %pqueue : buffer")   # else the atomic may alias every input (vector loads)
         e(f"  %pqv = buffer.view %pq_na[%base] : buffer -> view<{PQ_WORDS}xi32>")
@@ -1635,8 +1787,20 @@ def gen():
             e("  %kpj = index.div %kpq, %kstd : index")
             e("  %kpt = index.rem %kpq, %kstd : index")
             e("  %kpu = index.add %ksw, %kpt : index")
-            e("  %wglk = scf.select %kpis, %kpu, %wglp : index")
-            e("  %wgl = index.assume %wglk [range(%wglk, 0, 1048576), lt(%wglk, %pun)] : index")
+            if NPU:   # NPU unit u: kernel 1 piece kspn + u (its slot), kernel 2 id kst + u; unit id pun + u
+                kb = "%kst" if "ksmerge" in R2P_DIAG else "%kspn"
+                e(f"  %kpn = index.cmp uge, %kpq, {kb} : index")
+                e(f"  %kpnc = index.max %kpq, {kb} : index")
+                e(f"  %kpnu = index.sub %kpnc, {kb} : index")
+                e("  %kpnw = index.add %pun, %kpnu : index")
+                e("  %kpns = index.add %kspn, %kpnu : index")       # its kernel 1 slot
+                e("  %kpuu = scf.select %kpn, %kpnw, %kpu : index")
+                e("  %wglk = scf.select %kpis, %kpuu, %wglp : index")
+                e("  %punall = index.add %pun, %nun : index")
+                e("  %wgl = index.assume %wglk [range(%wglk, 0, 1048576), lt(%wglk, %punall)] : index")
+            else:
+                e("  %wglk = scf.select %kpis, %kpu, %wglp : index")
+                e("  %wgl = index.assume %wglk [range(%wglk, 0, 1048576), lt(%wglk, %pun)] : index")
         else:
             e("  %wgl = index.assume %wglp [range(%wglp, 0, 1048576), lt(%wglp, %pun)] : index")
     else:
@@ -1674,6 +1838,28 @@ def gen():
         e("  %qb0 = index.div %kvr, %pkv : index")
         e("  %hp0 = index.mul %kvh_m, %pkv : index")
         e("  %hp = index.add %hp0, %pig_m : index")
+    elif PERSIST and NPU:   # GPU units over the GPU's pairs, NPU units over the NPU's, blended by a 0 / 1 index:
+        # with scf.select here Loom gave live kernel-argument SGPRs (output, ksplit, ptab bases) to lane masks
+        e("  %wgnc = index.max %wgl, %pun : index")
+        e("  %wgnu = index.sub %wgnc, %pun : index")
+        e("  %hpn0 = index.rem %wgnu, %npn : index")
+        e("  %hpn = index.add %npairs_g, %hpn0 : index")
+        e("  %qbn = index.div %wgnu, %npn : index")
+        e("  %hpg = index.rem %wgl, %npairs_g : index")
+        e("  %qbg = index.div %wgl, %npairs_g : index")
+        e("  %wnp1 = index.add %wgl, %c1 : index")
+        e("  %wnp2 = index.max %wnp1, %pun : index")
+        e("  %wnp3 = index.sub %wnp2, %pun : index")
+        e("  %wnpi = index.min %wnp3, %c1 : index")              # 1: an NPU unit
+        e("  %wnpg = index.sub %c1, %wnpi : index")
+        e("  %hpa = index.mul %hpg, %wnpg : index")
+        e("  %hpb = index.mul %hpn, %wnpi : index")
+        e("  %hp0 = index.add %hpa, %hpb : index")
+        e("  %hp = index.assume %hp0 [range(%hp0, 0, 1048576), lt(%hp0, %npairs)] : index")
+        e("  %qba = index.mul %qbg, %wnpg : index")
+        e("  %qbb = index.mul %qbn, %wnpi : index")
+        e("  %qb00 = index.add %qba, %qbb : index")
+        e("  %qb0 = index.assume %qb00 [range(%qb00, 0, 1048576), lt(%qb00, %nqb)] : index")
     else:
         e("  %hp = index.rem %wgl, %npairs : index")
         e("  %qb0 = index.div %wgl, %npairs : index")
@@ -1868,12 +2054,17 @@ def gen():
         e("  %kvt = index.div %kvt0, %c32 : index")
         e("  %kvl0 = index.mul %kvt, %kpj : index")
         e("  %kvl1 = index.div %kvl0, %kskc : index")
-        e("  %kvlo = index.mul %kvl1, %c32 : index")
+        e(f"  %kvlo{'1' if NPU else ''} = index.mul %kvl1, %c32 : index")
         e("  %kpj1 = index.add %kpj, %c1 : index")
         e("  %kvh0 = index.mul %kvt, %kpj1 : index")
         e("  %kvh1 = index.div %kvh0, %kskc : index")
         e("  %kvh2 = index.mul %kvh1, %c32 : index")
-        e("  %kvhi = index.min %kvh2, %max_visu : index")
+        e(f"  %kvhi{'0' if NPU else ''} = index.min %kvh2, %max_visu : index")
+        if NPU:   # an NPU unit: kernel 1 keys [k_lo, end), kernel 2 the sink [0, 32)
+            e("  %nklo0 = index.div %start_pos, %c512 : index")
+            e("  %nklo = index.mul %nklo0, %c512 : index")
+            e("  %kvlo = scf.select %kpn, %{}, %kvlo1 : index".format("c0" if "ksmerge" in R2P_DIAG else "nklo"))
+            e("  %kvhi = scf.select %kpn, %max_visu, %kvhi0 : index")
         if "ksk0" in R2P_DIAG:   # diag (compile bisect): every unit from key 0
             e("  %kbeg = index.add %c0, %c0 : index")
         else:
