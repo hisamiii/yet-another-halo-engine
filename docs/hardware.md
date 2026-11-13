@@ -137,3 +137,7 @@ HRX counters, rocprofv3, ATT and what does not work (PC sampling, RGP) are liste
 ## NPU (XDNA2)
 
 The NPU compute tile and data movement measurements (2026-10-07..12) are in this file on branch `npu`, with the earlier NPU prefill split (every large GEMM split by output columns, the IQ4_XS model).
+
+The NPU's writes to host pages do not invalidate the CPU's caches (2026-11-13, `npu_attn_run` soak: 28,800 attention calls).
+A line the CPU cached before the NPU wrote stays stale for the CPU: a plain CPU read saw 1-48 stale lines in the first pass, none after `clflush` of the range.
+The GPU read the NPU's bytes every time (a copy right after the done word, 0 stale lines): GPU consumers need nothing, CPU readers invalidate first.

@@ -128,6 +128,7 @@ class LoomNpu {
     if (hsa) export_dmabuf_ = reinterpret_cast<ExportFn>(dlsym(hsa, "hsa_amd_portable_export_dmabuf"));
     if (!export_dmabuf_) throw LoomError("npu: hsa_amd_portable_export_dmabuf not found");
     reaper_ = std::thread([this] { Reaper(); });
+    attn_thread_ = std::thread([this] { AttnSubmitter(); });
     packets_ = &CreateShared(kPacketBytes, true);   // here: allocating it later would wait for the GPU mid-forward
   }
   LoomNpu(const LoomNpu&) = delete;
@@ -144,6 +145,9 @@ class LoomNpu {
       stop_ = true;
     }
     reap_cv_.notify_all();
+    attn_cv_.notify_all();
+    if (attn_thread_.joinable()) attn_thread_.join();
+    for (const AttnPending& q : attn_queue_) Fail({q.job});
     if (reaper_.joinable()) reaper_.join();
     // the array first: after its last job a gated image's head keeps polling its flag words (and writing its tick
     // scratch) for the rest of its supply, and streamed fills stay armed; with the IOMMU in passthrough a page freed
@@ -407,7 +411,150 @@ class LoomNpu {
     volatile std::uint32_t* done = nullptr;
     std::uint32_t gate = 0;
     std::string tag;
+    std::size_t host_calls = 0;  // a host-gated job (EnqueueAttn): its calls; the reaper stores done itself
   };
+
+  // NPU attention (tools/gen_npu_attn.py). The kernel takes all 32 cores, so no core can wait for the GPU: the host
+  // gates it. Each call's 4 streams read the call's payloads (its own views) and then the KV head's records (views every
+  // call of the head shares); a call writes its own outputs. The image's first invocation sets the array up and runs
+  // one call, its continuation runs one more call on the array as the last call left it.
+  struct AttnImage {
+    Kernel* k = nullptr;
+    std::uint32_t nb_built = 0;
+    // byte offsets of the 4 record descriptors' lengths (gen_npu_attn.stream_words) in the first and continuation
+    std::vector<std::size_t> first_lengths, cont_lengths;
+  };
+  // One call: the image's invocation bytes as bound for it.
+  struct AttnCall {
+    const AttnImage* image = nullptr;
+    std::vector<std::uint8_t> first, cont;
+  };
+  // A record descriptor's length in i32 words for nb bodies (nb + 1 records of 64 bfp16 fragments).
+  static constexpr std::uint32_t AttnLength(std::uint32_t nb) { return (nb + 1) * 64 * 72 / 4; }
+  // An instance of the attention image at path built for nb_built bodies, bound to views (any call's).
+  AttnImage LoadAttn(const std::string& path, std::uint32_t nb_built, const std::vector<View>& views) {
+    iree_hal_amd_xdna_image_t* image = Image(path);
+    uint32_t entry_ordinal = 0;
+    NpuCheck(iree_hal_amd_xdna_image_find_entry(image, iree_make_cstring_view("probe"), &entry_ordinal),
+             "image_find_entry");
+    auto k = std::make_unique<Kernel>();
+    k->image_key = image;
+    k->path = path;
+    k->image = image;
+    k->entry_ordinal = entry_ordinal;
+    k->streamed = false;
+    const iree_hal_amd_xdna_image_tables_t* tables = iree_hal_amd_xdna_image_tables(image);
+    const iree_xdna_elf_entry_record_t rec = iree_hal_amd_xdna_image_tables_entry(tables, entry_ordinal);
+    k->storage.resize(rec.allocation_use_count);
+    k->storage_maps.resize(rec.allocation_use_count);
+    for (uint32_t i = 0; i < rec.allocation_use_count; ++i) {
+      const uint32_t ord = iree_hal_amd_xdna_image_tables_allocation_use(tables, rec.first_allocation_use + i);
+      AllocateStorage(iree_hal_amd_xdna_image_tables_allocation(tables, ord), &k->storage[i], &k->storage_maps[i]);
+    }
+    const auto n = static_cast<iree_host_size_t>(k->storage.size());
+    NpuCheck(iree_hal_amd_xdna_executable_load(image, entry_ordinal, n, k->storage.data()), "executable_load");
+    Rebind(*k, views);
+    NpuCheck(
+        iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), false, &k->first),
+        "query_continuation(first)");
+    NpuCheck(
+        iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), true, &k->call),
+        "query_continuation");
+    AttnImage a;
+    a.k = k.get();
+    a.nb_built = nb_built;
+    kernels_.push_back(std::move(k));
+    auto find = [&](const amdf_xdna_kernel_command_t& c, std::vector<std::size_t>& at) {
+      const std::uint8_t* p = CommandBytes(*a.k, c);
+      for (std::size_t i = 16; i + 4 <= c.byte_length; i += 4) {
+        std::uint32_t w = 0;
+        std::memcpy(&w, p + i, 4);
+        if (w == AttnLength(nb_built)) at.push_back(i);
+      }
+    };
+    find(a.k->first, a.first_lengths), find(a.k->call, a.cont_lengths);
+    if (a.cont_lengths.size() != 4 || (a.first_lengths.size() != 4 && !a.first_lengths.empty()))
+      throw LoomError("npu: " + path + ": record lengths for nb " + std::to_string(nb_built) + " not found");
+    return a;
+  }
+  // The invocation bytes of a call of a bound to views.
+  AttnCall BindAttn(const AttnImage& a, const std::vector<View>& views) {
+    Rebind(*a.k, views);
+    AttnCall c;
+    c.image = &a;
+    const std::uint8_t* f = CommandBytes(*a.k, a.k->first);
+    const std::uint8_t* r = CommandBytes(*a.k, a.k->call);
+    c.first.assign(f, f + a.k->first.byte_length);
+    c.cont.assign(r, r + a.k->call.byte_length);
+    return c;
+  }
+  // A layer's calls of one image as one command (its first call sets the array up if another image ran since), nb
+  // bodies each (<= the image's nb_built; the payloads carry nb too). The host thread submits it once *ready >=
+  // ready_value; the reaper stores done_value to *done after it (done_value | kGateFailed after a failure or ~5 s
+  // without ready). Commands run in enqueue order: no gated job may queue behind an unsubmitted one (EnqueueGated
+  // checks).
+  struct AttnJob {
+    std::vector<const AttnCall*> calls;
+    std::uint32_t nb = 0;
+    volatile std::uint32_t* ready = nullptr;
+    std::uint32_t ready_value = 0;
+    volatile std::uint32_t* done = nullptr;
+    std::uint32_t done_value = 0;
+    std::string tag;
+  };
+  void EnqueueAttn(const AttnJob& job) {
+    CheckHealth();
+    const auto t0 = std::chrono::steady_clock::now();
+    const AttnImage& a = *job.calls.at(0)->image;
+    if (job.nb > a.nb_built || job.nb < 32 || job.nb % 16) throw LoomError("npu: attention nb");
+    bool resident = false;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const bool idle = retired_ == submitted_ && attn_queue_.empty() && active_.time_since_epoch().count() &&
+                        t0 - active_ > suspend_after_;
+      resident = resident_ == a.k->image_key && !idle;
+      resident_ = a.k->image_key, resident_dec_ = -1;
+    }
+    if (!resident) program_.Forget(), ++epoch_;  // a full setup outside FusedCommand
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t ops = 0;
+    auto append = [&](const std::vector<std::uint8_t>& b, const std::vector<std::size_t>& lengths) {
+      std::uint32_t n = 0, size = 0;
+      std::memcpy(&n, b.data() + 8, 4), std::memcpy(&size, b.data() + 12, 4);
+      if (size != b.size()) throw LoomError("npu: unexpected command header");
+      const std::size_t at = bytes.empty() ? 0 : bytes.size() - 16;
+      if (bytes.empty()) bytes.assign(b.begin(), b.begin() + 16);
+      bytes.insert(bytes.end(), b.begin() + 16, b.end());
+      ops += n;
+      for (const std::size_t i : lengths) {
+        std::uint32_t w = 0;
+        std::memcpy(&w, &bytes[at + i], 4);
+        if (w != AttnLength(a.nb_built)) throw LoomError("npu: attention record length moved");
+        w = AttnLength(job.nb);
+        std::memcpy(&bytes[at + i], &w, 4);
+      }
+    };
+    for (std::size_t i = 0; i < job.calls.size(); ++i) {
+      const AttnCall& c = *job.calls[i];
+      if (c.image != &a) throw LoomError("npu: an attention job mixes images");
+      if (i == 0 && !resident)
+        append(c.first, a.first_lengths);
+      else
+        append(c.cont, a.cont_lengths);
+    }
+    const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
+    std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
+    AttnPending p;
+    p.command = Place(bytes);
+    p.ready = job.ready, p.ready_value = job.ready_value;
+    p.job = GatedJob{{}, job.done, job.done_value, job.tag, job.calls.size()};
+    p.t0 = t0;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      attn_queue_.push_back(std::move(p));
+    }
+    attn_cv_.notify_one();
+  }
   // Gated jobs as one command, submitted now (no host between the jobs). The first job of an image first runs its setup
   // as its own command (one ungated call, any data, unless gfirst; the host waits for it once), after which the gate
   // waits for job 1.
@@ -417,6 +564,7 @@ class LoomNpu {
   // sequence restarts there, NpuSplit::BeginChunk).
   void EnqueueGated(std::vector<GatedJob> jobs, bool fresh = false) {
     CheckHealth();
+    AttnQueued();
     const auto t0 = std::chrono::steady_clock::now();
     {
       // Idle past the device's autosuspend delay, the NPU may have been powered down: the array kept nothing, so the
@@ -519,6 +667,7 @@ class LoomNpu {
   // submitted.
   void Replay(const Script& s, std::size_t& queued) {
     CheckHealth();
+    AttnQueued();
     for (std::size_t i = 0; i < s.commands.size(); ++i) {
       const auto t0 = std::chrono::steady_clock::now();
       const std::uint64_t submission = Submit(s.commands[i]);
@@ -538,10 +687,10 @@ class LoomNpu {
     }
     s = Script{};
   }
-  // Waits until the reaper retired every submitted command (its stats and failures are in).
+  // Waits until the reaper retired every command, queued attention commands included (stats and failures are in).
   void Drain() {
     std::unique_lock<std::mutex> lock(mu_);
-    retired_cv_.wait(lock, [this] { return retired_ == submitted_; });
+    retired_cv_.wait(lock, [this] { return retired_ == submitted_ && attn_queue_.empty(); });
   }
   // Per job tag: jobs, calls.
   struct TagStats {
@@ -1013,8 +1162,13 @@ class LoomNpu {
     }
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
-    if (size > kArenaBytes) throw LoomError("npu: fused command exceeds its arena");
     if (recording_) recording_->bytes.push_back(bytes);
+    return {Place(bytes), dec, fam};
+  }
+  // A command's bytes in the arena ring, for the next command submitted after the attention commands still queued.
+  amdf_xdna_kernel_command_t Place(const std::vector<std::uint8_t>& bytes) {
+    const std::size_t size = bytes.size();
+    if (size > kArenaBytes) throw LoomError("npu: fused command exceeds its arena");
     if (arenas_.empty() || arenas_[arena_].used + size > kArenaBytes) {
       if (arenas_.size() < kArenas) {
         arenas_.emplace_back();
@@ -1037,7 +1191,7 @@ class LoomNpu {
     Arena& a = arenas_[arena_];
     {
       std::lock_guard<std::mutex> lock(mu_);
-      a.last = submitted_ + 1;   // the command about to be submitted (EnqueueGated)
+      a.last = submitted_ + attn_queue_.size() + 1;  // this command's submission
       commands_.bytes += size;
     }
     std::memcpy(static_cast<std::uint8_t*>(a.storage.mapping.data) + a.used, bytes.data(), size);
@@ -1049,7 +1203,7 @@ class LoomNpu {
     c.byte_offset = a.storage.memory_byte_offset + a.used;
     c.byte_length = size;
     a.used += (size + kCommandAlign - 1) / kCommandAlign * kCommandAlign;
-    return {c, dec, fam};
+    return c;
   }
   std::deque<Arena> arenas_;
   std::size_t arena_ = 0;   // the arena being filled
@@ -1067,6 +1221,73 @@ class LoomNpu {
     std::uint64_t submission = 0;
     YAH_AMDF(xdna_->kernel_queue_submit(queue_, &si, &submission), "kernel_queue_submit");
     return submission;
+  }
+
+  // Attention commands (EnqueueAttn) wait here, built, for their ready words; the thread submits them in order.
+  struct AttnPending {
+    amdf_xdna_kernel_command_t command{};
+    volatile std::uint32_t* ready = nullptr;
+    std::uint32_t ready_value = 0;
+    GatedJob job;
+    std::chrono::steady_clock::time_point t0;
+  };
+  std::deque<AttnPending> attn_queue_;  // under mu_
+  std::condition_variable attn_cv_;
+  std::thread attn_thread_;
+  static constexpr auto kAttnReadyTimeout = std::chrono::seconds(5);
+  void AttnQueued() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!attn_queue_.empty()) throw LoomError("npu: a command would run before queued attention commands");
+  }
+  // Polls each queued command's ready word (~50 us apart) and submits it. Without ready for kAttnReadyTimeout after the
+  // previous submission, or after any failure, a command fails: its done gets kGateFailed and nothing later runs.
+  void AttnSubmitter() {
+    auto since = std::chrono::steady_clock::now();
+    for (;;) {
+      AttnPending* p = nullptr;
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        attn_cv_.wait(lock, [this] { return stop_ || !attn_queue_.empty(); });
+        if (attn_queue_.empty()) return;
+        p = &attn_queue_.front();  // stays queued until submitted: Place counts it
+      }
+      bool ok = true;
+      for (;;) {
+        bool stop = false;
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          stop = stop_ || !failure_.empty();
+          if (!stop && std::chrono::steady_clock::now() - std::max(since, p->t0) > kAttnReadyTimeout) {
+            failure_ = "npu: an attention job's ready word never came (" + p->job.tag + ")";
+            stop = true;
+          }
+        }
+        if (stop) {
+          ok = false;
+          break;
+        }
+        if (__atomic_load_n(p->ready, __ATOMIC_ACQUIRE) >= p->ready_value) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+      }
+      if (!ok) {
+        // its done word fails; the commands built after it never run (the array state they expect is not there)
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const AttnPending& q : attn_queue_) Fail({q.job});
+        attn_queue_.clear();
+        resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, ++epoch_;
+        retired_cv_.notify_all();
+        continue;
+      }
+      const std::uint64_t submission = Submit(p->command);
+      since = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        pending_.push_back({submission, {p->job}, p->t0});
+        attn_queue_.pop_front();
+        ++submitted_;
+      }
+      reap_cv_.notify_one();
+    }
   }
 
   // Retires gated commands in order (EnqueueGated): stats.
@@ -1115,7 +1336,8 @@ class LoomNpu {
         if (ok) {
           for (const GatedJob& g : p.jobs) {
             auto& st = stats_[g.tag];
-            st.jobs += 1, st.calls += g.calls.size();
+            st.jobs += 1, st.calls += g.calls.size() + g.host_calls;
+            if (g.host_calls) __atomic_store_n(g.done, g.gate, __ATOMIC_RELEASE);
           }
           commands_.commands += 1, commands_.busy_ms += ms, commands_.max_ms = std::max(commands_.max_ms, ms);
           commands_.idle_ms += idle;

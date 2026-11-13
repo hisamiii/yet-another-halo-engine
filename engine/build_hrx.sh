@@ -74,6 +74,10 @@ if [ ${#npu_flags[@]} -gt 0 ]; then
   "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/npu_split_run.cc" \
       -o "$root/engine/build/npu_split_run" "$root/engine/build/libyah_core.a" \
       "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+  # NPU attention calls through LoomNpu's host-gated runner (tools/npu_attn_check.py --runner).
+  "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/npu_attn_run.cc" \
+      -o "$root/engine/build/npu_attn_run" "$root/engine/build/libyah_core.a" \
+      "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 fi
 # The Responses API server (engine/serve).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" \

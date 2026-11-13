@@ -262,13 +262,16 @@ def main():
     ap.add_argument("--kv-head", type=int, default=0)
     ap.add_argument("--inputs", help="the GPU encoder's records (npu_attn_encode_check.py)")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--runner", help="CALLS,JOBS: run through engine/build/npu_attn_run (LoomNpu's host-gated runner: "
+                    "jobs of chained calls, each call its own payload copy and outputs) and check every call")
     a = ap.parse_args()
     W, mc, nb = a.workdir, a.mc, a.nb
     os.makedirs(W, exist_ok=True)
     nb_built = a.built_nb or nb
     if a.image:
         img = open(a.image, "rb").read()
-        open(f"{W}/p.xdna", "wb").write(G.patch_nb(img, mc, nb_built, nb) if nb_built != nb else img)
+        open(f"{W}/p.xdna", "wb").write(G.patch_nb(img, mc, nb_built, nb) if nb_built != nb and not a.runner
+                                        else img)
     else:
         open(f"{W}/p.loom", "w").write(G.emit(mc, nb))
         G.compile_xdna(f"{W}/p.loom", f"{W}/p.xdna")
@@ -280,6 +283,35 @@ def main():
         inp = real_inputs(a.real, 2 * mc, nb, a.kv_head)
     else:
         inp = random_inputs(2 * mc, nb, a.seed)
+    if a.runner:
+        calls, jobs = (int(v) for v in a.runner.split(","))
+        recs, pays = streams(inp, mc, nb, nb_built)
+        for s, b in enumerate(recs):
+            b.tofile(f"{W}/s{s}.bin")
+        for s, b in enumerate(pays):
+            b.tofile(f"{W}/q{s}.bin")
+        r = subprocess.run([os.path.join(hrx_paths.ROOT, "engine", "build", "npu_attn_run"), f"{W}/p.xdna", W, str(mc),
+                            str(nb_built), str(nb), str(calls), str(jobs), str(G.NEG * 1024)],
+                           capture_output=True, text=True, env=hrx_paths.env(), timeout=600)
+        print(r.stdout.strip())
+        if r.returncode or "npu_attn_run: ok" not in r.stdout:
+            sys.exit("npu_attn_run failed\n" + r.stderr[-1500:])
+        outs = [[f"{W}/out{c}_{p}.bin" for p in range(mc)] for c in range(calls)]
+    else:
+        outs = [[f"{W}/out{p}.bin" for p in range(mc)]]
+        run_once(W, inp, mc, nb, nb_built)
+    bad, per, errs, emu = 0, [], [], {}
+    for files in outs:
+        b, pc, er = compare(files, inp, nb, emu)
+        bad, per, errs = bad + b, per + pc, errs + er
+    print(f"mc={mc} nb={nb}: {2 * mc} cores x {len(outs)} calls, a body min {min(per):.1f} mean "
+          f"{sum(per) / len(per):.1f} max {max(per):.1f}; misses {bad}" +
+          (f"; real vs f64 mean |err| {np.mean(errs):.3e} max {np.max(errs):.3e}" if errs else ""))
+    sys.exit(1 if bad else 0)
+
+
+def run_once(W, inp, mc, nb, nb_built):
+    """one fresh call through iree-xdna-run (outputs out<pair>.bin)"""
     args = [hrx_paths.XDNA_RUN, f"--columns={max(2, min(8, mc))}", f"--image={W}/p.xdna", "--entry=probe",
             "--binding_memory=system", "--invocation_count=1"]
     recs, pays = streams(inp, mc, nb, nb_built)
@@ -296,16 +328,23 @@ def main():
     r = subprocess.run(args, capture_output=True, text=True, env=hrx_paths.env(), timeout=600)
     if r.returncode:
         sys.exit("run failed\n" + r.stdout[-1500:] + r.stderr[-1500:])
+
+
+def compare(files, inp, nb, emu):
+    """one call's outputs (a file a pair) against the emulation (cached in emu per core): misses, cycles a body per
+    core, errors vs float64"""
     bad, per, errs = 0, [], []
-    for p in range(mc):
-        o = np.fromfile(f"{W}/out{p}.bin", np.uint8)
+    for p, fn in enumerate(files):
+        o = np.fromfile(fn, np.uint8)
         for h in range(2):
             w = 2 * p + h
             rw = o[OSTRIDE * h:OSTRIDE * (h + 1)]
             O = rw[:16384].view(f32).reshape(16, 4, 8, 8)
             t1, t0 = (int(v) for v in rw[16384:16392].view(np.uint32))
             l = rw[16384 + G.LSL:16384 + G.LSL + 256].view(f32).reshape(8, 8)
-            Oe, le = emulate(inp["Qs"][w], inp["Cs"][w], inp["K"], inp["V"], nb, h == 1)
+            if w not in emu:
+                emu[w] = emulate(inp["Qs"][w], inp["Cs"][w], inp["K"], inp["V"], nb, h == 1)
+            Oe, le = emu[w]
             ob = int(((O != Oe) & ~(np.isnan(O) & np.isnan(Oe))).sum())
             lb = int((l != le).sum())
             bad += ob + lb
@@ -315,11 +354,9 @@ def main():
                 er = np.abs(unpack(O, l) - inp["ref"][w])
                 errs.append(er)
                 msg += f"; vs f64 mean |err| {er.mean():.2e} max {er.max():.2e}"
-            if ob or lb or "ref" in inp:
+            if ob or lb:
                 print(msg)
-    print(f"mc={mc} nb={nb}: {2 * mc} cores, a body min {min(per):.1f} mean {sum(per) / len(per):.1f} max {max(per):.1f}; "
-          f"misses {bad}" + (f"; real vs f64 mean |err| {np.mean(errs):.3e} max {np.max(errs):.3e}" if errs else ""))
-    sys.exit(1 if bad else 0)
+    return bad, per, errs
 
 
 if __name__ == "__main__":
