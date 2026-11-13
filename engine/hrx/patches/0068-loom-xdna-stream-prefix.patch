@@ -1,0 +1,294 @@
+Loom AIE2P array plans: constrain.prefix %channel, %binding, %bytes. The first |bytes| of an ingress channel's stream
+come from the start of another binding: the shim chains a descriptor on that binding ahead of the channel's own (one
+more shim descriptor; the main transfer is the channel's records minus the prefix's). A host can then rebind a small
+per-call prefix (the NPU attention's query payloads) while every call streams the same large binding after it (the
+K / V records of one KV head). The channel must own its shim channel, carry whole records in the prefix, and transfer
+once (no task repeat, chain, iteration, or panel). Programs without the op emit byte-identical.
+
+diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py
+--- a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py
++++ b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py
+@@ -591,6 +591,23 @@ _DESCRIPTORS = (
+         schedule_class=_SCHEDULE_GRAPH,
+         flags=(DescriptorFlag.SIDE_EFFECTING,),
+     ),
++    Descriptor(
++        key=f"{_DESCRIPTOR_SET_KEY}.constrain.prefix",
++        mnemonic="constrain.prefix",
++        semantic_tag="array.constraint.prefix",
++        operands=(
++            _operand(_REG_CHANNEL, "channel"),
++            _operand(_REG_BINDING, "binding"),
++            _operand(_REG_SCALAR, "bytes"),
++        ),
++        asm_forms=_asm(
++            "constrain.prefix",
++            operands=("channel", "binding", "bytes"),
++        ),
++        effects=(_TOPOLOGY_EFFECT,),
++        schedule_class=_SCHEDULE_GRAPH,
++        flags=(DescriptorFlag.SIDE_EFFECTING,),
++    ),
+ )
+ 
+ 
+diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors_test.py b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors_test.py
+--- a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors_test.py
++++ b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors_test.py
+@@ -233,6 +233,7 @@ def test_asm_mnemonics_are_target_relative() -> None:
+         "constrain.intake",
+         "constrain.leaf_sync",
+         "constrain.location",
++        "constrain.prefix",
+         "constrain.request",
+         "constrain.signal",
+         "constrain.stage",
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -327,6 +327,12 @@ typedef struct loom_aie2p_array_channel_t {
+   uint32_t stage_panel_sub_bytes;
+   uint32_t stage_panel_sub_offset;
+   uint32_t stage_panel_unit_bytes;
++  // constrain.prefix: the first prefix_byte_length bytes of the ingress
++  // stream come from binding prefix_binding (whole, from its start), the rest
++  // from the channel's own binding: the shim chains a descriptor on each. The
++  // channel must own its shim channel. UINT32_MAX: none.
++  uint32_t prefix_binding;
++  uint32_t prefix_byte_length;
+ } loom_aie2p_array_channel_t;
+ 
+ // A core stream channel carrying data on every invocation (no gate, signal, or
+@@ -613,6 +619,11 @@ typedef struct loom_aie2p_array_binding_plan_t {
+   // chain_length descriptors, descriptor i offset by i chain_step_byte_length
+   // bytes; zero for a chain of identical descriptors.
+   uint64_t chain_step_byte_length;
++  // constrain.prefix: the binding whose first prefix_byte_length bytes the
++  // shim sends before this transfer (a descriptor chained ahead of it), or
++  // UINT32_MAX.
++  uint32_t prefix_binding_index;
++  uint32_t prefix_byte_length;
+ } loom_aie2p_array_binding_plan_t;
+ 
+ // Complete arena-owned logical topology and deterministic NPU2 physical plan.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -288,6 +288,7 @@ static void loom_aie2p_array_count_topology(
+       case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_LOCATION:
+       case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_STAGE:
+       case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_LEAF_SYNC:
++      case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_PREFIX:
+         break;
+       case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_GROUP:
+         ++builder->plan->group_count;
+@@ -653,6 +654,8 @@ static void loom_aie2p_array_extract_channel(
+   channel->stage_panel_sub_bytes = 0;
+   channel->stage_panel_sub_offset = 0;
+   channel->stage_panel_unit_bytes = 0;
++  channel->prefix_binding = UINT32_MAX;
++  channel->prefix_byte_length = 0;
+   channel->stage_first_record = UINT32_MAX;
+   loom_aie2p_array_define_entity(builder, channel->value_id,
+                                  LOOM_AIE2P_ARRAY_ENTITY_CHANNEL,
+@@ -918,6 +921,21 @@ static iree_status_t loom_aie2p_array_extract_topology(
+         builder->channels[panel].intake_prefix = intake;
+         break;
+       }
++      case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_PREFIX: {
++        loom_aie2p_array_channel_t* channel =
++            &builder->channels[loom_aie2p_array_lookup_entity(
++                                   builder, loom_op_operands(op)[0])
++                                   ->index];
++        const loom_aie2p_array_entity_t* binding =
++            loom_aie2p_array_lookup_entity(builder, loom_op_operands(op)[1]);
++        // Any other operand kind is rejected with the channel's resources.
++        channel->prefix_binding =
++            binding->kind == LOOM_AIE2P_ARRAY_ENTITY_BINDING ? binding->index
++                                                             : UINT32_MAX - 1u;
++        channel->prefix_byte_length = (uint32_t)loom_aie2p_array_constant(
++            builder, loom_op_operands(op)[2]);
++        break;
++      }
+       case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_SIGNAL: {
+         builder->channels[loom_aie2p_array_lookup_entity(
+                               builder, loom_op_operands(op)[0])
+@@ -2490,6 +2508,23 @@ static iree_status_t loom_aie2p_array_admit_binding_transfers(
+         channel->resource_flags,
+         LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_MEMORY_TO_STREAM |
+             LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_STREAM_TO_MEMORY);
++    if (channel->prefix_binding != UINT32_MAX &&
++        (!owns_shim || !ingress || channel->core_stream ||
++         loom_aie2p_array_channel_is_intake(channel) ||
++         channel->prefix_binding >= builder->plan->binding_count ||
++         channel->prefix_byte_length == 0 || channel->record_byte_length == 0 ||
++         channel->prefix_byte_length % channel->record_byte_length != 0 ||
++         channel->prefix_byte_length / channel->record_byte_length >=
++             channel->record_count ||
++         channel->prefix_byte_length %
++                 shim_dma_facts->transfer_length_granularity !=
++             0)) {
++      return loom_aie2p_array_reject_channel_resources(
++          builder, channel_index, (loom_xdna_tile_coordinate_t){0, 0},
++          IREE_SV("a stream prefix needs an ingress channel that owns its "
++                  "shim channel, a binding, and whole records (fewer than the "
++                  "channel's) in whole transfer units"));
++    }
+     if (!owns_shim) {
+       const loom_aie2p_array_channel_t* source_channel =
+           channel->stage_panel_owner != UINT32_MAX
+@@ -2512,6 +2547,8 @@ static iree_status_t loom_aie2p_array_admit_binding_transfers(
+         .partition_lane = binding_endpoint->partition_lane,
+         .partition_lane_count = binding_endpoint->partition_lane_count,
+         .completion_route_index = UINT32_MAX,
++        .prefix_binding_index = channel->prefix_binding,
++        .prefix_byte_length = channel->prefix_byte_length,
+     };
+     iree_string_view_t reason = iree_string_view_empty();
+     if (!loom_aie2p_array_resolve_binding_transfer(
+@@ -2520,7 +2557,12 @@ static iree_status_t loom_aie2p_array_admit_binding_transfers(
+             binding_endpoint->binding_byte_offset,
+             binding_endpoint->binding_view_partitioned,
+             binding_endpoint->partition_lane, channel->record_byte_length,
+-            channel->record_count, shim_dma_facts,
++            // a prefix's records come from its own binding
++            channel->prefix_binding != UINT32_MAX
++                ? channel->record_count -
++                      channel->prefix_byte_length / channel->record_byte_length
++                : channel->record_count,
++            shim_dma_facts,
+             channel->core_stream || loom_aie2p_array_channel_is_intake(channel)
+                 ? LOOM_AIE2P_ARRAY_CORE_STREAM_MAX_CHAIN
+                 : 1,
+@@ -2534,6 +2576,22 @@ static iree_status_t loom_aie2p_array_admit_binding_transfers(
+       binding_plan->task_repeat_count = (uint16_t)(
+           binding_plan->task_repeat_count / channel->stage_repeat_count);
+     }
++    // The prefix descriptor heads the task's chain, so the task runs once.
++    if (channel->prefix_binding != UINT32_MAX &&
++        (binding_plan->task_repeat_count != 1 ||
++         binding_plan->chain_length > 1 || binding_plan->iteration_wrap > 1 ||
++         builder->plan->stream_panels ||
++         channel->stage_panel_owner != UINT32_MAX ||
++         (uint64_t)channel->prefix_byte_length /
++                 shim_dma_facts->transfer_length_granularity >
++             (uint64_t)shim_dma_facts->maximum_encoded_transfer_length +
++                 shim_dma_facts->transfer_length_offset)) {
++      return loom_aie2p_array_reject_channel_resources(
++          builder, channel_index, (loom_xdna_tile_coordinate_t){0, 0},
++          IREE_SV("a stream prefix needs a transfer that runs once (no task "
++                  "repeat, chain, iteration, or panel) and a prefix within "
++                  "one shim transfer"));
++    }
+     if (channel->stage_panel_owner == channel_index) {
+       // The owner's patch reads the whole shared panel once, linearly.
+       uint64_t panel_length = 0;
+@@ -3001,7 +3059,8 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+   loom_aie2p_array_shim_endpoint_proposal_t shim_proposal = {0};
+   // A streamed plan alternates two descriptor sets between invocations; a
+   // streamed panel owner transfers each group with its own descriptor.
+-  uint16_t shim_descriptor_count = 1;
++  uint16_t shim_descriptor_count =
++      channel->prefix_binding != UINT32_MAX ? 2u : 1u;
+   if (builder->plan->stream_panels) {
+     // A chained transfer axis takes its chain in each set.
+     const loom_aie2p_array_binding_plan_t* binding_plan =
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1757,23 +1757,74 @@ static iree_host_size_t loom_aie2p_program_chained_descriptor_count(
+             : 1u;
+     count += chain_length > 1 ? sets * (chain_length - 1u) : 0u;
+     count += plan->channels[plan->binding_plans[i].channel_index].signal;
++    count += plan->binding_plans[i].prefix_binding_index != UINT32_MAX;
+   }
+   return count;
+ }
+ 
+-// One descriptor, or a chain of identical ones (a core stream supply).
++// The prefix descriptor (constrain.prefix) at |descriptor|: the prefix
++// binding's first bytes, dense, chained to |next_descriptor|.
++static void loom_aie2p_program_build_shim_dma_prefix_descriptor(
++    loom_aie2p_array_program_builder_t* builder,
++    const loom_aie2p_array_binding_plan_t* binding_plan,
++    const loom_aie2p_array_dma_plan_t* dma, uint16_t descriptor,
++    uint16_t next_descriptor) {
++  const loom_xdna_tile_facts_t* tile =
++      loom_xdna_array_tile_facts(builder->plan->family, dma->coordinate);
++  const uint32_t target_record_index = (uint32_t)builder->control.record_count;
++  uint32_t* words = loom_aie2p_program_append_register_block_write32(
++      &builder->control,
++      loom_aie2p_program_shim_dma_buffer_descriptor_address(
++          builder->plan, dma->coordinate, descriptor),
++      LOOM_AIE2P_SHIM_DMA_BUFFER_DESCRIPTOR_WORD_COUNT);
++  memset(words, 0,
++         LOOM_AIE2P_SHIM_DMA_BUFFER_DESCRIPTOR_WORD_COUNT * sizeof(*words));
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD0_BUFFER_LENGTH,
++      binding_plan->prefix_byte_length / tile->dma.transfer_length_granularity -
++          tile->dma.transfer_length_offset,
++      &words[0]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD4_BURST_LENGTH,
++      LOOM_AIE2P_SHIM_DMA_BURST_LENGTH_ENCODING, &words[4]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD5_AXI_CACHE,
++      LOOM_AIE2P_SHIM_DMA_AXI_CACHE_ENCODING, &words[5]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD7_VALID_BD, 1, &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD7_NEXT_BD, next_descriptor,
++      &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD7_USE_NEXT_BD, 1, &words[7]);
++  loom_aie2p_program_append_relocation(
++      builder, target_record_index,
++      builder->plan->bindings[binding_plan->prefix_binding_index].ordinal, 0,
++      binding_plan->prefix_byte_length, &tile->dma);
++}
++
++// One descriptor, or a chain of identical ones (a core stream supply); a
++// prefixed binding's descriptor follows its prefix descriptor.
+ static void loom_aie2p_program_build_shim_dma_descriptor(
+     loom_aie2p_array_program_builder_t* builder,
+     const loom_aie2p_array_binding_plan_t* binding_plan,
+     const loom_aie2p_array_dma_plan_t* dma) {
+   const uint16_t chain_length = iree_max(1, binding_plan->chain_length);
++  const uint16_t first =
++      binding_plan->prefix_binding_index != UINT32_MAX ? 1u : 0u;
++  if (first) {
++    loom_aie2p_program_build_shim_dma_prefix_descriptor(
++        builder, binding_plan, dma, dma->buffer_descriptor_start,
++        (uint16_t)(dma->buffer_descriptor_start + 1u));
++  }
+   for (uint16_t i = 0; i < chain_length; ++i) {
+     loom_aie2p_program_build_shim_dma_descriptor_at(
+-        builder, binding_plan, dma, dma->buffer_descriptor_start + i,
++        builder, binding_plan, dma, dma->buffer_descriptor_start + first + i,
+         (uint32_t)(i * binding_plan->chain_step_byte_length),
+         binding_plan->transfer_byte_length,
+-        i + 1u < chain_length ? (uint16_t)(dma->buffer_descriptor_start + i + 1)
+-                              : UINT16_MAX);
++        i + 1u < chain_length
++            ? (uint16_t)(dma->buffer_descriptor_start + first + i + 1)
++            : UINT16_MAX);
+   }
+ }
+ 
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
+@@ -157,6 +157,13 @@ static void loom_aie2p_xdna_build_binding_records(
+     record->minimum_byte_length =
+         iree_max(record->minimum_byte_length, minimum_byte_length);
+     record->minimum_alignment = address_alignment;
++    if (binding_plan->prefix_binding_index != UINT32_MAX) {
++      iree_xdna_elf_binding_record_t* prefix =
++          &records[plan->bindings[binding_plan->prefix_binding_index].ordinal];
++      prefix->minimum_byte_length = iree_max(prefix->minimum_byte_length,
++                                             binding_plan->prefix_byte_length);
++      prefix->minimum_alignment = address_alignment;
++    }
+   }
+ }
+ 
