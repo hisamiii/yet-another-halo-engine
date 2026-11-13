@@ -8,8 +8,8 @@ the GPU's bytes, against the float64 softmax(q k / 16) v of the same rows).
 
 usage: npu_attn_encode_check.py <dump prefix> <workdir> [key=value ...]   (gen_npu_attn_encode.Call; B, start_pos and
                                                                           pages come from the dump)
-With kvn=n (mc 16, two heads of one pair, t0 a multiple of 256) it also runs the payloads' layer form (every call of KV
-heads [4 - n, 4)) and checks the checked call's bytes in it against the one-call kernel's.
+With kvn=n (mc 16, two heads of one pair, t0 a multiple of 256) it also runs the layer forms (every call and record of KV
+heads [4 - n, 4)) and checks the checked head's and call's bytes in them against the one-call kernels'.
 """
 import os
 import subprocess
@@ -100,9 +100,24 @@ def main():
     kpay = np.fromfile(fs["kq.bin"], np.uint8).reshape(2, c.mcf, REC)
     vpay = np.fromfile(fs["vq.bin"], np.uint8).reshape(2, c.mcf, REC)
     kn = np.fromfile(fs["kn.bin"], f32)
+    lbad = 0
+    if kvn:   # the record kernels' layer form: head g's records and norms as the one-call kernels wrote them
+        lay = GE.Call(**{**c.__dict__, "kvn": kvn})
+        lay.check()
+        gp = c.g - (KVH - kvn)
+        assert gp >= 0, "kvn must cover the checked KV head"
+        lf = {n: os.path.join(W, n) for n in ("lks.bin", "lvs.bin", "lkn.bin")}
+        gpu(W, lay, "k", [f"f:{fs['kp.bin']}", f"f:{fs['ptab.bin']}", f"o:{kvn * c.ks_bytes()}:{lf['lks.bin']}",
+                          f"o:{4 * lay.kn_floats()}:{lf['lkn.bin']}"])
+        gpu(W, lay, "v", [f"f:{fs['vp.bin']}", f"f:{fs['ptab.bin']}", f"o:{kvn * c.vs_bytes()}:{lf['lvs.bin']}"])
+        for n, one, per in (("lks.bin", "ks.bin", c.ks_bytes()), ("lvs.bin", "vs.bin", c.vs_bytes()),
+                            ("lkn.bin", "kn.bin", 4 * max(c.M, 1))):
+            got = np.fromfile(lf[n], np.uint8)[gp * per:(gp + 1) * per]
+            lbad += int((got != np.fromfile(fs[one], np.uint8)).sum())
+        print(f"layer form records (kvn {kvn}, head {gp}): {lbad} bytes differ from the one-call kernels'")
     for n in ("kp.bin", "vp.bin"):
         os.remove(fs[n])
-    bad = 0
+    bad = lbad
 
     # K / V records: bit for bit
     Kf = kl[c.k0:c.k0 + nk, c.g * D:(c.g + 1) * D].astype(np.float64)
