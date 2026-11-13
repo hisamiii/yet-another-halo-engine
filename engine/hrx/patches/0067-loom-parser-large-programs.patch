@@ -1,0 +1,19 @@
+Loom: the text parser skips op field spans past its 16-bit source locations instead of failing, so programs over
+65535 lines (32 attention leaves) parse. Emits byte-identical.
+diff --git a/loom/src/loom/format/text/parser/accumulator.c b/loom/src/loom/format/text/parser/accumulator.c
+--- a/loom/src/loom/format/text/parser/accumulator.c
++++ b/loom/src/loom/format/text/parser/accumulator.c
+@@ -350,9 +350,10 @@ iree_status_t loom_parsed_op_add_field_span(
+   }
+   if (start_token.line > UINT16_MAX || start_token.column > UINT16_MAX ||
+       end_line > UINT16_MAX || end_column > UINT16_MAX) {
+-    return iree_make_status(
+-        IREE_STATUS_RESOURCE_EXHAUSTED,
+-        "parsed op field span source location exceeds storage limit");
++    // Field spans keep 16-bit locations; a span past them is not recorded
++    // (diagnostics for that field lose their location). Large multi-leaf
++    // programs exceed 65535 source lines.
++    return iree_ok_status();
+   }
+   if (parsed->field_span_count >= parsed->field_span_capacity) {
+     iree_host_size_t capacity = parsed->field_span_capacity;
