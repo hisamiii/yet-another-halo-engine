@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check gen_npu_attn_encode.py on the GPU against a real attention dump (loom_prefill YAH_ATTN_DUMP, qnorm + qsplit):
+"""Check gen_npu_attn_encode.py on the GPU against a real attention dump (loom_prefill YAH_ATTN_DUMP, qnorm + qsplit, or
+qlay=1 for an A4 set's raw f16 query):
 K / V records bit for bit against npu_attn_check.encode, the payloads against float64 (Q within a mantissa step, C,
 the park starts, nb, the pad slot). The keys sit in a small shuffled page pool, so the page table is exercised.
 Writes <workdir>/inputs.npz for `npu_attn_check.py <workdir> <mc> <nb> --inputs <workdir>/inputs.npz` (the NPU run on
@@ -7,6 +8,8 @@ the GPU's bytes, against the float64 softmax(q k / 16) v of the same rows).
 
 usage: npu_attn_encode_check.py <dump prefix> <workdir> [key=value ...]   (gen_npu_attn_encode.Call; B, start_pos and
                                                                           pages come from the dump)
+With kvn=n (mc 16, two heads of one pair, t0 a multiple of 256) it also runs the payloads' layer form (every call of KV
+heads [4 - n, 4)) and checks the checked call's bytes in it against the one-call kernel's.
 """
 import os
 import subprocess
@@ -63,6 +66,7 @@ def main():
     T = os.path.getsize(prefix + ".kpool") // (KVH * D * 2)
     c = GE.parse(sys.argv[3:])
     c.B, c.start_pos = B, T - B
+    kvn, c.kvn = c.kvn, 0                                 # the one-call kernels first
     nk = 32 * c.M
     c.pages = 2 * -(-(c.k0 + nk) // PAGE)                # every other page unused
     c.check()
@@ -91,8 +95,8 @@ def main():
     gpu(W, c, "v", [f"f:{fs['vp.bin']}", f"f:{fs['ptab.bin']}", f"o:{c.vs_bytes()}:{fs['vs.bin']}"])
     gpu(W, c, "q", [f"f:{prefix}.q", f"f:{prefix}.qnw", f"f:{fs['qeps.bin']}", f"f:{fs['kn.bin']}",
                     f"o:{c.payload_bytes()}:{fs['kq.bin']}", f"o:{c.payload_bytes()}:{fs['vq.bin']}"])
-    ks = np.fromfile(fs["ks.bin"], np.uint8).reshape(2, c.records, REC)
-    vs = np.fromfile(fs["vs.bin"], np.uint8).reshape(2, c.records, REC)
+    ks = np.fromfile(fs["ks.bin"], np.uint8).reshape(2, c.slots, REC)[:, :c.records]
+    vs = np.fromfile(fs["vs.bin"], np.uint8).reshape(2, c.slots, REC)[:, :c.records]
     kpay = np.fromfile(fs["kq.bin"], np.uint8).reshape(2, c.mcf, REC)
     vpay = np.fromfile(fs["vq.bin"], np.uint8).reshape(2, c.mcf, REC)
     kn = np.fromfile(fs["kn.bin"], f32)
@@ -140,20 +144,31 @@ def main():
     # payloads: Q against float64, C, the park starts, nb, the pad slot. Q's exponents must match and its mantissas
     # round float64 (clamped at 127) except in the rotary dims: the attention's fast sin / cos (afn) at positions near
     # 2^17 miss float64 by up to ~2 steps, and the encoder repeats the attention's RoPE op for op
+    # qlay 1: the dump's q is the raw f16 query (an A4 set's); the encoder rounds f16(q / 16) before bfp16, so a mantissa
+    # may sit one f16 step (<= 0.13 bfp16 steps) past rounding
     raw = np.fromfile(prefix + ".q", np.uint8)
     q16 = raw[:B * 12288].view(np.float16).reshape(B, H, D).astype(np.float64)
-    rot = raw[B * 12288:B * 18432].view(f32).reshape(B, H, 64).astype(np.float64)
-    sums = raw[B * 18432:B * 19968].view(f32).reshape(B, H, 16).astype(np.float64)
     qnw = np.fromfile(prefix + ".qnw", f32).astype(np.float64)
     inv = 1.0 / 10000000.0 ** (2.0 * np.arange(32) / 64.0)
+    if c.qlay:
+        q16 = q16 / np.sqrt((q16 * q16).mean(-1, keepdims=True) + 1e-6) * qnw
+    else:
+        rot = raw[B * 12288:B * 18432].view(f32).reshape(B, H, 64).astype(np.float64)
+        sums = raw[B * 18432:B * 19968].view(f32).reshape(B, H, 16).astype(np.float64)
+    tol = 0.5 + (0.13 if c.qlay else 1e-3)
     Qs, Cs, refs, qoff, qexp, rexp, cer, rmax = [], [], [], 0, 0, 0, 0.0, 0.0
     for w in range(ncores):
         hd, toks = c.heads[w % nh], c.t0 + 16 * (w // nh) + np.arange(16)
-        q = 16.0 * q16[toks, hd]
         ang = (c.start_pos + toks)[:, None].astype(np.float64) * inv[None, :]
-        a, b = rot[toks, hd, :32] * qnw[:32], rot[toks, hd, 32:64] * qnw[32:64]
+        if c.qlay:
+            q = q16[toks, hd].copy()
+            a, b = q[:, :32].copy(), q[:, 32:64].copy()
+        else:
+            q = 16.0 * q16[toks, hd]
+            a, b = rot[toks, hd, :32] * qnw[:32], rot[toks, hd, 32:64] * qnw[32:64]
         q[:, :32], q[:, 32:64] = a * np.cos(ang) - b * np.sin(ang), a * np.sin(ang) + b * np.cos(ang)
-        q *= (1.0 / np.sqrt(sums[toks, hd].sum(-1) / D + 1e-6))[:, None]
+        if not c.qlay:
+            q *= (1.0 / np.sqrt(sums[toks, hd].sum(-1) / D + 1e-6))[:, None]
         S = q @ Kf.T / 16.0
         P = np.exp(S - S.max(1, keepdims=True))
         refs.append(P @ Vf / P.sum(1, keepdims=True))
@@ -167,7 +182,7 @@ def main():
         de = e - NC.encode(qf)[1]
         qexp += int((de[16:] != 0).sum()) + int((np.abs(de[:16]) > 1).sum())
         rexp += int((de[:16] != 0).sum())
-        qoff += int((er[16:] > 0.5 + 1e-3).sum())        # fragments 2d + rb, d >= 8: dims 64 ..
+        qoff += int((er[16:] > tol).sum())                # fragments 2d + rb, d >= 8: dims 64 ..
         rmax = max(rmax, float(er[:16].max()))
         qb = NC.decode(m, e)
         qn = np.array([np.linalg.norm(np.concatenate([qb[2 * d + r // 8][r % 8] for d in range(32)])) for r in range(16)])
@@ -192,6 +207,23 @@ def main():
              int((pays[s] != (kpay if s < 2 else vpay)[s % 2].reshape(-1)).sum()) for s in range(4))
     print(f"streams rebuilt from the parsed inputs: {rb} bytes differ")
     bad += rb
+    if kvn:
+        lay = GE.Call(**{**c.__dict__, "kvn": kvn})
+        lay.check()
+        gp, pp = c.g - (KVH - kvn), (c.heads[0] - 6 * c.g) // 2
+        assert 0 <= gp and c.mc == 16 and c.heads == (6 * c.g + 2 * pp, 6 * c.g + 2 * pp + 1) and c.t0 % 256 == 0
+        cl = (3 * gp + pp) * (B // 256) + c.t0 // 256
+        lkn = np.tile(kn[:max(c.M, 1)], kvn).astype(f32)   # every KV head's slot the checked head's norms
+        lkn.tofile(fs["kn.bin"])
+        lq = {n: os.path.join(W, n) for n in ("lkq.bin", "lvq.bin")}
+        gpu(W, lay, "q", [f"f:{prefix}.q", f"f:{prefix}.qnw", f"f:{fs['qeps.bin']}", f"f:{fs['kn.bin']}",
+                          f"o:{lay.payload_bytes()}:{lq['lkq.bin']}", f"o:{lay.payload_bytes()}:{lq['lvq.bin']}"])
+        lb = 0
+        for n, one in (("lkq.bin", kpay), ("lvq.bin", vpay)):
+            got = np.fromfile(lq[n], np.uint8).reshape(lay.calls, 2, c.mcf, REC)
+            lb += int((got[cl] != one).sum())
+        print(f"layer form (kvn {kvn}, call {cl} of {lay.calls}): {lb} payload bytes differ from the one-call kernel's")
+        bad += lb
     def pk(fr):
         return np.stack([m for m, e in fr]).astype(np.int8), np.stack([e for m, e in fr]).astype(np.uint8)
     (Qm, Qe), (Km, Ke), (Vm, Ve) = pk(Qs), pk(Kr), pk(Vr)

@@ -49,6 +49,16 @@ class Call:
     start_pos: int = 0
     t0: int = 0
     heads: tuple = (0, 1, 2, 3, 4, 5)
+    nbs: int = 0                                         # the records' half stride is nbs + 1 slots (the nb an image was
+                                                         # built for: its stream views are fixed); 0: nb
+    kvn: int = 0                                         # q only, the layer form: every call of KV heads [4 - kvn, 4)
+                                                         # in one dispatch (g, t0, heads unused): mc 16, call
+                                                         # c = (3 g' + p) (B / 256) + t / 256 (tokens t, heads
+                                                         # 6 (4 - kvn) + 2 (3 g' + p) + 0 / 1); kn [kvn][M], kq / vq
+                                                         # [calls][2][mcf][4608 B]
+    qlay: int = 0                                        # q only: 0 the split-norm query (R2P_QSPLIT), 1 the raw f16
+                                                         # query [token][24][256] (A4 sets: the attention does the head
+                                                         # norm), normed here
 
     @property
     def mcf(self):
@@ -60,6 +70,8 @@ class Call:
 
     def check(self):
         assert self.nb % 16 == 0 and self.nb >= 32 and 1 <= self.mc <= 16 and 0 <= self.g < KVH
+        assert self.nbs == 0 or self.nbs >= self.nb
+        assert self.kvn == 0 or (self.mc == 16 and self.kvn <= KVH and self.B % 256 == 0)
         assert self.k0 % 32 == 0 and self.pages * PAGE >= self.k0 + 32 * self.M, "the pool pages must hold the keys"
 
     @property
@@ -67,26 +79,41 @@ class Call:
         """a stream's records: nb + 1 K records (nb V records and a dummy)"""
         return self.nb + 1
 
+    @property
+    def slots(self):
+        """a half's record slots (its stride)"""
+        return (self.nbs or self.nb) + 1
+
+    @property
+    def calls(self):
+        """the layer form's calls (1: one call)"""
+        return 3 * self.kvn * (self.B // 256) if self.kvn else 1
+
     def ks_bytes(self):
-        return 2 * self.records * REC
+        return 2 * self.slots * REC
 
     def vs_bytes(self):
-        return 2 * self.records * REC
+        return 2 * self.slots * REC
 
     def payload_bytes(self):
-        """kq or vq: the payloads and the pad slot of each half"""
-        return 2 * self.mcf * REC
+        """kq or vq: the payloads and the pad slot of each half (of every call in the layer form)"""
+        return self.calls * 2 * self.mcf * REC
+
+    def kn_floats(self):
+        return max(self.kvn, 1) * max(self.M, 1)
 
     def footprints(self, kind):
         """the bytes each binding's views span, in binding order (hal_run's min sizes)"""
-        kn = 4 * max(self.M, 1)
+        kn = 4 * self.kn_floats()
         return {"k": [self.pages * PAGE * 2048, 4 * self.pages, self.ks_bytes(), kn],
                 "v": [KVH * self.pages * PAGE * D * 2, 4 * self.pages, self.vs_bytes()],
-                "q": [self.B * 19968, 4 * D, 4, kn, self.payload_bytes(), self.payload_bytes()]}[kind]
+                "q": [self.B * (12288 if self.qlay else 19968), 4 * D, 4, kn, self.payload_bytes(),
+                      self.payload_bytes()]}[kind]
 
     def grid(self, kind):
         """(workgroups, workgroup size)"""
-        return {"k": (self.nb + 1, 128), "v": (self.nb, 128), "q": (2 * self.mc + (self.mcf > self.mc), 64)}[kind]
+        return {"k": (self.nb + 1, 128), "v": (self.nb, 128),
+                "q": (self.calls * (2 * self.mc + (self.mcf > self.mc)), 64)}[kind]
 
 
 def head(e, name, wgs, wg, args):
@@ -167,7 +194,7 @@ def gen_k(c):
         e(f"  %kv{r} = vector.load %kp_flat[%ka{r}] : view<[%nkp]xf16> -> vector<8xf16>")
         e(f"  %kx{r} = scf.select %live, %kv{r}, %zv : vector<8xf16>")
         return f"%kx{r}"
-    e(f"  %slots = index.constant {c.records} : index")
+    e(f"  %slots = index.constant {c.slots} : index")
     e("  %fo1 = index.mul %s, %slots : index")
     e("  %fo3 = index.add %fo1, %wg : index")
     e("  %fo4 = index.mul %fo3, %c4608 : index")
@@ -287,7 +314,7 @@ def gen_v(c):
         e(f"  %vv{r} = vector.load %vp_flat[%va{r}] : view<[%nvp]xf16> -> vector<8xf16>")
         e(f"  %vx{r} = scf.select %live, %vv{r}, %zv : vector<8xf16>")
         return f"%vx{r}"
-    e(f"  %slots = index.constant {c.records} : index")
+    e(f"  %slots = index.constant {c.slots} : index")
     e("  %h = index.div %tid, %c64 : index")
     e("  %f64 = index.rem %tid, %c64 : index")
     e("  %fo1 = index.mul %h, %slots : index")
@@ -304,42 +331,54 @@ def gen_v(c):
 def gen_q(c):
     """payloads: workgroup w < 2 mc = core w (item f = 2 d + rb: rows 8 rb .., dims 8 d ..); workgroup 2 mc zeroes the
     pad slots (mcf > mc)"""
-    nh = len(c.heads)
-    assert (2 * c.mc) % nh == 0 and all(6 * c.g <= h < 6 * c.g + 6 for h in c.heads)
-    assert c.t0 + 16 * (2 * c.mc // nh) <= c.B
+    nh = 2 if c.kvn else len(c.heads)
+    if not c.kvn:
+        assert (2 * c.mc) % nh == 0 and all(6 * c.g <= h < 6 * c.g + 6 for h in c.heads)
+        assert c.t0 + 16 * (2 * c.mc // nh) <= c.B
     L = []
     e = L.append
     pad = c.mcf > c.mc
     head(e, "yah_npuattn_q", *c.grid("q"), ("q", "qnw", "qeps", "kn", "kq", "vq"))
     consts(e, 0, 1, 2, 8, 16, 24, 32, 64, 72, 256, REC)
-    e(f"  %nq = index.constant {c.B * 19968 // 2} : index")
+    e(f"  %nq = index.constant {c.B * (12288 if c.qlay else 19968) // 2} : index")
     e(f"  %nkq = index.constant {c.payload_bytes()} : index")
     e(f"  %nvq = index.constant {c.payload_bytes()} : index")
-    e(f"  %nkn = index.constant {max(c.M, 1)} : index")
+    e(f"  %nkn = index.constant {c.kn_floats()} : index")
     e("  %q_na, %w_na, %e_na, %kn_na, %kq_na, %vq_na = buffer.assume.noalias %q, %qnw, %qeps, %kn, %kq, %vq : "
       "buffer, buffer, buffer, buffer, buffer, buffer")
     e("  %qh_flat = buffer.view %q_na[%base] : buffer -> view<[%nq]xf16>")
-    e(f"  %nq32 = index.constant {c.B * 19968 // 4} : index")
-    e("  %qf_flat = buffer.view %q_na[%base] : buffer -> view<[%nq32]xf32>")
+    if not c.qlay:
+        e(f"  %nq32 = index.constant {c.B * 19968 // 4} : index")
+        e("  %qf_flat = buffer.view %q_na[%base] : buffer -> view<[%nq32]xf32>")
     e("  %w_flat = buffer.view %w_na[%base] : buffer -> view<[%c256]xf32>")
     e("  %e_flat = buffer.view %e_na[%base] : buffer -> view<[%c1]xf32>")
     e("  %kn_flat = buffer.view %kn_na[%base] : buffer -> view<[%nkn]xf32>")
     e("  %kq_flat = buffer.view %kq_na[%base] : buffer -> view<[%nkq]xi8>")
     e("  %vq_flat = buffer.view %vq_na[%base] : buffer -> view<[%nvq]xi8>")
     e(f"  %ncore = index.constant {2 * c.mc} : index")
-    e("  %core = index.cmp ult, %wg, %ncore : index")
+    wg = "%wg"
+    if c.kvn:   # workgroup = call cl, its core (or pad) wgc
+        e(f"  %cper = index.constant {2 * c.mc + pad} : index")
+        e("  %cl = index.div %wg, %cper : index")
+        e("  %wgc = index.rem %wg, %cper : index")
+        e(f"  %ccb = index.constant {2 * c.mcf * REC} : index")
+        e("  %cbase = index.mul %cl, %ccb : index")      # the call's kq / vq bytes
+        wg = "%wgc"
+    e(f"  %core = index.cmp ult, {wg}, %ncore : index")
     e("  scf.if %core {")
-    q_core(e, c, nh)
+    q_core(e, c, nh, wg)
     e("  }")
     if pad:
-        e("  %padwg = index.cmp eq, %wg, %ncore : index")
+        e(f"  %padwg = index.cmp eq, {wg}, %ncore : index")
         e("  scf.if %padwg {")
         e("    %zb = scalar.constant 0 : i8")
         e("    %z8 = vector.splat %zb : vector<8xi8>")
         imgs = (("%kq_flat", "%nkq"), ("%vq_flat", "%nvq"))
         for hv, (buf, nb_) in enumerate(imgs):
             for h in range(2):
-                e(f"    %pz{hv}{h} = index.constant {(h * c.mcf + c.mc) * REC} : index")
+                e(f"    %pz{hv}{h}{'c' if c.kvn else ''} = index.constant {(h * c.mcf + c.mc) * REC} : index")
+                if c.kvn:
+                    e(f"    %pz{hv}{h} = index.add %pz{hv}{h}c, %cbase : index")
                 for k in range(REC // 8 // 64):
                     e(f"    %pzo{hv}{h}_{k}a = index.constant {8 * 64 * k} : index")
                     e(f"    %pzo{hv}{h}_{k}b = index.mul %tid, %c8 : index")
@@ -352,21 +391,43 @@ def gen_q(c):
     return "\n".join(L) + "\n"
 
 
-def q_core(e, c, nh):
+def q_core(e, c, nh, wg):
     def x(s):
         e("    " + s)
+    def based(name):   # the layer form adds the call's base to a payload byte offset
+        if not c.kvn:
+            return name
+        x(f"{name} = index.add {name}c, %cbase : index")
+        return None
+    sfx = "c" if c.kvn else ""
     x(f"%cnh = index.constant {nh} : index")
-    x("%wh = index.rem %wg, %cnh : index")
-    x("%wt = index.div %wg, %cnh : index")
-    x(f"%hsel0 = index.constant {c.heads[0]} : index")
-    hv = "%hsel0"
-    for i, hh in enumerate(c.heads[1:], 1):              # head = heads[w % nh]
-        x(f"%hc{i} = index.constant {i} : index")
-        x(f"%hk{i} = index.constant {hh} : index")
-        x(f"%hq{i} = index.cmp eq, %wh, %hc{i} : index")
-        x(f"%hsel{i} = scf.select %hq{i}, %hk{i}, {hv} : index")
-        hv = f"%hsel{i}"
-    x(f"%ct0 = index.constant {c.t0} : index")
+    x(f"%wh = index.rem {wg}, %cnh : index")
+    x(f"%wt = index.div {wg}, %cnh : index")
+    if c.kvn:   # call cl = (3 g' + p) ncb + t0 / 256: heads 6 (4 - kvn) + 2 (3 g' + p) + wh
+        x(f"%cncb = index.constant {c.B // 256} : index")
+        x("%hpq = index.div %cl, %cncb : index")
+        x("%hpq2 = index.mul %hpq, %c2 : index")
+        x(f"%hpb = index.constant {6 * (KVH - c.kvn)} : index")
+        x("%hpc = index.add %hpq2, %hpb : index")
+        x("%hph = index.add %hpc, %wh : index")
+        x(f"%hsel = index.assume %hph [range(%hph, 0, {H}), lt(%hph, %c24)] : index")
+        hv = "%hsel"
+        x("%ctb = index.rem %cl, %cncb : index")
+        x("%ct0 = index.mul %ctb, %c256 : index")
+        x(f"%cn3 = index.constant {3 * (c.B // 256)} : index")
+        x("%kng = index.div %cl, %cn3 : index")          # g': its kn
+        x(f"%knm = index.constant {max(c.M, 1)} : index")
+        x("%knb = index.mul %kng, %knm : index")
+    else:
+        x(f"%hsel0 = index.constant {c.heads[0]} : index")
+        hv = "%hsel0"
+        for i, hh in enumerate(c.heads[1:], 1):          # head = heads[w % nh]
+            x(f"%hc{i} = index.constant {i} : index")
+            x(f"%hk{i} = index.constant {hh} : index")
+            x(f"%hq{i} = index.cmp eq, %wh, %hc{i} : index")
+            x(f"%hsel{i} = scf.select %hq{i}, %hk{i}, {hv} : index")
+            hv = f"%hsel{i}"
+        x(f"%ct0 = index.constant {c.t0} : index")
     x("%wt16 = index.mul %wt, %c16 : index")
     x("%tok0 = index.add %ct0, %wt16 : index")            # the core's first token
     x("%d = index.div %tid, %c2 : index")
@@ -470,14 +531,17 @@ def q_core(e, c, nh):
             out.append(f"%qy{r}_{i}")
         x(f"%qrow{r} = vector.from_elements {', '.join(out)} : vector<8xf32>")
         return f"%qrow{r}"
+    if c.qlay:
+        load = q_raw(e, c, hv, inv)
     x(f"%slots = index.constant {c.mcf} : index")
-    x("%wl = index.rem %wg, %c2 : index")
-    x("%wp = index.div %wg, %c2 : index")
+    x(f"%wl = index.rem {wg}, %c2 : index")
+    x(f"%wp = index.div {wg}, %c2 : index")
     x("%fo1 = index.mul %wl, %slots : index")
     x("%fo2 = index.add %fo1, %wp : index")
     x("%fo3 = index.mul %fo2, %c4608 : index")
     x("%fo4 = index.mul %tid, %c72 : index")
-    x("%frag = index.add %fo3, %fo4 : index")
+    x(f"%frag{sfx} = index.add %fo3, %fo4 : index")
+    based("%frag")
     sums = BE.emit_encode(e, load, "%frag", "%kq_flat", "%nkq", p="e_", ind="    ", src="f32", norms=True)
     # row norms: partials [item][8] -> row 8 rb + r sums its 32 items in d order; kmax: max of kn over the wave
     x("%lb = index.constant 2048 : offset")
@@ -493,7 +557,9 @@ def q_core(e, c, nh):
         x(f"%kn{k}a = index.add %lane, %kn{k}c : index")
         x(f"%kn{k}m = index.constant {max(c.M, 1) - 1} : index")
         x(f"%kn{k}i = index.min %kn{k}a, %kn{k}m : index")
-        x(f"%kn{k} = view.load %kn_flat[%kn{k}i] : view<[%nkn]xf32> -> f32")
+        if c.kvn:
+            x(f"%kn{k}j = index.add %kn{k}i, %knb : index")
+        x(f"%kn{k} = view.load %kn_flat[%kn{k}{'j' if c.kvn else 'i'}] : view<[%nkn]xf32> -> f32")
         if acc:
             x(f"%kx{k} = scalar.maxnumf {acc}, %kn{k} : f32")
         acc = f"%kx{k}" if acc else f"%kn{k}"
@@ -521,7 +587,9 @@ def q_core(e, c, nh):
     x("  %crv = vector.splat %cr : vector<8xf32>")
     x("  %vo1 = index.mul %wl, %slots : index")
     x("  %vo2 = index.add %vo1, %wp : index")
-    x("  %vbase = index.mul %vo2, %c4608 : index")
+    x(f"  %vbase{sfx} = index.mul %vo2, %c4608 : index")
+    if c.kvn:
+        x("  %vbase = index.add %vbasec, %cbase : index")
     x("  %c32b = index.mul %tid, %c32 : index")
     x("  %cbo = index.add %vbase, %c32b : index")
     x("  %crb = vector.bitcast %crv : vector<8xf32> to vector<32xi8>")
@@ -533,7 +601,8 @@ def q_core(e, c, nh):
     x("%nbf = scalar.bitcast %nbw : i32 to f32")
     x("%pvb2 = index.mul %wl, %slots : index")
     x("%pvb3 = index.add %pvb2, %wp : index")
-    x("%pvb4 = index.mul %pvb3, %c4608 : index")
+    x(f"%pvb4{sfx} = index.mul %pvb3, %c4608 : index")
+    based("%pvb4")
     x("%c512 = index.constant 512 : index")
     x("%pvbase = index.add %pvb4, %c512 : index")
     x("%t16 = index.mul %tid, %c16 : index")
@@ -549,6 +618,112 @@ def q_core(e, c, nh):
             x(f"%pkv{k} = vector.splat %f128 : vector<4xf32>")
         x(f"%pkb{k} = vector.bitcast %pkv{k} : vector<4xf32> to vector<16xi8>")
         x(f"vector.store %pkb{k}, %vq_flat[%pk{k}] : vector<16xi8>, view<[%nvq]xi8>")
+
+
+def q_raw(e, c, hv, inv):
+    """qlay 1: the item's 8 rows of the raw f16 query normed as the attention does (q / rms x w, RoPE, f16(x / 16)) x
+    log2e. 1 / rms per row from LDS: partials [item][8 rows] of the item's 8 dims, rows summed by threads 0 .. 15."""
+    def x(s):
+        e("    " + s)
+    x("%xw0 = index.mul %tid, %c8 : index")
+    for i in range(8):                                   # the own dims' weights (the rotary ones: %wa / %wb)
+        x(f"%wo{i}c = index.constant {i} : index")
+        x(f"%wo{i}a = index.add %d8, %wo{i}c : index")
+        x(f"%wo{i} = view.load %w_flat[%wo{i}a] : view<[%c256]xf32> -> f32")
+    x("%pb = index.constant 2112 : offset")
+    x("%pbuf = buffer.alloca<workgroup> align(16) %pb : buffer")
+    x("%pv = buffer.view %pbuf[%base] : buffer -> view<528xf32>")
+    parts = []
+    for r in range(8):
+        x(f"%xt{r}c = index.constant {r} : index")
+        x(f"%xt{r} = index.add %tokb, %xt{r}c : index")
+        x(f"%xh{r}a = index.mul %xt{r}, %c24 : index")
+        x(f"%xh{r} = index.add %xh{r}a, {hv} : index")
+        x(f"%xa{r}a = index.mul %xh{r}, %c256 : index")
+        x(f"%xa{r} = index.add %xa{r}a, %d8 : index")
+        x(f"%xv{r} = vector.load %qh_flat[%xa{r}] : view<[%nq]xf16> -> vector<8xf16>")
+        x(f"%xf{r} = vector.extf %xv{r} : vector<8xf16> to vector<8xf32>")
+        x(f"%xs{r} = vector.mulf %xf{r}, %xf{r} : vector<8xf32>")
+        acc = None
+        for i in range(8):
+            x(f"%xs{r}_{i} = vector.extract %xs{r}[{i}] : vector<8xf32> -> f32")
+            if acc:
+                x(f"%xp{r}_{i} = scalar.addf {acc}, %xs{r}_{i} : f32")
+            acc = f"%xp{r}_{i}" if acc else f"%xs{r}_{i}"
+        parts.append(acc)
+    x(f"%xpv = vector.from_elements {', '.join(parts)} : vector<8xf32>")
+    x("vector.store %xpv, %pv[%xw0] : vector<8xf32>, view<528xf32>")
+    x("kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    x("%xrow = index.cmp ult, %tid, %c16 : index")
+    x("scf.if %xrow {")                                  # row R = 8 rb + r: items 2 d + rb, entry r
+    x("  %xrb = index.div %tid, %c8 : index")
+    x("  %xr = index.rem %tid, %c8 : index")
+    x("  %xi0 = index.mul %xrb, %c8 : index")
+    x("  %xi = index.add %xi0, %xr : index")
+    acc = None
+    for d in range(32):
+        x(f"  %xn{d}c = index.constant {16 * d} : index")
+        x(f"  %xn{d}a = index.add %xi, %xn{d}c : index")
+        x(f"  %xn{d} = view.load %pv[%xn{d}a] : view<528xf32> -> f32")
+        if acc:
+            x(f"  %xm{d} = scalar.addf {acc}, %xn{d} : f32")
+        acc = f"%xm{d}" if acc else f"%xn{d}"
+    x(f"  %xmean = scalar.mulf {acc}, %sc256 : f32")
+    x("  %xme = scalar.addf %xmean, %eps : f32")
+    x("  %xinv = scalar.rsqrtf %xme : f32")
+    x("  %xo = index.constant 512 : index")
+    x("  %xoa = index.add %xo, %tid : index")
+    x("  view.store %xinv, %pv[%xoa] : f32, view<528xf32>")
+    x("}")
+    x("kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    x("%xq0 = index.constant 512 : index")
+    x("%xq1 = index.add %xq0, %rb8 : index")
+    for r in range(8):
+        x(f"%xi{r}c = index.constant {r} : index")
+        x(f"%xi{r}a = index.add %xq1, %xi{r}c : index")
+        x(f"%rinv{r} = view.load %pv[%xi{r}a] : view<528xf32> -> f32")
+
+    def load(r):
+        # the rotary pair of this fragment's dims (d < 8): dims dlo + i and dlo + 32 + i
+        x(f"%ya{r} = index.add %xa{r}a, %dlo : index")
+        x(f"%yb{r} = index.add %ya{r}, %c32 : index")
+        x(f"%yav{r} = vector.load %qh_flat[%ya{r}] : view<[%nq]xf16> -> vector<8xf16>")
+        x(f"%ybv{r} = vector.load %qh_flat[%yb{r}] : view<[%nq]xf16> -> vector<8xf16>")
+        x(f"%yaf{r} = vector.extf %yav{r} : vector<8xf16> to vector<8xf32>")
+        x(f"%ybf{r} = vector.extf %ybv{r} : vector<8xf16> to vector<8xf32>")
+        x(f"%pos{r}a = index.add %csp, %xt{r} : index")
+        x(f"%pos{r}i = index.cast %pos{r}a : index to i32")
+        x(f"%pos{r} = scalar.sitofp %pos{r}i : i32 to f32")
+        out = []
+        for i in range(8):
+            x(f"%ox{r}_{i} = vector.extract %xf{r}[{i}] : vector<8xf32> -> f32")
+            x(f"%on{r}_{i} = scalar.mulf %ox{r}_{i}, %rinv{r} : f32")
+            x(f"%ow{r}_{i} = scalar.mulf %on{r}_{i}, %wo{i} : f32")
+            x(f"%ax{r}_{i} = vector.extract %yaf{r}[{i}] : vector<8xf32> -> f32")
+            x(f"%bx{r}_{i} = vector.extract %ybf{r}[{i}] : vector<8xf32> -> f32")
+            x(f"%an{r}_{i}n = scalar.mulf %ax{r}_{i}, %rinv{r} : f32")
+            x(f"%bn{r}_{i}n = scalar.mulf %bx{r}_{i}, %rinv{r} : f32")
+            x(f"%a{r}_{i} = scalar.mulf %an{r}_{i}n, %wa{i} : f32")
+            x(f"%b{r}_{i} = scalar.mulf %bn{r}_{i}n, %wb{i} : f32")
+            x(f"%an{r}_{i} = scalar.mulf %pos{r}, {inv[i]} : f32")
+            x(f"%co{r}_{i} = scalar.cosf<afn> %an{r}_{i} : f32")
+            x(f"%si{r}_{i} = scalar.sinf<afn> %an{r}_{i} : f32")
+            x(f"%x0{r}_{i} = scalar.mulf %a{r}_{i}, %co{r}_{i} : f32")
+            x(f"%x1{r}_{i} = scalar.mulf %b{r}_{i}, %si{r}_{i} : f32")
+            x(f"%lo{r}_{i} = scalar.subf %x0{r}_{i}, %x1{r}_{i} : f32")
+            x(f"%y0{r}_{i} = scalar.mulf %a{r}_{i}, %si{r}_{i} : f32")
+            x(f"%y1{r}_{i} = scalar.mulf %b{r}_{i}, %co{r}_{i} : f32")
+            x(f"%up{r}_{i} = scalar.addf %y0{r}_{i}, %y1{r}_{i} : f32")
+            x(f"%rr{r}_{i} = scf.select %hi32, %up{r}_{i}, %lo{r}_{i} : f32")
+            x(f"%qs{r}_{i} = scf.select %rot, %rr{r}_{i}, %ow{r}_{i} : f32")
+            x(f"%rs{r}_{i} = scalar.mulf %qs{r}_{i}, %c16f : f32")
+            x(f"%rt{r}_{i} = scalar.fptrunc %rs{r}_{i} : f32 to f16")
+            x(f"%qx{r}_{i} = scalar.extf %rt{r}_{i} : f16 to f32")
+            x(f"%qy{r}_{i} = scalar.mulf %qx{r}_{i}, %log2e : f32")
+            out.append(f"%qy{r}_{i}")
+        x(f"%qrow{r} = vector.from_elements {', '.join(out)} : vector<8xf32>")
+        return f"%qrow{r}"
+    return load
 
 
 def parse(argv):
