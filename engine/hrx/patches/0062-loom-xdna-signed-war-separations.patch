@@ -1,0 +1,37 @@
+Loom: AIE2P write-after-read event separations keep their sign, so a late register write (a FIFO pop lands 8 cycles
+after issue) may issue below the last read of the old value. The core is in-order and stalls freeze the whole pipeline.
+GPU sets and the NPU split's images byte-identical; the NPU attention kernel needs it (966 -> 700 cycles a body).
+diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py b/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
+--- a/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
++++ b/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
+@@ -1661,19 +1661,18 @@ def _endpoint_itinerary(endpoint: tuple[int, str | None]) -> Itinerary:
+ 
+ 
+ def _physical_war_separation(producer: Itinerary, consumer: Itinerary) -> int:
+-    # The signed LLVM anti-dependency latency assumes that its scheduler
+-    # preserves topological issue order. Loom's physical issuer can backfill a
+-    # later accepted instruction into an earlier issue cycle, so preserve the
+-    # accepted read-before-overwrite order in the shared event table.
+-    return max(
++    # Signed: a late register write (a FIFO pop's fragment lands 8 cycles after
++    # issue) may issue below the last read of the register's old value, as
++    # long as the write lands after the read. The core is in-order and a stall
++    # freezes the whole pipeline, so issue-relative stage timing holds when
++    # the physical issuer backfills a later accepted writer into an earlier
++    # cycle. Hand-scheduled locked bodies (LOOM_EXP_LOCKED_HOIST) rely on it.
++    return dependency_separation(
++        producer,
+         0,
+-        dependency_separation(
+-            producer,
+-            0,
+-            consumer,
+-            0,
+-            DependencyKind.WAR,
+-        ),
++        consumer,
++        0,
++        DependencyKind.WAR,
+     )
+ 
+ 
