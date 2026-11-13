@@ -14,10 +14,10 @@ m 2^(E - 133), one exponent a row of 8):
   V  record b [128 fragments] (P.V group n = b // 16, dim slice rp = (14 + b) % 16): fragment 2st + dp, st = 4bs + 2s + kp
                     over K record r = 16(n - 1) - 1 + bs, keys 16s + 8kp ..: [8 dims 16rp + 8dp ..][8 keys] (zeros for
                     r < 0 or r >= M)
-Record 0 of each stream is the payload of each core (Q | C | the park starts 2 x 8 x 256 B of f32 128 = P 1 a fake key;
-nb in park half 1's first word), then 1 zero record if mc is even, then nb + 1 K records / nb V records and a dummy
-(any bytes: every ring then ends a call on copy 0, so calls chain as continuations), each stream carrying the lower or
-the upper 64 fragments. Output a pair: 34 KB records, core h at 17 KB h: O [16 rp][4 c = 2dp + rbp]
+Each stream carries the lower or the upper 64 fragments of its records: first the call's payload prefix (its own
+binding: the payload of each pair's core, Q | C | the park starts 2 x 8 x 256 B of f32 128 = P 1 a fake key, nb in
+park half 1's first word; then 1 zero record if mc is even), then the KV head's records (nb + 1 K records / nb V
+records and a dummy: any bytes; every ring then ends a call on copy 0, so calls chain as continuations). Output a pair: 34 KB records, core h at 17 KB h: O [16 rp][4 c = 2dp + rbp]
 [8][8] f32, then t1, t0 (cycles) and at + 640 the l block [8][8] (cols 0-3 rows 0-7, 4-7 rows 8-15, x 2^-63).
 """
 import argparse
@@ -231,7 +231,7 @@ def unpack(O, l):
 
 
 def streams(inp, mc, nb, nb_built):
-    """the 4 stream bindings (K lower, K upper, V lower, V upper), sized for nb_built"""
+    """the 4 record bindings (K lower, K upper, V lower, V upper; sized for nb_built) and the 4 payload prefixes"""
     mcf = mc + (1 - mc % 2)
     st = [[], [], [], []]
     for w in range(2 * mc):
@@ -241,15 +241,14 @@ def streams(inp, mc, nb, nb_built):
         pl[G.KB + 512 + 2048:G.KB + 512 + 2052] = np.array([nb], np.uint32).view(np.uint8)
         st[w % 2].append(pl[:G.KB])
         st[2 + w % 2].append(pl[G.KB:])
+    recs = []
     for s in range(4):
         h = s % 2
-        st[s] += [np.zeros(G.KB, np.uint8)] * (mcf - mc)
+        st[s] = np.concatenate(st[s] + [np.zeros(G.KB, np.uint8)] * (mcf - mc))
         rec = inp["K"][:nb + 1] if s < 2 else inp["V"][:nb]
-        st[s] += [frag_bytes(m[64 * h:64 * h + 64], e[64 * h:64 * h + 64]) for m, e in rec]
-        full = (mcf + nb_built + 1) * (G.KB if s < 2 else G.VB)
-        b = np.concatenate(st[s])
-        st[s] = np.concatenate([b, np.zeros(full - b.size, np.uint8)])
-    return st
+        b = np.concatenate([frag_bytes(m[64 * h:64 * h + 64], e[64 * h:64 * h + 64]) for m, e in rec])
+        recs.append(np.concatenate([b, np.zeros((nb_built + 1) * (G.KB if s < 2 else G.VB) - b.size, np.uint8)]))
+    return recs, st
 
 
 def main():
@@ -283,12 +282,16 @@ def main():
         inp = random_inputs(2 * mc, nb, a.seed)
     args = [hrx_paths.XDNA_RUN, f"--columns={max(2, min(8, mc))}", f"--image={W}/p.xdna", "--entry=probe",
             "--binding_memory=system", "--invocation_count=1"]
-    for s, b in enumerate(streams(inp, mc, nb, nb_built)):
+    recs, pays = streams(inp, mc, nb, nb_built)
+    for s, b in enumerate(recs):
         b.tofile(f"{W}/s{s}.bin")
         args.append(f"--binding={W}/s{s}.bin")
     for p in range(mc):
         np.zeros(G.NEG * 1024, np.uint8).tofile(f"{W}/o{p}.bin")
         args.append(f"--binding={W}/o{p}.bin")
+    for s, b in enumerate(pays):
+        b.tofile(f"{W}/q{s}.bin")
+        args.append(f"--binding={W}/q{s}.bin")
     args += [f"--output={4 + p}={W}/out{p}.bin" for p in range(mc)]
     r = subprocess.run(args, capture_output=True, text=True, env=hrx_paths.env(), timeout=600)
     if r.returncode:

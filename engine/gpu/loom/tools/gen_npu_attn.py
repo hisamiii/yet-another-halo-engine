@@ -2,16 +2,18 @@
 """Emit the NPU prefill attention kernel (XDNA2 array program + core leaves, Loom low asm) for loom-compile.
 
 One call: 2 mc cores (mc pairs, mc <= 16) each hold 16 query rows of one KV head and stream the same nb K / V records
-(the 4 multicast streams: K / V x lower / upper half of a record). A body = one K record (32 keys): QK round S = Q K^T + C
-(bfp16ebs8 MMAs, f32 chains from the row constants C), the S blocks parked, softmaxed one body later (P = 2^(U - 128),
-one accumulator, pushed as bfp16), and one 64-step P.V round of the P of the 16 bodies before (O += P V). Each core of
+(the 4 multicast streams: K / V x lower / upper half of a record; each streams the call's payloads, bindings 4 + mc ..,
+then the KV head's records, bindings 0 .. 3, which every call of the head shares: HRX patch 0068's constrain.prefix).
+A body = one K record (32 keys): QK round S = Q K^T + C (bfp16ebs8 MMAs, f32 chains from the row constants C), the S
+blocks parked, softmaxed one body later (P = 2^(U - 128), one accumulator, pushed as bfp16), and one 64-step P.V round
+of the P of the 16 bodies before (O += P V). Each core of
 a pair receives one half of every K / V record (the lower / upper 64 fragments) and reads the other half from its
 partner's tile; a token channel keeps the pair in step. Row sums l = sum P ride as an MMA chain against half-ones
 fragments. Records, scales and the unpack: npu_attn_check.py.
 
 The kernel covers K records -1 .. 16 (G - 1) + 14 for nb = 16 (G + 1) (record -1 = the park's start, P = 1 a key; the
 GPU takes the keys after them). The cores read nb from the payload (park 1's first word in record 0), so one image serves
-every nb up to the one it was built for: patch_nb() rewrites the 4 stream lengths of its command words.
+every nb up to the one it was built for: patch_nb() rewrites the 4 record lengths of its command words.
 
 The layout is fixed by the Loom planner switches in LOOM_ENV (pinned ring records, bank map npu_attn_banks.txt, the
 locked-body planner controls of engine/hrx/patches 0059-0067). Leaves are scheduled by npu_attn_sched.py's model
@@ -832,7 +834,7 @@ def leaf(mc, pair, half):
 
 def array_program(mc, nb):
     mcf = mc + (1 - mc % 2)
-    nk, nv = mcf + nb + 1, mcf + nb + 1
+    nk, nv = mcf + nb + 1, mcf + nb + 1                  # a channel's records: the call's payloads, then the KV head's
     S_ = "reg<aie2p.array.scalar : index>"
     ty_ = lambda kind, n_: f"reg<aie2p.array.{kind} : tile<{n_}xi32>>"
     H = ["aie2p.target<array> @array_target", "aie2p.target<core> @core_target", "",
@@ -848,8 +850,10 @@ def array_program(mc, nb):
         he(f"constrain.location %k{w_}, %c{p_ % 8}, %r{(2 if p_ < 8 else 4) + h_}")
     for s, nm in enumerate(("klo", "khi", "vlo", "vhi")):
         wd, nr, port = (KB // 4, "nk", 0) if s < 2 else (VB // 4, "nv", 2)
-        he(f'%b{nm} = binding {s}, "read"')
-        he(f"%a{nm} = sender %b{nm}, 0 : {ty_('sender', f'1x{nk if s < 2 else nv}x{wd}')}")
+        he(f'%b{nm} = binding {s}, "read"')                # the records (nb + 1)
+        he(f'%p{nm} = binding {4 + mc + s}, "read"')       # the payload prefix (mcf), HRX patch 0068
+        he(f"%pb{nm} = constant.u32 {mcf * (KB if s < 2 else VB)} : {S_}")
+        he(f"%a{nm} = sender %b{nm}, 0 : {ty_('sender', f'1x{nk if s < 2 else nv}x{wd}')}")   # the whole stream
         he(f"%x{nm} = partition.sender %a{nm}, %origin, %zero, %one : {ty_('sender', wd)}")
         for p_ in range(mc):
             w_ = 2 * p_ + s % 2
@@ -858,6 +862,7 @@ def array_program(mc, nb):
             he(f"constrain.leaf_sync %c{nm}{w_}")
             if p_ == 0:
                 he(f"constrain.stage %c{nm}{w_}, %c{s % 2}")
+                he(f"constrain.prefix %c{nm}{w_}, %p{nm}, %pb{nm}")
     for p_ in range(mc):
         lo, hi = 2 * p_, 2 * p_ + 1
         he(f'%bo{p_} = binding {4 + p_}, "write"')
@@ -891,14 +896,13 @@ def compile_xdna(loom, xdna):
 
 
 def stream_words(mc, nb):
-    """the 4 stream lengths in i32 words: K (lower, upper), V (lower, upper)"""
-    mcf = mc + (1 - mc % 2)
-    return (mcf + nb + 1) * KB // 4, (mcf + nb + 1) * VB // 4
+    """the record descriptors' lengths in i32 words: K, V (each stream's after its payload prefix)"""
+    return (nb + 1) * KB // 4, (nb + 1) * VB // 4
 
 
 def patch_nb(image, mc, nb_built, nb):
-    """an image built for nb_built bodies, run for nb <= nb_built: rewrites the 4 stream lengths in .xdna.command (the
-    host does the same on each call's invocation bytes; bindings stay sized for nb_built)"""
+    """an image built for nb_built bodies, run for nb <= nb_built: rewrites the 4 record lengths in .xdna.command (the
+    host does the same on each call's invocation bytes; record bindings stay sized for nb_built)"""
     b = bytearray(image)
     shoff, = struct.unpack_from("<I", b, 0x20)
     shentsize, shnum, shstrndx = struct.unpack_from("<HHH", b, 0x2E)

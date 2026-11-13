@@ -4,16 +4,19 @@
 usage: gen_npu_attn_encode.py k|v|q <out.loom> key=value ...   (the parameters of Call)
 
 A call covers KV head g with 2 mc cores of 16 query rows each and nb bodies: the K records of keys k0 .. k0 + 32 M - 1
-(M = 16 (nb / 16 - 1) - 1). Its four stream images (the NPU bindings) are written in place:
-  ks [2 halves][mcf + nb + 1 slots][4608 B]   slots 0 .. mc - 1 payloads (Q), the pad slot (mcf > mc), K records
-  vs [2 halves][mcf + nb + 1 slots][4608 B]   payloads (C, park starts, nb), the pad slot, V records, a dummy (not written)
+(M = 16 (nb / 16 - 1) - 1). Each of its four streams is a payload prefix (the call's) and records (the KV head's,
+shared by every call of the head), all written in place:
+  ks [2 halves][nb + 1][4608 B]    K records
+  vs [2 halves][nb + 1][4608 B]    V records and a dummy (not written)
+  kq [2 halves][mcf][4608 B]       payloads 0 .. mc - 1 (Q), the pad slot (mcf > mc)
+  vq [2 halves][mcf][4608 B]       payloads (C, park starts, nb), the pad slot
 Record and payload formats: npu_attn_check.py. Fragments are bfp16ebs8 as gen_bfp16_encode.emit_encode writes them
 (m = clamp(roundeven(x 2^(133 - E)), -128, 127)).
 
   yah_npuattn_k  (kpool f16 [rows][1024], ptab, ks, kn): one work item per fragment, a workgroup per record (128).
                  Records j >= M are zero. kn[j] = the record's max squared key norm (of the encoded keys).
   yah_npuattn_v  (vpool f16 V^T [4][tiles][256][16], ptab, vs): one work item per fragment, a workgroup per record.
-  yah_npuattn_q  (q, qnw, qeps, kn, ks, vs): a workgroup per core (64 items, one Q fragment each) and one for the pad
+  yah_npuattn_q  (q, qnw, qeps, kn, kq, vq): a workgroup per core (64 items, one Q fragment each) and one for the pad
                  slots. q is the split-norm query of the attention (gen_attn_fa R2P_QSPLIT): f16(q w / 16)
                  [token][24][256], the raw f32 rotary dims [token][24][64] at byte B * 12288, f32 sums of q^2 per 16
                  dims [token][24][16] at B * 18432. The NPU's Q = f16 half x r log2e with r = 1 / rms, the rotary
@@ -60,22 +63,26 @@ class Call:
         assert self.k0 % 32 == 0 and self.pages * PAGE >= self.k0 + 32 * self.M, "the pool pages must hold the keys"
 
     @property
-    def slots(self):
-        """a stream's slots: payloads, the pad, nb + 1 K records (nb V records and a dummy)"""
-        return self.mcf + self.nb + 1
+    def records(self):
+        """a stream's records: nb + 1 K records (nb V records and a dummy)"""
+        return self.nb + 1
 
     def ks_bytes(self):
-        return 2 * self.slots * REC
+        return 2 * self.records * REC
 
     def vs_bytes(self):
-        return 2 * self.slots * REC
+        return 2 * self.records * REC
+
+    def payload_bytes(self):
+        """kq or vq: the payloads and the pad slot of each half"""
+        return 2 * self.mcf * REC
 
     def footprints(self, kind):
         """the bytes each binding's views span, in binding order (hal_run's min sizes)"""
         kn = 4 * max(self.M, 1)
         return {"k": [self.pages * PAGE * 2048, 4 * self.pages, self.ks_bytes(), kn],
                 "v": [KVH * self.pages * PAGE * D * 2, 4 * self.pages, self.vs_bytes()],
-                "q": [self.B * 19968, 4 * D, 4, kn, self.ks_bytes(), self.vs_bytes()]}[kind]
+                "q": [self.B * 19968, 4 * D, 4, kn, self.payload_bytes(), self.payload_bytes()]}[kind]
 
     def grid(self, kind):
         """(workgroups, workgroup size)"""
@@ -160,11 +167,9 @@ def gen_k(c):
         e(f"  %kv{r} = vector.load %kp_flat[%ka{r}] : view<[%nkp]xf16> -> vector<8xf16>")
         e(f"  %kx{r} = scf.select %live, %kv{r}, %zv : vector<8xf16>")
         return f"%kx{r}"
-    e(f"  %slots = index.constant {c.slots} : index")
-    e(f"  %cmcf = index.constant {c.mcf} : index")
+    e(f"  %slots = index.constant {c.records} : index")
     e("  %fo1 = index.mul %s, %slots : index")
-    e("  %fo2 = index.add %fo1, %cmcf : index")
-    e("  %fo3 = index.add %fo2, %wg : index")
+    e("  %fo3 = index.add %fo1, %wg : index")
     e("  %fo4 = index.mul %fo3, %c4608 : index")
     e("  %fo5 = index.mul %f64, %c72 : index")
     e("  %frag = index.add %fo4, %fo5 : index")
@@ -282,13 +287,11 @@ def gen_v(c):
         e(f"  %vv{r} = vector.load %vp_flat[%va{r}] : view<[%nvp]xf16> -> vector<8xf16>")
         e(f"  %vx{r} = scf.select %live, %vv{r}, %zv : vector<8xf16>")
         return f"%vx{r}"
-    e(f"  %slots = index.constant {c.slots} : index")
-    e(f"  %cmcf = index.constant {c.mcf} : index")
+    e(f"  %slots = index.constant {c.records} : index")
     e("  %h = index.div %tid, %c64 : index")
     e("  %f64 = index.rem %tid, %c64 : index")
     e("  %fo1 = index.mul %h, %slots : index")
-    e("  %fo2 = index.add %fo1, %cmcf : index")
-    e("  %fo3 = index.add %fo2, %wg : index")
+    e("  %fo3 = index.add %fo1, %wg : index")
     e("  %fo4 = index.mul %fo3, %c4608 : index")
     e("  %fo5 = index.mul %f64, %c72 : index")
     e("  %frag = index.add %fo4, %fo5 : index")
@@ -307,13 +310,13 @@ def gen_q(c):
     L = []
     e = L.append
     pad = c.mcf > c.mc
-    head(e, "yah_npuattn_q", *c.grid("q"), ("q", "qnw", "qeps", "kn", "ks", "vs"))
+    head(e, "yah_npuattn_q", *c.grid("q"), ("q", "qnw", "qeps", "kn", "kq", "vq"))
     consts(e, 0, 1, 2, 8, 16, 24, 32, 64, 72, 256, REC)
     e(f"  %nq = index.constant {c.B * 19968 // 2} : index")
-    e(f"  %nks = index.constant {c.ks_bytes()} : index")
-    e(f"  %nvs = index.constant {c.vs_bytes()} : index")
+    e(f"  %nkq = index.constant {c.payload_bytes()} : index")
+    e(f"  %nvq = index.constant {c.payload_bytes()} : index")
     e(f"  %nkn = index.constant {max(c.M, 1)} : index")
-    e("  %q_na, %w_na, %e_na, %kn_na, %ks_na, %vs_na = buffer.assume.noalias %q, %qnw, %qeps, %kn, %ks, %vs : "
+    e("  %q_na, %w_na, %e_na, %kn_na, %kq_na, %vq_na = buffer.assume.noalias %q, %qnw, %qeps, %kn, %kq, %vq : "
       "buffer, buffer, buffer, buffer, buffer, buffer")
     e("  %qh_flat = buffer.view %q_na[%base] : buffer -> view<[%nq]xf16>")
     e(f"  %nq32 = index.constant {c.B * 19968 // 4} : index")
@@ -321,8 +324,8 @@ def gen_q(c):
     e("  %w_flat = buffer.view %w_na[%base] : buffer -> view<[%c256]xf32>")
     e("  %e_flat = buffer.view %e_na[%base] : buffer -> view<[%c1]xf32>")
     e("  %kn_flat = buffer.view %kn_na[%base] : buffer -> view<[%nkn]xf32>")
-    e("  %ks_flat = buffer.view %ks_na[%base] : buffer -> view<[%nks]xi8>")
-    e("  %vs_flat = buffer.view %vs_na[%base] : buffer -> view<[%nvs]xi8>")
+    e("  %kq_flat = buffer.view %kq_na[%base] : buffer -> view<[%nkq]xi8>")
+    e("  %vq_flat = buffer.view %vq_na[%base] : buffer -> view<[%nvq]xi8>")
     e(f"  %ncore = index.constant {2 * c.mc} : index")
     e("  %core = index.cmp ult, %wg, %ncore : index")
     e("  scf.if %core {")
@@ -333,10 +336,10 @@ def gen_q(c):
         e("  scf.if %padwg {")
         e("    %zb = scalar.constant 0 : i8")
         e("    %z8 = vector.splat %zb : vector<8xi8>")
-        imgs = (("%ks_flat", "%nks"), ("%vs_flat", "%nvs"))
+        imgs = (("%kq_flat", "%nkq"), ("%vq_flat", "%nvq"))
         for hv, (buf, nb_) in enumerate(imgs):
             for h in range(2):
-                e(f"    %pz{hv}{h} = index.constant {(h * c.slots + c.mc) * REC} : index")
+                e(f"    %pz{hv}{h} = index.constant {(h * c.mcf + c.mc) * REC} : index")
                 for k in range(REC // 8 // 64):
                     e(f"    %pzo{hv}{h}_{k}a = index.constant {8 * 64 * k} : index")
                     e(f"    %pzo{hv}{h}_{k}b = index.mul %tid, %c8 : index")
@@ -467,7 +470,7 @@ def q_core(e, c, nh):
             out.append(f"%qy{r}_{i}")
         x(f"%qrow{r} = vector.from_elements {', '.join(out)} : vector<8xf32>")
         return f"%qrow{r}"
-    x(f"%slots = index.constant {c.slots} : index")
+    x(f"%slots = index.constant {c.mcf} : index")
     x("%wl = index.rem %wg, %c2 : index")
     x("%wp = index.div %wg, %c2 : index")
     x("%fo1 = index.mul %wl, %slots : index")
@@ -475,7 +478,7 @@ def q_core(e, c, nh):
     x("%fo3 = index.mul %fo2, %c4608 : index")
     x("%fo4 = index.mul %tid, %c72 : index")
     x("%frag = index.add %fo3, %fo4 : index")
-    sums = BE.emit_encode(e, load, "%frag", "%ks_flat", "%nks", p="e_", ind="    ", src="f32", norms=True)
+    sums = BE.emit_encode(e, load, "%frag", "%kq_flat", "%nkq", p="e_", ind="    ", src="f32", norms=True)
     # row norms: partials [item][8] -> row 8 rb + r sums its 32 items in d order; kmax: max of kn over the wave
     x("%lb = index.constant 2048 : offset")
     x("%lbuf = buffer.alloca<workgroup> align(16) %lb : buffer")
@@ -522,7 +525,7 @@ def q_core(e, c, nh):
     x("  %c32b = index.mul %tid, %c32 : index")
     x("  %cbo = index.add %vbase, %c32b : index")
     x("  %crb = vector.bitcast %crv : vector<8xf32> to vector<32xi8>")
-    x("  vector.store %crb, %vs_flat[%cbo] : vector<32xi8>, view<[%nvs]xi8>")
+    x("  vector.store %crb, %vq_flat[%cbo] : vector<32xi8>, view<[%nvq]xi8>")
     x("}")
     # park starts: 2 x 8 blocks x 256 B of f32 128 (P = 1 a fake key), nb in park half 1's first word; 16 B a store
     x("%f128 = scalar.constant 128.0 : f32")
@@ -545,7 +548,7 @@ def q_core(e, c, nh):
         else:
             x(f"%pkv{k} = vector.splat %f128 : vector<4xf32>")
         x(f"%pkb{k} = vector.bitcast %pkv{k} : vector<4xf32> to vector<16xi8>")
-        x(f"vector.store %pkb{k}, %vs_flat[%pk{k}] : vector<16xi8>, view<[%nvs]xi8>")
+        x(f"vector.store %pkb{k}, %vq_flat[%pk{k}] : vector<16xi8>, view<[%nvq]xi8>")
 
 
 def parse(argv):

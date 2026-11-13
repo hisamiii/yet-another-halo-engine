@@ -81,7 +81,7 @@ def main():
         kphys[ptab[lp] * PAGE:(ptab[lp] + 1) * PAGE] = kl[lp * PAGE:(lp + 1) * PAGE]
         vphys[:, ptab[lp] * 16:(ptab[lp] + 1) * 16] = vl[:, lp * 16:(lp + 1) * 16]
     fs = {n: os.path.join(W, n) for n in ("kp.bin", "vp.bin", "ptab.bin", "qeps.bin", "ks.bin", "vs.bin", "kn.bin",
-                                         "ks2.bin", "vs2.bin")}
+                                         "kq.bin", "vq.bin")}
     kphys.tofile(fs["kp.bin"])
     vphys.tofile(fs["vp.bin"])
     ptab.tofile(fs["ptab.bin"])
@@ -90,11 +90,13 @@ def main():
                     f"o:{4 * max(c.M, 1)}:{fs['kn.bin']}"])
     gpu(W, c, "v", [f"f:{fs['vp.bin']}", f"f:{fs['ptab.bin']}", f"o:{c.vs_bytes()}:{fs['vs.bin']}"])
     gpu(W, c, "q", [f"f:{prefix}.q", f"f:{prefix}.qnw", f"f:{fs['qeps.bin']}", f"f:{fs['kn.bin']}",
-                    f"io:{fs['ks.bin']}:{fs['ks2.bin']}", f"io:{fs['vs.bin']}:{fs['vs2.bin']}"])
-    ks = np.fromfile(fs["ks2.bin"], np.uint8).reshape(2, c.slots, REC)
-    vs = np.fromfile(fs["vs2.bin"], np.uint8).reshape(2, c.slots, REC)
+                    f"o:{c.payload_bytes()}:{fs['kq.bin']}", f"o:{c.payload_bytes()}:{fs['vq.bin']}"])
+    ks = np.fromfile(fs["ks.bin"], np.uint8).reshape(2, c.records, REC)
+    vs = np.fromfile(fs["vs.bin"], np.uint8).reshape(2, c.records, REC)
+    kpay = np.fromfile(fs["kq.bin"], np.uint8).reshape(2, c.mcf, REC)
+    vpay = np.fromfile(fs["vq.bin"], np.uint8).reshape(2, c.mcf, REC)
     kn = np.fromfile(fs["kn.bin"], f32)
-    for n in ("kp.bin", "vp.bin", "ks.bin", "vs.bin"):
+    for n in ("kp.bin", "vp.bin"):
         os.remove(fs[n])
     bad = 0
 
@@ -120,7 +122,7 @@ def main():
     for name, img, recs in (("K", ks, Kr), ("V", vs, Vr)):
         want = np.stack([np.stack([NC.frag_bytes(m[64 * h:64 * h + 64], e[64 * h:64 * h + 64]) for m, e in recs])
                          for h in range(2)])
-        got = img[:, c.mcf:c.mcf + len(recs)]
+        got = img[:, :len(recs)]
         nbad = int((got != want).sum())
         bad += nbad
         print(f"{name} records: {nbad} of {got.size} bytes differ")
@@ -157,7 +159,7 @@ def main():
         refs.append(P @ Vf / P.sum(1, keepdims=True))
         qr = q * (NC.L2E / 16.0)
         qf = np.stack([qr[8 * rb:8 * rb + 8, 8 * d:8 * d + 8] for d in range(32) for rb in range(2)])
-        m, e = frags(ks[w % 2, w // 2])
+        m, e = frags(kpay[w % 2, w // 2])
         Qs.append((m, e))
         x = qf.reshape(64, 8, 8) / np.exp2(e - 133.0)[..., None]
         er = np.abs(x - m)
@@ -169,23 +171,25 @@ def main():
         rmax = max(rmax, float(er[:16].max()))
         qb = NC.decode(m, e)
         qn = np.array([np.linalg.norm(np.concatenate([qb[2 * d + r // 8][r % 8] for d in range(32)])) for r in range(16)])
-        C = vs[w % 2, w // 2, :512].view(f32).reshape(2, 8, 8)
+        C = vpay[w % 2, w // 2, :512].view(f32).reshape(2, 8, 8)
         Cs.append(C.copy())
         cw = (248.5 - qn * kmax).reshape(2, 8, 1)
         cer = max(cer, float(np.abs(C - cw).max()))
-        park = vs[w % 2, w // 2, 512:].view(f32).copy()
+        park = vpay[w % 2, w // 2, 512:].view(f32).copy()
         nbw = park[512:513].view(np.uint32)[0]
         park[512] = 128.0
         bad += int((park != 128.0).sum()) + (nbw != c.nb)
-    pad = int(ks[:, c.mc:c.mcf].sum()) + int(vs[:, c.mc:c.mcf].sum())
+    pad = int(kpay[:, c.mc:c.mcf].sum()) + int(vpay[:, c.mc:c.mcf].sum())
     print(f"Q: {qexp} exponents differ from float64 ({rexp} rotary ones by 1 allowed), {qoff} mantissas (dims 64 ..) "
           f"off by more than rounding, rotary dims max {rmax:.2f} steps; C max |err| {cer:.2e}; "
           f"pad slot nonzero bytes {pad}")
     bad += qexp + qoff + (rmax > 3) + pad + (cer > 1e-3)
     # the GPU's bytes must be exactly what npu_attn_check.streams builds from the parsed inputs
     inp = dict(Qs=Qs, Cs=Cs, K=Kr, V=Vr, ref=refs)
-    st = NC.streams(inp, c.mc, c.nb, c.nb)
-    rb = sum(int((st[s] != (ks if s < 2 else vs)[s % 2].reshape(-1)).sum()) for s in range(4))
+    recs, pays = NC.streams(inp, c.mc, c.nb, c.nb)
+    rb = sum(int((recs[s][:c.records * REC - (s >= 2) * REC] !=
+                  (ks if s < 2 else vs)[s % 2].reshape(-1)[:c.records * REC - (s >= 2) * REC]).sum()) +
+             int((pays[s] != (kpay if s < 2 else vpay)[s % 2].reshape(-1)).sum()) for s in range(4))
     print(f"streams rebuilt from the parsed inputs: {rb} bytes differ")
     bad += rb
     def pk(fr):
