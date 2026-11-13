@@ -6,7 +6,7 @@ usage: gen_npu_attn_encode.py k|v|q <out.loom> key=value ...   (the parameters o
 A call covers KV head g with 2 mc cores of 16 query rows each and nb bodies: the K records of keys k0 .. k0 + 32 M - 1
 (M = 16 (nb / 16 - 1) - 1). Its four stream images (the NPU bindings) are written in place:
   ks [2 halves][mcf + nb + 1 slots][4608 B]   slots 0 .. mc - 1 payloads (Q), the pad slot (mcf > mc), K records
-  vs [2 halves][mcf + nb slots][4608 B]       payloads (C, park starts, nb), the pad slot, V records
+  vs [2 halves][mcf + nb + 1 slots][4608 B]   payloads (C, park starts, nb), the pad slot, V records, a dummy (not written)
 Record and payload formats: npu_attn_check.py. Fragments are bfp16ebs8 as gen_bfp16_encode.emit_encode writes them
 (m = clamp(roundeven(x 2^(133 - E)), -128, 127)).
 
@@ -59,11 +59,16 @@ class Call:
         assert self.nb % 16 == 0 and self.nb >= 32 and 1 <= self.mc <= 16 and 0 <= self.g < KVH
         assert self.k0 % 32 == 0 and self.pages * PAGE >= self.k0 + 32 * self.M, "the pool pages must hold the keys"
 
+    @property
+    def slots(self):
+        """a stream's slots: payloads, the pad, nb + 1 K records (nb V records and a dummy)"""
+        return self.mcf + self.nb + 1
+
     def ks_bytes(self):
-        return 2 * (self.mcf + self.nb + 1) * REC
+        return 2 * self.slots * REC
 
     def vs_bytes(self):
-        return 2 * (self.mcf + self.nb) * REC
+        return 2 * self.slots * REC
 
     def footprints(self, kind):
         """the bytes each binding's views span, in binding order (hal_run's min sizes)"""
@@ -155,7 +160,7 @@ def gen_k(c):
         e(f"  %kv{r} = vector.load %kp_flat[%ka{r}] : view<[%nkp]xf16> -> vector<8xf16>")
         e(f"  %kx{r} = scf.select %live, %kv{r}, %zv : vector<8xf16>")
         return f"%kx{r}"
-    e(f"  %slots = index.constant {c.mcf + c.nb + 1} : index")
+    e(f"  %slots = index.constant {c.slots} : index")
     e(f"  %cmcf = index.constant {c.mcf} : index")
     e("  %fo1 = index.mul %s, %slots : index")
     e("  %fo2 = index.add %fo1, %cmcf : index")
@@ -277,7 +282,7 @@ def gen_v(c):
         e(f"  %vv{r} = vector.load %vp_flat[%va{r}] : view<[%nvp]xf16> -> vector<8xf16>")
         e(f"  %vx{r} = scf.select %live, %vv{r}, %zv : vector<8xf16>")
         return f"%vx{r}"
-    e(f"  %slots = index.constant {c.mcf + c.nb} : index")
+    e(f"  %slots = index.constant {c.slots} : index")
     e(f"  %cmcf = index.constant {c.mcf} : index")
     e("  %h = index.div %tid, %c64 : index")
     e("  %f64 = index.rem %tid, %c64 : index")
@@ -328,10 +333,10 @@ def gen_q(c):
         e("  scf.if %padwg {")
         e("    %zb = scalar.constant 0 : i8")
         e("    %z8 = vector.splat %zb : vector<8xi8>")
-        imgs = (("%ks_flat", "%nks", c.mcf + c.nb + 1), ("%vs_flat", "%nvs", c.mcf + c.nb))
-        for hv, (buf, nb_, slots) in enumerate(imgs):
+        imgs = (("%ks_flat", "%nks"), ("%vs_flat", "%nvs"))
+        for hv, (buf, nb_) in enumerate(imgs):
             for h in range(2):
-                e(f"    %pz{hv}{h} = index.constant {(h * slots + c.mc) * REC} : index")
+                e(f"    %pz{hv}{h} = index.constant {(h * c.slots + c.mc) * REC} : index")
                 for k in range(REC // 8 // 64):
                     e(f"    %pzo{hv}{h}_{k}a = index.constant {8 * 64 * k} : index")
                     e(f"    %pzo{hv}{h}_{k}b = index.mul %tid, %c8 : index")
@@ -462,7 +467,7 @@ def q_core(e, c, nh):
             out.append(f"%qy{r}_{i}")
         x(f"%qrow{r} = vector.from_elements {', '.join(out)} : vector<8xf32>")
         return f"%qrow{r}"
-    x(f"%slots = index.constant {c.mcf + c.nb + 1} : index")
+    x(f"%slots = index.constant {c.slots} : index")
     x("%wl = index.rem %wg, %c2 : index")
     x("%wp = index.div %wg, %c2 : index")
     x("%fo1 = index.mul %wl, %slots : index")
@@ -511,8 +516,7 @@ def q_core(e, c, nh):
     x("  %cb = scalar.constant 248.5 : f32")
     x("  %cr = scalar.subf %cb, %qk : f32")
     x("  %crv = vector.splat %cr : vector<8xf32>")
-    x(f"  %vslots = index.constant {c.mcf + c.nb} : index")
-    x("  %vo1 = index.mul %wl, %vslots : index")
+    x("  %vo1 = index.mul %wl, %slots : index")
     x("  %vo2 = index.add %vo1, %wp : index")
     x("  %vbase = index.mul %vo2, %c4608 : index")
     x("  %c32b = index.mul %tid, %c32 : index")
@@ -524,8 +528,7 @@ def q_core(e, c, nh):
     x("%f128 = scalar.constant 128.0 : f32")
     x(f"%nbw = scalar.constant {c.nb} : i32")
     x("%nbf = scalar.bitcast %nbw : i32 to f32")
-    x(f"%pvb1 = index.constant {c.mcf + c.nb} : index")
-    x("%pvb2 = index.mul %wl, %pvb1 : index")
+    x("%pvb2 = index.mul %wl, %slots : index")
     x("%pvb3 = index.add %pvb2, %wp : index")
     x("%pvb4 = index.mul %pvb3, %c4608 : index")
     x("%c512 = index.constant 512 : index")

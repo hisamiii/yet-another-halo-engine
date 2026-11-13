@@ -15,8 +15,9 @@ m 2^(E - 133), one exponent a row of 8):
                     over K record r = 16(n - 1) - 1 + bs, keys 16s + 8kp ..: [8 dims 16rp + 8dp ..][8 keys] (zeros for
                     r < 0 or r >= M)
 Record 0 of each stream is the payload of each core (Q | C | the park starts 2 x 8 x 256 B of f32 128 = P 1 a fake key;
-nb in park half 1's first word), then 1 zero record if mc is even, then nb + 1 K records / nb V records, each stream
-carrying the lower or the upper 64 fragments. Output a pair: 34 KB records, core h at 17 KB h: O [16 rp][4 c = 2dp + rbp]
+nb in park half 1's first word), then 1 zero record if mc is even, then nb + 1 K records / nb V records and a dummy
+(any bytes: every ring then ends a call on copy 0, so calls chain as continuations), each stream carrying the lower or
+the upper 64 fragments. Output a pair: 34 KB records, core h at 17 KB h: O [16 rp][4 c = 2dp + rbp]
 [8][8] f32, then t1, t0 (cycles) and at + 640 the l block [8][8] (cols 0-3 rows 0-7, 4-7 rows 8-15, x 2^-63).
 """
 import argparse
@@ -245,7 +246,7 @@ def streams(inp, mc, nb, nb_built):
         st[s] += [np.zeros(G.KB, np.uint8)] * (mcf - mc)
         rec = inp["K"][:nb + 1] if s < 2 else inp["V"][:nb]
         st[s] += [frag_bytes(m[64 * h:64 * h + 64], e[64 * h:64 * h + 64]) for m, e in rec]
-        full = (mcf + nb_built + 1) * G.KB if s < 2 else (mcf + nb_built) * G.VB
+        full = (mcf + nb_built + 1) * (G.KB if s < 2 else G.VB)
         b = np.concatenate(st[s])
         st[s] = np.concatenate([b, np.zeros(full - b.size, np.uint8)])
     return st

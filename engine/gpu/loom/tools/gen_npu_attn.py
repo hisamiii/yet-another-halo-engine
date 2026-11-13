@@ -807,6 +807,10 @@ def leaf(mc, pair, half):
             return []
         cloop("egr", 32, [], rbody)
     e("%one1 = mova.i32 1")
+    e("%am1v = mova.i32 -1")                         # the stream's last V record (a dummy): every ring then ends a
+    e("acq %am1v, 2"); e("rel %one1, 2")             # call on copy 0, where the next call (a continuation) starts
+    if half == 1:                                    # the token credit the lower core's first acquire took (setup
+        e("rel %one1, 4")                            # holds one): back for the next call
     for p_ in (0, 2):
         e(f"rel %one1, {p_}")
     e("return")
@@ -828,7 +832,7 @@ def leaf(mc, pair, half):
 
 def array_program(mc, nb):
     mcf = mc + (1 - mc % 2)
-    nk, nv = mcf + nb + 1, mcf + nb
+    nk, nv = mcf + nb + 1, mcf + nb + 1
     S_ = "reg<aie2p.array.scalar : index>"
     ty_ = lambda kind, n_: f"reg<aie2p.array.{kind} : tile<{n_}xi32>>"
     H = ["aie2p.target<array> @array_target", "aie2p.target<core> @core_target", "",
@@ -889,7 +893,7 @@ def compile_xdna(loom, xdna):
 def stream_words(mc, nb):
     """the 4 stream lengths in i32 words: K (lower, upper), V (lower, upper)"""
     mcf = mc + (1 - mc % 2)
-    return (mcf + nb + 1) * KB // 4, (mcf + nb) * VB // 4
+    return (mcf + nb + 1) * KB // 4, (mcf + nb + 1) * VB // 4
 
 
 def patch_nb(image, mc, nb_built, nb):

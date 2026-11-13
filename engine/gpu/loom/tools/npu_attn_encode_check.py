@@ -91,8 +91,8 @@ def main():
     gpu(W, c, "v", [f"f:{fs['vp.bin']}", f"f:{fs['ptab.bin']}", f"o:{c.vs_bytes()}:{fs['vs.bin']}"])
     gpu(W, c, "q", [f"f:{prefix}.q", f"f:{prefix}.qnw", f"f:{fs['qeps.bin']}", f"f:{fs['kn.bin']}",
                     f"io:{fs['ks.bin']}:{fs['ks2.bin']}", f"io:{fs['vs.bin']}:{fs['vs2.bin']}"])
-    ks = np.fromfile(fs["ks2.bin"], np.uint8).reshape(2, c.mcf + c.nb + 1, REC)
-    vs = np.fromfile(fs["vs2.bin"], np.uint8).reshape(2, c.mcf + c.nb, REC)
+    ks = np.fromfile(fs["ks2.bin"], np.uint8).reshape(2, c.slots, REC)
+    vs = np.fromfile(fs["vs2.bin"], np.uint8).reshape(2, c.slots, REC)
     kn = np.fromfile(fs["kn.bin"], f32)
     for n in ("kp.bin", "vp.bin", "ks.bin", "vs.bin"):
         os.remove(fs[n])
