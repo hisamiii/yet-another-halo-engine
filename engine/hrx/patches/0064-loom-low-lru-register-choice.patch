@@ -1,0 +1,156 @@
+Loom: opt-in LOOM_EXP_LRU=<register class>,... gives values of those classes the location freed longest ago, so
+hoisted pops and loads of a locked body can land early. Unset: emits byte-identical.
+diff --git a/loom/src/loom/codegen/low/allocation/search.c b/loom/src/loom/codegen/low/allocation/search.c
+--- a/loom/src/loom/codegen/low/allocation/search.c
++++ b/loom/src/loom/codegen/low/allocation/search.c
+@@ -6,6 +6,7 @@
+ 
+ #include "loom/codegen/low/allocation/search.h"
+ 
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "iree/base/internal/math.h"
+@@ -488,6 +489,63 @@ static bool loom_low_allocation_search_hard_relations_conflict(
+   return false;
+ }
+ 
++// EXPERIMENT (opt-in): LOOM_EXP_LRU=<class name>,... gives a value of these
++// register classes the legal location freed longest ago instead of the lowest
++// one, so a locked body's hoisted pops and loads can land early (the register
++// event frontier holds a write behind the last read of the location's old
++// value).
++static bool loom_low_allocation_search_uses_lru(
++    const loom_low_descriptor_set_t* descriptor_set, uint16_t reg_class_id) {
++  static const char* list = (const char*)1;
++  if (list == (const char*)1) {
++    list = getenv("LOOM_EXP_LRU");
++  }
++  if (!list || reg_class_id >= descriptor_set->reg_class_count) {
++    return false;
++  }
++  const iree_string_view_t name = loom_low_descriptor_set_string(
++      descriptor_set,
++      descriptor_set->reg_classes[reg_class_id].name_string_ref);
++  for (const char* p = list; *p;) {
++    const char* comma = strchr(p, ',');
++    const iree_host_size_t n =
++        comma ? (iree_host_size_t)(comma - p) : strlen(p);
++    if (n == name.size && memcmp(p, name.data, n) == 0) {
++      return true;
++    }
++    if (!comma) {
++      break;
++    }
++    p = comma + 1;
++  }
++  return false;
++}
++
++// The latest end point of an earlier value of reg_class_id that overlaps
++// [base, base + unit_count) and ends by start_point (0: none).
++static uint32_t loom_low_allocation_search_lru_score(
++    const loom_low_allocation_assignment_map_t* assignment_map,
++    uint16_t reg_class_id, bool same_class_only, uint32_t base,
++    uint32_t unit_count, uint32_t start_point) {
++  uint32_t score = 0;
++  for (iree_host_size_t i = 0; i < assignment_map->assignment_count; ++i) {
++    const loom_low_allocation_assignment_t* assignment =
++        &assignment_map->assignments[i];
++    if (same_class_only &&
++        assignment->descriptor_reg_class_id != reg_class_id) {
++      continue;
++    }
++    if (assignment->location_base + assignment->location_count <= base ||
++        assignment->location_base >= base + unit_count) {
++      continue;
++    }
++    if (assignment->end_point <= start_point && assignment->end_point > score) {
++      score = assignment->end_point;
++    }
++  }
++  return score;
++}
++
+ bool loom_low_allocation_search_assignment_conflicts(
+     loom_low_allocation_search_context_t* context,
+     const loom_low_allocation_assignment_t* candidate,
+@@ -780,6 +838,8 @@ loom_low_allocation_search_find_explicit_physical_register_for_release_policy(
+                       : descriptor_set->physical_register_view_count;
+   const bool needs_first_candidate =
+       loom_low_allocation_search_has_pressure_release_records(context);
++  const bool uses_lru =
++      loom_low_allocation_search_uses_lru(descriptor_set, reg_class_id);
+   for (uint32_t i = 0; i < candidate_count; ++i) {
+     uint32_t physical_register_id = 0;
+     uint32_t candidate_ordinal = 0;
+@@ -850,6 +910,23 @@ loom_low_allocation_search_find_explicit_physical_register_for_release_policy(
+         out_choice->found
+             ? iree_min(out_choice->first_candidate_ordinal, candidate_ordinal)
+             : candidate_ordinal;
++    if (uses_lru) {
++      // LOOM_EXP_LRU: rank by when the register's last earlier value ended.
++      uint32_t score = 0;
++      const loom_low_allocation_assignment_map_t* assignment_map =
++          context->assignment_map;
++      for (iree_host_size_t k = 0; k < assignment_map->assignment_count; ++k) {
++        const loom_low_allocation_assignment_t* assignment =
++            &assignment_map->assignments[k];
++        if (assignment->location_base == physical_register_id &&
++            assignment->end_point <= candidate_template->start_point &&
++            assignment->end_point > score) {
++          score = assignment->end_point;
++        }
++      }
++      packing_rank = score;
++      candidate_ordinal = score;
++    }
+     if (loom_low_allocation_search_explicit_choice_is_better(
+             domain_reserved, tier, preference_penalty, domain_penalty,
+             packing_rank, candidate_ordinal, out_choice)) {
+@@ -873,7 +950,7 @@ loom_low_allocation_search_find_explicit_physical_register_for_release_policy(
+     // indexed lookup.
+     if (unit_count == 1 && !domain_reserved && preference_penalty == 0 &&
+         tier == query->tier_limit && domain_penalty == 0 &&
+-        !needs_first_candidate) {
++        !needs_first_candidate && !uses_lru) {
+       return;
+     }
+   }
+@@ -989,6 +1066,36 @@ bool loom_low_allocation_search_find_free_location(
+                 (uint32_t)reg_class->allocatable_count,
+                 capacity.is_bounded ? capacity.max_units : UINT32_MAX)
+           : 0;
++  if (!uses_explicit_physical_registers &&
++      !loom_low_allocation_search_has_pressure_release_records(context) &&
++      loom_low_allocation_search_uses_lru(context->descriptor_set,
++                                          capacity.descriptor_reg_class_id)) {
++    // LOOM_EXP_LRU: the legal base whose last earlier value ended first.
++    uint32_t best_base = UINT32_MAX, best_score = UINT32_MAX;
++    for (uint32_t base = 0; base <= last_base;) {
++      loom_low_allocation_search_location_choice_t choice = {0};
++      loom_low_allocation_search_find_location_for_release_policy(
++          context, &candidate_template, &query, base, last_base, alignment,
++          scalar_packing_frontier,
++          LOOM_LOW_ALLOCATION_STORAGE_RELEASE_FORBIDDEN, &choice);
++      if (!choice.found || choice.base < base) {
++        break;
++      }
++      const uint32_t score = loom_low_allocation_search_lru_score(
++          context->assignment_map, capacity.descriptor_reg_class_id,
++          /*same_class_only=*/true, choice.base, interval->unit_count,
++          interval->start_point);
++      if (score < best_score) {
++        best_score = score;
++        best_base = choice.base;
++      }
++      base = choice.base + alignment;
++    }
++    if (best_base != UINT32_MAX) {
++      *out_base = best_base;
++      return true;
++    }
++  }
+   if (!uses_explicit_physical_registers &&
+       loom_low_allocation_search_has_pressure_release_records(context)) {
+     const loom_low_allocation_storage_release_policy_t policy =
