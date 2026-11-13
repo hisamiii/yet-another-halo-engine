@@ -1,0 +1,111 @@
+Loom: opt-in LOOM_EXP_RING_AT=<bytes>@<offset>[:<offset>...],... pins a compute tile's ring records at fixed
+offsets (a leaf layout that keeps DMA fills off its dense banks). Unset: emits byte-identical.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+@@ -19,6 +19,84 @@ static void loom_aie2p_array_channel_resources_initialize_probe(
+   out_probe->bank_cursors = probe_bank_cursors;
+ }
+ 
++// EXPERIMENT (opt-in): LOOM_EXP_RING_AT=<bytes>@<offset>[:<offset>...],...
++// places a ring of <bytes> records, one record at each listed owner offset (as
++// many records as offsets), in a 64 KB compute tile: a fixed leaf layout whose
++// generator keeps it collision-free.
++// Entries of one size are taken in list order: an entry whose records' banks
++// are already filled past its offsets (an earlier ring of that size took it) is
++// skipped.
++static bool loom_aie2p_array_ring_at(const loom_xdna_tile_facts_t* facts,
++                                     const uint32_t* bank_cursors,
++                                     uint32_t byte_length,
++                                     uint32_t record_count,
++                                     uint32_t* out_offsets) {
++  const uint32_t bank_capacity =
++      facts->memory.local_capacity / facts->memory.bank_count;
++  const char* value = getenv("LOOM_EXP_RING_AT");
++  if (!value || facts->memory.local_capacity != 65536u) {
++    return false;
++  }
++  while (*value) {
++    char* end = NULL;
++    const unsigned long bytes = strtoul(value, &end, 0);
++    if (!end || *end != '@') {
++      return false;
++    }
++    uint32_t n = 0, offsets[16];
++    do {
++      const unsigned long offset = strtoul(end + 1, &end, 0);
++      if (n < 16) {
++        offsets[n] = (uint32_t)offset;
++      }
++      ++n;
++    } while (*end == ':');
++    bool taken = false;
++    for (uint32_t i = 0; i < n && i < 16; ++i) {
++      if (bank_cursors[offsets[i] / bank_capacity] >
++          offsets[i] % bank_capacity) {
++        taken = true;
++      }
++    }
++    if (bytes == byte_length && n == record_count && n <= 16 && !taken) {
++      for (uint32_t i = 0; i < n; ++i) {
++        if (offsets[i] + bytes > facts->memory.local_capacity) {
++          return false;
++        }
++        out_offsets[i] = offsets[i];
++      }
++      return true;
++    }
++    if (*end != ',') {
++      return false;
++    }
++    value = end + 1;
++  }
++  return false;
++}
++
++static void loom_aie2p_array_ring_at_commit(const loom_xdna_tile_facts_t* facts,
++                                            uint32_t offset, uint32_t bytes,
++                                            uint32_t* bank_cursors,
++                                            uint8_t* next_bank) {
++  const uint32_t bank_capacity =
++      facts->memory.local_capacity / facts->memory.bank_count;
++  const uint32_t first = offset / bank_capacity,
++                 last = (offset + bytes - 1u) / bank_capacity;
++  const loom_aie2p_array_local_memory_proposal_t proposal = {
++      .owner_offset = offset,
++      .ending_bank_cursor = offset + bytes - last * bank_capacity,
++      .first_bank = (uint8_t)first,
++      .last_bank = (uint8_t)last,
++  };
++  const uint32_t keep_last = bank_cursors[last];
++  loom_aie2p_array_local_memory_commit(facts, &proposal, bank_cursors,
++                                       next_bank);
++  if (keep_last > bank_cursors[last]) {
++    bank_cursors[last] = keep_last;  // (records committed out of address order)
++  }
++}
++
+ static loom_aie2p_array_channel_resource_failure_t
+ loom_aie2p_array_channel_resources_propose_ring_from_probe(
+     loom_aie2p_array_tile_resources_t* probe,
+@@ -60,6 +138,20 @@ loom_aie2p_array_channel_resources_propose_ring_from_probe(
+       record_count = 0;
+     }
+   }
++  {
++    uint32_t pinned[16];
++    if (record_count <= 16 &&
++        loom_aie2p_array_ring_at(probe->facts, probe->bank_cursors,
++                                 record_byte_length, record_count, pinned)) {
++      for (uint16_t record = 0; record < record_count; ++record) {
++        loom_aie2p_array_ring_at_commit(probe->facts, pinned[record],
++                                        record_byte_length, probe->bank_cursors,
++                                        &probe->next_bank);
++        proposal.owner_offsets[record] = pinned[record];
++      }
++      record_count = 0;
++    }
++  }
+   if (contiguous && record_count != 0) {   // plain contiguous (or banked fallback)
+     // slot_pitch (>= record_byte_length): slots that far apart, each sending its leading record bytes
+     const uint32_t pitch = slot_pitch ? slot_pitch : record_byte_length;
