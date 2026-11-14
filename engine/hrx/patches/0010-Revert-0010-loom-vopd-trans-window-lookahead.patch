@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:56:52 +0100
-Subject: [PATCH 10/73] Revert "0010-loom-vopd-trans-window-lookahead"
+Subject: [PATCH 10/75] Revert "0010-loom-vopd-trans-window-lookahead"
 
 This reverts commit f8bb6127c5c511584bfc2f4c6111314d0b9117ed.
 ---

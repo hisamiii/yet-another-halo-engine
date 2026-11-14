@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 34/73] 0032-loom-kernel-priority
+Subject: [PATCH 34/75] 0032-loom-kernel-priority
 
 Loom: kernel.priority {level = N}, the issue priority of the current subgroup, lowered on AMDGPU to s_setprio.
 The descriptor is an ordered execution barrier, so a pair of kernel.priority ops brackets the target instructions

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:08 +0100
-Subject: [PATCH 58/73] 0066-loom-xdna-pinned-ring-records
+Subject: [PATCH 58/75] 0066-loom-xdna-pinned-ring-records
 
 Loom: opt-in LOOM_EXP_RING_AT=<bytes>@<offset>[:<offset>...],... pins a compute tile's ring records at fixed
 offsets (a leaf layout that keeps DMA fills off its dense banks). Unset: emits byte-identical.

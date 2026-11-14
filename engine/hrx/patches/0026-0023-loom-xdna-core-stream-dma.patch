@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 26/73] 0023-loom-xdna-core-stream-dma
+Subject: [PATCH 26/75] 0023-loom-xdna-core-stream-dma
 
 Core-to-core streams own no DMA (Loom AIE2P array plans): a routed channel between two workers' core stream ports
 (constrain.core_stream) took a compute memory-to-stream and stream-to-memory channel from the array's budget although

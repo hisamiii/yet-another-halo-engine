@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:07 +0100
-Subject: [PATCH 55/73] 0061-loom-sticky-status-writes-skip-issue-order
+Subject: [PATCH 55/75] 0061-loom-sticky-status-writes-skip-issue-order
 
 Loom: the physical issuer orders sticky status writes (OR-accumulating flags such as srFPFlags) like ordinary
 writes, though the schedule graph already treats them as commutative; a softmax MAC waited 4 cycles on an earlier FP op's flag

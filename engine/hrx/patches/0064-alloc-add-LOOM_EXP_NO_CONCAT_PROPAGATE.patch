@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 18:53:08 +0100
-Subject: [PATCH 64/73] alloc : add LOOM_EXP_NO_CONCAT_PROPAGATE
+Subject: [PATCH 64/75] alloc : add LOOM_EXP_NO_CONCAT_PROPAGATE
 
 Inferred concat affinity makes AIE2P GEMM decoders spill; opt-out keeps authored chains only.
 ---

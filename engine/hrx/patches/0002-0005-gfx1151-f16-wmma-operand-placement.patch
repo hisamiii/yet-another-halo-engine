@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:05 +0100
-Subject: [PATCH 02/73] 0005-gfx1151-f16-wmma-operand-placement
+Subject: [PATCH 02/75] 0005-gfx1151-f16-wmma-operand-placement
 
 Qualify the f16 WMMA (v_wmma_f32_16x16x16_f16, wave32, gfx1151) for matrix-operand register placement (#1160), which
 upstream enables for bf16 only: spreads each WMMA's operands over the register banks. Prefill GEMM cycles -2.6%, bit-identical.

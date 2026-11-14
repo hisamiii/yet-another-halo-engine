@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:07 +0100
-Subject: [PATCH 52/73] 0059-loom-cse-keeps-concat-pieces
+Subject: [PATCH 52/75] 0059-loom-cse-keeps-concat-pieces
 
 Loom: low CSE keeps a duplicate producer whose results only feed low.concat pieces when one of those concats also
 consumes the existing producer's result and the concat's result lives in explicit physical registers (AIE2P). Merging

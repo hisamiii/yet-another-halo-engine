@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:50:52 +0100
+Subject: [PATCH 75/75] loom : pair VOPD inside TRANS-result windows when no
+ read relies on it
+
+Port of pin patch 0010 onto main's trans_result_window.
+
+Assisted-by: Claude Opus 5.5
+---
+ .../amdgpu/planning/trans_result_window.c     | 23 +++++
+ .../amdgpu/planning/trans_result_window.h     |  8 ++
+ .../target/arch/amdgpu/planning/vopd_plan.c   | 98 ++++++++++++++++++-
+ 3 files changed, 128 insertions(+), 1 deletion(-)
+
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/trans_result_window.c b/loom/src/loom/target/arch/amdgpu/planning/trans_result_window.c
+index 57b3753b47..902ae6fc85 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/trans_result_window.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/trans_result_window.c
+@@ -275,3 +275,26 @@ bool loom_amdgpu_trans_result_window_query_assignment_origin(
+   }
+   return false;
+ }
++
++bool loom_amdgpu_trans_result_window_snapshot(
++    const loom_amdgpu_trans_result_window_t* window, uint32_t capacity,
++    uint32_t* out_registers, uint8_t* out_valu_intervals,
++    uint8_t* out_trans_intervals, uint32_t* out_count) {
++  *out_count = 0;
++  if (!loom_amdgpu_trans_result_window_has_active(window)) {
++    return true;
++  }
++  if (window->active_register_count > capacity) {
++    return false;
++  }
++  const uint32_t* active_register_indices =
++      loom_amdgpu_trans_result_window_active_register_indices(window);
++  for (uint32_t i = 0; i < window->active_register_count; ++i) {
++    const uint32_t register_index = active_register_indices[i];
++    out_registers[i] = register_index;
++    out_valu_intervals[i] = window->entries[register_index].valu_interval;
++    out_trans_intervals[i] = window->entries[register_index].trans_interval;
++  }
++  *out_count = window->active_register_count;
++  return true;
++}
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/trans_result_window.h b/loom/src/loom/target/arch/amdgpu/planning/trans_result_window.h
+index c3d6a09331..2360f9a4d3 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/trans_result_window.h
++++ b/loom/src/loom/target/arch/amdgpu/planning/trans_result_window.h
+@@ -82,6 +82,14 @@ void loom_amdgpu_trans_result_window_record_assignment(
+     loom_amdgpu_trans_result_window_t* window,
+     const loom_low_allocation_assignment_t* assignment, uint32_t origin);
+ 
++// Copies the active physical VGPRs and their VALU / TRANS packet distances
++// since production into the caller's arrays. Returns false (copying nothing)
++// when more than |capacity| registers are active.
++bool loom_amdgpu_trans_result_window_snapshot(
++    const loom_amdgpu_trans_result_window_t* window, uint32_t capacity,
++    uint32_t* out_registers, uint8_t* out_valu_intervals,
++    uint8_t* out_trans_intervals, uint32_t* out_count);
++
+ // Returns true when a physical-VGPR |assignment| overlaps an active window and
+ // stores its origin in |out_origin|. Requires TRACK_ORIGINS initialization.
+ bool loom_amdgpu_trans_result_window_query_assignment_origin(
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
+index b4d4134571..af901a9190 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
+@@ -1193,6 +1193,100 @@ static void loom_amdgpu_vopd_commit_static_packet(
+       quiescent_boundary);
+ }
+ 
++static bool loom_amdgpu_vopd_assignment_overlaps_vgpr(
++    const loom_low_allocation_assignment_t* assignment, uint32_t vgpr_index) {
++  return assignment != NULL &&
++         assignment->location_kind ==
++             LOOM_LOW_ALLOCATION_LOCATION_PHYSICAL_REGISTER &&
++         assignment->descriptor_reg_class_id == LOOM_AMDGPU_REG_CLASS_ID_VGPR &&
++         vgpr_index >= assignment->location_base &&
++         vgpr_index < (uint64_t)assignment->location_base +
++                          assignment->location_count;
++}
++
++// A pair inside an active TRANS-result window is safe unless a later packet
++// reads an active TRANS result without an ALU wait in front of it. The wait
++// plan gives every read within MAX_VALU_INTERVAL VALU and MAX_TRANS_INTERVAL
++// TRANS packets of its producer that wait; later reads rely on the distance.
++// Fusing k pairs shortens a distance D to D - k >= D / 2, so reads at an
++// uncompressed VALU distance above 2 * MAX_VALU_INTERVAL + 1 stay safe. The walk
++// drops a VGPR there, after a second TRANS or when it is overwritten, and stops
++// at an ALU wait, a vector memory packet (both clear every window, as in
++// advance_trans_result_packet) or the block end. Later pairs run the same check,
++// so no read that relies on the distance loses it.
++static bool loom_amdgpu_vopd_trans_window_pair_is_safe(
++    const loom_amdgpu_vopd_plan_builder_t* builder,
++    const loom_low_schedule_block_t* block,
++    iree_host_size_t first_packet_index) {
++  enum { kMaxTracked = 64 };
++  uint32_t vgprs[kMaxTracked];
++  uint8_t valu[kMaxTracked], trans[kMaxTracked];
++  uint32_t count = 0;
++  if (!loom_amdgpu_trans_result_window_snapshot(&builder->trans_result_window,
++                                                kMaxTracked, vgprs, valu,
++                                                trans, &count)) {
++    return false;
++  }
++  const uint32_t horizon =
++      2u * LOOM_AMDGPU_VALU_TRANS_USE_DEPCTR_MAX_VALU_INTERVAL + 1u;
++  const iree_host_size_t block_end =
++      block->scheduled_node_start + block->scheduled_node_count;
++  const loom_low_descriptor_set_t* descriptor_set =
++      builder->schedule->target.descriptor_set;
++  for (iree_host_size_t p = first_packet_index; p < block_end && count != 0;
++       ++p) {
++    const loom_amdgpu_vopd_packet_flags_t flags = builder->packet_flags[p];
++    if (iree_any_bit_set(flags,
++                         LOOM_AMDGPU_VOPD_PACKET_FLAG_TRANS_RESULT_CLEAR)) {
++      return true;
++    }
++    if (iree_any_bit_set(flags, LOOM_AMDGPU_VOPD_PACKET_FLAG_TRANSPARENT)) {
++      continue;
++    }
++    const loom_low_packet_view_t packet =
++        loom_low_packet_at(builder->schedule, p);
++    if (packet.descriptor == NULL || packet.node->op == NULL) continue;
++    const loom_amdgpu_descriptor_traits_t traits =
++        loom_amdgpu_descriptor_traits(descriptor_set, packet.descriptor);
++    if (iree_any_bit_set(traits, LOOM_AMDGPU_DESCRIPTOR_TRAIT_VECTOR_MEMORY)) {
++      return true;
++    }
++    for (uint16_t o = 0; o < packet.node->operand_count; ++o) {
++      const loom_low_allocation_assignment_t* assignment =
++          loom_low_packet_operand_assignment(builder->allocation, &packet, o);
++      for (uint32_t i = 0; i < count; ++i) {
++        if (loom_amdgpu_vopd_assignment_overlaps_vgpr(assignment, vgprs[i])) {
++          return false;  // a read that relies on the distance
++        }
++      }
++    }
++    const bool is_valu =
++        iree_any_bit_set(traits, LOOM_AMDGPU_DESCRIPTOR_TRAIT_VECTOR_ALU);
++    const bool is_trans =
++        iree_any_bit_set(traits, LOOM_AMDGPU_DESCRIPTOR_TRAIT_TRANSCENDENTAL);
++    for (uint32_t i = 0; i < count;) {
++      bool drop = (is_valu && ++valu[i] > horizon) ||
++                  (is_trans &&
++                   ++trans[i] >
++                       LOOM_AMDGPU_VALU_TRANS_USE_DEPCTR_MAX_TRANS_INTERVAL);
++      for (uint16_t r = 0; r < packet.node->result_count && !drop; ++r) {
++        drop = loom_amdgpu_vopd_assignment_overlaps_vgpr(
++            loom_low_packet_result_assignment(builder->allocation, &packet, r),
++            vgprs[i]);
++      }
++      if (drop) {
++        --count;
++        vgprs[i] = vgprs[count];
++        valu[i] = valu[count];
++        trans[i] = trans[count];
++        continue;
++      }
++      ++i;
++    }
++  }
++  return true;
++}
++
+ static iree_status_t loom_amdgpu_vopd_plan_block(
+     loom_amdgpu_vopd_plan_builder_t* builder, uint16_t block_index,
+     const loom_low_schedule_block_t* block) {
+@@ -1228,7 +1322,9 @@ static iree_status_t loom_amdgpu_vopd_plan_block(
+       first = second;
+       continue;
+     }
+-    if (loom_amdgpu_vopd_has_active_trans_result_window(builder)) {
++    if (loom_amdgpu_vopd_has_active_trans_result_window(builder) &&
++        !loom_amdgpu_vopd_trans_window_pair_is_safe(
++            builder, block, first.packet.packet_index)) {
+       loom_amdgpu_vopd_append_rejection(
+           builder, &first.packet, &second.packet, &analysis,
+           LOOM_AMDGPU_VOPD_REJECTION_REASON_TRANS_RESULT_WINDOW);

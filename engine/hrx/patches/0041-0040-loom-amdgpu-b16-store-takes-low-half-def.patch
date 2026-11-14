@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 41/73] 0040-loom-amdgpu-b16-store-takes-low-half-def
+Subject: [PATCH 41/75] 0040-loom-amdgpu-b16-store-takes-low-half-def
 
 Loom: a 16-bit VGPR store writes bits 0..15 of its data register only, so a payload defined by a low-half write
 (v_cvt_f16_f32 to .l and friends) is stored as it is. The store lowering cleared the upper half first with

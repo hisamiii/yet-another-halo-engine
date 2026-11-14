@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:07 +0100
-Subject: [PATCH 56/73] 0063-loom-low-generator-asserted-effect-relaxations
+Subject: [PATCH 56/75] 0063-loom-low-generator-asserted-effect-relaxations
 
 Loom: opt-in effect-order relaxations for hand-scheduled AIE2P bodies whose generator proves them
 (LOOM_EXP_NOALIAS_ACC=2 vector loads vs stores, LOOM_EXP_NOWAR_ACC=1 accumulator stores vs loads,

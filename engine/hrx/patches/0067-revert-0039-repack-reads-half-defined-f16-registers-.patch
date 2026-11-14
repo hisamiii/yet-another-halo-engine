@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hisamiii <265242552+hisamiii@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 19:18:38 +0100
-Subject: [PATCH 67/73] revert 0039 : repack reads half-defined f16 registers
+Subject: [PATCH 67/75] revert 0039 : repack reads half-defined f16 registers
  on main
 
 ds_swizzle needs the full register; main rejects the low-half def (DOMINANCE/011).

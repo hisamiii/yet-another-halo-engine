@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 18:07:05 +0100
-Subject: [PATCH 23/73] 0020 : route multicast core streams through route trees
+Subject: [PATCH 23/75] 0020 : route multicast core streams through route trees
 
 ---
  loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c | 4 ++--

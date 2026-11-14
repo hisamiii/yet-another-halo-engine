@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hisamiii <265242552+hisamiii@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 19:17:36 +0100
-Subject: [PATCH 66/73] sync : add LOOM_EXP_WAVE_ROLE_BARRIERS for wave role
+Subject: [PATCH 66/75] sync : add LOOM_EXP_WAVE_ROLE_BARRIERS for wave role
  branches
 
 Workgroup barriers under wave-uniform control pass when the source opts in.

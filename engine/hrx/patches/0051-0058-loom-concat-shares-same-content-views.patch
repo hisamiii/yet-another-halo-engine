@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:07 +0100
-Subject: [PATCH 51/73] 0058-loom-concat-shares-same-content-views
+Subject: [PATCH 51/75] 0058-loom-concat-shares-same-content-views
 
 Loom: a concat result may share registers with an already placed concat or slice result when every shared unit holds
 the same producer's unit (followed back through concat and slice relations) and neither value is written in place

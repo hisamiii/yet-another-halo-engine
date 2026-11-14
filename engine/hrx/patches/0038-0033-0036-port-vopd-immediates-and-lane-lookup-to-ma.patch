@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 18:13:04 +0100
-Subject: [PATCH 38/73] 0033-0036 : port vopd immediates and lane lookup to
+Subject: [PATCH 38/75] 0033-0036 : port vopd immediates and lane lookup to
  main
 
 ---

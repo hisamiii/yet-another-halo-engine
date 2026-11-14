@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hisamiii <265242552+hisamiii@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 21:17:54 +0100
-Subject: [PATCH 69/73] alloc : add LOOM_EXP_BUDGET for a register class budget
+Subject: [PATCH 69/75] alloc : add LOOM_EXP_BUDGET for a register class budget
 
 Assisted-by: Claude Opus 5.5
 ---

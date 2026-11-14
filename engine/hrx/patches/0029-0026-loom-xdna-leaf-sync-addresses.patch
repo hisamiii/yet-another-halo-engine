@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 29/73] 0026-loom-xdna-leaf-sync-addresses
+Subject: [PATCH 29/75] 0026-loom-xdna-leaf-sync-addresses
 
 Two Loom AIE2P array fixes for leaf-synchronized channels (yah gen_npu_gemm ghelp: a helper core decodes a K row and
 sends its records to the head through a leaf-synced neighbor-memory ring):
