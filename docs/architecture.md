@@ -4,7 +4,7 @@ The engine runs one model (Qwen3.8-27B as a llama.cpp GGUF, run in the GGUF's ow
 
 This page describes the model, the prefill pipeline, the decode step, the data layouts and the HAL sets. Numbers are in [results.md](results.md), measured hardware facts in [hardware.md](hardware.md).
 
-Until 2026-10-20 the engine also ran the IQ4_XS GGUF model natively (11 quant formats, tile GEMMs with per-format decoders, afrag GEMMs, a tuner) and split every large prefill GEMM with the NPU; the tag `pre-cleanup-2026-10-20` has that path and branch `npu` the NPU history. From 2026-10-13 the engine ran hipfire's MQ4 HFQ file, and from 2026-10-25 GGUFs converted to MQ4 at load; from 2026-10-25 to 2026-11-08 the NPU took part of the A4 prefill's FFN (an FFN block over chunk pairs). Since 2026-11-08 the native GGUF sets run again, with the NPU split. On 2026-11-14 the MQ4 path (the HFQ file, the conversion, A4 and W4A16 prefill, the rotated decode, MTP speculative decoding) was removed; commit be687da is the last with it.
+The native GGUF sets are the only path. Older paths are in git: the first native engine at tag `pre-cleanup-2026-10-20` (its NPU history on branch `npu`), and the MQ4 path (hipfire's HFQ file, A4 prefill, MTP speculative decoding) at commit be687da, the last before its removal on 2026-11-14.
 
 ## The model
 
