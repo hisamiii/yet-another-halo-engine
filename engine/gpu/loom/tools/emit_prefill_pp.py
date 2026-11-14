@@ -2133,7 +2133,10 @@ def main():
     print("emitted %d GEMM + fixed prefill HALs for B=%d (tile=%d, token_tiles=%d)"
           % (n, B, TILE, TT))
     if npu_halves(B) and not EMIT_HALF:
-        env = {k: v for k, v in os.environ.items() if k != "YAH_NPU_FFNBLK"}
+        # the halves run the plain 2 x 32 attention per half chunk (LoomPrefill RunAttentionHalves): no 2 x 64, key
+        # split or NPU attention forms
+        drop = {"YAH_NPU_FFNBLK", "YAH_ATTN_W64", "YAH_ATTN_KSPLIT", "YAH_NPU_ATTN", "YAH_NPU_ATTN_FROM"}
+        env = {k: v for k, v in os.environ.items() if k not in drop}
         env.update(YAH_EMIT_HALF="1", YAH_CTX=str(T))
         subprocess.run([sys.executable, os.path.abspath(__file__), model, os.path.join(outdir, "h"), str(B // 2)], env=env, check=True)
 
