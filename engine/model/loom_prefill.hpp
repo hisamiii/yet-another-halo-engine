@@ -211,7 +211,6 @@ class LoomPrefill {
     const auto g = geom_.find("npuattn");
     if (!npu || g == geom_.end())
       throw LoomError("prefill: the set has no NPU attention (emit_prefill_pp YAH_NPU_ATTN)");
-    if (npu_) throw LoomError("prefill: a set splits either the GEMMs or the attention with the NPU");
     if (!kv_paged_) throw LoomError("prefill: the NPU attention needs paged pools");
     na_kvn_ = g->second.tokens, na_nbs_ = g->second.rowgrp, na_from_ = g->second.tt;
     if (na_from_ == 0 || NaReady(full_) > 1024) throw LoomError("prefill: npuattn row out of range");
@@ -368,26 +367,33 @@ class LoomPrefill {
       return;
     }
     chunk_graph_->Launch();
-    if (!na_jobs_.empty()) {
-      try {
-        for (const auto& [ai, nb] : na_jobs_) npu_attn_->Enqueue(nb, NaReady(ai), NaReady(ai) + 1, na_seq_, "attn");
-      } catch (...) {
-        gpu_.Synchronize();  // the graph's waits time out (the sticky status word): it reads the NPU's buffers
-        throw;
-      }
-      na_jobs_.clear();
-    }
     jobs.swap(flagged_);
     if (npu_ && npu_->Prof() && !jobs.empty() && prof_tags_.empty())   // the first NPU chunk's jobs (ReportNpuProf)
       for (const auto& q : jobs) prof_tags_.push_back(q.tag);
-    if (!jobs.empty()) {
+    // in recording order: each attention job after the GEMM jobs recorded before it (the two NPU contexts run in the
+    // order their commands were built, LoomNpu::SetPeer)
+    std::size_t from = 0;
+    auto gemm_to = [&](std::size_t to) {
+      if (to <= from) return;
       try {
-        npu_->Enqueue(jobs);   // on a failure it releases the graph's waits for the jobs left
+        npu_->Enqueue({jobs.begin() + from, jobs.begin() + to});   // on a failure it releases the graph's waits
       } catch (...) {
         gpu_.Synchronize();   // the graph reads NPU buffers: it must end before anyone frees them
         throw;
       }
+      from = to;
+    };
+    for (const NaJob& j : na_jobs_) {
+      gemm_to(j.after);
+      try {
+        npu_attn_->Enqueue(j.nb, NaReady(j.ai), NaReady(j.ai) + 1, na_seq_, "attn");
+      } catch (...) {
+        gpu_.Synchronize();  // the graph's waits time out (the sticky status word): it reads the NPU's buffers
+        throw;
+      }
     }
+    na_jobs_.clear();
+    gemm_to(jobs.size());
   }
 
   // The 64 layers of chunk ci, in dispatch order.
@@ -1593,7 +1599,8 @@ class LoomPrefill {
         0b110000);
     graph_->AtomicStore(NaWord(NaReady(ai)), na_seq_, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
                         {Ref(*na_.ks), Ref(*na_.vs), Ref(*na_.kq), Ref(*na_.vq)}, {});
-    na_jobs_.push_back({ai, nb});
+    na_jobs_.push_back({ai, nb, flagged_.size()});
+    if (npu_on_) npu_->AfterForeignCommand();   // the GEMM split's next job follows this one on the array
   }
 
   // af: the afrag form, input normt_ (fragment-major)
@@ -2445,7 +2452,8 @@ class LoomPrefill {
   bool RunAttentionHalves(std::uint32_t l, std::uint32_t ci, const std::string& pre, const KvHook& hook, bool q_af,
                           bool k_af, bool v_af, bool q_npu) {
     const std::string wq = pre + "attn_q.weight", wo = pre + "attn_output.weight";
-    if (!HalvesOn() || hook || !kv_paged_ || !paged_f16k_ || !paged_f16v_ || !rope_kpaged_ || !kv16_scratch_ || kdeq_ ||
+    if (!HalvesOn() || (npu_attn_ && ci >= na_from_) || hook || !kv_paged_ || !paged_f16k_ || !paged_f16v_ ||
+        !rope_kpaged_ || !kv16_scratch_ || kdeq_ ||
         qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || gsig_ || qsplit_ ||
         (q_npu ? DcolImage(wq, nullptr, true).empty() : !HalfOutOk(wo, Af("gemm_kres", wo))))
       return false;
@@ -2554,7 +2562,11 @@ class LoomPrefill {
   NpuAttn* npu_attn_ = nullptr;
   NpuAttn::Buffers na_{};
   std::uint32_t na_kvn_ = 0, na_nbs_ = 0, na_from_ = 0, na_seq_ = 0;
-  std::vector<std::pair<std::uint32_t, std::uint32_t>> na_jobs_;
+  struct NaJob {
+    std::uint32_t ai, nb;
+    std::size_t after;   // the chunk's GEMM split jobs recorded before it (flagged_)
+  };
+  std::vector<NaJob> na_jobs_;
   std::size_t ksplit_bytes_ = 0;
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records

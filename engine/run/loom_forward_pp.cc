@@ -166,18 +166,21 @@ int main(int argc, char** argv) {
     const std::string mtp = "blk." + std::to_string(cfg.main_block_count()) + ".";
     // --npu with the GEMM split: the GPU reads the resident copy in place (the NPU reads its rows through host
     // pointers; the whole copy stays, pinned). The NPU attention reads no weights: its sets upload as without --npu.
-    const bool npu_attn_set = [&] {
+    // a set may split the GEMMs (npusplit_ / npuffnblk rows), the attention (npuattn) or both
+    bool npu_attn_set = false, npu_gemm_set = false;
+    {
       std::ifstream f(std::string(argv[2]) + "/dispatch.txt");
-      for (std::string row; std::getline(f, row);)
-        if (row.rfind("npuattn ", 0) == 0) return true;
-      return false;
-    }();
+      for (std::string row; std::getline(f, row);) {
+        if (row.rfind("npuattn ", 0) == 0) npu_attn_set = true;
+        if (row.rfind("npusplit_", 0) == 0 || row.rfind("npuffnblk ", 0) == 0) npu_gemm_set = true;
+      }
+    }
     LoomWeights weights(
         gpu, gguf,
         [&](const std::string& n) {
           return (n == "token_embd.weight" && opt.gen == 0) || n.starts_with(mtp);
         },
-        opt.npu && !npu_attn_set);
+        opt.npu && (npu_gemm_set || !npu_attn_set));
     lap("weights");
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
     lap("prefill set");
@@ -185,7 +188,7 @@ int main(int argc, char** argv) {
     yah::model::DpmPin dpm;  // the NPU split's (the level restored after the NPU stops)
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
     std::unique_ptr<yah::model::LoomNpuAttn> npu_attn;  // an NPU attention set's (dispatch.txt npuattn)
-    if (opt.npu && pf.npu_attn_set()) {                 // (no DPM pin: LoomNpuAttn)
+    if (opt.npu && pf.npu_attn_set() && !npu_gemm_set) {   // (no DPM pin: LoomNpuAttn)
       npu_attn = std::make_unique<yah::model::LoomNpuAttn>(gpu);
       pf.EnableNpuAttn(npu_attn.get());
       lap("npu enable");
@@ -201,6 +204,11 @@ int main(int argc, char** argv) {
       }
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
       pf.EnableNpu(npu.get());
+      if (pf.npu_attn_set()) {   // both: two NPU contexts, their commands ordered by the host (LoomNpu::SetPeer)
+        npu_attn = std::make_unique<yah::model::LoomNpuAttn>(gpu);
+        npu->Npu().SetPeer(npu_attn->Npu()), npu_attn->Npu().SetPeer(npu->Npu());
+        pf.EnableNpuAttn(npu_attn.get());
+      }
       lap("npu enable");
       // full chunks only: every split GEMM leaves the NPU's rows to the NPU, so the model rows its own copies replace
       // (pre-decoded / transcoded rows) are not kept

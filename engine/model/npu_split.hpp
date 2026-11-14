@@ -77,6 +77,9 @@ class NpuSplit {
   virtual Job NewJob(const std::vector<std::uint32_t>& calls) = 0;
   // Before a chunk's first NewJob: decoder-column sets restart the job count per chunk (and per image family run).
   virtual void BeginChunk() {}
+  // Another kind of NPU command (the NPU attention's) ran since the last job: the array's next GEMM job starts after an
+  // image setup, so the gate's job count restarts there (decoder-column sets).
+  virtual void AfterForeignCommand() {}
   // After the calls are bound (the caller's binding pass): images whose commands the calls hold as copies free their
   // command storage (the NPU's command memory is ~64 MB per process); a later new bind loads its image again.
   virtual void EndBinding() {}

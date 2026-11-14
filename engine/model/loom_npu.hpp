@@ -131,6 +131,9 @@ class LoomNpu {
     attn_thread_ = std::thread([this] { AttnSubmitter(); });
     packets_ = &CreateShared(kPacketBytes, true);   // here: allocating it later would wait for the GPU mid-forward
   }
+  // Another context on the same array whose commands interleave with this one's (both enqueued by one thread), set
+  // before either builds a command.
+  void SetPeer(LoomNpu& peer) { peer_ = peer.counts_; }
   LoomNpu(const LoomNpu&) = delete;
   LoomNpu& operator=(const LoomNpu&) = delete;
   ~LoomNpu() {
@@ -147,7 +150,7 @@ class LoomNpu {
     reap_cv_.notify_all();
     attn_cv_.notify_all();
     if (attn_thread_.joinable()) attn_thread_.join();
-    for (const AttnPending& q : attn_queue_) Fail({q.job});
+    for (const AttnPending& q : attn_queue_) Fail(q.jobs);
     if (reaper_.joinable()) reaper_.join();
     // the array first: after its last job a gated image's head keeps polling its flag words (and writing its tick
     // scratch) for the rest of its supply, and streamed fills stay armed; with the IOMMU in passthrough a page freed
@@ -517,6 +520,7 @@ class LoomNpu {
       resident = resident_ == a.k->image_key && !idle;
       resident_ = a.k->image_key, resident_dec_ = -1;
     }
+    if (PeerRan()) resident = false;   // the other context's commands ran on the array in between
     if (!resident) program_.Forget(), ++epoch_;  // a full setup outside FusedCommand
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
@@ -549,8 +553,10 @@ class LoomNpu {
     AttnPending p;
     p.command = Place(bytes);
     p.ready = job.ready, p.ready_value = job.ready_value;
-    p.job = GatedJob{{}, job.done, job.done_value, job.tag, job.calls.size()};
+    p.jobs = {GatedJob{{}, job.done, job.done_value, job.tag, job.calls.size()}};
     p.t0 = t0;
+    p.peer_need = PeerNeed();
+    ++counts_->built;
     {
       std::lock_guard<std::mutex> lock(mu_);
       attn_queue_.push_back(std::move(p));
@@ -566,13 +572,13 @@ class LoomNpu {
   // sequence restarts there, NpuSplit::BeginChunk).
   void EnqueueGated(std::vector<GatedJob> jobs, bool fresh = false) {
     CheckHealth();
-    AttnQueued();
     const auto t0 = std::chrono::steady_clock::now();
     {
       // Idle past the device's autosuspend delay, the NPU may have been powered down: the array kept nothing, so the
       // next setups write whole programs (as after a failure)
       std::lock_guard<std::mutex> lock(mu_);
-      if (retired_ == submitted_ && active_.time_since_epoch().count() && t0 - active_ > suspend_after_) {
+      if (retired_ == submitted_ && attn_queue_.empty() && active_.time_since_epoch().count() &&
+          t0 - active_ > suspend_after_) {
         resident_ = nullptr;
         resident_dec_ = -1;
         program_lost_ = true;
@@ -583,6 +589,10 @@ class LoomNpu {
     const void* family = k->family ? k->family : k->image_key;
     bool resident = false;
     int dec = -1;
+    if (PeerRan()) {   // the other context's commands ran on the array: its state is theirs now, set up in full
+      std::lock_guard<std::mutex> lock(mu_);
+      resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, lane_lost_ = true, ++epoch_;
+    }
     {
       std::lock_guard<std::mutex> lock(mu_);
       resident = resident_ == family;
@@ -595,7 +605,15 @@ class LoomNpu {
     } else if (!resident) {
       program_.Forget();   // a full setup outside FusedCommand
       ++epoch_;
-      YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k->first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
+      bool queued = false;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        queued = !attn_queue_.empty() || PeerBehind(PeerNeed());
+      }
+      if (queued)   // behind waiting attention commands: in order, not waited for
+        SubmitOrdered(k->first, {}, t0);
+      else
+        YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k->first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
       std::lock_guard<std::mutex> lock(mu_);
       resident_ = family;
       dec = resident_dec_ = k->dec;
@@ -614,13 +632,7 @@ class LoomNpu {
       recording_->jobs.push_back(jobs);
       recording_->family = fused.family, recording_->dec = fused.dec;
     }
-    const std::uint64_t submission = Submit(command);
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      pending_.push_back({submission, std::move(jobs), t0});
-      ++submitted_;
-    }
-    reap_cv_.notify_one();
+    SubmitOrdered(command, std::move(jobs), t0);
   }
   // Command replay. A command's bytes depend only on its jobs and on the array state it starts from (DeltaSetup's
   // program memory and read-only data, the family and decoder set up), and a sequence of commands leaves the state of
@@ -669,16 +681,11 @@ class LoomNpu {
   // submitted.
   void Replay(const Script& s, std::size_t& queued) {
     CheckHealth();
-    AttnQueued();
     for (std::size_t i = 0; i < s.commands.size(); ++i) {
-      const auto t0 = std::chrono::steady_clock::now();
-      const std::uint64_t submission = Submit(s.commands[i]);
+      SubmitOrdered(s.commands[i], s.jobs[i], std::chrono::steady_clock::now(), true);
       std::lock_guard<std::mutex> lock(mu_);
-      pending_.push_back({submission, s.jobs[i], t0});
-      ++submitted_, ++commands_.replayed;
       resident_ = s.family, resident_dec_ = s.dec;
       queued += s.jobs[i].size();
-      reap_cv_.notify_one();
     }
   }
   void Free(Script& s) {
@@ -1129,6 +1136,28 @@ class LoomNpu {
   std::size_t packets_used_ = 0;
   std::unordered_map<std::string, std::uint64_t> packet_index_;
   std::atomic<bool> program_lost_{false};
+  // The peer's commands ran since the last family setup (EnqueueGated): the next one writes the packet lane's switches
+  // itself (no control packets). Engine thread only.
+  bool lane_lost_ = false;
+  // A second context on the same array (a GEMM split's and an NPU attention's, SetPeer): the host orders the two. Each
+  // command records the peer's commands enqueued so far (peer_need) and is submitted only once the peer retired them,
+  // and a command after the peer's commands sets its image up in full (the peer's ran on the array in between).
+  struct Counts {   // commands built / retired (setups included); shared, so neither context outlives the other's
+    std::atomic<std::uint64_t> built{0}, retired{0};
+  };
+  const std::shared_ptr<Counts> counts_ = std::make_shared<Counts>();
+  std::shared_ptr<const Counts> peer_;   // SetPeer
+  std::uint64_t peer_seen_ = 0;          // the peer's built count when this side last built a command (engine thread)
+  // true if the peer built commands since this side's last one
+  bool PeerRan() {
+    if (!peer_) return false;
+    const std::uint64_t n = peer_->built.load();
+    if (n == peer_seen_) return false;
+    peer_seen_ = n;
+    return true;
+  }
+  std::uint64_t PeerNeed() const { return peer_ ? peer_->built.load() : 0; }
+  bool PeerBehind(std::uint64_t need) const { return peer_ && peer_->retired.load() < need; }
   std::atomic<std::uint64_t> epoch_{0};   // Epoch
   Script* recording_ = nullptr;           // Record
   std::vector<std::pair<amdf_memory_t*, amdf_host_mapping_t*>> scripts_;   // sealed scripts' storage
@@ -1152,7 +1181,9 @@ class LoomNpu {
       int queued = 0, since = 0;
       if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
         if (k0->setup.empty()) throw LoomError("npu: a job switches image families without a setup");
-        append(DeltaSetup(k0->setup.data(), k0->setup.size(), true));
+        // after the peer's commands (another image's routes on the array) the setup writes every switch itself
+        append(DeltaSetup(k0->setup.data(), k0->setup.size(), !lane_lost_));
+        lane_lost_ = false;
         fam = FamilyOf(k0), dec = k0->dec;
       }
       append(calls[0]->gate);
@@ -1242,21 +1273,45 @@ class LoomNpu {
     return submission;
   }
 
-  // Attention commands (EnqueueAttn) wait here, built, for their ready words; the thread submits them in order.
+  // Attention commands (EnqueueAttn) wait here, built, for their ready words; the thread submits them in order. A
+  // command built while attention commands wait (EnqueueGated, Replay, a setup: ready null) queues behind them, so the
+  // NPU runs every command in the order it was built; so does one waiting for the peer's earlier commands (SetPeer).
   struct AttnPending {
     amdf_xdna_kernel_command_t command{};
     volatile std::uint32_t* ready = nullptr;
     std::uint32_t ready_value = 0;
-    GatedJob job;
+    std::vector<GatedJob> jobs;
     std::chrono::steady_clock::time_point t0;
+    std::uint64_t peer_need = 0;   // the peer's commands to retire first (PeerNeed)
   };
   std::deque<AttnPending> attn_queue_;  // under mu_
   std::condition_variable attn_cv_;
   std::thread attn_thread_;
   bool attn_gpu_done_ = false;  // under mu_ (Drain)
-  void AttnQueued() {
+  // Submits a command now, or queues it behind waiting attention commands or the peer's commands built before it (the
+  // same thread enqueues all of them, so the queue cannot fill between the check and the submit). jobs empty: a setup
+  // (the reaper counts it as a command).
+  void SubmitOrdered(const amdf_xdna_kernel_command_t& command, std::vector<GatedJob> jobs,
+                     std::chrono::steady_clock::time_point t0, bool replayed = false) {
+    const std::uint64_t need = PeerNeed();
+    ++counts_->built;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!attn_queue_.empty() || PeerBehind(need)) {
+        AttnPending p;
+        p.command = command, p.jobs = std::move(jobs), p.t0 = t0, p.peer_need = need;
+        attn_queue_.push_back(std::move(p));
+        if (replayed) ++commands_.replayed;
+        attn_cv_.notify_one();
+        return;
+      }
+    }
+    const std::uint64_t submission = Submit(command);
     std::lock_guard<std::mutex> lock(mu_);
-    if (!attn_queue_.empty()) throw LoomError("npu: a command would run before queued attention commands");
+    pending_.push_back({submission, std::move(jobs), t0});
+    ++submitted_;
+    if (replayed) ++commands_.replayed;
+    reap_cv_.notify_one();
   }
   // Polls each queued command's ready word (~20 us apart) and submits it. No time limit: the host queues chunks ahead
   // of the GPU, so a ready word can be many seconds away. After any failure, or without ready once the GPU is done
@@ -1276,8 +1331,8 @@ class LoomNpu {
         {
           std::lock_guard<std::mutex> lock(mu_);
           stop = stop_ || !failure_.empty();
-          if (!stop && attn_gpu_done_ && __atomic_load_n(p->ready, __ATOMIC_ACQUIRE) < p->ready_value) {
-            failure_ = "npu: an attention job's ready word never came (" + p->job.tag + ")";
+          if (!stop && p->ready && attn_gpu_done_ && __atomic_load_n(p->ready, __ATOMIC_ACQUIRE) < p->ready_value) {
+            failure_ = "npu: an attention job's ready word never came (" + p->jobs.at(0).tag + ")";
             stop = true;
           }
         }
@@ -1285,13 +1340,14 @@ class LoomNpu {
           ok = false;
           break;
         }
-        if (__atomic_load_n(p->ready, __ATOMIC_ACQUIRE) >= p->ready_value) break;
+        if ((!p->ready || __atomic_load_n(p->ready, __ATOMIC_ACQUIRE) >= p->ready_value) && !PeerBehind(p->peer_need))
+          break;
         std::this_thread::sleep_for(std::chrono::microseconds(20));
       }
       if (!ok) {
         // its done word fails; the commands built after it never run (the array state they expect is not there)
         std::lock_guard<std::mutex> lock(mu_);
-        for (const AttnPending& q : attn_queue_) Fail({q.job});
+        for (const AttnPending& q : attn_queue_) Fail(q.jobs);
         attn_queue_.clear();
         resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, ++epoch_;
         retired_cv_.notify_all();
@@ -1300,7 +1356,7 @@ class LoomNpu {
       const std::uint64_t submission = Submit(p->command);
       {
         std::lock_guard<std::mutex> lock(mu_);
-        pending_.push_back({submission, {p->job}, p->t0});
+        pending_.push_back({submission, std::move(p->jobs), p->t0});
         attn_queue_.pop_front();
         ++submitted_;
       }
@@ -1366,6 +1422,7 @@ class LoomNpu {
       {
         std::lock_guard<std::mutex> lock(mu_);
         ++retired_;
+        ++counts_->retired;
         active_ = std::chrono::steady_clock::now();
       }
       retired_cv_.notify_all();
@@ -1801,6 +1858,13 @@ class LoomNpuSplit : public NpuSplit {
     j.gate = ++seq_ * plan_.gate_calls + static_cast<std::uint32_t>(calls.size());
     return j;
   }
+  // An NPU attention command (the peer context's, LoomNpu::SetPeer) forces the next command's image setup, which
+  // restarts the gate's job count.
+  void AfterForeignCommand() override {
+    if (plan_.dcol) job_family_ = nullptr;
+  }
+  // the NPU context (SetPeer beside an NPU attention's)
+  LoomNpu& Npu() { return npu_; }
   // The chunk's graph clears each job's words after joining it (LoomPrefill::NpuJoin), so they read zero here.
   void BeginChunk() override {
     if (plan_.dcol) job_family_ = nullptr, fresh_ = true;
@@ -1940,6 +2004,8 @@ class LoomNpuAttn : public NpuAttn {
   // No DPM pin (the GEMM split's): on auto the 128K kv8 runs matched the pinned ones bit for bit with no machine checks
   // logged, and the pin's fabric clock costs the GPU ~10% at depth (results.md).
   explicit LoomNpuAttn(LoomDevice& gpu) : npu_(gpu, 8) {}
+  // the NPU context (SetPeer beside a GEMM split's; the split's DPM pin covers both)
+  LoomNpu& Npu() { return npu_; }
   Buffers Setup(const std::string& image, std::uint32_t kvn, std::uint32_t nbs, std::uint32_t B) override {
     if (!calls_.empty()) throw LoomError("npu attention: set up twice");
     constexpr std::size_t kRec = 4608, kOut = 34816, kMc = 16, kMcf = 17;

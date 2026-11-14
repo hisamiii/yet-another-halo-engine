@@ -1700,8 +1700,10 @@ def main():
         # "npuattn <n> <nb built> <first chunk>"; the twins' "ksplit_" rows carry their larger partials
         if npu_kv:
             npu_from = max(int(os.environ.get("YAH_NPU_ATTN_FROM", "0")) or ks_from, ks_from, 1)
-            if NPU_SPLIT or NPU_FFNBLK:
-                sys.exit("YAH_NPU_ATTN: a set splits either the GEMMs or the attention with the NPU")
+            # the NPU's q GEMM rows leave the GPU's kqg GEMM without its split-norm q, and the q encoder's other
+            # layout reads an f16 q the attention's q norm does not keep (it reads the raw f32 q)
+            if NPU_SPLIT.get("q"):
+                sys.exit("YAH_NPU_ATTN: the q encoder reads the split-norm q of the GPU's kqg GEMM: drop q= from YAH_NPU_SPLIT")
         for diag, stem in (("ksstore", "ks"), ("ksmerge", "km")) + ((("ksstore", "ksn"), ("ksmerge", "kmn")) if npu_kv else ()):
             gen_attn_fa.NPU_KV = npu_kv if stem.endswith("n") else 0
             gen_attn_fa.R2P_DIAG.add(diag)
@@ -1878,9 +1880,10 @@ def main():
                 src = os.path.join(tmp, "npua%s_c%d.loom" % (kind, c))
                 open(src, "w").write(gen(call))
                 npua.append((src, "npua%s_c%d.hal" % (kind, c)))
-        src = os.path.join(tmp, "npu_flag_wait.loom")
-        open(src, "w").write(GU.gen_flag_wait())
-        npua.append((src, "npu_flag_wait.hal"))
+        if not (NPU_SPLIT or NPU_FFNBLK):   # (a GEMM split emits the same wait)
+            src = os.path.join(tmp, "npu_flag_wait.loom")
+            open(src, "w").write(GU.gen_flag_wait())
+            npua.append((src, "npu_flag_wait.hal"))
         img = os.path.join(tmp, "npu_attn.loom")
         open(img, "w").write(gen_npu_attn.emit(16, npu_nbs))
         gen_npu_attn.compile_xdna(img, os.path.join(outdir, "npu_attn.xdna"))
