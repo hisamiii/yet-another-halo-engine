@@ -1090,7 +1090,7 @@ def qpf_pass(L, pval_line):
            "  %qwl_view = buffer.view %pool[%qwl_o] : buffer -> view<256xf32>",
            "  view.store %qpwv, %qwl_view[%qpwt] : f32, view<256xf32>",
            "  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)"]   # (all waves, once)
-    pro = ["  %qpzh = vector.constant 0.0 : vector<8xf16>"] + (wcp if R2P_QPFW else []) + [
+    pro = ["  %qpzh = vector.splatf 0.0 : vector<8xf16>"] + (wcp if R2P_QPFW else []) + [
            "  %qpfc1i = index.sub %pun, %c1 : index", "  %qpfi = index.min %pqiu, %qpfc1i : index"] + pro
     drop = set(rawl + kld + kst + list(range(i_e0, i_sb + 1)) + list(range(i_sb + 1, i_xb2 + 1)))
     car = [f"%qcp{k}" for k in range(16)]
@@ -1502,10 +1502,10 @@ def gen():
     e("  %ninf = scalar.constant -3.4028234663852886e+38 : f32")
     e("  %log2e = scalar.constant 1.4426950408889634 : f32")
     e("  %qscale = scalar.constant 0.0625 : f32")
-    e("  %zh8 = vector.constant 0.0 : vector<8xf16>")
-    e(f"  %zeros8 = vector.constant 0.0 : {V8}")
-    e(f"  %zq16 = vector.constant 0.0 : {V16H}")
-    e(f"  %ones8 = vector.constant 1.0 : {V8}")
+    e("  %zh8 = vector.splatf 0.0 : vector<8xf16>")
+    e(f"  %zeros8 = vector.splatf 0.0 : {V8}")
+    e(f"  %zq16 = vector.splatf 0.0 : {V16H}")
+    e(f"  %ones8 = vector.splatf 1.0 : {V8}")
     e(f"  %log2e8 = vector.splat %log2e : {V8}")
     e(f"  %ninf8 = vector.splat %ninf : {V8}")
     e("  %m = index.constant 16 : index")
@@ -2288,7 +2288,7 @@ def gen():
         e("  %qrow = index.add %qrow0, %qhb : index")
         e("  %qsc_v = vector.splat %qscale : " + V4)
         if K4:
-            e(f"  %z4h = vector.constant 0.0 : {V4}")
+            e(f"  %z4h = vector.splatf 0.0 : {V4}")
         e("  %qdb0a = index.mul %qpart, %c64 : index")
         rotq = {}
         if K4:   # H256 of the scaled f32 Q (dims qpart*64 + 8c + 0..7) first
@@ -4172,9 +4172,9 @@ def gen():
     def gsig_decode(f):
         """GSIG: %eg{f} = the loaded gate fragment's sigmoid as f32"""
         if GSIG == "u16":   # u | 0x4B00 << 16 = 2^23 + u; fma(2^23 + u, c, -2^23 c) = round(u c), c = f32(1 / 65535)
-            e(f"  %egk{f} = vector.constant 14.0 : {V8H}")
-            e(f"  %egc{f} = vector.constant 1.5259021893143654e-05 : {V8}")
-            e(f"  %egd{f} = vector.constant -128.001953125 : {V8}")
+            e(f"  %egk{f} = vector.splatf 14.0 : {V8H}")
+            e(f"  %egc{f} = vector.splatf 1.5259021893143654e-05 : {V8}")
+            e(f"  %egd{f} = vector.splatf -128.001953125 : {V8}")
             e(f"  %egi{f} = vector.interleave<0> %eg{f}h, %egk{f} : {V8H}, {V8H} -> vector<16xf16>")
             e(f"  %egx{f} = vector.bitcast %egi{f} : vector<16xf16> to {V8}")
             e(f"  %eg{f} = vector.fmaf %egx{f}, %egc{f}, %egd{f} : {V8}")
@@ -4465,7 +4465,7 @@ def gen_qrot():
     e("  %qrow = index.mul %rowc, %c256 : index")    # [token][head][256]: row-major rows of 256
     e("  %qscale = scalar.constant 0.0625 : f32")
     e(f"  %qsc_v = vector.splat %qscale : {V4}")
-    e(f"  %z4h = vector.constant 0.0 : {V4}")
+    e(f"  %z4h = vector.splatf 0.0 : {V4}")
     e("  %qdb0a = index.mul %qpart, %c64 : index")
     raw = []
     for c in range(8):
@@ -4790,7 +4790,7 @@ def gen_vtrans():
     e("  %r = index.div %tid, %c8 : index")
     e("  %sg0 = index.rem %tid, %c8 : index")
     e("  %sg = index.mul %sg0, %c4 : index")
-    e("  %zh4 = vector.constant 0.0 : vector<4xf16>")
+    e("  %zh4 = vector.splatf 0.0 : vector<4xf16>")
     # load: token tok0 + r, cols col0 + sg .. +3 (zero past the tokens)
     e("  %tok = index.add %tok0, %r : index")
     e("  %live = index.cmp ult, %tok, %ntok : index")

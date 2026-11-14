@@ -79,7 +79,7 @@ def gen(heads):
     e("  %one = scalar.constant 1.0 : f32")
     e("  %zh = scalar.constant 0.0 : f16")
     e("  %negone = scalar.constant -1.0 : f32")
-    e(f"  %zeros8 = vector.constant 0.0 : {V8}")
+    e(f"  %zeros8 = vector.splatf 0.0 : {V8}")
     e("  %m = index.constant 16 : index")
     e("  %n = index.constant 16 : index")
     e("  %k = index.constant 16 : index")

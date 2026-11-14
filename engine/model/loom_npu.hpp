@@ -31,10 +31,11 @@
 
 #include "amdf/amdf.h"
 #include "amdf/xdna.h"
-#include "experimental/xdna/amdf_status.h"
-#include "experimental/xdna/executable.h"
 #include "iree/base/byte_sequence.h"
-#include "iree/hal/drivers/amd/xdna/image/aie2p/npu2.h"
+#include "iree/hal/driver/amd/status.h"
+#include "libhrx/src/libhrx/buffer.h"   // hrx_buffer_s::hal_buffer, for the DMA-BUF export
+#include "iree/hal/driver/amd/xdna/executable_storage.h"
+#include "iree/hal/driver/amd/xdna/image/aie2p/npu2.h"
 #include "model/loom_runtime.hpp"
 #include "model/npu_prof.hpp"
 #include "model/npu_split.hpp"
@@ -123,10 +124,6 @@ class LoomNpu {
     SelectScope();
     OpenEndpoint();
     CreateDevice();
-    // HRX's own libhsa (already loaded) exports its allocations as DMA-BUFs.
-    void* hsa = dlopen("libhsa-runtime64.so.1", RTLD_NOW | RTLD_NOLOAD);
-    if (hsa) export_dmabuf_ = reinterpret_cast<ExportFn>(dlsym(hsa, "hsa_amd_portable_export_dmabuf"));
-    if (!export_dmabuf_) throw LoomError("npu: hsa_amd_portable_export_dmabuf not found");
     reaper_ = std::thread([this] { Reaper(); });
     attn_thread_ = std::thread([this] { AttnSubmitter(); });
     packets_ = &CreateShared(kPacketBytes, true);   // here: allocating it later would wait for the GPU mid-forward
@@ -159,30 +156,33 @@ class LoomNpu {
     if (context_) xdna_->context_destroy(context_), context_ = nullptr;
     for (auto& a : arenas_) {
       api_->host_mapping_destroy(a.map);
-      api_->memory_destroy(a.storage.memory);
+      (void)api_->memory_destroy(a.storage.memory, nullptr);
     }
     for (auto& [memory, map] : scripts_) {
       api_->host_mapping_destroy(map);
-      api_->memory_destroy(memory);
+      (void)api_->memory_destroy(memory, nullptr);
     }
     for (auto& k : kernels_) {
       for (auto* m : k->storage_maps) api_->host_mapping_destroy(m);
-      for (auto& s : k->storage) api_->memory_destroy(s.memory);
+      for (auto& s : k->storage) (void)api_->memory_destroy(s.memory, nullptr);
       for (auto* b : k->buffers) iree_hal_buffer_release(b);
     }
-    for (auto& [key, m] : imports_) api_->memory_destroy(m);
-    for (auto& [key, image] : images_) iree_hal_amd_xdna_image_destroy(image);
+    for (auto& [key, m] : imports_) (void)api_->memory_destroy(m, nullptr);
+    for (auto& [key, image] : images_) iree_hal_amd_xdna_image_free(image);
     for (auto& s : shared_) {
       if (s->external) {
-        api_->memory_destroy(s->native);
+        (void)api_->memory_destroy(s->native, nullptr);
       } else if (s->host) {   // the HRX import first, then the registration, then the pages
         s->gpu.reset();
-        api_->memory_destroy(s->native);
+        (void)api_->memory_destroy(s->native, nullptr);
         munmap(s->host, s->bytes);
       } else {
         close(s->fd);
+        s->gpu.reset();   // before its pool
       }
     }
+    if (export_pool_) hrx_mem_pool_release(export_pool_);
+    if (export_sem_) hrx_semaphore_release(export_sem_);
     if (queue_) api_->kernel_queue_destroy(queue_);
     if (context_) xdna_->context_destroy(context_);
     if (device_) api_->device_destroy(device_);
@@ -212,8 +212,8 @@ class LoomNpu {
       ci.byte_length = s->bytes;
       ci.minimum_alignment = 4096;
       ci.registered_host_pointer = s->host;
-      ci.registered_host_cacheability = AMDF_HOST_CACHEABILITY_WRITE_BACK;
-      YAH_AMDF(api_->memory_create(scope_, &ci, &s->native), "memory_create(registered host)");
+      ci.registered_host_properties = AMDF_HOST_MEMORY_PROPERTY_READ_CACHED | AMDF_HOST_MEMORY_PROPERTY_WRITE_BACK;
+      YAH_AMDF(api_->memory_create(scope_, &ci, &s->native, nullptr), "memory_create(registered host)");
       s->device = s->host;
       s->gpu.size = s->bytes;
       hrx_buffer_params_t params = {};
@@ -227,13 +227,60 @@ class LoomNpu {
       shared_.push_back(std::move(s));
       return *shared_.back();
     }
-    s->gpu = gpu_.Allocate(s->bytes);
+    s->gpu = AllocateExportable(s->bytes);
     gpu_.Fill(s->gpu, 0);
     gpu_.Synchronize();
-    LoomCheck(hrx_buffer_get_device_ptr(s->gpu.handle, &s->device), "hrx_buffer_get_device_ptr");
-    if (export_dmabuf_(s->device, s->bytes, &s->fd, &s->fd_offset) != 0) throw LoomError("npu: dma-buf export");
+    s->device = gpu_.DeviceAddress(s->gpu.handle);
+    ExportDmabuf(*s);
     shared_.push_back(std::move(s));
     return *shared_.back();
+  }
+  // A device buffer whose backing the GPU driver can export as a DMA-BUF. HRX's default sources declare no export
+  // classes, so these come from one slab pool that requires DMA_BUF_FD on its owned backing (KFD export, the same
+  // ioctl HSA's hsa_amd_portable_export_dmabuf used).
+  LoomBuffer AllocateExportable(std::size_t bytes) {
+    if (!export_pool_) {
+      static const hrx_external_storage_class_t dmabuf = {HRX_EXTERNAL_STORAGE_TYPE_DMA_BUF_FD, {0, 0}};
+      hrx_pool_family_access_t family{};
+      family.device = gpu_.device();
+      family.family_ordinal = gpu_.family();
+      family.usage = HRX_BUFFER_USAGE_DEFAULT;
+      hrx_pool_scope_t scope{};
+      scope.family_count = 1;
+      scope.families = &family;
+      hrx_slab_pool_options_t options{};
+      options.owned.exports.class_count = 1;
+      options.owned.exports.classes = &dmabuf;
+      options.trace_name = "yah_npu_shared";
+      LoomCheck(hrx_slab_pool_create(gpu_.group(), scope, &options, &export_pool_), "hrx_slab_pool_create(dma-buf)");
+      LoomCheck(hrx_semaphore_create(gpu_.device(), 0, &export_sem_), "hrx_semaphore_create(dma-buf)");
+    }
+    gpu_.Synchronize();   // the queue is idle: the allocation needs no wait on the stream's work
+    LoomBuffer buffer;
+    buffer.size = bytes;
+    std::uint64_t value = ++export_value_;
+    hrx_semaphore_list_t waits = {nullptr, nullptr, 0};
+    hrx_semaphore_list_t signals = {&export_sem_, &value, 1};
+    const hrx_pool_reservation_request_t request = {bytes, 4096};
+    LoomCheck(hrx_queue_alloca(gpu_.queue(), &waits, &signals, export_pool_, 1, &request, &buffer.handle),
+              "hrx_queue_alloca(dma-buf)");
+    LoomCheck(hrx_semaphore_wait(export_sem_, value, UINT64_MAX), "hrx_semaphore_wait(dma-buf)");
+    return buffer;
+  }
+  // The DMA-BUF fd (owned by s) and the buffer's offset in it. HRX has no public export, so this reads the HAL
+  // buffer from the handle (libhrx/buffer.h); the export dispatches through the buffer's own vtable.
+  void ExportDmabuf(Shared& s) {
+    iree_hal_external_storage_t storage{};
+    iree_hal_buffer_range_t range{};
+    NpuCheck(iree_hal_buffer_export(reinterpret_cast<hrx_buffer_s*>(s.gpu.handle)->hal_buffer,
+                                    iree_hal_make_buffer_range(0, IREE_HAL_WHOLE_BUFFER),
+                                    iree_hal_make_external_storage_class(IREE_HAL_EXTERNAL_STORAGE_TYPE_DMA_BUF_FD),
+                                    &storage, &range),
+             "dma-buf export");
+    s.fd = dup(static_cast<int>(storage.payload.file_descriptor));
+    s.fd_offset = range.byte_offset;
+    iree_hal_external_storage_release(&storage);
+    if (s.fd < 0) throw LoomError("npu: dma-buf dup");
   }
   // Shared buffers round to pages.
   [[nodiscard]] static std::size_t Align(std::size_t bytes) { return (bytes + 4095) / 4096 * 4096; }
@@ -253,8 +300,8 @@ class LoomNpu {
     ci.byte_length = bytes;
     ci.minimum_alignment = 4096;
     ci.registered_host_pointer = pages;
-    ci.registered_host_cacheability = AMDF_HOST_CACHEABILITY_WRITE_BACK;
-    YAH_AMDF(api_->memory_create(scope_, &ci, &s->native), "memory_create(registered weights)");
+    ci.registered_host_properties = AMDF_HOST_MEMORY_PROPERTY_READ_CACHED | AMDF_HOST_MEMORY_PROPERTY_WRITE_BACK;
+    YAH_AMDF(api_->memory_create(scope_, &ci, &s->native, nullptr), "memory_create(registered weights)");
     s->device = pages;
     shared_.push_back(std::move(s));
     return *shared_.back();
@@ -293,7 +340,7 @@ class LoomNpu {
       AllocateStorage(iree_hal_amd_xdna_image_tables_allocation(tables, ord), &k.storage[i], &k.storage_maps[i]);
     }
     const auto n = static_cast<iree_host_size_t>(k.storage.size());
-    NpuCheck(iree_hal_amd_xdna_executable_load(k.image, k.entry_ordinal, n, k.storage.data()), "executable_load");
+    NpuCheck(iree_hal_amd_xdna_executable_storage_load(k.image, k.entry_ordinal, n, k.storage.data()), "executable_load");
     Rebind(k, views);
     NpuCheck(
         iree_hal_amd_xdna_executable_query_continuation(k.image, k.entry_ordinal, n, k.storage.data(), false, &k.first),
@@ -310,7 +357,7 @@ class LoomNpu {
   void UnloadStorage(Kernel& k) {
     for (std::size_t i = 0; i < k.storage.size(); ++i) {
       api_->host_mapping_destroy(k.storage_maps[i]);
-      api_->memory_destroy(k.storage[i].memory);
+      (void)api_->memory_destroy(k.storage[i].memory, nullptr);
       storage_bytes_ -= storage_size_.at(k.storage[i].memory);
       storage_size_.erase(k.storage[i].memory);
       --storage_count_;
@@ -351,28 +398,14 @@ class LoomNpu {
         em.payload.file_descriptor = v.shared->fd;
         em.source_byte_offset = v.shared->fd_offset + v.offset;
         em.byte_length = v.length;
-        YAH_AMDF(api_->memory_import(scope_, &ii, &em, &mem), "memory_import");
+        YAH_AMDF(api_->memory_import(scope_, &ii, &em, &mem, nullptr), "memory_import");
         imports_[{v.shared, v.offset, v.length}] = mem;
       }
       YAH_AMDF(api_->memory_query_address(mem, 0, AMDF_MEMORY_ADDRESS_XDNA_DMA, &addr), "memory_query_address");
       addr += mem_off;
-      // executable_bind checks this wrapper's range and access only; the span is never dereferenced (the address is
-      // device_address). Wrappers start 64-byte aligned: raw weight rows need not.
-      std::uint8_t* span = static_cast<std::uint8_t*>(v.shared->device) + v.offset;
-      const std::size_t lead = reinterpret_cast<std::uintptr_t>(span) & 63;
-      iree_hal_buffer_t* buffer = nullptr;
-      NpuCheck(iree_hal_heap_buffer_wrap(
-                   iree_hal_buffer_placement_undefined(),
-                   IREE_HAL_MEMORY_TYPE_HOST_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
-                       IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE,
-                   IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE, IREE_HAL_BUFFER_USAGE_STORAGE,
-                   v.length + lead, iree_make_byte_span(span - lead, v.length + lead),
-                   iree_hal_buffer_release_callback_null(), iree_allocator_system(), &buffer),
-               "heap_buffer_wrap");
-      k.buffers.push_back(buffer);
-      bindings[i].buffer_ref = iree_hal_make_buffer_ref(buffer, 0, v.length + lead);
-      bindings[i].memory = mem;
-      bindings[i].memory_byte_offset = mem_off;
+      bindings[i].byte_length = v.length;
+      if (contract.minimum_alignment && (addr & (contract.minimum_alignment - 1)) != 0)
+        throw LoomError("npu: binding " + std::to_string(i) + " address misaligned");
       bindings[i].device_address = addr;
     }
     return bindings;
@@ -382,9 +415,16 @@ class LoomNpu {
   void Rebind(Kernel& k, const std::vector<View>& views) {
     const std::vector<iree_hal_amd_xdna_executable_binding_t> bindings = Bindings(k, views);
     const auto n = static_cast<iree_host_size_t>(k.storage.size());
-    NpuCheck(iree_hal_amd_xdna_executable_bind(k.image, k.entry_ordinal, n, k.storage.data(), bindings.size(),
-                                               bindings.data()),
-             "executable_bind");
+    // main's patch trusts its input: the addresses are checked here (alignment in Bindings, relocations below)
+    const iree_hal_amd_xdna_image_tables_t* tables = iree_hal_amd_xdna_image_tables(k.image);
+    const iree_xdna_elf_entry_record_t rec = iree_hal_amd_xdna_image_tables_entry(tables, k.entry_ordinal);
+    for (uint32_t i = 0; i < rec.dynamic_relocation_count; ++i) {
+      const iree_xdna_elf_relocation_record_t r =
+          iree_hal_amd_xdna_image_tables_relocation(tables, rec.first_dynamic_relocation + i);
+      NpuCheck(iree_hal_amd_xdna_executable_storage_validate_relocation(&r, bindings[r.source_ordinal].device_address),
+               "validate_relocation");
+    }
+    iree_hal_amd_xdna_executable_storage_patch(k.image, k.entry_ordinal, k.storage.data(), bindings.data());
     for (uint32_t i = 0; i < n; ++i)
       YAH_AMDF(api_->host_mapping_cache_control(k.storage_maps[i], AMDF_HOST_CACHE_OPERATION_FLUSH, 0,
                                                 k.storage[i].mapping.data_length),
@@ -457,7 +497,7 @@ class LoomNpu {
       AllocateStorage(iree_hal_amd_xdna_image_tables_allocation(tables, ord), &k->storage[i], &k->storage_maps[i]);
     }
     const auto n = static_cast<iree_host_size_t>(k->storage.size());
-    NpuCheck(iree_hal_amd_xdna_executable_load(image, entry_ordinal, n, k->storage.data()), "executable_load");
+    NpuCheck(iree_hal_amd_xdna_executable_storage_load(image, entry_ordinal, n, k->storage.data()), "executable_load");
     Rebind(*k, views);
     NpuCheck(
         iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), false, &k->first),
@@ -691,7 +731,7 @@ class LoomNpu {
   void Free(Script& s) {
     Drain();
     if (s.map) {
-      api_->host_mapping_destroy(s.map), api_->memory_destroy(s.storage.memory);
+      api_->host_mapping_destroy(s.map), (void)api_->memory_destroy(s.storage.memory, nullptr);
       std::erase_if(scripts_, [&](const auto& m) { return m.first == s.storage.memory; });
     }
     s = Script{};
@@ -1572,7 +1612,7 @@ class LoomNpu {
     iree_byte_span_t span = iree_make_byte_span(data, size);
     NpuCheck(iree_byte_sequence_create_from_span_move(&span, iree_allocator_system(), &seq), "byte_sequence");
     iree_hal_amd_xdna_image_t* image = nullptr;
-    const iree_status_t st = iree_hal_amd_xdna_image_create(seq, &target_, iree_allocator_system(), &image);
+    const iree_status_t st = iree_hal_amd_xdna_image_allocate(seq, &target_, iree_allocator_system(), &image);
     iree_byte_sequence_release(seq);
     NpuCheck(st, ("image_create " + path).c_str());
     images_[path] = image;
@@ -1622,7 +1662,7 @@ class LoomNpu {
     ci.accesses = &access;
     storage_bytes_ += ci.byte_length;   // the NPU's command memory is small (~64 MB per process): report the total
     ++storage_count_;
-    YAH_AMDF(api_->memory_create(scope, &ci, &out->memory),
+    YAH_AMDF(api_->memory_create(scope, &ci, &out->memory, nullptr),
              ("memory_create(storage) " + std::to_string(storage_count_) + " storages, " +
               std::to_string(storage_bytes_ >> 10) + " KB with this one").c_str());
     storage_size_[out->memory] = ci.byte_length;
@@ -1653,8 +1693,9 @@ class LoomNpu {
   amdf_kernel_queue_t* queue_ = nullptr;
   amdf_memory_device_access_t access_{};
   amdf_memory_profile_t profile_{};
-  using ExportFn = int (*)(const void*, std::size_t, int*, std::uint64_t*);
-  ExportFn export_dmabuf_ = nullptr;
+  hrx_mem_pool_t export_pool_ = nullptr;      // exportable GPU buffers (AllocateExportable)
+  hrx_semaphore_t export_sem_ = nullptr;
+  std::uint64_t export_value_ = 0;
   iree_hal_amd_xdna_aie2p_target_t target_{};
   std::map<std::string, iree_hal_amd_xdna_image_t*> images_;
   std::vector<std::unique_ptr<Shared>> shared_;

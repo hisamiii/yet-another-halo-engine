@@ -179,6 +179,11 @@ def loom_env(cfg):
         env["LOOM_EXP_DRAIN_USED"] = "1"   # (HRX patch 0048: the stale-request drain raises only the image's locks)
     if cfg.gate:
         env["LOOM_EXP_SETUP_ONLY"] = "1"
+    # HRX main: the inferred concat affinity grows the decoders' frames past 16 KB (worker 16518 B on q4_k), so the
+    # images keep the pin's allocation; q4_k also needs the LRU register choice to fit its dequant loads
+    env["LOOM_EXP_NO_CONCAT_PROPAGATE"] = "1"
+    if cfg.fuse == 2 and cfg.fmt == "Q4_K":
+        env["LOOM_EXP_LRU"] = "aie2p.vec256"
     return env
 
 

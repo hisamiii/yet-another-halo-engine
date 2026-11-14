@@ -704,7 +704,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             L.append(l)
     e("  %z8s = scalar.constant 0 : i8")
     e("  %z8v = vector.splat %z8s : vector<8xi8>")
-    e(f"  %zeros = vector.constant 0.0 : {V8}")
+    e(f"  %zeros = vector.splatf 0.0 : {V8}")
     e(f"  %init = vector.fragment<init> %zeros shape [%m, %n] : {V8}")
     NA = FM * FN
     types = ", ".join([V8] * NA)
@@ -1239,15 +1239,15 @@ KQG_QSPLIT = os.environ.get("KQG_QSPLIT", "0") == "1"
 
 
 def gsig16_consts(e):
-    e("  %qs_one4 = vector.constant 1.0 : vector<4xf32>")
-    e("  %qs_neg4 = vector.constant -1.0 : vector<4xf32>")
-    e("  %qs_l2e4 = vector.constant 1.4426950408889634 : vector<4xf32>")
-    e("  %qs_fmax4 = vector.constant 3.4028234663852886e+38 : vector<4xf32>")
+    e("  %qs_one4 = vector.splatf 1.0 : vector<4xf32>")
+    e("  %qs_neg4 = vector.splatf -1.0 : vector<4xf32>")
+    e("  %qs_l2e4 = vector.splatf 1.4426950408889634 : vector<4xf32>")
+    e("  %qs_fmax4 = vector.splatf 3.4028234663852886e+38 : vector<4xf32>")
     if KQG_GSIG == "u16":
-        e("  %qs_u16 = vector.constant 65535.0 : vector<4xf32>")
-        e("  %qs_iu16 = vector.constant 1.5259021896696422e-05 : vector<4xf32>")
-        e("  %qs_mag = vector.constant 12582912.0 : vector<4xf32>")
-        e("  %qs_m23 = vector.constant 8388608.0 : vector<4xf32>")
+        e("  %qs_u16 = vector.splatf 65535.0 : vector<4xf32>")
+        e("  %qs_iu16 = vector.splatf 1.5259021896696422e-05 : vector<4xf32>")
+        e("  %qs_mag = vector.splatf 12582912.0 : vector<4xf32>")
+        e("  %qs_m23 = vector.splatf 8388608.0 : vector<4xf32>")
 
 
 def gsig16(e, y, val, ind):

@@ -13,7 +13,10 @@ export YAH_HRX="${YAH_HRX:-$root/external/hrx}"
 H="${YAH_HRX_BUILD:-$YAH_HRX/build/cmake}"
 inc="$YAH_HRX/libhrx/include"
 # Build only against the pinned, patched HRX, so anyone can reproduce the binaries.
-"$root/engine/hrx/bootstrap.sh" --check >/dev/null || { "$root/engine/hrx/bootstrap.sh" --check; exit 1; }
+# YAH_HRX_UNPINNED=1 skips the check (porting to a new HRX revision).
+if [ "${YAH_HRX_UNPINNED:-0}" != 1 ]; then
+  "$root/engine/hrx/bootstrap.sh" --check >/dev/null || { "$root/engine/hrx/bootstrap.sh" --check; exit 1; }
+fi
 libhrx="$H/libhrx/src/libhrx"
 
 # Host code: clang, -O3 -march=native. -ffp-contract=off keeps host float results the same as
@@ -33,17 +36,16 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # NPU (libamdf + the xdna loader, static from an HRX build with the xdna targets, engine/hrx/bootstrap.sh): the NPU FFN
 # block of the prefill driver and the server (--npu). Without them both are GPU-only.
 npu_flags=() npu_libs=()
-if [ -f "$H/libamdf/libamdf_static.a" ]; then
-  for a in experimental/xdna/libiree_experimental_xdna_amdf_status.a experimental/xdna/libiree_experimental_xdna_executable.a \
-           libamdf/libamdf_static.a runtime/src/iree/hal/drivers/amd/xdna/image/aie2p/libiree_hal_drivers_amd_xdna_image_aie2p_npu2.a \
-           runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_image.a \
-           runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_validation.a \
-           runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_directory.a \
-           runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_tables.a \
+if [ -f "$H/libamdf/libamdf_static.a" ] && [ -f "$H/runtime/src/iree/hal/driver/amd/xdna/libiree_hal_driver_amd_xdna_executable_storage.a" ]; then
+  x=runtime/src/iree/hal/driver/amd/xdna
+  for a in runtime/src/iree/hal/driver/amd/libiree_hal_driver_amd_status.a $x/libiree_hal_driver_amd_xdna_executable_storage.a \
+           libamdf/libamdf_static.a $x/image/aie2p/libiree_hal_driver_amd_xdna_image_aie2p_npu2.a \
+           $x/image/libiree_hal_driver_amd_xdna_image_image.a $x/image/libiree_hal_driver_amd_xdna_image_validation.a \
+           $x/image/libiree_hal_driver_amd_xdna_image_directory.a $x/image/libiree_hal_driver_amd_xdna_image_tables.a \
            runtime/src/iree/schemas/libiree_schemas_xdna_executable.a runtime/src/iree/hal/libiree_hal_hal.a \
            runtime/src/iree/io/libiree_io_file_handle.a runtime/src/iree/async/libiree_async_async.a \
            runtime/src/iree/base/threading/libiree_base_threading_threading.a \
-           runtime/src/iree/base/internal/libiree_base_internal_memory.a runtime/src/iree/hal/memory/libiree_hal_memory_asan.a \
+           runtime/src/iree/base/internal/libiree_base_internal_memory.a \
            runtime/src/iree/hal/utils/libiree_hal_utils_platform_topology.a \
            runtime/src/iree/base/internal/libiree_base_internal_sysfs.a runtime/src/iree/base/internal/libiree_base_internal_path.a \
            runtime/src/iree/base/internal/libiree_base_internal_time.a runtime/src/iree/base/libiree_base_base.a; do

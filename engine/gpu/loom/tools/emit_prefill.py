@@ -69,6 +69,10 @@ def sym_of(loomfile):
 # wait(). Each one is cached in YAH_EMIT_CACHE (default ~/.cache/yah-emit, "0" off) under the hash of its specialized
 # source, target, LOOM_* environment, loom-compile binary and UNBOUNDED.
 ASYNC = False
+# Kernels whose waves split into roles (attention's softmax and P.V waves, DeltaNet's row split): each role region runs
+# the same barrier sequence, which Loom cannot prove through their while loops, so the source asserts it
+# (LOOM_EXP_WAVE_ROLE_BARRIERS: workgroup barriers need only wave-uniform control).
+ROLE_SPLIT = ("wmma", "rowsplit")
 CACHE = os.environ.get("YAH_EMIT_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "yah-emit"))
 JOBS = int(os.environ.get("YAH_EMIT_JOBS", "16"))
 _pool, _pending, _latest, _lock, _lc = None, {}, {}, threading.Lock(), None
@@ -85,6 +89,12 @@ def emit(loomfile, configs, outname, outdir, env=None, gate=None):
     if _lc is None:
         _lc = hashlib.sha256(open(hrx_paths.LOOM_COMPILE, "rb").read()).hexdigest()
     ce = {**hrx_paths.env(), **(env or {})}
+    if os.path.basename(outname).startswith(ROLE_SPLIT):
+        ce["LOOM_EXP_WAVE_ROLE_BARRIERS"] = "1"
+    # YAH_ATTN_VGPR_BUDGET=N: the attention kernels allocate within N VGPRs (HRX main LOOM_EXP_BUDGET; 224 gets
+    # main's 224 / 232 down to 216 without spills: 9 of gfx1151's 24-register blocks, 7 waves per SIMD instead of 6)
+    if os.path.basename(outname).startswith("wmma") and os.environ.get("YAH_ATTN_VGPR_BUDGET"):
+        ce["LOOM_EXP_BUDGET"] = "amdgpu.vgpr=" + os.environ["YAH_ATTN_VGPR_BUDGET"]
     tgt = ce.get("YAH_LOOM_TARGET", "gfx1151")
     raw = open(os.path.join(LOOM, loomfile)).read()
     text, _ = emit_hal.specialize(raw,

@@ -46,9 +46,17 @@ struct hrx_graph_s { size_t nodes; };
 struct hrx_graph_exec_s { struct hrx_graph_s* graph; };
 
 static void* real_lib;
-static __typeof__(hrx_gpu_initialize)* r_initialize;
-static __typeof__(hrx_gpu_device_get)* r_device_get;
-static __typeof__(hrx_gpu_shutdown)* r_shutdown;
+static __typeof__(hrx_runtime_create)* r_runtime_create;
+static __typeof__(hrx_runtime_release)* r_runtime_release;
+static __typeof__(hrx_runtime_query_available_devices)* r_query_devices;
+static __typeof__(hrx_host_allocator_system)* r_host_allocator_system;
+static __typeof__(hrx_host_allocator_free)* r_host_allocator_free;
+static __typeof__(hrx_device_group_create)* r_group_create;
+static __typeof__(hrx_device_group_release)* r_group_release;
+static __typeof__(hrx_device_group_get_device)* r_group_get_device;
+static __typeof__(hrx_device_queue_family_count)* r_family_count;
+static __typeof__(hrx_device_query_queue_family)* r_query_family;
+static __typeof__(hrx_device_get_queue)* r_get_queue;
 static __typeof__(hrx_executable_load_file)* r_load_file;
 static __typeof__(hrx_executable_export_count)* r_export_count;
 static __typeof__(hrx_executable_export_info)* r_export_info;
@@ -197,34 +205,76 @@ static void report(void) {
           dispatches, graph_nodes, copies, enveloped, errors, device_peak / gb, host_now / gb, imported / gb, ram_peak / gb);
 }
 
-hrx_status_t hrx_gpu_initialize(uint32_t flags) {
+// The engine opens the GPU through these calls; they load the real libhrx (HRX_DRY_REAL) in a namespace of its own and
+// pass through to it, so executables load and report their exports. Nothing else reaches the real library.
+static void load_real(void) {
+  if (real_lib) return;
   const char* path = getenv("HRX_DRY_REAL");
-  if (!path) return make(HRX_STATUS_FAILED_PRECONDITION, "hrx_dry: HRX_DRY_REAL names no real libhrx");
+  if (!path) {
+    fprintf(stderr, "hrx_dry: HRX_DRY_REAL names no real libhrx\n");
+    _exit(2);
+  }
   real_lib = dlmopen(LM_ID_NEWLM, path, RTLD_NOW | RTLD_LOCAL);
-  if (!real_lib) return make(HRX_STATUS_NOT_FOUND, "hrx_dry: %s", dlerror());
-  r_initialize = dlsym(real_lib, "hrx_gpu_initialize");
-  r_device_get = dlsym(real_lib, "hrx_gpu_device_get");
-  r_shutdown = dlsym(real_lib, "hrx_gpu_shutdown");
+  if (!real_lib) {
+    fprintf(stderr, "hrx_dry: %s\n", dlerror());
+    _exit(2);
+  }
+  r_runtime_create = dlsym(real_lib, "hrx_runtime_create");
+  r_runtime_release = dlsym(real_lib, "hrx_runtime_release");
+  r_query_devices = dlsym(real_lib, "hrx_runtime_query_available_devices");
+  r_host_allocator_system = dlsym(real_lib, "hrx_host_allocator_system");
+  r_host_allocator_free = dlsym(real_lib, "hrx_host_allocator_free");
+  r_group_create = dlsym(real_lib, "hrx_device_group_create");
+  r_group_release = dlsym(real_lib, "hrx_device_group_release");
+  r_group_get_device = dlsym(real_lib, "hrx_device_group_get_device");
+  r_family_count = dlsym(real_lib, "hrx_device_queue_family_count");
+  r_query_family = dlsym(real_lib, "hrx_device_query_queue_family");
+  r_get_queue = dlsym(real_lib, "hrx_device_get_queue");
   r_load_file = dlsym(real_lib, "hrx_executable_load_file");
   r_export_count = dlsym(real_lib, "hrx_executable_export_count");
   r_export_info = dlsym(real_lib, "hrx_executable_export_info");
   r_to_string = dlsym(real_lib, "hrx_status_to_string");
   r_free_message = dlsym(real_lib, "hrx_status_free_message");
+}
+hrx_host_allocator_t hrx_host_allocator_system(void) { return load_real(), r_host_allocator_system(); }
+void hrx_host_allocator_free(hrx_host_allocator_t allocator, void* ptr) { load_real(), r_host_allocator_free(allocator, ptr); }
+hrx_status_t hrx_runtime_create(const hrx_runtime_options_t* options, hrx_host_allocator_t allocator,
+                                hrx_runtime_t* runtime) {
+  load_real();
   atexit(report);
   signal(SIGSEGV, on_fault);
   signal(SIGBUS, on_fault);
   fprintf(stderr, "hrx_dry: no GPU work runs; checking every binding\n");
-  return from_real(r_initialize(flags));
+  return from_real(r_runtime_create(options, allocator, runtime));
 }
-hrx_status_t hrx_gpu_device_get(int index, hrx_device_t* device) { return from_real(r_device_get(index, device)); }
-hrx_status_t hrx_gpu_shutdown(void) {
+void hrx_runtime_release(hrx_runtime_t runtime) { r_runtime_release(runtime); }
+hrx_status_t hrx_runtime_query_available_devices(hrx_runtime_t runtime, const char* driver_name,
+                                                 hrx_host_allocator_t allocator, size_t* count,
+                                                 hrx_device_info_t** infos) {
+  return from_real(r_query_devices(runtime, driver_name, allocator, count, infos));
+}
+hrx_status_t hrx_device_group_create(hrx_runtime_t runtime, size_t device_count,
+                                     const hrx_device_create_params_t* devices, hrx_device_group_t* group) {
+  return from_real(r_group_create(runtime, device_count, devices, group));
+}
+hrx_device_t hrx_device_group_get_device(hrx_device_group_t group, size_t index) {
+  return r_group_get_device(group, index);
+}
+size_t hrx_device_queue_family_count(hrx_device_t device) { return r_family_count(device); }
+hrx_status_t hrx_device_query_queue_family(hrx_device_t device, uint32_t family, hrx_queue_family_info_t* info) {
+  return from_real(r_query_family(device, family, info));
+}
+hrx_queue_t hrx_device_get_queue(hrx_device_t device, uint32_t family, uint32_t queue) {
+  return r_get_queue(device, family, queue);
+}
+// The engine releases the group when it is done with the GPU: report, and exit 3 if a check failed.
+void hrx_device_group_release(hrx_device_group_t group) {
   report();
-  hrx_status_t s = from_real(r_shutdown());
+  r_group_release(group);
   if (errors) {
     fflush(stdout);
     _exit(3);
   }
-  return s;
 }
 
 hrx_status_code_t hrx_status_code(hrx_status_t s) { return s ? s->code : HRX_STATUS_OK; }
@@ -236,15 +286,17 @@ hrx_status_t hrx_status_to_string(hrx_status_t s, char** out_message, size_t* ou
 void hrx_status_free_message(char* message) { free(message); }
 void hrx_status_ignore(hrx_status_t s) { free(s); }
 
-hrx_status_t hrx_stream_create(hrx_device_t device, uint32_t flags, hrx_stream_t* stream) {
-  (void)device, (void)flags;
+hrx_status_t hrx_stream_create(hrx_queue_t queue, uint32_t flags, hrx_stream_t* stream) {
+  (void)queue, (void)flags;
   *stream = calloc(1, sizeof **stream);
   return NULL;
 }
 void hrx_stream_release(hrx_stream_t stream) { free(stream); }
 hrx_status_t hrx_stream_synchronize(hrx_stream_t stream) { return (void)stream, drain(), NULL; }
 hrx_status_t hrx_stream_flush(hrx_stream_t stream) { return (void)stream, NULL; }
-hrx_status_t hrx_stream_execution_barrier(hrx_stream_t stream) { return (void)stream, NULL; }
+hrx_status_t hrx_stream_barrier(hrx_stream_t stream, const hrx_barrier_t* barrier) {
+  return (void)stream, (void)barrier, NULL;
+}
 hrx_status_t hrx_stream_get_timeline_position(hrx_stream_t stream, hrx_timeline_point_t* position) {
   (void)stream;
   static int timeline;   // a semaphore, so the caller waits on the point (the wait reads its pending uploads)
@@ -302,8 +354,21 @@ hrx_status_t hrx_buffer_map(hrx_buffer_t b, hrx_map_flags_t flags, size_t offset
   *mapped_ptr = (char*)b->host + offset;
   return NULL;
 }
-hrx_status_t hrx_buffer_get_device_ptr(hrx_buffer_t b, void** device_ptr) {
-  *device_ptr = (void*)b->va;
+hrx_status_t hrx_device_query_queue_family_memory_scope(hrx_device_t device, uint32_t family_ordinal,
+                                                       hrx_memory_site_t site, hrx_memory_scope_t* out_scope) {
+  static int domain;   // one scope: every buffer has one address here
+  (void)device, (void)family_ordinal, (void)site;
+  out_scope->domain = &domain, out_scope->id = 1;
+  return NULL;
+}
+hrx_status_t hrx_buffer_query_address(hrx_buffer_t b, hrx_memory_scope_t scope, hrx_buffer_interface_t type,
+                                      uint64_t* out_address) {
+  (void)scope;
+  if (type != HRX_BUFFER_INTERFACE_DEVICE_ADDRESS) {
+    *out_address = 0;
+    return make(HRX_STATUS_UNIMPLEMENTED, "hrx_dry: address interface %d", (int)type);
+  }
+  *out_address = b->va;
   return NULL;
 }
 
@@ -353,8 +418,8 @@ static hrx_status_t h2d(const char* what, const void* src, hrx_buffer_t dst, siz
   pendings[pending_count++] = (struct pending){what, src, dst, off, n};
   return NULL;
 }
-hrx_status_t hrx_synchronous_h2d(hrx_device_t device, const void* src, hrx_buffer_t dst, size_t off, size_t n) {
-  return (void)device, h2d("synchronous_h2d", src, dst, off, n, 0);
+hrx_status_t hrx_synchronous_h2d(hrx_queue_t queue, const void* src, hrx_buffer_t dst, size_t off, size_t n) {
+  return (void)queue, h2d("synchronous_h2d", src, dst, off, n, 0);
 }
 hrx_status_t hrx_stream_copy_h2d(hrx_stream_t stream, const void* src, hrx_buffer_t dst, size_t off, size_t n) {
   return (void)stream, h2d("stream_copy_h2d", src, dst, off, n, 1);
@@ -364,8 +429,8 @@ hrx_status_t hrx_stream_update_buffer(hrx_stream_t stream, const void* src, size
   if (n > 65536) error("update_buffer: %zu bytes, the limit is 64 KB", n);
   return h2d("update_buffer", src, dst, off, n, 0);   // (recorded into the command: copied now)
 }
-hrx_status_t hrx_synchronous_d2h(hrx_device_t device, hrx_buffer_t src, size_t off, void* dst, size_t n) {
-  (void)device;
+hrx_status_t hrx_synchronous_d2h(hrx_queue_t queue, hrx_buffer_t src, size_t off, void* dst, size_t n) {
+  (void)queue;
   drain();
   ++copies;
   if (!check_ref("synchronous_d2h", src, off, n)) return NULL;
@@ -493,8 +558,8 @@ hrx_status_t hrx_graph_add_atomic_store_node(hrx_graph_t g, const hrx_graph_node
   *out_node = new_node(g);
   return NULL;
 }
-hrx_status_t hrx_graph_instantiate(hrx_graph_t g, uint32_t flags, hrx_graph_exec_t* exec) {
-  (void)flags;
+hrx_status_t hrx_graph_instantiate(hrx_graph_t g, hrx_queue_t queue, uint32_t flags, hrx_graph_exec_t* exec) {
+  (void)queue, (void)flags;
   *exec = calloc(1, sizeof **exec);
   (*exec)->graph = g;
   return NULL;

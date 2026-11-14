@@ -47,7 +47,7 @@ PAGE_DECLS = ("config.decl @yah_kvq.start_pos : %value: index where [range(%valu
 
 def page_setup(e):
     e("  %start0 = config.get @yah_kvq.start_pos : index")
-    e("  %start = index.assume %start0 [mul(%start0, 256)] : index")   # chunks start on a page
+    e("  %start = index.assume %start0 [multiple_of(%start0, 256)] : index")   # chunks start on a page
     e("  %prows = config.get @yah_kvq.pool_rows : index")
     e("  %c255g = index.constant 255 : index")
     e("  %c256g = index.constant 256 : index")
@@ -135,7 +135,7 @@ def gen_kmean():
     e("  %col8 = index.mul %chunk, %c8 : index")
     e("  %hb = index.mul %head, %c256 : index")
     e("  %col = index.add %hb, %col8 : index")
-    e(f"  %z8 = vector.constant 0.0 : {V8}")
+    e(f"  %z8 = vector.splatf 0.0 : {V8}")
     e(f"  %acc = scf.for %r = [%grp to %ntok step %c8](%a = %z8 : {V8}) -> ({V8}) {{")
     e("    %ra = index.mul %r, %c1024 : index")
     e("    %ad = index.add %ra, %col : index")
@@ -255,7 +255,7 @@ def gen_kq8():
                 acc = f"%bo{w}_{slot}"
         words.append(acc)
     e(f"  %bw = vector.from_elements {words[0]}, {words[1]} : vector<2xi32>")
-    e("  %bz = vector.constant 0 : vector<2xi32>")
+    e("  %bz = vector.splati 0 : vector<2xi32>")
     e("  %bwo = scf.select %live, %bw, %bz : vector<2xi32>")
     e("  %bda0 = index.mul %tokc, %c256 : index")
     e("  %bda1 = index.mul %lt, %c2 : index")
@@ -340,7 +340,7 @@ def gen_kq4():
     e(f"  %xf = vector.extf %x : {V8H} to {V8}")
     e(f"  %m = vector.load %m_flat[%col] : view<1024xf32> -> {V8}")
     e(f"  %xc = vector.subf %xf, %m : {V8}")
-    e(f"  %zero8 = vector.constant 0.0 : {V8}")
+    e(f"  %zero8 = vector.splatf 0.0 : {V8}")
     # in-lane butterflies (dims 1, 2, 4 apart)
     xs = []
     for i in range(8):
@@ -414,8 +414,8 @@ def gen_kq4_asym(e):
     e(f"  %xs = vector.subf %xr, %lo8 : {V8}")
     e(f"  %xq = vector.mulf %xs, %inv8 : {V8}")
     e(f"  %xn0 = vector.roundevenf %xq : {V8}")
-    e(f"  %z8f = vector.constant 0.0 : {V8}")
-    e(f"  %f15 = vector.constant 15.0 : {V8}")
+    e(f"  %z8f = vector.splatf 0.0 : {V8}")
+    e(f"  %f15 = vector.splatf 15.0 : {V8}")
     e(f"  %xn1 = vector.maxnumf %xn0, %z8f : {V8}")
     e(f"  %xn = vector.minnumf %xn1, %f15 : {V8}")
     e("  %m15 = scalar.constant 15 : i32")
@@ -781,7 +781,7 @@ def gen_vtpage():
     e("  %r = index.div %tid, %c8 : index")
     e("  %sg0 = index.rem %tid, %c8 : index")
     e("  %sg = index.mul %sg0, %c4 : index")
-    e("  %zh4 = vector.constant 0.0 : vector<4xf16>")
+    e("  %zh4 = vector.splatf 0.0 : vector<4xf16>")
     e("  %tok = index.add %tok0, %r : index")
     e("  %live = index.cmp ult, %tok, %ntok : index")
     e("  %ntok1 = index.sub %ntok, %c1 : index")

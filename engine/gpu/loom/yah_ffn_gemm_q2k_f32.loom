@@ -91,7 +91,7 @@ kernel.def target(@yah_gemm_wave32) @yah_ffn_gemm_q2k() {
   %m_origin_i = index.cast %m_origin : index to i32
   %k_blocks_i = index.cast %k_blocks : index to i32
   %bpr_i = scalar.muli %k_blocks_i, %c144i : i32
-  %zeros = vector.constant 0.0 : vector<8xf32>
+  %zeros = vector.splatf 0.0 : vector<8xf32>
   %init = vector.fragment<init> %zeros shape [%m, %n] : vector<8xf32>
   %acc0, %acc1, %acc2, %acc3 = scf.for %kk = [%c0 to %ktot step %c16](%a0 = %init : vector<8xf32>, %a1 = %init : vector<8xf32>, %a2 = %init : vector<8xf32>, %a3 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
