@@ -24,13 +24,13 @@ fmts = fmt.split(":")
 qk, bpb = QB[fmts[0]]
 M, K = mt * 16, kb * qk
 MO = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("ostride=")), M)
-# kfull: a K window (dequant chunk, gen_gemm_tile.DQ_BFP / KWIN) reading kb of each <kfull>-block weight row (and input row)
+# kfull: a K window (gen_gemm_tile.KWIN) reading kb of each <kfull>-block weight row (and input row)
 KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")), kb)
 # a split ffn reads the full gate tensor's rows before the up rows
 wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
 GRID = {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096, "iq2s": 8192}
 bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate": B * MO * 4,
-         "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4) // (2 if kind == "kst2" else 1),
+         "output": B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4) // (2 if kind == "kst2" else 1),
          "gate_out": B * MO * 2,
          # gen_gemm_tile KQG_QSPLIT: the q head-norm weight (256 f32)
          "qnw": 1024,

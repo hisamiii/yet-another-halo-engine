@@ -23,6 +23,14 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 EMIT = os.path.join(HERE, "..", "emit_hal.py")
 HALRUN = os.path.join(ROOT, "engine", "build", "hal_run")
 GPURUN = os.path.join(ROOT, "engine", "run", "gpu_run.sh")
+TABLE_DIR = os.path.join(HERE, "..", "tables")
+FMT = {"Q3_K": "q3k", "Q4_K": "q4k", "Q5_K": "q5k", "Q6_K": "q6k", "IQ4_XS": "iq4xs", "IQ3_XXS": "iq3xxs",
+       "IQ3_S": "iq3s", "IQ2_XXS": "iq2xxs", "IQ2_XS": "iq2xs", "Q8_0": "q8_0"}
+
+
+def table_file(fmt, extra):
+    """The tile GEMM's LDS table bindings: the format's grid, and the IQ2 sign table."""
+    return os.path.join(TABLE_DIR, "ksigns_iq2xs.bin" if extra == "ksigns" else f"grid_{fmt}.bin")
 
 
 def quantize(x):

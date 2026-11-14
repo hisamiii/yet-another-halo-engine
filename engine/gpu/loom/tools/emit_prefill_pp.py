@@ -1383,9 +1383,9 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
-def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, sym=None, kfull=0):
+def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, kfull=0):
     """ostride: a GEMM over the leading mt * 16 rows of an ostride-row output (gen_gemm_tile.OSTRIDE, the NPU split's GPU share);
-    f16 output then follows the full shape (O16_MT). sym: the kernel symbol, if not the GEMM's or the dequant's.
+    f16 output then follows the full shape (O16_MT).
     kfull: a K window's whole-row k_blocks (gen_gemm_tile.KWIN)."""
     if B % tile and not masked:
         return None
@@ -1401,10 +1401,7 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
             fh.write(gen(fmt, kind))
     finally:
         _TG.OSTRIDE = 0
-    if sym is None:
-        sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
-        if kind == "dequant":
-            sym = "yah_dequant_" + fmt
+    sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     gate = [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []) \
         + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else [])

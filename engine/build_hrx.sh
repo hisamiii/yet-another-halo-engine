@@ -69,11 +69,8 @@ fi
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/attn_bench.cc" \
     -o "$root/engine/build/attn_bench" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
-# GPU / NPU split of one GEMM (tools/npu_split_check.py); NPU builds only.
+# NPU builds only.
 if [ ${#npu_flags[@]} -gt 0 ]; then
-  "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/npu_split_run.cc" \
-      -o "$root/engine/build/npu_split_run" "$root/engine/build/libyah_core.a" \
-      "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
   # NPU attention calls through LoomNpu's host-gated runner (tools/npu_attn_check.py --runner).
   "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/npu_attn_run.cc" \
       -o "$root/engine/build/npu_attn_run" "$root/engine/build/libyah_core.a" \
