@@ -319,7 +319,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     # switches from its own default tile); every lane loads its row of both (no branch around the loads: a branch drains
     # vmcnt(0) at its join) and carries both, each wave decodes the one its rows are
     MX = fmt_up is not None
-    MX_SWZ = (fmt, fmt_up) in MX_SWZ_PAIRS if os.environ.get("YAH_MX_SWZ", "1") == "1" else False
+    MX_SWZ = (fmt, fmt_up) in MX_SWZ_PAIRS
     if MX:
         Fu = G.FMTS[fmt_up]
         bbu, (loads_u, compute_u) = Fu["bb"], Fu["decode"]
@@ -1532,21 +1532,16 @@ SW_GATE_AHEAD = 1
 # every f32 dn in [1, 2^126] (exhaustive on the GPU, yah-scratch/rcp/rcp_dump.loom: 0 of 1.06e9 differ) and dn = inf (the
 # select). In (2^126, inf) 1/dn is denormal and can differ, but there g is in [-88.7, -87.3], so g * iv * up is below
 # 1e-35 for any finite up and f16 rounds both to the same signed zero.
-FAST_RCP = True
 
 
 def rcp_consts(e, ind="  "):
-    if FAST_RCP:
-        e(f"{ind}%rcp_infb = scalar.constant 2139095040 : i32")
-        e(f"{ind}%rcp_inf = scalar.bitcast %rcp_infb : i32 to f32")
-        e(f"{ind}%rcp_zero = scalar.constant 0.0 : f32")
+    e(f"{ind}%rcp_infb = scalar.constant 2139095040 : i32")
+    e(f"{ind}%rcp_inf = scalar.bitcast %rcp_infb : i32 to f32")
+    e(f"{ind}%rcp_zero = scalar.constant 0.0 : f32")
 
 
 def recip1(e, out, dn, ind="  "):
     """out = 1 / dn for dn >= 1 (a sigmoid's denominator); needs %one, %negone and rcp_consts."""
-    if not FAST_RCP:
-        e(f"{ind}{out} = scalar.divf %one, {dn} : f32")
-        return
     e(f"{ind}{out}_r0 = scalar.divf<nnan|ninf|nsz|arcp> %one, {dn} : f32")
     e(f"{ind}{out}_nd = scalar.mulf {dn}, %negone : f32")
     e(f"{ind}{out}_er = scalar.fmaf {out}_nd, {out}_r0, %one : f32")
@@ -1564,9 +1559,6 @@ KQG_GSIG16 = KQG_GSIG in ("16", "u16")   # u16: round(s * 65535) as unorm16 bits
 # sum of q^2 at tokens * 18432 ([token][head][16], 16-row group g = 2 (d / 32) + the lane's half; no cross-lane
 # shuffle); the attention applies the norm's 1 / rms to S
 KQG_QSPLIT = os.environ.get("KQG_QSPLIT", "0") == "1"
-KQG_QSPLIT_DIAG = os.environ.get("KQG_QSPLIT_DIAG", "")   # diags (wrong values, timing only): "now" no w load, "nosum"
-# no sums, "norot" no rotary stores
-KQG_QH = os.environ.get("KQG_QH", "0") == "1"   # diag: q rounded to f16, stored as f32 (the precision of an f16 q)
 
 
 def gsig16_consts(e):
@@ -1574,7 +1566,7 @@ def gsig16_consts(e):
     e("  %qs_neg4 = vector.constant -1.0 : vector<4xf32>")
     e("  %qs_l2e4 = vector.constant 1.4426950408889634 : vector<4xf32>")
     e("  %qs_fmax4 = vector.constant 3.4028234663852886e+38 : vector<4xf32>")
-    if KQG_GSIG in ("32u", "u16"):
+    if KQG_GSIG == "u16":
         e("  %qs_u16 = vector.constant 65535.0 : vector<4xf32>")
         e("  %qs_iu16 = vector.constant 1.5259021896696422e-05 : vector<4xf32>")
         e("  %qs_mag = vector.constant 12582912.0 : vector<4xf32>")
@@ -1592,16 +1584,6 @@ def gsig16(e, y, val, ind):
     e(f"{ind}%qs_nd{y} = vector.mulf %qs_c{y}, %qs_neg4 : vector<4xf32>")
     e(f"{ind}%qs_er{y} = vector.fmaf %qs_nd{y}, %qs_r0{y}, %qs_one4 : vector<4xf32>")
     e(f"{ind}%qs_r{y} = vector.fmaf %qs_er{y}, %qs_r0{y}, %qs_r0{y} : vector<4xf32>")
-    if KQG_GSIG == "32h":   # diag: f16 rounding, stored as f32 (the precision of =16 alone)
-        e(f"{ind}%qs_hh{y} = vector.fptrunc %qs_r{y} : vector<4xf32> to vector<4xf16>")
-        e(f"{ind}%qs_hr{y} = vector.extf %qs_hh{y} : vector<4xf16> to vector<4xf32>")
-        return f"%qs_hr{y}"
-    if KQG_GSIG == "32u":   # diag: unorm16 rounding (round(s * 65535) / 65535), stored as f32
-        e(f"{ind}%qs_ut{y} = vector.mulf %qs_r{y}, %qs_u16 : vector<4xf32>")
-        e(f"{ind}%qs_ua{y} = vector.addf %qs_ut{y}, %qs_mag : vector<4xf32>")
-        e(f"{ind}%qs_ur{y} = vector.subf %qs_ua{y}, %qs_mag : vector<4xf32>")
-        e(f"{ind}%qs_uq{y} = vector.mulf %qs_ur{y}, %qs_iu16 : vector<4xf32>")
-        return f"%qs_uq{y}"
     if KQG_GSIG == "u16":   # t + 2^23 holds round(t) in its low 16 bits (exact: t <= 65535); keep the low halves
         e(f"{ind}%qs_ut{y} = vector.mulf %qs_r{y}, %qs_u16 : vector<4xf32>")
         e(f"{ind}%qs_ua{y} = vector.addf %qs_ut{y}, %qs_m23 : vector<4xf32>")
@@ -1612,14 +1594,6 @@ def gsig16(e, y, val, ind):
         return f"%qs_r{y}"
     e(f"{ind}%qs_h{y} = vector.fptrunc %qs_r{y} : vector<4xf32> to vector<4xf16>")
     return f"%qs_h{y}"
-
-def qh(e, y, val):
-    """KQG_QH diag: q rounded to f16 and widened back"""
-    if not KQG_QH:
-        return val
-    e(f"    %qh_h{y} = vector.fptrunc {val} : vector<4xf32> to vector<4xf16>")
-    e(f"    %qh_r{y} = vector.extf %qh_h{y} : vector<4xf16> to vector<4xf32>")
-    return f"%qh_r{y}"
 
 def qsplit_views(e):
     """KQG_QSPLIT: f16 q (the f32 q's indices), rotary f32 and sums regions of the output, the norm weight"""
@@ -1647,8 +1621,6 @@ def qsplit_views(e):
     e("  %qs_x32 = scalar.constant 32 : i32")
     e("  %qs_s16 = scalar.constant 0.0625 : f32")
     e("  %qs_s16v = vector.splat %qs_s16 : vector<4xf32>")
-    if "norot" in KQG_QSPLIT_DIAG:
-        e("  %false_qs = index.cmp ult, %qs_c64, %qs_c8 : index")
 
 
 def qsplit_lane(e):
@@ -1666,8 +1638,6 @@ def qsplit_lane(e):
 
 def qsplit_sums(e, j, tka):
     """KQG_QSPLIT: the lane's 16 squares' sum, stored by every q lane (its own 16-row group)"""
-    if "nosum" in KQG_QSPLIT_DIAG:
-        return
     for x in range(4):
         e(f"  %qse{j}_{x} = vector.extract %qsa{j}_3[{x}] : vector<4xf32> -> f32")
     e(f"  %qsb{j}_0 = scalar.addf %qse{j}_0, %qse{j}_1 : f32")
@@ -1691,9 +1661,6 @@ def qsplit_sq(e, j, n, val):
 
 def qsplit_w(e, y, d, c):
     """KQG_QSPLIT: w / 16 for rows d + c .. + 3, loaded at its use (hoisted, 16 VGPRs live through the epilogue)"""
-    if "now" in KQG_QSPLIT_DIAG:
-        e(f"    %qsw{y} = vector.splat %qs_s16 : vector<4xf32>")
-        return
     e(f"    %qswc{y} = index.constant {c} : index")
     e(f"    %qswb{y} = index.add {d}, %qswc{y} : index")
     e(f"    %qswa{y} = index.min %qswb{y}, %qs_c252 : index")   # (d + c <= 252 already)
@@ -1703,7 +1670,7 @@ def qsplit_w(e, y, d, c):
 
 def qsplit_tall_sums(e, g, j, tka):
     """KQG_QSPLIT, tall epilogue: on odd g the lane's 16 squares of slabs g - 1, g (its own 16-row group), stored"""
-    if g % 2 == 0 or "nosum" in KQG_QSPLIT_DIAG:
+    if g % 2 == 0:
         return
     for x in range(4):
         e(f"  %qse{g}_{j}_{x} = vector.extract %qsa{g // 2}_{j}_3[{x}] : vector<4xf32> -> f32")
@@ -1866,7 +1833,7 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
                 e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
                 e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
                 e(f"  scf.if %qg_isq {{")
-                e(f"    vector.store {qh(e, f'{j}_{q}', val)}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e(f"    vector.store {val}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  } else {")
                 if KQG_GSIG:
                     e(f"    vector.store {gsig16(e, f'{j}_{q}', val, '    ')}, %g_flat[%qg_oi{j}_{q}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
@@ -2055,7 +2022,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     e(f"    %qsy{y} = vector.mulf {val}, %qsw{y} : vector<4xf32>")
                     e(f"    %qsh{y} = vector.fptrunc %qsy{y} : vector<4xf32> to vector<4xf16>")
                     e(f"    vector.store %qsh{y}, %qs_h[%qg_oi{y}] : vector<4xf16>, view<[%qg_tot]xf16>")
-                    e(f"    scf.if %qs_isrot{g} {{") if "norot" not in KQG_QSPLIT_DIAG else e("    scf.if %false_qs {")
+                    e(f"    scf.if %qs_isrot{g} {{")
                     e(f"      %qsr{y} = index.add %qsrb{q0}, %et_q{y}c : index")
                     e(f"      vector.store {val}, %qs_rot[%qsr{y}] : vector<4xf32>, view<[%qs_rtot]xf32>")
                     e("    }")
@@ -2068,7 +2035,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     # always in range; the clamp states it for the bound proof
                     e(f"  %qg_oi{y} = index.min %et_oi{y}, %qg_last4 : index")
                     e(f"  scf.if %qg_isq{g} {{")
-                    e(f"    vector.store {qh(e, y, val)}, %q_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                    e(f"    vector.store {val}, %q_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
                     e("  } else {")
                     if KQG_GSIG:
                         e(f"    vector.store {gsig16(e, y, val, '    ')}, %g_flat[%qg_oi{y}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
@@ -2298,7 +2265,7 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
                 e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
                 e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
                 e(f"  scf.if %qg_isq {{")
-                e(f"    vector.store {qh(e, f'{j}_{q}', val)}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e(f"    vector.store {val}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  } else {")
                 if KQG_GSIG:
                     e(f"    vector.store {gsig16(e, f'{j}_{q}', val, '    ')}, %g_flat[%qg_oi{j}_{q}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
