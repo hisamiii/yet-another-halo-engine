@@ -108,16 +108,16 @@ class LoomPrefill {
       const auto it = geom_.find("npusplit_" + site);
       NpuPlan q;
       if (it == geom_.end()) return q;
-      const std::size_t calls = it->second.tokens / NpuCallRows(), mats = site == "ffn" ? 2 : 1;
+      const std::size_t calls = it->second.tokens / NpuCallRows();
       for (const auto& [k0, K] : NpuChunks(site)) {
         const NpuBytes nb = NpuK(K);
-        q.a_bytes += nb.a, q.c_bytes += mats * calls * nb.c;
+        q.a_bytes += nb.a, q.c_bytes += calls * nb.c;
       }
       return q;
     };
     const NpuPlan qkv = need("qkv"), gate = need("gate");
     for (const NpuPlan& q : {NpuPlan{std::max(qkv.a_bytes, gate.a_bytes), 0, qkv.c_bytes + gate.c_bytes},
-                             need("q"), need("out"), need("down"), need("ffn")})
+                             need("q"), need("out")})
       p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.c_bytes = std::max(p.c_bytes, q.c_bytes);
     if (FfnBlkF()) {   // the FFN block: gate / up's activations; H and down's partials in C
       p.a_bytes = std::max(p.a_bytes, NpuK(5120).a);
@@ -966,31 +966,10 @@ class LoomPrefill {
     const bool gate_af = Af("gemm_kstore", pre + "ffn_gate.weight");
     const bool up_af = Af("gemm_swiglu", pre + "ffn_up.weight");
     const bool down_af = up_af && Af("gemm_kres", pre + "ffn_down.weight");
-    const std::uint32_t nn = trim_row_ == kAllRows && FfnNpuOk(pre) ? NpuRows("ffn") : 0;
-    const std::string gs = nn ? NpuHal(KstoreHal(pre + "ffn_gate.weight", gate_af)) : "";
-    const std::string us = nn ? NpuHal(SwigluHal(pre + "ffn_up.weight", up_af, down_af)) : "";
     RunNorm(pre + "post_attention_norm.weight",
-            gate_af && up_af ? NormOut::kTiled : gate_af || up_af ? NormOut::kBoth : NormOut::kRow,
-            !gs.empty() && !us.empty() ? "ffn" : nullptr);
-    if (!gs.empty() && !us.empty()) {
-      // the NPU's rows of gate and up; the unpack applies silu(gate) * up
-      std::vector<NpuView> ag, au;
-      FfnEncode(pre, gate_af && up_af ? *normt_ : *scratch_, gate_af && up_af, ag, au);
-      std::size_t c_off = 0;
-      const auto wg = NpuRawRows("ffn", pre + "ffn_gate.weight", nn);
-      const auto wu = NpuRawRows("ffn", pre + "ffn_up.weight", nn);
-      std::vector<std::uint32_t> calls;
-      const NpuView cg = NpuCalls("ffn", ag, wg, c_off, calls, pre + "ffn_gate.weight");
-      const NpuView cu = NpuCalls("ffn", au, wu, c_off, calls, pre + "ffn_up.weight");
-      NpuEnqueue(std::move(calls), "ffn");
-      RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, gate_af, gs, nn);
-      RunSwigluSplit(pre + "ffn_up.weight", up_af, us, nn);
-      NpuJoin();
-      FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
-    } else {
-      RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
-      RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
-    }
+            gate_af && up_af ? NormOut::kTiled : gate_af || up_af ? NormOut::kBoth : NormOut::kRow);
+    RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
+    RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
     RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
   }
 
@@ -1187,24 +1166,12 @@ class LoomPrefill {
     return true;
   }
 
-  // The ffn site's NPU rows need both matrices on the NPU (the unpack applies silu(gate) * up).
-  bool FfnNpuOk(const std::string& pre) const { return NpuOk(pre + "ffn_gate.weight") && NpuOk(pre + "ffn_up.weight"); }
-  // The ffn site's activations for gate (ag) and up (au), each in its decoder's k-block order.
-  void FfnEncode(const std::string& pre, const LoomBuffer& input, bool tiled, std::vector<NpuView>& ag,
-                 std::vector<NpuView>& au) {
-    const bool kg = NpuPk(pre + "ffn_gate.weight"), ku = NpuPk(pre + "ffn_up.weight");
-    std::vector<NpuView> a4, ak;
-    if (!kg || !ku) a4 = NpuEncode("ffn", input, tiled);
-    if (kg || ku) ak = NpuEncode("ffn", input, tiled, true);
-    ag = kg ? ak : a4, au = ku ? ak : a4;
-  }
   // kRow: f16 row-major into scratch_; kTiled: fragment-major into normt_ (afrag GEMMs); kBoth: both, one pass.
   enum class NormOut { kRow, kTiled, kBoth };
   // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): ffn_up
   // stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r). Gate and up of one
   // format, or a pair "gemm_ffn_<gate>_<up>_.." (AF_FFN_MIX: mixed formats, which bind the gate format's tables, then
-  // the up format's, or one format without an NPU split); pairs have no NPU split, so they run only while the ffn site
-  // has no NPU rows.
+  // the up format's, or one format without an NPU split).
   // It writes f16(silu(gate) * up) into ffnup_, fragment-major when ffn_down is afrag too. Returns false if not taken.
   bool RunFfnFused(const std::string& pre) {
     if (!AfChunk()) return false;
@@ -1219,14 +1186,12 @@ class LoomPrefill {
     const char* sfx = down_af ? ".af.to.hal" : ".af.hal";
     std::string hal = mixed ? "" : AfHal(base, sfx);
     if (hal.empty()) {   // "gemm_ffn_<gate>_<mt>_<kb>.hal" -> "gemm_ffn_<gate>_<up>_<mt>_<kb>.hal"
-      if (NpuRows("ffn")) return false;
       base.insert(std::strlen("gemm_ffn_") + std::strlen(f.name), "_" + std::string(fu.name));
       hal = AfHal(base, sfx);
     }
     if (hal.empty()) return false;
     const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (mixed ? "_" + std::string(fu.name) : "") + "_ffn";
-    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled,
-            trim_row_ == kAllRows && FfnNpuOk(pre) && NpuRows("ffn") && !NpuHal(hal).empty() ? "ffn" : nullptr);
+    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled);
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*tg, f);
     b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
@@ -1237,26 +1202,7 @@ class LoomPrefill {
     const std::size_t first = b.size();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
     const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(tg->dims[1]) * 2}, g);
-    const std::uint32_t nn = tt == g.tt && FfnNpuOk(pre) ? NpuRows("ffn") : 0;
-    const std::string sh = nn ? NpuHal(hal) : "";
-    if (!sh.empty()) {
-      // the NPU's rows of gate and up (the weights' last rows of each tensor); the unpack applies silu(gate) * up
-      std::vector<NpuView> ag, au;
-      FfnEncode(pre, *normt_, true, ag, au);
-      std::size_t c_off = 0;
-      const auto wg = NpuRawRows("ffn", pre + "ffn_gate.weight", nn);
-      const auto wu = NpuRawRows("ffn", pre + "ffn_up.weight", nn);
-      std::vector<std::uint32_t> calls;
-      const NpuView cg = NpuCalls("ffn", ag, wg, c_off, calls, pre + "ffn_gate.weight");
-      const NpuView cu = NpuCalls("ffn", au, wu, c_off, calls, pre + "ffn_up.weight");
-      NpuEnqueue(std::move(calls), "ffn");
-      Dispatch(Exe(sh), sym.c_str(), (MTiles(*tg) - nn / 16) / GeomOf(sh).rowgrp, tt, 1, 32, 1, 1, b,
-               GemmWrites(b, f, {ffnup_}));
-      NpuJoin();
-      FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
-    } else {
-      Dispatch(Exe(hal), sym.c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
-    }
+    Dispatch(Exe(hal), sym.c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
     RunResidual(pre + "ffn_down.weight", *ffnup_, down_af);
     return true;
   }
@@ -1298,7 +1244,7 @@ class LoomPrefill {
   // a memory tile).
   // The NPU runs one image (K = 5120 per call; an image switch costs ~0.55 ms): a site's K in chunks of 5120, the rest
   // of K (out: 1024, down: 2048) on the GPU ("npurem_<site>_<fmt>.hal"), added by the unpack.
-  static std::uint32_t NpuSiteK(const std::string& site) { return site == "down" ? 17408 : site == "out" ? 6144 : 5120; }
+  static std::uint32_t NpuSiteK(const std::string& site) { return site == "out" ? 6144 : 5120; }
   static std::vector<std::pair<std::uint32_t, std::uint32_t>> NpuChunks(const std::string& site) {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> v;
     for (std::uint32_t k = 0; k + 5120 <= NpuSiteK(site); k += 5120) v.push_back({k, 5120});
@@ -1370,19 +1316,16 @@ class LoomPrefill {
   // p4 order of the other decoders).
   std::vector<NpuView> NpuEncode(const std::string& site, const LoomBuffer& input, bool tiled, bool pk = false) {
     const auto chunks = NpuChunks(site);
-    // down after an ffn unpack that wrote its columns (FfnUnpack): only each chunk's columns before them
-    const bool from_ffn = site == "down" && ffn_bfp_ && !pk;
-    ffn_bfp_ = false;
     // a K = 5120 site after a norm that wrote its input (RunNorm npu_site)
     const bool from_norm = norm_bfp_ == site && !pk;
     norm_bfp_.clear();
-    const std::uint32_t ffn_cols = from_ffn ? geom_.at("npuffnbfp").tokens : NpuSiteK(site);
+    const std::uint32_t site_k = NpuSiteK(site);
     std::vector<NpuView> views;
     std::size_t off = pk ? npu_->A().size / 2 : 0;
     for (std::size_t c = 0; c < chunks.size(); ++c) {
       const std::size_t bytes = NpuK(chunks[c].second).a;
       const auto [k0, K] = chunks[c];
-      const std::uint32_t cover = ffn_cols > k0 ? std::min(K, ffn_cols - k0) : 0;
+      const std::uint32_t cover = site_k > k0 ? std::min(K, site_k - k0) : 0;
       if (cover && !from_norm) {
         const std::string hal = "npu_enc_" + std::to_string(NpuSiteK(site)) + (NpuChunked(site) ? "_c" + std::to_string(c) : "") +
                                 (cover < K ? "p" : "") + (tiled ? "_t" : "") + (pk ? "_pk" : "") + ".hal";
@@ -1394,21 +1337,6 @@ class LoomPrefill {
       off += bytes;
     }
     return views;
-  }
-  // The ffn site's unpack: f16(silu(gate) * up) into ffnup_ (fragment-major for an afrag down). With "npuffnbfp" (down
-  // split too) it also writes down's BFP16 input for the ffn's NPU columns into A at down's chunk offsets, and
-  // NpuEncode("down") encodes only the columns before them.
-  void FfnUnpack(bool tiled, NpuView c) {
-    std::vector<hrx_buffer_ref_t> rest = {Ref(*ffnup_)};
-    std::uint64_t writes = 2;
-    ffn_bfp_ = geom_.count("npuffnbfp") && NpuRows("down");
-    if (ffn_bfp_) {
-      std::size_t bytes = 0;
-      for (const auto& [k0, K] : NpuChunks("down")) bytes += NpuK(K).a;
-      rest.push_back({npu_->A().handle, 0, bytes});
-      writes |= 4;
-    }
-    NpuUnpack(tiled ? "npu_unpack_ffn_t.hal" : "npu_unpack_ffn.hal", c, rest, writes);
   }
   // The NPU's rows of wname (its last rows) as raw GGUF bytes, per chunk and call (offsets from the tensor data base).
   // A call reads, per row and pass, one record of 4 super-blocks from the chunk's first k; the
@@ -1780,9 +1708,10 @@ class LoomPrefill {
       // the persistent kres (".af.p.hal": each workgroup runs every token tile of its row block, grid y = 1) unless trimmed
       const std::string pers = af ? AfHal(fused0, ".af.p.hal") : "";
       const bool use_p = !pers.empty() && tt == g.tt;
-      // NPU split (sites "out": ssm_out / attn_output, "down": ffn_down) of untrimmed chunks
-      const char* site = wname.find("ffn_down") != std::string::npos ? "down" : "out";
-      const std::uint32_t nn = tt == g.tt && NpuOk(wname) ? NpuRows(site) : 0;
+      // NPU split (site "out": ssm_out / attn_output, not ffn_down) of untrimmed chunks
+      const char* site = "out";
+      const bool down = wname.find("ffn_down") != std::string::npos;
+      const std::uint32_t nn = tt == g.tt && !down && NpuOk(wname) ? NpuRows(site) : 0;
       // The persistent kres runs one workgroup per row block (one per CU unsplit), so the split uses the tiled form.
       const std::string sh = nn ? NpuHal(fused) : "";
       if (!sh.empty()) {
@@ -2605,7 +2534,6 @@ class LoomPrefill {
   LoomBuffer* npurem_ = nullptr;   // the GPU's K remainder of the NPU's out / down rows (f32 [tokens][rows])
   std::uint32_t ffnblk_ = 0;       // the NPU's FFN block features (dispatch.txt "npuffnblk"; RunFfnBlock), 0: none
   LoomBuffer* ffnrem_ = nullptr;   // its GPU down over the other features (f32 [tokens][5120])
-  bool ffn_bfp_ = false;           // the last ffn unpack wrote down's BFP16 input for its columns (FfnUnpack)
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
   static std::size_t RecordRow(const char* fmt) {
