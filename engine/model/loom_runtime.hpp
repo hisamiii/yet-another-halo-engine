@@ -190,6 +190,8 @@ class LoomDevice {
 
   [[nodiscard]] hrx_device_t device() const { return device_; }
   [[nodiscard]] hrx_queue_t queue() const { return queue_; }
+  [[nodiscard]] hrx_device_group_t group() const { return group_; }
+  [[nodiscard]] uint32_t family() const { return family_; }
   // The address kernels on the dispatch queue see for buffer's first byte.
   [[nodiscard]] void* DeviceAddress(hrx_buffer_t buffer) const {
     uint64_t address = 0;
