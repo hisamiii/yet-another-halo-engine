@@ -171,6 +171,10 @@ struct LoomExecutable {
 class LoomDevice {
  public:
   LoomDevice() {
+    // ROCm's host pools (kernel arguments, signals, queues) from driver memory: on an APU it otherwise backs them with
+    // shared anonymous pages the GPU reads through user pointers, which compaction moves, each move evicting every
+    // GPU queue (0.1-0.3 s NPU split stalls, 2026-11-14). A value set by the caller wins.
+    ::setenv("HSA_USERPTR_FOR_PAGED_MEM", "0", 0);
     LoomCheck(hrx_gpu_initialize(0),
               "hrx_gpu_initialize (the GPU runtime did not start: is /dev/kfd there and is the user in the render "
               "group?)");
