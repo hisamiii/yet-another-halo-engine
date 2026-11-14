@@ -201,7 +201,7 @@ def bench(model, table_dir, jobs, work, tag, counters=True):
     if counters:
         env.update(HRX_PROFILE_FILE=prof, HRX_PROFILE_MODE="counters", HRX_PROFILE_COUNTERS="SQ_BUSY_CYCLES",
                    LD_LIBRARY_PATH=AQL + ":" + env["LD_LIBRARY_PATH"])
-    # The compiles open the GPU device (iree-run-loom --device=amdgpu): let it settle, or gpu_run.sh refuses a busy GPU.
+    # Let the GPU settle first: gpu_run.sh refuses a busy GPU.
     for _ in range(120):
         busy = [int(open(p).read()) for p in glob.glob("/sys/class/drm/card*/device/gpu_busy_percent")]
         if max(busy or [0]) <= 10:
