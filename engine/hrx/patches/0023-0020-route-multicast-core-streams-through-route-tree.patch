@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:07:05 +0100
+Subject: [PATCH 23/70] 0020 : route multicast core streams through route trees
+
+---
+ loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index 19081b9355..3cdb683107 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2729,8 +2729,8 @@ static iree_status_t loom_aie2p_array_plan_core_stream_channel(
+     channel->sender_dma_index = source->sender_dma_index;
+     if (!loom_aie2p_array_route_ingress(
+             &builder->route_builder, channel_index,
+-            channel->source_channel_index, shim_dma->coordinate,
+-            shim_dma->dma_channel,
++            &builder->route_trees[channel->source_channel_index],
++            shim_dma->coordinate, shim_dma->dma_channel,
+             builder->workers[receiver->owner_index].coordinate,
+             LOOM_XDNA_STREAM_PORT_CORE, 0, /*vertical_first=*/false)) {
+       return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);

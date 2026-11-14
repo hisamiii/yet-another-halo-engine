@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 17:50:05 +0100
+Subject: [PATCH 07/70] 0012-loom-slice-alias-coalescing
+
+low-slice aliasing: lowering splits vector results into unit slices and regathers them with low.concat for wide
+consumers (the b128 stores of the two halves of a WMMA accumulator), and coalescing a slice ignored only its source,
+not values sharing the source's exact storage (the dead tied accumulator input of the WMMA that produced it), so the
+allocator materialized both halves (8 moves per tile in the attention's S exchange). Two parts: low.concat of
+consecutive slices of one value canonicalizes to the subrange slice (or the value; not when the value is itself a
+concat, whose slices fold into its operands), and slice coalescing also ignores the source's dead exact-storage
+aliases, as copy coalescing already did (same liveness check: no use after the clobber point). Attention loop 29 -> 21
+moves: fp16 -1.6% at 32K context, kv4 126K-depth chunk attention -2.3%, kv8 32K -0.8%, pp2048 -0.5%; every other
+kernel of the reference sets byte-identical; outputs bit-identical. Test expectations updated where the fold or the
+removed copy shows (source_low_slice, the fp8 / bf8 MMA conversions, one gfx1250 matrix-window case whose consumer
+now reads the accumulator after the same hazard nops instead of a copy of it).
+
+(cherry picked from commit c95fe07bbe3ef4535b6a10071355acc41228890f)
+---
+ loom/py/loom/dialect/low/defs.py              |  1 +
+ .../loom/codegen/low/allocation/coalescing.c  | 15 ++++-
+ loom/src/loom/ops/low/canonicalize.c          | 67 +++++++++++++++++++
+ loom/src/loom/ops/low/ops.h                   |  1 +
+ .../test/source_low/mma_bf8_to_bf16.loom-test | 36 ++++------
+ .../test/source_low/mma_fp8_to_bf16.loom-test | 60 ++++++-----------
+ .../test/source_low/mma_fp8_to_f16.loom-test  | 24 +++----
+ 7 files changed, 121 insertions(+), 83 deletions(-)
+
+diff --git a/loom/py/loom/dialect/low/defs.py b/loom/py/loom/dialect/low/defs.py
+index 5b557fddfe..d965a16213 100644
+--- a/loom/py/loom/dialect/low/defs.py
++++ b/loom/py/loom/dialect/low/defs.py
+@@ -1618,6 +1618,7 @@ low_concat = Op(
+         SameRegisterClass("sources", "result"),
+         RegisterUnitsSumTo("sources", "result"),
+     ],
++    canonicalize="loom_low_concat_canonicalize",
+     verify="loom_low_concat_verify",
+     facts="loom_low_concat_facts",
+     format=[
+diff --git a/loom/src/loom/codegen/low/allocation/coalescing.c b/loom/src/loom/codegen/low/allocation/coalescing.c
+index df9c2c0c51..3e59c4719c 100644
+--- a/loom/src/loom/codegen/low/allocation/coalescing.c
++++ b/loom/src/loom/codegen/low/allocation/coalescing.c
+@@ -734,11 +734,20 @@ static iree_status_t loom_low_allocation_coalescing_assign_relation_interval(
+     const loom_liveness_interval_t* interval,
+     const loom_low_placement_relation_t* relation, bool* out_assigned) {
+   *out_assigned = false;
+-  const loom_value_id_t source_value_id =
++  // A slice aliases its source's storage. Values sharing that exact storage
++  // and dead at the slice (a tied accumulator input whose result is the
++  // source) hold nothing the slice could clobber, as for copies.
++  loom_value_id_t ignored_value_ids[16];
++  uint16_t ignored_value_count = 1;
++  ignored_value_ids[0] =
+       loom_low_placement_value_id(context->placement, relation->source_ordinal);
++  IREE_RETURN_IF_ERROR(
++      loom_low_allocation_coalescing_collect_dead_exact_storage_aliases(
++          context, relation->op, interval->start_point, ignored_value_ids,
++          (uint16_t)IREE_ARRAYSIZE(ignored_value_ids), &ignored_value_count));
+   return loom_low_allocation_coalescing_append_relation_interval(
+-      context, interval, relation, &source_value_id,
+-      /*ignored_value_count=*/1, out_assigned);
++      context, interval, relation, ignored_value_ids, ignored_value_count,
++      out_assigned);
+ }
+ 
+ static iree_status_t
+diff --git a/loom/src/loom/ops/low/canonicalize.c b/loom/src/loom/ops/low/canonicalize.c
+index 5ed024e3be..e11f65320c 100644
+--- a/loom/src/loom/ops/low/canonicalize.c
++++ b/loom/src/loom/ops/low/canonicalize.c
+@@ -291,3 +291,70 @@ iree_status_t loom_low_slice_canonicalize(loom_op_t* op,
+   }
+   return iree_ok_status();
+ }
++
++// concat(slice %x[o], slice %x[o + n0], ...) of consecutive subranges of one
++// value is the subrange slice %x[o] (or %x itself when it covers all of %x):
++// lowering splits vector results into unit slices and regathers them for wide
++// consumers (a b128 store of half a WMMA accumulator), and the regathered
++// concat otherwise needs the allocator to rebuild an alias it can miss.
++iree_status_t loom_low_concat_canonicalize(loom_op_t* op,
++                                           loom_rewriter_t* rewriter) {
++  loom_value_slice_t sources = loom_low_concat_sources(op);
++  if (sources.count < 2) {
++    return iree_ok_status();
++  }
++  loom_value_id_t base = LOOM_VALUE_ID_INVALID;
++  int64_t first_offset = 0;
++  int64_t next_offset = 0;
++  for (uint16_t i = 0; i < sources.count; ++i) {
++    loom_op_t* slice_op = loom_low_defining_op(rewriter, sources.values[i]);
++    if (!loom_low_slice_isa(slice_op)) {
++      return iree_ok_status();
++    }
++    const loom_value_id_t slice_source = loom_low_slice_source(slice_op);
++    const int64_t offset = loom_low_slice_offset(slice_op);
++    if (offset < 0) {
++      return iree_ok_status();
++    }
++    if (i == 0) {
++      base = slice_source;
++      first_offset = offset;
++      next_offset = offset;
++    } else if (slice_source != base || offset != next_offset) {
++      return iree_ok_status();
++    }
++    const loom_type_t slice_type =
++        loom_module_value_type(rewriter->module, sources.values[i]);
++    if (!loom_type_is_register(slice_type)) {
++      return iree_ok_status();
++    }
++    next_offset += loom_low_register_type_unit_count(slice_type);
++  }
++  // Slices of a concat fold through it into its operands instead
++  // (loom_low_slice_canonicalize); a subrange slice here would keep the whole
++  // concat live behind it.
++  if (loom_low_concat_isa(loom_low_defining_op(rewriter, base))) {
++    return iree_ok_status();
++  }
++  const loom_type_t base_type = loom_module_value_type(rewriter->module, base);
++  const loom_type_t result_type =
++      loom_module_value_type(rewriter->module, loom_low_concat_result(op));
++  if (!loom_type_is_register(base_type) || !loom_type_is_register(result_type) ||
++      loom_low_register_type_unit_count(result_type) !=
++          (uint32_t)(next_offset - first_offset)) {
++    return iree_ok_status();
++  }
++  if (first_offset == 0 && loom_type_equal(result_type, base_type)) {
++    return loom_low_replace_single_result_with_value(op, rewriter, base);
++  }
++  loom_builder_set_before(&rewriter->builder, op);
++  loom_value_id_t value_checkpoint = loom_rewriter_value_checkpoint(rewriter);
++  loom_op_t* replacement_op = NULL;
++  IREE_RETURN_IF_ERROR(loom_low_slice_build(&rewriter->builder, base,
++                                            first_offset, result_type,
++                                            op->location, &replacement_op));
++  loom_value_id_t replacement = loom_low_slice_result(replacement_op);
++  IREE_RETURN_IF_ERROR(loom_rewriter_preserve_result_names_on_new_values(
++      rewriter, op, &replacement, 1, value_checkpoint));
++  return loom_low_replace_single_result_with_value(op, rewriter, replacement);
++}
+diff --git a/loom/src/loom/ops/low/ops.h b/loom/src/loom/ops/low/ops.h
+index 3699a263c7..d92689353a 100644
+--- a/loom/src/loom/ops/low/ops.h
++++ b/loom/src/loom/ops/low/ops.h
+@@ -525,6 +525,7 @@ iree_status_t loom_low_concat_build(
+     loom_type_t result_type,
+     loom_location_id_t location,
+     loom_op_t** out_op);
++iree_status_t loom_low_concat_canonicalize(loom_op_t* op, loom_rewriter_t* rewriter);
+ iree_status_t loom_low_concat_facts(
+     loom_fact_context_t* context,
+     const loom_module_t* module, const loom_op_t* op,
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/mma_bf8_to_bf16.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/mma_bf8_to_bf16.loom-test
+index dac236c49a..6a1ff6538a 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/mma_bf8_to_bf16.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/mma_bf8_to_bf16.loom-test
+@@ -594,18 +594,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %30 = v_lshl_add_u32_shift_imm %24, %29, 4
+   %31 = global_load_b128_saddr %30, %rhs_view
+   %32 = v_mov_b32 2139062143
+-  %33 = slice %31[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %34 = slice %31[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %35 = concat(%33, %34) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %36 = v_cvt_scale_pk8_bf16_bf8 %35, %32
++  %72 = slice %31[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %36 = v_cvt_scale_pk8_bf16_bf8 %72, %32
+   %37 = slice %36[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %38 = slice %36[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %39 = slice %36[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %40 = slice %36[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %41 = slice %31[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %42 = slice %31[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %43 = concat(%41, %42) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %44 = v_cvt_scale_pk8_bf16_bf8 %43, %32
++  %71 = slice %31[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %44 = v_cvt_scale_pk8_bf16_bf8 %71, %32
+   %45 = slice %44[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %46 = slice %44[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %47 = slice %44[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+@@ -681,18 +677,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %32 = v_lshl_add_u32_shift_imm %26, %31, 4
+   %33 = global_load_b128_saddr %32, %rhs_view
+   %34 = v_mov_b32 2139062143
+-  %35 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %36 = slice %33[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %37 = concat(%35, %36) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %38 = v_cvt_scale_pk8_bf16_bf8 %37, %34
++  %74 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %38 = v_cvt_scale_pk8_bf16_bf8 %74, %34
+   %39 = slice %38[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %40 = slice %38[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %41 = slice %38[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %42 = slice %38[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %43 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %44 = slice %33[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %45 = concat(%43, %44) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %46 = v_cvt_scale_pk8_bf16_bf8 %45, %34
++  %73 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %46 = v_cvt_scale_pk8_bf16_bf8 %73, %34
+   %47 = slice %46[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %48 = slice %46[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %49 = slice %46[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+@@ -1168,18 +1160,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %33 = v_lshl_add_u32_shift_imm %27, %32, 4
+   %34 = global_load_b128_saddr %33, %rhs_view
+   %35 = v_mov_b32 2139062143
+-  %36 = slice %34[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %37 = slice %34[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %38 = concat(%36, %37) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %39 = v_cvt_scale_pk8_bf16_bf8 %38, %35
++  %78 = slice %34[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %39 = v_cvt_scale_pk8_bf16_bf8 %78, %35
+   %40 = slice %39[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %41 = slice %39[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %42 = slice %39[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %43 = slice %39[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %44 = slice %34[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %45 = slice %34[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %46 = concat(%44, %45) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %47 = v_cvt_scale_pk8_bf16_bf8 %46, %35
++  %77 = slice %34[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %47 = v_cvt_scale_pk8_bf16_bf8 %77, %35
+   %48 = slice %47[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %49 = slice %47[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %50 = slice %47[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/mma_fp8_to_bf16.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/mma_fp8_to_bf16.loom-test
+index a5dcc25e15..0337d5e101 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/mma_fp8_to_bf16.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/mma_fp8_to_bf16.loom-test
+@@ -583,18 +583,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %30 = v_lshl_add_u32_shift_imm %24, %29, 4
+   %31 = global_load_b128_saddr %30, %rhs_view
+   %32 = v_mov_b32 2139062143
+-  %33 = slice %31[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %34 = slice %31[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %35 = concat(%33, %34) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %36 = v_cvt_scale_pk8_bf16_fp8 %35, %32
++  %72 = slice %31[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %36 = v_cvt_scale_pk8_bf16_fp8 %72, %32
+   %37 = slice %36[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %38 = slice %36[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %39 = slice %36[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %40 = slice %36[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %41 = slice %31[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %42 = slice %31[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %43 = concat(%41, %42) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %44 = v_cvt_scale_pk8_bf16_fp8 %43, %32
++  %71 = slice %31[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %44 = v_cvt_scale_pk8_bf16_fp8 %71, %32
+   %45 = slice %44[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %46 = slice %44[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %47 = slice %44[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+@@ -670,18 +666,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %32 = v_lshl_add_u32_shift_imm %26, %31, 4
+   %33 = global_load_b128_saddr %32, %rhs_view
+   %34 = v_mov_b32 2139062143
+-  %35 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %36 = slice %33[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %37 = concat(%35, %36) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %38 = v_cvt_scale_pk8_bf16_fp8 %37, %34
++  %74 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %38 = v_cvt_scale_pk8_bf16_fp8 %74, %34
+   %39 = slice %38[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %40 = slice %38[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %41 = slice %38[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %42 = slice %38[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %43 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %44 = slice %33[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %45 = concat(%43, %44) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %46 = v_cvt_scale_pk8_bf16_fp8 %45, %34
++  %73 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %46 = v_cvt_scale_pk8_bf16_fp8 %73, %34
+   %47 = slice %46[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %48 = slice %46[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %49 = slice %46[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+@@ -1456,18 +1448,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %33 = v_lshl_add_u32_shift_imm %27, %32, 4
+   %34 = global_load_b128_saddr %33, %rhs_view
+   %35 = v_mov_b32 2139062143
+-  %36 = slice %34[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %37 = slice %34[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %38 = concat(%36, %37) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %39 = v_cvt_scale_pk8_bf16_fp8 %38, %35
++  %78 = slice %34[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %39 = v_cvt_scale_pk8_bf16_fp8 %78, %35
+   %40 = slice %39[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %41 = slice %39[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %42 = slice %39[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %43 = slice %39[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %44 = slice %34[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %45 = slice %34[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %46 = concat(%44, %45) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %47 = v_cvt_scale_pk8_bf16_fp8 %46, %35
++  %77 = slice %34[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %47 = v_cvt_scale_pk8_bf16_fp8 %77, %35
+   %48 = slice %47[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %49 = slice %47[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %50 = slice %47[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+@@ -1874,18 +1862,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %30 = v_lshl_add_u32_shift_imm %24, %29, 4
+   %31 = global_load_b128_saddr %30, %rhs_view
+   %32 = v_mov_b32 2139062143
+-  %33 = slice %31[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %34 = slice %31[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %35 = concat(%33, %34) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %36 = v_cvt_scale_pk8_bf16_bf8 %35, %32
++  %72 = slice %31[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %36 = v_cvt_scale_pk8_bf16_bf8 %72, %32
+   %37 = slice %36[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %38 = slice %36[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %39 = slice %36[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %40 = slice %36[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %41 = slice %31[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %42 = slice %31[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %43 = concat(%41, %42) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %44 = v_cvt_scale_pk8_bf16_bf8 %43, %32
++  %71 = slice %31[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %44 = v_cvt_scale_pk8_bf16_bf8 %71, %32
+   %45 = slice %44[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %46 = slice %44[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %47 = slice %44[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+@@ -2212,18 +2196,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %32 = v_lshl_add_u32_shift_imm %26, %31, 4
+   %33 = global_load_b128_saddr %32, %rhs_view
+   %34 = v_mov_b32 2139062143
+-  %35 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %36 = slice %33[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %37 = concat(%35, %36) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %38 = v_cvt_scale_pk8_bf16_bf8 %37, %34
++  %74 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %38 = v_cvt_scale_pk8_bf16_bf8 %74, %34
+   %39 = slice %38[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %40 = slice %38[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %41 = slice %38[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %42 = slice %38[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %43 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %44 = slice %33[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %45 = concat(%43, %44) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %46 = v_cvt_scale_pk8_bf16_bf8 %45, %34
++  %73 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %46 = v_cvt_scale_pk8_bf16_bf8 %73, %34
+   %47 = slice %46[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %48 = slice %46[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %49 = slice %46[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/mma_fp8_to_f16.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/mma_fp8_to_f16.loom-test
+index 329f1f0315..0cdeede1a2 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/mma_fp8_to_f16.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/mma_fp8_to_f16.loom-test
+@@ -359,18 +359,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %32 = v_lshl_add_u32_shift_imm %26, %31, 4
+   %33 = global_load_b128_saddr %32, %rhs_view
+   %34 = v_mov_b32 2139062143
+-  %35 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %36 = slice %33[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %37 = concat(%35, %36) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %38 = v_cvt_scale_pk8_f16_fp8 %37, %34
++  %74 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %38 = v_cvt_scale_pk8_f16_fp8 %74, %34
+   %39 = slice %38[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %40 = slice %38[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %41 = slice %38[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %42 = slice %38[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %43 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %44 = slice %33[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %45 = concat(%43, %44) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %46 = v_cvt_scale_pk8_f16_fp8 %45, %34
++  %73 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %46 = v_cvt_scale_pk8_f16_fp8 %73, %34
+   %47 = slice %46[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %48 = slice %46[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %49 = slice %46[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+@@ -446,18 +442,14 @@ low.kernel.def target<amdgpu.rdna4.gfx125x.core>(@target) abi_layout({constant_c
+   %32 = v_lshl_add_u32_shift_imm %26, %31, 4
+   %33 = global_load_b128_saddr %32, %rhs_view
+   %34 = v_mov_b32 2139062143
+-  %35 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %36 = slice %33[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %37 = concat(%35, %36) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %38 = v_cvt_scale_pk8_f16_bf8 %37, %34
++  %74 = slice %33[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %38 = v_cvt_scale_pk8_f16_bf8 %74, %34
+   %39 = slice %38[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %40 = slice %38[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %41 = slice %38[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %42 = slice %38[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %43 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %44 = slice %33[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+-  %45 = concat(%43, %44) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+-  %46 = v_cvt_scale_pk8_f16_bf8 %45, %34
++  %73 = slice %33[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr x2>
++  %46 = v_cvt_scale_pk8_f16_bf8 %73, %34
+   %47 = slice %46[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %48 = slice %46[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+   %49 = slice %46[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>

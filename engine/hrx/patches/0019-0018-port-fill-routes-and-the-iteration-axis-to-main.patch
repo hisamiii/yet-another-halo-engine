@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:04:57 +0100
+Subject: [PATCH 19/70] 0018 : port fill routes and the iteration axis to main
+
+---
+ loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index 33dc164970..cacf3254d7 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -3005,7 +3005,8 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+       binding_plan->completion_route_index = UINT32_MAX;
+     }
+     loom_aie2p_array_bind_worker_port(builder, worker_endpoint, channel_index,
+-                                      committed_compute.credit_lock_index);
++                                      committed_compute.credit_lock_index,
++                                      compute_proposal.ring.load_window);
+     return iree_ok_status();
+   }
+   if (channel->fill_target != UINT32_MAX) {

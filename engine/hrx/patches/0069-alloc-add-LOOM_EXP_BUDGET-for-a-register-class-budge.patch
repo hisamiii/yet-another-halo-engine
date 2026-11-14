@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:17:54 +0100
+Subject: [PATCH 69/70] alloc : add LOOM_EXP_BUDGET for a register class budget
+
+Assisted-by: Claude Opus 5.5
+---
+ .../codegen/low/allocation/target_constraints.c    | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/loom/src/loom/codegen/low/allocation/target_constraints.c b/loom/src/loom/codegen/low/allocation/target_constraints.c
+index 660bd537d8..7d45d7874f 100644
+--- a/loom/src/loom/codegen/low/allocation/target_constraints.c
++++ b/loom/src/loom/codegen/low/allocation/target_constraints.c
+@@ -609,6 +609,20 @@ static iree_status_t loom_low_allocation_target_constraints_resolve_budgets(
+     loom_low_allocation_target_constraints_t* constraints,
+     const loom_low_allocation_budget_t* budgets, iree_host_size_t budget_count,
+     iree_arena_allocator_t* arena) {
++  // EXPERIMENT (opt-in): LOOM_EXP_BUDGET=<register class>=<units> applies one
++  // register budget when the caller passes none (e.g. amdgpu.vgpr=192).
++  loom_low_allocation_budget_t experiment_budget;
++  if (budget_count == 0) {
++    const char* value = getenv("LOOM_EXP_BUDGET");
++    const char* separator = value ? strrchr(value, '=') : NULL;
++    if (separator != NULL && separator != value) {
++      experiment_budget.register_class =
++          iree_make_string_view(value, (iree_host_size_t)(separator - value));
++      experiment_budget.max_units = (uint32_t)strtoul(separator + 1, NULL, 10);
++      budgets = &experiment_budget;
++      budget_count = 1;
++    }
++  }
+   if (budget_count == 0) {
+     return iree_ok_status();
+   }

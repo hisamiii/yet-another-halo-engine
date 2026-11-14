@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 17:50:05 +0100
+Subject: [PATCH 17/70] 0017-loom-xdna-gated-call-invocations
+
+NPU-side gate for plans that are not streamed (one replay group, e.g. the NPU GEMM with final outputs): the control
+program is [call | gate | done] and the product publishes four invocations (array setup + call, call, gate, done), so
+a host runs a job of calls as [gate][call]...[call][done] with one gate per job, as streamed plans do with [gate | done]
+(patch 0016). Ungated plans and streamed plans are unchanged.
+
+(cherry picked from commit 02ab9c97f58a6270f5847d2100c20193db6d8641)
+---
+ .../arch/amd/xdna/aie2p/array/program.c       | 23 +++++++++++++------
+ .../target/arch/amd/xdna/aie2p/emit/program.h |  6 +++++
+ 2 files changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index eb5d05535a..203fe57bd5 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1577,20 +1577,24 @@ static void loom_aie2p_program_build_control_waits(
+ }
+ 
+ // Ungated: queue every binding, then wait for every egress. Gated
+-// (constrain.gate): queue the core stream channels, wait for the gates, then
+-// queue and wait for the rest; no other channel's data moves before the gate.
++// (constrain.gate): [call | gate | done]; the call queues and waits for every
++// other binding, the gate queues the core stream channels and waits for the
++// gates, done queues and waits for the rest. A host runs a job as [gate][call]
++// ... [call][done], so no other channel's data moves before the gate.
+ static void loom_aie2p_program_build_control(
+-    loom_aie2p_array_program_builder_t* builder) {
++    loom_aie2p_array_program_builder_t* builder,
++    iree_host_size_t* out_call_end, iree_host_size_t* out_gate_end) {
+   bool gated = false;
+   for (iree_host_size_t i = 0; i < builder->plan->channel_count; ++i) {
+     gated |= builder->plan->channels[i].gate;
+   }
+-  if (gated) {
+-    loom_aie2p_program_build_core_stream_phase(builder, /*gate_phase=*/true);
+-  }
+   loom_aie2p_program_build_control_pushes(builder, gated, false);
+   loom_aie2p_program_build_control_waits(builder, false);
++  *out_call_end = *out_gate_end = 0;
+   if (gated) {
++    *out_call_end = builder->control.record_count;
++    loom_aie2p_program_build_core_stream_phase(builder, /*gate_phase=*/true);
++    *out_gate_end = builder->control.record_count;
+     loom_aie2p_program_build_core_stream_phase(builder, /*gate_phase=*/false);
+   }
+ }
+@@ -1901,12 +1905,15 @@ iree_status_t loom_aie2p_array_program_build(
+   iree_host_size_t stream_odd_end = 0;
+   iree_host_size_t stream_lead_end = 0;
+   iree_host_size_t stream_gate_end = 0;
++  iree_host_size_t gated_call_end = 0;
++  iree_host_size_t gated_gate_end = 0;
+   if (plan->stream_panels) {
+     IREE_RETURN_IF_ERROR(loom_aie2p_program_build_stream_control(
+         &builder, &stream_push_end, &stream_wait_end, &stream_odd_end,
+         &stream_lead_end, &stream_gate_end));
+   } else {
+-    loom_aie2p_program_build_control(&builder);
++    loom_aie2p_program_build_control(&builder, &gated_call_end,
++                                     &gated_gate_end);
+   }
+   *out_program = (loom_aie2p_array_program_t){
+       .array_records = builder.array.records,
+@@ -1929,6 +1936,8 @@ iree_status_t loom_aie2p_array_program_build(
+       .stream_odd_end = stream_odd_end,
+       .stream_lead_end = stream_lead_end,
+       .stream_gate_end = stream_gate_end,
++      .gated_call_end = gated_call_end,
++      .gated_gate_end = gated_gate_end,
+   };
+   return iree_ok_status();
+ }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/program.h b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/program.h
+index 411d49d2ce..e91e9d6f08 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/program.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/program.h
+@@ -163,6 +163,12 @@ typedef struct loom_aie2p_array_program_t {
+   // when not gated.
+   iree_host_size_t stream_lead_end;
+   iree_host_size_t stream_gate_end;
++  // Gated plans that are not streamed: the control records are [call | gate |
++  // done]; gated_call_end ends the call (every other binding's shim tasks and
++  // egress waits), gated_gate_end the gate. A host runs a job of calls as
++  // [gate][call]...[call][done]. Zero otherwise.
++  iree_host_size_t gated_call_end;
++  iree_host_size_t gated_gate_end;
+ } loom_aie2p_array_program_t;
+ 
+ #ifdef __cplusplus

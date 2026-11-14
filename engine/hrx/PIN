@@ -1,4 +1,4 @@
 # The HRX / Loom revision this tree is built and tested against, plus the patches in patches/ (applied by bootstrap.sh).
 # Raise it deliberately: bootstrap, rebuild, then check the emits (byte-identical or explained) and the GPU references.
 repo https://github.com/ROCm/hrx.git
-ref a02a5ab945e568eb1e788c16c8c71c6a9cbfc46e
+ref 6a240f51fb3c8ba2f8ed017d41fcf9c37e9c9b03

@@ -1,0 +1,730 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:28:05 +0100
+Subject: [PATCH 61/70] 0065 : port locked-body planner controls to main
+
+Assisted-by: Claude Opus 5.5
+---
+ .../arch/amd/xdna/aie2p/emit/bundle_plan.c    | 547 +++++++++++++++++-
+ 1 file changed, 534 insertions(+), 13 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
+index 871e717506..f7ee2a2dd3 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
+@@ -6,9 +6,9 @@
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.h"
+ 
+-#include <stdlib.h>
+-
+ #include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "iree/base/internal/math.h"
+@@ -25,6 +25,194 @@
+ #include "loom/target/arch/amd/xdna/aie2p/emit/bundle_encoding.h"
+ #include "loom/target/arch/amd/xdna/aie2p/emit/leaf_plan_metadata.h"
+ 
++// EXPERIMENT (opt-in): schedule controls for hand-scheduled locked bodies
++// (LOOM_EXP_LOCKED_PACK). Each is read once from the environment; unset keeps
++// the default plan.
++//   LOOM_EXP_LOCKED_HOIST=K: a FIFO pop or fill (and, with
++//     LOOM_EXP_LOCKED_HOIST_ACC=1 / _ST=1, an accumulator load / store) may
++//     issue up to K cycles below the authored-order floor. The register event
++//     frontier keeps a delayed write behind the last read of the old value.
++//   LOOM_EXP_LOCKED_VIEWS=1: views (no descriptor) are not order boundaries.
++//   LOOM_EXP_LOCKED_FLOAT=all|p1,p2,..: instructions with these mnemonic
++//     prefixes issue at or after the floor without raising it.
++//   LOOM_EXP_LATE_READ=m1,m2,..: these mnemonics read their register operands
++//     at stage 2 (the tables say 1): their reads are committed again as
++//     read.c2 events (vmov.vector512.to.accumulator512 reads a cycle late).
++//   LOOM_EXP_DELAYFILL=1|2: control placement in the block's last delay
++//     window (bundle sharing included) is the default planner here; the knob
++//     selects which branches take the relaxed retirement below (2: also a
++//     conditional one). LOOM_EXP_DELAYFILL_NOEFF=1: a conditional branch
++//     waits for its sources only, not for resources or memory effects to
++//     drain (the generator orders the loop's effects).
++//     LOOM_EXP_DELAYFILL_EFFD=1: a back edge's memory effects need only land
++//     by the target's first memory-effect instruction.
++//   LOOM_EXP_BANKMAP=<file>: memory ops keep off the 16 KB banks other mapped
++//     ops touch in the same cycle. Lines "name mask stage" (name = result 0,
++//     or "st:" + operand 0 for stores; mask bit 7 = never moves), "@ mask
++//     cycle" (a pre-booked bank slot) and "= name cycle" (the op's cycle in
++//     the pass that wrote the map). LOOM_EXP_BANKDRIFT=1 checks pre-booked
++//     slots shifted by how far the never-move ops drifted from their map
++//     cycles. LOOM_EXP_POPDODGE=n: never-move ops dodge this plan's own
++//     bookings for at most n cycles.
++typedef struct loom_aie2p_bundle_plan_experiments_t {
++  uint32_t locked_hoist;
++  bool locked_hoist_acc;
++  bool locked_hoist_st;
++  bool locked_views;
++  const char* locked_float;
++  const char* late_read;
++  uint8_t delay_fill;
++  bool delay_fill_no_effect_wait;
++  bool delay_fill_effect_drain;
++  bool bank_drift;
++  uint32_t pop_dodge;
++} loom_aie2p_bundle_plan_experiments_t;
++
++static bool loom_aie2p_env_is_one(const char* name) {
++  const char* value = getenv(name);
++  return value && value[0] == '1';
++}
++
++static const loom_aie2p_bundle_plan_experiments_t*
++loom_aie2p_bundle_plan_experiments(void) {
++  static int initialized = 0;
++  static loom_aie2p_bundle_plan_experiments_t experiments;
++  if (!initialized) {
++    const char* hoist = getenv("LOOM_EXP_LOCKED_HOIST");
++    experiments.locked_hoist = hoist ? (uint32_t)atoi(hoist) : 0;
++    experiments.locked_hoist_acc =
++        loom_aie2p_env_is_one("LOOM_EXP_LOCKED_HOIST_ACC");
++    experiments.locked_hoist_st =
++        loom_aie2p_env_is_one("LOOM_EXP_LOCKED_HOIST_ST");
++    experiments.locked_views = getenv("LOOM_EXP_LOCKED_VIEWS") != NULL;
++    experiments.locked_float = getenv("LOOM_EXP_LOCKED_FLOAT");
++    experiments.late_read = getenv("LOOM_EXP_LATE_READ");
++    const char* fill = getenv("LOOM_EXP_DELAYFILL");
++    experiments.delay_fill = fill ? (fill[0] == '2' ? 2 : 1) : 0;
++    experiments.delay_fill_no_effect_wait =
++        getenv("LOOM_EXP_DELAYFILL_NOEFF") != NULL;
++    experiments.delay_fill_effect_drain =
++        getenv("LOOM_EXP_DELAYFILL_EFFD") != NULL;
++    experiments.bank_drift = loom_aie2p_env_is_one("LOOM_EXP_BANKDRIFT");
++    const char* dodge = getenv("LOOM_EXP_POPDODGE");
++    experiments.pop_dodge = dodge ? (uint32_t)atoi(dodge) : 0;
++    initialized = 1;
++  }
++  return &experiments;
++}
++
++// Whether name (length n) matches an entry of the comma-separated list, as a
++// prefix or exactly.
++static bool loom_aie2p_list_contains(const char* list, const char* name,
++                                     iree_host_size_t n, bool prefix) {
++  for (const char* p = list; p && *p;) {
++    const char* comma = strchr(p, ',');
++    const iree_host_size_t k =
++        comma ? (iree_host_size_t)(comma - p) : strlen(p);
++    if (prefix ? (k <= n && memcmp(name, p, k) == 0)
++               : (k == n && memcmp(name, p, k) == 0)) {
++      return true;
++    }
++    p += k + (comma ? 1 : 0);
++  }
++  return false;
++}
++
++#define LOOM_AIE2P_BANK_MAP_CYCLES 65536
++#define LOOM_AIE2P_BANK_MAP_NEVER_MOVES 0x80u
++
++typedef struct loom_aie2p_bank_map_entry_t {
++  char name[48];
++  uint8_t mask;
++  uint8_t stage;
++  // The op's cycle in the pass that wrote the map, or -1.
++  int32_t map_cycle;
++} loom_aie2p_bank_map_entry_t;
++
++typedef struct loom_aie2p_bank_map_t {
++  loom_aie2p_bank_map_entry_t* entries;
++  int count;
++  // Pre-booked bank masks by cycle.
++  uint8_t pre[LOOM_AIE2P_BANK_MAP_CYCLES];
++} loom_aie2p_bank_map_t;
++
++static int loom_aie2p_bank_map_entry_compare(const void* a, const void* b) {
++  return strcmp(((const loom_aie2p_bank_map_entry_t*)a)->name,
++                ((const loom_aie2p_bank_map_entry_t*)b)->name);
++}
++
++// The LOOM_EXP_BANKMAP file, loaded once (process lifetime), or NULL.
++static const loom_aie2p_bank_map_t* loom_aie2p_bank_map(void) {
++  static int loaded = 0;
++  static loom_aie2p_bank_map_t* map = NULL;
++  if (loaded) {
++    return map;
++  }
++  loaded = 1;
++  const char* path = getenv("LOOM_EXP_BANKMAP");
++  FILE* file = path ? fopen(path, "r") : NULL;
++  if (!file) {
++    return NULL;
++  }
++  map = (loom_aie2p_bank_map_t*)calloc(1, sizeof(*map));
++  const int capacity = 4096;
++  loom_aie2p_bank_map_entry_t* cycles =
++      (loom_aie2p_bank_map_entry_t*)calloc(capacity, sizeof(*cycles));
++  if (map) {
++    map->entries =
++        (loom_aie2p_bank_map_entry_t*)calloc(capacity, sizeof(*map->entries));
++  }
++  if (!map || !map->entries || !cycles) {
++    fclose(file);
++    free(cycles);
++    free(map ? map->entries : NULL);
++    free(map);
++    map = NULL;
++    return NULL;
++  }
++  int cycle_count = 0;
++  char name[64], line[256];
++  unsigned mask = 0, value = 0;
++  while (map->count < capacity && fgets(line, sizeof(line), file)) {
++    if (line[0] == '=') {
++      if (cycle_count < capacity &&
++          sscanf(line + 1, "%63s %u", name, &value) == 2) {
++        snprintf(cycles[cycle_count].name, sizeof(cycles[cycle_count].name),
++                 "%s", name);
++        cycles[cycle_count++].map_cycle = (int32_t)value;
++      }
++      continue;
++    }
++    if (sscanf(line, "%63s %u %u", name, &mask, &value) != 3) {
++      continue;
++    }
++    if (name[0] == '@') {
++      if (value < LOOM_AIE2P_BANK_MAP_CYCLES) {
++        map->pre[value] |= (uint8_t)mask;
++      }
++      continue;
++    }
++    loom_aie2p_bank_map_entry_t* entry = &map->entries[map->count++];
++    snprintf(entry->name, sizeof(entry->name), "%s", name);
++    entry->mask = (uint8_t)mask;
++    entry->stage = (uint8_t)value;
++    entry->map_cycle = -1;
++  }
++  fclose(file);
++  qsort(map->entries, map->count, sizeof(*map->entries),
++        loom_aie2p_bank_map_entry_compare);
++  for (int i = 0; i < cycle_count; ++i) {
++    loom_aie2p_bank_map_entry_t* entry = (loom_aie2p_bank_map_entry_t*)bsearch(
++        &cycles[i], map->entries, map->count, sizeof(cycles[i]),
++        loom_aie2p_bank_map_entry_compare);
++    if (entry) {
++      entry->map_cycle = cycles[i].map_cycle;
++    }
++  }
++  free(cycles);
++  return map;
++}
++
+ // Native control transfers after a returned JL require two intervening issue
+ // positions. Ordinary caller work may occupy them; otherwise they encode as
+ // NOPs. This is distinct from JL's five architectural delay positions.
+@@ -184,6 +372,18 @@ typedef struct loom_aie2p_bundle_plan_builder_t {
+   loom_aie2p_register_unit_set_t register_writes;
+   // Issue cycle of the most recently admitted instruction.
+   uint64_t last_admitted_cycle;
++  // The op whose packet is being appended (LOOM_EXP_BANKMAP names).
++  const loom_op_t* current_op;
++  // LOOM_EXP_BANKMAP: this plan's bank bookings by cycle, the never-move ops'
++  // drift from their map cycles, and the op dodging its own bookings
++  // (LOOM_EXP_POPDODGE) with its first tried cycle.
++  const loom_aie2p_bank_map_t* bank_map;
++  uint8_t* bank_busy;
++  int32_t bank_drift;
++  const loom_aie2p_bank_map_entry_t* dodge_entry;
++  uint32_t dodge_first_cycle;
++  // LOOM_EXP_DELAYFILL_EFFD: the first issue cycle of each planned block.
++  uint32_t* block_start_cycles;
+ } loom_aie2p_bundle_plan_builder_t;
+ 
+ static void loom_aie2p_bundle_plan_record_recurrence_instruction(
+@@ -782,6 +982,113 @@ static iree_status_t loom_aie2p_bundle_plan_flush_pending(
+   return loom_aie2p_bundle_plan_advance(builder, end_cycle);
+ }
+ 
++// LOOM_EXP_BANKMAP: the map entry of the current op, or NULL.
++static const loom_aie2p_bank_map_entry_t* loom_aie2p_bundle_plan_bank_entry(
++    const loom_aie2p_bundle_plan_builder_t* builder) {
++  const loom_aie2p_bank_map_t* map = builder->bank_map;
++  const loom_op_t* op = builder->current_op;
++  if (!map || !map->count || !op) {
++    return NULL;
++  }
++  loom_aie2p_bank_map_entry_t key;
++  if (op->result_count) {
++    const iree_string_view_t name =
++        loom_module_value_name(builder->frame->module, loom_op_results(op)[0]);
++    snprintf(key.name, sizeof(key.name), "%.*s", (int)name.size, name.data);
++  } else if (op->operand_count) {
++    const iree_string_view_t name =
++        loom_module_value_name(builder->frame->module, loom_op_operands(op)[0]);
++    snprintf(key.name, sizeof(key.name), "st:%.*s", (int)name.size, name.data);
++  } else {
++    return NULL;
++  }
++  return (const loom_aie2p_bank_map_entry_t*)bsearch(
++      &key, map->entries, map->count, sizeof(key),
++      loom_aie2p_bank_map_entry_compare);
++}
++
++// LOOM_EXP_BANKMAP: whether entry's banks are taken at cycle (+ its stage).
++static bool loom_aie2p_bundle_plan_bank_busy_at(
++    loom_aie2p_bundle_plan_builder_t* builder,
++    const loom_aie2p_bank_map_entry_t* entry, uint32_t cycle) {
++  if (!entry || cycle + entry->stage >= LOOM_AIE2P_BANK_MAP_CYCLES) {
++    return false;
++  }
++  const uint32_t at = cycle + entry->stage;
++  const uint8_t mask = entry->mask & 0x0Fu;
++  if (entry->mask & LOOM_AIE2P_BANK_MAP_NEVER_MOVES) {
++    const uint32_t dodge = loom_aie2p_bundle_plan_experiments()->pop_dodge;
++    if (!dodge) {
++      return false;
++    }
++    if (entry != builder->dodge_entry) {
++      builder->dodge_entry = entry;
++      builder->dodge_first_cycle = cycle;
++    }
++    if (cycle >= builder->dodge_first_cycle + dodge) {
++      return false;
++    }
++    return (builder->bank_busy[at] & mask) != 0;
++  }
++  if (loom_aie2p_bundle_plan_experiments()->bank_drift) {
++    const int64_t shifted = (int64_t)at - builder->bank_drift;
++    const uint8_t pre = shifted >= 0 && shifted < LOOM_AIE2P_BANK_MAP_CYCLES
++                            ? builder->bank_map->pre[shifted]
++                            : 0;
++    return ((builder->bank_busy[at] | pre) & mask) != 0;
++  }
++  return (builder->bank_busy[at] & mask) != 0;
++}
++
++// LOOM_EXP_LATE_READ: commits the register reads of the prepared instruction
++// (builder->instructions[0]) again as stage-2 reads into |issue| when its
++// mnemonic is listed.
++static iree_status_t loom_aie2p_bundle_plan_commit_late_reads(
++    const loom_aie2p_bundle_plan_builder_t* builder,
++    loom_low_physical_issue_t* issue, uint32_t cycle) {
++  const char* list = loom_aie2p_bundle_plan_experiments()->late_read;
++  if (!list) {
++    return iree_ok_status();
++  }
++  const loom_low_descriptor_set_t* descriptor_set = builder->descriptor_set;
++  static uint16_t late_event = LOOM_LOW_TIMING_EVENT_NONE;
++  static int resolved = 0;
++  if (!resolved) {
++    const loom_low_schedule_model_t* schedule_model = builder->schedule_model;
++    for (uint16_t e = 0; e < schedule_model->timing_event_count; ++e) {
++      if (iree_string_view_equal(
++              loom_low_schedule_model_timing_event_name(descriptor_set,
++                                                        schedule_model, e),
++              IREE_SV("amd.xdna.aie2p.operand.read.c2.none"))) {
++        late_event = e;
++      }
++    }
++    resolved = 1;
++  }
++  if (late_event == LOOM_LOW_TIMING_EVENT_NONE) {
++    return iree_ok_status();
++  }
++  const loom_low_descriptor_t* descriptor =
++      &descriptor_set->descriptors[builder->instructions[0].descriptor_ordinal];
++  const iree_string_view_t mnemonic = loom_low_descriptor_set_string(
++      descriptor_set, descriptor->mnemonic_string_ref);
++  if (!loom_aie2p_list_contains(list, mnemonic.data, mnemonic.size,
++                                /*prefix=*/false)) {
++    return iree_ok_status();
++  }
++  for (uint16_t j = 0; j < descriptor->operand_count; ++j) {
++    const loom_low_operand_t* operand =
++        loom_low_descriptor_operand(descriptor_set, descriptor, j);
++    if (operand->read_event_id == LOOM_LOW_TIMING_EVENT_NONE) {
++      continue;
++    }
++    IREE_RETURN_IF_ERROR(loom_low_schedule_event_frontier_commit(
++        &issue->events, builder->instructions[0].physical_registers[j],
++        late_event, cycle));
++  }
++  return iree_ok_status();
++}
++
+ // Publishes one actual instruction in accepted source/expansion order. Its
+ // timestamp may precede a prior publication, but never the retained-history or
+ // source-fence floor. The shared event frontier therefore sees the intended
+@@ -800,6 +1107,8 @@ static iree_status_t loom_aie2p_bundle_plan_admit_instruction(
+   }
+   uint32_t cycle = loom_aie2p_bundle_plan_find_earliest_issue_cycle(
+       builder, 1, proposed_cycle);
++  const loom_aie2p_bank_map_entry_t* bank_entry =
++      loom_aie2p_bundle_plan_bank_entry(builder);
+   loom_aie2p_pending_bundle_t* pending = NULL;
+   loom_aie2p_bundle_format_id_t format;
+   do {
+@@ -818,14 +1127,27 @@ static iree_status_t loom_aie2p_bundle_plan_admit_instruction(
+       format = loom_aie2p_encoding_find_bundle_format_for_slots(
+           slots, pending->slot_count + 1);
+     }
++    if (format != LOOM_AIE2P_BUNDLE_FORMAT_ID_INVALID &&
++        loom_aie2p_bundle_plan_bank_busy_at(builder, bank_entry, cycle)) {
++      format = LOOM_AIE2P_BUNDLE_FORMAT_ID_INVALID;  // the bank is taken
++    }
+     if (format == LOOM_AIE2P_BUNDLE_FORMAT_ID_INVALID) {
+       cycle = loom_aie2p_bundle_plan_find_earliest_issue_cycle(builder, 1,
+                                                                cycle + 1);
+     }
+   } while (format == LOOM_AIE2P_BUNDLE_FORMAT_ID_INVALID);
++  if (bank_entry && cycle + bank_entry->stage < LOOM_AIE2P_BANK_MAP_CYCLES) {
++    builder->bank_busy[cycle + bank_entry->stage] |= bank_entry->mask & 0x0Fu;
++    if ((bank_entry->mask & LOOM_AIE2P_BANK_MAP_NEVER_MOVES) &&
++        bank_entry->map_cycle >= 0) {
++      builder->bank_drift = (int32_t)cycle - bank_entry->map_cycle;
++    }
++  }
+   builder->last_admitted_cycle = cycle;
+   IREE_RETURN_IF_ERROR(
+       loom_aie2p_bundle_plan_commit_instruction_group(builder, 1, cycle));
++  IREE_RETURN_IF_ERROR(
++      loom_aie2p_bundle_plan_commit_late_reads(builder, &builder->issue, cycle));
+   loom_aie2p_bundle_plan_record_recurrence_instruction(builder, slot,
+                                                        realization, cycle);
+   if (slot.scheduled_packet_index != LOOM_AIE2P_BUNDLE_PLAN_PACKET_NONE) {
+@@ -1068,8 +1390,9 @@ static iree_status_t loom_aie2p_bundle_plan_append_control(
+     loom_aie2p_bundle_plan_builder_t* builder, uint32_t source_packet_index,
+     uint32_t slot_packet_index, uint32_t logical_issue_cycle,
+     iree_host_size_t block_bundle_start, uint32_t minimum_issue_cycle,
+-    uint32_t descriptor_ordinal, loom_aie2p_encoded_slot_t encoded_control,
+-    bool close_delay_window, uint32_t* out_bundle_index);
++    uint64_t quiescent_cycle, uint32_t descriptor_ordinal,
++    loom_aie2p_encoded_slot_t encoded_control, bool close_delay_window,
++    uint32_t* out_bundle_index);
+ 
+ static iree_status_t loom_aie2p_bundle_plan_append_register_move(
+     loom_aie2p_bundle_plan_builder_t* builder, loom_aie2p_register_move_t move,
+@@ -1346,7 +1669,9 @@ static iree_status_t loom_aie2p_bundle_plan_append_call(
+   IREE_RETURN_IF_ERROR(loom_aie2p_bundle_plan_append_control(
+       builder, packet_index, LOOM_AIE2P_BUNDLE_PLAN_PACKET_NONE,
+       logical_issue_cycle, builder->execution_bundle_start,
+-      minimum_call_issue_cycle, AIE2P_CORE_DESCRIPTOR_REF_CALL_DIRECT,
++      minimum_call_issue_cycle,
++      loom_aie2p_bundle_plan_quiescent_cycle(builder, packet_index),
++      AIE2P_CORE_DESCRIPTOR_REF_CALL_DIRECT,
+       loom_aie2p_bundle_plan_encode_call(builder),
+       /*close_delay_window=*/false, &call_bundle_index));
+   const uint32_t call_issue_cycle =
+@@ -1417,17 +1742,17 @@ static iree_status_t loom_aie2p_bundle_plan_append_control(
+     loom_aie2p_bundle_plan_builder_t* builder, uint32_t source_packet_index,
+     uint32_t slot_packet_index, uint32_t logical_issue_cycle,
+     iree_host_size_t block_bundle_start, uint32_t minimum_issue_cycle,
+-    uint32_t descriptor_ordinal, loom_aie2p_encoded_slot_t encoded_control,
+-    bool close_delay_window, uint32_t* out_bundle_index) {
++    uint64_t quiescent_cycle, uint32_t descriptor_ordinal,
++    loom_aie2p_encoded_slot_t encoded_control, bool close_delay_window,
++    uint32_t* out_bundle_index) {
+   const loom_low_descriptor_t* descriptor =
+       &builder->descriptor_set->descriptors[descriptor_ordinal];
+   const uint8_t delay_slot_count =
+       loom_aie2p_bundle_encoding_instruction_info(descriptor->encoding_id)
+           .delay_slot_count;
+   const uint32_t control_cycles = (uint32_t)delay_slot_count + 1;
+-  const uint64_t retire_cycle = iree_max(
+-      (uint64_t)builder->next_issue_cycle,
+-      loom_aie2p_bundle_plan_quiescent_cycle(builder, source_packet_index));
++  const uint64_t retire_cycle =
++      iree_max((uint64_t)builder->next_issue_cycle, quiescent_cycle);
+   const uint64_t earliest_control_cycle =
+       retire_cycle > control_cycles ? retire_cycle - control_cycles : 0;
+   // At most one hardware delay window is inspected, including implicit NOP
+@@ -1512,6 +1837,78 @@ static iree_status_t loom_aie2p_bundle_plan_align_next_block(
+   return iree_ok_status();
+ }
+ 
++// The cycle a block's branch must retire by. Default: full quiescence and the
++// terminator's sources. LOOM_EXP_DELAYFILL relaxes it for a block's only
++// branch: LOOM_EXP_DELAYFILL=2 with _NOEFF lets a conditional branch wait for
++// its sources only (without _NOEFF, resources and memory effects drain but
++// register events do not), and _EFFD lets an unconditional back edge's memory
++// effects land as late as the target's first memory-effect instruction.
++static uint64_t loom_aie2p_bundle_plan_branch_quiescent_cycle(
++    const loom_aie2p_bundle_plan_builder_t* builder,
++    const loom_aie2p_block_analysis_t* block_analysis,
++    const loom_aie2p_block_branch_t* branch) {
++  const uint32_t packet_index = block_analysis->terminator_packet_index;
++  const uint64_t quiescent_cycle =
++      loom_aie2p_bundle_plan_quiescent_cycle(builder, packet_index);
++  const loom_aie2p_bundle_plan_experiments_t* experiments =
++      loom_aie2p_bundle_plan_experiments();
++  if (!experiments->delay_fill || block_analysis->branches.count != 1) {
++    return quiescent_cycle;
++  }
++  const uint64_t source_ready_cycle =
++      loom_low_physical_issue_source_ready_cycle(&builder->issue, packet_index);
++  if (block_analysis->terminator ==
++      LOOM_AIE2P_BLOCK_TERMINATOR_CONDITIONAL_BRANCH) {
++    if (experiments->delay_fill != 2) {
++      return quiescent_cycle;
++    }
++    const uint64_t drain =
++        experiments->delay_fill_no_effect_wait
++            ? 0
++            : iree_max((uint64_t)builder->issue.resources.quiescent_cycle,
++                       (uint64_t)builder->issue.effect_quiescent_cycle);
++    return iree_max(drain, source_ready_cycle);
++  }
++  if (block_analysis->terminator != LOOM_AIE2P_BLOCK_TERMINATOR_BRANCH ||
++      !experiments->delay_fill_effect_drain ||
++      builder->block_start_cycles == NULL ||
++      branch->target_block_index >= builder->current_block_index) {
++    return quiescent_cycle;
++  }
++  // A back edge to an already planned block: in-flight memory effects only
++  // have to land by the target's first memory-effect instruction (registers
++  // and resources stay fully quiescent).
++  const uint32_t target_start_cycle =
++      builder->block_start_cycles[branch->target_block_index];
++  uint32_t first = UINT32_MAX;
++  for (iree_host_size_t i = 0;
++       i < builder->bundle_count && first == UINT32_MAX; ++i) {
++    const loom_aie2p_planned_bundle_t* bundle = &builder->bundles[i];
++    if (bundle->block_index != branch->target_block_index ||
++        bundle->issue_cycle < target_start_cycle) {
++      continue;
++    }
++    for (uint8_t j = 0; j < bundle->slot_count; ++j) {
++      const uint32_t ordinal =
++          builder->slot_realizations[bundle->slot_start + j].descriptor_ordinal;
++      if (loom_low_descriptor_layout(
++              builder->descriptor_set,
++              &builder->descriptor_set->descriptors[ordinal])
++              ->effect_count) {
++        first = bundle->issue_cycle;
++        break;
++      }
++    }
++  }
++  const uint32_t offset =
++      first == UINT32_MAX ? 0 : first - target_start_cycle;
++  const uint64_t effects = builder->issue.effect_quiescent_cycle;
++  return iree_max(
++      iree_max((uint64_t)builder->issue.resources.quiescent_cycle,
++               (uint64_t)builder->issue.events.quiescent_cycle),
++      iree_max(effects > offset ? effects - offset : 0, source_ready_cycle));
++}
++
+ static iree_status_t loom_aie2p_bundle_plan_append_terminator(
+     loom_aie2p_bundle_plan_builder_t* builder,
+     const loom_aie2p_block_analysis_t* block_analysis,
+@@ -1530,7 +1927,10 @@ static iree_status_t loom_aie2p_bundle_plan_append_terminator(
+         builder, block_analysis->terminator_packet_index,
+         block_analysis->terminator_packet_index,
+         block_analysis->terminator_issue_cycle, block_bundle_start,
+-        builder->execution_issue_cycle, AIE2P_CORE_DESCRIPTOR_REF_RETURN_,
++        builder->execution_issue_cycle,
++        loom_aie2p_bundle_plan_quiescent_cycle(
++            builder, block_analysis->terminator_packet_index),
++        AIE2P_CORE_DESCRIPTOR_REF_RETURN_,
+         loom_aie2p_bundle_encoding_encode_structural_descriptor(
+             builder->descriptor_set, AIE2P_CORE_DESCRIPTOR_REF_RETURN_),
+         /*close_delay_window=*/true, &bundle_index);
+@@ -1565,7 +1965,10 @@ static iree_status_t loom_aie2p_bundle_plan_append_terminator(
+         builder, block_analysis->terminator_packet_index,
+         block_analysis->terminator_packet_index,
+         block_analysis->terminator_issue_cycle, block_bundle_start,
+-        minimum_issue_cycle, branch->descriptor_ordinal, encoded_branch,
++        minimum_issue_cycle,
++        loom_aie2p_bundle_plan_branch_quiescent_cycle(builder, block_analysis,
++                                                      branch),
++        branch->descriptor_ordinal, encoded_branch,
+         /*close_delay_window=*/true, &bundle_index);
+     if (iree_status_is_ok(status)) {
+       builder->branch_fixups[builder->branch_fixup_count++] =
+@@ -1696,6 +2099,11 @@ typedef struct loom_aie2p_hardware_loop_snapshot_t {
+   uint64_t resource_minimum_issue_cycle;
+   // First cycle after every retained effect event.
+   uint32_t effect_quiescent_cycle;
++  // LOOM_EXP_BANKMAP: copied bank bookings, drift, and dodge state.
++  uint8_t* bank_busy;
++  int32_t bank_drift;
++  const loom_aie2p_bank_map_entry_t* dodge_entry;
++  uint32_t dodge_first_cycle;
+ } loom_aie2p_hardware_loop_snapshot_t;
+ 
+ static iree_status_t loom_aie2p_bundle_plan_snapshot_hardware_loop(
+@@ -1725,7 +2133,17 @@ static iree_status_t loom_aie2p_bundle_plan_snapshot_hardware_loop(
+       .resource_minimum_issue_cycle =
+           builder->issue.resources.minimum_issue_cycle,
+       .effect_quiescent_cycle = builder->issue.effect_quiescent_cycle,
++      .bank_drift = builder->bank_drift,
++      .dodge_entry = builder->dodge_entry,
++      .dodge_first_cycle = builder->dodge_first_cycle,
+   };
++  if (builder->bank_busy != NULL) {
++    IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++        builder->scratch_arena, LOOM_AIE2P_BANK_MAP_CYCLES,
++        sizeof(*out_snapshot->bank_busy), (void**)&out_snapshot->bank_busy));
++    memcpy(out_snapshot->bank_busy, builder->bank_busy,
++           LOOM_AIE2P_BANK_MAP_CYCLES);
++  }
+   const iree_host_size_t node_count = builder->frame->schedule.node_count;
+   if (node_count != 0) {
+     IREE_RETURN_IF_ERROR(
+@@ -1813,6 +2231,13 @@ static void loom_aie2p_bundle_plan_restore_hardware_loop(
+   builder->issue.resources.minimum_issue_cycle =
+       snapshot->resource_minimum_issue_cycle;
+   builder->issue.effect_quiescent_cycle = snapshot->effect_quiescent_cycle;
++  if (snapshot->bank_busy != NULL) {
++    memcpy(builder->bank_busy, snapshot->bank_busy,
++           LOOM_AIE2P_BANK_MAP_CYCLES);
++  }
++  builder->bank_drift = snapshot->bank_drift;
++  builder->dodge_entry = snapshot->dodge_entry;
++  builder->dodge_first_cycle = snapshot->dodge_first_cycle;
+   builder->block_byte_offsets[loop->header_block_index] = 0;
+   builder->block_byte_offsets[loop->body_block_index] = 0;
+ }
+@@ -1822,6 +2247,9 @@ static void loom_aie2p_bundle_plan_begin_block(
+     uint32_t block_byte_offset) {
+   builder->current_block_index = block_index;
+   builder->block_issue_cycle = builder->next_issue_cycle;
++  if (builder->block_start_cycles != NULL) {
++    builder->block_start_cycles[block_index] = builder->next_issue_cycle;
++  }
+   builder->execution_bundle_start = builder->bundle_count;
+   builder->execution_issue_cycle =
+       iree_max(builder->execution_issue_cycle, builder->next_issue_cycle);
+@@ -1835,6 +2263,17 @@ static iree_status_t loom_aie2p_bundle_plan_append_block_packets(
+     const loom_aie2p_block_analysis_t* block_analysis) {
+   const loom_low_schedule_block_t* block =
+       &builder->frame->schedule.blocks[block_index];
++  const loom_low_descriptor_set_t* descriptor_set = builder->descriptor_set;
++  // LOOM_EXP_LOCKED_HOIST / _VIEWS / _FLOAT: the authored-order floor of this
++  // block's locked body (the latest admission of a non-hoisted, non-floating
++  // instruction).
++  const loom_aie2p_bundle_plan_experiments_t* experiments =
++      loom_aie2p_bundle_plan_experiments();
++  const bool locked_floor = experiments->locked_hoist > 0 ||
++                            experiments->locked_views ||
++                            experiments->locked_float;
++  bool locked_floor_started = false;
++  uint32_t locked_floor_cycle = 0;
+   for (uint32_t ordinal = 0; ordinal < block->scheduled_node_count; ++ordinal) {
+     const loom_low_packet_view_t packet = loom_low_packet_at_block_ordinal(
+         &builder->frame->schedule, block_index, ordinal);
+@@ -1851,7 +2290,46 @@ static iree_status_t loom_aie2p_bundle_plan_append_block_packets(
+       const char* value = getenv("LOOM_EXP_LOCKED_PACK");
+       locked_pack = value && value[0] == '1';
+     }
+-    if (is_boundary && locked_pack && packet.descriptor != NULL) {
++    builder->current_op = packet.node->op;
++    bool hoisted = false;
++    if (locked_floor && is_boundary && locked_pack &&
++        packet.descriptor == NULL && experiments->locked_views) {
++      // A view (slice / concat) issues nothing; its register moves, if the
++      // allocation needs any, are admitted at the order floor.
++      is_boundary = false;
++      builder->pending.minimum_issue_cycle = iree_max(
++          builder->next_issue_cycle,
++          locked_floor_started ? locked_floor_cycle : builder->next_issue_cycle);
++    }
++    if (locked_floor && is_boundary && locked_pack &&
++        packet.descriptor != NULL) {
++      is_boundary = false;
++      if (experiments->locked_hoist > 0) {
++        const iree_string_view_t mnemonic = loom_low_descriptor_set_string(
++            descriptor_set, packet.descriptor->mnemonic_string_ref);
++        hoisted =
++            (experiments->locked_hoist_acc &&
++             iree_string_view_starts_with(mnemonic, IREE_SV("vlda.acc"))) ||
++            (experiments->locked_hoist_st &&
++             iree_string_view_starts_with(mnemonic, IREE_SV("vst.acc"))) ||
++            iree_string_view_find(mnemonic, IREE_SV(".pop."), 0) !=
++                IREE_STRING_VIEW_NPOS ||
++            iree_string_view_find(mnemonic, IREE_SV(".fill"), 0) !=
++                IREE_STRING_VIEW_NPOS;
++      }
++      if (!locked_floor_started) {
++        locked_floor_started = true;
++        locked_floor_cycle = builder->next_issue_cycle;
++      }
++      uint32_t floor_cycle = locked_floor_cycle;
++      if (hoisted) {
++        floor_cycle = floor_cycle > experiments->locked_hoist
++                          ? floor_cycle - experiments->locked_hoist
++                          : 0;
++      }
++      builder->pending.minimum_issue_cycle =
++          iree_max(builder->next_issue_cycle, floor_cycle);
++    } else if (is_boundary && locked_pack && packet.descriptor != NULL) {
+       is_boundary = false;
+       builder->pending.minimum_issue_cycle =
+           iree_max(builder->pending.minimum_issue_cycle,
+@@ -1864,12 +2342,30 @@ static iree_status_t loom_aie2p_bundle_plan_append_block_packets(
+     }
+     IREE_RETURN_IF_ERROR(
+         loom_aie2p_bundle_plan_append_packet(builder, &packet));
++    if (locked_floor && locked_pack && !is_boundary && !hoisted &&
++        packet.descriptor != NULL) {
++      bool floating = false;
++      if (experiments->locked_float) {
++        const iree_string_view_t mnemonic = loom_low_descriptor_set_string(
++            descriptor_set, packet.descriptor->mnemonic_string_ref);
++        floating = strcmp(experiments->locked_float, "all") == 0 ||
++                   loom_aie2p_list_contains(experiments->locked_float,
++                                            mnemonic.data, mnemonic.size,
++                                            /*prefix=*/true);
++      }
++      if (!floating) {
++        locked_floor_cycle = iree_max(locked_floor_cycle,
++                                      (uint32_t)builder->last_admitted_cycle);
++      }
++    }
+     if (is_boundary) {
+       IREE_RETURN_IF_ERROR(loom_aie2p_bundle_plan_flush_pending(
+           builder, builder->pending.end_cycle));
+       builder->pending.minimum_issue_cycle = builder->next_issue_cycle;
+     }
+   }
++  // Edge moves, envelopes and control after the body are not the last op.
++  builder->current_op = NULL;
+   IREE_RETURN_IF_ERROR(loom_aie2p_bundle_plan_flush_pending(
+       builder, builder->pending.end_cycle));
+   builder->pending.minimum_issue_cycle = builder->next_issue_cycle;
+@@ -1984,6 +2480,8 @@ static iree_status_t loom_aie2p_bundle_plan_check_hardware_loop_recurrence(
+                 &replay, builder->instructions, 1, builder->resource_classes,
+                 builder->resource_class_count, admitted_cycle));
+       }
++      IREE_RETURN_IF_ERROR(loom_aie2p_bundle_plan_commit_late_reads(
++          builder, &replay, admitted_cycle));
+     }
+   }
+   *out_admitted = true;
+@@ -2338,6 +2836,29 @@ static iree_status_t loom_aie2p_bundle_plan_build_impl(
+   };
+   IREE_RETURN_IF_ERROR(loom_low_physical_issue_initialize(
+       &frame->schedule, scratch_arena, &builder.issue));
++  builder.bank_map = loom_aie2p_bank_map();
++  if (builder.bank_map) {
++    // Every plan (each core variant, each retry) books banks from the
++    // pre-booked state; with LOOM_EXP_BANKDRIFT the pre-booked slots are
++    // checked shifted instead.
++    IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++        scratch_arena, LOOM_AIE2P_BANK_MAP_CYCLES, sizeof(*builder.bank_busy),
++        (void**)&builder.bank_busy));
++    if (loom_aie2p_bundle_plan_experiments()->bank_drift) {
++      memset(builder.bank_busy, 0, LOOM_AIE2P_BANK_MAP_CYCLES);
++    } else {
++      memcpy(builder.bank_busy, builder.bank_map->pre,
++             LOOM_AIE2P_BANK_MAP_CYCLES);
++    }
++  }
++  if (loom_aie2p_bundle_plan_experiments()->delay_fill_effect_drain) {
++    IREE_RETURN_IF_ERROR(
++        iree_arena_allocate_array(scratch_arena, frame->schedule.block_count,
++                                  sizeof(*builder.block_start_cycles),
++                                  (void**)&builder.block_start_cycles));
++    memset(builder.block_start_cycles, 0,
++           frame->schedule.block_count * sizeof(*builder.block_start_cycles));
++  }
+   IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
+       scratch_arena, builder.pending.capacity, sizeof(*builder.pending.bundles),
+       (void**)&builder.pending.bundles));

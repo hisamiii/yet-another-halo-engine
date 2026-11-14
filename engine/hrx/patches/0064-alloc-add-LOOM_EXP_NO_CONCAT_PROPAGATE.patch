@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:53:08 +0100
+Subject: [PATCH 64/70] alloc : add LOOM_EXP_NO_CONCAT_PROPAGATE
+
+Inferred concat affinity makes AIE2P GEMM decoders spill; opt-out keeps authored chains only.
+---
+ .../codegen/low/allocation/concat_affinity.c    | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/loom/src/loom/codegen/low/allocation/concat_affinity.c b/loom/src/loom/codegen/low/allocation/concat_affinity.c
+index f80e726ef8..b612d994bc 100644
+--- a/loom/src/loom/codegen/low/allocation/concat_affinity.c
++++ b/loom/src/loom/codegen/low/allocation/concat_affinity.c
+@@ -6,6 +6,8 @@
+ 
+ #include "loom/codegen/low/allocation/concat_affinity.h"
+ 
++#include <stdlib.h>
++
+ #include <string.h>
+ 
+ #include "iree/base/bitmap.h"
+@@ -419,8 +421,19 @@ iree_status_t loom_low_allocation_concat_affinity_build(
+         },
+         /*can_alias_storage=*/true);
+   }
+-  IREE_RETURN_IF_ERROR(loom_low_allocation_concat_affinity_propagate_paths(
+-      affinity, descriptor_set, placement, liveness, unit_liveness, arena));
++  // EXPERIMENT: LOOM_EXP_NO_CONCAT_PROPAGATE=1 keeps authored concat chains
++  // but infers no affinity through other ops. The AIE2P GEMM decoders come out
++  // smaller and spill-free without it; a register shuffle cycle may then need a
++  // scratch register that AIE2P cannot take from memory.
++  static int no_propagate = -1;
++  if (no_propagate < 0) {
++    const char* value = getenv("LOOM_EXP_NO_CONCAT_PROPAGATE");
++    no_propagate = value && value[0] == '1';
++  }
++  if (!no_propagate) {
++    IREE_RETURN_IF_ERROR(loom_low_allocation_concat_affinity_propagate_paths(
++        affinity, descriptor_set, placement, liveness, unit_liveness, arena));
++  }
+   *out_affinity = affinity;
+   return iree_ok_status();
+ }

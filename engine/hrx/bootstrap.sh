@@ -118,18 +118,29 @@ if [ ! -f "$build/CMakeCache.txt" ]; then
   cmake -S "$hrx" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" -DIREE_ROCM_PATH="$rocm" \
     -DIREE_DEPENDENCY_MODE=pinned -DIREE_ROCM_DEPENDENCY_MODE=pinned \
-    -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_HAL_DRIVER_TASK=ON \
+    -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_AMD=ON -DIREE_HAL_DRIVER_TASK=ON \
     -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_SAMPLES=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
     -DLIBHRX_BUILD=ON -DLIBHRX_BUILD_HIP_BINDING=ON -DLIBHRX_BUILD_CTS=OFF \
-    -DLOOM_BUILD=ON -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults \
-    -DAMDF_BUILD=ON -DAMDF_FAMILY_XDNA=ON -DLOOM_TARGET_XDNA=ON -DLOOM_TARGET_ARCH_XDNA=ON -DLOOM_EMIT_XDNA=ON
+    -DLOOM_BUILD=ON -DLOOM_TARGET_ALL_AMD=ON -DAMDF_BUILD=ON -DAMDF_FAMILY_XDNA=ON
 fi
-# What the engine uses: the runtime, its HIP binding, the HAL emitter, the compiler (compile reports), the profiler,
-# and the NPU runner (tools/npu_gemm_check.py).
+# What the engine uses: the runtime, the compiler (emits and compile reports), the profiler, and the static
+# libraries engine/build_hrx.sh links into the NPU runners. (HRX main has no iree-xdna-run; tools/npu_gemm_check.py
+# needs another runner.)
 # YAH_HRX_TARGETS overrides the list (a release build needs only libhrx/src/libhrx/libhrx.so).
-read -ra targets <<< "${YAH_HRX_TARGETS:-libhrx/src/libhrx/libhrx.so libhrx/src/binding/hip/libamdhip64.so \
-  loom/src/loom/tools/iree-run-loom/iree-run-loom loom/src/loom/tools/loom-compile/loom-compile \
-  runtime/src/iree/tools/iree-profile/iree-profile experimental/xdna/iree-xdna-run}"
+x=runtime/src/iree/hal/driver/amd/xdna
+read -ra targets <<< "${YAH_HRX_TARGETS:-libhrx/src/libhrx/libhrx.so loom/src/loom/tools/loom-compile/loom-compile \
+  runtime/src/iree/tools/iree-profile/iree-profile \
+  runtime/src/iree/hal/driver/amd/libiree_hal_driver_amd_status.a $x/libiree_hal_driver_amd_xdna_executable_storage.a \
+  libamdf/libamdf_static.a $x/image/aie2p/libiree_hal_driver_amd_xdna_image_aie2p_npu2.a \
+  $x/image/libiree_hal_driver_amd_xdna_image_image.a $x/image/libiree_hal_driver_amd_xdna_image_validation.a \
+  $x/image/libiree_hal_driver_amd_xdna_image_directory.a $x/image/libiree_hal_driver_amd_xdna_image_tables.a \
+  runtime/src/iree/schemas/libiree_schemas_xdna_executable.a runtime/src/iree/hal/libiree_hal_hal.a \
+  runtime/src/iree/io/libiree_io_file_handle.a runtime/src/iree/async/libiree_async_async.a \
+  runtime/src/iree/base/threading/libiree_base_threading_threading.a \
+  runtime/src/iree/base/internal/libiree_base_internal_memory.a \
+  runtime/src/iree/hal/utils/libiree_hal_utils_platform_topology.a \
+  runtime/src/iree/base/internal/libiree_base_internal_sysfs.a runtime/src/iree/base/internal/libiree_base_internal_path.a \
+  runtime/src/iree/base/internal/libiree_base_internal_time.a runtime/src/iree/base/libiree_base_base.a}"
 ninja -C "$build" ${YAH_HRX_JOBS:+-j"$YAH_HRX_JOBS"} "${targets[@]}"
 status=0
 check || status=$?

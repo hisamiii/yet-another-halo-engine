@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:46:35 +0100
+Subject: [PATCH 63/70] alloc : let slices alias before inferred concat
+ affinity
+
+Affinity through vldb claimed slice results first; each became a move (iq3_xxs decoder 157 -> 45 moves).
+---
+ .../src/loom/codegen/low/allocation/coalescing.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/loom/src/loom/codegen/low/allocation/coalescing.c b/loom/src/loom/codegen/low/allocation/coalescing.c
+index 79150eb490..fb5aacbe4a 100644
+--- a/loom/src/loom/codegen/low/allocation/coalescing.c
++++ b/loom/src/loom/codegen/low/allocation/coalescing.c
+@@ -1882,7 +1882,21 @@ iree_status_t loom_low_allocation_coalescing_assign_concat_source_interval(
+       }
+     }
+   }
+-  if (!has_authored_concat_relation) {
++  // An inferred affinity follows an equal-width operand into a later concat.
++  // A slice result can instead alias its source's subrange for free, so the
++  // affinity must not claim it before slice coalescing runs.
++  bool is_aliasing_slice = false;
++  const loom_low_placement_relation_range_t result_range =
++      loom_low_placement_relation_range_for_value_ordinal(context->placement,
++                                                          source_ordinal);
++  for (uint32_t i = 0; i < result_range.count; ++i) {
++    const loom_low_placement_relation_t* relation =
++        &context->placement->relations[result_range.start + i];
++    is_aliasing_slice |=
++        relation->cause == LOOM_LOW_PLACEMENT_CAUSE_LOW_SLICE &&
++        loom_low_placement_relation_can_alias(relation);
++  }
++  if (!has_authored_concat_relation && !is_aliasing_slice) {
+     loom_low_placement_relation_t affinity_relation;
+     if (loom_low_allocation_concat_affinity_relation_for_source(
+             context->concat_affinity, source_ordinal, &affinity_relation)) {

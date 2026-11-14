@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:06:37 +0100
+Subject: [PATCH 21/70] 0019 : port core routes, chained axis and resets to
+ main
+
+---
+ .../target/arch/amd/xdna/aie2p/array/plan.c   |  2 +-
+ .../arch/amd/xdna/aie2p/array/program.c       | 34 +++++++++++--------
+ .../target/arch/amd/xdna/aie2p/array/route.c  | 19 ++++-------
+ .../target/arch/amd/xdna/aie2p/array/route.h  |  2 +-
+ 4 files changed, 27 insertions(+), 30 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index 3aae6c9039..548cc17efe 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -3232,7 +3232,7 @@ static iree_status_t loom_aie2p_array_plan_channels(
+         if (channel->core_stream) {   // two workers' core stream ports
+           if (!loom_aie2p_array_route_cores(
+                   &builder->route_builder, (uint32_t)i,
+-                  channel->source_channel_index,
++                  &builder->route_trees[channel->source_channel_index],
+                   builder->workers[sender->owner_index].coordinate,
+                   builder->workers[receiver->owner_index].coordinate)) {
+             IREE_RETURN_IF_ERROR(
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index f8365bd84e..c129edaa44 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -626,10 +626,11 @@ static iree_status_t loom_aie2p_program_reset_masters(
+         }
+         for (uint8_t c = 0; c < range->count; ++c) {
+           const uint16_t indices[] = {(uint16_t)(range->ordinal + c)};
+-          loom_aie2p_register_update_t update = {0};
+-          IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
+-              plan, loom_aie2p_program_stream_master_enable_field(tile->kind),
+-              coordinate, IREE_ARRAYSIZE(indices), indices, 0, &update));
++          const loom_aie2p_register_update_t update =
++              loom_aie2p_program_resolve_field_update(
++                  plan,
++                  loom_aie2p_program_stream_master_enable_field(tile->kind),
++                  coordinate, indices, 0);
+           if (address_count == IREE_ARRAYSIZE(addresses)) abort();
+           addresses[address_count++] = update.address;
+         }
+@@ -645,14 +646,17 @@ static iree_status_t loom_aie2p_program_reset_masters(
+           for (uint8_t c = 0; c < range->count; ++c) {
+             for (uint16_t slot = 0; slot < 4; ++slot) {
+               const uint16_t indices[] = {(uint16_t)(range->ordinal + c), slot};
+-              loom_aie2p_register_update_t update = {0};
+-              const iree_status_t status = loom_aie2p_program_resolve_field_update(
+-                  plan, LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_SLOT_ENABLE,
+-                  coordinate, IREE_ARRAYSIZE(indices), indices, 0, &update);
+-              if (!iree_status_is_ok(status)) {   // a slave without packet rules
+-                iree_status_ignore(status);
+-                continue;
++              const loom_xdna_register_field_id_t field =
++                  LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_SLOT_ENABLE;
++              if (indices[0] >=
++                      loom_xdna_register_field_dimension(field, 0).count ||
++                  indices[1] >=
++                      loom_xdna_register_field_dimension(field, 1).count) {
++                continue;  // a slave without packet rules
+               }
++              const loom_aie2p_register_update_t update =
++                  loom_aie2p_program_resolve_field_update(plan, field,
++                                                          coordinate, indices, 0);
+               if (address_count == IREE_ARRAYSIZE(addresses)) abort();
+               addresses[address_count++] = update.address;
+             }
+@@ -1293,12 +1297,12 @@ static iree_status_t loom_aie2p_program_append_memory_tile_dma_resets(
+         if (!tile || tile->kind != LOOM_XDNA_TILE_KIND_MEMORY) continue;
+         for (uint16_t channel = 0; channel < tile->dma.channel_count_per_direction; ++channel) {
+           const uint16_t indices[] = {channel};
+-          IREE_RETURN_IF_ERROR(loom_aie2p_program_append_masked_field(
++          loom_aie2p_program_append_masked_field(
+               builder->plan, &builder->array, LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_CONTROL_RESET,
+-              coordinate, IREE_ARRAYSIZE(indices), indices, reset_state));
+-          IREE_RETURN_IF_ERROR(loom_aie2p_program_append_masked_field(
++              coordinate, indices, reset_state);
++          loom_aie2p_program_append_masked_field(
+               builder->plan, &builder->array, LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_S2MM_CONTROL_RESET,
+-              coordinate, IREE_ARRAYSIZE(indices), indices, reset_state));
++              coordinate, indices, reset_state);
+         }
+       }
+     }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
+index 037ea9c958..e2972c2c8d 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
+@@ -712,19 +712,12 @@ bool loom_aie2p_array_route_workers(
+ 
+ bool loom_aie2p_array_route_cores(
+     loom_aie2p_array_route_builder_t* builder, uint32_t channel_index,
+-    uint32_t source_channel_index,
++    loom_aie2p_array_route_tree_t* tree,
+     loom_xdna_tile_coordinate_t sender_coordinate,
+     loom_xdna_tile_coordinate_t receiver_coordinate) {
+-  iree_host_size_t node_index = loom_aie2p_array_route_worker_source(
+-      builder, source_channel_index, sender_coordinate,
+-      LOOM_XDNA_STREAM_PORT_CORE, 0);
+-  if (!loom_aie2p_array_plan_horizontal_route_segment(
+-          builder, channel_index, receiver_coordinate.column, &node_index) ||
+-      !loom_aie2p_array_plan_vertical_route_segment(
+-          builder, channel_index, receiver_coordinate.row, &node_index)) {
+-    return false;
+-  }
+-  loom_aie2p_array_plan_route_destination(builder, channel_index, node_index,
+-                                          LOOM_XDNA_STREAM_PORT_CORE, 0);
+-  return true;
++  // Along the sender's row, then the receiver's column.
++  return loom_aie2p_array_route_stream(
++      builder, channel_index, tree, sender_coordinate,
++      LOOM_XDNA_STREAM_PORT_CORE, 0, receiver_coordinate,
++      LOOM_XDNA_STREAM_PORT_CORE, 0, /*packet=*/false);
+ }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
+index eada46d3dd..87e6d182e3 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
+@@ -189,7 +189,7 @@ bool loom_aie2p_array_route_control(loom_aie2p_array_route_builder_t* builder,
+ // stream channel between two workers). Returns false on link exhaustion.
+ bool loom_aie2p_array_route_cores(
+     loom_aie2p_array_route_builder_t* builder, uint32_t channel_index,
+-    uint32_t source_channel_index,
++    loom_aie2p_array_route_tree_t* tree,
+     loom_xdna_tile_coordinate_t sender_coordinate,
+     loom_xdna_tile_coordinate_t receiver_coordinate);
+ 

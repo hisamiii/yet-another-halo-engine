@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 17:50:05 +0100
+Subject: [PATCH 13/70] 0014-xdna-continuation-invocation
+
+XDNA loader: iree_hal_amd_xdna_executable_query_continuation resolves an entry's control-only continuation
+(no tile setup; valid while the context keeps its resident state). iree-xdna-run --repeat_invocation uses it.
+iree_hal_amd_xdna_executable_query_invocation_ordinal resolves any invocation record of an entry (a streamed entry's
+pushes and waits).
+
+(cherry picked from commit 807783e5be1b2fddc2dad519b5bf7c909f1ecf3e)
+---
+ .../hal/driver/amd/xdna/executable_storage.c  | 45 ++++++++++++++++++-
+ .../hal/driver/amd/xdna/executable_storage.h  | 19 ++++++++
+ 2 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/iree/hal/driver/amd/xdna/executable_storage.c b/runtime/src/iree/hal/driver/amd/xdna/executable_storage.c
+index b4bea29fb8..7d2213323c 100644
+--- a/runtime/src/iree/hal/driver/amd/xdna/executable_storage.c
++++ b/runtime/src/iree/hal/driver/amd/xdna/executable_storage.c
+@@ -176,13 +176,36 @@ iree_status_t iree_hal_amd_xdna_executable_storage_query_invocation(
+     iree_host_size_t storage_count,
+     const iree_hal_amd_xdna_executable_storage_t* storage,
+     amdf_xdna_kernel_command_t* out_command) {
++  return iree_hal_amd_xdna_executable_query_continuation(
++      image, entry_ordinal, storage_count, storage, /*continuation=*/false,
++      out_command);
++}
++
++static iree_status_t iree_hal_amd_xdna_executable_command(
++    const iree_hal_amd_xdna_image_t* image, uint32_t entry_ordinal,
++    iree_host_size_t storage_count,
++    const iree_hal_amd_xdna_executable_storage_t* storage, bool by_ordinal,
++    uint32_t invocation_ordinal, bool continuation,
++    amdf_xdna_kernel_command_t* out_command) {
+   iree_xdna_elf_entry_record_t entry;
+   IREE_RETURN_IF_ERROR(iree_hal_amd_xdna_executable_entry(
+       image, entry_ordinal, storage_count, storage, &entry));
+   const iree_hal_amd_xdna_image_tables_t* tables =
+       iree_hal_amd_xdna_image_tables(image);
+-  const iree_xdna_elf_invocation_record_t invocation =
++  iree_xdna_elf_invocation_record_t invocation =
+       iree_hal_amd_xdna_image_tables_invocation(tables, entry.first_invocation);
++  if (by_ordinal) {
++    if (invocation_ordinal >= entry.invocation_count) {
++      return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
++                              "XDNA invocation ordinal %u of %u",
++                              invocation_ordinal, entry.invocation_count);
++    }
++    invocation = iree_hal_amd_xdna_image_tables_invocation(
++        tables, entry.first_invocation + invocation_ordinal);
++  } else if (continuation) {
++    invocation = iree_hal_amd_xdna_image_tables_invocation(
++        tables, entry.first_invocation + invocation.next_invocation);
++  }
+   const uint32_t ordinal = iree_hal_amd_xdna_image_tables_allocation_use(
+       tables, entry.first_allocation_use + invocation.allocation_use);
+   const iree_xdna_elf_allocation_record_t allocation =
+@@ -199,3 +222,23 @@ iree_status_t iree_hal_amd_xdna_executable_storage_query_invocation(
+   };
+   return iree_ok_status();
+ }
++
++iree_status_t iree_hal_amd_xdna_executable_query_continuation(
++    const iree_hal_amd_xdna_image_t* image, uint32_t entry_ordinal,
++    iree_host_size_t storage_count,
++    const iree_hal_amd_xdna_executable_storage_t* storage, bool continuation,
++    amdf_xdna_kernel_command_t* out_command) {
++  return iree_hal_amd_xdna_executable_command(image, entry_ordinal,
++                                              storage_count, storage, false, 0,
++                                              continuation, out_command);
++}
++
++iree_status_t iree_hal_amd_xdna_executable_query_invocation_ordinal(
++    const iree_hal_amd_xdna_image_t* image, uint32_t entry_ordinal,
++    iree_host_size_t storage_count,
++    const iree_hal_amd_xdna_executable_storage_t* storage, uint32_t ordinal,
++    amdf_xdna_kernel_command_t* out_command) {
++  return iree_hal_amd_xdna_executable_command(image, entry_ordinal,
++                                              storage_count, storage, true,
++                                              ordinal, false, out_command);
++}
+diff --git a/runtime/src/iree/hal/driver/amd/xdna/executable_storage.h b/runtime/src/iree/hal/driver/amd/xdna/executable_storage.h
+index b0f9e14cc6..d149cdf03a 100644
+--- a/runtime/src/iree/hal/driver/amd/xdna/executable_storage.h
++++ b/runtime/src/iree/hal/driver/amd/xdna/executable_storage.h
+@@ -100,6 +100,25 @@ iree_status_t iree_hal_amd_xdna_executable_storage_query_invocation(
+     const iree_hal_amd_xdna_executable_storage_t* storage,
+     amdf_xdna_kernel_command_t* out_command);
+ 
++// Diagnostic: resolves invocation zero, or with |continuation| the image's
++// named continuation after it. The continuation is valid only while context,
++// backing and resident tile state stay intact (not guaranteed when
++// time-sliced).
++// Resolves the entry's invocation record |ordinal| (entry-relative) to a
++// command. Streamed entries publish four: the establishing run, the even and
++// odd pushes and the egress waits.
++iree_status_t iree_hal_amd_xdna_executable_query_invocation_ordinal(
++    const iree_hal_amd_xdna_image_t* image, uint32_t entry_ordinal,
++    iree_host_size_t storage_count,
++    const iree_hal_amd_xdna_executable_storage_t* storage, uint32_t ordinal,
++    amdf_xdna_kernel_command_t* out_command);
++
++iree_status_t iree_hal_amd_xdna_executable_query_continuation(
++    const iree_hal_amd_xdna_image_t* image, uint32_t entry_ordinal,
++    iree_host_size_t storage_count,
++    const iree_hal_amd_xdna_executable_storage_t* storage, bool continuation,
++    amdf_xdna_kernel_command_t* out_command);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif

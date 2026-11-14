@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:18:16 +0100
+Subject: [PATCH 48/70] 0045 : follow main's source access pointer
+
+---
+ loom/src/loom/target/arch/amdgpu/lower/memory_cache.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amdgpu/lower/memory_cache.c b/loom/src/loom/target/arch/amdgpu/lower/memory_cache.c
+index dfadcaf846..4bac19b689 100644
+--- a/loom/src/loom/target/arch/amdgpu/lower/memory_cache.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/memory_cache.c
+@@ -224,8 +224,8 @@ loom_amdgpu_memory_cache_policy_resolve(
+   const bool outer_nt = temporal == LOOM_CACHE_TEMPORAL_NON_TEMPORAL ||
+                         temporal == LOOM_CACHE_TEMPORAL_REGULAR_NON_TEMPORAL;
+   if ((near_nt || outer_nt) &&
+-      (access->source.operation_kind == LOOM_MEMORY_ACCESS_OPERATION_LOAD ||
+-       access->source.operation_kind == LOOM_MEMORY_ACCESS_OPERATION_STORE)) {
++      (access->source->operation_kind == LOOM_MEMORY_ACCESS_OPERATION_LOAD ||
++       access->source->operation_kind == LOOM_MEMORY_ACCESS_OPERATION_STORE)) {
+     if (near_nt && iree_any_bit_set(row->attr_flags, LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_SLC)) {
+       out_attrs->flags |= LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_SLC;
+       out_attrs->slc = 1;
+@@ -235,7 +235,7 @@ loom_amdgpu_memory_cache_policy_resolve(
+       out_attrs->dlc = 1;
+     }
+     if (near_nt && iree_any_bit_set(row->attr_flags, LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_GLC) &&
+-        access->source.operation_kind == LOOM_MEMORY_ACCESS_OPERATION_STORE) {
++        access->source->operation_kind == LOOM_MEMORY_ACCESS_OPERATION_STORE) {
+       out_attrs->flags |= LOOM_AMDGPU_MEMORY_CACHE_POLICY_ATTR_GLC;
+       out_attrs->glc = 1;
+     }

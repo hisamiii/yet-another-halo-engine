@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:09:02 +0100
+Subject: [PATCH 30/70] 0021-0026 : port intake and stream timing to main
+
+---
+ .../arch/amd/xdna/aie2p/core_descriptors.py   | 20 ++++--------------
+ .../target/arch/amd/xdna/aie2p/array/plan.c   | 21 +++++++++++--------
+ .../arch/amd/xdna/aie2p/array/program.c       | 19 ++++++++---------
+ 3 files changed, 25 insertions(+), 35 deletions(-)
+
+diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py b/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
+index 38a6c3a211..a3e8739c60 100644
+--- a/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
++++ b/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
+@@ -57,9 +57,6 @@ from loom.target.arch.amd.xdna.aie2p.core_schedule_data import CORE_SCHEDULE_TAB
+ from loom.target.arch.amd.xdna.aie2p.core_stack_descriptors import (
+     STACK_SPILLABLE_CLASSES,
+ )
+-from loom.target.arch.amd.xdna.aie2p.core_stream_descriptors import (
+-    _SCALAR_STREAM_ISSUE_EVENT,
+-)
+ from loom.target.low_descriptors import (
+     AsmForm,
+     AsmImmediate,
+@@ -2011,19 +2008,8 @@ def _event_separations() -> tuple[EventSeparation, ...]:
+                 for consumer_access in ("read", "write")
+             )
+     # Scalar stream order is an issue constraint, not a wait for the status
+-    # result. Other protocols retain their own timing: cascade instructions
+-    # consume data at different stages, and locks order memory retirement.
+-    result.append(
+-        EventSeparation(
+-            _SCALAR_STREAM_ISSUE_EVENT,
+-            _SCALAR_STREAM_ISSUE_EVENT,
+-            1,
+-            ModelQuality.EXACT,
+-        )
+-    )
+-    # Cascade transfers: in order on one link, independent across links and of
+-    # local memory traffic, which only keeps its issue order around them.
+-    # Scalar stream ports: same in-order / independent rule as the cascade links.
++    # result: in order on one port, independent across the input and output
++    # ports and of local memory traffic, like the cascade links below.
+     stream_events = (STREAM_READ_EVENT, STREAM_WRITE_EVENT)
+     for producer in stream_events:
+         for consumer in stream_events:
+@@ -2045,6 +2031,8 @@ def _event_separations() -> tuple[EventSeparation, ...]:
+                 result.append(
+                     EventSeparation(memory_event, stream_event, 0, ModelQuality.EXACT)
+                 )
++    # Cascade transfers: in order on one link, independent across links and of
++    # local memory traffic, which only keeps its issue order around them.
+     cascade_events = (CASCADE_READ_EVENT, CASCADE_WRITE_EVENT)
+     for producer in cascade_events:
+         for consumer in cascade_events:
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index 4fe084c5ad..f28572d690 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -3309,7 +3309,7 @@ static iree_status_t loom_aie2p_array_plan_intake_channel(
+     const loom_aie2p_array_dma_plan_t* dma = &builder->dma_channels[i];
+     if (dma->channel_index == channel->intake_panel &&
+         dma->flags == 0 &&
+-        dma->direction == LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY &&
++        dma->direction == LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY &&
+         loom_aie2p_array_coordinates_equal(dma->coordinate,
+                                            worker->coordinate)) {
+       panel_core = dma;
+@@ -3335,7 +3335,7 @@ static iree_status_t loom_aie2p_array_plan_intake_channel(
+     loom_aie2p_array_shim_endpoint_proposal_t shim_proposal = {0};
+     if (!loom_aie2p_array_select_shim_endpoint(
+             builder, channel->stage_column,
+-            LOOM_AIE2P_ARRAY_DMA_DIRECTION_MEMORY_TO_STREAM,
++            LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM,
+             builder->plan->stream_panels ? (uint16_t)(2u * chain) : chain,
+             &shim_proposal)) {
+       return loom_aie2p_array_reject_channel_resources(
+@@ -3399,7 +3399,7 @@ static iree_status_t loom_aie2p_array_plan_intake_channel(
+         (loom_aie2p_array_dma_plan_t){
+             .channel_index = channel_index,
+             .coordinate = stage,
+-            .direction = LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY,
++            .direction = LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY,
+             .dma_channel = fill_channel,
+             .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE |
+                      LOOM_AIE2P_ARRAY_DMA_FLAG_INTAKE,
+@@ -3414,8 +3414,9 @@ static iree_status_t loom_aie2p_array_plan_intake_channel(
+           ring.owner_offsets[r];
+     }
+     if (!loom_aie2p_array_route_ingress(
+-            &builder->route_builder, channel_index, channel_index,
+-            shim_dma->coordinate, shim_dma->dma_channel, stage,
++            &builder->route_builder, channel_index,
++            &builder->route_trees[channel_index], shim_dma->coordinate,
++            shim_dma->dma_channel, stage,
+             LOOM_XDNA_STREAM_PORT_DMA, fill_channel, /*vertical_first=*/false)) {
+       return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
+     }
+@@ -3464,7 +3465,7 @@ static iree_status_t loom_aie2p_array_plan_intake_channel(
+       (loom_aie2p_array_dma_plan_t){
+           .channel_index = channel_index,
+           .coordinate = stage,
+-          .direction = LOOM_AIE2P_ARRAY_DMA_DIRECTION_MEMORY_TO_STREAM,
++          .direction = LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM,
+           .dma_channel = panel_drain->dma_channel,
+           .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE |
+                    LOOM_AIE2P_ARRAY_DMA_FLAG_INTAKE,
+@@ -3490,7 +3491,7 @@ static iree_status_t loom_aie2p_array_plan_intake_channel(
+       (loom_aie2p_array_dma_plan_t){
+           .channel_index = channel_index,
+           .coordinate = worker->coordinate,
+-          .direction = LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY,
++          .direction = LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY,
+           .dma_channel = panel_core->dma_channel,
+           .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_INTAKE,
+           .buffer_descriptor_start = core_resources->next_buffer_descriptor,
+@@ -3530,8 +3531,10 @@ static iree_status_t loom_aie2p_array_plan_intake_channel(
+                                      owner_offset},
+         };
+   }
+-  loom_aie2p_array_bind_worker_port(builder, receiver, channel_index,
+-                                    core_lock_index);
++  loom_aie2p_array_bind_worker_port(
++      builder, receiver, channel_index, core_lock_index,
++      loom_xdna_array_load_window(builder->family, worker->coordinate,
++                                  worker->coordinate));
+   return iree_ok_status();
+ }
+ 
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index 4eb20ae430..7f29947b7c 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -877,7 +877,7 @@ static const loom_aie2p_array_dma_plan_t* loom_aie2p_program_intake_panel_core(
+   for (iree_host_size_t i = 0; i < plan->dma_channel_count; ++i) {
+     const loom_aie2p_array_dma_plan_t* dma = &plan->dma_channels[i];
+     if (dma->channel_index == intake->intake_panel && dma->flags == 0 &&
+-        dma->direction == LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY &&
++        dma->direction == LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY &&
+         dma->coordinate.column == core->coordinate.column &&
+         dma->coordinate.row == core->coordinate.row) {
+       return dma;
+@@ -975,7 +975,7 @@ static iree_status_t loom_aie2p_program_build_intake_memory_tile_descriptor(
+   const loom_aie2p_array_channel_t* source =
+       &plan->channels[channel->source_channel_index];
+   const bool fill =
+-      dma->direction == LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY;
++      dma->direction == LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY;
+   const uint32_t chain = source->intake_chain_lock;
+   const uint32_t m = channel->intake_member;
+   const loom_aie2p_array_lock_plan_t* acquire_lock =
+@@ -1003,7 +1003,7 @@ static iree_status_t loom_aie2p_program_build_intake_memory_tile_descriptor(
+   const uint16_t indices[] = {buffer_descriptor};
+   uint32_t* words = loom_aie2p_program_append_register_block_write32(
+       &builder->array,
+-      (uint32_t)loom_xdna_register_field_address_admitted(
++      (uint32_t)loom_xdna_register_field_address(
+           plan->family,
+           LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD0_BUFFER_LENGTH,
+           dma->coordinate, indices),
+@@ -1060,26 +1060,25 @@ static iree_status_t loom_aie2p_program_queue_task(
+   const bool memory_tile =
+       iree_any_bit_set(dma->flags, LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE);
+   const bool drain =
+-      dma->direction == LOOM_AIE2P_ARRAY_DMA_DIRECTION_MEMORY_TO_STREAM;
++      dma->direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM;
+   const uint16_t indices[] = {dma->dma_channel};
+-  loom_aie2p_register_update_t task = {0};
+-  IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
++  loom_aie2p_register_update_t task = loom_aie2p_program_resolve_field_update(
+       builder->plan,
+       memory_tile
+           ? (drain ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_START_BD_ID
+                    : LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_S2MM_START_QUEUE_START_BD_ID)
+           : (drain ? LOOM_XDNA_REGISTER_FIELD_COMPUTE_MEMORY_DMA_CHANNEL_MM2S_START_QUEUE_START_BD_ID
+                    : LOOM_XDNA_REGISTER_FIELD_COMPUTE_MEMORY_DMA_CHANNEL_S2MM_START_QUEUE_START_BD_ID),
+-      dma->coordinate, IREE_ARRAYSIZE(indices), indices, descriptor, &task));
+-  loom_aie2p_register_update_t count = {0};
+-  IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
++      dma->coordinate, indices, descriptor);
++  const loom_aie2p_register_update_t count =
++      loom_aie2p_program_resolve_field_update(
+       builder->plan,
+       memory_tile
+           ? (drain ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_REPEAT_COUNT
+                    : LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_S2MM_START_QUEUE_REPEAT_COUNT)
+           : (drain ? LOOM_XDNA_REGISTER_FIELD_COMPUTE_MEMORY_DMA_CHANNEL_MM2S_START_QUEUE_REPEAT_COUNT
+                    : LOOM_XDNA_REGISTER_FIELD_COMPUTE_MEMORY_DMA_CHANNEL_S2MM_START_QUEUE_REPEAT_COUNT),
+-      dma->coordinate, IREE_ARRAYSIZE(indices), indices, repeat, &count));
++      dma->coordinate, indices, repeat);
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_register_update(&count, &task));
+   loom_aie2p_program_append_register_write32(&builder->control, task.address,
+                                              task.value);

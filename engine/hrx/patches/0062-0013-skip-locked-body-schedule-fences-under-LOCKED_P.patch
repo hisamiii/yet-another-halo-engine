@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:40:14 +0100
+Subject: [PATCH 62/70] 0013 : skip locked-body schedule fences under
+ LOCKED_PACK
+
+Main fences every locked op; each fence closed the bundle, so locked loops issued one instruction per bundle.
+---
+ .../loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
+index f7ee2a2dd3..f6ea0d45a4 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
+@@ -16,6 +16,7 @@
+ #include "loom/codegen/low/schedule/physical_issue.h"
+ #include "loom/ir/module.h"
+ #include "loom/ir/types.h"
++#include "loom/codegen/low/function.h"
+ #include "loom/ops/low/ops.h"
+ #include "loom/target/arch/amd/xdna/aie2p/core_structure.h"
+ #include "loom/target/arch/amd/xdna/aie2p/descriptors/core_descriptors.h"
+@@ -2291,6 +2292,15 @@ static iree_status_t loom_aie2p_bundle_plan_append_block_packets(
+       locked_pack = value && value[0] == '1';
+     }
+     builder->current_op = packet.node->op;
++    // Main spells a locked body's order as a schedule fence after every op.
++    // Under LOCKED_PACK the order is the issue floor below, so a fence emits
++    // nothing and must not close the pending bundle.
++    if (locked_pack && packet.descriptor == NULL &&
++        loom_low_schedule_fence_isa(packet.node->op) &&
++        loom_low_function_schedule(builder->frame->function_op) ==
++            LOOM_LOW_SCHEDULE_LOCKED) {
++      continue;
++    }
+     bool hoisted = false;
+     if (locked_floor && is_boundary && locked_pack &&
+         packet.descriptor == NULL && experiments->locked_views) {

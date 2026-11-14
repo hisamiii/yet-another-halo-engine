@@ -1,0 +1,578 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 17:50:05 +0100
+Subject: [PATCH 20/70] 0019-loom-xdna-npu-ffn-block
+
+index 033b166e8..fcdaf1c96 100644
+
+(cherry picked from commit fa01bda1fe51cac71d2c55740814ee19a5021f9d)
+---
+ .../arch/amd/xdna/aie2p/array/binding.c       |  35 +++-
+ .../target/arch/amd/xdna/aie2p/array/plan.c   |  51 +++--
+ .../target/arch/amd/xdna/aie2p/array/plan.h   |   7 +
+ .../arch/amd/xdna/aie2p/array/program.c       | 179 ++++++++++++++++--
+ .../target/arch/amd/xdna/aie2p/array/route.c  |  19 ++
+ .../target/arch/amd/xdna/aie2p/array/route.h  |   8 +
+ .../arch/amd/xdna/aie2p/array/topology.c      |  47 +++--
+ 7 files changed, 301 insertions(+), 45 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
+index 129178a25f..1d6c472d72 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
+@@ -112,6 +112,8 @@ bool loom_aie2p_array_resolve_binding_transfer(
+   uint8_t dma_dimension_count = 0;
+   uint32_t iteration_step_size = 0;
+   uint16_t iteration_wrap = 0;
++  uint16_t axis_chain_length = 0;
++  uint64_t axis_chain_step_bytes = 0;
+   loom_aie2p_array_binding_dma_dimension_t
+       dma_dimensions[LOOM_AIE2P_ARRAY_BINDING_DMA_DIMENSION_CAPACITY] = {0};
+ 
+@@ -208,7 +210,8 @@ bool loom_aie2p_array_resolve_binding_transfer(
+     binding_span_byte_length = binding_span_bit_length / 8u;
+ 
+     if (!span.dense) {
+-      if (transfer_rank == dma_facts->address_dimension_count + 1u) {
++      if (transfer_rank == dma_facts->address_dimension_count + 1u ||
++          transfer_rank == dma_facts->address_dimension_count + 2u) {
+         // One axis too many: the outermost addressed axis becomes the
+         // descriptor iteration, the queued task repeating the descriptor once
+         // per index.
+@@ -236,6 +239,30 @@ bool loom_aie2p_array_resolve_binding_transfer(
+         first_transfer_axis = (uint8_t)(outer + 1u);
+         --transfer_rank;
+       }
++      if (transfer_rank == dma_facts->address_dimension_count + 1u) {
++        // Two axes too many: the next one becomes a chain of descriptors, one
++        // per index, each offset by the axis stride (the chain runs once per
++        // repeat of the queued task, so the iteration axis stays outermost).
++        uint8_t chained = first_transfer_axis;
++        while (geometry->axes[chained].extent == 1) ++chained;
++        const uint64_t dimension = geometry->axes[chained].extent;
++        uint64_t step_bits = 0;
++        if (!iree_checked_mul_u64(geometry->axes[chained].element_stride,
++                                  (uint64_t)element_bit_width, &step_bits) ||
++            (step_bits & 7u) != 0 || step_bits == 0 || dimension < 2 ||
++            dimension > LOOM_AIE2P_ARRAY_BINDING_AXIS_CHAIN_MAX ||
++            transfer_byte_length % dimension != 0) {
++          return loom_aie2p_array_reject_binding_transfer(
++              IREE_SV("the chained second axis exceeds the descriptor chain "
++                      "limit"),
++              out_reason);
++        }
++        axis_chain_length = (uint16_t)dimension;
++        axis_chain_step_bytes = step_bits / 8u;
++        transfer_byte_length /= dimension;
++        first_transfer_axis = (uint8_t)(chained + 1u);
++        --transfer_rank;
++      }
+       if (transfer_rank > dma_facts->address_dimension_count) {
+         return loom_aie2p_array_reject_binding_transfer(
+             IREE_SV("the strided transfer requires more address dimensions "
+@@ -278,7 +305,7 @@ bool loom_aie2p_array_resolve_binding_transfer(
+         out_reason);
+   }
+   uint64_t chain_length = 1;
+-  if (iteration_wrap == 0 &&
++  if (iteration_wrap == 0 && axis_chain_length == 0 &&
+       task_repeat_count > dma_facts->maximum_task_repeat_count &&
+       maximum_chain_length > 1 &&
+       task_repeat_count % dma_facts->maximum_task_repeat_count == 0 &&
+@@ -308,7 +335,9 @@ bool loom_aie2p_array_resolve_binding_transfer(
+   binding_plan->binding_span_byte_length = binding_span_byte_length;
+   binding_plan->transfer_byte_length = (uint32_t)transfer_byte_length;
+   binding_plan->task_repeat_count = (uint16_t)task_repeat_count;
+-  binding_plan->chain_length = (uint16_t)chain_length;
++  binding_plan->chain_length =
++      axis_chain_length ? axis_chain_length : (uint16_t)chain_length;
++  binding_plan->chain_step_byte_length = axis_chain_step_bytes;
+   binding_plan->dma_dimension_count = dma_dimension_count;
+   binding_plan->iteration_step_size = iteration_step_size;
+   binding_plan->iteration_wrap = iteration_wrap;
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index cacf3254d7..3aae6c9039 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -1481,8 +1481,14 @@ static iree_status_t loom_aie2p_array_admit_memory_tile_panel(
+         (uint32_t)(units - stage_dma->transfer_length_offset);
+     member->stage_panel_group_count = loom_aie2p_array_panel_groups(
+         records, member->stage_panel_group_records);
+-    member->stage_panel_stream = member->stage_panel_group_count > 1 &&
+-                                 loom_aie2p_array_panel_stream();
++    // EXPERIMENT LOOM_EXP_PANEL_STREAM_SINGLE=1: a single group streams too
++    // (an interleaved panel's core stream fill takes the whole panel's
++    // credits).
++    const char* single_spec = getenv("LOOM_EXP_PANEL_STREAM_SINGLE");
++    member->stage_panel_stream =
++        (member->stage_panel_group_count > 1 ||
++         (single_spec != NULL && atoi(single_spec) != 0)) &&
++        loom_aie2p_array_panel_stream();
+     if (member->stage_panel_group_count > 1 && repeat_count > 63) {
+       return loom_aie2p_array_reject_channel_resources(
+           builder, (uint32_t)i, stage,
+@@ -1864,11 +1870,11 @@ static iree_status_t loom_aie2p_array_plan_workers(
+           &builder->endpoints[channel->sender_endpoint_index];
+       const loom_aie2p_array_endpoint_t* receiver =
+           &builder->endpoints[channel->receiver_endpoint_index];
+-      const loom_aie2p_array_endpoint_t* endpoint =
+-          sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER
+-              ? sender
+-              : receiver;
+-      core_stream_count += endpoint->owner_index == i;
++      core_stream_count +=
++          (sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER &&
++           sender->owner_index == i) +
++          (receiver->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER &&
++           receiver->owner_index == i);
+     }
+     builder->worker_port_cursor +=
+         worker->active_endpoint_count - core_stream_count;
+@@ -2522,7 +2528,7 @@ static iree_status_t loom_aie2p_array_plan_stage(
+   const uint32_t credit_lock_index = loom_aie2p_array_append_lock_pair(
+       builder, channel_index, LOOM_AIE2P_ARRAY_ENDPOINT_DIRECTION_RECEIVE,
+       &ring);
+-  if (groups > 1) {
++  if (groups > 1 || (panel && channel->stage_panel_stream)) {
+     // Every fill descriptor takes one credit; later groups gate the owner's
+     // own drains through the lock pairs that follow.
+     builder->locks[credit_lock_index].initial_value = (int8_t)fill_count;
+@@ -2863,11 +2869,21 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+   // streamed panel owner transfers each group with its own descriptor.
+   uint16_t shim_descriptor_count = 1;
+   if (builder->plan->stream_panels) {
++    // A chained transfer axis takes its chain in each set.
++    const loom_aie2p_array_binding_plan_t* binding_plan =
++        channel->binding_plan_index != UINT32_MAX
++            ? &builder->binding_plans[channel->binding_plan_index]
++            : NULL;
++    const uint16_t chain =
++        binding_plan != NULL && binding_plan->chain_step_byte_length != 0
++            ? binding_plan->chain_length
++            : 1u;
+     shim_descriptor_count =
+-        (uint16_t)(2u * (channel->stage_panel_owner == channel_index &&
+-                                 channel->stage_panel_stream
+-                             ? channel->stage_panel_group_count
+-                             : 1u));
++        (uint16_t)(2u * chain *
++                   (channel->stage_panel_owner == channel_index &&
++                            channel->stage_panel_stream
++                        ? channel->stage_panel_group_count
++                        : 1u));
+   }
+   if (owns_shim_dma) {
+     if (!loom_aie2p_array_select_shim_endpoint(
+@@ -3213,6 +3229,17 @@ static iree_status_t loom_aie2p_array_plan_channels(
+         break;
+       }
+       case LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_ROUTED_DMA: {
++        if (channel->core_stream) {   // two workers' core stream ports
++          if (!loom_aie2p_array_route_cores(
++                  &builder->route_builder, (uint32_t)i,
++                  channel->source_channel_index,
++                  builder->workers[sender->owner_index].coordinate,
++                  builder->workers[receiver->owner_index].coordinate)) {
++            IREE_RETURN_IF_ERROR(
++                loom_aie2p_array_diagnose_route_capacity(builder, (uint32_t)i));
++          }
++          break;
++        }
+         IREE_RETURN_IF_ERROR(loom_aie2p_array_plan_routed_channel(
+             builder, (uint32_t)i, sender, receiver));
+         break;
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+index 0c00a5a078..bff5e2db30 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -521,6 +521,9 @@ typedef struct loom_aie2p_array_binding_dma_dimension_t {
+ } loom_aie2p_array_binding_dma_dimension_t;
+ 
+ // Runtime patch record connecting an ABI binding to one shim DMA program.
++// Descriptors a chained transfer axis may take (shim descriptor budget).
++#define LOOM_AIE2P_ARRAY_BINDING_AXIS_CHAIN_MAX 8
++
+ typedef struct loom_aie2p_array_binding_plan_t {
+   // Index of the logical binding represented by this patch.
+   uint32_t binding_index;
+@@ -557,6 +560,10 @@ typedef struct loom_aie2p_array_binding_plan_t {
+   // repeats per cycle); zero when unused.
+   uint32_t iteration_step_size;
+   uint16_t iteration_wrap;
++  // A strided transfer two axes beyond: the next axis is a chain of
++  // chain_length descriptors, descriptor i offset by i chain_step_byte_length
++  // bytes; zero for a chain of identical descriptors.
++  uint64_t chain_step_byte_length;
+ } loom_aie2p_array_binding_plan_t;
+ 
+ // Complete arena-owned logical topology and deterministic NPU2 physical plan.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index 0aa741f35d..f8365bd84e 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -581,8 +581,108 @@ static iree_status_t loom_aie2p_program_accumulate_shim_mux_route(
+   return loom_aie2p_program_accumulate_route_update(builder, &update);
+ }
+ 
++// LOOM_EXP_ROUTE_RESET: disables every data master (core, DMA, compass ports)
++// of the tiles in the image's columns before its routes are written. A context
++// that ran an image of another layout keeps that image's masters otherwise: one
++// still selecting a slave this image routes broadcasts its stream into a sink
++// nobody drains, and the stream stalls.
++static iree_status_t loom_aie2p_program_reset_masters(
++    loom_aie2p_array_program_builder_t* builder) {
++  const loom_aie2p_array_plan_t* plan = builder->plan;
++  const loom_xdna_array_family_t* family = plan->family;
++  uint16_t columns = 0;
++  for (iree_host_size_t i = 0; i < plan->route_count; ++i) {
++    columns = iree_max(columns, (uint16_t)(plan->routes[i].coordinate.column + 1));
++  }
++  for (iree_host_size_t i = 0; i < plan->worker_plan_count; ++i) {
++    columns = iree_max(columns,
++                       (uint16_t)(plan->worker_plans[i].coordinate.column + 1));
++  }
++  for (uint16_t column = 0; column < columns; ++column) {
++    for (uint16_t row = 0; row < family->row_count; ++row) {
++      const loom_xdna_tile_coordinate_t coordinate = {.column = column,
++                                                      .row = row};
++      const loom_xdna_tile_facts_t* tile =
++          loom_xdna_array_tile_facts(family, coordinate);
++      if (!tile) continue;
++      uint32_t addresses[256];
++      iree_host_size_t address_count = 0;
++      for (uint8_t r = 0; r < family->stream_port_count; ++r) {
++        const loom_xdna_stream_port_range_t* range = &family->stream_ports[r];
++        if (range->tile_kind != tile->kind ||
++            range->direction != LOOM_XDNA_STREAM_DIRECTION_MASTER) {
++          continue;
++        }
++        switch (range->port) {
++          case LOOM_XDNA_STREAM_PORT_CORE:
++          case LOOM_XDNA_STREAM_PORT_DMA:
++          case LOOM_XDNA_STREAM_PORT_SOUTH:
++          case LOOM_XDNA_STREAM_PORT_WEST:
++          case LOOM_XDNA_STREAM_PORT_NORTH:
++          case LOOM_XDNA_STREAM_PORT_EAST:
++            break;
++          default:
++            continue;
++        }
++        for (uint8_t c = 0; c < range->count; ++c) {
++          const uint16_t indices[] = {(uint16_t)(range->ordinal + c)};
++          loom_aie2p_register_update_t update = {0};
++          IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
++              plan, loom_aie2p_program_stream_master_enable_field(tile->kind),
++              coordinate, IREE_ARRAYSIZE(indices), indices, 0, &update));
++          if (address_count == IREE_ARRAYSIZE(addresses)) abort();
++          addresses[address_count++] = update.address;
++        }
++      }
++      // the shim's packet rules (task-completion routes): every slot of every slave
++      if (tile->kind == LOOM_XDNA_TILE_KIND_SHIM_NOC) {
++        for (uint8_t r = 0; r < family->stream_port_count; ++r) {
++          const loom_xdna_stream_port_range_t* range = &family->stream_ports[r];
++          if (range->tile_kind != tile->kind ||
++              range->direction != LOOM_XDNA_STREAM_DIRECTION_SLAVE) {
++            continue;
++          }
++          for (uint8_t c = 0; c < range->count; ++c) {
++            for (uint16_t slot = 0; slot < 4; ++slot) {
++              const uint16_t indices[] = {(uint16_t)(range->ordinal + c), slot};
++              loom_aie2p_register_update_t update = {0};
++              const iree_status_t status = loom_aie2p_program_resolve_field_update(
++                  plan, LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_SLOT_ENABLE,
++                  coordinate, IREE_ARRAYSIZE(indices), indices, 0, &update);
++              if (!iree_status_is_ok(status)) {   // a slave without packet rules
++                iree_status_ignore(status);
++                continue;
++              }
++              if (address_count == IREE_ARRAYSIZE(addresses)) abort();
++              addresses[address_count++] = update.address;
++            }
++          }
++        }
++      }
++      // the tile's master registers, ascending: one zero block per consecutive run
++      for (iree_host_size_t i = 1; i < address_count; ++i) {
++        for (iree_host_size_t j = i; j > 0 && addresses[j - 1] > addresses[j]; --j) {
++          const uint32_t t = addresses[j];
++          addresses[j] = addresses[j - 1], addresses[j - 1] = t;
++        }
++      }
++      for (iree_host_size_t i = 0; i < address_count;) {
++        iree_host_size_t n = 1;
++        while (i + n < address_count && addresses[i + n] == addresses[i] + 4u * n) ++n;
++        memset(loom_aie2p_program_append_register_block_write32(&builder->array, addresses[i], n), 0,
++               n * sizeof(uint32_t));
++        i += n;
++      }
++    }
++  }
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_aie2p_program_build_routes(
+     loom_aie2p_array_program_builder_t* builder) {
++  if (getenv("LOOM_EXP_ROUTE_RESET")) {
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_reset_masters(builder));
++  }
+   for (iree_host_size_t i = 0; i < builder->plan->route_count; ++i) {
+     const loom_aie2p_array_route_plan_t* route = &builder->plan->routes[i];
+     switch (route->switch_kind) {
+@@ -795,7 +895,7 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+   const uint32_t groups = channel->stage_panel_owner != UINT32_MAX
+                               ? channel->stage_panel_group_count
+                               : 1u;
+-  const bool stream = groups > 1 && channel->stage_panel_stream;
++  const bool stream = groups >= 1 && channel->stage_panel_stream;
+   // Lock values: a streamed fill takes a whole panel of credits and releases
+   // as many replays; each streamed replay takes one ready and returns one
+   // credit (its own pair's credit lock).
+@@ -1117,7 +1217,7 @@ static iree_status_t loom_aie2p_program_start_memory_tile_dma(
+   const uint32_t groups = channel->stage_panel_owner != UINT32_MAX
+                               ? channel->stage_panel_group_count
+                               : 1u;
+-  const bool stream = groups > 1 && channel->stage_panel_stream;
++  const bool stream = groups >= 1 && channel->stage_panel_stream;
+   // A streamed panel's fill starts once with the array (its chain loops); its
+   // locks are initialized once with the array and never restored.
+   loom_aie2p_program_record_builder_t* records =
+@@ -1175,6 +1275,35 @@ static iree_status_t loom_aie2p_program_start_memory_tile_dma(
+ static iree_status_t loom_aie2p_program_append_memory_tile_dma_resets(
+     loom_aie2p_array_program_builder_t* builder,
+     loom_aie2p_compute_dma_reset_state_t reset_state) {
++  if (getenv("LOOM_EXP_ROUTE_RESET")) {
++    // every channel of the memory tiles in the image's columns: a channel another image left armed (a ring's cyclic
++    // descriptors) would otherwise take this image's lock tokens
++    const loom_xdna_array_family_t* family = builder->plan->family;
++    uint16_t columns = 0;
++    for (iree_host_size_t i = 0; i < builder->plan->route_count; ++i) {
++      columns = iree_max(columns, (uint16_t)(builder->plan->routes[i].coordinate.column + 1));
++    }
++    for (iree_host_size_t i = 0; i < builder->plan->worker_plan_count; ++i) {
++      columns = iree_max(columns, (uint16_t)(builder->plan->worker_plans[i].coordinate.column + 1));
++    }
++    for (uint16_t column = 0; column < columns; ++column) {
++      for (uint16_t row = 0; row < family->row_count; ++row) {
++        const loom_xdna_tile_coordinate_t coordinate = {.column = column, .row = row};
++        const loom_xdna_tile_facts_t* tile = loom_xdna_array_tile_facts(family, coordinate);
++        if (!tile || tile->kind != LOOM_XDNA_TILE_KIND_MEMORY) continue;
++        for (uint16_t channel = 0; channel < tile->dma.channel_count_per_direction; ++channel) {
++          const uint16_t indices[] = {channel};
++          IREE_RETURN_IF_ERROR(loom_aie2p_program_append_masked_field(
++              builder->plan, &builder->array, LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_CONTROL_RESET,
++              coordinate, IREE_ARRAYSIZE(indices), indices, reset_state));
++          IREE_RETURN_IF_ERROR(loom_aie2p_program_append_masked_field(
++              builder->plan, &builder->array, LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_S2MM_CONTROL_RESET,
++              coordinate, IREE_ARRAYSIZE(indices), indices, reset_state));
++        }
++      }
++    }
++    return iree_ok_status();
++  }
+   for (iree_host_size_t i = 0; i < builder->plan->dma_channel_count; ++i) {
+     const loom_aie2p_array_dma_plan_t* dma = &builder->plan->dma_channels[i];
+     if (!loom_aie2p_program_is_memory_tile_dma(dma)) continue;
+@@ -1332,7 +1461,12 @@ static iree_host_size_t loom_aie2p_program_chained_descriptor_count(
+   iree_host_size_t count = 0;
+   for (iree_host_size_t i = 0; i < plan->binding_plan_count; ++i) {
+     const uint16_t chain_length = plan->binding_plans[i].chain_length;
+-    count += chain_length > 1 ? chain_length - 1u : 0u;
++    // A chained transfer axis is rebuilt by each streamed push (three).
++    const iree_host_size_t sets =
++        plan->stream_panels && plan->binding_plans[i].chain_step_byte_length
++            ? 4u
++            : 1u;
++    count += chain_length > 1 ? sets * (chain_length - 1u) : 0u;
+     count += plan->channels[plan->binding_plans[i].channel_index].signal;
+   }
+   return count;
+@@ -1346,7 +1480,8 @@ static void loom_aie2p_program_build_shim_dma_descriptor(
+   const uint16_t chain_length = iree_max(1, binding_plan->chain_length);
+   for (uint16_t i = 0; i < chain_length; ++i) {
+     loom_aie2p_program_build_shim_dma_descriptor_at(
+-        builder, binding_plan, dma, dma->buffer_descriptor_start + i, 0,
++        builder, binding_plan, dma, dma->buffer_descriptor_start + i,
++        (uint32_t)(i * binding_plan->chain_step_byte_length),
+         binding_plan->transfer_byte_length,
+         i + 1u < chain_length ? (uint16_t)(dma->buffer_descriptor_start + i + 1)
+                               : UINT16_MAX);
+@@ -1416,8 +1551,7 @@ static const loom_aie2p_array_channel_t* loom_aie2p_program_stream_owner(
+   const loom_aie2p_array_channel_t* channel =
+       &plan->channels[dma->channel_index];
+   return channel->stage_panel_owner == dma->channel_index &&
+-                 channel->stage_panel_stream &&
+-                 channel->stage_panel_group_count > 1
++                 channel->stage_panel_stream
+              ? channel
+              : NULL;
+ }
+@@ -1519,11 +1653,19 @@ static iree_status_t loom_aie2p_program_build_stream_push(
+     }
+     // Core stream channels move in the gate and done invocations only.
+     if (plan->channels[binding_plan->channel_index].core_stream) continue;
++    // A chained transfer axis: each parity set is its own chain.
++    const uint16_t chain = binding_plan->chain_step_byte_length != 0
++                               ? binding_plan->chain_length
++                               : 1u;
+     const uint16_t descriptor =
+-        (uint16_t)(dma->buffer_descriptor_start + parity);
+-    loom_aie2p_program_build_shim_dma_descriptor_at(
+-        builder, binding_plan, dma, descriptor, 0,
+-        binding_plan->transfer_byte_length, UINT16_MAX);
++        (uint16_t)(dma->buffer_descriptor_start + parity * chain);
++    for (uint16_t c = 0; c < chain; ++c) {
++      loom_aie2p_program_build_shim_dma_descriptor_at(
++          builder, binding_plan, dma, (uint16_t)(descriptor + c),
++          (uint32_t)(c * binding_plan->chain_step_byte_length),
++          binding_plan->transfer_byte_length,
++          c + 1u < chain ? (uint16_t)(descriptor + c + 1u) : UINT16_MAX);
++    }
+     loom_aie2p_program_build_shim_dma_queue_at(builder, binding_plan, dma,
+                                                descriptor, NULL);
+   }
+@@ -1839,8 +1981,23 @@ static iree_status_t loom_aie2p_program_count_storage(
+       memory_tile_buffer_descriptor_count, &array_record_capacity));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
+       memory_tile_dma_count, 3, &array_record_capacity));
++  iree_host_size_t reset_words = 0;
++  if (getenv("LOOM_EXP_ROUTE_RESET")) {   // loom_aie2p_program_reset_masters
++    iree_host_size_t masters = 0;
++    for (uint8_t r = 0; r < plan->family->stream_port_count; ++r) {
++      if (plan->family->stream_ports[r].direction ==
++          LOOM_XDNA_STREAM_DIRECTION_MASTER) {
++        masters += plan->family->stream_ports[r].count;
++      }
++    }
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
++        (iree_host_size_t)plan->family->column_count * plan->family->row_count,
++        masters + 4 * 64 + 2 * 2 * 16, &array_record_capacity));
++    reset_words = (iree_host_size_t)plan->family->column_count *
++                  plan->family->row_count * (masters + 4 * 64);
++  }
+ 
+-  iree_host_size_t array_word_capacity = 0;
++  iree_host_size_t array_word_capacity = reset_words;
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
+       compute_buffer_descriptor_count,
+       LOOM_AIE2P_COMPUTE_DMA_BUFFER_DESCRIPTOR_WORD_COUNT,
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
+index 8f641c647f..037ea9c958 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
+@@ -709,3 +709,22 @@ bool loom_aie2p_array_route_workers(
+       LOOM_XDNA_STREAM_PORT_DMA, sender_stream_channel, receiver_coordinate,
+       LOOM_XDNA_STREAM_PORT_DMA, receiver_stream_channel, packet);
+ }
++
++bool loom_aie2p_array_route_cores(
++    loom_aie2p_array_route_builder_t* builder, uint32_t channel_index,
++    uint32_t source_channel_index,
++    loom_xdna_tile_coordinate_t sender_coordinate,
++    loom_xdna_tile_coordinate_t receiver_coordinate) {
++  iree_host_size_t node_index = loom_aie2p_array_route_worker_source(
++      builder, source_channel_index, sender_coordinate,
++      LOOM_XDNA_STREAM_PORT_CORE, 0);
++  if (!loom_aie2p_array_plan_horizontal_route_segment(
++          builder, channel_index, receiver_coordinate.column, &node_index) ||
++      !loom_aie2p_array_plan_vertical_route_segment(
++          builder, channel_index, receiver_coordinate.row, &node_index)) {
++    return false;
++  }
++  loom_aie2p_array_plan_route_destination(builder, channel_index, node_index,
++                                          LOOM_XDNA_STREAM_PORT_CORE, 0);
++  return true;
++}
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
+index 82eaaa5aad..eada46d3dd 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
+@@ -185,6 +185,14 @@ bool loom_aie2p_array_route_control(loom_aie2p_array_route_builder_t* builder,
+                                     loom_xdna_tile_coordinate_t destination,
+                                     loom_aie2p_array_route_sharing_t* sharing);
+ 
++// Connects one worker core's stream port to another's (EXPERIMENT: a core
++// stream channel between two workers). Returns false on link exhaustion.
++bool loom_aie2p_array_route_cores(
++    loom_aie2p_array_route_builder_t* builder, uint32_t channel_index,
++    uint32_t source_channel_index,
++    loom_xdna_tile_coordinate_t sender_coordinate,
++    loom_xdna_tile_coordinate_t receiver_coordinate);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+index 0bde9c80c4..573fcf61fc 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+@@ -1095,7 +1095,8 @@ iree_status_t loom_aie2p_array_topology_validate(
+           sender_worker->coordinate.column ==
+               receiver_worker->coordinate.column &&
+           (row_delta == -1 || row_delta == 1);
+-      if (workers_are_vertical_neighbors) {
++      // a core stream between two workers is a route (no memory, no DMA)
++      if (workers_are_vertical_neighbors && !channel->core_stream) {
+         channel->transport = LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_NEIGHBOR_MEMORY;
+         channel->neighbor_receiver_window = loom_xdna_array_load_window(
+             topology->plan->family, receiver_worker->coordinate,
+@@ -1163,33 +1164,41 @@ iree_status_t loom_aie2p_array_topology_validate(
+         &plan->endpoints[channel->sender_endpoint_index];
+     const loom_aie2p_array_endpoint_t* receiver =
+         &plan->endpoints[channel->receiver_endpoint_index];
+-    if (channel->transport != LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_EXTERNAL_DMA ||
++    // Two workers: a route from one core's stream port to the other's, no DMA
++    // (EXPERIMENT, HRX patch 0019).
++    const bool worker_pair =
++        sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER &&
++        receiver->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER;
++    if ((!worker_pair &&
++         channel->transport != LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_EXTERNAL_DMA) ||
+         channel->stage_column != UINT16_MAX || channel->leaf_sync ||
+         sender->channel_use_count != 1) {
+       return loom_aie2p_array_topology_reject_channel_connection(
+           topology, (uint32_t)i,
+           IREE_SV("a core stream channel must connect one binding and one "
+-                  "worker directly: no stage, multicast, or leaf sync"));
++                  "worker, or two workers, directly: no stage, multicast, or "
++                  "leaf sync"));
+     }
+-    const loom_aie2p_array_endpoint_t* worker =
+-        sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER ? sender
+-                                                                     : receiver;
+     for (iree_host_size_t j = 0; j < i; ++j) {
+       const loom_aie2p_array_channel_t* other = &topology->channels[j];
+       if (!other->core_stream) continue;
+-      const loom_aie2p_array_endpoint_t* other_sender =
+-          &plan->endpoints[other->sender_endpoint_index];
+-      const loom_aie2p_array_endpoint_t* other_receiver =
+-          &plan->endpoints[other->receiver_endpoint_index];
+-      const loom_aie2p_array_endpoint_t* other_worker =
+-          other_sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER
+-              ? other_sender
+-              : other_receiver;
+-      if (other_worker->owner_index == worker->owner_index &&
+-          other_worker->direction == worker->direction) {
+-        return loom_aie2p_array_topology_reject_channel_connection(
+-            topology, (uint32_t)i,
+-            IREE_SV("a worker core has one stream port per direction"));
++      const loom_aie2p_array_endpoint_t* ends[2] = {sender, receiver};
++      const loom_aie2p_array_endpoint_t* other_ends[2] = {
++          &plan->endpoints[other->sender_endpoint_index],
++          &plan->endpoints[other->receiver_endpoint_index]};
++      for (int a = 0; a < 2; ++a) {
++        for (int b = 0; b < 2; ++b) {
++          if (ends[a]->owner_kind != LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER ||
++              other_ends[b]->owner_kind !=
++                  LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER ||
++              other_ends[b]->owner_index != ends[a]->owner_index ||
++              other_ends[b]->direction != ends[a]->direction) {
++            continue;
++          }
++          return loom_aie2p_array_topology_reject_channel_connection(
++              topology, (uint32_t)i,
++              IREE_SV("a worker core has one stream port per direction"));
++        }
+       }
+     }
+   }

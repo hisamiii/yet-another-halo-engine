@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:03:35 +0100
+Subject: [PATCH 16/70] 0016 : port core stream routes and chain length to main
+
+---
+ .../loom/target/arch/amd/xdna/aie2p/array/plan.c | 16 +++++++++-------
+ .../target/arch/amd/xdna/aie2p/array/program.c   |  2 +-
+ .../arch/amd/xdna/aie2p/pipeline/dma_plan.c      |  2 +-
+ 3 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index f0ad5e0fb9..8d172b90a6 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2656,8 +2656,8 @@ static iree_status_t loom_aie2p_array_plan_core_stream_channel(
+   if (!loom_aie2p_array_select_shim_endpoint(
+           builder,
+           poll_dma ? poll_dma->coordinate.column : worker->coordinate.column,
+-          ingress ? LOOM_AIE2P_ARRAY_DMA_DIRECTION_MEMORY_TO_STREAM
+-                  : LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY,
++          ingress ? LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM
++                  : LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY,
+           shim_descriptor_count, &shim_proposal) ||
+       (poll_dma &&
+        !loom_aie2p_array_coordinates_equal(shim_proposal.coordinate,
+@@ -2698,13 +2698,15 @@ static iree_status_t loom_aie2p_array_plan_core_stream_channel(
+   const bool routed =
+       ingress ? loom_aie2p_array_route_ingress(
+                     &builder->route_builder, channel_index,
+-                    channel->source_channel_index, shim_dma->coordinate,
+-                    shim_dma->dma_channel, worker->coordinate,
+-                    LOOM_XDNA_STREAM_PORT_CORE, 0, /*vertical_first=*/false)
++                    &builder->route_trees[channel->source_channel_index],
++                    shim_dma->coordinate, shim_dma->dma_channel,
++                    worker->coordinate, LOOM_XDNA_STREAM_PORT_CORE, 0,
++                    /*vertical_first=*/false)
+               : loom_aie2p_array_route_egress(
+                     &builder->route_builder, channel_index,
+-                    channel->source_channel_index, worker->coordinate,
+-                    LOOM_XDNA_STREAM_PORT_CORE, 0, shim_dma->coordinate,
++                    &builder->route_trees[channel->source_channel_index],
++                    worker->coordinate, LOOM_XDNA_STREAM_PORT_CORE, 0,
++                    shim_dma->coordinate,
+                     shim_dma->dma_channel);
+   if (!routed) {
+     return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index 3cffc962a3..eb5d05535a 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1479,7 +1479,7 @@ static void loom_aie2p_program_build_core_stream_phase(
+       const loom_aie2p_array_dma_plan_t* dma =
+           &plan->dma_channels[binding_plan->dma_index];
+       const bool egress =
+-          dma->direction == LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY;
++          dma->direction == LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY;
+       const bool pushes = gate_phase || channel->signal;
+       if (pass == 0 && channel->signal) {   // both phases, one record each
+         // Record 0 (gate phase) or 1 (done phase) on its own descriptor.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/pipeline/dma_plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/pipeline/dma_plan.c
+index 50b0f019f2..f0adb4ee90 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/pipeline/dma_plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/pipeline/dma_plan.c
+@@ -208,7 +208,7 @@ bool loom_aie2p_native_encode_descriptor(
+   loom_aie2p_array_binding_plan_t layout = {0};
+   if (!loom_aie2p_array_resolve_binding_transfer(
+           geometry, geometry->rank, family, 0, false, 0, record_bytes,
+-          record_count, dma, &layout, reason)) {
++          record_count, dma, /*maximum_chain_length=*/1, &layout, reason)) {
+     return false;
+   }
+   words[0] = layout.transfer_byte_length / dma->transfer_length_granularity -

@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:11:21 +0100
+Subject: [PATCH 35/70] 0027-0032 : port rodata deferral, startup section and
+ priority op to main
+
+---
+ loom/py/loom/dialect/kernel/defs.py                    |  1 +
+ loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c  |  3 +--
+ .../loom/target/arch/amd/xdna/aie2p/array/program.c    |  4 ++--
+ .../loom/target/arch/amd/xdna/aie2p/emit/tile_link.c   | 10 +++++-----
+ 4 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/loom/py/loom/dialect/kernel/defs.py b/loom/py/loom/dialect/kernel/defs.py
+index 4116964acd..a0e3de9a0c 100644
+--- a/loom/py/loom/dialect/kernel/defs.py
++++ b/loom/py/loom/dialect/kernel/defs.py
+@@ -74,6 +74,7 @@ from loom.dsl import (
+     EnumCase,
+     EnumDef,
+     FuncLikeInterface,
++    HasAncestor,
+     HasAnyAncestor,
+     HasParent,
+     ImplicitTerminator,
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index a6592d29ba..cfe7c11c7c 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2040,8 +2040,7 @@ static iree_status_t loom_aie2p_array_plan_deferred_read_only_data(
+     const loom_aie2p_array_worker_t* worker =
+         &builder->workers[placement->worker_index];
+     const loom_low_read_only_data_requirement_t* requirement =
+-        &worker->leaf->requirements
+-             .read_only_data[placement->requirement_ordinal];
++        &worker->source->program_data->values[placement->requirement_ordinal];
+     if (placement->byte_length != 0 ||
+         requirement->contents.data_length == 0) {
+       continue;
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index ccb7a79c78..dbd1f2e532 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -2388,8 +2388,8 @@ static iree_status_t loom_aie2p_program_drain_lock_requests(
+             .lock_id = (uint8_t)lock,
+             .initial_value = tile->lock_value_maximum,
+         };
+-        IREE_RETURN_IF_ERROR(loom_aie2p_program_append_lock_initialization(
+-            builder, &builder->array, &raised));
++        loom_aie2p_program_append_lock_initialization(builder, &builder->array,
++                                                      &raised);
+       }
+     }
+   }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/tile_link.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/tile_link.c
+index 61e4f7cf3a..66719d8dc0 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/tile_link.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/tile_link.c
+@@ -320,7 +320,7 @@ static iree_status_t loom_aie2p_tile_link_place_startup_jump(
+                             "AIE2P startup jump overlaps the program");
+   }
+   const iree_host_size_t count = assembly->section_count + 1;
+-  loom_native_elf_section_t* sections = NULL;
++  loom_native_section_t* sections = NULL;
+   loom_aie2p_linked_section_placement_t* placements = NULL;
+   IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
+       arena, count, sizeof(*sections), (void**)&sections));
+@@ -330,11 +330,11 @@ static iree_status_t loom_aie2p_tile_link_place_startup_jump(
+          assembly->section_count * sizeof(*sections));
+   memcpy(placements, *inout_section_placements,
+          assembly->section_count * sizeof(*placements));
+-  sections[count - 1] = (loom_native_elf_section_t){
++  sections[count - 1] = (loom_native_section_t){
+       .name = IREE_SV(".text.startup"),
+-      .type = LOOM_NATIVE_ELF_SECTION_TYPE_PROGBITS,
+-      .flags = LOOM_NATIVE_ELF_SECTION_FLAG_ALLOC |
+-               LOOM_NATIVE_ELF_SECTION_FLAG_EXECINSTR,
++      .storage = LOOM_NATIVE_SECTION_STORAGE_CONTENTS,
++      .access = LOOM_NATIVE_SECTION_ACCESS_READ |
++                LOOM_NATIVE_SECTION_ACCESS_EXECUTE,
+       .address = layout->startup_address,
+       .alignment = 16,
+       .contents = iree_make_const_byte_span(bytes, length),

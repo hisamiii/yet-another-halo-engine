@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 19:16:40 +0100
+Subject: [PATCH 65/70] facts : look through folded arms when joining block
+ args
+
+A divergent branch whose exits all carry the same value no longer weakens the join.
+
+Assisted-by: Claude Opus 5.5
+---
+ loom/src/loom/util/fact_table_compute.c | 79 ++++++++++++++++++++++++-
+ 1 file changed, 77 insertions(+), 2 deletions(-)
+
+diff --git a/loom/src/loom/util/fact_table_compute.c b/loom/src/loom/util/fact_table_compute.c
+index 3ee05b2e04..c084207d4e 100644
+--- a/loom/src/loom/util/fact_table_compute.c
++++ b/loom/src/loom/util/fact_table_compute.c
+@@ -539,6 +539,77 @@ static loom_value_facts_t loom_value_fact_table_refine_cfg_recurrence(
+   return facts;
+ }
+ 
++// Returns the block whose execution decides whether |value| reaches |target|
++// through |predecessor_index|. CFG simplification folds the merge block of a
++// branch into a later join, so each arm then enters the join directly. When
++// every exit of that branch reaches the join with the same |value|, the branch
++// cannot change the joined value: its own block's execution decides instead of
++// the arm's, which a divergent selector would otherwise weaken.
++static uint16_t loom_value_fact_cfg_value_choice_block(
++    const loom_cfg_graph_t* graph, const loom_block_t* target,
++    uint16_t target_index, uint16_t arg_index, uint16_t predecessor_index,
++    loom_value_id_t value) {
++  if (loom_cfg_graph_successor_edges(graph, predecessor_index).count != 1) {
++    return predecessor_index;
++  }
++  const loom_cfg_edge_index_span_t entries =
++      loom_cfg_graph_predecessor_edges(graph, predecessor_index);
++  if (entries.count != 1) {
++    return predecessor_index;
++  }
++  const loom_cfg_edge_info_t* entry = loom_cfg_graph_edge(graph,
++                                                          entries.values[0]);
++  if (!entry) {
++    return predecessor_index;
++  }
++  const uint16_t branch_index = entry->source_block_index;
++  if (branch_index == target_index ||
++      !loom_cfg_graph_block_is_reachable(graph, branch_index)) {
++    return predecessor_index;
++  }
++  const loom_cfg_edge_index_span_t exits =
++      loom_cfg_graph_successor_edges(graph, branch_index);
++  iree_host_size_t direct_count = 0;
++  for (iree_host_size_t i = 0; i < exits.count; ++i) {
++    const loom_cfg_edge_info_t* exit = loom_cfg_graph_edge(graph,
++                                                           exits.values[i]);
++    if (!exit) {
++      return predecessor_index;
++    }
++    uint16_t arm_index = branch_index;
++    if (exit->target_block_index == target_index) {
++      // Two direct exits may carry different payloads to the same block.
++      if (++direct_count > 1) {
++        return predecessor_index;
++      }
++    } else {
++      arm_index = exit->target_block_index;
++      const loom_cfg_edge_index_span_t arm_entries =
++          loom_cfg_graph_predecessor_edges(graph, arm_index);
++      const loom_cfg_edge_index_span_t arm_exits =
++          loom_cfg_graph_successor_edges(graph, arm_index);
++      if (arm_entries.count != 1 || arm_exits.count != 1) {
++        return predecessor_index;
++      }
++      const loom_cfg_edge_info_t* arm_exit =
++          loom_cfg_graph_edge(graph, arm_exits.values[0]);
++      if (!arm_exit || arm_exit->target_block_index != target_index) {
++        return predecessor_index;
++      }
++    }
++    const loom_block_t* arm = graph->blocks[arm_index].block;
++    const loom_value_id_t* args = NULL;
++    uint16_t arg_count = 0;
++    if (!arm ||
++        !loom_cfg_terminator_payload_for_successor(arm->last_op, target, &args,
++                                                   &arg_count) ||
++        arg_index >= arg_count || args[arg_index] != value) {
++      return predecessor_index;
++    }
++  }
++  return branch_index;
++}
++
+ static iree_status_t loom_value_fact_table_compute_cfg_block_arg(
+     loom_value_fact_table_t* table, const loom_module_t* module,
+     const loom_value_fact_cfg_region_t* region, const loom_scc_t* component,
+@@ -613,11 +684,15 @@ static iree_status_t loom_value_fact_table_compute_cfg_block_arg(
+       }
+       // Internal forwarding edges still select dynamic observations, even
+       // when their numeric inputs add nothing to the component's value join.
++      const loom_value_id_t source_value = edge_args[arg_index];
+       loom_value_facts_propagate_binary_distribution(
+           control_facts,
+-          loom_value_fact_control_execution(region->control, predecessor_index),
++          loom_value_fact_control_execution(
++              region->control,
++              loom_value_fact_cfg_value_choice_block(
++                  graph, block, block_index, arg_index, predecessor_index,
++                  source_value)),
+           &control_facts);
+-      const loom_value_id_t source_value = edge_args[arg_index];
+       if (component) {
+         iree_host_size_t source =
+             loom_value_fact_cfg_region_argument_index(region, source_value);

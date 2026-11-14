@@ -1,0 +1,405 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:00:06 +0100
+Subject: [PATCH 12/70] 0013 : port to main's routes, geometry, descriptors and
+ lock selectors
+
+---
+ loom/src/loom/codegen/low/pointer_roots.c     | 33 +++++----
+ .../arch/amd/xdna/aie2p/array/binding.c       | 26 +++----
+ .../target/arch/amd/xdna/aie2p/array/plan.c   |  9 ++-
+ .../arch/amd/xdna/aie2p/array/program.c       | 71 ++++++++++---------
+ .../arch/amd/xdna/aie2p/array/resident.c      | 10 +--
+ .../arch/amd/xdna/aie2p/emit/leaf_compile.c   |  3 +-
+ .../loom/target/arch/amd/xdna/array/facts.c   | 37 ++++++++++
+ .../loom/target/arch/amd/xdna/array/facts.h   |  8 +++
+ 8 files changed, 118 insertions(+), 79 deletions(-)
+
+diff --git a/loom/src/loom/codegen/low/pointer_roots.c b/loom/src/loom/codegen/low/pointer_roots.c
+index d4353d287c..753b756335 100644
+--- a/loom/src/loom/codegen/low/pointer_roots.c
++++ b/loom/src/loom/codegen/low/pointer_roots.c
+@@ -120,20 +120,19 @@ static void loom_pointer_roots_visit_op(loom_pointer_roots_t* state,
+   if (op->result_count <= IREE_ARRAYSIZE(derived_storage)) {
+     derived = derived_storage;
+   }
+-  for (uint16_t c = 0; c < descriptor->constraint_count; ++c) {
++  const loom_low_descriptor_layout_t* layout =
++      loom_low_descriptor_layout(state->descriptor_set, descriptor);
++  for (uint16_t c = 0; c < layout->constraint_count; ++c) {
+     const loom_low_constraint_t* constraint =
+-        &state->descriptor_set
+-             ->constraints[descriptor->constraint_start + c];
++        &state->descriptor_set->constraints[layout->constraint_start + c];
+     if (constraint->kind != LOOM_LOW_CONSTRAINT_KIND_TIED ||
+         constraint->rhs_operand_index == LOOM_LOW_ID_NONE) {
+       continue;
+     }
+-    const loom_low_operand_t* lhs =
+-        &state->descriptor_set
+-             ->operands[descriptor->operand_start + constraint->lhs_operand_index];
+-    const loom_low_operand_t* rhs =
+-        &state->descriptor_set
+-             ->operands[descriptor->operand_start + constraint->rhs_operand_index];
++    const loom_low_operand_t* lhs = loom_low_descriptor_operand(
++        state->descriptor_set, descriptor, constraint->lhs_operand_index);
++    const loom_low_operand_t* rhs = loom_low_descriptor_operand(
++        state->descriptor_set, descriptor, constraint->rhs_operand_index);
+     if (lhs->role != LOOM_LOW_OPERAND_ROLE_RESULT ||
+         rhs->role != LOOM_LOW_OPERAND_ROLE_OPERAND ||
+         lhs->source_value_index >= op->result_count ||
+@@ -158,15 +157,19 @@ static iree_status_t loom_pointer_roots_summarize_op(
+     loom_low_memory_access_map_t** map) {
+   loom_low_descriptor_packet_t packet;
+   loom_low_descriptor_packet_initialize(state->descriptor_set, op, &packet);
+-  if (packet.kind != LOOM_LOW_DESCRIPTOR_PACKET_OP ||
+-      packet.descriptor->effect_count == 0) {
++  if (packet.kind != LOOM_LOW_DESCRIPTOR_PACKET_OP) {
+     return iree_ok_status();
+   }
+   const loom_low_descriptor_t* descriptor = packet.descriptor;
++  const loom_low_descriptor_layout_t* layout =
++      loom_low_descriptor_layout(state->descriptor_set, descriptor);
++  if (layout->effect_count == 0) {
++    return iree_ok_status();
++  }
+   uint32_t root = LOOM_POINTER_ROOT_UNDEF;
+   for (uint16_t i = 0; i < descriptor->operand_count; ++i) {
+     const loom_low_operand_t* operand =
+-        &state->descriptor_set->operands[descriptor->operand_start + i];
++        loom_low_descriptor_operand(state->descriptor_set, descriptor, i);
+     if (operand->role != LOOM_LOW_OPERAND_ROLE_OPERAND ||
+         operand->source_value_index >= op->operand_count ||
+         !iree_string_view_equal(
+@@ -184,15 +187,15 @@ static iree_status_t loom_pointer_roots_summarize_op(
+   if (root == LOOM_POINTER_ROOT_UNDEF || root == LOOM_POINTER_ROOT_UNKNOWN) {
+     return iree_ok_status();
+   }
+-  for (uint16_t i = 0; i < descriptor->effect_count; ++i) {
++  for (uint16_t i = 0; i < layout->effect_count; ++i) {
+     const loom_low_effect_t* effect =
+-        &state->descriptor_set->effects[descriptor->effect_start + i];
++        &state->descriptor_set->effects[layout->effect_start + i];
+     if (effect->kind != LOOM_LOW_EFFECT_KIND_READ &&
+         effect->kind != LOOM_LOW_EFFECT_KIND_WRITE) {
+       continue;
+     }
+     if (*map == NULL) {
+-      IREE_RETURN_IF_ERROR(loom_low_memory_access_map_create(arena, map));
++      IREE_RETURN_IF_ERROR(loom_low_memory_access_map_allocate(arena, map));
+     }
+     loom_low_memory_access_summary_t summary =
+         *loom_low_memory_access_summary_for_space(effect->memory_space);
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
+index 2a089d7de1..3876e44456 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
+@@ -76,29 +76,19 @@ static bool loom_aie2p_array_binding_address_dimension(
+ uint64_t loom_aie2p_array_binding_repeat_count(
+     const loom_module_t* module, const loom_value_fact_table_t* facts,
+     loom_type_t source_type, loom_type_t record_type, bool partitioned) {
+-  loom_value_facts_t stride_storage[LOOM_ENCODING_ADDRESS_LAYOUT_MAX_RANK];
+-  loom_value_fact_address_layout_t layout = {0};
+-  if (!loom_encoding_query_type_address_layout(
+-          &facts->context, module, source_type, stride_storage,
+-          IREE_ARRAYSIZE(stride_storage), &layout) ||
+-      layout.kind != LOOM_VALUE_FACT_ADDRESS_LAYOUT_STRIDED) {
++  loom_storage_geometry_t geometry;
++  if (!loom_storage_geometry_query(&facts->context, module, source_type,
++                                   &geometry)) {
+     return 1;
+   }
+-  const uint8_t source_rank = loom_type_rank(source_type);
+   const uint8_t record_rank = loom_type_rank(record_type);
+   const uint8_t first_axis = partitioned ? 1 : 0;
+-  if (source_rank < record_rank) return 1;
++  if (geometry.rank < record_rank) return 1;
++  // Leading zero-stride axes repeat the same records (task replay).
+   uint64_t repeat_count = 1;
+-  for (uint8_t axis = first_axis; axis < source_rank - record_rank; ++axis) {
+-    uint64_t element_stride = 0;
+-    iree_string_view_t reason = iree_string_view_empty();
+-    if (!loom_aie2p_array_binding_stride_value(&layout, axis, &element_stride,
+-                                               &reason) ||
+-        element_stride != 0) {
+-      break;
+-    }
+-    repeat_count *=
+-        loom_aie2p_array_binding_dimension_value(facts, source_type, axis);
++  for (uint8_t axis = first_axis; axis < geometry.rank - record_rank; ++axis) {
++    if (geometry.axes[axis].element_stride != 0) break;
++    repeat_count *= geometry.axes[axis].extent;
+   }
+   return repeat_count;
+ }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index 3940f40c8a..b7862e86c6 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2694,7 +2694,8 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+       return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
+     }
+     loom_aie2p_array_bind_worker_port(builder, worker_endpoint, channel_index,
+-                                      committed_compute.credit_lock_index);
++                                      committed_compute.credit_lock_index,
++                                      compute_proposal.ring.load_window);
+     return iree_ok_status();
+   }
+   if (ingress && !staged && channel->stage_column != UINT16_MAX) {
+@@ -2711,7 +2712,8 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+       return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
+     }
+     loom_aie2p_array_bind_worker_port(builder, worker_endpoint, channel_index,
+-                                      committed_compute.credit_lock_index);
++                                      committed_compute.credit_lock_index,
++                                      compute_proposal.ring.load_window);
+     return iree_ok_status();
+   }
+   if (staged) {
+@@ -2742,7 +2744,8 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+     binding_plan->dma_index = shim_dma_index;
+     binding_plan->completion_route_index = UINT32_MAX;
+     loom_aie2p_array_bind_worker_port(builder, worker_endpoint, channel_index,
+-                                      committed_compute.credit_lock_index);
++                                      committed_compute.credit_lock_index,
++                                      compute_proposal.ring.load_window);
+     return iree_ok_status();
+   }
+ 
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index d77a31d4fa..34b671a6c0 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -969,13 +969,13 @@ static iree_status_t loom_aie2p_program_start_memory_tile_dma(
+   loom_aie2p_register_update_t queue = {0};
+   const bool drain =
+       dma->direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM;
+-  IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
+-      builder->plan,
++  queue = loom_aie2p_program_resolve_field_update(
++        builder->plan,
+       drain
+           ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_START_BD_ID
+           : LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_S2MM_START_QUEUE_START_BD_ID,
+-      dma->coordinate, IREE_ARRAYSIZE(indices), indices,
+-      dma->buffer_descriptor_start, &queue));
++      dma->coordinate, indices,
++        dma->buffer_descriptor_start);
+   const loom_aie2p_array_channel_t* channel =
+       &builder->plan->channels[dma->channel_index];
+   // A replaying ring fills once and its drains end with the invocation, so the
+@@ -992,12 +992,12 @@ static iree_status_t loom_aie2p_program_start_memory_tile_dma(
+       replay && !(stream && !drain) ? &builder->control : &builder->array;
+   if (replay && !stream) {
+     for (uint32_t g = 0; g < groups; ++g) {
+-      IREE_RETURN_IF_ERROR(loom_aie2p_program_append_lock_initialization(
++      loom_aie2p_program_append_lock_initialization(
+           builder, records,
+-          &builder->plan->locks[dma->credit_lock_index + 2u * g]));
+-      IREE_RETURN_IF_ERROR(loom_aie2p_program_append_lock_initialization(
++          &builder->plan->locks[dma->credit_lock_index + 2u * g]);
++      loom_aie2p_program_append_lock_initialization(
+           builder, records,
+-          &builder->plan->locks[dma->credit_lock_index + 2u * g + 1u]));
++          &builder->plan->locks[dma->credit_lock_index + 2u * g + 1u]);
+     }
+   }
+   if (drain && replay && stream) {
+@@ -1006,18 +1006,18 @@ static iree_status_t loom_aie2p_program_start_memory_tile_dma(
+   if (drain && replay && groups > 1) {
+     // One task per group, queued in order: each replays its group descriptor.
+     for (uint32_t g = 0; g < groups; ++g) {
+-      loom_aie2p_register_update_t task = {0};
+-      IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
+-          builder->plan,
++      loom_aie2p_register_update_t task =
++          loom_aie2p_program_resolve_field_update(
++              builder->plan,
+           LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_START_BD_ID,
+-          dma->coordinate, IREE_ARRAYSIZE(indices), indices,
+-          dma->buffer_descriptor_start + g, &task));
+-      loom_aie2p_register_update_t repeat = {0};
+-      IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
+-          builder->plan,
++          dma->coordinate, indices,
++              dma->buffer_descriptor_start + g);
++      const loom_aie2p_register_update_t repeat =
++          loom_aie2p_program_resolve_field_update(
++              builder->plan,
+           LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_REPEAT_COUNT,
+-          dma->coordinate, IREE_ARRAYSIZE(indices), indices,
+-          channel->stage_repeat_count - 1u, &repeat));
++          dma->coordinate, indices,
++              channel->stage_repeat_count - 1u);
+       IREE_RETURN_IF_ERROR(
+           loom_aie2p_program_merge_register_update(&repeat, &task));
+       loom_aie2p_program_append_register_write32(records, task.address,
+@@ -1026,12 +1026,12 @@ static iree_status_t loom_aie2p_program_start_memory_tile_dma(
+     return iree_ok_status();
+   }
+   if (drain && replay) {
+-    loom_aie2p_register_update_t repeat = {0};
+-    IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
+-        builder->plan,
++    const loom_aie2p_register_update_t repeat =
++        loom_aie2p_program_resolve_field_update(
++            builder->plan,
+         LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_REPEAT_COUNT,
+-        dma->coordinate, IREE_ARRAYSIZE(indices), indices,
+-        channel->stage_repeat_count - 1u, &repeat));
++        dma->coordinate, indices,
++            channel->stage_repeat_count - 1u);
+     IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_register_update(&repeat,
+                                                                    &queue));
+   }
+@@ -1047,12 +1047,13 @@ static iree_status_t loom_aie2p_program_append_memory_tile_dma_resets(
+     const loom_aie2p_array_dma_plan_t* dma = &builder->plan->dma_channels[i];
+     if (!loom_aie2p_program_is_memory_tile_dma(dma)) continue;
+     const uint16_t indices[] = {dma->dma_channel};
+-    IREE_RETURN_IF_ERROR(loom_aie2p_program_append_masked_field(
++    loom_aie2p_program_append_masked_field(
+         builder->plan, &builder->array,
+         dma->direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM
+             ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_CONTROL_RESET
+             : LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_S2MM_CONTROL_RESET,
+-        dma->coordinate, IREE_ARRAYSIZE(indices), indices, reset_state));
++        dma->coordinate, indices,
++        reset_state);
+   }
+   return iree_ok_status();
+ }
+@@ -1283,18 +1284,18 @@ static iree_status_t loom_aie2p_program_build_stream_push(
+     }
+     const uint16_t indices[] = {dma->dma_channel};
+     for (uint32_t g = 0; g < channel->stage_panel_group_count; ++g) {
+-      loom_aie2p_register_update_t task = {0};
+-      IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
+-          plan,
++      loom_aie2p_register_update_t task =
++          loom_aie2p_program_resolve_field_update(
++              plan,
+           LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_START_BD_ID,
+-          dma->coordinate, IREE_ARRAYSIZE(indices), indices,
+-          dma->buffer_descriptor_start + g, &task));
+-      loom_aie2p_register_update_t repeat = {0};
+-      IREE_RETURN_IF_ERROR(loom_aie2p_program_resolve_field_update(
+-          plan,
++          dma->coordinate, indices,
++              dma->buffer_descriptor_start + g);
++      const loom_aie2p_register_update_t repeat =
++          loom_aie2p_program_resolve_field_update(
++              plan,
+           LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_REPEAT_COUNT,
+-          dma->coordinate, IREE_ARRAYSIZE(indices), indices,
+-          channel->stage_repeat_count - 1u, &repeat));
++          dma->coordinate, indices,
++              channel->stage_repeat_count - 1u);
+       IREE_RETURN_IF_ERROR(
+           loom_aie2p_program_merge_register_update(&repeat, &task));
+       loom_aie2p_program_append_register_write32(&builder->control,
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/resident.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/resident.c
+index 41060b39ea..351d81e35a 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/resident.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/resident.c
+@@ -873,12 +873,8 @@ static iree_status_t loom_aie2p_array_resident_rewrite_leaf_locks(
+           const loom_aie2p_array_lock_role_t role =
+               receive == acquire ? LOOM_AIE2P_ARRAY_LOCK_ROLE_READY
+                                  : LOOM_AIE2P_ARRAY_LOCK_ROLE_CREDIT;
+-          const loom_aie2p_array_lock_plan_t* lock =
+-              &builder->plan->locks[port->credit_lock_index + role];
+-          uint16_t selector = 0;
+-          IREE_RETURN_IF_ERROR(loom_xdna_array_form_lock_selector(
+-              builder->plan->family, worker_plan->coordinate, lock->coordinate,
+-              lock->lock_id, &selector));
++          // The port's selectors are in lock-plan order: credit, ready.
++          const uint16_t selector = port->lock_selectors[role];
+           const loom_named_attr_t attribute = {
+               .name_id = builder->lock_selector_name,
+               .value = loom_attr_i64(selector),
+@@ -888,7 +884,7 @@ static iree_status_t loom_aie2p_array_resident_rewrite_leaf_locks(
+               builder, ir_builder, ordinal, loom_op_operands(op),
+               op->operand_count, loom_make_named_attr_slice(&attribute, 1),
+               /*result_type=*/NULL, op->location, /*out_value=*/NULL));
+-          IREE_RETURN_IF_ERROR(loom_op_erase(builder->module, op));
++          IREE_RETURN_IF_ERROR(loom_op_erase(builder->clone.module, op));
+           break;
+         }
+       }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/leaf_compile.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/leaf_compile.c
+index 5b100d2151..fe6c14fd67 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/leaf_compile.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/leaf_compile.c
+@@ -116,7 +116,8 @@ static iree_status_t loom_aie2p_leaf_build_frame(
+         const loom_low_descriptor_t* descriptor =
+             &descriptor_set->descriptors[loom_low_op_descriptor(op)];
+         iree_string_view_t key = loom_low_descriptor_set_string(
+-            descriptor_set, descriptor->key_string_ref);
++            descriptor_set,
++            loom_low_descriptor_key_string_ref(descriptor_set, descriptor));
+         int lane = -1;
+         if (iree_string_view_equal(
+                 key, IREE_SV("amd.xdna.aie2p.load.a.bfp16ebs8.fifo.pop"))) lane = 0;
+diff --git a/loom/src/loom/target/arch/amd/xdna/array/facts.c b/loom/src/loom/target/arch/amd/xdna/array/facts.c
+index e7fb508c17..9c5a423124 100644
+--- a/loom/src/loom/target/arch/amd/xdna/array/facts.c
++++ b/loom/src/loom/target/arch/amd/xdna/array/facts.c
+@@ -80,3 +80,40 @@ const loom_xdna_address_window_t* loom_xdna_array_load_window(
+   }
+   return NULL;
+ }
++
++iree_status_t loom_xdna_array_form_lock_selector(
++    const loom_xdna_array_family_t* family,
++    loom_xdna_tile_coordinate_t accessor, loom_xdna_tile_coordinate_t owner,
++    uint16_t owner_lock_ordinal, uint16_t* out_selector) {
++  IREE_ASSERT_ARGUMENT(family);
++  IREE_ASSERT_ARGUMENT(out_selector);
++  *out_selector = 0;
++  const loom_xdna_tile_facts_t* accessor_tile =
++      loom_xdna_array_tile_facts(family, accessor);
++  const loom_xdna_tile_facts_t* owner_tile =
++      loom_xdna_array_tile_facts(family, owner);
++  if (owner_lock_ordinal >= owner_tile->lock_count) {
++    return iree_make_status(
++        IREE_STATUS_OUT_OF_RANGE,
++        "XDNA owner lock ordinal %u exceeds tile (%u, %u) lock count %u",
++        owner_lock_ordinal, owner.column, owner.row,
++        (unsigned)owner_tile->lock_count);
++  }
++  for (uint8_t i = 0; i < accessor_tile->memory.window_count; ++i) {
++    const loom_xdna_address_window_t* window =
++        &family->address_windows[accessor_tile->memory.window_start + i];
++    const int32_t window_owner_column =
++        (int32_t)accessor.column + window->owner_column_delta;
++    const int32_t window_owner_row =
++        (int32_t)accessor.row + window->owner_row_delta;
++    if (window_owner_column != owner.column || window_owner_row != owner.row ||
++        window->owner_kind != owner_tile->kind) {
++      continue;
++    }
++    *out_selector = window->lock_selector_base + owner_lock_ordinal;
++    return iree_ok_status();
++  }
++  return iree_make_status(
++      IREE_STATUS_OUT_OF_RANGE,
++      "XDNA owner lock is not visible from the accessor tile");
++}
+diff --git a/loom/src/loom/target/arch/amd/xdna/array/facts.h b/loom/src/loom/target/arch/amd/xdna/array/facts.h
+index c660e30bf4..a1f0d3ef01 100644
+--- a/loom/src/loom/target/arch/amd/xdna/array/facts.h
++++ b/loom/src/loom/target/arch/amd/xdna/array/facts.h
+@@ -332,6 +332,14 @@ const loom_xdna_address_window_t* loom_xdna_array_load_window(
+     const loom_xdna_array_family_t* family,
+     loom_xdna_tile_coordinate_t accessor, loom_xdna_tile_coordinate_t owner);
+ 
++// Forms an accessor-relative lock selector for a physical owner lock: the
++// owner tile's lock ordinal offset by the accessor's address window onto that
++// owner. Fails when the owner's locks are not visible from the accessor.
++iree_status_t loom_xdna_array_form_lock_selector(
++    const loom_xdna_array_family_t* family,
++    loom_xdna_tile_coordinate_t accessor, loom_xdna_tile_coordinate_t owner,
++    uint16_t owner_lock_ordinal, uint16_t* out_selector);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif

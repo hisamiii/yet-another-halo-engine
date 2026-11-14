@@ -1,0 +1,584 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:16:43 +0100
+Subject: [PATCH 44/70] 0013+0016-0019 : port multi-range invocation layout to
+ main
+
+Assisted-by: Claude Opus 5.5
+---
+ .../arch/amd/xdna/aie2p/emit/artifact.c       |   2 +
+ .../arch/amd/xdna/aie2p/emit/xdna_product.c   | 345 ++++++++++++++----
+ .../arch/amd/xdna/aie2p/emit/xdna_product.h   |   1 +
+ .../amd/xdna/aie2p/emit/xdna_product_test.cc  |   2 +
+ 4 files changed, 273 insertions(+), 77 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/artifact.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/artifact.c
+index cea2425982..66ba860060 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/artifact.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/artifact.c
+@@ -238,6 +238,8 @@ static iree_string_view_t loom_aie2p_xdna_product_issue_quantity(
+       return IREE_SV("file bytes");
+     case LOOM_AIE2P_XDNA_PRODUCT_ISSUE_SECTION_NAME_BYTE_LENGTH:
+       return IREE_SV("section-name bytes");
++    case LOOM_AIE2P_XDNA_PRODUCT_ISSUE_INVOCATION_RECORD_COUNT:
++      return IREE_SV("invocation records");
+     case LOOM_AIE2P_XDNA_PRODUCT_ISSUE_NONE:
+       break;
+   }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
+index eef136622e..61a94b956d 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
+@@ -6,6 +6,7 @@
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/emit/xdna_product.h"
+ 
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "iree/schemas/xdna_executable.h"
+@@ -14,6 +15,9 @@
+ enum {
+   LOOM_AIE2P_XDNA_ELF32_SYMBOL_SIZE = 16,
+   LOOM_AIE2P_NATIVE_HEADER_SIZE = 16,
++  // Streamed gated plans: array + even push + waits, even push, odd push,
++  // waits, lead push, gate, done.
++  LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT = 7,
+ };
+ 
+ static void loom_aie2p_xdna_store_u16(uint8_t* target, uint16_t value) {
+@@ -137,8 +141,27 @@ typedef struct loom_aie2p_xdna_entry_layout_t {
+   uint32_t first_tile;
+   // First global external binding contract.
+   uint32_t first_binding;
+-  // First global dynamic relocation, covering initial and repeat invocations.
++  // First global dynamic relocation, covering every invocation.
+   uint32_t first_relocation;
++  // First global invocation record.
++  uint32_t first_invocation;
++  // Entry invocations. Each submits one contiguous range of control records:
++  // invocation 0 is the array setup followed by its range, every other one a
++  // native header and its range in an aligned region of its own.
++  uint32_t invocation_count;
++  // Control-record range [range_begin, range_end) of each invocation.
++  uint32_t range_begin[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT];
++  uint32_t range_end[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT];
++  // Command-backing byte range of each invocation, including its header.
++  uint32_t region_offset[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT];
++  uint32_t region_bytes[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT];
++  // Sorted distinct range boundaries. The control body is emitted as one
++  // fragment per adjacent pair and each range loads its fragments in order.
++  uint32_t cuts[2 * LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT];
++  uint32_t cut_count;
++  // Dynamic relocations over all invocations: one per program relocation per
++  // range holding its target record.
++  uint32_t relocation_count;
+   // Native operation bytes, excluding inline linked payloads.
+   iree_byte_span_t source;
+   // Expanded array initialization operation count.
+@@ -147,12 +170,8 @@ typedef struct loom_aie2p_xdna_entry_layout_t {
+   uint32_t control_source_offset;
+   // Offset of the control body in initial command backing.
+   uint32_t control_destination_offset;
+-  // Complete initial invocation byte length, including inline code.
+-  uint32_t initial_byte_length;
+-  // Aligned beginning of the repeat invocation in command backing.
+-  uint32_t repeat_offset;
+-  // Complete repeat invocation byte length.
+-  uint32_t repeat_byte_length;
++  // Native byte length of the whole control body.
++  uint32_t control_byte_length;
+   // Native byte offsets of control records relative to their shared body.
+   uint32_t* control_record_offsets;
+ } loom_aie2p_xdna_entry_layout_t;
+@@ -170,6 +189,8 @@ struct loom_aie2p_xdna_product_admission_t {
+   uint32_t binding_count;
+   // Aggregate runtime relocation-record count.
+   uint32_t relocation_count;
++  // Aggregate runtime invocation-record count.
++  uint32_t invocation_count;
+   // Aggregate exported entry-name byte length.
+   uint32_t entry_name_byte_length;
+   // Occupied array-column prefix across all entries.
+@@ -329,6 +350,95 @@ static void loom_aie2p_xdna_set_issue(
+   };
+ }
+ 
++// Splits the control records into invocation ranges. Ranges depend only on
++// the program, so admission sizes the invocation and relocation tables before
++// command layout is measured.
++static void loom_aie2p_xdna_plan_invocations(
++    const loom_aie2p_array_program_t* program,
++    loom_aie2p_xdna_entry_layout_t* layout) {
++  const uint32_t control_count = (uint32_t)program->control_record_count;
++  // EXPERIMENT LOOM_EXP_SETUP_ONLY=1: for streamed and gated-call plans,
++  // invocation 0 is the array setup alone (no first call), so a runtime can
++  // splice an image's setup into a command between other images' jobs.
++  const char* setup_only_flag = getenv("LOOM_EXP_SETUP_ONLY");
++  const bool setup_only = setup_only_flag != NULL && setup_only_flag[0] == '1';
++  if (program->stream_push_end != 0) {
++    // [even push | waits | odd push | lead push]: array + even push + waits,
++    // even push, odd push, waits, lead push. A gated plan ends the lead push
++    // at stream_lead_end and appends [gate | done] as two more invocations.
++    const uint32_t push = (uint32_t)program->stream_push_end;
++    const uint32_t wait = (uint32_t)program->stream_wait_end;
++    const uint32_t odd = (uint32_t)program->stream_odd_end;
++    const bool gated = program->stream_lead_end != 0;
++    const uint32_t lead_end =
++        gated ? (uint32_t)program->stream_lead_end : control_count;
++    const uint32_t gate_end = (uint32_t)program->stream_gate_end;
++    const uint32_t begins[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT] = {
++        0, 0, wait, push, odd, lead_end, gate_end};
++    const uint32_t ends[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT] = {
++        wait, push, odd, wait, lead_end, gate_end, control_count};
++    layout->invocation_count = gated ? 7u : 5u;
++    memcpy(layout->range_begin, begins, sizeof(begins));
++    memcpy(layout->range_end, ends, sizeof(ends));
++    if (setup_only) {
++      layout->range_end[0] = 0;
++    }
++  } else if (program->gated_call_end != 0) {
++    // [call | gate | done]: array + call, call, gate, done.
++    const uint32_t call_end = (uint32_t)program->gated_call_end;
++    const uint32_t gate_end = (uint32_t)program->gated_gate_end;
++    const uint32_t begins[4] = {0, 0, call_end, gate_end};
++    const uint32_t ends[4] = {call_end, call_end, gate_end, control_count};
++    layout->invocation_count = 4;
++    memcpy(layout->range_begin, begins, sizeof(begins));
++    memcpy(layout->range_end, ends, sizeof(ends));
++    if (setup_only) {
++      layout->range_end[0] = 0;
++    }
++  } else {
++    // Array + every record, then every record again.
++    layout->invocation_count = 2;
++    layout->range_begin[0] = layout->range_begin[1] = 0;
++    layout->range_end[0] = layout->range_end[1] = control_count;
++  }
++  layout->relocation_count = 0;
++  layout->cut_count = 0;
++  for (uint32_t k = 0; k < layout->invocation_count; ++k) {
++    for (iree_host_size_t j = 0; j < program->relocation_count; ++j) {
++      const uint32_t target = program->relocations[j].target_record_index;
++      if (target >= layout->range_begin[k] && target < layout->range_end[k]) {
++        ++layout->relocation_count;
++      }
++    }
++    const uint32_t bounds[2] = {layout->range_begin[k], layout->range_end[k]};
++    for (uint32_t b = 0; b < 2; ++b) {
++      uint32_t c = 0;
++      while (c < layout->cut_count && layout->cuts[c] != bounds[b]) {
++        ++c;
++      }
++      if (c == layout->cut_count) {
++        layout->cuts[layout->cut_count++] = bounds[b];
++      }
++    }
++  }
++  for (uint32_t a = 1; a < layout->cut_count; ++a) {
++    for (uint32_t b = a; b > 0 && layout->cuts[b - 1] > layout->cuts[b]; --b) {
++      const uint32_t cut = layout->cuts[b];
++      layout->cuts[b] = layout->cuts[b - 1];
++      layout->cuts[b - 1] = cut;
++    }
++  }
++}
++
++// Returns true when control fragment |c| (between cuts c and c + 1) is
++// nonempty and loaded by invocation |k|.
++static bool loom_aie2p_xdna_invocation_loads_fragment(
++    const loom_aie2p_xdna_entry_layout_t* layout, uint32_t k, uint32_t c) {
++  return layout->cuts[c + 1] > layout->cuts[c] &&
++         layout->cuts[c] >= layout->range_begin[k] &&
++         layout->cuts[c + 1] <= layout->range_end[k];
++}
++
+ static loom_aie2p_xdna_product_issue_kind_t loom_aie2p_xdna_measure_entry(
+     const loom_aie2p_xdna_entry_t* entry,
+     const loom_aie2p_xdna_tile_layout_t* tile_layouts, uint32_t alignment,
+@@ -362,14 +472,28 @@ static loom_aie2p_xdna_product_issue_kind_t loom_aie2p_xdna_measure_entry(
+     }
+   }
+   uint64_t control_bytes = 0;
++  uint64_t range_bytes[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT] = {0};
+   for (iree_host_size_t i = 0; i < program->control_record_count; ++i) {
+-    control_bytes +=
++    const uint32_t record_size =
+         loom_aie2p_xdna_native_record_size(&program->control_records[i]);
++    control_bytes += record_size;
++    for (uint32_t k = 0; k < layout->invocation_count; ++k) {
++      if (i >= layout->range_begin[k] && i < layout->range_end[k]) {
++        range_bytes[k] += record_size;
++      }
++    }
++  }
++  // Invocation 0 starts the backing; each later one starts aligned after the
++  // previous one.
++  uint64_t region_offsets[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT] = {0};
++  uint64_t region_bytes[LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT] = {0};
++  region_bytes[0] = array_bytes + inline_bytes + range_bytes[0];
++  uint64_t native_byte_length = region_bytes[0];
++  for (uint32_t k = 1; k < layout->invocation_count; ++k) {
++    region_offsets[k] = iree_align_uint64(native_byte_length, alignment);
++    region_bytes[k] = LOOM_AIE2P_NATIVE_HEADER_SIZE + range_bytes[k];
++    native_byte_length = region_offsets[k] + region_bytes[k];
+   }
+-  const uint64_t initial_bytes = array_bytes + inline_bytes + control_bytes;
+-  const uint64_t repeat_offset = iree_align_uint64(initial_bytes, alignment);
+-  const uint64_t repeat_bytes = LOOM_AIE2P_NATIVE_HEADER_SIZE + control_bytes;
+-  const uint64_t native_byte_length = repeat_offset + repeat_bytes;
+   if (native_byte_length > UINT32_MAX) {
+     *out_actual = native_byte_length;
+     return LOOM_AIE2P_XDNA_PRODUCT_ISSUE_NATIVE_COMMAND_BYTE_LENGTH;
+@@ -383,24 +507,42 @@ static loom_aie2p_xdna_product_issue_kind_t loom_aie2p_xdna_measure_entry(
+   layout->array_operation_count = (uint32_t)array_operation_count;
+   layout->control_source_offset = (uint32_t)array_bytes;
+   layout->control_destination_offset = (uint32_t)(array_bytes + inline_bytes);
+-  layout->initial_byte_length = (uint32_t)initial_bytes;
+-  layout->repeat_offset = (uint32_t)repeat_offset;
+-  layout->repeat_byte_length = (uint32_t)repeat_bytes;
+-  const uint64_t has_control = program->control_record_count != 0 ? 1u : 0u;
++  layout->control_byte_length = (uint32_t)control_bytes;
++  for (uint32_t k = 0; k < layout->invocation_count; ++k) {
++    layout->region_offset[k] = (uint32_t)region_offsets[k];
++    layout->region_bytes[k] = (uint32_t)region_bytes[k];
++  }
++  // One section per nonempty control fragment and one load per invocation
++  // using it; every invocation after the first adds its header.
++  uint64_t fragment_count = 0;
++  uint64_t fragment_load_count = 0;
++  for (uint32_t c = 0; c + 1 < layout->cut_count; ++c) {
++    if (layout->cuts[c + 1] > layout->cuts[c]) {
++      ++fragment_count;
++    }
++    for (uint32_t k = 0; k < layout->invocation_count; ++k) {
++      if (loom_aie2p_xdna_invocation_loads_fragment(layout, k, c)) {
++        ++fragment_load_count;
++      }
++    }
++  }
++  const uint64_t header_count = layout->invocation_count - 1u;
+   *out_command_section_count = loadable_section_count +
+-                               (has_trailing_fragment ? 1u : 0u) + has_control +
+-                               1u;
++                               (has_trailing_fragment ? 1u : 0u) +
++                               fragment_count + header_count;
+   *out_segment_count = 2u * loadable_section_count +
+-                       (has_trailing_fragment ? 1u : 0u) + 2u * has_control +
+-                       1u;
++                       (has_trailing_fragment ? 1u : 0u) + fragment_load_count +
++                       header_count;
+   return LOOM_AIE2P_XDNA_PRODUCT_ISSUE_NONE;
+ }
+ 
+ static iree_status_t loom_aie2p_xdna_allocate_entry_storage(
+     const loom_aie2p_xdna_entry_t* entry, iree_arena_allocator_t* arena,
+     loom_aie2p_xdna_entry_layout_t* layout) {
++  // Array records, the control body, then one header per later invocation.
+   const uint64_t source_byte_length =
+-      (uint64_t)layout->control_source_offset + layout->repeat_byte_length;
++      (uint64_t)layout->control_source_offset + layout->control_byte_length +
++      (uint64_t)LOOM_AIE2P_NATIVE_HEADER_SIZE * (layout->invocation_count - 1u);
+   IREE_ASSERT_LE(source_byte_length, UINT32_MAX);
+   IREE_RETURN_IF_ERROR(loom_aie2p_xdna_allocate_bytes(
+       arena, (iree_host_size_t)source_byte_length, &layout->source));
+@@ -455,8 +597,9 @@ static void loom_aie2p_xdna_emit_entry(
+   uint8_t* source = layout->source.data;
+   loom_aie2p_xdna_native_header(
+       profile, family, columns, memory_rows,
+-      layout->array_operation_count + (uint32_t)program->control_record_count,
+-      layout->initial_byte_length, source);
++      layout->array_operation_count +
++          (layout->range_end[0] - layout->range_begin[0]),
++      layout->region_bytes[0], source);
+   uint32_t source_offset = LOOM_AIE2P_NATIVE_HEADER_SIZE;
+   uint32_t fragment_start = 0;
+   uint32_t destination = 0;
+@@ -547,30 +690,50 @@ static void loom_aie2p_xdna_emit_entry(
+     layout->control_record_offsets[program->control_record_count] =
+         control_offset;
+   }
+-  uint32_t control_section;
+-  if (program->control_record_count != 0) {
+-    control_section = loom_aie2p_xdna_append_fragment(
+-        IREE_SV(".xdna.command"), source + layout->control_source_offset,
+-        control_offset, sections, section_count);
+-    segments[(*segment_count)++] =
+-        loom_aie2p_xdna_load(allocation, layout->control_destination_offset,
+-                             control_offset, control_section);
++  IREE_ASSERT_EQ(control_offset, layout->control_byte_length);
++  // The control body splits at every range boundary into fragments, each one
++  // section shared by every invocation whose range covers it.
++  uint32_t fragment_sections[2 * LOOM_AIE2P_XDNA_MAX_INVOCATION_COUNT];
++  for (uint32_t c = 0; c + 1 < layout->cut_count; ++c) {
++    if (layout->cuts[c + 1] == layout->cuts[c]) {
++      continue;
++    }
++    const uint32_t begin = layout->control_record_offsets[layout->cuts[c]];
++    const uint32_t end = layout->control_record_offsets[layout->cuts[c + 1]];
++    fragment_sections[c] = loom_aie2p_xdna_append_fragment(
++        IREE_SV(".xdna.command"),
++        source + layout->control_source_offset + begin, end - begin, sections,
++        section_count);
+   }
+-  uint8_t* repeat_header =
+-      source + layout->control_source_offset + control_offset;
+-  loom_aie2p_xdna_native_header(profile, family, columns, memory_rows,
+-                                (uint32_t)program->control_record_count,
+-                                layout->repeat_byte_length, repeat_header);
+-  const uint32_t repeat_section = loom_aie2p_xdna_append_fragment(
+-      IREE_SV(".xdna.command"), repeat_header, LOOM_AIE2P_NATIVE_HEADER_SIZE,
+-      sections, section_count);
+-  segments[(*segment_count)++] =
+-      loom_aie2p_xdna_load(allocation, layout->repeat_offset,
+-                           LOOM_AIE2P_NATIVE_HEADER_SIZE, repeat_section);
+-  if (program->control_record_count != 0) {
+-    segments[(*segment_count)++] = loom_aie2p_xdna_load(
+-        allocation, layout->repeat_offset + LOOM_AIE2P_NATIVE_HEADER_SIZE,
+-        control_offset, control_section);
++  uint8_t* headers = source + layout->control_source_offset + control_offset;
++  for (uint32_t k = 0; k < layout->invocation_count; ++k) {
++    uint32_t destination_offset = layout->control_destination_offset;
++    if (k != 0) {
++      uint8_t* header = headers + (k - 1u) * LOOM_AIE2P_NATIVE_HEADER_SIZE;
++      loom_aie2p_xdna_native_header(
++          profile, family, columns, memory_rows,
++          layout->range_end[k] - layout->range_begin[k],
++          layout->region_bytes[k], header);
++      const uint32_t header_section = loom_aie2p_xdna_append_fragment(
++          IREE_SV(".xdna.command"), header, LOOM_AIE2P_NATIVE_HEADER_SIZE,
++          sections, section_count);
++      segments[(*segment_count)++] =
++          loom_aie2p_xdna_load(allocation, layout->region_offset[k],
++                               LOOM_AIE2P_NATIVE_HEADER_SIZE, header_section);
++      destination_offset =
++          layout->region_offset[k] + LOOM_AIE2P_NATIVE_HEADER_SIZE;
++    }
++    for (uint32_t c = 0; c + 1 < layout->cut_count; ++c) {
++      if (!loom_aie2p_xdna_invocation_loads_fragment(layout, k, c)) {
++        continue;
++      }
++      const uint32_t size =
++          layout->control_record_offsets[layout->cuts[c + 1]] -
++          layout->control_record_offsets[layout->cuts[c]];
++      segments[(*segment_count)++] = loom_aie2p_xdna_load(
++          allocation, destination_offset, size, fragment_sections[c]);
++      destination_offset += size;
++    }
+   }
+ }
+ 
+@@ -629,6 +792,7 @@ iree_status_t loom_aie2p_xdna_product_admit(
+   uint64_t tile_count = 0;
+   uint64_t binding_count = 0;
+   uint64_t relocation_count = 0;
++  uint64_t invocation_count = 0;
+   uint64_t entry_name_byte_length = 0;
+   for (iree_host_size_t i = 0; i < product->entry_count; ++i) {
+     const loom_aie2p_xdna_entry_t* entry = &product->entries[i];
+@@ -637,7 +801,9 @@ iree_status_t loom_aie2p_xdna_product_admit(
+         .first_tile = (uint32_t)tile_count,
+         .first_binding = (uint32_t)binding_count,
+         .first_relocation = (uint32_t)relocation_count,
++        .first_invocation = (uint32_t)invocation_count,
+     };
++    loom_aie2p_xdna_plan_invocations(entry->array_program, layout);
+ 
+     if (entry->name.size > IREE_XDNA_ELF_MAX_ENTRY_NAME_LENGTH) {
+       loom_aie2p_xdna_set_issue(
+@@ -647,7 +813,8 @@ iree_status_t loom_aie2p_xdna_product_admit(
+     }
+     tile_count += entry->tile_count;
+     binding_count += entry->binding_count;
+-    relocation_count += 2u * (uint64_t)entry->array_program->relocation_count;
++    relocation_count += layout->relocation_count;
++    invocation_count += layout->invocation_count;
+     entry_name_byte_length += entry->name.size;
+     if (entry->column_count > admission->partition_column_count) {
+       admission->partition_column_count = entry->column_count;
+@@ -665,6 +832,12 @@ iree_status_t loom_aie2p_xdna_product_admit(
+           relocation_count, 0, IREE_XDNA_ELF_MAX_TABLE_RECORD_COUNT, out_issue);
+       return iree_ok_status();
+     }
++    if (invocation_count > IREE_XDNA_ELF_MAX_TABLE_RECORD_COUNT) {
++      loom_aie2p_xdna_set_issue(
++          LOOM_AIE2P_XDNA_PRODUCT_ISSUE_INVOCATION_RECORD_COUNT, (uint32_t)i,
++          invocation_count, 0, IREE_XDNA_ELF_MAX_TABLE_RECORD_COUNT, out_issue);
++      return iree_ok_status();
++    }
+   }
+   IREE_ASSERT_LT(tile_count, UINT32_MAX);
+ 
+@@ -682,7 +855,7 @@ iree_status_t loom_aie2p_xdna_product_admit(
+       relocation_count * IREE_XDNA_ELF_RELOCATION_RECORD_SIZE;
+   const uint64_t string_offset =
+       invocation_offset +
+-      2u * entry_count * IREE_XDNA_ELF_INVOCATION_RECORD_SIZE;
++      invocation_count * IREE_XDNA_ELF_INVOCATION_RECORD_SIZE;
+   const uint64_t metadata_byte_length = string_offset + entry_name_byte_length;
+   if (metadata_byte_length > IREE_XDNA_ELF_MAX_METADATA_TABLE_SIZE) {
+     loom_aie2p_xdna_set_issue(
+@@ -695,6 +868,7 @@ iree_status_t loom_aie2p_xdna_product_admit(
+   admission->tile_count = (iree_host_size_t)tile_count;
+   admission->binding_count = (uint32_t)binding_count;
+   admission->relocation_count = (uint32_t)relocation_count;
++  admission->invocation_count = (uint32_t)invocation_count;
+   admission->entry_name_byte_length = (uint32_t)entry_name_byte_length;
+   admission->use_offset = (uint32_t)use_offset;
+   admission->entry_offset = (uint32_t)entry_offset;
+@@ -905,7 +1079,7 @@ iree_status_t loom_aie2p_xdna_product_finalize(
+       .entry_count = entry_count,
+       .binding_count = admission->binding_count,
+       .relocation_count = admission->relocation_count,
+-      .invocation_count = 2 * entry_count,
++      .invocation_count = admission->invocation_count,
+       .string_byte_length = admission->entry_name_byte_length,
+   };
+   iree_xdna_elf_encode_header(&header, metadata.data);
+@@ -939,7 +1113,8 @@ iree_status_t loom_aie2p_xdna_product_finalize(
+     const iree_xdna_elf_allocation_record_t allocation = {
+         .domain = IREE_XDNA_ELF_ALLOCATION_DOMAIN_COMMAND,
+         .byte_length =
+-            (uint64_t)layout->repeat_offset + layout->repeat_byte_length,
++            (uint64_t)layout->region_offset[layout->invocation_count - 1u] +
++            layout->region_bytes[layout->invocation_count - 1u],
+         .alignment = profile->limits.instruction_address_alignment,
+         .first_load = first_load,
+         .load_count = emitted_segment_count - first_load,
+@@ -958,10 +1133,9 @@ iree_status_t loom_aie2p_xdna_product_finalize(
+         .binding_count = (uint32_t)entry->binding_count,
+         .first_static_relocation = layout->first_relocation,
+         .first_dynamic_relocation = layout->first_relocation,
+-        .dynamic_relocation_count =
+-            (uint32_t)(2 * entry->array_program->relocation_count),
+-        .first_invocation = 2 * i,
+-        .invocation_count = 2,
++        .dynamic_relocation_count = layout->relocation_count,
++        .first_invocation = layout->first_invocation,
++        .invocation_count = layout->invocation_count,
+     };
+     iree_xdna_elf_encode_entry(&entry_record,
+                                metadata.data + admission->entry_offset +
+@@ -975,57 +1149,74 @@ iree_status_t loom_aie2p_xdna_product_finalize(
+           metadata.data + admission->binding_offset +
+               (layout->first_binding + j) * IREE_XDNA_ELF_BINDING_RECORD_SIZE);
+     }
+-    for (uint32_t invocation = 0; invocation < 2; ++invocation) {
+-      const uint32_t body_offset =
+-          invocation == 0
+-              ? layout->control_destination_offset
+-              : layout->repeat_offset + LOOM_AIE2P_NATIVE_HEADER_SIZE;
+-      for (uint32_t j = 0; j < entry->array_program->relocation_count; ++j) {
++    const loom_aie2p_array_program_t* program = entry->array_program;
++    uint32_t relocation_ordinal = layout->first_relocation;
++    for (uint32_t invocation = 0; invocation < layout->invocation_count;
++         ++invocation) {
++      const uint32_t range_begin = layout->range_begin[invocation];
++      const uint32_t range_end = layout->range_end[invocation];
++      const uint32_t body_offset = invocation == 0
++                                       ? layout->control_destination_offset
++                                       : layout->region_offset[invocation] +
++                                             LOOM_AIE2P_NATIVE_HEADER_SIZE;
++      // Command-backing offset of record |range_begin| minus its body offset.
++      const uint32_t range_base =
++          layout->control_record_offsets
++              ? layout->control_record_offsets[range_begin]
++              : 0;
++      for (uint32_t j = 0; j < program->relocation_count; ++j) {
+         const loom_aie2p_program_relocation_t* source =
+-            &entry->array_program->relocations[j];
++            &program->relocations[j];
++        if (source->target_record_index < range_begin ||
++            source->target_record_index >= range_end) {
++          continue;
++        }
+         const iree_xdna_elf_relocation_record_t relocation = {
+             .destination_use = 0,
+             .source_ordinal = source->binding_ordinal,
+             .byte_offset =
+                 body_offset +
+-                layout->control_record_offsets[source->target_record_index] +
+-                16 + source->target_word_index * 4,
++                layout->control_record_offsets[source->target_record_index] -
++                range_base + 16 + source->target_word_index * 4,
+             .kind = IREE_XDNA_ELF_RELOCATION_KIND_SHIM_ADDRESS,
+             .addend = source->addend,
+             .minimum_value = source->minimum_value,
+             .maximum_value = source->maximum_value,
+             .alignment = source->required_alignment,
+         };
+-        const uint32_t ordinal =
+-            layout->first_relocation +
+-            invocation * (uint32_t)entry->array_program->relocation_count + j;
++        const uint32_t ordinal = relocation_ordinal++;
+         iree_xdna_elf_encode_relocation(
+             &relocation, metadata.data + admission->relocation_offset +
+                              ordinal * IREE_XDNA_ELF_RELOCATION_RECORD_SIZE);
+       }
+       iree_xdna_elf_invocation_record_t range = {
+           .allocation_use = 0,
+-          .byte_offset = invocation == 0 ? 0 : layout->repeat_offset,
+-          .byte_length = invocation == 0 ? layout->initial_byte_length
+-                                         : layout->repeat_byte_length,
++          .byte_offset = layout->region_offset[invocation],
++          .byte_length = layout->region_bytes[invocation],
+           .next_invocation = 1,
+       };
+-      if (entry->array_program->measurement.present) {
++      // The timer interval is published only by invocations whose range holds
++      // the whole measured record span.
++      if (program->measurement.present &&
++          program->measurement.begin_record >= range_begin &&
++          program->measurement.end_record <= range_end) {
+         const uint32_t control_begin = body_offset - range.byte_offset;
+         range.measurement.begin =
+             control_begin +
+-            layout->control_record_offsets[entry->array_program->measurement
+-                                               .begin_record];
++            layout->control_record_offsets[program->measurement.begin_record] -
++            range_base;
+         range.measurement.end =
+             control_begin +
+-            layout->control_record_offsets[entry->array_program->measurement
+-                                               .end_record];
++            layout->control_record_offsets[program->measurement.end_record] -
++            range_base;
+       }
+       iree_xdna_elf_encode_invocation(
+-          &range,
+-          metadata.data + admission->invocation_offset +
+-              (2 * i + invocation) * IREE_XDNA_ELF_INVOCATION_RECORD_SIZE);
++          &range, metadata.data + admission->invocation_offset +
++                      (layout->first_invocation + invocation) *
++                          IREE_XDNA_ELF_INVOCATION_RECORD_SIZE);
+     }
++    IREE_ASSERT_EQ(relocation_ordinal,
++                   layout->first_relocation + layout->relocation_count);
+   }
+   iree_const_byte_span_t symbols;
+   iree_const_byte_span_t strings;
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.h b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.h
+index 646f1fd600..fc621b7f83 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.h
+@@ -78,6 +78,7 @@ typedef enum loom_aie2p_xdna_product_issue_kind_e {
+   LOOM_AIE2P_XDNA_PRODUCT_ISSUE_SYMBOL_STRING_BYTE_LENGTH = 10,
+   LOOM_AIE2P_XDNA_PRODUCT_ISSUE_FILE_BYTE_LENGTH = 11,
+   LOOM_AIE2P_XDNA_PRODUCT_ISSUE_SECTION_NAME_BYTE_LENGTH = 12,
++  LOOM_AIE2P_XDNA_PRODUCT_ISSUE_INVOCATION_RECORD_COUNT = 13,
+ } loom_aie2p_xdna_product_issue_kind_t;
+ 
+ // Structured semantic rejection returned to the compiler boundary.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product_test.cc b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product_test.cc
+index 7534023ded..50b6e1ca32 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product_test.cc
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product_test.cc
+@@ -122,6 +122,8 @@ TEST_F(XdnaProductTest, RejectsSourceKnownRelocationCount) {
+       kSourceRelocationCount);
+   program.relocations = relocations.data();
+   program.relocation_count = relocations.size();
++  // Every relocation targets record 0, which both invocation ranges hold.
++  program.control_record_count = 1;
+   ExpectAdmissionIssue(
+       &product, LOOM_AIE2P_XDNA_PRODUCT_ISSUE_RELOCATION_RECORD_COUNT, 0,
+       2u * kSourceRelocationCount, 0, IREE_XDNA_ELF_MAX_TABLE_RECORD_COUNT);

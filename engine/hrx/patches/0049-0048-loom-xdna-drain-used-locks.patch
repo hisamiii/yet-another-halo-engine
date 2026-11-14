@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 17:50:07 +0100
+Subject: [PATCH 49/70] 0048-loom-xdna-drain-used-locks
+
+loom: LOOM_EXP_DRAIN_USED raises only the locks an image initializes
+
+Under LOOM_EXP_ROUTE_RESET the drain raised every core and memory tile lock (1024 write32s a setup). A stale request
+steals a token only from a lock that later receives one, and an image initializes every lock it gives tokens to, so
+raising those drains every request that could matter: ~400 writes a setup.
+
+(cherry picked from commit 35bb91542c1024e82b208ad52c5a2e59032b70b0)
+---
+ .../arch/amd/xdna/aie2p/array/program.c       | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index dbd1f2e532..da80b8cae5 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -2372,6 +2372,35 @@ static iree_status_t loom_aie2p_program_drain_lock_requests(
+     columns = iree_max(columns,
+                        (uint16_t)(plan->worker_plans[i].coordinate.column + 1));
+   }
++  // LOOM_EXP_DRAIN_USED=1: raise only the locks this image initializes. A
++  // stale request steals a token only from a lock that receives one, and every
++  // image initializes each lock it gives tokens to, so its own raise drains it.
++  const char* used_spec = getenv("LOOM_EXP_DRAIN_USED");
++  if (used_spec && atoi(used_spec) != 0) {
++    for (iree_host_size_t i = 0; i < plan->lock_count; ++i) {
++      const loom_aie2p_array_lock_plan_t* lock = &plan->locks[i];
++      bool seen = false;
++      for (iree_host_size_t j = 0; j < i && !seen; ++j) {
++        seen = plan->locks[j].coordinate.column == lock->coordinate.column &&
++               plan->locks[j].coordinate.row == lock->coordinate.row &&
++               plan->locks[j].lock_id == lock->lock_id;
++      }
++      const loom_xdna_tile_facts_t* tile =
++          loom_xdna_array_tile_facts(family, lock->coordinate);
++      if (seen || !tile || (tile->kind != LOOM_XDNA_TILE_KIND_COMPUTE &&
++                            tile->kind != LOOM_XDNA_TILE_KIND_MEMORY)) {
++        continue;
++      }
++      const loom_aie2p_array_lock_plan_t raised = {
++          .coordinate = lock->coordinate,
++          .lock_id = lock->lock_id,
++          .initial_value = tile->lock_value_maximum,
++      };
++      IREE_RETURN_IF_ERROR(loom_aie2p_program_append_lock_initialization(
++          builder, &builder->array, &raised));
++    }
++    return iree_ok_status();
++  }
+   for (uint16_t column = 0; column < columns; ++column) {
+     for (uint16_t row = 0; row < family->row_count; ++row) {
+       const loom_xdna_tile_coordinate_t coordinate = {.column = column,

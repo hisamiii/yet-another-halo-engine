@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yah <yah@localhost>
+Date: Sat, 14 Nov 2026 18:20:38 +0100
+Subject: [PATCH 53/70] 0048-0059 : port coalescing, alignbit and concat CSE to
+ main
+
+---
+ .../target/arch/amdgpu/descriptors/alu.py     | 29 -------------------
+ .../target/arch/amdgpu/descriptors/bitwise.py |  6 ++++
+ .../loom/codegen/low/allocation/coalescing.c  |  2 +-
+ loom/src/loom/codegen/low/transforms/cse.c    |  2 ++
+ .../arch/amd/xdna/aie2p/array/program.c       |  4 +--
+ 5 files changed, 11 insertions(+), 32 deletions(-)
+
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/alu.py b/loom/py/loom/target/arch/amdgpu/descriptors/alu.py
+index 1ff649ff37..f1d460fde7 100644
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/alu.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/alu.py
+@@ -2566,34 +2566,6 @@ def _v_bfi_b32_overlay() -> AmdgpuDescriptorOverlay:
+     )
+ 
+ 
+-def _v_alignbit_b32_overlay() -> AmdgpuDescriptorOverlay:
+-    return AmdgpuDescriptorOverlay(
+-        descriptor_key="amdgpu.v_alignbit_b32",
+-        instruction_name="V_ALIGNBIT_B32",
+-        mnemonic="v_alignbit_b32",
+-        encoding_name="ENC_VOP3",
+-        semantic_tag="integer.funnel_shift.right.u32",
+-        schedule_class=_SCHEDULE_VALU,
+-        operands=(
+-            AmdgpuOperandOverlay("VDST", _vgpr_result()),
+-            AmdgpuOperandOverlay("SRC0", _sgpr_vgpr_operand("high")),
+-            AmdgpuOperandOverlay("SRC1", _sgpr_vgpr_operand("low")),
+-            AmdgpuOperandOverlay(
+-                "SRC2",
+-                _sgpr_vgpr_operand("shift"),
+-                size_exception_reason="alignbit-reads-low-5-bits-of-b32-shift",
+-            ),
+-        ),
+-        asm_forms=_asm(
+-            mnemonic="v_alignbit_b32",
+-            results=("dst",),
+-            operands=("high", "low", "shift"),
+-        ),
+-        constraints=_REMATERIALIZABLE_RESULT_CONSTRAINTS,
+-        flags=(DescriptorFlag.DEAD_REMOVABLE,),
+-    )
+-
+-
+ def _v_and_or_b32_overlay() -> AmdgpuDescriptorOverlay:
+     return AmdgpuDescriptorOverlay(
+         descriptor_key="amdgpu.v_and_or_b32",
+@@ -2921,7 +2893,6 @@ def _integer_bitwise_shift_overlays(
+         _v_bfe_offset_0_width_inline_low16_overlay(is_signed=True),
+         _v_bfi_b32_overlay(),
+         *((_v_bfi_b32_src0_literal_overlay(),) if include_vop3_literal_forms else ()),
+-        _v_alignbit_b32_overlay(),
+         _v_and_or_b32_overlay(),
+         _v_lshrrev_b32_overlay(),
+         _v_lshrrev_b32_src0_inline_overlay(),
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/bitwise.py b/loom/py/loom/target/arch/amdgpu/descriptors/bitwise.py
+index 6bf1228daa..298450a731 100644
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/bitwise.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/bitwise.py
+@@ -227,6 +227,12 @@ def _v_alignbit_b32_overlay() -> AmdgpuDescriptorOverlay:
+                 size_exception_reason="Low five count bits use a full register.",
+             ),
+         ),
++        asm_forms=_asm(
++            mnemonic="v_alignbit_b32",
++            results=("dst",),
++            operands=("high", "low", "shift"),
++        ),
++        constraints=(Constraint(ConstraintKind.REMATERIALIZABLE, 0),),
+         flags=(DescriptorFlag.DEAD_REMOVABLE,),
+     )
+ 
+diff --git a/loom/src/loom/codegen/low/allocation/coalescing.c b/loom/src/loom/codegen/low/allocation/coalescing.c
+index 828ced7258..79150eb490 100644
+--- a/loom/src/loom/codegen/low/allocation/coalescing.c
++++ b/loom/src/loom/codegen/low/allocation/coalescing.c
+@@ -916,7 +916,7 @@ static bool loom_low_allocation_coalescing_same_content_view(
+     }
+     for (uint32_t k = 0; k + small->location_count <= big->location_count;
+          ++k) {
+-      if (!loom_low_allocation_storage_assignment_subranges_equal(
++      if (!loom_low_allocation_storage_assignment_subranges_correspond(
+               ds, big, k, small, 0, small->location_count)) {
+         continue;
+       }
+diff --git a/loom/src/loom/codegen/low/transforms/cse.c b/loom/src/loom/codegen/low/transforms/cse.c
+index de637d43de..a2481d38fe 100644
+--- a/loom/src/loom/codegen/low/transforms/cse.c
++++ b/loom/src/loom/codegen/low/transforms/cse.c
+@@ -552,6 +552,8 @@ static void loom_low_cse_commit_packet(
+     state_class->assignment = can_reuse_assignment ? cursor->op : NULL;
+     state_class->boundary = can_reuse_assignment ? boundary : NULL;
+   }
++}
++
+ // Returns whether |op| only feeds low.concat pieces and one of those concats
+ // also consumes |existing|'s result. Replacing |op| by |existing| would then
+ // make that concat consume one value as two pieces, and a value has one storage
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index da80b8cae5..9dd1ef8624 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -2396,8 +2396,8 @@ static iree_status_t loom_aie2p_program_drain_lock_requests(
+           .lock_id = lock->lock_id,
+           .initial_value = tile->lock_value_maximum,
+       };
+-      IREE_RETURN_IF_ERROR(loom_aie2p_program_append_lock_initialization(
+-          builder, &builder->array, &raised));
++      loom_aie2p_program_append_lock_initialization(builder, &builder->array,
++                                                    &raised);
+     }
+     return iree_ok_status();
+   }
