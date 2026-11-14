@@ -1022,11 +1022,6 @@ class LoomPrefill {
     }
     return parts;
   }
-  // An image's decoder swap image, the image itself where there is none (fused sets)
-  static std::string SwapOf(const std::string& image) {
-    const std::string swap = image + ".swap.xdna";
-    return ::access(swap.c_str(), R_OK) == 0 ? swap : image + ".xdna";
-  }
   // H's bytes in C (from 0), then down's partials from FfnBlkDown().
   std::size_t FfnBlkH() const { return std::size_t{B_ / 64} * (FfnBlkF() / 1024) * 4 * 128 * 144; }
   std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
@@ -1160,7 +1155,7 @@ class LoomPrefill {
       for (std::uint32_t j = 0; j < F / 256; ++j) {
         const std::size_t r0 = f0 + 256 * j;
         csw.push_back(npu_->BindRawPair(
-            sw + ".xdna", SwapOf(sw), 16 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            sw + ".xdna", sw + ".xdna", 16 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
             pg + r0 * rb, 255 * rb + 16 * blk + RecordRow(f.name),
             pu + r0 * rbu, 255 * rbu + 16 * blku + RecordRow(fu.name),
             {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, 4 * (B_ / 64) * 4 * 1152,
@@ -1171,7 +1166,7 @@ class LoomPrefill {
       for (std::uint32_t j = 0; j < F / 192; ++j) {
         const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);
         csw.push_back(npu_->BindRawPair(
-            sw + ".xdna", SwapOf(sw), 16 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            sw + ".xdna", sw + ".xdna", 16 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
             pg + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + RecordRow(f.name),
             pu + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + RecordRow(fu.name),
             {(j / 16) * 4 * 128 * 144 + (j % 16) * 8 * 144, bs.c}, 3 * (B_ / 64) * 4 * 1152,
@@ -1181,7 +1176,7 @@ class LoomPrefill {
                                   // at H k-blocks 32 j + 4 c .. (gen_npu_gemm swcol 32)
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 256; ++j)
-        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), mix && !bmix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(gdec), ag,
+        csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".xdna", mix && !bmix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(gdec), ag,
                                     pg + (f0 + 256 * j) * rb,
                                     dgu + 255 * rb + 16 * blk + RecordRow(gdec),
                                     {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, "ffnsw" + hord));
@@ -1189,7 +1184,7 @@ class LoomPrefill {
                // (gen_npu_gemm hord): its two 16-row slabs 32 rows apart from 64 (j / 2) + 16 (j % 2)
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 224; ++j)
-        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
+        csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".xdna", DecoderId(f.name), ag,
                                     pg + (f0 + (q4k ? 64 * (j / 2) + 16 * (j % 2) : 32 * j)) * rb,
                                     dgu + (6 * 1024 + (q4k ? 47 : 31)) * rb + 16 * blk + RecordRow(f.name),
                                     {4 * j * 144, bs.c},
@@ -1205,7 +1200,7 @@ class LoomPrefill {
       if (bd.c != cp) throw LoomError("prefill: the FFN block's down parts differ in C bytes");
       for (std::uint32_t r = 0; r < calls; ++r) {
         const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + 4 * p0;
-        cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", SwapOf(dn[ci]), DecoderId(fd.name),
+        cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", dn[ci] + ".xdna", DecoderId(fd.name),
                                         {std::size_t{p0} * 4 * 128 * 144, bd.a, true},
                                         pd + r0 * rbd + k0 * blkd,
                                         (rows - 1) * rbd + 16 * blkd + RecordRow(fd.name),
@@ -1406,7 +1401,7 @@ class LoomPrefill {
   }
   // Decoder-column sets ("npudcol"): the NPU decodes a tensor of a format with a decoder itself, from its raw rows
   // ("npu_dcol_<fmt>_<K>.xdna"; "" for other formats: that site stays on the GPU in that layer). dec: the format's
-  // decoder id (the images' swaps).
+  // decoder id.
   std::string DcolImage(const std::string& wname, int* dec = nullptr, bool half = false) const {
     const char* const name = SiteDec(wname);
     if (!name) return "";
@@ -1518,17 +1513,14 @@ class LoomPrefill {
     const auto chunks = NpuChunks(site);
     const std::size_t start = c_off;
     int dec = -1;
-    std::string swap;
-    swap = (half ? hdir_ : dir_) + "/npu_dcol_" + SiteDec(wname) + ".swap.xdna";
-    if (::access(swap.c_str(), R_OK) != 0) swap.clear();   // fused sets (YAH_NPU_FUSE): no decoder tiles to swap
     for (std::size_t c = 0; c < chunks.size(); ++c) {
       const std::string image = DcolImage(wname, &dec, half);
       const std::size_t cp = half ? HNpuK(chunks[c].second).c : NpuK(chunks[c].second).c;
       for (const NpuView& wv : w[c]) {
-        // fused sets: each image its own family (a family change runs the image's setup; a swap would splice a whole
+        // each image its own family (a family change runs the image's setup; a shared family would splice a whole
         // image's first call, which stalls the array)
-        calls.push_back(npu_->BindRaw(image, swap.empty() ? image : swap, dec, a[c], RawBase(wname) + wv.offset,
-                                      wv.length, {c_off, cp}, swap.empty() ? image : "dcol"));
+        calls.push_back(npu_->BindRaw(image, image, dec, a[c], RawBase(wname) + wv.offset, wv.length, {c_off, cp},
+                                      image));
         c_off += cp;
       }
     }
@@ -2136,9 +2128,8 @@ class LoomPrefill {
       const auto wg = NpuRawRows("gate", pre + "attn_gate.weight", ng);
       std::vector<std::uint32_t> calls;
       const NpuView cq = NpuCalls("qkv", kq ? ak : a4, wq, c_off, calls, pre + "attn_qkv.weight");
-      // fused sets: a job runs one image (one family: NpuCalls)
-      if (DcolImage(pre + "attn_qkv.weight") != DcolImage(pre + "attn_gate.weight") &&
-          ::access((dir_ + "/npu_dcol_iq4xs.swap.xdna").c_str(), R_OK) != 0)
+      // a job runs one image (one family: NpuCalls)
+      if (DcolImage(pre + "attn_qkv.weight") != DcolImage(pre + "attn_gate.weight"))
         NpuEnqueue(std::exchange(calls, {}), "qkv");
       const NpuView cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
       NpuEnqueue(std::move(calls), "qkv");
@@ -2452,9 +2443,8 @@ class LoomPrefill {
     const bool out_af = Af("gemm_kres", wo), out_half = HalfOutOk(wo, out_af);
     const bool bfp = out_half && hgeom_.count("npupostnormbfp");  // the postnorm writes out's p4 stream
     const bool kq = NpuPk(wq), kg = NpuPk(wg);
-    // fused sets: a job runs one image; with two, half 1 runs gate first (the array keeps half 0's last image)
-    const bool two = DcolImage(wq, nullptr, true) != DcolImage(wg, nullptr, true) &&
-                     ::access((hdir_ + "/npu_dcol_iq4xs.swap.xdna").c_str(), R_OK) != 0;
+    // a job runs one image; with two, half 1 runs gate first (the array keeps half 0's last image)
+    const bool two = DcolImage(wq, nullptr, true) != DcolImage(wg, nullptr, true);
     const auto rq = NpuRawRows("qkv", wq, nq), rg = NpuRawRows("gate", wg, ng);
     // with two images gate runs whole between qkv's halves (one switch and one fill less than its halves): its own A
     // stream in out's half-1 slots (free until A_1) and C past half 0's region (dead past C_1's FFN unpack)
