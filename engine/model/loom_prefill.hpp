@@ -733,8 +733,9 @@ class LoomPrefill {
     // Activations are token major, [token][row], with row stride = the K extent of the GEMM that reads them.
     kv_cache_ = std::size_t{T_} * kKvRow;
     hidden_ = &Alloc(B * kHidden * 4);
-    reszero_ = &Alloc(B * kHidden * 4);
-    sumout_ = &Alloc(B * kHidden * 4);
+    // The norms' residual and sum_out bindings: the emitted norms (gen_half_norm.gen_split) never touch them (only
+    // gen(resadd) does), so one 4-byte buffer stands for both, read-only in the graph (no false waits between norms)
+    normnil_ = &Alloc(4);
     scratch_ = &Alloc(B * kFfn * 2);
     qkv_ = &Alloc(B * kQProj * 4);
     gate_ = &Alloc(B * kInner * 4);
@@ -812,7 +813,6 @@ class LoomPrefill {
     Zero(*conv_state_);
     Zero(*state_);
     Zero(*kv16_);
-    Zero(*reszero_);
 
     // "kv_paged": 256-token pages, one page table per sequence (logical -> physical page, shared by all layers).
     kv_paged_ = geom_.count("kv_paged") != 0;
@@ -1393,9 +1393,9 @@ class LoomPrefill {
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
     std::vector<hrx_buffer_ref_t> b =
         mode == NormOut::kBoth
-            ? std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
+            ? std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_),
                                             Ref(*scratch_), Ref(*normt_)}
-            : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
+            : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_),
                                             Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)};
     if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
@@ -1684,7 +1684,7 @@ class LoomPrefill {
     chunk_graph_ = std::make_unique<LoomGraph>(gpu_);
     LoomGraph& g = *chunk_graph_;
     weights_.ForEachBuffer([&](hrx_buffer_t h) { g.ReadOnly(h); });
-    for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, grid_iq2s_, ksigns_, eps_, reszero_})
+    for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, grid_iq2s_, ksigns_, eps_, normnil_})
       g.ReadOnly(t->handle);
     graph_ = &g;
   }
@@ -2463,7 +2463,7 @@ class LoomPrefill {
                                : mode == NormOut::kBoth ? "norm_rt_bfp.hal"
                                                         : "norm_bfp.hal");
     const std::size_t r = std::size_t{kHidden} * 4, r16 = std::size_t{kHidden} * 2;
-    std::vector<hrx_buffer_ref_t> b{Tok(*hidden_, h, r), Tok(*reszero_, h, r), TRef(*Find(wname)), Tok(*sumout_, h, r),
+    std::vector<hrx_buffer_ref_t> b{Tok(*hidden_, h, r), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_),
                                     Tok(mode == NormOut::kTiled ? *normt_ : *scratch_, h, r16)};
     if (mode == NormOut::kBoth) b.push_back(Tok(*normt_, h, r16));
     b.push_back(AView(HalfA(false, h, false)));
@@ -2475,9 +2475,9 @@ class LoomPrefill {
     const std::size_t r = std::size_t{kHidden} * 4, r16 = std::size_t{kHidden} * 2;
     Dispatch(exe, "yah_half_norm", HB() / NormRowsPerWg(exe), 1, 1, 32, 1, 1,
              {Tok(x, h, r),
-              Tok(*reszero_, h, r),
+              Ref(*normnil_),
               TRef(*Find(pre + "post_attention_norm.weight")),
-              Tok(*sumout_, h, r),
+              Ref(*normnil_),
               Tok(*normt_, h, r16),
               {npu_->A().handle, 0, NpuK(5120).a}});
   }
@@ -2878,7 +2878,7 @@ class LoomPrefill {
   std::vector<std::string> prof_tags_;     // YAH_NPU_PROF: the first NPU chunk's job tags (ReportNpuProf)
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *grid_iq2s_ = nullptr, *ksigns_ = nullptr;
-  LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
+  LoomBuffer *hidden_ = nullptr, *normnil_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
              *gate_ = nullptr, *alpha_ = nullptr, *beta_ = nullptr, *q_ = nullptr, *q16_ = nullptr, *kbuf_ = nullptr,
              *vbuf_ = nullptr, *raw_ = nullptr, *raw2_ = nullptr, *conv_out_ = nullptr, *kqbuf_ = nullptr, *ab_ = nullptr,
              *conv_state_ = nullptr, *state_ = nullptr, *kv16_ = nullptr, *kc32_ = nullptr, *vc32_ = nullptr,
