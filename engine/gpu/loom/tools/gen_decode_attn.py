@@ -171,7 +171,7 @@ def gen_part(T):
     e("  %kh0 = index.mul %h, %c256 : index")
     e("  %kr = index.add %kr0, %kh0 : index")
     e(f"  %klim = index.constant {T * KVW - 8} : index")
-    e("  %zv8 = vector.constant 0.0 : vector<8xf32>")
+    e("  %zv8 = vector.splatf 0.0 : vector<8xf32>")
     inits = ", ".join(f"%sa{j} = %zv8 : vector<8xf32>" for j in range(G))
     res = ", ".join(f"%sr{j}" for j in range(G))
     e(f"  %cpk = index.constant {PIPE_K} : index")
@@ -279,7 +279,7 @@ def gen_part(T):
     e("  %vt1 = index.mul %pg, %c16 : index")
     e("  %vtb = index.add %vt0, %vt1 : index")
     e(f"  %vlim = index.constant {T * KVW - 16} : index")
-    e("  %zv16 = vector.constant 0.0 : vector<16xf32>")
+    e("  %zv16 = vector.splatf 0.0 : vector<16xf32>")
     ty16 = ", ".join(["vector<16xf32>"] * G)
     e(f"  %cpv = index.constant {PIPE_V} : index")
 
@@ -949,7 +949,7 @@ def gen_part_q(T, kb, vb):
     e("  %oh0 = index.mul %h, %c256 : index")
     e("  %oh1 = index.add %oh0, %t : index")
     e("  %oo = index.mul %oh1, %c16 : index")                 # open tile row of dim t
-    e("  %zv16 = vector.constant 0.0 : vector<16xf32>")
+    e("  %zv16 = vector.splatf 0.0 : vector<16xf32>")
     e(f"  %vsm = scalar.constant {1.0 / 256 if vb == 8 else 1.0 / 16} : f32")
     inits = ", ".join(f"%oa{j} = %zv16 : vector<16xf32>" for j in range(G))
     res = ", ".join(f"%or{j}" for j in range(G))
