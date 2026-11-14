@@ -307,8 +307,9 @@ class LoomNpu {
     return *shared_.back();
   }
 
-  // A new instance of the image at path (entry), its bindings the given views.
-  Kernel& Load(const std::string& path, const std::string& entry, const std::vector<View>& views) {
+  // A new instance of the image at path (entry), its bindings the given views. gated: a gated image (setup, gate and
+  // done invocations); else any image, of which RunOnce runs the first invocation only.
+  Kernel& Load(const std::string& path, const std::string& entry, const std::vector<View>& views, bool gated = true) {
     iree_hal_amd_xdna_image_t* image = Image(path);
     uint32_t entry_ordinal = 0;
     NpuCheck(iree_hal_amd_xdna_image_find_entry(image, iree_make_string_view(entry.data(), entry.size()),
@@ -317,17 +318,26 @@ class LoomNpu {
     const iree_hal_amd_xdna_image_tables_t* tables = iree_hal_amd_xdna_image_tables(image);
     const iree_xdna_elf_entry_record_t rec = iree_hal_amd_xdna_image_tables_entry(tables, entry_ordinal);
     if (rec.binding_count != views.size()) throw LoomError("npu: " + path + ": binding count");
-    if (rec.invocation_count != 7 && rec.invocation_count != 4)
+    if (gated && rec.invocation_count != 7 && rec.invocation_count != 4)
       throw LoomError("npu: " + path + " has no gate (re-emit it)");
     auto k = std::make_unique<Kernel>();
     k->image_key = image;
     k->path = path;
     k->image = image;
     k->entry_ordinal = entry_ordinal;
-    k->streamed = rec.invocation_count == 7;
+    k->streamed = gated && rec.invocation_count == 7;
     LoadStorage(*k, views);
     kernels_.push_back(std::move(k));
     return *kernels_.back();
+  }
+  // Runs an image's first invocation once on views and waits for it: a plain image's whole run, a gated image's setup
+  // call (run/npu_run for tools/npu_gemm_check.py and npu_attn_check.py).
+  void RunOnce(const std::string& path, const std::string& entry, const std::vector<View>& views) {
+    Kernel& k = Load(path, entry, views, false);
+    program_.Forget();   // a whole program load: the array holds nothing the gated paths know
+    ++epoch_;
+    YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k.first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(run)");
+    CheckHealth();
   }
   // k's command storage: the image's commands loaded into it, bound to views, and k's invocations in it.
   void LoadStorage(Kernel& k, const std::vector<View>& views) {
@@ -347,7 +357,8 @@ class LoomNpu {
         "query_invocation");
     amdf_xdna_kernel_command_t* const streamed[] = {&k.push[0], &k.push[1], &k.wait, &k.lead, &k.gate, &k.done};
     amdf_xdna_kernel_command_t* const single[] = {&k.call, &k.gate, &k.done};
-    for (uint32_t i = 0; i + 1 < rec.invocation_count; ++i)
+    const uint32_t queried = k.streamed ? 6 : 3;   // the arrays below (an ungated RunOnce image may have more)
+    for (uint32_t i = 0; i + 1 < rec.invocation_count && i < queried; ++i)
       NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(k.image, k.entry_ordinal, n, k.storage.data(),
                                                                      i + 1, k.streamed ? streamed[i] : single[i]),
                "query_invocation_ordinal");

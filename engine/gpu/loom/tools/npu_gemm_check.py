@@ -4,7 +4,7 @@
 usage: npu_gemm_check.py <workdir> <cols> <m_blocks> <ks,ks,ks,ks> <passes> [act.f16 wgt.f16]
 
 Operands are random (wide per-row dynamic range) or f16 files: activations [64 * m_blocks][K], weights [TN * cols][K] (gen_npu_gemm.TN).
-They are packed with the encoder's numpy oracle (bfp16_check.reference), the image runs through iree-xdna-run, and each C
+They are packed with the encoder's numpy oracle (bfp16_check.reference), the image runs through the engine's npu_run, and each C
 partial (one per replay group of passes, gen_npu_gemm.groups) is compared with the exact product of its K range of the
 bfp16 values; C is bf16: within half an ulp of the exact product (f32 accumulation order is ~1e-7 below that).
 Time the NPU with the counter profiler, not wall clock.
@@ -115,8 +115,7 @@ def main():
     rw.tofile(w_b)
     np.zeros(sc // 4, np.float32).tofile(c_b)
     co = os.path.join(work, "c_out.bin")
-    base = ["--image=" + img, "--entry=" + cfg.entry, "--binding_memory=system", "--binding=" + a_b,
-            "--binding=" + w_b, "--binding=" + c_b]
+    bindings = [a_b, w_b, c_b]
     if fuse:   # the egress lanes' dummy binding (never transferred), the raw stream binding
         d_b, r_b = os.path.join(work, "d.bin"), os.path.join(work, "r.bin")
         words = max(fw * nrec for c in range(cols) for fw, nrec in (N.fuse_record(cfg, cov)
@@ -124,16 +123,16 @@ def main():
         np.zeros(len(ks) * cols * words, np.int32).tofile(d_b)
         # the GGUF rows as they are, from the call's first column
         np.concatenate([wraw.reshape(-1)[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
-        base += ["--binding=" + d_b, "--binding=" + r_b]
+        bindings += [d_b, r_b]
     width = None
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
-        r = subprocess.run([hrx_paths.XDNA_RUN, f"--columns={cand}", f"--output=2={co}"] + base,
+        r = subprocess.run([hrx_paths.NPU_RUN, img, cfg.entry, str(cand), "2=" + co] + bindings,
                            capture_output=True, text=True, env=env, timeout=600)
         if r.returncode == 0:
             width = cand
             break
         if "does not match the admitted native context" not in r.stderr:
-            sys.exit(f"iree-xdna-run failed\n{r.stderr[-2000:]}")
+            sys.exit(f"npu_run failed\n{r.stderr[-2000:]}")
     if width is None:
         sys.exit("no context width admitted the image")
     raw = (np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32)   # bf16 C

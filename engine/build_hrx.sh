@@ -77,6 +77,10 @@ if [ ${#npu_flags[@]} -gt 0 ]; then
   "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/npu_attn_run.cc" \
       -o "$root/engine/build/npu_attn_run" "$root/engine/build/libyah_core.a" \
       "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
+  # One NPU image invocation run once (tools/npu_gemm_check.py, npu_attn_check.py; HRX main has no iree-xdna-run).
+  "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/npu_run.cc" \
+      -o "$root/engine/build/npu_run" "$root/engine/build/libyah_core.a" \
+      "${npu_libs[@]}" -L"$libhrx" -lhrx -licuuc -lpthread "${ldflags[@]}"
 fi
 # The Responses API server (engine/serve).
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" \

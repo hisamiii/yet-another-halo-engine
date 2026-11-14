@@ -311,20 +311,20 @@ def main():
 
 
 def run_once(W, inp, mc, nb, nb_built):
-    """one fresh call through iree-xdna-run (outputs out<pair>.bin)"""
-    args = [hrx_paths.XDNA_RUN, f"--columns={max(2, min(8, mc))}", f"--image={W}/p.xdna", "--entry=probe",
-            "--binding_memory=system", "--invocation_count=1"]
+    """one fresh call through the engine's npu_run, the image's first invocation (outputs out<pair>.bin)"""
+    files = []
     recs, pays = streams(inp, mc, nb, nb_built)
     for s, b in enumerate(recs):
         b.tofile(f"{W}/s{s}.bin")
-        args.append(f"--binding={W}/s{s}.bin")
+        files.append(f"{W}/s{s}.bin")
     for p in range(mc):
         np.zeros(G.NEG * 1024, np.uint8).tofile(f"{W}/o{p}.bin")
-        args.append(f"--binding={W}/o{p}.bin")
+        files.append(f"{W}/o{p}.bin")
     for s, b in enumerate(pays):
         b.tofile(f"{W}/q{s}.bin")
-        args.append(f"--binding={W}/q{s}.bin")
-    args += [f"--output={4 + p}={W}/out{p}.bin" for p in range(mc)]
+        files.append(f"{W}/q{s}.bin")
+    outs = ",".join(f"{4 + p}={W}/out{p}.bin" for p in range(mc))
+    args = [hrx_paths.NPU_RUN, f"{W}/p.xdna", "probe", str(max(2, min(8, mc))), outs] + files
     r = subprocess.run(args, capture_output=True, text=True, env=hrx_paths.env(), timeout=600)
     if r.returncode:
         sys.exit("run failed\n" + r.stdout[-1500:] + r.stderr[-1500:])

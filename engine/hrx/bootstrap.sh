@@ -124,8 +124,8 @@ if [ ! -f "$build/CMakeCache.txt" ]; then
     -DLOOM_BUILD=ON -DLOOM_TARGET_ALL_AMD=ON -DAMDF_BUILD=ON -DAMDF_FAMILY_XDNA=ON
 fi
 # What the engine uses: the runtime, the compiler (emits and compile reports), the profiler, and the static
-# libraries engine/build_hrx.sh links into the NPU runners. (HRX main has no iree-xdna-run; tools/npu_gemm_check.py
-# needs another runner.)
+# libraries engine/build_hrx.sh links into the NPU runners. (HRX main has no iree-xdna-run: the NPU checks run images
+# through the engine's run/npu_run.)
 # YAH_HRX_TARGETS overrides the list (a release build needs only libhrx/src/libhrx/libhrx.so).
 x=runtime/src/iree/hal/driver/amd/xdna
 read -ra targets <<< "${YAH_HRX_TARGETS:-libhrx/src/libhrx/libhrx.so loom/src/loom/tools/loom-compile/loom-compile \

@@ -14,9 +14,9 @@ ROCM = os.environ.get("YAH_ROCM") or os.path.join(ROOT, "external", "rocm10")
 PREFIX = os.path.join(ROCM, "root/opt/rocm/core-10.0")   # every package extracted into one prefix (engine/hrx-env.sh)
 LIBHSA = os.path.join(PREFIX, "lib")
 
-IREE_RUN_LOOM = os.path.join(BUILD, "loom/src/loom/tools/iree-run-loom/iree-run-loom")
 LOOM_COMPILE = os.path.join(BUILD, "loom/src/loom/tools/loom-compile/loom-compile")
-XDNA_RUN = os.path.join(BUILD, "experimental/xdna/iree-xdna-run")   # the NPU runner (an HRX built with the XDNA flags)
+# One plain NPU image run once: the engine's run/npu_run (engine/build_hrx.sh; HRX main has no iree-xdna-run).
+NPU_RUN = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "build", "npu_run")
 
 
 def env():
