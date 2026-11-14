@@ -27,7 +27,6 @@ Needs HRX patch 0013; compile with LOOM_ENV. Config.gate > 0 adds the NPU-side g
 import contextlib
 import dataclasses
 import importlib
-import math
 import os
 import re
 import struct
@@ -73,11 +72,12 @@ class Config:
                           # and the P4 grid decoders'), "Q4K" ((0, 4, 1, 5, 2, 6, 3, 7) per 8: Q4_K's; a call's 4 gate
                           # k-blocks (one format) are then slabs 32 rows apart, the caller steps call j's rows by
                           # 64 (j / 2) + 16 (j % 2)), "": natural
-    fuse: int = 0       # 1: every GEMM core fills its own weight panel slice at each replay group's first firing
-                        # (pass-through: its column's raw stream multicast to its core stream, its slice through a
-                        # leaf-synced egress ring into its memory-tile panel, constrain.fill; HRX patch 0020); W is
-                        # leaf-synchronized. 2: the raw stream is IQ4_XS GGUF rows (kraw): every filling core decodes
-                        # the super-blocks covering its slice (gen_npu_dec.leaf_inline, in its idle W ring)
+    fuse: int = 0       # 0: the W binding holds the BFP16 panels (npu_gemm_check). 2: every GEMM core fills its own
+                        # weight panel slice at each replay group's first firing, decoding the super-blocks covering
+                        # it from the column's raw GGUF rows (kraw; gen_npu_dec.leaf_inline, in its idle W ring), its
+                        # slice through a leaf-synced egress ring into its memory-tile panel (constrain.fill; HRX patch
+                        # 0020); W is leaf-synchronized. Tried, not kept: 1, the same fill from a BFP16 pass-through
+                        # stream.
     rawdma: int = 1     # fuse 2: each filler's raw rows reach it through its W DMA instead of its core stream: the
                         # column's raw stream lands in a memory-tile ring the fillers drain in turn, each queued ahead of
                         # its panel's records, into a ring in its idle W ring (constrain.intake, HRX patch 0022)
@@ -102,8 +102,6 @@ class Config:
     hlate: int = 0      # kchain: the helper rings declared after the A rings (rings are placed in channel order: the mids'
                         # second small ring would split their banks so no contiguous A ring is left: grid formats)
     gtail: int = 0      # kchain gwest: the gate's waiter and relay on the tails of columns 1, 2 (rows 1: program memory)
-    gfirst: int = 0     # gate: the waiter and relay wait at a job's first firing (gate_first), not after the last one
-                        # of the job before, so the setup runs no call (LOOM_EXP_SETUP_ONLY: no dummy call per switch)
     kchain: int = 0     # fuse 2: core r decodes super-block r of each unit (the fill balanced) whatever the k-slices: each row
                         # sends the k-blocks of its super-block before its slice to the row above (kchain_send)
     dfr: int = 0        # swiglu (mu 1, not paired): each M block's epilogue deferred into the next block's passes: segment s
@@ -121,7 +119,7 @@ class Config:
 
 # NPU-side gate (cfg.gate = supply): column 0's head waits for each job's ready word itself and its neighbor mid relays.
 # Extra bindings: 3 flag (read; 16-byte record, word 0 ready = the job's gate value), 4 tick (write; scratch), 5 signal
-# (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
+# (write; go at byte 0, done at byte 16). At a job's first firing the head polls request-driven
 # (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * GATE_CALLS (jobs count from 1 after the
 # setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), at a pace of
 # GP0 + GPR * max(0, polls - GRAMP) + GPS * max(0, polls - GFAST) delay iterations (~7.7 ns each in the engine). A poll
@@ -138,8 +136,9 @@ class Config:
 # after C. done = the job's ready value, with GATE_FAILED set if the head gave up (status 2). Job state (firings done, firings per job, leftover
 # supply, pending reads, sequence) lives in private storage, which the array setup of a core stream plan zeroes; a job of
 # N calls is N * nb * passes firings, and before the first gated job (state zero) it is one call: the setup call's.
-# Config.gfirst moves a job's wait and relay to its first firing (gate_first; the end of a firing only counts and
-# drains, gate_count): state zero is then at the gate, so the setup runs no call (LOOM_EXP_SETUP_ONLY).
+# The wait and the relay run at a job's first firing (gate_first; the end of a firing only counts and drains,
+# gate_count): state zero is then at the gate, so the setup runs no call (LOOM_EXP_SETUP_ONLY). Tried, not kept: the
+# wait after the last firing of the job before (the setup then ran one ungated call).
 GP0, GPR, GRAMP, GPS, GFAST, GB = 5000, 200, 512, 16000, 896, 8
 # The protocol the host follows (dispatch.txt "npugate <GATE_SUPPLY> <GATE_CALLS> <GATE_RECORD>"): a job's gate value is
 # sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
@@ -178,7 +177,7 @@ def loom_env(cfg):
     if cfg.fuse == 2:   # other layouts share the context: routes must not outlive them
         env["LOOM_EXP_ROUTE_RESET"] = "1"
         env["LOOM_EXP_DRAIN_USED"] = "1"   # (HRX patch 0048: the stale-request drain raises only the image's locks)
-    if cfg.gate and cfg.gfirst:
+    if cfg.gate:
         env["LOOM_EXP_SETUP_ONLY"] = "1"
     return env
 
@@ -700,17 +699,14 @@ def fuse_dcov(cfg, c, r):
 def fuse_record(cfg, cov):
     """(egress record words, records per call) of a filler of the rows cov. Records are whole 4-word steps dividing
     every replay group's fill."""
-    unit = NP * sum(slab(cfg.ks[j]) for j in cov) // 4   # (fuse 1: cov in row order)
-    if cfg.fuse == 2:   # whole 64-byte copies, whole records per slab
-        # (swiglu: not C's record size, LOOM_EXP_LS_SEND_PITCH_RECORD would pitch the egress ring like C's)
-        xs = [36 * fuse_hx(cfg)] if cov == (1, 0) and fuse_hx(cfg) else []   # (hsplit: the helper's extra piece)
-        if cfg.kchain:
-            xs += [36 * kchain_piece(cfg, r) for r in range(1, len(cfg.ks)) if kchain_piece(cfg, r)]
-        fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for sw in [sw for _, sw in fuse_pieces(cfg, cov)] + xs)
-                 and not (cfg.swiglu and 4 * w == SW_REC))
-        return fw, cfg.passes * unit // fw
-    g = math.gcd(*(len(p) * unit for p in fuse_groups(cfg)))
-    fw = max(w for w in range(4, FUSE_REC + 1, 4) if g % w == 0)
+    unit = NP * sum(slab(cfg.ks[j]) for j in cov) // 4
+    # whole 64-byte copies, whole records per slab
+    # (swiglu: not C's record size, LOOM_EXP_LS_SEND_PITCH_RECORD would pitch the egress ring like C's)
+    xs = [36 * fuse_hx(cfg)] if cov == (1, 0) and fuse_hx(cfg) else []   # (hsplit: the helper's extra piece)
+    if cfg.kchain:
+        xs += [36 * kchain_piece(cfg, r) for r in range(1, len(cfg.ks)) if kchain_piece(cfg, r)]
+    fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for sw in [sw for _, sw in fuse_pieces(cfg, cov)] + xs)
+             and not (cfg.swiglu and 4 * w == SW_REC))
     return fw, cfg.passes * unit // fw
 
 
@@ -746,26 +742,6 @@ def fuse_pieces(cfg, cov):
     return out
 
 
-def fuse_raw(w, cfg):
-    """The fused raw binding from the weight binding (int32 words, [column][group][slice][pass in group][NP slabs]):
-    per column, per replay group, per unit (pass in group, slab): the rows' slabs ([unit][row][slab])."""
-    import numpy as np
-    P = cfg.passes
-    panel = sum(P * NP * slab(k) for k in cfg.ks) // 4
-    out = []
-    for c in range(cfg.cols):
-        off = c * panel
-        for g in fuse_groups(cfg):
-            sl = []
-            for k in cfg.ks:
-                n = len(g) * NP * slab(k) // 4
-                sl.append(w[off:off + n].reshape(len(g) * NP, slab(k) // 4))
-                off += n
-            for u in range(len(g) * NP):
-                out.extend(s_[u] for s_ in sl)
-    return np.concatenate(out)
-
-
 _HLATE = []   # Config.hlate: fuse_channels' helper-ring lines, emitted by array_program after the A rings
 
 
@@ -774,26 +750,24 @@ def fuse_channels(e, cfg, panel):
     write binding, a lane per worker, is never transferred), and its column's raw stream, multicast over the column's
     filling core streams."""
     rows, cols = len(cfg.ks), cfg.cols
-    uw = fuse_unit_raw(cfg) // 4 if cfg.fuse == 2 else sum(slab(k) for k in cfg.ks) // 4
+    uw = fuse_unit_raw(cfg) // 4
     units = cfg.passes * NP
     e(f"  %fdb = binding {6 if cfg.gate else 3}, \"write\"")
     e(f"  %frb = binding {7 if cfg.gate else 4}, \"read\"")
     e(f"  %fdl = constant.u32 {rows * cols} : reg<aie2p.array.scalar : index>")
     e(f"  %fun = constant.u32 {units} : reg<aie2p.array.scalar : index>")
-    if cfg.fuse == 2:   # raw rows [N][kraw / 256][136]: per column, per (pass, slab) unit [16 rows][4 super-blocks]
-        BLK = fuse_blk(cfg)
-        RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * BLK // 4   # row stride in words
-        if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on; Q4K:
-            # its 2 slabs 32 rows apart (fuse_rows)
-            assert cfg.dgu % 4 == 0 and NP % 2 == 0 and cfg.hord in ("", "P4", "Q4K")
-            e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x2x{NP // 2}x16x{uw // 16}xi32, "
-              f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {cfg.dgu // 4}, "
-              f"{(32 if cfg.hord == 'Q4K' else 16) * RS}, {RS}, 1]>>>")
-        else:
-            e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x{NP}x16x{uw // 16}xi32, "
-              f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {16 * RS}, {RS}, 1]>>>")
+    # raw rows [N][kraw / 256][136]: per column, per (pass, slab) unit [16 rows][4 super-blocks]
+    BLK = fuse_blk(cfg)
+    RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * BLK // 4   # row stride in words
+    if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on; Q4K:
+        # its 2 slabs 32 rows apart (fuse_rows)
+        assert cfg.dgu % 4 == 0 and NP % 2 == 0 and cfg.hord in ("", "P4", "Q4K")
+        e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x2x{NP // 2}x16x{uw // 16}xi32, "
+          f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {cfg.dgu // 4}, "
+          f"{(32 if cfg.hord == 'Q4K' else 16) * RS}, {RS}, 1]>>>")
     else:
-        e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cols}x{units}x{uw}xi32>>")
+        e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x{NP}x16x{uw // 16}xi32, "
+          f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {16 * RS}, {RS}, 1]>>>")
     covs = list(fuse_cover(cfg, -1).values())   # an ordinary column's covers, then any other column's
     for cov in (cov for c in range(cols) for cov in fuse_cover(cfg, c).values()):
         covs += [cov] if cov not in covs else []
@@ -803,13 +777,11 @@ def fuse_channels(e, cfg, panel):
         e(f"  %fdn{tag(cov)} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
         e(f"  %fd_all{tag(cov)} = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{rows * cols}x{nrec}x{fw}xi32>>")
     for c in range(cols):
-        if cfg.fuse == 2:   # column c: rows TN c .. (swiglu: gate rows swcol c ..; Q4K: 64 (c / 2) + 16 (c % 2) ..)
-            r0 = (64 * (c // 2) + 16 * (c % 2) if cfg.swiglu and cfg.hord == "Q4K" else
-                  c * (cfg.swcol if cfg.swiglu else TN))
-            e(f"  %fro{c} = constant.u64 {r0 * RS * 4} : reg<aie2p.array.offset : offset>")
-            e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
-        else:
-            e(f"  %fru{c} = partition.sender %fru_all, %origin, %n{c}, %ncols : reg<aie2p.array.sender : tile<{uw}xi32>>")
+        # column c: rows TN c .. (swiglu: gate rows swcol c ..; Q4K: 64 (c / 2) + 16 (c % 2) ..)
+        r0 = (64 * (c // 2) + 16 * (c % 2) if cfg.swiglu and cfg.hord == "Q4K" else
+              c * (cfg.swcol if cfg.swiglu else TN))
+        e(f"  %fro{c} = constant.u64 {r0 * RS * 4} : reg<aie2p.array.offset : offset>")
+        e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
         for r, cov in fuse_cover(cfg, c).items():
             dp, sp = fuse_ports("")
             fw, nrec = fuse_record(cfg, cov)
@@ -818,7 +790,7 @@ def fuse_channels(e, cfg, panel):
             e(f"  %fds{c}_{r} = sender %k{c}_{r}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
             e(f"  %chd{c}_{r} = channel %fds{c}_{r}, %fdr{c}_{r}, %two, %fdn{i} : reg<aie2p.array.channel : tile<{fw}xi32>>")
             e(f"  constrain.leaf_sync %chd{c}_{r}")
-            ut = f"16x{uw // 16}" if cfg.fuse == 2 else f"{uw}"
+            ut = f"16x{uw // 16}"
             e(f"  %frr{c}_{r} = receiver %k{c}_{r}, {sp} : reg<aie2p.array.receiver : tile<{ut}xi32>>")
             if cfg.rawdma:   # staged in the column's memory tile; intake ring depth fuse_raw_ring
                 cap = fuse_raw_ring(cfg, fuse_dcov(cfg, c, r))[1]
@@ -855,167 +827,19 @@ def fuse_channels(e, cfg, panel):
             eh(f"  constrain.leaf_sync %chh{c}{s}")
 
 
-class _Fill:
-    """Emits a filling worker's stream walk: skips and takes of 4-word steps; a take appends to the egress ring
-    (fuse_record words a record, slot = record % 2) with its state (words in the record, record) in private storage."""
-
-    def __init__(self, e, dp):
-        self.e, self.dp, self.n = e, dp, 0
-
-    def tag(self):
-        self.n += 1
-        return f"{self.n}"
-
-    def skip(self, n):
-        """n words."""
-        assert n % 4 == 0
-        if n == 0:
-            return
-        e, t = self.e, self.tag()
-        e(f"  %fzk{t} = mov.i32 {n // 4}")
-        e(f"  low.br ^fzs{t}(%zero: reg<aie2p.er>)")
-        e(f"^fzs{t}(%fzi{t}: reg<aie2p.er>):")
-        e(f"  %fzim{t} = lt %fzi{t}, %fzk{t}")
-        e(f"  low.cond_br %fzim{t}, ^fzsb{t}, ^fzsx{t} : reg<aie2p.er>")
-        e(f"^fzsb{t}:")
-        for w in range(4):
-            e(f"  %fzx{t}_{w} = mov.ss")
-            e(f"  st %fzx{t}_{w}, %fzjp, {4 * w}")   # into a junk block (the pops stay)
-        e(f"  %fzi1{t} = add.rr %fzi{t}, %one")
-        e(f"  low.br ^fzs{t}(%fzi1{t}: reg<aie2p.er>)")
-        e(f"^fzsx{t}:")
-
-    def slot(self, dn, t):
-        """The egress slot address of record dn plus dq words."""
-        e = self.e
-        e(f"  %fzSh{t} = lshl {dn}, %fzkh")
-        e(f"  %fzSh2{t} = add.rr %fzSh{t}, %fzSh{t}")
-        e(f"  %fzSr{t} = sub {dn}, %fzSh2{t}")
-        e(f"  %fzSo{t} = mul %fzSr{t}, %fzrb")
-        e(f"  %fzpa{t} = add.rr %fzdb, %fzSo{t}")
-
-    def take(self, n):
-        """n words."""
-        assert n % 4 == 0
-        if n == 0:
-            return
-        e, t = self.e, self.tag()
-        dp = self.dp
-        e(f"  %fzk{t} = mov.i32 {n // 4}")
-        e(f"  %fzq0{t} = lda %fzp, 4")
-        e(f"  %fzn0{t} = lda %fzp, 8")
-        self.slot(f"%fzn0{t}", t)
-        e(f"  %fzqb{t} = add.rr %fzq0{t}, %fzq0{t}")
-        e(f"  %fzqo{t} = add.rr %fzqb{t}, %fzqb{t}")
-        e(f"  %fzpq{t} = add.rr %fzpa{t}, %fzqo{t}")
-        e(f"  %fzp0{t} = mov.scalar-to-address %fzpq{t}")
-        e(f"  low.br ^fzt{t}(%zero: reg<aie2p.er>, %fzq0{t}: reg<aie2p.er>, %fzn0{t}: reg<aie2p.er>, %fzp0{t}: reg<aie2p.ep>)")
-        e(f"^fzt{t}(%fzi{t}: reg<aie2p.er>, %fzq{t}: reg<aie2p.er>, %fzn{t}: reg<aie2p.er>, %fzpp{t}: reg<aie2p.ep>):")
-        e(f"  %fzim{t} = lt %fzi{t}, %fzk{t}")
-        e(f"  low.cond_br %fzim{t}, ^fztb{t}, ^fztx{t} : reg<aie2p.er>")
-        e(f"^fztb{t}:")
-        e(f"  %fzro{t} = lt %fzq{t}, %fzrw")
-        e(f"  low.cond_br %fzro{t}, ^fztk{t}, ^fztr{t} : reg<aie2p.er>")
-        e(f"^fztk{t}:")
-        e(f"  low.br ^fztw{t}(%fzq{t}: reg<aie2p.er>, %fzn{t}: reg<aie2p.er>, %fzpp{t}: reg<aie2p.ep>)")
-        e(f"^fztr{t}:")   # the record is full: send it, take the next slot
-        e(f"  rel %one, {dp}")
-        e(f"  %fzn1{t} = add.rr %fzn{t}, %one")
-        e(f"  acq %am1, {dp}")
-        self.slot(f"%fzn1{t}", t + "r")
-        e(f"  %fzrp{t} = mov.scalar-to-address %fzpa{t}r")
-        e(f"  low.br ^fztw{t}(%zero: reg<aie2p.er>, %fzn1{t}: reg<aie2p.er>, %fzrp{t}: reg<aie2p.ep>)")
-        e(f"^fztw{t}(%fzwq{t}: reg<aie2p.er>, %fzwn{t}: reg<aie2p.er>, %fzwp{t}: reg<aie2p.ep>):")
-        for w in range(4):
-            e(f"  %fzv{t}_{w} = mov.ss")
-            e(f"  st %fzv{t}_{w}, %fzwp{t}, {4 * w}")
-        e(f"  %fzwp1{t} = padds.modifier %fzwp{t}, %fzm16")
-        e(f"  %fzwq1{t} = add.rr %fzwq{t}, %fzfour")
-        e(f"  %fzi1{t} = add.rr %fzi{t}, %one")
-        e(f"  low.br ^fzt{t}(%fzi1{t}: reg<aie2p.er>, %fzwq1{t}: reg<aie2p.er>, %fzwn{t}: reg<aie2p.er>, %fzwp1{t}: reg<aie2p.ep>)")
-        e(f"^fztx{t}:")
-        e(f"  st %fzq{t}, %fzp, 4")
-        e(f"  st %fzn{t}, %fzp, 8")
-
-    def loop(self, n, body):
-        """body() n times."""
-        e, t = self.e, self.tag()
-        e(f"  %fzlk{t} = mov.i32 {n}")
-        e(f"  low.br ^fzl{t}(%zero: reg<aie2p.er>)")
-        e(f"^fzl{t}(%fzli{t}: reg<aie2p.er>):")
-        e(f"  %fzlm{t} = lt %fzli{t}, %fzlk{t}")
-        e(f"  low.cond_br %fzlm{t}, ^fzlb{t}, ^fzlx{t} : reg<aie2p.er>")
-        e(f"^fzlb{t}:")
-        body()
-        e(f"  %fzli1{t} = add.rr %fzli{t}, %one")
-        e(f"  low.br ^fzl{t}(%fzli1{t}: reg<aie2p.er>)")
-        e(f"^fzlx{t}:")
-
-
 def fuse_prologue(L, cfg, role, ks, cov, helper=None, gate=None):
     """A filling worker's firing (row r < rows - 1): the firing counter (private), the W slot by parity (leaf-synced
     W, acquired here and released at the exit); at each replay group's first firing (firings run group, M block,
     pass), that group's fill: per unit, skip the rows before its own, take its slab (row rows - 2 also the last
     row's: their panel is interleaved per unit), skip the rest (pass-through). A group's fill ends on a whole record;
     the record count runs on across groups and calls (the egress ring's slot parity)."""
-    assert len(groups(cfg)) > 1 or cfg.fuse == 2, "fuse 1: the interleaved last-two-rows panel needs streamed groups"
     e = L.append
     rows = len(cfg.ks)
     dp = HELP_SEND if (helper or "")[:1] == "M" else fuse_ports(role)[0]
     wrec = NP * slab(ks)
-    sw = [slab(k) // 4 for k in cfg.ks]
-    pre = sum(sw[:min(cov)])
-    mine = sum(sw[j] for j in cov)
-    post = sum(sw) - pre - mine
     e("  %fzs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
-    if cfg.fuse == 2:
-        fuse2_entry(L, cfg, dp, cov, wrec, helper, gate, tail=role == "tail")
-        return
-    e("  %fzjs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
-    e("  %fzjp = storage_address %fzjs : low.storage<private> -> reg<aie2p.ep>")
-    e("  %fzc = lda %fzp, 0")
-    e("  %fzc1 = add.rr %fzc, %one")
-    e(f"  %fzcl = mov.i32 {cfg.nb * cfg.passes}")
-    e("  %fzcw = lt %fzc1, %fzcl")
-    e("  %fzcn = mul %fzc1, %fzcw")
-    e("  st %fzcn, %fzp, 0")
-    e("  %fzkh = mova.i32 -1")
-    e("  %fzh = lshl %fzc, %fzkh")
-    e("  %fzh2 = add.rr %fzh, %fzh")
-    e("  %fzpar = sub %fzc, %fzh2")
-    e(f"  %fzwr = mov.i32 {wrec}")
-    e("  %fzwo = mul %fzpar, %fzwr")
-    e("  %fzwm = mov.modifier %fzwo")
-    e("  %fzw0c = copy %w0 : reg<aie2p.ep> -> reg<aie2p.ep>")
-    e("  %w = padds.modifier %fzw0c, %fzwm")
-    e("  %fzdb = mov.address-to-scalar %fzd")
-    fw, _ = fuse_record(cfg, cov)
-    e(f"  %fzrb = mov.i32 {4 * fw}")
-    e(f"  %fzrw = mov.i32 {fw}")
-    e("  %fzfour = mova.i32 4")
-    e("  %fz16 = mova.i32 16")
-    e("  %fzm16 = mov.modifier %fz16")
-    fuse_dispatch(e, cfg)
-    f = _Fill(e, dp)
-    for i, g in enumerate(fuse_groups(cfg)):
-        n = len(g) * NP
-        e(f"^fzgo{i}:")
-        e(f"  acq %am1, {dp}")
-
-        def unit():
-            f.skip(pre)
-            f.take(mine)
-            f.skip(post)
-        f.loop(n, unit)
-        e(f"  rel %one, {dp}")   # the group's last record (full)
-        e(f"  %fzen{i} = lda %fzp, 8")
-        e(f"  %fzen1{i} = add.rr %fzen{i}, %one")
-        e("  st %zero, %fzp, 4")
-        e(f"  st %fzen1{i}, %fzp, 8")
-        e("  low.br ^fzgemm")
-    e("^fzgemm:")
-    e("  acq %am1, 1")
+    fuse2_entry(L, cfg, dp, cov, wrec, helper, gate, tail=role == "tail")
 
 
 def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
@@ -1042,17 +866,16 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
         e("  %fzts = mov.address-to-scalar %o_r")
         e("  st %fzts, %fztp, 0")
     hlp = helper == "H" or "h" in (helper or "")       # (kchain "K..h": helped too)
-    gpark = gate and not cfg.gfirst   # (gfirst: the epilogue needs no neighbor pointer)
     # %fzx: 0 the helper's ring, 4 the helper record count (the head), 8 the gate's neighbor, (kchain) 12 the ring to
     # the row above, 16 its record count
-    if hlp or (helper or "").startswith("K") or gpark:
+    if hlp or (helper or "").startswith("K"):
         e("  %fzx = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
         e("  %fzxp = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
-        for o, nm in ((((0, "%fzh_r"),) if hlp else ()) + (((8, "%gn1_r"),) if gpark else ()) +
+        for o, nm in ((((0, "%fzh_r"),) if hlp else ()) +
                       (((12, "%fzq_r"),) if "u" in (helper or "") else ())):
             e(f"  %fzxs{o} = mov.address-to-scalar {nm}")
             e(f"  st %fzxs{o}, %fzxp, {o}")
-    e("  st %fzwo, %fzp, 4")   # (fuse 1's in-record word count slot)
+    e("  st %fzwo, %fzp, 4")
     e("  %fzcf = mov.i32 780")                         # the GEMM's MMA config, loaded after the fill: as a constant,
     e("  st %fzcf, %fzp, 16")                          # the allocator's pressure repairs (for the decoder) cloned it at
                                                        # each of its 720 MMA uses (+2.3 KB of program)
@@ -1076,7 +899,7 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
             e(f"^fzne{i}:")
     for i, g in enumerate(fuse_groups(cfg)):
         e(f"^fzgo{i}:")
-        if i == 0 and gate and cfg.gfirst:   # (a call's first firing: the check costs once per call)
+        if i == 0 and gate:   # (a call's first firing: the check costs once per call)
             e("  %gsp0 = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
             gate_first(e, cfg, gate, "%gn1_r")
         e(f"  %fzgn{i} = mov.i32 {len(g) * NP}")
@@ -1095,26 +918,6 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
     e("  %fzwm = mov.modifier %fzwo2")
     e("  %fzw0c = copy %w0 : reg<aie2p.ep> -> reg<aie2p.ep>")
     e("  %w = padds.modifier %fzw0c, %fzwm")
-
-
-def fuse_dispatch(e, cfg):
-    """Branches to ^fzgo{i} at replay group i's first firing (%fzc: the firing number), else to ^fzgemm."""
-    starts, s0 = [], 0
-    for g in fuse_groups(cfg):
-        starts.append(s0)
-        s0 += cfg.nb * len(g)
-    for i, st in enumerate(starts):   # firing == st: group i's fill (firings below st were checked before)
-        last = i + 1 == len(starts)
-        if st:
-            e(f"  %fzbl{i} = mov.i32 {st}")
-            e(f"  %fzml{i} = lt %fzc, %fzbl{i}")
-            e(f"  low.cond_br %fzml{i}, ^fzgemm, ^fzck{i} : reg<aie2p.er>")
-            e(f"^fzck{i}:")
-        e(f"  %fzbh{i} = mov.i32 {st + 1}")
-        e(f"  %fzmh{i} = lt %fzc, %fzbh{i}")
-        e(f"  low.cond_br %fzmh{i}, ^fzgo{i}, {'^fzgemm' if last else f'^fzne{i}'} : reg<aie2p.er>")
-        if not last:
-            e(f"^fzne{i}:")
 
 
 FZ_SP, FZ_IN, FZ_SP2, FZ_OUT = 0, 3264, 16384, 23616   # fuse 2 scratch (from the W ring's first 2048-aligned byte):
@@ -1639,7 +1442,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None):
     name = name or role + ("_g" if gate else "")
     fills = cov is not None
     e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
-    rs = "_r" if fills and cfg.fuse == 2 else ""   # fuse 2: parked as scalars across the decoding fill (^fzgemm)
+    rs = "_r" if fills else ""   # parked as scalars across the decoding fill (^fzgemm)
     e(f"  %a{rs} = resource<native_pointer> {{index = 0, source_type = buffer}} : reg<aie2p.ep>")
     if fills:   # the W ring's first slot and the fused fill's egress ring (fuse_prologue; a helper's: its channel to
         # the head, whose ring the head reads it from)
@@ -1658,8 +1461,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None):
         e(f"  %gn1{rs} = resource<native_pointer> {{index = {gp['nbr']}, source_type = buffer}} : reg<aie2p.ep>")
     if tail:
         e(f"  %o{rs} = resource<native_pointer> {{index = 2, source_type = buffer}} : reg<aie2p.ep>")
-    early = fills and cfg.fuse == 2   # the decoding fill first: nothing of the GEMM's lives across the decoder
-    if gate and cfg.gfirst:   # job state (private storage, zeroed by the setup): the first job's gate before any firing
+    early = fills   # the decoding fill first: nothing of the GEMM's lives across the decoder
+    if gate:   # job state (private storage, zeroed by the setup): the first job's gate before any firing
         e("  %gst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
         if not early:   # (fuse 2: at a call's first firing, fuse2_entry)
             e("  %gsp0 = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
@@ -1701,8 +1504,6 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None):
     e("  %cstep = mul %k512, %k2")
     e("  %mcs = mov.modifier %cstep")
     e("  %mz = mov.modifier %zero")
-    if fills and not early:
-        fuse_prologue(L, cfg, role, ks, cov)
     if tail:
         # pass counter in private storage; C segments are acquired on the first pass and released after the last
         e("  %cst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
@@ -1807,16 +1608,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None):
                 e("  %bnn = mul %bn1, %bmore")
                 e("  st %bnn, %cnp, 4")
     if gate:   # job state: private storage, zeroed by the array setup of a core stream plan
-        if not cfg.gfirst:
-            e("  %gst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
         e("  %gsp = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
     body(L, cfg, role, ks, a_adv, acap, gate, fills, helper)
-
-
-def gate_parked(e):
-    e("  %gnpP = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
-    e("  %gnpl = lda %gnpP, 8")
-    e("  %gn1 = mov.scalar-to-address %gnpl")
 
 
 def gate_pace(e, p, pn1, out):
@@ -1838,179 +1631,15 @@ def imm32(v):
     return "mova.i32" if -1024 <= v < 1024 else "mov.i32"
 
 
-def gate_epilogue(L, cfg, gate, parked=False):
-    """The gated leaves' end of firing (see GATE): job accounting, background supply drain, the wait, the relay.
-    parked: the neighbor channel's pointer is in the fill's private storage (fuse2_entry)."""
-    e = L.append
-    if cfg.gfirst:   # (the wait and the relay at the next job's first firing)
-        return gate_count(e, cfg, gate)
-    S, FPC = cfg.gate, cfg.nb * cfg.passes
-    nbr = gate_ports(cfg)[gate]["nbr"]   # (the neighbor channel's port: its acquires and releases)
-    if parked and not (gate == "waiter" and cfg.ghelp):
-        gate_parked(e)
-    e("  %g0 = mova.i32 0")   # (mova: 4 bytes in the load slot, |immediate| < 1024; mov.i32 is a 6-byte bundle)
-    e("  %g1 = mova.i32 1")
-    e("  %g2 = mova.i32 2")
-    e("  %gm1 = mova.i32 -1")
-    e(f"  %gfpc = {imm32(FPC)} {FPC}")
-    if gate == "waiter" and cfg.ghelp:   # (the helper's program memory: waiter_epilogue)
-        return waiter_epilogue(e, S, parked, nbr)
-    e("  %gF = lda %gsp, 0")
-    e("  %gN = lda %gsp, 4")
-    if gate == "waiter":
-        e("  %gL = lda %gsp, 8")
-        e("  %gQ = lda %gsp, 12")
-        e("  %gseq = lda %gsp, 16")
-        # read back last firing's ticks, then tick up to GB more of the leftover supply
-        e("  low.br ^gq(%g0: reg<aie2p.er>)")
-        e("^gq(%gqi: reg<aie2p.er>):")
-        e("  %gqm = lt %gqi, %gQ")
-        e("  low.cond_br %gqm, ^gq1, ^gqd : reg<aie2p.er>")
-        e("^gq1:")
-        for i in range(4):
-            e(f"  %gqx{i} = mov.ss")
-        e("  %gqn = add.rr %gqi, %g1")
-        e("  low.br ^gq(%gqn: reg<aie2p.er>)")
-        e("^gqd:")
-        e(f"  %ggb = mov.i32 {GB}")
-        e("  %gls = lt %gL, %ggb")          # L < GB: send L, else GB
-        e("  %glsn = sub %g1, %gls")
-        e("  %gb1 = mul %gL, %gls")
-        e("  %gb2 = mul %ggb, %glsn")
-        e("  %gbt = add.rr %gb1, %gb2")
-        e("  low.br ^gt(%g0: reg<aie2p.er>)")
-        e("^gt(%gti: reg<aie2p.er>):")
-        e("  %gtm = lt %gti, %gbt")
-        e("  low.cond_br %gtm, ^gt1, ^gtd : reg<aie2p.er>")
-        e("^gt1:")
-        for i in range(4):
-            e("  mov.ms %g0")
-        e("  %gtk = add.rr %gti, %g1")
-        e("  low.br ^gt(%gtk: reg<aie2p.er>)")
-        e("^gtd:")
-        e("  %gL2 = sub %gL, %gbt")
-    # this firing ends the job?
-    e("  %gF1 = add.rr %gF, %g1")
-    e("  %gnz = lt %gN, %g1")
-    e("  %gdef = mul %gnz, %gfpc")
-    e("  %glim = add.rr %gN, %gdef")
-    e("  %gcont = lt %gF1, %glim")
-    e("  low.cond_br %gcont, ^gmid, ^gend : reg<aie2p.er>")
-    e("^gmid:")
-    e("  st %gF1, %gsp, 0")
-    if gate == "waiter":
-        e("  st %gL2, %gsp, 8")
-        e("  st %gbt, %gsp, 12")
-    e("  return")
-    e("^gend:")
-    if gate == "waiter":
-        # finish the leftover: the pending reads, then one tick + read per remaining record
-        e("  low.br ^gr(%g0: reg<aie2p.er>)")
-        e("^gr(%gri: reg<aie2p.er>):")
-        e("  %grm = lt %gri, %gbt")
-        e("  low.cond_br %grm, ^gr1, ^grd : reg<aie2p.er>")
-        e("^gr1:")
-        for i in range(4):
-            e(f"  %grx{i} = mov.ss")
-        e("  %grn = add.rr %gri, %g1")
-        e("  low.br ^gr(%grn: reg<aie2p.er>)")
-        e("^grd:")
-        e("  low.br ^gl(%g0: reg<aie2p.er>)")
-        e("^gl(%gli: reg<aie2p.er>):")
-        e("  %glm = lt %gli, %gL2")
-        e("  low.cond_br %glm, ^gl1, ^gld : reg<aie2p.er>")
-        e("^gl1:")
-        for i in range(4):
-            e("  mov.ms %g0")
-        for i in range(4):
-            e(f"  %glx{i} = mov.ss")
-        e("  %gln = add.rr %gli, %g1")
-        e("  low.br ^gl(%gln: reg<aie2p.er>)")
-        e("^gld:")
-        # the wait for ready >= seq + 1
-        e("  %gnext = add.rr %gseq, %g1")
-        e(f"  %g64 = mov.i32 {GATE_CALLS}")
-        e("  %gexp = mul %gnext, %g64")   # ready = sequence * GATE_CALLS + calls
-        e(f"  %gsup = mov.i32 {S}")
-        e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
-        e("^gp(%gpn: reg<aie2p.er>, %gnc0: reg<aie2p.er>):")
-        e("  %gpo = lt %gpn, %gsup")
-        e("  low.cond_br %gpo, ^gask, ^gquit : reg<aie2p.er>")
-        e("^gask:")
-        for i in range(4):
-            e("  mov.ms %g0")
-        e("  %grdy = mov.ss")
-        e("  %gy1 = mov.ss")
-        e("  %gy2 = mov.ss")
-        e("  %gy3 = mov.ss")
-        e("  %gnc = sub %grdy, %gexp")   # the job's calls (when ready holds exactly its sequence)
-        e("  %gpn1 = add.rr %gpn, %g1")
-        e("  %glate = lt %grdy, %gexp")
-        e("  low.cond_br %glate, ^gpace, ^gopen : reg<aie2p.er>")
-        e("^gpace:")
-        gate_pace(e, "%gv", "%gpn1", "%gpace")
-        e("  low.br ^gw(%g0: reg<aie2p.er>, %gpace: reg<aie2p.er>, %gpn1: reg<aie2p.er>, %g0: reg<aie2p.er>)")
-        e("^gw(%gwi: reg<aie2p.er>, %gwl: reg<aie2p.er>, %gwp: reg<aie2p.er>, %gwc: reg<aie2p.er>):")
-        e("  %gwm = lt %gwi, %gwl")
-        e("  low.cond_br %gwm, ^gw1, ^gwd : reg<aie2p.er>")
-        e("^gw1:")
-        e("  %gwn = add.rr %gwi, %g1")
-        e("  low.br ^gw(%gwn: reg<aie2p.er>, %gwl: reg<aie2p.er>, %gwp: reg<aie2p.er>, %gwc: reg<aie2p.er>)")
-        e("^gwd:")
-        e("  low.br ^gp(%gwp: reg<aie2p.er>, %gwc: reg<aie2p.er>)")
-        e("^gopen:")
-        e("  low.br ^ghand(%gpn1: reg<aie2p.er>, %gnc: reg<aie2p.er>, %g1: reg<aie2p.er>, %grdy: reg<aie2p.er>)")
-        e("^gquit:")
-        e("  low.br ^ghand(%gpn: reg<aie2p.er>, %gnc0: reg<aie2p.er>, %g2: reg<aie2p.er>, %gexp: reg<aie2p.er>)")
-        e("^ghand(%ghp: reg<aie2p.er>, %ghc: reg<aie2p.er>, %ghs: reg<aie2p.er>, %ghv: reg<aie2p.er>):")
-        e(f"  acq %gm1, {nbr}")
-        e("  st %ghv, %gn1, 0")
-        e("  st %ghs, %gn1, 4")
-        e("  st %ghp, %gn1, 8")
-        e("  st %ghc, %gn1, 12")
-        e(f"  rel %g1, {nbr}")
-        e("  %gNn = mul %ghc, %gfpc")
-        e("  %gLn = sub %gsup, %ghp")
-        e("  st %g0, %gsp, 0")
-        e("  st %gNn, %gsp, 4")
-        e("  st %gLn, %gsp, 8")
-        e("  st %g0, %gsp, 12")
-        e("  st %gnext, %gsp, 16")
-        e("  return")
-    else:
-        e(f"  acq %gm1, {nbr}")
-        e("  %gexp = lda %gn1, 0")
-        e("  %gsts = lda %gn1, 4")
-        e("  %gpol = lda %gn1, 8")
-        e("  %gnc = lda %gn1, 12")
-        e(f"  rel %g1, {nbr}")
-        e("  mov.ms %gexp")
-        e("  mov.ms %gsts")
-        e("  mov.ms %gpol")
-        e("  mov.ms %g0")
-        e("  %gbad = lt %g1, %gsts")
-        e(f"  %gfb = mov.i32 {GATE_FAILED - (1 << 32)}")   # the waiter gave up
-        e("  %gmark = mul %gbad, %gfb")
-        e("  %gdone = add.rr %gexp, %gmark")
-        e("  mov.ms %gdone")
-        e("  mov.ms %gsts")
-        e("  mov.ms %gpol")
-        e("  mov.ms %g0")
-        e("  %gNn = mul %gnc, %gfpc")
-        e("  st %g0, %gsp, 0")
-        e("  st %gNn, %gsp, 4")
-        e("  return")
-
-
 def gate_first(e, cfg, gate, gn):
-    """Config.gfirst: the gate at a job's first firing, before any of its data (see GATE), so a freshly set up array
+    """The gate at a job's first firing, before any of its data (see GATE), so a freshly set up array
     (job state zero: at the gate) runs no call. The waiter polls for the job's ready value and hands it to the relay,
     which emits its go and done; job state then holds the job's firings (gate_count counts them down, back to zero at
     its end). Fuse 2 checks at a call's first firing (before its fill), others at every firing. gn: the neighbor
     channel's pointer (the resource: no fill ran yet)."""
     S, FPC = cfg.gate, cfg.nb * cfg.passes
     nbr = gate_ports(cfg)[gate]["nbr"]
-    compact = gate == "waiter" and cfg.ghelp   # (waiter_epilogue's state: firings left at word 0)
+    compact = gate == "waiter" and cfg.ghelp   # (the helper's waiter: firings left at word 0, less program)
     e(f"  %gfs = lda %gsp0, {0 if compact else 4}")
     e("  low.cond_br %gfs, ^gfgo, ^gfw : reg<aie2p.er>")
     e("^gfw:")
@@ -2100,8 +1729,8 @@ def gate_first(e, cfg, gate, gn):
 
 
 def gate_count(e, cfg, gate):
-    """Config.gfirst's end of firing: the job's firings counted down (zero at its end: the next firing waits at the
-    gate, gate_first) and the waiter's leftover supply drained in the background as gate_epilogue / waiter_epilogue do
+    """The gated leaves' end of firing: the job's firings counted down (zero at its end: the next firing waits at the
+    gate, gate_first) and the waiter's leftover supply drained in the background
     (all of it by the job's end)."""
     e("  %g0 = mova.i32 0")
     e("  %g1 = mova.i32 1")
@@ -2116,7 +1745,7 @@ def gate_count(e, cfg, gate):
         e("  st %gNn, %gsp, 4")
         e("  return")
         return
-    if cfg.ghelp:   # waiter_epilogue's: [firings left, -, leftover, pending reads, the last job's ready value]
+    if cfg.ghelp:   # compact: [firings left, -, leftover, pending reads, the last job's ready value]
         R27 = "reg<aie2p.er> -> reg<aie2p.mr27_select>"
         e("  %gR = lda %gsp, 0")
         e("  %gL = lda %gsp, 8")
@@ -2158,7 +1787,7 @@ def gate_count(e, cfg, gate):
         e("  st %gQn, %gsp, 12")
         e("  return")
         return
-    # gate_epilogue's waiter: [firings done, firings of the job, leftover, pending reads, sequence]
+    # the waiter's: [firings done, firings of the job, leftover, pending reads, sequence]
     e("  %gF = lda %gsp, 0")
     e("  %gN = lda %gsp, 4")
     e("  %gL = lda %gsp, 8")
@@ -2223,106 +1852,6 @@ def gate_count(e, cfg, gate):
     e("^gld:")
     for o in (0, 4, 8, 12):
         e(f"  st %g0, %gsp, {o}")
-    e("  return")
-
-
-def waiter_epilogue(e, S, parked, nbr):
-    """gate_epilogue's waiter in less program (ghelp: it shares the core with a decoder). The same protocol in fewer
-    blocks and constants: one supply loop per firing reads n and ticks m records, a read and a tick per iteration (the
-    reads trail the ticks by the pending count), m = min(L, GB) and n = Q, or at the job's end m = L, n = Q + L; the
-    wait polls with its pace spin in the same loop and selects the handoff branch-free. Its private state: firings left
-    (0: one call, the setup call's), -, leftover supply, pending reads, the last job's ready value. Ticks carry the read
-    bound (the tick binding is scratch). sel.eqz / sel.nez a, b, c: c (in r27) == 0 / != 0 ? a : b."""
-    R27 = "reg<aie2p.er> -> reg<aie2p.mr27_select>"
-    e("  %gR = lda %gsp, 0")
-    e("  %gL = lda %gsp, 8")
-    e("  %gQ = lda %gsp, 12")
-    e("  %gE = lda %gsp, 16")
-    if parked:
-        gate_parked(e)
-    e("  %gRs = copy %gR : " + R27)
-    e("  %gRv = sel.eqz %gfpc, %gR, %gRs")
-    e("  %gR1 = add %gRv, -1")                    # this firing ends the job: R1 == 0
-    e(f"  %ggb = mova.i32 {GB}")
-    e("  %gls = lt.select %gL, %ggb")             # m = min(L, GB), or L at the end
-    e("  %gmin = sel.nez %gL, %ggb, %gls")
-    e("  %gcs = copy %gR1 : " + R27)
-    e("  %gm = sel.nez %gmin, %gL, %gcs")
-    e("  %gQL = add.rr %gQ, %gL")
-    e("  %gn = sel.nez %gQ, %gQL, %gcs")
-    e("  low.br ^gd(%g0: reg<aie2p.er>)")
-    e("^gd(%gdi: reg<aie2p.er>):")   # (the conditions up front: a branch waits for its block's work)
-    e("  %gdtm = lt %gdi, %gm")
-    e("  %gdrm = lt %gdi, %gn")
-    e("  %gdm = or %gdtm, %gdrm")                # (max(m, n) iterations)
-    e("  %gdi1 = add %gdi, 1")
-    e("  low.cond_br %gdm, ^gdr, ^gdx : reg<aie2p.er>")
-    e("^gdr:")   # the read first: no more than GB records outstanding (at the job's end Q >= 1 while L > 0)
-    e("  low.cond_br %gdrm, ^gdr1, ^gdt : reg<aie2p.er>")
-    e("^gdr1:")
-    for i in range(4):
-        e(f"  %gdx{i} = mov.ss")
-    e("  low.br ^gdt")
-    e("^gdt:")
-    e("  low.cond_br %gdtm, ^gdt1, ^gdn : reg<aie2p.er>")
-    e("^gdt1:")
-    for i in range(4):
-        e("  mov.ms %gn")
-    e("  low.br ^gdn")
-    e("^gdn:")
-    e("  low.br ^gd(%gdi1: reg<aie2p.er>)")
-    e("^gdx:")
-    e("  low.cond_br %gR1, ^gmid, ^gend : reg<aie2p.er>")
-    e("^gmid:")
-    e("  st %gR1, %gsp, 0")
-    e("  %gL2 = sub %gL, %gm")
-    e("  st %gL2, %gsp, 8")
-    e("  st %gm, %gsp, 12")
-    e("  return")
-    e("^gend:")
-    # the wait for ready >= the last job's + GATE_CALLS: poll, then spin the pace (gate_pace)
-    e(f"  %g64 = mova.i32 {GATE_CALLS}")
-    e("  %gexp = add.rr %gE, %g64")
-    e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
-    e("^gp(%gpn: reg<aie2p.er>, %gpw: reg<aie2p.er>):")
-    e("  low.cond_br %gpw, ^gspin, ^gask : reg<aie2p.er>")
-    e("^gspin:")
-    e("  %gpw1 = add %gpw, -1")
-    e("  low.br ^gp(%gpn: reg<aie2p.er>, %gpw1: reg<aie2p.er>)")
-    e("^gask:")
-    for i in range(4):
-        e("  mov.ms %gpn")
-    e("  %grdy = mov.ss")
-    e("  %gy1 = mov.ss")
-    e("  %gy2 = mov.ss")
-    e("  %gy3 = mov.ss")
-    e("  %gpn1 = add %gpn, 1")
-    e("  %glate = lt %grdy, %gexp")
-    e(f"  %gsl = mova.i32 {S - 1}")
-    e("  %gquit = lt %gsl, %gpn1")                # (pn + 1 >= S; pn and pw die before the back edge's values)
-    e("  %gwait = lt %gquit, %glate")
-    gate_pace(e, "%gv", "%gpn1", "%gpace")
-    e("  low.cond_br %gwait, ^gpgo, ^ghand : reg<aie2p.er>")
-    e("^gpgo:")
-    e("  low.br ^gp(%gpn1: reg<aie2p.er>, %gpace: reg<aie2p.er>)")
-    e("^ghand:")   # opened: [ready, 1, polls, calls]; gave up after S polls: [expected, 2, S, 0] (the next job: one call)
-    e("  %gls27 = copy %glate : " + R27)
-    e("  %ghs = add %glate, 1")
-    e("  %ghv = sel.nez %gexp, %grdy, %gls27")
-    e("  %ghc = sub %ghv, %gexp")                # (the job's calls when open, else 0)
-    e(f"  acq %gm1, {nbr}")
-    e("  st %ghv, %gn1, 0")
-    e("  st %ghs, %gn1, 4")
-    e("  st %gpn1, %gn1, 8")
-    e("  st %ghc, %gn1, 12")
-    e(f"  rel %g1, {nbr}")
-    e("  %gNn = mul %ghc, %gfpc")
-    e("  %gLn1 = sub %gsl, %gpn1")
-    e("  %gLn = add %gLn1, 1")                    # (S - (pn + 1))
-    e("  st %gNn, %gsp, 0")
-    e("  st %gLn, %gsp, 8")
-    e("  st %gR1, %gsp, 12")                      # (%gR1: 0 at the job's end)
-    e("  st %gexp, %gsp, 16")
     e("  return")
 
 
@@ -3156,7 +2685,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None):
     if fills:
         e("  rel %one, 1")
     if gate:
-        gate_epilogue(L, cfg, gate, parked=fills and cfg.fuse == 2)
+        gate_count(L.append, cfg, gate)
         e("}\n")
     else:
         e("  return\n}\n")
@@ -3194,6 +2723,7 @@ def silu_rodata():
 
 def gen(cfg):
     assert len(cfg.ks) == 4 and cfg.passes >= 2 and 1 <= cfg.cols <= 8
+    assert cfg.fuse in (0, 2) and (cfg.fuse == 2 or not cfg.gate), "fuse 0 or 2; gated images are fused"
     L = []
     array_program(L, cfg)
     assert len(set(cfg.ks[1:-1])) == 1 or cfg.kchain, "the mids share one leaf"   # (kchain: a leaf per mid)
@@ -3223,9 +2753,6 @@ def gen(cfg):
         leaf(L, cfg, "head", cfg.ks[0])
         leaf(L, cfg, "mid", cfg.ks[1])
         leaf(L, cfg, "tail", cfg.ks[-1])
-    if cfg.gate and not cfg.fuse:
-        leaf(L, cfg, "head", cfg.ks[0], gate="waiter")
-        leaf(L, cfg, "mid", cfg.ks[1], gate="relay")
     return "\n".join(L)
 
 

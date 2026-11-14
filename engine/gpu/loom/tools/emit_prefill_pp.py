@@ -782,9 +782,9 @@ KCHAIN = lambda fmt: dict(kchain=1, hcap=2, gtail=1, hlate=int(fmt in ("iq3s", "
 
 
 def npu_cfg(B, ks, passes, **kw):
-    """A fused NPU image's gen_npu_gemm config: gated, its gate's waiter and relay at a job's first firing (gfirst: the
-    setup runs no call, so an image switch inside a command costs no dummy call; dispatch.txt "npugfirst")."""
-    return GN.Config(NPU_COLS, B // 64, ks, passes, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, gfirst=1, **kw)
+    """A fused NPU image's gen_npu_gemm config: gated, its gate's waiter and relay at a job's first firing (the setup
+    runs no call, so an image switch inside a command costs no dummy call; dispatch.txt "npugfirst")."""
+    return GN.Config(NPU_COLS, B // 64, ks, passes, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, **kw)
 
 
 # Token halves (LoomPrefill halves): the qkv / q and out jobs and their GPU chains run per half of the chunk, so the NPU works during the DeltaNet / attention chain.

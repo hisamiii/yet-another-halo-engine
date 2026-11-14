@@ -55,13 +55,14 @@ def main():
         sys.exit(__doc__)
     work, cols, nb = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     ks, passes = tuple(int(v) for v in sys.argv[4].split(",")), int(sys.argv[5])
-    # NPU_MU=1: one M slab per iteration (2-slot activation ring); NPU_FUSE=1: the GEMM cores fill their panels
+    # NPU_MU=1: one M slab per iteration (2-slot activation ring); NPU_FUSE=2: the GEMM cores decode their panels
     mu, fuse = int(os.environ.get("NPU_MU", "2")), int(os.environ.get("NPU_FUSE", "0"))
     if os.environ.get("NPU_GROUPS"):   # replay groups of passes, e.g. "5" (one group)
         N.GE.GROUPS = tuple(int(v) for v in os.environ["NPU_GROUPS"].split(","))
     # fuse 2, NPU_KRAW=<K> NPU_K0=<k>: rows of K columns, the call's K at column k (a site's chunk)
     kraw, k0r = int(os.environ.get("NPU_KRAW", "0")), int(os.environ.get("NPU_K0", "0"))
     fmt = os.environ.get("NPU_FMT", "IQ4_XS")   # fuse 2: the raw rows' format (gen_npu_gemm FUSE_FMTS)
+    assert fuse in (0, 2), "NPU_FUSE: 0 or 2"
     cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw, fmt=fmt)
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
@@ -121,11 +122,8 @@ def main():
         words = max(fw * nrec for c in range(cols) for fw, nrec in (N.fuse_record(cfg, cov)
                                                                   for cov in N.fuse_cover(cfg, c).values()))
         np.zeros(len(ks) * cols * words, np.int32).tofile(d_b)
-        if fuse == 2:
-            # the GGUF rows as they are, from the call's first column
-            np.concatenate([wraw.reshape(-1)[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
-        else:
-            N.fuse_raw(np.frombuffer(rw.tobytes(), np.int32), cfg).tofile(r_b)
+        # the GGUF rows as they are, from the call's first column
+        np.concatenate([wraw.reshape(-1)[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
         base += ["--binding=" + d_b, "--binding=" + r_b]
     width = None
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
