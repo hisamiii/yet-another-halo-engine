@@ -2275,7 +2275,7 @@ def main():
         ("yah_unpack_qg_f32.loom", "unpack.hal",
          ["yah_unpack_qg.batch=%d" % B, "yah_unpack_qg.num_heads=24",
           "yah_unpack_qg.head_dim=256"]),
-        *[(src_, stem_ + ".hal" if c == 0 else stem_ + "_c%d.hal" % c, [
+        *[(rope_src, "rope.hal" if c == 0 else "rope_c%d.hal" % c, [
             "yah_fused_qk_rope_batched.start_pos=%d" % (c * B),
             "yah_fused_qk_rope_batched.batch=%d" % B,
             "yah_fused_qk_rope_batched.layer_idx=0",
@@ -2289,8 +2289,7 @@ def main():
             "yah_fused_qk_rope_batched.cache32_elems=%d" % KC,
             "yah_fused_qk_rope_batched.cache16_elems=%d" % (1024 * B if kv16_scratch else KC),
             *(["yah_fused_qk_rope_batched.cache_start=%d" % (c * B)] if kv16_scratch else []),
-            *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)
-          for src_, stem_ in ((rope_src, "rope"),)],
+            *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)],
         *([(qrot_src, "qrot.hal", ["yah_qrot.token_count=%d" % B])] if qrot_first < NCH else []),
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c),
            ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)]
