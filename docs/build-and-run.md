@@ -7,7 +7,7 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 - HRX / Loom: the revision pinned in `engine/hrx/PIN` plus the patches in `engine/hrx/patches/`. `engine/hrx/bootstrap.sh` clones it into `external/hrx` (gitignored; `YAH_HRX` overrides, and a symlink to an existing checkout works), checks out the pin, applies the patches and builds what the engine uses: `libhrx` and its HIP binding, `iree-run-loom`, `loom-compile`, `iree-profile`. `engine/hrx/bootstrap.sh --check` verifies the checkout; `engine/build_hrx.sh` refuses anything else. On this box `main` builds against `/home/q/Development/Projects/hrx-npu` (the pin plus every patch here, the NPU ones 0013-0029 included; `external/hrx` links there) and branch `npu` against `/home/q/Development/Projects/hrx` (that branch's patch set); point `external/hrx` at the one matching the branch you build. Without HRX's XDNA targets the build is GPU-only (`--npu` off).
 - The official ROCm Core SDK 10.0.0 packages (runtime, sysdeps, llvm, base, profiler-base), extracted into one prefix (no system install) by `engine/hrx-env.sh --fetch` under `external/rocm10/root` (`YAH_ROCM` overrides). They hold both the GPU runtime and the toolchain the bootstrap builds HRX with; no system ROCm is needed. Do not use a TheRock nightly: HRX needs `hsa_amd_queue_create`, which only the 10.0.0 release exports. `engine/hrx-env.sh --check` verifies the install.
 - `source engine/hrx-env.sh` in every shell that runs a GPU job. It only sets `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH`. The Python emitters find the same paths through `engine/gpu/loom/hrx_paths.py`.
-- The model: hipfire's MQ4G256 HFQ file of Qwen3.8 27B, `~/Downloads/qwen3.8-27b.mq4-xts` (15 GB, read into resident memory by every driver), or a llama.cpp GGUF of it (any of Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K .. Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, F16, BF16, F32 per tensor), whose projections are re-quantized to MQ4G256 at load (~22 s on 16 cores; architecture.md). Only a GGUF with the MTP layer (`blk.64.nextn.*`, e.g. unsloth's) can draft for speculative decoding. The HAL sets are emitted from the model they run with.
+- The model: a llama.cpp GGUF of Qwen3.8 27B, run in its own formats (projections in Q8_0, Q2_K .. Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL or IQ4_XS). The target is unsloth's UD-IQ4_XS, `~/Downloads/qwen3.8-gguf/Qwen3.8-27B-UD-IQ4_XS.gguf` (14.3 GB, read into resident memory by every driver). The HAL sets are emitted from the model they run with.
 - Python 3. The emitters need only the standard library; the checkers and gate tools need numpy, and an OpenBLAS-backed one (a venv) is ~100x faster there than a reference-BLAS build.
 
 ### HRX patches
@@ -87,14 +87,13 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 
 | set | command |
 |---|---|
-| prefill, one pass of B tokens (A4) | `python3 tools/emit_prefill_pp.py <model> <dir> 2048` (B a multiple of 256; int4 activations on the iu4 WMMA) |
-| prefill, W4A16 (the quality mode) | add `YAH_A16=1` (f16 activations, the tile GEMM) |
+| prefill, one pass of B tokens | `python3 tools/emit_prefill_pp.py <model> <dir> 2048` (B a multiple of 256) |
 | prefill, chunked, context T | `YAH_CTX=32768 python3 tools/emit_prefill_pp.py <model> <dir> 2048` (chunk 2048, pools for 32768 tokens; T a multiple of B) |
 | prefill with kv8a16 / kv4a16 | add `YAH_KV=kv8` or `YAH_KV=kv4` (or mixed `k8v4`, `k4v8`; `k8` / `v4` alone quantize one side, prefill only) |
 | decode | `python3 tools/emit_decode.py <model> <dir> <max_context>` (multiple of 256, default 4096) |
 | decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
 
-The emitters read the model's tensor table from `engine/build/yah-dump --table` (headers only, no weights), so build first. The decode set also holds the 4-token verify GEMVs (`<gemv>_t4`) and, for a model with the MTP layer, its kernels: the set serves speculative decoding (Serving).
+The emitters read the model's tensor table from `engine/build/yah-dump --table` (headers only, no weights), so build first.
 
 `engine/build_hrx.sh <model> [dir]` also emits a decode set (default `engine/hal`), which the end-to-end gates use.
 
@@ -133,12 +132,12 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids
 
 ## Serving
 
-`engine/build/yah_server` serves the model over the OpenAI Responses and Chat Completions APIs. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and KV format. `--ctx` (default 32768, a multiple of 2048) and `--kv` (default `kv8`; `fp16`, `kv4`, `k8v4`, `k4v8`) pick them: a release bundle's `hal/<ctx>-<kv>/`, or in a source tree `~/.cache/yah/hal/<ctx>-<kv>/` (`XDG_CACHE_HOME`), emitted there on first use (~20 s). The prefill sets are the same for the HFQ and any GGUF; a decode set emitted from a model with the MTP layer adds its kernels (`decode-mtp/`) and serves either. `--prefill` / `--decode` name sets instead.
+`engine/build/yah_server` serves the model over the OpenAI Responses and Chat Completions APIs. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and KV format. `--ctx` (default 32768, a multiple of 2048) and `--kv` (default `kv8`; `fp16`, `kv4`, `k8v4`, `k4v8`) pick them: a release bundle's `hal/<ctx>-<kv>/`, or in a source tree `~/.cache/yah/hal/<model file name>/<ctx>-<kv>/` (`XDG_CACHE_HOME`), emitted there on first use. The sets run the model's own formats, so each model has its own. `--prefill` / `--decode` name sets instead.
 
 ```
 source engine/hrx-env.sh
 engine/run/gpu_run.sh serve -- engine/build/yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080] \
-  [--draft mtp [--draft-len N]] [--npu] [--no-reuse] [--prefill <set> --decode <set>]
+  [--npu] [--no-reuse] [--prefill <set> --decode <set>]
 engine/build/yah_server --model <model> --fake    # canned replies, CPU only: for clients and API tests
 ```
 
@@ -148,9 +147,7 @@ A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the
 
 Multi-turn chats reuse the cache. The engine keeps the token sequence of the last request (prompt and output) and two snapshots of the recurrent state (conv rings and DeltaNet states, 159 MB each): one at the last 2048-token chunk boundary 32 tokens short of the prompt's end, one at the last boundary the decode crossed. A prompt that starts with that sequence resumes at the deepest snapshot inside the shared prefix: the KV rows below it are still in the pools, so only the rest runs (a 9.3K-token follow-up: 1.7 s to the first token instead of 10 s). The first slot serves the usual follow-up, whose history ends at the old assistant header (thinking turns drop their reasoning there); the second serves a history that keeps the whole output. From the first slot the result is bit-identical to a fresh prefill; from the second it is the continued run's (the tokens past the old prompt were decode steps, not a prefill chunk, so a greedy reply can take another near-tie). `usage.prompt_tokens_details.cached_tokens` (`input_tokens_details` for Responses) reports the reused tokens. `yah_server --no-reuse` turns it off.
 
-Speculative decoding: `--draft mtp` drafts with the model's MTP layer (a GGUF that has it) and verifies the draft and the next token in one pass of the decode set's 4-token GEMVs; every other kernel runs once per token as in a step, so a greedy output is the same token for token as without drafting. A rejected token rolls back the conv rings, the DeltaNet states (one ring slot per verified token) and the open KV tile. The draft length follows the acceptance: each round picks the length with the most expected tokens per ms (from a decayed acceptance rate and the measured round times), down to plain steps where drafting does not pay. `--draft-len N` fixes it. On the Q4_K_M GGUF at 32K kv8 (`spec_engine`): code 15.9 -> 24.3 t/s, a long factual prompt 13.6 -> 22.0, free prose 14.4 -> 13.7 (the acceptance is low there). Sampled requests (temperature > 0) decode without drafts. The request log line carries `accepted=<accepted>/<drafted>`.
-
-The NPU: `--npu` runs a prefill set's NPU split on the XDNA2 NPU (`prefill-npu/` beside `prefill/`, or `--prefill`; architecture.md, NPU split). The split exists only for native GGUF sets (`YAH_NATIVE=1`), and the server does not run native sets yet, so for now `--npu` there finds no split set and the GPU runs everything; `loom_forward_pp <model.gguf> <split set> ... --npu` runs it. It needs an unlimited memlock limit (the GPU's DPM level is pinned to high while the NPU runs) and falls back to the GPU alone without what it needs. A set with the NPU attention split (`YAH_NPU_ATTN=n` with `YAH_ATTN_KSPLIT`, any model, fp16 or kv8 KV; architecture.md, NPU attention) runs with `loom_forward_pp ... --npu` too; it needs the memlock limit but no DPM pin. The server does not run it yet.
+The NPU: `--npu` runs a prefill set's NPU split on the XDNA2 NPU (`prefill-npu/` beside `prefill/`, or `--prefill`; architecture.md, NPU split). `loom_forward_pp <model.gguf> <split set> ... --npu` runs it too. It needs an unlimited memlock limit (the GPU's DPM level is pinned to high while the NPU runs) and falls back to the GPU alone without what it needs. A set with the NPU attention split (`YAH_NPU_ATTN=n` with `YAH_ATTN_KSPLIT`, any model, fp16 or kv8 KV; architecture.md, NPU attention) runs with `loom_forward_pp ... --npu` too; it needs the memlock limit but no DPM pin. The server does not run it yet.
 
 For quick tests, `engine/build/yah_chat` is a terminal chat client: it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply. Commands: `/reset`, `/effort E`, `/temp T`, `/max N`, `/system TEXT`, `/quit`; Ctrl-C stops a reply.
 
@@ -198,20 +195,13 @@ Tests (no GPU):
 engine/build/yah_serve_test <model> engine/build/yah_server_fake   # chat template golden, then --fake over HTTP
 ```
 
-GPU tests of speculative decoding: `spec_check` runs verify rounds with one wrong draft per round at a rotating index against plain steps (every verified logit bit-identical, `--time` adds the step / verify / draft costs); `spec_engine` runs prompts through the engine greedy with and without drafts and requires the same tokens:
-
-```
-engine/run/gpu_run.sh spec -- engine/build/spec_check <model> <decode set> 96 [--time]
-engine/run/gpu_run.sh spec -- engine/build/spec_engine <GGUF with MTP> <prefill set> <decode set> [--draft-len N] [--npu]
-```
-
 GPU test of the reuse (bit-exact continuation from the decode slot, reused = fresh from the prefill slot; ~2 min):
 
 ```
 engine/run/gpu_run.sh reuse -- engine/build/engine_reuse <model> <prefill set> <decode set>
 ```
 
-`yah_server_fake` is `yah_server` built without the engine (`YAH_SERVE_FAKE_ONLY`): only `--fake`, no libhrx. The default server is `yah_server` next to the test, which links libhrx: source `engine/hrx-env.sh` first. `--fake` reads only the tokenizer, so `<model>` can be the tokenizer-only cut `python3 engine/tests/make_tokenizer_fixture.py <model path or URL> <out.hfq>` makes (~14 MB; from a URL it fetches only the metadata ranges). `engine/tests/verify_tokenizer.py --model` takes it too. The CPU CI (`.github/workflows/cpu.yml`) runs both on that cut once the repository variable `YAH_MODEL_URL` names the model's download URL; without it the job only builds.
+`yah_server_fake` is `yah_server` built without the engine (`YAH_SERVE_FAKE_ONLY`): only `--fake`, no libhrx. The default server is `yah_server` next to the test, which links libhrx: source `engine/hrx-env.sh` first. `--fake` reads only the tokenizer, so `<model>` can be the tokenizer-only cut `python3 engine/tests/make_tokenizer_fixture.py <model path or URL> <out.gguf>` makes (~11 MB; from a URL it fetches only the metadata ranges). `engine/tests/verify_tokenizer.py --model` takes it too. The CPU CI (`.github/workflows/cpu.yml`) runs both on that cut once the repository variable `YAH_MODEL_URL` names the model's download URL; without it the job only builds.
 
 It checks the C++ chat template byte for byte against `engine/serve/testdata/chat_template_cases.json` and `chat_template_tool_cases.json`, then starts `yah_server --fake` on a free port and checks the response object and stream event shapes (the required fields of the openai SDK models), event order, deltas, `max_output_tokens`, the 400 error objects and client disconnect. The first fixture was frozen from jinja2 on 2026-10-02 against the GGUF's template; regenerating it is not supported in-tree. The tool fixture comes from `engine/tests/make_tool_template_cases.py <model>` (jinja2, the model file's own template; the HFQ's and the unsloth GGUF's render these cases the same).
 
@@ -241,7 +231,7 @@ python3 engine/release/bundle.py pack yah-<version>-gfx1151       # checks it is
 | `tools/dattn_check.py <model> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
 | `tools/sample_check.py <model> <work> [draws]` | the decode sampler against a numpy model of it (token for token), the model against the exact top-p distribution | sampler changes |
 | `tools/dattn_q_check.py <model> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
-| `engine/run/gate/kld_ref.py <model> <set> <ref.bin> <workdir> [chunks]` | KL vs the BF16 model: hipfire's HFKLDR reference (24 wikitext-2 chunks of 2048, top-256 log-probs of positions 1024..2046; `~/Development/Scratch/w4/kld/qwen3.8-27b.ref_wt2.bin`), one pp2048 per chunk, scored as hipfire's `eval_hipfire` scores; prints mean / p99 / p99.9 / max KL, top-1, PPL | HFQ model numerics |
+| `engine/run/gate/kld_ref.py <model> <set> <ref.bin> <workdir> [chunks]` | KL vs the BF16 model: hipfire's HFKLDR reference (24 wikitext-2 chunks of 2048, top-256 log-probs of positions 1024..2046; `~/Development/Scratch/w4/kld/qwen3.8-27b.ref_wt2.bin`), one pp2048 per chunk, scored as hipfire's `eval_hipfire` scores; prints mean / p99 / p99.9 / max KL, top-1, PPL | model numerics |
 | `engine/run/gate/` (`gate_run.sh`, `accgate2.py`) | tiered accuracy gate on wikitext windows, all-position logits (`--logits-from`): T1 rounding level, T2 quantization level. See `engine/run/gate/README.md` | any numerics change |
 | `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `--rowstats` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |
 | `engine/tests/m0_gate.sh <model> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |

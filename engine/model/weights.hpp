@@ -46,9 +46,6 @@ struct Qwen35Weights {
   TensorRef output;
   std::vector<Qwen35Layer> layers;
 
-  // The MTP head's tensors, present only on block_count - 1. Not resolved for the text path.
-  TensorRef nextn_eh_proj, nextn_enorm, nextn_hnorm, nextn_shared_head_norm;
-
   // Resolves every tensor the layer loop needs and checks it against the config (row lengths, counts, layer types).
   // Throws on anything missing or inconsistent; never returns a partial table.
   static Qwen35Weights FromGguf(const core::Gguf& gguf, const core::Qwen35Config& config);

@@ -19,7 +19,6 @@ Kinds:
 Usage (module): gen(kind, fmts, M, K, R=2, W=4) -> Loom source text.
 Bindings: weights (one per format in fmts), then the IQ tables the formats need (TABLE_ORDER), then x, then y.
 """
-import gen_rot
 import re
 import sys
 
@@ -32,7 +31,6 @@ FMT = {
     "q5k": (256, 176, ()),
     "q6k": (256, 210, ()),
     "iq4xs": (256, 136, ()),
-    "mq4": (256, 136, ()),
     "iq3s": (256, 110, ("grid_iq3s",)),
     "iq3xxs": (256, 98, ("grid_iq3xxs", "ksigns")),
     "iq2xxs": (256, 66, ("grid_iq2xxs", "ksigns")),
@@ -48,7 +46,7 @@ IQ4_KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 
 # Loom read-ahead depth of the sub-block loop: 2 is the fastest on the full decode (none and 3 are slower).
 PIPE = 2
 GGML = {8: "q8_0", 10: "q2k", 11: "q3k", 12: "q4k", 13: "q5k", 14: "q6k", 16: "iq2xxs", 17: "iq2xs",
-        18: "iq3xxs", 20: "iq4nl", 21: "iq3s", 22: "iq2s", 23: "iq4xs", 44: "mq4"}
+        18: "iq3xxs", 20: "iq4nl", 21: "iq3s", 22: "iq2s", 23: "iq4xs"}
 
 
 def rows_per_wg(R=2, W=4):
@@ -96,12 +94,8 @@ class E:
         return nm
 
 
-def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=False, peel=0, amax=False, T=1):
-    """T: tokens per dispatch (speculative verify): x is [T][K], y [T][M]; every weight load serves all T, and each
-    token's sums take the T = 1 kernel's ops in its order, so its y is bit-identical to a T = 1 dispatch on that row.
-    rot: y feeds an MQ4 GEMV, so rotate it in place (gen_rot.gen in place, f32: y / awq, signs, H256): the last
-    workgroup to finish each 256-row block (its monotonic counter, bindings awq, signs, cnt after y) rotates it.
-    amax (plain): also the argmax of y into a token (bindings ak: u64 key + i32 counter, tok: i32 after y; amax_tail).
+def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=0, amax=False):
+    """amax (plain): also the argmax of y into a token (bindings ak: u64 key + i32 counter, tok: i32 after y; amax_tail).
     peel: the first peel K iterations run before the loop, their weight loads and decode (which do not read x) ahead
     of a "// chain.wait" marker (gen_chain puts the producer wait there), the x part after it (the same ops)."""
     assert kind in ("plain", "resid", "swiglu")
@@ -109,9 +103,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
     assert K % 512 == 0, "K / 16 sub-blocks must split evenly over 32 lanes"
     rows_wg = R * W
     assert M % rows_wg == 0, (M, rows_wg)
-    assert T == 1 or not (rot or amax or peel or _parts is not None), "T > 1: plain dispatches only"
     NT = K // 512                    # sub-blocks per lane
-    tk = [""] + [f"t{j}" for j in range(1, T)]   # per-token name suffixes (token 0 keeps the T = 1 names)
     tabs = tables_for(fmts)
     e = _e if _e is not None else E()
     body = []
@@ -246,14 +238,6 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             b(f"  %{p}sl1 = scalar.andi %{p}s32i, {e.cs(1)} : i32")
             b(f"  %{p}sls = scalar.shli %{p}sl1, {e.cs(2)} : i32")              # 4 * (sb32 % 2)
             b(f"  %{p}shs = scalar.shli %{p}s32i, {e.cs(1)} : i32")              # 2 * sb32
-        elif f == "mq4":
-            # sub-block (s32, hlf): nibble bytes 16 s32 + 8 hlf .. + 7 at 8, scale f16 at 4 (s32 / 4)
-            b(f"  %{p}qb0 = index.mul %{p}s32, {e.ci(16)} : index")
-            b(f"  %{p}qb1 = index.mul %{p}hlf, {e.ci(8)} : index")
-            b(f"  %{p}qb2 = index.add %{p}qb0, %{p}qb1 : index")
-            b(f"  %{p}qo = index.add %{p}qb2, {e.ci(8)} : index")
-            b(f"  %{p}s4 = index.div %{p}s32, {e.ci(4)} : index")
-            b(f"  %{p}so = index.mul %{p}s4, {e.ci(4)} : index")
         elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs", "iq2s"):
             # sign of element j: bit (j % 8) of sign byte l = 2 * hlf + j / 8
             b(f"  %{p}l0 = index.mul %{p}hlf, {e.ci(2)} : index")                # l of the first eight
@@ -540,27 +524,6 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             q = f"%{p}q"
             bias = 128
             scale = ld_d(hv, nh, boff, 0, p, "d")
-        elif f == "mq4":
-            # signed nibbles (the HFQ loader's code - 8) ^ 8 = the unsigned codes; byte j holds elements 2j (low), 2j + 1
-            b(f"    %{p}qa = index.add {boff}, %{lp}qo : index")
-            raw = ld(wv, nb, f"%{p}qa", p, "qr", 8)
-            b(f"    %{p}qw = vector.bitcast {raw} : vector<8xi8> to vector<2xi32>")
-            b(f"    %{p}qx = vector.xori %{p}qw, %ws2_88 : vector<2xi32>")
-            b(f"    %{p}ql = vector.andi %{p}qx, %ws2_0f : vector<2xi32>")
-            b(f"    %{p}qs = vector.shrui %{p}qx, %ws2_4 : vector<2xi32>")
-            b(f"    %{p}qh = vector.andi %{p}qs, %ws2_0f : vector<2xi32>")
-            for nm, cv in (("%ws2_88", -2004318072), ("%ws2_0f", 0x0F0F0F0F), ("%ws2_4", 4)):
-                e.consts[nm] = f"  {nm} = vector.splat {e.cs(cv)} : vector<2xi32>"
-            for k in range(2):
-                b(f"    %{p}ql{k} = vector.extract %{p}ql[{k}] : vector<2xi32> -> i32")
-                b(f"    %{p}qh{k} = vector.extract %{p}qh[{k}] : vector<2xi32> -> i32")
-            b(f"    %{p}qlh = vector.from_elements %{p}ql0, %{p}ql1, %{p}qh0, %{p}qh1 : vector<4xi32>")
-            qb = tob(p, f"%{p}qlh", "qlb")
-            b(f"    %{p}q = vector.shuffle<[0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15]> {qb} : vector<16xi8>")
-            q = f"%{p}q"
-            bias = 8
-            b(f"    %{p}sa = index.add {boff}, %{lp}so : index")
-            scale = ld_d(hv, nh, f"%{p}sa", 0, p, "d")
         elif f in ("iq3s", "iq3xxs", "iq2xxs", "iq2xs", "iq2s"):
             (gw, s0, s1), scale = decode_grid(f, S, p, wv, hv, nb, boff, lp)
             q = signed_grid(p, gw, s0, s1)
@@ -730,22 +693,15 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             b(f"  %f{i}rb{r} = index.mul %f{i}row{r}, {e.ci(rb)} : index")
             b(f"  %f{i}base{r} = index.add %f{i}rb{r}, %f{i}lboff : index")
     b(f"  %xl16 = index.mul %lane, {e.ci(16)} : index")
-    accs = [f"%a{i}_{r}{tk[j]}" for j in range(T) for i in range(nw) for r in range(R)]
+    accs = [f"%a{i}_{r}" for i in range(nw) for r in range(R)]
     b("  %zf = scalar.constant 0.0 : f32")
     inits = ", ".join(f"{a} = %zf : f32" for a in accs)
     res = [f"%res{j}" for j in range(len(accs))]
     b(f"  {', '.join(res)} = scf.for %t = [{e.ci(0)} to {e.ci(NT)} step {e.ci(1)}]({inits}) -> ({', '.join(['f32'] * len(accs))}) pipeline({e.ci(PIPE)}) {{")
     b(f"    %xo0 = index.mul %t, {e.ci(512)} : index")
     b("    %xo = index.add %xo0, %xl16 : index")
-    xvs, xsums = [], []
-    for j in range(T):
-        xo = "%xo"
-        if j:
-            b(f"    %xo{tk[j]} = index.add %xo, {e.ci(j * K)} : index")
-            xo = f"%xo{tk[j]}"
-        xvs.append(ld("%xv", K * T, xo, "", "xa" + tk[j], 16, "f32"))   # (not "xv": that would shadow the view)
-        b(f"    %xsum{tk[j]} = vector.reduce<addf> {xvs[j]}, %zf : vector<16xf32>, f32")
-        xsums.append(f"%xsum{tk[j]}")
+    xa = ld("%xv", K, "%xo", "", "xa", 16, "f32")   # (not "xv": that would shadow the view)
+    b(f"    %xsum = vector.reduce<addf> {xa}, %zf : vector<16xf32>, f32")
     nxt = [None] * len(accs)
     for i, f in enumerate(fmts):
         for r in range(R):
@@ -754,15 +710,13 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             b(f"    %{p}bo = index.add %f{i}base{r}, %{p}to : index")
             q, scale, offs = decode_w(f, S[i], p, f"%wv{i}", f"%wh{i}", wnb[i], f"%{p}bo", f"f{i}")
             b(f"    %{p}qf = vector.uitofp {q} : vector<16xi8> to vector<16xf32>")
-            for j in range(T):
-                pj = p + tk[j]
-                b(f"    %{pj}pr = vector.mulf %{p}qf, {xvs[j]} : vector<16xf32>")
-                b(f"    %{pj}dot = vector.reduce<addf> %{pj}pr, %zf : vector<16xf32>, f32")
-                b(f"    %{pj}sd = scalar.mulf {scale}, %{pj}dot : f32")
-                b(f"    %{pj}ox = scalar.mulf {offs}, {xsums[j]} : f32")
-                b(f"    %{pj}c = scalar.subf %{pj}sd, %{pj}ox : f32")
-                b(f"    %{pj}n = scalar.addf %a{i}_{r}{tk[j]}, %{pj}c : f32")
-                nxt[(j * nw + i) * R + r] = f"%{pj}n"
+            b(f"    %{p}pr = vector.mulf %{p}qf, {xa} : vector<16xf32>")
+            b(f"    %{p}dot = vector.reduce<addf> %{p}pr, %zf : vector<16xf32>, f32")
+            b(f"    %{p}sd = scalar.mulf {scale}, %{p}dot : f32")
+            b(f"    %{p}ox = scalar.mulf {offs}, %xsum : f32")
+            b(f"    %{p}c = scalar.subf %{p}sd, %{p}ox : f32")
+            b(f"    %{p}n = scalar.addf %a{i}_{r}, %{p}c : f32")
+            nxt[i * R + r] = f"%{p}n"
     b(f"    scf.yield {', '.join(nxt)} : {', '.join(['f32'] * len(accs))}")
     b("  }")
     if peel:
@@ -779,41 +733,29 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
             b(f"  {tg}s = scalar.addf {cur}, {tg}f : f32")
             cur = f"{tg}s"
         tot.append(cur)
-    if rot:   # the rotation's awq / sign loads beside the stores (gen_rot.block_rot_pre)
-        b(f"  %rblk = index.div %wg, {e.ci(256 // rows_wg)} : index")
-        gen_rot.block_rot_pre(b, "rr", "%rblk", "%tid", M, "%rav", "%rsv")
     b(f"  %is0 = index.cmp eq, %lane, {e.ci(0)} : index")
     b("  scf.if %is0 {")
-    for j in range(T):
-        tt = tot[j * nw * R:(j + 1) * nw * R]
-        for r in range(R):
-            rj = f"{r}{tk[j]}"
-            oc = f"%orc{r}"
-            if not j:
-                b(f"    %orow{r} = index.add %row0, {e.ci(r)} : index")
-                b(f"    %orc{r} = index.min %orow{r}, {e.ci(M - 1)} : index")
-            else:
-                b(f"    %orc{rj} = index.add %orc{r}, {e.ci(j * M)} : index")
-                oc = f"%orc{rj}"
-            if kind == "plain":
-                v = tt[r]
-            elif kind == "resid":
-                b(f"    %old{rj} = view.load %yv[{oc}] : view<{M * T}xf32> -> f32")
-                b(f"    %new{rj} = scalar.addf %old{rj}, {tt[r]} : f32")
-                v = f"%new{rj}"
-            else:
-                g, u = tt[r], tt[R + r]
-                b(f"    %ng{rj} = scalar.negf {g} : f32")
-                b(f"    %eg{rj} = scalar.expf<afn> %ng{rj} : f32")
-                b(f"    %dg{rj} = scalar.addf %eg{rj}, {e.cs(1.0, 'f32')} : f32")
-                b(f"    %sg{rj} = scalar.divf {e.cs(1.0, 'f32')}, %dg{rj} : f32")
-                b(f"    %gs{rj} = scalar.mulf {g}, %sg{rj} : f32")
-                b(f"    %sw{rj} = scalar.mulf %gs{rj}, {u} : f32")
-                v = f"%sw{rj}"
-            b(f"    view.store {v}, %yv[{oc}] : f32, view<{M * T}xf32>")
+    for r in range(R):
+        oc = f"%orc{r}"
+        b(f"    %orow{r} = index.add %row0, {e.ci(r)} : index")
+        b(f"    %orc{r} = index.min %orow{r}, {e.ci(M - 1)} : index")
+        if kind == "plain":
+            v = tot[r]
+        elif kind == "resid":
+            b(f"    %old{r} = view.load %yv[{oc}] : view<{M}xf32> -> f32")
+            b(f"    %new{r} = scalar.addf %old{r}, {tot[r]} : f32")
+            v = f"%new{r}"
+        else:
+            g, u = tot[r], tot[R + r]
+            b(f"    %ng{r} = scalar.negf {g} : f32")
+            b(f"    %eg{r} = scalar.expf<afn> %ng{r} : f32")
+            b(f"    %dg{r} = scalar.addf %eg{r}, {e.cs(1.0, 'f32')} : f32")
+            b(f"    %sg{r} = scalar.divf {e.cs(1.0, 'f32')}, %dg{r} : f32")
+            b(f"    %gs{r} = scalar.mulf {g}, %sg{r} : f32")
+            b(f"    %sw{r} = scalar.mulf %gs{r}, {u} : f32")
+            v = f"%sw{r}"
+        b(f"    view.store {v}, %yv[{oc}] : f32, view<{M}xf32>")
     b("  }")
-    if rot:
-        rot_tail(b, e, M, rows_wg)
     if amax:
         assert kind == "plain"
         amax_tail(b, e, M, R, W, tot)
@@ -825,7 +767,7 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
     # ---- assemble ----
     out = []
     o = out.append
-    o(f"// GENERATED by tools/gen_gemv.py ({kind} {'/'.join(fmts)} M={M} K={K} R={R} W={W}{f' T={T}' if T > 1 else ''})"
+    o(f"// GENERATED by tools/gen_gemv.py ({kind} {'/'.join(fmts)} M={M} K={K} R={R} W={W})"
       " -- edit the generator.")
     o("amdgpu.target<gfx1151> @gv32 {subgroup_size = 32}")
     o("")
@@ -835,7 +777,6 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
     o(f"  %wgs = index.constant {32 * W} : index")
     o("  kernel.launch.config workgroups(%nwg, %u1, %u1) workgroup_size(%wgs, %u1, %u1) : index")
     params = [f"%w{i}: buffer" for i in range(nw)] + [f"%{t}: buffer" for t in tabs] + ["%x: buffer", "%y: buffer"]
-    params += ["%rawq: buffer", "%rsg: buffer", "%rcnt: buffer"] if rot else []
     params += ["%ak: buffer", "%atok: buffer"] if amax else []
     o(f"}} launch({', '.join(params)}) {{")
     o("  %base = index.constant 0 : offset")
@@ -848,16 +789,12 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, rot=F
     for t in tabs:
         ty, n = TABLES[t]
         o(f"  %t_{t} = buffer.view %{t}_na[%base] : buffer -> view<{n}x{ty}>")
-    o(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{K * T}xf32>")
-    o(f"  %yv = buffer.view %y_na[%base] : buffer -> view<{M * T}xf32>")
+    o(f"  %xv = buffer.view %x_na[%base] : buffer -> view<{K}xf32>")
+    o(f"  %yv = buffer.view %y_na[%base] : buffer -> view<{M}xf32>")
     if amax:
         o("  %akv = buffer.view %ak_na[%base] : buffer -> view<2xi64>")
         o("  %acv = buffer.view %ak_na[%base] : buffer -> view<4xi32>")
         o("  %atv = buffer.view %atok_na[%base] : buffer -> view<1xi32>")
-    if rot:
-        o(f"  %rav = buffer.view %rawq_na[%base] : buffer -> view<{M}xf32>")
-        o("  %rsv = buffer.view %rsg_na[%base] : buffer -> view<512xf32>")
-        o(f"  %rcv = buffer.view %rcnt_na[%base] : buffer -> view<{M // 256}xi32>")
     if "iq4xs" in fmts or "iq4nl" in fmts:
         o("\n".join(f"  %kvu{i} = scalar.constant {v + 128 - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)))
         o("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
@@ -984,15 +921,6 @@ def amax_tail(b, e, M, R, W, tot):
     b("  }")
 
 
-def rot_tail(b, e, M, rows_wg):
-    """gen rot: the block's last workgroup (gen_rot.last_arriver) rotates it in place (gen_rot.block_rot_post)."""
-    assert M % 256 == 0 and 256 % rows_wg == 0
-    last = gen_rot.last_arriver(b, "rl", "%rcv", f"view<{M // 256}xi32>", "%rblk", 256 // rows_wg, "%tid")
-    b(f"  %rln = index.cmp ult, %tid, {e.ci(16)} : index")
-    b(f"  %rgo = scalar.andi {last}, %rln : i1")
-    gen_rot.block_rot_post(b, "rr", "%rgo", "%yv", "%yv", M)
-
-
 _SHARED = re.compile(r"%(c[iwbf]\w*|ws\w*|sv\w*|kvtu|t_\w+|xv)$")
 
 
@@ -1092,13 +1020,13 @@ def footprint_bands(fmts, Ms, K):
     return sizes + [K * 4] + [M * 4 for M in Ms]
 
 
-def footprint(kind, fmts, M, K, T=1):
+def footprint(kind, fmts, M, K):
     """Exact binding sizes in bytes, in binding order (weights, tables, x, y)."""
     sizes = [row_bytes(f, K) * M for f in fmts]
     for t in tables_for(fmts):
         ty, n = TABLES[t]
         sizes.append(n * (4 if ty == "i32" else 1))
-    return sizes + [K * T * 4, M * T * 4]
+    return sizes + [K * 4, M * 4]
 
 
 if __name__ == "__main__":

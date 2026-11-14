@@ -27,8 +27,8 @@ struct MemoryPlan {
   [[nodiscard]] bool fits() const { return need() + kReserve <= available; }
 
   // model: the model file; decode_hal: its decode set (context and KV format); npu_set: the prefill set whose NPU split
-  // runs, empty without the NPU; mtp: drafting with the MTP layer.
-  static MemoryPlan For(const std::string& model, const std::string& decode_hal, const std::string& npu_set, bool mtp) {
+  // runs, empty without the NPU.
+  static MemoryPlan For(const std::string& model, const std::string& decode_hal, const std::string& npu_set) {
     std::ifstream f(decode_hal + "/decode.txt");
     if (!f) throw LoomError("cannot read " + decode_hal + "/decode.txt: not a decode set (tools/emit_decode.py)");
     std::uint32_t context = 0, kb = 16, vb = 16;
@@ -39,20 +39,20 @@ struct MemoryPlan {
       if (key == "ctx") in >> context;
       if (key == "kv") in >> kind >> kb >> vb;
     }
-    return For(model, context, kb, vb, npu_set, mtp);
+    return For(model, context, kb, vb, npu_set);
   }
   // The same for a context and KV bits (K, V: 16, 8 or 4) before the sets exist.
   static MemoryPlan For(const std::string& model, std::uint32_t context, std::uint32_t kb, std::uint32_t vb,
-                        const std::string& npu_set, bool mtp) {
+                        const std::string& npu_set) {
     MemoryPlan p;
     p.context = context;
     const core::Gguf index = core::Gguf::OpenIndex(model);
     for (const auto& t : index.tensors()) p.weights += t.bytes;
     // Fitted to MemAvailable over a load and 4 requests on gfx1151 (2048-token chunks, verify GEMVs, MTP; 8K and 32K
     // kv8 within 0.15 GB): what grows with the context is the KV pools (K and V of 16 layers x 1024 per token, at the
-    // format's bits plus scales), f32 / f16 attention scratch and the MTP layer's f16 KV.
+    // format's bits plus scales) and f32 / f16 attention scratch. (The fit had the MTP layer's KV too: a margin now.)
     const std::uint64_t kv = 16ull * 1024 * (kb + vb) / 8 * 33 / 32;
-    p.buffers = kFixed + std::uint64_t{p.context} * (kv + kScratchPerToken + (mtp ? kMtpPerToken : 0));
+    p.buffers = kFixed + std::uint64_t{p.context} * (kv + kScratchPerToken);
     if (!npu_set.empty()) {  // the NPU's own rows, read into memory (pre-decoded and transcoded: npu_bfp_*, npu_ix4_*)
       std::error_code ec;
       for (const auto& e : std::filesystem::directory_iterator(npu_set, ec)) {
@@ -86,7 +86,7 @@ struct MemoryPlan {
 
  private:
   // kFixed: the chunk-sized buffers, state snapshots, the host side (~1.1 GB resident) and HRX's own memory
-  static constexpr std::uint64_t kFixed = 3600ull << 20, kScratchPerToken = 19500, kMtpPerToken = 4096, kNpuFixed = 0;
+  static constexpr std::uint64_t kFixed = 3600ull << 20, kScratchPerToken = 19500, kNpuFixed = 0;
 };
 
 }  // namespace yah::model

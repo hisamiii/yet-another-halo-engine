@@ -58,7 +58,7 @@ class Call:
                                                          # 6 (4 - kvn) + 2 (3 g' + p) + 0 / 1); kq / vq
                                                          # [calls][2][mcf][4608 B]
     qlay: int = 0                                        # q only: 0 the split-norm query (R2P_QSPLIT), 1 the raw f16
-                                                         # query [token][24][256] (A4 sets: the attention does the head
+                                                         # query [token][24][256] (split-norm Q off: the attention does the head
                                                          # norm), normed here
 
     @property

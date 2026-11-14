@@ -20,7 +20,7 @@ ROOT = HERE.parents[1]
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="the HFQ model file")
+    parser.add_argument("--model", required=True, help="the model (a GGUF, or make_tokenizer_fixture.py's cut of one)")
     parser.add_argument(
         "--binary", default=str(ROOT / "engine" / "build" / "yah-tokenize"))
     parser.add_argument("--goldens", default=str(HERE / "tokenizer_goldens.json"))

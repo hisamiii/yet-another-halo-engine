@@ -49,18 +49,11 @@ class Engine : public TextGenerator {
     // The NPU computes the trailing rows of the split GEMMs of a prefill set that has an NPU split
     // (emit_prefill_pp.py YAH_NPU_SPLIT). Off, or not ready (NpuProblem), the GPU runs everything.
     bool npu = false;
-    // Speculative decoding of greedy requests: "mtp" drafts with the model's MTP layer (a GGUF with blk.<n>.nextn.*)
-    // and verifies with the decode set's T-token GEMVs (emit_decode.py VERIFY); "off". draft_len: tokens per draft,
-    // 0 adapts it to the acceptance (up to the verify width - 1).
-    std::string draft = "off";
-    std::uint32_t draft_len = 0;
     bool reuse = true;  // keep the last sequence's KV and state snapshots for a prompt that extends it
   };
   // How the tokens after the last whole chunk are run.
   enum class Tail { kAuto, kChunk, kDecode };
   void set_tail(Tail t) { tail_ = t; }
-  // Speculative decoding for the next requests, if Options::draft set it up (draft_status() empty).
-  void set_draft(bool on) { draft_on_ = on; }
 
   explicit Engine(const Options& o)
       : t0_(std::chrono::steady_clock::now()),
@@ -68,7 +61,7 @@ class Engine : public TextGenerator {
         gguf_(core::Gguf::OpenResident(o.model)),
         cfg_(core::Qwen35Config::FromGguf(gguf_)),
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
-        weights_(gpu_, gguf_, {}, NpuInPlace(o)),
+        weights_(gpu_, gguf_, MtpLayer(cfg_), NpuInPlace(o)),
         prefill_(gpu_, gguf_, cfg_, o.prefill_hal, weights_),
         decoder_(gpu_, gguf_, cfg_, o.decode_hal, weights_) {
     if (decoder_.context() != prefill_.pool_rows())
@@ -88,24 +81,9 @@ class Engine : public TextGenerator {
     const void* th = nullptr;
     tokens_mirror_ = gpu_.AllocateHost((std::size_t{decoder_.context()} + 1) * 4, &th);
     tokens_host_ = static_cast<const std::uint32_t*>(th);
-    guess_ = gpu_.AllocateHost(4, &th);
-    guess_host_ = static_cast<const std::uint32_t*>(th);
     const core::MetadataValue* name = gguf_.Meta("general.name");
     name_ = name && !name->s.empty() ? name->s : "qwen3.8-27b";
     if (o.npu) StartNpu(o);
-    if (o.draft == "mtp") {
-      if (!decoder_.has_mtp())
-        draft_status_ = "the model has no MTP layer (a GGUF with blk.N.nextn.*) or the decode set no MTP kernels";
-      else if (decoder_.verify_tokens() < 2)
-        draft_status_ = "the decode set has no verify GEMVs (emit_decode.py VERIFY)";
-      else if (decoder_.verify_tokens() > LoomDecoder::kMaxVerify)
-        draft_status_ = "the decode set's verify width is past " + std::to_string(LoomDecoder::kMaxVerify);
-      else
-        draft_status_.clear(), draft_len_ = std::min(o.draft_len ? o.draft_len : 0xffu, decoder_.verify_tokens() - 1),
-                               draft_auto_ = o.draft_len == 0;
-    } else if (o.draft != "off") {
-      throw LoomError("engine: unknown draft mode " + o.draft + " (mtp, off)");
-    }
     load_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count();
   }
   // The memory estimate (checked before the load) and what the GPU holds: a line for the log.
@@ -118,8 +96,6 @@ class Engine : public TextGenerator {
   }
   ~Engine() override { gpu_.Synchronize(); }  // (the graphs wait on NPU words: none may run past npu_)
 
-  // Why speculative decoding is off ("" when it runs, "off" when not asked for).
-  [[nodiscard]] const std::string& draft_status() const { return draft_status_; }
   // Why the NPU block is off ("" when it runs).
   [[nodiscard]] const std::string& npu_status() const { return npu_status_; }
 
@@ -233,14 +209,6 @@ class Engine : public TextGenerator {
     std::deque<LoomEvent> made;
     made.push_back(MarkToken(n));
     auto t1 = std::chrono::steady_clock::now();
-    if (draft_status_.empty() && draft_on_ && greedy && !decoder_.penalized()) {
-      gpu_.Wait(made.front());
-      if (tail_steps) Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
-      r.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-      Speculate(r, n, params, on_token, ys);
-      return r;
-    }
-
     // Decode: report each token, then run the step that consumes it.
     r.finish_reason = "length";
     std::uint32_t queued = n;  // the next step to queue
@@ -298,6 +266,11 @@ class Engine : public TextGenerator {
     npu_status_ = "this build has no NPU support (build against an HRX with the xdna targets)";
 #endif
   }
+  // LoomWeights' skip: the MTP layer (blk.<main blocks>.*), which nothing reads
+  static std::function<bool(const std::string&)> MtpLayer(const core::Qwen35Config& cfg) {
+    const std::string pre = "blk." + std::to_string(cfg.main_block_count()) + ".";
+    return [pre](const std::string& n) { return n.starts_with(pre); };
+  }
   // --npu with the NPU ready: the GPU reads the model's resident copy in place (LoomWeights in_place: the NPU reads
   // its rows through host pointers)
   static bool NpuInPlace(const Options& o) {
@@ -322,103 +295,6 @@ class Engine : public TextGenerator {
   // The prefill slot sits this many tokens short of the prompt's end: the next turn's history replaces the assistant
   // header's tail (<think> and the like).
   static constexpr std::uint32_t kMargin = 32;
-  // Greedy decode by draft and verify rounds (Options::draft). Token n (toks[n]) is known. A plain step at n gives
-  // the first draft its hidden state; each round then drafts k tokens with the MTP layer after token q (into the
-  // token stream), verifies q and the drafts in one pass, keeps the drafts up to the first the model disagrees with
-  // and the model's own token after them (the next round's q). A verify never runs past a chunk boundary, so the
-  // decode slot (Save) lands on one. k = 0 is a plain step, after an MTP draft that keeps the MTP layer's KV whole
-  // and whose guess still measures the acceptance.
-  // Draft length (auto): the k with the most tokens per ms, E(k) / cost(k), E(k) = 1 + p + .. + p^k for the measured
-  // acceptance p of a draft token, cost(k) the measured time of a round with k drafts.
-  void Speculate(GenerateResult& r, std::uint32_t n, const GenerateParams& params,
-                 const std::function<bool(core::TokenId)>& on_token, int ys) {
-    const auto t1 = std::chrono::steady_clock::now();
-    const std::uint32_t B = prefill_.chunk(), T = decoder_.context(), limit = n + params.max_tokens;
-    r.finish_reason = "length";
-    // false: stop here (a stop id, on_token, or max_tokens)
-    const auto report = [&](core::TokenId tok) {
-      if (tok >= LoomDecoder::kVocab) throw LoomError("decoder: token id out of range: " + std::to_string(tok));
-      seq_.push_back(tok);
-      if (std::find(params.stop_ids.begin(), params.stop_ids.end(), tok) != params.stop_ids.end()) {
-        r.finish_reason = "stop";
-        return false;
-      }
-      ++r.generated_tokens;
-      if (!on_token(tok)) {
-        r.finish_reason = "stop";
-        return false;
-      }
-      return r.generated_tokens < params.max_tokens;
-    };
-    core::TokenId cur = __atomic_load_n(&tokens_host_[n], __ATOMIC_ACQUIRE);
-    if (report(cur) && n + 1 < limit && n + 1 < T) {
-      decoder_.Step(n, n);
-      if (reuse_ && (n + 1) % B == 0) Save(ys, n + 1, decoder_.conv_state());
-      decoder_.MtpBegin();
-      decoder_.MtpHidden(decoder_.MainHidden());
-      std::uint32_t q = n + 1;
-      gpu_.Synchronize();
-      cur = decoder_.Tokens(q, q + 1)[0];
-      while (report(cur) && q + 1 < limit && q + 1 < T) {
-        // k drafts, at most to the chunk boundary, the token budget and the context
-        const std::uint32_t edge = std::min({(q / B + 1) * B, limit, T});
-        const std::uint32_t kmax = std::min(draft_len_, edge - q - 1);
-        const std::uint32_t k = draft_auto_ ? DraftLength(kmax) : kmax;
-        const std::uint32_t v = q - (n + 1);  // the MTP layer's position
-        const auto t0 = std::chrono::steady_clock::now();
-        std::uint32_t m = 0, tested = 1;
-        bool more = true;
-        if (k == 0) {
-          decoder_.Draft(q, v);
-          gpu_.Copy(decoder_.TokenRef(q + 1), Ref(guess_));
-          decoder_.Step(q, q);
-          decoder_.MtpHidden(decoder_.MainHidden());
-          gpu_.Synchronize();
-          cur = decoder_.Tokens(q + 1, q + 2)[0];
-          m = __atomic_load_n(guess_host_, __ATOMIC_ACQUIRE) == cur ? 1 : 0;  // (scored, not kept)
-          if (reuse_ && (q + 1) % B == 0) Save(ys, q + 1, decoder_.conv_state());
-          q += 1;
-        } else {
-          for (std::uint32_t j = 0; j < k; ++j) decoder_.Draft(q + j, v + j);
-          decoder_.Verify(q, k + 1);
-          gpu_.Synchronize();
-          const std::vector<std::uint32_t> got = decoder_.VerifyResult(k + 1);
-          const std::vector<std::uint32_t> draft = decoder_.Tokens(q + 1, q + k + 1);
-          while (m < k && draft[m] == got[m]) ++m;
-          tested = std::min(m + 1, k);
-          decoder_.Accept(m);
-          decoder_.SetTokens(&got[m], 1, q + m + 1);
-          if (reuse_ && (q + m + 1) % B == 0) Save(ys, q + m + 1, decoder_.conv_state());
-          decoder_.MtpHidden(decoder_.VerifyHidden(m));
-          r.drafted += k, r.accepted += m;
-          for (std::uint32_t i = 0; i < m && more; ++i) more = report(draft[i]);
-          q += m + 1;
-          cur = got[m];
-        }
-        // the acceptance and this round's cost (synced: the round's GPU work included)
-        accept_n_ = 0.95 * accept_n_ + m, accept_d_ = 0.95 * accept_d_ + tested;
-        Track(round_ms_[k], std::chrono::steady_clock::now() - t0, true);
-        if (!more) break;
-      }
-    }
-    gpu_.Synchronize();
-    r.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
-    for (Snapshot& s : snaps_)
-      if (s.at > seq_.size()) s.at = 0;
-  }
-  // The draft length up to kmax with the most expected tokens per ms (Speculate).
-  [[nodiscard]] std::uint32_t DraftLength(std::uint32_t kmax) const {
-    const double p = std::clamp(accept_n_ / accept_d_, 0.0, 0.99);
-    std::uint32_t best = 0;
-    double best_rate = 0.0, e = 0.0, pk = 1.0;
-    for (std::uint32_t k = 0; k <= kmax; ++k, pk *= p) {
-      e += pk;
-      const double rate = e / round_ms_[k];
-      if (rate > best_rate) best = k, best_rate = rate;
-    }
-    return best;
-  }
-
   // The recurrent state at sequence position at (0: empty); the KV rows below it stay in the pools.
   struct Snapshot {
     LoomBuffer conv, delta;
@@ -455,7 +331,7 @@ class Engine : public TextGenerator {
   }
 
   static MemoryPlan Plan(const Options& o) {
-    MemoryPlan p = MemoryPlan::For(o.model, o.decode_hal, o.npu ? o.prefill_hal : "", o.draft == "mtp");
+    MemoryPlan p = MemoryPlan::For(o.model, o.decode_hal, o.npu ? o.prefill_hal : "");
     if (!p.fits())
       throw LoomError("engine: not enough memory: " + p.Describe() +
                       "; close other programs, or use sets with a smaller context or KV format");
@@ -477,15 +353,6 @@ class Engine : public TextGenerator {
   std::unique_ptr<LoomNpuSplit> npu_;  // (destroyed before the prefill that points at it)
 #endif
   std::string npu_status_ = "off";
-  std::string draft_status_ = "off";
-  // Speculate's measurements: the decayed accepted / scored draft tokens, the time of a round by draft length
-  // (priors: a step 62 ms, a draft 4 ms, a verify 85 ms + 5 ms a token; measured on gfx1151, refined as it runs)
-  double accept_n_ = 3.0, accept_d_ = 5.0;
-  double round_ms_[LoomDecoder::kMaxVerify] = {66.0, 98.0, 107.0, 116.0, 125.0, 134.0, 143.0, 152.0};
-  LoomBuffer guess_;  // the MTP layer's guess on a plain step (Speculate)
-  const std::uint32_t* guess_host_ = nullptr;
-  std::uint32_t draft_len_ = 0;  // the draft length cap (auto) or the fixed length
-  bool draft_auto_ = false, draft_on_ = true;
   LoomBuffer logits_, seed_;
   LoomBuffer tokens_mirror_;                    // host-local copy of the decoder's token stream (MarkToken)
   const std::uint32_t* tokens_host_ = nullptr;  // its mapping

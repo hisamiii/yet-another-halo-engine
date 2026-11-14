@@ -59,8 +59,6 @@ QDIRECT = None    # None: follow Q16
 # of its row (both 128-dim halves for the sum, its own half for the values: 16 RoPE pairs per lane half) and trades
 # subtree sums and finished fragments with its xor-16 partner. Same bits as RoPE + rope_q16; RoPE then does K / V only.
 QNORM = False
-# QG16: q and gate arrive as f16 (the kqg GEMM's f16 epilogue, emit_prefill_pp.QG16); with QNORM the prologue widens q
-QG16 = False
 QX_OFF = 0          # QNORM: LDS offset of the sums slot (set by gen)
 QW_OFF = 0          # R2P_QPF: LDS offset of the norm weights (set by gen)
 # PIPE2_EARLY: the QK of tile j+1 goes in before the softmax's rescale branch (its loads stay after it: a branch join
@@ -325,16 +323,6 @@ def ksplit_floats():
     P.V lanes x 132"""
     return ((PERSIST - 1) * KSPLIT + npu_units()) * 32 * NQB * 132
 PDYN_ZZ_BELOW = int(os.environ.get("R2P_ZZ_BELOW", "8192"))
-# OCNT: binding ocnt (after the others): after a workgroup barrier lane 0 adds 1 to counter c tt + t (release) for
-# 1024-feature chunk c and 128-token tile t of its output, tt = token_count / 128 (ocnt_need workgroups per counter),
-# so a flag-waiting rotq (gen_rot.gen_qp flag) runs without a graph barrier behind this kernel (every lane adding,
-# as the GEMMs do, made the kernel ~4% slower)
-OCNT = False
-
-
-def ocnt_need():
-    """The lanes adding to one OCNT counter: query blocks per 128-token tile x workgroups per 1024-feature chunk."""
-    return (128 // QT) * (1024 // (256 * HPW))
 DOWHILE_MAIN = False   # the same for the head_dim-split loop (measured neutral)
 # SOFT1..4 (measured, not adopted, docs/results.md): keep the head_dim split and run the softmax in wave A only, P^T and
 # alpha through LDS. Bit-identical, -35% VALU, but the waiting partner raises barrier idle: +1.4..+4.4% at 126K.
@@ -572,7 +560,7 @@ def qnorm_phase1(e):
         e(f"  %qo{n} = index.constant {n} : index")
     if R2P_QSPLIT:
         return qsplit_phase1(e, nown), lambda: None
-    vecs = qnorm_load(e, "qxv", "%q_flat", "%qtot", "%qnb", range(nown), QG16 or "q16" in R2P_DIAG)
+    vecs = qnorm_load(e, "qxv", "%q_flat", "%qtot", "%qnb", range(nown), "q16" in R2P_DIAG)
     own = [[f"%qx{k}e{j}" for j in range(16)] for k in range(nown)]
     return own, lambda: qnorm_sums(e, vecs, nown)
 
@@ -1311,7 +1299,7 @@ def gen():
             # Only them: a QK lane aliases a P.V lane's record (tid % 256), and its merged stores over piece 0 raced the
             # P.V wave's loads of it (fragments merged twice, per wave and fragment; measured on the chain run)
             e("    %kplast = scalar.andi %isB, %isB : i1")
-        # gen_rot.last_arriver: release barrier, lane 0's device add (monotonic: last when old % K == K - 1), acquire
+        # the last-arriver count: release barrier, lane 0's device add (monotonic: last when old % K == K - 1), acquire
         if not ksm:
             e("    kernel.barrier<global> scope(workgroup) ordering(acq_rel)")
             e("    %kpfb = index.constant 4 : offset")
@@ -1483,7 +1471,7 @@ def gen():
     e("  %tp = index.add %token_count, %cqt1 : index")
     e("  %qblocks = index.div %tp, %cqt : index")
     if PERSIST:
-        assert not (KVMAJOR or OCNT or (PERSIST_REV and QB_ZIGZAG)) and (PERSIST_DYN or not KVG)
+        assert not (KVMAJOR or (PERSIST_REV and QB_ZIGZAG)) and (PERSIST_DYN or not KVG)
         assert not (PERSIST_DYN and (PERSIST_REV or QB_ZIGZAG))
         e(f"  %cpst = index.constant {PERSIST} : index")
         e("  kernel.launch.config workgroups(%cpst, %c1, %c1) workgroup_size(%cnt, %c1, %c1) : index")
@@ -1493,7 +1481,7 @@ def gen():
       + (", %kscale: buffer" if KDEC else "")
       + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "")
       + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + (", %kscale: buffer" if KRAW else "")
-      + (", %ocnt: buffer" if OCNT else "") + (", %pqueue: buffer" if PERSIST and PERSIST_DYN else "")
+      + (", %pqueue: buffer" if PERSIST and PERSIST_DYN else "")
       + (", %ksplit: buffer" if KS else "") + (", %npuo: buffer, %npuq: buffer" if NPU and ksm2 else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
@@ -1540,10 +1528,8 @@ def gen():
         e("  %kscn = index.mul %pcap, %c8 : index")
         e("  %ksc_view = buffer.view %ksc_na[%base] : buffer -> view<[%kscn]xf16>")
     e("  %q_na, %g_na, %k_na, %v_na, %o_na = buffer.assume.noalias %query, %gate, %key_cache, %value_cache, %output : buffer, buffer, buffer, buffer, buffer")
-    if OCNT:   # without it the atomic may alias every input: their scalar loads become vector loads, the code shifts
-        e("  %oc_na = buffer.assume.noalias %ocnt : buffer")
     # (diag q16: f16 q only, the gate as configured: the Q bytes' share of the prologue; wrong values)
-    q16 = Q16 and (not QNORM or QG16 or "q16" in R2P_DIAG or R2P_QSPLIT)
+    q16 = Q16 and (not QNORM or "q16" in R2P_DIAG or R2P_QSPLIT)
     e(f"  %q_flat = buffer.view %q_na[%base] : buffer -> view<[%qtot]x{'f16' if q16 else 'f32'}>")
     if R2P_QSPLIT:
         e("  %qsp_c1536 = index.constant 1536 : index")
@@ -1558,7 +1544,7 @@ def gen():
         e("  %qss_o = index.cast %qss_oi : index to offset")
         e("  %qr_flat = buffer.view %q_na[%qrb_o] : buffer -> view<[%qrtot]xf32>")
         e("  %qs_flat = buffer.view %q_na[%qss_o] : buffer -> view<[%qsstot]xf32>")
-    e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if QG16 or GSIG16 else 'f32'}>")
+    e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if GSIG16 else 'f32'}>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
     if "stamp" in R2P_DIAG:   # diag: progress records in the gate buffer (wrong gate; see the QK loop)
         e("  %st_v = buffer.view %g_na[%base] : buffer -> view<262144xi32>")
@@ -4177,7 +4163,7 @@ def gen():
         e(f"  %eo{f}b = index.add %eo{f}, %c4 : index")
 
     def gate_load(f):
-        if QG16 or GSIG16:
+        if GSIG16:
             e(f"  %eg{f}h = vector.load %g_flat[%eo{f}] : view<[%qtot]xf16> -> {V8H}")
             return
         e(f"  %eg{f}a = vector.load %g_flat[%eo{f}] : view<[%qtot]xf32> -> {V4}")
@@ -4290,10 +4276,7 @@ def gen():
             e(f"  %eqe{f} = vector.fmaf %eq{f}, %enls8{bs}, %og{f} : {V8}")
             e(f"  %eout{f} = vector.fmaf %eqe{f}, %elr8{bs}, %eq{f} : {V8}")
         else:
-            if QG16:
-                e(f"  %eg{f} = vector.extf %eg{f}h : {V8H} to {V8}")
-            else:
-                e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
+            e(f"  %eg{f} = vector.concat<0> %eg{f}a, %eg{f}b : {V4}, {V4} -> {V8}")
             e(f"  %egn{f} = vector.negf %eg{f} : {V8}")
             e(f"  %egm{f} = vector.mulf %egn{f}, %nlog2e8 : {V8}")
             e(f"  %egx{f} = vector.exp2f<afn> %egm{f} : {V8}")
@@ -4332,26 +4315,6 @@ def gen():
         if not gpf:
             e("  }")
     if gpf:
-        e("  }")
-    if OCNT:
-        assert not TILED_OUT and 128 % QT == 0 and 1024 % (256 * HPW) == 0
-        e(f"  %oc_qpt = index.constant {128 // QT} : index")
-        e(f"  %oc_ppc = index.constant {1024 // (256 * HPW)} : index")
-        e("  %oc_t = index.div %qb, %oc_qpt : index")
-        e("  %oc_c = index.div %hp, %oc_ppc : index")
-        e("  %oc_tt = index.div %B, %c128 : index")
-        e("  %oc_i0 = index.mul %oc_c, %oc_tt : index")
-        e("  %oc_i = index.add %oc_i0, %oc_t : index")
-        e("  %oc_nc = index.div %npairs, %oc_ppc : index")
-        e("  %oc_n = index.mul %oc_nc, %oc_tt : index")
-        e("  %oc_one = scalar.constant 1 : i32")
-        e("  %oc_v = buffer.view %oc_na[%base] : buffer -> view<[%oc_n]xi32>")
-        # every wave's O stores before lane 0's add; release only: an acquiring barrier marks global memory as
-        # interfered, so every input's scalar loads would become vector loads (the whole kernel's code shifts)
-        e("  kernel.barrier<global> scope(workgroup) ordering(release)")
-        e("  %oc_l0 = index.cmp eq, %tid, %c0 : index")
-        e("  scf.if %oc_l0 {")
-        e("    view.atomic.reduce<addi> %oc_one, %oc_v[%oc_i] {ordering = release, scope = device} : i32, view<[%oc_n]xi32>")
         e("  }")
     if PERSIST and PERSIST_DYN:
         if not STEER:

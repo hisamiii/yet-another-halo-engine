@@ -9,13 +9,14 @@ chain(src) adds three i32 launch arguments and one buffer to a 1-D Loom kernel:
 Wave 0 polls cnt[ws] until (cnt - need) >= 0 as i32 (wrap-safe), the other waves wait at the barrier, then the
 workgroup acquires (device scope). The host dispatches chained kernels without the ordering barrier; the queue
 launches workgroups in order, so a waiting workgroup never blocks its producer.
-A lost signal costs one bound of polls per workgroup (gen_rot.FLAG_POLLS, ~0.2 s), not a hang.
+A lost signal costs one bound of polls per workgroup (FLAG_POLLS, ~0.2 s), not a hang.
 """
 import re
 
-import gen_rot
-
 CHAIN_SLOTS = 1024
+# Polls before a waiting kernel gives up (~0.2 s; a real wait is one producer workgroup, ~0.5 ms): a lost producer
+# flag costs one bound per workgroup, not a hang or a ring timeout.
+FLAG_POLLS = 200_000
 
 
 def chain(src):
@@ -40,7 +41,7 @@ def chain(src):
         "  %ch_c32 = index.constant 32 : index",
         "  %ch_zero = scalar.constant 0 : i32",
         "  %ch_one = scalar.constant 1 : i32",
-        f"  %ch_limit = scalar.constant {gen_rot.FLAG_POLLS} : i32",
+        f"  %ch_limit = scalar.constant {FLAG_POLLS} : i32",
         f"  %ch_mask = scalar.constant {CHAIN_SLOTS - 1} : i32",
         "  %ch_wsm = scalar.andi %ch_ws, %ch_mask : i32",
         "  %ch_ssm = scalar.andi %ch_ss, %ch_mask : i32",

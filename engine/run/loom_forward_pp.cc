@@ -153,15 +153,7 @@ int main(int argc, char** argv) {
     lt = n;
   };
   try {
-    // a native set (emit_prefill_pp.py YAH_NATIVE=1) runs the GGUF's own formats
-    const bool native = [&] {
-      std::ifstream f(std::string(argv[2]) + "/dispatch.txt");
-      for (std::string row; std::getline(f, row);)
-        if (row.rfind("native ", 0) == 0) return true;
-      return false;
-    }();
-    lap("set kind");
-    auto gguf = yah::core::Gguf::OpenResident(argv[1], native);
+    auto gguf = yah::core::Gguf::OpenResident(argv[1]);
     lap("model");
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
     std::vector<std::uint32_t> ids = ParseIds(ids_path);
@@ -169,14 +161,14 @@ int main(int argc, char** argv) {
     lap("device");
     // The layers queue ~950 dispatches and wait once: the runtime wait would busy-poll a host core the whole time.
     gpu.SetSleepSync(200);
-    // a native set's prefill reads neither the MTP layer nor token_embd's device copy (Embed stages its rows); the
-    // decode's embed kernel reads token_embd's
+    // the prefill reads neither the MTP layer nor token_embd's device copy (Embed stages its rows); the decode's embed
+    // kernel reads token_embd's
     const std::string mtp = "blk." + std::to_string(cfg.main_block_count()) + ".";
     // --npu: the GPU reads the resident copy in place (the NPU reads its rows through host pointers)
     LoomWeights weights(
         gpu, gguf,
         [&](const std::string& n) {
-          return native && ((n == "token_embd.weight" && opt.gen == 0) || n.starts_with(mtp));
+          return (n == "token_embd.weight" && opt.gen == 0) || n.starts_with(mtp);
         },
         opt.npu);
     lap("weights");

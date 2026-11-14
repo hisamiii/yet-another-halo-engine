@@ -42,9 +42,6 @@ enum class GgmlType : std::uint32_t {
   kF64 = 28,
   kIQ1_M = 29,
   kBF16 = 30,
-  // Not a GGML type: hipfire MQ4G256V2 (HFQ qt 44), 136 B per 256: f16 scale per 128 (4 B pairs), 128 B nibbles.
-  // The HFQ loader stores the nibbles as signed codes (code - 8), so a weight is nibble * scale.
-  kMQ4G256 = 44,
 };
 
 [[nodiscard]] const char* TypeName(GgmlType type);
@@ -72,20 +69,18 @@ struct MetadataValue {
 };
 
 // A read-only, mmapped GGUF file. Weight bytes are not copied: Data() points into the mapping.
-// An HFQ container (hipfire, core/hfq.cpp) opens as the GGUF the engine reads: GGUF names, dims and metadata.
-// OpenResident and OpenIndex present a GGUF model converted the same way (core/gguf_convert.cpp).
+// OpenResident and OpenIndex present it as the engine reads it (core/gguf_convert.cpp).
 class Gguf {
  public:
   static Gguf Open(const std::string& path);
-  // The file read into locked anonymous memory (2 MB pages where the kernel has them) instead of mapped: for a GPU
+  // The file read into anonymous memory (2 MB pages where the kernel has them) instead of mapped: for a GPU
   // that imports the bytes as user pages. Reclaim scans mapped file pages (their large folios escape mlock) and every
   // scan of an imported page evicts all of the process's GPU queues for 0.03-3 s. The memory is writable, so a
-  // device that pins it for writing shares these pages (no copy-on-write copies). Needs RLIMIT_MEMLOCK (a warning
-  // when the kernel refuses the lock).
-  // native (a GGUF): its projections as they are, for the native sets (core/gguf_convert.cpp).
-  static Gguf OpenResident(const std::string& path, bool native = false);
+  // device that pins it for writing shares these pages (no copy-on-write copies). Filled range by range as a device
+  // uploads it (Prepare, Stream).
+  static Gguf OpenResident(const std::string& path);
   // Names, types, dims and metadata only, as the engine sees them: the weights are not read, Data() is unusable.
-  static Gguf OpenIndex(const std::string& path, bool native = false);
+  static Gguf OpenIndex(const std::string& path);
   Gguf(Gguf&& other) noexcept;
   Gguf& operator=(Gguf&& other) noexcept;
   Gguf(const Gguf&) = delete;
@@ -109,30 +104,28 @@ class Gguf {
   // Drops the host pages wholly inside [offset, offset + bytes) of the tensor-data region, once a device holds its own
   // copy: Data() then reads zeros (resident) or the file again (mapped) there.
   void ReleaseData(std::size_t offset, std::size_t bytes);
-  // Before a device copies [offset, offset + bytes) of the tensor-data region: a native resident copy is filled range
-  // by range in offset order (OpenResident native), so the host never holds all of it; otherwise nothing to do.
+  // Before a device copies [offset, offset + bytes) of the tensor-data region: a resident copy is filled range by
+  // range in offset order (OpenResident), so the host never holds all of it; otherwise nothing to do.
   void Prepare(std::size_t offset, std::size_t bytes) {
     if (fill_) fill_(offset, bytes);
   }
-  // The ranges (offset, bytes) a device will Prepare, ascending, before the first: a native resident copy then fills
+  // The ranges (offset, bytes) a device will Prepare, ascending, before the first: a resident copy then fills
   // them on a background thread (the file read straight into the copy) at most one range ahead of Prepare, so the read
   // overlaps the uploads; otherwise nothing to do.
   void Stream(std::vector<std::pair<std::size_t, std::size_t>> ranges) {
     if (stream_) stream_(std::move(ranges));
   }
-  // Rows of a 2-D tensor (as tensors() describes it) into out, rows[i] at i: from the copy, or for a native resident
-  // copy's tensor no device took (never Prepared) straight from the file.
+  // Rows of a 2-D tensor (as tensors() describes it) into out, rows[i] at i: from the copy, or for a resident copy's
+  // tensor no device took (never Prepared) straight from the file.
   void Rows(const TensorInfo& t, const std::uint32_t* rows, std::size_t n, std::uint8_t* out) const;
 
  private:
   Gguf() = default;
   void Close();
-  static Gguf OpenHfq(const std::string& path, bool lock, bool weights = true);
-  // A GGUF with the projections converted to MQ4G256 (core/gguf_convert.cpp); weights false: the table only.
-  static Gguf OpenConverted(const std::string& path, bool weights, bool lock, bool native);
+  // The GGUF as the engine reads it (core/gguf_convert.cpp); weights false: the table only.
+  static Gguf OpenConverted(const std::string& path, bool weights);
   // 2 MB aligned anonymous memory of at least `bytes` (a multiple of 2 MB) for a resident copy.
   static std::uint8_t* Reserve(std::size_t bytes, const std::string& path);
-  void ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) const;
 
   std::uint8_t* base_{nullptr};
   std::size_t size_{0};
@@ -142,9 +135,9 @@ class Gguf {
   std::uint64_t data_offset_{0};
   std::vector<TensorInfo> tensors_;
   std::map<std::string, MetadataValue> meta_;
-  std::function<void(std::size_t, std::size_t)> fill_;   // Prepare's filler (a native resident copy)
+  std::function<void(std::size_t, std::size_t)> fill_;   // Prepare's filler (a resident copy)
   std::function<void(std::vector<std::pair<std::size_t, std::size_t>>)> stream_;   // Stream's (the same copy)
-  // Rows' reader for a native resident copy: (tensor, rows, n, out), false if the tensor is filled (read the copy)
+  // Rows' reader for a resident copy: (tensor, rows, n, out), false if the tensor is filled (read the copy)
   std::function<bool(const TensorInfo&, const std::uint32_t*, std::size_t, std::uint8_t*)> rows_;
 };
 

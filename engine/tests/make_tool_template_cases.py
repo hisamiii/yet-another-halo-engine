@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Render the tool-calling cases of serve/chat_template.cpp with the model's own Jinja template (the GGUF's or the
-HFQ's tokenizer.chat_template), as transformers' apply_chat_template renders it (its tojson: json.dumps with
+"""Render the tool-calling cases of serve/chat_template.cpp with the model's own Jinja template (the GGUF's
+tokenizer.chat_template), as transformers' apply_chat_template renders it (its tojson: json.dumps with
 ensure_ascii=False), into serve/testdata/chat_template_tool_cases.json for yah_serve_test.
 
-usage: make_tool_template_cases.py <model.gguf | model.hfq> [out.json]   (needs jinja2)
+usage: make_tool_template_cases.py <model.gguf> [out.json]   (needs jinja2)
 """
 import json
 import os
@@ -19,13 +19,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def template_of(path):
     with open(path, "rb") as f:
         head = f.read(64 << 20)
-    if head[:4] == b"GGUF":   # the metadata key, then its string value (u64 length)
-        key = b"tokenizer.chat_template"
-        at = head.index(struct.pack("<Q", len(key)) + key) + 8 + len(key)
-        n = struct.unpack_from("<Q", head, at + 4)[0]
-        return head[at + 12:at + 12 + n].decode()
-    at = head.index(b'"chat_template":"')   # the HFQ's JSON header
-    return json.JSONDecoder().raw_decode(head[at + 16:].decode("utf-8", "replace"))[0]
+    if head[:4] != b"GGUF":
+        raise SystemExit(f"make_tool_template_cases: {path}: not a GGUF file")
+    key = b"tokenizer.chat_template"   # the metadata key, then its string value (u64 length)
+    at = head.index(struct.pack("<Q", len(key)) + key) + 8 + len(key)
+    n = struct.unpack_from("<Q", head, at + 4)[0]
+    return head[at + 12:at + 12 + n].decode()
 
 
 def render(template, messages, tools, effort, add_generation_prompt=True):

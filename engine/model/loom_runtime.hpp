@@ -572,16 +572,15 @@ class LoomWeights {
               bool in_place = false) {
     constexpr size_t kChunk = size_t{1} << 30;
     constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
-    // (begin, end, glued): a layer's ffn_gate, its awq, ffn_up and its awq stay in one buffer (the NPU FFN block reads
-    // a gate row through its up row in one view, LoomPrefill::RunFfnBlock)
+    // (begin, end, glued): a layer's ffn_gate and ffn_up stay in one buffer (the NPU FFN block reads a gate row through
+    // its up row in one view, LoomPrefill::RunFfnBlock)
     std::vector<std::tuple<size_t, size_t, bool>> spans;
     for (const auto& t : gguf.tensors()) {
       if (skip && !in_place && skip(t.name)) {
         skipped_.push_back(t.name);
         continue;
       }
-      const bool glued = t.name.ends_with("ffn_gate.awq") || t.name.ends_with("ffn_up.weight") ||
-                         t.name.ends_with("ffn_up.awq");
+      const bool glued = t.name.ends_with("ffn_up.weight");
       spans.emplace_back(t.offset, t.offset + t.bytes, glued);
     }
     std::sort(spans.begin(), spans.end());

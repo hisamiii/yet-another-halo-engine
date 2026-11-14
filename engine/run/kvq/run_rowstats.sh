@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_rowstats.sh <hal set> <tokens> <ids file> <out .rs>: one prefill run writing compact row stats for gate2.py.
 # The reference is an fp16-KV chunked set; a candidate is the same set emitted with another YAH_KV.
-set_dir=$1; T=$2; ids=$3; out=$4; M=${MODEL:-$HOME/Downloads/qwen3.8-27b.mq4-xts}
+set_dir=$1; T=$2; ids=$3; out=$4; M=${MODEL:-$HOME/Downloads/qwen3.8-gguf/Qwen3.8-27B-UD-IQ4_XS.gguf}
 # resumable: a run whose log already reports layers_ms is done
 if grep -q layers_ms ${out%.rs}.log 2>/dev/null; then echo "$(basename $out): done earlier, skipped"; exit 0; fi
 E=$(cd "$(dirname "$0")/../../.." && pwd)

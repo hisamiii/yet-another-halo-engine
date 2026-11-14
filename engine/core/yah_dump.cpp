@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
   }
   auto gguf = argc == 3 ? yah::core::Gguf::OpenIndex(argv[1]) : yah::core::Gguf::Open(argv[1]);
   if (argc == 3) {
-    // one line per tensor as the engine sees it: name, type id, dims (GGUF order); the emitter reads HFQ models with it
+    // one line per tensor as the engine sees it: name, type id, dims (GGUF order); tools read the engine's view of a model with it
     for (const auto& t : gguf.tensors()) {
       std::printf("%s %u", t.name.c_str(), static_cast<unsigned>(t.type));
       for (const auto d : t.dims) std::printf(" %" PRIu64, d);

@@ -4,7 +4,7 @@ Conventions for anyone (human or agent) changing this repo. Adapted from llama.c
 
 ## The project
 
-Qwen3.8-27B (MQ4 HFQ) inference on Strix Halo (gfx1151), written as Loom kernels run through HRX. Python generators emit the kernels; small C++ drivers run them.
+Qwen3.8-27B (a GGUF in its own formats, UD-IQ4_XS) inference on Strix Halo (gfx1151), written as Loom kernels run through HRX. Python generators emit the kernels; small C++ drivers run them.
 
 Layout:
 
@@ -12,7 +12,7 @@ Layout:
 - `engine/gpu/loom/*.loom`: hand-written Loom kernels the emitters still read; `tables/`: IQ codebooks.
 - `engine/run/`: the drivers (`loom_forward_pp.cc` prefill and prefill -> decode, `loom_decode.cc`, `hal_run.cc`), `gpu_run.sh` (run every GPU job through it), `gate/` (accuracy gate), `kvq/` (KV codec gate).
 - `engine/model/`: `loom_runtime.hpp` (HRX wrappers), `loom_decoder.hpp` (the decode step).
-- `engine/core/`: model reader (HFQ and plain GGUF), model config, tokenizer, small CLI tools.
+- `engine/core/`: model reader (GGUF), model config, tokenizer, small CLI tools.
 - `engine/tests/`: end-to-end gates.
 - `docs/`: see Docs below.
 

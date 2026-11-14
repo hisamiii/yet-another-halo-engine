@@ -282,44 +282,6 @@ Block BlockFn(GgmlType t) {
   // clang-format on
 }
 
-// In place over 256 values: the natural-order Walsh-Hadamard transform, unnormalized.
-[[gnu::target_clones("avx512f", "avx2", "default")]] void H256(float* x) {
-  for (int h = 1; h < 256; h *= 2)
-    for (int i = 0; i < 256; i += 2 * h)
-      for (int j = i; j < i + h; ++j) {
-        const float a = x[j], b = x[j + h];
-        x[j] = a + b, x[j + h] = a - b;
-      }
-}
-
-// Squared error of 128 values coded at scale d (codes clamp to [-8, 7], ties to even as the hardware rounds).
-[[gnu::target_clones("avx512f", "avx2", "default")]] float Mq4Error(const float* w, float d) {
-  const float inv = 1.0F / d;
-  float e = 0;
-  for (int i = 0; i < 128; ++i) {
-    const float q = std::clamp(std::nearbyint(w[i] * inv), -8.0F, 7.0F);
-    const float r = w[i] - q * d;
-    e += r * r;
-  }
-  return e;
-}
-
-// hipfire's sign vectors (gen_rot.sign_vec, seeds 42 and 1042): state = state * 1103515245 + 12345 mod 2^31, +1 when
-// bit 16 is set.
-struct Signs {
-  float s1[256], s2[256];
-  Signs() {
-    for (auto [seed, out] : {std::pair{42U, s1}, std::pair{1042U, s2}}) {
-      std::uint32_t s = seed;
-      for (int i = 0; i < 256; ++i) {
-        s = (s * 1103515245U + 12345U) & 0x7FFFFFFFU;
-        out[i] = (s >> 16) & 1 ? 1.0F : -1.0F;
-      }
-    }
-  }
-};
-const Signs kSigns;
-
 }  // namespace
 
 bool CanDequantize(GgmlType t) {
@@ -342,40 +304,6 @@ void Dequantize(GgmlType t, const std::uint8_t* src, float* dst, std::uint64_t n
     if (f == nullptr) throw std::runtime_error(std::string("gguf: cannot read tensor type ") + TypeName(t));
     const std::uint32_t be = BlockElements(t), bb = BlockBytes(t);
     for (std::uint64_t b = 0; b < n / be; ++b) f(src + b * bb, dst + b * be);
-  }
-}
-
-void QuantizeMq4Row(float* w, std::uint64_t k, std::uint8_t* dst) {
-  for (std::uint64_t g = 0; g < k / 256; ++g, dst += 136) {
-    float* x = w + 256 * g;
-    for (int i = 0; i < 256; ++i) x[i] *= kSigns.s1[i];
-    H256(x);
-    for (int i = 0; i < 256; ++i) x[i] *= kSigns.s2[i] / 16.0F;
-    std::memset(dst, 0, 136);
-    for (int h = 0; h < 2; ++h) {
-      const float* v = x + 128 * h;
-      float amax = 0;
-      for (int i = 0; i < 128; ++i) amax = std::max(amax, std::fabs(v[i]));
-      float d = 0;
-      if (amax > 0) {
-        float best = INFINITY;
-        for (int j = 0; j < 16; ++j) {
-          // the stored scale is f16: search over what the kernels will read
-          const float c = static_cast<float>(static_cast<_Float16>(amax / 7.0F * (0.5F + j / 30.0F)));
-          if (c <= 0) continue;
-          const float e = Mq4Error(v, c);
-          if (e < best) best = e, d = c;
-        }
-      }
-      const std::uint16_t hd = ToHalf(d), hm = ToHalf(-8.0F * d);
-      std::memcpy(dst + 4 * h, &hd, 2);
-      std::memcpy(dst + 4 * h + 2, &hm, 2);
-      const float inv = d > 0 ? 1.0F / d : 0.0F;
-      for (int i = 0; i < 128; ++i) {
-        const int q = static_cast<int>(std::clamp(std::nearbyint(v[i] * inv), -8.0F, 7.0F));
-        dst[8 + 64 * h + i / 2] |= static_cast<std::uint8_t>((q & 15) << (4 * (i & 1)));
-      }
-    }
   }
 }
 

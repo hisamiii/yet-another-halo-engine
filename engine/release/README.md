@@ -1,18 +1,18 @@
 # yah for gfx1151
 
-Qwen3.8-27B (the MQ4 HFQ build) served on a Ryzen AI Max (Strix Halo, gfx1151) GPU, with an OpenAI-compatible API. Everything it loads is in this directory: the HRX runtime, AMD's ROCm 10 HSA runtime and the HAL sets. No ROCm install, no root.
+Qwen3.8-27B (a GGUF, run in its own formats) served on a Ryzen AI Max (Strix Halo, gfx1151) GPU, with an OpenAI-compatible API. Everything it loads is in this directory: the HRX runtime, AMD's ROCm 10 HSA runtime and the HAL sets. No ROCm install, no root.
 
 Needs:
 - a gfx1151 GPU with a recent kernel's amdgpu driver (tested on Linux 7.3)
 - glibc 2.39 or later (Ubuntu 24.04, Fedora 40, Debian 13, Arch)
 - read and write access to `/dev/kfd` and `/dev/dri/renderD*`: membership in the `render` group on most distros
 - about 17 GB of GPU-visible memory: the model (15 GB) and a 32K-token kv8 cache. On a 32 GB machine, set the BIOS GPU carve-out low and let the GTT take it.
-- the model file `qwen3.8-27b.mq4-xts`
+- the model as a GGUF, for example `Qwen3.8-27B-UD-IQ4_XS.gguf`
 
 ## Run
 
 ```
-bin/yah_server --model qwen3.8-27b.mq4-xts [--host 127.0.0.1] [--port 8080]
+bin/yah_server --model Qwen3.8-27B-UD-IQ4_XS.gguf [--host 127.0.0.1] [--port 8080]
 ```
 
 It is ready when `curl localhost:8080/health` answers. The first start takes about a minute.
@@ -49,7 +49,6 @@ Without one of them the server says why (`yah_server: npu off: ...`) and runs on
 
 ## If something is off
 
-- `hfq: cannot lock the model in memory (RLIMIT_MEMLOCK)` is a warning: the model stays mapped but may be paged out under memory pressure. To lock it, raise the memlock limit, for example a line `<user> - memlock unlimited` in `/etc/security/limits.d/90-yah.conf`, then log in again.
 - No GPU found: check `ls -l /dev/kfd` and your groups (`id`).
 - `IREE_HAL_AMDGPU_LIBHSA_PATH` set in the environment overrides the bundled HSA runtime.
 

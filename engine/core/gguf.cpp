@@ -15,7 +15,6 @@ namespace yah::core {
 namespace {
 
 constexpr std::uint32_t kGgufMagic = 0x46554747U;  // "GGUF"
-constexpr std::uint32_t kHfqMagic = 0x4D514648U;   // "HFQM"
 
 struct TypeTraits {
   const char* name;
@@ -130,24 +129,16 @@ MetadataValue ReadValue(Cursor& c, std::uint32_t kind) {
   return v;
 }
 
-bool IsHfq(const std::string& path) {
-  const int fd = ::open(path.c_str(), O_RDONLY);
-  std::uint32_t magic = 0;
-  const bool hfq = fd >= 0 && ::pread(fd, &magic, 4, 0) == 4 && magic == kHfqMagic;
-  if (fd >= 0) ::close(fd);
-  return hfq;
-}
-
 }  // namespace
 
 const char* TypeName(GgmlType type) {
-  return type == GgmlType::kMQ4G256 ? "MQ4G256" : kTraits[static_cast<std::size_t>(type)].name;
+  return kTraits[static_cast<std::size_t>(type)].name;
 }
 std::uint32_t BlockElements(GgmlType type) {
-  return type == GgmlType::kMQ4G256 ? 256 : kTraits[static_cast<std::size_t>(type)].elements;
+  return kTraits[static_cast<std::size_t>(type)].elements;
 }
 std::uint32_t BlockBytes(GgmlType type) {
-  return type == GgmlType::kMQ4G256 ? 136 : kTraits[static_cast<std::size_t>(type)].bytes;
+  return kTraits[static_cast<std::size_t>(type)].bytes;
 }
 
 Gguf::Gguf(Gguf&& other) noexcept {
@@ -181,7 +172,7 @@ Gguf::~Gguf() {
 }
 
 void Gguf::Close() {
-  // (first: the last holder of a native copy's filler joins its background read, which writes into base_)
+  // (first: the last holder of a resident copy's filler joins its background read, which writes into base_)
   fill_ = nullptr, stream_ = nullptr, rows_ = nullptr;
   if (base_ != nullptr) {
     ::munmap(base_, map_bytes_);
@@ -195,7 +186,6 @@ void Gguf::Close() {
 }
 
 Gguf Gguf::Open(const std::string& path) {
-  if (IsHfq(path)) return OpenHfq(path, false);
   Gguf g;
   g.fd_ = ::open(path.c_str(), O_RDONLY);
   if (g.fd_ < 0) throw std::runtime_error("gguf: cannot open " + path);
@@ -302,18 +292,6 @@ std::uint8_t* Gguf::Reserve(std::size_t bytes, const std::string& path) {
   return p;
 }
 
-void Gguf::ReadAll(std::uint8_t* p, std::size_t size, const std::string& path) const {
-  for (std::size_t off = 0; off < size;) {
-    const ssize_t n =
-        ::pread(fd_, p + off, std::min<std::size_t>(size - off, std::size_t{1} << 30), static_cast<off_t>(off));
-    if (n <= 0) throw std::runtime_error("gguf: read failed: " + path);
-    // The copy is the model's only host image: drop the file's cached pages as they are read, or the two images fill
-    // a 30 GB machine and reclaim and compaction run on through the forward pass (stalling the GPU queues).
-    ::posix_fadvise(fd_, static_cast<off_t>(off), n, POSIX_FADV_DONTNEED);
-    off += static_cast<std::size_t>(n);
-  }
-}
-
 void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
   constexpr std::uintptr_t kPage = 4096;
   const auto a = reinterpret_cast<std::uintptr_t>(base_ + data_offset_ + offset);
@@ -323,8 +301,8 @@ void Gguf::ReleaseData(std::size_t offset, std::size_t bytes) {
   ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
 }
 
-Gguf Gguf::OpenIndex(const std::string& path, bool native) {
-  return IsHfq(path) ? OpenHfq(path, false, false) : OpenConverted(path, false, false, native);
+Gguf Gguf::OpenIndex(const std::string& path) {
+  return OpenConverted(path, false);
 }
 
 void Gguf::Rows(const TensorInfo& t, const std::uint32_t* rows, std::size_t n, std::uint8_t* out) const {
@@ -333,8 +311,8 @@ void Gguf::Rows(const TensorInfo& t, const std::uint32_t* rows, std::size_t n, s
   for (std::size_t i = 0; i < n; ++i) std::memcpy(out + i * rb, Data(t) + std::size_t{rows[i]} * rb, rb);
 }
 
-Gguf Gguf::OpenResident(const std::string& path, bool native) {
-  return IsHfq(path) ? OpenHfq(path, true) : OpenConverted(path, true, true, native);
+Gguf Gguf::OpenResident(const std::string& path) {
+  return OpenConverted(path, true);
 }
 
 }  // namespace yah::core

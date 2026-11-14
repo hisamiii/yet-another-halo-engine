@@ -111,13 +111,6 @@ Qwen35Weights Qwen35Weights::FromGguf(const core::Gguf& gguf, const core::Qwen35
     }
   }
 
-  const std::uint32_t mtp = config.block_count - 1;
-  if (config.nextn_predict_layers > 0) {
-    weights.nextn_eh_proj = Resolve(gguf, LayerName(mtp, "nextn.eh_proj.weight"));
-    weights.nextn_enorm = Resolve(gguf, LayerName(mtp, "nextn.enorm.weight"));
-    weights.nextn_hnorm = Resolve(gguf, LayerName(mtp, "nextn.hnorm.weight"));
-    weights.nextn_shared_head_norm = Resolve(gguf, LayerName(mtp, "nextn.shared_head_norm.weight"));
-  }
   return weights;
 }
 
@@ -128,10 +121,6 @@ void Qwen35Weights::Rebase(std::ptrdiff_t delta) {
   shift(token_embd);
   shift(output_norm);
   shift(output);
-  shift(nextn_eh_proj);
-  shift(nextn_enorm);
-  shift(nextn_hnorm);
-  shift(nextn_shared_head_norm);
   for (auto& layer : layers) {
     shift(layer.attn_norm);
     shift(layer.post_attention_norm);

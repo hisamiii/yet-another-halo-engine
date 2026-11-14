@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""The GGUF conversion's CPU pieces (core/gguf_quant.cpp, through build/gguf_rows) against ggml's Python reference
-(the gguf package, gguf.quants), and the MQ4 rotation against gen_rot's basis.
+"""The GGUF loader's CPU pieces (core/gguf_quant.cpp, through build/gguf_rows) against ggml's Python reference
+(the gguf package, gguf.quants).
 
 usage: gguf_check.py [model.gguf ...]   (needs numpy and gguf: pip install gguf)
 
   per type: random blocks of every type the loader reads, dequantized by both, must match to f32 rounding
-  mq4: random rows with outliers, quantized to MQ4G256 and decoded back to the original basis (s1 H256(s2 / 16 w)),
-       must land within 4-bit error (a wrong basis gives a relative error near 1.4)
+  q8: random values with outliers to Q8_0 (token_embd's load), decoded by ggml's reference, within half a step
   each model given: the first rows of one tensor per type in the file, read through the GGUF reader of both
 """
 import os
@@ -66,43 +65,18 @@ def check_types(tmp, rng):
     return bad
 
 
-def sign_vec(seed):
-    s, out = seed, []
-    for _ in range(256):
-        s = (s * 1103515245 + 12345) & 0x7FFFFFFF
-        out.append(1.0 if (s >> 16) & 1 else -1.0)
-    return np.array(out)
-
-
-def h256(x):
-    y = x.reshape(-1, 256).astype(np.float64)
-    h = 1
-    while h < 256:
-        y = y.reshape(-1, 256 // (2 * h), 2, h)
-        y = np.stack([y[:, :, 0] + y[:, :, 1], y[:, :, 0] - y[:, :, 1]], 2)
-        h *= 2
-    return y.reshape(x.shape)
-
-
-def check_mq4(tmp, rng):
-    k, rows = 1024, 64
-    w = rng.standard_normal((rows, k)).astype(np.float32) * 0.02
-    w[rng.integers(0, rows, 40), rng.integers(0, k, 40)] *= 25   # outliers: what the rotation spreads
-    src, dst = os.path.join(tmp, "rows.f32"), os.path.join(tmp, "rows.mq4")
-    w.tofile(src)
-    run("mq4", src, k, dst)
-    b = np.fromfile(dst, np.uint8).reshape(rows, k // 256, 136)
-    d = b[..., 0:8].copy().view(np.float16).astype(np.float64)   # d0, -8 d0, d1, -8 d1
-    q = b[..., 8:].astype(np.int64)
-    code = np.stack([q & 15, q >> 4], -1).reshape(rows, k // 256, 256)
-    code = np.where(code >= 8, code - 16, code)
-    wr = (np.repeat(d[..., [0, 2]], 128, -1) * code).reshape(rows, k)
-    s1, s2 = np.tile(sign_vec(42), k // 256), np.tile(sign_vec(1042), k // 256)
-    back = s1 * h256(s2 / 16 * wr)
-    rel = np.sqrt(((back - w) ** 2).sum() / (w.astype(np.float64) ** 2).sum())
-    header = np.allclose(d[..., 1], -8 * d[..., 0], rtol=1e-3) and np.allclose(d[..., 3], -8 * d[..., 2], rtol=1e-3)
-    ok = rel < 0.12 and header
-    print(f"{'ok  ' if ok else 'FAIL'} mq4      relative rms error {rel:.4f} (4-bit level ~0.09), header {header}")
+def check_q8(tmp, rng):
+    x = rng.standard_normal(32 * 256).astype(np.float32) * 0.02
+    x[rng.integers(0, x.size, 40)] *= 25
+    src, dst = os.path.join(tmp, "x.f32"), os.path.join(tmp, "x.q8")
+    x.tofile(src)
+    run("q8", src, dst)
+    raw = np.fromfile(dst, np.uint8)
+    back = dequantize(raw, Q.Q8_0).reshape(-1)
+    step = np.repeat(np.abs(x.reshape(-1, 32)).max(1) / 127, 32)
+    # (the f16 scale moves a value by up to 127 x its rounding: 2^-11 relative)
+    ok = raw.size == x.size // 32 * 34 and bool(np.all(np.abs(back - x) <= step * (0.5 + 1e-3) + np.abs(x) * 2 ** -10))
+    print(f"{'ok  ' if ok else 'FAIL'} q8       {x.size} values, max error {np.abs(back - x).max():.3g}")
     return not ok
 
 
@@ -126,7 +100,7 @@ def check_model(tmp, path):
 def main():
     rng = np.random.default_rng(1)
     with tempfile.TemporaryDirectory() as tmp:
-        bad = check_types(tmp, rng) + check_mq4(tmp, rng)
+        bad = check_types(tmp, rng) + check_q8(tmp, rng)
         for path in sys.argv[1:]:
             bad += check_model(tmp, path)
     print("gguf_check: ok" if not bad else f"gguf_check: {bad} FAILED")

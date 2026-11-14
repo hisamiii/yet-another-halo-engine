@@ -126,7 +126,7 @@ Steady state per instruction mix (5 s probe, default tctl):
 | HRX device init | 180 ms |
 | import of the 12 GiB GGUF mmap into HRX (warm page cache) | 250-450 ms (3.2 M 4 KB PTEs) |
 | the same after warming the cache with `cat` | 830 ms (small page-cache folios) |
-| copy of the 15 GB HFQ model into device-local buffers (1 GiB chunks, host pages released) | ~2 s |
+| copy of a 15 GB model (the MQ4 HFQ file, 2026-10) into device-local buffers (1 GiB chunks, host pages released) | ~2 s |
 | gu GEMM on real layer-10 operands, weights imported host pages vs device-local (2026-10-14) | 26.0 vs 23.4 M SQ_BUSY cycles per WGP (+11%); synthetic data 23.4; 2 MB-aligned import no change |
 | host CPU during prefill, sleep-polled final wait | 3-4% of a core (busy-poll: 104%) |
 

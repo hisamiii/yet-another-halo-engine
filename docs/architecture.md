@@ -1,10 +1,10 @@
 # Architecture
 
-The engine runs one model (Qwen3.8-27B as hipfire's MQ4 file, `qwen3.8-27b.mq4-xts`, or a llama.cpp GGUF of it converted at load) on one GPU (Strix Halo, gfx1151), with part of a native GGUF prefill's GEMMs optionally on the NPU. Every kernel is written in Loom and compiled for the exact shapes of this model. Python generators write the Loom source, `emit_hal.py` compiles it to an HRX HAL executable, and two small C++ drivers dispatch the HAL sets through the HRX native API. There is no general tensor runtime: the layer loop is hand-written.
+The engine runs one model (Qwen3.8-27B as a llama.cpp GGUF, run in the GGUF's own quant formats; the target is unsloth's UD-IQ4_XS) on one GPU (Strix Halo, gfx1151), with part of a prefill's GEMMs and attention optionally on the NPU. Every kernel is written in Loom and compiled for the exact shapes of this model. Python generators write the Loom source, `emit_hal.py` compiles it to an HRX HAL executable, and two small C++ drivers dispatch the HAL sets through the HRX native API. There is no general tensor runtime: the layer loop is hand-written.
 
 This page describes the model, the prefill pipeline, the decode step, the data layouts and the HAL sets. Numbers are in [results.md](results.md), measured hardware facts in [hardware.md](hardware.md).
 
-Until 2026-10-20 the engine also ran the IQ4_XS GGUF model natively (11 quant formats, tile GEMMs with per-format decoders, afrag GEMMs, a tuner) and split every large prefill GEMM with the NPU; the tag `pre-cleanup-2026-10-20` has that path and branch `npu` the NPU history. Since 2026-10-25 a GGUF loads by conversion to the MQ4 layout instead (Loading), and from 2026-10-25 to 2026-11-08 the NPU took part of the A4 prefill's FFN (an FFN block over chunk pairs); since then the split runs again, on native GGUF sets (Prefill).
+Until 2026-10-20 the engine also ran the IQ4_XS GGUF model natively (11 quant formats, tile GEMMs with per-format decoders, afrag GEMMs, a tuner) and split every large prefill GEMM with the NPU; the tag `pre-cleanup-2026-10-20` has that path and branch `npu` the NPU history. From 2026-10-13 the engine ran hipfire's MQ4 HFQ file, and from 2026-10-25 GGUFs converted to MQ4 at load; from 2026-10-25 to 2026-11-08 the NPU took part of the A4 prefill's FFN (an FFN block over chunk pairs). Since 2026-11-08 the native GGUF sets run again, with the NPU split. On 2026-11-14 the MQ4 path (the HFQ file, the conversion, A4 and W4A16 prefill, the rotated decode, MTP speculative decoding) was removed; commit be687da is the last with it.
 
 ## The model
 
@@ -12,7 +12,7 @@ Qwen3.8-27B is a hybrid: every 4th layer is full (softmax) attention, the others
 
 | item | value |
 |---|---|
-| layers | 64 main layers; GGUFs from unsloth add the MTP layer as `blk.64.nextn.*` (`nextn_predict_layers` 1: one full-attention block behind `eh_proj` 10240 -> 5120, sharing the output head) |
+| layers | 64 main layers; GGUFs from unsloth add the MTP layer as `blk.64.nextn.*` (`nextn_predict_layers` 1: one full-attention block behind `eh_proj` 10240 -> 5120, sharing the output head); the engine does not load it |
 | full-attention layers | 16: layers 3, 7, 11, ..., 63 (`(l + 1) % 4 == 0`) |
 | Gated DeltaNet layers | 48 |
 | hidden | 5120 |
@@ -21,22 +21,11 @@ Qwen3.8-27B is a hybrid: every 4th layer is full (softmax) attention, the others
 | attention q projection | 12288 rows: per head 256 q rows then 256 gate rows |
 | DeltaNet | 16 key heads, 48 value heads, head dim 128, state 128 x 128 per value head, short conv width 4 over 10240 channels (q 2048, k 2048, v 6144), z gate 6144, alpha / beta 48 each |
 | vocab | 248320 |
-| weights | 13.96 GiB: every linear layer, the output head included, MQ4G256; the token embedding Q8_0; the rest f16 |
-
-MQ4G256 is symmetric int4 with one f16 scale per 128 weights, 136 bytes per 256. Each 256-wide group of every weight row is stored in a rotated basis (random signs, 256-point Walsh-Hadamard, random signs), so every GEMM input gets the same rotation. Each projection also carries an AWQ activation scale (`blk.N.<weight>.awq`, f32): the input is divided by it before the rotation.
+| weights | each tensor in its GGUF format (UD-IQ4_XS: a 13.27 GiB file, projections from IQ2_XXS to Q8_0); at load the token embedding becomes Q8_0 and the norms and small DeltaNet tensors f32 |
 
 ### Loading
 
-`engine/core/hfq.cpp` reads the HFQ container and presents it through `core::Gguf`: GGUF tensor names and dims, GGUF metadata keys for the config and the tokenizer (the tokenizer goldens pass). The file is read into locked anonymous memory (2 MB pages where the kernel has them) and changed in place at load (about 4 s):
-
-| tensor | change at load |
-|---|---|
-| MQ4G256 weights | nibbles xor 8: signed codes, weight = nibble x scale (the stored zero is always -8 x scale) |
-| DeltaNet value heads | GGUF order (value head i uses key head i mod 16; HF groups them by key head): rows of `attn_qkv` (v part), `attn_gate`, `ssm_alpha`, `ssm_beta`, channels of `ssm_conv1d`, `ssm_a`, `ssm_dt` |
-| norms | f32, 1 + w as GGUF stores them (DeltaNet `ssm_norm` as is) |
-| `ssm_a`, `ssm_dt`, `ssm_conv1d`, AWQ scales | f32 (`ssm_a` = -exp(A_log)), placed after the file's bytes in the same import |
-
-`ssm_out` keeps the HF value-head order on its input axis: a head permutation does not commute with the rotation, so its input is written in HF head order. A GGUF (`engine/core/gguf_convert.cpp`) already has the names, dims, norms and DeltaNet head order; its projections are dequantized (`engine/core/gguf_quant.cpp`, the common GGML formats), rotated and re-quantized to MQ4G256 with all-ones AWQ scales on every core (~22 s for Q4_K_M), the embedding becomes Q8_0, the small tensors f32, and `ssm_out`'s columns are permuted to HF head order. The re-quantization costs accuracy over the HFQ file: UD-Q4_K_M converted scores mean KL 0.0997, top-1 85.8% (the HFQ A4 path 0.0687; results.md).
+`engine/core/gguf.cpp` reads the GGUF (`core::Gguf`) and `engine/core/gguf_convert.cpp` presents it as the engine reads it: the projections keep their bytes (the sets run the GGUF's own formats), ffn_up right after ffn_gate (the NPU FFN block reads gate through up rows in one view); token_embd becomes Q8_0, as does an output.weight that is not Q6_K or Q8_0, and the small tensors f32 (`engine/core/gguf_quant.cpp` has the dequantizers). Every kernel works in the GGUF's DeltaNet value-head order. The MTP layer (`blk.64.*`) is skipped. The file is read into anonymous memory (2 MB pages where the kernel has them), range by range as the device uploads it.
 
 The tensors are then copied into device-local HRX buffers of about 1 GiB cut at tensor boundaries (`LoomWeights`), each host range released right after its copy: RAM holds one copy of the model. A mapped file does not work: reclaim and compaction scan its page-cache folios, and every scan of a GPU-imported page evicts all of the process's GPU queues (hardware.md).
 
@@ -44,68 +33,46 @@ The tensors are then copied into device-local HRX buffers of about 1 GiB cut at 
 
 `engine/model/loom_prefill.hpp` (`LoomPrefill`) runs a prompt through all 64 layers as one batch of B tokens (B = 2048 by default); `loom_forward_pp` is its command-line driver. Every kernel has the token count in its grid, so there is no per-tile loop. All activations are token-major (`[token][row]`). The residual stream is f32.
 
-Two modes, chosen when the set is emitted:
+The GEMMs run on the f16 WMMA with f16 activations; the weights are decoded from their GGUF format to f16 in LDS (the tile GEMM, below), with the reference dequantization's ops, so every GEMM is bit-identical to a dequantize-then-multiply.
 
-- A4 (the default): the GEMMs run on `v_wmma_i32_16x16x16_iu4` with int4 activations, one f32 scale per 128 values of each token. Accuracy is on par with hipfire's A4 route (results.md).
-- W4A16 (`YAH_A16=1`, the reference mode): f16 activations on the f16 WMMA, the weights decoded to f16 in LDS (`gen_gemm_tile`).
-
-### A4 kernels per layer
+### Kernels per layer
 
 The chunk graph starts with `yah_embed` (`gen_decode_misc.gen_embed_q8_0`, rows = B), which dequantizes the token_embd rows of the chunk's token ids.
 
-Every GEMM input site has a quantizer: the input rotated as above, then int4 codes and one scale per 128 values (hipfire's recipe: the best of 8 candidate scales (amax / 7)(1 + j / 7) / 2 by squared error, round to nearest even, clamp to [-8, 7]) into `aq_` / `ad_`. The norm sites fuse it with the norm (`normq`, `gen_rot.gen_nq`), the others run `rotq` (`gen_rot.gen_q`) on the f16 producer output, and the DeltaNet postnorm fuses it as `pnq` (`gen_rot.gen_pnq`).
+Every layer starts with `yah_half_norm` (attn_norm) into f16: row-major (`norm`), fragment-major for afrag GEMMs (`norm_t`, below) or both (`norm_rt`); dispatch.txt `norm_split` gives a row several waves.
 
 Full-attention layer:
 
-1. `normq` (attn_norm).
-2. `iu4_kqg` attn_q (12288 rows): the epilogue writes q and gate (f16) to separate buffers; `iu4_kstore` attn_k and attn_v (1024 rows each).
-3. `yah_fused_qk_rope_batched` (the k / v form, `ropekv`): K RMSNorm and RoPE, K and V straight into their pages of the KV pools (f16), or the KV quantizers (`yah_kmean` on the first chunk, `yah_kq8` / `yah_kq4`, then `yah_vq8` / `yah_vq4`) for quantized KV.
-4. `yah_attn_wmma` (FlashAttention-style, below): the q RMSNorm and RoPE run inside it (`qnorm`); it writes `f16(o / sum * sigmoid(gate))`.
-5. `rotq` (K = 6144), then `iu4_kres` attn_output: the GEMM reads the residual and writes residual + W x into the second hidden buffer; the two swap.
+1. The norm.
+2. attn_q as a `kqg` GEMM (12288 rows): the epilogue writes q and gate to separate buffers; with `qsplit` it stores the split-norm query the attention reads (gen_attn_fa `R2P_QSPLIT`), with `gsig` the gate's sigmoid as unorm16. attn_k and attn_v as `kstore`; in f16 sets they ride in the kqg GEMM's dispatch (`seg_kqg`, segmented GEMMs).
+3. `yah_fused_qk_rope_batched` (the k / v form): K RMSNorm and RoPE, K straight into its page of the K pool (`rope_kpaged`), V into the paged V^T tiles (`vtrope`), or the KV quantizers (`yah_kmean` on the first chunk, `yah_kq8` / `yah_kq4`, then `yah_vq8` / `yah_vq4`) for quantized KV.
+4. `yah_attn_wmma` (FlashAttention-style, below): the q RMSNorm and RoPE run inside it (`qnorm`).
+5. attn_output as a `kres` GEMM: it reads the residual and writes residual + W x into the second hidden buffer; the two swap.
 
 Gated DeltaNet layer:
 
-1. `normq` (attn_norm).
-2. `iu4_kstore` ssm_alpha and ssm_beta (48 rows each; first, so they read the norm's output before the big GEMMs evict it), attn_qkv (10240 rows).
-3. `yah_ssm_conv_kq` (`gen_conv_kq`): the causal conv of the q / k heads with their L2 normalization, a workgroup per (256 channels, 16 tokens).
-4. `yah_deltanet` (`gen_gdn_chunk`, below) in two parts (heads 0-39, then 40-47): it computes the v channels' conv and alpha / beta itself.
-5. attn_gate (z, 6144 rows) beside the second DeltaNet part, which leaves most of the GPU free; `iu4_kstoreh` writes it in HF head order.
-6. `yah_deltanet_prep_ab` advances the conv ring past the real tokens; `pnq`: the gated RMSNorm per head with z, ssm_out's rotation and quantization in one kernel.
-7. `iu4_kres` ssm_out.
+1. The norm.
+2. ssm_alpha and ssm_beta (48 rows each; first, so they read the norm's output before the big GEMMs evict it), attn_qkv (10240 rows) and attn_gate (z, 6144 rows) as `kstore` GEMMs; in f16 sets alpha and beta ride in the qkv GEMM's dispatch (`seg_kstore`).
+3. `yah_ssm_conv_kq` (`gen_conv_kq`): the causal conv of the q / k heads with their L2 normalization, a workgroup per (256 channels, `convtb` tokens).
+4. `yah_deltanet` in two parts (dispatch.txt `dnsplit`: heads 0-39, then 40-47): it computes the v channels' conv and alpha / beta itself. f16 sets run the state-stationary kernel (`gen_gdn_ss`: one workgroup per head, the state in registers), and with `dnvconv` the gate GEMM runs beside the second part, which leaves most of the GPU free; other sets run the chunked form (`gen_gdn_chunk`, below).
+5. `yah_deltanet_prep_ab` advances the conv ring past the real tokens; `yah_ssm_postnorm_fp16`: the gated RMSNorm per head with z.
+6. ssm_out as `kres`.
 
-Then the FFN, for every layer: `normq` (post_attention_norm), `iu4_gu` (gate and up in one GEMM: a workgroup stages 64 gate rows and the same features' 64 up rows, and the epilogue pairs them through LDS into f16 silu(gate) x up, so the gate never goes to memory), `rotq` (K = 17408), `iu4_kres` ffn_down.
+Then the FFN, for every layer: the norm (post_attention_norm), gate and up, ffn_down as `kres`. Gate and up run as one `ffn` GEMM where a fused kernel exists for the layer's pair of formats (`emit_prefill_pp.ffn_fused`: a workgroup stages the gate rows and the same features' up rows, and the epilogue writes f16 silu(gate) x up, so the gate never goes to memory), else as `kstore` gate, then `swiglu` up.
 
-After the last layer of the last chunk: `yah_rmsnorm` on the last token, `rot_head` (the rotation without awq), the MQ4 output GEMV (`gen_gemv`, 248320 rows) and `yah_argmax`. The last layer's tail runs only the GEMM token tiles holding the rows the caller reads (`RunLayers` keep: the last token, or none on chunks whose output nobody reads).
+After the last layer of the last chunk: `yah_rmsnorm` on the last token, the output GEMV (`gen_gemv`, 248320 rows) and `yah_argmax`. The last layer's tail runs only the GEMM token tiles holding the rows the caller reads (`RunLayers` keep: the last token, or none on chunks whose output nobody reads).
 
-### Overlap through completion counters
+### The tile GEMM
 
-A graph edge waits for every workgroup of the producer, so each GEMM's tail (its last, partly filled wave of workgroups) would leave the GPU idle. Most producer / consumer pairs therefore skip the edge: the producer adds 1 to a counter per 128-token tile as it finishes it, and the consumer's workgroups poll the counters of the tiles they read (`FlagSlot` in `loom_prefill.hpp`, a slot per pair, zeroed before the chunk; dispatch.txt markers `nqov`, `nqw`, `nqgu`, `guov`, `rqk`, `dnov`, `dnring`, `aov`, `ropew`). So the normq after a kres runs in the kres's tail, the ffn_down rotq in the gu's tail, the conv in the qkv GEMM's tail, the pnq in the gate GEMM's tail, the GEMMs after a normq start on the first finished token tiles, and so on. Consumers that would otherwise queue thousands of workgroups ahead of the next GEMM run as persistent workgroups (`rotqp`, `rotqop`, `pnq_abfrp`, `convkqp`). Where a consumer writes the activations its producer still reads, the two use the other buffer pair (`aq2_` / `ad2_`) and swap. Results are bit-identical to the barriered graph.
-
-### The iu4 GEMM
-
-`tools/gen_gemm_iu4.py` (`iu4_<kind>_<m_tiles>_<k_blocks>.hal`, kinds kstore, kstoreh, kqg, kres, gu):
-
-- Workgroup 128 rows x 128 tokens, 4 x 2 waves of 32 x 64 (the 48-row alpha / beta: 48 x 128, 3 x 2 waves): at 216-232 VGPRs and 42 KB LDS three workgroups share a WGP, so one's fold, barrier and epilogue stalls overlap the others' WMMAs.
-- Per 128-K phase (one scale group) the weight and activation nibbles and scales are staged in LDS, double-buffered with one barrier per phase.
-- Each wave runs 8 k steps of i32 WMMAs into zeroed accumulators, then folds them: acc += f32(c) x (weight scale x activation scale). In the iu4 C layout, element i of lane l is row 2i + l / 16 and token l % 16, so the weight scales sit in LDS in that order (one vector load) and the activation scale is one value per lane.
-- Epilogues through `gen_gemm_tile.lds_epilogue` (wave-private LDS slabs, 4 rows per vector store); the 48-row tile stores its f32 fragments directly.
-- Grouped grids (dispatch.txt `iu4grp_<hal> G`): grid (G, token tiles, row tiles / G), x fastest, so a band of G weight tiles stays in L2 while all token tiles run over it.
-- The flagged (`f`) and waiting (`w`) forms count finished token tiles and wait on their producer's counters (above).
-
-HAL names encode the shape: m_tiles = rows / 16, k_blocks = K / 256. For example `iu4_kstore_640_20` is a 10240 x 5120 GEMM (attn_qkv).
-
-### The tile GEMM (W4A16)
-
-`tools/gen_gemm_tile.py` with the MQ4 decoder of `tools/gen_gemm_decode.py` (weight = f16(nibble x scale)):
+`tools/gen_gemm_tile.py` with a per-format decoder from `tools/gen_gemm_decode.py` (Q8_0, Q2_K-Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS; the IQ grids bound after the weights):
 
 - Workgroup 128 rows x 256 tokens over 4 x 4 wave32 waves of 32 x 64.
 - Per K phase (64), the decoded weight tile and the activation tile are both in LDS, so the MMA loop reads only LDS. LDS rows are padded (+8 f16) against bank conflicts.
 - The next phase's weight bytes and activations load into registers while the current phase computes and go to LDS after it; a schedule fence keeps those loads behind the current LDS stores.
-- Epilogue kinds: `kstore`, `kqg` (q / gate split), `swiglu` (reads the f32 gate), `kres` (residual add).
-- On grids of 320 or more workgroups, the second workgroup on each WGP in the first round runs 8000 empty workgroup barriers before it starts, which breaks the lockstep epilogue bursts of the short-K residual GEMMs.
+- Epilogue kinds: `kstore`, `kqg` (q / gate split), `swiglu` (reads the f32 gate), `ffn` (gate and up fused), `kres` (residual add).
+- afrag GEMMs (HAL suffix `.af`) read their input fragment-major, as the WMMA takes it (`norm_t`, or a producer's `.to` output form), instead of row-major.
+- Segmented GEMMs (`seg_*`): small GEMMs that read the same input (alpha / beta, k / v) run as extra row tiles of the large one's dispatch.
 - The 48-row alpha / beta use a 16-row x 64-token tile.
-
-The W4A16 mode runs `yah_half_norm` and `yah_rot256` (`gen_rot.gen`, in place) where A4 runs normq, and `yah_ssm_postnorm_fp16` plus `rot_heads` (the GGUF to HF value-head gather) for ssm_out.
 
 ### Attention
 
@@ -141,7 +108,7 @@ Slots: `SaveState` / `LoadState` write and read the sequence state after some ch
 Each large prefill GEMM can be split by output columns: the NPU (XDNA2, 32 compute tiles through HRX `.xdna`) computes the trailing rows, the GPU the rest. A native UD-IQ4_XS set with the split (2.9 GB, ~170 s; needs numpy and gguf-py for the pre-decoded and transcoded rows):
 
 ```
-YAH_NATIVE=1 YAH_NPU_FFNRES=0 YAH_NPU_FUSE=1 YAH_NPU_FFNBLK=8192 YAH_NPU_SPLIT=qkv=5120,gate=3072,q=6144,out=2560 \
+YAH_NPU_FFNRES=0 YAH_NPU_FUSE=1 YAH_NPU_FFNBLK=8192 YAH_NPU_SPLIT=qkv=5120,gate=3072,q=6144,out=2560 \
   python3 tools/emit_prefill_pp.py <model.gguf> <dir> 2048
 ```
 
@@ -181,38 +148,27 @@ For splitting prefill attention with the NPU: `tools/gen_npu_attn.py <out.loom> 
 - The GPU's side is the 2 x 64 key-split pair's NPU twins (emit `YAH_NPU_ATTN=n` with `YAH_ATTN_KSPLIT`: `yah_attn_hip64ksn` / `kmn`, gen_attn_fa `NPU_KV`): the last n KV heads' units go to the NPU over keys [32, k_lo), k_lo = 512 floor(start_pos / 512) (an image built for nb = 16 (floor(start_pos / 512) + 1)), so they need start_pos >= 512. Kernel 1 runs one piece of each over [k_lo, end) after the tail pieces and stores its partial; kernel 2 runs the sink [0, 32) and merges the three per row and head (m = 128 - C for the NPU's, its l = the l block x 2^63), streaming each merged fragment over kernel 1's record (16 fragments live across the join spilled). On chunk 63 of a 128K dump with a float64 stand-in for the NPU's piece (`Scratch/npu/attn/merge/gate.py`), heads 0-17 match the plain pair to 3e-6 mean, the NPU's heads stay within the plain pair's error to float64, and kernel 1 takes 150 ms vs 194 (one KV head of four).
 - Prefill: a set emitted with `YAH_NPU_ATTN=n` (fp16 KV, or kv8 through its per-layer f16 copies `yah_kdeq8` / `yah_vdeq8`, not KRAW) runs the twins from chunk `YAH_NPU_ATTN_FROM` (default the first key-split chunk) and adds per chunk the encoders `npua{k,v,q}_c<c>.hal`, the GPU's wait `npu_flag_wait.hal`, the image `npu_attn.xdna` (built for the last chunk's nb) and the dispatch.txt row `npuattn <n> <nb built> <first chunk>`. `loom_forward_pp --npu` hands `LoomPrefill::EnableNpuAttn` a `LoomNpuAttn`. Each attention layer of an NPU chunk then runs the encoders on the attention's own q and K / V pools, stores its ready word (release, system scope), runs kernel 1 while the NPU computes, waits for the done word (`npu_flag_wait`: ~2 s, then the sticky status word) and runs kernel 2 on the NPU's outputs; the chunk's jobs are queued once its graph is launched. A chunk whose rows nobody reads skips the last layer's attention (15 jobs). Unlike the GEMM split it runs on the auto DPM level (results.md).
 - `tools/npu_attn_check.py <dir> <mc> <nb> [--real <dump> | --inputs <npz>]` runs it through `iree-xdna-run` against a CPU emulation of the core arithmetic (O and l bit for bit) and, on real data, against float64. Its docstring has the record formats.
-- The GPU writes the streams in place (`tools/gen_npu_attn_encode.py k|v|q`): K records from the paged f16 K pool (and each record's max squared key norm), V records from the paged V^T tiles, and each call's payloads (its own pair of buffers) from the attention's split-norm query (gen_attn_fa `R2P_QSPLIT`: the f16 halves, the rotary dims RoPE'd op for op as the attention does, scaled by r log2(e) / 16) with C from the norms. A record depends only on its own keys, so earlier records stay valid in later chunks. For prefill the encoders also take the image's record stride (`nbs`: its stream views are fixed, a chunk's nb is patched in), layer forms (`kvn`: the records and every call's payloads of the last kvn KV heads, one dispatch each) and the raw f16 query of A4 sets (`qlay=1`: the encoder does the head norm and RoPE as the attention does, then f16(x / 16)). `tools/npu_attn_encode_check.py <dump> <dir> ...` checks them on the GPU (K / V bit for bit against `npu_attn_check.encode`, the payloads against float64, the pool pages shuffled) and writes the `--inputs` file for the NPU run.
+- The GPU writes the streams in place (`tools/gen_npu_attn_encode.py k|v|q`): K records from the paged f16 K pool (and each record's max squared key norm), V records from the paged V^T tiles, and each call's payloads (its own pair of buffers) from the attention's split-norm query (gen_attn_fa `R2P_QSPLIT`: the f16 halves, the rotary dims RoPE'd op for op as the attention does, scaled by r log2(e) / 16) with C from the norms. A record depends only on its own keys, so earlier records stay valid in later chunks. For prefill the encoders also take the image's record stride (`nbs`: its stream views are fixed, a chunk's nb is patched in), layer forms (`kvn`: the records and every call's payloads of the last kvn KV heads, one dispatch each) and the raw f16 query of sets without split-norm Q (`qlay=1`: the encoder does the head norm and RoPE as the attention does, then f16(x / 16)). `tools/npu_attn_encode_check.py <dump> <dir> ...` checks them on the GPU (K / V bit for bit against `npu_attn_check.encode`, the payloads against float64, the pool pages shuffled) and writes the `--inputs` file for the NPU run.
 
 2026-11-13: bit-exact at mc 1 (nb 48) and 16 (nb 64, and the nb 64 image patched to 48), 730-731 cycles a body on every core (70% of one MMA a cycle); real dump (k8_c63_l8, 992 keys at depth 128K): mean |err| 1.4e-3 vs float64, max 1.6e-2. On the GPU encoder's bytes (keys 32 ..): bit-exact, mean |err| 1.3-1.6e-3, max 1.8-2.6e-2 (keys 0 .. instead: max 0.38, the sink). The encoders at nb 4000 (127K keys, one KV head): K 1.68 ms, V 0.65 ms, payloads 0.013 ms. 101 chained calls on all 32 cores (nb 48): the last call's O and l equal a fresh call's. Through `LoomNpu` (mc 16, image built for nb 480): 4 jobs x 24 calls at nb 64 and 3 x 8 at nb 480 bit-exact against the emulation; soaks of 300 passes x 4 x 24 calls (nb 64) and 200 x 3 x 8 (nb 480) equal to a fresh call in every call.
 
 ## Engine
 
-`engine/model/engine.hpp` (`Engine`) loads the model, a chunked prefill set and a decode set once and serves `Generate(prompt, params, on_token)` calls one at a time (the `TextGenerator` interface in `engine/model/generator.hpp`; the server in `engine/serve/` talks only to that). Per request: reset the recurrent state, prefill the whole chunks, finish the tail with a partial chunk or with decode steps (whichever its measured costs say is cheaper), then decode. Greedy takes the argmax on the GPU; temperature / top_p sample on the GPU too (`gen_sample`). With `draft mtp`, greedy requests decode speculatively (`Engine::Speculate`, Decode below). With the NPU (`--npu`, `LoomNpuSplit` in `engine/model/loom_npu.hpp`), a prefill set emitted with the NPU split runs it (NPU split, above).
+`engine/model/engine.hpp` (`Engine`) loads the model, a chunked prefill set and a decode set once and serves `Generate(prompt, params, on_token)` calls one at a time (the `TextGenerator` interface in `engine/model/generator.hpp`; the server in `engine/serve/` talks only to that). Per request: reset the recurrent state, prefill the whole chunks, finish the tail with a partial chunk or with decode steps (whichever its measured costs say is cheaper), then decode. Greedy takes the argmax on the GPU; temperature / top_p sample on the GPU too (`gen_sample`). With the NPU (`--npu`, `LoomNpuSplit` in `engine/model/loom_npu.hpp`), a prefill set emitted with the NPU split runs it (NPU split, above).
 
 ## Decode
 
-`engine/model/loom_decoder.hpp` (`LoomDecoder`) is the single-token step. `loom_decode` feeds a prompt through it one token at a time; `loom_forward_pp --gen` runs it after a prefill, on the prefill's KV pools and recurrent state. Decode reads 13.63 GB of weights per token (every MQ4 tensor, one embedding row), so it is a bandwidth problem: the floor is ~58.1 ms at 240 GB/s with the DeltaNet state traffic, and the step runs at 96% of it (results.md).
-
-### Speculative decode
-
-`LoomDecoder::Verify(pos, n)` runs n + 1 tokens (the last accepted token and n drafts, up to 4) through the layers at once: the projections as T-token GEMVs (`gen_gemv` T, one pass over the weights for all tokens; R 4 rows per wave for plain / residual GEMVs, where each wave re-reads x for its rows), every other kernel (norms, conv, DeltaNet, attention, append) once per token exactly as `Step` runs it, so each token's logits are bit-identical to a step's. `Accept(m)` keeps the first m + 1 tokens and restores the recurrent state of the last kept one: the conv state is a ring of T buffers (the verify writes token t's state to slot t), the DeltaNet states are copied to one of T - 1 ring slots after each token but the last, and with quantized KV the open 16-key V tile is snapshotted before the verify and refilled when a rejected token crossed a tile. Rejected keys past the accepted position are simply overwritten later.
-
-The drafter is the MTP layer (`MtpBegin`, `Draft`): rmsnorm(embed(token)) and rmsnorm(h) (h the main stack's output-normed hidden) concatenated, `eh_proj`, one full-attention block with its own f16 KV pool (draft positions), `shared_head_norm` and the shared output head. Its hidden chains into the next draft. A draft costs ~4 ms; a verify of 1 / 2 / 3 / 4 drafts 75 / 80 / 85 / 90 ms against a 62 ms step (synced, the HFQ model, 4K set). `Engine::Speculate` picks each round's draft length k to maximize E(k) / cost(k), E(k) = 1 + p + .. + p^k with p a decayed acceptance rate and cost(k) an average of the measured round times; k = 0 is a plain step (preceded by one draft, which keeps the MTP KV whole and keeps p measured).
+`engine/model/loom_decoder.hpp` (`LoomDecoder`) is the single-token step. `loom_decode` feeds a prompt through it one token at a time; `loom_forward_pp --gen` runs it after a prefill, on the prefill's KV pools and recurrent state. Decode reads every weight tensor once per token (one embedding row), so it is a bandwidth problem (results.md, Decode floor).
 
 ### Step, per layer
 
-1. `normrot` (`gen_rot.gen_norm`): rmsnorm and the rotation of its output in one kernel.
+1. `rmsnorm` (attn_norm).
 2. Input projections as one band-fused GEMV (`gb_*`): attn_q / attn_k / attn_v, or attn_qkv / attn_gate / ssm_alpha / ssm_beta, in one dispatch.
-3. Full attention: `unpack` (q / gate), `rope` (QK norm + RoPE), KV append (`dattn_kvappend`, or `dattn_kappend_q` + `dattn_vappend_q`), `dattn_part` (or `dattn_part_q`), `dattn_reduce`, the rotation `drot_*`, then `gv_resid` attn_output.
-4. DeltaNet: `deltanet_conv` (the conv fused into the DeltaNet step, gated norm inside), `drot_*` (into HF head order), then `gv_resid` ssm_out.
-5. `normrot`, `gv_swiglu` (ffn_gate and ffn_up in one kernel, with the rotation of its output: `swrot`, below), `gv_resid` ffn_down.
+3. Full attention: `unpack` (q / gate), `rope` (QK norm + RoPE), KV append (`dattn_kvappend`, or `dattn_kappend_q` + `dattn_vappend_q`), `dattn_part` (or `dattn_part_q`), `dattn_reduce`, then `gv_resid` attn_output.
+4. DeltaNet: `deltanet_conv` (the conv fused into the DeltaNet step, gated norm inside), then `gv_resid` ssm_out.
+5. `rmsnorm` (post_attention_norm), `gv_swiglu` (ffn_gate and ffn_up in one kernel), `gv_resid` ffn_down.
 
-Head: `normrot` without awq, `gv_plain` output (248320 rows) with the argmax in it. The argmax writes the next token id into a device token stream; the next step's `embed` kernel (Q8_0 row) reads it. Positions come from a device array. So steps are enqueued back to back and the host waits only after the prompt and at the end. Each step is submitted as soon as it is recorded (`LoomDevice::Flush`), so the GPU runs one step while the host records the next.
-
-Rotations inside their producers, bit-identical to separate `drot_*` dispatches:
-
-- `normrot` (`drot_norm_*`): each of the 5 workgroups reduces all of x in rmsnorm's lane order, then waves 0-1 rotate the workgroup's 1024 values.
-- `swrot` (`gv_swiglurot_*`): ffn_down's input. After its stores, a SwiGLU workgroup adds 1 to its 256-row block's counter (`gen_rot.last_arriver`); the block's last workgroup (old count & 31 = 31) rotates it in place. The counters are monotonic and never reset.
+Head: `rmsnorm` (output_norm), `gv_plain` output (248320 rows) with the argmax in it. The argmax writes the next token id into a device token stream; the next step's `embed` kernel (Q8_0 row) reads it. Positions come from a device array. So steps are enqueued back to back and the host waits only after the prompt and at the end. Each step is submitted as soon as it is recorded (`LoomDevice::Flush`), so the GPU runs one step while the host records the next.
 
 ### Flag-chained dispatch
 
@@ -226,15 +182,12 @@ A stream dispatch ends with an ordering barrier: the next kernel cannot launch u
 Logits are byte-identical to the barriered step. On top of the chain:
 
 - Peeled GEMV start (`emit_decode.PEEL`, `gen_gemv` peel): a chained GEMV runs its first K iteration before the loop, split by dataflow at a `// chain.wait` marker. The weight loads and their decode, which do not read x, issue before the wait, so the first weights arrive during the producer's tail. Band GEMVs have one marker per band branch.
-- The rotation kernels load their constants (s1, awq, s2, the norm weight) before the wait and x after it, and divide x by awq with a reciprocal and Markstein's three fmas (the IEEE quotient for every normal awq) instead of the IEEE divide.
 - DeltaNet state stores (decode.txt `latestate`): `deltanet_conv` stores its updated state after its output, past a `// chain.signal` marker, with gfx11 DLC (no MALL allocation, HRX patch 0045), so the 3 MiB per layer do not get flushed out of the MALL during the next GEMV's weight stream. `LoomDecoder::Step` starts each step with `Order()`: the next token's DeltaNet reads the state after it.
 - Greedy argmax in the output GEMV (decode.txt `amax`, `gen_gemv.amax_tail`): each workgroup reduces its rows' keys (order-preserving bits of the logit, then the inverted row, as a u64; NaN and +-inf skipped, -0 as +0) through LDS and takes one atomic max; the last workgroup by count stores the row as the token and resets the key. Ties keep the lowest index. Sampled steps run the output GEMV without it and then `gen_sample`.
 
 ### GEMV design
 
-`tools/gen_gemv.py`, one kernel per (kind, rows, K), MQ4 rows (unsigned codes: nibble xor 8 with bias 8, one scale per 128).
-
-A native GGUF set (`emit_decode.py` with `YAH_NATIVE=1`) runs the GGUF's own formats unrotated instead: Q8_0, Q2_K-Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, the IQ grids bound after the weights; token_embd is Q8_0 (converted at load), and there are no verify GEMVs or MTP layer.
+`tools/gen_gemv.py`, one kernel per (kind, formats, rows, K), in the GGUF's own formats: Q8_0, Q2_K-Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, the IQ grids bound after the weights; token_embd is Q8_0 (converted at load).
 
 - Decode on 32-bit words (`vector<4xi32>`), never on `vector<16xi8>`, which Loom lowers byte by byte.
 - Two rows per wave share each x load; 4 waves per workgroup (R x W = 2 x 4, decode.txt `rw`).
@@ -291,14 +244,14 @@ A HAL set is a directory of compiled kernels plus one text file that records how
 
 ### Prefill set: `tools/emit_prefill_pp.py <model> <dir> [B]`
 
-- One GEMM HAL per (kind, shape), the fixed kernels (`embed.hal`, `normq_5120.hal`, `rotq_*.hal`, `convkq*.hal`, `rowsplit_*.hal` = DeltaNet, `pnq_*.hal`, `prepab*.hal`, `rope.hal`, `wmma.hal` = attention, `rmsnorm.hal`, `rot_head.hal`, `gemv.hal`, `argmax.hal`, ...), one rope / attention / KV-writer HAL per chunk, and `rot_signs.bin`.
-- `dispatch.txt`, one line per HAL: `<hal> <tokens per workgroup> <row groups> <token tiles>`. Marker rows with zeros carry the set's features (`a4`, `rot`, `kv_paged`, the overlap markers above, `ctx <B> 0 <T>` for chunked sets, ...). The driver refuses a set without `rot` (a GGUF-era set).
+- One GEMM HAL per (kind, formats, shape, input form), the fixed kernels (`embed.hal`, `norm*.hal`, `convkq*.hal`, `rowsplit*.hal` = DeltaNet, `postnorm*.hal`, `prepab*.hal`, `rope.hal`, `wmma.hal` = attention, `rmsnorm.hal`, `gemv.hal`, `argmax.hal`, ...), one rope / attention / KV-writer HAL per chunk, and the IQ grid tables.
+- `dispatch.txt`, one line per HAL: `<hal> <tokens per workgroup> <row groups> <token tiles>`. Marker rows with zeros carry the set's features (`native`, `kv_paged`, `qsplit`, `gsig`, `dnsplit`, `ctx <B> 0 <T>` for chunked sets, ...). The driver refuses a set without `native` (an MQ4 set).
 - `tools/footprint_gate.py` runs for every GEMM before it is emitted and refuses a kernel whose declared operand footprint is larger than the buffer the driver binds.
 
 ### Decode set: `tools/emit_decode.py <model> <dir> [max_context]`
 
-- `gv_<kind>_<fmts>_<M>_<K>.hal` and `gb_<fmts>_<Ms>_<K>.hal` (GEMVs and band GEMVs), `dattn_*` (attention), `drot_*`, `unpack`, `rope`, `deltanet_conv`, `embed`, `argmax`, `sample`, and `rot_signs.bin`.
-- `decode.txt`: `ctx <T>`, `kv q <K bits> <V bits>` for quantized KV, `chain` (flag-chained kernels; sets without it run barriered), `rot` with `normrot`, `swrot`, `amax` (argmax in the output GEMV), `latestate`, `rw <kind> <R> <W>` (GEMV geometry), and `grid <hal> <workgroups> 0` for every GEMV kernel.
+- `gv_<kind>_<fmts>_<M>_<K>.hal` and `gb_<fmts>_<Ms>_<K>.hal` (GEMVs and band GEMVs), `dattn_*` (attention), `rmsnorm`, `unpack`, `rope`, `deltanet_conv`, `embed`, `argmax`, `sample`, `penalty`, and the IQ grid tables.
+- `decode.txt`: `ctx <T>`, `kv q <K bits> <V bits>` for quantized KV, `chain` (flag-chained kernels; sets without it run barriered), `amax` (argmax in the output GEMV), `latestate`, `rw <kind> <R> <W>` (GEMV geometry), and `grid <hal> <workgroups> 0` for every GEMV kernel.
 - To decode after a prefill, emit the decode set with the same context as the prefill pools and the same `YAH_KV`. The driver refuses a mismatch.
 
 ### From generator to HAL

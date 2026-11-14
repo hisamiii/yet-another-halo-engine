@@ -1749,7 +1749,7 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
         # row r = head*512 + half*256 + d goes to (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
         e("  %qg_tot = index.div %out_total, %c2 : index")
         e(f"  %qg_rows = index.div {orw()}, %c2 : index")
-        qt = "f16" if OUT16 else "f32"   # OUT16: q and gate stored as f16 (emit_prefill_pp.QG16), 8 rows per store
+        qt = "f16" if OUT16 else "f32"   # OUT16: q and gate stored as f16, 8 rows per store
         e(f"  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]x{qt}>")
         assert not (KQG_GSIG and OUT16)
         e(f"  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]x{'f16' if KQG_GSIG16 else qt}>")

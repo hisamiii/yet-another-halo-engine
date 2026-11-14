@@ -1,5 +1,7 @@
 # Results
 
+The MQ4 path (hipfire's HFQ file, GGUFs converted to MQ4, A4 / W4A16 prefill, MTP speculative decoding) was removed on 2026-11-14 (be687da is the last commit with it). The MQ4 numbers below stay as history; the engine now runs the GGUF's own formats (UD-IQ4_XS), and native numbers are marked as such.
+
 Qwen3.8-27B on Strix Halo (gfx1151), Loom kernels through HRX: the MQ4 HFQ model (`qwen3.8-27b.mq4-xts`) since 2026-10-13, IQ4_XS GGUF before (that path was removed 2026-10-20, tag `pre-cleanup-2026-10-20`). One round per number, APU cooled to <= 55 C first, 15 s (pp2048) or 30 s (longer) gap, no clock pinning; the p71 prefill rows at tctl 95 (rules in [build-and-run.md](build-and-run.md)). HIP baselines are in the section below this one.
 
 ## Current results

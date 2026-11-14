@@ -1,4 +1,4 @@
-// Json: the JSON value of the HFQ metadata and the server, in place of nlohmann::ordered_json (the subset of its
+// Json: the JSON value of the server, in place of nlohmann::ordered_json (the subset of its
 // interface core/ and serve/ use, with the same semantics). Objects keep their insertion order; a key set again keeps its place.
 //   Json{{"k", 1}, {"a", {1, 2}}}   brace lists: an object when every element is a [string, value] pair, else an array
 //   Json::parse(text)               RFC 8259; throws Json::parse_error (bad syntax, invalid UTF-8, nesting past 512)

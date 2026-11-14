@@ -1,6 +1,7 @@
 # CPU-only checks: the core and serving build, the tokenizer goldens, yah_server_fake over HTTP. No GPU, no HRX.
 # The tests read the tokenizer from the model's metadata: set the repository variable YAH_MODEL_URL to the model file's
-# download URL (Hugging Face resolve link) and engine/tests/make_tokenizer_fixture.py fetches only that part (~14 MB).
+# download URL (a GGUF's Hugging Face resolve link) and engine/tests/make_tokenizer_fixture.py fetches only that part
+# (~11 MB).
 # Without the variable the job only builds.
 name: cpu
 
@@ -30,17 +31,17 @@ jobs:
         id: fixture
         uses: actions/cache@v6
         with:
-          path: fixture.hfq
+          path: fixture.gguf
           key: fixture-${{ hashFiles('engine/tests/make_tokenizer_fixture.py') }}-${{ vars.YAH_MODEL_URL }}
 
       - name: tokenizer fixture
         if: vars.YAH_MODEL_URL != '' && steps.fixture.outputs.cache-hit != 'true'
-        run: python3 engine/tests/make_tokenizer_fixture.py "${{ vars.YAH_MODEL_URL }}" fixture.hfq
+        run: python3 engine/tests/make_tokenizer_fixture.py "${{ vars.YAH_MODEL_URL }}" fixture.gguf
 
       - name: tokenizer goldens
         if: vars.YAH_MODEL_URL != ''
-        run: python3 engine/tests/verify_tokenizer.py --model fixture.hfq
+        run: python3 engine/tests/verify_tokenizer.py --model fixture.gguf
 
       - name: serving tests
         if: vars.YAH_MODEL_URL != ''
-        run: engine/build/yah_serve_test fixture.hfq engine/build/yah_server_fake
+        run: engine/build/yah_serve_test fixture.gguf engine/build/yah_server_fake

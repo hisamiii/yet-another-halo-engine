@@ -19,7 +19,6 @@ FMT = {
     18: ("iq3xxs", "iq3xxs", 256), 20: ("iq4nl", "iq4nl", 32),
     17: ("iq2xs", "iq2xs", 256), 8: ("q8_0", "q8_0", 32),
     16: ("iq2xxs", "iq2xxs", 256), 22: ("iq2s", "iq2s", 256), 10: ("q2k", "q2k", 256),
-    44: ("mq4", "mq4", 256),   # hipfire MQ4G256 (HFQ models; not a ggml type)
 }
 KSTORE = {"attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight",
           "ssm_beta.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
@@ -29,15 +28,12 @@ SWIGLU = {"ffn_up.weight"}
 
 
 def parse(model):
-    """Return [(name, dims, type)] for every tensor of a model as the engine sees it: an HFQ model or a GGUF one with
-    its projections converted to MQ4G256 at load (yah-dump --table, core/gguf_convert.cpp), or with YAH_NATIVE=1 a
-    GGUF's own tensors (token_embd converted to Q8_0, the embed kernel's format, and an output.weight that is not Q6_K,
+    """Return [(name, dims, type)] for every tensor of a GGUF as the engine sees it (core/gguf_convert.cpp): the GGUF's
+    own tensors (token_embd converted to Q8_0, the embed kernel's format, and an output.weight that is not Q6_K,
     for gen_gemv's head)."""
     f = open(model, "rb")
-    if f.read(4) == b"HFQM" or os.environ.get("YAH_NATIVE") != "1":
-        dump = os.path.join(LOOM, "..", "..", "build", "yah-dump")
-        out = subprocess.run([dump, model, "--table"], capture_output=True, text=True, check=True).stdout
-        return [(p[0], [int(d) for d in p[2:]], int(p[1])) for p in (ln.split() for ln in out.splitlines())]
+    if f.read(4) != b"GGUF":
+        raise SystemExit("%s: not a GGUF file (the engine reads GGUF models only)" % model)
     f.seek(8)
     nt, nkv = struct.unpack("<QQ", f.read(16))
     SIZ = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}

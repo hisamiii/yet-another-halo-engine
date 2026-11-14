@@ -12,14 +12,9 @@ usage: emit_decode.py <model> <outdir> [max_context]       (default 4096, multip
   dattn_{kappend,vappend,part}_q only with a quantized YAH_KV (kv8 | kv4 | k8v4 | k4v8, same as the prefill set):
                                  the kv8a16 / kv4a16 pools; decode.txt gets "kv q KB VB"
   rmsnorm, deltanet_conv, embed  tools/gen_decode_misc.py (deltanet_conv also runs the decode conv)
-  drot_*, rot_signs.bin          MQ4 models only: tools/gen_rot.py on the f32 GEMV inputs (decode.txt "rot")
   unpack, rope, argmax           hand-written kernels in loom/*.loom.
                                  rope's own cache write goes to a one-row dummy (max_context=1); dattn_kvappend writes the pools.
-  gv_<kind>_..._t<VERIFY>.hal    the same GEMVs at VERIFY tokens per dispatch (gen_gemv T): the speculative verify
-                                 (LoomDecoder::Verify; decode.txt "verify - VERIFY 0")
-  gv_plain_mq4_5120_10240.hal    models with an MTP layer (blk.<n>.nextn.*): its eh_proj and its input rotation
-  drot_10240.hal                 (drot_10240; decode.txt "mtp")
-  grid_*.bin, ksigns_iq2xs.bin   YAH_NATIVE=1 (a GGUF's own formats): the IQ tables (loom/tables); no verify GEMVs, no MTP
+  grid_*.bin, ksigns_iq2xs.bin   the IQ tables (loom/tables) the GEMVs of the IQ formats read
   decode.txt                     "ctx <max_context>", GEMV geometry and grids; "chain": the kernels are flag-chained
                                  (tools/gen_chain.py: extra counter binding and wait / signal constants)
 """
@@ -39,19 +34,16 @@ import gen_chain  # noqa: E402
 import gen_decode_misc as DM  # noqa: E402
 import gen_gemv as GV  # noqa: E402
 import gen_kvq  # noqa: E402
-import gen_rot  # noqa: E402
 
 NUM_HEADS, NUM_KV, HEAD_DIM, ROTARY = 24, 4, 256, 64
 # rows per wave R and waves per workgroup W per GEMV kind; recorded in decode.txt ("rw kind R W"). Each wave reads all
-# of x for its rows, so the verify GEMVs (VERIFY tokens of x) want more rows per wave: R 4 for plain / resid takes 14%
-# off a 4-token verify with the steps unchanged (2026-10-26, gfx1151); SwiGLU's two weights spill at R 4 with 4 tokens.
+# of x for its rows (R 4 for plain / resid, 2026-10-26, gfx1151; SwiGLU's two weights spill at R 4 with 4 tokens).
 RW = {"plain": (4, 4), "resid": (4, 4), "swiglu": (2, 4), "bands": (2, 4)}
 
 
 # Every kernel waits on its producer's counter instead of a queue barrier (gen_chain.py; decode.txt "chain").
 # Chained GEMVs load and decode their first PEEL K iterations' weights before the wait (gen_gemv peel).
 PEEL = 1
-VERIFY = 4   # tokens per speculative verify GEMV (a draft of up to VERIFY - 1 tokens and the token before it)
 # The output GEMV also takes the greedy argmax (gen_gemv amax, decode.txt "amax"), instead of the argmax kernel.
 
 
@@ -170,8 +162,6 @@ def main():
         raise SystemExit("max_context must be a multiple of 256")
     os.makedirs(outdir, exist_ok=True)
     gs = gemv_set(model)
-    types = {nm: ty for nm, _, ty in EP.parse(model)}
-    rot = types.get("blk.0.ffn_down.weight") == 44
     # Exact launch grid of every GEMV kernel; the decoder refuses any other.
     # Loom may drop row clamps it proves redundant for this grid, so a larger grid reads out of bounds and can hang the GPU.
     grids = {}
@@ -181,26 +171,10 @@ def main():
         peel = (PEEL)
         emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel), name, outdir)
         grids[name] = M // GV.rows_per_wg(R, W)
-        if rot and kind == "swiglu":   # also rotating its output for ffn_down (decode.txt "swrot")
-            rname = name.replace("gv_swiglu_", "gv_swiglurot_")
-            emit_src(GV.gen(kind, fmts, M, K, R, W, rot=True, peel=peel), rname, outdir)
-            grids[rname] = grids[name]
         if ((kind == "plain") and (M == vocab)):   # the output GEMV
             aname = name.replace("gv_plain_", "gv_plainam_")
             emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, amax=True), aname, outdir)
             grids[aname] = grids[name]
-    for name, (kind, fmts, M, K) in sorted(gs.items() if rot else ()):   # the verify GEMVs: no peel, no fused epilogues
-        R, W = RW[kind]   # (R = 1 halves the accumulators but runs slower: more x reads per weight row)
-        emit_src(GV.gen(kind, fmts, M, K, R, W, T=VERIFY), name + "_t%d" % VERIFY, outdir)
-        grids[name + "_t%d" % VERIFY] = M // GV.rows_per_wg(R, W)
-    eh = [(d, ty) for nm, d, ty in EP.parse(model) if nm.endswith(".nextn.eh_proj.weight")]
-    if eh and rot:   # the MTP layer's input projection (embedding and hidden concatenated)
-        (K, M), ty = (int(eh[0][0][0]), int(eh[0][0][1])), eh[0][1]
-        name = gemv_name("plain", [GV.GGML[ty]], M, K)
-        emit_src(GV.gen("plain", [GV.GGML[ty]], M, K, *RW["plain"], peel=PEEL), name, outdir)
-        grids[name] = M // GV.rows_per_wg(*RW["plain"])
-        if rot:
-            emit_src(gen_rot.gen(K, 1, ty="f32", early=True), "drot_%d" % K, outdir)
     bs = bands_set(model)
     for name, (fmts, Ms, K) in sorted(bs.items()):
         emit_src(GV.gen_bands(fmts, Ms, K, *RW["bands"], peel=(PEEL)), name, outdir)
@@ -226,25 +200,14 @@ def main():
     emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # also runs the decode conv
     # token_embd row (Q8_0) from the device token stream
     emit_src(DM.gen_embed_q8_0(), "embed", outdir)
-    # MQ4 GEMVs read x in the weights' rotated basis: in place per input site, ssm_out's input gathered into HF head
-    # order, the head's without awq
-    if rot:
-        for name, args in (("drot_5120", (5120, 1)), ("drot_6144", (6144, 1)), ("drot_17408", (17408, 1)),
-                           ("drot_heads", (6144, 1, True, (48, 16, 128))), ("drot_head", (5120, 1, False))):
-            emit_src(gen_rot.gen(*args, ty="f32", early=True), name, outdir)
-        # rmsnorm + rotation in one kernel at the norm sites (decode.txt "normrot")
-        emit_src(gen_rot.gen_norm(5120, early=True), "drot_norm_5120", outdir)
-        emit_src(gen_rot.gen_norm(5120, awq=False, early=True), "drot_norm_head", outdir)
-        open(os.path.join(outdir, "rot_signs.bin"), "wb").write(gen_rot.signs())
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-k / top-p / min-p sampling into the token stream
     emit_src(DM.gen_penalty(T=T), "penalty", outdir)     # repetition / frequency / presence penalties on the logits
-    if not rot:   # the GEMVs of the IQ formats read their grids
-        for f in os.listdir(os.path.join(LOOM, "tables")):
-            shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
+    for f in os.listdir(os.path.join(LOOM, "tables")):   # the GEMVs of the IQ formats read their grids
+        shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + ("rot - 0 0\nnormrot - 0 0\nswrot - 0 0\n" if rot else "") + (("chain - 0 0\n")) + (("amax - 0 0\n")) + ("latestate - 0 0\n" if DM.LATE_STATE else "") +
-        ("verify - %d 0\n" % VERIFY if rot else "") + ("mtp - 0 0\n" if eh and rot else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
+        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + "chain - 0 0\n" + "amax - 0 0\n" +
+        ("latestate - 0 0\n" if DM.LATE_STATE else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + the decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))

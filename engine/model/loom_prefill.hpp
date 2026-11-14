@@ -178,7 +178,6 @@ class LoomPrefill {
     npu_ = npu;
     npu_dcol_ = geom_.count("npudcol") != 0;
     halves_ = !hgeom_.empty() && npu_dcol_;
-    if (halves_ && geom_.count("dnperm")) throw LoomError("dnperm sets have no token-half DeltaNet");
     if (halves_ && (npu_->A().size < 6 * HNpuK(5120).a || npu_->C().size < HalfC(1) + HalfCBytes()))
       throw LoomError("prefill: the NPU buffers lack the token halves' slots (build the split from npu_plan())");
     std::size_t rem = 0;
@@ -270,7 +269,6 @@ class LoomPrefill {
     keep_rows_ = keep;
     if (std::size_t{ci + 1} * B_ > T_) throw LoomError("prefill: chunk past the emitted context");
     if (n_ == 0) throw LoomError("prefill: RunLayers before Embed");
-    if (flags_) gpu_.Fill(*flags_, 0);   // the chunk's completion counters (FlagSlot), in stream order before its work
     // The layers go into one graph, so kernels with no data between them (the input projections of a layer, the DeltaNet
     // gate projection and the conv / DeltaNet chain) can run at the same time.
     // NPU split: full chunks only, its handoffs graph nodes on flag words (NpuEnqueue / NpuJoin)
@@ -288,7 +286,6 @@ class LoomPrefill {
     // layer's last kernel anyway. The NPU split's flagged jobs keep one graph.
     split_layer_ = !npu_on_ && cfg_.main_block_count() > 1 ? 1 : 0;
     RecordLayers(ci, hook);
-    FlushKres();
     split_layer_ = 0, split_armed_ = false;
     LaunchChunk();
   }
@@ -399,7 +396,6 @@ class LoomPrefill {
 
   // The 64 layers of chunk ci, in dispatch order.
   void RecordLayers(std::uint32_t ci, const KvHook& hook) {
-    flag_slot_ = 0;
     Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
              {EmbedTable(), Ref(*ids_), Ref(*hidden_)}, 4);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) RecordLayer(l, ci, hook);
@@ -417,13 +413,11 @@ class LoomPrefill {
       const bool q_npu = NpuRows("q") && NpuOk(pre + "attn_q.weight") && !NpuHal(KqgHal(pre + "attn_q.weight", q_af)).empty();
       if (!RunAttentionHalves(l, ci, pre, hook, q_af, k_af, v_af, q_npu)) {
         FfnUnpackPending(-1);
-        nq_want_ = nqw_ && !q_npu;
         RunNorm(pre + "attn_norm.weight",
                 q_af && k_af && v_af   ? NormOut::kTiled
                 : q_af || k_af || v_af ? NormOut::kBoth
                                        : NormOut::kRow,
                 q_npu ? "q" : nullptr);
-        nq_want_ = false;
         RunAttention(l, ci, pre, hook, q_af, k_af, v_af);
       }
     } else {
@@ -436,10 +430,8 @@ class LoomPrefill {
                            !NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)).empty();
       if (!qkv_npu || !RunDeltaNetHalves(l, pre, qkv_af, gate_af)) {
         FfnUnpackPending(-1);
-        nq_want_ = nqw_ && !qkv_npu;
         RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow,
                 qkv_npu ? "qkv" : nullptr);
-        nq_want_ = false;
         RunDeltaNet(l, pre, qkv_af, gate_af);
       }
     }
@@ -459,9 +451,6 @@ class LoomPrefill {
     const auto* ow = Find("output.weight");
     Dispatch(Exe("rmsnorm.hal"), "yah_rmsnorm", 1, 1, 1, 32, 1, 1,
              {{hidden_->handle, std::size_t{row} * kHidden * 4, std::size_t{kHidden} * 4}, TRef(*onw), Ref(*normed_)});
-    // MQ4 head: the f32 norm row into the weights' basis (no awq) first
-    if (rot_)
-      Dispatch(Exe("rot_head.hal"), "yah_rot256", kHidden / 1024, 1, 1, 64, 1, 1, {Ref(*normed_), Ref(*rot_signs_)});
     if (geom_.count("gemv.hal")) {   // gen_gemv's tile-free GEMV (a head that is not Q6_K)
       const Geom& g = geom_.at("gemv.hal");   // (rows per workgroup, lanes, workgroups)
       Dispatch(Exe("gemv.hal"), "yah_gemv", g.tt, 1, 1, g.rowgrp, 1, 1, {TRef(*ow), Ref(*normed_), dst});
@@ -578,7 +567,6 @@ class LoomPrefill {
       case 16: *out = {"iq2xxs", 256}; return true;
       case 22: *out = {"iq2s", 256}; return true;
       case 10: *out = {"q2k", 256}; return true;
-      case 44: *out = {"mq4", 256}; return true;
       default: return false;
     }
   }
@@ -669,7 +657,6 @@ class LoomPrefill {
                 std::uint64_t writes = ~std::uint64_t{0}, const std::vector<hrx_buffer_ref_t>* also_writes = nullptr,
                 std::uint64_t untracked = 0) {
     if (split_armed_ && graph_ && !npu_planning_ && !warming_) SplitGraph();
-    FlushKres();
     if (npu_planning_ || warming_) return;
     const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
@@ -696,6 +683,8 @@ class LoomPrefill {
   }
 
   void LoadTables() {
+    // a set of the GGUF's own formats (emit_prefill_pp.py writes the "native" row); the removed MQ4 sets lack it
+    if (!geom_.count("native")) throw LoomError("prefill: " + dir_ + " is not a native set (an MQ4 set: re-emit it)");
     const auto table = [&](const char* file, std::size_t bytes) -> LoomBuffer& {
       LoomBuffer& b = Alloc(bytes);
       std::vector<std::uint8_t> v(bytes);
@@ -709,22 +698,6 @@ class LoomPrefill {
     grid_iq2xs_ = &table("grid_iq2xs.bin", 1024 * 4);
     grid_iq2s_ = &table("grid_iq2s.bin", 2048 * 4);
     ksigns_ = &table("ksigns_iq2xxs.bin", 128);
-    rot_ = geom_.count("rot") != 0;
-    a4_ = geom_.count("a4") != 0;
-    nqov_ = a4_ && geom_.count("nqov") != 0;
-    dnov_ = a4_ && geom_.count("dnov") != 0;
-    pnq_ab_ = dnov_ && geom_.count("pnq_abf.hal") != 0;
-    guov_ = a4_ && geom_.count("guov") != 0;
-    nqgu_ = guov_ && geom_.count("nqgu") != 0;
-    rqk_ = nqov_ && geom_.count("rqk") != 0;
-    rqp_ = rqk_ && guov_ && geom_.count("rotqp_17408.hal") != 0;
-    aov_ = rqk_ && geom_.count("aov") != 0 && std::ifstream(dir_ + "/wmmaf.hal").good();
-    ropew_ = geom_.count("ropew") != 0;
-    ropekv_ = geom_.count("ropekv") != 0;
-    if (const auto it = geom_.find("nqp"); it != geom_.end()) nqp_ = it->second.tokens;
-    nqw_ = a4_ && geom_.count("nqw") != 0;
-    dnring_ = nqw_ && rqk_ && geom_.count("dnring") != 0;
-    if (rot_) rot_signs_ = &table("rot_signs.bin", 512 * 4);
   }
 
   void AllocateBuffers() {
@@ -735,13 +708,6 @@ class LoomPrefill {
     reszero_ = &Alloc(B * kHidden * 4);
     sumout_ = &Alloc(B * kHidden * 4);
     scratch_ = &Alloc(B * kFfn * 2);
-    if (rot_ && !a4_) rotbuf_ = &Alloc(B * kInner * 2);
-    if (a4_) aq_ = &Alloc(B * kFfn / 2), ad_ = &Alloc(B * (kFfn / 128) * 4);
-    if (nqov_ || dnov_ || guov_) {
-      // the flag-waiting kernels' activation pair (swapped with aq_ / ad_ after each) and their producers' counters
-      aq2_ = &Alloc(B * kFfn / 2), ad2_ = &Alloc(B * (kFfn / 128) * 4);
-      flags_ = &Alloc(kFlagSlots * TokenTiles128() * 4);
-    }
     qkv_ = &Alloc(B * kQProj * 4);
     gate_ = &Alloc(B * kInner * 4);
     alpha_ = &Alloc(B * kTs * 4);
@@ -790,7 +756,7 @@ class LoomPrefill {
     bool any_af = false;
     for (const auto& [name, g] : geom_) any_af = any_af || name.size() > 7 && name.compare(name.size() - 7, 7, ".af.hal") == 0;
     if (any_af) normt_ = &Alloc(B * kHidden * 2);
-    if (!a4_) gateffn_ = &Alloc(B * kFfn * 4);   // A4's gu GEMM keeps the gate in LDS
+    gateffn_ = &Alloc(B * kFfn * 4);
     // Per-workgroup weight staging (ABI only: the tile GEMMs stage in LDS) and epilogue scratch sized for the widest
     // GEMM, which the compiler declares over the whole [m_rows][tokens] tile.
     uwstage_ = &Alloc(std::size_t{kFfn} * 16 * 2);
@@ -856,7 +822,6 @@ class LoomPrefill {
     // "rope_kpaged": RoPE writes the fp16 K rows straight into the paged pool.
     rope_kpaged_ = geom_.count("rope_kpaged") != 0;
     qnorm_ = geom_.count("qnorm") != 0;
-    qg16_ = geom_.count("qg16") != 0;
     gsig_ = geom_.count("gsig") != 0;
     qsplit_ = geom_.count("qsplit") != 0;
     vtrope_ = geom_.count("vtrope") != 0;
@@ -912,12 +877,11 @@ class LoomPrefill {
   // Load every HAL chunk 0 dispatches now (a pass of the layers that dispatches nothing): a first load copies the code to
   // the GPU, ~0.25 ms per HAL, which RunLayers would otherwise spend before the GPU starts.
   void WarmExecutables() {
-    LoomBuffer *h = hidden_, *h2 = hidden2_, *aq = aq_, *aq2 = aq2_, *ad = ad_, *ad2 = ad2_;
+    LoomBuffer *h = hidden_, *h2 = hidden2_;
     n_ = B_, warming_ = true;
     RecordLayers(0, {});
-    FlushKres();
     n_ = 0, warming_ = false;
-    hidden_ = h, hidden2_ = h2, aq_ = aq, aq2_ = aq2, ad_ = ad, ad2_ = ad2;
+    hidden_ = h, hidden2_ = h2;
   }
 
   // Bindings shared by every GEMM: weights, then the IQ grid / sign tables the format needs.
@@ -1009,11 +973,9 @@ class LoomPrefill {
     const std::uint32_t nn = trim_row_ == kAllRows && FfnNpuOk(pre) ? NpuRows("ffn") : 0;
     const std::string gs = nn ? NpuHal(KstoreHal(pre + "ffn_gate.weight", gate_af)) : "";
     const std::string us = nn ? NpuHal(SwigluHal(pre + "ffn_up.weight", up_af, down_af)) : "";
-    nq_want_ = nqgu_ && nn == 0;
     RunNorm(pre + "post_attention_norm.weight",
             gate_af && up_af ? NormOut::kTiled : gate_af || up_af ? NormOut::kBoth : NormOut::kRow,
             !gs.empty() && !us.empty() ? "ffn" : nullptr);
-    nq_want_ = false;
     if (!gs.empty() && !us.empty()) {
       // the NPU's rows of gate and up; the unpack applies silu(gate) * up
       std::vector<NpuView> ag, au;
@@ -1029,15 +991,6 @@ class LoomPrefill {
       RunSwigluSplit(pre + "ffn_up.weight", up_af, us, nn);
       NpuJoin();
       FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
-    } else if (a4_) {
-      // one GEMM for gate and up: silu(gate) * up straight into ffnup_ (gen_gemm_iu4 gu); guov: flagged (a counter per
-      // 1024 features and token tile), RunResidual's rotq waits on it
-      const auto* up = Find(pre + "ffn_up.weight");
-      if (guov_) gu_cnt_ = FlagSlots(kFfn / 1024);
-      gu_flagged_ = RunIu4("gu", *Find(pre + "ffn_gate.weight"), {ffnup_}, {std::size_t(up->dims[1]) * 2}, 0b10000, up,
-                           guov_ ? &gu_cnt_ : nullptr, &nq_cnt_);
-      gu_waited_ = gu_flagged_ && nq_cnt_.buffer;
-      nq_cnt_ = {};
     } else {
       RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
       RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
@@ -1384,9 +1337,8 @@ class LoomPrefill {
     return true;
   }
 
-  // The RMSNorm of hidden() rows into scratch_ (f16; afrag: fragment-major into normt_), MQ4 sets: rotated into the
-  // weights' basis (A4: and quantized into aq_ / ad_). npu_site: the NPU split of a K = 5120 site reads this norm's
-  // output; with "npunormbfp" in the set the norm also writes its BFP16 input into A ("<norm>_bfp.hal") and
+  // The RMSNorm of hidden() rows into scratch_ (f16; afrag: fragment-major into normt_). npu_site: the NPU split of a
+  // K = 5120 site reads this norm's output; with "npunormbfp" in the set the norm also writes its BFP16 input into A ("<norm>_bfp.hal") and
   // NpuEncode(npu_site) skips the encoder.
   void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow, const char* npu_site = nullptr) {
     // A row takes `split` waves (dispatch.txt norm_split, else 1); a workgroup of w waves takes w / split rows.
@@ -1404,44 +1356,6 @@ class LoomPrefill {
     const std::uint32_t rows_per_wg = ws ? ws / 32 / split : 1;
     if (!rows_per_wg || (ws && ws % (32 * split))) throw LoomError("norm.hal: workgroup size does not match norm_split");
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
-    if (a4_ && mode == NormOut::kRow && !bfp && geom_.count("normq_5120.hal")) {
-      // A4: the norm and its rotq in one kernel (gen_rot.gen_nq), one row per workgroup; the f16 norm output is not kept.
-      // nqov: right after its kres (deferred by RunResidual, untrimmed) as kresf + normqf with no graph edge between
-      // them: the rows wait on the kres's per-token-tile counters (FlagSlot), so they start in the GEMM's tail. normqf
-      // writes the other activation pair (the kres still reads aq_ / ad_), which becomes aq_ / ad_.
-      // nq_want_ (nqgu: the FFN norm, nqw: the attention norm): the normq also counts its finished rows in nq_cnt_ for
-      // the GEMMs that wait on them
-      const bool want = std::exchange(nq_want_, false);
-      nq_cnt_ = {};
-      if (const PendingKres p = pending_kres_; p.t && p.out == hidden_) {
-        pending_kres_ = {};
-        const hrx_buffer_ref_t cnt = FlagSlot();
-        const std::int64_t trim = std::exchange(trim_row_, p.trim);
-        const bool flagged = RunIu4("kres", *p.t, {p.in, p.out}, {std::size_t(p.t->dims[1]) * 4, std::size_t(p.t->dims[1]) * 4},
-                                    0b10000, nullptr, &cnt, &p.wcnt, p.chain ? 0b11000 : 0);
-        trim_row_ = trim;
-        if (flagged) {
-          std::vector<hrx_buffer_ref_t> b = {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))),
-                                             Ref(*rot_signs_), Ref(*aq2_), Ref(*ad2_), cnt};
-          if (want) b.push_back(nq_cnt_ = FlagSlot());
-          // a chained kres (rqk): aq2_ / ad2_'s readers since the last barrier (the gu) finished each token tile
-          // before the rotq, the kres and so these rows: untracked too
-          const std::uint64_t pair = p.chain && p.wcnt.buffer ? 0b110000 : 0;
-          Dispatch(Exe(want ? "normqfo_5120.hal" : "normqf_5120.hal"), "yah_normq", want && nqp_ ? nqp_ : B_, 1, 1,
-                   geom_.at("normq_5120.hal").rowgrp, 1, 1, b, want ? 0b10110000 : 0b0110000, nullptr,
-                   (want ? 0b11000001 : 0b1000001) | pair);
-          std::swap(aq_, aq2_), std::swap(ad_, ad2_);
-          return;
-        }
-      }
-      FlushKres();
-      std::vector<hrx_buffer_ref_t> b = {Ref(*hidden_), TRef(*Find(wname)), TRef(*Find(NormAwq(wname))),
-                                         Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)};
-      if (want) b.push_back(nq_cnt_ = FlagSlot());
-      Dispatch(Exe(want ? "normqo_5120.hal" : "normq_5120.hal"), "yah_normq", want && nqp_ ? nqp_ : B_, 1, 1,
-               geom_.at("normq_5120.hal").rowgrp, 1, 1, b, want ? 0b1110000 : 0b110000, nullptr, want ? 0b1000000 : 0);
-      return;
-    }
     std::vector<hrx_buffer_ref_t> b =
         mode == NormOut::kBoth
             ? std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
@@ -1450,151 +1364,7 @@ class LoomPrefill {
                                             Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)};
     if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
-    if (rot_) {
-      if (mode != NormOut::kRow || bfp) throw LoomError("prefill: MQ4 sets rotate only the row-major norm output");
-      if (a4_)
-        RotQ(*scratch_, kHidden, NormAwq(wname), false);
-      else
-        Rotate(*scratch_, nullptr, kHidden, NormAwq(wname));
-    }
   }
-  // the awq of a norm's input site: the post-attention norm feeds the FFN, attn_norm qkv / gate / alpha / beta or q / k / v
-  std::string NormAwq(const std::string& wname) const {
-    const std::string pre = wname.substr(0, wname.find('.', 4) + 1);
-    const char* w = wname.find("post_attention_norm") != std::string::npos   ? "ffn_gate"
-                    : cfg_.IsFullAttention(std::stoul(wname.substr(4))) ? "attn_q"
-                                                                        : "attn_qkv";
-    return pre + w + ".awq";
-  }
-  // MQ4 sets: x (B_ rows of k f16) into the weights' basis (gen_rot): in place, or dst != nullptr (k = kInner, ssm_out):
-  // the DeltaNet value heads from GGUF into HF order into dst.
-  void Rotate(const LoomBuffer& x, const LoomBuffer* dst, std::uint32_t k, const std::string& awq) {
-    std::vector<hrx_buffer_ref_t> b = {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_)};
-    if (dst) b.push_back(Ref(*dst));
-    Dispatch(Exe(dst ? std::string("rot_heads.hal") : "rot_" + std::to_string(k) + ".hal"), "yah_rot256", k / 1024, B_,
-             1, 64, 1, 1, b);
-  }
-  // A4 sets: x (B_ rows of k f16) rotated and quantized into aq_ / ad_ (gen_rot.gen_q, one scale per 128 values);
-  // heads: ssm_out's value heads from GGUF into HF order.
-  // ocnt (rqk): counters for the kres after it (PendingKres::wcnt) when this rotq has a counting variant
-  // (rotqfo_17408, rotqo_6144), else left null. Returns whether it ran flagged after a waiting gu (PendingKres::chain).
-  bool RotQ(const LoomBuffer& x, std::uint32_t k, const std::string& awq, bool heads, hrx_buffer_ref_t* ocnt = nullptr) {
-    const std::string hal = heads ? std::string("rotq_heads.hal") : "rotq_" + std::to_string(k) + ".hal";
-    const Geom& g = geom_.at(hal);
-    if (std::exchange(gu_flagged_, false)) {
-      // the flagged gu's output, x untracked: the workgroups wait on its counters, so they run in the GEMM's tail; the
-      // other activation pair (the gu still reads aq_ / ad_) becomes aq_ / ad_
-      // gu_waited_: the gu waited on its normq's counters, so no barrier since the kres that read aq2_ / ad2_ (nqov); a
-      // row's token tile of that kres finished before its normq rows, gu tiles and so these workgroups: untracked too
-      if (&x != ffnup_ || k != kFfn || heads) throw LoomError("rotqf_17408.hal: not the flagged gu's output");
-      const bool chain = std::exchange(gu_waited_, false), counts = ocnt != nullptr;
-      std::vector<hrx_buffer_ref_t> b = {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq2_), Ref(*ad2_), gu_cnt_};
-      if (counts) b.push_back(*ocnt = FlagSlot());
-      // rqp: as persistent workgroups (rotqp_17408), so the kres after it is not queued behind 34816 rotq workgroups
-      const bool persist = counts && rqp_;
-      Dispatch(Exe(persist ? "rotqp_17408.hal" : counts ? "rotqfo_17408.hal" : "rotqf_17408.hal"), "yah_rotq256",
-               persist ? geom_.at("rotqp_17408.hal").tokens : g.tt, persist ? 1 : B_, 1, g.rowgrp, 1, 1, b,
-               counts ? 0b1011000 : 0b11000, nullptr, (chain ? 0b111001 : 0b100001) | (counts ? 0b1000000 : 0));
-      std::swap(aq_, aq2_), std::swap(ad_, ad2_);
-      return chain && counts;
-    }
-    const std::string ohal = "rotqo_" + std::to_string(k) + ".hal";
-    const bool counts = ocnt && !heads && k == 6144;
-    std::vector<hrx_buffer_ref_t> b = {Ref(x), TRef(*Find(awq)), Ref(*rot_signs_), Ref(*aq_), Ref(*ad_)};
-    if (counts) b.push_back(*ocnt = FlagSlot());
-    // rotqop_6144: as persistent workgroups, so the kres after it is not queued behind the rotq's grid
-    const std::string phal = "rotqop_" + ohal.substr(6);
-    // the flagged attention's output (x untracked): the persistent workgroups wait on its counters
-    if (const auto it = geom_.find("rotqopf_6144.hal"); std::exchange(attn_flagged_, false) && counts && &x == scratch_ &&
-                                                         it != geom_.end()) {
-      b.insert(b.begin() + 5, attn_cnt_);
-      Dispatch(Exe("rotqopf_6144.hal"), "yah_rotq256", it->second.tokens, 1, 1, g.rowgrp, 1, 1, b, 0b1011000, nullptr,
-               0b1100001);
-      return false;
-    }
-    if (const auto it = geom_.find(phal); counts && it != geom_.end()) {
-      Dispatch(Exe(phal), "yah_rotq256", it->second.tokens, 1, 1, g.rowgrp, 1, 1, b, 0b111000, nullptr, 0b100000);
-      return false;
-    }
-    Dispatch(Exe(counts ? ohal : hal), "yah_rotq256", g.tt, B_, 1, g.rowgrp, 1, 1, b, counts ? 0b111000 : 0b11000,
-             nullptr, counts ? 0b100000 : 0);
-    return false;
-  }
-  // A4 sets: the iu4 GEMM (gen_gemm_iu4) of kind on t over aq_ / ad_; io: the kind's bindings after them (outputs at
-  // the bits of writes), row_bytes: their bytes per token.
-  // t2: a second weight tensor bound after the activations (gu: up beside gate).
-  // cnt (kres, kstore, kstoreh): the flagged GEMM (iu4_<kind>f_*: per-token-tile completion counters in cnt, a FlagSlot,
-  // untracked) when the chunk is untrimmed; returns whether it ran flagged.
-  // wcnt: the activations' producer's counters (nq_cnt_, a rotq's): untrimmed, the GEMM also waits on them
-  // (iu4_<kind>[f]w_*), aq_ / ad_ and wcnt untracked, so no graph barrier separates it from the producer; then also the
-  // bindings at the bits of untrack, which the producer's own waits order per token tile.
-  bool RunIu4(const char* kind, const core::TensorInfo& t, std::initializer_list<const LoomBuffer*> io,
-              std::initializer_list<std::size_t> row_bytes, std::uint64_t writes, const core::TensorInfo* t2 = nullptr,
-              const hrx_buffer_ref_t* cnt = nullptr, const hrx_buffer_ref_t* wcnt = nullptr, std::uint64_t untrack = 0) {
-    const std::size_t K = t.dims[0];
-    const std::string hal = std::string("iu4_") + kind + "_" + std::to_string(MTiles(t)) + "_" + std::to_string(K / 256) + ".hal";
-    const Geom g = GeomOf(hal);
-    std::vector<hrx_buffer_ref_t> b = {TRef(t), Ref(*aq_), Ref(*ad_)};
-    std::vector<std::size_t> rb = {K / 2, K / 128 * 4};
-    if (t2) b.push_back(TRef(*t2)), rb.push_back(0);
-    for (const LoomBuffer* x : io) b.push_back(Ref(*x));
-    rb.insert(rb.end(), row_bytes);
-    const std::uint32_t tt = Trim(b, 1, rb, g);
-    const char* sfx = std::strcmp(kind, "kres") == 0 ? "_kres" : std::strcmp(kind, "kqg") == 0 ? "_kqg" : std::strcmp(kind, "gu") == 0 ? "_gu" : "";
-    // dispatch.txt "iu4grp_<hal> G": grouped grid (G, token tiles, row tiles / G), x fastest = bands of G weight tiles
-    std::uint32_t gx = MTiles(t) / g.rowgrp, gz = 1;
-    if (const auto it = geom_.find("iu4grp_" + hal); it != geom_.end()) {
-      if (it->second.tokens == 0 || gx % it->second.tokens != 0) throw LoomError(hal + ": iu4grp does not divide the row tiles");
-      gz = gx / it->second.tokens, gx = it->second.tokens;
-    }
-    const bool flagged = cnt && tt == g.tt;
-    const bool waits = wcnt && wcnt->buffer && tt == g.tt;
-    std::uint64_t untracked = 0;
-    if (flagged) {
-      b.push_back(*cnt);
-      writes |= std::uint64_t{1} << (b.size() - 1), untracked |= std::uint64_t{1} << (b.size() - 1);
-    }
-    if (waits) b.push_back(*wcnt), untracked |= std::uint64_t{1} << (b.size() - 1) | 0b110 | untrack;
-    const std::string exe = flagged || waits ? std::string("iu4_") + kind + (flagged ? "f" : "") + (waits ? "w" : "") +
-                                                   hal.substr(4 + std::strlen(kind))
-                                             : hal;
-    Dispatch(Exe(exe), (std::string("yah_iu4_gemm") + sfx).c_str(), gx, tt, gz, 32, 1, 1, b, writes, nullptr, untracked);
-    return flagged;
-  }
-  // Completion counters of a flagged producer and its flag-waiting consumer (gen_gemm_iu4 flag, gen_rot.flag_wait): a
-  // word per 128-token tile, a slot per pair in the chunk, zeroed before the chunk (RunLayers; a pair: both chunks). Both bind it untracked.
-  static constexpr std::size_t kFlagSlots = 4096;
-  std::size_t TokenTiles128() const { return (B_ + 127) / 128; }
-  hrx_buffer_ref_t FlagSlot() { return FlagSlots(1); }
-  // k consecutive slots (a flagged gu: a counter per 1024 features and token tile)
-  hrx_buffer_ref_t FlagSlots(std::size_t k) {
-    if (flag_slot_ + k > kFlagSlots) throw LoomError("prefill: out of completion-counter slots");
-    const std::size_t n = TokenTiles128() * 4;
-    flag_slot_ += k;
-    return {flags_->handle, (flag_slot_ - k) * n, k * n};
-  }
-  // A kres RunResidual deferred (nqov): RunNorm's normq takes it as the flagged pair, anything else runs it plain first.
-  // trim: trim_row_ when it was deferred (the GEMM runs as it would have then).
-  struct PendingKres {
-    const core::TensorInfo* t = nullptr;
-    const LoomBuffer* in = nullptr;
-    const LoomBuffer* out = nullptr;
-    std::int64_t trim = kAllRows;
-    // rqk: its rotq's per-token-tile counters (wcnt.buffer null: none); chain: that rotq waited on a gu that waited on
-    // its normq (RotQ), so the kres's residual input and output are ordered per token tile too
-    hrx_buffer_ref_t wcnt{};
-    bool chain = false;
-  };
-  PendingKres pending_kres_;
-  void FlushKres() {
-    if (!pending_kres_.t) return;
-    const PendingKres p = pending_kres_;
-    pending_kres_ = {};
-    const std::int64_t trim = std::exchange(trim_row_, p.trim);
-    RunIu4("kres", *p.t, {p.in, p.out}, {std::size_t(p.t->dims[1]) * 4, std::size_t(p.t->dims[1]) * 4}, 0b10000);
-    trim_row_ = trim;
-  }
-
   // NPU column split (EnableNpu, emit_prefill_pp.npu_split). A site's NPU rows in this chunk (0: GPU only).
   std::uint32_t NpuRows(const char* site) const {
     const auto it = npu_rows_.find(site);
@@ -2014,17 +1784,8 @@ class LoomPrefill {
   }
 
   // af: the afrag form, input normt_ (fragment-major)
-  // cnt (A4): run the flagged GEMM on these counters if it can (RunIu4); returns whether it did.
-  bool RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false, const hrx_buffer_ref_t* cnt = nullptr) {
+  void RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false) {
     const auto* t = Find(wname);
-    if (a4_) {
-      // dnperm sets: the DeltaNet gate in HF head order (kstoreh), as the pnq kernels read it
-      const bool hp = geom_.count("dnperm") && wname.ends_with("attn_gate.weight");
-      if (hp && !geom_.count("iu4_kstoreh_" + std::to_string(MTiles(*t)) + "_" + std::to_string(t->dims[0] / 256) + ".hal"))
-        throw LoomError("dnperm sets need the kstoreh gate GEMM");
-      return RunIu4(hp ? "kstoreh" : "kstore", *t, {&out}, {std::size_t(t->dims[1]) * 4}, 0b1000, nullptr, cnt, &iu4_wait_,
-                    iu4_untrack_);
-    }
     Fmt f{};
     const std::string base = GemmHal("gemm_kstore", *t, &f);
     const std::string hal = af ? AfHal(base) : PickGemm(base);
@@ -2037,7 +1798,6 @@ class LoomPrefill {
     const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, 0, 0, std::size_t(t->dims[1]) * 4}, g);
     Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), MTiles(*t) / g.rowgrp,
              tt, 1, 32, 1, 1, b, GemmWrites(b, f, {&out}));
-    return false;
   }
   // qsplit: the q head-norm weight beside a layer's attn_q.weight
   static std::string QNormName(const std::string& wq) {
@@ -2055,7 +1815,7 @@ class LoomPrefill {
     std::vector<const LoomBuffer*> outs;
   };
   bool RunSeg(const std::vector<SegPart>& parts) {
-    if (a4_ || trim_row_ >= 0 || !AfChunk()) return false;
+    if (trim_row_ >= 0 || !AfChunk()) return false;
     std::string hal = "seg";
     std::vector<std::pair<const core::TensorInfo*, Fmt>> ts;
     for (const SegPart& p : parts) {
@@ -2096,7 +1856,7 @@ class LoomPrefill {
     const auto* ta = Find(pre + "ssm_alpha.weight");
     const auto* tb = Find(pre + "ssm_beta.weight");
     Fmt f{};
-    const std::string hal = a4_ || ta->type != tb->type || ta->dims != tb->dims || tb->offset != ta->offset + ta->bytes
+    const std::string hal = ta->type != tb->type || ta->dims != tb->dims || tb->offset != ta->offset + ta->bytes
                                 ? "" : GemmHal("gemm_kst2", *ta, &f);
     if (hal.empty() || !geom_.count(hal)) {
       RunKstore(pre + "ssm_alpha.weight", *alpha_);
@@ -2120,11 +1880,6 @@ class LoomPrefill {
   // af: the afrag form, input normt_ (fragment-major)
   bool RunKqg(const std::string& wname, bool af = false) {
     const auto* t = Find(wname);
-    if (a4_) {
-      RunIu4("kqg", *t, {q_, gate_}, {std::size_t(t->dims[1]) * 2, std::size_t(t->dims[1]) * 2}, 0b11000, nullptr, nullptr,
-             &iu4_wait_, iu4_untrack_);
-      return true;
-    }
     Fmt f{};
     if (!FmtOf(static_cast<std::uint32_t>(t->type), &f)) return false;
     std::string hal = GemmHal("gemm_kqg", *t, &f);
@@ -2160,25 +1915,8 @@ class LoomPrefill {
   // hidden += W input. The fused kres GEMM writes hidden + W input into hidden2; otherwise kStore writes W input
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
   // af: the afrag form of the fused kres GEMM (input fragment-major)
-  // quantized (A4): aq_ / ad_ already hold the rotated input (gen_pnq), in is not read
-  // qcnt (quantized, dnring): the pnq's per-token-tile counters, which the kres waits on (a chained PendingKres)
-  void RunResidual(const std::string& wname, const LoomBuffer& in, bool af = false, bool quantized = false,
-                   const hrx_buffer_ref_t* qcnt = nullptr) {
+  void RunResidual(const std::string& wname, const LoomBuffer& input, bool af = false) {
     const auto* t = Find(wname);
-    const bool heads = rot_ && wname.find("ssm_out") != std::string::npos;
-    const std::string awq = wname.substr(0, wname.size() - 6) + "awq";
-    if (a4_) {
-      hrx_buffer_ref_t rc = qcnt ? *qcnt : hrx_buffer_ref_t{};
-      const bool chain =
-          qcnt ? true : !quantized && RotQ(in, static_cast<std::uint32_t>(t->dims[0]), awq, heads, rqk_ ? &rc : nullptr);
-      // nqov: the next A4 normq takes it as the flagged pair (RunNorm); any other dispatch flushes it first
-      pending_kres_ = {t, hidden_, hidden2_, trim_row_, rc, chain};
-      if (!nqov_) FlushKres();
-      std::swap(hidden_, hidden2_);
-      return;
-    }
-    if (rot_) Rotate(in, heads ? rotbuf_ : nullptr, static_cast<std::uint32_t>(t->dims[0]), awq);
-    const LoomBuffer& input = heads ? *rotbuf_ : in;
     Fmt f{};
     const std::string fused0 = GemmHal("gemm_kres", *t, &f);
     if (geom_.count(fused0)) {
@@ -2270,7 +2008,6 @@ class LoomPrefill {
     const std::uint32_t nq = NpuOk(pre + "attn_q.weight") ? NpuRows("q") : 0;   // (a format without a decoder: GPU)
     const std::string qs = nq ? NpuHal(KqgHal(pre + "attn_q.weight", q_af)) : "";
     bool qg_fused = !qs.empty();
-    if (qg16_ && qg_fused) throw LoomError("f16 q / gate (qg16) needs the GPU kqg GEMM, not the NPU's");
     if (gsig_ && qg_fused) throw LoomError("the kqg GEMM's sigmoid gate (gsig) needs the GPU kqg GEMM, not the NPU's");
     if (qsplit_ && qg_fused) throw LoomError("the kqg GEMM's split q norm (qsplit) needs the GPU kqg GEMM, not the NPU's");
     if (qg_fused) {
@@ -2289,33 +2026,18 @@ class LoomPrefill {
       NpuJoin();
       NpuUnpack("npu_unpack_q.hal", c, {Ref(*q_), Ref(*gate_)}, 6);
     } else {
-      // nqw: all three wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_) gate_'s
-      // reader since the last barrier (that tail's pnq, row by row) finished each token tile before it reaches kqg:
-      // kqg's outputs untracked too
-      iu4_wait_ = std::exchange(nq_cnt_, {});
-      iu4_untrack_ = std::exchange(dn_chained_, false) && iu4_wait_.buffer ? 0b11000 : 0;
       // seg: k and v ride in the kqg GEMM's dispatch (f16 sets)
       const bool seg = q_af && k_af && v_af && RunSeg({{"gemm_kqg", pre + "attn_q.weight", {q_, gate_}},
                                                        {"gemm_kstore", pre + "attn_k.weight", {kbuf_}},
                                                        {"gemm_kstore", pre + "attn_v.weight", {vbuf_}}});
       qg_fused = seg || RunKqg(pre + "attn_q.weight", q_af);
-      iu4_untrack_ = 0;
-      if (qg16_ && !qg_fused) throw LoomError("f16 q / gate (qg16) needs the kqg GEMM");
       if (gsig_ && !qg_fused) throw LoomError("the sigmoid gate (gsig) needs the kqg GEMM");
       if (qsplit_ && !qg_fused) throw LoomError("the split q norm (qsplit) needs the kqg GEMM");
       if (!qg_fused) RunKstore(pre + "attn_q.weight", *qkv_);
-      // ropew: k / v flagged (per-token-tile counters), RoPE polls them instead of a graph barrier. Not when RoPE ends
-      // the chunk's graph (tail kNoRows): the next chunk's counter fill is not ordered after its polls
-      const bool rw = ropew_ && qnorm_ && n_ == B_ && tail_ != kNoRows;
-      if (rw) kv_cnt_[0] = FlagSlot(), kv_cnt_[1] = FlagSlot();
-      if (seg && rw) throw LoomError("seg k / v: no RoPE flags (ropew is A4)");
       if (!seg) {
-        kv_flagged_ = RunKstore(pre + "attn_k.weight", *kbuf_, k_af, rw ? &kv_cnt_[0] : nullptr);
-        kv_flagged_ = RunKstore(pre + "attn_v.weight", *vbuf_, v_af, rw ? &kv_cnt_[1] : nullptr) && kv_flagged_;
-      } else {
-        kv_flagged_ = false;
+        RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
+        RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
       }
-      iu4_wait_ = {}, iu4_untrack_ = 0;
     }
     if (!qg_fused)
       Dispatch(Exe("unpack.hal"), "yah_unpack_qg", 24, B_, 1, 256, 1, 1, {Ref(*qkv_), Ref(*q_), Ref(*gate_)});
@@ -2337,13 +2059,8 @@ class LoomPrefill {
                                          vtrope_ ? vtpool_l : hrx_buffer_ref_t{kv16_->handle, voff, kv16_layer_},
                                          {eps_->handle, 0, 4}};
       if (rope_kpaged_) b.push_back(ptab_ref_);
-      // ropew: the k-only RoPE reads k / v (untracked: it waits on their counters) and writes only the pools; its q /
-      // q_out / k_out bindings are unused
-      const bool rw = std::exchange(kv_flagged_, false) && rope_kpaged_ && vtrope_;
-      if (rw) b.push_back(kv_cnt_[0]), b.push_back(kv_cnt_[1]);
-      Dispatch(ChunkExe(rw ? "ropew" : "rope", ci), "yah_fused_qk_rope_batched",
-               ropekv_ ? 3 * B_ / 4 : qnorm_ ? kKvHeads : kHeads + kKvHeads, ropekv_ ? 1 : B_, 1, 256, 1, 1, b,
-               rw ? 0b11000000000 : ~std::uint64_t{0}, nullptr, rw ? 0b110000001100111 : 0);
+      Dispatch(ChunkExe("rope", ci), "yah_fused_qk_rope_batched", qnorm_ ? kKvHeads : kHeads + kKvHeads, B_, 1, 256, 1,
+               1, b);
     }
     if (hook) hook(ai, ci, koff, voff);
     const std::size_t q8off = std::size_t{ai} * kq_bytes_;
@@ -2428,11 +2145,8 @@ class LoomPrefill {
       const auto ag = geom_.find(ah);
       const std::uint32_t tpw = ag != geom_.end() ? ag->second.tokens : attn_tpw_,
                           hpw = ag != geom_.end() ? ag->second.rowgrp : attn_hpw_;
-      // aov: the counters (untracked) for the rotq after it; wmmaf.hal is chunk 0's main kernel with them
-      attn_flagged_ = aov_ && ah == "wmma.hal" && !qrot && n_ == B_;
-      if (attn_flagged_) b.push_back(attn_cnt_ = FlagSlots(6));
       // a persistent attention HAL (dispatch.txt "persist_<hal> <slots>") runs <slots> workgroups over all the units
-      const std::string ahx = attn_flagged_ ? "wmmaf.hal" : ah;
+      const std::string& ahx = ah;
       const auto pg = geom_.find("persist_" + ahx);
       if (pg != geom_.end() && pg->second.tt) {
         if (ai >= kPqueueSlots) throw LoomError("prefill: more attention layers than queue counters");
@@ -2441,7 +2155,7 @@ class LoomPrefill {
       // the key-split tail: kernel 1 (this HAL) stores the tail pieces' partials, the merge "wmmak<rest>" writes their output
       const bool ks = geom_.count("ksplit_" + ahx) != 0;
       if (ks) {
-        if (attn_flagged_ || pg == geom_.end() || !pg->second.tt || !ksplit_)
+        if (pg == geom_.end() || !pg->second.tt || !ksplit_)
           throw LoomError("prefill: ksplit_" + ahx + " without its queue");
         b.push_back({ksplit_->handle, 0, ksplit_bytes_});
       }
@@ -2452,8 +2166,7 @@ class LoomPrefill {
         RunNpuAttnEncode(ci, ai, b[0], b[2], b[3], pre);  // the attention's own K / V^T pools (kv8: the f16 copies)
       }
       Dispatch(Exe(ahx), "yah_attn_wmma", pg != geom_.end() ? pg->second.tokens : (B_ + tpw - 1) / tpw,
-               pg != geom_.end() ? 1 : kHeads / hpw, 1, 256, 1, 1,
-               b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
+               pg != geom_.end() ? 1 : kHeads / hpw, 1, 256, 1, 1, b);
       if (ks) {
         const std::string mh = "wmmak" + ahx.substr(4);
         const auto mg = geom_.find("persist_" + mh);
@@ -2477,7 +2190,6 @@ class LoomPrefill {
 
   void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
     const std::uint32_t si = l - l / cfg_.full_attention_interval;
-    const bool dn_chained = std::exchange(dn_chained_, false);   // the last DeltaNet tail ran chained (dnring)
     // alpha / beta first: they read the norm's row-major copy (21 MB), which the qkv / gate GEMMs would evict from the
     // last-level cache (0.18 vs ~0.39 M cycles each)
     const bool nok = NpuOk(pre + "attn_qkv.weight") && NpuOk(pre + "attn_gate.weight");
@@ -2487,10 +2199,6 @@ class LoomPrefill {
     // conv_c: the conv reads the NPU's qkv columns straight from C ("convkq_c.hal"); the unpack writes only the conv ring
     NpuView conv_c{};
     bool gate_late = false;
-    // dnov: the qkv GEMM and the conv, the gate GEMM and pnq part a as flagged pairs (FlagSlot), so the conv runs in the
-    // qkv GEMM's tail and pnq part a in the gate GEMM's
-    hrx_buffer_ref_t qkv_cnt{}, gate_cnt{}, dn_cnt{};
-    bool qkv_flagged = false, gate_flagged = false, qkv_waited = false;
     if (!qkv_split.empty() && !gate_split.empty()) {
       // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows (one job: the same activations)
       // decoder-column sets: each matrix's activations in its decoder's k-block order
@@ -2521,11 +2229,6 @@ class LoomPrefill {
       }
       NpuUnpack("npu_unpack_gate.hal", cg, {Ref(*gate_)}, 2);
     } else {
-      // nqw: alpha, beta and qkv wait on the norm's counters (iu4_wait_); after a chained DeltaNet tail (dn_chained_)
-      // their outputs' readers since the last barrier (that tail's DeltaNet part b and ring update) finished before its
-      // pnq and so before each token tile reaches them: untracked too
-      iu4_wait_ = std::exchange(nq_cnt_, {});
-      iu4_untrack_ = dn_chained && iu4_wait_.buffer ? 0b1000 : 0;
       // seg: alpha and beta ride in the qkv GEMM's dispatch (f16 sets)
       const bool seg = qkv_af && RunSeg({{"gemm_kstore", pre + "attn_qkv.weight", {qkv_}},
                                          {"gemm_kstore", pre + "ssm_alpha.weight", {alpha_}},
@@ -2533,11 +2236,8 @@ class LoomPrefill {
       if (!seg) RunAlphaBeta(pre);
       // dnvconv: the gate GEMM goes after DeltaNet's second part (below), beside it, and the conv no longer waits for it
       gate_late = geom_.count("dnvconv") != 0;
-      if (dnov_ && gate_late) qkv_cnt = FlagSlot();
-      qkv_waited = iu4_wait_.buffer && iu4_untrack_;
-      if (!seg) qkv_flagged = RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_cnt.buffer ? &qkv_cnt : nullptr);
+      if (!seg) RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af);
       if (!gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
-      iu4_wait_ = {}, iu4_untrack_ = 0;
     }
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
@@ -2548,7 +2248,7 @@ class LoomPrefill {
     const std::uint32_t conv_tb = ctb != geom_.end() ? ctb->second.tokens : 1;
     bool dn_done = false;
     // dnvconv: the conv ring update (prep_ab's ring lanes only; its alpha / beta lanes below qkv_size write ab_, which
-    // nothing reads). It waits for both DeltaNet parts (they read the ring), so it is queued after the pnq kernels.
+    // nothing reads). It waits for both DeltaNet parts (they read the ring), so it is queued after the postnorm parts.
     const auto ring = [&] {
       Dispatch(Exe("prepab.hal"), "yah_deltanet_prep_ab", (kQkv + 255u) / 256u, 1, 1, 256, 1, 1,
                {Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")), TRef(*Find(pre + "ssm_dt.bias")), Ref(*qkv_), cs,
@@ -2571,45 +2271,18 @@ class LoomPrefill {
       // conv and alpha / beta itself (gen_gdn_chunk vconv), and prep_ab only advances the conv ring, after both parts
       // (they read the ring before token 0)
       if (!dnsplit_a_ || !dvc->second.tokens) throw LoomError("dispatch.txt dnvconv needs dnsplit and a conv grid");
-      // dn_chained (and a waiting qkv GEMM): conv_out_ / kqbuf_'s readers since the last barrier (the last DeltaNet tail's
-      // part b) finished before the token tiles reached the qkv GEMM: untracked too
-      // dispatch.txt "convkqp.hal <workgroups>": the flagged conv as persistent workgroups (gen_conv_kq.gen_p)
-      const auto cp = geom_.find("convkqp.hal");
-      if (qkv_flagged && cp != geom_.end())
-        Dispatch(Exe("convkqp.hal"), "yah_ssm_conv_kq_p", cp->second.tokens, 1, 1, 128, 1, 1,
-                 {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_), qkv_cnt},
-                 0b011000, nullptr, dn_chained && qkv_waited ? 0b111001 : 0b100001);
-      else if (qkv_flagged)
-        Dispatch(Exe("convkqf.hal"), "yah_ssm_conv_kq", dvc->second.tokens, B_ / conv_tb, 1, 256, 1, 1,
-                 {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_), qkv_cnt},
-                 0b011000, nullptr, dn_chained && qkv_waited ? 0b111001 : 0b100001);
-      else
-        Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", dvc->second.tokens, B_ / conv_tb, 1, 256, 1, 1,
-                 {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
+      Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", dvc->second.tokens, B_ / conv_tb, 1, 256, 1, 1,
+               {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
       const std::vector<hrx_buffer_ref_t> in{Ref(*conv_out_), Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs,
                                              Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")),
                                              TRef(*Find(pre + "ssm_dt.bias")), Ref(*valid_)};
       auto ba = in, bb = in;
-      if (pnq_ab_) {
-        // raw_: part b's compact f16 rows, then part a's (gen_rot.gen_pnq "ab"); part b counts its finished lanes in
-        // dn_cnt, which the merged pnq waits on
-        const std::size_t b_bytes = std::size_t{B_} * geom_.at("pnq_b.hal").tt * 1024 * 2;
-        ba.insert(ba.end(), {st, {raw_->handle, b_bytes, std::size_t{B_} * geom_.at("pnq_a.hal").tt * 1024 * 2}});
-        dn_cnt = FlagSlot();
-        bb.insert(bb.end(), {st, {raw_->handle, 0, b_bytes}, dn_cnt});
-      } else {
-        ba.insert(ba.end(), {st, Ref(*raw_)});
-        bb.insert(bb.end(), {st, Ref(*raw2_)});
-      }
+      ba.insert(ba.end(), {st, Ref(*raw_)});
+      bb.insert(bb.end(), {st, Ref(*raw2_)});
       Dispatch(Exe("rowsplit_a.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_a_, 1, dn_threads_, 1, 1, ba, 0b11000000000);
-      Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, dn_threads_, 1, 1, bb, 0b111000000000,
-               nullptr, pnq_ab_ ? 0b100000000000 : 0);
-      // The second part's few workgroups leave most of the GPU to the gate GEMM; pnq part a beside it was DRAM-bound and
-      // slowed it about as much, but gained less than the GEMM's whole tail and the conv's wait.
-      if (gate_late) {
-        if (dnov_) gate_cnt = FlagSlot();
-        gate_flagged = RunKstore(pre + "attn_gate.weight", *gate_, gate_af, gate_cnt.buffer ? &gate_cnt : nullptr);
-      }
+      Dispatch(Exe("rowsplit_b.hal"), "yah_deltanet", dn_rowgrp_, dnsplit_b_, 1, dn_threads_, 1, 1, bb, 0b111000000000);
+      // The second part's few workgroups leave most of the GPU to the gate GEMM
+      if (gate_late) RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
       dn_done = true;
     } else {
       Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_ / conv_tb, 1, 256, 1, 1,
@@ -2642,70 +2315,6 @@ class LoomPrefill {
     // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
     const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
     const hrx_buffer_ref_t gate{gate_->handle, 0, std::size_t{B_} * kInner * 4};
-    // dispatch.txt "dnperm": the DeltaNet parts run head sets (gen_rot.pn_heads) into compact outputs, which only the
-    // pnq kernels read
-    const bool pnq = a4_ && dnsplit_a_ && !out_af && geom_.count("pnq_a.hal");
-    if (pnq != (geom_.count("dnperm") != 0)) throw LoomError("the A4 pnq postnorm and dnperm go together");
-    // dnvconv without pnq (f16 sets, gen_gdn_ss natural): the plain postnorm parts, then the conv ring update
-    if (pnq) {
-      // A4: the postnorm and ssm_out's rotq in one kernel per DeltaNet part (gen_rot.gen_pnq), each reading its part's
-      // output (after the gate GEMM, which runs beside the second DeltaNet part)
-      const auto* nw = Find(pre + "ssm_norm.weight");
-      const auto* aw = Find(pre + "ssm_out.awq");
-      const Geom& ga = geom_.at("pnq_a.hal");
-      const Geom& gb = geom_.at("pnq_b.hal");
-      // dnov: part a waits on the gate GEMM's counters while the GEMM still reads aq_ / ad_, so both parts write the
-      // other pair, which becomes aq_ / ad_
-      const LoomBuffer& q = gate_flagged ? *aq2_ : *aq_;
-      const LoomBuffer& d = gate_flagged ? *ad2_ : *ad_;
-      // dnring: the ring update (prepabr) waits on dn_cnt and counts in ring_cnt, the pnq waits on that and counts its rows
-      // in pq_cnt for ssm_out's kres: the whole tail runs without a graph barrier (the next layer's input GEMMs and conv
-      // leave their outputs untracked, dn_chained_)
-      const bool chained = dnring_ && pnq_ab_ && gate_flagged;
-      hrx_buffer_ref_t pq_cnt{};
-      if (pnq_ab_) {
-        // raw_ untracked: part a's DeltaNet is behind the barrier before part b's, part b's done count is dn_cnt
-        if (!dn_done) throw LoomError("pnq_abf.hal needs dnvconv");
-        const Geom& gab = geom_.at("pnq_abf.hal");
-        if (chained) {
-          // cs untracked: the DeltaNet parts read it (part b before dn_cnt is complete, part a behind part b's barrier)
-          const hrx_buffer_ref_t ring_cnt = FlagSlot();
-          pq_cnt = FlagSlot();
-          Dispatch(Exe("prepabr.hal"), "yah_deltanet_prep_ab", (kQkv + 255u) / 256u, 1, 1, 256, 1, 1,
-                   {Ref(*qkv_), cs, Ref(*valid_), dn_cnt, ring_cnt}, 0b10010, nullptr, 0b11010);
-          // pnq_abfrp: as persistent workgroups, so ssm_out's kres is not queued behind 12288 pnq workgroups
-          const auto pp = geom_.find("pnq_abfrp.hal");
-          const bool persist = pp != geom_.end();
-          Dispatch(Exe(persist ? "pnq_abfrp.hal" : "pnq_abfr.hal"), "yah_pnq", persist ? pp->second.tokens : gab.tt,
-                   persist ? 1 : B_, 1, gab.rowgrp, 1, 1,
-                   {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt, ring_cnt, pq_cnt},
-                   0b1001100000, nullptr, 0b1110000101);
-        } else if (gate_flagged)
-          Dispatch(Exe("pnq_abf.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
-                   {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt, dn_cnt}, 0b1100000,
-                   nullptr, 0b110000101);
-        else   // a trimmed chunk: the gate GEMM ran unflagged, the graph orders this after it
-          Dispatch(Exe("pnq_abd.hal"), "yah_pnq", gab.tt, B_, 1, gab.rowgrp, 1, 1,
-                   {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), dn_cnt}, 0b1100000,
-                   nullptr, 0b10000001);
-      } else if (gate_flagged)
-        Dispatch(Exe("pnq_af.hal"), "yah_pnq", ga.tt, B_, 1, ga.rowgrp, 1, 1,
-                 {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d), gate_cnt}, 0b1100000, nullptr,
-                 0b10000100);
-      else
-        Dispatch(Exe("pnq_a.hal"), "yah_pnq", ga.tt, B_, 1, ga.rowgrp, 1, 1,
-                 {Ref(*raw_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d)}, 0b1100000);
-      if (!pnq_ab_)
-        Dispatch(Exe("pnq_b.hal"), "yah_pnq", gb.tt, B_, 1, gb.rowgrp, 1, 1,
-                 {Ref(*raw2_), TRef(*nw), gate, TRef(*aw), Ref(*rot_signs_), Ref(q), Ref(d)}, 0b1100000);
-      if (gate_flagged) std::swap(aq_, aq2_), std::swap(ad_, ad2_);
-      if (dn_done && !chained) ring();
-      trim_row_ = tail_;
-      RunResidual(pre + "ssm_out.weight", *scratch_, false, true, chained ? &pq_cnt : nullptr);
-      trim_row_ = kAllRows;
-      dn_chained_ = chained;
-      return;
-    }
     if (dnsplit_a_) {
       const std::string pn = out_af ? "postnorm_t" : "postnorm";
       // heads [0, a) are ssm_out's NPU K chunk: with "npupostnormbfp" this part also writes the NPU's input into A and
@@ -3025,7 +2634,7 @@ class LoomPrefill {
                           bool k_af, bool v_af, bool q_npu) {
     const std::string wq = pre + "attn_q.weight", wo = pre + "attn_output.weight";
     if (!HalvesOn() || hook || !kv_paged_ || !paged_f16k_ || !paged_f16v_ || !rope_kpaged_ || !kv16_scratch_ || kdeq_ ||
-        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || qg16_ || gsig_ || qsplit_ ||
+        qr16_ || attn_kq8_ || attn_vqt_ || (q16_ == q_ && !qnorm_) || gsig_ || qsplit_ ||
         (q_npu ? DcolImage(wq, nullptr, true).empty() : !HalfOutOk(wo, Af("gemm_kres", wo))))
       return false;
     norm_bfp_.clear();
@@ -3214,7 +2823,6 @@ class LoomPrefill {
   bool ffn_normed_ = false;  // the halves ran the next FFN block's norm (OutHalvesEnd)
   bool kv16_scratch_ = false, kv_paged_ = false, vtrans_ = false, rope_kpaged_ = false;
   bool qnorm_ = false;  // the attention normalizes / rotates its own (raw f32) Q; RoPE does K / V only
-  bool qg16_ = false;   // the kqg GEMM stores q and gate as f16 (only the GPU kqg path writes them so)
   bool gsig_ = false;   // the kqg GEMM stores the gate's sigmoid (unorm16 bits by default; only the GPU kqg path)
   bool qsplit_ = false;   // the kqg GEMM stores f16 q w / 16 + rotary dims + sums of q^2 (binds the q norm weight)
   bool vtrope_ = false;  // RoPE stores V^T straight into the paged pool (no yah_vtpage pass)
@@ -3229,48 +2837,10 @@ class LoomPrefill {
   std::vector<std::uint8_t> host_rows_;          // the chunk's staged token_embd rows
   hrx_timeline_point_t rows_copied_ = {};        // when their last copy landed
   hrx_buffer_ref_t EmbedTable() const { return embed_rows_ ? Ref(*embed_rows_) : TRef(*Find("token_embd.weight")); }
-  // MQ4 sets ("rot"): the rotation signs (gen_rot.signs) and ssm_out's input in HF head order
-  bool rot_ = false;
-  LoomBuffer *rot_signs_ = nullptr, *rotbuf_ = nullptr;
-  // A4 sets (dispatch.txt "a4"): int4 activations (B_ x kFfn / 2 bytes) and their scales (one per 128) for the iu4 GEMMs
-  bool a4_ = false, nqov_ = false, dnov_ = false;
-  bool pnq_ab_ = false;   // dispatch.txt pnq_abf.hal: one flagged pnq for both DeltaNet parts, their outputs in raw_
-  // dispatch.txt guov: the flagged gu GEMM and its rotq (rotqf_17408); gu_flagged_: the last gu ran flagged on gu_cnt_
-  bool guov_ = false, gu_flagged_ = false;
-  hrx_buffer_ref_t gu_cnt_{};
-  // dispatch.txt nqgu: the FFN norm's normq counts its finished rows (normq[f]o_5120) in nq_cnt_ when nq_want_, and
-  // the flagged gu waits on them (iu4_gufw_*); nq_cnt_.buffer is null unless the last normq counted (nqw: the attention
-  // norm's, for iu4_wait_)
-  // gu_waited_: the last flagged gu also waited (RotQ)
-  bool nqgu_ = false, nq_want_ = false, gu_waited_ = false;
-  // dispatch.txt rotqp_17408.hal (rqk, guov): the flagged gu's counting rotq as persistent workgroups (RotQ)
-  bool rqp_ = false;
-  // dispatch.txt "aov": chunk 0's attention as wmmaf.hal adds to attn_cnt_ (attn_flagged_), the attention-out rotq
-  // (rotqopf_6144) waits on it without a graph barrier
-  bool aov_ = false, attn_flagged_ = false;
-  // dispatch.txt "ropew": the attention's k / v GEMMs flagged (kv_cnt_), RoPE (ropew) waits on them
-  bool ropew_ = false, kv_flagged_ = false, ropekv_ = false;
-  // dispatch.txt "nqp": the flag-counting normq (normq[f]o) runs as nqp_ persistent workgroups
-  std::uint32_t nqp_ = 0;
-  hrx_buffer_ref_t kv_cnt_[2]{};
-  hrx_buffer_ref_t attn_cnt_{};
-  // dispatch.txt rqk: the deferred kres waits on its rotq's counters (rotqfo_17408 / rotqo_<k>, iu4_kresfw_*)
-  bool rqk_ = false;
-  // dispatch.txt nqw: the attention / DeltaNet input GEMMs wait on their norm's counters (iu4_wait_ = nq_cnt_ around
-  // them; iu4_kstorew_*, iu4_kstorefw_*, iu4_kqgw_*)
-  bool nqw_ = false;
-  hrx_buffer_ref_t iu4_wait_{};
-  // iu4_untrack_: bindings the waiting input GEMMs also leave untracked (RunIu4 untrack); dnring: dn_chained_, the last
-  // DeltaNet tail ran without a graph barrier (RunDeltaNet)
-  std::uint64_t iu4_untrack_ = 0;
-  bool dnring_ = false, dn_chained_ = false;
-  hrx_buffer_ref_t nq_cnt_{};
-  LoomBuffer *aq_ = nullptr, *ad_ = nullptr, *aq2_ = nullptr, *ad2_ = nullptr, *flags_ = nullptr;
   static constexpr std::size_t kWaitLogSlots = 65536;
   LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
   std::vector<std::string> waitlog_tag_;   // each slot's layer and job tag
   std::vector<std::string> prof_tags_;     // YAH_NPU_PROF: the first NPU chunk's job tags (ReportNpuProf)
-  std::size_t flag_slot_ = 0;
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *grid_iq2s_ = nullptr, *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,

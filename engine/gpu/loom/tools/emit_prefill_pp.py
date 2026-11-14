@@ -23,8 +23,6 @@ import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
 import gen_decode_misc  # noqa: E402
 import gen_gemv  # noqa: E402
-import gen_rot  # noqa: E402
-import gen_gemm_iu4  # noqa: E402
 import gen_kvq  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
 import npu_prof  # noqa: E402
@@ -177,21 +175,12 @@ O16_MT = (640, 384)
 # the first DeltaNet part and runs beside the second (whose 16 workgroups fill 16 of 40 slots). Same math per head.
 DNSPLIT = (40, 8)
 
-# DNVCONV: A4 dnperm sets without a NPU qkv split: the v channels' conv and alpha / beta run inside DeltaNet
-# (gen_gdn_chunk vconv), the conv kernel takes only the q / k heads (gen_conv_kq.gen(4096)) and prep_ab only advances
+# DNVCONV: sets without a NPU qkv split: the v channels' conv and alpha / beta run inside DeltaNet
+# (gen_gdn_ss natural), the conv kernel takes only the q / k heads (gen_conv_kq.gen(4096)) and prep_ab only advances
 # the conv ring, after both DeltaNet parts. Bit-identical; dispatch.txt "dnvconv <conv workgroups>".
 DNVCONV = True
-# DNO16: DeltaNet's output (the pnq input) as f16(O 2^8) in A4 dnperm sets (gen_gdn_chunk o16): not bit-exact; vs the
-# WT2 KL reference (24 chunks) mean 0.0671 / q99.9 2.026 / top-1 88.40% vs f32 0.0687 / 2.023 / 87.91%, inside the A4
-# redraw spread (0.0693-0.0695 / 2.15-2.27). Unscaled f16 failed the tail (q99.9 2.52: subnormal outputs).
-DNO16 = os.environ.get("YAH_DN_O16", "1") == "1"
-# DNSS: the dnperm parts as the state-stationary kernel (gen_gdn_ss: one workgroup per head, the state in registers, the
-# head's v-independent work once). Grid (1, heads) x gen_gdn_ss.THREADS (dispatch.txt "dnthreads"). pp2048 (sums over
-# 48 layers): part a 54.9 -> 36.1 ms; part b 27.3 -> 33.8 (8 workgroups, one per WGP: each head's serial chain, beside
-# pnq a). A ninth wave runs the solve beside the row waves' K S^T / Q S^T (X = T1 (K S^T), not bit-identical): part a
-# 34.5 -> 30.7 ms, part b 33.4 -> 31.0; WT2 KL 0.0671 -> 0.0683 / q99.9 2.026 -> 2.054, inside the redraw spread.
-DNSS = True
-# DNSS_NAT: f16 (non-A4) sets with the state-stationary DeltaNet too: the v conv inside it (DNVCONV's path), head ranges,
+# DNSS_NAT: the state-stationary DeltaNet (gen_gdn_ss: one workgroup per head, the state in registers): the v conv
+# inside it (DNVCONV's path), head ranges,
 # its O as f32 at the heads' own columns (gen_gdn_ss natural), read by the plain postnorm parts. Sets whose NPU takes
 # qkv rows keep gen_gdn_chunk (the v conv needs every qkv column). Gate N mean KL 1.06e-6 (vs the f32 recurrent
 # reference 1.53e-6, gen_gdn_chunk 1.08e-6); pp2048 GPU only -0.97% (11-02: DeltaNet alone 66 -> 34 ms, conv 18 -> 9,
@@ -240,42 +229,6 @@ def prepab_x16(text):
          "%qkv_view = buffer.view %qkv_na[%base] : buffer -> view<[%qkv_total]xf16>"),
         ("%v = view.load %qkv_view[%src] : view<[%qkv_total]xf32> -> f32\n",
          "%vh = view.load %qkv_view[%src] : view<[%qkv_total]xf16> -> f16\n        %v = scalar.extf %vh : f16 to f32\n")])
-
-
-RING_WGS = (10240 + 255) // 256   # the dnvconv ring update's grid (one lane per qkv channel)
-
-
-def prepab_ring(text, dflag):
-    """yah_deltanet_prep_ab's conv ring update alone (DNRING): it waits until dcnt[0] (DeltaNet part b's counter) reaches
-    dflag, so the ring is no longer behind a graph barrier, and counts its waves in ocnt[0] (gen_rot.emit_oflag,
-    ring_flag_count), which pnq_abfr waits on. The alpha / beta lanes (their ab_ output is not read in dnvconv sets) are
-    gone with their bindings: qkv, state, valid, dcnt, ocnt."""
-    i = text.index("  %in_count = index.cmp ult, %i, %count : index")
-    j = text.index("  kernel.return", i)
-    L = []
-    gen_rot.emit_oflag(L.append, 1, "%c0", "%lane")
-    text = text[:i] + "\n".join(L) + "\n" + text[j:]
-    W = []
-    W.append("  %dcnt_na, %ocnt_na = buffer.assume.noalias %dcnt, %ocnt : buffer, buffer")
-    W.append("  %dn_cv = buffer.view %dcnt_na[%base] : buffer -> view<1xi32>")
-    gen_rot.flag_wait(W.append, "%dn_cv", "view<1xi32>", ["%c0"], dflag, "%lane", "dn")
-    return _rewrite(text, [
-        ("launch(%alpha: buffer, %beta: buffer, %ssm_a: buffer, %ssm_dt: buffer, %qkv: buffer, %state: buffer, %ab: buffer, "
-         "%valid: buffer) {", "launch(%qkv: buffer, %state: buffer, %valid: buffer, %dcnt: buffer, %ocnt: buffer) {"),
-        ("  %alpha_na, %beta_na, %a_na, %dt_na, %qkv_na, %state_na, %ab_na = buffer.assume.noalias %alpha, %beta, %ssm_a, "
-         "%ssm_dt, %qkv, %state, %ab : buffer, buffer, buffer, buffer, buffer, buffer, buffer\n",
-         "  %qkv_na, %state_na = buffer.assume.noalias %qkv, %state : buffer, buffer\n"),
-        ("  %alpha_view = buffer.view %alpha_na[%base] : buffer -> view<[%count]xf32>\n", ""),
-        ("  %beta_view = buffer.view %beta_na[%base] : buffer -> view<[%count]xf32>\n", ""),
-        ("  %a_view = buffer.view %a_na[%base] : buffer -> view<[%num_heads]xf32>\n", ""),
-        ("  %dt_view = buffer.view %dt_na[%base] : buffer -> view<[%num_heads]xf32>\n", ""),
-        ("  %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>\n", ""),
-        ("  %i = index.add %wg_base, %lane : index\n", "  %i = index.add %wg_base, %lane : index\n" + "\n".join(W) + "\n")])
-
-
-def ring_flag_count():
-    """What prepab_ring adds to its counter: one per wave of its grid."""
-    return RING_WGS * 256 // 32
 
 
 def postnorm_g16(text):
@@ -378,269 +331,6 @@ def rope_konly(text):
     return text[:i] + text[j + len("\n  }\n"):]
 
 
-def rope_wait(text, need):
-    """rope_konly polling its token tile's k and v GEMM counters (bindings kcnt, vcnt after the others; gen_gemm_iu4
-    flag: need each) before any load: wave 0 polls relaxed, the barrier's global acquire after it."""
-    a = "%ptab: buffer) {"
-    assert text.count(a) == 1
-    text = text.replace(a, "%ptab: buffer, %kcnt: buffer, %vcnt: buffer) {")
-    a = "  %tid = kernel.workitem.id<x> : index\n"
-    assert text.count(a) == 1
-    poll = [
-        "  %rw_c32 = index.constant 32 : index",
-        "  %rw_c128 = index.constant 128 : index",
-        "  %rw_c127 = index.constant 127 : index",
-        "  %rw_b = config.get @yah_fused_qk_rope_batched.batch : index",
-        "  %rw_b1 = index.add %rw_b, %rw_c127 : index",
-        "  %rw_tt = index.div %rw_b1, %rw_c128 : index",
-        "  %rw_t = index.div %bi, %rw_c128 : index",
-        "  %rw_kna, %rw_vna = buffer.assume.noalias %kcnt, %vcnt : buffer, buffer",
-        "  %rw_kv = buffer.view %rw_kna[%base] : buffer -> view<[%rw_tt]xi32>",
-        "  %rw_vv = buffer.view %rw_vna[%base] : buffer -> view<[%rw_tt]xi32>",
-        "  %rw_w0 = index.cmp ult, %tid, %rw_c32 : index",
-        f"  %rw_need = scalar.constant {need} : i32",
-        f"  %rw_lim = scalar.constant {gen_rot.FLAG_POLLS} : i32",
-        "  %rw_z = scalar.constant 0 : i32",
-        "  %rw_one = scalar.constant 1 : i32",
-        "  scf.if %rw_w0 {",
-        "    %rw_n = scf.while(%rw_i = %rw_z : i32) -> (i32) {",
-        "      %rw_x = view.atomic.load %rw_kv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32",
-        "      %rw_y = view.atomic.load %rw_vv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32",
-        "      %rw_m = scalar.minsi %rw_x, %rw_y : i32",
-        "      %rw_e = scalar.cmpi slt, %rw_m, %rw_need : i32",
-        "      %rw_l = scalar.cmpi ult, %rw_i, %rw_lim : i32",
-        "      %rw_g = scalar.andi %rw_e, %rw_l : i1",
-        "      scf.condition %rw_g, %rw_i : i1, i32",
-        "    } do(%rw_j: i32) {",
-        "      %rw_j1 = scalar.addi %rw_j, %rw_one : i32",
-        "      scf.yield %rw_j1 : i32",
-        "    }",
-        "  }",
-        "  kernel.barrier<global> scope(workgroup) ordering(acquire)",
-    ]
-    return text.replace(a, a + "\n".join(poll) + "\n")
-
-
-def rope_kv(text, need=None):
-    """rope_konly (KV16 + vtrope) rewritten wave-per-head: K workgroups (x < batch / 2) normalize, rotate and store 8
-    (token, KV head) rows, one per wave; V workgroups (batch / 4 more) store one KV head of a 16-token tile as V^T,
-    lane = dim, one 32 B row per lane. Same ops and sum order as the workgroup reduce (per-32 subgroup reduces, then
-    the 8 partials as a cluster-8 tree), so the same bits. need: wait for the k / v GEMM counters (rope_wait)."""
-    S = "@yah_fused_qk_rope_batched"
-    L = [text[:text.index("kernel.def ")]]
-    e = L.append
-    e(f"kernel.def target(@yah_wave32) {S}() {{")
-    e("  %unit = index.constant 1 : index")
-    e(f"  %batch = config.get {S}.batch : index")
-    e("  %kw0 = index.constant 2 : index")
-    e("  %kwg = index.div %batch, %kw0 : index")
-    e("  %vw0 = index.constant 4 : index")
-    e("  %vwg = index.div %batch, %vw0 : index")
-    e("  %nwg = index.add %kwg, %vwg : index")
-    e("  %c256 = index.constant 256 : index")
-    e("  kernel.launch.config workgroups(%nwg, %unit, %unit) workgroup_size(%c256, %unit, %unit) : index")
-    e("} launch(%q: buffer, %k: buffer, %v: buffer, %q_weight: buffer, %k_weight: buffer, %q_out: buffer, %k_out: buffer, "
-      "%k_cache: buffer, %v_cache: buffer, %k_cache_f16: buffer, %v_cache_f16: buffer, %eps_buf: buffer, %ptab: buffer"
-      + (", %kcnt: buffer, %vcnt: buffer" if need else "") + ") {")
-    e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 255, 256, 1024, 4096):
-        e(f"  %c{v} = index.constant {v} : index")
-    e("  %two = scalar.constant 2.0 : f32")
-    e("  %one = scalar.constant 1.0 : f32")
-    for n in ("start_pos", "batch", "max_context", "kv_elems", "k16_elems"):
-        e(f"  %{n} = config.get {S}.{n} : index")
-    e(f"  %theta = config.get {S}.theta : f32")
-    e("  %head_dimf = scalar.constant 256.0 : f32")
-    e("  %rotary_dimf = scalar.constant 64.0 : f32")
-    e("  %k_na, %v_na, %kw_na, %k16_na, %v16_na, %eps_na, %pt_na = buffer.assume.noalias %k, %v, %k_weight, "
-      "%k_cache_f16, %v_cache_f16, %eps_buf, %ptab : buffer, buffer, buffer, buffer, buffer, buffer, buffer")
-    e("  %k_view = buffer.view %k_na[%base] : buffer -> view<[%kv_elems]xf16>")
-    e("  %v_view = buffer.view %v_na[%base] : buffer -> view<[%kv_elems]xf16>")
-    e("  %kw_view = buffer.view %kw_na[%base] : buffer -> view<[%c256]xf32>")
-    e("  %k16_view = buffer.view %k16_na[%base] : buffer -> view<[%k16_elems]xf16>")
-    e("  %v16_view = buffer.view %v16_na[%base] : buffer -> view<[%k16_elems]xf16>")
-    e("  %eps_view = buffer.view %eps_na[%base] : buffer -> view<[%c1]xf32>")
-    e("  %pgrows = index.div %k16_elems, %c1024 : index")
-    e("  %pgn0 = index.add %pgrows, %c255 : index")
-    e("  %pgnp = index.div %pgn0, %c256 : index")
-    e("  %pglp1 = index.sub %pgnp, %c1 : index")
-    e("  %pt_view = buffer.view %pt_na[%base] : buffer -> view<[%pgnp]xi32>")
-    e("  %ctx_m1 = index.sub %max_context, %c1 : index")
-    e("  %kwg = index.div %batch, %c2 : index")
-    e("  %wg = kernel.workgroup.id<x> : index")
-    e("  %tid = kernel.workitem.id<x> : index")
-    e("  %lane = index.rem %tid, %c32 : index")
-    e("  %wave = index.div %tid, %c32 : index")
-    e("  %is_kw = index.cmp ult, %wg, %kwg : index")
-    e("  %vg0 = index.sub %wg, %kwg : index")
-    e("  %vg = index.max %vg0, %c0 : index")
-    # the workgroup's first chunk-local token: K 2 per workgroup (waves 0-3, 4-7), V 16 (4 KV heads per tile)
-    e("  %kt0 = index.mul %wg, %c2 : index")
-    e("  %vtl = index.div %vg, %c4 : index")
-    e("  %vt0 = index.mul %vtl, %c16 : index")
-    e("  %bt = scf.select %is_kw, %kt0, %vt0 : index")
-    if need:
-        e("  %rw_tt0 = index.add %batch, %c128 : index")
-        e("  %rw_tt1 = index.sub %rw_tt0, %c1 : index")
-        e("  %rw_tt = index.div %rw_tt1, %c128 : index")
-        e("  %rw_t = index.div %bt, %c128 : index")
-        e("  %rw_kna, %rw_vna = buffer.assume.noalias %kcnt, %vcnt : buffer, buffer")
-        e("  %rw_kv = buffer.view %rw_kna[%base] : buffer -> view<[%rw_tt]xi32>")
-        e("  %rw_vv = buffer.view %rw_vna[%base] : buffer -> view<[%rw_tt]xi32>")
-        e("  %rw_w0 = index.cmp ult, %tid, %c32 : index")
-        e(f"  %rw_need = scalar.constant {need} : i32")
-        e(f"  %rw_lim = scalar.constant {gen_rot.FLAG_POLLS} : i32")
-        e("  %rw_z = scalar.constant 0 : i32")
-        e("  %rw_one = scalar.constant 1 : i32")
-        e("  scf.if %rw_w0 {")
-        e("    %rw_n = scf.while(%rw_i = %rw_z : i32) -> (i32) {")
-        e("      %rw_x = view.atomic.load %rw_kv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32")
-        e("      %rw_y = view.atomic.load %rw_vv[%rw_t] {ordering = relaxed, scope = device} : view<[%rw_tt]xi32> -> i32")
-        e("      %rw_m = scf.select %is_kw, %rw_x, %rw_y : i32")
-        e("      %rw_e = scalar.cmpi slt, %rw_m, %rw_need : i32")
-        e("      %rw_l = scalar.cmpi ult, %rw_i, %rw_lim : i32")
-        e("      %rw_g = scalar.andi %rw_e, %rw_l : i1")
-        e("      scf.condition %rw_g, %rw_i : i1, i32")
-        e("    } do(%rw_j: i32) {")
-        e("      %rw_j1 = scalar.addi %rw_j, %rw_one : i32")
-        e("      scf.yield %rw_j1 : i32")
-        e("    }")
-        e("  }")
-        e("  kernel.barrier<global> scope(workgroup) ordering(acquire)")
-    e("  scf.if %is_kw {")
-    e("    %kh = index.rem %wave, %c4 : index")
-    e("    %kwt = index.div %wave, %c4 : index")
-    e("    %bi = index.add %kt0, %kwt : index")
-    e("    %eps = view.load %eps_view[%c0] : view<[%c1]xf32> -> f32")
-    e("    %cur_raw = index.add %start_pos, %bi : index")
-    e("    %cur = index.min %cur_raw, %ctx_m1 : index")
-    e("    %pglp = index.div %cur, %c256 : index")
-    e("    %pglpc = index.min %pglp, %pglp1 : index")
-    e("    %pgv = view.load %pt_view[%pglpc] : view<[%pgnp]xi32> -> i32")
-    e("    %pgu = index.cast %pgv : i32 to index")
-    e("    %pgz = index.max %pgu, %c0 : index")
-    e("    %pg = index.min %pgz, %pglp1 : index")
-    e("    %pgb = index.mul %pg, %c256 : index")
-    e("    %pgo = index.rem %cur, %c256 : index")
-    e("    %krow = index.add %pgb, %pgo : index")
-    e("    %cur_i = index.cast %cur : index to i32")
-    e("    %curf = scalar.sitofp %cur_i : i32 to f32")
-    e("    %bkw = index.mul %bi, %c1024 : index")
-    e("    %hbkq = index.mul %kh, %c256 : index")
-    e("    %hbk = index.add %bkw, %hbkq : index")
-    e("    %src = index.add %hbk, %lane : index")
-    for j in range(8):
-        e(f"    %xo{j} = index.add %src, %c{32 * j} : index")
-        e(f"    %x{j}h = view.load %k_view[%xo{j}] : view<[%kv_elems]xf16> -> f16")
-        e(f"    %x{j} = scalar.extf %x{j}h : f16 to f32")
-        e(f"    %sq{j} = scalar.mulf %x{j}, %x{j} : f32")
-        e(f"    %ps{j} = kernel.subgroup.reduce<addf> %sq{j} : f32")
-    e("    %l8 = index.rem %lane, %c8 : index")
-    for j in range(1, 8):
-        e(f"    %lj{j}c = index.constant {j} : index")
-        e(f"    %lj{j} = index.cmp eq, %l8, %lj{j}c : index")
-        e(f"    %pv{j} = scf.select %lj{j}, %ps{j}, {'%ps0' if j == 1 else '%%pv%d' % (j - 1)} : f32")
-    e("    %total_k = kernel.subgroup.reduce<addf> %pv7 {cluster_size = 8} : f32")
-    e("    %mean_k = scalar.divf %total_k, %head_dimf : f32")
-    e("    %me_k = scalar.addf %mean_k, %eps : f32")
-    e("    %inv_k = scalar.rsqrtf %me_k : f32")
-    e("    %k16_pre = index.mul %krow, %c1024 : index")
-    e("    %k16_raw = index.add %k16_pre, %hbkq : index")
-    e("    %k16_max = index.sub %k16_elems, %c256 : index")
-    e("    %k16_base = index.min %k16_raw, %k16_max : index")
-    e("    %p3b = index.add %lane, %c32 : index")
-    e("    %kw0 = view.load %kw_view[%lane] : view<[%c256]xf32> -> f32")
-    e("    %kw1 = view.load %kw_view[%p3b] : view<[%c256]xf32> -> f32")
-    e("    %kn0 = scalar.mulf %x0, %inv_k : f32")
-    e("    %kn0w = scalar.mulf %kn0, %kw0 : f32")
-    e("    %kn1 = scalar.mulf %x1, %inv_k : f32")
-    e("    %kn1w = scalar.mulf %kn1, %kw1 : f32")
-    e("    %p3i = index.cast %lane : index to i32")
-    e("    %p3if = scalar.sitofp %p3i : i32 to f32")
-    e("    %twop3 = scalar.mulf %two, %p3if : f32")
-    e("    %expo3 = scalar.divf %twop3, %rotary_dimf : f32")
-    e("    %invfreq3 = scalar.powf<afn> %theta, %expo3 : f32")
-    e("    %inv3 = scalar.divf %one, %invfreq3 : f32")
-    e("    %angle3 = scalar.mulf %curf, %inv3 : f32")
-    e("    %cv3 = scalar.cosf<afn> %angle3 : f32")
-    e("    %sv3 = scalar.sinf<afn> %angle3 : f32")
-    e("    %ka = scalar.mulf %kn0w, %cv3 : f32")
-    e("    %kb = scalar.mulf %kn1w, %sv3 : f32")
-    e("    %kr0 = scalar.subf %ka, %kb : f32")
-    e("    %kc2 = scalar.mulf %kn0w, %sv3 : f32")
-    e("    %kd = scalar.mulf %kn1w, %cv3 : f32")
-    e("    %kr1 = scalar.addf %kc2, %kd : f32")
-    e("    %ko0 = index.add %k16_base, %lane : index")
-    e("    %ko1 = index.add %k16_base, %p3b : index")
-    e("    %kr0h = scalar.fptrunc %kr0 : f32 to f16")
-    e("    %kr1h = scalar.fptrunc %kr1 : f32 to f16")
-    e("    view.store %kr0h, %k16_view[%ko0] : f16, view<[%k16_elems]xf16>")
-    e("    view.store %kr1h, %k16_view[%ko1] : f16, view<[%k16_elems]xf16>")
-    for j in range(2, 8):
-        e(f"    %i3_{j} = index.add %lane, %c{32 * j} : index")
-        e(f"    %w3_{j} = view.load %kw_view[%i3_{j}] : view<[%c256]xf32> -> f32")
-        e(f"    %n3_{j} = scalar.mulf %x{j}, %inv_k : f32")
-        e(f"    %n3w{j} = scalar.mulf %n3_{j}, %w3_{j} : f32")
-        e(f"    %ko3_{j} = index.add %k16_base, %i3_{j} : index")
-        e(f"    %n3h{j} = scalar.fptrunc %n3w{j} : f32 to f16")
-        e(f"    view.store %n3h{j}, %k16_view[%ko3_{j}] : f16, view<[%k16_elems]xf16>")
-    e("  } else {")
-    # V^T tile: [kv head][pool tiles][256 dims][16 keys], pool tile = ptab page * 16 + tile in page
-    e("    %vh = index.rem %vg, %c4 : index")
-    e("    %cur0r = index.add %start_pos, %vt0 : index")
-    e("    %cur0 = index.min %cur0r, %ctx_m1 : index")
-    e("    %vpglp = index.div %cur0, %c256 : index")
-    e("    %vpglpc = index.min %vpglp, %pglp1 : index")
-    e("    %vpgv = view.load %pt_view[%vpglpc] : view<[%pgnp]xi32> -> i32")
-    e("    %vpgu = index.cast %vpgv : i32 to index")
-    e("    %vpgz = index.max %vpgu, %c0 : index")
-    e("    %vpg = index.min %vpgz, %pglp1 : index")
-    e("    %vpgo = index.rem %cur0, %c256 : index")
-    e("    %vt_pt0 = index.mul %vpg, %c16 : index")
-    e("    %vt_lt = index.div %vpgo, %c16 : index")
-    e("    %vt_ptile = index.add %vt_pt0, %vt_lt : index")
-    e("    %vt_kt = index.mul %pgnp, %c16 : index")
-    e("    %vt_a = index.mul %vh, %vt_kt : index")
-    e("    %vt_b = index.add %vt_a, %vt_ptile : index")
-    e("    %vt_b0 = index.mul %vt_b, %c4096 : index")
-    e("    %vt_o0 = index.mul %tid, %c16 : index")
-    e("    %vt_o = index.add %vt_b0, %vt_o0 : index")
-    e("    %vt_m = index.sub %k16_elems, %c16 : index")
-    e("    %vt_d = index.min %vt_o, %vt_m : index")
-    e("    %vrow0 = index.mul %vt0, %c1024 : index")
-    e("    %vhd = index.mul %vh, %c256 : index")
-    e("    %vs0 = index.add %vrow0, %vhd : index")
-    e("    %vs = index.add %vs0, %tid : index")
-    for kk in range(16):
-        e(f"    %vk{kk}c = index.constant {kk * 1024} : index")
-        e(f"    %vk{kk}o = index.add %vs, %vk{kk}c : index")
-        e(f"    %vk{kk} = view.load %v_view[%vk{kk}o] : view<[%kv_elems]xf16> -> f16")
-    for h in range(2):
-        e(f"    %vq{h} = vector.from_elements {', '.join('%%vk%d' % (8 * h + i) for i in range(8))} : vector<8xf16>")
-    e("    %vt_d8 = index.add %vt_d, %c8 : index")
-    e("    vector.store %vq0, %v16_view[%vt_d] : vector<8xf16>, view<[%k16_elems]xf16>")
-    e("    vector.store %vq1, %v16_view[%vt_d8] : vector<8xf16>, view<[%k16_elems]xf16>")
-    e("  }")
-    e("  kernel.return")
-    e("}")
-    return "\n".join(L) + "\n"
-
-
-def rope_kv16(text):
-    """yah_fused_qk_rope_batched reading f16 K / V (the GEMMs' f16 outputs, KV16): each load widened to f32"""
-    for b in ("k", "v"):
-        a = f"%{b}_view = buffer.view %{b}_na[%base] : buffer -> view<[%kv_elems]xf32>"
-        assert text.count(a) == 1
-        text = text.replace(a, a.replace("xf32>", "xf16>"))
-    loads = re.findall(r"(%\w+) = view\.load %([kv])_view\[(%\w+)\] : view<\[%kv_elems\]xf32> -> f32", text)
-    assert len(loads) >= 4, loads
-    for v, b, i in loads:
-        text = text.replace(f"{v} = view.load %{b}_view[{i}] : view<[%kv_elems]xf32> -> f32",
-                            f"{v}_x16 = view.load %{b}_view[{i}] : view<[%kv_elems]xf16> -> f16\n"
-                            f"      {v} = scalar.extf {v}_x16 : f16 to f32")
-    return text
-
-
 def qk_of(fmt):
     return next(qk for f, _, qk in E.FMT.values() if f == fmt)
 
@@ -655,14 +345,11 @@ def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
 
 
 QNORM = os.environ.get("YAH_QNORM", "1") == "1"   # gen_attn_fa QNORM: the attention does the Q head norm + RoPE (RoPE: K / V only)
-# QG16 (A4 with QNORM): the kqg GEMM stores q and gate as f16, the attention reads them so. dispatch.txt "qg16"
-QG16 = True
-QG16_ON = False   # set by main
 # GSIG (YAH_GSIG, default u16; 0: off): the kqg GEMM's epilogue applies the gate's sigmoid and stores it as unorm16
 # bits ("u16", gen_gemm_tile KQG_GSIG), the attention multiplies (gen_attn_fa GSIG): half the gate bytes, no exp /
 # reciprocal in the attention epilogue. Gate N (KL 1.07e-6); attention busiest SQ 71.6 -> 73.8% of floor at depth 0,
 # +0.2 at 8K, even at 64K; pp2048 attention -3.1%, kqg -0.3% (half the stores). Only where the kqg GEMM writes every
-# gate row: not with the NPU's q rows, f16 q / gate (QG16) or half sets. dispatch.txt "gsig"
+# gate row: not with the NPU's q rows or half sets. dispatch.txt "gsig"
 GSIG = os.environ.get("YAH_GSIG", "u16")
 GSIG = "" if GSIG == "0" else GSIG
 # QSPLIT (YAH_QSPLIT=1; with the u16 gate, GPU q rows): the kqg GEMM stores q as f16(q w / 16) plus the raw rotary dims
@@ -678,76 +365,6 @@ ATTN_C0SEED = os.environ.get("YAH_ATTN_C0SEED")
 # points busiest SQ at depth 0 (gate N, kl_mean 1.7e-6); deeper chunks keep the f32 rotary dims (dirty banks at depth)
 ATTN_C0ROT16 = os.environ.get("YAH_ATTN_C0ROT16", "1") == "1"
 GSIG_ON = False   # set by main
-# KV16 (A4): the K / V GEMMs (kstore, 1024 rows) store f16, RoPE widens them (rope_kv16). dispatch.txt "kv16in"
-KV16 = True
-KV16_ON = False   # set by main
-# NQOV (A4): every kres also as iu4_kresf_* (gen_gemm_iu4 flag: per-token-tile completion counters) and normq as
-# normqf_5120 (gen_rot.gen_nq flag: rows wait for their token tile), so the driver records the norm after its kres
-# with no graph barrier and the norm runs in the GEMM's tail. Same values. dispatch.txt "nqov"
-NQOV = True
-NQOV_ON = False   # set by main
-# DNOV (A4 dnvconv, with DNSPLIT (40, 8)): the qkv and gate kstores also flagged (iu4_kstoref_*, iu4_kstorehf_*), the
-# conv as convkqf and pnq part a as pnq_af waiting on their counters, so the conv runs in the qkv GEMM's tail and pnq
-# part a in the gate GEMM's. Same values. dispatch.txt "dnov"
-DNOV = True
-DNOV_ON = False   # set by main
-# CONVP (with DNOV): the flagged conv as gen_conv_kq.gen_p (persistent workgroups walking (key head, token tile)
-# segments, convkqp.hal) instead of gen's grid of 16-token workgroups: conv exposure 5.3-5.5 -> 4.2 ms per pp2048
-# (64-token segments over 512 workgroups: -> ~1.9 ms). Same values
-CONVP = True
-# GUOV (A4): the gu GEMM also as iu4_guf_* (gen_gemm_iu4 flag: a counter per 1024 features and token tile) and
-# rotq_17408 as rotqf_17408 (gen_rot.gen_q flag), so the down projection's rotq runs in the gu GEMM's tail. Same values.
-# dispatch.txt "guov"
-GUOV = True
-GUOV_ON = False   # set by main
-# NQGU (A4, with NQOV and GUOV): normq also as normqo_5120 / normqfo_5120 (gen_rot.gen_nq oflag: per-token-tile counters)
-# and the flagged gu as iu4_gufw_* (gen_gemm_iu4 wait), so the driver records the gu GEMM after its norm with no graph
-# barrier and its first workgroups start in the norm's tail. Same values. dispatch.txt "nqgu"
-NQGU = True
-NQGU_ON = False   # set by main
-# RQK (A4, with NQOV): the residual rotqs also as rotqfo_17408 / rotqo_6144 (gen_rot.gen_q oflag) and the flagged kres as
-# iu4_kresfw_* (gen_gemm_iu4 wait), so the driver records the kres after its rotq with no graph barrier. Same values.
-# dispatch.txt "rqk"
-RQK = True
-RQK_ON = False   # set by main
-# RQP (with RQK and GUOV): the down projection's rotq also as rotqp_17408 (gen_rot.gen_qp: RQP persistent workgroups
-# walking the token tiles in order), so the kres after it is not queued behind 34816 rotq workgroups and starts on the
-# first token tiles in the gu's tail: rotq exposure 21.3 -> 0.3 ms, gu start .. kres end 1.546 -> 1.474 gu, pp2048 ~-1.9%
-# timeline span. Same values. (P 96 / 240 lose; recorded before the gu, its LDS takes a gu workgroup per WGP: gu +44%)
-RQP = 160
-# RQOP (with RQK): the attention output's rotq also as rotqop_6144 (gen_rot.gen_qp, no producer counters: a graph
-# barrier orders it after the attention), so its kres is not queued behind its 12288 workgroups
-RQOP = 160
-# AOV (with RQOP): chunk 0's attention also as wmmaf.hal (gen_attn_fa OCNT: per (1024 features, token tile) counters)
-# and the attention-out rotq as rotqopf_6144 (gen_qp waiting on them), so no graph barrier separates the two: the rotq
-# runs in the attention's tail (polling at priority 0 beside it): attention start .. kres end -131 us per attention
-# layer. Same values. dispatch.txt "aov"
-AOV = True
-# ROPEW (with NQW and QNORM): the attention's k / v GEMMs also as iu4_kstorefw_* (per-token-tile counters) and RoPE as
-# ropew[_c<i>].hal (rope_wait: a workgroup polls its token tile's k and v counters), so no graph barrier separates
-# them: RoPE runs in the v GEMM's tail. Same values. dispatch.txt "ropew"
-ROPEW = True
-# ROPEKV (QNORM, KV16, vtrope): RoPE as rope_kv (wave-per-head K, coalesced V^T tiles), grid (3 * batch / 4).
-# Same values. dispatch.txt "ropekv"
-ROPEKV = True
-# NQP: the flag-counting normq (normq[f]o: its GEMM waits on the counters) as NQP persistent workgroups (gen_nq persist),
-# so the waiting GEMM is dispatched while the rows run. Same values. dispatch.txt "nqp <NQP>"
-NQP = 64
-ROPEW_ON = False   # set by main
-# PNQP (with DNRING): the chained pnq also as pnq_abfrp (gen_rot.gen_pnqp: PNQP persistent workgroups walking the token
-# tiles in order), for the same reason: ssm_out's kres was queued behind its 12288 workgroups. 155 VGPRs: 6 workgroups
-# per WGP beside two kres workgroups
-PNQP = 120
-# NQW (A4): the attention and DeltaNet input GEMMs (kqg, kstore K / V / alpha / beta, the flagged qkv kstore) also as
-# iu4_<kind>[f]w_* (gen_gemm_iu4 wait) on the attention norm's counters (normq[f]o_5120), so the driver records them after
-# the norm with no graph barrier. Same values. dispatch.txt "nqw"
-NQW = True
-NQW_ON = False   # set by main
-# DNRING (A4, with DNOV's pnq_abf, RQK, NQW): the conv ring update as prepabr (prepab_ring: waits on DeltaNet part b's
-# counter, counts) before the pnq, pnq_abfr waiting on it and counting rows for ssm_out's kres (iu4_kresfw_*), so a
-# DeltaNet layer's tail and the next layer's input GEMMs need no graph barrier. Same values. dispatch.txt "dnring"
-DNRING = True
-DNRING_ON = False   # set by main
 
 
 def alt(path):
@@ -823,7 +440,7 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
 
 
 # Formats the tile GEMM (tools/gen_gemm_tile.py) is verified bit-identical on in the pp2048 pipeline.
-TILE_FMTS = ("iq3s", "iq4xs", "iq4nl", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "iq2s", "q3k", "q8_0", "mq4", "q2k")
+TILE_FMTS = ("iq3s", "iq4xs", "iq4nl", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", "iq2xs", "iq2s", "q3k", "q8_0", "q2k")
 
 
 # Activations-from-global GEMMs (gen_gemm_tile Tile.afrag): "<hal>.af.hal" reads a fragment-major input (Tile.atiled; the
@@ -2060,28 +1677,6 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     return (out, tile, rowgrp, tt)
 
 
-def iu4_gemm(kind, mt, kb, B, outdir, hperm=None, flag=False, wait=0):
-    """Emit the A4 GEMM (tools/gen_gemm_iu4.py) of an MQ4 tensor; return its dispatch.txt row. hperm: a kstore whose
-    output heads go to HF order (gen_gemm_iu4.gen), as "kstoreh". flag: the completion-counter variant, "<kind>f"
-    (NQOV, DNOV); wait: the flag-waiting variant (gen_gemm_iu4 wait), "w" after that (NQGU)."""
-    bm, bn, _, _ = gen_gemm_iu4.tile(mt * 16)
-    if kind == "gu":
-        bm //= 2   # a gu workgroup stages bm rows of gate and up for bm / 2 features
-    if B % bn or (mt * 16) % bm:
-        raise SystemExit("iu4 GEMM %s: %d rows / %d tokens do not tile" % (kind, mt * 16, B))
-    tt = B // bn
-    sym = gen_gemm_iu4.sym(kind)
-    out = "iu4_%s_%d_%d.hal" % (kind + ("h" if hperm else "") + ("f" if flag else "") + ("w" if wait else ""), mt, kb)
-    tmp = os.path.join(outdir, ".emit_tmp")
-    os.makedirs(tmp, exist_ok=True)
-    src = os.path.join(tmp, out[:-4] + ".loom")
-    out16 = (kind == "kstore" and (mt in O16_MT or (mt == 64 and KV16_ON))) or (kind == "kqg" and QG16_ON)
-    open(src, "w").write(gen_gemm_iu4.gen(kind, mt * 16, out16, hperm, flag, wait))
-    E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)], out, outdir,
-           gate=[sym, "mq4", kind, str(mt), str(kb), str(tt), str(B), "aspan=%d" % gen_gemm_iu4.KP])
-    return (out, bn, bm // 16, tt)
-
-
 def gemm_combos(rows):
     """{(kind, fmt, port, m_tiles, k_blocks): [tensor names]} of the model's GEMM tensors; kind is kstore, residual or
     swiglu. rows: emit_prefill.parse(model)."""
@@ -2111,7 +1706,7 @@ def gemm_kinds(kind, mt):
 
 
 def main():
-    global MODEL, NPU_FFNBLK, QG16_ON, GSIG_ON, QSPLIT_ON, KV16_ON, NQOV_ON, DNOV_ON, GUOV_ON, NQGU_ON, RQK_ON, NQW_ON, DNRING_ON, ROPEW_ON
+    global MODEL, NPU_FFNBLK, GSIG_ON, QSPLIT_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
     E.ASYNC = True
@@ -2133,38 +1728,18 @@ def main():
     rows = E.parse(model)
     combos = gemm_combos(rows)
     types = {nm: ty for nm, _, ty in rows}
-    # MQ4 weights (HFQ, or GGUF converted at load): A4 prefill (int4 activations, iu4 GEMMs) unless YAH_A16=1 (W4A16: f16
-    # activations, the quality mode). YAH_NATIVE=1 (a GGUF loaded as it is): W4A16 on the file's own formats, no rotation.
-    rot = types.get("blk.0.ffn_down.weight") == 44
-    if rot and (types.get("output.weight") != 44 or types["token_embd.weight"] != 8):
-        raise SystemExit("emit_prefill_pp: the model's weights are not MQ4G256 as yah-dump --table shows them")
-    if not rot and os.environ.get("YAH_NATIVE") != "1":
-        raise SystemExit("emit_prefill_pp: not MQ4 weights; a GGUF loaded natively needs YAH_NATIVE=1")
-    a4 = rot and os.environ.get("YAH_A16") != "1"
-    # R2P_LAZY (gen_attn_fa: lazy rescale threshold, nats) 5 on native and A16 sets, as the npu branch: 2 x 32 busiest
-    # SQ +0.8 at 126K on real kv8 inputs, native kld_ref 0.0164 = exact. A4 keeps the exact kernel (kld_ref 0.0675 ->
-    # 0.0692, npu_gate over its limit)
+    # R2P_LAZY (gen_attn_fa: lazy rescale threshold, nats) 5, as the npu branch: 2 x 32 busiest SQ +0.8 at 126K on real
+    # kv8 inputs, native kld_ref 0.0164 = exact
     if "R2P_LAZY" not in os.environ:
-        gen_attn_fa.R2P_LAZY = 0.0 if a4 else 5.0
-    KV16_ON = a4
-    NQOV_ON = a4
-    GUOV_ON = a4 and not EMIT_HALF
-    NQGU_ON = GUOV_ON
-    RQK_ON = (NQOV_ON and GUOV_ON)
-    NQW_ON = a4 and not EMIT_HALF
-    # the engine runs ropew only with fp16 paged K and V (RoPE writes both pools; quantized KV has its own staging)
-    ROPEW_ON = ROPEW and NQW_ON and QNORM and B % gen_rot.FLAG_TT == 0 and gen_kvq.kv_bits() == (16, 16) and T % 256 == 0
-    DNOV_ON = (DNOV and a4 and DNSPLIT == (40, 8) and DNVCONV and conv_tb_ok(B) and "qkv" not in NPU_SPLIT
-               and not EMIT_HALF)   # the dnvconv conv (dn_vconv below)
-    QG16_ON = QG16 and a4 and QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False
-    GSIG_ON = bool(GSIG) and not (QG16_ON or EMIT_HALF or "q" in NPU_SPLIT)
+        gen_attn_fa.R2P_LAZY = 5.0
+    GSIG_ON = bool(GSIG) and not (EMIT_HALF or "q" in NPU_SPLIT)
     if GSIG_ON:
         import gen_gemm_tile
         assert GSIG in ("u16", "16", "32"), GSIG
         gen_gemm_tile.KQG_GSIG, gen_gemm_tile.KQG_GSIG16 = GSIG, GSIG in ("16", "u16")
         gen_attn_fa.GSIG, gen_attn_fa.GSIG16 = GSIG, GSIG in ("16", "u16")
         os.environ["KQG_GSIG"] = os.environ["GSIG"] = GSIG   # (the calibration menu's worker processes)
-    QSPLIT_ON = QSPLIT and GSIG_ON and GSIG in ("16", "u16") and QNORM and gen_attn_fa.Q16 and not a4
+    QSPLIT_ON = QSPLIT and GSIG_ON and GSIG in ("16", "u16") and QNORM and gen_attn_fa.Q16
     if QSPLIT_ON:
         import gen_gemm_tile
         gen_gemm_tile.KQG_QSPLIT = gen_attn_fa.R2P_QSPLIT = True
@@ -2180,43 +1755,6 @@ def main():
         # A residual projection gets a kstore and the fused-residual kres; the attention q projection (12288 rows =
         # 24 heads x [q | gate]) also gets kqg, which stores q and gate unpacked. The driver prefers kres and kqg.
         kinds = gemm_kinds(kind, mt)
-        if a4 and fmt == "mq4":
-            # A4: the FFN's gate and up run as one gu GEMM (on the up combo); the gate tensors need no kstore
-            if all(t.endswith("ffn_gate.weight") for t in combos[(kind, fmt, port, mt, kb)]):
-                continue
-            for k in (["gu"] if kind == "swiglu" else kinds):
-                if k != "kstore" or kind != "residual":
-                    # dnperm sets (DNSPLIT (40, 8)): the DeltaNet gate (attn_gate) also as kstoreh, in HF head order
-                    # for the pnq kernels
-                    gate = k == "kstore" and any(t.endswith("attn_gate.weight") for t in combos[(kind, fmt, port, mt, kb)])
-                    for hp in [None] + ([gen_rot.PN_HEADS[:2]] if gate and DNSPLIT == (40, 8) else []):
-                        geom.append(iu4_gemm(k, mt, kb, B, outdir, hp))
-                        if gen_gemm_iu4.group_of(k, mt * 16):   # grouped grid: the engine launches (G, tiles, row tiles / G)
-                            geom.append(("iu4grp_" + geom[-1][0], gen_gemm_iu4.group_of(k, mt * 16), 0, 0))
-                        # the flagged variants: the plain GEMM's geometry (dispatch.txt row) serves both
-                        if k == "kres" and NQOV_ON and mt * 16 == 5120:
-                            iu4_gemm(k, mt, kb, B, outdir, flag=True)
-                        if k == "kres" and RQK_ON and mt * 16 == 5120 and kb * 256 in (6144, 17408):
-                            iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.q_flag_count(kb * 256))
-                        if k == "gu" and GUOV_ON:
-                            iu4_gemm(k, mt, kb, B, outdir, flag=True)
-                        if k == "gu" and GUOV_ON and NQGU_ON:
-                            iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.nq_flag_count(5120))
-                        if k == "kstore" and DNOV_ON and (hp is not None or any(
-                                t.endswith("attn_qkv.weight") for t in combos[(kind, fmt, port, mt, kb)])):
-                            iu4_gemm(k, mt, kb, B, outdir, hp, flag=True)
-                        # the attention norm's readers (kb 20: K = 5120)
-                        tn = combos[(kind, fmt, port, mt, kb)]
-                        if NQW_ON and hp is None and kb == 20 and (k == "kqg" or k == "kstore" and any(
-                                t.endswith(x) for t in tn for x in ("attn_k.weight", "attn_v.weight", "ssm_alpha.weight",
-                                                                    "ssm_beta.weight", "attn_qkv.weight"))):
-                            qkv = any(t.endswith("attn_qkv.weight") for t in tn)
-                            kv = ROPEW_ON and k == "kstore" and any(t.endswith(("attn_k.weight", "attn_v.weight")) for t in tn)
-                            iu4_gemm(k, mt, kb, B, outdir, flag=qkv and DNOV_ON, wait=gen_rot.nq_flag_count(5120))
-                            if kv:   # ropew: also flagged (the plain one serves chunks without ropew)
-                                iu4_gemm(k, mt, kb, B, outdir, flag=True, wait=gen_rot.nq_flag_count(5120))
-            n += 1
-            continue
         for k in kinds:
             r = gemm(fmt, mt, kb, B, name(k), outdir, kind=k)
             if r:
@@ -2236,9 +1774,9 @@ def main():
 
     if not EMIT_HALF:
         geom.extend(ffn_fused(rows, B, outdir))
-        if KST2 and not a4:
+        if KST2:
             geom.extend(kst2(rows, B, outdir))
-        if SEG and not a4:
+        if SEG:
             geom.extend(seg_gemms(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
         import gen_bfp16_encode as GE
@@ -2288,8 +1826,7 @@ def main():
     # One attention kernel at every depth: the persistent kernel (gen_attn_fa PERSIST, YAH_ATTN_PERSIST=<slots>, 80; 0:
     # the grid kernel), workgroups running whole units, bit-identical; dispatch.txt "persist_<hal> <slots> 1 <dyn>" rows.
     # Busiest SQ % of floor 11-03: 82.7 / 85.4 / 85.8 / 85.8 at 16K / 32K / 96K / 124K, where the 3-workgroup twins it
-    # replaced (KT2, PAIR "deep") ran 75-77 / 73. Not the OCNT kernel (wmmaf.hal: its counters feed a concurrent
-    # consumer) nor half sets (the grid kernel: 85.0% to 96K, 73.2% at 124K).
+    # replaced (KT2, PAIR "deep") ran 75-77 / 73. Not half sets (the grid kernel: 85.0% to 96K, 73.2% at 124K).
     persist = 0 if EMIT_HALF else int(os.environ.get("YAH_ATTN_PERSIST", str(320 // gen_attn_fa.NQB)))   # 20 WGPs x 4 (2x64: x 2)
     MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=not persist, PERSIST=persist, PV_FENCE=True,
                       R2P=os.environ.get("YAH_ATTN_R2P", "1") != "0", PRO_FAST=os.environ.get("YAH_ATTN_PROF", "1") != "0")
@@ -2322,9 +1859,6 @@ def main():
         for k, v in saved.items():
             setattr(A, k, v)
     gen_attn_fa.QNORM = QNORM and gen_attn_fa.Q16 and gen_attn_fa.QDIRECT is not False   # (see RoPE below)
-    gen_attn_fa.QG16 = QG16_ON
-    if QG16_ON:
-        geom.append(("qg16", 0, 0, 0))
     if GSIG_ON:
         geom.append(("gsig", 0, 0, 0))
     if QSPLIT_ON:
@@ -2361,17 +1895,6 @@ def main():
             open(path, "w").write(text)
         return path if c0seed or c0rot16 or kdb else src
     attn_c0_src = write_c0(attn_src, os.path.join(tmp, "yah_attn_hip_c0.loom"))
-    attn_f_src = os.path.join(tmp, "yah_attn_hipf.loom")
-    aov_need = 0
-    if AOV and a4 and RQOP and B % gen_rot.FLAG_TT == 0 and not EMIT_HALF:   # the main kernel with OCNT
-        A = gen_attn_fa
-        saved = {k: getattr(A, k) for k in ("OCNT",) + tuple(MAIN_FLAGS)}
-        for k, v in dict(MAIN_FLAGS, OCNT=True, PERSIST=0, QB_ZIGZAG=True).items():
-            setattr(A, k, v)
-        open(attn_f_src, "w").write(A.gen())
-        aov_need = A.ocnt_need()
-        for k, v in saved.items():
-            setattr(A, k, v)
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
     af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
     if EMIT_HALF:   # the whole set's (its o-projections' afrag forms)
@@ -2564,7 +2087,7 @@ def main():
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
     conv_tb = conv_tb_ok(B)
-    dn_vconv = (DNVCONV and conv_tb and (a4 or (DNSS_NAT and B % 32 == 0)) and DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT
+    dn_vconv = (DNVCONV and conv_tb and DNSS_NAT and B % 32 == 0 and DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT
                 and not EMIT_HALF)
     if dn_vconv:
         text = gen_conv_kq.gen(4096)
@@ -2579,60 +2102,29 @@ def main():
             text = conv_n16(text)
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
-    assert DNOV_ON <= dn_vconv
-    convf_src = os.path.join(tmp, "yah_ssm_conv_kqf.loom")
-    if DNOV_ON:
-        open(convf_src, "w").write(gen_conv_kq.gen(4096, flag=gen_gemm_iu4.flag_count(10240)))
-        geom.append(("dnov", 0, 0, 0))
-    convp_src = os.path.join(tmp, "yah_ssm_conv_kq_p.loom")
-    convp = CONVP and DNOV_ON and B % gen_rot.FLAG_TT == 0
-    if convp:
-        open(convp_src, "w").write(gen_conv_kq.gen_p(B))
-        geom.append(("convkqp.hal", gen_conv_kq.PG, 0, 0))
     prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
     text = open(os.path.join(E.LOOM, "yah_deltanet_prep_ab_f32.loom")).read()
     open(prepab_src, "w").write(prepab_x16(text) if 640 in O16_MT else text)
-    prepab_text = prepab_x16(text) if 640 in O16_MT else text
     postnorm_base = open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()
     if 384 in O16_MT:
         postnorm_base = postnorm_g16(postnorm_base)
     postnorm_src = os.path.join(tmp, "yah_ssm_postnorm.loom")
     open(postnorm_src, "w").write(postnorm_base)
-    dn_perm = a4 and DNSPLIT == (40, 8)
-    dn_ss = DNSS and dn_perm and dn_vconv and DNO16 and B % 32 == 0
-    dn_nat = not a4 and dn_vconv   # DNSS_NAT
-    dn_ss = dn_ss or dn_nat
-    # one flagged pnq for both DeltaNet parts (gen_rot.gen_pnq "ab"): part b's DeltaNet counts its finished lanes
-    pnq_ab = DNOV_ON and dn_ss
-    DNRING_ON = DNRING and pnq_ab and RQK_ON and NQW_ON and DNSPLIT == (40, 8)
-    prepabr_src = os.path.join(tmp, "yah_deltanet_prep_abr.loom")
-    if DNRING_ON:
-        open(prepabr_src, "w").write(prepab_ring(prepab_text, gen_gdn_ss.done_count(DNSPLIT[1])))
-        geom.append(("dnring", 0, 0, 0))
+    dn_ss = dn_vconv   # DNSS_NAT: the DeltaNet parts on the state-stationary kernel
     # blocks per head of the DeltaNet grid (the unsplit rowsplit.hal is not dispatched with dnsplit)
     geom.append(("rowsplit.hal", 0, 1 if dn_ss else 2, 0))
     geom.append(("dnthreads", gen_gdn_ss.THREADS if dn_ss else 256, 0, 0))
     dn_parts = []
-    # A4 sets: DeltaNet part b runs the heads of whole rotq groups (gen_rot.pn_heads), so each fused postnorm + rotq part
-    # (gen_pnq) reads one part's compact output; "dnperm" tells the host the parts are head sets, not ranges
     if dn32(B) and DNSPLIT:
         ha, hb = DNSPLIT
         for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
-            if dn_perm:
-                assert len(gen_rot.pn_heads(tag)) == nh
-                if dn_ss:
-                    open(src, "w").write(gen_gdn_ss.gen(gen_rot.pn_heads(tag), flag=pnq_ab and tag == "b"))
-                else:
-                    open(src, "w").write(gen_gdn_chunk.gen(heads=gen_rot.pn_heads(tag), vconv=dn_vconv, o16=DNO16))
-            elif dn_nat:
-                open(src, "w").write(gen_gdn_ss.gen(list(range(h0, h0 + nh)), natural=True))
+            if dn_ss:
+                open(src, "w").write(gen_gdn_ss.gen(list(range(h0, h0 + nh))))
             else:
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
         geom.append(("dnsplit", 0, ha, hb))
-        if dn_perm:
-            geom.append(("dnperm", 0, 0, 0))
     if conv_tb:
         geom.append(("convtb", gen_conv_kq.TB, 0, 0))
 
@@ -2671,7 +2163,6 @@ def main():
         open(img, "w").write(gen_npu_attn.emit(16, npu_nbs))
         gen_npu_attn.compile_xdna(img, os.path.join(outdir, "npu_attn.xdna"))
     rope_src = "yah_fused_qk_rope_batched_f32.loom"
-    ropew_src = os.path.join(tmp, "yah_fused_qk_rope_batched_wait.loom")
     if paged_f16k:   # RoPE writes K rows straight into the paged pool
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_kpaged.loom")
         open(rope_src, "w").write(rope_kpaged(open(os.path.join(E.LOOM, "yah_fused_qk_rope_batched_f32.loom")).read()))
@@ -2679,30 +2170,18 @@ def main():
     text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
     rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_live.loom")
     text = rope_live(text)
-    if KV16_ON:
-        text = rope_kv16(text)
     vtrope = paged_f16k and paged_f16v   # RoPE stores V^T into the paged pool: no yah_vtpage pass
     if vtrope:
         text = rope_vtpage(text)
         geom.append(("vtrope", 0, 0, 0))
     open(rope_src, "w").write(text)
-    if KV16_ON:
-        geom.append(("kv16in", 0, 0, 0))
     # QNORM: the attention takes the raw f32 q and does the head norm + RoPE + f16(q / 16) in its prologue (same bits);
     # RoPE does K / V only. dispatch.txt "qnorm"
     if gen_attn_fa.QNORM:
         text = open(rope_src).read()
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_konly.loom")
-        konly = rope_konly(text)
-        kv = ROPEKV and KV16_ON and vtrope and B % 16 == 0
-        open(rope_src, "w").write(rope_kv(konly) if kv else konly)
+        open(rope_src, "w").write(rope_konly(text))
         geom.append(("qnorm", 0, 0, 0))
-        if kv:
-            geom.append(("ropekv", 0, 0, 0))
-        if ROPEW_ON:
-            need = gen_gemm_iu4.flag_count(1024)
-            open(ropew_src, "w").write(rope_kv(konly, need) if kv else rope_wait(konly, need))
-            geom.append(("ropew", 0, 0, 0))
     elif gen_attn_fa.Q16:   # RoPE hands the attention f16(q / 16) (not with K4: its H256 rotates the f32 Q)
         text = open(rope_src if os.path.isabs(rope_src) else os.path.join(E.LOOM, rope_src)).read()
         rope_src = os.path.join(tmp, "yah_fused_qk_rope_batched_q16.loom")
@@ -2726,115 +2205,8 @@ def main():
         raise SystemExit("emit_prefill_pp: the embed kernel reads a Q8_0 token_embd")
     open(embed_src, "w").write(gen_decode_misc.gen_embed_q8_0(rows=B))
     geom.append(("embed.hal", 1, 5120 // 16, B))   # one token per workgroup
-    # MQ4 GEMMs read their input in the weights' rotated basis (gen_rot): the driver rotates each GEMM input site in place,
-    # the DeltaNet postnorm's out of place (dst in HF head order); the head's f32 norm row without awq.
-    # A4 sets rotate and quantize instead (rotq_*: int4 activations with one scale per 128 values, the iu4 GEMM's K phase;
-    # rows "<hal> 0 <lanes> <workgroups>"). Per-token scales for the norm-fed sites and 512-value spans for the others cost
-    # WT2 KL 0.064 vs 0.051 (2 chunks; p99.9 2.08 vs 1.01).
-    rot_src = {}
-    if rot:
-        rots = [("rot_head.hal", (5120, 1, False, None, "f32"))]
-        if not a4:
-            rots += [("rot_5120.hal", (5120, B)), ("rot_6144.hal", (6144, B)), ("rot_17408.hal", (17408, B)),
-                     ("rot_heads.hal", (6144, B, True, (48, 16, 128)))]
-        for name, args in rots:
-            rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-            open(rot_src[name], "w").write(gen_rot.gen(*args))
-        for name, (k, heads) in (("rotq_5120.hal", (5120, None)), ("rotq_6144.hal", (6144, None)),
-                                 ("rotq_17408.hal", (17408, None)), ("rotq_heads.hal", (6144, (48, 16, 128)))) if a4 else ():
-            rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-            open(rot_src[name], "w").write(gen_rot.gen_q(k, B, gen_gemm_iu4.KP, True, heads, hot=k == 17408))
-            geom.append((name, 0, 64, k // 1024))
-        if GUOV_ON:   # rotq_17408's geometry
-            rot_src["rotqf_17408.hal"] = os.path.join(tmp, "rotqf_17408.loom")
-            open(rot_src["rotqf_17408.hal"], "w").write(
-                gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None, flag=gen_gemm_iu4.gu_flag_count(17408)))
-            geom.append(("guov", 0, 0, 0))
-        if RQK_ON:   # the rotq_17408 / rotq_6144 geometry
-            for name, src in (("rotqfo_17408.hal", gen_rot.gen_q(17408, B, gen_gemm_iu4.KP, True, None,
-                                                                  flag=gen_gemm_iu4.gu_flag_count(17408), oflag=True)),
-                              ("rotqo_6144.hal", gen_rot.gen_q(6144, B, gen_gemm_iu4.KP, True, None, oflag=True))):
-                rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-                open(rot_src[name], "w").write(src)
-            geom.append(("rqk", 0, 0, 0))
-            if RQP and GUOV_ON and B % gen_rot.FLAG_TT == 0:
-                rot_src["rotqp_17408.hal"] = os.path.join(tmp, "rotqp_17408.loom")
-                open(rot_src["rotqp_17408.hal"], "w").write(
-                    gen_rot.gen_qp(17408, B, gen_gemm_iu4.KP, RQP, gen_gemm_iu4.gu_flag_count(17408)))
-                geom.append(("rotqp_17408.hal", RQP, 0, 0))
-            if RQOP and B % gen_rot.FLAG_TT == 0:
-                rot_src["rotqop_6144.hal"] = os.path.join(tmp, "rotqop_6144.loom")
-                open(rot_src["rotqop_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, 0))
-                geom.append(("rotqop_6144.hal", RQOP, 0, 0))
-                if aov_need:
-                    rot_src["rotqopf_6144.hal"] = os.path.join(tmp, "rotqopf_6144.loom")
-                    open(rot_src["rotqopf_6144.hal"], "w").write(gen_rot.gen_qp(6144, B, gen_gemm_iu4.KP, RQOP, aov_need, plow=True))
-                    geom.append(("rotqopf_6144.hal", RQOP, 0, 0))
-                    geom.append(("aov", 0, 0, 0))
-        if NQW_ON:
-            geom.append(("nqw", 0, 0, 0))
-        if a4:
-            # the norm-fed sites: RMS norm + rotq in one kernel (gen_rot.gen_nq; same bits, no f16 norm round trip)
-            rot_src["normq_5120.hal"] = os.path.join(tmp, "normq_5120.loom")
-            open(rot_src["normq_5120.hal"], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP))
-            geom.append(("normq_5120.hal", 0, 16 * 5120 // 256, 1))
-            if NQOV_ON:
-                assert gen_gemm_iu4.tile(5120)[1] == gen_rot.FLAG_TT
-                rot_src["normqf_5120.hal"] = os.path.join(tmp, "normqf_5120.loom")
-                open(rot_src["normqf_5120.hal"], "w").write(
-                    gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=gen_gemm_iu4.flag_count(5120)))
-                geom.append(("nqov", 0, 0, 0))
-            if NQGU_ON or NQW_ON:
-                for f in (0, gen_gemm_iu4.flag_count(5120)) if NQOV_ON else (0,):
-                    name = "normq%so_5120.hal" % ("f" if f else "")
-                    rot_src[name] = os.path.join(tmp, name[:-4] + ".loom")
-                    open(rot_src[name], "w").write(gen_rot.gen_nq(5120, B, gen_gemm_iu4.KP, flag=f, oflag=True,
-                                                                  persist=NQP if B % NQP == 0 else 0))
-                geom.append(("nqgu", 0, 0, 0))
-                if NQP and B % NQP == 0:
-                    geom.append(("nqp", NQP, 0, 0))
-            if DNSPLIT == (40, 8):
-                # the DeltaNet postnorm + rotq_heads (gen_rot.gen_pnq) per DeltaNet part (dn_perm): a beside part b, b after it
-                for part in "ab":
-                    name = "pnq_%s.hal" % part
-                    rot_src[name] = os.path.join(tmp, "pnq_%s.loom" % part)
-                    open(rot_src[name], "w").write(gen_rot.gen_pnq(B, gen_gemm_iu4.KP, part, o16=DNO16))   # gate: kstoreh
-                    geom.append((name, 0, 64, len(gen_rot.pnq_groups(part)) // 4))
-                if DNOV_ON:   # part a waiting on the gate GEMM's counters (pnq_a.hal's geometry)
-                    rot_src["pnq_af.hal"] = os.path.join(tmp, "pnq_af.loom")
-                    open(rot_src["pnq_af.hal"], "w").write(
-                        gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "a", o16=DNO16, flag=gen_gemm_iu4.flag_count(6144)))
-                if pnq_ab:   # both parts in one grid (raw_: part b's compact f16 rows, then part a's), so part b no
-                    # longer dispatches behind part a's waiting workgroups
-                    rot_src["pnq_abf.hal"] = os.path.join(tmp, "pnq_abf.loom")
-                    open(rot_src["pnq_abf.hal"], "w").write(
-                        gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
-                                        dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
-                    geom.append(("pnq_abf.hal", 0, 64, len(gen_rot.pnq_groups("ab")) // 4))
-                    # a trimmed chunk's gate GEMM runs unflagged (gen_gemm_iu4 flags only full token tiles): the same
-                    # grid waiting only on DeltaNet part b, behind the gate GEMM in the graph (pnq_abf.hal's geometry)
-                    if DNRING_ON:   # waiting on the ring update (which waits on part b), counting for ssm_out's kres
-                        assert gen_rot.q_flag_count(6144) == 128 * len(gen_rot.pnq_groups("ab")) // 4 * 2
-                        rot_src["pnq_abfr.hal"] = os.path.join(tmp, "pnq_abfr.loom")
-                        open(rot_src["pnq_abfr.hal"], "w").write(
-                            gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, flag=gen_gemm_iu4.flag_count(6144),
-                                            dflag=ring_flag_count(), oflag=True))
-                        if PNQP and B % gen_rot.FLAG_TT == 0:
-                            rot_src["pnq_abfrp.hal"] = os.path.join(tmp, "pnq_abfrp.loom")
-                            open(rot_src["pnq_abfrp.hal"], "w").write(gen_rot.gen_pnqp(
-                                B, gen_gemm_iu4.KP, PNQP, gen_gemm_iu4.flag_count(6144), ring_flag_count()))
-                            geom.append(("pnq_abfrp.hal", PNQP, 0, 0))
-                    rot_src["pnq_abd.hal"] = os.path.join(tmp, "pnq_abd.loom")
-                    open(rot_src["pnq_abd.hal"], "w").write(
-                        gen_rot.gen_pnq(B, gen_gemm_iu4.KP, "ab", o16=True, dflag=gen_gdn_ss.done_count(DNSPLIT[1])))
-        with open(os.path.join(outdir, "rot_signs.bin"), "wb") as fh:
-            fh.write(gen_rot.signs())
-        geom.append(("rot", 0, 0, 0))
-        if a4:
-            geom.append(("a4", 0, 0, 0))
-    else:
-        geom.append(("native", 0, 0, 0))   # the engine loads the GGUF as it is (core/gguf_convert.cpp native)
-    # the output head: the tile-free GEMV (gen_gemv) for MQ4 or Q8_0 (a native GGUF's head that is not Q6_K, which
+    geom.append(("native", 0, 0, 0))   # the engine loads the GGUF as it is (core/gguf_convert.cpp)
+    # the output head: the tile-free GEMV (gen_gemv) for Q8_0 (a GGUF head that is not Q6_K, which
     # yah_gemv_q6k_f32 reads), rows per workgroup / lanes / workgroups in its row
     head_src, head_fmt = None, gen_gemv.GGML.get(types["output.weight"])
     if head_fmt:
@@ -2861,7 +2233,7 @@ def main():
     postnorm_t_src = os.path.join(tmp, "yah_ssm_postnorm_tiled.loom")
     open(postnorm_t_src, "w").write(postnorm_tiled(postnorm_base))
     pn_parts = []
-    for tag, h0, nh, _ in ([] if dn_perm else dn_parts):
+    for tag, h0, nh, _ in dn_parts:
         base = postnorm_base
         for t_, txt in (("", postnorm_heads(base, h0, nh, B)), ("_t", postnorm_tiled(postnorm_heads(base, h0, nh, B)))):
             src = os.path.join(tmp, f"yah_ssm_postnorm{t_}_{tag}.loom")
@@ -2885,14 +2257,6 @@ def main():
         (conv_src, "convkq.hal",
          ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
           "yah_ssm_conv_kq.num_key_heads=16"]),
-        *([(convf_src, "convkqf.hal",
-            ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
-             "yah_ssm_conv_kq.num_key_heads=16"])] if DNOV_ON else []),
-        *([(convp_src, "convkqp.hal", ["yah_ssm_conv_kq_p.items=%d" % (16 * B // gen_conv_kq.PST)])] if convp else []),
-        *([(prepabr_src, "prepabr.hal",
-             ["yah_deltanet_prep_ab.batch=%d" % B,
-              "yah_deltanet_prep_ab.qkv_size=10240",
-              "yah_deltanet_prep_ab.num_heads=48"])] if DNRING_ON else []),
         (prepab_src, "prepab.hal",
          ["yah_deltanet_prep_ab.batch=%d" % B,
           "yah_deltanet_prep_ab.qkv_size=10240",
@@ -2905,7 +2269,7 @@ def main():
          ["yah_ssm_postnorm_fp16.head_count=%d" % (48 * B)]),
         *[(src, f"rowsplit_{tag}.hal",
            ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
-            "yah_deltanet.inner_size=%d" % (128 * nh if dn_perm else 6144), "yah_deltanet.num_key_heads=16",
+            "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
             "yah_deltanet.num_heads=48"]) for tag, _, nh, src in dn_parts],
         *[(src, hal, ["yah_ssm_postnorm_fp16.head_count=%d" % (nh * B)]) for hal, src, nh in pn_parts],
         ("yah_unpack_qg_f32.loom", "unpack.hal",
@@ -2926,7 +2290,7 @@ def main():
             "yah_fused_qk_rope_batched.cache16_elems=%d" % (1024 * B if kv16_scratch else KC),
             *(["yah_fused_qk_rope_batched.cache_start=%d" % (c * B)] if kv16_scratch else []),
             *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)
-          for src_, stem_ in ((rope_src, "rope"),) + (((ropew_src, "ropew"),) if ROPEW_ON and gen_attn_fa.QNORM else ())],
+          for src_, stem_ in ((rope_src, "rope"),)],
         *([(qrot_src, "qrot.hal", ["yah_qrot.token_count=%d" % B])] if qrot_first < NCH else []),
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c),
            ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)]
@@ -2944,12 +2308,6 @@ def main():
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH)],
-        *([(attn_f_src, "wmmaf.hal", [
-            "attention_prefill.cache_capacity=%d" % T,
-            "attention_prefill.token_count=%d" % B,
-            "attention_prefill.start_pos=0",
-            "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
-            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and qrot_first > 0 else []),
         *[(attn_qr_t_src if c >= qrot_first else attn_t_c0_src if c == 0
            else ksn_srcs["ksn"][1] if c >= npu_from else attn64ks_t_src if c >= ks_from
            else attn64_t_src if c >= w64_from else attn_t_src,
@@ -2994,7 +2352,6 @@ def main():
          ["yah_rmsnorm.rows=1", "yah_rmsnorm.eps=1e-06"]),
         *([(head_src, "gemv.hal", ["nop=0"])] if head_src else [("yah_gemv_q6k_f32.loom", "gemv.hal",
           ["yah_gemv_q6k.m_rows=248320", "yah_gemv_q6k.k_blocks=20"])]),
-        *[(src, name, ["nop=0"]) for name, src in rot_src.items()],
         ("yah_argmax_f32.loom", "argmax.hal", ["yah_argmax.vocab=248320"]),
     ]
     # Loom low-level LICM (HRX patch 0011) for the attention kernels where it wins: it hoists the fragment loads'
@@ -3004,7 +2361,7 @@ def main():
     def attn_env(loom):
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
-        if loom in (attn_src, attn_t_src, attn_f_src, attn_c0_src, attn_t_c0_src, attn64_src, attn64_t_src,
+        if loom in (attn_src, attn_t_src, attn_c0_src, attn_t_c0_src, attn64_src, attn64_t_src,
                     attn64ks_src, attn64ks_t_src, attn64km_src, attn64km_t_src, *ksn_twins) and loom is not None and (
                 not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
@@ -3026,7 +2383,7 @@ def main():
                                  % (outname, hal_spills(hal)))
             if hal_vgprs(hal) > ATTN_VGPR:   # (3 workgroups per WGP instead of 4)
                 print("attention %s: %d VGPRs, over %d" % (outname, hal_vgprs(hal), ATTN_VGPR))
-        if outname.startswith("wmma") and persist and outname != "wmmaf.hal":
+        if outname.startswith("wmma") and persist:
             persist_rows.append((outname, persist64 if loom in (attn64_src, attn64_t_src, attn64ks_src, attn64ks_t_src,
                                                                 attn64km_src, attn64km_t_src, *ksn_twins) else persist))
             if loom in (attn64ks_src, attn64ks_t_src):

@@ -4,7 +4,7 @@ head, the state in registers.
 
 usage: gen_gdn_ss.py [out.loom]
 
-Same ABI as gen_gdn_chunk.gen(heads=..., vconv=True, o16=True) (bindings conv, x, conv_weights, conv_state, alpha, beta,
+ABI of yah_deltanet with the v conv folded in (bindings conv, x, conv_weights, conv_state, alpha, beta,
 ssm_a, ssm_dt, valid, state, out), grid (1, len(heads)) x THREADS = 288 threads (9 wave32 waves; dispatch.txt
 "dnthreads").
 
@@ -47,10 +47,8 @@ POOL = OS + 8 * 2 * 16 * 16 * 2
 assert POOL <= 65536
 
 
-def gen(heads, flag=False, natural=False):
-    """flag: binding cnt after out (i32, zero before); each row-wave lane adds 1 after its last stores (release), so a
-    flag-waiting consumer (gen_rot.gen_pnq "ab") sees the outputs once cnt reaches done_count(len(heads)).
-    natural (the f16 sets): O as f32 [batch][inner_size] at head h's own columns 128 h .. (gen_gdn_chunk's output, the
+def gen(heads):
+    """O as f32 [batch][inner_size] at head h's own columns 128 h .. (gen_gdn_chunk's output, the
     plain postnorm's input), stored from the accumulators (no staging), and the v conv with gen_gdn_chunk's ops and V
     rounded to f16 as its Vt: one chaotic gate token (window 06) fails gate N with the fma / exp2 form (mean KL 2.45e-6
     vs 1.06e-6)."""
@@ -73,7 +71,7 @@ def gen(heads, flag=False, natural=False):
     e(f"  %launch_heads = index.constant {nh} : index")
     e("  kernel.launch.config workgroups(%unit, %launch_heads, %unit) workgroup_size(%nthreads, %unit, %unit) : index")
     e("} launch(%conv: buffer, %x: buffer, %cw: buffer, %cst: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, "
-      "%ssm_dt: buffer, %valid: buffer, %state: buffer, %out: buffer" + (", %cnt: buffer" if flag else "") + ") {")
+      "%ssm_dt: buffer, %valid: buffer, %state: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 31, 32, 40, 48, 64, 127, 128, 255, 16384):
         e(f"  %c{v} = index.constant {v} : index")
@@ -109,7 +107,7 @@ def gen(heads, flag=False, natural=False):
     e("  %sdt_view = buffer.view %sdt_na[%base] : buffer -> view<[%num_heads]xf32>")
     e("  %valid_view = buffer.view %valid[%base] : buffer -> view<1xi32>")
     e("  %state_view = buffer.view %st_na[%base] : buffer -> view<[%state_total]xf32>")
-    e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%out_total]x" + ("f32" if natural else "f16") + ">")
+    e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%out_total]xf32>")
     e(f"  %o16_sc = scalar.constant {float(2 ** O16_EXP)!r} : f32")
     e("  %o16_hi = scalar.constant 65504.0 : f32")
     e("  %o16_lo = scalar.constant -65504.0 : f32")
@@ -176,7 +174,7 @@ def gen(heads, flag=False, natural=False):
     e("  %v_heads = index.mul %num_key_heads, %c2 : index")
     e("  %v_head = index.add %v_heads, %h : index")
     e("  %v_rel = index.mul %v_head, %c128 : index")
-    e("  %o_rel = index.mul " + ("%h" if natural else "%h_rel") + ", %c128 : index")
+    e("  %o_rel = index.mul %h, %c128 : index")
     e("  %s_head = index.mul %h, %c16384 : index")
     # wave roles: wave 8 the solver; row waves: value rows 16 sg .. +15 (the solver's row-wave values are clamped
     # copies of wave 7's: computed, never used)
@@ -308,43 +306,16 @@ def gen(heads, flag=False, natural=False):
         return [f"%{p}al", f"%{p}be"]
 
     def ostage(ind, acc, t, p):
-        """O tile t (tokens 16 t + half + 2 i, row) -> this wave's staging tile [tok][row], f16(clamp(O 2^O16_EXP));
-        natural: f32 straight to out (the chunk's token base %ost0)"""
-        if natural:
-            e(f"{ind}%{p}tb0 = index.add %ost0, %half : index")
-            e(f"{ind}%{p}tb = index.add %{p}tb0, %c{16 * t} : index")
-            for i in range(8):
-                e(f"{ind}%{p}e{i} = vector.extract {acc}[{i}] : {V8} -> f32")
-                e(f"{ind}%{p}t{i}c = index.constant {2 * i} : index")
-                e(f"{ind}%{p}t{i} = index.add %{p}tb, %{p}t{i}c : index")
-                e(f"{ind}%{p}g{i}0 = index.mul %{p}t{i}, %inner_size : index")
-                e(f"{ind}%{p}g{i} = index.add %{p}g{i}0, %orow : index")
-                e(f"{ind}view.store %{p}e{i}, %out_view[%{p}g{i}] : f32, view<[%out_total]xf32>")
-            return
-        e(f"{ind}%{p}w = index.add %os_w, %c{16 * t} : index")
+        """O tile t (tokens 16 t + half + 2 i, row) -> out as f32 (the chunk's token base %ost0)"""
+        e(f"{ind}%{p}tb0 = index.add %ost0, %half : index")
+        e(f"{ind}%{p}tb = index.add %{p}tb0, %c{16 * t} : index")
         for i in range(8):
             e(f"{ind}%{p}e{i} = vector.extract {acc}[{i}] : {V8} -> f32")
-            e(f"{ind}%{p}s{i} = scalar.mulf %{p}e{i}, %o16_sc : f32")
-            e(f"{ind}%{p}l{i} = scalar.minnumf<nnan> %{p}s{i}, %o16_hi : f32")
-            e(f"{ind}%{p}c{i} = scalar.maxnumf<nnan> %{p}l{i}, %o16_lo : f32")
-            e(f"{ind}%{p}h{i} = scalar.fptrunc %{p}c{i} : f32 to f16")
-            e(f"{ind}%{p}r{i}c = index.constant {2 * i} : index")
-            e(f"{ind}%{p}r{i}0 = index.add %{p}w, %half : index")
-            e(f"{ind}%{p}r{i} = index.add %{p}r{i}0, %{p}r{i}c : index")
-            e(f"{ind}view.store %{p}h{i}, %os_v[%{p}r{i}, %sub] : f16, view<256x16xf16>")
-
-    def oflush(ind, t0, t, p):
-        """staged O tile t of the chunk at t0 -> out, one b128 per lane (token 16 t + lane / 2, rows 8 (lane % 2) .. +7)"""
-        if natural:
-            return
-        e(f"{ind}%{p}w = index.add %os_w, %c{16 * t} : index")
-        e(f"{ind}%{p}q = index.add %{p}w, %os_lr : index")
-        e(f"{ind}%{p}v = vector.load %os_v[%{p}q, %os_lc] : view<256x16xf16> -> {V8H}")
-        e(f"{ind}%{p}gt0 = index.add {t0}, %os_lr : index")
-        e(f"{ind}%{p}gt1 = index.add %{p}gt0, %c{16 * t} : index")
-        e(f"{ind}%{p}gt2 = index.mul %{p}gt1, %inner_size : index")
-        e(f"{ind}%{p}gt = index.add %{p}gt2, %os_gc : index")
-        e(f"{ind}vector.store %{p}v, %out_view[%{p}gt] : {V8H}, view<[%out_total]xf16>")
+            e(f"{ind}%{p}t{i}c = index.constant {2 * i} : index")
+            e(f"{ind}%{p}t{i} = index.add %{p}tb, %{p}t{i}c : index")
+            e(f"{ind}%{p}g{i}0 = index.mul %{p}t{i}, %inner_size : index")
+            e(f"{ind}%{p}g{i} = index.add %{p}g{i}0, %orow : index")
+            e(f"{ind}view.store %{p}e{i}, %out_view[%{p}g{i}] : f32, view<[%out_total]xf32>")
 
     def repack(ind, src, nm):
         """f32 accumulator tile [m][n] -> f16 rhs fragment [k = m][n], in registers (value i in the low half of
@@ -584,8 +555,6 @@ def gen(heads, flag=False, natural=False):
         e(f"{I}%opc0 = index.max %ci, %c1 : index")
         e(f"{I}%opc = index.sub %opc0, %c1 : index")
         e(f"{I}%opt0 = index.mul %opc, %c32 : index")
-        for t in range(2):
-            oflush(I, "%opt0", t, f"ox{t}")
         e(f"{I}{barrier}")
         # ---- phase 2: P = QK^T (f16), its 3 lower tiles on waves 5-7 (the strictly upper one is zero: never computed,
         # its P Vn product skipped)
@@ -689,33 +658,21 @@ def gen(heads, flag=False, natural=False):
                 u = 8 * tt + i
                 q = f"%vc{tt}_{i}"
                 s0, s1, s2, s3 = xs[2 * u], xs[2 * u + 1], xs[2 * u + 2], xs[2 * u + 3]
-                if natural:   # gen_gdn_chunk's (gen_conv_kq's) ops
-                    for k_, s_ in enumerate((s0, s1, s2, s3)):
-                        e(f"{I}{q}d{k_} = scalar.mulf {s_}, {w[k_]} : f32")
-                    e(f"{I}{q}sa = scalar.addf {q}d0, {q}d1 : f32")
-                    e(f"{I}{q}sb = scalar.addf {q}d2, {q}d3 : f32")
-                    e(f"{I}{q}dot = scalar.addf {q}sa, {q}sb : f32")
-                    e(f"{I}{q}ng = scalar.mulf {q}dot, %negone : f32")
-                    e(f"{I}{q}ex = scalar.expf<afn> {q}ng : f32")
-                    e(f"{I}{q}dn = scalar.addf %one, {q}ex : f32")
-                    e(f"{I}{q}sg = scalar.divf %one, {q}dn : f32")
-                else:
-                    # taps as fma_mix on the f16 inputs
-                    e(f"{I}{q}d0 = scalar.mulf {s0}, {w[0]} : f32")
-                    e(f"{I}{q}d1 = scalar.fmaf {s1}, {w[1]}, {q}d0 : f32")
-                    e(f"{I}{q}d2 = scalar.fmaf {s2}, {w[2]}, {q}d1 : f32")
-                    e(f"{I}{q}dot = scalar.fmaf {s3}, {w[3]}, {q}d2 : f32")
-                    e(f"{I}{q}ng = scalar.mulf {q}dot, %nl2e : f32")
-                    e(f"{I}{q}ex = scalar.exp2f<afn> {q}ng : f32")
-                    e(f"{I}{q}dn = scalar.addf %one, {q}ex : f32")
-                    e(f"{I}{q}sg = scalar.divf<nnan|ninf|nsz|arcp> %one, {q}dn : f32")   # v_rcp: rcp(inf) = 0
+                # gen_gdn_chunk's (gen_conv_kq's) ops
+                for k_, s_ in enumerate((s0, s1, s2, s3)):
+                    e(f"{I}{q}d{k_} = scalar.mulf {s_}, {w[k_]} : f32")
+                e(f"{I}{q}sa = scalar.addf {q}d0, {q}d1 : f32")
+                e(f"{I}{q}sb = scalar.addf {q}d2, {q}d3 : f32")
+                e(f"{I}{q}dot = scalar.addf {q}sa, {q}sb : f32")
+                e(f"{I}{q}ng = scalar.mulf {q}dot, %negone : f32")
+                e(f"{I}{q}ex = scalar.expf<afn> {q}ng : f32")
+                e(f"{I}{q}dn = scalar.addf %one, {q}ex : f32")
+                e(f"{I}{q}sg = scalar.divf %one, {q}dn : f32")
                 e(f"{I}{q}r = scalar.mulf {q}dot, {q}sg : f32")
-                if natural:   # V rounded to f16 as gen_gdn_chunk's Vt
-                    e(f"{I}{q}rh = scalar.fptrunc {q}r : f32 to f16")
-                    e(f"{I}{q}rr = scalar.extf {q}rh : f16 to f32")
-                    hs.append(f"{q}rr")
-                else:
-                    hs.append(f"{q}r")
+                # V rounded to f16 as gen_gdn_chunk's Vt
+                e(f"{I}{q}rh = scalar.fptrunc {q}r : f32 to f16")
+                e(f"{I}{q}rr = scalar.extf {q}rh : f16 to f32")
+                hs.append(f"{q}rr")
             e(f"{I}%vv{tt} = vector.from_elements {', '.join(hs)} : {V8}")
             vt.append(f"%vv{tt}")
         by = []
@@ -737,8 +694,7 @@ def gen(heads, flag=False, natural=False):
             o1s.append(f"%o18_{tt}")
         # O = O1 + P Vn (staged now, stored next iteration)
         oacc = []
-        if natural:
-            e(f"{I}%ost0 = index.mul %ci, %c32 : index")
+        e(f"{I}%ost0 = index.mul %ci, %c32 : index")
         for tt in range(2):
             e(f"{I}%o1f{tt} = vector.fragment<init> {o1s[tt]} shape [%m, %n] : {V8}")
             acc = f"%o1f{tt}"
@@ -768,8 +724,6 @@ def gen(heads, flag=False, natural=False):
         e("    }")
         # the last chunk's O
         e("    %oplast = index.mul %lastc, %c32 : index")
-        for tt in range(2):
-            oflush("    ", "%oplast", tt, f"ol{tt}")
         # ---- final state: the initial load's exchange in reverse, two b128 stores per tile
         for j in range(8):
             fe = []
@@ -789,10 +743,6 @@ def gen(heads, flag=False, natural=False):
             for hi, hlf in enumerate("ab"):
                 e(f"    %fv{j}{hlf} = vector.from_elements {', '.join(ov[4 * hi:4 * hi + 4])} : {V4}")
                 e(f"    vector.store %fv{j}{hlf}, %state_view[%sq{j}{hlf}] : {V4}, view<[%state_total]xf32>")
-        if flag:
-            e("    %dn_cv = buffer.view %cnt[%base] : buffer -> view<1xi32>")
-            e("    %dn_one = scalar.constant 1 : i32")
-            e("    view.atomic.reduce<addi> %dn_one, %dn_cv[%c0] {ordering = release, scope = device} : i32, view<1xi32>")
 
     # wave-uniform role branch: every barrier inside has a matching barrier in the other region (HRX patch 0037)
     e("  scf.if %issv {")
@@ -804,14 +754,8 @@ def gen(heads, flag=False, natural=False):
     e("}")
     return "\n".join(L) + "\n"
 
-def done_count(nh):
-    """gen(flag)'s count once all nh workgroups are done: one per row-wave lane"""
-    return nh * (THREADS - 32)
-
-
 def main():
-    import gen_rot
-    text = gen(gen_rot.pn_heads("a"))
+    text = gen(list(range(40)))
     if len(sys.argv) > 1:
         open(sys.argv[1], "w").write(text)
     else:

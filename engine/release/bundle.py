@@ -13,7 +13,7 @@ The bundle:
   bin/        yah_server, yah_chat (RPATH $ORIGIN/../lib)
   lib/        libhrx, ICU, the HSA runtime with librocprofiler-register and the ROCm sysdeps it loads (in
               lib/rocm_sysdeps/lib, where the HSA runtime's own RPATH looks)
-  hal/        <ctx>-<kv>/prefill and decode/ (decode-mtp/: with the MTP layer's kernels), prefill-npu/
+  hal/        <ctx>-<kv>/prefill and decode/, prefill-npu/
               (emit_prefill_pp.py YAH_NPU_SPLIT); 32768-kv8 is the default
   licenses/   this repository's, HRX's, the ROCm parts', ICU's and the sysdeps' (--licenses: extra files)
   README.md   engine/release/README.md
@@ -122,15 +122,14 @@ def build(out, version, licenses):
 
 def set_name(decode):
     """(<ctx>-<kv>, decode dir name) from a decode set's decode.txt."""
-    ctx, kv, mtp = None, "fp16", False
+    ctx, kv = None, "fp16"
     for line in open(os.path.join(decode, "decode.txt")):
         f = line.split()
         if f[:1] == ["ctx"]:
             ctx = int(f[1])
         if f[:2] == ["kv", "q"]:
             kv = {("8", "8"): "kv8", ("4", "4"): "kv4", ("8", "4"): "k8v4", ("4", "8"): "k4v8"}[(f[2], f[3])]
-        mtp |= f[:1] == ["mtp"]
-    return f"{ctx}-{kv}", "decode-mtp" if mtp else "decode"
+    return f"{ctx}-{kv}", "decode"
 
 
 def hal(b, prefill, decode, npu=None):

@@ -39,18 +39,16 @@ namespace http = yah::serve::http;
 int Usage() {
   std::fprintf(stderr,
                "usage: yah_server --model <model> [--ctx 32768] [--kv kv8] [--host 127.0.0.1] [--port 8080]\n"
-               "                  [--draft mtp|off [--draft-len N]] [--npu] [--no-reuse]\n"
+               "                  [--npu] [--no-reuse]\n"
                "                  [--prefill <hal set> --decode <hal set>]\n"
                "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
                "--ctx: the context in tokens (a multiple of 2048); --kv: the KV cache format, fp16, kv8, kv4, k8v4 or\n"
                "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
-               "~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use. --prefill / --decode name sets instead.\n"
+               "~/.cache/yah/hal/<model file name>/<ctx>-<kv>/, emitted there on first use. --prefill / --decode\n"
+               "name sets instead.\n"
                "--npu: the NPU computes part of the prefill's GEMMs, with a prefill set that has the NPU split\n"
                "(prefill-npu/ beside prefill/, or --prefill a set emitted with YAH_NPU_SPLIT); without what it\n"
                "needs the GPU runs everything.\n"
-               "--draft mtp: greedy requests decode speculatively, drafting with the model's MTP layer (a GGUF with\n"
-               "blk.N.nextn.*) and verifying with the decode set's verify GEMVs; --draft-len N fixes the draft length\n"
-               "(default: adapts to the acceptance).\n"
                "--no-reuse: every request prefills from scratch (no multi-turn cache).\n");
   return 2;
 }
@@ -67,19 +65,15 @@ bool Exists(const std::string& path) { return ::access(path.c_str(), R_OK) == 0;
 
 #ifndef YAH_SERVE_FAKE_ONLY
 // The HAL sets for a context and KV format when the command line names none: a bundle's hal/<ctx>-<kv>/, else (a
-// source tree, root = engine/) ~/.cache/yah/hal/<ctx>-<kv>/, emitted there on first use (the Python emitters).
-// A decode set emitted from a model with the MTP layer has its kernels too (decode-mtp/): it serves any model.
+// source tree, root = engine/) ~/.cache/yah/hal/<model file name>/<ctx>-<kv>/, emitted there on first use (the Python
+// emitters). The sets run the model's own formats, so the cache is per model (a bundle ships one model's sets).
 // npu: the prefill set with the NPU split (prefill-npu/, emit_prefill_pp.py YAH_NPU_SPLIT: not emitted here), the plain
 // prefill/ when there is none (the engine then says the NPU is off and why).
 std::pair<std::string, std::string> HalSets(const std::string& root, const std::string& model, std::uint32_t ctx,
                                             const std::string& kv, bool npu) {
-  const auto cfg = yah::core::Qwen35Config::FromGguf(yah::core::Gguf::OpenIndex(model));
-  const std::string name = std::to_string(ctx) + "-" + kv, dec = cfg.nextn_predict_layers ? "decode-mtp" : "decode";
-  const auto decode_of = [&](const std::string& b) {
-    return b + (Exists(b + "/decode-mtp/decode.txt") ? "/decode-mtp" : "/decode");
-  };
+  const std::string name = std::to_string(ctx) + "-" + kv;
   if (const std::string b = root + "/hal/" + name; Exists(b + "/prefill/dispatch.txt"))
-    return {b + (npu && Exists(b + "/prefill-npu/dispatch.txt") ? "/prefill-npu" : "/prefill"), decode_of(b)};
+    return {b + (npu && Exists(b + "/prefill-npu/dispatch.txt") ? "/prefill-npu" : "/prefill"), b + "/decode"};
   const std::string tools = root + "/gpu/loom";
   if (!Exists(tools + "/tools/emit_decode.py"))
     throw std::runtime_error("no HAL sets for " + name + " in " + root +
@@ -87,14 +81,15 @@ std::pair<std::string, std::string> HalSets(const std::string& root, const std::
   const char* xdg = std::getenv("XDG_CACHE_HOME");
   const char* home = std::getenv("HOME");
   const std::string dir =
-      (xdg && *xdg ? std::string(xdg) : std::string(home ? home : ".") + "/.cache") + "/yah/hal/" + name;
+      (xdg && *xdg ? std::string(xdg) : std::string(home ? home : ".") + "/.cache") + "/yah/hal/" +
+      std::filesystem::path(model).filename().string() + "/" + name;
   // steps: emitters run in turn as <command> <model> <set> <args>
   const auto emit = [&](const std::string& sub, const std::string& marker,
                         std::initializer_list<std::pair<std::string, std::string>> steps) {
     const std::string out = dir + "/" + sub;
     if (Exists(out + "/" + marker)) return;
-    std::fprintf(stderr, "yah_server: emitting the %s set for %s into %s (once, %s)\n", sub.c_str(), name.c_str(),
-                 out.c_str(), steps.size() > 1 ? "about a minute" : "about 20 s");
+    std::fprintf(stderr, "yah_server: emitting the %s set for %s into %s (once, a few minutes)\n", sub.c_str(),
+                 name.c_str(), out.c_str());
     const std::string part = out + ".part";
     std::filesystem::remove_all(part);
     std::filesystem::create_directories(dir);
@@ -108,9 +103,8 @@ std::pair<std::string, std::string> HalSets(const std::string& root, const std::
   };
   const std::string pp = "YAH_CTX=" + std::to_string(ctx) + " python3 tools/emit_prefill_pp.py";
   emit("prefill", "dispatch.txt", {{pp, "2048"}});
-  if (!Exists(dir + "/decode-mtp/decode.txt"))
-    emit(dec, "decode.txt", {{"python3 tools/emit_decode.py", std::to_string(ctx)}});
-  return {dir + (npu && Exists(dir + "/prefill-npu/dispatch.txt") ? "/prefill-npu" : "/prefill"), decode_of(dir)};
+  emit("decode", "decode.txt", {{"python3 tools/emit_decode.py", std::to_string(ctx)}});
+  return {dir + (npu && Exists(dir + "/prefill-npu/dispatch.txt") ? "/prefill-npu" : "/prefill"), dir + "/decode"};
 }
 #endif
 
@@ -249,10 +243,10 @@ class Server {
     stream.Finish(result);
     const double tok_s = Timings(result)["predicted_per_second"].get<double>();
     std::fprintf(stderr,
-                 "yah_server: %s prompt=%u cached=%u output=%u prefill_ms=%.1f decode_tok_s=%.1f accepted=%u/%u "
+                 "yah_server: %s prompt=%u cached=%u output=%u prefill_ms=%.1f decode_tok_s=%.1f "
                  "finish=%s\n",
                  stream.id().c_str(), result.prompt_tokens, result.cached_tokens, result.generated_tokens,
-                 result.prefill_ms, tok_s, result.accepted, result.drafted,
+                 result.prefill_ms, tok_s,
                  stream.client_alive() ? result.finish_reason.c_str() : "cancelled");
   }
 
@@ -278,7 +272,7 @@ void CheckModel(const std::string& model) {
   }
   if (!why.empty()) {
     throw std::runtime_error(model + ": " + why +
-                             ". --model takes Qwen3.8-27B as a GGUF (Q4_K_M, Q8_0, IQ4_XS, ...) or the HFQ (.mq4-xts)");
+                             ". --model takes Qwen3.8-27B as a GGUF (Q4_K_M, Q8_0, IQ4_XS, ...)");
   }
 }
 
@@ -288,8 +282,8 @@ int main(int argc, char** argv) {
   std::string model, prefill, decode, host = "127.0.0.1";
   int port = 8080;
   bool fake = false, npu = false, reuse = true;
-  std::string draft = "off", kv = "kv8";
-  std::uint32_t draft_len = 0, ctx = 32768;
+  std::string kv = "kv8";
+  std::uint32_t ctx = 32768;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const bool has_value = i + 1 < argc;
@@ -309,10 +303,6 @@ int main(int argc, char** argv) {
       reuse = false;
     } else if (arg == "--npu") {
       npu = true;
-    } else if (arg == "--draft" && has_value) {
-      draft = argv[++i];
-    } else if (arg == "--draft-len" && has_value) {
-      draft_len = static_cast<std::uint32_t>(std::atoi(argv[++i]));
     } else if (arg == "--host" && has_value) {
       host = argv[++i];
     } else if (arg == "--port" && has_value) {
@@ -338,7 +328,7 @@ int main(int argc, char** argv) {
       // the memory check before the sets are looked for (and maybe emitted); the Engine checks again with them
       const std::uint32_t kb = kv == "fp16" ? 16 : kv == "kv4" || kv == "k4v8" ? 4 : 8;
       const std::uint32_t vb = kv == "fp16" ? 16 : kv == "kv4" || kv == "k8v4" ? 4 : 8;
-      if (const auto plan = yah::model::MemoryPlan::For(model, ctx, kb, vb, "", draft == "mtp"); !plan.fits())
+      if (const auto plan = yah::model::MemoryPlan::For(model, ctx, kb, vb, ""); !plan.fits())
         throw std::runtime_error("not enough memory: " + plan.Describe() +
                                  "; close other programs, or try a smaller --ctx or --kv kv4");
       std::tie(prefill, decode) = HalSets(bundle, model, ctx, kv, npu);
@@ -357,20 +347,13 @@ int main(int argc, char** argv) {
       options.prefill_hal = prefill;
       options.decode_hal = decode;
       options.npu = npu;
-      options.draft = draft;
       options.reuse = reuse;
-      options.draft_len = draft_len;
       auto engine = std::make_unique<yah::model::Engine>(options);
       std::fprintf(stderr, "yah_server: %s\n", engine->memory_report().c_str());
       if (npu) {
         const std::string& why = engine->npu_status();
         std::fprintf(stderr, "yah_server: npu %s%s\n", why.empty() ? "on" : "off: ", why.c_str());
       }
-      if (draft != "off") {
-        const std::string& why = engine->draft_status();
-        std::fprintf(stderr, "yah_server: draft %s %s%s\n", draft.c_str(), why.empty() ? "on" : "off: ", why.c_str());
-      }
-      if (draft != "off" && engine->draft_status().empty()) features += ", draft " + draft;
       if (npu && engine->npu_status().empty()) features += ", npu";
       generator = std::move(engine);
 #endif

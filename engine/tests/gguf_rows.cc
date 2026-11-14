@@ -1,8 +1,9 @@
-// The GGUF conversion's CPU pieces on files, for tests/gguf_check.py:
+// The GGUF loader's CPU pieces on files, for tests/gguf_check.py:
 //   gguf_rows dequant <ggml type id> <blocks.bin> <out.f32>       raw blocks of a type to f32
-//   gguf_rows mq4 <rows.f32> <row length> <out.mq4>                original-basis rows to MQ4G256 (engine form)
+//   gguf_rows q8 <values.f32> <out.q8>                             f32 values (a multiple of 32) to Q8_0
 //   gguf_rows tensor <model.gguf> <tensor> <rows> <out.f32>        a tensor's first rows to f32
-//   gguf_rows load <model>                                         the engine's resident open (conversion), timed
+//   gguf_rows load <model>                                         the engine's resident open, timed (the copy
+//                                                                  fills as a device uploads it: the table only)
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -39,13 +40,12 @@ int main(int argc, char** argv) {
       std::vector<float> out(n);
       Dequantize(t, in.data(), out.data(), n);
       Write(argv[4], out.data(), n * 4);
-    } else if (mode == "mq4" && argc == 5) {
+    } else if (mode == "q8" && argc == 4) {
       auto in = Read(argv[2]);
-      const std::uint64_t k = std::strtoull(argv[3], nullptr, 10), rows = in.size() / 4 / k;
-      std::vector<std::uint8_t> out(rows * k / 256 * 136);
-      for (std::uint64_t r = 0; r < rows; ++r)
-        QuantizeMq4Row(reinterpret_cast<float*>(in.data()) + r * k, k, out.data() + r * k / 256 * 136);
-      Write(argv[4], out.data(), out.size());
+      const std::uint64_t n = in.size() / 4 / 32 * 32;
+      std::vector<std::uint8_t> out(n / 32 * 34);
+      QuantizeQ8_0(reinterpret_cast<const float*>(in.data()), n, out.data());
+      Write(argv[3], out.data(), out.size());
     } else if (mode == "tensor" && argc == 6) {
       const Gguf g = Gguf::Open(argv[2]);
       const TensorInfo* t = g.Find(argv[3]);
@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     } else {
       std::fprintf(stderr,
-                   "usage: gguf_rows dequant <type> <blocks> <out> | mq4 <rows.f32> <k> <out> | "
+                   "usage: gguf_rows dequant <type> <blocks> <out> | q8 <values.f32> <out> | "
                    "tensor <model> <name> <rows> <out> | load <model>\n");
       return 2;
     }

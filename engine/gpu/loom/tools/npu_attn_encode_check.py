@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Check gen_npu_attn_encode.py on the GPU against a real attention dump (loom_prefill YAH_ATTN_DUMP, qnorm + qsplit, or
-qlay=1 for an A4 set's raw f16 query):
+qlay=1 for a set's raw f16 query, split-norm Q off):
 K / V records bit for bit against npu_attn_check.encode, the payloads against float64 (Q within a mantissa step, C,
 the park starts, nb, the pad slot). The keys sit in a small shuffled page pool, so the page table is exercised.
 Writes <workdir>/inputs.npz for `npu_attn_check.py <workdir> <mc> <nb> --inputs <workdir>/inputs.npz` (the NPU run on
@@ -159,7 +159,7 @@ def main():
     # payloads: Q against float64, C, the park starts, nb, the pad slot. Q's exponents must match and its mantissas
     # round float64 (clamped at 127) except in the rotary dims: the attention's fast sin / cos (afn) at positions near
     # 2^17 miss float64 by up to ~2 steps, and the encoder repeats the attention's RoPE op for op
-    # qlay 1: the dump's q is the raw f16 query (an A4 set's); the encoder rounds f16(q / 16) before bfp16, so a mantissa
+    # qlay 1: the dump's q is the raw f16 query (split-norm Q off); the encoder rounds f16(q / 16) before bfp16, so a mantissa
     # may sit one f16 step (<= 0.13 bfp16 steps) past rounding
     raw = np.fromfile(prefix + ".q", np.uint8)
     q16 = raw[:B * 12288].view(np.float16).reshape(B, H, D).astype(np.float64)

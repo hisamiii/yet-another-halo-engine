@@ -20,7 +20,7 @@ import numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 TAIL, HID = 64, 5120
-# GPU vs NPU on this prompt (serve-pp1024, MQ4 HFQ): top-1 1.000, KL 0.0014, cos 0.960; an all-zero down pack (the
+# GPU vs NPU on this prompt (serve-pp1024, the removed MQ4 HFQ model): top-1 1.000, KL 0.0014, cos 0.960; an all-zero down pack (the
 # NPU's features dropped from every layer, measured with a pack file): 0.984, 0.0132, 0.837
 TOP1_MIN, KL_MAX, COS_MIN = 0.95, 0.005, 0.93
 
