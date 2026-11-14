@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 25/70] 0022-loom-xdna-intake
+Subject: [PATCH 25/73] 0022-loom-xdna-intake
 
 Intake channels (Loom AIE2P array plans, constrain.intake %intake, %panel, %offset, %rows, %pitch): a staged binding
 multicast reaches each member worker through its streamed panel channel instead of a channel of its own: one memory-tile

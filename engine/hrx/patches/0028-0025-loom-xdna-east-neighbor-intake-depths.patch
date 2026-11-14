@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 28/70] 0025-loom-xdna-east-neighbor-intake-depths
+Subject: [PATCH 28/73] 0025-loom-xdna-east-neighbor-intake-depths
 
 Two Loom AIE2P array fixes for the gate placement that frees the gate column's fill (yah gen_npu_gemm gwest):
 - A worker channel to the sender's east neighbor (same row) is neighbor memory: the receiver loads the sender's

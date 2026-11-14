@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:05 +0100
-Subject: [PATCH 15/70] 0016-loom-xdna-npu-side-gate
+Subject: [PATCH 15/73] 0016-loom-xdna-npu-side-gate
 
 NPU-side gate (Loom AIE2P array programs): lets an NPU job wait for a flag in memory itself, so a GPU and the NPU can
 hand work over without a host relay.

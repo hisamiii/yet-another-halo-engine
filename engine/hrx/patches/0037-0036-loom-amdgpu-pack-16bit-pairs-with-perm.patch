@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 37/70] 0036-loom-amdgpu-pack-16bit-pairs-with-perm
+Subject: [PATCH 37/73] 0036-loom-amdgpu-pack-16bit-pairs-with-perm
 
 Loom: pack two 16-bit lanes with one v_perm_b32. vector.from_elements of f16 lanes zero-extended the low half (bfe),
 shifted the high half and or-ed them (3 VALU per register), and vector f32 -> f16 truncation zero-extended both halves

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 24/70] 0021-loom-xdna-pack-low
+Subject: [PATCH 24/73] 0021-loom-xdna-pack-low
 
 Low bank packing (Loom AIE2P array plans, opt-in LOOM_EXP_PACK_LOW=1): read-only leaf data and ring records wider than a
 bank are placed from the lowest bank up instead of top-down / by channel bank rotation. A fused GEMM worker holds a

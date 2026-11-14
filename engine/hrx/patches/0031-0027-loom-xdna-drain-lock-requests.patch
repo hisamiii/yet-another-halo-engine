@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 31/70] 0027-loom-xdna-drain-lock-requests
+Subject: [PATCH 31/73] 0027-loom-xdna-drain-lock-requests
 
 A Loom AIE2P setup fix for images of other layouts sharing a context (LOOM_EXP_ROUTE_RESET; yah gen_npu_gemm ghelp
 images next to images without it):

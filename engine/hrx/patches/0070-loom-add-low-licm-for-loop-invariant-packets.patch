@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hisamiii <265242552+hisamiii@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 21:48:04 +0100
-Subject: [PATCH 70/70] loom : add low-licm for loop-invariant packets
+Subject: [PATCH 70/73] loom : add low-licm for loop-invariant packets
 
 Port of pin patch 0011; opt-in with LOOM_EXP_LICM=1.
 

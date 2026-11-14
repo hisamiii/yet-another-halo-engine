@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:05 +0100
-Subject: [PATCH 03/70] 0007-amdgpu-u24-address-multiplies
+Subject: [PATCH 03/73] 0007-amdgpu-u24-address-multiplies
 
 Address multiplies use v_mul_u32_u24 (full rate) instead of v_mul_lo_u32 (quarter rate) when value facts prove the
 operands fit 24 bits: fragment-memory lane offsets and scaled terms, and memory-address scale terms. Bit-identical

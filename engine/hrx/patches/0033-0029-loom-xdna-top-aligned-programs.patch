@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 33/70] 0029-loom-xdna-top-aligned-programs
+Subject: [PATCH 33/73] 0029-loom-xdna-top-aligned-programs
 
 Loom AIE2P core programs end at the top of program memory, behind a 16-byte startup jump at the core startup address
 (J to the entry plus its delay-window NOPs; .text.startup). Images that share code tails (the GEMM loop after a

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:25:34 +0100
+Subject: [PATCH 72/73] graph : give partitions with atomic stores the ATOMIC
+ category
+
+Assisted-by: Claude Opus 5.5
+---
+ libhrx/src/libhrx/graph_exec.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/libhrx/src/libhrx/graph_exec.c b/libhrx/src/libhrx/graph_exec.c
+index 915bf91c62..0d0740325b 100644
+--- a/libhrx/src/libhrx/graph_exec.c
++++ b/libhrx/src/libhrx/graph_exec.c
+@@ -158,11 +158,22 @@ static iree_status_t hrx_graph_recording_compile_schedule(
+     if (type == HRX_GRAPH_BLOCK_TYPE_QUEUE_BARRIER) {
+       hrx_graph_block_barrier(block)->flags = IREE_HAL_QUEUE_BARRIER_FLAG_NONE;
+     } else if (type == HRX_GRAPH_BLOCK_TYPE_QUEUE_EXECUTE) {
++      // A partition holding an atomic store node (hrx_graph_add_atomic_store_node) records it into this command
++      // buffer, which then needs the ATOMIC category; the others keep the family's TRANSFER | DISPATCH.
++      iree_hal_command_category_t partition_categories = command_categories;
++      for (uint32_t i = 0; i < partition->count; ++i) {
++        const hrx_command_t* command =
++            schedule->sources[schedule->order[partition->start_index + i]];
++        if (command && command->kind == HRX_COMMAND_ATOMIC_BATCH) {
++          partition_categories |= IREE_HAL_COMMAND_CATEGORY_ATOMIC;
++          break;
++        }
++      }
+       iree_hal_command_buffer_t* command_buffer = NULL;
+       status = iree_hal_command_buffer_create(
+           queue_family,
+           hrx_device_profile_command_buffer_mode(recording->graph->device),
+-          command_categories, /*binding_capacity=*/0, &command_buffer);
++          partition_categories, /*binding_capacity=*/0, &command_buffer);
+       if (iree_status_is_ok(status)) {
+         status = iree_hal_resource_set_insert(recording->resource_set, 1,
+                                               &command_buffer);

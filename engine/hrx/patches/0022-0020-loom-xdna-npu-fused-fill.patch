@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 22/70] 0020-loom-xdna-npu-fused-fill
+Subject: [PATCH 22/73] 0020-loom-xdna-npu-fused-fill
 
 Fused panel fill (Loom AIE2P array programs): GEMM workers fill their own memory-tile panels, so weights can be decoded
 by the cores that use them (no decoder column).

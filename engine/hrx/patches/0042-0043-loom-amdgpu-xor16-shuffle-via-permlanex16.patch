@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:07 +0100
-Subject: [PATCH 42/70] 0043-loom-amdgpu-xor16-shuffle-via-permlanex16
+Subject: [PATCH 42/73] 0043-loom-amdgpu-xor16-shuffle-via-permlanex16
 
 Loom: wave32 xor-16 subgroup shuffles lower to v_permlanex16_b32.
 

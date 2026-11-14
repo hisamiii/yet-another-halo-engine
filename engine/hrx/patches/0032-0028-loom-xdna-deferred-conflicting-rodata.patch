@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 32/70] 0028-loom-xdna-deferred-conflicting-rodata
+Subject: [PATCH 32/73] 0028-loom-xdna-deferred-conflicting-rodata
 
 A Loom AIE2P planner change for read-only data with bank conflicts (`conflicts([...])`; yah gen_npu_dec grid decoders:
 the grid table and the sign table in different banks, so a gather's address lanes 0, 1 and 2, 3 never share a bank

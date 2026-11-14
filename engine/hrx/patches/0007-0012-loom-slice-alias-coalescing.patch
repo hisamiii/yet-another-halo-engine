@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:05 +0100
-Subject: [PATCH 07/70] 0012-loom-slice-alias-coalescing
+Subject: [PATCH 07/73] 0012-loom-slice-alias-coalescing
 
 low-slice aliasing: lowering splits vector results into unit slices and regathers them with low.concat for wide
 consumers (the b128 stores of the two halves of a WMMA accumulator), and coalescing a slice ignored only its source,

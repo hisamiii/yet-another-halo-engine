@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:25:34 +0100
+Subject: [PATCH 73/73] loom : lower f32 fma to tied v_fmac_f32 when the addend
+ dies
+
+Port of pin patch 0030.
+
+Assisted-by: Claude Opus 5.5
+---
+ .../arch/amdgpu/contracts/arithmetic.py       | 68 ++++++++++++++++++-
+ 1 file changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py b/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py
+index 0e19ace718..a5671334bc 100644
+--- a/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py
++++ b/loom/py/loom/target/arch/amdgpu/contracts/arithmetic.py
+@@ -146,6 +146,7 @@ _DESCRIPTOR_KEYS = (
+     "amdgpu.v_fma_f32.neg_a",
+     "amdgpu.v_fma_f32.neg_a_one",
+     "amdgpu.v_fmaak_f32",
++    "amdgpu.v_fmac_f32",
+     "amdgpu.v_fmamk_f32",
+     "amdgpu.v_fmamk_f32.flush_product",
+     "amdgpu.v_pk_add_f32",
+@@ -3753,6 +3754,7 @@ def _fma_rule(
+     source_op: Op,
+     type_pattern: TypePattern,
+     descriptor_key: str,
++    extra_guards: tuple[Guard, ...] = (),
+ ) -> DescriptorRule:
+     descriptor = _descriptor(descriptor_key)
+     return DescriptorRule(
+@@ -3760,6 +3762,7 @@ def _fma_rule(
+         descriptor=descriptor,
+         guards=(
+             *_typed_guards(("a", "b", "c", "result"), type_pattern),
++            *extra_guards,
+             Guard.descriptor_available(descriptor),
+         ),
+         emit=(
+@@ -3867,9 +3870,47 @@ def _f32_fmamk_literal_rule(
+     )
+ 
+ 
++def _f32_fmac_rule(
++    source_op: Op,
++    type_pattern: TypePattern,
++    *,
++    src0_field: str,
++    src0_register_class: str,
++    vsrc1_field: str,
++) -> DescriptorRule:
++    """Tied-accumulator VOP2 form when the addend dies here (VOPD-pairable)."""
++    descriptor = _descriptor("amdgpu.v_fmac_f32")
++    return DescriptorRule(
++        source_op=source_op,
++        descriptor=descriptor,
++        guards=(
++            *_typed_guards(("a", "b", "c", "result"), type_pattern),
++            _register_class(src0_field, src0_register_class),
++            _register_class(vsrc1_field, "amdgpu.vgpr"),
++            _register_class("c", "amdgpu.vgpr"),
++            Guard.value_no_uses_after("c"),
++            Guard.descriptor_available(descriptor),
++        ),
++        emit=(
++            EmitDescriptorOp(
++                descriptor=descriptor,
++                operands={
++                    "acc": ValueRef.operand("c"),
++                    "a": ValueRef.operand(src0_field),
++                    "b": ValueRef.operand(vsrc1_field),
++                },
++                results={"dst": ValueRef.result("result")},
++                form=_emit_form(type_pattern),
++            ),
++        ),
++    )
++
++
+ def _f32_fma_rules(
+     source_op: Op,
+     type_pattern: TypePattern,
++    *,
++    tied: bool = False,
+ ) -> tuple[DescriptorRule, ...]:
+     rules: list[DescriptorRule] = []
+     register_classes = ("amdgpu.sgpr", "amdgpu.vgpr")
+@@ -3933,6 +3974,29 @@ def _f32_fma_rules(
+                 extra_guards=(Guard.instance_flags_has_all("fastmath", "afn"),),
+             )
+         )
++    if tied:
++        # A splat addend's lanes are copies of one scalar that may share one
++        # register: the tied form would overwrite it for the remaining lanes,
++        # so splat addends keep the VOP3 form (matched first).
++        rules.append(
++            _fma_rule(
++                source_op,
++                type_pattern,
++                "amdgpu.v_fma_f32",
++                extra_guards=(Guard.exact_uniform_element_origin_type("c", _F32),),
++            )
++        )
++        for src0_field, vsrc1_field in (("a", "b"), ("b", "a")):
++            for src0_register_class in register_classes:
++                rules.append(
++                    _f32_fmac_rule(
++                        source_op,
++                        type_pattern,
++                        src0_field=src0_field,
++                        src0_register_class=src0_register_class,
++                        vsrc1_field=vsrc1_field,
++                    )
++                )
+     rules.append(_fma_rule(source_op, type_pattern, "amdgpu.v_fma_f32"))
+     return tuple(rules)
+ 
+@@ -4795,7 +4859,7 @@ def _rules() -> tuple[ContractCase, ...]:
+             *_vector_integer_conversion_recipe_rules(),
+             *_vector_16bit_float_conversion_recipe_rules(),
+             _vector_transform_recipe_rule(),
+-            *_f32_fma_rules(vector.vector_fmaf, _VEC_F32_STATIC),
++            *_f32_fma_rules(vector.vector_fmaf, _VEC_F32_STATIC, tied=True),
+             _unary_rule(vector.vector_exp2f, _VEC_F32_STATIC, "amdgpu.v_exp_f32"),
+             _unary_rule(vector.vector_log2f, _VEC_F32_STATIC, "amdgpu.v_log_f32"),
+             _unary_rule(vector.vector_sinturnsf, _VEC_F32_STATIC, "amdgpu.v_sin_f32"),
+@@ -5111,7 +5175,7 @@ def _rules() -> tuple[ContractCase, ...]:
+             _divf_exact_rule(scalar_arithmetic.scalar_divf, _F32),
+             _divf_f64_rule(scalar_arithmetic.scalar_divf, _F64, allow_reciprocal=True),
+             _divf_f64_rule(scalar_arithmetic.scalar_divf, _F64, allow_reciprocal=False),
+-            *_f32_fma_rules(scalar_math.scalar_fmaf, _F32),
++            *_f32_fma_rules(scalar_math.scalar_fmaf, _F32, tied=True),
+             _fma_rule(scalar_math.scalar_fmaf, _F64, "amdgpu.v_fma_f64"),
+             _unary_rule(scalar_math.scalar_exp2f, _F32, "amdgpu.v_exp_f32"),
+             _unary_rule(scalar_math.scalar_log2f, _F32, "amdgpu.v_log_f32"),
