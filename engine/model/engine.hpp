@@ -259,6 +259,7 @@ class Engine : public TextGenerator {
       } else if (npu_status_ = dpm_.Pin(); npu_status_.empty()) {
         npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
         prefill_.EnableNpu(npu_.get());
+        prefill_.PinModel();
       }
     }
 #else

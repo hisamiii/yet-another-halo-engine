@@ -557,10 +557,11 @@ class LoomGraph {
   std::vector<std::array<uint32_t, 3>> grids_;
 };
 
-// Back the whole pages of [p, p + bytes), which nothing reads, with one shared 2 MB page run: pinning them (an import
-// or an NPU registration of a range around them pins every page) then takes no memory of its own. lock: mlocked like
-// the model they replace (Gguf::OpenResident: reclaim would move pages under the GPU's import)
-inline void AliasUnread(std::uint8_t* p, std::size_t bytes, bool lock) {
+// Back the whole pages of [p, p + bytes), which nothing reads, with one shared 2 MB page run: pinning them (an NPU
+// registration of a range around them pins every page) then takes no memory of its own. Never inside memory the GPU
+// imports: compaction retries a pinned shared page without end, and each try unmaps it from every alias, an
+// invalidation of the GPU's import that evicts its queues (2026-11-14: 25,000 in one pp2048).
+inline void AliasUnread(std::uint8_t* p, std::size_t bytes) {
   constexpr std::uintptr_t kPage = 4096;
   constexpr std::size_t kRun = std::size_t{2} << 20;
   static const int fd = [] {
@@ -574,7 +575,6 @@ inline void AliasUnread(std::uint8_t* p, std::size_t bytes, bool lock) {
     n = std::min<std::size_t>(kRun, e - a);
     void* q = ::mmap(reinterpret_cast<void*>(a), n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
     if (q == MAP_FAILED) throw LoomError("cannot alias unread pages");
-    if (lock) ::mlock(q, n);
   }
 }
 
@@ -585,8 +585,9 @@ inline void AliasUnread(std::uint8_t* p, std::size_t bytes, bool lock) {
 class LoomWeights {
  public:
   // skip: tensors the device never reads (not uploaded; Has() false, Ref() refuses them). in_place (the NPU split): the
-  // GPU reads the resident copy itself (one import of the whole tensor data, every range filled and kept: the NPU
-  // reads its rows through host pointers), skip unused.
+  // GPU reads the resident copy itself (the NPU reads its rows through host pointers): one import per stretch of
+  // tensors it reads, every range filled and kept; skipped tensors are never read from the file and their pages, outside
+  // the imports and the pin (LoomPrefill::PinModel), never touched.
   LoomWeights(LoomDevice& gpu, core::Gguf& gguf, const std::function<bool(const std::string&)>& skip = {},
               bool in_place = false) {
     constexpr size_t kChunk = size_t{1} << 30;
@@ -595,7 +596,7 @@ class LoomWeights {
     // its up row in one view, LoomPrefill::RunFfnBlock)
     std::vector<std::tuple<size_t, size_t, bool>> spans;
     for (const auto& t : gguf.tensors()) {
-      if (skip && !in_place && skip(t.name)) {
+      if (skip && skip(t.name)) {
         skipped_.push_back(t.name);
         continue;
       }
@@ -614,9 +615,21 @@ class LoomWeights {
     gguf.Stream(ranges);   // (a native copy reads the next range while this one uploads)
     if (in_place) {
       for (const auto& [begin, bytes] : ranges) gguf.Prepare(begin, bytes);
-      const uintptr_t base = reinterpret_cast<uintptr_t>(gguf.tensor_data_base()), start = base & ~uintptr_t{4095};
-      LoomBuffer buffer = gpu.Import(reinterpret_cast<void*>(start), gguf.tensor_data_size() + base - start);
-      chunks_.push_back({0, gguf.tensor_data_size(), base - start, std::move(buffer)});
+      // stretches: tensors less than 1 MiB apart in one import; one before a gap keeps kPad of it (a kernel's read past
+      // its last tensor), the last ends with the tensor data, as the whole-region import did
+      std::vector<std::pair<size_t, size_t>> runs;
+      for (const auto& [b, e, glued] : spans) {
+        if (!runs.empty() && b < runs.back().second + (size_t{1} << 20)) runs.back().second = std::max(runs.back().second, e);
+        else runs.emplace_back(b, e);
+      }
+      const uintptr_t base = reinterpret_cast<uintptr_t>(gguf.tensor_data_base());
+      for (size_t i = 0; i < runs.size(); ++i) {
+        const auto [b, e] = runs[i];
+        const size_t stop = i + 1 < runs.size() ? e + kPad : std::max(e, gguf.tensor_data_size());
+        const uintptr_t start = (base + b) & ~uintptr_t{4095};
+        LoomBuffer buffer = gpu.Import(reinterpret_cast<void*>(start), base + stop - start);
+        chunks_.push_back({b, e, base + b - start, std::move(buffer)});
+      }
       in_place_ = true;
       return;
     }
@@ -642,23 +655,6 @@ class LoomWeights {
       std::fprintf(stderr, "load: weights in %zu buffers: allocate %.1f, fill %.1f, h2d %.1f, release %.1f ms\n",
                    chunks_.size(), ms[0], ms[1], ms[2], ms[3]);
   }
-  // in_place, the device idle and no recorded graph left: give the import back, alias spans (tensor-data offsets) nobody
-  // reads (AliasUnread) and import the region again, so their pages go (the import pins every page of its range).
-  // Returns the bytes freed.
-  std::size_t DropUnread(LoomDevice& gpu, core::Gguf& gguf, const std::vector<std::pair<size_t, size_t>>& spans) {
-    if (!in_place_ || spans.empty()) return 0;
-    gpu.Synchronize();
-    const size_t bytes = chunks_[0].buffer.size;
-    auto* start = const_cast<std::uint8_t*>(gguf.tensor_data_base()) - chunks_[0].delta;
-    chunks_[0].buffer.reset();
-    std::size_t freed = 0;
-    for (const auto& [o, n] : spans) {
-      AliasUnread(start + chunks_[0].delta + o, n, true);
-      freed += n;
-    }
-    chunks_[0].buffer = gpu.Import(start, bytes);
-    return freed;
-  }
   [[nodiscard]] bool Has(const core::TensorInfo& t) const {
     return std::find(skipped_.begin(), skipped_.end(), t.name) == skipped_.end();
   }
@@ -672,6 +668,12 @@ class LoomWeights {
   }
   // The whole device buffer holding tensor t (the NPU shares it, NpuSplit::ShareGpu).
   [[nodiscard]] const LoomBuffer& ChunkOf(const core::TensorInfo& t) const { return ChunkHolding(t).buffer; }
+  // in_place: each import's host range (start, bytes), for the pin of the copy (LoomPrefill::PinModel)
+  template <typename F>
+  void ForEachImport(const core::Gguf& gguf, F&& f) const {
+    if (!in_place_) return;
+    for (const Chunk& c : chunks_) f(gguf.tensor_data_base() + c.begin - c.delta, c.buffer.size);
+  }
 
  private:
   struct Chunk {

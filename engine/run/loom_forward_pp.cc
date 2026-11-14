@@ -202,11 +202,8 @@ int main(int argc, char** argv) {
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
       pf.EnableNpu(npu.get());
       lap("npu enable");
-      // full chunks only: every split GEMM leaves the NPU's rows to the NPU, so the model rows its own copies replace
-      // (pre-decoded / transcoded rows) are not kept
-      if (want && want % pf.chunk() == 0)
-        std::fprintf(stderr, "loom_forward_pp: released %.2f GB of model rows the NPU reads from its copies\n",
-                     weights.DropUnread(gpu, gguf, pf.npu_only()) / 1e9);
+      pf.PinModel();
+      lap("pin model");
     }
 #else
     if (opt.npu) throw LoomError("--npu: this build has no NPU support");

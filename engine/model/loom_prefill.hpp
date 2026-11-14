@@ -90,9 +90,6 @@ class LoomPrefill {
   // Buffer sizes of the NPU column split this set carries (dispatch.txt "npusplit_<site>", "npubytes_<K>"); zero: none.
   // A job is the NPU work behind one cut: the DeltaNet qkv + gate, or one other site; the buffers fit the largest
   // (W twice).
-  // After EnableNpu: the model rows only the NPU reads (from its own copies, NpuOnly). Only a GEMM over all rows reads
-  // them otherwise, which an unsplit (partial) chunk or decode runs: LoomWeights::DropUnread for full chunks only.
-  [[nodiscard]] const std::vector<std::pair<std::size_t, std::size_t>>& npu_only() const { return npu_only_; }
   [[nodiscard]] NpuPlan npu_plan() const {
     NpuPlan p = WholePlan();
     if (!hgeom_.empty() && p.dcol) {  // token halves: their A slots and C regions (HalfA, HalfC)
@@ -205,6 +202,14 @@ class LoomPrefill {
     hidden_ = h, hidden2_ = h2;
   }
 
+  // In-place weights (the NPU split), after EnableNpu: every page the GPU imports from the model's resident copy pinned
+  // by NPU registrations (LoomWeights::ForEachImport). The GPU's imports do not pin: compaction (assembling the copy's
+  // huge pages) migrated it page by page under the GPU, each move evicting every GPU queue (stalls of 0.1-2.5 s per
+  // pp2048, 2026-11-14). Compaction skips pinned anonymous pages; the pin takes no memory (the copy is resident) and
+  // ~0.3 s (the registration flushes the copy's cache lines).
+  void PinModel() {
+    weights_.ForEachImport(gguf_, [&](const std::uint8_t* p, std::size_t bytes) { npu_->RegisterRaw(p, bytes); });
+  }
   // Split the attention of chunks from the set's first NPU chunk with the NPU (dispatch.txt "npuattn <kvn> <nb built>
   // <first chunk>", emit YAH_NPU_ATTN): per full-attention layer the encoders write the NPU's records and payloads, the
   // graph stores the layer's ready word, kernel 1 (the key-split twin) runs beside the NPU, a wait polls the done word
@@ -1164,15 +1169,17 @@ class LoomPrefill {
     // them (the GPU's) are in the range registered for the NPU, which pins its pages: one aliased page run
     const auto gate_up = [&](const std::string& file) {
       auto* p = const_cast<std::uint8_t*>(HostRows(file, 2 * M * rb, {{f0 * rb, F * rb}, {(M + f0) * rb, F * rb}}));
-      AliasUnread(p + M * rb, f0 * rb, false);
+      AliasUnread(p + M * rb, f0 * rb);
       return p;
     };
     const std::uint8_t* pg = bmix ? gate_up("npu_bfp_" + pre + "ffn_gate_up.bin")
-                             : bg ? BfpRows(pre + "ffn_gate.weight", M * rb)
+                             : bg ? (npair ? BfpTail(pre + "ffn_gate.weight", M * rb, f0 * rb)
+                                      : BfpRows(pre + "ffn_gate.weight", M * rb))
                              : !xg ? base + tg->offset
                              : npair ? ix4_rows("ffn_gate", rb) : gate_up("npu_ix4_" + pre + "ffn_gate_up.bin");
     const std::uint8_t* pu = bmix ? pg + M * rb
-                             : bu ? BfpRows(pre + "ffn_up.weight", M * rbu)
+                             : bu ? (npair ? BfpTail(pre + "ffn_up.weight", M * rbu, f0 * rbu)
+                                      : BfpRows(pre + "ffn_up.weight", M * rbu))
                              : !xu ? base + tu->offset
                              : npair ? ix4_rows("ffn_up", rbu) : pg + M * rb;
     const std::uint8_t* pd = bd ? BfpRows(pre + "ffn_down.weight", Nd * rbd) : base + td->offset;
@@ -1188,8 +1195,6 @@ class LoomPrefill {
         npu_->RegisterRaw(base + a, std::min(tu->offset + M * rb + 4096, end) - a);
       }
       npu_->RegisterRaw(pd, bd ? Nd * rbd + 8192 : std::min<std::size_t>(td->bytes + 4096, end - td->offset));
-      if (bg || xg) NpuOnly(tg->offset + f0 * (tg->bytes / M), F * (tg->bytes / M));
-      if (bu || xu) NpuOnly(tu->offset + f0 * (tu->bytes / M), F * (tu->bytes / M));
     }
     std::vector<std::uint32_t> csw;
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
@@ -1573,7 +1578,6 @@ class LoomPrefill {
       const std::size_t end = bx ? first + rows * row_bytes + 8192
                                  : std::min(first + rows * row_bytes + 4096, gguf_.tensor_data_size());
       npu_->RegisterRaw(RawBase(wname) + first, end - first);
-      if (bx) NpuOnly(t->offset + (M - rows) * (t->bytes / M), rows * (t->bytes / M));
     }
     std::vector<std::vector<NpuView>> views;
     for (const auto& [k0, Kc] : NpuChunks(site)) {
@@ -2803,17 +2807,18 @@ class LoomPrefill {
   // npu_bfp_<name>.bin: the decoder records' bfp16 fragments, 288 bytes per 256 weights), read once into resident
   // writable memory like the model (RegisterRaw pins it; + 8192 bytes of over-read slack)
   static constexpr std::size_t kBfpBlock = 288, kIx4Block = 136;
-  // Host-side NPU rows (emit_prefill_pp bfp_rows / ix4_files): file's bytes in order into the spans (offset, bytes) of
-  // a buffer of bytes (+ 8 KB the records over-read; pages outside the spans are never touched), kept for the run
+  // Host-side NPU rows (emit_prefill_pp bfp_rows / ix4_files): file's bytes in order from file_at into the spans
+  // (offset, bytes) of a buffer of bytes (+ 8 KB the records over-read; pages outside the spans are never touched), kept
+  // for the run
   const std::uint8_t* HostRows(const std::string& file, std::size_t bytes,
-                               const std::vector<std::pair<std::size_t, std::size_t>>& spans) {
+                               const std::vector<std::pair<std::size_t, std::size_t>>& spans, std::size_t file_at = 0) {
     if (const auto it = bfp_.find(file); it != bfp_.end()) return it->second;
     const std::string path = dir_ + "/" + file;
     void* p = ::mmap(nullptr, bytes + 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw LoomError("prefill: no memory for " + path);
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) throw LoomError("prefill: cannot open " + path);
-    std::size_t at = 0;   // the file's bytes in order, span after span
+    std::size_t at = file_at;   // the file's bytes in order, span after span
     for (const auto& [off, n] : spans) {
       for (std::size_t done = 0; done < n;) {
         const ::ssize_t r = ::pread(fd, static_cast<std::uint8_t*>(p) + off + done, n - done, static_cast<off_t>(at + done));
@@ -2831,13 +2836,12 @@ class LoomPrefill {
   const std::uint8_t* BfpRows(const std::string& name, std::size_t bytes) {
     return HostRows("npu_bfp_" + name + ".bin", bytes, {{0, bytes}});
   }
-  std::map<std::string, std::uint8_t*> bfp_;
-  // The planning pass's model rows the NPU reads from its own copies (BFP / IX4 rows: tensor-data offset, bytes), not
-  // the last layer's (its tail runs on the kept row's token tile, over all rows: Trim)
-  void NpuOnly(std::size_t offset, std::size_t bytes) {
-    if (layer_ + 1 != cfg_.main_block_count()) npu_only_.emplace_back(offset, bytes);
+  // A whole-tensor file's rows from byte `from` on (the NPU's rows of a column-pair gate / up): the rows before them stay
+  // untouched pages
+  const std::uint8_t* BfpTail(const std::string& name, std::size_t bytes, std::size_t from) {
+    return HostRows("npu_bfp_" + name + ".bin", bytes, {{from, bytes - from}}, from);
   }
-  std::vector<std::pair<std::size_t, std::size_t>> npu_only_;
+  std::map<std::string, std::uint8_t*> bfp_;
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
   std::size_t npu_cleared_ = 0;    // flagged_ jobs whose flag words NpuJoin cleared
   std::size_t npu_joined_ = 0;     // flagged_ jobs an NpuJoin waited for (in order)
