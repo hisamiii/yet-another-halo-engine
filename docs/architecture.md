@@ -108,7 +108,7 @@ Slots: `SaveState` / `LoadState` write and read the sequence state after some ch
 Each large prefill GEMM can be split by output columns: the NPU (XDNA2, 32 compute tiles through HRX `.xdna`) computes the trailing rows, the GPU the rest. A native UD-IQ4_XS set with the split (2.9 GB, ~170 s; needs numpy and gguf-py for the pre-decoded and transcoded rows):
 
 ```
-YAH_NPU_FFNRES=0 YAH_NPU_FUSE=1 YAH_NPU_FFNBLK=8192 YAH_NPU_SPLIT=qkv=5120,gate=3072,q=6144,out=2560 \
+YAH_NPU_FFNBLK=8192 YAH_NPU_SPLIT=qkv=5120,gate=3072,q=6144,out=2560 \
   python3 tools/emit_prefill_pp.py <model.gguf> <dir> 2048
 ```
 
