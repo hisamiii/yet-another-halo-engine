@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""NPU weight decoders for the fill column of gen_npu_gemm (dcol = 2), one per GGUF format (DQ_FMT: IQ4_XS, Q4_K, IQ3_S,
-IQ3_XXS, IQ2_XXS, IQ2_XS, Q3_K; the module's constants follow DQ_FMT at import, gen_npu_gemm.decoder reloads it per format).
+"""NPU weight decoders, inlined into the fused GEMM cores of gen_npu_gemm (fuse 2), one per GGUF format (DQ_FMT: IQ4_XS,
+Q4_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, Q3_K; the module's constants follow DQ_FMT at import, gen_npu_gemm.decoder reloads it
+per format).
 Standalone check: DQ_FMT=<fmt> [DQ_PORTS=2] gen_npu_dec.py <work> <model.gguf> (decodes 80 rows per port of the
 first matching K = 5120 tensor and compares every fragment with the oracle, bit for bit).
 The IQ4_XS decoder (16-row panel units):

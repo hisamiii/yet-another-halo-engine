@@ -766,7 +766,7 @@ IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX")
 # one BFP image like a single format's with the deferred epilogue ("npu_ffnsw_bfp_<hord>", dispatch rows
 # "npuffnbx_<gate>_<up>"). Site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU rows
 # pre-decoded too (bfp_site_rows: npu_bfp_<tensor>.bin), on the BFP site image ("npu_dcol_iq2s_<K>", dispatch rows
-# "npusitebx_<tensor>"). Tried, not kept: gate and up of two formats on column pairs (gen_npu_gemm ufmt, pnbr).
+# "npusitebx_<tensor>"). Tried, not kept: gate and up of two formats on column pairs (the gate tail streaming its C to the up tail).
 
 
 def gu_fmt(fmt):
