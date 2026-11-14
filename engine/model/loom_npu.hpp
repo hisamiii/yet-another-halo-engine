@@ -191,7 +191,9 @@ class LoomNpu {
   // host: anonymous host pages registered with libamdf and imported into HRX instead of a device buffer the NPU imports.
   // C uses them: with all shared buffers in device memory, deferred data-fabric machine checks (some corrupting an NPU
   // output) were more frequent; their trigger is the SMU switching fabric / memory clocks during NPU work (results.md).
-  Shared& CreateShared(std::size_t bytes, bool host = false) {
+  Shared& CreateShared(std::size_t bytes, bool host = false,
+                       std::source_location loc = std::source_location::current()) {
+    AllocLog(host ? "npuhost" : "npudev", bytes, loc);
     auto s = std::make_unique<Shared>();
     s->bytes = Align(bytes);
     if (host) {

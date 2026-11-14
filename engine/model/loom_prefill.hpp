@@ -614,8 +614,8 @@ class LoomPrefill {
   }
   // Zero-filled: a partial chunk leaves rows past its last token tile unwritten, and the full-chunk kernels (conv,
   // DeltaNet) read them. They must be finite: the DeltaNet masks a padding token by multiplying it with 0.
-  LoomBuffer& Alloc(std::size_t bytes) {
-    keep_.push_back(gpu_.Allocate(bytes));
+  LoomBuffer& Alloc(std::size_t bytes, std::source_location loc = std::source_location::current()) {
+    keep_.push_back(gpu_.Allocate(bytes, loc));
     Zero(keep_.back());
     return keep_.back();
   }

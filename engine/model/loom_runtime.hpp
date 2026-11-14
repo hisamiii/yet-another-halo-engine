@@ -9,10 +9,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <map>
 #include <set>
+#include <source_location>
 #include <stdexcept>
 #include <tuple>
 #include <string>
@@ -21,10 +23,20 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "core/gguf.hpp"
 #include "hrx_runtime.h"
+
+// YAH_ALLOC_LOG=1: one stderr line per allocation, "alloc <kind> <bytes> <file>:<line>"
+inline void AllocLog(const char* kind, std::size_t bytes, const std::source_location& l) {
+  static const bool on = std::getenv("YAH_ALLOC_LOG") != nullptr;
+  if (!on) return;
+  const char* f = l.file_name();
+  if (const char* s = std::strrchr(f, '/')) f = s + 1;
+  std::fprintf(stderr, "alloc %s %zu %s:%u\n", kind, bytes, f, static_cast<unsigned>(l.line()));
+}
 
 namespace yah::model {
 
@@ -184,7 +196,9 @@ class LoomDevice {
 
   [[nodiscard]] hrx_stream_t stream() const { return stream_; }
 
-  [[nodiscard]] LoomExecutable Load(const std::string& path, const char* target_key = "gfx1151") {
+  [[nodiscard]] LoomExecutable Load(const std::string& path, const char* target_key = "gfx1151",
+                                    std::source_location loc = std::source_location::current()) {
+    if (struct stat st{}; ::stat(path.c_str(), &st) == 0) AllocLog("hal", static_cast<std::size_t>(st.st_size), loc);
     LoomExecutable executable;
     LoomCheck(hrx_executable_load_file(device_, path.c_str(), "amdgpu", target_key, &executable.handle),
               "hrx_executable_load_file");
@@ -200,7 +214,8 @@ class LoomDevice {
     return executable;
   }
 
-  [[nodiscard]] LoomBuffer Allocate(size_t bytes) {
+  [[nodiscard]] LoomBuffer Allocate(size_t bytes, std::source_location loc = std::source_location::current()) {
+    AllocLog("dev", bytes, loc);
     LoomBuffer buffer;
     buffer.size = bytes;
     allocated_ += bytes;
@@ -212,7 +227,9 @@ class LoomDevice {
 
   // A host-local buffer, persistently mapped at *host: the host reads what the stream copied there once it completed
   // (Mark / Wait), without a queue transfer (a synchronous D2H waits behind all queued work).
-  [[nodiscard]] LoomBuffer AllocateHost(size_t bytes, const void** host) {
+  [[nodiscard]] LoomBuffer AllocateHost(size_t bytes, const void** host,
+                                        std::source_location loc = std::source_location::current()) {
+    AllocLog("host", bytes, loc);
     LoomBuffer buffer;
     buffer.size = bytes;
     allocated_ += bytes;
@@ -234,7 +251,9 @@ class LoomDevice {
   }
   // Import an external host pointer (e.g. a GGUF mmap window) as an HRX buffer.
   // The caller must keep the mapping alive while the buffer is in use.
-  [[nodiscard]] LoomBuffer Import(void* host_ptr, size_t bytes) {
+  [[nodiscard]] LoomBuffer Import(void* host_ptr, size_t bytes,
+                                  std::source_location loc = std::source_location::current()) {
+    AllocLog("import", bytes, loc);
     LoomBuffer buffer;
     buffer.size = bytes;
     hrx_buffer_params_t params = {};
