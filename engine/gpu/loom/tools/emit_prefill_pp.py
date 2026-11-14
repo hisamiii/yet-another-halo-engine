@@ -805,7 +805,7 @@ NPU_PASSES = 5   # K = 5120 per call (gen_npu_gemm passes)
 # FUSE_FFN_FMTS / FUSE_FFN_DOWN_FMTS (and ffn_up follows ffn_gate). Its gate / up calls (gen_npu_gemm swiglu, NP 4, raw
 # rows straight from the model; call j (F / 256 of them) column c features 256 j + 32 c + [0, 32) of F, swcol 32) apply
 # swiglu and write H into C: bfp16 fragments as [M block][pass][16-token slab][128 k-blocks] (hpass). Its down calls
-# (ain "h", 640 rows) write their partials. The GPU runs the other features through the fused ffn's split (".npu.hal",
+# (ain "h", 512 rows) write their partials. The GPU runs the other features through the fused ffn's split (".npu.hal",
 # nn = F) and down over them ("npuffnrem_<fmt>.hal", a K window, f32); npu_unpack_ffnblk.hal adds hidden + both after
 # the job. Down's K parts: F's passes in the fewest parts of at most 5 (a fused panel holds a part), sizes balanced.
 # A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup).

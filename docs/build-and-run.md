@@ -31,7 +31,7 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8 byte store in a graph (the GPU releases NPU jobs and clears their words) |
 | `0016-loom-xdna-npu-side-gate` | an NPU job waits for a flag in memory itself, so the GPU and the NPU sync without the host |
 | `0017-loom-xdna-gated-call-invocations` | the NPU-side gate for plans that are not streamed (one replay group) |
-| `0018-loom-xdna-npu-decoder-column` | array descriptors and bindings for the decoder column (`gen_npu_gemm` dcol 2: weight rows decoded on the cores) |
+| `0018-loom-xdna-npu-decoder-column` | array descriptors and bindings for raw weight rows decoded on the cores (first for a decoder column, a form no longer emitted) |
 | `0019-loom-xdna-npu-ffn-block` | array plan, binding (axis chains) and route changes for the NPU FFN block |
 | `0020-loom-xdna-npu-fused-fill` | GEMM workers fill their own memory-tile panels, so weights can be decoded on the way in |
 | `0021-loom-xdna-pack-low` | low bank packing of read-only leaf data and wide ring records (opt-in `LOOM_EXP_PACK_LOW=1`) |
