@@ -354,8 +354,21 @@ hrx_status_t hrx_buffer_map(hrx_buffer_t b, hrx_map_flags_t flags, size_t offset
   *mapped_ptr = (char*)b->host + offset;
   return NULL;
 }
-hrx_status_t hrx_buffer_get_device_ptr(hrx_buffer_t b, void** device_ptr) {
-  *device_ptr = (void*)b->va;
+hrx_status_t hrx_device_query_queue_family_memory_scope(hrx_device_t device, uint32_t family_ordinal,
+                                                       hrx_memory_site_t site, hrx_memory_scope_t* out_scope) {
+  static int domain;   // one scope: every buffer has one address here
+  (void)device, (void)family_ordinal, (void)site;
+  out_scope->domain = &domain, out_scope->id = 1;
+  return NULL;
+}
+hrx_status_t hrx_buffer_query_address(hrx_buffer_t b, hrx_memory_scope_t scope, hrx_buffer_interface_t type,
+                                      uint64_t* out_address) {
+  (void)scope;
+  if (type != HRX_BUFFER_INTERFACE_DEVICE_ADDRESS) {
+    *out_address = 0;
+    return make(HRX_STATUS_UNIMPLEMENTED, "hrx_dry: address interface %d", (int)type);
+  }
+  *out_address = b->va;
   return NULL;
 }
 

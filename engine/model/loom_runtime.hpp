@@ -190,6 +190,13 @@ class LoomDevice {
 
   [[nodiscard]] hrx_device_t device() const { return device_; }
   [[nodiscard]] hrx_queue_t queue() const { return queue_; }
+  // The address kernels on the dispatch queue see for buffer's first byte.
+  [[nodiscard]] void* DeviceAddress(hrx_buffer_t buffer) const {
+    uint64_t address = 0;
+    LoomCheck(hrx_buffer_query_address(buffer, program_scope_, HRX_BUFFER_INTERFACE_DEVICE_ADDRESS, &address),
+              "hrx_buffer_query_address");
+    return reinterpret_cast<void*>(address);
+  }
 
   [[nodiscard]] hrx_stream_t stream() const { return stream_; }
 
@@ -440,9 +447,12 @@ class LoomDevice {
       }
       if ((info.roles & HRX_QUEUE_ROLE_DISPATCH) && info.provisioned_queue_count) {
         queue_ = hrx_device_get_queue(device_, f, 0);
+        family_ = f;
       }
     }
     if (!queue_) throw LoomError("the GPU has no dispatch queue");
+    LoomCheck(hrx_device_query_queue_family_memory_scope(device_, family_, HRX_MEMORY_SITE_PROGRAM, &program_scope_),
+              "hrx_device_query_queue_family_memory_scope");
     LoomCheck(hrx_stream_create(queue_, 0, &stream_), "hrx_stream_create");
   }
   void Close() {
@@ -459,6 +469,8 @@ class LoomDevice {
   hrx_device_group_t group_ = nullptr;
   hrx_device_t device_ = nullptr;
   hrx_queue_t queue_ = nullptr;
+  uint32_t family_ = 0;
+  hrx_memory_scope_t program_scope_ = {};
   hrx_stream_t stream_ = nullptr;
   size_t allocated_ = 0;
   uint32_t next_flags_ = 0;
