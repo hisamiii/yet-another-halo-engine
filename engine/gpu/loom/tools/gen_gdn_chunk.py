@@ -3,7 +3,7 @@
 
 usage: gen_gdn_chunk.py [out.loom]
 
-Same ABI and math as tools/gen_deltanet_hip.py (yah_deltanet).
+Same ABI and math as the f32 recurrent yah_deltanet it replaced (tools/gen_deltanet_hip.py, removed 2026-11-14).
 With k_hat = inv_k k and q_hat = q_scale q (yah_deltanet_prep_kq), and value head h reading key head h mod 16:
 
     S_t = a_t S_{t-1} + b_t (v_t - a_t S_{t-1} k_hat_t) k_hat_t^T,  o_t = S_t q_hat_t
@@ -41,14 +41,12 @@ KR, QR, KT, VT, AF, PP, T1, T2, SS, GA = (0, 8704, 17408, 27648, 32768, 37888, 4
 POOL = GA + 6 * 32 * 4          # LG, G2, BETA, BG, GC, GG
 assert POOL <= 65536
 LG, G2, BETA, BG, GC, GG = range(6)
-# OLATE: a chunk's O stores go into the next iteration, after its decay scan and next-chunk loads are issued. The
+# A chunk's O stores go into the next iteration, after its decay scan and next-chunk loads are issued. The
 # compiler drains every outstanding global store (s_waitcnt_vscnt 0) before the scan's ds_bpermute and before global
 # loads (no alias tracking), so stores at the chunk end stalled wave 0, the critical wave, at the next chunk's start.
-OLATE = True
-# CONV16: the conv hands over f16 K, Q, V with K and Q already normalized: f16(k * inv_k), f16(q * q_scale), f16(v), the
+# The conv hands over f16 K, Q, V with K and Q already normalized: f16(k * inv_k), f16(q * q_scale), f16(v), the
 # same f32 ops and rounding this kernel did on the f32 conv output, so the result is bit-identical; half the bytes,
 # and phase 1 only moves them into LDS. The f16 rows are carried raw through the prefetch.
-CONV16 = True
 TPRE = 2   # phase 3 column loads this many steps ahead (0: at their step); 2: -5.2% (3 hits 256 VGPRs, 4 spills)
 
 
@@ -102,7 +100,7 @@ def gen(head_base=0, launch_heads=0):
     e("  %state_total = index.mul %num_heads, %c16384 : index")
     e("  %out_total = index.mul %batch, %inner_size : index")
     e("  %cv_na, %kq_na, %ab_na, %st_na, %out_na = buffer.assume.noalias %conv, %kq, %ab, %state, %out : buffer, buffer, buffer, buffer, buffer")
-    e(f"  %conv_view = buffer.view %cv_na[%base] : buffer -> view<[%conv_total]x{'f16' if CONV16 else 'f32'}>")
+    e(f"  %conv_view = buffer.view %cv_na[%base] : buffer -> view<[%conv_total]xf16>")
     e("  %kq_view = buffer.view %kq_na[%base] : buffer -> view<[%kq_total]xf32>")
     e("  %ab_view = buffer.view %ab_na[%base] : buffer -> view<[%ab_total]xf32>")
     e("  %state_view = buffer.view %st_na[%base] : buffer -> view<[%state_total]xf32>")
@@ -227,30 +225,19 @@ def gen(head_base=0, launch_heads=0):
         e(f"{ind}%{p}kqb = index.mul %{p}kqb1, %c3 : index")
         e(f"{ind}%{p}kqb_1 = index.add %{p}kqb, %c1 : index")
         names = []
-        if not CONV16:
-            e(f"{ind}%{p}ik = view.load %kq_view[%{p}kqb] : view<[%kq_total]xf32> -> f32")
-            e(f"{ind}%{p}qs = view.load %kq_view[%{p}kqb_1] : view<[%kq_total]xf32> -> f32")
-            names = [f"%{p}ik", f"%{p}qs"]
         for nm, rel in (("k", "%k_rel"), ("q", "%q_rel")):
             e(f"{ind}%{p}{nm}base0 = index.add %{p}crow, {rel} : index")
             e(f"{ind}%{p}{nm}base = index.add %{p}{nm}base0, %dseg : index")
             for g in range(4):
                 e(f"{ind}%{p}{nm}a{g}c = index.constant {4 * g} : index")
                 e(f"{ind}%{p}{nm}a{g} = index.add %{p}{nm}base, %{p}{nm}a{g}c : index")
-                if CONV16:
-                    e(f"{ind}%{p}{nm}v{g} = vector.load %conv_view[%{p}{nm}a{g}] : view<[%conv_total]xf16> -> {V4H}")
-                else:
-                    e(f"{ind}%{p}{nm}v{g} = vector.load %conv_view[%{p}{nm}a{g}] : view<[%conv_total]xf32> -> {V4}")
+                e(f"{ind}%{p}{nm}v{g} = vector.load %conv_view[%{p}{nm}a{g}] : view<[%conv_total]xf16> -> {V4H}")
                 names.append(f"%{p}{nm}v{g}")
         e(f"{ind}%{p}va0 = index.add %{p}crow, %v_rel : index")
         e(f"{ind}%{p}va = index.add %{p}va0, %rseg : index")
         e(f"{ind}%{p}va4 = index.add %{p}va, %c4 : index")
-        if CONV16:
-            for q, a in ((0, "va"), (1, "va4")):
-                e(f"{ind}%{p}vv{q} = vector.load %conv_view[%{p}{a}] : view<[%conv_total]xf16> -> {V4H}")
-        else:
-            e(f"{ind}%{p}vv0 = vector.load %conv_view[%{p}va] : view<[%conv_total]xf32> -> {V4}")
-            e(f"{ind}%{p}vv1 = vector.load %conv_view[%{p}va4] : view<[%conv_total]xf32> -> {V4}")
+        for q, a in ((0, "va"), (1, "va4")):
+            e(f"{ind}%{p}vv{q} = vector.load %conv_view[%{p}{a}] : view<[%conv_total]xf16> -> {V4H}")
         names += [f"%{p}vv0", f"%{p}vv1"]
         e(f"{ind}%{p}abt = index.add %{p}t0, %lane : index")
         e(f"{ind}%{p}ab0 = index.mul %{p}abt, %num_heads : index")
@@ -272,34 +259,24 @@ def gen(head_base=0, launch_heads=0):
             e(f"{ind}%{p}t{i}3 = index.add %{p}t{i}2, %o_rel : index")
             e(f"{ind}%{p}t{i} = index.add %{p}t{i}3, %ur_row : index")
             e(f"{ind}view.store %{p}e{i}, %out_view[%{p}t{i}] : f32, view<[%out_total]xf32>")
-    ftypes = ([] if CONV16 else ["f32", "f32"]) + [V4H if CONV16 else V4] * 10 + ["f32", "f32"]
-    fnames = ([] if CONV16 else ["%inv_k", "%q_scale"]) + [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + \
+    ftypes = [V4H] * 10 + ["f32", "f32"]
+    fnames = [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)] + \
         ["%vv0", "%vv1", "%alpha", "%beta"]
     pre = fetch("%c0", "f0_", "  ")
     carried = ", ".join(f"%s{j} = {st[j]} : {V8}" for j in range(4))
     carried += ", " + ", ".join(f"{n} = {v} : {t}" for n, v, t in zip(fnames, pre, ftypes))
     res = ", ".join(f"%sf{j}" for j in range(4)) + ", " + ", ".join(f"%ff{i}" for i in range(len(fnames)))
     alltypes = ", ".join([V8] * 4 + ftypes)
-    if OLATE:   # the previous chunk's O (8 f32 per lane), stored next iteration
-        carried += f", %opv = %zeros8 : {V8}"
-        res += ", %opf"
-        alltypes += f", {V8}"
+    # the previous chunk's O (8 f32 per lane), stored next iteration
+    carried += f", %opv = %zeros8 : {V8}"
+    res += ", %opf"
+    alltypes += f", {V8}"
     e(f"  {res} = scf.for %ci = [%c0 to %nchunks step %c1]({carried}) -> ({alltypes}) {{")
     I = "    "
     e(f"{I}%t0 = index.mul %ci, %c32 : index")
     # ---- phase 1: K, Q (normalized, f16) -> Kr/Qr rows, Kt; V -> Vt; alpha / beta
-    if not CONV16:
-        e(f"{I}%ik4 = vector.splat %inv_k : {V4}")
-        e(f"{I}%qs4 = vector.splat %q_scale : {V4}")
-    for nm, rel, sc, row in (("k", "%k_rel", "%ik4", "%lt"), ("q", "%q_rel", "%qs4", "%qrow")):
-        hs = []
-        for g in range(4):
-            if CONV16:
-                hs.append(f"%{nm}v{g}")
-                continue
-            e(f"{I}%{nm}n{g} = vector.mulf %{nm}v{g}, {sc} : {V4}")
-            e(f"{I}%{nm}h{g} = vector.fptrunc %{nm}n{g} : {V4} to {V4H}")
-            hs.append(f"%{nm}h{g}")
+    for nm, row in (("k", "%lt"), ("q", "%qrow")):
+        hs = [f"%{nm}v{g}" for g in range(4)]
         for p in range(2):
             e(f"{I}%{nm}c{p} = vector.concat<0> {hs[2 * p]}, {hs[2 * p + 1]} : {V4H}, {V4H} -> {V8H}")
             e(f"{I}%{nm}d{p} = index.add %dseg, %c{8 * p} : index")
@@ -313,9 +290,7 @@ def gen(head_base=0, launch_heads=0):
                     e(f"{I}view.store %kt{g}{i}e, %kt_w[%kt{g}{i}r, %lt] : f16, view<128x40xf16>")
     # V: thread (token lt, rows (tid % 8) * 8 .. +7) -> Vt[row][tok]
     for p in range(2):
-        vh = f"%vv{p}" if CONV16 else f"%vh{p}"   # f16 input: already the f16 the fptrunc would give
-        if not CONV16:
-            e(f"{I}%vh{p} = vector.fptrunc %vv{p} : {V4} to {V4H}")
+        vh = f"%vv{p}"   # f16 input: already the f16 the fptrunc would give
         for i in range(4):
             e(f"{I}%vt{p}{i}e = vector.extract {vh}[{i}] : {V4H} -> f16")
             e(f"{I}%vt{p}{i}c = index.constant {4 * p + i} : index")
@@ -355,13 +330,12 @@ def gen(head_base=0, launch_heads=0):
     e(f"{I}%cn0 = index.add %ci, %c1 : index")
     e(f"{I}%cn = index.min %cn0, %lastc : index")
     nxt = fetch("%cn", "nx_", I)
-    if OLATE:
-        # the previous chunk's O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores
-        # zeros to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same addresses, in order)
-        e(f"{I}%opc0 = index.max %ci, %c1 : index")
-        e(f"{I}%opc = index.sub %opc0, %c1 : index")
-        e(f"{I}%opt0 = index.mul %opc, %c32 : index")
-        ostore(I, "%opt0", "%opv", "ox")
+    # the previous chunk's O, unconditionally (a branch's join drains the loads just issued): at chunk 0 it stores
+    # zeros to chunk 0's rows, which chunk 1 then overwrites with the real O (same wave, same addresses, in order)
+    e(f"{I}%opc0 = index.max %ci, %c1 : index")
+    e(f"{I}%opc = index.sub %opc0, %c1 : index")
+    e(f"{I}%opt0 = index.mul %opc, %c32 : index")
+    ostore(I, "%opt0", "%opv", "ox")
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     # ---- phase 2: KK^T (waves 0-3) -> A (f32), QK^T (waves 4-7) -> P (f16)
     e(f"{I}%p2t = index.rem %sg, %c4 : index")
@@ -539,8 +513,6 @@ def gen(head_base=0, launch_heads=0):
         e(f"{I}%pc{c} = vector.mma %pa{c}, %pb{c}, {acc} : {V16H}, {V16H}, {V8}")
         acc = f"%pc{c}"
     oacc = acc
-    if not OLATE:
-        ostore(I, "%t0", acc, "o")
     # S <- 2^G_C S + Vn'^T K
     e(f"{I}%gtot = view.load %ga[%gaGC, %c0] : view<6x32xf32> -> f32")   # 2^(G_31 - G_0)
     e(f"{I}%gg0 = view.load %ga[%gaGG, %c0] : view<6x32xf32> -> f32")
@@ -561,11 +533,11 @@ def gen(head_base=0, launch_heads=0):
             acc = f"%ukc{j}{c}"
         new.append(acc)
     e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-    e(f"{I}scf.yield {', '.join(new + nxt + ([oacc] if OLATE else []))} : {alltypes}")
+    e(f"{I}scf.yield {', '.join(new + nxt + [oacc])} : {alltypes}")
     e("  }")
-    if OLATE:   # the last chunk's O
-        e("  %oplast = index.mul %lastc, %c32 : index")
-        ostore("  ", "%oplast", "%opf", "ol")
+    # the last chunk's O
+    e("  %oplast = index.mul %lastc, %c32 : index")
+    ostore("  ", "%oplast", "%opf", "ol")
     # ---- final state
     for j in range(4):
         for i in range(8):
