@@ -15,7 +15,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import emit_prefill as E  # noqa: E402
 import gen_attn_fa  # noqa: E402
-import gen_deltanet_hip  # noqa: E402
 import gen_gdn_chunk  # noqa: E402
 import gen_gdn_ss  # noqa: E402
 import gen_conv_kq  # noqa: E402
@@ -175,17 +174,15 @@ O16_MT = (640, 384)
 # the first DeltaNet part and runs beside the second (whose 16 workgroups fill 16 of 40 slots). Same math per head.
 DNSPLIT = (40, 8)
 
-# DNVCONV: sets without a NPU qkv split: the v channels' conv and alpha / beta run inside DeltaNet
+# Sets without a NPU qkv split (dn_vconv): the v channels' conv and alpha / beta run inside DeltaNet
 # (gen_gdn_ss natural), the conv kernel takes only the q / k heads (gen_conv_kq.gen(4096)) and prep_ab only advances
 # the conv ring, after both DeltaNet parts. Bit-identical; dispatch.txt "dnvconv <conv workgroups>".
-DNVCONV = True
-# DNSS_NAT: the state-stationary DeltaNet (gen_gdn_ss: one workgroup per head, the state in registers): the v conv
-# inside it (DNVCONV's path), head ranges,
+# There the DeltaNet is the state-stationary one (gen_gdn_ss: one workgroup per head, the state in registers): the v
+# conv inside it, head ranges,
 # its O as f32 at the heads' own columns (gen_gdn_ss natural), read by the plain postnorm parts. Sets whose NPU takes
 # qkv rows keep gen_gdn_chunk (the v conv needs every qkv column). Gate N mean KL 1.06e-6 (vs the f32 recurrent
 # reference 1.53e-6, gen_gdn_chunk 1.08e-6); pp2048 GPU only -0.97% (11-02: DeltaNet alone 66 -> 34 ms, conv 18 -> 9,
 # the postnorm loses its overlap 14 -> 24). Fusing the postnorm into part a passed the gate but doubled part a.
-DNSS_NAT = os.environ.get("YAH_DNSS_NAT", "1") == "1"
 
 
 def _rewrite(text, pairs):
@@ -193,33 +190,6 @@ def _rewrite(text, pairs):
         assert text.count(a) == 1, a
         text = text.replace(a, b)
     return text
-
-
-# DN_REC: the f32 recurrent DeltaNet (gen_deltanet_hip) at any B, as the B % 32 != 0 sets have it: an accuracy reference
-# for DeltaNet changes (engine/run/gate), not a production set
-DN_REC = os.environ.get("YAH_DN_REC", "0") == "1"
-
-
-def dn32(B):
-    """The chunked DeltaNet (and its f16 conv hand-off) applies."""
-    return B % 32 == 0 and not DN_REC
-
-
-def conv_tb_ok(B):
-    """The f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup applies."""
-    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and dn32(B) and gen_gdn_chunk.CONV16
-
-
-def conv_x16(text):
-    """yah_ssm_conv_kq reading the qkv GEMM's f16 output (O16_MT 640): each tap widened back to f32 at its load."""
-    pairs = [("%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf32>",
-              "%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf16>")]
-    for v in ("s3", "x1", "x2", "x3"):
-        off = "%s3_off" if v == "s3" else f"%{v}_off"
-        pairs.append((f"    %{v} = view.load %x_view[{off}] : view<[%x_total]xf32> -> f32\n",
-                      f"    %{v}h = view.load %x_view[{off}] : view<[%x_total]xf16> -> f16\n"
-                      f"    %{v} = scalar.extf %{v}h : f16 to f32\n"))
-    return _rewrite(text, pairs)
 
 
 def prepab_x16(text):
@@ -238,48 +208,6 @@ def postnorm_g16(text):
          "%gate_view = buffer.view %gate_na[%base] : buffer -> view<[%io_total]xf16>"),
         ("%g = view.load %gate_view[%off2] : view<[%io_total]xf32> -> f32\n",
          "%gh = view.load %gate_view[%off2] : view<[%io_total]xf16> -> f16\n      %g = scalar.extf %gh : f16 to f32\n")])
-
-
-def conv_n16(text):
-    """yah_ssm_conv_kq handing DeltaNet (gen_gdn_chunk CONV16) its f16 inputs: conv_out holds f16(v) for the v channels and
-    f16(k * inv_k), f16(q * q_scale) for the q / k channels, the f32 products and rounding DeltaNet did itself on the f32
-    conv_out, so the result is bit-identical. Lane 0 of a q / k workgroup also leaves inv_k / q_scale in LDS for the others."""
-    def rep(a, b):
-        nonlocal text
-        assert text.count(a) == 1, a
-        text = text.replace(a, b)
-    rep("%out_view = buffer.view %out_noalias[%base] : buffer -> view<[%x_total]xf32>",
-        "%out_view = buffer.view %out_noalias[%base] : buffer -> view<[%x_total]xf16>")
-    rep("%kq_bytes = index.constant 1024 : offset", "%kq_bytes = index.constant 1040 : offset")
-    text = text.replace("view<256xf32>", "view<258xf32>")
-    rep("    view.store %result, %out_view[%s3_off] : f32, view<[%x_total]xf32>\n", """    %is_v = index.cmp uge, %wg, %nkh : index
-    scf.if %is_v {
-      %result_h = scalar.fptrunc %result : f32 to f16
-      view.store %result_h, %out_view[%s3_off] : f16, view<[%x_total]xf16>
-    }
-""")
-    rep("        view.store %kq_all, %scales_view[%o2] : f32, view<[%scale_total]xf32>\n      }\n    }\n  }\n", """        view.store %kq_all, %scales_view[%o2] : f32, view<[%scale_total]xf32>
-        %ks_slot = index.constant 256 : index
-        %qs_slot = index.constant 257 : index
-        view.store %inv_k, %kq_lds[%ks_slot] : f32, view<258xf32>
-        view.store %q_scaled, %kq_lds[%qs_slot] : f32, view<258xf32>
-      }
-    }
-    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    %ks_at = index.constant 256 : index
-    %qs_at = index.constant 257 : index
-    %ks = view.load %kq_lds[%ks_at] : view<258xf32> -> f32
-    %qs = view.load %kq_lds[%qs_at] : view<258xf32> -> f32
-    %own_scale = scf.select %lane_hi, %ks, %qs : f32
-    %own = view.load %kq_lds[%lane] : view<258xf32> -> f32
-    %own_n = scalar.mulf %own, %own_scale : f32
-    %own_h = scalar.fptrunc %own_n : f32 to f16
-    %own_row = index.mul %t, %qkv_dim : index
-    %own_off = index.add %own_row, %c : index
-    view.store %own_h, %out_view[%own_off] : f16, view<[%x_total]xf16>
-  }
-""")
-    return text
 
 
 NORM_SPLIT = 2
@@ -1181,7 +1109,7 @@ def npu_split(rows, combos, B, outdir):
             open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
             E.emit(src, ["nop=0"], name, outdir)
             out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
-        if site == "qkv" and conv_tb_ok(B):
+        if site == "qkv":
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads
             for hal, text, cfg in (
@@ -2081,25 +2009,18 @@ def main():
 
     # DeltaNet: chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py), f16 WMMA inputs.
     # Its grid (2, heads) is recorded as rowsplit.hal's row group.
-    # It needs B % 32 == 0; else the recurrent kernel (tools/gen_deltanet_hip.py, same ABI and grid).
+    # It needs B % 32 == 0 (main's token tile 64 holds it).
     dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
-    open(dn_src, "w").write(gen_gdn_chunk.gen() if dn32(B) else gen_deltanet_hip.gen())
-    # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
+    open(dn_src, "w").write(gen_gdn_chunk.gen())
+    # the conv pairs with the DeltaNet kernel: f16 normalized hand-off
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
-    conv_tb = conv_tb_ok(B)
-    dn_vconv = (DNVCONV and conv_tb and DNSS_NAT and B % 32 == 0 and DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT
-                and not EMIT_HALF)
+    assert 640 in O16_MT and B % gen_conv_kq.TB == 0
+    dn_vconv = DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT and not EMIT_HALF
     if dn_vconv:
         text = gen_conv_kq.gen(4096)
         geom.append(("dnvconv", gen_conv_kq.tiles(4096), 0, 0))
-    elif conv_tb:
-        text = gen_conv_kq.gen()
     else:
-        text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
-        if 640 in O16_MT:
-            text = conv_x16(text)
-        if dn32(B) and gen_gdn_chunk.CONV16:
-            text = conv_n16(text)
+        text = gen_conv_kq.gen()
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
     prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
@@ -2110,12 +2031,12 @@ def main():
         postnorm_base = postnorm_g16(postnorm_base)
     postnorm_src = os.path.join(tmp, "yah_ssm_postnorm.loom")
     open(postnorm_src, "w").write(postnorm_base)
-    dn_ss = dn_vconv   # DNSS_NAT: the DeltaNet parts on the state-stationary kernel
+    dn_ss = dn_vconv   # the DeltaNet parts on the state-stationary kernel
     # blocks per head of the DeltaNet grid (the unsplit rowsplit.hal is not dispatched with dnsplit)
     geom.append(("rowsplit.hal", 0, 1 if dn_ss else 2, 0))
     geom.append(("dnthreads", gen_gdn_ss.THREADS if dn_ss else 256, 0, 0))
     dn_parts = []
-    if dn32(B) and DNSPLIT:
+    if DNSPLIT:
         ha, hb = DNSPLIT
         for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
@@ -2125,8 +2046,7 @@ def main():
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
         geom.append(("dnsplit", 0, ha, hb))
-    if conv_tb:
-        geom.append(("convtb", gen_conv_kq.TB, 0, 0))
+    geom.append(("convtb", gen_conv_kq.TB, 0, 0))
 
     # loom_forward_pp reads the launch geometry from dispatch.txt instead of recomputing the grid.
     # So the dispatch site and the compiled kernel cannot disagree; a mismatch is silent and wrong, not a crash.
