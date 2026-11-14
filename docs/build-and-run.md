@@ -71,6 +71,8 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0055-libhrx-profile-function-filter` | `HRX_PROFILE_FILTER=<glob>` limits profiling capture to matching functions, which ATT capture needs; diagnostics only |
 | `0056-profile-att-raw-wave-dump` | `IREE_PROFILE_ATT_DUMP=<file>` writes every decoded ATT wave as raw records for per-SIMD timelines; diagnostics only |
 
+0030-0036 were made for the int4 (iu4) GEMMs, which went with the MQ4 path. Only 0033 and 0034 are iu4-only (inline-accumulator iu4 WMMA forms); the others also act on native kernels (0032's `kernel.priority` is used by `gen_attn_fa`, 0036 packs every f16-output GEMM's stores). All stay in the stack: dropping a patch changes the compiler.
+
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
 ## Build
