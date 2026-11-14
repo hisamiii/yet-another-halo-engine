@@ -48,9 +48,10 @@ struct MemoryPlan {
     p.context = context;
     const core::Gguf index = core::Gguf::OpenIndex(model);
     for (const auto& t : index.tensors()) p.weights += t.bytes;
-    // Fitted to MemAvailable over a load and 4 requests on gfx1151 (2048-token chunks, verify GEMVs, MTP; 8K and 32K
-    // kv8 within 0.15 GB): what grows with the context is the KV pools (K and V of 16 layers x 1024 per token, at the
-    // format's bits plus scales) and f32 / f16 attention scratch. (The fit had the MTP layer's KV too: a margin now.)
+    // Fitted to MemAvailable over a load and 4 requests on gfx1151 with the removed MQ4 engine (2048-token chunks,
+    // MTP drafting on; 8K and 32K kv8 within 0.15 GB); not refitted on the native sets. What grows with the context
+    // is the KV pools (K and V of 16 layers x 1024 per token, at the format's bits plus scales) and f32 / f16
+    // attention scratch.
     const std::uint64_t kv = 16ull * 1024 * (kb + vb) / 8 * 33 / 32;
     p.buffers = kFixed + std::uint64_t{p.context} * (kv + kScratchPerToken);
     if (!npu_set.empty()) {  // the NPU's own rows, read into memory (pre-decoded and transcoded: npu_bfp_*, npu_ix4_*)
