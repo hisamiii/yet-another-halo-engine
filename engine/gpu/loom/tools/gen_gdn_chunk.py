@@ -35,7 +35,6 @@ V4 = "vector<4xf32>"
 V16H = "vector<16xf16>"
 V8H = "vector<8xf16>"
 V4H = "vector<4xf16>"
-V2H = "vector<2xf16>"
 # LDS regions (bytes); Kr and Qr adjacent so one 64-row view serves both
 KR, QR, KT, VT, AF, PP, T1, T2, SS, GA = (0, 8704, 17408, 27648, 32768, 37888, 40448, 43008,
                                           45568, 62976)
