@@ -164,13 +164,20 @@ int main(int argc, char** argv) {
     // the prefill reads neither the MTP layer nor token_embd's device copy (Embed stages its rows); the decode's embed
     // kernel reads token_embd's
     const std::string mtp = "blk." + std::to_string(cfg.main_block_count()) + ".";
-    // --npu: the GPU reads the resident copy in place (the NPU reads its rows through host pointers)
+    // --npu with the GEMM split: the GPU reads the resident copy in place (the NPU reads its rows through host
+    // pointers; the whole copy stays, pinned). The NPU attention reads no weights: its sets upload as without --npu.
+    const bool npu_attn_set = [&] {
+      std::ifstream f(std::string(argv[2]) + "/dispatch.txt");
+      for (std::string row; std::getline(f, row);)
+        if (row.rfind("npuattn ", 0) == 0) return true;
+      return false;
+    }();
     LoomWeights weights(
         gpu, gguf,
         [&](const std::string& n) {
           return (n == "token_embd.weight" && opt.gen == 0) || n.starts_with(mtp);
         },
-        opt.npu);
+        opt.npu && !npu_attn_set);
     lap("weights");
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
     lap("prefill set");
