@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <exception>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -131,6 +132,7 @@ class LoomNpu {
   LoomNpu(const LoomNpu&) = delete;
   LoomNpu& operator=(const LoomNpu&) = delete;
   ~LoomNpu() {
+    if (std::uncaught_exceptions()) std::fprintf(stderr, "npu: tearing down after an error (it prints below)\n");
     // no GPU work may still read the shared buffers (flag words, C) once they are freed: on this GPU a read of freed
     // memory hangs the shader and the GPU's scheduler
     try {
@@ -175,9 +177,27 @@ class LoomNpu {
         munmap(s->host, s->bytes);
       } else {
         close(s->fd);
-        s->gpu.reset();   // before its pool
       }
     }
+    // the exportable buffers' pool allocations end with a dealloca (a release alone leaves them live, and the pool's
+    // destroy then waits for them forever), then the handles, then the pool
+    std::vector<hrx_buffer_t> exported;
+    for (auto& s : shared_)
+      if (!s->external && !s->host && s->gpu.handle) exported.push_back(s->gpu.handle);
+    if (!exported.empty()) {
+      std::uint64_t value = ++export_value_;
+      hrx_semaphore_list_t waits = {nullptr, nullptr, 0};
+      hrx_semaphore_list_t signals = {&export_sem_, &value, 1};
+      hrx_status_t st = hrx_queue_dealloca(gpu_.queue(), &waits, &signals, exported.size(), exported.data());
+      if (hrx_status_is_ok(st)) st = hrx_semaphore_wait(export_sem_, value, UINT64_MAX);
+      if (!hrx_status_is_ok(st)) {
+        std::fprintf(stderr, "npu: dealloca of the shared GPU buffers failed; leaking their pool\n");
+        hrx_status_ignore(st);
+        export_pool_ = nullptr;
+      }
+    }
+    for (auto& s : shared_)
+      if (!s->external && !s->host) s->gpu.reset();
     if (export_pool_) hrx_mem_pool_release(export_pool_);
     if (export_sem_) hrx_semaphore_release(export_sem_);
     if (queue_) api_->kernel_queue_destroy(queue_);
@@ -214,7 +234,9 @@ class LoomNpu {
       s->device = s->host;
       s->gpu.size = s->bytes;
       hrx_buffer_params_t params = {};
-      params.type = HRX_MEMORY_TYPE_DEVICE_VISIBLE;
+      // uncached for the GPU: its polls of the NPU's done words and its reads of C must see the NPU's writes (HSA's
+      // locked host memory was fine-grained, uncached; HRX main maps an ordinary host import cached in L2)
+      params.type = HRX_MEMORY_TYPE_DEVICE_VISIBLE | HRX_MEMORY_TYPE_DEVICE_UNCACHED;
       params.access = HRX_MEMORY_ACCESS_READ | HRX_MEMORY_ACCESS_WRITE;
       params.usage = HRX_BUFFER_USAGE_DEFAULT;
       LoomCheck(hrx_allocator_import_buffer(hrx_device_allocator(gpu_.device()), params, s->host, s->bytes, &s->gpu.handle),
