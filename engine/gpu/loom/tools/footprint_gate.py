@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked] [ostride=<rows>]
-[kfull=<k_blocks of the whole row>] [npuc=<bytes>]
+[kfull=<k_blocks of the whole row>]
 
 Compile the source under the exact config and read each root's declared byte envelope from the compile report.
 Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for that root.
@@ -41,10 +41,7 @@ bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate
          "grid": next((GRID[f] for f in fmts if f in GRID), 0),
          "gridu": GRID[fmts[1]] if len(fmts) > 1 and all(f in GRID for f in fmts) else 0,
          "ksigns": 128, "ksignsu": 128,
-         "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4,
-         # gen_gemm_tile.NPUADD: the NPU's down partials the engine binds, its flag words
-         "npuc": next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("npuc=")), 0),
-         "done": 4, "ready": 4, "status": 4}
+         "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4}
 sys.path.insert(0, os.path.dirname(HERE))
 import hrx_paths  # noqa: E402
 e = hrx_paths.env()
