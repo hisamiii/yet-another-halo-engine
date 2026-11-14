@@ -1721,12 +1721,10 @@ def qsplit_tall_sums(e, g, j, tka):
     e("  }")
 
 
-def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False):
+def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
     """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
-    A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical.
-    col_fence: a fence per column keeps each column's residual loads (4 b128 per lane) below the previous column: hoisted
-    all at once, a workgroup's 512 DRAM misses stall the co-resident waves' operand loads (iu4 kres K = 6144 -20%)."""
+    A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical."""
     if sw and SW_GATE_AHEAD:
         return _lds_epilogue_ahead(e, t, kr, V8, sw, qg, masked)
     TM, FM, FN = t.tm, t.tm // 16, t.tn // 16
@@ -1787,8 +1785,6 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
         if KQG_QSPLIT:
             qsplit_lane(e)
     for j in range(FN):
-        if col_fence and j:
-            e("  scf.schedule.fence")
         for i in range(FM):
             e(f"  %es_r{i}_{j} = index.constant {16 * i} : index")
             e(f"  vector.fragment.store<result> %acc{i * FN + j}, %es_view[%es_r{i}_{j}, %c0] shape [%m, %n] : {V8}, view<{TM}x16xf32, %es_lay>")
