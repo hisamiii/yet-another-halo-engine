@@ -619,6 +619,31 @@ class LoomPrefill {
     Zero(keep_.back());
     return keep_.back();
   }
+  // The first `bytes` of host as a buffer of its own (the same handle, offset 0): for buffers that are never live at
+  // once. The graph orders their users by the overlapping byte range of the one handle. Neither may rely on the other's
+  // padding rows: each is fully written before it is read, or read only where it was written.
+  LoomBuffer& Share(const LoomBuffer& host, std::size_t bytes) {
+    if (bytes > host.size) throw LoomError("prefill: a shared buffer is larger than its host");
+    hrx_buffer_retain(host.handle);
+    LoomBuffer& b = keep_.emplace_back();
+    b.handle = host.handle, b.size = bytes;
+    return b;
+  }
+  // The most rows of a hand-written Q2_K GEMM in the set (yah_ffn_gemm_q2k_f32.loom, emitted only as
+  // "...kstore_q2k_<m tiles>_<k blocks>..."), 0 without one. It is the only kernel that writes ostage: its accumulators,
+  // [rows][tokens] f32. Its .fp files leave ostage out, so they cannot size it.
+  static std::size_t HandQ2kRows(const std::string& name) {
+    std::size_t most = 0;
+    const std::string tag = "kstore_q2k_";
+    for (std::size_t at = name.find(tag); at != std::string::npos; at = name.find(tag, at + 1))
+      most = std::max<std::size_t>(most, 16 * std::strtoul(name.c_str() + at + tag.size(), nullptr, 10));
+    return most;
+  }
+  std::size_t HandQ2kRows() const {
+    std::size_t most = 0;
+    for (const auto& [name, g] : geom_) most = std::max(most, HandQ2kRows(name));
+    return most;
+  }
   // Waits: the fill is stream work, while uploads (tables, Embed) are synchronous copies that would otherwise land first
   // and be zeroed.
   void Zero(LoomBuffer& b) {
@@ -645,7 +670,10 @@ class LoomPrefill {
   }
   LoomExecutable& Exe(const std::string& hal) {
     auto it = exes_.find(hal);
-    if (it == exes_.end()) it = exes_.emplace(hal, gpu_.Load(dir_ + "/" + hal)).first;
+    if (it == exes_.end()) {
+      if (const std::size_t q = HandQ2kRows(hal); q && (!ostage_ || q * B_ * 4 > ostage_->size)) throw LoomError("prefill: ostage is too small for " + hal);
+      it = exes_.emplace(hal, gpu_.Load(dir_ + "/" + hal)).first;
+    }
     return it->second;
   }
   // The export's own workgroup size wins; sx is only the fallback for metadata without one.
@@ -728,7 +756,14 @@ class LoomPrefill {
     if (ksplit_bytes_) ksplit_ = &Alloc(ksplit_bytes_), gpu_.Fill(*ksplit_, 0);
     kbuf_ = &Alloc(B * kKv * 4);
     vbuf_ = &Alloc(B * kKv * 4);
-    raw_ = &Alloc(B * kInner * 4);
+    // FFN / DeltaNet pairs in shared memory (Share): layer l's ffn_down writes hidden, which layer l + 1's norm, qkv
+    // GEMM, conv and DeltaNet wait on, so each reuse is ordered (the DeltaNet's raw_ binding is untracked). Not in sets
+    // with token halves (h/): there layer l's FFN unpack and ffn_down run per half inside layer l + 1.
+    const bool share = hgeom_.empty();
+    LoomBuffer* up_host = share ? &Alloc(std::max(B * kInner * 4, B * kFfn * 2)) : nullptr;
+    LoomBuffer* gate_host = share ? &Alloc(std::max(B * kQkv * 4, B * kFfn * 4)) : nullptr;
+    const auto part = [&](LoomBuffer* host, std::size_t bytes) -> LoomBuffer& { return host ? Share(*host, bytes) : Alloc(bytes); };
+    raw_ = &part(up_host, B * kInner * 4);
     // DeltaNet as two head ranges (dispatch.txt "dnsplit": heads [0, a) and [a, a + b)); the second writes raw2_
     if (const auto ds = geom_.find("dnsplit"); ds != geom_.end()) {
       dnsplit_a_ = ds->second.rowgrp, dnsplit_b_ = ds->second.tt;
@@ -736,7 +771,7 @@ class LoomPrefill {
         throw LoomError("dispatch.txt dnsplit does not cover the DeltaNet heads");
       raw2_ = &Alloc(B * kInner * 4);
     }
-    conv_out_ = &Alloc(B * kQkv * 4);
+    conv_out_ = &part(gate_host, B * kQkv * 4);
     kqbuf_ = &Alloc(B * kKh * 3 * 4);
     ab_ = &Alloc(B * kTs * 2 * 4);
     conv_state_ = &Alloc(std::size_t{48} * kQkv * 4 * 4);
@@ -751,17 +786,17 @@ class LoomPrefill {
     vc32_ = &Alloc(4);
     lse_ = &Alloc(B * kHeads * 4);
     eps_ = &Alloc(4);
-    ffnup_ = &Alloc(B * kFfn * 2);
+    ffnup_ = &part(up_host, B * kFfn * 2);
     // the FFN norm's fragment-major copy for the afrag GEMMs (norm_t.hal), only in sets that have them
     bool any_af = false;
     for (const auto& [name, g] : geom_) any_af = any_af || name.size() > 7 && name.compare(name.size() - 7, 7, ".af.hal") == 0;
     if (any_af) normt_ = &Alloc(B * kHidden * 2);
-    gateffn_ = &Alloc(B * kFfn * 4);
-    // Per-workgroup weight staging (ABI only: the tile GEMMs stage in LDS) and epilogue scratch sized for the widest
-    // GEMM, which the compiler declares over the whole [m_rows][tokens] tile.
+    gateffn_ = &part(gate_host, B * kFfn * 4);
+    // Per-workgroup weight staging (ABI only: the tile GEMMs stage in LDS)
     uwstage_ = &Alloc(std::size_t{kFfn} * 16 * 2);
     wstage_ = &Alloc(std::size_t{kFfn} * 16 * 2);
-    ostage_ = &Alloc(std::size_t{kFfn} * B * 4);
+    // ostage: the hand-written Q2_K GEMM's [rows][tokens] f32 accumulators (HandQ2kRows); the tile GEMMs bind it unused
+    ostage_ = &Alloc(std::max<std::size_t>(HandQ2kRows() * B * 4, 4));
     partial_ = &Alloc(B * kHidden * 4);
     hidden2_ = &Alloc(B * kHidden * 4);
     normed_ = &Alloc(std::size_t{kHidden} * 4);
