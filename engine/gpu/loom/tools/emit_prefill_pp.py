@@ -1096,7 +1096,7 @@ def npu_images(images, B, tmp, outdir, extra=()):
 def bfp_rows(names, outdir):
     """IQ2_S tensors the NPU takes (DCOL_FMTS "BFP"): each written pre-decoded to outdir/npu_bfp_<name>.bin, rows of
     K / 1024 units of 1152 bytes: unit (16-row slab b, pass u)'s decoder output ([kb 128 in KPERM order][h 2] bfp16
-    fragments of the exact f32 weights, gen_npu_dec.oracle) as its 16 rows (the engine binds it like raw rows)."""
+    fragments of the exact f32 weights, as gen_npu_dec decodes them) as its 16 rows (the engine binds it like raw rows)."""
     import gguf
     import numpy as np
     import npu_dec_emit as Q
