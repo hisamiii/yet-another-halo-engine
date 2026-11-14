@@ -175,28 +175,21 @@ class LoomDevice {
     // shared anonymous pages the GPU reads through user pointers, which compaction moves, each move evicting every
     // GPU queue (0.1-0.3 s NPU split stalls, 2026-11-14). A value set by the caller wins.
     ::setenv("HSA_USERPTR_FOR_PAGED_MEM", "0", 0);
-    LoomCheck(hrx_gpu_initialize(0),
-              "hrx_gpu_initialize (the GPU runtime did not start: is /dev/kfd there and is the user in the render "
-              "group?)");
-    initialized_ = true;
-    if (!hrx_status_is_ok(hrx_gpu_device_get(0, &device_))) {
-      hrx_gpu_shutdown();
-      throw LoomError("hrx_gpu_device_get: no GPU (the engine needs a gfx1151, Strix Halo, with the amdgpu driver)");
+    try {
+      Open();
+    } catch (...) {
+      Close();
+      throw;
     }
-    LoomCheck(hrx_stream_create(device_, 0, &stream_), "hrx_stream_create");
   }
   LoomDevice(const LoomDevice&) = delete;
   LoomDevice& operator=(const LoomDevice&) = delete;
   // Bytes of every buffer allocated so far (freed ones included).
   [[nodiscard]] size_t allocated() const { return allocated_; }
-  ~LoomDevice() {
-    if (stream_) hrx_stream_release(stream_);
-    // device_ is borrowed (hrx_gpu_device_get does not retain it); hrx_gpu_shutdown releases it.
-    // Do not release it here: that clears the device early and HRX_PROFILE_FILE gets no dispatch events or session_end.
-    if (initialized_) hrx_gpu_shutdown();
-  }
+  ~LoomDevice() { Close(); }
 
   [[nodiscard]] hrx_device_t device() const { return device_; }
+  [[nodiscard]] hrx_queue_t queue() const { return queue_; }
 
   [[nodiscard]] hrx_stream_t stream() const { return stream_; }
 
@@ -264,7 +257,6 @@ class LoomDevice {
     params.type = HRX_MEMORY_TYPE_DEVICE_VISIBLE;
     params.access = HRX_MEMORY_ACCESS_READ;
     params.usage = HRX_BUFFER_USAGE_DEFAULT;
-    params.queue_affinity = 0;
     LoomCheck(hrx_allocator_import_buffer(hrx_device_allocator(device_), params, host_ptr, bytes, &buffer.handle),
               "hrx_allocator_import_buffer");
     return buffer;
@@ -301,13 +293,13 @@ class LoomDevice {
     if (p.semaphore) LoomCheck(hrx_semaphore_wait(p.semaphore, p.value, UINT64_MAX), "hrx_semaphore_wait");
   }
   void H2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
-    LoomCheck(hrx_synchronous_h2d(device_, host, buffer.handle, offset, bytes), "hrx_synchronous_h2d");
+    LoomCheck(hrx_synchronous_h2d(queue_, host, buffer.handle, offset, bytes), "hrx_synchronous_h2d");
   }
   void D2H(const LoomBuffer& buffer, void* host, size_t bytes, size_t offset = 0) {
-    LoomCheck(hrx_synchronous_d2h(device_, buffer.handle, offset, host, bytes), "hrx_synchronous_d2h");
+    LoomCheck(hrx_synchronous_d2h(queue_, buffer.handle, offset, host, bytes), "hrx_synchronous_d2h");
   }
   void D2H(const hrx_buffer_ref_t& ref, void* host) {
-    LoomCheck(hrx_synchronous_d2h(device_, ref.buffer, ref.offset, host, ref.length), "hrx_synchronous_d2h");
+    LoomCheck(hrx_synchronous_d2h(queue_, ref.buffer, ref.offset, host, ref.length), "hrx_synchronous_d2h");
   }
 
   void Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
@@ -342,7 +334,7 @@ class LoomDevice {
   }
   // Orders what follows after every chained dispatch so far, and starts a new chain.
   void Order() {
-    if (chain_open_) LoomCheck(hrx_stream_execution_barrier(stream_), "hrx_stream_execution_barrier");
+    if (chain_open_) LoomCheck(hrx_stream_barrier(stream_, nullptr), "hrx_stream_barrier");
     chain_open_ = false;
     chain_slot_ = 0;
   }
@@ -419,7 +411,54 @@ class LoomDevice {
   }
 
  private:
+  // The GPU: the first device of YAH_GPU_DRIVER (amdgpu, the HSA driver, by default; rdna is HRX's native driver),
+  // in a group of its own, and a stream on the first queue family that dispatches.
+  void Open() {
+    const char* driver = std::getenv("YAH_GPU_DRIVER");
+    if (!driver || !*driver) driver = "amdgpu";
+    LoomCheck(hrx_runtime_create(nullptr, hrx_host_allocator_system(), &runtime_), "hrx_runtime_create");
+    size_t count = 0;
+    hrx_device_info_t* infos = nullptr;
+    LoomCheck(hrx_runtime_query_available_devices(runtime_, driver, hrx_host_allocator_system(), &count, &infos),
+              "hrx_runtime_query_available_devices (the GPU runtime did not start: is /dev/kfd there and is the "
+              "user in the render group?)");
+    hrx_device_create_params_t params = {};
+    params.uri = count ? infos[0].uri : nullptr;
+    hrx_status_t status = count ? hrx_device_group_create(runtime_, 1, &params, &group_) : nullptr;
+    hrx_host_allocator_free(hrx_host_allocator_system(), infos);
+    if (!count) {
+      throw LoomError(std::string("no ") + driver + " device (the engine needs a gfx1151, Strix Halo)");
+    }
+    LoomCheck(status, "hrx_device_group_create");
+    device_ = hrx_device_group_get_device(group_, 0);
+    for (uint32_t f = 0; f < hrx_device_queue_family_count(device_) && !queue_; ++f) {
+      hrx_queue_family_info_t info = {};
+      hrx_status_t queried = hrx_device_query_queue_family(device_, f, &info);
+      if (!hrx_status_is_ok(queried)) {
+        hrx_status_ignore(queried);
+        continue;
+      }
+      if ((info.roles & HRX_QUEUE_ROLE_DISPATCH) && info.provisioned_queue_count) {
+        queue_ = hrx_device_get_queue(device_, f, 0);
+      }
+    }
+    if (!queue_) throw LoomError("the GPU has no dispatch queue");
+    LoomCheck(hrx_stream_create(queue_, 0, &stream_), "hrx_stream_create");
+  }
+  void Close() {
+    if (stream_) hrx_stream_release(stream_);
+    stream_ = nullptr;
+    // device_ and queue_ are borrowed from the group.
+    if (group_) hrx_device_group_release(group_);
+    group_ = nullptr;
+    if (runtime_) hrx_runtime_release(runtime_);
+    runtime_ = nullptr;
+  }
+
+  hrx_runtime_t runtime_ = nullptr;
+  hrx_device_group_t group_ = nullptr;
   hrx_device_t device_ = nullptr;
+  hrx_queue_t queue_ = nullptr;
   hrx_stream_t stream_ = nullptr;
   size_t allocated_ = 0;
   uint32_t next_flags_ = 0;
@@ -430,7 +469,6 @@ class LoomDevice {
   uint32_t chain_slot_ = 0, chain_wait_ = 0, chain_need_ = 0;
   bool chain_open_ = false;   // the last dispatch has no trailing barrier
   long sleep_us_ = 0;
-  bool initialized_ = false;
 };
 
 // Records dispatches into one HRX graph and launches it on the device stream. Each dispatch waits only for what it
@@ -518,7 +556,7 @@ class LoomGraph {
 
   // Instantiates the graph now, so that Launch only queues it (segments joined by host waits launch back to back).
   void Instantiate() {
-    if (!exec_) LoomCheck(hrx_graph_instantiate(graph_, 0, &exec_), "hrx_graph_instantiate");
+    if (!exec_) LoomCheck(hrx_graph_instantiate(graph_, gpu_.queue(), 0, &exec_), "hrx_graph_instantiate");
   }
   // Queues the graph on the device stream, after everything queued before (instantiates it first if needed).
   void Launch() {

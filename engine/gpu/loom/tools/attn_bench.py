@@ -150,7 +150,8 @@ def main():
         src, *envs = spec.split(",")
         text = open(src).read()
         lay = layout(text, src)
-        env = {"LOOM_EXP_LICM": "1", **({"LOOM_EXP_LICM_MAX_LIVE": "6"} if "_kt2" in src else {})}
+        env = {"LOOM_EXP_LICM": "1", "LOOM_EXP_WAVE_ROLE_BARRIERS": "1",
+               **({"LOOM_EXP_LICM_MAX_LIVE": "6"} if "_kt2" in src else {})}
         env.update(e.split("=", 1) for e in envs)
         variants.append((name, src, text, env, lay))
     report = []

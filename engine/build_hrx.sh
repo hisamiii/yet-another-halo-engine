@@ -13,7 +13,10 @@ export YAH_HRX="${YAH_HRX:-$root/external/hrx}"
 H="${YAH_HRX_BUILD:-$YAH_HRX/build/cmake}"
 inc="$YAH_HRX/libhrx/include"
 # Build only against the pinned, patched HRX, so anyone can reproduce the binaries.
-"$root/engine/hrx/bootstrap.sh" --check >/dev/null || { "$root/engine/hrx/bootstrap.sh" --check; exit 1; }
+# YAH_HRX_UNPINNED=1 skips the check (porting to a new HRX revision).
+if [ "${YAH_HRX_UNPINNED:-0}" != 1 ]; then
+  "$root/engine/hrx/bootstrap.sh" --check >/dev/null || { "$root/engine/hrx/bootstrap.sh" --check; exit 1; }
+fi
 libhrx="$H/libhrx/src/libhrx"
 
 # Host code: clang, -O3 -march=native. -ffp-contract=off keeps host float results the same as
@@ -33,7 +36,7 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 # NPU (libamdf + the xdna loader, static from an HRX build with the xdna targets, engine/hrx/bootstrap.sh): the NPU FFN
 # block of the prefill driver and the server (--npu). Without them both are GPU-only.
 npu_flags=() npu_libs=()
-if [ -f "$H/libamdf/libamdf_static.a" ]; then
+if [ -f "$H/libamdf/libamdf_static.a" ] && [ -f "$H/experimental/xdna/libiree_experimental_xdna_executable.a" ]; then
   for a in experimental/xdna/libiree_experimental_xdna_amdf_status.a experimental/xdna/libiree_experimental_xdna_executable.a \
            libamdf/libamdf_static.a runtime/src/iree/hal/drivers/amd/xdna/image/aie2p/libiree_hal_drivers_amd_xdna_image_aie2p_npu2.a \
            runtime/src/iree/hal/drivers/amd/xdna/image/libiree_hal_drivers_amd_xdna_image_image.a \
