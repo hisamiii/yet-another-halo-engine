@@ -454,7 +454,7 @@ AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
 # right after its load, which drains vmcnt(0) once per phase (IQ4_XS: 200 VGPRs with it, fused IQ3_S ffn: 216)
 AF_PIPE3 = dict(AF_PIPE, b0early=2)
 AF_KQ = dict(rhs_outer=False, rhs_fence=0)   # K-quants without B prefetch (Q6_K: 208 VGPRs with it)
-# Q4_K / Q3_K / Q5_K with the B prefetch: their decoders came down to 184-192 VGPRs (Q4DFMA, Q3_FMIX), so it fits now:
+# Q4_K / Q3_K / Q5_K with the B prefetch: their decoders came down to 184-192 VGPRs (fma narrowing, results.md), so it fits now:
 # -3.6..-4.0% clock-free (Q4_K swiglu -5.6%, kstore 64 -5.5%)
 AF_KQP = dict(AF_KQ, **AF_PIPE, lhs_stream=4)
 # No B prefetch (bpre 0, no b0early, lhs_stream 0): under HRX 0051 the prefetching forms sit at 192 VGPRs with
@@ -540,7 +540,7 @@ AF = {
     ("q5k", "kqg", 768, 20): dict(AF_KQP, ksl=True),                            # -10.8%
     # 11-02, the q of the two layers in these formats (tiled 96 x 8 at 69-72% of the floor): Q2_K without B prefetch
     # -19.0% (with it -13.4%); IQ4_NL (32-element blocks) spills without it, lhs_stream 4 -17.7%
-    # Q2_K with the B prefetch since its fptrunc(fma) decode (Q2DFMA, 187 -> 192 VGPRs): attention seg -0.15 M cycles
+    # Q2_K with the B prefetch since its fptrunc(fma) decode (187 -> 192 VGPRs): attention seg -0.15 M cycles
     ("q2k", "kqg", 768, 20): dict(AF_KQP, ksl=True),
     ("iq4nl", "kqg", 768, 160): dict(ksl=True, wlate=True, b0early=True, lhs_stream=4),
     ("iq4xs", "kstore", 64, 20): dict(AF_PIPE),                                 # -15.7%
