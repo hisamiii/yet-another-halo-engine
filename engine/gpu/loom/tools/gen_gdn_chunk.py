@@ -49,7 +49,6 @@ OLATE = True
 # same f32 ops and rounding this kernel did on the f32 conv output, so the result is bit-identical; half the bytes,
 # and phase 1 only moves them into LDS. The f16 rows are carried raw through the prefetch.
 CONV16 = True
-O16_EXP = 8   # (gen_gdn_ss's %o16_sc constant: 2^8)
 TPRE = 2   # phase 3 column loads this many steps ahead (0: at their step); 2: -5.2% (3 hits 256 VGPRs, 4 spills)
 
 
