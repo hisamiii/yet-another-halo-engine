@@ -15,7 +15,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import emit_prefill as E  # noqa: E402
 import gen_attn_fa  # noqa: E402
-import gen_deltanet_hip  # noqa: E402
 import gen_gdn_chunk  # noqa: E402
 import gen_gdn_ss  # noqa: E402
 import gen_conv_kq  # noqa: E402
@@ -175,17 +174,15 @@ O16_MT = (640, 384)
 # the first DeltaNet part and runs beside the second (whose 16 workgroups fill 16 of 40 slots). Same math per head.
 DNSPLIT = (40, 8)
 
-# DNVCONV: sets without a NPU qkv split: the v channels' conv and alpha / beta run inside DeltaNet
+# Sets without a NPU qkv split (dn_vconv): the v channels' conv and alpha / beta run inside DeltaNet
 # (gen_gdn_ss natural), the conv kernel takes only the q / k heads (gen_conv_kq.gen(4096)) and prep_ab only advances
 # the conv ring, after both DeltaNet parts. Bit-identical; dispatch.txt "dnvconv <conv workgroups>".
-DNVCONV = True
-# DNSS_NAT: the state-stationary DeltaNet (gen_gdn_ss: one workgroup per head, the state in registers): the v conv
-# inside it (DNVCONV's path), head ranges,
+# There the DeltaNet is the state-stationary one (gen_gdn_ss: one workgroup per head, the state in registers): the v
+# conv inside it, head ranges,
 # its O as f32 at the heads' own columns (gen_gdn_ss natural), read by the plain postnorm parts. Sets whose NPU takes
 # qkv rows keep gen_gdn_chunk (the v conv needs every qkv column). Gate N mean KL 1.06e-6 (vs the f32 recurrent
 # reference 1.53e-6, gen_gdn_chunk 1.08e-6); pp2048 GPU only -0.97% (11-02: DeltaNet alone 66 -> 34 ms, conv 18 -> 9,
 # the postnorm loses its overlap 14 -> 24). Fusing the postnorm into part a passed the gate but doubled part a.
-DNSS_NAT = os.environ.get("YAH_DNSS_NAT", "1") == "1"
 
 
 def _rewrite(text, pairs):
@@ -193,33 +190,6 @@ def _rewrite(text, pairs):
         assert text.count(a) == 1, a
         text = text.replace(a, b)
     return text
-
-
-# DN_REC: the f32 recurrent DeltaNet (gen_deltanet_hip) at any B, as the B % 32 != 0 sets have it: an accuracy reference
-# for DeltaNet changes (engine/run/gate), not a production set
-DN_REC = os.environ.get("YAH_DN_REC", "0") == "1"
-
-
-def dn32(B):
-    """The chunked DeltaNet (and its f16 conv hand-off) applies."""
-    return B % 32 == 0 and not DN_REC
-
-
-def conv_tb_ok(B):
-    """The f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup applies."""
-    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and dn32(B) and gen_gdn_chunk.CONV16
-
-
-def conv_x16(text):
-    """yah_ssm_conv_kq reading the qkv GEMM's f16 output (O16_MT 640): each tap widened back to f32 at its load."""
-    pairs = [("%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf32>",
-              "%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf16>")]
-    for v in ("s3", "x1", "x2", "x3"):
-        off = "%s3_off" if v == "s3" else f"%{v}_off"
-        pairs.append((f"    %{v} = view.load %x_view[{off}] : view<[%x_total]xf32> -> f32\n",
-                      f"    %{v}h = view.load %x_view[{off}] : view<[%x_total]xf16> -> f16\n"
-                      f"    %{v} = scalar.extf %{v}h : f16 to f32\n"))
-    return _rewrite(text, pairs)
 
 
 def prepab_x16(text):
@@ -238,48 +208,6 @@ def postnorm_g16(text):
          "%gate_view = buffer.view %gate_na[%base] : buffer -> view<[%io_total]xf16>"),
         ("%g = view.load %gate_view[%off2] : view<[%io_total]xf32> -> f32\n",
          "%gh = view.load %gate_view[%off2] : view<[%io_total]xf16> -> f16\n      %g = scalar.extf %gh : f16 to f32\n")])
-
-
-def conv_n16(text):
-    """yah_ssm_conv_kq handing DeltaNet (gen_gdn_chunk CONV16) its f16 inputs: conv_out holds f16(v) for the v channels and
-    f16(k * inv_k), f16(q * q_scale) for the q / k channels, the f32 products and rounding DeltaNet did itself on the f32
-    conv_out, so the result is bit-identical. Lane 0 of a q / k workgroup also leaves inv_k / q_scale in LDS for the others."""
-    def rep(a, b):
-        nonlocal text
-        assert text.count(a) == 1, a
-        text = text.replace(a, b)
-    rep("%out_view = buffer.view %out_noalias[%base] : buffer -> view<[%x_total]xf32>",
-        "%out_view = buffer.view %out_noalias[%base] : buffer -> view<[%x_total]xf16>")
-    rep("%kq_bytes = index.constant 1024 : offset", "%kq_bytes = index.constant 1040 : offset")
-    text = text.replace("view<256xf32>", "view<258xf32>")
-    rep("    view.store %result, %out_view[%s3_off] : f32, view<[%x_total]xf32>\n", """    %is_v = index.cmp uge, %wg, %nkh : index
-    scf.if %is_v {
-      %result_h = scalar.fptrunc %result : f32 to f16
-      view.store %result_h, %out_view[%s3_off] : f16, view<[%x_total]xf16>
-    }
-""")
-    rep("        view.store %kq_all, %scales_view[%o2] : f32, view<[%scale_total]xf32>\n      }\n    }\n  }\n", """        view.store %kq_all, %scales_view[%o2] : f32, view<[%scale_total]xf32>
-        %ks_slot = index.constant 256 : index
-        %qs_slot = index.constant 257 : index
-        view.store %inv_k, %kq_lds[%ks_slot] : f32, view<258xf32>
-        view.store %q_scaled, %kq_lds[%qs_slot] : f32, view<258xf32>
-      }
-    }
-    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    %ks_at = index.constant 256 : index
-    %qs_at = index.constant 257 : index
-    %ks = view.load %kq_lds[%ks_at] : view<258xf32> -> f32
-    %qs = view.load %kq_lds[%qs_at] : view<258xf32> -> f32
-    %own_scale = scf.select %lane_hi, %ks, %qs : f32
-    %own = view.load %kq_lds[%lane] : view<258xf32> -> f32
-    %own_n = scalar.mulf %own, %own_scale : f32
-    %own_h = scalar.fptrunc %own_n : f32 to f16
-    %own_row = index.mul %t, %qkv_dim : index
-    %own_off = index.add %own_row, %c : index
-    view.store %own_h, %out_view[%own_off] : f16, view<[%x_total]xf16>
-  }
-""")
-    return text
 
 
 NORM_SPLIT = 2
@@ -445,8 +373,7 @@ TILE_FMTS = ("iq3s", "iq4xs", "iq4nl", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", 
 
 # Activations-from-global GEMMs (gen_gemm_tile Tile.afrag): "<hal>.af.hal" reads a fragment-major input (Tile.atiled; the
 # FFN norm "norm_t.hal" and the swiglu "<hal>.af.to.hal" write it). 512-token tiles, only the decoded weights in LDS.
-# Same values as the GEMM. YAH_AFRAG=0 leaves them out.
-AFRAG = os.environ.get("YAH_AFRAG", "1") != "0"
+# Same values as the GEMM.
 AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, stg_minwg=0,
                tallepi=True, ecoal=True, esr=32)
 AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
@@ -454,7 +381,7 @@ AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
 # right after its load, which drains vmcnt(0) once per phase (IQ4_XS: 200 VGPRs with it, fused IQ3_S ffn: 216)
 AF_PIPE3 = dict(AF_PIPE, b0early=2)
 AF_KQ = dict(rhs_outer=False, rhs_fence=0)   # K-quants without B prefetch (Q6_K: 208 VGPRs with it)
-# Q4_K / Q3_K / Q5_K with the B prefetch: their decoders came down to 184-192 VGPRs (Q4DFMA, Q3_FMIX), so it fits now:
+# Q4_K / Q3_K / Q5_K with the B prefetch: their decoders came down to 184-192 VGPRs (fma narrowing, results.md), so it fits now:
 # -3.6..-4.0% clock-free (Q4_K swiglu -5.6%, kstore 64 -5.5%)
 AF_KQP = dict(AF_KQ, **AF_PIPE, lhs_stream=4)
 # No B prefetch (bpre 0, no b0early, lhs_stream 0): under HRX 0051 the prefetching forms sit at 192 VGPRs with
@@ -540,7 +467,7 @@ AF = {
     ("q5k", "kqg", 768, 20): dict(AF_KQP, ksl=True),                            # -10.8%
     # 11-02, the q of the two layers in these formats (tiled 96 x 8 at 69-72% of the floor): Q2_K without B prefetch
     # -19.0% (with it -13.4%); IQ4_NL (32-element blocks) spills without it, lhs_stream 4 -17.7%
-    # Q2_K with the B prefetch since its fptrunc(fma) decode (Q2DFMA, 187 -> 192 VGPRs): attention seg -0.15 M cycles
+    # Q2_K with the B prefetch since its fptrunc(fma) decode (187 -> 192 VGPRs): attention seg -0.15 M cycles
     ("q2k", "kqg", 768, 20): dict(AF_KQP, ksl=True),
     ("iq4nl", "kqg", 768, 160): dict(ksl=True, wlate=True, b0early=True, lhs_stream=4),
     ("iq4xs", "kstore", 64, 20): dict(AF_PIPE),                                 # -15.7%
@@ -584,8 +511,6 @@ AF_MIX = dict(ffn_inload=True, bpre=0, b0early=False, lhs_stream=0)
 # (11-03), bit-identical: iq3xxs:iq3s -1.6%, iq2xs:iq3s -1.5%, iq2s:iq3xxs -1.3%, iq4xs:iq3s -1.0%, iq3xxs:iq2s -0.8%,
 # iq3s:iq4xs -0.6%, q3k:iq3s -0.3%, GEMMs -0.13%; iq2xs:iq2s +1.7% (keeps the in-decode loads)
 AF_SEL = dict(ffn_sel=True, bpre=0, b0early=False, lhs_stream=1)
-if __import__("os").environ.get("YAH_FFN_SEL", "1") == "0":
-    AF_SEL = AF_MIX
 AF_FFN_MIX = {
     ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], **AF_SEL),
     ("iq4xs", "q4k"): dict(AF_FFN["iq4xs"], **AF_SEL),
@@ -612,7 +537,7 @@ def ffn_fused(rows, B, outdir):
     """Emit "gemm_ffn_<fmt>_<mt>_<kb>.af.hal" / ".af.to.hal" for each AF_FFN format some layer uses for both its gate
     and up, and "gemm_ffn_<gate>_<up>_.." for each AF_FFN_MIX pair some layer has; return the dispatch.txt rows."""
     import gen_gemm_tile as TG
-    if not AFRAG or B % AF_TILE["bn"]:
+    if B % AF_TILE["bn"]:
         return []
     by = {}
     for nm, dims, ty in rows:
@@ -644,7 +569,6 @@ def ffn_fused(rows, B, outdir):
 # to the second output (gen_gemm_tile.SPLIT2). gemm_bench 11-02: 0.111 vs 0.157 Mcyc for the two 48-row kstores (the
 # merged rows at the old 16-row tile 0.144: the tile, not the shared input, wins); pp2048 counters 20.2 -> 15.5 Mcyc.
 # Same values.
-KST2 = os.environ.get("YAH_KST2", "1") == "1"
 KST2_GEOM = (48, 64, 3, 2)
 
 
@@ -679,7 +603,6 @@ def kst2(rows, B, outdir):
 # attention: the q + gate kqg + attn_k + attn_v (their afrag tiles; k and v are not adjacent and often of two formats).
 # "seg_<kind>_<fmt>_<mt>_<kb>__..." per segment, the large GEMM first; dispatch.txt "<hal> <tile> <groups> <tt>": the
 # grid x (all segments' row groups) in the rowgrp column. Same values.
-SEG = os.environ.get("YAH_SEG", "1") == "1"
 SEG_SMALL = dict(ksl=True, bm=48, tallepi=False, ecoal=False)   # the 48-row afrag tile (fragment-store epilogue)
 SEG_VGPR_TIER = 192   # 1536 / 8 waves: two 16-wave workgroups per WGP
 # riders' knobs when the segmented GEMM would cross the tier: each A fragment loaded just before its MMAs, one step
@@ -701,7 +624,7 @@ def seg_gemms(rows, B, outdir):
     import gen_gemm_tile as TG
     import gen_segcat
     import hrx_paths
-    if not (AFRAG and B % AF_TILE["bn"] == 0):
+    if B % AF_TILE["bn"]:
         return []
     by = {}
     for nm, dims, ty in rows:
@@ -769,7 +692,7 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     """Emit "<hal>.af.hal" (and for swiglu "<hal>.af.to.hal", fragment-major output) if this GEMM has an afrag form."""
     import gen_gemm_tile as TG
     knobs = AF.get((fmt, kind, mt, kb))
-    if not AFRAG or knobs is None or B % AF_TILE["bn"]:
+    if knobs is None or B % AF_TILE["bn"]:
         return []
     knobs = dict(knobs)
     if kind == "kres" and kb == 24:
@@ -796,71 +719,54 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     return rows
 
 
-# NPU column split (YAH_NPU_SPLIT="<site>=<NPU rows>,...", rows multiples of "npurows" (640; fused sets 512), q also of 512; empty: none): the NPU (XDNA2, HRX .xdna)
-# computes the trailing rows of a GEMM, the GPU the leading ones. Sites (rows x K):
+# NPU column split (YAH_NPU_SPLIT="<site>=<NPU rows>,...", rows multiples of "npurows" (512), q also of 512; empty: none):
+# the NPU (XDNA2, HRX .xdna) computes the trailing rows of a GEMM, the GPU the leading ones. Sites (rows x K):
 #   qkv  DeltaNet attn_qkv (10240 x 5120, f16 out)     gate  DeltaNet attn_gate (6144 x 5120, f16 out)
 #   q    attention attn_q (12288 x 5120, kqg: whole heads of [256 q | 256 gate])
-#   out  ssm_out / attn_output (5120 x 6144, kres)      down  ffn_down (5120 x 17408, kres)
-# The NPU runs one image (K = 5120 per call: switching images costs ~0.55 ms each): out and down take K chunks of 5120 and
-# the GPU computes the rest of K for the NPU's rows (npu_rem_tile, gen_gemm_tile.KWIN), which the unpack adds.
-#   ffn  ffn_gate + ffn_up (17408 x 5120 each): the same NPU rows of both, silu(gate) * up in the unpack
+#   out  ssm_out / attn_output (5120 x 6144, kres)
+# The NPU's calls have K = 5120 (gen_npu_gemm passes): out takes a K chunk of 5120 and the GPU computes the rest of K for
+# the NPU's rows (npu_rem_tile, gen_gemm_tile.KWIN), which the unpack adds.
 # Per site and format, the GPU's share of every variant the driver may run ("<hal>.npu.hal": "<hal>" any of the set's
-# GEMM HALs, its afrag / persistent / fragment-major-output forms included; gen_gemm_tile.OSTRIDE) and the NPU's rows
-# decoded straight to its BFP16 weight stream ("dqbfp_<fmt>_<mt>_<kb>[_c<chunk>].hal", gen_gemm_tile.DQ_BFP). Per K the
-# activation encoders ("npu_enc_<K>[_c<chunk>][_t].hal", _t: fragment-major input) and the NPU GEMM image
-# ("npu_gemm_<K>.xdna", 8 columns of gen_npu_gemm.TN = 640 rows per call: "npurows"); per site the unpack ("npu_unpack_<site>.hal", ffn also
-# "npu_unpack_ffn_t.hal" with fragment-major output; qkv: "npu_unpack_qkv_tail.hal" + the conv split "convkq_g.hal" /
-# "convkq_c.hal", which reads C itself). dispatch.txt: "npusplit_<site> <rows> 0 0", "npubytes_<K> <A>
-# <W per call> <C per call>", and per kernel "<hal> <workgroups> <workgroup size> 0" (the split GEMMs have GEMM rows).
+# GEMM HALs, its afrag / persistent / fragment-major-output forms included; gen_gemm_tile.OSTRIDE). Per K the activation
+# encoders ("npu_enc_<K>[_c<chunk>][_t][_pk].hal", _t: fragment-major input); per site the unpack
+# ("npu_unpack_<site>.hal"; qkv: "npu_unpack_qkv_tail.hal" + the conv split "convkq_g.hal" / "convkq_c.hal", which reads C
+# itself). dispatch.txt: "npusplit_<site> <rows> 0 0", "npubytes_<K> <A> <W per call> <C per call>", and per kernel
+# "<hal> <workgroups> <workgroup size> 0" (the split GEMMs have GEMM rows).
 NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("YAH_NPU_SPLIT", "").split(",") if x))
 # The NPU image waits for each job's ready word itself (gen_npu_gemm GATE, HRX patch 0016): no host relay sits between
 # the GPU and the NPU. dispatch.txt: "npugate <supply> <calls> <record>" (gen_npu_gemm GATE_*), and npu_flag_wait.hal
 # waits for a job's done word (gen_npu_unpack.gen_flag_wait).
-# YAH_NPU_DCOL=1: the NPU decodes its weights itself (gen_npu_gemm dcol 2): 7 GEMM columns read by a decoder column
-# from the raw GGUF rows the engine registers with the NPU, so no GPU decode ("dqbfp") runs. Per format with a decoder
-# (DCOL_FMTS) and site K the image "npu_dcol_<fmt>_<K>.xdna", and per format "npu_dcol_<fmt>.swap.xdna" (its decoder
-# tiles' setup alone: the engine switches formats inside a command). The decoders' k-block order (gen_npu_dec.KPERM)
-# permutes the activations (gen_bfp16_encode.ACT_PERM): "p4" for the fused writers (norm, postnorm, ffn unpack) and the
-# plain encoders, "pk" (Q4_K) by the "_pk" encoders into A's second half. Tensors of other formats stay on the GPU.
-# YAH_NPU_FUSE=1: the same raw-row sets on 8 fused GEMM columns (gen_npu_gemm fuse 2: every GEMM core decodes its own
-# panel slice; no decoder column, no swap images), images "npu_dcol_<fmt>_<K>.xdna" for the formats in FUSE_FMTS, NP 4:
-# 512-row calls (site rows multiples of 512; NP 5 images no longer fit the grid decoders' raw rings), one replay group.
-NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
-NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
+# The NPU decodes its weights itself from the raw GGUF rows the engine registers with it: 8 GEMM columns whose cores each
+# decode their own panel slice (gen_npu_gemm fuse 2), images "npu_dcol_<fmt>_<K>.xdna" for the formats in FUSE_FMTS, NP 4:
+# 512-row calls (NP 5 images no longer fit the grid decoders' raw rings), one replay group. The decoders' k-block order
+# (gen_npu_dec.KPERM) permutes the activations (gen_bfp16_encode.ACT_PERM): "p4" for the fused writers (norm, postnorm,
+# ffn unpack) and the plain encoders, "pk" (Q4_K) by the "_pk" encoders into A's second half.
+# Tried, not kept: the GPU decoding the NPU's rows to its BFP16 stream (dqbfp, one plain image), and a decoder column
+# feeding 7 GEMM columns (per-format swap images inside a command); pp2048 2126 ms came from the fused form.
 FUSE_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q4k", "q5k")
-FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q5k", "q4k", "iq2s")   # the fused FFN block's gate / up (NP
+FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q5k", "q4k", "iq2s")   # the FFN block's gate / up (NP
 # 4 images: room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream: Q4_K only
-# in pairs, a P4 H through its gather-free decoder, gord GF)
+# in pairs, a P4 H through its gather-free decoder)
 FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k", "q3k", "q5k", "iq2s")
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4"), "q5k": ("Q5_K", "p4"),
              "iq2s": ("BFP", "p4")}   # IQ2_S: no decoder, the rows pre-decoded (bfp_rows: npu_bfp_<tensor>.bin)
-NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
-# the fused FFN block's gate / up of the formats whose filler cores hold 40 k-block slices (IQ3_S's head A ring does not
+NPU_KS = (36, 36, 36, 20)   # k-blocks per pass and K-slice row; K = 1024 * passes
+# the FFN block's gate / up of the formats whose filler cores hold 40 k-block slices (IQ3_S's head A ring does not
 # place): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
 # layer writes this split's stream ("norm_t_bfp_g1s.hal", dispatch row "npuffndfr_<fmt>")
-NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs"), (40, 40, 40, 8)
-# YAH_NPU_IX4 (default 1): the FFN block's IQ3_S / IQ3_XXS gate / up rows transcoded on the host to IQ4_XS blocks with
-# the same weights (ix4_files: npu_ix4_<...>.bin), decoded by IQ4_XS's decoder with their kvalues (gen_npu_dec IQ4_XO /
-# IQ4_XX): no grid tables, so IQ3_S's fillers also hold the deferred epilogue's 40 k-block slices
-NPU_IX4 = os.environ.get("YAH_NPU_IX4", "1") == "1"
-IX4_FMTS = {"iq3s": "IQ4_XO", "iq3xxs": "IQ4_XX"} if NPU_IX4 else {}
-IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX") if NPU_IX4 else ()
-if NPU_IX4:
-    NPU_DFR_FMTS += ("iq3s",)
-# YAH_NPU_BFPSW (default 1): the other pairs' gate / up rows (the NPU's) pre-decoded to bfp16 (bfp_pair_rows:
-# npu_bfp_<prefix>ffn_gate_up.bin), one BFP image like a single format's with the deferred epilogue
-# ("npu_ffnsw_bfp_<hord>", dispatch rows "npuffnbx_<gate>_<up>") instead of column pairs
-NPU_BFPSW = os.environ.get("YAH_NPU_BFPSW", "1") == "1"
-# YAH_NPU_BFPSITE (default 1): site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU
-# rows pre-decoded (bfp_site_rows: npu_bfp_<tensor>.bin), on the BFP site image ("npu_dcol_iq2s_<K>", dispatch rows
-# "npusitebx_<tensor>")
-NPU_BFPSITE = os.environ.get("YAH_NPU_BFPSITE", "1") == "1"
-# pairs of one format (no fused GPU gate / up) whose decoder holds the deferred epilogue's slices: the NPU's side one
-# image like a single format's, on the GGUF rows (Q3_K's leaf exceeds the program memory at 40 / 8; Q5_K's decode
-# runs slower than the BFP image's stream: BFP with NPU_BFPSW)
-SAME_SW_FMTS = ("q5k",) if NPU_IX4 and not NPU_BFPSW else ()
+NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs", "iq3s"), (40, 40, 40, 8)
+# The FFN block's IQ3_S / IQ3_XXS gate / up rows are transcoded on the host to IQ4_XS blocks with the same weights
+# (ix4_files: npu_ix4_<...>.bin), decoded by IQ4_XS's decoder with their kvalues (gen_npu_dec IQ4_XO / IQ4_XX): no grid
+# tables, so IQ3_S's fillers also hold the deferred epilogue's 40 k-block slices (dispatch row "npuffnix4")
+IX4_FMTS = {"iq3s": "IQ4_XO", "iq3xxs": "IQ4_XX"}
+IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX")
+# The other pairs' gate / up rows (the NPU's) are pre-decoded to bfp16 (bfp_pair_rows: npu_bfp_<prefix>ffn_gate_up.bin),
+# one BFP image like a single format's with the deferred epilogue ("npu_ffnsw_bfp_<hord>", dispatch rows
+# "npuffnbx_<gate>_<up>"). Site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU rows
+# pre-decoded too (bfp_site_rows: npu_bfp_<tensor>.bin), on the BFP site image ("npu_dcol_iq2s_<K>", dispatch rows
+# "npusitebx_<tensor>"). Tried, not kept: gate and up of two formats on column pairs (the gate tail streaming its C to the up tail).
 
 
 def gu_fmt(fmt):
@@ -873,49 +779,39 @@ def gu_fmt(fmt):
 # (hlate: their tables leave the mids no contiguous A ring otherwise)
 NPU_KCHAIN_FMTS = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "q5k")
 KCHAIN = lambda fmt: dict(kchain=1, hcap=2, gtail=1, hlate=int(fmt in ("iq3s", "iq3xxs"))) if fmt in NPU_KCHAIN_FMTS else {}
-# the decoder-column images' setups run no call (gen_npu_gemm gfirst: the gate waits at a job's first firing), so an
-# image switch inside a command costs no dummy call; dispatch.txt "npugfirst"
-NPU_GFIRST = 1
+
+
+def npu_cfg(B, ks, passes, **kw):
+    """A fused NPU image's gen_npu_gemm config: gated, its gate's waiter and relay at a job's first firing (the setup
+    runs no call, so an image switch inside a command costs no dummy call; dispatch.txt "npugfirst")."""
+    return GN.Config(NPU_COLS, B // 64, ks, passes, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, **kw)
+
+
 # Token halves (LoomPrefill halves): the qkv / q and out jobs and their GPU chains run per half of the chunk, so the NPU works during the DeltaNet / attention chain.
 # main emits the set at half the chunk into "<outdir>/h" (YAH_EMIT_HALF=1: only what the halves run); the FFN block's unpack and norm get "_h<i>" forms for half i's tokens.
 EMIT_HALF = os.environ.get("YAH_EMIT_HALF") == "1"
 
 
 def npu_halves(B):
-    split = set(NPU_SPLIT)
-    return NPU_DCOL and B % 128 == 0 and bool({"qkv", "q", "out"} & split) and not {"ffn", "down"} & split
+    return B % 128 == 0 and bool({"qkv", "q", "out"} & set(NPU_SPLIT))
 
 
-NPU_COLS = 7 if NPU_DCOL and not NPU_FUSE else 8
-NPU_NP = 4 if NPU_FUSE else GN.NP   # 16-row slabs per column of a site call
+NPU_COLS = 8
+NPU_NP = 4   # 16-row slabs per column of a call
 NPU_ROWS = NPU_COLS * 16 * NPU_NP   # output rows per NPU call
-NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24),
-             "down": ("kres", 320, 68), "ffn": ("ffn", 1088, 20)}
-NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
-# YAH_NPU_FFNBLK=<F> (decoder-column sets, F = 7168): the NPU owns the FFN's last F features of every layer whose
-# ffn_gate and ffn_up share a p4 decoder format (and ffn_up follows ffn_gate) and whose ffn_down has a grid decoder
-# (natural k-block order). Its gate / up calls (gen_npu_gemm swiglu, NP 4, raw rows straight from the model; call j's
-# column c computes features 8 (128 c + 4 j) + [0, 32) of F) apply swiglu and write H into C: bfp16 fragments as
-# [M block][pass 7][16-token slab][128 k-blocks] (hpass). Its down calls (ain "h": 4 + 3 passes, 560 rows each, the 10th
-# call overlapping the 9th) write their partials. The GPU runs the other features through the fused ffn's split
-# (".npu.hal", nn = F) and down over them ("npuffnrem_<fmt>.hal", a K window); npu_unpack_ffnblk.hal adds hidden + both.
-# A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup, and one ungated call
-# unless NPU_GFIRST).
-# With YAH_NPU_FUSE (any F = 1024 n; layers whose three tensors are in FUSE_FMTS): gate / up on 8 fused columns, call j
-# (F / 256 of them) column c features 256 j + 32 c + [0, 32) of F (gen_npu_gemm swcol 32), down in 640-row calls.
-# Down's K parts (both kinds): F's passes in the fewest parts of at most 5 (a fused panel holds a part), sizes balanced.
+NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24)}
+NPU_PASSES = 5   # K = 5120 per call (gen_npu_gemm passes)
+# YAH_NPU_FFNBLK=<F> (F = 1024 n): the NPU owns the FFN's last F features of every layer whose gate, up and down are in
+# FUSE_FFN_FMTS / FUSE_FFN_DOWN_FMTS (and ffn_up follows ffn_gate). Its gate / up calls (gen_npu_gemm swiglu, NP 4, raw
+# rows straight from the model; call j (F / 256 of them) column c features 256 j + 32 c + [0, 32) of F, swcol 32) apply
+# swiglu and write H into C: bfp16 fragments as [M block][pass][16-token slab][128 k-blocks] (hpass). Its down calls
+# (ain "h", 512 rows) write their partials. The GPU runs the other features through the fused ffn's split (".npu.hal",
+# nn = F) and down over them ("npuffnrem_<fmt>.hal", a K window, f32); npu_unpack_ffnblk.hal adds hidden + both after
+# the job. Down's K parts: F's passes in the fewest parts of at most 5 (a fused panel holds a part), sizes balanced.
+# A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup).
+# Tried, not kept: the GPU window's residual epilogue waiting for the NPU (npuffnres): only 20 of its workgroups fit at
+# once, so while the NPU is the late one the rest of the GPU's down starts after the NPU's (~5 ms a layer).
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
-# Fused sets: the GPU window writes f32 and npu_unpack_ffnblk adds hidden + it + the NPU's partials after the job.
-# YAH_NPU_FFNRES=1: its residual epilogue waits for the NPU instead (npuffnres). Only 20 of its workgroups fit at once
-# (one per WGP), so while the NPU is the late one the rest of the GPU's down starts after the NPU's (~5 ms a layer).
-NPU_FFNRES = os.environ.get("YAH_NPU_FFNRES", "0") == "1"
-FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs", "q3k", "iq2xxs", "iq2xs")
-FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs", "iq4xs", "q4k")
-# the down decoders' k-block order where it is not natural: their layers' gate / up images write H in it (_p4 / _q4k)
-FFNBLK_HORD = {"iq4xs": "P4", "q4k": "Q4K"}
-# Layers whose gate and up formats differ: column pairs (gen_npu_gemm ufmt; 192 features per call), F = 6144 and down in
-# two 3-pass parts.
-FFNBLK_PAIR = 6144
 
 
 def ffnblk_parts(F):
@@ -949,9 +845,9 @@ def npu_rem_tile(fmt, kbw, kbt, kind="kstore"):
 
 
 def fit_rowgrp(t, mt):
-    """Tile t over mt row tiles: decoder-column splits (560-row NPU calls) leave GPU / remainder row counts the tile's
-    row group need not divide; the largest of its row group, 4, 2, 1 that does."""
-    if not NPU_DCOL or mt % t.rowgrp == 0:
+    """Tile t over mt row tiles: NPU splits can leave GPU / remainder row counts the tile's row group need not divide;
+    the largest of its row group, 4, 2, 1 that does."""
+    if mt % t.rowgrp == 0:
         return t
     import gen_gemm_tile as TG
     for r in (4, 2, 1):
@@ -972,14 +868,11 @@ def npu_split(rows, combos, B, outdir):
     import gen_bfp16_encode as GE
     import gen_gemm_tile as TG
     import gen_npu_unpack as GU
-    sys.path.insert(0, os.path.dirname(HERE))
-    import hrx_paths
     bad = set(NPU_SPLIT) - set(NPU_SITES)
     assert not bad, "unknown NPU split sites %s" % sorted(bad)
     assert all(v % NPU_ROWS == 0 and 0 < v < NPU_SITES[k][1] * 16 for k, v in NPU_SPLIT.items()) and B % 512 == 0
     assert NPU_SPLIT.get("q", 0) % 512 == 0, "q: whole heads"
-    assert not (NPU_COLS == 7 and "q" in NPU_SPLIT), "dcol: q's whole heads are not 560-row calls"
-    GE.ACT_PERM = "p4" if NPU_DCOL else None
+    GE.ACT_PERM = "p4"
     out = []
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
@@ -1004,7 +897,7 @@ def npu_split(rows, combos, B, outdir):
         except (SystemExit, RuntimeError, ValueError) as ex:
             if tf is t:
                 raise
-            # a decoder-column split's narrower row group may not emit (spills): the engine runs that form unsplit
+            # a split's narrower row group may not emit (spills): the engine runs that form unsplit
             print("npu split %s: not emitted with row group %d (%s)" % (name, tf.rowgrp, str(ex)[:120]))
 
     def variants(fmt, kind, mt, kb, base, nn):
@@ -1015,7 +908,7 @@ def npu_split(rows, combos, B, outdir):
         if fmt in TILE_FMTS and mt % t.rowgrp == 0:
             split(fmt, kind, mt, kb, t, base, nn)
         knobs = AF.get((fmt, kind, mt, kb))
-        if AFRAG and knobs is not None and B % AF_TILE["bn"] == 0:
+        if knobs is not None and B % AF_TILE["bn"] == 0:
             knobs = dict(knobs)
             persist = knobs.pop("persist", False)
             ta = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **knobs)
@@ -1029,38 +922,14 @@ def npu_split(rows, combos, B, outdir):
                 if B // ta.bn > 2:
                     split(fmt, kind, mt, kb, ta, base[:-4] + ".af.p3.hal", nn, persist=pt, tokens=B - ta.bn)
 
-    def dqbfp(fmt, mt, kb, nn, ci=None, chunk=None):
-        """The NPU's rows (the last nn of mt * 16) decoded to its weight stream; chunk ci: (k offset, passes) of a K chunk."""
-        dt = dataclasses.replace(TG.default_tile(fmt, "kstore", kb), bm=64, wm=2, wn=4, decahead=False,
-                                 ksub=TG.DQ_BFP_KSUB, dbuf=False)
-        name = "dqbfp_%s_%d_%d%s.hal" % (fmt, mt, kb, "" if chunk is None else "_c%d" % ci)
-        if chunk is None:
-            TG.DQ_BFP, kbc, kfull = (NPU_KS, kb * qk_of(fmt) // 1024), kb, 0
-        else:
-            TG.DQ_BFP = (NPU_KS, chunk[1], chunk[0] // 256, kb)
-            kbc, kfull = chunk[1] * 4, kb
-        try:
-            _emit_gen(lambda f, k: TG.gen(f, "dequant", dt), dt.bn, fmt, nn // 16, kbc, B, name, outdir, "dequant",
-                      dt.rowgrp, sym="yah_dequant_%s_bfp16" % fmt, kfull=kfull)
-        finally:
-            TG.DQ_BFP = None
-        out.append((name, TG.dq_wgs(nn // 16, kbc, dt, fmt), dt.lanes, 0))
-
     done = set()
-    dcol_images, bsites = set(), set()
+    images, bsites = set(), set()
     for kind, fmt, port, mt, kb in sorted(combos):
         for site, (skind, smt, skb) in NPU_SITES.items():
             if site not in NPU_SPLIT or mt != smt or kb * qk_of(fmt) != skb * 256 or fmt not in TILE_FMTS:
                 continue
             nn = NPU_SPLIT[site]
-            if site == "ffn":   # the gate kstore and the up swiglu of each format (the fused ffn below)
-                if kind == "kstore":
-                    variants(fmt, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb), nn)
-                elif kind == "swiglu":
-                    variants(fmt, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (fmt, mt, kb), nn)
-                else:
-                    continue
-            elif skind == "kres":
+            if skind == "kres":
                 if kind != "residual":
                     continue
                 variants(fmt, "kres", mt, kb, "gemm_kres_%s_%d_%d.hal" % (fmt, mt, kb), nn)
@@ -1068,19 +937,12 @@ def npu_split(rows, combos, B, outdir):
                 variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn)
             else:
                 continue
-            chunks = npu_chunks(site)
-            chunked = len(chunks) > 1 or npu_rem(site)
-            for ci, chunk in (enumerate(chunks) if chunked else ((None, None),)):
-                if NPU_DCOL:
-                    if fmt in (FUSE_FMTS if NPU_FUSE else DCOL_FMTS):
-                        dcol_images.add((fmt, kb * 256))
-                    elif NPU_FUSE and NPU_BFPSITE and chunk is None and skind != "kres":   # (BFP site rows)
-                        dcol_images.add(("iq2s", skb * 256))
-                        bsites.update((t, nn) for t in combos[(kind, fmt, port, mt, kb)])
-                    continue
-                if (fmt, mt, kb, chunk) not in done:
-                    done.add((fmt, mt, kb, chunk))
-                    dqbfp(fmt, mt, kb, NPU_SPLIT[site], ci, chunk)
+            chunked = len(npu_chunks(site)) > 1 or npu_rem(site)
+            if fmt in FUSE_FMTS:
+                images.add((fmt, kb * 256))
+            elif not chunked and skind != "kres":   # (BFP site rows)
+                images.add(("iq2s", skb * 256))
+                bsites.update((t, nn) for t in combos[(kind, fmt, port, mt, kb)])
             if npu_rem(site) and (site, fmt) not in done:   # the GPU's K remainder of the NPU's rows (f32 [B][nn])
                 done.add((site, fmt))
                 kbw = npu_rem(site) // 256
@@ -1095,17 +957,6 @@ def npu_split(rows, combos, B, outdir):
                 assert nn // 16 not in O16_MT, "the remainder writes f32"
                 out.append(_emit_gen(gen_rem, tr.bn, fmt, nn // 16, kbw, B, "npurem_%s_%s.hal" % (site, fmt), outdir,
                                      "kstore", tr.rowgrp, kfull=kb))
-    if "ffn" in NPU_SPLIT and AFRAG and B % AF_TILE["bn"] == 0:   # the fused gate + up GEMMs (ffn_fused)
-        by = {}
-        for nm, dims, ty in rows:
-            p = nm.split(".")
-            if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up") and E.FMT.get(ty):
-                by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
-        for fmt, mt, kb in sorted({l["ffn_gate"] for l in by.values() if l.get("ffn_gate") == l.get("ffn_up")}):
-            if fmt in AF_FFN:
-                t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
-                for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
-                    split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), NPU_SPLIT["ffn"])
     # activation encoders: per K (chunked: per chunk), row-major and fragment-major input
     encs = set()
     for site in NPU_SPLIT:
@@ -1116,26 +967,9 @@ def npu_split(rows, combos, B, outdir):
             encs.add((K, ci if chunked else None, chunk))
     if NPU_FFNBLK:   # the FFN block's gate / up activations
         encs.add((5120, None, (0, NPU_PASSES)))
-    # the ffn unpack writes down's BFP16 input for its columns (gen_npu_unpack bfp): down's chunks there need only their
-    # leading k-blocks encoded ("npu_enc_17408_c<i>p")
-    ffn_bfp = "ffn" in NPU_SPLIT and "down" in NPU_SPLIT
-    if ffn_bfp:
-        ffn_off = NPU_SITES["ffn"][1] * 16 - NPU_SPLIT["ffn"]
-        assert NPU_SITES["ffn"][1] * 16 == NPU_SITES["down"][2] * 256
-        for ci, (k_off, passes) in enumerate(npu_chunks("down")):
-            cover = min(k_off + 1024 * passes, ffn_off) - k_off
-            if 0 < cover < 1024 * passes:
-                for tiled in (False, True):
-                    name = "npu_enc_17408_c%dp%s.hal" % (ci, "_t" if tiled else "")
-                    src = os.path.join(tmp, name[:-4] + ".loom")
-                    open(src, "w").write(GE.gen("act", B, list(NPU_KS), passes, tiled=tiled, k_off=k_off, k_src=17408,
-                                                kb_count=cover // 8))
-                    E.emit(src, ["nop=0"], name, outdir)
-                    out.append((name, B // 8 * (cover // 8) // GE.WG, GE.WG, 0))
-        out.append(("npuffnbfp", ffn_off, 0, 0))
     for K, ci, (k_off, passes) in sorted(encs, key=lambda x: (x[0], -1 if x[1] is None else x[1])):
         for tiled in (False, True):
-            for perm in (("p4", "pk") if NPU_DCOL else (None,)):
+            for perm in ("p4", "pk"):
                 name = "npu_enc_%d%s%s%s.hal" % (K, "" if ci is None else "_c%d" % ci, "_t" if tiled else "",
                                                  "_pk" if perm == "pk" else "")
                 src = os.path.join(tmp, name[:-4] + ".loom")
@@ -1144,11 +978,11 @@ def npu_split(rows, combos, B, outdir):
                     open(src, "w").write(GE.gen("act", B, list(NPU_KS), passes, tiled=tiled, k_off=k_off,
                                                 k_src=K if 1024 * passes != K else None))
                 finally:
-                    GE.ACT_PERM = "p4" if NPU_DCOL else None
+                    GE.ACT_PERM = "p4"
                 E.emit(src, ["nop=0"], name, outdir)   # emit_hal.py wants a config; the encoder has none
                 out.append((name, B // 8 * (passes * sum(NPU_KS)) // GE.WG, GE.WG, 0))
     # the norms that feed K = 5120 sites also write the NPU's BFP16 input (gen_half_norm.gen_split bfp): "<norm>_bfp.hal"
-    if {"qkv", "q", "ffn"} & set(NPU_SPLIT):
+    if {"qkv", "q"} & set(NPU_SPLIT):
         for tiled, name in ((False, "norm_bfp.hal"), (True, "norm_t_bfp.hal"), ("both", "norm_rt_bfp.hal")):
             src = os.path.join(tmp, name[:-4] + ".loom")
             open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=tiled,
@@ -1169,19 +1003,14 @@ def npu_split(rows, combos, B, outdir):
     for site, n in sorted(NPU_SPLIT.items()):
         skind, mt, kb = NPU_SITES[site]
         N = mt * 16
-        forms = {"qkv": [dict(out16=True)], "gate": [dict(out16=True)], "q": [dict(qg=True)],
-                 "out": [dict(resid=True, parts=len(npu_chunks("out")), rem=True)],
-                 "down": [dict(resid=True, parts=len(npu_chunks("down")), rem=True)],
-                 "ffn": [dict(swiglu=True), dict(swiglu=True, tiled=True)]}[site]
-        if site == "ffn" and ffn_bfp:
-            forms = [dict(f, bfp=(NPU_KS, NPU_PASSES, 1024 * NPU_PASSES, len(npu_chunks("down")))) for f in forms]
-        for f in forms:
-            name = "npu_unpack_%s%s.hal" % (site, "_t" if f.get("tiled") else "")
-            src = os.path.join(tmp, name[:-4] + ".loom")
-            open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
-            E.emit(src, ["nop=0"], name, outdir)
-            out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
-        if site == "qkv" and conv_tb_ok(B):
+        f = {"qkv": dict(out16=True), "gate": dict(out16=True), "q": dict(qg=True),
+             "out": dict(resid=True, parts=len(npu_chunks("out")), rem=True)}[site]
+        name = "npu_unpack_%s.hal" % site
+        src = os.path.join(tmp, name[:-4] + ".loom")
+        open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
+        E.emit(src, ["nop=0"], name, outdir)
+        out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
+        if site == "qkv":
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads
             for hal, text, cfg in (
@@ -1207,59 +1036,31 @@ def npu_split(rows, combos, B, outdir):
     E.emit(src, ["nop=0"], "npu_flag_wait_log.hal", outdir)
     out.append(("npu_flag_wait_log.hal", 1, 32, 0))
     out.append(("npugate", GN.GATE_SUPPLY, GN.GATE_CALLS, GN.GATE_RECORD))
-    if NPU_DCOL:
-        bfp_site_rows(bsites, outdir)
-        out.extend(("npusitebx_" + t, 1, 0, 0) for t, _ in sorted(bsites))
-        extra = npu_ffnblk(rows, B, tmp, outdir, out, split, variants) if NPU_FFNBLK else []
-        out.extend(npu_dcol_images(dcol_images, B, tmp, outdir, extra))
-        GE.ACT_PERM = None
-        return out
-    # NPU images, one per pass count
-    env = dict(hrx_paths.env(), **GN.LOOM_ENV)
-    for passes in sorted({p for s in NPU_SPLIT for _, p in npu_chunks(s)}):
-        K = 1024 * passes
-        cfg = GN.Config(8, B // 64, NPU_KS, passes, gate=GN.GATE_SUPPLY)
-        src = os.path.join(tmp, "npu_gemm_%d.loom" % K)
-        open(src, "w").write(GN.gen(cfg))
-        r = subprocess.run([hrx_paths.LOOM_COMPILE, src, "--root=@" + cfg.entry,
-                            "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
-                            "--output=" + os.path.join(outdir, "npu_gemm_%d.xdna" % K)], capture_output=True, text=True,
-                           env=env)
-        if r.returncode:
-            raise SystemExit("NPU GEMM compile failed: " + r.stderr[-800:])
-        out.append(("npubytes_%d" % K,) + tuple(GN.stream_bytes(cfg)))
-    out.append(("npurows", NPU_ROWS, 0, 0))
+    bfp_site_rows(bsites, outdir)
+    out.extend(("npusitebx_" + t, 1, 0, 0) for t, _ in sorted(bsites))
+    extra = npu_ffnblk(rows, B, tmp, outdir, out, split, variants) if NPU_FFNBLK else []
+    out.extend(npu_images(images, B, tmp, outdir, extra))
+    GE.ACT_PERM = None
     return out
 
 
-def npu_dcol_images(images, B, tmp, outdir, extra=()):
-    """The decoder-column images (NPU_DCOL): per (format, site K) the gated GEMM reading raw rows of that K, per format
-    its decoder swap image; dispatch.txt "npudcol <cols>", "npubytes_5120" and "npurows". extra: more (cfg, name, np)
-    images (npu_ffnblk; np: their gen_npu_gemm NP)."""
+def npu_images(images, B, tmp, outdir, extra=()):
+    """The NPU images: per (format, site K) the gated GEMM reading raw rows of that K; dispatch.txt "npudcol <cols>",
+    "npubytes_5120" and "npurows". extra: more (cfg, name, np) images (npu_ffnblk; np: their gen_npu_gemm NP)."""
     import concurrent.futures
     sys.path.insert(0, os.path.dirname(HERE))
     import hrx_paths
-    jobs = []
-    for fmt, K in sorted(images):
-        if NPU_FUSE:
-            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, kraw=K,
-                            fmt=DCOL_FMTS[fmt][0], **KCHAIN(fmt))
-        else:
-            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
-                            kraw=K)
-        jobs.append((cfg, "npu_dcol_%s_%d" % (fmt, K), None, GN.NP))
-    for fmt in sorted({f for f, _ in images} if not NPU_FUSE else ()):
-        cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0])
-        jobs.append((cfg, "npu_dcol_%s.swap" % fmt, "swap", GN.NP))
-    jobs += [(cfg, name, mode, np_) for cfg, name, mode, np_ in extra]
+    assert images, "an NPU split needs a site the NPU computes"
+    jobs = [(npu_cfg(B, NPU_KS, NPU_PASSES, kraw=K, fmt=DCOL_FMTS[fmt][0], **KCHAIN(fmt)), "npu_dcol_%s_%d" % (fmt, K),
+             GN.NP) for fmt, K in sorted(images)]
+    jobs += list(extra)
+
     # sources and environments first (gen_npu_gemm's NP is module state), then the compiles in parallel
-    def source(cfg, name, mode, np_):
-        if cfg.gate and NPU_GFIRST:
-            cfg = dataclasses.replace(cfg, gfirst=1)
-        with GN.np_override(*(np_ if isinstance(np_, tuple) else (np_,))):
+    def source(cfg, name, np_):
+        with GN.np_override(np_):
             src = os.path.join(tmp, name + ".loom")
             open(src, "w").write(GN.gen(cfg))
-            return cfg, name, src, dict(hrx_paths.env(), **GN.loom_env(cfg, mode == "swap"))
+            return cfg, name, src, dict(hrx_paths.env(), **GN.loom_env(cfg))
 
     def compile_one(b):
         cfg, name, src, env = b
@@ -1284,20 +1085,18 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
                 print("%s: %s (program memory)" % (jobs[i][1], msg), file=sys.stderr)
             for i, r in zip(redo, ex.map(compile_one, [source(*jobs[i]) for i in redo])):
                 rs[i] = r
-    for (cfg, name, _, _), r in zip(jobs, rs):
+    for (cfg, name, _), r in zip(jobs, rs):
         if r.returncode:
-            raise SystemExit("NPU decoder-column compile failed (%s): %s" % (name, r.stderr[-800:]))
-    # a site's K = 5120 call (with no sites, the FFN block's gate / up activations still use its A)
-    cfg = jobs[0][0] if images else GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
-                                              fmt="IQ4_XS")
-    out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(cfg)), ("npurows", NPU_ROWS, 0, 0)]
-    return out + ([("npugfirst", 1, 0, 0)] if NPU_GFIRST else [])
+            raise SystemExit("NPU image compile failed (%s): %s" % (name, r.stderr[-800:]))
+    out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(jobs[0][0])),
+           ("npurows", NPU_ROWS, 0, 0)]
+    return out + [("npugfirst", 1, 0, 0)]
 
 
 def bfp_rows(names, outdir):
     """IQ2_S tensors the NPU takes (DCOL_FMTS "BFP"): each written pre-decoded to outdir/npu_bfp_<name>.bin, rows of
     K / 1024 units of 1152 bytes: unit (16-row slab b, pass u)'s decoder output ([kb 128 in KPERM order][h 2] bfp16
-    fragments of the exact f32 weights, gen_npu_dec.oracle) as its 16 rows (the engine binds it like raw rows)."""
+    fragments of the exact f32 weights, as gen_npu_dec decodes them) as its 16 rows (the engine binds it like raw rows)."""
     import gguf
     import numpy as np
     import npu_dec_emit as Q
@@ -1348,7 +1147,7 @@ def bfp_units(w, kperm):
 
 
 def bfp_site_rows(sites, outdir):
-    """YAH_NPU_BFPSITE: the site tensors (name, NPU rows) of formats without an NPU decoder, their last rows (the NPU's)
+    """The site tensors (name, NPU rows) of formats without an NPU decoder, their last rows (the NPU's)
     dequantized exactly (gguf quants) as BFP rows (bfp_units) to npu_bfp_<name>.bin."""
     import gguf
     import numpy as np
@@ -1371,7 +1170,7 @@ def bfp_site_rows(sites, outdir):
 
 
 def bfp_pair_rows(layers, F, outdir):
-    """YAH_NPU_BFPSW: the gate / up tensors of the pairs in layers (prefixes), their last F rows (the NPU's) decoded to
+    """The gate / up tensors of the pairs in layers (prefixes), their last F rows (the NPU's) decoded to
     their decoders' exact f32 weights (gen_npu_dec.weights; IQ2_S: iq2s_weights) as BFP rows (bfp_units), gate's then
     up's, to npu_bfp_<prefix>ffn_gate_up.bin (the engine's one BFP image binds them like a single format's)."""
     import gguf
@@ -1400,7 +1199,7 @@ def bfp_pair_rows(layers, F, outdir):
 
 
 def ix4_files(layers, sw, F, outdir):
-    """YAH_NPU_IX4: the FFN block's IQ3_S / IQ3_XXS gate / up tensors (layers: prefix -> kinds) transcoded
+    """The FFN block's IQ3_S / IQ3_XXS gate / up tensors (layers: prefix -> kinds) transcoded
     (gen_npu_dec.ix4_rows), their last F rows (the NPU's) only: sw layers (prefixes in sw) to
     npu_ix4_<prefix>ffn_gate_up.bin (gate's rows, then up's), the others to npu_ix4_<tensor>.bin (engine Ix4Rows)."""
     import gguf
@@ -1433,45 +1232,41 @@ def ix4_files(layers, sw, F, outdir):
 
 
 def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
-    """NPU_FFNBLK: the GPU's kernels of the FFN block (appended to out, split / variants: npu_split's) and its NPU images (returned
-    as npu_dcol_images extra jobs); dispatch.txt "npuffnblk <F>", "npubytes_ffnsw" / "npubytes_ffndn<passes>"."""
+    """NPU_FFNBLK: the GPU's kernels of the FFN block (appended to out, split / variants: npu_split's) and its NPU images
+    (returned as npu_images extra jobs); dispatch.txt "npuffnblk <F>", "npubytes_ffnsw" / "npubytes_ffndn<passes>"."""
     import gen_bfp16_encode as GE
     import gen_gemm_tile as TG
     import gen_npu_unpack as GU
     F = NPU_FFNBLK
-    assert NPU_DCOL and (F == 7168 or NPU_FUSE and F % 1024 == 0) and "ffn" not in NPU_SPLIT and AFRAG
-    assert B % AF_TILE["bn"] == 0
+    assert F % 1024 == 0 and B % AF_TILE["bn"] == 0
     by = {}
     for nm, dims, ty in rows:
         p = nm.split(".")
         if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up", "ffn_down") and E.FMT.get(ty):
             by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
-    fmts, dfmts = (FUSE_FFN_FMTS, FUSE_FFN_DOWN_FMTS) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS)
-    # H's k-block order: the down decoder's (fused: P4 but Q4_K's)
-    hord_of = (lambda d: "Q4K" if d == "q4k" else "P4") if NPU_FUSE else (lambda d: FFNBLK_HORD.get(d, ""))
-    rows = NPU_COLS * 64 if NPU_FUSE else NPU_ROWS   # down rows per call (fused: NP 4)
+    fmts, dfmts = FUSE_FFN_FMTS, FUSE_FFN_DOWN_FMTS
+    hord_of = lambda d: "Q4K" if d == "q4k" else "P4"   # H's k-block order: the down decoder's (P4 but Q4_K's)
+    rows = NPU_COLS * 64   # down rows per call (NP 4)
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
           and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in dfmts]
-    # gate and up of two formats: column pairs (gen_npu_gemm ufmt; fused sets: F features like the others)
-    pfmts, pdfmts, PF = (fmts, dfmts, F) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS, FFNBLK_PAIR)
-    # (also one format without a fused GPU gate / up: its gate kstore and up swiglu, like a pair's)
+    # gate and up of two formats, or one without a fused GPU gate / up (its gate kstore and up swiglu): pairs
     pairs = [l for l in by.values() if l.get("ffn_gate") and l.get("ffn_up")
              and (l["ffn_gate"][0] != l["ffn_up"][0] or l["ffn_gate"][0] not in AF_FFN)
-             and l["ffn_gate"][1:] == l["ffn_up"][1:] and l["ffn_gate"][0] in pfmts and l["ffn_up"][0] in pfmts
-             and l.get("ffn_down", ("",))[0] in pdfmts]
-    # pairs whose gate and up both take IQ4_XS's decoder (YAH_NPU_IX4): one image like a single format's, its up slabs
-    # gathering from their own kvalues table (gen_npu_gemm kv2), with the deferred epilogue ("npu_ffnsw_<gate>_<up>")
-    mixed = [l for l in pairs if NPU_FUSE and {gu_fmt(l[kd][0]) for kd in ("ffn_gate", "ffn_up")} <= set(IX4_FAMILY)]
-    same = [l for l in pairs if NPU_FUSE and l["ffn_gate"][0] == l["ffn_up"][0] and l["ffn_gate"][0] in SAME_SW_FMTS]
-    bsw = [l for l in pairs if NPU_FUSE and NPU_BFPSW and l not in mixed + same]
+             and l["ffn_gate"][1:] == l["ffn_up"][1:] and l["ffn_gate"][0] in fmts and l["ffn_up"][0] in fmts
+             and l.get("ffn_down", ("",))[0] in dfmts]
+    # pairs whose gate and up both take IQ4_XS's decoder (IX4_FAMILY): one image like a single format's, its up slabs
+    # gathering from their own kvalues table (gen_npu_gemm kv2), with the deferred epilogue ("npu_ffnsw_<gate>_<up>");
+    # the other pairs take the BFP image (bsw)
+    mixed = [l for l in pairs if {gu_fmt(l[kd][0]) for kd in ("ffn_gate", "ffn_up")} <= set(IX4_FAMILY)]
+    bsw = [l for l in pairs if l not in mixed]
     bfp_rows({"blk.%s.%s.weight" % (n, kd) for n, l in by.items() if l in ok + pairs
               for kd in ("ffn_gate", "ffn_up", "ffn_down") if l.get(kd, ("",))[0] == "iq2s"
               and not (l in bsw and kd != "ffn_down")}, outdir)
     bfp_pair_rows({"blk.%s." % n for n, l in by.items() if l in bsw}, F, outdir)
-    if NPU_IX4:   # sw layers: gate and up in one file (the image's dgu); pairs: per tensor; the NPU's rows only
-        ix4_files({"blk.%s." % n: [kd for kd in ("ffn_gate", "ffn_up") if l[kd][0] in IX4_FMTS]
-                   for n, l in by.items() if l in ok + pairs and l not in bsw},
-                  {"blk.%s." % n for n, l in by.items() if l in ok + mixed}, F, outdir)
+    # sw layers: gate and up in one file (the image's dgu); pairs: per tensor; the NPU's rows only
+    ix4_files({"blk.%s." % n: [kd for kd in ("ffn_gate", "ffn_up") if l[kd][0] in IX4_FMTS]
+               for n, l in by.items() if l in ok + pairs and l not in bsw},
+              {"blk.%s." % n for n, l in by.items() if l in ok + mixed}, F, outdir)
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
         hords = sorted({hord_of(l["ffn_down"][0]) for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
@@ -1481,39 +1276,13 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
                     split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), F)
             blk = GN.decoder(gu_fmt(fmt)).BLK
-            name = "npu_ffnsw_%s%s" % (fmt, hord and "_" + hord.lower())
-            if NPU_FUSE:
-                dfr = fmt in NPU_DFR_FMTS
-                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, mu=1,
-                                       gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32,
-                                       hpass=F // 1024, hord=hord, fmt=gu_fmt(fmt), dfr=int(dfr)), name, None, 4))
-                continue
-            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
-                                   fmt=DCOL_FMTS[fmt][0], swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024,
-                                   hpass=F // 1024, hord=hord), name, None, 4))
-            jobs.append((jobs[-1][0], name + ".swap", "swap", 4))
+            dfr = fmt in NPU_DFR_FMTS
+            jobs.append((npu_cfg(B, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk,
+                                 swcol=32, hpass=F // 1024, hord=hord, fmt=gu_fmt(fmt), dfr=int(dfr)),
+                         "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 4))
     parts = ffnblk_parts(F)
-    for fmt, mt, kb, kbw in sorted({l["ffn_down"] + ((l["ffn_down"][2] * 256 - F) // 256,) for l in ok} |
-                                   {l["ffn_down"] + ((l["ffn_down"][2] * 256 - PF) // 256,) for l in pairs}):
-        if NPU_FUSE and NPU_FFNRES:   # the GPU's K window as the residual GEMM, adding the NPU's down partials
-            with GN.np_override(4):
-                dcfg = GN.Config(NPU_COLS, B // 64, NPU_KS, parts[0][1], mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2,
-                                 kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0])
-                cp, tn, calls = GN.stream_bytes(dcfg)[2], GN.TN, -(-5120 // rows)
-            assert rows == NPU_COLS * tn and 5120 % rows == 0
-            tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb, "kres"), mt)
-            add = dict(rows=rows, tn=tn, np=4, call=cp // 2, calls=calls, parts=len(parts), tokens=B)
-
-            def gen_res(f, k, tr=tr, kb=kb, add=add):
-                TG.KWIN, TG.NPUADD = (0, kb), add
-                try:
-                    return TG.gen(f, "kres", tr, False)
-                finally:
-                    TG.KWIN = TG.NPUADD = None
-            out.append(_emit_gen(gen_res, tr.bn, fmt, mt, kbw, B, "npuffnres_%s_%d.hal" % (fmt, kbw), outdir, "kres",
-                                 tr.rowgrp, kfull=kb, npuc=len(parts) * calls * cp))
-            continue
-        # the GPU's K window [0, 17408 - F)
+    # the GPU's K window [0, 17408 - F)
+    for fmt, mt, kb, kbw in sorted({l["ffn_down"] + ((l["ffn_down"][2] * 256 - F) // 256,) for l in ok + pairs}):
         tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb), mt)
 
         def gen_rem(f, k, tr=tr, kb=kb):
@@ -1525,68 +1294,42 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         assert mt not in O16_MT, "the window writes f32"
         out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d.hal" % (fmt, kbw), outdir, "kstore",
                              tr.rowgrp, kfull=kb))
-    for fmt, mt, kb in sorted({l["ffn_down"] for l in ok} | {l["ffn_down"] for l in pairs}):
-        for passes in sorted({p for _, p in parts + (ffnblk_parts(PF) if pairs else ())}):
-            if NPU_FUSE:
-                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2,
-                                       kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0],
-                                       **KCHAIN(fmt)),
-                             "npu_ffndn%d_%s" % (passes, fmt), None, 4))
-                continue
-            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
-                                   kraw=kb * 256, ain="h", hpass=F // 1024, gord="N"), "npu_ffndn%d_%s" % (passes, fmt),
-                         None, GN.NP))
-            jobs.append((jobs[-1][0], "npu_ffndn%d_%s.swap" % (passes, fmt), "swap", GN.NP))
-    for (gf, mt, kb), (uf, _, _), hord in sorted({(l["ffn_gate"], l["ffn_up"], hord_of(l["ffn_down"][0]) if NPU_FUSE
-                                                   else FFNBLK_HORD.get(l["ffn_down"][0], "")) for l in pairs}):
-        # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = PF)
-        variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), PF)
-        variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), PF)
-        name = "npu_ffnsp_%s_%s%s" % (gf, uf, hord and "_" + hord.lower())
+    for fmt, mt, kb in sorted({l["ffn_down"] for l in ok + pairs}):
+        for passes in sorted({p for _, p in parts}):
+            jobs.append((npu_cfg(B, NPU_KS, passes, kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0],
+                                 **KCHAIN(fmt)), "npu_ffndn%d_%s" % (passes, fmt), 4))
+    for (gf, mt, kb), (uf, _, _), hord in sorted({(l["ffn_gate"], l["ffn_up"], hord_of(l["ffn_down"][0]))
+                                                  for l in pairs}):
+        # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = F)
+        variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), F)
+        variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), F)
         if any(l in bsw for l in pairs if (l["ffn_gate"], l["ffn_up"]) == ((gf, mt, kb), (uf, mt, kb))):   # (BFP)
             if "npu_ffnsw_bfp_" + hord.lower() not in {j[1] for j in jobs}:
-                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_DFR_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1,
-                                       ghelp=1, fuse=2, swiglu=True, dgu=mt * 16 * kb * 288, swcol=32, hpass=F // 1024,
-                                       hord=hord, fmt="BFP", dfr=1), "npu_ffnsw_bfp_" + hord.lower(), None, 4))
+                jobs.append((npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * 288, swcol=32,
+                                     hpass=F // 1024, hord=hord, fmt="BFP", dfr=1), "npu_ffnsw_bfp_" + hord.lower(), 4))
             continue
-        if NPU_FUSE and ({gu_fmt(gf), gu_fmt(uf)} <= set(IX4_FAMILY) or gf == uf and gf in SAME_SW_FMTS):   # (mixed)
-            blk = GN.decoder(gu_fmt(gf)).BLK
-            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_DFR_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1,
-                                   fuse=2, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024, hord=hord,
-                                   fmt=gu_fmt(gf), kv2=gu_fmt(uf) if gf != uf else "", dfr=1),
-                         "npu_ffnsw_%s_%s%s" % (gf, uf, hord and "_" + hord.lower()), None, 4))
-            continue
-        if NPU_FUSE:   # pair u: gate column 2 u, up column 2 u + 1, features 256 j + 64 u + [0, 64) of call j
-            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, swiglu=True,
-                                   pnbr=1, swcol=64, hpass=F // 1024, hord=hord, fmt=gu_fmt(gf), ufmt=gu_fmt(uf),
-                                   gord="GF" if "q4k" in (gf, uf) and hord == "P4" else "P4"),
-                         name, None, (4, True)))
-            continue
-        jobs.append((GN.Config(6, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[gf][0],
-                               ufmt=DCOL_FMTS[uf][0], swiglu=True, swcol=2048, hpass=F // 1024, hord=hord),
-                     name, None, (4, True)))
-        jobs.append((jobs[-1][0], name + ".swap", "swap", (4, True)))
-    # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each); fused
-    # sets add them in the GPU window's residual epilogue (npuffnres) unless NPU_FFNRES is off
+        blk = GN.decoder(gu_fmt(gf)).BLK   # (mixed)
+        jobs.append((npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024,
+                             hord=hord, fmt=gu_fmt(gf), kv2=gu_fmt(uf) if gf != uf else "", dfr=1),
+                     "npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower()), 4))
+    # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each)
     N, calls = 5120, -(-5120 // rows)
-    assert not pairs or len(ffnblk_parts(PF)) == len(parts)
     # token halves (LoomPrefill halves): "_h<i>" unpacks half i's tokens of the same C
-    if not (NPU_FUSE and NPU_FFNRES):
-        for name, tr in (("npu_unpack_ffnblk", None),) + tuple(("npu_unpack_ffnblk_h%d" % h, (h * B // 2, B // 2))
-                                                                for h in range(2) if npu_halves(B)):
-            cg = GU.CG
-            GU.CG = 1
-            try:
-                with GN.np_override(4 if NPU_FUSE else GN.NP):
-                    text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
-                                  dup=((calls - 1) * NPU_COLS, N - rows), trange=tr)
-                    nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
-            finally:
-                GU.CG = cg
-            src = os.path.join(tmp, name + ".loom")
-            open(src, "w").write(text)
-            E.emit(src, ["nop=0"], name + ".hal", outdir)
-            out.append((name + ".hal", (tr[1] if tr else B) * calls * NPU_COLS * nj // wg, wg, 0))
+    for name, tr in (("npu_unpack_ffnblk", None),) + tuple(("npu_unpack_ffnblk_h%d" % h, (h * B // 2, B // 2))
+                                                            for h in range(2) if npu_halves(B)):
+        cg = GU.CG
+        GU.CG = 1
+        try:
+            with GN.np_override(4):
+                text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
+                              dup=((calls - 1) * NPU_COLS, N - rows), trange=tr)
+                nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
+        finally:
+            GU.CG = cg
+        src = os.path.join(tmp, name + ".loom")
+        open(src, "w").write(text)
+        E.emit(src, ["nop=0"], name + ".hal", outdir)
+        out.append((name + ".hal", (tr[1] if tr else B) * calls * NPU_COLS * nj // wg, wg, 0))
     # gate / up read their activations in one replay group: the norm before them writes that stream (fragment-major)
     import gen_half_norm
     groups, perm = GE.GROUPS, GE.ACT_PERM
@@ -1606,26 +1349,21 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     for fmt in NPU_DFR_FMTS:
         if gu_fmt(fmt) in dfrs:
             out.append(("npuffndfr_" + fmt, 1, 0, 0))
-    if NPU_IX4:
-        out.append(("npuffnix4", 1, 0, 0))
-    for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in mixed + same + bsw}):
+    out.append(("npuffnix4", 1, 0, 0))
+    for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs}):
         out.append(("npuffndfr_%s_%s" % (gf, uf), 1, 0, 0))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in bsw}):
         out.append(("npuffnbx_%s_%s" % (gf, uf), 1, 0, 0))
-    out.append(("npuffnblk", F, 256 if NPU_FUSE else 224, rows))   # F, gate / up features per call, down rows
+    out.append(("npuffnblk", F, 256, rows))   # F, gate / up features per call, down rows
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):
         out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
-    for passes in sorted({p for _, p in parts + (ffnblk_parts(PF) if pairs else ())}):
+    for passes in sorted({p for _, p in parts}):
         dn = next(j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes))
-        with GN.np_override(dn[3]):
+        with GN.np_override(dn[2]):
             out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
-    sp = next((j for j in jobs if j[1].startswith("npu_ffnsp_")), None)
-    if sp:
-        with GN.np_override(4, True):
-            out.append(("npubytes_ffnsp",) + tuple(GN.stream_bytes(sp[0])))
-    if pairs:   # (also the mixed / BFP pairs': their GPU side's features)
-        out.append(("npuffnpair", PF, 0, 0))
+    if pairs:   # (the mixed / BFP pairs': their GPU side's features)
+        out.append(("npuffnpair", F, 0, 0))
     return jobs
 
 
@@ -1645,11 +1383,10 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
-def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, sym=None, kfull=0, npuc=0):
+def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, kfull=0):
     """ostride: a GEMM over the leading mt * 16 rows of an ostride-row output (gen_gemm_tile.OSTRIDE, the NPU split's GPU share);
-    f16 output then follows the full shape (O16_MT). sym: the kernel symbol, if not the GEMM's or the dequant's.
-    kfull: a K-chunk dequant's whole-row k_blocks (gen_gemm_tile.DQ_BFP). npuc: the bytes of NPU C a gen_gemm_tile.NPUADD
-    epilogue reads."""
+    f16 output then follows the full shape (O16_MT).
+    kfull: a K window's whole-row k_blocks (gen_gemm_tile.KWIN)."""
     if B % tile and not masked:
         return None
     import gen_gemm_tile as _TG
@@ -1664,14 +1401,10 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
             fh.write(gen(fmt, kind))
     finally:
         _TG.OSTRIDE = 0
-    if sym is None:
-        sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
-        if kind == "dequant":
-            sym = "yah_dequant_" + fmt
+    sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     gate = [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []) \
-        + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else []) \
-        + (["npuc=%d" % npuc] if npuc else [])
+        + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else [])
     E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)]
            + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir, gate=gate)
     return (out, tile, rowgrp, tt)
@@ -1749,7 +1482,7 @@ def main():
     geom = []  # (<hal>, <tokens per workgroup>, <row groups>, <token_tiles>)
     if EMIT_HALF:   # a half set: no GEMMs of its own (the NPU split's GPU shares come from npu_split)
         NPU_FFNBLK = 0
-        assert not {"ffn", "down"} & set(NPU_SPLIT) and T % (2 * B) == 0
+        assert T % (2 * B) == 0
     for kind, fmt, port, mt, kb in sorted(combos) if not EMIT_HALF else ():
         name = lambda k: "gemm_%s_%s_%d_%d.hal" % (k, fmt, mt, kb)
         # A residual projection gets a kstore and the fused-residual kres; the attention q projection (12288 rows =
@@ -1774,17 +1507,14 @@ def main():
 
     if not EMIT_HALF:
         geom.extend(ffn_fused(rows, B, outdir))
-        if KST2:
-            geom.extend(kst2(rows, B, outdir))
-        if SEG:
-            geom.extend(seg_gemms(rows, B, outdir))
+        geom.extend(kst2(rows, B, outdir))
+        geom.extend(seg_gemms(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
         import gen_bfp16_encode as GE
         import gen_npu_unpack as GU
-        # fused sets: one replay group per call (the fillers' W-DMA raw ring hangs with two), so C is one partial
+        # one replay group per call (the fillers' W-DMA raw ring hangs with two), so C is one partial
         groups, cg = GE.GROUPS, GU.CG
-        if NPU_FUSE:
-            GE.GROUPS, GU.CG = (NPU_PASSES,), 1
+        GE.GROUPS, GU.CG = (NPU_PASSES,), 1
         try:
             with GN.np_override(NPU_NP):
                 geom.extend(npu_split(rows, combos, B, outdir))
@@ -1898,7 +1628,7 @@ def main():
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
     af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
     if EMIT_HALF:   # the whole set's (its o-projections' afrag forms)
-        af24 = AFRAG and B % AF_TILE["bn"] == 0 and any(
+        af24 = B % AF_TILE["bn"] == 0 and any(
             AF.get((fmt, "kres", mt, kb)) is not None for kind, fmt, port, mt, kb in combos
             if kind == "residual" and (mt, kb) == (320, 24))
     attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
@@ -2081,25 +1811,18 @@ def main():
 
     # DeltaNet: chunked WY Gated DeltaNet (tools/gen_gdn_chunk.py), f16 WMMA inputs.
     # Its grid (2, heads) is recorded as rowsplit.hal's row group.
-    # It needs B % 32 == 0; else the recurrent kernel (tools/gen_deltanet_hip.py, same ABI and grid).
+    # It needs B % 32 == 0 (main's token tile 64 holds it).
     dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
-    open(dn_src, "w").write(gen_gdn_chunk.gen() if dn32(B) else gen_deltanet_hip.gen())
-    # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
+    open(dn_src, "w").write(gen_gdn_chunk.gen())
+    # the conv pairs with the DeltaNet kernel: f16 normalized hand-off
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
-    conv_tb = conv_tb_ok(B)
-    dn_vconv = (DNVCONV and conv_tb and DNSS_NAT and B % 32 == 0 and DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT
-                and not EMIT_HALF)
+    assert 640 in O16_MT and B % gen_conv_kq.TB == 0
+    dn_vconv = DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT and not EMIT_HALF
     if dn_vconv:
         text = gen_conv_kq.gen(4096)
         geom.append(("dnvconv", gen_conv_kq.tiles(4096), 0, 0))
-    elif conv_tb:
-        text = gen_conv_kq.gen()
     else:
-        text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
-        if 640 in O16_MT:
-            text = conv_x16(text)
-        if dn32(B) and gen_gdn_chunk.CONV16:
-            text = conv_n16(text)
+        text = gen_conv_kq.gen()
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
     prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
@@ -2110,12 +1833,12 @@ def main():
         postnorm_base = postnorm_g16(postnorm_base)
     postnorm_src = os.path.join(tmp, "yah_ssm_postnorm.loom")
     open(postnorm_src, "w").write(postnorm_base)
-    dn_ss = dn_vconv   # DNSS_NAT: the DeltaNet parts on the state-stationary kernel
+    dn_ss = dn_vconv   # the DeltaNet parts on the state-stationary kernel
     # blocks per head of the DeltaNet grid (the unsplit rowsplit.hal is not dispatched with dnsplit)
     geom.append(("rowsplit.hal", 0, 1 if dn_ss else 2, 0))
     geom.append(("dnthreads", gen_gdn_ss.THREADS if dn_ss else 256, 0, 0))
     dn_parts = []
-    if dn32(B) and DNSPLIT:
+    if DNSPLIT:
         ha, hb = DNSPLIT
         for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
             src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
@@ -2125,8 +1848,7 @@ def main():
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
         geom.append(("dnsplit", 0, ha, hb))
-    if conv_tb:
-        geom.append(("convtb", gen_conv_kq.TB, 0, 0))
+    geom.append(("convtb", gen_conv_kq.TB, 0, 0))
 
     # loom_forward_pp reads the launch geometry from dispatch.txt instead of recomputing the grid.
     # So the dispatch site and the compiled kernel cannot disagree; a mismatch is silent and wrong, not a crash.
@@ -2275,7 +1997,7 @@ def main():
         ("yah_unpack_qg_f32.loom", "unpack.hal",
          ["yah_unpack_qg.batch=%d" % B, "yah_unpack_qg.num_heads=24",
           "yah_unpack_qg.head_dim=256"]),
-        *[(src_, stem_ + ".hal" if c == 0 else stem_ + "_c%d.hal" % c, [
+        *[(rope_src, "rope.hal" if c == 0 else "rope_c%d.hal" % c, [
             "yah_fused_qk_rope_batched.start_pos=%d" % (c * B),
             "yah_fused_qk_rope_batched.batch=%d" % B,
             "yah_fused_qk_rope_batched.layer_idx=0",
@@ -2289,8 +2011,7 @@ def main():
             "yah_fused_qk_rope_batched.cache32_elems=%d" % KC,
             "yah_fused_qk_rope_batched.cache16_elems=%d" % (1024 * B if kv16_scratch else KC),
             *(["yah_fused_qk_rope_batched.cache_start=%d" % (c * B)] if kv16_scratch else []),
-            *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)
-          for src_, stem_ in ((rope_src, "rope"),)],
+            *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)],
         *([(qrot_src, "qrot.hal", ["yah_qrot.token_count=%d" % B])] if qrot_first < NCH else []),
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c),
            ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)]

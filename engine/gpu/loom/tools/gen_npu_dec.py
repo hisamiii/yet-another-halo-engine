@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""NPU weight decoders for the fill column of gen_npu_gemm (dcol = 2), one per GGUF format (DQ_FMT: IQ4_XS, Q4_K, IQ3_S,
-IQ3_XXS, IQ2_XXS, IQ2_XS, Q3_K; the module's constants follow DQ_FMT at import, gen_npu_gemm.decoder reloads it per format).
-Standalone check: DQ_FMT=<fmt> [DQ_PORTS=2] gen_npu_dec.py <work> <model.gguf> (decodes 80 rows per port of the
-first matching K = 5120 tensor and compares every fragment with the oracle, bit for bit).
+"""NPU weight decoders, inlined into the fused GEMM cores of gen_npu_gemm (fuse 2), one per GGUF format (DQ_FMT: IQ4_XS,
+Q4_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, Q3_K; the module's constants follow DQ_FMT at import, gen_npu_gemm.decoder reloads it
+per format).
+Checked inside the fused GEMM: NPU_FUSE=2 NPU_FMT=<fmt> npu_gemm_check.py (the decoded panels against weights(),
+bit for bit). Tried, not kept: a standalone decoder array with one or two ports (the fill column's).
 The IQ4_XS decoder (16-row panel units):
 Input record (one panel unit): [16 rows][4 super-blocks x 136 B] (the (pass, slab) unit read from the row-major GGUF
-tensor by an iterated shim view). Output: 4 leaf-synchronized records of 64 bfp16 fragments (super-block j of the
-unit), in panel order [kb 32][h 2] (h = rows 0-7 / 8-15).
+tensor by an iterated shim view). Output: 2 records a super-block (records 2 j, 2 j + 1 of super-block j: no ring) of
+bfp16 fragments in panel order [kb][h 2] (h = rows 0-7 / 8-15).
 Per super-block: both halves are prepped (header words; qs rows realigned by vshift and transposed to [chunk][row][8 B];
 the IQ4_XS scale path into the half's TB), then 8 sub-block iterations of 4 chunk-halves (chunks 2 s, 2 s + 1 x h):
 the low-nibble fragments are pushed in order, the high-nibble accumulators parked and pushed after them.
 """
-import os, subprocess, sys
+import os, sys
 os.environ.setdefault("LS_LAT", "vshuffle=3")     # the packer's shuffle spacing (measured: 520 -> 505 bundles)
 import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, ".."))
-import hrx_paths
 import npu_dec_emit as Q
 I = Q
 from npu_dec_emit import Emit, V1, V2, V4, M1, M2, M4
@@ -104,8 +104,7 @@ if BFP:
     SCR_B = SCR2_B = 64
 TABV, BASEV = [TAB], ["%sp"]
 KV = KVX.get(FMT0, I.KV) if FMT == "IQ4_XS" else [float(v) for v in range(16)]
-OUTCAP = 2
-INLINE = [0]                    # leaf_inline: super-blocks per input record (0: a standalone leaf)
+INLINE = [0]                    # leaf_inline: super-blocks per input record (set while it runs leaf)
 VROLL = [False]                 # leaf_inline: the scale halves rolled whatever the format (program memory)
 TONCE = [True]                  # leaf_inline: the table built once per fill (flag at TFLAG), else every invocation
 TFLAG = 32                      # leaf_inline: the table-built flag's byte offset in the caller's private storage %fzs
@@ -121,7 +120,6 @@ NIB = 0                         # Q3_K: storage B nibble rows per half: hmask ni
                                 # 2048 + 256 h + 64 c
 KVT = list(range(16)) if FMT == "Q4_K" else None    # the gather table's values (IQ4_XS: its kvalues)
 CTOFF = 0                       # splat-constant table in storage A (DQ_CT; 0 = timing ablation: the table area)
-DUMP = False
 
 
 def bf16_bits_np(v):
@@ -175,21 +173,18 @@ def grid_rodata(name):
             f'global.rodata.def @gs_{name} = align(256) conflicts([@gt_{name}]) bytes("{hexs(st)}")']
 
 
-def leaf(name="dec", nports=1):
+def leaf(name="dec"):
+    """The decoder's core function; only leaf_inline's form is emitted (INLINE[0] super-blocks, no output ring)."""
+    assert INLINE[0], "leaf_inline only"
     e = Emit()
     e.L.append(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
 
-    for pp_ in range(nports):
-        sfx = "" if pp_ == 0 else str(pp_)
-        e(f"%in{sfx} = resource<native_pointer> {{index = {pp_}, source_type = buffer}} : reg<aie2p.ep>")
-    for pp_ in range(nports):
-        sfx = "" if pp_ == 0 else str(pp_)
-        e(f"%out{sfx} = resource<native_pointer> {{index = {nports + pp_}, source_type = buffer}} : reg<aie2p.ep>")
-    pad_a = int(os.environ.get("DQ_PADA", "0"))      # standalone tests: push storage A out of storage B's bank
-    e(f"%scr = storage {{byte_alignment = 64, byte_length = {SCR_B + pad_a}}} : low.storage<private>")
+    e("%in = resource<native_pointer> {index = 0, source_type = buffer} : reg<aie2p.ep>")
+    e("%out = resource<native_pointer> {index = 1, source_type = buffer} : reg<aie2p.ep>")
+    e(f"%scr = storage {{byte_alignment = 64, byte_length = {SCR_B}}} : low.storage<private>")
     # storage B in its own space: one region per space, so the gathers (table in A) and the address / T-part loads (B)
     # can sit in different banks (both in one bank: a conflict in nearly every hot-loop bundle)
-    sp2 = os.environ.get("DQ_SPACE2", "scratch")
+    sp2 = "scratch"
     e(f"%scr2 = storage {{byte_alignment = 64, byte_length = {SCR2_B}}} : low.storage<{sp2}>")
     e(f"%sp2 = storage_address %scr2 : low.storage<{sp2}> -> reg<aie2p.ep>")
     e("%sp = storage_address %scr : low.storage<private> -> reg<aie2p.ep>")
@@ -326,10 +321,8 @@ def leaf(name="dec", nports=1):
         return r4
 
 
-    for pp_ in range(nports):
-        sfx = "" if pp_ == 0 else str(pp_)
-        e(f"%ina{sfx} = mov.address-to-scalar %in{sfx}")
-        e(f"%outa{sfx} = mov.address-to-scalar %out{sfx}")
+    e("%ina = mov.address-to-scalar %in")
+    e("%outa = mov.address-to-scalar %out")
     e("%spa = mov.address-to-scalar %sp")
     e("%spb = mov.address-to-scalar %sp2")
     e(f"%cgt = lshl %spa, {k(-3)}")                  # (GT = 0) >> 3: u16 b + it, << 3 = GT + 8 b (GT < 0x7F800)
@@ -377,20 +370,15 @@ def leaf(name="dec", nports=1):
     elif not Q3K and not GF:
         # ---- table (once per invocation of the program: a flag in private storage)
         tb_, tdone = label("tbuild"), label("tdone")
-        if INLINE[0] and not TONCE[0]:                      # every invocation (program memory)
+        if not TONCE[0]:                      # every invocation (program memory)
             e(f"low.br ^{tb_}")
-        elif INLINE[0]:   # the storages are the caller's scratch: built once per fill (the caller clears the flag)
+        else:   # the storages are the caller's scratch: built once per fill (the caller clears the flag)
             e("%tfp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
             e("%tfs = mov.address-to-scalar %tfp")
             e(f"%tft = add %tfs, {TFLAG}")
             e("%tfr = mov.scalar-to-address %tft")
             e("%tflag = lda %tfr, 0")
             e(f"low.cond_br %tflag, ^{tdone}, ^{tb_} : reg<aie2p.er>")
-        else:
-            stp = P(e, "%spa", STATE)
-            e(f"%tflag = lda {stp}, 0")
-            e(f"%tx = xor %tflag, {k(0x5A5A1234)}")          # private storage starts undefined: a magic marks the table
-            e(f"low.cond_br %tx, ^{tb_}, ^{tdone} : reg<aie2p.er>")
         e.L.append(f"^{tb_}:")
         kvs = KV + 2 * (KV2 or [])   # (KV2 at +32: %kvv's lanes 16-31, and at +64: a 64-byte aligned load)
         for i in range(len(kvs) // 2):
@@ -413,45 +401,38 @@ def leaf(name="dec", nports=1):
                 for blk, hv_ in ((0, h0), (1, h1)):
                     for half in range(2):
                         e(f"vst.256.i16x16 {hv_}, {pg}, {64 * blk + 32 * half}")
-        if INLINE[0] or os.environ.get("DQ_TROLL") == "1":   # rolled (program memory; DQ_TROLL=1: standalone test)
-            e(f"%tla0 = add.rr %spa, {k(GT)}")
-            e(f"%tlb0 = add.rr %spb, {k(GT2)}")
-            e(f"low.br ^tlh({k(0)}: reg<aie2p.er>, %tla0: reg<aie2p.er>, %tlb0: reg<aie2p.er>)")
-            e.L.append("^tlh(%tl_i: reg<aie2p.er>, %tla: reg<aie2p.er>, %tlb: reg<aie2p.er>):")
-            e(f"%tl_m = lt %tl_i, {k(32 if KV2 else 16)}")
-            e("low.cond_br %tl_m, ^tlb, ^tlx : reg<aie2p.er>")
-            e.L.append("^tlb:")
-            e.L.append("// LOOP-BEGIN")
-            e("%tlkb = vextract.16.reg %kvv, %tl_i")       # (not a load: the KV words were just stored)
-            e("%tlpa = mov.scalar-to-address %tla")
-            e("%tlpb = mov.scalar-to-address %tlb")
-            if KV2:   # line i of table i // 16: its values from the KV words at KVS + 64 (i // 16)
-                e(f"%tlq = lshl %tl_i, {k(-4)}")
-                e(f"%tlq5 = lshl %tlq, {k(6)}")
-                e(f"%tlkq = add.rr %spa, %tlq5")
-                e(f"%tlkr = add.rr %tlkq, {k(KVS)}")
-                e("%tlkp = mov.scalar-to-address %tlkr")
-                e("%kvl = vlda.512.bf16x32 %tlkp, 0")
-            tline(None, "%tlkb", "%tlpa", "%tlpb", "%kvl" if KV2 else "%kvv")
-            e(f"%tla1 = add.rr %tla, {k(128)}")
-            e(f"%tlb1 = add.rr %tlb, {k(128)}")
-            e("%tl_n = add %tl_i, 1")
-            e("low.br ^tlh(%tl_n: reg<aie2p.er>, %tla1: reg<aie2p.er>, %tlb1: reg<aie2p.er>)")
-            e.L.append("// LOOP-END")
-            e.L.append("^tlx:")
-            if INLINE[0] and TONCE[0]:
-                e("%tfq = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
-                e("%tfqs = mov.address-to-scalar %tfq")
-                e(f"%tfqt = add %tfqs, {TFLAG}")
-                e("%tfqr = mov.scalar-to-address %tfqt")
-                e(f"st {k(1)}, %tfqr, 0")
-        else:
-            assert not KV2, "DQ_KV2: inlined decoders only"
-            for m in range(16):
-                e(f"%kb{m} = mov.i32 {I.bf16_bits(KV[m])}")
-                tline(m, f"%kb{m}", None, None)
-            stp2 = P(e, "%spa", STATE)
-            e(f"st {k(0x5A5A1234)}, {stp2}, 0")
+        # rolled (program memory)
+        e(f"%tla0 = add.rr %spa, {k(GT)}")
+        e(f"%tlb0 = add.rr %spb, {k(GT2)}")
+        e(f"low.br ^tlh({k(0)}: reg<aie2p.er>, %tla0: reg<aie2p.er>, %tlb0: reg<aie2p.er>)")
+        e.L.append("^tlh(%tl_i: reg<aie2p.er>, %tla: reg<aie2p.er>, %tlb: reg<aie2p.er>):")
+        e(f"%tl_m = lt %tl_i, {k(32 if KV2 else 16)}")
+        e("low.cond_br %tl_m, ^tlb, ^tlx : reg<aie2p.er>")
+        e.L.append("^tlb:")
+        e.L.append("// LOOP-BEGIN")
+        e("%tlkb = vextract.16.reg %kvv, %tl_i")       # (not a load: the KV words were just stored)
+        e("%tlpa = mov.scalar-to-address %tla")
+        e("%tlpb = mov.scalar-to-address %tlb")
+        if KV2:   # line i of table i // 16: its values from the KV words at KVS + 64 (i // 16)
+            e(f"%tlq = lshl %tl_i, {k(-4)}")
+            e(f"%tlq5 = lshl %tlq, {k(6)}")
+            e(f"%tlkq = add.rr %spa, %tlq5")
+            e(f"%tlkr = add.rr %tlkq, {k(KVS)}")
+            e("%tlkp = mov.scalar-to-address %tlkr")
+            e("%kvl = vlda.512.bf16x32 %tlkp, 0")
+        tline(None, "%tlkb", "%tlpa", "%tlpb", "%kvl" if KV2 else "%kvv")
+        e(f"%tla1 = add.rr %tla, {k(128)}")
+        e(f"%tlb1 = add.rr %tlb, {k(128)}")
+        e("%tl_n = add %tl_i, 1")
+        e("low.br ^tlh(%tl_n: reg<aie2p.er>, %tla1: reg<aie2p.er>, %tlb1: reg<aie2p.er>)")
+        e.L.append("// LOOP-END")
+        e.L.append("^tlx:")
+        if TONCE[0]:
+            e("%tfq = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+            e("%tfqs = mov.address-to-scalar %tfq")
+            e(f"%tfqt = add %tfqs, {TFLAG}")
+            e("%tfqr = mov.scalar-to-address %tfqt")
+            e(f"st {k(1)}, %tfqr, 0")
         e(f"low.br ^{tdone}")
         e.L.append(f"^{tdone}:")
 
@@ -647,45 +628,10 @@ def leaf(name="dec", nports=1):
         x(f"{a_} = vadd.8 {z}, {b8(33)}")
         return a_
 
-    # ---- super-block loop (port 0; other ports are renamed copies of its section)
-    PLOOP = nports > 1 and os.environ.get("DQ_PLOOP", "0" if FMT == "IQ4_XS" else "1") == "1"   # one code copy for all ports (16 KiB limit; IQ4_XS fits twice: +2% without)
-    INA, OUTA = ["%ina"], ["%outa"]
-    lk = [0]
-
-    def lockop(op, val):
-        """acq / rel on the output ring of the current port (immediate port index: a branch per port in PLOOP)."""
-        if INLINE[0]:                                   # leaf_inline: the output is plain memory
-            return
-        if not PLOOP:
-            e(f"{op} {val}, {nports}")
-            return
-        lk[0] += 1
-        n_ = lk[0]
-        e(f"%lkv{n_} = or {val}, {k(0)}")          # before the branch: both arms use it (constants land at first use)
-        e(f"low.cond_br {PL[0]}, ^lk{n_}b, ^lk{n_}a : reg<aie2p.er>")
-        e.L.append(f"^lk{n_}a:")
-        e(f"{op} %lkv{n_}, {nports}")
-        e(f"low.br ^lk{n_}j")
-        e.L.append(f"^lk{n_}b:")
-        e(f"{op} %lkv{n_}, {nports + 1}")
-        e(f"low.br ^lk{n_}j")
-        e.L.append(f"^lk{n_}j:")
-    PL = [None]
-    if PLOOP:
-        assert nports == 2
-        e("%pdi = sub %ina1, %ina")
-        e("%pdo = sub %outa1, %outa")
-        pl_, _ = loop_begin("pl", nports)
-        PL[0] = pl_
-        e(f"%plmi = mul {pl_}, %pdi")
-        e(f"%plmo = mul {pl_}, %pdo")
-        e("%pina = add.rr %ina, %plmi")
-        e("%pouta = add.rr %outa, %plmo")
-        INA[0], OUTA[0] = "%pina", "%pouta"
-    sec0 = len(e.L)
-    j, _ = loop_begin("jl", INLINE[0] or 4)
+    # ---- super-block loop
+    j, _ = loop_begin("jl", INLINE[0])
     e(f"%j136 = mul {j}, {k(BLK)}")
-    e(f"%jin = add.rr {INA[0]}, %j136")
+    e("%jin = add.rr %ina, %j136")
     # -- halves: straight-line, one stream each (the scale path is one long dependency chain per half: the two
     # chains interleave)
     for h in range(2):
@@ -1131,12 +1077,11 @@ def leaf(name="dec", nports=1):
     CTP["on"] = False
 
 
-    e("%mark_hotsetup = mova.i32 0") if os.environ.get("DQ_MARK") else None
     # -- hot: two output records (slots 0, 1), each 2 iterations of 2 sub-blocks (u) x 4 chunk-halves; T row-broadcast
     # from the halves' PARTS ((4 p + 2 r + t) 64: record r = sub-block group f, iteration t = sl // 2, u = sl % 2)
     rlo, rhi = RREC[0] or (0, 2 * INLINE[0])
     rs = rn = None
-    if INLINE[0] and (rlo, rhi) != (0, 2 * INLINE[0]):  # skipped records: the first super-block's record 0, the last's 1
+    if (rlo, rhi) != (0, 2 * INLINE[0]):  # skipped records: the first super-block's record 0, the last's 1
         assert 0 <= rlo <= 1 and 2 * INLINE[0] - 1 <= rhi <= 2 * INLINE[0] and os.environ.get("DQ_SLU", "1") == "1"
         if rlo:
             e(f"%rls = lt {j}, {k(1)}")
@@ -1636,9 +1581,7 @@ def leaf(name="dec", nports=1):
             e(f"%al{par} = and %qs{par}, {k(-64)}")
             e(f"%ar{par} = add.rr %al{par}, %r64")
         # the table base in 32 accumulator lanes: addresses = (b << 3) + GT on the MAC slot (vadd.acc.integer mode 0)
-        if KV2 and not INLINE[0]:   # (standalone check, DQ_TROLL=1: DQ_TSEL picks the table for every unit)
-            e(f"%tsel = mov.i32 {int(os.environ.get('DQ_TSEL', '2048'))}")
-        elif KV2:   # units 2, 3 mod 4 of the fill (units left %fzs [12] = 1, 2 mod 4): the second table, 2048 on
+        if KV2:   # units 2, 3 mod 4 of the fill (units left %fzs [12] = 1, 2 mod 4): the second table, 2048 on
             e("%tsp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
             e("%tsu = lda %tsp, 12")
             e("%tsu1 = add %tsu, 1")
@@ -1675,7 +1618,7 @@ def leaf(name="dec", nports=1):
                 row = 8 * hh + r
                 sh, pa_ = f"%sh{row % 2}", x.t("pa")
                 x(f"{pa_} = add.rr %ar{row % 2}, {k(ROWB * (row - row % 2))}" if row > 1 else f"{pa_} = or %ar{row % 2}, {k(0)}")
-                pv = Pr(x, pa_) if os.environ.get("DQ_ABL") != "3" else P(x, "%spa", 128 * r + 1024 * hh)   # 3: timing ablation (rows from the table)
+                pv = Pr(x, pa_)
                 va, vb, q = x.t("va"), x.t("vb"), x.t("q")
                 x(f"{va} = vlda.512.i8x64 {pv}, 0")
                 x(f"{vb} = vlda.512.i8x64 {pv}, 64")
@@ -1701,7 +1644,7 @@ def leaf(name="dec", nports=1):
                 u8s = []
                 for hb_ in range(2):                     # bytes 32 hb_ .. + 31 (rows 4 hb_ .. + 3): 32 x u32 b << 3
                     bv, u8 = x.t("bv"), x.t("u8")
-                    x(f"{bv} = slice {'%z8' if os.environ.get('DQ_ABL') == '1' else vs[i]}[{hb_}] : {V2} -> {V1}")   # DQ_ABL=1: timing ablation (all gathers -> entry 0)
+                    x(f"{bv} = slice {vs[i]}[{hb_}] : {V2} -> {V1}")
                     x(f"{u8} = vups.4x.w-to-c.unsigned {bv}, %sh3")
                     u8s.append(u8)
                 u4, a_ = x.t("u4"), x.t("ua")
@@ -1716,16 +1659,11 @@ def leaf(name="dec", nports=1):
     e("%qp0 = mov.scalar-to-address %qp0a")
     rq = "%qp0"
     e(f"%jso = mul {r_}, {k(OUT_B)}")
-    if INLINE[0]:                               # no output ring: super-block j's records at 2 j + r
-        e(f"%jsj = mul {j}, {k(2 * OUT_B)}")
-        e("%jsr = add.rr %jso, %jsj")
-        e(f"%osa = add.rr {OUTA[0]}, %jsr")
-    else:
-        e(f"%osa = add.rr {OUTA[0]}, %jso")
+    # no output ring: super-block j's records at 2 j + r
+    e(f"%jsj = mul {j}, {k(2 * OUT_B)}")
+    e("%jsr = add.rr %jso, %jsj")
+    e("%osa = add.rr %outa, %jsr")
     e("%osp = mov.scalar-to-address %osa")
-    lockop("acq", "%km1o")
-    e.pre.append("  %km1o = mov.i32 -1")
-    e.consts["%km1o"] = True
     e("%op = copy %osp : reg<aie2p.ep> -> reg<aie2p.mpfs>")
     e("%sl = vlda.store-fifo.low512 %osp, 0")
     e("%f0 = vlda.store-fifo.high512 %osp, %sl, 64")
@@ -2047,9 +1985,6 @@ def leaf(name="dec", nports=1):
                             av, gl, gh = x.t("av"), x.t("gl"), x.t("gh")
                             x(f"{av} = slice {ad}[{hf_}] : {V2} -> {V1}")
                             x(f"{gl} = vldb.4x32.lo {av}")
-                            if os.environ.get("DQ_ABL") == "4":           # timing ablation: half the gathers
-                                gls.append((gl, gl))
-                                continue
                             x(f"{gh} = vldb.4x32.hi {av}")
                             gls.append((gl, gh))
                         gcs = []
@@ -2123,33 +2058,22 @@ def leaf(name="dec", nports=1):
                                 sl4.append(q1)
                         m4 = x.t("m4")
                         x(f"{m4} = concat({sl4[0]}, {sl4[1]}, {sl4[2]}, {sl4[3]}) : ({M1}, {M1}, {M1}, {M1}) -> {M4}")
-                        accs[n_] = m4 if os.environ.get("DQ_DBG") != "noM" else None
+                        accs[n_] = m4
                     xs = build_xs()
-                    if os.environ.get("DQ_DBG") == "tdump":   # X = 1.0, no -M: the fragments are the broadcast T0 + T1
-                        o3, o4, ones = x.t("one"), x.t("one"), x.t("one4")
-                        x(f"{o3} = vbcst.16 {k(0x3F80)}")
-                        x(f"{o4} = vbcst.16 {k(0x3F80)}")
-                        x(f"{ones} = concat({o3}, {o4}) : ({V2}, {V2}) -> {V4}")
-                        xs = [ones, ones]
-                        accs = [None, None]
                     for p in range(2):
                         ld = x.t("pl")
                         x(f"{ld} = vlda.512.bf16x32 {ppt}, {(hh * NPARTS + p) * 64}")
                         for n_, x4 in enumerate(xs):
-                            ix = 2 * t_ + (0 if os.environ.get("DQ_DBG") == "hi0" else n_)
+                            ix = 2 * t_ + n_
                             accs[n_] = mac(x, accs[n_], rowb(ld, ix), x4)
                 if NPARTS != 4:
                     for p in range(2):
                         ld = lds[p]
                         bc, ra, rb, t4 = x.t("bc"), x.t("ra"), x.t("rb"), x.t("TB")
-                        if os.environ.get("DQ_ABL") == "5":          # timing ablation: T rows loaded, not broadcast
-                            x(f"{rb} = vlda.512.bf16x32 {ppt}, {512 * hh - 512 + 256 * p + 64}")
-                            x(f"{t4} = concat({ld}, {rb}) : ({V2}, {V2}) -> {V4}")
-                        else:
-                            x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {2 * t_ + u}")
-                            x(f"{ra} = vshuffle {bc}, {bc}, {m52}")
-                            x(f"{rb} = vshuffle {bc}, {bc}, {m53}")
-                            x(f"{t4} = concat({ra}, {rb}) : ({V2}, {V2}) -> {V4}")
+                        x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {2 * t_ + u}")
+                        x(f"{ra} = vshuffle {bc}, {bc}, {m52}")
+                        x(f"{rb} = vshuffle {bc}, {bc}, {m53}")
+                        x(f"{t4} = concat({ra}, {rb}) : ({V2}, {V2}) -> {V4}")
                         for n_, x4 in enumerate(xs):
                             accs[n_] = mac(x, accs[n_], t4, x4)
                 hi_acc[(cc, hh)] = accs[1]
@@ -2174,7 +2098,6 @@ def leaf(name="dec", nports=1):
         else:                                            # padda immediates reach 448
             e(f"%spm0 = padda %spc0, 256")
             e(f"%spn0 = padda %spm0, {2 * NPARTS * 64 - 256}")
-        lockop("rel", "%k1r")
         loop_end("rl", [("%spn0", "reg<aie2p.ep>")])
     ff = st["fifo"]
     if not SLU:
@@ -2187,16 +2110,8 @@ def leaf(name="dec", nports=1):
       e("%spn0 = padda %spc0, 64")
       loop_end("sl", [("%yf", "reg<aie2p.mstfifo>"), ("%yp", "reg<aie2p.mpfs>"), ("%yq", "reg<aie2p.mr26_fifo_st>"),
                       ("%sqn", "reg<aie2p.ep>"), ("%spn0", "reg<aie2p.ep>")])
-      lockop("rel", "%k1r")
       loop_end("rl", [(sp0, "reg<aie2p.ep>")])
-    e.pre.append("  %k1r = mova.i32 1")
-    e.consts["%k1r"] = True
     loop_end("jl")
-    sec = e.L[sec0:]
-    if PLOOP:
-        loop_end("pl")
-    for pp_ in range(1, nports if not PLOOP else 1):
-        e.L += port_copy(sec, pp_, nports)
     e("return")
     e.L.append("}")
     pre_ = grid_rodata(name) if GRID else []
@@ -2214,7 +2129,7 @@ def leaf_inline(nsb, name="inl", vroll=False, tonce=True, rec=None):
         return bfp_copy(nsb, rec)
     INLINE[0], VROLL[0], TONCE[0], RREC[0] = nsb, vroll, tonce, rec
     try:
-        txt = leaf(name, 1)
+        txt = leaf(name)
     finally:
         INLINE[0], VROLL[0], TONCE[0], RREC[0] = 0, False, True, None
     out = []
@@ -2292,7 +2207,7 @@ def place_consts(pre, body):
     first, cond, region_of = {}, None, {}
     for n_, l in enumerate(body):
         t_ = l.strip()
-        if t_.startswith("^tbuild") and not (INLINE[0] and not TONCE[0]):   # (inline: conditional on the fill's flag)
+        if t_.startswith("^tbuild") and TONCE[0]:   # (inline: conditional on the fill's flag)
             cond = (max(i for i in range(n_) if body[i].strip().startswith("low.cond_br")), "^tdone")
         elif cond and t_.startswith(cond[1]):
             cond = None
@@ -2325,41 +2240,6 @@ def place_consts(pre, body):
             out.append(l)
     return out
 
-def array(units, nports=1):
-    S = "reg<aie2p.array.scalar : index>"
-    RS, NS, P = 20 * BLK // 4, 5, units // 5           # row stride (words): K / 256 super-blocks of BLK bytes
-    return f"""aie2p.target<array> @array_target
-aie2p.target<core> @core_target
-
-low.func.def public retain target<amd.xdna.aie2p.array>(@array_target) abi(array_program) @probe() asm {{
-  %n0 = constant.u32 0 : {S}
-  %n1 = constant.u32 1 : {S}
-  %n2 = constant.u32 2 : {S}
-  %rec = constant.u32 {units} : {S}
-  %orec = constant.u32 {8 * units} : {S}
-  %origin = constant.u64 0 : reg<aie2p.array.offset : offset>
-  %workers = group %n1
-  %k = worker %workers, %n0, @dec
-  constrain.location %k, %n0, %n2
-  %ib = binding 0, "read"
-  %ob = binding 1, "write"
-  %np = constant.u32 {nports} : {S}
-  %o_all = receiver %ob, 0 : reg<aie2p.array.receiver : tile<{nports}x{8 * units}x{OUT_B // 4}xi32>>
-""" + "".join(f"""  %io{p} = constant.u64 {p * 80 * RS * 4} : reg<aie2p.array.offset : offset>
-  %is{p} = sender %ib, 0 : reg<aie2p.array.sender : tile<{P}x{NS}x16x{ROWB // 4}xi32, #encoding.layout.strided<strides=[{BLK}, {16 * RS}, {RS}, 1]>>>
-  %iv{p} = view.sender %is{p}, %io{p} : reg<aie2p.array.sender : tile<16x{ROWB // 4}xi32>>
-  %ri{p} = receiver %k, {p} : reg<aie2p.array.receiver : tile<16x{ROWB // 4}xi32>>
-  %chi{p} = channel %iv{p}, %ri{p}, %n1, %rec : reg<aie2p.array.channel : tile<16x{ROWB // 4}xi32>>
-  %orc{p} = partition.receiver %o_all, %origin, %n{p}, %np : reg<aie2p.array.receiver : tile<{OUT_B // 4}xi32>>
-  %so{p} = sender %k, {nports + p} : reg<aie2p.array.sender : tile<{OUT_B // 4}xi32>>
-  %cho{p} = channel %so{p}, %orc{p}, %n2, %orec : reg<aie2p.array.channel : tile<{OUT_B // 4}xi32>>
-  constrain.leaf_sync %cho{p}
-""" for p in range(nports)) + """  return
-}
-"""
-
-
-# panel position -> k-block within a pass: per sub-block of 4, (0, 2, 1, 3)
 KPERM = (np.array([8 * (p // 8) + (0, 4, 1, 5, 2, 6, 3, 7)[p % 8] for p in range(128)])
          if (FMT == "Q4_K" and not Q4G) or (Q3K and GORD == "PK") else   # (GF: P4)
          np.arange(128) if (GRID or Q3K) and not GP4 else np.array([4 * (p // 4) + (0, 2, 1, 3)[p % 4] for p in range(128)]))
@@ -2370,15 +2250,6 @@ def parts2(v):
     """f32 v -> the kernel's two bf16 parts (RNE, then the RNE of the exact remainder)."""
     p0 = Q.bf16_rne(v.astype(np.float32))
     return p0, Q.bf16_rne((v.astype(np.float32) - p0).astype(np.float32))
-
-
-def oracle(raw):
-    """raw [80 rows][20 super-blocks][BLK] -> panel-order fragments [pass][slab][kb 128][h 2][72]."""
-    w = weights(raw)
-    w = w.reshape(80, 640, 8)                                     # [row][kb][8]
-    frag = w.reshape(5, 2, 8, 5, 128, 8).transpose(3, 0, 4, 1, 2, 5)   # [pass][slab][kb][h][row][8]
-    frag = frag[:, :, KPERM]                                      # the panel's k-block order
-    return Q.bfp_hw(frag.reshape(-1, 8, 8)).reshape(5, 5, 128, 2, 72)
 
 
 def q3k_fields(blk):
@@ -2528,86 +2399,3 @@ def ix4_rows(raw, src):
     q = q.reshape(sh + (8, 2, 16))
     out[..., 8:] = (q[..., 0, :] | (q[..., 1, :] << 4)).reshape(sh + (128,))
     return out
-
-
-def main():
-    work = sys.argv[1]
-    units = 25
-    nports = int(os.environ.get("DQ_PORTS", "1"))
-    os.makedirs(work, exist_ok=True)
-    src = array(units, nports) + "\n" + leaf("dec", nports) + "\n"
-    open(f"{work}/p.loom", "w").write(src)
-    LC = os.environ.get("LC", hrx_paths.LOOM_COMPILE)
-    env = dict(hrx_paths.env(), LOOM_EXP_LOCKED_PACK="1")
-    r = subprocess.run([LC, f"{work}/p.loom", "--root=@probe", "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
-                        f"--output={work}/p.xdna", "--compile-report=text", f"--compile-report-output={work}/report.txt"],
-                       capture_output=True, text=True, env=env)
-    if r.returncode:
-        sys.exit("compile failed\n" + r.stderr[-4000:])
-    for l in open(f"{work}/report.txt"):
-        if l.startswith("COMPILE-REPORT: emission"):
-            print("compiled:", " ".join(t for t in l.split() if t.split("=")[0] in ("instructions", "code_bytes")))
-    if os.environ.get("DQ_NORUN"):
-        return
-    import gguf   # llama.cpp's gguf-py on PYTHONPATH
-    rd = gguf.GGUFReader(sys.argv[2])
-    sfmt = IX4_SRC.get(FMT0, FMT)
-    t = next(x for x in rd.tensors if x.tensor_type.name == sfmt and len(x.shape) == 2 and int(x.shape[0]) == 5120
-             and int(x.shape[1]) >= 1024)
-    rows = np.asarray(t.data).view(np.uint8).reshape(int(t.shape[1]), -1)[160:160 + 80 * nports]   # 80 rows per port
-    raw = rows.reshape(len(rows), 20, -1).copy()
-    if FMT0 in IX4_SRC:   # the transcoded rows' weights are the source's, bit for bit
-        raw = ix4_rows(raw, sfmt)
-        ref = gguf.quants.dequantize(rows, gguf.GGMLQuantizationType[sfmt]).reshape(raw.shape[:-1] + (256,))
-        print("transcoded weights bit-identical:",
-              np.array_equal(weights(raw).view(np.uint32), ref.astype(np.float32).view(np.uint32)))
-    np.concatenate([raw.reshape(-1), np.zeros(1024, np.uint8)]).tofile(f"{work}/in.bin")   # + slack: records over-read
-    np.zeros(nports * 8 * units * OUT_B, np.uint8).tofile(f"{work}/o0.bin")
-    r = subprocess.run([hrx_paths.XDNA_RUN, "--columns=1", f"--image={work}/p.xdna", "--entry=probe", "--binding_memory=system",
-                        f"--binding={work}/in.bin", f"--binding={work}/o0.bin", f"--output=1={work}/out.bin"],
-                       capture_output=True, text=True, env=env, timeout=60)
-    if r.returncode:
-        sys.exit("run failed\n" + r.stdout[-1500:] + r.stderr[-1500:])
-    got = np.fromfile(f"{work}/out.bin", np.uint8).reshape(nports, 5, 5, 128, 2, 72)
-    global KV
-    if KV2 and os.environ.get("DQ_TSEL", "2048") != "0":   # every unit gathered from the second table
-        KV = KV2
-    ref = np.stack([oracle(raw[80 * p:80 * p + 80]) for p in range(nports)])
-    bad = np.any(got != ref, axis=-1)
-    print(f"fragments differing: {int(bad.sum())} of {bad.size}")
-    if bad.any():
-        i = np.argwhere(bad)[0]
-        print("first bad [pass, slab, kb, h]:", i.tolist(), "\n got", got[tuple(i)][:18].tolist(), "\n ref", ref[tuple(i)][:18].tolist())
-
-
-
-
-def port_copy(sec, p, nports):
-    """Port p's section: port 0's with every value / label defined in it suffixed, port 0's resources swapped for
-    port p's, and the output ring's acquire / release index moved."""
-    import re
-    defined = set()
-    for l in sec:
-        t = l.strip()
-        m = re.match(r"((?:%[\w.]+)(?:, %[\w.]+)*) = ", t)
-        if m:
-            defined.update(re.findall(r"%[\w.]+", m.group(1)))
-        m = re.match(r"\^([\w]+)\((.*)\):", t)
-        if m:
-            defined.update(re.findall(r"(%[\w.]+):", m.group(2)))
-    labels = {m for l in sec for m in re.findall(r"\^([\w]+)", l)}
-    swap = {"%in": f"%in{p}", "%out": f"%out{p}", "%ina": f"%ina{p}", "%outa": f"%outa{p}"}
-    sfx = f"_p{p}"
-
-    def fix(l):
-        l = re.sub(r"%[\w.]+", lambda m: swap.get(m.group(0), m.group(0) + sfx if m.group(0) in defined else m.group(0)), l)
-        l = re.sub(r"\^([\w]+)", lambda m: "^" + m.group(1) + (sfx if m.group(1) in labels else ""), l)
-        l = re.sub(r"^(\s*(?:acq|rel) %\w+, )" + str(nports) + r"$", lambda m: m.group(1) + str(nports + p), l)
-        l = l.replace("{index = 0, source_type", f"{{index = {p}, source_type").replace(
-            f"{{index = {nports}, source_type", f"{{index = {nports + p}, source_type")
-        return l
-    return [fix(l) for l in sec]
-
-
-if __name__ == "__main__":
-    main()

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Generate yah_ssm_conv_kq for the chunked DeltaNet (gen_gdn_chunk CONV16) reading the qkv GEMM's f16 output: the same
-ops, roundings and summation orders as yah_ssm_conv_kq_f32.loom with emit_prefill_pp.conv_x16 / conv_n16, so the
-output is bit-identical, but one workgroup per (256 channels, TB tokens) instead of per (256 channels, token).
+"""Generate yah_ssm_conv_kq for the chunked DeltaNet reading the qkv GEMM's f16 output: the same ops, roundings and
+summation orders as the per-token f32 kernel it replaced (yah_ssm_conv_kq_f32.loom with emit_prefill_pp.conv_x16 /
+conv_n16, removed 2026-11-14), so the output is bit-identical, but one workgroup per (256 channels, TB tokens) instead
+of per (256 channels, token).
 
 usage: gen_conv_kq.py [out.loom]
 

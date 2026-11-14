@@ -17,8 +17,6 @@ from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import gen_bfp16_encode as GE  # noqa: E402
-import gen_npu_gemm as GN  # noqa: E402
 import gen_gemm_decode as G  # noqa: E402
 
 # Mixed gate:up pairs whose decode waves are swizzled so each SIMD holds both roles (gate/up by wave bit 2, not bit 1):
@@ -261,11 +259,6 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
     return _gen(fmt, kind, t, masked, fmt_up)
 
 
-# dequant kernels: 256-wide K blocks per work item (the table staging and pipeline fill amortize over them), and the
-# persistent grid (one workgroup per WGP: 20 KB of LDS fits beside two GEMM workgroups)
-DQ_BLOCKS = 4
-DQ_WGS = 20
-
 # Column split with the NPU (emit_prefill_pp NPU_SPLIT): the GPU computes output rows [0, m_tiles * 16) of a wider
 # matrix; OSTRIDE (> 0) is the full row count: the token stride of the output (and kres residual, swiglu gate input),
 # the tile count of a fragment-major output, for ffn the gate rows before the up rows, for kqg twice the q / gate row
@@ -277,29 +270,10 @@ OSTRIDE = 0
 SPLIT2 = False
 
 
-# NPU weights (emit_prefill_pp NPU_SPLIT): with DQ_BFP = (ks, passes), the dequant kind writes the NPU's BFP16 weight
-# stream (gen_bfp16_encode "wgt", gen_npu_gemm.TN-row columns) instead of f16 rows; K must be 8 * passes * sum(ks).
-# DQ_BFP = (ks, passes, kb_start, kb_total): a K chunk, k_blocks (config) 256-wide blocks from kb_start of kb_total-block rows.
-# Its grid is dq_wgs(): one workgroup per item.
-DQ_BFP = None
-# DQ_BFP's phase width: 128 (2 phases per 256-wide block, every lane decodes) reads each weight row in half as many
-# pieces, so the output stream evicts fewer of a row's lines between its phases (IQ3_S ffn_gate 7680 rows: L2 misses
-# 0.70 -> 0.51 M, 0.384 -> 0.355 ms standalone).
-DQ_BFP_KSUB = 128
 # KWIN = (kb_start, kb_total): a K window of an afrag tiled kstore, k_blocks (config) 256-wide blocks from kb_start of
 # kb_total-block weight rows and kb_total * 256-column activations (the NPU split's K remainder, emit_prefill_pp).
 KWIN = None
-# NPUADD (kres in a KWIN, the NPU FFN block's GPU down): the epilogue also adds the NPU's down partials, the bf16 C of
-# gen_npu_gemm calls of one replay group (bindings npuc, done, ready, status after output), once the NPU job is done
-# (gen_npu_unpack.WAIT_LOOP: done reaches ready, bounded; status set on a timeout or a failed job).
-# dict(rows=output rows per call, tn=GN.TN, np=GN.NP, call=C elements per call, calls=calls per K part, parts=K parts):
-# the element of (token t, row n) in part p is (p * calls + n / rows) * call + gen_npu_unpack c_lane(n % rows) + c_tok(t).
-NPUADD = None
 
-
-def dq_wgs(m_tiles, k_blocks, t, fmt):
-    """Workgroups of the DQ_BFP dequant: (row groups) x (K groups of DQ_BLOCKS 256-wide blocks)."""
-    return m_tiles // t.rowgrp * (k_blocks // G.FMTS[fmt].get("kdiv", 1) // DQ_BLOCKS)
 
 
 def orw():
@@ -319,7 +293,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     # switches from its own default tile); every lane loads its row of both (no branch around the loads: a branch drains
     # vmcnt(0) at its join) and carries both, each wave decodes the one its rows are
     MX = fmt_up is not None
-    MX_SWZ = (fmt, fmt_up) in MX_SWZ_PAIRS if os.environ.get("YAH_MX_SWZ", "1") == "1" else False
+    MX_SWZ = (fmt, fmt_up) in MX_SWZ_PAIRS
     if MX:
         Fu = G.FMTS[fmt_up]
         bbu, (loads_u, compute_u) = Fu["bb"], Fu["decode"]
@@ -421,22 +395,15 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     # kqg: the attention q projection (rows = heads x [256 q | 256 gate]) writes q and gate to [tokens][heads*256] buffers.
     # Same values as the separate yah_unpack_qg pass, so bit-identical.
     qg = kind == "kqg"
-    # dequant: decode the weights to f16 [rows][K] once with this tile's decode (the decode-free GEMMs read that)
-    dq = kind == "dequant"
     # ffn: ffn_gate and ffn_up (same format) in one GEMM, out = f16(silu(gate) * up), the swiglu GEMM's scalar ops
     ff = kind == "ffn"
     assert ff == t.ffn, "kind ffn needs Tile.ffn"
     bufs = (["weight"] + F["extra"] + (extra_u if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
-            + ["wstage", "ostage", "output"] + (["out2"] if SPLIT2 else []) + (["gate_out"] if qg else []) + (["qnw"] if qg and KQG_QSPLIT else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
-    assert not NPUADD or (kr and KWIN and t.tallepi and t.ecoal and not masked and not t.respre)
+            + ["wstage", "ostage", "output"] + (["out2"] if SPLIT2 else []) + (["gate_out"] if qg else []) + (["qnw"] if qg and KQG_QSPLIT else []))
     assert not SPLIT2 or (kind == "kstore" and not (OSTRIDE or MX or masked or AFRAG or t.tallepi or t.tm == 32 or OUT16)), \
         "SPLIT2: a plain tiled f32 kstore with the default fragment-store epilogue"
     sym = (f"yah_ffn_gemm_{fmt}" + (f"_{fmt_up}" if MX else "") + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
            + ("_ffn" if ff else ""))
-    if dq:
-        assert not (DECAHEAD or DBUF or masked)
-        bufs = ["weight"] + F["extra"] + ["output"]
-        sym = f"yah_dequant_{fmt}" + ("_bfp16" if DQ_BFP else "")
     slots = G.GPP                   # decoding lane groups of BM per phase
     arow = ksub + APAD              # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
@@ -467,24 +434,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e(f"  %wgs = index.constant {LANES} : index")
     e(f"  %rowgrp = index.constant {ROWGRP} : index")
     e("  %m_groups = index.div %m_tiles, %rowgrp : index")
-    if dq:
-        # one workgroup per (row group, K phase)
-        e(f"  %kbl0 = config.get @{sym}.k_blocks : index")
-        e(f"  %kdivl = index.constant {F.get('kdiv', 1)} : index")
-        e("  %kbl = index.div %kbl0, %kdivl : index")
-        # DQ_BLOCKS 256-wide blocks per workgroup (k_blocks is a multiple of it: 20 and 68 here)
-        e(f"  %cdqb = index.constant {DQ_BLOCKS} : index")
-        e("  %kgl = index.div %kbl, %cdqb : index")
-        if DQ_BFP:
-            # one workgroup per (row group, K group) item: the NPU weights are encoded with the GPU otherwise idle
-            e("  %dqw = index.mul %m_groups, %kgl : index")
-        else:
-            # persistent: DQ_WGS workgroups (one per WGP) walk the (row group, K group) items, so the dequant fits beside a
-            # running GEMM (whose workgroups would otherwise all launch first) and finishes within it
-            e(f"  %dqw = index.constant {DQ_WGS} : index")
-        e("  kernel.launch.config workgroups(%dqw, %unit, %unit) workgroup_size(%wgs, %unit, %unit) : index")
-    else:
-        e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
+    e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     e("} launch(" + ", ".join(f"%{b}: buffer" for b in bufs) + ") {")
     e("  %base = index.constant 0 : offset")
     for v in sorted({0, 1, 2, 4, 6, 7, 8, 16, 32, 48, 63, 64, 80, 96, 112, 127, 128, 224, 255, 256, 512, BM, BM - 1, BN}):
@@ -523,10 +473,9 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     if OSTRIDE:
         assert kind in ("kstore", "kres", "swiglu", "ffn", "kqg") and not MX, "the NPU column split: kstore / kres / swiglu / ffn / kqg"
         e(f"  %o_rows = index.constant {OSTRIDE} : index")
-    dq_chunk = kind == "dequant" and DQ_BFP is not None and len(DQ_BFP) == 4
     if KWIN:
         assert kind in ("kstore", "kres") and AFRAG and t.atiled and F.get("kdiv", 1) == 1 and not (MX or OSTRIDE)
-    kwin = KWIN or (DQ_BFP[2:] if dq_chunk else None)
+    kwin = KWIN
     if kwin:   # weight rows keep their full length; the window starts kb_start blocks in
         assert F.get("kdiv", 1) == 1
         e(f"  %ckbt = index.constant {kwin[1]} : index")
@@ -568,15 +517,14 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
       + ", ".join(f"%{b}" for b in bufs) + " : " + ", ".join(["buffer"] * len(bufs)))
     e("  %w_view = buffer.view %weight_na[%base] : buffer -> view<[%w_bytes]xi8>")
     e("  %w_f16_view = buffer.view %weight_na[%base] : buffer -> view<[%w_halfs]xf16>")
-    if not dq:
-        e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
+    e("  %a_flat = buffer.view %input_na[%base] : buffer -> view<[%a_total]xf16>")
     if AFRAG:
         e("  %a_rhs = buffer.view %input_na[%base] : buffer -> view<[%ktot]x[%tokens]xf16, %a_layout>")
         if t.atiled:
             e(f"  %a_ktiles = index.div {'%kfull' if KWIN else '%ktot'}, %c16 : index")
             e("  %a_tlay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
     # LDS: decoded weight tile and staged activation tile
-    wl_b = BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF or dq else 1)
+    wl_b = BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF else 1)
     # the tall epilogue's slab rows (kstore / kres; coalesced only): its slabs live in the weight tile
     esr = t.esr if t.tallepi and t.ecoal and not (ff or sw or qg or masked) else 16
     wl_b = max(wl_b, NWAVE * (esr + EPAD) * 16 * 4) if esr != 16 else wl_b
@@ -584,23 +532,22 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e(f"  %wl_tb = index.constant {BM * G.ROWP * 2} : index")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
-    if not dq:
-        # the LDS epilogue's wave-private TM x 16 f32 slabs live in the activation tile
-        al_bytes = 256 if AFRAG else BN * arow * 2 * (2 if DBUF else 1)
-        slabs = NWAVE * (TM + EPAD) * 16 * 4
-        if TM == 32:
-            al_bytes = max(al_bytes, slabs)
-        if sw and not t.swepi:
-            # swiglu_epilogue's per-wave slabs; narrow tiles need more than the activation tile holds
-            al_bytes = max(al_bytes, NWAVE * 16 * swiglu_slab(t, arow) * 4)
-        e(f"  %al_bytes = index.constant {al_bytes} : offset")
-        e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
-        e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
-        e(f"  %carow = index.constant {arow} : index")
-        e(f"  %cksubi = index.constant {ksub} : index")
-        e("  %al_layout = encoding.layout.strided [%c1, %carow] : encoding<layout>")
-        e(f"  %al_t = buffer.view %al[%base] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
-        e(f"  %al_tb = index.constant {BN * arow * 2} : index")
+    # the LDS epilogue's wave-private TM x 16 f32 slabs live in the activation tile
+    al_bytes = 256 if AFRAG else BN * arow * 2 * (2 if DBUF else 1)
+    slabs = NWAVE * (TM + EPAD) * 16 * 4
+    if TM == 32:
+        al_bytes = max(al_bytes, slabs)
+    if sw and not t.swepi:
+        # swiglu_epilogue's per-wave slabs; narrow tiles need more than the activation tile holds
+        al_bytes = max(al_bytes, NWAVE * 16 * swiglu_slab(t, arow) * 4)
+    e(f"  %al_bytes = index.constant {al_bytes} : offset")
+    e("  %al = buffer.alloca<workgroup> align(16) %al_bytes : buffer")
+    e(f"  %al_rows = buffer.view %al[%base] : buffer -> view<{BN}x{arow}xf16>")
+    e(f"  %carow = index.constant {arow} : index")
+    e(f"  %cksubi = index.constant {ksub} : index")
+    e("  %al_layout = encoding.layout.strided [%c1, %carow] : encoding<layout>")
+    e(f"  %al_t = buffer.view %al[%base] : buffer -> view<{ksub}x{BN}xf16, %al_layout>")
+    e(f"  %al_tb = index.constant {BN * arow * 2} : index")
     if t.tokfast:
         # linear id -> (row block, token tile) with the token tile fastest; the same grid, a different order
         e("  %wg_rx = kernel.workgroup.id<x> : index")
@@ -611,17 +558,6 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %wg_lin = index.add %wg_l0, %wg_rx : index")
         e("  %wg_x = index.div %wg_lin, %wg_gy : index")
         e("  %wg_y = index.rem %wg_lin, %wg_gy : index")
-    elif dq:
-        e("  %dq_wid = kernel.workgroup.id<x> : index")
-        e("  %dq_nwg = kernel.workgroup.count<x> : index")
-        e(f"  %dq_cdqb = index.constant {DQ_BLOCKS} : index")
-        e("  %dq_kg = index.div %k_blocks, %dq_cdqb : index")
-        e(f"  %rowgrp_k = index.constant {ROWGRP} : index")
-        e("  %dq_mg = index.div %m_tiles, %rowgrp_k : index")
-        e("  %dq_nit = index.mul %dq_mg, %dq_kg : index")
-        e("  scf.for %dq_item = [%dq_wid to %dq_nit step %dq_nwg] {")
-        e("  %wg_x = index.div %dq_item, %dq_kg : index")
-        e("  %wg_y = index.rem %dq_item, %dq_kg : index")
     else:
         e("  %wg_x = kernel.workgroup.id<x> : index")
         e("  %wg_y = kernel.workgroup.id<y> : index")
@@ -645,7 +581,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e(f"  %stg_w2 = index.constant {2 * STG_NWGP} : index")
     e("  %stg_ge = index.cmp uge, %stg_lin, %stg_w : index")
     e("  %stg_lt = index.cmp ult, %stg_lin, %stg_w2 : index")
-    e(f"  %stg_n = index.constant {0 if dq else t.stagger} : index")
+    e(f"  %stg_n = index.constant {t.stagger} : index")
     e("  %stg_n1 = scf.select %stg_ge, %stg_n, %c0 : index")
     e("  %stg_n2 = scf.select %stg_lt, %stg_n1, %c0 : index")
     e("  %stg_iters = scf.select %stg_big, %stg_n2, %c0 : index")
@@ -766,182 +702,6 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
                 assert have[n] == l.strip(), (n, have[n], l)
                 continue
             L.append(l)
-    if dq:
-        # the setup's LDS tables visible, then this workgroup's phase (wg_y) decoded into the LDS tile as the GEMM does it
-        e("  %z8s = scalar.constant 0 : i8")
-        e("  %z8v = vector.splat %z8s : vector<8xi8>")
-        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        if DQ_BFP:
-            bks, bpasses = DQ_BFP[:2]
-            bpanel = sum(bpasses * GN.NP * GE.slab_bytes(k) for k in bks)
-            nfrag = (BM // 8) * (ksub // 8)
-            assert BM % 64 == 0 and ksub % 8 == 0 and nfrag <= LANES
-            e(f"  %dq_bpanel = index.constant {bpanel} : index")
-            e(f"  %dq_ctn = index.constant {GN.TN} : index")
-            e("  %dq_bcols = index.div %m_rows, %dq_ctn : index")
-            e("  %dq_tot = index.mul %dq_bcols, %dq_bpanel : index")
-            e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xi8>")
-            # the phase's fragments in stream order (72 bytes each), assembled by all lanes and copied out 8 bytes at a time
-            e(f"  %bfs_bytes = index.constant {nfrag * 72} : offset")
-            e("  %bfs = buffer.alloca<workgroup> align(16) %bfs_bytes : buffer")
-            e(f"  %bfs_view = buffer.view %bfs[%base] : buffer -> view<{nfrag * 72}xi8>")
-        else:
-            e("  %dq_tot = index.mul %m_rows, %ktot : index")
-            e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xf16>")
-        e("  %dq_g = index.add %wg_y, %c0 : index")
-        e(f"  %dq_np = index.constant {DQ_BLOCKS * G.PH} : index")
-        e("  %dq_p0 = index.mul %dq_g, %dq_np : index")
-        # phase p's bytes are carried in registers (loaded during phase p - 1); the tile is double-buffered, so one
-        # barrier per phase separates decode into buffer p % 2 from its copy-out (buffer p % 2 is next written at p + 2)
-        def dq_loads(pfx, kp):
-            e(f"  %{pfx}kb = index.div {kp}, %cph : index")
-            e(f"  %{pfx}ph = index.rem {kp}, %cph : index")
-            e(f"  %{pfx}kbi = index.cast %{pfx}kb : index to i32")
-            e(f"  %{pfx}phi = index.cast %{pfx}ph : index to i32")
-            e(f"  %{pfx}bo = scalar.muli %{pfx}kbi, %cbbi : i32")
-            e(f"  %{pfx}blk = scalar.addi %row_off_i, %{pfx}bo : i32")
-            e(f"  %{pfx}gg = scalar.muli %{pfx}phi, %cgppi : i32")
-            e(f"  %{pfx}gb = scalar.addi %{pfx}gg, %gl_i : i32")
-            Ld, wd = loads(pfx + "w_", f"%{pfx}blk", f"%{pfx}gb")
-            L.extend(Ld)
-            return wd
-        e("  %dq_plast0 = index.add %dq_p0, %dq_np : index")
-        e("  %dq_plast = index.sub %dq_plast0, %c1 : index")
-        w0 = dq_loads("dq0_", "%dq_p0")
-        orig = w0
-        w0p = G.pack_vals(e, w0, "dq0")
-        ctys = ", ".join(ty for _, ty in w0p)
-        e("  " + ", ".join(f"%dqo{x}" for x in range(len(w0p))) + " = scf.for %dq_it = [%c0 to %dq_np step %c1]("
-          + ", ".join(f"%dqv{x} = {nm} : {ty}" for x, (nm, ty) in enumerate(w0p)) + f") -> ({ctys}) {{")
-        e("  %dq_kp = index.add %dq_p0, %dq_it : index")
-        e("  %dq_kb = index.div %dq_kp, %cph : index")
-        e("  %dq_ph = index.rem %dq_kp, %cph : index")
-        e("  %dq_phi = index.cast %dq_ph : index to i32")
-        e("  %dq_gg = scalar.muli %dq_phi, %cgppi : i32")
-        e("  %dq_gb = scalar.addi %dq_gg, %gl_i : i32")
-        e("  %dq_buf = index.rem %dq_it, %c2 : index")
-        e("  %dq_bo0 = index.mul %dq_buf, %wl_tb : index")
-        e("  %dq_bof = index.cast %dq_bo0 : index to offset")
-        e(f"  %wl_dq = buffer.view %wl[%dq_bof] : buffer -> view<{BM}x{G.ROWP}xf16>")
-        e("  scf.if %decoder {")
-        names = G.unpack_vals(e, [(f"%dqv{x}", ty) for x, (_, ty) in enumerate(w0p)], orig)
-        L.extend(l.replace("%wl_view[", "%wl_dq[") for l in compute(names, "%dq_gb"))
-        e("  }")
-        # the next phase's bytes, in flight while this phase is copied out
-        e("  scf.schedule.fence")
-        e("  %dq_kn0 = index.add %dq_kp, %c1 : index")
-        e("  %dq_kn = index.min %dq_kn0, %dq_plast : index")
-        wn = G.pack_vals(e, dq_loads("dqn_", "%dq_kn"), "dqn")
-        e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        if DQ_BFP:
-            # encode the BM x KSUB tile into the NPU weight stream. Fragment f (8 rows x 8 k, 72 bytes) is the one the lane
-            # pair (f / 2, half f % 2) took before: k-block kk = (f / 2) % ckq of the 16 rows r16 = (f / 2) / ckq. Every
-            # lane encodes row blocks (8 k of one row, its own exponent) into the staged fragments, then the fragments go
-            # out as aligned 8-byte stores.
-            import gen_npu_unpack as GU
-            nrec, nwd = nfrag * 8, nfrag * 9
-            cst = (("c2", 2), ("c144", 144), ("c72", 72), ("csub", GN.NP), ("cpk", sum(bks)), ("cpass", bpasses),
-                   ("c8", 8), ("c9", 9), ("ckq", ksub // 8))
-
-            def frag_of(q, f, ind):   # (row in the tile of the fragment's first row, k-block in the item) of fragment f
-                e(f"{ind}%{q}half = index.rem {f}, %{q}c2 : index")
-                e(f"{ind}%{q}pair = index.div {f}, %{q}c2 : index")
-                e(f"{ind}%{q}r16 = index.div %{q}pair, %{q}ckq : index")
-                e(f"{ind}%{q}kk = index.rem %{q}pair, %{q}ckq : index")
-                e(f"{ind}%{q}r16x2 = index.mul %{q}r16, %{q}c2 : index")
-                e(f"{ind}%{q}rr = index.add %{q}r16x2, %{q}half : index")
-                e(f"{ind}%{q}r0 = index.mul %{q}rr, %{q}c8 : index")
-
-            def rounds(n, body):
-                for i in range(-(-n // LANES)):
-                    q = f"bf{body.__name__[0]}{i}_"
-                    for nm, v in cst + (("ci", LANES * i),):
-                        e(f"  %{q}{nm} = index.constant {v} : index")
-                    e(f"  %{q}id = index.add %tid, %{q}ci : index")
-                    ind = "  "
-                    if LANES * (i + 1) > n:
-                        e(f"  %{q}n = index.constant {n} : index")
-                        e(f"  %{q}live = index.cmp ult, %{q}id, %{q}n : index")
-                        e(f"  scf.if %{q}live {{")
-                        ind = "    "
-                    body(q, ind)
-                    if ind != "  ":
-                        e("  }")
-
-            def assemble(q, ind):   # row block id: fragment id / 8, row id % 8
-                e(f"{ind}%{q}f = index.div %{q}id, %{q}c8 : index")
-                e(f"{ind}%{q}r = index.rem %{q}id, %{q}c8 : index")
-                frag_of(q, f"%{q}f", ind)
-                e(f"{ind}%{q}lr = index.add %{q}r0, %{q}r : index")
-                e(f"{ind}%{q}kc = index.mul %{q}kk, %{q}c8 : index")
-                e(f"{ind}%{q}xh = vector.load %wl_dq[%{q}lr, %{q}kc] : view<{BM}x{G.ROWP}xf16> -> vector<8xf16>")
-                hs = []
-                for x in range(8):
-                    e(f"{ind}%{q}h{x} = vector.extract %{q}xh[{x}] : vector<8xf16> -> f16")
-                    hs.append(f"%{q}h{x}")
-                e(f"{ind}%{q}fb = index.mul %{q}f, %{q}c72 : index")
-                e(f"{ind}%{q}ro = index.mul %{q}r, %{q}c9 : index")
-                e(f"{ind}%{q}sb = index.add %{q}fb, %{q}ro : index")
-
-                def store(x, v):
-                    a = f"%{q}sb"
-                    if x:
-                        e(f"    %{q}so{x} = index.constant {x} : index")
-                        e(f"    %{q}sa{x} = index.add %{q}sb, %{q}so{x} : index")
-                        a = f"%{q}sa{x}"
-                    e(f"    view.store {v}, %bfs_view[{a}] : i8, view<{nfrag * 72}xi8>")
-                GU.bfp_block(e, hs, q, store)
-
-            def copy(q, ind):   # 8-byte word id: fragment id / 9, word id % 9
-                e(f"{ind}%{q}f = index.div %{q}id, %{q}c9 : index")
-                e(f"{ind}%{q}w = index.rem %{q}id, %{q}c9 : index")
-                frag_of(q, f"%{q}f", ind)
-                e(f"{ind}%{q}gr = index.add %wg_row, %{q}r0 : index")
-                e(f"{ind}%{q}g8 = index.div %{q}gr, %{q}c8 : index")
-                e(f"{ind}%{q}kb0 = index.mul %dq_kp, %{q}ckq : index")
-                e(f"{ind}%{q}kbi = index.add %{q}kb0, %{q}kk : index")
-                frag = GE.emit_offset(e, "wgt", 0, bks, bpasses, GN.TN, True, f"%{q}g8", f"%{q}kbi", p=q, ind=ind)
-                e(f"{ind}%{q}wo = index.mul %{q}w, %{q}c8 : index")
-                e(f"{ind}%{q}ga = index.add {frag}, %{q}wo : index")
-                e(f"{ind}%{q}fb = index.mul %{q}f, %{q}c72 : index")
-                e(f"{ind}%{q}la = index.add %{q}fb, %{q}wo : index")
-                e(f"{ind}%{q}v = vector.load %bfs_view[%{q}la] : view<{nfrag * 72}xi8> -> vector<8xi8>")
-                e(f"{ind}vector.store %{q}v, %dq_out[%{q}ga] : vector<8xi8>, view<[%dq_tot]xi8>")
-
-            rounds(nrec, assemble)
-            e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-            rounds(nwd, copy)
-            e("  scf.yield " + ", ".join(nm for nm, _ in wn) + f" : {ctys}")
-            e("  }")
-            e("  }")
-            e("  kernel.return")
-            e("}")
-            return "\n".join(L) + "\n"
-        # copy the BM x KSUB tile to out[row][K] (f16), 8 halves per store
-        e("  %dq_k0 = index.mul %dq_kp, %cksub : index")
-        cpr = ksub // 8
-        nch = BM * cpr
-        e(f"  %dq_cpr = index.constant {cpr} : index")
-        e(f"  %dq_qm = index.constant {BM * cpr - 1} : index")
-        for i in range(-(-nch // LANES)):
-            e(f"  %dq_q{i}c = index.constant {i * LANES} : index")
-            e(f"  %dq_q{i}0 = index.add %tid, %dq_q{i}c : index")
-            e(f"  %dq_q{i} = index.min %dq_q{i}0, %dq_qm : index")
-            e(f"  %dq_r{i} = index.div %dq_q{i}, %dq_cpr : index")
-            e(f"  %dq_cq{i} = index.rem %dq_q{i}, %dq_cpr : index")
-            e(f"  %dq_c{i} = index.mul %dq_cq{i}, %c8 : index")
-            e(f"  %dq_v{i} = vector.load %wl_dq[%dq_r{i}, %dq_c{i}] : view<{BM}x{G.ROWP}xf16> -> vector<8xf16>")
-            e(f"  %dq_gr{i} = index.add %wg_row, %dq_r{i} : index")
-            e(f"  %dq_go{i} = index.mul %dq_gr{i}, %ktot : index")
-            e(f"  %dq_gk{i} = index.add %dq_k0, %dq_c{i} : index")
-            e(f"  %dq_ga{i} = index.add %dq_go{i}, %dq_gk{i} : index")
-            e(f"  vector.store %dq_v{i}, %dq_out[%dq_ga{i}] : vector<8xf16>, view<[%dq_tot]xf16>")
-        e("  scf.yield " + ", ".join(nm for nm, _ in wn) + f" : {ctys}")
-        e("  }")
-        e("  }")
-        e("  kernel.return")
-        e("}")
-        return "\n".join(L) + "\n"
     e("  %z8s = scalar.constant 0 : i8")
     e("  %z8v = vector.splat %z8s : vector<8xi8>")
     e(f"  %zeros = vector.constant 0.0 : {V8}")
@@ -1438,89 +1198,6 @@ def _split2_epilogue(e, t, V8):
     e("  }")
 
 
-def npu_wait(e):
-    """NPUADD: the views of the NPU's C and flag words, then gen_npu_unpack.WAIT_LOOP (its values prefixed nw_)."""
-    import re
-    import gen_npu_unpack as GU
-    A = NPUADD
-    nw = A["parts"] * A["calls"] * A["call"] // 2
-    e(f"  %nw_cn = index.constant {nw} : index")
-    e("  %npc_v = buffer.view %npuc_na[%base] : buffer -> view<[%nw_cn]xi32>")
-    e(f"  %nw_wlast = index.constant {nw - 2} : index")
-    e("  %nw_dv = buffer.view %done_na[%base] : buffer -> view<1xi32>")
-    e("  %nw_rv = buffer.view %ready_na[%base] : buffer -> view<1xi32>")
-    e("  %nw_sv = buffer.view %status_na[%base] : buffer -> view<1xi32>")
-    e("  %nw_c0 = index.constant 0 : index")
-    e("  %nw_want = view.atomic.load %nw_rv[%nw_c0] {ordering = acquire, scope = system} : view<1xi32> -> i32")
-    e("  %nw_zero = scalar.constant 0 : i32")
-    e("  %nw_one = scalar.constant 1 : i32")
-    e(f"  %nw_limit = scalar.constant {GU.FLAG_WAIT_POLLS} : i32")
-    e(re.sub(r"%(\w+)", r"%nw_\1", GU.WAIT_LOOP))
-    e("  %nw_c16i = scalar.constant 16 : i32")
-    e("  %nw_chii = scalar.constant -65536 : i32")
-    for nm, v in (("rows", A["rows"]), ("tn", A["tn"]), ("call", A["call"]), ("cs", A["tokens"] * A["tn"]), ("c8", 8),
-                  ("c2", 2), ("c4", 4), ("c16", 16), ("c64", 64), ("cbs", 64 * A["tn"]), ("cmp", A["np"] * 4 * 64)):
-        e(f"  %nw_{nm} = index.constant {v} : index")
-
-
-def npu_add(e, y, tok, row, val):
-    """NPUADD: val (vector<4xf32>, rows row .. row + 3 of token tok) plus the NPU's parts' values there."""
-    A = NPUADD
-    p = f"%nx{y}_"
-    e(f"  {p}call = index.div {row}, %nw_rows : index")
-    e(f"  {p}nc = index.rem {row}, %nw_rows : index")
-    e(f"  {p}col = index.div {p}nc, %nw_tn : index")
-    e(f"  {p}q = index.rem {p}nc, %nw_tn : index")
-    e(f"  {p}j = index.div {p}q, %nw_c8 : index")
-    e(f"  {p}jj = index.rem {p}q, %nw_c8 : index")
-    e(f"  {p}npi = index.div {p}j, %nw_c2 : index")
-    e(f"  {p}nh = index.rem {p}j, %nw_c2 : index")
-    e(f"  {p}a0 = index.mul {p}call, %nw_call : index")
-    e(f"  {p}a1 = index.mul {p}col, %nw_cs : index")
-    e(f"  {p}a2 = index.mul {p}npi, %nw_c4 : index")
-    e(f"  {p}a3 = index.add {p}a2, {p}nh : index")
-    e(f"  {p}a4 = index.mul {p}a3, %nw_c64 : index")
-    e(f"  {p}blk = index.div {tok}, %nw_c64 : index")
-    e(f"  {p}r = index.rem {tok}, %nw_c64 : index")
-    e(f"  {p}mp = index.div {p}r, %nw_c16 : index")
-    e(f"  {p}r16 = index.rem {p}r, %nw_c16 : index")
-    e(f"  {p}mh = index.div {p}r16, %nw_c8 : index")
-    e(f"  {p}rw = index.rem {p}r, %nw_c8 : index")
-    e(f"  {p}b0 = index.mul {p}blk, %nw_cbs : index")
-    e(f"  {p}b1 = index.mul {p}mp, %nw_cmp : index")
-    e(f"  {p}b2 = index.mul {p}mh, %nw_c2 : index")
-    e(f"  {p}b3 = index.mul {p}b2, %nw_c64 : index")
-    e(f"  {p}b4 = index.mul {p}rw, %nw_c8 : index")
-    acc = None
-    for i, nm in enumerate(("a0", "a1", "a4", "jj", "b0", "b1", "b3", "b4")):
-        if acc is None:
-            acc = f"{p}{nm}"
-            continue
-        e(f"  {p}s{i} = index.add {acc}, {p}{nm} : index")
-        acc = f"{p}s{i}"
-    e(f"  {p}w0 = index.div {acc}, %nw_c2 : index")
-    for pt in range(A["parts"]):
-        w = f"{p}w0"
-        if pt:
-            e(f"  {p}po{pt} = index.constant {pt * A['calls'] * A['call'] // 2} : index")
-            e(f"  {p}w{pt}u = index.add {p}w0, {p}po{pt} : index")
-            w = f"{p}w{pt}u"
-        e(f"  {p}wc{pt} = index.min {w}, %nw_wlast : index")   # always in range; for the bound proof
-        e(f"  {p}v{pt} = vector.load %npc_v[{p}wc{pt}] : view<[%nw_cn]xi32> -> vector<2xi32>")
-        fs = []
-        for wd in range(2):
-            e(f"  {p}e{pt}_{wd} = vector.extract {p}v{pt}[{wd}] : vector<2xi32> -> i32")
-            e(f"  {p}l{pt}_{wd} = scalar.shli {p}e{pt}_{wd}, %nw_c16i : i32")
-            e(f"  {p}h{pt}_{wd} = scalar.andi {p}e{pt}_{wd}, %nw_chii : i32")
-            for hl in ("l", "h"):
-                e(f"  {p}f{hl}{pt}_{wd} = scalar.bitcast {p}{hl}{pt}_{wd} : i32 to f32")
-                fs.append(f"{p}f{hl}{pt}_{wd}")
-        e(f"  {p}nv{pt} = vector.from_elements {', '.join(fs)} : vector<4xf32>")
-        e(f"  {p}sum{pt} = vector.addf {val}, {p}nv{pt} : vector<4xf32>")
-        val = f"{p}sum{pt}"
-    return val
-
-
 # swiglu through lds_epilogue: the gate loads of a 16-token column are issued this many columns before it is processed,
 # so their memory latency overlaps the column in between (0: each column loads its gate just before use). Measured
 # 2026-10-03: 1 is -1.2% IQ3_S / -0.7% IQ3_XXS swiglu cycles; 2 and 4 are slower (the epilogue is mostly a gate-stream
@@ -1532,25 +1209,16 @@ SW_GATE_AHEAD = 1
 # every f32 dn in [1, 2^126] (exhaustive on the GPU, yah-scratch/rcp/rcp_dump.loom: 0 of 1.06e9 differ) and dn = inf (the
 # select). In (2^126, inf) 1/dn is denormal and can differ, but there g is in [-88.7, -87.3], so g * iv * up is below
 # 1e-35 for any finite up and f16 rounds both to the same signed zero.
-FAST_RCP = True
 
 
 def rcp_consts(e, ind="  "):
-    if FAST_RCP:
-        e(f"{ind}%rcp_infb = scalar.constant 2139095040 : i32")
-        e(f"{ind}%rcp_inf = scalar.bitcast %rcp_infb : i32 to f32")
-        e(f"{ind}%rcp_zero = scalar.constant 0.0 : f32")
+    e(f"{ind}%rcp_infb = scalar.constant 2139095040 : i32")
+    e(f"{ind}%rcp_inf = scalar.bitcast %rcp_infb : i32 to f32")
+    e(f"{ind}%rcp_zero = scalar.constant 0.0 : f32")
 
 
-def recip1(e, out, dn, ind="  ", bare=False):
-    """out = 1 / dn for dn >= 1 (a sigmoid's denominator); needs %one, %negone and rcp_consts. bare: v_rcp_f32 alone
-    (1 ulp; rcp(inf) = 0)."""
-    if bare:
-        e(f"{ind}{out} = scalar.divf<nnan|ninf|nsz|arcp> %one, {dn} : f32")
-        return
-    if not FAST_RCP:
-        e(f"{ind}{out} = scalar.divf %one, {dn} : f32")
-        return
+def recip1(e, out, dn, ind="  "):
+    """out = 1 / dn for dn >= 1 (a sigmoid's denominator); needs %one, %negone and rcp_consts."""
     e(f"{ind}{out}_r0 = scalar.divf<nnan|ninf|nsz|arcp> %one, {dn} : f32")
     e(f"{ind}{out}_nd = scalar.mulf {dn}, %negone : f32")
     e(f"{ind}{out}_er = scalar.fmaf {out}_nd, {out}_r0, %one : f32")
@@ -1568,9 +1236,6 @@ KQG_GSIG16 = KQG_GSIG in ("16", "u16")   # u16: round(s * 65535) as unorm16 bits
 # sum of q^2 at tokens * 18432 ([token][head][16], 16-row group g = 2 (d / 32) + the lane's half; no cross-lane
 # shuffle); the attention applies the norm's 1 / rms to S
 KQG_QSPLIT = os.environ.get("KQG_QSPLIT", "0") == "1"
-KQG_QSPLIT_DIAG = os.environ.get("KQG_QSPLIT_DIAG", "")   # diags (wrong values, timing only): "now" no w load, "nosum"
-# no sums, "norot" no rotary stores
-KQG_QH = os.environ.get("KQG_QH", "0") == "1"   # diag: q rounded to f16, stored as f32 (the precision of an f16 q)
 
 
 def gsig16_consts(e):
@@ -1578,7 +1243,7 @@ def gsig16_consts(e):
     e("  %qs_neg4 = vector.constant -1.0 : vector<4xf32>")
     e("  %qs_l2e4 = vector.constant 1.4426950408889634 : vector<4xf32>")
     e("  %qs_fmax4 = vector.constant 3.4028234663852886e+38 : vector<4xf32>")
-    if KQG_GSIG in ("32u", "u16"):
+    if KQG_GSIG == "u16":
         e("  %qs_u16 = vector.constant 65535.0 : vector<4xf32>")
         e("  %qs_iu16 = vector.constant 1.5259021896696422e-05 : vector<4xf32>")
         e("  %qs_mag = vector.constant 12582912.0 : vector<4xf32>")
@@ -1596,16 +1261,6 @@ def gsig16(e, y, val, ind):
     e(f"{ind}%qs_nd{y} = vector.mulf %qs_c{y}, %qs_neg4 : vector<4xf32>")
     e(f"{ind}%qs_er{y} = vector.fmaf %qs_nd{y}, %qs_r0{y}, %qs_one4 : vector<4xf32>")
     e(f"{ind}%qs_r{y} = vector.fmaf %qs_er{y}, %qs_r0{y}, %qs_r0{y} : vector<4xf32>")
-    if KQG_GSIG == "32h":   # diag: f16 rounding, stored as f32 (the precision of =16 alone)
-        e(f"{ind}%qs_hh{y} = vector.fptrunc %qs_r{y} : vector<4xf32> to vector<4xf16>")
-        e(f"{ind}%qs_hr{y} = vector.extf %qs_hh{y} : vector<4xf16> to vector<4xf32>")
-        return f"%qs_hr{y}"
-    if KQG_GSIG == "32u":   # diag: unorm16 rounding (round(s * 65535) / 65535), stored as f32
-        e(f"{ind}%qs_ut{y} = vector.mulf %qs_r{y}, %qs_u16 : vector<4xf32>")
-        e(f"{ind}%qs_ua{y} = vector.addf %qs_ut{y}, %qs_mag : vector<4xf32>")
-        e(f"{ind}%qs_ur{y} = vector.subf %qs_ua{y}, %qs_mag : vector<4xf32>")
-        e(f"{ind}%qs_uq{y} = vector.mulf %qs_ur{y}, %qs_iu16 : vector<4xf32>")
-        return f"%qs_uq{y}"
     if KQG_GSIG == "u16":   # t + 2^23 holds round(t) in its low 16 bits (exact: t <= 65535); keep the low halves
         e(f"{ind}%qs_ut{y} = vector.mulf %qs_r{y}, %qs_u16 : vector<4xf32>")
         e(f"{ind}%qs_ua{y} = vector.addf %qs_ut{y}, %qs_m23 : vector<4xf32>")
@@ -1616,14 +1271,6 @@ def gsig16(e, y, val, ind):
         return f"%qs_r{y}"
     e(f"{ind}%qs_h{y} = vector.fptrunc %qs_r{y} : vector<4xf32> to vector<4xf16>")
     return f"%qs_h{y}"
-
-def qh(e, y, val):
-    """KQG_QH diag: q rounded to f16 and widened back"""
-    if not KQG_QH:
-        return val
-    e(f"    %qh_h{y} = vector.fptrunc {val} : vector<4xf32> to vector<4xf16>")
-    e(f"    %qh_r{y} = vector.extf %qh_h{y} : vector<4xf16> to vector<4xf32>")
-    return f"%qh_r{y}"
 
 def qsplit_views(e):
     """KQG_QSPLIT: f16 q (the f32 q's indices), rotary f32 and sums regions of the output, the norm weight"""
@@ -1651,8 +1298,6 @@ def qsplit_views(e):
     e("  %qs_x32 = scalar.constant 32 : i32")
     e("  %qs_s16 = scalar.constant 0.0625 : f32")
     e("  %qs_s16v = vector.splat %qs_s16 : vector<4xf32>")
-    if "norot" in KQG_QSPLIT_DIAG:
-        e("  %false_qs = index.cmp ult, %qs_c64, %qs_c8 : index")
 
 
 def qsplit_lane(e):
@@ -1670,8 +1315,6 @@ def qsplit_lane(e):
 
 def qsplit_sums(e, j, tka):
     """KQG_QSPLIT: the lane's 16 squares' sum, stored by every q lane (its own 16-row group)"""
-    if "nosum" in KQG_QSPLIT_DIAG:
-        return
     for x in range(4):
         e(f"  %qse{j}_{x} = vector.extract %qsa{j}_3[{x}] : vector<4xf32> -> f32")
     e(f"  %qsb{j}_0 = scalar.addf %qse{j}_0, %qse{j}_1 : f32")
@@ -1695,9 +1338,6 @@ def qsplit_sq(e, j, n, val):
 
 def qsplit_w(e, y, d, c):
     """KQG_QSPLIT: w / 16 for rows d + c .. + 3, loaded at its use (hoisted, 16 VGPRs live through the epilogue)"""
-    if "now" in KQG_QSPLIT_DIAG:
-        e(f"    %qsw{y} = vector.splat %qs_s16 : vector<4xf32>")
-        return
     e(f"    %qswc{y} = index.constant {c} : index")
     e(f"    %qswb{y} = index.add {d}, %qswc{y} : index")
     e(f"    %qswa{y} = index.min %qswb{y}, %qs_c252 : index")   # (d + c <= 252 already)
@@ -1707,7 +1347,7 @@ def qsplit_w(e, y, d, c):
 
 def qsplit_tall_sums(e, g, j, tka):
     """KQG_QSPLIT, tall epilogue: on odd g the lane's 16 squares of slabs g - 1, g (its own 16-row group), stored"""
-    if g % 2 == 0 or "nosum" in KQG_QSPLIT_DIAG:
+    if g % 2 == 0:
         return
     for x in range(4):
         e(f"  %qse{g}_{j}_{x} = vector.extract %qsa{g // 2}_{j}_3[{x}] : vector<4xf32> -> f32")
@@ -1721,12 +1361,10 @@ def qsplit_tall_sums(e, g, j, tka):
     e("  }")
 
 
-def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False):
+def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
     """Store out[t*m + r] (+ resid) for the wave's TM x TN tile, one 16-token column of fragments at a time.
     Fragments go to an LDS slab; each lane reads 16 contiguous rows of one token (two lanes per token) and writes 4 b128 stores.
-    A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical.
-    col_fence: a fence per column keeps each column's residual loads (4 b128 per lane) below the previous column: hoisted
-    all at once, a workgroup's 512 DRAM misses stall the co-resident waves' operand loads (iu4 kres K = 6144 -20%)."""
+    A direct fragment store writes each lane's values at an 8-byte row stride instead. Same values: bit-identical."""
     if sw and SW_GATE_AHEAD:
         return _lds_epilogue_ahead(e, t, kr, V8, sw, qg, masked)
     TM, FM, FN = t.tm, t.tm // 16, t.tn // 16
@@ -1787,8 +1425,6 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
         if KQG_QSPLIT:
             qsplit_lane(e)
     for j in range(FN):
-        if col_fence and j:
-            e("  scf.schedule.fence")
         for i in range(FM):
             e(f"  %es_r{i}_{j} = index.constant {16 * i} : index")
             e(f"  vector.fragment.store<result> %acc{i * FN + j}, %es_view[%es_r{i}_{j}, %c0] shape [%m, %n] : {V8}, view<{TM}x16xf32, %es_lay>")
@@ -1874,7 +1510,7 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False, col_fence=False
                 e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
                 e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
                 e(f"  scf.if %qg_isq {{")
-                e(f"    vector.store {qh(e, f'{j}_{q}', val)}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e(f"    vector.store {val}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  } else {")
                 if KQG_GSIG:
                     e(f"    vector.store {gsig16(e, f'{j}_{q}', val, '    ')}, %g_flat[%qg_oi{j}_{q}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
@@ -1925,8 +1561,6 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         e(f"  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]x{'f16' if OUT16 and not kr else 'f32'}>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
-    if NPUADD:
-        npu_wait(e)
     if masked:
         e("  %et_tok_last = index.sub %tokens, %c1 : index")
     e("  %et_lane = index.rem %tid, %c32 : index")
@@ -2052,9 +1686,6 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     e(f"  %et_rf{y} = vector.load %res_flat[%et_oi{y}] : view<[%out_total]xf32> -> vector<4xf32>")
                     e(f"  %et_rs{y} = vector.addf %et_rf{y}, %et_v{y} : vector<4xf32>")
                     val = f"%et_rs{y}"
-                if NPUADD:   # access q: token + tpa q (coalesced), rows et_row{g} .. + 3
-                    e(f"  %nt{y} = index.add {tka}, %et_qk{y} : index")
-                    val = npu_add(e, y, f"%nt{y}", f"%et_row{g}", val)
                 if qg and KQG_QSPLIT:
                     e(f"  %qg_oi{y} = index.min %et_oi{y}, %qg_last4 : index")
                     qsplit_sq(e, f"{g // 2}_{j}", 2 * (g % 2) + q, val)   # (a 32-row group: slabs g - g % 2, + 1)
@@ -2063,7 +1694,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     e(f"    %qsy{y} = vector.mulf {val}, %qsw{y} : vector<4xf32>")
                     e(f"    %qsh{y} = vector.fptrunc %qsy{y} : vector<4xf32> to vector<4xf16>")
                     e(f"    vector.store %qsh{y}, %qs_h[%qg_oi{y}] : vector<4xf16>, view<[%qg_tot]xf16>")
-                    e(f"    scf.if %qs_isrot{g} {{") if "norot" not in KQG_QSPLIT_DIAG else e("    scf.if %false_qs {")
+                    e(f"    scf.if %qs_isrot{g} {{")
                     e(f"      %qsr{y} = index.add %qsrb{q0}, %et_q{y}c : index")
                     e(f"      vector.store {val}, %qs_rot[%qsr{y}] : vector<4xf32>, view<[%qs_rtot]xf32>")
                     e("    }")
@@ -2076,7 +1707,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     # always in range; the clamp states it for the bound proof
                     e(f"  %qg_oi{y} = index.min %et_oi{y}, %qg_last4 : index")
                     e(f"  scf.if %qg_isq{g} {{")
-                    e(f"    vector.store {qh(e, y, val)}, %q_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                    e(f"    vector.store {val}, %q_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
                     e("  } else {")
                     if KQG_GSIG:
                         e(f"    vector.store {gsig16(e, y, val, '    ')}, %g_flat[%qg_oi{y}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")
@@ -2306,7 +1937,7 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
                 e(f"  %qg_oir{j}_{q} = index.add %qg_ob{j}, %es_q{j}_{q}c : index")
                 e(f"  %qg_oi{j}_{q} = index.min %qg_oir{j}_{q}, %qg_last4 : index")
                 e(f"  scf.if %qg_isq {{")
-                e(f"    vector.store {qh(e, f'{j}_{q}', val)}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
+                e(f"    vector.store {val}, %q_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  } else {")
                 if KQG_GSIG:
                     e(f"    vector.store {gsig16(e, f'{j}_{q}', val, '    ')}, %g_flat[%qg_oi{j}_{q}] : vector<4x{'f16' if KQG_GSIG16 else 'f32'}>, view<[%qg_tot]x{'f16' if KQG_GSIG16 else 'f32'}>")

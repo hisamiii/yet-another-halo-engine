@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked] [ostride=<rows>]
-[kfull=<k_blocks of the whole row>] [npuc=<bytes>]
+[kfull=<k_blocks of the whole row>]
 
 Compile the source under the exact config and read each root's declared byte envelope from the compile report.
 Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for that root.
@@ -24,13 +24,13 @@ fmts = fmt.split(":")
 qk, bpb = QB[fmts[0]]
 M, K = mt * 16, kb * qk
 MO = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("ostride=")), M)
-# kfull: a K window (dequant chunk, gen_gemm_tile.DQ_BFP / KWIN) reading kb of each <kfull>-block weight row (and input row)
+# kfull: a K window (gen_gemm_tile.KWIN) reading kb of each <kfull>-block weight row (and input row)
 KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")), kb)
 # a split ffn reads the full gate tensor's rows before the up rows
 wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
 GRID = {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096, "iq2s": 8192}
 bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate": B * MO * 4,
-         "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4) // (2 if kind == "kst2" else 1),
+         "output": B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4) // (2 if kind == "kst2" else 1),
          "gate_out": B * MO * 2,
          # gen_gemm_tile KQG_QSPLIT: the q head-norm weight (256 f32)
          "qnw": 1024,
@@ -41,10 +41,7 @@ bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate
          "grid": next((GRID[f] for f in fmts if f in GRID), 0),
          "gridu": GRID[fmts[1]] if len(fmts) > 1 and all(f in GRID for f in fmts) else 0,
          "ksigns": 128, "ksignsu": 128,
-         "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4,
-         # gen_gemm_tile.NPUADD: the NPU's down partials the engine binds, its flag words
-         "npuc": next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("npuc=")), 0),
-         "done": 4, "ready": 4, "status": 4}
+         "wstage": 17408 * 16 * 2, "ostage": 20480 * B * 4}
 sys.path.insert(0, os.path.dirname(HERE))
 import hrx_paths  # noqa: E402
 e = hrx_paths.env()

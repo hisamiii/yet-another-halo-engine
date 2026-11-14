@@ -11,7 +11,8 @@ Layout:
 - `engine/gpu/loom/tools/`: kernel generators. `emit_prefill_pp.py` and `emit_decode.py` write a HAL set (compiled kernels + `dispatch.txt` / `decode.txt`); `*_check.py` test generated kernels against numpy oracles through `hal_run`.
 - `engine/gpu/loom/*.loom`: hand-written Loom kernels the emitters still read; `tables/`: IQ codebooks.
 - `engine/run/`: the drivers (`loom_forward_pp.cc` prefill and prefill -> decode, `loom_decode.cc`, `hal_run.cc`), `gpu_run.sh` (run every GPU job through it), `gate/` (accuracy gate), `kvq/` (KV codec gate).
-- `engine/model/`: `loom_runtime.hpp` (HRX wrappers), `loom_decoder.hpp` (the decode step).
+- `engine/model/`: `loom_runtime.hpp` (HRX wrappers), `loom_prefill.hpp` (the prefill), `loom_decoder.hpp` (the decode step), `loom_npu.hpp` (the NPU side), `engine.hpp` (load once, serve requests).
+- `engine/serve/`: `yah_server` (OpenAI-compatible API), `yah_chat`, and their tests.
 - `engine/core/`: model reader (GGUF), model config, tokenizer, small CLI tools.
 - `engine/tests/`: end-to-end gates.
 - `docs/`: see Docs below.

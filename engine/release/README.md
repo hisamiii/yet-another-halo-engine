@@ -6,7 +6,7 @@ Needs:
 - a gfx1151 GPU with a recent kernel's amdgpu driver (tested on Linux 7.3)
 - glibc 2.39 or later (Ubuntu 24.04, Fedora 40, Debian 13, Arch)
 - read and write access to `/dev/kfd` and `/dev/dri/renderD*`: membership in the `render` group on most distros
-- about 17 GB of GPU-visible memory: the model (15 GB) and a 32K-token kv8 cache. On a 32 GB machine, set the BIOS GPU carve-out low and let the GTT take it.
+- about 21 GB of GPU-visible memory for `Qwen3.8-27B-UD-IQ4_XS.gguf` (a 14.3 GB file) with a 32K-token kv8 cache, by the server's own estimate: it checks that against `MemAvailable` before it loads. On a 32 GB machine, set the BIOS GPU carve-out low and let the GTT take it.
 - the model as a GGUF, for example `Qwen3.8-27B-UD-IQ4_XS.gguf`
 
 ## Run
@@ -15,7 +15,7 @@ Needs:
 bin/yah_server --model Qwen3.8-27B-UD-IQ4_XS.gguf [--host 127.0.0.1] [--port 8080]
 ```
 
-It is ready when `curl localhost:8080/health` answers. The first start takes about a minute.
+It is ready when `curl localhost:8080/health` answers.
 
 ```
 bin/yah_chat --url http://127.0.0.1:8080     # a terminal chat client
@@ -40,12 +40,12 @@ The HAL sets in `hal/` give 32K tokens of context, with an 8-bit KV cache (`hal/
 
 ## The NPU
 
-`--npu` runs part of each layer's FFN on the XDNA2 NPU during prompt processing: long prompts (two chunks, 4096 tokens or more) get about 10% faster. It needs:
+`--npu` splits the large GEMMs of prompt processing with the XDNA2 NPU (the bundle's `prefill-npu` set). How much faster that makes a request through the server is not measured yet. It needs:
 - the `amdxdna` driver, with read and write access to `/dev/accel/accel0`
 - an unlimited memlock limit (`<user> - memlock unlimited` in `/etc/security/limits.d/90-yah.conf`, then log in again)
 - the GPU's DPM level at `high` while it runs (clock switches corrupt the NPU's outputs). The server pins it at start and puts the previous level back when it exits, however it exits. It writes `/sys/class/drm/card*/device/power_dpm_force_performance_level` directly when it may, else through `doas -n tee` or `sudo -n tee`; grant one without a password, e.g. the doas.conf line `permit nopass <user> cmd tee args /sys/class/drm/card1/device/power_dpm_force_performance_level`.
 
-Without one of them the server says why (`yah_server: npu off: ...`) and runs on the GPU alone. The start takes about 3 s longer: the NPU's down weights are packed from the model.
+Without one of them the server says why (`yah_server: npu off: ...`) and runs on the GPU alone.
 
 ## If something is off
 

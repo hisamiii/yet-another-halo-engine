@@ -23,13 +23,13 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import dataclasses  # noqa: E402
-import dq_bfp16_check as DQ  # noqa: E402
+import bfp16_check as BC  # noqa: E402
 import gen_kres_persist  # noqa: E402
 import emit_prefill_pp as EP  # noqa: E402
 import gen_gemm_tile as TG  # noqa: E402
 
-EMIT = DQ.EMIT
-HALRUN, GPURUN = DQ.HALRUN, DQ.GPURUN
+EMIT = BC.EMIT
+HALRUN, GPURUN = BC.HALRUN, BC.GPURUN
 
 
 def tile(fmt, kind, kb, n, mode):
@@ -75,7 +75,7 @@ def main():
     os.makedirs(work, exist_ok=True)
     rd = gguf.GGUFReader(model)
     tn = next(x for x in rd.tensors if x.name == name)
-    fmt = DQ.FMT[tn.tensor_type.name]
+    fmt = BC.FMT[tn.tensor_type.name]
     K, N = int(tn.shape[0]), int(tn.shape[1])
     x = np.fromfile(act, np.float16)
     B = x.size // K
@@ -109,7 +109,7 @@ def main():
         x.reshape(B // 16, 16, K // 16, 16).transpose(0, 2, 1, 3).tofile(act_t)
         act = act_t
     esz = 2 if out16 else 4
-    tables = [DQ.table_file(fmt, e) for e in TG.G.FMTS[fmt]["extra"]]
+    tables = [BC.table_file(fmt, e) for e in TG.G.FMTS[fmt]["extra"]]
     wst, ost = 17408 * 16 * 2, 17408 * B * 4   # the driver's wstage_ / ostage_
     env = dict(os.environ, HAL_RUN_ITERS="1")
 

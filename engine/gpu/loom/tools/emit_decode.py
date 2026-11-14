@@ -207,7 +207,7 @@ def main():
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
         "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + "chain - 0 0\n" + "amax - 0 0\n" +
-        ("latestate - 0 0\n" if DM.LATE_STATE else "") + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
+        "latestate - 0 0\n" + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)
     print("emitted %d GEMV + %d band GEMV + the decode HALs (max context %d) to %s" % (len(gs), len(bs), T, outdir))
