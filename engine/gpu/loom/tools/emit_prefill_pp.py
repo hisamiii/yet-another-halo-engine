@@ -373,8 +373,7 @@ TILE_FMTS = ("iq3s", "iq4xs", "iq4nl", "iq3xxs", "q4k", "q5k", "q6k", "iq2xxs", 
 
 # Activations-from-global GEMMs (gen_gemm_tile Tile.afrag): "<hal>.af.hal" reads a fragment-major input (Tile.atiled; the
 # FFN norm "norm_t.hal" and the swiglu "<hal>.af.to.hal" write it). 512-token tiles, only the decoded weights in LDS.
-# Same values as the GEMM. YAH_AFRAG=0 leaves them out.
-AFRAG = os.environ.get("YAH_AFRAG", "1") != "0"
+# Same values as the GEMM.
 AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, stg_minwg=0,
                tallepi=True, ecoal=True, esr=32)
 AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
@@ -512,8 +511,6 @@ AF_MIX = dict(ffn_inload=True, bpre=0, b0early=False, lhs_stream=0)
 # (11-03), bit-identical: iq3xxs:iq3s -1.6%, iq2xs:iq3s -1.5%, iq2s:iq3xxs -1.3%, iq4xs:iq3s -1.0%, iq3xxs:iq2s -0.8%,
 # iq3s:iq4xs -0.6%, q3k:iq3s -0.3%, GEMMs -0.13%; iq2xs:iq2s +1.7% (keeps the in-decode loads)
 AF_SEL = dict(ffn_sel=True, bpre=0, b0early=False, lhs_stream=1)
-if __import__("os").environ.get("YAH_FFN_SEL", "1") == "0":
-    AF_SEL = AF_MIX
 AF_FFN_MIX = {
     ("iq3s", "iq4xs"): dict(AF_FFN["iq3s"], **AF_SEL),
     ("iq4xs", "q4k"): dict(AF_FFN["iq4xs"], **AF_SEL),
@@ -540,7 +537,7 @@ def ffn_fused(rows, B, outdir):
     """Emit "gemm_ffn_<fmt>_<mt>_<kb>.af.hal" / ".af.to.hal" for each AF_FFN format some layer uses for both its gate
     and up, and "gemm_ffn_<gate>_<up>_.." for each AF_FFN_MIX pair some layer has; return the dispatch.txt rows."""
     import gen_gemm_tile as TG
-    if not AFRAG or B % AF_TILE["bn"]:
+    if B % AF_TILE["bn"]:
         return []
     by = {}
     for nm, dims, ty in rows:
@@ -572,7 +569,6 @@ def ffn_fused(rows, B, outdir):
 # to the second output (gen_gemm_tile.SPLIT2). gemm_bench 11-02: 0.111 vs 0.157 Mcyc for the two 48-row kstores (the
 # merged rows at the old 16-row tile 0.144: the tile, not the shared input, wins); pp2048 counters 20.2 -> 15.5 Mcyc.
 # Same values.
-KST2 = os.environ.get("YAH_KST2", "1") == "1"
 KST2_GEOM = (48, 64, 3, 2)
 
 
@@ -607,7 +603,6 @@ def kst2(rows, B, outdir):
 # attention: the q + gate kqg + attn_k + attn_v (their afrag tiles; k and v are not adjacent and often of two formats).
 # "seg_<kind>_<fmt>_<mt>_<kb>__..." per segment, the large GEMM first; dispatch.txt "<hal> <tile> <groups> <tt>": the
 # grid x (all segments' row groups) in the rowgrp column. Same values.
-SEG = os.environ.get("YAH_SEG", "1") == "1"
 SEG_SMALL = dict(ksl=True, bm=48, tallepi=False, ecoal=False)   # the 48-row afrag tile (fragment-store epilogue)
 SEG_VGPR_TIER = 192   # 1536 / 8 waves: two 16-wave workgroups per WGP
 # riders' knobs when the segmented GEMM would cross the tier: each A fragment loaded just before its MMAs, one step
@@ -629,7 +624,7 @@ def seg_gemms(rows, B, outdir):
     import gen_gemm_tile as TG
     import gen_segcat
     import hrx_paths
-    if not (AFRAG and B % AF_TILE["bn"] == 0):
+    if B % AF_TILE["bn"]:
         return []
     by = {}
     for nm, dims, ty in rows:
@@ -697,7 +692,7 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     """Emit "<hal>.af.hal" (and for swiglu "<hal>.af.to.hal", fragment-major output) if this GEMM has an afrag form."""
     import gen_gemm_tile as TG
     knobs = AF.get((fmt, kind, mt, kb))
-    if not AFRAG or knobs is None or B % AF_TILE["bn"]:
+    if knobs is None or B % AF_TILE["bn"]:
         return []
     knobs = dict(knobs)
     if kind == "kres" and kb == 24:
@@ -943,7 +938,7 @@ def npu_split(rows, combos, B, outdir):
         if fmt in TILE_FMTS and mt % t.rowgrp == 0:
             split(fmt, kind, mt, kb, t, base, nn)
         knobs = AF.get((fmt, kind, mt, kb))
-        if AFRAG and knobs is not None and B % AF_TILE["bn"] == 0:
+        if knobs is not None and B % AF_TILE["bn"] == 0:
             knobs = dict(knobs)
             persist = knobs.pop("persist", False)
             ta = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **knobs)
@@ -1023,7 +1018,7 @@ def npu_split(rows, combos, B, outdir):
                 assert nn // 16 not in O16_MT, "the remainder writes f32"
                 out.append(_emit_gen(gen_rem, tr.bn, fmt, nn // 16, kbw, B, "npurem_%s_%s.hal" % (site, fmt), outdir,
                                      "kstore", tr.rowgrp, kfull=kb))
-    if "ffn" in NPU_SPLIT and AFRAG and B % AF_TILE["bn"] == 0:   # the fused gate + up GEMMs (ffn_fused)
+    if "ffn" in NPU_SPLIT and B % AF_TILE["bn"] == 0:   # the fused gate + up GEMMs (ffn_fused)
         by = {}
         for nm, dims, ty in rows:
             p = nm.split(".")
@@ -1367,7 +1362,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     import gen_gemm_tile as TG
     import gen_npu_unpack as GU
     F = NPU_FFNBLK
-    assert NPU_DCOL and (F == 7168 or NPU_FUSE and F % 1024 == 0) and "ffn" not in NPU_SPLIT and AFRAG
+    assert NPU_DCOL and (F == 7168 or NPU_FUSE and F % 1024 == 0) and "ffn" not in NPU_SPLIT
     assert B % AF_TILE["bn"] == 0
     by = {}
     for nm, dims, ty in rows:
@@ -1702,10 +1697,8 @@ def main():
 
     if not EMIT_HALF:
         geom.extend(ffn_fused(rows, B, outdir))
-        if KST2:
-            geom.extend(kst2(rows, B, outdir))
-        if SEG:
-            geom.extend(seg_gemms(rows, B, outdir))
+        geom.extend(kst2(rows, B, outdir))
+        geom.extend(seg_gemms(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
         import gen_bfp16_encode as GE
         import gen_npu_unpack as GU
@@ -1826,7 +1819,7 @@ def main():
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
     af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
     if EMIT_HALF:   # the whole set's (its o-projections' afrag forms)
-        af24 = AFRAG and B % AF_TILE["bn"] == 0 and any(
+        af24 = B % AF_TILE["bn"] == 0 and any(
             AF.get((fmt, "kres", mt, kb)) is not None for kind, fmt, port, mt, kb in combos
             if kind == "residual" and (mt, kb) == (320, 24))
     attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
