@@ -183,9 +183,14 @@ int main(int argc, char** argv) {
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
     lap("prefill set");
 #ifdef YAH_WITH_NPU
-    yah::model::DpmPin dpm;  // (the level restored after the NPU stops)
+    yah::model::DpmPin dpm;  // the NPU split's (the level restored after the NPU stops)
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
-    if (opt.npu) {
+    std::unique_ptr<yah::model::LoomNpuAttn> npu_attn;  // an NPU attention set's (dispatch.txt npuattn)
+    if (opt.npu && pf.npu_attn_set()) {                 // (no DPM pin: LoomNpuAttn)
+      npu_attn = std::make_unique<yah::model::LoomNpuAttn>(gpu);
+      pf.EnableNpuAttn(npu_attn.get());
+      lap("npu enable");
+    } else if (opt.npu) {
       const auto plan = pf.npu_plan();
       if (plan.a_bytes == 0) {
         std::fprintf(stderr, "--npu: needs a set with the NPU split (emit_prefill_pp.py YAH_NPU_SPLIT)\n");
@@ -302,6 +307,7 @@ int main(int argc, char** argv) {
     std::printf("layers_ms=%.1f\n", layer_ms);
 #ifdef YAH_WITH_NPU
     if (npu) npu->Report(stdout);
+    if (npu_attn) npu_attn->Report(stdout), npu_attn->Finish();
     pf.ReportWaitLog(stdout);
     pf.ReportNpuProf();
 #endif

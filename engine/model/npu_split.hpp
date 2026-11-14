@@ -98,6 +98,29 @@ class NpuSplit {
   virtual NpuProf* Prof() { return nullptr; }
 };
 
+// The NPU's side of the split prefill attention (tools/gen_npu_attn.py, dispatch.txt "npuattn"): per full-attention
+// layer of a deep chunk, the calls of KV heads [4 - kvn, 4) (3 kvn (B / 256) calls of 32 cores: one head pair, 256
+// tokens), host-gated on flag words (NpuSplit's protocol: the graph stores ready, the GPU's wait polls done).
+class NpuAttn {
+ public:
+  virtual ~NpuAttn() = default;
+  // The shared buffers the GPU writes (the encoders' records, key norms and payloads) and reads (the outputs), and the
+  // flag words (host memory), as gen_npu_attn_encode's layer forms lay them out.
+  struct Buffers {
+    const LoomBuffer *ks, *vs, *kn, *kq, *vq, *out, *flags;
+  };
+  // Allocates the buffers, loads the image built for nbs bodies and binds every call; once, before any chunk.
+  virtual Buffers Setup(const std::string& image, std::uint32_t kvn, std::uint32_t nbs, std::uint32_t B) = 0;
+  // Queues a layer's calls at nb bodies: submitted once word ready reaches value, then done gets value (value |
+  // NpuSplit::kGateFailed if the job failed or its ready word did not come).
+  virtual void Enqueue(std::uint32_t nb, std::uint32_t ready, std::uint32_t done, std::uint32_t value,
+                       const std::string& tag) = 0;
+  [[nodiscard]] virtual std::uint32_t Word(std::uint32_t word) = 0;
+  // After the GPU finished its work: waits for the queued jobs (one still without its ready word fails); throws if one
+  // failed or a GPU wait timed out (word NpuSplit::kFlagStatus).
+  virtual void Finish() = 0;
+};
+
 }  // namespace yah::model
 
 #endif  // YAH_MODEL_NPU_SPLIT_HPP_

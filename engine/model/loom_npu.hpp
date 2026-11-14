@@ -490,9 +490,9 @@ class LoomNpu {
   }
   // A layer's calls of one image as one command (its first call sets the array up if another image ran since), nb
   // bodies each (<= the image's nb_built; the payloads carry nb too). The host thread submits it once *ready >=
-  // ready_value; the reaper stores done_value to *done after it (done_value | kGateFailed after a failure or ~5 s
-  // without ready). Commands run in enqueue order: no gated job may queue behind an unsubmitted one (EnqueueGated
-  // checks).
+  // ready_value; the reaper stores done_value to *done after it (done_value | kGateFailed after a failure, or without
+  // ready once the GPU is done: Drain). Commands run in enqueue order: no gated job may queue behind an unsubmitted one
+  // (EnqueueGated checks).
   struct AttnJob {
     std::vector<const AttnCall*> calls;
     std::uint32_t nb = 0;
@@ -688,9 +688,13 @@ class LoomNpu {
     s = Script{};
   }
   // Waits until the reaper retired every command, queued attention commands included (stats and failures are in).
-  void Drain() {
+  // gpu_done: the GPU has finished all work it was given, so a queued attention command whose ready word is not there
+  // never gets it and fails.
+  void Drain(bool gpu_done = false) {
     std::unique_lock<std::mutex> lock(mu_);
+    attn_gpu_done_ = gpu_done;
     retired_cv_.wait(lock, [this] { return retired_ == submitted_ && attn_queue_.empty(); });
+    attn_gpu_done_ = false;
   }
   // Per job tag: jobs, calls.
   struct TagStats {
@@ -713,6 +717,19 @@ class LoomNpu {
   }
   // NPU time of the last retired command (CommandStats).
   [[nodiscard]] double LastCommandMs() const { return last_command_ms_.load(); }
+  // One line per job tag (jobs, calls), then the commands (CommandStats).
+  void Report(std::FILE* f) {
+    for (const auto& [tag, st] : Stats())
+      std::fprintf(f, "npu: %-5s %4zu jobs %5zu calls\n", tag.c_str(), st.jobs, st.calls);
+    const CommandStats c = Commands();
+    std::fprintf(f, "npu: %zu commands, NPU %.1f ms (waits for the GPU included), longest %.1f ms\n", c.commands,
+                 c.busy_ms, c.max_ms);
+    std::fprintf(f,
+                 "npu: %.1f MB of commands, host waits for a free arena %zu (%.1f ms), NPU idle with none queued "
+                 "%.1f ms\n",
+                 c.bytes / 1e6, c.arena_waits, c.arena_wait_ms, c.idle_ms);
+    if (c.replayed) std::fprintf(f, "npu: %zu commands replayed\n", c.replayed);
+  }
   // Throws if a command failed.
   NpuProf* Prof() { return prof_.get(); }
   void CheckHealth() {
@@ -1234,15 +1251,15 @@ class LoomNpu {
   std::deque<AttnPending> attn_queue_;  // under mu_
   std::condition_variable attn_cv_;
   std::thread attn_thread_;
-  static constexpr auto kAttnReadyTimeout = std::chrono::seconds(5);
+  bool attn_gpu_done_ = false;  // under mu_ (Drain)
   void AttnQueued() {
     std::lock_guard<std::mutex> lock(mu_);
     if (!attn_queue_.empty()) throw LoomError("npu: a command would run before queued attention commands");
   }
-  // Polls each queued command's ready word (~50 us apart) and submits it. Without ready for kAttnReadyTimeout after the
-  // previous submission, or after any failure, a command fails: its done gets kGateFailed and nothing later runs.
+  // Polls each queued command's ready word (~20 us apart) and submits it. No time limit: the host queues chunks ahead
+  // of the GPU, so a ready word can be many seconds away. After any failure, or without ready once the GPU is done
+  // (Drain), a command fails: its done gets kGateFailed and nothing later runs.
   void AttnSubmitter() {
-    auto since = std::chrono::steady_clock::now();
     for (;;) {
       AttnPending* p = nullptr;
       {
@@ -1257,7 +1274,7 @@ class LoomNpu {
         {
           std::lock_guard<std::mutex> lock(mu_);
           stop = stop_ || !failure_.empty();
-          if (!stop && std::chrono::steady_clock::now() - std::max(since, p->t0) > kAttnReadyTimeout) {
+          if (!stop && attn_gpu_done_ && __atomic_load_n(p->ready, __ATOMIC_ACQUIRE) < p->ready_value) {
             failure_ = "npu: an attention job's ready word never came (" + p->job.tag + ")";
             stop = true;
           }
@@ -1279,7 +1296,6 @@ class LoomNpu {
         continue;
       }
       const std::uint64_t submission = Submit(p->command);
-      since = std::chrono::steady_clock::now();
       {
         std::lock_guard<std::mutex> lock(mu_);
         pending_.push_back({submission, {p->job}, p->t0});
@@ -1853,17 +1869,9 @@ class LoomNpuSplit : public NpuSplit {
   void Report(std::FILE* f) {
     npu_.Drain();
     if (Word(kFlagStatus)) std::fprintf(f, "npu: ERROR a GPU wait for the NPU failed\n");
-    for (const auto& [tag, st] : npu_.Stats())
-      std::fprintf(f, "npu: %-5s %4zu jobs %5zu calls\n", tag.c_str(), st.jobs, st.calls);
-    const LoomNpu::CommandStats c = npu_.Commands();
-    std::fprintf(f, "npu: %zu commands, NPU %.1f ms (waits for the GPU included), longest %.1f ms\n", c.commands,
-                 c.busy_ms, c.max_ms);
-    std::fprintf(f, "npu: %.1f MB of commands, host waits for a free arena %zu (%.1f ms), NPU idle with none queued %.1f ms\n",
-                 c.bytes / 1e6, c.arena_waits, c.arena_wait_ms, c.idle_ms);
-    if (c.replayed) std::fprintf(f, "npu: %zu commands replayed\n", c.replayed);
+    npu_.Report(f);
   }
 
- private:
   // The amdgpu card's DPM performance level is "high" (results.md: deferred data-fabric errors otherwise).
   static bool GpuPinnedHigh() {
     for (int card = 0; card < 8; ++card) {
@@ -1873,6 +1881,8 @@ class LoomNpuSplit : public NpuSplit {
     }
     return false;
   }
+
+ private:
   // Gate slots, one per bound call from byte kGateBase of the flag words (below it: kFlagStatus), every view 64-byte
   // aligned: flag record (+0: ready), tick scratch (+kTick), signal (+kSignal: go, then done one record later).
   static constexpr std::size_t kGateBase = 256, kGateSlot = 192, kTick = 64, kSignal = 128;
@@ -1920,6 +1930,71 @@ class LoomNpuSplit : public NpuSplit {
   std::map<std::tuple<std::string, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>,
            std::uint32_t>
       ids_;
+};
+
+// The split prefill attention's NPU side on its own LoomNpu (a set splits either the GEMMs or the attention).
+class LoomNpuAttn : public NpuAttn {
+ public:
+  // No DPM pin (the GEMM split's): on auto the 128K kv8 runs matched the pinned ones bit for bit with no machine checks
+  // logged, and the pin's fabric clock costs the GPU ~10% at depth (results.md).
+  explicit LoomNpuAttn(LoomDevice& gpu) : npu_(gpu, 8) {}
+  Buffers Setup(const std::string& image, std::uint32_t kvn, std::uint32_t nbs, std::uint32_t B) override {
+    if (!calls_.empty()) throw LoomError("npu attention: set up twice");
+    constexpr std::size_t kRec = 4608, kOut = 34816, kMc = 16, kMcf = 17;
+    const std::size_t slots = nbs + 1, half = slots * kRec, heads = std::size_t{2} * half, pay = 2 * kMcf * kRec;
+    const std::size_t calls = std::size_t{3} * kvn * (B / 256), per_head = calls / kvn;
+    LoomNpu::Shared& ks = npu_.CreateShared(kvn * heads);
+    LoomNpu::Shared& vs = npu_.CreateShared(kvn * heads);
+    LoomNpu::Shared& kn = npu_.CreateShared(std::size_t{4} * kvn * (16 * (nbs / 16 - 1) - 1));
+    LoomNpu::Shared& kq = npu_.CreateShared(calls * pay);
+    LoomNpu::Shared& vq = npu_.CreateShared(calls * pay);
+    LoomNpu::Shared& out = npu_.CreateShared(calls * kMc * kOut, true);  // the NPU writes it (CreateShared)
+    flags_ = &npu_.CreateShared(4096, true);
+    // a call's views: its KV head's 4 record streams, its 16 cores' outputs, its 4 payload prefixes
+    auto views = [&](std::size_t c) {
+      const std::size_t g = c / per_head;
+      std::vector<LoomNpu::View> v = {
+          {&ks, g * heads, half}, {&ks, g * heads + half, half}, {&vs, g * heads, half}, {&vs, g * heads + half, half}};
+      for (std::size_t p = 0; p < kMc; ++p) v.push_back({&out, (c * kMc + p) * kOut, kOut});
+      for (LoomNpu::Shared* q : {&kq, &vq})
+        for (std::size_t h = 0; h < 2; ++h) v.push_back({q, c * pay + h * kMcf * kRec, kMcf * kRec});
+      return v;
+    };
+    image_ = npu_.LoadAttn(image, nbs, views(0));
+    calls_.reserve(calls);
+    for (std::size_t c = 0; c < calls; ++c) calls_.push_back(npu_.BindAttn(image_, views(c)));
+    return {&ks.gpu, &vs.gpu, &kn.gpu, &kq.gpu, &vq.gpu, &out.gpu, &flags_->gpu};
+  }
+  void Enqueue(std::uint32_t nb, std::uint32_t ready, std::uint32_t done, std::uint32_t value,
+               const std::string& tag) override {
+    if (Word(NpuSplit::kFlagStatus)) throw LoomError("npu: a GPU wait for the NPU attention failed");
+    LoomNpu::AttnJob job;
+    for (const auto& c : calls_) job.calls.push_back(&c);
+    job.nb = nb;
+    job.ready = Words() + ready, job.ready_value = value;
+    job.done = Words() + done, job.done_value = value;
+    job.tag = tag;
+    npu_.EnqueueAttn(job);
+  }
+  std::uint32_t Word(std::uint32_t word) override { return __atomic_load_n(Words() + word, __ATOMIC_ACQUIRE); }
+  // Both after the GPU finished the work it was given (a job still without its ready word fails).
+  void Finish() override {
+    npu_.Drain(true);
+    npu_.CheckHealth();
+    if (Word(NpuSplit::kFlagStatus)) throw LoomError("npu: a GPU wait for the NPU attention failed");
+  }
+  void Report(std::FILE* f) {
+    npu_.Drain(true);
+    if (Word(NpuSplit::kFlagStatus)) std::fprintf(f, "npu: ERROR a GPU wait for the NPU attention failed\n");
+    npu_.Report(f);
+  }
+
+ private:
+  volatile std::uint32_t* Words() const { return static_cast<volatile std::uint32_t*>(flags_->host); }
+  LoomNpu npu_;
+  LoomNpu::Shared* flags_ = nullptr;
+  LoomNpu::AttnImage image_;
+  std::vector<LoomNpu::AttnCall> calls_;
 };
 
 }  // namespace yah::model

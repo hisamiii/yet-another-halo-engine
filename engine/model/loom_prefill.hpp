@@ -206,6 +206,23 @@ class LoomPrefill {
     hidden_ = h, hidden2_ = h2;
   }
 
+  // Split the attention of chunks from the set's first NPU chunk with the NPU (dispatch.txt "npuattn <kvn> <nb built>
+  // <first chunk>", emit YAH_NPU_ATTN): per full-attention layer the encoders write the NPU's records and payloads, the
+  // graph stores the layer's ready word, kernel 1 (the key-split twin) runs beside the NPU, a wait polls the done word
+  // and kernel 2 merges the NPU's piece. npu (a LoomNpuAttn) outlives this object.
+  [[nodiscard]] bool npu_attn_set() const { return geom_.count("npuattn") != 0; }
+  void EnableNpuAttn(NpuAttn* npu) {
+    const auto g = geom_.find("npuattn");
+    if (!npu || g == geom_.end())
+      throw LoomError("prefill: the set has no NPU attention (emit_prefill_pp YAH_NPU_ATTN)");
+    if (npu_) throw LoomError("prefill: a set splits either the GEMMs or the attention with the NPU");
+    if (!kv_paged_) throw LoomError("prefill: the NPU attention needs paged pools");
+    na_kvn_ = g->second.tokens, na_nbs_ = g->second.rowgrp, na_from_ = g->second.tt;
+    if (na_from_ == 0 || NaReady(full_) > 1024) throw LoomError("prefill: npuattn row out of range");
+    na_ = npu->Setup(dir_ + "/npu_attn.xdna", na_kvn_, na_nbs_, B_);
+    npu_attn_ = npu;
+  }
+
   // Zero the recurrent state before a new sequence. KV rows need no reset: attention reads only keys <= the query.
   void Reset() {
     Zero(*conv_state_);
@@ -259,6 +276,7 @@ class LoomPrefill {
     // NPU split: full chunks only, its handoffs graph nodes on flag words (NpuEnqueue / NpuJoin)
     npu_on_ = npu_ && n_ == B_;
     if (npu_on_) npu_->BeginChunk();
+    if (npu_attn_ && ci >= na_from_) ++na_seq_;  // the layers' ready / done values (words are reused per chunk)
     flagged_.clear();
     predecoded_.clear();
     npu_job_ = 0, npu_cleared_ = 0, npu_joined_ = 0;
@@ -357,6 +375,15 @@ class LoomPrefill {
       return;
     }
     chunk_graph_->Launch();
+    if (!na_jobs_.empty()) {
+      try {
+        for (const auto& [ai, nb] : na_jobs_) npu_attn_->Enqueue(nb, NaReady(ai), NaReady(ai) + 1, na_seq_, "attn");
+      } catch (...) {
+        gpu_.Synchronize();  // the graph's waits time out (the sticky status word): it reads the NPU's buffers
+        throw;
+      }
+      na_jobs_.clear();
+    }
     jobs.swap(flagged_);
     if (npu_ && npu_->Prof() && !jobs.empty() && prof_tags_.empty())   // the first NPU chunk's jobs (ReportNpuProf)
       for (const auto& q : jobs) prof_tags_.push_back(q.tag);
@@ -1963,6 +1990,29 @@ class LoomPrefill {
           graph_->AtomicStore(FlagWord(w), 0, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE, {}, {});
   }
 
+  // The NPU attention's flag words: layer ai's ready and done at NaReady(ai), + 1 (word NpuSplit::kFlagStatus: status).
+  static constexpr std::uint32_t kNaWord0 = 16;
+  static std::uint32_t NaReady(std::uint32_t ai) { return kNaWord0 + 2 * ai; }
+  hrx_buffer_ref_t NaWord(std::uint32_t w) const { return {na_.flags->handle, std::size_t{w} * 4, 4}; }
+  // Chunk ci's NPU attention inputs for layer ai (gen_npu_attn_encode's layer forms, npua{k,v,q}_c<ci>.hal): the KV
+  // heads' K / V records of keys [32, k_lo) (k_lo = 512 floor(start / 512): nb = 16 (k_lo / 512 + 1) bodies) and every
+  // call's payloads from q, the attention's own; then the layer's ready word.
+  void RunNpuAttnEncode(std::uint32_t ci, std::uint32_t ai, hrx_buffer_ref_t q, hrx_buffer_ref_t kpool,
+                        hrx_buffer_ref_t vtpool, const std::string& pre) {
+    const std::uint32_t nb = 16 * (ci * B_ / 512 + 1), calls = 3 * na_kvn_ * (B_ / 256);
+    Dispatch(ChunkExe("npuak", ci), "yah_npuattn_k", na_kvn_ * (nb + 1), 1, 1, 128, 1, 1,
+             {kpool, ptab_ref_, Ref(*na_.ks), Ref(*na_.kn)}, 0b1100);
+    Dispatch(ChunkExe("npuav", ci), "yah_npuattn_v", na_kvn_ * nb, 1, 1, 128, 1, 1, {vtpool, ptab_ref_, Ref(*na_.vs)},
+             0b100);
+    Dispatch(
+        ChunkExe("npuaq", ci), "yah_npuattn_q", calls * 33, 1, 1, 64, 1, 1,
+        {q, TRef(*Find(pre + "attn_q_norm.weight")), {eps_->handle, 0, 4}, Ref(*na_.kn), Ref(*na_.kq), Ref(*na_.vq)},
+        0b110000);
+    graph_->AtomicStore(NaWord(NaReady(ai)), na_seq_, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
+                        {Ref(*na_.ks), Ref(*na_.vs), Ref(*na_.kq), Ref(*na_.vq)}, {});
+    na_jobs_.push_back({ai, nb});
+  }
+
   // af: the afrag form, input normt_ (fragment-major)
   // cnt (A4): run the flagged GEMM on these counters if it can (RunIu4); returns whether it did.
   bool RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false, const hrx_buffer_ref_t* cnt = nullptr) {
@@ -2395,6 +2445,12 @@ class LoomPrefill {
           throw LoomError("prefill: ksplit_" + ahx + " without its queue");
         b.push_back({ksplit_->handle, 0, ksplit_bytes_});
       }
+      // the NPU's piece (EnableNpuAttn): its encoders, then the ready word, so the NPU runs beside kernel 1
+      const bool na = npu_attn_ && ci >= na_from_ && !warming_ && !npu_planning_;
+      if (na) {
+        if (!ks) throw LoomError("prefill: the NPU attention needs the key-split pair");
+        RunNpuAttnEncode(ci, ai, b[0], b[2], b[3], pre);  // the attention's own K / V^T pools (kv8: the f16 copies)
+      }
       Dispatch(Exe(ahx), "yah_attn_wmma", pg != geom_.end() ? pg->second.tokens : (B_ + tpw - 1) / tpw,
                pg != geom_.end() ? 1 : kHeads / hpw, 1, 256, 1, 1,
                b, ~std::uint64_t{0}, nullptr, attn_flagged_ ? std::uint64_t{1} << (b.size() - 1) : 0);
@@ -2402,6 +2458,14 @@ class LoomPrefill {
         const std::string mh = "wmmak" + ahx.substr(4);
         const auto mg = geom_.find("persist_" + mh);
         if (mg == geom_.end() || !mg->second.tt) throw LoomError("prefill: no persist_" + mh);
+        if (na) {  // the wait stands for the NPU's reads of the records and payloads and its writes of the outputs
+          const std::vector<hrx_buffer_ref_t> side = {Ref(*na_.ks), Ref(*na_.vs), Ref(*na_.kq), Ref(*na_.vq),
+                                                      Ref(*na_.out)};
+          Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
+                   {NaWord(NaReady(ai) + 1), NaWord(NaReady(ai)), NaWord(NpuSplit::kFlagStatus)}, 4, &side);
+          b.push_back(Ref(*na_.out));
+          b.push_back(Ref(*na_.vq));
+        }
         Dispatch(Exe(mh), "yah_attn_wmma", mg->second.tokens, 1, 1, 256, 1, 1, b);
       }
     }
@@ -3064,6 +3128,12 @@ class LoomPrefill {
   static constexpr std::uint32_t kPqueueSlots = 64;
   LoomBuffer* pqueue_ = nullptr;
   LoomBuffer* ksplit_ = nullptr;  // the key-split tail's partials (dispatch.txt "ksplit_<hal>")
+  // the NPU attention (EnableNpuAttn): its KV heads, built nb, first chunk, buffers, the count of NPU chunks so far
+  // (the flag words' values) and the chunk's layer jobs (layer, nb), queued once its graph launched
+  NpuAttn* npu_attn_ = nullptr;
+  NpuAttn::Buffers na_{};
+  std::uint32_t na_kvn_ = 0, na_nbs_ = 0, na_from_ = 0, na_seq_ = 0;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> na_jobs_;
   std::size_t ksplit_bytes_ = 0;
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records

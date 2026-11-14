@@ -2428,7 +2428,10 @@ def main():
         sys.exit("ATTN_KSPLIT: the one-kernel split hangs the GPU; use YAH_ATTN_KSPLIT=<chunk>")
     ks_from = int(os.environ.get("YAH_ATTN_KSPLIT", "0")) or NCH
     attn64ks_src = attn64ks_t_src = attn64km_src = attn64km_t_src = None
-    ks_floats = 0
+    ksn_srcs = {}   # (YAH_NPU_ATTN) the twins: stem -> (src, tiled src)
+    ks_floats = ks_floats_npu = 0
+    npu_kv = int(os.environ.get("YAH_NPU_ATTN", "0"))
+    npu_from = NCH
     if ks_from < NCH:
         assert w64_from <= ks_from and pdyn and not EMIT_HALF
         gen_attn_fa.configure(2, 64)
@@ -2438,8 +2441,14 @@ def main():
         # (gen_attn_fa R2P_PRIOQ 1) on the relane pass: busiest SQ -0.5% at 16K..126K, bit-identical (alone each <= -0.15%)
         prio64 = os.environ.get("YAH_ATTN_PRIO64", "1") == "1"
         # YAH_NPU_ATTN=n (with YAH_ATTN_KSPLIT): the pair's NPU twins yah_attn_hip64{ks,km}n.loom (gen_attn_fa NPU_KV n:
-        # the last n KV heads' units shared with the NPU attention)
-        npu_kv = int(os.environ.get("YAH_NPU_ATTN", "0"))
+        # the last n KV heads' units shared with the NPU attention) run chunks from YAH_NPU_ATTN_FROM (default: the
+        # first key-split chunk; at least 1: the twins need start_pos >= 512), beside the NPU attention (gen_npu_attn,
+        # npu_attn.xdna) and its encoders npua{k,v,q}_c<c>.hal (gen_npu_attn_encode's layer forms). dispatch.txt
+        # "npuattn <n> <nb built> <first chunk>"; the twins' "ksplit_" rows carry their larger partials
+        if npu_kv:
+            npu_from = max(int(os.environ.get("YAH_NPU_ATTN_FROM", "0")) or ks_from, ks_from, 1)
+            if NPU_SPLIT or NPU_FFNBLK:
+                sys.exit("YAH_NPU_ATTN: a set splits either the GEMMs or the attention with the NPU")
         for diag, stem in (("ksstore", "ks"), ("ksmerge", "km")) + ((("ksstore", "ksn"), ("ksmerge", "kmn")) if npu_kv else ()):
             gen_attn_fa.NPU_KV = npu_kv if stem.endswith("n") else 0
             gen_attn_fa.R2P_DIAG.add(diag)
@@ -2460,8 +2469,13 @@ def main():
                 attn64ks_src, attn64ks_t_src = p, pt
             elif stem == "km":
                 attn64km_src, attn64km_t_src = p, pt
+            else:
+                ksn_srcs[stem] = (p, pt)
         p0, gen_attn_fa.PERSIST = gen_attn_fa.PERSIST, persist64   # write_attn applies MAIN_FLAGS only while it generates
         ks_floats = gen_attn_fa.ksplit_floats()
+        gen_attn_fa.NPU_KV = npu_kv
+        ks_floats_npu = gen_attn_fa.ksplit_floats()
+        gen_attn_fa.NPU_KV = 0
         gen_attn_fa.PERSIST = p0
         gen_attn_fa.KSPLIT = 0
         MAIN_FLAGS["PERSIST"] = persist
@@ -2633,6 +2647,29 @@ def main():
         geom.append(("kv16_scratch", 0, 0, 0))
     paged_f16k = kv_paged and not kq8_on
     paged_f16v = kv_paged and not (vq4_on or vq8_on)
+    npua = []   # (YAH_NPU_ATTN) the encoders and the GPU's wait: (src, hal)
+    npu_nbs = 16 * ((NCH - 1) * B // 512 + 1)   # the image's nb: the last chunk's
+    if npu_kv:
+        # the paged f16 K / V^T pools, or kv8's per-layer f16 copies of them (kvdeq, not KRAW's raw codes)
+        if qrot_first < NCH or not ((paged_f16k and paged_f16v) or (kv8deq and not gen_attn_fa.KRAW)):
+            sys.exit("YAH_NPU_ATTN: the encoders read paged f16 K / V^T pools (fp16 or kv8) and the attention's own q")
+        import gen_npu_attn
+        import gen_npu_attn_encode as NE
+        import gen_npu_unpack as GU
+        for c in range(npu_from, NCH):
+            call = NE.Call(mc=16, nb=16 * (c * B // 512 + 1), nbs=npu_nbs, pages=T // 256, B=B, start_pos=c * B,
+                           kvn=npu_kv, qlay=0 if QSPLIT_ON else 1)
+            call.check()
+            for kind, gen in (("k", NE.gen_k), ("v", NE.gen_v), ("q", NE.gen_q)):
+                src = os.path.join(tmp, "npua%s_c%d.loom" % (kind, c))
+                open(src, "w").write(gen(call))
+                npua.append((src, "npua%s_c%d.hal" % (kind, c)))
+        src = os.path.join(tmp, "npu_flag_wait.loom")
+        open(src, "w").write(GU.gen_flag_wait())
+        npua.append((src, "npu_flag_wait.hal"))
+        img = os.path.join(tmp, "npu_attn.loom")
+        open(img, "w").write(gen_npu_attn.emit(16, npu_nbs))
+        gen_npu_attn.compile_xdna(img, os.path.join(outdir, "npu_attn.xdna"))
     rope_src = "yah_fused_qk_rope_batched_f32.loom"
     ropew_src = os.path.join(tmp, "yah_fused_qk_rope_batched_wait.loom")
     if paged_f16k:   # RoPE writes K rows straight into the paged pool
@@ -2898,7 +2935,8 @@ def main():
           for c in range(NCH) if kvdeq
           for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
                                  (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
-        *[(attn_qr_src if c >= qrot_first else attn_c0_src if c == 0 else attn64ks_src if c >= ks_from
+        *[(attn_qr_src if c >= qrot_first else attn_c0_src if c == 0
+           else ksn_srcs["ksn"][0] if c >= npu_from else attn64ks_src if c >= ks_from
            else attn64_src if c >= w64_from else attn_src,
            "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
@@ -2912,7 +2950,8 @@ def main():
             "attention_prefill.start_pos=0",
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"])] if aov_need and qrot_first > 0 else []),
-        *[(attn_qr_t_src if c >= qrot_first else attn_t_c0_src if c == 0 else attn64ks_t_src if c >= ks_from
+        *[(attn_qr_t_src if c >= qrot_first else attn_t_c0_src if c == 0
+           else ksn_srcs["ksn"][1] if c >= npu_from else attn64ks_t_src if c >= ks_from
            else attn64_t_src if c >= w64_from else attn_t_src,
            "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
@@ -2926,7 +2965,9 @@ def main():
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(ks_from, NCH)
-          for src_, stem_ in ((attn64km_src, "wmmak"),) + (((attn64km_t_src, "wmmak_t"),) if af24 else ())],
+          for src_, stem_ in ((ksn_srcs["kmn"][0] if c >= npu_from else attn64km_src, "wmmak"),)
+          + (((ksn_srcs["kmn"][1] if c >= npu_from else attn64km_t_src, "wmmak_t"),) if af24 else ())],
+        *[(src, hal, ["nop=0"]) for src, hal in npua],
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
           if vtrans_src else []),
@@ -2959,11 +3000,12 @@ def main():
     # Loom low-level LICM (HRX patch 0011) for the attention kernels where it wins: it hoists the fragment loads'
     # per-lane LDS address math out of the key loop (fp16 -1..-2%; kv4 QROT -0.5% with one extra live register); the
     # kv4 staged-Q build loses 11% and the afrag GEMMs 5-20%, so they compile without it
+    ksn_twins = [x for pair in ksn_srcs.values() for x in pair if x]
     def attn_env(loom):
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
         if loom in (attn_src, attn_t_src, attn_f_src, attn_c0_src, attn_t_c0_src, attn64_src, attn64_t_src,
-                    attn64ks_src, attn64ks_t_src, attn64km_src, attn64km_t_src) and loom is not None and (
+                    attn64ks_src, attn64ks_t_src, attn64km_src, attn64km_t_src, *ksn_twins) and loom is not None and (
                 not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
@@ -2986,16 +3028,20 @@ def main():
                 print("attention %s: %d VGPRs, over %d" % (outname, hal_vgprs(hal), ATTN_VGPR))
         if outname.startswith("wmma") and persist and outname != "wmmaf.hal":
             persist_rows.append((outname, persist64 if loom in (attn64_src, attn64_t_src, attn64ks_src, attn64ks_t_src,
-                                                                attn64km_src, attn64km_t_src) else persist))
+                                                                attn64km_src, attn64km_t_src, *ksn_twins) else persist))
             if loom in (attn64ks_src, attn64ks_t_src):
-                ks_rows.append(outname)
+                ks_rows.append((outname, ks_floats))
+            elif loom in ksn_srcs.get("ksn", ()):
+                ks_rows.append((outname, ks_floats_npu))
         n += 1
     if persist_rows:   # the persistent attention HALs launch persist workgroups on x only
         with open(os.path.join(outdir, "dispatch.txt"), "a") as fh:
             for hal, slots in persist_rows:
                 fh.write("persist_%s %d 1 %d\n" % (hal, slots, pdyn))
-            for hal in ks_rows:
-                fh.write("ksplit_%s %d 0 0\n" % (hal, ks_floats))
+            for hal, floats in ks_rows:
+                fh.write("ksplit_%s %d 0 0\n" % (hal, floats))
+            if npu_kv:
+                fh.write("npuattn %d %d %d\n" % (npu_kv, npu_nbs, npu_from))
 
     tables = os.path.join(E.LOOM, "tables")
     for src, dst in [] if EMIT_HALF else [("grid_iq3s.bin", "grid_iq3s.bin"),
