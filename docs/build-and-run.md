@@ -93,8 +93,6 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 | decode | `python3 tools/emit_decode.py <model> <dir> <max_context>` (multiple of 256, default 4096) |
 | decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
 
-The emitters read the model's tensor table from `engine/build/yah-dump --table` (headers only, no weights), so build first.
-
 `engine/build_hrx.sh <model> [dir]` also emits a decode set (default `engine/hal`), which the end-to-end gates use.
 
 Big sets belong in `~/Development/Scratch` (HAL sets under `~/Development/Scratch/hal/`), not in the repo.
