@@ -91,6 +91,10 @@ def emit(loomfile, configs, outname, outdir, env=None, gate=None):
     ce = {**hrx_paths.env(), **(env or {})}
     if os.path.basename(outname).startswith(ROLE_SPLIT):
         ce["LOOM_EXP_WAVE_ROLE_BARRIERS"] = "1"
+    # YAH_ATTN_VGPR_BUDGET=N: the attention kernels allocate within N VGPRs (HRX main LOOM_EXP_BUDGET; 224 gets
+    # main's 224 / 232 down to 216 without spills: 9 of gfx1151's 24-register blocks, 7 waves per SIMD instead of 6)
+    if os.path.basename(outname).startswith("wmma") and os.environ.get("YAH_ATTN_VGPR_BUDGET"):
+        ce["LOOM_EXP_BUDGET"] = "amdgpu.vgpr=" + os.environ["YAH_ATTN_VGPR_BUDGET"]
     tgt = ce.get("YAH_LOOM_TARGET", "gfx1151")
     raw = open(os.path.join(LOOM, loomfile)).read()
     text, _ = emit_hal.specialize(raw,
