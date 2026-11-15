@@ -5,31 +5,9 @@ Subject: [PATCH 38/76] 0033-0036 : port vopd immediates and lane lookup to
  main
 
 ---
- .../target/arch/amdgpu/lower/value/vector_construct.c  | 10 ++++------
- loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c  |  4 +++-
- 2 files changed, 7 insertions(+), 7 deletions(-)
+ loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
 
-diff --git a/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c b/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c
-index d3185dd687..4cb4346036 100644
---- a/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c
-+++ b/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c
-@@ -1442,12 +1442,10 @@ static iree_status_t loom_amdgpu_pack_16bit_lane_pair_with_permute(
-     const loom_amdgpu_vector_from_elements_plan_t* plan,
-     const loom_low_lower_resolved_descriptor_t* permute, uint32_t lane_base,
-     loom_type_t lane_type, loom_value_id_t* out_packed) {
--  loom_value_id_t low_lane = LOOM_VALUE_ID_INVALID;
--  loom_value_id_t high_lane = LOOM_VALUE_ID_INVALID;
--  IREE_RETURN_IF_ERROR(loom_low_lower_lookup_value(
--      context, plan->payload.elements[lane_base], &low_lane));
--  IREE_RETURN_IF_ERROR(loom_low_lower_lookup_value(
--      context, plan->payload.elements[lane_base + 1u], &high_lane));
-+  loom_value_id_t low_lane =
-+      loom_low_lower_lookup_value(context, plan->payload.elements[lane_base]);
-+  loom_value_id_t high_lane = loom_low_lower_lookup_value(
-+      context, plan->payload.elements[lane_base + 1u]);
-   IREE_RETURN_IF_ERROR(loom_amdgpu_materialize_low_vgpr_b32(
-       context, source_op, low_lane, &low_lane));
-   IREE_RETURN_IF_ERROR(loom_amdgpu_materialize_low_vgpr_b32(
 diff --git a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
 index 2462d9f989..b4d4134571 100644
 --- a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c

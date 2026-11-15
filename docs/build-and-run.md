@@ -22,12 +22,8 @@ The series is the pin's patches rebuilt on HRX main in their old order. A carrie
 | `0002-0005-gfx1151-f16-wmma-operand-placement` | the f16 WMMA spreads its operands over the register banks (upstream does it for bf16 only): prefill GEMM cycles -2.6% |
 | `0003-0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
 | `0004-0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later (8 `v_mov` + a load wait per k phase in afrag GEMMs); bit-identical, enables the IQ3_S sign chain |
-| `0005-0010-loom-vopd-trans-window-lookahead` | VOPD pairs inside TRANS-result windows when a lookahead finds no read that relies on the distance: prefill attention and SwiGLU epilogues -0.1..-0.25% cycles, bit-identical |
-| `0006-0011-loom-low-licm` | loop-invariant code motion for low CFGs, only with `LOOM_EXP_LICM=1` (the emitter sets it for the fp16 and kv4 prefill attention): -1.0% at pp2048, -2.15% at 32K, bit-identical |
 | `0007-0012-loom-slice-alias-coalescing` | concats of consecutive slices fold, and slice coalescing ignores dead exact-storage aliases: attention loop 29 -> 21 moves, -0.8..-2.3% attention, bit-identical |
 | `0008-0013-xdna-npu-cascade-gemm-compiler` | the Loom AIE2P compiler pieces of the NPU cascade GEMM: memory-tile staging, replay and multicast |
-| `0009-Revert-0011-loom-low-licm` | reverts 0006 (the pin's 0011, low LICM) as first ported; redone on main as 0070 |
-| `0010-Revert-0010-loom-vopd-trans-window-lookahead` | reverts 0005 (the pin's 0010); redone on main as 0075 |
 | `0011-0013-keep-main-s-xdna_product-layout-multi-range-por` | 0008 adapted: keeps main's `xdna_product` layout (the multi-range part is 0044) |
 | `0012-0013-port-to-main-s-routes-geometry-descriptors-and-` | 0008 ported to main's routes, geometry, descriptors and lock selectors |
 | `0013-0014-xdna-continuation-invocation` | the XDNA loader resolves an entry's control-only continuation (`iree_hal_amd_xdna_executable_query_continuation`) |
@@ -54,13 +50,10 @@ The series is the pin's patches rebuilt on HRX main in their old order. A carrie
 | `0034-0032-loom-kernel-priority` | `kernel.priority {level = N}` lowers to `s_setprio` as an ordered execution barrier; used around the iu4 GEMM fold; bit-identical |
 | `0035-0027-0032-port-rodata-deferral-startup-section-and-p` | the pin's 0027-0032 ported: rodata deferral, startup section and the priority op |
 | `0036-0033-loom-amdgpu-iu4-inline-seed-subrev` | an iu4 WMMA accumulator splat of the bits of 1/(2 pi) selects the inline-source form; `x - c` with an inline `c` selects `v_subrev_f32`, which VOPD pairs; bit-identical |
-| `0037-0036-loom-amdgpu-pack-16bit-pairs-with-perm` | two 16-bit lanes pack with one `v_perm_b32` instead of 3 VALU: iu4 gu epilogue 48 -> 16 packing VALU, bit-identical |
-| `0038-0033-0036-port-vopd-immediates-and-lane-lookup-to-ma` | the pin's 0033-0036 ported: VOPD immediates and lane lookup |
+| `0038-0033-0036-port-vopd-immediates-and-lane-lookup-to-ma` | the pin's 0033-0036 ported: VOPD immediates for 0036's inline-source pairs |
 | `0039-0037-loom-wave-uniform-branches-with-matched-barrier` | workgroup barriers under a subgroup-uniform branch are accepted when every region runs the same barrier sequence: one wave runs its own loop (`gen_gdn_ss`'s solver wave) |
-| `0040-0039-loom-amdgpu-repack-reads-constructing-lanes` | a result -> rhs b16 fragment repack reads the constructing lanes directly: 8 fewer VALU per repacked tile, bit-identical |
 | `0041-0040-loom-amdgpu-b16-store-takes-low-half-def` | a 16-bit store of a low-half definition skips the `v_bfe_u32` that cleared the upper half: 168 VALU fewer in `gen_gdn_ss`, bit-identical |
 | `0042-0043-loom-amdgpu-xor16-shuffle-via-permlanex16` | wave32 xor-16 shuffles lower to `v_permlanex16_b32` instead of `ds_swizzle`: attention softmax exchanges -1.1..-3%, bit-identical |
-| `0043-0039-0043-port-lane-lookup-and-permlanex16-kind-to-m` | the pin's 0039-0043 ported: lane lookup and the permlanex16 kind |
 | `0044-0013-0016-0019-port-multi-range-invocation-layout-to` | the pin's 0013 and 0016-0019 ported to main's multi-range invocation layout |
 | `0045-0045-loom-amdgpu-gfx11-non-temporal-cache-policy` | gfx11 non-temporal hints encode as GLC / SLC / DLC; decode's DeltaNet state store skips the MALL (+18 us per DeltaNet layer before) |
 | `0046-0046-libamdf-fault-in-imported-dma-bufs-at-attach` | the NPU attach faults in an imported dma-buf's pages (Linux 7.4 stopped prefaulting them at mmap: IO page faults and an all-NaN NPU prefill) |
@@ -77,14 +70,12 @@ The series is the pin's patches rebuilt on HRX main in their old order. A carrie
 | `0057-0064-loom-low-lru-register-choice` | the pin's 0064: opt-in `LOOM_EXP_LRU` register choice; unset, byte-identical |
 | `0058-0066-loom-xdna-pinned-ring-records` | the pin's 0066: opt-in `LOOM_EXP_RING_AT` pins a tile's ring records; unset, byte-identical |
 | `0059-0068-loom-xdna-stream-prefix` | the pin's 0068: `constrain.prefix`, a stream's first bytes from another binding (the NPU attention sender) |
-| `0060-revert-0036-v_perm-reads-half-defined-f16-registers-` | reverts 0037 (the pin's 0036): main's register part check rejects a `v_perm_b32` that reads a half-defined f16 register; redone as 0076 |
 | `0061-0065-port-locked-body-planner-controls-to-main` | the pin's 0065 ported: locked-body planner controls |
 | `0062-0013-skip-locked-body-schedule-fences-under-LOCKED_P` | under `LOCKED_PACK`, locked ops no longer fence the schedule (main closed a bundle at each one) |
 | `0063-alloc-let-slices-alias-before-inferred-concat-affini` | slices alias before inferred concat affinity (iq3_xxs decoder 157 -> 45 moves) |
 | `0064-alloc-add-LOOM_EXP_NO_CONCAT_PROPAGATE` | `LOOM_EXP_NO_CONCAT_PROPAGATE`: opt out of inferred concat affinity (AIE2P GEMM decoders spilled with it) |
 | `0065-facts-look-through-folded-arms-when-joining-block-ar` | value facts look through folded arms when joining block arguments |
 | `0066-sync-add-LOOM_EXP_WAVE_ROLE_BARRIERS-for-wave-role-b` | `LOOM_EXP_WAVE_ROLE_BARRIERS`: workgroup barriers under wave-uniform control (the emitter sets it for role-split kernels) |
-| `0067-revert-0039-repack-reads-half-defined-f16-registers-` | reverts 0040 (the pin's 0039): `ds_swizzle` reads the whole register, so main rejects the low-half definition |
 | `0068-loom-skip-cross-block-waits-proven-independent-by-al` | the pin's 0041: cross-block waits skipped where alias summaries prove the accesses independent |
 | `0069-alloc-add-LOOM_EXP_BUDGET-for-a-register-class-budge` | `LOOM_EXP_BUDGET=<target>.<class>=<n>`: allocate within a register budget (the emitter keeps non-attention kernels within 192 VGPRs, 8 waves, unless that spills more than 32 bytes) |
 | `0070-loom-add-low-licm-for-loop-invariant-packets` | the pin's 0011 redone on main: low LICM, opt-in `LOOM_EXP_LICM=1` (the emitter sets it for attention) |
@@ -111,6 +102,8 @@ Not carried over from the pin (checked against main 2026-11-15):
 | 0009 `loom-omit-dead-fma-mix-seeds`, 0057 `loom-amdgpu-f16-inline-accumulator-bank-placement` | small (one dead constant per fma_mix pair; one WMMA bank preference, 6% of key-split WMMAs at 33 instead of 32 cycles on the pin); not ported |
 
 Carried under a new number: 0010 as 0075, 0011 as 0070, 0030 as 0073, 0036 as 0076, 0038 as 0074, 0041 as 0068, 0053 as 0078.
+
+The numbering has gaps: 0005, 0006, 0009, 0010, 0037, 0040, 0043, 0060 and 0067 were first ports that later patches reverted or fixed up to nothing (the series without them gives the same HRX tree), so they were dropped.
 
 0030-0036 were made for the int4 (iu4) GEMMs, which went with the MQ4 path. Only 0033 and 0034 are iu4-only (inline-accumulator iu4 WMMA forms); the others also act on native kernels (0032's `kernel.priority` is used by `gen_attn_fa`, 0036 packs every f16-output GEMM's stores). All stay in the stack: dropping a patch changes the compiler.
 
