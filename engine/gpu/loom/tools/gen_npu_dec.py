@@ -81,6 +81,7 @@ Q4G = FMT == "Q4_K" and os.environ.get("DQ_GORD") == "GF"
 GF = Q5 or Q4G                  # gather-free K-quants (no table)
 Q4L = FMT in ("Q4_K", "Q5_K")   # Q4_K's header and scale path
 HROLL = os.environ.get("DQ_HROLL", "1") == "1"   # Q3_K, IQ2_XS, IQ2_XXS inlined: the scale prep rolled (program memory)
+Q3ROLL = [False]                # leaf_inline: Q3_K's record realign of both halves in a loop (program memory)
 GORD = os.environ.get("DQ_GORD", "P4")       # Q3_K pushes any k-block order: "P4", "N" or "PK" (Q4_K's, for its pairs)
 # BFP: rows pre-decoded on the host (engine RegisterBfp, emit_prefill_pp bfp_rows): a unit's record is already the
 # decoder's output ([kb 128 in KPERM order][h 2] bfp16 fragments, its 16 rows of 1152 bytes), the leaf only copies it
@@ -1414,7 +1415,14 @@ def leaf(name="dec"):
             e(f"%q3s{nm_} = and {src}, {k(63)}")
             e(f"%q3a{nm_} = and {src}, {k(-64)}")
         qstreams = []
-        for hh in range(2):
+        if Q3ROLL[0]:   # the halves in a loop (program memory): half hh's rows 8 ROWB on, its NIB rows 768 on
+            hl_, _ = loop_begin("q3h", 2)
+            e(f"%q3ho = mul {hl_}, {k(8 * ROWB)}")
+            e(f"%q3hn = mul {hl_}, {k(768)}")
+            e("%q3hp = add.rr %spb, %q3hn")
+            for nm_ in ("m", "q"):
+                e(f"%q3b{nm_} = add.rr %q3a{nm_}, %q3ho")
+        for hh in range(1 if Q3ROLL[0] else 2):
             rws = []
             for r in range(8):
                 x = e.stream()
@@ -1423,7 +1431,8 @@ def leaf(name="dec"):
                 hv_ = []
                 for nm_ in ("m", "q"):
                     pa_ = x.t("pa")
-                    x(f"{pa_} = add.rr %q3a{nm_}, {k(ROWB * row)}" if row else f"{pa_} = or %q3a{nm_}, {k(0)}")
+                    ab_ = f"%q3b{nm_}" if Q3ROLL[0] else f"%q3a{nm_}"
+                    x(f"{pa_} = add.rr {ab_}, {k(ROWB * row)}" if row else f"{pa_} = or {ab_}, {k(0)}")
                     pv = Pr(x, pa_)
                     va, vb, q, q1 = x.t("va"), x.t("vb"), x.t("q"), x.t("q1")
                     x(f"{va} = vlda.512.i8x64 {pv}, 0")
@@ -1447,7 +1456,7 @@ def leaf(name="dec"):
                         x(f"{b_} = vshuffle {vs[i]}, {vs[jj]}, {k(15)}")
                         out[i], out[jj] = a_, b_
                 vs = out
-            pn = P(x, "%spb", NIB + 768 * hh + 512)
+            pn = P(x, "%q3hp" if Q3ROLL[0] else "%spb", NIB + 768 * hh + 512)
             for c in range(8):
                 us = []
                 for hf_ in range(2):
@@ -1460,6 +1469,8 @@ def leaf(name="dec"):
                     x(f"{nv} = vshuffle {us[0]}, {us[1]}, {md}")
                     x(f"vst.512.i8x64 {nv}, {pn}, {64 * slot - 512}")
         run(qstreams, int(os.environ.get("DQ_QWIN", "1")))          # 8 rows of 64 B live: one row stream at a time
+        if Q3ROLL[0]:
+            loop_end("q3h")
     elif GF:
         # ---- Q5_K record r: per half the rows' qs (64 B at HBY + 64 r) and qh (32 B at 16; Q4G: none) realigned (one
         # shift for all rows) and transposed to [chunk][row][8 B]; nibble-unpacked into NIB: qs lo, hi, qh nibble r (mode r)
@@ -2098,20 +2109,20 @@ def leaf(name="dec"):
     return "\n".join(pre_ + e.L[:hdr_end] + place_consts(e.pre, e.L[hdr_end:]))
 
 
-def leaf_inline(nsb, name="inl", vroll=False, tonce=True, rec=None):
+def leaf_inline(nsb, name="inl", vroll=False, tonce=True, rec=None, q3roll=False):
     """The leaf's body for inlining into another core function: decodes nsb super-blocks of an input record
     ([16 rows][RECROW]) at %in into OUT_B records at %out (2 per super-block, no output ring), storages at %sp
     (SCR_B, 2048-aligned) and %sp2 (SCR2_B), all defined by the caller (the table is rebuilt each call). Returns the
     lines (not renamed; the caller prefixes its values and labels). Grid formats gather from module rodata
     (inline_rodata(name), defined once by the caller's module). rec: (first, end) of the records 2 j + r to decode
-    (the others are left as they are)."""
+    (the others are left as they are). q3roll: Q3ROLL."""
     if BFP:
         return bfp_copy(nsb, rec)
-    INLINE[0], VROLL[0], TONCE[0], RREC[0] = nsb, vroll, tonce, rec
+    INLINE[0], VROLL[0], TONCE[0], RREC[0], Q3ROLL[0] = nsb, vroll, tonce, rec, q3roll
     try:
         txt = leaf(name)
     finally:
-        INLINE[0], VROLL[0], TONCE[0], RREC[0] = 0, False, True, None
+        INLINE[0], VROLL[0], TONCE[0], RREC[0], Q3ROLL[0] = 0, False, True, None, False
     out = []
     for ln in txt.split("\n"):
         t = ln.strip()

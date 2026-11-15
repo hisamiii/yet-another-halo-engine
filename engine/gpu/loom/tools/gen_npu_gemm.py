@@ -89,6 +89,7 @@ class Config:
                         # decode row 1 themselves and hand its records to the head over neighbor memory (fuse_helper)
     hvroll: int = 0     # ghelp: the helpers' decoder with its scale halves rolled (gen_npu_dec VROLL; program memory)
     htab: int = 1       # ghelp: the helpers' decoder table built once per fill (else every unit; program memory)
+    q3roll: int = 0     # fuse 2: Q3_K's record realign of both halves in a loop (gen_npu_dec Q3ROLL; program memory)
     seam: int = 1       # head / mids: the next iteration's first sub-tile init and its WB pops ride with the last
                         # sub-tile's cascade writes (carried across the back edge), like the inner sub-tile boundaries;
                         # 2: not on ghelp's helpers (program memory)
@@ -1201,7 +1202,8 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     # only the records (half super-blocks: 16 k-blocks) overlapping k0 .. k1: the egress reads nothing else
     rec = ((k0 - 32 * s0) // 16, -(-(k1 - 32 * s0) // 16)) if cfg.rskip else None
     assert D.OUT_B == 16 * 144
-    for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool((helper or "")[:1] == "M" and cfg.hvroll), tonce=tonce, rec=rec):
+    for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool((helper or "")[:1] == "M" and cfg.hvroll), tonce=tonce, rec=rec,
+                             q3roll=bool(cfg.q3roll)):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if cfg.rawdma:   # the raw record is consumed: back to the DMA, but for the last cap units (the panel follows them)

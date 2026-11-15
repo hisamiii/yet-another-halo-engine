@@ -763,12 +763,13 @@ NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs", "iq3s"), (40, 40, 40, 8)
 IX4_FMTS = {"iq3s": "IQ4_XO", "iq3xxs": "IQ4_XX"}
 IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX")
 # gate and up of one format without a fused GPU gate / up whose single-format deferred image fits: their own decoder
-# on the GGUF rows, no pre-decoded copy (Q3_K's gate helper is 0.6 KB over the core's program memory)
-NPU_SAME_SW = ("q5k",)
+# on the GGUF rows, no pre-decoded copy (Q3_K's with its record realign rolled: npu_images' q3roll fallback)
+NPU_SAME_SW = ("q5k", "q3k")
 # gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
-# tensor's rows, the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>"). Q3_K's
-# gate roles are over the core's program memory (16.7 and 17.0 KB of 16), IQ2_XS's grid tables do not place.
-NPU_COLPAIR = ("iq4xs", "q4k")
+# tensor's rows (IQ3_S's transcoded, npu_ix4_<tensor>.bin), the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>",
+# dispatch rows "npuffncp_<gate>_<up>"); not two formats of IQ4_XS's decoder (one image, kv2). IQ2_XS's grid tables do
+# not place.
+NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s")
 # The other pairs' gate / up rows (the NPU's) are pre-decoded to bfp16 (bfp_pair_rows: npu_bfp_<prefix>ffn_gate_up.bin),
 # one BFP image like a single format's with the deferred epilogue ("npu_ffnsw_bfp_<hord>", dispatch rows
 # "npuffnbx_<gate>_<up>"). Site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU rows
@@ -778,7 +779,8 @@ NPU_COLPAIR = ("iq4xs", "q4k")
 
 def colpair(l):
     """A layer whose gate and up run as column pairs (NPU_COLPAIR)."""
-    return l["ffn_gate"][0] != l["ffn_up"][0] and {l["ffn_gate"][0], l["ffn_up"][0]} <= set(NPU_COLPAIR)
+    g, u = l["ffn_gate"][0], l["ffn_up"][0]
+    return g != u and {g, u} <= set(NPU_COLPAIR) and not {gu_fmt(g), gu_fmt(u)} <= set(IX4_FAMILY)
 
 
 def gu_fmt(fmt):
@@ -1084,9 +1086,10 @@ def npu_images(images, B, tmp, outdir, extra=()):
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         rs = list(ex.map(compile_one, [source(*j) for j in jobs]))
         # ghelp's helper (a decoder plus the gate's waiter) can exceed the core's program memory: that image with
-        # no seam on the helpers, then the helpers' scale halves rolled (hvroll). Not without ghelp: those images
-        # hang the NPU (docs/results.md)
-        for fix, msg in ((dict(seam=2), "helper without seam"), (dict(hvroll=1), "hvroll"),
+        # Q3_K's record realign rolled (q3roll), then no seam on the helpers, then the helpers' scale halves rolled
+        # (hvroll). Not without ghelp: those images hang the NPU (docs/results.md)
+        for fix, msg in ((dict(q3roll=1), "Q3_K realign rolled"), (dict(seam=2), "helper without seam"),
+                         (dict(hvroll=1), "hvroll"),
                          (dict(hvroll=1, htab=0), "hvroll, helper table per unit")):
             redo = [i for i, r in enumerate(rs) if r.returncode and jobs[i][0].ghelp and "XDNA/058" in r.stderr]
             for i in redo:
@@ -1210,7 +1213,7 @@ def bfp_pair_rows(layers, F, outdir):
 def ix4_files(layers, sw, F, outdir):
     """The FFN block's IQ3_S / IQ3_XXS gate / up tensors (layers: prefix -> kinds) transcoded
     (gen_npu_dec.ix4_rows), their last F rows (the NPU's) only: sw layers (prefixes in sw) to
-    npu_ix4_<prefix>ffn_gate_up.bin (gate's rows, then up's), the others to npu_ix4_<tensor>.bin (engine Ix4Rows)."""
+    npu_ix4_<prefix>ffn_gate_up.bin (gate's rows, then up's), the others (column pairs) to npu_ix4_<tensor>.bin."""
     import gguf
     import numpy as np
     rd = gguf.GGUFReader(MODEL)
@@ -1276,7 +1279,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     # sw layers: gate and up in one file (the image's dgu); pairs: per tensor; the NPU's rows only
     ix4_files({"blk.%s." % n: [kd for kd in ("ffn_gate", "ffn_up") if l[kd][0] in IX4_FMTS]
                for n, l in by.items() if l in ok + pairs and l not in bsw},
-              {"blk.%s." % n for n, l in by.items() if l in ok + mixed}, F, outdir)
+              {"blk.%s." % n for n, l in by.items() if l in ok + mixed and not colpair(l)}, F, outdir)
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
         hords = sorted({hord_of(l["ffn_down"][0]) for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
@@ -1318,7 +1321,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 jobs.append((npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * 288, swcol=32,
                                      hpass=F // 1024, hord=hord, fmt="BFP", dfr=1), "npu_ffnsw_bfp_" + hord.lower(), 4))
             continue
-        if gf != uf and {gf, uf} <= set(NPU_COLPAIR):   # (column pairs; Q4_K in P4 order: gen_npu_dec "GF")
+        if colpair({"ffn_gate": (gf,), "ffn_up": (uf,)}):   # (column pairs; Q4_K in P4 order: gen_npu_dec "GF")
             go = lambda f: "GF" if f == "q4k" else "P4"
             cfg = npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, swcol=32, hpass=F // 1024, hord=hord, fmt=gu_fmt(gf),
                           gord=go(gf), ufmt=gu_fmt(uf), ugord=go(uf), dfr=1)
