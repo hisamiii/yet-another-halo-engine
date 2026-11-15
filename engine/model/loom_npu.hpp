@@ -172,8 +172,9 @@ class LoomNpu {
     for (auto& [key, m] : imports_) (void)api_->memory_destroy(m, nullptr);
     for (auto& [key, image] : images_) iree_hal_amd_xdna_image_free(image);
     for (auto& s : shared_) {
-      if (s->external) {
+      if (s->external) {   // (ImportGpu: the dma-buf fd is ours, the buffer the caller's)
         (void)api_->memory_destroy(s->native, nullptr);
+        if (s->fd >= 0) close(s->fd);
       } else if (s->host) {   // the HRX import first, then the registration, then the pages
         s->gpu.reset();
         (void)api_->memory_destroy(s->native, nullptr);
@@ -182,27 +183,10 @@ class LoomNpu {
         close(s->fd);
       }
     }
-    // the exportable buffers' pool allocations end with a dealloca (a release alone leaves them live, and the pool's
-    // destroy then waits for them forever), then the handles, then the pool
-    std::vector<hrx_buffer_t> exported;
+    std::vector<LoomBuffer*> exported;   // (AllocateExportable's)
     for (auto& s : shared_)
-      if (!s->external && !s->host && s->gpu.handle) exported.push_back(s->gpu.handle);
-    if (!exported.empty()) {
-      std::uint64_t value = ++export_value_;
-      hrx_semaphore_list_t waits = {nullptr, nullptr, 0};
-      hrx_semaphore_list_t signals = {&export_sem_, &value, 1};
-      hrx_status_t st = hrx_queue_dealloca(gpu_.queue(), &waits, &signals, exported.size(), exported.data());
-      if (hrx_status_is_ok(st)) st = hrx_semaphore_wait(export_sem_, value, UINT64_MAX);
-      if (!hrx_status_is_ok(st)) {
-        std::fprintf(stderr, "npu: dealloca of the shared GPU buffers failed; leaking their pool\n");
-        hrx_status_ignore(st);
-        export_pool_ = nullptr;
-      }
-    }
-    for (auto& s : shared_)
-      if (!s->external && !s->host) s->gpu.reset();
-    if (export_pool_) hrx_mem_pool_release(export_pool_);
-    if (export_sem_) hrx_semaphore_release(export_sem_);
+      if (!s->external && !s->host) exported.push_back(&s->gpu);
+    gpu_.ReleaseExportable(std::move(exported));
     if (queue_) api_->kernel_queue_destroy(queue_);
     if (context_) xdna_->context_destroy(context_);
     if (device_) api_->device_destroy(device_);
@@ -249,52 +233,20 @@ class LoomNpu {
       shared_.push_back(std::move(s));
       return *shared_.back();
     }
-    s->gpu = AllocateExportable(s->bytes);
+    s->gpu = gpu_.AllocateExportable(s->bytes);
     gpu_.Fill(s->gpu, 0);
     gpu_.Synchronize();
     s->device = gpu_.DeviceAddress(s->gpu.handle);
-    ExportDmabuf(*s);
+    ExportDmabuf(s->gpu.handle, *s);
     shared_.push_back(std::move(s));
     return *shared_.back();
   }
-  // A device buffer whose backing the GPU driver can export as a DMA-BUF. HRX's default sources declare no export
-  // classes, so these come from one slab pool that requires DMA_BUF_FD on its owned backing (KFD export, the same
-  // ioctl HSA's hsa_amd_portable_export_dmabuf used).
-  LoomBuffer AllocateExportable(std::size_t bytes) {
-    if (!export_pool_) {
-      static const hrx_external_storage_class_t dmabuf = {HRX_EXTERNAL_STORAGE_TYPE_DMA_BUF_FD, {0, 0}};
-      hrx_pool_family_access_t family{};
-      family.device = gpu_.device();
-      family.family_ordinal = gpu_.family();
-      family.usage = HRX_BUFFER_USAGE_DEFAULT;
-      hrx_pool_scope_t scope{};
-      scope.family_count = 1;
-      scope.families = &family;
-      hrx_slab_pool_options_t options{};
-      options.owned.exports.class_count = 1;
-      options.owned.exports.classes = &dmabuf;
-      options.trace_name = "yah_npu_shared";
-      LoomCheck(hrx_slab_pool_create(gpu_.group(), scope, &options, &export_pool_), "hrx_slab_pool_create(dma-buf)");
-      LoomCheck(hrx_semaphore_create(gpu_.device(), 0, &export_sem_), "hrx_semaphore_create(dma-buf)");
-    }
-    gpu_.Synchronize();   // the queue is idle: the allocation needs no wait on the stream's work
-    LoomBuffer buffer;
-    buffer.size = bytes;
-    std::uint64_t value = ++export_value_;
-    hrx_semaphore_list_t waits = {nullptr, nullptr, 0};
-    hrx_semaphore_list_t signals = {&export_sem_, &value, 1};
-    const hrx_pool_reservation_request_t request = {bytes, 4096};
-    LoomCheck(hrx_queue_alloca(gpu_.queue(), &waits, &signals, export_pool_, 1, &request, &buffer.handle),
-              "hrx_queue_alloca(dma-buf)");
-    LoomCheck(hrx_semaphore_wait(export_sem_, value, UINT64_MAX), "hrx_semaphore_wait(dma-buf)");
-    return buffer;
-  }
   // The DMA-BUF fd (owned by s) and the buffer's offset in it. HRX has no public export, so this reads the HAL
   // buffer from the handle (libhrx/buffer.h); the export dispatches through the buffer's own vtable.
-  void ExportDmabuf(Shared& s) {
+  void ExportDmabuf(hrx_buffer_t buffer, Shared& s) {
     iree_hal_external_storage_t storage{};
     iree_hal_buffer_range_t range{};
-    NpuCheck(iree_hal_buffer_export(reinterpret_cast<hrx_buffer_s*>(s.gpu.handle)->hal_buffer,
+    NpuCheck(iree_hal_buffer_export(reinterpret_cast<hrx_buffer_s*>(buffer)->hal_buffer,
                                     iree_hal_make_buffer_range(0, IREE_HAL_WHOLE_BUFFER),
                                     iree_hal_make_external_storage_class(IREE_HAL_EXTERNAL_STORAGE_TYPE_DMA_BUF_FD),
                                     &storage, &range),
@@ -303,6 +255,31 @@ class LoomNpu {
     s.fd_offset = range.byte_offset;
     iree_hal_external_storage_release(&storage);
     if (s.fd < 0) throw LoomError("npu: dma-buf dup");
+  }
+  // The caller's GPU buffer (LoomDevice::AllocateExportable, kept alive past this NPU) readable by the NPU, imported
+  // once whole: views bind at their offset in it, like registered host pages. The model's rows with the NPU split
+  // (LoomWeights npu): device memory has no MMU notifier, so nothing the kernel does to host pages stalls the GPU.
+  Shared& ImportGpu(const LoomBuffer& buffer) {
+    auto s = std::make_unique<Shared>();
+    s->bytes = buffer.size;
+    s->external = true;
+    ExportDmabuf(buffer.handle, *s);
+    amdf_memory_import_info_t ii{};
+    ii.type = AMDF_STRUCTURE_TYPE_MEMORY_IMPORT_INFO;
+    ii.structure_size = sizeof(ii);
+    ii.memory_profile_ordinal = profile_.ordinal;
+    ii.access_count = 1;
+    ii.minimum_alignment = 4096;
+    ii.accesses = &access_;
+    amdf_external_memory_t em{};   // borrowed: the fd stays ours
+    em.type = AMDF_EXTERNAL_MEMORY_TYPE_DMA_BUF_FD;
+    em.payload.file_descriptor = s->fd;
+    em.source_byte_offset = s->fd_offset;
+    em.byte_length = s->bytes;
+    YAH_AMDF(api_->memory_import(scope_, &ii, &em, &s->native, nullptr), "memory_import(model)");
+    s->device = gpu_.DeviceAddress(buffer.handle);
+    shared_.push_back(std::move(s));
+    return *shared_.back();
   }
   // Shared buffers round to pages.
   [[nodiscard]] static std::size_t Align(std::size_t bytes) { return (bytes + 4095) / 4096 * 4096; }
@@ -1726,9 +1703,6 @@ class LoomNpu {
   amdf_kernel_queue_t* queue_ = nullptr;
   amdf_memory_device_access_t access_{};
   amdf_memory_profile_t profile_{};
-  hrx_mem_pool_t export_pool_ = nullptr;      // exportable GPU buffers (AllocateExportable)
-  hrx_semaphore_t export_sem_ = nullptr;
-  std::uint64_t export_value_ = 0;
   iree_hal_amd_xdna_aie2p_target_t target_{};
   std::map<std::string, iree_hal_amd_xdna_image_t*> images_;
   std::vector<std::unique_ptr<Shared>> shared_;
@@ -1796,14 +1770,20 @@ class LoomNpuSplit : public NpuSplit {
                                               {&flags_, slot + kSignal, 2 * plan_.gate_record}})));
     return ids_[key] = static_cast<std::uint32_t>(calls_.size() - 1);
   }
+  void ShareWeights(const void* key, std::size_t bytes, const LoomBuffer& buffer) override {
+    const auto b = reinterpret_cast<std::uintptr_t>(key);
+    raw_.push_back({b, b + bytes, &npu_.ImportGpu(buffer)});
+  }
   void RegisterRaw(const void* p, std::size_t bytes) override {
+    const auto p0 = reinterpret_cast<std::uintptr_t>(p);
+    for (const Raw& r : raw_)   // (ShareWeights' ranges are not page-aligned)
+      if (r.begin <= p0 && p0 + bytes <= r.end) return;
     const auto b = reinterpret_cast<std::uintptr_t>(p) & ~std::uintptr_t{4095};
     const auto e = (reinterpret_cast<std::uintptr_t>(p) + bytes + 4095) & ~std::uintptr_t{4095};
     for (const Raw& r : raw_)
       if (r.begin <= b && e <= r.end) return;
-    // libamdf pins for writing: the model is resident writable memory (Gguf::OpenResident), so the NPU shares the
-    // GPU's pages (a protection change or a copy-on-write fault there would evict every GPU queue). The NPU does not
-    // snoop the CPU's caches, so the rows are flushed to memory.
+    // libamdf pins for writing: the host rows (pre-decoded copies, LoomPrefill::HostRows) are private writable
+    // memory. The NPU does not snoop the CPU's caches, so the rows are flushed to memory.
     auto* pages = reinterpret_cast<void*>(b);
     LoomNpu::Shared& s = npu_.RegisterHost(pages, e - b);
     for (std::uintptr_t a = b; a < e; a += 64) _mm_clflushopt(reinterpret_cast<void*>(a));

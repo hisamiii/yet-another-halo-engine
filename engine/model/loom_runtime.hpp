@@ -231,6 +231,63 @@ class LoomDevice {
     return buffer;
   }
 
+  // A device buffer whose backing the GPU driver can export as a DMA-BUF (the NPU imports such buffers: its operands,
+  // and the model with the NPU split, LoomWeights npu). HRX's default sources declare no export classes, so these come
+  // from one slab pool that requires DMA_BUF_FD on its owned backing (KFD export, the same ioctl HSA's
+  // hsa_amd_portable_export_dmabuf used). Each ends with ReleaseExportable.
+  [[nodiscard]] LoomBuffer AllocateExportable(size_t bytes, std::source_location loc = std::source_location::current()) {
+    AllocLog("export", bytes, loc);
+    if (!export_pool_) {
+      static const hrx_external_storage_class_t dmabuf = {HRX_EXTERNAL_STORAGE_TYPE_DMA_BUF_FD, {0, 0}};
+      hrx_pool_family_access_t family{};
+      family.device = device_;
+      family.family_ordinal = family_;
+      family.usage = HRX_BUFFER_USAGE_DEFAULT;
+      hrx_pool_scope_t scope{};
+      scope.family_count = 1;
+      scope.families = &family;
+      hrx_slab_pool_options_t options{};
+      options.owned.exports.class_count = 1;
+      options.owned.exports.classes = &dmabuf;
+      options.trace_name = "yah_exportable";
+      LoomCheck(hrx_slab_pool_create(group_, scope, &options, &export_pool_), "hrx_slab_pool_create(dma-buf)");
+      LoomCheck(hrx_semaphore_create(device_, 0, &export_sem_), "hrx_semaphore_create(dma-buf)");
+    }
+    Synchronize();   // the queue is idle: the allocation needs no wait on the stream's work
+    LoomBuffer buffer;
+    buffer.size = bytes;
+    allocated_ += bytes;
+    std::uint64_t value = ++export_value_;
+    hrx_semaphore_list_t waits = {nullptr, nullptr, 0};
+    hrx_semaphore_list_t signals = {&export_sem_, &value, 1};
+    const hrx_pool_reservation_request_t request = {bytes, 4096};
+    LoomCheck(hrx_queue_alloca(queue_, &waits, &signals, export_pool_, 1, &request, &buffer.handle),
+              "hrx_queue_alloca(dma-buf)");
+    LoomCheck(hrx_semaphore_wait(export_sem_, value, UINT64_MAX), "hrx_semaphore_wait(dma-buf)");
+    return buffer;
+  }
+  // Gives AllocateExportable's buffers back: a pool allocation ends with a dealloca (a release alone leaves it live,
+  // and the pool's destroy then waits for it forever), then the handles go.
+  void ReleaseExportable(std::vector<LoomBuffer*> buffers) {
+    std::vector<hrx_buffer_t> handles;
+    for (LoomBuffer* b : buffers)
+      if (b->handle) handles.push_back(b->handle);
+    if (!handles.empty()) {
+      Synchronize();
+      std::uint64_t value = ++export_value_;
+      hrx_semaphore_list_t waits = {nullptr, nullptr, 0};
+      hrx_semaphore_list_t signals = {&export_sem_, &value, 1};
+      hrx_status_t st = hrx_queue_dealloca(queue_, &waits, &signals, handles.size(), handles.data());
+      if (hrx_status_is_ok(st)) st = hrx_semaphore_wait(export_sem_, value, UINT64_MAX);
+      if (!hrx_status_is_ok(st)) {
+        std::fprintf(stderr, "loom: dealloca of exportable buffers failed; leaking their pool\n");
+        hrx_status_ignore(st);
+        export_leak_ = true;
+      }
+    }
+    for (LoomBuffer* b : buffers) b->reset();
+  }
+
   // A host-local buffer, persistently mapped at *host: the host reads what the stream copied there once it completed
   // (Mark / Wait), without a queue transfer (a synchronous D2H waits behind all queued work).
   [[nodiscard]] LoomBuffer AllocateHost(size_t bytes, const void** host,
@@ -458,6 +515,10 @@ class LoomDevice {
     LoomCheck(hrx_stream_create(queue_, 0, &stream_), "hrx_stream_create");
   }
   void Close() {
+    if (export_pool_ && !export_leak_) hrx_mem_pool_release(export_pool_);
+    export_pool_ = nullptr;
+    if (export_sem_) hrx_semaphore_release(export_sem_);
+    export_sem_ = nullptr;
     if (stream_) hrx_stream_release(stream_);
     stream_ = nullptr;
     // device_ and queue_ are borrowed from the group.
@@ -475,6 +536,10 @@ class LoomDevice {
   hrx_memory_scope_t program_scope_ = {};
   hrx_stream_t stream_ = nullptr;
   size_t allocated_ = 0;
+  hrx_mem_pool_t export_pool_ = nullptr;   // AllocateExportable's
+  hrx_semaphore_t export_sem_ = nullptr;
+  std::uint64_t export_value_ = 0;
+  bool export_leak_ = false;   // a dealloca failed: the pool is never released
   uint32_t next_flags_ = 0;
   bool no_barrier_ok_ = true;
   static constexpr uint32_t kChainSlots = 1024;   // gen_chain.CHAIN_SLOTS
@@ -613,10 +678,9 @@ class LoomGraph {
   std::vector<std::array<uint32_t, 3>> grids_;
 };
 
-// Back the whole pages of [p, p + bytes), which nothing reads, with one shared 2 MB page run: pinning them (an import
-// or an NPU registration of a range around them pins every page) then takes no memory of its own. lock: mlocked like
-// the model they replace (Gguf::OpenResident: reclaim would move pages under the GPU's import)
-inline void AliasUnread(std::uint8_t* p, std::size_t bytes, bool lock) {
+// Back the whole pages of [p, p + bytes), which nothing reads, with one shared 2 MB page run: pinning them (an NPU
+// registration of a range around them pins every page) then takes no memory of its own
+inline void AliasUnread(std::uint8_t* p, std::size_t bytes) {
   constexpr std::uintptr_t kPage = 4096;
   constexpr std::size_t kRun = std::size_t{2} << 20;
   static const int fd = [] {
@@ -630,32 +694,29 @@ inline void AliasUnread(std::uint8_t* p, std::size_t bytes, bool lock) {
     n = std::min<std::size_t>(kRun, e - a);
     void* q = ::mmap(reinterpret_cast<void*>(a), n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
     if (q == MAP_FAILED) throw LoomError("cannot alias unread pages");
-    if (lock) ::mlock(q, n);
   }
 }
 
-// The model's tensor data on the GPU; Ref(t) binds a tensor. By default it is copied into device-local buffers of about
-// 1 GiB cut at tensor boundaries, each host range released right after its copy (RAM holds one copy of the model):
-// the GPU reads imported host pages snooped, ~6% more GEMM cycles. in_place: the host region imported once (the NPU
-// split also reads the weights through host pointers); the import needs a page-aligned start, hence a delta inside it.
+// The model's tensor data on the GPU; Ref(t) binds a tensor. It is copied into device-local buffers of about 1 GiB cut
+// at tensor boundaries, each host range released right after its copy (RAM holds one copy of the model). npu (the NPU
+// split): the buffers are exportable (LoomDevice::AllocateExportable) and the NPU reads its rows from them
+// (ForEachShared, NpuSplit::ShareWeights). The split once had the GPU import the host copy instead: the GPU maps such
+// an import through user pointers, compaction kept moving its pages, and each move evicted every GPU queue, for
+// seconds in all, which held gated NPU jobs past amdxdna's 2 s command limit (2026-11-15).
 class LoomWeights {
  public:
-  // skip: tensors the device never reads (not uploaded; Has() false, Ref() refuses them). in_place (the NPU split): the
-  // GPU reads the resident copy itself (one import of the whole tensor data, every range filled and kept: the NPU
-  // reads its rows through host pointers); the skipped tensors' whole pages are aliased (AliasUnread) before the import
-  // pins them (Gguf::Rows reads a skipped tensor from the source).
+  // skip: tensors the device never reads (not uploaded; Has() false, Ref() refuses them; Gguf::Rows reads them from
+  // the source).
   LoomWeights(LoomDevice& gpu, core::Gguf& gguf, const std::function<bool(const std::string&)>& skip = {},
-              bool in_place = false) {
+              bool npu = false)
+      : gpu_(gpu), base_(gguf.tensor_data_base()), npu_(npu) {
     constexpr size_t kChunk = size_t{1} << 30;
-    constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
     // (begin, end, glued): a layer's ffn_gate and ffn_up stay in one buffer (the NPU FFN block reads a gate row through
     // its up row in one view, LoomPrefill::RunFfnBlock)
     std::vector<std::tuple<size_t, size_t, bool>> spans;
-    std::vector<std::pair<size_t, size_t>> unread;   // in_place: the skipped tensors (offset, bytes)
     for (const auto& t : gguf.tensors()) {
       if (skip && skip(t.name)) {
         skipped_.push_back(t.name);
-        if (in_place) unread.emplace_back(t.offset, t.bytes);
         continue;
       }
       const bool glued = t.name.ends_with("ffn_up.weight");
@@ -671,16 +732,6 @@ class LoomWeights {
       ranges.emplace_back(begin, end - begin);
     }
     gguf.Stream(ranges);   // (a native copy reads the next range while this one uploads)
-    if (in_place) {
-      for (const auto& [begin, bytes] : ranges) gguf.Prepare(begin, bytes);
-      for (const auto& [o, n] : unread)
-        AliasUnread(const_cast<std::uint8_t*>(gguf.tensor_data_base()) + o, n, true);
-      const uintptr_t base = reinterpret_cast<uintptr_t>(gguf.tensor_data_base()), start = base & ~uintptr_t{4095};
-      LoomBuffer buffer = gpu.Import(reinterpret_cast<void*>(start), gguf.tensor_data_size() + base - start);
-      chunks_.push_back({0, gguf.tensor_data_size(), base - start, std::move(buffer)});
-      in_place_ = true;
-      return;
-    }
     // YAH_LOAD_TIMES=1: each upload step's total (fill: until the host copy of the range is there)
     double ms[4] = {};
     auto t = std::chrono::steady_clock::now();
@@ -689,7 +740,7 @@ class LoomWeights {
       ms[i] += std::chrono::duration<double, std::milli>(n - t).count(), t = n;
     };
     for (const auto& [begin, bytes] : ranges) {
-      LoomBuffer buffer = gpu.Allocate(bytes + kPad);
+      LoomBuffer buffer = npu ? gpu.AllocateExportable(bytes + kPad) : gpu.Allocate(bytes + kPad);
       step(0);
       gguf.Prepare(begin, bytes);
       step(1);
@@ -697,47 +748,42 @@ class LoomWeights {
       step(2);
       gguf.ReleaseData(begin, bytes);
       step(3);
-      chunks_.push_back({begin, begin + bytes, 0, std::move(buffer)});
+      chunks_.push_back({begin, begin + bytes, std::move(buffer)});
     }
     if (std::getenv("YAH_LOAD_TIMES"))
       std::fprintf(stderr, "load: weights in %zu buffers: allocate %.1f, fill %.1f, h2d %.1f, release %.1f ms\n",
                    chunks_.size(), ms[0], ms[1], ms[2], ms[3]);
   }
-  // in_place, the device idle and no recorded graph left: give the import back, alias spans (tensor-data offsets) nobody
-  // reads (AliasUnread) and import the region again, so their pages go (the import pins every page of its range).
-  // Returns the bytes freed.
-  std::size_t DropUnread(LoomDevice& gpu, core::Gguf& gguf, const std::vector<std::pair<size_t, size_t>>& spans) {
-    if (!in_place_ || spans.empty()) return 0;
-    gpu.Synchronize();
-    const size_t bytes = chunks_[0].buffer.size;
-    auto* start = const_cast<std::uint8_t*>(gguf.tensor_data_base()) - chunks_[0].delta;
-    chunks_[0].buffer.reset();
-    std::size_t freed = 0;
-    for (const auto& [o, n] : spans) {
-      AliasUnread(start + chunks_[0].delta + o, n, true);
-      freed += n;
-    }
-    chunks_[0].buffer = gpu.Import(start, bytes);
-    return freed;
+  LoomWeights(const LoomWeights&) = delete;
+  LoomWeights& operator=(const LoomWeights&) = delete;
+  ~LoomWeights() {
+    if (!npu_) return;
+    std::vector<LoomBuffer*> buffers;
+    for (Chunk& c : chunks_) buffers.push_back(&c.buffer);
+    gpu_.ReleaseExportable(std::move(buffers));
+  }
+  // npu: f(key, bytes, buffer) for each buffer, [key, key + bytes) the host addresses of the tensor data it holds and
+  // its over-read pad (NpuSplit::ShareWeights); else nothing
+  template <typename F>
+  void ForEachShared(F&& f) const {
+    if (npu_)
+      for (const Chunk& c : chunks_) f(static_cast<const void*>(base_ + c.begin), c.buffer.size, c.buffer);
   }
   [[nodiscard]] bool Has(const core::TensorInfo& t) const {
     return std::find(skipped_.begin(), skipped_.end(), t.name) == skipped_.end();
   }
   [[nodiscard]] hrx_buffer_ref_t Ref(const core::TensorInfo& t) const {
     const Chunk& c = ChunkHolding(t);
-    return {c.buffer.handle, c.delta + static_cast<size_t>(t.offset) - c.begin, static_cast<size_t>(t.bytes)};
+    return {c.buffer.handle, static_cast<size_t>(t.offset) - c.begin, static_cast<size_t>(t.bytes)};
   }
   template <typename F>
   void ForEachBuffer(F&& f) const {
     for (const Chunk& c : chunks_) f(c.buffer.handle);
   }
-  // The whole device buffer holding tensor t (the NPU shares it, NpuSplit::ShareGpu).
-  [[nodiscard]] const LoomBuffer& ChunkOf(const core::TensorInfo& t) const { return ChunkHolding(t).buffer; }
 
  private:
   struct Chunk {
     size_t begin, end;  // the tensor-data range the buffer holds
-    size_t delta;       // in_place: the tensor data's offset inside the import (else 0)
     LoomBuffer buffer;
   };
   const Chunk& ChunkHolding(const core::TensorInfo& t) const {
@@ -750,7 +796,10 @@ class LoomWeights {
   }
   std::vector<Chunk> chunks_;
   std::vector<std::string> skipped_;
-  bool in_place_ = false;
+  static constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
+  LoomDevice& gpu_;
+  const std::uint8_t* base_;   // the tensor data's host addresses (ForEachShared's keys)
+  bool npu_;
 };
 
 }  // namespace yah::model

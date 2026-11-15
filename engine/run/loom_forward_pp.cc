@@ -164,8 +164,8 @@ int main(int argc, char** argv) {
     // the prefill reads neither the MTP layer nor token_embd's device copy (Embed stages its rows); the decode's embed
     // kernel reads token_embd's
     const std::string mtp = "blk." + std::to_string(cfg.main_block_count()) + ".";
-    // --npu with the GEMM split: the GPU reads the resident copy in place (the NPU reads its rows through host
-    // pointers; the whole copy stays, pinned). The NPU attention reads no weights: its sets upload as without --npu.
+    // --npu with the GEMM split: the weights go to exportable buffers, the NPU reads its rows from them
+    // (LoomWeights npu). The NPU attention reads no weights: its sets upload as without --npu.
     // a set may split the GEMMs (npusplit_ / npuffnblk rows), the attention (npuattn) or both
     bool npu_attn_set = false, npu_gemm_set = false;
     {
@@ -203,6 +203,7 @@ int main(int argc, char** argv) {
         return 2;
       }
       npu = std::make_unique<yah::model::LoomNpuSplit>(gpu, plan);
+      weights.ForEachShared([&](const void* key, std::size_t bytes, const LoomBuffer& b) { npu->ShareWeights(key, bytes, b); });
       pf.EnableNpu(npu.get());
       if (pf.npu_attn_set()) {   // both: two NPU contexts, their commands ordered by the host (LoomNpu::SetPeer)
         npu_attn = std::make_unique<yah::model::LoomNpuAttn>(gpu);
@@ -210,11 +211,6 @@ int main(int argc, char** argv) {
         pf.EnableNpuAttn(npu_attn.get());
       }
       lap("npu enable");
-      // full chunks only: every split GEMM leaves the NPU's rows to the NPU, so the model rows its own copies replace
-      // (pre-decoded / transcoded rows) are not kept
-      if (want && want % pf.chunk() == 0)
-        std::fprintf(stderr, "loom_forward_pp: released %.2f GB of model rows the NPU reads from its copies\n",
-                     weights.DropUnread(gpu, gguf, pf.npu_only()) / 1e9);
     }
 #else
     if (opt.npu) throw LoomError("--npu: this build has no NPU support");

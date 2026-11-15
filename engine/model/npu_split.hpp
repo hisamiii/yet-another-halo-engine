@@ -43,13 +43,17 @@ class NpuSplit {
   [[nodiscard]] virtual const LoomBuffer& C() const = 0;
   // One call of the NPU GEMM image at path on these views (cold: loads and binds; the same arguments return the same id).
   virtual std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) = 0;
-  // Decoder-column sets (NpuPlan::dcol): the NPU reads raw weight rows from the model's own mapping.
+  // Decoder-column sets (NpuPlan::dcol): the NPU reads raw weight rows, the model's (from the GPU's copy, ShareWeights)
+  // or pre-decoded host copies.
   // RegisterRaw makes the pages holding [p, p + bytes) readable by the NPU (once per range, before any work).
   // BindRaw is one call of a decoder-column image whose raw rows are [raw, raw + raw_bytes) of a registered range;
   // swap is the image that re-programs only the decoder tiles for its format, dec that format's id. family names the
   // images that differ only in their decoder tiles (swaps switch between them); a job's images are one family, and
   // where a job's family differs from the array's, the command first runs the image's setup ("<image>.setup.xdna").
   virtual void RegisterRaw(const void* p, std::size_t bytes) = 0;
+  // The model's rows from the GPU's own copy (LoomWeights npu, ForEachShared): the host addresses [key, key + bytes)
+  // name the bytes of buffer, so RegisterRaw / BindRaw ranges inside them read the buffer. Before any RegisterRaw.
+  virtual void ShareWeights(const void* key, std::size_t bytes, const LoomBuffer& buffer) = 0;
   virtual std::uint32_t BindRaw(const std::string& image, const std::string& swap, int dec, NpuView a,
                                 const void* raw, std::size_t raw_bytes, NpuView c,
                                 const std::string& family = "dcol") = 0;

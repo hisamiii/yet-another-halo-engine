@@ -61,7 +61,7 @@ class Engine : public TextGenerator {
         gguf_(core::Gguf::OpenResident(o.model)),
         cfg_(core::Qwen35Config::FromGguf(gguf_)),
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
-        weights_(gpu_, gguf_, MtpLayer(cfg_), NpuInPlace(o)),
+        weights_(gpu_, gguf_, MtpLayer(cfg_), NpuWeights(o)),
         prefill_(gpu_, gguf_, cfg_, o.prefill_hal, weights_),
         decoder_(gpu_, gguf_, cfg_, o.decode_hal, weights_) {
     if (decoder_.context() != prefill_.pool_rows())
@@ -258,6 +258,8 @@ class Engine : public TextGenerator {
         npu_status_ = "the prefill set has no NPU split (emit_prefill_pp.py YAH_NPU_SPLIT)";
       } else if (npu_status_ = dpm_.Pin(); npu_status_.empty()) {
         npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
+        weights_.ForEachShared(
+            [&](const void* key, std::size_t bytes, const LoomBuffer& b) { npu_->ShareWeights(key, bytes, b); });
         prefill_.EnableNpu(npu_.get());
       }
     }
@@ -271,9 +273,8 @@ class Engine : public TextGenerator {
     const std::string pre = "blk." + std::to_string(cfg.main_block_count()) + ".";
     return [pre](const std::string& n) { return n.starts_with(pre); };
   }
-  // --npu with the NPU ready: the GPU reads the model's resident copy in place (LoomWeights in_place: the NPU reads
-  // its rows through host pointers)
-  static bool NpuInPlace(const Options& o) {
+  // --npu with the NPU ready: the weights go to exportable buffers (LoomWeights npu: the NPU reads its rows from them)
+  static bool NpuWeights(const Options& o) {
 #ifdef YAH_WITH_NPU
     return o.npu && NpuProblem().empty();
 #else
