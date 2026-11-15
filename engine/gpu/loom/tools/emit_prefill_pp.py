@@ -750,8 +750,8 @@ FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q5k", "q4
 FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k", "q3k", "q5k", "iq2s")
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
-             "iq2xs": ("IQ2_XS", "p4"), "q5k": ("Q5_K", "p4"),
-             "iq2s": ("BFP", "p4")}   # IQ2_S: no decoder, the rows pre-decoded (bfp_rows: npu_bfp_<tensor>.bin)
+             "iq2xs": ("IQ2_XS", "p4"), "q5k": ("Q5_K", "p4"), "iq2s": ("IQ2_S", "p4"),
+             "bfp": ("BFP", "p4")}   # BFP: rows pre-decoded on the host (bfp_pair_rows, bfp_site_rows)
 NPU_KS = (36, 36, 36, 20)   # k-blocks per pass and K-slice row; K = 1024 * passes
 # the FFN block's gate / up of the formats whose filler cores hold 40 k-block slices (IQ3_S's head A ring does not
 # place): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
@@ -764,16 +764,16 @@ IX4_FMTS = {"iq3s": "IQ4_XO", "iq3xxs": "IQ4_XX"}
 IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX")
 # gate and up of one format without a fused GPU gate / up whose single-format deferred image fits: their own decoder
 # on the GGUF rows, no pre-decoded copy (Q3_K's with its record realign rolled: npu_images' q3roll fallback)
-NPU_SAME_SW = ("q5k", "q3k")
+NPU_SAME_SW = ("q5k", "q3k", "iq2s")
 # gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
 # tensor's rows (IQ3_S's transcoded, npu_ix4_<tensor>.bin), the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>",
 # dispatch rows "npuffncp_<gate>_<up>"); not two formats of IQ4_XS's decoder (one image, kv2). IQ2_XS's grid tables do
 # not place.
-NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s")
+NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s")
 # The other pairs' gate / up rows (the NPU's) are pre-decoded to bfp16 (bfp_pair_rows: npu_bfp_<prefix>ffn_gate_up.bin),
 # one BFP image like a single format's with the deferred epilogue ("npu_ffnsw_bfp_<hord>", dispatch rows
 # "npuffnbx_<gate>_<up>"). Site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU rows
-# pre-decoded too (bfp_site_rows: npu_bfp_<tensor>.bin), on the BFP site image ("npu_dcol_iq2s_<K>", dispatch rows
+# pre-decoded too (bfp_site_rows: npu_bfp_<tensor>.bin), on the BFP site image ("npu_dcol_bfp_<K>", dispatch rows
 # "npusitebx_<tensor>").
 
 
@@ -946,7 +946,7 @@ def npu_split(rows, combos, B, outdir):
             if fmt in FUSE_FMTS:
                 images.add((fmt, kb * 256))
             elif not chunked and skind != "kres":   # (BFP site rows)
-                images.add(("iq2s", skb * 256))
+                images.add(("bfp", skb * 256))
                 bsites.update((t, nn) for t in combos[(kind, fmt, port, mt, kb)])
             if npu_rem(site) and (site, fmt) not in done:   # the GPU's K remainder of the NPU's rows (f32 [B][nn])
                 done.add((site, fmt))
@@ -1105,49 +1105,6 @@ def npu_images(images, B, tmp, outdir, extra=()):
     return out + [("npugfirst", 1, 0, 0)]
 
 
-def bfp_rows(names, outdir):
-    """IQ2_S tensors the NPU takes (DCOL_FMTS "BFP"): each written pre-decoded to outdir/npu_bfp_<name>.bin, rows of
-    K / 1024 units of 1152 bytes: unit (16-row slab b, pass u)'s decoder output ([kb 128 in KPERM order][h 2] bfp16
-    fragments of the exact f32 weights, as gen_npu_dec decodes them) as its 16 rows (the engine binds it like raw rows)."""
-    import gguf
-    import numpy as np
-    import npu_dec_emit as Q
-    kperm = GN.decoder("BFP").KPERM
-    grid = np.fromfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tables", "grid_iq2s.bin"),
-                       np.uint8).reshape(1024, 8).astype(np.float32)
-    rd = gguf.GGUFReader(MODEL)
-    for t in rd.tensors:
-        if t.name not in names:
-            continue
-        path = os.path.join(outdir, "npu_bfp_%s.bin" % t.name)
-        assert t.tensor_type.name == "IQ2_S", t.name
-        K, N = int(t.shape[0]), int(t.shape[1])
-        if os.path.exists(path) and os.path.getsize(path) == N * K // 256 * 288:
-            continue
-        raw = np.asarray(t.data).view(np.uint8).reshape(N, K // 256, 82)
-        with open(path, "wb") as f:
-            for b0 in range(0, N, 256):   # 256 rows at a time
-                f.write(bfp_units(iq2s_weights(raw[b0:b0 + 256], grid), kperm))
-        print("bfp rows: %s (%d x %d) -> %s" % (t.name, N, K, path))
-
-
-def iq2s_weights(blk, grid):
-    """IQ2_S super-blocks [n][sb][82] -> their exact f32 weights [n][sb][256]."""
-    import numpy as np
-    n, nsb = blk.shape[:2]
-    d = blk[..., 0:2].copy().view(np.float16)[..., 0].astype(np.float32)        # [n][sb]
-    qs, sg = blk[..., 2:34].astype(np.int64), blk[..., 34:66].astype(np.int64)  # [n][sb][32]
-    qh, sc = blk[..., 66:74].astype(np.int64), blk[..., 74:82].astype(np.int64)  # [n][sb][8]
-    l = np.arange(32) % 4
-    ib = np.arange(32) // 4
-    idx = qs | ((qh[..., ib] << (8 - 2 * l)) & 0x300)                            # [n][sb][32]
-    s4 = np.stack([sc & 15, sc >> 4], -1).reshape(n, nsb, 16)                   # per 16 values
-    dl = (d[..., None] * (np.float32(0.5) + s4.astype(np.float32)) * np.float32(0.25)).astype(np.float32)
-    g = grid[idx]                                                                # [n][sb][32][8]
-    sign = 1 - 2 * ((sg[..., None] >> np.arange(8)) & 1)                         # [n][sb][32][8]
-    return (np.repeat(dl, 16, -1).reshape(n, nsb, 32, 8) * g * sign).astype(np.float32).reshape(n, nsb, 256)
-
-
 def bfp_units(w, kperm):
     """f32 weights [n (16 | n)][K / 256][256] -> the BFP decoder's rows (bytes): per 16-row slab, its rows of K / 1024
     units of 1152 bytes (unit (slab, pass): [kb 128 in kperm order][h 2] bfp16 fragments)."""
@@ -1183,13 +1140,11 @@ def bfp_site_rows(sites, outdir):
 
 def bfp_pair_rows(layers, F, outdir):
     """The gate / up tensors of the pairs in layers (prefixes), their last F rows (the NPU's) decoded to
-    their decoders' exact f32 weights (gen_npu_dec.weights; IQ2_S: iq2s_weights) as BFP rows (bfp_units), gate's then
+    their decoders' exact f32 weights (gen_npu_dec.weights) as BFP rows (bfp_units), gate's then
     up's, to npu_bfp_<prefix>ffn_gate_up.bin (the engine's one BFP image binds them like a single format's)."""
     import gguf
     import numpy as np
     kperm = GN.decoder("BFP").KPERM
-    grid = np.fromfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tables", "grid_iq2s.bin"),
-                       np.uint8).reshape(1024, 8).astype(np.float32)
     rd = gguf.GGUFReader(MODEL)
     ts = {t.name: t for t in rd.tensors}
     for pre in sorted(layers):
@@ -1204,8 +1159,7 @@ def bfp_pair_rows(layers, F, outdir):
                 raw = np.asarray(t.data).view(np.uint8).reshape(N, K // 256, -1)
                 for r0 in range(N - F, N, 512):
                     blk = raw[r0:r0 + 512]
-                    w = iq2s_weights(blk, grid) if src == "IQ2_S" else GN.decoder(src).weights(blk)
-                    f.write(bfp_units(w, kperm))
+                    f.write(bfp_units(GN.decoder(src).weights(blk), kperm))
         os.replace(path + ".tmp", path)
         print("bfp pair rows: %s -> %s" % (pre, path))
 
@@ -1272,9 +1226,6 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     mixed = [l for l in pairs if {gu_fmt(l[kd][0]) for kd in ("ffn_gate", "ffn_up")} <= set(IX4_FAMILY)
              or l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW or colpair(l)]
     bsw = [l for l in pairs if l not in mixed]
-    bfp_rows({"blk.%s.%s.weight" % (n, kd) for n, l in by.items() if l in ok + pairs
-              for kd in ("ffn_gate", "ffn_up", "ffn_down") if l.get(kd, ("",))[0] == "iq2s"
-              and not (l in bsw and kd != "ffn_down")}, outdir)
     bfp_pair_rows({"blk.%s." % n for n, l in by.items() if l in bsw}, F, outdir)
     # sw layers: gate and up in one file (the image's dgu); pairs: per tensor; the NPU's rows only
     ix4_files({"blk.%s." % n: [kd for kd in ("ffn_gate", "ffn_up") if l[kd][0] in IX4_FMTS]
