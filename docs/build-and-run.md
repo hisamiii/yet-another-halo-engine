@@ -14,62 +14,90 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 
 Each patch says at its top what it is for. Patches stack (a later one may edit an earlier one's lines): the bootstrap builds the pin with every patch applied in order and brings the checkout's patched files to it, and `--check` compares them; a patch that no longer fits the pin stops it. Raise the pin deliberately: bootstrap, rebuild, then check the emits and the GPU references.
 
+The series is the pin's patches rebuilt on HRX main in their old order. A carried patch keeps the pin's number after its own (`0014-0015-graph-atomic-store-node` is the pin's 0015); a `port` patch adapts the patches it names to main; a few were reverted and redone later in the series. Older docs (results.md) cite the pin's numbers.
+
 | patch | effect |
 |---|---|
-| `0001-stream-dispatch-no-ordering-barrier` | `HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER`: decode overlaps independent dispatches (`LoomDevice::NoBarrierNext`) |
-| `0002-stream-profile-metadata` | `HRX_PROFILE_MODE=dispatch` records stream dispatches |
-| `0003-profile-counters-mode` | `HRX_PROFILE_MODE=counters` with `HRX_PROFILE_COUNTERS`: per-dispatch PMC such as `SQ_BUSY_CYCLES`, plus the gfx11 GL2C counters |
-| `0005-gfx1151-f16-wmma-operand-placement` | the f16 WMMA spreads its operands over the register banks (upstream does it for bf16 only): prefill GEMM cycles -2.6% |
-| `0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
-| `0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later (8 `v_mov` + a load wait per k phase in afrag GEMMs); bit-identical, enables the IQ3_S sign chain |
-| `0009-loom-omit-dead-fma-mix-seeds` | after allocation, drops the `v_mov_b32 0` that seeds an f16 pair built by `v_fma_mixlo` + `v_fma_mixhi` (no bit of it is ever read), keeping the schedule and registers; afrag kstore cycles -1.0%, bit-identical |
-| `0010-loom-vopd-trans-window-lookahead` | VOPD pairs inside TRANS-result windows when a lookahead finds no read that relies on the distance: prefill attention and SwiGLU epilogues -0.1..-0.25% cycles, bit-identical |
-| `0011-loom-low-licm` | loop-invariant code motion for low CFGs, only with `LOOM_EXP_LICM=1` (the emitter sets it for the fp16 and kv4 prefill attention): -1.0% at pp2048, -2.15% at 32K, bit-identical |
-| `0012-loom-slice-alias-coalescing` | concats of consecutive slices fold, and slice coalescing ignores dead exact-storage aliases: attention loop 29 -> 21 moves, -0.8..-2.3% attention, bit-identical |
-| `0013-xdna-npu-cascade-gemm-compiler` | the Loom AIE2P compiler pieces of the NPU cascade GEMM: memory-tile staging, replay and multicast |
-| `0014-xdna-continuation-invocation` | the XDNA loader resolves an entry's control-only continuation (`iree_hal_amd_xdna_executable_query_continuation`) |
-| `0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8 byte store in a graph (the GPU releases NPU jobs and clears their words) |
-| `0016-loom-xdna-npu-side-gate` | an NPU job waits for a flag in memory itself, so the GPU and the NPU sync without the host |
-| `0017-loom-xdna-gated-call-invocations` | the NPU-side gate for plans that are not streamed (one replay group) |
-| `0018-loom-xdna-npu-decoder-column` | array descriptors and bindings for raw weight rows decoded on the cores (first for a decoder column, a form no longer emitted) |
-| `0019-loom-xdna-npu-ffn-block` | array plan, binding (axis chains) and route changes for the NPU FFN block |
-| `0020-loom-xdna-npu-fused-fill` | GEMM workers fill their own memory-tile panels, so weights can be decoded on the way in |
-| `0021-loom-xdna-pack-low` | low bank packing of read-only leaf data and wide ring records (opt-in `LOOM_EXP_PACK_LOW=1`) |
-| `0022-loom-xdna-intake` | intake channels (`constrain.intake`): a staged binding read in panels |
-| `0023-loom-xdna-core-stream-dma` | core-to-core streams own no DMA |
-| `0024-loom-xdna-core-stream-schedule` | scalar core stream transfers schedule like the cascade |
-| `0025-loom-xdna-east-neighbor-intake-depths` | two array fixes for the gate placement that frees the gate column's fill (`gen_npu_gemm` gwest) |
-| `0026-loom-xdna-leaf-sync-addresses` | two array fixes for leaf-synchronized channels (`gen_npu_gemm` ghelp) |
-| `0027-loom-xdna-drain-lock-requests` | a setup fix for images of other layouts sharing a context (`LOOM_EXP_ROUTE_RESET`) |
-| `0028-loom-xdna-deferred-conflicting-rodata` | the planner defers read-only data with bank conflicts (`conflicts([...])`) |
-| `0029-loom-xdna-top-aligned-programs` | core programs end at the top of program memory, behind a 16-byte startup jump |
-| `0030-loom-amdgpu-tied-fmac` | an f32 fma whose addend dies there becomes the tied `v_fmac_f32`, which VOPD pairs; the iu4 GEMM fold: 31 fewer VALU issue slots per phase, bit-identical |
-| `0031-loom-amdgpu-matrix-bank-allocation` | register allocation also tries a first fit that sees instruction operand preferences (matrix operand banks), kept only without spills and without a lower residency tier; adds the gfx1151 iu4 WMMA qualification; bit-identical |
-| `0032-loom-kernel-priority` | `kernel.priority {level = N}` lowers to `s_setprio` as an ordered execution barrier; used around the iu4 GEMM fold; bit-identical |
-| `0033-loom-amdgpu-iu4-inline-seed-subrev` | an iu4 WMMA accumulator splat of the bits of 1/(2 pi) selects the inline-source form; `x - c` with an inline `c` selects `v_subrev_f32`, which VOPD pairs; bit-identical |
-| `0034-loom-amdgpu-inline-accumulator-bank-placement` | the inline-accumulator iu4 WMMA forms get their own gfx1151 placement preference (A and B in different VGPR banks); bit-identical |
-| `0035-loom-amdgpu-valu-source-bank-placement` | VALU instructions prefer pairwise different source banks (two reads of one bank issue in 2.5 cycles): GEMM fold bank conflicts 21 -> 4, pp2048 GEMM cycles -0.7%, bit-identical |
-| `0036-loom-amdgpu-pack-16bit-pairs-with-perm` | two 16-bit lanes pack with one `v_perm_b32` instead of 3 VALU: iu4 gu epilogue 48 -> 16 packing VALU, bit-identical |
-| `0037-loom-wave-uniform-branches-with-matched-barriers` | workgroup barriers under a subgroup-uniform branch are accepted when every region runs the same barrier sequence: one wave runs its own loop (`gen_gdn_ss`'s solver wave) |
-| `0038-loom-loop-carried-frame-placement` | loop-carried storage frames are placed together, so lane-decomposed accumulators keep one location around the backedge (`gen_gdn_ss` row loop 100 -> 33 `v_mov`) |
-| `0039-loom-amdgpu-repack-reads-constructing-lanes` | a result -> rhs b16 fragment repack reads the constructing lanes directly: 8 fewer VALU per repacked tile, bit-identical |
-| `0040-loom-amdgpu-b16-store-takes-low-half-def` | a 16-bit store of a low-half definition skips the `v_bfe_u32` that cleared the upper half: 168 VALU fewer in `gen_gdn_ss`, bit-identical |
-| `0041-loom-amdgpu-cross-block-memory-waits-use-alias-summaries` | cross-block memory waits use the source's alias summaries (no `vscnt 0` drain for noalias buffers), and `ds_swizzle` touches no memory |
-| `0042-amdgpu-one-mib-command-buffer-blocks` | 1 MiB command-buffer blocks: the pp2048 chunk graph (~980 dispatches) is one submission, no 0.5-0.7 ms host replay gap at a 128 KiB block boundary |
-| `0043-loom-amdgpu-xor16-shuffle-via-permlanex16` | wave32 xor-16 shuffles lower to `v_permlanex16_b32` instead of `ds_swizzle`: attention softmax exchanges -1.1..-3%, bit-identical |
-| `0044-libhrx-graph-barrier-state-256` | the graph barrier planner tracks 256 commands since the last barrier (was 8): no full barrier for an edge a barrier-free run already retired |
-| `0045-loom-amdgpu-gfx11-non-temporal-cache-policy` | gfx11 non-temporal hints encode as GLC / SLC / DLC; decode's DeltaNet state store skips the MALL (+18 us per DeltaNet layer before) |
-| `0046-libamdf-fault-in-imported-dma-bufs-at-attach` | the NPU attach faults in an imported dma-buf's pages (Linux 7.4 stopped prefaulting them at mmap: IO page faults and an all-NaN NPU prefill) |
-| `0047-loom-xdna-diag-pc-block-addresses` | `LOOM_DIAG_PC` prints each AIE2P leaf's block offsets and code placement (diagnostic, for PC-range NPU counters) |
-| `0048-loom-xdna-drain-used-locks` | `LOOM_EXP_DRAIN_USED` drains only the locks an image initializes (~400 instead of 1024 writes per setup) |
-| `0049-loom-numbering-trades-single-use-regressions` | final register numbering accepts a lower total preference cost even when one use gets worse, so packed 192-VGPR kernels still get clean WMMA banks; bit-identical |
-| `0050-loom-amdgpu-matrix-bank-weight` | gfx1151 WMMA operand-bank ranks weigh twice a VALU source-bank pair in numbering and 0031's allocation; bit-identical |
-| `0051-loom-amdgpu-u4-table-lookup` | cheaper u4 byte-table lookups (`v_bfi_b32` merge selector, masked / shifted indices read directly): IQ4_XS decode loop 154 -> 138 VALU per 128 WMMA; bit-identical |
-| `0052-loom-amdgpu-alignbit-and-or-descriptors` | `v_alignbit_b32` and `v_and_or_b32` descriptors, so Low helpers can author them (Q5_K fifth bits: 2 VALU per word); bit-identical |
-| `0053-loom-realization-runtime-loops-uniform-split` | address realization for runtime-bounded, bottom-tested loops, and uniform loop-varying terms move out of the vector address (attention K / V staging becomes buffer loads); bit-identical |
-| `0054-profile-gfx11-sq-wait-lds-counters` | gfx11 SQ wait and LDS counters for `HRX_PROFILE_COUNTERS` (`SQ_WAIT_INST_LDS`, `SQC_LDS_BANK_CONFLICT`, ...); diagnostics only |
-| `0055-libhrx-profile-function-filter` | `HRX_PROFILE_FILTER=<glob>` limits profiling capture to matching functions, which ATT capture needs; diagnostics only |
-| `0056-profile-att-raw-wave-dump` | `IREE_PROFILE_ATT_DUMP=<file>` writes every decoded ATT wave as raw records for per-SIMD timelines; diagnostics only |
+| `0001-0001-stream-dispatch-no-ordering-barrier` | `HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER`: decode overlaps independent dispatches (`LoomDevice::NoBarrierNext`) |
+| `0002-0005-gfx1151-f16-wmma-operand-placement` | the f16 WMMA spreads its operands over the register banks (upstream does it for bf16 only): prefill GEMM cycles -2.6% |
+| `0003-0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
+| `0004-0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later (8 `v_mov` + a load wait per k phase in afrag GEMMs); bit-identical, enables the IQ3_S sign chain |
+| `0005-0010-loom-vopd-trans-window-lookahead` | VOPD pairs inside TRANS-result windows when a lookahead finds no read that relies on the distance: prefill attention and SwiGLU epilogues -0.1..-0.25% cycles, bit-identical |
+| `0006-0011-loom-low-licm` | loop-invariant code motion for low CFGs, only with `LOOM_EXP_LICM=1` (the emitter sets it for the fp16 and kv4 prefill attention): -1.0% at pp2048, -2.15% at 32K, bit-identical |
+| `0007-0012-loom-slice-alias-coalescing` | concats of consecutive slices fold, and slice coalescing ignores dead exact-storage aliases: attention loop 29 -> 21 moves, -0.8..-2.3% attention, bit-identical |
+| `0008-0013-xdna-npu-cascade-gemm-compiler` | the Loom AIE2P compiler pieces of the NPU cascade GEMM: memory-tile staging, replay and multicast |
+| `0009-Revert-0011-loom-low-licm` | reverts 0006 (the pin's 0011, low LICM) as first ported; redone on main as 0070 |
+| `0010-Revert-0010-loom-vopd-trans-window-lookahead` | reverts 0005 (the pin's 0010); redone on main as 0075 |
+| `0011-0013-keep-main-s-xdna_product-layout-multi-range-por` | 0008 adapted: keeps main's `xdna_product` layout (the multi-range part is 0044) |
+| `0012-0013-port-to-main-s-routes-geometry-descriptors-and-` | 0008 ported to main's routes, geometry, descriptors and lock selectors |
+| `0013-0014-xdna-continuation-invocation` | the XDNA loader resolves an entry's control-only continuation (`iree_hal_amd_xdna_executable_query_continuation`) |
+| `0014-0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8 byte store in a graph (the GPU releases NPU jobs and clears their words) |
+| `0015-0016-loom-xdna-npu-side-gate` | an NPU job waits for a flag in memory itself, so the GPU and the NPU sync without the host |
+| `0016-0016-port-core-stream-routes-and-chain-length-to-mai` | 0015 (the pin's 0016) ported to main's core stream routes and chain length |
+| `0017-0017-loom-xdna-gated-call-invocations` | the NPU-side gate for plans that are not streamed (one replay group) |
+| `0018-0018-loom-xdna-npu-decoder-column` | array descriptors and bindings for raw weight rows decoded on the cores (first for a decoder column, a form no longer emitted) |
+| `0019-0018-port-fill-routes-and-the-iteration-axis-to-main` | the pin's 0018 ported to main's fill routes and iteration axis |
+| `0020-0019-loom-xdna-npu-ffn-block` | array plan, binding (axis chains) and route changes for the NPU FFN block |
+| `0021-0019-port-core-routes-chained-axis-and-resets-to-mai` | the pin's 0019 ported to main's core routes, chained axis and resets |
+| `0022-0020-loom-xdna-npu-fused-fill` | GEMM workers fill their own memory-tile panels, so weights can be decoded on the way in |
+| `0023-0020-route-multicast-core-streams-through-route-tree` | the pin's 0020: multicast core streams go through main's route trees |
+| `0024-0021-loom-xdna-pack-low` | low bank packing of read-only leaf data and wide ring records (opt-in `LOOM_EXP_PACK_LOW=1`) |
+| `0025-0022-loom-xdna-intake` | intake channels (`constrain.intake`): a staged binding read in panels |
+| `0026-0023-loom-xdna-core-stream-dma` | core-to-core streams own no DMA |
+| `0027-0024-loom-xdna-core-stream-schedule` | scalar core stream transfers schedule like the cascade |
+| `0028-0025-loom-xdna-east-neighbor-intake-depths` | two array fixes for the gate placement that frees the gate column's fill (`gen_npu_gemm` gwest) |
+| `0029-0026-loom-xdna-leaf-sync-addresses` | two array fixes for leaf-synchronized channels (`gen_npu_gemm` ghelp) |
+| `0030-0021-0026-port-intake-and-stream-timing-to-main` | the pin's 0021-0026 ported to main's intake and stream timing |
+| `0031-0027-loom-xdna-drain-lock-requests` | a setup fix for images of other layouts sharing a context (`LOOM_EXP_ROUTE_RESET`) |
+| `0032-0028-loom-xdna-deferred-conflicting-rodata` | the planner defers read-only data with bank conflicts (`conflicts([...])`) |
+| `0033-0029-loom-xdna-top-aligned-programs` | core programs end at the top of program memory, behind a 16-byte startup jump |
+| `0034-0032-loom-kernel-priority` | `kernel.priority {level = N}` lowers to `s_setprio` as an ordered execution barrier; used around the iu4 GEMM fold; bit-identical |
+| `0035-0027-0032-port-rodata-deferral-startup-section-and-p` | the pin's 0027-0032 ported: rodata deferral, startup section and the priority op |
+| `0036-0033-loom-amdgpu-iu4-inline-seed-subrev` | an iu4 WMMA accumulator splat of the bits of 1/(2 pi) selects the inline-source form; `x - c` with an inline `c` selects `v_subrev_f32`, which VOPD pairs; bit-identical |
+| `0037-0036-loom-amdgpu-pack-16bit-pairs-with-perm` | two 16-bit lanes pack with one `v_perm_b32` instead of 3 VALU: iu4 gu epilogue 48 -> 16 packing VALU, bit-identical |
+| `0038-0033-0036-port-vopd-immediates-and-lane-lookup-to-ma` | the pin's 0033-0036 ported: VOPD immediates and lane lookup |
+| `0039-0037-loom-wave-uniform-branches-with-matched-barrier` | workgroup barriers under a subgroup-uniform branch are accepted when every region runs the same barrier sequence: one wave runs its own loop (`gen_gdn_ss`'s solver wave) |
+| `0040-0039-loom-amdgpu-repack-reads-constructing-lanes` | a result -> rhs b16 fragment repack reads the constructing lanes directly: 8 fewer VALU per repacked tile, bit-identical |
+| `0041-0040-loom-amdgpu-b16-store-takes-low-half-def` | a 16-bit store of a low-half definition skips the `v_bfe_u32` that cleared the upper half: 168 VALU fewer in `gen_gdn_ss`, bit-identical |
+| `0042-0043-loom-amdgpu-xor16-shuffle-via-permlanex16` | wave32 xor-16 shuffles lower to `v_permlanex16_b32` instead of `ds_swizzle`: attention softmax exchanges -1.1..-3%, bit-identical |
+| `0043-0039-0043-port-lane-lookup-and-permlanex16-kind-to-m` | the pin's 0039-0043 ported: lane lookup and the permlanex16 kind |
+| `0044-0013-0016-0019-port-multi-range-invocation-layout-to` | the pin's 0013 and 0016-0019 ported to main's multi-range invocation layout |
+| `0045-0045-loom-amdgpu-gfx11-non-temporal-cache-policy` | gfx11 non-temporal hints encode as GLC / SLC / DLC; decode's DeltaNet state store skips the MALL (+18 us per DeltaNet layer before) |
+| `0046-0046-libamdf-fault-in-imported-dma-bufs-at-attach` | the NPU attach faults in an imported dma-buf's pages (Linux 7.4 stopped prefaulting them at mmap: IO page faults and an all-NaN NPU prefill) |
+| `0047-0047-loom-xdna-diag-pc-block-addresses` | `LOOM_DIAG_PC` prints each AIE2P leaf's block offsets and code placement (diagnostic, for PC-range NPU counters) |
+| `0048-0045-follow-main-s-source-access-pointer` | the pin's 0045 follows main's source access pointer |
+| `0049-0048-loom-xdna-drain-used-locks` | `LOOM_EXP_DRAIN_USED` drains only the locks an image initializes (~400 instead of 1024 writes per setup) |
+| `0050-0052-loom-amdgpu-alignbit-and-or-descriptors` | `v_alignbit_b32` and `v_and_or_b32` descriptors, so Low helpers can author them (Q5_K fifth bits: 2 VALU per word); bit-identical |
+| `0051-0058-loom-concat-shares-same-content-views` | the pin's 0058: a concat result may share registers with an already placed concat or slice result that holds the same producer's units |
+| `0052-0059-loom-cse-keeps-concat-pieces` | the pin's 0059: low CSE keeps a duplicate producer that feeds concat pieces in explicit registers (AIE2P) |
+| `0053-0048-0059-port-coalescing-alignbit-and-concat-CSE-to` | the pin's 0048-0059 ported: coalescing, alignbit and concat CSE |
+| `0054-0060-loom-concat-reserves-explicit-registers-early` | the pin's 0060: a concat in explicit registers (AIE2P) is reserved from its earliest unit's start |
+| `0055-0061-loom-sticky-status-writes-skip-issue-order` | the pin's 0061: sticky status writes (`srFPFlags`) do not order issue |
+| `0056-0063-loom-low-generator-asserted-effect-relaxations` | the pin's 0063: opt-in effect-order relaxations for hand-scheduled AIE2P bodies (`LOOM_EXP_NOALIAS_ACC`, `LOOM_EXP_NOWAR_ACC`, `LOOM_EXP_LOCK_ACQREL`); unset, emits are byte-identical |
+| `0057-0064-loom-low-lru-register-choice` | the pin's 0064: opt-in `LOOM_EXP_LRU` register choice; unset, byte-identical |
+| `0058-0066-loom-xdna-pinned-ring-records` | the pin's 0066: opt-in `LOOM_EXP_RING_AT` pins a tile's ring records; unset, byte-identical |
+| `0059-0068-loom-xdna-stream-prefix` | the pin's 0068: `constrain.prefix`, a stream's first bytes from another binding (the NPU attention sender) |
+| `0060-revert-0036-v_perm-reads-half-defined-f16-registers-` | reverts 0037 (the pin's 0036): main's register part check rejects a `v_perm_b32` that reads a half-defined f16 register; redone as 0076 |
+| `0061-0065-port-locked-body-planner-controls-to-main` | the pin's 0065 ported: locked-body planner controls |
+| `0062-0013-skip-locked-body-schedule-fences-under-LOCKED_P` | under `LOCKED_PACK`, locked ops no longer fence the schedule (main closed a bundle at each one) |
+| `0063-alloc-let-slices-alias-before-inferred-concat-affini` | slices alias before inferred concat affinity (iq3_xxs decoder 157 -> 45 moves) |
+| `0064-alloc-add-LOOM_EXP_NO_CONCAT_PROPAGATE` | `LOOM_EXP_NO_CONCAT_PROPAGATE`: opt out of inferred concat affinity (AIE2P GEMM decoders spilled with it) |
+| `0065-facts-look-through-folded-arms-when-joining-block-ar` | value facts look through folded arms when joining block arguments |
+| `0066-sync-add-LOOM_EXP_WAVE_ROLE_BARRIERS-for-wave-role-b` | `LOOM_EXP_WAVE_ROLE_BARRIERS`: workgroup barriers under wave-uniform control (the emitter sets it for role-split kernels) |
+| `0067-revert-0039-repack-reads-half-defined-f16-registers-` | reverts 0040 (the pin's 0039): `ds_swizzle` reads the whole register, so main rejects the low-half definition |
+| `0068-loom-skip-cross-block-waits-proven-independent-by-al` | the pin's 0041: cross-block waits skipped where alias summaries prove the accesses independent |
+| `0069-alloc-add-LOOM_EXP_BUDGET-for-a-register-class-budge` | `LOOM_EXP_BUDGET=<target>.<class>=<n>`: allocate within a register budget (the emitter keeps non-attention kernels within 192 VGPRs, 8 waves, unless that spills more than 32 bytes) |
+| `0070-loom-add-low-licm-for-loop-invariant-packets` | the pin's 0011 redone on main: low LICM, opt-in `LOOM_EXP_LICM=1` (the emitter sets it for attention) |
+| `0071-libhrx-honor-DEVICE_UNCACHED-when-importing-host-poi` | libhrx honors `DEVICE_UNCACHED` when importing host pointers (the NPU's flag and C pages) |
+| `0072-graph-give-partitions-with-atomic-stores-the-ATOMIC-` | graph partitions that hold atomic stores get the ATOMIC category (without it, a graph with NPU handoffs fails to instantiate) |
+| `0073-loom-lower-f32-fma-to-tied-v_fmac_f32-when-the-adden` | the pin's 0030 redone: f32 FMA lowers to a tied `v_fmac_f32` when the addend dies |
+| `0074-loom-place-loop-carried-storage-frames-together` | the pin's 0038 redone: loop-carried storage frames placed together (attention 224 -> 192 VGPRs) |
+| `0075-loom-pair-VOPD-inside-TRANS-result-windows-when-no-r` | the pin's 0010 redone on main's TRANS result window |
+| `0076-loom-pack-16-bit-pairs-with-a-low-16-v_perm_b32` | the pin's 0036 redone with a `v_perm_b32` form that reads only the low 16 bits of each source |
+| `0077-libhrx-start-HRX_PROFILE_FILE-captures-in-hrx_device` | `HRX_PROFILE_FILE` / `HRX_PROFILE_MODE` captures for device groups the engine creates (upstream starts them only in the HIP binding) |
+| `0078-loom-realize-uniform-split-addresses-in-runtime-loop` | the pin's 0053 redone: address realization in runtime-bounded loops, uniform terms in scalar offsets |
+
+Not carried over from the pin: 0002 `stream-profile-metadata`, 0003 `profile-counters-mode`, 0009 `loom-omit-dead-fma-mix-seeds`, 0031 `loom-amdgpu-matrix-bank-allocation`, 0034 `loom-amdgpu-inline-accumulator-bank-placement`, 0035 `loom-amdgpu-valu-source-bank-placement`, 0042 `amdgpu-one-mib-command-buffer-blocks`, 0044 `libhrx-graph-barrier-state-256`, 0049 `loom-numbering-trades-single-use-regressions`, 0050 `loom-amdgpu-matrix-bank-weight`, 0051 `loom-amdgpu-u4-table-lookup`, 0054 `profile-gfx11-sq-wait-lds-counters`, 0055 `libhrx-profile-function-filter`, 0056 `profile-att-raw-wave-dump`, 0057 `loom-amdgpu-f16-inline-accumulator-bank-placement`, 0062 `loom-xdna-signed-war-separations`, 0067 `loom-parser-large-programs`. Carried under a new number: 0010 as 0075, 0011 as 0070, 0030 as 0073, 0036 as 0076, 0038 as 0074, 0041 as 0068, 0053 as 0078.
 
 0030-0036 were made for the int4 (iu4) GEMMs, which went with the MQ4 path. Only 0033 and 0034 are iu4-only (inline-accumulator iu4 WMMA forms); the others also act on native kernels (0032's `kernel.priority` is used by `gen_attn_fa`, 0036 packs every f16-output GEMM's stores). All stay in the stack: dropping a patch changes the compiler.
 
@@ -250,8 +278,8 @@ Gate notes:
 
 | question | tool |
 |---|---|
-| device time per dispatch in the real pipeline | `HRX_PROFILE_FILE=p.irpf HRX_PROFILE_MODE=dispatch <driver ...>`, then `external/hrx/build/cmake/runtime/src/iree/tools/iree-profile/iree-profile dispatch --dispatch_events --format=jsonl p.irpf`. Costs ~1%. |
-| cycles per dispatch (clock-free) | `HRX_PROFILE_MODE=counters HRX_PROFILE_COUNTERS=SQ_BUSY_CYCLES`, then `iree-profile counter --format=jsonl --counter_samples`. Needs `libhsa-amd-aqlprofile64`, which `engine/hrx-env.sh` puts on the path. Inflates dispatch gaps ~4x. |
+| device time per dispatch in the real pipeline | `HRX_PROFILE_FILE=p.irpf HRX_PROFILE_MODE=dispatch <driver ...>`, then `external/hrx/build/cmake/runtime/src/iree/tools/iree-profile/iree-profile dispatch --dispatch_events --format=jsonl p.irpf`. Costs ~1%. The engine's device groups start the capture through HRX patch 0077 (`HRX_PROFILE_MODE` queue, dispatch or all). |
+| cycles per dispatch (clock-free) | Not on HRX main: the counters mode was the pin's patch 0003, not carried over. On the pin it was `HRX_PROFILE_MODE=counters HRX_PROFILE_COUNTERS=SQ_BUSY_CYCLES`, then `iree-profile counter --format=jsonl --counter_samples`. Needs `libhsa-amd-aqlprofile64`, which `engine/hrx-env.sh` puts on the path. Inflates dispatch gaps ~4x. |
 | registers, spills, residency, schedule | `loom-compile k.loom --root=@k --target=amdgpu:gfx1151 --format=amdgpu-hsaco --output=k.hsaco --compile-report=details --compile-report-output=k.json`, then `PYTHONPATH=external/hrx/loom/py python3 -m loom.tools.compile_report show\|suggest\|diff k.json`. Run `suggest --include-experimental` before hand-tuning. `allocation.materialized_spill_*` shows real spills even when `spill_count` is 0. |
 | instruction counts | `llvm-objdump -d --mcpu=gfx1151` on the hsaco (a `.hal` embeds the ELF from the first `\x7fELF`). Run it with `env -u LD_LIBRARY_PATH`. |
 | PMC, occupancy, per-wave ATT | rocprofv3 cannot see HRX dispatches. The `loomhip` harness that ran one Loom hsaco through HIP under `rocprofv3 --pmc` / `--att` is on tag `pre-cleanup-2026-10-20`. |
