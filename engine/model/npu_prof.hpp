@@ -6,6 +6,10 @@
 // Spec "c0,c1,c2,c3/m0,m1": the core module's four counters' events and the memory module's two (AIE2P event ids:
 // tools/npu_prof.py, which sums them per family); each counter counts the cycles its event is set. Its cost is in the
 // noise (family times within 1% of a plain run).
+// Optional, after a job's tile values: YAH_NPU_PROF_MT="e0,e1,e2,e3" the memory tiles' (row 1) four counters,
+// YAH_NPU_PROF_MT_SEL="s0,s1,m0,m1" the DMA channels their SEL0 / SEL1 events watch (S2MM, MM2S), and
+// YAH_NPU_PROF_SHIM="e0,e1" the shim tiles' (row 0) two (e.g. 36 / 32: MM2S 0 starved of memory / held back by its
+// stream). Unset: those counters count nothing.
 #ifndef YAH_MODEL_NPU_PROF_HPP_
 #define YAH_MODEL_NPU_PROF_HPP_
 
@@ -31,7 +35,8 @@ namespace yah::model {
 class NpuProf {
  public:
   static constexpr std::uint32_t kCols = 8, kRows = 4, kRow0 = 2, kCore = 4, kMem = 2, kRegs = kCore + kMem;
-  static constexpr std::uint32_t kTiles = kCols * kRows, kValues = kTiles * kRegs;
+  static constexpr std::uint32_t kMt = 4, kShim = 2;   // memory tile and shim counters, after the tiles'
+  static constexpr std::uint32_t kTiles = kCols * kRows, kValues = kTiles * kRegs + kCols * (kMt + kShim);
 
   explicit NpuProf(const char* spec) {
     if (std::sscanf(spec, "%u,%u,%u,%u/%u,%u", &c_[0], &c_[1], &c_[2], &c_[3], &m_[0], &m_[1]) != 6)
@@ -43,6 +48,18 @@ class NpuProf {
         for (std::uint32_t r = 0; r < kCore; ++r) addr.push_back(t + 0x31520 + 4 * r);
         for (std::uint32_t r = 0; r < kMem; ++r) addr.push_back(t + 0x11020 + 4 * r);
       }
+    for (std::uint32_t col = 0; col < kCols; ++col) {
+      for (std::uint32_t r = 0; r < kMt; ++r) addr.push_back((col << 25 | 1u << 20) + 0x91020 + 4 * r);
+      for (std::uint32_t r = 0; r < kShim; ++r) addr.push_back((col << 25) + 0x31020 + 4 * r);
+    }
+    if (const char* e = std::getenv("YAH_NPU_PROF_MT"))
+      std::sscanf(e, "%u,%u,%u,%u", &mt_[0], &mt_[1], &mt_[2], &mt_[3]);
+    if (const char* e = std::getenv("YAH_NPU_PROF_MT_SEL")) {
+      unsigned a = 0, b = 0, c = 0, d = 0;
+      std::sscanf(e, "%u,%u,%u,%u", &a, &b, &c, &d);
+      mt_sel_ = (a & 7) | (b & 7) << 8 | (c & 7) << 16 | (d & 7) << 24;
+    }
+    if (const char* e = std::getenv("YAH_NPU_PROF_SHIM")) std::sscanf(e, "%u,%u", &sh_[0], &sh_[1]);
     // READ_REGS (transaction custom op 130): {op, col, row, pad, u32 size}, u32 count, u32 pad, u64 addresses
     read_.assign(16 + 8 * addr.size(), 0);
     read_[0] = 130;
@@ -101,9 +118,20 @@ class NpuProf {
         Write(ops, t + 0x31500, ctl(c_[0], c_[1])), Write(ops, t + 0x31504, ctl(c_[2], c_[3]));
         Write(ops, t + 0x11000, ctl(m_[0], m_[1]));
       }
+    for (std::uint32_t col = 0; col < kCols; ++col) {
+      const std::uint32_t m = col << 25 | 1u << 20, sh = col << 25;
+      Write(ops, m + 0x91000, 0), Write(ops, m + 0x91004, 0), Write(ops, sh + 0x31000, 0);   // stop
+      for (std::uint32_t r = 0; r < kMt; ++r) Write(ops, m + 0x91020 + 4 * r, 0);
+      for (std::uint32_t r = 0; r < kShim; ++r) Write(ops, sh + 0x31020 + 4 * r, 0);
+      Write(ops, m + 0xA06A0, mt_sel_);
+      Write(ops, m + 0x91000, ctl(mt_[0], mt_[1])), Write(ops, m + 0x91004, ctl(mt_[2], mt_[3]));
+      Write(ops, sh + 0x31000, ctl(sh_[0], sh_[1]));
+    }
     return ops;
   }
-  static constexpr std::uint32_t SetupOps() { return kTiles * (3 + kCore + kMem + 4 + 3); }
+  static constexpr std::uint32_t SetupOps() {
+    return kTiles * (3 + kCore + kMem + 4 + 3) + kCols * (3 + kMt + kShim + 1 + 3);
+  }
   const std::vector<std::uint8_t>& Read() const { return read_; }
 
   // After the last job's done: the firmware's log of every job's READ_REGS, kValues words per job in job order
@@ -152,7 +180,8 @@ class NpuProf {
     ops.insert(ops.end(), op, op + 24);
   }
 
-  unsigned c_[kCore] = {}, m_[kMem] = {};
+  unsigned c_[kCore] = {}, m_[kMem] = {}, mt_[kMt] = {}, sh_[kShim] = {};
+  std::uint32_t mt_sel_ = 0;
   std::map<std::string, std::vector<std::uint8_t>> setup_;   // per image
   std::vector<std::uint8_t> read_;
   std::uint32_t bo_ = 0;

@@ -36,7 +36,7 @@ def load(path):
             acc = fam[f[4]]
             acc[0] += float(f[5])
             acc[1] += 1
-            for k, v in enumerate(f[6:]):
+            for k, v in enumerate(f[6:6 + COLS * ROWS * REGS]):   # (then the memory tiles' and shims': shim.py)
                 acc[2][k] += int(v)
     names = [NAMES.get(e, f"c{e}") for e in events[:4]] + [MNAMES.get(e, f"m{e}") for e in events[4:]]
     return events, names, fam
