@@ -2083,6 +2083,10 @@ def main():
     # kv4 staged-Q build loses 11% and the afrag GEMMs 5-20%, so they compile without it
     ksn_twins = [x for pair in ksn_srcs.values() for x in pair if x]
     def attn_env(loom):
+        # the NPU split's merge twins: HRX main's allocator lands them at 216 VGPRs (7 waves); within 192 they fit
+        # without spills at 8 waves, as on the old pin (npu8x2 16K +3.9% at 216)
+        if loom is not None and loom in ksn_srcs.get("kmn", ()):
+            return {"LOOM_EXP_LICM": "1", "LOOM_EXP_BUDGET": "amdgpu.vgpr=192"}
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
         if loom in (attn_src, attn_t_src, attn_c0_src, attn_t_c0_src, attn64_src, attn64_t_src,
