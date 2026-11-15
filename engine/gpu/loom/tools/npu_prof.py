@@ -54,12 +54,14 @@ def pc_ranges(loom, diag):
         if f and f[0] == "PCBLOCKS":
             blocks[f[1]] = (int(f[2]), [int(x) for x in f[3:]])
         elif f and f[0] == "PCTEXT" and f[3].startswith(".text.npu_gemm"):
-            place[f[3][len(".text."):]] = (int(f[1]), int(f[2]), int(f[4]))
+            # (col, row): the program its tile runs (identical leaves share one: worker$k of the first tile)
+            place[(int(f[1]), int(f[2]))] = (f[3][len(".text."):], int(f[4]))
     out = []
-    workers = re.findall(r"%k\d+_\d+ = worker %workers, %\w+, @(\w+)", text)
-    for n, fn in enumerate(workers):
-        size, offs = blocks[f"npu_gemm$worker${n}"]
-        col, row, base = place[f"npu_gemm$worker${n}"]
+    rows = 1 + max(int(r) for r in re.findall(r"%k\d+_(\d+) = worker", text))
+    for c, r, fn in re.findall(r"%k(\d+)_(\d+) = worker %workers, %\w+, @(\w+)", text):
+        col, row = int(c), 2 + rows - 1 - int(r)   # (constrain.location: row r at physical row 2 + rows - 1 - r)
+        prog, base = place[(col, row)]
+        size, offs = blocks[prog]
         lab = labels[fn]
         at = lambda name: base + offs[lab.index(name)]
         r = [0, 0, 0, 0]
