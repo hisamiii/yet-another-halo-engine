@@ -762,6 +762,9 @@ NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs", "iq3s"), (40, 40, 40, 8)
 # tables, so IQ3_S's fillers also hold the deferred epilogue's 40 k-block slices (dispatch row "npuffnix4")
 IX4_FMTS = {"iq3s": "IQ4_XO", "iq3xxs": "IQ4_XX"}
 IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX")
+# gate and up of one format without a fused GPU gate / up whose single-format deferred image fits: their own decoder
+# on the GGUF rows, no pre-decoded copy (Q3_K's gate helper is 0.6 KB over the core's program memory)
+NPU_SAME_SW = ("q5k",)
 # The other pairs' gate / up rows (the NPU's) are pre-decoded to bfp16 (bfp_pair_rows: npu_bfp_<prefix>ffn_gate_up.bin),
 # one BFP image like a single format's with the deferred epilogue ("npu_ffnsw_bfp_<hord>", dispatch rows
 # "npuffnbx_<gate>_<up>"). Site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU rows
@@ -1251,10 +1254,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
              and (l["ffn_gate"][0] != l["ffn_up"][0] or l["ffn_gate"][0] not in AF_FFN)
              and l["ffn_gate"][1:] == l["ffn_up"][1:] and l["ffn_gate"][0] in fmts and l["ffn_up"][0] in fmts
              and l.get("ffn_down", ("",))[0] in dfmts]
-    # pairs whose gate and up both take IQ4_XS's decoder (IX4_FAMILY): one image like a single format's, its up slabs
-    # gathering from their own kvalues table (gen_npu_gemm kv2), with the deferred epilogue ("npu_ffnsw_<gate>_<up>");
-    # the other pairs take the BFP image (bsw)
-    mixed = [l for l in pairs if {gu_fmt(l[kd][0]) for kd in ("ffn_gate", "ffn_up")} <= set(IX4_FAMILY)]
+    # pairs whose gate and up both take IQ4_XS's decoder (IX4_FAMILY), or one format of NPU_SAME_SW: one image like a
+    # single format's (IX4_FAMILY: its up slabs gathering from their own kvalues table, gen_npu_gemm kv2), with the
+    # deferred epilogue ("npu_ffnsw_<gate>_<up>"); the other pairs take the BFP image (bsw)
+    mixed = [l for l in pairs if {gu_fmt(l[kd][0]) for kd in ("ffn_gate", "ffn_up")} <= set(IX4_FAMILY)
+             or l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW]
     bsw = [l for l in pairs if l not in mixed]
     bfp_rows({"blk.%s.%s.weight" % (n, kd) for n, l in by.items() if l in ok + pairs
               for kd in ("ffn_gate", "ffn_up", "ffn_down") if l.get(kd, ("",))[0] == "iq2s"
