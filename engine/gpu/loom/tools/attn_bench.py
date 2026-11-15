@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Standalone prefill attention at any depth: compile attention sources for each context start, run them interleaved in one
 attn_bench process under HRX counters, print busiest-SQ and mean-SQ cycles per call against the WMMA floor.
+Needs HRX's counters mode (the old pin's patch 0003), which HRX main does not have: on main, compare attention kernels
+with a dispatch profile of the real pipeline instead (build-and-run.md, Profiling), clock-adjusted through the kernels
+both sets share.
 
   attn_bench.py [--reps N] [--depths 0,8192,...] [--tag DIR] <name>=<source.loom>[,ENV=VAL...] ...
 
