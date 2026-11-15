@@ -150,12 +150,16 @@ GP0, GPR, GRAMP, GPS, GFAST, GB = 5000, 200, 512, 16000, 896, 8
 GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
 
 
-def decoder(fmt, gord="P4"):
-    """gen_npu_dec for fmt (its constants follow DQ_FMT and DQ_GORD at import)."""
+def decoder(fmt, gord="P4", g8=True):
+    """gen_npu_dec for fmt (its constants follow DQ_FMT, DQ_GORD and DQ_G8 at import). g8: IQ3_S from the byte grid,
+    which the gate / up images need (the 8 KB bf16 grid does not fit beside the FFN block's rings); the other images
+    keep the bf16 grid's modulo-scheduled loop (faster)."""
     import gen_npu_dec
-    if gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord:
+    g = "1" if g8 else "0"
+    if gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord or os.environ.get("DQ_G8", "1") != g:
         os.environ["DQ_FMT"] = fmt
         os.environ["DQ_GORD"] = gord
+        os.environ["DQ_G8"] = g
         gen_npu_dec = importlib.reload(gen_npu_dec)
     return gen_npu_dec
 
@@ -456,7 +460,7 @@ def array_program(L, cfg):
         e(f"  %firows = constant.u32 16 : reg<aie2p.array.scalar : index>")
         for c in range(cols):
             cc = colcfg(cfg, c)
-            e(f"  %fipitch{c} = constant.u32 {decoder(cc.fmt, cc.gord).RECROW} : reg<aie2p.array.scalar : index>")
+            e(f"  %fipitch{c} = constant.u32 {decoder(cc.fmt, cc.gord, cc.swiglu).RECROW} : reg<aie2p.array.scalar : index>")
             for r in dict.fromkeys(list(fuse_cover(cfg, c)) + list(fuse_helpers(cfg, c))):
                 cov = fuse_dcov(cfg, c, r)
                 e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(cc, cov)[0]} : reg<aie2p.array.scalar : index>")
@@ -823,7 +827,7 @@ FUSE_FMTS = ("IQ4_XS", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "IQ2_S",
 def fuse_blk(cfg):
     """fuse 2: bytes per super-block of cfg.fmt."""
     assert cfg.fmt in FUSE_FMTS, cfg.fmt
-    return decoder(cfg.fmt, cfg.gord).BLK
+    return decoder(cfg.fmt, cfg.gord, cfg.swiglu).BLK
 
 
 def fuse_unit_raw(cfg):
@@ -1058,14 +1062,14 @@ FZ_RAW_COMPACT = 0, 28992, 21760, 3264   # rawdma, 4 super-blocks a row: one raw
 def fuse_raw_ring(cfg, cov):
     """rawdma: (byte offset from the W ring's first 2048-aligned byte, records) of the filler's raw ring: two
     [16][RECROW] records where the decoder output allows (FZ_RAW, Q5_K's packed layout), else one."""
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
     sp, in_, sp2, out = fuse_scratch(cfg, cov)
     return in_, (2 if sp2 - in_ >= 2 * 16 * D.RECROW else 1)
 
 
 def fuse_scratch(cfg, cov):
     """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
     _, _, _, nsb = fuse_span(cfg, cov)
     ring = 2 * NP * slab(cfg.ks[cov[-1]]) - 2047   # (the scratch starts at the ring's first 2048-aligned byte)
     if cfg.rawdma:
@@ -1108,7 +1112,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     until this panel's drain, which starts after the last record). Unit index and count live in private storage
     (the decoder needs every register)."""
     e = L.append
-    D = decoder(cfg.fmt, cfg.gord)
+    D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
     hrow = cov[0] if helper == "H" else None           # (the helper's row, listed first: the filler copies its records)
     K = (helper or "").startswith("K")
     dcov = tuple(j for j in cov if j != hrow) if not K else (cov[0],)
@@ -2869,7 +2873,7 @@ def gen(cfg):
     if cfg.fuse:   # every worker's leaf, once (worker_leaf)
         if cfg.fuse == 2:   # the inlined decoder's tables (grid formats)
             for cc in [cfg] + ([colcfg(cfg, 1)] if fpair(cfg) else []):
-                L.extend(decoder(cc.fmt, cc.gord).inline_rodata(dec_tag(cc)))
+                L.extend(decoder(cc.fmt, cc.gord, cc.swiglu).inline_rodata(dec_tag(cc)))
         seen = set()
         used = {worker_leaf(cfg, c, r)[0] for c in range(cfg.cols) for r in range(len(cfg.ks))}
         for c in [-1] + list(range(cfg.cols)):   # (-1: an ordinary column first: head, mid, mid_l, tail)

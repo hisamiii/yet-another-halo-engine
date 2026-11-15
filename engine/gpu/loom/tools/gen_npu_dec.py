@@ -39,7 +39,7 @@ GMIX = GRID and FMT not in ("IQ2_XS", "IQ2_S")
 # IQ3_S: a byte grid (4 KB: the 8 KB bf16 grid does not fit beside the FFN block's rings) and byte signs. Value v is
 # coded as b = (bf16(2 v) - 0x4000) / 2 (b <= 0xF8), its sign as the byte 0x20 (+) / 0x60 (-): the u16 sign << 8 | b,
 # doubled, is bf16(+-2 v) exactly, and T is halved. Entries are 4 bytes at 8 idx (address = base + 8 idx)
-G8 = FMT == "IQ3_S"
+G8 = FMT == "IQ3_S" and os.environ.get("DQ_G8", "1") == "1"   # (gate / up images; DQ_G8=0: the bf16 grid, sites and down)
 # GMIX hot loop: op offsets (cycles) in a unit (pr, hh); a unit starts every GII cycles. Modulo schedule from npu_modsched.py:
 # Loom's latencies, vec256 peak 22 of 24, pushes of a pr in a 7-cycle window without loads (Loom loads wait 4 cycles after a store)
 GII = 29
@@ -204,6 +204,19 @@ def grid_rodata(name):
         # the sign table its own object, in another bank
         return [f'global.rodata.def @gt_{name} = align(4096) conflicts([@gs_{name}]) bytes("{hexs(gt)}")',
                 f'global.rodata.def @gs_{name} = align(64) conflicts([@gt_{name}]) bytes("{hexs(st)}")']
+    if not G8:   # IQ3_S: the grid's 2 pages and the qh bit masks [kb 4][row 8][e 2] = 1 << (2 kb + e); in another bank
+        # the signs by nibble n (even lanes: the low nibble -> values 0-3, odd lanes: the high nibble -> values 4-7)
+        grid = grid_table("grid_iq3s.bin", 512).astype(np.float32)
+        gt = np.zeros((128, 2, 4, 4), np.uint16)
+        for idx in range(512):
+            gt[idx >> 2, :, idx & 3] = bf16_bits_np(grid[idx])
+        st = np.zeros((4, 2, 4, 4), np.uint16)
+        for n in range(16):
+            for v in range(4):
+                st[n >> 2, :, n & 3, v] = 0x8000 if (n >> v) & 1 else 0
+        hm = np.array([1 << (2 * (i // 16) + i % 2) for i in range(64)], np.uint8)
+        return [f'global.rodata.def @gt_{name} = align(4096) conflicts([@gs_{name}]) bytes("{hexs(gt)}{hexs(hm)}")',
+                f'global.rodata.def @gs_{name} = align(256) conflicts([@gt_{name}]) bytes("{hexs(st)}")']
     # IQ3_S (G8): the byte grid's page; after it (+4096) the sign bytes by nibble n (even lanes: the low nibble ->
     # values 0-3, odd lanes: the high nibble -> values 4-7: both halves alike), then the qh bit masks [kb 4][row 8][e 2]
     # = 1 << (2 kb + e)
@@ -425,8 +438,10 @@ def leaf(name="dec"):
             e(f"%sb4 = lshl %gsa, {k(-4)}")
         if S2:
             e(f"%hma = add.rr %gta, {k(S2HM)}")                      # IQ2_S: the qh bit masks
+        elif G8:
+            e(f"%hma = add.rr %gsa, {k(128)}")                       # IQ3_S byte grid: the qh bit masks after the signs
         elif not (XXS or XS2):
-            e(f"%hma = add.rr %gsa, {k(128)}")                       # IQ3_S: the qh bit masks after the signs
+            e(f"%hma = add.rr %gta, {k(8192)}")                      # IQ3_S bf16 grid: the qh bit masks after it
     elif not Q3K and not GF:
         # ---- table (once per invocation of the program: a flag in private storage)
         tb_, tdone = label("tbuild"), label("tdone")
