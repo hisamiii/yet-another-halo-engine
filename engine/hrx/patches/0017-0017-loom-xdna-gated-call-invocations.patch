@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:05 +0100
-Subject: [PATCH 17/75] 0017-loom-xdna-gated-call-invocations
+Subject: [PATCH 17/76] 0017-loom-xdna-gated-call-invocations
 
 NPU-side gate for plans that are not streamed (one replay group, e.g. the NPU GEMM with final outputs): the control
 program is [call | gate | done] and the product publishes four invocations (array setup + call, call, gate, done), so

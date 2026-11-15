@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:07 +0100
-Subject: [PATCH 49/75] 0048-loom-xdna-drain-used-locks
+Subject: [PATCH 49/76] 0048-loom-xdna-drain-used-locks
 
 loom: LOOM_EXP_DRAIN_USED raises only the locks an image initializes
 

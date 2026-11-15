@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:08 +0100
-Subject: [PATCH 59/75] 0068-loom-xdna-stream-prefix
+Subject: [PATCH 59/76] 0068-loom-xdna-stream-prefix
 
 Loom AIE2P array plans: constrain.prefix %channel, %binding, %bytes. The first |bytes| of an ingress channel's stream
 come from the start of another binding: the shim chains a descriptor on that binding ahead of the channel's own (one

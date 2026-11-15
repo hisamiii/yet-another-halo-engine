@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hisamiii <265242552+hisamiii@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 00:25:34 +0100
-Subject: [PATCH 73/75] loom : lower f32 fma to tied v_fmac_f32 when the addend
+Subject: [PATCH 73/76] loom : lower f32 fma to tied v_fmac_f32 when the addend
  dies
 
 Port of pin patch 0030.

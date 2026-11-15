@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hisamiii <265242552+hisamiii@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 00:25:34 +0100
-Subject: [PATCH 71/75] libhrx : honor DEVICE_UNCACHED when importing host
+Subject: [PATCH 71/76] libhrx : honor DEVICE_UNCACHED when importing host
  pointers
 
 The NPU's flag and C pages need an uncached GPU mapping, as HSA gave them.

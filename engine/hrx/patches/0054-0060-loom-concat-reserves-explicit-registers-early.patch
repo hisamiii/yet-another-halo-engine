@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:07 +0100
-Subject: [PATCH 54/75] 0060-loom-concat-reserves-explicit-registers-early
+Subject: [PATCH 54/76] 0060-loom-concat-reserves-explicit-registers-early
 
 Loom: a concat whose result lives in explicit physical registers (AIE2P) is reserved from its earliest unit's start
 with per-unit start points, as fragmented tied-source assemblies already are: a whole register cannot be split, so a

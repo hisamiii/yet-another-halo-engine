@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 27/75] 0024-loom-xdna-core-stream-schedule
+Subject: [PATCH 27/76] 0024-loom-xdna-core-stream-schedule
 
 Scalar core stream transfers schedule like the cascade (Loom AIE2P descriptors): mov.ss / mov.ms were descriptor
 barriers, so each one split its block into separately scheduled source ranges, and consecutive transfers waited the

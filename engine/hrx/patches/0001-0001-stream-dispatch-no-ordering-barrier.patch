@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:04 +0100
-Subject: [PATCH 01/75] 0001-stream-dispatch-no-ordering-barrier
+Subject: [PATCH 01/76] 0001-stream-dispatch-no-ordering-barrier
 
 hrx_stream_dispatch flag HRX_DISPATCH_FLAG_NO_ORDERING_BARRIER: skip the trailing ordering barrier so the next
 dispatch may overlap this one; the caller orders dependent work. Used by the decode step (independent projections).

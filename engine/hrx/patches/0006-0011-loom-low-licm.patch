@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:05 +0100
-Subject: [PATCH 06/75] 0011-loom-low-licm
+Subject: [PATCH 06/76] 0011-loom-low-licm
 
 low-licm: loop-invariant code motion for descriptor-backed low CFGs, after low-cse in packetization preparation, plus a
 second low-cse. Inert unless LOOM_EXP_LICM=1 (the pipeline schedules it only then), so default output is unchanged; the

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:05 +0100
-Subject: [PATCH 08/75] 0013-xdna-npu-cascade-gemm-compiler
+Subject: [PATCH 08/76] 0013-xdna-npu-cascade-gemm-compiler
 
 Loom AIE2P / XDNA: the compiler pieces of the engine's NPU cascade GEMM: memory-tile staging, replay and multicast,
 shared panels, cascade link timing, worker.accumulate, leaf-synchronized channels (constrain.leaf_sync), re-armed

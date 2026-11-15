@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hisamiii <265242552+hisamiii@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 00:50:52 +0100
-Subject: [PATCH 75/75] loom : pair VOPD inside TRANS-result windows when no
+Subject: [PATCH 75/76] loom : pair VOPD inside TRANS-result windows when no
  read relies on it
 
 Port of pin patch 0010 onto main's trans_result_window.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:07 +0100
-Subject: [PATCH 50/75] 0052-loom-amdgpu-alignbit-and-or-descriptors
+Subject: [PATCH 50/76] 0052-loom-amdgpu-alignbit-and-or-descriptors
 
 Loom: v_alignbit_b32 and v_and_or_b32 descriptors for AMDGPU, so Low helpers (low.func.def asm) can author them.
 Q5_K decode: the fifth bit of every byte by one rotate and one masked OR, 2 VALU per word instead of shift / and /

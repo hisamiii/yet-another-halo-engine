@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:06 +0100
-Subject: [PATCH 39/75] 0037-loom-wave-uniform-branches-with-matched-barriers
+Subject: [PATCH 39/76] 0037-loom-wave-uniform-branches-with-matched-barriers
 
 Ported into main's synchronization legality pass; inert on CFG form, see todo.
 ---

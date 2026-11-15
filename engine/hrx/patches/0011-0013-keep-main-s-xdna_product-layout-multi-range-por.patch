@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:56:52 +0100
-Subject: [PATCH 11/75] 0013 : keep main's xdna_product layout (multi-range
+Subject: [PATCH 11/76] 0013 : keep main's xdna_product layout (multi-range
  port pending)
 
 ---

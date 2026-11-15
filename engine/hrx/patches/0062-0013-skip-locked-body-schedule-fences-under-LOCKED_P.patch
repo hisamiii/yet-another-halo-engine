@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 18:40:14 +0100
-Subject: [PATCH 62/75] 0013 : skip locked-body schedule fences under
+Subject: [PATCH 62/76] 0013 : skip locked-body schedule fences under
  LOCKED_PACK
 
 Main fences every locked op; each fence closed the bundle, so locked loops issued one instruction per bundle.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 18:26:45 +0100
-Subject: [PATCH 60/75] revert 0036 : v_perm reads half-defined f16 registers
+Subject: [PATCH 60/76] revert 0036 : v_perm reads half-defined f16 registers
  on main
 
 Main verifies register part masks; the cvt result defines only the low half. Redo with an explicit tied partial write.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hisamiii <265242552+hisamiii@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 00:33:32 +0100
-Subject: [PATCH 74/75] loom : place loop-carried storage frames together
+Subject: [PATCH 74/76] loom : place loop-carried storage frames together
 
 Port of pin patch 0038: attention c40 224 -> 192 VGPRs, 97 back-edge swaps gone.
 

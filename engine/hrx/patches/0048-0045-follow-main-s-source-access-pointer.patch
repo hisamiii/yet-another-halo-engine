@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 18:18:16 +0100
-Subject: [PATCH 48/75] 0045 : follow main's source access pointer
+Subject: [PATCH 48/76] 0045 : follow main's source access pointer
 
 ---
  loom/src/loom/target/arch/amdgpu/lower/memory_cache.c | 6 +++---

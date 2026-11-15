@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: yah <yah@localhost>
 Date: Sat, 14 Nov 2026 17:50:05 +0100
-Subject: [PATCH 05/75] 0010-loom-vopd-trans-window-lookahead
+Subject: [PATCH 05/76] 0010-loom-vopd-trans-window-lookahead
 
 VOPD inside TRANS-result windows: the packetizer rejected every adjacent pair while any VGPR written by a TRANS op was
 within the VALU-TRANS-use window, because fusing two packets shortens the distances the wait plan counted. Only reads
