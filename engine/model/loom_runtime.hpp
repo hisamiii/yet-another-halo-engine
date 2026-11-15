@@ -477,7 +477,7 @@ class LoomDevice {
   }
 
  private:
-  // The GPU: the first device of YAH_GPU_DRIVER (amdgpu, the HSA driver, by default; rdna is HRX's native driver),
+  // The GPU: the first device of YAH_GPU_DRIVER (default amdgpu; rdna names the same native HRX driver, RDNA GPUs only),
   // in a group of its own, and a stream on the first queue family that dispatches.
   void Open() {
     const char* driver = std::getenv("YAH_GPU_DRIVER");
