@@ -1094,22 +1094,16 @@ class LoomPrefill {
     RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk");
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
-    // (npuffnix4_<fmt>: the format's gate / up rows transcoded to IQ4_XS blocks, the NPU's rows only)
-    const auto tx = [&](const Fmt& x) { return geom_.count("npuffnix4_" + std::string(x.name)) != 0; };
-    // (a mixed pair of one untranscoded format, emit_prefill_pp SAME_SW_FMTS: up follows gate in the GGUF, like a
-    // single format's)
-    // (cpair: gate and up on column pairs, emit_prefill_pp NPU_COLPAIR: each from its own tensor's rows, a transcoded
-    // one's from npu_ix4_<tensor>.bin)
+    // (a mixed pair of one format, emit_prefill_pp NPU_SAME_SW: up follows gate in the GGUF, like a single format's)
+    // (cpair: gate and up on column pairs, emit_prefill_pp NPU_COLPAIR: each from its own tensor's rows)
     const bool cpair = mix && geom_.count("npuffncp_" + std::string(f.name) + "_" + fu.name) != 0;
-    const bool xmix = mix && !bmix && !cpair && (tx(f) || tx(fu));
-    if (mix && !bmix && !xmix && ((!cpair && std::strcmp(f.name, fu.name)) || tu->offset != tg->offset + tg->bytes))
-      throw LoomError("prefill: " + pre + " mixed image without transcoded or contiguous rows");
-    const bool xg = !bmix && !cpair && (xmix || tx(f)), xu = !bmix && !cpair && (xmix || tx(fu));
+    if (mix && !bmix && ((!cpair && std::strcmp(f.name, fu.name)) || tu->offset != tg->offset + tg->bytes))
+      throw LoomError("prefill: " + pre + " mixed image without contiguous rows");
     // (the decoder binding the NPU's gate / up rows: bmix's BFP)
     const char* const gdec = bmix ? "bfp" : f.name;
-    const std::size_t blk = bmix ? kBfpBlock : xg ? kIx4Block : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
+    const std::size_t blk = bmix ? kBfpBlock : tg->bytes / M * 256 / tg->dims[0], rb = blk * tg->dims[0] / 256;
     const std::size_t blkd = td->bytes / td->dims[1] * 256 / td->dims[0], rbd = blkd * td->dims[0] / 256;
-    const std::size_t f0 = M - F, dgu = xg || bmix ? M * rb : static_cast<std::size_t>(tg->bytes);
+    const std::size_t f0 = M - F, dgu = bmix ? M * rb : static_cast<std::size_t>(tg->bytes);
     // a combined gate / up copy: the NPU's gate rows and up rows, M rows apart (the images' dgu); the up rows between
     // them (the GPU's) are in the range registered for the NPU, which pins its pages: one aliased page run
     const auto gate_up = [&](const std::string& file) {
@@ -1117,32 +1111,18 @@ class LoomPrefill {
       AliasUnread(p + M * rb, f0 * rb);
       return p;
     };
-    const std::uint8_t* pg = bmix ? gate_up("npu_bfp_" + pre + "ffn_gate_up.bin")
-                             : !xg ? base + tg->offset
-                             : gate_up("npu_ix4_" + pre + "ffn_gate_up.bin");
+    const std::uint8_t* pg = bmix ? gate_up("npu_bfp_" + pre + "ffn_gate_up.bin") : base + tg->offset;
     const std::uint8_t* pd = base + td->offset;
-    // cpair: per column (gate, up) its rows' address (row 0; a transcoded tensor's file fills the last F of M rows)
-    // and row bytes
+    // cpair: per column (gate, up) its rows' address (row 0) and row bytes
     struct ColRows {
       const std::uint8_t* p;
       std::size_t rb;
     };
-    const auto col_rows = [&](const auto* t, const Fmt& x, const char* kind) {
-      if (!tx(x)) return ColRows{base + t->offset, static_cast<std::size_t>(t->bytes) / M};
-      const std::size_t r = kIx4Block * static_cast<std::size_t>(t->dims[0]) / 256;
-      return ColRows{HostRows("npu_ix4_" + pre + kind + ".bin", M * r, {{f0 * r, F * r}}), r};
-    };
-    const ColRows cg = cpair ? col_rows(tg, f, "ffn_gate") : ColRows{}, cu = cpair ? col_rows(tu, fu, "ffn_up") : ColRows{};
+    const auto col_rows = [&](const auto* t) { return ColRows{base + t->offset, static_cast<std::size_t>(t->bytes) / M}; };
+    const ColRows cg = cpair ? col_rows(tg) : ColRows{}, cu = cpair ? col_rows(tu) : ColRows{};
     if (npu_planning_) {   // the NPU's gate / up rows (one range when up follows gate), all of down
       const std::size_t end = gguf_.tensor_data_size();
-      if (cpair && (tx(f) || tx(fu))) {   // (each column's NPU rows: a transcoded file's, the GGUF tensor's)
-        for (const auto& [c, t] : {std::pair{cg, tg}, std::pair{cu, tu}}) {
-          const std::uint8_t* a = c.p + f0 * c.rb;
-          npu_->RegisterRaw(a, c.p == base + t->offset
-                                   ? std::min<std::size_t>(F * c.rb + 4096, end - (t->offset + f0 * c.rb))
-                                   : F * c.rb + 8192);
-        }
-      } else if (xg || bmix) {
+      if (bmix) {
         npu_->RegisterRaw(pg + f0 * rb, 2 * M * rb - f0 * rb + 8192);
       } else {
         const std::size_t a = tg->offset + f0 * rb;
@@ -1156,9 +1136,9 @@ class LoomPrefill {
     // (gen_npu_gemm swcol 32)
     const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
     const auto c_sw = [&](std::uint32_t j) { return NpuView{(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}; };
-    // (a column's raw view: 256 rows from row r0, its last record over-read; transcoded rows decode as IQ4_XS)
+    // (a column's raw view: 256 rows from row r0, its last record over-read)
     const auto col_bytes = [&](const ColRows& c, const auto* t, const Fmt& x) {
-      return 255 * c.rb + 16 * (c.rb * 256 / static_cast<std::size_t>(t->dims[0])) + RecordRow(tx(x) ? "iq4xs" : x.name);
+      return 255 * c.rb + 16 * (c.rb * 256 / static_cast<std::size_t>(t->dims[0])) + RecordRow(x.name);
     };
     for (std::uint32_t j = 0; j < F / 256 && cpair; ++j)
       csw.push_back(npu_->BindRawPair(sw + ".xdna", sw + ".xdna", 100 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
@@ -2250,8 +2230,8 @@ class LoomPrefill {
   // Rows without an NPU decoder (gate / up pairs, sites) the emitter wrote pre-decoded (emit_prefill_pp bfp_pair_rows,
   // bfp_site_rows: npu_bfp_<...>.bin, the decoder records' bfp16 fragments, 288 bytes per 256 weights), read once into
   // resident writable memory like the model (RegisterRaw pins it; + 8192 bytes of over-read slack)
-  static constexpr std::size_t kBfpBlock = 288, kIx4Block = 136;
-  // Host-side NPU rows (emit_prefill_pp bfp_pair_rows / bfp_site_rows / ix4_files): file's bytes in order into the spans (offset, bytes) of
+  static constexpr std::size_t kBfpBlock = 288;
+  // Host-side NPU rows (emit_prefill_pp bfp_pair_rows / bfp_site_rows): file's bytes in order into the spans (offset, bytes) of
   // a buffer of bytes (+ 8 KB the records over-read; pages outside the spans are never touched), kept for the run
   const std::uint8_t* HostRows(const std::string& file, std::size_t bytes,
                                const std::vector<std::pair<std::size_t, std::size_t>>& spans) {

@@ -757,18 +757,11 @@ NPU_KS = (36, 36, 36, 20)   # k-blocks per pass and K-slice row; K = 1024 * pass
 # place): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
 # layer writes this split's stream ("norm_t_bfp_g1s.hal", dispatch row "npuffndfr_<fmt>")
 NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs", "iq3s"), (40, 40, 40, 8)
-# The FFN block's IQ3_S gate / up rows are transcoded on the host to IQ4_XS blocks with the same weights (ix4_files:
-# npu_ix4_<...>.bin), decoded by IQ4_XS's decoder with their kvalues (gen_npu_dec IQ4_XO): its 8 KB grid does not fit
-# beside the rings (dispatch rows "npuffnix4_<fmt>")
-IX4_FMTS = {"iq3s": "IQ4_XO"}
-IX4_FAMILY = ("IQ4_XS", "IQ4_XO")
 # gate and up of one format without a fused GPU gate / up whose single-format deferred image fits: their own decoder
 # on the GGUF rows, no pre-decoded copy (Q3_K's with its record realign rolled: npu_images' q3roll fallback)
 NPU_SAME_SW = ("q5k", "q3k", "iq2s")
 # gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
-# tensor's rows (IQ3_S's transcoded, npu_ix4_<tensor>.bin), the tails swap halves;
-# "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>"); not two formats of IQ4_XS's decoder (one image,
-# kv2)
+# tensor's rows), the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>")
 NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s", "iq2xs")
 # The other pairs' gate / up rows (the NPU's) are pre-decoded to bfp16 (bfp_pair_rows: npu_bfp_<prefix>ffn_gate_up.bin),
 # one BFP image like a single format's with the deferred epilogue ("npu_ffnsw_bfp_<hord>", dispatch rows
@@ -780,12 +773,12 @@ NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s", "iq2xs")
 def colpair(l):
     """A layer whose gate and up run as column pairs (NPU_COLPAIR)."""
     g, u = l["ffn_gate"][0], l["ffn_up"][0]
-    return g != u and {g, u} <= set(NPU_COLPAIR) and not {gu_fmt(g), gu_fmt(u)} <= set(IX4_FAMILY)
+    return g != u and {g, u} <= set(NPU_COLPAIR)
 
 
 def gu_fmt(fmt):
     """The NPU decoder of the FFN block's gate / up rows of fmt."""
-    return IX4_FMTS.get(fmt) or DCOL_FMTS[fmt][0]
+    return DCOL_FMTS[fmt][0]
 
 
 # the fused site and down images of the formats whose four cores each decode one super-block of every unit (gen_npu_gemm
@@ -1164,39 +1157,6 @@ def bfp_pair_rows(layers, F, outdir):
         print("bfp pair rows: %s -> %s" % (pre, path))
 
 
-def ix4_files(layers, sw, F, outdir):
-    """The FFN block's IQ3_S gate / up tensors (layers: prefix -> kinds) transcoded
-    (gen_npu_dec.ix4_rows), their last F rows (the NPU's) only: sw layers (prefixes in sw) to
-    npu_ix4_<prefix>ffn_gate_up.bin (gate's rows, then up's), the others (column pairs) to npu_ix4_<tensor>.bin."""
-    import gguf
-    import numpy as np
-    rd = gguf.GGUFReader(MODEL)
-    ts = {t.name: t for t in rd.tensors}
-    for pre, kinds in sorted(layers.items()):
-        if not kinds:
-            continue
-        files = [(pre + "ffn_gate_up", ["ffn_gate", "ffn_up"])] if pre in sw else [(pre + k, [k]) for k in kinds]
-        # (an sw file's IQ4_XS tensor: its rows as they are)
-        for name, ks in files:
-            path = os.path.join(outdir, "npu_ix4_%s.bin" % name)
-            K = int(ts[pre + ks[0] + ".weight"].shape[0])
-            if os.path.exists(path) and os.path.getsize(path) == len(ks) * F * K // 256 * 136:
-                continue
-            with open(path + ".tmp", "wb") as f:
-                for k in ks:
-                    t = ts[pre + k + ".weight"]
-                    src, N = t.tensor_type.name, int(t.shape[1])
-                    raw = np.asarray(t.data).view(np.uint8).reshape(N, K // 256, -1)
-                    if src == "IQ4_XS":
-                        f.write(raw[N - F:].tobytes())
-                        continue
-                    D = GN.decoder(IX4_FMTS[E.FMT[int(t.tensor_type)][0]])
-                    for r0 in range(N - F, N, 512):
-                        f.write(D.ix4_rows(raw[r0:r0 + 512], src).tobytes())
-            os.replace(path + ".tmp", path)
-            print("ix4 rows: %s -> %s" % (name, path))
-
-
 def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     """NPU_FFNBLK: the GPU's kernels of the FFN block (appended to out, split / variants: npu_split's) and its NPU images
     (returned as npu_images extra jobs); dispatch.txt "npuffnblk <F>", "npubytes_ffnsw" / "npubytes_ffndn<passes>"."""
@@ -1220,17 +1180,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
              and (l["ffn_gate"][0] != l["ffn_up"][0] or l["ffn_gate"][0] not in AF_FFN)
              and l["ffn_gate"][1:] == l["ffn_up"][1:] and l["ffn_gate"][0] in fmts and l["ffn_up"][0] in fmts
              and l.get("ffn_down", ("",))[0] in dfmts]
-    # pairs whose gate and up both take IQ4_XS's decoder (IX4_FAMILY), or one format of NPU_SAME_SW: one image like a
-    # single format's (IX4_FAMILY: its up slabs gathering from their own kvalues table, gen_npu_gemm kv2), with the
-    # deferred epilogue ("npu_ffnsw_<gate>_<up>"); the other pairs take the BFP image (bsw)
-    mixed = [l for l in pairs if {gu_fmt(l[kd][0]) for kd in ("ffn_gate", "ffn_up")} <= set(IX4_FAMILY)
-             or l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW or colpair(l)]
+    # pairs of one format of NPU_SAME_SW: one image like a single format's, with the deferred epilogue
+    # ("npu_ffnsw_<gate>_<up>"); column pairs; the other pairs take the BFP image (bsw)
+    mixed = [l for l in pairs if l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW or colpair(l)]
     bsw = [l for l in pairs if l not in mixed]
     bfp_pair_rows({"blk.%s." % n for n, l in by.items() if l in bsw}, F, outdir)
-    # sw layers: gate and up in one file (the image's dgu); pairs: per tensor; the NPU's rows only
-    ix4_files({"blk.%s." % n: [kd for kd in ("ffn_gate", "ffn_up") if l[kd][0] in IX4_FMTS]
-               for n, l in by.items() if l in ok + pairs and l not in bsw},
-              {"blk.%s." % n for n, l in by.items() if l in ok + mixed and not colpair(l)}, F, outdir)
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
         hords = sorted({hord_of(l["ffn_down"][0]) for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
@@ -1279,7 +1233,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         else:   # (mixed)
             blk = GN.decoder(gu_fmt(gf)).BLK
             cfg = npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024,
-                          hord=hord, fmt=gu_fmt(gf), kv2=gu_fmt(uf) if gf != uf else "", dfr=1)
+                          hord=hord, fmt=gu_fmt(gf), dfr=1)
         jobs.append((cfg, "npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower()), 4))
     # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each)
     N, calls = 5120, -(-5120 // rows)
@@ -1329,7 +1283,6 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     for fmt in NPU_DFR_FMTS:
         if gu_fmt(fmt) in dfrs:
             out.append(("npuffndfr_" + fmt, 1, 0, 0))
-    out.extend(("npuffnix4_" + f, 1, 0, 0) for f in sorted(IX4_FMTS))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs}):
         out.append(("npuffndfr_%s_%s" % (gf, uf), 1, 0, 0))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs if colpair(l)}):

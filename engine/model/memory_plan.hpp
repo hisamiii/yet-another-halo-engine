@@ -54,11 +54,11 @@ struct MemoryPlan {
     // attention scratch.
     const std::uint64_t kv = 16ull * 1024 * (kb + vb) / 8 * 33 / 32;
     p.buffers = kFixed + std::uint64_t{p.context} * (kv + kScratchPerToken);
-    if (!npu_set.empty()) {  // the NPU's own rows, read into memory (pre-decoded and transcoded: npu_bfp_*, npu_ix4_*)
+    if (!npu_set.empty()) {  // the NPU's own rows, read into memory (pre-decoded: npu_bfp_*)
       std::error_code ec;
       for (const auto& e : std::filesystem::directory_iterator(npu_set, ec)) {
         const std::string n = e.path().filename().string();
-        if (n.starts_with("npu_bfp_") || n.starts_with("npu_ix4_")) p.buffers += e.file_size(ec);
+        if (n.starts_with("npu_bfp_")) p.buffers += e.file_size(ec);
       }
       p.buffers += kNpuFixed;
     }
