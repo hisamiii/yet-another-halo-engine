@@ -97,7 +97,20 @@ The series is the pin's patches rebuilt on HRX main in their old order. A carrie
 | `0077-libhrx-start-HRX_PROFILE_FILE-captures-in-hrx_device` | `HRX_PROFILE_FILE` / `HRX_PROFILE_MODE` captures for device groups the engine creates (upstream starts them only in the HIP binding) |
 | `0078-loom-realize-uniform-split-addresses-in-runtime-loop` | the pin's 0053 redone: address realization in runtime-bounded loops, uniform terms in scalar offsets |
 
-Not carried over from the pin: 0002 `stream-profile-metadata`, 0003 `profile-counters-mode`, 0009 `loom-omit-dead-fma-mix-seeds`, 0031 `loom-amdgpu-matrix-bank-allocation`, 0034 `loom-amdgpu-inline-accumulator-bank-placement`, 0035 `loom-amdgpu-valu-source-bank-placement`, 0042 `amdgpu-one-mib-command-buffer-blocks`, 0044 `libhrx-graph-barrier-state-256`, 0049 `loom-numbering-trades-single-use-regressions`, 0050 `loom-amdgpu-matrix-bank-weight`, 0051 `loom-amdgpu-u4-table-lookup`, 0054 `profile-gfx11-sq-wait-lds-counters`, 0055 `libhrx-profile-function-filter`, 0056 `profile-att-raw-wave-dump`, 0057 `loom-amdgpu-f16-inline-accumulator-bank-placement`, 0062 `loom-xdna-signed-war-separations`, 0067 `loom-parser-large-programs`. Carried under a new number: 0010 as 0075, 0011 as 0070, 0030 as 0073, 0036 as 0076, 0038 as 0074, 0041 as 0068, 0053 as 0078.
+Not carried over from the pin (checked against main 2026-11-15):
+
+| pin patch | why not carried |
+|---|---|
+| 0002 `stream-profile-metadata`, 0003 `profile-counters-mode`, 0054 `profile-gfx11-sq-wait-lds-counters`, 0055 `libhrx-profile-function-filter`, 0056 `profile-att-raw-wave-dump` | diagnostics only; main has no counters mode (so `tools/attn_bench.py`, which reads SQ_BUSY_CYCLES, runs only on the pin) |
+| 0031 `loom-amdgpu-matrix-bank-allocation`, 0034 `loom-amdgpu-inline-accumulator-bank-placement`, 0035 `loom-amdgpu-valu-source-bank-placement`, 0049 `loom-numbering-trades-single-use-regressions`, 0050 `loom-amdgpu-matrix-bank-weight` | bank placement made for the iu4 GEMMs, which went with the MQ4 path |
+| 0042 `amdgpu-one-mib-command-buffer-blocks` | main has no AQL block builder; a prefill chunk records as one command buffer |
+| 0044 `libhrx-graph-barrier-state-256` | main's graph analysis has no fixed-size hazard set |
+| 0062 `loom-xdna-signed-war-separations` | main's AIE2P write-after-read separations are already signed |
+| 0067 `loom-parser-large-programs` | the NPU split's large programs parse on main |
+| 0051 `loom-amdgpu-u4-table-lookup` | ported to main's permute tree and measured: the IQ4_XS / IQ4_NL GEMMs ran 1.04% slower (clock-adjusted dispatch profile, pp2048) despite 6-64 fewer VALU per 128 WMMA; not carried |
+| 0009 `loom-omit-dead-fma-mix-seeds`, 0057 `loom-amdgpu-f16-inline-accumulator-bank-placement` | small (one dead constant per fma_mix pair; one WMMA bank preference, 6% of key-split WMMAs at 33 instead of 32 cycles on the pin); not ported |
+
+Carried under a new number: 0010 as 0075, 0011 as 0070, 0030 as 0073, 0036 as 0076, 0038 as 0074, 0041 as 0068, 0053 as 0078.
 
 0030-0036 were made for the int4 (iu4) GEMMs, which went with the MQ4 path. Only 0033 and 0034 are iu4-only (inline-accumulator iu4 WMMA forms); the others also act on native kernels (0032's `kernel.priority` is used by `gen_attn_fa`, 0036 packs every f16-output GEMM's stores). All stay in the stack: dropping a patch changes the compiler.
 
