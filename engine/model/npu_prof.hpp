@@ -10,6 +10,8 @@
 // YAH_NPU_PROF_MT_SEL="s0,s1,m0,m1" the DMA channels their SEL0 / SEL1 events watch (S2MM, MM2S), and
 // YAH_NPU_PROF_SHIM="e0,e1" the shim tiles' (row 0) two (e.g. 36 / 32: MM2S 0 starved of memory / held back by its
 // stream). Unset: those counters count nothing.
+// The read also takes core tile (0, 2)'s 64-bit timer (array clock cycles, the last two values): with event 1 (TRUE) on
+// core counter 0, the job's gate opened at timer - that tile's counter 0 (Finish: times()).
 #ifndef YAH_MODEL_NPU_PROF_HPP_
 #define YAH_MODEL_NPU_PROF_HPP_
 
@@ -36,7 +38,10 @@ class NpuProf {
  public:
   static constexpr std::uint32_t kCols = 8, kRows = 4, kRow0 = 2, kCore = 4, kMem = 2, kRegs = kCore + kMem;
   static constexpr std::uint32_t kMt = 4, kShim = 2;   // memory tile and shim counters, after the tiles'
-  static constexpr std::uint32_t kTiles = kCols * kRows, kValues = kTiles * kRegs + kCols * (kMt + kShim);
+  static constexpr std::uint32_t kTiles = kCols * kRows, kValues = kTiles * kRegs + kCols * (kMt + kShim) + 2;
+  struct Times {
+    std::uint64_t gate, done;   // (gate: valid with TRUE on core counter 0)
+  };
 
   explicit NpuProf(const char* spec) {
     if (std::sscanf(spec, "%u,%u,%u,%u/%u,%u", &c_[0], &c_[1], &c_[2], &c_[3], &m_[0], &m_[1]) != 6)
@@ -52,6 +57,7 @@ class NpuProf {
       for (std::uint32_t r = 0; r < kMt; ++r) addr.push_back((col << 25 | 1u << 20) + 0x91020 + 4 * r);
       for (std::uint32_t r = 0; r < kShim; ++r) addr.push_back((col << 25) + 0x31020 + 4 * r);
     }
+    addr.push_back((kRow0 << 20) + 0x340F8), addr.push_back((kRow0 << 20) + 0x340FC);   // tile (0, 2) Timer_Low / High
     if (const char* e = std::getenv("YAH_NPU_PROF_MT"))
       std::sscanf(e, "%u,%u,%u,%u", &mt_[0], &mt_[1], &mt_[2], &mt_[3]);
     if (const char* e = std::getenv("YAH_NPU_PROF_MT_SEL")) {
@@ -133,9 +139,12 @@ class NpuProf {
     return kTiles * (3 + kCore + kMem + 4 + 3) + kCols * (3 + kMt + kShim + 1 + 3);
   }
   const std::vector<std::uint8_t>& Read() const { return read_; }
+  // Finish's jobs' timer stamps
+  const std::vector<Times>& times() const { return times_; }
 
   // After the last job's done: the firmware's log of every job's READ_REGS, kValues words per job in job order
-  // (col-major tiles, core counters then memory counters). The sync queues behind the context's last command.
+  // (col-major tiles, core counters then memory counters, then the memory tiles', the shims' and the timer; times()).
+  // The sync queues behind the context's last command.
   std::vector<std::uint32_t> Finish(std::size_t jobs) {
     if (jobs * kValues > kBytes / 4) throw LoomError("npu prof: more jobs than the debug buffer holds");
     amdxdna_drm_sync_bo sb{};
@@ -143,7 +152,14 @@ class NpuProf {
     if (ioctl(fd_, DRM_IOCTL_AMDXDNA_SYNC_BO, &sb)) throw LoomError("npu prof: SYNC_BO failed");
     Flush();
     if (map_[jobs * kValues] != 0) std::fprintf(stderr, "npu prof: the log runs past the last job\n");
-    return std::vector<std::uint32_t>(map_, map_ + jobs * kValues);
+    std::vector<std::uint32_t> v(map_, map_ + jobs * kValues);
+    times_.clear();
+    for (std::size_t j = 0; j < jobs; ++j) {
+      const std::uint32_t* const x = v.data() + j * kValues;
+      const std::uint64_t done = std::uint64_t{x[kValues - 1]} << 32 | x[kValues - 2];
+      times_.push_back({done - x[0], done});
+    }
+    return v;
   }
 
  private:
@@ -184,6 +200,7 @@ class NpuProf {
   std::uint32_t mt_sel_ = 0;
   std::map<std::string, std::vector<std::uint8_t>> setup_;   // per image
   std::vector<std::uint8_t> read_;
+  std::vector<Times> times_;
   std::uint32_t bo_ = 0;
   int fd_ = -1;
   volatile std::uint32_t* map_ = nullptr;

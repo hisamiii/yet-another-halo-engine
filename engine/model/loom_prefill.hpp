@@ -149,6 +149,17 @@ class LoomPrefill {
       for (std::uint32_t k = 0; k < NpuProf::kValues; ++k) std::fprintf(stderr, " %u", v[i * NpuProf::kValues + k]);
       std::fprintf(stderr, "\n");
     }
+    PrintNpuTimes(*prof, prof_tags_, prof_layers_);
+  }
+  // "npu time: <job> <layer> <tag> <gate> <done>": when each job's gate opened and its done landed (array cycles;
+  // NpuProf::Times)
+  static void PrintNpuTimes(const NpuProf& prof, const std::vector<std::string>& tags,
+                            const std::vector<std::uint32_t>& layers) {
+    for (std::size_t i = 0; i < tags.size() && i < prof.times().size(); ++i) {
+      const NpuProf::Times& t = prof.times()[i];
+      std::fprintf(stderr, "npu time: %zu %u %s %llu %llu\n", i, i < layers.size() ? layers[i] : 0u, tags[i].c_str(),
+                   static_cast<unsigned long long>(t.gate), static_cast<unsigned long long>(t.done));
+    }
   }
   // Split the set's NPU sites of full chunks with the NPU from now on: it computes their trailing npusplit rows.
   // npu (built from npu_plan()) outlives this object.
@@ -344,6 +355,10 @@ class LoomPrefill {
           for (std::uint32_t k = 0; k < NpuProf::kValues; ++k) std::fprintf(stderr, " %u", v[i * NpuProf::kValues + k]);
           std::fprintf(stderr, "\n");
         }
+        std::vector<std::string> tags;
+        std::vector<std::uint32_t> layers;
+        for (const auto& j : jobs) tags.push_back(j.tag), layers.push_back(j.layer);
+        PrintNpuTimes(*prof, tags, layers);
       }
       for (const auto& [tag, ms] : family_ms) std::fprintf(stderr, "npu cpu-driven: %-8s %8.1f ms\n", tag.c_str(), ms);
       if (const char* cmd = std::getenv("YAH_NPU_CPU_DONE_CMD")) std::system(cmd);
@@ -352,7 +367,7 @@ class LoomPrefill {
     chunk_graph_->Launch();
     jobs.swap(flagged_);
     if (npu_ && npu_->Prof() && !jobs.empty() && prof_tags_.empty())   // the first NPU chunk's jobs (ReportNpuProf)
-      for (const auto& q : jobs) prof_tags_.push_back(q.tag);
+      for (const auto& q : jobs) prof_tags_.push_back(q.tag), prof_layers_.push_back(q.layer);
     // in recording order: each attention job after the GEMM jobs recorded before it (the two NPU contexts run in the
     // order their commands were built, LoomNpu::SetPeer)
     std::size_t from = 0;
@@ -2218,6 +2233,7 @@ class LoomPrefill {
   LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
   std::vector<std::string> waitlog_tag_;   // each slot's layer and job tag
   std::vector<std::string> prof_tags_;     // YAH_NPU_PROF: the first NPU chunk's job tags (ReportNpuProf)
+  std::vector<std::uint32_t> prof_layers_;  // and their layers
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *grid_iq2s_ = nullptr, *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *normnil_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
