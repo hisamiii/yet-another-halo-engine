@@ -62,7 +62,6 @@ The series is the pin's patches rebuilt on HRX main in their old order. A carrie
 | `0052-0059-loom-cse-keeps-concat-pieces` | the pin's 0059: low CSE keeps a duplicate producer that feeds concat pieces in explicit registers (AIE2P) |
 | `0053-0048-0059-port-coalescing-alignbit-and-concat-CSE-to` | the pin's 0048-0059 ported: coalescing, alignbit and concat CSE |
 | `0054-0060-loom-concat-reserves-explicit-registers-early` | the pin's 0060: a concat in explicit registers (AIE2P) is reserved from its earliest unit's start |
-| `0055-0061-loom-sticky-status-writes-skip-issue-order` | the pin's 0061: sticky status writes (`srFPFlags`) do not order issue |
 | `0056-0063-loom-low-generator-asserted-effect-relaxations` | the pin's 0063: opt-in effect-order relaxations for hand-scheduled AIE2P bodies (`LOOM_EXP_NOALIAS_ACC`, `LOOM_EXP_NOWAR_ACC`, `LOOM_EXP_LOCK_ACQREL`); unset, emits are byte-identical |
 | `0057-0064-loom-low-lru-register-choice` | the pin's 0064: opt-in `LOOM_EXP_LRU` register choice; unset, byte-identical |
 | `0058-0066-loom-xdna-pinned-ring-records` | the pin's 0066: opt-in `LOOM_EXP_RING_AT` pins a tile's ring records; unset, byte-identical |
@@ -100,7 +99,7 @@ Not carried over from the pin (checked against main 2026-11-15):
 
 Carried under a new number: 0010 as 0075, 0011 as 0070, 0030 as 0073, 0036 as 0076, 0038 as 0074, 0041 as 0068, 0053 as 0078.
 
-The numbering has gaps: 0005, 0006, 0009, 0010, 0037, 0040, 0043, 0060 and 0067 were first ports that later patches reverted or fixed up to nothing (the series without them gives the same HRX tree), so they were dropped. 0036 (the iu4 accumulator seed and inline subtract), its fixup 0038 and 0039 (barriers under wave-uniform branches, inert on main's CFG form; 0066 does that job) changed no emitted kernel (every default set plus pp8192, k4v8 decode and npusplit4k byte-identical without them), so they were dropped too.
+The numbering has gaps: 0005, 0006, 0009, 0010, 0037, 0040, 0043, 0060 and 0067 were first ports that later patches reverted or fixed up to nothing (the series without them gives the same HRX tree), so they were dropped. 0036 (the iu4 accumulator seed and inline subtract), its fixup 0038 and 0039 (barriers under wave-uniform branches, inert on main's CFG form; 0066 does that job) changed no emitted kernel (every default set plus pp8192, k4v8 decode and npusplit4k byte-identical without them), so they were dropped too. 0055 (AIE2P sticky status writes in issue order) changed no emitted kernel either, so it went in the same leave-one-out check; every other carried compiler patch changes kernels.
 
 0030-0036 were made for the int4 (iu4) GEMMs, which went with the MQ4 path. Only 0033 and 0034 are iu4-only (inline-accumulator iu4 WMMA forms); the others also act on native kernels (0032's `kernel.priority` is used by `gen_attn_fa`, 0036 packs every f16-output GEMM's stores). All stay in the stack: dropping a patch changes the compiler.
 
