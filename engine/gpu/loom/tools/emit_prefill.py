@@ -95,19 +95,26 @@ def emit(loomfile, configs, outname, outdir, env=None, gate=None):
     # main's 224 / 232 down to 216 without spills: 9 of gfx1151's 24-register blocks, 7 waves per SIMD instead of 6)
     if os.path.basename(outname).startswith("wmma") and os.environ.get("YAH_ATTN_VGPR_BUDGET"):
         ce["LOOM_EXP_BUDGET"] = "amdgpu.vgpr=" + os.environ["YAH_ATTN_VGPR_BUDGET"]
+    # Every other kernel first allocates within YAH_VGPR_TRY VGPRs (default 192, 8 waves; "0": off) and keeps that
+    # unless it spills. HRX main's allocator spreads an unbudgeted kernel past what it needs: the IQ4_XS fused ffn at
+    # 232 VGPRs (6 waves) allocates in 176 without spills, as on the old pin, and npu8x2's GEMMs ran 7-12% slower.
+    vtry = os.environ.get("YAH_VGPR_TRY", "192")
+    vtry = vtry if (vtry != "0" and "LOOM_EXP_BUDGET" not in ce
+                    and not os.path.basename(outname).startswith(ROLE_SPLIT)) else None
     tgt = ce.get("YAH_LOOM_TARGET", "gfx1151")
     raw = open(os.path.join(LOOM, loomfile)).read()
     text, _ = emit_hal.specialize(raw,
                                   {k.lstrip("@"): v for k, _, v in (c.partition("=") for c in configs)}, tgt)
     loomenv = sorted((k, v) for k, v in ce.items() if k.startswith("LOOM_"))
-    key = hashlib.sha256(repr((text, tgt, loomenv, _lc, sorted(UNBOUNDED.items()))).encode()).hexdigest()
+    key = hashlib.sha256(repr((text, tgt, loomenv, _lc, sorted(UNBOUNDED.items())) + ((("vtry", vtry),) if vtry else ()))
+                         .encode()).hexdigest()
     dst = os.path.join(outdir, outname)
     os.makedirs(outdir, exist_ok=True)
     with _lock:
         _latest[dst] = seq = _latest.get(dst, 0) + 1
         if _pool is None:
             _pool = ThreadPoolExecutor(JOBS)
-        _pending.setdefault(dst, []).append(_pool.submit(_build, loomfile, text, tgt, ce, key, dst, seq, gate and (raw, gate)))
+        _pending.setdefault(dst, []).append(_pool.submit(_build, loomfile, text, tgt, ce, key, dst, seq, gate and (raw, gate), vtry))
     if not ASYNC:
         wait(dst)
     return dst
@@ -150,7 +157,13 @@ def _gate(loomfile, raw, args, ce):
 GATE_CODE = ("footprint_gate.py", "loom_preflight.py")
 
 
-def _build(loomfile, text, tgt, ce, key, dst, seq, gate):
+def _spills(hal):
+    notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
+    m = re.search(r"\.private_segment_fixed_size:\s*(\d+)", notes)
+    return int(m.group(1)) if m else 0
+
+
+def _build(loomfile, text, tgt, ce, key, dst, seq, gate, vtry=None):
     import hrx_paths
     if gate:
         _gate(loomfile, gate[0], gate[1], ce)
@@ -161,7 +174,13 @@ def _build(loomfile, text, tgt, ce, key, dst, seq, gate):
             open(src, "w").write(text)
             cmd = [hrx_paths.LOOM_COMPILE, src, "--target=amdgpu:" + tgt, "--format=amdgpu-hsaco", "--output=" + out,
                    "--compile-report=summary", "--compile-report-output=" + rep]
-            r = subprocess.run(cmd, env=ce, capture_output=True, text=True)
+            r = None
+            if vtry:
+                r = subprocess.run(cmd, env={**ce, "LOOM_EXP_BUDGET": "amdgpu.vgpr=" + vtry}, capture_output=True, text=True)
+                if r.returncode != 0 or not os.path.exists(out) or _spills(out):
+                    r = None
+            if r is None:
+                r = subprocess.run(cmd, env=ce, capture_output=True, text=True)
             if r.returncode != 0 or not os.path.exists(out):
                 # stderr first: it holds the compiler diagnostics
                 log = os.path.join("/tmp", "emit_fail_" + os.path.basename(dst) + ".log")
