@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:44:46 +0100
+Subject: [PATCH] libhrx : start HRX_PROFILE_FILE captures in
+ hrx_device_group_create
+
+---
+ libhrx/src/libhrx/BUILD.bazel    |  1 +
+ libhrx/src/libhrx/device_group.c | 59 ++++++++++++++++++++++++++++++--
+ 2 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/libhrx/src/libhrx/BUILD.bazel b/libhrx/src/libhrx/BUILD.bazel
+index 8cc3450e37..4439b81616 100644
+--- a/libhrx/src/libhrx/BUILD.bazel
++++ b/libhrx/src/libhrx/BUILD.bazel
+@@ -99,6 +99,7 @@ HRX_DEPS = [
+     "//runtime/src/iree/hal/driver/task:driver",
+     "//runtime/src/iree/hal/driver/task/executable/loaders/registration",
+     "//runtime/src/iree/hal/utils:resource_set",
++    "//runtime/src/iree/hal/utils:profile_file",
+     "//runtime/src/iree/io:file_handle",
+     "//runtime/src/iree/task:api",
+ ] + iree_select({
+diff --git a/libhrx/src/libhrx/device_group.c b/libhrx/src/libhrx/device_group.c
+index 0f005b48bf..11e1623822 100644
+--- a/libhrx/src/libhrx/device_group.c
++++ b/libhrx/src/libhrx/device_group.c
+@@ -8,6 +8,12 @@
+ #include "iree/base/internal/path.h"
+ #include "runtime.h"
+ 
++#include <stdlib.h>
++#include <string.h>
++
++#include "iree/hal/utils/profile_file.h"
++#include "iree/io/file_handle.h"
++
+ static_assert((uint32_t)HRX_WAIT_FLAG_YIELD == IREE_ASYNC_WAIT_FLAG_YIELD,
+               "wait flag mismatch");
+ static_assert((uint32_t)HRX_WAIT_FLAG_ACTIVE == IREE_ASYNC_WAIT_FLAG_ACTIVE,
+@@ -137,11 +143,60 @@ iree_status_t hrx_device_group_create_with_extensions(
+   return status;
+ }
+ 
++// HRX_PROFILE_FILE / HRX_PROFILE_MODE for groups made through the public API
++// (the HIP binding starts its own capture), so embedders get the same profiles.
++static iree_status_t hrx_device_group_profile_begin_from_env(
++    hrx_device_group_t group) {
++  const char* path = getenv("HRX_PROFILE_FILE");
++  if (!path || !path[0]) return iree_ok_status();
++  iree_hal_device_profiling_options_t options = {0};
++  const char* mode = getenv("HRX_PROFILE_MODE");
++  if (!mode || !mode[0] || strcmp(mode, "queue") == 0) {
++    options.data_families = IREE_HAL_DEVICE_PROFILING_DATA_QUEUE_EVENTS;
++  } else if (strcmp(mode, "dispatch") == 0) {
++    options.data_families = IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA |
++                            IREE_HAL_DEVICE_PROFILING_DATA_DISPATCH_EVENTS;
++  } else if (strcmp(mode, "all") == 0) {
++    options.data_families = IREE_HAL_DEVICE_PROFILING_DATA_QUEUE_EVENTS |
++                            IREE_HAL_DEVICE_PROFILING_DATA_EXECUTABLE_METADATA |
++                            IREE_HAL_DEVICE_PROFILING_DATA_DEVICE_QUEUE_EVENTS |
++                            IREE_HAL_DEVICE_PROFILING_DATA_DISPATCH_EVENTS;
++  } else {
++    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
++                            "unsupported HRX_PROFILE_MODE '%s'", mode);
++  }
++  iree_allocator_t allocator = iree_allocator_system();
++  iree_io_file_handle_t* file = NULL;
++  IREE_RETURN_IF_ERROR(iree_io_file_handle_create(
++      IREE_IO_FILE_MODE_WRITE | IREE_IO_FILE_MODE_SEQUENTIAL_SCAN |
++          IREE_IO_FILE_MODE_SHARE_READ,
++      iree_make_cstring_view(path), /*initial_size=*/0, allocator, &file));
++  iree_status_t status =
++      iree_hal_profile_file_sink_create(file, allocator, &options.sink);
++  iree_io_file_handle_release(file);
++  for (size_t i = 0;
++       iree_status_is_ok(status) && i < hrx_device_group_device_count(group);
++       ++i) {
++    status = hrx_device_profile_begin(hrx_device_group_get_device(group, i),
++                                      &options);
++  }
++  iree_hal_profile_sink_release(options.sink);
++  return status;
++}
++
+ hrx_status_t hrx_device_group_create(hrx_runtime_t runtime, size_t device_count,
+                                      const hrx_device_create_params_t* devices,
+                                      hrx_device_group_t* out_group) {
+-  return hrx_status_from_iree(hrx_device_group_create_with_extensions(
+-      runtime, device_count, devices, NULL, 0, out_group));
++  iree_status_t status = hrx_device_group_create_with_extensions(
++      runtime, device_count, devices, NULL, 0, out_group);
++  if (iree_status_is_ok(status)) {
++    status = hrx_device_group_profile_begin_from_env(*out_group);
++    if (!iree_status_is_ok(status)) {
++      hrx_device_group_release(*out_group);
++      *out_group = NULL;
++    }
++  }
++  return hrx_status_from_iree(status);
+ }
+ 
+ void hrx_device_group_retain(hrx_device_group_t group) {
