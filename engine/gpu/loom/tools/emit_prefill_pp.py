@@ -765,11 +765,20 @@ IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX")
 # gate and up of one format without a fused GPU gate / up whose single-format deferred image fits: their own decoder
 # on the GGUF rows, no pre-decoded copy (Q3_K's gate helper is 0.6 KB over the core's program memory)
 NPU_SAME_SW = ("q5k",)
+# gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
+# tensor's rows, the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>"). Q3_K's
+# gate roles are over the core's program memory (16.7 and 17.0 KB of 16), IQ2_XS's grid tables do not place.
+NPU_COLPAIR = ("iq4xs", "q4k")
 # The other pairs' gate / up rows (the NPU's) are pre-decoded to bfp16 (bfp_pair_rows: npu_bfp_<prefix>ffn_gate_up.bin),
 # one BFP image like a single format's with the deferred epilogue ("npu_ffnsw_bfp_<hord>", dispatch rows
 # "npuffnbx_<gate>_<up>"). Site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU rows
 # pre-decoded too (bfp_site_rows: npu_bfp_<tensor>.bin), on the BFP site image ("npu_dcol_iq2s_<K>", dispatch rows
-# "npusitebx_<tensor>"). Tried, not kept: gate and up of two formats on column pairs (the gate tail streaming its C to the up tail).
+# "npusitebx_<tensor>").
+
+
+def colpair(l):
+    """A layer whose gate and up run as column pairs (NPU_COLPAIR)."""
+    return l["ffn_gate"][0] != l["ffn_up"][0] and {l["ffn_gate"][0], l["ffn_up"][0]} <= set(NPU_COLPAIR)
 
 
 def gu_fmt(fmt):
@@ -1258,7 +1267,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     # single format's (IX4_FAMILY: its up slabs gathering from their own kvalues table, gen_npu_gemm kv2), with the
     # deferred epilogue ("npu_ffnsw_<gate>_<up>"); the other pairs take the BFP image (bsw)
     mixed = [l for l in pairs if {gu_fmt(l[kd][0]) for kd in ("ffn_gate", "ffn_up")} <= set(IX4_FAMILY)
-             or l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW]
+             or l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW or colpair(l)]
     bsw = [l for l in pairs if l not in mixed]
     bfp_rows({"blk.%s.%s.weight" % (n, kd) for n, l in by.items() if l in ok + pairs
               for kd in ("ffn_gate", "ffn_up", "ffn_down") if l.get(kd, ("",))[0] == "iq2s"
@@ -1309,10 +1318,15 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 jobs.append((npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * 288, swcol=32,
                                      hpass=F // 1024, hord=hord, fmt="BFP", dfr=1), "npu_ffnsw_bfp_" + hord.lower(), 4))
             continue
-        blk = GN.decoder(gu_fmt(gf)).BLK   # (mixed)
-        jobs.append((npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024,
-                             hord=hord, fmt=gu_fmt(gf), kv2=gu_fmt(uf) if gf != uf else "", dfr=1),
-                     "npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower()), 4))
+        if gf != uf and {gf, uf} <= set(NPU_COLPAIR):   # (column pairs; Q4_K in P4 order: gen_npu_dec "GF")
+            go = lambda f: "GF" if f == "q4k" else "P4"
+            cfg = npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, swcol=32, hpass=F // 1024, hord=hord, fmt=gu_fmt(gf),
+                          gord=go(gf), ufmt=gu_fmt(uf), ugord=go(uf), dfr=1)
+        else:   # (mixed)
+            blk = GN.decoder(gu_fmt(gf)).BLK
+            cfg = npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024,
+                          hord=hord, fmt=gu_fmt(gf), kv2=gu_fmt(uf) if gf != uf else "", dfr=1)
+        jobs.append((cfg, "npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower()), 4))
     # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each)
     N, calls = 5120, -(-5120 // rows)
     name = "npu_unpack_ffnblk"
@@ -1364,6 +1378,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     out.append(("npuffnix4", 1, 0, 0))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs}):
         out.append(("npuffndfr_%s_%s" % (gf, uf), 1, 0, 0))
+    for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs if colpair(l)}):
+        out.append(("npuffncp_%s_%s" % (gf, uf), 1, 0, 0))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in bsw}):
         out.append(("npuffnbx_%s_%s" % (gf, uf), 1, 0, 0))
     out.append(("npuffnblk", F, 256, rows))   # F, gate / up features per call, down rows

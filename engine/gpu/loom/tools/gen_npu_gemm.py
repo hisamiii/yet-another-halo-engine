@@ -112,6 +112,11 @@ class Config:
                         # dummy buffer), so no branch delay / quiescence splits the push tile
     kv2: str = ""       # swiglu fuse 2 (gen_npu_dec DQ_KV2): fmt an IQ4_XS alias, the up slabs' rows in kv2's kvalues (an
                         # IQ4_XS alias too: IQ3_S / IQ3_XXS gate / up of one layer in different formats run like one)
+    ufmt: str = ""      # swiglu fuse 2 column pairs (dfr): pair u is gate column 2 u (fmt rows, binding 7) and up
+                        # column 2 u + 1 (ufmt rows in ugord's order, binding 8; dgu unused) of the same 64 features, so
+                        # each column's cores hold one decoder; the tails swap halves (pair_swap), each runs the
+                        # epilogue of 32
+    ugord: str = ""     # ufmt's k-block order (the activations' order is shared: Q4_K's "GF" beside a P4 format)
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
                         # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
                         # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
@@ -215,6 +220,7 @@ def f32_bits(x):
 SW_REC = NP * 2 * 72      # swiglu: a segment's output record, NP k-blocks x 2 token halves of bfp16 fragments (720 B)
 SW_PITCH = 8              # its send pitch: a C slot of 8 records (5760 B) holds the segment's f32 C (5120 B)
 SW_SLOT = SW_PITCH * SW_REC
+SW_HALF = 512 * NP        # column pairs: half a segment's f32 C (NP / 2 slabs)
 DFR_T = (0, 2)            # Config.dfr: the sub-tiles after which a deferred push runs (2 of the 4: 8 pushes a pass)
 DFT = "reg<aie2p.mstfifo>, reg<aie2p.mpfs>, reg<aie2p.mr26_fifo_st>"
 
@@ -223,17 +229,18 @@ DFT = "reg<aie2p.mstfifo>, reg<aie2p.mpfs>, reg<aie2p.mr26_fifo_st>"
 def np_override(n):
     """Generate with n 16-row slabs per column (TN = 16 n) instead of NP (e.g. 4: a swiglu call's 32 features per
     column, so its k-block units line up with 1024-feature passes)."""
-    global NP, TN, SW_REC, SW_PITCH, SW_SLOT
-    saved = NP, TN, SW_REC, SW_PITCH, SW_SLOT
+    global NP, TN, SW_REC, SW_PITCH, SW_SLOT, SW_HALF
+    saved = NP, TN, SW_REC, SW_PITCH, SW_SLOT, SW_HALF
     NP, TN = n, 16 * n
     SW_REC = NP * 2 * 72
     SW_PITCH = 8
     SW_SLOT = SW_PITCH * SW_REC
+    SW_HALF = 512 * NP
     assert SW_SLOT >= 1024 * NP
     try:
         yield
     finally:
-        NP, TN, SW_REC, SW_PITCH, SW_SLOT = saved
+        NP, TN, SW_REC, SW_PITCH, SW_SLOT, SW_HALF = saved
 
 
 def h_col_stride(cfg):
@@ -450,10 +457,11 @@ def array_program(L, cfg):
     if cfg.rawdma:   # each filler's raw ring in its W ring (fuse_raw_ring), records [16 rows][RECROW bytes]
         e(f"  %firows = constant.u32 16 : reg<aie2p.array.scalar : index>")
         for c in range(cols):
-            e(f"  %fipitch{c} = constant.u32 {decoder(cfg.fmt, cfg.gord).RECROW} : reg<aie2p.array.scalar : index>")
+            cc = colcfg(cfg, c)
+            e(f"  %fipitch{c} = constant.u32 {decoder(cc.fmt, cc.gord).RECROW} : reg<aie2p.array.scalar : index>")
             for r in dict.fromkeys(list(fuse_cover(cfg, c)) + list(fuse_helpers(cfg, c))):
                 cov = fuse_dcov(cfg, c, r)
-                e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(cfg, cov)[0]} : reg<aie2p.array.scalar : index>")
+                e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(cc, cov)[0]} : reg<aie2p.array.scalar : index>")
                 e(f"  constrain.intake %chr{c}_{r}, %chw{c}_{r}, %fioff{c}_{r}, %firows, %fipitch{c}")
     # activations: one stream per row, one slab per record, multicast along the row (first branch rotates)
     for r in range(rows):
@@ -513,6 +521,13 @@ def array_program(L, cfg):
         e("  constrain.core_stream %chgs")
         e("  constrain.gate %chgs")
         e("  constrain.signal %chgs")
+    if fpair(cfg):   # pair_swap's rings: the gate tail's half of a C segment (f32), one slot, two records a segment
+        e(f"  %nxs = constant.u32 {2 * cfg.nb * MP} : reg<aie2p.array.scalar : index>")
+        for u in range(cols // 2):
+            e(f"  %xs{u} = sender %k{2 * u}_{rows - 1}, {PAIR_PORT} : reg<aie2p.array.sender : tile<{SW_HALF // 4}xi32>>")
+            e(f"  %xr{u} = receiver %k{2 * u + 1}_{rows - 1}, {PAIR_PORT} : reg<aie2p.array.receiver : tile<{SW_HALF // 4}xi32>>")
+            e(f"  %chx{u} = channel %xs{u}, %xr{u}, %one, %nxs : reg<aie2p.array.channel : tile<{SW_HALF // 4}xi32>>")
+            e(f"  constrain.leaf_sync %chx{u}")
     e("  return\n}\n")
 
 
@@ -570,12 +585,99 @@ def worker_leaf(cfg, c, r):
         name = "mid_l" if len(cov) > 1 else role   # the last mid also fills the tail's slice
     else:
         name = role + "_f" + "".join(map(str, cov)) + ("h" if h is not None else "")
+    if fpair(cfg) and c >= 0 and role == "tail":   # (pair_swap: the gate tail's half is its second)
+        name += "_xe" if c % 2 else "_xw"
+    elif fpair(cfg) and c >= 0 and c % 2 and (fuse_dcov(cfg, c, r) is not None or r in hs):   # (a decoder of ufmt)
+        name += "_u"
     return name + ("" if not gate else "_g" + gate[0] if cfg.fuse else "_g"), role, cov, gate
 
 
 def fuse_ports(role):
     """(egress port, core stream port) of a filling worker: after its A and W ports."""
     return 2, 3
+
+
+def fpair(cfg):
+    """Column pairs (Config.ufmt)."""
+    return bool(cfg.ufmt)
+
+
+def colcfg(cfg, c):
+    """Column c's config: a pair's up column decodes ufmt rows in ugord's order."""
+    return dataclasses.replace(cfg, fmt=cfg.ufmt, gord=cfg.ugord) if fpair(cfg) and c >= 0 and c % 2 else cfg
+
+
+def dec_tag(cfg):
+    """The inlined decoder's rodata name: a pair's up columns (colcfg) their own."""
+    return "inlu" if fpair(cfg) and cfg.fmt == cfg.ufmt else "inl"
+
+
+PAIR_PORT = 3   # pair_swap's ring port on both tails (after A, W and C)
+
+
+def pair_copy(e, y, src, dst, swap=False):
+    """SW_HALF bytes from scalar address src to dst, 256 bytes an iteration (4 64-byte loads, then their stores); swap:
+    both ways (dst's bytes to src)."""
+    ER = "reg<aie2p.er>"
+    t = y[1:]
+    e(f"  {y}n = mova.i32 {SW_HALF // 256}")
+    e(f"  {y}st = mov.i32 256")
+    e(f"  {y}i0 = mova.i32 0")
+    e(f"  low.br ^{t}l({y}i0: {ER}, {src}: {ER}, {dst}: {ER})")
+    e(f"^{t}l({y}i: {ER}, {y}s: {ER}, {y}d: {ER}):")
+    e(f"  {y}m = lt {y}i, {y}n")
+    e(f"  low.cond_br {y}m, ^{t}b, ^{t}x : {ER}")
+    e(f"^{t}b:")
+    e(f"  {y}sa = mov.scalar-to-address {y}s")
+    e(f"  {y}da = mov.scalar-to-address {y}d")
+    for q in range(4):
+        e(f"  {y}v{q} = vlda.512.i32x16 {y}sa, {64 * q}")
+        if swap:
+            e(f"  {y}u{q} = vldb.512.i32x16 {y}da, {64 * q}")
+    for q in range(4):
+        e(f"  vst.512.i32x16 {y}v{q}, {y}da, {64 * q}")
+        if swap:
+            e(f"  vst.512.i32x16 {y}u{q}, {y}sa, {64 * q}")
+    e(f"  {y}i1 = add.rr {y}i, %one")
+    e(f"  {y}s1 = add.rr {y}s, {y}st")
+    e(f"  {y}d1 = add.rr {y}d, {y}st")
+    e(f"  low.br ^{t}l({y}i1: {ER}, {y}s1: {ER}, {y}d1: {ER})")
+    e(f"^{t}x:")
+
+
+def pair_swap(e, pair, slot, tag):
+    """Column pairs: a finished C segment at scalar slot (gate slabs then up slabs of a single format's column) is
+    swapped half for half with the other tail's, so each holds a single format column's segment: the gate tail ("w")
+    gives its second two slabs (the gate rows of the features the up tail keeps) and takes the up tail's first two (the
+    up rows of its own features) in their place. One ring (in the gate tail's memory: the up tail reaches it through
+    its west window), two records a segment: the gate tail fills the first with its half, the up tail swaps it in place
+    for its own; the gate tail's second acquire (once the up tail released the first) reads the up half."""
+    x = f"%px{tag}"
+    e(f"  {x}sp = storage_address %pxst : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  {x}r = lda {x}sp, 0")
+    e(f"  acq %am1, {PAIR_PORT}")
+    if pair == "w":
+        e(f"  {x}k = mov.i32 {SW_HALF}")
+        e(f"  {x}h = add.rr {slot}, {x}k")
+        pair_copy(e, f"{x}0", f"{x}h", f"{x}r")
+        e(f"  rel %one, {PAIR_PORT}")
+        e(f"  acq %am1, {PAIR_PORT}")
+        pair_copy(e, f"{x}1", f"{x}r", f"{x}h")
+    else:
+        pair_copy(e, f"{x}0", f"{x}r", slot, swap=True)
+        e(f"  rel %one, {PAIR_PORT}")
+        e(f"  acq %am1, {PAIR_PORT}")
+    e(f"  rel %one, {PAIR_PORT}")
+
+
+def pair_park(e):
+    """Column pairs: the tail's swap ring (one slot) parked as a scalar in private storage (the tail's pointer registers
+    are spoken for)."""
+    e(f"  %pxp = resource<native_pointer> {{index = {PAIR_PORT}, source_type = buffer}} : reg<aie2p.ep>")
+    e("  %pxst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+    e("  %pxsp = storage_address %pxst : low.storage<private> -> reg<aie2p.ep>")
+    e("  %pxs = mov.address-to-scalar %pxp")
+    e("  st %pxs, %pxsp, 0")
 
 
 def fuse_groups(cfg):
@@ -755,22 +857,32 @@ def fuse_channels(e, cfg, panel):
     write binding, a lane per worker, is never transferred), and its column's raw stream, multicast over the column's
     filling core streams."""
     rows, cols = len(cfg.ks), cfg.cols
-    uw = fuse_unit_raw(cfg) // 4
     units = cfg.passes * NP
     e(f"  %fdb = binding {6 if cfg.gate else 3}, \"write\"")
     e(f"  %frb = binding {7 if cfg.gate else 4}, \"read\"")
     e(f"  %fdl = constant.u32 {rows * cols} : reg<aie2p.array.scalar : index>")
     e(f"  %fun = constant.u32 {units} : reg<aie2p.array.scalar : index>")
     # raw rows [N][kraw / 256][136]: per column, per (pass, slab) unit [16 rows][4 super-blocks]
-    BLK = fuse_blk(cfg)
-    RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * BLK // 4   # row stride in words
-    if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on; Q4K:
+    rstride = lambda cc: (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * fuse_blk(cc) // 4   # row stride in words
+    if fpair(cfg):   # pair u: [two feature groups (the gate tails' columns 2 u, 2 u + 1 of a single format's image)]
+        # [NP / 2 slabs]; the gate column's rows from %frb, the up column's (ufmt) from their own binding
+        assert cfg.swiglu and cfg.dfr and NP == 4 and cfg.hord in ("P4", "Q4K")
+        e(f"  %frbu = binding {8 if cfg.gate else 5}, \"read\"")
+        for up in (0, 1):
+            cc = colcfg(cfg, up)
+            BLK, RS, uw = fuse_blk(cc), rstride(cc), fuse_unit_raw(cc) // 4
+            gs, ss = (16, 32) if cfg.hord == "Q4K" else (cfg.swcol, 16)
+            e(f"  %fru_all{up} = sender {'%frbu' if up else '%frb'}, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x2x{NP // 2}x16x{uw // 16}xi32, "
+              f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {gs * RS}, {ss * RS}, {RS}, 1]>>>")
+    elif cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on; Q4K:
         # its 2 slabs 32 rows apart (fuse_rows)
         assert cfg.dgu % 4 == 0 and NP % 2 == 0 and cfg.hord in ("", "P4", "Q4K")
+        BLK, RS, uw = fuse_blk(cfg), rstride(cfg), fuse_unit_raw(cfg) // 4
         e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x2x{NP // 2}x16x{uw // 16}xi32, "
           f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {cfg.dgu // 4}, "
           f"{(32 if cfg.hord == 'Q4K' else 16) * RS}, {RS}, 1]>>>")
     else:
+        BLK, RS, uw = fuse_blk(cfg), rstride(cfg), fuse_unit_raw(cfg) // 4
         e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x{NP}x16x{uw // 16}xi32, "
           f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {16 * RS}, {RS}, 1]>>>")
     covs = list(fuse_cover(cfg, -1).values())   # an ordinary column's covers, then any other column's
@@ -782,11 +894,19 @@ def fuse_channels(e, cfg, panel):
         e(f"  %fdn{tag(cov)} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
         e(f"  %fd_all{tag(cov)} = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{rows * cols}x{nrec}x{fw}xi32>>")
     for c in range(cols):
-        # column c: rows TN c .. (swiglu: gate rows swcol c ..; Q4K: 64 (c / 2) + 16 (c % 2) ..)
-        r0 = (64 * (c // 2) + 16 * (c % 2) if cfg.swiglu and cfg.hord == "Q4K" else
-              c * (cfg.swcol if cfg.swiglu else TN))
-        e(f"  %fro{c} = constant.u64 {r0 * RS * 4} : reg<aie2p.array.offset : offset>")
-        e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
+        # column c: rows TN c .. (swiglu: gate rows swcol c ..; Q4K: 64 (c / 2) + 16 (c % 2) ..; pairs: pair c / 2's
+        # first gate rows, the up column's in its binding)
+        cc = colcfg(cfg, c)
+        uw = fuse_unit_raw(cc) // 4
+        if fpair(cfg):
+            r0 = 64 * (c // 2) if cfg.hord == "Q4K" else 2 * (c // 2) * cfg.swcol
+            e(f"  %fro{c} = constant.u64 {r0 * rstride(cc) * 4} : reg<aie2p.array.offset : offset>")
+            e(f"  %fru{c} = view.sender %fru_all{c % 2}, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
+        else:
+            r0 = (64 * (c // 2) + 16 * (c % 2) if cfg.swiglu and cfg.hord == "Q4K" else
+                  c * (cfg.swcol if cfg.swiglu else TN))
+            e(f"  %fro{c} = constant.u64 {r0 * RS * 4} : reg<aie2p.array.offset : offset>")
+            e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
         for r, cov in fuse_cover(cfg, c).items():
             dp, sp = fuse_ports("")
             fw, nrec = fuse_record(cfg, cov)
@@ -798,7 +918,7 @@ def fuse_channels(e, cfg, panel):
             ut = f"16x{uw // 16}"
             e(f"  %frr{c}_{r} = receiver %k{c}_{r}, {sp} : reg<aie2p.array.receiver : tile<{ut}xi32>>")
             if cfg.rawdma:   # staged in the column's memory tile; intake ring depth fuse_raw_ring
-                cap = fuse_raw_ring(cfg, fuse_dcov(cfg, c, r))[1]
+                cap = fuse_raw_ring(cc, fuse_dcov(cfg, c, r))[1]
                 e(f"  %chr{c}_{r} = channel %fru{c}, %frr{c}_{r}, %n{cap}, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
                 e(f"  constrain.stage %chr{c}_{r}, %n{c if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chr{c}_{r}")
@@ -818,7 +938,7 @@ def fuse_channels(e, cfg, panel):
             nrec = cfg.passes * NP * words // fw
             if h not in fuse_cover(cfg, c):   # (kchain: a filler's raw arrives through its own intake)
                 e(f"  %frr{c}_{h} = receiver %k{c}_{h}, {HELP_RAW} : reg<aie2p.array.receiver : tile<{ut}xi32>>")
-                cap = fuse_raw_ring(cfg, (h,))[1]
+                cap = fuse_raw_ring(cc, (h,))[1]
                 e(f"  %chr{c}_{h} = channel %fru{c}, %frr{c}_{h}, %n{cap}, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
                 e(f"  constrain.stage %chr{c}_{h}, %n{c if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chr{c}_{h}")
@@ -1081,7 +1201,7 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     # only the records (half super-blocks: 16 k-blocks) overlapping k0 .. k1: the egress reads nothing else
     rec = ((k0 - 32 * s0) // 16, -(-(k1 - 32 * s0) // 16)) if cfg.rskip else None
     assert D.OUT_B == 16 * 144
-    for ln in D.leaf_inline(nsb, "inl", vroll=bool((helper or "")[:1] == "M" and cfg.hvroll), tonce=tonce, rec=rec):
+    for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool((helper or "")[:1] == "M" and cfg.hvroll), tonce=tonce, rec=rec):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if cfg.rawdma:   # the raw record is consumed: back to the DMA, but for the last cap units (the panel follows them)
@@ -1438,7 +1558,7 @@ def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
     e("  low.br ^fzex")
 
 
-def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None):
+def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=None):
     e = L.append
     tail = role == "tail"
     fa = slab(ks)
@@ -1469,6 +1589,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None):
         e(f"  %gn1{rs} = resource<native_pointer> {{index = {gp['nbr']}, source_type = buffer}} : reg<aie2p.ep>")
     if tail:
         e(f"  %o{rs} = resource<native_pointer> {{index = 2, source_type = buffer}} : reg<aie2p.ep>")
+    if pair:
+        pair_park(e)
     early = fills   # the decoding fill first: nothing of the GEMM's lives across the decoder
     if gate:   # job state (private storage, zeroed by the setup): the first job's gate before any firing
         e("  %gst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
@@ -1617,7 +1739,13 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None):
                 e("  st %bnn, %cnp, 4")
     if gate:   # job state: private storage, zeroed by the array setup of a core stream plan
         e("  %gsp = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
-    body(L, cfg, role, ks, a_adv, acap, gate, fills, helper)
+    if pair:   # the deferred segment's swap, before its pushes
+        e("  low.cond_br %dfx, ^pxd, ^pxn : reg<aie2p.er>")
+        e("^pxd:")
+        pair_swap(e, pair, "%dss", "d")
+        e("  low.br ^pxn")
+        e("^pxn:")
+    body(L, cfg, role, ks, a_adv, acap, gate, fills, helper, pair)
 
 
 def gate_pace(e, p, pn1, out):
@@ -1863,7 +1991,7 @@ def gate_count(e, cfg, gate):
     e("  return")
 
 
-def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None):
+def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pair=None):
     """The locked stream: per sub-tile MMA + pop bundles, then the cascade boundary.
     head: chains start with mmul; after each sub-tile, 16 cascade writes (the next sub-tile's pops ride with them)
     mid:  mmul at k 0, then k 1-4 add the incoming partial quarter by quarter (fused cascade MMA); writes like the head
@@ -2322,6 +2450,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None):
                 e(f"^swb{t}:")
                 e(f"  {p}so = mul {p}k, {p}kslot")
                 e(f"  {p}ss = add.rr {p}ds, {p}so")
+                if pair:
+                    pair_swap(e, pair, f"{p}ss", f"w{t}")
             e(f"  {p}c = mova.i32 60")
 
             kn, kmemo, kch = [0], {}, [None]   # kmemo: a chain's constants, made once (per chain: sharing them
@@ -2739,14 +2869,16 @@ def gen(cfg):
         L.append(silu_rodata())
     if cfg.fuse:   # every worker's leaf, once (worker_leaf)
         if cfg.fuse == 2:   # the inlined decoder's tables (grid formats)
-            L.extend(decoder(cfg.fmt, cfg.gord).inline_rodata("inl"))
+            for cc in [cfg] + ([colcfg(cfg, 1)] if fpair(cfg) else []):
+                L.extend(decoder(cc.fmt, cc.gord).inline_rodata(dec_tag(cc)))
         seen = set()
         used = {worker_leaf(cfg, c, r)[0] for c in range(cfg.cols) for r in range(len(cfg.ks))}
         for c in [-1] + list(range(cfg.cols)):   # (-1: an ordinary column first: head, mid, mid_l, tail)
             for r in range(len(cfg.ks)):
                 name, role, cov, gate = (worker_leaf(cfg, c, r) if c >= 0 else
                                          (lambda w: (w[0], w[1], w[2], None))(worker_leaf(cfg, -1, r)))
-                if c < 0 and (cfg.thelp or cfg.kchain) and name not in used:   # (thelp: no column runs the unhelped last mid)
+                # (thelp: no column runs the unhelped last mid; pairs: every tail swaps)
+                if c < 0 and (cfg.thelp or cfg.kchain or fpair(cfg)) and name not in used:
                     continue
                 hs = fuse_helpers(cfg, c)
                 helper = "M" if r in hs else "H" if r in hs.values() else None
@@ -2756,7 +2888,8 @@ def gen(cfg):
                     cov = (r,)
                 if name not in seen:
                     seen.add(name)
-                    leaf(L, cfg, role, cfg.ks[r], gate=gate, cov=cov, name=name, helper=helper)
+                    pair = ("e" if c % 2 else "w") if fpair(cfg) and c >= 0 and role == "tail" else None
+                    leaf(L, colcfg(cfg, c), role, cfg.ks[r], gate=gate, cov=cov, name=name, helper=helper, pair=pair)
     else:
         leaf(L, cfg, "head", cfg.ks[0])
         leaf(L, cfg, "mid", cfg.ks[1])

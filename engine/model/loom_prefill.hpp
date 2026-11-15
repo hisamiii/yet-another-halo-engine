@@ -1101,7 +1101,9 @@ class LoomPrefill {
     // (a mixed pair of one untranscoded format, emit_prefill_pp SAME_SW_FMTS: up follows gate in the GGUF, like a
     // single format's)
     const bool xmix = mix && !bmix && (tx(f) || tx(fu));
-    if (mix && !bmix && !xmix && (std::strcmp(f.name, fu.name) || tu->offset != tg->offset + tg->bytes))
+    // (cpair: gate and up on column pairs, emit_prefill_pp NPU_COLPAIR: each from its own tensor's rows)
+    const bool cpair = mix && geom_.count("npuffncp_" + std::string(f.name) + "_" + fu.name) != 0;
+    if (mix && !bmix && !xmix && ((!cpair && std::strcmp(f.name, fu.name)) || tu->offset != tg->offset + tg->bytes))
       throw LoomError("prefill: " + pre + " mixed image without transcoded or contiguous rows");
     const bool xg = !bmix && (xmix || tx(f)), xu = !bmix && (xmix || tx(fu));
     // (the decoder binding the NPU's gate / up rows: bmix's BFP, iq2s's)
@@ -1128,7 +1130,7 @@ class LoomPrefill {
         npu_->RegisterRaw(pg + f0 * rb, 2 * M * rb - f0 * rb + 8192);
       } else {
         const std::size_t a = tg->offset + f0 * rb;
-        npu_->RegisterRaw(base + a, std::min(tu->offset + M * rb + 4096, end) - a);
+        npu_->RegisterRaw(base + a, std::min<std::size_t>(tu->offset + tu->bytes + 4096, end) - a);
       }
       npu_->RegisterRaw(pd, bd ? Nd * rbd + 8192 : std::min<std::size_t>(td->bytes + 4096, end - td->offset));
     }
@@ -1137,11 +1139,19 @@ class LoomPrefill {
     // F / 256 calls: call j's column c takes features 256 j + 32 c + [0, 32), its records at H k-blocks 32 j + 4 c ..
     // (gen_npu_gemm swcol 32)
     const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
-    for (std::uint32_t j = 0; j < F / 256; ++j)
+    const std::size_t rbu = tu->bytes / M;   // (cpair: up's row bytes)
+    const auto c_sw = [&](std::uint32_t j) { return NpuView{(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}; };
+    for (std::uint32_t j = 0; j < F / 256 && cpair; ++j)
+      csw.push_back(npu_->BindRawPair(sw + ".xdna", sw + ".xdna", 100 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
+                                      pg + (f0 + 256 * j) * rb, 255 * rb + 16 * blk + RecordRow(f.name),
+                                      base + tu->offset + (f0 + 256 * j) * rbu,
+                                      255 * rbu + 16 * (rbu * 256 / tu->dims[0]) + RecordRow(fu.name), c_sw(j),
+                                      "ffnsw" + hord));
+    for (std::uint32_t j = 0; j < F / 256 && !cpair; ++j)
       csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".xdna", mix && !bmix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(gdec), ag,
                                   pg + (f0 + 256 * j) * rb,
                                   dgu + 255 * rb + 16 * blk + RecordRow(gdec),
-                                  {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, "ffnsw" + hord));
+                                  c_sw(j), "ffnsw" + hord));
     // down: per K part, FfnBlkCalls() calls of FfnBlkRows() rows (a last one ending at the last row)
     const std::uint32_t rows = FfnBlkRows(), calls = FfnBlkCalls();
     const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c;
