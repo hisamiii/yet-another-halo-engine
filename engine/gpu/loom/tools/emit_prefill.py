@@ -106,7 +106,7 @@ def emit(loomfile, configs, outname, outdir, env=None, gate=None):
     text, _ = emit_hal.specialize(raw,
                                   {k.lstrip("@"): v for k, _, v in (c.partition("=") for c in configs)}, tgt)
     loomenv = sorted((k, v) for k, v in ce.items() if k.startswith("LOOM_"))
-    vspill = os.environ.get("YAH_VGPR_TRY_SPILL") if vtry else None
+    vspill = os.environ.get("YAH_VGPR_TRY_SPILL", "32") if vtry else None
     key = hashlib.sha256(repr((text, tgt, loomenv, _lc, sorted(UNBOUNDED.items())) + ((("vtry", vtry),) if vtry else ())
                               + ((("vspill", vspill),) if vspill else ())).encode()).hexdigest()
     dst = os.path.join(outdir, outname)
@@ -178,9 +178,10 @@ def _build(loomfile, text, tgt, ce, key, dst, seq, gate, vtry=None):
             r = None
             if vtry:
                 r = subprocess.run(cmd, env={**ce, "LOOM_EXP_BUDGET": "amdgpu.vgpr=" + vtry}, capture_output=True, text=True)
-                # YAH_VGPR_TRY_SPILL=N (experiment): keep the budgeted build with up to N bytes of spills
-                if (r.returncode != 0 or not os.path.exists(out)
-                        or _spills(out) > int(os.environ.get("YAH_VGPR_TRY_SPILL", "0"))):
+                # and up to YAH_VGPR_TRY_SPILL bytes of spills (default 32): the paired kres GEMMs spill their zero
+                # accumulator init at 192 (reloads at each outer pass, none in the inner loops) and still run ~6%
+                # faster than at 216 VGPRs (7 waves), as the old pin's 190-192 did; "0": no spills
+                if (r.returncode != 0 or not os.path.exists(out) or _spills(out) > int(vspill)):
                     r = None
             if r is None:
                 r = subprocess.run(cmd, env=ce, capture_output=True, text=True)
