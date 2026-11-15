@@ -70,10 +70,12 @@ XS2 = FMT == "IQ2_XS"
 # its halves' piece ids, the low half's in the first 32 bytes of each 64-byte line, the high half's in the second, 2
 # bytes an entry: one vldb.4x16 lane per half at 2-byte grain) and the pieces (IQ2_XS's hot loop reads their
 # addresses as it reads its grid's)
+# IQ2_XS: the same two levels over its 512 entries (2 KB), its ksigns table (IQ2_XXS's) at +2048, the pieces on page 1
 S2 = FMT == "IQ2_S"
-XSL = XS2 or S2                 # IQ2_XS's scale path and hot loop
+XSL = XS2 or S2                 # IQ2_XS's scale path and hot loop, the two-level grid
 SCOFF = 74 if S2 else 66        # XSL: the scale bytes
 S2SG, S2HM = 4096, 4096 + 256 + 21 * 64   # IQ2_S rodata: level-1 (page 0), signs, pieces (16 (16 + id)), qh masks
+PIDOFF = 16 if S2 else 0        # XSL: a piece's slot on page 1 (IQ2_S: after its signs)
 # Q3_K: no gathers. Per record (128 values: qs bits of half n, hmask bit 4 n + j) both halves' rows of [hmask 32 B |
 # qs 32 B] are transposed to [chunk][row][8 B] and nibble-unpacked to scratch (NIB); a fragment (k-block 4 j + c) is
 # then (qs nibble & crumb mask) | (hmask nibble & 1 << j) doubled into place, interleaved with a high byte 0x43 (j even:
@@ -137,37 +139,48 @@ def bf16_bits_np(v):
     return (np.asarray(v, np.float32).view(np.uint32) >> 16).astype(np.uint16)
 
 
+def ksign_table():
+    """IQ3_XXS / IQ2 signs by the 7-bit field f (ksigns(f) = f | parity(f) << 7): [f / 4][half][f % 4][4] bf16 masks."""
+    st = np.zeros((32, 2, 4, 4), np.uint16)
+    for f in range(128):
+        ks = f | ((bin(f).count("1") & 1) << 7)
+        for j in range(8):
+            st[f >> 2, j // 4, f & 3, j % 4] = 0x8000 if (ks >> j) & 1 else 0
+    return st
+
+
 def grid_rodata(name):
     """IQ3_S tables (4096-aligned rodata; a gather reads an 8-byte piece at (L & ~63) + (L & 63) / 2, +32 on odd lanes):
     grid 512 x [4 bf16] (both block halves), signs 256 x (masks of bits 0-3 | bits 4-7 in the two halves),
     qh bits 256 x [8 bytes 0 / 1] (both halves)."""
     hexs = lambda a: a.view(np.uint8).tobytes().hex()
-    if S2:
-        g8 = np.fromfile(os.path.join(TABLES, "grid_iq2s.bin"), np.uint8).reshape(1024, 8)
+    if XSL:
+        n_ = 1024 if S2 else 512
+        g8 = np.fromfile(os.path.join(TABLES, "grid_iq2s.bin" if S2 else "grid_iq2xs.bin"), np.uint8).reshape(n_, 8)
         dig = np.searchsorted(np.array([8, 25, 43]), g8)                 # {8, 25, 43} -> 0, 1, 2
         assert np.all(np.array([8, 25, 43])[dig] == g8)
         pid = dig[:, 0:4] @ np.array([1, 3, 9, 27]), dig[:, 4:8] @ np.array([1, 3, 9, 27])
-        l1 = np.zeros((64, 2, 16), np.uint16)                            # [line][half][entry]: 16 + piece id
+        l1 = np.zeros((n_ // 16, 2, 16), np.uint16)                      # [line][half][entry]: PIDOFF + piece id
         for h_ in range(2):
-            l1[np.arange(1024) >> 4, h_, np.arange(1024) & 15] = 16 + pid[h_]
-        st = np.zeros((4, 2, 4, 4), np.uint16)                           # IQ3_S's signs by nibble
-        for n in range(16):
-            for v in range(4):
-                st[n >> 2, :, n & 3, v] = 0x8000 if (n >> v) & 1 else 0
-        pc = np.zeros((21, 2, 4, 4), np.uint16)                          # piece p at 16 (16 + p): both halves
+            l1[np.arange(n_) >> 4, h_, np.arange(n_) & 15] = PIDOFF + pid[h_]
+        if S2:
+            st = np.zeros((4, 2, 4, 4), np.uint16)                       # IQ3_S's signs by nibble
+            for n in range(16):
+                for v in range(4):
+                    st[n >> 2, :, n & 3, v] = 0x8000 if (n >> v) & 1 else 0
+        else:
+            st = ksign_table()
+        pc = np.zeros((21, 2, 4, 4), np.uint16)                          # piece p at 16 (PIDOFF + p): both halves
         for p in range(81):
             pc[p >> 2, :, p & 3] = bf16_bits_np(np.array([8, 25, 43])[[(p // 3 ** i) % 3 for i in range(4)]] / 8)
+        if not S2:
+            return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(l1)}{hexs(st)}{hexs(pc)}")']
         hm = np.array([1 << (2 * (i // 16) + i % 2) for i in range(64)], np.uint8)   # IQ3_S's qh bit masks
         return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(l1)}{hexs(st)}{hexs(pc)}{hexs(hm)}")']
-    if XXS or XS2:
+    if XXS:
         # IQ3_XXS: grid / 4 (T = d (2 s + 1)), 256 entries; signs by the 7-bit field f: ksigns(f) = f | parity(f) << 7
-        gt = np.zeros((128 if XS2 else 64, 2, 4, 4), np.uint16)
-        if XS2:                                     # IQ2_XS: as IQ2_XXS, 512 entries
-            g8 = (np.fromfile(os.path.join(TABLES, "grid_iq2xs.bin"), np.uint8).reshape(512, 8) / 8).astype(np.float32)
-            for idx in range(512):
-                for h_ in range(2):
-                    gt[idx >> 2, h_, idx & 3] = bf16_bits_np(g8[idx, 4 * h_:4 * h_ + 4])
-        elif X2:                                      # IQ2_XXS: grid / 8, entry idx's values 4 h .. 4 h + 3 in half h
+        gt = np.zeros((64, 2, 4, 4), np.uint16)
+        if X2:                                      # IQ2_XXS: grid / 8, entry idx's values 4 h .. 4 h + 3 in half h
             g8 = (np.fromfile(os.path.join(TABLES, "grid_iq2xxs.bin"), np.uint8).reshape(256, 8) / 8).astype(np.float32)
             for idx in range(256):
                 for h_ in range(2):
@@ -176,16 +189,10 @@ def grid_rodata(name):
             grid = (grid_table("grid_iq3xxs.bin", 256) / 4).astype(np.float32)
             for idx in range(256):
                 gt[idx >> 2, :, idx & 3] = bf16_bits_np(grid[idx])
-        st = np.zeros((32, 2, 4, 4), np.uint16)
-        for f in range(128):
-            ks = f | ((bin(f).count("1") & 1) << 7)
-            for j in range(8):
-                st[f >> 2, j // 4, f & 3, j % 4] = 0x8000 if (ks >> j) & 1 else 0
-        if GMIX:   # the sign table its own object, in another bank
-            return [f'global.rodata.def @gt_{name} = align(4096) conflicts([@gs_{name}]) bytes("{hexs(gt)}")',
-                    f'global.rodata.def @gs_{name} = align(64) conflicts([@gt_{name}]) bytes("{hexs(st)}")']
-        # IQ2_XS: one object, the sign table on the pages after the grid's
-        return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(gt)}{hexs(st)}")']
+        st = ksign_table()
+        # the sign table its own object, in another bank
+        return [f'global.rodata.def @gt_{name} = align(4096) conflicts([@gs_{name}]) bytes("{hexs(gt)}")',
+                f'global.rodata.def @gs_{name} = align(64) conflicts([@gt_{name}]) bytes("{hexs(st)}")']
     # IQ3_S: the grid's 2 pages and the qh bit masks [kb 4][row 8][e 2] = 1 << (2 kb + e); in another bank the signs by
     # nibble n (even lanes: the low nibble -> values 0-3, odd lanes: the high nibble -> values 4-7: both halves alike)
     grid = grid_table("grid_iq3s.bin", 512).astype(np.float32)
@@ -391,10 +398,10 @@ def leaf(name="dec"):
             e(f"%gq1 = vbcst.32 {k(1)}")
             e(f"%gqp = vshuffle %gq0, %gq1, {k(14)}")
             e("%gmk = vlt.u32x16.el.low32 %gqp, %gq1")
-        else:      # IQ2_XS: the sign table on the pages after the grid's (grid_rodata); IQ2_S: on the next page
-            e(f"%stc = add.rr %gtc, {k(1 if S2 else 2)}")
-        if S2:
-            e(f"%gsa = add.rr %gta, {k(S2SG)}")
+        else:      # IQ2_XS, IQ2_S: the pieces on the page after level-1's (grid_rodata)
+            e(f"%stc = add.rr %gtc, {k(1)}")
+        if XSL:    # the sign table
+            e(f"%gsa = add.rr %gta, {k(S2SG if S2 else 2048)}")
             e(f"%sb4 = lshl %gsa, {k(-4)}")
         if not (XXS or XS2):
             e(f"%hma = add.rr %gta, {k(S2HM if S2 else 8192)}")      # IQ3_S, IQ2_S: the qh bit masks
@@ -1153,9 +1160,10 @@ def leaf(name="dec"):
             if not XXS:
                 e("%csl = vbcst.8 %sb4")                       # IQ3_S: the sign table's address bits 8-11, << 4
         e("%sh4 = mov.shift 4")
-        if S2:
+        if XSL:
             e("%sh2 = mov.shift 2")
-            e(f"%l1c = lshl %gtc, {k(2)}")                    # the level-1 page << 2: an index's high byte
+            if S2:
+                e(f"%l1c = lshl %gtc, {k(2)}")                # the level-1 page << 2: an index's high byte
             e(f"%pcc = lshl %stc, {k(8)}")                    # the pieces' page << 8
 
         anp = {}                                        # per table: the pointer walking its rows (post-increment)
@@ -1269,6 +1277,38 @@ def leaf(name="dec"):
                 SV.append(sv_)
             return SV
 
+        def l1_store(x, du, pcv, kbs, hh, own):
+            """IQ2_S, IQ2_XS: u16 (level-1 page << 10 | index) [kb 2][row][dup] -> << 2 level-1 addresses; 4 vldb.4x16 a
+            k-block -> [row][low, high piece] (first u16 of each lane, mode 24); | pieces' page << 8, << 4 -> the grid
+            addresses of k-blocks kbs, stored to their grid slots."""
+            ua = x.t("ia")
+            x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh2")
+            ids = []
+            for q2 in range(2):
+                q1, av = x.t("il"), x.t("iv")
+                x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
+                x(f"{av} = vmov.accumulator512.to.vector512 {q1}")
+                gc = []
+                for hf_ in range(2):
+                    a1, gl, gh, c2 = x.t("ia1"), x.t("igl"), x.t("igh"), x.t("igc")
+                    x(f"{a1} = slice {av}[{hf_}] : {V2} -> {V1}")
+                    x(f"{gl} = vldb.4x16.lo {a1}")
+                    x(f"{gh} = vldb.4x16.hi {a1}")
+                    x(f"{c2} = concat({gl}, {gh}) : ({V1}, {V1}) -> {V2}")
+                    gc.append(c2)
+                t_, tl = x.t("it"), x.t("itl")
+                x(f"{t_} = vshuffle {gc[0]}, {gc[1]}, {km(24)}")   # [row][low, high]: PIDOFF + id
+                x(f"{tl} = slice {t_}[0] : {V2} -> {V1}")
+                ids.append(tl)
+            iv2, pa_, ua2 = x.t("iw"), x.t("ip"), x.t("ig")
+            x(f"{iv2} = concat({ids[0]}, {ids[1]}) : ({V1}, {V1}) -> {V2}")
+            x(f"{pa_} = vbor {iv2}, {pcv}")
+            x(f"{ua2} = vups.2x.x-to-c.unsigned {pa_}, %sh4")
+            for q2 in range(2):
+                q1 = x.t("ga")
+                x(f"{q1} = slice {ua2}[{q2}] : {M2} -> {M1}")
+                gst(x, q1, 2048 * hh + 256 * gpair(kbs[q2]) + 64 * gpos(kbs[q2]), own=own)
+
         def sign_addresses(hh):
             """IQ3_S, IQ2_S signs: [row][16 B] -> [kb][row] bytes; (page_s << 8 | nibble) twice -> GA; its streams."""
             rsg = []
@@ -1335,52 +1375,28 @@ def leaf(name="dec"):
                         u_ = x.t("iu")
                         x(f"{u_} = vshuffle {QV[i]}, {hc2}, {km(md)}")
                         for h2, md2 in enumerate((18, 19)):
-                            du, ua = x.t("id"), x.t("ia")
+                            du = x.t("id")
                             x(f"{du} = vshuffle {u_}, {u_}, {km(md2)}")   # [kb 2][row][dup]
-                            x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh2")
-                            ids = []
-                            for q2 in range(2):
-                                q1, av = x.t("il"), x.t("iv")
-                                x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
-                                x(f"{av} = vmov.accumulator512.to.vector512 {q1}")
-                                gc = []
-                                for hf_ in range(2):
-                                    a1, gl, gh, c2 = x.t("ia1"), x.t("igl"), x.t("igh"), x.t("igc")
-                                    x(f"{a1} = slice {av}[{hf_}] : {V2} -> {V1}")
-                                    x(f"{gl} = vldb.4x16.lo {a1}")
-                                    x(f"{gh} = vldb.4x16.hi {a1}")
-                                    x(f"{c2} = concat({gl}, {gh}) : ({V1}, {V1}) -> {V2}")
-                                    gc.append(c2)
-                                t_, tl = x.t("it"), x.t("itl")
-                                x(f"{t_} = vshuffle {gc[0]}, {gc[1]}, {km(24)}")   # [row][low, high]: 16 + id
-                                x(f"{tl} = slice {t_}[0] : {V2} -> {V1}")
-                                ids.append(tl)
-                            iv2, pa_, ua2 = x.t("iw"), x.t("ip"), x.t("ig")
-                            x(f"{iv2} = concat({ids[0]}, {ids[1]}) : ({V1}, {V1}) -> {V2}")
-                            x(f"{pa_} = vbor {iv2}, {pcv}")
-                            x(f"{ua2} = vups.2x.x-to-c.unsigned {pa_}, %sh4")
-                            for q2 in range(2):
-                                q1 = x.t("ga")
-                                kb_ = 8 * i + 4 * part + 2 * h2 + q2
-                                x(f"{q1} = slice {ua2}[{q2}] : {M2} -> {M1}")
-                                gst(x, q1, 2048 * hh + 256 * gpair(kb_) + 64 * gpos(kb_), own=True)
+                            l1_store(x, du, pcv, [8 * i + 4 * part + 2 * h2 + q2 for q2 in range(2)], hh, True)
                 anq.extend(rq)
                 anq.extend(sign_addresses(hh))
                 continue
             if XS2:
-                # IQ2_XS record r: 8 rows' u16 words (k-blocks 2 w, 2 w + 1) transposed; grid index (9 bit, + page << 8:
-                # the 8 KB table crosses a page) and sign field (7 bit, | page << 8) per k-block -> addresses
+                # IQ2_XS record r: 8 rows' u16 words (k-blocks 2 w, 2 w + 1) transposed; grid index (9 bit, + level-1
+                # page << 10: l1_store) and sign field (7 bit, | the sign table / 16) per k-block -> addresses
                 x = e.stream()
                 sx = [x]
                 xa = x.t("xra")
                 x(f"{xa} = add.rr %goq, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %goq, {k(0)}")
                 O = aux_words(x, xa, rmod=anmod(ROWB - 64))
                 cvs = {}
-                for kind, page_ in (("g", "%gtc"), ("s", "%stc")):
-                    cw_, cv_ = x.t("cw"), x.t("cv")
-                    x(f"{cw_} = lshl {page_}, {k(8)}")
-                    x(f"{cv_} = vbcst.16 {cw_}")
-                    cvs[kind] = cv_
+                cw_, cv_ = x.t("cw"), x.t("cv")
+                x(f"{cw_} = lshl %gtc, {k(10)}")
+                x(f"{cv_} = vbcst.16 {cw_}")
+                cvs["g"] = cv_
+                cvs["s"], pcv = x.t("cv"), x.t("pcv")
+                x(f"{cvs['s']} = vbcst.16 %sb4")
+                x(f"{pcv} = vbcst.16 %pcc")
                 for a_ in range(2):                             # words 4 a .. 4 a + 3
                     for e_ in range(2):                         # the u16 of k-block 2 w + e
                         x = e.stream()                          # a stream per field
@@ -1394,15 +1410,18 @@ def leaf(name="dec"):
                             u_ = x.t("su")
                             x(f"{u_} = {'vadd.16' if kind == 'g' else 'vbor'} {f_}, {cvs[kind]}")
                             for h2, md2 in enumerate((18, 19)):
-                                du, ua = x.t("sd"), x.t("sa")
+                                du = x.t("sd")
                                 x(f"{du} = vshuffle {u_}, {u_}, {km(md2)}")    # [w 2][row][dup]
+                                kbs = [2 * (4 * a_ + 2 * h2 + q2) + e_ for q2 in range(2)]
+                                if kind == "g":
+                                    l1_store(x, du, pcv, kbs, hh, False)
+                                    continue
+                                ua = x.t("sa")
                                 x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh4")
                                 for q2 in range(2):
                                     q1 = x.t("sg")
-                                    kb_ = 2 * (4 * a_ + 2 * h2 + q2) + e_
                                     x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
-                                    gst(x, q1, 2048 * hh + 256 * gpair(kb_) + (128 if kind == "s" else 0) +
-                                        64 * gpos(kb_))
+                                    gst(x, q1, 2048 * hh + 256 * gpair(kbs[q2]) + 128 + 64 * gpos(kbs[q2]))
                 anq.extend(sx)
                 continue
             if X2:

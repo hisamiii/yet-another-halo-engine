@@ -766,10 +766,10 @@ IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX")
 # on the GGUF rows, no pre-decoded copy (Q3_K's with its record realign rolled: npu_images' q3roll fallback)
 NPU_SAME_SW = ("q5k", "q3k", "iq2s")
 # gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
-# tensor's rows (IQ3_S's transcoded, npu_ix4_<tensor>.bin), the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>",
-# dispatch rows "npuffncp_<gate>_<up>"); not two formats of IQ4_XS's decoder (one image, kv2). IQ2_XS's grid tables do
-# not place.
-NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s")
+# tensor's rows (IQ3_S / IQ3_XXS's transcoded, npu_ix4_<tensor>.bin), the tails swap halves;
+# "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>"); not two formats of IQ4_XS's decoder (one image,
+# kv2)
+NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s", "iq2xs")
 # The other pairs' gate / up rows (the NPU's) are pre-decoded to bfp16 (bfp_pair_rows: npu_bfp_<prefix>ffn_gate_up.bin),
 # one BFP image like a single format's with the deferred epilogue ("npu_ffnsw_bfp_<hord>", dispatch rows
 # "npuffnbx_<gate>_<up>"). Site tensors of a format without an NPU decoder (IQ4_NL, Q2_K attn_q) take their NPU rows
