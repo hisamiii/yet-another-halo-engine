@@ -277,7 +277,7 @@ QNORM = os.environ.get("YAH_QNORM", "1") == "1"   # gen_attn_fa QNORM: the atten
 # bits ("u16", gen_gemm_tile KQG_GSIG), the attention multiplies (gen_attn_fa GSIG): half the gate bytes, no exp /
 # reciprocal in the attention epilogue. Gate N (KL 1.07e-6); attention busiest SQ 71.6 -> 73.8% of floor at depth 0,
 # +0.2 at 8K, even at 64K; pp2048 attention -3.1%, kqg -0.3% (half the stores). Only where the kqg GEMM writes every
-# gate row: not with the NPU's q rows or half sets. dispatch.txt "gsig"
+# gate row: not with the NPU's q rows. dispatch.txt "gsig"
 GSIG = os.environ.get("YAH_GSIG", "u16")
 GSIG = "" if GSIG == "0" else GSIG
 # QSPLIT (YAH_QSPLIT=1; with the u16 gate, GPU q rows): the kqg GEMM stores q as f16(q w / 16) plus the raw rotary dims
@@ -785,15 +785,6 @@ def npu_cfg(B, ks, passes, **kw):
     """A fused NPU image's gen_npu_gemm config: gated, its gate's waiter and relay at a job's first firing (the setup
     runs no call, so an image switch inside a command costs no dummy call; dispatch.txt "npugfirst")."""
     return GN.Config(NPU_COLS, B // 64, ks, passes, mu=1, gate=GN.GATE_SUPPLY, gwest=1, ghelp=1, fuse=2, **kw)
-
-
-# Token halves (LoomPrefill halves): the qkv / q and out jobs and their GPU chains run per half of the chunk, so the NPU works during the DeltaNet / attention chain.
-# main emits the set at half the chunk into "<outdir>/h" (YAH_EMIT_HALF=1: only what the halves run); the FFN block's unpack and norm get "_h<i>" forms for half i's tokens.
-EMIT_HALF = os.environ.get("YAH_EMIT_HALF") == "1"
-
-
-def npu_halves(B):
-    return B % 128 == 0 and bool({"qkv", "q", "out"} & set(NPU_SPLIT))
 
 
 NPU_COLS = 8
@@ -1314,38 +1305,34 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                      "npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower()), 4))
     # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each)
     N, calls = 5120, -(-5120 // rows)
-    # token halves (LoomPrefill halves): "_h<i>" unpacks half i's tokens of the same C
-    for name, tr in (("npu_unpack_ffnblk", None),) + tuple(("npu_unpack_ffnblk_h%d" % h, (h * B // 2, B // 2))
-                                                            for h in range(2) if npu_halves(B)):
-        cg = GU.CG
-        GU.CG = 1
-        try:
-            with GN.np_override(4):
-                text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
-                              dup=((calls - 1) * NPU_COLS, N - rows), trange=tr)
-                nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
-        finally:
-            GU.CG = cg
-        src = os.path.join(tmp, name + ".loom")
-        open(src, "w").write(text)
-        E.emit(src, ["nop=0"], name + ".hal", outdir)
-        out.append((name + ".hal", (tr[1] if tr else B) * calls * NPU_COLS * nj // wg, wg, 0))
+    name = "npu_unpack_ffnblk"
+    cg = GU.CG
+    GU.CG = 1
+    try:
+        with GN.np_override(4):
+            text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
+                          dup=((calls - 1) * NPU_COLS, N - rows))
+            nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
+    finally:
+        GU.CG = cg
+    src = os.path.join(tmp, name + ".loom")
+    open(src, "w").write(text)
+    E.emit(src, ["nop=0"], name + ".hal", outdir)
+    out.append((name + ".hal", B * calls * NPU_COLS * nj // wg, wg, 0))
     # gate / up read their activations in one replay group: the norm before them writes that stream (fragment-major)
     import gen_half_norm
     groups, perm = GE.GROUPS, GE.ACT_PERM
     dfrs = sorted({j[0].fmt for j in jobs if j[0].dfr})
-    # "_h<i>": half i's rows (token halves), into the whole chunk's stream
     for name, ks in (("norm_t_bfp_g1", NPU_KS),) + ((("norm_t_bfp_g1s", NPU_DFR_KS),) if dfrs else ()):
-        for sfx, part in (("", None),) + tuple(("_h%d" % h, (h * B // 2, B // 2)) for h in range(2) if npu_halves(B)):
-            GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
-            try:
-                src = os.path.join(tmp, name + sfx + ".loom")
-                open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
-                                                             bfp=(B, list(ks), NPU_PASSES), bfp_part=part))
-            finally:
-                GE.GROUPS, GE.ACT_PERM = groups, perm
-            E.emit(src, ["yah_half_norm.rows=%d" % (part[1] if part else B), "yah_half_norm.dim=5120",
-                         "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"], name + sfx + ".hal", outdir)
+        GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
+        try:
+            src = os.path.join(tmp, name + ".loom")
+            open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
+                                                         bfp=(B, list(ks), NPU_PASSES)))
+        finally:
+            GE.GROUPS, GE.ACT_PERM = groups, perm
+        E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
+                     "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"], name + ".hal", outdir)
     for fmt in NPU_DFR_FMTS:
         if gu_fmt(fmt) in dfrs:
             out.append(("npuffndfr_" + fmt, 1, 0, 0))
@@ -1451,7 +1438,7 @@ def main():
     TT = B // TILE
     # An NPU call replays each memory-tile W panel once per 64-token M block: past 63 (B > 4032) the HRX pair-replay
     # patch counts replay pairs, whose twin descriptors fit the memory tile only with one replay group per call (set in
-    # the environment too: the half set's child emit keeps the same groups)
+    # the environment too: the calibration menu's worker processes keep the same groups)
     import gen_bfp16_encode as GE0
     if B // 64 > 63 and not os.environ.get("YAH_NPU_GROUPS"):
         os.environ["YAH_NPU_GROUPS"] = str(NPU_PASSES)
@@ -1472,7 +1459,7 @@ def main():
     # kv8 inputs, native kld_ref 0.0164 = exact
     if "R2P_LAZY" not in os.environ:
         gen_attn_fa.R2P_LAZY = 5.0
-    GSIG_ON = bool(GSIG) and not (EMIT_HALF or "q" in NPU_SPLIT)
+    GSIG_ON = bool(GSIG) and "q" not in NPU_SPLIT
     if GSIG_ON:
         import gen_gemm_tile
         assert GSIG in ("u16", "16", "32"), GSIG
@@ -1487,10 +1474,7 @@ def main():
 
     n = 0
     geom = []  # (<hal>, <tokens per workgroup>, <row groups>, <token_tiles>)
-    if EMIT_HALF:   # a half set: no GEMMs of its own (the NPU split's GPU shares come from npu_split)
-        NPU_FFNBLK = 0
-        assert T % (2 * B) == 0
-    for kind, fmt, port, mt, kb in sorted(combos) if not EMIT_HALF else ():
+    for kind, fmt, port, mt, kb in sorted(combos):
         name = lambda k: "gemm_%s_%s_%d_%d.hal" % (k, fmt, mt, kb)
         # A residual projection gets a kstore and the fused-residual kres; the attention q projection (12288 rows =
         # 24 heads x [q | gate]) also gets kqg, which stores q and gate unpacked. The driver prefers kres and kqg.
@@ -1512,10 +1496,9 @@ def main():
                 raise SystemExit("no GEMM kernel for %s %s (%d rows, K = %d)" % (fmt, k, mt * 16, kb * qk_of(fmt)))
         n += 1
 
-    if not EMIT_HALF:
-        geom.extend(ffn_fused(rows, B, outdir))
-        geom.extend(kst2(rows, B, outdir))
-        geom.extend(seg_gemms(rows, B, outdir))
+    geom.extend(ffn_fused(rows, B, outdir))
+    geom.extend(kst2(rows, B, outdir))
+    geom.extend(seg_gemms(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
         import gen_bfp16_encode as GE
         import gen_npu_unpack as GU
@@ -1563,8 +1546,8 @@ def main():
     # One attention kernel at every depth: the persistent kernel (gen_attn_fa PERSIST, YAH_ATTN_PERSIST=<slots>, 80; 0:
     # the grid kernel), workgroups running whole units, bit-identical; dispatch.txt "persist_<hal> <slots> 1 <dyn>" rows.
     # Busiest SQ % of floor 11-03: 82.7 / 85.4 / 85.8 / 85.8 at 16K / 32K / 96K / 124K, where the 3-workgroup twins it
-    # replaced (KT2, PAIR "deep") ran 75-77 / 73. Not half sets (the grid kernel: 85.0% to 96K, 73.2% at 124K).
-    persist = 0 if EMIT_HALF else int(os.environ.get("YAH_ATTN_PERSIST", str(320 // gen_attn_fa.NQB)))   # 20 WGPs x 4 (2x64: x 2)
+    # replaced (KT2, PAIR "deep") ran 75-77 / 73.
+    persist = int(os.environ.get("YAH_ATTN_PERSIST", str(320 // gen_attn_fa.NQB)))   # 20 WGPs x 4 (2x64: x 2)
     MAIN_FLAGS = dict(MAXNN=True, SUM0=True, EPI_FAST=True, CTX16=B % 16 == 0, QB_ZIGZAG=not persist, PERSIST=persist, PV_FENCE=True,
                       R2P=os.environ.get("YAH_ATTN_R2P", "1") != "0", PRO_FAST=os.environ.get("YAH_ATTN_PROF", "1") != "0")
     # YAH_ATTN_PREV=1 (with PERSIST): half the slots run their snake rounds in reverse (gen_attn_fa PERSIST_REV):
@@ -1634,10 +1617,6 @@ def main():
     attn_c0_src = write_c0(attn_src, os.path.join(tmp, "yah_attn_hip_c0.loom"))
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
     af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
-    if EMIT_HALF:   # the whole set's (its o-projections' afrag forms)
-        af24 = B % AF_TILE["bn"] == 0 and any(
-            AF.get((fmt, "kres", mt, kb)) is not None for kind, fmt, port, mt, kb in combos
-            if kind == "residual" and (mt, kb) == (320, 24))
     attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
     attn_t_c0_src = attn_t_src
     if af24:
@@ -1693,7 +1672,7 @@ def main():
     npu_kv = int(os.environ.get("YAH_NPU_ATTN", "0"))
     npu_from = NCH
     if ks_from < NCH:
-        assert w64_from <= ks_from and pdyn and not EMIT_HALF
+        assert w64_from <= ks_from and pdyn
         gen_attn_fa.configure(2, 64)
         MAIN_FLAGS["PERSIST"] = persist64
         gen_attn_fa.KSPLIT = 5
@@ -1826,7 +1805,7 @@ def main():
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
     assert 640 in O16_MT and B % gen_conv_kq.TB == 0
-    dn_vconv = DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT and not EMIT_HALF
+    dn_vconv = DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT
     if dn_vconv:
         text = gen_conv_kq.gen(4096)
         geom.append(("dnvconv", gen_conv_kq.tiles(4096), 0, 0))
@@ -2101,8 +2080,6 @@ def main():
                 not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
-    if EMIT_HALF:   # the DeltaNet / attention chain of a half (the norms, unpacks and conv halves come from npu_split)
-        fixed = [f for f in fixed if f[1].startswith(("prepab", "rowsplit", "postnorm", "rope", "vtpage", "wmma"))]
     persist_rows, ks_rows = [], []
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
@@ -2136,7 +2113,7 @@ def main():
                 fh.write("npuattn %d %d %d\n" % (npu_kv, npu_nbs, npu_from))
 
     tables = os.path.join(E.LOOM, "tables")
-    for src, dst in [] if EMIT_HALF else [("grid_iq3s.bin", "grid_iq3s.bin"),
+    for src, dst in [("grid_iq3s.bin", "grid_iq3s.bin"),
                      ("grid_iq3xxs.bin", "grid_iq3xxs.bin"),
                      ("grid_iq2xxs.bin", "grid_iq2xxs.bin"),
                      ("grid_iq2xs.bin", "grid_iq2xs.bin"),
@@ -2146,13 +2123,6 @@ def main():
     E.wait()
     print("emitted %d GEMM + fixed prefill HALs for B=%d (tile=%d, token_tiles=%d)"
           % (n, B, TILE, TT))
-    if npu_halves(B) and not EMIT_HALF:
-        # the halves run the plain 2 x 32 attention per half chunk (LoomPrefill RunAttentionHalves): no 2 x 64, key
-        # split or NPU attention forms
-        drop = {"YAH_NPU_FFNBLK", "YAH_ATTN_W64", "YAH_ATTN_KSPLIT", "YAH_NPU_ATTN", "YAH_NPU_ATTN_FROM"}
-        env = {k: v for k, v in os.environ.items() if k not in drop}
-        env.update(YAH_EMIT_HALF="1", YAH_CTX=str(T))
-        subprocess.run([sys.executable, os.path.abspath(__file__), model, os.path.join(outdir, "h"), str(B // 2)], env=env, check=True)
 
 
 if __name__ == "__main__":
