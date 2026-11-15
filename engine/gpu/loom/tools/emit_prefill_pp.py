@@ -1313,12 +1313,27 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
                           dup=((calls - 1) * NPU_COLS, N - rows))
             nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
+            # the same sum fused into the next layer's norm when it feeds a K = 5120 NPU site ("npu_unorm[_pk].hal",
+            # gen_half_norm.gen_unorm: the norm_bfp stream, with _pk also the Q4_K-order one); needs the last down call's
+            # overlap to keep whole NPU columns (rows a multiple of 5120 / calls)
+            import gen_half_norm
+            unorm = {}
+            if {"qkv", "q"} & set(NPU_SPLIT) and (N - rows) == (calls - 1) * NPU_COLS * GN.TN:
+                for pk in (False, True):
+                    unorm["npu_unorm%s.hal" % ("_pk" if pk else "")] = gen_half_norm.gen_unorm(
+                        B, list(NPU_KS), NPU_PASSES, len(parts), pk)
     finally:
         GU.CG = cg
     src = os.path.join(tmp, name + ".loom")
     open(src, "w").write(text)
     E.emit(src, ["nop=0"], name + ".hal", outdir)
     out.append((name + ".hal", B * calls * NPU_COLS * nj // wg, wg, 0))
+    for hal, text in unorm.items():
+        src = os.path.join(tmp, hal[:-4] + ".loom")
+        open(src, "w").write(text)
+        E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                     "yah_half_norm.fused=0"], hal, outdir)
+        out.append((hal, B // 4, 32 * 4 * 4, 0))   # gen_unorm: 4 rows x split 4
     # gate / up read their activations in one replay group: the norm before them writes that stream (fragment-major)
     import gen_half_norm
     groups, perm = GE.GROUPS, GE.ACT_PERM

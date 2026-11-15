@@ -399,6 +399,7 @@ class LoomPrefill {
     Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
              {EmbedTable(), Ref(*ids_), Ref(*hidden_)}, 4);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) RecordLayer(l, ci, hook);
+    FlushFfn();
   }
   void RecordLayer(std::uint32_t l, std::uint32_t ci, const KvHook& hook) {
     const std::string pre = "blk." + std::to_string(l) + ".";
@@ -410,11 +411,11 @@ class LoomPrefill {
       const bool k_af = Af("gemm_kstore", pre + "attn_k.weight");
       const bool v_af = Af("gemm_kstore", pre + "attn_v.weight");
       const bool q_npu = NpuRows("q") && NpuOk(pre + "attn_q.weight") && !NpuHal(KqgHal(pre + "attn_q.weight", q_af)).empty();
-      RunNorm(pre + "attn_norm.weight",
-              q_af && k_af && v_af   ? NormOut::kTiled
-              : q_af || k_af || v_af ? NormOut::kBoth
-                                     : NormOut::kRow,
-              q_npu ? "q" : nullptr);
+      RunLayerNorm(pre + "attn_norm.weight",
+                   q_af && k_af && v_af   ? NormOut::kTiled
+                   : q_af || k_af || v_af ? NormOut::kBoth
+                                          : NormOut::kRow,
+                   q_npu ? "q" : nullptr, q_npu && NpuPk(pre + "attn_q.weight"));
       RunAttention(l, ci, pre, hook, q_af, k_af, v_af);
     } else {
       // afrag qkv / gate read the fragment-major copy; alpha / beta keep the row-major one
@@ -424,9 +425,11 @@ class LoomPrefill {
                            NpuOk(pre + "attn_gate.weight") &&
                            !NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)).empty() &&
                            !NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)).empty();
-      RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow, qkv_npu ? "qkv" : nullptr);
+      RunLayerNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow, qkv_npu ? "qkv" : nullptr,
+                   qkv_npu && (NpuPk(pre + "attn_qkv.weight") || NpuPk(pre + "attn_gate.weight")));
       RunDeltaNet(l, pre, qkv_af, gate_af);
     }
+    if (!pending_norm_.empty()) throw LoomError("prefill: " + pre + " fused norm without its f16 output");
     if (tail_ != kNoRows) {
       trim_row_ = tail_;
       RunFfn(pre);
@@ -1179,14 +1182,46 @@ class LoomPrefill {
     Dispatch(Exe(rem), ("yah_ffn_gemm_" + std::string(fd.name)).c_str(), MTiles(*td) / gr.rowgrp, gr.tt, 1, 32, 1, 1, r,
              std::uint64_t{1} << (r.size() - 1));
     NpuJoin();
-    NpuUnpack("npu_unpack_ffnblk.hal", {doff, parts.size() * calls * cp},
+    // the sum into hidden() waits for the next layer's norm, which fuses it when it feeds the NPU (RunLayerNorm)
+    ffn_pending_ = {doff, parts.size() * calls * cp};
+    if (!geom_.count("npu_unorm.hal")) FlushFfn();
+    return true;
+  }
+  // The FFN block's sum (hidden + the GPU's down + the NPU's partials) into hidden(), if RunFfnBlock left it pending.
+  void FlushFfn() {
+    if (!ffn_pending_.length) return;
+    NpuUnpack("npu_unpack_ffnblk.hal", std::exchange(ffn_pending_, {}),
               {Ref(*hidden_), {ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4}, Ref(*hidden2_)}, 8);
     std::swap(hidden_, hidden2_);
-    return true;
   }
 
   // kRow: f16 row-major into scratch_; kTiled: fragment-major into normt_ (afrag GEMMs); kBoth: both, one pass.
   enum class NormOut { kRow, kTiled, kBoth };
+  // A layer's input norm (RunNorm with npu_site). After an FFN block whose sum is pending, with npu_site set,
+  // "npu_unorm[_pk].hal" adds the sum and writes the NPU's BFP16 input (the Q4_K order too with pk) in one pass; the
+  // f16 output(s) for the GPU's GEMMs follow in RunPendingNorm, recorded after the NPU job is released, so the job does
+  // not wait for them.
+  void RunLayerNorm(const std::string& wname, NormOut mode, const char* npu_site, bool pk) {
+    if (!ffn_pending_.length || !npu_site || !geom_.count("npunormbfp")) {
+      FlushFfn();
+      RunNorm(wname, mode, npu_site);
+      return;
+    }
+    const std::size_t a = NpuK(5120).a;
+    std::vector<hrx_buffer_ref_t> b{CView(std::exchange(ffn_pending_, {})), Ref(*hidden_),
+                                    {ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4}, TRef(*Find(wname)),
+                                    Ref(*hidden2_), {npu_->A().handle, 0, a}};
+    if (pk) b.push_back({npu_->A().handle, npu_->A().size / 2, a});
+    const LoomExecutable& exe = Exe(pk ? "npu_unorm_pk.hal" : "npu_unorm.hal");
+    Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1, b,
+             pk ? 0b1110000 : 0b110000);
+    std::swap(hidden_, hidden2_);
+    norm_bfp_ = npu_site, norm_pk_ = pk ? npu_site : "";
+    pending_norm_ = wname, pending_mode_ = mode;
+  }
+  void RunPendingNorm() {
+    if (!pending_norm_.empty()) RunNorm(std::exchange(pending_norm_, ""), pending_mode_);
+  }
   // The FFN with ffn_gate and ffn_up in one afrag GEMM ("gemm_ffn_<fmt>_..", emit_prefill_pp.py ffn_fused): ffn_up
   // stored right after ffn_gate, so one binding spans them (the kernel reads up row r at m_rows + r). Gate and up of one
   // format, or a pair "gemm_ffn_<gate>_<up>_.." (AF_FFN_MIX: mixed formats, which bind the gate format's tables, then
@@ -1237,6 +1272,7 @@ class LoomPrefill {
     const bool g1 = g1s || (npu_site && std::strcmp(npu_site, "ffnblk") == 0);
     const bool bfp = npu_site && (g1 || geom_.count("npunormbfp"));
     norm_bfp_ = bfp && !g1 ? npu_site : "";
+    norm_pk_.clear();
     const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
     const LoomExecutable& exe = Exe(g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1.hal" : hal + (bfp ? "_bfp.hal" : ".hal"));
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
@@ -1334,9 +1370,10 @@ class LoomPrefill {
   // p4 order of the other decoders).
   std::vector<NpuView> NpuEncode(const std::string& site, const LoomBuffer& input, bool tiled, bool pk = false) {
     const auto chunks = NpuChunks(site);
-    // a K = 5120 site after a norm that wrote its input (RunNorm npu_site)
-    const bool from_norm = norm_bfp_ == site && !pk;
-    norm_bfp_.clear();
+    // a K = 5120 site after a norm that wrote its input (RunNorm npu_site; the Q4_K order: RunLayerNorm pk)
+    std::string& wrote = pk ? norm_pk_ : norm_bfp_;
+    const bool from_norm = wrote == site;
+    wrote.clear();
     const std::uint32_t site_k = NpuSiteK(site);
     std::vector<NpuView> views;
     std::size_t off = pk ? npu_->A().size / 2 : 0;
@@ -1815,6 +1852,7 @@ class LoomPrefill {
       std::vector<std::uint32_t> calls;
       const NpuView c = NpuCalls("q", a, w, c_off, calls, pre + "attn_q.weight");
       NpuEnqueue(std::move(calls), "q");
+      RunPendingNorm();
       RunKqgSplit(pre + "attn_q.weight", q_af, qs, nq);
       RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
       RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
@@ -2011,6 +2049,7 @@ class LoomPrefill {
       const std::uint32_t qkv_job = NpuEnqueue(std::exchange(calls, {}), "qkv");
       cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
       gate_job = NpuEnqueue(std::move(calls), "gate");
+      RunPendingNorm();
       RunAlphaBeta(pre);
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
       RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, ng);
@@ -2173,6 +2212,10 @@ class LoomPrefill {
   std::uint32_t ffnblk_ = 0;       // the NPU's FFN block features (dispatch.txt "npuffnblk"; RunFfnBlock), 0: none
   LoomBuffer* ffnrem_ = nullptr;   // its GPU down over the other features (f32 [tokens][5120])
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
+  std::string norm_pk_;            // .. in the Q4_K order (RunLayerNorm pk)
+  NpuView ffn_pending_{};          // the FFN block's partials not yet summed into hidden() (RunFfnBlock, FlushFfn)
+  std::string pending_norm_;       // a fused norm's f16 output still to record (RunLayerNorm, RunPendingNorm)
+  NormOut pending_mode_{};
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
   static std::size_t RecordRow(const char* fmt) {
     return std::strcmp(fmt, "q5k") == 0 ? 704 : std::strcmp(fmt, "iq2s") == 0 ? 1152 : kDcolRecordRow;
