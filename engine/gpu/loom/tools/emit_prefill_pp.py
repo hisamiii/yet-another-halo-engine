@@ -1055,13 +1055,19 @@ def npu_images(images, B, tmp, outdir, extra=()):
 
     def compile_one(b):
         cfg, name, src, env = b
+        # YAH_NPU_REPORT=1: each image's text-details compile report beside it ("<name>.report": blocks, bundles)
+        rep = (["--compile-report=text-details", "--compile-report-output=" + os.path.join(outdir, name + ".report")]
+               if os.environ.get("YAH_NPU_REPORT") == "1" else [])
         r = subprocess.run([hrx_paths.LOOM_COMPILE, src, "--root=@" + cfg.entry,
                             "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
-                            "--output=" + os.path.join(outdir, name + ".xdna")], capture_output=True, text=True,
+                            "--output=" + os.path.join(outdir, name + ".xdna")] + rep, capture_output=True, text=True,
                            env=env)
         if os.environ.get("LOOM_DIAG_PC") and not r.returncode:   # the image's PC ranges for YAH_NPU_PROF_PC
             open(os.path.join(outdir, name + ".pc"), "w").write(
                 "\n".join(npu_prof.pc_ranges(src, r.stderr.splitlines())) + "\n")
+            # the raw block table too (npu_prof.pc_ranges input), for ranges between any two labels
+            open(os.path.join(outdir, name + ".pcdiag"), "w").write(
+                "".join(l + "\n" for l in r.stderr.splitlines() if l.split()[:1] in (["PCBLOCKS"], ["PCTEXT"])))
         return r
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         rs = list(ex.map(compile_one, [source(*j) for j in jobs]))
