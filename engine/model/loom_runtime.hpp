@@ -590,7 +590,8 @@ class LoomWeights {
  public:
   // skip: tensors the device never reads (not uploaded; Has() false, Ref() refuses them). in_place (the NPU split): the
   // GPU reads the resident copy itself (one import of the whole tensor data, every range filled and kept: the NPU
-  // reads its rows through host pointers), skip unused.
+  // reads its rows through host pointers); the skipped tensors' whole pages are aliased (AliasUnread) before the import
+  // pins them (Gguf::Rows reads a skipped tensor from the source).
   LoomWeights(LoomDevice& gpu, core::Gguf& gguf, const std::function<bool(const std::string&)>& skip = {},
               bool in_place = false) {
     constexpr size_t kChunk = size_t{1} << 30;
@@ -598,9 +599,11 @@ class LoomWeights {
     // (begin, end, glued): a layer's ffn_gate and ffn_up stay in one buffer (the NPU FFN block reads a gate row through
     // its up row in one view, LoomPrefill::RunFfnBlock)
     std::vector<std::tuple<size_t, size_t, bool>> spans;
+    std::vector<std::pair<size_t, size_t>> unread;   // in_place: the skipped tensors (offset, bytes)
     for (const auto& t : gguf.tensors()) {
-      if (skip && !in_place && skip(t.name)) {
+      if (skip && skip(t.name)) {
         skipped_.push_back(t.name);
+        if (in_place) unread.emplace_back(t.offset, t.bytes);
         continue;
       }
       const bool glued = t.name.ends_with("ffn_up.weight");
@@ -618,6 +621,8 @@ class LoomWeights {
     gguf.Stream(ranges);   // (a native copy reads the next range while this one uploads)
     if (in_place) {
       for (const auto& [begin, bytes] : ranges) gguf.Prepare(begin, bytes);
+      for (const auto& [o, n] : unread)
+        AliasUnread(const_cast<std::uint8_t*>(gguf.tensor_data_base()) + o, n, true);
       const uintptr_t base = reinterpret_cast<uintptr_t>(gguf.tensor_data_base()), start = base & ~uintptr_t{4095};
       LoomBuffer buffer = gpu.Import(reinterpret_cast<void*>(start), gguf.tensor_data_size() + base - start);
       chunks_.push_back({0, gguf.tensor_data_size(), base - start, std::move(buffer)});
