@@ -757,16 +757,16 @@ NPU_KS = (36, 36, 36, 20)   # k-blocks per pass and K-slice row; K = 1024 * pass
 # place): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
 # layer writes this split's stream ("norm_t_bfp_g1s.hal", dispatch row "npuffndfr_<fmt>")
 NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs", "iq3s"), (40, 40, 40, 8)
-# The FFN block's IQ3_S / IQ3_XXS gate / up rows are transcoded on the host to IQ4_XS blocks with the same weights
-# (ix4_files: npu_ix4_<...>.bin), decoded by IQ4_XS's decoder with their kvalues (gen_npu_dec IQ4_XO / IQ4_XX): no grid
-# tables, so IQ3_S's fillers also hold the deferred epilogue's 40 k-block slices (dispatch row "npuffnix4")
-IX4_FMTS = {"iq3s": "IQ4_XO", "iq3xxs": "IQ4_XX"}
-IX4_FAMILY = ("IQ4_XS", "IQ4_XO", "IQ4_XX")
+# The FFN block's IQ3_S gate / up rows are transcoded on the host to IQ4_XS blocks with the same weights (ix4_files:
+# npu_ix4_<...>.bin), decoded by IQ4_XS's decoder with their kvalues (gen_npu_dec IQ4_XO): its 8 KB grid does not fit
+# beside the rings (dispatch rows "npuffnix4_<fmt>")
+IX4_FMTS = {"iq3s": "IQ4_XO"}
+IX4_FAMILY = ("IQ4_XS", "IQ4_XO")
 # gate and up of one format without a fused GPU gate / up whose single-format deferred image fits: their own decoder
 # on the GGUF rows, no pre-decoded copy (Q3_K's with its record realign rolled: npu_images' q3roll fallback)
 NPU_SAME_SW = ("q5k", "q3k", "iq2s")
 # gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
-# tensor's rows (IQ3_S / IQ3_XXS's transcoded, npu_ix4_<tensor>.bin), the tails swap halves;
+# tensor's rows (IQ3_S's transcoded, npu_ix4_<tensor>.bin), the tails swap halves;
 # "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>"); not two formats of IQ4_XS's decoder (one image,
 # kv2)
 NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s", "iq2xs")
@@ -1165,7 +1165,7 @@ def bfp_pair_rows(layers, F, outdir):
 
 
 def ix4_files(layers, sw, F, outdir):
-    """The FFN block's IQ3_S / IQ3_XXS gate / up tensors (layers: prefix -> kinds) transcoded
+    """The FFN block's IQ3_S gate / up tensors (layers: prefix -> kinds) transcoded
     (gen_npu_dec.ix4_rows), their last F rows (the NPU's) only: sw layers (prefixes in sw) to
     npu_ix4_<prefix>ffn_gate_up.bin (gate's rows, then up's), the others (column pairs) to npu_ix4_<tensor>.bin."""
     import gguf
@@ -1190,7 +1190,7 @@ def ix4_files(layers, sw, F, outdir):
                     if src == "IQ4_XS":
                         f.write(raw[N - F:].tobytes())
                         continue
-                    D = GN.decoder({"IQ3_S": "IQ4_XO", "IQ3_XXS": "IQ4_XX"}[src])
+                    D = GN.decoder(IX4_FMTS[E.FMT[int(t.tensor_type)][0]])
                     for r0 in range(N - F, N, 512):
                         f.write(D.ix4_rows(raw[r0:r0 + 512], src).tobytes())
             os.replace(path + ".tmp", path)
@@ -1329,7 +1329,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     for fmt in NPU_DFR_FMTS:
         if gu_fmt(fmt) in dfrs:
             out.append(("npuffndfr_" + fmt, 1, 0, 0))
-    out.append(("npuffnix4", 1, 0, 0))
+    out.extend(("npuffnix4_" + f, 1, 0, 0) for f in sorted(IX4_FMTS))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs}):
         out.append(("npuffndfr_%s_%s" % (gf, uf), 1, 0, 0))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs if colpair(l)}):

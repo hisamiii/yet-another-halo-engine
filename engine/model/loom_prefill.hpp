@@ -1094,9 +1094,8 @@ class LoomPrefill {
     RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk");
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
-    // (npuffnix4: IQ3_S / IQ3_XXS gate / up rows transcoded to IQ4_XS blocks, the NPU's rows only)
-    const bool ix4 = geom_.count("npuffnix4") != 0;
-    const auto tx = [&](const Fmt& x) { return ix4 && (!std::strcmp(x.name, "iq3s") || !std::strcmp(x.name, "iq3xxs")); };
+    // (npuffnix4_<fmt>: the format's gate / up rows transcoded to IQ4_XS blocks, the NPU's rows only)
+    const auto tx = [&](const Fmt& x) { return geom_.count("npuffnix4_" + std::string(x.name)) != 0; };
     // (a mixed pair of one untranscoded format, emit_prefill_pp SAME_SW_FMTS: up follows gate in the GGUF, like a
     // single format's)
     // (cpair: gate and up on column pairs, emit_prefill_pp NPU_COLPAIR: each from its own tensor's rows, a transcoded

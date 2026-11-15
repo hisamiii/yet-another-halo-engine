@@ -819,7 +819,7 @@ def fuse_record(cfg, cov):
 
 
 FUSE_SB = 4   # fuse 2: super-blocks per row of a unit (a pass: 1024 k)
-FUSE_FMTS = ("IQ4_XS", "IQ4_XO", "IQ4_XX", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "IQ2_S", "Q4_K", "Q5_K", "BFP")   # fuse 2 decoders (cfg.fmt, in
+FUSE_FMTS = ("IQ4_XS", "IQ4_XO", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "IQ2_S", "Q4_K", "Q5_K", "BFP")   # fuse 2 decoders (cfg.fmt, in
 # cfg.gord's k-block order; program and data memory decide which fit an image: gen_npu_dec sizes)
 
 
