@@ -115,7 +115,7 @@ def emit(loomfile, configs, outname, outdir, env=None, gate=None):
         _latest[dst] = seq = _latest.get(dst, 0) + 1
         if _pool is None:
             _pool = ThreadPoolExecutor(JOBS)
-        _pending.setdefault(dst, []).append(_pool.submit(_build, loomfile, text, tgt, ce, key, dst, seq, gate and (raw, gate), vtry))
+        _pending.setdefault(dst, []).append(_pool.submit(_build, loomfile, text, tgt, ce, key, dst, seq, gate and (raw, gate), vtry, vspill))
     if not ASYNC:
         wait(dst)
     return dst
@@ -164,7 +164,7 @@ def _spills(hal):
     return int(m.group(1)) if m else 0
 
 
-def _build(loomfile, text, tgt, ce, key, dst, seq, gate, vtry=None):
+def _build(loomfile, text, tgt, ce, key, dst, seq, gate, vtry=None, vspill=None):
     import hrx_paths
     if gate:
         _gate(loomfile, gate[0], gate[1], ce)
@@ -181,7 +181,7 @@ def _build(loomfile, text, tgt, ce, key, dst, seq, gate, vtry=None):
                 # and up to YAH_VGPR_TRY_SPILL bytes of spills (default 32): the paired kres GEMMs spill their zero
                 # accumulator init at 192 (reloads at each outer pass, none in the inner loops) and still run ~6%
                 # faster than at 216 VGPRs (7 waves), as the old pin's 190-192 did; "0": no spills
-                if (r.returncode != 0 or not os.path.exists(out) or _spills(out) > int(vspill)):
+                if (r.returncode != 0 or not os.path.exists(out) or _spills(out) > int(vspill or 0)):
                     r = None
             if r is None:
                 r = subprocess.run(cmd, env=ce, capture_output=True, text=True)
