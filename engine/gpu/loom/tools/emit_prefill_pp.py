@@ -1449,6 +1449,13 @@ def main():
     if B % TILE:
         raise SystemExit("tokens=%d must be a multiple of the token tile=%d" % (B, TILE))
     TT = B // TILE
+    # An NPU call replays each memory-tile W panel once per 64-token M block: past 63 (B > 4032) the HRX pair-replay
+    # patch counts replay pairs, whose twin descriptors fit the memory tile only with one replay group per call (set in
+    # the environment too: the half set's child emit keeps the same groups)
+    import gen_bfp16_encode as GE0
+    if B // 64 > 63 and not os.environ.get("YAH_NPU_GROUPS"):
+        os.environ["YAH_NPU_GROUPS"] = str(NPU_PASSES)
+        GE0.GROUPS = (NPU_PASSES,)
     # Chunked prefill: YAH_CTX=T (> B) emits every kernel at the chunk size B and the KV cache (rope, attention, V^T) at T.
     # One rope / attention HAL per chunk i (start_pos = i * B): rope_c<i>.hal / wmma_c<i>.hal; rope.hal / wmma.hal are chunk 0.
     # The driver runs T / B passes over the 64 layers. dispatch.txt row "ctx" records T.

@@ -14,10 +14,13 @@ A call of other pass counts is one group (the layouts without the group level).
 One work item per fragment; a lane pair takes rows 0-7 and 8-15 of one k-block (its 144 contiguous bytes), adjacent pairs
 adjacent k-blocks: a wave writes whole lines (half records left partial lines for other waves: read-modify-write in DRAM).
 """
+import os
 import sys
 
 WG = 256
 GROUPS = (2, 3)   # passes per replay group of a 5-pass call (gen_npu_gemm)
+if os.environ.get("YAH_NPU_GROUPS"):   # diagnosis: e.g. 5 = one replay group (B=4096 sites, HRX pair replays)
+    GROUPS = tuple(int(v) for v in os.environ["YAH_NPU_GROUPS"].split(","))
 # The k-block order of the activation stream when the NPU decodes the weights itself (gen_npu_dec: its panels hold the
 # k-blocks of each sub-block group in the order its decoder computes them): None (k ascending), "p4" (per 4 k-blocks
 # 0, 2, 1, 3: IQ4_XS, IQ3_S, IQ3_XXS), "pk" (per 8: 0, 4, 1, 5, 2, 6, 3, 7: Q4_K). Panel position p holds k-block

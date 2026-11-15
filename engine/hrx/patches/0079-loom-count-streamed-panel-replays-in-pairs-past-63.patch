@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 04:07:29 +0100
+Subject: [PATCH] loom : count streamed panel replays in pairs past 63
+
+Port of yah 0069 (pair panel replays) onto main's register field helpers and stream push.
+---
+ .../target/arch/amd/xdna/aie2p/array/plan.c   | 37 +++++++--
+ .../arch/amd/xdna/aie2p/array/program.c       | 77 +++++++++++++++++--
+ 2 files changed, 99 insertions(+), 15 deletions(-)
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index e3515cb869..f2ca4170e9 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -8,6 +8,19 @@
+ 
+ #include <inttypes.h>
+ #include <string.h>
++#include <stdlib.h>
++
++// Replays a lock unit stands for: a streamed panel member past the 6-bit lock
++// value counts replay pairs (two chained drain descriptors per lock unit).
++static inline uint32_t loom_aie2p_panel_pair(uint64_t repeat_count) {
++  // EXPERIMENT LOOM_EXP_PAIR_MIN=n: pair-count past n replays (diagnosis; even counts only)
++  const char* spec = getenv("LOOM_EXP_PAIR_MIN");
++  const uint64_t limit = spec != NULL ? (uint64_t)atoi(spec) : 63u;
++  return repeat_count > limit && repeat_count % 2u == 0 ? 2u : 1u;
++}
++static inline uint32_t loom_aie2p_panel_units(uint64_t repeat_count) {
++  return (uint32_t)(repeat_count / loom_aie2p_panel_pair(repeat_count));
++}
+ 
+ #include "loom/codegen/low/packet.h"
+ #include "loom/codegen/low/representation_binding.h"
+@@ -1537,7 +1550,10 @@ static iree_status_t loom_aie2p_array_admit_memory_tile_panel(
+         (member->stage_panel_group_count > 1 ||
+          (single_spec != NULL && atoi(single_spec) != 0)) &&
+         loom_aie2p_array_panel_stream();
+-    if (member->stage_panel_group_count > 1 && repeat_count > 63) {
++    if (repeat_count > 63 &&
++        (member->stage_panel_stream
++             ? repeat_count % 2u != 0 || repeat_count / 2u > 63
++             : member->stage_panel_group_count > 1)) {
+       return loom_aie2p_array_reject_channel_resources(
+           builder, (uint32_t)i, stage,
+           IREE_SV("a grouped shared panel replays at most 63 times"));
+@@ -2690,12 +2706,16 @@ static iree_status_t loom_aie2p_array_plan_stage(
+   const uint16_t fill_count =
+       (uint16_t)(groups * (interleaved ? 2u * record_count + 1u : record_count));
+   const uint16_t drain_count = panel ? groups : record_count;
++  const uint16_t drain_reserve =
++      (uint16_t)(panel && channel->stage_panel_stream
++                     ? drain_count * loom_aie2p_panel_pair(channel->stage_repeat_count)
++                     : drain_count);
+   uint16_t* fill_cursor = &state->memory_tile_bd_cursors[fill_channel & 1u];
+   uint16_t* drain_cursor = &state->memory_tile_bd_cursors[drain_channel & 1u];
+   if (fill_channel >= resources->facts->dma.channel_count_per_direction ||
+       drain_channel >= resources->facts->dma.channel_count_per_direction ||
+       *fill_cursor + fill_count > half_capacity ||
+-      *drain_cursor + drain_count > half_capacity) {
++      *drain_cursor + drain_reserve > half_capacity) {
+     return loom_aie2p_array_reject_channel_resources(
+         builder, channel_index, coordinate,
+         IREE_SV("the stage memory tile has no DMA channel pair with enough "
+@@ -2709,7 +2729,7 @@ static iree_status_t loom_aie2p_array_plan_stage(
+   *fill_cursor += fill_count;
+   const uint16_t drain_bd = (uint16_t)((drain_channel & 1u) * half_capacity +
+                                        *drain_cursor);
+-  *drain_cursor += drain_count;
++  *drain_cursor += drain_reserve;
+   const uint32_t credit_lock_index = loom_aie2p_array_append_lock_pair(
+       builder, channel_index, LOOM_AIE2P_ARRAY_ENDPOINT_DIRECTION_RECEIVE,
+       &ring);
+@@ -2739,7 +2759,7 @@ static iree_status_t loom_aie2p_array_plan_stage(
+       // Counting locks: each group pair starts with one full panel of credits.
+       for (uint16_t g = 0; g < groups; ++g) {
+         builder->locks[credit_lock_index + 2u * g].initial_value =
+-            (int8_t)channel->stage_repeat_count;
++            (int8_t)loom_aie2p_panel_units(channel->stage_repeat_count);
+       }
+     }
+   }
+@@ -2830,8 +2850,11 @@ static iree_status_t loom_aie2p_array_plan_panel_drain(
+       (uint16_t)(resources->facts->dma.buffer_descriptor_count / 2u);
+   uint16_t* drain_cursor = &state->memory_tile_bd_cursors[drain_channel & 1u];
+   const uint16_t groups = channel->stage_panel_group_count;
++  // a pair-counted member's twin descriptors follow its group descriptors
++  const uint16_t drain_bds =
++      (uint16_t)(groups * loom_aie2p_panel_pair(channel->stage_repeat_count));
+   if (drain_channel >= resources->facts->dma.channel_count_per_direction ||
+-      *drain_cursor + groups > half_capacity) {
++      *drain_cursor + drain_bds > half_capacity) {
+     return loom_aie2p_array_reject_channel_resources(
+         builder, channel_index, coordinate,
+         IREE_SV("the shared panel memory tile has no free drain channel with "
+@@ -2846,7 +2869,7 @@ static iree_status_t loom_aie2p_array_plan_panel_drain(
+   resources->next_memory_to_stream_channel = drain_channel + 1u;
+   const uint16_t drain_bd = (uint16_t)((drain_channel & 1u) * half_capacity +
+                                        *drain_cursor);
+-  *drain_cursor += groups;
++  *drain_cursor += drain_bds;
+   for (uint16_t g = 0; g < groups; ++g) {
+     const loom_aie2p_array_ring_resource_proposal_t lock_pair = {
+         .coordinate = coordinate,
+@@ -2859,7 +2882,7 @@ static iree_status_t loom_aie2p_array_plan_panel_drain(
+         &lock_pair);
+     if (channel->stage_panel_stream) {
+       builder->locks[lock_index].initial_value =
+-          (int8_t)channel->stage_repeat_count;
++          (int8_t)loom_aie2p_panel_units(channel->stage_repeat_count);
+     }
+     if (g == 0) channel->stage_panel_lock_index = lock_index;
+   }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index 76d0a16118..88d9ec0353 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -10,6 +10,19 @@
+ 
+ #include <inttypes.h>
+ #include <string.h>
++#include <stdlib.h>
++
++// Replays a lock unit stands for: a streamed panel member past the 6-bit lock
++// value counts replay pairs (two chained drain descriptors per lock unit).
++static inline uint32_t loom_aie2p_panel_pair(uint64_t repeat_count) {
++  // EXPERIMENT LOOM_EXP_PAIR_MIN=n: pair-count past n replays (diagnosis; even counts only)
++  const char* spec = getenv("LOOM_EXP_PAIR_MIN");
++  const uint64_t limit = spec != NULL ? (uint64_t)atoi(spec) : 63u;
++  return repeat_count > limit && repeat_count % 2u == 0 ? 2u : 1u;
++}
++static inline uint32_t loom_aie2p_panel_units(uint64_t repeat_count) {
++  return (uint32_t)(repeat_count / loom_aie2p_panel_pair(repeat_count));
++}
+ 
+ #include "loom/target/arch/amd/xdna/array/registers.h"
+ 
+@@ -1187,8 +1200,10 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+         if (stream) {
+           acquire_lock =
+               &plan->locks[member->stage_panel_lock_index + 2u * group];
+-          acquire_value = -(int32_t)member->stage_repeat_count;
+-          release_value = (int32_t)member->stage_repeat_count;
++          acquire_value =
++              -(int32_t)loom_aie2p_panel_units(member->stage_repeat_count);
++          release_value =
++              (int32_t)loom_aie2p_panel_units(member->stage_repeat_count);
+         }
+         break;
+       }
+@@ -1259,7 +1274,8 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+       record_byte_offset = group_base + member->stage_panel_sub_offset;
+       byte_length = member->stage_panel_sub_bytes;
+       acquire_lock = &plan->locks[member->stage_panel_lock_index + 2u * panel_group];
+-      interleaved_acquire = -(int32_t)member->stage_repeat_count;
++      interleaved_acquire =
++          -(int32_t)loom_aie2p_panel_units(member->stage_repeat_count);
+     } else if (fill && part == member_count) {
+       record_byte_offset = group_base + unit;
+       byte_length = (units - 2u) * unit;
+@@ -1269,7 +1285,8 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+       byte_length = member->stage_panel_sub_bytes;
+       release_lock =
+           &plan->locks[member->stage_panel_lock_index + 2u * panel_group + 1u];
+-      interleaved_release = (int32_t)member->stage_repeat_count;
++      interleaved_release =
++          (int32_t)loom_aie2p_panel_units(member->stage_repeat_count);
+     } else {
+       record_byte_offset = group_base + channel->stage_panel_sub_offset;
+       byte_length = units * channel->stage_panel_sub_bytes;
+@@ -1313,9 +1330,15 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_BASE_ADDRESS,
+       dma_address >> tile->dma.address_encoding_shift, &words[1]);
++  const bool pair_drain = gated_drain && stream &&
++                          loom_aie2p_panel_pair(channel->stage_repeat_count) > 1u;
+   const uint16_t next_buffer_descriptor =
+-      dma->buffer_descriptor_start +
+-      (uint16_t)((slot_ordinal + 1) % dma->buffer_descriptor_count);
++      pair_drain
++          ? (uint16_t)(dma->buffer_descriptor_start +
++                       dma->buffer_descriptor_count + slot_ordinal)
++          : (uint16_t)(dma->buffer_descriptor_start +
++                       (uint16_t)((slot_ordinal + 1) %
++                                  dma->buffer_descriptor_count));
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_NEXT_BD,
+       next_buffer_descriptor, &words[1]);
+@@ -1323,7 +1346,8 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+   // fill loops forever.
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_USE_NEXT_BD,
+-      (replay && last_slot && !(stream && fill)) ||
++      pair_drain ? 1
++      : (replay && last_slot && !(stream && fill)) ||
+               (gated_drain && groups > 1)
+           ? 0
+           : 1,
+@@ -1387,6 +1411,43 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+     }
+     return iree_ok_status();
+   }
++  if (pair_drain) {
++    // the first of the pair acquires one ready (a pair of replays); its twin
++    // (same slice, no acquire, task end) returns the pair's credit
++    uint32_t twin[LOOM_AIE2P_MEMORY_TILE_DMA_BUFFER_DESCRIPTOR_WORD_COUNT];
++    memcpy(twin, words, sizeof(twin));
++    twin[1] &= ~(loom_xdna_register_field_encode(
++                     LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_NEXT_BD,
++                     next_buffer_descriptor) |
++                 loom_xdna_register_field_encode(
++                     LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_USE_NEXT_BD,
++                     1));
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_ENABLE, 1,
++        &words[7]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_VALUE, -1,
++        &words[7]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_ID,
++        acquire_selector, &words[7]);
++    const uint16_t twin_indices[] = {next_buffer_descriptor};
++    uint32_t* twin_words = loom_aie2p_program_append_register_block_write32(
++        &builder->array,
++        (uint32_t)loom_xdna_register_field_address(
++            plan->family,
++            LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD0_BUFFER_LENGTH,
++            dma->coordinate, twin_indices),
++        LOOM_AIE2P_MEMORY_TILE_DMA_BUFFER_DESCRIPTOR_WORD_COUNT);
++    memcpy(twin_words, twin, sizeof(twin));
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_VALUE, 1,
++        &twin_words[7]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_ID,
++        release_selector, &twin_words[7]);
++    return iree_ok_status();
++  }
+   if (gated_drain && stream) {
+     loom_aie2p_program_encode_admitted_field(
+         LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_VALUE, 1,
+@@ -1958,7 +2019,7 @@ static iree_status_t loom_aie2p_program_build_stream_push(
+               plan,
+           LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_CHANNEL_MM2S_START_QUEUE_REPEAT_COUNT,
+           dma->coordinate, indices,
+-              channel->stage_repeat_count - 1u);
++              loom_aie2p_panel_units(channel->stage_repeat_count) - 1u);
+       IREE_RETURN_IF_ERROR(
+           loom_aie2p_program_merge_register_update(&repeat, &task));
+       loom_aie2p_program_append_register_write32(&builder->control,
