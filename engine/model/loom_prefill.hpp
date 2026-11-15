@@ -1992,10 +1992,12 @@ class LoomPrefill {
     const std::string qkv_split = nq ? NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)) : "";
     const std::string gate_split = ng ? NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)) : "";
     // conv_c: the conv reads the NPU's qkv columns straight from C ("convkq_c.hal"); the unpack writes only the conv ring
-    NpuView conv_c{};
+    NpuView conv_c{}, cg{};
     bool gate_late = false;
+    std::int64_t gate_job = -1;   // the NPU's gate rows: joined before the postnorm, the first to read them
     if (!qkv_split.empty() && !gate_split.empty()) {
-      // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows (one job: the same activations)
+      // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows: a qkv job, then a gate job (the same
+      // activations), so the GPU's conv and DeltaNet run while the NPU computes gate
       // decoder-column sets: each matrix's activations in its decoder's k-block order
       const bool kq = NpuPk(pre + "attn_qkv.weight"), kg = NpuPk(pre + "attn_gate.weight");
       std::vector<NpuView> a4, ak;
@@ -2006,22 +2008,19 @@ class LoomPrefill {
       const auto wg = NpuRawRows("gate", pre + "attn_gate.weight", ng);
       std::vector<std::uint32_t> calls;
       const NpuView cq = NpuCalls("qkv", kq ? ak : a4, wq, c_off, calls, pre + "attn_qkv.weight");
-      // a job runs one image (one family: NpuCalls)
-      if (DcolImage(pre + "attn_qkv.weight") != DcolImage(pre + "attn_gate.weight"))
-        NpuEnqueue(std::exchange(calls, {}), "qkv");
-      const NpuView cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
-      NpuEnqueue(std::move(calls), "qkv");
+      const std::uint32_t qkv_job = NpuEnqueue(std::exchange(calls, {}), "qkv");
+      cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
+      gate_job = NpuEnqueue(std::move(calls), "gate");
       RunAlphaBeta(pre);
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
       RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, ng);
-      NpuJoin();
+      NpuJoin(qkv_job);
       if (geom_.count("convkq_c.hal")) {
         conv_c = cq;
         NpuUnpack("npu_unpack_qkv_tail.hal", cq, {Ref(*qkv_)}, 2);
       } else {
         NpuUnpack("npu_unpack_qkv.hal", cq, {Ref(*qkv_)}, 2);
       }
-      NpuUnpack("npu_unpack_gate.hal", cg, {Ref(*gate_)}, 2);
     } else {
       // seg: alpha and beta ride in the qkv GEMM's dispatch (f16 sets)
       const bool seg = qkv_af && RunSeg({{"gemm_kstore", pre + "attn_qkv.weight", {qkv_}},
@@ -2101,6 +2100,10 @@ class LoomPrefill {
         Dispatch(Exe("rowsplit.hal"), "yah_deltanet", dn_rowgrp_, kTs, 1, dn_threads_, 1, 1,
                  {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
       }
+    }
+    if (gate_job >= 0) {   // (the conv and DeltaNet neither read gate's C nor write the A it reads)
+      NpuJoin(gate_job);
+      NpuUnpack("npu_unpack_gate.hal", cg, {Ref(*gate_)}, 2);
     }
     if (tail_ == kNoRows) {  // the recurrent state is written; nothing reads this layer's output
       if (dn_done) ring();
