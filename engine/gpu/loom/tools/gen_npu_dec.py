@@ -2030,35 +2030,15 @@ def leaf(name="dec"):
                     return t4
                 if NPARTS == 4:
                     # Q4_K: a byte's low nibbles are sub-block 2 t, its high nibbles 2 t + 1 (separate scales). The -dmin m
-                    # term first (32-lane vmul / vmac against 1.0 per broadcast half, accumulator halves concatenated), each
-                    # scale line loaded right before its broadcasts; then the fragments; then T (lines loaded late)
-                    one2 = x.t("one")
-                    x(f"{one2} = vbcst.16 {k(0x3F80)}")
-                    halves_acc = [[None, None], [None, None]]          # [n_][broadcast half]
+                    # term first, on the matrix unit as the GF path's: mmul (M hi row broadcast, 1.0), mma (+ M lo), each
+                    # scale line loaded right before its broadcasts (the 32-lane vmul / vmac form held the vector slots:
+                    # record loop -2.6%, bit-identical); then the fragments; then T (lines loaded late)
+                    one4 = wide(x, splat16(x, 0x3F80))
                     for p in (2, 3):
                         ld = x.t("pl")
                         x(f"{ld} = vlda.512.bf16x32 {ppt}, {(hh * NPARTS + p) * 64}")
                         for n_ in range(2):
-                            bc, ra, rb = x.t("bc"), x.t("ra"), x.t("rb")
-                            x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {2 * t_ + n_}")
-                            x(f"{ra} = vshuffle {bc}, {bc}, {m52}")
-                            x(f"{rb} = vshuffle {bc}, {bc}, {m53}")
-                            for hb_, v_ in enumerate((ra, rb)):
-                                a0 = halves_acc[n_][hb_]
-                                r_ = x.t("ma")
-                                x(f"{r_} = vmul.bf16x32 {v_}, {one2}, {conf}" if a0 is None else
-                                  f"{r_} = vmac.bf16x32 {a0}, {v_}, {one2}, {conf}")
-                                halves_acc[n_][hb_] = r_
-                    for n_ in range(2):
-                        sl4 = []
-                        for hb_ in range(2):
-                            for q_ in range(2):
-                                q1 = x.t("mq")
-                                x(f"{q1} = slice {halves_acc[n_][hb_]}[{q_}] : {M4} -> {M1}")
-                                sl4.append(q1)
-                        m4 = x.t("m4")
-                        x(f"{m4} = concat({sl4[0]}, {sl4[1]}, {sl4[2]}, {sl4[3]}) : ({M1}, {M1}, {M1}, {M1}) -> {M4}")
-                        accs[n_] = m4
+                            accs[n_] = mac(x, accs[n_], rowb(ld, 2 * t_ + n_), one4)
                     xs = build_xs()
                     for p in range(2):
                         ld = x.t("pl")
