@@ -1111,6 +1111,9 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
         if "u" in helper:
             kchain_up(e, kchain_send(cfg, r, False), fw, OUT, s0, cfg.hcap, eg512(cfg))
         tl = cfg.ks[cov[1]] if len(cov) == 2 else 0    # (a second member: the row below's whole slice after its own)
+        # the memory tile's fill takes each unit as padded slabs (fuse_record): the egress below sends real k-blocks
+        # only, so a slice of 2 mod 4 k-blocks would leave the fill waiting for its pad words (NPU timeout)
+        assert 36 * (cfg.ks[r] + tl) == sum(slab(cfg.ks[j]) for j in cov) // 4, ("kchain egress != fill", cfg.ks, cov)
         if "h" in helper:
             fuse_egress_helped(e, dp, 36 * (cfg.ks[r] + tl) // fw, fw, OUT + (b - 32 * s0) * 144,
                                36 * (kchain_piece(cfg, r + 1) + tl) // fw, cfg.hcap, eg512(cfg), nh=0)
