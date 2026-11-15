@@ -8,11 +8,11 @@ Workgroup barriers under wave-uniform control pass when the source opts in.
 
 Assisted-by: Claude Opus 5.5
 ---
- .../kernel_synchronization_legality.c         | 22 +++++++++++++++++++
+ loom/src/loom/analysis/kernel_synchronization_legality.c | 22 ++++++++++++++++++++++
  1 file changed, 22 insertions(+)
 
 diff --git a/loom/src/loom/analysis/kernel_synchronization_legality.c b/loom/src/loom/analysis/kernel_synchronization_legality.c
-index ea15ef54e3..dd1f747754 100644
+index d596e46761..39025995e3 100644
 --- a/loom/src/loom/analysis/kernel_synchronization_legality.c
 +++ b/loom/src/loom/analysis/kernel_synchronization_legality.c
 @@ -6,6 +6,7 @@
@@ -20,11 +20,11 @@ index ea15ef54e3..dd1f747754 100644
  #include "loom/analysis/kernel_synchronization_legality.h"
  
 +#include <stdlib.h>
- #include <string.h>
- 
  #include "iree/base/internal/arena.h"
-@@ -428,6 +429,15 @@ static bool loom_kernel_accept_matched_barrier_branch(
-   return loom_kernel_barrier_op_signature(context, branch_op, &signature);
+ #include "loom/analysis/control_uniformity.h"
+ #include "loom/analysis/movement.h"
+@@ -287,6 +288,15 @@ loom_kernel_synchronization_legality_barrier_uniform_scope(
+              : LOOM_VALUE_FACT_UNIFORM_SCOPE_WORKGROUP;
  }
  
 +static bool loom_kernel_synchronization_legality_wave_role_barriers(void) {
@@ -39,8 +39,8 @@ index ea15ef54e3..dd1f747754 100644
  static iree_status_t loom_kernel_synchronization_legality_check_barrier_control(
      loom_kernel_synchronization_legality_state_t* state, const loom_op_t* op) {
    const loom_value_fact_uniform_scope_t required_scope =
-@@ -454,6 +464,18 @@ static iree_status_t loom_kernel_synchronization_legality_check_barrier_control(
-   if (proven) {
+@@ -301,6 +311,18 @@ static iree_status_t loom_kernel_synchronization_legality_check_barrier_control(
+                                               required_scope, &failure)) {
      return iree_ok_status();
    }
 +  // LOOM_EXP_WAVE_ROLE_BARRIERS=1: the source asserts that wave-uniform role
@@ -58,3 +58,4 @@ index ea15ef54e3..dd1f747754 100644
  
    loom_diagnostic_param_t params[] = {
        loom_param_string(
+-- 

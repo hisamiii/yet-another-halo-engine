@@ -49,9 +49,6 @@ The series is the pin's patches rebuilt on HRX main in their old order. A carrie
 | `0033-0029-loom-xdna-top-aligned-programs` | core programs end at the top of program memory, behind a 16-byte startup jump |
 | `0034-0032-loom-kernel-priority` | `kernel.priority {level = N}` lowers to `s_setprio` as an ordered execution barrier; used around the iu4 GEMM fold; bit-identical |
 | `0035-0027-0032-port-rodata-deferral-startup-section-and-p` | the pin's 0027-0032 ported: rodata deferral, startup section and the priority op |
-| `0036-0033-loom-amdgpu-iu4-inline-seed-subrev` | an iu4 WMMA accumulator splat of the bits of 1/(2 pi) selects the inline-source form; `x - c` with an inline `c` selects `v_subrev_f32`, which VOPD pairs; bit-identical |
-| `0038-0033-0036-port-vopd-immediates-and-lane-lookup-to-ma` | the pin's 0033-0036 ported: VOPD immediates for 0036's inline-source pairs |
-| `0039-0037-loom-wave-uniform-branches-with-matched-barrier` | workgroup barriers under a subgroup-uniform branch are accepted when every region runs the same barrier sequence: one wave runs its own loop (`gen_gdn_ss`'s solver wave) |
 | `0041-0040-loom-amdgpu-b16-store-takes-low-half-def` | a 16-bit store of a low-half definition skips the `v_bfe_u32` that cleared the upper half: 168 VALU fewer in `gen_gdn_ss`, bit-identical |
 | `0042-0043-loom-amdgpu-xor16-shuffle-via-permlanex16` | wave32 xor-16 shuffles lower to `v_permlanex16_b32` instead of `ds_swizzle`: attention softmax exchanges -1.1..-3%, bit-identical |
 | `0044-0013-0016-0019-port-multi-range-invocation-layout-to` | the pin's 0013 and 0016-0019 ported to main's multi-range invocation layout |
@@ -103,7 +100,7 @@ Not carried over from the pin (checked against main 2026-11-15):
 
 Carried under a new number: 0010 as 0075, 0011 as 0070, 0030 as 0073, 0036 as 0076, 0038 as 0074, 0041 as 0068, 0053 as 0078.
 
-The numbering has gaps: 0005, 0006, 0009, 0010, 0037, 0040, 0043, 0060 and 0067 were first ports that later patches reverted or fixed up to nothing (the series without them gives the same HRX tree), so they were dropped.
+The numbering has gaps: 0005, 0006, 0009, 0010, 0037, 0040, 0043, 0060 and 0067 were first ports that later patches reverted or fixed up to nothing (the series without them gives the same HRX tree), so they were dropped. 0036 (the iu4 accumulator seed and inline subtract), its fixup 0038 and 0039 (barriers under wave-uniform branches, inert on main's CFG form; 0066 does that job) changed no emitted kernel (every default set plus pp8192, k4v8 decode and npusplit4k byte-identical without them), so they were dropped too.
 
 0030-0036 were made for the int4 (iu4) GEMMs, which went with the MQ4 path. Only 0033 and 0034 are iu4-only (inline-accumulator iu4 WMMA forms); the others also act on native kernels (0032's `kernel.priority` is used by `gen_attn_fa`, 0036 packs every f16-output GEMM's stores). All stay in the stack: dropping a patch changes the compiler.
 
