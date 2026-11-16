@@ -8,6 +8,8 @@
 // context width the image does not admit fails with the loader's message ("does not match the admitted native
 // context"): the caller retries a wider one.
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -77,7 +79,28 @@ int main(int argc, char** argv) {
       FlushLines(s.host, s.bytes);
       views.push_back({&s, 0, f.size()});
     }
-    npu.RunOnce(image, entry, views);
+    // NPU_RUN_REPEAT=<n>: n runs, each one's host wall time (load + run) printed; timing by difference of two
+    // problem sizes cancels the fixed part
+    const char* rep = std::getenv("NPU_RUN_REPEAT");
+    for (int i = 0, n = rep ? std::max(1, std::atoi(rep)) : 1; i < n; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      if (const char* spec = std::getenv("YAH_NPU_PROF")) {   // the counters (NpuProf spec c0,c1,c2,c3/m0,m1)
+        const std::vector<std::uint32_t> v = npu.RunOnceProf(image, entry, views);
+        std::printf("npu_run: prof events %s\n", spec);
+        std::size_t at = 0;
+        for (std::uint32_t c = 0; c < columns; ++c)
+          for (std::uint32_t r = 0; r < 4; ++r, at += 6)
+            std::printf("npu_run: prof tile %u %u %u %u %u %u %u %u\n", c, r + 2, v[at], v[at + 1], v[at + 2],
+                        v[at + 3], v[at + 4], v[at + 5]);
+        for (std::uint32_t c = 0; c < columns; ++c, at += 6)
+          std::printf("npu_run: prof memtile %u %u %u %u %u shim %u %u\n", c, v[at], v[at + 1], v[at + 2], v[at + 3],
+                      v[at + 4], v[at + 5]);
+      } else {
+        npu.RunOnce(image, entry, views);
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      if (rep) std::printf("npu_run: run %d %.1f us\n", i, std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
     for (const auto& [b, path] : outputs) {
       FlushLines(views[b].shared->host, views[b].shared->bytes);
       std::ofstream out(path, std::ios::binary);

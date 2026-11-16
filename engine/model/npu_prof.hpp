@@ -43,17 +43,19 @@ class NpuProf {
     std::uint64_t gate, done;   // (gate: valid with TRUE on core counter 0)
   };
 
-  explicit NpuProf(const char* spec) {
+  // cols: the context's columns (the engine's 8; a narrower context's run_once tools fewer), counted from column 0
+  explicit NpuProf(const char* spec, std::uint32_t cols = kCols) : cols_(cols) {
+    if (cols_ < 1 || cols_ > kCols) throw LoomError("npu prof: bad column count");
     if (std::sscanf(spec, "%u,%u,%u,%u/%u,%u", &c_[0], &c_[1], &c_[2], &c_[3], &m_[0], &m_[1]) != 6)
       throw LoomError(std::string("YAH_NPU_PROF: want c0,c1,c2,c3/m0,m1 event ids, got ") + spec);
     std::vector<std::uint32_t> addr;   // the counters READ_REGS reads, per tile
-    for (std::uint32_t col = 0; col < kCols; ++col)
+    for (std::uint32_t col = 0; col < cols_; ++col)
       for (std::uint32_t row = kRow0; row < kRow0 + kRows; ++row) {
         const std::uint32_t t = col << 25 | row << 20;
         for (std::uint32_t r = 0; r < kCore; ++r) addr.push_back(t + 0x31520 + 4 * r);
         for (std::uint32_t r = 0; r < kMem; ++r) addr.push_back(t + 0x11020 + 4 * r);
       }
-    for (std::uint32_t col = 0; col < kCols; ++col) {
+    for (std::uint32_t col = 0; col < cols_; ++col) {
       for (std::uint32_t r = 0; r < kMt; ++r) addr.push_back((col << 25 | 1u << 20) + 0x91020 + 4 * r);
       for (std::uint32_t r = 0; r < kShim; ++r) addr.push_back((col << 25) + 0x31020 + 4 * r);
     }
@@ -114,7 +116,7 @@ class NpuProf {
       }
     }
     auto ctl = [](unsigned a, unsigned b) { return (a & 127) | (a & 127) << 8 | (b & 127) << 16 | (b & 127) << 24; };
-    for (std::uint32_t col = 0; col < kCols; ++col)
+    for (std::uint32_t col = 0; col < cols_; ++col)
       for (std::uint32_t row = kRow0; row < kRow0 + kRows; ++row) {
         const std::uint32_t t = col << 25 | row << 20;
         Write(ops, t + 0x31500, 0), Write(ops, t + 0x31504, 0), Write(ops, t + 0x11000, 0);   // stop
@@ -124,7 +126,7 @@ class NpuProf {
         Write(ops, t + 0x31500, ctl(c_[0], c_[1])), Write(ops, t + 0x31504, ctl(c_[2], c_[3]));
         Write(ops, t + 0x11000, ctl(m_[0], m_[1]));
       }
-    for (std::uint32_t col = 0; col < kCols; ++col) {
+    for (std::uint32_t col = 0; col < cols_; ++col) {
       const std::uint32_t m = col << 25 | 1u << 20, sh = col << 25;
       Write(ops, m + 0x91000, 0), Write(ops, m + 0x91004, 0), Write(ops, sh + 0x31000, 0);   // stop
       for (std::uint32_t r = 0; r < kMt; ++r) Write(ops, m + 0x91020 + 4 * r, 0);
@@ -135,28 +137,30 @@ class NpuProf {
     }
     return ops;
   }
-  static constexpr std::uint32_t SetupOps() {
-    return kTiles * (3 + kCore + kMem + 4 + 3) + kCols * (3 + kMt + kShim + 1 + 3);
+  std::uint32_t SetupOps() const {
+    return cols_ * kRows * (3 + kCore + kMem + 4 + 3) + cols_ * (3 + kMt + kShim + 1 + 3);
   }
+  // words per job (kValues with the engine's 8 columns)
+  std::uint32_t Values() const { return cols_ * kRows * kRegs + cols_ * (kMt + kShim) + 2; }
   const std::vector<std::uint8_t>& Read() const { return read_; }
   // Finish's jobs' timer stamps
   const std::vector<Times>& times() const { return times_; }
 
-  // After the last job's done: the firmware's log of every job's READ_REGS, kValues words per job in job order
+  // After the last job's done: the firmware's log of every job's READ_REGS, Values() words per job in job order
   // (col-major tiles, core counters then memory counters, then the memory tiles', the shims' and the timer; times()).
   // The sync queues behind the context's last command.
   std::vector<std::uint32_t> Finish(std::size_t jobs) {
-    if (jobs * kValues > kBytes / 4) throw LoomError("npu prof: more jobs than the debug buffer holds");
+    if (jobs * Values() > kBytes / 4) throw LoomError("npu prof: more jobs than the debug buffer holds");
     amdxdna_drm_sync_bo sb{};
     sb.handle = bo_, sb.direction = SYNC_DIRECT_FROM_DEVICE, sb.size = kBytes;
     if (ioctl(fd_, DRM_IOCTL_AMDXDNA_SYNC_BO, &sb)) throw LoomError("npu prof: SYNC_BO failed");
     Flush();
-    if (map_[jobs * kValues] != 0) std::fprintf(stderr, "npu prof: the log runs past the last job\n");
-    std::vector<std::uint32_t> v(map_, map_ + jobs * kValues);
+    if (map_[jobs * Values()] != 0) std::fprintf(stderr, "npu prof: the log runs past the last job\n");
+    std::vector<std::uint32_t> v(map_, map_ + jobs * Values());
     times_.clear();
     for (std::size_t j = 0; j < jobs; ++j) {
-      const std::uint32_t* const x = v.data() + j * kValues;
-      const std::uint64_t done = std::uint64_t{x[kValues - 1]} << 32 | x[kValues - 2];
+      const std::uint32_t* const x = v.data() + j * Values();
+      const std::uint64_t done = std::uint64_t{x[Values() - 1]} << 32 | x[Values() - 2];
       times_.push_back({done - x[0], done});
     }
     return v;
@@ -196,6 +200,7 @@ class NpuProf {
     ops.insert(ops.end(), op, op + 24);
   }
 
+  std::uint32_t cols_ = kCols;
   unsigned c_[kCore] = {}, m_[kMem] = {}, mt_[kMt] = {}, sh_[kShim] = {};
   std::uint32_t mt_sel_ = 0;
   std::map<std::string, std::vector<std::uint8_t>> setup_;   // per image

@@ -338,6 +338,29 @@ class LoomNpu {
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k.first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(run)");
     CheckHealth();
   }
+  // RunOnce with the AIE counters (YAH_NPU_PROF): the image's first command with the counters' setup before its ops
+  // and their READ_REGS after them. Returns the run's NpuProf values (one job; run/npu_run).
+  std::vector<std::uint32_t> RunOnceProf(const std::string& path, const std::string& entry, const std::vector<View>& views) {
+    if (!prof_) throw LoomError("npu: RunOnceProf without YAH_NPU_PROF");
+    Kernel& k = Load(path, entry, views, false);
+    program_.Forget();
+    ++epoch_;
+    const std::vector<std::uint8_t> first = FirstBytes(k);
+    std::uint32_t n = 0, size = 0;
+    std::memcpy(&n, first.data() + 8, 4), std::memcpy(&size, first.data() + 12, 4);
+    if (size != first.size()) throw LoomError("npu: unexpected command header");
+    std::vector<std::uint8_t> bytes(first.begin(), first.begin() + 16);
+    const std::vector<std::uint8_t>& setup = prof_->Setup(path);
+    bytes.insert(bytes.end(), setup.begin(), setup.end());
+    bytes.insert(bytes.end(), first.begin() + 16, first.end());
+    bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end());
+    n += prof_->SetupOps() + 1;
+    size = static_cast<std::uint32_t>(bytes.size());
+    std::memcpy(&bytes[8], &n, 4), std::memcpy(&bytes[12], &size, 4);
+    YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(Place(bytes)), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(run)");
+    CheckHealth();
+    return prof_->Finish(1);
+  }
   // k's command storage: the image's commands loaded into it, bound to views, and k's invocations in it.
   void LoadStorage(Kernel& k, const std::vector<View>& views) {
     const iree_hal_amd_xdna_image_tables_t* tables = iree_hal_amd_xdna_image_tables(k.image);
@@ -1599,7 +1622,7 @@ class LoomNpu {
     qi.queue_family_ordinal = family;
     YAH_AMDF(xdna_->kernel_queue_create(context_, &qi, &queue_), "xdna.kernel_queue_create");
     if (const char* spec = std::getenv("YAH_NPU_PROF")) {
-      prof_ = std::make_unique<NpuProf>(spec);
+      prof_ = std::make_unique<NpuProf>(spec, std::min<std::uint32_t>(columns_, NpuProf::kCols));
       amdf_xdna_context_info_t info{};
       info.type = AMDF_STRUCTURE_TYPE_XDNA_CONTEXT_INFO;
       info.structure_size = sizeof(info);
