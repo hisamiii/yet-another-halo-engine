@@ -618,33 +618,36 @@ PAIR_PORT = 3   # pair_swap's ring port on both tails (after A, W and C)
 
 
 def pair_copy(e, y, src, dst, swap=False):
-    """SW_HALF bytes from scalar address src to dst, 256 bytes an iteration (4 64-byte loads, then their stores); swap:
-    both ways (dst's bytes to src)."""
-    ER = "reg<aie2p.er>"
-    t = y[1:]
-    e(f"  {y}n = mova.i32 {SW_HALF // 256}")
-    e(f"  {y}st = mov.i32 256")
-    e(f"  {y}i0 = mova.i32 0")
-    e(f"  low.br ^{t}l({y}i0: {ER}, {src}: {ER}, {dst}: {ER})")
-    e(f"^{t}l({y}i: {ER}, {y}s: {ER}, {y}d: {ER}):")
-    e(f"  {y}m = lt {y}i, {y}n")
-    e(f"  low.cond_br {y}m, ^{t}b, ^{t}x : {ER}")
-    e(f"^{t}b:")
-    e(f"  {y}sa = mov.scalar-to-address {y}s")
-    e(f"  {y}da = mov.scalar-to-address {y}d")
-    for q in range(4):
-        e(f"  {y}v{q} = vlda.512.i32x16 {y}sa, {64 * q}")
-        if swap:
-            e(f"  {y}u{q} = vldb.512.i32x16 {y}da, {64 * q}")
-    for q in range(4):
-        e(f"  vst.512.i32x16 {y}v{q}, {y}da, {64 * q}")
-        if swap:
-            e(f"  vst.512.i32x16 {y}u{q}, {y}sa, {64 * q}")
-    e(f"  {y}i1 = add.rr {y}i, %one")
-    e(f"  {y}s1 = add.rr {y}s, {y}st")
-    e(f"  {y}d1 = add.rr {y}d, {y}st")
-    e(f"  low.br ^{t}l({y}i1: {ER}, {y}s1: {ER}, {y}d1: {ER})")
-    e(f"^{t}x:")
+    """SW_HALF bytes from scalar address src to dst, unrolled (a loop's branch delays and load waits cost ~25 bundles
+    per 256 bytes); swap: both ways (dst's bytes to src). Per KB one base pointer 512 bytes in (the immediates reach
+    -512 .. 448), 64-byte loads and stores in groups of four."""
+    def padd(name, src_, off):
+        cur, i = src_, 0
+        while off > 0:
+            step = min(off, 448)
+            off -= step
+            nxt = name if off == 0 else f"{name}_{i}"
+            i += 1
+            e(f"  {nxt} = padda {cur}, {step}")
+            cur = nxt
+        return cur
+    e(f"  {y}sa = mov.scalar-to-address {src}")
+    e(f"  {y}da = mov.scalar-to-address {dst}")
+    assert SW_HALF % 256 == 0
+    sb, db = f"{y}sa", f"{y}da"
+    for g in range(SW_HALF // 256):
+        k, qs = g // 4, range(4 * g, 4 * g + 4)
+        if g % 4 == 0:
+            sb = padd(f"{y}sb{k}", sb, 512 if k == 0 else 1024)
+            db = padd(f"{y}db{k}", db, 512 if k == 0 else 1024)
+        for q in qs:
+            e(f"  {y}v{q} = vlda.512.i32x16 {sb}, {64 * (q % 16) - 512}")
+            if swap:
+                e(f"  {y}u{q} = vldb.512.i32x16 {db}, {64 * (q % 16) - 512}")
+        for q in qs:
+            e(f"  vst.512.i32x16 {y}v{q}, {db}, {64 * (q % 16) - 512}")
+            if swap:
+                e(f"  vst.512.i32x16 {y}u{q}, {sb}, {64 * (q % 16) - 512}")
 
 
 def pair_swap(e, pair, slot, tag):
