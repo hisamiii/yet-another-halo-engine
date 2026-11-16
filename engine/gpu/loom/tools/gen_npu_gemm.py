@@ -2193,9 +2193,14 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         pc, pl = pc + [f"%pc{NT}"], pl + [f"%pl{NT}"]
     fifo = {"a": "%fa", "w": "%fw"}
 
+    wend = {}   # (GN_QWCONT) each sub-tile's final W FIFO state
+
     def units_for(t):
         x = f"s{t}"
         tw, tm = t % NP, t // NP
+        # (GN_QWCONT, Q' passes) a row's W blocks sit back to back and a sub-tile pops exactly its 63 lines: the W
+        # FIFO runs on into the next sub-tile (no pointer copy, no position reset; only the first fill)
+        wcont = qpass and os.environ.get("GN_QWCONT") == "1" and 0 < t < NT
         if tw == 0 and not (qpass and t == NT):
             wp, wsrc = [], "%w"
         else:   # (qpass: from the carried W slot, the next row's at t = NT)
@@ -2223,10 +2228,17 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         positions = [f"  %{x}qa = mova.fifo.position 0", f"  %{x}qw = mova.fifo.position 0"]
         # the tail is one pointer short for early W derivation (it has slack)
         early = (wp + positions) if not tail and t > 0 else []
-        init = ap + [f"  %{x}pa = copy {asrc} : reg<aie2p.ep> -> reg<aie2p.eps>"] + ([] if early else wp) + [
-                f"  %{x}pw = copy {wsrc} : reg<aie2p.ep> -> reg<aie2p.eps>"] + ([] if early else positions) + [
-                f"  %{x}pa1, %{x}fa1, %{x}qa1 = vlda.fill.512 %{x}pa, {fifo['a']}, %{x}qa",
-                f"  %{x}pw1, %{x}fw1, %{x}qw1 = vldb.fill.512 %{x}pw, {fifo['w']}, %{x}qw"]
+        if wcont:
+            assert not early and t - 1 in wend
+            pw0, fw0, qw0 = wend[t - 1]
+            init = ap + [f"  %{x}pa = copy {asrc} : reg<aie2p.ep> -> reg<aie2p.eps>", positions[0],
+                         f"  %{x}pa1, %{x}fa1, %{x}qa1 = vlda.fill.512 %{x}pa, {fifo['a']}, %{x}qa",
+                         f"  %{x}pw1, %{x}fw1, %{x}qw1 = vldb.fill.512 {pw0}, {fw0}, {qw0}"]
+        else:
+            init = ap + [f"  %{x}pa = copy {asrc} : reg<aie2p.ep> -> reg<aie2p.eps>"] + ([] if early else wp) + [
+                    f"  %{x}pw = copy {wsrc} : reg<aie2p.ep> -> reg<aie2p.eps>"] + ([] if early else positions) + [
+                    f"  %{x}pa1, %{x}fa1, %{x}qa1 = vlda.fill.512 %{x}pa, {fifo['a']}, %{x}qa",
+                    f"  %{x}pw1, %{x}fw1, %{x}qw1 = vldb.fill.512 %{x}pw, {fifo['w']}, %{x}qw"]
         st = {"pa": f"%{x}pa1", "fa": f"%{x}fa1", "qa": f"%{x}qa1", "pw": f"%{x}pw1", "fw": f"%{x}fw1", "qw": f"%{x}qw1"}
         units, carry, n = [], [], 0
         for k in range(ks):
@@ -2250,6 +2262,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         if carry:
             units.append(carry)
         fifo["a"], fifo["w"] = st["fa"], st["fw"]
+        wend[t] = (st["pw"], st["fw"], st["qw"])
         return early, init, units
 
     # each unit (a pop, maybe a fill) rides with one MMA; at a sub-tile boundary of the head and mids the next
