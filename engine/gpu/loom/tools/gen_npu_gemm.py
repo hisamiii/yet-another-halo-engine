@@ -79,8 +79,34 @@ def qa3_on():
     return on
 
 
+# GN_QCB1=1 (with GN_QA3): all of C in Loom bank 1 (the C ring and the odd sub-tiles' area, in its own storage block),
+# all A slots in bank 2 beside the small private block: the core's C and A accesses never share a bank (the A DMA
+# then always writes the bank the core reads A from)
+QCB1_RING_AT = "2048@16384:18432:20480:22528,16128@0:49152,4032@32768:36864:40960"
+
+
+def qcb1_on():
+    on = os.environ.get("GN_QCB1") == "1"
+    assert not on or qa3_on(), "GN_QCB1 needs GN_QA3"
+    return on
+
+
+# GN_QA4=1 (with GN_QBANK=3): four A slots alternating Loom banks 1 and 2 (slot order 24576, 32768, 28672, 36864):
+# the A DMA, up to three slots ahead, fills a slot in the other bank than the one the core reads (as the W ring
+# does), and 4 divides a firing's 64 rows (every firing starts at slot 0). Room: the odd sub-tiles' area in its own
+# block at bank 2's top, the never-run zero-fill block and its 1 KB buffer dropped (private: 128 B beside a W slot).
+QA4_RING_AT = "2048@16384:18432:20480:22528,16128@0:49152,4032@24576:32768:28672:36864"
+
+
+def qa4_on():
+    on = os.environ.get("GN_QA4") == "1"
+    assert not on or (qpass_on() and os.environ.get("GN_QBANK") == "3" and not qa3_on()), \
+        "GN_QA4 needs GN_QPASS, GN_QBANK=3, not GN_QA3"
+    return on
+
+
 def acap_tail(cfg):
-    return 3 if qa3_on() else cfg.acap_t
+    return 4 if qa4_on() else 3 if qa3_on() else cfg.acap_t
 
 
 def qpass_cslots():
@@ -1660,9 +1686,9 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     tail = role == "tail"
     fa = slab(ks)
     acap = acap_tail(cfg) if tail else cfg.acap
-    a_adv = acap == MP and not qa3_on()   # a ring of MP slabs is addressed like a whole record: the base advances per iteration
+    a_adv = acap == MP and not (qa3_on() or qa4_on())   # a ring of MP slabs is addressed like a whole record: the base advances per iteration
     # mu 1 with a 2-slot ring: the slot alternates per iteration (body: the base steps +1 / -1 slab by parity)
-    assert MP % cfg.mu == 0 and (a_adv or cfg.mu % acap == 0 or (cfg.mu, acap) in ((1, 2), (1, 3))), \
+    assert MP % cfg.mu == 0 and (a_adv or cfg.mu % acap == 0 or (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4))), \
         "ring slot of a row must be static per iteration"
     name = name or role + ("_g" if gate else "")
     fills = cov is not None
@@ -1728,7 +1754,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     qbank = tail and os.environ.get("GN_QBANK") in ("1", "2", "3") and os.environ.get("GN_QCORE")
     q3 = qbank and os.environ.get("GN_QBANK") == "3"
     if qbank:   # (QBANK_RING_AT pins the slots) A slot 1 a 16 KB bank above slot 0 (a_next); C rows (body)
-        assert (cfg.mu, acap) in ((1, 2), (1, 3)) and not a_adv and MP == 4 and NP == 4 and fa <= 4096
+        assert (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)) and not a_adv and MP == 4 and NP == 4 and fa <= 4096
     assert not q3 or qpass, "GN_QBANK=3 needs GN_QPASS=1"
     e(f"  %kks = mova.i32 {fa // 16}")
     e("  %fstep = mul %k144, %kks")   # slab stride
@@ -1739,8 +1765,9 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     e("  %mcs = mov.modifier %cstep")
     e("  %mz = mov.modifier %zero")
     if q3:   # the odd sub-tiles' area; %qodb: row 0 sub-tile 1's pointer (the odd chain's first)
-        e("  %qods = storage {byte_alignment = 1024, byte_length = 8192} : low.storage<private>")
-        e("  %qod = storage_address %qods : low.storage<private> -> reg<aie2p.ep>")
+        sp = "scratch" if qcb1_on() or qa4_on() else "private"   # (GN_QCB1: its own block, placed apart from the private one)
+        e(f"  %qods = storage {{byte_alignment = 1024, byte_length = 8192}} : low.storage<{sp}>")
+        e(f"  %qod = storage_address %qods : low.storage<{sp}> -> reg<aie2p.ep>")
         e("  %qodc = copy %qod : reg<aie2p.ep> -> reg<aie2p.ep>")
         bump(L, "%qodb", "%qodc", 512)
     if tail:
@@ -1823,8 +1850,9 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
             e("  %dsh = add.rr %os, %dho")
             e("  %dss = add.rr %dsh, %dso")
         # first pass: C loads read a 1 KB zero buffer with step 0
-        e("  %zst = storage {byte_alignment = 64, byte_length = 1024} : low.storage<private>")
-        e("  %zbp = storage_address %zst : low.storage<private> -> reg<aie2p.ep>")
+        if not qa4_on():
+            e("  %zst = storage {byte_alignment = 64, byte_length = 1024} : low.storage<private>")
+            e("  %zbp = storage_address %zst : low.storage<private> -> reg<aie2p.ep>")
         if cfg.dfr:   # the zero buffer's address: the deferred store fifo's dummy source
             e("  %zsc0 = mov.address-to-scalar %zbp")
         if cfg.dfr and cfg.dfi:   # the inline push's target in a firing without a deferred segment
@@ -1855,14 +1883,15 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e(f"  %olc = copy {'%oh' if cfg.dfr else '%o'} : reg<aie2p.ep> -> reg<aie2p.ep>")
         bump(L, "%olb", "%olc", 512)
         e("  low.br ^start(%olb: reg<aie2p.ep>)")
-        e("^zfill:")
-        e("  %zacc = acc.clear.f32x64")
-        e("  %zp = slice %zacc[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>")
-        e("  %zbc = copy %zbp : reg<aie2p.ep> -> reg<aie2p.ep>")
-        bump(L, "%zbb", "%zbc", 512)
-        for q in range(16):
-            e(f"  vst.acc %zp, %zbb, {64 * q - 512}")
-        e("  low.br ^start(%zbb: reg<aie2p.ep>)")
+        if not qa4_on():
+            e("^zfill:")
+            e("  %zacc = acc.clear.f32x64")
+            e("  %zp = slice %zacc[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>")
+            e("  %zbc = copy %zbp : reg<aie2p.ep> -> reg<aie2p.ep>")
+            bump(L, "%zbb", "%zbc", 512)
+            for q in range(16):
+                e(f"  vst.acc %zp, %zbb, {64 * q - 512}")
+            e("  low.br ^start(%zbb: reg<aie2p.ep>)")
         e("^start(%plb: reg<aie2p.ep>):")
         if qpass:   # (the W slot as a scalar: the loop carries it)
             e("  %wsb = mov.address-to-scalar %w")
@@ -2166,7 +2195,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     # rides in sub-tile 1; a last pass converts every row after the loop
     qrow = tail and bool(os.environ.get("GN_QCORE")) and os.environ.get("GN_QROW") == "1"
     if qrow:
-        assert cfg.mu == 1 and acap in (2, 3) and not a_adv and not cfg.swiglu and not cfg.dfr and not cfg.ofeat
+        assert cfg.mu == 1 and acap in (2, 3, 4) and not a_adv and not cfg.swiglu and not cfg.dfr and not cfg.ofeat
         QEr, QE2r = (json.load(open(os.environ["GN_QCORE"]))[k] for k in ("E", "E2"))
     qpass = qrow and qpass_on()
     # swiglu tail: the A pointer is loop-carried as a scalar, a short-lived pointer per sub-tile. Its store fifo pins
@@ -2369,7 +2398,22 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e("  %fsn = mul %fstep, %nxm")
             e("  %mfn = mov.modifier %fsn")
             mf = "%mfn"
-        if not a_adv and (cfg.mu, acap) == (1, 3):   # (GN_QA3) slot j = (mp + %qai) % 3: +4 KB, from slot 2 -8 KB
+        if not a_adv and (cfg.mu, acap) == (1, 4):   # (GN_QA4) slot i = mp & 3: +8 KB, -4 KB, +8 KB, -12 KB
+            e("  %q4k3 = mova.i32 3")
+            e("  %q4i = and %mp, %q4k3")
+            e("  %q4o = and %mp, %one")
+            e("  %q4l = lt %k2, %q4i")
+            e("  %q4ak = mova.i32 16")
+            e("  %q4a = mul %k512, %q4ak")
+            e("  %q4bk = mova.i32 -24")
+            e("  %q4b = mul %k512, %q4bk")
+            e("  %q4ck = mova.i32 -16")
+            e("  %q4c = mul %k512, %q4ck")
+            e("  %q4x = mul %q4b, %q4o")
+            e("  %q4y = mul %q4c, %q4l")
+            e("  %q4xy = add.rr %q4x, %q4y")
+            e("  %pst = add.rr %q4a, %q4xy")
+        elif not a_adv and (cfg.mu, acap) == (1, 3):   # (GN_QA3) slot j = (mp + %qai) % 3: +4 KB, from slot 2 -8 KB
             e("  %q3j = add.rr %mp, %qai")
             e("  %q3k = mova.i32 171")   # j // 3 = (j * 171) >> 9 for j < 256
             e("  %q3m = mul %q3j, %q3k")
@@ -2400,9 +2444,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e("  %pst = mul %pstr, %nxm")
             else:
                 e(f"  %pst = sub {fs}, %pst0")
-        if spa and not a_adv and (cfg.mu, acap) in ((1, 2), (1, 3)):
+        if spa and not a_adv and (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)):
             e("  %pan = add.rr %pa, %pst")
-        elif not a_adv and (cfg.mu, acap) in ((1, 2), (1, 3)):
+        elif not a_adv and (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)):
             e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
             e("  %pmod = mov.modifier %pst")
             e("  %pan = padds.modifier %pac, %pmod")
