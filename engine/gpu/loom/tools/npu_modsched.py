@@ -1,15 +1,16 @@
-"""Modulo schedule of a decoder hot loop: the GMIX grid's (gen_npu_dec GMOD, unit (pr, hh)) or IQ4_XS's (I4MOD, unit
-(t, u, cc, hh)): op offsets in a unit, one unit per II cycles.
+"""Modulo schedule of a decoder hot loop: the GMIX grid's (gen_npu_dec GMOD, unit (pr, hh)), the IQ3_S byte grid's
+(G8MOD, unit (pr, hh)) or IQ4_XS's (I4MOD, unit (t, u, cc, hh)): op offsets in a unit, one unit per II cycles.
 CP-SAT model (pip install ortools) of the unit: Loom's issue distances, one op per cycle per resource modulo II, the
 register budget (concat groups hold their whole aligned width) and the pushes in a window without loads.
-Usage: npu_modsched.py [II] [seconds] [grid | iq4xs] -> prints the table; checks it over a whole record (16 units).
+Usage: npu_modsched.py [II] [seconds] [grid | g8 | iq4xs] -> prints the table; checks it over a whole record (16 units).
 (I4MOD: II 32, 300 s; II 29 finds nothing in 120 s.)"""
 import collections, sys
 from ortools.sat.python import cp_model
 
 II = int(sys.argv[1]) if len(sys.argv) > 1 else 29
 SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 300
-I4 = (sys.argv[3] if len(sys.argv) > 3 else "grid") == "iq4xs"
+KIND = sys.argv[3] if len(sys.argv) > 3 else "grid"
+I4, G8 = KIND == "iq4xs", KIND == "g8"
 VEC, ACC = 22, 20      # vec256 units (Loom fails at 24 with fragmentation), mbms units
 
 # unit ops: name -> (resources, inputs, (register class, units)); P = the load port (vlda and gathers share it)
@@ -35,6 +36,28 @@ if I4:
         OPS[f"m1{n}"] = (("V",), [f"m0{n}", "r1a", "r1b", f"x0{k}", f"x1{k}"], ("a", 4))
     GROUPS = [[f"g{g}{hf}l", f"g{g}{hf}h"] for g in range(4) for hf in range(2)]
     GROUPS += [["x0l", "x1l"], ["x0h", "x1h"]] + [[f"r{p}a", f"r{p}b"] for p in range(2)]
+elif G8:
+    for pos in range(2):
+        for k in "gs":
+            OPS[f"a{pos}{k}"] = (("P",), [], ("v", 2))                              # address vector loads
+            for hf in range(2):
+                for lh in "lh":
+                    OPS[f"g{pos}{k}{hf}{lh}"] = (("P",), [f"a{pos}{k}"], ("v", 1))  # gathers
+            OPS[f"w{pos}{k}"] = (("MV", "RM"), [f"g{pos}{k}{hf}{lh}" for hf in range(2) for lh in "lh"], ("v", 2))
+        for hf in range(2):                                                         # grid / sign bytes zipped, doubled
+            OPS[f"z{pos}{hf}"] = (("MV", "RM"), [f"w{pos}g", f"w{pos}s"], ("v", 2))
+            OPS[f"b{pos}{hf}"] = (("MV",), [f"z{pos}{hf}"], ("v", 2))
+    for p in range(2):
+        OPS[f"t{p}"] = (("P",), [], ("v", 2))
+        OPS[f"c{p}"] = (("MV",), [f"t{p}"], ("v", 2))
+        OPS[f"r{p}a"] = (("MV", "RM"), [f"c{p}"], ("v", 2))
+        OPS[f"r{p}b"] = (("MV", "RM"), [f"c{p}"], ("v", 2))
+    for pos in range(2):
+        OPS[f"m0{pos}"] = (("V",), ["r0a", "r0b", f"b{pos}0", f"b{pos}1"], ("a", 4))
+    for pos in range(2):
+        OPS[f"m1{pos}"] = (("V",), [f"m0{pos}", "r1a", "r1b", f"b{pos}0", f"b{pos}1"], ("a", 4))
+    GROUPS = [[f"g{pos}{k}{hf}l", f"g{pos}{k}{hf}h"] for pos in range(2) for k in "gs" for hf in range(2)]
+    GROUPS += [[f"b{pos}0", f"b{pos}1"] for pos in range(2)] + [[f"r{p}a", f"r{p}b"] for p in range(2)]
 else:
     for pos in range(2):
         for k in "gs":
@@ -187,4 +210,4 @@ O = {n: sol.Value(s[n]) for n in names}
 viol, pv, pa = check(O)
 print(f"II {II}: {sol.StatusName(st)}, record {15 * II + max(O.values()) - min(O.values())} cycles, vec {pv}, acc {pa}, "
       f"violations {viol}")
-print(("I4MOD" if I4 else "GMOD") + " = dict(" + ", ".join(f"{n}={c}" for n, c in sorted(O.items(), key=lambda kv: (kv[1], kv[0]))) + ")")
+print(("I4MOD" if I4 else "G8MOD" if G8 else "GMOD") + " = dict(" + ", ".join(f"{n}={c}" for n, c in sorted(O.items(), key=lambda kv: (kv[1], kv[0]))) + ")")

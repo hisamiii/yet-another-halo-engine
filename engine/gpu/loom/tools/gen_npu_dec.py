@@ -47,6 +47,12 @@ GMOD = dict(a1s=5, a1g=6, a0s=14, mg1=14, a0g=15, ms1=15, g1g0l=16, g1g0h=17, g1
             g1s0h=22, ms0=22, g1s0l=23, mg0=23, g0s1l=24, t0=25, g0s1h=26, g0s0l=27, g0s0h=28, b11=29, g0g1l=29, b10=30,
             g0g1h=30, g0g0l=31, c0=32, g0g0h=32, r0b=33, t1=33, r0a=34, p0=36, b01=37, b00=39, c1=40, m01=40, m00=41,
             r1a=41, r1b=42, m11=44, m10=45, p1=64, p2=66, p3=67, fl=68)
+# IQ3_S byte-grid (G8) hot loop: the same in a unit (pr, hh), a unit every G8II cycles (tools/npu_modsched.py 29 300 g8)
+G8II = 29
+G8MOD = dict(a1g=1, a1s=14, g1g1h=15, g1g1l=16, g1g0h=17, g1g0l=18, a0g=19, t0=20, g1s0h=21, g1s0l=22, g1s1l=23,
+             g1s1h=24, a0s=25, w1g=25, g0g0h=26, g0g0l=27, c0=28, g0g1l=28, g0g1h=29, r0a=30, t1=31, w1s=31, g0s0h=32,
+             r0b=32, g0s0l=33, z10=33, g0s1h=34, z11=34, g0s1l=35, b11=36, b10=37, p0=37, c1=38, w0g=40, m01=41, r1a=41,
+             w0s=42, r1b=43, m11=45, z00=45, z01=46, b00=47, b01=48, m00=50, m10=54, p1=64, p2=65, p3=67, fl=68)
 # IQ4_XS hot loop (SLU): op offsets (cycles) in a unit (t, u, cc, hh); a unit starts every I4II cycles
 # (tools/npu_modsched.py 32 300 iq4xs)
 I4M = FMT == "IQ4_XS"
@@ -1961,6 +1967,86 @@ def leaf(name="dec"):
                 for n_ in range(2):
                     for j_, a_ in enumerate((parked[pr][n_], accs[n_])):
                         cap(t + O[f"p{2 * n_ + j_}"], lambda: push(x, a_))
+                if pr % 2 == 1:
+                    cap(t + O["fl"], lambda: flush(x))
+        # same cycle: slices, then loads, then the rest (Loom splits a bundle where a load follows an MV op)
+        tl.sort(key=lambda r_: (r_[0], 0 if " = slice" in r_[2] else 1 if " = vld" in r_[2] else 2, r_[1]))
+        e.L += [s_ for _, _, s_ in tl]
+        frags, tails = [], []
+    elif GMIX and G8:
+        # ---- IQ3_S byte-grid hot, modulo-scheduled (G8MOD) in one in-order stream: unit (pr, hh) = both positions of a
+        # k-block pair; per position grid / sign address loads, 8 gathers, words compacted, zipped, doubled; T shared
+        x = e.stream()
+        tl = []
+
+        def op(c, s_):
+            tl.append((c, len(tl), "  " + s_))
+
+        def cap(c, fn):
+            n0 = len(x.L)
+            r_ = fn()
+            for s_ in x.L[n0:]:
+                tl.append((c, len(tl), s_))
+            del x.L[n0:]
+            return r_
+        O = G8MOD
+        gpp, parked = {}, {}
+        for pr in range(8):
+            for hh in range(2):
+                t = (2 * pr + hh) * G8II
+                key = (hh, pr // 4)
+                if key not in gpp:     # pairs 4 j .. 4 j + 3 of a half: offsets -512 .. 448
+                    gpp[key] = cap(t + min(O.values()) - 3, lambda: P(x, "%spb", GAS + 2048 * hh + 1024 * (pr // 4) + 512))
+                xs4 = []
+                for pos in range(2):
+                    kw = {}
+                    for kind, off in (("g", 0), ("s", 128)):
+                        ad = x.t("ad")
+                        op(t + O[f"a{pos}{kind}"], f"{ad} = vlda.512.i8x64 {gpp[key]}, {256 * (pr % 4) + off + 64 * pos - 512}")
+                        gcs = []
+                        for hf_ in range(2):
+                            av, gl, gh, gc = x.t("av"), x.t("gl"), x.t("gh"), x.t("gc")
+                            cl, ch = t + O[f"g{pos}{kind}{hf_}l"], t + O[f"g{pos}{kind}{hf_}h"]
+                            op(min(cl, ch), f"{av} = slice {ad}[{hf_}] : {V2} -> {V1}")
+                            op(cl, f"{gl} = vldb.4x32.lo {av}")
+                            op(ch, f"{gh} = vldb.4x32.hi {av}")
+                            op(max(cl, ch), f"{gc} = concat({gl}, {gh}) : ({V1}, {V1}) -> {V2}")
+                            gcs.append(gc)
+                        kw[kind] = x.t("kw")
+                        op(t + O[f"w{pos}{kind}"], f"{kw[kind]} = vshuffle {gcs[0]}, {gcs[1]}, {m4c}")
+                    xvs = []
+                    for hf_ in range(2):
+                        z_, xv = x.t("zw"), x.t("xv")
+                        op(t + O[f"z{pos}{hf_}"], f"{z_} = vshuffle {kw['g']}, {kw['s']}, {(m20, m21)[hf_]}")
+                        op(t + O[f"b{pos}{hf_}"], f"{xv} = vadd.16 {z_}, {z_}")
+                        xvs.append(xv)
+                    x4 = x.t("X")
+                    op(t + max(O[f"b{pos}0"], O[f"b{pos}1"]), f"{x4} = concat({xvs[0]}, {xvs[1]}) : ({V2}, {V2}) -> {V4}")
+                    xs4.append(x4)
+                ts = []
+                for p in range(2):
+                    ld, bc, ra, rb, t4 = x.t("pl"), x.t("bc"), x.t("ra"), x.t("rb"), x.t("TB")
+                    op(t + O[f"t{p}"], f"{ld} = vlda.512.bf16x32 {sp0}, {(hh * NPARTS + p) * 64}")
+                    op(t + O[f"c{p}"], f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {pr // 2}")
+                    op(t + O[f"r{p}a"], f"{ra} = vshuffle {bc}, {bc}, {m52}")
+                    op(t + O[f"r{p}b"], f"{rb} = vshuffle {bc}, {bc}, {m53}")
+                    op(t + max(O[f"r{p}a"], O[f"r{p}b"]), f"{t4} = concat({ra}, {rb}) : ({V2}, {V2}) -> {V4}")
+                    ts.append(t4)
+                accs = []
+                for pos in range(2):
+                    a0 = x.t("ac")
+                    op(t + O[f"m0{pos}"], f"{a0} = mmul.bf16bf16.m8n8k1 {ts[0]}, {xs4[pos]}, {conf}")
+                    accs.append(a0)
+                for pos in range(2):
+                    a1 = x.t("ac")
+                    op(t + O[f"m1{pos}"], f"{a1} = mma.bf16bf16.m8n8k1 {accs[pos]}, {ts[1]}, {xs4[pos]}, {conf}")
+                    accs[pos] = a1
+                if hh == 0:
+                    parked[pr] = accs
+                    continue
+                for n_ in range(2):
+                    for j_, a_ in enumerate((parked[pr][n_], accs[n_])):
+                        cap(t + O[f"p{2 * n_ + j_}"], lambda a_=a_: push(x, a_))
                 if pr % 2 == 1:
                     cap(t + O["fl"], lambda: flush(x))
         # same cycle: slices, then loads, then the rest (Loom splits a bundle where a load follows an MV op)
