@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 23:30:00 +0100
+Subject: [PATCH] loom : take an authored hardware loop trip count
+
+LOOM_EXP_HWLOOP_TRIP=N: a structural hardware-loop candidate without producer facts (an asm leaf) runs N iterations.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
+@@ -6,6 +6,7 @@
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.h"
+ 
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "iree/base/internal/math.h"
+@@ -238,8 +239,15 @@
+   const loom_low_schedule_table_t* schedule = &frame->schedule;
+   const loom_cfg_graph_t* graph = &schedule->cfg_graph;
+   const loom_cfg_loop_nest_t* nest = &schedule->loop_nest;
++  // EXPERIMENT (LOOM_EXP_HWLOOP_TRIP=N): an authored (asm) loop has no
++  // producer-proven count; the author states it. A structural candidate
++  // without facts runs exactly N body iterations (1..1023).
++  const char* trip_env = getenv("LOOM_EXP_HWLOOP_TRIP");
++  const uint64_t authored_trip =
++      trip_env != NULL ? (uint64_t)strtoull(trip_env, NULL, 10) : 0;
+   if (!nest->reducible || nest->loop_count == 0 ||
+-      schedule->loop_execution.block_count != schedule->block_count) {
++      (authored_trip == 0 &&
++       schedule->loop_execution.block_count != schedule->block_count)) {
+     return;
+   }
+   for (uint16_t loop_index = 0; loop_index < nest->loop_count; ++loop_index) {
+@@ -322,6 +330,11 @@
+     const loom_low_loop_execution_facts_t* facts =
+         loom_low_loop_execution_index_lookup(
+             &schedule->loop_execution, schedule->blocks[header_index].block);
++    const loom_low_loop_execution_facts_t authored_facts = {
++        .trip_count = authored_trip,
++        .count_kind = LOOM_LOW_LOOP_EXECUTION_COUNT_EXACT,
++    };
++    if (facts == NULL && authored_trip != 0) facts = &authored_facts;
+     if (facts == NULL ||
+         facts->count_kind != LOOM_LOW_LOOP_EXECUTION_COUNT_EXACT ||
+         facts->trip_count == 0 || facts->trip_count > 1023u) {
