@@ -2569,6 +2569,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         gs_ = [g for s_ in range(1, NT - 1) for g in range((s_ * ks + QE2r + 2) * 4, (s_ * ks + ks - 6) * 4, 2)]
         if len(gs_) < len(lat):   # (short sub-tiles, ks < 28: one line per MMA)
             gs_ = [g for s_ in range(1, NT - 1) for g in range((s_ * ks + QE2r + 2) * 4, (s_ * ks + ks - 6) * 4)]
+        if len(gs_) < len(lat):   # (ks 16: sub-tile 0's too, and up to 3 lines an MMA)
+            gs_ = list(range((QE2r + 2) * 4, (ks - 6) * 4)) + gs_
+            gs_ = sorted(gs_ * 3)
         assert len(gs_) >= len(lat) and len(late_) == 2, (len(gs_), len(lat), len(late_), ks, QE2r, QEr)
         for g, ln in zip(gs_, lat):
             slots.setdefault(g, []).append(ln)
