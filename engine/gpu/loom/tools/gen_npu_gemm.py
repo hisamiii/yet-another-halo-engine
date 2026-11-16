@@ -1268,9 +1268,8 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
         e(f"  %fzem{i} = lt %fzei{i}, %fznr{i}")
         e(f"  low.cond_br %fzem{i}, ^fze{i}b, ^fze{i}s : reg<aie2p.er>")
         e(f"^fze{i}b:")
-        e(f"  acq %fzEm1, {dp}")
         sp_, b_ = egress_record(e, f"{i}", f"%fzes{i}", f"%fzec{i}", f"%fzdl{i}", fw, cfg.hcap if (helper or "")[:1] == "M" else 2,
-                                eg512(cfg))
+                                eg512(cfg), acq=f"  acq %fzEm1, {dp}")
         e(f"  rel %fzE1, {dp}")
         e(f"  %fzcs{i} = padda {sp_}, {4 * fw - b_}")
         e(f"  %fzec1{i} = add.rr %fzec{i}, %fzE1")
@@ -1339,12 +1338,14 @@ def eg512(cfg):
     return bool(cfg.eg512) and all(k % 4 == 0 for k in cfg.ks) and fuse_hx(cfg) % 4 == 0
 
 
-def egress_record(e, t, src, cnt, ring, fw, slots=2, w512=False):
+def egress_record(e, t, src, cnt, ring, fw, slots=2, w512=False, acq=None):
     """One egress record: fw words from src (16-byte aligned: k-blocks are 144 bytes) into the egress ring slot of
     record count cnt mod slots, straight-line in chunks of up to 12 copies (all loads, then all stores), each through
     pointers 64 bytes in (immediates reach -128 .. 112; padda steps by multiples of 64). w512 (64-byte aligned src):
-    64-byte copies in chunks of up to 7, loads alternating the A / B lanes, pointers 256 bytes in. Returns (the source
-    pointer now: padda consumes src, its byte offset from src)."""
+    64-byte copies in chunks of up to 7, loads alternating the A / B lanes, pointers 256 bytes in: every chunk's loads
+    first (loom cannot prove a store leaves the next chunk's source alone), then acq (the ring slot's lock: the
+    source is the core's own), then the stores. Returns (the source pointer now: padda consumes src, its byte offset
+    from src)."""
     e(f"  %fzk1{t} = mova.i32 {slots - 1}")
     e(f"  %fzer{t} = and {cnt}, %fzk1{t}")
     e(f"  %fzerb{t} = mov.i32 {4 * fw}")
@@ -1353,6 +1354,7 @@ def egress_record(e, t, src, cnt, ring, fw, slots=2, w512=False):
     off = 0
     if w512:
         assert fw % 16 == 0
+        stores = []
         for c, q0 in enumerate(range(0, fw // 16, 7)):   # (padda steps reach 448)
             o = 64 * q0 + 256
             e(f"  %fzsx{t}_{c} = padda {src}, {o - off}")
@@ -1363,9 +1365,14 @@ def egress_record(e, t, src, cnt, ring, fw, slots=2, w512=False):
             qs = range(q0, min(q0 + 7, fw // 16))
             for q in qs:
                 e(f"  %fzv{t}_{q} = {'vldb' if q % 2 else 'vlda'}.512.i32x16 {src}, {64 * (q - q0) - 256}")
-            for q in qs:
-                e(f"  vst.512.i32x16 %fzv{t}_{q}, %fzed{t}_{c}, {64 * (q - q0) - 256}")
+            stores += [f"  vst.512.i32x16 %fzv{t}_{q}, %fzed{t}_{c}, {64 * (q - q0) - 256}" for q in qs]
+        if acq:
+            e(acq)
+        for ln in stores:
+            e(ln)
         return src, off
+    if acq:
+        e(acq)
     for c, q0 in enumerate(range(0, fw // 4, 12)):
         o = 16 * q0 + 64
         e(f"  %fzsx{t}_{c} = padda {src}, {o - off}")
