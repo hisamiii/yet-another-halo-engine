@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <immintrin.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +33,15 @@ std::vector<char> ReadAll(const std::string& path) {
   f.seekg(0);
   f.read(data.data(), static_cast<std::streamsize>(data.size()));
   return data;
+}
+
+// The host pages are cached write-back and the NPU's DMA does not snoop the CPU caches (LoomNpu flushes its own
+// command storage the same way): write the copied-in bytes back before the run, and drop the lines before reading
+// what the NPU wrote.
+void FlushLines(const void* p, std::size_t n) {
+  const auto* c = static_cast<const char*>(p);
+  for (std::size_t i = 0; i < n; i += 64) _mm_clflushopt(const_cast<char*>(c + i));
+  _mm_sfence();
 }
 
 }  // namespace
@@ -64,10 +74,12 @@ int main(int argc, char** argv) {
     for (const auto& f : files) {
       LoomNpu::Shared& s = npu.CreateShared(f.size() ? f.size() : 4, true);
       std::memcpy(s.host, f.data(), f.size());
+      FlushLines(s.host, s.bytes);
       views.push_back({&s, 0, f.size()});
     }
     npu.RunOnce(image, entry, views);
     for (const auto& [b, path] : outputs) {
+      FlushLines(views[b].shared->host, views[b].shared->bytes);
       std::ofstream out(path, std::ios::binary);
       out.write(static_cast<const char*>(views[b].shared->host), static_cast<std::streamsize>(files[b].size()));
       if (!out) throw LoomError("cannot write " + path);
