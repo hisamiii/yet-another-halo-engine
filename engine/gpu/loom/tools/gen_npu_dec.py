@@ -2437,7 +2437,7 @@ def leaf(name="dec"):
                         flush(pt)                          # every 8 pushes (SLU: the iteration-end flush too)
                 tails.append(pt.L)
     if frags:
-        run(frags, int(os.environ.get("DQ_WINH", "1" if Q3K else "3" if GF else "6")), tails,   # Q3_K: 4 x4 operands per stream
+        run(frags, int(os.environ.get("DQ_WINH", "3" if Q3K or GF else "6")), tails,
             hv=int(os.environ.get("DQ_HHV", "20" if XSL else "24")),   # IQ2_XS: X (4 vec256) per G stream, 8 T rows per C
             full=False)                                     # (the full unit table slows the IQ2_XS hot loop)
     if SLU:
