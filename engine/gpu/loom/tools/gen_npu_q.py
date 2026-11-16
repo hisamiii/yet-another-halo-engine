@@ -47,6 +47,8 @@ def array_program(L, cfg):
         e(f"  %rw{c} = receiver %k{c}, 1 : reg<aie2p.array.receiver : tile<{wrec // 4}xi32>>")
         e(f"  %chw{c} = channel %wv{c}, %rw{c}, %two, %rec : reg<aie2p.array.channel : tile<{wrec // 4}xi32>>")
         e(f"  constrain.stage %chw{c}, %n{c if cols > 1 else 1}")
+        if N.qpass_on():   # (GN_QPASS) the leaf walks the W ring: one firing per M block
+            e(f"  constrain.leaf_sync %chw{c}")
     fa = N.slab(ks)
     e(f"  %as0 = sender %ab, 0 : reg<aie2p.array.sender : tile<{nb * P * MP}x{fa // 4}xi32>>")
     e(f"  %a0 = view.sender %as0, %origin : reg<aie2p.array.sender : tile<{fa // 4}xi32>>")
