@@ -105,6 +105,17 @@ def qa4_on():
     return on
 
 
+# GN_QPEEL=1 (with GN_QA4): the last pass peeled: the (pass, row) loop runs MP * (passes - 1) iterations, then a copy
+# of its body runs the last pass's MP rows, storing each sub-tile's sums straight to bf16 in its row's C slot (sub-tile
+# t at 512 t, as the post-loop convert packed them) and releasing the slot at the row's end: no post-loop convert, and
+# the output DMA drains each slot while the next rows run. In place: a sub-tile's bf16 lands in the f32 of sub-tile
+# t & 2 (even area), whose loads precede the store through the MMA / pop chain.
+def qpeel_on():
+    on = os.environ.get("GN_QPEEL") == "1"
+    assert not on or qa4_on(), "GN_QPEEL needs GN_QA4"
+    return on
+
+
 def acap_tail(cfg):
     return 4 if qa4_on() else 3 if qa3_on() else cfg.acap_t
 
@@ -270,7 +281,7 @@ def loom_env(cfg):
         if os.environ.get("GN_QACQREL") == "1":   # (UNSAFE: FIFO pops are not ordered behind the acquire)
             env["LOOM_EXP_LOCK_ACQREL"] = "6"
     if qpass_on() and os.environ.get("GN_QHW") != "0":   # the (pass, row) loop as a hardware loop (HRX patch 0080: the
-        env["LOOM_EXP_HWLOOP_TRIP"] = str(MP * cfg.passes)   # authored trip count; the image's only loop)
+        env["LOOM_EXP_HWLOOP_TRIP"] = (f"{MP * (cfg.passes - 1)},{MP}" if qpeel_on() else str(MP * cfg.passes))   # authored trip count; the image's only loop)
     if qpass_on() and os.environ.get("GN_QLOCK") == "1":   # spread lock lines, reads 2 / 1 cycles from a lock (HRX
         # patch 0081; still ordered: the first reads after an acquire hit the slot's start, which the DMA wrote first,
         # and the last ones before a release hit its end, which the DMA writes last)
@@ -3358,7 +3369,63 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             pln = ", %pln: reg<aie2p.ep>" if tail else ""
             e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln}{dfa(dfifo)})")
     e("^exit:")
-    if q3:   # each row: its f32 sub-tiles (even area, odd area, alternating) packed to bf16 in its even half
+    if qpeel_on():
+        assert q3 and qrow and qpass and NT == NP == 4 and not cfg.dfr
+        i0 = L.index("^obody:", hdr)
+        hl = next(ln for ln in L[hdr:i0] if ln.startswith("^outer("))
+        hargs = [a.split(": ", 1) for a in hl[len("^outer("):-2].split(", ")]
+        back = L[-2]
+        assert L[-1] == "^exit:" and back.startswith("  low.br ^outer(") and back.endswith(")"), (back, L[-1])
+        body = L[i0 + 1:-2]
+        bdefs = {n for ln in body if " = " in ln for n in re.findall(r"%\w+", ln.partition(" = ")[0])}
+        pren = {n: n + "_P" for n in bdefs | {a for a, _ in hargs}}
+        sub_ = lambda ln: re.sub(r"%\w+", lambda m: pren.get(m.group(0), m.group(0)), ln)
+        e("  %ppk = mova.i32 256")
+        e("  %ppm = mov.modifier %ppk")
+        e("  %ppc = copy %o : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e("  %pp0 = padds.modifier %ppc, %ppm")   # (row 0's slot + 256: the stores' offsets -256 .. 224)
+        e("  %pqm = mov.modifier %k512")
+        e(f"  low.br ^pouter({', '.join(f'{a}: {ty}' for a, ty in hargs)}, %pp0: reg<aie2p.ep>)")
+        e(f"^pouter({', '.join(f'{a}_P: {ty}' for a, ty in hargs)}, %psl_P: reg<aie2p.ep>):")
+        e("  low.cond_br %more_P, ^pbody, ^pexit : reg<aie2p.er>")
+        e("^pbody:")
+        q = "%psl_P"
+        for t in range(1, NP):   # the sub-tiles' bf16 pointers: 512 apart
+            e(f"  %pqc{t}_P = copy {q} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e(f"  %pq{t}_P = padds.modifier %pqc{t}_P, %pqm")
+            q = f"%pq{t}_P"
+        nst = 0
+        for ln in body:
+            m = re.match(r"  vst\.acc (%o(\d+)_(\d)_(\d)), (%\w+), (-?\d+)$", ln)
+            if m:
+                t, c, qq = int(m.group(2)), int(m.group(3)), int(m.group(4))
+                assert 0 <= t < NP and int(m.group(6)) == 256 * c + 64 * qq - 512, ln
+                e(f"  vst.convert.f32x16.to.bf16x16 {pren[m.group(1)]}, {'%psl_P' if t == 0 else f'%pq{t}_P'}, "
+                  f"{128 * c + 32 * qq - 256}")
+                nst += 1
+            else:
+                e(sub_(ln))
+        assert nst == 16 * NP, nst
+        if QCYC:   # (diag) the cycles since the first firing's start into the row's first word
+            e("  %ptw = mov.cycles")
+            e("  %ptl = slice %ptw[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+            e("  %pta = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>")
+            e("  %pts = lda %pta, 0")
+            e("  %ptp = sub %ptl, %pts")
+            e("  %ptk = mova.i32 -256")
+            e("  %ptm = mov.modifier %ptk")
+            e("  %ptc = copy %psl_P : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e("  %ptq = padds.modifier %ptc, %ptm")
+            e("  st %ptp, %ptq, 0")
+        e("  rel %one, 2")
+        e(f"  %pnc = copy {q} : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e("  %pnx = padds.modifier %pnc, %pqm")   # (the next row's slot: 2048 on)
+        e(sub_(back)[:-1] + ", %pnx: reg<aie2p.ep>)")
+        L[-1] = L[-1].replace("^outer(", "^pouter(")
+        e("^pexit:")
+    if q3 and qpeel_on():
+        pass
+    elif q3:   # each row: its f32 sub-tiles (even area, odd area, alternating) packed to bf16 in its even half
         for r in range(MP):
             t = 100 + r
             ptr = {}
