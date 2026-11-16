@@ -46,6 +46,13 @@ KS = (35, 35, 35, 23)    # production k-blocks per pass and K-slice row: K = 102
 # GN_QCYC=1 (diag, the plain tail's convert): each last-pass segment's first word = the core cycles since the first
 # firing's start (npu_gemm_check prints the per-M-block steps; the outputs are not checked)
 QCYC = os.environ.get("GN_QCYC") == "1"
+# GN_QBANK=1 (experimental, the Q' tail with mu 1, ks <= 28): the bank plan of a one-core Q' tile, 16 KB banks
+# 0 W slot 0 | 1 C rows 0, 2 + A slot 0 | 2 C rows 1, 3 + A slot 1 | 3 W slot 1: the DMA refills only a bank the core
+# is not reading. The C pins reserve the sent 2 KB of each 4 KB slot; each bank's A slot comes after its C slots, so
+# the allocator's cursor passes the slots' f32 halves. The check sets LOOM_EXP_RING_AT to QBANK_RING_AT.
+QBANK_RING_AT = "2048@16384:32768:20480:36864,16128@0:49152,4032@24576:40960"
+# GN_QBANK=2: C rows 0, 2 in bank 2 and 1, 3 in bank 1 (each row's C in the bank of the A slot the DMA refills)
+QBANK2_RING_AT = "2048@32768:16384:36864:20480,16128@0:49152,4032@24576:40960"
 LOOM_ENV = dict(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2",
                 LOOM_EXP_PANEL_GROUPS=",".join(map(str, GE.GROUPS)), LOOM_EXP_PANEL_STREAM="1")
 
@@ -1665,6 +1672,9 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     if not early:
         e("  %conf = lda %cfp, 0")   # (the store above has settled: a load right after its store reads stale)
     e("  %k144 = mova.i32 16")
+    qbank = tail and os.environ.get("GN_QBANK") in ("1", "2") and os.environ.get("GN_QCORE")
+    if qbank:   # (QBANK_RING_AT pins the slots) A slot 1 a 16 KB bank above slot 0 (a_next); C rows (body)
+        assert (cfg.mu, acap) == (1, 2) and not a_adv and MP == 4 and NP == 4 and fa <= 4096
     e(f"  %kks = mova.i32 {fa // 16}")
     e("  %fstep = mul %k144, %kks")   # slab stride
     e("  %mf = mov.modifier %fstep")
@@ -2051,6 +2061,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     e = L.append
     tail = role == "tail"
     mid = role == "mid"
+    qbank = tail and os.environ.get("GN_QBANK") in ("1", "2") and os.environ.get("GN_QCORE")   # (leaf)
     NT = NP * cfg.mu      # sub-tiles per iteration, M-slab major
     # swiglu tail: the A pointer is loop-carried as a scalar, a short-lived pointer per sub-tile. Its store fifo pins
     # p2; a pointer live across the loop would otherwise be pushed into p0 / p1, which the operand load fifos need.
@@ -2214,13 +2225,18 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e("  %ph = lshl %mp, %am1")
             e("  %ph2 = add.rr %ph, %ph")
             e("  %par = sub %mp, %ph2")
-            e("  %fst2 = add.rr %fstep, %fstep")
+            fs = "%fstep"
+            if qbank:   # (GN_QBANK) the A slots 16 KB apart; W keeps the slab stride (%mf)
+                e("  %kqa = mova.i32 32")
+                e("  %fsq = mul %k512, %kqa")
+                fs = "%fsq"
+            e(f"  %fst2 = add.rr {fs}, {fs}")
             e("  %pst0 = mul %par, %fst2")
             if seam:
-                e("  %pstr = sub %fstep, %pst0")
+                e(f"  %pstr = sub {fs}, %pst0")
                 e("  %pst = mul %pstr, %nxm")
             else:
-                e("  %pst = sub %fstep, %pst0")
+                e(f"  %pst = sub {fs}, %pst0")
         if spa and not a_adv and (cfg.mu, acap) == (1, 2):
             e("  %pan = add.rr %pa, %pst")
         elif not a_adv and (cfg.mu, acap) == (1, 2):
@@ -2942,12 +2958,29 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         if cfg.swiglu:
             e("  %pong = padds.modifier %pcl, %mcs")
             e("  %pon = padds.modifier %pong, %mcb")
+        elif qbank:   # the next row's slot (QBANK_C): +12288 after an even row, -16384 after an odd one
+            # (GN_QBANK=2, each row in the other A slot's bank: -20480 after an even row, +16384 after an odd one)
+            v2 = os.environ.get("GN_QBANK") == "2"
+            e(f"  %kcd0a = mova.i32 {40 if v2 else 24}")
+            e("  %kcd0 = mul %k512, %kcd0a")   # 20480 / 12288
+            e(f"  %kcd1a = mova.i32 {72 if v2 else 56}")
+            e("  %kcd1 = mul %k512, %kcd1a")   # 36864 / 28672
+            e("  %cdp = mul %par, %kcd1")
+            e("  %cdel = sub %cdp, %kcd0" if v2 else "  %cdel = sub %kcd0, %cdp")
+            e("  %mcd = mov.modifier %cdel")
+            e("  %pong = padds.modifier %pcl, %mcs")
+            e("  %pon = padds.modifier %pong, %mcd")
         else:
             e("  %pon = padds.modifier %pcl, %mcs")
         e(f"  %plx = copy {pl[-1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if cfg.swiglu:
             e("  %plng = padds.modifier %plx, %mls")
             e("  %pln = padds.modifier %plng, %mlb")
+        elif qbank:   # (the first pass's loads stay on the zero buffer: step 0)
+            e("  %cdl = mul %cdel, %nf")
+            e("  %mcdl = mov.modifier %cdl")
+            e("  %plng = padds.modifier %plx, %mls")
+            e("  %pln = padds.modifier %plng, %mcdl")
         else:
             e("  %pln = padds.modifier %plx, %mls")
     else:
