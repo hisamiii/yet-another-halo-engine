@@ -103,6 +103,9 @@ def main():
         if os.environ.get("GN_QBANK") in ("1", "2", "3"):   # (gen_npu_gemm.QBANK_RING_AT)
             env["LOOM_EXP_RING_AT"] = {"2": N.QBANK2_RING_AT, "3": N.QA4_RING_AT if N.qa4_on() else (N.QCB1_RING_AT if N.qcb1_on() else N.QA3_RING_AT) if N.qa3_on() else N.QBANK3_RING_AT}.get(
                 os.environ["GN_QBANK"], N.QBANK_RING_AT)
+            # (the pins are written for ks 28: W slots NP slabs, A slots one slab)
+            env["LOOM_EXP_RING_AT"] = env["LOOM_EXP_RING_AT"].replace("16128@", f"{N.NP * N.slab(ks[0])}@").replace(
+                "4032@", f"{N.slab(ks[0])}@")
     for k in os.environ.get("NPU_ENV_DROP", "").split(","):   # e.g. LOOM_EXP_PANEL_STREAM (diagnosis)
         env.pop(k, None)
     for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
@@ -148,7 +151,7 @@ def main():
     if N.QCYC:   # (diag) each segment's first word: core cycles since the first firing; per M block: its last segment's
         seg = N.NP * 256 * 2   # bytes of one bf16 segment (NP sub-tiles of 16 x 16)
         cyc = np.fromfile(co, np.uint32)[::seg // 4].astype(np.int64)
-        last = cyc.reshape(cols, nb, N.MP)[0, :, -1]
+        last = cyc.reshape(cols, nb, N.MP)[0, :nb // int(os.environ.get("NPU_QROWS", "1")), -1]   # (core 0, row 0)
         step = np.diff(last)
         mma = passes * N.MP * N.NP * sum(ks) * 4   # MMAs a core issues per M block
         med = float(np.median(step))
