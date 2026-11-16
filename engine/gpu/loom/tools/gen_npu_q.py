@@ -50,7 +50,7 @@ def array_program(L, cfg):
             t = f"{c}_{r}"
             e(f"  %cr{t} = partition.receiver %c_all, %origin, %lane{t}, %ncols : reg<aie2p.array.receiver : tile<{rec}xi32>>")
             e(f"  %sc{t} = sender {kk[c, r]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
-            e(f"  %chc{t} = channel %sc{t}, %cr{t}, %n{MP}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
+            e(f"  %chc{t} = channel %sc{t}, %cr{t}, %n{2 if N.qalt_on() and not N.qaltp_on() else MP}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
             e(f"  constrain.leaf_sync %chc{t}")
     wrec = NP * N.slab(ks)
     for c in range(cols):
