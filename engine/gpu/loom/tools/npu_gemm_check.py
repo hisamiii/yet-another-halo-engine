@@ -92,9 +92,14 @@ def main():
         w = (rng.standard_normal((Nn, K)) * 0.05).astype(np.float16)
     src = os.path.join(work, "npu_gemm.loom")
     img = os.path.join(work, "npu_gemm.xdna")
-    open(src, "w").write(N.gen(cfg))
+    if QMODE:   # layout Q' (gen_npu_q, stage 1): one K slice, the tail leaf as a Q' core (GN_QCORE = boundary json)
+        import gen_npu_q as Q
+        assert len(ks) == 1 and os.environ.get("GN_QCORE"), "NPU_Q: ks of one entry and GN_QCORE"
+    open(src, "w").write((Q.gen if QMODE else N.gen)(cfg))
     env = hrx_paths.env()
     env.update(N.loom_env(cfg))
+    if QMODE:   # generator-asserted: in one leaf body no C store writes a block a later C load reads
+        env.update(LOOM_EXP_NOALIAS_ACC="2", LOOM_EXP_NOWAR_ACC="1")
     for k in os.environ.get("NPU_ENV_DROP", "").split(","):   # e.g. LOOM_EXP_PANEL_STREAM (diagnosis)
         env.pop(k, None)
     for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
@@ -130,11 +135,23 @@ def main():
                            capture_output=True, text=True, env=env, timeout=600)
         if r.returncode == 0:
             width = cand
+            if os.environ.get("NPU_RUN_REPEAT") or os.environ.get("YAH_NPU_PROF"):   # (npu_run's times, counters)
+                print("".join(ln + "\n" for ln in r.stdout.splitlines() if " run " in ln or " prof " in ln), end="")
             break
         if "does not match the admitted native context" not in r.stderr:
             sys.exit(f"npu_run failed\n{r.stderr[-2000:]}")
     if width is None:
         sys.exit("no context width admitted the image")
+    if N.QCYC:   # (diag) each segment's first word: core cycles since the first firing; per M block: its last segment's
+        seg = N.NP * 256 * 2   # bytes of one bf16 segment (NP sub-tiles of 16 x 16)
+        cyc = np.fromfile(co, np.uint32)[::seg // 4].astype(np.int64)
+        last = cyc.reshape(cols, nb, N.MP)[0, :, -1]
+        step = np.diff(last)
+        mma = passes * N.MP * N.NP * sum(ks) * 4   # MMAs a core issues per M block
+        med = float(np.median(step))
+        print(f"cycles per M block (core 0, {nb} blocks): median {med:.0f} min {step.min()} max {step.max()}; "
+              f"{mma} MMAs -> MMA share {mma / med:.1%}; first block done at {last[0]}")
+        sys.exit(0)
     raw = (np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32)   # bf16 C
     grp = N.groups(cfg) or (passes,)
     err, k0 = 0.0, 0
@@ -162,5 +179,11 @@ def main():
     sys.exit(0 if err <= 0.501 else 1)   # each partial rounded once (RNE) from f32 accumulation
 
 
+QMODE = os.environ.get("NPU_Q") == "1"   # layout Q' images: 64-wide tiles (NP 4)
+
 if __name__ == "__main__":
-    main()
+    if QMODE:
+        with N.np_override(4):
+            main()
+    else:
+        main()

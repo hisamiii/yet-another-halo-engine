@@ -43,6 +43,9 @@ MP, NP = 4, 5            # 16-row slabs per M block / per NPU column
 TM, TN = 16 * MP, 16 * NP
 KS = (35, 35, 35, 23)    # production k-blocks per pass and K-slice row: K = 1024 per pass
 # loom-compile environment for the NPU image
+# GN_QCYC=1 (diag, the plain tail's convert): each last-pass segment's first word = the core cycles since the first
+# firing's start (npu_gemm_check prints the per-M-block steps; the outputs are not checked)
+QCYC = os.environ.get("GN_QCYC") == "1"
 LOOM_ENV = dict(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2",
                 LOOM_EXP_PANEL_GROUPS=",".join(map(str, GE.GROUPS)), LOOM_EXP_PANEL_STREAM="1")
 
@@ -1695,6 +1698,19 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
             e("  %first = lt %cnt, %one")
             e(f"  %pm2 = mova.i32 {cfg.passes - 2}")
             e("  %clast = lt %pm2, %cnt")
+        if QCYC:   # (diag) the first firing's start cycle (word 0; word 4 set once it is written)
+            e("  %tcs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+            e("  %tca = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>")
+            e("  %t0w = mov.cycles")
+            e("  %t0l = slice %t0w[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+            e("  %tfl = lda %tca, 4")
+            e("  %tso = lda %tca, 0")
+            e("  %tfirst = lt %tfl, %one")
+            e("  %tdl = sub %t0l, %tso")
+            e("  %tdm = mul %tdl, %tfirst")
+            e("  %tsn = add.rr %tso, %tdm")
+            e("  st %tsn, %tca, 0")
+            e("  st %one, %tca, 4")
         if cfg.dfr:   # the M block (%blk): its C on ring half blk & 1; %nfb: not the call's first, %lastb: its last
             assert cfg.swiglu and cfg.mu == 1 and not grp and cfg.nb % 2 == 0 and cfg.passes > MP
             e("  %blk = lda %cnp, 4")
@@ -2326,7 +2342,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         QW = json.load(open(os.environ["GN_QCORE"]))
         QE, QE2 = QW["E"], QW["E2"]
         assert ks >= QE + QE2
-    rot = lambda t: qcore and t + 1 < NT and (t + 1) % NP != 0
+    # (GN_QNOROT=1: every boundary serial, a control for the windows)
+    rot = lambda t: qcore and not os.environ.get("GN_QNOROT") and t + 1 < NT and (t + 1) % NP != 0
 
     def emit_window(t):
         """The rotated boundary t -> t + 1 (both sub-tiles' window k-blocks, stores, loads); leaves cur = t + 1's."""
@@ -2463,6 +2480,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e(f"  %cvb{t}_{k} = padda {d}, {-step}")
                 d, k = f"%cvb{t}_{k}", k + 1
             e(f"  %cvs{t}_0 = copy {d} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            if QCYC:
+                e(f"  %cvt{t} = copy {d} : reg<aie2p.ep> -> reg<aie2p.ep>")
             s_ = f"%cvs{t}_0"
             n = 16 * NP
 
@@ -2477,6 +2496,13 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 d = f"%cvd{t}_{i}"
                 if i + 16 < n:
                     load(i + 16)
+            if QCYC:   # (diag) the cycles since the first firing's start into the segment's first word
+                e(f"  %tcw{t} = mov.cycles")
+                e(f"  %tcl{t} = slice %tcw{t}[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+                e(f"  %tsa{t} = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>")
+                e(f"  %tst{t} = lda %tsa{t}, 0")
+                e(f"  %tsp{t} = sub %tcl{t}, %tst{t}")
+                e(f"  st %tsp{t}, %cvt{t}, 0")
             bump(L, f"%cvr{t}", d, back + 512 - 32 * n)
             e(f"  %cvq{t} = copy %cvr{t} : reg<aie2p.ep> -> reg<aie2p.ep>")
             e(f"  low.br ^cj{t}(%cvr{t}: reg<aie2p.ep>, %cvq{t}: reg<aie2p.ep>)")
