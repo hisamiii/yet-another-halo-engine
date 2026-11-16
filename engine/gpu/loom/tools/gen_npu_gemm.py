@@ -234,6 +234,9 @@ def loom_env(cfg):
         # patch 0081; still ordered: the first reads after an acquire hit the slot's start, which the DMA wrote first,
         # and the last ones before a release hit its end, which the DMA writes last)
         env["LOOM_EXP_LOCK_READ_SEP"] = "2,1"
+    if qpass_on() and os.environ.get("GN_QFLOAT") == "1":   # the Q' body's text order stops being the issue floor
+        # (HRX 0061-0065 planner controls: dependencies only; views no boundaries, pops / fills 2 cycles under)
+        env.update(LOOM_EXP_LOCKED_FLOAT="all", LOOM_EXP_LOCKED_VIEWS="1", LOOM_EXP_LOCKED_HOIST="2")
     if cfg.fuse == 2 and cfg.fmt == "Q4_K":
         env["LOOM_EXP_LRU"] = "aie2p.vec256"
     return env
