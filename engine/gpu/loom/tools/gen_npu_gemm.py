@@ -116,6 +116,14 @@ def qpeel_on():
     return on
 
 
+# GN_QUNR=1 (with GN_QPEEL): the main (pass, row) loop's body holds two rows (the second copy takes the first's
+# back-edge values), so the loop-carried operands meet their header registers every second row only.
+def qunr_on():
+    on = os.environ.get("GN_QUNR") == "1"
+    assert not on or qpeel_on(), "GN_QUNR needs GN_QPEEL"
+    return on
+
+
 def acap_tail(cfg):
     return 4 if qa4_on() else 3 if qa3_on() else cfg.acap_t
 
@@ -281,7 +289,8 @@ def loom_env(cfg):
         if os.environ.get("GN_QACQREL") == "1":   # (UNSAFE: FIFO pops are not ordered behind the acquire)
             env["LOOM_EXP_LOCK_ACQREL"] = "6"
     if qpass_on() and os.environ.get("GN_QHW") != "0":   # the (pass, row) loop as a hardware loop (HRX patch 0080: the
-        env["LOOM_EXP_HWLOOP_TRIP"] = (f"{MP * (cfg.passes - 1)},{MP}" if qpeel_on() else str(MP * cfg.passes))   # authored trip count; the image's only loop)
+        env["LOOM_EXP_HWLOOP_TRIP"] = (f"{MP * (cfg.passes - 1) // (2 if qunr_on() else 1)},{MP}" if qpeel_on()
+                                       else str(MP * cfg.passes))   # authored trip count; the image's only loop)
     if qpass_on() and os.environ.get("GN_QLOCK") == "1":   # spread lock lines, reads 2 / 1 cycles from a lock (HRX
         # patch 0081; still ordered: the first reads after an acquire hit the slot's start, which the DMA wrote first,
         # and the last ones before a release hit its end, which the DMA writes last)
@@ -3377,6 +3386,17 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         back = L[-2]
         assert L[-1] == "^exit:" and back.startswith("  low.br ^outer(") and back.endswith(")"), (back, L[-1])
         body = L[i0 + 1:-2]
+        if qunr_on():   # (the peel below copies one row: body / back as captured here)
+            assert MP * (cfg.passes - 1) % 2 == 0
+            bvals = [a.split(": ", 1)[0] for a in back[len("  low.br ^outer("):-1].split(", ")]
+            assert len(bvals) == len(hargs)
+            bd = {n for ln in body if " = " in ln for n in re.findall(r"%\w+", ln.partition(" = ")[0])}
+            uren = {n: n + "_U" for n in bd}
+            uren.update({a: v for (a, _), v in zip(hargs, bvals)})
+            sub_u = lambda ln: re.sub(r"%\w+", lambda m: uren.get(m.group(0), m.group(0)), ln)
+            back_u = "  low.br ^outer(" + ", ".join(f"{v}_U: {ty}" if v in bd else f"{uren.get(v, v)}: {ty}"
+                                                      for v, (_, ty) in zip(bvals, hargs)) + ")"
+            L[i0 + 1:-1] = body + [sub_u(ln) for ln in body] + [back_u]
         bdefs = {n for ln in body if " = " in ln for n in re.findall(r"%\w+", ln.partition(" = ")[0])}
         pren = {n: n + "_P" for n in bdefs | {a for a, _ in hargs}}
         sub_ = lambda ln: re.sub(r"%\w+", lambda m: pren.get(m.group(0), m.group(0)), ln)
