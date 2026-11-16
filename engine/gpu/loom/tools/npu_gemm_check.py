@@ -100,8 +100,8 @@ def main():
     env.update(N.loom_env(cfg))
     if QMODE:   # generator-asserted: in one leaf body no C store writes a block a later C load reads
         env.update(LOOM_EXP_NOALIAS_ACC="2", LOOM_EXP_NOWAR_ACC="1")
-        if os.environ.get("GN_QBANK") in ("1", "2"):   # (gen_npu_gemm.QBANK_RING_AT)
-            env["LOOM_EXP_RING_AT"] = N.QBANK2_RING_AT if os.environ["GN_QBANK"] == "2" else N.QBANK_RING_AT
+        if os.environ.get("GN_QBANK") in ("1", "2", "3"):   # (gen_npu_gemm.QBANK_RING_AT)
+            env["LOOM_EXP_RING_AT"] = {"2": N.QBANK2_RING_AT, "3": N.QBANK3_RING_AT}.get(os.environ["GN_QBANK"], N.QBANK_RING_AT)
     for k in os.environ.get("NPU_ENV_DROP", "").split(","):   # e.g. LOOM_EXP_PANEL_STREAM (diagnosis)
         env.pop(k, None)
     for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
