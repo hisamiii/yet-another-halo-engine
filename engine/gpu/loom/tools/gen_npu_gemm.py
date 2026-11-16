@@ -3390,16 +3390,18 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         e("  low.cond_br %more_P, ^pbody, ^pexit : reg<aie2p.er>")
         e("^pbody:")
         q = "%psl_P"
-        for t in range(1, NP):   # the sub-tiles' bf16 pointers: 512 apart
-            e(f"  %pqc{t}_P = copy {q} : reg<aie2p.ep> -> reg<aie2p.ep>")
-            e(f"  %pq{t}_P = padds.modifier %pqc{t}_P, %pqm")
-            q = f"%pq{t}_P"
-        nst = 0
+        nst, made = 0, {0}
         for ln in body:
             m = re.match(r"  vst\.acc (%o(\d+)_(\d)_(\d)), (%\w+), (-?\d+)$", ln)
             if m:
                 t, c, qq = int(m.group(2)), int(m.group(3)), int(m.group(4))
                 assert 0 <= t < NP and int(m.group(6)) == 256 * c + 64 * qq - 512, ln
+                if t not in made:   # the sub-tile's bf16 pointer (512 on from the previous), at its first store
+                    assert t - 1 in made
+                    made.add(t)
+                    e(f"  %pqc{t}_P = copy {q} : reg<aie2p.ep> -> reg<aie2p.ep>")
+                    e(f"  %pq{t}_P = padds.modifier %pqc{t}_P, %pqm")
+                    q = f"%pq{t}_P"
                 e(f"  vst.convert.f32x16.to.bf16x16 {pren[m.group(1)]}, {'%psl_P' if t == 0 else f'%pq{t}_P'}, "
                   f"{128 * c + 32 * qq - 256}")
                 nst += 1
