@@ -1,37 +1,62 @@
-"""Modulo schedule of the GMIX grid hot loop (gen_npu_dec GMOD): op offsets in a unit (pr, hh), one unit per II cycles.
+"""Modulo schedule of a decoder hot loop: the GMIX grid's (gen_npu_dec GMOD, unit (pr, hh)) or IQ4_XS's (I4MOD, unit
+(t, u, cc, hh)): op offsets in a unit, one unit per II cycles.
 CP-SAT model (pip install ortools) of the unit: Loom's issue distances, one op per cycle per resource modulo II, the
 register budget (concat groups hold their whole aligned width) and the pushes in a window without loads.
-Usage: npu_modsched.py [II] [seconds] -> prints GMOD; checks the table over a whole record (16 units)."""
+Usage: npu_modsched.py [II] [seconds] [grid | iq4xs] -> prints the table; checks it over a whole record (16 units).
+(I4MOD: II 32, 300 s; II 29 finds nothing in 120 s.)"""
 import collections, sys
 from ortools.sat.python import cp_model
 
 II = int(sys.argv[1]) if len(sys.argv) > 1 else 29
 SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 300
+I4 = (sys.argv[3] if len(sys.argv) > 3 else "grid") == "iq4xs"
 VEC, ACC = 22, 20      # vec256 units (Loom fails at 24 with fragmentation), mbms units
 
 # unit ops: name -> (resources, inputs, (register class, units)); P = the load port (vlda and gathers share it)
 OPS = {}
-for pos in range(2):
-    for k in "gs":
-        OPS[f"a{pos}{k}"] = (("P",), [], ("v", 2))                              # address vector loads
-    for k in "sg":
-        OPS[f"m{k}{pos}"] = (("MV", "RM"), [f"a{pos}g", f"a{pos}s"], ("v", 2))  # vsel lane mixing
-    for hf in range(2):
-        for k in "sg":
+if I4:
+    for g in range(4):                                                          # G streams (half g // 2, blk g % 2)
+        OPS[f"a{g}"] = (("P",), [], ("v", 2))                                   # address vector load
+        for hf in range(2):
             for lh in "lh":
-                OPS[f"g{pos}{k}{hf}{lh}"] = (("P",), [f"m{k}{pos}"], ("v", 1))  # gathers
-        OPS[f"b{pos}{hf}"] = (("MV",), [f"g{pos}{k}{hf}{lh}" for k in "sg" for lh in "lh"], ("v", 2))
-for p in range(2):
-    OPS[f"t{p}"] = (("P",), [], ("v", 2))                                       # T part load, broadcast, shuffles
-    OPS[f"c{p}"] = (("MV",), [f"t{p}"], ("v", 2))
-    OPS[f"r{p}a"] = (("MV", "RM"), [f"c{p}"], ("v", 2))
-    OPS[f"r{p}b"] = (("MV", "RM"), [f"c{p}"], ("v", 2))
-for pos in range(2):
-    OPS[f"m0{pos}"] = (("V",), ["r0a", "r0b", f"b{pos}0", f"b{pos}1"], ("a", 4))
-for pos in range(2):
-    OPS[f"m1{pos}"] = (("V",), [f"m0{pos}", "r1a", "r1b", f"b{pos}0", f"b{pos}1"], ("a", 4))
-GROUPS = [[f"g{pos}{k}{hf}l", f"g{pos}{k}{hf}h"] for pos in range(2) for k in "sg" for hf in range(2)]
-GROUPS += [[f"b{pos}0", f"b{pos}1"] for pos in range(2)] + [[f"r{p}a", f"r{p}b"] for p in range(2)]
+                OPS[f"g{g}{hf}{lh}"] = (("P",), [f"a{g}"], ("v", 1))            # gathers
+        OPS[f"e{g}"] = (("MV", "RM"), [f"g{g}{hf}{lh}" for hf in range(2) for lh in "lh"], ("v", 2))   # entries
+    for half in range(2):
+        for k in "lh":                                                          # X: lo / hi values (m2c / m3c)
+            OPS[f"x{half}{k}"] = (("MV", "RM"), [f"e{2 * half}", f"e{2 * half + 1}"], ("v", 2))
+    for p in range(2):
+        OPS[f"t{p}"] = (("P",), [], ("v", 2))                                   # T part load, broadcast, shuffles
+        OPS[f"c{p}"] = (("MV",), [f"t{p}"], ("v", 2))
+        OPS[f"r{p}a"] = (("MV", "RM"), [f"c{p}"], ("v", 2))
+        OPS[f"r{p}b"] = (("MV", "RM"), [f"c{p}"], ("v", 2))
+    for n, k in enumerate("lh"):
+        OPS[f"m0{n}"] = (("V",), ["r0a", "r0b", f"x0{k}", f"x1{k}"], ("a", 4))
+    for n, k in enumerate("lh"):
+        OPS[f"m1{n}"] = (("V",), [f"m0{n}", "r1a", "r1b", f"x0{k}", f"x1{k}"], ("a", 4))
+    GROUPS = [[f"g{g}{hf}l", f"g{g}{hf}h"] for g in range(4) for hf in range(2)]
+    GROUPS += [["x0l", "x1l"], ["x0h", "x1h"]] + [[f"r{p}a", f"r{p}b"] for p in range(2)]
+else:
+    for pos in range(2):
+        for k in "gs":
+            OPS[f"a{pos}{k}"] = (("P",), [], ("v", 2))                              # address vector loads
+        for k in "sg":
+            OPS[f"m{k}{pos}"] = (("MV", "RM"), [f"a{pos}g", f"a{pos}s"], ("v", 2))  # vsel lane mixing
+        for hf in range(2):
+            for k in "sg":
+                for lh in "lh":
+                    OPS[f"g{pos}{k}{hf}{lh}"] = (("P",), [f"m{k}{pos}"], ("v", 1))  # gathers
+            OPS[f"b{pos}{hf}"] = (("MV",), [f"g{pos}{k}{hf}{lh}" for k in "sg" for lh in "lh"], ("v", 2))
+    for p in range(2):
+        OPS[f"t{p}"] = (("P",), [], ("v", 2))                                       # T part load, broadcast, shuffles
+        OPS[f"c{p}"] = (("MV",), [f"t{p}"], ("v", 2))
+        OPS[f"r{p}a"] = (("MV", "RM"), [f"c{p}"], ("v", 2))
+        OPS[f"r{p}b"] = (("MV", "RM"), [f"c{p}"], ("v", 2))
+    for pos in range(2):
+        OPS[f"m0{pos}"] = (("V",), ["r0a", "r0b", f"b{pos}0", f"b{pos}1"], ("a", 4))
+    for pos in range(2):
+        OPS[f"m1{pos}"] = (("V",), [f"m0{pos}", "r1a", "r1b", f"b{pos}0", f"b{pos}1"], ("a", 4))
+    GROUPS = [[f"g{pos}{k}{hf}l", f"g{pos}{k}{hf}h"] for pos in range(2) for k in "sg" for hf in range(2)]
+    GROUPS += [[f"b{pos}0", f"b{pos}1"] for pos in range(2)] + [[f"r{p}a", f"r{p}b"] for p in range(2)]
 GROUPED = {n for g in GROUPS for n in g}
 # pushes of a pr (in its hh = 1 unit): p0 / p2 take the hh = 0 unit's accumulators (one unit earlier)
 PUSH = {"p0": ("m10", II), "p1": ("m10", 0), "p2": ("m11", II), "p3": ("m11", 0), "fl": (None, 0)}
@@ -162,4 +187,4 @@ O = {n: sol.Value(s[n]) for n in names}
 viol, pv, pa = check(O)
 print(f"II {II}: {sol.StatusName(st)}, record {15 * II + max(O.values()) - min(O.values())} cycles, vec {pv}, acc {pa}, "
       f"violations {viol}")
-print("GMOD = dict(" + ", ".join(f"{n}={c}" for n, c in sorted(O.items(), key=lambda kv: (kv[1], kv[0]))) + ")")
+print(("I4MOD" if I4 else "GMOD") + " = dict(" + ", ".join(f"{n}={c}" for n, c in sorted(O.items(), key=lambda kv: (kv[1], kv[0]))) + ")")
