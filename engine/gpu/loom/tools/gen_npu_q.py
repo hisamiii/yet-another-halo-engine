@@ -55,7 +55,7 @@ def array_program(L, cfg):
     e(f"  %arec = constant.u32 {nb * P * MP} : reg<aie2p.array.scalar : index>")
     for c in range(cols):
         e(f"  %ra{c} = receiver %k{c}, 0 : reg<aie2p.array.receiver : tile<{fa // 4}xi32>>")
-        e(f"  %cha{c} = channel %a0, %ra{c}, %n{cfg.acap_t}, %arec : reg<aie2p.array.channel : tile<{fa // 4}xi32>>")
+        e(f"  %cha{c} = channel %a0, %ra{c}, %n{N.acap_tail(cfg)}, %arec : reg<aie2p.array.channel : tile<{fa // 4}xi32>>")
         e(f"  constrain.leaf_sync %cha{c}")
         e(f"  constrain.stage %cha{c}, %n{N.astage(0, cols) if cols > 1 else 2}")
     e("  return\n}\n")
