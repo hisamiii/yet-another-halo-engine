@@ -245,8 +245,10 @@ def grid_rodata(name):
         for v in range(4):
             st[n >> 3, :, n & 7, v] = 0x60 if (n >> v) & 1 else 0x20
     hm = np.array([1 << (2 * (i // 16) + i % 2) for i in range(64)], np.uint8)
-    # (one object: Loom's leaf link pairs two conflicting tables of different alignment in different orders)
-    return [f'global.rodata.def @gt_{name} = align(2048) bytes("{hexs(gt)}{hexs(st)}{hexs(hm)}")']
+    # (one object: Loom's leaf link pairs two conflicting tables of different alignment in different orders) and a
+    # copy of the signs in another bank: a sign gather's lanes 2, 3 of each 4 read it (no bank stall)
+    return [f'global.rodata.def @gt_{name} = align(2048) conflicts([@gs2_{name}]) bytes("{hexs(gt)}{hexs(st)}{hexs(hm)}")',
+            f'global.rodata.def @gs2_{name} = align(128) conflicts([@gt_{name}]) bytes("{hexs(st)}")']
 
 
 def leaf(name="dec"):
@@ -1203,7 +1205,19 @@ def leaf(name="dec"):
             if G8:
                 e(f"%gt11 = lshl %gta, {k(-11)}")
             e(f"%cgv = vbcst.8 {'%gt11' if G8 else '%gtc'}")
-        if not (X2 or XS2):
+        if G8:   # the sign address bytes: lanes 2, 3 of each 4 (bytes 4 j + 2, 4 j + 3) for the copy's address
+            e(f"%s2p = mov.local-address @gs2_{name}")
+            e("%s2a = mov.address-to-scalar %s2p")
+            for nm_, sh_ in (("csv", -11), ("csl", -3)):
+                for c_, a_ in (("a", "%gsa"), ("b", "%s2a")):
+                    e(f"%{nm_}{c_}0 = lshl {a_}, {k(sh_)}")
+                    e(f"%{nm_}{c_}1 = and %{nm_}{c_}0, {k(255)}")
+                    e(f"%{nm_}{c_}2 = lshl %{nm_}{c_}1, {k(8)}")
+                    e(f"%{nm_}{c_}3 = or %{nm_}{c_}1, %{nm_}{c_}2")
+                e(f"%{nm_}b4 = lshl %{nm_}b3, {k(16)}")
+                e(f"%{nm_}w = or %{nm_}a3, %{nm_}b4")
+                e(f"%{nm_} = vbcst.32 %{nm_}w")
+        elif not (X2 or XS2):
             e("%csv = vbcst.8 %stc")
             if not XXS:
                 e("%csl = vbcst.8 %sb4")                       # IQ3_S: the sign table's address >> 3, low byte
