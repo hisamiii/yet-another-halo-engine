@@ -230,6 +230,10 @@ def loom_env(cfg):
             env["LOOM_EXP_LOCK_ACQREL"] = "6"
     if qpass_on() and os.environ.get("GN_QHW") != "0":   # the (pass, row) loop as a hardware loop (HRX patch 0080: the
         env["LOOM_EXP_HWLOOP_TRIP"] = str(MP * cfg.passes)   # authored trip count; the image's only loop)
+    if qpass_on() and os.environ.get("GN_QLOCK") == "1":   # spread lock lines, reads 2 / 1 cycles from a lock (HRX
+        # patch 0081; still ordered: the first reads after an acquire hit the slot's start, which the DMA wrote first,
+        # and the last ones before a release hit its end, which the DMA writes last)
+        env["LOOM_EXP_LOCK_READ_SEP"] = "2,1"
     if cfg.fuse == 2 and cfg.fmt == "Q4_K":
         env["LOOM_EXP_LRU"] = "aie2p.vec256"
     return env
@@ -2279,8 +2283,23 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             if qrow and t == NT:   # the row's slab released after its last pop, the next acquired if that row runs
                 keep = ["  rel %one, 0", "  %cqn = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>",
                         "  acq.cond %am1, %cqn, 0"] + keep
-                if qpass:   # the W slot at a pass end (each lock line with its r26 copy: one r26 value at a time)
-                    keep = ["  rel %one, 0", "  %cqn = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>\n  acq.cond %am1, %cqn, 0",
+                if qpass and os.environ.get("GN_QLOCK") == "1":   # the lock work spread over the MMAs around the
+                    # switch (a lock line orders the stream: lumped they leave ~20 bundles without an MMA): the next A slab
+                    # and W slot acquired 9 / 5 MMAs ahead, the releases after the new FIFOs' first pops (one r26 value
+                    # at a time: each conditional line 3 MMAs after its copy)
+                    ra, rw = (int(x) for x in os.environ.get("GN_QLOCKR", "3,24").split(","))   # release offsets
+                    assert base + max(ra, rw) < (NT * ks + QE2r) * 4, "a lock line past the last window is dropped"
+                    for g, ln in ((base - 12, "  %cqn = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>"),
+                                  (base - 9, "  acq.cond %am1, %cqn, 0"),
+                                  (base - 8, "  %waq = copy %wwa : reg<aie2p.er> -> reg<aie2p.mr26_lock>"),
+                                  (base - 5, "  acq.cond %am1, %waq, 1"),
+                                  (base + ra, "  rel %one, 0"),
+                                  (base + rw - 3, "  %wrq = copy %wrap : reg<aie2p.er> -> reg<aie2p.mr26_lock>"),
+                                  (base + rw, "  rel.cond %one, %wrq, 1")):
+                        slots.setdefault(g, []).append(ln)
+                    keep = keep[3:]
+                elif qpass:   # the W slot at a pass end (each lock line with its r26 copy: one r26 value at a time)
+                    keep =["  rel %one, 0", "  %cqn = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>\n  acq.cond %am1, %cqn, 0",
                             "  %wrq = copy %wrap : reg<aie2p.er> -> reg<aie2p.mr26_lock>\n  rel.cond %one, %wrq, 1",
                             "  %waq = copy %wwa : reg<aie2p.er> -> reg<aie2p.mr26_lock>\n  acq.cond %am1, %waq, 1"] + keep[3:]
             units[0] = keep + units[0]
