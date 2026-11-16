@@ -27,6 +27,7 @@ Needs HRX patch 0013; compile with LOOM_ENV. Config.gate > 0 adds the NPU-side g
 import contextlib
 import dataclasses
 import importlib
+import json
 import os
 import re
 import struct
@@ -1603,7 +1604,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         "ring slot of a row must be static per iteration"
     name = name or role + ("_g" if gate else "")
     fills = cov is not None
-    e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
+    lk = "" if tail and os.environ.get("GN_QUNLOCK") else "schedule(locked) "   # (probe: Loom's scheduler orders it)
+    e(f"low.func.def {lk}target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
     rs = "_r" if fills else ""   # parked as scalars across the decoding fill (^fzgemm)
     e(f"  %a{rs} = resource<native_pointer> {{index = 0, source_type = buffer}} : reg<aie2p.ep>")
     if fills:   # the W ring's first slot and the fused fill's egress ring (fuse_prologue; a helper's: its channel to
@@ -2165,7 +2167,15 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             for u in range(wb, len(units)):
                 slots.setdefault(u - wb, []).extend(units[u])
             continue
-        units[0] = init + units[0]
+        if tail and os.environ.get("GN_QCORE") and t > 0:   # Q' core: the init's address work one line per MMA ahead;
+            # the FIFO pointer copies (eps, budget 2: free only after t - 1's last pop) and the fills stay with the pop
+            keep = [ln for ln in init if "eps>" in ln or "fill.512" in ln]
+            ahead = [ln for ln in init if ln not in keep]
+            for i, line in enumerate(ahead):
+                slots.setdefault(base - len(ahead) + i, []).append(line)
+            units[0] = keep + units[0]
+        else:
+            units[0] = init + units[0]
         for i, line in enumerate(early):
             g = base - (len(early) - i)
             (prologue if g < 0 else slots.setdefault(g, [])).append(line)
@@ -2307,9 +2317,88 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     else:
         for line in rest:
             e(line)
+    # GN_QCORE=<boundary json> (experimental, layout Q'): the tail without a cascade input (plain MMAs from C) and each
+    # in-row sub-tile boundary emitted in a solved order (night/sim/bound.py DUMP): the old sub-tile's last E k-blocks,
+    # its C stores, the next sub-tile's C loads and first E2 k-blocks interleaved. Row ends stay serial.
+    qcore = tail and bool(os.environ.get("GN_QCORE"))
+    if qcore:
+        assert not cfg.swiglu and not cfg.dfr and not cfg.ofeat
+        QW = json.load(open(os.environ["GN_QCORE"]))
+        QE, QE2 = QW["E"], QW["E2"]
+        assert ks >= QE + QE2
+    rot = lambda t: qcore and t + 1 < NT and (t + 1) % NP != 0
+
+    def emit_window(t):
+        """The rotated boundary t -> t + 1 (both sub-tiles' window k-blocks, stores, loads); leaves cur = t + 1's."""
+        e(f"  %plc{t + 1} = copy {pl[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e(f"  %pl{t + 1} = padds.modifier %plc{t + 1}, %mls")
+        g0, gi, new = (t * ks + ks - QE) * 4, 0, {}
+        # the window's pops and fills in stream order, pulled by need: before each MMA every line defining an operand
+        # of the next LAGU MMAs (the window's own order, which moves some new-chain MMAs ahead of their slots)
+        pend = [ln for g in range(g0, g0 + 4 * (QE + QE2)) for ln in slots.get(g, [])]
+        mm = [ev for _, ev in QW["events"] if ev[0] == "mma"]
+        ops = [{f"%s{t if ev[1] == 'o' else t + 1}a{(ks if ev[1] == 'o' else 0) + ev[3]}_{ev[2] >> 1}",
+                f"%s{t if ev[1] == 'o' else t + 1}w{(ks if ev[1] == 'o' else 0) + ev[3]}_{ev[2] & 1}"} for ev in mm]
+        defd = set()
+        pdefs = {n for ln in pend if "=" in ln for n in re.findall(r"%\w+", ln.partition("=")[0])}
+
+        def side_of(ln):
+            lhs, eq, _ = ln.partition("=")
+            m = re.match(r"%s\d+r?[pfq]?(am|a|w)", (re.findall(r"%\w+", lhs) or [""])[0]) if eq else None
+            return ("w" if m.group(1) == "w" else "a") if m else None
+
+        def pull(name):
+            """Emit this FIFO side's pending lines (and side-less ones) up to the one defining name."""
+            sd = side_of(next(ln for ln in pend if name in re.findall(r"%\w+", ln.partition("=")[0])))
+            i = 0
+            while name not in defd:
+                ln = pend[i]
+                if side_of(ln) in (sd, None):
+                    pend.pop(i)
+                    defd.update(re.findall(r"%\w+", ln.partition("=")[0]) if "=" in ln else [])
+                    e(ln)
+                else:
+                    i += 1
+        for _, ev in QW["events"]:
+            if ev[0] == "pop":   # the solver's pop time
+                s_, sd, r_, j_ = ev[1:]
+                nm = f"%s{t if s_ == 'o' else t + 1}{sd}{(ks if s_ == 'o' else 0) + j_}_{r_}"
+                if nm in pdefs and nm not in defd:
+                    pull(nm)
+                continue
+            if ev[0] == "mma":
+                for nm in sorted(ops[gi] & pdefs - defd):
+                    pull(nm)
+                side, c, j = ev[1], ev[2], ev[3]
+                tt, kk = (t, ks + j) if side == "o" else (t + 1, j)
+                if side == "n" and c not in new:
+                    e(f"  %z{t + 1}_{c} = concat(%l{t + 1}_{c}_0, %l{t + 1}_{c}_1, %l{t + 1}_{c}_2, %l{t + 1}_{c}_3) : {MBMS4}")
+                    new[c] = f"%z{t + 1}_{c}"
+                acc = cur[c] if side == "o" else new[c]
+                e(f"  %m{tt}_{kk}_{c} = mma.bfp16ebs8.m8n8k8 {acc}, %s{tt}a{kk}_{c >> 1}, %s{tt}w{kk}_{c & 1}, %conf")
+                if side == "o":
+                    cur[c] = f"%m{tt}_{kk}_{c}"
+                else:
+                    new[c] = f"%m{tt}_{kk}_{c}"
+                gi += 1
+            elif ev[0] == "drain":
+                c, q = ev[1], ev[2]
+                e(f"  %o{t}_{c}_{q} = slice {cur[c]}[{q}] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>")
+                e(f"  vst.acc %o{t}_{c}_{q}, {pc[t]}, {256 * c + 64 * q - 512}")
+            else:
+                n, q = ev[1], ev[2]
+                e(f"  %l{t + 1}_{n}_{q} = vlda.acc {pl[t + 1]}, {256 * n + 64 * q - 512}")
+        for ln in pend:   # (pops ahead for the MMAs after the window)
+            e(ln)
+        assert gi == 4 * (QE + QE2) and len(new) == 4
+        e(f"  %pcc{t + 1} = copy {pc[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e(f"  %pc{t + 1} = padds.modifier %pcc{t + 1}, %mcs")
+        for c in range(4):
+            cur[c] = new[c]
+
     for t in range(NT):
-        for k in range(ks):
-            fq = k if tail else (k - 1 if mid else -1)   # incoming quarter added at this k step
+        for k in range(QE2 if t > 0 and rot(t - 1) else 0, ks - QE if rot(t) else ks):
+            fq = -1 if qcore else (k if tail else (k - 1 if mid else -1))   # incoming quarter added at this k step
             if fq == 0:
                 e(f"  %q{t}_{k} = copy %qsel0 : reg<aie2p.er> -> reg<aie2p.mr31_scd>")
                 sel = f"%q{t}_{k}"
@@ -2333,6 +2422,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         nxt = t + 1 < NT
         if not tail:
             emit_writes(t)
+            continue
+        if rot(t):
+            emit_window(t)
             continue
         # store sub-tile t, load the next sub-tile's C (or zeros on the first pass)
         row_end = (t + 1) % NP == 0
