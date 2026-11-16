@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 21:00:00 +0100
+Subject: [PATCH] loom : cap lock read separations on request
+
+LOOM_EXP_LOCK_READ_SEP=A,B: lock -> read and read -> lock separations capped at A and B cycles.
+---
+
+diff --git a/loom/src/loom/codegen/low/descriptors.c b/loom/src/loom/codegen/low/descriptors.c
+--- a/loom/src/loom/codegen/low/descriptors.c
++++ b/loom/src/loom/codegen/low/descriptors.c
+@@ -7,6 +7,9 @@
+ #include "loom/codegen/low/descriptors.h"
+ 
+ #include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "loom/util/stable_id.h"
+ 
+@@ -48,6 +51,46 @@
+       schedule_model->timing_events[timing_event_id].name_string_ref);
+ }
+ 
++static bool loom_low_event_name_contains(iree_string_view_t name,
++                                         const char* part) {
++  const iree_host_size_t length = strlen(part);
++  for (iree_host_size_t i = 0; i + length <= name.size; ++i) {
++    if (memcmp(name.data + i, part, length) == 0) return true;
++  }
++  return false;
++}
++
++int32_t loom_low_schedule_model_experiment_separation(
++    const loom_low_descriptor_set_t* descriptor_set,
++    const loom_low_schedule_model_t* schedule_model, uint16_t producer_event_id,
++    uint16_t consumer_event_id, int32_t cycles) {
++  static bool parsed = false;
++  static int cap_after = 0;
++  static int cap_before = 0;
++  if (!parsed) {
++    parsed = true;
++    const char* value = getenv("LOOM_EXP_LOCK_READ_SEP");
++    if (value == NULL || sscanf(value, "%d,%d", &cap_after, &cap_before) != 2 ||
++        cap_after < 1 || cap_before < 1) {
++      cap_after = cap_before = 0;
++    }
++  }
++  if (cap_after == 0 || descriptor_set == NULL) return cycles;
++  const iree_string_view_t producer = loom_low_schedule_model_timing_event_name(
++      descriptor_set, schedule_model, producer_event_id);
++  const iree_string_view_t consumer = loom_low_schedule_model_timing_event_name(
++      descriptor_set, schedule_model, consumer_event_id);
++  if (loom_low_event_name_contains(producer, ".lock.") &&
++      loom_low_event_name_contains(consumer, ".memory.read.")) {
++    return cycles < cap_after ? cycles : cap_after;
++  }
++  if (loom_low_event_name_contains(producer, ".memory.read.") &&
++      loom_low_event_name_contains(consumer, ".lock.")) {
++    return cycles < cap_before ? cycles : cap_before;
++  }
++  return cycles;
++}
++
+ const loom_low_event_separation_t*
+ loom_low_schedule_model_lookup_event_separation(
+     const loom_low_schedule_model_t* schedule_model, uint16_t producer_event_id,
+diff --git a/loom/src/loom/codegen/low/descriptors.h b/loom/src/loom/codegen/low/descriptors.h
+--- a/loom/src/loom/codegen/low/descriptors.h
++++ b/loom/src/loom/codegen/low/descriptors.h
+@@ -2166,6 +2166,16 @@
+     const loom_low_descriptor_set_t* descriptor_set,
+     const loom_low_schedule_model_t* schedule_model, uint16_t timing_event_id);
+ 
++// EXPERIMENT (opt-in): LOOM_EXP_LOCK_READ_SEP=A,B (each >= 1) caps a lock ->
++// memory read separation at A cycles and a memory read -> lock separation at B.
++// The conservative lock model fences reads that cannot race when the producer
++// writes and the consumer reads each slot in one address order. Returns
++// |cycles| for every other pair or when the variable is unset.
++int32_t loom_low_schedule_model_experiment_separation(
++    const loom_low_descriptor_set_t* descriptor_set,
++    const loom_low_schedule_model_t* schedule_model, uint16_t producer_event_id,
++    uint16_t consumer_event_id, int32_t cycles);
++
+ // Finds the signed separation rule for an event pair, or NULL when the target
+ // model uses its schedule-class default for the dependency.
+ const loom_low_event_separation_t*
+diff --git a/loom/src/loom/codegen/low/schedule/graph.c b/loom/src/loom/codegen/low/schedule/graph.c
+--- a/loom/src/loom/codegen/low/schedule/graph.c
++++ b/loom/src/loom/codegen/low/schedule/graph.c
+@@ -331,7 +331,11 @@
+   if (event_separation != NULL) {
+     return (loom_low_schedule_dependency_timing_t){
+         .minimum_issue_separation_cycles =
+-            event_separation->minimum_issue_separation_cycles,
++            loom_low_schedule_model_experiment_separation(
++                state->target.descriptor_set, state->target.schedule_model,
++                producer_endpoint.timing_event_id,
++                consumer_endpoint.timing_event_id,
++                event_separation->minimum_issue_separation_cycles),
+         .model_quality = event_separation->model_quality,
+         .separation_source = LOOM_LOW_SCHEDULE_SEPARATION_SOURCE_EVENT_PAIR,
+     };
