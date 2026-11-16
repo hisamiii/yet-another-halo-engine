@@ -224,6 +224,8 @@ def loom_env(cfg):
         env["LOOM_EXP_LRU"] = os.environ.get("GN_QLRU", "aie2p.mbms")  # header's registers (no moves on the back edge)
         if os.environ.get("GN_QACQREL") == "1":   # (UNSAFE: FIFO pops are not ordered behind the acquire)
             env["LOOM_EXP_LOCK_ACQREL"] = "6"
+    if qpass_on() and os.environ.get("GN_QHW") != "0":   # the (pass, row) loop as a hardware loop (HRX patch 0080: the
+        env["LOOM_EXP_HWLOOP_TRIP"] = str(MP * cfg.passes)   # authored trip count; the image's only loop)
     if cfg.fuse == 2 and cfg.fmt == "Q4_K":
         env["LOOM_EXP_LRU"] = "aie2p.vec256"
     return env
