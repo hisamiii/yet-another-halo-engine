@@ -523,12 +523,12 @@ def array_program(L, cfg):
         e("  constrain.core_stream %chgs")
         e("  constrain.gate %chgs")
         e("  constrain.signal %chgs")
-    if fpair(cfg):   # pair_swap's rings: the gate tail's half of a C segment (f32), one slot, two records a segment
+    if fpair(cfg):   # pair_swap's rings: the gate tail's half's address, one slot, two records a segment
         e(f"  %nxs = constant.u32 {2 * cfg.nb * MP} : reg<aie2p.array.scalar : index>")
         for u in range(cols // 2):
-            e(f"  %xs{u} = sender %k{2 * u}_{rows - 1}, {PAIR_PORT} : reg<aie2p.array.sender : tile<{SW_HALF // 4}xi32>>")
-            e(f"  %xr{u} = receiver %k{2 * u + 1}_{rows - 1}, {PAIR_PORT} : reg<aie2p.array.receiver : tile<{SW_HALF // 4}xi32>>")
-            e(f"  %chx{u} = channel %xs{u}, %xr{u}, %one, %nxs : reg<aie2p.array.channel : tile<{SW_HALF // 4}xi32>>")
+            e(f"  %xs{u} = sender %k{2 * u}_{rows - 1}, {PAIR_PORT} : reg<aie2p.array.sender : tile<16xi32>>")
+            e(f"  %xr{u} = receiver %k{2 * u + 1}_{rows - 1}, {PAIR_PORT} : reg<aie2p.array.receiver : tile<16xi32>>")
+            e(f"  %chx{u} = channel %xs{u}, %xr{u}, %one, %nxs : reg<aie2p.array.channel : tile<16xi32>>")
             e(f"  constrain.leaf_sync %chx{u}")
     e("  return\n}\n")
 
@@ -654,22 +654,43 @@ def pair_swap(e, pair, slot, tag):
     """Column pairs: a finished C segment at scalar slot (gate slabs then up slabs of a single format's column) is
     swapped half for half with the other tail's, so each holds a single format column's segment: the gate tail ("w")
     gives its second two slabs (the gate rows of the features the up tail keeps) and takes the up tail's first two (the
-    up rows of its own features) in their place. One ring (in the gate tail's memory: the up tail reaches it through
-    its west window), two records a segment: the gate tail fills the first with its half, the up tail swaps it in place
-    for its own; the gate tail's second acquire (once the up tail released the first) reads the up half."""
+    up rows of its own features) in their place. The up tail swaps both halves in place, the gate tail's through its
+    west window: the gate tail posts its half's address and its view of the ring's (a ring in its memory, one slot, two
+    records a segment) and waits for the second record, which the up tail sends once it swapped; the up tail's view of
+    the gate tail's memory is the ring address difference away."""
     x = f"%px{tag}"
     e(f"  {x}sp = storage_address %pxst : low.storage<private> -> reg<aie2p.ep>")
     e(f"  {x}r = lda {x}sp, 0")
     e(f"  acq %am1, {PAIR_PORT}")
+    e(f"  {x}rp = mov.scalar-to-address {x}r")
     if pair == "w":
         e(f"  {x}k = mov.i32 {SW_HALF}")
         e(f"  {x}h = add.rr {slot}, {x}k")
-        pair_copy(e, f"{x}0", f"{x}h", f"{x}r")
+        e(f"  st {x}h, {x}rp, 0")
+        e(f"  {x}rq = mov.scalar-to-address {x}r")
+        e(f"  st {x}r, {x}rq, 4")
         e(f"  rel %one, {PAIR_PORT}")
         e(f"  acq %am1, {PAIR_PORT}")
-        pair_copy(e, f"{x}1", f"{x}r", f"{x}h")
     else:
-        pair_copy(e, f"{x}0", f"{x}r", slot, swap=True)
+        e(f"  {x}wh = lda {x}rp, 0")
+        e(f"  {x}rq = mov.scalar-to-address {x}r")
+        e(f"  {x}wr = lda {x}rq, 4")
+        e(f"  {x}dv = sub {x}r, {x}wr")
+        e(f"  {x}src = add.rr {x}wh, {x}dv")
+        # (a guard: the half must lie in the ring's 64 KB window, else no swap: wrong output, no stray access)
+        e(f"  {x}hk = mov.i32 {SW_HALF - 1}")
+        e(f"  {x}end = add.rr {x}src, {x}hk")
+        e(f"  {x}x0 = xor {x}src, {x}r")
+        e(f"  {x}x1 = xor {x}end, {x}r")
+        e(f"  {x}x2 = or {x}x0, {x}x1")
+        e(f"  {x}sk = mov.i32 -16")
+        e(f"  {x}x3 = lshl {x}x2, {x}sk")
+        e(f"  {x}ok = eqz {x}x3")
+        e(f"  low.cond_br {x}ok, ^pxd{tag}, ^pxj{tag} : reg<aie2p.er>")
+        e(f"^pxd{tag}:")
+        pair_copy(e, f"{x}0", f"{x}src", slot, swap=True)
+        e(f"  low.br ^pxj{tag}")
+        e(f"^pxj{tag}:")
         e(f"  rel %one, {PAIR_PORT}")
         e(f"  acq %am1, {PAIR_PORT}")
     e(f"  rel %one, {PAIR_PORT}")
