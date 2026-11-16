@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 23:00:00 +0100
+Subject: [PATCH] loom : take a per-loop authored hardware loop trip list
+
+LOOM_EXP_HWLOOP_TRIP=N[,N...]: the k-th authored loop in block order takes the k-th count (0: none).
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
+@@ -239,12 +239,22 @@
+   const loom_low_schedule_table_t* schedule = &frame->schedule;
+   const loom_cfg_graph_t* graph = &schedule->cfg_graph;
+   const loom_cfg_loop_nest_t* nest = &schedule->loop_nest;
+-  // EXPERIMENT (LOOM_EXP_HWLOOP_TRIP=N): an authored (asm) loop has no
++  // EXPERIMENT (LOOM_EXP_HWLOOP_TRIP=N[,N...]): an authored (asm) loop has no
+   // producer-proven count; the author states it. A structural candidate
+-  // without facts runs exactly N body iterations (1..1023).
++  // without facts runs exactly N body iterations (1..1023); with a list, the
++  // k-th such candidate in block order takes the k-th count (the last count
++  // past the list's end; 0: not a hardware loop).
+   const char* trip_env = getenv("LOOM_EXP_HWLOOP_TRIP");
+-  const uint64_t authored_trip =
+-      trip_env != NULL ? (uint64_t)strtoull(trip_env, NULL, 10) : 0;
++  uint64_t authored_trips[8] = {0};
++  uint32_t authored_trip_count = 0;
++  for (const char* p = trip_env; p != NULL && *p && authored_trip_count < 8;) {
++    char* end = NULL;
++    authored_trips[authored_trip_count++] = strtoull(p, &end, 10);
++    p = (end != NULL && *end == ',') ? end + 1 : NULL;
++  }
++  const uint64_t authored_trip = authored_trip_count ? authored_trips[0] : 0;
++  uint16_t authored_headers[16];
++  uint32_t authored_header_count = 0;
+   if (!nest->reducible || nest->loop_count == 0 ||
+       (authored_trip == 0 &&
+        schedule->loop_execution.block_count != schedule->block_count)) {
+@@ -334,7 +344,8 @@
+         .trip_count = authored_trip,
+         .count_kind = LOOM_LOW_LOOP_EXECUTION_COUNT_EXACT,
+     };
+-    if (facts == NULL && authored_trip != 0) facts = &authored_facts;
++    const bool authored = facts == NULL && authored_trip != 0;
++    if (authored) facts = &authored_facts;
+     if (facts == NULL ||
+         facts->count_kind != LOOM_LOW_LOOP_EXECUTION_COUNT_EXACT ||
+         facts->trip_count == 0 || facts->trip_count > 1023u) {
+@@ -349,6 +360,30 @@
+         .is_candidate = true,
+     };
+     ++analysis->hardware_loop_candidate_count;
++    if (authored && authored_trip_count > 1 && authored_header_count < 16) {
++      authored_headers[authored_header_count++] = header_index;
++    }
++  }
++  // (a trip list: the authored candidates' counts in block order)
++  for (uint32_t i = 1; i < authored_header_count; ++i) {
++    for (uint32_t j = i; j > 0 && authored_headers[j - 1] > authored_headers[j];
++         --j) {
++      const uint16_t t = authored_headers[j];
++      authored_headers[j] = authored_headers[j - 1];
++      authored_headers[j - 1] = t;
++    }
++  }
++  for (uint32_t k = 0; k < authored_header_count; ++k) {
++    const uint64_t trip =
++        authored_trips[k < authored_trip_count ? k : authored_trip_count - 1];
++    loom_aie2p_block_analysis_t* header =
++        &analysis->blocks[authored_headers[k]];
++    if (trip == 0 || trip > 1023u) {
++      header->hardware_loop.is_candidate = false;
++      --analysis->hardware_loop_candidate_count;
++    } else {
++      header->hardware_loop.trip_count = (uint16_t)trip;
++    }
+   }
+ }
+ 
