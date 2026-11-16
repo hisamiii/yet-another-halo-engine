@@ -172,6 +172,16 @@ def main():
                     bad = np.argwhere(ec > 0.501)
                     print(f"group {g} column {c}: {len(bad)} bad, features {np.unique(bad[:, 1] // 16)} (slabs), "
                           f"tokens {bad[:, 0].min()}..{bad[:, 0].max()}")
+                    if os.environ.get("NPU_BADMAP"):   # (diag) M blocks, rows of a block, tokens within a row
+                        tb = N.MP * 16
+                        print("  M blocks:", np.unique(bad[:, 0] // tb).tolist())
+                        print("  rows in a block:", np.bincount(bad[:, 0] % tb // 16, minlength=N.MP).tolist(),
+                              "token in row:", np.bincount(bad[:, 0] % 16, minlength=16).tolist(),
+                              "feature in slab:", np.bincount(bad[:, 1] % 16, minlength=16).tolist())
+                        pc_ = part[:, N.TN * c:N.TN * (c + 1)]
+                        rc_ = ref[:, N.TN * c:N.TN * (c + 1)]
+                        i0 = bad[0]
+                        print("  first bad:", i0.tolist(), "got", pc_[i0[0], i0[1]], "want", rc_[i0[0], i0[1]])
         k0 = k1
     got = unpack_c(raw, cols, nb, len(grp))
     exact = a.astype(np.float64) @ (w.astype(np.float64) if wq is None else wf).T

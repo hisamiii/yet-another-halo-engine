@@ -200,6 +200,10 @@ def loom_env(cfg):
     # HRX main: the inferred concat affinity grows the decoders' frames past 16 KB (worker 16518 B on q4_k), so the
     # images keep the pin's allocation; q4_k also needs the LRU register choice to fit its dequant loads
     env["LOOM_EXP_NO_CONCAT_PROPAGATE"] = "1"
+    if os.environ.get("GN_QROW") == "1":   # (layout Q' row-rotated tail) accumulators LRU: the chains come back to the
+        env["LOOM_EXP_LRU"] = os.environ.get("GN_QLRU", "aie2p.mbms")  # header's registers (no moves on the back edge)
+        if os.environ.get("GN_QACQREL") == "1":   # (UNSAFE: FIFO pops are not ordered behind the acquire)
+            env["LOOM_EXP_LOCK_ACQREL"] = "6"
     if cfg.fuse == 2 and cfg.fmt == "Q4_K":
         env["LOOM_EXP_LRU"] = "aie2p.vec256"
     return env
@@ -2063,6 +2067,13 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     mid = role == "mid"
     qbank = tail and os.environ.get("GN_QBANK") in ("1", "2") and os.environ.get("GN_QCORE")   # (leaf)
     NT = NP * cfg.mu      # sub-tiles per iteration, M-slab major
+    # GN_QROW=1 (layout Q', with GN_QCORE): the row end is a rotated window too, into the next row's sub-tile 0, whose
+    # state after its first E2 k-blocks (accumulators, FIFOs, pops ahead) crosses the back edge; the join's scalar work
+    # rides in sub-tile 1; a last pass converts every row after the loop
+    qrow = tail and bool(os.environ.get("GN_QCORE")) and os.environ.get("GN_QROW") == "1"
+    if qrow:
+        assert cfg.mu == 1 and acap == 2 and not a_adv and not cfg.swiglu and not cfg.dfr and not cfg.ofeat
+        QEr, QE2r = (json.load(open(os.environ["GN_QCORE"]))[k] for k in ("E", "E2"))
     # swiglu tail: the A pointer is loop-carried as a scalar, a short-lived pointer per sub-tile. Its store fifo pins
     # p2; a pointer live across the loop would otherwise be pushed into p0 / p1, which the operand load fifos need.
     spa = tail and cfg.swiglu
@@ -2114,6 +2125,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     e("^obody:")
     pc = ["%po"] + [f"%pc{t}" for t in range(1, NT)]
     pl = (["%pl"] + [f"%pl{t}" for t in range(1, NT)]) if tail else pc
+    if qrow:
+        pc, pl = pc + [f"%pc{NT}"], pl + [f"%pl{NT}"]
     fifo = {"a": "%fa", "w": "%fw"}
 
     def units_for(t):
@@ -2140,6 +2153,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             asrc = f"%{x}am{sm}"
         if tw == 0:   # the previous row's slab is fully popped; wait for this row's slab
             ap = (["  rel %one, 0"] if t > 0 else []) + ["  acq %am1, 0"] + ap
+        if qrow and t == NT:   # (qrow) the next row's sub-tile 0: slab pointer from a_next, locks placed below
+            asrc, ap = "%pan", []
         positions = [f"  %{x}qa = mova.fifo.position 0", f"  %{x}qw = mova.fifo.position 0"]
         # the tail is one pointer short for early W derivation (it has slack)
         early = (wp + positions) if not tail and t > 0 else []
@@ -2177,7 +2192,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     slots, prologue, wblock, held = {}, [], {}, {}
     wb = 0 if tail else WB
     seam = bool(cfg.seam and wb) and not (cfg.seam == 2 and (helper or "")[:1] == "M")
-    for t in range(NT):
+    for t in range(NT + (1 if qrow else 0)):
         base = t * ks * 4 - LAGU
         early, init, units = units_for(t)
         if wb and t > 0:
@@ -2200,6 +2215,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             ahead = [ln for ln in init if ln not in keep]
             for i, line in enumerate(ahead):
                 slots.setdefault(base - len(ahead) + i, []).append(line)
+            if qrow and t == NT:   # the row's slab released after its last pop, the next acquired if that row runs
+                keep = ["  rel %one, 0", "  %cqn = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>",
+                        "  acq.cond %am1, %cqn, 0"] + keep
             units[0] = keep + units[0]
         else:
             units[0] = init + units[0]
@@ -2208,6 +2226,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             (prologue if g < 0 else slots.setdefault(g, [])).append(line)
         for u, lines in enumerate(units):
             g = base + u
+            if qrow and t == NT and g >= (NT * ks + QE2r) * 4:
+                continue
             if tail and cfg.dfr and t - 1 in DFR_T and g < t * ks * 4:   # held past the deferred push (vector registers)
                 held.setdefault(t, []).extend(lines)
                 continue
@@ -2306,6 +2326,26 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             slots.setdefault(g, []).append(ln)
         wblock[NT - 1] = [[ln for ln in init_n if ln not in pos]] + [[ln] for ln in nxt0 if ".pop." in ln]
 
+    if qrow:   # one line per two MMAs in sub-tile 1: the next row's slab pointer, C row deltas, counter
+        lat = []
+        a_next(lat.append)
+        if qbank:
+            v2 = os.environ.get("GN_QBANK") == "2"
+            lat += [f"  %kcd0a = mova.i32 {40 if v2 else 24}", "  %kcd0 = mul %k512, %kcd0a",
+                    f"  %kcd1a = mova.i32 {72 if v2 else 56}", "  %kcd1 = mul %k512, %kcd1a", "  %cdp = mul %par, %kcd1",
+                    "  %cdel = sub %cdp, %kcd0" if v2 else "  %cdel = sub %kcd0, %cdp", "  %mcd = mov.modifier %cdel",
+                    "  %cdl = mul %cdel, %nf", "  %mcdl = mov.modifier %cdl"]
+        lat += ["  %mpn = add.rr %mp, %one", "  %nxm = lt %mpn, %nmp"]
+        # (the pointer itself just before the row-end window: one fewer pointer live through the row)
+        late_ = [ln for ln in lat if ln.split(" = ")[0].strip() in ("%pac", "%pan")]
+        lat = [ln for ln in lat if ln not in late_]
+        g1 = (ks + QE2r + 2) * 4
+        assert g1 + 2 * len(lat) < (2 * ks - 6) * 4 and len(late_) == 2
+        for i, ln in enumerate(lat):
+            slots.setdefault(g1 + 2 * i, []).append(ln)
+        for i, ln in enumerate(late_):
+            slots.setdefault((NT * ks - QEr) * 4 - 4 + i, []).append(ln)
+
     def emit_writes(t):
         blk = wblock.get(t, [[]])
         for line in blk[0]:
@@ -2322,11 +2362,34 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e(line)
 
     n_init = 6
+    cur = [None] * 4
+    if qrow:   # the first row's sub-tile 0 start: the entry, before the loop (renamed and spliced in at the end)
+        ent, rest = list(prologue[:n_init]), prologue[n_init:]
+        lds = [f"  %l0_{c}_{q} = vlda.acc {pl[0]}, {256 * c + 64 * q - 512}" for c in range(4) for q in range(4)]
+        for i, line in enumerate(lds):
+            ent.append(line)
+            if i < len(rest):
+                ent.append(rest[i])
+        ent += rest[len(lds):]
+        c0 = []
+        for c in range(4):
+            ent.append(f"  %z0_{c} = concat(%l0_{c}_0, %l0_{c}_1, %l0_{c}_2, %l0_{c}_3) : {MBMS4}")
+            c0.append(f"%z0_{c}")
+        for k in range(QE2r):
+            for ci, c in enumerate(ORDER_C):
+                ent.append(f"  %m0_{k}_{c} = mma.bfp16ebs8.m8n8k8 {c0[c]}, %s0a{k}_{c >> 1}, %s0w{k}_{c & 1}, %conf")
+                c0[c] = f"%m0_{k}_{c}"
+                ent += slots.pop(k * 4 + ci, [])
+        e("  %cqa0 = copy %first : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
+        e("  acq.cond %am1, %cqa0, 2")
+        cur = c0
+        prologue = rest = []
     for line in prologue[:n_init]:
         e(line)
     rest = prologue[n_init:]
-    cur = [None] * 4
-    if tail and cfg.dfr:   # (r26 holds the deferred fifo's position: a branch, not acq.cond)
+    if qrow:
+        pass
+    elif tail and cfg.dfr:   # (r26 holds the deferred fifo's position: a branch, not acq.cond)
         e("  low.cond_br %first, ^qa, ^qj : reg<aie2p.er>")
         e("^qa:")
         e("  acq %am1, 2")
@@ -2335,7 +2398,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     elif tail:
         e("  %cqa0 = copy %first : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
         e("  acq.cond %am1, %cqa0, 2")
-    if tail:
+    if tail and not qrow:
         lds = [f"  %l0_{c}_{q} = vlda.acc {pl[0]}, {256 * c + 64 * q - 512}" for c in range(4) for q in range(4)]
         for i, line in enumerate(lds):
             e(line)
@@ -2346,7 +2409,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         for c in range(4):
             e(f"  %z0_{c} = concat(%l0_{c}_0, %l0_{c}_1, %l0_{c}_2, %l0_{c}_3) : {MBMS4}")
             cur[c] = f"%z0_{c}"
-    else:
+    elif not qrow:
         for line in rest:
             e(line)
     # GN_QCORE=<boundary json> (experimental, layout Q'): the tail without a cascade input (plain MMAs from C) and each
@@ -2359,12 +2422,18 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         QE, QE2 = QW["E"], QW["E2"]
         assert ks >= QE + QE2
     # (GN_QNOROT=1: every boundary serial, a control for the windows)
-    rot = lambda t: qcore and not os.environ.get("GN_QNOROT") and t + 1 < NT and (t + 1) % NP != 0
+    QDRIP = int(os.environ.get("GN_QDRIP", "0"))
+    QEAGER = int(os.environ.get("GN_QEAGER", "0"))
+    rot = lambda t: qcore and not os.environ.get("GN_QNOROT") and (t + 1 < NT and (t + 1) % NP != 0 or qrow and t == NT - 1)
 
     def emit_window(t):
         """The rotated boundary t -> t + 1 (both sub-tiles' window k-blocks, stores, loads); leaves cur = t + 1's."""
         e(f"  %plc{t + 1} = copy {pl[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
-        e(f"  %pl{t + 1} = padds.modifier %plc{t + 1}, %mls")
+        if qrow and qbank and t == NT - 1:   # the next row's C slot
+            e(f"  %pl{t + 1}g = padds.modifier %plc{t + 1}, %mls")
+            e(f"  %pl{t + 1} = padds.modifier %pl{t + 1}g, %mcdl")
+        else:
+            e(f"  %pl{t + 1} = padds.modifier %plc{t + 1}, %mls")
         g0, gi, new = (t * ks + ks - QE) * 4, 0, {}
         # the window's pops and fills in stream order, pulled by need: before each MMA every line defining an operand
         # of the next LAGU MMAs (the window's own order, which moves some new-chain MMAs ahead of their slots)
@@ -2376,6 +2445,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         pdefs = {n for ln in pend if "=" in ln for n in re.findall(r"%\w+", ln.partition("=")[0])}
 
         def side_of(ln):
+            if qrow and ("%cqn" in ln or ln.strip() == "rel %one, 0"):   # (in A stream order)
+                return "a"
             lhs, eq, _ = ln.partition("=")
             m = re.match(r"%s\d+r?[pfq]?(am|a|w)", (re.findall(r"%\w+", lhs) or [""])[0]) if eq else None
             return ("w" if m.group(1) == "w" else "a") if m else None
@@ -2392,6 +2463,25 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     e(ln)
                 else:
                     i += 1
+
+        def eager():
+            """(GN_QEAGER) after an MMA: per FIFO side, its earliest pending line when it is not a pop and its inputs
+            are defined (the next sub-tile's pointer copies, positions, fills ride with MMAs instead of clustering
+            before its first pop); side-less lines ahead of it go first. QEAGER 2: at most one line per MMA."""
+            n = 0
+            for sd in ("a", "w"):
+                i = next((k for k, ln in enumerate(pend) if side_of(ln) == sd), None)
+                if i is None or ".pop." in pend[i] or n and QEAGER == 2:
+                    continue
+                if any(side_of(pend[k]) is None for k in range(i)):
+                    continue
+                uses = set(re.findall(r"%\w+", pend[i].partition("=")[2] if "=" in pend[i] else pend[i]))
+                if (uses & pdefs) - defd:
+                    continue
+                ln = pend.pop(i)
+                defd.update(re.findall(r"%\w+", ln.partition("=")[0]) if "=" in ln else [])
+                e(ln)
+                n += 1
         for _, ev in QW["events"]:
             if ev[0] == "pop":   # the solver's pop time
                 s_, sd, r_, j_ = ev[1:]
@@ -2414,6 +2504,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 else:
                     new[c] = f"%m{tt}_{kk}_{c}"
                 gi += 1
+                if QEAGER:
+                    eager()
+                if QDRIP and gi > 4 * (QE + QE2) - QDRIP and pend:   # (GN_QDRIP=n) the pops ahead for the MMAs after the
+                    ln = pend.pop(0)                                  # window, one per MMA over its last n MMAs
+                    defd.update(re.findall(r"%\w+", ln.partition("=")[0]) if "=" in ln else [])
+                    e(ln)
             elif ev[0] == "drain":
                 c, q = ev[1], ev[2]
                 e(f"  %o{t}_{c}_{q} = slice {cur[c]}[{q}] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>")
@@ -2425,12 +2521,64 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e(ln)
         assert gi == 4 * (QE + QE2) and len(new) == 4
         e(f"  %pcc{t + 1} = copy {pc[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
-        e(f"  %pc{t + 1} = padds.modifier %pcc{t + 1}, %mcs")
+        if qrow and qbank and t == NT - 1:
+            e(f"  %pc{t + 1}g = padds.modifier %pcc{t + 1}, %mcs")
+            e(f"  %pc{t + 1} = padds.modifier %pc{t + 1}g, %mcd")
+        else:
+            e(f"  %pc{t + 1} = padds.modifier %pcc{t + 1}, %mcs")
         for c in range(4):
             cur[c] = new[c]
 
+    def convert(base, lp, back):
+        """Last pass: pack the segment's f32 C (NP sub-tiles) in place to bf16 in its first half, which the C ring sends
+        (LOOM_EXP_LS_SEND_PITCH=2). base is a store pointer back bytes past the segment's slot + 512; on a last pass the C
+        load pointer lp equals it, so lp walks the f32 source (post-increment loads) while base walks the bf16
+        destination (post-increment stores); both are rebuilt for the join.
+        It runs between a sub-tile's C stores and the next C loads, so all accumulators are free and loads run 16 ahead.
+        Returns the join's (base, lp)."""
+        e(f"  low.cond_br %clast, ^cv{t}, ^nc{t} : reg<aie2p.er>")
+        e(f"^nc{t}:")
+        e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>, {lp}: reg<aie2p.ep>)")
+        e(f"^cv{t}:")
+        d, k, rest = base, 0, back + 512
+        while rest > 0:
+            step = min(rest, 448)
+            rest -= step
+            e(f"  %cvb{t}_{k} = padda {d}, {-step}")
+            d, k = f"%cvb{t}_{k}", k + 1
+        e(f"  %cvs{t}_0 = copy {d} : reg<aie2p.ep> -> reg<aie2p.ep>")
+        if QCYC:
+            e(f"  %cvt{t} = copy {d} : reg<aie2p.ep> -> reg<aie2p.ep>")
+        s_ = f"%cvs{t}_0"
+        n = 16 * NP
+
+        def load(i):
+            nonlocal s_
+            e(f"  %cvl{t}_{i}, %cvs{t}_{i + 1} = vlda.acc.post {s_}, 64")
+            s_ = f"%cvs{t}_{i + 1}"
+        for i in range(16):
+            load(i)
+        for i in range(n):
+            e(f"  %cvd{t}_{i} = vst.convert.f32x16.to.bf16x16.post %cvl{t}_{i}, {d}, 32")
+            d = f"%cvd{t}_{i}"
+            if i + 16 < n:
+                load(i + 16)
+        if QCYC:   # (diag) the cycles since the first firing's start into the segment's first word
+            e(f"  %tcw{t} = mov.cycles")
+            e(f"  %tcl{t} = slice %tcw{t}[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+            e(f"  %tsa{t} = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>")
+            e(f"  %tst{t} = lda %tsa{t}, 0")
+            e(f"  %tsp{t} = sub %tcl{t}, %tst{t}")
+            e(f"  st %tsp{t}, %cvt{t}, 0")
+        bump(L, f"%cvr{t}", d, back + 512 - 32 * n)
+        e(f"  %cvq{t} = copy %cvr{t} : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e(f"  low.br ^cj{t}(%cvr{t}: reg<aie2p.ep>, %cvq{t}: reg<aie2p.ep>)")
+        e(f"^cj{t}(%cj{t}p: reg<aie2p.ep>, %cj{t}l: reg<aie2p.ep>):")
+        e(f"  %cqr{t} = copy %clast : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
+        e(f"  rel.cond %one, %cqr{t}, 2")
+        return f"%cj{t}p", f"%cj{t}l"
     for t in range(NT):
-        for k in range(QE2 if t > 0 and rot(t - 1) else 0, ks - QE if rot(t) else ks):
+        for k in range(QE2 if t > 0 and rot(t - 1) or qrow and t == 0 else 0, ks - QE if rot(t) else ks):
             fq = -1 if qcore else (k if tail else (k - 1 if mid else -1))   # incoming quarter added at this k step
             if fq == 0:
                 e(f"  %q{t}_{k} = copy %qsel0 : reg<aie2p.er> -> reg<aie2p.mr31_scd>")
@@ -2478,54 +2626,6 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     e(f"  %l{t + 1}_{c}_{q} = vlda.acc {pl[t + 1]}, {256 * c + 64 * q - 512}")
                 e(f"  %o{t}_{c}_{q} = slice {cur[c]}[{q}] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>")
                 e(f"  vst.acc %o{t}_{c}_{q}, {pc[t]}, {256 * c + 64 * q - 512}")
-        def convert(base, lp, back):
-            """Last pass: pack the segment's f32 C (NP sub-tiles) in place to bf16 in its first half, which the C ring sends
-            (LOOM_EXP_LS_SEND_PITCH=2). base is a store pointer back bytes past the segment's slot + 512; on a last pass the C
-            load pointer lp equals it, so lp walks the f32 source (post-increment loads) while base walks the bf16
-            destination (post-increment stores); both are rebuilt for the join.
-            It runs between a sub-tile's C stores and the next C loads, so all accumulators are free and loads run 16 ahead.
-            Returns the join's (base, lp)."""
-            e(f"  low.cond_br %clast, ^cv{t}, ^nc{t} : reg<aie2p.er>")
-            e(f"^nc{t}:")
-            e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>, {lp}: reg<aie2p.ep>)")
-            e(f"^cv{t}:")
-            d, k, rest = base, 0, back + 512
-            while rest > 0:
-                step = min(rest, 448)
-                rest -= step
-                e(f"  %cvb{t}_{k} = padda {d}, {-step}")
-                d, k = f"%cvb{t}_{k}", k + 1
-            e(f"  %cvs{t}_0 = copy {d} : reg<aie2p.ep> -> reg<aie2p.ep>")
-            if QCYC:
-                e(f"  %cvt{t} = copy {d} : reg<aie2p.ep> -> reg<aie2p.ep>")
-            s_ = f"%cvs{t}_0"
-            n = 16 * NP
-
-            def load(i):
-                nonlocal s_
-                e(f"  %cvl{t}_{i}, %cvs{t}_{i + 1} = vlda.acc.post {s_}, 64")
-                s_ = f"%cvs{t}_{i + 1}"
-            for i in range(16):
-                load(i)
-            for i in range(n):
-                e(f"  %cvd{t}_{i} = vst.convert.f32x16.to.bf16x16.post %cvl{t}_{i}, {d}, 32")
-                d = f"%cvd{t}_{i}"
-                if i + 16 < n:
-                    load(i + 16)
-            if QCYC:   # (diag) the cycles since the first firing's start into the segment's first word
-                e(f"  %tcw{t} = mov.cycles")
-                e(f"  %tcl{t} = slice %tcw{t}[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
-                e(f"  %tsa{t} = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>")
-                e(f"  %tst{t} = lda %tsa{t}, 0")
-                e(f"  %tsp{t} = sub %tcl{t}, %tst{t}")
-                e(f"  st %tsp{t}, %cvt{t}, 0")
-            bump(L, f"%cvr{t}", d, back + 512 - 32 * n)
-            e(f"  %cvq{t} = copy %cvr{t} : reg<aie2p.ep> -> reg<aie2p.ep>")
-            e(f"  low.br ^cj{t}(%cvr{t}: reg<aie2p.ep>, %cvq{t}: reg<aie2p.ep>)")
-            e(f"^cj{t}(%cj{t}p: reg<aie2p.ep>, %cj{t}l: reg<aie2p.ep>):")
-            e(f"  %cqr{t} = copy %clast : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
-            e(f"  rel.cond %one, %cqr{t}, 2")
-            return f"%cj{t}p", f"%cj{t}l"
         def convert_f32(base, lp, back):
             """Last pass (cfg.ofeat): permute each (sub-tile, mh) half of the segment's f32 C in place from [nh][row][8]
             to [row][nh][8] (whole 32-byte chain rows), so the slot is [sub-tile][16 tokens][16 f32] for the strided C
@@ -2950,48 +3050,102 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             for c in range(4):
                 e(f"  %z{t + 1}_{c} = concat(%l{t + 1}_{c}_0, %l{t + 1}_{c}_1, %l{t + 1}_{c}_2, %l{t + 1}_{c}_3) : {MBMS4}")
                 cur[c] = f"%z{t + 1}_{c}"
-    if not seam:
-        e("  rel %one, 0")
-        a_next(e)
-    if tail:
-        e(f"  %pcl = copy {pc[-1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
-        if cfg.swiglu:
-            e("  %pong = padds.modifier %pcl, %mcs")
-            e("  %pon = padds.modifier %pong, %mcb")
-        elif qbank:   # the next row's slot (QBANK_C): +12288 after an even row, -16384 after an odd one
-            # (GN_QBANK=2, each row in the other A slot's bank: -20480 after an even row, +16384 after an odd one)
-            v2 = os.environ.get("GN_QBANK") == "2"
-            e(f"  %kcd0a = mova.i32 {40 if v2 else 24}")
-            e("  %kcd0 = mul %k512, %kcd0a")   # 20480 / 12288
-            e(f"  %kcd1a = mova.i32 {72 if v2 else 56}")
-            e("  %kcd1 = mul %k512, %kcd1a")   # 36864 / 28672
-            e("  %cdp = mul %par, %kcd1")
-            e("  %cdel = sub %cdp, %kcd0" if v2 else "  %cdel = sub %kcd0, %cdp")
-            e("  %mcd = mov.modifier %cdel")
-            e("  %pong = padds.modifier %pcl, %mcs")
-            e("  %pon = padds.modifier %pong, %mcd")
-        else:
-            e("  %pon = padds.modifier %pcl, %mcs")
-        e(f"  %plx = copy {pl[-1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
-        if cfg.swiglu:
-            e("  %plng = padds.modifier %plx, %mls")
-            e("  %pln = padds.modifier %plng, %mlb")
-        elif qbank:   # (the first pass's loads stay on the zero buffer: step 0)
-            e("  %cdl = mul %cdel, %nf")
-            e("  %mcdl = mov.modifier %cdl")
-            e("  %plng = padds.modifier %plx, %mls")
-            e("  %pln = padds.modifier %plng, %mcdl")
-        else:
-            e("  %pln = padds.modifier %plx, %mls")
+    if qrow:   # header arguments: the body's live-ins (t 0 names); entry values: the entry's, renamed
+        defs, uses = set(), set()
+        for ln in L[hdr + 5:]:
+            lhs, eq, rhs = ln.partition(" = ")
+            (defs.update(re.findall(r"%\w+", lhs)), uses.update(re.findall(r"%\w+", rhs))) if eq else uses.update(re.findall(r"%\w+", ln))
+        edefs = {n for ln in ent if " = " in ln for n in re.findall(r"%\w+", ln.partition(" = ")[0])}
+        hv = {"%mp": "%zero", "%pa": a0, "%po": po0, "%pl": "%plb", "%more": "%one"}
+        live = sorted(n for n in uses - defs if n in edefs or n in hv) + ["%more"]
+
+        def qkind(n):
+            if n in ("%mp", "%more"):
+                return "reg<aie2p.er>"
+            if n in ("%pa", "%po", "%pl"):
+                return "reg<aie2p.ep>"
+            if re.match(r"%m0_\d+_\d$", n):
+                return "reg<aie2p.mbms x4>"
+            for pat_, k_ in ((r"%s0[aw]\d", "mexa"), (r"%s0r?p", "eps"), (r"%s0r?f", "eldfiforeg"), (r"%s0r?q", "erf2")):
+                if re.match(pat_, n):
+                    return f"reg<aie2p.{k_}>"
+            raise AssertionError(n)
+        bm = {"%mp": "%mpn", "%pa": "%pan", "%po": pc[NT], "%pl": pl[NT], "%more": "%nxm"}
+        bname = lambda n: bm.get(n) or re.sub(r"^%s0(?=[a-z])", f"%s{NT}", re.sub(r"^%m0_", f"%m{NT}_", n))
+        for n in live:
+            assert bname(n) in defs, (n, bname(n))
+        e(f"  low.br ^outer({', '.join(f'{bname(n)}: {qkind(n)}' for n in live)})")
+        ren = {n: n + "_e" for n in edefs}
+        ren.update({"%pa": a0, "%pl": "%plb", "%fa": "%fa0", "%fw": "%fw0", "%po": po0, "%mp": "%zero"})
+        ent2 = [re.sub(r"%\w+", lambda m: ren.get(m.group(0), m.group(0)), ln) for ln in ent]
+        ev_ = lambda n: ren[n] if n in edefs else hv[n]
+        assert L[hdr + 2].strip() == "%omore = lt %mp, %nmp" and L[hdr + 4] == "^obody:"
+        L[hdr:hdr + 4] = ent2 + [
+            f"  low.br ^outer({', '.join(f'{ev_(n)}: {qkind(n)}' for n in live)})",
+            f"^outer({', '.join(f'{n}: {qkind(n)}' for n in live)}):",
+            "  low.cond_br %more, ^obody, ^exit : reg<aie2p.er>"]
     else:
-        e("  %pon = copy %po : reg<aie2p.er> -> reg<aie2p.er>")
-    if seam:
-        e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, %nxm: reg<aie2p.er>{cty(ren('n0'))})")
-    else:
-        e("  %mpn = add.rr %mp, %one")
-        pln = ", %pln: reg<aie2p.ep>" if tail else ""
-        e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln}{dfa(dfifo)})")
+        if not seam:
+            e("  rel %one, 0")
+            a_next(e)
+        if tail:
+            e(f"  %pcl = copy {pc[-1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            if cfg.swiglu:
+                e("  %pong = padds.modifier %pcl, %mcs")
+                e("  %pon = padds.modifier %pong, %mcb")
+            elif qbank:   # the next row's slot (QBANK_C): +12288 after an even row, -16384 after an odd one
+                # (GN_QBANK=2, each row in the other A slot's bank: -20480 after an even row, +16384 after an odd one)
+                v2 = os.environ.get("GN_QBANK") == "2"
+                e(f"  %kcd0a = mova.i32 {40 if v2 else 24}")
+                e("  %kcd0 = mul %k512, %kcd0a")   # 20480 / 12288
+                e(f"  %kcd1a = mova.i32 {72 if v2 else 56}")
+                e("  %kcd1 = mul %k512, %kcd1a")   # 36864 / 28672
+                e("  %cdp = mul %par, %kcd1")
+                e("  %cdel = sub %cdp, %kcd0" if v2 else "  %cdel = sub %kcd0, %cdp")
+                e("  %mcd = mov.modifier %cdel")
+                e("  %pong = padds.modifier %pcl, %mcs")
+                e("  %pon = padds.modifier %pong, %mcd")
+            else:
+                e("  %pon = padds.modifier %pcl, %mcs")
+            e(f"  %plx = copy {pl[-1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            if cfg.swiglu:
+                e("  %plng = padds.modifier %plx, %mls")
+                e("  %pln = padds.modifier %plng, %mlb")
+            elif qbank:   # (the first pass's loads stay on the zero buffer: step 0)
+                e("  %cdl = mul %cdel, %nf")
+                e("  %mcdl = mov.modifier %cdl")
+                e("  %plng = padds.modifier %plx, %mls")
+                e("  %pln = padds.modifier %plng, %mcdl")
+            else:
+                e("  %pln = padds.modifier %plx, %mls")
+        else:
+            e("  %pon = copy %po : reg<aie2p.er> -> reg<aie2p.er>")
+        if seam:
+            e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, %nxm: reg<aie2p.er>{cty(ren('n0'))})")
+        else:
+            e("  %mpn = add.rr %mp, %one")
+            pln = ", %pln: reg<aie2p.ep>" if tail else ""
+            e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln}{dfa(dfifo)})")
     e("^exit:")
+    if qrow:   # last pass: each row's f32 C stays in its slot until here (row offsets: the C pins, else 4 KB apart)
+        if qbank:
+            cs = [int(v) for v in (QBANK2_RING_AT if os.environ.get("GN_QBANK") == "2" else QBANK_RING_AT)
+                  .split(",")[0].split("@")[1].split(":")]
+        else:
+            cs = [1024 * NP * r for r in range(MP)]
+        # from %po (the row after the last one, as the latch left it: one fewer pointer live through the loop)
+        par_ = (MP - 1) & 1
+        dl = (0 if not qbank else par_ * 36864 - 20480 if os.environ.get("GN_QBANK") == "2" else 12288 - par_ * 28672)
+        cx = cs[-1] + 1024 * NP + dl
+        for r, off in enumerate(cs):
+            v = off - cx + 1024 * (NP - 1)
+            e(f"  %cvoa{r} = mova.i32 {v // 512}")
+            e(f"  %cvo{r} = mul %k512, %cvoa{r}")
+            e(f"  %cvm{r} = mov.modifier %cvo{r}")
+            e(f"  %cvpc{r} = copy %po : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e(f"  %cvp{r} = padds.modifier %cvpc{r}, %cvm{r}")
+            t = 100 + r
+            convert(f"%cvp{r}", f"%cvp{r}", 1024 * (NP - 1))
     if tail and cfg.dfr:   # the deferred segment: pads, flush (convert_swiglu's), its slot released
         e("  low.cond_br %dfx, ^dfl, ^dfe : reg<aie2p.er>")
         e("^dfl:")
