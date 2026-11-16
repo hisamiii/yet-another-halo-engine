@@ -39,7 +39,7 @@ MBMS4 = "(reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) ->
 ORDER_C = (0, 2, 1, 3)   # MMA order of the 4 chains inside a k step (a-row, w-col: c >> 1, c & 1)
 LAGU = 9                 # pops issue 9 MMAs ahead of their first use (the pop -> operand latency)
 WB = 9                   # pops of the next sub-tile that ride in the cascade-write block (head, mids)
-MP, NP = 4, 5            # 16-row slabs per M block / per NPU column
+MP, NP = int(os.environ.get("GN_QMP", "4")), 5   # 16-row slabs per M block / per NPU column (GN_QMP: Q' experiments)
 TM, TN = 16 * MP, 16 * NP
 KS = (35, 35, 35, 23)    # production k-blocks per pass and K-slice row: K = 1024 per pass
 # loom-compile environment for the NPU image
@@ -131,6 +131,26 @@ def acap_tail(cfg):
 def qpass_cslots():
     """The C row slots' byte addresses (QBANK_RING_AT's C pins)."""
     return [int(v) for v in QBANK_RING_AT.split(",")[0].split("@")[1].split(":")]
+
+
+def q3_strides():
+    """(GN_QBANK=3) the even / odd sub-tile areas' row strides: NP odd puts one more sub-tile in the even area."""
+    return 1024 * ((NP + 1) // 2), 1024 * (NP // 2)
+
+
+def qa4_slots():
+    """(GN_QA4) the 4 A slots' byte addresses: GN_QPINS' third group if set, else QA4_RING_AT's."""
+    pins = os.environ.get("GN_QPINS") or QA4_RING_AT
+    return [int(v) for v in pins.split(",")[2].split("@")[1].split(":")]
+
+
+def div_mp(src, dst, x):
+    """Lines: dst = src // MP (src < 4096; MP = 4: a shift)."""
+    if MP == 4:   # (the names of the original lines: byte-identical 4 x 4 images)
+        return ["  %qkm2 = mova.i32 -2", f"  {dst} = lshl {src}, %qkm2"]
+    m = -(-65536 // MP)
+    assert all(v * m >> 16 == v // MP for v in range(4096))
+    return [f"  %{x}m = mov.i32 {m}", f"  %{x}p = mul {src}, %{x}m", f"  %{x}k = mova.i32 -16", f"  {dst} = lshl %{x}p, %{x}k"]
 
 
 def qpass_wdelta():
@@ -1774,7 +1794,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     qbank = tail and os.environ.get("GN_QBANK") in ("1", "2", "3") and os.environ.get("GN_QCORE")
     q3 = qbank and os.environ.get("GN_QBANK") == "3"
     if qbank:   # (QBANK_RING_AT pins the slots) A slot 1 a 16 KB bank above slot 0 (a_next); C rows (body)
-        assert (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)) and not a_adv and MP == 4 and NP == 4 and fa <= 4096
+        assert (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)) and not a_adv and MP in (4, 5) and NP in (4, 5) and fa <= 4096
     assert not q3 or qpass, "GN_QBANK=3 needs GN_QPASS=1"
     e(f"  %kks = mova.i32 {fa // 16}")
     e("  %fstep = mul %k144, %kks")   # slab stride
@@ -1786,7 +1806,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     e("  %mz = mov.modifier %zero")
     if q3:   # the odd sub-tiles' area; %qodb: row 0 sub-tile 1's pointer (the odd chain's first)
         sp = "scratch" if qcb1_on() or qa4_on() else "private"   # (GN_QCB1: its own block, placed apart from the private one)
-        e(f"  %qods = storage {{byte_alignment = 1024, byte_length = 8192}} : low.storage<{sp}>")
+        e(f"  %qods = storage {{byte_alignment = 1024, byte_length = {MP * q3_strides()[1]}}} : low.storage<{sp}>")
         e(f"  %qod = storage_address %qods : low.storage<{sp}> -> reg<aie2p.ep>")
         e("  %qodc = copy %qod : reg<aie2p.ep> -> reg<aie2p.ep>")
         bump(L, "%qodb", "%qodc", 512)
@@ -1880,7 +1900,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
             e("  %dmsp = storage_address %dmst : low.storage<private> -> reg<aie2p.ep>")
             e("  %dmsc = mov.address-to-scalar %dmsp")
         if qpass:   # the 4 C slots and the first W slot acquired, the C slots zeroed (every pass loads its C)
-            assert MP == 4 and not cfg.dfr and not grp
+            assert MP in (4, 5) and not cfg.dfr and not grp
             for _ in range(MP):
                 e("  acq %am1, 2")
             e("  acq %am1, 1")
@@ -1889,7 +1909,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
             e("  %qk64 = mova.i32 64")
             cs = qpass_cslots()
             zb = ([(r, b, off - cs[0] + 1024 * b + 512, "%o") for r, off in enumerate(cs) for b in range(NP)] if not q3 else
-                  [(a, b, 1024 * b + 512, base) for a, base in enumerate(("%o", "%qod")) for b in range(MP * NP // 2)])
+                  [(a, b, 1024 * b + 512, base) for a, (base, st_) in enumerate(zip(("%o", "%qod"), q3_strides()))
+                   for b in range(MP * st_ // 1024)])
             for r, b, off, base in zb:
                 e(f"  %qzm{r}_{b} = mova.i32 {off // 64}")
                 e(f"  %qzo{r}_{b} = mul %qzm{r}_{b}, %qk64")
@@ -2423,12 +2444,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e("  %q4i = and %mp, %q4k3")
             e("  %q4o = and %mp, %one")
             e("  %q4l = lt %k2, %q4i")
-            e("  %q4ak = mova.i32 16")
-            e("  %q4a = mul %k512, %q4ak")
-            e("  %q4bk = mova.i32 -24")
-            e("  %q4b = mul %k512, %q4bk")
-            e("  %q4ck = mova.i32 -16")
-            e("  %q4c = mul %k512, %q4ck")
+            a_ = qa4_slots()
+            d_ = [a_[(i + 1) % 4] - a_[i] for i in range(4)]
+            assert d_[0] == d_[2], a_
+            e(f"  %q4a = mov.i32 {d_[0]}")
+            e(f"  %q4b = mov.i32 {d_[1] - d_[0]}")
+            e(f"  %q4c = mov.i32 {d_[3] - d_[1]}")
             e("  %q4x = mul %q4b, %q4o")
             e("  %q4y = mul %q4c, %q4l")
             e("  %q4xy = add.rr %q4x, %q4y")
@@ -2538,9 +2559,16 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         a_next(lat.append)
         if qbank:
             v2 = os.environ.get("GN_QBANK") == "2"
-            if q3:   # rows 2 KB apart in both areas: the odd -> even step lands on the next row; row MP - 1 wraps
-                lat += ["  %qk3 = mova.i32 3", "  %qmq = and %mp, %qk3", "  %qk2 = mova.i32 2", "  %wrap = lt %qk2, %qmq",
-                        f"  %qkw = mova.i32 {-2048 * MP // 512}", "  %qkwa = mul %k512, %qkw", "  %cdel = mul %wrap, %qkwa"]
+            if q3:   # each area's rows a fixed stride apart (q3_strides): a chain's +1 KB step lands on the next row;
+                # row MP - 1 wraps (NP odd: the chains' strides differ, each its own wrap)
+                ses, sos = q3_strides()
+                rowq = (["  %qk3 = mova.i32 3", "  %qmq = and %mp, %qk3"] if MP == 4 else div_mp("%mp", "%qmd", "qmd") +
+                        [f"  %qk5 = mova.i32 {MP}", "  %qm5 = mul %qmd, %qk5", "  %qmq = sub %mp, %qm5"])
+                lat += rowq + [f"  %qk2 = mova.i32 {MP - 2}", "  %wrap = lt %qk2, %qmq",
+                        f"  %qkw = mova.i32 {-ses * MP // 512}", "  %qkwa = mul %k512, %qkw", "  %cdel = mul %wrap, %qkwa"]
+                if NP % 2:
+                    lat += [f"  %qkwo = mova.i32 {-sos * MP // 512}", "  %qkwao = mul %k512, %qkwo",
+                            "  %cdelo = mul %wrap, %qkwao", "  %mcdo = mov.modifier %cdelo"]
             else:
                 lat += [f"  %kcd0a = mova.i32 {40 if v2 else 24}", "  %kcd0 = mul %k512, %kcd0a",
                         f"  %kcd1a = mova.i32 {72 if v2 else 56}", "  %kcd1 = mul %k512, %kcd1a", "  %cdp = mul %par, %kcd1"]
@@ -2557,7 +2585,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             lat += ["  %mcd = mov.modifier %cdel"] + ([] if qpass else ["  %cdl = mul %cdel, %nf", "  %mcdl = mov.modifier %cdl"])
         lat += ["  %mpn = add.rr %mp, %one", "  %nxm = lt %mpn, %nmp"]
         if qpass:   # the W slot: acquired at a pass end if a row follows; the next row's slot (pass parity)
-            lat += ["  %wwa = mul %wrap, %nxm", "  %qkm2 = mova.i32 -2", "  %qpq = lshl %mpn, %qkm2",
+            lat += ["  %wwa = mul %wrap, %nxm"] + div_mp("%mpn", "%qpq", "qpd") + [
                     "  %qppn = and %qpq, %one", f"  %qwda = mova.i32 {qpass_wdelta() // 512}", "  %qwd = mul %k512, %qwda",
                     "  %qwo = mul %qppn, %qwd", "  %wcn = add.rr %wsb, %qwo"]
         elif os.environ.get("GN_QROW") == "1":   # (first pass: rows 1.. acquire their C slot at the row-end window)
@@ -2669,7 +2697,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             if t == 0:
                 pl[1] = "%pl"
             else:
-                e(f"  %plc{t + 1} = copy {pc[t - 1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
+                src_ = pc[t] if t == NT - 1 and NP % 2 else pc[t - 1]
+                e(f"  %plc{t + 1} = copy {src_} : reg<aie2p.ep> -> reg<aie2p.ep>")
                 e(f"  %pl{t + 1}{'g' if t == NT - 1 else ''} = padds.modifier %plc{t + 1}, %mcs")
                 if t == NT - 1:
                     e(f"  %pl{t + 1} = padds.modifier %pl{t + 1}g, %mcd")
@@ -2772,9 +2801,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         if q3:   # t + 1 stores where it loaded; after the row end, the next row's odd chain from this row's sub-tile 3
             pc[t + 1] = pl[t + 1]
             if t == NT - 1:
-                e(f"  %pqoc = copy {pc[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
+                e(f"  %pqoc = copy {pc[t - 1] if NP % 2 else pc[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
                 e("  %pqog = padds.modifier %pqoc, %mcs")
-                e("  %pqo = padds.modifier %pqog, %mcd")
+                e(f"  %pqo = padds.modifier %pqog, {'%mcdo' if NP % 2 else '%mcd'}")
         else:
             e(f"  %pcc{t + 1} = copy {pc[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
             if qrow and qbank and t == NT - 1:
@@ -3384,7 +3413,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln}{dfa(dfifo)})")
     e("^exit:")
     if qpeel_on():
-        assert q3 and qrow and qpass and NT == NP == 4 and not cfg.dfr
+        assert q3 and qrow and qpass and NT == NP and not cfg.dfr
         i0 = L.index("^obody:", hdr)
         hl = next(ln for ln in L[hdr:i0] if ln.startswith("^outer("))
         hargs = [a.split(": ", 1) for a in hl[len("^outer("):-2].split(", ")]
@@ -3446,7 +3475,13 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e("  st %ptp, %ptq, 0")
         e("  rel %one, 2")
         e(f"  %pnc = copy {q} : reg<aie2p.ep> -> reg<aie2p.ep>")
-        e("  %pnx = padds.modifier %pnc, %pqm")   # (the next row's slot: 2048 on)
+        if q3_strides()[0] == 512 * NT:
+            e("  %pnx = padds.modifier %pnc, %pqm")   # (the next row's slot: the even area's row stride on)
+        else:
+            e(f"  %pnk = mova.i32 {(q3_strides()[0] - 512 * (NT - 1)) // 512}")
+            e("  %pnk2 = mul %k512, %pnk")
+            e("  %pnm = mov.modifier %pnk2")
+            e("  %pnx = padds.modifier %pnc, %pnm")
         e(sub_(back)[:-1] + ", %pnx: reg<aie2p.ep>)")
         L[-1] = L[-1].replace("^outer(", "^pouter(")
         e("^pexit:")

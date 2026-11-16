@@ -106,6 +106,8 @@ def main():
             # (the pins are written for ks 28: W slots NP slabs, A slots one slab)
             env["LOOM_EXP_RING_AT"] = env["LOOM_EXP_RING_AT"].replace("16128@", f"{N.NP * N.slab(ks[0])}@").replace(
                 "4032@", f"{N.slab(ks[0])}@")
+        if os.environ.get("GN_QPINS"):   # (Q' experiments: the whole pin list)
+            env["LOOM_EXP_RING_AT"] = os.environ["GN_QPINS"]
     for k in os.environ.get("NPU_ENV_DROP", "").split(","):   # e.g. LOOM_EXP_PANEL_STREAM (diagnosis)
         env.pop(k, None)
     for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
@@ -119,7 +121,7 @@ def main():
     if fuse == 2:   # the decoders emit each pass's k-blocks in panel order (gen_npu_dec.KPERM): A follows
         kperm = np.concatenate([128 * p + D.KPERM for p in range(passes)])
         a_in = a.reshape(M, K // 8, 8)[:, kperm].reshape(M, K)
-    ra, _ = B.reference(a_in, "act", M, list(ks), passes, 64, True)
+    ra, _ = B.reference(a_in, "act", M, list(ks), passes, N.TM, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
     assert ra.size == sa and rw.size == sw
     ra.tofile(a_b)
@@ -137,8 +139,18 @@ def main():
         bindings += [d_b, r_b]
     width = None
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
-        r = subprocess.run([hrx_paths.NPU_RUN, img, cfg.entry, str(cand), "2=" + co] + bindings,
-                           capture_output=True, text=True, env=env, timeout=600)
+        if os.environ.get("NPU_STALL_CMD"):   # (diag) a command run 3 s into the job, while it lives (a status dump)
+            import time
+            pr = subprocess.Popen([hrx_paths.NPU_RUN, img, cfg.entry, str(cand), "2=" + co] + bindings,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            time.sleep(float(os.environ.get("NPU_STALL_S", "3")))
+            if pr.poll() is None:
+                subprocess.run(os.environ["NPU_STALL_CMD"], shell=True)
+            o, er = pr.communicate(timeout=600)
+            r = subprocess.CompletedProcess(pr.args, pr.returncode, o, er)
+        else:
+            r = subprocess.run([hrx_paths.NPU_RUN, img, cfg.entry, str(cand), "2=" + co] + bindings,
+                               capture_output=True, text=True, env=env, timeout=600)
         if r.returncode == 0:
             width = cand
             if os.environ.get("NPU_RUN_REPEAT") or os.environ.get("YAH_NPU_PROF"):   # (npu_run's times, counters)
@@ -199,7 +211,7 @@ QMODE = os.environ.get("NPU_Q") == "1"   # layout Q' images: 64-wide tiles (NP 4
 
 if __name__ == "__main__":
     if QMODE:
-        with N.np_override(4):
+        with N.np_override(int(os.environ.get("GN_QNP", "4"))):   # (GN_QNP: Q' experiments)
             main()
     else:
         main()
