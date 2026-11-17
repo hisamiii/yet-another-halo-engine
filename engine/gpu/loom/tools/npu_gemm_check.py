@@ -169,6 +169,7 @@ def main():
             width = cand
             if os.environ.get("NPU_RUN_REPEAT") or os.environ.get("YAH_NPU_PROF"):   # (npu_run's times, counters)
                 print("".join(ln + "\n" for ln in r.stdout.splitlines() if " run " in ln or " prof " in ln), end="")
+            print("".join(ln + "\n" for ln in r.stderr.splitlines() if "RunGatedOnce" in ln), end="")
             break
         if "does not match the admitted native context" not in r.stderr:
             sys.exit(f"npu_run failed\n{r.stderr[-2000:]}")
