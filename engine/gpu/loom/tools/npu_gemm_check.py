@@ -248,10 +248,12 @@ def main():
                 st_ = np.diff(cyc.reshape(cols, nb, N.MP)[0, r_::R_, -1])
                 print(f"  row {r_} (core 0): median {float(np.median(st_)):.0f} min {st_.min()} max {st_.max()}")
         if os.environ.get("GN_QFCYC") == "1" and fuse == 2:   # (the filler's fill words 1-3 of its blocks' segments)
-            w4f = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[0, :, :, :4].astype(np.int64)
+            w4f = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[0, :, :, :5].astype(np.int64)
             fb_ = ((1 if N.qcstage_on() else 2) if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
             v_ = w4f[fb_, -1]
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
+            if os.environ.get("DQ_CYC") == "1":   # (diag) word 1: the decoder's cycles; word 4: its hot loop's
+                print(f"  decoder (DQ_CYC): {v_[1]} cycles, hot loop {v_[4]}")
         if os.environ.get("GN_QCYCABS") == "1":   # (diag) the call's span over every core: last end - first start
             w2_ = np.fromfile(co, np.uint32).reshape(-1, seg // 4)[:, :2].astype(np.int64)
             st0_, en_ = w2_[:, 1], w2_[:, 0] + w2_[:, 1]

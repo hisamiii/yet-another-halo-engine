@@ -146,6 +146,7 @@ NIB = 0                         # Q3_K: storage B nibble rows per half: hmask ni
                                 # Q5_K: v = nibble | 16 h of k-block kb at 1024 h + 64 kb; qh nibble r of chunk c at
                                 # 2048 + 256 h + 64 c
 KVT = list(range(16)) if FMT == "Q4_K" else None    # the gather table's values (IQ4_XS: its kvalues)
+DQCYC = all(os.environ.get(k) == "1" for k in ("DQ_CYC", "GN_QCYC", "GN_QFCYC"))   # (diag: hot loop cycles)
 CTOFF = 0                       # splat-constant table in storage A (DQ_CT; 0 = timing ablation: the table area)
 
 
@@ -2331,7 +2332,13 @@ def leaf(name="dec"):
                 cap(t + O["fl"], lambda: flush(x))
         # same cycle: slices, then loads, then the rest (Loom splits a bundle where a load follows an MV op)
         tl.sort(key=lambda r_: (r_[0], 0 if " = slice" in r_[2] else 1 if " = vld" in r_[2] else 2, r_[1]))
+        if DQCYC:   # (diag, fused, GN_QFCYC: the hot loop's cycles summed into %qfc byte 28)
+            e.L += ["%dqcy0w = mov.cycles", "%dqcy0 = slice %dqcy0w[0] : reg<aie2p.er x2> -> reg<aie2p.er>"]
         e.L += [s_ for _, _, s_ in tl]
+        if DQCYC:
+            e.L += ["%dqcy1w = mov.cycles", "%dqcy1 = slice %dqcy1w[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                    "%dqcyd = sub %dqcy1, %dqcy0", "%dqcyp = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
+                    "%dqcys = lda %dqcyp, 28", "%dqcyn = add.rr %dqcys, %dqcyd", "st %dqcyn, %dqcyp, 28"]
         frags, tails = [], []
     else:
         order = [(0, 0), (0, 1), (1, 0), (1, 1)]           # (chunk cc of the sub-block, half)
@@ -2499,7 +2506,8 @@ def leaf_inline(nsb, name="inl", vroll=False, tonce=True, rec=None, q3roll=False
     for ln in txt.split("\n"):
         t = ln.strip()
         if (t.startswith("global.rodata.def ") or t.startswith("low.func.def ") or " = resource<" in t or
-                " = storage " in t or (" = storage_address " in t and "%fzs" not in t) or t in ("return", "}")):
+                " = storage " in t or (" = storage_address " in t and "%fzs" not in t and "%qfc" not in t) or
+                t in ("return", "}")):
             continue
         out.append(ln)
     return out

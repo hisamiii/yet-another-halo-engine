@@ -2053,13 +2053,25 @@ def qf_decode(L, cfg, dp):
         e(f"  %fza_out = lda %fzpOa, {QF_OUT}")
     for nm in ("sp", "in", "sp2", "out"):
         e(f"  %dq_{nm} = mov.scalar-to-address %fza_{nm}")
-    ren = lambda m: m.group(0) if m.group(2) in ("fzs", "fzt") else m.group(1) + "dq_" + m.group(2)
+    ren = lambda m: m.group(0) if m.group(2) in ("fzs", "fzt", "qfc") else m.group(1) + "dq_" + m.group(2)
+    qfdec = QFCYC and os.environ.get("DQ_CYC") == "1"   # (diag: the decoder's cycles summed into %qfc byte 16)
+    if qfdec:
+        e("  %qfdw0 = mov.cycles")
+        e("  %qfd0 = slice %qfdw0[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
     for ln in ([] if os.environ.get("GN_QFNODEC") else   # (diag: no decoder, every lock and egress kept)
                D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll),
                              vroll=os.environ.get("GN_QFVROLL") == "1",   # (diag: the halves rolled, program memory)
                              rec=(lambda h: (h, h + 1) if h is not None else None)(qfhalf()))):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
+    if qfdec:
+        e("  %qfdw1 = mov.cycles")
+        e("  %qfd1 = slice %qfdw1[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+        e("  %qfdd = sub %qfd1, %qfd0")
+        e("  %qfdp = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
+        e("  %qfds = lda %qfdp, 16")
+        e("  %qfdn = add.rr %qfds, %qfdd")
+        e("  st %qfdn, %qfdp, 16")
     if direct:   # the slab's records to the egress DMA
         e("  %fzE2d = mova.i32 2")
         e(f"  rel %fzE2d, {dp}")
@@ -4864,7 +4876,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e("  st %tst_l, %cvds, 4")
             if QFCYC and QF.get("cfg") is not None and fills is True:   # (fill cycles: words 1-3)
                 e("  %qfaL = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
-                for w_, o_ in ((1, 4), (2, 12), (3, 24)):
+                dqc_ = os.environ.get("DQ_CYC") == "1"   # (diag: word 1 the decoder's cycles, word 4 its hot loop's)
+                for w_, o_ in ((1, 16 if dqc_ else 4), (2, 12), (3, 24)) + (((4, 28),) if dqc_ else ()):
                     e(f"  %qfvL{w_} = lda %qfaL, {o_}")
                     e(f"  st %qfvL{w_}, %cvds, {4 * w_}")
         e("  rel %one, 2")
