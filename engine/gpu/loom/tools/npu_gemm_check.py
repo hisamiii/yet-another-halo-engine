@@ -124,6 +124,43 @@ def main():
                     out_ += [f"  %tlr{o_} = lda %pta, {o_}", f"  %tld{o_} = sub %tlr{o_}, %pts",
                              f"  st %tld{o_}, %ptq, {4 * w_}"]
         text_ = "\n".join(out_) + "\n"
+    if os.environ.get("GN_QCW") == "1" and N.QCYC:   # (diag, Q' leaves) per block: cycles in the entry C acquire, the
+        out_, n_ = [], 0                             # lazy C acquires and the W acquires (private words 20 / 24 / 28,
+        acqs_ = {"  acq %am1, 2": 20, "  acq.cond %am1, %qclk, 2": 24, "  acq %am1, 1": 28,   # reset per firing)
+                 "  acq.cond %am1, %waq, 1": 28}   # -> words 1-3 of each stamped segment
+        for ln_ in text_.splitlines():
+            n_ += 1
+            o_ = acqs_.get(ln_)
+            if o_ is not None:
+                out_ += [f"  %qcwa{n_} = mov.cycles", f"  %qcwb{n_} = slice %qcwa{n_}[0] : reg<aie2p.er x2> -> reg<aie2p.er>"]
+            out_.append(ln_)
+            if o_ is not None:
+                out_ += [f"  %qcwc{n_} = mov.cycles", f"  %qcwd{n_} = slice %qcwc{n_}[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                         f"  %qcwe{n_} = sub %qcwd{n_}, %qcwb{n_}",
+                         f"  %qcwp{n_} = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>",
+                         f"  %qcwf{n_} = lda %qcwp{n_}, {o_}", f"  %qcwg{n_} = add.rr %qcwf{n_}, %qcwe{n_}",
+                         f"  st %qcwg{n_}, %qcwp{n_}, {o_}"]
+            if o_ == 24:   # the lazy acquire's done time from the firing start: words 40 / 44 / 48 (mp 0 / 1 / 2; 36: sink)
+                out_ += [f"  %qcwhc{n_} = copy %qcwp{n_} : reg<aie2p.ep> -> reg<aie2p.ep>", f"  %qcwhk{n_} = mov.i32 32", f"  %qcwhm{n_} = mov.modifier %qcwhk{n_}",
+                         f"  %qcwh{n_} = padds.modifier %qcwhc{n_}, %qcwhm{n_}",
+                         f"  %qcwt{n_} = lda %qcwh{n_}, 0", f"  %qcwu{n_} = sub %qcwd{n_}, %qcwt{n_}",
+                         f"  %qcwk{n_} = mova.i32 4", f"  %qcwm{n_} = mul %mp, %qcwk{n_}",
+                         f"  %qcwn{n_} = add.rr %qcwm{n_}, %qcwk{n_}", f"  %qcwo{n_} = mul %qcwn{n_}, %qcl",
+                         f"  %qcwv{n_} = mov.modifier %qcwo{n_}", f"  %qcwq{n_} = padds.modifier %qcwh{n_}, %qcwv{n_}",
+                         f"  st %qcwu{n_}, %qcwq{n_}, 4"]
+            if ln_ == "  st %tsn, %tca, 0":
+                out_ += [f"  %qcwz{n_} = mova.i32 0"] + [f"  st %qcwz{n_}, %tca, {w_}" for w_ in (20, 24, 28)]
+                out_ += [f"  %qcws{n_} = mov.cycles", f"  %qcsl{n_} = slice %qcws{n_}[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                         f"  %qcsc{n_} = copy %tca : reg<aie2p.ep> -> reg<aie2p.ep>", f"  %qcshk{n_} = mov.i32 32", f"  %qcshm{n_} = mov.modifier %qcshk{n_}",
+                         f"  %qcsh{n_} = padds.modifier %qcsc{n_}, %qcshm{n_}",
+                         f"  st %qcsl{n_}, %qcsh{n_}, 0"]
+            if ln_ == "  st %tsp_l, %cvds, 0":
+                out_ += [f"  %qcwyc{n_} = copy %tsa_l : reg<aie2p.ep> -> reg<aie2p.ep>", f"  %qcwyk{n_} = mov.i32 32",
+                         f"  %qcwym{n_} = mov.modifier %qcwyk{n_}", f"  %qcwy{n_} = padds.modifier %qcwyc{n_}, %qcwym{n_}"]
+                out_ += [f"  %qcwr{n_}_{w_} = lda {b2_}, {o2_}\n  st %qcwr{n_}_{w_}, %cvds, {4 * w_}"
+                         for w_, b2_, o2_ in ((1, "%tsa_l", 20), (2, "%tsa_l", 24), (3, "%tsa_l", 28), (4, f"%qcwy{n_}", 8),
+                                              (5, f"%qcwy{n_}", 12), (6, f"%qcwy{n_}", 16))]
+        text_ = "\n".join(out_) + "\n"
     open(src, "w").write(text_)
     env = hrx_paths.env()
     env.update(Q.loom_env(cfg) if QMODE else N.loom_env(cfg))
@@ -260,6 +297,15 @@ def main():
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
             if os.environ.get("DQ_CYC") == "1":   # (diag) word 1: the decoder's cycles; word 4: its hot loop's
                 print(f"  decoder (DQ_CYC): {v_[1]} cycles, hot loop {v_[4]}")
+        if os.environ.get("GN_QCW") == "1" and mrel:   # (diag) per row: median per block of the C / W acquire waits
+            w4c = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[0, :, -1, :7].astype(np.int64)
+            for r_ in range(4):
+                b_ = r_ if N.qcstage_on() else 2 * (r_ % 2) + r_ // 2
+                v_ = w4c[b_::4][1:]   # (the row's first block apart)
+                print(f"  row {r_} waits a block (median, column 0): C entry {np.median(v_[:, 1]):.0f} "
+                      f"C lazy {np.median(v_[:, 2]):.0f} W {np.median(v_[:, 3]):.0f}; slots 1-3 got at "
+                      f"{np.median(v_[:, 4]):.0f} {np.median(v_[:, 5]):.0f} {np.median(v_[:, 6]):.0f}; "
+                      f"first block: {w4c[b_][1:].tolist()}")
         if os.environ.get("GN_QCYCABS") == "1":   # (diag) the call's span over every core: last end - first start
             w2_ = np.fromfile(co, np.uint32).reshape(-1, seg // 4)[:, :2].astype(np.int64)
             st0_, en_ = w2_[:, 1], w2_[:, 0] + w2_[:, 1]
