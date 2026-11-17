@@ -1205,7 +1205,8 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
     e("  %fzc = lda %fzp, 0")
     e("  %fzc1 = add %fzc, 1")
     q = QF["cfg"]
-    e(f"  %fzcl = mov.i32 {cfg.nb if q is not None else cfg.nb * cfg.passes}")
+    # (Q': a filling core fires once per M block of its row, nb / rows a call)
+    e(f"  %fzcl = mov.i32 {cfg.nb // QF.get('rows', 1) if q is not None else cfg.nb * cfg.passes}")
     e("  %fzcw = lt %fzc1, %fzcl")
     e("  %fzcn = mul %fzc1, %fzcw")
     e("  st %fzcn, %fzp, 0")
@@ -1529,6 +1530,45 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     e("  low.br ^fzu")
     e("^fzux:")
     e("  low.br ^fzgemm")
+
+
+def qf_skip_raw(e, cfg):
+    """(Q' fuse 2, a row below the filler) the memory tile's raw and panel drains share the column's multicast W
+    stream: the raw records (rows padded: gen_npu_q) reach this row as whole W records ahead of the panel; at a call's
+    first firing take and return them, then the GEMM."""
+    n = QF["rawn"] * 64 * QF["raww"] // QF["wslot"]
+    e("  %rzs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+    e("  %rzp = storage_address %rzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %rzc = lda %rzp, 0")
+    e("  %rzc1 = add %rzc, 1")
+    e(f"  %rzcl = mov.i32 {cfg.nb // QF.get('rows', 1)}")
+    e("  %rzcw = lt %rzc1, %rzcl")
+    e("  %rzcn = mul %rzc1, %rzcw")
+    e("  st %rzcn, %rzp, 0")
+    e("  %rzm = eqz %rzc")
+    e("  low.cond_br %rzm, ^rzs0, ^rzgo : reg<aie2p.er>")
+    e("^rzs0:")
+    e("  %rzps = storage_address %rzs : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  %rzN = mov.i32 {n}")
+    e("  st %rzN, %rzps, 4")
+    e("  low.br ^rzu")
+    e("^rzu:")
+    e("  %rzpu = storage_address %rzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %rzu = lda %rzpu, 4")
+    e("  %rzum = eqz %rzu")
+    e("  low.cond_br %rzum, ^rzgo, ^rzub : reg<aie2p.er>")
+    e("^rzub:")
+    e("  %rzA = mova.i32 -1")
+    e("  acq %rzA, 1")
+    e("  %rzR = mova.i32 1")
+    e("  rel %rzR, 1")
+    e("  %rzpb = storage_address %rzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %rzv = lda %rzpb, 4")
+    e("  %rzk = mov.i32 -1")
+    e("  %rzvn = add.rr %rzv, %rzk")
+    e("  st %rzvn, %rzpb, 4")
+    e("  low.br ^rzu")
+    e("^rzgo:")
 
 
 def qf_decode(L, cfg, dp):
@@ -2021,6 +2061,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e("  set.rounding 12")   # round to nearest even (the bf16 C)
     if early:
         fuse_prologue(L, cfg, role, ks, cov, helper, gate)
+    elif QF["cfg"] is not None and name == "tailr":
+        qf_skip_raw(e, cfg)
     if early:   # (fuse2_entry)
         e("  %fzpL = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
         e("  %conf = lda %fzpL, 16")

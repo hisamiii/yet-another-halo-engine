@@ -37,7 +37,8 @@ def array_program(L, cfg):
         for r in range(R):
             kk[c, r] = f"%k{c}_{r}"
             e(f"  %lane{c}_{r} = constant.u32 {c * R + r} : reg<aie2p.array.scalar : index>")
-            e(f"  {kk[c, r]} = worker %workers, %lane{c}_{r}, @tail")
+            # (fuse 2: row 0 decodes its column's panel; the rows below read it, a leaf without the fill)
+            e(f"  {kk[c, r]} = worker %workers, %lane{c}_{r}, @{'tailr' if cfg.fuse == 2 and r else 'tail'}")
             e(f"  constrain.location {kk[c, r]}, %n{c}, %n{2 + r}")
     # C first (rings are placed in channel order: C claims whole banks before the input rings)
     rec = MP * NP * 4 * 256 // MP // 8
@@ -91,40 +92,48 @@ def array_program(L, cfg):
         U, BLK = q.passes, N.fuse_blk(q)
         RS = (cfg.kraw or 8 * P * ks) // 256 * BLK // 4
         fw, nrec = N.fuse_record(q, (0,))
+        # raw row words: a block's; with rows below the filler, padded so the raw records (multicast with the panel)
+        # are whole W records to them (qf_skip_raw)
+        nraw, rw = U * N.FUSE_SB * NP, BLK // 4
+        while R > 1 and nraw * 64 * rw % N.QF["wslot"]:
+            rw += 1
+        assert 4 * rw <= N.decoder(cfg.fmt, cfg.gord).RECROW
+        N.QF["rawn"], N.QF["raww"] = nraw, rw
         dp, sp = N.QF_PORTS
         e('  %fdb = binding 3, "write"')
         e('  %frb = binding 4, "read"')
-        e(f"  %fdl = constant.u32 {cols * R} : reg<aie2p.array.scalar : index>")
+        e(f"  %fdl = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
         e(f"  %fun = constant.u32 {U * N.FUSE_SB * NP} : reg<aie2p.array.scalar : index>")
         e(f"  %fdn = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
-        e(f"  %fd_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{cols * R}x{nrec}x{fw}xi32>>")
+        e(f"  %fd_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nrec}x{fw}xi32>>")
         # records [super-block][slab][16 rows][one block] (super-blocks are BLK apart in a row)
-        e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x{NP}x16x{BLK // 4}xi32, "
+        e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x{NP}x16x{rw}xi32, "
           f"#encoding.layout.strided<strides=[{BLK // 4}, {16 * RS}, {RS}, 1]>>>")
         for c in range(cols):
             e(f"  %fro{c} = constant.u64 {c * N.TN * RS * 4} : reg<aie2p.array.offset : offset>")
-            e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{BLK // 4}xi32>>")
-            for r in range(R):
+            e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{rw}xi32>>")
+            for r in range(1):   # (row 0 fills; the rows below see its raw rows as W records: gen_npu_gemm.qf_skip_raw)
                 t = f"{c}_{r}"
-                e(f"  %fdr{t} = partition.receiver %fd_all, %origin, %lane{t}, %fdl : reg<aie2p.array.receiver : tile<{fw}xi32>>")
+                e(f"  %fdlane{c} = constant.u32 {c} : reg<aie2p.array.scalar : index>")
+                e(f"  %fdr{t} = partition.receiver %fd_all, %origin, %fdlane{c}, %fdl : reg<aie2p.array.receiver : tile<{fw}xi32>>")
                 e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
                 e(f"  %chd{t} = channel %fds{t}, %fdr{t}, %two, %fdn : reg<aie2p.array.channel : tile<{fw}xi32>>")
                 e(f"  constrain.leaf_sync %chd{t}")
-                e(f"  %frr{t} = receiver {kk[c, r]}, {sp} : reg<aie2p.array.receiver : tile<16x{BLK // 4}xi32>>")
-                e(f"  %chr{t} = channel %fru{c}, %frr{t}, %one, %fun : reg<aie2p.array.channel : tile<16x{BLK // 4}xi32>>")
+                e(f"  %frr{t} = receiver {kk[c, r]}, {sp} : reg<aie2p.array.receiver : tile<16x{rw}xi32>>")
+                e(f"  %chr{t} = channel %fru{c}, %frr{t}, %one, %fun : reg<aie2p.array.channel : tile<16x{rw}xi32>>")
                 e(f"  constrain.stage %chr{t}, %n{c if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chr{t}")
-        assert R == 1, "fuse 2: one row (a column's panel filled by one core)"
     jt = len(L)
     if fz:   # filled by the core's egress; its raw rows land in its W ring's first slot
         L[iw:jt] = L[jf:jt] + L[iw:ia] + L[ia:jf]
         for c in range(cols):
-            t = f"{c}_0"
-            e(f"  constrain.fill %chw{t}, %chd{t}")
-            e(f"  %fioff{t} = constant.u32 0 : reg<aie2p.array.scalar : index>")
-            e(f"  %firows{t} = constant.u32 16 : reg<aie2p.array.scalar : index>")
-            e(f"  %fipitch{t} = constant.u32 {N.decoder(cfg.fmt, cfg.gord).RECROW} : reg<aie2p.array.scalar : index>")
-            e(f"  constrain.intake %chr{t}, %chw{t}, %fioff{t}, %firows{t}, %fipitch{t}")
+            e(f"  constrain.fill %chw{c}_0, %chd{c}_0")
+            for r in range(1):
+                t = f"{c}_{r}"
+                e(f"  %fioff{t} = constant.u32 0 : reg<aie2p.array.scalar : index>")
+                e(f"  %firows{t} = constant.u32 16 : reg<aie2p.array.scalar : index>")
+                e(f"  %fipitch{t} = constant.u32 {N.decoder(cfg.fmt, cfg.gord).RECROW} : reg<aie2p.array.scalar : index>")
+                e(f"  constrain.intake %chr{t}, %chw{t}, %fioff{t}, %firows{t}, %fipitch{t}")
     e("  return\n}\n")
 
 
@@ -136,8 +145,11 @@ def gen(cfg):
         assert K % 1024 == 0 and 32 % cfg.ks[0] == 0, "fuse 2: K a multiple of 1024, ks dividing a super-block"
         N.QF["cfg"] = N.Config(cfg.cols, cfg.nb, (128,), K // 1024, mu=1, fuse=2, kraw=cfg.kraw, fmt=cfg.fmt, rawdma=1)
         N.QF["wslot"] = N.NP * N.slab(cfg.ks[0])
+        N.QF["rows"] = QROWS
     else:
         N.QF["cfg"] = None
     array_program(L, cfg)
     N.leaf(L, cfg, "tail", cfg.ks[0], cov=(0,) if cfg.fuse == 2 else None)
+    if cfg.fuse == 2 and QROWS > 1:   # the rows below row 0: the same GEMM leaf without the fill
+        N.leaf(L, cfg, "tail", cfg.ks[0], name="tailr")
     return "\n".join(L)
