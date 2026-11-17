@@ -13,6 +13,18 @@ import gen_npu_gemm as N
 # NPU_QROWS=R (1..4): R array rows (2 .. 1 + R); row r takes M blocks [r nb / R, (r + 1) nb / R) (its own A stream,
 # multicast along the row); a column's W panel is multicast to its R cores; C [col][M block][slab] as before.
 QROWS = int(os.environ.get("NPU_QROWS", "1"))
+
+
+def crel():
+    """C relay (2 rows; NPU_QCREL=0: off): row r takes M blocks 2 f + r; row 1's C ring goes to row 0's core (its south
+    neighbor reads it in place), which copies each firing's segments after its own: one C stream a column (8, not 16:
+    the shim has 16 stream-to-memory channels, and the gate takes 2)."""
+    return QROWS == 2 and os.environ.get("NPU_QCREL", "1") == "1"
+
+
+def crel_port(gate):
+    """Row 0's port for row 1's C ring (past the filler's 0-4 and the gate's)."""
+    return {None: 5, "waiter": 8, "relay": 7}[gate]
 # The Q' core's knobs (gen_npu_gemm GN_Q*; defaults(): environment values win) and its solved sub-tile order
 QCORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "q_core.json")
 Q_ENV = dict(GN_QFLOAT="1", GN_QWCONT="1", GN_QLOCK="1", GN_QPASS="1", GN_QBANK="3", GN_QA4="1", GN_QEAGER="1",
@@ -75,14 +87,30 @@ def array_program(L, cfg):
     rec = MP * NP * 4 * 256 // MP // 8
     e(f"  %ncols = constant.u32 {cols * R} : reg<aie2p.array.scalar : index>")
     e(f"  %nseg = constant.u32 {nbr * MP} : reg<aie2p.array.scalar : index>")
+    cd = f"%n{2 if N.qalt_on() and not N.qaltp_on() else MP}"
+    if crel():   # [col][M block]: row 0's C stream carries its blocks and row 1's, interleaved
+        e(f"  %ncols1 = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
+        e(f"  %nseg2 = constant.u32 {nb * MP} : reg<aie2p.array.scalar : index>")
+        e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nb * MP}x{rec}xi32>>")
+        for c in range(cols):
+            g = "waiter" if cfg.gate and c == 1 else "relay" if cfg.gate and c == 2 else None
+            e(f"  %cr{c}_0 = partition.receiver %c_all, %origin, %n{c}, %ncols1 : reg<aie2p.array.receiver : tile<{rec}xi32>>")
+            e(f"  %sc{c}_0 = sender {kk[c, 0]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
+            e(f"  %chc{c}_0 = channel %sc{c}_0, %cr{c}_0, {cd}, %nseg2 : reg<aie2p.array.channel : tile<{rec}xi32>>")
+            e(f"  constrain.leaf_sync %chc{c}_0")
+            e(f"  %cr{c}_1 = receiver {kk[c, 0]}, {crel_port(g)} : reg<aie2p.array.receiver : tile<{rec}xi32>>")
+            e(f"  %sc{c}_1 = sender {kk[c, 1]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
+            e(f"  %chc{c}_1 = channel %sc{c}_1, %cr{c}_1, {cd}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
+            e(f"  constrain.leaf_sync %chc{c}_1")
     # [col][row][its M blocks] = [col][M block]: lane c R + r
-    e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R}x{nbr * MP}x{rec}xi32>>")
-    for c in range(cols):
+    else:
+        e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R}x{nbr * MP}x{rec}xi32>>")
+    for c in range(cols if not crel() else 0):
         for r in range(R):
             t = f"{c}_{r}"
             e(f"  %cr{t} = partition.receiver %c_all, %origin, %lane{t}, %ncols : reg<aie2p.array.receiver : tile<{rec}xi32>>")
             e(f"  %sc{t} = sender {kk[c, r]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
-            e(f"  %chc{t} = channel %sc{t}, %cr{t}, %n{2 if N.qalt_on() and not N.qaltp_on() else MP}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
+            e(f"  %chc{t} = channel %sc{t}, %cr{t}, {cd}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
             e(f"  constrain.leaf_sync %chc{t}")
     wrec = NP * N.slab(ks)
     fz = cfg.fuse == 2
@@ -105,8 +133,13 @@ def array_program(L, cfg):
     fa = N.slab(ks)
     e(f"  %arec = constant.u32 {nbr * P * MP} : reg<aie2p.array.scalar : index>")
     for r in range(R):   # row r: its M blocks' records [M block][pass][slab], multicast along the row
-        e(f"  %ao{r} = constant.u64 {r * nbr * P * MP * fa} : reg<aie2p.array.offset : offset>")
-        e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nbr * P * MP}x{fa // 4}xi32>>")
+        if crel():   # (row r: M blocks r, r + R, ...)
+            e(f"  %ao{r} = constant.u64 {r * P * MP * fa} : reg<aie2p.array.offset : offset>")
+            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nbr}x{P * MP}x{fa // 4}xi32, "
+              f"#encoding.layout.strided<strides=[{R * P * MP * fa // 4}, {fa // 4}, 1]>>>")
+        else:
+            e(f"  %ao{r} = constant.u64 {r * nbr * P * MP * fa} : reg<aie2p.array.offset : offset>")
+            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nbr * P * MP}x{fa // 4}xi32>>")
         e(f"  %a{r} = view.sender %as{r}, %ao{r} : reg<aie2p.array.sender : tile<{fa // 4}xi32>>")
         for j in range(cols):
             c = (2 * r + j) % cols
@@ -205,18 +238,24 @@ def qgate(cfg):
         N.QF["gports"] = None
         return None, None
     assert cfg.cols >= 3
-    r, b = QROWS - 1, 5 if QROWS == 1 and cfg.fuse == 2 else 3
+    r = gate_row()
+    b = 5 if r == 0 and cfg.fuse == 2 else 3
     N.QF["gports"] = {"col": 1, "waiter": dict(row=r, poll=b, tick=b + 1, nbr=b + 2),
                       "relay": dict(col=2, row=r, nbr=b, sig=b + 1)}
     return (1, r), (2, r)
 
 
+def gate_row():
+    """The gate cores' row: the last (crel: row 0, whose C stream ends the job)."""
+    return 0 if crel() else QROWS - 1
+
+
 def leaf_name(cfg, c, r):
     """Worker (c, r)'s leaf: tail (fuse 2: row 0 decodes the panel), tailr (the rows below), _gw / _gr: the gate's."""
     name = "tailr" if cfg.fuse == 2 and r else "tail"
-    if cfg.gate and (c, r) == (1, QROWS - 1):
+    if cfg.gate and (c, r) == (1, gate_row()):
         return name + "_gw"
-    if cfg.gate and (c, r) == (2, QROWS - 1):
+    if cfg.gate and (c, r) == (2, gate_row()):
         return name + "_gr"
     return name
 
@@ -242,6 +281,7 @@ def gen(cfg):
     else:
         N.QF["cfg"] = None
     N.QF["rows"] = QROWS
+    N.QF["crel"] = crel_port if crel() else None
     array_program(L, cfg)
     for name, gate in leaves(cfg):   # (tailr: the GEMM leaf without the fill, skipping the raw rows)
         fill = cfg.fuse == 2 and not name.startswith("tailr")

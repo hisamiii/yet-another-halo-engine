@@ -1228,6 +1228,11 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
         e("  %fztp = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
         e("  %fzts = mov.address-to-scalar %o_r")
         e("  st %fzts, %fztp, 0")
+        if QF.get("crel"):   # (its own word: the Q' fill counts in %fzt's words 4-12)
+            e("  %crst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+            e("  %crstp = storage_address %crst : low.storage<private> -> reg<aie2p.ep>")
+            e("  %fzcr = mov.address-to-scalar %crb_r")
+            e("  st %fzcr, %crstp, 0")
     hlp = helper == "H" or "h" in (helper or "")       # (kchain "K..h": helped too)
     # %fzx: 0 the helper's ring, 4 the helper record count (the head), 8 the gate's neighbor, (kchain) 12 the ring to
     # the row above, 16 its record count
@@ -2046,6 +2051,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
             e(f"  %fzq{rs} = resource<native_pointer> {{index = {HELP_SEND}, source_type = buffer}} : reg<aie2p.ep>")
     else:
         e("  %w = resource<native_pointer> {index = 1, source_type = buffer} : reg<aie2p.ep>")
+    if fills and QF.get("crel"):   # (Q' C relay) row 1's C ring (parked: fuse2_entry)
+        e(f"  %crb_r = resource<native_pointer> {{index = {QF['crel'](gate)}, source_type = buffer}} : reg<aie2p.ep>")
     if gate:   # the neighbor channel to / from the relay (leaf-synchronized; a filling gate core parks it: fuse2_entry)
         gp = gate_ports(cfg)[gate]
         e(f"  %gn1{rs} = resource<native_pointer> {{index = {gp['nbr']}, source_type = buffer}} : reg<aie2p.ep>")
@@ -2476,6 +2483,48 @@ def gate_first(e, cfg, gate, gn):
     e(f"  st {'%gfexp' if compact else '%gfnext'}, %gsp0, 16")
     e("  low.br ^gfgo")
     e("^gfgo:")
+
+
+def crel_copy(e, port):
+    """(Q' C relay) the firing's end on row 0: row 1's MP C segments (its ring, through the north window) copied into
+    this core's C ring after its own, so its C stream carries block 2 f, then block 2 f + 1. The pointers come back
+    from fuse2_entry's parking word. A segment is the slot's first 2 KB (the peeled pass's bf16)."""
+    cs = [int(v) for v in QA4_RING_AT.split(",")[0].split("@")[1].split(":")]
+    assert QA4_RING_AT.startswith("2048@") and len(cs) == MP and qa4_on() and qpeel_on() and not qalt_on()
+    e("  %crG = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    e("  %crol = lda %crG, 0")
+    e("  %cro = mov.scalar-to-address %crol")
+    e("  %crS = storage_address %crst : low.storage<private> -> reg<aie2p.ep>")
+    e("  %crrl = lda %crS, 0")
+    e("  %crr = mov.scalar-to-address %crrl")
+    e("  %crm1 = mova.i32 -1")
+    e("  %cr1 = mova.i32 1")
+    e("  %crz = mova.i32 0")
+    e(f"  %crK = mova.i32 {MP}")
+    assert all(b - a == 2048 for a, b in zip(cs, cs[1:])), cs   # (a segment's post-increments end at the next slot)
+    # (a loop over the segments, its counter stepped in the header: no hardware loop candidate, so
+    # LOOM_EXP_HWLOOP_TRIP's '@' counts stay the GEMM's)
+    e("  low.br ^crl(%crz: reg<aie2p.er>, %crr: reg<aie2p.ep>, %cro: reg<aie2p.ep>)")
+    e("^crl(%cri: reg<aie2p.er>, %crs: reg<aie2p.ep>, %crq_0: reg<aie2p.ep>):")
+    e("  %crm = lt %cri, %crK")
+    e("  %crin = add.rr %cri, %cr1")
+    e("  low.cond_br %crm, ^crbd, ^crdn : reg<aie2p.er>")
+    e("^crbd:")
+    e(f"  acq %crm1, {port}")
+    e("  acq %crm1, 2")
+    # the vector loads' address waits for a first load (LOOM_EXP_LOCK_READ_SEP: reads 2 cycles past an acquire read
+    # row 1's stores stale; see the gate relay's record)
+    e("  %crk = lda %crs, 0")
+    e("  %crk0 = mul %crk, %crz")
+    e("  %crkm = mov.modifier %crk0")
+    e("  %crp_0 = padda.modifier %crs, %crkm")
+    for i in range(32):
+        e(f"  %crv_{i}, %crp_{i + 1} = vlda.acc.post %crp_{i}, 64")
+        e(f"  %crq_{i + 1} = vst.acc.post %crv_{i}, %crq_{i}, 64")
+    e("  rel %cr1, 2")
+    e(f"  rel %cr1, {port}")
+    e("  low.br ^crl(%crin: reg<aie2p.er>, %crp_32: reg<aie2p.ep>, %crq_32: reg<aie2p.ep>)")
+    e("^crdn:")
 
 
 def gate_count(e, cfg, gate):
@@ -4034,6 +4083,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         e("  rel.cond %one, %dqr, 2")
     if fills and not (role == "tail" and qpass_on()):
         e("  rel %one, 1")
+    if fills and QF.get("crel"):
+        crel_copy(e, QF["crel"](gate))
     if gate:
         gate_count(L.append, cfg, gate)
         e("}\n")
