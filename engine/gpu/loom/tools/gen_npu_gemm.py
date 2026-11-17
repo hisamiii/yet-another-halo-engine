@@ -244,6 +244,18 @@ def qw4_deltas():
     return w[1] - w[0], w[2] - w[0]
 
 
+def qclazy_on():
+    """GN_QCLAZY=1 (GN_QZACC): the firing acquires C slot 0 at entry, slot r at pass 0's row r - 1 end, so the DMA
+    drains the last firing's segments (and a pair relay's copies) while the rows before run."""
+    return os.environ.get("GN_QCLAZY") == "1" and qzacc_on()
+
+
+def crelp_on():
+    """NPU_QCREL=2 (GN_QP1, an even number of rows): each P1 pair's row 1 sends its C to row 0 (port 5), which copies
+    each firing's MP segments after its own: one C stream per pair (2 a column at 4 rows: the shim's 16)."""
+    return os.environ.get("NPU_QCREL") == "2" and qp1_on()
+
+
 def qzacc_on():
     """GN_QZACC=1 (Q' QPASS + QROW + GN_QCORE): no C zeroing at the firing start; a chain's first MMA of a sub-tile
     (the one reading its loaded C) takes the MMA config with bit 0 (zero the accumulator input) on in pass 0."""
@@ -2444,9 +2456,10 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     MBNAME[0] = name   # (GN_QMB1 diag: body reads it)
     # (C relay, a row 0 that does not fill: NPU_QDEC) row 1's C ring and this core's, parked for crel_copy
     crel0 = bool(QF.get("crel")) and bool(QF.get("dec")) and not fills and role == "tail" and not name.startswith("tailr")
+    crel0 = crel0 or (crelp_on() and name == "tailm0")   # (NPU_QCREL=2: a P1 pair's row 0 relays row 1's C)
     CREL0[0] = crel0
     if crmid or crel0:   # (C relay chain, a middle row) the next row's C ring and this core's, parked for crel_copy
-        crp = QF["crelmid"] if crmid else QF["crel"](gate)
+        crp = QF["crelmid"] if crmid else 5 if crelp_on() else QF["crel"](gate)
         e(f"  %crb{rs} = resource<native_pointer> {{index = {crp}, source_type = buffer}} : reg<aie2p.ep>")
         e("  %crst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
         e("  %crstp = storage_address %crst : low.storage<private> -> reg<aie2p.ep>")
@@ -2668,7 +2681,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
             e("  %dmsc = mov.address-to-scalar %dmsp")
         if qpass:   # the 4 C slots and the first W slot acquired, the C slots zeroed (every pass loads its C)
             assert MP in (4, 5) and not cfg.dfr and not grp
-            for _ in range(0 if qalt_on() and not qaltp_on() else MP):
+            for _ in range(0 if qalt_on() and not qaltp_on() else 1 if qclazy_on() else MP):
                 e("  acq %am1, 2")
             e("  acq %am1, 1")
             e("  %qzacc = acc.clear.f32x64")
@@ -2885,8 +2898,10 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     """(Q' C relay) the firing's end on row 0: row 1's MP C segments (its ring, through the north window) copied into
     this core's C ring after its own, so its C stream carries block 2 f, then block 2 f + 1. The pointers come back
     from fuse2_entry's parking word. A segment is the slot's first 2 KB (the peeled pass's bf16)."""
-    cs = [int(v) for v in QA4_RING_AT.split(",")[0].split("@")[1].split(":")]
-    assert QA4_RING_AT.startswith("2048@") and len(cs) == MP and qa4_on() and (qpeel_on() or qunr_on()) and not qalt_on()
+    pins = os.environ.get("GN_QPINS") or QA4_RING_AT
+    sb = int(pins.split(",")[0].split("@")[0])   # (a segment: one C ring slot; 2048 B, the P1 layout's 3072 B)
+    cs = [int(v) for v in pins.split(",")[0].split("@")[1].split(":")]
+    assert sb % 64 == 0 and len(cs) == MP and qa4_on() and (qpeel_on() or qunr_on()) and not qalt_on()
     e(f"  %crG = storage_address {own[0]} : low.storage<private> -> reg<aie2p.ep>")
     e(f"  %crol = lda %crG, {own[1]}")
     e("  %cro = mov.scalar-to-address %crol")
@@ -2897,7 +2912,7 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     e("  %cr1 = mova.i32 1")
     e("  %crz = mova.i32 0")
     e(f"  %crK = mova.i32 {nseg or MP}")
-    assert all(b - a == 2048 for a, b in zip(cs, cs[1:])), cs   # (a segment's post-increments end at the next slot)
+    assert all(b - a == sb for a, b in zip(cs, cs[1:])), cs   # (a segment's post-increments end at the next slot)
     # (a loop over the segments, its counter stepped in the header: no hardware loop candidate, so
     # LOOM_EXP_HWLOOP_TRIP's '@' counts stay the GEMM's)
     e("  low.br ^crl(%crz: reg<aie2p.er>, %crr: reg<aie2p.ep>, %cro: reg<aie2p.ep>)")
@@ -2914,7 +2929,8 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     e("  %crk0 = mul %crk, %crz")
     e("  %crkm = mov.modifier %crk0")
     e("  %crp_0 = padda.modifier %crs, %crkm")
-    for i in range(32):
+    nl = sb // 64
+    for i in range(nl):
         e(f"  %crv_{i}, %crp_{i + 1} = vlda.acc.post %crp_{i}, 64")
         e(f"  %crq_{i + 1} = vst.acc.post %crv_{i}, %crq_{i}, 64")
     e("  rel %cr1, 2")
@@ -2924,14 +2940,14 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
         e(f"  %crwm = mova.i32 {MP - 1}")
         e("  %crw = and %crin, %crwm")
         e("  %crwz = eqz %crw")
-        e(f"  %crwk = mov.i32 {-MP * 2048}")
+        e(f"  %crwk = mov.i32 {-MP * sb}")
         e("  %crwo = mul %crwz, %crwk")
         e("  %crwmd = mov.modifier %crwo")
-        e("  %crpw = padda.modifier %crp_32, %crwmd")
-        e("  %crqw = padda.modifier %crq_32, %crwmd")
+        e(f"  %crpw = padda.modifier %crp_{nl}, %crwmd")
+        e(f"  %crqw = padda.modifier %crq_{nl}, %crwmd")
         e("  low.br ^crl(%crin: reg<aie2p.er>, %crpw: reg<aie2p.ep>, %crqw: reg<aie2p.ep>)")
     else:
-        e("  low.br ^crl(%crin: reg<aie2p.er>, %crp_32: reg<aie2p.ep>, %crq_32: reg<aie2p.ep>)")
+        e(f"  low.br ^crl(%crin: reg<aie2p.er>, %crp_{nl}: reg<aie2p.ep>, %crq_{nl}: reg<aie2p.ep>)")
     e("^crdn:")
 
 
@@ -3649,6 +3665,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e("  %qzm = add.rr %mp, %one")
             e("  %qzl1 = lt %qzm, %qzk")
             e("  %qzcn = add.rr %conf, %qzl1")
+        if qpass and qclazy_on() and t == NT - 1:   # (GN_QCLAZY) pass 0's next row's C slot (rows 1 .. MP - 1)
+            e("  %qcm = add.rr %mp, %one")
+            e(f"  %qck = mova.i32 {MP}")
+            e("  %qcl = lt %qcm, %qck")
+            e("  %qclk = copy %qcl : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
+            e("  acq.cond %am1, %qclk, 2")
         if qrow and not qpass and t == NT - 1:   # the next row's C slot on the first pass (before its loads)
             e("  %cqc = copy %cfn : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
             e("  acq.cond %am1, %cqc, 2")
@@ -4628,6 +4650,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         crel_copy(e, QF["crel"](gate), MP * (QF.get("rows", 2) - 1))
     elif CRMID[0]:
         crel_copy(e, QF["crelmid"], MP * (QF["rows"] - 1 - CRMID[0]), own=("%crst", 4))
+    elif CREL0[0] and crelp_on():
+        crel_copy(e, 5, MP, own=("%crst", 4))
     elif CREL0[0]:
         crel_copy(e, QF["crel"](gate), MP * (QF.get("rows", 2) - 1), own=("%crst", 4))
     if gate:

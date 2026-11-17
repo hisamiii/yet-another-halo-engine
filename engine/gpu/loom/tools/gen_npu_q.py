@@ -7,6 +7,7 @@ Stage 1 array: one row of cols workers (array row 2). A: one stream multicast al
 column, segments [M block][slab] as bf16 (the tail's last-pass convert). Same bindings as gen_npu_gemm with one K
 slice, so npu_gemm_check.py checks it (NPU_Q=1, ks of one entry, NP 4)."""
 import os
+import re
 
 import gen_npu_gemm as N
 
@@ -102,6 +103,8 @@ def loom_env(cfg):
         env["LOOM_EXP_RING_AT"] = N.qf_ring_at(env["LOOM_EXP_RING_AT"])
     if os.environ.get("GN_QRELAX") == "1":   # (HRX 0087) no MMA-latency drain before the row loop's back edge
         env["LOOM_EXP_HWLOOP_TERM_RELAX"] = "1"
+    if N.crelp_on():   # (HRX 0089) the pair relay's channel and the P1 tokens form a leaf-synchronized cycle
+        env["LOOM_EXP_LEAF_SYNC_CYCLES"] = "1"
     return env
 
 
@@ -160,7 +163,25 @@ def array_program(L, cfg):
     # [col][row][its M blocks] = [col][M block]: lane c R + r
     else:
         e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R}x{nbr * MP}x{rec}xi32>>")
-    for c in range(cols if not crel() else 0):
+    if N.crelp_on():   # (NPU_QCREL=2) [col][pair][its blocks]: row 2p + j takes pair p's blocks 2 f + j; row 2p's
+        # stream carries both rows' (row 2p + 1's C ring read in place by row 2p, copied after its own)
+        assert R % 2 == 0 and cfg.fuse != 2 and not cfg.gate
+        L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr * MP}x{rec}xi32>>")
+        e(f"  %ncolp = constant.u32 {cols * R // 2} : reg<aie2p.array.scalar : index>")
+        e(f"  %nseg2 = constant.u32 {2 * nbr * MP} : reg<aie2p.array.scalar : index>")
+        for c in range(cols):
+            for q in range(0, R, 2):
+                t, u = f"{c}_{q}", f"{c}_{q + 1}"
+                e(f"  %lanep{t} = constant.u32 {c * R // 2 + q // 2} : reg<aie2p.array.scalar : index>")
+                e(f"  %cr{t} = partition.receiver %c_all, %origin, %lanep{t}, %ncolp : reg<aie2p.array.receiver : tile<{rec}xi32>>")
+                e(f"  %sc{t} = sender {kk[c, q]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
+                e(f"  %chc{t} = channel %sc{t}, %cr{t}, {cd}, %nseg2 : reg<aie2p.array.channel : tile<{rec}xi32>>")
+                e(f"  constrain.leaf_sync %chc{t}")
+                e(f"  %cr{u} = receiver {kk[c, q]}, 5 : reg<aie2p.array.receiver : tile<{rec}xi32>>")
+                e(f"  %sc{u} = sender {kk[c, q + 1]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
+                e(f"  %chc{u} = channel %sc{u}, %cr{u}, {cd}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
+                e(f"  constrain.leaf_sync %chc{u}")
+    for c in range(cols if not crel() and not N.crelp_on() else 0):
         for r in range(R):
             t = f"{c}_{r}"
             e(f"  %cr{t} = partition.receiver %c_all, %origin, %lane{t}, %ncols : reg<aie2p.array.receiver : tile<{rec}xi32>>")
@@ -172,7 +193,9 @@ def array_program(L, cfg):
     Kb = (8 * P * ks) // 8
     iw = len(L)   # (fuse 2 reorders the sections below: C, the fill channels, W, A, the fill constraints)
     wty = f"{wrec // 4}"
-    for c in range(cols if N.qp1_on() else 0):   # (GN_QP1) a half-record view per pair row parity: row r gets half r % 2
+    wdup = 2 if os.environ.get("GN_QWDUP") == "2" else 1   # (diag: column pairs share one W stream, production's DRAM)
+    assert cols % wdup == 0
+    for c in range(0, cols if N.qp1_on() else 0, wdup):   # (GN_QP1) a half-record view per pair row parity: row r gets half r % 2
         assert not fz and not N.qw4_on() and "w" not in qfix() and N.qpass_on() and R % 2 == 0
         hrec = wrec // 2
         for h in range(2):
@@ -180,11 +203,12 @@ def array_program(L, cfg):
             e(f"  %ws{c}_h{h} = sender %wb, 0 : reg<aie2p.array.sender : tile<{nbr}x{P}x{hrec // 4}xi32, "
               f"#encoding.layout.strided<strides=[0, {hrec // 4}, 1]>>>")
             e(f"  %wv{c}_h{h} = view.sender %ws{c}_h{h}, %wo{c}_h{h} : reg<aie2p.array.sender : tile<{hrec // 4}xi32>>")
-            for r in range(h, R, 2):
-                t = f"{c}_{r}"
-                e(f"  %rw{t} = receiver {kk[c, r]}, 1 : reg<aie2p.array.receiver : tile<{hrec // 4}xi32>>")
+            for c2, r in ((c2, r) for c2 in range(c, c + wdup) for r in range(h, R, 2)):
+                t = f"{c2}_{r}"
+                e(f"  %rw{t} = receiver {kk[c2, r]}, 1 : reg<aie2p.array.receiver : tile<{hrec // 4}xi32>>")
                 e(f"  %chw{t} = channel %wv{c}_h{h}, %rw{t}, %two, %rec : reg<aie2p.array.channel : tile<{hrec // 4}xi32>>")
-                e(f"  constrain.stage %chw{t}, %n{c if cols > 1 else 1}")
+                # (GN_QWDUP: half h of the column pair stages in column c + h: one W half a shim)
+                e(f"  constrain.stage %chw{t}, %n{(c + h if wdup > 1 else c) if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chw{t}")
     for c in range(0 if N.qp1_on() else cols):
         e(f"  %wo{c} = constant.u64 {c * P * wrec} : reg<aie2p.array.offset : offset>")
@@ -205,6 +229,7 @@ def array_program(L, cfg):
     fa = N.slab(ks)
     # (GN_QDIAG_FIX=a, diag: the A channels carry the ring's slots only; the leaves reread them without locks)
     e(f"  %arec = constant.u32 {N.acap_tail(cfg) if 'a' in qfix() else nbr * P * MP} : reg<aie2p.array.scalar : index>")
+    art = f"{fa // 4}"   # (the pair relay: the host orders A so row 2 p + j's blocks are contiguous, npu_gemm_check)
     for r in range(R):   # row r: its M blocks' records [M block][pass][slab], multicast along the row
         if crel():   # (row r: M blocks r, r + R, ...)
             e(f"  %ao{r} = constant.u64 {r * P * MP * fa} : reg<aie2p.array.offset : offset>")
@@ -214,14 +239,30 @@ def array_program(L, cfg):
         else:
             e(f"  %ao{r} = constant.u64 {r * nbr * P * MP * fa} : reg<aie2p.array.offset : offset>")
             e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{N.acap_tail(cfg) if 'a' in qfix() else nbr * P * MP}x{fa // 4}xi32>>")
-        e(f"  %a{r} = view.sender %as{r}, %ao{r} : reg<aie2p.array.sender : tile<{fa // 4}xi32>>")
+        # (GN_QASPLIT=2: the row's columns in two halves, each its own stream staged in its own memory tile, so a
+        # multicast stalls on 4 receivers, not 8)
+        asp = 2 if os.environ.get("GN_QASPLIT") == "2" and cols >= 4 else 1
+        for g in range(asp):
+            av = f"%a{r}" if g == 0 else f"%a{r}g{g}"
+            if g:   # (its own sender, an equal layout of another type: Loom keys a multicast by the sender, CSE merges equals)
+                sl = next(ln for ln in reversed(L) if ln.startswith(f"  %as{r} = sender "))
+                m_ = re.search(r"tile<([\dx]+)xi32(, #encoding.layout.strided<strides=\[([\d, ]+)\]>)?>>$", sl)
+                dims = [int(v) for v in m_.group(1).split("x")]
+                assert not m_.group(3) and len(dims) == 2 and dims[0] % 2 == 0, sl   # [n][rec] -> [n / 2][2][rec]
+                sl = sl[:m_.start()] + f"tile<{dims[0] // 2}x2x{dims[1]}xi32>>"
+                e(sl.replace(f"%as{r} = ", f"%as{r}g{g} = "))
+            e(f"  {av} = view.sender %as{r}{f'g{g}' if g else ''}, %ao{r} : reg<aie2p.array.sender : tile<{art}xi32>>")
         for j in range(cols):
             c = (2 * r + j) % cols
+            g = c * asp // cols
+            av = f"%a{r}" if g == 0 else f"%a{r}g{g}"
+            # (split: each half's stages inside its own columns, rows spread over them; 2 rows: 0, 2 / 4, 6)
+            st = (g * (cols // 2) + r * (cols // 2) // R if asp > 1 else N.astage(r, cols)) if cols > 1 else 2
             t = f"{c}_{r}"
-            e(f"  %ra{t} = receiver {kk[c, r]}, 0 : reg<aie2p.array.receiver : tile<{fa // 4}xi32>>")
-            e(f"  %cha{t} = channel %a{r}, %ra{t}, %n{N.acap_tail(cfg)}, %arec : reg<aie2p.array.channel : tile<{fa // 4}xi32>>")
+            e(f"  %ra{t} = receiver {kk[c, r]}, 0 : reg<aie2p.array.receiver : tile<{art}xi32>>")
+            e(f"  %cha{t} = channel {av}, %ra{t}, %n{N.acap_tail(cfg)}, %arec : reg<aie2p.array.channel : tile<{art}xi32>>")
             e(f"  constrain.leaf_sync %cha{t}")
-            e(f"  constrain.stage %cha{t}, %n{N.astage(r, cols) if cols > 1 else 2}")
+            e(f"  constrain.stage %cha{t}, %n{st}")
     # (fuse 2) the egress ring before the panel it fills (W), the panel before the A stage (gen_npu_gemm.qf_ring_at)
     jf = len(L)
     if fz:   # per core: its egress ring (dummy write binding, never transferred) and its raw rows (rawdma: through its
@@ -336,13 +377,15 @@ def array_program(L, cfg):
         # order. Row 0 (sender, port 3): a ready pre-released at the firing start, then acquire a credit before and release
         # a ready after each half (the last half's release skipped); row 1 (receiver, port 4): acquire a ready before and
         # release a credit after each half. Per firing 2 MP passes of each.
-        assert R == 2 and not fz and not cfg.gate and not crel()
+        assert R % 2 == 0 and not fz and not cfg.gate and not crel()   # (one channel per vertical pair)
         e(f"  %mbn = constant.u32 {nbr * P * MP * 2} : reg<aie2p.array.scalar : index>")
         for c in range(cols):
-            e(f"  %mbs{c} = sender {kk[c, 0]}, 3 : reg<aie2p.array.sender : tile<16xi32>>")
-            e(f"  %mbr{c} = receiver {kk[c, 1]}, 4 : reg<aie2p.array.receiver : tile<16xi32>>")
-            e(f"  %chm{c} = channel %mbs{c}, %mbr{c}, %one, %mbn : reg<aie2p.array.channel : tile<16xi32>>")
-            e(f"  constrain.leaf_sync %chm{c}")
+            for q in range(0, R, 2):
+                t = f"{c}" if q == 0 else f"{c}_{q}"
+                e(f"  %mbs{t} = sender {kk[c, q]}, 3 : reg<aie2p.array.sender : tile<16xi32>>")
+                e(f"  %mbr{t} = receiver {kk[c, q + 1]}, 4 : reg<aie2p.array.receiver : tile<16xi32>>")
+                e(f"  %chm{t} = channel %mbs{t}, %mbr{t}, %one, %mbn : reg<aie2p.array.channel : tile<16xi32>>")
+                e(f"  constrain.leaf_sync %chm{t}")
     e("  return\n}\n")
 
 
@@ -370,9 +413,10 @@ def leaf_name(cfg, c, r):
     if qdec() and r >= QROWS:
         return "qdec" if qdec_rows() == 1 else f"qdec{r - QROWS}"
     name = "tailr" if cfg.fuse == 2 and r else "tail"
-    if cfg.fuse == 0 and r == 1 and os.environ.get("GN_QMB1"):   # (diag: row 1 reads row 0's W, gen_npu_gemm)
+    pr = r % 2 if os.environ.get("GN_QMB1") == "5" and QROWS % 2 == 0 else r   # (MB2 / P1: each vertical pair)
+    if cfg.fuse == 0 and pr == 1 and os.environ.get("GN_QMB1"):   # (diag: row 1 reads row 0's W, gen_npu_gemm)
         name = "tailm"
-    if cfg.fuse == 0 and r == 0 and os.environ.get("GN_QMB1") in ("2", "3", "4", "5"):   # (diag: row 0 reads W from row 1)
+    if cfg.fuse == 0 and pr == 0 and os.environ.get("GN_QMB1") in ("2", "3", "4", "5"):   # (diag: row 0 reads W from row 1)
         name = "tailm0"
     if r and crel() and r < QROWS - 1:   # (a middle row of the relay chain: tailr<r>)
         name += str(r)

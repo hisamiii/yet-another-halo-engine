@@ -92,6 +92,9 @@ def main():
         rng = np.random.default_rng(11)
         a = (rng.standard_normal((M, K)) * np.exp(rng.uniform(-3, 3, (M, 1)))).astype(np.float16)
         w = (rng.standard_normal((Nn, K)) * 0.05).astype(np.float16)
+        if os.environ.get("GN_QWDUP") == "2":   # (Q' P1 diag) column 2 j + 1 reads column 2 j's W (one multicast stream)
+            for c_ in range(0, Nn // N.TN, 2):
+                w[N.TN * (c_ + 1):N.TN * (c_ + 2)] = w[N.TN * c_:N.TN * (c_ + 1)]
     if os.environ.get("NPU_AONEHOT"):   # (diag) token t reads only k0 + t: C[t, n] = W[n, k0 + t] (the panel, readable)
         ko = int(os.environ["NPU_AONEHOT"])
         a = np.zeros((M, K), np.float16)
@@ -120,6 +123,9 @@ def main():
                             env=dict(env, LOOM_DIAG_PC="1"), capture_output=True, text=True)
         open(os.path.join(work, "npu_gemm.pcdiag"), "w").write(
             "".join(ln + "\n" for ln in r_.stderr.splitlines() if ln.split()[:1] in (["PCBLOCKS"], ["PCTEXT"])))
+        for ln in r_.stderr.splitlines():   # (diag, HRX pin: LOOM_EXP_TRACE_SHIM in NPU_ENV_ADD) the shim DMA choices
+            if ln.startswith("SHIM "):
+                print(ln)
     if os.environ.get("NPU_COMPILE_ONLY"):   # (diag) stop after the image (compiler work, no NPU)
         sys.exit(0)
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
@@ -131,6 +137,11 @@ def main():
     ra, _ = B.reference(a_in, "act", M, list(ks), passes, N.TM, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
     assert ra.size == sa and rw.size == sw
+    if QMODE and os.environ.get("NPU_QCREL") == "2":   # (pair relay) row 2 p + j reads its blocks p nb / 2 + 2 f + j in order
+        R_ = int(os.environ.get("NPU_QROWS", "2"))
+        nbr_ = nb // R_
+        src = [(q // 2) * 2 * nbr_ + 2 * f + q % 2 for q in range(R_) for f in range(nbr_)]
+        ra = np.ascontiguousarray(ra.view(np.uint8).reshape(nb, -1)[src]).reshape(-1).view(ra.dtype)
     ra.tofile(a_b)
     if QMODE and N.qp1_on():   # (GN_QP1) [col][pass][record] -> [col][half][pass][half record]: each half view contiguous
         wb_ = rw.view(np.uint8).reshape(cols, passes, 2, -1)
@@ -186,6 +197,8 @@ def main():
         R_ = int(os.environ.get("NPU_QROWS", "1"))
         rel_ = R_ >= 2 and os.environ.get("NPU_QCREL", "1") == "1"   # (C relay: row r's blocks r, r + R, ..)
         last = cyc.reshape(cols, nb, N.MP)[0, ::R_, -1] if rel_ else cyc.reshape(cols, nb, N.MP)[0, :nb // R_, -1]
+        if os.environ.get("NPU_QCREL") == "2":   # (P1 pair relay: core 0's blocks 0, 2, .. of pair 0's half)
+            last = cyc.reshape(cols, nb, N.MP)[0, :nb // (R_ // 2):2, -1]
         if rel_:
             for r_ in range(R_):
                 st_ = np.diff(cyc.reshape(cols, nb, N.MP)[0, r_::R_, -1])
@@ -234,9 +247,15 @@ def main():
         part = unpack_c(raw, cols, nb, len(grp), g)
         ref = value(a[:, k0:k1]) @ (value(w[:, k0:k1]) if wq is None else wq[:, k0:k1]).T
         if os.environ.get("GN_QMB1") in ("2", "5"):   # (diag) row 1's tokens (second half) see their column halves swapped
+            R_ = int(os.environ.get("NPU_QROWS", "2"))
+            tb, nbr_ = N.TM, nb // R_
+            # (a block's row: the pair relay interleaves a pair's blocks, else row r holds blocks r nbr ..)
+            odd = [(b % 2 == 1) if os.environ.get("NPU_QCREL") == "2" else (b // nbr_) % 2 == 1 for b in range(nb)]
             for c in range(cols):
-                blk = ref[M // 2:, N.TN * c:N.TN * (c + 1)]
-                ref[M // 2:, N.TN * c:N.TN * (c + 1)] = np.roll(blk, -N.TN // 2, axis=1)
+                for b in range(nb):
+                    if odd[b]:
+                        blk = ref[b * tb:(b + 1) * tb, N.TN * c:N.TN * (c + 1)]
+                        ref[b * tb:(b + 1) * tb, N.TN * c:N.TN * (c + 1)] = np.roll(blk, -N.TN // 2, axis=1)
         ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # of bf16 at ref
         e = np.abs(part - ref) / ulp
         e = np.where(np.isnan(e), np.inf, e)   # (Python max drops NaN)

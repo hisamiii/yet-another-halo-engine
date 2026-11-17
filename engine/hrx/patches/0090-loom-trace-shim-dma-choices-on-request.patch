@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:00:00 +0100
+Subject: [PATCH] loom : trace shim DMA choices on request
+
+LOOM_EXP_TRACE_SHIM=1 prints each shim DMA's channel, column, direction and stage to stderr.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -8,6 +8,7 @@
+ 
+ #include <inttypes.h>
+ #include <string.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ 
+ // Replays a lock unit stands for: a streamed panel member past the 6-bit lock
+@@ -1162,6 +1163,13 @@
+   loom_aie2p_array_tile_resources_t* resources =
+       &loom_aie2p_array_tile_state(builder, proposal->coordinate)->resources;
+   loom_aie2p_array_channel_resources_commit_shim(proposal, resources);
++  if (getenv("LOOM_EXP_TRACE_SHIM") != NULL) {  // (diag) one line per shim DMA
++    fprintf(stderr, "SHIM channel %u column %u direction %d dma %u stage %u bytes %u\n",
++            channel_index, (unsigned)proposal->coordinate.column,
++            (int)proposal->direction, (unsigned)proposal->dma_channel,
++            (unsigned)builder->channels[channel_index].stage_column,
++            (unsigned)builder->channels[channel_index].record_byte_length);
++  }
+   const uint32_t dma_index = (uint32_t)builder->dma_channel_cursor;
+   builder->dma_channels[builder->dma_channel_cursor++] =
+       (loom_aie2p_array_dma_plan_t){

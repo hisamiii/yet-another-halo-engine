@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:00:00 +0100
+Subject: [PATCH] loom : let leaf-synchronized channels form cycles on request
+
+LOOM_EXP_LEAF_SYNC_CYCLES=1 drops leaf-synchronized channels from the worker dependency check.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+@@ -6,6 +6,8 @@
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/array/topology.h"
+ 
++#include <stdlib.h>
++
+ #include "loom/target/arch/amd/xdna/aie2p/array/binding.h"
+ 
+ #include <string.h>
+@@ -412,6 +414,13 @@
+         receiver->owner_kind != LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER) {
+       continue;
+     }
++    // Experimental LOOM_EXP_LEAF_SYNC_CYCLES=1: a leaf-synchronized channel
++    // (its leaves acquire and release each record themselves) adds no firing
++    // dependency; the leaves' own protocol must be deadlock-free.
++    const char* leaf_cycles = getenv("LOOM_EXP_LEAF_SYNC_CYCLES");
++    if (channel->leaf_sync && leaf_cycles != NULL && atoi(leaf_cycles) != 0) {
++      continue;
++    }
+     graph.next_channels[i] = graph.first_channels[sender->owner_index];
+     graph.first_channels[sender->owner_index] = i;
+   }
