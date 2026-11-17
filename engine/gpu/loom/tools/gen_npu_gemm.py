@@ -2363,6 +2363,8 @@ def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
     e("  low.br ^fzex")
 
 
+MBNAME = [None]   # (GN_QMB1 diag) the leaf being generated
+
 def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=None):
     e = L.append
     tail = role == "tail"
@@ -2390,6 +2392,9 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
             e(f"  %fzh{rs} = resource<native_pointer> {{index = {rp}, source_type = buffer}} : reg<aie2p.ep>")
         if "u" in (helper or ""):   # (kchain: the ring to the row above)
             e(f"  %fzq{rs} = resource<native_pointer> {{index = {HELP_SEND}, source_type = buffer}} : reg<aie2p.ep>")
+    elif name == "tailm" and os.environ.get("GN_QMB1") == "1":   # (GN_QMB1 diag, synthetic 2-row Q': row 1 pops row 0's W slots through its south window;
+        # the multicast gives both rows the same W and a slot refills only once both rows released it)
+        e("  %wmb = resource<native_pointer> {index = 1, source_type = buffer} : reg<aie2p.ep>")
     else:
         e(f"  %w{rs} = resource<native_pointer> {{index = 1, source_type = buffer}} : reg<aie2p.ep>")
     if split_r1:   # (the split channel's ring: slab 3's output)
@@ -2405,8 +2410,14 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e(f"  %o{rs} = resource<native_pointer> {{index = 2, source_type = buffer}} : reg<aie2p.ep>")
     if pair:
         pair_park(e)
+    if name == "tailm" and os.environ.get("GN_QMB1") == "1":   # (GN_QMB1, after the resources)
+        e("  %wmbs = mov.address-to-scalar %wmb")
+        e(f"  %wmbk = mov.i32 {int(os.environ.get('GN_QMB1_DELTA', 0x40000 - 0x70000))}")
+        e("  %wmbt = add.rr %wmbs, %wmbk")
+        e("  %w = mov.scalar-to-address %wmbt")
     crmid = int(name[5]) if QF.get("crelmid") and name[:5] == "tailr" and name[5:6].isdigit() else 0
     CRMID[0] = crmid
+    MBNAME[0] = name   # (GN_QMB1 diag: body reads it)
     # (C relay, a row 0 that does not fill: NPU_QDEC) row 1's C ring and this core's, parked for crel_copy
     crel0 = bool(QF.get("crel")) and bool(QF.get("dec")) and not fills and role == "tail" and not name.startswith("tailr")
     CREL0[0] = crel0
@@ -3126,6 +3137,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     fifo = {"a": "%fa", "w": "%fw"}
 
     wend = {}   # (GN_QWCONT) each sub-tile's final W FIFO state
+    name = MBNAME[0]
+    mb2 = os.environ.get("GN_QMB1") in ("2", "3", "4") and name in ("tailm", "tailm0") and qpass
 
     def units_for(t):
         x = f"s{t}"
@@ -3141,6 +3154,21 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             for j in range(tw):
                 wp.append(f"  %{x}w{j + 1} = padds.modifier %{x}w{j}, %mf")
             wsrc = f"%{x}w{tw}"
+        if mb2 and not wcont:   # (GN_QMB1=2 diag, 2-row synthetic: W column halves split between the two rows' memories,
+            # row 0 owns groups 0, 1, row 1 groups 2, 3; row 1 visits its groups rotated by NP / 2, so at any sub-tile the two
+            # cores read different memories; the other half through the neighbour window. Row 1's output column halves swap.)
+            mb3 = os.environ.get("GN_QMB1") == "3"   # (=3: every W pop from the other row's memory, no rotation)
+            rot = name == "tailm" and os.environ.get("GN_QMB1") == "2"   # (=4: the split halves, no rotation)
+            g = (tw + (NP // 2 if rot else 0)) % NP
+            own = (g < NP // 2) == (name == "tailm0") and not mb3
+            d = 0 if own else (0x60000 - 0x70000 if name == "tailm0" else 0x40000 - 0x70000)
+            bs = "%wcn" if t == NT else "%wc" if t else f"%{x}mbw"
+            wp = ([f"  %{x}mbw = mov.address-to-scalar %w"] if t == 0 else []) + [
+                  f"  %{x}mbk = mov.i32 {g * slab(ks) + d}", f"  %{x}mbs = add.rr {bs}, %{x}mbk",
+                  f"  %{x}w0 = mov.scalar-to-address %{x}mbs"]
+            wsrc = f"%{x}w0"
+            if t == 0 and g == 0 and d == 0:
+                wp, wsrc = [], "%w"
         asrc, ap = "%pa", []
         # spa: a distinct opaque zero per sub-tile (outer counter >> 8 + t) keeps the conversions from being merged
         # into one long-lived pointer

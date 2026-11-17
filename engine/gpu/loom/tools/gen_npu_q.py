@@ -342,6 +342,10 @@ def leaf_name(cfg, c, r):
     if qdec() and r >= QROWS:
         return "qdec" if qdec_rows() == 1 else f"qdec{r - QROWS}"
     name = "tailr" if cfg.fuse == 2 and r else "tail"
+    if cfg.fuse == 0 and r == 1 and os.environ.get("GN_QMB1"):   # (diag: row 1 reads row 0's W, gen_npu_gemm)
+        name = "tailm"
+    if cfg.fuse == 0 and r == 0 and os.environ.get("GN_QMB1") in ("2", "3", "4"):   # (diag: row 0 reads W from row 1)
+        name = "tailm0"
     if r and crel() and r < QROWS - 1:   # (a middle row of the relay chain: tailr<r>)
         name += str(r)
     if cfg.gate and (c, r) == (1, gate_row()):

@@ -228,6 +228,10 @@ def main():
         k1 = k0 + 8 * gp * sum(ks)
         part = unpack_c(raw, cols, nb, len(grp), g)
         ref = value(a[:, k0:k1]) @ (value(w[:, k0:k1]) if wq is None else wq[:, k0:k1]).T
+        if os.environ.get("GN_QMB1") == "2":   # (diag) row 1's tokens (second half) see their column halves swapped
+            for c in range(cols):
+                blk = ref[M // 2:, N.TN * c:N.TN * (c + 1)]
+                ref[M // 2:, N.TN * c:N.TN * (c + 1)] = np.roll(blk, -N.TN // 2, axis=1)
         ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # of bf16 at ref
         e = np.abs(part - ref) / ulp
         e = np.where(np.isnan(e), np.inf, e)   # (Python max drops NaN)
