@@ -4,7 +4,8 @@ Date: Wed, 18 Nov 2026 00:20:00 +0100
 Subject: [PATCH] loom : split an intake's records over its members
 
 LOOM_EXP_INTAKE_SPLIT=1: an intake's members take the memory-tile stage ring's records in turn (member m: m, m + n,
-...), each drained as soon as it lands; LOOM_EXP_INTAKE_STAGE_DEPTH=N: the stage ring holds N records. Intake
+...), each drained as soon as it lands, each with its own free lock (the fill writes in order, the members
+drain apart); LOOM_EXP_INTAKE_STAGE_DEPTH=N: the stage ring holds N records. Intake
 siblings: a second receiver of a W multicast shares its member's drain (core descriptors and lock pair only), and a
 multicast member's panel resolves through its source. LOOM_EXP_ROUTE_DUMP prints routed lanes and intake rejections.
 ---
@@ -148,7 +149,35 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
      channel->intake_member_count = member_count;
      channel->intake_chain_lock = loom_aie2p_array_append_lock_pair(
          builder, channel_index, LOOM_AIE2P_ARRAY_ENDPOINT_DIRECTION_RECEIVE,
-@@ -3972,12 +4018,12 @@
+@@ -3962,6 +4008,27 @@
+           .consumer_ready = 1,
+       };
+     }
++    if (loom_aie2p_array_intake_split()) {   // (each member's free lock)
++      if (stage_depth % member_count != 0) {
++        return loom_aie2p_array_reject_channel_resources(
++            builder, channel_index, worker->coordinate,
++            IREE_SV("a split intake's stage depth must be a multiple of its "
++                    "member count"));
++      }
++      builder->locks[channel->intake_chain_lock].initial_value =
++          (int8_t)(stage_depth / member_count);
++      for (uint32_t m = 1; m < member_count; ++m) {
++        builder->locks[builder->lock_cursor++] = (loom_aie2p_array_lock_plan_t){
++            .channel_index = channel_index,
++            .coordinate = stage,
++            .lock_id = stage_resources->next_lock++,
++            .initial_value = (int8_t)(stage_depth / member_count),
++            .ring_endpoint_direction =
++                LOOM_AIE2P_ARRAY_ENDPOINT_DIRECTION_RECEIVE,
++            .consumer_ready = 0,
++        };
++      }
++    }
+     channel->intake_fill_dma = (uint32_t)builder->dma_channel_cursor;
+     builder->dma_channels[builder->dma_channel_cursor++] =
+         (loom_aie2p_array_dma_plan_t){
+@@ -3972,12 +4039,12 @@
              .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE |
                       LOOM_AIE2P_ARRAY_DMA_FLAG_INTAKE,
              .buffer_descriptor_start = fill_bd,
@@ -163,7 +192,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
        builder->stage_record_offsets[builder->stage_record_cursor++] =
            ring.owner_offsets[r];
      }
-@@ -3998,11 +4044,18 @@
+@@ -3998,11 +4065,18 @@
    }
    channel->sender_dma_index = source->sender_dma_index;
    channel->stage_first_record = source->stage_first_record;
@@ -183,7 +212,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
    }
    // The member's drain descriptors, on its panel's drain channel.
    uint16_t* drain_cursor =
-@@ -4015,7 +4068,17 @@
+@@ -4015,7 +4089,17 @@
        builder->dma_channels[source->intake_fill_dma].buffer_descriptor_count;
    uint32_t drain_count = capacity;
    while (drain_count % stage_count != 0) drain_count += capacity;
@@ -202,7 +231,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
        (uint32_t)core_resources->next_buffer_descriptor + capacity >
            core_resources->facts->dma.buffer_descriptor_count ||
        (uint32_t)core_resources->next_lock + 2u >
-@@ -4027,6 +4090,7 @@
+@@ -4027,6 +4111,7 @@
    const uint16_t drain_bd =
        (uint16_t)((panel_drain->dma_channel & 1u) * half_capacity +
                   *drain_cursor);
@@ -210,7 +239,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
    *drain_cursor += drain_count;
    channel->intake_drain_dma = (uint32_t)builder->dma_channel_cursor;
    builder->dma_channels[builder->dma_channel_cursor++] =
-@@ -4042,6 +4106,7 @@
+@@ -4042,6 +4127,7 @@
            .credit_lock_index = source->intake_chain_lock,
            .stage_record_base = source->stage_first_record,
        };
@@ -218,7 +247,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
    // The member's core descriptors and lock pair, on its panel's receiving
    // channel; the credit starts empty (the worker grants it).
    const loom_aie2p_array_ring_resource_proposal_t core_pair = {
-@@ -4176,6 +4241,10 @@
+@@ -4176,6 +4262,10 @@
          &builder->endpoints[channel->sender_endpoint_index],
          &builder->endpoints[channel->receiver_endpoint_index]));
    }
@@ -229,7 +258,13 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
    return iree_ok_status();
  }
  
-@@ -4306,7 +4375,9 @@
+@@ -4302,11 +4392,14 @@
+       // lock pair and its chain lock; the source: the fill row, the chain's
+       // free lock, the ring records and the fill's route.
+       out_cardinalities->dma_channel_count += 2u;
+-      out_cardinalities->lock_count += 3u;
++      out_cardinalities->lock_count +=
++          loom_aie2p_array_intake_split() ? 4u : 3u;   // (split: a free lock)
        if (channel->source_channel_index == channel_index) {
          out_cardinalities->dma_channel_count += 1u;
          out_cardinalities->lock_count += 1u;
@@ -255,7 +290,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/lo
    // Member ordinal in the drain chain; the source holds the member count.
    uint32_t intake_member;
    uint32_t intake_member_count;
-@@ -789,6 +794,26 @@
+@@ -789,6 +794,29 @@
    return n;
  }
  
@@ -274,6 +309,9 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/lo
 +// LOOM_EXP_INTAKE_SPLIT=1 (EXPERIMENT): an intake's members (not siblings)
 +// take the stage ring's records in turn (member m: records m, m + n, ...;
 +// stage depth a multiple of n), each drained as soon as it lands, in parallel.
++// Each member owns its slots' free lock (depth / n credits: the fill writes in
++// order, the members drain apart): member 0's is the chain lock, member m's
++// (m > 0) chain + n + m.
 +static inline bool loom_aie2p_array_intake_split(void) {
 +  const char* env = getenv("LOOM_EXP_INTAKE_SPLIT");
 +  return env && atoi(env) != 0;
@@ -285,7 +323,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/lo
 diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
 --- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
 +++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
-@@ -1206,12 +1206,15 @@
+@@ -1206,12 +1206,21 @@
        dma->direction == LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY;
    const uint32_t chain = source->intake_chain_lock;
    const uint32_t m = channel->intake_member;
@@ -293,18 +331,25 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src
 +  const bool split = loom_aie2p_array_intake_split();
 +  // (split: the fill's record k readies member k % n, each member returns the
 +  // free lock itself)
++  // (split: member k's free lock, chain for member 0, chain + n + k after)
++  const uint32_t fill_member = split ? slot_ordinal % n : 0u;
++  const uint32_t member_free = m == 0 ? chain : chain + n + m;
++  const uint32_t fill_free =
++      fill_member == 0 ? chain : chain + n + fill_member;
    const loom_aie2p_array_lock_plan_t* acquire_lock =
-       &plan->locks[fill ? chain : chain + 1u + m];
+-      &plan->locks[fill ? chain : chain + 1u + m];
++      &plan->locks[fill ? fill_free : chain + 1u + m];
    const loom_aie2p_array_lock_plan_t* release_lock =
 -      &plan->locks[fill ? chain + 1u
 -                        : (m + 1u < source->intake_member_count ? chain + 2u + m
 -                                                                : chain)];
-+      &plan->locks[fill ? chain + 1u + (split ? slot_ordinal % n : 0u)
-+                        : (!split && m + 1u < n ? chain + 2u + m : chain)];
++      &plan->locks[fill ? chain + 1u + fill_member
++                        : (split ? member_free
++                                 : m + 1u < n ? chain + 2u + m : chain)];
    uint16_t acquire_selector = 0;
    uint16_t release_selector = 0;
    IREE_RETURN_IF_ERROR(loom_xdna_array_form_lock_selector(
-@@ -1248,7 +1251,9 @@
+@@ -1248,7 +1257,9 @@
        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_BASE_ADDRESS,
        (tile->memory.local_load_base +
         plan->stage_record_offsets[dma->stage_record_base +
@@ -315,7 +360,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src
            tile->dma.address_encoding_shift,
        &words[1]);
    const bool last = slot_ordinal + 1u == dma->buffer_descriptor_count;
-@@ -1326,9 +1331,17 @@
+@@ -1326,9 +1337,17 @@
      return iree_make_status(IREE_STATUS_INTERNAL,
                              "an intake's panel has no receiving row");
    }
@@ -334,7 +379,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src
    // The queue's repeat field holds 256 runs at most: longer panels queue
    // several tasks of the same terminating chain.
    uint32_t runs = plan->channels[intake->intake_panel].record_count /
-@@ -2338,11 +2351,23 @@
+@@ -2338,11 +2357,23 @@
        }
        const loom_aie2p_array_dma_plan_t* intake_drain =
            &plan->dma_channels[intake->intake_drain_dma];
