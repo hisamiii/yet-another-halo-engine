@@ -78,10 +78,25 @@ Q_ENV = dict(GN_QFLOAT="1", GN_QWCONT="1", GN_QLOCK="1", GN_QPASS="1", GN_QBANK=
              GN_QDRIP="12", GN_QROW="1", GN_QLRU="aie2p.mbms,aie2p.mexa", GN_QPEEL="1", GN_QCORE=QCORE)
 
 
-def defaults():
-    """Set the Q' knobs that the environment leaves unset."""
-    for k, v in Q_ENV.items():
+# The 64x80 P1K image (NP 5, ks 32 x 20 passes, 4 rows, fuse 2): row 1 of each column decodes the panel straight into
+# its egress ring, the vertical pairs share W by K half (GN_QP1K), each pair's row 0 relays row 1's C and the column's
+# memory tile merges the two pair streams (A, C in token order, gen_npu_q.mrel). 11-17: gated run bit-exact on
+# UD-IQ4_XS rows, 67K cycles a 64-token block (76% MMA share), the first block of a 2048-token call at ~364K.
+P1K_NP, P1K_KS, P1K_PASSES = 5, (32,), 20
+P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="2560@37376:40448:43520:46592,11520@0:53760,4608@20480:32768,64@30720",
+               GN_QZACC="1", GN_QRELAX="1", GN_QTOK="-6,0,0,10", GN_QDRIP="4", GN_QEMERGE="1", GN_QWDUP="1",
+               GN_QCLAZY="1", NPU_QCREL="2", GN_QLOCKA="12,5", GN_QWCONT="0", GN_QPEEL="0", GN_QP1="1", GN_QMB1="5",
+               GN_QP1K="1", GN_QCVL="1")
+P1K_LOOM = dict(LOOM_EXP_RING_AT_FORCE="1", LOOM_EXP_SPACE_AT="scratch@12288", LOOM_EXP_EGRESS_MERGE="1",
+                LOOM_EXP_REPLAY_GROUP="4", LOOM_EXP_MERGE_RING_LOW="1", LOOM_EXP_PANEL_STREAM="1",
+                LOOM_EXP_PANEL_STREAM_SINGLE="1")
+
+
+def defaults(p1k=False):
+    """Set the Q' knobs that the environment leaves unset (p1k: the 64x80 P1K image's first)."""
+    for k, v in list(P1K_ENV.items() if p1k else ()) + list(Q_ENV.items()):
         os.environ.setdefault(k, v)
+    N.ORDER_C = tuple(int(x) for x in os.environ.get("GN_ORDC", "0,2,1,3").split(","))   # (read at import)
 
 
 def loom_env(cfg):
@@ -105,6 +120,8 @@ def loom_env(cfg):
         env["LOOM_EXP_HWLOOP_TERM_RELAX"] = "1"
     if N.crelp_on():   # (HRX 0089) the pair relay's channel and the P1 tokens form a leaf-synchronized cycle
         env["LOOM_EXP_LEAF_SYNC_CYCLES"] = "1"
+    if N.qp1k_on() and cfg.fuse == 2:   # (the P1K image's placement and stream knobs)
+        env.update(P1K_LOOM)
     return env
 
 

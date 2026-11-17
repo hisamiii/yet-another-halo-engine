@@ -804,6 +804,12 @@ NPU_PASSES = 5   # K = 5120 per call (gen_npu_gemm passes)
 NPU_Q = int(os.environ.get("YAH_NPU_Q", "0"))
 if NPU_Q:
     NPU_KS, NPU_PASSES = (16,), 40
+# YAH_NPU_QP1K=1 (with YAH_NPU_Q=4): the 64x80 P1K image (gen_npu_q P1K_*): 640-row calls, ks 32 x 20 passes
+NPU_QP1K = NPU_Q == 4 and os.environ.get("YAH_NPU_QP1K") == "1"
+if NPU_QP1K:
+    import gen_npu_q as _Q
+    NPU_NP, NPU_KS, NPU_PASSES = _Q.P1K_NP, _Q.P1K_KS, _Q.P1K_PASSES
+    NPU_ROWS = NPU_COLS * 16 * NPU_NP
 NPU_KCALL = 8 * sum(NPU_KS) * NPU_PASSES   # K per call (5120)
 # YAH_NPU_FFNBLK=<F> (F = 1024 n): the NPU owns the FFN's last F features of every layer whose gate, up and down are in
 # FUSE_FFN_FMTS / FUSE_FFN_DOWN_FMTS (and ffn_up follows ffn_gate). Its gate / up calls (gen_npu_gemm swiglu, NP 4, raw
@@ -1060,10 +1066,10 @@ def npu_images(images, B, tmp, outdir, extra=()):
         assert not extra, "YAH_NPU_Q: no FFN block"
         images = {(f, K) for f, K in images if f == "iq4xs"}
         import gen_npu_q as Q
-        Q.defaults()
+        Q.defaults(p1k=NPU_QP1K)
         Q.QROWS = NPU_Q
         jobs = [(GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K,
-                           fmt=DCOL_FMTS[fmt][0], rawdma=1), "npu_dcol_%s_%d" % (fmt, K), GN.NP)
+                           fmt=DCOL_FMTS[fmt][0], rawdma=1), "npu_dcol_%s_%d" % (fmt, K), NPU_NP if NPU_QP1K else GN.NP)
                 for fmt, K in sorted(images)]
     else:
         jobs = [(npu_cfg(B, NPU_KS, NPU_PASSES, kraw=K, fmt=DCOL_FMTS[fmt][0], **KCHAIN(fmt)),
