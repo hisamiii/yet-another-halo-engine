@@ -123,12 +123,11 @@ def qpeel_on():
     return on
 
 
-# GN_QUNR=1 (with GN_QPEEL): the main (pass, row) loop's body holds two rows (the second copy takes the first's
-# back-edge values), so the loop-carried operands meet their header registers every second row only.
+# GN_QUNR=1: the main (pass, row) loop's body holds two rows (the second copy takes the first's back-edge values), so
+# the loop-carried operands meet their header registers every second row only. Without GN_QPEEL the code stays the
+# peel's size (the unrolled copy instead of the peel's; the post-loop convert stores C).
 def qunr_on():
-    on = os.environ.get("GN_QUNR") == "1"
-    assert not on or qpeel_on(), "GN_QUNR needs GN_QPEEL"
-    return on
+    return os.environ.get("GN_QUNR") == "1"
 
 
 # Layout Q' with fuse 2 (gen_npu_q sets QF["cfg"]): every Q' core decodes its column's panel at a call's first firing,
@@ -388,7 +387,7 @@ def loom_env(cfg):
     if qpass_on() and os.environ.get("GN_QHW") != "0":   # the (pass, row) loop as a hardware loop (HRX patch 0080: the
         # authored trip count; 0083 '@': the counts go to the last loops, the GEMM's, after any fill loop)
         env["LOOM_EXP_HWLOOP_TRIP"] = "@" + (f"{MP * (cfg.passes - 1) // (2 if qunr_on() else 1)},{MP}" if qpeel_on()
-                                             else str(MP * cfg.passes))
+                                             else str(MP * cfg.passes // (2 if qunr_on() else 1)))
     if qlock_on():   # spread lock lines, reads 2 / 1 cycles from a lock (HRX
         # patch 0081; still ordered: the first reads after an acquire hit the slot's start, which the DMA wrote first,
         # and the last ones before a release hit its end, which the DMA writes last)
@@ -2718,7 +2717,7 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     this core's C ring after its own, so its C stream carries block 2 f, then block 2 f + 1. The pointers come back
     from fuse2_entry's parking word. A segment is the slot's first 2 KB (the peeled pass's bf16)."""
     cs = [int(v) for v in QA4_RING_AT.split(",")[0].split("@")[1].split(":")]
-    assert QA4_RING_AT.startswith("2048@") and len(cs) == MP and qa4_on() and qpeel_on() and not qalt_on()
+    assert QA4_RING_AT.startswith("2048@") and len(cs) == MP and qa4_on() and (qpeel_on() or qunr_on()) and not qalt_on()
     e(f"  %crG = storage_address {own[0]} : low.storage<private> -> reg<aie2p.ep>")
     e(f"  %crol = lda %crG, {own[1]}")
     e("  %cro = mov.scalar-to-address %crol")
@@ -4137,7 +4136,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             pln = ", %pln: reg<aie2p.ep>" if tail else ""
             e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln}{dfa(dfifo)})")
     e("^exit:")
-    if qpeel_on():
+    if qpeel_on() or qunr_on():
         assert q3 and qrow and qpass and NT == NP and not cfg.dfr
         i0 = L.index("^obody:", hdr)
         hl = next(ln for ln in L[hdr:i0] if ln.startswith("^outer("))
@@ -4146,7 +4145,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         assert L[-1] == "^exit:" and back.startswith("  low.br ^outer(") and back.endswith(")"), (back, L[-1])
         body = L[i0 + 1:-2]
         if qunr_on():   # (the peel below copies one row: body / back as captured here)
-            assert MP * (cfg.passes - 1) % 2 == 0
+            assert MP * (cfg.passes - (1 if qpeel_on() else 0)) % 2 == 0
             bvals = [a.split(": ", 1)[0] for a in back[len("  low.br ^outer("):-1].split(", ")]
             assert len(bvals) == len(hargs)
             bd = {n for ln in body if " = " in ln for n in re.findall(r"%\w+", ln.partition(" = ")[0])}
@@ -4156,6 +4155,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             back_u = "  low.br ^outer(" + ", ".join(f"{v}_U: {ty}" if v in bd else f"{uren.get(v, v)}: {ty}"
                                                       for v, (_, ty) in zip(bvals, hargs)) + ")"
             L[i0 + 1:-1] = body + [sub_u(ln) for ln in body] + [back_u]
+    if qpeel_on():
         bdefs = {n for ln in body if " = " in ln for n in re.findall(r"%\w+", ln.partition(" = ")[0])}
         pren = {n: n + "_P" for n in bdefs | {a for a, _ in hargs}}
         sub_ = lambda ln: re.sub(r"%\w+", lambda m: pren.get(m.group(0), m.group(0)), ln)
