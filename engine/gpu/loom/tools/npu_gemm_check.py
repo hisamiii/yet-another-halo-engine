@@ -128,6 +128,13 @@ def main():
         out_, n_ = [], 0                             # lazy C acquires and the W acquires (private words 20 / 24 / 28,
         acqs_ = {"  acq %am1, 2": 20, "  acq.cond %am1, %qclk, 2": 24, "  acq %am1, 1": 28,   # reset per firing)
                  "  acq.cond %am1, %waq, 1": 28}   # -> words 1-3 of each stamped segment
+        if os.environ.get("GN_QCWA") == "1":   # (word 3 = the A acquires instead of W)
+            acqs_ = {k_: v_ for k_, v_ in acqs_.items() if v_ != 28}
+            acqs_.update({"  acq %am1, 0": 28, "  acq.cond %am1, %cqn, 0": 28})
+        if os.environ.get("GN_QCWT") == "1":   # (words 1 / 2 / 3 = the pair tokens / the relay copy / A)
+            acqs_ = {"  acq %am2_e, 3": 20, "  acq %am1, 3": 20, "  acq %am1, 4": 20, "  acq.cond %am1, %mbq, 3": 20,
+                     "  acq.cond %am1, %mbq, 4": 20, "  acq %crm1, 5": 24, "  acq %crm1, 2": 24,
+                     "  acq %am1, 0": 28, "  acq.cond %am1, %cqn, 0": 28}
         for ln_ in text_.splitlines():
             n_ += 1
             o_ = acqs_.get(ln_)
@@ -140,7 +147,7 @@ def main():
                          f"  %qcwp{n_} = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>",
                          f"  %qcwf{n_} = lda %qcwp{n_}, {o_}", f"  %qcwg{n_} = add.rr %qcwf{n_}, %qcwe{n_}",
                          f"  st %qcwg{n_}, %qcwp{n_}, {o_}"]
-            if o_ == 24:   # the lazy acquire's done time from the firing start: words 40 / 44 / 48 (mp 0 / 1 / 2; 36: sink)
+            if o_ is not None and ln_ == "  acq.cond %am1, %qclk, 2":   # the lazy acquire's done time from the firing start: words 40 / 44 / 48 (mp 0 / 1 / 2; 36: sink)
                 out_ += [f"  %qcwhc{n_} = copy %qcwp{n_} : reg<aie2p.ep> -> reg<aie2p.ep>", f"  %qcwhk{n_} = mov.i32 32", f"  %qcwhm{n_} = mov.modifier %qcwhk{n_}",
                          f"  %qcwh{n_} = padds.modifier %qcwhc{n_}, %qcwhm{n_}",
                          f"  %qcwt{n_} = lda %qcwh{n_}, 0", f"  %qcwu{n_} = sub %qcwd{n_}, %qcwt{n_}",
