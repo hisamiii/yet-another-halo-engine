@@ -3054,6 +3054,73 @@ def gate_first(e, cfg, gate, gn):
     e("^gfgo:")
 
 
+QCSTAGE_AT = (25088, 27648, 30208, 49152)   # (GN_QCSTAGE) the relay row's staging slots (free core memory)
+
+
+def qcstage_on():
+    """GN_QCSTAGE=1 (pair relay, NPU_QCREL=2): the relay row's C ring has 2 MP slots, its own MP (the accumulator
+    rows) then MP staging slots (QCSTAGE_AT; GN_QPINS needs the 2 MP-slot entry) that take the partner's copied
+    segments, so its next block waits for its own segments' drain only, not for the copies' too."""
+    return os.environ.get("GN_QCSTAGE") == "1" and crelp_on()
+
+
+def crel_copy_staged(e, port, own):
+    """(GN_QCSTAGE) crel_copy into the staging slots: segment i of the partner's ring to QCSTAGE_AT[i] (the own ring
+    pointer, slot 0, parked at own: its address + QCSTAGE_AT[i] - slot 0's)."""
+    pins = os.environ.get("GN_QPINS") or QA4_RING_AT
+    sb = int(pins.split(",")[0].split("@")[0])
+    cs = [int(v) for v in pins.split(",")[0].split("@")[1].split(":")]
+    st = QCSTAGE_AT
+    assert len(st) == MP == 4 and all(b - a == sb for a, b in zip(st[:3], st[1:3])) and st[3] >= st[2] + sb
+    sd = cs[1] - cs[0]
+    e(f"  %crG = storage_address {own[0]} : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  %crol = lda %crG, {own[1]}")
+    e("  %crS = storage_address %crst : low.storage<private> -> reg<aie2p.ep>")
+    e("  %crrl = lda %crS, 0")
+    e("  %crr = mov.scalar-to-address %crrl")
+    e("  %crm1 = mova.i32 -1")
+    e("  %cr1 = mova.i32 1")
+    e("  %crz = mova.i32 0")
+    e(f"  %crK = mova.i32 {MP}")
+    e("  low.br ^crl(%crz: reg<aie2p.er>, %crr: reg<aie2p.ep>)")
+    e("^crl(%cri: reg<aie2p.er>, %crs: reg<aie2p.ep>):")
+    e("  %crm = lt %cri, %crK")
+    e("  %crin = add.rr %cri, %cr1")
+    e("  low.cond_br %crm, ^crbd, ^crdn : reg<aie2p.er>")
+    e("^crbd:")
+    e(f"  acq %crm1, {port}")
+    e("  acq %crm1, 2")
+    # staging slot i: own + (st0 - cs0) + sb i + (i > 2) (st3 - st2 - sb)
+    e(f"  %crok = mov.i32 {sb}")
+    e("  %croi = mul %cri, %crok")
+    e("  %crk2 = mova.i32 2")
+    e("  %crg3 = lt %crk2, %cri")
+    e(f"  %crjk = mov.i32 {st[3] - st[2] - sb}")
+    e("  %crj = mul %crg3, %crjk")
+    e(f"  %crb0 = mov.i32 {st[0] - cs[0]}")
+    e("  %crs1 = add.rr %crol, %crb0")
+    e("  %crs2 = add.rr %crs1, %croi")
+    e("  %crs3 = add.rr %crs2, %crj")
+    e("  %crq_0 = mov.scalar-to-address %crs3")
+    e("  %crk = lda %crs, 0")   # (the vector loads' address waits for a first load: crel_copy)
+    e("  %crk0 = mul %crk, %crz")
+    e("  %crkm = mov.modifier %crk0")
+    e("  %crp_0 = padda.modifier %crs, %crkm")
+    nl = sb // 64
+    for i in range(nl):
+        e(f"  %crv_{i}, %crp_{i + 1} = vlda.acc.post %crp_{i}, 64")
+        e(f"  %crq_{i + 1} = vst.acc.post %crv_{i}, %crq_{i}, 64")
+    e("  rel %cr1, 2")
+    e(f"  rel %cr1, {port}")
+    if sd > sb:   # (the source pointer past the slot's tail)
+        e(f"  %crgk = mov.i32 {sd - sb}")
+        e("  %crgm = mov.modifier %crgk")
+        e(f"  %crp_{nl}g = padda.modifier %crp_{nl}, %crgm")
+        nl = f"{nl}g"
+    e(f"  low.br ^crl(%crin: reg<aie2p.er>, %crp_{nl}: reg<aie2p.ep>)")
+    e("^crdn:")
+
+
 def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     """(Q' C relay) the firing's end on row 0: row 1's MP C segments (its ring, through the north window) copied into
     this core's C ring after its own, so its C stream carries block 2 f, then block 2 f + 1. The pointers come back
@@ -3091,7 +3158,15 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     e("  %crkm = mov.modifier %crk0")
     e("  %crp_0 = padda.modifier %crs, %crkm")
     nl = sb // 64
+    nocopy = os.environ.get("GN_QCRELNOCOPY") == "1"   # (diag: the locks only, pointers stepped)
+    if nocopy:
+        e("  %crnk = mova.i32 64")
+        e("  %crnm = mov.modifier %crnk")
     for i in range(nl):
+        if nocopy:
+            e(f"  %crp_{i + 1} = padds.modifier %crp_{i}, %crnm")
+            e(f"  %crq_{i + 1} = padds.modifier %crq_{i}, %crnm")
+            continue
         e(f"  %crv_{i}, %crp_{i + 1} = vlda.acc.post %crp_{i}, 64")
         e(f"  %crq_{i + 1} = vst.acc.post %crv_{i}, %crq_{i}, 64")
     e("  rel %cr1, 2")
@@ -4870,7 +4945,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     elif CRMID[0]:
         crel_copy(e, QF["crelmid"], MP * (QF["rows"] - 1 - CRMID[0]), own=("%crst", 4))
     elif CREL0[0] and crelp_on():
-        crel_copy(e, 5, MP, own=("%crst", 4))
+        (crel_copy_staged(e, 5, ("%crst", 4)) if qcstage_on() else crel_copy(e, 5, MP, own=("%crst", 4)))
     elif CREL0[0]:
         crel_copy(e, QF["crel"](gate), MP * (QF.get("rows", 2) - 1), own=("%crst", 4))
     if gate:

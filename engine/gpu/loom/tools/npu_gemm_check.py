@@ -249,7 +249,7 @@ def main():
                 print(f"  row {r_} (core 0): median {float(np.median(st_)):.0f} min {st_.min()} max {st_.max()}")
         if os.environ.get("GN_QFCYC") == "1" and fuse == 2:   # (the filler's fill words 1-3 of its blocks' segments)
             w4f = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[0, :, :, :4].astype(np.int64)
-            fb_ = (2 if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
+            fb_ = ((1 if N.qcstage_on() else 2) if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
             v_ = w4f[fb_, -1]
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
         step = np.diff(last)

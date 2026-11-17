@@ -192,7 +192,7 @@ def array_program(L, cfg):
                 e(f"  %lanep{t} = constant.u32 {c * R // 2 + q // 2} : reg<aie2p.array.scalar : index>")
                 e(f"  %cr{t} = partition.receiver %c_all, %origin, %lanep{t}, %ncolp : reg<aie2p.array.receiver : tile<{rec}xi32>>")
                 e(f"  %sc{t} = sender {kk[c, q]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
-                e(f"  %chc{t} = channel %sc{t}, %cr{t}, {cd}, %nseg2 : reg<aie2p.array.channel : tile<{rec}xi32>>")
+                e(f"  %chc{t} = channel %sc{t}, %cr{t}, {'%n8' if N.qcstage_on() else cd}, %nseg2 : reg<aie2p.array.channel : tile<{rec}xi32>>")
                 e(f"  constrain.leaf_sync %chc{t}")
                 if os.environ.get("GN_QEMERGE") == "1":   # (LOOM_EXP_EGRESS_MERGE) the column's memtile merges its pairs'
                     e(f"  constrain.stage %chc{t}, %n{c if cols > 1 else 1}")   # streams into one shim write
@@ -257,7 +257,7 @@ def array_program(L, cfg):
         art = f"{asp_}x{fa // 4 // asp_}"
     for r in range(R):   # row r: its M blocks' records [M block][pass][slab], multicast along the row
         if crel() or mrel():   # (row r: M blocks r, r + R, ...; merged pair relay: row 2 p + j's 4 f + 2 j + p)
-            b0 = r if crel() else 2 * (r % 2) + r // 2
+            b0 = r if crel() or N.qcstage_on() else 2 * (r % 2) + r // 2   # (GN_QCSTAGE: the merge takes a pair round: row r owns 4 f + r)
             e(f"  %ao{r} = constant.u64 {b0 * P * MP * fa} : reg<aie2p.array.offset : offset>")
             na_, ra_ = (1, N.acap_tail(cfg)) if "a" in qfix() else (nbr, P * MP)
             assert fa // 4 % asp_ == 0 and fa // 4 // asp_ <= 1023
