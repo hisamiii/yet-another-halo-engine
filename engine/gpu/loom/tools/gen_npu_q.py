@@ -13,6 +13,36 @@ import gen_npu_gemm as N
 # NPU_QROWS=R (1..4): R array rows (2 .. 1 + R); row r takes M blocks [r nb / R, (r + 1) nb / R) (its own A stream,
 # multicast along the row); a column's W panel is multicast to its R cores; C [col][M block][slab] as before.
 QROWS = int(os.environ.get("NPU_QROWS", "1"))
+# The Q' core's knobs (gen_npu_gemm GN_Q*; defaults(): environment values win) and its solved sub-tile order
+QCORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "q_core.json")
+Q_ENV = dict(GN_QFLOAT="1", GN_QWCONT="1", GN_QLOCK="1", GN_QPASS="1", GN_QBANK="3", GN_QA4="1", GN_QEAGER="1",
+             GN_QDRIP="12", GN_QROW="1", GN_QLRU="aie2p.mbms,aie2p.mexa", GN_QPEEL="1", GN_QCORE=QCORE)
+
+
+def defaults():
+    """Set the Q' knobs that the environment leaves unset."""
+    for k, v in Q_ENV.items():
+        os.environ.setdefault(k, v)
+
+
+def loom_env(cfg):
+    """loom-compile's environment for a Q' image of cfg (gen_npu_gemm.loom_env plus the Q' core's): the C block
+    no-alias facts (generator-asserted: in one leaf body no C store writes a block a later C load reads) and the ring
+    pins (GN_QBANK; GN_QPINS: the whole list; fuse 2: qf_ring_at)."""
+    env = dict(N.loom_env(cfg))
+    env.update(LOOM_EXP_NOALIAS_ACC="2", LOOM_EXP_NOWAR_ACC="1")
+    ks = cfg.ks[0]
+    if os.environ.get("GN_QBANK") in ("1", "2", "3"):
+        env["LOOM_EXP_RING_AT"] = {"2": N.QBANK2_RING_AT, "3": N.QA4_RING_AT if N.qa4_on() else (N.QCB1_RING_AT if N.qcb1_on() else N.QA3_RING_AT) if N.qa3_on() else N.QBANK3_RING_AT}.get(
+            os.environ["GN_QBANK"], N.QBANK_RING_AT)
+        # (the pins are written for ks 28: W slots NP slabs, A slots one slab)
+        env["LOOM_EXP_RING_AT"] = env["LOOM_EXP_RING_AT"].replace("16128@", f"{N.NP * N.slab(ks)}@").replace(
+            "4032@", f"{N.slab(ks)}@")
+    if os.environ.get("GN_QPINS"):
+        env["LOOM_EXP_RING_AT"] = os.environ["GN_QPINS"]
+    if cfg.fuse == 2:
+        env["LOOM_EXP_RING_AT"] = N.qf_ring_at(env["LOOM_EXP_RING_AT"])
+    return env
 
 
 def array_program(L, cfg):
@@ -21,6 +51,7 @@ def array_program(L, cfg):
     MP, NP, R = N.MP, N.NP, QROWS
     assert 1 <= R <= 4 and nb % R == 0
     nbr = nb // R
+    gw, gr = qgate(cfg)
     e("aie2p.target<array> @array_target\naie2p.target<core> @core_target\n")
     e(f"low.func.def public retain target<amd.xdna.aie2p.array>(@array_target) abi(array_program) @{cfg.entry}() asm {{")
     for k, v in (("zero", 0), ("one", 1), ("two", 2), ("nw", cols * R), ("rec", nbr * P)):
@@ -38,7 +69,7 @@ def array_program(L, cfg):
             kk[c, r] = f"%k{c}_{r}"
             e(f"  %lane{c}_{r} = constant.u32 {c * R + r} : reg<aie2p.array.scalar : index>")
             # (fuse 2: row 0 decodes its column's panel; the rows below read it, a leaf without the fill)
-            e(f"  {kk[c, r]} = worker %workers, %lane{c}_{r}, @{'tailr' if cfg.fuse == 2 and r else 'tail'}")
+            e(f"  {kk[c, r]} = worker %workers, %lane{c}_{r}, @{leaf_name(cfg, c, r)}")
             e(f"  constrain.location {kk[c, r]}, %n{c}, %n{2 + r}")
     # C first (rings are placed in channel order: C claims whole banks before the input rings)
     rec = MP * NP * 4 * 256 // MP // 8
@@ -100,8 +131,8 @@ def array_program(L, cfg):
         assert 4 * rw <= N.decoder(cfg.fmt, cfg.gord).RECROW
         N.QF["rawn"], N.QF["raww"] = nraw, rw
         dp, sp = N.QF_PORTS
-        e('  %fdb = binding 3, "write"')
-        e('  %frb = binding 4, "read"')
+        e(f'  %fdb = binding {6 if cfg.gate else 3}, "write"')   # (gated: the engine's binding order)
+        e(f'  %frb = binding {7 if cfg.gate else 4}, "read"')
         e(f"  %fdl = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
         e(f"  %fun = constant.u32 {U * N.FUSE_SB * NP} : reg<aie2p.array.scalar : index>")
         e(f"  %fdn = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
@@ -134,22 +165,86 @@ def array_program(L, cfg):
                 e(f"  %firows{t} = constant.u32 16 : reg<aie2p.array.scalar : index>")
                 e(f"  %fipitch{t} = constant.u32 {N.decoder(cfg.fmt, cfg.gord).RECROW} : reg<aie2p.array.scalar : index>")
                 e(f"  constrain.intake %chr{t}, %chw{t}, %fioff{t}, %firows{t}, %fipitch{t}")
+    if cfg.gate:   # (last: the pinned rings first) gen_npu_gemm's gate channels on the two gate cores
+        S = cfg.gate
+        e('  %fb = binding 3, "read"')
+        e('  %tb = binding 4, "write"')
+        e('  %sb = binding 5, "write"')
+        e(f"  %gsup = constant.u32 {S} : reg<aie2p.array.scalar : index>")
+        e(f"  %gf_all = sender %fb, 0 : reg<aie2p.array.sender : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
+        e("  %gf = partition.sender %gf_all, %origin, %n0, %one : reg<aie2p.array.sender : tile<4xi32>>")
+        kw, kr = kk[gw], kk[gr]
+        p = N.QF["gports"]
+        e(f"  %gpoll = receiver {kw}, {p['waiter']['poll']} : reg<aie2p.array.receiver : tile<4xi32>>")
+        e("  %chgp = channel %gf, %gpoll, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
+        e("  constrain.core_stream %chgp")
+        e(f"  %gt_all = receiver %tb, 0 : reg<aie2p.array.receiver : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
+        e("  %gt = partition.receiver %gt_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
+        e(f"  %gtick = sender {kw}, {p['waiter']['tick']} : reg<aie2p.array.sender : tile<4xi32>>")
+        e("  %chgt = channel %gtick, %gt, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
+        e("  constrain.core_stream %chgt")
+        e("  constrain.request %chgp, %chgt")
+        e(f"  %gn1s = sender {kw}, {p['waiter']['nbr']} : reg<aie2p.array.sender : tile<4xi32>>")
+        e(f"  %gn1r = receiver {kr}, {p['relay']['nbr']} : reg<aie2p.array.receiver : tile<4xi32>>")
+        e("  %chgn = channel %gn1s, %gn1r, %one, %one : reg<aie2p.array.channel : tile<4xi32>>")
+        e("  constrain.leaf_sync %chgn")
+        e("  %gs_all = receiver %sb, 0 : reg<aie2p.array.receiver : tile<1x2x4xi32>>")
+        e("  %gs = partition.receiver %gs_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
+        e(f"  %gsig = sender {kr}, {p['relay']['sig']} : reg<aie2p.array.sender : tile<4xi32>>")
+        e("  %chgs = channel %gsig, %gs, %two, %two : reg<aie2p.array.channel : tile<4xi32>>")
+        e("  constrain.core_stream %chgs")
+        e("  constrain.gate %chgs")
+        e("  constrain.signal %chgs")
     e("  return\n}\n")
 
 
+def qgate(cfg):
+    """(gated) the waiter and relay cores, (column 1, the last row) and (column 2, the last row), and their ports past
+    the leaf's (A 0, W 1, C 2; a filler's egress 3, raw 4): gen_npu_gemm.gate_ports reads QF["gports"]."""
+    if not cfg.gate:
+        N.QF["gports"] = None
+        return None, None
+    assert cfg.cols >= 3
+    r, b = QROWS - 1, 5 if QROWS == 1 and cfg.fuse == 2 else 3
+    N.QF["gports"] = {"col": 1, "waiter": dict(row=r, poll=b, tick=b + 1, nbr=b + 2),
+                      "relay": dict(col=2, row=r, nbr=b, sig=b + 1)}
+    return (1, r), (2, r)
+
+
+def leaf_name(cfg, c, r):
+    """Worker (c, r)'s leaf: tail (fuse 2: row 0 decodes the panel), tailr (the rows below), _gw / _gr: the gate's."""
+    name = "tailr" if cfg.fuse == 2 and r else "tail"
+    if cfg.gate and (c, r) == (1, QROWS - 1):
+        return name + "_gw"
+    if cfg.gate and (c, r) == (2, QROWS - 1):
+        return name + "_gr"
+    return name
+
+
+def leaves(cfg):
+    """[(name, gate role)] of the image's distinct leaves."""
+    out = {}
+    for c in range(cfg.cols):
+        for r in range(QROWS):
+            n = leaf_name(cfg, c, r)
+            out[n] = "waiter" if n.endswith("_gw") else "relay" if n.endswith("_gr") else None
+    return list(out.items())
+
+
 def gen(cfg):
-    assert len(cfg.ks) == 1 and cfg.fuse in (0, 2) and not cfg.gate and cfg.passes >= 2 and 1 <= cfg.cols <= 8
+    assert len(cfg.ks) == 1 and cfg.fuse in (0, 2) and cfg.passes >= 2 and 1 <= cfg.cols <= 8
     L = []
     if cfg.fuse == 2:   # the decode side: 1024-K passes over the call's K, one 128-k-block slice
         K = 8 * cfg.passes * cfg.ks[0]
         assert K % 1024 == 0 and 32 % cfg.ks[0] == 0, "fuse 2: K a multiple of 1024, ks dividing a super-block"
         N.QF["cfg"] = N.Config(cfg.cols, cfg.nb, (128,), K // 1024, mu=1, fuse=2, kraw=cfg.kraw, fmt=cfg.fmt, rawdma=1)
         N.QF["wslot"] = N.NP * N.slab(cfg.ks[0])
-        N.QF["rows"] = QROWS
     else:
         N.QF["cfg"] = None
+    N.QF["rows"] = QROWS
     array_program(L, cfg)
-    N.leaf(L, cfg, "tail", cfg.ks[0], cov=(0,) if cfg.fuse == 2 else None)
-    if cfg.fuse == 2 and QROWS > 1:   # the rows below row 0: the same GEMM leaf without the fill
-        N.leaf(L, cfg, "tail", cfg.ks[0], name="tailr")
+    for name, gate in leaves(cfg):   # (tailr: the GEMM leaf without the fill, skipping the raw rows)
+        fill = cfg.fuse == 2 and not name.startswith("tailr")
+        N.leaf(L, cfg, "tail", cfg.ks[0], cov=(0,) if fill else None, gate=gate, name=name)
     return "\n".join(L)
+

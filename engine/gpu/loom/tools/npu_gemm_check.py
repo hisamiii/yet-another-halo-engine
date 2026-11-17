@@ -63,7 +63,9 @@ def main():
     kraw, k0r = int(os.environ.get("NPU_KRAW", "0")), int(os.environ.get("NPU_K0", "0"))
     fmt = os.environ.get("NPU_FMT", "IQ4_XS")   # fuse 2: the raw rows' format (gen_npu_gemm FUSE_FMTS)
     assert fuse in (0, 2), "NPU_FUSE: 0 or 2"
-    cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw, fmt=fmt, rawdma=int(fuse == 2))
+    # NPU_GATE=1 (diag): the gated image (the engine's bindings) with its flag record already open for one call
+    cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw, fmt=fmt, rawdma=int(fuse == 2),
+                   gate=N.GATE_SUPPLY if os.environ.get("NPU_GATE") else 0)
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
     wq = None
@@ -102,19 +104,7 @@ def main():
         assert len(ks) == 1 and os.environ.get("GN_QCORE"), "NPU_Q: ks of one entry and GN_QCORE"
     open(src, "w").write((Q.gen if QMODE else N.gen)(cfg))
     env = hrx_paths.env()
-    env.update(N.loom_env(cfg))
-    if QMODE:   # generator-asserted: in one leaf body no C store writes a block a later C load reads
-        env.update(LOOM_EXP_NOALIAS_ACC="2", LOOM_EXP_NOWAR_ACC="1")
-        if os.environ.get("GN_QBANK") in ("1", "2", "3"):   # (gen_npu_gemm.QBANK_RING_AT)
-            env["LOOM_EXP_RING_AT"] = {"2": N.QBANK2_RING_AT, "3": N.QA4_RING_AT if N.qa4_on() else (N.QCB1_RING_AT if N.qcb1_on() else N.QA3_RING_AT) if N.qa3_on() else N.QBANK3_RING_AT}.get(
-                os.environ["GN_QBANK"], N.QBANK_RING_AT)
-            # (the pins are written for ks 28: W slots NP slabs, A slots one slab)
-            env["LOOM_EXP_RING_AT"] = env["LOOM_EXP_RING_AT"].replace("16128@", f"{N.NP * N.slab(ks[0])}@").replace(
-                "4032@", f"{N.slab(ks[0])}@")
-        if os.environ.get("GN_QPINS"):   # (Q' experiments: the whole pin list)
-            env["LOOM_EXP_RING_AT"] = os.environ["GN_QPINS"]
-        if fuse == 2:   # (Q' fuse 2) the egress ring right after the A slots (bank 2; the odd-C block follows at 40960)
-            env["LOOM_EXP_RING_AT"] = N.qf_ring_at(env["LOOM_EXP_RING_AT"])
+    env.update(Q.loom_env(cfg) if QMODE else N.loom_env(cfg))
     for k in os.environ.get("NPU_ENV_DROP", "").split(","):   # e.g. LOOM_EXP_PANEL_STREAM (diagnosis)
         env.pop(k, None)
     for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
@@ -136,6 +126,12 @@ def main():
     np.zeros(sc // 4, np.float32).tofile(c_b)
     co = os.path.join(work, "c_out.bin")
     bindings = [a_b, w_b, c_b]
+    if cfg.gate:   # flag (ready = the first job's GATE_CALLS + 1 call), tick, signal (go, done)
+        g_b = [os.path.join(work, n) for n in ("flag.bin", "tick.bin", "sig.bin")]
+        np.array([N.GATE_CALLS + 1, 0, 0, 0], np.uint32).tofile(g_b[0])
+        np.zeros(cfg.gate * 4, np.uint32).tofile(g_b[1])
+        np.zeros(8, np.uint32).tofile(g_b[2])
+        bindings += g_b
     if fuse:   # the egress lanes' dummy binding (never transferred), the raw stream binding
         d_b, r_b = os.path.join(work, "d.bin"), os.path.join(work, "r.bin")
         if QMODE:   # (gen_npu_q: one filler a core, the decode side's records)

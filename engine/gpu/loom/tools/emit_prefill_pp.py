@@ -799,6 +799,12 @@ NPU_NP = 4   # 16-row slabs per column of a call
 NPU_ROWS = NPU_COLS * 16 * NPU_NP   # output rows per NPU call
 NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24)}
 NPU_PASSES = 5   # K = 5120 per call (gen_npu_gemm passes)
+# YAH_NPU_Q=<R> (experimental): the site images in layout Q' (gen_npu_q: every core a 64 x 64 tile over the whole K, no
+# cascade; R array rows split the M blocks), one K slice of 16 k-blocks over 40 passes; IQ4_XS sites only, no FFN block
+NPU_Q = int(os.environ.get("YAH_NPU_Q", "0"))
+if NPU_Q:
+    NPU_KS, NPU_PASSES = (16,), 40
+NPU_KCALL = 8 * sum(NPU_KS) * NPU_PASSES   # K per call (5120)
 # YAH_NPU_FFNBLK=<F> (F = 1024 n): the NPU owns the FFN's last F features of every layer whose gate, up and down are in
 # FUSE_FFN_FMTS / FUSE_FFN_DOWN_FMTS (and ffn_up follows ffn_gate). Its gate / up calls (gen_npu_gemm swiglu, NP 4, raw
 # rows straight from the model; call j (F / 256 of them) column c features 256 j + 32 c + [0, 32) of F, swcol 32) apply
@@ -823,12 +829,12 @@ def ffnblk_parts(F):
 def npu_chunks(site):
     """(k offset, passes) of the NPU's K chunks of a site; the GPU computes the rest of K (npu_rem) for the NPU's rows."""
     K = NPU_SITES[site][2] * 256
-    return [(1024 * NPU_PASSES * i, NPU_PASSES) for i in range(K // (1024 * NPU_PASSES))]
+    return [(NPU_KCALL * i, NPU_PASSES) for i in range(K // NPU_KCALL)]
 
 
 def npu_rem(site):
     """The K columns past the NPU's chunks (out: 1024 of 6144, down: 2048 of 17408): the GPU's npurem_<site>_<fmt>.hal."""
-    return NPU_SITES[site][2] * 256 % (1024 * NPU_PASSES)
+    return NPU_SITES[site][2] * 256 % NPU_KCALL
 
 
 def npu_rem_tile(fmt, kbw, kbt, kind="kstore"):
@@ -974,7 +980,7 @@ def npu_split(rows, combos, B, outdir):
                 GE.ACT_PERM = perm
                 try:
                     open(src, "w").write(GE.gen("act", B, list(NPU_KS), passes, tiled=tiled, k_off=k_off,
-                                                k_src=K if 1024 * passes != K else None))
+                                                k_src=K if 8 * sum(NPU_KS) * passes != K else None))
                 finally:
                     GE.ACT_PERM = "p4"
                 E.emit(src, ["nop=0"], name, outdir)   # emit_hal.py wants a config; the encoder has none
@@ -990,7 +996,7 @@ def npu_split(rows, combos, B, outdir):
         out.append(("npunormbfp", 1, 0, 0))
     # the DeltaNet postnorm over heads 0 .. DNSPLIT[0] - 1 (exactly ssm_out's NPU K chunk) also writes the NPU's BFP16
     # input (gen_postnorm_bfp): "postnorm[_t]_a_bfp.hal"
-    if "out" in NPU_SPLIT and DNSPLIT and DNSPLIT[0] * 128 == 1024 * NPU_PASSES:
+    if "out" in NPU_SPLIT and DNSPLIT and DNSPLIT[0] * 128 == NPU_KCALL:
         import gen_postnorm_bfp
         for tiled, name in ((False, "postnorm_a_bfp.hal"), (True, "postnorm_t_a_bfp.hal")):
             src = os.path.join(tmp, name[:-4] + ".loom")
@@ -1049,16 +1055,27 @@ def npu_images(images, B, tmp, outdir, extra=()):
     sys.path.insert(0, os.path.dirname(HERE))
     import hrx_paths
     assert images, "an NPU split needs a site the NPU computes"
-    jobs = [(npu_cfg(B, NPU_KS, NPU_PASSES, kraw=K, fmt=DCOL_FMTS[fmt][0], **KCHAIN(fmt)), "npu_dcol_%s_%d" % (fmt, K),
-             GN.NP) for fmt, K in sorted(images)]
+    if NPU_Q:   # (layout Q': gen_npu_q)
+        # (IQ4_XS only: the layers of other formats keep the site on the GPU, LoomPrefill::DcolImage)
+        assert not extra, "YAH_NPU_Q: no FFN block"
+        images = {(f, K) for f, K in images if f == "iq4xs"}
+        import gen_npu_q as Q
+        Q.defaults()
+        Q.QROWS = NPU_Q
+        jobs = [(GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K,
+                           fmt=DCOL_FMTS[fmt][0], rawdma=1), "npu_dcol_%s_%d" % (fmt, K), GN.NP)
+                for fmt, K in sorted(images)]
+    else:
+        jobs = [(npu_cfg(B, NPU_KS, NPU_PASSES, kraw=K, fmt=DCOL_FMTS[fmt][0], **KCHAIN(fmt)),
+                 "npu_dcol_%s_%d" % (fmt, K), GN.NP) for fmt, K in sorted(images)]
     jobs += list(extra)
 
     # sources and environments first (gen_npu_gemm's NP is module state), then the compiles in parallel
     def source(cfg, name, np_):
         with GN.np_override(np_):
             src = os.path.join(tmp, name + ".loom")
-            open(src, "w").write(GN.gen(cfg))
-            return cfg, name, src, dict(hrx_paths.env(), **GN.loom_env(cfg))
+            open(src, "w").write(Q.gen(cfg) if NPU_Q else GN.gen(cfg))
+            return cfg, name, src, dict(hrx_paths.env(), **(Q.loom_env(cfg) if NPU_Q else GN.loom_env(cfg)))
 
     def compile_one(b):
         cfg, name, src, env = b

@@ -67,6 +67,10 @@ QA3_RING_AT = "2048@16384:18432:20480:22528,16128@0:49152,4032@24576:28672:32768
 # acquired in its window); the C slots are acquired and zeroed once per M block and converted after the loop.
 
 
+def qlock_on():   # (layout Q') LOOM_EXP_LOCK_READ_SEP on: reads may issue 2 cycles after an acquire
+    return qpass_on() and os.environ.get("GN_QLOCK") == "1"
+
+
 def qpass_on():
     on = os.environ.get("GN_QPASS") == "1"
     assert not on or (os.environ.get("GN_QROW") == "1" and os.environ.get("GN_QBANK") in ("1", "3")), "GN_QPASS: QROW, QBANK 1/3"
@@ -382,7 +386,7 @@ def loom_env(cfg):
         # authored trip count; 0083 '@': the counts go to the last loops, the GEMM's, after any fill loop)
         env["LOOM_EXP_HWLOOP_TRIP"] = "@" + (f"{MP * (cfg.passes - 1) // (2 if qunr_on() else 1)},{MP}" if qpeel_on()
                                              else str(MP * cfg.passes))
-    if qpass_on() and os.environ.get("GN_QLOCK") == "1":   # spread lock lines, reads 2 / 1 cycles from a lock (HRX
+    if qlock_on():   # spread lock lines, reads 2 / 1 cycles from a lock (HRX
         # patch 0081; still ordered: the first reads after an acquire hit the slot's start, which the DMA wrote first,
         # and the last ones before a release hit its end, which the DMA writes last)
         env["LOOM_EXP_LOCK_READ_SEP"] = "2,1"
@@ -752,6 +756,8 @@ def gate_ports(cfg):
     one stream port per direction, so with fuse the gate moves to rows 1 (waiter) and 2 (relay) of column 1, whose
     head fills every panel (fuse_cover; the filling cores' stream input carries their raw weights; column 0's memory
     tile also stages an activation row: its northward link has no channel left for the flag stream)."""
+    if QF.get("gports"):   # (layout Q': gen_npu_q places the gate)
+        return QF["gports"]
     rows = len(cfg.ks)
     if cfg.fuse and cfg.gwest:   # (the relay's column: "col" is the waiter's)
         if cfg.gtail:   # (the tail's ports 0, 1, 2: A, W, C; 5, 6: kchain's raw intake and sender)
@@ -2061,7 +2067,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e("  set.rounding 12")   # round to nearest even (the bf16 C)
     if early:
         fuse_prologue(L, cfg, role, ks, cov, helper, gate)
-    elif QF["cfg"] is not None and name == "tailr":
+    elif QF["cfg"] is not None and name.startswith("tailr"):
         qf_skip_raw(e, cfg)
     if early:   # (fuse2_entry)
         e("  %fzpL = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
@@ -2370,7 +2376,8 @@ def gate_first(e, cfg, gate, gn):
     which emits its go and done; job state then holds the job's firings (gate_count counts them down, back to zero at
     its end). Fuse 2 checks at a call's first firing (before its fill), others at every firing. gn: the neighbor
     channel's pointer (the resource: no fill ran yet)."""
-    S, FPC = cfg.gate, cfg.nb * cfg.passes
+    # (a Q' core fires once per M block of its row: nb / rows a call)
+    S, FPC = cfg.gate, (cfg.nb // QF.get("rows", 1) if qpass_on() else cfg.nb * cfg.passes)
     nbr = gate_ports(cfg)[gate]["nbr"]
     compact = gate == "waiter" and cfg.ghelp   # (the helper's waiter: firings left at word 0, less program)
     e(f"  %gfs = lda %gsp0, {0 if compact else 4}")
@@ -2380,7 +2387,17 @@ def gate_first(e, cfg, gate, gn):
     e("  %gfm1 = mova.i32 -1")
     e(f"  %gffpc = {imm32(FPC)} {FPC}")
     if gate == "relay":
+        if qlock_on():   # the record's loads wait for a first load's result (their address adds 0 times it):
+            # LOOM_EXP_LOCK_READ_SEP lets reads issue 2 cycles after an acquire, and the relay's first two then read
+            # the waiter's record stale (tests: markers 0x51, 0xa2, 0xf3 came out 0, 0, 0xf3)
+            e("  %gfzr = mova.i32 0")
         e(f"  acq %gfm1, {nbr}")
+        if qlock_on():
+            e(f"  %gfk = lda {gn}, 12")
+            e("  %gfk0 = mul %gfk, %gfzr")
+            e("  %gfkm = mov.modifier %gfk0")
+            e(f"  %gfgn = padda.modifier {gn}, %gfkm")
+            gn = "%gfgn"
         e(f"  %gfexp = lda {gn}, 0")
         e(f"  %gfsts = lda {gn}, 4")
         e(f"  %gfpol = lda {gn}, 8")
@@ -2521,6 +2538,12 @@ def gate_count(e, cfg, gate):
         e("  return")
         return
     # the waiter's: [firings done, firings of the job, leftover, pending reads, sequence]
+    # (Q': each drain loop's step in its header, so no drain loop is a hardware loop candidate: LOOM_EXP_HWLOOP_TRIP's
+    # '@' list, HRX patch 0083, goes to a leaf's last candidates, which must stay the GEMM's)
+    hstep = qpass_on()
+
+    def step(nxt, cur):
+        e(f"  {nxt} = add.rr {cur}, %g1")
     e("  %gF = lda %gsp, 0")
     e("  %gN = lda %gsp, 4")
     e("  %gL = lda %gsp, 8")
@@ -2528,11 +2551,14 @@ def gate_count(e, cfg, gate):
     e("  low.br ^gq(%g0: reg<aie2p.er>)")   # read back last firing's ticks, then tick up to GB more of the leftover
     e("^gq(%gqi: reg<aie2p.er>):")
     e("  %gqm = lt %gqi, %gQ")
+    if hstep:
+        step("%gqn", "%gqi")
     e("  low.cond_br %gqm, ^gq1, ^gqd : reg<aie2p.er>")
     e("^gq1:")
     for i in range(4):
         e(f"  %gqx{i} = mov.ss")
-    e("  %gqn = add.rr %gqi, %g1")
+    if not hstep:
+        step("%gqn", "%gqi")
     e("  low.br ^gq(%gqn: reg<aie2p.er>)")
     e("^gqd:")
     e(f"  %ggb = mov.i32 {GB}")
@@ -2544,11 +2570,14 @@ def gate_count(e, cfg, gate):
     e("  low.br ^gt(%g0: reg<aie2p.er>)")
     e("^gt(%gti: reg<aie2p.er>):")
     e("  %gtm = lt %gti, %gbt")
+    if hstep:
+        step("%gtk", "%gti")
     e("  low.cond_br %gtm, ^gt1, ^gtd : reg<aie2p.er>")
     e("^gt1:")
     for i in range(4):
         e("  mov.ms %g0")
-    e("  %gtk = add.rr %gti, %g1")
+    if not hstep:
+        step("%gtk", "%gti")
     e("  low.br ^gt(%gtk: reg<aie2p.er>)")
     e("^gtd:")
     e("  %gL2 = sub %gL, %gbt")
@@ -2564,23 +2593,29 @@ def gate_count(e, cfg, gate):
     e("  low.br ^gr(%g0: reg<aie2p.er>)")
     e("^gr(%gri: reg<aie2p.er>):")
     e("  %grm = lt %gri, %gbt")
+    if hstep:
+        step("%grn", "%gri")
     e("  low.cond_br %grm, ^gr1, ^grd : reg<aie2p.er>")
     e("^gr1:")
     for i in range(4):
         e(f"  %grx{i} = mov.ss")
-    e("  %grn = add.rr %gri, %g1")
+    if not hstep:
+        step("%grn", "%gri")
     e("  low.br ^gr(%grn: reg<aie2p.er>)")
     e("^grd:")
     e("  low.br ^gl(%g0: reg<aie2p.er>)")
     e("^gl(%gli: reg<aie2p.er>):")
     e("  %glm = lt %gli, %gL2")
+    if hstep:
+        step("%gln", "%gli")
     e("  low.cond_br %glm, ^gl1, ^gld : reg<aie2p.er>")
     e("^gl1:")
     for i in range(4):
         e("  mov.ms %g0")
     for i in range(4):
         e(f"  %glx{i} = mov.ss")
-    e("  %gln = add.rr %gli, %g1")
+    if not hstep:
+        step("%gln", "%gli")
     e("  low.br ^gl(%gln: reg<aie2p.er>)")
     e("^gld:")
     for o in (0, 4, 8, 12):
