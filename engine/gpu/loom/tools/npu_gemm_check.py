@@ -252,6 +252,13 @@ def main():
             fb_ = ((1 if N.qcstage_on() else 2) if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
             v_ = w4f[fb_, -1]
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
+        if os.environ.get("GN_QCYCABS") == "1":   # (diag) the call's span over every core: last end - first start
+            w2_ = np.fromfile(co, np.uint32).reshape(-1, seg // 4)[:, :2].astype(np.int64)
+            st0_, en_ = w2_[:, 1], w2_[:, 0] + w2_[:, 1]
+            print(f"  call span (all cores): {en_.max() - st0_.min()} cycles; first starts spread {st0_.max() - st0_.min()}")
+            b4_ = w2_.reshape(cols, nb, N.MP, 2)[0, :4, -1]   # (column 0, blocks 0-3: their last segment)
+            print("  column 0 blocks 0-3 (start, end) from the first start:",
+                  [(int(s - st0_.min()), int(s + e - st0_.min())) for e, s in b4_])
         step = np.diff(last)
         mma = passes * N.MP * N.NP * sum(ks) * 4   # MMAs a core issues per M block
         med = float(np.median(step))

@@ -49,6 +49,9 @@ QCYC = os.environ.get("GN_QCYC") == "1"
 # GN_QFCYC=1 (diag, with GN_QCYC): the Q' fill's cycles (word 2: the whole fill; word 1: its egress phases) into every
 # C segment's next words (the last call's fill; %qfc words 0 / 8: phase starts, 4: egress sum, 12: fill)
 QFCYC = QCYC and os.environ.get("GN_QFCYC") == "1"
+# GN_QCYCABS=1 (diag, with GN_QCYC, not GN_QFCYC): word 1 of each stamped segment = the core's first firing's absolute
+# cycle (low word), so the call's span = max(word 0 + word 1) - min(word 1) over the cores
+QCYCABS = QCYC and not QFCYC and os.environ.get("GN_QCYCABS") == "1"
 # GN_QBANK=1 (experimental, the Q' tail with mu 1, ks <= 28): the bank plan of a one-core Q' tile, 16 KB banks
 # 0 W slot 0 | 1 C rows 0, 2 + A slot 0 | 2 C rows 1, 3 + A slot 1 | 3 W slot 1: the DMA refills only a bank the core
 # is not reading. The C pins reserve the sent 2 KB of each 4 KB slot; each bank's A slot comes after its C slots, so
@@ -4121,6 +4124,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e(f"  %tst{t} = lda %tsa{t}, 0")
             e(f"  %tsp{t} = sub %tcl{t}, %tst{t}")
             e(f"  st %tsp{t}, %cvt{t}, 0")
+            if QCYCABS:
+                e(f"  st %tst{t}, %cvt{t}, 4")
             if QFCYC and tail and QF.get("cfg") is not None and fills is True:
                 e(f"  %qfa{t} = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
                 e(f"  %qfe{t} = lda %qfa{t}, 4")
@@ -4855,6 +4860,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e("  %tst_l = lda %tsa_l, 0")
             e("  %tsp_l = sub %tcl_l, %tst_l")
             e("  st %tsp_l, %cvds, 0")
+            if QCYCABS:
+                e("  st %tst_l, %cvds, 4")
             if QFCYC and QF.get("cfg") is not None and fills is True:   # (fill cycles: words 1-3)
                 e("  %qfaL = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
                 for w_, o_ in ((1, 4), (2, 12), (3, 24)):
@@ -4905,6 +4912,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e(f"  %c3q{r} = copy %o : reg<aie2p.ep> -> reg<aie2p.ep>")
                 e(f"  %c3qq{r} = padds.modifier %c3q{r}, %c3dm{r}")
                 e(f"  st %tsp{t}, %c3qq{r}, 0")
+                if QCYCABS:
+                    e(f"  st %tst{t}, %c3qq{r}, 4")
             e("  rel %one, 2")
     elif qrow:   # last pass: each row's f32 C stays in its slot until here (row offsets: the C pins, else 4 KB apart)
         if qbank:
