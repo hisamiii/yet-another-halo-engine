@@ -14,7 +14,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
      }
      loom_aie2p_array_local_memory_proposal_t proposal;
 -    if (!loom_aie2p_array_local_memory_propose_worker(
-+    // Experimental LOOM_EXP_SPACE_AT=<space>@<offset>,...: a worker storage
++    // Experimental LOOM_EXP_SPACE_AT=<space>@<offset>[,;]...: a worker storage
 +    // space (scratch, private) at a fixed owner offset in a 64 KB compute
 +    // tile; the generator keeps the layout collision-free. The covered banks'
 +    // cursors only grow (to the region's end in its last bank).
@@ -46,7 +46,7 @@ diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/lo
 +          space_pinned = true;
 +          break;
 +        }
-+        pins = end && *end == ',' ? end + 1 : NULL;
++        pins = end && (*end == ',' || *end == ';') ? end + 1 : NULL;
 +      }
 +    }
 +    if (space_pinned) {
