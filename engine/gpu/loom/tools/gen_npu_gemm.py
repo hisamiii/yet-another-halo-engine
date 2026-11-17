@@ -3313,6 +3313,17 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             if t == NT:
                 (prologue if base - 3 < 0 else slots.setdefault(base - 3, [])).append(
                     "  %mbq = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
+            # GN_QTOK=r1,a1,r2,a2 (MMA slots from base): the t = NP / 2 release / acquire and the row end's, spread (a
+            # lumped lock pair leaves bundles without an MMA). The half-switch acquire stays ahead of the remote fills
+            # (a1 <= 0); the row end's lines stay within the r26 copy's window (>= -2, < 21: %wrq's copy)
+            ofs = [int(v) for v in os.environ.get("GN_QTOK", "0,0,0,0").split(",")]
+            o_ = (0, 0) if t == 0 else (ofs[0], ofs[1]) if t == NP // 2 else (ofs[2], ofs[3])
+            assert t != NP // 2 or o_[1] <= 0
+            assert t != NT or (min(o_) >= -2 and max(o_) < 21)
+            if t and len(tl) == 2:
+                for ln, o in zip(tl, o_):
+                    (prologue if base + o < 0 else slots.setdefault(base + o, [])).append(ln)
+                tl = []
             (prologue if base < 0 else slots.setdefault(base, [])).extend(tl)
         for i, line in enumerate(early):
             g = base - (len(early) - i)
