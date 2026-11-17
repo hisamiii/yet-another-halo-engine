@@ -176,6 +176,12 @@ def main():
     for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
         if "=" in kv:
             env[kv.split("=")[0]] = kv.split("=", 1)[1]
+    if os.environ.get("NPU_SAVE_CMD"):   # (diag) the compile's command and Loom environment, to rerun it by hand
+        import json
+        json.dump({"cmd": [hrx_paths.LOOM_COMPILE, src, f"--root=@{cfg.entry}",
+                           "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11", f"--output={img}"],
+                   "env": {k: v for k, v in env.items() if k.startswith("LOOM_")}},
+                  open(os.environ["NPU_SAVE_CMD"], "w"), indent=1)
     run([hrx_paths.LOOM_COMPILE, src, f"--root=@{cfg.entry}", "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
          f"--output={img}"] + ([f"--compile-report={os.environ.get('NPU_REPORT_KIND', 'text-details')}",
                                 f"--compile-report-output={os.environ['NPU_REPORT']}"]
@@ -187,7 +193,7 @@ def main():
         open(os.path.join(work, "npu_gemm.pcdiag"), "w").write(
             "".join(ln + "\n" for ln in r_.stderr.splitlines() if ln.split()[:1] in (["PCBLOCKS"], ["PCTEXT"], ["PCACQ"])))
         for ln in r_.stderr.splitlines():   # (diag, HRX pin: LOOM_EXP_TRACE_SHIM in NPU_ENV_ADD) the shim DMA choices
-            if ln.startswith(("SHIM ", "TWIN ", "STAGE ", "packet share")):
+            if ln.startswith(("SHIM ", "TWIN ", "STAGE ", "packet share", "route dump")):
                 print(ln)
     if os.environ.get("NPU_COMPILE_ONLY"):   # (diag) stop after the image (compiler work, no NPU)
         sys.exit(0)
@@ -302,6 +308,10 @@ def main():
             fb_ = ((1 if N.qcstage_on() else 2) if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
             v_ = w4f[fb_, -1]
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
+            if os.environ.get("GN_QF4R") == "1":   # (every row fills: row r's first block 2 (r % 2) + r // 2)
+                for r_ in range(4):
+                    u_ = w4f[2 * (r_ % 2) + r_ // 2, -1]
+                    print(f"  fill row {r_}: decoder/egress {u_[1]} whole fill {u_[2]} raw waits {u_[3]} hot {u_[4]}")
             if os.environ.get("DQ_CYC") == "1":   # (diag) word 1: the decoder's cycles; word 4: its hot loop's
                 print(f"  decoder (DQ_CYC): {v_[1]} cycles, hot loop {v_[4]}")
         if os.environ.get("GN_QCW") == "1" and mrel:   # (diag) per row: median per block of the C / W acquire waits

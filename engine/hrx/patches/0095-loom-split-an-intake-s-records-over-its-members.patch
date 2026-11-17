@@ -1,0 +1,411 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:20:00 +0100
+Subject: [PATCH] loom : split an intake's records over its members
+
+LOOM_EXP_INTAKE_SPLIT=1: an intake's members take the memory-tile stage ring's records in turn (member m: m, m + n,
+...), each drained as soon as it lands; LOOM_EXP_INTAKE_STAGE_DEPTH=N: the stage ring holds N records. Intake
+siblings: a second receiver of a W multicast shares its member's drain (core descriptors and lock pair only), and a
+multicast member's panel resolves through its source. LOOM_EXP_ROUTE_DUMP prints routed lanes and intake rejections.
+---
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -649,6 +649,7 @@
+   channel->intake_rows = 0;
+   channel->intake_pitch = 0;
+   channel->intake_member = 0;
++  channel->intake_sibling = UINT32_MAX;
+   channel->intake_member_count = 0;
+   channel->intake_fill_dma = UINT32_MAX;
+   channel->intake_chain_lock = UINT32_MAX;
+@@ -2507,10 +2508,10 @@
+   return index;
+ }
+ 
+-static iree_status_t loom_aie2p_array_diagnose_route_capacity(
+-    loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index) {
+-  builder->valid = false;
+-  if (getenv("LOOM_EXP_ROUTE_DUMP")) {  // (diag) used lanes per link: S/N per vertical link, W/E per horizontal
++// (diag) used lanes per link: S/N per vertical link, W/E per horizontal
++static void loom_aie2p_array_dump_lanes(
++    loom_aie2p_array_plan_builder_t* builder) {
++  {
+     const loom_aie2p_array_route_builder_t* r = &builder->route_builder;
+     const uint16_t cols = r->family->column_count, rows = r->family->row_count;
+     for (uint16_t row = 0; row + 1 < rows; ++row) {
+@@ -2532,6 +2533,12 @@
+       fprintf(stderr, "\n");
+     }
+   }
++}
++
++static iree_status_t loom_aie2p_array_diagnose_route_capacity(
++    loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index) {
++  builder->valid = false;
++  if (getenv("LOOM_EXP_ROUTE_DUMP")) loom_aie2p_array_dump_lanes(builder);
+   const loom_diagnostic_param_t params[] = {loom_param_u32(channel_index)};
+   const loom_diagnostic_emission_t emission = {
+       .op = loom_value_def_op(loom_value_table_const_value(
+@@ -3853,23 +3860,58 @@
+ // with descriptors and locks of its own. The chain locks order the members:
+ // the fill releases member 0's ready lock, each member's drain the next one's,
+ // the last member's the fill's free lock.
++// The memory-tile drain DMA index of an intake's panel multicast.
++static uint32_t loom_aie2p_array_intake_drain_index(
++    const loom_aie2p_array_plan_builder_t* builder,
++    const loom_aie2p_array_channel_t* channel) {
++  const uint32_t source =
++      builder->channels[channel->intake_panel].source_channel_index;
++  const loom_aie2p_array_channel_t* panel = &builder->channels[source];
++  if (panel->stage_dma_index == UINT32_MAX) return UINT32_MAX;
++  return panel->stage_dma_index +
++         (panel->stage_panel_owner == source ? 1u : 0u);
++}
++
++// The earlier member of |channel_index|'s intake multicast whose panel shares
++// its drain (multicast siblings: one drain feeds both), or UINT32_MAX.
++static uint32_t loom_aie2p_array_intake_sibling_of(
++    const loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index) {
++  const loom_aie2p_array_channel_t* channel = &builder->channels[channel_index];
++  const uint32_t drain = loom_aie2p_array_intake_drain_index(builder, channel);
++  if (drain == UINT32_MAX) return UINT32_MAX;
++  for (uint32_t i = channel->source_channel_index; i < channel_index; ++i) {
++    const loom_aie2p_array_channel_t* other = &builder->channels[i];
++    if (other->source_channel_index == channel->source_channel_index &&
++        loom_aie2p_array_channel_is_intake(other) &&
++        loom_aie2p_array_intake_drain_index(builder, other) == drain) {
++      return other->intake_sibling != UINT32_MAX ? other->intake_sibling : i;
++    }
++  }
++  return UINT32_MAX;
++}
++
+ static iree_status_t loom_aie2p_array_plan_intake_channel(
+     loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index,
+     const loom_aie2p_array_endpoint_t* receiver) {
+   loom_aie2p_array_channel_t* channel = &builder->channels[channel_index];
+   const loom_aie2p_array_channel_t* panel =
+       &builder->channels[channel->intake_panel];
++  // (a multicast member's panel: its source holds the stage DMA facts)
++  const uint32_t stage_index = panel->source_channel_index;
++  const loom_aie2p_array_channel_t* stage_panel =
++      &builder->channels[stage_index];
+   const loom_aie2p_array_worker_t* worker =
+       &builder->workers[receiver->owner_index];
+   const uint8_t capacity = (uint8_t)channel->capacity;
+-  if (panel->stage_dma_index == UINT32_MAX || !panel->stage_panel_stream) {
++  if (stage_panel->stage_dma_index == UINT32_MAX ||
++      !stage_panel->stage_panel_stream) {
+     return loom_aie2p_array_reject_channel_resources(
+         builder, channel_index, worker->coordinate,
+         IREE_SV("an intake's panel must be a streamed shared panel member"));
+   }
+   const loom_aie2p_array_dma_plan_t* panel_drain =
+-      &builder->dma_channels[panel->stage_dma_index +
+-                             (panel->stage_panel_owner == channel->intake_panel
++      &builder->dma_channels[stage_panel->stage_dma_index +
++                             (stage_panel->stage_panel_owner == stage_index
+                                   ? 1u
+                                   : 0u)];
+   const loom_aie2p_array_dma_plan_t* panel_core = NULL;
+@@ -3912,21 +3954,25 @@
+                   "buffer descriptors for the intake"));
+     }
+     // The ring, its fill channel and descriptors, and the chain locks.
+-    uint32_t member_count = 0;
++    uint32_t member_count = 0;   // (siblings share a member's drain)
+     for (iree_host_size_t i = 0; i < builder->plan->channel_count; ++i) {
+       member_count +=
+           builder->channels[i].source_channel_index == channel_index &&
+-          loom_aie2p_array_channel_is_intake(&builder->channels[i]);
++          loom_aie2p_array_channel_is_intake(&builder->channels[i]) &&
++          loom_aie2p_array_intake_sibling_of(builder, (uint32_t)i) ==
++              UINT32_MAX;
+     }
+     loom_aie2p_array_ring_resource_proposal_t ring = {0};
+     const uint8_t fill_channel = stage_resources->next_stream_to_memory_channel;
+     uint16_t* fill_cursor = &stage_state->memory_tile_bd_cursors[fill_channel & 1u];
++    const uint8_t stage_depth =
++        loom_aie2p_array_intake_stage_depth(capacity, channel->record_count);
+     if (loom_aie2p_array_channel_resources_propose_neighbor(
+-            stage_resources, stage, /*load_address_base=*/0, capacity,
++            stage_resources, stage, /*load_address_base=*/0, stage_depth,
+             channel->record_byte_length, /*contiguous=*/false,
+             &ring) != LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_NONE ||
+         fill_channel >= stage_resources->facts->dma.channel_count_per_direction ||
+-        *fill_cursor + capacity > half_capacity ||
++        *fill_cursor + stage_depth > half_capacity ||
+         (uint32_t)ring.post_next_lock + member_count - 1u >
+             stage_resources->facts->lock_count) {
+       return loom_aie2p_array_reject_channel_resources(
+@@ -3947,7 +3993,7 @@
+     stage_resources->next_stream_to_memory_channel = fill_channel + 1u;
+     const uint16_t fill_bd =
+         (uint16_t)((fill_channel & 1u) * half_capacity + *fill_cursor);
+-    *fill_cursor += capacity;
++    *fill_cursor += stage_depth;
+     channel->intake_member_count = member_count;
+     channel->intake_chain_lock = loom_aie2p_array_append_lock_pair(
+         builder, channel_index, LOOM_AIE2P_ARRAY_ENDPOINT_DIRECTION_RECEIVE,
+@@ -3972,12 +4018,12 @@
+             .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE |
+                      LOOM_AIE2P_ARRAY_DMA_FLAG_INTAKE,
+             .buffer_descriptor_start = fill_bd,
+-            .buffer_descriptor_count = capacity,
++            .buffer_descriptor_count = stage_depth,
+             .credit_lock_index = channel->intake_chain_lock,
+             .stage_record_base = (uint32_t)builder->stage_record_cursor,
+         };
+     channel->stage_first_record = (uint32_t)builder->stage_record_cursor;
+-    for (uint8_t r = 0; r < capacity; ++r) {
++    for (uint8_t r = 0; r < stage_depth; ++r) {
+       builder->stage_record_offsets[builder->stage_record_cursor++] =
+           ring.owner_offsets[r];
+     }
+@@ -3998,11 +4044,18 @@
+   }
+   channel->sender_dma_index = source->sender_dma_index;
+   channel->stage_first_record = source->stage_first_record;
++  channel->intake_sibling =
++      loom_aie2p_array_intake_sibling_of(builder, channel_index);
+   for (uint32_t i = channel->source_channel_index; i < channel_index; ++i) {
+     channel->intake_member +=
+         builder->channels[i].source_channel_index ==
+             channel->source_channel_index &&
+-        loom_aie2p_array_channel_is_intake(&builder->channels[i]);
++        loom_aie2p_array_channel_is_intake(&builder->channels[i]) &&
++        builder->channels[i].intake_sibling == UINT32_MAX;
++  }
++  if (getenv("LOOM_EXP_ROUTE_DUMP") && channel->intake_sibling != UINT32_MAX) {
++    fprintf(stderr, "intake sibling: channel %u takes channel %u's drain\n",
++            channel_index, channel->intake_sibling);
+   }
+   // The member's drain descriptors, on its panel's drain channel.
+   uint16_t* drain_cursor =
+@@ -4015,7 +4068,17 @@
+       builder->dma_channels[source->intake_fill_dma].buffer_descriptor_count;
+   uint32_t drain_count = capacity;
+   while (drain_count % stage_count != 0) drain_count += capacity;
+-  if (*drain_cursor + drain_count > half_capacity ||
++  if (loom_aie2p_array_intake_split()) {   // (its share of the stage ring)
++    if (stage_count % source->intake_member_count != 0) {
++      return loom_aie2p_array_reject_channel_resources(
++          builder, channel_index, worker->coordinate,
++          IREE_SV("a split intake's stage depth must be a multiple of its "
++                  "member count"));
++    }
++    drain_count = stage_count / source->intake_member_count;
++  }
++  const bool sibling = channel->intake_sibling != UINT32_MAX;
++  if ((!sibling && *drain_cursor + drain_count > half_capacity) ||
+       (uint32_t)core_resources->next_buffer_descriptor + capacity >
+           core_resources->facts->dma.buffer_descriptor_count ||
+       (uint32_t)core_resources->next_lock + 2u >
+@@ -4027,6 +4090,7 @@
+   const uint16_t drain_bd =
+       (uint16_t)((panel_drain->dma_channel & 1u) * half_capacity +
+                  *drain_cursor);
++  if (!sibling) {
+   *drain_cursor += drain_count;
+   channel->intake_drain_dma = (uint32_t)builder->dma_channel_cursor;
+   builder->dma_channels[builder->dma_channel_cursor++] =
+@@ -4042,6 +4106,7 @@
+           .credit_lock_index = source->intake_chain_lock,
+           .stage_record_base = source->stage_first_record,
+       };
++  }
+   // The member's core descriptors and lock pair, on its panel's receiving
+   // channel; the credit starts empty (the worker grants it).
+   const loom_aie2p_array_ring_resource_proposal_t core_pair = {
+@@ -4176,6 +4241,10 @@
+         &builder->endpoints[channel->sender_endpoint_index],
+         &builder->endpoints[channel->receiver_endpoint_index]));
+   }
++  const char* dump = getenv("LOOM_EXP_ROUTE_DUMP");
++  if (builder->valid && dump && dump[0] == '2') {  // (diag) the lanes of a routed program too
++    loom_aie2p_array_dump_lanes(builder);
++  }
+   return iree_ok_status();
+ }
+ 
+@@ -4306,7 +4375,9 @@
+       if (channel->source_channel_index == channel_index) {
+         out_cardinalities->dma_channel_count += 1u;
+         out_cardinalities->lock_count += 1u;
+-        out_cardinalities->stage_record_count += channel->capacity;
++        out_cardinalities->stage_record_count +=
++            loom_aie2p_array_intake_stage_depth(channel->capacity,
++                                                channel->record_count);
+         out_cardinalities->route_capacity += maximum_route_length;
+       }
+     }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -260,6 +260,11 @@
+   uint32_t intake_offset;
+   uint32_t intake_rows;
+   uint32_t intake_pitch;
++  // A sibling member (its panel shares an earlier member's multicast drain):
++  // that member's intake; it takes the drained records through its own core
++  // descriptors and locks, with no drain or chain lock of its own. UINT32_MAX
++  // otherwise.
++  uint32_t intake_sibling;
+   // Member ordinal in the drain chain; the source holds the member count.
+   uint32_t intake_member;
+   uint32_t intake_member_count;
+@@ -789,6 +794,26 @@
+   return n;
+ }
+ 
++// LOOM_EXP_INTAKE_STAGE_DEPTH=N (EXPERIMENT): the memory-tile ring of an
++// intake holds N records (N dividing |record_count|) instead of |capacity|,
++// more DRAM reads in flight than the members' rings allow.
++static inline uint8_t loom_aie2p_array_intake_stage_depth(
++    uint8_t capacity, uint32_t record_count) {
++  const char* env = getenv("LOOM_EXP_INTAKE_STAGE_DEPTH");
++  const int depth = env ? atoi(env) : 0;
++  return depth > 0 && depth <= 16 && record_count % (uint32_t)depth == 0
++             ? (uint8_t)depth
++             : capacity;
++}
++
++// LOOM_EXP_INTAKE_SPLIT=1 (EXPERIMENT): an intake's members (not siblings)
++// take the stage ring's records in turn (member m: records m, m + n, ...;
++// stage depth a multiple of n), each drained as soon as it lands, in parallel.
++static inline bool loom_aie2p_array_intake_split(void) {
++  const char* env = getenv("LOOM_EXP_INTAKE_SPLIT");
++  return env && atoi(env) != 0;
++}
++
+ // The payload |channel| shares with, or UINT32_MAX when it shares none.
+ static inline uint32_t loom_aie2p_array_share_payload(uint32_t channel) {
+   uint32_t c[8], p[8];
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1206,12 +1206,15 @@
+       dma->direction == LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY;
+   const uint32_t chain = source->intake_chain_lock;
+   const uint32_t m = channel->intake_member;
++  const uint32_t n = source->intake_member_count;
++  const bool split = loom_aie2p_array_intake_split();
++  // (split: the fill's record k readies member k % n, each member returns the
++  // free lock itself)
+   const loom_aie2p_array_lock_plan_t* acquire_lock =
+       &plan->locks[fill ? chain : chain + 1u + m];
+   const loom_aie2p_array_lock_plan_t* release_lock =
+-      &plan->locks[fill ? chain + 1u
+-                        : (m + 1u < source->intake_member_count ? chain + 2u + m
+-                                                                : chain)];
++      &plan->locks[fill ? chain + 1u + (split ? slot_ordinal % n : 0u)
++                        : (!split && m + 1u < n ? chain + 2u + m : chain)];
+   uint16_t acquire_selector = 0;
+   uint16_t release_selector = 0;
+   IREE_RETURN_IF_ERROR(loom_xdna_array_form_lock_selector(
+@@ -1248,7 +1251,9 @@
+       LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_BASE_ADDRESS,
+       (tile->memory.local_load_base +
+        plan->stage_record_offsets[dma->stage_record_base +
+-                                  slot_ordinal % stage_count]) >>
++                                  (fill || !split ? slot_ordinal
++                                                  : m + n * slot_ordinal) %
++                                      stage_count]) >>
+           tile->dma.address_encoding_shift,
+       &words[1]);
+   const bool last = slot_ordinal + 1u == dma->buffer_descriptor_count;
+@@ -1326,9 +1331,17 @@
+     return iree_make_status(IREE_STATUS_INTERNAL,
+                             "an intake's panel has no receiving row");
+   }
++  const loom_aie2p_array_channel_t* primary =
++      intake->intake_sibling != UINT32_MAX
++          ? &plan->channels[intake->intake_sibling]
++          : intake;
++  const uint32_t share =
++      loom_aie2p_array_intake_split()
++          ? plan->channels[primary->source_channel_index].intake_member_count
++          : 1u;   // (split: the member's records)
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_task(
+       builder, core, core->buffer_descriptor_start,
+-      intake->record_count / core->buffer_descriptor_count - 1u));
++      intake->record_count / share / core->buffer_descriptor_count - 1u));
+   // The queue's repeat field holds 256 runs at most: longer panels queue
+   // several tasks of the same terminating chain.
+   uint32_t runs = plan->channels[intake->intake_panel].record_count /
+@@ -2338,11 +2351,23 @@
+       }
+       const loom_aie2p_array_dma_plan_t* intake_drain =
+           &plan->dma_channels[intake->intake_drain_dma];
++      const uint32_t share =
++          loom_aie2p_array_intake_split()
++              ? plan->channels[intake->source_channel_index].intake_member_count
++              : 1u;   // (split: the member's records)
+       IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_task(
+           builder, intake_drain, intake_drain->buffer_descriptor_start,
+-          intake->record_count / intake_drain->buffer_descriptor_count - 1u));
++          intake->record_count / share / intake_drain->buffer_descriptor_count -
++              1u));
+       IREE_RETURN_IF_ERROR(
+           loom_aie2p_program_queue_intake_core(builder, intake));
++      for (iree_host_size_t s = 0; s < plan->channel_count; ++s) {
++        // (the members that take this drain too)
++        if (plan->channels[s].intake_sibling == channel->intake_prefix) {
++          IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_intake_core(
++              builder, &plan->channels[s]));
++        }
++      }
+     }
+     const uint16_t indices[] = {dma->dma_channel};
+     const uint32_t drain_tasks = loom_aie2p_program_panel_blockmajor()
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+@@ -4,6 +4,9 @@
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
++#include <stdio.h>
++#include <stdlib.h>
++
+ #include "loom/target/arch/amd/xdna/aie2p/array/topology.h"
+ 
+ #include <stdlib.h>
+@@ -1440,6 +1443,9 @@
+     if (!loom_aie2p_array_channel_is_intake(channel)) continue;
+     const loom_aie2p_array_channel_t* panel =
+         &topology->channels[channel->intake_panel];
++    // (a multicast member's panel: its source holds the shared-panel facts)
++    const loom_aie2p_array_channel_t* stage =
++        &topology->channels[panel->source_channel_index];
+     const loom_aie2p_array_endpoint_t* receiver =
+         &plan->endpoints[channel->receiver_endpoint_index];
+     const loom_aie2p_array_endpoint_t* panel_receiver =
+@@ -1452,13 +1458,24 @@
+         receiver->owner_kind != LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER ||
+         panel_receiver->owner_kind != LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER ||
+         panel_receiver->owner_index != receiver->owner_index ||
+-        panel->stage_panel_owner == UINT32_MAX ||
+-        panel->stage_column != channel->stage_column ||
++        stage->stage_panel_owner == UINT32_MAX ||
++        stage->stage_column != channel->stage_column ||
+         channel->capacity == 0 || channel->capacity > 2 ||
+         channel->record_count % channel->capacity != 0 || row_bytes == 0 ||
+         row_bytes % 4 != 0 ||
+         row_bytes * channel->intake_rows != channel->record_byte_length ||
+         channel->intake_pitch < row_bytes || channel->intake_pitch % 4 != 0) {
++      if (getenv("LOOM_EXP_ROUTE_DUMP")) {
++        fprintf(stderr,
++                "route dump: intake %u: transport %d core_stream %d stage col %u "
++                "panel %u owner %u panel col %u recv %u/%u cap %u count %u\n",
++                (unsigned)channel_index, (int)channel->transport,
++                (int)channel->core_stream, channel->stage_column,
++                channel->intake_panel, panel->stage_panel_owner,
++                panel->stage_column, receiver->owner_index,
++                panel_receiver->owner_index, channel->capacity,
++                channel->record_count);
++      }
+       return loom_aie2p_array_topology_reject_channel_connection(
+           topology, (uint32_t)channel_index,
+           IREE_SV("an intake is a staged binding-to-worker channel (one or two "

@@ -338,12 +338,17 @@ def array_program(L, cfg):
             rw = N.decoder(cfg.fmt, cfg.gord).RECROW // (4 * NP)
         fr = 1 if N.qp1k_on() else 0   # (P1K: row 1 decodes; row 0's program holds the pair relay's copy)
         dr = R if qdec() else fr   # (the decoding worker's row: the egressing one)
-        drs = tuple(range(R, R + qdec_rows())) if qdec() else (0, 1) if N.qfkh_on() else (fr,)
-        egr = drs if N.qfkh_on() else (dr,)   # (the egressing decoders: lane c len(egr) + i)
+        drs = tuple(range(R, R + qdec_rows())) if qdec() else (0, 1, 2, 3) if N.qf4r_on() else (0, 1) if N.qfkh_on() else (fr,)
+        egr = (1, 2) if N.qf4r_on() else drs if N.qfkh_on() else (dr,)   # (the egressing decoders: lane c len(egr) + i)
+        h4 = {0: 1, 3: 2} if N.qf4r_on() else {}   # (GN_QF4R) helper row -> its egress neighbour
         if N.qfkh_on():
             nrec //= len(egr)
         assert 4 * rw <= N.decoder(cfg.fmt, cfg.gord).RECROW
         N.QF["rawn"], N.QF["raww"] = nraw, rw
+        if os.environ.get("GN_QDBG"):   # (diag) the raw layout
+            import sys
+            print(f"raw layout: fmt {cfg.fmt} nraw {nraw} rw {rw} wslot {N.QF['wslot']} fw {fw} nrec {nrec} "
+                  f"recrow {N.decoder(cfg.fmt, cfg.gord).RECROW}", file=open(os.environ["GN_QDBG"], "a"))
         dp, sp = N.QF_PORTS
         e(f'  %fdb = binding {6 if cfg.gate else 3}, "write"')   # (gated: the engine's binding order)
         e(f'  %frb = binding {7 if cfg.gate else 4}, "read"')
@@ -359,8 +364,10 @@ def array_program(L, cfg):
             e(f"  %fsn = constant.u32 {U * N.FUSE_SB} : reg<aie2p.array.scalar : index>")
         else:
             rty = f"16x{rw}"
+            # (GN_QRAWCONTIG=1, diag, wrong output: each record's 16 rows read contiguously, the same bytes a record)
+            rs_ = rw if os.environ.get("GN_QRAWCONTIG") == "1" else RS
             e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U if r4 else U * N.FUSE_SB}x{NP}x16x{rw}xi32, "
-              f"#encoding.layout.strided<strides=[{(N.FUSE_SB if r4 else 1) * BLK // 4}, {16 * RS}, {RS}, 1]>>>")
+              f"#encoding.layout.strided<strides=[{(N.FUSE_SB if r4 else 1) * BLK // 4}, {16 * rs_}, {rs_}, 1]>>>")
         for c in range(cols):
             e(f"  %fro{c} = constant.u64 {c * N.TN * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<{rty}xi32>>")
@@ -371,6 +378,13 @@ def array_program(L, cfg):
                     e(f"  %fdr{t} = partition.receiver %fd_all, %origin, %fdlane{t}, %fdl : reg<aie2p.array.receiver : tile<{fw}xi32>>")
                     e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
                     e(f"  %chd{t} = channel %fds{t}, %fdr{t}, {'%n4' if N.qfdirect_on() else '%two'}, %fdn : "
+                      f"reg<aie2p.array.channel : tile<{fw}xi32>>")
+                    e(f"  constrain.leaf_sync %chd{t}")
+                elif r in h4:   # (GN_QF4R) the helper's records to its egress neighbour (its window reads them)
+                    e(f"  %fhn{t} = constant.u32 {nrec // 2} : reg<aie2p.array.scalar : index>")
+                    e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
+                    e(f"  %fhr{t} = receiver {kk[c, h4[r]]}, {N.QF4R_NB} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
+                    e(f"  %chd{t} = channel %fds{t}, %fhr{t}, %n{N.QF4R_HSLOTS}, %fhn{t} : "
                       f"reg<aie2p.array.channel : tile<{fw}xi32>>")
                     e(f"  constrain.leaf_sync %chd{t}")
                 e(f"  %frr{t} = receiver {kk[c, r]}, {sp} : reg<aie2p.array.receiver : tile<{rty}xi32>>")
@@ -389,7 +403,10 @@ def array_program(L, cfg):
     if fz:   # filled by the core's egress; its raw rows land in its W ring's first slot
         L[iw:jt] = L[jf:jt] + L[iw:ia] + L[ia:jf]
         for c in range(cols):
-            if N.qfkh_on():   # (a panel per K half, each filled by its decoder: rows 0 / 2 by row 0, 1 / 3 by row 1)
+            if N.qf4r_on():   # (half 0's panel (rows 0 / 2) by row 2, half 1's (rows 1 / 3) by row 1)
+                e(f"  constrain.fill %chw{c}_0, %chd{c}_2")
+                e(f"  constrain.fill %chw{c}_1, %chd{c}_1")
+            elif N.qfkh_on():   # (a panel per K half, each filled by its decoder: rows 0 / 2 by row 0, 1 / 3 by row 1)
                 e(f"  constrain.fill %chw{c}_0, %chd{c}_0")
                 e(f"  constrain.fill %chw{c}_1, %chd{c}_1")
             else:
@@ -461,7 +478,8 @@ def array_program(L, cfg):
     if N.pshare():   # (Loom numbers the channels in program order) the tick and the signal on their column's row 0 egress lane
         chans = [x.split(" = channel ")[0].strip() for x in "\n".join(L).splitlines() if " = channel " in x]
         gp = N.QF["gports"]
-        N.QF["pshare"] = ",".join(f"{chans.index(c)}:{chans.index(f'%chd{col}_0')}" for c, col in
+        er = 2 if N.qf4r_on() else 0   # (the column's egress lane nearest the gate row)
+        N.QF["pshare"] = ",".join(f"{chans.index(c)}:{chans.index(f'%chd{col}_{er}')}" for c, col in
                                   (("%chgt", gp["col"]), ("%chgs", gp["relay"]["col"])))
     e("  return\n}\n")
 
@@ -481,6 +499,8 @@ def qgate(cfg):
     assert cfg.cols >= 3
     r = gate_row()
     b = 5 if (r == 0 and cfg.fuse == 2) or os.environ.get("GN_QMB1") == "5" else 3   # (MB2: row q + 1 receives on 4)
+    if cfg.fuse == 2 and N.qf4r_on():   # (GN_QF4R: the gate row decodes too: 6 its helper sender, 7 its raw intake)
+        b = 9
     N.QF["gports"] = {"col": 1, "waiter": dict(row=r, poll=b, tick=b + 1, nbr=b + 2),
                       "relay": dict(col=2, row=r, nbr=b, sig=b + 1)}
     return (1, r), (2, r)
@@ -502,7 +522,9 @@ def leaf_name(cfg, c, r):
         name = ("tailm" if r == 1 else "tailms") if pr == 1 else (
             "tailm0s" if os.environ.get("GN_QP1RAW1") == "1" else "tailm0")
         if N.qfkh_on() and pr == 0:   # (GN_QFKH) row 0 decodes K half 0 (an intake needs its W stream's source member); row 2 skips the raw
-            name = "tailm0d" if r == 0 else "tailm0s"
+            name = "tailm0d" if r == 0 else "tailm0e" if N.qf4r_on() else "tailm0s"
+        if N.qf4r_on() and r == 3:   # (GN_QF4R) row 3 decodes too
+            name = "tailmh"
         return name + ("_gw" if cfg.gate and (c, r) == (1, gate_row()) else
                        "_gr" if cfg.gate and (c, r) == (2, gate_row()) else "")
     if cfg.fuse == 0 and pr == 1 and os.environ.get("GN_QMB1"):   # (diag: row 1 reads row 0's W, gen_npu_gemm)
@@ -551,7 +573,7 @@ def gen(cfg):
             N.qdec_leaf(L, cfg, None if name == "qdec" else int(name[4:]))
             continue
         fill = cfg.fuse == 2 and not name.startswith("tailr") and not qdec() and (
-            name == "tailm" or name.startswith("tailm0d") or not N.qp1k_on())
+            name == "tailm" or name.startswith(("tailm0d", "tailm0e", "tailmh")) or not N.qp1k_on())
         N.leaf(L, cfg, "tail", cfg.ks[0], cov=(0,) if fill else None, gate=gate, name=name)
     if qfix():   # (any acquire / release of the dropped ports: the unrolled copies' renamed operands too)
         import re
