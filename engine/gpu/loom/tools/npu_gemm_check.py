@@ -170,7 +170,13 @@ def main():
         ra = np.concatenate([ra, ra])
     ra.tofile(a_b)
     if QMODE and N.qp1_on():   # (GN_QP1) [col][pass][record] -> [col][half][pass][half record]: each half view contiguous
-        if N.qp1k_on():   # (P1K) [col][pass][group][K half][half slab] -> [col][K half][pass][group][half slab]
+        il_ = os.environ.get("GN_QP1IL")   # (P1K interleaved panel, LOOM_EXP_PANEL_INTERLEAVE: 5 = [pass][group][K half]
+        if N.qp1k_on() and il_ == "5":    # the record order as is; 1 = [pass][K half][group], the fill decoder's)
+            pass
+        elif N.qp1k_on() and il_ == "1":
+            wb_ = rw.view(np.uint8).reshape(cols, passes, N.NP, 2, -1)
+            rw = np.ascontiguousarray(wb_.transpose(0, 1, 3, 2, 4)).reshape(-1)
+        elif N.qp1k_on():   # (P1K) [col][pass][group][K half][half slab] -> [col][K half][pass][group][half slab]
             wb_ = rw.view(np.uint8).reshape(cols, passes, N.NP, 2, -1)
             rw = np.ascontiguousarray(wb_.transpose(0, 3, 1, 2, 4)).reshape(-1)
         else:

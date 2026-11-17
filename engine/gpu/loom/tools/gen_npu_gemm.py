@@ -140,6 +140,10 @@ QF_REC = 8          # then the slab outputs' addresses (words 12 .. 24)
 QF_OUT = 12
 QDEC_SPORT, QDEC_RPORT = 3, 5   # (NPU_QDEC, two decoder rows) the second's slab sender, the first's receiver
 QF_OUTS = (19584, 49152, 53760, None)    # slab outputs (4608 B each): C rows after SP, W slot 1 (two), private
+# (P1K fill, the 64x80 map: W slots 0 / 53760, scratch 12288, A 20480 / 32768, C rows 37376..49664) the decoder's areas,
+# all idle during the fill (the A slots are not: A streams in meanwhile): IN W slot 0, SP in the scratch's tail (bank 1),
+# SP2 in the C rows (bank 2), the 5 slab outputs, the egress ring (2 x 576 B) in the free run past the small pin
+QF_P1K = dict(sp=16896, sp2=37376, outs=(12288, 25088, 44608, 53760, 58368), egr=30784)
 QF_FW = 144         # egress record words: a 16-k-block piece is 4 records
 QF_A13 = {32768: 33920, 36864: 38016}   # A slots 1, 3 (bank 2) past the egress ring at its start: qf_ring_at
 
@@ -149,6 +153,8 @@ def qf_ring_at(pins):
     panel before the A stage: one memory tile holds both at 8 columns) and a pin is skipped once its bank holds a later
     allocation, so the egress ring takes bank 2's start (32768) and A slot 1 moves past it (QF_A13; both bank-2 slots, the leaf steps slots symmetrically)."""
     fb = 4 * fuse_record(QF["cfg"], (0,))[0]
+    if qp1k_on():   # (P1K fill) the egress ring in QF_P1K's free run; the A pins stay
+        return pins + f",{fb}@{QF_P1K['egr']}:{QF_P1K['egr'] + fb}"
     g = pins.split(",")
     a = [QF_A13.get(int(v), int(v)) for v in g[2].split("@")[1].split(":")]
     g[2] = g[2].split("@")[0] + "@" + ":".join(map(str, a))
@@ -218,7 +224,7 @@ def qa4_slots():
     """(GN_QA4) the 4 A slots' byte addresses: GN_QPINS' third group if set, else QA4_RING_AT's."""
     pins = os.environ.get("GN_QPINS") or QA4_RING_AT
     a = [int(v) for v in pins.split(",")[2].split("@")[1].split(":")]
-    return [QF_A13.get(v, v) for v in a] if QF["cfg"] is not None else a
+    return [QF_A13.get(v, v) for v in a] if QF["cfg"] is not None and not qp1k_on() else a   # (P1K: the A pins stay)
 
 
 def div_mp(src, dst, x):
@@ -1393,6 +1399,10 @@ def fuse_raw_ring(cfg, cov):
 def fuse_scratch(cfg, cov):
     """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
     D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
+    if QF["cfg"] is not None and qp1k_on():   # (P1K fill: QF_P1K)
+        m = QF_P1K
+        assert 16 * D.RECROW <= QF["wslot"] and D.SCR_B <= 20480 - m["sp"] and D.SCR2_B <= m["outs"][2] - m["sp2"]
+        return m["sp"], 0, m["sp2"], m["outs"][0]
     if QF["cfg"] is not None:   # Q' (QA4 pins, W slot 0 at 0): areas idle until the panel's replay
         ws = QF["wslot"]   # IN: W slot 0; SP: the C rows (bank 1); SP2: the odd-C block; OUT: QF_OUTS (one per slab)
         assert 16 * D.RECROW <= ws and 16384 + D.SCR_B <= QF_OUTS[0] and QF_OUTS[0] + 2 * D.OUT_B <= 24576, ws
@@ -1809,7 +1819,7 @@ def qf_decode(L, cfg, dp):
     dsnd = dec and QF.get("drole") == 1             # (the second: slabs 2-3 into its sender, no egress)
     NS = 2 if spl or dsp or dsnd else NP            # (split: this row's slabs; row 1 decodes the rest)
     pport = QDEC_RPORT if dsp else QF["split"](QF["gate_now"]) if spl else None
-    if not spl and not dec:
+    if not spl and not dec and not qp1k_on():   # (P1K: every slab output in QF_P1K)
         e(f"  %fzo3s = storage {{byte_alignment = 64, byte_length = {2 * D.OUT_B}}} : low.storage<private>")
     # the slab outputs' addresses (from the W ring's first 2048-aligned byte)
     e("  %fzw0a = lda %fzpD, 24")
@@ -1827,7 +1837,9 @@ def qf_decode(L, cfg, dp):
         e(f"  st %fzq2, %fzpT, {QF_OUT + 8}")
         e("  %fzq3 = lda %fzqG, 4")
         e(f"  st %fzq3, %fzpT, {QF_OUT + 12}")
-    for i, off in enumerate(QF_OUTS[:0 if dsnd else NS]):   # (dsnd, dsp's slabs 2-3: qdec_leaf)
+    outs = QF_P1K["outs"] if qp1k_on() else QF_OUTS
+    assert len(outs) >= NS and QF_OUT + 4 * NS <= 64
+    for i, off in enumerate(outs[:0 if dsnd else NS]):   # (dsnd, dsp's slabs 2-3: qdec_leaf)
         if dec:   # (the decoder's outputs: one private block, 2 OUT_B a slab)
             e(f"  %fzop{i} = storage_address %dqo : low.storage<private> -> reg<aie2p.ep>")
             e(f"  %fzoq{i} = mov.address-to-scalar %fzop{i}")
@@ -1994,7 +2006,7 @@ def qf_decode(L, cfg, dp):
     e("^fze:")
     e("  %fzpE = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
     e(f"  %fzr = lda %fzpE, {QF_REC}")
-    e("  %fzr32 = mova.i32 32")
+    e(f"  %fzr32 = mova.i32 {8 * NS}")   # (8 records a slab: 2 halves x 4 parts)
     e("  %fzrm = lt %fzr, %fzr32")
     e("  low.cond_br %fzrm, ^fzeb, ^fzex : reg<aie2p.er>")
     e("^fzeb:")
@@ -2003,10 +2015,18 @@ def qf_decode(L, cfg, dp):
     e("  %fzk3 = mova.i32 3")
     e("  %fzk2 = mova.i32 -2")
     e("  %fzk4 = mova.i32 -4")
-    e("  %fzpart = and %fzr, %fzk3")                # r % 4
-    e("  %fzpc = lshl %fzr, %fzk2")                 # r / 4 (lshl by a negative count shifts right)
-    e("  %fzsl = and %fzpc, %fzk3")                 # slab
-    e("  %fzps = lshl %fzr, %fzk4")                 # pass of the step (r / 16)
+    if qp1k_on():   # (P1K: the panel interleaved per slab, [step][slab][half][part]: r = 8 slab + 4 half + part)
+        e("  %fzk7 = mova.i32 7")
+        e("  %fzkm3 = mova.i32 -3")
+        e("  %fzr7 = and %fzr, %fzk7")
+        e("  %fzpart = and %fzr, %fzk3")
+        e("  %fzsl = lshl %fzr, %fzkm3")                # slab (r / 8)
+        e("  %fzps = lshl %fzr7, %fzk2")                # half (r / 4 % 2)
+    else:
+        e("  %fzpart = and %fzr, %fzk3")                # r % 4
+        e("  %fzpc = lshl %fzr, %fzk2")                 # r / 4 (lshl by a negative count shifts right)
+        e("  %fzsl = and %fzpc, %fzk3")                 # slab
+        e("  %fzps = lshl %fzr, %fzk4")                 # pass of the step (r / 16)
     e("  %fzpEs = mov.address-to-scalar %fzpE")
     e("  %fzk4b = mova.i32 4")
     e("  %fzslq = mul %fzsl, %fzk4b")
@@ -2413,9 +2433,11 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     assert MP % cfg.mu == 0 and (a_adv or cfg.mu % acap == 0 or (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4))), \
         "ring slot of a row must be static per iteration"
     name = name or role + ("_g" if gate else "")
+    skp1 = name in ("tailm0s", "tailms")   # (P1K fill) a P1 leaf that skips the raw records: its pair role without the s
+    full_name, name = name, (name[:-1] if skp1 else name)
     fills = cov is not None
     lk = "" if tail and os.environ.get("GN_QUNLOCK") else "schedule(locked) "   # (probe: Loom's scheduler orders it)
-    e(f"low.func.def {lk}target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
+    e(f"low.func.def {lk}target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{full_name}() asm {{")
     split_r1 = QF["cfg"] is not None and bool(QF.get("split")) and name.startswith("tailr")   # (row 1 decodes too)
     QODS_EARLY[0] = split_r1
     rs = "_r" if fills or split_r1 else ""   # parked as scalars across the decoding fill (^fzgemm / ^rzgo)
@@ -2491,7 +2513,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         fuse_prologue(L, cfg, role, ks, cov, helper, gate)
     elif split_r1:
         qf_split_r1(L, cfg)
-    elif QF["cfg"] is not None and name.startswith("tailr") and not QF.get("dec"):
+    elif QF["cfg"] is not None and (name.startswith("tailr") or skp1) and not QF.get("dec"):
         qf_skip_raw(e, cfg)
     if early:   # (fuse2_entry)
         e("  %fzpL = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
@@ -2909,7 +2931,7 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     pins = os.environ.get("GN_QPINS") or QA4_RING_AT
     sb = int(pins.split(",")[0].split("@")[0])   # (a segment: one C ring slot; 2048 B, the P1 layout's 3072 B)
     cs = [int(v) for v in pins.split(",")[0].split("@")[1].split(":")]
-    assert sb % 64 == 0 and len(cs) == MP and qa4_on() and (qpeel_on() or qunr_on()) and not qalt_on()
+    assert sb % 64 == 0 and len(cs) == MP and qa4_on() and (qpeel_on() or qunr_on() or os.environ.get("GN_QBANK") == "3") and not qalt_on()
     e(f"  %crG = storage_address {own[0]} : low.storage<private> -> reg<aie2p.ep>")
     e(f"  %crol = lda %crG, {own[1]}")
     e("  %cro = mov.scalar-to-address %crol")
@@ -2920,7 +2942,8 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     e("  %cr1 = mova.i32 1")
     e("  %crz = mova.i32 0")
     e(f"  %crK = mova.i32 {nseg or MP}")
-    assert all(b - a == sb for a, b in zip(cs, cs[1:])), cs   # (a segment's post-increments end at the next slot)
+    sd = cs[1] - cs[0] if len(cs) > 1 else sb   # (the slot stride: odd NP's C slots hold an f32 tail past the bf16)
+    assert sd >= sb and sd % 64 == 0 and all(b - a == sd for a, b in zip(cs, cs[1:])), cs
     # (a loop over the segments, its counter stepped in the header: no hardware loop candidate, so
     # LOOM_EXP_HWLOOP_TRIP's '@' counts stay the GEMM's)
     e("  low.br ^crl(%crz: reg<aie2p.er>, %crr: reg<aie2p.ep>, %cro: reg<aie2p.ep>)")
@@ -2943,12 +2966,18 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
         e(f"  %crq_{i + 1} = vst.acc.post %crv_{i}, %crq_{i}, 64")
     e("  rel %cr1, 2")
     e(f"  rel %cr1, {port}")
+    if sd > sb:   # (both pointers past the slot's tail)
+        e(f"  %crgk = mov.i32 {sd - sb}")
+        e("  %crgm = mov.modifier %crgk")
+        e(f"  %crp_{nl}g = padda.modifier %crp_{nl}, %crgm")
+        e(f"  %crq_{nl}g = padda.modifier %crq_{nl}, %crgm")
+        nl = f"{nl}g"
     if (nseg or MP) > MP:   # (a chain: both rings wrap every MP segments)
         assert MP & (MP - 1) == 0
         e(f"  %crwm = mova.i32 {MP - 1}")
         e("  %crw = and %crin, %crwm")
         e("  %crwz = eqz %crw")
-        e(f"  %crwk = mov.i32 {-MP * sb}")
+        e(f"  %crwk = mov.i32 {-MP * sd}")
         e("  %crwo = mul %crwz, %crwk")
         e("  %crwmd = mov.modifier %crwo")
         e(f"  %crpw = padda.modifier %crp_{nl}, %crwmd")
@@ -4584,9 +4613,10 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         pass
     elif q3 and os.environ.get("GN_QCVL", "1" if qunr_on() else "0") == "1":
         # (GN_QCVL: the convert below as a loop over the rows, ~1/4 of its code: the unroll's room without the peel)
-        # a row's loads: 16 from the even area, 16 odd, 16 even, 16 odd (post-incremented: each ends a row on, as d)
+        # a row's loads: 16 from the even area, 16 odd, 16 even, ... (post-incremented: each ends a row on; d too, but
+        # for odd NP: its bf16 row is 512 B short of the even area's row, stepped below)
         n = 16 * NP
-        assert n == 64
+        assert q3_strides() == (1024 * ((NP + 1) // 2), 1024 * (NP // 2))
         e("  %cvz = mova.i32 0")
         e("  %cvo0 = copy %o : reg<aie2p.ep> -> reg<aie2p.ep>")
         e("  %cvq0 = copy %qod : reg<aie2p.ep> -> reg<aie2p.ep>")
@@ -4621,14 +4651,21 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e("  %tsp_l = sub %tcl_l, %tst_l")
             e("  st %tsp_l, %cvds, 0")
         e("  rel %one, 2")
+        if q3_strides()[0] > 32 * n:   # (odd NP: d to the next even-area row)
+            e(f"  %cvgk = mov.i32 {q3_strides()[0] - 32 * n}")
+            e("  %cvgm = mov.modifier %cvgk")
+            e(f"  %cvdg = padda.modifier {d}, %cvgm")
+            d = "%cvdg"
         e(f"  low.br ^cvl(%cvrn: reg<aie2p.er>, {d}: reg<aie2p.ep>, {cur['a']}: reg<aie2p.ep>, {cur['b']}: reg<aie2p.ep>)")
         e("^cvx:")
     elif q3:   # each row: its f32 sub-tiles (even area, odd area, alternating) packed to bf16 in its even half
         for r in range(MP):
             t = 100 + r
             ptr = {}
-            for nm, base, off in (("d", "%o", 2048 * r), ("s0", "%o", 2048 * r), ("s1", "%qod", 2048 * r),
-                                  ("s2", "%o", 2048 * r + 1024), ("s3", "%qod", 2048 * r + 1024)):
+            evs, ods = q3_strides()   # (sub-tile t: the even area's (t even) or the odd area's, 1 KB each a row)
+            for nm, base, off in ((("d", "%o", evs * r),) +
+                                  tuple((f"s{t_}", "%o" if t_ % 2 == 0 else "%qod",
+                                         (evs if t_ % 2 == 0 else ods) * r + 1024 * (t_ // 2)) for t_ in range(NP))):
                 e(f"  %c3{nm}a{r} = mova.i32 {off // 512}")
                 e(f"  %c3{nm}o{r} = mul %k512, %c3{nm}a{r}")
                 e(f"  %c3{nm}m{r} = mov.modifier %c3{nm}o{r}")

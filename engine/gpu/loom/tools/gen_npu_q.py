@@ -165,7 +165,7 @@ def array_program(L, cfg):
         e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R}x{nbr * MP}x{rec}xi32>>")
     if N.crelp_on():   # (NPU_QCREL=2) [col][pair][its blocks]: row 2p + j takes pair p's blocks 2 f + j; row 2p's
         # stream carries both rows' (row 2p + 1's C ring read in place by row 2p, copied after its own)
-        assert R % 2 == 0 and cfg.fuse != 2 and not cfg.gate
+        assert R % 2 == 0 and (cfg.fuse != 2 or N.qp1k_on()) and not cfg.gate
         L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr * MP}x{rec}xi32>>")
         e(f"  %ncolp = constant.u32 {cols * R // 2} : reg<aie2p.array.scalar : index>")
         e(f"  %nseg2 = constant.u32 {2 * nbr * MP} : reg<aie2p.array.scalar : index>")
@@ -199,7 +199,7 @@ def array_program(L, cfg):
     wdup = int(os.environ.get("GN_QWDUP") or 1)   # (diag: groups of wdup columns share one W stream; 2: production's DRAM)
     assert cols % wdup == 0
     for c in range(0, cols if N.qp1_on() else 0, wdup):   # (GN_QP1) a half-record view per pair row parity: row r gets half r % 2
-        assert not fz and not N.qw4_on() and "w" not in qfix() and N.qpass_on() and R % 2 == 0
+        assert (not fz or N.qp1k_on()) and not N.qw4_on() and "w" not in qfix() and N.qpass_on() and R % 2 == 0
         hrec = wrec // 2
         for h in range(2):
             e(f"  %wo{c}_h{h} = constant.u64 {c * P * wrec + h * P * hrec} : reg<aie2p.array.offset : offset>")
@@ -303,8 +303,9 @@ def array_program(L, cfg):
             rw += 1
         if qdec():   # (the split's record: a step's NP slabs side by side, 144 B each: the decoder's 576 B row)
             rw = N.decoder(cfg.fmt, cfg.gord).RECROW // (4 * NP)
-        dr = R if qdec() else 0   # (the decoding worker's row: the egressing one)
-        drs = tuple(range(R, R + qdec_rows())) if qdec() else (0,)
+        fr = 1 if N.qp1k_on() else 0   # (P1K: row 1 decodes; row 0's program holds the pair relay's copy)
+        dr = R if qdec() else fr   # (the decoding worker's row: the egressing one)
+        drs = tuple(range(R, R + qdec_rows())) if qdec() else (fr,)
         assert 4 * rw <= N.decoder(cfg.fmt, cfg.gord).RECROW
         N.QF["rawn"], N.QF["raww"] = nraw, rw
         dp, sp = N.QF_PORTS
@@ -351,8 +352,8 @@ def array_program(L, cfg):
     if fz:   # filled by the core's egress; its raw rows land in its W ring's first slot
         L[iw:jt] = L[jf:jt] + L[iw:ia] + L[ia:jf]
         for c in range(cols):
-            e(f"  constrain.fill %chw{c}_0, %chd{c}_{dr}")
-            for r in (() if qdec() else range(1)):
+            e(f"  constrain.fill %chw{c}_0, %chd{c}_{dr}")   # (the shared panel's owner: row 0's member)
+            for r in (() if qdec() else (fr,)):
                 t = f"{c}_{r}"
                 e(f"  %fioff{t} = constant.u32 0 : reg<aie2p.array.scalar : index>")
                 e(f"  %firows{t} = constant.u32 16 : reg<aie2p.array.scalar : index>")
@@ -402,7 +403,7 @@ def array_program(L, cfg):
         # order. Row 0 (sender, port 3): a ready pre-released at the firing start, then acquire a credit before and release
         # a ready after each half (the last half's release skipped); row 1 (receiver, port 4): acquire a ready before and
         # release a credit after each half. Per firing 2 MP passes of each.
-        assert R % 2 == 0 and not fz and not cfg.gate and not crel()   # (one channel per vertical pair)
+        assert R % 2 == 0 and (not fz or N.qp1k_on()) and not cfg.gate and not crel()   # (one channel per vertical pair)
         e(f"  %mbn = constant.u32 {nbr * P * MP * 2} : reg<aie2p.array.scalar : index>")
         for c in range(cols):
             for q in range(0, R, 2):
@@ -439,6 +440,10 @@ def leaf_name(cfg, c, r):
         return "qdec" if qdec_rows() == 1 else f"qdec{r - QROWS}"
     name = "tailr" if cfg.fuse == 2 and r else "tail"
     pr = r % 2 if os.environ.get("GN_QMB1") == "5" and QROWS % 2 == 0 else r   # (MB2 / P1: each vertical pair)
+    if cfg.fuse == 2 and N.qp1k_on():   # (P1K fill) row 1 decodes; row 3 shares its W stream: it skips the raw records
+        # (s); rows 0, 2 read the other half's stream (GN_QP1RAW1=1: the raw reaches them too)
+        return ("tailm" if r == 1 else "tailms") if pr == 1 else (
+            "tailm0s" if os.environ.get("GN_QP1RAW1") == "1" else "tailm0")
     if cfg.fuse == 0 and pr == 1 and os.environ.get("GN_QMB1"):   # (diag: row 1 reads row 0's W, gen_npu_gemm)
         name = "tailm"
     if cfg.fuse == 0 and pr == 0 and os.environ.get("GN_QMB1") in ("2", "3", "4", "5"):   # (diag: row 0 reads W from row 1)
@@ -469,7 +474,8 @@ def gen(cfg):
         K = 8 * cfg.passes * cfg.ks[0]
         assert K % 1024 == 0 and 32 % cfg.ks[0] == 0, "fuse 2: K a multiple of 1024, ks dividing a super-block"
         N.QF["cfg"] = N.Config(cfg.cols, cfg.nb, (128,), K // 1024, mu=1, fuse=2, kraw=cfg.kraw, fmt=cfg.fmt, rawdma=1)
-        N.QF["wslot"] = N.NP * N.slab(cfg.ks[0])
+        N.QF["wslot"] = N.NP * N.slab(cfg.ks[0]) // (2 if N.qp1k_on() else 1)   # (P1K: a member's W record, one half)
+        N.QF_PORTS = (6, 7) if N.qp1k_on() else (3, 4)   # (P1K: 3 / 4 the pair's tokens, 5 the pair C relay)
     else:
         N.QF["cfg"] = None
     N.QF["rows"] = QROWS
@@ -483,7 +489,7 @@ def gen(cfg):
         if name.startswith("qdec"):
             N.qdec_leaf(L, cfg, None if name == "qdec" else int(name[4:]))
             continue
-        fill = cfg.fuse == 2 and not name.startswith("tailr") and not qdec()
+        fill = cfg.fuse == 2 and not name.startswith("tailr") and not qdec() and (name == "tailm" or not N.qp1k_on())
         N.leaf(L, cfg, "tail", cfg.ks[0], cov=(0,) if fill else None, gate=gate, name=name)
     if qfix():   # (any acquire / release of the dropped ports: the unrolled copies' renamed operands too)
         import re
