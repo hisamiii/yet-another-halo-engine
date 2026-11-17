@@ -170,8 +170,12 @@ def main():
         ra = np.concatenate([ra, ra])
     ra.tofile(a_b)
     if QMODE and N.qp1_on():   # (GN_QP1) [col][pass][record] -> [col][half][pass][half record]: each half view contiguous
-        wb_ = rw.view(np.uint8).reshape(cols, passes, 2, -1)
-        rw = np.ascontiguousarray(wb_.transpose(0, 2, 1, 3)).reshape(-1)
+        if N.qp1k_on():   # (P1K) [col][pass][group][K half][half slab] -> [col][K half][pass][group][half slab]
+            wb_ = rw.view(np.uint8).reshape(cols, passes, N.NP, 2, -1)
+            rw = np.ascontiguousarray(wb_.transpose(0, 3, 1, 2, 4)).reshape(-1)
+        else:
+            wb_ = rw.view(np.uint8).reshape(cols, passes, 2, -1)
+            rw = np.ascontiguousarray(wb_.transpose(0, 2, 1, 3)).reshape(-1)
     rw.tofile(w_b)
     np.zeros(sc // 4, np.float32).tofile(c_b)
     co = os.path.join(work, "c_out.bin")
@@ -276,7 +280,7 @@ def main():
         k1 = k0 + 8 * gp * sum(ks)
         part = unpack_c(raw, cols, nb, len(grp), g)
         ref = value(a[:, k0:k1]) @ (value(w[:, k0:k1]) if wq is None else wq[:, k0:k1]).T
-        if os.environ.get("GN_QMB1") in ("2", "5"):   # (diag) row 1's tokens (second half) see their column halves swapped
+        if os.environ.get("GN_QMB1") in ("2", "5") and not N.qp1k_on():   # (diag) row 1's column halves swapped
             R_ = int(os.environ.get("NPU_QROWS", "2"))
             tb, nbr_ = N.TM, nb // R_
             # (a block's row: the pair relay interleaves a pair's blocks, else row r holds blocks r nbr ..)
@@ -308,6 +312,15 @@ def main():
                         rc_ = ref[:, N.TN * c:N.TN * (c + 1)]
                         i0 = bad[0]
                         print("  first bad:", i0.tolist(), "got", pc_[i0[0], i0[1]], "want", rc_[i0[0], i0[1]])
+                        if os.environ.get("NPU_SRCMAP"):   # (diag) which reference column's values this column holds
+                            fin_ = np.isfinite(pc_)
+                            near = [float(np.mean(np.isclose(pc_[fin_], ref[:, N.TN * c2:N.TN * (c2 + 1)][fin_], rtol=1e-2)))
+                                    for c2 in range(cols)]
+                            print(f"  finite {fin_.mean():.3f}; share matching ref column:", [f"{v:.2f}" for v in near])
+                            okm = (ec <= 0.501).reshape(nb, N.MP, 16, N.NP, 16).mean(axis=(0, 2, 4))
+                            fim = np.isfinite(pc_).reshape(nb, N.MP, 16, N.NP, 16).mean(axis=(0, 2, 4))
+                            print("  good share per sub-tile [slab][group]:", np.round(okm, 2).tolist())
+                            print("  finite share per sub-tile [slab][group]:", np.round(fim, 2).tolist())
         k0 = k1
     got = unpack_c(raw, cols, nb, len(grp))
     exact = a.astype(np.float64) @ (w.astype(np.float64) if wq is None else wf).T

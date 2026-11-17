@@ -267,8 +267,16 @@ def qp1_on():
     half of every W record (column groups 0 .. NP / 2 - 1 in row 0, the rest in row 1, written by that core's own W
     DMA); the other half is read through the neighbour window, the two cores taking turns per half (MB2's tokens)."""
     on = os.environ.get("GN_QP1") == "1"
-    assert not on or (os.environ.get("GN_QMB1") == "5" and NP % 2 == 0), "GN_QP1 needs GN_QMB1=5, NP even"
+    assert not on or (os.environ.get("GN_QMB1") == "5" and (NP % 2 == 0 or qp1k_on())), "GN_QP1 needs GN_QMB1=5, NP even"
     return on
+
+
+def qp1k_on():
+    """GN_QP1K=1 (with GN_QP1): P1 split by K, not by column groups (any NP, e.g. 64x80): each core's W slot holds one
+    K half (128 of a pass's 256) of every group, row r half r % 2; every sub-tile reads its first 16 k steps from row
+    0's memory and the rest from row 1's (one W FIFO restart mid sub-tile). The record halves are per group
+    (npu_gemm_check); no group rotation, so no output column swap."""
+    return os.environ.get("GN_QP1K") == "1"
 
 
 def qpass_wdelta():
@@ -3186,6 +3194,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         # (GN_QWCONT, Q' passes) a row's W blocks sit back to back and a sub-tile pops exactly its 63 lines: the W
         # FIFO runs on into the next sub-tile (no pointer copy, no position reset; only the first fill)
         wcont = qpass and os.environ.get("GN_QWCONT") == "1" and 0 < t < NT
+        p1k_mid = None   # (P1K) the second K half's W base: (scalar base, byte offset)
         if tw == 0 and not (qpass and t == NT):
             wp, wsrc = [], ("%qw0a" if qpass and cfg.passes % 2 else "%w")
         else:   # (qpass: from the carried W slot, the next row's at t = NT)
@@ -3198,7 +3207,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             # row 0 owns groups 0, 1, row 1 groups 2, 3; row 1 visits its groups rotated by NP / 2, so at any sub-tile the two
             # cores read different memories; the other half through the neighbour window. Row 1's output column halves swap.)
             mb3 = os.environ.get("GN_QMB1") == "3"   # (=3: every W pop from the other row's memory, no rotation)
-            rot = name == "tailm" and os.environ.get("GN_QMB1") in ("2", "5")   # (=4: the split halves, no rotation)
+            rot = name == "tailm" and os.environ.get("GN_QMB1") in ("2", "5") and not qp1k_on()   # (=4: no rotation)
             g = (tw + (NP // 2 if rot else 0)) % NP
             own = (g < NP // 2) == (name == "tailm0") and not mb3
             d = 0 if own else (0x60000 - 0x70000 if name == "tailm0" else 0x40000 - 0x70000)
@@ -3207,7 +3216,16 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                   f"  %{x}mbk = mov.i32 {(g % (NP // 2) if qp1_on() else g) * slab(ks) + d}", f"  %{x}mbs = add.rr {bs}, %{x}mbk",
                   f"  %{x}w0 = mov.scalar-to-address %{x}mbs"]
             wsrc = f"%{x}w0"
-            if t == 0 and (g % (NP // 2) if qp1_on() else g) == 0 and d == 0:
+            if qp1k_on():   # (P1K) group g's K half 0 sits in row 0's memory, half 1 in row 1's, both at g half;
+                # each core reads its own memory first (GN_QP1K_REV=1: row 1 runs K half 1 first, A too), so the two never
+                # read one memory at once; =0: both in k order (row 1 starts on row 0's memory)
+                dn = 0x60000 - 0x70000 if name == "tailm0" else 0x40000 - 0x70000
+                hs = slab(ks) // 2
+                rev = name == "tailm" and os.environ.get("GN_QP1K_REV", "1") == "1"
+                o0, o1 = (g * hs, g * hs + dn) if name == "tailm0" or rev else (g * hs + dn, g * hs)
+                wp[-3] = f"  %{x}mbk = mov.i32 {o0}"
+                p1k_mid = ("%wc" if t == 0 else bs, o1)   # (t 0: the carried slot; its own base is per entry)
+            elif t == 0 and (g % (NP // 2) if qp1_on() else g) == 0 and d == 0:
                 wp, wsrc = [], "%w"
         asrc, ap = "%pa", []
         # spa: a distinct opaque zero per sub-tile (outer counter >> 8 + t) keeps the conversions from being merged
@@ -3225,6 +3243,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             ap = (["  rel %one, 0"] if t > 0 else []) + ["  acq %am1, 0"] + ap
         if qrow and t == NT:   # (qrow) the next row's sub-tile 0: slab pointer from a_next, locks placed below
             asrc, ap = "%pan", []
+        p1k_a = None   # (P1K, row 1 reversed) the slab start as a scalar: A starts at its K half 1, restarts there
+        if p1k_mid and name == "tailm" and os.environ.get("GN_QP1K_REV", "1") == "1":
+            p1k_a = f"%{x}zra"
+            ap = ap + [f"  %{x}zra = mov.address-to-scalar {asrc}", f"  %{x}zrk = mov.i32 {slab(ks) // 2}",
+                       f"  %{x}zrs = add.rr %{x}zra, %{x}zrk", f"  %{x}zre = mov.scalar-to-address %{x}zrs"]
+            asrc = f"%{x}zre"
         positions = [f"  %{x}qa = mova.fifo.position 0", f"  %{x}qw = mova.fifo.position 0"]
         # the tail is one pointer short for early W derivation (it has slack)
         early = (wp + positions) if not tail and t > 0 else []
@@ -3252,6 +3276,28 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 if i % 2 == 0:
                     continue
                 n += 1
+                if p1k_mid and n == ks:   # (P1K) the W FIFO restarts on the other memory's K half: base early,
+                    # pointer copy (eps budget 2: after the half's last pop), position and fill ahead of the next pop
+                    assert ks % 8 == 0, "P1K: the restart on a refill boundary"
+                    early_ = [f"  %{x}mk = mov.i32 {p1k_mid[1]}", f"  %{x}ms = add.rr {p1k_mid[0]}, %{x}mk",
+                              f"  %{x}mw = mov.scalar-to-address %{x}ms"]
+                    if p1k_a:   # (row 1 reversed) A restarts at the slab start
+                        early_.append(f"  %{x}zrm = mov.scalar-to-address {p1k_a}")
+                    for j, ln_ in enumerate(early_):
+                        units[-12 + 2 * j].append(ln_)
+                    carry = []
+                    if p1k_a:
+                        carry = [f"  %{x}paM = copy %{x}zrm : reg<aie2p.ep> -> reg<aie2p.eps>", f"  %{x}qaM = mova.fifo.position 0",
+                                 f"  %{x}paM1, %{x}faM1, %{x}qaM1 = vlda.fill.512 %{x}paM, {st['fa']}, %{x}qaM"]
+                        st["pa"], st["fa"], st["qa"] = f"%{x}paM1", f"%{x}faM1", f"%{x}qaM1"
+                    else:
+                        fa_ = f"  %{x}rpaM, %{x}rfaM, %{x}rqaM = vlda.fill.512 {st['pa']}, {st['fa']}, {st['qa']}"
+                        st["pa"], st["fa"], st["qa"] = f"%{x}rpaM", f"%{x}rfaM", f"%{x}rqaM"
+                        units[-1].append(fa_)
+                    carry += [f"  %{x}pwM = copy %{x}mw : reg<aie2p.ep> -> reg<aie2p.eps>", f"  %{x}qwM = mova.fifo.position 0",
+                              f"  %{x}pwM1, %{x}fwM1, %{x}qwM1 = vldb.fill.512 %{x}pwM, {st['fw']}, %{x}qwM"]
+                    st["pw"], st["fw"], st["qw"] = f"%{x}pwM1", f"%{x}fwM1", f"%{x}qwM1"
+                    continue
                 if n % 8 == 0 and n < 2 * ks:   # FIFO refill: pops fetch 512 bits and consume 576
                     fills = []
                     for ln2, kk2 in (("a", "a"), ("w", "b")):
@@ -3540,7 +3586,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             lat += ["  %mcd = mov.modifier %cdel"] + ([] if qpass else ["  %cdl = mul %cdel, %nf", "  %mcdl = mov.modifier %cdl"])
         lat += ["  %mpn = add.rr %mp, %one", "  %nxm = lt %mpn, %nmp"]
         if qpass:   # the W slot: acquired at a pass end if a row follows; the next row's slot (pass parity)
-            lat += ["  %wwa = mul %wrap, %nxm"] + div_mp("%mpn", "%qpq", "qpd") + [
+            assert (qw4_deltas()[0] if qw4_on() else qpass_wdelta()) % 512 == 0, "W slot delta: a multiple of 512"
+            lat +=["  %wwa = mul %wrap, %nxm"] + div_mp("%mpn", "%qpq", "qpd") + [
                     *(["  %qpqw = add.rr %qpq, %qwp", "  %qppn = and %qpqw, %one"] if cfg.passes % 2 else
                       ["  %qppn = and %qpq, %one"]), f"  %qwda = mova.i32 {(qw4_deltas()[0] if qw4_on() else qpass_wdelta()) // 512}",
                     "  %qwd = mul %k512, %qwda", "  %qwo = mul %qppn, %qwd"]
@@ -4337,7 +4384,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         live = sorted(n for n in uses - defs if n in edefs or n in hv) + ["%more"]
 
         def qkind(n):
-            if n in ("%mp", "%more", "%wc"):
+            if n in ("%mp", "%more", "%wc") or re.match(r"%s0z", n):   # (%s0z*: P1K's slab-start scalar)
                 return "reg<aie2p.er>"
             if n in ("%pa", "%po", "%pl"):
                 return "reg<aie2p.ep>"

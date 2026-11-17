@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:00:00 +0100
+Subject: [PATCH] loom : place merged egress rings low on request
+
+LOOM_EXP_MERGE_RING_LOW=1: a panel wider than the free banks starts behind the rings (64x80 at K 5120).
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2959,7 +2959,12 @@
+     const uint32_t bank_capacity =
+         resources->facts->memory.local_capacity / bank_count;
+     const uint32_t bytes = (uint32_t)record_count * channel->record_byte_length;
+-    for (uint32_t b = bank_count; b-- > 0;) {
++    // Experimental LOOM_EXP_MERGE_RING_LOW: the lowest bank instead, so a
++    // panel wider than the free banks can start behind the rings and span up.
++    const char* ring_low = getenv("LOOM_EXP_MERGE_RING_LOW");
++    const bool low = ring_low != NULL && atoi(ring_low) != 0;
++    for (uint32_t i = 0; i < bank_count; ++i) {
++      const uint32_t b = low ? i : bank_count - 1u - i;
+       const uint32_t cursor = (uint32_t)iree_host_align(
+           resources->bank_cursors[b], LOOM_AIE2P_ARRAY_CHANNEL_STORAGE_ALIGNMENT);
+       if (cursor + bytes > bank_capacity) continue;
