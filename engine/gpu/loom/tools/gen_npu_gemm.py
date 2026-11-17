@@ -1601,6 +1601,7 @@ def qf_skip_raw(e, cfg):
     e("^rzgo:")
 
 
+CRMID = [0]   # (C relay chain) the leaf's middle row (leaf header -> its end), 0: none
 QODS_EARLY = [False]   # (row 1 split: %qods declared ahead of its fill, qf_split_r1)
 
 
@@ -2275,6 +2276,16 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e(f"  %o{rs} = resource<native_pointer> {{index = 2, source_type = buffer}} : reg<aie2p.ep>")
     if pair:
         pair_park(e)
+    crmid = int(name[5]) if QF.get("crelmid") and name[:5] == "tailr" and name[5:6].isdigit() else 0
+    CRMID[0] = crmid
+    if crmid:   # (C relay chain, a middle row) the next row's C ring and this core's, parked for crel_copy
+        e(f"  %crb{rs} = resource<native_pointer> {{index = {QF['crelmid']}, source_type = buffer}} : reg<aie2p.ep>")
+        e("  %crst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+        e("  %crstp = storage_address %crst : low.storage<private> -> reg<aie2p.ep>")
+        e(f"  %crx0 = mov.address-to-scalar %crb{rs}")
+        e("  st %crx0, %crstp, 0")
+        e(f"  %crx4 = mov.address-to-scalar %o{rs}")
+        e("  st %crx4, %crstp, 4")
     early = fills   # the decoding fill first: nothing of the GEMM's lives across the decoder
     if gate:   # job state (private storage, zeroed by the setup): the first job's gate before any firing
         e("  %gst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
@@ -2702,14 +2713,14 @@ def gate_first(e, cfg, gate, gn):
     e("^gfgo:")
 
 
-def crel_copy(e, port):
+def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     """(Q' C relay) the firing's end on row 0: row 1's MP C segments (its ring, through the north window) copied into
     this core's C ring after its own, so its C stream carries block 2 f, then block 2 f + 1. The pointers come back
     from fuse2_entry's parking word. A segment is the slot's first 2 KB (the peeled pass's bf16)."""
     cs = [int(v) for v in QA4_RING_AT.split(",")[0].split("@")[1].split(":")]
     assert QA4_RING_AT.startswith("2048@") and len(cs) == MP and qa4_on() and qpeel_on() and not qalt_on()
-    e("  %crG = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
-    e("  %crol = lda %crG, 0")
+    e(f"  %crG = storage_address {own[0]} : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  %crol = lda %crG, {own[1]}")
     e("  %cro = mov.scalar-to-address %crol")
     e("  %crS = storage_address %crst : low.storage<private> -> reg<aie2p.ep>")
     e("  %crrl = lda %crS, 0")
@@ -2717,7 +2728,7 @@ def crel_copy(e, port):
     e("  %crm1 = mova.i32 -1")
     e("  %cr1 = mova.i32 1")
     e("  %crz = mova.i32 0")
-    e(f"  %crK = mova.i32 {MP}")
+    e(f"  %crK = mova.i32 {nseg or MP}")
     assert all(b - a == 2048 for a, b in zip(cs, cs[1:])), cs   # (a segment's post-increments end at the next slot)
     # (a loop over the segments, its counter stepped in the header: no hardware loop candidate, so
     # LOOM_EXP_HWLOOP_TRIP's '@' counts stay the GEMM's)
@@ -2740,7 +2751,19 @@ def crel_copy(e, port):
         e(f"  %crq_{i + 1} = vst.acc.post %crv_{i}, %crq_{i}, 64")
     e("  rel %cr1, 2")
     e(f"  rel %cr1, {port}")
-    e("  low.br ^crl(%crin: reg<aie2p.er>, %crp_32: reg<aie2p.ep>, %crq_32: reg<aie2p.ep>)")
+    if (nseg or MP) > MP:   # (a chain: both rings wrap every MP segments)
+        assert MP & (MP - 1) == 0
+        e(f"  %crwm = mova.i32 {MP - 1}")
+        e("  %crw = and %crin, %crwm")
+        e("  %crwz = eqz %crw")
+        e(f"  %crwk = mov.i32 {-MP * 2048}")
+        e("  %crwo = mul %crwz, %crwk")
+        e("  %crwmd = mov.modifier %crwo")
+        e("  %crpw = padda.modifier %crp_32, %crwmd")
+        e("  %crqw = padda.modifier %crq_32, %crwmd")
+        e("  low.br ^crl(%crin: reg<aie2p.er>, %crpw: reg<aie2p.ep>, %crqw: reg<aie2p.ep>)")
+    else:
+        e("  low.br ^crl(%crin: reg<aie2p.er>, %crp_32: reg<aie2p.ep>, %crq_32: reg<aie2p.ep>)")
     e("^crdn:")
 
 
@@ -4315,7 +4338,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
     if fills and not (role == "tail" and qpass_on()):
         e("  rel %one, 1")
     if fills and QF.get("crel"):
-        crel_copy(e, QF["crel"](gate))
+        crel_copy(e, QF["crel"](gate), MP * (QF.get("rows", 2) - 1))
+    elif CRMID[0]:
+        crel_copy(e, QF["crelmid"], MP * (QF["rows"] - 1 - CRMID[0]), own=("%crst", 4))
     if gate:
         gate_count(L.append, cfg, gate)
         e("}\n")

@@ -130,7 +130,7 @@ def main():
     bindings = [a_b, w_b, c_b]
     if cfg.gate:   # flag (ready = the first job's GATE_CALLS + 1 call), tick, signal (go, done)
         g_b = [os.path.join(work, n) for n in ("flag.bin", "tick.bin", "sig.bin")]
-        np.array([N.GATE_CALLS + 1, 0, 0, 0], np.uint32).tofile(g_b[0])
+        np.array([N.GATE_CALLS + max(1, int(os.environ.get('NPU_RUN_GATED') or 1)), 0, 0, 0], np.uint32).tofile(g_b[0])
         np.zeros(cfg.gate * 4, np.uint32).tofile(g_b[1])
         np.zeros(8, np.uint32).tofile(g_b[2])
         bindings += g_b
@@ -171,7 +171,13 @@ def main():
     if N.QCYC:   # (diag) each segment's first word: core cycles since the first firing; per M block: its last segment's
         seg = N.NP * 256 * 2   # bytes of one bf16 segment (NP sub-tiles of 16 x 16)
         cyc = np.fromfile(co, np.uint32)[::seg // 4].astype(np.int64)
-        last = cyc.reshape(cols, nb, N.MP)[0, :nb // int(os.environ.get("NPU_QROWS", "1")), -1]   # (core 0, row 0)
+        R_ = int(os.environ.get("NPU_QROWS", "1"))
+        rel_ = R_ >= 2 and os.environ.get("NPU_QCREL", "1") == "1"   # (C relay: row r's blocks r, r + R, ..)
+        last = cyc.reshape(cols, nb, N.MP)[0, ::R_, -1] if rel_ else cyc.reshape(cols, nb, N.MP)[0, :nb // R_, -1]
+        if rel_:
+            for r_ in range(R_):
+                st_ = np.diff(cyc.reshape(cols, nb, N.MP)[0, r_::R_, -1])
+                print(f"  row {r_} (core 0): median {float(np.median(st_)):.0f} min {st_.min()} max {st_.max()}")
         step = np.diff(last)
         mma = passes * N.MP * N.NP * sum(ks) * 4   # MMAs a core issues per M block
         med = float(np.median(step))
