@@ -85,7 +85,10 @@ int main(int argc, char** argv) {
     for (int i = 0, n = rep ? std::max(1, std::atoi(rep)) : 1; i < n; ++i) {
       const auto t0 = std::chrono::steady_clock::now();
       if (const char* spec = std::getenv("YAH_NPU_PROF")) {   // the counters (NpuProf spec c0,c1,c2,c3/m0,m1)
-        const std::vector<std::uint32_t> v = npu.RunOnceProf(image, entry, views);
+        const std::vector<std::uint32_t> v =   // (NPU_RUN_GATED=<calls>: one gated job of that many calls)
+            std::getenv("NPU_RUN_GATED")
+                ? npu.RunGatedOnce(image, entry, views, std::max(1, std::atoi(std::getenv("NPU_RUN_GATED"))))
+                : npu.RunOnceProf(image, entry, views);
         std::printf("npu_run: prof events %s\n", spec);
         std::size_t at = 0;
         for (std::uint32_t c = 0; c < columns; ++c)

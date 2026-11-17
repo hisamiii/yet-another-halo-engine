@@ -360,7 +360,9 @@ class LoomNpu {
   // (diagnosis, run/npu_run NPU_RUN_GATED=<calls>) A gated image's setup, then one job of that many calls on the same
   // views, in one command as FusedCommand builds a job: gate, then call per call (streamed: lead, push[parity], a wait
   // per call, at most two queued), done. The flag binding must already hold the job's ready value.
-  void RunGatedOnce(const std::string& path, const std::string& entry, const std::vector<View>& views, int calls) {
+  // With YAH_NPU_PROF: the counters' setup before the job's ops, their READ_REGS after; returns their values.
+  std::vector<std::uint32_t> RunGatedOnce(const std::string& path, const std::string& entry,
+                                          const std::vector<View>& views, int calls) {
     Kernel& k = Load(path, entry, views, true);
     program_.Forget();
     ++epoch_;
@@ -383,18 +385,30 @@ class LoomNpu {
                  k.streamed ? "streamed" : "plain", k.depth, calls, seq.size());
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
-    for (const std::vector<std::uint8_t>* b : seq) {
+    // (diag) NPU_PROF_AT=<i>: the counters start before the job's i-th piece (0 the gate, 1 the lead push, ...)
+    const std::size_t prof_at = std::getenv("NPU_PROF_AT") ? std::atoi(std::getenv("NPU_PROF_AT")) : 0;
+    for (std::size_t s = 0; s < seq.size(); ++s) {
+      const std::vector<std::uint8_t>* b = seq[s];
       std::uint32_t n = 0, size = 0;
       std::memcpy(&n, b->data() + 8, 4), std::memcpy(&size, b->data() + 12, 4);
       if (size != b->size()) throw LoomError("npu: unexpected command header");
       if (bytes.empty()) bytes.assign(b->begin(), b->begin() + 16);
+      if (s == prof_at) {
+        if (prof_) {
+          const std::vector<std::uint8_t>& setup = prof_->Setup(path);
+          bytes.insert(bytes.end(), setup.begin(), setup.end());
+          ops += prof_->SetupOps();
+        }
+      }
       bytes.insert(bytes.end(), b->begin() + 16, b->end());
       ops += n;
     }
+    if (prof_) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(Place(bytes)), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(job)");
     CheckHealth();
+    return prof_ ? prof_->Finish(1) : std::vector<std::uint32_t>{};
   }
   // RunOnce with the AIE counters (YAH_NPU_PROF): the image's first command with the counters' setup before its ops
   // and their READ_REGS after them. Returns the run's NpuProf values (one job; run/npu_run).
