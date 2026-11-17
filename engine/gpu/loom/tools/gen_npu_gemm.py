@@ -138,6 +138,7 @@ QF_PORTS = (3, 4)   # a Q' filler's egress sender and raw receiver (A 0, W 1, C 
 QF_SLAB = 4         # %fzt words (the tail's parked C ring is word 0): the slab being decoded, the egress record,
 QF_REC = 8          # then the slab outputs' addresses (words 12 .. 24)
 QF_OUT = 12
+QDEC_SPORT, QDEC_RPORT = 3, 5   # (NPU_QDEC, two decoder rows) the second's slab sender, the first's receiver
 QF_OUTS = (19584, 49152, 53760, None)    # slab outputs (4608 B each): C rows after SP, W slot 1 (two), private
 QF_FW = 144         # egress record words: a 16-k-block piece is 4 records
 QF_A13 = {32768: 33920, 36864: 38016}   # A slots 1, 3 (bank 2) past the egress ring at its start: qf_ring_at
@@ -1607,6 +1608,7 @@ def qf_skip_raw(e, cfg):
 
 
 CRMID = [0]   # (C relay chain) the leaf's middle row (leaf header -> its end), 0: none
+CREL0 = [False]       # (leaf: a non-filling row 0 relays row 1's C)
 QODS_EARLY = [False]   # (row 1 split: %qods declared ahead of its fill, qf_split_r1)
 
 
@@ -1751,7 +1753,10 @@ def qf_decode(L, cfg, dp):
     spl = bool(QF.get("split"))
     dec = bool(QF.get("dec"))                       # (a decoder row: its own memory map, qdec_leaf)
     one = spl or dec                                # (a step's raw record holds its slabs side by side)
-    NS = 2 if spl else NP                           # (split: this row's slabs; row 1 decodes the rest)
+    dsp = dec and QF.get("drole") == 0              # (two decoder rows: the first, fed slabs 2-3 by the second)
+    dsnd = dec and QF.get("drole") == 1             # (the second: slabs 2-3 into its sender, no egress)
+    NS = 2 if spl or dsp or dsnd else NP            # (split: this row's slabs; row 1 decodes the rest)
+    pport = QDEC_RPORT if dsp else QF["split"](QF["gate_now"]) if spl else None
     if not spl and not dec:
         e(f"  %fzo3s = storage {{byte_alignment = 64, byte_length = {2 * D.OUT_B}}} : low.storage<private>")
     # the slab outputs' addresses (from the W ring's first 2048-aligned byte)
@@ -1770,7 +1775,7 @@ def qf_decode(L, cfg, dp):
         e(f"  st %fzq2, %fzpT, {QF_OUT + 8}")
         e("  %fzq3 = lda %fzqG, 4")
         e(f"  st %fzq3, %fzpT, {QF_OUT + 12}")
-    for i, off in enumerate(QF_OUTS[:NS]):
+    for i, off in enumerate(QF_OUTS[:0 if dsnd else NS]):   # (dsnd, dsp's slabs 2-3: qdec_leaf)
         if dec:   # (the decoder's outputs: one private block, 2 OUT_B a slab)
             e(f"  %fzop{i} = storage_address %dqo : low.storage<private> -> reg<aie2p.ep>")
             e(f"  %fzoq{i} = mov.address-to-scalar %fzop{i}")
@@ -1801,6 +1806,9 @@ def qf_decode(L, cfg, dp):
     if one:   # (a step's raw record: one acquire)
         e("  %fzAs = mova.i32 -1")
         e(f"  acq %fzAs, {rawport}")
+    if dsnd:   # (the sender's slot: one record a step)
+        e("  %fzAd = mova.i32 -1")
+        e(f"  acq %fzAd, {QDEC_SPORT}")
     e("  %fzH0 = mova.i32 0")
     e("  %fzpT1 = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
     e(f"  st %fzH0, %fzpT1, {QF_SLAB}")
@@ -1850,7 +1858,11 @@ def qf_decode(L, cfg, dp):
         e(f"  %fzo_in = mov.i32 {IN}")
     if one:   # (slab s: 4 s raw words a row on)
         e(f"  %fzsk = mov.i32 {4 * QF['raww']}")
-        e("  %fzso = mul %fzhv, %fzsk")
+        if dsnd:   # (slabs 2, 3)
+            e("  %fzhv2 = add %fzhv, 2")
+            e("  %fzso = mul %fzhv2, %fzsk")
+        else:
+            e("  %fzso = mul %fzhv, %fzsk")
         e("  %fza_in0 = add.rr %fzsb, %fzo_in")
         e("  %fza_in = add.rr %fza_in0, %fzso")
     else:
@@ -1910,9 +1922,14 @@ def qf_decode(L, cfg, dp):
     e("  low.br ^fzh")
     # the step's egress: records r = 0 .. 31: piece r / 4 (pass r / 16 of the step's two, slab r / 4 % 4), part r % 4
     e("^fzhx:")
-    if spl:   # (row 1's slabs 2, 3 of the step)
+    if dsnd:   # (the step's slabs to the first decoder; no egress)
+        e("  %fzqd = mova.i32 1")
+        e(f"  rel %fzqd, {QDEC_SPORT}")
+        e("  low.br ^fzex")
+    hx0 = len(L)
+    if spl or dsp:   # (row 1's slabs 2, 3 of the step)
         e("  %fzqa = mova.i32 -1")
-        e(f"  acq %fzqa, {QF['split'](QF['gate_now'])}")
+        e(f"  acq %fzqa, {pport}")
     if QFCYC:
         e("  %qfphx = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
         e("  %qfwhx = mov.cycles")
@@ -1965,10 +1982,12 @@ def qf_decode(L, cfg, dp):
     e("  %fzr1 = add.rr %fzr2, %fzE1")
     e(f"  st %fzr1, %fzpE2, {QF_REC}")
     e("  low.br ^fze")
+    if dsnd:
+        del L[hx0:]
     e("^fzex:")
-    if spl:   # (row 1 may overwrite them)
+    if spl or dsp:   # (row 1 may overwrite them)
         e("  %fzqr = mova.i32 1")
-        e(f"  rel %fzqr, {QF['split'](QF['gate_now'])}")
+        e(f"  rel %fzqr, {pport}")
     if QFCYC:
         e("  %qfpex = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
         e("  %qfwex = mov.cycles")
@@ -1996,15 +2015,23 @@ def qf_decode(L, cfg, dp):
     e("  low.br ^fzgemm")
 
 
-def qdec_leaf(L, cfg):
+def qdec_leaf(L, cfg, role=None):
     """(Q' NPU_QDEC) a decoder row's leaf: per firing (one a call) its column's whole panel decoded from its raw ring
-    (port QF_PORTS[1], a step's record a slot) into private outputs and egressed (port QF_PORTS[0]) into the panel."""
+    (port QF_PORTS[1], a step's record a slot) into private outputs and egressed (port QF_PORTS[0]) into the panel.
+    role 0 / 1 (two decoder rows): 0 decodes slabs 0-1 and egresses all 4, slabs 2-3 from 1's channel (QDEC_RPORT);
+    1 decodes slabs 2-3 straight into its sender (QDEC_SPORT), one record a step."""
     e = L.append
     q = QF["cfg"]
     D = decoder(q.fmt, q.gord, q.swiglu)
     dp, rp = QF_PORTS
-    e("low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @qdec() asm {")
-    e(f"  %fzd_r = resource<native_pointer> {{index = {dp}, source_type = buffer}} : reg<aie2p.ep>")
+    nm = "qdec" if role is None else f"qdec{role}"
+    e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{nm}() asm {{")
+    if role != 1:
+        e(f"  %fzd_r = resource<native_pointer> {{index = {dp}, source_type = buffer}} : reg<aie2p.ep>")
+    else:
+        e(f"  %qds_r = resource<native_pointer> {{index = {QDEC_SPORT}, source_type = buffer}} : reg<aie2p.ep>")
+    if role == 0:
+        e(f"  %qdr_r = resource<native_pointer> {{index = {QDEC_RPORT}, source_type = buffer}} : reg<aie2p.ep>")
     e(f"  %raw_r = resource<native_pointer> {{index = {rp}, source_type = buffer}} : reg<aie2p.ep>")
     e("  set.scd-enable 1")
     e("  set.rounding 12")
@@ -2012,19 +2039,35 @@ def qdec_leaf(L, cfg):
     e("  %fzt = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e(f"  %dqa = storage {{byte_alignment = 64, byte_length = {D.SCR_B}}} : low.storage<private>")
     # (A, the outputs, then B: B starts > 16 KB after A, so in another bank: the table's second copy)
-    e(f"  %dqo = storage {{byte_alignment = 64, byte_length = {2 * D.OUT_B * NP}}} : low.storage<private>")
+    ob = 2 * D.OUT_B * (NP if role is None else 2)
+    pad = int(os.environ.get("GN_QDPAD", 64))   # (diag: a full bank's pad does not fit role 1 on columns 4-7)
+    if role != 1:
+        e(f"  %dqo = storage {{byte_alignment = 64, byte_length = {ob + (pad if role is not None else 0)}}} : low.storage<private>")
+    else:
+        e(f"  %dqp = storage {{byte_alignment = 64, byte_length = {pad}}} : low.storage<private>")
     e(f"  %dqb = storage {{byte_alignment = 64, byte_length = {D.SCR2_B}}} : low.storage<private>")
     if QFCYC:
         e("  %qfc = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  %fzps24 = mov.address-to-scalar %raw_r")
     e("  st %fzps24, %fzp, 24")
-    e("  %fzps28 = mov.address-to-scalar %fzd_r")
-    e("  st %fzps28, %fzp, 28")
+    if role != 1:
+        e("  %fzps28 = mov.address-to-scalar %fzd_r")
+        e("  st %fzps28, %fzp, 28")
+    if role is not None:   # the outputs of the slabs not in %dqo: 1's sender (0, 1), the channel's record (2, 3)
+        e("  %fzpTq = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+        e(f"  %fzqb = mov.address-to-scalar {'%qds_r' if role == 1 else '%qdr_r'}")
+        e(f"  %fzqk = mov.i32 {2 * D.OUT_B}")
+        e("  %fzqb1 = add.rr %fzqb, %fzqk")
+        o = QF_OUT if role == 1 else QF_OUT + 8
+        e(f"  st %fzqb, %fzpTq, {o}")
+        e(f"  st %fzqb1, %fzpTq, {o + 4}")
     e(f"  %fzgn0 = mov.i32 {q.passes * FUSE_SB}")
     e("  low.br ^fzdq(%fzgn0: reg<aie2p.er>)")
     QF["gate_now"] = None
+    QF["drole"] = role
     qf_decode(L, q, dp)
+    QF["drole"] = None
     e("^fzgemm:")
     e("  return")
     e("}")
@@ -2350,8 +2393,12 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         pair_park(e)
     crmid = int(name[5]) if QF.get("crelmid") and name[:5] == "tailr" and name[5:6].isdigit() else 0
     CRMID[0] = crmid
-    if crmid:   # (C relay chain, a middle row) the next row's C ring and this core's, parked for crel_copy
-        e(f"  %crb{rs} = resource<native_pointer> {{index = {QF['crelmid']}, source_type = buffer}} : reg<aie2p.ep>")
+    # (C relay, a row 0 that does not fill: NPU_QDEC) row 1's C ring and this core's, parked for crel_copy
+    crel0 = bool(QF.get("crel")) and bool(QF.get("dec")) and not fills and role == "tail" and not name.startswith("tailr")
+    CREL0[0] = crel0
+    if crmid or crel0:   # (C relay chain, a middle row) the next row's C ring and this core's, parked for crel_copy
+        crp = QF["crelmid"] if crmid else QF["crel"](gate)
+        e(f"  %crb{rs} = resource<native_pointer> {{index = {crp}, source_type = buffer}} : reg<aie2p.ep>")
         e("  %crst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
         e("  %crstp = storage_address %crst : low.storage<private> -> reg<aie2p.ep>")
         e(f"  %crx0 = mov.address-to-scalar %crb{rs}")
@@ -2374,7 +2421,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         fuse_prologue(L, cfg, role, ks, cov, helper, gate)
     elif split_r1:
         qf_split_r1(L, cfg)
-    elif QF["cfg"] is not None and name.startswith("tailr"):
+    elif QF["cfg"] is not None and name.startswith("tailr") and not QF.get("dec"):
         qf_skip_raw(e, cfg)
     if early:   # (fuse2_entry)
         e("  %fzpL = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
@@ -4455,6 +4502,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         crel_copy(e, QF["crel"](gate), MP * (QF.get("rows", 2) - 1))
     elif CRMID[0]:
         crel_copy(e, QF["crelmid"], MP * (QF["rows"] - 1 - CRMID[0]), own=("%crst", 4))
+    elif CREL0[0]:
+        crel_copy(e, QF["crel"](gate), MP * (QF.get("rows", 2) - 1), own=("%crst", 4))
     if gate:
         gate_count(L.append, cfg, gate)
         e("}\n")
