@@ -150,12 +150,37 @@ _QFRAW2 = os.environ.get("GN_QFRAW2", "1") == "1"
 # raw: intake slots, 9216 B apart (GN_QFRAW2=1, the default: 2, slot 1 over the scratch %qods, time-disjoint). SP then
 # leaves bank 2 (slot 1 ends at 18432): 26112, bank 3 past Loom's stack (at the bank cursor, 25088: SP 25088 gave wrong
 # output); gated one-call fill 288K -> 264K. 49664 / 60992 cost +50K / +32K (banks shared with SP2).
-QF_P1KD = dict(sp=int(os.environ.get("GN_QFSP", "26112" if _QFRAW2 else "16896")), sp2=53760, egr=40448, rec=2304,
-               slots=4, raw=2 if _QFRAW2 else 1)
+_QFKH = os.environ.get("GN_QFKH") == "1"   # (the K-half split: one record a raw record, a 4 x 1152 B ring off the C ring)
+QF_P1KD = dict(sp=int(os.environ.get("GN_QFSP", "26112" if _QFRAW2 else "16896")), sp2=53760,
+               egr=49152 if _QFKH else 40448, rec=1152 if _QFKH else 2304, slots=4, raw=2 if _QFRAW2 else 1)
 
 
 def qfdirect_on():
     return qp1k_on() and QF["cfg"] is not None and os.environ.get("GN_QFDIRECT", "1") == "1"
+
+
+def qfkh_on():
+    """GN_QFKH=1 (P1K direct fill): the K-half split: rows 0 and 1 decode (tailm0d, tailm), each one K half of every
+    super-block (record h, h = row) into its own panel (rows h, h + 2) through its own egress lane."""
+    return qfdirect_on() and os.environ.get("GN_QFKH") == "1"
+
+
+QF_HALF = [None]   # (GN_QFKH) the leaf's K half
+
+
+def qfhalf():
+    """GN_QFHALF=h (P1K direct fill, diag): the decoder takes record h of each super-block only (K half h; None:
+    both); GN_QFKH: the leaf's half."""
+    if QF_HALF[0] is not None:
+        return QF_HALF[0]
+    v = os.environ.get("GN_QFHALF")
+    return int(v) if v and qfdirect_on() else None
+
+
+def qfraw4_on():
+    """GN_QFRAW4=1 (P1K direct fill): a raw record holds a slab's 4 super-blocks a row (one 576 B DRAM read a row,
+    25 records a call, not 100 of 144 B reads); the decoder takes each record's 4 passes in turn."""
+    return qfdirect_on() and os.environ.get("GN_QFRAW4") == "1"
 QF_FW = 144         # egress record words: a 16-k-block piece is 4 records
 QF_A13 = {32768: 33920, 36864: 38016}   # A slots 1, 3 (bank 2) past the egress ring at its start: qf_ring_at
 
@@ -1368,7 +1393,7 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
         if i == 0 and gate:   # (a call's first firing: the check costs once per call)
             e("  %gsp0 = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
             gate_first(e, cfg, gate, "%gn1_r")
-        e(f"  %fzgn{i} = mov.i32 {len(g) * (FUSE_SB if q is not None else NP)}")   # (Q': super-block steps)
+        e(f"  %fzgn{i} = mov.i32 {len(g) * ((1 if qfraw4_on() else FUSE_SB) if q is not None else NP)}")   # (Q': super-block steps)
         e(f"  low.br ^fzdq(%fzgn{i}: reg<aie2p.er>)")
     if q is not None:
         QF["gate_now"] = gate   # (the split channel's port)
@@ -1787,7 +1812,9 @@ def qf_split_r1(L, cfg):
         e(f"  %dq_{nm} = mov.scalar-to-address %rza_{nm}")
     ren = lambda m: m.group(0) if m.group(2) in ("fzs", "fzt") else m.group(1) + "dq_" + m.group(2)
     for ln in ([] if os.environ.get("GN_QFNODEC") else
-               D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll))):
+               D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll),
+                             vroll=os.environ.get("GN_QFVROLL") == "1",   # (diag: the halves rolled, program memory)
+                             rec=(lambda h: (h, h + 1) if h is not None else None)(qfhalf()))):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     e("  %rzpn = storage_address %rzs : low.storage<private> -> reg<aie2p.ep>")
@@ -1919,6 +1946,19 @@ def qf_decode(L, cfg, dp):
     if not one:
         e("  %fzAm1 = mova.i32 -1")
         e(f"  acq %fzAm1, {rawport}")
+    raw4 = qfraw4_on()
+    if raw4:   # (the record's 4 passes: %fzt word QF_REC counts them)
+        e("  %fzJ0 = mova.i32 0")
+        e("  %fzpJ0 = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+        e(f"  st %fzJ0, %fzpJ0, {QF_REC}")
+        e("  low.br ^fzj")
+        e("^fzj:")
+        e("  %fzpJ = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+        e(f"  %fzjv = lda %fzpJ, {QF_REC}")
+        e(f"  %fzj4 = mova.i32 {FUSE_SB}")
+        e("  %fzjm = lt %fzjv, %fzj4")
+        e("  low.cond_br %fzjm, ^fzjb, ^fzjx : reg<aie2p.er>")
+        e("^fzjb:")
     if direct:   # (the slab's two egress records)
         e("  %fzAd2 = mova.i32 -2")
         e(f"  acq %fzAd2, {dp}")
@@ -1967,9 +2007,17 @@ def qf_decode(L, cfg, dp):
             e("  %fzrpd = and %fzrcd, %fzrk1")
             e(f"  %fzrkb = mov.i32 {16 * D.RECROW}")
             e("  %fzrod = mul %fzrpd, %fzrkb")
-            e("  %fza_in = add.rr %fza_in0d, %fzrod")
-            e("  %fzrcn = add %fzrcd, 1")
-            e(f"  st %fzrcn, %fzpTd, {QF_OUT}")
+            if raw4:   # (pass j's super-block: BLK bytes on in each row; the count steps after the record)
+                e("  %fzpJi = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+                e(f"  %fzjvi = lda %fzpJi, {QF_REC}")
+                e(f"  %fzjkb = mov.i32 {D.BLK}")
+                e("  %fzjo = mul %fzjvi, %fzjkb")
+                e("  %fza_in0j = add.rr %fza_in0d, %fzjo")
+                e("  %fza_in = add.rr %fza_in0j, %fzrod")
+            else:
+                e("  %fza_in = add.rr %fza_in0d, %fzrod")
+                e("  %fzrcn = add %fzrcd, 1")
+                e(f"  st %fzrcn, %fzpTd, {QF_OUT}")
         else:
             e("  %fza_in = add.rr %fzsb, %fzo_in")
     if dec:
@@ -1992,14 +2040,21 @@ def qf_decode(L, cfg, dp):
         e("  %fzslo = and %fzcno, %fzk3o")
         e(f"  %fzkbo = mov.i32 {m_['rec']}")
         e("  %fzofo = mul %fzslo, %fzkbo")
-        e("  %fza_out = add.rr %fzdlo, %fzofo")
+        if qfhalf():   # (record h only: written at out + h OUT_B)
+            e(f"  %fzofh = mov.i32 {-qfhalf() * D.OUT_B}")
+            e("  %fzofo2 = add.rr %fzofo, %fzofh")
+            e("  %fza_out = add.rr %fzdlo, %fzofo2")
+        else:
+            e("  %fza_out = add.rr %fzdlo, %fzofo")
     else:
         e(f"  %fza_out = lda %fzpOa, {QF_OUT}")
     for nm in ("sp", "in", "sp2", "out"):
         e(f"  %dq_{nm} = mov.scalar-to-address %fza_{nm}")
     ren = lambda m: m.group(0) if m.group(2) in ("fzs", "fzt") else m.group(1) + "dq_" + m.group(2)
     for ln in ([] if os.environ.get("GN_QFNODEC") else   # (diag: no decoder, every lock and egress kept)
-               D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll))):
+               D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll),
+                             vroll=os.environ.get("GN_QFVROLL") == "1",   # (diag: the halves rolled, program memory)
+                             rec=(lambda h: (h, h + 1) if h is not None else None)(qfhalf()))):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if direct:   # the slab's records to the egress DMA
@@ -2009,6 +2064,17 @@ def qf_decode(L, cfg, dp):
         e("  %fzend = lda %fzpWd, 8")
         e("  %fzend2 = add %fzend, 2")
         e("  st %fzend2, %fzpWd, 8")
+    if raw4:   # the next pass of the record; after its 4th, the intake count steps
+        e("  %fzpJn = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+        e(f"  %fzjn0 = lda %fzpJn, {QF_REC}")
+        e("  %fzjn = add %fzjn0, 1")
+        e(f"  st %fzjn, %fzpJn, {QF_REC}")
+        e("  low.br ^fzj")
+        e("^fzjx:")
+        e("  %fzpTx = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+        e(f"  %fzrcx = lda %fzpTx, {QF_OUT}")
+        e("  %fzrcxn = add %fzrcx, 1")
+        e(f"  st %fzrcxn, %fzpTx, {QF_OUT}")
     # the raw slot back to the DMA, but for the call's last record (the panel's W records follow it)
     e("  %fzpQ = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  %fzuQ = lda %fzpQ, 12")
@@ -2496,8 +2562,10 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     full_name = name
     name = name[:-3] if name.endswith(("_gw", "_gr")) and gate else name   # (the gate role rides in gate)
     skp1 = name in ("tailm0s", "tailms")   # (P1K fill) a P1 leaf that skips the raw records: its pair role without the s
-    name = name[:-1] if skp1 else name
+    dfill = name == "tailm0d"   # (GN_QFKH) row 0: tailm0 that decodes K half 0
+    name = name[:-1] if skp1 or dfill else name
     fills = cov is not None
+    QF_HALF[0] = (0 if dfill else 1) if fills and qfkh_on() else None
     lk = "" if tail and os.environ.get("GN_QUNLOCK") else "schedule(locked) "   # (probe: Loom's scheduler orders it)
     e(f"low.func.def {lk}target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{full_name}() asm {{")
     split_r1 = QF["cfg"] is not None and bool(QF.get("split")) and name.startswith("tailr")   # (row 1 decodes too)
