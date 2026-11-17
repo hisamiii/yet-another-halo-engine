@@ -82,11 +82,14 @@ Q_ENV = dict(GN_QFLOAT="1", GN_QWCONT="1", GN_QLOCK="1", GN_QPASS="1", GN_QBANK=
 # its egress ring, the vertical pairs share W by K half (GN_QP1K), each pair's row 0 relays row 1's C and the column's
 # memory tile merges the two pair streams (A, C in token order, gen_npu_q.mrel). 11-17: gated run bit-exact on
 # UD-IQ4_XS rows, 67K cycles a 64-token block (76% MMA share), the first block of a 2048-token call at ~364K.
+# 11-17 night: K-half split (GN_QFKH: rows 0 / 1 each decode one K half, own egress lane) with the gate's tick and go /
+# done packet-shared on the row 0 egress lanes of columns 1 / 2 (GN_QPSHARE, HRX 0094): real calls qkv 52.6 -> 57.2%,
+# gate 38.7 -> 43.4% MMA busy; pp2048 2682.9 -> 2667.6 ms, bit-exact.
 P1K_NP, P1K_KS, P1K_PASSES = 5, (32,), 20
 P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="2560@37376:40448:43520:46592,11520@0:53760,4608@20480:32768,64@30720",
                GN_QZACC="1", GN_QRELAX="1", GN_QTOK="-6,0,0,10", GN_QDRIP="4", GN_QEMERGE="1", GN_QWDUP="1",
                GN_QCLAZY="1", NPU_QCREL="2", GN_QLOCKA="12,5", GN_QWCONT="0", GN_QPEEL="0", GN_QP1="1", GN_QMB1="5",
-               GN_QP1K="1", GN_QCVL="1")
+               GN_QP1K="1", GN_QCVL="1", GN_QFKH="1", GN_QPSHARE="1")
 P1K_LOOM = dict(LOOM_EXP_RING_AT_FORCE="1", LOOM_EXP_SPACE_AT="scratch@12288", LOOM_EXP_EGRESS_MERGE="1",
                 LOOM_EXP_REPLAY_GROUP="4", LOOM_EXP_MERGE_RING_LOW="1", LOOM_EXP_PANEL_STREAM="1",
                 LOOM_EXP_PANEL_STREAM_SINGLE="1")
@@ -97,6 +100,7 @@ def defaults(p1k=False):
     for k, v in list(P1K_ENV.items() if p1k else ()) + list(Q_ENV.items()):
         os.environ.setdefault(k, v)
     N.ORDER_C = tuple(int(x) for x in os.environ.get("GN_ORDC", "0,2,1,3").split(","))   # (read at import)
+    N.qf_p1kd_layout()   # (read at import too)
 
 
 def loom_env(cfg):
@@ -105,6 +109,8 @@ def loom_env(cfg):
     pins (GN_QBANK; GN_QPINS: the whole list; fuse 2: qf_ring_at)."""
     env = dict(N.loom_env(cfg))
     env.update(LOOM_EXP_NOALIAS_ACC="2", LOOM_EXP_NOWAR_ACC="1")
+    if N.pshare():   # (array_program counted the two channels)
+        env["LOOM_EXP_PACKET_SHARE"] = N.QF["pshare"]
     ks = cfg.ks[0]
     if os.environ.get("GN_QBANK") in ("1", "2", "3"):
         env["LOOM_EXP_RING_AT"] = {"2": N.QBANK2_RING_AT, "3": N.QA4_RING_AT if N.qa4_on() else (N.QCB1_RING_AT if N.qcb1_on() else N.QA3_RING_AT) if N.qa3_on() else N.QBANK3_RING_AT}.get(
@@ -407,19 +413,24 @@ def array_program(L, cfg):
         e(f"  %gpoll = receiver {kw}, {p['waiter']['poll']} : reg<aie2p.array.receiver : tile<4xi32>>")
         e("  %chgp = channel %gf, %gpoll, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
         e("  constrain.core_stream %chgp")
-        e(f"  %gt_all = receiver %tb, 0 : reg<aie2p.array.receiver : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
-        e("  %gt = partition.receiver %gt_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
-        e(f"  %gtick = sender {kw}, {p['waiter']['tick']} : reg<aie2p.array.sender : tile<4xi32>>")
-        e("  %chgt = channel %gtick, %gt, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
-        e("  constrain.core_stream %chgt")
-        e("  constrain.request %chgp, %chgt")
+        if not N.notick():   # (the tick channel: one fresh flag read per tick)
+            e(f"  %gt_all = receiver %tb, 0 : reg<aie2p.array.receiver : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
+            e("  %gt = partition.receiver %gt_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
+            e(f"  %gtick = sender {kw}, {p['waiter']['tick']} : reg<aie2p.array.sender : tile<4xi32>>")
+            e("  %chgt = channel %gtick, %gt, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
+            e("  constrain.core_stream %chgt")
+            e("  constrain.request %chgp, %chgt")
+        else:   # (a free-running poll, queued at the gate: Loom's constrain.request %p, %p, HRX pin)
+            e("  constrain.request %chgp, %chgp")
         e(f"  %gn1s = sender {kw}, {p['waiter']['nbr']} : reg<aie2p.array.sender : tile<4xi32>>")
         e(f"  %gn1r = receiver {kr}, {p['relay']['nbr']} : reg<aie2p.array.receiver : tile<4xi32>>")
         e("  %chgn = channel %gn1s, %gn1r, %one, %one : reg<aie2p.array.channel : tile<4xi32>>")
         e("  constrain.leaf_sync %chgn")
         e("  %gs_all = receiver %sb, 0 : reg<aie2p.array.receiver : tile<1x2x4xi32>>")
         e("  %gs = partition.receiver %gs_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
-        e(f"  %gsig = sender {kr}, {p['relay']['sig']} : reg<aie2p.array.sender : tile<4xi32>>")
+        # (GN_QNOTICK: the waiter sends go / done itself on its free stream port; the relay only counts)
+        gsig = f"{kw}, {p['waiter']['tick']}" if N.notick() else f"{kr}, {p['relay']['sig']}"
+        e(f"  %gsig = sender {gsig} : reg<aie2p.array.sender : tile<4xi32>>")
         e("  %chgs = channel %gsig, %gs, %two, %two : reg<aie2p.array.channel : tile<4xi32>>")
         e("  constrain.core_stream %chgs")
         e("  constrain.gate %chgs")
@@ -447,6 +458,11 @@ def array_program(L, cfg):
                 e(f"  %mbr{t} = receiver {kk[c, q + 1]}, 4 : reg<aie2p.array.receiver : tile<16xi32>>")
                 e(f"  %chm{t} = channel %mbs{t}, %mbr{t}, %one, %mbn : reg<aie2p.array.channel : tile<16xi32>>")
                 e(f"  constrain.leaf_sync %chm{t}")
+    if N.pshare():   # (Loom numbers the channels in program order) the tick and the signal on their column's row 0 egress lane
+        chans = [x.split(" = channel ")[0].strip() for x in "\n".join(L).splitlines() if " = channel " in x]
+        gp = N.QF["gports"]
+        N.QF["pshare"] = ",".join(f"{chans.index(c)}:{chans.index(f'%chd{col}_0')}" for c, col in
+                                  (("%chgt", gp["col"]), ("%chgs", gp["relay"]["col"])))
     e("  return\n}\n")
 
 

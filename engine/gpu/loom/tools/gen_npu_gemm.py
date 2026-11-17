@@ -77,6 +77,28 @@ def qlock_on():   # (layout Q') LOOM_EXP_LOCK_READ_SEP on: reads may issue 2 cyc
     return qpass_on() and os.environ.get("GN_QLOCK") == "1"
 
 
+def notick():
+    """GN_QNOTICK=1: the waiter's poll stream runs free (no tick channel, no constrain.request): its shim DMA reads
+    ahead as far as the stream FIFOs hold, so a poll is staler by that depth (gate values only grow: a stale read only
+    waits longer), and one southbound lane less leaves the waiter's tile (the K-half split routes gated)."""
+    return os.environ.get("GN_QNOTICK") == "1"
+
+
+def pshare():
+    """GN_QPSHARE=1 (Loom LOOM_EXP_PACKET_SHARE, HRX pin; the K-half split takes every compute -> memory tile lane):
+    the waiter's tick and the relay's go / done borrow the lane of their column's row 0 decoder egress past row 0, as
+    packets (each record a header + 4 words, the last with TLAST). The relay sends done at its last firing of the job
+    (after every fill of the job), so done never waits at the shim inside the shared lane while a fill needs it."""
+    on = os.environ.get("GN_QPSHARE") == "1"
+    assert not (on and notick()), "GN_QPSHARE keeps the tick"
+    return on
+
+
+def gate_tick(e, v, tag):
+    """One tick (a request for one flag record; GN_QPSHARE: a packet)."""
+    gate_record(e, (v, v, v, v), f"%gtid{tag}")
+
+
 def qpass_on():
     on = os.environ.get("GN_QPASS") == "1"
     assert not on or (os.environ.get("GN_QROW") == "1" and os.environ.get("GN_QBANK") in ("1", "3")), "GN_QPASS: QROW, QBANK 1/3"
@@ -153,9 +175,18 @@ _QFRAW2 = os.environ.get("GN_QFRAW2", "1") == "1"
 # raw: intake slots, 9216 B apart (GN_QFRAW2=1, the default: 2, slot 1 over the scratch %qods, time-disjoint). SP then
 # leaves bank 2 (slot 1 ends at 18432): 26112, bank 3 past Loom's stack (at the bank cursor, 25088: SP 25088 gave wrong
 # output); gated one-call fill 288K -> 264K. 49664 / 60992 cost +50K / +32K (banks shared with SP2).
-_QFKH = os.environ.get("GN_QFKH") == "1"   # (the K-half split: one record a raw record, a 4 x 1152 B ring off the C ring)
-QF_P1KD = dict(sp=int(os.environ.get("GN_QFSP", "26112" if _QFRAW2 else "16896")), sp2=53760,
-               egr=49152 if _QFKH else 40448, rec=1152 if _QFKH else 2304, slots=4, raw=2 if _QFRAW2 else 1)
+QF_P1KD = {}
+
+
+def qf_p1kd_layout():
+    """QF_P1KD from the environment (at import, and again after gen_npu_q.defaults sets the P1K knobs). GN_QFKH: the
+    K-half split's ring, one record a raw record, 4 x 1152 B off the C ring."""
+    kh = os.environ.get("GN_QFKH") == "1"
+    QF_P1KD.update(sp=int(os.environ.get("GN_QFSP", "26112" if _QFRAW2 else "16896")), sp2=53760,
+                   egr=49152 if kh else 40448, rec=1152 if kh else 2304, slots=4, raw=2 if _QFRAW2 else 1)
+
+
+qf_p1kd_layout()
 
 
 def qfdirect_on():
@@ -823,12 +854,15 @@ def array_program(L, cfg):
         e(f"  %gpoll = receiver {kw}, {gw['poll']} : reg<aie2p.array.receiver : tile<4xi32>>")
         e("  %chgp = channel %gf, %gpoll, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
         e("  constrain.core_stream %chgp")
-        e(f"  %gt_all = receiver %tb, 0 : reg<aie2p.array.receiver : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
-        e("  %gt = partition.receiver %gt_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
-        e(f"  %gtick = sender {kw}, {gw['tick']} : reg<aie2p.array.sender : tile<4xi32>>")
-        e("  %chgt = channel %gtick, %gt, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
-        e("  constrain.core_stream %chgt")
-        e("  constrain.request %chgp, %chgt")
+        if not notick():   # (the tick channel: one fresh flag read per tick)
+            e(f"  %gt_all = receiver %tb, 0 : reg<aie2p.array.receiver : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
+            e("  %gt = partition.receiver %gt_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
+            e(f"  %gtick = sender {kw}, {gw['tick']} : reg<aie2p.array.sender : tile<4xi32>>")
+            e("  %chgt = channel %gtick, %gt, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
+            e("  constrain.core_stream %chgt")
+            e("  constrain.request %chgp, %chgt")
+        else:   # (a free-running poll, queued at the gate: Loom's constrain.request %p, %p, HRX pin)
+            e("  constrain.request %chgp, %chgp")
         e(f"  %gn1s = sender {kw}, {gw['nbr']} : reg<aie2p.array.sender : tile<4xi32>>")
         e(f"  %gn1r = receiver {kr}, {gr['nbr']} : reg<aie2p.array.receiver : tile<4xi32>>")
         e("  %chgn = channel %gn1s, %gn1r, %one, %one : reg<aie2p.array.channel : tile<4xi32>>")
@@ -2961,6 +2995,44 @@ def imm32(v):
     return "mova.i32" if -1024 <= v < 1024 else "mov.i32"
 
 
+def gate_signal(e, exp, sts, pol, one):
+    """go [ready, status, polls, 0], then done [ready (| GATE_FAILED if the waiter gave up: status 2), status, polls, 0]
+    on the core's signal stream (the relay's; GN_QNOTICK: the waiter's)."""
+    e("  %gs0 = mova.i32 0")
+    gate_record(e, (exp, sts, pol, "%gs0"), "%gsid0")
+    if pshare():
+        return
+    e(f"  %gsbad = lt {one}, {sts}")
+    e(f"  %gsfb = mov.i32 {GATE_FAILED - (1 << 32)}")   # the waiter gave up
+    e("  %gsmark = mul %gsbad, %gsfb")
+    e(f"  %gsdone = add.rr {exp}, %gsmark")
+    gate_record(e, ("%gsdone", sts, pol, "%gs0"), "%gsid1")
+
+
+def gate_record(e, words, idr):
+    """One signal record (GN_QPSHARE: a packet, header first, TLAST on the last word)."""
+    if pshare():
+        e(f"  {idr} = mova.i32 2")   # (Loom's LOOM_AIE2P_SHARE_CHANNEL_ID)
+        e(f"  mov.ph {idr}, 0")
+    for i, v in enumerate(words):
+        e(f"  mov.ms{'.last' if pshare() and i == 3 else ''} {v}")
+
+
+def gate_done_late(e):
+    """GN_QPSHARE: the job's done at the relay's last firing, from the hand-off kept in job state (20 ready, 24 status,
+    28 polls)."""
+    e("  %gdv = lda %gsp, 20")
+    e("  %gds = lda %gsp, 24")
+    e("  %gdp = lda %gsp, 28")
+    e("  %gd0 = mova.i32 0")
+    e("  %gd1 = mova.i32 1")
+    e("  %gdbad = lt %gd1, %gds")
+    e(f"  %gdfb = mov.i32 {GATE_FAILED - (1 << 32)}")   # the waiter gave up
+    e("  %gdmark = mul %gdbad, %gdfb")
+    e("  %gddone = add.rr %gdv, %gdmark")
+    gate_record(e, ("%gddone", "%gds", "%gdp", "%gd0"), "%gdid")
+
+
 def gate_first(e, cfg, gate, gn):
     """The gate at a job's first firing, before any of its data (see GATE), so a freshly set up array
     (job state zero: at the gate) runs no call. The waiter polls for the job's ready value and hands it to the relay,
@@ -2994,19 +3066,12 @@ def gate_first(e, cfg, gate, gn):
         e(f"  %gfpol = lda {gn}, 8")
         e(f"  %gfnc = lda {gn}, 12")
         e(f"  rel %gf1, {nbr}")
-        e("  %gf0 = mova.i32 0")
-        e("  mov.ms %gfexp")
-        e("  mov.ms %gfsts")
-        e("  mov.ms %gfpol")
-        e("  mov.ms %gf0")
-        e("  %gfbad = lt %gf1, %gfsts")
-        e(f"  %gffb = mov.i32 {GATE_FAILED - (1 << 32)}")   # the waiter gave up
-        e("  %gfmark = mul %gfbad, %gffb")
-        e("  %gfdone = add.rr %gfexp, %gfmark")
-        e("  mov.ms %gfdone")
-        e("  mov.ms %gfsts")
-        e("  mov.ms %gfpol")
-        e("  mov.ms %gf0")
+        if not notick():
+            gate_signal(e, "%gfexp", "%gfsts", "%gfpol", "%gf1")
+        if pshare():   # (done at the job's last firing: gate_count)
+            e("  st %gfexp, %gsp0, 20")
+            e("  st %gfsts, %gsp0, 24")
+            e("  st %gfpol, %gsp0, 28")
         e("  %gfz = lt %gfnc, %gf1")   # (given up: one call)
         e("  %gfnc1 = add.rr %gfnc, %gfz")
         e("  %gfNn = mul %gfnc1, %gffpc")
@@ -3031,8 +3096,8 @@ def gate_first(e, cfg, gate, gn):
     e("  %gfpw1 = add %gfpw, -1")
     e("  low.br ^gfp(%gfpn: reg<aie2p.er>, %gfpw1: reg<aie2p.er>)")
     e("^gfask:")
-    for i in range(4):   # (ghelp's ticks carry the read bound: the tick binding is scratch)
-        e(f"  mov.ms {'%gfpn' if compact else '%gf0'}")
+    if not notick():   # (ghelp's ticks carry the read bound: the tick binding is scratch)
+        gate_tick(e, '%gfpn' if compact else '%gf0', "f")
     e("  %gfrdy = mov.ss")
     e("  %gfy1 = mov.ss")
     e("  %gfy2 = mov.ss")
@@ -3057,6 +3122,8 @@ def gate_first(e, cfg, gate, gn):
     e(f"  st %gfpn1, {gn}, 8")
     e(f"  st %gfhc, {gn}, 12")
     e(f"  rel %gf1, {nbr}")
+    if notick():
+        gate_signal(e, "%gfhv", "%gfhs", "%gfpn1", "%gf1")
     e("  %gfz = lt %gfhc, %gf1")
     e("  %gfhc1 = add.rr %gfhc, %gfz")
     e("  %gfNn = mul %gfhc1, %gffpc")
@@ -3223,6 +3290,12 @@ def gate_count(e, cfg, gate):
         e("  %gNn = mul %gN, %gcont")
         e("  st %gFn, %gsp, 0")
         e("  st %gNn, %gsp, 4")
+        if pshare():   # the job's last firing: its done
+            e("  low.cond_br %gcont, ^grx, ^grd : reg<aie2p.er>")
+            e("^grd:")
+            gate_done_late(e)
+            e("  low.br ^grx")
+            e("^grx:")
         e("  return")
         return
     if cfg.ghelp:   # compact: [firings left, -, leftover, pending reads, the last job's ready value]
@@ -3304,8 +3377,11 @@ def gate_count(e, cfg, gate):
         step("%gtk", "%gti")
     e("  low.cond_br %gtm, ^gt1, ^gtd : reg<aie2p.er>")
     e("^gt1:")
-    for i in range(4):
-        e("  mov.ms %g0")
+    if notick():
+        for i in range(4):
+            e(f"  %gtx{i} = mov.ss")
+    else:
+        gate_tick(e, "%g0", "t")
     if not hstep:
         step("%gtk", "%gti")
     e("  low.br ^gt(%gtk: reg<aie2p.er>)")
@@ -3317,12 +3393,12 @@ def gate_count(e, cfg, gate):
     e("^gmid:")
     e("  st %gF1, %gsp, 0")
     e("  st %gL2, %gsp, 8")
-    e("  st %gbt, %gsp, 12")
+    e(f"  st {'%g0' if notick() else '%gbt'}, %gsp, 12")
     e("  return")
     e("^gend:")   # finish the leftover: the pending reads, then one tick + read per remaining record
     e("  low.br ^gr(%g0: reg<aie2p.er>)")
     e("^gr(%gri: reg<aie2p.er>):")
-    e("  %grm = lt %gri, %gbt")
+    e(f"  %grm = lt %gri, {'%g0' if notick() else '%gbt'}")
     if hstep:
         step("%grn", "%gri")
     e("  low.cond_br %grm, ^gr1, ^grd : reg<aie2p.er>")
@@ -3340,8 +3416,8 @@ def gate_count(e, cfg, gate):
         step("%gln", "%gli")
     e("  low.cond_br %glm, ^gl1, ^gld : reg<aie2p.er>")
     e("^gl1:")
-    for i in range(4):
-        e("  mov.ms %g0")
+    if not notick():
+        gate_tick(e, "%g0", "l")
     for i in range(4):
         e(f"  %glx{i} = mov.ss")
     if not hstep:

@@ -1,0 +1,579 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:30:00 +0100
+Subject: [PATCH] loom : packet-share a worker egress lane with core streams
+
+LOOM_EXP_PACKET_SHARE=<channel>:<payload>[,...]: a core stream egress borrows its payload's lanes up to the payload's
+receiver; the meet and part switches run packet rules (payload id 1, channel id 2), the payload's sender descriptors
+carry id 1, and the sharing channels plan after the intake pass. Also: constrain.request %p, %p is a free-running poll
+(queued at the gate, no tick, no lock); LOOM_EXP_ROUTE_DUMP prints lane use when a route fails.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -655,6 +655,7 @@
+   channel->intake_drain_dma = UINT32_MAX;
+   channel->intake_core_dma = UINT32_MAX;
+   channel->request_poll = false;
++  channel->request_free = false;
+   channel->request_lock_id = UINT8_MAX;
+   channel->stage_dma_index = UINT32_MAX;
+   channel->stage_repeat_count = 1;
+@@ -909,6 +910,10 @@
+         const uint32_t tick =
+             loom_aie2p_array_lookup_entity(builder, loom_op_operands(op)[1])
+                 ->index;
++        if (poll == tick) {   // a free-running poll (no tick, no lock)
++          builder->channels[poll].request_free = true;
++          break;
++        }
+         builder->channels[poll].request_partner = tick;
+         builder->channels[poll].request_poll = true;
+         builder->channels[tick].request_partner = poll;
+@@ -2505,6 +2510,28 @@
+ static iree_status_t loom_aie2p_array_diagnose_route_capacity(
+     loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index) {
+   builder->valid = false;
++  if (getenv("LOOM_EXP_ROUTE_DUMP")) {  // (diag) used lanes per link: S/N per vertical link, W/E per horizontal
++    const loom_aie2p_array_route_builder_t* r = &builder->route_builder;
++    const uint16_t cols = r->family->column_count, rows = r->family->row_count;
++    for (uint16_t row = 0; row + 1 < rows; ++row) {
++      fprintf(stderr, "route dump: rows %u-%u S/N:", row, row + 1);
++      for (uint16_t c = 0; c < cols; ++c) {
++        const iree_host_size_t i = (iree_host_size_t)row * cols + c;
++        fprintf(stderr, " %d/%d", __builtin_popcount(r->link_channels.southbound[i]),
++                __builtin_popcount(r->link_channels.northbound[i]));
++      }
++      fprintf(stderr, "\n");
++    }
++    for (uint16_t row = 0; row < rows; ++row) {
++      fprintf(stderr, "route dump: row %u W/E:", row);
++      for (uint16_t c = 0; c + 1 < cols; ++c) {
++        const iree_host_size_t i = (iree_host_size_t)row * cols + c;
++        fprintf(stderr, " %d/%d", __builtin_popcount(r->link_channels.westbound[i]),
++                __builtin_popcount(r->link_channels.eastbound[i]));
++      }
++      fprintf(stderr, "\n");
++    }
++  }
+   const loom_diagnostic_param_t params[] = {loom_param_u32(channel_index)};
+   const loom_diagnostic_emission_t emission = {
+       .op = loom_value_def_op(loom_value_table_const_value(
+@@ -3173,6 +3200,15 @@
+   return iree_ok_status();
+ }
+ 
++// LOOM_EXP_PACKET_SHARE: the channel whose route records carry |payload|'s
++// path (a constrain.fill source's path is its panel's fill).
++static uint32_t loom_aie2p_array_share_route_channel(
++    const loom_aie2p_array_channel_t* channels, uint32_t payload) {
++  return channels[payload].fill_target != UINT32_MAX
++             ? channels[payload].fill_target
++             : payload;
++}
++
+ // A core stream channel (constrain.core_stream): the shim DMA and a route that
+ // ends at, or starts from, the worker core's stream port. The worker owns no
+ // DMA, ring, slots, or locks for it, and it is not one of the worker's ports.
+@@ -3272,6 +3308,57 @@
+   if (ingress) {
+     channel->sender_dma_index = shim_dma_index;
+   }
++  // LOOM_EXP_PACKET_SHARE=<channel>:<payload channel> (EXPERIMENT): this core
++  // stream egress may borrow the (already routed) payload's lanes up to the
++  // payload's receiver; program.c frames both as packets.
++  loom_aie2p_array_route_sharing_t share_storage;
++  loom_aie2p_array_route_sharing_t* share = NULL;
++  {
++    const uint32_t share_payload =
++        loom_aie2p_array_share_payload(channel_index);
++    if (!ingress && share_payload != UINT32_MAX) {
++      const loom_aie2p_array_route_builder_t* rb = &builder->route_builder;
++      // (a constrain.fill source routes as its panel's fill: the panel
++      // channel's first records, up to the memory tile's write)
++      const uint32_t route_channel =
++          loom_aie2p_array_share_route_channel(builder->channels,
++                                               share_payload);
++      iree_host_size_t first = IREE_HOST_SIZE_MAX, count = 0;
++      for (iree_host_size_t i = 0; i < rb->route_count; ++i) {
++        if (rb->routes[i].channel_index != route_channel) continue;
++        first = i;
++        while (first + count < rb->route_count &&
++               rb->routes[first + count].channel_index == route_channel) {
++          ++count;
++          if (rb->routes[first + count - 1].destination_port ==
++              LOOM_XDNA_STREAM_PORT_DMA) {
++            break;
++          }
++        }
++        break;
++      }
++      if (!count) {
++        return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
++                                "packet share: payload %u is not routed before "
++                                "channel %u", share_payload, channel_index);
++      }
++      IREE_RETURN_IF_ERROR(loom_aie2p_array_route_sharing_initialize(
++          rb, first, count, rb->routes[first + count - 1].coordinate,
++          builder->arena, &share_storage));
++      share = &share_storage;
++      if (getenv("LOOM_EXP_ROUTE_DUMP")) {
++        for (iree_host_size_t i = first; i < first + count; ++i) {
++          const loom_aie2p_array_route_plan_t* r = &rb->routes[i];
++          fprintf(stderr,
++                  "route share: payload %u record (%u,%u) kind %d src %d.%u -> "
++                  "dst %d.%u\n",
++                  share_payload, r->coordinate.column, r->coordinate.row,
++                  (int)r->switch_kind, (int)r->source_port, r->source_channel,
++                  (int)r->destination_port, r->destination_channel);
++        }
++      }
++    }
++  }
+   const bool routed =
+       ingress ? loom_aie2p_array_route_ingress(
+                     &builder->route_builder, channel_index,
+@@ -3279,15 +3366,19 @@
+                     shim_dma->coordinate, shim_dma->dma_channel,
+                     worker->coordinate, LOOM_XDNA_STREAM_PORT_CORE, 0,
+                     /*vertical_first=*/false)
+-              : loom_aie2p_array_route_egress(
++              : loom_aie2p_array_route_egress_shared(
+                     &builder->route_builder, channel_index,
+                     &builder->route_trees[channel->source_channel_index],
+                     worker->coordinate, LOOM_XDNA_STREAM_PORT_CORE, 0,
+                     shim_dma->coordinate,
+-                    shim_dma->dma_channel);
++                    shim_dma->dma_channel, share);
+   if (!routed) {
+     return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
+   }
++  if (share && !share->used) {
++    fprintf(stderr, "packet share: channel %u routed without borrowing\n",
++            channel_index);
++  }
+   loom_aie2p_array_binding_plan_t* binding_plan =
+       &builder->binding_plans[channel->binding_plan_index];
+   binding_plan->dma_index = shim_dma_index;
+@@ -4017,6 +4108,9 @@
+ 
+ static iree_status_t loom_aie2p_array_plan_channels(
+     loom_aie2p_array_plan_builder_t* builder) {
++  uint32_t share_channels[8], share_payloads[8];
++  const int share_count =
++      loom_aie2p_array_share_pairs(share_channels, share_payloads, 8);
+   for (iree_host_size_t i = 0;
+        builder->valid && i < builder->plan->channel_count; ++i) {
+     loom_aie2p_array_channel_t* channel = &builder->channels[i];
+@@ -4025,6 +4119,9 @@
+     const loom_aie2p_array_endpoint_t* receiver =
+         &builder->endpoints[channel->receiver_endpoint_index];
+     if (loom_aie2p_array_channel_is_intake(channel)) continue;   // below
++    if (loom_aie2p_array_share_payload((uint32_t)i) != UINT32_MAX) {
++      continue;   // (after its payload: below)
++    }
+     channel->first_channel_slot = (uint32_t)builder->channel_slot_cursor;
+     switch (channel->transport) {
+       case LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_EXTERNAL_DMA: {
+@@ -4067,6 +4164,18 @@
+         builder, (uint32_t)i,
+         &builder->endpoints[channel->receiver_endpoint_index]));
+   }
++  for (int k = 0; k < share_count && builder->valid; ++k) {
++    // LOOM_EXP_PACKET_SHARE: the sharing core streams, once their payloads
++    // routed
++    const uint32_t share_channel = share_channels[k];
++    if (share_channel >= builder->plan->channel_count) continue;
++    loom_aie2p_array_channel_t* channel = &builder->channels[share_channel];
++    channel->first_channel_slot = (uint32_t)builder->channel_slot_cursor;
++    IREE_RETURN_IF_ERROR(loom_aie2p_array_plan_external_channel(
++        builder, share_channel,
++        &builder->endpoints[channel->sender_endpoint_index],
++        &builder->endpoints[channel->receiver_endpoint_index]));
++  }
+   return iree_ok_status();
+ }
+ 
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -9,6 +9,9 @@
+ #ifndef LOOM_TARGET_ARCH_AMD_XDNA_AIE2P_ARRAY_PLAN_H_
+ #define LOOM_TARGET_ARCH_AMD_XDNA_AIE2P_ARRAY_PLAN_H_
+ 
++#include <stdio.h>
++#include <stdlib.h>
++
+ #include "iree/base/api.h"
+ #include "iree/base/internal/arena.h"
+ #include "loom/codegen/low/function_requirements.h"
+@@ -268,6 +271,9 @@
+   uint32_t intake_core_dma;
+   // True on the poll side of a request pair.
+   bool request_poll;
++  // constrain.request %poll, %poll (EXPERIMENT): a free-running poll, no tick
++  // and no lock; still queued in the gate phase like a request poll.
++  bool request_free;
+   // The pair's shim lock once planned.
+   uint8_t request_lock_id;
+   // Memory-tile stream-to-memory DMA row of a staged channel, or UINT32_MAX;
+@@ -348,7 +354,7 @@
+ static inline bool loom_aie2p_array_channel_is_data_stream(
+     const loom_aie2p_array_channel_t* channel) {
+   return channel->core_stream && !channel->gate && !channel->signal &&
+-         channel->request_partner == UINT32_MAX;
++         channel->request_partner == UINT32_MAX && !channel->request_free;
+ }
+ // Contiguous equal-width transfers between an output and private fold state.
+ typedef struct loom_aie2p_array_fold_span_t {
+@@ -763,6 +769,36 @@
+     iree_diagnostic_emitter_t diagnostic_emitter, iree_arena_allocator_t* arena,
+     loom_aie2p_array_plan_t* out_plan, bool* out_valid);
+ 
++// LOOM_EXP_PACKET_SHARE=<channel>:<payload>[,<channel>:<payload>...]
++// (EXPERIMENT): each core stream egress channel may borrow its payload's lanes
++// up to the payload's receiver, as packets. Returns the pair count (<= max).
++static inline int loom_aie2p_array_share_pairs(uint32_t* channels,
++                                               uint32_t* payloads, int max) {
++  const char* env = getenv("LOOM_EXP_PACKET_SHARE");
++  int n = 0;
++  while (env && *env && n < max) {
++    unsigned c = 0, p = 0;
++    int used = 0;
++    if (sscanf(env, "%u:%u%n", &c, &p, &used) != 2) break;
++    channels[n] = c;
++    payloads[n] = p;
++    ++n;
++    env += used;
++    if (*env == ',') ++env;
++  }
++  return n;
++}
++
++// The payload |channel| shares with, or UINT32_MAX when it shares none.
++static inline uint32_t loom_aie2p_array_share_payload(uint32_t channel) {
++  uint32_t c[8], p[8];
++  const int n = loom_aie2p_array_share_pairs(c, p, 8);
++  for (int i = 0; i < n; ++i) {
++    if (c[i] == channel) return p[i];
++  }
++  return UINT32_MAX;
++}
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -474,6 +474,185 @@
+   return loom_aie2p_program_accumulate_route_update(builder, &slave);
+ }
+ 
++// LOOM_EXP_PACKET_SHARE=<channel>:<payload channel> (EXPERIMENT, plan.c): the
++// channel's core stream borrows the payload's lanes. Both run as packets on the
++// shared hops: the payload's sender descriptors carry SHARE_PAYLOAD_ID, the
++// core writes SHARE_CHANNEL_ID headers. Where the two meet (one master, two
++// slaves) both slaves filter into one arbiter; where they part (one slave, two
++// masters) each id selects its master, which drops the header.
++enum {
++  LOOM_AIE2P_SHARE_PAYLOAD_ID = 1,
++  LOOM_AIE2P_SHARE_CHANNEL_ID = 2,
++};
++
++
++static iree_status_t loom_aie2p_program_packet_slave(
++    loom_aie2p_array_program_builder_t* builder, loom_xdna_tile_kind_t kind,
++    loom_xdna_tile_coordinate_t coordinate, uint16_t slave, uint16_t slot,
++    uint8_t id, uint8_t arbiter, uint8_t master_select) {
++  const bool mem = kind == LOOM_XDNA_TILE_KIND_MEMORY;
++  const uint16_t slave_indices[] = {slave};
++  loom_aie2p_register_update_t config = loom_aie2p_program_resolve_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_CONFIG_ENABLE
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_CONFIG_ENABLE,
++      coordinate, slave_indices, 1);
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_CONFIG_PACKET_ENABLE
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_CONFIG_PACKET_ENABLE,
++      coordinate, slave_indices, 1, &config));
++  IREE_RETURN_IF_ERROR(
++      loom_aie2p_program_accumulate_route_update(builder, &config));
++  const uint16_t slot_indices[] = {slave, slot};
++  loom_aie2p_register_update_t rule = loom_aie2p_program_resolve_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_PACKET_ID
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_PACKET_ID,
++      coordinate, slot_indices, id);
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_PACKET_MASK
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_PACKET_MASK,
++      coordinate, slot_indices, LOOM_AIE2P_TASK_COMPLETION_PACKET_MASK, &rule));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_ENABLE
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_ENABLE,
++      coordinate, slot_indices, 1, &rule));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_MASTER_SELECT
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_MASTER_SELECT,
++      coordinate, slot_indices, master_select, &rule));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_ARBITER
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_ARBITER,
++      coordinate, slot_indices, arbiter, &rule));
++  return loom_aie2p_program_accumulate_route_update(builder, &rule);
++}
++
++static iree_status_t loom_aie2p_program_packet_master(
++    loom_aie2p_array_program_builder_t* builder, loom_xdna_tile_kind_t kind,
++    loom_xdna_tile_coordinate_t coordinate, uint16_t master, uint8_t arbiter,
++    uint8_t master_select, bool drop_header) {
++  const bool mem = kind == LOOM_XDNA_TILE_KIND_MEMORY;
++  const uint16_t indices[] = {master};
++  loom_aie2p_register_update_t config = loom_aie2p_program_resolve_field_update(
++      builder->plan, loom_aie2p_program_stream_master_enable_field(kind),
++      coordinate, indices, 1);
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_MASTER_CONFIG_PACKET_ENABLE
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_MASTER_CONFIG_PACKET_ENABLE,
++      coordinate, indices, 1, &config));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
++      builder->plan,
++      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_MASTER_CONFIG_DROP_HEADER
++          : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_MASTER_CONFIG_DROP_HEADER,
++      coordinate, indices, drop_header ? 1 : 0, &config));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
++      builder->plan, loom_aie2p_program_stream_master_configuration_field(kind),
++      coordinate, indices,
++      arbiter | ((UINT32_C(1) << master_select)
++                 << LOOM_AIE2P_TASK_COMPLETION_ROUTE_MASTER_SELECT_SHIFT),
++      &config));
++  return loom_aie2p_program_accumulate_route_update(builder, &config);
++}
++
++// One record of the shared pair: |out_handled| when configured here (a meet or
++// a part) or by its partner's record; a hop both ride whole stays a circuit.
++static iree_status_t loom_aie2p_program_packet_share_route(
++    loom_aie2p_array_program_builder_t* builder,
++    const loom_aie2p_array_route_plan_t* route, uint32_t share_channel,
++    uint32_t share_payload, bool* out_handled) {
++  *out_handled = false;
++  if (route->switch_kind != LOOM_AIE2P_ARRAY_SWITCH_KIND_STREAM_SWITCH ||
++      (route->channel_index != share_channel &&
++       route->channel_index != share_payload)) {
++    return iree_ok_status();
++  }
++  const uint32_t other_channel = route->channel_index == share_channel
++                                     ? share_payload
++                                     : share_channel;
++  const loom_aie2p_array_route_plan_t* other = NULL;
++  for (iree_host_size_t i = 0; i < builder->plan->route_count; ++i) {
++    const loom_aie2p_array_route_plan_t* r = &builder->plan->routes[i];
++    if (r->channel_index != other_channel ||
++        r->switch_kind != LOOM_AIE2P_ARRAY_SWITCH_KIND_STREAM_SWITCH ||
++        r->coordinate.column != route->coordinate.column ||
++        r->coordinate.row != route->coordinate.row) {
++      continue;
++    }
++    const bool same_source = r->source_port == route->source_port &&
++                             r->source_channel == route->source_channel;
++    const bool same_destination =
++        r->destination_port == route->destination_port &&
++        r->destination_channel == route->destination_channel;
++    if (same_source || same_destination) {
++      other = r;
++      break;
++    }
++  }
++  if (!other) return iree_ok_status();
++  const bool same_source = other->source_port == route->source_port &&
++                           other->source_channel == route->source_channel;
++  const bool same_destination =
++      other->destination_port == route->destination_port &&
++      other->destination_channel == route->destination_channel;
++  if (same_source && same_destination) {
++    // a hop both ride whole: one circuit (the payload's record emits it)
++    *out_handled = route->channel_index == share_channel;
++    return iree_ok_status();
++  }
++  *out_handled = true;
++  if (route->channel_index != share_channel) {
++    return iree_ok_status();  // (the channel's record configures the pair)
++  }
++  const loom_xdna_tile_facts_t* tile =
++      loom_xdna_array_tile_facts(builder->plan->family, route->coordinate);
++  uint16_t c_src = 0, c_dst = 0, p_src = 0, p_dst = 0;
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_stream_ordinal(
++      builder->plan, tile->kind, LOOM_XDNA_STREAM_DIRECTION_SLAVE,
++      route->source_port, route->source_channel, &c_src));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_stream_ordinal(
++      builder->plan, tile->kind, LOOM_XDNA_STREAM_DIRECTION_MASTER,
++      route->destination_port, route->destination_channel, &c_dst));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_stream_ordinal(
++      builder->plan, tile->kind, LOOM_XDNA_STREAM_DIRECTION_SLAVE,
++      other->source_port, other->source_channel, &p_src));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_stream_ordinal(
++      builder->plan, tile->kind, LOOM_XDNA_STREAM_DIRECTION_MASTER,
++      other->destination_port, other->destination_channel, &p_dst));
++  fprintf(stderr,
++          "packet share: %s at (%u,%u): slaves %u/%u masters %u/%u\n",
++          same_destination ? "meet" : "part", route->coordinate.column,
++          route->coordinate.row, c_src, p_src, c_dst, p_dst);
++  if (same_destination) {  // two slaves into one arbiter
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_slave(
++        builder, tile->kind, route->coordinate, c_src, 0,
++        LOOM_AIE2P_SHARE_CHANNEL_ID, 0, 0));
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_slave(
++        builder, tile->kind, route->coordinate, p_src, 0,
++        LOOM_AIE2P_SHARE_PAYLOAD_ID, 0, 0));
++    return loom_aie2p_program_packet_master(builder, tile->kind,
++                                            route->coordinate, c_dst, 0, 0,
++                                            route->dma_destination);
++  }
++  // one slave, the id picks the master (each drops the header)
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_slave(
++      builder, tile->kind, route->coordinate, c_src, 0,
++      LOOM_AIE2P_SHARE_PAYLOAD_ID, 0, 0));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_slave(
++      builder, tile->kind, route->coordinate, c_src, 1,
++      LOOM_AIE2P_SHARE_CHANNEL_ID, 1, 0));
++  IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_master(
++      builder, tile->kind, route->coordinate, p_dst, 0, 0, true));
++  return loom_aie2p_program_packet_master(builder, tile->kind,
++                                          route->coordinate, c_dst, 1, 0, true);
++}
++
+ static iree_status_t loom_aie2p_program_build_completion_route(
+     loom_aie2p_array_program_builder_t* builder,
+     const loom_aie2p_array_completion_route_t* route) {
+@@ -700,8 +879,23 @@
+   if (getenv("LOOM_EXP_ROUTE_RESET")) {
+     IREE_RETURN_IF_ERROR(loom_aie2p_program_reset_masters(builder));
+   }
++  uint32_t share_channels[8], share_payloads[8];
++  const int share_count =
++      loom_aie2p_array_share_pairs(share_channels, share_payloads, 8);
+   for (iree_host_size_t i = 0; i < builder->plan->route_count; ++i) {
+     const loom_aie2p_array_route_plan_t* route = &builder->plan->routes[i];
++    bool handled = false;
++    for (int k = 0; k < share_count && !handled; ++k) {
++      // (a constrain.fill source's path is recorded as its panel's fill)
++      const uint32_t share_payload = share_payloads[k];
++      const uint32_t share_route =
++          builder->plan->channels[share_payload].fill_target != UINT32_MAX
++              ? builder->plan->channels[share_payload].fill_target
++              : share_payload;
++      IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_share_route(
++          builder, route, share_channels[k], share_route, &handled));
++    }
++    if (handled) continue;
+     switch (route->switch_kind) {
+       case LOOM_AIE2P_ARRAY_SWITCH_KIND_STREAM_SWITCH: {
+         IREE_RETURN_IF_ERROR(
+@@ -825,6 +1019,27 @@
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_COMPUTE_MEMORY_DMA_BD_WORD0_BUFFER_LENGTH,
+       channel->encoded_dma_record_length, &words[0]);
++  uint32_t share_channels[8], share_payloads[8];
++  const int share_count =
++      loom_aie2p_array_share_pairs(share_channels, share_payloads, 8);
++  bool share_sender = false;
++  for (int k = 0; k < share_count; ++k) {
++    share_sender |= share_payloads[k] == dma->channel_index;
++  }
++  if (dma->direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM &&
++      share_sender) {
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_COMPUTE_MEMORY_DMA_BD_WORD1_ENABLE_PACKET, 1,
++        &words[1]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_COMPUTE_MEMORY_DMA_BD_WORD1_PACKET_ID,
++        LOOM_AIE2P_SHARE_PAYLOAD_ID, &words[1]);
++    if (!slot_ordinal) {
++      fprintf(stderr, "packet share: payload descriptors at (%u,%u) bd %u+%u\n",
++              dma->coordinate.column, dma->coordinate.row,
++              dma->buffer_descriptor_start, dma->buffer_descriptor_count);
++    }
++  }
+   const uint16_t next_buffer_descriptor =
+       dma->buffer_descriptor_start +
+       (uint16_t)((slot_ordinal + 1) % dma->buffer_descriptor_count);
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.c
+@@ -381,6 +381,19 @@
+     feasible = loom_aie2p_array_route_inputs(builder, step->input, step->output,
+                                              step->feasible);
+   }
++  if (sharing && getenv("LOOM_EXP_ROUTE_DUMP")) {  // (diag) the shared route's steps
++    for (iree_host_size_t i = 0; i < step_count; ++i) {
++      const loom_aie2p_array_route_step_t* step = &builder->steps[i];
++      fprintf(stderr,
++              "route share: step %zu to (%u,%u) dir %d feasible %#x shared %#x "
++              "occupied %#x%s\n",
++              i, step->destination.column, step->destination.row,
++              (int)step->direction, step->feasible, step->shared,
++              *step->occupied, i == shared_step_count ? " (receiver)" : "");
++    }
++    fprintf(stderr, "route share: entry %#x, prefix channel %u\n", feasible,
++            prefix->incoming_channel);
++  }
+   if (!(feasible & (UINT32_C(1) << prefix->incoming_channel))) {
+     loom_aie2p_array_discard_route_prefix(builder, first_route);
+     return false;
+@@ -500,6 +513,18 @@
+     loom_xdna_tile_coordinate_t worker_coordinate,
+     loom_xdna_stream_port_t worker_port, uint8_t worker_channel,
+     loom_xdna_tile_coordinate_t shim_coordinate, uint8_t shim_dma_channel) {
++  return loom_aie2p_array_route_egress_shared(
++      builder, channel_index, tree, worker_coordinate, worker_port,
++      worker_channel, shim_coordinate, shim_dma_channel, NULL);
++}
++
++bool loom_aie2p_array_route_egress_shared(
++    loom_aie2p_array_route_builder_t* builder, uint32_t channel_index,
++    loom_aie2p_array_route_tree_t* tree,
++    loom_xdna_tile_coordinate_t worker_coordinate,
++    loom_xdna_stream_port_t worker_port, uint8_t worker_channel,
++    loom_xdna_tile_coordinate_t shim_coordinate, uint8_t shim_dma_channel,
++    loom_aie2p_array_route_sharing_t* sharing) {
+   iree_host_size_t node_index = loom_aie2p_array_route_worker_source(
+       builder, tree, worker_coordinate, worker_port, worker_channel);
+   const uint8_t shim_link_channel = loom_aie2p_array_dma_stream_channel(
+@@ -508,7 +533,7 @@
+   if (!loom_aie2p_array_plan_route(builder, channel_index, node_index,
+                                    shim_coordinate, LOOM_XDNA_STREAM_PORT_SOUTH,
+                                    shim_link_channel, shim_coordinate.row,
+-                                   false, NULL, NULL)) {
++                                   false, sharing, NULL)) {
+     return false;
+   }
+   builder->routes[builder->route_count - 1].dma_destination = true;
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/route.h
+@@ -119,6 +119,17 @@
+     loom_xdna_stream_port_t worker_port, uint8_t worker_channel,
+     loom_xdna_tile_coordinate_t shim_coordinate, uint8_t shim_dma_channel);
+ 
++// route_egress whose path may borrow |sharing|'s payload lanes up to the
++// payload's receiver (EXPERIMENT, LOOM_EXP_PACKET_SHARE: the caller frames both
++// classes as packets and configures the merge and split switches).
++bool loom_aie2p_array_route_egress_shared(
++    loom_aie2p_array_route_builder_t* builder, uint32_t channel_index,
++    loom_aie2p_array_route_tree_t* tree,
++    loom_xdna_tile_coordinate_t worker_coordinate,
++    loom_xdna_stream_port_t worker_port, uint8_t worker_channel,
++    loom_xdna_tile_coordinate_t shim_coordinate, uint8_t shim_dma_channel,
++    loom_aie2p_array_route_sharing_t* sharing);
++
+ // Connects memory-to-stream and stream-to-memory DMA channels on two workers,
+ // reusing the physical sender's |tree|.
+ // Packet classes share that physical tree and retain complete paths for their
