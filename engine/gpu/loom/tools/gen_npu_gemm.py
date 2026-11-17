@@ -146,9 +146,10 @@ QF_OUTS = (19584, 49152, 53760, None)    # slab outputs (4608 B each): C rows af
 QF_P1K = dict(sp=16896, sp2=37376, outs=(12288, 25088, 44608, 53760, 58368), egr=30784)
 # (P1K fill, GN_QFDIRECT=1, the default) the decoder writes each slab's 4608 B straight into the egress ring, 4 records
 # of 2304 B (2 a slab) over C slots 1-3 and their tails (40448..49664, idle in the fill); SP2 in W slot 1
-QF_P1KD = dict(sp=60992 if os.environ.get("GN_QFRAW2") == "1" else 16896, sp2=53760, egr=40448, rec=2304, slots=4,
+QF_P1KD = dict(sp=int(os.environ.get("GN_QFSP", "25088" if os.environ.get("GN_QFRAW2") == "1" else "16896")), sp2=53760, egr=40448, rec=2304, slots=4,
                raw=int(os.environ.get("GN_QFRAW2", "0")) + 1)   # (raw: intake slots, 9216 B apart; GN_QFRAW2=1: SP
-# in W slot 1's tail (25088 gave wrong output, 11-17: likely private storage there), bit-exact but fill 273K vs 241K)
+# in W slot 1's tail, bit-exact but fill 273K vs 241K; GN_QFSP=<SP>: 25088 WRONG output even with one slot (nothing of
+# Loom's there, 11-17: open), 49664 bit-exact but fill +50K (banks shared with SP2): keep 16896)
 
 
 def qfdirect_on():
@@ -1414,7 +1415,7 @@ def fuse_scratch(cfg, cov):
     D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
     if qfdirect_on():   # (P1K fill, direct: QF_P1KD)
         m = QF_P1KD
-        assert 16 * D.RECROW <= QF["wslot"] and (m["sp"] + D.SCR_B <= 20480 or m["sp"] >= m["sp2"] + D.SCR2_B) and m["sp2"] + D.SCR2_B <= 65280 and m["sp"] + D.SCR_B <= 65280
+        assert 16 * D.RECROW <= QF["wslot"] and (m["sp"] + D.SCR_B <= 20480 or 25088 <= m["sp"] <= 30720 - D.SCR_B or 49664 <= m["sp"] <= 53760 - D.SCR_B or m["sp"] >= m["sp2"] + D.SCR2_B) and m["sp2"] + D.SCR2_B <= 65280 and m["sp"] + D.SCR_B <= 65280
         assert m["raw"] * 16 * D.RECROW <= 20480   # (the intake slots: W slot 0, its tail, the odd C area)
         return m["sp"], 0, m["sp2"], None
     if QF["cfg"] is not None and qp1k_on():   # (P1K fill: QF_P1K)
