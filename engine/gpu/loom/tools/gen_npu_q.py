@@ -315,6 +315,18 @@ def array_program(L, cfg):
             e(f"  %qsr{c} = receiver {kk[c, 0]}, {qsplit_port(g)} : reg<aie2p.array.receiver : tile<{rq}xi32>>")
             e(f"  %chq{c} = channel %qss{c}, %qsr{c}, %one, %qsn : reg<aie2p.array.channel : tile<{rq}xi32>>")
             e(f"  constrain.leaf_sync %chq{c}")
+    if os.environ.get("GN_QMB1") == "5":   # (diag MB2) one channel per column, row 0 -> row 1 (Loom: no channel cycles):
+        # its credit / ready locks order both memories' hand-overs, since each core alternates own / other half in a fixed
+        # order. Row 0 (sender, port 3): a ready pre-released at the firing start, then acquire a credit before and release
+        # a ready after each half (the last half's release skipped); row 1 (receiver, port 4): acquire a ready before and
+        # release a credit after each half. Per firing 2 MP passes of each.
+        assert R == 2 and not fz and not cfg.gate and not crel()
+        e(f"  %mbn = constant.u32 {nbr * P * MP * 2} : reg<aie2p.array.scalar : index>")
+        for c in range(cols):
+            e(f"  %mbs{c} = sender {kk[c, 0]}, 3 : reg<aie2p.array.sender : tile<16xi32>>")
+            e(f"  %mbr{c} = receiver {kk[c, 1]}, 4 : reg<aie2p.array.receiver : tile<16xi32>>")
+            e(f"  %chm{c} = channel %mbs{c}, %mbr{c}, %one, %mbn : reg<aie2p.array.channel : tile<16xi32>>")
+            e(f"  constrain.leaf_sync %chm{c}")
     e("  return\n}\n")
 
 
@@ -344,7 +356,7 @@ def leaf_name(cfg, c, r):
     name = "tailr" if cfg.fuse == 2 and r else "tail"
     if cfg.fuse == 0 and r == 1 and os.environ.get("GN_QMB1"):   # (diag: row 1 reads row 0's W, gen_npu_gemm)
         name = "tailm"
-    if cfg.fuse == 0 and r == 0 and os.environ.get("GN_QMB1") in ("2", "3", "4"):   # (diag: row 0 reads W from row 1)
+    if cfg.fuse == 0 and r == 0 and os.environ.get("GN_QMB1") in ("2", "3", "4", "5"):   # (diag: row 0 reads W from row 1)
         name = "tailm0"
     if r and crel() and r < QROWS - 1:   # (a middle row of the relay chain: tailr<r>)
         name += str(r)

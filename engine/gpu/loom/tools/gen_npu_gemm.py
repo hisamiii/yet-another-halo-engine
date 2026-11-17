@@ -2408,8 +2408,14 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e(f"  %gn1{rs} = resource<native_pointer> {{index = {gp['nbr']}, source_type = buffer}} : reg<aie2p.ep>")
     if tail:
         e(f"  %o{rs} = resource<native_pointer> {{index = 2, source_type = buffer}} : reg<aie2p.ep>")
+    if name == "tailm0" and os.environ.get("GN_QMB1") == "5":
+        e("  %mbt3 = resource<native_pointer> {index = 3, source_type = buffer} : reg<aie2p.ep>")
+    if name == "tailm" and os.environ.get("GN_QMB1") == "5":
+        e("  %mbt4 = resource<native_pointer> {index = 4, source_type = buffer} : reg<aie2p.ep>")
     if pair:
         pair_park(e)
+    if name in ("tailm", "tailm0") and os.environ.get("GN_QMB1") == "5":   # (MB2 tokens: ports 3 own, 4 other)
+        pass
     if name == "tailm" and os.environ.get("GN_QMB1") == "1":   # (GN_QMB1, after the resources)
         e("  %wmbs = mov.address-to-scalar %wmb")
         e(f"  %wmbk = mov.i32 {int(os.environ.get('GN_QMB1_DELTA', 0x40000 - 0x70000))}")
@@ -3138,7 +3144,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
 
     wend = {}   # (GN_QWCONT) each sub-tile's final W FIFO state
     name = MBNAME[0]
-    mb2 = os.environ.get("GN_QMB1") in ("2", "3", "4") and name in ("tailm", "tailm0") and qpass
+    mb2 = os.environ.get("GN_QMB1") in ("2", "3", "4", "5") and name in ("tailm", "tailm0") and qpass
 
     def units_for(t):
         x = f"s{t}"
@@ -3158,7 +3164,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             # row 0 owns groups 0, 1, row 1 groups 2, 3; row 1 visits its groups rotated by NP / 2, so at any sub-tile the two
             # cores read different memories; the other half through the neighbour window. Row 1's output column halves swap.)
             mb3 = os.environ.get("GN_QMB1") == "3"   # (=3: every W pop from the other row's memory, no rotation)
-            rot = name == "tailm" and os.environ.get("GN_QMB1") == "2"   # (=4: the split halves, no rotation)
+            rot = name == "tailm" and os.environ.get("GN_QMB1") in ("2", "5")   # (=4: the split halves, no rotation)
             g = (tw + (NP // 2 if rot else 0)) % NP
             own = (g < NP // 2) == (name == "tailm0") and not mb3
             d = 0 if own else (0x60000 - 0x70000 if name == "tailm0" else 0x40000 - 0x70000)
@@ -3278,6 +3284,20 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             units[0] = keep + units[0]
         else:
             units[0] = init + units[0]
+        if mb2 and os.environ.get("GN_QMB1") == "5" and t in (0, NP // 2, NT):   # (MB2) the memory tokens, ahead of
+            # the sub-tile's W fill: first half = own memory's token (port 3, sender), second = the other's (port 4)
+            if name == "tailm0":   # (sender, port 3)
+                tl = (["  rel %one, 3", "  acq %am1, 3"] if t == 0 else
+                      ["  rel %one, 3", "  acq %am1, 3"] if t == NP // 2 else
+                      ["  rel.cond %one, %mbq, 3", "  acq.cond %am1, %mbq, 3"])
+            else:   # (receiver, port 4)
+                tl = (["  acq %am1, 4"] if t == 0 else
+                      ["  rel %one, 4", "  acq %am1, 4"] if t == NP // 2 else
+                      ["  rel %one, 4", "  acq.cond %am1, %mbq, 4"])
+            if t == NT:
+                (prologue if base - 3 < 0 else slots.setdefault(base - 3, [])).append(
+                    "  %mbq = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
+            (prologue if base < 0 else slots.setdefault(base, [])).extend(tl)
         for i, line in enumerate(early):
             g = base - (len(early) - i)
             (prologue if g < 0 else slots.setdefault(g, [])).append(line)

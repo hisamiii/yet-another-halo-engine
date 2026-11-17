@@ -228,7 +228,7 @@ def main():
         k1 = k0 + 8 * gp * sum(ks)
         part = unpack_c(raw, cols, nb, len(grp), g)
         ref = value(a[:, k0:k1]) @ (value(w[:, k0:k1]) if wq is None else wq[:, k0:k1]).T
-        if os.environ.get("GN_QMB1") == "2":   # (diag) row 1's tokens (second half) see their column halves swapped
+        if os.environ.get("GN_QMB1") in ("2", "5"):   # (diag) row 1's tokens (second half) see their column halves swapped
             for c in range(cols):
                 blk = ref[M // 2:, N.TN * c:N.TN * (c + 1)]
                 ref[M // 2:, N.TN * c:N.TN * (c + 1)] = np.roll(blk, -N.TN // 2, axis=1)
