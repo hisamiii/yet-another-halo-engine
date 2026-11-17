@@ -237,6 +237,21 @@ def qw4_on():
     return os.environ.get("GN_QW4") == "1"
 
 
+# GN_QPAIR=1 (WIP, with GN_QW4): pass pairs. A row's sub-tile visit runs passes 2 q and 2 q + 1 back to back (the C
+# sums cross one pass boundary in registers: half the C boundary loads / stores). The A stream then carries an M
+# block's records [pair][slab][pass in the pair] instead of [pass][slab] (qpair_perm; the host writes that order).
+def qpair_on():
+    return os.environ.get("GN_QPAIR") == "1"
+
+
+def qpair_perm(passes, mp=None):
+    """(GN_QPAIR) record j of an M block's pair-ordered A stream = record qpair_perm(...)[j] of the [pass][slab]
+    order: j = (q, s, h) -> pass 2 q + h, slab s."""
+    mp = mp or MP
+    assert passes % 2 == 0, passes
+    return [(2 * q + h) * mp + s for q in range(passes // 2) for s in range(mp) for h in range(2)]
+
+
 def qw4_deltas():
     """(GN_QW4) d1, d2 from GN_QPINS' W group."""
     w = [int(v) for v in os.environ["GN_QPINS"].split(",")[1].split("@")[1].split(":")]

@@ -129,7 +129,25 @@ def main():
     ra, _ = B.reference(a_in, "act", M, list(ks), passes, N.TM, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
     assert ra.size == sa and rw.size == sw
+    if N.qpair_on():   # (GN_QPAIR, WIP) an M block's A records in pair order [pair][slab][pass in the pair]
+        assert len(ks) == 1, ks
+        fa_ = N.slab(ks[0])
+        perm = N.qpair_perm(passes)
+        rec = ra.reshape(cfg.nb, passes * N.MP, fa_ // ra.itemsize)
+        pa_ = np.ascontiguousarray(rec[:, perm])
+        flat = ra.reshape(-1, fa_ // ra.itemsize)   # readout: each record = the flat stream's record at its own
+        for b_ in range(cfg.nb):                      # (block, pass, slab) offset, byte for byte
+            for j, src in enumerate(perm):
+                p_, s_ = src // N.MP, src % N.MP
+                assert np.array_equal(pa_[b_, j], flat[(b_ * passes + p_) * N.MP + s_]), (b_, j, src)
+        tags = [f"p{src // N.MP}s{src % N.MP}" for src in perm[:2 * N.MP + 2]]
+        print(f"A pair order (GN_QPAIR): block records 0..{len(tags) - 1} = {' '.join(tags)}; "
+              f"{cfg.nb} x {len(perm)} records checked against the [pass][slab] stream", flush=True)
+        ra = pa_.reshape(-1)
     ra.tofile(a_b)
+    if os.environ.get("NPU_HOSTONLY") == "1":   # (WIP readouts) stop before anything touches the NPU
+        print("NPU_HOSTONLY: host side done, no NPU run", flush=True)
+        sys.exit(0)
     rw.tofile(w_b)
     np.zeros(sc // 4, np.float32).tofile(c_b)
     co = os.path.join(work, "c_out.bin")
