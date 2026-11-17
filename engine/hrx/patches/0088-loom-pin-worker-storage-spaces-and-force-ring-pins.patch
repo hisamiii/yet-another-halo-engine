@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:00:00 +0100
+Subject: [PATCH] loom: pin worker storage spaces and force ring pins
+
+Experimental LOOM_EXP_SPACE_AT=<space>@<offset> places a worker storage space at a fixed offset; LOOM_EXP_RING_AT_FORCE=1 drops the ring-pin taken check, for a fully pinned leaf layout.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -1921,7 +1921,50 @@
+       continue;
+     }
+     loom_aie2p_array_local_memory_proposal_t proposal;
+-    if (!loom_aie2p_array_local_memory_propose_worker(
++    // Experimental LOOM_EXP_SPACE_AT=<space>@<offset>,...: a worker storage
++    // space (scratch, private) at a fixed owner offset in a 64 KB compute
++    // tile; the generator keeps the layout collision-free. The covered banks'
++    // cursors only grow (to the region's end in its last bank).
++    bool space_pinned = false;
++    {
++      iree_string_view_t pin_name = iree_string_view_empty();
++      (void)loom_low_storage_space_set_names(
++          loom_low_storage_space_set_for(storage_space), 1, &pin_name);
++      const char* pins = getenv("LOOM_EXP_SPACE_AT");
++      const loom_xdna_tile_facts_t* pin_facts = tile_state->resources.facts;
++      while (pins && *pins && pin_facts->memory.local_capacity == 65536u) {
++        const char* at = strchr(pins, '@');
++        if (!at) break;
++        char* end = NULL;
++        const unsigned long offset = strtoul(at + 1, &end, 0);
++        if ((iree_host_size_t)(at - pins) == pin_name.size &&
++            memcmp(pins, pin_name.data, pin_name.size) == 0 &&
++            offset % requirement.minimum_alignment == 0 &&
++            offset + requirement.byte_length <= 65536u) {
++          const uint32_t cap = pin_facts->memory.local_capacity /
++                               pin_facts->memory.bank_count;
++          const uint32_t last = (uint32_t)((offset + requirement.byte_length - 1u) / cap);
++          proposal = (loom_aie2p_array_local_memory_proposal_t){
++              .owner_offset = (uint32_t)offset,
++              .ending_bank_cursor = (uint32_t)(offset + requirement.byte_length - last * cap),
++              .first_bank = (uint8_t)(offset / cap),
++              .last_bank = (uint8_t)last,
++          };
++          space_pinned = true;
++          break;
++        }
++        pins = end && *end == ',' ? end + 1 : NULL;
++      }
++    }
++    if (space_pinned) {
++      uint32_t* cursors = tile_state->resources.bank_cursors;
++      const uint32_t cap = tile_state->resources.facts->memory.local_capacity /
++                           tile_state->resources.facts->memory.bank_count;
++      for (uint32_t b = proposal.first_bank; b <= proposal.last_bank; ++b) {
++        const uint32_t want = b < proposal.last_bank ? cap : proposal.ending_bank_cursor;
++        if (cursors[b] < want) cursors[b] = want;
++      }
++    } else if (!loom_aie2p_array_local_memory_propose_worker(
+             tile_state->resources.facts, tile_state->resources.bank_cursors,
+             requirement.byte_length, requirement.minimum_alignment,
+             &proposal)) {
+@@ -1933,9 +1976,11 @@
+           builder, i, storage_space_name, requirement.byte_length,
+           requirement.minimum_alignment);
+     }
+-    loom_aie2p_array_local_memory_commit(
+-        tile_state->resources.facts, &proposal,
+-        tile_state->resources.bank_cursors, &tile_state->resources.next_bank);
++    if (!space_pinned) {
++      loom_aie2p_array_local_memory_commit(
++          tile_state->resources.facts, &proposal,
++          tile_state->resources.bank_cursors, &tile_state->resources.next_bank);
++    }
+     builder->worker_storage[builder->worker_storage_cursor++] =
+         (loom_aie2p_array_worker_storage_plan_t){
+             .worker_index = i,
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+@@ -52,7 +52,10 @@
+       ++n;
+     } while (*end == ':');
+     bool taken = false;
+-    for (uint32_t i = 0; i < n && i < 16; ++i) {
++    // (LOOM_EXP_RING_AT_FORCE=1: every region is pinned, sizes are unique per
++    // tile; no taken check.)
++    const char* force = getenv("LOOM_EXP_RING_AT_FORCE");
++    for (uint32_t i = 0; i < n && i < 16 && !(force && atoi(force)); ++i) {
+       if (bank_cursors[offsets[i] / bank_capacity] >
+           offsets[i] % bank_capacity) {
+         taken = true;

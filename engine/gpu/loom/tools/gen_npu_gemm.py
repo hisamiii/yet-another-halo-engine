@@ -36,7 +36,7 @@ import sys
 import gen_bfp16_encode as GE
 
 MBMS4 = "(reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>"
-ORDER_C = (0, 2, 1, 3)   # MMA order of the 4 chains inside a k step (a-row, w-col: c >> 1, c & 1)
+ORDER_C = tuple(int(x) for x in os.environ.get("GN_ORDC", "0,2,1,3").split(","))   # MMA order of the 4 chains inside a k step (a-row, w-col: c >> 1, c & 1)
 LAGU = 9                 # pops issue 9 MMAs ahead of their first use (the pop -> operand latency)
 WB = 9                   # pops of the next sub-tile that ride in the cascade-write block (head, mids)
 MP, NP = int(os.environ.get("GN_QMP", "4")), 5   # 16-row slabs per M block / per NPU column (GN_QMP: Q' experiments)
@@ -2519,7 +2519,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     qbank = tail and os.environ.get("GN_QBANK") in ("1", "2", "3") and os.environ.get("GN_QCORE")
     q3 = qbank and os.environ.get("GN_QBANK") == "3"
     if qbank:   # (QBANK_RING_AT pins the slots) A slot 1 a 16 KB bank above slot 0 (a_next); C rows (body)
-        assert (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)) and not a_adv and MP in (4, 5) and NP in (4, 5, 6) and fa <= 4096
+        assert (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)) and not a_adv and MP in (4, 5) and NP in (4, 5, 6) and fa <= (4608 if qp1_on() else 4096)
     assert not q3 or qpass, "GN_QBANK=3 needs GN_QPASS=1"
     e(f"  %kks = mova.i32 {fa // 16}")
     e("  %fstep = mul %k144, %kks")   # slab stride
