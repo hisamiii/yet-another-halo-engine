@@ -111,7 +111,9 @@ def main():
         if "=" in kv:
             env[kv.split("=")[0]] = kv.split("=", 1)[1]
     run([hrx_paths.LOOM_COMPILE, src, f"--root=@{cfg.entry}", "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
-         f"--output={img}"], env, "loom-compile")
+         f"--output={img}"] + ([f"--compile-report={os.environ.get('NPU_REPORT_KIND', 'text-details')}",
+                                f"--compile-report-output={os.environ['NPU_REPORT']}"]
+                               if os.environ.get("NPU_REPORT") else []), env, "loom-compile")   # (diag) Loom's report
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
     sa, sw, sc = N.stream_bytes(cfg)
     a_in = a

@@ -22,6 +22,21 @@ def crel():
     return QROWS == 2 and os.environ.get("NPU_QCREL", "1") == "1"
 
 
+def qsplit():
+    """(NPU_QSPLIT=1, the C relay's 2 rows) the fill split: a step's raw rows arrive as one record [16 rows][slab]
+    [144 B] (the decoder's 576 B row: 4 slabs side by side), row 0 through its intake, row 1 as one W record; row 1
+    decodes slabs 2, 3 (slab 2 into its idle C ring, slab 3 into the split channel's ring), row 0 slabs 0, 1, then
+    egresses all four (row 1's through its north window). The split channel's locks hand a step's outputs over."""
+    on = os.environ.get("NPU_QSPLIT") == "1"
+    assert not on or crel(), "NPU_QSPLIT needs the C relay (NPU_QROWS=2)"
+    return on
+
+
+def qsplit_port(gate):
+    """Row 0's port for the split channel (past the relay's)."""
+    return {None: 6, "waiter": 9, "relay": 8}[gate]
+
+
 def crel_port(gate):
     """Row 0's port for row 1's C ring (past the filler's 0-4 and the gate's)."""
     return {None: 5, "waiter": 8, "relay": 7}[gate]
@@ -171,11 +186,18 @@ def array_program(L, cfg):
         e(f"  %fdn = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
         e(f"  %fd_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nrec}x{fw}xi32>>")
         # records [super-block][slab][16 rows][one block] (super-blocks are BLK apart in a row)
-        e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x{NP}x16x{rw}xi32, "
-          f"#encoding.layout.strided<strides=[{BLK // 4}, {16 * RS}, {RS}, 1]>>>")
+        if qsplit():   # (a step's 4 slabs side by side in each row: the decoder's 576 B record row)
+            rty = f"16x{NP}x{rw}"
+            e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x16x{NP}x{rw}xi32, "
+              f"#encoding.layout.strided<strides=[{BLK // 4}, {RS}, {16 * RS}, 1]>>>")
+            e(f"  %fsn = constant.u32 {U * N.FUSE_SB} : reg<aie2p.array.scalar : index>")
+        else:
+            rty = f"16x{rw}"
+            e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x{NP}x16x{rw}xi32, "
+              f"#encoding.layout.strided<strides=[{BLK // 4}, {16 * RS}, {RS}, 1]>>>")
         for c in range(cols):
             e(f"  %fro{c} = constant.u64 {c * N.TN * RS * 4} : reg<aie2p.array.offset : offset>")
-            e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{rw}xi32>>")
+            e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<{rty}xi32>>")
             for r in range(1):   # (row 0 fills; the rows below see its raw rows as W records: gen_npu_gemm.qf_skip_raw)
                 t = f"{c}_{r}"
                 e(f"  %fdlane{c} = constant.u32 {c} : reg<aie2p.array.scalar : index>")
@@ -183,8 +205,9 @@ def array_program(L, cfg):
                 e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
                 e(f"  %chd{t} = channel %fds{t}, %fdr{t}, %two, %fdn : reg<aie2p.array.channel : tile<{fw}xi32>>")
                 e(f"  constrain.leaf_sync %chd{t}")
-                e(f"  %frr{t} = receiver {kk[c, r]}, {sp} : reg<aie2p.array.receiver : tile<16x{rw}xi32>>")
-                e(f"  %chr{t} = channel %fru{c}, %frr{t}, %one, %fun : reg<aie2p.array.channel : tile<16x{rw}xi32>>")
+                e(f"  %frr{t} = receiver {kk[c, r]}, {sp} : reg<aie2p.array.receiver : tile<{rty}xi32>>")
+                e(f"  %chr{t} = channel %fru{c}, %frr{t}, %one, {'%fsn' if qsplit() else '%fun'} : "
+                  f"reg<aie2p.array.channel : tile<{rty}xi32>>")
                 e(f"  constrain.stage %chr{t}, %n{c if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chr{t}")
     jt = len(L)
@@ -228,6 +251,15 @@ def array_program(L, cfg):
         e("  constrain.core_stream %chgs")
         e("  constrain.gate %chgs")
         e("  constrain.signal %chgs")
+    if fz and qsplit():   # row 1 -> row 0: a step's slab-3 output (slab 2: row 1's C ring), one record a step
+        rq = 2 * N.decoder(cfg.fmt, cfg.gord).OUT_B // 4
+        e(f"  %qsn = constant.u32 {N.QF['cfg'].passes * N.FUSE_SB} : reg<aie2p.array.scalar : index>")
+        for c in range(cols):
+            g = "waiter" if cfg.gate and c == 1 else "relay" if cfg.gate and c == 2 else None
+            e(f"  %qss{c} = sender {kk[c, 1]}, 3 : reg<aie2p.array.sender : tile<{rq}xi32>>")
+            e(f"  %qsr{c} = receiver {kk[c, 0]}, {qsplit_port(g)} : reg<aie2p.array.receiver : tile<{rq}xi32>>")
+            e(f"  %chq{c} = channel %qss{c}, %qsr{c}, %one, %qsn : reg<aie2p.array.channel : tile<{rq}xi32>>")
+            e(f"  constrain.leaf_sync %chq{c}")
     e("  return\n}\n")
 
 
@@ -282,6 +314,7 @@ def gen(cfg):
         N.QF["cfg"] = None
     N.QF["rows"] = QROWS
     N.QF["crel"] = crel_port if crel() else None
+    N.QF["split"] = qsplit_port if qsplit() else None
     array_program(L, cfg)
     for name, gate in leaves(cfg):   # (tailr: the GEMM leaf without the fill, skipping the raw rows)
         fill = cfg.fuse == 2 and not name.startswith("tailr")
