@@ -37,6 +37,15 @@ def qsplit():
     return on
 
 
+def qdec():
+    """(NPU_QDEC=1, fuse 2) decoder rows: a core above the compute rows decodes its column's panel (raw on its own DMA
+    ring, a step's record [16 rows][slab][144 B]; its scratch private), egresses it into the panel, and computes
+    nothing; the compute rows run the GEMM leaf without the fill."""
+    on = os.environ.get("NPU_QDEC") == "1"
+    assert not on or (QROWS == 1 and not qsplit()), "NPU_QDEC: one compute row for now"
+    return on
+
+
 def qsplit_port(gate):
     """Row 0's port for the split channel (past the relay's)."""
     return {None: 6, "waiter": 9, "relay": 8}[gate]
@@ -97,7 +106,8 @@ def array_program(L, cfg):
     gw, gr = qgate(cfg)
     e("aie2p.target<array> @array_target\naie2p.target<core> @core_target\n")
     e(f"low.func.def public retain target<amd.xdna.aie2p.array>(@array_target) abi(array_program) @{cfg.entry}() asm {{")
-    for k, v in (("zero", 0), ("one", 1), ("two", 2), ("nw", cols * R), ("rec", nbr * P)):
+    RW_ = R + (1 if qdec() else 0)   # (worker rows: the compute rows, then the decoder row)
+    for k, v in (("zero", 0), ("one", 1), ("two", 2), ("nw", cols * RW_), ("rec", nbr * P)):
         e(f"  %{k} = constant.u32 {v} : reg<aie2p.array.scalar : index>")
     e("  %origin = constant.u64 0 : reg<aie2p.array.offset : offset>")
     e("  %workers = group %nw")
@@ -108,9 +118,10 @@ def array_program(L, cfg):
         e(f"  %n{i} = constant.u32 {i} : reg<aie2p.array.scalar : index>")
     kk = {}
     for c in range(cols):
-        for r in range(R):
+        for r in range(RW_):
             kk[c, r] = f"%k{c}_{r}"
-            e(f"  %lane{c}_{r} = constant.u32 {c * R + r} : reg<aie2p.array.scalar : index>")
+            lane_ = c * R + r if r < R else cols * R + c   # (compute lanes first: the C partitions index them)
+            e(f"  %lane{c}_{r} = constant.u32 {lane_} : reg<aie2p.array.scalar : index>")
             # (fuse 2: row 0 decodes its column's panel; the rows below read it, a leaf without the fill)
             e(f"  {kk[c, r]} = worker %workers, %lane{c}_{r}, @{leaf_name(cfg, c, r)}")
             e(f"  constrain.location {kk[c, r]}, %n{c}, %n{2 + r}")
@@ -202,6 +213,9 @@ def array_program(L, cfg):
         nraw, rw = U * N.FUSE_SB * NP, BLK // 4
         while R > 1 and nraw * 64 * rw % N.QF["wslot"]:
             rw += 1
+        if qdec():   # (the split's record: a step's NP slabs side by side, 144 B each: the decoder's 576 B row)
+            rw = N.decoder(cfg.fmt, cfg.gord).RECROW // (4 * NP)
+        dr = R if qdec() else 0   # (the decoding worker's row)
         assert 4 * rw <= N.decoder(cfg.fmt, cfg.gord).RECROW
         N.QF["rawn"], N.QF["raww"] = nraw, rw
         dp, sp = N.QF_PORTS
@@ -212,7 +226,7 @@ def array_program(L, cfg):
         e(f"  %fdn = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
         e(f"  %fd_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nrec}x{fw}xi32>>")
         # records [super-block][slab][16 rows][one block] (super-blocks are BLK apart in a row)
-        if qsplit():   # (a step's 4 slabs side by side in each row: the decoder's 576 B record row)
+        if qsplit() or qdec():   # (a step's 4 slabs side by side in each row: the decoder's 576 B record row)
             rty = f"16x{NP}x{rw}"
             e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x16x{NP}x{rw}xi32, "
               f"#encoding.layout.strided<strides=[{BLK // 4}, {RS}, {16 * RS}, 1]>>>")
@@ -224,7 +238,7 @@ def array_program(L, cfg):
         for c in range(cols):
             e(f"  %fro{c} = constant.u64 {c * N.TN * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<{rty}xi32>>")
-            for r in range(1):   # (row 0 fills; the rows below see its raw rows as W records: gen_npu_gemm.qf_skip_raw)
+            for r in (dr,):   # (row 0 fills; the rows below see its raw rows as W records: gen_npu_gemm.qf_skip_raw)
                 t = f"{c}_{r}"
                 e(f"  %fdlane{c} = constant.u32 {c} : reg<aie2p.array.scalar : index>")
                 e(f"  %fdr{t} = partition.receiver %fd_all, %origin, %fdlane{c}, %fdl : reg<aie2p.array.receiver : tile<{fw}xi32>>")
@@ -232,16 +246,17 @@ def array_program(L, cfg):
                 e(f"  %chd{t} = channel %fds{t}, %fdr{t}, %two, %fdn : reg<aie2p.array.channel : tile<{fw}xi32>>")
                 e(f"  constrain.leaf_sync %chd{t}")
                 e(f"  %frr{t} = receiver {kk[c, r]}, {sp} : reg<aie2p.array.receiver : tile<{rty}xi32>>")
-                e(f"  %chr{t} = channel %fru{c}, %frr{t}, %one, {'%fsn' if qsplit() else '%fun'} : "
-                  f"reg<aie2p.array.channel : tile<{rty}xi32>>")
-                e(f"  constrain.stage %chr{t}, %n{c if cols > 1 else 1}")
+                e(f"  %chr{t} = channel %fru{c}, %frr{t}, {'%n3' if qdec() else '%one'}, "
+                  f"{'%fsn' if qsplit() or qdec() else '%fun'} : reg<aie2p.array.channel : tile<{rty}xi32>>")
+                if not qdec() or os.environ.get("GN_QDSTAGE", "1") == "1":   # (decoder rows: staged too, else shim to core)
+                    e(f"  constrain.stage %chr{t}, %n{c if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chr{t}")
     jt = len(L)
     if fz:   # filled by the core's egress; its raw rows land in its W ring's first slot
         L[iw:jt] = L[jf:jt] + L[iw:ia] + L[ia:jf]
         for c in range(cols):
-            e(f"  constrain.fill %chw{c}_0, %chd{c}_0")
-            for r in range(1):
+            e(f"  constrain.fill %chw{c}_0, %chd{c}_{dr}")
+            for r in (() if qdec() else range(1)):
                 t = f"{c}_{r}"
                 e(f"  %fioff{t} = constant.u32 0 : reg<aie2p.array.scalar : index>")
                 e(f"  %firows{t} = constant.u32 16 : reg<aie2p.array.scalar : index>")
@@ -310,6 +325,8 @@ def gate_row():
 
 def leaf_name(cfg, c, r):
     """Worker (c, r)'s leaf: tail (fuse 2: row 0 decodes the panel), tailr (the rows below), _gw / _gr: the gate's."""
+    if qdec() and r == QROWS:
+        return "qdec"
     name = "tailr" if cfg.fuse == 2 and r else "tail"
     if r and crel() and r < QROWS - 1:   # (a middle row of the relay chain: tailr<r>)
         name += str(r)
@@ -324,7 +341,7 @@ def leaves(cfg):
     """[(name, gate role)] of the image's distinct leaves."""
     out = {}
     for c in range(cfg.cols):
-        for r in range(QROWS):
+        for r in range(QROWS + (1 if qdec() else 0)):
             n = leaf_name(cfg, c, r)
             out[n] = "waiter" if n.endswith("_gw") else "relay" if n.endswith("_gr") else None
     return list(out.items())
@@ -344,10 +361,14 @@ def gen(cfg):
     N.QF["crel"] = crel_port if crel() else None
     N.QF["crelmid"] = crel_mid_port() if crel() else None
     N.QF["split"] = qsplit_port if qsplit() else None
+    N.QF["dec"] = qdec()
     array_program(L, cfg)
     i0 = len(L)
     for name, gate in leaves(cfg):   # (tailr: the GEMM leaf without the fill, skipping the raw rows)
-        fill = cfg.fuse == 2 and not name.startswith("tailr")
+        if name == "qdec":
+            N.qdec_leaf(L, cfg)
+            continue
+        fill = cfg.fuse == 2 and not name.startswith("tailr") and not qdec()
         N.leaf(L, cfg, "tail", cfg.ks[0], cov=(0,) if fill else None, gate=gate, name=name)
     if qfix():   # (any acquire / release of the dropped ports: the unrolled copies' renamed operands too)
         import re

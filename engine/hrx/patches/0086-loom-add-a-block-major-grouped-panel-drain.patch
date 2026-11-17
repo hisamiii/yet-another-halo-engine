@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 05:00:00 +0100
+Subject: [PATCH] loom : add a block-major grouped panel drain
+
+LOOM_EXP_PANEL_BLOCKMAJOR=1 chains a replay's group descriptors in one task: a group refills once every block passed it.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1132,6 +1132,15 @@
+   return iree_any_bit_set(dma->flags, LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE);
+ }
+
++// Experimental: LOOM_EXP_PANEL_BLOCKMAJOR=1 drains a grouped panel block-major: one task over the chain of its
++// group descriptors (each acquires its group's ready lock and returns its credit), repeated per replay, instead of
++// one task per group replaying it (group-major). A group's credits then return once the LAST replay passes it, so a
++// streamed panel refills group g with the next call's weights while the last replay reads the later groups.
++static bool loom_aie2p_program_panel_blockmajor(void) {
++  const char* value = getenv("LOOM_EXP_PANEL_BLOCKMAJOR");
++  return value != NULL && atoi(value) != 0;
++}
++
+ // One memory-tile ring descriptor of a staged channel. Pass-through rings loop:
+ // the stream-to-memory side acquires credit and releases ready per record, the
+ // memory-to-stream side the reverse. Replaying rings (stage_repeat_count > 1)
+@@ -1354,7 +1363,8 @@
+       LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_USE_NEXT_BD,
+       pair_drain ? 1
+       : (replay && last_slot && !(stream && fill)) ||
+-              (gated_drain && groups > 1)
++              (gated_drain && groups > 1 &&
++               !(loom_aie2p_program_panel_blockmajor() && group + 1 < groups))
+           ? 0
+           : 1,
+       &words[1]);
+@@ -1554,7 +1564,7 @@
+   }
+   if (drain && replay && groups > 1) {
+     // One task per group, queued in order: each replays its group descriptor.
+-    for (uint32_t g = 0; g < groups; ++g) {
++    for (uint32_t g = 0; g < (loom_aie2p_program_panel_blockmajor() ? 1u : groups); ++g) {
+       loom_aie2p_register_update_t task =
+           loom_aie2p_program_resolve_field_update(
+               builder->plan,
+@@ -2013,7 +2023,10 @@
+           loom_aie2p_program_queue_intake_core(builder, intake));
+     }
+     const uint16_t indices[] = {dma->dma_channel};
+-    for (uint32_t g = 0; g < channel->stage_panel_group_count; ++g) {
++    const uint32_t drain_tasks = loom_aie2p_program_panel_blockmajor()
++                                     ? 1u
++                                     : channel->stage_panel_group_count;
++    for (uint32_t g = 0; g < drain_tasks; ++g) {
+       loom_aie2p_register_update_t task =
+           loom_aie2p_program_resolve_field_update(
+               plan,
