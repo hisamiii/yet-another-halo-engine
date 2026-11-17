@@ -68,6 +68,15 @@ class NpuProf {
       mt_sel_ = (a & 7) | (b & 7) << 8 | (c & 7) << 16 | (d & 7) << 24;
     }
     if (const char* e = std::getenv("YAH_NPU_PROF_SHIM")) std::sscanf(e, "%u,%u", &sh_[0], &sh_[1]);
+    // YAH_NPU_PROF_COMBO="a,b,c,d,o0,o1,o2": the core modules' combo events (9 = a o0 b, 10 = c o1 d, 11 = 9 o2 10;
+    // op 0 AND, 1 AND NOT, 2 OR, 3 OR NOT), e.g. 26,20,26,21,0,0,0: lock stalls in PC ranges 0-1 / 2-3
+    if (const char* e = std::getenv("YAH_NPU_PROF_COMBO")) {
+      unsigned v[7] = {};
+      if (std::sscanf(e, "%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]) != 7)
+        throw LoomError("YAH_NPU_PROF_COMBO: want a,b,c,d,o0,o1,o2");
+      combo_[0] = (v[0] & 127) | (v[1] & 127) << 8 | (v[2] & 127) << 16 | (v[3] & 127) << 24;
+      combo_[1] = (v[4] & 3) | (v[5] & 3) << 8 | (v[6] & 3) << 16;
+    }
     // READ_REGS (transaction custom op 130): {op, col, row, pad, u32 size}, u32 count, u32 pad, u64 addresses
     read_.assign(16 + 8 * addr.size(), 0);
     read_[0] = 130;
@@ -123,6 +132,7 @@ class NpuProf {
         for (std::uint32_t r = 0; r < kCore; ++r) Write(ops, t + 0x31520 + 4 * r, 0);
         for (std::uint32_t r = 0; r < kMem; ++r) Write(ops, t + 0x11020 + 4 * r, 0);
         for (std::uint32_t r = 0; r < 4; ++r) Write(ops, t + 0x32020 + 4 * r, pc[col][row - kRow0][r]);
+        Write(ops, t + 0x34400, combo_[0]), Write(ops, t + 0x34404, combo_[1]);   // (YAH_NPU_PROF_COMBO)
         Write(ops, t + 0x31500, ctl(c_[0], c_[1])), Write(ops, t + 0x31504, ctl(c_[2], c_[3]));
         Write(ops, t + 0x11000, ctl(m_[0], m_[1]));
       }
@@ -138,7 +148,7 @@ class NpuProf {
     return ops;
   }
   std::uint32_t SetupOps() const {
-    return cols_ * kRows * (3 + kCore + kMem + 4 + 3) + cols_ * (3 + kMt + kShim + 1 + 3);
+    return cols_ * kRows * (3 + kCore + kMem + 4 + 2 + 3) + cols_ * (3 + kMt + kShim + 1 + 3);
   }
   // words per job (kValues with the engine's 8 columns)
   std::uint32_t Values() const { return cols_ * kRows * kRegs + cols_ * (kMt + kShim) + 2; }
@@ -200,6 +210,7 @@ class NpuProf {
     ops.insert(ops.end(), op, op + 24);
   }
 
+  std::uint32_t combo_[2] = {};
   std::uint32_t cols_ = kCols;
   unsigned c_[kCore] = {}, m_[kMem] = {}, mt_[kMt] = {}, sh_[kShim] = {};
   std::uint32_t mt_sel_ = 0;

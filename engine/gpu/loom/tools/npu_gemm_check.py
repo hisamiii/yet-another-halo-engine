@@ -243,6 +243,12 @@ def main():
         last = cyc.reshape(cols, nb, N.MP)[0, ::R_, -1] if rel_ else cyc.reshape(cols, nb, N.MP)[0, :nb // R_, -1]
         if os.environ.get("NPU_QCREL") == "2":   # (P1 pair relay: core 0's blocks 0, 2, .. of pair 0's half; merged: 0, 4, ..)
             last = cyc.reshape(cols, nb, N.MP)[0, ::4, -1] if mrel else cyc.reshape(cols, nb, N.MP)[0, :nb // (R_ // 2):2, -1]
+            if mrel:   # (each row's own blocks: staged row q owns 4 f + q, else row 2 p + j owns 4 f + 2 j + p)
+                c4_ = cyc.reshape(cols, nb, N.MP)[0, :, -1]
+                for r_ in range(4):
+                    b_ = r_ if N.qcstage_on() else 2 * (r_ % 2) + r_ // 2
+                    st_ = np.diff(c4_[b_::4])
+                    print(f"  row {r_} (column 0): median {float(np.median(st_)):.0f} min {st_.min()} max {st_.max()}")
         if rel_:
             for r_ in range(R_):
                 st_ = np.diff(cyc.reshape(cols, nb, N.MP)[0, r_::R_, -1])
