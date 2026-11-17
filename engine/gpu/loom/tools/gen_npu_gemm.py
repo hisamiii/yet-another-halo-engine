@@ -3286,10 +3286,12 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     # at a time: each conditional line 3 MMAs after its copy)
                     ra, rw = (int(x) for x in os.environ.get("GN_QLOCKR", "3,24").split(","))   # release offsets
                     assert base + max(ra, rw) < (NT * ks + QE2r) * 4, "a lock line past the last window is dropped"
-                    for g, ln in ((base - 12, "  %cqn = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>"),
-                                  (base - 9, "  acq.cond %am1, %cqn, 0"),
-                                  (base - 8, "  %waq = copy %wwa : reg<aie2p.er> -> reg<aie2p.mr26_lock>"),
-                                  (base - 5, "  acq.cond %am1, %waq, 1"),
+                    qa_, qw_ = (int(x) for x in os.environ.get("GN_QLOCKA", "9,5").split(","))   # acquire offsets
+                    assert qa_ - 3 > qw_, "the A acquire ahead of the W slot's r26 copy"
+                    for g, ln in ((base - qa_ - 3, "  %cqn = copy %nxm : reg<aie2p.er> -> reg<aie2p.mr26_lock>"),
+                                  (base - qa_, "  acq.cond %am1, %cqn, 0"),
+                                  (base - qw_ - 3, "  %waq = copy %wwa : reg<aie2p.er> -> reg<aie2p.mr26_lock>"),
+                                  (base - qw_, "  acq.cond %am1, %waq, 1"),
                                   (base + ra, "  rel %one, 0"),
                                   (base + rw - 3, "  %wrq = copy %wrap : reg<aie2p.er> -> reg<aie2p.mr26_lock>"),
                                   (base + rw, "  rel.cond %one, %wrq, 1")):
