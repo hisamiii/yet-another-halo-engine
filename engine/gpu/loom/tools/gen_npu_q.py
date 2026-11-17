@@ -165,7 +165,7 @@ def array_program(L, cfg):
         e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R}x{nbr * MP}x{rec}xi32>>")
     if N.crelp_on():   # (NPU_QCREL=2) [col][pair][its blocks]: row 2p + j takes pair p's blocks 2 f + j; row 2p's
         # stream carries both rows' (row 2p + 1's C ring read in place by row 2p, copied after its own)
-        assert R % 2 == 0 and (cfg.fuse != 2 or N.qp1k_on()) and not cfg.gate
+        assert R % 2 == 0 and (cfg.fuse != 2 or N.qp1k_on())
         L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr * MP}x{rec}xi32>>")
         e(f"  %ncolp = constant.u32 {cols * R // 2} : reg<aie2p.array.scalar : index>")
         e(f"  %nseg2 = constant.u32 {2 * nbr * MP} : reg<aie2p.array.scalar : index>")
@@ -177,6 +177,8 @@ def array_program(L, cfg):
                 e(f"  %sc{t} = sender {kk[c, q]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
                 e(f"  %chc{t} = channel %sc{t}, %cr{t}, {cd}, %nseg2 : reg<aie2p.array.channel : tile<{rec}xi32>>")
                 e(f"  constrain.leaf_sync %chc{t}")
+                if os.environ.get("GN_QEMERGE") == "1":   # (LOOM_EXP_EGRESS_MERGE) the column's memtile merges its pairs'
+                    e(f"  constrain.stage %chc{t}, %n{c if cols > 1 else 1}")   # streams into one shim write
                 e(f"  %cr{u} = receiver {kk[c, q]}, 5 : reg<aie2p.array.receiver : tile<{rec}xi32>>")
                 e(f"  %sc{u} = sender {kk[c, q + 1]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
                 e(f"  %chc{u} = channel %sc{u}, %cr{u}, {cd}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
@@ -404,7 +406,7 @@ def array_program(L, cfg):
         # order. Row 0 (sender, port 3): a ready pre-released at the firing start, then acquire a credit before and release
         # a ready after each half (the last half's release skipped); row 1 (receiver, port 4): acquire a ready before and
         # release a credit after each half. Per firing 2 MP passes of each.
-        assert R % 2 == 0 and (not fz or N.qp1k_on()) and not cfg.gate and not crel()   # (one channel per vertical pair)
+        assert R % 2 == 0 and (not fz or N.qp1k_on()) and not crel()   # (one channel per vertical pair)
         e(f"  %mbn = constant.u32 {nbr * P * MP * 2} : reg<aie2p.array.scalar : index>")
         for c in range(cols):
             for q in range(0, R, 2):
@@ -424,7 +426,7 @@ def qgate(cfg):
         return None, None
     assert cfg.cols >= 3
     r = gate_row()
-    b = 5 if r == 0 and cfg.fuse == 2 else 3
+    b = 5 if (r == 0 and cfg.fuse == 2) or os.environ.get("GN_QMB1") == "5" else 3   # (MB2: row q + 1 receives on 4)
     N.QF["gports"] = {"col": 1, "waiter": dict(row=r, poll=b, tick=b + 1, nbr=b + 2),
                       "relay": dict(col=2, row=r, nbr=b, sig=b + 1)}
     return (1, r), (2, r)
@@ -443,8 +445,10 @@ def leaf_name(cfg, c, r):
     pr = r % 2 if os.environ.get("GN_QMB1") == "5" and QROWS % 2 == 0 else r   # (MB2 / P1: each vertical pair)
     if cfg.fuse == 2 and N.qp1k_on():   # (P1K fill) row 1 decodes; row 3 shares its W stream: it skips the raw records
         # (s); rows 0, 2 read the other half's stream (GN_QP1RAW1=1: the raw reaches them too)
-        return ("tailm" if r == 1 else "tailms") if pr == 1 else (
+        name = ("tailm" if r == 1 else "tailms") if pr == 1 else (
             "tailm0s" if os.environ.get("GN_QP1RAW1") == "1" else "tailm0")
+        return name + ("_gw" if cfg.gate and (c, r) == (1, gate_row()) else
+                       "_gr" if cfg.gate and (c, r) == (2, gate_row()) else "")
     if cfg.fuse == 0 and pr == 1 and os.environ.get("GN_QMB1"):   # (diag: row 1 reads row 0's W, gen_npu_gemm)
         name = "tailm"
     if cfg.fuse == 0 and pr == 0 and os.environ.get("GN_QMB1") in ("2", "3", "4", "5"):   # (diag: row 0 reads W from row 1)

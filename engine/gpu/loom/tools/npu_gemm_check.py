@@ -156,12 +156,18 @@ def main():
     ra, _ = B.reference(a_in, "act", M, list(ks), passes, N.TM, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
     assert ra.size == sa and rw.size == sw
-    if QMODE and os.environ.get("NPU_QCREL") == "2":   # (pair relay) row 2 p + j reads its blocks p nb / 2 + 2 f + j in order
+    mrel = os.environ.get("NPU_QCREL") == "2" and os.environ.get("GN_QEMERGE") == "1"
+    if QMODE and mrel:   # (pair relay + merge: the memtile drains the pairs' streams a block in turn) row 2 p + j owns
+        R_ = int(os.environ.get("NPU_QROWS", "2"))   # blocks 4 f + 2 j + p, so the merged drain is M block order
+        assert R_ == 4
+        src = [4 * f + 2 * (q % 2) + q // 2 for q in range(R_) for f in range(nb // R_)]
+        ra = np.ascontiguousarray(ra.view(np.uint8).reshape(nb, -1)[src]).reshape(-1).view(ra.dtype)
+    elif QMODE and os.environ.get("NPU_QCREL") == "2":   # (pair relay) row 2 p + j reads its blocks p nb / 2 + 2 f + j in order
         R_ = int(os.environ.get("NPU_QROWS", "2"))
         nbr_ = nb // R_
         src = [(q // 2) * 2 * nbr_ + 2 * f + q % 2 for q in range(R_) for f in range(nbr_)]
         ra = np.ascontiguousarray(ra.view(np.uint8).reshape(nb, -1)[src]).reshape(-1).view(ra.dtype)
-    if QMODE and os.environ.get("GN_QEMERGE") == "1":   # (egress merge) row r reads blocks b R + r: the merged drain
+    elif QMODE and os.environ.get("GN_QEMERGE") == "1":   # (egress merge) row r reads blocks b R + r: the merged drain
         R_ = int(os.environ.get("NPU_QROWS", "2"))         # writes [b][r] = M block order
         nbr_ = nb // R_
         src = [b * R_ + r for r in range(R_) for b in range(nbr_)]
@@ -234,18 +240,19 @@ def main():
             w4_ = np.fromfile(co, np.uint32).reshape(-1, seg // 4)[:, :4].astype(np.int64)
             np.save(os.path.join(work, "tl.npy"), w4_.reshape(cols, nb, N.MP, 4))
         R_ = int(os.environ.get("NPU_QROWS", "1"))
-        rel_ = R_ >= 2 and (os.environ.get("NPU_QCREL", "1") == "1" or os.environ.get("GN_QEMERGE") == "1")   # (C relay
+        rel_ = R_ >= 2 and (os.environ.get("NPU_QCREL", "1") == "1" or (os.environ.get("GN_QEMERGE") == "1"
+                                                                      and os.environ.get("NPU_QCREL") != "2"))   # (C relay
         # or egress merge: row r's blocks r, r + R, ..)
         last = cyc.reshape(cols, nb, N.MP)[0, ::R_, -1] if rel_ else cyc.reshape(cols, nb, N.MP)[0, :nb // R_, -1]
-        if os.environ.get("NPU_QCREL") == "2":   # (P1 pair relay: core 0's blocks 0, 2, .. of pair 0's half)
-            last = cyc.reshape(cols, nb, N.MP)[0, :nb // (R_ // 2):2, -1]
+        if os.environ.get("NPU_QCREL") == "2":   # (P1 pair relay: core 0's blocks 0, 2, .. of pair 0's half; merged: 0, 4, ..)
+            last = cyc.reshape(cols, nb, N.MP)[0, ::4, -1] if mrel else cyc.reshape(cols, nb, N.MP)[0, :nb // (R_ // 2):2, -1]
         if rel_:
             for r_ in range(R_):
                 st_ = np.diff(cyc.reshape(cols, nb, N.MP)[0, r_::R_, -1])
                 print(f"  row {r_} (core 0): median {float(np.median(st_)):.0f} min {st_.min()} max {st_.max()}")
         if os.environ.get("GN_QFCYC") == "1" and fuse == 2:   # (the filler's fill words 1-3 of its blocks' segments)
             w4f = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[0, :, :, :4].astype(np.int64)
-            fb_ = 1 if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
+            fb_ = (2 if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
             v_ = w4f[fb_, -1]
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
         step = np.diff(last)
@@ -323,6 +330,12 @@ def main():
                         rc_ = ref[:, N.TN * c:N.TN * (c + 1)]
                         i0 = bad[0]
                         print("  first bad:", i0.tolist(), "got", pc_[i0[0], i0[1]], "want", rc_[i0[0], i0[1]])
+                        if os.environ.get("NPU_BLKMAP"):   # (diag) per output M block: the reference block it holds
+                            tb = N.MP * 16
+                            pb = pc_.reshape(nb, tb, -1)
+                            rb = rc_.reshape(nb, tb, -1)
+                            print("  block map:", [int(np.argmin([np.nanmean(np.abs(pb[b] - rb[b2])) for b2 in range(nb)]))
+                                                   for b in range(nb)])
                         if os.environ.get("NPU_SRCMAP"):   # (diag) which reference column's values this column holds
                             fin_ = np.isfinite(pc_)
                             near = [float(np.mean(np.isclose(pc_[fin_], ref[:, N.TN * c2:N.TN * (c2 + 1)][fin_], rtol=1e-2)))

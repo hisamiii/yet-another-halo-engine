@@ -2490,8 +2490,10 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     assert MP % cfg.mu == 0 and (a_adv or cfg.mu % acap == 0 or (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4))), \
         "ring slot of a row must be static per iteration"
     name = name or role + ("_g" if gate else "")
+    full_name = name
+    name = name[:-3] if name.endswith(("_gw", "_gr")) and gate else name   # (the gate role rides in gate)
     skp1 = name in ("tailm0s", "tailms")   # (P1K fill) a P1 leaf that skips the raw records: its pair role without the s
-    full_name, name = name, (name[:-1] if skp1 else name)
+    name = name[:-1] if skp1 else name
     fills = cov is not None
     lk = "" if tail and os.environ.get("GN_QUNLOCK") else "schedule(locked) "   # (probe: Loom's scheduler orders it)
     e(f"low.func.def {lk}target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{full_name}() asm {{")
