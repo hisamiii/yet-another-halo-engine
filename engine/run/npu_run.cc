@@ -95,6 +95,8 @@ int main(int argc, char** argv) {
         for (std::uint32_t c = 0; c < columns; ++c, at += 6)
           std::printf("npu_run: prof memtile %u %u %u %u %u shim %u %u\n", c, v[at], v[at + 1], v[at + 2], v[at + 3],
                       v[at + 4], v[at + 5]);
+      } else if (std::getenv("NPU_RUN_GATED")) {   // (diagnosis) a gated image: its setup, then one job of one call
+        npu.RunGatedOnce(image, entry, views, std::max(1, std::atoi(std::getenv("NPU_RUN_GATED"))));
       } else {
         npu.RunOnce(image, entry, views);
       }

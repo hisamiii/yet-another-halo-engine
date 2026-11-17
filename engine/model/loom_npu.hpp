@@ -99,6 +99,9 @@ class LoomNpu {
     // push with its weight fills unpaced, for the first call of a job (nothing computes yet that pacing would
     // protect). Not streamed (four invocations, one replay group, HRX patch 0017): call runs one whole call.
     bool streamed = true;
+    // Streamed: calls queued ahead of their waits (QueueDepth: 2, or 1 where one call's pushes fill a DMA channel's
+    // task queue past half, e.g. layout Q''s 4 W tasks a call: a second call's would overflow it)
+    int depth = 2;
     amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{}, gate{}, done{}, call{};
     std::vector<iree_hal_amd_xdna_executable_storage_t> storage;
     std::vector<amdf_host_mapping_t*> storage_maps;
@@ -333,9 +336,64 @@ class LoomNpu {
   // call (run/npu_run for tools/npu_gemm_check.py and npu_attn_check.py).
   void RunOnce(const std::string& path, const std::string& entry, const std::vector<View>& views) {
     Kernel& k = Load(path, entry, views, false);
+    DumpInvocations(k, Call{});
     program_.Forget();   // a whole program load: the array holds nothing the gated paths know
     ++epoch_;
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k.first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(run)");
+    CheckHealth();
+  }
+  // (diagnosis) NPU_RUN_DUMP=<dir>: k's invocation bytes as bound into <dir>/<name>.bin
+  void DumpInvocations(const Kernel& k, const Call& c) const {
+    const char* dir = std::getenv("NPU_RUN_DUMP");
+    if (!dir) return;
+    auto put = [&](const char* name, const std::vector<std::uint8_t>& b) {
+      if (b.empty()) return;
+      if (std::FILE* f = std::fopen((std::string(dir) + "/" + name + ".bin").c_str(), "wb")) {
+        std::fwrite(b.data(), 1, b.size(), f);
+        std::fclose(f);
+      }
+    };
+    put("first", FirstBytes(k));
+    put("gate", c.gate), put("done", c.done), put("call", c.call), put("lead", c.lead), put("wait", c.wait);
+    put("push0", c.push[0]), put("push1", c.push[1]);
+  }
+  // (diagnosis, run/npu_run NPU_RUN_GATED=<calls>) A gated image's setup, then one job of that many calls on the same
+  // views, in one command as FusedCommand builds a job: gate, then call per call (streamed: lead, push[parity], a wait
+  // per call, at most two queued), done. The flag binding must already hold the job's ready value.
+  void RunGatedOnce(const std::string& path, const std::string& entry, const std::vector<View>& views, int calls) {
+    Kernel& k = Load(path, entry, views, true);
+    program_.Forget();
+    ++epoch_;
+    YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k.first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
+    const Call c = Snapshot(k);
+    DumpInvocations(k, c);
+    std::vector<const std::vector<std::uint8_t>*> seq{&c.gate};
+    if (!k.streamed) {
+      for (int i = 0; i < calls; ++i) seq.push_back(&c.call);
+    } else {
+      int queued = 0;
+      for (int i = 0; i < calls; ++i) {
+        seq.push_back(i == 0 ? &c.lead : &c.push[i & 1]);
+        if (++queued == k.depth) seq.push_back(&c.wait), --queued;
+      }
+      for (; queued > 0; --queued) seq.push_back(&c.wait);
+    }
+    seq.push_back(&c.done);
+    std::fprintf(stderr, "npu: RunGatedOnce %s (depth %d), %d calls, %zu invocations\n",
+                 k.streamed ? "streamed" : "plain", k.depth, calls, seq.size());
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t ops = 0;
+    for (const std::vector<std::uint8_t>* b : seq) {
+      std::uint32_t n = 0, size = 0;
+      std::memcpy(&n, b->data() + 8, 4), std::memcpy(&size, b->data() + 12, 4);
+      if (size != b->size()) throw LoomError("npu: unexpected command header");
+      if (bytes.empty()) bytes.assign(b->begin(), b->begin() + 16);
+      bytes.insert(bytes.end(), b->begin() + 16, b->end());
+      ops += n;
+    }
+    const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
+    std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
+    YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(Place(bytes)), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(job)");
     CheckHealth();
   }
   // RunOnce with the AIE counters (YAH_NPU_PROF): the image's first command with the counters' setup before its ops
@@ -384,6 +442,35 @@ class LoomNpu {
       NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(k.image, k.entry_ordinal, n, k.storage.data(),
                                                                      i + 1, k.streamed ? streamed[i] : single[i]),
                "query_invocation_ordinal");
+    if (k.streamed && k.push[0].byte_length) k.depth = QueueDepth(CommandBytes(k, k.push[0]), k.push[0].byte_length);
+  }
+  // Calls a streamed image may queue ahead: 2 if two calls' task pushes fit every DMA channel's queue (kQueueTasks
+  // each), else 1. Counts one call's queue pushes (transaction writes to a channel's start-queue register) per
+  // (column, row, channel).
+  static int QueueDepth(const std::uint8_t* b, std::size_t size) {
+    constexpr int kQueueTasks = 4;
+    std::map<std::uint32_t, int> pushes;
+    for (std::size_t o = 16; o + 16 <= size;) {
+      std::uint32_t len = 0, addr = 0;
+      switch (b[o]) {   // libamdf transaction 0.1 (DeltaSetup)
+        case 0: len = 24; break;
+        case 3: len = 28; break;
+        case 1: std::memcpy(&len, b + o + 12, 4); break;
+        case 128: std::memcpy(&len, b + o + 4, 4); break;
+        default: return 1;
+      }
+      if (len < 16 || o + len > size) return 1;
+      std::memcpy(&addr, b + o + 8, 4);
+      const std::uint32_t row = (addr >> 20) & 31, off = addr & 0xFFFFF;
+      const bool queue = b[o] == 0 && (row >= 2   ? off >= 0x1DE04 && off < 0x1DE20 && (off - 0x1DE04) % 8 == 0
+                                       : row == 1 ? off >= 0xA0604 && off < 0xA0660 && (off - 0xA0604) % 8 == 0
+                                                  : off >= 0x1D204 && off < 0x1D220 && (off - 0x1D204) % 8 == 0);
+      if (queue) ++pushes[addr];
+      o += len;
+    }
+    int most = 0;
+    for (const auto& [addr, n] : pushes) most = std::max(most, n);
+    return 2 * most <= kQueueTasks ? 2 : 1;
   }
   // Frees k's command storage (LoadStorage brings it back). Only for an instance whose commands are all copied out
   // (Snapshot, its setup copy): no command in it was submitted, so the NPU never read these pages.
@@ -1277,7 +1364,7 @@ class LoomNpu {
         }
         append(since == 0 ? c.lead : c.push[since & 1]);
         ++since;
-        if (++queued == 2) append(c.wait), --queued;
+        if (++queued == c.k->depth) append(c.wait), --queued;
       }
       for (; queued > 0; --queued) append(calls.back()->wait);
       append(calls.back()->done);
