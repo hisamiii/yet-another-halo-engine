@@ -480,7 +480,9 @@ class Config:
 # The wait and the relay run at a job's first firing (gate_first; the end of a firing only counts and drains,
 # gate_count): state zero is then at the gate, so the setup runs no call (LOOM_EXP_SETUP_ONLY). Tried, not kept: the
 # wait after the last firing of the job before (the setup then ran one ungated call).
-GP0, GPR, GRAMP, GPS, GFAST, GB = 5000, 200, 512, 16000, 896, 8
+# GB (GN_GB): 32 (was 8) drains a job's leftover supply in the background, so its last firing does not tick + read
+# the rest one round trip at a time (~580 cycles each: an 8-call P1K job 5417K -> 5198K cycles, 11-18)
+GP0, GPR, GRAMP, GPS, GFAST, GB = 5000, 200, 512, 16000, 896, int(os.environ.get("GN_GB", "32"))
 # The protocol the host follows (dispatch.txt "npugate <GATE_SUPPLY> <GATE_CALLS> <GATE_RECORD>"): a job's gate value is
 # sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
 # binding. GATE_FAILED in done: the head gave up (the host sets it too for a failed command; gen_npu_unpack.gen_flag_wait).
