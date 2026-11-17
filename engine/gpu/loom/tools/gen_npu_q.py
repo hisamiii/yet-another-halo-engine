@@ -42,6 +42,17 @@ def qsplit_port(gate):
     return {None: 6, "waiter": 9, "relay": 8}[gate]
 
 
+def qfix():
+    """(GN_QDIAG_FIX=a, diag: wrong output) the intake test: A reread from the core's ring, its locks dropped."""
+    return os.environ.get("GN_QDIAG_FIX", "")
+
+
+QFIX_A = ("  acq %am1, 0", "  acq.cond %am1, %cqn, 0", "  acq.cond %am1, %cqn_P, 0", "  rel %one, 0")
+QFIX_W = ("  acq %am1, 1", "  acq.cond %am1, %waq, 1", "  acq.cond %am1, %waq_P, 1", "  rel.cond %one, %wrq, 1",
+          "  rel.cond %one, %wrq_P, 1")   # (fuse 0 only: the fill takes W locks too)
+QFIX_DROP = {"a": QFIX_A, "w": QFIX_W, "aw": QFIX_A + QFIX_W}
+
+
 def crel_port(gate):
     """Row 0's port for row 1's C ring (past the filler's 0-4 and the gate's)."""
     return {None: 5, "waiter": 8, "relay": 7}[gate]
@@ -144,27 +155,32 @@ def array_program(L, cfg):
     wty = f"{wrec // 4}"
     for c in range(cols):
         e(f"  %wo{c} = constant.u64 {c * P * wrec} : reg<aie2p.array.offset : offset>")
-        e(f"  %ws{c} = sender %wb, 0 : reg<aie2p.array.sender : tile<{nbr}x{P}x{wrec // 4}xi32, "
+        assert "w" not in qfix() or not fz, "GN_QDIAG_FIX=w: fuse 0 only"
+        nw_, pw_ = (1, 2) if "w" in qfix() else (nbr, P)
+        e(f"  %ws{c} = sender %wb, 0 : reg<aie2p.array.sender : tile<{nw_}x{pw_}x{wrec // 4}xi32, "
           f"#encoding.layout.strided<strides=[0, {wrec // 4}, 1]>>>")
         e(f"  %wv{c} = view.sender %ws{c}, %wo{c} : reg<aie2p.array.sender : tile<{wty}xi32>>")
         for r in range(R):   # (one view, R channels: multicast down the column)
             t = f"{c}_{r}"
             e(f"  %rw{t} = receiver {kk[c, r]}, 1 : reg<aie2p.array.receiver : tile<{wty}xi32>>")
-            e(f"  %chw{t} = channel %wv{c}, %rw{t}, %two, %rec : reg<aie2p.array.channel : tile<{wty}xi32>>")
+            e(f"  %chw{t} = channel %wv{c}, %rw{t}, %two, {'%two' if 'w' in qfix() else '%rec'} : "
+              f"reg<aie2p.array.channel : tile<{wty}xi32>>")
             e(f"  constrain.stage %chw{t}, %n{c if cols > 1 else 1}")
             if N.qpass_on():   # (GN_QPASS) the leaf walks the W ring: one firing per M block
                 e(f"  constrain.leaf_sync %chw{t}")
     ia = len(L)
     fa = N.slab(ks)
-    e(f"  %arec = constant.u32 {nbr * P * MP} : reg<aie2p.array.scalar : index>")
+    # (GN_QDIAG_FIX=a, diag: the A channels carry the ring's slots only; the leaves reread them without locks)
+    e(f"  %arec = constant.u32 {N.acap_tail(cfg) if 'a' in qfix() else nbr * P * MP} : reg<aie2p.array.scalar : index>")
     for r in range(R):   # row r: its M blocks' records [M block][pass][slab], multicast along the row
         if crel():   # (row r: M blocks r, r + R, ...)
             e(f"  %ao{r} = constant.u64 {r * P * MP * fa} : reg<aie2p.array.offset : offset>")
-            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nbr}x{P * MP}x{fa // 4}xi32, "
+            na_, ra_ = (1, N.acap_tail(cfg)) if "a" in qfix() else (nbr, P * MP)
+            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{na_}x{ra_}x{fa // 4}xi32, "
               f"#encoding.layout.strided<strides=[{R * P * MP * fa // 4}, {fa // 4}, 1]>>>")
         else:
             e(f"  %ao{r} = constant.u64 {r * nbr * P * MP * fa} : reg<aie2p.array.offset : offset>")
-            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nbr * P * MP}x{fa // 4}xi32>>")
+            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{N.acap_tail(cfg) if 'a' in qfix() else nbr * P * MP}x{fa // 4}xi32>>")
         e(f"  %a{r} = view.sender %as{r}, %ao{r} : reg<aie2p.array.sender : tile<{fa // 4}xi32>>")
         for j in range(cols):
             c = (2 * r + j) % cols
@@ -329,8 +345,14 @@ def gen(cfg):
     N.QF["crelmid"] = crel_mid_port() if crel() else None
     N.QF["split"] = qsplit_port if qsplit() else None
     array_program(L, cfg)
+    i0 = len(L)
     for name, gate in leaves(cfg):   # (tailr: the GEMM leaf without the fill, skipping the raw rows)
         fill = cfg.fuse == 2 and not name.startswith("tailr")
         N.leaf(L, cfg, "tail", cfg.ks[0], cov=(0,) if fill else None, gate=gate, name=name)
+    if qfix():   # (any acquire / release of the dropped ports: the unrolled copies' renamed operands too)
+        import re
+        ports = "".join({"a": "0", "w": "1"}[c] for c in qfix())
+        pat = re.compile(rf"^  (acq|rel)(\.cond)? %\w+(, %\w+)?, [{ports}]$")
+        L[i0:] = [ln for ln in "\n".join(L[i0:]).split("\n") if not pat.match(ln)]
     return "\n".join(L)
 
