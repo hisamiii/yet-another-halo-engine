@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:00:00 +0100
+Subject: [PATCH] loom : pack merged egress rings into the top memory-tile bank
+
+Keeps the low banks contiguous for replayed panels: real (per-column) W panels fit.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2952,6 +2952,28 @@
+         IREE_SV("the stage memory tile cannot host the merged egress ring and "
+                 "its lock pair"));
+   }
++  {
++    // Pack the ring into the highest bank with room, leaving the low banks
++    // contiguous for the replayed panels planned after it.
++    const uint32_t bank_count = resources->facts->memory.bank_count;
++    const uint32_t bank_capacity =
++        resources->facts->memory.local_capacity / bank_count;
++    const uint32_t bytes = (uint32_t)record_count * channel->record_byte_length;
++    for (uint32_t b = bank_count; b-- > 0;) {
++      const uint32_t cursor = (uint32_t)iree_host_align(
++          resources->bank_cursors[b], LOOM_AIE2P_ARRAY_CHANNEL_STORAGE_ALIGNMENT);
++      if (cursor + bytes > bank_capacity) continue;
++      memcpy(ring.post_bank_cursors, resources->bank_cursors,
++             bank_count * sizeof(*ring.post_bank_cursors));
++      ring.post_bank_cursors[b] = cursor + bytes;
++      ring.post_next_bank = resources->next_bank;
++      for (uint32_t r = 0; r < record_count; ++r) {
++        ring.owner_offsets[r] =
++            b * bank_capacity + cursor + r * channel->record_byte_length;
++      }
++      break;
++    }
++  }
+   const uint16_t half_capacity =
+       (uint16_t)(resources->facts->dma.buffer_descriptor_count / 2u);
+   // One drain descriptor per member: its whole (contiguous) ring at once.
