@@ -244,9 +244,18 @@ def qw4_deltas():
     return w[1] - w[0], w[2] - w[0]
 
 
+def qp1_on():
+    """GN_QP1=1 (with GN_QMB1=5, 2 rows, NP even): layout P1, a vertical pair shares W: each core's W ring holds only its
+    half of every W record (column groups 0 .. NP / 2 - 1 in row 0, the rest in row 1, written by that core's own W
+    DMA); the other half is read through the neighbour window, the two cores taking turns per half (MB2's tokens)."""
+    on = os.environ.get("GN_QP1") == "1"
+    assert not on or (os.environ.get("GN_QMB1") == "5" and NP % 2 == 0), "GN_QP1 needs GN_QMB1=5, NP even"
+    return on
+
+
 def qpass_wdelta():
-    """W slot 1 - W slot 0 in bytes (QBANK_RING_AT's W pins)."""
-    w = [int(v) for v in QBANK_RING_AT.split(",")[1].split("@")[1].split(":")]
+    """W slot 1 - W slot 0 in bytes (QBANK_RING_AT's W pins; GN_QPINS' if set)."""
+    w = [int(v) for v in (os.environ.get("GN_QPINS") or QBANK_RING_AT).split(",")[1].split("@")[1].split(":")]
     return w[1] - w[0]
 LOOM_ENV = dict(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2",
                 LOOM_EXP_PANEL_GROUPS=",".join(map(str, GE.GROUPS)), LOOM_EXP_PANEL_STREAM="1")
@@ -416,6 +425,9 @@ def loom_env(cfg):
     if qpass_on() and os.environ.get("GN_QFLOAT") == "1":   # the Q' body's text order stops being the issue floor
         # (HRX 0061-0065 planner controls: dependencies only; views no boundaries, pops / fills 2 cycles under)
         env.update(LOOM_EXP_LOCKED_FLOAT="all", LOOM_EXP_LOCKED_VIEWS="1", LOOM_EXP_LOCKED_HOIST="2")
+        if os.environ.get("GN_QMB1") == "5":   # (MB2 / P1 tokens) a plain acquire stays an order floor: the neighbour reads
+            # after a token acquire have no dependency on it (acq.cond, the rings' and the row-end token's, still float)
+            env["LOOM_EXP_LOCKED_FLOAT"] = "acc,acq.,add,and," + ",".join("bcdefghijklmnopqrstuvwxyz")
         if cfg.fuse == 2:   # (HRX 0084) only the GEMM's blocks float: a locked body has no memory dependencies, and
             env["LOOM_EXP_LOCKED_FLOAT_MMA"] = "1"   # the decoder's header stores must land before its vector loads
     if cfg.fuse == 2 and cfg.fmt == "Q4_K":
@@ -2501,7 +2513,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     qbank = tail and os.environ.get("GN_QBANK") in ("1", "2", "3") and os.environ.get("GN_QCORE")
     q3 = qbank and os.environ.get("GN_QBANK") == "3"
     if qbank:   # (QBANK_RING_AT pins the slots) A slot 1 a 16 KB bank above slot 0 (a_next); C rows (body)
-        assert (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)) and not a_adv and MP in (4, 5) and NP in (4, 5) and fa <= 4096
+        assert (cfg.mu, acap) in ((1, 2), (1, 3), (1, 4)) and not a_adv and MP in (4, 5) and NP in (4, 5, 6) and fa <= 4096
     assert not q3 or qpass, "GN_QBANK=3 needs GN_QPASS=1"
     e(f"  %kks = mova.i32 {fa // 16}")
     e("  %fstep = mul %k144, %kks")   # slab stride
@@ -3170,10 +3182,10 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             d = 0 if own else (0x60000 - 0x70000 if name == "tailm0" else 0x40000 - 0x70000)
             bs = "%wcn" if t == NT else "%wc" if t else f"%{x}mbw"
             wp = ([f"  %{x}mbw = mov.address-to-scalar %w"] if t == 0 else []) + [
-                  f"  %{x}mbk = mov.i32 {g * slab(ks) + d}", f"  %{x}mbs = add.rr {bs}, %{x}mbk",
+                  f"  %{x}mbk = mov.i32 {(g % (NP // 2) if qp1_on() else g) * slab(ks) + d}", f"  %{x}mbs = add.rr {bs}, %{x}mbk",
                   f"  %{x}w0 = mov.scalar-to-address %{x}mbs"]
             wsrc = f"%{x}w0"
-            if t == 0 and g == 0 and d == 0:
+            if t == 0 and (g % (NP // 2) if qp1_on() else g) == 0 and d == 0:
                 wp, wsrc = [], "%w"
         asrc, ap = "%pa", []
         # spa: a distinct opaque zero per sub-tile (outer counter >> 8 + t) keeps the conversions from being merged
@@ -3286,12 +3298,16 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             units[0] = init + units[0]
         if mb2 and os.environ.get("GN_QMB1") == "5" and t in (0, NP // 2, NT):   # (MB2) the memory tokens, ahead of
             # the sub-tile's W fill: first half = own memory's token (port 3, sender), second = the other's (port 4)
+            # (GN_QP1) a firing starts with a handshake: row 1 releases one more credit after its first W acquire (entry
+            # block), row 0 takes two at t 0: its first remote reads (floated a few cycles above their token acquire:
+            # no dependency) then never precede row 1's first W slot. Later reads trail the partner by a half row.
             if name == "tailm0":   # (sender, port 3)
-                tl = (["  rel %one, 3", "  acq %am1, 3"] if t == 0 else
+                tl = ((["  rel %one, 3", "  %am2 = mova.i32 -2", "  acq %am2, 3"] if qp1_on() else
+                       ["  rel %one, 3", "  acq %am1, 3"]) if t == 0 else
                       ["  rel %one, 3", "  acq %am1, 3"] if t == NP // 2 else
                       ["  rel.cond %one, %mbq, 3", "  acq.cond %am1, %mbq, 3"])
             else:   # (receiver, port 4)
-                tl = (["  acq %am1, 4"] if t == 0 else
+                tl = ((["  rel %one, 4", "  acq %am1, 4"] if qp1_on() else ["  acq %am1, 4"]) if t == 0 else
                       ["  rel %one, 4", "  acq %am1, 4"] if t == NP // 2 else
                       ["  rel %one, 4", "  acq.cond %am1, %mbq, 4"])
             if t == NT:
@@ -3340,14 +3356,20 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e(f"  %q4o = and {q4m}, %one")
             e("  %q4l = lt %k2, %q4i")
             d_ = [a_[(i + 1) % 4] - a_[i] for i in range(4)]
-            assert d_[0] == d_[2], a_
             e(f"  %q4a = mov.i32 {d_[0]}")
             e(f"  %q4b = mov.i32 {d_[1] - d_[0]}")
-            e(f"  %q4c = mov.i32 {d_[3] - d_[1]}")
+            e(f"  %q4c = mov.i32 {d_[3] - d_[1] - (d_[2] - d_[0])}")
             e("  %q4x = mul %q4b, %q4o")
             e("  %q4y = mul %q4c, %q4l")
             e("  %q4xy = add.rr %q4x, %q4y")
-            e("  %pst = add.rr %q4a, %q4xy")
+            if d_[0] != d_[2]:   # (slots not evenly paired, e.g. 64x96 tiles) + (d2 - d0) for i >= 2
+                e(f"  %q4g = lt %one, %q4i")
+                e(f"  %q4h = mov.i32 {d_[2] - d_[0]}")
+                e("  %q4z = mul %q4h, %q4g")
+                e("  %q4xz = add.rr %q4xy, %q4z")
+                e("  %pst = add.rr %q4a, %q4xz")
+            else:
+                e("  %pst = add.rr %q4a, %q4xy")
         elif not a_adv and (cfg.mu, acap) == (1, 3):   # (GN_QA3) slot j = (mp + %qai) % 3: +4 KB, from slot 2 -8 KB
             e("  %q3j = add.rr %mp, %qai")
             e("  %q3k = mova.i32 171")   # j // 3 = (j * 171) >> 9 for j < 256

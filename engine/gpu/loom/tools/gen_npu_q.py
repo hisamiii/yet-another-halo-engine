@@ -170,7 +170,21 @@ def array_program(L, cfg):
     Kb = (8 * P * ks) // 8
     iw = len(L)   # (fuse 2 reorders the sections below: C, the fill channels, W, A, the fill constraints)
     wty = f"{wrec // 4}"
-    for c in range(cols):
+    for c in range(cols if N.qp1_on() else 0):   # (GN_QP1) a half-record view per pair row parity: row r gets half r % 2
+        assert not fz and not N.qw4_on() and "w" not in qfix() and N.qpass_on() and R % 2 == 0
+        hrec = wrec // 2
+        for h in range(2):
+            e(f"  %wo{c}_h{h} = constant.u64 {c * P * wrec + h * P * hrec} : reg<aie2p.array.offset : offset>")
+            e(f"  %ws{c}_h{h} = sender %wb, 0 : reg<aie2p.array.sender : tile<{nbr}x{P}x{hrec // 4}xi32, "
+              f"#encoding.layout.strided<strides=[0, {hrec // 4}, 1]>>>")
+            e(f"  %wv{c}_h{h} = view.sender %ws{c}_h{h}, %wo{c}_h{h} : reg<aie2p.array.sender : tile<{hrec // 4}xi32>>")
+            for r in range(h, R, 2):
+                t = f"{c}_{r}"
+                e(f"  %rw{t} = receiver {kk[c, r]}, 1 : reg<aie2p.array.receiver : tile<{hrec // 4}xi32>>")
+                e(f"  %chw{t} = channel %wv{c}_h{h}, %rw{t}, %two, %rec : reg<aie2p.array.channel : tile<{hrec // 4}xi32>>")
+                e(f"  constrain.stage %chw{t}, %n{c if cols > 1 else 1}")
+                e(f"  constrain.leaf_sync %chw{t}")
+    for c in range(0 if N.qp1_on() else cols):
         e(f"  %wo{c} = constant.u64 {c * P * wrec} : reg<aie2p.array.offset : offset>")
         assert "w" not in qfix() or not fz, "GN_QDIAG_FIX=w: fuse 0 only"
         nw_, pw_ = (1, 2) if "w" in qfix() else (nbr, P)

@@ -130,6 +130,9 @@ def main():
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
     assert ra.size == sa and rw.size == sw
     ra.tofile(a_b)
+    if QMODE and N.qp1_on():   # (GN_QP1) [col][pass][record] -> [col][half][pass][half record]: each half view contiguous
+        wb_ = rw.view(np.uint8).reshape(cols, passes, 2, -1)
+        rw = np.ascontiguousarray(wb_.transpose(0, 2, 1, 3)).reshape(-1)
     rw.tofile(w_b)
     np.zeros(sc // 4, np.float32).tofile(c_b)
     co = os.path.join(work, "c_out.bin")
