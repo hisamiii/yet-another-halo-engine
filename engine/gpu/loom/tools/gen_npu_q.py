@@ -235,12 +235,19 @@ def array_program(L, cfg):
     # (GN_QDIAG_FIX=a, diag: the A channels carry the ring's slots only; the leaves reread them without locks)
     e(f"  %arec = constant.u32 {N.acap_tail(cfg) if 'a' in qfix() else nbr * P * MP} : reg<aie2p.array.scalar : index>")
     art = f"{fa // 4}"   # (the pair relay: the host orders A so row 2 p + j's blocks are contiguous, npu_gemm_check)
+    asp_ = 1 if fa // 4 <= 1023 or not (crel() or mrel()) else 2   # (strided A: the shim DMA's wrap fields hold 1023
+    if asp_ > 1:                                                     # words, so a record of two halves)
+        art = f"{asp_}x{fa // 4 // asp_}"
     for r in range(R):   # row r: its M blocks' records [M block][pass][slab], multicast along the row
-        if crel():   # (row r: M blocks r, r + R, ...)
-            e(f"  %ao{r} = constant.u64 {r * P * MP * fa} : reg<aie2p.array.offset : offset>")
+        if crel() or mrel():   # (row r: M blocks r, r + R, ...; merged pair relay: row 2 p + j's 4 f + 2 j + p)
+            b0 = r if crel() else 2 * (r % 2) + r // 2
+            e(f"  %ao{r} = constant.u64 {b0 * P * MP * fa} : reg<aie2p.array.offset : offset>")
             na_, ra_ = (1, N.acap_tail(cfg)) if "a" in qfix() else (nbr, P * MP)
-            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{na_}x{ra_}x{fa // 4}xi32, "
-              f"#encoding.layout.strided<strides=[{R * P * MP * fa // 4}, {fa // 4}, 1]>>>")
+            assert fa // 4 % asp_ == 0 and fa // 4 // asp_ <= 1023
+            ah_ = f"{asp_}x" if asp_ > 1 else ""
+            st_ = f"{fa // 4 // asp_}, " if asp_ > 1 else ""
+            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{na_}x{ra_}x{ah_}{fa // 4 // asp_}xi32, "
+              f"#encoding.layout.strided<strides=[{R * P * MP * fa // 4}, {fa // 4}, {st_}1]>>>")
         else:
             e(f"  %ao{r} = constant.u64 {r * nbr * P * MP * fa} : reg<aie2p.array.offset : offset>")
             rpl = int(os.environ.get("GN_QAREPLAY") or 0)   # (timing diag: the memory tile replays an rpl-record A panel,
@@ -416,6 +423,12 @@ def array_program(L, cfg):
                 e(f"  %chm{t} = channel %mbs{t}, %mbr{t}, %one, %mbn : reg<aie2p.array.channel : tile<16xi32>>")
                 e(f"  constrain.leaf_sync %chm{t}")
     e("  return\n}\n")
+
+
+def mrel():
+    """The pair relay (NPU_QCREL=2) with the egress merge (GN_QEMERGE=1): each column's memory tile drains its pairs'
+    C streams a block in turn, so row 2 p + j owns M blocks 4 f + 2 j + p (a strided A stream) and C is in token order."""
+    return N.crelp_on() and os.environ.get("GN_QEMERGE") == "1"
 
 
 def qgate(cfg):

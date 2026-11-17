@@ -157,11 +157,8 @@ def main():
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
     assert ra.size == sa and rw.size == sw
     mrel = os.environ.get("NPU_QCREL") == "2" and os.environ.get("GN_QEMERGE") == "1"
-    if QMODE and mrel:   # (pair relay + merge: the memtile drains the pairs' streams a block in turn) row 2 p + j owns
-        R_ = int(os.environ.get("NPU_QROWS", "2"))   # blocks 4 f + 2 j + p, so the merged drain is M block order
-        assert R_ == 4
-        src = [4 * f + 2 * (q % 2) + q // 2 for q in range(R_) for f in range(nb // R_)]
-        ra = np.ascontiguousarray(ra.view(np.uint8).reshape(nb, -1)[src]).reshape(-1).view(ra.dtype)
+    if QMODE and mrel:   # (pair relay + merge: A and C in token order, gen_npu_q.mrel)
+        pass
     elif QMODE and os.environ.get("NPU_QCREL") == "2":   # (pair relay) row 2 p + j reads its blocks p nb / 2 + 2 f + j in order
         R_ = int(os.environ.get("NPU_QROWS", "2"))
         nbr_ = nb // R_
