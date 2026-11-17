@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 17:00:00 +0100
+Subject: [PATCH] loom : relax backedge terminator operand timing
+
+LOOM_EXP_HWLOOP_TERM_RELAX=1 drops the SSA separation into a loop backedge terminator; physical timing guards the reads.
+---
+
+diff --git a/loom/src/loom/codegen/low/schedule/graph.c b/loom/src/loom/codegen/low/schedule/graph.c
+--- a/loom/src/loom/codegen/low/schedule/graph.c
++++ b/loom/src/loom/codegen/low/schedule/graph.c
+@@ -7,6 +7,7 @@
+ #include "loom/codegen/low/schedule/graph.h"
+ 
+ #include <inttypes.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "loom/codegen/low/descriptor_traits.h"
+@@ -368,6 +369,15 @@
+   };
+ }
+ 
++static bool loom_low_schedule_hwloop_term_relax_enabled(void) {
++  static int enabled = -1;
++  if (enabled < 0) {
++    const char* value = getenv("LOOM_EXP_HWLOOP_TERM_RELAX");
++    enabled = value != NULL && value[0] == '1';
++  }
++  return enabled == 1;
++}
++
+ static iree_status_t loom_low_schedule_append_dependency(
+     loom_low_schedule_build_state_t* state, uint32_t producer_node,
+     uint32_t consumer_node, loom_low_schedule_dependency_kind_t kind,
+@@ -379,9 +389,33 @@
+         IREE_STATUS_RESOURCE_EXHAUSTED,
+         "low schedule dependency count exceeds uint32_t index capacity");
+   }
+-  const loom_low_schedule_dependency_timing_t timing =
++  loom_low_schedule_dependency_timing_t timing =
+       loom_low_schedule_resolve_dependency_timing(
+           state, producer_node, kind, producer_endpoint, consumer_endpoint);
++  // (exp) LOOM_EXP_HWLOOP_TERM_RELAX=1: a value passed by a loop backedge's
++  // unconditional terminator is read by the next iteration's consumers, not by
++  // the branch. Drop the separation into the terminator; the bundle planner's
++  // physical register timing (and the hardware-loop recurrence replay) still
++  // separates the real consumers.
++  if (kind == LOOM_LOW_SCHEDULE_DEPENDENCY_SSA &&
++      state->nodes[consumer_node].kind == LOOM_LOW_SCHEDULE_NODE_TERMINATOR &&
++      timing.minimum_issue_separation_cycles > 0 &&
++      loom_low_schedule_hwloop_term_relax_enabled()) {
++    const uint16_t block_index = state->nodes[consumer_node].block_index;
++    const loom_cfg_block_index_span_t successors =
++        loom_cfg_graph_successors(state->cfg_graph, block_index);
++    bool backedge = false;
++    if (successors.count == 1) {
++      const loom_cfg_block_index_span_t header_successors =
++          loom_cfg_graph_successors(state->cfg_graph, successors.values[0]);
++      for (iree_host_size_t i = 0; i < header_successors.count; ++i) {
++        backedge |= header_successors.values[i] == block_index;
++      }
++    }
++    if (backedge) {
++      timing.minimum_issue_separation_cycles = 0;
++    }
++  }
+   loom_low_schedule_setup_order_record_dependency(
+       &state->setup_order, producer_node, consumer_node,
+       kind == LOOM_LOW_SCHEDULE_DEPENDENCY_SSA);

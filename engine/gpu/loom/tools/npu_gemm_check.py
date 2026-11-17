@@ -120,6 +120,8 @@ def main():
                             env=dict(env, LOOM_DIAG_PC="1"), capture_output=True, text=True)
         open(os.path.join(work, "npu_gemm.pcdiag"), "w").write(
             "".join(ln + "\n" for ln in r_.stderr.splitlines() if ln.split()[:1] in (["PCBLOCKS"], ["PCTEXT"])))
+    if os.environ.get("NPU_COMPILE_ONLY"):   # (diag) stop after the image (compiler work, no NPU)
+        sys.exit(0)
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
     sa, sw, sc = N.stream_bytes(cfg)
     a_in = a

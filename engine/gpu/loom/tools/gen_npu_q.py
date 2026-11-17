@@ -100,6 +100,8 @@ def loom_env(cfg):
         env["LOOM_EXP_RING_AT"] = os.environ["GN_QPINS"]
     if cfg.fuse == 2:
         env["LOOM_EXP_RING_AT"] = N.qf_ring_at(env["LOOM_EXP_RING_AT"])
+    if os.environ.get("GN_QRELAX") == "1":   # (HRX 0087) no MMA-latency drain before the row loop's back edge
+        env["LOOM_EXP_HWLOOP_TERM_RELAX"] = "1"
     return env
 
 
