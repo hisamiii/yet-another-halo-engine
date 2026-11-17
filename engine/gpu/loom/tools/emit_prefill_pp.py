@@ -1112,7 +1112,8 @@ def npu_images(images, B, tmp, outdir, extra=()):
             raise SystemExit("NPU image compile failed (%s): %s" % (name, r.stderr[-800:]))
     out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(jobs[0][0])),
            ("npurows", NPU_ROWS, 0, 0)]
-    return out + [("npugfirst", 1, 0, 0)]
+    # (Q': the NPU queues one call at most; at depth 2 the next call's data corrupts the running one's)
+    return out + [("npugfirst", 1, 0, 0)] + ([("npudepth1", 1, 0, 0)] if NPU_Q else [])
 
 
 def bfp_units(w, kperm):

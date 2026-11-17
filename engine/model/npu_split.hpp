@@ -27,6 +27,9 @@ struct NpuPlan {
   // dispatch.txt "npugfirst": the images' setups run no call (gen_npu_gemm gfirst: the gate waits at a job's first
   // firing).
   bool gfirst = false;
+  // dispatch.txt "npudepth1": one call queued at most (layout Q': at depth 2 the next call's data corrupts the
+  // running one's; its check runs identical calls, so it cannot see it).
+  bool depth1 = false;
 };
 
 // A byte range of A, W or C (in_c: an activation view of C, e.g. the FFN block's H, read by its down calls).

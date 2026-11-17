@@ -114,6 +114,7 @@ class LoomPrefill {
     }
     p.dcol = geom_.count("npudcol") != 0;
     p.gfirst = geom_.count("npugfirst") != 0;
+    p.depth1 = geom_.count("npudepth1") != 0;
     if (p.dcol) {
       // the NPU decodes raw rows: W is one call's unread panel binding; A holds the p4 stream, then the pk one (Q4_K)
       p.w_bytes = NpuK(5120).w;

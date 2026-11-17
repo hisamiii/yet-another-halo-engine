@@ -442,8 +442,11 @@ class LoomNpu {
       NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(k.image, k.entry_ordinal, n, k.storage.data(),
                                                                      i + 1, k.streamed ? streamed[i] : single[i]),
                "query_invocation_ordinal");
-    if (k.streamed && k.push[0].byte_length) k.depth = QueueDepth(CommandBytes(k, k.push[0]), k.push[0].byte_length);
+    if (k.streamed && k.push[0].byte_length)
+      k.depth = std::min(max_depth_, QueueDepth(CommandBytes(k, k.push[0]), k.push[0].byte_length));
   }
+  // At most this many calls queued ahead (SetMaxDepth; dispatch.txt npudepth1: 1).
+  void SetMaxDepth(int d) { max_depth_ = d; }
   // Calls a streamed image may queue ahead: 2 if two calls' task pushes fit every DMA channel's queue (kQueueTasks
   // each), else 1. Counts one call's queue pushes (transaction writes to a channel's start-queue register) per
   // (column, row, channel).
@@ -907,6 +910,7 @@ class LoomNpu {
   }
 
  private:
+  int max_depth_ = 2;   // (SetMaxDepth)
   // Gated jobs as one command, each [gate c0][lead c0][push c1][wait][push c2][wait] ... [wait][wait][done cN], or for
   // an image that is not streamed [gate c0][call c0] ... [call cN][done cN].
   // Pushes alternate descriptor sets, at most two calls queued: calls overlap, and no command boundary falls while a
@@ -1857,6 +1861,7 @@ class LoomNpuSplit : public NpuSplit {
         flags_(npu_.CreateShared(plan.dcol ? kDcolFlagBytes : 65536, true)),
         cscratch_(npu_.CreateShared(plan.dcol ? plan.c_bytes : 4096, true)),
         plan_(plan) {
+    if (plan.depth1) npu_.SetMaxDepth(1);
     if (!plan.gate_calls) throw LoomError("npu: the set has no gate protocol (dispatch.txt npugate; re-emit it)");
     if (!GpuPinnedHigh())
       throw LoomError("npu: pin the GPU performance level first (echo high > /sys/class/drm/card*/device/"
