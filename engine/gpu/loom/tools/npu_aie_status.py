@@ -78,7 +78,7 @@ def decode(meta, filled, raw):
             words(2 * core["events"])
             cs, pc, sp, lr = words(4)
             flags = "|".join(n for k, n in CORE.items() if cs >> k & 1)
-            out.append(f"c{i} r{core['start'] + r}: core {cs:08x} {flags:20s} {ch}  locks {locks(core['locks'])}")
+            out.append(f"c{i} r{core['start'] + r}: core {cs:08x} pc {pc:05x} {flags:20s} {ch}  locks {locks(core['locks'])}")
         for name, t in (("mem", mem), ("shim", shim)):
             ch = chans(t["dma"])
             words(t["events"])

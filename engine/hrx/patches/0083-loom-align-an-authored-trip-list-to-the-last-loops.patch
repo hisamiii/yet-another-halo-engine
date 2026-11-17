@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:30:00 +0100
+Subject: [PATCH] loom : align an authored trip list to the last loops
+
+LOOM_EXP_HWLOOP_TRIP=@N[,N...]: the counts go to the last authored loops; earlier ones stay plain loops.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_analysis.c
+@@ -243,8 +243,11 @@
+   // producer-proven count; the author states it. A structural candidate
+   // without facts runs exactly N body iterations (1..1023); with a list, the
+   // k-th such candidate in block order takes the k-th count (the last count
+-  // past the list's end; 0: not a hardware loop).
++  // past the list's end; 0: not a hardware loop). A leading '@' aligns the
++  // list to the last candidates instead (earlier ones: not hardware loops).
+   const char* trip_env = getenv("LOOM_EXP_HWLOOP_TRIP");
++  const bool authored_tail = trip_env != NULL && trip_env[0] == '@';
++  if (authored_tail) ++trip_env;
+   uint64_t authored_trips[8] = {0};
+   uint32_t authored_trip_count = 0;
+   for (const char* p = trip_env; p != NULL && *p && authored_trip_count < 8;) {
+@@ -360,7 +363,8 @@
+         .is_candidate = true,
+     };
+     ++analysis->hardware_loop_candidate_count;
+-    if (authored && authored_trip_count > 1 && authored_header_count < 16) {
++    if (authored && (authored_trip_count > 1 || authored_tail) &&
++        authored_header_count < 16) {
+       authored_headers[authored_header_count++] = header_index;
+     }
+   }
+@@ -374,8 +378,14 @@
+     }
+   }
+   for (uint32_t k = 0; k < authored_header_count; ++k) {
++    const int64_t index =
++        authored_tail ? (int64_t)k + authored_trip_count - authored_header_count
++                      : (int64_t)k;
+     const uint64_t trip =
+-        authored_trips[k < authored_trip_count ? k : authored_trip_count - 1];
++        index < 0 ? 0
++                  : authored_trips[index < authored_trip_count
++                                       ? index
++                                       : authored_trip_count - 1];
+     loom_aie2p_block_analysis_t* header =
+         &analysis->blocks[authored_headers[k]];
+     if (trip == 0 || trip > 1023u) {

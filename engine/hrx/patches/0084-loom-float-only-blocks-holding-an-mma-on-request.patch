@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:30:00 +0100
+Subject: [PATCH] loom : float only blocks holding an MMA on request
+
+LOOM_EXP_LOCKED_FLOAT_MMA=1: other locked blocks keep their authored order (no memory dependencies there).
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/bundle_plan.c
+@@ -2275,6 +2275,22 @@
+                             experiments->locked_float;
+   bool locked_floor_started = false;
+   uint32_t locked_floor_cycle = 0;
++  // LOOM_EXP_LOCKED_FLOAT_MMA=1: only blocks holding an MMA float (a locked
++  // body has no memory dependencies: other blocks keep their authored order).
++  bool block_floats = true;
++  if (experiments->locked_float && getenv("LOOM_EXP_LOCKED_FLOAT_MMA")) {
++    block_floats = false;
++    for (uint32_t i = 0; i < block->scheduled_node_count && !block_floats;
++         ++i) {
++      const loom_low_packet_view_t p = loom_low_packet_at_block_ordinal(
++          &builder->frame->schedule, block_index, i);
++      if (p.descriptor == NULL) continue;
++      const iree_string_view_t m = loom_low_descriptor_set_string(
++          descriptor_set, p.descriptor->mnemonic_string_ref);
++      block_floats = iree_string_view_find(m, IREE_SV("mma"), 0) !=
++                     IREE_STRING_VIEW_NPOS;
++    }
++  }
+   for (uint32_t ordinal = 0; ordinal < block->scheduled_node_count; ++ordinal) {
+     const loom_low_packet_view_t packet = loom_low_packet_at_block_ordinal(
+         &builder->frame->schedule, block_index, ordinal);
+@@ -2355,7 +2371,7 @@
+     if (locked_floor && locked_pack && !is_boundary && !hoisted &&
+         packet.descriptor != NULL) {
+       bool floating = false;
+-      if (experiments->locked_float) {
++      if (experiments->locked_float && block_floats) {
+         const iree_string_view_t mnemonic = loom_low_descriptor_set_string(
+             descriptor_set, packet.descriptor->mnemonic_string_ref);
+         floating = strcmp(experiments->locked_float, "all") == 0 ||

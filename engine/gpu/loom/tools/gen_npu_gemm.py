@@ -124,6 +124,31 @@ def qunr_on():
     return on
 
 
+# Layout Q' with fuse 2 (gen_npu_q sets QF["cfg"]): every Q' core decodes its column's panel at a call's first firing,
+# slab-major (unit order [slab][1024-K pass]), so the memory tile holds [slab][K] and the W channel reads passes of any
+# ks. QF["cfg"]: the decode side's Config (ks (128,), passes K / 1024); QF["wslot"]: the Q' W slot bytes.
+QF = {"cfg": None, "wslot": 0}
+QF_PORTS = (3, 4)   # a Q' filler's egress sender and raw receiver (A 0, W 1, C 2)
+QF_SLAB = 4         # %fzt words (the tail's parked C ring is word 0): the slab being decoded, the egress record,
+QF_REC = 8          # then the slab outputs' addresses (words 12 .. 24)
+QF_OUT = 12
+QF_OUTS = (19584, 49152, 53760, None)    # slab outputs (4608 B each): C rows after SP, W slot 1 (two), private
+QF_FW = 144         # egress record words: a 16-k-block piece is 4 records
+QF_A13 = {32768: 33920, 36864: 38016}   # A slots 1, 3 (bank 2) past the egress ring at its start: qf_ring_at
+
+
+def qf_ring_at(pins):
+    """(Q' fuse 2) LOOM_EXP_RING_AT for pins: rings are placed in channel order C, egress + raw, W, A (W's memory-tile
+    panel before the A stage: one memory tile holds both at 8 columns) and a pin is skipped once its bank holds a later
+    allocation, so the egress ring takes bank 2's start (32768) and A slot 1 moves past it (QF_A13; both bank-2 slots, the leaf steps slots symmetrically)."""
+    fb = 4 * fuse_record(QF["cfg"], (0,))[0]
+    g = pins.split(",")
+    a = [QF_A13.get(int(v), int(v)) for v in g[2].split("@")[1].split(":")]
+    g[2] = g[2].split("@")[0] + "@" + ":".join(map(str, a))
+    assert 32768 + 2 * fb <= QF_A13[32768], fb
+    return ",".join(g) + f",{fb}@32768:{32768 + fb}"
+
+
 def acap_tail(cfg):
     return len(qa4_slots()) if qa4_on() else 3 if qa3_on() else cfg.acap_t
 
@@ -185,7 +210,8 @@ def qa4_carry(cfg):
 def qa4_slots():
     """(GN_QA4) the 4 A slots' byte addresses: GN_QPINS' third group if set, else QA4_RING_AT's."""
     pins = os.environ.get("GN_QPINS") or QA4_RING_AT
-    return [int(v) for v in pins.split(",")[2].split("@")[1].split(":")]
+    a = [int(v) for v in pins.split(",")[2].split("@")[1].split(":")]
+    return [QF_A13.get(v, v) for v in a] if QF["cfg"] is not None else a
 
 
 def div_mp(src, dst, x):
@@ -353,8 +379,9 @@ def loom_env(cfg):
         if os.environ.get("GN_QACQREL") == "1":   # (UNSAFE: FIFO pops are not ordered behind the acquire)
             env["LOOM_EXP_LOCK_ACQREL"] = "6"
     if qpass_on() and os.environ.get("GN_QHW") != "0":   # the (pass, row) loop as a hardware loop (HRX patch 0080: the
-        env["LOOM_EXP_HWLOOP_TRIP"] = (f"{MP * (cfg.passes - 1) // (2 if qunr_on() else 1)},{MP}" if qpeel_on()
-                                       else str(MP * cfg.passes))   # authored trip count; the image's only loop)
+        # authored trip count; 0083 '@': the counts go to the last loops, the GEMM's, after any fill loop)
+        env["LOOM_EXP_HWLOOP_TRIP"] = "@" + (f"{MP * (cfg.passes - 1) // (2 if qunr_on() else 1)},{MP}" if qpeel_on()
+                                             else str(MP * cfg.passes))
     if qpass_on() and os.environ.get("GN_QLOCK") == "1":   # spread lock lines, reads 2 / 1 cycles from a lock (HRX
         # patch 0081; still ordered: the first reads after an acquire hit the slot's start, which the DMA wrote first,
         # and the last ones before a release hit its end, which the DMA writes last)
@@ -362,6 +389,8 @@ def loom_env(cfg):
     if qpass_on() and os.environ.get("GN_QFLOAT") == "1":   # the Q' body's text order stops being the issue floor
         # (HRX 0061-0065 planner controls: dependencies only; views no boundaries, pops / fills 2 cycles under)
         env.update(LOOM_EXP_LOCKED_FLOAT="all", LOOM_EXP_LOCKED_VIEWS="1", LOOM_EXP_LOCKED_HOIST="2")
+        if cfg.fuse == 2:   # (HRX 0084) only the GEMM's blocks float: a locked body has no memory dependencies, and
+            env["LOOM_EXP_LOCKED_FLOAT_MMA"] = "1"   # the decoder's header stores must land before its vector loads
     if cfg.fuse == 2 and cfg.fmt == "Q4_K":
         env["LOOM_EXP_LRU"] = "aie2p.vec256"
     return env
@@ -769,7 +798,7 @@ def worker_leaf(cfg, c, r):
 
 def fuse_ports(role):
     """(egress port, core stream port) of a filling worker: after its A and W ports."""
-    return 2, 3
+    return QF_PORTS if QF["cfg"] is not None else (2, 3)
 
 
 def fpair(cfg):
@@ -1013,6 +1042,8 @@ def fuse_record(cfg, cov):
         xs += [36 * kchain_piece(cfg, r) for r in range(1, len(cfg.ks)) if kchain_piece(cfg, r)]
     fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for sw in [sw for _, sw in fuse_pieces(cfg, cov)] + xs)
              and not (cfg.swiglu and 4 * w == SW_REC))
+    if cfg is QF["cfg"]:   # (Q': 4 records a 16-k-block piece)
+        fw = QF_FW
     return fw, cfg.passes * unit // fw
 
 
@@ -1173,13 +1204,14 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
     e = L.append
     e("  %fzc = lda %fzp, 0")
     e("  %fzc1 = add %fzc, 1")
-    e(f"  %fzcl = mov.i32 {cfg.nb * cfg.passes}")
+    q = QF["cfg"]
+    e(f"  %fzcl = mov.i32 {cfg.nb if q is not None else cfg.nb * cfg.passes}")
     e("  %fzcw = lt %fzc1, %fzcl")
     e("  %fzcn = mul %fzc1, %fzcw")
     e("  st %fzcn, %fzp, 0")
     e("  %fzc1o = sub %fzc1, %fzc")                     # 1, not a constant
     e("  %fzpar = and %fzc, %fzc1o")
-    e(f"  %fzwr = mov.i32 {wrec}")
+    e(f"  %fzwr = mov.i32 {0 if q is not None else wrec}")
     e("  %fzwo = mul %fzpar, %fzwr")
     for o, nm in ((20, "%a_r"), (24, "%w0_r"), (28, "%fzd_r")):
         e(f"  %fzps{o} = mov.address-to-scalar {nm}")
@@ -1204,7 +1236,7 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
     e("  st %fzcf, %fzp, 16")                          # the allocator's pressure repairs (for the decoder) cloned it at
                                                        # each of its 720 MMA uses (+2.3 KB of program)
     starts, s0 = [], 0
-    for g in fuse_groups(cfg):
+    for g in ([range(q.passes)] if q is not None else fuse_groups(cfg)):
         starts.append(s0)
         s0 += cfg.nb * len(g)
     for i, st in enumerate(starts):   # firing == st: group i's fill
@@ -1221,14 +1253,17 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
         e(f"  low.cond_br %fzmh{i}, ^fzgo{i}, {'^fzgemm' if last else f'^fzne{i}'} : reg<aie2p.er>")
         if not last:
             e(f"^fzne{i}:")
-    for i, g in enumerate(fuse_groups(cfg)):
+    for i, g in enumerate([range(q.passes)] if q is not None else fuse_groups(cfg)):   # (Q': one fill a call)
         e(f"^fzgo{i}:")
         if i == 0 and gate:   # (a call's first firing: the check costs once per call)
             e("  %gsp0 = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
             gate_first(e, cfg, gate, "%gn1_r")
-        e(f"  %fzgn{i} = mov.i32 {len(g) * NP}")
+        e(f"  %fzgn{i} = mov.i32 {len(g) * (FUSE_SB if q is not None else NP)}")   # (Q': super-block steps)
         e(f"  low.br ^fzdq(%fzgn{i}: reg<aie2p.er>)")
-    fuse_decode(L, cfg, dp, cov, helper)
+    if q is not None:
+        qf_decode(L, q, dp)
+    else:
+        fuse_decode(L, cfg, dp, cov, helper)
     e("^fzgemm:")
     e("  %fzpG = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     for o, nm in ((20, "a"), (24, "w0"), (28, "fzd")):
@@ -1261,12 +1296,19 @@ def fuse_raw_ring(cfg, cov):
     [16][RECROW] records where the decoder output allows (FZ_RAW, Q5_K's packed layout), else one."""
     D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
     sp, in_, sp2, out = fuse_scratch(cfg, cov)
+    if QF["cfg"] is not None:   # (Q': W slot 0 holds one raw record of one super-block)
+        return in_, 1
     return in_, (2 if sp2 - in_ >= 2 * 16 * D.RECROW else 1)
 
 
 def fuse_scratch(cfg, cov):
     """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
     D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
+    if QF["cfg"] is not None:   # Q' (QA4 pins, W slot 0 at 0): areas idle until the panel's replay
+        ws = QF["wslot"]   # IN: W slot 0; SP: the C rows (bank 1); SP2: the odd-C block; OUT: QF_OUTS (one per slab)
+        assert 16 * D.RECROW <= ws and 16384 + D.SCR_B <= QF_OUTS[0] and QF_OUTS[0] + 2 * D.OUT_B <= 24576, ws
+        assert QF_OUTS[2] + 2 * D.OUT_B <= 49152 + ws and D.SCR2_B <= 8192, ws
+        return 16384, 0, 40960, QF_OUTS[0]
     _, _, _, nsb = fuse_span(cfg, cov)
     ring = 2 * NP * slab(cfg.ks[cov[-1]]) - 2047   # (the scratch starts at the ring's first 2048-aligned byte)
     if cfg.rawdma:
@@ -1484,6 +1526,172 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     e("  %fzu2 = lda %fzpX, 12")
     e("  %fzu21 = add %fzu2, -1")
     e("  st %fzu21, %fzpX, 12")
+    e("  low.br ^fzu")
+    e("^fzux:")
+    e("  low.br ^fzgemm")
+
+
+def qf_decode(L, cfg, dp):
+    """Q' fuse 2's fill (cfg: the decode side's Config). Per super-block step (passes of 1024 K, 4 steps each): each
+    slab's raw record (16 rows of the super-block, W slot 0) decoded into its own output area (QF_OUTS), then 8 pieces
+    of 16 k-blocks in Q' pass order ([pass][slab]: the memory-tile panel drains linearly) to the egress ring."""
+    e = L.append
+    D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
+    SP, IN, _, _ = fuse_scratch(cfg, (0,))
+    fw = QF_FW
+    assert 64 * 36 % (4 * fw) == 0 or 16 * 36 == 4 * fw, fw
+    rawport = QF_PORTS[1]
+    e("^fzdq(%fzN: reg<aie2p.er>):")
+    e("  %fzpD = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  st %fzN, %fzpD, 12")                       # the super-block steps left
+    tonce = not (D.GRID or D.Q3K)
+    if tonce:                                       # the decoder's table: built by the fill's first record
+        e("  %fzT0 = mova.i32 0")
+        e("  %fzTs = mov.address-to-scalar %fzpD")
+        e(f"  %fzTt = add %fzTs, {D.TFLAG}")
+        e("  %fzTr = mov.scalar-to-address %fzTt")
+        e("  st %fzT0, %fzTr, 0")
+    e(f"  %fzo3s = storage {{byte_alignment = 64, byte_length = {2 * D.OUT_B}}} : low.storage<private>")
+    # the slab outputs' addresses (from the W ring's first 2048-aligned byte)
+    e("  %fzw0a = lda %fzpD, 24")
+    e("  %fzk2047a = mov.i32 2047")
+    e("  %fzwba = add.rr %fzw0a, %fzk2047a")
+    e("  %fzkm2048a = mov.i32 -2048")
+    e("  %fzsba = and %fzwba, %fzkm2048a")
+    e("  %fzpT = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    for i, off in enumerate(QF_OUTS):
+        if off is None:
+            e(f"  %fzop{i} = storage_address %fzo3s : low.storage<private> -> reg<aie2p.ep>")
+            e(f"  %fzoa{i} = mov.address-to-scalar %fzop{i}")
+            e(f"  st %fzoa{i}, %fzpT, {QF_OUT + 4 * i}")
+            continue
+        e(f"  %fzok{i} = mov.i32 {off}")
+        e(f"  %fzoa{i} = add.rr %fzsba, %fzok{i}")
+        e(f"  st %fzoa{i}, %fzpT, {QF_OUT + 4 * i}")
+    e("  %fzZ0 = mova.i32 0")                       # (fuse_decode: clear a stale lock request, grant the raw slot)
+    e(f"  acq %fzZ0, {rawport}")
+    e("  %fzG = mova.i32 1")
+    e(f"  rel %fzG, {rawport}")
+    e("  low.br ^fzu")
+    e("^fzu:")
+    e("  %fzpU = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzu = lda %fzpU, 12")
+    e("  %fzum = eqz %fzu")
+    e("  low.cond_br %fzum, ^fzux, ^fzub : reg<aie2p.er>")
+    e("^fzub:")
+    e("  %fzH0 = mova.i32 0")
+    e("  %fzpT1 = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  st %fzH0, %fzpT1, {QF_SLAB}")
+    e("  low.br ^fzh")
+    # per slab: its raw record, decoded into its output
+    e("^fzh:")
+    e("  %fzpH = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  %fzhv = lda %fzpH, {QF_SLAB}")
+    e(f"  %fzh4 = mova.i32 {NP}")
+    e("  %fzhm = lt %fzhv, %fzh4")
+    e("  low.cond_br %fzhm, ^fzhb, ^fzhx : reg<aie2p.er>")
+    e("^fzhb:")
+    e("  %fzAm1 = mova.i32 -1")
+    e(f"  acq %fzAm1, {rawport}")
+    e("  %fzpB = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzw0l = lda %fzpB, 24")
+    e("  %fzk2047 = mov.i32 2047")
+    e("  %fzwb = add.rr %fzw0l, %fzk2047")
+    e("  %fzkm2048 = mov.i32 -2048")
+    e("  %fzsb = and %fzwb, %fzkm2048")
+    e(f"  %fzo_sp = mov.i32 {SP}")
+    e("  %fza_sp = add.rr %fzsb, %fzo_sp")
+    e(f"  %fzo_in = mov.i32 {IN}")
+    e("  %fza_in = add.rr %fzsb, %fzo_in")
+    e(f"  %fzo_sp2 = mov.i32 {fuse_scratch(cfg, (0,))[2]}")
+    e("  %fza_sp2 = add.rr %fzsb, %fzo_sp2")
+    e("  %fzpO = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzpOs = mov.address-to-scalar %fzpO")
+    e("  %fzh4b = mova.i32 4")
+    e("  %fzhq = mul %fzhv, %fzh4b")
+    e("  %fzpOq = add.rr %fzpOs, %fzhq")
+    e("  %fzpOa = mov.scalar-to-address %fzpOq")
+    e(f"  %fza_out = lda %fzpOa, {QF_OUT}")
+    for nm in ("sp", "in", "sp2", "out"):
+        e(f"  %dq_{nm} = mov.scalar-to-address %fza_{nm}")
+    ren = lambda m: m.group(0) if m.group(2) in ("fzs", "fzt") else m.group(1) + "dq_" + m.group(2)
+    for ln in ([] if os.environ.get("GN_QFNODEC") else   # (diag: no decoder, every lock and egress kept)
+               D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll))):
+        ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
+        e(ln if ln.startswith("^") else "  " + ln.strip())
+    # the raw slot back to the DMA, but for the call's last record (the panel's W records follow it)
+    e("  %fzpQ = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzuQ = lda %fzpQ, 12")
+    e("  %fzpQ2 = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  %fzhQ = lda %fzpQ2, {QF_SLAB}")
+    e("  %fzQ1 = mova.i32 1")
+    e("  %fzmQa = lt %fzQ1, %fzuQ")                 # more steps after this one
+    e(f"  %fzQ3 = mova.i32 {NP - 1}")
+    e("  %fzmQb = lt %fzhQ, %fzQ3")                 # more slabs in this step
+    e("  %fzmQ = or %fzmQa, %fzmQb")
+    e("  low.cond_br %fzmQ, ^fzrr, ^fzrj : reg<aie2p.er>")
+    e("^fzrr:")
+    e("  %fzr1Q = mova.i32 1")
+    e(f"  rel %fzr1Q, {rawport}")
+    e("  low.br ^fzrj")
+    e("^fzrj:")
+    e("  %fzhn = add.rr %fzhQ, %fzQ1")
+    e(f"  st %fzhn, %fzpQ2, {QF_SLAB}")
+    e("  low.br ^fzh")
+    # the step's egress: records r = 0 .. 31: piece r / 4 (pass r / 16 of the step's two, slab r / 4 % 4), part r % 4
+    e("^fzhx:")
+    e("  %fzE0 = mova.i32 0")
+    e("  %fzpX = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  st %fzE0, %fzpX, {QF_REC}")
+    e("  low.br ^fze")
+    e("^fze:")
+    e("  %fzpE = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  %fzr = lda %fzpE, {QF_REC}")
+    e("  %fzr32 = mova.i32 32")
+    e("  %fzrm = lt %fzr, %fzr32")
+    e("  low.cond_br %fzrm, ^fzeb, ^fzex : reg<aie2p.er>")
+    e("^fzeb:")
+    e("  %fzEm1 = mova.i32 -1")
+    e("  %fzE1 = mova.i32 1")
+    e("  %fzk3 = mova.i32 3")
+    e("  %fzk2 = mova.i32 -2")
+    e("  %fzk4 = mova.i32 -4")
+    e("  %fzpart = and %fzr, %fzk3")                # r % 4
+    e("  %fzpc = lshl %fzr, %fzk2")                 # r / 4 (lshl by a negative count shifts right)
+    e("  %fzsl = and %fzpc, %fzk3")                 # slab
+    e("  %fzps = lshl %fzr, %fzk4")                 # pass of the step (r / 16)
+    e("  %fzpEs = mov.address-to-scalar %fzpE")
+    e("  %fzk4b = mova.i32 4")
+    e("  %fzslq = mul %fzsl, %fzk4b")
+    e("  %fzpEq = add.rr %fzpEs, %fzslq")
+    e("  %fzpEa = mov.scalar-to-address %fzpEq")
+    e(f"  %fzob = lda %fzpEa, {QF_OUT}")             # the slab's output
+    e(f"  %fzkps = mov.i32 {16 * 144}")
+    e("  %fzpso = mul %fzps, %fzkps")
+    e(f"  %fzkpt = mov.i32 {4 * fw}")
+    e("  %fzpto = mul %fzpart, %fzkpt")
+    e("  %fzsrc1 = add.rr %fzob, %fzpso")
+    e("  %fzsrc = add.rr %fzsrc1, %fzpto")
+    e("  %fzsp = mov.scalar-to-address %fzsrc")
+    e("  %fzpW = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzen = lda %fzpW, 8")                     # the egress record count (its parity: the ring slot)
+    e("  %fzdl = lda %fzpW, 28")                    # the egress ring
+    egress_record(e, "q", "%fzsp", "%fzen", "%fzdl", fw, 2, eg512(cfg), acq=f"  acq %fzEm1, {dp}")
+    e(f"  rel %fzE1, {dp}")
+    e("  %fzpW2 = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzen2 = lda %fzpW2, 8")
+    e("  %fzen1 = add.rr %fzen2, %fzE1")
+    e("  st %fzen1, %fzpW2, 8")
+    e("  %fzpE2 = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  %fzr2 = lda %fzpE2, {QF_REC}")
+    e("  %fzr1 = add.rr %fzr2, %fzE1")
+    e(f"  st %fzr1, %fzpE2, {QF_REC}")
+    e("  low.br ^fze")
+    e("^fzex:")
+    e("  %fzpX2 = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzu2 = lda %fzpX2, 12")
+    e("  %fzu21 = add %fzu2, -1")
+    e("  st %fzu21, %fzpX2, 12")
     e("  low.br ^fzu")
     e("^fzux:")
     e("  low.br ^fzgemm")
@@ -1824,7 +2032,27 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e("  %conf0 = mova.i32 780")
         e("  st %conf0, %cfp, 0")
     e("  %am1 = mova.i32 -1")
-    if early:
+    if tail and os.environ.get("GN_QSPIN", "").startswith("d"):   # (diag) a straight-line delay: N dependent adds
+        e("  %dl0 = mova.i32 1")
+        n = int(os.environ["GN_QSPIN"][1:])
+        for i in range(n):
+            e(f"  %dl{i + 1} = add %dl{i}, 3")
+        e(f"  st %dl{n}, %cfp, 16")
+    elif tail and os.environ.get("GN_QSPIN") == "fwd":   # (diag) one forward branch: a block boundary, no loop
+        e("  low.br ^spdone")
+        e("^spdone:")
+    elif tail and os.environ.get("GN_QSPIN"):   # (diag) a spin of GN_QSPIN iterations before the GEMM, every firing
+        sp = os.environ["GN_QSPIN"]
+        e(f"  %spn = mova.i32 {int(sp[1:])}" if sp[0] == "a" else f"  %spn = mov.i32 {int(sp)}")
+        e("  low.br ^spin(%spn: reg<aie2p.er>)")
+        e("^spin(%spv: reg<aie2p.er>):")
+        e("  %spm = eqz %spv")
+        e("  low.cond_br %spm, ^spdone, ^spb : reg<aie2p.er>")
+        e("^spb:")
+        e("  %spv1 = add %spv, -1")
+        e("  low.br ^spin(%spv1: reg<aie2p.er>)")
+        e("^spdone:")
+    if early and not (tail and qpass_on()):
         e("  acq %am1, 1")
     e("  %addmode = mova.i32 60")
     if role != "head":
@@ -3727,7 +3955,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         e("^dfe:")
         e("  %dqr = copy %dfx : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
         e("  rel.cond %one, %dqr, 2")
-    if fills:
+    if fills and not (role == "tail" and qpass_on()):
         e("  rel %one, 1")
     if gate:
         gate_count(L.append, cfg, gate)

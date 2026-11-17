@@ -90,6 +90,11 @@ def main():
         rng = np.random.default_rng(11)
         a = (rng.standard_normal((M, K)) * np.exp(rng.uniform(-3, 3, (M, 1)))).astype(np.float16)
         w = (rng.standard_normal((Nn, K)) * 0.05).astype(np.float16)
+    if os.environ.get("NPU_AONEHOT"):   # (diag) token t reads only k0 + t: C[t, n] = W[n, k0 + t] (the panel, readable)
+        ko = int(os.environ["NPU_AONEHOT"])
+        a = np.zeros((M, K), np.float16)
+        tt = np.arange(min(M, K - ko))
+        a[tt, ko + tt] = 1
     src = os.path.join(work, "npu_gemm.loom")
     img = os.path.join(work, "npu_gemm.xdna")
     if QMODE:   # layout Q' (gen_npu_q, stage 1): one K slice, the tail leaf as a Q' core (GN_QCORE = boundary json)
@@ -108,6 +113,8 @@ def main():
                 "4032@", f"{N.slab(ks[0])}@")
         if os.environ.get("GN_QPINS"):   # (Q' experiments: the whole pin list)
             env["LOOM_EXP_RING_AT"] = os.environ["GN_QPINS"]
+        if fuse == 2:   # (Q' fuse 2) the egress ring right after the A slots (bank 2; the odd-C block follows at 40960)
+            env["LOOM_EXP_RING_AT"] = N.qf_ring_at(env["LOOM_EXP_RING_AT"])
     for k in os.environ.get("NPU_ENV_DROP", "").split(","):   # e.g. LOOM_EXP_PANEL_STREAM (diagnosis)
         env.pop(k, None)
     for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
@@ -119,7 +126,7 @@ def main():
     sa, sw, sc = N.stream_bytes(cfg)
     a_in = a
     if fuse == 2:   # the decoders emit each pass's k-blocks in panel order (gen_npu_dec.KPERM): A follows
-        kperm = np.concatenate([128 * p + D.KPERM for p in range(passes)])
+        kperm = np.concatenate([128 * p + D.KPERM for p in range(K // 1024 if QMODE else passes)])
         a_in = a.reshape(M, K // 8, 8)[:, kperm].reshape(M, K)
     ra, _ = B.reference(a_in, "act", M, list(ks), passes, N.TM, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
@@ -131,8 +138,11 @@ def main():
     bindings = [a_b, w_b, c_b]
     if fuse:   # the egress lanes' dummy binding (never transferred), the raw stream binding
         d_b, r_b = os.path.join(work, "d.bin"), os.path.join(work, "r.bin")
-        words = max(fw * nrec for c in range(cols) for fw, nrec in (N.fuse_record(cfg, cov)
-                                                                  for cov in N.fuse_cover(cfg, c).values()))
+        if QMODE:   # (gen_npu_q: one filler a core, the decode side's records)
+            words = np.prod(N.fuse_record(N.QF["cfg"], (0,)))
+        else:
+            words = max(fw * nrec for c in range(cols) for fw, nrec in (N.fuse_record(cfg, cov)
+                                                                      for cov in N.fuse_cover(cfg, c).values()))
         np.zeros(len(ks) * cols * words, np.int32).tofile(d_b)
         # the GGUF rows as they are, from the call's first column
         np.concatenate([wraw.reshape(-1)[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
@@ -141,7 +151,7 @@ def main():
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
         if os.environ.get("NPU_STALL_CMD"):   # (diag) a command run 3 s into the job, while it lives (a status dump)
             import time
-            pr = subprocess.Popen([hrx_paths.NPU_RUN, img, cfg.entry, str(cand), "2=" + co] + bindings,
+            pr = subprocess.Popen([hrx_paths.NPU_RUN, img, cfg.entry, str(cand), "2=" + co + os.environ.get("NPU_OUTX", "")] + bindings,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
             time.sleep(float(os.environ.get("NPU_STALL_S", "3")))
             if pr.poll() is None:
@@ -149,7 +159,7 @@ def main():
             o, er = pr.communicate(timeout=600)
             r = subprocess.CompletedProcess(pr.args, pr.returncode, o, er)
         else:
-            r = subprocess.run([hrx_paths.NPU_RUN, img, cfg.entry, str(cand), "2=" + co] + bindings,
+            r = subprocess.run([hrx_paths.NPU_RUN, img, cfg.entry, str(cand), "2=" + co + os.environ.get("NPU_OUTX", "")] + bindings,
                                capture_output=True, text=True, env=env, timeout=600)
         if r.returncode == 0:
             width = cand
@@ -171,6 +181,36 @@ def main():
               f"{mma} MMAs -> MMA share {mma / med:.1%}; first block done at {last[0]}")
         sys.exit(0)
     raw = (np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32)   # bf16 C
+    if os.environ.get("NPU_AONEHOT"):   # (diag) per token (= k): how many features match the panel
+        ko = int(os.environ["NPU_AONEHOT"])
+        got = unpack_c(raw, cols, nb, 1)
+        T = min(M, K - ko)
+        want = (wq if wq is not None else value(w))[:, ko:ko + T].T   # [t][n]
+        g = got[:T]
+        ok = np.isclose(g, want, rtol=1e-2, atol=1e-30)
+        print(f"onehot k0 {ko}: tokens {T}, match {ok.mean():.3f}, nan {np.isnan(g).mean():.3f}, zero {(g == 0).mean():.3f}")
+        rowok = ok.mean(axis=1)
+        for t0 in range(0, T, 64):
+            print(f"  k {ko + t0:5d}..{ko + t0 + 63:5d}: " + "".join("#" if r > 0.9 else "n" if np.isnan(g[t0 + i]).all()
+                  else "0" if (g[t0 + i] == 0).all() else "." for i, r in enumerate(rowok[t0:t0 + 64])))
+        if os.environ.get("NPU_AONEHOT_MAP"):   # (diag) for each feature n, the panel row m whose values it holds
+            wfull = (wq if wq is not None else value(w))   # [n][k]
+            np.save(os.path.join(work, "oh_got.npy"), g)
+            np.save(os.path.join(work, "oh_w.npy"), wfull)
+            best = []
+            for n in range(g.shape[1]):
+                sc = [(np.isclose(g[:, n], wfull[m, ko:ko + T], rtol=1e-2, atol=1e-30).mean(), m) for m in range(wfull.shape[0])]
+                r, m = max(sc)
+                best.append(f"{m}" if r > 0.9 else f"{m}?{r:.2f}")
+            print("  feature -> row:", " ".join(best))
+            okm = np.isclose(g, want, rtol=1e-2, atol=1e-30)   # [t][n]
+            for n in range(g.shape[1]):
+                print(f"  f{n:3d} " + "".join("#" if okm[k0:k0 + 8, n].all() else "." if not okm[k0:k0 + 8, n].any()
+                                            else "+" for k0 in range(0, T, 8)))
+        for t in (0, 1, 8, 64):
+            if t < T:
+                print(f"  t {t}: got {g[t, :6]} want {want[t, :6]}")
+        sys.exit(0)
     grp = N.groups(cfg) or (passes,)
     err, k0 = 0.0, 0
     for g, gp in enumerate(grp):   # each group's partial: its K range

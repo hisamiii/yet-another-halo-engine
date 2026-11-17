@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:30:00 +0100
+Subject: [PATCH] loom : split an intake panel task past 256 runs
+
+The queue's repeat field holds 256 runs: longer panels queue several tasks of the same chain.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1114,11 +1114,17 @@
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_task(
+       builder, core, core->buffer_descriptor_start,
+       intake->record_count / core->buffer_descriptor_count - 1u));
+-  return loom_aie2p_program_queue_task(
+-      builder, panel_core, panel_core->buffer_descriptor_start,
+-      plan->channels[intake->intake_panel].record_count /
+-              panel_core->buffer_descriptor_count -
+-          1u);
++  // The queue's repeat field holds 256 runs at most: longer panels queue
++  // several tasks of the same terminating chain.
++  uint32_t runs = plan->channels[intake->intake_panel].record_count /
++                  panel_core->buffer_descriptor_count;
++  while (runs != 0) {
++    const uint32_t chunk = runs < 256u ? runs : 256u;
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_task(
++        builder, panel_core, panel_core->buffer_descriptor_start, chunk - 1u));
++    runs -= chunk;
++  }
++  return iree_ok_status();
+ }
+ 
+ static bool loom_aie2p_program_is_memory_tile_dma(
