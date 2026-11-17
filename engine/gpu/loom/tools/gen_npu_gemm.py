@@ -244,6 +244,12 @@ def qw4_deltas():
     return w[1] - w[0], w[2] - w[0]
 
 
+def qzacc_on():
+    """GN_QZACC=1 (Q' QPASS + QROW + GN_QCORE): no C zeroing at the firing start; a chain's first MMA of a sub-tile
+    (the one reading its loaded C) takes the MMA config with bit 0 (zero the accumulator input) on in pass 0."""
+    return os.environ.get("GN_QZACC") == "1"
+
+
 def qp1_on():
     """GN_QP1=1 (with GN_QMB1=5, 2 rows, NP even): layout P1, a vertical pair shares W: each core's W ring holds only its
     half of every W record (column groups 0 .. NP / 2 - 1 in row 0, the rest in row 1, written by that core's own W
@@ -2674,7 +2680,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
                    for b in range(MP * st_ // 1024)] if not qalt_on() else
                   [(a, b, 1024 * b + 512, base) for a, (base, sz_) in enumerate(zip(("%qev", "%qod"), qalt_sizes()))
                    for b in range(sz_ // 1024)])
-            for r, b, off, base in zb:
+            for r, b, off, base in ([] if qzacc_on() or os.environ.get("GN_QZACC") == "n" else zb):   # (n: diag, wrong)
                 e(f"  %qzm{r}_{b} = mova.i32 {off // 64}")
                 e(f"  %qzo{r}_{b} = mul %qzm{r}_{b}, %qk64")
                 e(f"  %qzd{r}_{b} = mov.modifier %qzo{r}_{b}")
@@ -3575,9 +3581,13 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         for c in range(4):
             ent.append(f"  %z0_{c} = concat(%l0_{c}_0, %l0_{c}_1, %l0_{c}_2, %l0_{c}_3) : {MBMS4}")
             c0.append(f"%z0_{c}")
+        if qzacc_on():   # (the entry is row 0 of pass 0: its first MMAs ignore the unzeroed C)
+            assert qpass
+            ent.append("  %qzc0 = add.rr %conf, %one")
         for k in range(QE2r):
             for ci, c in enumerate(ORDER_C):
-                ent.append(f"  %m0_{k}_{c} = mma.bfp16ebs8.m8n8k8 {c0[c]}, %s0a{k}_{c >> 1}, %s0w{k}_{c & 1}, %conf")
+                cf_ = "%qzc0" if qzacc_on() and k == 0 else "%conf"
+                ent.append(f"  %m0_{k}_{c} = mma.bfp16ebs8.m8n8k8 {c0[c]}, %s0a{k}_{c >> 1}, %s0w{k}_{c & 1}, {cf_}")
                 c0[c] = f"%m0_{k}_{c}"
                 ent += slots.pop(k * 4 + ci, [])
         if not qpass:   # (qpass: the leaf acquired every C slot)
@@ -3629,6 +3639,14 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
 
     def emit_window(t):
         """The rotated boundary t -> t + 1 (both sub-tiles' window k-blocks, stores, loads); leaves cur = t + 1's."""
+        if qzacc_on() and t == 0:   # (GN_QZACC) conf + 1 while this row / the next row is in pass 0 (row mp < MP)
+            assert qpass and qrow
+            e(f"  %qzk = mova.i32 {MP}")
+            e("  %qzl = lt %mp, %qzk")
+            e("  %qzc = add.rr %conf, %qzl")
+            e("  %qzm = add.rr %mp, %one")
+            e("  %qzl1 = lt %qzm, %qzk")
+            e("  %qzcn = add.rr %conf, %qzl1")
         if qrow and not qpass and t == NT - 1:   # the next row's C slot on the first pass (before its loads)
             e("  %cqc = copy %cfn : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
             e("  acq.cond %am1, %cqc, 2")
@@ -3712,11 +3730,14 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     pull(nm)
                 side, c, j = ev[1], ev[2], ev[3]
                 tt, kk = (t, ks + j) if side == "o" else (t + 1, j)
+                cf_ = "%conf"
                 if side == "n" and c not in new:
                     e(f"  %z{t + 1}_{c} = concat(%l{t + 1}_{c}_0, %l{t + 1}_{c}_1, %l{t + 1}_{c}_2, %l{t + 1}_{c}_3) : {MBMS4}")
                     new[c] = f"%z{t + 1}_{c}"
+                    if qzacc_on():   # (the row-end window starts the next row's sub-tile 0: the next row's pass)
+                        cf_ = "%qzcn" if t == NT - 1 else "%qzc"
                 acc = cur[c] if side == "o" else new[c]
-                e(f"  %m{tt}_{kk}_{c} = mma.bfp16ebs8.m8n8k8 {acc}, %s{tt}a{kk}_{c >> 1}, %s{tt}w{kk}_{c & 1}, %conf")
+                e(f"  %m{tt}_{kk}_{c} = mma.bfp16ebs8.m8n8k8 {acc}, %s{tt}a{kk}_{c >> 1}, %s{tt}w{kk}_{c & 1}, {cf_}")
                 if side == "o":
                     cur[c] = f"%m{tt}_{kk}_{c}"
                 else:
