@@ -1,0 +1,533 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:00:00 +0100
+Subject: [PATCH] loom : merge staged egress channels in the memory tile
+
+LOOM_EXP_EGRESS_MERGE=1: staged worker-to-binding channels of one column on adjacent lanes fill their own memory-tile rings; one drain sends each ring as a block into one shim write. LOOM_EXP_REPLAY_GROUP=g packs g replayed records per memory-tile record.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -291,6 +291,17 @@
+   // first member) fills it once; every member drains its own slice. Index of
+   // the owning channel, or UINT32_MAX when the stage is not shared.
+   uint32_t stage_panel_owner;
++  // Experimental LOOM_EXP_EGRESS_MERGE=1: staged worker-to-binding channels
++  // of one memory-tile column writing adjacent partition lanes of one
++  // binding merge: each fills its own memory-tile ring, the owner (the first
++  // member) drains all rings in turn (each member's ring as one block)
++  // through one memory-to-stream channel into one shim write covering every
++  // member's lanes. Owner index (its own for the owner) or UINT32_MAX.
++  uint32_t egress_merge_owner;
++  uint32_t egress_merge_ordinal;
++  uint32_t egress_merge_count;
++  // The owner's merged drain (an index into dma_channels).
++  uint32_t egress_merge_drain;
+   // Memory-tile record of the panel holding this member's slice.
+   uint32_t stage_panel_slot;
+   // Byte offset of this member's slice within the panel.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -662,6 +662,10 @@
+   channel->stage_group = 1;
+   channel->stage_encoded_length = 0;
+   channel->stage_panel_owner = UINT32_MAX;
++  channel->egress_merge_owner = UINT32_MAX;
++  channel->egress_merge_ordinal = 0;
++  channel->egress_merge_count = 0;
++  channel->egress_merge_drain = UINT32_MAX;
+   channel->stage_panel_slot = 0;
+   channel->stage_panel_lock_index = UINT32_MAX;
+   channel->stage_panel_byte_offset = 0;
+@@ -1346,6 +1350,42 @@
+     loom_aie2p_array_physical_demands_t* demands,
+     loom_aie2p_array_physical_cardinalities_t* cardinalities) {
+   loom_aie2p_array_channel_t* channel = &builder->channels[channel_index];
++  if (channel->egress_merge_owner != UINT32_MAX) {
++    // A merged egress (LOOM_EXP_EGRESS_MERGE): a capacity-deep fill ring; the
++    // owner also drains every member's ring (a descriptor per record).
++    const loom_xdna_tile_coordinate_t stage = {channel->stage_column, 1};
++    const loom_xdna_dma_facts_t* stage_dma =
++        &loom_xdna_array_tile_kind_facts(builder->family,
++                                         LOOM_XDNA_TILE_KIND_MEMORY)
++             ->dma;
++    const uint64_t stage_units =
++        channel->record_byte_length / stage_dma->transfer_length_granularity;
++    if (channel->record_byte_length % stage_dma->transfer_length_granularity ||
++        stage_units < iree_max(1u, stage_dma->transfer_length_offset) ||
++        stage_units > (uint64_t)stage_dma->maximum_encoded_transfer_length +
++                          stage_dma->transfer_length_offset ||
++        channel->capacity == 0 || channel->record_count % channel->capacity) {
++      return loom_aie2p_array_reject_channel_resources(
++          builder, channel_index, stage,
++          IREE_SV("a merged egress needs whole-record descriptors and whole "
++                  "rings"));
++    }
++    channel->stage_group = 1;
++    channel->stage_encoded_length =
++        (uint32_t)(stage_units - stage_dma->transfer_length_offset);
++    channel->stage_repeat_count = 1;
++    channel->stage_record_count = channel->capacity;
++    const bool owner = channel->egress_merge_owner == channel_index;
++    const uint32_t descriptors =
++        channel->capacity + (owner ? channel->egress_merge_count : 0u);
++    demands->memory_tile_dma_channels += owner ? 1u : 0u;
++    demands->memory_tile_buffer_descriptors += descriptors;
++    demands->memory_tile_locks += 2u;
++    cardinalities->dma_channel_count += owner ? 2u : 1u;
++    cardinalities->lock_count += 2u;
++    cardinalities->stage_record_count += channel->capacity;
++    return iree_ok_status();
++  }
+   // A binding with leading zero-stride (repeated) axes is read once into the
+   // memory tile, which replays it; otherwise the ring passes records through.
+   const loom_aie2p_array_endpoint_t* sender =
+@@ -1385,6 +1425,15 @@
+     // records into each memory-tile record: the stream is continuous, so the
+     // receiving DMA still completes one descriptor per channel record.
+     uint32_t group = 1;
++    // Experimental LOOM_EXP_REPLAY_GROUP=g: pack g records of a replayed panel
++    // into each memory-tile record even when the panel fits a descriptor half
++    // (frees descriptors for other rings of the tile).
++    const char* replay_group = getenv("LOOM_EXP_REPLAY_GROUP");
++    if (repeat_count > 1 && replay_group != NULL && atoi(replay_group) > 1 &&
++        ring_record_count % (uint64_t)atoi(replay_group) == 0) {
++      group = (uint32_t)atoi(replay_group);
++      ring_record_count /= group;
++    }
+     if (repeat_count > 1 && ring_record_count > half_descriptor_count) {
+       group = (uint32_t)((ring_record_count + half_descriptor_count - 1) /
+                          half_descriptor_count);
+@@ -2605,6 +2654,12 @@
+                   "shim channel, a binding, and whole records (fewer than the "
+                   "channel's) in whole transfer units"));
+     }
++    if (!owns_shim && channel->egress_merge_owner != UINT32_MAX) {
++      // A merged egress member writes through its owner's shim transfer.
++      channel->binding_plan_index =
++          builder->channels[channel->egress_merge_owner].binding_plan_index;
++      continue;
++    }
+     if (!owns_shim) {
+       const loom_aie2p_array_channel_t* source_channel =
+           channel->stage_panel_owner != UINT32_MAX
+@@ -2640,15 +2695,31 @@
+           IREE_SV("the binding source must have exact extents and non-negative "
+                   "dense or strided address geometry"));
+     }
++    // A merged egress owner writes its members' lanes as one transfer: a
++    // dense partition lane |merge_count| times longer (the owner's lane a
++    // multiple of it).
++    const bool merged = channel->egress_merge_owner == channel_index;
++    if (merged &&
++        (geometry.layout_kind != LOOM_VALUE_FACT_ADDRESS_LAYOUT_DENSE ||
++         binding_endpoint->partition_lane % channel->egress_merge_count != 0)) {
++      return loom_aie2p_array_diagnose_binding_transfer(
++          builder, channel_index, binding_endpoint, base_binding_endpoint,
++          IREE_SV("a merged egress needs a dense binding and an owner lane "
++                  "that is a multiple of its member count"));
++    }
+     if (!loom_aie2p_array_resolve_binding_transfer(
+             &geometry, loom_type_rank(binding_endpoint->message_type),
+             builder->family, binding_endpoint->binding_byte_offset,
+             binding_endpoint->binding_view_partitioned,
+-            binding_endpoint->partition_lane, channel->record_byte_length,
++            merged ? binding_endpoint->partition_lane / channel->egress_merge_count
++                   : binding_endpoint->partition_lane,
++            channel->record_byte_length,
+             // a prefix's records come from its own binding
+             channel->prefix_binding != UINT32_MAX
+                 ? channel->record_count -
+                       channel->prefix_byte_length / channel->record_byte_length
++            : channel->egress_merge_owner == channel_index
++                ? channel->record_count * channel->egress_merge_count
+                 : channel->record_count,
+             shim_dma_facts,
+             channel->core_stream || loom_aie2p_array_channel_is_intake(channel)
+@@ -2855,6 +2926,122 @@
+   for (uint32_t record = 0; record < record_count; ++record) {
+     builder->stage_record_offsets[builder->stage_record_cursor++] =
+         ring.owner_offsets[interleaved ? 0u : record];
++  }
++  return iree_ok_status();
++}
++
++// A merged egress member's memory-tile fill ring (stream-to-memory, a
++// descriptor per record); the owner also reserves its merged drain, a
++// descriptor per record of every member (LOOM_EXP_EGRESS_MERGE).
++static iree_status_t loom_aie2p_array_plan_egress_merge(
++    loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index) {
++  loom_aie2p_array_channel_t* channel = &builder->channels[channel_index];
++  const loom_xdna_tile_coordinate_t coordinate = {channel->stage_column, 1};
++  loom_aie2p_array_tile_state_t* state =
++      loom_aie2p_array_tile_state(builder, coordinate);
++  loom_aie2p_array_tile_resources_t* resources = &state->resources;
++  const uint16_t record_count = (uint16_t)channel->stage_record_count;
++  const bool owner = channel->egress_merge_owner == channel_index;
++  loom_aie2p_array_ring_resource_proposal_t ring = {0};
++  if (loom_aie2p_array_channel_resources_propose_neighbor(
++          resources, coordinate, /*load_address_base=*/0, (uint8_t)record_count,
++          channel->record_byte_length, /*contiguous=*/true,
++          &ring) != LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_NONE) {
++    return loom_aie2p_array_reject_channel_resources(
++        builder, channel_index, coordinate,
++        IREE_SV("the stage memory tile cannot host the merged egress ring and "
++                "its lock pair"));
++  }
++  const uint16_t half_capacity =
++      (uint16_t)(resources->facts->dma.buffer_descriptor_count / 2u);
++  // One drain descriptor per member: its whole (contiguous) ring at once.
++  const uint16_t drain_count =
++      owner ? (uint16_t)channel->egress_merge_count : 0u;
++  uint8_t fill_channel = resources->next_stream_to_memory_channel;
++  uint8_t drain_channel = resources->next_memory_to_stream_channel;
++  // The drain takes the half with room; the fill the other one when it can.
++  uint16_t* cursors = state->memory_tile_bd_cursors;
++  if (owner && cursors[drain_channel & 1u] + drain_count > half_capacity &&
++      drain_channel + 1u < resources->facts->dma.channel_count_per_direction) {
++    ++drain_channel;
++  }
++  if (cursors[fill_channel & 1u] + record_count +
++              (owner && (fill_channel & 1u) == (drain_channel & 1u)
++                   ? drain_count
++                   : 0u) >
++          half_capacity &&
++      fill_channel + 1u < resources->facts->dma.channel_count_per_direction) {
++    ++fill_channel;
++  }
++  if (getenv("LOOM_EXP_TRACE_SHIM") != NULL) {
++    fprintf(stderr,
++            "EMERGE channel %u column %u ordinal %u fill %u (half %u at %u) "
++            "drain %u (half %u at %u) +%u\n",
++            channel_index, (unsigned)coordinate.column,
++            channel->egress_merge_ordinal, fill_channel, fill_channel & 1u,
++            cursors[fill_channel & 1u], owner ? drain_channel : 255u,
++            drain_channel & 1u, cursors[drain_channel & 1u], drain_count);
++  }
++  if (fill_channel >= resources->facts->dma.channel_count_per_direction ||
++      (owner &&
++       drain_channel >= resources->facts->dma.channel_count_per_direction) ||
++      cursors[fill_channel & 1u] + record_count +
++              (owner && (fill_channel & 1u) == (drain_channel & 1u)
++                   ? drain_count
++                   : 0u) >
++          half_capacity ||
++      (owner && cursors[drain_channel & 1u] + drain_count > half_capacity)) {
++    return loom_aie2p_array_reject_channel_resources(
++        builder, channel_index, coordinate,
++        IREE_SV("the stage memory tile has no DMA channels with enough buffer "
++                "descriptors in their halves for the merged egress"));
++  }
++  loom_aie2p_array_channel_resources_commit_ring(&ring, resources);
++  resources->next_stream_to_memory_channel = fill_channel + 1u;
++  const uint16_t fill_bd =
++      (uint16_t)((fill_channel & 1u) * half_capacity + cursors[fill_channel & 1u]);
++  cursors[fill_channel & 1u] += record_count;
++  const uint32_t credit_lock_index = loom_aie2p_array_append_lock_pair(
++      builder, channel_index, LOOM_AIE2P_ARRAY_ENDPOINT_DIRECTION_RECEIVE,
++      &ring);
++  channel->stage_dma_index = (uint32_t)builder->dma_channel_cursor;
++  builder->dma_channels[builder->dma_channel_cursor++] =
++      (loom_aie2p_array_dma_plan_t){
++          .channel_index = channel_index,
++          .coordinate = coordinate,
++          .direction = LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY,
++          .dma_channel = fill_channel,
++          .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE,
++          .buffer_descriptor_start = fill_bd,
++          .buffer_descriptor_count = record_count,
++          .credit_lock_index = credit_lock_index,
++          .stage_record_base = (uint32_t)builder->stage_record_cursor,
++          .gate_count = record_count,
++      };
++  if (owner) {
++    resources->next_memory_to_stream_channel = drain_channel + 1u;
++    const uint16_t drain_bd = (uint16_t)((drain_channel & 1u) * half_capacity +
++                                         cursors[drain_channel & 1u]);
++    cursors[drain_channel & 1u] += drain_count;
++    channel->egress_merge_drain = (uint32_t)builder->dma_channel_cursor;
++    builder->dma_channels[builder->dma_channel_cursor++] =
++        (loom_aie2p_array_dma_plan_t){
++            .channel_index = channel_index,
++            .coordinate = coordinate,
++            .direction = LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM,
++            .dma_channel = drain_channel,
++            .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE,
++            .buffer_descriptor_start = drain_bd,
++            .buffer_descriptor_count = drain_count,
++            .credit_lock_index = credit_lock_index,
++            .stage_record_base = (uint32_t)builder->stage_record_cursor,
++            .gate_count = drain_count,
++        };
++  }
++  channel->stage_first_record = (uint32_t)builder->stage_record_cursor;
++  for (uint32_t record = 0; record < record_count; ++record) {
++    builder->stage_record_offsets[builder->stage_record_cursor++] =
++        ring.owner_offsets[record];
+   }
+   return iree_ok_status();
+ }
+@@ -3253,6 +3440,49 @@
+             drain->coordinate, drain->dma_channel, compute_dma->coordinate,
+             compute_dma->dma_channel, false)) {
+       return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
++    }
++    loom_aie2p_array_bind_worker_port(builder, worker_endpoint, channel_index,
++                                      committed_compute.credit_lock_index,
++                                      compute_proposal.ring.load_window);
++    return iree_ok_status();
++  }
++  if (staged && channel->egress_merge_owner != UINT32_MAX) {
++    // A merged egress (LOOM_EXP_EGRESS_MERGE): the core's send fills its
++    // memory-tile ring; the owner's drain empties every member's ring into
++    // the owner's shim write.
++    IREE_RETURN_IF_ERROR(
++        loom_aie2p_array_plan_egress_merge(builder, channel_index));
++    if (!builder->valid) {
++      return iree_ok_status();
++    }
++    const loom_aie2p_array_dma_plan_t* fill =
++        &builder->dma_channels[channel->stage_dma_index];
++    if (!loom_aie2p_array_route_workers(
++            &builder->route_builder, channel_index,
++            &builder->route_trees[channel->source_channel_index],
++            compute_dma->coordinate, compute_dma->dma_channel,
++            fill->coordinate, fill->dma_channel, false)) {
++      return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
++    }
++    if (owns_shim_dma) {
++      const loom_aie2p_array_dma_plan_t* drain =
++          &builder->dma_channels[channel->egress_merge_drain];
++      if (!loom_aie2p_array_route_egress(
++              &builder->route_builder, channel_index,
++              &builder->route_trees[builder->plan->channel_count +
++                                    channel_index],
++              drain->coordinate, LOOM_XDNA_STREAM_PORT_DMA,
++              drain->dma_channel, shim_dma->coordinate,
++              shim_dma->dma_channel)) {
++        return loom_aie2p_array_diagnose_route_capacity(builder,
++                                                        channel_index);
++      }
++      loom_aie2p_array_binding_plan_t* binding_plan =
++          &builder->binding_plans[channel->binding_plan_index];
++      binding_plan->dma_index = shim_dma_index;
++      binding_plan->completion_route_index =
++          loom_aie2p_array_plan_completion_route(builder,
++                                                 shim_dma->coordinate);
+     }
+     loom_aie2p_array_bind_worker_port(builder, worker_endpoint, channel_index,
+                                       committed_compute.credit_lock_index,
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+@@ -96,6 +96,15 @@
+                     ? LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_MEMORY_TILE_RING
+                     : 0);
+       }
++      if (channel->egress_merge_owner != UINT32_MAX) {
++        // A merged egress: its core send and memory-tile ring; the owner also
++        // the shim write.
++        return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_COMPUTE_MEMORY_TO_STREAM |
++               LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_MEMORY_TILE_RING |
++               (channel->egress_merge_owner == channel_index
++                    ? LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_STREAM_TO_MEMORY
++                    : 0);
++      }
+       return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_STREAM_TO_MEMORY |
+              (owns_source
+                   ? LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_COMPUTE_MEMORY_TO_STREAM
+@@ -1089,7 +1098,11 @@
+             IREE_SV("the sending binding is write-only"));
+       }
+       channel->transport = LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_EXTERNAL_DMA;
+-    } else if (channel->stage_column != UINT16_MAX) {
++    } else if (channel->stage_column != UINT16_MAX &&
++               !(getenv("LOOM_EXP_EGRESS_MERGE") != NULL &&
++                 sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER &&
++                 receiver->owner_kind ==
++                     LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_BINDING)) {
+       return loom_aie2p_array_topology_reject_channel_connection(
+           topology, (uint32_t)i,
+           IREE_SV("only binding-to-worker ingress channels can be staged "
+@@ -1290,6 +1303,56 @@
+       if (channel->transport ==
+           LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_NEIGHBOR_MEMORY) {
+         channel->transport = LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_ROUTED_DMA;
++      }
++    }
++  }
++
++  // Experimental LOOM_EXP_EGRESS_MERGE=1: staged worker-to-binding channels
++  // of one column whose receivers are adjacent lanes of one binding partition
++  // (in channel order) merge into one memory-tile drain and shim write.
++  if (getenv("LOOM_EXP_EGRESS_MERGE") != NULL) {
++    for (iree_host_size_t channel_index = 0;
++         channel_index < plan->channel_count; ++channel_index) {
++      loom_aie2p_array_channel_t* channel = &topology->channels[channel_index];
++      const loom_aie2p_array_endpoint_t* receiver =
++          &plan->endpoints[channel->receiver_endpoint_index];
++      const loom_aie2p_array_endpoint_t* base_receiver =
++          loom_aie2p_array_topology_base_endpoint(plan, receiver);
++      if (channel->stage_column == UINT16_MAX ||
++          channel->transport != LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_EXTERNAL_DMA ||
++          channel->core_stream ||
++          base_receiver->owner_kind != LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_BINDING ||
++          plan->endpoints[channel->sender_endpoint_index].owner_kind !=
++              LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_WORKER) {
++        continue;
++      }
++      channel->egress_merge_owner = (uint32_t)channel_index;
++      channel->egress_merge_ordinal = 0;
++      channel->egress_merge_count = 1;
++      for (iree_host_size_t other_index = 0; other_index < channel_index;
++           ++other_index) {
++        loom_aie2p_array_channel_t* other = &topology->channels[other_index];
++        if (other->egress_merge_owner != other_index ||
++            other->stage_column != channel->stage_column) {
++          continue;
++        }
++        const loom_aie2p_array_endpoint_t* other_receiver =
++            &plan->endpoints[other->receiver_endpoint_index];
++        if (loom_aie2p_array_topology_base_endpoint(plan, other_receiver)
++                    ->owner_index != base_receiver->owner_index ||
++            other_receiver->partition_lane_count !=
++                receiver->partition_lane_count ||
++            receiver->partition_lane !=
++                other_receiver->partition_lane + other->egress_merge_count ||
++            other->record_byte_length != channel->record_byte_length ||
++            other->record_count != channel->record_count ||
++            other->capacity != channel->capacity) {
++          continue;
++        }
++        channel->egress_merge_owner = (uint32_t)other_index;
++        channel->egress_merge_ordinal = other->egress_merge_count++;
++        channel->egress_merge_count = 0;
++        break;
+       }
+     }
+   }
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1148,12 +1148,119 @@
+ // descriptor, which acquires all C ready records and releases them again, so
+ // the queue's repeat count can re-run it without consuming the fill. Own locks
+ // are selected through the memory tile's self window.
++// A merged egress drain descriptor (LOOM_EXP_EGRESS_MERGE): descriptor k
++// sends member k's whole contiguous ring, taking all its ready tokens and
++// returning as many credits; the chain loops over every member.
++static iree_status_t loom_aie2p_program_build_egress_merge_drain_descriptor(
++    loom_aie2p_array_program_builder_t* builder,
++    const loom_aie2p_array_dma_plan_t* dma, uint32_t slot_ordinal) {
++  const loom_aie2p_array_plan_t* plan = builder->plan;
++  const loom_aie2p_array_channel_t* owner = &plan->channels[dma->channel_index];
++  const uint32_t depth = owner->stage_record_count;
++  const uint32_t ordinal = slot_ordinal;
++  const loom_aie2p_array_channel_t* member = NULL;
++  for (iree_host_size_t i = 0; i < plan->channel_count; ++i) {
++    if (plan->channels[i].egress_merge_owner == dma->channel_index &&
++        plan->channels[i].egress_merge_ordinal == ordinal) {
++      member = &plan->channels[i];
++      break;
++    }
++  }
++  if (member == NULL || member->stage_dma_index == UINT32_MAX) {
++    return iree_make_status(IREE_STATUS_INTERNAL,
++                            "merged egress member %u of channel %u not planned",
++                            ordinal, dma->channel_index);
++  }
++  const loom_aie2p_array_dma_plan_t* fill =
++      &plan->dma_channels[member->stage_dma_index];
++  const loom_aie2p_array_lock_plan_t* credit_lock =
++      &plan->locks[fill->credit_lock_index];
++  const loom_aie2p_array_lock_plan_t* ready_lock =
++      &plan->locks[fill->credit_lock_index + 1u];
++  uint16_t acquire_selector = 0;
++  uint16_t release_selector = 0;
++  IREE_RETURN_IF_ERROR(loom_xdna_array_form_lock_selector(
++      plan->family, dma->coordinate, ready_lock->coordinate,
++      ready_lock->lock_id, &acquire_selector));
++  IREE_RETURN_IF_ERROR(loom_xdna_array_form_lock_selector(
++      plan->family, dma->coordinate, credit_lock->coordinate,
++      credit_lock->lock_id, &release_selector));
++  const loom_xdna_tile_facts_t* tile =
++      loom_xdna_array_tile_facts(plan->family, dma->coordinate);
++  const uint32_t dma_address =
++      tile->memory.local_load_base +
++      plan->stage_record_offsets[fill->stage_record_base];
++  for (uint32_t r = 1; r < depth; ++r) {
++    if (plan->stage_record_offsets[fill->stage_record_base + r] !=
++        plan->stage_record_offsets[fill->stage_record_base] +
++            r * member->record_byte_length) {
++      return iree_make_status(IREE_STATUS_INTERNAL,
++                              "merged egress ring of channel %u is not "
++                              "contiguous",
++                              (unsigned)(member - plan->channels));
++    }
++  }
++  const loom_xdna_dma_facts_t* stage_dma = &tile->dma;
++  const uint32_t ring_length =
++      depth * member->record_byte_length / stage_dma->transfer_length_granularity -
++      stage_dma->transfer_length_offset;
++  const uint16_t indices[] = {
++      (uint16_t)(dma->buffer_descriptor_start + slot_ordinal)};
++  uint32_t* words = loom_aie2p_program_append_register_block_write32(
++      &builder->array,
++      (uint32_t)loom_xdna_register_field_address(
++          plan->family,
++          LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD0_BUFFER_LENGTH,
++          dma->coordinate, indices),
++      LOOM_AIE2P_MEMORY_TILE_DMA_BUFFER_DESCRIPTOR_WORD_COUNT);
++  memset(words, 0,
++         LOOM_AIE2P_MEMORY_TILE_DMA_BUFFER_DESCRIPTOR_WORD_COUNT *
++             sizeof(*words));
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD0_BUFFER_LENGTH,
++      ring_length, &words[0]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_BASE_ADDRESS,
++      dma_address >> tile->dma.address_encoding_shift, &words[1]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_NEXT_BD,
++      dma->buffer_descriptor_start +
++          (slot_ordinal + 1u) % dma->buffer_descriptor_count,
++      &words[1]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_USE_NEXT_BD, 1,
++      &words[1]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_VALID_BD, 1, &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_VALUE,
++      (int32_t)depth, &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_ID,
++      release_selector, &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_ENABLE, 1,
++      &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_VALUE,
++      -(int32_t)depth, &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_ID,
++      acquire_selector, &words[7]);
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+     loom_aie2p_array_program_builder_t* builder,
+     const loom_aie2p_array_dma_plan_t* dma, uint32_t slot_ordinal) {
+   const loom_aie2p_array_plan_t* plan = builder->plan;
+   const loom_aie2p_array_channel_t* channel =
+       &plan->channels[dma->channel_index];
++  if (channel->egress_merge_owner == dma->channel_index &&
++      dma->direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM) {
++    return loom_aie2p_program_build_egress_merge_drain_descriptor(
++        builder, dma, slot_ordinal);
++  }
+   const loom_aie2p_array_lock_plan_t* credit_lock =
+       &plan->locks[dma->credit_lock_index];
+   const loom_aie2p_array_lock_plan_t* ready_lock =

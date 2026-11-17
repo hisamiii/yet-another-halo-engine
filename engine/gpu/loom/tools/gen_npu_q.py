@@ -188,12 +188,15 @@ def array_program(L, cfg):
             e(f"  %sc{t} = sender {kk[c, r]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
             e(f"  %chc{t} = channel %sc{t}, %cr{t}, {cd}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
             e(f"  constrain.leaf_sync %chc{t}")
+            if os.environ.get("GN_QEMERGE") == "1":   # (LOOM_EXP_EGRESS_MERGE) the column's memory tile merges its
+                # cores' C rings into one shim write, a block of each row in turn (row r takes blocks b R + r)
+                e(f"  constrain.stage %chc{t}, %n{c if cols > 1 else 1}")
     wrec = NP * N.slab(ks)
     fz = cfg.fuse == 2
     Kb = (8 * P * ks) // 8
     iw = len(L)   # (fuse 2 reorders the sections below: C, the fill channels, W, A, the fill constraints)
     wty = f"{wrec // 4}"
-    wdup = 2 if os.environ.get("GN_QWDUP") == "2" else 1   # (diag: column pairs share one W stream, production's DRAM)
+    wdup = int(os.environ.get("GN_QWDUP") or 1)   # (diag: groups of wdup columns share one W stream; 2: production's DRAM)
     assert cols % wdup == 0
     for c in range(0, cols if N.qp1_on() else 0, wdup):   # (GN_QP1) a half-record view per pair row parity: row r gets half r % 2
         assert not fz and not N.qw4_on() and "w" not in qfix() and N.qpass_on() and R % 2 == 0
@@ -238,26 +241,48 @@ def array_program(L, cfg):
               f"#encoding.layout.strided<strides=[{R * P * MP * fa // 4}, {fa // 4}, 1]>>>")
         else:
             e(f"  %ao{r} = constant.u64 {r * nbr * P * MP * fa} : reg<aie2p.array.offset : offset>")
-            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{N.acap_tail(cfg) if 'a' in qfix() else nbr * P * MP}x{fa // 4}xi32>>")
+            rpl = int(os.environ.get("GN_QAREPLAY") or 0)   # (timing diag: the memory tile replays an rpl-record A panel,
+            if rpl:                                        # no A from DDR in steady state; results wrong)
+                assert nbr * P * MP % rpl == 0 and "a" not in qfix()
+                e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nbr * P * MP // rpl}x{rpl}x{fa // 4}xi32, "
+                  f"#encoding.layout.strided<strides=[0, {fa // 4}, 1]>>>")
+            else:
+                e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{N.acap_tail(cfg) if 'a' in qfix() else nbr * P * MP}x{fa // 4}xi32>>")
         # (GN_QASPLIT=2: the row's columns in two halves, each its own stream staged in its own memory tile, so a
         # multicast stalls on 4 receivers, not 8)
-        asp = 2 if os.environ.get("GN_QASPLIT") == "2" and cols >= 4 else 1
+        srows = os.environ.get("GN_QASPLIT_ROWS")   # (diag: split only these rows)
+        asp = 2 if os.environ.get("GN_QASPLIT") == "2" and cols >= 4 and (not srows or str(r) in srows.split(",")) else 1
         for g in range(asp):
             av = f"%a{r}" if g == 0 else f"%a{r}g{g}"
             if g:   # (its own sender, an equal layout of another type: Loom keys a multicast by the sender, CSE merges equals)
                 sl = next(ln for ln in reversed(L) if ln.startswith(f"  %as{r} = sender "))
                 m_ = re.search(r"tile<([\dx]+)xi32(, #encoding.layout.strided<strides=\[([\d, ]+)\]>)?>>$", sl)
                 dims = [int(v) for v in m_.group(1).split("x")]
-                assert not m_.group(3) and len(dims) == 2 and dims[0] % 2 == 0, sl   # [n][rec] -> [n / 2][2][rec]
-                sl = sl[:m_.start()] + f"tile<{dims[0] // 2}x2x{dims[1]}xi32>>"
+                if m_.group(3):   # (replay diag: [n][rpl][rec] -> [n / 2][2][rpl][rec], both outer strides 0)
+                    assert len(dims) == 3 and dims[0] % 2 == 0, sl
+                    sl = sl[:m_.start()] + (f"tile<{dims[0] // 2}x2x{dims[1]}x{dims[2]}xi32, "
+                                            f"#encoding.layout.strided<strides=[0, 0, {dims[2]}, 1]>>>")
+                else:
+                    assert len(dims) == 2 and dims[0] % 2 == 0, sl   # [n][rec] -> [n / 2][2][rec]
+                    sl = sl[:m_.start()] + f"tile<{dims[0] // 2}x2x{dims[1]}xi32>>"
                 e(sl.replace(f"%as{r} = ", f"%as{r}g{g} = "))
-            e(f"  {av} = view.sender %as{r}{f'g{g}' if g else ''}, %ao{r} : reg<aie2p.array.sender : tile<{art}xi32>>")
+            ao = f"%ao{r}"
+            if g and os.environ.get("GN_QASPLIT_COPY") == "1":   # (diag) the second copy of A (npu_gemm_check)
+                ao = f"%ao{r}c"
+                e(f"  {ao} = constant.u64 {r * nbr * P * MP * fa + cfg.nb * P * MP * fa} : reg<aie2p.array.offset : offset>")
+            e(f"  {av} = view.sender %as{r}{f'g{g}' if g else ''}, {ao} : reg<aie2p.array.sender : tile<{art}xi32>>")
         for j in range(cols):
             c = (2 * r + j) % cols
             g = c * asp // cols
             av = f"%a{r}" if g == 0 else f"%a{r}g{g}"
             # (split: each half's stages inside its own columns, rows spread over them; 2 rows: 0, 2 / 4, 6)
             st = (g * (cols // 2) + r * (cols // 2) // R if asp > 1 else N.astage(r, cols)) if cols > 1 else 2
+            if os.environ.get("GN_QASTAGE"):   # (diag) row r's A stage columns
+                st = int(os.environ["GN_QASTAGE"].split(",")[r])
+            if asp > 1 and os.environ.get("GN_QASPLIT_EVEN") == "1":   # (diag) stages in even columns only
+                st = g * (cols // 2) + 2 * (r * (cols // 4) // R)
+            if asp > 1 and os.environ.get("GN_QASPLIT_ODD") == "1":   # (diag) stages in odd columns only
+                st = g * (cols // 2) + 2 * (r * (cols // 4) // R) + 1
             t = f"{c}_{r}"
             e(f"  %ra{t} = receiver {kk[c, r]}, 0 : reg<aie2p.array.receiver : tile<{art}xi32>>")
             e(f"  %cha{t} = channel {av}, %ra{t}, %n{N.acap_tail(cfg)}, %arec : reg<aie2p.array.channel : tile<{art}xi32>>")

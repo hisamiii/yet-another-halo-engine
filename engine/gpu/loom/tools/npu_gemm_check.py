@@ -92,9 +92,10 @@ def main():
         rng = np.random.default_rng(11)
         a = (rng.standard_normal((M, K)) * np.exp(rng.uniform(-3, 3, (M, 1)))).astype(np.float16)
         w = (rng.standard_normal((Nn, K)) * 0.05).astype(np.float16)
-        if os.environ.get("GN_QWDUP") == "2":   # (Q' P1 diag) column 2 j + 1 reads column 2 j's W (one multicast stream)
-            for c_ in range(0, Nn // N.TN, 2):
-                w[N.TN * (c_ + 1):N.TN * (c_ + 2)] = w[N.TN * c_:N.TN * (c_ + 1)]
+        wd_ = int(os.environ.get("GN_QWDUP") or 1)   # (Q' P1 diag) columns d j + i read column d j's W (one multicast)
+        for c_ in range(Nn // N.TN):
+            if c_ % wd_:
+                w[N.TN * c_:N.TN * (c_ + 1)] = w[N.TN * (c_ - c_ % wd_):N.TN * (c_ - c_ % wd_ + 1)]
     if os.environ.get("NPU_AONEHOT"):   # (diag) token t reads only k0 + t: C[t, n] = W[n, k0 + t] (the panel, readable)
         ko = int(os.environ["NPU_AONEHOT"])
         a = np.zeros((M, K), np.float16)
@@ -105,7 +106,25 @@ def main():
     if QMODE:   # layout Q' (gen_npu_q, stage 1): one K slice, the tail leaf as a Q' core (GN_QCORE = boundary json)
         import gen_npu_q as Q
         assert len(ks) == 1 and os.environ.get("GN_QCORE"), "NPU_Q: ks of one entry and GN_QCORE"
-    open(src, "w").write((Q.gen if QMODE else N.gen)(cfg))
+    text_ = (Q.gen if QMODE else N.gen)(cfg)
+    if os.environ.get("GN_QTL") == "1" and N.QCYC:   # (diag, Q' leaves) block timeline: private words 8 / 12 / 16 =
+        out_, stage_ = [], {}                           # block start / after the start W / after the start A acquire,
+        for ln_ in text_.splitlines():                  # copied into words 1-3 of each row's stamped segment
+            if ln_.startswith("low.func.def"):
+                stage_ = {}
+            out_.append(ln_)
+            hit = (8 if ln_ == "  st %tsn, %tca, 0" else 12 if ln_ == "  acq %am1, 1" else
+                   16 if ln_ == "  acq %am1, 0" else None)
+            if hit is not None and hit not in stage_:
+                stage_[hit] = 1
+                out_ += [f"  %tlw{hit} = mov.cycles", f"  %tll{hit} = slice %tlw{hit}[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                         f"  st %tll{hit}, %tca, {hit}"]
+            if ln_ == "  st %ptp, %ptq, 0":
+                for w_, o_ in ((1, 8), (2, 12), (3, 16)):
+                    out_ += [f"  %tlr{o_} = lda %pta, {o_}", f"  %tld{o_} = sub %tlr{o_}, %pts",
+                             f"  st %tld{o_}, %ptq, {4 * w_}"]
+        text_ = "\n".join(out_) + "\n"
+    open(src, "w").write(text_)
     env = hrx_paths.env()
     env.update(Q.loom_env(cfg) if QMODE else N.loom_env(cfg))
     for k in os.environ.get("NPU_ENV_DROP", "").split(","):   # e.g. LOOM_EXP_PANEL_STREAM (diagnosis)
@@ -122,9 +141,9 @@ def main():
                              "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11", f"--output={img}"],
                             env=dict(env, LOOM_DIAG_PC="1"), capture_output=True, text=True)
         open(os.path.join(work, "npu_gemm.pcdiag"), "w").write(
-            "".join(ln + "\n" for ln in r_.stderr.splitlines() if ln.split()[:1] in (["PCBLOCKS"], ["PCTEXT"])))
+            "".join(ln + "\n" for ln in r_.stderr.splitlines() if ln.split()[:1] in (["PCBLOCKS"], ["PCTEXT"], ["PCACQ"])))
         for ln in r_.stderr.splitlines():   # (diag, HRX pin: LOOM_EXP_TRACE_SHIM in NPU_ENV_ADD) the shim DMA choices
-            if ln.startswith("SHIM "):
+            if ln.startswith(("SHIM ", "TWIN ", "STAGE ")):
                 print(ln)
     if os.environ.get("NPU_COMPILE_ONLY"):   # (diag) stop after the image (compiler work, no NPU)
         sys.exit(0)
@@ -142,6 +161,13 @@ def main():
         nbr_ = nb // R_
         src = [(q // 2) * 2 * nbr_ + 2 * f + q % 2 for q in range(R_) for f in range(nbr_)]
         ra = np.ascontiguousarray(ra.view(np.uint8).reshape(nb, -1)[src]).reshape(-1).view(ra.dtype)
+    if QMODE and os.environ.get("GN_QEMERGE") == "1":   # (egress merge) row r reads blocks b R + r: the merged drain
+        R_ = int(os.environ.get("NPU_QROWS", "2"))         # writes [b][r] = M block order
+        nbr_ = nb // R_
+        src = [b * R_ + r for r in range(R_) for b in range(nbr_)]
+        ra = np.ascontiguousarray(ra.view(np.uint8).reshape(nb, -1)[src]).reshape(-1).view(ra.dtype)
+    if os.environ.get("GN_QASPLIT_COPY") == "1":   # (diag) a second copy of A for the split's second streams
+        ra = np.concatenate([ra, ra])
     ra.tofile(a_b)
     if QMODE and N.qp1_on():   # (GN_QP1) [col][pass][record] -> [col][half][pass][half record]: each half view contiguous
         wb_ = rw.view(np.uint8).reshape(cols, passes, 2, -1)
@@ -194,8 +220,12 @@ def main():
     if N.QCYC:   # (diag) each segment's first word: core cycles since the first firing; per M block: its last segment's
         seg = N.NP * 256 * 2   # bytes of one bf16 segment (NP sub-tiles of 16 x 16)
         cyc = np.fromfile(co, np.uint32)[::seg // 4].astype(np.int64)
+        if os.environ.get("GN_QTL") == "1":   # (diag) words 0-3 of every segment: [col][block][row of MP][end, start, W, A]
+            w4_ = np.fromfile(co, np.uint32).reshape(-1, seg // 4)[:, :4].astype(np.int64)
+            np.save(os.path.join(work, "tl.npy"), w4_.reshape(cols, nb, N.MP, 4))
         R_ = int(os.environ.get("NPU_QROWS", "1"))
-        rel_ = R_ >= 2 and os.environ.get("NPU_QCREL", "1") == "1"   # (C relay: row r's blocks r, r + R, ..)
+        rel_ = R_ >= 2 and (os.environ.get("NPU_QCREL", "1") == "1" or os.environ.get("GN_QEMERGE") == "1")   # (C relay
+        # or egress merge: row r's blocks r, r + R, ..)
         last = cyc.reshape(cols, nb, N.MP)[0, ::R_, -1] if rel_ else cyc.reshape(cols, nb, N.MP)[0, :nb // R_, -1]
         if os.environ.get("NPU_QCREL") == "2":   # (P1 pair relay: core 0's blocks 0, 2, .. of pair 0's half)
             last = cyc.reshape(cols, nb, N.MP)[0, :nb // (R_ // 2):2, -1]
@@ -250,7 +280,8 @@ def main():
             R_ = int(os.environ.get("NPU_QROWS", "2"))
             tb, nbr_ = N.TM, nb // R_
             # (a block's row: the pair relay interleaves a pair's blocks, else row r holds blocks r nbr ..)
-            odd = [(b % 2 == 1) if os.environ.get("NPU_QCREL") == "2" else (b // nbr_) % 2 == 1 for b in range(nb)]
+            inter_ = os.environ.get("NPU_QCREL") == "2" or os.environ.get("GN_QEMERGE") == "1"   # (row = b mod R)
+            odd = [(b % 2 == 1) if inter_ else (b // nbr_) % 2 == 1 for b in range(nb)]
             for c in range(cols):
                 for b in range(nb):
                     if odd[b]:
