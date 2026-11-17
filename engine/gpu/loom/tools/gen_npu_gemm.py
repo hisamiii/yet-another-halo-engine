@@ -230,6 +230,20 @@ def div_mp(src, dst, x):
     return [f"  %{x}m = mov.i32 {m}", f"  %{x}p = mul {src}, %{x}m", f"  %{x}k = mova.i32 -16", f"  {dst} = lshl %{x}p, %{x}k"]
 
 
+# GN_QW4=1 (with GN_QPASS, passes % 4 == 0): a 4-slot W ring (slot = pass & 3; the DMA up to 3 passes ahead), the
+# step to pass pairs. Slot k = slot 0 + (k & 1) d1 + (k >> 1) d2 (GN_QPINS' W group in ring order: s0, s0 + d1,
+# s0 + d2, s0 + d1 + d2); every firing starts at slot 0.
+def qw4_on():
+    return os.environ.get("GN_QW4") == "1"
+
+
+def qw4_deltas():
+    """(GN_QW4) d1, d2 from GN_QPINS' W group."""
+    w = [int(v) for v in os.environ["GN_QPINS"].split(",")[1].split("@")[1].split(":")]
+    assert len(w) == 4 and w[3] - w[0] == (w[1] - w[0]) + (w[2] - w[0]), w
+    return w[1] - w[0], w[2] - w[0]
+
+
 def qpass_wdelta():
     """W slot 1 - W slot 0 in bytes (QBANK_RING_AT's W pins)."""
     w = [int(v) for v in QBANK_RING_AT.split(",")[1].split("@")[1].split(":")]
@@ -3423,8 +3437,16 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         if qpass:   # the W slot: acquired at a pass end if a row follows; the next row's slot (pass parity)
             lat += ["  %wwa = mul %wrap, %nxm"] + div_mp("%mpn", "%qpq", "qpd") + [
                     *(["  %qpqw = add.rr %qpq, %qwp", "  %qppn = and %qpqw, %one"] if cfg.passes % 2 else
-                      ["  %qppn = and %qpq, %one"]), f"  %qwda = mova.i32 {qpass_wdelta() // 512}", "  %qwd = mul %k512, %qwda",
-                    "  %qwo = mul %qppn, %qwd", "  %wcn = add.rr %wsb, %qwo"]
+                      ["  %qppn = and %qpq, %one"]), f"  %qwda = mova.i32 {(qw4_deltas()[0] if qw4_on() else qpass_wdelta()) // 512}",
+                    "  %qwd = mul %k512, %qwda", "  %qwo = mul %qppn, %qwd"]
+            if qw4_on():   # (GN_QW4) + (pass & 2) d2 / 2
+                d2 = qw4_deltas()[1]
+                assert cfg.passes % 4 == 0 and d2 % 1024 == 0, (cfg.passes, d2)
+                lat += ["  %qw4k = mova.i32 2", "  %qw4b = and %qpq, %qw4k", f"  %qw4a = mova.i32 {d2 // 1024}",
+                        "  %qw4d = mul %k512, %qw4a", "  %qw4o = mul %qw4b, %qw4d", "  %qwo4 = add.rr %qwo, %qw4o",
+                        "  %wcn = add.rr %wsb, %qwo4"]
+            else:
+                lat += ["  %wcn = add.rr %wsb, %qwo"]
         elif os.environ.get("GN_QROW") == "1":   # (first pass: rows 1.. acquire their C slot at the row-end window)
             lat += ["  %cfn = mul %first, %nxm"]
         # (the pointer itself just before the row-end window: one fewer pointer live through the row)

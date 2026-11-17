@@ -113,7 +113,7 @@ def array_program(L, cfg):
     e("aie2p.target<array> @array_target\naie2p.target<core> @core_target\n")
     e(f"low.func.def public retain target<amd.xdna.aie2p.array>(@array_target) abi(array_program) @{cfg.entry}() asm {{")
     RW_ = R + qdec_rows()   # (worker rows: the compute rows, then the decoder rows)
-    for k, v in (("zero", 0), ("one", 1), ("two", 2), ("nw", cols * RW_), ("rec", nbr * P)):
+    for k, v in (("zero", 0), ("one", 1), ("two", 2), ("nw", cols * RW_), ("rec", nbr * P)) + ((("qw4n", 4),) if N.qw4_on() else ()):
         e(f"  %{k} = constant.u32 {v} : reg<aie2p.array.scalar : index>")
     e("  %origin = constant.u64 0 : reg<aie2p.array.offset : offset>")
     e("  %workers = group %nw")
@@ -180,7 +180,7 @@ def array_program(L, cfg):
         for r in range(R):   # (one view, R channels: multicast down the column)
             t = f"{c}_{r}"
             e(f"  %rw{t} = receiver {kk[c, r]}, 1 : reg<aie2p.array.receiver : tile<{wty}xi32>>")
-            e(f"  %chw{t} = channel %wv{c}, %rw{t}, %two, {'%two' if 'w' in qfix() else '%rec'} : "
+            e(f"  %chw{t} = channel %wv{c}, %rw{t}, {'%qw4n' if N.qw4_on() else '%two'}, {'%two' if 'w' in qfix() else '%rec'} : "
               f"reg<aie2p.array.channel : tile<{wty}xi32>>")
             e(f"  constrain.stage %chw{t}, %n{c if cols > 1 else 1}")
             if N.qpass_on():   # (GN_QPASS) the leaf walks the W ring: one firing per M block
