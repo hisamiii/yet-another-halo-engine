@@ -4267,6 +4267,47 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         e("^pexit:")
     if q3 and qpeel_on():
         pass
+    elif q3 and os.environ.get("GN_QCVL", "1" if qunr_on() else "0") == "1":
+        # (GN_QCVL: the convert below as a loop over the rows, ~1/4 of its code: the unroll's room without the peel)
+        # a row's loads: 16 from the even area, 16 odd, 16 even, 16 odd (post-incremented: each ends a row on, as d)
+        n = 16 * NP
+        assert n == 64
+        e("  %cvz = mova.i32 0")
+        e("  %cvo0 = copy %o : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e("  %cvq0 = copy %qod : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e(f"  %cvK = mova.i32 {MP}")
+        e("  low.br ^cvl(%cvz: reg<aie2p.er>, %cvo0: reg<aie2p.ep>, %cvo0: reg<aie2p.ep>, %cvq0: reg<aie2p.ep>)")
+        e("^cvl(%cvr: reg<aie2p.er>, %cvd_0: reg<aie2p.ep>, %cva_0: reg<aie2p.ep>, %cvb_0: reg<aie2p.ep>):")
+        e("  %cvm = lt %cvr, %cvK")
+        e("  %cvrn = add %cvr, 1")
+        e("  low.cond_br %cvm, ^cvb, ^cvx : reg<aie2p.er>")
+        e("^cvb:")
+        if QCYC:   # (the row's first word, for the stamp: the stores consume %cvd_0)
+            e("  %cvds = copy %cvd_0 : reg<aie2p.ep> -> reg<aie2p.ep>")
+        cur = {"a": "%cva_0", "b": "%cvb_0"}
+
+        def load_(i):
+            g = "a" if (i // 16) % 2 == 0 else "b"
+            e(f"  %cvl_{i}, %cv{g}_{i + 1} = vlda.acc.post {cur[g]}, 64")
+            cur[g] = f"%cv{g}_{i + 1}"
+        for i in range(16):
+            load_(i)
+        d = "%cvd_0"
+        for i in range(n):
+            e(f"  %cvd_{i + 1} = vst.convert.f32x16.to.bf16x16.post %cvl_{i}, {d}, 32")
+            d = f"%cvd_{i + 1}"
+            if i + 16 < n:
+                load_(i + 16)
+        if QCYC:   # (diag) the cycles since the first firing's start into the row's first word
+            e("  %tcw_l = mov.cycles")
+            e("  %tcl_l = slice %tcw_l[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+            e("  %tsa_l = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>")
+            e("  %tst_l = lda %tsa_l, 0")
+            e("  %tsp_l = sub %tcl_l, %tst_l")
+            e("  st %tsp_l, %cvds, 0")
+        e("  rel %one, 2")
+        e(f"  low.br ^cvl(%cvrn: reg<aie2p.er>, {d}: reg<aie2p.ep>, {cur['a']}: reg<aie2p.ep>, {cur['b']}: reg<aie2p.ep>)")
+        e("^cvx:")
     elif q3:   # each row: its f32 sub-tiles (even area, odd area, alternating) packed to bf16 in its even half
         for r in range(MP):
             t = 100 + r
