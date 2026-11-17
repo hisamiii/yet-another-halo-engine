@@ -334,10 +334,11 @@ def array_program(L, cfg):
                     e(f"  %fdlane{c} = constant.u32 {c} : reg<aie2p.array.scalar : index>")
                     e(f"  %fdr{t} = partition.receiver %fd_all, %origin, %fdlane{c}, %fdl : reg<aie2p.array.receiver : tile<{fw}xi32>>")
                     e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
-                    e(f"  %chd{t} = channel %fds{t}, %fdr{t}, %two, %fdn : reg<aie2p.array.channel : tile<{fw}xi32>>")
+                    e(f"  %chd{t} = channel %fds{t}, %fdr{t}, {'%n4' if N.qfdirect_on() else '%two'}, %fdn : "
+                      f"reg<aie2p.array.channel : tile<{fw}xi32>>")
                     e(f"  constrain.leaf_sync %chd{t}")
                 e(f"  %frr{t} = receiver {kk[c, r]}, {sp} : reg<aie2p.array.receiver : tile<{rty}xi32>>")
-                e(f"  %chr{t} = channel %fru{c}, %frr{t}, {'%n3' if qdec() else '%one'}, "
+                e(f"  %chr{t} = channel %fru{c}, %frr{t}, {'%n3' if qdec() else '%two' if N.qfdirect_on() and N.QF_P1KD['raw'] == 2 else '%one'}, "
                   f"{'%fsn' if qsplit() or qdec() else '%fun'} : reg<aie2p.array.channel : tile<{rty}xi32>>")
                 if not qdec() or os.environ.get("GN_QDSTAGE", "1") == "1":   # (decoder rows: staged too, else shim to core)
                     e(f"  constrain.stage %chr{t}, %n{c if cols > 1 else 1}")
