@@ -103,6 +103,9 @@ class LoomNpu {
     // Streamed: calls queued ahead of their waits (QueueDepth: 2, or 1 where one call's pushes fill a DMA channel's
     // task queue past half, e.g. layout Q''s 4 W tasks a call: a second call's would overflow it)
     int depth = 2;
+    // depth 1 by SetMaxDepth while the task queues hold two calls: the next call's push but its core starts may run
+    // before the wait (EarlyPush)
+    bool early = false;
     amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{}, gate{}, done{}, call{};
     // the device address ranges of the weight views as bound now (Rebind; SplitLead)
     std::vector<std::pair<std::uint64_t, std::uint64_t>> weights;
@@ -117,7 +120,46 @@ class LoomNpu {
     std::vector<std::uint8_t> push[2], wait, lead, gate, done, call;
     // lead split at the gate (SplitLead): lead_pre before it, lead_post after; both empty when lead does not split
     std::vector<std::uint8_t> lead_pre, lead_post;
+    // push[p] split at the previous call's wait (SplitPush): push_pre before it, push_post after; empty: no split
+    std::vector<std::uint8_t> push_pre[2], push_post[2];
   };
+  // Early push (kernels at depth 1 whose task queues hold two calls, Kernel::early; YAH_NPU_EARLYPUSH=0: off): a call's
+  // push but its core-tile queue starts runs before the previous call's wait (SplitPush). At depth 2 a core starts the next call as soon as its own last firing ends, and its fill writes
+  // rings over its C slots 1-3 (the helper's records, the egress ring) and its raw rows into W slot 0 while its last
+  // C may still be undrained (1 of 5 engine runs NaN, 11-18). Here the cores' tasks wait for the drain; the shim and
+  // memory-tile tasks (descriptors, staging of the raw rows and A) do not.
+  static bool EarlyPush() {
+    static const bool on = !std::getenv("YAH_NPU_EARLYPUSH") || std::getenv("YAH_NPU_EARLYPUSH")[0] != '0';
+    return on;
+  }
+  static void SplitPush(const std::vector<std::uint8_t>& push, std::vector<std::uint8_t>& pre,
+                        std::vector<std::uint8_t>& post) {
+    pre.clear(), post.clear();
+    std::uint32_t size = 0;
+    if (push.size() < 16 || (std::memcpy(&size, push.data() + 12, 4), size != push.size())) return;
+    std::vector<std::uint8_t> a(push.begin(), push.begin() + 16), b = a;
+    std::uint32_t na = 0, nb = 0;
+    for (std::size_t o = 16; o < size;) {
+      std::uint32_t len = 0, addr = 0;
+      switch (push[o]) {   // libamdf transaction 0.1 operations
+        case 0: len = 24; break;
+        case 3: len = 28; break;
+        case 1: std::memcpy(&len, push.data() + o + 12, 4); break;
+        default: return;   // (anything else: no split)
+      }
+      if (len < 16 || o + len > size) return;
+      std::memcpy(&addr, push.data() + o + 8, 4);
+      const bool core = push[o] == 0 && ((addr >> 20) & 31) >= 2;   // a core tile's register write (queue start)
+      (core ? b : a).insert((core ? b : a).end(), push.begin() + o, push.begin() + o + len);
+      ++(core ? nb : na);
+      o += len;
+    }
+    if (!na || !nb) return;
+    const std::uint32_t sa = static_cast<std::uint32_t>(a.size()), sb = static_cast<std::uint32_t>(b.size());
+    std::memcpy(&a[8], &na, 4), std::memcpy(&a[12], &sa, 4);
+    std::memcpy(&b[8], &nb, 4), std::memcpy(&b[12], &sb, 4);
+    pre.swap(a), post.swap(b);
+  }
   // A job's lead push is ~150 register writes before its first call's data moves. Only the shim read starts (MM2S
   // queue starts) of data the GPU writes must wait for the gate; its descriptors, the memory-tile, core and shim write
   // (C) queue starts and the reads of weights (a start whose descriptor, set in this lead, reads a weight view and
@@ -462,9 +504,19 @@ class LoomNpu {
       for (int i = 0; i < calls; ++i) seq.push_back(&c.call);
     } else {
       int queued = 0;
-      for (int i = 0; i < calls; ++i) {
-        seq.push_back(i == 0 ? (pre ? &cl(0).lead_post : &cl(0).lead) : &cl(i).push[i & 1]);
-        if (++queued == k.depth) seq.push_back(&cl(i + 1 - queued).wait), --queued;
+      if (EarlyPush() && k.early && !c.push_pre[1].empty()) {   // (early push)
+        seq.push_back(pre ? &cl(0).lead_post : &cl(0).lead);
+        for (int i = 1; i < calls; ++i) {
+          seq.push_back(&cl(i).push_pre[i & 1]);
+          seq.push_back(&cl(i - 1).wait);
+          seq.push_back(&cl(i).push_post[i & 1]);
+        }
+        seq.push_back(&cl(calls - 1).wait);
+      } else {
+        for (int i = 0; i < calls; ++i) {
+          seq.push_back(i == 0 ? (pre ? &cl(0).lead_post : &cl(0).lead) : &cl(i).push[i & 1]);
+          if (++queued == k.depth) seq.push_back(&cl(i + 1 - queued).wait), --queued;
+        }
       }
       for (; queued > 0; --queued) seq.push_back(&cl(calls - queued).wait);
     }
@@ -606,8 +658,11 @@ class LoomNpu {
       NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(k.image, k.entry_ordinal, n, k.storage.data(),
                                                                      i + 1, k.streamed ? streamed[i] : single[i]),
                "query_invocation_ordinal");
-    if (k.streamed && k.push[0].byte_length)
-      k.depth = std::min(max_depth_, QueueDepth(CommandBytes(k, k.push[0]), k.push[0].byte_length));
+    if (k.streamed && k.push[0].byte_length) {
+      const int q = QueueDepth(CommandBytes(k, k.push[0]), k.push[0].byte_length);
+      k.depth = std::min(max_depth_, q);
+      k.early = k.depth == 1 && q >= 2;
+    }
   }
   // At most this many calls queued ahead (SetMaxDepth; dispatch.txt npudepth1: 1).
   void SetMaxDepth(int d) { max_depth_ = d; }
@@ -738,6 +793,8 @@ class LoomNpu {
     copy(k.push[0], c.push[0]), copy(k.push[1], c.push[1]), copy(k.wait, c.wait), copy(k.lead, c.lead);
     copy(k.gate, c.gate), copy(k.done, c.done), copy(k.call, c.call);
     SplitLead(c.lead, k.weights, c.lead_pre, c.lead_post);
+    if (EarlyPush())
+      for (int p = 0; p < 2; ++p) SplitPush(c.push[p], c.push_pre[p], c.push_post[p]);
     return c;
   }
 
@@ -1531,18 +1588,31 @@ class LoomNpu {
         if (prof_) append_ops(prof_->Read(), 1);
         continue;
       }
+      const Call* pend = nullptr;   // (early push) the call whose wait waits for the next call's push_pre
       for (std::size_t i = 0; i < calls.size(); ++i) {
         const Call& c = *calls[i];
         if (c.k->swap && c.k->dec != dec) {
+          if (pend) append(pend->wait), pend = nullptr;
           for (; queued > 0; --queued) append(calls[i - 1]->wait);
           // mid-job (a gate's tasks live on columns 1-2): no packets
           append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length, false));
           dec = c.k->dec, since = 0;
         }
+        if (pend && since > 0 && !c.push_pre[since & 1].empty()) {   // (early push)
+          append(c.push_pre[since & 1]), append(pend->wait), append(c.push_post[since & 1]);
+          pend = &c, ++since;
+          continue;
+        }
+        if (pend) append(pend->wait), pend = nullptr;
         append(since == 0 ? (i == 0 && pre ? c.lead_post : c.lead) : c.push[since & 1]);
         ++since;
+        if (EarlyPush() && c.k->early) {
+          pend = &c;
+          continue;
+        }
         if (++queued == c.k->depth) append(c.wait), --queued;
       }
+      if (pend) append(pend->wait);
       for (; queued > 0; --queued) append(calls.back()->wait);
       append(calls.back()->done);
       if (prof_) append_ops(prof_->Read(), 1);
