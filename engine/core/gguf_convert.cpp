@@ -212,18 +212,31 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights) {
       const TensorInfo& s = *it->src;
       const std::uint64_t k = s.dims[0];
       const std::size_t sb = k / BlockElements(s.type) * BlockBytes(s.type), db = k / BlockElements(t.type) * BlockBytes(t.type);
-      std::vector<float> buf(k);
-      for (std::size_t i = 0; i < n; ++i) {
-        const std::uint8_t* in = st->src.Data(s) + std::size_t{rows[i]} * sb;
-        if (it->kind == Kind::kCopy) {
-          std::memcpy(out + i * db, in, db);
-        } else if (it->kind == Kind::kQ8_0) {
-          Dequantize(s.type, in, buf.data(), k);
-          QuantizeQ8_0(buf.data(), k, out + i * db);
-        } else {
-          throw std::runtime_error("gguf: Rows of " + t.name + " from the source: not a copy or Q8_0 item");
+      if (it->kind != Kind::kCopy && it->kind != Kind::kQ8_0)
+        throw std::runtime_error("gguf: Rows of " + t.name + " from the source: not a copy or Q8_0 item");
+      // rows [r0, r1): each row on its own (a prefill chunk's 2048 Q8_0 rows took ~54 ms on one thread)
+      const auto run = [&](std::size_t r0, std::size_t r1) {
+        std::vector<float> buf(k);
+        for (std::size_t i = r0; i < r1; ++i) {
+          const std::uint8_t* in = st->src.Data(s) + std::size_t{rows[i]} * sb;
+          if (it->kind == Kind::kCopy) {
+            std::memcpy(out + i * db, in, db);
+          } else {
+            Dequantize(s.type, in, buf.data(), k);
+            QuantizeQ8_0(buf.data(), k, out + i * db);
+          }
         }
+      };
+      const std::size_t threads = n < 64 ? 1 : std::min<std::size_t>(16, std::max(1U, std::thread::hardware_concurrency()));
+      if (threads == 1) {
+        run(0, n);
+        return true;
       }
+      run(0, 1);   // (row 0 here: a format Dequantize rejects throws on this thread, not in a worker)
+      std::vector<std::thread> pool;
+      for (std::size_t w = 0; w < threads; ++w)
+        pool.emplace_back(run, std::max<std::size_t>(1, n * w / threads), n * (w + 1) / threads);
+      for (auto& th : pool) th.join();
       return true;
     };
     // a job's bytes in the copy (dst) and in the file (src)
