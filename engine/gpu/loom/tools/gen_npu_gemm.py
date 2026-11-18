@@ -1377,6 +1377,8 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
     e = L.append
     if QFCYC:
         e("  %qfc = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+    if gate and qprefill_on(QF["cfg"]):   # (GN_QPREFILL) the gate's neighbor, parked across the fill
+        e("  %gnk = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzc = lda %fzp, 0")
     e("  %fzc1 = add %fzc, 1")
     q = QF["cfg"]
@@ -1454,7 +1456,11 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
             e("  %qfwgo = mov.cycles")
             e("  %qflgo = slice %qfwgo[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
             e("  st %qflgo, %qfpgo, 8")
-        if i == 0 and gate:   # (a call's first firing: the check costs once per call)
+        if i == 0 and gate and qprefill_on(q):   # (GN_QPREFILL) the gate after the fill: its neighbor parked
+            e("  %gsq = storage_address %gnk : low.storage<private> -> reg<aie2p.ep>")
+            e("  %gnqs = mov.address-to-scalar %gn1_r")
+            e("  st %gnqs, %gsq, 0")
+        elif i == 0 and gate:   # (a call's first firing: the check costs once per call)
             e("  %gsp0 = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
             if QFCYC and os.environ.get("GN_QFW") == "2":   # (diag) the gate check's cycles: %qfc byte 44
                 L0_ = len(L)
@@ -1472,6 +1478,12 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
     else:
         fuse_decode(L, cfg, dp, cov, helper)
     e("^fzgemm:")
+    if gate and qprefill_on(q):   # (GN_QPREFILL) every firing; only a job's first (state zero) waits
+        e("  %gsp0 = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
+        e("  %gsk = storage_address %gnk : low.storage<private> -> reg<aie2p.ep>")
+        e("  %gnql = lda %gsk, 0")
+        e("  %gn1q = mov.scalar-to-address %gnql")
+        gate_first(e, cfg, gate, "%gn1q")
     e("  %fzpG = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     for o, nm in ((20, "a"), (24, "w0"), (28, "fzd")):
         e(f"  %fzpl{o} = lda %fzpG, {o}")
@@ -3186,6 +3198,13 @@ def gate_done_late(e):
     e("  %gdmark = mul %gdbad, %gdfb")
     e("  %gddone = add.rr %gdv, %gdmark")
     gate_record(e, ("%gddone", "%gds", "%gdp", "%gd0"), "%gdid")
+
+
+def qprefill_on(q):
+    """(GN_QPREFILL=1, Q' fuse 2) the gate cores check the gate after a call's fill, not before: a job's first fill
+    then runs in the wait for the GPU. The host must start the weight reads before the gate (LoomNpu::SplitLead), or
+    the gate waits on a fill that waits on it."""
+    return q is not None and os.environ.get("GN_QPREFILL") == "1"
 
 
 def gate_first(e, cfg, gate, gn):

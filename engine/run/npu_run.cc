@@ -73,11 +73,44 @@ int main(int argc, char** argv) {
     LoomDevice gpu;
     LoomNpu npu(gpu, columns);
     std::vector<LoomNpu::View> views;
-    for (const auto& f : files) {
-      LoomNpu::Shared& s = npu.CreateShared(f.size() ? f.size() : 4, true);
-      std::memcpy(s.host, f.data(), f.size());
-      FlushLines(s.host, s.bytes);
-      views.push_back({&s, 0, f.size()});
+    // NPU_RUN_DEV="i,j": those bindings in GPU device memory (as the engine's A and raw weights), the rest host pages
+    std::vector<bool> dev(files.size());
+    if (const char* d = std::getenv("NPU_RUN_DEV"))
+      for (std::string spec = d; !spec.empty();) {
+        const std::size_t comma = spec.find(',');
+        const std::size_t i = std::stoul(spec.substr(0, comma));
+        if (i < dev.size()) dev[i] = true;
+        spec = comma == std::string::npos ? "" : spec.substr(comma + 1);
+      }
+    // NPU_RUN_SHIFT="i:bytes": binding i's data starts that many bytes into its buffer (diag: the engine's raw views
+    // start at GGUF row offsets, not on a page)
+    std::vector<std::size_t> shift(files.size());
+    if (const char* d = std::getenv("NPU_RUN_SHIFT")) {
+      const std::string spec = d;
+      const std::size_t colon = spec.find(':');
+      const std::size_t i = std::stoul(spec.substr(0, colon));
+      if (i < shift.size()) shift[i] = std::stoul(spec.substr(colon + 1));
+    }
+    // NPU_RUN_WEIGHTS="i,j,...": bindings that hold weights (LoomNpu::View::weights: the split lead reads them before
+    // the gate)
+    std::vector<bool> weights(files.size());
+    if (const char* d = std::getenv("NPU_RUN_WEIGHTS"))
+      for (std::string spec = d; !spec.empty();) {
+        const std::size_t comma = spec.find(',');
+        const std::size_t i = std::stoul(spec.substr(0, comma));
+        if (i < weights.size()) weights[i] = true;
+        spec = comma == std::string::npos ? "" : spec.substr(comma + 1);
+      }
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      const auto& f = files[i];
+      LoomNpu::Shared& s = npu.CreateShared(f.size() ? f.size() + shift[i] : 4, !dev[i]);
+      if (dev[i]) {
+        gpu.H2D(s.gpu, f.data(), f.size());
+      } else {
+        std::memcpy(static_cast<char*>(s.host) + shift[i], f.data(), f.size());
+        FlushLines(s.host, s.bytes);
+      }
+      views.push_back({&s, shift[i], f.size(), weights[i]});
     }
     // NPU_RUN_REPEAT=<n>: n runs, each one's host wall time (load + run) printed; timing by difference of two
     // problem sizes cancels the fixed part

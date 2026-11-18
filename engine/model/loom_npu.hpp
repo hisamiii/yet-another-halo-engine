@@ -74,6 +74,7 @@ class LoomNpu {
   struct View {
     Shared* shared;
     std::size_t offset, length;
+    bool weights = false;   // read-only model weights: nothing writes them during a forward (SplitLead)
   };
   // One loaded instance of an image with its bindings and native command storage.
   struct Kernel {
@@ -103,6 +104,8 @@ class LoomNpu {
     // task queue past half, e.g. layout Q''s 4 W tasks a call: a second call's would overflow it)
     int depth = 2;
     amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{}, gate{}, done{}, call{};
+    // the device address ranges of the weight views as bound now (Rebind; SplitLead)
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> weights;
     std::vector<iree_hal_amd_xdna_executable_storage_t> storage;
     std::vector<amdf_host_mapping_t*> storage_maps;
     std::vector<iree_hal_buffer_t*> buffers;
@@ -115,12 +118,14 @@ class LoomNpu {
     // lead split at the gate (SplitLead): lead_pre before it, lead_post after; both empty when lead does not split
     std::vector<std::uint8_t> lead_pre, lead_post;
   };
-  // A job's lead push is ~150 register writes (~85K array cycles of the command processor) before its first call's
-  // data moves. Only its shim read starts (MM2S queue starts: the activations, which the GPU writes, and the raw
-  // weights) must wait for the gate; its descriptors and the memory-tile, core and shim write (C) queue starts can run
-  // before it, in the wait for the GPU. YAH_NPU_PRELEAD=0: the whole lead after the gate (as before 11-18).
-  static void SplitLead(const std::vector<std::uint8_t>& lead, std::vector<std::uint8_t>& pre,
-                        std::vector<std::uint8_t>& post) {
+  // A job's lead push is ~150 register writes before its first call's data moves. Only the shim read starts (MM2S
+  // queue starts) of data the GPU writes must wait for the gate; its descriptors, the memory-tile, core and shim write
+  // (C) queue starts and the reads of weights (a start whose descriptor, set in this lead, reads a weight view and
+  // chains to no other) run before it, in the wait for the GPU: the first call's weight fill with them (an image whose
+  // gate cores check after their fill, GN_QPREFILL, relies on that). YAH_NPU_PRELEAD=0: the whole lead after the gate
+  // (as before 11-18; not for GN_QPREFILL images: their gate would wait on a fill that waits on it).
+  static void SplitLead(const std::vector<std::uint8_t>& lead, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& weights,
+                        std::vector<std::uint8_t>& pre, std::vector<std::uint8_t>& post) {
     pre.clear(), post.clear();
     static const bool off = [] {
       const char* v = std::getenv("YAH_NPU_PRELEAD");
@@ -130,6 +135,8 @@ class LoomNpu {
     if (off || lead.size() < 16 || (std::memcpy(&size, lead.data() + 12, 4), size != lead.size())) return;
     std::vector<std::uint8_t> a(lead.begin(), lead.begin() + 16), b = a;
     std::uint32_t na = 0, nb = 0;
+    // per (column, shim descriptor): 1 it reads weights and chains nowhere, 0 not (descriptors set in this lead)
+    std::map<std::pair<std::uint32_t, std::uint32_t>, bool> wbd;
     for (std::size_t o = 16; o < size;) {
       std::uint32_t len = 0, addr = 0;
       switch (lead[o]) {   // libamdf transaction 0.1 operations
@@ -140,8 +147,28 @@ class LoomNpu {
       }
       if (len < 16 || o + len > size) return;
       std::memcpy(&addr, lead.data() + o + 8, 4);
-      const std::uint32_t row = (addr >> 20) & 31, off_ = addr & 0xFFFFF;
-      const bool start = lead[o] == 0 && row == 0 && (off_ == 0x1D214 || off_ == 0x1D21C);   // shim MM2S0 / 1 queue
+      const std::uint32_t col = addr >> 25, row = (addr >> 20) & 31, off_ = addr & 0xFFFFF;
+      if (lead[o] == 1 && row == 0 && off_ >= 0x1D000 && off_ < 0x1D200 && (off_ - 0x1D000) % 32 == 0) {
+        for (std::size_t j = 0; j + 32 <= len - 16; j += 32) {   // shim descriptors: [1] address low, [2] its high
+          std::uint32_t w[8];                                    // 16 bits, [7] use-next at bit 26
+          std::memcpy(w, lead.data() + o + 16 + j, 32);
+          const std::uint64_t ad = w[1] | (std::uint64_t{w[2] & 0xFFFF} << 32);
+          const std::uint64_t end = ad + std::uint64_t{w[0]} * 4;
+          bool in = !(w[7] >> 26 & 1);
+          if (in) {
+            in = false;
+            for (const auto& r : weights) in |= r.first <= ad && end <= r.second;
+          }
+          wbd[{col, (off_ - 0x1D000 + static_cast<std::uint32_t>(j)) / 32}] = in;
+        }
+      }
+      bool start = lead[o] == 0 && row == 0 && (off_ == 0x1D214 || off_ == 0x1D21C);   // shim MM2S0 / 1 queue
+      if (start) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, lead.data() + o + 16, 4);
+        const auto it = wbd.find({col, v & 63});
+        start = it == wbd.end() || !it->second;
+      }
       (start ? b : a).insert((start ? b : a).end(), lead.begin() + o, lead.begin() + o + len);
       ++(start ? nb : na);
       o += len;
@@ -394,7 +421,7 @@ class LoomNpu {
     };
     put("first", FirstBytes(k));
     put("gate", c.gate), put("done", c.done), put("call", c.call), put("lead", c.lead), put("wait", c.wait);
-    put("push0", c.push[0]), put("push1", c.push[1]);
+    put("push0", c.push[0]), put("push1", c.push[1]), put("lead_pre", c.lead_pre), put("lead_post", c.lead_post);
   }
   // (diagnosis, run/npu_run NPU_RUN_GATED=<calls>) A gated image's setup, then one job of that many calls on the same
   // views, in one command as FusedCommand builds a job: gate, then call per call (streamed: lead, push[parity], a wait
@@ -604,6 +631,10 @@ class LoomNpu {
                "validate_relocation");
     }
     iree_hal_amd_xdna_executable_storage_patch(k.image, k.entry_ordinal, k.storage.data(), bindings.data());
+    k.weights.clear();
+    for (std::size_t i = 0; i < views.size() && i < bindings.size(); ++i)
+      if (views[i].weights)
+        k.weights.push_back({bindings[i].device_address, bindings[i].device_address + bindings[i].byte_length});
     for (uint32_t i = 0; i < n; ++i)
       YAH_AMDF(api_->host_mapping_cache_control(k.storage_maps[i], AMDF_HOST_CACHE_OPERATION_FLUSH, 0,
                                                 k.storage[i].mapping.data_length),
@@ -625,7 +656,7 @@ class LoomNpu {
     };
     copy(k.push[0], c.push[0]), copy(k.push[1], c.push[1]), copy(k.wait, c.wait), copy(k.lead, c.lead);
     copy(k.gate, c.gate), copy(k.done, c.done), copy(k.call, c.call);
-    SplitLead(c.lead, c.lead_pre, c.lead_post);
+    SplitLead(c.lead, k.weights, c.lead_pre, c.lead_post);
     return c;
   }
 
@@ -2003,7 +2034,7 @@ class LoomNpuSplit : public NpuSplit {
   LoomNpu::View RawView(const void* raw, std::size_t bytes) const {
     const auto r0 = reinterpret_cast<std::uintptr_t>(raw);
     for (const Raw& x : raw_)
-      if (x.begin <= r0 && r0 + bytes <= x.end) return {x.shared, r0 - x.begin, bytes};
+      if (x.begin <= r0 && r0 + bytes <= x.end) return {x.shared, r0 - x.begin, bytes, true};
     throw LoomError("npu: raw weights outside the registered ranges");
   }
   std::uint32_t BindViews(const std::string& image, const std::string& swap, int dec, const std::string& family,

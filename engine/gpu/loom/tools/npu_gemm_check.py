@@ -256,6 +256,8 @@ def main():
         # the GGUF rows as they are, from the call's first column
         np.concatenate([wraw.reshape(-1)[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
         bindings += [d_b, r_b]
+        # the raw stream reads weights (the split lead starts it before the gate; GN_QPREFILL images need that)
+        os.environ.setdefault("NPU_RUN_WEIGHTS", str(len(bindings) - 1))
     width = None
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
         if os.environ.get("NPU_STALL_CMD"):   # (diag) a command run 3 s into the job, while it lives (a status dump)
