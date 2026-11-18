@@ -310,6 +310,11 @@ def main():
             fb_ = ((1 if N.qcstage_on() else 2) if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
             v_ = w4f[fb_, -1]
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
+            if os.environ.get("GN_QF4R") == "1" and os.environ.get("GN_QFCOLS") == "1":   # (diag) whole fill per column
+                wall_ = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[:, :, -1, 2].astype(np.int64)
+                for c_ in range(cols):
+                    print(f"  column {c_} whole fill by row: " + " ".join(str(wall_[c_, 2 * (r_ % 2) + r_ // 2])
+                                                                      for r_ in range(4)))
             if os.environ.get("GN_QF4R") == "1":   # (every row fills: row r's first block 2 (r % 2) + r // 2)
                 for r_ in range(4):
                     u_ = w4f[2 * (r_ % 2) + r_ // 2, -1]
