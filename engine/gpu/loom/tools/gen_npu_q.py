@@ -100,7 +100,8 @@ P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="2560@37376:40448:43520:46592,11520@0
                GN_QLRU="aie2p.mbms")   # (11-18: no LRU on the operand vectors: memstall -1.5K a call)
 P1K_LOOM = dict(LOOM_EXP_RING_AT_FORCE="1", LOOM_EXP_SPACE_AT="scratch@12288", LOOM_EXP_EGRESS_MERGE="1",
                 LOOM_EXP_REPLAY_GROUP="4", LOOM_EXP_MERGE_RING_LOW="1", LOOM_EXP_PANEL_STREAM="1",
-                LOOM_EXP_PANEL_STREAM_SINGLE="1")
+                LOOM_EXP_PANEL_STREAM_SINGLE="1",
+                LOOM_EXP_LOCK_ACQREL="6")   # (11-18: locks order as acquire / release only: loop 696 -> 685 bundles)
 
 
 def defaults(p1k=False):
