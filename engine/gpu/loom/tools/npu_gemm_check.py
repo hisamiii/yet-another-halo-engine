@@ -124,6 +124,50 @@ def main():
                     out_ += [f"  %tlr{o_} = lda %pta, {o_}", f"  %tld{o_} = sub %tlr{o_}, %pts",
                              f"  st %tld{o_}, %ptq, {4 * w_}"]
         text_ = "\n".join(out_) + "\n"
+    if os.environ.get("GN_QTL2") == "1" and N.QFCYC and os.environ.get("GN_QFW") == "1":   # (diag, P1K fill rows)
+        out_, seen_ = [], set()   # absolute cycles (low word) at the fill's end (before the first C slot acquire) /
+        for ln_ in text_.splitlines():   # after the block-start W / A acquires -> %qfc 32 / 36 / 40 = words 5-7
+            if ln_.startswith("low.func.def"):
+                seen_ = set()
+            pre_, post_ = ln_ == "  acq %am1, 2" and 32 not in seen_, None
+            if pre_:
+                seen_.add(32)
+                post_ = 32
+                out_.append(ln_)
+            else:
+                out_.append(ln_)
+                post_ = (36 if ln_.startswith("  %qfc = storage ") and 36 not in seen_ else   # (the firing's start)
+                         40 if ln_ == "  acq %am1, 0" and 40 not in seen_ else None)
+            if post_ is not None:
+                seen_.add(post_)
+                stamp_ = [f"  %tq2w{post_} = mov.cycles", f"  %tq2l{post_} = slice %tq2w{post_}[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                          f"  %tq2a{post_} = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
+                          f"  %tq2k{post_} = mova.i32 32", f"  %tq2m{post_} = mov.modifier %tq2k{post_}",
+                          f"  %tq2b{post_} = padda.modifier %tq2a{post_}, %tq2m{post_}",
+                          f"  st %tq2l{post_}, %tq2b{post_}, {post_ - 32}"]
+                if pre_:   # (before the acquire: the fill's end)
+                    out_[-1:-1] = stamp_
+                else:
+                    out_ += stamp_
+        text_ = "\n".join(out_) + "\n"
+    if os.environ.get("GN_QTL3") == "1" and N.QFCYC and not os.environ.get("GN_QFW"):   # (diag, P1K fill rows)
+        out_ = []   # absolute cycles (low word) after the firing's first / last own-slab egress acquire (%fzAd2) and
+        for ln_ in text_.splitlines():   # at the firing's start -> %qfc 32 / 40 / 36 = words 5 / 7 / 6
+            out_.append(ln_)
+            if ln_.startswith("  %qfc = storage "):
+                out_ += ["  %tq3c = mov.cycles", "  %tq3cl = slice %tq3c[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                         "  %tq3a0 = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
+                         "  %tq3k0 = mova.i32 32", "  %tq3m0 = mov.modifier %tq3k0",
+                         "  %tq3b0 = padda.modifier %tq3a0, %tq3m0", "  %tq3z0 = mova.i32 0",
+                         "  st %tq3z0, %tq3b0, 0", "  st %tq3cl, %tq3b0, 4"]
+            elif ln_.startswith("  acq %fzAd2, "):
+                out_ += ["  %tq3w = mov.cycles", "  %tq3l = slice %tq3w[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                         "  %tq3a = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
+                         "  %tq3k = mova.i32 32", "  %tq3m = mov.modifier %tq3k",
+                         "  %tq3b = padda.modifier %tq3a, %tq3m", "  %tq3o = lda %tq3b, 0", "  %tq3e = eqz %tq3o",
+                         "  %tq3v = mul %tq3e, %tq3l", "  %tq3n = add.rr %tq3o, %tq3v", "  st %tq3n, %tq3b, 0",
+                         "  st %tq3l, %tq3b, 8"]
+        text_ = "\n".join(out_) + "\n"
     if os.environ.get("GN_QCW") == "1" and N.QCYC:   # (diag, Q' leaves) per block: cycles in the entry C acquire, the
         out_, n_ = [], 0                             # lazy C acquires and the W acquires (private words 20 / 24 / 28,
         acqs_ = {"  acq %am1, 2": 20, "  acq.cond %am1, %qclk, 2": 24, "  acq %am1, 1": 28,   # reset per firing)
@@ -323,6 +367,9 @@ def main():
                         print(f"  fill row {r_}: gate check {u_[5]} copies {u_[6]}")
                     if os.environ.get("GN_QFW") in ("3", "4", "5", "6"):   # (diag) the helper-record branch's cycles
                         print(f"  fill row {r_}: helper-record branch {u_[5]}")
+                    if os.environ.get("GN_QTL3") == "1":   # (diag) the last firing's own-slab acquires from its start
+                        print(f"  fill row {r_} egress acquires: first done +{(u_[5] - u_[6]) % 2**32} "
+                              f"last done +{(u_[7] - u_[6]) % 2**32}")
                     if os.environ.get("GN_QFW") == "1":   # (diag) the egress slot waits (own, copy), helper waits
                         print(f"  fill row {r_} waits: own egress {u_[5]} helper records {u_[6]} copy egress {u_[7]}")
             if os.environ.get("DQ_CYC") == "1":   # (diag) word 1: the decoder's cycles; word 4: its hot loop's
