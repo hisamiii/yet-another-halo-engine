@@ -741,7 +741,8 @@ def gen(cfg):
     if cfg.fuse == 2:   # the decode side: 1024-K passes over the call's K, one 128-k-block slice
         K = 8 * cfg.passes * cfg.ks[0]
         assert K % 1024 == 0 and 32 % cfg.ks[0] == 0, "fuse 2: K a multiple of 1024, ks dividing a super-block"
-        N.QF["cfg"] = N.Config(cfg.cols, cfg.nb, (128,), K // 1024, mu=1, fuse=2, kraw=cfg.kraw, fmt=cfg.fmt, rawdma=1)
+        N.QF["cfg"] = N.Config(cfg.cols, cfg.nb, (128,), K // 1024, mu=1, fuse=2, kraw=cfg.kraw, fmt=cfg.fmt, rawdma=1,
+                              gord=cfg.gord)
         N.QF["cfgu"] = N.Config(cfg.cols, cfg.nb, (128,), K // 1024, mu=1, fuse=2, kraw=cfg.kraw, fmt=cfg.ufmt,
                                 rawdma=1, gord=cfg.ugord or "P4") if N.fpair(cfg) else None   # (column pairs)
         N.QF["wslot"] = N.NP * N.slab(cfg.ks[0]) // (2 if N.qp1k_on() else 1)   # (P1K: a member's W record, one half)
