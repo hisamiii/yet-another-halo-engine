@@ -1285,7 +1285,7 @@ class LoomPrefill {
   void RunLayerNorm(const std::string& wname, NormOut mode, const char* npu_site, bool pk) {
     if (!ffn_pending_.length || !npu_site || !geom_.count("npunormbfp")) {
       FlushFfn();
-      RunNorm(wname, mode, npu_site);
+      RunNorm(wname, mode, npu_site, pk);
       return;
     }
     const std::size_t a = NpuK(5120).a;
@@ -1344,8 +1344,9 @@ class LoomPrefill {
 
   // The RMSNorm of hidden() rows into scratch_ (f16; afrag: fragment-major into normt_). npu_site: the NPU split of a
   // K = 5120 site reads this norm's output; with "npunormbfp" in the set the norm also writes its BFP16 input into A ("<norm>_bfp.hal") and
-  // NpuEncode(npu_site) skips the encoder.
-  void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow, const char* npu_site = nullptr) {
+  // NpuEncode(npu_site) skips the encoder; pk: also the Q4_K-order stream into A's second half ("<norm>_bfp_pk.hal",
+  // with "npunormbfppk" in the set; NpuEncode pk then skips its encoder too).
+  void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow, const char* npu_site = nullptr, bool pk = false) {
     // A row takes `split` waves (dispatch.txt norm_split, else 1); a workgroup of w waves takes w / split rows.
     // npu_site "ffnblk": the FFN block's one-replay-group stream (RunFfnBlock, fragment-major output only); "ffnblk_s":
     // in the deferred-epilogue images' K split
@@ -1353,9 +1354,11 @@ class LoomPrefill {
     const bool g1 = g1s || (npu_site && std::strcmp(npu_site, "ffnblk") == 0);
     const bool bfp = npu_site && (g1 || geom_.count("npunormbfp"));
     norm_bfp_ = bfp && !g1 ? npu_site : "";
-    norm_pk_.clear();
     const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
-    const LoomExecutable& exe = Exe(g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1.hal" : hal + (bfp ? "_bfp.hal" : ".hal"));
+    const bool wpk = bfp && !g1 && pk && geom_.count("npunormbfppk");
+    norm_pk_ = wpk ? npu_site : "";
+    const LoomExecutable& exe = Exe(g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1.hal"
+                                    : hal + (wpk ? "_bfp_pk.hal" : bfp ? "_bfp.hal" : ".hal"));
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const auto ns = geom_.find("norm_split");
     const std::uint32_t split = ns != geom_.end() && ns->second.rowgrp ? ns->second.rowgrp : 1;
@@ -1369,6 +1372,7 @@ class LoomPrefill {
             : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_),
                                             Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)};
     if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
+    if (wpk) b.push_back({npu_->A().handle, npu_->A().size / 2, NpuK(5120).a});
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
   }
   // NPU column split (EnableNpu, emit_prefill_pp.npu_split). A site's NPU rows in this chunk (0: GPU only).

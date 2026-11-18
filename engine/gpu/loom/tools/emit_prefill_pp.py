@@ -1042,13 +1042,17 @@ def npu_split(rows, combos, B, outdir):
                 out.append((name, B // 8 * (passes * sum(NPU_KS)) // GE.WG, GE.WG, 0))
     # the norms that feed K = 5120 sites also write the NPU's BFP16 input (gen_half_norm.gen_split bfp): "<norm>_bfp.hal"
     if {"qkv", "q"} & set(NPU_SPLIT):
-        for tiled, name in ((False, "norm_bfp.hal"), (True, "norm_t_bfp.hal"), ("both", "norm_rt_bfp.hal")):
+        # (and "<norm>_bfp_pk.hal": the Q4_K-order stream too, into A's second half, for sites with a Q4_K weight)
+        for tiled, name, pk in [(t, n[:-4] + pk * "_pk" + ".hal", pk) for pk in (False, True)
+                                for t, n in ((False, "norm_bfp.hal"), (True, "norm_t_bfp.hal"),
+                                             ("both", "norm_rt_bfp.hal"))]:
             src = os.path.join(tmp, name[:-4] + ".loom")
             open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=tiled,
-                                                         bfp=(B, list(NPU_KS), NPU_PASSES)))
+                                                         bfp=(B, list(NPU_KS), NPU_PASSES, pk)))
             E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                          "yah_half_norm.fused=0"], name, outdir)
         out.append(("npunormbfp", 1, 0, 0))
+        out.append(("npunormbfppk", 1, 0, 0))
     # the DeltaNet postnorm over heads 0 .. DNSPLIT[0] - 1 (exactly ssm_out's NPU K chunk) also writes the NPU's BFP16
     # input (gen_postnorm_bfp): "postnorm[_t]_a_bfp.hal"
     if "out" in NPU_SPLIT and DNSPLIT and DNSPLIT[0] * 128 == NPU_KCALL:

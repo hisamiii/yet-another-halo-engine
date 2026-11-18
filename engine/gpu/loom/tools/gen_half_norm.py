@@ -173,8 +173,9 @@ def gen(dim=5120, wpr=1, tiled=False, resadd=False, keep=None, wlds=False):
 
 def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
     """The same norm with each row split over `split` waves (part p holds k in [p n/S, (p+1) n/S), all in registers).
-    bfp = (tokens, ks, passes): also the NPU's BFP16 activation stream of the output (gen_bfp16_encode "act", binding ab after
-    the outputs), encoded from the f16 values; see split_bfp_out.
+    bfp = (tokens, ks, passes[, pk]): also the NPU's BFP16 activation stream of the output (gen_bfp16_encode "act", binding
+    ab after the outputs; with pk also in Q4_K's k-block order, binding abk after ab), encoded from the f16 values; see
+    split_bfp_out.
     Lane l's sum of squares stays one chain in k order: part p continues it from part p-1's partial (LDS, barrier
     between steps), so the bits are those of gen(). Branch-free: at step p every wave runs its chain from its
     predecessor's partial, only part p's result is used. Fewer values per wave: more waves and loads in flight."""
@@ -201,7 +202,8 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
     e("  %wgs = index.div %rows, %cwpr : index")
     e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%cwgs, %unit, %unit) : index")
     e("} launch(%x: buffer, %residual: buffer, %weight: buffer, %sum_out: buffer, %out: buffer"
-      + (", %out_t: buffer" if both else "") + (", %ab: buffer" if bfp else "") + ") {")
+      + (", %out_t: buffer" if both else "") + (", %ab: buffer" if bfp else "")
+      + (", %abk: buffer" if bfp and bfp[3:] and bfp[3] else "") + ") {")
     e("  %base = index.constant 0 : offset")
     e("  %zero = scalar.constant 0.0 : f32")
     e("  %one = scalar.constant 1.0 : f32")
@@ -362,13 +364,16 @@ def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp):
     a k-block's 4 rows are 36 contiguous stream bytes (half a fragment), copied out as dwords after a barrier."""
     import gen_bfp16_encode as GE
     import gen_npu_unpack as GU
-    tokens, ks, passes = bfp
+    tokens, ks, passes = bfp[:3]
+    pk = bool(bfp[3:] and bfp[3])
     both = tiled == "both"
     assert wpr == 4, "4 rows per workgroup: half a fragment per k-block"
     nkb, nth = dim // 8, 32 * wpr * split
     nab = GE.layout_bytes("act", tokens, ks, passes)
     e(f"  %nab4 = index.constant {nab // 4} : index")
     e("  %abv = buffer.view %ab[%base] : buffer -> view<[%nab4]xi32>")
+    if pk:
+        e("  %abkv = buffer.view %abk[%base] : buffer -> view<[%nab4]xi32>")
     e(f"  %bs_bytes = index.constant {nkb * wpr * 9} : offset")
     e("  %bs_buf = buffer.alloca<workgroup> align(16) %bs_bytes : buffer")
     e(f"  %bs_view = buffer.view %bs_buf[%base] : buffer -> view<{nkb * wpr * 9}xi8>")
@@ -442,6 +447,13 @@ def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp):
     e("  %bo_ho = index.mul %bo_h, %c36o : index")
     e("  %c4o = index.constant 4 : index")
     bfp_copy_out(e, nkb, wpr, nth, tokens, ks, passes, "%abv", "bo")
+    if pk:   # (the same staged blocks in Q4_K's k-block order)
+        perm = GE.ACT_PERM
+        GE.ACT_PERM = "pk"
+        try:
+            bfp_copy_out(e, nkb, wpr, nth, tokens, ks, passes, "%abkv", "bk")
+        finally:
+            GE.ACT_PERM = perm
 
 
 def bfp_copy_out(e, nkb, wpr, nth, tokens, ks, passes, abv, pre):
