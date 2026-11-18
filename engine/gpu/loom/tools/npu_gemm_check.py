@@ -193,7 +193,7 @@ def main():
         open(os.path.join(work, "npu_gemm.pcdiag"), "w").write(
             "".join(ln + "\n" for ln in r_.stderr.splitlines() if ln.split()[:1] in (["PCBLOCKS"], ["PCTEXT"], ["PCACQ"])))
         for ln in r_.stderr.splitlines():   # (diag, HRX pin: LOOM_EXP_TRACE_SHIM in NPU_ENV_ADD) the shim DMA choices
-            if ln.startswith(("SHIM ", "TWIN ", "STAGE ", "packet share", "route dump")):
+            if ln.startswith(("SHIM ", "TWIN ", "STAGE ", "packet share", "route dump", "dma dump")):
                 print(ln)
     if os.environ.get("NPU_COMPILE_ONLY"):   # (diag) stop after the image (compiler work, no NPU)
         sys.exit(0)
@@ -257,7 +257,7 @@ def main():
         np.concatenate([wraw.reshape(-1)[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
         bindings += [d_b, r_b]
         # the raw stream reads weights (the split lead starts it before the gate; GN_QPREFILL images need that)
-        os.environ.setdefault("NPU_RUN_WEIGHTS", str(len(bindings) - 1))
+        env.setdefault("NPU_RUN_WEIGHTS", str(len(bindings) - 1))   # (env: copied from os.environ above)
     width = None
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
         if os.environ.get("NPU_STALL_CMD"):   # (diag) a command run 3 s into the job, while it lives (a status dump)
