@@ -97,6 +97,8 @@ P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="2560@37376:40448:43520:46592,11520@0
                GN_QPREFILL="1",   # (11-18: the gate cores check after their fill: a job's first fill in the GPU wait)
                GN_QFGUARD="1",    # (11-18: a fill waits for its core's C drain: safe at queue depth 2, see gen_npu_gemm)
                GN_QF4RSWAP="1",   # (11-18: rows 0 / 1 swap fill roles: each egress row owns its half's first record)
+               GN_QF4RCOPY="2",   # (11-18: helper copies pipelined, groups of 6: copy cycles 41.9K -> 34.1K a job)
+               GN_QFEGR2="1",     # (11-18: egress ring of 4 slabs: with the copies, the last call's first block -4.8K)
                GN_QLRU="aie2p.mbms")   # (11-18: no LRU on the operand vectors: memstall -1.5K a call)
 P1K_LOOM = dict(LOOM_EXP_RING_AT_FORCE="1", LOOM_EXP_SPACE_AT="scratch@12288", LOOM_EXP_EGRESS_MERGE="1",
                 LOOM_EXP_REPLAY_GROUP="4", LOOM_EXP_MERGE_RING_LOW="1", LOOM_EXP_PANEL_STREAM="1",
@@ -365,8 +367,9 @@ def array_program(L, cfg):
         e(f'  %frb = binding {7 if cfg.gate else 4}, "read"')
         e(f"  %fdl = constant.u32 {cols * len(egr)} : reg<aie2p.array.scalar : index>")
         e(f"  %fun = constant.u32 {nraw} : reg<aie2p.array.scalar : index>")
-        e(f"  %fdn = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
-        e(f"  %fd_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{cols * len(egr)}x{nrec}x{fw}xi32>>")
+        eg2 = N.QF_P1KD["eb"] // N.QF_P1KD["rec"] if N.qfdirect_on() else 1   # (GN_QFEGR2: slab-sized egress records)
+        e(f"  %fdn = constant.u32 {nrec // eg2} : reg<aie2p.array.scalar : index>")
+        e(f"  %fd_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{cols * len(egr)}x{nrec // eg2}x{fw * eg2}xi32>>")
         # records [super-block][slab][16 rows][one block] (super-blocks are BLK apart in a row)
         if qsplit() or qdec():   # (a step's 4 slabs side by side in each row: the decoder's 576 B record row)
             rty = f"16x{NP}x{rw}"
@@ -386,10 +389,10 @@ def array_program(L, cfg):
                 t = f"{c}_{r}"
                 if r in egr:   # (the egressing decoders; raw multicast to every decoder row)
                     e(f"  %fdlane{t} = constant.u32 {c * len(egr) + egr.index(r)} : reg<aie2p.array.scalar : index>")
-                    e(f"  %fdr{t} = partition.receiver %fd_all, %origin, %fdlane{t}, %fdl : reg<aie2p.array.receiver : tile<{fw}xi32>>")
-                    e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
+                    e(f"  %fdr{t} = partition.receiver %fd_all, %origin, %fdlane{t}, %fdl : reg<aie2p.array.receiver : tile<{fw * eg2}xi32>>")
+                    e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw * eg2}xi32>>")
                     e(f"  %chd{t} = channel %fds{t}, %fdr{t}, {'%n4' if N.qfdirect_on() else '%two'}, %fdn : "
-                      f"reg<aie2p.array.channel : tile<{fw}xi32>>")
+                      f"reg<aie2p.array.channel : tile<{fw * eg2}xi32>>")
                     e(f"  constrain.leaf_sync %chd{t}")
                 elif r in h4:   # (GN_QF4R) the helper's records to its egress neighbour (its window reads them)
                     e(f"  %fhn{t} = constant.u32 {nrec // 2} : reg<aie2p.array.scalar : index>")

@@ -182,8 +182,16 @@ def qf_p1kd_layout():
     """QF_P1KD from the environment (at import, and again after gen_npu_q.defaults sets the P1K knobs). GN_QFKH: the
     K-half split's ring, one record a raw record, 4 x 1152 B off the C ring."""
     kh = os.environ.get("GN_QFKH") == "1"
+    e2 = kh and os.environ.get("GN_QFEGR2") == "1"   # (GN_QFEGR2: the egress ring 4 BDs of a slab, 2 records each)
     QF_P1KD.update(sp=int(os.environ.get("GN_QFSP", "26112" if _QFRAW2 else "16896")), sp2=53760,
-                   egr=49152 if kh else 40448, rec=1152 if kh else 2304, slots=4, raw=2 if _QFRAW2 else 1)
+                   egr=40448 if e2 or not kh else 49152, rec=1152 if kh else 2304, slots=8 if e2 else 4,
+                   eb=2304 if kh and e2 else 1152 if kh else 2304, raw=2 if _QFRAW2 else 1)
+
+
+def qfegr2_on():
+    """GN_QFEGR2=1 (GN_QF4R): an egress row's ring holds 4 slabs (8 records, 40448..49664, C slots 1-3), one BD and
+    one lock step a slab; the address math keeps 1152 B records (8 slots)."""
+    return QF_P1KD["eb"] != QF_P1KD["rec"]
 
 
 qf_p1kd_layout()
@@ -248,7 +256,8 @@ def qf_ring_at(pins):
         m = QF_P1KD
         assert fb == m["rec"]
         h4 = (f",{fb}@" + ":".join(str(QF4R_HAT + i * fb) for i in range(QF4R_HSLOTS))) if qf4r_on() else ""
-        return pins + f",{fb}@" + ":".join(str(m["egr"] + i * fb) for i in range(m["slots"])) + h4
+        eb = m["eb"]
+        return pins + f",{eb}@" + ":".join(str(m["egr"] + i * eb) for i in range(m["slots"] * fb // eb)) + h4
     if qp1k_on():   # (P1K fill) the egress ring in QF_P1K's free run; the A pins stay
         return pins + f",{fb}@{QF_P1K['egr']}:{QF_P1K['egr'] + fb}"
     g = pins.split(",")
@@ -2068,7 +2077,7 @@ def qf_decode(L, cfg, dp):
         e("  low.cond_br %fzjm, ^fzjb, ^fzjx : reg<aie2p.er>")
         e("^fzjb:")
     if direct:   # (the slab's two egress records)
-        e("  %fzAd2 = mova.i32 -2")
+        e(f"  %fzAd2 = mova.i32 {-1 if qfegr2_on() and not (QF4R[0] and QF4R[0]['help']) else -2}")
         qfw_wrap(e, "o", 32, [f"  acq %fzAd2, {dp}"])
     if QFCYC and os.environ.get("GN_QFRAW") == "1":
         e("  %qfprb = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
@@ -2178,7 +2187,7 @@ def qf_decode(L, cfg, dp):
         e("  %qfdn = add.rr %qfds, %qfdd")
         e("  st %qfdn, %qfdp, 16")
     if direct:   # the slab's records to the egress DMA
-        e("  %fzE2d = mova.i32 2")
+        e(f"  %fzE2d = mova.i32 {1 if qfegr2_on() and not (QF4R[0] and QF4R[0]['help']) else 2}")
         e(f"  rel %fzE2d, {dp}")
         e("  %fzpWd = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
         e("  %fzend = lda %fzpWd, 8")
@@ -2404,7 +2413,8 @@ def qf4r_other(e, NS, rawport, dp, direct):
             e("  %qxt = lda %qxp2, 24")
             e("  %qxn = add.rr %qxt, %qxd")
             e("  st %qxn, %qxp2, 24")
-        qfw_wrap(e, "x", 40, [f"  acq %f4A2, {dp}"])
+        e(f"  %f4AE = mova.i32 {-1 if qfegr2_on() else -2}")
+        qfw_wrap(e, "x", 40, [f"  acq %f4AE, {dp}"])
         e("  %f4pS = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
         e("  %f4pN4 = storage_address %f4s : low.storage<private> -> reg<aie2p.ep>")
         e("  %f4nb = lda %f4pN4, 0")
@@ -2449,7 +2459,25 @@ def qf4r_other(e, NS, rawport, dp, direct):
             e("  %qx5n = add.rr %qx5t, %qx5d")
             e("  st %qx5n, %qx5p, 24")
         nl = 2 * QF_P1KD["rec"] // 64
-        if os.environ.get("GN_QF4RCOPY", "1") == "1":   # groups of 7: loads on both load units, then the stores (a
+        if os.environ.get("GN_QF4RCOPY", "1") == "2":   # groups of G, pipelined: group g + 1's loads beside g's stores
+            G_ = int(os.environ.get("GN_QF4RCOPYG", "6"))
+            ng_ = (nl + G_ - 1) // G_
+            cl_, sp_, dp_ = [], ["%f4p_0"], ["%f4q_0"]
+            for s_ in range(ng_ + 1):
+                if s_ < ng_:
+                    if s_:
+                        cl_.append(f"  %f4s{s_} = padda {sp_[-1]}, {64 * G_}")
+                        sp_.append(f"%f4s{s_}")
+                    cl_ += [f"  %f4w{q} = {'vlda' if q % 2 == 0 else 'vldb'}.512.i32x16 {sp_[s_]}, {64 * (q % G_)}"
+                            for q in range(G_ * s_, min(G_ * s_ + G_, nl))]
+                if s_:
+                    g_ = s_ - 1
+                    if g_:
+                        cl_.append(f"  %f4d{g_} = padda {dp_[-1]}, {64 * G_}")
+                        dp_.append(f"%f4d{g_}")
+                    cl_ += [f"  vst.512.i32x16 %f4w{q}, {dp_[g_]}, {64 * (q % G_)}"
+                            for q in range(G_ * g_, min(G_ * g_ + G_, nl))]
+        elif os.environ.get("GN_QF4RCOPY", "1") == "1":   # groups of 7: loads on both load units, then the stores (a
             cl_, sb_, db_ = [], "%f4p_0", "%f4q_0"           # load waits for the store before it: one pair a 7 cycles)
             for g_ in range((nl + 6) // 7):
                 if g_:
@@ -2473,9 +2501,10 @@ def qf4r_other(e, NS, rawport, dp, direct):
             e("  %qxt = lda %qxp2, 24")
             e("  %qxn = add.rr %qxt, %qxd")
             e("  st %qxn, %qxp2, 24")
-        qfw_wrap(e, "c", 48, cl_, mode="2")
+        qfw_wrap(e, "c", 48, [] if os.environ.get("GN_QFNOCOPY") else cl_, mode="2")   # (GN_QFNOCOPY: diag, no copies)
         e("  %f4R2 = mova.i32 2")
-        e(f"  rel %f4R2, {dp}")
+        e(f"  %f4RE = mova.i32 {1 if qfegr2_on() else 2}")
+        e(f"  rel %f4RE, {dp}")
         e(f"  rel %f4R2, {QF4R_NB}")
         e("  %f4ec2 = add %f4ec, 2")
         e("  st %f4ec2, %f4pS, 8")
@@ -5209,7 +5238,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e("  %qfaL = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
                 dqc_ = os.environ.get("DQ_CYC") == "1"   # (diag: word 1 the decoder's cycles, word 4 its hot loop's)
                 for w_, o_ in ((1, 16 if dqc_ else 4), (2, 12), (3, 24)) + (((4, 28),) if dqc_ else ()) + (
-                        ((5, 32), (6, 36), (7, 40)) if os.environ.get("GN_QFW") == "1" else
+                        ((5, 32), (6, 36), (7, 40)) if os.environ.get("GN_QFW") == "1" or os.environ.get("GN_QTL3") == "1" else
                         ((5, 44), (6, 48)) if os.environ.get("GN_QFW") == "2" else
                         ((5, 56),) if os.environ.get("GN_QFW") in ("3", "4", "5", "6") else ()):
                     if o_ >= 32 and w_ == 5:   # (offsets past the lda immediate: a pointer 32 on)
