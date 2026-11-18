@@ -828,10 +828,11 @@ NPU_KCALL = 8 * sum(NPU_KS) * NPU_PASSES   # K per call (5120)
 # nn = F) and down over them ("npuffnrem_<fmt>.hal", a K window, f32); npu_unpack_ffnblk.hal adds hidden + both after
 # the job. Down's K parts: F's passes in the fewest parts of at most 5 (a fused panel holds a part), sizes balanced.
 # A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup).
-# With YAH_NPU_QP1K (layout Q', F = 5120): only layers whose gate, up and down are all IQ4_XS; gate / up are Q' qsw
-# images (NP 4, 20 calls of 256 features, the swiglu epilogue writing H straight in down's A layout: call j at
-# j x 18432 B, gen_npu_q), down is the plain P1K site image over H (8 calls of 640 rows, K window [M - F, M);
-# dispatch.txt "npuffnq").
+# With YAH_NPU_QP1K (layout Q', F's K parts of one size S, ffnblk_parts: F = 5120, 8192, 10240, ..): only layers
+# whose gate, up and down are all IQ4_XS; gate / up are Q' qsw images (NP 4, F / 256 calls of 256 features, the
+# swiglu epilogue writing H straight in down's A layout: H in parts of S features, each [M block][S / 256 calls][...]
+# as one K = S down reads it, call j at part j / (S / 256), gen_npu_q), down is the plain P1K site image (K = S) over
+# its part of H (8 calls of 640 rows a part, K window [M - F, M); dispatch.txt "npuffnq").
 # Tried, not kept: the GPU window's residual epilogue waiting for the NPU (npuffnres): only 20 of its workgroups fit at
 # once, so while the NPU is the late one the rest of the GPU's down starts after the NPU's (~5 ms a layer).
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
@@ -1276,7 +1277,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     # pp2048 2286.9 ms vs 2158.0 without them)
     q4kdn = os.environ.get("YAH_NPU_FFNQ4K", "1") == "1"
     rows = NPU_ROWS if NPU_QP1K else NPU_COLS * 64   # down rows per call (NP 4; Q': the P1K site image's)
-    assert not NPU_Q or (NPU_QP1K and F == NPU_KCALL), "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and F = 5120"
+    qcalls = 4 * ffnblk_parts(F)[0][1]   # (Q': a K part's qsw calls, its down's passes)
+    assert not NPU_Q or (NPU_QP1K and len({p for _, p in ffnblk_parts(F)}) == 1), \
+        "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and K parts of one size (F = 5120, 8192, 10240, ..)"
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
           and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in dfmts]
     # gate and up of two formats, or one without a fused GPU gate / up (its gate kstore and up swiglu): pairs
@@ -1313,7 +1316,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             if NPU_Q:   # (Q' qsw at NP 4; its egress ring stays 4 records, GN_QFEGR2 would reach the silu table)
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
                                        kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1, qsw=True, dgu=mt * 16 * kb * blk,
-                                       swcol=32, hpass=F // 256, hord=hord), "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 4))
+                                       swcol=32, hpass=qcalls, hord=hord), "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 4))
                 QJOB_ENV[jobs[-1][1]] = dict(GN_QFEGR2="0")
                 continue
             jobs.append((npu_cfg(B, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk,
@@ -1335,8 +1338,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                              tr.rowgrp, kfull=kb))
     for fmt, mt, kb in sorted({l["ffn_down"] for l in ok + pairs}):
         for passes in sorted({p for _, p in parts}):
-            if NPU_Q:   # (Q': the site image of down's raw K, A bound to H; the NP 4 formats' at NP 4)
-                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
+            if NPU_Q:   # (Q': the site image of down's raw K (a part's), A bound to H; the NP 4 formats' at NP 4)
+                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, 4 * passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
                                        kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1,
                                        gord="GF" if fmt == "q4k" else "P4"),   # (H in P4 order)
                              "npu_ffndn%d_%s" % (passes, fmt), 4 if np4(fmt) else NPU_NP))
@@ -1356,7 +1359,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         go = lambda f: "GF" if f == "q4k" else "P4"
         if NPU_Q and colpair({"ffn_gate": (gf,), "ffn_up": (uf,)}):   # (Q' column pairs: H as the qsw image's)
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=kb * 256,
-                            fmt=gu_fmt(gf), gord=go(gf), rawdma=1, qsw=True, dgu=0, swcol=32, hpass=F // 256, hord=hord,
+                            fmt=gu_fmt(gf), gord=go(gf), rawdma=1, qsw=True, dgu=0, swcol=32, hpass=qcalls, hord=hord,
                             ufmt=gu_fmt(uf), ugord=go(uf))
             QJOB_ENV["npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower())] = dict(GN_QFEGR2="0")
         elif colpair({"ffn_gate": (gf,), "ffn_up": (uf,)}):   # (column pairs; Q4_K in P4 order: gen_npu_dec "GF")
@@ -1365,7 +1368,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         elif NPU_Q:   # (Q': one format, the qsw image as above)
             blk = GN.decoder(gu_fmt(gf)).BLK
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=kb * 256,
-                            fmt=DCOL_FMTS[gf][0], rawdma=1, qsw=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 256,
+                            fmt=DCOL_FMTS[gf][0], rawdma=1, qsw=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=qcalls,
                             hord=hord)
             QJOB_ENV["npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower())] = dict(GN_QFEGR2="0")
         else:   # (mixed)

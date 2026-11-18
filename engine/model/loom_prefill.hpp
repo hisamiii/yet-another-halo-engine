@@ -1155,12 +1155,17 @@ class LoomPrefill {
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
     // F / 256 calls: call j's column c takes features 256 j + 32 c + [0, 32), its records at H k-blocks 32 j + 4 c ..
     // (gen_npu_gemm swcol 32)
-    // (dispatch.txt "npuffnq", layout Q': H in down's A layout [M block][call][slab][column][576 B], call j's records
-    // from j x 4 x 4608 B)
+    // (dispatch.txt "npuffnq", layout Q': H in K parts of one size (FfnBlkParts, one down each), a part in down's A
+    // layout [M block][its qc calls][slab][column][576 B]: call j's records from part j / qc, (j % qc) x 4 x 4608 B)
     const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
     const bool qffn = geom_.count("npuffnq") != 0;
+    const std::uint32_t qc = 4 * parts[0].second;   // (Q': a part's calls; its H bytes qpart)
+    const std::size_t qpart = std::size_t{B_ / 64} * parts[0].second * 4 * 128 * 144;
+    for (const auto& pp : parts)
+      if (qffn && pp.second != parts[0].second) throw LoomError("prefill: the Q' FFN block's K parts differ in size");
     const auto c_sw = [&](std::uint32_t j) {
-      return NpuView{qffn ? std::size_t{j} * 4 * 4608 : (j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c};
+      return NpuView{qffn ? j / qc * qpart + std::size_t{j % qc} * 4 * 4608 : (j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144,
+                     bs.c};
     };
     // (a column's raw view: 256 rows from row r0, its last record over-read)
     const auto col_bytes = [&](const ColRows& c, const auto* t, const Fmt& x) {
@@ -1191,7 +1196,7 @@ class LoomPrefill {
       for (std::uint32_t r = 0; r < calls; ++r) {
         const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + 4 * p0;
         cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", dn[ci] + ".xdna", DecoderId(fd.name),
-                                        {std::size_t{p0} * 4 * 128 * 144, bd.a, true},
+                                        {qffn ? ci * qpart : std::size_t{p0} * 4 * 128 * 144, bd.a, true},
                                         pd + r0 * rbd + k0 * blkd,
                                         (rows - 1) * rbd + 16 * blkd + RecordRow(fd.name),
                                         {doff + (ci * calls + r) * cp, cp}, fam));
