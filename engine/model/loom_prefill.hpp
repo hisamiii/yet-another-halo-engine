@@ -1053,8 +1053,8 @@ class LoomPrefill {
   std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
   static int DecoderId(const char* fmt) {
     static const char* const kDecoders[] = {"iq4xs", "iq3s",  "iq3xxs", "q4k",  "q3k",
-                                            "iq2xxs", "iq2xs", "q5k",    "iq2s", "bfp"};
-    for (int i = 0; i < 10; ++i)
+                                            "iq2xxs", "iq2xs", "q5k",    "iq2s", "bfp",  "iq4nl"};
+    for (int i = 0; i < 11; ++i)
       if (std::strcmp(kDecoders[i], fmt) == 0) return i;
     return -1;
   }
