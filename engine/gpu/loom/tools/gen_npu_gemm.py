@@ -216,6 +216,12 @@ def qf4r_on():
     return qfkh_on() and os.environ.get("GN_QF4R") == "1"
 
 
+def qf4r_swap():
+    """GN_QF4RSWAP=1 (with GN_QF4R): rows 0 / 1 swap the fill roles (row 0 egresses half 1, row 1 helps): an egress
+    row's first record in panel order is then its own in both pairs (row 1 waited ~3K a call for its helper's)."""
+    return qf4r_on() and os.environ.get("GN_QF4RSWAP") == "1"
+
+
 def qfhalf():
     """GN_QFHALF=h (P1K direct fill, diag): the decoder takes record h of each super-block only (K half h; None:
     both); GN_QFKH: the leaf's half."""
@@ -2850,7 +2856,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
     QF_HALF[0] = (0 if dfill else 1) if fills and qfkh_on() else None
     QF4R[0] = None
     if fills and qf4r_on():   # (rows 0 / 1 half 1, rows 2 / 3 half 0; helpers 0 / 3 take the odd steps)
-        hlp4 = full_name.startswith(("tailm0d", "tailmh"))
+        hlp4 = full_name.startswith(("tailmh",) + (() if qf4r_swap() else ("tailm0d",))) or (
+            qf4r_swap() and full_name.split("_")[0] == "tailm")
         QF_HALF[0] = 0 if full_name.startswith(("tailm0e", "tailmh")) else 1
         # (own records: multicast 0's rows (tailm0*) the even ones)
         QF4R[0] = dict(par=0 if full_name.startswith("tailm0") else 1, help=hlp4)

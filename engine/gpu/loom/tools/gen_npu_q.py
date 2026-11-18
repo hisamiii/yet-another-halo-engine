@@ -95,7 +95,8 @@ P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="2560@37376:40448:43520:46592,11520@0
                GN_QP1K="1", GN_QCVL="1", GN_QFKH="1", GN_QPSHARE="1", GN_QF4R="1", DQ_HDRWIN="8",
                GN_QLSDEPTH="7",   # (11-18: the A streams staged 7 deep in the memory tiles: gate 796K -> 731K a call)
                GN_QPREFILL="1",   # (11-18: the gate cores check after their fill: a job's first fill in the GPU wait)
-               GN_QFGUARD="1")    # (11-18: a fill waits for its core's C drain: safe at queue depth 2, see gen_npu_gemm)
+               GN_QFGUARD="1",    # (11-18: a fill waits for its core's C drain: safe at queue depth 2, see gen_npu_gemm)
+               GN_QF4RSWAP="1")   # (11-18: rows 0 / 1 swap fill roles: each egress row owns its half's first record)
 P1K_LOOM = dict(LOOM_EXP_RING_AT_FORCE="1", LOOM_EXP_SPACE_AT="scratch@12288", LOOM_EXP_EGRESS_MERGE="1",
                 LOOM_EXP_REPLAY_GROUP="4", LOOM_EXP_MERGE_RING_LOW="1", LOOM_EXP_PANEL_STREAM="1",
                 LOOM_EXP_PANEL_STREAM_SINGLE="1")
@@ -345,8 +346,10 @@ def array_program(L, cfg):
         fr = 1 if N.qp1k_on() else 0   # (P1K: row 1 decodes; row 0's program holds the pair relay's copy)
         dr = R if qdec() else fr   # (the decoding worker's row: the egressing one)
         drs = tuple(range(R, R + qdec_rows())) if qdec() else (0, 1, 2, 3) if N.qf4r_on() else (0, 1) if N.qfkh_on() else (fr,)
-        egr = (1, 2) if N.qf4r_on() else drs if N.qfkh_on() else (dr,)   # (the egressing decoders: lane c len(egr) + i)
-        h4 = {0: 1, 3: 2} if N.qf4r_on() else {}   # (GN_QF4R) helper row -> its egress neighbour
+        # (GN_QF4RSWAP=1: pair (0, 1) swaps roles, row 0 egresses, so both egress rows own their K half's first record)
+        swp = N.qf4r_on() and N.qf4r_swap()
+        egr = ((0, 2) if swp else (1, 2)) if N.qf4r_on() else drs if N.qfkh_on() else (dr,)   # (lane c len(egr) + i)
+        h4 = ({1: 0, 3: 2} if swp else {0: 1, 3: 2}) if N.qf4r_on() else {}   # (GN_QF4R) helper row -> its egress row
         if N.qfkh_on():
             nrec //= len(egr)
         assert 4 * rw <= N.decoder(cfg.fmt, cfg.gord).RECROW
@@ -411,7 +414,7 @@ def array_program(L, cfg):
         for c in range(cols):
             if N.qf4r_on():   # (half 0's panel (rows 0 / 2) by row 2, half 1's (rows 1 / 3) by row 1)
                 e(f"  constrain.fill %chw{c}_0, %chd{c}_2")
-                e(f"  constrain.fill %chw{c}_1, %chd{c}_1")
+                e(f"  constrain.fill %chw{c}_1, %chd{c}_{0 if N.qf4r_swap() else 1}")
             elif N.qfkh_on():   # (a panel per K half, each filled by its decoder: rows 0 / 2 by row 0, 1 / 3 by row 1)
                 e(f"  constrain.fill %chw{c}_0, %chd{c}_0")
                 e(f"  constrain.fill %chw{c}_1, %chd{c}_1")
