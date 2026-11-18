@@ -416,7 +416,7 @@ def array_program(L, cfg):
                     e(f"  %fhn{t} = constant.u32 {nrec // 2} : reg<aie2p.array.scalar : index>")
                     e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
                     e(f"  %fhr{t} = receiver {kk[c, h4[r]]}, {N.QF4R_NB} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
-                    e(f"  %chd{t} = channel %fds{t}, %fhr{t}, %n{N.QF4R_HSLOTS}, %fhn{t} : "
+                    e(f"  %chd{t} = channel %fds{t}, %fhr{t}, %n{N.qf4r_hslots()}, %fhn{t} : "
                       f"reg<aie2p.array.channel : tile<{fw}xi32>>")
                     e(f"  constrain.leaf_sync %chd{t}")
                 e(f"  %frr{t} = receiver {kk[c, r]}, {sp} : reg<aie2p.array.receiver : tile<{rty}xi32>>")

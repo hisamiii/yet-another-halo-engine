@@ -320,7 +320,8 @@ class LoomPrefill {
         const NpuSplit::Job& w = jobs[i].words;
         std::vector<std::uint32_t> before;   // the job's gate slots, to report which words its calls changed
         for (std::uint32_t k = w.ready; k <= w.done + 16; ++k) before.push_back(npu_->HostLoad(k));
-        if (const char* h = std::getenv("YAH_NPU_CPU_HOLD"); h && std::strtoul(h, nullptr, 10) == i) {
+        // (YAH_NPU_CPU_HOLD=all: every job)
+        if (const char* h = std::getenv("YAH_NPU_CPU_HOLD"); h && (!std::strcmp(h, "all") || std::strtoul(h, nullptr, 10) == i)) {
           // the job parked at its gate (its setup done): the stall command sees the array waiting
           std::this_thread::sleep_for(std::chrono::milliseconds(300));
           if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);
@@ -1135,8 +1136,13 @@ class LoomPrefill {
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
     // F / 256 calls: call j's column c takes features 256 j + 32 c + [0, 32), its records at H k-blocks 32 j + 4 c ..
     // (gen_npu_gemm swcol 32)
+    // (dispatch.txt "npuffnq", layout Q': H in down's A layout [M block][call][slab][column][576 B], call j's records
+    // from j x 4 x 4608 B)
     const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
-    const auto c_sw = [&](std::uint32_t j) { return NpuView{(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}; };
+    const bool qffn = geom_.count("npuffnq") != 0;
+    const auto c_sw = [&](std::uint32_t j) {
+      return NpuView{qffn ? std::size_t{j} * 4 * 4608 : (j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c};
+    };
     // (a column's raw view: 256 rows from row r0, its last record over-read)
     const auto col_bytes = [&](const ColRows& c, const auto* t, const Fmt& x) {
       return 255 * c.rb + 16 * (c.rb * 256 / static_cast<std::size_t>(t->dims[0])) + RecordRow(x.name);

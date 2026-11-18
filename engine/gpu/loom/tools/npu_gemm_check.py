@@ -153,6 +153,8 @@ def main():
                                    for x in (tg_, tu_)])
             cfg = dataclasses.replace(cfg, qsw=True, dgu=Nn // 2 * KR // 256 * D.BLK, swcol=32, hord="P4",
                                       hpass=int(os.environ.get("NPU_QSW_HPASS", "2")))   # (H: this call is call 0)
+            if int(os.environ.get("NPU_QSW_GAP", "0")):   # the up rows NPU_QSW_GAP rows past the gate rows (the
+                cfg = dataclasses.replace(cfg, dgu=int(os.environ["NPU_QSW_GAP"]) * KR // 256 * D.BLK)   # engine: M)
         else:
             wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
         wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32
@@ -392,7 +394,10 @@ def main():
                                                                       for cov in N.fuse_cover(cfg, c).values()))
         np.zeros(len(ks) * cols * words, np.int32).tofile(d_b)
         # the GGUF rows as they are, from the call's first column
-        np.concatenate([wraw.reshape(-1)[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
+        gap_ = int(os.environ.get("NPU_QSW_GAP", "0")) if qsw else 0
+        rawv = (np.concatenate([wraw[:Nn // 2].reshape(-1), np.zeros((gap_ - Nn // 2) * KR // 256 * D.BLK, np.uint8),
+                                wraw[Nn // 2:].reshape(-1)]) if gap_ else wraw.reshape(-1))
+        np.concatenate([rawv[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
         bindings += [d_b, r_b]
         # the raw stream reads weights (the split lead starts it before the gate; GN_QPREFILL images need that)
         env.setdefault("NPU_RUN_WEIGHTS", str(len(bindings) - 1))   # (env: copied from os.environ above)

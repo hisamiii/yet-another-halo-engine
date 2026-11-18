@@ -211,7 +211,12 @@ QF_HALF = [None]   # (GN_QFKH) the leaf's K half
 QF4R = [None]      # (GN_QF4R) the leaf's role: dict(par: its super-block steps' parity, help: hands its records to its
                    # egress neighbour) or None
 QF4R_NB = 8        # (GN_QF4R) an egress row's receiver of its helper's records (the helper sends on its egress port)
-QF4R_HSLOTS = 8    # (GN_QF4R) the helper's ring: 8 records over its C slots 1-3 (idle in the fill)
+def qf4r_hslots():
+    """(GN_QF4R) the helper ring's records over its C slots 1-3 (idle in the fill): 8, or 4 in an FFN gate / up image
+    (8 would reach its silu table at 45568); GN_QF4RHS overrides."""
+    return int(os.environ.get("GN_QF4RHS") or (4 if QF.get("qsw") else 8))
+
+
 QF4R_HAT = 40448
 
 
@@ -255,11 +260,12 @@ def qf_ring_at(pins):
     if qfdirect_on():   # (P1K fill, direct) the 4-record egress ring over C slots 1-3
         m = QF_P1KD
         assert fb == m["rec"]
-        h4 = (f",{fb}@" + ":".join(str(QF4R_HAT + i * fb) for i in range(QF4R_HSLOTS))) if qf4r_on() else ""
+        h4 = (f",{fb}@" + ":".join(str(QF4R_HAT + i * fb) for i in range(qf4r_hslots()))) if qf4r_on() else ""
         eb = m["eb"]
         # (FFN gate / up: the K-half ring over C slots 1-3 too, idle in the fill; the silu table takes 45568 .. 53760)
         egr = 40448 if QF.get("qsw") and "GN_QFEGR" not in os.environ else m["egr"]
         assert not QF.get("qsw") or egr + m["slots"] * fb <= 45568
+        assert not (QF.get("qsw") and qf4r_on()) or QF4R_HAT + qf4r_hslots() * fb <= 45568
         return pins + f",{eb}@" + ":".join(str(egr + i * eb) for i in range(m["slots"] * fb // eb)) + h4
     if qp1k_on():   # (P1K fill) the egress ring in QF_P1K's free run; the A pins stay
         return pins + f",{fb}@{QF_P1K['egr']}:{QF_P1K['egr'] + fb}"
@@ -671,6 +677,8 @@ def stream_bytes(cfg):
         a = (144 * sum(cfg.ks[:-1]) + (cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (cfg.passes * MP - 1) * 128 * 144
              + slab(cfg.ks[-1]))
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
+    if cfg.qsw:   # (Q') the receiver's extent in H from call 0's records: [M block][hpass calls][slab][column][576 B]
+        return a, w, ((cfg.nb - 1) * cfg.hpass + 1) * MP * cfg.cols * SW_REC
     if cfg.swiglu:   # the receiver's extent in H: the last 16-token row's columns
         last = (cfg.cols - 1) * h_col_stride(cfg)   # the last column's (pass's) last record in H
         return a, w, ((cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (MP - 1) * 128 * 144 + last + SW_REC)
@@ -2174,7 +2182,7 @@ def qf_decode(L, cfg, dp):
         m_ = QF_P1KD
         e("  %fzdlo = lda %fzpB, 28")
         e("  %fzcno = lda %fzpB, 8")
-        e(f"  %fzk3o = mova.i32 {(QF4R_HSLOTS if QF4R[0] and QF4R[0]['help'] else m_['slots']) - 1}")
+        e(f"  %fzk3o = mova.i32 {(qf4r_hslots() if QF4R[0] and QF4R[0]['help'] else m_['slots']) - 1}")
         e("  %fzslo = and %fzcno, %fzk3o")
         e(f"  %fzkbo = mov.i32 {m_['rec']}")
         e("  %fzofo = mul %fzslo, %fzkbo")
@@ -2440,7 +2448,7 @@ def qf4r_other(e, NS, rawport, dp, direct):
         e("  %f4pN4 = storage_address %f4s : low.storage<private> -> reg<aie2p.ep>")
         e("  %f4nb = lda %f4pN4, 0")
         e("  %f4nc = lda %f4pN4, 4")
-        e(f"  %f4k7 = mova.i32 {QF4R_HSLOTS - 1}")
+        e(f"  %f4k7 = mova.i32 {qf4r_hslots() - 1}")
         e("  %f4ns = and %f4nc, %f4k7")
         e(f"  %f4kr = mov.i32 {QF_P1KD['rec']}")
         e("  %f4no = mul %f4ns, %f4kr")

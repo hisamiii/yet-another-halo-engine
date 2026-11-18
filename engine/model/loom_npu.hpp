@@ -162,9 +162,9 @@ class LoomNpu {
   }
   // A job's lead push is ~150 register writes before its first call's data moves. Only the shim read starts (MM2S
   // queue starts) of data the GPU writes must wait for the gate; its descriptors, the memory-tile, core and shim write
-  // (C) queue starts and the reads of weights (a start whose descriptor, set in this lead, reads a weight view and
-  // chains to no other) run before it, in the wait for the GPU: the first call's weight fill with them (an image whose
-  // gate cores check after their fill, GN_QPREFILL, relies on that). YAH_NPU_PRELEAD=0: the whole lead after the gate
+  // (C) queue starts and the reads of weights (a start whose descriptor chain, set in this lead, reads weight views
+  // only: the FFN gate / up read chains its up rows) run before it, in the wait for the GPU: the first call's weight
+  // fill with them (an image whose gate cores check after their fill, GN_QPREFILL, relies on that). YAH_NPU_PRELEAD=0: the whole lead after the gate
   // (as before 11-18; not for GN_QPREFILL images: their gate would wait on a fill that waits on it).
   static void SplitLead(const std::vector<std::uint8_t>& lead, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& weights,
                         std::vector<std::uint8_t>& pre, std::vector<std::uint8_t>& post) {
@@ -177,8 +177,8 @@ class LoomNpu {
     if (off || lead.size() < 16 || (std::memcpy(&size, lead.data() + 12, 4), size != lead.size())) return;
     std::vector<std::uint8_t> a(lead.begin(), lead.begin() + 16), b = a;
     std::uint32_t na = 0, nb = 0;
-    // per (column, shim descriptor): 1 it reads weights and chains nowhere, 0 not (descriptors set in this lead)
-    std::map<std::pair<std::uint32_t, std::uint32_t>, bool> wbd;
+    // per (column, shim descriptor): (it reads weights, the descriptor it chains to or -1) (set in this lead)
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::pair<bool, int>> wbd;
     for (std::size_t o = 16; o < size;) {
       std::uint32_t len = 0, addr = 0;
       switch (lead[o]) {   // libamdf transaction 0.1 operations
@@ -192,24 +192,32 @@ class LoomNpu {
       const std::uint32_t col = addr >> 25, row = (addr >> 20) & 31, off_ = addr & 0xFFFFF;
       if (lead[o] == 1 && row == 0 && off_ >= 0x1D000 && off_ < 0x1D200 && (off_ - 0x1D000) % 32 == 0) {
         for (std::size_t j = 0; j + 32 <= len - 16; j += 32) {   // shim descriptors: [1] address low, [2] its high
-          std::uint32_t w[8];                                    // 16 bits, [7] use-next at bit 26
+          std::uint32_t w[8];                                    // 16 bits, [7] use-next at bit 26, next 27..30
           std::memcpy(w, lead.data() + o + 16 + j, 32);
           const std::uint64_t ad = w[1] | (std::uint64_t{w[2] & 0xFFFF} << 32);
           const std::uint64_t end = ad + std::uint64_t{w[0]} * 4;
-          bool in = !(w[7] >> 26 & 1);
-          if (in) {
-            in = false;
-            for (const auto& r : weights) in |= r.first <= ad && end <= r.second;
-          }
-          wbd[{col, (off_ - 0x1D000 + static_cast<std::uint32_t>(j)) / 32}] = in;
+          bool in = false;
+          for (const auto& r : weights) in |= r.first <= ad && end <= r.second;
+          const int next = w[7] >> 26 & 1 ? static_cast<int>(w[7] >> 27 & 15) : -1;
+          wbd[{col, (off_ - 0x1D000 + static_cast<std::uint32_t>(j)) / 32}] = {in, next};
         }
       }
       bool start = lead[o] == 0 && row == 0 && (off_ == 0x1D214 || off_ == 0x1D21C);   // shim MM2S0 / 1 queue
       if (start) {
         std::uint32_t v = 0;
         std::memcpy(&v, lead.data() + o + 16, 4);
-        const auto it = wbd.find({col, v & 63});
-        start = it == wbd.end() || !it->second;
+        bool weights_only = true;   // (every link of the chain; a loop or 16 links: no)
+        std::uint32_t bd = v & 63;
+        for (int n = 0;; ++n) {
+          const auto it = wbd.find({col, bd});
+          if (n == 16 || it == wbd.end() || !it->second.first) {
+            weights_only = false;
+            break;
+          }
+          if (it->second.second < 0) break;
+          bd = static_cast<std::uint32_t>(it->second.second);
+        }
+        start = !weights_only;
       }
       (start ? b : a).insert((start ? b : a).end(), lead.begin() + o, lead.begin() + o + len);
       ++(start ? nb : na);
