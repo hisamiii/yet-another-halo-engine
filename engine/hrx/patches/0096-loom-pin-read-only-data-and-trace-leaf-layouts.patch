@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:00:00 +0100
+Subject: [PATCH] loom: pin read-only data and trace leaf layouts on request
+
+Experimental LOOM_EXP_RODATA_AT=<symbol>@<offset> places a read-only data symbol at a fixed owner offset beside forced ring pins; LOOM_EXP_TRACE_RINGS=1 prints each ring proposal, rodata and storage placement.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2044,6 +2044,11 @@
+           tile_state->resources.facts, &proposal,
+           tile_state->resources.bank_cursors, &tile_state->resources.next_bank);
+     }
++    if (getenv("LOOM_EXP_TRACE_RINGS") != NULL) {  // (diag)
++      fprintf(stderr, "STORAGE worker %u tile %u,%u space %u at %u bytes %u\n", i,
++              worker->coordinate.column, worker->coordinate.row, space_index,
++              proposal.owner_offset, (uint32_t)requirement.byte_length);
++    }
+     builder->worker_storage[builder->worker_storage_cursor++] =
+         (loom_aie2p_array_worker_storage_plan_t){
+             .worker_index = i,
+@@ -2105,7 +2110,49 @@
+       const loom_low_read_only_data_requirement_t* requirement =
+           &data->values[requirement_ordinal];
+       uint32_t owner_offset = 0;
++      // Experimental LOOM_EXP_RODATA_AT=<symbol>@<offset>[,;]...: read-only
++      // data at a fixed owner offset in a 64 KB compute tile (beside pinned,
++      // forced rings: the generator keeps the layout collision-free). The
++      // covered banks' cursors only grow.
++      bool rodata_pinned = false;
+       if (requirement->contents.data_length != 0 &&
++          tile_state->resources.facts->memory.local_capacity == 65536u) {
++        const loom_symbol_t* pin_symbol =
++            &builder->module->symbols.entries[requirement->symbol.symbol_id];
++        const iree_string_view_t pin_name =
++            loom_string_table_get(&builder->module->strings, pin_symbol->name_id);
++        const char* pins = getenv("LOOM_EXP_RODATA_AT");
++        while (pins && *pins) {
++          const char* at = strchr(pins, '@');
++          if (!at) break;
++          char* end = NULL;
++          const unsigned long offset = strtoul(at + 1, &end, 0);
++          const uint64_t length = requirement->contents.data_length;
++          if ((iree_host_size_t)(at - pins) == pin_name.size &&
++              memcmp(pins, pin_name.data, pin_name.size) == 0 &&
++              offset % requirement->minimum_alignment == 0 &&
++              offset + length <= 65536u) {
++            const uint32_t cap =
++                tile_state->resources.facts->memory.local_capacity /
++                tile_state->resources.facts->memory.bank_count;
++            uint32_t* cursors = tile_state->resources.bank_cursors;
++            const uint32_t first = (uint32_t)(offset / cap);
++            const uint32_t last = (uint32_t)((offset + length - 1u) / cap);
++            for (uint32_t b = first; b <= last; ++b) {
++              const uint32_t want = b < last ? cap
++                                             : (uint32_t)(offset + length -
++                                                          (uint64_t)last * cap);
++              if (cursors[b] < want) cursors[b] = want;
++            }
++            owner_offset = (uint32_t)offset;
++            rodata_pinned = true;
++            break;
++          }
++          pins = end && (*end == ',' || *end == ';') ? end + 1 : NULL;
++        }
++      }
++      if (rodata_pinned) {
++      } else if (requirement->contents.data_length != 0 &&
+           requirement->bank_conflicts.count != 0) {
+         // Data with bank conflicts takes its ordinary place unless that shares
+         // a bank with a placed peer; else it is placed after the channel rings
+@@ -2167,6 +2214,12 @@
+                   owner_offset,
+               .byte_length = (uint32_t)requirement->contents.data_length,
+           };
++      if (getenv("LOOM_EXP_TRACE_RINGS") != NULL) {  // (diag)
++        fprintf(stderr, "RODATA worker %u tile %u,%u at %u bytes %u\n",
++                (uint32_t)worker_index, worker->coordinate.column,
++                worker->coordinate.row, owner_offset,
++                (uint32_t)requirement->contents.data_length);
++      }
+     }
+   }
+   return iree_ok_status();
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+@@ -6,6 +6,7 @@
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/array/channel_resources.h"
+ 
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -197,6 +198,15 @@
+   proposal.post_next_bank = probe->next_bank;
+   memcpy(proposal.post_bank_cursors, probe->bank_cursors,
+          probe->facts->memory.bank_count * sizeof(*proposal.post_bank_cursors));
++  if (getenv("LOOM_EXP_TRACE_RINGS") != NULL) {  // (diag) one line per ring proposal
++    fprintf(stderr, "RING tile %u,%u bytes %u x %u at", coordinate.column,
++            coordinate.row, record_byte_length, proposal.record_count);
++    for (uint16_t record = 0; record < proposal.record_count && record < 16;
++         ++record) {
++      fprintf(stderr, " %u", proposal.owner_offsets[record]);
++    }
++    fprintf(stderr, "\n");
++  }
+   *out_proposal = proposal;
+   return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_NONE;
+ }

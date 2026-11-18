@@ -9,6 +9,7 @@ partial (one per replay group of passes, gen_npu_gemm.groups) is compared with t
 bfp16 values; C is bf16: within half an ulp of the exact product (f32 accumulation order is ~1e-7 below that).
 Time the NPU with the counter profiler, not wall clock.
 """
+import dataclasses
 import os
 import subprocess
 import sys
@@ -37,6 +38,60 @@ def unpack_c(raw, cols, nb, groups=1, group=None):
     return c.transpose(1, 2, 4, 6, 0, 3, 5, 7).reshape(N.TM * nb, N.TN * cols)
 
 
+def bf16(x):
+    """f32 -> bf16 (nearest even), as f32."""
+    u = np.asarray(x, np.float32).view(np.uint32).astype(np.uint64)
+    return ((u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000).astype(np.uint32).view(np.float32)
+
+
+def qsw_h(g, u):
+    if os.environ.get("GN_QSWH") == "one":
+        return np.ones_like(g)
+    if os.environ.get("GN_QSWH") == "raw":
+        return g.astype(np.float32)
+    if os.environ.get("GN_QSWH") in ("g", "u"):   # (diag) the image's h = g or u
+        return bf16(g if os.environ["GN_QSWH"] == "g" else u)
+    """gen_npu_gemm convert_swiglu on f32 sums g, u: h = max(g, 0) u + t (-|g| u) in f32, bf16 operands, t = sigmoid(-|g|)
+    from its table (|g| clamped to [2^-8, 128] as bf16 bits), -|g| u rounded to bf16."""
+    gb, ub = bf16(g), bf16(u)
+    x = (np.arange(N.SL_LO, N.SL_HI + 1, dtype=np.uint32) << 16).view(np.float32).astype(np.float64)
+    tt = (1 / (1 + np.exp(x))).astype(np.float32)
+    tt = bf16(tt)
+    tt[tt < np.float32(2.0 ** -126)] = 0
+    la = (gb.view(np.uint32) >> 16) & 0x7FFF
+    t = tt[np.clip(la, N.SL_LO, N.SL_HI) - N.SL_LO]
+    fp = np.maximum(gb, np.float32(0)) * ub
+    fqb = bf16(-np.abs(gb) * ub)
+    return (fp + t * fqb).astype(np.float32)
+
+
+def qsw_check(hraw, av, wq, D, cols, nb):
+    """NPU_QSW: H ([column][M block][slab][576 B]: k-blocks in P4 order, token halves, 8 x [E][8 m]) against the model:
+    g, u = the exact sums (f64) to f32, qsw_h, the NPU's bfp16 conversion (gen_npu_dec Q.bfp_hw). Returns the exit code."""
+    F = wq.shape[0] // 2
+    s_ = av.astype(np.float64) @ wq.T.astype(np.float64)
+    h = qsw_h(s_[:, :F].astype(np.float32), s_[:, F:].astype(np.float32))   # [tokens][F]
+    M = h.shape[0]
+    perm = (0, 2, 1, 3)
+    # [col][M block][slab][position p][token half][8 tokens][8 features]: k-block perm[p] of the column's 4
+    hv = h.reshape(nb, N.MP, 2, 8, cols, 4, 8)[:, :, :, :, :, list(perm), :]
+    hv = hv.transpose(4, 0, 1, 5, 2, 3, 6)
+    want = D.Q.bfp_hw(np.ascontiguousarray(hv).reshape(-1, 8, 8)).reshape(-1)
+    got = hraw[:want.size]
+    if os.environ.get("GN_QSWDUMP"):   # (diag) the sums and both H to an npz
+        np.savez(os.environ["GN_QSWDUMP"], g=s_[:, :F], u=s_[:, F:], want=want, got=got)
+    bad = np.flatnonzero(got != want)
+    print(f"NPU_QSW H: {got.size} bytes, {bad.size} differ ({bad.size / got.size:.2e})")
+    if bad.size:
+        rec = bad // 9
+        print(f"  first: byte {bad[0]} (record {rec[0] // 64} of [col][block][slab], row byte {bad[0] % 9}) "
+              f"got {got[bad[0]]} want {want[bad[0]]}; exponent bytes {np.count_nonzero(bad % 9 == 0)}")
+        dm = np.abs(got[bad].view(np.int8).astype(int) - want[bad].view(np.int8).astype(int))
+        print(f"  mantissa |diff| max {dm[bad % 9 != 0].max() if np.any(bad % 9) else 0}; "
+              f"records hit {np.unique(bad // 576).size} of {got.size // 576}")
+    return 0 if bad.size == 0 else 1
+
+
 def value(x):
     E, m = B.quantize(x)
     rows, k = m.shape
@@ -62,6 +117,9 @@ def main():
     # fuse 2, NPU_KRAW=<K> NPU_K0=<k>: rows of K columns, the call's K at column k (a site's chunk)
     kraw, k0r = int(os.environ.get("NPU_KRAW", "0")), int(os.environ.get("NPU_K0", "0"))
     fmt = os.environ.get("NPU_FMT", "IQ4_XS")   # fuse 2: the raw rows' format (gen_npu_gemm FUSE_FMTS)
+    # NPU_QSW=1 (Q', NP 4, fuse 2): the FFN gate / up image (Config.qsw): a layer's ffn_gate rows 0 .. N / 2 and the
+    # same ffn_up rows (NPU_QSW_LAYER, else the first layer with both IQ4_XS), H against an exact model of the epilogue
+    qsw = os.environ.get("NPU_QSW") == "1"
     assert fuse in (0, 2), "NPU_FUSE: 0 or 2"
     # NPU_GATE=1 (diag): the gated image (the engine's bindings) with its flag record already open for one call
     cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw, fmt=fmt, rawdma=int(fuse == 2),
@@ -78,7 +136,20 @@ def main():
         KR = kraw or K
         t = next(x for x in rd.tensors if x.tensor_type.name == fmt and len(x.shape) == 2
                  and int(x.shape[0]) == KR and int(x.shape[1]) >= Nn)
-        wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
+        if qsw:   # W = [gate rows][up rows], N / 2 each; the raw stream's up rows dgu bytes after the gate rows
+            assert QMODE and N.NP == 4 and fmt == "IQ4_XS" and not k0r
+            ts_ = {x.name: x for x in rd.tensors}
+            lay_ = os.environ.get("NPU_QSW_LAYER") or next(
+                n_.split(".")[1] for n_ in ts_ if n_.endswith("ffn_gate.weight") and ts_[n_].tensor_type.name == fmt
+                and ts_[n_.replace("gate", "up")].tensor_type.name == fmt)
+            tg_, tu_ = ts_[f"blk.{lay_}.ffn_gate.weight"], ts_[f"blk.{lay_}.ffn_up.weight"]
+            assert int(tg_.shape[0]) == KR and tg_.tensor_type.name == tu_.tensor_type.name == fmt
+            print(f"NPU_QSW: blk.{lay_} ffn_gate / ffn_up rows 0 .. {Nn // 2}")
+            wraw = np.concatenate([np.asarray(x.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn // 2]
+                                   for x in (tg_, tu_)])
+            cfg = dataclasses.replace(cfg, qsw=True, dgu=Nn // 2 * KR // 256 * D.BLK, swcol=32, hord="P4")
+        else:
+            wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
         wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32
         frag = wf.reshape(Nn // 8, 8, K // 8, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
         bb = D.Q.bfp_hw(frag).reshape(-1, 8, 9)                    # per row [E][8 mantissas]
@@ -250,7 +321,17 @@ def main():
     if os.environ.get("NPU_COMPILE_ONLY"):   # (diag) stop after the image (compiler work, no NPU)
         sys.exit(0)
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
+    if qsw and os.environ.get("GN_QSWDIAG") == "intake":   # (diag) plain C: column c = gate rows 32 c .., up rows 32 c ..
+        idx_ = np.concatenate([np.r_[32 * c_:32 * c_ + 32, Nn // 2 + 32 * c_:Nn // 2 + 32 * c_ + 32] for c_ in range(cols)])
+        wq, wf, qsw = wq[idx_], wf[idx_], False
+    if qsw and os.environ.get("GN_QSWDIAG") == "convert":   # (diag) plain intake: column c's gate = W rows 64 c .. + 32,
+        # its up the next 32 (the qsw model's gate / up halves gathered from them)
+        idx_ = np.r_[np.concatenate([np.r_[64 * c_:64 * c_ + 32] for c_ in range(cols)]),
+                     np.concatenate([np.r_[64 * c_ + 32:64 * c_ + 64] for c_ in range(cols)])]
+        wq, wf = wq[idx_], wf[idx_]
     sa, sw, sc = N.stream_bytes(cfg)
+    if qsw:   # H: [column][M block][slab][576 B]
+        sc = cols * nb * N.MP * N.SW_REC
     a_in = a
     if fuse == 2:   # the decoders emit each pass's k-blocks in panel order (gen_npu_dec.KPERM): A follows
         kperm = np.concatenate([128 * p + D.KPERM for p in range(K // 1024 if QMODE else passes)])
@@ -409,6 +490,8 @@ def main():
         print(f"cycles per M block (core 0, {nb} blocks): median {med:.0f} min {step.min()} max {step.max()}; "
               f"{mma} MMAs -> MMA share {mma / med:.1%}; first block done at {last[0]}")
         sys.exit(0)
+    if qsw:
+        sys.exit(qsw_check(np.fromfile(co, np.uint8), value(a), wq, D, cols, nb))
     raw = (np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32)   # bf16 C
     if os.environ.get("NPU_AONEHOT"):   # (diag) per token (= k): how many features match the panel
         ko = int(os.environ["NPU_AONEHOT"])

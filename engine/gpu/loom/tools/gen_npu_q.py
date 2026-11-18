@@ -118,8 +118,12 @@ def loom_env(cfg):
     """loom-compile's environment for a Q' image of cfg (gen_npu_gemm.loom_env plus the Q' core's): the C block
     no-alias facts (generator-asserted: in one leaf body no C store writes a block a later C load reads) and the ring
     pins (GN_QBANK; GN_QPINS: the whole list; fuse 2: qf_ring_at)."""
+    N.QF["qsw"] = cfg.qsw and qswdiag() != "intake"   # (the C pins: qpins)
     env = dict(N.loom_env(cfg))
     env.update(LOOM_EXP_NOALIAS_ACC="2", LOOM_EXP_NOWAR_ACC="1")
+    if N.QF["qsw"]:   # the silu table between the C rows' f32 areas and W slot 1 (the rings are forced, and Loom's
+        # own place, offset 0, is under W slot 0; qf_ring_at moves the K-half egress ring off 49152)
+        env["LOOM_EXP_RODATA_AT"] = "silu_t@45568"
     if N.pshare():   # (array_program counted the two channels)
         env["LOOM_EXP_PACKET_SHARE"] = N.QF["pshare"]
     ks = cfg.ks[0]
@@ -171,7 +175,7 @@ def array_program(L, cfg):
             e(f"  {kk[c, r]} = worker %workers, %lane{c}_{r}, @{leaf_name(cfg, c, r)}")
             e(f"  constrain.location {kk[c, r]}, %n{c}, %n{2 + r}")
     # C first (rings are placed in channel order: C claims whole banks before the input rings)
-    rec = MP * NP * 4 * 256 // MP // 8
+    rec = N.SW_REC // 4 if N.QF["qsw"] else MP * NP * 4 * 256 // MP // 8   # (qsw: a 16-token row's h records)
     e(f"  %ncols = constant.u32 {cols * R} : reg<aie2p.array.scalar : index>")
     e(f"  %nseg = constant.u32 {nbr * MP} : reg<aie2p.array.scalar : index>")
     cd = f"%n{2 if N.qalt_on() and not N.qaltp_on() else MP}"
@@ -380,10 +384,16 @@ def array_program(L, cfg):
             rty = f"16x{rw}"
             # (GN_QRAWCONTIG=1, diag, wrong output: each record's 16 rows read contiguously, the same bytes a record)
             rs_ = rw if os.environ.get("GN_QRAWCONTIG") == "1" else RS
-            e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U if r4 else U * N.FUSE_SB}x{NP}x16x{rw}xi32, "
-              f"#encoding.layout.strided<strides=[{(N.FUSE_SB if r4 else 1) * BLK // 4}, {16 * rs_}, {rs_}, 1]>>>")
-        for c in range(cols):
-            e(f"  %fro{c} = constant.u64 {c * N.TN * RS * 4} : reg<aie2p.array.offset : offset>")
+            if cfg.qsw and qswdiag() != "convert":   # (FFN gate / up) per step: the column's 2 gate slabs, then the
+                # same up rows dgu bytes on
+                assert NP == 4 and not r4 and cfg.dgu % 4 == 0
+                e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x2x2x16x{rw}xi32, "
+                  f"#encoding.layout.strided<strides=[{BLK // 4}, {cfg.dgu // 4}, {16 * rs_}, {rs_}, 1]>>>")
+            else:
+                e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U if r4 else U * N.FUSE_SB}x{NP}x16x{rw}xi32, "
+                  f"#encoding.layout.strided<strides=[{(N.FUSE_SB if r4 else 1) * BLK // 4}, {16 * rs_}, {rs_}, 1]>>>")
+        for c in range(cols):   # (qsw: column c's gate rows swcol c ..)
+            e(f"  %fro{c} = constant.u64 {c * (cfg.swcol if cfg.qsw and qswdiag() != 'convert' else N.TN) * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<{rty}xi32>>")
             for r in drs:   # (row 0 fills; the rows below see its raw rows as W records: gen_npu_gemm.qf_skip_raw)
                 t = f"{c}_{r}"
@@ -564,6 +574,12 @@ def leaves(cfg):
     return list(out.items())
 
 
+def qswdiag():
+    """(diag, Config.qsw) GN_QSWDIAG=intake: only the gate / up intake (plain bf16 C, [gate 32][up 32] per column);
+    convert: only the swiglu epilogue and its H records (the plain intake)."""
+    return os.environ.get("GN_QSWDIAG", "")
+
+
 def gen(cfg):
     assert len(cfg.ks) == 1 and cfg.fuse in (0, 2) and cfg.passes >= 2 and 1 <= cfg.cols <= 8
     L = []
@@ -580,7 +596,10 @@ def gen(cfg):
     N.QF["crelmid"] = crel_mid_port() if crel() else None
     N.QF["split"] = qsplit_port if qsplit() else None
     N.QF["dec"] = qdec()
+    N.QF["qsw"] = cfg.qsw and qswdiag() != "intake"
     array_program(L, cfg)
+    if N.QF["qsw"]:
+        L.append(N.silu_rodata())
     i0 = len(L)
     for name, gate in leaves(cfg):   # (tailr: the GEMM leaf without the fill, skipping the raw rows)
         if name.startswith("qdec"):
