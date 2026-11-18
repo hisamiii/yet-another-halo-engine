@@ -30,10 +30,6 @@ struct NpuPlan {
   // dispatch.txt "npudepth1": one call queued at most (layout Q' without GN_QFGUARD: at depth 2 a core's next fill
   // writes its rings over C slots its last call may not have drained; guarded P1K sets run at depth 2).
   bool depth1 = false;
-  // Images (name prefixes: the NP 4 formats' site images, dispatch.txt "npunp4_<fmt>") whose family switches write
-  // program words by the microcontroller, not by control packets: with packets, a switch to or from one stalls the next
-  // job's gate column now and then (11-18, cause open; LoomNpu::DeltaSetup).
-  std::vector<std::string> no_packets;
 };
 
 // A byte range of A, W or C (in_c: an activation view of C, e.g. the FFN block's H, read by its down calls).

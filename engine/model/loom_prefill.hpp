@@ -123,11 +123,6 @@ class LoomPrefill {
     p.dcol = geom_.count("npudcol") != 0;
     p.gfirst = geom_.count("npugfirst") != 0;
     p.depth1 = geom_.count("npudepth1") != 0;
-    for (auto it = geom_.lower_bound("npunp4_"); it != geom_.end() && it->first.rfind("npunp4_", 0) == 0; ++it)
-      p.no_packets.push_back("npu_dcol_" + it->first.substr(7) + "_");
-    for (auto it = geom_.lower_bound("npuffndn4_"); it != geom_.end() && it->first.rfind("npuffndn4_", 0) == 0; ++it)
-      for (const auto& [p0, passes] : FfnBlkParts(FfnBlkF()))   // (the NP 4 downs, npu_ffndn<passes>_<fmt>)
-        p.no_packets.push_back("npu_ffndn" + std::to_string(passes) + "_" + it->first.substr(10) + ".");
     if (p.dcol) {
       // the NPU decodes raw rows: W is one call's unread panel binding; A holds the p4 stream, then the pk one (Q4_K)
       p.w_bytes = std::max(NpuK(5120).w, geom_.count("npubytes4_5120") ? NpuK(5120, true).w : 0);

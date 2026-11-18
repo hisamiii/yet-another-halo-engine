@@ -106,8 +106,6 @@ class LoomNpu {
     // depth 1 by SetMaxDepth while the task queues hold two calls: the next call's push but its core starts may run
     // before the wait (EarlyPush)
     bool early = false;
-    // a family switch to or from this image writes program words by the microcontroller (NpuPlan::no_packets)
-    bool no_packets = false;
     amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{}, gate{}, done{}, call{};
     // the device address ranges of the weight views as bound now (Rebind; SplitLead)
     std::vector<std::pair<std::uint64_t, std::uint64_t>> weights;
@@ -253,9 +251,6 @@ class LoomNpu {
   // Another context on the same array whose commands interleave with this one's (both enqueued by one thread), set
   // before either builds a command.
   void SetPeer(LoomNpu& peer) { peer_ = peer.counts_; }
-  // k (its family set) switches to or from other families with its program words by the microcontroller
-  // (NpuPlan::no_packets).
-  void NoPackets(Kernel& k) { k.no_packets = true, no_packets_.insert(FamilyOf(&k)); }
   LoomNpu(const LoomNpu&) = delete;
   LoomNpu& operator=(const LoomNpu&) = delete;
   ~LoomNpu() {
@@ -1381,7 +1376,13 @@ class LoomNpu {
     const std::size_t bytes = 4 * st.size();
     std::string key(reinterpret_cast<const char*>(st.data()), bytes);
     if (const auto it = packet_index_.find(key); it != packet_index_.end()) return it->second;
-    if (packets_used_ + bytes > packets_->bytes) return 0;
+    if (packets_used_ + bytes > packets_->bytes) {
+      static bool said = false;
+      if (!std::exchange(said, true))
+        std::fprintf(stderr, "npu: the packet store is full (%zu of %zu bytes, %zu streams)\n", packets_used_,
+                     packets_->bytes, packet_index_.size());
+      return 0;
+    }
     auto* dst = static_cast<std::uint8_t*>(packets_->host) + packets_used_;
     std::memcpy(dst, st.data(), bytes);
     for (std::size_t q = 0; q < bytes; q += 64) _mm_clflush(dst + q);   // the NPU's reads do not snoop the CPU caches
@@ -1499,13 +1500,17 @@ class LoomNpu {
           if (ps.shim[c][m] == 0x80000005) w32(tile(c, 0) | 0x3F000 + 4 * m, 0);
         w32(tile(c, 0) | 0x3F044, 0x80000005);                                // M17 <- S5 (MM2S0)
         w32(tile(c, 1) | 0xB0130, 0x80000000), w32(tile(c, 1) | 0xB0040, 0x8000000C);   // S12, M16 <- S12
+        // The lane takes arbiter 5 on the cores, one no image uses: images' packet-switched masters use arbiter 0
+        // (row 2 of the gate columns 1-2: master 7 by msel 0). On arbiter 0 the lane's packets for those tiles also
+        // went out that master, into the memory tile's DMA, and the NPU hung now and then after the switch.
+        constexpr std::uint32_t arb = 5;
         for (std::uint32_t r = 0; r < top[c]; ++r) {
           const std::uint32_t t = tile(c, r + 2);
-          w32(t | 0x3F128, 0xC0000000);   // S10 by packets: own row to arbiter 0 msel 0, rows above msel 1
+          w32(t | 0x3F128, 0xC0000000);   // S10 by packets: own row to the lane's arbiter msel 0, rows above msel 1
           for (std::uint32_t k = 0; r + k < PS::kRows; ++k)
-            w32(t | 0x3F2A0 + 4 * k, (r + 2 + k) << 24 | 0x1F << 16 | 1u << 8 | (k ? 1u << 4 : 0));
-          w32(t | 0x3F00C, 0xC0000008);
-          if (r + 1 < top[c]) w32(t | 0x3F048, 0xC0000010);
+            w32(t | 0x3F2A0 + 4 * k, (r + 2 + k) << 24 | 0x1F << 16 | 1u << 8 | (k ? 1u << 4 : 0) | arb);
+          w32(t | 0x3F00C, 0xC0000008 | arb);
+          if (r + 1 < top[c]) w32(t | 0x3F048, 0xC0000010 | arb);
         }
       }
       batch(0);
@@ -1570,7 +1575,6 @@ class LoomNpu {
   std::atomic<std::uint64_t> epoch_{0};   // Epoch
   Script* recording_ = nullptr;           // Record
   std::vector<std::pair<amdf_memory_t*, amdf_host_mapping_t*>> scripts_;   // sealed scripts' storage
-  std::set<const void*> no_packets_;   // the families of no_packets images (NoPackets)
   Fused FusedCommand(const std::vector<std::vector<const Call*>>& runs, int dec, const void* fam) {
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
@@ -1591,11 +1595,10 @@ class LoomNpu {
       int queued = 0, since = 0;
       if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
         if (k0->setup.empty()) throw LoomError("npu: a job switches image families without a setup");
-        // after the peer's commands (another image's routes on the array) the setup writes every switch itself; a
-        // switch to or from a no_packets image writes its program words by the microcontroller
-        // (YAH_NPU_NOPACKETS: every switch)
+        // after the peer's commands (another image's routes on the array) the setup writes every switch itself
+        // (YAH_NPU_NOPACKETS: diag, every switch)
         static const bool nopk = std::getenv("YAH_NPU_NOPACKETS") != nullptr;
-        const bool packets = !lane_lost_ && !nopk && !k0->no_packets && !no_packets_.count(fam);
+        const bool packets = !lane_lost_ && !nopk;
         append(DeltaSetup(k0->setup.data(), k0->setup.size(), packets));
         lane_lost_ = false;
         fam = FamilyOf(k0), dec = k0->dec;
@@ -2239,9 +2242,6 @@ class LoomNpuSplit : public NpuSplit {
           k->family = other->family;
           break;
         }
-      const std::string base = image.substr(image.rfind('/') + 1);
-      for (const std::string& pre : plan_.no_packets)
-        if (base.rfind(pre, 0) == 0) npu_.NoPackets(*k);
     } else {
       npu_.Rebind(*k, views);
     }
