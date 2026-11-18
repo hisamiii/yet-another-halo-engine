@@ -125,6 +125,7 @@ int main(int argc, char** argv) {
     // NPU_RUN_REPEAT=<n>: n runs, each one's host wall time (load + run) printed; timing by difference of two
     // problem sizes cancels the fixed part
     const char* rep = std::getenv("NPU_RUN_REPEAT");
+    try {
     for (int i = 0, n = rep ? std::max(1, std::atoi(rep)) : 1; i < n; ++i) {
       const auto t0 = std::chrono::steady_clock::now();
       if (const char* spec = std::getenv("YAH_NPU_PROF")) {   // the counters (NpuProf spec c0,c1,c2,c3/m0,m1)
@@ -148,6 +149,15 @@ int main(int argc, char** argv) {
       }
       const auto t1 = std::chrono::steady_clock::now();
       if (rep) std::printf("npu_run: run %d %.1f us\n", i, std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
+    } catch (const std::exception&) {   // (diag, NPU_RUN_DUMPFAIL=1) the outputs as the failed job left them
+      if (std::getenv("NPU_RUN_DUMPFAIL"))
+        for (const auto& [b, path] : outputs) {
+          FlushLines(views[b].shared->host, views[b].shared->bytes);
+          std::ofstream(path, std::ios::binary)
+              .write(static_cast<const char*>(views[b].shared->host), static_cast<std::streamsize>(views[b].shared->bytes));
+        }
+      throw;
     }
     for (const auto& [b, path] : outputs) {
       FlushLines(views[b].shared->host, views[b].shared->bytes);
