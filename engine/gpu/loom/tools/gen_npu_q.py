@@ -92,7 +92,8 @@ P1K_NP, P1K_KS, P1K_PASSES = 5, (32,), 20
 P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="2560@37376:40448:43520:46592,11520@0:53760,4608@20480:32768,64@30720",
                GN_QZACC="1", GN_QRELAX="1", GN_QTOK="-6,0,0,10", GN_QDRIP="4", GN_QEMERGE="1", GN_QWDUP="1",
                GN_QCLAZY="1", NPU_QCREL="2", GN_QLOCKA="12,5", GN_QWCONT="0", GN_QPEEL="0", GN_QP1="1", GN_QMB1="5",
-               GN_QP1K="1", GN_QCVL="1", GN_QFKH="1", GN_QPSHARE="1", GN_QF4R="1", DQ_HDRWIN="8")
+               GN_QP1K="1", GN_QCVL="1", GN_QFKH="1", GN_QPSHARE="1", GN_QF4R="1", DQ_HDRWIN="8",
+               GN_QLSDEPTH="7")   # (11-18: the A streams staged 7 deep in the memory tiles: gate 796K -> 731K a call in the engine)
 P1K_LOOM = dict(LOOM_EXP_RING_AT_FORCE="1", LOOM_EXP_SPACE_AT="scratch@12288", LOOM_EXP_EGRESS_MERGE="1",
                 LOOM_EXP_REPLAY_GROUP="4", LOOM_EXP_MERGE_RING_LOW="1", LOOM_EXP_PANEL_STREAM="1",
                 LOOM_EXP_PANEL_STREAM_SINGLE="1")

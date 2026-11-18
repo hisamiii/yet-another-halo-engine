@@ -515,6 +515,8 @@ def loom_env(cfg):
     if cfg.fuse == 2 and qf4r_on():   # (GN_QF4R) the raw records split by parity over the two W multicasts
         env["LOOM_EXP_INTAKE_SPLIT"] = "1"
         env["LOOM_EXP_INTAKE_STAGE_DEPTH"] = os.environ.get("GN_QF4RDEPTH", "4")   # (2 records a multicast in flight)
+    if os.environ.get("GN_QLSDEPTH"):   # the activation streams' memory-tile stage depth (records; default the core ring's)
+        env["LOOM_EXP_LS_STAGE_DEPTH"] = os.environ["GN_QLSDEPTH"]
     if not groups(cfg):
         env["LOOM_EXP_PANEL_GROUPS"] = str(cfg.passes)
         if cfg.fuse == 2:   # one group, still streamed (HRX patch 0019): the panel's fill
