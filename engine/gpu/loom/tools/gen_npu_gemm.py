@@ -1074,6 +1074,12 @@ def colcfg(cfg, c):
     return dataclasses.replace(cfg, fmt=cfg.ufmt, gord=cfg.ugord) if fpair(cfg) and c >= 0 and c % 2 else cfg
 
 
+def qf_vroll(cfg):
+    """The Q' fill's decoder with its scale halves rolled (program memory): GN_QFVROLL=1 (diag), or IQ3_XXS in an
+    FFN gate / up image (its gate core 16816 B of 16384 unrolled, 16144 rolled)."""
+    return os.environ.get("GN_QFVROLL") == "1" or (bool(QF.get("qsw")) and cfg.fmt == "IQ3_XXS")
+
+
 def dec_tag(cfg):
     """The inlined decoder's rodata name: a pair's up columns (colcfg) their own."""
     if QF.get("gfmt"):   # (Q', gen_npu_q: the fill leaves see decode Configs) the gate format's "inl", the up's "inlu"
@@ -2115,7 +2121,7 @@ def qf_split_r1(L, cfg):
     ren = lambda m: m.group(0) if m.group(2) in ("fzs", "fzt") else m.group(1) + "dq_" + m.group(2)
     for ln in ([] if os.environ.get("GN_QFNODEC") else
                D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll),
-                             vroll=os.environ.get("GN_QFVROLL") == "1",   # (diag: the halves rolled, program memory)
+                             vroll=qf_vroll(cfg),   # (the halves rolled, program memory)
                              rec=(lambda h: (h, h + 1) if h is not None else None)(qfhalf()))):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
@@ -2391,7 +2397,7 @@ def qf_decode(L, cfg, dp):
         e("  %qfd0 = slice %qfdw0[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
     for ln in ([] if os.environ.get("GN_QFNODEC") else   # (diag: no decoder, every lock and egress kept)
                D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll),
-                             vroll=os.environ.get("GN_QFVROLL") == "1",   # (diag: the halves rolled, program memory)
+                             vroll=qf_vroll(cfg),   # (the halves rolled, program memory)
                              rec=(lambda h: (h, h + 1) if h is not None else None)(qfhalf()))):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
