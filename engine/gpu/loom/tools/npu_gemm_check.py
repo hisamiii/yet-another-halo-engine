@@ -304,7 +304,7 @@ def main():
                 st_ = np.diff(cyc.reshape(cols, nb, N.MP)[0, r_::R_, -1])
                 print(f"  row {r_} (core 0): median {float(np.median(st_)):.0f} min {st_.min()} max {st_.max()}")
         if os.environ.get("GN_QFCYC") == "1" and fuse == 2:   # (the filler's fill words 1-3 of its blocks' segments)
-            w4f = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[0, :, :, :5].astype(np.int64)
+            w4f = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[0, :, :, :8].astype(np.int64)
             fb_ = ((1 if N.qcstage_on() else 2) if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
             v_ = w4f[fb_, -1]
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
@@ -312,6 +312,10 @@ def main():
                 for r_ in range(4):
                     u_ = w4f[2 * (r_ % 2) + r_ // 2, -1]
                     print(f"  fill row {r_}: decoder/egress {u_[1]} whole fill {u_[2]} raw waits {u_[3]} hot {u_[4]}")
+                    if os.environ.get("GN_QFW") == "2":   # (diag) the gate check, the helper record copies
+                        print(f"  fill row {r_}: gate check {u_[5]} copies {u_[6]}")
+                    if os.environ.get("GN_QFW") == "1":   # (diag) the egress slot waits (own, copy), helper waits
+                        print(f"  fill row {r_} waits: own egress {u_[5]} helper records {u_[6]} copy egress {u_[7]}")
             if os.environ.get("DQ_CYC") == "1":   # (diag) word 1: the decoder's cycles; word 4: its hot loop's
                 print(f"  decoder (DQ_CYC): {v_[1]} cycles, hot loop {v_[4]}")
         if os.environ.get("GN_QCW") == "1" and mrel:   # (diag) per row: median per block of the C / W acquire waits
