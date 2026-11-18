@@ -124,12 +124,16 @@ def loom_env(cfg):
     env.update(LOOM_EXP_NOALIAS_ACC="2", LOOM_EXP_NOWAR_ACC="1")
     if N.QF["qsw"]:   # the silu table between the C rows' f32 areas and W slot 1 (the rings are forced, and Loom's
         # own place, offset 0, is under W slot 0; qf_ring_at moves the K-half egress ring off 49152)
-        env["LOOM_EXP_RODATA_AT"] = "silu_t@45568"
+        env["LOOM_EXP_RODATA_AT"] = ",".join(f"{N.silu_sym(k)}@{a}" for k, (_, a) in enumerate(N.silu_pieces()))
+        if len(N.silu_pieces()) > 1 and not N.qgmap_on():   # (GN_QSILU by hand: GN_QSILUK, @silu_k's address)
+            env["LOOM_EXP_RODATA_AT"] += f",silu_k@{os.environ['GN_QSILUK']}"
         env["LOOM_EXP_EGRESS_MERGE_STRIDED"] = "1"
     if p1k4(cfg):   # (NP 4) the scratch pad's guard
         env["LOOM_EXP_RODATA_AT"] = ",".join(([env["LOOM_EXP_RODATA_AT"]] if "LOOM_EXP_RODATA_AT" in env else [])
-                                             + [f"qfgd@{N.P1K4_GUARD}"])
-    if N.QF["grid"]:   # the decoder's tables (gen_npu_gemm P1K_GRID_*: 49152 .. 53760, the others in spare runs),
+                                             + [f"qfgd@{N.p1k4_guard()}"])
+    if N.qgmap_on():   # (FFN gate / up, a grid format: gen_npu_gemm QG_*) the tables, @silu_k
+        env["LOOM_EXP_RODATA_AT"] = ",".join([env["LOOM_EXP_RODATA_AT"]] + qgmap_pins(cfg))
+    elif N.QF["grid"]:   # the decoder's tables (gen_npu_gemm P1K_GRID_*: 49152 .. 53760, the others in spare runs),
         # largest first
         at, pins, used = N.P1K_GRID_AT, [], set()
         ms = [re.match(r"global.rodata.def @(\w+) = align\((\d+)\).*bytes\(\"([0-9a-fA-F]*)\"\)", ln)
@@ -678,18 +682,57 @@ def p1k4(cfg):
     return cfg.fuse == 2 and N.qp1k_on() and N.NP == 4 and os.environ.get("GN_QFDIRECT", "1") == "1"
 
 
+def qgmap_pins(cfg):
+    """(gen_npu_gemm.qgmap_on) RODATA_AT pins: per decoder (a pair's two formats sit in different cores, so each
+    format's tables are packed alone) the largest table at 49152, the rest first-fit in QG_SPARE's runs; then @silu_k
+    first-fit in what every format leaves free (it is in every core). The rest of the runs: Loom's stack."""
+    def syms(cc):
+        out = []
+        for ln in N.decoder(cc.fmt, cc.gord).inline_rodata(N.dec_tag(cc)):
+            m = re.match(r"global.rodata.def @(\w+) = align\((\d+)\).*bytes\(\"([0-9a-fA-F]*)\"\)", ln)
+            out.append((m[1], int(m[2]), len(m[3]) // 2))
+        return sorted(out, key=lambda t: -t[2])
+
+    def fit(free, al, n):   # first fit in [(lo, hi)]: (address, the free list without it)
+        for i, (lo, hi) in enumerate(free):
+            a = -(-lo // al) * al
+            if a + n <= hi:
+                return a, free[:i] + [(lo, a), (a + n, hi)] + free[i + 1:]
+        return None, free
+
+    pins, frees = [], []
+    for cc in [cfg] + ([N.colcfg(cfg, 1)] if N.fpair(cfg) and cfg.ufmt != cfg.fmt else []):
+        if not N.decoder(cc.fmt, cc.gord).GRID:
+            frees.append(list(N.QG_SPARE))
+            continue
+        free = list(N.QG_SPARE)
+        for i, (nm, al, n) in enumerate(syms(cc)):
+            if i == 0:   # (the main table at the page start: its gathers take the page from the address's high bytes)
+                assert 49152 % al == 0 and 49152 + n <= 53760, (cc.fmt, nm, n)
+                a, free = 49152, [(49152 + n, 53760)] + free[1:]
+            else:
+                a, free = fit(free, al, n)
+                assert a is not None, (cc.fmt, nm, n, free)
+            pins.append(f"{nm}@{a}")
+        frees.append([r for r in free if r[1] > r[0]])
+    nk = 64 * len(N.silu_kvals())
+    cand = sorted({-(-lo // 64) * 64 for fr in frees for lo, _ in fr})
+    ka = next((a for a in cand if all(any(lo <= a and a + nk <= hi for lo, hi in fr) for fr in frees)), None)
+    assert ka is not None, frees
+    return pins + [f"silu_k@{ka}"]
+
+
 def grid_flags(cfg):
     """gen_npu_gemm's Q' decoder flags: the byte grid (QF qg8) and, for a grid format at fuse 2, the P1K grid map."""
     N.QF["qg8"] = True
-    N.QF["grid"] = cfg.fuse == 2 and N.qp1k_on() and N.decoder(cfg.fmt, cfg.gord).GRID
-    # (column pairs: grid formats need the P1K map rework first, their tables and the silu table share 49152 .. 53760)
-    assert not N.fpair(cfg) or not (N.QF["grid"] or N.decoder(cfg.ufmt, cfg.ugord or "P4").GRID), \
-        "Q' column pairs: no grid format yet"
+    N.QF["grid"] = cfg.fuse == 2 and N.qp1k_on() and any(
+        N.decoder(f, g).GRID for f, g in [(cfg.fmt, cfg.gord)] + ([(cfg.ufmt, cfg.ugord or "P4")] if N.fpair(cfg) else []))
 
 
 def gen(cfg):
     assert len(cfg.ks) == 1 and cfg.fuse in (0, 2) and cfg.passes >= 2 and 1 <= cfg.cols <= 8
     grid_flags(cfg)
+    N.QF["gfmt"] = cfg.fmt   # (gen_npu_gemm.dec_tag)
     L = []
     if cfg.fuse == 2:   # the decode side: 1024-K passes over the call's K, one 128-k-block slice
         K = 8 * cfg.passes * cfg.ks[0]

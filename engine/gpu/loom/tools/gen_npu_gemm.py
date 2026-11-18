@@ -265,7 +265,7 @@ def qf_ring_at(pins):
         eb = m["eb"]
         # (FFN gate / up: the K-half ring over C slots 1-3 too, idle in the fill; the silu table takes 45568 .. 53760)
         egr = 40448 if QF.get("qsw") and "GN_QFEGR" not in os.environ else m["egr"]
-        if QF.get("grid"):   # (grid formats at NP 4: P1K_GRID_*)
+        if QF.get("grid") and not QF.get("qsw"):   # (grid formats at NP 4: P1K_GRID_*; gate / up: qgmap_on)
             assert NP == 4 and not QF.get("qsw") and egr == 40448, "Q' grid formats: NP 4 site images"
             egr = P1K_GRID_RING
             assert egr + m["slots"] * fb <= P1K_GRID_AT and hat + qf4r_hslots() * fb <= P1K_GRID_AT
@@ -298,7 +298,7 @@ def qpins(default=None):
     if v != "p1k":
         return v
     cs = ":".join(str(37376 + q3_strides()[0] * r) for r in range(4))
-    return f"{SW_REC if QF.get('qsw') else 512 * NP}@{cs},{2304 * NP}@0:53760,4608@20480:32768,64@30720"
+    return f"{SW_REC if QF.get('qsw') else 512 * NP}@{cs},{2304 * NP}@0:53760,4608@20480:32768,64@{p1k_tok()}"
 
 
 # (P1K at NP 4, grid formats) the decoder's tables from 49152 (4 KB pages: the gathers' address high bytes) to W slot 1
@@ -312,6 +312,26 @@ P1K_GRID_AT, P1K_GRID_END, P1K_GRID_RING = 49152, 53760, 39424
 # takes the pad's address from the guard's
 P1K4_SP, P1K4_GUARD = 25088, 30656
 P1K_GRID_SPARE = ((63488, 65536), (28672, P1K4_GUARD))
+# (P1K at NP 4, FFN gate / up with a grid format: qgmap_on) the silu table in two pieces around the grid page:
+# 56 blocks at 45568 .. 49152 (the even C rows' end to the page), 65 at 28288 .. 32448 (the decoder pad's end, a grid
+# decoder's 3200 B); the pad's guard and the MB2 token word move past it (32448, 32704); the SL_K vectors (@silu_k),
+# the grid tables' small symbols and Loom's stack take the grid page's tail and 63488 .. 65536 (gen_npu_q.qgmap_pins)
+QG_SILU = ((56, 45568), (65, 28288))
+QG_GUARD, QG_TOK = 32448, 32704
+QG_SPARE = ((49152, 53760), (63488, 65536))
+
+
+def qgmap_on():
+    """The P1K grid map of an FFN gate / up image (QF grid and qsw: gen_npu_q.grid_flags)."""
+    return bool(QF.get("grid") and QF.get("qsw"))
+
+
+def p1k4_guard():
+    return QG_GUARD if qgmap_on() else P1K4_GUARD
+
+
+def p1k_tok():
+    return QG_TOK if qgmap_on() else 30720
 
 
 def p1k4_on():
@@ -1056,6 +1076,8 @@ def colcfg(cfg, c):
 
 def dec_tag(cfg):
     """The inlined decoder's rodata name: a pair's up columns (colcfg) their own."""
+    if QF.get("gfmt"):   # (Q', gen_npu_q: the fill leaves see decode Configs) the gate format's "inl", the up's "inlu"
+        return "inl" if cfg.fmt == QF["gfmt"] else "inlu"
     return "inlu" if fpair(cfg) and cfg.fmt == cfg.ufmt else "inl"
 
 
@@ -1091,10 +1113,10 @@ def pair_copy(e, y, src, dst, swap=False, nbytes=None):
         return cur
     e(f"  {y}sa = mov.scalar-to-address {src}")
     e(f"  {y}da = mov.scalar-to-address {dst}")
-    assert nb_ % 256 == 0
+    assert nb_ % 256 == 0 or nb_ == 128   # (128: qpair_swap's GN_QPAIRCH pieces, one group of two)
     sb, db = f"{y}sa", f"{y}da"
-    for g in range(nb_ // 256):
-        k, qs = g // 4, range(4 * g, 4 * g + 4)
+    for g in range(-(-nb_ // 256)):
+        k, qs = g // 4, range(4 * g, min(4 * g + 4, nb_ // 64))
         if g % 4 == 0:
             sb = padd(f"{y}sb{k}", sb, 512 if k == 0 else 1024)
             db = padd(f"{y}db{k}", db, 512 if k == 0 else 1024)
@@ -1204,23 +1226,36 @@ def qpair_swap(e, pair, ea, ob, tag):
         e(f"  {x}eo = sub {x}ob, {x}ea")
         e(f"  {x}go = sub {x}wo, {x}wh")         # (the gate's odd - even)
         e(f"  {x}so = add.rr {x}se, {x}go")
-        # (a guard: both gate pieces inside the ring's 64 KB window, else no swap: wrong output, no stray access)
-        e(f"  {x}hk = mov.i32 1023")
-        e(f"  {x}end = add.rr {x}so, {x}hk")
-        e(f"  {x}x0 = xor {x}se, {x}r")
-        e(f"  {x}x1 = xor {x}end, {x}r")
-        e(f"  {x}x2 = or {x}x0, {x}x1")
-        e(f"  {x}sk = mov.i32 -16")
-        e(f"  {x}x3 = lshl {x}x2, {x}sk")
-        e(f"  {x}ok = eqz {x}x3")
-        e(f"  low.cond_br {x}ok, ^qxd{tag}, ^qxj{tag} : reg<aie2p.er>")
+        # (a guard: both gate pieces inside the ring's 64 KB window, else no swap: wrong output, no stray access;
+        # GN_QPAIRGUARD=mask: each piece's gate address forced into the window instead, ch-aligned, less code)
+        gmask = os.environ.get("GN_QPAIRGUARD", "mask") == "mask"
+        if gmask:
+            e(f"  {x}wk = mov.i32 -65536")
+            e(f"  {x}wb = and {x}r, {x}wk")
+            e(f"  low.br ^qxd{tag}")
+        else:
+            e(f"  {x}hk = mov.i32 1023")
+            e(f"  {x}end = add.rr {x}so, {x}hk")
+            e(f"  {x}x0 = xor {x}se, {x}r")
+            e(f"  {x}x1 = xor {x}end, {x}r")
+            e(f"  {x}x2 = or {x}x0, {x}x1")
+            e(f"  {x}sk = mov.i32 -16")
+            e(f"  {x}x3 = lshl {x}x2, {x}sk")
+            e(f"  {x}ok = eqz {x}x3")
+            e(f"  low.cond_br {x}ok, ^qxd{tag}, ^qxj{tag} : reg<aie2p.er>")
         e(f"^qxd{tag}:")   # (8 pieces of 256 B: 4 of the even KB, then 4 of the odd one odd - even on; a loop, the
         # copy's code once: the program memory is full, 16 KB)
         ER = "reg<aie2p.er>"
+        ch = int(os.environ.get("GN_QPAIRCH", "128"))   # (the copy's piece: 128 B, 16 pieces, halves its code)
+        assert ch in (128, 256)
+        npc, lpc = 1024 // ch, (1024 // ch).bit_length() - 1
         e(f"  {x}i0 = mova.i32 0")
-        e(f"  {x}k8 = mova.i32 8")
-        e(f"  {x}k3 = mova.i32 3")
-        e(f"  {x}km2 = mova.i32 -2")
+        e(f"  {x}k8 = mova.i32 {2 * npc}")
+        e(f"  {x}k3 = mova.i32 {npc - 1}")
+        e(f"  {x}km2 = mova.i32 {-lpc}")
+        e(f"  {x}kc = mova.i32 {ch.bit_length() - 1}")
+        if gmask:
+            e(f"  {x}lk = mov.i32 {0xFFFF & -ch}")
         e(f"  low.br ^qxl{tag}({x}i0: {ER})")
         e(f"^qxl{tag}({x}li: {ER}):")
         e(f"  {x}lm = lt {x}li, {x}k8")
@@ -1228,16 +1263,19 @@ def qpair_swap(e, pair, ea, ob, tag):
         e(f"  {x}ln = add {x}li, 1")
         e(f"  low.cond_br {x}lm, ^qxb{tag}, ^qxj{tag} : {ER}")
         e(f"^qxb{tag}:")
-        e(f"  {x}pc = lshl {x}li, {x}km2")      # (the piece: i >> 2)
+        e(f"  {x}pc = lshl {x}li, {x}km2")      # (the KB: i >> 2, 128 B pieces i >> 3)
         e(f"  {x}po = mul {x}pc, {x}eo")
         e(f"  {x}pg = mul {x}pc, {x}go")
         e(f"  {x}qa = and {x}li, {x}k3")
-        e(f"  {x}qo = lshl {x}qa, {x}k8")      # ((i & 3) << 8)
+        e(f"  {x}qo = lshl {x}qa, {x}kc")      # ((i & 3) << 8; 128 B pieces (i & 7) << 7)
         e(f"  {x}oo = add.rr {x}po, {x}qo")
         e(f"  {x}og = add.rr {x}pg, {x}qo")
         e(f"  {x}ls = add.rr {x}se, {x}og")
+        if gmask:
+            e(f"  {x}lw = and {x}ls, {x}lk")
+            e(f"  {x}lv = or {x}lw, {x}wb")
         e(f"  {x}ld = add.rr {x}ea, {x}oo")
-        pair_copy(e, f"{x}c", f"{x}ls", f"{x}ld", swap=True, nbytes=256)
+        pair_copy(e, f"{x}c", f"{x}lv" if gmask else f"{x}ls", f"{x}ld", swap=True, nbytes=ch)
         e(f"  low.br ^qxl{tag}({x}ln: {ER})")
         e(f"^qxj{tag}:")
         e(f"  rel %one, {P}")
@@ -1705,6 +1743,7 @@ def fuse_scratch(cfg, cov):
     if qfdirect_on():   # (P1K fill, direct: QF_P1KD; NP 4: P1K4_SP)
         m = dict(QF_P1KD, sp=P1K4_SP) if p1k4_on() else QF_P1KD
         assert not p1k4_on() or P1K4_SP + D.SCR_B <= P1K_GRID_SPARE[1][0], D.SCR_B
+        assert not (p1k4_on() and qgmap_on()) or P1K4_SP + D.SCR_B <= QG_SILU[1][1], D.SCR_B   # (the silu piece)
         assert 16 * D.RECROW <= QF["wslot"] and (m["sp"] + D.SCR_B <= 20480 or 25088 <= m["sp"] <= 30720 - D.SCR_B or 49664 <= m["sp"] <= 53760 - D.SCR_B or m["sp"] >= m["sp2"] + D.SCR2_B) and m["sp2"] + D.SCR2_B <= 65280 and m["sp"] + D.SCR_B <= 65280
         assert m["raw"] * 16 * D.RECROW <= 20480   # (the intake slots: W slot 0, its tail, the odd C area)
         return m["sp"], 0, m["sp2"], None
@@ -2268,7 +2307,7 @@ def qf_decode(L, cfg, dp):
         if p1k4_on():   # (the pad from the guard's address: the guard stays referenced, so pinned)
             e("  %fzgp = mov.local-address @qfgd")
             e("  %fzgs = mov.address-to-scalar %fzgp")
-            e(f"  %fzo_sp = mov.i32 {SP - P1K4_GUARD}")
+            e(f"  %fzo_sp = mov.i32 {SP - p1k4_guard()}")
             e("  %fza_sp = add.rr %fzgs, %fzo_sp")
         else:
             e(f"  %fzo_sp = mov.i32 {SP}")
@@ -4772,11 +4811,11 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             if ("b", b, kch[0]) in kmemo:
                 return kmemo[("b", b, kch[0])]
             kn[0] += 1
-            if b in SL_K:   # loaded from the table's tail (a broadcast would be rematerialized at every use)
+            if b in silu_kvals():   # loaded from the table's tail (a broadcast would be rematerialized at every use)
                 if ("p", kch[0]) not in kmemo:
                     e(f"  {p}kvp{kn[0]} = mov.scalar-to-address {p}cts")
                     kmemo[("p", kch[0])] = f"{p}kvp{kn[0]}"
-                e(f"  {p}kv{kn[0]} = vlda.512.i8x64 {kmemo[('p', kch[0])]}, {64 * SL_K.index(b) - 512}")
+                e(f"  {p}kv{kn[0]} = vlda.512.i8x64 {kmemo[('p', kch[0])]}, {64 * silu_kvals().index(b) - 512}")
             else:
                 e(f"  {p}kc{kn[0]} = mov.i32 {b}")
                 e(f"  {p}kv{kn[0]} = vbcst.16 {p}kc{kn[0]}")
@@ -4813,14 +4852,21 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                         L.extend(sg[i])
         e(f"  {p}sh2 = mov.shift 2")
         e(f"  {p}m24 = mova.i32 24")                        # vshuffle: each 8-byte piece's first value
-        e(f"  {p}tla = mov.local-address @silu_t")
-        e(f"  {p}tla0 = mov.address-to-scalar {p}tla")
         e(f"  {p}km2 = mova.i32 -2")
-        e(f"  {p}tq4 = lshl {p}tla0, {p}km2")
-        e(f"  {p}tqk = mov.i32 {SL_LO}")
-        e(f"  {p}tq = sub {p}tq4, {p}tqk")                   # (the table's address - 4 SL_LO) / 4: index = |g|'s bits
+        sp_, b0_ = silu_pieces(), 0
+        for k_, (nb_, _) in enumerate(sp_):   # (each piece: its address / 4 less its first index, in 16 bits)
+            x_ = f"{p}tla{k_ or ''}"
+            e(f"  {x_} = mov.local-address @{silu_sym(k_)}")
+            e(f"  {x_}0 = mov.address-to-scalar {x_}")
+            e(f"  {p}tq4{k_ or ''} = lshl {x_}0, {p}km2")
+            e(f"  {p}tqk{k_ or ''} = mov.i32 {SL_LO + 16 * b0_}")
+            e(f"  {p}tq{k_ or ''} = sub {p}tq4{k_ or ''}, {p}tqk{k_ or ''}")   # (the address - 4 SL_LO) / 4: index = |g|'s bits
+            b0_ += nb_
         e(f"  {p}ctk = mov.i32 {silu_kofs() + 512}")
-        e(f"  {p}cts = add.rr {p}tla0, {p}ctk")              # SL_K's vectors (+ 512)
+        if len(sp_) > 1:   # (pieces: the vectors in @silu_k)
+            e(f"  {p}tlk = mov.local-address @silu_k")
+            e(f"  {p}tlk0 = mov.address-to-scalar {p}tlk")
+        e(f"  {p}cts = add.rr {p + 'tlk0' if len(sp_) > 1 else p + 'tla0'}, {p}ctk")   # SL_K's vectors (+ 512)
         if unit:
             fifo = unit
         else:
@@ -4852,6 +4898,39 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e(f"  {q}kup = mov.i32 {1024 * NP // 2}")
                 e(f"  {q}uib = add.rr {q}gib, {q}kup")
                 fifo = jpush(q, T, kind, fifo, [0])
+            if not one and (cfg.hord or not q3) and hi - lo > 1 and os.environ.get("GN_QSWJROLL", "1") == "1":
+                # (program memory) j a runtime loop: the gate block's offset is linear in j (hord: 256 j, else
+                # 1024 j; q3 with hord: half i's area, 256 j on); the counter steps in the header, so no
+                # hardware-loop candidate (LOOM_EXP_HWLOOP_TRIP)
+                assert not cfg.hord or (lo, hi) == (0, 2)
+                e(f"  {q}jk0 = mova.i32 {lo}")
+                e(f"  {q}jkn = mova.i32 {hi}")
+                e(f"  {q}jks = mov.i32 {256 if cfg.hord else 1024}")
+                e(f"  low.br ^jl{T}({q}jk0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+                e(f"^jl{T}({q}jv: {ER}, {q}jf: {MF}, {q}jp: {MP_}, {q}jq: {MS}):")
+                e(f"  {q}jm = lt {q}jv, {q}jkn")
+                e(f"  {q}jx = add {q}jv, 1")
+                e(f"  low.cond_br {q}jm, ^jb{T}, ^je{T} : {ER}")
+                e(f"^jb{T}:")
+                s1 = len(L)
+                e(f"  {q}jo = mul {q}jv, {q}jks")
+                fifo = (f"{q}jf", f"{q}jp", f"{q}jq")
+                for i in range(2):
+                    qq = f"{q}u{i}"
+                    go, du = (1024 * i + 512) if cfg.hord else (256 * i + 512), 1024 * NP // 2
+                    gb = f"{p}ss"
+                    if q3:
+                        go, du, gb = 512, 1024, f"{p}os" if i else f"{p}ss"
+                    e(f"  {qq}jg = add.rr {gb}, {q}jo")
+                    e(f"  {qq}gk = mov.i32 {go}")
+                    e(f"  {qq}gib = add.rr {qq}jg, {qq}gk")
+                    e(f"  {qq}uk = mov.i32 {go + du}")
+                    e(f"  {qq}uib = add.rr {qq}jg, {qq}uk")
+                    fifo = jpush(qq, T, kind, fifo, range(2))
+                L[s1:] = lsched(L[s1:], 24)   # (12 or 40: more code)
+                e(f"  low.br ^jl{T}({q}jx: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+                e(f"^je{T}:")
+                return (f"{q}jf", f"{q}jp", f"{q}jq")
             for j in range(lo, hi) if not one else ():
                 for i in range(2):
                     # gate rows: slab j, half i (sub-tiles at 256 i, 512 + 256 i); up: NP / 2 slabs on. The record
@@ -4875,7 +4954,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
 
         def jpush(q, T, kind, fifo, rs):
             nonlocal nf
-            kmemo.clear()   # (constants made before the body stay in their own blocks)
+            kmemo.clear()   # (constants made before the body stay in their own blocks; shared across the rolled
+            # loop's halves they spill: +600 B)
             for r in rs:                                    # token half: chain row bit
                 n = f"{q}b{r}"
 
@@ -4907,11 +4987,19 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     e(f"  {n}lc{h}, {n}lcm{h} = vmin_ge.s16x32 {n}lc0{h}, {kbf(128.0)}")
                     # + the table's address / 4 less SL_LO in 16 bits (the table ends below 2^18), then x 4 as i32:
                     # the gathers' byte addresses
-                    if ("q", kch[0]) not in kmemo:
-                        kn[0] += 1
-                        e(f"  {p}kv{kn[0]} = vbcst.16 {p}tq")
-                        kmemo[("q", kch[0])] = f"{p}kv{kn[0]}"
-                    e(f"  {n}lb{h} = vadd.16 {n}lc{h}, {kmemo[('q', kch[0])]}")
+                    sp_ = silu_pieces()
+                    for k_ in range(len(sp_)):
+                        if ("q", k_, kch[0]) not in kmemo:
+                            kn[0] += 1
+                            e(f"  {p}kv{kn[0]} = vbcst.16 {p}tq{k_ or ''}")
+                            kmemo[("q", k_, kch[0])] = f"{p}kv{kn[0]}"
+                    tb_, b0_ = kmemo[("q", 0, kch[0])], 0
+                    for k_ in range(1, len(sp_)):   # (GN_QSILU pieces: index >= the piece's first takes its base)
+                        b0_ += sp_[k_ - 1][0]
+                        e(f"  {n}lp{h}{k_} = vlt.s16x32.el.low32 {n}lc{h}, {kbits(SL_LO + 16 * b0_)}")
+                        e(f"  {n}lt{h}s{k_} = vsel.16.mask64 {kmemo[('q', k_, kch[0])]}, {tb_}, {n}lp{h}{k_}")
+                        tb_ = f"{n}lt{h}s{k_}"
+                    e(f"  {n}lb{h} = vadd.16 {n}lc{h}, {tb_}")
                     e(f"  {n}lu{h} = vups.2x.x-to-c.unsigned {n}lb{h}, {p}sh2")
                     fill, tv = list(fill), []
 
@@ -5567,10 +5655,42 @@ SL_LO, SL_HI = 0x3B80, 0x4300
 SL_K = (0x7FFF, 0x3B80, 0x4300, 0x0000, 0x8000, 0x3F80)   # bf16x32 constants after the table (epilogue loads)
 
 
+SL_NB = (SL_HI - SL_LO + 1 + 15) // 16   # the table's 16-entry blocks
+
+
+def silu_pieces():
+    """GN_QSILU="blocks@address,...": the table in pieces of whole blocks (their sum SL_NB), each its own symbol
+    (silu_sym) pinned at its byte address (gen_npu_q.loom_env), no pad after one (a gather's over-read past a piece
+    lands in memory that only needs to exist: its bytes are dropped); the SL_K vectors in @silu_k.
+    Default: one piece with the pad at 45568. [(blocks, address)]"""
+    v = os.environ.get("GN_QSILU")
+    if not v:
+        return list(QG_SILU) if qgmap_on() else [(SL_NB, 45568)]
+    ps = [(int(a), int(b)) for a, b in (x.split("@") for x in v.split(","))]
+    assert sum(n for n, _ in ps) == SL_NB, (ps, SL_NB)
+    return ps
+
+
+def silu_kvals():
+    """The bf16x32 constant vectors at the table's tail: SL_K, then (pieces) each later piece's first index."""
+    sp, b0, ks = silu_pieces(), 0, list(SL_K)
+    for n, _ in sp[:-1]:
+        b0 += n
+        ks.append(SL_LO + 16 * b0)
+    return tuple(ks)
+
+
+def silu_sym(k):
+    return "silu_t" if k == 0 else f"silu_t{k}"
+
+
 def silu_kofs():
-    """The byte offset of SL_K's first vector from @silu_t."""
-    n = ((SL_HI - SL_LO + 1 + 15) // 16) * 32 + 32
-    return 2 * (n + (-n % 32))
+    """The byte offset of SL_K's first vector from the last piece's symbol."""
+    sp = silu_pieces()
+    if len(sp) == 1:
+        n = SL_NB * 32 + 32
+        return 2 * (n + (-n % 32))
+    return 0   # (pieces: @silu_k)
 
 
 def silu_rodata():
@@ -5583,9 +5703,19 @@ def silu_rodata():
     blk = np.zeros((len(tb) + 15) // 16 * 16, np.uint16)
     blk[:len(tb)] = tb
     blk = blk.reshape(-1, 16)
-    pay = np.concatenate([np.stack([blk, blk], 1).reshape(-1), np.zeros(32, np.uint16)])
-    pay = np.concatenate([pay, np.zeros(-len(pay) % 32, np.uint16)] + [np.full(32, k, np.uint16) for k in SL_K])
-    return f'global.rodata.def @silu_t = align(64) bytes("{pay.view(np.uint8).tobytes().hex()}")'
+    sp = silu_pieces()
+    kv = [np.full(32, k, np.uint16) for k in silu_kvals()]
+    if len(sp) == 1:
+        pay = np.concatenate([np.stack([blk, blk], 1).reshape(-1), np.zeros(32, np.uint16)])
+        pay = np.concatenate([pay, np.zeros(-len(pay) % 32, np.uint16)] + kv)
+        return f'global.rodata.def @silu_t = align(64) bytes("{pay.view(np.uint8).tobytes().hex()}")'
+    out, b0 = [], 0
+    for k, (nb, _) in enumerate(sp):
+        pay = np.stack([blk[b0:b0 + nb], blk[b0:b0 + nb]], 1).reshape(-1)
+        out.append(f'global.rodata.def @{silu_sym(k)} = align(64) bytes("{pay.view(np.uint8).tobytes().hex()}")')
+        b0 += nb
+    out.append(f'global.rodata.def @silu_k = align(64) bytes("{np.concatenate(kv).view(np.uint8).tobytes().hex()}")')
+    return "\n".join(out)
 
 
 def gen(cfg):
