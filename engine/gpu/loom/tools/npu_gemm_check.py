@@ -150,23 +150,31 @@ def main():
                 else:
                     out_ += stamp_
         text_ = "\n".join(out_) + "\n"
-    if os.environ.get("GN_QTL3") == "1" and N.QFCYC and not os.environ.get("GN_QFW"):   # (diag, P1K fill rows)
+    if os.environ.get("GN_QTL3") in ("1", "2") and N.QFCYC and not os.environ.get("GN_QFW"):   # (diag, P1K fill rows)
         out_ = []   # absolute cycles (low word) after the firing's first / last own-slab egress acquire (%fzAd2) and
-        for ln_ in text_.splitlines():   # at the firing's start -> %qfc 32 / 40 / 36 = words 5 / 7 / 6
+        r2_ = os.environ.get("GN_QTL3") == "2"   # at the firing's start -> %qfc 32 / 40 / 36 = words 5 / 7 / 6
+        for ln_ in text_.splitlines():   # (GN_QTL3=2: word 7 = after the firing's first raw record acquire instead)
             out_.append(ln_)
+            if r2_ and ln_.startswith("  acq %fzAm1, "):
+                out_ += ["  %tq4w = mov.cycles", "  %tq4l = slice %tq4w[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                         "  %tq4a = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
+                         "  %tq4k = mova.i32 32", "  %tq4m = mov.modifier %tq4k",
+                         "  %tq4b = padda.modifier %tq4a, %tq4m", "  %tq4o = lda %tq4b, 8", "  %tq4e = eqz %tq4o",
+                         "  %tq4v = mul %tq4e, %tq4l", "  %tq4n = add.rr %tq4o, %tq4v", "  st %tq4n, %tq4b, 8"]
+                continue
             if ln_.startswith("  %qfc = storage "):
                 out_ += ["  %tq3c = mov.cycles", "  %tq3cl = slice %tq3c[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
                          "  %tq3a0 = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
                          "  %tq3k0 = mova.i32 32", "  %tq3m0 = mov.modifier %tq3k0",
                          "  %tq3b0 = padda.modifier %tq3a0, %tq3m0", "  %tq3z0 = mova.i32 0",
-                         "  st %tq3z0, %tq3b0, 0", "  st %tq3cl, %tq3b0, 4"]
+                         "  st %tq3z0, %tq3b0, 0", "  st %tq3cl, %tq3b0, 4"] + (["  st %tq3z0, %tq3b0, 8"] if r2_ else [])
             elif ln_.startswith("  acq %fzAd2, "):
                 out_ += ["  %tq3w = mov.cycles", "  %tq3l = slice %tq3w[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
                          "  %tq3a = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
                          "  %tq3k = mova.i32 32", "  %tq3m = mov.modifier %tq3k",
                          "  %tq3b = padda.modifier %tq3a, %tq3m", "  %tq3o = lda %tq3b, 0", "  %tq3e = eqz %tq3o",
                          "  %tq3v = mul %tq3e, %tq3l", "  %tq3n = add.rr %tq3o, %tq3v", "  st %tq3n, %tq3b, 0",
-                         "  st %tq3l, %tq3b, 8"]
+                         ] + ([] if r2_ else ["  st %tq3l, %tq3b, 8"])
         text_ = "\n".join(out_) + "\n"
     if os.environ.get("GN_QCW") == "1" and N.QCYC:   # (diag, Q' leaves) per block: cycles in the entry C acquire, the
         out_, n_ = [], 0                             # lazy C acquires and the W acquires (private words 20 / 24 / 28,
@@ -350,7 +358,7 @@ def main():
                 st_ = np.diff(cyc.reshape(cols, nb, N.MP)[0, r_::R_, -1])
                 print(f"  row {r_} (core 0): median {float(np.median(st_)):.0f} min {st_.min()} max {st_.max()}")
         if os.environ.get("GN_QFCYC") == "1" and fuse == 2:   # (the filler's fill words 1-3 of its blocks' segments)
-            w4f = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[0, :, :, :8].astype(np.int64)
+            w4f = np.fromfile(co, np.uint32).reshape(cols, nb, N.MP, seg // 4)[int(os.environ.get("GN_QCOL", "0")), :, :, :8].astype(np.int64)
             fb_ = ((1 if N.qcstage_on() else 2) if mrel else 1) if N.qp1k_on() and os.environ.get("NPU_QCREL") == "2" else 0
             v_ = w4f[fb_, -1]
             print(f"  fill (core 0 column, filling row's block {fb_}): egress {v_[1]} whole fill {v_[2]} raw waits {v_[3]}")
@@ -367,7 +375,7 @@ def main():
                         print(f"  fill row {r_}: gate check {u_[5]} copies {u_[6]}")
                     if os.environ.get("GN_QFW") in ("3", "4", "5", "6"):   # (diag) the helper-record branch's cycles
                         print(f"  fill row {r_}: helper-record branch {u_[5]}")
-                    if os.environ.get("GN_QTL3") == "1":   # (diag) the last firing's own-slab acquires from its start
+                    if os.environ.get("GN_QTL3") in ("1", "2"):   # (diag) the last firing's own-slab acquires from its start
                         print(f"  fill row {r_} egress acquires: first done +{(u_[5] - u_[6]) % 2**32} "
                               f"last done +{(u_[7] - u_[6]) % 2**32}")
                     if os.environ.get("GN_QFW") == "1":   # (diag) the egress slot waits (own, copy), helper waits
@@ -390,6 +398,11 @@ def main():
             b4_ = w2_.reshape(cols, nb, N.MP, 2)[0, :4, -1]   # (column 0, blocks 0-3: their last segment)
             print("  column 0 blocks 0-3 (start, end) from the first start:",
                   [(int(s - st0_.min()), int(s + e - st0_.min())) for e, s in b4_])
+        if os.environ.get("GN_QSTAMPS") == "1":   # (diag) every M block's stamp, core 0
+            print("  block stamps (core 0):", [int(x) for x in last])
+            a_ = cyc.reshape(cols, nb, N.MP)[:, :, -1]
+            print("  last block done per column:", [int(x) for x in a_.max(axis=1)], "first block per column:",
+                  [int(x) for x in a_.min(axis=1)])
         step = np.diff(last)
         mma = passes * N.MP * N.NP * sum(ks) * 4   # MMAs a core issues per M block
         med = float(np.median(step))

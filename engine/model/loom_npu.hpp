@@ -528,8 +528,12 @@ class LoomNpu {
     // (diag) NPU_PROF_AT=<i>: the counters start before the job's i-th piece (0 the gate, 1 the lead push, ...; with
     // the split lead, 0 its part before the gate, 1 the gate, ...); default: at the gate, as in the engine
     const std::size_t prof_at = std::getenv("NPU_PROF_AT") ? std::atoi(std::getenv("NPU_PROF_AT")) : pre ? 1 : 0;
+    // (diag) NPU_PROF_READ_AT=<i>: the counters read before the job's i-th piece (seq.size() - 1: before done)
+    // instead of after the last
+    const std::size_t read_at = std::getenv("NPU_PROF_READ_AT") ? std::atoi(std::getenv("NPU_PROF_READ_AT")) : seq.size();
     for (std::size_t s = 0; s < seq.size(); ++s) {
       const std::vector<std::uint8_t>* b = seq[s];
+      if (s == read_at && prof_) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
       std::uint32_t n = 0, size = 0;
       std::memcpy(&n, b->data() + 8, 4), std::memcpy(&size, b->data() + 12, 4);
       if (size != b->size()) throw LoomError("npu: unexpected command header");
@@ -544,7 +548,7 @@ class LoomNpu {
       bytes.insert(bytes.end(), b->begin() + 16, b->end());
       ops += n;
     }
-    if (prof_) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
+    if (prof_ && read_at >= seq.size()) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
     // (diag) NPU_RUN_FLAG_DELAY_MS=<ms>: the flag binding's ready word held at 0 and stored that long after the submit
@@ -573,6 +577,7 @@ class LoomNpu {
     };
     const char* snap_c = nullptr;
     std::size_t snap_n = 0;
+    const auto snap_t0 = std::chrono::steady_clock::now();   // (DONESNAP) the done flip and the wait's return from here
     if (std::getenv("NPU_RUN_DONESNAP") && views.size() > 5 && views[5].shared->host && views[2].shared->host) {
       const std::size_t last = per.empty() ? 0 : std::size_t(calls - 1);
       auto* dw = reinterpret_cast<volatile std::uint32_t*>(static_cast<char*>(views[5].shared->host) + views[5].offset +
@@ -584,8 +589,7 @@ class LoomNpu {
       _mm_clflush(const_cast<std::uint32_t*>(dw));
       _mm_mfence();
       const std::uint32_t init = *dw;
-      snap = std::thread([dw, init, c = snap_c, n = snap_n, count_unwritten] {
-        const auto t0 = std::chrono::steady_clock::now();
+      snap = std::thread([dw, init, c = snap_c, n = snap_n, count_unwritten, t0 = snap_t0] {
         std::uint32_t v = init;
         while ((v = *dw) == init) {
           _mm_clflush(const_cast<std::uint32_t*>(dw));
@@ -606,6 +610,8 @@ class LoomNpu {
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(Place(bytes)), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(job)");
     if (late.joinable()) late.join();
     if (snap.joinable()) {
+      std::fprintf(stderr, "npu: DONESNAP the job's wait returned at %.1f us\n",
+                   std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - snap_t0).count());
       snap.join();
       std::fprintf(stderr, "npu: DONESNAP after the command: %zu half-words unwritten\n", count_unwritten(snap_c, snap_n));
     }

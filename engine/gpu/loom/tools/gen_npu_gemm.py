@@ -5238,7 +5238,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e("  %qfaL = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
                 dqc_ = os.environ.get("DQ_CYC") == "1"   # (diag: word 1 the decoder's cycles, word 4 its hot loop's)
                 for w_, o_ in ((1, 16 if dqc_ else 4), (2, 12), (3, 24)) + (((4, 28),) if dqc_ else ()) + (
-                        ((5, 32), (6, 36), (7, 40)) if os.environ.get("GN_QFW") == "1" or os.environ.get("GN_QTL3") == "1" else
+                        ((5, 32), (6, 36), (7, 40)) if os.environ.get("GN_QFW") == "1" or os.environ.get("GN_QTL3") in ("1", "2") else
                         ((5, 44), (6, 48)) if os.environ.get("GN_QFW") == "2" else
                         ((5, 56),) if os.environ.get("GN_QFW") in ("3", "4", "5", "6") else ()):
                     if o_ >= 32 and w_ == 5:   # (offsets past the lda immediate: a pointer 32 on)
