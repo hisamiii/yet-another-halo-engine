@@ -126,8 +126,10 @@ def main():
     qsw = os.environ.get("NPU_QSW") == "1"
     assert fuse in (0, 2), "NPU_FUSE: 0 or 2"
     # NPU_GATE=1 (diag): the gated image (the engine's bindings) with its flag record already open for one call
+    # NPU_GORD: the decoder's k-block order (gen_npu_gemm Config.gord; "GF": Q4_K pushed in P4)
     cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw, fmt=fmt, rawdma=int(fuse == 2),
-                   gate=N.GATE_SUPPLY if os.environ.get("NPU_GATE") else 0)
+                   gate=N.GATE_SUPPLY if os.environ.get("NPU_GATE") else 0,
+                   gord=os.environ.get("NPU_GORD", "P4"))
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
     wq = None
@@ -579,6 +581,21 @@ def main():
                             rb = rc_.reshape(nb, tb, -1)
                             print("  block map:", [int(np.argmin([np.nanmean(np.abs(pb[b] - rb[b2])) for b2 in range(nb)]))
                                                    for b in range(nb)])
+                        if os.environ.get("NPU_WEFF") and wq is not None:   # (diag) a bad feature's effective weights
+                            # (least squares over the tokens) against the true ones, per 32-K sub-block: the fit
+                            # w_eff = s w + t (s, t) and the rms misfit
+                            A_ = value(a[:, k0:k1]).astype(np.float64)
+                            for f_ in np.unique(bad[:, 1])[:1]:
+                                fg_ = N.TN * c + f_
+                                we_ = np.linalg.lstsq(A_, pc_[:, f_].astype(np.float64), rcond=None)[0]
+                                wt_ = wq[fg_, k0:k1].astype(np.float64)
+                                np.save(os.path.join(work, f"weff_{fg_}.npy"), np.stack([we_, wt_]))
+                                out_ = []
+                                for j in range((k1 - k0) // 32):
+                                    x_, y_ = wt_[32 * j:32 * j + 32], we_[32 * j:32 * j + 32]
+                                    st_ = np.polyfit(x_, y_, 1) if np.ptp(x_) > 0 else (0.0, 0.0)
+                                    out_.append((round(float(st_[0]), 2), round(float(st_[1] / (np.std(x_) + 1e-12)), 2)))
+                                print(f"  feature {fg_} per sub-block (scale, offset / std):", out_)
                         if os.environ.get("NPU_SRCMAP"):   # (diag) which reference column's values this column holds
                             fin_ = np.isfinite(pc_)
                             near = [float(np.mean(np.isclose(pc_[fin_], ref[:, N.TN * c2:N.TN * (c2 + 1)][fin_], rtol=1e-2)))

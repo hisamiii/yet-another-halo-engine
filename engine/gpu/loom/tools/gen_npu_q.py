@@ -119,12 +119,32 @@ def loom_env(cfg):
     no-alias facts (generator-asserted: in one leaf body no C store writes a block a later C load reads) and the ring
     pins (GN_QBANK; GN_QPINS: the whole list; fuse 2: qf_ring_at)."""
     N.QF["qsw"] = cfg.qsw and qswdiag() != "intake"   # (the C pins: qpins)
+    grid_flags(cfg)
     env = dict(N.loom_env(cfg))
     env.update(LOOM_EXP_NOALIAS_ACC="2", LOOM_EXP_NOWAR_ACC="1")
     if N.QF["qsw"]:   # the silu table between the C rows' f32 areas and W slot 1 (the rings are forced, and Loom's
         # own place, offset 0, is under W slot 0; qf_ring_at moves the K-half egress ring off 49152)
         env["LOOM_EXP_RODATA_AT"] = "silu_t@45568"
         env["LOOM_EXP_EGRESS_MERGE_STRIDED"] = "1"
+    if p1k4(cfg):   # (NP 4) the scratch pad's guard
+        env["LOOM_EXP_RODATA_AT"] = ",".join(([env["LOOM_EXP_RODATA_AT"]] if "LOOM_EXP_RODATA_AT" in env else [])
+                                             + [f"qfgd@{N.P1K4_GUARD}"])
+    if N.QF["grid"]:   # the decoder's tables (gen_npu_gemm P1K_GRID_*: 49152 .. 53760, the others in spare runs),
+        # largest first
+        at, pins, used = N.P1K_GRID_AT, [], set()
+        ms = [re.match(r"global.rodata.def @(\w+) = align\((\d+)\).*bytes\(\"([0-9a-fA-F]*)\"\)", ln)
+              for ln in N.decoder(cfg.fmt, cfg.gord).inline_rodata(N.dec_tag(cfg))]
+        for m in sorted(ms, key=lambda m: -len(m[3])):
+            a, n = -(-at // int(m[2])) * int(m[2]), len(m[3]) // 2
+            if a + n > N.P1K_GRID_END:   # (a spare run, once each)
+                fit = [s for s, t in N.P1K_GRID_SPARE if s % int(m[2]) == 0 and s + n <= t and s not in used]
+                assert pins and fit, (cfg.fmt, m[1], n)
+                a = fit[0]
+                used.add(a)
+            else:
+                at = a + n
+            pins.append(f"{m[1]}@{a}")
+        env["LOOM_EXP_RODATA_AT"] = ",".join(([env["LOOM_EXP_RODATA_AT"]] if "LOOM_EXP_RODATA_AT" in env else []) + pins)
     if N.pshare():   # (array_program counted the two channels)
         env["LOOM_EXP_PACKET_SHARE"] = N.QF["pshare"]
     ks = cfg.ks[0]
@@ -355,6 +375,10 @@ def array_program(L, cfg):
         # are whole W records to them (qf_skip_raw)
         r4 = N.qfraw4_on()   # (GN_QFRAW4: a record's rows hold the step's 4 super-blocks)
         nraw, rw = (U * NP, N.FUSE_SB * BLK // 4) if r4 else (U * N.FUSE_SB * NP, BLK // 4)
+        odd = N.qf_odd2(q)   # (a super-block of 2 mod 4 bytes: read in pairs, 2 bytes of slop before the odd ones)
+        if odd:
+            assert not r4 and U * N.FUSE_SB % 2 == 0, (cfg.fmt, U)
+            rw = (BLK + 2 + 3) // 4
         while R > 1 and nraw * 64 * rw % N.QF["wslot"]:
             rw += 1
         if qdec():   # (the split's record: a step's NP slabs side by side, 144 B each: the decoder's 576 B row)
@@ -394,9 +418,12 @@ def array_program(L, cfg):
             rs_ = rw if os.environ.get("GN_QRAWCONTIG") == "1" else RS
             if cfg.qsw and qswdiag() != "convert":   # (FFN gate / up) per step: the column's 2 gate slabs, then the
                 # same up rows dgu bytes on
-                assert NP == 4 and not r4 and cfg.dgu % 4 == 0
+                assert NP == 4 and not r4 and cfg.dgu % 4 == 0 and not odd
                 e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x2x2x16x{rw}xi32, "
                   f"#encoding.layout.strided<strides=[{BLK // 4}, {cfg.dgu // 4}, {16 * rs_}, {rs_}, 1]>>>")
+            elif odd:   # (pairs of super-blocks: the second's read starts 2 bytes before it)
+                e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB // 2}x2x{NP}x16x{rw}xi32, "
+                  f"#encoding.layout.strided<strides=[{BLK // 2}, {BLK // 4}, {16 * rs_}, {rs_}, 1]>>>")
             else:
                 e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U if r4 else U * N.FUSE_SB}x{NP}x16x{rw}xi32, "
                   f"#encoding.layout.strided<strides=[{(N.FUSE_SB if r4 else 1) * BLK // 4}, {16 * rs_}, {rs_}, 1]>>>")
@@ -588,8 +615,20 @@ def qswdiag():
     return os.environ.get("GN_QSWDIAG", "")
 
 
+def p1k4(cfg):
+    """The P1K direct fill at NP 4 (gen_npu_gemm.p1k4_on, before its QF cfg is set)."""
+    return cfg.fuse == 2 and N.qp1k_on() and N.NP == 4 and os.environ.get("GN_QFDIRECT", "1") == "1"
+
+
+def grid_flags(cfg):
+    """gen_npu_gemm's Q' decoder flags: the byte grid (QF qg8) and, for a grid format at fuse 2, the P1K grid map."""
+    N.QF["qg8"] = True
+    N.QF["grid"] = cfg.fuse == 2 and N.qp1k_on() and N.decoder(cfg.fmt, cfg.gord).GRID
+
+
 def gen(cfg):
     assert len(cfg.ks) == 1 and cfg.fuse in (0, 2) and cfg.passes >= 2 and 1 <= cfg.cols <= 8
+    grid_flags(cfg)
     L = []
     if cfg.fuse == 2:   # the decode side: 1024-K passes over the call's K, one 128-k-block slice
         K = 8 * cfg.passes * cfg.ks[0]
@@ -608,6 +647,10 @@ def gen(cfg):
     array_program(L, cfg)
     if N.QF["qsw"]:
         L.append(N.silu_rodata())
+    if cfg.fuse == 2:   # the inlined decoder's tables (grid formats)
+        L.extend(N.decoder(cfg.fmt, cfg.gord, cfg.swiglu).inline_rodata(N.dec_tag(cfg)))
+    if p1k4(cfg):   # (NP 4) the scratch pad's guard (gen_npu_gemm P1K4_GUARD)
+        L.append(f'global.rodata.def @qfgd = align(64) bytes("{"00" * 64}")')
     i0 = len(L)
     for name, gate in leaves(cfg):   # (tailr: the GEMM leaf without the fill, skipping the raw rows)
         if name.startswith("qdec"):

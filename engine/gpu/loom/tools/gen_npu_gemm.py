@@ -260,10 +260,15 @@ def qf_ring_at(pins):
     if qfdirect_on():   # (P1K fill, direct) the 4-record egress ring over C slots 1-3
         m = QF_P1KD
         assert fb == m["rec"]
-        h4 = (f",{fb}@" + ":".join(str(QF4R_HAT + i * fb) for i in range(qf4r_hslots()))) if qf4r_on() else ""
+        hat = P1K_GRID_RING if QF.get("grid") else QF4R_HAT
+        h4 = (f",{fb}@" + ":".join(str(hat + i * fb) for i in range(qf4r_hslots()))) if qf4r_on() else ""
         eb = m["eb"]
         # (FFN gate / up: the K-half ring over C slots 1-3 too, idle in the fill; the silu table takes 45568 .. 53760)
         egr = 40448 if QF.get("qsw") and "GN_QFEGR" not in os.environ else m["egr"]
+        if QF.get("grid"):   # (grid formats at NP 4: P1K_GRID_*)
+            assert NP == 4 and not QF.get("qsw") and egr == 40448, "Q' grid formats: NP 4 site images"
+            egr = P1K_GRID_RING
+            assert egr + m["slots"] * fb <= P1K_GRID_AT and hat + qf4r_hslots() * fb <= P1K_GRID_AT
         assert not QF.get("qsw") or egr + m["slots"] * fb <= 45568
         assert not (QF.get("qsw") and qf4r_on()) or QF4R_HAT + qf4r_hslots() * fb <= 45568
         return pins + f",{eb}@" + ":".join(str(egr + i * eb) for i in range(m["slots"] * fb // eb)) + h4
@@ -294,6 +299,24 @@ def qpins(default=None):
         return v
     cs = ":".join(str(37376 + q3_strides()[0] * r) for r in range(4))
     return f"{SW_REC if QF.get('qsw') else 512 * NP}@{cs},{2304 * NP}@0:53760,4608@20480:32768,64@30720"
+
+
+# (P1K at NP 4, grid formats) the decoder's tables from 49152 (4 KB pages: the gathers' address high bytes) to W slot 1
+# (53760); the egress and helper rings move down from 40448 to 39424 (C slot 1: slots 1-3 are idle in the fill) to
+# make room. A table symbol past 53760 goes to the first spare run it fits aligned: 63488 .. 65536 (after the 320 B
+# storage at 62976) or 28672 .. 30656 (after the scratch pad, before its guard: P1K4_*).
+# NP 5 has no room: its 25088 .. 29312 holds Loom's stack and the decoder's scratch pad, the rest of the map is full.
+P1K_GRID_AT, P1K_GRID_END, P1K_GRID_RING = 49152, 53760, 39424
+# (P1K at NP 4, every format) the decoder's scratch pad at 25088 (A slot 0's end), a 64 B rodata guard (@qfgd) at
+# 30656: its pin grows bank 1's cursor past the pad, so Loom's stack (placed at the cursor) goes after it; the fill
+# takes the pad's address from the guard's
+P1K4_SP, P1K4_GUARD = 25088, 30656
+P1K_GRID_SPARE = ((63488, 65536), (28672, P1K4_GUARD))
+
+
+def p1k4_on():
+    """The P1K direct fill at NP 4 (gen_npu_q pins @qfgd): P1K4_SP / P1K4_GUARD."""
+    return qfdirect_on() and NP == 4
 
 
 def q3_strides():
@@ -530,14 +553,20 @@ GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
 
 def decoder(fmt, gord="P4", g8=True):
     """gen_npu_dec for fmt (its constants follow DQ_FMT, DQ_GORD and DQ_G8 at import). g8: IQ3_S from the byte grid,
-    which the gate / up images need (the 8 KB bf16 grid does not fit beside the FFN block's rings); the other images
-    keep the bf16 grid's modulo-scheduled loop (faster)."""
+    which the gate / up images and every Q' image need (the 8 KB bf16 grid does not fit beside their rings); the other
+    images keep the bf16 grid's modulo-scheduled loop (faster)."""
     import gen_npu_dec
+    g8 = g8 or QF.get("qg8", False)
     g = "1" if g8 else "0"
-    if gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord or os.environ.get("DQ_G8", "1") != g:
+    gs = "1" if QF.get("grid") else "0"   # (the Q' grid map: IQ2_XS / IQ2_S tables in two symbols)
+    q1 = "1" if QF.get("qg8") else "0"    # (Q' images: one super-block a record row, gen_npu_dec Q1SB)
+    if (gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord or os.environ.get("DQ_G8", "1") != g
+            or os.environ.get("DQ_GSPLIT", "0") != gs or os.environ.get("DQ_Q1SB", "0") != q1):
         os.environ["DQ_FMT"] = fmt
         os.environ["DQ_GORD"] = gord
         os.environ["DQ_G8"] = g
+        os.environ["DQ_GSPLIT"] = gs
+        os.environ["DQ_Q1SB"] = q1
         gen_npu_dec = importlib.reload(gen_npu_dec)
     return gen_npu_dec
 
@@ -1266,6 +1295,14 @@ FUSE_FMTS = ("IQ4_XS", "Q3_K", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "IQ2_S",
 # cfg.gord's k-block order; program and data memory decide which fit an image: gen_npu_dec sizes)
 
 
+def qf_odd2(cfg):
+    """(Q' P1K direct fill, one super-block a raw record) cfg.fmt's super-blocks are 2 mod 4 bytes: the raw stream reads
+    them in pairs (gen_npu_q), each odd one from the word before it, and the fill starts its decode 2 bytes on."""
+    b = fuse_blk(cfg)
+    assert b % 2 == 0, b
+    return b % 4 == 2 and not qfraw4_on()
+
+
 def fuse_blk(cfg):
     """fuse 2: bytes per super-block of cfg.fmt."""
     assert cfg.fmt in FUSE_FMTS, cfg.fmt
@@ -1570,9 +1607,10 @@ def fuse_raw_ring(cfg, cov):
 def fuse_scratch(cfg, cov):
     """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
     D = decoder(cfg.fmt, cfg.gord, cfg.swiglu)
-    if qfdirect_on():   # (P1K fill, direct: QF_P1KD)
-        m = QF_P1KD
-        assert 16 * D.RECROW <= QF["wslot"] and (m["sp"] + D.SCR_B <= 20480 or 26112 <= m["sp"] <= 30720 - D.SCR_B or 49664 <= m["sp"] <= 53760 - D.SCR_B or m["sp"] >= m["sp2"] + D.SCR2_B) and m["sp2"] + D.SCR2_B <= 65280 and m["sp"] + D.SCR_B <= 65280
+    if qfdirect_on():   # (P1K fill, direct: QF_P1KD; NP 4: P1K4_SP)
+        m = dict(QF_P1KD, sp=P1K4_SP) if p1k4_on() else QF_P1KD
+        assert not p1k4_on() or P1K4_SP + D.SCR_B <= P1K_GRID_SPARE[1][0], D.SCR_B
+        assert 16 * D.RECROW <= QF["wslot"] and (m["sp"] + D.SCR_B <= 20480 or 25088 <= m["sp"] <= 30720 - D.SCR_B or 49664 <= m["sp"] <= 53760 - D.SCR_B or m["sp"] >= m["sp2"] + D.SCR2_B) and m["sp2"] + D.SCR2_B <= 65280 and m["sp"] + D.SCR_B <= 65280
         assert m["raw"] * 16 * D.RECROW <= 20480   # (the intake slots: W slot 0, its tail, the odd C area)
         return m["sp"], 0, m["sp2"], None
     if QF["cfg"] is not None and qp1k_on():   # (P1K fill: QF_P1K)
@@ -2132,8 +2170,14 @@ def qf_decode(L, cfg, dp):
         e("  %fzwb = add.rr %fzw0l, %fzk2047")
         e("  %fzkm2048 = mov.i32 -2048")
         e("  %fzsb = and %fzwb, %fzkm2048")
-        e(f"  %fzo_sp = mov.i32 {SP}")
-        e("  %fza_sp = add.rr %fzsb, %fzo_sp")
+        if p1k4_on():   # (the pad from the guard's address: the guard stays referenced, so pinned)
+            e("  %fzgp = mov.local-address @qfgd")
+            e("  %fzgs = mov.address-to-scalar %fzgp")
+            e(f"  %fzo_sp = mov.i32 {SP - P1K4_GUARD}")
+            e("  %fza_sp = add.rr %fzgs, %fzo_sp")
+        else:
+            e(f"  %fzo_sp = mov.i32 {SP}")
+            e("  %fza_sp = add.rr %fzsb, %fzo_sp")
         e(f"  %fzo_in = mov.i32 {IN}")
     if one:   # (slab s: 4 s raw words a row on)
         e(f"  %fzsk = mov.i32 {4 * QF['raww']}")
@@ -2161,7 +2205,17 @@ def qf_decode(L, cfg, dp):
                 e("  %fza_in0j = add.rr %fza_in0d, %fzjo")
                 e("  %fza_in = add.rr %fza_in0j, %fzrod")
             else:
-                e("  %fza_in = add.rr %fza_in0d, %fzrod")
+                if qf_odd2(QF["cfg"]):   # (odd steps start 2 bytes into the record: the step's parity is the steps
+                    # left's, word 12 of %fzs, for an even step count)
+                    e("  %fza_inr = add.rr %fza_in0d, %fzrod")
+                    e("  %fzoU = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+                    e("  %fzou = lda %fzoU, 12")
+                    e("  %fzok1 = mova.i32 1")
+                    e("  %fzop1 = and %fzou, %fzok1")
+                    e("  %fzrp2 = add.rr %fzop1, %fzop1")
+                    e("  %fza_in = add.rr %fza_inr, %fzrp2")
+                else:
+                    e("  %fza_in = add.rr %fza_in0d, %fzrod")
                 e("  %fzrcn = add %fzrcd, 1")
                 e(f"  st %fzrcn, %fzpTd, {QF_OUT}")
         else:

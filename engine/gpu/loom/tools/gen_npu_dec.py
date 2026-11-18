@@ -88,6 +88,7 @@ XS2 = FMT == "IQ2_XS"
 S2 = FMT == "IQ2_S"
 XSL = XS2 or S2                 # IQ2_XS's scale path and hot loop, the two-level grid
 SCOFF = 74 if S2 else 66        # XSL: the scale bytes
+GSPLIT = XSL and os.environ.get("DQ_GSPLIT") == "1"   # (Q' grid map) page 1 of the tables its own symbol, @gz
 S2SG, S2HM = 4096, 4096 + 256 + 21 * 64   # IQ2_S rodata: level-1 (page 0), signs, pieces (16 (16 + id)), qh masks
 PIDOFF = 16 if S2 else 0        # XSL: a piece's slot on page 1 (IQ2_S: after its signs)
 # Q3_K: no gathers. Per record (128 values: qs bits of half n, hmask bit 4 n + j) both halves' rows of [hmask 32 B |
@@ -121,7 +122,8 @@ GORD = os.environ.get("DQ_GORD", "P4")       # Q3_K pushes any k-block order: "P
 # BFP: rows pre-decoded on the host (emit_prefill_pp bfp_pair_rows, bfp_site_rows): a unit's record is already the
 # decoder's output ([kb 128 in KPERM order][h 2] bfp16 fragments, its 16 rows of 1152 bytes), the leaf only copies it
 BFP = FMT == "BFP"
-RECROW = 1152 if BFP else 704 if Q5 else 576     # record row bytes, the same for every format but Q5_K (Q4_K's 4 x 144): switches
+Q1SB = os.environ.get("DQ_Q1SB") == "1"   # (Q' images) one super-block a record row: Q5_K's rows fit 576 B too
+RECROW = 1152 if BFP else 704 if Q5 and not Q1SB else 576     # record row bytes, the same for every format but Q5_K (Q4_K's 4 x 144): switches
                                 # between formats then re-program only the decoder tiles (the staging buffers stay
                                 # identical)
 ROWB = RECROW if os.environ.get("DQ_FIXREC", "1") == "1" else 4 * BLK   # a row's 4 super-blocks (+ ignored tail)
@@ -197,10 +199,13 @@ def grid_rodata(name):
         pc = np.zeros((21, 2, 4, 4), np.uint16)                          # piece p at 16 (PIDOFF + p): both halves
         for p in range(81):
             pc[p >> 2, :, p & 3] = bf16_bits_np(np.array([8, 25, 43])[[(p // 3 ** i) % 3 for i in range(4)]] / 8)
-        if not S2:
-            return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(l1)}{hexs(st)}{hexs(pc)}")']
         hm = np.array([1 << (2 * (i // 16) + i % 2) for i in range(64)], np.uint8)   # IQ3_S's qh bit masks
-        return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(l1)}{hexs(st)}{hexs(pc)}{hexs(hm)}")']
+        p0, p1 = (hexs(l1), hexs(st) + hexs(pc) + hexs(hm)) if S2 else (hexs(l1) + hexs(st), hexs(pc))
+        assert len(p0) == 2 * 4096, len(p0)
+        if GSPLIT:   # (page 1 anywhere 4 KB-aligned)
+            return [f'global.rodata.def @gt_{name} = align(4096) bytes("{p0}")',
+                    f'global.rodata.def @gz_{name} = align(4096) bytes("{p1}")']
+        return [f'global.rodata.def @gt_{name} = align(4096) bytes("{p0}{p1}")']
     if XXS:
         # IQ3_XXS: grid / 4 (T = d (2 s + 1)), 256 entries; signs by the 7-bit field f: ksigns(f) = f | parity(f) << 7
         gt = np.zeros((64, 2, 4, 4), np.uint16)
@@ -439,6 +444,8 @@ def leaf(name="dec"):
 
     if GRID:
         # rodata tables: their 4 KB pages as address high bytes (address = page << 12 | 16 index via vups << 4)
+        if GSPLIT:   # (page 1's symbol referenced first: Loom's leaf and worker rodata orders then agree)
+            e(f"%gzp = mov.local-address @gz_{name}")
         e(f"%gtp = mov.local-address @gt_{name}")
         e(f"%gta = mov.address-to-scalar %gtp")
         e(f"%gtc = lshl %gta, {k(-12)}")
@@ -457,13 +464,16 @@ def leaf(name="dec"):
             e(f"%gq1 = vbcst.32 {k(1)}")
             e(f"%gqp = vshuffle %gq0, %gq1, {k(14)}")
             e("%gmk = vlt.u32x16.el.low32 %gqp, %gq1")
+        elif GSPLIT:   # IQ2_XS, IQ2_S: the pieces on page 1, its own symbol
+            e("%gpa = mov.address-to-scalar %gzp")
+            e(f"%stc = lshl %gpa, {k(-12)}")
         else:      # IQ2_XS, IQ2_S: the pieces on the page after level-1's (grid_rodata)
             e(f"%stc = add.rr %gtc, {k(1)}")
         if XSL:    # the sign table
-            e(f"%gsa = add.rr %gta, {k(S2SG if S2 else 2048)}")
+            e(f"%gsa = add.rr %gpa, {k(S2SG - 4096)}" if GSPLIT and S2 else f"%gsa = add.rr %gta, {k(S2SG if S2 else 2048)}")
             e(f"%sb4 = lshl %gsa, {k(-4)}")
         if S2:
-            e(f"%hma = add.rr %gta, {k(S2HM)}")                      # IQ2_S: the qh bit masks
+            e(f"%hma = add.rr %gpa, {k(S2HM - 4096)}" if GSPLIT else f"%hma = add.rr %gta, {k(S2HM)}")   # IQ2_S: the qh bit masks
         elif G8:
             e(f"%hma = add.rr %gsa, {k(128)}")                       # IQ3_S byte grid: the qh bit masks after the signs
         elif not (XXS or XS2):
