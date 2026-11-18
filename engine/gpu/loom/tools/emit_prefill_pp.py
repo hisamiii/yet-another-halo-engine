@@ -1269,9 +1269,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     fmts, dfmts = FUSE_FFN_FMTS, FUSE_FFN_DOWN_FMTS
     # H's k-block order: the down decoder's (P4 but Q4_K's; Q': P4, Q4_K's down decodes in P4 order, gord "GF")
     hord_of = lambda d: "Q4K" if d == "q4k" and not NPU_Q else "P4"
-    # (Q', YAH_NPU_FFNQ4K=1: the layers with Q4_K downs too; off: at FFNBLK 5120 the NPU is the critical path, p6d
+    # (Q', YAH_NPU_FFNQ4K=0: not the layers with Q4_K downs; at FFNBLK 5120 the NPU is the critical path, p6d
     # pp2048 2286.9 ms vs 2158.0 without them)
-    q4kdn = os.environ.get("YAH_NPU_FFNQ4K", "0") == "1"
+    q4kdn = os.environ.get("YAH_NPU_FFNQ4K", "1") == "1"
     rows = NPU_ROWS if NPU_QP1K else NPU_COLS * 64   # down rows per call (NP 4; Q': the P1K site image's)
     assert not NPU_Q or (NPU_QP1K and F == NPU_KCALL), "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and F = 5120"
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
