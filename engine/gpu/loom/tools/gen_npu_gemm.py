@@ -428,11 +428,11 @@ class Config:
     swiglu: bool = False  # one replay group: a column's first NP / 2 slabs are gate rows, the rest the up rows of the
                           # same features; the tail writes silu(gate) * up as bfp16ebs8 fragments (convert_swiglu) into
                           # H (hpass), the next GEMM's activations (ain = "h")
-    ain: str = ""         # "h": the activations are read from H (a swiglu call's output) instead of the encoder's stream;
-                          # "qh" (Q'): from the Q' gate / up calls' H (gen_npu_q: [pass][column][M block][slab][576 B])
+    ain: str = ""         # "h": the activations are read from H (a swiglu call's output) instead of the encoder's stream
     qsw: bool = False     # (Q', NP 4) FFN gate / up: column c's slabs 0, 1 are gate rows swcol c .., 2, 3 the same up
                           # rows dgu bytes on; the row convert writes h = silu(gate) up as bfp16 records (convert_swiglu,
-                          # hord "P4"), 576 B a 16-token row: H, down's activations (ain "qh")
+                          # hord "P4"), 576 B a 16-token row, into H = down's A ([M block][call, hpass of them][slab]
+                          # [column][576 B]; this call's at its C binding offset)
     dgu: int = 0          # swiglu fuse 2: bytes from a gate row to its up row (the raw stream per pass: [gate / up][32 rows])
     hpass: int = 0        # H as [M block][pass hpass][16-token slab][128 k-blocks] (the FFN block's swiglu output, down's
                           # input): swiglu (cols = hpass): column c writes pass c; ain "h": records [M block][pass, slab]

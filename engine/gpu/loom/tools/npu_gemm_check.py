@@ -65,8 +65,9 @@ def qsw_h(g, u):
     return (fp + t * fqb).astype(np.float32)
 
 
-def qsw_check(hraw, av, wq, D, cols, nb):
-    """NPU_QSW: H ([column][M block][slab][576 B]: k-blocks in P4 order, token halves, 8 x [E][8 m]) against the model:
+def qsw_check(hraw, av, wq, D, cols, nb, hpass):
+    """NPU_QSW: H ([M block][call of hpass, this one 0][slab][column][576 B]; 576 B: k-blocks in P4 order, token
+    halves, 8 x [E][8 m]; the other calls' records must stay 0) against the model:
     g, u = the exact sums (f64) to f32, qsw_h, the NPU's bfp16 conversion (gen_npu_dec Q.bfp_hw). Returns the exit code."""
     F = wq.shape[0] // 2
     s_ = av.astype(np.float64) @ wq.T.astype(np.float64)
@@ -75,21 +76,24 @@ def qsw_check(hraw, av, wq, D, cols, nb):
     perm = (0, 2, 1, 3)
     # [col][M block][slab][position p][token half][8 tokens][8 features]: k-block perm[p] of the column's 4
     hv = h.reshape(nb, N.MP, 2, 8, cols, 4, 8)[:, :, :, :, :, list(perm), :]
-    hv = hv.transpose(4, 0, 1, 5, 2, 3, 6)
+    hv = hv.transpose(0, 1, 4, 5, 2, 3, 6)   # [M block][slab][column][p][token half][8][8]
     want = D.Q.bfp_hw(np.ascontiguousarray(hv).reshape(-1, 8, 8)).reshape(-1)
-    got = hraw[:want.size]
+    hj = hraw[:nb * hpass * N.MP * cols * N.SW_REC].reshape(nb, hpass, -1)
+    other = int(np.count_nonzero(hj[:, 1:]))
+    print(f"NPU_QSW H: the other {hpass - 1} calls' records hold {other} nonzero bytes (want 0)")
+    got = np.ascontiguousarray(hj[:, 0]).reshape(-1)
     if os.environ.get("GN_QSWDUMP"):   # (diag) the sums and both H to an npz
         np.savez(os.environ["GN_QSWDUMP"], g=s_[:, :F], u=s_[:, F:], want=want, got=got)
     bad = np.flatnonzero(got != want)
     print(f"NPU_QSW H: {got.size} bytes, {bad.size} differ ({bad.size / got.size:.2e})")
     if bad.size:
         rec = bad // 9
-        print(f"  first: byte {bad[0]} (record {rec[0] // 64} of [col][block][slab], row byte {bad[0] % 9}) "
+        print(f"  first: byte {bad[0]} (record {rec[0] // 64} of [block][slab][col], row byte {bad[0] % 9}) "
               f"got {got[bad[0]]} want {want[bad[0]]}; exponent bytes {np.count_nonzero(bad % 9 == 0)}")
         dm = np.abs(got[bad].view(np.int8).astype(int) - want[bad].view(np.int8).astype(int))
         print(f"  mantissa |diff| max {dm[bad % 9 != 0].max() if np.any(bad % 9) else 0}; "
               f"records hit {np.unique(bad // 576).size} of {got.size // 576}")
-    return 0 if bad.size == 0 else 1
+    return 0 if bad.size == 0 and other == 0 else 1
 
 
 def value(x):
@@ -147,7 +151,8 @@ def main():
             print(f"NPU_QSW: blk.{lay_} ffn_gate / ffn_up rows 0 .. {Nn // 2}")
             wraw = np.concatenate([np.asarray(x.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn // 2]
                                    for x in (tg_, tu_)])
-            cfg = dataclasses.replace(cfg, qsw=True, dgu=Nn // 2 * KR // 256 * D.BLK, swcol=32, hord="P4")
+            cfg = dataclasses.replace(cfg, qsw=True, dgu=Nn // 2 * KR // 256 * D.BLK, swcol=32, hord="P4",
+                                      hpass=int(os.environ.get("NPU_QSW_HPASS", "2")))   # (H: this call is call 0)
         else:
             wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
         wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32
@@ -330,8 +335,8 @@ def main():
                      np.concatenate([np.r_[64 * c_ + 32:64 * c_ + 64] for c_ in range(cols)])]
         wq, wf = wq[idx_], wf[idx_]
     sa, sw, sc = N.stream_bytes(cfg)
-    if qsw:   # H: [column][M block][slab][576 B]
-        sc = cols * nb * N.MP * N.SW_REC
+    if qsw:   # H: [M block][call][slab][column][576 B]
+        sc = nb * cfg.hpass * N.MP * cols * N.SW_REC
     a_in = a
     if fuse == 2:   # the decoders emit each pass's k-blocks in panel order (gen_npu_dec.KPERM): A follows
         kperm = np.concatenate([128 * p + D.KPERM for p in range(K // 1024 if QMODE else passes)])
@@ -416,8 +421,10 @@ def main():
     if width is None:
         sys.exit("no context width admitted the image")
     if N.QCYC:   # (diag) each segment's first word: core cycles since the first firing; per M block: its last segment's
-        seg = N.NP * 256 * 2   # bytes of one bf16 segment (NP sub-tiles of 16 x 16)
+        seg = N.SW_REC if qsw else N.NP * 256 * 2   # bytes of one bf16 segment (NP sub-tiles of 16 x 16; qsw: a row's H)
         cyc = np.fromfile(co, np.uint32)[::seg // 4].astype(np.int64)
+        if qsw:
+            print("  (qsw: the H bytes carry the stamps, not checked)")
         if os.environ.get("GN_QTL") == "1":   # (diag) words 0-3 of every segment: [col][block][row of MP][end, start, W, A]
             w4_ = np.fromfile(co, np.uint32).reshape(-1, seg // 4)[:, :4].astype(np.int64)
             np.save(os.path.join(work, "tl.npy"), w4_.reshape(cols, nb, N.MP, 4))
@@ -491,7 +498,7 @@ def main():
               f"{mma} MMAs -> MMA share {mma / med:.1%}; first block done at {last[0]}")
         sys.exit(0)
     if qsw:
-        sys.exit(qsw_check(np.fromfile(co, np.uint8), value(a), wq, D, cols, nb))
+        sys.exit(qsw_check(np.fromfile(co, np.uint8), value(a), wq, D, cols, nb, cfg.hpass))
     raw = (np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32)   # bf16 C
     if os.environ.get("NPU_AONEHOT"):   # (diag) per token (= k): how many features match the panel
         ko = int(os.environ["NPU_AONEHOT"])

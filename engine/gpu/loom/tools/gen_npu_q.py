@@ -124,6 +124,7 @@ def loom_env(cfg):
     if N.QF["qsw"]:   # the silu table between the C rows' f32 areas and W slot 1 (the rings are forced, and Loom's
         # own place, offset 0, is under W slot 0; qf_ring_at moves the K-half egress ring off 49152)
         env["LOOM_EXP_RODATA_AT"] = "silu_t@45568"
+        env["LOOM_EXP_EGRESS_MERGE_STRIDED"] = "1"
     if N.pshare():   # (array_program counted the two channels)
         env["LOOM_EXP_PACKET_SHARE"] = N.QF["pshare"]
     ks = cfg.ks[0]
@@ -205,6 +206,13 @@ def array_program(L, cfg):
         # stream carries both rows' (row 2p + 1's C ring read in place by row 2p, copied after its own)
         assert R % 2 == 0 and (cfg.fuse != 2 or N.qp1k_on())
         L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr * MP}x{rec}xi32>>")
+        if N.QF["qsw"]:   # (FFN gate / up) H straight in down's A layout [M block][call][slab][column][576 B], this
+            # call's records at its binding offset: lane 2 c + p (the merged owner, lane / 2 = c) at column c's piece,
+            # its blocks hpass calls' records apart (Loom LOOM_EXP_EGRESS_MERGE_STRIDED, HRX 0097)
+            assert mrel() and cfg.hpass >= 1 and rec * 4 == N.SW_REC and R == 4
+            hm_ = cfg.hpass * MP * 8 * rec
+            L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x{rec}xi32, "
+                     f"#encoding.layout.strided<strides=[{rec}, {hm_}, {8 * rec}, 1]>>>")
         e(f"  %ncolp = constant.u32 {cols * R // 2} : reg<aie2p.array.scalar : index>")
         e(f"  %nseg2 = constant.u32 {2 * nbr * MP} : reg<aie2p.array.scalar : index>")
         for c in range(cols):

@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:30:00 +0100
+Subject: [PATCH] loom: let a merged egress write a strided binding
+
+Experimental LOOM_EXP_EGRESS_MERGE_STRIDED=1: the owner's transfer takes its lane divided by the member count and its outermost sequence axis that many times longer, as the dense rule does.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2786,8 +2786,20 @@
+     // dense partition lane |merge_count| times longer (the owner's lane a
+     // multiple of it).
+     const bool merged = channel->egress_merge_owner == channel_index;
++    // Experimental LOOM_EXP_EGRESS_MERGE_STRIDED=1: a strided binding too,
++    // [lane][record sequence ...][record]: the owner's transfer takes its lane
++    // divided by the member count (axis 0 strides one owner's lane) and its
++    // outermost sequence axis |merge_count| times longer.
++    const bool merged_strided =
++        merged && geometry.layout_kind != LOOM_VALUE_FACT_ADDRESS_LAYOUT_DENSE &&
++        getenv("LOOM_EXP_EGRESS_MERGE_STRIDED") != NULL &&
++        binding_endpoint->binding_view_partitioned && geometry.rank >= 3;
++    if (merged_strided) {
++      geometry.axes[1].extent *= channel->egress_merge_count;
++    }
+     if (merged &&
+-        (geometry.layout_kind != LOOM_VALUE_FACT_ADDRESS_LAYOUT_DENSE ||
++        ((geometry.layout_kind != LOOM_VALUE_FACT_ADDRESS_LAYOUT_DENSE &&
++          !merged_strided) ||
+          binding_endpoint->partition_lane % channel->egress_merge_count != 0)) {
+       return loom_aie2p_array_diagnose_binding_transfer(
+           builder, channel_index, binding_endpoint, base_binding_endpoint,
