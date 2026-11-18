@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NPU weight decoders, inlined into the fused GEMM cores of gen_npu_gemm (fuse 2), one per GGUF format (DQ_FMT: IQ4_XS,
-Q4_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, Q3_K; the module's constants follow DQ_FMT at import, gen_npu_gemm.decoder reloads it
+IQ4_NL, Q4_K, Q5_K, Q3_K, Q2_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S; the module's constants follow DQ_FMT at import, gen_npu_gemm.decoder reloads it
 per format).
 Checked inside the fused GEMM: NPU_FUSE=2 NPU_FMT=<fmt> npu_gemm_check.py (the decoded panels against weights(),
 bit for bit). Tried, not kept: a standalone decoder array with one or two ports (the fill column's).
@@ -29,9 +29,9 @@ def grid_table(name, n):
 
 FMT0 = FMT = os.environ.get("DQ_FMT", "IQ4_XS")
 BLK = {"IQ4_XS": 136, "IQ4_NL": 144, "Q4_K": 144, "Q5_K": 176, "IQ3_S": 110, "IQ3_XXS": 98, "IQ2_XXS": 66, "IQ2_XS": 74,
-       "IQ2_S": 82, "Q3_K": 110, "BFP": 288}[FMT]   # bytes per super-block
+       "IQ2_S": 82, "Q3_K": 110, "Q2_K": 84, "BFP": 288}[FMT]   # bytes per super-block
 HBY = {"IQ4_XS": 8, "IQ4_NL": 0, "Q4_K": 16, "Q5_K": 48, "IQ3_S": 2, "IQ3_XXS": 2, "IQ2_XXS": 2, "IQ2_XS": 2,
-       "IQ2_S": 2, "Q3_K": 0, "BFP": 0}[FMT]        # header bytes before qs
+       "IQ2_S": 2, "Q3_K": 0, "Q2_K": 16, "BFP": 0}[FMT]        # header bytes before qs
 GRID = FMT in ("IQ3_S", "IQ3_XXS", "IQ2_XXS", "IQ2_XS", "IQ2_S")   # grid formats: gathers of 4-value grid pieces + sign masks (rodata)
 # grid and sign tables in different banks, each gather's address lanes 0, 1 at one and 2, 3 at the other (no bank stall);
 # the modulo-scheduled hot loop (GMOD) but for IQ3_S (G8), whose combine runs in IQ2_XS's list-scheduled loop
@@ -112,7 +112,14 @@ Q3K = FMT == "Q3_K"
 Q5 = FMT == "Q5_K"
 # Q4_K in P4 order (DQ_GORD "GF": pairs with an IQ4_XS gate, whose H the IQ4_XS down reads in P4): Q5_K's path, h = 0
 Q4G = FMT == "Q4_K" and os.environ.get("DQ_GORD") == "GF"
-GF = Q5 or Q4G                  # gather-free K-quants (no table)
+# Q2_K: [scales 16 (sc | m << 4) | qs 64 | d | dmin]: Q5_K's path with 16 sub-blocks of 16. Header: d | dmin (+80) to
+# plane 0 [row], scale bytes 8 c .. 8 c + 7 to SCM + 64 c [row][8 B]; the halves loop runs (record c, half h): two
+# chains (sc / m nibbles: Q4_K's register budget; four in one iteration spilled past Loom's stack into storage A) to
+# parts lines [c][h][f][T hi, T lo, -M hi, -M lo] (NPARTS 8, PARTSS 2048). Record r: the rows' qs (32 B at 16 + 32 r) transposed to
+# [chunk kk][row][8 B], crumb j of chunk kk (values 32 j + 8 kk ..) masked in place (nibble lo / hi, & 3 / & 12) to
+# NIB; X = bf16 128 + q (j even, high byte 0x43) or 32 + q (j odd: 0x42, the crumb 2 bits up), C = -M - base T
+Q2K = FMT == "Q2_K"
+GF = Q5 or Q4G or Q2K           # gather-free K-quants (no table)
 Q4L = FMT in ("Q4_K", "Q5_K")   # Q4_K's header and scale path
 
 
@@ -141,10 +148,10 @@ HDR, SCM, HB, TAB, PARTS, TB, QT = 0, 64, 192, 256, 384, 896, 2944
 HS = 512                       # half regions now hold only the scale-path temporaries (HDR .. PARTS)
 STATE, KVS = HR + 2 * HS, HR + 2 * HS + 64
 SCR_B = KVS + 64   # storage A (2048-aligned: the table)
-GAS, PARTSS, GT2 = 0, 4096, 5120
+GAS, PARTSS, GT2 = 0, 2048 if FMT == "Q2_K" else 4096, 5120   # (Q2_K: parts right after NIB, storage B 4 KB)
 # storage B (gather addresses, T parts, the table's second copy (not the grid formats': theirs is rodata); +64: gathers
 # read a + 32; Q5_K: NIB and the parts)
-SCR2_B = PARTSS + 1024 if GF else GT2 + (0 if GRID else 2048) + 64
+SCR2_B = PARTSS + (2048 if Q2K else 1024) if GF else GT2 + (0 if GRID else 2048) + 64
 if BFP:
     SCR_B = SCR2_B = 64
 TABV, BASEV = [TAB], ["%sp"]
@@ -157,7 +164,7 @@ TFLAG = 32                      # leaf_inline: the table-built flag's byte offse
 RREC = [None]                   # leaf_inline: (first, end) output record decoded (records 2 j + r), None: all
 TC_IQ4 = (("su", 0x380), ("sv", 0), ("u", 0xC6A0), ("v", 0xC320), ("s", 0xC681), ("1", 0x4A01), ("1", 0x4901))
 TC_Q4K = (("su", 0x380), ("sv", 0), ("u", 0xC680), ("v", 0xC300), ("s", 0xC681), ("1", 0x4A01))   # T = d sc
-NPARTS = 4 if Q4L or FMT in ("Q3_K", "IQ2_XS", "IQ2_S") else 2   # bf16 parts per scale line (T hi / lo; Q4_K adds -M hi / lo,
+NPARTS = 8 if Q2K else 4 if Q4L or FMT in ("Q3_K", "IQ2_XS", "IQ2_S") else 2   # bf16 parts per scale line (T hi / lo; Q4_K adds -M hi / lo,
                                                # Q3_K holds 8 sub-blocks: lines (f, p) = 2 f + p)
 NIB = 0                         # Q3_K: storage B nibble rows per half: hmask nibble n of chunk c at 64 c, qs lo / hi at
                                 # 64 (4 + c) / 64 (8 + c); 768 B per half (the gather addresses' region, unused).
@@ -758,12 +765,12 @@ def leaf(name="dec"):
             if h == 0:
                 e(f"%hmk = mov.i32 {ROWB}")
                 e("%hmd = mov.modifier %hmk")
-        if not Q4L and not GRID and not Q3K and not NL4:
+        if not Q4L and not GRID and not Q3K and not NL4 and not Q2K:
             e(f"%hdpa_{h} = add.rr %hb0_{h}, {k(HDR + 32)}")
             e(f"%hdp_{h} = mov.scalar-to-address %hdpa_{h}")
     # header words -> HDR [row][8 B]
     rows_s = []
-    hroll = (Q3K or XSL or Q4L or NL4) and HROLL and INLINE[0]
+    hroll = (Q3K or XSL or Q4L or NL4 or Q2K) and HROLL and INLINE[0]
     if hroll:   # Q3_K, IQ2_XS: the 16 rows' scale words in a loop (program memory; the rows ran one at a time anyway)
         rr_, _ = loop_begin("hl", 16)
         x = e.stream()
@@ -778,6 +785,26 @@ def leaf(name="dec"):
         x(f"{hb_} = add.rr %spa, {hq_}")
         if Q3K:
             q3k_scales(x, ra, hb_)
+        elif Q2K:   # d | dmin (+80) -> plane 0 [row] (HDR + 4 row); scale words 2 c, 2 c + 1 -> SCM + 64 c [row][8 B]
+            pr_, ws = Pr(x, ra), [x.t("w") for _ in range(4)]
+            for kk in range(4):
+                x(f"{ws[kk]} = lda {pr_}, {4 * kk}")
+            da_, dw = x.t("q2d"), x.t("w")
+            x(f"{da_} = add.rr {ra}, {k(80)}")
+            x(f"{dw} = lda {Pr(x, da_)}, 0")
+            r4_, q4_ = x.t("q4s"), x.t("q4r")
+            x(f"{r4_} = lshl {r8_}, {k(2)}")                 # (rows 4 B apart)
+            x(f"{q4_} = add.rr %spa, {hm_}")
+            x(f"{q4_}b = add.rr {q4_}, {r4_}")
+            pa_ = x.t("q4a")
+            x(f"{pa_} = add.rr {q4_}b, {k(HR + HDR + 32)}")
+            x(f"st {dw}, {Pr(x, pa_)}, -32")
+            for c_ in range(2):
+                sa_ = x.t("q2s")
+                x(f"{sa_} = add.rr {hb_}, {k(HR + SCM + 64 * c_ + 32)}")
+                ps_ = Pr(x, sa_)
+                for i_ in range(2):
+                    x(f"st {ws[2 * c_ + i_]}, {ps_}, {4 * i_ - 32}")
         elif Q4L or NL4:   # 4 words -> word planes [k][row] (4 B a row): HDR + 32 k + 4 row
             if NL4:   # (the 8 block d by u16 loads, a pointer between two blocks (immediates -16 .. 14): d_p | d_(p+4) << 16)
                 ds, ws = [], []
@@ -920,7 +947,7 @@ def leaf(name="dec"):
                 x(f"{HP[h]} = padda.modifier {pr}, %hmd")
             x(f"st {w0}, %hdp_{h}, {8 * r - 32}")         # one shared store pointer per half at HDR + 32
             x(f"st {w1}, %hdp_{h}, {8 * r - 28}")
-    if not Q4L and not GRID and not Q3K and not NL4:
+    if not Q4L and not GRID and not Q3K and not NL4 and not Q2K:
         run(rows_s, int(os.environ.get("DQ_HDRWIN", "2")))
     if os.environ.get("DQ_CT"):
         e(f"%ctpa = add.rr %spa, {k(CTOFF + 512)}")
@@ -929,7 +956,7 @@ def leaf(name="dec"):
     halves_s = []
     vroll = hroll or ((X2 or Q4L or VROLL[0]) and HROLL and INLINE[0])   # Q3_K, IQ2_XS, IQ2_XXS, Q4_K: the halves in a loop (program memory) instead of two interleaved streams
     if vroll:
-        hv_i, _ = loop_begin("vl", 2)
+        hv_i, _ = loop_begin("vl", 4 if Q2K else 2)   # (Q2_K: iteration 2 c + h, record c's two chains of half h)
     for h in range(1 if vroll else 2):
         x = e.stream()
         halves_s.append(x)
@@ -937,10 +964,20 @@ def leaf(name="dec"):
         hbp, pph1, pph = x.t("hbp"), x.t("pph"), x.t("pph")
         if vroll:   # half hv_i: its region, rows and parts lines from half 0's
             hm_, pm_, pq_ = x.t("hvm"), x.t("ppm"), x.t("ppq")
-            x(f"{hm_} = mul {hv_i}, {k(HS)}")
+            hvh = hv_i
+            if Q2K:   # (half h = i & 1, record c = i >> 1: its scale bytes at + 64 c, its lines at + 2 NP 64 c)
+                hvh, q2c, q2o, q2l = x.t("hvh"), x.t("hvc"), x.t("hvo"), x.t("hvl")
+                x(f"{hvh} = and {hv_i}, {k(1)}")
+                x(f"{q2c} = lshl {hv_i}, {k(-1)}")
+                x(f"{q2o} = mul {q2c}, {k(2 * NPARTS * 64)}")
+                x(f"{q2l} = mul {q2c}, {k(64)}")
+            x(f"{hm_} = mul {hvh}, {k(HS)}")
             hb0 = x.t("hva")
             x(f"{hb0} = add.rr %hb0_0, {hm_}")
-            x(f"{pm_} = mul {hv_i}, {k(NPARTS * 64)}")
+            x(f"{pm_} = mul {hvh}, {k(NPARTS * 64)}")
+            if Q2K:
+                x(f"{pm_}c = add.rr {pm_}, {q2o}")
+                pm_ += "c"
             x(f"{pq_} = add.rr %spb, {pm_}")
             x(f"{hbp} = mov.scalar-to-address {hb0}")
             x(f"{pph1} = add.rr {pq_}, {k(PARTSS)}")
@@ -998,6 +1035,34 @@ def leaf(name="dec"):
                 ls_ = x.t("LS")
                 x(f"{ls_} = vlda.512.i8x64 {phd}, {SCM + 64 * c}")
                 chains.append((lsplit(ls_), hv, TC_IQ4, c, False))
+        elif Q2K:   # plane 0 d | dmin [row] (Q4_K's); record c's scale bytes [row][j] (SCM + 64 c): sc lo, m hi nibble
+            PW, DMv, p0s, p0c, DD = x.t("PW"), x.t("DM"), x.t("p0"), x.t("p0"), x.t("DD")
+            x(f"{PW} = vlda.512.i8x64 {phd}, 0")
+            x(f"{p0s} = slice {PW}[0] : {V2} -> {V1}")
+            x(f"{p0c} = slice {PW}[0] : {V2} -> {V1}")
+            x(f"{DD} = concat({p0s}, {p0c}) : ({V1}, {V1}) -> {V2}")
+            x(f"{Dv} = vshuffle {DD}, {DD}, {m2c}")            # d [row] (twice)
+            x(f"{DMv} = vshuffle {DD}, {DD}, {m3c}")           # dmin [row] (twice)
+            hvd, hvm = x.t("hv"), x.t("hv")
+            x(f"{hvd} = vshuffle {Dv}, {Dv}, {m18}")
+            x(f"{hvm} = vshuffle {DMv}, {DMv}, {m18}")
+            assert vroll
+            q2a_, scv = x.t("q2a"), x.t("scv")
+            x(f"{q2a_} = add.rr {hb0}, {q2l}")
+            x(f"{scv} = vlda.512.i8x64 {Pr(x, q2a_)}, {SCM}")   # record c's scale bytes [row][j]
+
+            def q2ls(md):   # (built when its chain starts: register budget)
+                us_ = []
+                for i_ in range(2):
+                    sl_, u_ = x.t("ss"), x.t("su")
+                    x(f"{sl_} = slice {scv}[{i_}] : {V2} -> {V1}")
+                    x(f"{u_} = vunpack.u4.to.u8x64 {sl_}")
+                    us_.append(u_)
+                nv = x.t("LS")
+                x(f"{nv} = vshuffle {us_[0]}, {us_[1]}, {md}")
+                return lsplit(nv)
+            chains = [((lambda md=md: q2ls(md)), hvm if isM else hvd, TC_Q4K, isM, bool(isM))
+                      for isM, md in ((0, m0c), (1, m1c))]
         elif Q4L:
             # planes: 0 d | dmin [row], 1 s0..3, 2 s4..7, 3 s8..11; sc / m (6 bit) by the K-quant packing:
             # j < 4: sc = s_j & 63, m = s_{j+4} & 63; j >= 4: sc = (s_{j+4} & 15) | (s_{j-4} >> 6) << 4,
@@ -1107,6 +1172,9 @@ def leaf(name="dec"):
             x(f"{hv} = vshuffle {Dv}, {Dv}, {m18}")              # d [row][f]
             chains = [(a, hv, TC_IQ4, 0, False)]
         for a, hvx, tconst, pbase, neg in chains:
+            if callable(a):   # (Q2_K: the chain's ls built here)
+                a = a()
+
             def derive(hv):
                 e4 = band(x, shr8(x, hv), 0x7C)
                 e128 = e4
@@ -1211,7 +1279,8 @@ def leaf(name="dec"):
                         x(f"{dv} = vshuffle {cs_[0]}, {cs_[1]}, {k(2 + f)}")
                         # Q3_K: record pbase, its lines (f, p) at 2 f + p
                         pp_, o = x.addr(pph, (pbase * 2 * NPARTS * 64 + (2 * f + p) * 64) if Q3K or XSL else
-                                        (f * 2 * NPARTS * 64 + (pbase + p) * 64), cursor="pph_w")
+                                        ((pbase // 2) * 2 * NPARTS * 64 + (4 * f + 2 * (pbase % 2) + p) * 64) if Q2K
+                                        else (f * 2 * NPARTS * 64 + (pbase + p) * 64), cursor="pph_w")
                         x(f"vst.512.bf16x32 {dv}, {pp_}, {o}")
                     if p < 1:
                         accs = [m32(accs[hi_], cs_[hi_], m1) for hi_ in range(2)]
@@ -1760,7 +1829,7 @@ def leaf(name="dec"):
     elif GF:
         # ---- Q5_K record r: per half the rows' qs (64 B at HBY + 64 r) and qh (32 B at 16; Q4G: none) realigned (one
         # shift for all rows) and transposed to [chunk][row][8 B]; nibble-unpacked into NIB: qs lo, hi, qh nibble r (mode r)
-        e(f"%q5r = mul {r_}, {k(64)}")
+        e(f"%q5r = mul {r_}, {k(32 if Q2K else 64)}")
         e("%q5b = add.rr %jin, %q5r")
         e(f"%q5q = add.rr %q5b, {k(HBY)}")
         if Q5:
@@ -1839,16 +1908,34 @@ def leaf(name="dec"):
             rws.append(rowv(x, "q", r))
         x = e.stream()
         qstreams.append(x)
-        vs = butterfly(x, rws, (4, 2, 1))
+        if Q2K:   # units 0-3 only (32 B a row): the first stage's low zips
+            vs = []
+            for i in range(4):
+                vs.append(x.t("tq"))
+                x(f"{vs[-1]} = vshuffle {rws[i]}, {rws[i + 4]}, {k(14)}")
+            vs = butterfly(x, vs, (2, 1))
+        else:
+            vs = butterfly(x, rws, (4, 2, 1))
         pn = P(x, "%q5n", NIB + 512)
         pt_ = P(x, "%q5t", NIB + 2048 + 512) if Q5 else None
-        for c in range(8):                      # chunk c = 4 g + kk: sub-blocks jl = 2 g (lo), 2 g + 1 (hi)
+        for c in range(4 if Q2K else 8):        # chunk c = 4 g + kk: sub-blocks jl = 2 g (lo), 2 g + 1 (hi)
             us = []
             for hf_ in range(2):
                 sl_, u_ = x.t("ns"), x.t("nu")
                 x(f"{sl_} = slice {vs[c]}[{hf_}] : {V2} -> {V1}")
                 x(f"{u_} = vunpack.u4.to.u8x64 {sl_}")
                 us.append(u_)
+            if Q2K:   # (Q2_K) chunk kk = c: crumb j in nibble j // 2 at bit 2 (j % 2), masked in place -> NIB 4 j + kk
+                lh_ = []
+                for md in (m0c, m1c):
+                    lh_.append(x.t("nv"))
+                    x(f"{lh_[-1]} = vshuffle {us[0]}, {us[1]}, {md}")
+                for j_ in range(4):
+                    b2, v_ = x.t("b8"), x.t("v")
+                    x(f"{b2} = vbcst.8 {k(3 if j_ % 2 == 0 else 12)}")
+                    x(f"{v_} = vband {lh_[j_ // 2]}, {b2}")
+                    x(f"vst.512.i8x64 {v_}, {pn}, {64 * (4 * j_ + c) - 512}")
+                continue
             if Q5:
                 nh = x.t("nh")
                 x(f"{nh} = vlda.512.i8x64 {pt_}, {64 * (c % 4) - 512}")
@@ -2321,25 +2408,48 @@ def leaf(name="dec"):
         frags, tails = [], []
         pns = {}
         npush = 0
-        def rowb(x, jl, hh, p):
+        if Q2K:   # (program memory) jl = 2 i + parity in a loop of 2: parts lines through one pointer at + 512
+            # (immediates -512 .. 448), + 256 an iteration (sub-blocks 4 i ..); NIB pointers + 512 (k-blocks 8 i ..)
+            e(f"%q2spc = copy {sp0} : reg<aie2p.ep> -> reg<aie2p.ep>")   # (padda consumes its pointer)
+            e("%q2sp0 = padda %q2spc, 448")
+            e("%q2sp = padda %q2sp0, 64")
+            for hh in range(2):
+                e(f"%q2na{hh} = add.rr %spb, {k(NIB + 1024 * hh + 512)}")
+                e(f"%q2n{hh} = mov.scalar-to-address %q2na{hh}")
+            ff_ = st["fifo"]
+            _, q2a = loop_begin("q2j", 2, [(ff_[0], "reg<aie2p.mstfifo>"), (ff_[1], "reg<aie2p.mpfs>"),
+                                           (ff_[2], "reg<aie2p.mr26_fifo_st>"), ("%q2sp", "reg<aie2p.ep>"),
+                                           ("%q2n0", "reg<aie2p.ep>"), ("%q2n1", "reg<aie2p.ep>")])
+            st["fifo"] = tuple(q2a[:3])
+            q2p = q2a[3]
+            pns = {0: q2a[4], 1: q2a[5]}
+
+        def rowb(x, jl, hh, p):   # (Q2_K: jl the local sub-block 0 .. 3 of the iteration, lane group jl)
             ld, bc, ra, rb, t4 = x.t("pl"), x.t("bc"), x.t("ra"), x.t("rb"), x.t("TB")
-            x(f"{ld} = vlda.512.bf16x32 {sp0}, {(hh * NPARTS + p) * 64}")
-            x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {jl}")
+            if Q2K:
+                x(f"{ld} = vlda.512.bf16x32 {q2p}, {(hh * NPARTS + 4 * (jl // 4) + p) * 64 - 512}")
+                x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {jl % 4}")
+            else:
+                x(f"{ld} = vlda.512.bf16x32 {sp0}, {(hh * NPARTS + p) * 64}")
+                x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {jl}")
             x(f"{ra} = vshuffle {bc}, {bc}, {m52}")
             x(f"{rb} = vshuffle {bc}, {bc}, {m53}")
             x(f"{t4} = concat({ra}, {rb}) : ({V2}, {V2}) -> {V4}")
             return t4
-        for jl in range(4):
+        for jl in range(2 if Q2K else 4):
             x = e.stream()                                      # C of both halves (no push)
             frags.append(x)
             tails.append([])
-            cs = []
-            for hh in range(2):                                 # (constants per use: tuple live ranges)
-                c_ = mac(x, None, rowb(x, jl, hh, 2), wide(x, splat16(x, 0x3F80)))
-                c_ = mac(x, c_, rowb(x, jl, hh, 3), wide(x, splat16(x, 0x3F80)))
-                for p in range(2):
-                    c_ = mac(x, c_, rowb(x, jl, hh, p), wide(x, splat16(x, 0xC300)))
-                cs.append(c_)
+            cs = {}
+            for l2 in range(2 if Q2K else 1):                   # (Q2_K: sub-blocks 2 jl + l2; base 128 / 32)
+                sb_ = 2 * jl + l2 if Q2K else jl
+                nb_ = 0xC200 if Q2K and jl % 2 else 0xC300
+                for hh in range(2):                             # (constants per use: tuple live ranges)
+                    c_ = mac(x, None, rowb(x, sb_, hh, 2), wide(x, splat16(x, 0x3F80)))
+                    c_ = mac(x, c_, rowb(x, sb_, hh, 3), wide(x, splat16(x, 0x3F80)))
+                    for p in range(2):
+                        c_ = mac(x, c_, rowb(x, sb_, hh, p), wide(x, splat16(x, nb_)))
+                    cs[(l2, hh)] = c_
             for kk in (0, 2, 1, 3):
                 for hh in range(2):
                     x = e.stream()
@@ -2348,18 +2458,34 @@ def leaf(name="dec"):
                         pns[hh] = P(x, "%spb", NIB + 1024 * hh + 512)
                     v_, b3, xl, xh, X = x.t("nq"), x.t("b8"), x.t("xl"), x.t("xh"), x.t("X")
                     x(f"{v_} = vlda.512.i8x64 {pns[hh]}, {64 * (4 * jl + kk) - 512}")
-                    x(f"{b3} = vbcst.8 {k(0x43)}")
+                    x(f"{b3} = vbcst.8 {k(0x42 if Q2K and jl % 2 else 0x43)}")
                     x(f"{xl} = vshuffle {v_}, {b3}, {m20}")
                     x(f"{xh} = vshuffle {v_}, {b3}, {m21}")
                     x(f"{X} = concat({xl}, {xh}) : ({V2}, {V2}) -> {V4}")   # bf16 128 + v, [row][8]
-                    acc = mac(x, cs[hh], rowb(x, jl, hh, 0), X)
-                    acc = mac(x, acc, rowb(x, jl, hh, 1), X)
+                    l2 = kk // 2 if Q2K else 0
+                    sb_ = 2 * jl + l2 if Q2K else jl
+                    acc = mac(x, cs[(l2, hh)], rowb(x, sb_, hh, 0), X)
+                    acc = mac(x, acc, rowb(x, sb_, hh, 1), X)
                     pt = e.stream()
                     push(pt, acc)
                     npush += 1
                     if npush % 8 == 0:
                         flush(pt)                               # every 8 pushes
                     tails.append(pt.L)
+        if Q2K:
+            run(frags, int(os.environ.get("DQ_WINH", "3")), tails, hv=24, full=False)
+            frags, tails = [], []
+            e(f"%q2pc = copy {q2p} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e("%q2pn = padda %q2pc, 256")
+            for hh in range(2):
+                e(f"%q2c{hh} = copy {pns[hh]} : reg<aie2p.ep> -> reg<aie2p.ep>")
+                e(f"%q2m{hh} = padda %q2c{hh}, 448")
+                e(f"%q2x{hh} = padda %q2m{hh}, 64")
+            ff_ = st["fifo"]
+            loop_end("q2j", [(ff_[0], "reg<aie2p.mstfifo>"), (ff_[1], "reg<aie2p.mpfs>"),
+                             (ff_[2], "reg<aie2p.mr26_fifo_st>"), ("%q2pn", "reg<aie2p.ep>"),
+                             ("%q2x0", "reg<aie2p.ep>"), ("%q2x1", "reg<aie2p.ep>")])
+            st["fifo"] = tuple(q2a[:3])
     elif I4M and SLU:
         # ---- IQ4_XS hot, modulo-scheduled (I4MOD) in one in-order stream: unit (t, u, cc, hh) = 4 address vectors ->
         # 16 gathers -> 4 entry vectors -> X lo / hi, T (2 parts), 4 MACs; a pair's (hh 0, 1) pushes lo, lo, hi, hi
@@ -2571,9 +2697,11 @@ def leaf(name="dec"):
         e(f"%spc0 = copy {sp0} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if 2 * NPARTS * 64 <= 448:
             e(f"%spn0 = padda %spc0, {2 * NPARTS * 64}")
-        else:                                            # padda immediates reach 448
-            e(f"%spm0 = padda %spc0, 256")
-            e(f"%spn0 = padda %spm0, {2 * NPARTS * 64 - 256}")
+        else:                                            # padda immediates reach 448: steps of 256 (Q2_K: 4)
+            n_ = 2 * NPARTS * 64 // 256
+            assert 2 * NPARTS * 64 % 256 == 0
+            for i_ in range(n_):
+                e(f"%{'spn0' if i_ == n_ - 1 else f'spm{i_}'} = padda %{'spc0' if i_ == 0 else f'spm{i_ - 1}'}, 256")
         loop_end("rl", [("%spn0", "reg<aie2p.ep>")])
     ff = st["fifo"]
     if not SLU:
@@ -2811,6 +2939,26 @@ def weights(raw):
     if Q3K:                                             # w = d (sc - 32) (crumb + 4 hbit - 4): exact in f32
         d, sc, q = q3k_fields(raw)
         return (np.repeat(d[..., None] * (sc - 32), 16, -1) * q).astype(np.float32)
+    if Q2K:   # T = d sc, Mn = -dmin m per 16 values; X = base + q (base 128 / 32: crumb j even / odd); the kernel's order
+        f = np.float32
+        d = raw[..., 80:82].copy().view(np.float16)[..., 0].astype(f)
+        dm = raw[..., 82:84].copy().view(np.float16)[..., 0].astype(f)
+        sb = raw[..., 0:16].astype(np.int64)
+        qs = raw[..., 16:80].astype(np.int64)
+        v = np.arange(256)
+        j_ = (v % 128) // 32
+        q = (qs[..., 32 * (v // 128) + v % 32] >> (2 * j_)) & 3
+        base = np.where(j_ % 2 == 0, 128, 32).astype(f)
+        T0, T1 = parts2((d[..., None] * (sb & 15).astype(f)).astype(f))
+        M0, M1 = parts2((-dm[..., None] * (sb >> 4).astype(f)).astype(f))
+        rep_ = lambda a: np.repeat(a, 16, -1)
+        X = (q + base).astype(f)
+        w = (rep_(M0) + rep_(M1)).astype(f)
+        for T_ in (T0, T1):
+            w = (w + rep_(T_) * -base).astype(f)
+        for T_ in (T0, T1):
+            w = (w + rep_(T_) * X).astype(f)
+        return w
     if GF:
         # T, Mn as Q4_K's; X = 128 + q (q = nibble + 16 h); the kernel's order: w = Mn0 + Mn1 + T0 (-128) + T1 (-128)
         # + T0 X + T1 X

@@ -748,7 +748,7 @@ FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q5k", "q4
 # 4 images: room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream: Q4_K only
 # in pairs, a P4 H through its gather-free decoder)
 FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k", "q3k", "q5k", "iq2s")
-DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq4nl": ("IQ4_NL", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
+DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq4nl": ("IQ4_NL", "p4"), "q2k": ("Q2_K", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4"), "q5k": ("Q5_K", "p4"), "iq2s": ("IQ2_S", "p4"),
              "bfp": ("BFP", "p4")}   # BFP: rows pre-decoded on the host (bfp_pair_rows, bfp_site_rows)
@@ -893,7 +893,7 @@ def fit_rowgrp(t, mt):
     raise SystemExit("no row group of %s divides %d row tiles" % (t, mt))
 
 
-QSITE_FMTS = ("iq4xs", "iq4nl")   # Q' site images at NPU_NP (the others: NP 4, QNP4_FMTS)
+QSITE_FMTS = ("iq4xs", "iq4nl", "q2k")   # Q' site images at NPU_NP (the others: NP 4, QNP4_FMTS)
 
 
 def np4(fmt):
