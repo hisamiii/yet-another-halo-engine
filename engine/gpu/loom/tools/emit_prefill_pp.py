@@ -950,7 +950,7 @@ def npu_split(rows, combos, B, outdir):
             chunked = len(npu_chunks(site)) > 1 or npu_rem(site)
             if fmt in FUSE_FMTS:
                 images.add((fmt, kb * 256))
-            elif not chunked and skind != "kres":   # (BFP site rows)
+            elif not chunked and skind != "kres" and not NPU_Q:   # (BFP site rows; Q': those layers stay on the GPU)
                 images.add(("bfp", skb * 256))
                 bsites.update((t, nn) for t in combos[(kind, fmt, port, mt, kb)])
             if npu_rem(site) and (site, fmt) not in done:   # the GPU's K remainder of the NPU's rows (f32 [B][nn])
