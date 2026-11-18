@@ -435,6 +435,26 @@ class LoomNpu {
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k.first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
     const Call c = Snapshot(k);
     DumpInvocations(k, c);
+    // (diag) NPU_RUN_CSPREAD=1: call i's C at i * C's length (views[2]'s buffer holds all calls'): its own bytes
+    std::vector<Call> per;
+    if (std::getenv("NPU_RUN_CSPREAD") && views.size() > 2 &&
+        views[2].shared->bytes >= views[2].offset + std::size_t(calls) * views[2].length) {
+      for (int i = 0; i < calls; ++i) {
+        std::vector<View> v = views;
+        v[2].offset += std::size_t(i) * views[2].length;
+        if (const char* r = std::getenv("NPU_RUN_RSPREAD"))   // (diag: those bindings' call i at i * their length too)
+          for (std::string spec = r; !spec.empty();) {
+            const std::size_t comma = spec.find(','), b = std::stoul(spec.substr(0, comma));
+            v[b].offset += std::size_t(i) * views[b].length;
+            spec = comma == std::string::npos ? "" : spec.substr(comma + 1);
+          }
+        Rebind(k, v);
+        per.push_back(Snapshot(k));
+      }
+      Rebind(k, views);
+      std::fprintf(stderr, "npu: RunGatedOnce: C spread over %d calls\n", calls);
+    }
+    auto cl = [&](int i) -> const Call& { return per.empty() ? c : per[i]; };
     std::vector<const std::vector<std::uint8_t>*> seq{&c.gate};
     const bool pre = k.streamed && !c.lead_pre.empty();
     if (pre) seq.insert(seq.begin(), &c.lead_pre);
@@ -443,12 +463,12 @@ class LoomNpu {
     } else {
       int queued = 0;
       for (int i = 0; i < calls; ++i) {
-        seq.push_back(i == 0 ? (pre ? &c.lead_post : &c.lead) : &c.push[i & 1]);
-        if (++queued == k.depth) seq.push_back(&c.wait), --queued;
+        seq.push_back(i == 0 ? (pre ? &cl(0).lead_post : &cl(0).lead) : &cl(i).push[i & 1]);
+        if (++queued == k.depth) seq.push_back(&cl(i + 1 - queued).wait), --queued;
       }
-      for (; queued > 0; --queued) seq.push_back(&c.wait);
+      for (; queued > 0; --queued) seq.push_back(&cl(calls - queued).wait);
     }
-    seq.push_back(&c.done);
+    seq.push_back(&cl(calls - 1).done);
     std::fprintf(stderr, "npu: RunGatedOnce %s (depth %d), %d calls, %zu invocations\n",
                  k.streamed ? "streamed" : "plain", k.depth, calls, seq.size());
     std::vector<std::uint8_t> bytes;
@@ -475,7 +495,68 @@ class LoomNpu {
     if (prof_) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
+    // (diag) NPU_RUN_FLAG_DELAY_MS=<ms>: the flag binding's ready word held at 0 and stored that long after the submit
+    // (the engine's NPU waits at the gate for the GPU; the checker's flag is preset)
+    std::thread late;
+    if (const char* d = std::getenv("NPU_RUN_FLAG_DELAY_MS"); d && views.size() > 3 && views[3].shared->host) {
+      auto* w = reinterpret_cast<volatile std::uint32_t*>(static_cast<char*>(views[3].shared->host) + views[3].offset);
+      const std::uint32_t ready = *w;
+      *w = 0, __builtin_ia32_clflush(const_cast<std::uint32_t*>(w)), __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      late = std::thread([w, ready, ms = std::atoi(d)] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        __atomic_store_n(w, ready, __ATOMIC_RELEASE);
+        __builtin_ia32_clflush(const_cast<std::uint32_t*>(w));
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      });
+    }
+    // (diag) NPU_RUN_DONESNAP=1: C filled with 0xFF; a thread spins on the done word (the last call's signal record 1,
+    // which the engine's GPU polls) and, the moment it changes, counts the last call's C half-words still 0xFFFF
+    std::thread snap;
+    auto count_unwritten = [](const char* p, std::size_t n) {
+      for (std::size_t o = 0; o < n; o += 64) _mm_clflush(p + o);
+      _mm_mfence();
+      std::size_t u = 0;
+      for (std::size_t o = 0; o + 2 <= n; o += 2) u += *reinterpret_cast<const volatile std::uint16_t*>(p + o) == 0xFFFF;
+      return u;
+    };
+    const char* snap_c = nullptr;
+    std::size_t snap_n = 0;
+    if (std::getenv("NPU_RUN_DONESNAP") && views.size() > 5 && views[5].shared->host && views[2].shared->host) {
+      const std::size_t last = per.empty() ? 0 : std::size_t(calls - 1);
+      auto* dw = reinterpret_cast<volatile std::uint32_t*>(static_cast<char*>(views[5].shared->host) + views[5].offset +
+                                                           last * views[5].length + views[5].length / 2);
+      snap_c = static_cast<const char*>(views[2].shared->host) + views[2].offset + last * views[2].length;
+      snap_n = views[2].length;
+      std::memset(views[2].shared->host, 0xFF, views[2].shared->bytes);
+      for (std::size_t o = 0; o < views[2].shared->bytes; o += 64) _mm_clflush(static_cast<char*>(views[2].shared->host) + o);
+      _mm_clflush(const_cast<std::uint32_t*>(dw));
+      _mm_mfence();
+      const std::uint32_t init = *dw;
+      snap = std::thread([dw, init, c = snap_c, n = snap_n, count_unwritten] {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::uint32_t v = init;
+        while ((v = *dw) == init) {
+          _mm_clflush(const_cast<std::uint32_t*>(dw));
+          _mm_mfence();
+          if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10)) break;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const std::size_t tail = count_unwritten(c + n - n / 32, n / 32);
+        const auto tt = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "npu: DONESNAP tail 1/32 unwritten %zu (scan %.1f us)\\n", tail, std::chrono::duration<double, std::micro>(tt - t1).count());
+        const std::size_t u = count_unwritten(c, n);
+        const auto t2 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "npu: DONESNAP done word %#x -> %#x at %.1f us; last call's C unwritten then: %zu half-words "
+                     "(scan %.1f us)\n", init, v, std::chrono::duration<double, std::micro>(t1 - t0).count(), u,
+                     std::chrono::duration<double, std::micro>(t2 - t1).count());
+      });
+    }
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(Place(bytes)), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(job)");
+    if (late.joinable()) late.join();
+    if (snap.joinable()) {
+      snap.join();
+      std::fprintf(stderr, "npu: DONESNAP after the command: %zu half-words unwritten\n", count_unwritten(snap_c, snap_n));
+    }
     CheckHealth();
     return prof_ ? prof_->Finish(1) : std::vector<std::uint32_t>{};
   }
@@ -1953,7 +2034,7 @@ class LoomNpuSplit : public NpuSplit {
         flags_(npu_.CreateShared(plan.dcol ? kDcolFlagBytes : 65536, true)),
         cscratch_(npu_.CreateShared(plan.dcol ? plan.c_bytes : 4096, true)),
         plan_(plan) {
-    if (plan.depth1) npu_.SetMaxDepth(1);
+    if (plan.depth1 && !std::getenv("YAH_NPU_DEPTH2")) npu_.SetMaxDepth(1);   // (YAH_NPU_DEPTH2=1: diag, depth 2)
     if (!plan.gate_calls) throw LoomError("npu: the set has no gate protocol (dispatch.txt npugate; re-emit it)");
     if (!GpuPinnedHigh())
       throw LoomError("npu: pin the GPU performance level first (echo high > /sys/class/drm/card*/device/"

@@ -101,16 +101,26 @@ int main(int argc, char** argv) {
         if (i < weights.size()) weights[i] = true;
         spec = comma == std::string::npos ? "" : spec.substr(comma + 1);
       }
+    // NPU_RUN_DEPTH=<n>: at most n calls queued (the engine's sets with npudepth1 run at 1)
+    if (const char* d = std::getenv("NPU_RUN_DEPTH")) npu.SetMaxDepth(std::atoi(d));
     for (std::size_t i = 0; i < files.size(); ++i) {
       const auto& f = files[i];
-      LoomNpu::Shared& s = npu.CreateShared(f.size() ? f.size() + shift[i] : 4, !dev[i]);
+      // (NPU_RUN_CSPREAD: C sized for every call of the gated job)
+      const std::size_t spread = i == 2 && std::getenv("NPU_RUN_CSPREAD") && std::getenv("NPU_RUN_GATED")
+                                     ? std::max(1, std::atoi(std::getenv("NPU_RUN_GATED"))) : 1;
+      LoomNpu::Shared& s = npu.CreateShared(f.size() ? f.size() * spread + shift[i] : 4, !dev[i]);
       if (dev[i]) {
         gpu.H2D(s.gpu, f.data(), f.size());
       } else {
         std::memcpy(static_cast<char*>(s.host) + shift[i], f.data(), f.size());
         FlushLines(s.host, s.bytes);
       }
-      views.push_back({&s, shift[i], f.size(), weights[i]});
+      // (NPU_RUN_RSPREAD=i: binding i's file holds every gated call's data, one call's length each)
+      const char* rs = std::getenv("NPU_RUN_RSPREAD");
+      const std::size_t div = rs && ("," + std::string(rs) + ",").find("," + std::to_string(i) + ",") != std::string::npos &&
+                                      std::getenv("NPU_RUN_GATED")
+                                  ? std::max(1, std::atoi(std::getenv("NPU_RUN_GATED"))) : 1;
+      views.push_back({&s, shift[i], f.size() / div, weights[i]});
     }
     // NPU_RUN_REPEAT=<n>: n runs, each one's host wall time (load + run) printed; timing by difference of two
     // problem sizes cancels the fixed part
@@ -142,6 +152,10 @@ int main(int argc, char** argv) {
     for (const auto& [b, path] : outputs) {
       FlushLines(views[b].shared->host, views[b].shared->bytes);
       std::ofstream out(path, std::ios::binary);
+      if (std::getenv("NPU_RUN_CSPREAD") && b == 2) {   // (every call's C)
+        out.write(static_cast<const char*>(views[b].shared->host), static_cast<std::streamsize>(views[b].shared->bytes));
+        continue;
+      }
       out.write(static_cast<const char*>(views[b].shared->host), static_cast<std::streamsize>(files[b].size()));
       if (!out) throw LoomError("cannot write " + path);
     }
