@@ -994,7 +994,7 @@ class LoomNpu {
     int dec = -1;
     if (PeerRan()) {   // the other context's commands ran on the array: its state is theirs now, set up in full
       std::lock_guard<std::mutex> lock(mu_);
-      resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, lane_lost_ = true, ++epoch_;
+      resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, lane_lost_ = true, pair_resident_ = false, ++epoch_;
     }
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -1553,6 +1553,11 @@ class LoomNpu {
   // The peer's commands ran since the last family setup (EnqueueGated): the next one writes the packet lane's switches
   // itself (no control packets). Engine thread only.
   bool lane_lost_ = false;
+  bool pair_resident_ = false;   // FusedCommand: the array's last family setup was a Q' column-pair image's
+  static bool QPairImage(const std::string& path) {
+    const std::string stem = path.substr(path.find_last_of('/') + 1);
+    return stem.rfind("npu_ffnsw_", 0) == 0 && std::count(stem.begin(), stem.end(), '_') == 4;
+  }
   // A second context on the same array (a GEMM split's and an NPU attention's, SetPeer): the host orders the two. Each
   // command records the peer's commands enqueued so far (peer_need) and is submitted only once the peer retired them,
   // and a command after the peer's commands sets its image up in full (the peer's ran on the array in between).
@@ -1598,9 +1603,11 @@ class LoomNpu {
         // after the peer's commands (another image's routes on the array) the setup writes every switch itself
         // (YAH_NPU_NOPACKETS: diag, every switch)
         static const bool nopk = std::getenv("YAH_NPU_NOPACKETS") != nullptr;
-        const bool packets = !lane_lost_ && !nopk;
+        // (Q' column-pair images "npu_ffnsw_<gate>_<up>_<hord>": the next setup's packets stalled the NPU) a switch
+        // to or from one writes by the microcontroller
+        const bool packets = !lane_lost_ && !nopk && !pair_resident_ && !QPairImage(k0->path);
         append(DeltaSetup(k0->setup.data(), k0->setup.size(), packets));
-        lane_lost_ = false;
+        lane_lost_ = false, pair_resident_ = QPairImage(k0->path);
         fam = FamilyOf(k0), dec = k0->dec;
       }
       // (SplitLead) the first call's lead before the gate, but its shim read starts, where no format swap comes first
