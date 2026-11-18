@@ -1119,8 +1119,10 @@ def npu_images(images, B, tmp, outdir, extra=()):
     out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(jobs[0][0])),
            ("npurows", NPU_ROWS, 0, 0)]
     # (Q': the NPU queues one call at most; at depth 2 a core's next fill overwrote its undrained C (its rings overlay C
-    # slots 1-3). P1K images with GN_QFGUARD wait for the drain in the fill: depth 2.)
-    guard = NPU_QP1K and os.environ.get("GN_QFGUARD") == "1"
+    # slots 1-3). P1K images with GN_QFGUARD wait for the drain in the fill and ran bit-exact at depth 2, but 1 of 47
+    # engine runs hung (NPU firmware timeout, cause unknown, 11-18): depth 1 until explained; YAH_NPU_DEPTH2=1 at run
+    # time, or GN_QDEPTH2=1 at emit, for depth 2.)
+    guard = NPU_QP1K and os.environ.get("GN_QFGUARD") == "1" and os.environ.get("GN_QDEPTH2") == "1"
     return out + [("npugfirst", 1, 0, 0)] + ([("npudepth1", 1, 0, 0)] if NPU_Q and not guard else [])
 
 
