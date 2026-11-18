@@ -249,9 +249,17 @@ class LoomPrefill {
     if (embed_rows_) {   // token_embd stays on the host: the chunk's rows staged, the embed reads row t for token t
       // (the slot's staging is rewritten once its last copy landed: the GPU a whole chunk behind the host waits here)
       std::vector<std::uint8_t>& rows = host_rows_;
+      const auto e0 = std::chrono::steady_clock::now();
       LoomDevice::WaitFor(rows_copied_);
+      const auto e1 = std::chrono::steady_clock::now();
       gguf_.Rows(*Find("token_embd.weight"), host_ids_.data(), B_, rows.data());
+      const auto e2 = std::chrono::steady_clock::now();
       rows_copied_ = gpu_.StreamH2D(*embed_rows_, rows.data(), rows.size());
+      if (std::getenv("YAH_HOST_TIMES"))
+        std::fprintf(stderr, "host: embed wait %.2f ms, gather %.2f ms (%zu B), stream %.2f ms\n",
+                     std::chrono::duration<double, std::milli>(e1 - e0).count(),
+                     std::chrono::duration<double, std::milli>(e2 - e1).count(), rows.size(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e2).count());
       for (std::uint32_t t = 0; t < B_; ++t) host_ids_[t] = t;
     }
     gpu_.Update(*ids_, host_ids_.data(), host_ids_.size() * 4);
@@ -284,9 +292,38 @@ class LoomPrefill {
     // falls before its deferred down GEMM (the first dispatch while recording layer 1), which waits for all of the
     // layer's last kernel anyway. The NPU split's flagged jobs keep one graph.
     split_layer_ = !npu_on_ && cfg_.main_block_count() > 1 ? 1 : 0;
+    // YAH_HOST_TIMES=1 (diag): the host's recording and launch times per chunk
+    static const bool host_times = std::getenv("YAH_HOST_TIMES") != nullptr;
+    const auto h0 = std::chrono::steady_clock::now();
     RecordLayers(ci, hook);
+    const auto h1 = std::chrono::steady_clock::now();
     split_layer_ = 0, split_armed_ = false;
+    // (with the NPU split: a thread polls the first job's ready word, which the GPU stores after its first kernels)
+    double first_ready = -1, last_ready = -1, last_done = -1;
+    std::thread poll;
+    if (host_times && npu_on_ && !flagged_.empty()) {
+      const NpuSplit::Job w = flagged_[0].words, wl = flagged_.back().words;
+      poll = std::thread([this, w, wl, h1, &first_ready, &last_ready, &last_done] {
+        const auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h1).count(); };
+        while (std::chrono::steady_clock::now() - h1 < std::chrono::seconds(8)) {
+          if (first_ready < 0 && npu_->HostLoad(w.ready) == w.gate) first_ready = ms();
+          if (last_ready < 0 && npu_->HostLoad(wl.ready) == wl.gate) last_ready = ms();
+          if (last_done < 0 && (npu_->HostLoad(wl.done) & 0x7fffffffu) >= wl.gate) last_done = ms();
+          if (last_done >= 0 && first_ready >= 0 && last_ready >= 0) return;
+        }
+      });
+    }
     LaunchChunk();
+    const auto h2 = std::chrono::steady_clock::now();
+    if (host_times) gpu_.Synchronize();
+    if (poll.joinable()) poll.join();
+    if (host_times)
+      std::fprintf(stderr, "host: chunk %u record %.1f ms, launch + NPU enqueue %.1f ms, GPU done %.1f ms; first ready "
+                   "word %.2f, last ready %.1f, last done %.1f ms (after the record)\n", ci,
+                   std::chrono::duration<double, std::milli>(h1 - h0).count(),
+                   std::chrono::duration<double, std::milli>(h2 - h1).count(),
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h1).count(), first_ready,
+                   last_ready, last_done);
   }
 
   // The recorded chunk's graph to the GPU, its NPU jobs to the NPU.
