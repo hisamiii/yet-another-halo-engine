@@ -760,6 +760,12 @@ NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs", "iq3s"), (40, 40, 40, 8)
 # gate and up of one format without a fused GPU gate / up whose single-format deferred image fits: their own decoder
 # on the GGUF rows, no pre-decoded copy (Q3_K's with its record realign rolled: npu_images' q3roll fallback)
 NPU_SAME_SW = ("q5k", "q3k", "iq2s")
+# (Q') the gate / up pairs of one format on the NPU's qsw image (YAH_NPU_QSW_FMTS, default none): super-blocks of a
+# multiple of 4 bytes only (an odd one's pair-of-super-blocks axis plus the gate-to-up step need more shim DMA address
+# dimensions than there are). Q5_K works but loses (11-18 pp2048 +2.7%): the GPU's side runs as the pair's separate
+# gate kstore and up swiglu splits (20.4 ms a layer vs 18.9 for its fused gate / up over all features); it needs a
+# fused GPU gate / up with an NPU split first.
+QSW_FMTS = tuple(f for f in os.environ.get("YAH_NPU_QSW_FMTS", "").split(",") if f)
 # gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
 # tensor's rows), the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>")
 NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s", "iq2xs")
@@ -1272,9 +1278,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         # does not write yet; the other layers keep the FFN on the GPU)
         # (YAH_NPU_FFNDN4=0: IQ4_XS downs only)
         dn4 = os.environ.get("YAH_NPU_FFNDN4", "1") != "0"
-        ok = [l for l in ok if l["ffn_gate"][0] == "iq4xs" and (l["ffn_down"][0] == "iq4xs" or (
-            dn4 and np4(l["ffn_down"][0]) and l["ffn_down"][0] != "q4k"))]
-        pairs = []
+        dok = lambda l: l["ffn_down"][0] == "iq4xs" or (dn4 and np4(l["ffn_down"][0]) and l["ffn_down"][0] != "q4k")
+        ok = [l for l in ok if l["ffn_gate"][0] == "iq4xs" and dok(l)]
+        # pairs: gate and up of one QSW_FMTS format without a fused GPU gate / up (the GPU's side a pair's, the NPU's
+        # one qsw image of that format)
+        pairs = [l for l in pairs if l["ffn_gate"][0] == l["ffn_up"][0] in QSW_FMTS and dok(l)]
     # pairs of one format of NPU_SAME_SW: one image like a single format's, with the deferred epilogue
     # ("npu_ffnsw_<gate>_<up>"); column pairs; the other pairs take the BFP image (bsw)
     mixed = [l for l in pairs if l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW or colpair(l)]
@@ -1336,6 +1344,12 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             go = lambda f: "GF" if f == "q4k" else "P4"
             cfg = npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, swcol=32, hpass=F // 1024, hord=hord, fmt=gu_fmt(gf),
                           gord=go(gf), ufmt=gu_fmt(uf), ugord=go(uf), dfr=1)
+        elif NPU_Q:   # (Q': one format, the qsw image as above)
+            blk = GN.decoder(gu_fmt(gf)).BLK
+            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=kb * 256,
+                            fmt=DCOL_FMTS[gf][0], rawdma=1, qsw=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 256,
+                            hord=hord)
+            QJOB_ENV["npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower())] = dict(GN_QFEGR2="0")
         else:   # (mixed)
             blk = GN.decoder(gu_fmt(gf)).BLK
             cfg = npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024,
@@ -1409,7 +1423,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     for fmt in NPU_DFR_FMTS:
         if gu_fmt(fmt) in dfrs:
             out.append(("npuffndfr_" + fmt, 1, 0, 0))
-    for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs}):
+    for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs} if not NPU_Q else ()):   # (Q': none)
         out.append(("npuffndfr_%s_%s" % (gf, uf), 1, 0, 0))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in pairs if colpair(l)}):
         out.append(("npuffncp_%s_%s" % (gf, uf), 1, 0, 0))

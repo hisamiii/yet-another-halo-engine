@@ -1171,7 +1171,8 @@ class LoomPrefill {
       csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".xdna", mix && !bmix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(gdec), ag,
                                   pg + (f0 + 256 * j) * rb,
                                   dgu + 255 * rb + 16 * blk + RecordRow(gdec),
-                                  c_sw(j), "ffnsw" + hord));
+                                  c_sw(j), "ffnsw" + hord + (qffn && mix ? std::string("_") + f.name : "")));
+    // (Q': a format's qsw image is its own family, its array state differs beyond the decoder tiles)
     // down: per K part, FfnBlkCalls() calls of FfnBlkRows() rows (a last one ending at the last row)
     const bool dn4 = FfnDn4(fd.name);
     const std::string bytes = dn4 ? "npubytes4_ffndn" : "npubytes_ffndn";
