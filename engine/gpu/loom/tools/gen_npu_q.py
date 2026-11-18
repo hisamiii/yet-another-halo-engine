@@ -168,6 +168,10 @@ def loom_env(cfg):
         env["LOOM_EXP_LEAF_SYNC_CYCLES"] = "1"
     if N.qp1k_on() and cfg.fuse == 2:   # (the P1K image's placement and stream knobs)
         env.update(P1K_LOOM)
+    if N.qgmap_on():   # (gen_npu_gemm QG_*) private storage after W slot 1, below the spare runs: the tables' pins
+        # in 63488 .. 65536 grow bank 3's cursor past where Loom would place it
+        assert N.QG_PRIVATE + 512 <= N.QG_SPARE[1][0]
+        env["LOOM_EXP_SPACE_AT"] = ",".join(filter(None, [env.get("LOOM_EXP_SPACE_AT"), f"private@{N.QG_PRIVATE}"]))
     return env
 
 

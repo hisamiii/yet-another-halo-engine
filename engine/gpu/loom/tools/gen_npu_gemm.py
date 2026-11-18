@@ -318,6 +318,7 @@ P1K_GRID_SPARE = ((63488, 65536), (28672, P1K4_GUARD))
 # the grid tables' small symbols and Loom's stack take the grid page's tail and 63488 .. 65536 (gen_npu_q.qgmap_pins)
 QG_SILU = ((56, 45568), (65, 28288))
 QG_GUARD, QG_TOK = 32448, 32704
+QG_PRIVATE = 62976   # (W slot 1's end; Loom's private storage, <= 512 B, pinned: gen_npu_q.loom_env)
 QG_SPARE = ((49152, 53760), (63488, 65536))
 
 
@@ -578,7 +579,8 @@ def decoder(fmt, gord="P4", g8=True):
     import gen_npu_dec
     g8 = g8 or QF.get("qg8", False)
     g = "1" if g8 else "0"
-    gs = "1" if QF.get("grid") else "0"   # (the Q' grid map: IQ2_XS / IQ2_S tables in two symbols)
+    gs = ("2" if QF.get("qsw") else "1") if QF.get("grid") else "0"   # (the Q' grid map: IQ2_XS / IQ2_S tables in two
+    # symbols; FFN gate / up, qgmap_on: @gz 2 KB-aligned, gen_npu_dec GS2K)
     q1 = "1" if QF.get("qg8") else "0"    # (Q' images: one super-block a record row, gen_npu_dec Q1SB)
     if (gen_npu_dec.FMT0 != fmt or os.environ.get("DQ_GORD", "P4") != gord or os.environ.get("DQ_G8", "1") != g
             or os.environ.get("DQ_GSPLIT", "0") != gs or os.environ.get("DQ_Q1SB", "0") != q1):
@@ -1072,6 +1074,13 @@ def fpair(cfg):
 def colcfg(cfg, c):
     """Column c's config: a pair's up column decodes ufmt rows in ugord's order."""
     return dataclasses.replace(cfg, fmt=cfg.ufmt, gord=cfg.ugord) if fpair(cfg) and c >= 0 and c % 2 else cfg
+
+
+def qsw_roll4(cfg):
+    """(FFN gate / up epilogue, program memory) the rolled j loop one half an iteration instead of two:
+    GN_QSWROLL4=1 / 0, else on for the IQ2 decoders' cores (IQ2_S gate core 16816 B of 16384 with two halves)."""
+    v = os.environ.get("GN_QSWROLL4")
+    return v == "1" if v in ("0", "1") else cfg.fmt in ("IQ2_S", "IQ2_XS")
 
 
 def qf_vroll(cfg):
@@ -4909,9 +4918,17 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 # 1024 j; q3 with hord: half i's area, 256 j on); the counter steps in the header, so no
                 # hardware-loop candidate (LOOM_EXP_HWLOOP_TRIP)
                 assert not cfg.hord or (lo, hi) == (0, 2)
-                e(f"  {q}jk0 = mova.i32 {lo}")
-                e(f"  {q}jkn = mova.i32 {hi}")
+                r4 = qsw_roll4(cfg)   # (one half an iteration: u = 2 j + i)
+                e(f"  {q}jk0 = mova.i32 {(2 if r4 else 1) * lo}")
+                e(f"  {q}jkn = mova.i32 {(2 if r4 else 1) * hi}")
                 e(f"  {q}jks = mov.i32 {256 if cfg.hord else 1024}")
+                if r4:   # (half i's offset: q3 the odd area's, hord 1024, else 256)
+                    e(f"  {q}jk1 = mova.i32 1")
+                    e(f"  {q}jkm1 = mova.i32 -1")
+                    if q3:
+                        e(f"  {q}jks2 = sub {p}os, {p}ss")
+                    else:
+                        e(f"  {q}jks2 = mov.i32 {1024 if cfg.hord else 256}")
                 e(f"  low.br ^jl{T}({q}jk0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
                 e(f"^jl{T}({q}jv: {ER}, {q}jf: {MF}, {q}jp: {MP_}, {q}jq: {MS}):")
                 e(f"  {q}jm = lt {q}jv, {q}jkn")
@@ -4919,9 +4936,24 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e(f"  low.cond_br {q}jm, ^jb{T}, ^je{T} : {ER}")
                 e(f"^jb{T}:")
                 s1 = len(L)
-                e(f"  {q}jo = mul {q}jv, {q}jks")
                 fifo = (f"{q}jf", f"{q}jp", f"{q}jq")
-                for i in range(2):
+                if r4:
+                    e(f"  {q}ju = lshl {q}jv, {q}jkm1")
+                    e(f"  {q}ji = and {q}jv, {q}jk1")
+                    e(f"  {q}jo = mul {q}ju, {q}jks")
+                    e(f"  {q}jo2 = mul {q}ji, {q}jks2")
+                    e(f"  {q}jg0 = add.rr {p}ss, {q}jo")
+                    qq = f"{q}u"
+                    e(f"  {qq}jg = add.rr {q}jg0, {q}jo2")
+                    go, du = 512, 1024 if q3 else 1024 * NP // 2
+                    e(f"  {qq}gk = mov.i32 {go}")
+                    e(f"  {qq}gib = add.rr {qq}jg, {qq}gk")
+                    e(f"  {qq}uk = mov.i32 {go + du}")
+                    e(f"  {qq}uib = add.rr {qq}jg, {qq}uk")
+                    fifo = jpush(qq, T, kind, fifo, range(2))
+                else:
+                    e(f"  {q}jo = mul {q}jv, {q}jks")
+                for i in range(0 if r4 else 2):
                     qq = f"{q}u{i}"
                     go, du = (1024 * i + 512) if cfg.hord else (256 * i + 512), 1024 * NP // 2
                     gb = f"{p}ss"

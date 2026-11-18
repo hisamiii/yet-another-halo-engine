@@ -323,7 +323,11 @@ def main():
         env.pop(k, None)
     for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
         if "=" in kv:
-            env[kv.split("=")[0]] = kv.split("=", 1)[1]
+            k_, v_ = kv.split("=", 1)
+            if k_ == "LOOM_EXP_SPACE_AT" and env.get(k_):   # (the image's own pins for spaces the add leaves out)
+                named = {p_.split("@")[0] for p_ in v_.split(",")}
+                v_ = ",".join([v_] + [p_ for p_ in env[k_].split(",") if p_.split("@")[0] not in named])
+            env[k_] = v_
     if os.environ.get("NPU_SAVE_CMD"):   # (diag) the compile's command and Loom environment, to rerun it by hand
         import json
         json.dump({"cmd": [hrx_paths.LOOM_COMPILE, src, f"--root=@{cfg.entry}",

@@ -88,7 +88,10 @@ XS2 = FMT == "IQ2_XS"
 S2 = FMT == "IQ2_S"
 XSL = XS2 or S2                 # IQ2_XS's scale path and hot loop, the two-level grid
 SCOFF = 74 if S2 else 66        # XSL: the scale bytes
-GSPLIT = XSL and os.environ.get("DQ_GSPLIT") == "1"   # (Q' grid map) page 1 of the tables its own symbol, @gz
+GSPLIT = XSL and os.environ.get("DQ_GSPLIT") in ("1", "2")   # (Q' grid map) page 1 of the tables its own symbol, @gz
+# (DQ_GSPLIT=2, the Q' gate / up grid map) @gz 2 KB-aligned: the pieces' u16 lanes take gz >> 4 (ids <= 96 OR into
+# its low byte, whose low 7 bits are 0), the sign fields (<= 127) OR into the sign base / 16 the same way
+GS2K = GSPLIT and os.environ.get("DQ_GSPLIT") == "2"
 S2SG, S2HM = 4096, 4096 + 256 + 21 * 64   # IQ2_S rodata: level-1 (page 0), signs, pieces (16 (16 + id)), qh masks
 PIDOFF = 16 if S2 else 0        # XSL: a piece's slot on page 1 (IQ2_S: after its signs)
 # Q3_K: no gathers. Per record (128 values: qs bits of half n, hmask bit 4 n + j) both halves' rows of [hmask 32 B |
@@ -204,7 +207,7 @@ def grid_rodata(name):
         assert len(p0) == 2 * 4096, len(p0)
         if GSPLIT:   # (page 1 anywhere 4 KB-aligned)
             return [f'global.rodata.def @gt_{name} = align(4096) bytes("{p0}")',
-                    f'global.rodata.def @gz_{name} = align(4096) bytes("{p1}")']
+                    f'global.rodata.def @gz_{name} = align({2048 if GS2K else 4096}) bytes("{p1}")']
         return [f'global.rodata.def @gt_{name} = align(4096) bytes("{p0}{p1}")']
     if XXS:
         # IQ3_XXS: grid / 4 (T = d (2 s + 1)), 256 entries; signs by the 7-bit field f: ksigns(f) = f | parity(f) << 7
@@ -444,9 +447,14 @@ def leaf(name="dec"):
 
     if GRID:
         # rodata tables: their 4 KB pages as address high bytes (address = page << 12 | 16 index via vups << 4)
-        if GSPLIT:   # (page 1's symbol referenced first: Loom's leaf and worker rodata orders then agree)
+        # (GS2K, the gate / up grid map: page 1's symbol referenced after page 0's, else IQ2_S's leaf and worker
+        # rodata orders disagree, EMIT/TARGET "read-only data symbol is invalid"; a wrong order fails the compile)
+        gzl = os.environ.get("DQ_GZLAST", "1" if GS2K else "0") == "1"
+        if GSPLIT and not gzl:   # (page 1's symbol referenced first: Loom's leaf and worker rodata orders then agree)
             e(f"%gzp = mov.local-address @gz_{name}")
         e(f"%gtp = mov.local-address @gt_{name}")
+        if GSPLIT and gzl:
+            e(f"%gzp = mov.local-address @gz_{name}")
         e(f"%gta = mov.address-to-scalar %gtp")
         e(f"%gtc = lshl %gta, {k(-12)}")
         if GMIX:   # the sign table's own object (XXS: 64-aligned, addresses base + 16 f); u32 lanes 4 q, 4 q + 1: grid
@@ -1261,7 +1269,7 @@ def leaf(name="dec"):
             e("%sh2 = mov.shift 2")
             if S2:
                 e(f"%l1c = lshl %gtc, {k(2)}")                # the level-1 page << 2: an index's high byte
-            e(f"%pcc = lshl %stc, {k(8)}")                    # the pieces' page << 8
+            e(f"%pcc = lshl %gpa, {k(-4)}" if GS2K else f"%pcc = lshl %stc, {k(8)}")   # the pieces' page << 8 (GS2K: gz / 16)
 
         anp = {}                                        # per table: the pointer walking its rows (post-increment)
 
