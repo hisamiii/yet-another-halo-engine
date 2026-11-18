@@ -159,7 +159,8 @@ def main():
                 wrawg = np.asarray(tg_.data).view(np.uint8).reshape(-1, KR // 256, N.decoder(fmt, "P4").BLK)[:Nn // 2].copy()
                 wrawu = np.asarray(tu_.data).view(np.uint8).reshape(-1, KR // 256, N.decoder(ufmt_, "P4").BLK)[:Nn // 2].copy()
                 D = N.decoder(fmt, cfg.gord)
-                cfg = dataclasses.replace(cfg, qsw=True, dgu=0, swcol=32, hord="P4", ufmt=ufmt_, ugord="P4",
+                cfg = dataclasses.replace(cfg, qsw=True, dgu=0, swcol=32, hord="P4", ufmt=ufmt_,
+                                          ugord=os.environ.get("NPU_QSW_UGORD") or ("GF" if ufmt_ == "Q4_K" else "P4"),
                                           hpass=int(os.environ.get("NPU_QSW_HPASS", "2")))
             else:
                 wraw = np.concatenate([np.asarray(x.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn // 2]
