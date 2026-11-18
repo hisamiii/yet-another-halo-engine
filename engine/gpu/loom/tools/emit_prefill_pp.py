@@ -765,6 +765,9 @@ NPU_SAME_SW = ("q5k", "q3k", "iq2s")
 # dimensions than there are). Q5_K: pp2048 -2.3% (11-18, layers 58-60; the GPU's side still runs as separate gate
 # kstore and up swiglu splits, a fused GPU gate / up with an NPU split would gain more).
 QSW_FMTS = tuple(f for f in os.environ.get("YAH_NPU_QSW_FMTS", "q5k").split(",") if f)
+# (Q') gate / up of NPU_COLPAIR formats on Q' column-pair images (gen_npu_q ufmt: "npu_ffnsw_<gate>_<up>_<hord>",
+# dispatch rows "npuffncp_<gate>_<up>", one image family each); YAH_NPU_QCP=0: only QSW_FMTS pairs
+QCP = os.environ.get("YAH_NPU_QCP", "1") == "1"
 # gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
 # tensor's rows), the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>")
 NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s", "iq2xs")
@@ -776,9 +779,10 @@ NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s", "iq2xs")
 
 
 def colpair(l):
-    """A layer whose gate and up run as column pairs (NPU_COLPAIR)."""
+    """A layer whose gate and up run as column pairs (NPU_COLPAIR). Q' (QCP): one format too but IQ4_XS's (the
+    formats of odd super-blocks have no single-format qsw image: pairs read one tensor a column)."""
     g, u = l["ffn_gate"][0], l["ffn_up"][0]
-    return g != u and {g, u} <= set(NPU_COLPAIR)
+    return (g != u or (QCP and NPU_Q and g != "iq4xs")) and {g, u} <= set(NPU_COLPAIR)
 
 
 def gu_fmt(fmt):
@@ -1280,8 +1284,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         dok = lambda l: l["ffn_down"][0] == "iq4xs" or (dn4 and np4(l["ffn_down"][0]) and l["ffn_down"][0] != "q4k")
         ok = [l for l in ok if l["ffn_gate"][0] == "iq4xs" and dok(l)]
         # pairs: gate and up of one QSW_FMTS format without a fused GPU gate / up (the GPU's side a pair's, the NPU's
-        # one qsw image of that format)
-        pairs = [l for l in pairs if l["ffn_gate"][0] == l["ffn_up"][0] in QSW_FMTS and dok(l)]
+        # one qsw image of that format); QCP: column pairs (colpair), one format's too (taken from ok's candidates)
+        if QCP:
+            pairs += [l for l in by.values() if l.get("ffn_gate") and l.get("ffn_gate") == l.get("ffn_up")
+                      and l not in pairs and colpair(l) and l.get("ffn_down", ("",))[0] in dfmts]
+        pairs = [l for l in pairs if (l["ffn_gate"][0] == l["ffn_up"][0] in QSW_FMTS or (QCP and colpair(l))) and dok(l)]
     # pairs of one format of NPU_SAME_SW: one image like a single format's, with the deferred epilogue
     # ("npu_ffnsw_<gate>_<up>"); column pairs; the other pairs take the BFP image (bsw)
     mixed = [l for l in pairs if l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW or colpair(l)]
@@ -1339,8 +1346,13 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 jobs.append((npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * 288, swcol=32,
                                      hpass=F // 1024, hord=hord, fmt="BFP", dfr=1), "npu_ffnsw_bfp_" + hord.lower(), 4))
             continue
-        if colpair({"ffn_gate": (gf,), "ffn_up": (uf,)}):   # (column pairs; Q4_K in P4 order: gen_npu_dec "GF")
-            go = lambda f: "GF" if f == "q4k" else "P4"
+        go = lambda f: "GF" if f == "q4k" else "P4"
+        if NPU_Q and colpair({"ffn_gate": (gf,), "ffn_up": (uf,)}):   # (Q' column pairs: H as the qsw image's)
+            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=kb * 256,
+                            fmt=gu_fmt(gf), gord=go(gf), rawdma=1, qsw=True, dgu=0, swcol=32, hpass=F // 256, hord=hord,
+                            ufmt=gu_fmt(uf), ugord=go(uf))
+            QJOB_ENV["npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower())] = dict(GN_QFEGR2="0")
+        elif colpair({"ffn_gate": (gf,), "ffn_up": (uf,)}):   # (column pairs; Q4_K in P4 order: gen_npu_dec "GF")
             cfg = npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, swcol=32, hpass=F // 1024, hord=hord, fmt=gu_fmt(gf),
                           gord=go(gf), ufmt=gu_fmt(uf), ugord=go(uf), dfr=1)
         elif NPU_Q:   # (Q': one format, the qsw image as above)

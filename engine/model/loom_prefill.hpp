@@ -1069,7 +1069,9 @@ class LoomPrefill {
       return false;
     // gate and up of one format with a fused GPU gate / up: one image (its columns compute both); else a pair: the GPU's
     // side two splits, the NPU's one mixed (or BFP) image
-    const std::string hal = tg->type == tu->type ? AfHal(GemmHal("gemm_ffn", *tg, &f), ".af.to.hal") : "";
+    // (dispatch.txt "npuffncp_<gate>_<up>" of one format, emit_prefill_pp QCP: a Q' column-pair image, so the pair path)
+    const bool cprow = geom_.count("npuffncp_" + std::string(f.name) + "_" + fu.name) != 0;
+    const std::string hal = tg->type == tu->type && !cprow ? AfHal(GemmHal("gemm_ffn", *tg, &f), ".af.to.hal") : "";
     const bool pair = hal.empty();
     // (bmix: a pair whose NPU rows the emitter pre-decoded, emit_prefill_pp NPU_BFPSW: one BFP image like a single
     // format's, "npu_ffnsw_bfp<hord>", on npu_bfp_<pre>ffn_gate_up.bin)
@@ -1166,7 +1168,8 @@ class LoomPrefill {
     for (std::uint32_t j = 0; j < F / 256 && cpair; ++j)
       csw.push_back(npu_->BindRawPair(sw + ".xdna", sw + ".xdna", 100 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
                                       cg.p + (f0 + 256 * j) * cg.rb, col_bytes(cg, tg, f),
-                                      cu.p + (f0 + 256 * j) * cu.rb, col_bytes(cu, tu, fu), c_sw(j), "ffnsw" + hord));
+                                      cu.p + (f0 + 256 * j) * cu.rb, col_bytes(cu, tu, fu), c_sw(j),
+                                      "ffnsw" + hord + (qffn ? std::string("_") + f.name + "_" + fu.name : "")));
     for (std::uint32_t j = 0; j < F / 256 && !cpair; ++j)
       csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".xdna", mix && !bmix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(gdec), ag,
                                   pg + (f0 + 256 * j) * rb,
