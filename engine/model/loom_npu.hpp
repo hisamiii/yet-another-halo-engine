@@ -112,7 +112,46 @@ class LoomNpu {
   struct Call {
     const Kernel* k = nullptr;
     std::vector<std::uint8_t> push[2], wait, lead, gate, done, call;
+    // lead split at the gate (SplitLead): lead_pre before it, lead_post after; both empty when lead does not split
+    std::vector<std::uint8_t> lead_pre, lead_post;
   };
+  // A job's lead push is ~150 register writes (~85K array cycles of the command processor) before its first call's
+  // data moves. Only its shim read starts (MM2S queue starts: the activations, which the GPU writes, and the raw
+  // weights) must wait for the gate; its descriptors and the memory-tile, core and shim write (C) queue starts can run
+  // before it, in the wait for the GPU. YAH_NPU_PRELEAD=0: the whole lead after the gate (as before 11-18).
+  static void SplitLead(const std::vector<std::uint8_t>& lead, std::vector<std::uint8_t>& pre,
+                        std::vector<std::uint8_t>& post) {
+    pre.clear(), post.clear();
+    static const bool off = [] {
+      const char* v = std::getenv("YAH_NPU_PRELEAD");
+      return v && v[0] == '0';
+    }();
+    std::uint32_t size = 0;
+    if (off || lead.size() < 16 || (std::memcpy(&size, lead.data() + 12, 4), size != lead.size())) return;
+    std::vector<std::uint8_t> a(lead.begin(), lead.begin() + 16), b = a;
+    std::uint32_t na = 0, nb = 0;
+    for (std::size_t o = 16; o < size;) {
+      std::uint32_t len = 0, addr = 0;
+      switch (lead[o]) {   // libamdf transaction 0.1 operations
+        case 0: len = 24; break;
+        case 3: len = 28; break;
+        case 1: std::memcpy(&len, lead.data() + o + 12, 4); break;
+        default: return;   // (anything else: no split)
+      }
+      if (len < 16 || o + len > size) return;
+      std::memcpy(&addr, lead.data() + o + 8, 4);
+      const std::uint32_t row = (addr >> 20) & 31, off_ = addr & 0xFFFFF;
+      const bool start = lead[o] == 0 && row == 0 && (off_ == 0x1D214 || off_ == 0x1D21C);   // shim MM2S0 / 1 queue
+      (start ? b : a).insert((start ? b : a).end(), lead.begin() + o, lead.begin() + o + len);
+      ++(start ? nb : na);
+      o += len;
+    }
+    if (!na || !nb) return;
+    const std::uint32_t sa = static_cast<std::uint32_t>(a.size()), sb = static_cast<std::uint32_t>(b.size());
+    std::memcpy(&a[8], &na, 4), std::memcpy(&a[12], &sa, 4);
+    std::memcpy(&b[8], &nb, 4), std::memcpy(&b[12], &sb, 4);
+    pre.swap(a), post.swap(b);
+  }
 
   LoomNpu(LoomDevice& gpu, std::uint32_t columns) : gpu_(gpu), columns_(columns) {
     YAH_AMDF(amdf_query_api(AMDF_ABI_VERSION_LATEST, AMDF_ABI_VERSION_LATEST, &api_), "query_api");
@@ -370,12 +409,14 @@ class LoomNpu {
     const Call c = Snapshot(k);
     DumpInvocations(k, c);
     std::vector<const std::vector<std::uint8_t>*> seq{&c.gate};
+    const bool pre = k.streamed && !c.lead_pre.empty();
+    if (pre) seq.insert(seq.begin(), &c.lead_pre);
     if (!k.streamed) {
       for (int i = 0; i < calls; ++i) seq.push_back(&c.call);
     } else {
       int queued = 0;
       for (int i = 0; i < calls; ++i) {
-        seq.push_back(i == 0 ? &c.lead : &c.push[i & 1]);
+        seq.push_back(i == 0 ? (pre ? &c.lead_post : &c.lead) : &c.push[i & 1]);
         if (++queued == k.depth) seq.push_back(&c.wait), --queued;
       }
       for (; queued > 0; --queued) seq.push_back(&c.wait);
@@ -385,8 +426,9 @@ class LoomNpu {
                  k.streamed ? "streamed" : "plain", k.depth, calls, seq.size());
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
-    // (diag) NPU_PROF_AT=<i>: the counters start before the job's i-th piece (0 the gate, 1 the lead push, ...)
-    const std::size_t prof_at = std::getenv("NPU_PROF_AT") ? std::atoi(std::getenv("NPU_PROF_AT")) : 0;
+    // (diag) NPU_PROF_AT=<i>: the counters start before the job's i-th piece (0 the gate, 1 the lead push, ...; with
+    // the split lead, 0 its part before the gate, 1 the gate, ...); default: at the gate, as in the engine
+    const std::size_t prof_at = std::getenv("NPU_PROF_AT") ? std::atoi(std::getenv("NPU_PROF_AT")) : pre ? 1 : 0;
     for (std::size_t s = 0; s < seq.size(); ++s) {
       const std::vector<std::uint8_t>* b = seq[s];
       std::uint32_t n = 0, size = 0;
@@ -583,6 +625,7 @@ class LoomNpu {
     };
     copy(k.push[0], c.push[0]), copy(k.push[1], c.push[1]), copy(k.wait, c.wait), copy(k.lead, c.lead);
     copy(k.gate, c.gate), copy(k.done, c.done), copy(k.call, c.call);
+    SplitLead(c.lead, c.lead_pre, c.lead_post);
     return c;
   }
 
@@ -1364,6 +1407,10 @@ class LoomNpu {
         lane_lost_ = false;
         fam = FamilyOf(k0), dec = k0->dec;
       }
+      // (SplitLead) the first call's lead before the gate, but its shim read starts, where no format swap comes first
+      const Call& c0 = *calls[0];
+      const bool pre = c0.k->streamed && !c0.lead_pre.empty() && !(c0.k->swap && c0.k->dec != dec);
+      if (pre) append(c0.lead_pre);
       append(calls[0]->gate);
       if (prof_) append_ops(prof_->Setup(calls[0]->k->path), prof_->SetupOps());
       if (!calls[0]->k->streamed) {
@@ -1380,7 +1427,7 @@ class LoomNpu {
           append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length, false));
           dec = c.k->dec, since = 0;
         }
-        append(since == 0 ? c.lead : c.push[since & 1]);
+        append(since == 0 ? (i == 0 && pre ? c.lead_post : c.lead) : c.push[since & 1]);
         ++since;
         if (++queued == c.k->depth) append(c.wait), --queued;
       }
