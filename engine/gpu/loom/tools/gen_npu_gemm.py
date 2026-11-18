@@ -2370,9 +2370,34 @@ def qf4r_other(e, NS, rawport, dp, direct):
     assert direct and QF_P1KD["raw"] == 2
     hlp = QF4R[0]["help"]
     e("^f4x:")
+    xw = QFCYC and os.environ.get("GN_QFW") in ("3", "4", "6")   # (diag) the branch's cycles: %qfc byte 56 (start: 60;
+    xw4 = xw and os.environ.get("GN_QFW") == "4"                # 4: up to its copies only; 5: the neighbour's first
+    xw5 = QFCYC and os.environ.get("GN_QFW") == "5"             # load only)
+    if xw:
+        e("  %qxp0 = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
+        e("  %qxk = mova.i32 32")
+        e("  %qxm = mov.modifier %qxk")
+        e("  %qxp = padda.modifier %qxp0, %qxm")
+        e("  %qxa = mov.cycles")
+        e("  %qxal = slice %qxa[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+        e("  st %qxal, %qxp, 28")
     if not hlp:   # the helper's slab (two records) into the egress ring
         e("  %f4A2 = mova.i32 -2")
         qfw_wrap(e, "h", 36, [f"  acq %f4A2, {QF4R_NB}"])
+        if os.environ.get("GN_QFW") == "6" and QFCYC:   # (diag) branch start .. past the helper-record acquire,
+            e("  low.br ^q6a")                                # in its own block (no reordering across it)
+            e("^q6a:")
+            e("  %qxp20 = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
+            e("  %qxk2 = mova.i32 32")
+            e("  %qxm2 = mov.modifier %qxk2")
+            e("  %qxp2 = padda.modifier %qxp20, %qxm2")
+            e("  %qxb = mov.cycles")
+            e("  %qxbl = slice %qxb[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+            e("  %qxs = lda %qxp2, 28")
+            e("  %qxd = sub %qxbl, %qxs")
+            e("  %qxt = lda %qxp2, 24")
+            e("  %qxn = add.rr %qxt, %qxd")
+            e("  st %qxn, %qxp2, 24")
         qfw_wrap(e, "x", 40, [f"  acq %f4A2, {dp}"])
         e("  %f4pS = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
         e("  %f4pN4 = storage_address %f4s : low.storage<private> -> reg<aie2p.ep>")
@@ -2393,11 +2418,30 @@ def qf4r_other(e, NS, rawport, dp, direct):
         e("  %f4q_0 = mov.scalar-to-address %f4dst")
         # (the vector loads' address waits for a first load from the neighbour's memory: reads right past an acquire
         # can see its stores stale, crel_copy)
-        e("  %f4kk = lda %f4s0, 0")
-        e("  %f4z0 = mova.i32 0")
-        e("  %f4k0 = mul %f4kk, %f4z0")
-        e("  %f4km = mov.modifier %f4k0")
-        e("  %f4p_0 = padda.modifier %f4s0, %f4km")
+        body5 = ["  %f4kk = lda %f4s0, 0",
+                 "  %f4z0 = mova.i32 0",
+                 "  %f4k0 = mul %f4kk, %f4z0",
+                 "  %f4km = mov.modifier %f4k0",
+                 "  %f4p_0 = padda.modifier %f4s0, %f4km"]
+        if xw5:   # (the stamp after the address that waits on the load)
+            body5 += ["  %qx5s = mov.address-to-scalar %f4p_0", "  %qx5z = mul %qx5s, %f4z0"]
+        if xw5:
+            e("  %qx5p0 = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
+            e("  %qx5k = mova.i32 32")
+            e("  %qx5m = mov.modifier %qx5k")
+            e("  %qx5p = padda.modifier %qx5p0, %qx5m")
+            e("  %qx5a = mov.cycles")
+            e("  %qx5al = slice %qx5a[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+        for ln_ in body5:
+            e(ln_)
+        if xw5:
+            e("  %qx5b = mov.cycles")
+            e("  %qx5bl = slice %qx5b[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+            e("  %qx5bz = add.rr %qx5bl, %qx5z")
+            e("  %qx5d = sub %qx5bz, %qx5al")
+            e("  %qx5t = lda %qx5p, 24")
+            e("  %qx5n = add.rr %qx5t, %qx5d")
+            e("  st %qx5n, %qx5p, 24")
         nl = 2 * QF_P1KD["rec"] // 64
         if os.environ.get("GN_QF4RCOPY", "1") == "1":   # groups of 7: loads on both load units, then the stores (a
             cl_, sb_, db_ = [], "%f4p_0", "%f4q_0"           # load waits for the store before it: one pair a 7 cycles)
@@ -2411,6 +2455,18 @@ def qf4r_other(e, NS, rawport, dp, direct):
         else:
             cl_ = [ln for i in range(nl) for ln in (f"  %f4v_{i}, %f4p_{i + 1} = vlda.acc.post %f4p_{i}, 64",
                                                     f"  %f4q_{i + 1} = vst.acc.post %f4v_{i}, %f4q_{i}, 64")]
+        if xw4:
+            e("  %qxp20 = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
+            e("  %qxk2 = mova.i32 32")
+            e("  %qxm2 = mov.modifier %qxk2")
+            e("  %qxp2 = padda.modifier %qxp20, %qxm2")
+            e("  %qxb = mov.cycles")
+            e("  %qxbl = slice %qxb[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+            e("  %qxs = lda %qxp2, 28")
+            e("  %qxd = sub %qxbl, %qxs")
+            e("  %qxt = lda %qxp2, 24")
+            e("  %qxn = add.rr %qxt, %qxd")
+            e("  st %qxn, %qxp2, 24")
         qfw_wrap(e, "c", 48, cl_, mode="2")
         e("  %f4R2 = mova.i32 2")
         e(f"  rel %f4R2, {dp}")
@@ -2423,6 +2479,18 @@ def qf4r_other(e, NS, rawport, dp, direct):
     e(f"  %f4hv2 = lda %f4pN, {QF_SLAB}")
     e("  %f4hv3 = add %f4hv2, 1")
     e(f"  st %f4hv3, %f4pN, {QF_SLAB}")
+    if xw and not xw4 and os.environ.get("GN_QFW") != "6":
+        e("  %qxp20 = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
+        e("  %qxk2 = mova.i32 32")
+        e("  %qxm2 = mov.modifier %qxk2")
+        e("  %qxp2 = padda.modifier %qxp20, %qxm2")
+        e("  %qxb = mov.cycles")
+        e("  %qxbl = slice %qxb[0] : reg<aie2p.er x2> -> reg<aie2p.er>")
+        e("  %qxs = lda %qxp2, 28")
+        e("  %qxd = sub %qxbl, %qxs")
+        e("  %qxt = lda %qxp2, 24")
+        e("  %qxn = add.rr %qxt, %qxd")
+        e("  st %qxn, %qxp2, 24")
     e("  low.br ^fzh")
 
 
@@ -5135,7 +5203,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 dqc_ = os.environ.get("DQ_CYC") == "1"   # (diag: word 1 the decoder's cycles, word 4 its hot loop's)
                 for w_, o_ in ((1, 16 if dqc_ else 4), (2, 12), (3, 24)) + (((4, 28),) if dqc_ else ()) + (
                         ((5, 32), (6, 36), (7, 40)) if os.environ.get("GN_QFW") == "1" else
-                        ((5, 44), (6, 48)) if os.environ.get("GN_QFW") == "2" else ()):
+                        ((5, 44), (6, 48)) if os.environ.get("GN_QFW") == "2" else
+                        ((5, 56),) if os.environ.get("GN_QFW") in ("3", "4", "5", "6") else ()):
                     if o_ >= 32 and w_ == 5:   # (offsets past the lda immediate: a pointer 32 on)
                         e("  %qfkL = mova.i32 32")
                         e("  %qfmL = mov.modifier %qfkL")

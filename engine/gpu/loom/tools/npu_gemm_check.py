@@ -316,6 +316,8 @@ def main():
                     print(f"  fill row {r_}: decoder/egress {u_[1]} whole fill {u_[2]} raw waits {u_[3]} hot {u_[4]}")
                     if os.environ.get("GN_QFW") == "2":   # (diag) the gate check, the helper record copies
                         print(f"  fill row {r_}: gate check {u_[5]} copies {u_[6]}")
+                    if os.environ.get("GN_QFW") in ("3", "4", "5", "6"):   # (diag) the helper-record branch's cycles
+                        print(f"  fill row {r_}: helper-record branch {u_[5]}")
                     if os.environ.get("GN_QFW") == "1":   # (diag) the egress slot waits (own, copy), helper waits
                         print(f"  fill row {r_} waits: own egress {u_[5]} helper records {u_[6]} copy egress {u_[7]}")
             if os.environ.get("DQ_CYC") == "1":   # (diag) word 1: the decoder's cycles; word 4: its hot loop's
