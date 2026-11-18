@@ -418,6 +418,7 @@ def array_program(L, cfg):
             rs_ = rw if os.environ.get("GN_QRAWCONTIG") == "1" else RS
             if cfg.qsw and qswdiag() != "convert":   # (FFN gate / up) per step: the column's 2 gate slabs, then the
                 # same up rows dgu bytes on
+                # (not odd: the pair axis would need the descriptor chain that the gate-to-up stride takes)
                 assert NP == 4 and not r4 and cfg.dgu % 4 == 0 and not odd
                 e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{U * N.FUSE_SB}x2x2x16x{rw}xi32, "
                   f"#encoding.layout.strided<strides=[{BLK // 4}, {cfg.dgu // 4}, {16 * rs_}, {rs_}, 1]>>>")

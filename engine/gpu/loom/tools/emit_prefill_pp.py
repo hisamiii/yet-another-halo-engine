@@ -826,6 +826,11 @@ NPU_KCALL = 8 * sum(NPU_KS) * NPU_PASSES   # K per call (5120)
 # Tried, not kept: the GPU window's residual epilogue waiting for the NPU (npuffnres): only 20 of its workgroups fit at
 # once, so while the NPU is the late one the rest of the GPU's down starts after the NPU's (~5 ms a layer).
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
+# (Q' P1K) the formats whose site images are NP 4 (512-row calls: the grid decoders' tables, Q4_K's program and Q5_K's
+# raw ring do not fit an NP 5 core): those layers' sites take NPU rows rounded down to 512 (npu_rows4) and their own
+# unpacks / conv split at TN 64 ("<hal>_4.hal"); dispatch.txt "npusplit4_<site>", "npurows4", "npubytes4_5120",
+# "npunp4_<fmt>" (LoomPrefill::Np4)
+QNP4_FMTS = tuple(os.environ.get("YAH_NPU_NP4", "iq3s,iq3xxs,iq2s,iq2xs,q3k,q4k,q5k").split(","))   # (YAH_NPU_NP4: a subset)
 QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (npu_images source)
 
 
@@ -877,6 +882,26 @@ def fit_rowgrp(t, mt):
             except ValueError:
                 pass
     raise SystemExit("no row group of %s divides %d row tiles" % (t, mt))
+
+
+def np4(fmt):
+    """fmt's Q' site images are NP 4 (QNP4_FMTS)."""
+    return NPU_QP1K and fmt in QNP4_FMTS
+
+
+# YAH_NPU_SPLIT4="<site>=<rows>,...": the NP 4 formats' layers' NPU rows (multiples of 512; a site not named: NPU_SPLIT's
+# rows rounded down). Their calls take ~20-40% more NPU cycles a row than NP 5's (each 512-row call streams the whole A,
+# as a 640-row call does). 11-18 pp2048 at p2ffq's split (night log 41): qkv 4608 -2.4% vs IQ4_XS-only sites; the NPU
+# spans' balance (qkv 4608, gate 2560, q 4096, out 2048) +7.0%; q 4096 alone +0.9%.
+NPU_SPLIT4 = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("YAH_NPU_SPLIT4", "qkv=4608").split(",")
+                                           if x))
+
+
+def npu_rows4(site):
+    """A site's NPU rows in the layers of NP 4 formats (np4)."""
+    n = NPU_SPLIT4.get(site, NPU_SPLIT[site] // 512 * 512)
+    assert n % 512 == 0 and 0 <= n < NPU_SITES[site][1] * 16, (site, n)
+    return n
 
 
 def npu_split(rows, combos, B, outdir):
@@ -938,12 +963,14 @@ def npu_split(rows, combos, B, outdir):
                     split(fmt, kind, mt, kb, ta, base[:-4] + ".af.p3.hal", nn, persist=pt, tokens=B - ta.bn)
 
     done = set()
-    images, bsites = set(), set()
+    images, bsites, sites4 = set(), set(), set()
     for kind, fmt, port, mt, kb in sorted(combos):
         for site, (skind, smt, skb) in NPU_SITES.items():
             if site not in NPU_SPLIT or mt != smt or kb * qk_of(fmt) != skb * 256 or fmt not in TILE_FMTS:
                 continue
-            nn = NPU_SPLIT[site]
+            nn = npu_rows4(site) if np4(fmt) else NPU_SPLIT[site]
+            if not nn:
+                continue
             if skind == "kres":
                 if kind != "residual":
                     continue
@@ -953,7 +980,11 @@ def npu_split(rows, combos, B, outdir):
             else:
                 continue
             chunked = len(npu_chunks(site)) > 1 or npu_rem(site)
-            if fmt in FUSE_FMTS:
+            if NPU_Q and (fmt == "iq4xs" or np4(fmt)):   # (Q': IQ4_XS, the NP 4 formats)
+                images.add((fmt, kb * 256))
+                if np4(fmt):
+                    sites4.add(site)
+            elif fmt in FUSE_FMTS and not NPU_Q:
                 images.add((fmt, kb * 256))
             elif not chunked and skind != "kres" and not NPU_Q:   # (BFP site rows; Q': those layers stay on the GPU)
                 images.add(("bfp", skb * 256))
@@ -1014,13 +1045,13 @@ def npu_split(rows, combos, B, outdir):
             open(src, "w").write(gen_postnorm_bfp.gen(B, 0, DNSPLIT[0], list(NPU_KS), NPU_PASSES, tiled, 384 in O16_MT))
             E.emit(src, ["yah_ssm_postnorm_fp16.head_count=%d" % (DNSPLIT[0] * B)], name, outdir)
         out.append(("npupostnormbfp", 1, 0, 0))
-    # unpacks
-    for site, n in sorted(NPU_SPLIT.items()):
+    # unpacks (the NP 4 formats' sites: TN 64, "_4")
+    def unpacks(site, n, sfx):
         skind, mt, kb = NPU_SITES[site]
         N = mt * 16
         f = {"qkv": dict(out16=True), "gate": dict(out16=True), "q": dict(qg=True),
              "out": dict(resid=True, parts=len(npu_chunks("out")), rem=True)}[site]
-        name = "npu_unpack_%s.hal" % site
+        name = "npu_unpack_%s%s.hal" % (site, sfx)
         src = os.path.join(tmp, name[:-4] + ".loom")
         open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
         E.emit(src, ["nop=0"], name, outdir)
@@ -1029,18 +1060,24 @@ def npu_split(rows, combos, B, outdir):
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads
             for hal, text, cfg in (
-                    ("npu_unpack_qkv_tail.hal", GU.gen(B, n // GN.TN, N, N - n, out16=True, last8=True), ["nop=0"]),
-                    ("convkq_g.hal", gen_conv_kq.gen(N - n), ["yah_ssm_conv_kq.batch=%d" % B,
-                                                            "yah_ssm_conv_kq.qkv_dim=10240",
-                                                            "yah_ssm_conv_kq.num_key_heads=16"]),
-                    ("convkq_c.hal", gen_conv_kq.gen_c(N - n, n // GN.TN, B), ["nop=0"])):
+                    ("npu_unpack_qkv_tail%s.hal" % sfx, GU.gen(B, n // GN.TN, N, N - n, out16=True, last8=True),
+                     ["nop=0"]),
+                    ("convkq_g%s.hal" % sfx, gen_conv_kq.gen(N - n), ["yah_ssm_conv_kq.batch=%d" % B,
+                                                                      "yah_ssm_conv_kq.qkv_dim=10240",
+                                                                      "yah_ssm_conv_kq.num_key_heads=16"]),
+                    ("convkq_c%s.hal" % sfx, gen_conv_kq.gen_c(N - n, n // GN.TN, B), ["nop=0"])):
                 src = os.path.join(tmp, hal[:-4] + ".loom")
                 open(src, "w").write(text)
                 E.emit(src, cfg, hal, outdir)
-            out.append(("npu_unpack_qkv_tail.hal", n // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))   # 8 tokens x n / 8 items
-            out.append(("convkq_g.hal", gen_conv_kq.tiles(N - n), 256, 0))
-            out.append(("convkq_c.hal", n // gen_conv_kq.cw(n), gen_conv_kq.cw(n), B // gen_conv_kq.TC))
-        out.append(("npusplit_" + site, n, 0, 0))
+            out.append(("npu_unpack_qkv_tail%s.hal" % sfx, n // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))   # 8 tokens x n / 8 items
+            out.append(("convkq_g%s.hal" % sfx, gen_conv_kq.tiles(N - n), 256, 0))
+            out.append(("convkq_c%s.hal" % sfx, n // gen_conv_kq.cw(n), gen_conv_kq.cw(n), B // gen_conv_kq.TC))
+        out.append(("npusplit%s_%s" % (sfx[1:], site), n, 0, 0))
+    for site, n in sorted(NPU_SPLIT.items()):
+        unpacks(site, n, "")
+    for site in sorted(sites4):
+        with GN.np_override(4):
+            unpacks(site, npu_rows4(site), "_4")
     # one graph per chunk: the GPU waits for each NPU job on a flag word (gen_npu_unpack.gen_flag_wait)
     src = os.path.join(tmp, "npu_flag_wait.loom")
     open(src, "w").write(GU.gen_flag_wait())
@@ -1067,13 +1104,14 @@ def npu_images(images, B, tmp, outdir, extra=()):
     import hrx_paths
     assert images, "an NPU split needs a site the NPU computes"
     if NPU_Q:   # (layout Q': gen_npu_q)
-        # (IQ4_XS only: the layers of other formats keep the site on the GPU, LoomPrefill::DcolImage)
-        images = {(f, K) for f, K in images if f == "iq4xs"}
+        # (IQ4_XS and the NP 4 formats: the layers of other formats keep the site on the GPU, LoomPrefill::DcolImage)
+        images = {(f, K) for f, K in images if f == "iq4xs" or np4(f)}
         import gen_npu_q as Q
         Q.defaults(p1k=NPU_QP1K)
         Q.QROWS = NPU_Q
         jobs = [(GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K,
-                           fmt=DCOL_FMTS[fmt][0], rawdma=1), "npu_dcol_%s_%d" % (fmt, K), NPU_NP if NPU_QP1K else GN.NP)
+                           fmt=DCOL_FMTS[fmt][0], rawdma=1), "npu_dcol_%s_%d" % (fmt, K),
+                 4 if np4(fmt) else NPU_NP if NPU_QP1K else GN.NP)
                 for fmt, K in sorted(images)]
     else:
         jobs = [(npu_cfg(B, NPU_KS, NPU_PASSES, kraw=K, fmt=DCOL_FMTS[fmt][0], **KCHAIN(fmt)),
@@ -1131,8 +1169,14 @@ def npu_images(images, B, tmp, outdir, extra=()):
     for (cfg, name, _), r in zip(jobs, rs):
         if r.returncode:
             raise SystemExit("NPU image compile failed (%s): %s" % (name, r.stderr[-800:]))
-    out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(jobs[0][0])),
+    j0 = next(j for j in jobs if j[2] == NPU_NP)
+    out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(j0[0])),
            ("npurows", NPU_ROWS, 0, 0)]
+    j4 = [j for j in jobs if NPU_Q and j[2] == 4 and j[0].fmt != "IQ4_XS" and not j[0].qsw]
+    if j4 and NPU_QP1K:   # (the NP 4 formats' site images, np4)
+        with GN.np_override(4):
+            out += [("npubytes4_5120",) + tuple(GN.stream_bytes(j4[0][0])), ("npurows4", NPU_COLS * 64, 0, 0)]
+        out += [("npunp4_" + f, 1, 0, 0) for f in sorted({f for f, _ in images if np4(f)})]
     # (Q': the NPU queues one call at most; at depth 2 a core's next fill overwrote its undrained C (its rings overlay C
     # slots 1-3). P1K images with GN_QFGUARD wait for the drain in the fill and ran bit-exact at depth 2, but 1 of 47
     # engine runs hung (NPU firmware timeout, cause unknown, 11-18): depth 1 until explained; YAH_NPU_DEPTH2=1 at run

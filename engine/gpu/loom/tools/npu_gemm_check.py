@@ -143,7 +143,7 @@ def main():
         t = next(x for x in rd.tensors if x.tensor_type.name == fmt and len(x.shape) == 2
                  and int(x.shape[0]) == KR and int(x.shape[1]) >= Nn)
         if qsw:   # W = [gate rows][up rows], N / 2 each; the raw stream's up rows dgu bytes after the gate rows
-            assert QMODE and N.NP == 4 and fmt == "IQ4_XS" and not k0r
+            assert QMODE and N.NP == 4 and not k0r
             ts_ = {x.name: x for x in rd.tensors}
             lay_ = os.environ.get("NPU_QSW_LAYER") or next(
                 n_.split(".")[1] for n_ in ts_ if n_.endswith("ffn_gate.weight") and ts_[n_].tensor_type.name == fmt
