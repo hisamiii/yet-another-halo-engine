@@ -1118,8 +1118,10 @@ def npu_images(images, B, tmp, outdir, extra=()):
             raise SystemExit("NPU image compile failed (%s): %s" % (name, r.stderr[-800:]))
     out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(jobs[0][0])),
            ("npurows", NPU_ROWS, 0, 0)]
-    # (Q': the NPU queues one call at most; at depth 2 the next call's data corrupts the running one's)
-    return out + [("npugfirst", 1, 0, 0)] + ([("npudepth1", 1, 0, 0)] if NPU_Q else [])
+    # (Q': the NPU queues one call at most; at depth 2 a core's next fill overwrote its undrained C (its rings overlay C
+    # slots 1-3). P1K images with GN_QFGUARD wait for the drain in the fill: depth 2.)
+    guard = NPU_QP1K and os.environ.get("GN_QFGUARD") == "1"
+    return out + [("npugfirst", 1, 0, 0)] + ([("npudepth1", 1, 0, 0)] if NPU_Q and not guard else [])
 
 
 def bfp_units(w, kperm):

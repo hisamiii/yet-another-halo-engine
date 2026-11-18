@@ -1446,6 +1446,12 @@ def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None, tail=False):
             e(f"^fzne{i}:")
     for i, g in enumerate([range(q.passes)] if q is not None else fuse_groups(cfg)):   # (Q': one fill a call)
         e(f"^fzgo{i}:")
+        if i == 0 and q is not None and os.environ.get("GN_QFGUARD") == "1":
+            # (GN_QFGUARD=1) the fill's rings overlay C slots 1-3 (the helper's records, the egress ring): wait (an
+            # acquire-equal) until the last call's C left the slots. Only a queue depth 2 (the next call's tasks
+            # queued while this one runs) can start a fill before that.
+            e(f"  %fzgd = mova.i32 {int(os.environ.get('GN_QFGUARD_N', MP))}")
+            e("  acq %fzgd, 2")
         if QFCYC and q is not None:
             e("  %qfpz = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
             e("  %qfz = mova.i32 0")

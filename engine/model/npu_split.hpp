@@ -27,8 +27,8 @@ struct NpuPlan {
   // dispatch.txt "npugfirst": the images' setups run no call (gen_npu_gemm gfirst: the gate waits at a job's first
   // firing).
   bool gfirst = false;
-  // dispatch.txt "npudepth1": one call queued at most (layout Q': at depth 2 the next call's data corrupts the
-  // running one's; its check runs identical calls, so it cannot see it).
+  // dispatch.txt "npudepth1": one call queued at most (layout Q' without GN_QFGUARD: at depth 2 a core's next fill
+  // writes its rings over C slots its last call may not have drained; guarded P1K sets run at depth 2).
   bool depth1 = false;
 };
 
