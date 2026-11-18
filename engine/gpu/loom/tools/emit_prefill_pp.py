@@ -1267,7 +1267,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up", "ffn_down") and E.FMT.get(ty):
             by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
     fmts, dfmts = FUSE_FFN_FMTS, FUSE_FFN_DOWN_FMTS
-    hord_of = lambda d: "Q4K" if d == "q4k" else "P4"   # H's k-block order: the down decoder's (P4 but Q4_K's)
+    # H's k-block order: the down decoder's (P4 but Q4_K's; Q': P4, Q4_K's down decodes in P4 order, gord "GF")
+    hord_of = lambda d: "Q4K" if d == "q4k" and not NPU_Q else "P4"
+    # (Q', YAH_NPU_FFNQ4K=1: the layers with Q4_K downs too; off: at FFNBLK 5120 the NPU is the critical path, p6d
+    # pp2048 2286.9 ms vs 2158.0 without them)
+    q4kdn = os.environ.get("YAH_NPU_FFNQ4K", "0") == "1"
     rows = NPU_ROWS if NPU_QP1K else NPU_COLS * 64   # down rows per call (NP 4; Q': the P1K site image's)
     assert not NPU_Q or (NPU_QP1K and F == NPU_KCALL), "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and F = 5120"
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
@@ -1277,11 +1281,10 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
              and (l["ffn_gate"][0] != l["ffn_up"][0] or l["ffn_gate"][0] not in AF_FFN)
              and l["ffn_gate"][1:] == l["ffn_up"][1:] and l["ffn_gate"][0] in fmts and l["ffn_up"][0] in fmts
              and l.get("ffn_down", ("",))[0] in dfmts]
-    if NPU_Q:   # (Q': IQ4_XS gate and up; down IQ4_XS or an NP 4 format but Q4_K, whose H order the gate / up image
-        # does not write yet; the other layers keep the FFN on the GPU)
+    if NPU_Q:   # (Q': IQ4_XS gate and up; down IQ4_XS or an NP 4 format; the other layers keep the FFN on the GPU)
         # (YAH_NPU_FFNDN4=0: IQ4_XS downs only)
         dn4 = os.environ.get("YAH_NPU_FFNDN4", "1") != "0"
-        dok = lambda l: l["ffn_down"][0] == "iq4xs" or (dn4 and np4(l["ffn_down"][0]) and l["ffn_down"][0] != "q4k")
+        dok = lambda l: l["ffn_down"][0] == "iq4xs" or (dn4 and np4(l["ffn_down"][0]) and (q4kdn or l["ffn_down"][0] != "q4k"))
         ok = [l for l in ok if l["ffn_gate"][0] == "iq4xs" and dok(l)]
         # pairs: gate and up of one QSW_FMTS format without a fused GPU gate / up (the GPU's side a pair's, the NPU's
         # one qsw image of that format); QCP: column pairs (colpair), one format's too (taken from ok's candidates)
@@ -1331,7 +1334,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         for passes in sorted({p for _, p in parts}):
             if NPU_Q:   # (Q': the site image of down's raw K, A bound to H; the NP 4 formats' at NP 4)
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
-                                       kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1),
+                                       kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1,
+                                       gord="GF" if fmt == "q4k" else "P4"),   # (H in P4 order)
                              "npu_ffndn%d_%s" % (passes, fmt), 4 if np4(fmt) else NPU_NP))
                 continue
             jobs.append((npu_cfg(B, NPU_KS, passes, kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0],

@@ -1086,8 +1086,9 @@ class LoomPrefill {
     const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
     // the GPU's down over its features: f32 for npu_unpack_ffnblk
     const std::string rem = "npuffnrem_" + std::string(fd.name) + "_" + std::to_string(kbw) + ".hal";
-    // gate / up write H in the down decoder's k-block order (emit_prefill_pp FFNBLK_HORD: P4 but Q4_K's)
-    const std::string hord = std::strcmp(fd.name, "q4k") == 0 ? "_q4k" : "_p4";
+    // gate / up write H in the down decoder's k-block order (emit_prefill_pp FFNBLK_HORD: P4 but Q4_K's; Q', dispatch.txt
+    // "npuffnq": P4, the Q4_K down decodes in P4 order)
+    const std::string hord = std::strcmp(fd.name, "q4k") == 0 && !geom_.count("npuffnq") ? "_q4k" : "_p4";
     // (mix: a pair whose formats share a decoder, emit_prefill_pp mixed: the GPU's side a pair's, the NPU's one image like
     // a single format's, "npu_ffnsw_<gate>_<up>")
     const std::string mixed = dir_ + "/npu_ffnsw_" + f.name + "_" + fu.name + hord;
