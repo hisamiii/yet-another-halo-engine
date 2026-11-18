@@ -994,7 +994,7 @@ class LoomNpu {
     int dec = -1;
     if (PeerRan()) {   // the other context's commands ran on the array: its state is theirs now, set up in full
       std::lock_guard<std::mutex> lock(mu_);
-      resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, lane_lost_ = true, pair_resident_ = false, ++epoch_;
+      resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, lane_lost_ = true, ++epoch_;
     }
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -1191,9 +1191,18 @@ class LoomNpu {
     // ran there since, and an image never writes its own read-only data
     std::vector<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>> rodata =
         std::vector<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>>(kCols * kRows);
+    // per column, the shim masters (bit m = master m) that route from slave 5 (MM2S0, the packet lane's source) in the
+    // array now: the last setup's, or all of them when unknown
+    std::array<std::uint32_t, kCols> s5 = AllS5();
+    static std::array<std::uint32_t, kCols> AllS5() {
+      std::array<std::uint32_t, kCols> a{};
+      a.fill(0x3FFFF8u & ~(1u << 17));   // masters 3-21 but the lane's 17 (2: the token route)
+      return a;
+    }
     void Forget() {
       std::fill(known.begin(), known.end(), 0);
       for (auto& r : rodata) r.clear();
+      s5 = AllS5();
     }
   };
   // A setup (transaction) with its program loads cut to the words the array does not hold already and its read-only
@@ -1216,6 +1225,7 @@ class LoomNpu {
     std::vector<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>> rodata(program_.rodata.size());
     std::vector<std::uint8_t> touched(program_.rodata.size());
     PacketSetup ps;
+    std::array<std::uint32_t, ProgramState::kCols> s5 = program_.s5;   // (this setup's shim masters from MM2S0)
     for (std::size_t o = 16; o < size;) {
       std::uint32_t len = 0, addr = 0;
       switch (src[o]) {   // libamdf transaction 0.1 operations (Loom's xdna_product.c)
@@ -1228,6 +1238,15 @@ class LoomNpu {
       if (len < 16 || o + len > size) throw LoomError("npu: setup operation outside its command");
       std::memcpy(&addr, src + o + 8, 4);
       const std::uint32_t col = addr >> 25, row = (addr >> 20) & 31, off = addr & 0xFFFFF;
+      if (row == 0 && col < ProgramState::kCols && (src[o] == 0 || src[o] == 1) && off >= 0x3F000 && off < 0x3F058) {
+        const std::uint32_t nw = src[o] == 0 ? 1 : (len - 16) / 4;
+        for (std::uint32_t q = 0; q < nw && off + 4 * q < 0x3F058; ++q) {
+          std::uint32_t v = 0;
+          std::memcpy(&v, src + o + 16 + 4 * q, 4);
+          const std::uint32_t m = (off - 0x3F000) / 4 + q;
+          s5[col] = v == 0x80000005 ? s5[col] | 1u << m : s5[col] & ~(1u << m);
+        }
+      }
       if (packets && col < ProgramState::kCols && ps.Take(src + o, len, col, row, off, out, ops)) {
         o += len;
         continue;
@@ -1305,6 +1324,7 @@ class LoomNpu {
     for (std::size_t t = 0; t < touched.size(); ++t)
       if (touched[t]) program_.rodata[t] = std::move(rodata[t]);
     if (packets) ControlPackets(ps, out, ops);
+    program_.s5 = s5;
     const std::uint32_t bytes = static_cast<std::uint32_t>(out.size());
     std::memcpy(&out[8], &ops, 4), std::memcpy(&out[12], &bytes, 4);
     return out;
@@ -1497,9 +1517,13 @@ class LoomNpu {
       for (std::uint32_t c = 0; c < PS::kCols; ++c) {
         if (!top[c]) continue;
         for (std::uint32_t m = 0; m < 22; ++m)
-          if (ps.shim[c][m] == 0x80000005) w32(tile(c, 0) | 0x3F000 + 4 * m, 0);
+          if (ps.shim[c][m] == 0x80000005 || (m != 17 && (program_.s5[c] >> m & 1)))
+            w32(tile(c, 0) | 0x3F000 + 4 * m, 0);
         w32(tile(c, 0) | 0x3F044, 0x80000005);                                // M17 <- S5 (MM2S0)
         w32(tile(c, 1) | 0xB0130, 0x80000000), w32(tile(c, 1) | 0xB0040, 0x8000000C);   // S12, M16 <- S12
+        // (Routes from MM2S0 zeroed above: the image's and the array's from the last setup. A Q' column pair image
+        // routes column 1's MM2S0 out master 12, the others out master 14; the old route stayed live through the next
+        // setup and the lane's packets left by it too, into the memory tile: the pair switches' stall.)
         // The lane takes arbiter 5 on the cores, one no image uses: images' packet-switched masters use arbiter 0
         // (row 2 of the gate columns 1-2: master 7 by msel 0). On arbiter 0 the lane's packets for those tiles also
         // went out that master, into the memory tile's DMA, and the NPU hung now and then after the switch.
@@ -1553,11 +1577,6 @@ class LoomNpu {
   // The peer's commands ran since the last family setup (EnqueueGated): the next one writes the packet lane's switches
   // itself (no control packets). Engine thread only.
   bool lane_lost_ = false;
-  bool pair_resident_ = false;   // FusedCommand: the array's last family setup was a Q' column-pair image's
-  static bool QPairImage(const std::string& path) {
-    const std::string stem = path.substr(path.find_last_of('/') + 1);
-    return stem.rfind("npu_ffnsw_", 0) == 0 && std::count(stem.begin(), stem.end(), '_') == 4;
-  }
   // A second context on the same array (a GEMM split's and an NPU attention's, SetPeer): the host orders the two. Each
   // command records the peer's commands enqueued so far (peer_need) and is submitted only once the peer retired them,
   // and a command after the peer's commands sets its image up in full (the peer's ran on the array in between).
@@ -1603,11 +1622,9 @@ class LoomNpu {
         // after the peer's commands (another image's routes on the array) the setup writes every switch itself
         // (YAH_NPU_NOPACKETS: diag, every switch)
         static const bool nopk = std::getenv("YAH_NPU_NOPACKETS") != nullptr;
-        // (Q' column-pair images "npu_ffnsw_<gate>_<up>_<hord>": the next setup's packets stalled the NPU) a switch
-        // to or from one writes by the microcontroller
-        const bool packets = !lane_lost_ && !nopk && !pair_resident_ && !QPairImage(k0->path);
+        const bool packets = !lane_lost_ && !nopk;
         append(DeltaSetup(k0->setup.data(), k0->setup.size(), packets));
-        lane_lost_ = false, pair_resident_ = QPairImage(k0->path);
+        lane_lost_ = false;
         fam = FamilyOf(k0), dec = k0->dec;
       }
       // (SplitLead) the first call's lead before the gate, but its shim read starts, where no format swap comes first
