@@ -116,12 +116,18 @@ class LoomPrefill {
       const auto parts = FfnBlkParts(FfnBlkF());
       p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls() *
                                                          NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c);
+      if (geom_.count("npuffnblk4"))
+        p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls(true) *
+                                                           NpuBytesOf("npubytes4_ffndn" + std::to_string(parts[0].second)).c);
     }
     p.dcol = geom_.count("npudcol") != 0;
     p.gfirst = geom_.count("npugfirst") != 0;
     p.depth1 = geom_.count("npudepth1") != 0;
     for (auto it = geom_.lower_bound("npunp4_"); it != geom_.end() && it->first.rfind("npunp4_", 0) == 0; ++it)
       p.no_packets.push_back("npu_dcol_" + it->first.substr(7) + "_");
+    for (auto it = geom_.lower_bound("npuffndn4_"); it != geom_.end() && it->first.rfind("npuffndn4_", 0) == 0; ++it)
+      for (const auto& [p0, passes] : FfnBlkParts(FfnBlkF()))   // (the NP 4 downs, npu_ffndn<passes>_<fmt>)
+        p.no_packets.push_back("npu_ffndn" + std::to_string(passes) + "_" + it->first.substr(10) + ".");
     if (p.dcol) {
       // the NPU decodes raw rows: W is one call's unread panel binding; A holds the p4 stream, then the pk one (Q4_K)
       p.w_bytes = std::max(NpuK(5120).w, geom_.count("npubytes4_5120") ? NpuK(5120, true).w : 0);
@@ -1029,8 +1035,13 @@ class LoomPrefill {
     return it == geom_.end() ? 0 : it->second.tokens;
   }
   // dispatch.txt "npuffnblk <F> <gate / up features a call: 256> <down rows a call>"
-  std::uint32_t FfnBlkRows() const { return geom_.at("npuffnblk").tt; }
-  std::uint32_t FfnBlkCalls() const { return (kHidden + FfnBlkRows() - 1) / FfnBlkRows(); }   // down calls per K part
+  // (np4: the NP 4 formats' downs, dispatch.txt "npuffnblk4", "npuffndn4_<fmt>", "npubytes4_ffndn<passes>" and
+  // npu_unpack_ffnblk_4.hal)
+  std::uint32_t FfnBlkRows(bool np4 = false) const { return geom_.at(np4 ? "npuffnblk4" : "npuffnblk").tt; }
+  std::uint32_t FfnBlkCalls(bool np4 = false) const {   // down calls per K part
+    return (kHidden + FfnBlkRows(np4) - 1) / FfnBlkRows(np4);
+  }
+  bool FfnDn4(const char* fmt) const { return geom_.count(std::string("npuffndn4_") + fmt) != 0; }
   // (first pass, passes) of down's K parts over F features: the fewest parts of at most 5 passes (a fused panel holds a
   // part), sizes balanced (emit_prefill_pp ffnblk_parts)
   static std::vector<std::pair<std::uint32_t, std::uint32_t>> FfnBlkParts(std::uint32_t F) {
@@ -1167,12 +1178,15 @@ class LoomPrefill {
                                   dgu + 255 * rb + 16 * blk + RecordRow(gdec),
                                   c_sw(j), "ffnsw" + hord));
     // down: per K part, FfnBlkCalls() calls of FfnBlkRows() rows (a last one ending at the last row)
-    const std::uint32_t rows = FfnBlkRows(), calls = FfnBlkCalls();
-    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c;
+    const bool dn4 = FfnDn4(fd.name);
+    const std::string bytes = dn4 ? "npubytes4_ffndn" : "npubytes_ffndn";
+    const std::uint32_t rows = FfnBlkRows(dn4), calls = FfnBlkCalls(dn4);
+    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf(bytes + std::to_string(parts[0].second)).c;
     for (std::size_t ci = 0; ci < parts.size(); ++ci) {
       const auto [p0, passes] = parts[ci];
-      const std::string fam = "ffndn" + std::to_string(passes);
-      const NpuBytes bd = NpuBytesOf("npubytes_" + fam);
+      // (an NP 4 down: its own family, its array state differs from the NP 5 images')
+      const std::string fam = "ffndn" + std::to_string(passes) + (dn4 ? std::string("_") + fd.name : "");
+      const NpuBytes bd = NpuBytesOf(bytes + std::to_string(passes));
       if (bd.c != cp) throw LoomError("prefill: the FFN block's down parts differ in C bytes");
       for (std::uint32_t r = 0; r < calls; ++r) {
         const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + 4 * p0;
@@ -1208,13 +1222,14 @@ class LoomPrefill {
     NpuJoin();
     // the sum into hidden() waits for the next layer's norm, which fuses it when it feeds the NPU (RunLayerNorm)
     ffn_pending_ = {doff, parts.size() * calls * cp};
-    if (!geom_.count("npu_unorm.hal")) FlushFfn();
+    ffn_pending4_ = dn4;
+    if (!geom_.count("npu_unorm.hal") || dn4) FlushFfn();   // (npu_unorm reads the NP 5 downs' C)
     return true;
   }
   // The FFN block's sum (hidden + the GPU's down + the NPU's partials) into hidden(), if RunFfnBlock left it pending.
   void FlushFfn() {
     if (!ffn_pending_.length) return;
-    NpuUnpack("npu_unpack_ffnblk.hal", std::exchange(ffn_pending_, {}),
+    NpuUnpack(ffn_pending4_ ? "npu_unpack_ffnblk_4.hal" : "npu_unpack_ffnblk.hal", std::exchange(ffn_pending_, {}),
               {Ref(*hidden_), {ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4}, Ref(*hidden2_)}, 8);
     std::swap(hidden_, hidden2_);
   }
@@ -2259,6 +2274,7 @@ class LoomPrefill {
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
   std::string norm_pk_;            // .. in the Q4_K order (RunLayerNorm pk)
   NpuView ffn_pending_{};          // the FFN block's partials not yet summed into hidden() (RunFfnBlock, FlushFfn)
+  bool ffn_pending4_ = false;      // ... from NP 4 down calls (npu_unpack_ffnblk_4.hal)
   std::string pending_norm_;       // a fused norm's f16 output still to record (RunLayerNorm, RunPendingNorm)
   NormOut pending_mode_{};
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)

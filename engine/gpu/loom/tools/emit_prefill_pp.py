@@ -1268,8 +1268,12 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
              and (l["ffn_gate"][0] != l["ffn_up"][0] or l["ffn_gate"][0] not in AF_FFN)
              and l["ffn_gate"][1:] == l["ffn_up"][1:] and l["ffn_gate"][0] in fmts and l["ffn_up"][0] in fmts
              and l.get("ffn_down", ("",))[0] in dfmts]
-    if NPU_Q:   # (Q': IQ4_XS gate, up and down only; the other layers keep the FFN on the GPU)
-        ok = [l for l in ok if l["ffn_gate"][0] == l["ffn_down"][0] == "iq4xs"]
+    if NPU_Q:   # (Q': IQ4_XS gate and up; down IQ4_XS or an NP 4 format but Q4_K, whose H order the gate / up image
+        # does not write yet; the other layers keep the FFN on the GPU)
+        # (YAH_NPU_FFNDN4=0: IQ4_XS downs only)
+        dn4 = os.environ.get("YAH_NPU_FFNDN4", "1") != "0"
+        ok = [l for l in ok if l["ffn_gate"][0] == "iq4xs" and (l["ffn_down"][0] == "iq4xs" or (
+            dn4 and np4(l["ffn_down"][0]) and l["ffn_down"][0] != "q4k"))]
         pairs = []
     # pairs of one format of NPU_SAME_SW: one image like a single format's, with the deferred epilogue
     # ("npu_ffnsw_<gate>_<up>"); column pairs; the other pairs take the BFP image (bsw)
@@ -1311,10 +1315,10 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                              tr.rowgrp, kfull=kb))
     for fmt, mt, kb in sorted({l["ffn_down"] for l in ok + pairs}):
         for passes in sorted({p for _, p in parts}):
-            if NPU_Q:   # (Q': the site image of down's raw K, A bound to H)
+            if NPU_Q:   # (Q': the site image of down's raw K, A bound to H; the NP 4 formats' at NP 4)
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
                                        kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1),
-                             "npu_ffndn%d_%s" % (passes, fmt), NPU_NP))
+                             "npu_ffndn%d_%s" % (passes, fmt), 4 if np4(fmt) else NPU_NP))
                 continue
             jobs.append((npu_cfg(B, NPU_KS, passes, kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0],
                                  **KCHAIN(fmt)), "npu_ffndn%d_%s" % (passes, fmt), 4))
@@ -1363,6 +1367,25 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     open(src, "w").write(text)
     E.emit(src, ["nop=0"], name + ".hal", outdir)
     out.append((name + ".hal", B * calls * NPU_COLS * nj // wg, wg, 0))
+    dn4 = sorted({j[1].split("_")[-1] for j in jobs if j[1].startswith("npu_ffndn") and j[2] == 4 != NPU_NP})
+    if dn4:   # (Q') the NP 4 downs' sum: 512-row calls at TN 64 ("npu_unpack_ffnblk_4.hal", "npuffnblk4")
+        rows4, cg = NPU_COLS * 64, GU.CG
+        calls4 = -(-N // rows4)
+        GU.CG = 1
+        try:
+            with GN.np_override(4):
+                text = GU.gen(B, calls4 * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
+                              dup=((calls4 - 1) * NPU_COLS, N - rows4))
+                nj4, wg4 = GN.TN // 8, GU.wg(calls4 * NPU_COLS)
+        finally:
+            GU.CG = cg
+        src = os.path.join(tmp, name + "_4.loom")
+        open(src, "w").write(text)
+        E.emit(src, ["nop=0"], name + "_4.hal", outdir)
+        out.append((name + "_4.hal", B * calls4 * NPU_COLS * nj4 // wg4, wg4, 0))
+        out.append(("npuffnblk4", F, 256, rows4))
+        for fmt in dn4:
+            out.append(("npuffndn4_" + fmt, 1, 0, 0))
     for hal, text in unorm.items():
         src = os.path.join(tmp, hal[:-4] + ".loom")
         open(src, "w").write(text)
@@ -1399,9 +1422,14 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     with GN.np_override(4):
         out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
     for passes in sorted({p for _, p in parts}):
-        dn = next(j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes))
+        dns = [j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes)]
+        dn = next((j for j in dns if j[2] == NPU_NP), dns[0])
         with GN.np_override(dn[2]):
             out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
+        if dn4:   # (Q') the NP 4 downs'
+            dn = next(j for j in dns if j[2] == 4)
+            with GN.np_override(4):
+                out.append(("npubytes4_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
     if pairs:   # (the mixed / BFP pairs': their GPU side's features)
         out.append(("npuffnpair", F, 0, 0))
     return jobs
