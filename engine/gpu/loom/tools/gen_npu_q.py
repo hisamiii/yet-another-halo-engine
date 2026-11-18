@@ -89,7 +89,7 @@ Q_ENV = dict(GN_QFLOAT="1", GN_QWCONT="1", GN_QLOCK="1", GN_QPASS="1", GN_QBANK=
 # Loom LOOM_EXP_INTAKE_SPLIT, HRX 0095) and the gate's leftover polls drained 32 a firing (gen_npu_gemm GB, was 8):
 # real calls qkv 57.2 -> 61.0%, gate 43.4 -> 52.9% MMA busy, bit-exact.
 P1K_NP, P1K_KS, P1K_PASSES = 5, (32,), 20
-P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="2560@37376:40448:43520:46592,11520@0:53760,4608@20480:32768,64@30720",
+P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="p1k",
                GN_QZACC="1", GN_QRELAX="1", GN_QTOK="-6,0,0,10", GN_QDRIP="4", GN_QEMERGE="1", GN_QWDUP="1",
                GN_QCLAZY="1", NPU_QCREL="2", GN_QLOCKA="12,5", GN_QWCONT="0", GN_QPEEL="0", GN_QP1="1", GN_QMB1="5",
                GN_QP1K="1", GN_QCVL="1", GN_QFKH="1", GN_QPSHARE="1", GN_QF4R="1", DQ_HDRWIN="8",
@@ -130,7 +130,7 @@ def loom_env(cfg):
         env["LOOM_EXP_RING_AT"] = env["LOOM_EXP_RING_AT"].replace("16128@", f"{N.NP * N.slab(ks)}@").replace(
             "4032@", f"{N.slab(ks)}@")
     if os.environ.get("GN_QPINS"):
-        env["LOOM_EXP_RING_AT"] = os.environ["GN_QPINS"]
+        env["LOOM_EXP_RING_AT"] = N.qpins()
     if cfg.fuse == 2:
         env["LOOM_EXP_RING_AT"] = N.qf_ring_at(env["LOOM_EXP_RING_AT"])
     if os.environ.get("GN_QRELAX") == "1":   # (HRX 0087) no MMA-latency drain before the row loop's back edge

@@ -276,6 +276,17 @@ def qpass_cslots():
     return [int(v) for v in QBANK_RING_AT.split(",")[0].split("@")[1].split(":")]
 
 
+def qpins(default=None):
+    """GN_QPINS (default if unset). "p1k": the P1K map's pins for the current NP: the MP C rows' bf16 slots (512 NP B)
+    at the even sub-tile area's row stride (q3_strides) from 37376, the W slots (NP x 2304 B: a member's half record)
+    at 0 / 53760, the A slots at 20480 / 32768, the 64 B word at 30720."""
+    v = os.environ.get("GN_QPINS") or default
+    if v != "p1k":
+        return v
+    cs = ":".join(str(37376 + q3_strides()[0] * r) for r in range(4))
+    return f"{512 * NP}@{cs},{2304 * NP}@0:53760,4608@20480:32768,64@30720"
+
+
 def q3_strides():
     """(GN_QBANK=3) the even / odd sub-tile areas' row strides: NP odd puts one more sub-tile in the even area."""
     return 1024 * ((NP + 1) // 2), 1024 * (NP // 2)
@@ -301,7 +312,7 @@ def qaltp_on():
 
 def qaltp_eo():
     """(GN_QALT=2) the E and O areas' byte addresses, from the C pins (checked against every row's slot)."""
-    v = [int(x) for x in os.environ["GN_QPINS"].split(",")[0].split("@")[1].split(":")]
+    v = [int(x) for x in qpins().split(",")[0].split("@")[1].split(":")]
     E, O = v[0], v[1] - 1024 * ((NP - 1) // 2)
     assert len(v) == MP and all(x == (E + 1024 * (NP * r // 2) if r % 2 == 0 else O + 1024 * ((NP * r - 1) // 2))
                                 for r, x in enumerate(v)), v
@@ -315,7 +326,7 @@ def qalt_sizes():
 
 def qalt_cslots():
     """(GN_QALT) the C ring's 2 slot addresses (GN_QPINS' first group)."""
-    v = [int(x) for x in os.environ["GN_QPINS"].split(",")[0].split("@")[1].split(":")]
+    v = [int(x) for x in qpins().split(",")[0].split("@")[1].split(":")]
     assert len(v) == 2, v
     return v
 
@@ -327,7 +338,7 @@ def qa4_carry(cfg):
 
 def qa4_slots():
     """(GN_QA4) the 4 A slots' byte addresses: GN_QPINS' third group if set, else QA4_RING_AT's."""
-    pins = os.environ.get("GN_QPINS") or QA4_RING_AT
+    pins = qpins(QA4_RING_AT)
     a = [int(v) for v in pins.split(",")[2].split("@")[1].split(":")]
     return [QF_A13.get(v, v) for v in a] if QF["cfg"] is not None and not qp1k_on() else a   # (P1K: the A pins stay)
 
@@ -350,7 +361,7 @@ def qw4_on():
 
 def qw4_deltas():
     """(GN_QW4) d1, d2 from GN_QPINS' W group."""
-    w = [int(v) for v in os.environ["GN_QPINS"].split(",")[1].split("@")[1].split(":")]
+    w = [int(v) for v in qpins().split(",")[1].split("@")[1].split(":")]
     assert len(w) == 4 and w[3] - w[0] == (w[1] - w[0]) + (w[2] - w[0]), w
     return w[1] - w[0], w[2] - w[0]
 
@@ -392,7 +403,7 @@ def qp1k_on():
 
 def qpass_wdelta():
     """W slot 1 - W slot 0 in bytes (QBANK_RING_AT's W pins; GN_QPINS' if set)."""
-    w = [int(v) for v in (os.environ.get("GN_QPINS") or QBANK_RING_AT).split(",")[1].split("@")[1].split(":")]
+    w = [int(v) for v in qpins(QBANK_RING_AT).split(",")[1].split("@")[1].split(":")]
     return w[1] - w[0]
 LOOM_ENV = dict(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2",
                 LOOM_EXP_PANEL_GROUPS=",".join(map(str, GE.GROUPS)), LOOM_EXP_PANEL_STREAM="1")
@@ -2043,14 +2054,17 @@ def qf_decode(L, cfg, dp):
     e("  %fzhm = lt %fzhv, %fzh4")
     e("  low.cond_br %fzhm, ^fzhb, ^fzhx : reg<aie2p.er>")
     e("^fzhb:")
-    if r4:   # (GN_QF4R) this row's records: the call's record index's parity, (steps left + slab) % 2 (an even step
-        # count, NS odd)
-        assert QF["rawn"] % 2 == 0 and QF["cfg"].passes * FUSE_SB % 2 == 0 and NS % 2 == 1
-        e("  %f4pU = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
-        e("  %f4u = lda %f4pU, 12")
+    if r4:   # (GN_QF4R) this row's records: the call's record index's parity, (steps left x NS + slab) % 2 (an even
+        # step count): (steps left + slab) % 2 for NS odd, slab % 2 for NS even
+        assert QF["rawn"] % 2 == 0 and QF["cfg"].passes * FUSE_SB % 2 == 0
         e("  %f4pV = storage_address %fzt : low.storage<private> -> reg<aie2p.ep>")
         e(f"  %f4v = lda %f4pV, {QF_SLAB}")
-        e("  %f4uv = add.rr %f4u, %f4v")
+        if NS % 2:
+            e("  %f4pU = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+            e("  %f4u = lda %f4pU, 12")
+            e("  %f4uv = add.rr %f4u, %f4v")
+        else:
+            e("  %f4uv = or %f4v, %f4v")
         e("  %f4k1 = mova.i32 1")
         e("  %f4p = and %f4uv, %f4k1")
         e(f"  low.cond_br %f4p, {'^f4own, ^f4x' if r4['par'] else '^f4x, ^f4own'} : reg<aie2p.er>")
@@ -3433,7 +3447,7 @@ def qcstage_on():
 def crel_copy_staged(e, port, own):
     """(GN_QCSTAGE) crel_copy into the staging slots: segment i of the partner's ring to QCSTAGE_AT[i] (the own ring
     pointer, slot 0, parked at own: its address + QCSTAGE_AT[i] - slot 0's)."""
-    pins = os.environ.get("GN_QPINS") or QA4_RING_AT
+    pins = qpins(QA4_RING_AT)
     sb = int(pins.split(",")[0].split("@")[0])
     cs = [int(v) for v in pins.split(",")[0].split("@")[1].split(":")]
     st = QCSTAGE_AT
@@ -3491,7 +3505,7 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     """(Q' C relay) the firing's end on row 0: row 1's MP C segments (its ring, through the north window) copied into
     this core's C ring after its own, so its C stream carries block 2 f, then block 2 f + 1. The pointers come back
     from fuse2_entry's parking word. A segment is the slot's first 2 KB (the peeled pass's bf16)."""
-    pins = os.environ.get("GN_QPINS") or QA4_RING_AT
+    pins = qpins(QA4_RING_AT)
     sb = int(pins.split(",")[0].split("@")[0])   # (a segment: one C ring slot; 2048 B, the P1 layout's 3072 B)
     cs = [int(v) for v in pins.split(",")[0].split("@")[1].split(":")]
     assert sb % 64 == 0 and len(cs) == MP and qa4_on() and (qpeel_on() or qunr_on() or os.environ.get("GN_QBANK") == "3") and not qalt_on()
@@ -5159,7 +5173,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         e(f"  %pnc = copy {q} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if qaltp_on():   # the next row's slot: row r even -> O - E + 2 KB on, odd -> E - O + 3 KB on (NP 5)
             E_, O_ = qaltp_eo()
-            cs_ = [int(x) for x in os.environ["GN_QPINS"].split(",")[0].split("@")[1].split(":")]
+            cs_ = [int(x) for x in qpins().split(",")[0].split("@")[1].split(":")]
             de_, do_ = cs_[1] - cs_[0], cs_[2] - cs_[1]
             assert all(cs_[r + 1] - cs_[r] == (de_ if r % 2 == 0 else do_) for r in range(MP - 1)), cs_
             e("  %pqk1 = mova.i32 1")
