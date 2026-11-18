@@ -162,7 +162,7 @@ def main():
     # qlay 1: the dump's q is the raw f16 query (split-norm Q off); the encoder rounds f16(q / 16) before bfp16, so a mantissa
     # may sit one f16 step (<= 0.13 bfp16 steps) past rounding
     raw = np.fromfile(prefix + ".q", np.uint8)
-    q16 = raw[:B * 12288].view(np.float16).reshape(B, H, D).astype(np.float64)
+    q16 = (raw[:B * 24576].view(f32) if c.qlay == 2 else raw[:B * 12288].view(np.float16)).reshape(B, H, D).astype(np.float64)
     qnw = np.fromfile(prefix + ".qnw", f32).astype(np.float64)
     inv = 1.0 / 10000000.0 ** (2.0 * np.arange(32) / 64.0)
     if c.qlay:

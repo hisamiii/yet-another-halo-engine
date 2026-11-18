@@ -59,7 +59,8 @@ class Call:
                                                          # [calls][2][mcf][4608 B]
     qlay: int = 0                                        # q only: 0 the split-norm query (R2P_QSPLIT), 1 the raw f16
                                                          # query [token][24][256] (split-norm Q off: the attention does the head
-                                                         # norm), normed here
+                                                         # norm), 2 the raw f32 query [token][24][256] (QNORM with the
+                                                         # NPU's q GEMM rows: the attention's own input); 1 / 2 normed here
 
     @property
     def mcf(self):
@@ -108,7 +109,7 @@ class Call:
         kn, nh = 4 * self.kn_floats(), max(self.kvn, 1)
         return {"k": [self.pages * PAGE * 2048, 4 * self.pages, nh * self.ks_bytes(), kn],
                 "v": [KVH * self.pages * PAGE * D * 2, 4 * self.pages, nh * self.vs_bytes()],
-                "q": [self.B * (12288 if self.qlay else 19968), 4 * D, 4, kn, self.payload_bytes(),
+                "q": [self.B * {0: 19968, 1: 12288, 2: 24576}[self.qlay], 4 * D, 4, kn, self.payload_bytes(),
                       self.payload_bytes()]}[kind]
 
     def grid(self, kind):
@@ -376,13 +377,13 @@ def gen_q(c):
     pad = c.mcf > c.mc
     head(e, "yah_npuattn_q", *c.grid("q"), ("q", "qnw", "qeps", "kn", "kq", "vq"))
     consts(e, 0, 1, 2, 8, 16, 24, 32, 64, 72, 256, REC)
-    e(f"  %nq = index.constant {c.B * (12288 if c.qlay else 19968) // 2} : index")
+    e(f"  %nq = index.constant {c.B * 6144 if c.qlay == 2 else c.B * (12288 if c.qlay else 19968) // 2} : index")
     e(f"  %nkq = index.constant {c.payload_bytes()} : index")
     e(f"  %nvq = index.constant {c.payload_bytes()} : index")
     e(f"  %nkn = index.constant {c.kn_floats()} : index")
     e("  %q_na, %w_na, %e_na, %kn_na, %kq_na, %vq_na = buffer.assume.noalias %q, %qnw, %qeps, %kn, %kq, %vq : "
       "buffer, buffer, buffer, buffer, buffer, buffer")
-    e("  %qh_flat = buffer.view %q_na[%base] : buffer -> view<[%nq]xf16>")
+    e(f"  %qh_flat = buffer.view %q_na[%base] : buffer -> view<[%nq]x{'f32' if c.qlay == 2 else 'f16'}>")
     if not c.qlay:
         e(f"  %nq32 = index.constant {c.B * 19968 // 4} : index")
         e("  %qf_flat = buffer.view %q_na[%base] : buffer -> view<[%nq32]xf32>")
@@ -677,8 +678,11 @@ def q_raw(e, c, hv, inv):
         x(f"%xh{r} = index.add %xh{r}a, {hv} : index")
         x(f"%xa{r}a = index.mul %xh{r}, %c256 : index")
         x(f"%xa{r} = index.add %xa{r}a, %d8 : index")
-        x(f"%xv{r} = vector.load %qh_flat[%xa{r}] : view<[%nq]xf16> -> vector<8xf16>")
-        x(f"%xf{r} = vector.extf %xv{r} : vector<8xf16> to vector<8xf32>")
+        if c.qlay == 2:
+            x(f"%xf{r} = vector.load %qh_flat[%xa{r}] : view<[%nq]xf32> -> vector<8xf32>")
+        else:
+            x(f"%xv{r} = vector.load %qh_flat[%xa{r}] : view<[%nq]xf16> -> vector<8xf16>")
+            x(f"%xf{r} = vector.extf %xv{r} : vector<8xf16> to vector<8xf32>")
         x(f"%xs{r} = vector.mulf %xf{r}, %xf{r} : vector<8xf32>")
         acc = None
         for i in range(8):
@@ -723,10 +727,14 @@ def q_raw(e, c, hv, inv):
         # the rotary pair of this fragment's dims (d < 8): dims dlo + i and dlo + 32 + i
         x(f"%ya{r} = index.add %xa{r}a, %dlo : index")
         x(f"%yb{r} = index.add %ya{r}, %c32 : index")
-        x(f"%yav{r} = vector.load %qh_flat[%ya{r}] : view<[%nq]xf16> -> vector<8xf16>")
-        x(f"%ybv{r} = vector.load %qh_flat[%yb{r}] : view<[%nq]xf16> -> vector<8xf16>")
-        x(f"%yaf{r} = vector.extf %yav{r} : vector<8xf16> to vector<8xf32>")
-        x(f"%ybf{r} = vector.extf %ybv{r} : vector<8xf16> to vector<8xf32>")
+        if c.qlay == 2:
+            x(f"%yaf{r} = vector.load %qh_flat[%ya{r}] : view<[%nq]xf32> -> vector<8xf32>")
+            x(f"%ybf{r} = vector.load %qh_flat[%yb{r}] : view<[%nq]xf32> -> vector<8xf32>")
+        else:
+            x(f"%yav{r} = vector.load %qh_flat[%ya{r}] : view<[%nq]xf16> -> vector<8xf16>")
+            x(f"%ybv{r} = vector.load %qh_flat[%yb{r}] : view<[%nq]xf16> -> vector<8xf16>")
+            x(f"%yaf{r} = vector.extf %yav{r} : vector<8xf16> to vector<8xf32>")
+            x(f"%ybf{r} = vector.extf %ybv{r} : vector<8xf16> to vector<8xf32>")
         x(f"%pos{r}a = index.add %csp, %xt{r} : index")
         x(f"%pos{r}i = index.cast %pos{r}a : index to i32")
         x(f"%pos{r} = scalar.sitofp %pos{r}i : i32 to f32")

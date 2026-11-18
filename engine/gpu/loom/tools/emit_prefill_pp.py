@@ -1799,10 +1799,8 @@ def main():
         # "npuattn <n> <nb built> <first chunk>"; the twins' "ksplit_" rows carry their larger partials
         if npu_kv:
             npu_from = max(int(os.environ.get("YAH_NPU_ATTN_FROM", "0")) or ks_from, ks_from, 1)
-            # the NPU's q GEMM rows leave the GPU's kqg GEMM without its split-norm q, and the q encoder's other
-            # layout reads an f16 q the attention's q norm does not keep (it reads the raw f32 q)
-            if NPU_SPLIT.get("q"):
-                sys.exit("YAH_NPU_ATTN: the q encoder reads the split-norm q of the GPU's kqg GEMM: drop q= from YAH_NPU_SPLIT")
+            # (the NPU's q GEMM rows leave the GPU's kqg GEMM without its split-norm q: the q encoder then reads the
+            # attention's raw f32 q, gen_npu_attn_encode qlay 2)
         for diag, stem in (("ksstore", "ks"), ("ksmerge", "km")) + ((("ksstore", "ksn"), ("ksmerge", "kmn")) if npu_kv else ()):
             gen_attn_fa.NPU_KV = npu_kv if stem.endswith("n") else 0
             gen_attn_fa.R2P_DIAG.add(diag)
@@ -1973,7 +1971,7 @@ def main():
         import gen_npu_unpack as GU
         for c in range(npu_from, NCH):
             call = NE.Call(mc=16, nb=16 * (c * B // 512 + 1), nbs=npu_nbs, pages=T // 256, B=B, start_pos=c * B,
-                           kvn=npu_kv, qlay=0 if QSPLIT_ON else 1)
+                           kvn=npu_kv, qlay=0 if QSPLIT_ON else 2 if gen_attn_fa.QNORM else 1)
             call.check()
             for kind, gen in (("k", NE.gen_k), ("v", NE.gen_v), ("q", NE.gen_q)):
                 src = os.path.join(tmp, "npua%s_c%d.loom" % (kind, c))
@@ -2183,8 +2181,9 @@ def main():
     ksn_twins = [x for pair in ksn_srcs.values() for x in pair if x]
     def attn_env(loom):
         # the NPU split's merge twins: HRX main's allocator lands them at 216 VGPRs (7 waves); within 192 they fit
-        # without spills at 8 waves, as on the old pin (npu8x2 16K +3.9% at 216)
-        if loom is not None and loom in ksn_srcs.get("kmn", ()):
+        # without spills at 8 waves, as on the old pin (npu8x2 16K +3.9% at 216). Not without the split-norm q (the
+        # q on the NPU: the attention's own head norm spills 16 B within 192)
+        if loom is not None and loom in ksn_srcs.get("kmn", ()) and QSPLIT_ON:
             return {"LOOM_EXP_LICM": "1", "LOOM_EXP_BUDGET": "amdgpu.vgpr=192"}
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
