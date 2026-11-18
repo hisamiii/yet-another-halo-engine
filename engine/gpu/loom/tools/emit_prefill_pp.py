@@ -760,12 +760,11 @@ NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs", "iq3xxs", "iq3s"), (40, 40, 40, 8)
 # gate and up of one format without a fused GPU gate / up whose single-format deferred image fits: their own decoder
 # on the GGUF rows, no pre-decoded copy (Q3_K's with its record realign rolled: npu_images' q3roll fallback)
 NPU_SAME_SW = ("q5k", "q3k", "iq2s")
-# (Q') the gate / up pairs of one format on the NPU's qsw image (YAH_NPU_QSW_FMTS, default none): super-blocks of a
+# (Q') the gate / up pairs of one format on the NPU's qsw image (YAH_NPU_QSW_FMTS, default q5k): super-blocks of a
 # multiple of 4 bytes only (an odd one's pair-of-super-blocks axis plus the gate-to-up step need more shim DMA address
-# dimensions than there are). Q5_K works but loses (11-18 pp2048 +2.7%): the GPU's side runs as the pair's separate
-# gate kstore and up swiglu splits (20.4 ms a layer vs 18.9 for its fused gate / up over all features); it needs a
-# fused GPU gate / up with an NPU split first.
-QSW_FMTS = tuple(f for f in os.environ.get("YAH_NPU_QSW_FMTS", "").split(",") if f)
+# dimensions than there are). Q5_K: pp2048 -2.3% (11-18, layers 58-60; the GPU's side still runs as separate gate
+# kstore and up swiglu splits, a fused GPU gate / up with an NPU split would gain more).
+QSW_FMTS = tuple(f for f in os.environ.get("YAH_NPU_QSW_FMTS", "q5k").split(",") if f)
 # gate and up of two of these formats: column pairs (gen_npu_gemm ufmt: each column decodes one format from its own
 # tensor's rows), the tails swap halves; "npu_ffnsw_<gate>_<up>_<hord>", dispatch rows "npuffncp_<gate>_<up>")
 NPU_COLPAIR = ("iq4xs", "q4k", "q3k", "iq3s", "iq3xxs", "iq2s", "iq2xs")
