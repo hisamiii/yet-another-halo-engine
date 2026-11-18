@@ -1060,12 +1060,25 @@ def dec_tag(cfg):
 
 
 PAIR_PORT = 3   # pair_swap's ring port on both tails (after A, W and C)
+QPAIR_PORT = 12   # (Q' column pairs) qpair_swap's ring port on every core (the P1K image's cores use 0 .. 11)
 
 
-def pair_copy(e, y, src, dst, swap=False):
-    """SW_HALF bytes from scalar address src to dst, unrolled (a loop's branch delays and load waits cost ~25 bundles
-    per 256 bytes); swap: both ways (dst's bytes to src). Per KB one base pointer 512 bytes in (the immediates reach
-    -512 .. 448), 64-byte loads and stores in groups of four."""
+def pair_port():
+    """The pair ring's port: Q' (gen_npu_q sets QF["cfg"]) or the old tails'."""
+    return QPAIR_PORT if QF.get("cfg") is not None else PAIR_PORT
+
+
+def qpair_off():
+    """(diag, GN_QPAIRDIAG=nohs) Q' column pairs without qpair_swap: no handshake, no swap (wrong output; a deadlock
+    that stays is not the pair rings')."""
+    return QF.get("cfg") is not None and os.environ.get("GN_QPAIRDIAG") == "nohs"
+
+
+def pair_copy(e, y, src, dst, swap=False, nbytes=None):
+    """nbytes (default SW_HALF) from scalar address src to dst, unrolled (a loop's branch delays and load waits cost
+    ~25 bundles per 256 bytes); swap: both ways (dst's bytes to src). Per KB one base pointer 512 bytes in (the
+    immediates reach -512 .. 448), 64-byte loads and stores in groups of four."""
+    nb_ = SW_HALF if nbytes is None else nbytes
     def padd(name, src_, off):
         cur, i = src_, 0
         while off > 0:
@@ -1078,9 +1091,9 @@ def pair_copy(e, y, src, dst, swap=False):
         return cur
     e(f"  {y}sa = mov.scalar-to-address {src}")
     e(f"  {y}da = mov.scalar-to-address {dst}")
-    assert SW_HALF % 256 == 0
+    assert nb_ % 256 == 0
     sb, db = f"{y}sa", f"{y}da"
-    for g in range(SW_HALF // 256):
+    for g in range(nb_ // 256):
         k, qs = g // 4, range(4 * g, 4 * g + 4)
         if g % 4 == 0:
             sb = padd(f"{y}sb{k}", sb, 512 if k == 0 else 1024)
@@ -1141,14 +1154,95 @@ def pair_swap(e, pair, slot, tag):
     e(f"  rel %one, {PAIR_PORT}")
 
 
-def pair_park(e):
+def pair_park(e, part="both"):
     """Column pairs: the tail's swap ring (one slot) parked as a scalar in private storage (the tail's pointer registers
-    are spoken for)."""
-    e(f"  %pxp = resource<native_pointer> {{index = {PAIR_PORT}, source_type = buffer}} : reg<aie2p.ep>")
+    are spoken for). part "res": only its resource (resources come before any instruction), "park": the rest."""
+    if part != "park":
+        e(f"  %pxp = resource<native_pointer> {{index = {pair_port()}, source_type = buffer}} : reg<aie2p.ep>")
+    if part == "res":
+        return
     e("  %pxst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %pxsp = storage_address %pxst : low.storage<private> -> reg<aie2p.ep>")
     e("  %pxs = mov.address-to-scalar %pxp")
     e("  st %pxs, %pxsp, 0")
+
+
+def qpair_swap(e, pair, ea, ob, tag):
+    """(Q' column pairs, cfg.qsw) one 16-token row's swap before its convert. Gate core (2 u, r), pair "w", holds the
+    gate sums of the pair's 64 features: sub-tiles 0 .. 3 at (even, odd, even + 1 KB, odd + 1 KB) of the row (q3
+    areas); up core (2 u + 1, r), "e", the up sums of the same features and tokens. The up core swaps its even and odd
+    first KB (up sub-tiles 0, 1) with the gate core's even and odd second KB (gate sub-tiles 2, 3) through its west
+    window, so each core holds today's qsw row (gate sub-tiles 0, 1, up sub-tiles 2, 3 of its own 32 features: the gate
+    core the pair's first 32, the up core the second 32) and runs the qsw convert unchanged. The ring (one slot, two
+    records a row) lives in the gate core's memory: the gate posts its even row address and its own view of the ring,
+    the up core maps the gate's addresses by the difference of the two views (the C areas are pinned alike in every
+    core, so odd - even is the same in both), swaps, frees the slot, and takes the gate's second record."""
+    P = pair_port()
+    x = f"%qx{tag}"
+    e(f"  {x}sp = storage_address %pxst : low.storage<private> -> reg<aie2p.ep>")
+    e(f"  {x}r = lda {x}sp, 0")
+    e(f"  acq %am1, {P}")
+    e(f"  {x}rp = mov.scalar-to-address {x}r")
+    if pair == "w":
+        e(f"  {x}h = mov.address-to-scalar {ea}")
+        e(f"  {x}ho = mov.address-to-scalar {ob}")
+        e(f"  st {x}h, {x}rp, 0")
+        e(f"  st {x}r, {x}rp, 4")
+        e(f"  st {x}ho, {x}rp, 8")   # (its odd row too: the two leaves' memory maps differ, their decoders do)
+        e(f"  rel %one, {P}")
+        e(f"  acq %am1, {P}")
+    else:
+        e(f"  {x}wh = lda {x}rp, 0")
+        e(f"  {x}wr = lda {x}rp, 4")
+        e(f"  {x}wo = lda {x}rp, 8")
+        e(f"  {x}dv = sub {x}r, {x}wr")
+        e(f"  {x}g0 = add.rr {x}wh, {x}dv")
+        e(f"  {x}k1 = mov.i32 1024")
+        e(f"  {x}se = add.rr {x}g0, {x}k1")
+        e(f"  {x}ea = mov.address-to-scalar {ea}")
+        e(f"  {x}ob = mov.address-to-scalar {ob}")
+        e(f"  {x}eo = sub {x}ob, {x}ea")
+        e(f"  {x}go = sub {x}wo, {x}wh")         # (the gate's odd - even)
+        e(f"  {x}so = add.rr {x}se, {x}go")
+        # (a guard: both gate pieces inside the ring's 64 KB window, else no swap: wrong output, no stray access)
+        e(f"  {x}hk = mov.i32 1023")
+        e(f"  {x}end = add.rr {x}so, {x}hk")
+        e(f"  {x}x0 = xor {x}se, {x}r")
+        e(f"  {x}x1 = xor {x}end, {x}r")
+        e(f"  {x}x2 = or {x}x0, {x}x1")
+        e(f"  {x}sk = mov.i32 -16")
+        e(f"  {x}x3 = lshl {x}x2, {x}sk")
+        e(f"  {x}ok = eqz {x}x3")
+        e(f"  low.cond_br {x}ok, ^qxd{tag}, ^qxj{tag} : reg<aie2p.er>")
+        e(f"^qxd{tag}:")   # (8 pieces of 256 B: 4 of the even KB, then 4 of the odd one odd - even on; a loop, the
+        # copy's code once: the program memory is full, 16 KB)
+        ER = "reg<aie2p.er>"
+        e(f"  {x}i0 = mova.i32 0")
+        e(f"  {x}k8 = mova.i32 8")
+        e(f"  {x}k3 = mova.i32 3")
+        e(f"  {x}km2 = mova.i32 -2")
+        e(f"  low.br ^qxl{tag}({x}i0: {ER})")
+        e(f"^qxl{tag}({x}li: {ER}):")
+        e(f"  {x}lm = lt {x}li, {x}k8")
+        # (the step in the header: no hardware loop candidate, so LOOM_EXP_HWLOOP_TRIP's '@' counts stay the GEMM's)
+        e(f"  {x}ln = add {x}li, 1")
+        e(f"  low.cond_br {x}lm, ^qxb{tag}, ^qxj{tag} : {ER}")
+        e(f"^qxb{tag}:")
+        e(f"  {x}pc = lshl {x}li, {x}km2")      # (the piece: i >> 2)
+        e(f"  {x}po = mul {x}pc, {x}eo")
+        e(f"  {x}pg = mul {x}pc, {x}go")
+        e(f"  {x}qa = and {x}li, {x}k3")
+        e(f"  {x}qo = lshl {x}qa, {x}k8")      # ((i & 3) << 8)
+        e(f"  {x}oo = add.rr {x}po, {x}qo")
+        e(f"  {x}og = add.rr {x}pg, {x}qo")
+        e(f"  {x}ls = add.rr {x}se, {x}og")
+        e(f"  {x}ld = add.rr {x}ea, {x}oo")
+        pair_copy(e, f"{x}c", f"{x}ls", f"{x}ld", swap=True, nbytes=256)
+        e(f"  low.br ^qxl{tag}({x}ln: {ER})")
+        e(f"^qxj{tag}:")
+        e(f"  rel %one, {P}")
+        e(f"  acq %am1, {P}")
+    e(f"  rel %one, {P}")
 
 
 def fuse_groups(cfg):
@@ -1285,7 +1379,8 @@ def fuse_record(cfg, cov):
         xs += [36 * kchain_piece(cfg, r) for r in range(1, len(cfg.ks)) if kchain_piece(cfg, r)]
     fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for sw in [sw for _, sw in fuse_pieces(cfg, cov)] + xs)
              and not (cfg.swiglu and 4 * w == SW_REC))
-    if cfg is QF["cfg"]:   # (Q': 4 records a 16-k-block piece; P1K direct: half a slab's output)
+    if cfg is QF["cfg"] or (QF.get("cfgu") is not None and cfg is QF["cfgu"]):   # (Q': 4 records a 16-k-block
+        # piece; P1K direct: half a slab's output; column pairs: the up format's decode config too)
         fw = QF_P1KD["rec"] // 4 if qfdirect_on() else QF_FW
     return fw, cfg.passes * unit // fw
 
@@ -2959,6 +3054,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         "ring slot of a row must be static per iteration"
     name = name or role + ("_g" if gate else "")
     full_name = name
+    name = name[:-3] if name.endswith(("_pw", "_pe")) and pair else name   # (Q' pairs: the role rides in pair)
     name = name[:-3] if name.endswith(("_gw", "_gr")) and gate else name   # (the gate role rides in gate)
     skp1 = name in ("tailm0s", "tailms")   # (P1K fill) a P1 leaf that skips the raw records: its pair role without the s
     dfill = name == "tailm0d"   # (GN_QFKH) row 0: tailm0 that decodes K half 0
@@ -3011,8 +3107,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e("  %mbt3 = resource<native_pointer> {index = 3, source_type = buffer} : reg<aie2p.ep>")
     if name == "tailm" and os.environ.get("GN_QMB1") == "5":
         e("  %mbt4 = resource<native_pointer> {index = 4, source_type = buffer} : reg<aie2p.ep>")
-    if pair:
-        pair_park(e)
+    if pair and not qpair_off():   # (its resource here; Q' parks it after the C relay's resources)
+        pair_park(e, "res" if QF.get("cfg") is not None else "both")
     if name in ("tailm", "tailm0") and os.environ.get("GN_QMB1") == "5":   # (MB2 tokens: ports 3 own, 4 other)
         pass
     if name == "tailm" and os.environ.get("GN_QMB1") == "1":   # (GN_QMB1, after the resources)
@@ -3036,6 +3132,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
         e("  st %crx0, %crstp, 0")
         e(f"  %crx4 = mov.address-to-scalar %o{rs}")
         e("  st %crx4, %crstp, 4")
+    if pair and QF.get("cfg") is not None and not qpair_off():
+        pair_park(e, "park")
     early = fills   # the decoding fill first: nothing of the GEMM's lives across the decoder
     if gate:   # job state (private storage, zeroed by the setup): the first job's gate before any firing
         e("  %gst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
@@ -3327,7 +3425,7 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
                 e("  st %bnn, %cnp, 4")
     if gate:   # job state: private storage, zeroed by the array setup of a core stream plan
         e("  %gsp = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
-    if pair:   # the deferred segment's swap, before its pushes
+    if pair and cfg.dfr:   # the deferred segment's swap, before its pushes (Q' pairs: qpair_swap in the convert)
         e("  low.cond_br %dfx, ^pxd, ^pxn : reg<aie2p.er>")
         e("^pxd:")
         pair_swap(e, pair, "%dss", "d")
@@ -5321,6 +5419,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             assert NP == 4 and cfg.hord == "P4" and q3_strides() == (2048, 2048) and not qalt_on()
             e("  %cvsa = copy %cva_0 : reg<aie2p.ep> -> reg<aie2p.ep>")
             e("  %cvsb = copy %cvb_0 : reg<aie2p.ep> -> reg<aie2p.ep>")
+            if pair and not qpair_off():   # (Q' column pairs) the row's halves swapped with the partner core's first
+                qpair_swap(e, pair, "%cvsa", "%cvsb", "q")
             t = "q"
             convert_swiglu(None, None, 0, q3=("%cvsa", "%cvsb"))
             e("  %cvsk = mov.i32 2048")

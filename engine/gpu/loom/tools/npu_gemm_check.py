@@ -148,18 +148,34 @@ def main():
             lay_ = os.environ.get("NPU_QSW_LAYER") or next(
                 n_.split(".")[1] for n_ in ts_ if n_.endswith("ffn_gate.weight") and ts_[n_].tensor_type.name == fmt
                 and ts_[n_.replace("gate", "up")].tensor_type.name == fmt)
-            tg_, tu_ = ts_[f"blk.{lay_}.ffn_gate.weight"], ts_[f"blk.{lay_}.ffn_up.weight"]
-            assert int(tg_.shape[0]) == KR and tg_.tensor_type.name == tu_.tensor_type.name == fmt
-            print(f"NPU_QSW: blk.{lay_} ffn_gate / ffn_up rows 0 .. {Nn // 2}")
-            wraw = np.concatenate([np.asarray(x.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn // 2]
-                                   for x in (tg_, tu_)])
-            cfg = dataclasses.replace(cfg, qsw=True, dgu=Nn // 2 * KR // 256 * D.BLK, swcol=32, hord="P4",
-                                      hpass=int(os.environ.get("NPU_QSW_HPASS", "2")))   # (H: this call is call 0)
+            # (NPU_QSW_UFMT=<type>: column pairs, the up rows of that format from NPU_QSW_ULAYER's ffn_up, on their
+            # own raw binding; gate columns 2 u, up columns 2 u + 1, the up decoder's own rows)
+            ufmt_ = os.environ.get("NPU_QSW_UFMT", "")
+            tg_ = ts_[f"blk.{lay_}.ffn_gate.weight"]
+            tu_ = ts_[f"blk.{os.environ.get('NPU_QSW_ULAYER') or lay_}.ffn_up.weight"]
+            assert int(tg_.shape[0]) == KR and tg_.tensor_type.name == fmt and tu_.tensor_type.name == (ufmt_ or fmt)
+            print(f"NPU_QSW: {tg_.name} / {tu_.name} rows 0 .. {Nn // 2}" + (f" (column pairs, up {ufmt_})" if ufmt_ else ""))
+            if ufmt_:   # (N.decoder reconfigures one shared decoder: take each format's right before its use)
+                wrawg = np.asarray(tg_.data).view(np.uint8).reshape(-1, KR // 256, N.decoder(fmt, "P4").BLK)[:Nn // 2].copy()
+                wrawu = np.asarray(tu_.data).view(np.uint8).reshape(-1, KR // 256, N.decoder(ufmt_, "P4").BLK)[:Nn // 2].copy()
+                D = N.decoder(fmt, cfg.gord)
+                cfg = dataclasses.replace(cfg, qsw=True, dgu=0, swcol=32, hord="P4", ufmt=ufmt_, ugord="P4",
+                                          hpass=int(os.environ.get("NPU_QSW_HPASS", "2")))
+            else:
+                wraw = np.concatenate([np.asarray(x.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn // 2]
+                                       for x in (tg_, tu_)])
+                cfg = dataclasses.replace(cfg, qsw=True, dgu=Nn // 2 * KR // 256 * D.BLK, swcol=32, hord="P4",
+                                          hpass=int(os.environ.get("NPU_QSW_HPASS", "2")))   # (H: this call is call 0)
             if int(os.environ.get("NPU_QSW_GAP", "0")):   # the up rows NPU_QSW_GAP rows past the gate rows (the
                 cfg = dataclasses.replace(cfg, dgu=int(os.environ["NPU_QSW_GAP"]) * KR // 256 * D.BLK)   # engine: M)
         else:
             wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
-        wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32
+        if qsw and cfg.ufmt:   # (column pairs) each half by its own decoder
+            wfu = N.decoder(cfg.ufmt, "P4").weights(np.ascontiguousarray(wrawu)).reshape(Nn // 2, K)
+            D = N.decoder(fmt, cfg.gord)
+            wf = np.concatenate([D.weights(np.ascontiguousarray(wrawg)).reshape(Nn // 2, K), wfu])
+        else:
+            wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32
         frag = wf.reshape(Nn // 8, 8, K // 8, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
         bb = D.Q.bfp_hw(frag).reshape(-1, 8, 9)                    # per row [E][8 mantissas]
         mq = bb[:, :, 1:].copy().view(np.int8).astype(np.float64)
@@ -325,7 +341,7 @@ def main():
         open(os.path.join(work, "npu_gemm.pcdiag"), "w").write(
             "".join(ln + "\n" for ln in r_.stderr.splitlines() if ln.split()[:1] in (["PCBLOCKS"], ["PCTEXT"], ["PCACQ"])))
         for ln in r_.stderr.splitlines():   # (diag, HRX pin: LOOM_EXP_TRACE_SHIM in NPU_ENV_ADD) the shim DMA choices
-            if ln.startswith(("SHIM ", "TWIN ", "STAGE ", "packet share", "route dump", "dma dump")):
+            if ln.startswith(("SHIM ", "TWIN ", "STAGE ", "packet share", "route dump", "dma dump", "RING ", "STORAGE ")):
                 print(ln)
     if os.environ.get("NPU_COMPILE_ONLY"):   # (diag) stop after the image (compiler work, no NPU)
         sys.exit(0)
@@ -378,7 +394,7 @@ def main():
             wb_ = rw.view(np.uint8).reshape(cols, passes, 2, -1)
             rw = np.ascontiguousarray(wb_.transpose(0, 2, 1, 3)).reshape(-1)
     rw.tofile(w_b)
-    np.zeros(sc // 4, np.float32).tofile(c_b)
+    (np.full(sc, 0xFF, np.uint8) if os.environ.get("NPU_CFILL") else np.zeros(sc // 4, np.float32)).tofile(c_b)   # (diag: NPU_CFILL, unwritten C shows)
     co = os.path.join(work, "c_out.bin")
     bindings = [a_b, w_b, c_b]
     if cfg.gate:   # flag (ready = the first job's GATE_CALLS + 1 call), tick, signal (go, done)
@@ -397,12 +413,19 @@ def main():
         np.zeros(len(ks) * cols * words, np.int32).tofile(d_b)
         # the GGUF rows as they are, from the call's first column
         gap_ = int(os.environ.get("NPU_QSW_GAP", "0")) if qsw else 0
-        rawv = (np.concatenate([wraw[:Nn // 2].reshape(-1), np.zeros((gap_ - Nn // 2) * KR // 256 * D.BLK, np.uint8),
-                                wraw[Nn // 2:].reshape(-1)]) if gap_ else wraw.reshape(-1))
-        np.concatenate([rawv[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
-        bindings += [d_b, r_b]
-        # the raw stream reads weights (the split lead starts it before the gate; GN_QPREFILL images need that)
-        env.setdefault("NPU_RUN_WEIGHTS", str(len(bindings) - 1))   # (env: copied from os.environ above)
+        if qsw and cfg.ufmt:   # (column pairs) the gate rows, then the up rows on their own binding
+            ru_b = os.path.join(work, "ru.bin")
+            np.concatenate([wrawg.reshape(-1), np.zeros(256, np.uint8)]).tofile(r_b)
+            np.concatenate([wrawu.reshape(-1), np.zeros(256, np.uint8)]).tofile(ru_b)
+            bindings += [d_b, r_b, ru_b]
+            env.setdefault("NPU_RUN_WEIGHTS", f"{len(bindings) - 2},{len(bindings) - 1}")
+        else:
+            rawv = (np.concatenate([wraw[:Nn // 2].reshape(-1), np.zeros((gap_ - Nn // 2) * KR // 256 * D.BLK, np.uint8),
+                                    wraw[Nn // 2:].reshape(-1)]) if gap_ else wraw.reshape(-1))
+            np.concatenate([rawv[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
+            bindings += [d_b, r_b]
+            # the raw stream reads weights (the split lead starts it before the gate; GN_QPREFILL images need that)
+            env.setdefault("NPU_RUN_WEIGHTS", str(len(bindings) - 1))   # (env: copied from os.environ above)
     width = None
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
         if os.environ.get("NPU_STALL_CMD"):   # (diag) a command run 3 s into the job, while it lives (a status dump)
