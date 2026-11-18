@@ -106,6 +106,15 @@ Q5 = FMT == "Q5_K"
 Q4G = FMT == "Q4_K" and os.environ.get("DQ_GORD") == "GF"
 GF = Q5 or Q4G                  # gather-free K-quants (no table)
 Q4L = FMT in ("Q4_K", "Q5_K")   # Q4_K's header and scale path
+
+
+HP = {}   # (DQ_HDR1P) a half's current header pointer
+
+
+def HDR1P():
+    """DQ_HDR1P=1 (IQ4_XS): the header words load through one pointer a half, the 8 rows at immediate offsets (no
+    pointer a row: the header streams' pointer budget no longer serializes them)."""
+    return os.environ.get("DQ_HDR1P") == "1" and not (GRID or Q3K or Q4L)
 HROLL = os.environ.get("DQ_HROLL", "1") == "1"   # Q3_K, IQ2_XS, IQ2_XXS inlined: the scale prep rolled (program memory)
 Q3ROLL = [False]                # leaf_inline: Q3_K's record realign of both halves in a loop (program memory)
 GORD = os.environ.get("DQ_GORD", "P4")       # Q3_K pushes any k-block order: "P4", "N" or "PK" (Q4_K's, for its pairs)
@@ -722,6 +731,11 @@ def leaf(name="dec"):
     for h in range(2):
         e(f"%hb0_{h} = add.rr %spa, {k(HR + h * HS)}")              # this half's region (scalar)
         e(f"%hin_{h} = add.rr %jin, {k(h * 8 * ROWB)}" if h else f"%hin_{h} = or %jin, {k(0)}")
+        if HDR1P():   # (DQ_HDR1P: one load pointer a half, stepped a row at a time)
+            e(f"%hip_{h} = mov.scalar-to-address %hin_{h}")
+            if h == 0:
+                e(f"%hmk = mov.i32 {ROWB}")
+                e("%hmd = mov.modifier %hmk")
         if not Q4L and not GRID and not Q3K:
             e(f"%hdpa_{h} = add.rr %hb0_{h}, {k(HDR + 32)}")
             e(f"%hdp_{h} = mov.scalar-to-address %hdpa_{h}")
@@ -799,11 +813,15 @@ def leaf(name="dec"):
             e(f"%hdq_{h} = mov.scalar-to-address %hdqa_{h}")
             rows_s = []
         for r in range(8):
-            x = e.stream()
-            rows_s.append(x)
+            if HDR1P() and r:   # (one stream a half: the rows share its pointer chain)
+                x = rows_s[-1]
+            else:
+                x = e.stream()
+                rows_s.append(x)
             ra, w0, w1 = x.t("ra"), x.t("w0"), x.t("w1")
-            x(f"{ra} = add.rr %hin_{h}, {k(ROWB * r)}" if r else f"{ra} = or %hin_{h}, {k(0)}")
-            pr = Pr(x, ra) if not Q3K else None
+            if not HDR1P():
+                x(f"{ra} = add.rr %hin_{h}, {k(ROWB * r)}" if r else f"{ra} = or %hin_{h}, {k(0)}")
+            pr = Pr(x, ra) if not Q3K and not HDR1P() else None
             if GRID:                                        # IQ3_S: d (+0) and the 4 scale bytes (+106), u16 loads
                 rb_, pr2, dw, s0, s1, s1h, sw = (x.t(n) for n in ("rb", "pq", "dw", "s0", "s1", "s1h", "sw"))
                 x(f"{dw} = lda.u16 {pr}, 0")                # d first: one pointer per stream at a time
@@ -855,8 +873,14 @@ def leaf(name="dec"):
                 if r == 7:
                     run(rows_s, int(os.environ.get("DQ_HDRWIN", "2")))
                 continue
+            hp_ = pr is None   # (DQ_HDR1P: row r through the half's pointer, then the pointer one row on)
+            if hp_:
+                pr = HP.pop(h, f"%hip_{h}")
             x(f"{w0} = lda {pr}, 0")
             x(f"{w1} = lda {pr}, 4")
+            if hp_ and r < 7:   # (padda takes its pointer: after the row's loads)
+                HP[h] = x.t("hp")
+                x(f"{HP[h]} = padda.modifier {pr}, %hmd")
             x(f"st {w0}, %hdp_{h}, {8 * r - 32}")         # one shared store pointer per half at HDR + 32
             x(f"st {w1}, %hdp_{h}, {8 * r - 28}")
     if not Q4L and not GRID and not Q3K:
