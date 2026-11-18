@@ -96,7 +96,8 @@ P1K_ENV = dict(GN_ORDC="3,2,0,1", GN_QPINS="2560@37376:40448:43520:46592,11520@0
                GN_QLSDEPTH="7",   # (11-18: the A streams staged 7 deep in the memory tiles: gate 796K -> 731K a call)
                GN_QPREFILL="1",   # (11-18: the gate cores check after their fill: a job's first fill in the GPU wait)
                GN_QFGUARD="1",    # (11-18: a fill waits for its core's C drain: safe at queue depth 2, see gen_npu_gemm)
-               GN_QF4RSWAP="1")   # (11-18: rows 0 / 1 swap fill roles: each egress row owns its half's first record)
+               GN_QF4RSWAP="1",   # (11-18: rows 0 / 1 swap fill roles: each egress row owns its half's first record)
+               GN_QLRU="aie2p.mbms")   # (11-18: no LRU on the operand vectors: memstall -1.5K a call)
 P1K_LOOM = dict(LOOM_EXP_RING_AT_FORCE="1", LOOM_EXP_SPACE_AT="scratch@12288", LOOM_EXP_EGRESS_MERGE="1",
                 LOOM_EXP_REPLAY_GROUP="4", LOOM_EXP_MERGE_RING_LOW="1", LOOM_EXP_PANEL_STREAM="1",
                 LOOM_EXP_PANEL_STREAM_SINGLE="1")
