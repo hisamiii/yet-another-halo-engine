@@ -1266,6 +1266,14 @@ class LoomNpu {
           return b.first == addr && b.second == payload;
         });
         if (!zero) rodata[t].emplace_back(addr, std::move(payload));
+        // Loom's scratch storage (8 KB at 12288 a core) is not zeroed: no image reads it before writing it (11-19: filled
+        // with 0xFF instead, every image of a pp2048 run bit-exact; the ffnsw switch 972 -> 690 us host-driven).
+        // YAH_NPU_SCRATCHZERO=1: written as the image has it.
+        static const bool scratchzero = std::getenv("YAH_NPU_SCRATCHZERO") != nullptr;
+        if (!scratchzero && zero && off == 12288 && len - 16 == 8192) {
+          o += len;
+          continue;
+        }
         if (!held) out.insert(out.end(), src + o, src + o + len), ++ops;
         o += len;
         continue;
