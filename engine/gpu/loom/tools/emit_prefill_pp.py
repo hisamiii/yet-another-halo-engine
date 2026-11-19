@@ -874,6 +874,15 @@ def npu_rem_tile(fmt, kbw, kbt, kind="kstore"):
     return dataclasses.replace(TG.default_tile(fmt, kind, kbw), **AF_TILE, **knobs)
 
 
+# The out site's GPU kres split (".af.npu.hal"): 1920 / 2048 rows give 15 / 16 row blocks of 128, so the AF tile's
+# 4 token tiles of 512 make 60 / 64 workgroups on 40 CUs (1.5 / 1.6 rounds). 256-token tiles with 2 x 8 waves: 120 / 128
+# workgroups. 11-19 standalone (n1118/kbench.py, B 2048, K 6144): IQ4_XS 1436-1678 -> 1172-1226 us, Q4_K 1691-1733 ->
+# 1343-1355, Q5_K 1676-1706 -> 1349-1357, Q3_K 1847-1913 -> 1393-1397; bit-identical (no knob changes the MMA order).
+# YAH_NPU_OUTTILE=0: the AF tile; "bm,bn,wm,wn": another.
+_ot = os.environ.get("YAH_NPU_OUTTILE", "128,256,2,8")
+OUT_SPLIT_TILE = dict(zip(("bm", "bn", "wm", "wn"), map(int, _ot.split(",")))) if _ot != "0" else None
+
+
 def fit_rowgrp(t, mt):
     """Tile t over mt row tiles: NPU splits can leave GPU / remainder row counts the tile's row group need not divide;
     the largest of its row group, 4, 2, 1 that does."""
@@ -965,7 +974,14 @@ def npu_split(rows, combos, B, outdir):
             knobs = dict(knobs)
             persist = knobs.pop("persist", False)
             ta = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **knobs)
-            split(fmt, kind, mt, kb, ta, base[:-4] + ".af.hal", nn)
+            ts = ta
+            if kind == "kres" and OUT_SPLIT_TILE and B % OUT_SPLIT_TILE["bn"] == 0:
+                ts = dataclasses.replace(ta, **OUT_SPLIT_TILE)
+                try:
+                    TG.check(ts)
+                except ValueError:
+                    ts = ta
+            split(fmt, kind, mt, kb, ts, base[:-4] + ".af.hal", nn)
             if kind == "swiglu":
                 split(fmt, kind, mt, kb, dataclasses.replace(ta, tout=True), base[:-4] + ".af.to.hal", nn)
             if persist and kind == "kres" and B // ta.bn > 1 and 2 * kb >= gen_kres_persist.SLICES:

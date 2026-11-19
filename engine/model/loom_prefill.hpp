@@ -1939,7 +1939,7 @@ class LoomPrefill {
         // token tiles, blocks x tt workgroups, is faster: IQ4_XS 1582 -> 1288 us, Q4_K / Q5_K equal; YAH_NPU_OUTP3=1:
         // the persistent part + the tiled last tile)
         static const bool outp3 = std::getenv("YAH_NPU_OUTP3") != nullptr;
-        if (outp3 && af && geom_.count(p3) && tt == g.tt) {
+        if (outp3 && af && geom_.count(p3) && tt == g.tt && gs.tt == g.tt) {
           const std::size_t T = tt - 1;
           const std::size_t tile = B_ / tt;
           // per-token bytes of input, residual and output (bindings first, first + 1, first + 4)
@@ -1954,7 +1954,8 @@ class LoomPrefill {
           Dispatch(Exe(p3), kname.c_str(), blocks, 1, 1, 32, 1, 1, b0, GemmWrites(b0, f, {hidden2_}));
           Dispatch(Exe(sh), kname.c_str(), blocks, 1, 1, 32, 1, 1, b1, GemmWrites(b1, f, {hidden2_}));
         } else {
-          Dispatch(Exe(sh), kname.c_str(), blocks, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+          // its own token tiles (emit_prefill_pp.OUT_SPLIT_TILE: 256 tokens; the split runs untrimmed chunks only)
+          Dispatch(Exe(sh), kname.c_str(), blocks, gs.tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
         }
         // the rest of K for the NPU's rows (its last nn weight rows), beside the GPU's rows: f32 [tokens][nn]
         const std::string rh = "npurem_" + std::string(site) + "_" + f.name + ".hal";
