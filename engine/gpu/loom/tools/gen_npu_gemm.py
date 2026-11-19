@@ -2325,6 +2325,17 @@ def qf_decode(L, cfg, dp):
         e("^fzjb:")
     if direct:   # (the slab's two egress records)
         e(f"  %fzAd2 = mova.i32 {-1 if qfegr2_on() and not (QF4R[0] and QF4R[0]['help']) else -2}")
+        if os.environ.get("GN_QFODLY"):   # (diag) spin N trips before every own-slab egress acquire
+            e(f"  %fzok = mov.i32 {int(os.environ['GN_QFODLY'])}")
+            e("  %fzoz = mova.i32 0")
+            e("  low.br ^fzoh(%fzok: reg<aie2p.er>)")
+            e("^fzoh(%fzoc: reg<aie2p.er>):")
+            e("  %fzom = lt %fzoz, %fzoc")
+            e("  low.cond_br %fzom, ^fzob, ^fzox : reg<aie2p.er>")
+            e("^fzob:")
+            e("  %fzon = add %fzoc, -1")
+            e("  low.br ^fzoh(%fzon: reg<aie2p.er>)")
+            e("^fzox:")
         qfw_wrap(e, "o", 32, [f"  acq %fzAd2, {dp}"])
         if qfl2guard():   # (the own slab takes its helper copy's slot of the second lane: that ring drained first)
             e("  %fzL2m = mova.i32 -1")
@@ -2618,7 +2629,8 @@ def qf_decode(L, cfg, dp):
 def qfw_wrap(e, tag, word, lines, raw=False, mode="1"):
     """(diag GN_QFW=mode, with GN_QFCYC) the cycles of lines (acquires) summed into %qfc byte word. raw: lines may hold
     block labels (the gate check): emitted as they are."""
-    on = QFCYC and os.environ.get("GN_QFW") == mode or raw
+    mx = QFCYC and tag == "o" and os.environ.get("GN_QFW") == "7"   # (diag) own egress: sum 32, max 36, its acquire 40
+    on = QFCYC and os.environ.get("GN_QFW") == mode or raw or mx
     if on:
         e(f"  %qw{tag}p = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
         e(f"  %qw{tag}a = mov.cycles")
@@ -2643,6 +2655,21 @@ def qfw_wrap(e, tag, word, lines, raw=False, mode="1"):
         e(f"  %qw{tag}s = lda %qw{tag}q, {word - 32}")
         e(f"  %qw{tag}n = add.rr %qw{tag}s, %qw{tag}d")
         e(f"  st %qw{tag}n, %qw{tag}q, {word - 32}")
+        if mx:   # (the longest single wait and the running acquire count, 1-based, at it; count at byte 56)
+            e(f"  %qw{tag}c0 = lda %qw{tag}q, 24")
+            e(f"  %qw{tag}c1 = add %qw{tag}c0, 1")
+            e(f"  st %qw{tag}c1, %qw{tag}q, 24")
+            e(f"  %qw{tag}mx = lda %qw{tag}q, 4")
+            e(f"  %qw{tag}gt = lt %qw{tag}mx, %qw{tag}d")
+            e(f"  %qw{tag}dm = sub %qw{tag}d, %qw{tag}mx")
+            e(f"  %qw{tag}dg = mul %qw{tag}dm, %qw{tag}gt")
+            e(f"  %qw{tag}m2 = add.rr %qw{tag}mx, %qw{tag}dg")
+            e(f"  st %qw{tag}m2, %qw{tag}q, 4")
+            e(f"  %qw{tag}ix = lda %qw{tag}q, 8")
+            e(f"  %qw{tag}di = sub %qw{tag}c1, %qw{tag}ix")
+            e(f"  %qw{tag}ig = mul %qw{tag}di, %qw{tag}gt")
+            e(f"  %qw{tag}i2 = add.rr %qw{tag}ix, %qw{tag}ig")
+            e(f"  st %qw{tag}i2, %qw{tag}q, 8")
 
 
 def qf4r_other(e, NS, rawport, dp, direct):
@@ -5628,7 +5655,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e("  %qfaL = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
                 dqc_ = os.environ.get("DQ_CYC") == "1"   # (diag: word 1 the decoder's cycles, word 4 its hot loop's)
                 for w_, o_ in ((1, 16 if dqc_ else 4), (2, 12), (3, 24)) + (((4, 28),) if dqc_ else ()) + (
-                        ((5, 32), (6, 36), (7, 40)) if os.environ.get("GN_QFW") == "1" or os.environ.get("GN_QTL3") in ("1", "2") else
+                        ((5, 32), (6, 36), (7, 40)) if os.environ.get("GN_QFW") in ("1", "7") or os.environ.get("GN_QTL3") in ("1", "2") else
                         ((5, 44), (6, 48)) if os.environ.get("GN_QFW") == "2" else
                         ((5, 56),) if os.environ.get("GN_QFW") in ("3", "4", "5", "6") else ()):
                     if o_ >= 32 and w_ == 5:   # (offsets past the lda immediate: a pointer 32 on)
