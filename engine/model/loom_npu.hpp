@@ -1194,6 +1194,9 @@ class LoomNpu {
     // per column, the shim masters (bit m = master m) that route from slave 5 (MM2S0, the packet lane's source) in the
     // array now: the last setup's, or all of them when unknown
     std::array<std::uint32_t, kCols> s5 = AllS5();
+    // per column, the packet lane's memory tile and core switches stay set from the last setup with packets (no image
+    // uses those ports; a setup without packets clears the cores' master 18 by its zero blocks)
+    std::array<bool, kCols> lane{};
     static std::array<std::uint32_t, kCols> AllS5() {
       std::array<std::uint32_t, kCols> a{};
       a.fill(0x3FFFF8u & ~(1u << 17));   // masters 3-21 but the lane's 17 (2: the token route)
@@ -1203,6 +1206,7 @@ class LoomNpu {
       std::fill(known.begin(), known.end(), 0);
       for (auto& r : rodata) r.clear();
       s5 = AllS5();
+      lane.fill(false);
     }
   };
   // A setup (transaction) with its program loads cut to the words the array does not hold already and its read-only
@@ -1324,6 +1328,7 @@ class LoomNpu {
     for (std::size_t t = 0; t < touched.size(); ++t)
       if (touched[t]) program_.rodata[t] = std::move(rodata[t]);
     if (packets) ControlPackets(ps, out, ops);
+    else program_.lane.fill(false);
     program_.s5 = s5;
     const std::uint32_t bytes = static_cast<std::uint32_t>(out.size());
     std::memcpy(&out[8], &ops, 4), std::memcpy(&out[12], &bytes, 4);
@@ -1460,8 +1465,37 @@ class LoomNpu {
     const std::vector<std::uint8_t> fallback = std::move(seq);
     const std::uint32_t fallback_ops = n;
     seq.clear(), n = 0;
+    // Per column, the batches: up to 3 tasks each (MM2S0's queue holds 4; the one-shot is the 4th). A task is one block
+    // of up to 64 packets (a BD repeated), or up to 12 full blocks whose BDs chain (next BD), the chain repeated 64
+    // times: each BD steps its own iteration once a repeat, so 12 x 64 packets take one queue entry (11-19: a switch
+    // 4950 -> 4200 operations, 160 -> 32 waits; the ffnsw switch 1120 -> 998 us host-driven). YAH_NPU_NOPKCHAIN=1: one
+    // block a task. The lane's memory tile and core switches stay set between setups with packets (program_.lane;
+    // YAH_NPU_NOLANEKEEP=1: set and cleared by each).
+    static const bool chain = std::getenv("YAH_NPU_NOPKCHAIN") == nullptr;
+    static const bool keep = std::getenv("YAH_NPU_NOLANEKEEP") == nullptr;
+    struct Task {
+      std::size_t k0, k1;   // blocks [k0, k1)
+    };
+    std::array<std::vector<std::vector<Task>>, PS::kCols> plan;
     std::size_t batches = 0;
-    for (const auto& b : blocks) batches = std::max(batches, (b.size() + 2) / 3);
+    for (std::uint32_t c = 0; c < PS::kCols; ++c) {
+      std::vector<Task> tasks;
+      for (std::size_t k = 0; k < blocks[c].size(); ++k) {
+        const bool full = blocks[c][k].n == 64;
+        if (chain && full && !tasks.empty() && tasks.back().k1 == k && tasks.back().k1 - tasks.back().k0 < 12 &&
+            blocks[c][tasks.back().k0].n == 64)
+          ++tasks.back().k1;
+        else
+          tasks.push_back({k, k + 1});
+      }
+      std::size_t bds = 0;
+      for (const Task& t : tasks) {
+        if (plan[c].empty() || plan[c].back().size() == 3 || bds + (t.k1 - t.k0) > (chain ? 15u : 3u))
+          plan[c].emplace_back(), bds = 0;
+        plan[c].back().push_back(t), bds += t.k1 - t.k0;
+      }
+      batches = std::max(batches, plan[c].size());
+    }
     // the leading core disables and the trailing core enables (maskwrites of 0x32000)
     std::vector<std::size_t> at;
     std::size_t lead = 16, tail = out.size();
@@ -1482,30 +1516,37 @@ class LoomNpu {
     auto flush = [&] { res.insert(res.end(), seq.begin(), seq.end()), ops += n, seq.clear(), n = 0; };
     auto batch = [&](std::size_t b) {
       for (std::uint32_t c = 0; c < PS::kCols; ++c) {
-        const std::size_t b0 = 3 * b, b1 = std::min(blocks[c].size(), b0 + 3);
-        for (std::size_t k = b0; k < b1; ++k) {
-          const Block& bl = blocks[c][k];
-          const auto bd = static_cast<std::uint32_t>(k - b0);
-          // 5 words a repeat, packet id = row; iteration step 5 words, wrap n (both encoded minus one)
-          blk(tile(c, 0) | 0x1D000 + 0x20 * bd,
-              {5, static_cast<std::uint32_t>(bl.da),
-               static_cast<std::uint32_t>(bl.da >> 32 & 0xFFFF) | 1u << 30 | bl.row << 19, 0, 0xC0000000, 0x02000000,
-               bl.n > 1 ? (bl.n - 1) << 20 | 4 : 0, 1u << 25});
-          w32(tile(c, 0) | 0x1D214, (bl.n - 1) << 16 | bd);
+        if (b >= plan[c].size()) continue;
+        std::uint32_t bd = 0;
+        std::size_t last = 0;
+        for (const Task& t : plan[c][b]) {
+          const std::uint32_t start = bd;
+          for (std::size_t k = t.k0; k < t.k1; ++k, ++bd) {
+            const Block& bl = blocks[c][k];
+            // 5 words a repeat, packet id = row; iteration step 5 words, wrap n (both encoded minus one); a chained
+            // BD names the next (word 7: next BD bits 27-30, use next bit 26, valid bit 25)
+            const std::uint32_t w7 = 1u << 25 | (k + 1 < t.k1 ? 1u << 26 | (bd + 1) << 27 : 0);
+            blk(tile(c, 0) | 0x1D000 + 0x20 * bd,
+                {5, static_cast<std::uint32_t>(bl.da),
+                 static_cast<std::uint32_t>(bl.da >> 32 & 0xFFFF) | 1u << 30 | bl.row << 19, 0, 0xC0000000, 0x02000000,
+                 bl.n > 1 ? (bl.n - 1) << 20 | 4 : 0, w7});
+            last = k;
+          }
+          w32(tile(c, 0) | 0x1D214, (blocks[c][t.k0].n - 1) << 16 | start);
         }
-        if (b1 > b0) {   // the one-shot: the last packet again
-          const Block& bl = blocks[c][b1 - 1];
-          const std::uint64_t la = bl.da + 20 * (bl.n - 1);
-          blk(tile(c, 0) | 0x1D060, {5, static_cast<std::uint32_t>(la),
-                                     static_cast<std::uint32_t>(la >> 32 & 0xFFFF) | 1u << 30 | bl.row << 19, 0,
-                                     0xC0000000, 0x02000000, 0, 1u << 25});
-          w32(tile(c, 0) | 0x1D214, 0x80000003);
-        }
+        // the one-shot: the last packet again
+        const Block& bl = blocks[c][last];
+        const std::uint64_t la = bl.da + 20 * (bl.n - 1);
+        const std::uint32_t one = chain ? 15 : 3;
+        blk(tile(c, 0) | 0x1D000 + 0x20 * one, {5, static_cast<std::uint32_t>(la),
+                                                static_cast<std::uint32_t>(la >> 32 & 0xFFFF) | 1u << 30 | bl.row << 19,
+                                                0, 0xC0000000, 0x02000000, 0, 1u << 25});
+        w32(tile(c, 0) | 0x1D214, 0x80000000 | one);
       }
     };
     auto wait = [&](std::size_t b) {
       for (std::uint32_t c = 0; c < PS::kCols; ++c) {
-        if (blocks[c].size() <= 3 * b) continue;
+        if (b >= plan[c].size()) continue;
         std::uint8_t op[16] = {128};
         const std::uint32_t sz = 16, w2 = 1 | c << 16, w3 = 1u << 8 | 1u << 16;   // MM2S0 of shim (c, 0)
         std::memcpy(op + 4, &sz, 4), std::memcpy(op + 8, &w2, 4), std::memcpy(op + 12, &w3, 4);
@@ -1520,6 +1561,7 @@ class LoomNpu {
           if (ps.shim[c][m] == 0x80000005 || (m != 17 && (program_.s5[c] >> m & 1)))
             w32(tile(c, 0) | 0x3F000 + 4 * m, 0);
         w32(tile(c, 0) | 0x3F044, 0x80000005);                                // M17 <- S5 (MM2S0)
+        if (keep && program_.lane[c]) continue;
         w32(tile(c, 1) | 0xB0130, 0x80000000), w32(tile(c, 1) | 0xB0040, 0x8000000C);   // S12, M16 <- S12
         // (Routes from MM2S0 zeroed above: the image's and the array's from the last setup. A Q' column pair image
         // routes column 1's MM2S0 out master 12, the others out master 14; the old route stayed live through the next
@@ -1528,13 +1570,14 @@ class LoomNpu {
         // (row 2 of the gate columns 1-2: master 7 by msel 0). On arbiter 0 the lane's packets for those tiles also
         // went out that master, into the memory tile's DMA, and the NPU hung now and then after the switch.
         constexpr std::uint32_t arb = 5;
-        for (std::uint32_t r = 0; r < top[c]; ++r) {
+        const std::uint32_t rows = keep ? PS::kRows : top[c];   // (kept: every row, for later setups' packets)
+        for (std::uint32_t r = 0; r < rows; ++r) {
           const std::uint32_t t = tile(c, r + 2);
           w32(t | 0x3F128, 0xC0000000);   // S10 by packets: own row to the lane's arbiter msel 0, rows above msel 1
           for (std::uint32_t k = 0; r + k < PS::kRows; ++k)
             w32(t | 0x3F2A0 + 4 * k, (r + 2 + k) << 24 | 0x1F << 16 | 1u << 8 | (k ? 1u << 4 : 0) | arb);
           w32(t | 0x3F00C, 0xC0000008 | arb);
-          if (r + 1 < top[c]) w32(t | 0x3F048, 0xC0000010 | arb);
+          if (r + 1 < rows) w32(t | 0x3F048, 0xC0000010 | arb);
         }
       }
       batch(0);
@@ -1555,6 +1598,10 @@ class LoomNpu {
       for (std::uint32_t c = 0; c < PS::kCols; ++c) {
         if (!top[c]) continue;
         w32(tile(c, 0) | 0x3F044, 0);
+        if (keep) {
+          program_.lane[c] = true;
+          continue;
+        }
         w32(tile(c, 1) | 0xB0040, 0), w32(tile(c, 1) | 0xB0130, 0);
         for (std::uint32_t r = 0; r < top[c]; ++r) {
           const std::uint32_t t = tile(c, r + 2);
@@ -1623,7 +1670,37 @@ class LoomNpu {
         // (YAH_NPU_NOPACKETS: diag, every switch)
         static const bool nopk = std::getenv("YAH_NPU_NOPACKETS") != nullptr;
         const bool packets = !lane_lost_ && !nopk;
-        append(DeltaSetup(k0->setup.data(), k0->setup.size(), packets));
+        {
+          std::vector<std::uint8_t> ds = DeltaSetup(k0->setup.data(), k0->setup.size(), packets);
+          static const bool swlog = std::getenv("YAH_NPU_SWLOG") != nullptr;   // (diag) each switch's setup by op kind
+          if (swlog) {
+            std::uint32_t n[4] = {}, blkb = 0, blkcore = 0, blkmem = 0, blkoth = 0;
+            for (std::size_t q = 16; q < ds.size();) {
+              std::uint32_t len = ds[q] == 0 ? 24 : ds[q] == 3 ? 28 : 0, a = 0;
+              if (ds[q] == 1) std::memcpy(&len, &ds[q + 12], 4);
+              else if (ds[q] == 128) std::memcpy(&len, &ds[q + 4], 4);
+              std::memcpy(&a, &ds[q + 8], 4);
+              n[ds[q] == 0 ? 0 : ds[q] == 3 ? 1 : ds[q] == 1 ? 2 : 3]++;
+              if (ds[q] == 1) {
+                blkb += len - 16;
+                const std::uint32_t row = a >> 20 & 31, off = a & 0xFFFFF;
+                (row >= 2 && off < 0x10000 ? blkmem : row >= 2 && off < 0x30000 ? blkcore : blkoth) += len - 16;
+              }
+              q += len;
+            }
+            std::fprintf(stderr, "npu switch: %s ops %u (w32 %u mask %u blk %u wait %u) blk KB %.1f (data %.1f prog %.1f "
+                         "other %.1f) packets %d\n", k0->path.substr(k0->path.find_last_of('/') + 1).c_str(),
+                         n[0] + n[1] + n[2] + n[3], n[0], n[1], n[2], n[3], blkb / 1024.0, blkmem / 1024.0,
+                         blkcore / 1024.0, blkoth / 1024.0, packets ? 1 : 0);
+            static int dumped = 0;
+            if (const char* sd = std::getenv("YAH_NPU_SETUPDUMP"); sd && dumped < 40) {
+              const std::string f = std::string(sd) + "/" + std::to_string(dumped++) + "_" +
+                                    k0->path.substr(k0->path.find_last_of('/') + 1) + ".delta";
+              if (FILE* fp = std::fopen(f.c_str(), "wb")) std::fwrite(ds.data(), 1, ds.size(), fp), std::fclose(fp);
+            }
+          }
+          append(ds);
+        }
         lane_lost_ = false;
         fam = FamilyOf(k0), dec = k0->dec;
       }
