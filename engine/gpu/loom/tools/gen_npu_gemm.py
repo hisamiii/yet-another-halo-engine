@@ -229,6 +229,26 @@ def qf4r_on():
     return qfkh_on() and os.environ.get("GN_QF4R") == "1"
 
 
+QF_LANE2_PORT = 9   # (GN_QFLANE2) an egress row's second egress lane (its C channel's DMA, idle in the fill)
+
+
+def qfl2guard():
+    """(GN_QFLANE2, GN_QFL2GUARD=1) in an egress row: its own slab acquires the second lane's slot of the helper copy
+    that follows it (the copy skips that acquire), so the own decode starts only once the last copy was sent."""
+    return qflane2_on() and bool(QF4R[0]) and not QF4R[0]["help"] and os.environ.get("GN_QFL2GUARD") == "1"
+
+
+def qflane2_on():
+    """GN_QFLANE2=1 (GN_QF4RSWAP, the FFN gate / up's 4-record egress ring): the fill's second egress lane. An
+    egress row's ring holds its own slab in slots 0-1 and its helper's copied slab in 2-3; slots 2-3 become a ring of
+    their own on port QF_LANE2_PORT (pinned right after the first), sent on the row's C channel's DMA (Loom: a second
+    constrain.fill of the panel, HRX 0098), so the two lanes egress a K half's panel in parallel. Not beside a Q4_K
+    up column (its GF decoder: panel half 0 comes out wrong, 11-19 log)."""
+    cu = QF.get("cfgu")
+    return (qf4r_swap() and os.environ.get("GN_QFLANE2") == "1" and not qfegr2_on() and qf4r_hslots() == 4
+            and not (cu is not None and cu.fmt == "Q4_K"))
+
+
 def qf4r_swap():
     """GN_QF4RSWAP=1 (with GN_QF4R): rows 0 / 1 swap the fill roles (row 0 egresses half 1, row 1 helps): an egress
     row's first record in panel order is then its own in both pairs (row 1 waited ~3K a call for its helper's)."""
@@ -271,6 +291,9 @@ def qf_ring_at(pins):
             assert egr + m["slots"] * fb <= P1K_GRID_AT and hat + qf4r_hslots() * fb <= P1K_GRID_AT
         assert not QF.get("qsw") or egr + m["slots"] * fb <= 45568
         assert not (QF.get("qsw") and qf4r_on()) or QF4R_HAT + qf4r_hslots() * fb <= 45568
+        if qflane2_on():   # (GN_QFLANE2) slots 0-1 the first lane's ring, 2-3 the second's (one 2-record slot)
+            assert eb == fb and m["slots"] == 4
+            return pins + f",{eb}@{egr}:{egr + eb},{2 * eb}@{egr + 2 * eb}" + h4
         return pins + f",{eb}@" + ":".join(str(egr + i * eb) for i in range(m["slots"] * fb // eb)) + h4
     if qp1k_on():   # (P1K fill) the egress ring in QF_P1K's free run; the A pins stay
         return pins + f",{fb}@{QF_P1K['egr']}:{QF_P1K['egr'] + fb}"
@@ -2295,6 +2318,9 @@ def qf_decode(L, cfg, dp):
     if direct:   # (the slab's two egress records)
         e(f"  %fzAd2 = mova.i32 {-1 if qfegr2_on() and not (QF4R[0] and QF4R[0]['help']) else -2}")
         qfw_wrap(e, "o", 32, [f"  acq %fzAd2, {dp}"])
+        if qfl2guard():   # (the own slab takes its helper copy's slot of the second lane: that ring drained first)
+            e("  %fzL2m = mova.i32 -1")
+            e(f"  acq %fzL2m, {QF_LANE2_PORT}")
     if QFCYC and os.environ.get("GN_QFRAW") == "1":
         e("  %qfprb = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>")
         e("  %qfwrb = mov.cycles")
@@ -2645,8 +2671,9 @@ def qf4r_other(e, NS, rawport, dp, direct):
             e("  %qxt = lda %qxp2, 24")
             e("  %qxn = add.rr %qxt, %qxd")
             e("  st %qxn, %qxp2, 24")
-        e(f"  %f4AE = mova.i32 {-1 if qfegr2_on() else -2}")
-        qfw_wrap(e, "x", 40, [f"  acq %f4AE, {dp}"])
+        e(f"  %f4AE = mova.i32 {-1 if qfegr2_on() or qflane2_on() else -2}")
+        dp = QF_LANE2_PORT if qflane2_on() else dp   # (GN_QFLANE2: the helper's slab on the second egress lane)
+        qfw_wrap(e, "x", 40, [] if qfl2guard() else [f"  acq %f4AE, {dp}"])   # (guard: the own slab took it)
         e("  %f4pS = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
         e("  %f4pN4 = storage_address %f4s : low.storage<private> -> reg<aie2p.ep>")
         e("  %f4nb = lda %f4pN4, 0")
@@ -2735,7 +2762,7 @@ def qf4r_other(e, NS, rawport, dp, direct):
             e("  st %qxn, %qxp2, 24")
         qfw_wrap(e, "c", 48, [] if os.environ.get("GN_QFNOCOPY") else cl_, mode="2")   # (GN_QFNOCOPY: diag, no copies)
         e("  %f4R2 = mova.i32 2")
-        e(f"  %f4RE = mova.i32 {1 if qfegr2_on() else 2}")
+        e(f"  %f4RE = mova.i32 {1 if qfegr2_on() or qflane2_on() else 2}")
         e(f"  rel %f4RE, {dp}")
         e(f"  rel %f4R2, {QF4R_NB}")
         e("  %f4ec2 = add %f4ec, 2")

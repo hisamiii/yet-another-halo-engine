@@ -1,0 +1,662 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:00:00 +0100
+Subject: [PATCH] loom: add a fill's second egress lane
+
+A second constrain.fill of a streamed interleaved panel: the second source rides on its worker's merged C egress channel (the same core memory-to-stream channel and route, its own ring and descriptors), and the panel gets a second memory-tile writer on the stream-to-memory channel where that C egress lands: the odd interleave units in one strided descriptor, queued per push before the C ring (both rings then run per push), freeing a done lock that the first writer (now the even units) waits on before it releases the panel; it starts on a go lock that the first writer's first unit releases past the panel's credit. LOOM_EXP_DMA_DUMP=1 (diag): the DMA, staged channel and column 0 lock plans.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -203,6 +203,9 @@
+   iree_host_size_t lock_cursor;
+   iree_host_size_t dma_channel_cursor;
+   iree_host_size_t binding_plan_cursor;
++  // A fill's second egress lane being planned: its worker's C channel's
++  // core DMA channel plus one (0: none), which its endpoint reuses.
++  uint8_t lane2_shared_dma_plus1;
+ 
+   loom_aie2p_array_tile_state_t* tile_states;
+ } loom_aie2p_array_plan_builder_t;
+@@ -643,6 +646,12 @@
+   channel->signal = false;
+   channel->fill_source = UINT32_MAX;
+   channel->fill_target = UINT32_MAX;
++  channel->fill_source2 = UINT32_MAX;
++  channel->fill_lane2 = false;
++  channel->lane2_share = UINT32_MAX;
++  channel->lane2_prefix = UINT32_MAX;
++  channel->lane2_fill_dma = UINT32_MAX;
++  channel->lane2_lock = UINT32_MAX;
+   channel->intake_panel = UINT32_MAX;
+   channel->intake_prefix = UINT32_MAX;
+   channel->intake_offset = 0;
+@@ -927,6 +936,13 @@
+         const uint32_t source =
+             loom_aie2p_array_lookup_entity(builder, loom_op_operands(op)[1])
+                 ->index;
++        if (builder->channels[panel].fill_source != UINT32_MAX) {
++          // A second fill of one panel: the fill's second egress lane.
++          builder->channels[panel].fill_source2 = source;
++          builder->channels[source].fill_target = panel;
++          builder->channels[source].fill_lane2 = true;
++          break;
++        }
+         builder->channels[panel].fill_source = source;
+         if (builder->channels[source].fill_target == UINT32_MAX) {
+           builder->channels[source].fill_target = panel;   // the first panel
+@@ -1047,11 +1063,15 @@
+       .flags = contiguous_ring
+                    ? LOOM_AIE2P_ARRAY_COMPUTE_ENDPOINT_REQUEST_FLAG_CONTIGUOUS_RING
+                    : 0,
++      .shared_dma_channel_plus1 = builder->lane2_shared_dma_plus1,
+   };
+   if (loom_aie2p_array_try_compute_endpoint(builder, source_endpoint, &request,
+                                             out_proposal)) {
+     return true;
+   }
++  if (builder->lane2_shared_dma_plus1 != 0) {
++    return false;   // (a shared channel is its worker's own tile's)
++  }
+ 
+   for (uint8_t worker_pass = 0; worker_pass < 2; ++worker_pass) {
+     const bool select_worker_tiles = worker_pass != 0;
+@@ -3461,6 +3481,103 @@
+   return iree_ok_status();
+ }
+ 
++// A fill's second egress lane (a second constrain.fill of |channel_index|, a
++// streamed interleaved one-member panel): the second writer takes the odd
++// interleave units on the stream-to-memory channel where its worker's merged
++// C egress lands (idle in the fill; per push, its descriptor runs before the C
++// ring). It frees its done lock; the first writer, now the even units, waits
++// on it in its last descriptor before it releases the panel.
++static iree_status_t loom_aie2p_array_plan_fill_lane2(
++    loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index) {
++  loom_aie2p_array_channel_t* panel = &builder->channels[channel_index];
++  const loom_xdna_tile_coordinate_t coordinate = {panel->stage_column, 1};
++  const loom_aie2p_array_channel_t* source =
++      &builder->channels[panel->fill_source2];
++  if (source->lane2_share == UINT32_MAX ||
++      source->sender_dma_index == UINT32_MAX) {
++    return loom_aie2p_array_reject_channel_resources(
++        builder, channel_index, coordinate,
++        IREE_SV("a fill's second egress lane must precede the panel it fills"));
++  }
++  const loom_aie2p_array_channel_t* c = &builder->channels[source->lane2_share];
++  if (c->stage_dma_index == UINT32_MAX ||
++      builder->dma_channels[c->stage_dma_index].coordinate.column !=
++          panel->stage_column ||
++      panel->stage_panel_owner != channel_index ||
++      panel->stage_panel_unit_bytes == 0 || !panel->stage_panel_stream ||
++      panel->stage_panel_group_count != 1 || panel->stage_record_count != 1 ||
++      panel->stage_panel_unit_bytes / 4u > 1023u ||
++      (panel->stage_panel_group_records[0] * builder->plan->panel_interleave) %
++              2u != 0) {
++    return loom_aie2p_array_reject_channel_resources(
++        builder, channel_index, coordinate,
++        IREE_SV("a fill's second egress lane needs a streamed interleaved "
++                "one-member panel of an even unit count and its C egress "
++                "landing in the panel's memory tile"));
++  }
++  const loom_aie2p_array_dma_plan_t* c_fill =
++      &builder->dma_channels[c->stage_dma_index];
++  loom_aie2p_array_tile_state_t* state =
++      loom_aie2p_array_tile_state(builder, coordinate);
++  loom_aie2p_array_tile_resources_t* resources = &state->resources;
++  const uint16_t half_capacity =
++      (uint16_t)(resources->facts->dma.buffer_descriptor_count / 2u);
++  uint16_t* cursor = &state->memory_tile_bd_cursors[c_fill->dma_channel & 1u];
++  if (*cursor + 1u > half_capacity ||
++      (uint32_t)resources->next_lock + 2u > resources->facts->lock_count) {
++    return loom_aie2p_array_reject_channel_resources(
++        builder, channel_index, coordinate,
++        IREE_SV("no descriptor or lock left for a fill's second egress lane"));
++  }
++  const uint16_t bd =
++      (uint16_t)((c_fill->dma_channel & 1u) * half_capacity + *cursor);
++  *cursor += 1u;
++  panel->lane2_lock = (uint32_t)builder->lock_cursor;
++  builder->locks[builder->lock_cursor++] = (loom_aie2p_array_lock_plan_t){
++      .channel_index = channel_index,
++      .coordinate = coordinate,
++      .lock_id = resources->next_lock++,
++      .initial_value = 0,
++      .ring_endpoint_direction = LOOM_AIE2P_ARRAY_ENDPOINT_DIRECTION_RECEIVE,
++      .consumer_ready = 1,
++  };
++  // (its go lock, right after: the first writer's first unit, past the
++  // panel's credit, frees the second writer)
++  builder->locks[builder->lock_cursor++] = (loom_aie2p_array_lock_plan_t){
++      .channel_index = channel_index,
++      .coordinate = coordinate,
++      .lock_id = resources->next_lock++,
++      .initial_value = 0,
++      .ring_endpoint_direction = LOOM_AIE2P_ARRAY_ENDPOINT_DIRECTION_RECEIVE,
++      .consumer_ready = 1,
++  };
++  panel->lane2_fill_dma = (uint32_t)builder->dma_channel_cursor;
++  builder->dma_channels[builder->dma_channel_cursor++] =
++      (loom_aie2p_array_dma_plan_t){
++          .channel_index = channel_index,
++          .coordinate = coordinate,
++          .direction = LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY,
++          .dma_channel = c_fill->dma_channel,
++          .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE |
++                   LOOM_AIE2P_ARRAY_DMA_FLAG_LANE2,
++          .buffer_descriptor_start = bd,
++          .buffer_descriptor_count = 1,
++          .credit_lock_index = panel->lane2_lock,
++          .stage_record_base =
++              builder->dma_channels[panel->stage_dma_index].stage_record_base,
++      };
++  if (getenv("LOOM_EXP_ROUTE_DUMP")) {
++    fprintf(stderr,
++            "lane2: panel %u source %u shares channel %u (core dma %u, memory "
++            "tile s2mm %u bd %u lock %u)\n",
++            channel_index, panel->fill_source2, source->lane2_share,
++            builder->dma_channels[source->sender_dma_index].dma_channel,
++            c_fill->dma_channel, bd,
++            builder->locks[panel->lane2_lock].lock_id);
++  }
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_aie2p_array_plan_external_channel(
+     loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index,
+     const loom_aie2p_array_endpoint_t* sender,
+@@ -3492,11 +3609,47 @@
+       LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_COMPUTE_MEMORY_TO_STREAM |
+           LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_COMPUTE_STREAM_TO_MEMORY);
+   loom_aie2p_array_compute_endpoint_proposal_t compute_proposal = {0};
++  if (owns_compute_dma && channel->fill_lane2) {
++    // A fill's second egress lane rides on its worker's merged C egress
++    // channel: the same core memory-to-stream channel and route, queued per
++    // push before the C ring (idle during the fill).
++    uint32_t share = UINT32_MAX;
++    for (uint32_t j = 0; j < channel_index && !ingress; ++j) {
++      const loom_aie2p_array_channel_t* c = &builder->channels[j];
++      if (c->egress_merge_owner == UINT32_MAX ||
++          c->sender_dma_index == UINT32_MAX ||
++          c->lane2_prefix != UINT32_MAX) {
++        continue;
++      }
++      const loom_aie2p_array_dma_plan_t* d =
++          &builder->dma_channels[c->sender_dma_index];
++      if (d->flags == 0 &&
++          d->direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM &&
++          loom_aie2p_array_coordinates_equal(d->coordinate,
++                                             worker->coordinate)) {
++        share = j;
++        break;
++      }
++    }
++    if (share == UINT32_MAX) {
++      return loom_aie2p_array_reject_channel_resources(
++          builder, channel_index, worker->coordinate,
++          IREE_SV("a fill's second egress lane needs its worker's merged C "
++                  "egress channel, planned before it"));
++    }
++    channel->lane2_share = share;
++    builder->channels[share].lane2_prefix = channel_index;
++    builder->lane2_shared_dma_plus1 = (uint8_t)(
++        builder->dma_channels[builder->channels[share].sender_dma_index]
++            .dma_channel + 1u);
++  }
+   if (owns_compute_dma) {
+-    if (!loom_aie2p_array_select_compute_endpoint(
+-            builder, worker->coordinate, compute_direction,
+-            (uint8_t)channel->capacity, channel->record_byte_length,
+-            channel->leaf_sync, /*source_endpoint=*/NULL, &compute_proposal)) {
++    const bool selected = loom_aie2p_array_select_compute_endpoint(
++        builder, worker->coordinate, compute_direction,
++        (uint8_t)channel->capacity, channel->record_byte_length,
++        channel->leaf_sync, /*source_endpoint=*/NULL, &compute_proposal);
++    builder->lane2_shared_dma_plus1 = 0;
++    if (!selected) {
+       const iree_string_view_t reason =
+           ingress ? IREE_SV(
+                         "no visible compute tile can host the receiving DMA "
+@@ -3714,6 +3867,13 @@
+           shim_dma->dma_channel, fill->coordinate, LOOM_XDNA_STREAM_PORT_DMA,
+           fill->dma_channel, /*vertical_first=*/false);
+     }
++    if (fill_routed && channel->fill_source2 != UINT32_MAX) {
++      IREE_RETURN_IF_ERROR(
++          loom_aie2p_array_plan_fill_lane2(builder, channel_index));
++      if (!builder->valid) {
++        return iree_ok_status();
++      }
++    }
+     const bool staged_routed =
+         fill_routed &&
+         loom_aie2p_array_route_workers(
+@@ -4452,6 +4612,12 @@
+           builder, channel_index, LOOM_XDNA_DMA_DIRECTION_STREAM_TO_MEMORY,
+           sender_coordinate, &demands, out_cardinalities));
+     }
++    if (channel->fill_source2 != UINT32_MAX) {
++      // A fill's second egress lane: its memory-tile writer row, done and go
++      // locks.
++      out_cardinalities->dma_channel_count += 1u;
++      out_cardinalities->lock_count += 2u;
++    }
+     if (loom_aie2p_array_channel_is_intake(channel)) {
+       // Each member: its memory-tile drain and core receive rows, its core
+       // lock pair and its chain lock; the source: the fill row, the chain's
+@@ -4663,6 +4829,42 @@
+   builder->plan->channel_slot_count = builder->channel_slot_cursor;
+   builder->plan->lock_count = builder->lock_cursor;
+   builder->plan->dma_channel_count = builder->dma_channel_cursor;
++  if (getenv("LOOM_EXP_DMA_DUMP") != NULL) {  // (diag) one line per DMA channel
++    for (iree_host_size_t i = 0; i < builder->dma_channel_cursor; ++i) {
++      const loom_aie2p_array_dma_plan_t* d = &builder->dma_channels[i];
++      fprintf(stderr, "STAGE DMA ch %u col %u row %u dir %u dma %u flags %x bd %u+%u gate %u\n",
++              d->channel_index, d->coordinate.column, d->coordinate.row,
++              (unsigned)d->direction, d->dma_channel, (unsigned)d->flags,
++              d->buffer_descriptor_start, d->buffer_descriptor_count,
++              d->gate_count);
++    }
++    for (iree_host_size_t i = 0; i < builder->plan->channel_count; ++i) {
++      const loom_aie2p_array_channel_t* c = &builder->channels[i];
++      if (c->stage_dma_index == UINT32_MAX && c->fill_target == UINT32_MAX) continue;
++      fprintf(stderr,
++              "STAGE CHAN %u src %u owner %u slot %u rc %u cap %u rbytes %u "
++              "srec %u rep %u sgrp %u groups %u [%u %u %u %u] prb %u stream %u "
++              "fsrc %u ftgt %u emerge %u lock %u sdma %u off %llu unit %u sub %u suboff %u il %u\n",
++              (unsigned)i, c->source_channel_index, c->stage_panel_owner,
++              c->stage_panel_slot, c->record_count, c->capacity,
++              c->record_byte_length, c->stage_record_count,
++              c->stage_repeat_count, c->stage_group,
++              c->stage_panel_group_count, c->stage_panel_group_records[0],
++              c->stage_panel_group_records[1], c->stage_panel_group_records[2],
++              c->stage_panel_group_records[3], c->stage_panel_record_bytes,
++              (unsigned)c->stage_panel_stream, c->fill_source, c->fill_target,
++              c->egress_merge_owner, c->stage_panel_lock_index,
++              c->stage_dma_index,
++              (unsigned long long)c->stage_panel_byte_offset, c->stage_panel_unit_bytes, c->stage_panel_sub_bytes, c->stage_panel_sub_offset, builder->plan->panel_interleave);
++    }
++    for (iree_host_size_t i = 0; i < builder->lock_cursor; ++i) {
++      const loom_aie2p_array_lock_plan_t* l = &builder->locks[i];
++      if (l->coordinate.column != 0) continue;
++      fprintf(stderr, "STAGE LOCK %u ch %u row %u id %u init %d\n",
++              (unsigned)i, l->channel_index, l->coordinate.row, l->lock_id,
++              (int)l->initial_value);
++    }
++  }
+   builder->plan->route_count = builder->route_builder.route_count;
+   // Fill-linked channels (constrain.fill) keep a binding plan for their layout
+   // facts during planning but transfer nothing: drop those plans.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -86,6 +86,10 @@
+   // memory-tile drain (on its panel's drain channel) or a member's core
+   // receive (on its panel's receiving channel).
+   LOOM_AIE2P_ARRAY_DMA_FLAG_INTAKE = 1u << 3,
++  // A fill's second egress lane (a second constrain.fill of one panel): the
++  // panel's second memory-tile writer, on the sharing C channel's
++  // stream-to-memory channel (queued per push before that channel's ring).
++  LOOM_AIE2P_ARRAY_DMA_FLAG_LANE2 = 1u << 4,
+ };
+ 
+ // Physical switch container programmed by a route connection.
+@@ -244,6 +248,21 @@
+   // channel) and on the source (the panel); UINT32_MAX otherwise.
+   uint32_t fill_source;
+   uint32_t fill_target;
++  // A fill's second egress lane: a second constrain.fill of one panel. The
++  // panel: fill_source2 (its second writer, the odd interleave units),
++  // lane2_fill_dma (that writer's memory-tile row) and lane2_lock (its done
++  // lock: the first writer's last descriptor waits on it; lane2_lock + 1 its
++  // go lock: the first writer's first descriptor, past the panel's credit,
++  // releases it and the second writer waits on it). The source:
++  // fill_lane2, and lane2_share, the C channel whose core memory-to-stream
++  // and memory-tile stream-to-memory channels it rides on; that C channel:
++  // lane2_prefix (the source), its rings then queued per push after it.
++  uint32_t fill_source2;
++  bool fill_lane2;
++  uint32_t lane2_share;
++  uint32_t lane2_prefix;
++  uint32_t lane2_fill_dma;
++  uint32_t lane2_lock;
+   // Experimental (HRX patch 0022) constrain.intake %intake, %panel, %offset,
+   // %rows, %pitch: the staged binding multicast |intake| reaches each member worker
+   // through its streamed panel channel's memory-tile drain and receiving DMA,
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+@@ -289,7 +289,9 @@
+        request->loopback_source_dma_channel != *next_channel)) {
+     return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_DMA_LOOPBACK;
+   }
+-  if (*next_channel >= probe.facts->dma.channel_count_per_direction) {
++  const bool shared = request->shared_dma_channel_plus1 != 0;
++  if (!shared &&
++      *next_channel >= probe.facts->dma.channel_count_per_direction) {
+     return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_DMA_CHANNEL;
+   }
+   if ((uint32_t)probe.next_buffer_descriptor + request->record_count >
+@@ -299,7 +301,8 @@
+ 
+   loom_aie2p_array_compute_endpoint_proposal_t proposal = {
+       .direction = request->direction,
+-      .dma_channel = (*next_channel)++,
++      .dma_channel = shared ? (uint8_t)(request->shared_dma_channel_plus1 - 1u)
++                            : (*next_channel)++,
+       .buffer_descriptor_start = probe.next_buffer_descriptor,
+       .buffer_descriptor_count = request->record_count,
+   };
+@@ -313,6 +316,10 @@
+         LOOM_AIE2P_ARRAY_COMPUTE_ENDPOINT_PROPOSAL_FLAG_STARTS_DMA_SERVICE;
+     probe.flags |= LOOM_AIE2P_ARRAY_TILE_RESOURCE_FLAG_HAS_DMA_SERVICE;
+   }
++  if (shared) {
++    proposal.flags |=
++        LOOM_AIE2P_ARRAY_COMPUTE_ENDPOINT_PROPOSAL_FLAG_SHARED_DMA_CHANNEL;
++  }
+ 
+   const loom_aie2p_array_channel_resource_failure_t failure =
+       loom_aie2p_array_channel_resources_propose_ring_from_probe(
+@@ -375,7 +382,11 @@
+       proposal->direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM
+           ? &resources->next_memory_to_stream_channel
+           : &resources->next_stream_to_memory_channel;
+-  *next_channel = proposal->dma_channel + 1u;
++  if (!iree_any_bit_set(
++          proposal->flags,
++          LOOM_AIE2P_ARRAY_COMPUTE_ENDPOINT_PROPOSAL_FLAG_SHARED_DMA_CHANNEL)) {
++    *next_channel = proposal->dma_channel + 1u;
++  }
+   resources->next_buffer_descriptor =
+       proposal->buffer_descriptor_start + proposal->buffer_descriptor_count;
+   if (iree_any_bit_set(
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.h
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.h
+@@ -110,12 +110,17 @@
+   uint8_t loopback_source_dma_channel;
+   // Optional loopback relationship required by the request.
+   loom_aie2p_array_compute_endpoint_request_flags_t flags;
++  // A DMA channel the endpoint shares with an earlier one, plus one (0:
++  // none): no channel is taken (a fill's second egress lane).
++  uint8_t shared_dma_channel_plus1;
+ } loom_aie2p_array_compute_endpoint_request_t;
+ 
+ typedef uint8_t loom_aie2p_array_compute_endpoint_proposal_flags_t;
+ enum loom_aie2p_array_compute_endpoint_proposal_flag_bits_e {
+   // This endpoint acquires service-tile lifecycle ownership.
+   LOOM_AIE2P_ARRAY_COMPUTE_ENDPOINT_PROPOSAL_FLAG_STARTS_DMA_SERVICE = 1u << 0,
++  // The endpoint shares an earlier endpoint's DMA channel (no channel taken).
++  LOOM_AIE2P_ARRAY_COMPUTE_ENDPOINT_PROPOSAL_FLAG_SHARED_DMA_CHANNEL = 1u << 1,
+ };
+ 
+ // Exact compute DMA, ring, and lock transition retained for commit.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -968,6 +968,14 @@
+       coordinate, indices);
+ }
+ 
++// A fill's second egress lane and the C channel it rides on: their core
++// memory-to-stream rings (and the C channel's memory-tile fill ring) run as
++// terminating chains queued per push, the lane's before the C ring's.
++static bool loom_aie2p_program_lane2_queued(
++    const loom_aie2p_array_channel_t* channel) {
++  return channel->fill_lane2 || channel->lane2_prefix != UINT32_MAX;
++}
++
+ static void loom_aie2p_program_build_compute_dma_descriptor(
+     loom_aie2p_array_program_builder_t* builder,
+     const loom_aie2p_array_dma_plan_t* dma, uint32_t slot_ordinal) {
+@@ -1050,7 +1058,8 @@
+   // terminating chain the queue's repeat count re-runs.
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_COMPUTE_MEMORY_DMA_BD_WORD5_USE_NEXT_BD,
+-      channel->intake_prefix != UINT32_MAX &&
++      (channel->intake_prefix != UINT32_MAX ||
++       loom_aie2p_program_lane2_queued(channel)) &&
+               slot_ordinal + 1u == dma->buffer_descriptor_count
+           ? 0
+           : 1,
+@@ -1484,10 +1493,118 @@
+   return iree_ok_status();
+ }
+ 
++// A fill's second egress lane: |units| interleave units of |unit_words| words,
++// every other one (d0 a unit, d1 two units apart).
++static void loom_aie2p_program_encode_lane2_dims(uint32_t unit_words,
++                                                 uint32_t units,
++                                                 uint32_t* words) {
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD2_D0_STEP_SIZE, 0,
++      &words[2]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD2_D0_WRAP, unit_words,
++      &words[2]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD3_D1_STEP_SIZE,
++      2u * unit_words - 1u, &words[3]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD3_D1_WRAP, units,
++      &words[3]);
++}
++
++// The second writer of a fill's second egress lane: the panel's odd units in
++// one terminating descriptor (queued per push before the C ring it shares a
++// channel with); no credit (the push order puts it after the C ring of the
++// previous invocation, so after the panel's last drain), then its done lock.
++static iree_status_t loom_aie2p_program_build_lane2_descriptor(
++    loom_aie2p_array_program_builder_t* builder,
++    const loom_aie2p_array_dma_plan_t* dma) {
++  const loom_aie2p_array_plan_t* plan = builder->plan;
++  const loom_aie2p_array_channel_t* panel = &plan->channels[dma->channel_index];
++  const uint32_t unit = panel->stage_panel_unit_bytes;
++  const uint32_t units =
++      panel->stage_panel_group_records[0] * plan->panel_interleave / 2u;
++  const loom_xdna_tile_facts_t* tile =
++      loom_xdna_array_tile_facts(plan->family, dma->coordinate);
++  const loom_aie2p_array_lock_plan_t* done = &plan->locks[dma->credit_lock_index];
++  const loom_aie2p_array_lock_plan_t* go =
++      &plan->locks[dma->credit_lock_index + 1u];
++  uint16_t release_selector = 0;
++  IREE_RETURN_IF_ERROR(loom_xdna_array_form_lock_selector(
++      plan->family, dma->coordinate, done->coordinate, done->lock_id,
++      &release_selector));
++  uint16_t acquire_selector = 0;
++  IREE_RETURN_IF_ERROR(loom_xdna_array_form_lock_selector(
++      plan->family, dma->coordinate, go->coordinate, go->lock_id,
++      &acquire_selector));
++  const uint32_t dma_address = tile->memory.local_load_base +
++                               plan->stage_record_offsets[dma->stage_record_base] +
++                               unit;
++  const uint16_t indices[] = {dma->buffer_descriptor_start};
++  uint32_t* words = loom_aie2p_program_append_register_block_write32(
++      &builder->array,
++      (uint32_t)loom_xdna_register_field_address(
++          plan->family,
++          LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD0_BUFFER_LENGTH,
++          dma->coordinate, indices),
++      LOOM_AIE2P_MEMORY_TILE_DMA_BUFFER_DESCRIPTOR_WORD_COUNT);
++  memset(words, 0,
++         LOOM_AIE2P_MEMORY_TILE_DMA_BUFFER_DESCRIPTOR_WORD_COUNT *
++             sizeof(*words));
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD0_BUFFER_LENGTH,
++      units * unit / tile->dma.transfer_length_granularity -
++          tile->dma.transfer_length_offset,
++      &words[0]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_BASE_ADDRESS,
++      dma_address >> tile->dma.address_encoding_shift, &words[1]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_NEXT_BD,
++      dma->buffer_descriptor_start, &words[1]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_USE_NEXT_BD, 0,
++      &words[1]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_VALID_BD, 1, &words[7]);
++  loom_aie2p_program_encode_lane2_dims(unit / 4u, units, words);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_VALUE, 1,
++      &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_ID,
++      release_selector, &words[7]);
++  // (it waits for the go lock: the first writer past the panel's credit, so it
++  // never writes a panel that its reader still replays)
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_ENABLE, 1,
++      &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_VALUE, -1,
++      &words[7]);
++  loom_aie2p_program_encode_admitted_field(
++      LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_ID,
++      acquire_selector, &words[7]);
++  if (getenv("LOOM_EXP_ROUTE_DUMP")) {
++    fprintf(stderr,
++            "lane2: writer 2 at (%u,%u) s2mm %u bd %u: %u units of %u B from "
++            "0x%x, done lock %u, go lock %u\n",
++            dma->coordinate.column, dma->coordinate.row, dma->dma_channel,
++            dma->buffer_descriptor_start, units, unit, dma_address,
++            done->lock_id, go->lock_id);
++  }
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+     loom_aie2p_array_program_builder_t* builder,
+     const loom_aie2p_array_dma_plan_t* dma, uint32_t slot_ordinal) {
+   const loom_aie2p_array_plan_t* plan = builder->plan;
++  if (iree_any_bit_set(dma->flags, LOOM_AIE2P_ARRAY_DMA_FLAG_LANE2)) {
++    return slot_ordinal == 0
++               ? loom_aie2p_program_build_lane2_descriptor(builder, dma)
++               : iree_ok_status();
++  }
+   const loom_aie2p_array_channel_t* channel =
+       &plan->channels[dma->channel_index];
+   if (channel->egress_merge_owner == dma->channel_index &&
+@@ -1590,6 +1707,7 @@
+   const uint32_t unit =
+       panel_owner != NULL ? panel_owner->stage_panel_unit_bytes : 0u;
+   bool interleaved_drain = false;
++  uint32_t lane2_units = 0;   // (a fill's second lane: strided units, 2 apart)
+   int32_t interleaved_acquire = 0;
+   int32_t interleaved_release = 0;
+   uint32_t drain_sub_words = 0;
+@@ -1626,7 +1744,32 @@
+     }
+     uint32_t byte_length = 0;
+     record_slot = 0;
+-    if (fill && part < member_count) {
++    if (fill && channel->fill_source2 != UINT32_MAX) {
++      // A fill's second egress lane: this writer takes the even units (the
++      // second the odd ones). Its last unit waits for the second's done lock,
++      // then releases the panel.
++      if (part == 0) {
++        record_byte_offset = group_base;
++        byte_length = unit;
++        acquire_lock = &plan->locks[member->stage_panel_lock_index];
++        interleaved_acquire =
++            -(int32_t)loom_aie2p_panel_units(member->stage_repeat_count);
++        release_lock = &plan->locks[channel->lane2_lock + 1u];   // (go)
++        interleaved_release = 1;
++      } else if (part == 1) {
++        record_byte_offset = group_base + 2u * unit;
++        lane2_units = units / 2u - 2u;
++        byte_length = lane2_units * unit;
++      } else {
++        record_byte_offset = group_base + (units - 2u) * unit;
++        byte_length = unit;
++        acquire_lock = &plan->locks[channel->lane2_lock];
++        interleaved_acquire = -1;
++        release_lock = &plan->locks[member->stage_panel_lock_index + 1u];
++        interleaved_release =
++            (int32_t)loom_aie2p_panel_units(member->stage_repeat_count);
++      }
++    } else if (fill && part < member_count) {
+       record_byte_offset = group_base + member->stage_panel_sub_offset;
+       byte_length = member->stage_panel_sub_bytes;
+       acquire_lock = &plan->locks[member->stage_panel_lock_index + 2u * panel_group];
+@@ -1704,6 +1847,7 @@
+       LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_USE_NEXT_BD,
+       pair_drain ? 1
+       : (replay && last_slot && !(stream && fill)) ||
++              (fill && last_slot && channel->lane2_prefix != UINT32_MAX) ||
+               (gated_drain && groups > 1 &&
+                !(loom_aie2p_program_panel_blockmajor() && group + 1 < groups))
+           ? 0
+@@ -1746,6 +1890,9 @@
+         LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD5_D3_STEP_SIZE,
+         plan->panel_interleave * unit_words - 1u, &words[5]);
+   }
++  if (lane2_units > 1u) {
++    loom_aie2p_program_encode_lane2_dims(unit / 4u, lane2_units, words);
++  }
+   if (unit != 0 && fill) {
+     if (interleaved_acquire != 0) {
+       loom_aie2p_program_encode_admitted_field(
+@@ -2329,6 +2476,43 @@
+     loom_aie2p_array_program_builder_t* builder, uint32_t parity,
+     bool unpaced) {
+   const loom_aie2p_array_plan_t* plan = builder->plan;
++  for (iree_host_size_t i = 0; i < plan->channel_count; ++i) {
++    // A fill's second egress lane: the invocation's lane records, then its C
++    // records, on the core's shared memory-to-stream channel and on the
++    // memory tile's stream-to-memory channel where the C egress lands.
++    const loom_aie2p_array_channel_t* c = &plan->channels[i];
++    if (c->lane2_prefix == UINT32_MAX) {
++      continue;
++    }
++    const loom_aie2p_array_channel_t* lane = &plan->channels[c->lane2_prefix];
++    const loom_aie2p_array_channel_t* panel = &plan->channels[lane->fill_target];
++    const loom_aie2p_array_dma_plan_t* lane_core =
++        &plan->dma_channels[lane->sender_dma_index];
++    const loom_aie2p_array_dma_plan_t* c_core =
++        &plan->dma_channels[c->sender_dma_index];
++    const loom_aie2p_array_dma_plan_t* writer =
++        &plan->dma_channels[panel->lane2_fill_dma];
++    const loom_aie2p_array_dma_plan_t* c_fill =
++        &plan->dma_channels[c->stage_dma_index];
++    if (lane->record_count % lane_core->buffer_descriptor_count != 0 ||
++        c->record_count % c_core->buffer_descriptor_count != 0 ||
++        c->record_count % c_fill->buffer_descriptor_count != 0) {
++      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
++                              "a fill's second egress lane and its C channel "
++                              "need whole ring repetitions");
++    }
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_task(
++        builder, writer, writer->buffer_descriptor_start, 0));
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_task(
++        builder, c_fill, c_fill->buffer_descriptor_start,
++        c->record_count / c_fill->buffer_descriptor_count - 1u));
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_task(
++        builder, lane_core, lane_core->buffer_descriptor_start,
++        lane->record_count / lane_core->buffer_descriptor_count - 1u));
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_queue_task(
++        builder, c_core, c_core->buffer_descriptor_start,
++        c->record_count / c_core->buffer_descriptor_count - 1u));
++  }
+   for (iree_host_size_t i = 0; i < plan->dma_channel_count; ++i) {
+     const loom_aie2p_array_dma_plan_t* dma = &plan->dma_channels[i];
+     if (!loom_aie2p_program_is_memory_tile_dma(dma) ||
+@@ -2987,6 +3171,15 @@
+              UINT32_MAX)) {
+       continue;
+     }
++    // A fill's second egress lane and its C channel's rings: per push too.
++    const loom_aie2p_array_channel_t* lane2_channel =
++        &builder->plan->channels[dma->channel_index];
++    if (iree_any_bit_set(dma->flags, LOOM_AIE2P_ARRAY_DMA_FLAG_LANE2) ||
++        (dma->flags == 0 && loom_aie2p_program_lane2_queued(lane2_channel)) ||
++        (lane2_channel->lane2_prefix != UINT32_MAX &&
++         i == lane2_channel->stage_dma_index)) {
++      continue;
++    }
+     if (loom_aie2p_program_is_memory_tile_dma(dma)) {
+       IREE_RETURN_IF_ERROR(
+           loom_aie2p_program_start_memory_tile_dma(builder, dma));
