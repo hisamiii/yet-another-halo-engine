@@ -838,6 +838,128 @@ def unpack_x(e, k, tokens, dim, parts, remres=False):
     e(f"  %x{k} = scalar.addf %ux{k}, %urs{k} : f32")
 
 
+def gen_osum(tokens, g, n, parts, split, bfp, dim=5120, wpr=4):
+    """The out site's NPU sum (gen_npu_unpack.gen resid rem: hidden + ((C chunks) + rem) for columns [g, g + n), `parts`
+    K chunks of GU.CG groups at the current GN.TN / NP) for a workgroup's own wpr rows, then a workgroup barrier and the
+    FFN block's norm of those rows (gen_split tiled, bfp) reading them back (cache-hot). The GPU's columns [0, g) are
+    already in x (its kres output). Phase 1 is the unpack's vector code item for item (8 columns of one token, the same
+    sums in the same order) and phase 2 is gen_split's text, so the bits are those of the unpack and then the norm.
+    Bindings c, hres (the residual hidden), rem (f32 [tokens][n]), then gen_split's (x, residual, weight, sum_out, out,
+    ab): x is read and its columns [g, g + n) written."""
+    import gen_npu_gemm as GN
+    import gen_npu_unpack as GU
+    TN, NJ, CG = GN.TN, GN.TN // 8, GU.CG
+    assert g + n == dim and n % TN == 0 and tokens % 64 == 0
+    NTH = 32 * wpr * split
+    items = wpr * n // 8
+    text = gen_split(dim, wpr=wpr, split=split, tiled=True, bfp=bfp)
+    P = []
+    e = P.append
+    e("  // phase 1: the out site's sum of this workgroup's rows into x (gen_half_norm.gen_osum)")
+    for nm, v in (("2", 2), ("4", 4), ("8", 8), ("16", 16), ("64", 64), ("wpr", wpr), ("nj", NJ), ("np", GN.NP),
+                  ("tile", 64 * TN), ("cmb", tokens // 64 * CG), ("tn", TN), ("dim", dim), ("off", g), ("n", n),
+                  ("items", items)):
+        e(f"  %o1c{nm} = index.constant {v} : index")
+    e("  %o1c16i = scalar.constant 16 : i32")
+    e("  %o1chii = scalar.constant -65536 : i32")
+    e(f"  %o1nc = index.constant {tokens * n * CG * parts // 2} : index")
+    e("  %o1cv = buffer.view %c[%base] : buffer -> view<[%o1nc]xi32>")
+    e("  %o1rv = buffer.view %hres[%base] : buffer -> view<[%total_elems]xf32>")
+    e(f"  %o1nrem = index.constant {tokens * n} : index")
+    e("  %o1remv = buffer.view %rem[%base] : buffer -> view<[%o1nrem]xf32>")
+    e("  %o1row0 = index.mul %wg, %o1cwpr : index")
+
+    def load8(q, idx):
+        e(f"    %{q}w = index.div {idx}, %o1c2 : index")
+        e(f"    %{q}v = vector.load %o1cv[%{q}w] : view<[%o1nc]xi32> -> vector<4xi32>")
+        vals = []
+        for w in range(4):
+            e(f"    %{q}e{w} = vector.extract %{q}v[{w}] : vector<4xi32> -> i32")
+            e(f"    %{q}l{w} = scalar.shli %{q}e{w}, %o1c16i : i32")
+            e(f"    %{q}h{w} = scalar.andi %{q}e{w}, %o1chii : i32")
+            e(f"    %{q}lf{w} = scalar.bitcast %{q}l{w} : i32 to f32")
+            e(f"    %{q}hf{w} = scalar.bitcast %{q}h{w} : i32 to f32")
+            vals += [f"%{q}lf{w}", f"%{q}hf{w}"]
+        e(f"    %{q}x = vector.from_elements {', '.join(vals)} : vector<8xf32>")
+        return f"%{q}x"
+
+    for it in range((items + NTH - 1) // NTH):
+        q = f"o1_{it}_"
+        e(f"  %{q}io = index.constant {it * NTH} : index")
+        e(f"  %{q}i = index.add %tid, %{q}io : index")
+        e(f"  %{q}live = index.cmp ult, %{q}i, %o1citems : index")
+        e(f"  scf.if %{q}live {{")
+        e(f"    %{q}tl = index.rem %{q}i, %o1cwpr : index")     # the row (token) fastest: wpr tokens of one C block
+        e(f"    %{q}jg = index.div %{q}i, %o1cwpr : index")
+        e(f"    %{q}tok = index.add %o1row0, %{q}tl : index")
+        e(f"    %{q}col = index.div %{q}jg, %o1cnj : index")
+        e(f"    %{q}j = index.rem %{q}jg, %o1cnj : index")
+        e(f"    %{q}blk = index.div %{q}tok, %o1c64 : index")
+        e(f"    %{q}r = index.rem %{q}tok, %o1c64 : index")
+        e(f"    %{q}mp = index.div %{q}r, %o1c16 : index")
+        e(f"    %{q}r16 = index.rem %{q}r, %o1c16 : index")
+        e(f"    %{q}mh = index.div %{q}r16, %o1c8 : index")
+        e(f"    %{q}row = index.rem %{q}r, %o1c8 : index")
+        e(f"    %{q}npi = index.div %{q}j, %o1c2 : index")
+        e(f"    %{q}nh = index.rem %{q}j, %o1c2 : index")
+        e(f"    %{q}tc = index.mul %{q}col, %o1ccmb : index")
+        e(f"    %{q}tile = index.add %{q}tc, %{q}blk : index")
+        e(f"    %{q}a0 = index.mul %{q}mp, %o1cnp : index")
+        e(f"    %{q}a1 = index.add %{q}a0, %{q}npi : index")
+        e(f"    %{q}a2 = index.mul %{q}a1, %o1c4 : index")
+        e(f"    %{q}a3 = index.mul %{q}mh, %o1c2 : index")
+        e(f"    %{q}a4 = index.add %{q}a2, %{q}a3 : index")
+        e(f"    %{q}a5 = index.add %{q}a4, %{q}nh : index")
+        e(f"    %{q}a6 = index.mul %{q}a5, %o1c64 : index")
+        e(f"    %{q}a7 = index.mul %{q}row, %o1c8 : index")
+        e(f"    %{q}a8 = index.add %{q}a6, %{q}a7 : index")
+        e(f"    %{q}a9 = index.mul %{q}tile, %o1ctile : index")
+        e(f"    %{q}ca = index.add %{q}a9, %{q}a8 : index")
+        e(f"    %{q}j0 = index.mul %{q}col, %o1ctn : index")
+        e(f"    %{q}j1 = index.mul %{q}j, %o1c8 : index")
+        e(f"    %{q}j2 = index.add %{q}j0, %{q}j1 : index")
+        e(f"    %{q}jo = index.add %{q}j2, %o1coff : index")
+        e(f"    %{q}tb = index.mul %{q}tok, %o1cdim : index")
+        e(f"    %{q}oa = index.add %{q}tb, %{q}jo : index")
+        val = None
+        for p in range(parts):
+            gv = None
+            for gi in range(CG):
+                t = f"{q}p{p}g{gi}_"
+                off = p * tokens * n * CG + gi * tokens * TN
+                if off:
+                    e(f"    %{t}o = index.constant {off} : index")
+                    e(f"    %{t}a = index.add %{q}ca, %{t}o : index")
+                    x = load8(t, f"%{t}a")
+                else:
+                    x = load8(t, f"%{q}ca")
+                if gv is None:
+                    gv = x
+                else:
+                    e(f"    %{t}s = vector.addf {gv}, {x} : vector<8xf32>")
+                    gv = f"%{t}s"
+            if val is None:
+                val = gv
+            else:
+                e(f"    %{q}ps{p} = vector.addf {val}, {gv} : vector<8xf32>")
+                val = f"%{q}ps{p}"
+        e(f"    %{q}rmb = index.mul %{q}tok, %o1cn : index")
+        e(f"    %{q}rma = index.add %{q}rmb, %{q}j2 : index")
+        e(f"    %{q}rmv = vector.load %o1remv[%{q}rma] : view<[%o1nrem]xf32> -> vector<8xf32>")
+        e(f"    %{q}rms = vector.addf {val}, %{q}rmv : vector<8xf32>")
+        e(f"    %{q}rsv = vector.load %o1rv[%{q}oa] : view<[%total_elems]xf32> -> vector<8xf32>")
+        e(f"    %{q}rs = vector.addf %{q}rsv, %{q}rms : vector<8xf32>")
+        e(f"    vector.store %{q}rs, %x_view[%{q}oa] : vector<8xf32>, view<[%total_elems]xf32>")
+        e("  }")
+    e("  kernel.barrier<global> scope(workgroup) ordering(acq_rel)")
+    anchor = "  %lane_base = index.add %lane_base0, %pk0 : index\n"
+    sig = "} launch(%x: buffer,"
+    assert text.count(anchor) == 1 and text.count(sig) == 1
+    text = text.replace(anchor, anchor + "\n".join(P) + "\n", 1)
+    text = text.replace(sig, "} launch(%c: buffer, %hres: buffer, %rem: buffer, %x: buffer,", 1)
+    return text.replace("gen_half_norm.py gen_split", "gen_half_norm.py gen_osum (the out site's sum) + gen_split", 1)
+
+
 def split_finish(L, split):
     """gen_split's closing lines and its per-part index constants."""
     L.append("  kernel.return")

@@ -888,6 +888,10 @@ def split_tile(site):
     return dict(zip(("bm", "bn", "wm", "wn"), map(int, v.split(",")))) if v != "0" else None
 
 
+# YAH_NPU_NOONORM=1: no "npu_onorm" (the out site's sum as its own unpack, then the FFN block's norm)
+NO_ONORM = os.environ.get("YAH_NPU_NOONORM") == "1"
+
+
 def fit_rowgrp(t, mt):
     """Tile t over mt row tiles: NPU splits can leave GPU / remainder row counts the tile's row group need not divide;
     the largest of its row group, 4, 2, 1 that does."""
@@ -1095,6 +1099,22 @@ def npu_split(rows, combos, B, outdir):
         open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
         E.emit(src, ["nop=0"], name, outdir)
         out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
+        if site == "out" and NPU_FFNBLK and not NO_ONORM:
+            # the same sum fused into the FFN block's norm ("norm_t_bfp_g1": its fragment-major f16 and the
+            # one-replay-group stream): "npu_onorm<sfx>.hal", gen_half_norm.gen_osum (LoomPrefill::RunNorm)
+            import gen_half_norm
+            groups, perm = GE.GROUPS, GE.ACT_PERM
+            GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
+            try:
+                text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], NORM_SPLIT, (B, list(NPU_KS), NPU_PASSES))
+            finally:
+                GE.GROUPS, GE.ACT_PERM = groups, perm
+            oname = "npu_onorm%s.hal" % sfx
+            src = os.path.join(tmp, oname[:-4] + ".loom")
+            open(src, "w").write(text)
+            E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                         "yah_half_norm.fused=0"], oname, outdir)
+            out.append((oname, B // 4, 32 * 4 * NORM_SPLIT, 0))   # 4 rows a workgroup
         if site == "qkv":
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads

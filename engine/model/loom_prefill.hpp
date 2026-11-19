@@ -485,6 +485,7 @@ class LoomPrefill {
       RunFfn(pre);
       trim_row_ = kAllRows;
     }
+    FlushOut();
     tail_ = kAllRows;
   }
 
@@ -492,6 +493,7 @@ class LoomPrefill {
 
   // Final norm + output head of hidden() row `row` (this chunk) into dst (kVocab f32).
   void Head(std::uint32_t row, const hrx_buffer_ref_t& dst) {
+    FlushOut();
     const auto* onw = Find("output_norm.weight");
     const auto* ow = Find("output.weight");
     Dispatch(Exe("rmsnorm.hal"), "yah_rmsnorm", 1, 1, 1, 32, 1, 1,
@@ -1288,6 +1290,7 @@ class LoomPrefill {
   }
   // The FFN block's sum (hidden + the GPU's down + the NPU's partials) into hidden(), if RunFfnBlock left it pending.
   void FlushFfn() {
+    FlushOut();
     if (!ffn_pending_.length) return;
     const hrx_buffer_ref_t remv{ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4};
     if (ffn_rr_)
@@ -1296,6 +1299,16 @@ class LoomPrefill {
     else
       NpuUnpack(ffn_pending4_ ? "npu_unpack_ffnblk_4.hal" : "npu_unpack_ffnblk.hal", std::exchange(ffn_pending_, {}),
                 {Ref(*hidden_), remv, Ref(*hidden2_)}, 8);
+    std::swap(hidden_, hidden2_);
+  }
+
+  // The out site's sum (hidden + the NPU's rows' C + their K remainder; the GPU's rows are in hidden2 already) into
+  // hidden(), if RunResidual left it pending.
+  std::string OnormHal() const { return out_np4_ ? "npu_onorm_4.hal" : "npu_onorm.hal"; }
+  void FlushOut() {
+    if (!out_pending_.length) return;
+    NpuUnpack(out_np4_ ? "npu_unpack_out_4.hal" : "npu_unpack_out.hal", std::exchange(out_pending_, {}),
+              {Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * out_nn_ * 4}, Ref(*hidden2_)}, 8);
     std::swap(hidden_, hidden2_);
   }
 
@@ -1314,6 +1327,7 @@ class LoomPrefill {
            (mode == NormOut::kRow ? "r" : mode == NormOut::kTiled ? "t" : "rt") + (pk ? "_pk.hal" : ".hal");
   }
   void RunLayerNorm(const std::string& wname, NormOut mode, const char* npu_site, bool pk) {
+    FlushOut();
     if (ffn_pending_.length && ffn_rr_ && npu_site && geom_.count("npunormbfp") && geom_.count(UnormRr(pk, mode))) {
       const std::size_t a = NpuK(5120).a;
       std::vector<hrx_buffer_ref_t> b{CView(std::exchange(ffn_pending_, {})),
@@ -1404,6 +1418,20 @@ class LoomPrefill {
     // in the deferred-epilogue images' K split
     const bool g1s = npu_site && std::strcmp(npu_site, "ffnblk_s") == 0;
     const bool g1 = g1s || (npu_site && std::strcmp(npu_site, "ffnblk") == 0);
+    if (out_pending_.length && g1 && !g1s && mode == NormOut::kTiled && geom_.count(OnormHal())) {
+      // the out site's sum fused with this norm (gen_half_norm.gen_osum): c, resid, rem, then the norm's bindings with
+      // x = hidden2 (the GPU's rows read, the NPU's written by the sum)
+      const LoomExecutable& exe = Exe(OnormHal());
+      Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1,
+               {CView(std::exchange(out_pending_, {})), Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * out_nn_ * 4},
+                Ref(*hidden2_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_), Ref(*normt_),
+                {npu_->A().handle, 0, NpuK(5120).a}},
+               (1u << 3) | (1u << 7) | (1u << 8));
+      std::swap(hidden_, hidden2_);
+      norm_bfp_.clear(), norm_pk_.clear();
+      return;
+    }
+    FlushOut();
     const bool bfp = npu_site && (g1 || geom_.count("npunormbfp"));
     norm_bfp_ = bfp && !g1 ? npu_site : "";
     const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
@@ -1901,6 +1929,7 @@ class LoomPrefill {
   // into partial and yah_residual_1d adds it. Either way the two hidden buffers swap.
   // af: the afrag form of the fused kres GEMM (input fragment-major)
   void RunResidual(const std::string& wname, const LoomBuffer& input, bool af = false) {
+    FlushOut();
     const auto* t = Find(wname);
     Fmt f{};
     const std::string fused0 = GemmHal("gemm_kres", *t, &f);
@@ -1954,7 +1983,7 @@ class LoomPrefill {
           Dispatch(Exe(p3), kname.c_str(), blocks, 1, 1, 32, 1, 1, b0, GemmWrites(b0, f, {hidden2_}));
           Dispatch(Exe(sh), kname.c_str(), blocks, 1, 1, 32, 1, 1, b1, GemmWrites(b1, f, {hidden2_}));
         } else {
-          // its own token tiles (emit_prefill_pp.OUT_SPLIT_TILE: 256 tokens; the split runs untrimmed chunks only)
+          // its own token tiles (emit_prefill_pp.split_tile: 256 tokens; the split runs untrimmed chunks only)
           Dispatch(Exe(sh), kname.c_str(), blocks, gs.tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
         }
         // the rest of K for the NPU's rows (its last nn weight rows), beside the GPU's rows: f32 [tokens][nn]
@@ -1968,9 +1997,10 @@ class LoomPrefill {
         Dispatch(Exe(rh), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), nn / 16 / gr.rowgrp, gr.tt, 1, 32, 1, 1, rb,
                  std::uint64_t{1} << (rb.size() - 1));
         NpuJoin();
-        NpuUnpack(Np4Hal(std::string("npu_unpack_") + site, wname), c,
-                  {Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * nn * 4}, Ref(*hidden2_)}, 8);
-        std::swap(hidden_, hidden2_);
+        // the sum waits for the FFN block's norm, which fuses it ("npu_onorm[_4].hal", RunNorm; YAH_NPU_NOONORM=1 at
+        // emit: the unpack here)
+        out_pending_ = c, out_nn_ = nn, out_np4_ = Np4(wname);
+        if (!geom_.count(OnormHal())) FlushOut();
         return;
       }
       RunAfterRelease();
@@ -2396,6 +2426,9 @@ class LoomPrefill {
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
   std::string norm_pk_;            // .. in the Q4_K order (RunLayerNorm pk)
   NpuView ffn_pending_{};          // the FFN block's partials not yet summed into hidden() (RunFfnBlock, FlushFfn)
+  NpuView out_pending_{};          // the out site's C not yet summed into hidden() (RunResidual, FlushOut)
+  std::uint32_t out_nn_ = 0;       // ... its NPU rows
+  bool out_np4_ = false;           // ... from an NP 4 image (npu_unpack_out_4.hal)
   bool ffn_pending4_ = false;      // ... from NP 4 down calls (npu_unpack_ffnblk_4.hal)
   std::string pending_norm_;       // a fused norm's f16 output still to record (RunLayerNorm, RunPendingNorm)
   NormOut pending_mode_{};
