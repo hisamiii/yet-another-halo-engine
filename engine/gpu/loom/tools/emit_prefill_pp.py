@@ -878,9 +878,14 @@ def npu_rem_tile(fmt, kbw, kbt, kind="kstore"):
 # 4 token tiles of 512 make 60 / 64 workgroups on 40 CUs (1.5 / 1.6 rounds). 256-token tiles with 2 x 8 waves: 120 / 128
 # workgroups. 11-19 standalone (n1118/kbench.py, B 2048, K 6144): IQ4_XS 1436-1678 -> 1172-1226 us, Q4_K 1691-1733 ->
 # 1343-1355, Q5_K 1676-1706 -> 1349-1357, Q3_K 1847-1913 -> 1393-1397; bit-identical (no knob changes the MMA order).
-# YAH_NPU_OUTTILE=0: the AF tile; "bm,bn,wm,wn": another.
-_ot = os.environ.get("YAH_NPU_OUTTILE", "128,256,2,8")
-OUT_SPLIT_TILE = dict(zip(("bm", "bn", "wm", "wn"), map(int, _ot.split(",")))) if _ot != "0" else None
+# In the engine (pp2048): Q4_K / Q5_K 1593 / 1611 -> 1425 / 1442 us, IQ4_XS 1273 -> 1270.
+# YAH_NPU_TILE_<SITE>="bm,bn,wm,wn" (site OUT, QKV, GATE, Q): the split's tile at that site; 0: the AF tile.
+SPLIT_TILE_DEFAULT = {"out": "128,256,2,8"}
+
+
+def split_tile(site):
+    v = os.environ.get("YAH_NPU_TILE_" + site.upper(), SPLIT_TILE_DEFAULT.get(site, "0"))
+    return dict(zip(("bm", "bn", "wm", "wn"), map(int, v.split(",")))) if v != "0" else None
 
 
 def fit_rowgrp(t, mt):
@@ -962,7 +967,7 @@ def npu_split(rows, combos, B, outdir):
             # a split's narrower row group may not emit (spills): the engine runs that form unsplit
             print("npu split %s: not emitted with row group %d (%s)" % (name, tf.rowgrp, str(ex)[:120]))
 
-    def variants(fmt, kind, mt, kb, base, nn):
+    def variants(fmt, kind, mt, kb, base, nn, site):
         """Every form of GEMM base the set emits (tile_kstore, afrag_variants): its split."""
         t = TG.default_tile(fmt, kind, kb)
         if base[:-4] in tiles()["tiles"]:
@@ -975,8 +980,9 @@ def npu_split(rows, combos, B, outdir):
             persist = knobs.pop("persist", False)
             ta = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **knobs)
             ts = ta
-            if kind == "kres" and OUT_SPLIT_TILE and B % OUT_SPLIT_TILE["bn"] == 0:
-                ts = dataclasses.replace(ta, **OUT_SPLIT_TILE)
+            st = split_tile(site)
+            if st and B % st["bn"] == 0:
+                ts = dataclasses.replace(ta, **st)
                 try:
                     TG.check(ts)
                 except ValueError:
@@ -1003,9 +1009,9 @@ def npu_split(rows, combos, B, outdir):
             if skind == "kres":
                 if kind != "residual":
                     continue
-                variants(fmt, "kres", mt, kb, "gemm_kres_%s_%d_%d.hal" % (fmt, mt, kb), nn)
+                variants(fmt, "kres", mt, kb, "gemm_kres_%s_%d_%d.hal" % (fmt, mt, kb), nn, site)
             elif kind == "kstore":
-                variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn)
+                variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn, site)
             else:
                 continue
             chunked = len(npu_chunks(site)) > 1 or npu_rem(site)
@@ -1377,8 +1383,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     for (gf, mt, kb), (uf, _, _), hord in sorted({(l["ffn_gate"], l["ffn_up"], hord_of(l["ffn_down"][0]))
                                                   for l in pairs}):
         # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = F)
-        variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), F)
-        variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), F)
+        variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), F, "ffn")
+        variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), F, "ffn")
         if any(l in bsw for l in pairs if (l["ffn_gate"], l["ffn_up"]) == ((gf, mt, kb), (uf, mt, kb))):   # (BFP)
             if "npu_ffnsw_bfp_" + hord.lower() not in {j[1] for j in jobs}:
                 jobs.append((npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * 288, swcol=32,
