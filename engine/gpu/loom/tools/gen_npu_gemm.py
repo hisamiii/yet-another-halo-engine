@@ -243,10 +243,11 @@ def qflane2_on():
     egress row's ring holds its own slab in slots 0-1 and its helper's copied slab in 2-3; slots 2-3 become a ring of
     their own on port QF_LANE2_PORT (pinned right after the first), sent on the row's C channel's DMA (Loom: a second
     constrain.fill of the panel, HRX 0098), so the two lanes egress a K half's panel in parallel. Not beside a Q4_K
-    up column (its GF decoder: panel half 0 comes out wrong, 11-19 log)."""
+    up column (its GF decoder: panel half 0 comes out wrong, 11-19 log; GN_QFLANE2=2, diag: there too)."""
     cu = QF.get("cfgu")
-    return (qf4r_swap() and os.environ.get("GN_QFLANE2") == "1" and not qfegr2_on() and qf4r_hslots() == 4
-            and not (cu is not None and cu.fmt == "Q4_K"))
+    v = os.environ.get("GN_QFLANE2")
+    return (qf4r_swap() and v in ("1", "2") and not qfegr2_on() and qf4r_hslots() == 4
+            and (v == "2" or not (cu is not None and cu.fmt == "Q4_K")))
 
 
 def qf4r_swap():
