@@ -188,8 +188,13 @@ def main():
         rd = gguf.GGUFReader(os.path.expanduser(os.environ.get(
             "NPU_GGUF", "~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf")))
         KR = kraw or K
+        # (NPU_KRAW < K: the pad read of a short down K part, rows KRAW wide read K wide: each row's last
+        # (K - KRAW) / 256 super-blocks are the next row's first ones, times zero activations; rows from a 5120-wide
+        # tensor's block stream)
+        over = bool(kraw) and kraw < K
+        assert not over or (not qsw and not k0r)
         t = next(x for x in rd.tensors if x.tensor_type.name == fmt and len(x.shape) == 2
-                 and int(x.shape[0]) == KR and int(x.shape[1]) >= Nn)
+                 and int(x.shape[0]) == (5120 if over else KR) and int(x.shape[1]) >= Nn)
         if qsw:   # W = [gate rows][up rows], N / 2 each; the raw stream's up rows dgu bytes after the gate rows
             assert QMODE and N.NP in (4, 5) and not k0r
             ts_ = {x.name: x for x in rd.tensors}
@@ -220,6 +225,9 @@ def main():
                 assert N.NP == 4 or cfg.hpass >= 5
             if int(os.environ.get("NPU_QSW_GAP", "0")):   # the up rows NPU_QSW_GAP rows past the gate rows (the
                 cfg = dataclasses.replace(cfg, dgu=int(os.environ["NPU_QSW_GAP"]) * KR // 256 * D.BLK)   # engine: M)
+        elif over:
+            rawflat = np.asarray(t.data).view(np.uint8).reshape(-1, D.BLK)[:Nn * (kraw // 256) + K // 256].copy()
+            wraw = np.stack([rawflat[kraw // 256 * r_:kraw // 256 * r_ + K // 256] for r_ in range(Nn)])
         else:
             wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
         if qsw and cfg.ufmt:   # (column pairs) each half by its own decoder
@@ -248,6 +256,8 @@ def main():
         for c_ in range(Nn // N.TN):
             if c_ % wd_:
                 w[N.TN * c_:N.TN * (c_ + 1)] = w[N.TN * (c_ - c_ % wd_):N.TN * (c_ - c_ % wd_ + 1)]
+    if fuse == 2 and kraw and kraw < K:   # (the pad read) the activations past the part's K are zero (H's pad unit)
+        a[:, kraw:] = 0
     if os.environ.get("NPU_AONEHOT"):   # (diag) token t reads only k0 + t: C[t, n] = W[n, k0 + t] (the panel, readable)
         ko = int(os.environ["NPU_AONEHOT"])
         a = np.zeros((M, K), np.float16)
@@ -491,7 +501,8 @@ def main():
             env.setdefault("NPU_RUN_WEIGHTS", f"{len(bindings) - 2},{len(bindings) - 1}")
         else:
             rawv = (np.concatenate([wraw[:Nn // 2].reshape(-1), np.zeros((gap_ - Nn // 2) * KR // 256 * D.BLK, np.uint8),
-                                    wraw[Nn // 2:].reshape(-1)]) if gap_ else wraw.reshape(-1))
+                                    wraw[Nn // 2:].reshape(-1)]) if gap_ else
+                    rawflat.reshape(-1) if kraw and kraw < K else wraw.reshape(-1))
             np.concatenate([rawv[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
             bindings += [d_b, r_b]
             # the raw stream reads weights (the split lead starts it before the gate; GN_QPREFILL images need that)
