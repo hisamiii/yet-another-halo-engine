@@ -11,6 +11,7 @@ The output is f16((v * inv) * w).
 Fully unrolled: each lane issues all dim/32 loads up front and keeps the values in registers,
 so the second pass reads mostly the weight (a loop form makes ~160 dependent round trips per lane).
 """
+import os
 import sys
 
 
@@ -499,7 +500,10 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     remres: rem already holds hidden + the GPU's down (gen_npu_unpack remres): the sum is rem + the C parts, no resid
     binding. f16 ("r", "t", "rt"): also the norm's f16 output for the GPU's GEMMs, row-major (binding hf16 after out),
     fragment-major ([row / 16][col / 16][row % 16][col % 16], binding hf16t), or both, from the same values as the
-    stream (RunNorm's kRow / kTiled / kBoth), so no second norm pass follows."""
+    stream (RunNorm's kRow / kTiled / kBoth), so no second norm pass follows.
+    The f16 outputs go out as lane pairs (default; YAH_UNORM_NOPAIR=1: one 2-byte store a lane and k): for k, k + 1 the
+    even lane stores its k and its odd neighbour's (one xor-1 shuffle a pair), the odd lane its neighbour's k + 1 and its
+    own, as one 4-byte word; the same halves at the same places."""
     import gen_bfp16_encode as GE
     import gen_npu_gemm as GN
     import gen_npu_unpack as GU
@@ -552,10 +556,17 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
         e("  %x_view = buffer.view %x_na[%base] : buffer -> view<[%total_elems]xf32>")
     e("  %rem_view = buffer.view %rem_na[%base] : buffer -> view<[%total_elems]xf32>")
     e("  %hout_view = buffer.view %out_na[%base] : buffer -> view<[%total_elems]xf32>")
+    pair = bool(f16) and os.environ.get("YAH_UNORM_NOPAIR") != "1"
+    if pair:
+        e(f"  %nh2 = index.constant {tokens * dim // 2} : index")
     if f16 and "r" in f16:
         e("  %hf16v = buffer.view %hf16[%base] : buffer -> view<[%total_elems]xf16>")
+        if pair:
+            e("  %hf16w = buffer.view %hf16[%base] : buffer -> view<[%nh2]xi32>")
     if f16 and "t" in f16:
         e("  %hf16tv = buffer.view %hf16t[%base] : buffer -> view<[%total_elems]xf16>")
+        if pair:
+            e("  %hf16tw = buffer.view %hf16t[%base] : buffer -> view<[%nh2]xi32>")
     e("  %weight_view = buffer.view %weight_na[%base] : buffer -> view<[%dim]xf32>")
     e(f"  %nab4 = index.constant {nab // 4} : index")
     e("  %abv = buffer.view %ab[%base] : buffer -> view<[%nab4]xi32>")
@@ -692,7 +703,7 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
         e(f"  %nm{k} = scalar.mulf %x{k}, %inv : f32")
         e(f"  %wt{k} = scalar.mulf %nm{k}, {w} : f32")
         e(f"  %h{k} = scalar.fptrunc %wt{k} : f32 to f16")
-        if f16 and "r" in f16:
+        if f16 and "r" in f16 and not pair:
             e(f"  view.store %h{k}, %hf16v[%a{k}] : f16, view<[%total_elems]xf16>")
         if f16 and "t" in f16:
             e(f"  %ufc{k} = index.div %wi{k}, %uf16 : index")
@@ -700,7 +711,31 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
             e(f"  %ufd{k} = index.mul %ufc{k}, %uf256 : index")
             e(f"  %ufe{k} = index.add %uftb, %ufd{k} : index")
             e(f"  %uff{k} = index.add %ufe{k}, %ufm{k} : index")
-            e(f"  view.store %h{k}, %hf16tv[%uff{k}] : f16, view<[%total_elems]xf16>")
+            if not pair:
+                e(f"  view.store %h{k}, %hf16tv[%uff{k}] : f16, view<[%total_elems]xf16>")
+        if pair and k % 2:   # (the pair k - 1, k: even lanes send h k, odd lanes h k - 1)
+            j = k - 1
+            e(f"  %pps{k} = scf.select %uodd, %h{j}, %h{k} : f16")
+            e(f"  %ppx{k} = scalar.extf %pps{k} : f16 to f32")
+            e(f"  %ppi{k} = scalar.bitcast %ppx{k} : f32 to i32")
+            e(f"  %ppr{k}, %ppv{k} = kernel.subgroup.shuffle<xor> %ppi{k}, %bx1, %bx32 : i32, i32, i32")
+            e(f"  %ppf{k} = scalar.bitcast %ppr{k} : i32 to f32")
+            e(f"  %pph{k} = scalar.fptrunc %ppf{k} : f32 to f16")
+            e(f"  %ppl{k} = scf.select %uodd, %pph{k}, %h{j} : f16")
+            e(f"  %pphi{k} = scf.select %uodd, %h{k}, %pph{k} : f16")
+            e(f"  %ppk{k} = vector.from_elements %ppl{k}, %pphi{k} : vector<2xf16>")
+            e(f"  %ppw{k} = vector.bitcast %ppk{k} : vector<2xf16> to vector<1xi32>")
+            e(f"  %ppe{k} = vector.extract %ppw{k}[0] : vector<1xi32> -> i32")
+            if "r" in f16:
+                e(f"  %ppra{k} = index.sub %a{k}, %one_i : index")
+                e(f"  %pprs{k} = scf.select %uodd, %ppra{k}, %a{j} : index")
+                e(f"  %ppri{k} = index.div %pprs{k}, %c2 : index")
+                e(f"  view.store %ppe{k}, %hf16w[%ppri{k}] : i32, view<[%nh2]xi32>")
+            if "t" in f16:
+                e(f"  %ppta{k} = index.sub %uff{k}, %one_i : index")
+                e(f"  %ppts{k} = scf.select %uodd, %ppta{k}, %uff{j} : index")
+                e(f"  %ppti{k} = index.div %ppts{k}, %c2 : index")
+                e(f"  view.store %ppe{k}, %hf16tw[%ppti{k}] : i32, view<[%nh2]xi32>")
         e(f"  %v{k} = scalar.extf %h{k} : f16 to f32")
         e(f"  %ab{k} = scalar.absf %v{k} : f32")
         cur = f"%ab{k}"
