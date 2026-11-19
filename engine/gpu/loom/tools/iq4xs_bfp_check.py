@@ -58,7 +58,7 @@ def main():
     nin, nout = raw.size, G.out_bytes(rows, K)
     # the kernel's ranges: reads up to the last row's last block + 136, stores up to item * 72 + 72
     last_read = (rows - 1) * rb + (K // 256 - 1) * 136 + 8 + 16 * 7 + 8 + 8
-    items = rows // 8 * (K // 8)
+    items = G.items(rows, K)
     if last_read > nin or items * 72 > nout:
         sys.exit(f"ranges outside the buffers (read {last_read} of {nin}, store {items * 72} of {nout}): not dispatching")
     os.makedirs(work, exist_ok=True)

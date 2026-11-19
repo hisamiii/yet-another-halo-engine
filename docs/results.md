@@ -424,6 +424,7 @@ Decode:
 - Residual GEMV R x W 2 x 8 instead of 2 x 4 (320 workgroups): its share of the GEMV time 0.3051 vs 0.3057 / 0.3042 in two baseline profiles, flat. Profiles of one set differ by up to 2 ms in total, but the large GEMV families' shares of the GEMV time agree within ~0.3%, so compare shares (the small kernels' shares still vary 5-10%).
 - Other GEMV peels (2026-10-19, one clean round each against the shipped one-iteration decoded peel at 61.49 ms): only the weight loads before the wait and their decode after it, 62.39 ms; two iterations that way, 61.97 ms. Two decoded iterations raise VGPRs from 66 to 128 (resid) and 112 to 192 (SwiGLU), so they were not timed.
 - kv4a16 decode attention vs kv8a16: no faster (347 vs 362 us at 30.7K) despite 40% fewer bytes; per-workgroup q rotation, barriers and group sums make it latency-bound.
+- GPU IQ4_XS -> NPU bfp16 decoder (gen_iq4xs_bfp.py) with 4 fragments a work item, one 16-byte qs load a row (2026-11-19, blk.22 gate/up NPU rows, 17920 x 5120): bit-exact, but 130 VGPRs vs 58 and 1.78 vs 1.03 ms alone, +0.75 vs +0.55 ms inside the GPU gate/up GEMM. One fragment an item stays.
 
 KV codecs (fake-quantized through a KV hook since removed, 32K):
 

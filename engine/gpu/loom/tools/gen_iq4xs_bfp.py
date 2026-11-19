@@ -4,7 +4,8 @@
 Input: IQ4_XS rows [rows][K / 256][136 B] (block_iq4_xs). Output: fragments [rows / 8][K / 8][72 B] (row-major).
 Fragment = 8 rows x 8 consecutive k: per row [E u8][8 x int8 m], value = m * 2^(E - 133) (gen_bfp16_encode's format).
 w = (d * (ls - 32)) * kvalue is exact in f32 (<= 23 significant bits). E = the f32 exponent field of the row block's
-max |w|, + 1 if a rounded mantissa leaves int8 (npu_dec_emit.bfp_hw, the NPU panel's rule); m = roundeven, clamped.
+max |w|, + 1 if a rounded mantissa leaves int8 (npu_dec_emit.bfp_hw, the NPU panel's rule); m = roundeven (no clamp
+needed after the bump).
 One work item per fragment; adjacent items take adjacent k-blocks of one 8-row group, so a wave writes whole lines.
 """
 import re
@@ -20,9 +21,8 @@ def out_bytes(rows, K):
 
 def gen(rows, K):
     assert rows % 8 == 0 and K % 256 == 0
-    kb = K // 8
     rb = K // 256 * 136
-    items = rows // 8 * kb
+    n = items(rows, K)
     nin, nout = rows * rb, out_bytes(rows, K)
     L = []
     e = L.append
@@ -31,7 +31,7 @@ def gen(rows, K):
     e("")
     e("kernel.def target(@yah_wave32) @yah_iq4xs_bfp() {")
     e("  %unit = index.constant 1 : index")
-    e(f"  %wgs = index.constant {(items + WG - 1) // WG} : index")
+    e(f"  %wgs = index.constant {(n + WG - 1) // WG} : index")
     e(f"  %wgsz = index.constant {WG} : index")
     e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%wgsz, %unit, %unit) : index")
     e("} launch(%w: buffer, %out: buffer) {")
@@ -52,18 +52,110 @@ def gen(rows, K):
     return "\n".join(L) + "\n"
 
 
-def body(rows, K, p=""):
-    """The decode of work item %item (views %wv over the rows, %ov over the fragments), names prefixed with p."""
+def items(rows, K):
+    return rows // 8 * (K // 8)
+
+
+def frag(e, src, r, s, qw, nsh):
+    """Row r: the 8 nibbles of the i32 pair qw (shifted by nsh) -> E' and 8 mantissa sources, appended to src."""
+    n = f"{r}"
+    sh = [f"%qy{n}_{h}" for h in range(2)]
+    for h in range(2):
+        e(f"    %qy{n}_{h} = scalar.shrui {qw[h]}, {nsh} : i32")
+    e(f"    %nw{n} = vector.from_elements {sh[0]}, {sh[1]} : vector<2xi32>")
+    e(f"    %nc{n} = vector.bitcast %nw{n} : vector<2xi32> to vector<8xi8>")
+    e(f"    %nb{n} = vector.andi %nc{n}, %m15v : vector<8xi8>")   # (the lookup's index range proof)
+    e(f"    %ku{n} = vector.table.lookup %kvt[%nb{n}] : vector<16xi8>, vector<8xi8> -> vector<8xi8>")
+    e(f"    %kw{n} = vector.bitcast %ku{n} : vector<8xi8> to vector<2xi32>")
+    u, kbs = [], []
+    for j in range(8):   # signed kvalue bytes: one v_bfe_i32 each
+        if j % 4 == 0:
+            e(f"    %kx{n}_{j // 4} = vector.extract %kw{n}[{j // 4}] : vector<2xi32> -> i32")
+        e(f"    %kb{n}_{j} = scalar.bitfield.extracts %kx{n}_{j // 4} {{offset = {8 * (j % 4)}, width = 8}} : i32 -> i32")
+        e(f"    %u{n}_{j} = scalar.sitofp %kb{n}_{j} : i32 to f32")
+        u.append(f"%u{n}_{j}")
+        kbs.append(f"%kb{n}_{j}")
+    # the codebook is increasing: the extremes of the 8 values are s times the extreme codes
+    hi, lo = kbs[0], kbs[0]
+    for j in range(1, 8):
+        e(f"    %uh{n}_{j} = scalar.maxsi {hi}, {kbs[j]} : i32")
+        e(f"    %ul{n}_{j} = scalar.minsi {lo}, {kbs[j]} : i32")
+        hi, lo = f"%uh{n}_{j}", f"%ul{n}_{j}"
+    e(f"    %khf{n} = scalar.sitofp {hi} : i32 to f32")
+    e(f"    %klf{n} = scalar.sitofp {lo} : i32 to f32")
+    e(f"    %wh{n} = scalar.mulf {s}, %khf{n} : f32")
+    e(f"    %wl{n} = scalar.mulf {s}, %klf{n} : f32")
+    e(f"    %ah{n} = scalar.absf %wh{n} : f32")
+    e(f"    %al{n} = scalar.absf %wl{n} : f32")
+    e(f"    %am{n} = scalar.maxnumf %ah{n}, %al{n} : f32")
+    e(f"    %pm{n} = scalar.maxnumf %wh{n}, %wl{n} : f32")
+    e(f"    %mb{n} = scalar.bitcast %am{n} : f32 to i32")
+    # exponent field of max |w|; an all-zero block has s = 0, so every product below is 0 and E = 0
+    e(f"    %E{n} = scalar.bitfield.extractu %mb{n} {{offset = 23, width = 8}} : i32 -> i32")
+    e(f"    %ie{n} = scalar.subi %i260, %E{n} : i32")
+    e(f"    %ib{n} = scalar.shli %ie{n}, %i23 : i32")
+    e(f"    %iq{n} = scalar.bitcast %ib{n} : i32 to f32")          # 2^(133 - E)
+    # bfp_hw's bump: the largest value rounds to 128 -> E + 1 (only a positive value can leave int8)
+    e(f"    %ps{n} = scalar.mulf %pm{n}, %iq{n} : f32")
+    e(f"    %pr{n} = scalar.roundevenf %ps{n} : f32")
+    e(f"    %bu{n} = scalar.cmpf ogt, %pr{n}, %f127 : f32")
+    e(f"    %Ep{n} = scalar.addi %E{n}, %i1 : i32")
+    e(f"    %E1_{n} = scf.select %bu{n}, %Ep{n}, %E{n} : i32")
+    e(f"    %je{n} = scalar.subi %i260, %E1_{n} : i32")
+    e(f"    %jb{n} = scalar.shli %je{n}, %i23 : i32")
+    e(f"    %jq{n} = scalar.bitcast %jb{n} : i32 to f32")
+    e(f"    %ss{n} = scalar.mulf {s}, %jq{n} : f32")   # s 2^(133 - E'), exact
+    src.append(f"%E1_{n}")
+    for j in range(8):   # m = roundeven(kvalue * ss): exact product, one rounding (|m| <= 128 after the bump)
+        e(f"    %y{n}_{j} = scalar.fmaf {u[j]}, %ss{n}, %magic : f32")
+        e(f"    %yb{n}_{j} = scalar.bitcast %y{n}_{j} : f32 to i32")
+        src.append(f"%yb{n}_{j}")
+
+
+def pack(e, src):
+    """72 sources (low bytes) -> 18 words: two byte pairs (v_perm) and their merge."""
+    words = []
+    for w in range(18):
+        a, b, c, d = src[4 * w:4 * w + 4]
+        n = f"{w}"
+        for nm, x, y in (("pa", a, b), ("pb", c, d)):
+            e(f"    %{nm}{n} = vector.from_elements {x}, {y} : vector<2xi32>")
+            e(f"    %{nm}c{n} = vector.bitcast %{nm}{n} : vector<2xi32> to vector<8xi8>")
+            e(f"    %{nm}s{n} = vector.shuffle<[0, 4, 0, 4, 0, 0, 0, 0]> %{nm}c{n} : vector<8xi8>")
+            e(f"    %{nm}w{n} = vector.bitcast %{nm}s{n} : vector<8xi8> to vector<2xi32>")
+            e(f"    %{nm}x{n} = vector.extract %{nm}w{n}[0] : vector<2xi32> -> i32")
+        e(f"    %pm2_{n} = vector.from_elements %pax{n}, %pbx{n} : vector<2xi32>")
+        e(f"    %pmc{n} = vector.bitcast %pm2_{n} : vector<2xi32> to vector<8xi8>")
+        e(f"    %pms{n} = vector.shuffle<[0, 1, 4, 5, 0, 0, 0, 0]> %pmc{n} : vector<8xi8>")
+        e(f"    %pmw{n} = vector.bitcast %pms{n} : vector<8xi8> to vector<2xi32>")
+        e(f"    %o{n} = vector.extract %pmw{n}[0] : vector<2xi32> -> i32")
+        words.append(f"%o{n}")
+    return words
+
+
+def st(e, words, base):
+    """18 words -> 72 bytes at base: 9 aligned 8-byte stores."""
+    for j in range(9):
+        n = f"{j}"
+        e(f"    %wd{n} = vector.from_elements {words[2 * j]}, {words[2 * j + 1]} : vector<2xi32>")
+        e(f"    %w{n} = vector.bitcast %wd{n} : vector<2xi32> to vector<8xi8>")
+        e(f"    %wo{n} = index.constant {8 * j} : index")
+        e(f"    %wa{n} = index.add {base}, %wo{n} : index")
+        e(f"    vector.store %w{n}, %ov[%wa{n}] : vector<8xi8>, view<[%nout]xi8>")
+
+
+def body(rows, K, p="", rstride=None, koff=0):
+    """The decode of work item %item (views %wv over the rows, %ov over the fragments), names prefixed with p.
+    Row r's IQ4_XS blocks start at byte r * rstride + koff (default: K's blocks back to back)."""
     kb = K // 8
-    rb = K // 256 * 136
-    items = rows // 8 * kb
+    rb = rstride or K // 256 * 136
     L = []
     e = L.append
-    e(f"  %citems = index.constant {items} : index")
+    e(f"  %citems = index.constant {items(rows, K)} : index")
     e("  %live = index.cmp ult, %item, %citems : index")
     e("  scf.if %live {")
-    for nm, v in (("ckb", kb), ("crb", rb), ("c8", 8), ("c4", 4), ("c2", 2), ("c32", 32), ("c136", 136),
-                  ("c16", 16), ("c72", 72)):
+    for nm, v in (("ckb", kb), ("crb", rb), ("ckoff", koff), ("c8", 8), ("c4", 4), ("c2", 2), ("c32", 32),
+                  ("c136", 136), ("c16", 16), ("c72", 72)):
         e(f"    %{nm} = index.constant {v} : index")
     e("    %g8 = index.div %item, %ckb : index")
     e("    %kbi = index.rem %item, %ckb : index")
@@ -82,24 +174,23 @@ def body(rows, K, p=""):
     e("    %qo1 = index.add %qo0, %c8 : index")
     e("    %row0 = index.mul %g8, %c8 : index")
     e("    %rb0 = index.mul %row0, %crb : index")
-    e("    %blkb = index.add %rb0, %sbo : index")
+    e("    %rb1 = index.add %rb0, %ckoff : index")
+    e("    %blkb = index.add %rb1, %sbo : index")
     e("    %ib_i = index.cast %ib : index to i32")
     e("    %hi_i = index.cast %hi : index to i32")
-    for nm, v in (("i1", 1), ("i2", 2), ("i3", 3), ("i4", 4), ("i8", 8), ("i15", 15), ("i16", 16), ("i23", 23),
-                  ("i24", 24), ("i32", 32), ("i128", 128), ("i255", 255), ("i260", 260), ("i0", 0)):
+    for nm, v in (("i1", 1), ("i2", 2), ("i3", 3), ("i15", 15), ("i16", 16), ("i23", 23), ("i32", 32), ("i260", 260)):
         e(f"    %{nm} = scalar.constant {v} : i32")
     e("    %sh2 = scalar.shli %ib_i, %i1 : i32")
     e("    %sh4 = scalar.shli %ib_i, %i2 : i32")
-    e("    %nsh = scalar.shli %hi_i, %i2 : i32")   # 0 (low nibbles) or 4 (high)
     e("    %sh16 = scalar.addi %sh2, %i16 : i32")
+    e("    %nsh = scalar.shli %hi_i, %i2 : i32")   # 0 (low nibbles) or 4 (high)
     e("    %c15b = scalar.constant 15 : i8")
     e("    %m15v = vector.splat %c15b : vector<8xi8>")
-    e("    %f128 = scalar.constant 128.0 : f32")
     e("    %f127 = scalar.constant 127.0 : f32")
     # 1.5 * 2^23: x + magic rounds x to the nearest even integer, left in the low mantissa bits (|x| < 2^22)
     e("    %magic = scalar.constant 12582912.0 : f32")
-    for i, v in enumerate(KVALUES):   # the codebook + 128 as unsigned bytes (one v_cvt_f32_ubyte each)
-        e(f"    %kv{i} = scalar.constant {v + 128 - 256 if v + 128 > 127 else v + 128} : i8")
+    for i, v in enumerate(KVALUES):
+        e(f"    %kv{i} = scalar.constant {v} : i8")
     e("    %kvt = vector.from_elements " + ", ".join(f"%kv{i}" for i in range(16)) + " : vector<16xi8>")
     src = []   # per fragment byte: an i32 whose low byte it is
     for r in range(8):
@@ -123,86 +214,12 @@ def body(rows, K, p=""):
         e(f"    %qa{r} = index.add %blk{r}, %qo1 : index")
         e(f"    %qb{r} = vector.load %wv[%qa{r}] : view<[%nin]xi8> -> vector<8xi8>")
         e(f"    %qw{r} = vector.bitcast %qb{r} : vector<8xi8> to vector<2xi32>")
+        qw = []
         for h in range(2):
             e(f"    %qx{r}_{h} = vector.extract %qw{r}[{h}] : vector<2xi32> -> i32")
-            e(f"    %qy{r}_{h} = scalar.shrui %qx{r}_{h}, %nsh : i32")
-        e(f"    %nw{r} = vector.from_elements %qy{r}_0, %qy{r}_1 : vector<2xi32>")
-        e(f"    %nc{r} = vector.bitcast %nw{r} : vector<2xi32> to vector<8xi8>")
-        e(f"    %nb{r} = vector.andi %nc{r}, %m15v : vector<8xi8>")   # (the lookup's index range proof)
-        e(f"    %ku{r} = vector.table.lookup %kvt[%nb{r}] : vector<16xi8>, vector<8xi8> -> vector<8xi8>")
-        e(f"    %kw{r} = vector.bitcast %ku{r} : vector<8xi8> to vector<2xi32>")
-        u, kbs = [], []
-        for j in range(8):
-            if j % 4 == 0:
-                e(f"    %kx{r}_{j // 4} = vector.extract %kw{r}[{j // 4}] : vector<2xi32> -> i32")
-            x = f"%kx{r}_{j // 4}"
-            if j % 4:
-                e(f"    %kr{r}_{j} = scalar.shrui {x}, %i{8 * (j % 4)} : i32")
-                x = f"%kr{r}_{j}"
-            e(f"    %kb{r}_{j} = scalar.andi {x}, %i255 : i32")   # (shift, mask, uitofp: one v_cvt_f32_ubyte)
-            e(f"    %u{r}_{j} = scalar.uitofp %kb{r}_{j} : i32 to f32")   # kvalue + 128
-            u.append(f"%u{r}_{j}")
-            kbs.append(f"%kb{r}_{j}")
-        # the codebook is increasing: the extremes of the 8 values are s times the extreme codes
-        hi, lo = kbs[0], kbs[0]
-        for j in range(1, 8):
-            e(f"    %uh{r}_{j} = scalar.maxui {hi}, {kbs[j]} : i32")
-            e(f"    %ul{r}_{j} = scalar.minui {lo}, {kbs[j]} : i32")
-            hi, lo = f"%uh{r}_{j}", f"%ul{r}_{j}"
-        e(f"    %kh{r} = scalar.subi {hi}, %i128 : i32")
-        e(f"    %kl{r} = scalar.subi {lo}, %i128 : i32")
-        e(f"    %khf{r} = scalar.sitofp %kh{r} : i32 to f32")
-        e(f"    %klf{r} = scalar.sitofp %kl{r} : i32 to f32")
-        e(f"    %wh{r} = scalar.mulf %s{r}, %khf{r} : f32")
-        e(f"    %wl{r} = scalar.mulf %s{r}, %klf{r} : f32")
-        e(f"    %ah{r} = scalar.absf %wh{r} : f32")
-        e(f"    %al{r} = scalar.absf %wl{r} : f32")
-        e(f"    %am{r} = scalar.maxnumf %ah{r}, %al{r} : f32")
-        e(f"    %pm{r} = scalar.maxnumf %wh{r}, %wl{r} : f32")
-        e(f"    %mb{r} = scalar.bitcast %am{r} : f32 to i32")
-        # exponent field of max |w|; an all-zero block has s = 0, so every product below is 0 and E = 0
-        e(f"    %E{r} = scalar.bitfield.extractu %mb{r} {{offset = 23, width = 8}} : i32 -> i32")
-        e(f"    %ie{r} = scalar.subi %i260, %E{r} : i32")
-        e(f"    %ib{r} = scalar.shli %ie{r}, %i23 : i32")
-        e(f"    %iq{r} = scalar.bitcast %ib{r} : i32 to f32")          # 2^(133 - E)
-        # bfp_hw's bump: the largest value rounds to 128 -> E + 1 (only a positive value can leave int8)
-        e(f"    %ps{r} = scalar.mulf %pm{r}, %iq{r} : f32")
-        e(f"    %pr{r} = scalar.roundevenf %ps{r} : f32")
-        e(f"    %bu{r} = scalar.cmpf ogt, %pr{r}, %f127 : f32")
-        e(f"    %Ep{r} = scalar.addi %E{r}, %i1 : i32")
-        e(f"    %E1_{r} = scf.select %bu{r}, %Ep{r}, %E{r} : i32")
-        e(f"    %je{r} = scalar.subi %i260, %E1_{r} : i32")
-        e(f"    %jb{r} = scalar.shli %je{r}, %i23 : i32")
-        e(f"    %jq{r} = scalar.bitcast %jb{r} : i32 to f32")
-        e(f"    %ss{r} = scalar.mulf %s{r}, %jq{r} : f32")   # s 2^(133 - E'), exact
-        src.append(f"%E1_{r}")
-        for j in range(8):   # m = roundeven(kvalue * ss): exact product, one rounding (|m| <= 128 after the bump)
-            e(f"    %k{r}_{j} = scalar.subf {u[j]}, %f128 : f32")
-            e(f"    %y{r}_{j} = scalar.fmaf %k{r}_{j}, %ss{r}, %magic : f32")
-            e(f"    %yb{r}_{j} = scalar.bitcast %y{r}_{j} : f32 to i32")
-            src.append(f"%yb{r}_{j}")
-    # 72 bytes = 18 words, each from the low bytes of 4 sources: two byte pairs (v_perm) and their merge
-    words = []
-    for w in range(18):
-        a, b, c, d = src[4 * w:4 * w + 4]
-        for nm, x, y in (("pa", a, b), ("pb", c, d)):
-            e(f"    %{nm}{w} = vector.from_elements {x}, {y} : vector<2xi32>")
-            e(f"    %{nm}c{w} = vector.bitcast %{nm}{w} : vector<2xi32> to vector<8xi8>")
-            e(f"    %{nm}s{w} = vector.shuffle<[0, 4, 0, 4, 0, 0, 0, 0]> %{nm}c{w} : vector<8xi8>")
-            e(f"    %{nm}w{w} = vector.bitcast %{nm}s{w} : vector<8xi8> to vector<2xi32>")
-            e(f"    %{nm}x{w} = vector.extract %{nm}w{w}[0] : vector<2xi32> -> i32")
-        e(f"    %pm2_{w} = vector.from_elements %pax{w}, %pbx{w} : vector<2xi32>")
-        e(f"    %pmc{w} = vector.bitcast %pm2_{w} : vector<2xi32> to vector<8xi8>")
-        e(f"    %pms{w} = vector.shuffle<[0, 1, 4, 5, 0, 0, 0, 0]> %pmc{w} : vector<8xi8>")
-        e(f"    %pmw{w} = vector.bitcast %pms{w} : vector<8xi8> to vector<2xi32>")
-        e(f"    %o{w} = vector.extract %pmw{w}[0] : vector<2xi32> -> i32")
-        words.append(f"%o{w}")
-    for j in range(9):   # 9 aligned 8-byte stores
-        e(f"    %wd{j} = vector.from_elements {words[2 * j]}, {words[2 * j + 1]} : vector<2xi32>")
-        e(f"    %w{j} = vector.bitcast %wd{j} : vector<2xi32> to vector<8xi8>")
-        e(f"    %wo{j} = index.constant {8 * j} : index")
-        e(f"    %wa{j} = index.add %frag, %wo{j} : index")
-        e(f"    vector.store %w{j}, %ov[%wa{j}] : vector<8xi8>, view<[%nout]xi8>")
+            qw.append(f"%qx{r}_{h}")
+        frag(e, src, r, f"%s{r}", qw, "%nsh")
+    st(e, pack(e, src), "%frag")
     e("  }")
     return [re.sub(r"%([A-Za-z_]\w*)", lambda m: "%" + p + m.group(1), ln) for ln in L] if p else L
 
