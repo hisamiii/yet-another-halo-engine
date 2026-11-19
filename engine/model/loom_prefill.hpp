@@ -1185,7 +1185,8 @@ class LoomPrefill {
       return false;
     const std::uint32_t F = pair ? geom_.at("npuffnpair").tokens : ffnblk_, M = static_cast<std::uint32_t>(tg->dims[1]);
     // the GPU's features: the fused ffn's split, or (pairs) gate kstore + up swiglu splits, fragment-major into ffnup_
-    const std::string sh = pair ? "" : NpuHal(hal);
+    // (rseg: the split of that layout, its up rows F rows on, emit_prefill_pp FFUP)
+    const std::string sh = pair ? "" : NpuHal(weights_.RSegOf(*tg) ? AfHal(RSegHal(GemmHal("gemm_ffn", *tg, &f), *tg), ".af.to.hal") : hal);
     const std::string gs = pair ? NpuHal(KstoreHal(pre + "ffn_gate.weight", true)) : "";
     const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
     const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;

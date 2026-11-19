@@ -727,11 +727,12 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=
                 b(f"  {q_}s = index.add {q_}s0, {e.ci(i)} : index")
                 b(f"  {q_}sb = index.mul {q_}s, {e.ci(RSEG_B)} : index")
                 b(f"  {q_}p0 = index.add {q_}sb, {q_}w : index")
-                b(f"  {q_}p1 = index.add {q_}p0, {e.ci(f0_)} : index")
-                b(f"  {q_}hi = index.cmp uge, {q_}s, {e.ci(rseg // RSEG_B)} : index")
-                b(f"  {q_}p2 = index.add {q_}p1, {e.ci(f0_)} : index")
-                b(f"  {q_}p = scf.select {q_}hi, {q_}p2, {q_}p1 : index")
-                b(f"  {q_}r = scf.select {q_}npu, {q_}p, {lg} : index")
+                b(f"  {q_}p = index.add {q_}p0, {e.ci(f0_)} : index")
+                lo_ = lg
+                if i:   # (the GPU's up rows: F rows on, after the NPU's run)
+                    lo_ = f"{q_}lo"
+                    b(f"  {lo_} = index.add {lg}, {e.ci(rseg)} : index")
+                b(f"  {q_}r = scf.select {q_}npu, {q_}p, {lo_} : index")
                 b(f"  %f{i}rb{r} = index.mul {q_}r, {e.ci(rb)} : index")
                 b(f"  %f{i}base{r} = index.add %f{i}rb{r}, %f{i}lboff : index")
                 continue
@@ -881,34 +882,34 @@ def kseg_ok(kseg, K):
 # Row segments (RSEG): an FFN layer whose last F gate / up features the NPU's 5-slab gate / up image reads (emit_prefill_pp
 # FFNSW5, gen_npu_q qsw5). Its 16-row records take 8 gate rows and the same features' 8 up rows, which the shim DMA
 # reaches by a step of under 2^20 words: so those rows are stored in blocks of RSEG_B, gate block g then up block g, a
-# pair per 2 RSEG_B rows over the gate tensor's last F rows and then the up tensor's (LoomWeights, in place at load).
+# pair per 2 RSEG_B rows, in one run of 2 F rows from the gate tensor's last F rows on; the up tensor's other rows (the
+# GPU's) after the run (LoomWeights, in place at load; any F / RSEG_B, the pairs never straddle the GPU's up rows).
 # Logical row L over gate and up ([0, M) gate, [M, 2M) up) at physical row rseg_phys(L), both from the gate tensor's
-# start; the other rows stay.
+# start: gate rows below M - F stay, up rows below M + M - F move F rows on.
 RSEG_B = 1280
 
 
 def rseg_ok(M, F):
-    return 0 < F < M and F % (2 * RSEG_B) == 0
+    return 0 < F < M and F % RSEG_B == 0
 
 
 def rseg_phys(L, M, F):
     """The physical row (from the gate tensor's start) of logical row L over gate and up."""
-    f0, ng = M - F, F // RSEG_B
+    f0 = M - F
     base = M + f0 if L >= M else f0
     if L < base:
-        return L
+        return L + (F if L >= M else 0)
     g, w = divmod(L - base, RSEG_B)
-    s_ = 2 * g + (L >= M)
-    return f0 + RSEG_B * s_ + w + (f0 if s_ >= ng else 0)
+    return f0 + RSEG_B * (2 * g + (L >= M)) + w
 
 
 def rseg_emit_i32(e, src, dst, M, F, off=0):
     """%dst (i32) = rseg_phys(%src + off) (gen_gemm_tile RSEG); e: the emitter's line function."""
     assert rseg_ok(M, F), (M, F)
-    f0, ng = M - F, F // RSEG_B
+    f0 = M - F
     c = lambda n, v: e(f"  %rs_{n} = scalar.constant {v} : i32")
     c("off", off), c("m", M), c("b0", f0), c("b1", M + f0), c("bb", RSEG_B), c("two", 2), c("one", 1), c("zero", 0)
-    c("ng", ng)
+    c("f", F)
     for ln in (f"%rs_l = scalar.addi {src}, %rs_off : i32",
                "%rs_up = scalar.cmpi uge, %rs_l, %rs_m : i32",
                "%rs_base = scf.select %rs_up, %rs_b1, %rs_b0 : i32",
@@ -922,11 +923,10 @@ def rseg_emit_i32(e, src, dst, M, F, off=0):
                "%rs_s = scalar.addi %rs_g2, %rs_ui : i32",
                "%rs_sb = scalar.muli %rs_s, %rs_bb : i32",
                "%rs_p0 = scalar.addi %rs_sb, %rs_w : i32",
-               "%rs_p1 = scalar.addi %rs_p0, %rs_b0 : i32",
-               "%rs_hi = scalar.cmpi uge, %rs_s, %rs_ng : i32",
-               "%rs_p2 = scalar.addi %rs_p1, %rs_b0 : i32",
-               "%rs_p = scf.select %rs_hi, %rs_p2, %rs_p1 : i32",
-               f"{dst} = scf.select %rs_npu, %rs_p, %rs_l : i32"):
+               "%rs_p = scalar.addi %rs_p0, %rs_b0 : i32",
+               "%rs_uf = scf.select %rs_up, %rs_f, %rs_zero : i32",   # (the GPU's up rows: F rows on)
+               "%rs_lo = scalar.addi %rs_l, %rs_uf : i32",
+               f"{dst} = scf.select %rs_npu, %rs_p, %rs_lo : i32"):
         e("  " + ln)
 
 

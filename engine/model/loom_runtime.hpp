@@ -13,6 +13,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <numeric>
 #include <set>
 #include <source_location>
 #include <stdexcept>
@@ -705,14 +706,14 @@ using KSeg = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
 // its last F features' gate and up rows in blocks of kRSegBlock, up block g kRSegBlock rows after gate block g (a
 // 16-row record's two halves within the shim DMA's 2^20-word step). Logical row L over gate and up ([0, M) gate,
 // [M, 2M) up, up stored right after gate) is at physical row RSegPhys(L) from the gate tensor's start: slot s of the
-// 2 F / kRSegBlock blocks holds gate block s / 2 (s even) or up block s / 2 (s odd), slots over the gate tensor's last
-// F rows, then the up tensor's.
+// 2 F / kRSegBlock blocks holds gate block s / 2 (s even) or up block s / 2 (s odd), one run of slots from the gate
+// tensor's last F rows on; the up tensor's other rows (the GPU's) after the run, F rows on (gen_gemv rseg_phys).
 constexpr std::size_t kRSegBlock = 1280;
 inline std::size_t RSegPhys(std::size_t L, std::size_t M, std::size_t F) {
-  const std::size_t f0 = M - F, ng = F / kRSegBlock, base = L >= M ? M + f0 : f0;
-  if (L < base) return L;
-  const std::size_t g = (L - base) / kRSegBlock, w = (L - base) % kRSegBlock, s = 2 * g + (L >= M);
-  return f0 + kRSegBlock * s + w + (s >= ng ? f0 : 0);
+  const std::size_t f0 = M - F, base = L >= M ? M + f0 : f0;
+  if (L < base) return L + (L >= M ? F : 0);
+  const std::size_t g = (L - base) / kRSegBlock, w = (L - base) % kRSegBlock;
+  return f0 + kRSegBlock * (2 * g + (L >= M)) + w;
 }
 
 // The model's tensor data on the GPU; Ref(t) binds a tensor. It is copied into device-local buffers of about 1 GiB cut
@@ -856,29 +857,32 @@ class LoomWeights {
       for (std::size_t r = 0; r < rows; ++r, d += w * bb) std::memcpy(d, p + (r * kb + k0) * bb, w * bb);
     std::memcpy(p, scratch->data(), static_cast<std::size_t>(t.bytes));
   }
-  // Gate (at p, then its up tensor u) into row segments of F (RSegPhys): the blocks moved by cycles, one in scratch.
+  // Gate (at p, then its up tensor u) into row segments of F (RSegPhys): rows [M - F, 2 M) moved in units of
+  // gcd(kRSegBlock, M - F) rows (each unit's rows stay together) by cycles, one unit in scratch.
   static void RowSegment(std::uint8_t* p, const core::TensorInfo& g, const core::TensorInfo* u, std::uint32_t F,
                          std::vector<std::uint8_t>* scratch) {
     const std::size_t M = static_cast<std::size_t>(g.dims[1]), rb = M ? static_cast<std::size_t>(g.bytes) / M : 0;
     if (!u || u->offset != g.offset + g.bytes || u->dims != g.dims || u->type != g.type || u->bytes != g.bytes ||
-        rb * M != g.bytes || F >= M || F % (2 * kRSegBlock))
+        rb * M != g.bytes || F >= M || F % kRSegBlock)
       throw LoomError("weights: bad row segments for " + g.name);
-    const std::size_t ng = F / kRSegBlock, f0 = M - F, n = kRSegBlock * rb;
-    const auto slot = [&](std::size_t s) { return p + (s < ng ? f0 + kRSegBlock * s : M + f0 + kRSegBlock * (s - ng)) * rb; };
-    const auto src = [&](std::size_t t) { return t % 2 ? ng + t / 2 : t / 2; };   // (slot t takes slot src(t)'s block)
+    const std::size_t f0 = M - F, un = std::gcd(kRSegBlock, f0), units = (2 * M - f0) / un, n = un * rb;
+    // unit i (logical rows f0 + i un ..) goes to physical unit to[i]; from[t]: the unit physical unit t takes
+    std::vector<std::size_t> from(units);
+    for (std::size_t i = 0; i < units; ++i) from[(RSegPhys(f0 + i * un, M, F) - f0) / un] = i;
+    const auto at = [&](std::size_t t) { return p + (f0 + t * un) * rb; };
     scratch->resize(n);
-    std::vector<bool> done(2 * ng);
-    for (std::size_t s0 = 0; s0 < 2 * ng; ++s0) {
+    std::vector<bool> done(units);
+    for (std::size_t s0 = 0; s0 < units; ++s0) {
       if (done[s0]) continue;
-      std::memcpy(scratch->data(), slot(s0), n);
+      std::memcpy(scratch->data(), at(s0), n);
       for (std::size_t c = s0;;) {
-        const std::size_t x = src(c);
+        const std::size_t x = from[c];
         done[c] = true;
         if (x == s0) {
-          std::memcpy(slot(c), scratch->data(), n);
+          std::memcpy(at(c), scratch->data(), n);
           break;
         }
-        std::memcpy(slot(c), slot(x), n);
+        std::memcpy(at(c), at(x), n);
         c = x;
       }
     }

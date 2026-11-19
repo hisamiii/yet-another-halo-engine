@@ -1428,6 +1428,12 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
                 for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
                     split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), FS)
+                    if sw5 and fmt == "iq4xs":   # (the row-segmented layers' GPU rows: their up rows F rows on)
+                        try:
+                            TG.FFUP = FS
+                            split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s%s" % (fmt, mt, kb, gen_gemv.rseg_suffix(FS), sfx), FS)
+                        finally:
+                            TG.FFUP = 0
             blk = GN.decoder(gu_fmt(fmt)).BLK
             dfr = fmt in NPU_DFR_FMTS
             if NPU_Q:   # (Q' qsw at NP 4, or FFNSW5's NP 5; its egress ring stays 4 records, GN_QFEGR2 would reach

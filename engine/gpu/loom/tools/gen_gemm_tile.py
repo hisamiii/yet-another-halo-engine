@@ -264,6 +264,9 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
 # the tile count of a fragment-major output, for ffn the gate rows before the up rows, for kqg twice the q / gate row
 # stride (whole heads split). kstore / kres / swiglu / ffn / kqg.
 OSTRIDE = 0
+# (ffn) the up rows FFUP rows further on than the gate rows' count: an NPU split's GPU rows over row-segmented gate / up
+# (RSEG, gen_gemv rseg_phys: the GPU's up rows after the NPU's run of 2 F rows, F rows on)
+FFUP = 0
 # Two tensors of one shape and format back to back in the weight binding (emit_prefill_pp KST2: ssm_alpha + ssm_beta),
 # one kstore over both: rows [0, m_rows / 2) go to output, the rest to out2, each [tokens][m_rows / 2]. A wave's rows
 # must lie in one half (the emitter checks the tile); the default fragment-store epilogue only.
@@ -644,7 +647,12 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         # m_rows further on in the binding (no branch: a branch around the loads drains vmcnt(0) at its join every phase)
         e("  %drow_g = index.rem %drow, %c64 : index")
         e("  %ff_up = index.cmp uge, %drow, %c64 : index")
-        e(f"  %ff_upr = scf.select %ff_up, {orw()}, %c0 : index")
+        upw = orw()
+        if FFUP:
+            e(f"  %ff_upk = index.constant {FFUP} : index")
+            e(f"  %ff_upw = index.add {orw()}, %ff_upk : index")
+            upw = "%ff_upw"
+        e(f"  %ff_upr = scf.select %ff_up, {upw}, %c0 : index")
         e("  %drow_t = index.add %drow_g, %ff_upr : index")
         e("  %drow_gi = index.cast %drow_t : index to i32")
         e(f"  {'%grow_q_i' if RSEG else '%grow_i'} = scalar.addi %wg_row_i, %drow_gi : i32")
