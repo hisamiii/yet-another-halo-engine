@@ -1935,7 +1935,11 @@ class LoomPrefill {
         // The persistent kres (one workgroup per row block) over all but the last token tile, the tiled kres on that
         // tile beside it (disjoint token ranges: the graph runs them together on the CUs the row blocks leave idle).
         const std::string p3 = fused0.substr(0, fused0.size() - 4) + ".af.p3.npu.hal";   // NPU split only
-        if (af && geom_.count(p3) && tt == g.tt) {
+        // (11-19: graph dispatches do not overlap here, so the two run one after the other and the tiled kres over all
+        // token tiles, blocks x tt workgroups, is faster: IQ4_XS 1582 -> 1288 us, Q4_K / Q5_K equal; YAH_NPU_OUTP3=1:
+        // the persistent part + the tiled last tile)
+        static const bool outp3 = std::getenv("YAH_NPU_OUTP3") != nullptr;
+        if (outp3 && af && geom_.count(p3) && tt == g.tt) {
           const std::size_t T = tt - 1;
           const std::size_t tile = B_ / tt;
           // per-token bytes of input, residual and output (bindings first, first + 1, first + 4)
