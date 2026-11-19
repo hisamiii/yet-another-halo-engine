@@ -1300,6 +1300,11 @@ class LoomPrefill {
     norm_bfp_ = npu_site, norm_pk_ = pk ? npu_site : "";
     pending_norm_ = wname, pending_mode_ = mode;
   }
+  // GPU work an NPU job does not read, recorded right after that job's release (RunDeltaNet's postnorm part b)
+  std::function<void()> after_release_;
+  void RunAfterRelease() {
+    if (after_release_) std::exchange(after_release_, nullptr)();
+  }
   void RunPendingNorm() {
     if (!pending_norm_.empty()) RunNorm(std::exchange(pending_norm_, ""), pending_mode_);
   }
@@ -1876,6 +1881,7 @@ class LoomPrefill {
         std::vector<std::uint32_t> calls;
         const NpuView c = NpuCalls(site, a, w, c_off, calls, wname);
         NpuEnqueue(std::move(calls), site);
+        RunAfterRelease();
         const Geom gs = GeomOf(sh);
         const std::string kname = std::string("yah_ffn_gemm_") + f.name + "_kres";
         const std::uint32_t blocks = (MTiles(*t) - nn / 16) / gs.rowgrp;
@@ -1915,11 +1921,13 @@ class LoomPrefill {
         std::swap(hidden_, hidden2_);
         return;
       }
+      RunAfterRelease();
       Dispatch(Exe(use_p ? pers : fused), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(),
                MTiles(*t) / g.rowgrp, use_p ? 1 : tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
       std::swap(hidden_, hidden2_);
       return;
     }
+    RunAfterRelease();
     const std::string base = GemmHal("gemm_kstore", *t, &f);
     const std::string hal = PickGemm(base);
     const Geom g = GeomOf(hal);
@@ -2266,8 +2274,22 @@ class LoomPrefill {
       std::vector<hrx_buffer_ref_t> b{Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)};
       if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
       Dispatch(Exe(pn + (bfp ? "_a_bfp.hal" : "_a.hal")), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1, b);
-      Dispatch(Exe(pn + "_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1,
-               {Ref(*raw2_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
+      const auto part_b = [this, pn, gate, w = TRef(*Find(pre + "ssm_norm.weight"))] {
+        Dispatch(Exe(pn + "_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1,
+                 {Ref(*raw2_), w, gate, Ref(*scratch_)});
+      };
+      // with the NPU's out job reading part a's A, part b (and the conv ring) follow its release (RunResidual), not
+      // precede it: the GPU's own out GEMM still reads them after (YAH_NPU_NODEFER=1: before, as without the NPU)
+      static const bool nodefer = std::getenv("YAH_NPU_NODEFER") != nullptr;
+      if (bfp && !nodefer) {
+        after_release_ = [part_b, &ring, dn_done] {
+          part_b();
+          if (dn_done) ring();
+        };
+        dn_done = false;
+      } else {
+        part_b();
+      }
     } else {
       Dispatch(Exe(out_af ? "postnorm_t.hal" : "postnorm.hal"), "yah_ssm_postnorm_fp16", 6 * B_, 1, 1, 256, 1, 1,
                {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
@@ -2275,6 +2297,7 @@ class LoomPrefill {
     if (dn_done) ring();
     trim_row_ = tail_;
     RunResidual(pre + "ssm_out.weight", *scratch_, out_af);
+    RunAfterRelease();
     trim_row_ = kAllRows;
   }
 
