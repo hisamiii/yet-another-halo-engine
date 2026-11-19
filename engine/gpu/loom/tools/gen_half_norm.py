@@ -245,17 +245,17 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
     e("  %iv_buf = buffer.alloca<workgroup> align(16) %iv_bytes : buffer")
     e(f"  %iv_view = buffer.view %iv_buf[%base] : buffer -> view<{wpr * split}xf32>")
     if wlds:
-        assert dim % (4 * NTH) == 0
+        wv = next(v for v in (4, 2, 1) if dim % (v * NTH) == 0)   # (4 at 256 threads, 2 at 512)
         e(f"  %wl_bytes = index.constant {dim * 4} : offset")
         e("  %wl_buf = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
         e(f"  %wl_view = buffer.view %wl_buf[%base] : buffer -> view<{dim}xf32>")
-        e("  %wl_c4 = index.constant 4 : index")
+        e(f"  %wl_c4 = index.constant {wv} : index")
         e("  %wl_t4 = index.mul %tid, %wl_c4 : index")
-        for c in range(dim // (4 * NTH)):
-            e(f"  %wl_o{c} = index.constant {c * 4 * NTH} : index")
+        for c in range(dim // (wv * NTH)):
+            e(f"  %wl_o{c} = index.constant {c * wv * NTH} : index")
             e(f"  %wl_i{c} = index.add %wl_t4, %wl_o{c} : index")
-            e(f"  %wl_v{c} = vector.load %weight_view[%wl_i{c}] : view<[%dim]xf32> -> vector<4xf32>")
-            e(f"  vector.store %wl_v{c}, %wl_view[%wl_i{c}] : vector<4xf32>, view<{dim}xf32>")
+            e(f"  %wl_v{c} = vector.load %weight_view[%wl_i{c}] : view<[%dim]xf32> -> vector<{wv}xf32>")
+            e(f"  vector.store %wl_v{c}, %wl_view[%wl_i{c}] : vector<{wv}xf32>, view<{dim}xf32>")
     for k in range(m):
         e(f"  %o{k} = index.constant {32 * k} : index")
         e(f"  %a{k} = index.add %lane_base, %o{k} : index")

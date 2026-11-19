@@ -211,6 +211,9 @@ def postnorm_g16(text):
 
 
 NORM_SPLIT = 2
+# the onorm's waves a row (gen_osum; the chain runs through the parts in order, so any split gives the same bits;
+# 4: 852 -> 840 and 862 -> 806 us a call at pp2048, YAH_ONORM_SPLIT=2 the old 256 threads)
+ONORM_SPLIT = int(os.environ.get("YAH_ONORM_SPLIT", "4"))
 
 
 def rope_live(text):
@@ -1106,7 +1109,7 @@ def npu_split(rows, combos, B, outdir):
             groups, perm = GE.GROUPS, GE.ACT_PERM
             GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
             try:
-                text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], NORM_SPLIT, (B, list(NPU_KS), NPU_PASSES))
+                text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES))
             finally:
                 GE.GROUPS, GE.ACT_PERM = groups, perm
             oname = "npu_onorm%s.hal" % sfx
@@ -1114,7 +1117,7 @@ def npu_split(rows, combos, B, outdir):
             open(src, "w").write(text)
             E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                          "yah_half_norm.fused=0"], oname, outdir)
-            out.append((oname, B // 4, 32 * 4 * NORM_SPLIT, 0))   # 4 rows a workgroup
+            out.append((oname, B // 4, 32 * 4 * ONORM_SPLIT, 0))   # 4 rows a workgroup
         if site == "qkv":
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads
