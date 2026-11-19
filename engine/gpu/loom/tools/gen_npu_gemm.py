@@ -524,6 +524,9 @@ class Config:
     dgu: int = 0          # swiglu fuse 2: bytes from a gate row to its up row (the raw stream per pass: [gate / up][32 rows])
     hpass: int = 0        # H as [M block][pass hpass][16-token slab][128 k-blocks] (the FFN block's swiglu output, down's
                           # input): swiglu (cols = hpass): column c writes pass c; ain "h": records [M block][pass, slab]
+    apass: int = 0        # (Q') A's passes a 64-token M block (records [M block][apass][slab]): the call reads passes
+                          # 0 .. passes - 1 of each from its binding's offset (an H window: a down K part of a wider H);
+                          # 0: passes
     swcol: int = 0        # swiglu fuse 2: raw rows between columns' first gate rows (0: TN / 2)
     gord: str = "P4"      # fuse 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural; "GF": Q4_K in P4)
     hord: str = ""        # swiglu: H in the down decoder's k-block order: "P4" ((0, 2, 1, 3) per 4 k-blocks: IQ4_XS's
@@ -762,6 +765,8 @@ def slab(ks):
 def stream_bytes(cfg):
     """(activation, weight, C) binding sizes."""
     a = sum(cfg.nb * cfg.passes * MP * slab(k) for k in cfg.ks)
+    if cfg.apass:   # (Q' A window) the extent from the first M block's pass 0 to the last one's pass passes - 1
+        a = sum(((cfg.nb - 1) * cfg.apass + cfg.passes) * MP * slab(k) for k in cfg.ks)
     if cfg.ain == "h":   # the view's extent in H ([M block][pass][slab][128 k-blocks])
         a = (144 * sum(cfg.ks[:-1]) + (cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (cfg.passes * MP - 1) * 128 * 144
              + slab(cfg.ks[-1]))

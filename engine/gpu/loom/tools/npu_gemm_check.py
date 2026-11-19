@@ -177,7 +177,7 @@ def main():
     # NPU_GORD: the decoder's k-block order (gen_npu_gemm Config.gord; "GF": Q4_K pushed in P4)
     cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw, fmt=fmt, rawdma=int(fuse == 2),
                    gate=N.GATE_SUPPLY if os.environ.get("NPU_GATE") else 0,
-                   gord=os.environ.get("NPU_GORD", "P4"))
+                   gord=os.environ.get("NPU_GORD", "P4"), apass=int(os.environ.get("NPU_APASS", "0")))
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
     wq = None
@@ -424,7 +424,7 @@ def main():
         a_in = a.reshape(M, K // 8, 8)[:, kperm].reshape(M, K)
     ra, _ = B.reference(a_in, "act", M, list(ks), passes, N.TM, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
-    assert ra.size == sa and rw.size == sw
+    assert (ra.size == sa or cfg.apass) and rw.size == sw
     mrel = os.environ.get("NPU_QCREL") == "2" and os.environ.get("GN_QEMERGE") == "1"
     if QMODE and mrel:   # (pair relay + merge: A and C in token order, gen_npu_q.mrel)
         pass
@@ -438,6 +438,15 @@ def main():
         nbr_ = nb // R_
         src = [b * R_ + r for r in range(R_) for b in range(nbr_)]
         ra = np.ascontiguousarray(ra.view(np.uint8).reshape(nb, -1)[src]).reshape(-1).view(ra.dtype)
+    if cfg.apass:   # (NPU_APASS, NPU_AOFF) A as a window of a wider H: [M block][apass passes][slab], the call's
+        # passes at pass NPU_AOFF of each block, junk (0x5A) in the others; the binding starts at block 0's window
+        rb_ = N.MP * N.slab(ks[0])
+        ao_ = int(os.environ.get("NPU_AOFF", "0"))
+        assert len(ks) == 1 and ao_ + passes <= cfg.apass
+        full_ = np.full((nb, cfg.apass * rb_), 0x5A, np.uint8)
+        full_[:, ao_ * rb_:(ao_ + passes) * rb_] = ra.view(np.uint8).reshape(nb, passes * rb_)
+        ra = np.ascontiguousarray(full_.reshape(-1)[ao_ * rb_:ao_ * rb_ + sa])
+        assert ra.size == sa
     if os.environ.get("GN_QASPLIT_COPY") == "1":   # (diag) a second copy of A for the split's second streams
         ra = np.concatenate([ra, ra])
     ra.tofile(a_b)
