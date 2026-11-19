@@ -57,13 +57,17 @@ class LoomPrefill {
   // The K-segmented ffn_down tensors of the set in dir (dispatch.txt "npudnseg_<fmt> <F> <m tiles> <k blocks>",
   // emit_prefill_pp YAH_NPU_DNSEG): every ffn_down of such a format and shape, its segments the GPU's K part [0,
   // K - F) and the NPU's K parts (FfnBlkParts) in order. LoomWeights holds these rows so; the set's kernels read them so.
+  // ("npudnsegl_<layer> <F>": that layer's down in the layout of its own F, emit_prefill_pp YAH_NPU_FFNBLKS: the
+  // single-format layers' F)
   static std::map<std::string, KSeg> DownKSegs(const std::string& dir, const core::Gguf& gguf) {
     std::ifstream f(dir + "/dispatch.txt");
     std::map<std::string, Geom> seg;   // fmt -> (F, m tiles, k blocks)
+    std::map<std::string, std::uint32_t> lf;   // layer -> F
     std::string name;
     Geom g{};
     while (f >> name >> g.tokens >> g.rowgrp >> g.tt)
       if (name.starts_with("npudnseg_")) seg[name.substr(9)] = g;
+      else if (name.starts_with("npudnsegl_")) lf[name.substr(10)] = g.tokens;
     std::map<std::string, KSeg> out;
     for (const auto& t : gguf.tensors()) {
       Fmt fm{};
@@ -72,12 +76,17 @@ class LoomPrefill {
       if (it == seg.end() || t.dims[1] != std::uint64_t{it->second.rowgrp} * 16 ||
           t.dims[0] != std::uint64_t{it->second.tt} * 256)
         continue;
-      const std::uint32_t F = it->second.tokens, kb = it->second.tt;
-      KSeg s{{0, kb - F / 256}};
-      for (const auto& [p0, passes] : FfnBlkParts(F)) s.push_back({kb - F / 256 + 4 * p0, 4 * passes});
-      out[t.name] = std::move(s);
+      const auto l = lf.find(t.name.substr(4, t.name.find('.', 4) - 4));   // ("blk.<N>.ffn_down.weight")
+      out[t.name] = KSegFor(l == lf.end() ? it->second.tokens : l->second, it->second.tt);
     }
     return out;
+  }
+  // The K segments of a down of kb blocks under an FFN block of F features: the GPU's K part [0, K - F), then the
+  // NPU's K parts (FfnBlkParts) in order.
+  static KSeg KSegFor(std::uint32_t F, std::uint32_t kb) {
+    KSeg s{{0, kb - F / 256}};
+    for (const auto& [p0, passes] : FfnBlkParts(F)) s.push_back({kb - F / 256 + 4 * p0, 4 * passes});
+    return s;
   }
 
   // Called after RoPE of attention layer ai in chunk ci, with the layer's f16 K and V offsets in the KV scratch.
@@ -1008,7 +1017,13 @@ class LoomPrefill {
     if (!FmtOf(static_cast<std::uint32_t>(t.type), f)) throw LoomError(std::string("no GEMM format for ") + kind);
     const std::uint32_t mt = static_cast<std::uint32_t>(t.dims[1] / 16);
     const std::uint32_t kb = static_cast<std::uint32_t>(t.dims[0] / f->qk);
-    return std::string(kind) + "_" + f->name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + ".hal";
+    std::string kseg;   // (a down in another F's K segments than its format's, DownKSegs: "_kseg<widths>")
+    const auto it = geom_.find("npudnseg_" + std::string(f->name));
+    if (const KSeg* ks = weights_.KSegOf(t); ks && it != geom_.end() && *ks != KSegFor(it->second.tokens, kb)) {
+      kseg = "_kseg";
+      for (std::size_t i = 0; i < ks->size(); ++i) kseg += (i ? "_" : "") + std::to_string((*ks)[i].second);
+    }
+    return std::string(kind) + "_" + f->name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + kseg + ".hal";
   }
   std::uint32_t MTiles(const core::TensorInfo& t) const { return static_cast<std::uint32_t>(t.dims[1] / 16); }
   // The GEMM variant for this chunk's real tokens: the set may carry "<hal>.t128.hal" / ".t64.hal" with narrower token

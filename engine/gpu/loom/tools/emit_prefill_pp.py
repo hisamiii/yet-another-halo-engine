@@ -841,6 +841,12 @@ NPU_KCALL = 8 * sum(NPU_KS) * NPU_PASSES   # K per call (5120)
 # Tried, not kept: the GPU window's residual epilogue waiting for the NPU (npuffnres): only 20 of its workgroups fit at
 # once, so while the NPU is the late one the rest of the GPU's down starts after the NPU's (~5 ms a layer).
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
+# YAH_NPU_FFNBLKS=<F> (Q', default YAH_NPU_FFNBLK): the F of the single-format layers (npu_ffnblk "ok": IQ4_XS gate and
+# up, dispatch.txt "npuffnblk"); the pairs keep YAH_NPU_FFNBLK ("npuffnpair"). Their downs then read their own F's K
+# segments: dispatch.txt "npudnsegl_<layer> <F>", the down GEMMs of that layout "<hal>_kseg<widths>" (FFNBLKS_DOWNS).
+NPU_FFNBLKS = int(os.environ.get("YAH_NPU_FFNBLKS", "0")) or NPU_FFNBLK
+FFNBLKS_DOWNS = set()   # (fmt, m_tiles, k_blocks) of the single-format layers' downs when their F differs (npu_ffnblk)
+KSEG_F = [0]   # (kseg_f) the F whose K segments kseg_for gives the K-segmented downs, 0: NPU_FFNBLK's (DNSEG)
 # YAH_NPU_DNSEG (Q', default 1): ffn_down's rows in K segments, reordered in place at load ([segment][row][its blocks]:
 # the GPU's K part, then each NPU K part, gen_gemv.kseg_layout; LoomWeights, dispatch.txt "npudnseg_<fmt> <F>"). The
 # down images read a part's rows contiguous (kraw 0): one raw block a column a call instead of 80 runs of S / 256
@@ -865,10 +871,22 @@ def dnseg_plan(rows):
 
 
 @contextlib.contextmanager
+def kseg_f(F):
+    """kseg_for's K segments for F (the single-format layers' downs, YAH_NPU_FFNBLKS) while generating."""
+    KSEG_F[0] = F if F != NPU_FFNBLK else 0
+    try:
+        yield
+    finally:
+        KSEG_F[0] = 0
+
+
+@contextlib.contextmanager
 def kseg_for(fmt, mt, kb):
     """gen_gemm_tile.KSEG while a GEMM over (fmt, mt, kb) weights is generated (kb: whole rows' k_blocks)."""
     import gen_gemm_tile as TG
     TG.KSEG = DNSEG.get((fmt, mt, kb))
+    if TG.KSEG and KSEG_F[0]:
+        TG.KSEG = gen_gemv.kseg_layout(kb, KSEG_F[0], ffnblk_parts(KSEG_F[0]))
     try:
         yield
     finally:
@@ -1345,8 +1363,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     import gen_bfp16_encode as GE
     import gen_gemm_tile as TG
     import gen_npu_unpack as GU
-    F = NPU_FFNBLK
-    assert F % 1024 == 0 and B % AF_TILE["bn"] == 0
+    F, FS = NPU_FFNBLK, NPU_FFNBLKS   # (pairs, single-format layers)
+    assert F % 1024 == 0 and FS % 1024 == 0 and B % AF_TILE["bn"] == 0 and (FS == F or NPU_Q)
     by = {}
     for nm, dims, ty in rows:
         p = nm.split(".")
@@ -1360,8 +1378,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     q4kdn = os.environ.get("YAH_NPU_FFNQ4K", "1") == "1"
     rows = NPU_ROWS if NPU_QP1K else NPU_COLS * 64   # down rows per call (NP 4; Q': the P1K site image's)
     qcalls = 4 * ffnblk_parts(F)[0][1]   # (Q': a K part's qsw calls, its down's passes)
-    assert not NPU_Q or (NPU_QP1K and len({p for _, p in ffnblk_parts(F)}) == 1), \
-        "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and K parts of one size (F = 5120, 8192, 10240, ..)"
+    qcallss = 4 * ffnblk_parts(FS)[0][1]
+    for f_ in {F, FS}:
+        assert not NPU_Q or (NPU_QP1K and len({p for _, p in ffnblk_parts(f_)}) == 1), \
+            "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and K parts of one size (F = 5120, 8192, 10240, ..)"
+    assert len(ffnblk_parts(F)) == len(ffnblk_parts(FS)), "the unpack sums one count of K parts"
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
           and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in dfmts]
     # gate and up of two formats, or one without a fused GPU gate / up (its gate kstore and up swiglu): pairs
@@ -1392,21 +1413,25 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             if hord == hords[0]:
                 t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
                 for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
-                    split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), F)
+                    split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), FS)
             blk = GN.decoder(gu_fmt(fmt)).BLK
             dfr = fmt in NPU_DFR_FMTS
             if NPU_Q:   # (Q' qsw at NP 4; its egress ring stays 4 records, GN_QFEGR2 would reach the silu table)
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
                                        kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1, qsw=True, dgu=mt * 16 * kb * blk,
-                                       swcol=32, hpass=qcalls, hord=hord), "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 4))
+                                       swcol=32, hpass=qcallss, hord=hord), "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 4))
                 QJOB_ENV[jobs[-1][1]] = dict(GN_QFEGR2="0")
                 continue
             jobs.append((npu_cfg(B, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk,
-                                 swcol=32, hpass=F // 1024, hord=hord, fmt=gu_fmt(fmt), dfr=int(dfr)),
+                                 swcol=32, hpass=FS // 1024, hord=hord, fmt=gu_fmt(fmt), dfr=int(dfr)),
                          "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 4))
     parts = ffnblk_parts(F)
+    lf = lambda l: FS if l in ok else F   # (a layer's F)
+    if FS != F:   # (the single-format layers' downs in FS's K segments: their GEMMs, main; their layers, npudnsegl)
+        FFNBLKS_DOWNS.update(l["ffn_down"] for l in ok)
+        out.extend(("npudnsegl_" + n, FS, 0, 0) for n, l in sorted(by.items()) if l in ok)
     # the GPU's K window [0, 17408 - F)
-    for fmt, mt, kb, kbw in sorted({l["ffn_down"] + ((l["ffn_down"][2] * 256 - F) // 256,) for l in ok + pairs}):
+    for fmt, mt, kb, kbw in sorted({l["ffn_down"] + ((l["ffn_down"][2] * 256 - lf(l)) // 256,) for l in ok + pairs}):
         tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb), mt)
 
         def gen_rem(f, k, tr=tr, kb=kb):
@@ -1416,8 +1441,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             finally:
                 TG.KWIN = None
         assert mt not in O16_MT, "the window writes f32"
-        out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d.hal" % (fmt, kbw), outdir, "kstore",
-                             tr.rowgrp, kfull=kb))
+        with kseg_f((kb - kbw) * 256):   # (the window's layer group's K segments)
+            out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d.hal" % (fmt, kbw), outdir, "kstore",
+                                 tr.rowgrp, kfull=kb))
 
         def gen_rem_rr(f, k, tr=tr, kb=kb):   # (the same window with the residual epilogue: hidden + it, "_rr")
             TG.KWIN = (0, kb)
@@ -1425,10 +1451,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 return TG.gen(f, "kres", tr, False)
             finally:
                 TG.KWIN = None
-        out.append(_emit_gen(gen_rem_rr, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d_rr.hal" % (fmt, kbw), outdir, "kres",
-                             tr.rowgrp, kfull=kb))
-    for fmt, mt, kb in sorted({l["ffn_down"] for l in ok + pairs}):
-        for passes in sorted({p for _, p in parts}):
+        with kseg_f((kb - kbw) * 256):
+            out.append(_emit_gen(gen_rem_rr, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d_rr.hal" % (fmt, kbw), outdir,
+                                 "kres", tr.rowgrp, kfull=kb))
+    for fmt, mt, kb, passes in sorted({l["ffn_down"] + (p,) for l in ok + pairs for _, p in ffnblk_parts(lf(l))}):
+        if True:
             if NPU_Q:   # (Q': the site image of down's raw K (a part's), A bound to H; the NP 4 formats' at NP 4)
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, 4 * passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
                                        kraw=0 if (fmt, mt, kb) in DNSEG else kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1,
@@ -1566,7 +1593,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         out.append(("npuffncp_%s_%s" % (gf, uf), 1, 0, 0))
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in bsw}):
         out.append(("npuffnbx_%s_%s" % (gf, uf), 1, 0, 0))
-    out.append(("npuffnblk", F, 256, rows))   # F, gate / up features per call, down rows
+    out.append(("npuffnblk", FS, 256, rows))   # F, gate / up features per call, down rows
     if NPU_Q:
         out.append(("npuffnq", 1, 0, 0))
         for fmt, mt, kb in sorted(DNSEG):   # (the engine reorders these formats' down rows: LoomWeights)
@@ -1574,7 +1601,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):
         out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
-    for passes in sorted({p for _, p in parts}):
+    for passes in sorted({p for f_ in {F, FS} for _, p in ffnblk_parts(f_)}):
         dns = [j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes)]
         dn = next((j for j in dns if j[2] == NPU_NP), dns[0])
         with GN.np_override(dn[2]):
@@ -1746,6 +1773,17 @@ def main():
                 geom.extend(npu_split(rows, combos, B, outdir))
         finally:
             GE.GROUPS, GU.CG = groups, cg
+    for kind, fmt, port, mt, kb in sorted(c for c in combos if c[1:2] + c[3:] in FFNBLKS_DOWNS):
+        sfx = gen_gemv.kseg_suffix(gen_gemv.kseg_layout(kb, NPU_FFNBLKS, ffnblk_parts(NPU_FFNBLKS)))
+        name = lambda k: "gemm_%s_%s_%d_%d%s.hal" % (k, fmt, mt, kb, sfx)
+        with kseg_f(NPU_FFNBLKS):
+            for k in gemm_kinds(kind, mt):
+                r = gemm(fmt, mt, kb, B, name(k), outdir, kind=k)
+                assert r, name(k)
+                geom.append(r)
+                if T > B:
+                    geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k))
+                geom.extend(afrag_variants(fmt, mt, kb, B, name(k), outdir, k))
 
 
     # Attention: tools/gen_attn_fa.py, 32 tokens x 2 heads per workgroup; reads V^T (vtrans.hal, or the paged / quantized pools).
