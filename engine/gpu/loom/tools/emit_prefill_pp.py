@@ -839,6 +839,11 @@ NPU_KCALL = 8 * sum(NPU_KS) * NPU_PASSES   # K per call (5120)
 # Tried, not kept: the GPU window's residual epilogue waiting for the NPU (npuffnres): only 20 of its workgroups fit at
 # once, so while the NPU is the late one the rest of the GPU's down starts after the NPU's (~5 ms a layer).
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
+# YAH_NPU_DNSLAB (Q', default 1): the down images read K = S rows (kraw 0) from the engine's slab copy of the NPU's K window
+# ([part][row][S / 256 super-blocks], LoomPrefill::DownSlabs; dispatch.txt "npudnslab"): one contiguous raw block a
+# column a call instead of 80 runs of S / 256 super-blocks at the 17408-wide row stride (11-19: the strided read's
+# DDR stalls, ~70K cycles a down call; the copy ~22 MB of host memory a layer)
+NPU_DNSLAB = os.environ.get("YAH_NPU_DNSLAB", "1") == "1"   # (0: the GGUF rows, 17408 wide)
 # (Q' P1K) the formats whose site images are NP 4 (512-row calls: the grid decoders' tables, Q4_K's program and Q5_K's
 # raw ring do not fit an NP 5 core): those layers' sites take NPU rows rounded down to 512 (npu_rows4) and their own
 # unpacks / conv split at TN 64 ("<hal>_4.hal"); dispatch.txt "npusplit4_<site>", "npurows4", "npubytes4_5120",
@@ -1397,7 +1402,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         for passes in sorted({p for _, p in parts}):
             if NPU_Q:   # (Q': the site image of down's raw K (a part's), A bound to H; the NP 4 formats' at NP 4)
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, 4 * passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
-                                       kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1,
+                                       kraw=0 if NPU_DNSLAB else kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1,
                                        gord="GF" if fmt == "q4k" else "P4"),   # (H in P4 order)
                              "npu_ffndn%d_%s" % (passes, fmt), 4 if np4(fmt) else NPU_NP))
                 continue
@@ -1535,6 +1540,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     out.append(("npuffnblk", F, 256, rows))   # F, gate / up features per call, down rows
     if NPU_Q:
         out.append(("npuffnq", 1, 0, 0))
+        if NPU_DNSLAB:
+            out.append(("npudnslab", 1, 0, 0))
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):
         out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
