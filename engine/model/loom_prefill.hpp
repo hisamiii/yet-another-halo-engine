@@ -1264,25 +1264,37 @@ class LoomPrefill {
       Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(sh).rowgrp, tt, 1,
                32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
     }
-    // down over them: f32 [tokens][5120]
-    const Geom& gr = geom_.at(rem);
+    // down over them: f32 [tokens][5120]. With "npuffnrem_<fmt>_<kbw>_rr.hal" its residual epilogue adds hidden() (the
+    // GPU waits for the NPU's down here anyway), so the sum after the NPU's down reads one f32 tensor less
+    // ("npu_unpack_ffnblk[_4]_rr.hal": (hidden + GPU down) + NPU partials, a summation order of its own; YAH_NPU_REMEXACT=1:
+    // hidden + (NPU partials + GPU down), bit-exact with the sets before it)
+    static const bool remexact = std::getenv("YAH_NPU_REMEXACT") != nullptr;
+    const std::string rem_rr = rem.substr(0, rem.size() - 4) + "_rr.hal";
+    ffn_rr_ = !remexact && geom_.count(rem_rr) && geom_.count(dn4 ? "npu_unpack_ffnblk_4_rr.hal" : "npu_unpack_ffnblk_rr.hal");
+    const Geom& gr = geom_.at(ffn_rr_ ? rem_rr : rem);
     auto r = GemmWeights(*td, fd);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{ffnup_, wstage_, ostage_}) r.push_back(Ref(*x));
+    if (ffn_rr_) r.insert(r.end() - 2, Ref(*hidden_));   // (kres: weights, input, resid, wstage, ostage, out)
     r.push_back({ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4});
-    Dispatch(Exe(rem), ("yah_ffn_gemm_" + std::string(fd.name)).c_str(), MTiles(*td) / gr.rowgrp, gr.tt, 1, 32, 1, 1, r,
-             std::uint64_t{1} << (r.size() - 1));
+    Dispatch(Exe(ffn_rr_ ? rem_rr : rem), ("yah_ffn_gemm_" + std::string(fd.name) + (ffn_rr_ ? "_kres" : "")).c_str(),
+             MTiles(*td) / gr.rowgrp, gr.tt, 1, 32, 1, 1, r, std::uint64_t{1} << (r.size() - 1));
     NpuJoin();
     // the sum into hidden() waits for the next layer's norm, which fuses it when it feeds the NPU (RunLayerNorm)
     ffn_pending_ = {doff, parts.size() * calls * cp};
     ffn_pending4_ = dn4;
-    if (!geom_.count("npu_unorm.hal") || dn4) FlushFfn();   // (npu_unorm reads the NP 5 downs' C)
+    if (!geom_.count("npu_unorm.hal") || dn4 || ffn_rr_) FlushFfn();   // (npu_unorm reads the NP 5 downs' C)
     return true;
   }
   // The FFN block's sum (hidden + the GPU's down + the NPU's partials) into hidden(), if RunFfnBlock left it pending.
   void FlushFfn() {
     if (!ffn_pending_.length) return;
-    NpuUnpack(ffn_pending4_ ? "npu_unpack_ffnblk_4.hal" : "npu_unpack_ffnblk.hal", std::exchange(ffn_pending_, {}),
-              {Ref(*hidden_), {ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4}, Ref(*hidden2_)}, 8);
+    const hrx_buffer_ref_t remv{ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4};
+    if (ffn_rr_)
+      NpuUnpack(ffn_pending4_ ? "npu_unpack_ffnblk_4_rr.hal" : "npu_unpack_ffnblk_rr.hal", std::exchange(ffn_pending_, {}),
+                {remv, Ref(*hidden2_)}, 4);
+    else
+      NpuUnpack(ffn_pending4_ ? "npu_unpack_ffnblk_4.hal" : "npu_unpack_ffnblk.hal", std::exchange(ffn_pending_, {}),
+                {Ref(*hidden_), remv, Ref(*hidden2_)}, 8);
     std::swap(hidden_, hidden2_);
   }
 
@@ -2349,6 +2361,7 @@ class LoomPrefill {
   bool npu_planning_ = false;      // EnableNpu's binding pass: Dispatch records nothing
   LoomBuffer* npurem_ = nullptr;   // the GPU's K remainder of the NPU's out / down rows (f32 [tokens][rows])
   std::uint32_t ffnblk_ = 0;       // the NPU's FFN block features (dispatch.txt "npuffnblk"; RunFfnBlock), 0: none
+  bool ffn_rr_ = false;   // (RunFfnBlock: the GPU's down added hidden, FlushFfn's "_rr" sum)
   LoomBuffer* ffnrem_ = nullptr;   // its GPU down over the other features (f32 [tokens][5120])
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
   std::string norm_pk_;            // .. in the Q4_K order (RunLayerNorm pk)

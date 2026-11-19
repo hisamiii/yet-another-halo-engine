@@ -28,7 +28,7 @@ def wg(cols):
 
 
 def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=False, tiled=False, qg=False, rem=False,
-        bfp=None, last8=False, dup=None):
+        bfp=None, last8=False, dup=None, remres=False):
     """resid: out = resid + C (f32; bindings c, resid, out), the kres GEMMs. parts: C is that many consecutive partial C
     blocks (the K chunks of one GEMM), summed in order. swiglu: C is the gate block then the up block; out =
     f16(silu(gate) * up) with the swiglu epilogue's scalar ops. tiled: f16 out fragment-major ([token / 16][column / 16]
@@ -43,7 +43,10 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     last8: only the last 8 tokens (the conv ring of a qkv split whose conv reads C itself, gen_conv_kq.gen_c).
     dup = (col0, base) with resid and rem (the NPU's FFN block, whose down calls cover all rows): C columns from col0 on
     (the last call, which overlaps the one before it) go to out column base + (col - col0) * TN + 8 j (the overlapped
-    columns are written twice with equal values), and rem is the GPU's f32 [token][stride] partial over the other K."""
+    columns are written twice with equal values), and rem is the GPU's f32 [token][stride] partial over the other K.
+    remres (with resid and rem): rem already holds resid + the GPU's partial (its GEMM's residual epilogue): out = rem +
+    the C chunks' sum (bindings c, rem, out), a summation order of its own."""
+    assert not remres or (resid and rem)
     assert not (resid and (swiglu or tiled or out16)) and not (swiglu and parts > 1) and (resid or not rem)
     assert not bfp or swiglu
     assert not qg or not (resid or swiglu or tiled or out16)
@@ -70,7 +73,9 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e(f"  %wgsz = index.constant {WG} : index")
     e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%wgsz, %unit, %unit) : index")
     nblk = parts * (2 if swiglu else 1)
-    if resid and rem:
+    if remres:
+        e("} launch(%c: buffer, %rem: buffer, %out: buffer) {")
+    elif resid and rem:
         e("} launch(%c: buffer, %resid: buffer, %rem: buffer, %out: buffer) {")
     elif resid:
         e("} launch(%c: buffer, %resid: buffer, %out: buffer) {")
@@ -83,7 +88,11 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %base = index.constant 0 : offset")
     e(f"  %nc = index.constant {c_elems * nblk // 2} : index")   # bf16 pairs
     e(f"  %no = index.constant {tokens * stride} : index")
-    if resid and rem:
+    if remres:
+        e("  %c_na, %rem_na, %out_na = buffer.assume.noalias %c, %rem, %out : buffer, buffer, buffer")
+        e(f"  %nrem = index.constant {tokens * (stride if dup else cols * TN)} : index")
+        e("  %remv = buffer.view %rem_na[%base] : buffer -> view<[%nrem]xf32>")
+    elif resid and rem:
         e("  %c_na, %res_na, %rem_na, %out_na = buffer.assume.noalias %c, %resid, %rem, %out : buffer, buffer, buffer, buffer")
         e("  %rv = buffer.view %res_na[%base] : buffer -> view<[%no]xf32>")
         e(f"  %nrem = index.constant {tokens * (stride if dup else cols * TN)} : index")
@@ -224,7 +233,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e("  %rmv = vector.load %remv[%rma] : view<[%nrem]xf32> -> vector<8xf32>")
         e(f"  %rms = vector.addf {val}, %rmv : vector<8xf32>")
         val = "%rms"
-    if resid:
+    if resid and not remres:
         e("  %rsv = vector.load %rv[%oa] : view<[%no]xf32> -> vector<8xf32>")
         e(f"  %rs = vector.addf %rsv, {val} : vector<8xf32>")
         val = "%rs"

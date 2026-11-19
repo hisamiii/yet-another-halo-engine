@@ -1339,6 +1339,15 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         assert mt not in O16_MT, "the window writes f32"
         out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d.hal" % (fmt, kbw), outdir, "kstore",
                              tr.rowgrp, kfull=kb))
+
+        def gen_rem_rr(f, k, tr=tr, kb=kb):   # (the same window with the residual epilogue: hidden + it, "_rr")
+            TG.KWIN = (0, kb)
+            try:
+                return TG.gen(f, "kres", tr, False)
+            finally:
+                TG.KWIN = None
+        out.append(_emit_gen(gen_rem_rr, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d_rr.hal" % (fmt, kbw), outdir, "kres",
+                             tr.rowgrp, kfull=kb))
     for fmt, mt, kb in sorted({l["ffn_down"] for l in ok + pairs}):
         for passes in sorted({p for _, p in parts}):
             if NPU_Q:   # (Q': the site image of down's raw K (a part's), A bound to H; the NP 4 formats' at NP 4)
@@ -1388,6 +1397,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         with GN.np_override(NPU_NP if NPU_Q else 4):
             text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
                           dup=((calls - 1) * NPU_COLS, N - rows))
+            text_rr = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
+                             dup=((calls - 1) * NPU_COLS, N - rows), remres=True)
             nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
             # the same sum fused into the next layer's norm when it feeds a K = 5120 NPU site ("npu_unorm[_pk].hal",
             # gen_half_norm.gen_unorm: the norm_bfp stream, with _pk also the Q4_K-order one); needs the last down call's
@@ -1405,6 +1416,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     open(src, "w").write(text)
     E.emit(src, ["nop=0"], name + ".hal", outdir)
     out.append((name + ".hal", B * calls * NPU_COLS * nj // wg, wg, 0))
+    # (with npuffnrem_*_rr: the sum after the GPU's down added hidden in its epilogue, "_rr")
+    src = os.path.join(tmp, name + "_rr.loom")
+    open(src, "w").write(text_rr)
+    E.emit(src, ["nop=0"], name + "_rr.hal", outdir)
+    out.append((name + "_rr.hal", B * calls * NPU_COLS * nj // wg, wg, 0))
     dn4 = sorted({j[1].split("_")[-1] for j in jobs if j[1].startswith("npu_ffndn") and j[2] == 4 != NPU_NP})
     if dn4:   # (Q') the NP 4 downs' sum: 512-row calls at TN 64 ("npu_unpack_ffnblk_4.hal", "npuffnblk4")
         rows4, cg = NPU_COLS * 64, GU.CG
@@ -1414,6 +1430,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             with GN.np_override(4):
                 text = GU.gen(B, calls4 * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
                               dup=((calls4 - 1) * NPU_COLS, N - rows4))
+                text4_rr = GU.gen(B, calls4 * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
+                                  dup=((calls4 - 1) * NPU_COLS, N - rows4), remres=True)
                 nj4, wg4 = GN.TN // 8, GU.wg(calls4 * NPU_COLS)
         finally:
             GU.CG = cg
@@ -1421,6 +1439,10 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         open(src, "w").write(text)
         E.emit(src, ["nop=0"], name + "_4.hal", outdir)
         out.append((name + "_4.hal", B * calls4 * NPU_COLS * nj4 // wg4, wg4, 0))
+        src = os.path.join(tmp, name + "_4_rr.loom")
+        open(src, "w").write(text4_rr)
+        E.emit(src, ["nop=0"], name + "_4_rr.hal", outdir)
+        out.append((name + "_4_rr.hal", B * calls4 * NPU_COLS * nj4 // wg4, wg4, 0))
         out.append(("npuffnblk4", F, 256, rows4))
         for fmt in dn4:
             out.append(("npuffndn4_" + fmt, 1, 0, 0))
