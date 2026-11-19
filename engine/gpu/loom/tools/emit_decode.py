@@ -8,6 +8,8 @@ usage: emit_decode.py <model> <outdir> [max_context]       (default 4096, multip
                                  plain for the input projections and the head,
                                  resid for attn_output / ssm_out / ffn_down (residual add fused),
                                  swiglu for ffn_gate + ffn_up
+  gv_resid_<fmt>_<M>_<K>_kseg<w>_..  ffn_down's resid on K-segmented rows (gen_gemv kseg) for each F of
+                                 YAH_DECODE_KSEG (default 8192): a prefill set's YAH_NPU_DNSEG layout
   dattn_{kvappend,part,reduce}   tools/gen_decode_attn.py: attention over the paged fp16 KV pools of the prefill
   dattn_{kappend,vappend,part}_q only with a quantized YAH_KV (kv8 | kv4 | k8v4 | k4v8, same as the prefill set):
                                  the kv8a16 / kv4a16 pools; decode.txt gets "kv q KB VB"
@@ -29,6 +31,7 @@ LOOM = os.path.abspath(os.path.join(HERE, ".."))
 EMIT = os.path.join(LOOM, "emit_hal.py")
 sys.path.insert(0, HERE)
 import emit_prefill as EP  # noqa: E402  (GGUF tensor table)
+import emit_prefill_pp as EPP  # noqa: E402  (the NPU FFN block's K parts)
 import gen_decode_attn as DA  # noqa: E402
 import gen_chain  # noqa: E402
 import gen_decode_misc as DM  # noqa: E402
@@ -45,6 +48,9 @@ RW = {"plain": (4, 4), "resid": (4, 4), "swiglu": (2, 4), "bands": (2, 4)}
 # Chained GEMVs load and decode their first PEEL K iterations' weights before the wait (gen_gemv peel).
 PEEL = 1
 # The output GEMV also takes the greedy argmax (gen_gemv amax, decode.txt "amax"), instead of the argmax kernel.
+# The NPU FFN blocks' F values (emit_prefill_pp YAH_NPU_FFNBLK) whose K-segmented ffn_down rows (YAH_NPU_DNSEG) this set
+# reads: each 256-block down format's resid GEMV also in that layout (gen_gemv kseg, "<gv name>_kseg<widths>").
+KSEG_F = [int(f) for f in os.environ.get("YAH_DECODE_KSEG", "8192").split(",") if f]
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):
@@ -166,11 +172,18 @@ def main():
     # Loom may drop row clamps it proves redundant for this grid, so a larger grid reads out of bounds and can hang the GPU.
     grids = {}
     vocab = next(int(d[1]) for nm, d, _ in EP.parse(model) if nm == "output.weight")
+    downs = {(GV.GGML.get(ty), int(d[1]), int(d[0])) for nm, d, ty in EP.parse(model) if nm.endswith(".ffn_down.weight")}
     for name, (kind, fmts, M, K) in sorted(gs.items()):
         R, W = RW[kind]
         peel = (PEEL)
         emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel), name, outdir)
         grids[name] = M // GV.rows_per_wg(R, W)
+        if kind == "resid" and (fmts[0], M, K) in downs and GV.FMT[fmts[0]][0] == 256:
+            for F in KSEG_F:
+                kseg = GV.kseg_layout(K // 256, F, EPP.ffnblk_parts(F))
+                sname = name + GV.kseg_suffix(kseg)
+                emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, kseg=kseg), sname, outdir)
+                grids[sname] = grids[name]
         if ((kind == "plain") and (M == vocab)):   # the output GEMV
             aname = name.replace("gv_plain_", "gv_plainam_")
             emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, amax=True), aname, outdir)

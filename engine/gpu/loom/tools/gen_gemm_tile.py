@@ -273,6 +273,11 @@ SPLIT2 = False
 # KWIN = (kb_start, kb_total): a K window of an afrag tiled kstore, k_blocks (config) 256-wide blocks from kb_start of
 # kb_total-block weight rows and kb_total * 256-column activations (the NPU split's K remainder, emit_prefill_pp).
 KWIN = None
+# KSEG = [(first block, blocks)]: K-segmented weights (gen_gemv kseg_layout), the rows stored segment by segment
+# ([segment][row][its blocks]: block kb of row r of segment (k0, w) at (m_rows k0 + r w + kb - k0) block bytes); a
+# kstore / kres reads each K step's blocks from its segment, in the same order (bit-identical results). With KWIN
+# (kb_start 0): the window is segment 0, its rows w blocks apart (the NPU split's GPU K part).
+KSEG = None
 
 
 
@@ -642,7 +647,21 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     else:
         e("  %grow_i = scalar.addi %wg_row_i, %drow_i : i32")
     e("  %k_blocks_i = index.cast %k_blocks : index to i32")
-    if kwin:
+    if KSEG:
+        assert kind in ("kstore", "kres") and not (MX or ff or OSTRIDE or SPLIT2) and F.get("kdiv", 1) == 1, kind
+        assert not kwin or (kwin[0] == 0 and KSEG[0][0] == 0), (kwin, KSEG)
+        # segment s's row offset (m_rows - 1) k0 bb + grow w bb; block kb at it + kb bb (wblk)
+        e("  %ks_mr0_i = index.cast %m_rows : index to i32")
+        e("  %ks_one_i = scalar.constant 1 : i32")
+        e("  %ks_mr_i = scalar.subi %ks_mr0_i, %ks_one_i : i32")
+        for si, (k0, w) in enumerate(KSEG[:1] if kwin else KSEG):
+            e(f"  %ks_w{si}_i = scalar.constant {w * bb} : i32")
+            e(f"  %ks_r{si}_i = scalar.muli %grow_i, %ks_w{si}_i : i32")
+            e(f"  %ks_k{si}_i = scalar.constant {k0 * bb} : i32")
+            e(f"  %ks_c{si}_i = scalar.muli %ks_mr_i, %ks_k{si}_i : i32")
+            e(f"  %row_off_s{si} = scalar.addi %ks_r{si}_i, %ks_c{si}_i : i32")
+        e("  %row_off_i = scalar.addi %row_off_s0, %ks_k0_i : i32")   # (segment 0: k0 0)
+    elif kwin:
         e(f"  %ckbt_i = scalar.constant {kwin[1]} : i32")
         e("  %bpr_i = scalar.muli %ckbt_i, %cbbi : i32")
         e("  %row_off_i0 = scalar.muli %grow_i, %bpr_i : i32")
@@ -740,6 +759,17 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e(f"    %as{sg} = index.add %aseg0, %as{sg}c : index")
             e(f"    vector.store {nm}, {view}[%atok, %as{sg}] : vector<8xf16>, view<{BN}x{arow}xf16>")
 
+    def wblk(ind, dst, kbi, off):
+        """%dst = block kbi's byte offset (off = kbi bb) in this lane's weight row: KSEG, its segment's row offset."""
+        base = "%row_off_i"
+        if KSEG and not kwin:
+            for si, (k0, _) in enumerate(KSEG[1:], 1):
+                e(f"{ind}%{dst}_k{si} = scalar.constant {k0} : i32")
+                e(f"{ind}%{dst}_lt{si} = scalar.cmpi ult, {kbi}, %{dst}_k{si} : i32")
+                e(f"{ind}%{dst}_ro{si} = scf.select %{dst}_lt{si}, {base}, %row_off_s{si} : i32")
+                base = f"%{dst}_ro{si}"
+        e(f"{ind}%{dst} = scalar.addi {base}, {off} : i32")
+
     if DECAHEAD:
         # phase 0 decoded into weight tile 0 now; phase 1's bytes carried
         L0, w00 = loads("pf_", "%row_off_i", "%gl_i")
@@ -754,7 +784,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %kb1_i = index.cast %kb1 : index to i32")
         e("  %ph1_i = index.cast %ph1 : index to i32")
         e("  %blk1o = scalar.muli %kb1_i, %cbbi : i32")
-        e("  %blk1 = scalar.addi %row_off_i, %blk1o : i32")
+        wblk("  ", "blk1", "%kb1_i", "%blk1o")
         e("  %gb1g = scalar.muli %ph1_i, %cgppi : i32")
         e("  %gb1 = scalar.addi %gb1g, %gl_i : i32")
         L1, wv0 = loads("p1_", "%blk1", "%gb1")
@@ -777,7 +807,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %kb1_i = index.cast %kb1 : index to i32")
         e("  %ph1_i = index.cast %ph1 : index to i32")
         e("  %blk1o = scalar.muli %kb1_i, %cbbi : i32")
-        e("  %blk1 = scalar.addi %row_off_i, %blk1o : i32")
+        wblk("  ", "blk1", "%kb1_i", "%blk1o")
         e("  %gb1g = scalar.muli %ph1_i, %cgppi : i32")
         e("  %gb1 = scalar.addi %gb1g, %gl_i : i32")
         L1, wv0 = loads("p1_", "%blk1", "%gb1")
@@ -936,7 +966,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("    %kb_ni = index.cast %kb_n : index to i32")
         e("    %ph_ni = index.cast %ph_n : index to i32")
         e("    %blk_off0n = scalar.muli %kb_ni, %cbbi : i32")
-        e("    %blk_n = scalar.addi %row_off_i, %blk_off0n : i32")
+        wblk("    ", "blk_n", "%kb_ni", "%blk_off0n")
         e("    %phg_n = scalar.muli %ph_ni, %cgppi : i32")
         e("    %gb_n = scalar.addi %phg_n, %gl_i : i32")
         Ln, nxt = loads("nx_", "%blk_n", "%gb_n")

@@ -461,6 +461,12 @@ class LoomDecoder {
       b.push_back(TRef(w));
     }
     name += "_" + std::to_string(M) + "_" + std::to_string(K);
+    // K-segmented rows (LoomWeights KSegOf: a prefill set's YAH_NPU_DNSEG): the GEMV of that layout ("_kseg<widths>",
+    // emit_decode YAH_DECODE_KSEG)
+    if (const KSeg* ks = ws.size() == 1 ? weights_.KSegOf(*Find(ws[0])) : nullptr) {
+      name += "_kseg";
+      for (std::size_t i = 0; i < ks->size(); ++i) name += (i ? "_" : "") + std::to_string((*ks)[i].second);
+    }
     PushTables(tbits, &b);
     if (x.size < std::size_t{K} * 4 || y.size < std::size_t{M} * 4) throw LoomError("GEMV operand too small: " + name);
     b.push_back({x.handle, 0, std::size_t{K} * 4});

@@ -61,7 +61,7 @@ class Engine : public TextGenerator {
         gguf_(core::Gguf::OpenResident(o.model)),
         cfg_(core::Qwen35Config::FromGguf(gguf_)),
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
-        weights_(gpu_, gguf_, MtpLayer(cfg_), NpuWeights(o)),
+        weights_(gpu_, gguf_, MtpLayer(cfg_), NpuWeights(o), LoomPrefill::DownKSegs(o.prefill_hal, gguf_)),
         prefill_(gpu_, gguf_, cfg_, o.prefill_hal, weights_),
         decoder_(gpu_, gguf_, cfg_, o.decode_hal, weights_) {
     if (decoder_.context() != prefill_.pool_rows())

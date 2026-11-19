@@ -97,6 +97,8 @@ class Gguf {
   // A device backend copies exactly this region and rebases every TensorRef by the pointer delta.
   [[nodiscard]] const std::uint8_t* tensor_data_base() const { return base_ + data_offset_; }
   [[nodiscard]] std::size_t tensor_data_size() const { return size_ - data_offset_; }
+  // OpenResident's copy: the tensor data is writable memory of this process (a device may rewrite it before its upload).
+  [[nodiscard]] bool resident() const { return static_cast<bool>(fill_); }
   [[nodiscard]] std::size_t metadata_count() const { return meta_.size(); }
   [[nodiscard]] const std::uint8_t* Data(const TensorInfo& tensor) const {
     return base_ + data_offset_ + tensor.offset;

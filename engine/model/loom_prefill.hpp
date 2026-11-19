@@ -54,6 +54,32 @@ class LoomPrefill {
   static constexpr std::uint32_t kHeads = 24, kKvHeads = 4, kHeadDim = 256, kVocab = 248320;
   static constexpr std::uint32_t kKvRow = kKvHeads * kHeadDim;  // one KV cache row: all KV heads of one token
 
+  // The K-segmented ffn_down tensors of the set in dir (dispatch.txt "npudnseg_<fmt> <F> <m tiles> <k blocks>",
+  // emit_prefill_pp YAH_NPU_DNSEG): every ffn_down of such a format and shape, its segments the GPU's K part [0,
+  // K - F) and the NPU's K parts (FfnBlkParts) in order. LoomWeights holds these rows so; the set's kernels read them so.
+  static std::map<std::string, KSeg> DownKSegs(const std::string& dir, const core::Gguf& gguf) {
+    std::ifstream f(dir + "/dispatch.txt");
+    std::map<std::string, Geom> seg;   // fmt -> (F, m tiles, k blocks)
+    std::string name;
+    Geom g{};
+    while (f >> name >> g.tokens >> g.rowgrp >> g.tt)
+      if (name.starts_with("npudnseg_")) seg[name.substr(9)] = g;
+    std::map<std::string, KSeg> out;
+    for (const auto& t : gguf.tensors()) {
+      Fmt fm{};
+      if (!t.name.ends_with(".ffn_down.weight") || !FmtOf(static_cast<std::uint32_t>(t.type), &fm)) continue;
+      const auto it = seg.find(fm.name);
+      if (it == seg.end() || t.dims[1] != std::uint64_t{it->second.rowgrp} * 16 ||
+          t.dims[0] != std::uint64_t{it->second.tt} * 256)
+        continue;
+      const std::uint32_t F = it->second.tokens, kb = it->second.tt;
+      KSeg s{{0, kb - F / 256}};
+      for (const auto& [p0, passes] : FfnBlkParts(F)) s.push_back({kb - F / 256 + 4 * p0, 4 * passes});
+      out[t.name] = std::move(s);
+    }
+    return out;
+  }
+
   // Called after RoPE of attention layer ai in chunk ci, with the layer's f16 K and V offsets in the KV scratch.
   using KvHook = std::function<void(std::uint32_t ai, std::uint32_t ci, std::size_t koff, std::size_t voff)>;
 
@@ -1180,13 +1206,17 @@ class LoomPrefill {
     };
     const auto col_rows = [&](const auto* t) { return ColRows{base + t->offset, static_cast<std::size_t>(t->bytes) / M}; };
     const ColRows cg = cpair ? col_rows(tg) : ColRows{}, cu = cpair ? col_rows(tu) : ColRows{};
-    // (dispatch.txt "npudnslab", emit_prefill_pp YAH_NPU_DNSLAB) the down images read their K part's rows contiguous:
-    // srb bytes a row, from the slab copy of the NPU's K window (DownSlabs); else the GGUF's rows (rbd apart)
-    const bool slab = geom_.count("npudnslab") != 0;
-    const std::size_t srb = slab ? std::size_t{parts[0].second} * 4 * blkd : rbd;
-    const std::uint8_t* ps = slab ? DownSlabs(pre, *td, rbd, srb, f0 / 256, parts, blkd)
-                                  : nullptr;
-    const std::size_t slab_bytes = parts.size() * static_cast<std::size_t>(td->dims[1]) * srb + 8192;
+    // (dispatch.txt "npudnseg_<fmt>", emit_prefill_pp YAH_NPU_DNSEG) down's rows in K segments (LoomWeights KSegOf):
+    // the down images read their K part's segment, srb bytes a row; else the GGUF's rows (rbd apart)
+    const KSeg* ks = weights_.KSegOf(*td);
+    if ((ks != nullptr) != (geom_.count("npudnseg_" + std::string(fd.name)) != 0))
+      throw LoomError("prefill: " + pre + "ffn_down's K segments differ from the set's (DownKSegs)");
+    for (std::size_t ci = 0; ks && ci < parts.size(); ++ci)
+      if (ks->size() != parts.size() + 1 ||
+          (*ks)[ci + 1] != std::pair<std::uint32_t, std::uint32_t>{static_cast<std::uint32_t>(f0 / 256 + 4 * parts[ci].first),
+                                                                   4 * parts[ci].second})
+        throw LoomError("prefill: " + pre + "ffn_down's K segments are not the FFN block's parts");
+    const std::size_t srb = ks ? std::size_t{parts[0].second} * 4 * blkd : rbd;
     if (npu_planning_) {   // the NPU's gate / up rows (one range when up follows gate), all of down
       const std::size_t end = gguf_.tensor_data_size();
       if (bmix) {
@@ -1195,10 +1225,7 @@ class LoomPrefill {
         const std::size_t a = tg->offset + f0 * rb;
         npu_->RegisterRaw(base + a, std::min<std::size_t>(tu->offset + tu->bytes + 4096, end) - a);
       }
-      if (slab)
-        npu_->RegisterRaw(ps, slab_bytes);
-      else
-        npu_->RegisterRaw(pd, std::min<std::size_t>(td->bytes + 4096, end - td->offset));
+      npu_->RegisterRaw(pd, std::min<std::size_t>(td->bytes + 4096, end - td->offset));
     }
     std::vector<std::uint32_t> csw;
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
@@ -1246,7 +1273,8 @@ class LoomPrefill {
         const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + 4 * p0;
         cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", dn[ci] + ".xdna", DecoderId(fd.name),
                                         {qffn ? ci * qpart : std::size_t{p0} * 4 * 128 * 144, bd.a, true},
-                                        slab ? ps + (ci * td->dims[1] + r0) * srb : pd + r0 * rbd + k0 * blkd,
+                                        ks ? pd + td->dims[1] * (*ks)[ci + 1].first * blkd + r0 * srb
+                                           : pd + r0 * rbd + k0 * blkd,
                                         (rows - 1) * srb + 16 * blkd + RecordRow(fd.name),
                                         {doff + (ci * calls + r) * cp, cp}, fam));
       }
@@ -2476,30 +2504,6 @@ class LoomPrefill {
     return bfp_[file] = static_cast<std::uint8_t*>(p);
   }
   std::map<std::string, std::uint8_t*> bfp_;
-  // (dispatch.txt "npudnslab") a down tensor's NPU K window as K-part slabs, once a tensor: part ci (K features
-  // f0 + 1024 p0 + [0, 1024 passes)) row n at (ci n_rows + n) srb, the GGUF row's bytes from super-block k0 + 4 p0;
-  // anonymous pages (8192 B over-read room). The same bytes, so the decode is the same.
-  // The rows come from the GPU's copy (the host's is released after the upload, LoomWeights).
-  const std::uint8_t* DownSlabs(const std::string& pre, const core::TensorInfo& td, std::size_t rbd, std::size_t srb,
-                                std::size_t k0, const std::vector<std::pair<std::uint32_t, std::uint32_t>>& parts,
-                                std::size_t blkd) {
-    const std::string key = "dnslab:" + pre;
-    if (const auto it = bfp_.find(key); it != bfp_.end()) return it->second;
-    const std::size_t n_rows = static_cast<std::size_t>(td.dims[1]);
-    std::vector<std::uint8_t> rows(static_cast<std::size_t>(td.bytes));
-    gpu_.D2H(TRef(td), rows.data());
-    const std::uint8_t* pd = rows.data();
-    const std::size_t bytes = parts.size() * n_rows * srb + 8192;
-    void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) throw LoomError("prefill: no memory for " + key);
-    auto* d = static_cast<std::uint8_t*>(p);
-    for (std::size_t ci = 0; ci < parts.size(); ++ci) {
-      if (std::size_t{parts[ci].second} * 4 * blkd != srb) throw LoomError("prefill: " + key + " parts differ in size");
-      const std::uint8_t* s = pd + (k0 + 4 * std::size_t{parts[ci].first}) * blkd;
-      for (std::size_t n = 0; n < n_rows; ++n) std::memcpy(d + (ci * n_rows + n) * srb, s + n * rbd, srb);
-    }
-    return bfp_[key] = d;
-  }
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far
   std::size_t npu_cleared_ = 0;    // flagged_ jobs whose flag words NpuJoin cleared
   std::size_t npu_joined_ = 0;     // flagged_ jobs an NpuJoin waited for (in order)

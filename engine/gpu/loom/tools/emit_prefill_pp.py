@@ -9,7 +9,7 @@ HAL names follow emit_prefill.py.
 
 usage: emit_prefill_pp.py <model.gguf> <outdir> [tokens]   (default 2048 tokens)
 """
-import dataclasses, functools, json, os, re, subprocess, sys, shutil
+import contextlib, dataclasses, functools, json, os, re, subprocess, sys, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -649,6 +649,7 @@ def seg_gemms(rows, B, outdir):
         """Emit one segmented GEMM; return its dispatch.txt row."""
         texts = []
         for i, ((fmt, mt, kb), kind, small) in enumerate(segs):
+            assert (fmt, mt, kb) not in DNSEG, "a segmented GEMM over K-segmented down rows"
             t = _seg_tile(fmt, kind, mt, kb, small, light if i and not small else None)
             TG.check(t)
             TG.OUT16 = kind == "kstore" and mt in O16_MT
@@ -713,9 +714,10 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
         # the persistent kres (gen_kres_persist): grid y = 1, each workgroup runs every token tile of its row block
         # persist: True, or a dict of knobs for the persistent variant (its slice loads need registers: IQ3_S drops b0early 2)
         pt = dataclasses.replace(t, **persist) if isinstance(persist, dict) else t
-        text = gen_kres_persist.persist(TG.gen(fmt, "kres", pt, False),
-                                        TG.gen(fmt, "kstore", dataclasses.replace(pt, respre=0), False), B // t.bn,
-                                        place=pt.pslice)
+        with kseg_for(fmt, mt, kb):
+            text = gen_kres_persist.persist(TG.gen(fmt, "kres", pt, False),
+                                            TG.gen(fmt, "kstore", dataclasses.replace(pt, respre=0), False), B // t.bn,
+                                            place=pt.pslice)
         r = _emit_gen(lambda f, k: text, t.bn, fmt, mt, kb, B, out[:-4] + ".af.p.hal", outdir, kind, t.rowgrp)
         if r:
             rows.append(r)
@@ -839,11 +841,38 @@ NPU_KCALL = 8 * sum(NPU_KS) * NPU_PASSES   # K per call (5120)
 # Tried, not kept: the GPU window's residual epilogue waiting for the NPU (npuffnres): only 20 of its workgroups fit at
 # once, so while the NPU is the late one the rest of the GPU's down starts after the NPU's (~5 ms a layer).
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
-# YAH_NPU_DNSLAB (Q', default 1): the down images read K = S rows (kraw 0) from the engine's slab copy of the NPU's K window
-# ([part][row][S / 256 super-blocks], LoomPrefill::DownSlabs; dispatch.txt "npudnslab"): one contiguous raw block a
-# column a call instead of 80 runs of S / 256 super-blocks at the 17408-wide row stride (11-19: the strided read's
-# DDR stalls, ~70K cycles a down call; the copy ~22 MB of host memory a layer)
-NPU_DNSLAB = os.environ.get("YAH_NPU_DNSLAB", "1") == "1"   # (0: the GGUF rows, 17408 wide)
+# YAH_NPU_DNSEG (Q', default 1): ffn_down's rows in K segments, reordered in place at load ([segment][row][its blocks]:
+# the GPU's K part, then each NPU K part, gen_gemv.kseg_layout; LoomWeights, dispatch.txt "npudnseg_<fmt> <F>"). The
+# down images read a part's rows contiguous (kraw 0): one raw block a column a call instead of 80 runs of S / 256
+# super-blocks at the 17408-wide row stride (11-19: the strided read's DDR stalls, ~70K cycles a down call, ~22K
+# contiguous). Every GPU kernel over those weights reads each block from its segment (gen_gemm_tile.KSEG, gen_gemv
+# kseg; bit-identical results); no memory beyond the model's.
+NPU_DNSEG = os.environ.get("YAH_NPU_DNSEG", "1") == "1"   # (0: the GGUF rows, 17408 wide)
+DNSEG = {}   # {(fmt, m_tiles, k_blocks): K segments} of the K-segmented down weights (main, dnseg_plan)
+
+
+def dnseg_plan(rows):
+    """DNSEG for YAH_NPU_DNSEG with the Q' FFN block: every ffn_down whose format both GEMM generators read with
+    K segments (one segment layout per format and shape: each format's down GEMMs and GEMVs read them all)."""
+    import gen_gemm_tile as TG
+    if not (NPU_DNSEG and NPU_FFNBLK and NPU_Q and NPU_QP1K):
+        return
+    for nm, dims, ty in rows:
+        if nm.endswith(".ffn_down.weight") and E.FMT.get(ty):
+            fmt, mt, kb = E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2]
+            if fmt in TG.G.FMTS and TG.G.FMTS[fmt].get("kdiv", 1) == 1 and gen_gemv.FMT.get(fmt, (0,))[0] == 256:
+                DNSEG[(fmt, mt, kb)] = gen_gemv.kseg_layout(kb, NPU_FFNBLK, ffnblk_parts(NPU_FFNBLK))
+
+
+@contextlib.contextmanager
+def kseg_for(fmt, mt, kb):
+    """gen_gemm_tile.KSEG while a GEMM over (fmt, mt, kb) weights is generated (kb: whole rows' k_blocks)."""
+    import gen_gemm_tile as TG
+    TG.KSEG = DNSEG.get((fmt, mt, kb))
+    try:
+        yield
+    finally:
+        TG.KSEG = None
 # (Q' P1K) the formats whose site images are NP 4 (512-row calls: the grid decoders' tables, Q4_K's program and Q5_K's
 # raw ring do not fit an NP 5 core): those layers' sites take NPU rows rounded down to 512 (npu_rows4) and their own
 # unpacks / conv split at TN 64 ("<hal>_4.hal"); dispatch.txt "npusplit4_<site>", "npurows4", "npubytes4_5120",
@@ -1402,7 +1431,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         for passes in sorted({p for _, p in parts}):
             if NPU_Q:   # (Q': the site image of down's raw K (a part's), A bound to H; the NP 4 formats' at NP 4)
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, 4 * passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
-                                       kraw=0 if NPU_DNSLAB else kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1,
+                                       kraw=0 if (fmt, mt, kb) in DNSEG else kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1,
                                        gord="GF" if fmt == "q4k" else "P4"),   # (H in P4 order)
                              "npu_ffndn%d_%s" % (passes, fmt), 4 if np4(fmt) else NPU_NP))
                 continue
@@ -1540,8 +1569,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     out.append(("npuffnblk", F, 256, rows))   # F, gate / up features per call, down rows
     if NPU_Q:
         out.append(("npuffnq", 1, 0, 0))
-        if NPU_DNSLAB:
-            out.append(("npudnslab", 1, 0, 0))
+        for fmt, mt, kb in sorted(DNSEG):   # (the engine reorders these formats' down rows: LoomWeights)
+            out.append(("npudnseg_%s" % fmt, F, mt, kb))
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):
         out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
@@ -1589,7 +1618,7 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
     try:
-        with open(src, "w") as fh:
+        with open(src, "w") as fh, kseg_for(fmt, mt, kfull or kb):
             fh.write(gen(fmt, kind))
     finally:
         _TG.OSTRIDE = 0
@@ -1658,6 +1687,7 @@ def main():
     KC = T * 4 * 256          # KV cache elements: T rows x 4 kv heads x 256
     os.makedirs(outdir, exist_ok=True)
     rows = E.parse(model)
+    dnseg_plan(rows)
     combos = gemm_combos(rows)
     types = {nm: ty for nm, _, ty in rows}
     # R2P_LAZY (gen_attn_fa: lazy rescale threshold, nats) 5, as the npu branch: 2 x 32 busiest SQ +0.8 at 126K on real
@@ -1693,6 +1723,7 @@ def main():
                 geom.extend(afrag_variants(fmt, mt, kb, B, name(k), outdir, k))
             elif k == "kstore" and fmt == "q2k":
                 # Q2_K has no tile decoder; its only tensors here are the 48-row ssm_alpha / ssm_beta.
+                assert (fmt, mt, kb) not in DNSEG, "the hand-written Q2_K GEMM reads GGUF rows"
                 sym = E.sym_of("yah_ffn_gemm_q2k_f32.loom")
                 E.emit("yah_ffn_gemm_q2k_f32.loom", ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb),
                                                      "%s.token_tiles=%d" % (sym, TT)], name(k), outdir)

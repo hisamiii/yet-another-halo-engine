@@ -94,8 +94,10 @@ class E:
         return nm
 
 
-def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=0, amax=False):
-    """amax (plain): also the argmax of y into a token (bindings ak: u64 key + i32 counter, tok: i32 after y; amax_tail).
+def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=0, amax=False, kseg=None):
+    """kseg (K-segmented weights, kseg_layout): [(first block, blocks)] covering K's 256-wide blocks, the weight rows
+    stored segment by segment ([segment][row][its blocks]); the same loop and summation order (bit-identical results).
+    amax (plain): also the argmax of y into a token (bindings ak: u64 key + i32 counter, tok: i32 after y; amax_tail).
     peel: the first peel K iterations run before the loop, their weight loads and decode (which do not read x) ahead
     of a "// chain.wait" marker (gen_chain puts the producer wait there), the x part after it (the same ops)."""
     assert kind in ("plain", "resid", "swiglu")
@@ -686,10 +688,19 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=
     b(f"  %row0 = index.mul %wid, {e.ci(R)} : index")
     S = [lane_setup(f, f"f{i}") for i, f in enumerate(fmts)]
     # row byte bases: row (row0 + r) * row_bytes + lane block offset
+    if kseg:
+        assert len(fmts) == 1 and FMT[fmts[0]][0] == 256 and kseg_ok(kseg, K), kseg
     for i, f in enumerate(fmts):
         rb = row_bytes(f, K)
         for r in range(R):
             b(f"  %f{i}row{r} = index.add %row0, {e.ci(r)} : index")
+            if kseg:   # segment s: (M - 1) k0 bb + row w bb + lane block offset (+ t 2 bb in the loop)
+                bb = FMT[f][1]
+                for si, (k0, w) in enumerate(kseg):
+                    b(f"  %f{i}rb{r}s{si} = index.mul %f{i}row{r}, {e.ci(w * bb)} : index")
+                    b(f"  %f{i}rc{r}s{si} = index.add %f{i}rb{r}s{si}, {e.ci((M - 1) * k0 * bb)} : index")
+                    b(f"  %f{i}base{r}s{si} = index.add %f{i}rc{r}s{si}, %f{i}lboff : index")
+                continue
             b(f"  %f{i}rb{r} = index.mul %f{i}row{r}, {e.ci(rb)} : index")
             b(f"  %f{i}base{r} = index.add %f{i}rb{r}, %f{i}lboff : index")
     b(f"  %xl16 = index.mul %lane, {e.ci(16)} : index")
@@ -707,7 +718,14 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=
         for r in range(R):
             p = f"d{i}_{r}"
             b(f"    %{p}to = index.mul %t, {e.ci(S[i]['tstep'])} : index")
-            b(f"    %{p}bo = index.add %f{i}base{r}, %{p}to : index")
+            base = f"%f{i}base{r}"
+            if kseg:   # the step's segment (its two blocks share one: segments start on even blocks)
+                base = f"%f{i}base{r}s0"
+                for si, (k0, _) in enumerate(kseg[1:], 1):
+                    b(f"    %{p}in{si} = index.cmp uge, %t, {e.ci(k0 // 2)} : index")
+                    b(f"    %{p}bs{si} = scf.select %{p}in{si}, %f{i}base{r}s{si}, {base} : index")
+                    base = f"%{p}bs{si}"
+            b(f"    %{p}bo = index.add {base}, %{p}to : index")
             q, scale, offs = decode_w(f, S[i], p, f"%wv{i}", f"%wh{i}", wnb[i], f"%{p}bo", f"f{i}")
             b(f"    %{p}qf = vector.uitofp {q} : vector<16xi8> to vector<16xf32>")
             b(f"    %{p}pr = vector.mulf %{p}qf, {xa} : vector<16xf32>")
@@ -807,6 +825,28 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=
     out += body
     o("}")
     return "\n".join(out) + "\n"
+
+
+def kseg_layout(kb, f_npu, parts):
+    """The K segments of a weight whose last f_npu columns the NPU reads in parts ([(first pass, passes)], a pass 4
+    blocks; emit_prefill_pp ffnblk_parts): [(0, the GPU's blocks)] + [(its first block, its blocks)] a part."""
+    g = kb - f_npu // 256
+    return [(0, g)] + [(g + 4 * p0, 4 * n) for p0, n in parts]
+
+
+def kseg_ok(kseg, K):
+    """Segments that tile K's 256-wide blocks in order, each starting on an even block (a GEMV step's two blocks)."""
+    k = 0
+    for k0, w in kseg:
+        if k0 != k or w <= 0 or k0 % 2:
+            return False
+        k += w
+    return k * 256 == K
+
+
+def kseg_suffix(kseg):
+    """A kernel name's suffix for K-segmented weights: "_kseg" and the segments' block counts."""
+    return "_kseg" + "_".join(str(w) for _, w in kseg) if kseg else ""
 
 
 def peel_loop(body, e, res, accs, inits, nxt, peel):
