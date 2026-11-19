@@ -65,6 +65,54 @@ def qsw_h(g, u):
     return (fp + t * fqb).astype(np.float32)
 
 
+def qsw5_feats(cols=8):
+    """(NP 5 gate / up, gen_npu_q qsw5) call 0's features in H order: pass b, slot c (k-block P8[c]), 8 features."""
+    import gen_npu_q as Q
+    return [256 * b + 8 * Q.QSW5_P8[c] + t for b in range(5) for c in range(cols) for t in range(8)]
+
+
+def qsw5_check(hraw, av, wq, D, cols, nb, hpass):
+    """NPU_QSW at NP 5: H [M block][hpass passes][16-token row][32 slots][token half][8 x [E][8 m]], call 0's records
+    at slots 0 .. 7 of passes 0 .. 4 (wq rows: qsw5_feats' gate rows, then their up rows), every other byte 0."""
+    F = wq.shape[0] // 2
+    s_ = av.astype(np.float64) @ wq.T.astype(np.float64)
+    h = qsw_h(s_[:, :F].astype(np.float32), s_[:, F:].astype(np.float32))   # [tokens][F]: (b, c, t)
+    hh = np.zeros((nb, hpass, N.MP, 32, 2, 8, 8), np.float32)
+    hh[:, :5, :, :cols] = h.reshape(nb, N.MP, 2, 8, 5, cols, 8).transpose(0, 4, 1, 5, 2, 3, 6)
+    want = D.Q.bfp_hw(np.ascontiguousarray(hh).reshape(-1, 8, 8)).reshape(-1)
+    got = hraw[:want.size]
+    bad = np.flatnonzero(got != want)
+    print(f"NPU_QSW H (NP 5): {got.size} bytes, {bad.size} differ ({bad.size / got.size:.2e}); call 0's "
+          f"{np.count_nonzero(hh)} values")
+    if bad.size and os.environ.get("NPU_QSW5_DIAG"):   # (diag) each output feature's best matching sum column
+        df_ = open(os.environ["NPU_QSW5_DIAG"], "w")   # (the file the diagnostic goes to)
+        gv = got.reshape(nb, hpass, N.MP, 32, 2, 8, 9)[:, :5, :, :cols].astype(np.int64)
+        gm = gv[..., 1:].astype(np.uint8).view(np.int8).astype(np.float64) * np.exp2(gv[..., :1] - 133)
+        G = gm.transpose(0, 2, 4, 5, 1, 3, 6).reshape(nb * N.MP * 16, 5, cols, 8)   # [token][b][c][f]
+        gb_ = bf16(s_[:, :F].astype(np.float32))   # (the error rate by |g|'s table piece)
+        la_ = np.clip((gb_.view(np.uint32) >> 16) & 0x7FFF, N.SL_LO, N.SL_HI) - N.SL_LO
+        Gh = G.reshape(G.shape[0], -1)
+        ok_ = np.isclose(Gh, h, rtol=2e-2, atol=1e-30)
+        for lo_, hi_ in ((0, 1024), (1024, 1440), (1440, 1792), (1792, 1840)):
+            m_ = (la_ >= lo_) & (la_ < hi_)
+            print(file=df_, *[f"  table entries {lo_} .. {hi_}: {m_.sum()} values, {(~ok_[m_]).mean() if m_.any() else 0:.3f} wrong"])
+        R = np.concatenate([s_, h], 1)   # (sum columns: gate, up of qsw5_feats' order, then h)
+        Rn = (R - R.mean(0)) / (R.std(0) + 1e-30)
+        for b_ in range(5):
+            for c_ in range(cols):
+                x = G[:, b_, c_]
+                xn = (x - x.mean(0)) / (x.std(0) + 1e-30)
+                cc = xn.T @ Rn / x.shape[0]
+                best = cc.argmax(1)
+                print(file=df_, *[f"  b {b_} c {c_}: want {[8 * (cols * b_ + c_) + t for t in range(8)]} best "
+                      f"{best.tolist()} corr {np.round(cc.max(1), 2).tolist()}"])
+    if bad.size:
+        rec = bad // 144
+        print(f"  first: byte {bad[0]} (slot record {rec[0]} of [block][pass][row][slot]) got {got[bad[0]]} want "
+              f"{want[bad[0]]}; slots hit {np.unique(rec % 32)[:12]}, passes {np.unique(rec // 32 // N.MP % hpass)}")
+    return 0 if bad.size == 0 else 1
+
+
 def qsw_check(hraw, av, wq, D, cols, nb, hpass):
     """NPU_QSW: H ([M block][call of hpass, this one 0][slab][column][576 B]; 576 B: k-blocks in P4 order, token
     halves, 8 x [E][8 m]; the other calls' records must stay 0) against the model:
@@ -143,7 +191,7 @@ def main():
         t = next(x for x in rd.tensors if x.tensor_type.name == fmt and len(x.shape) == 2
                  and int(x.shape[0]) == KR and int(x.shape[1]) >= Nn)
         if qsw:   # W = [gate rows][up rows], N / 2 each; the raw stream's up rows dgu bytes after the gate rows
-            assert QMODE and N.NP == 4 and not k0r
+            assert QMODE and N.NP in (4, 5) and not k0r
             ts_ = {x.name: x for x in rd.tensors}
             lay_ = os.environ.get("NPU_QSW_LAYER") or next(
                 n_.split(".")[1] for n_ in ts_ if n_.endswith("ffn_gate.weight") and ts_[n_].tensor_type.name == fmt
@@ -163,10 +211,13 @@ def main():
                                           ugord=os.environ.get("NPU_QSW_UGORD") or ("GF" if ufmt_ == "Q4_K" else "P4"),
                                           hpass=int(os.environ.get("NPU_QSW_HPASS", "2")))
             else:
-                wraw = np.concatenate([np.asarray(x.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn // 2]
+                nr_ = 1280 if N.NP == 5 else Nn // 2   # (NP 5: call 0 reads rows of 5 passes, qsw5_feats)
+                wraw = np.concatenate([np.asarray(x.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:nr_]
                                        for x in (tg_, tu_)])
-                cfg = dataclasses.replace(cfg, qsw=True, dgu=Nn // 2 * KR // 256 * D.BLK, swcol=32, hord="P4",
-                                          hpass=int(os.environ.get("NPU_QSW_HPASS", "2")))   # (H: this call is call 0)
+                cfg = dataclasses.replace(cfg, qsw=True, dgu=nr_ * KR // 256 * D.BLK, swcol=32 if N.NP == 4 else 40,
+                                          hord="P4", hpass=int(os.environ.get("NPU_QSW_HPASS",
+                                                                              "2" if N.NP == 4 else "5")))   # (H: call 0)
+                assert N.NP == 4 or cfg.hpass >= 5
             if int(os.environ.get("NPU_QSW_GAP", "0")):   # the up rows NPU_QSW_GAP rows past the gate rows (the
                 cfg = dataclasses.replace(cfg, dgu=int(os.environ["NPU_QSW_GAP"]) * KR // 256 * D.BLK)   # engine: M)
         else:
@@ -176,7 +227,11 @@ def main():
             D = N.decoder(fmt, cfg.gord)
             wf = np.concatenate([D.weights(np.ascontiguousarray(wrawg)).reshape(Nn // 2, K), wfu])
         else:
-            wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32
+            wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(-1, K)   # exact f32
+            if qsw and N.NP == 5:   # (the rows call 0 computes: qsw5_feats' gate rows, then their up rows)
+                f5_ = qsw5_feats(Nn // N.TN)
+                wf = wf[f5_ + [wf.shape[0] // 2 + f for f in f5_]]
+            assert wf.shape[0] == Nn
         frag = wf.reshape(Nn // 8, 8, K // 8, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
         bb = D.Q.bfp_hw(frag).reshape(-1, 8, 9)                    # per row [E][8 mantissas]
         mq = bb[:, :, 1:].copy().view(np.int8).astype(np.float64)
@@ -343,6 +398,7 @@ def main():
         r_ = subprocess.run([hrx_paths.LOOM_COMPILE, src, f"--root=@{cfg.entry}",
                              "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11", f"--output={img}"],
                             env=dict(env, LOOM_DIAG_PC="1"), capture_output=True, text=True)
+        open(os.path.join(work, "npu_gemm.stderr"), "w").write(r_.stderr)   # (the whole log: a failure's trace too)
         open(os.path.join(work, "npu_gemm.pcdiag"), "w").write(
             "".join(ln + "\n" for ln in r_.stderr.splitlines() if ln.split()[:1] in (["PCBLOCKS"], ["PCTEXT"], ["PCACQ"])))
         for ln in r_.stderr.splitlines():   # (diag, HRX pin: LOOM_EXP_TRACE_SHIM in NPU_ENV_ADD) the shim DMA choices
@@ -361,7 +417,7 @@ def main():
         wq, wf = wq[idx_], wf[idx_]
     sa, sw, sc = N.stream_bytes(cfg)
     if qsw:   # H: [M block][call][slab][column][576 B]
-        sc = nb * cfg.hpass * N.MP * cols * N.SW_REC
+        sc = nb * cfg.hpass * N.MP * (4608 if N.NP == 5 else cols * N.SW_REC)
     a_in = a
     if fuse == 2:   # the decoders emit each pass's k-blocks in panel order (gen_npu_dec.KPERM): A follows
         kperm = np.concatenate([128 * p + D.KPERM for p in range(K // 1024 if QMODE else passes)])
@@ -537,7 +593,8 @@ def main():
               f"{mma} MMAs -> MMA share {mma / med:.1%}; first block done at {last[0]}")
         sys.exit(0)
     if qsw:
-        sys.exit(qsw_check(np.fromfile(co, np.uint8), value(a), wq, D, cols, nb, cfg.hpass))
+        sys.exit((qsw5_check if N.NP == 5 else qsw_check)(np.fromfile(co, np.uint8), value(a), wq, D, cols, nb,
+                                                         cfg.hpass))
     raw = (np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32)   # bf16 C
     if os.environ.get("NPU_AONEHOT"):   # (diag) per token (= k): how many features match the panel
         ko = int(os.environ["NPU_AONEHOT"])

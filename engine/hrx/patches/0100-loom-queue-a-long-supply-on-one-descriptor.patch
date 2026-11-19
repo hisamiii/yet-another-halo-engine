@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:00:00 +0100
+Subject: [PATCH] loom: queue a long supply on one descriptor
+
+Experimental LOOM_EXP_SUPPLY_QUEUE=1: a core stream supply repeated past the queue's repeat field (a chain of identical descriptors) is one descriptor queued that many times, the last task's token standing for all; the same transfers in the same order, fewer shim descriptors. LOOM_EXP_TRACE_RINGS also prints each worker's final stack.
+---
+
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -638,6 +638,10 @@
+   // Identical descriptors chained in each task execution (one unless a core
+   // stream supply repeats beyond the queue's repeat field).
+   uint16_t chain_length;
++  // Experimental LOOM_EXP_SUPPLY_QUEUE=1: times the task is queued (one
++  // descriptor, task_repeat_count each) in place of a chain of identical
++  // descriptors; 0 or 1 queues it once.
++  uint16_t task_queue_count;
+   // Number of populated multidimensional address-generator rows.
+   uint8_t dma_dimension_count;
+   // Innermost-first multidimensional address-generator rows.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
+@@ -6,6 +6,7 @@
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/array/binding.h"
+ 
++#include <stdlib.h>
+ #include <string.h>
+ 
+ static bool loom_aie2p_array_reject_binding_transfer(
+@@ -337,6 +338,17 @@
+   binding_plan->task_repeat_count = (uint16_t)task_repeat_count;
+   binding_plan->chain_length =
+       axis_chain_length ? axis_chain_length : (uint16_t)chain_length;
++  binding_plan->task_queue_count = 1;
++  // Experimental LOOM_EXP_SUPPLY_QUEUE=1: a chain of identical descriptors
++  // (a core stream supply beyond the queue's repeat field) becomes one
++  // descriptor queued that many times, when the task queue holds them all
++  // (the shim descriptors it frees, the same transfers in the same order).
++  if (!axis_chain_length && chain_length > 1 &&
++      chain_length <= dma_facts->task_queue_depth &&
++      getenv("LOOM_EXP_SUPPLY_QUEUE") != NULL) {
++    binding_plan->task_queue_count = (uint16_t)chain_length;
++    binding_plan->chain_length = 1;
++  }
+   binding_plan->chain_step_byte_length = axis_chain_step_bytes;
+   binding_plan->dma_dimension_count = dma_dimension_count;
+   binding_plan->iteration_step_size = iteration_step_size;
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -2392,17 +2392,22 @@
+       loom_aie2p_program_shim_dma_queue_start_field(dma->direction);
+   const uint32_t queue_address = (uint32_t)loom_xdna_register_field_address(
+       builder->plan->family, start_field, dma->coordinate, indices);
+-  uint32_t queue_value =
+-      loom_xdna_register_field_encode(start_field, descriptor);
+-  queue_value |= loom_xdna_register_field_encode(
+-      loom_aie2p_program_shim_dma_queue_repeat_field(dma->direction),
+-      binding_plan->task_repeat_count - 1u);
+-  if (issues_completion) {
++  // (LOOM_EXP_SUPPLY_QUEUE: task_queue_count tasks, the last one's token
++  // standing for them all: a wait still sees one completion)
++  const uint16_t queue_count = iree_max(1, binding_plan->task_queue_count);
++  for (uint16_t q = 0; q < queue_count; ++q) {
++    uint32_t queue_value =
++        loom_xdna_register_field_encode(start_field, descriptor);
+     queue_value |= loom_xdna_register_field_encode(
+-        loom_aie2p_program_shim_dma_queue_token_field(dma->direction), 1);
+-  }
+-  loom_aie2p_program_append_register_write32(&builder->control, queue_address,
+-                                             queue_value);
++        loom_aie2p_program_shim_dma_queue_repeat_field(dma->direction),
++        binding_plan->task_repeat_count - 1u);
++    if (issues_completion && q + 1u == queue_count) {
++      queue_value |= loom_xdna_register_field_encode(
++          loom_aie2p_program_shim_dma_queue_token_field(dma->direction), 1);
++    }
++    loom_aie2p_program_append_register_write32(&builder->control,
++                                               queue_address, queue_value);
++  }
+ }
+ 
+ static void loom_aie2p_program_build_shim_dma_queue(
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/artifact.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/artifact.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/artifact.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/artifact.c
+@@ -5,6 +5,9 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
+ #include "loom/target/arch/amd/xdna/aie2p/emit/artifact.h"
++
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "iree/io/vec_stream.h"
+ #include "iree/schemas/xdna_executable.h"
+@@ -347,6 +350,12 @@
+         .param_count = IREE_ARRAYSIZE(params),
+     };
+     return iree_diagnostic_emit(request->diagnostic_emitter, &emission);
++  }
++  if (getenv("LOOM_EXP_TRACE_RINGS") != NULL) {  // (diag) the final stack
++    fprintf(stderr, "STACK worker %u tile %u,%u at %llu bytes %llu\n",
++            worker_index, (unsigned)worker->coordinate.column,
++            (unsigned)worker->coordinate.row, (unsigned long long)offset,
++            (unsigned long long)requirement->byte_length);
+   }
+   *out_placement = (loom_aie2p_tile_storage_placement_t){
+       .storage_space = LOOM_STORAGE_SPACE_STACK,

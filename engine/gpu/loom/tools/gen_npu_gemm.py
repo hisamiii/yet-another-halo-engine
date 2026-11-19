@@ -280,6 +280,9 @@ QF_FW = 144         # egress record words: a 16-k-block piece is 4 records
 QF_A13 = {32768: 33920, 36864: 38016}   # A slots 1, 3 (bank 2) past the egress ring at its start: qf_ring_at
 
 
+QSW5_RING = 49152 - 4 * 1152   # (gen_npu_q qsw5) the fill's egress and helper rings: C rows 2-3, idle in the fill
+
+
 def qf_ring_at(pins):
     """(Q' fuse 2) LOOM_EXP_RING_AT for pins: rings are placed in channel order C, egress + raw, W, A (W's memory-tile
     panel before the A stage: one memory tile holds both at 8 columns) and a pin is skipped once its bank holds a later
@@ -289,16 +292,20 @@ def qf_ring_at(pins):
         m = QF_P1KD
         assert fb == m["rec"]
         hat = P1K_GRID_RING if QF.get("grid") else QF4R_HAT
-        h4 = (f",{fb}@" + ":".join(str(hat + i * fb) for i in range(qf4r_hslots()))) if qf4r_on() else ""
         eb = m["eb"]
         # (FFN gate / up: the K-half ring over C slots 1-3 too, idle in the fill; the silu table takes 45568 .. 53760)
         egr = 40448 if QF.get("qsw") and "GN_QFEGR" not in os.environ else m["egr"]
+        lim = 45568   # (the silu table's start)
+        if QF.get("silu") and "GN_QFEGR" not in os.environ:   # (gen_npu_q qsw5: both rings end bank 2, C rows 2-3)
+            egr = hat = QSW5_RING
+            lim = 49152
+        h4 = (f",{fb}@" + ":".join(str(hat + i * fb) for i in range(qf4r_hslots()))) if qf4r_on() else ""
         if QF.get("grid") and not QF.get("qsw"):   # (grid formats at NP 4: P1K_GRID_*; gate / up: qgmap_on)
             assert NP == 4 and not QF.get("qsw") and egr == 40448, "Q' grid formats: NP 4 site images"
             egr = P1K_GRID_RING
             assert egr + m["slots"] * fb <= P1K_GRID_AT and hat + qf4r_hslots() * fb <= P1K_GRID_AT
-        assert not QF.get("qsw") or egr + m["slots"] * fb <= 45568
-        assert not (QF.get("qsw") and qf4r_on()) or QF4R_HAT + qf4r_hslots() * fb <= 45568
+        assert not QF.get("qsw") or egr + m["slots"] * fb <= lim
+        assert not (QF.get("qsw") and qf4r_on()) or hat + qf4r_hslots() * fb <= lim
         if qflane2_on():   # (GN_QFLANE2) slots 0-1 the first lane's ring, 2-3 the second's (one 2-record slot)
             assert eb == fb and m["slots"] == 4
             return pins + f",{eb}@{egr}:{egr + eb},{2 * eb}@{egr + 2 * eb}" + h4
@@ -760,6 +767,8 @@ def stream_bytes(cfg):
              + slab(cfg.ks[-1]))
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
     if cfg.qsw:   # (Q') the receiver's extent in H from call 0's records: [M block][hpass calls][slab][column][576 B]
+        if NP == 5:   # (NP 5: a call's records over 5 passes, H as [M block][hpass passes][slab][4608 B])
+            return a, w, ((cfg.nb - 1) * cfg.hpass + 5) * MP * 4608
         return a, w, ((cfg.nb - 1) * cfg.hpass + 1) * MP * cfg.cols * SW_REC
     if cfg.swiglu:   # the receiver's extent in H: the last 16-token row's columns
         last = (cfg.cols - 1) * h_col_stride(cfg)   # the last column's (pass's) last record in H
@@ -3818,7 +3827,10 @@ def crel_copy(e, port, nseg=None, own=("%fzt", 0)):
     pins = qpins(QA4_RING_AT)
     sb = int(pins.split(",")[0].split("@")[0])   # (a segment: one C ring slot; 2048 B, the P1 layout's 3072 B)
     cs = [int(v) for v in pins.split(",")[0].split("@")[1].split(":")]
-    assert sb % 64 == 0 and len(cs) == MP and qa4_on() and (qpeel_on() or qunr_on() or os.environ.get("GN_QBANK") == "3") and not qalt_on()
+    # (a segment not a multiple of 64 B, the NP 5 gate / up's 720 B: copied whole vectors, 768 B; the source's tail
+    # is the epilogue's zero pads, the destination's inside its slot)
+    sb = (sb + 63) // 64 * 64
+    assert len(cs) == MP and qa4_on() and (qpeel_on() or qunr_on() or os.environ.get("GN_QBANK") == "3") and not qalt_on()
     e(f"  %crG = storage_address {own[0]} : low.storage<private> -> reg<aie2p.ep>")
     e(f"  %crol = lda %crG, {own[1]}")
     e("  %cro = mov.scalar-to-address %crol")
@@ -5002,6 +5014,48 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e(f"  {q}kup = mov.i32 {1024 * NP // 2}")
                 e(f"  {q}uib = add.rr {q}gib, {q}kup")
                 fifo = jpush(q, T, kind, fifo, [0])
+            if q3 and NP == 5 and not one:   # (slab b: gate half 0, up half 1; sub-tile b at the even (b even) or
+                # odd area, 1 KB per b / 2)
+                if os.environ.get("GN_QSWJROLL", "1") == "0":
+                    for b in range(5):
+                        qq = f"{q}u{b}"
+                        for nm_, h_ in (("g", 0), ("u", 1)):
+                            e(f"  {qq}{nm_}k = mov.i32 {1024 * (b // 2) + 256 * h_ + 512}")
+                            e(f"  {qq}{nm_}ib = add.rr {p}{'os' if b % 2 else 'ss'}, {qq}{nm_}k")
+                        fifo = jpush(qq, T, kind, fifo, range(2))
+                    L[s0:] = lsched(L[s0:], 24)
+                    return fifo
+                # (program memory) b a runtime loop, its counter stepped in the header (no hardware-loop candidate)
+                e(f"  {q}jk0 = mova.i32 0")
+                e(f"  {q}jkn = mova.i32 5")
+                e(f"  {q}jks = mov.i32 1024")
+                e(f"  {q}jk1 = mova.i32 1")
+                e(f"  {q}jkm1 = mova.i32 -1")
+                e(f"  {q}jks2 = sub {p}os, {p}ss")
+                e(f"  low.br ^jl{T}({q}jk0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+                e(f"^jl{T}({q}jv: {ER}, {q}jf: {MF}, {q}jp: {MP_}, {q}jq: {MS}):")
+                e(f"  {q}jm = lt {q}jv, {q}jkn")
+                e(f"  {q}jx = add {q}jv, 1")
+                e(f"  low.cond_br {q}jm, ^jb{T}, ^je{T} : {ER}")
+                e(f"^jb{T}:")
+                s1 = len(L)
+                fifo = (f"{q}jf", f"{q}jp", f"{q}jq")
+                e(f"  {q}ju = lshl {q}jv, {q}jkm1")
+                e(f"  {q}ji = and {q}jv, {q}jk1")
+                e(f"  {q}jo = mul {q}ju, {q}jks")
+                e(f"  {q}jo2 = mul {q}ji, {q}jks2")
+                e(f"  {q}jg0 = add.rr {p}ss, {q}jo")
+                qq = f"{q}u"
+                e(f"  {qq}jg = add.rr {q}jg0, {q}jo2")
+                e(f"  {qq}gk = mov.i32 512")
+                e(f"  {qq}gib = add.rr {qq}jg, {qq}gk")
+                e(f"  {qq}uk = mov.i32 768")
+                e(f"  {qq}uib = add.rr {qq}jg, {qq}uk")
+                fifo = jpush(qq, T, kind, fifo, range(2))
+                L[s1:] = lsched(L[s1:], 24)
+                e(f"  low.br ^jl{T}({q}jx: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+                e(f"^je{T}:")
+                return (f"{q}jf", f"{q}jp", f"{q}jq")
             jr = os.environ.get("GN_QSWJROLL", "1")   # ("auto": unrolled only in IQ4_XS gate / up images, program memory)
             if not one and (cfg.hord or not q3) and hi - lo > 1 and (
                     jr == "1" or (jr == "auto" and not (cfg.fmt == "IQ4_XS" and cfg.ufmt in ("", "IQ4_XS")))):
@@ -5113,7 +5167,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     e(f"  {n}la{h} = vband {g_}, {kbits(0x7FFF)}")                 # |g|
                     # clamped as integers (a float compare lets NaN through: an address past the table)
                     e(f"  {n}lc0{h}, {n}lc0m{h} = vmax_lt.s16x32 {n}la{h}, {kbf(2.0 ** -8)}")
-                    e(f"  {n}lc{h}, {n}lcm{h} = vmin_ge.s16x32 {n}lc0{h}, {kbf(128.0)}")
+                    e(f"  {n}lc{h}, {n}lcm{h} = vmin_ge.s16x32 {n}lc0{h}, {kbits(SL_HI)}")
                     # + the table's address / 4 less SL_LO in 16 bits (the table ends below 2^18), then x 4 as i32:
                     # the gathers' byte addresses
                     sp_ = silu_pieces()
@@ -5633,7 +5687,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e(f"  %cvl_{i}, %cv{g}_{i + 1} = vlda.acc.post {cur[g]}, 64")
             cur[g] = f"%cv{g}_{i + 1}"
         if cfg.qsw and QF.get("qsw"):   # (FFN gate / up) the row's h = silu(g) u: 576 B of bfp16 records at its slot; pointers a row on
-            assert NP == 4 and cfg.hord == "P4" and q3_strides() == (2048, 2048) and not qalt_on()
+            assert NP in (4, 5) and cfg.hord == "P4" and q3_strides() == (1024 * ((NP + 1) // 2), 2048) and not qalt_on()
             e("  %cvsa = copy %cva_0 : reg<aie2p.ep> -> reg<aie2p.ep>")
             e("  %cvsb = copy %cvb_0 : reg<aie2p.ep> -> reg<aie2p.ep>")
             if pair and not qpair_off():   # (Q' column pairs) the row's halves swapped with the partner core's first
@@ -5642,10 +5696,13 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             convert_swiglu(None, None, 0, q3=("%cvsa", "%cvsb"))
             e("  %cvsk = mov.i32 2048")
             e("  %cvsm = mov.modifier %cvsk")
+            if NP == 5:   # (the even area's row stride 3072: its own modifier)
+                e("  %cvsk5 = mov.i32 3072")
+                e("  %cvsm5 = mov.modifier %cvsk5")
             for g_ in ("a", "b"):
-                e(f"  %cvn{g_} = padda.modifier %cv{g_}_0, %cvsm")
+                e(f"  %cvn{g_} = padda.modifier %cv{g_}_0, {'%cvsm5' if NP == 5 and g_ == 'a' else '%cvsm'}")
                 cur[g_] = f"%cvn{g_}"
-            e("  %cvnd = padda.modifier %cvd_0, %cvsm")
+            e(f"  %cvnd = padda.modifier %cvd_0, {'%cvsm5' if NP == 5 else '%cvsm'}")
             d = "%cvnd"
         else:
             for i in range(16):
@@ -5680,7 +5737,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     e(f"  %qfvL{w_} = lda {'%qfaL2' if o_ >= 32 else '%qfaL'}, {o_ - 32 if o_ >= 32 else o_}")
                     e(f"  st %qfvL{w_}, %cvds, {4 * w_}")
         e("  rel %one, 2")
-        if q3_strides()[0] > 32 * n:   # (odd NP: d to the next even-area row)
+        if q3_strides()[0] > 32 * n and not (cfg.qsw and QF.get("qsw")):   # (odd NP: d to the next even-area row)
             e(f"  %cvgk = mov.i32 {q3_strides()[0] - 32 * n}")
             e("  %cvgm = mov.modifier %cvgk")
             e(f"  %cvdg = padda.modifier {d}, %cvgm")
@@ -5786,6 +5843,19 @@ SL_K = (0x7FFF, 0x3B80, 0x4300, 0x0000, 0x8000, 0x3F80)   # bf16x32 constants af
 
 
 SL_NB = (SL_HI - SL_LO + 1 + 15) // 16   # the table's 16-entry blocks
+SL_HI0, SL_K0 = SL_HI, SL_K
+
+
+def set_sl_hi(hi=None):
+    """The table's upper bound (bf16 bits of |g|; None: SL_HI0, 128). Any bound whose sigmoid(-x) is below 2^-126
+    gives the same h (the clamp's t and the cut entries are all the flushed 0): 0x42AF (87.5) frees 6 blocks, the NP 5
+    gate / up map's room (gen_npu_q.qsw5_on)."""
+    global SL_HI, SL_K, SL_NB
+    SL_HI = SL_HI0 if hi is None else hi
+    t = 1 / (1 + __import__("math").exp((__import__("struct").unpack("<f", (SL_HI << 16).to_bytes(4, "little"))[0])))
+    assert SL_HI == SL_HI0 or t < 2.0 ** -126, hex(SL_HI)
+    SL_K = tuple(SL_HI if k == SL_HI0 else k for k in SL_K0)
+    SL_NB = (SL_HI - SL_LO + 1 + 15) // 16
 
 
 def silu_pieces():
@@ -5794,6 +5864,8 @@ def silu_pieces():
     lands in memory that only needs to exist: its bytes are dropped); the SL_K vectors in @silu_k.
     Default: one piece with the pad at 45568. [(blocks, address)]"""
     v = os.environ.get("GN_QSILU")
+    if not v and QF.get("silu"):   # (gen_npu_q qsw5: the NP 5 map's pieces)
+        return list(QF["silu"])
     if not v:
         return list(QG_SILU) if qgmap_on() else [(SL_NB, 45568)]
     ps = [(int(a), int(b)) for a, b in (x.split("@") for x in v.split(","))]

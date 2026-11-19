@@ -126,7 +126,7 @@ def loom_env(cfg):
         # own place, offset 0, is under W slot 0; qf_ring_at moves the K-half egress ring off 49152)
         env["LOOM_EXP_RODATA_AT"] = ",".join(f"{N.silu_sym(k)}@{a}" for k, (_, a) in enumerate(N.silu_pieces()))
         if len(N.silu_pieces()) > 1 and not N.qgmap_on():   # (GN_QSILU by hand: GN_QSILUK, @silu_k's address)
-            env["LOOM_EXP_RODATA_AT"] += f",silu_k@{os.environ['GN_QSILUK']}"
+            env["LOOM_EXP_RODATA_AT"] += f",silu_k@{os.environ.get('GN_QSILUK') or N.QF['siluk']}"
         env["LOOM_EXP_EGRESS_MERGE_STRIDED"] = "1"
     if p1k4(cfg):   # (NP 4) the scratch pad's guard
         env["LOOM_EXP_RODATA_AT"] = ",".join(([env["LOOM_EXP_RODATA_AT"]] if "LOOM_EXP_RODATA_AT" in env else [])
@@ -172,6 +172,13 @@ def loom_env(cfg):
         # in 63488 .. 65536 grow bank 3's cursor past where Loom would place it
         assert N.QG_PRIVATE + 512 <= N.QG_SPARE[1][0]
         env["LOOM_EXP_SPACE_AT"] = ",".join(filter(None, [env.get("LOOM_EXP_SPACE_AT"), f"private@{N.QG_PRIVATE}"]))
+    if N.QF.get("silu") == QSW5_SILU:   # (qsw5) private storage (<= 320 B) past the token ring, below silu piece 1:
+        # Loom's own choice lands in the even C area's last row
+        assert QSW5_PRIVATE + 320 <= QSW5_SILU[1][1]
+        env["LOOM_EXP_SPACE_AT"] = ",".join(filter(None, [env.get("LOOM_EXP_SPACE_AT"), f"private@{QSW5_PRIVATE}"]))
+        # (HRX 0100) the gate's poll and tick supplies queued 4 x 256 on one descriptor each: the raw rows' 5-run
+        # chain (10 descriptors a column) leaves column 1's shim tile, which holds them, 6 of its 16
+        env["LOOM_EXP_SUPPLY_QUEUE"] = "1"
     return env
 
 
@@ -241,15 +248,20 @@ def array_program(L, cfg):
             hm_ = cfg.hpass * MP * 8 * rec
             L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x{rec}xi32, "
                      f"#encoding.layout.strided<strides=[{rec}, {hm_}, {8 * rec}, 1]>>>")
+            if qsw5_on(cfg):   # (qsw5: column c's 144 B at slot c of each of 5 passes; rows 4608 B apart)
+                hm_ = cfg.hpass * MP * 1152
+                L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x5x36xi32, "
+                         f"#encoding.layout.strided<strides=[36, {hm_}, 1152, {MP * 1152}, 1]>>>")
         e(f"  %ncolp = constant.u32 {cols * R // 2} : reg<aie2p.array.scalar : index>")
         e(f"  %nseg2 = constant.u32 {2 * nbr * MP} : reg<aie2p.array.scalar : index>")
+        cty = "5x36" if N.QF["qsw"] and qsw5_on(cfg) else f"{rec}"   # (qsw5: a record as its 5 pieces)
         for c in range(cols):
             for q in range(0, R, 2):
                 t, u = f"{c}_{q}", f"{c}_{q + 1}"
                 e(f"  %lanep{t} = constant.u32 {c * R // 2 + q // 2} : reg<aie2p.array.scalar : index>")
-                e(f"  %cr{t} = partition.receiver %c_all, %origin, %lanep{t}, %ncolp : reg<aie2p.array.receiver : tile<{rec}xi32>>")
-                e(f"  %sc{t} = sender {kk[c, q]}, 2 : reg<aie2p.array.sender : tile<{rec}xi32>>")
-                e(f"  %chc{t} = channel %sc{t}, %cr{t}, {'%n8' if N.qcstage_on() else cd}, %nseg2 : reg<aie2p.array.channel : tile<{rec}xi32>>")
+                e(f"  %cr{t} = partition.receiver %c_all, %origin, %lanep{t}, %ncolp : reg<aie2p.array.receiver : tile<{cty}xi32>>")
+                e(f"  %sc{t} = sender {kk[c, q]}, 2 : reg<aie2p.array.sender : tile<{cty}xi32>>")
+                e(f"  %chc{t} = channel %sc{t}, %cr{t}, {'%n8' if N.qcstage_on() else cd}, %nseg2 : reg<aie2p.array.channel : tile<{cty}xi32>>")
                 e(f"  constrain.leaf_sync %chc{t}")
                 if os.environ.get("GN_QEMERGE") == "1":   # (LOOM_EXP_EGRESS_MERGE) the column's memtile merges its pairs'
                     e(f"  constrain.stage %chc{t}, %n{c if cols > 1 else 1}")   # streams into one shim write
@@ -437,9 +449,15 @@ def array_program(L, cfg):
                 if cfg.qsw and qswdiag() != "convert" and not N.fpair(cfg):   # (FFN gate / up) per step: the
                     # column's 2 gate slabs, then the same up rows dgu bytes on
                     # (not odd: the pair axis would need the descriptor chain that the gate-to-up stride takes)
-                    assert NP == 4 and not r4 and cfg.dgu % 4 == 0 and not odd
-                    e(f"  {s_} = sender {b_}, 0 : reg<aie2p.array.sender : tile<{U_ * N.FUSE_SB}x2x2x16x{rw_}xi32, "
-                      f"#encoding.layout.strided<strides=[{BLK_ // 4}, {cfg.dgu // 4}, {16 * rs_}, {rs_}, 1]>>>")
+                    assert NP in (4, 5) and not r4 and cfg.dgu % 4 == 0 and not odd
+                    if qsw5_on(cfg):   # (qsw5: per step slab b = the column's gate run b (8 rows, runs 256 rows
+                        # apart), then up's; a record [gate / up][8 rows])
+                        rty = f"2x8x{rw_}"
+                        e(f"  {s_} = sender {b_}, 0 : reg<aie2p.array.sender : tile<{U_ * N.FUSE_SB}x5x2x8x{rw_}xi32, "
+                          f"#encoding.layout.strided<strides=[{BLK_ // 4}, {256 * rs_}, {cfg.dgu // 4}, {rs_}, 1]>>>")
+                    else:
+                        e(f"  {s_} = sender {b_}, 0 : reg<aie2p.array.sender : tile<{U_ * N.FUSE_SB}x2x2x16x{rw_}xi32, "
+                          f"#encoding.layout.strided<strides=[{BLK_ // 4}, {cfg.dgu // 4}, {16 * rs_}, {rs_}, 1]>>>")
                 elif g_["odd"]:   # (pairs of super-blocks: the second's read starts 2 bytes before it)
                     e(f"  {s_} = sender {b_}, 0 : reg<aie2p.array.sender : tile<{U_ * N.FUSE_SB // 2}x2x{NP}x16x{rw_}xi32, "
                       f"#encoding.layout.strided<strides=[{BLK_ // 2}, {BLK_ // 4}, {16 * rs_}, {rs_}, 1]>>>")
@@ -453,6 +471,8 @@ def array_program(L, cfg):
                 rty = f"16x{cg(c)['rw']}"
             else:
                 fo_, fs_ = c * (cfg.swcol if cfg.qsw and qswdiag() != 'convert' else N.TN) * RS * 4, "%fru_all"
+                if qsw5_on(cfg) and qswdiag() != "convert":   # (qsw5: column c's runs at 8 P8[c] rows)
+                    fo_ = 8 * QSW5_P8[c] * RS * 4
             e(f"  %fro{c} = constant.u64 {fo_} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender {fs_}, %fro{c} : reg<aie2p.array.sender : tile<{rty}xi32>>")
             for r in drs:   # (row 0 fills; the rows below see its raw rows as W records: gen_npu_gemm.qf_skip_raw)
@@ -752,8 +772,29 @@ def qgmap_pins(cfg):
     return pins + [f"silu_k@{ka}"]
 
 
+# (qsw5) the NP 5 FFN gate / up map's SiLU table: the bound at 87.5 (gen_npu_gemm.set_sl_hi: 115 blocks), in the
+# runs the NP 5 site map leaves free (past the even C area's last row, past the private storage, below the token ring,
+# A slot 0's end), its 9 vectors (@silu_k) at 25280 .. 25856, below the decoder's pad (26112). Not 11520 .. 12288: the
+# fill's second raw intake slot (9216 .. 18432) covers it. Loom's stack (128 B) goes to 65280: the fill's rings end
+# bank 2 (gen_npu_gemm QSW5_RING), where Loom's cursor would put it inside the even C area's last row.
+QSW5_SILU = ((64, 49664), (26, 31104), (22, 29312), (3, 25088))
+QSW5_SILUK = 25280
+QSW5_PRIVATE = 30784   # (Loom's private storage: past the 64 B token ring at 30720)
+QSW5_P8 = (0, 2, 1, 3, 4, 6, 5, 7)   # (P4: column c computes k-block slot c's k-block, down's decode order)
+
+
+def qsw5_on(cfg):
+    """The NP 5 FFN gate / up image: column c of call j takes the 8 features of k-block 8 (j % 4) + QSW5_P8[c] of
+    each of 5 passes 5 (j / 4) + b (C slab b: gate block b's 8 rows, then up's), its H records [b][token half]
+    at slot c of those passes (H [M block][hpass passes][16-token row][4608 B], down's A)."""
+    return bool(cfg.qsw) and N.NP == 5
+
+
 def grid_flags(cfg):
     """gen_npu_gemm's Q' decoder flags: the byte grid (QF qg8) and, for a grid format at fuse 2, the P1K grid map."""
+    q5 = qsw5_on(cfg) and qswdiag() != "intake"
+    N.set_sl_hi(0x42AF if q5 else None)
+    N.QF["silu"], N.QF["siluk"] = (QSW5_SILU, QSW5_SILUK) if q5 else (None, None)
     N.QF["qg8"] = True
     N.QF["grid"] = cfg.fuse == 2 and N.qp1k_on() and any(
         N.decoder(f, g).GRID for f, g in [(cfg.fmt, cfg.gord)] + ([(cfg.ufmt, cfg.ugord or "P4")] if N.fpair(cfg) else []))
