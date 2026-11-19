@@ -4913,7 +4913,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e(f"  {q}kup = mov.i32 {1024 * NP // 2}")
                 e(f"  {q}uib = add.rr {q}gib, {q}kup")
                 fifo = jpush(q, T, kind, fifo, [0])
-            if not one and (cfg.hord or not q3) and hi - lo > 1 and os.environ.get("GN_QSWJROLL", "1") == "1":
+            jr = os.environ.get("GN_QSWJROLL", "1")   # ("auto": unrolled only in IQ4_XS gate / up images, program memory)
+            if not one and (cfg.hord or not q3) and hi - lo > 1 and (
+                    jr == "1" or (jr == "auto" and not (cfg.fmt == "IQ4_XS" and cfg.ufmt in ("", "IQ4_XS")))):
                 # (program memory) j a runtime loop: the gate block's offset is linear in j (hord: 256 j, else
                 # 1024 j; q3 with hord: half i's area, 256 j on); the counter steps in the header, so no
                 # hardware-loop candidate (LOOM_EXP_HWLOOP_TRIP)
