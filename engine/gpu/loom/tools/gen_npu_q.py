@@ -248,6 +248,11 @@ def array_program(L, cfg):
             hm_ = cfg.hpass * MP * 8 * rec
             L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x{rec}xi32, "
                      f"#encoding.layout.strided<strides=[{rec}, {hm_}, {8 * rec}, 1]>>>")
+            if N.QSWAP:   # (row 5 role swap) the merged lanes' first index is the token column (= its M block of
+                # H), the second the weight block (32 features): H slab-major [M block][slab][F / 32 pieces][576 B]
+                # (the down reads it with GN_QHSLAB strides); this call's blocks at its binding offset
+                L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x{rec}xi32, "
+                         f"#encoding.layout.strided<strides=[{hm_}, {rec}, {8 * cfg.hpass * rec}, 1]>>>")
             if qsw5_on(cfg):   # (qsw5: column c's 144 B at slot c of each of 5 passes; rows 4608 B apart)
                 hm_ = cfg.hpass * MP * 1152
                 L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x5x36xi32, "
@@ -859,5 +864,9 @@ def gen(cfg):
         ports = "".join({"a": "0", "w": "1"}[c] for c in qfix())
         pat = re.compile(rf"^  (acq|rel)(\.cond)? %\w+(, %\w+)?, [{ports}]$")
         L[i0:] = [ln for ln in "\n".join(L[i0:]).split("\n") if not pat.match(ln)]
+    if N.QSWAP:   # (row 5 role swap) every MMA's operands the other way round: C blocks [token][feature] (gen_npu_gemm)
+        import re
+        assert cfg.fuse == 0
+        return re.sub(r"(= mma\.bfp16ebs8\.m8n8k8 [^,]+), ([^,]+), ([^,]+), ", r"\1, \3, \2, ", "\n".join(L))
     return "\n".join(L)
 

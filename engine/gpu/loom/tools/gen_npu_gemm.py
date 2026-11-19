@@ -46,6 +46,13 @@ KS = (35, 35, 35, 23)    # production k-blocks per pass and K-slice row: K = 102
 # GN_QCYC=1 (diag, the plain tail's convert): each last-pass segment's first word = the core cycles since the first
 # firing's start (npu_gemm_check prints the per-M-block steps; the outputs are not checked)
 QCYC = os.environ.get("GN_QCYC") == "1"
+# GN_QSWAP=1 (row 5, experimental; Q' fuse 0, NP 4 gate / up): the roles swapped. The weights are the stream (the
+# "activations" binding: M blocks of 64 rows, each a column's 64 panel rows of today, gate then up) and the tokens the
+# panel (64 a column); every MMA takes its operands the other way round, so each 8 x 8 C block is still [token]
+# [feature]. C row s = stream slab s, sub-tile t = token slab t: the SwiGLU convert's row t reads sub-tile t of rows
+# 0, 1 (gate) and 2, 3 (up, 4 KB on), the chain bits exchanged (feature half 512, token half 256), and writes row t's
+# 576 B h record where today's row t does, so the egress and H stay as they are.
+QSWAP = os.environ.get("GN_QSWAP") == "1"
 # GN_QFCYC=1 (diag, with GN_QCYC): the Q' fill's cycles (word 2: the whole fill; word 1: its egress phases) into every
 # C segment's next words (the last call's fill; %qfc words 0 / 8: phase starts, 4: egress sum, 12: fill)
 QFCYC = QCYC and os.environ.get("GN_QFCYC") == "1"
@@ -4904,8 +4911,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             e(f"  {p}kr = mov.i32 {512 + 512 * DFR_T.index(t)}")
             e(f"  {p}uf = add.rr %dss, {p}kr")
         elif q3:
-            e(f"  {p}ss = mov.address-to-scalar {q3[0]}")
-            e(f"  {p}os = mov.address-to-scalar {q3[1]}")
+            if q3 != "swap":   # (QSWAP: the caller made {p}ss, {p}os and the record's {p}xs)
+                e(f"  {p}ss = mov.address-to-scalar {q3[0]}")
+                e(f"  {p}os = mov.address-to-scalar {q3[1]}")
         else:
             e(f"  {p}ds = mov.address-to-scalar {d}")
             e(f"  {p}k0 = mova.i32 0")
@@ -4991,7 +4999,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         if unit:
             fifo = unit
         else:
-            e(f"  {p}sp = mov.scalar-to-address {p}ss")
+            e(f"  {p}sp = mov.scalar-to-address {p}{'xs' if q3 == 'swap' else 'ss'}")
             e(f"  {p}sl = vlda.store-fifo.low512 {p}sp, 0")
             e(f"  {p}f0 = vlda.store-fifo.high512 {p}sp, {p}sl, 64")
             e(f"  {p}op = copy {p}sp : reg<aie2p.ep> -> reg<aie2p.mpfs>")
@@ -5019,6 +5027,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 e(f"  {q}kup = mov.i32 {1024 * NP // 2}")
                 e(f"  {q}uib = add.rr {q}gib, {q}kup")
                 fifo = jpush(q, T, kind, fifo, [0])
+            assert not (QSWAP and q3 and NP == 5)
             if q3 and NP == 5 and not one:   # (slab b: gate half 0, up half 1; sub-tile b at the even (b even) or
                 # odd area, 1 KB per b / 2)
                 if os.environ.get("GN_QSWJROLL", "1") == "0":
@@ -5071,7 +5080,8 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                 r4 = qsw_roll4(cfg)   # (one half an iteration: u = 2 j + i)
                 e(f"  {q}jk0 = mova.i32 {(2 if r4 else 1) * lo}")
                 e(f"  {q}jkn = mova.i32 {(2 if r4 else 1) * hi}")
-                e(f"  {q}jks = mov.i32 {256 if cfg.hord else 1024}")
+                assert not QSWAP or (q3 and cfg.hord and not qsw_roll4(cfg))
+                e(f"  {q}jks = mov.i32 {(512 if QSWAP else 256) if cfg.hord else 1024}")
                 if r4:   # (half i's offset: q3 the odd area's, hord 1024, else 256)
                     e(f"  {q}jk1 = mova.i32 1")
                     e(f"  {q}jkm1 = mova.i32 -1")
@@ -5108,7 +5118,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     go, du = (1024 * i + 512) if cfg.hord else (256 * i + 512), 1024 * NP // 2
                     gb = f"{p}ss"
                     if q3:
-                        go, du, gb = 512, 1024, f"{p}os" if i else f"{p}ss"
+                        go, du, gb = 512, 4096 if QSWAP else 1024, f"{p}os" if i else f"{p}ss"
                     e(f"  {qq}jg = add.rr {gb}, {q}jo")
                     e(f"  {qq}gk = mov.i32 {go}")
                     e(f"  {qq}gib = add.rr {qq}jg, {qq}gk")
@@ -5131,7 +5141,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                         jj, ii = (j & ~1) + i, j & 1
                     go, gb, du = 1024 * jj + 256 * ii + 512, f"{p}ss", 1024 * NP // 2
                     if q3:   # (sub-tile jj at the even (jj 0) or odd area's start, its up sub-tile jj + 2 a KB on)
-                        go, gb, du = 256 * ii + 512, f"{p}os" if jj else f"{p}ss", 1024
+                        go, gb, du = (512 if QSWAP else 256) * ii + 512, f"{p}os" if jj else f"{p}ss", 4096 if QSWAP else 1024
                     e(f"  {qq}gk = mov.i32 {go}")
                     e(f"  {qq}gib = add.rr {gb}, {qq}gk")
                     e(f"  {qq}uk = mov.i32 {go + du}")
@@ -5152,7 +5162,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
                     q4 = []
                     for q_ in range(4):
                         x = f"{n}{tag}l{q_}"
-                        e(f"  {x} = vlda.acc {pp}, {512 * r + 64 * q_ - 512}")
+                        e(f"  {x} = vlda.acc {pp}, {(256 if QSWAP else 512) * r + 64 * q_ - 512}")
                         q4.append(x)
                     return q4
 
@@ -5676,6 +5686,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
         e("  %cvz = mova.i32 0")
         e("  %cvo0 = copy %o : reg<aie2p.ep> -> reg<aie2p.ep>")
         e("  %cvq0 = copy %qod : reg<aie2p.ep> -> reg<aie2p.ep>")
+        if QSWAP and cfg.qsw and QF.get("qsw"):   # (the areas' row-0 starts as scalars, for the swapped convert)
+            e("  %swE = mov.address-to-scalar %o")
+            e("  %swO = mov.address-to-scalar %qod")
         e(f"  %cvK = mova.i32 {MP}")
         e("  low.br ^cvl(%cvz: reg<aie2p.er>, %cvo0: reg<aie2p.ep>, %cvo0: reg<aie2p.ep>, %cvq0: reg<aie2p.ep>)")
         e("^cvl(%cvr: reg<aie2p.er>, %cvd_0: reg<aie2p.ep>, %cva_0: reg<aie2p.ep>, %cvb_0: reg<aie2p.ep>):")
@@ -5698,7 +5711,26 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, fills=False, helper=None, pai
             if pair and not qpair_off():   # (Q' column pairs) the row's halves swapped with the partner core's first
                 qpair_swap(e, pair, "%cvsa", "%cvsb", "q")
             t = "q"
-            convert_swiglu(None, None, 0, q3=("%cvsa", "%cvsb"))
+            if QSWAP:   # (row t = token slab t) gate rows 0, 1 / up rows 2, 3 at sub-tile t (the even area's for t
+                # even, 1 KB per t / 2; row 1 a row stride on); the record at row t's even-area start, as today
+                assert NP == 4 and MP == 4 and not pair and q3_strides() == (2048, 2048)
+                e("  %swk1 = mova.i32 1")
+                e("  %swkm1 = mova.i32 -1")
+                e("  %swk1024 = mov.i32 1024")
+                e("  %swk2048 = mov.i32 2048")
+                e("  %swa = and %cvr, %swk1")
+                e("  %swb = lshl %cvr, %swkm1")
+                e("  %swd = sub %swO, %swE")
+                e("  %swad = mul %swa, %swd")
+                e("  %swbk = mul %swb, %swk1024")
+                e("  %swq_ss0 = add.rr %swE, %swad")
+                e("  %swq_ss = add.rr %swq_ss0, %swbk")
+                e("  %swq_os = add.rr %swq_ss, %swk2048")
+                e("  %swq_xr = mul %cvr, %swk2048")
+                e("  %swq_xs = add.rr %swE, %swq_xr")
+                convert_swiglu(None, None, 0, q3="swap")
+            else:
+                convert_swiglu(None, None, 0, q3=("%cvsa", "%cvsb"))
             e("  %cvsk = mov.i32 2048")
             e("  %cvsm = mov.modifier %cvsk")
             if NP == 5:   # (the even area's row stride 3072: its own modifier)
