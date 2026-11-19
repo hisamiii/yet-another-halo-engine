@@ -1240,7 +1240,17 @@ class LoomPrefill {
       }
     }
     NpuEnqueue(std::move(csw), "ffnsw");
-    for (std::size_t ci = 0; ci < parts.size(); ++ci) NpuEnqueue(std::move(cdn[ci]), "ffndn" + std::to_string(parts[ci].second));
+    // the down's K parts as one job when they run one image (no GPU work between them: a job boundary, ~120 us, saved;
+    // YAH_NPU_DNJOBS=1: a job per part)
+    static const bool dnjobs = std::getenv("YAH_NPU_DNJOBS") != nullptr;
+    const bool one = !dnjobs && std::all_of(dn.begin(), dn.end(), [&](const std::string& d) { return d == dn[0]; });
+    for (std::size_t ci = 0; ci < parts.size(); ++ci) {
+      if (one && ci + 1 < parts.size()) {
+        cdn[ci + 1].insert(cdn[ci + 1].begin(), cdn[ci].begin(), cdn[ci].end());
+        continue;
+      }
+      NpuEnqueue(std::move(cdn[ci]), "ffndn" + std::to_string(parts[ci].second));
+    }
     if (pair) {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
       RunSwigluSplit(pre + "ffn_up.weight", true, us, F);
