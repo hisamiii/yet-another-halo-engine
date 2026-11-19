@@ -12,6 +12,10 @@
 // stream). Unset: those counters count nothing.
 // The read also takes core tile (0, 2)'s 64-bit timer (array clock cycles, the last two values): with event 1 (TRUE) on
 // core counter 0, the job's gate opened at timer - that tile's counter 0 (Finish: times()).
+// YAH_NPU_PROF_ROT="s0;s1;...": several counter settings in one run, each "c0,c1,c2,c3/m0,m1[@combo][#pc dir]"
+// (combo as YAH_NPU_PROF_COMBO, the PC files' directory as YAH_NPU_PROF_PC; a part left out: those variables'). An
+// image's n-th job counts with setting n % count (chosen(): each Setup's setting, in job order), so the jobs of one
+// image share the settings out: e.g. 12 settings over 25 like layers, 2 layers each.
 #ifndef YAH_MODEL_NPU_PROF_HPP_
 #define YAH_MODEL_NPU_PROF_HPP_
 
@@ -20,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -91,6 +96,34 @@ class NpuProf {
       combo_[0] = (v[0] & 127) | (v[1] & 127) << 8 | (v[2] & 127) << 16 | (v[3] & 127) << 24;
       combo_[1] = (v[4] & 3) | (v[5] & 3) << 8 | (v[6] & 3) << 16;
     }
+    Setting base;
+    std::copy(c_, c_ + kCore, base.c), std::copy(m_, m_ + kMem, base.m);
+    base.combo[0] = combo_[0], base.combo[1] = combo_[1];
+    if (const char* dir = std::getenv("YAH_NPU_PROF_PC")) base.pc = dir;
+    rot_.push_back(base);
+    if (const char* e = std::getenv("YAH_NPU_PROF_ROT")) {
+      rot_.clear();
+      for (std::string s(e); !s.empty();) {
+        const std::size_t semi = s.find(';');
+        std::string item = s.substr(0, semi);
+        s = semi == std::string::npos ? "" : s.substr(semi + 1);
+        if (item.empty()) continue;
+        Setting t = base;
+        if (const std::size_t h = item.find('#'); h != std::string::npos) t.pc = item.substr(h + 1), item.resize(h);
+        if (const std::size_t a = item.find('@'); a != std::string::npos) {
+          unsigned v[7] = {};
+          if (std::sscanf(item.c_str() + a + 1, "%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]) != 7)
+            throw LoomError("YAH_NPU_PROF_ROT: a combo wants a,b,c,d,o0,o1,o2: " + item);
+          t.combo[0] = (v[0] & 127) | (v[1] & 127) << 8 | (v[2] & 127) << 16 | (v[3] & 127) << 24;
+          t.combo[1] = (v[4] & 3) | (v[5] & 3) << 8 | (v[6] & 3) << 16;
+          item.resize(a);
+        }
+        if (std::sscanf(item.c_str(), "%u,%u,%u,%u/%u,%u", &t.c[0], &t.c[1], &t.c[2], &t.c[3], &t.m[0], &t.m[1]) != 6)
+          throw LoomError("YAH_NPU_PROF_ROT: want c0,c1,c2,c3/m0,m1 event ids: " + item);
+        rot_.push_back(t);
+      }
+      if (rot_.empty()) throw LoomError("YAH_NPU_PROF_ROT: no settings");
+    }
     // READ_REGS (transaction custom op 130): {op, col, row, pad, u32 size}, u32 count, u32 pad, u64 addresses
     read_.assign(16 + 8 * addr.size(), 0);
     read_[0] = 130;
@@ -126,10 +159,14 @@ class NpuProf {
   // directory of "<image name>.pc" files (emit_prefill_pp with LOOM_DIAG_PC=1), lines "col row pc0 pc1 pc2 pc3": the
   // program addresses of a core's PC events (events 20 / 21: the PC in [pc0, pc1) / [pc2, pc3)); 0 or no file: none.
   const std::vector<std::uint8_t>& Setup(const std::string& image) {
-    std::vector<std::uint8_t>& ops = setup_[image];
+    const std::uint32_t k = occ_[image]++ % static_cast<std::uint32_t>(rot_.size());
+    chosen_.push_back(k);
+    const Setting& set = rot_[k];
+    std::vector<std::uint8_t>& ops = setup_[image + "\n" + std::to_string(k)];
     if (!ops.empty()) return ops;
     std::uint32_t pc[kCols][kRows][4] = {};
-    if (const char* dir = std::getenv("YAH_NPU_PROF_PC")) {
+    if (!set.pc.empty()) {
+      const std::string& dir = set.pc;
       std::string name = image.substr(image.rfind('/') + 1);
       if (std::FILE* f = std::fopen((dir + ("/" + name.substr(0, name.rfind('.')) + ".pc")).c_str(), "r")) {
         for (unsigned col, row, a[4]; std::fscanf(f, "%u %u %u %u %u %u", &col, &row, &a[0], &a[1], &a[2], &a[3]) == 6;)
@@ -146,9 +183,9 @@ class NpuProf {
         for (std::uint32_t r = 0; r < kCore; ++r) Write(ops, t + 0x31520 + 4 * r, 0);
         for (std::uint32_t r = 0; r < kMem; ++r) Write(ops, t + 0x11020 + 4 * r, 0);
         for (std::uint32_t r = 0; r < 4; ++r) Write(ops, t + 0x32020 + 4 * r, pc[col][row - kRow0][r]);
-        Write(ops, t + 0x34400, combo_[0]), Write(ops, t + 0x34404, combo_[1]);   // (YAH_NPU_PROF_COMBO)
-        Write(ops, t + 0x31500, ctl(c_[0], c_[1])), Write(ops, t + 0x31504, ctl(c_[2], c_[3]));
-        Write(ops, t + 0x11000, ctl(m_[0], m_[1]));
+        Write(ops, t + 0x34400, set.combo[0]), Write(ops, t + 0x34404, set.combo[1]);   // (YAH_NPU_PROF_COMBO)
+        Write(ops, t + 0x31500, ctl(set.c[0], set.c[1])), Write(ops, t + 0x31504, ctl(set.c[2], set.c[3]));
+        Write(ops, t + 0x11000, ctl(set.m[0], set.m[1]));
       }
     for (std::uint32_t col = 0; col < cols_; ++col) {
       const std::uint32_t m = col << 25 | 1u << 20, sh = col << 25;
@@ -169,6 +206,8 @@ class NpuProf {
   const std::vector<std::uint8_t>& Read() const { return read_; }
   // Finish's jobs' timer stamps
   const std::vector<Times>& times() const { return times_; }
+  // each Setup's setting (YAH_NPU_PROF_ROT; 0 without), in call order = job order
+  const std::vector<std::uint32_t>& chosen() const { return chosen_; }
 
   // After the last job's done: the firmware's log of every job's READ_REGS, Values() words per job in job order
   // (col-major tiles, core counters then memory counters, then the memory tiles', the shims' and the timer; times()).
@@ -224,6 +263,14 @@ class NpuProf {
     ops.insert(ops.end(), op, op + 24);
   }
 
+  struct Setting {   // one counter setting (YAH_NPU_PROF_ROT)
+    unsigned c[kCore] = {}, m[kMem] = {};
+    std::uint32_t combo[2] = {};
+    std::string pc;   // the PC files' directory, empty: none
+  };
+  std::vector<Setting> rot_;                       // the settings (one without YAH_NPU_PROF_ROT)
+  std::map<std::string, std::uint32_t> occ_;       // per image, its jobs set up so far
+  std::vector<std::uint32_t> chosen_;              // each Setup's setting
   std::uint32_t combo_[2] = {};
   std::uint32_t cols_ = kCols;
   std::uint32_t nvals_ = 0;

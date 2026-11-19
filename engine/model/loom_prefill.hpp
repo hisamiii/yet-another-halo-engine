@@ -201,7 +201,9 @@ class LoomPrefill {
     const std::vector<std::uint32_t> v = prof->Finish(prof_tags_.size());
     std::fprintf(stderr, "npu prof: events %s\n", std::getenv("YAH_NPU_PROF"));
     for (std::size_t i = 0; i < prof_tags_.size(); ++i) {
-      std::fprintf(stderr, "npu prof: job %zu %s 0", i, prof_tags_[i].c_str());
+      // (the field after the tag: the job's counter setting, YAH_NPU_PROF_ROT)
+      std::fprintf(stderr, "npu prof: job %zu %s %u", i, prof_tags_[i].c_str(),
+                   i < prof->chosen().size() ? prof->chosen()[i] : 0u);
       for (std::uint32_t k = 0; k < NpuProf::kValues; ++k) std::fprintf(stderr, " %u", v[i * NpuProf::kValues + k]);
       std::fprintf(stderr, "\n");
     }
