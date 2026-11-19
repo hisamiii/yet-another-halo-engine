@@ -879,7 +879,7 @@ def dnseg_plan(rows):
         if nm.endswith(".ffn_down.weight") and E.FMT.get(ty):
             fmt, mt, kb = E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2]
             if fmt in TG.G.FMTS and TG.G.FMTS[fmt].get("kdiv", 1) == 1 and gen_gemv.FMT.get(fmt, (0,))[0] == 256:
-                DNSEG[(fmt, mt, kb)] = gen_gemv.kseg_layout(kb, NPU_FFNBLK, ffnblk_parts(NPU_FFNBLK))
+                DNSEG[(fmt, mt, kb)] = dn_kseg(kb, NPU_FFNBLK)
 
 
 @contextlib.contextmanager
@@ -898,7 +898,7 @@ def kseg_for(fmt, mt, kb):
     import gen_gemm_tile as TG
     TG.KSEG = DNSEG.get((fmt, mt, kb))
     if TG.KSEG and KSEG_F[0]:
-        TG.KSEG = gen_gemv.kseg_layout(kb, KSEG_F[0], ffnblk_parts(KSEG_F[0]))
+        TG.KSEG = dn_kseg(kb, KSEG_F[0])
     try:
         yield
     finally:
@@ -913,10 +913,53 @@ QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (n
 
 def ffnblk_parts(F):
     """(first pass, passes) of down's K parts over F features (engine/model/loom_prefill.hpp FfnBlkParts)."""
+    assert F % 1024 == 0, F
     P = F // 1024
     n = -(-P // 5)
     sizes = [P // n + (i < P % n) for i in range(n)]
     return tuple((sum(sizes[:i]), sizes[i]) for i in range(n))
+
+
+def ffnblk_units(F):
+    """(first unit, units, padded units) of down's K parts over F features, a unit 256 features (a super-block;
+    loom_prefill.hpp FfnBlkUnits). F of whole passes: ffnblk_parts. Else (Q' FFNSW5, F of whole 1280-feature groups):
+    the fewest parts of at most 4 groups, the shorter ones first; a part of 15 units reads 16 (its down image's K): the
+    16th is the next row's first block (DNSEG) times H's zero pad unit (npu_zpad_<F>.hal)."""
+    if F % 1024 == 0:
+        return tuple((4 * p0, 4 * n, 4 * n) for p0, n in ffnblk_parts(F))
+    assert F % 1280 == 0, F
+    G = F // 1280
+    n = -(-G // 4)
+    g = [G // n + (i >= n - G % n) for i in range(n)]
+    return tuple((5 * sum(g[:i]), 5 * g[i], -(-5 * g[i] // 4) * 4) for i in range(n))
+
+
+def ffnblk_apass(F):
+    """(Q') H's units a 64-token M block when F's down parts differ in padded size: H one layout [M block][units], a
+    part's A a window of it (gen_npu_gemm apass; the gate / up image's hpass); else 0: H in parts, [part][M block][its
+    units]."""
+    us = ffnblk_units(F)
+    return sum(u[2] for u in us) if len({u[2] for u in us}) > 1 else 0
+
+
+def dn_tag(r, p, ap):
+    """A down part image's name tag ("npu_ffndn<tag>_<fmt>"): its passes (A its own, no pad), else
+    "u<units>_<padded units>_<apass>"."""
+    return "%d" % (p // 4) if r == p and not ap else "u%d_%d_%d" % (r, p, ap)
+
+
+def ffnblk_pads(F, B):
+    """H's pad units (zero, the padded parts' last units) as (first unit, units apart) over the 64-token M blocks."""
+    us, ap, nb, out = ffnblk_units(F), ffnblk_apass(F), B // 64, []
+    for i, (_, r, p) in enumerate(us):
+        base = sum(u[2] for u in us[:i]) if ap else i * nb * p
+        out.extend((base + k, ap or p) for k in range(r, p))
+    return out
+
+
+def dn_kseg(kb, F):
+    """The K segments of a down whose last F columns the NPU reads (DNSEG): the GPU's, then each part's."""
+    return gen_gemv.kseg_layout_units(kb, F, ffnblk_units(F))
 
 
 def npu_chunks(site):
@@ -1376,7 +1419,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     import gen_gemm_tile as TG
     import gen_npu_unpack as GU
     F, FS = NPU_FFNBLK, NPU_FFNBLKS   # (pairs, single-format layers)
-    assert F % 1024 == 0 and FS % 1024 == 0 and B % AF_TILE["bn"] == 0 and (FS == F or NPU_Q)
+    assert F % 1024 == 0 and (FS % 1024 == 0 or FS % 1280 == 0) and B % AF_TILE["bn"] == 0 and (FS == F or NPU_Q)
     by = {}
     for nm, dims, ty in rows:
         p = nm.split(".")
@@ -1390,13 +1433,16 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     q4kdn = os.environ.get("YAH_NPU_FFNQ4K", "1") == "1"
     rows = NPU_ROWS if NPU_QP1K else NPU_COLS * 64   # down rows per call (NP 4; Q': the P1K site image's)
     qcalls = 4 * ffnblk_parts(F)[0][1]   # (Q': a K part's qsw calls, its down's passes)
-    qcallss = 4 * ffnblk_parts(FS)[0][1]
-    sw5 = FFNSW5 and NPU_Q and all(p % 5 == 0 for _, p in ffnblk_parts(FS))   # (FFNSW5: whole 1280-feature groups)
+    qcallss = ffnblk_apass(FS) or ffnblk_units(FS)[0][2]   # (H's units a 64-token M block in a part, or in all)
+    # (FFNSW5: whole 1280-feature groups)
+    sw5 = FFNSW5 and NPU_Q and FS % 1280 == 0 and all(r % 5 == 0 for _, r, _ in ffnblk_units(FS))
     sw5 = sw5 and all(gen_gemv.rseg_ok(l["ffn_gate"][1] * 16, FS) for l in by.values() if l.get("ffn_gate"))
     for f_ in {F, FS}:
-        assert not NPU_Q or (NPU_QP1K and len({p for _, p in ffnblk_parts(f_)}) == 1), \
-            "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and K parts of one size (F = 5120, 8192, 10240, ..)"
-    assert len(ffnblk_parts(F)) == len(ffnblk_parts(FS)), "the unpack sums one count of K parts"
+        assert not NPU_Q or (NPU_QP1K and ((f_ % 1024 == 0 and len({u[2] for u in ffnblk_units(f_)}) == 1)
+                                           or (f_ == FS and sw5 and NPU_DNSEG))), \
+            "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and K parts of one size (F = 5120, 8192, 10240, ..; " \
+            "FFNSW5 with DNSEG: any F of whole 1280-feature groups)"
+    assert len(ffnblk_units(F)) == len(ffnblk_units(FS)), "the unpack sums one count of K parts"
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
           and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in dfmts]
     # gate and up of two formats, or one without a fused GPU gate / up (its gate kstore and up swiglu): pairs
@@ -1479,16 +1525,21 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         with kseg_f((kb - kbw) * 256):
             out.append(_emit_gen(gen_rem_rr, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d_rr.hal" % (fmt, kbw), outdir,
                                  "kres", tr.rowgrp, kfull=kb))
-    for fmt, mt, kb, passes in sorted({l["ffn_down"] + (p,) for l in ok + pairs for _, p in ffnblk_parts(lf(l))}):
+    for fmt, mt, kb, r, p, ap in sorted({l["ffn_down"] + (u[1], u[2], ffnblk_apass(lf(l))) for l in ok + pairs
+                                         for u in ffnblk_units(lf(l))}):
         if True:
             if NPU_Q:   # (Q': the site image of down's raw K (a part's), A bound to H; the NP 4 formats' at NP 4)
-                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, 4 * passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
-                                       kraw=0 if (fmt, mt, kb) in DNSEG else kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1,
+                # (a padded part: its segment's rows r blocks apart, read p blocks wide; ap: A an H window)
+                assert r == p or (fmt, mt, kb) in DNSEG, (fmt, r, p)
+                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, p, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
+                                       kraw=r * 256 if r != p else 0 if (fmt, mt, kb) in DNSEG else kb * 256,
+                                       fmt=DCOL_FMTS[fmt][0], rawdma=1, apass=ap,
                                        gord="GF" if fmt == "q4k" else "P4"),   # (H in P4 order)
-                             "npu_ffndn%d_%s" % (passes, fmt), 4 if np4(fmt) else NPU_NP))
+                             "npu_ffndn%s_%s" % (dn_tag(r, p, ap), fmt), 4 if np4(fmt) else NPU_NP))
                 continue
-            jobs.append((npu_cfg(B, NPU_KS, passes, kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0],
-                                 **KCHAIN(fmt)), "npu_ffndn%d_%s" % (passes, fmt), 4))
+            assert r == p and not ap
+            jobs.append((npu_cfg(B, NPU_KS, p // 4, kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0],
+                                 **KCHAIN(fmt)), "npu_ffndn%d_%s" % (p // 4, fmt), 4))
     for (gf, mt, kb), (uf, _, _), hord in sorted({(l["ffn_gate"], l["ffn_up"], hord_of(l["ffn_down"][0]))
                                                   for l in pairs}):
         # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = F)
@@ -1559,6 +1610,15 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     open(src, "w").write(text_rr)
     E.emit(src, ["nop=0"], name + "_rr.hal", outdir)
     out.append((name + "_rr.hal", B * calls * NPU_COLS * nj // wg, wg, 0))
+    for f_ in sorted({F, FS}):   # (padded down parts) zeros into H's pad units, before the gate / up job each layer
+        pads = ffnblk_pads(f_, B)
+        if pads:
+            us = ffnblk_units(f_)
+            zn = "npu_zpad_%d" % f_
+            src = os.path.join(tmp, zn + ".loom")
+            open(src, "w").write(GU.gen_zpad(B // 64, pads, B // 64 * sum(u[2] for u in us) * 18432))
+            E.emit(src, ["nop=0"], zn + ".hal", outdir)
+            out.append((zn + ".hal", B // 64 * len(pads), GU.ZPAD_WG, 0))
     dn4 = sorted({j[1].split("_")[-1] for j in jobs if j[1].startswith("npu_ffndn") and j[2] == 4 != NPU_NP})
     if dn4:   # (Q') the NP 4 downs' sum: 512-row calls at TN 64 ("npu_unpack_ffnblk_4.hal", "npuffnblk4")
         rows4, cg = NPU_COLS * 64, GU.CG
@@ -1632,15 +1692,15 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         out.append(("npuffnsw5", 320, 0, 0))
         out.extend(("npursegl_" + n, FS, 0, 0) for n, l in sorted(by.items()) if l in ok)
         RSEG_GEMMS.update(l["ffn_gate"] for l in ok)
-    for passes in sorted({p for f_ in {F, FS} for _, p in ffnblk_parts(f_)}):
-        dns = [j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes)]
+    for tag in sorted({dn_tag(r, p, ffnblk_apass(f_)) for f_ in {F, FS} for _, r, p in ffnblk_units(f_)}):
+        dns = [j for j in jobs if j[1].startswith("npu_ffndn%s_" % tag)]
         dn = next((j for j in dns if j[2] == NPU_NP), dns[0])
         with GN.np_override(dn[2]):
-            out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
+            out.append(("npubytes_ffndn%s" % tag,) + tuple(GN.stream_bytes(dn[0])))
         if dn4:   # (Q') the NP 4 downs'
             dn = next(j for j in dns if j[2] == 4)
             with GN.np_override(4):
-                out.append(("npubytes4_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
+                out.append(("npubytes4_ffndn%s" % tag,) + tuple(GN.stream_bytes(dn[0])))
     if pairs:   # (the mixed / BFP pairs': their GPU side's features)
         out.append(("npuffnpair", F, 0, 0))
     return jobs
@@ -1836,7 +1896,7 @@ def main():
         finally:
             GE.GROUPS, GU.CG = groups, cg
     for kind, fmt, port, mt, kb in sorted(c for c in combos if c[1:2] + c[3:] in FFNBLKS_DOWNS):
-        sfx = gen_gemv.kseg_suffix(gen_gemv.kseg_layout(kb, NPU_FFNBLKS, ffnblk_parts(NPU_FFNBLKS)))
+        sfx = gen_gemv.kseg_suffix(dn_kseg(kb, NPU_FFNBLKS))
         name = lambda k: "gemm_%s_%s_%d_%d%s.hal" % (k, fmt, mt, kb, sfx)
         with kseg_f(NPU_FFNBLKS):
             for k in gemm_kinds(kind, mt):

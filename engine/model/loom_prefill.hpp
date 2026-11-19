@@ -94,10 +94,10 @@ class LoomPrefill {
     return out;
   }
   // The K segments of a down of kb blocks under an FFN block of F features: the GPU's K part [0, K - F), then the
-  // NPU's K parts (FfnBlkParts) in order.
+  // NPU's K parts (FfnBlkUnits) in order.
   static KSeg KSegFor(std::uint32_t F, std::uint32_t kb) {
     KSeg s{{0, kb - F / 256}};
-    for (const auto& [p0, passes] : FfnBlkParts(F)) s.push_back({kb - F / 256 + 4 * p0, 4 * passes});
+    for (const FfnPart& u : FfnBlkUnits(F)) s.push_back({kb - F / 256 + u.u0, u.r});
     return s;
   }
 
@@ -160,12 +160,12 @@ class LoomPrefill {
       p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.c_bytes = std::max(p.c_bytes, q.c_bytes);
     if (FfnBlkF()) {   // the FFN block: gate / up's activations; H and down's partials in C
       p.a_bytes = std::max(p.a_bytes, NpuK(5120).a);
-      const auto parts = FfnBlkParts(FfnBlkF());
-      p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls() *
-                                                         NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c);
+      const auto parts = FfnBlkUnits(FfnBlkF());
+      const std::string tag = DnTag(parts[0], FfnBlkApass(FfnBlkF()));
+      p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls() * NpuBytesOf("npubytes_ffndn" + tag).c);
       if (geom_.count("npuffnblk4"))
         p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls(true) *
-                                                           NpuBytesOf("npubytes4_ffndn" + std::to_string(parts[0].second)).c);
+                                                           NpuBytesOf("npubytes4_ffndn" + tag).c);
     }
     p.dcol = geom_.count("npudcol") != 0;
     p.gfirst = geom_.count("npugfirst") != 0;
@@ -1153,8 +1153,50 @@ class LoomPrefill {
     }
     return parts;
   }
+  // A down K part over F (emit_prefill_pp ffnblk_units): its first unit (256 features, a super-block) within F, its
+  // units, and the units its image reads (padded: a part of 15 reads 16, the 16th its segment's next row's first block
+  // times H's zero pad unit, npu_zpad_<F>.hal).
+  struct FfnPart {
+    std::uint32_t u0, r, p;
+  };
+  // F of whole passes: FfnBlkParts. Else (F of whole 1280-feature groups, the NP 5 gate / up): the fewest parts of at
+  // most 4 groups, the shorter ones first.
+  static std::vector<FfnPart> FfnBlkUnits(std::uint32_t F) {
+    std::vector<FfnPart> out;
+    if (F % 1024 == 0) {
+      for (const auto& [p0, n] : FfnBlkParts(F)) out.push_back({4 * p0, 4 * n, 4 * n});
+      return out;
+    }
+    if (F % 1280) throw LoomError("prefill: FFN block of " + std::to_string(F) + " features: not whole passes or groups");
+    const std::uint32_t G = F / 1280, n = (G + 3) / 4;
+    for (std::uint32_t i = 0, u0 = 0; i < n; ++i) {
+      const std::uint32_t r = 5 * (G / n + (i >= n - G % n));
+      out.push_back({u0, r, (r + 3) / 4 * 4});
+      u0 += r;
+    }
+    return out;
+  }
+  // H's units a 64-token M block when F's parts differ in padded size (H one [M block][units] layout, a part's A a
+  // window of it), else 0 (H in parts, [part][M block][its units]).
+  static std::uint32_t FfnBlkApass(std::uint32_t F) {
+    const auto us = FfnBlkUnits(F);
+    std::uint32_t sum = 0;
+    bool same = true;
+    for (const FfnPart& u : us) sum += u.p, same = same && u.p == us[0].p;
+    return same ? 0 : sum;
+  }
+  // A down part image's tag (emit_prefill_pp dn_tag): "npu_ffndn<tag>_<fmt>", "npubytes_ffndn<tag>"
+  static std::string DnTag(const FfnPart& u, std::uint32_t apass) {
+    return u.r == u.p && !apass ? std::to_string(u.p / 4)
+                                : "u" + std::to_string(u.r) + "_" + std::to_string(u.p) + "_" + std::to_string(apass);
+  }
+  static std::size_t FfnBlkHOf(std::uint32_t B, std::uint32_t F) {
+    std::size_t units = 0;
+    for (const FfnPart& u : FfnBlkUnits(F)) units += u.p;
+    return std::size_t{B / 64} * units * 18432;
+  }
   // H's bytes in C (from 0), then down's partials from FfnBlkDown().
-  std::size_t FfnBlkH() const { return std::size_t{B_ / 64} * (FfnBlkF() / 1024) * 4 * 128 * 144; }
+  std::size_t FfnBlkH() const { return FfnBlkHOf(B_, FfnBlkF()); }
   std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
   static int DecoderId(const char* fmt) {
     static const char* const kDecoders[] = {"iq4xs", "iq3s",  "iq3xxs", "q4k",  "q3k",
@@ -1201,10 +1243,11 @@ class LoomPrefill {
     const bool mix = bmix || (pair && ::access((mixed + ".xdna").c_str(), R_OK) == 0);
     if (pair && !mix) return false;   // (a pair needs its mixed image)
     const std::string sw = bmix ? dir_ + "/npu_ffnsw_bfp" + hord : mix ? mixed : dir_ + "/npu_ffnsw_" + f.name + hord;
-    const auto parts = FfnBlkParts(F);
+    const auto parts = FfnBlkUnits(F);
+    const std::uint32_t apass = FfnBlkApass(F);
     std::vector<std::string> dn;
-    for (const auto& [p0, passes] : parts) {
-      dn.push_back(dir_ + "/npu_ffndn" + std::to_string(passes) + "_" + fd.name);
+    for (const FfnPart& u : parts) {
+      dn.push_back(dir_ + "/npu_ffndn" + DnTag(u, apass) + "_" + fd.name);
       if (::access((dn.back() + ".xdna").c_str(), R_OK)) return false;
     }
     if ((pair ? gs.empty() || us.empty() || !Af("gemm_kstore", pre + "ffn_gate.weight") ||
@@ -1254,10 +1297,12 @@ class LoomPrefill {
       throw LoomError("prefill: " + pre + "ffn_down's K segments differ from the set's (DownKSegs)");
     for (std::size_t ci = 0; ks && ci < parts.size(); ++ci)
       if (ks->size() != parts.size() + 1 ||
-          (*ks)[ci + 1] != std::pair<std::uint32_t, std::uint32_t>{static_cast<std::uint32_t>(f0 / 256 + 4 * parts[ci].first),
-                                                                   4 * parts[ci].second})
+          (*ks)[ci + 1] != std::pair<std::uint32_t, std::uint32_t>{static_cast<std::uint32_t>(f0 / 256 + parts[ci].u0),
+                                                                   parts[ci].r})
         throw LoomError("prefill: " + pre + "ffn_down's K segments are not the FFN block's parts");
-    const std::size_t srb = ks ? std::size_t{parts[0].second} * 4 * blkd : rbd;
+    for (const FfnPart& u : parts)
+      if (u.r != u.p && !ks) throw LoomError("prefill: " + pre + "a padded down part needs its rows in K segments");
+    const auto srb = [&](std::size_t ci) { return ks ? std::size_t{parts[ci].r} * blkd : rbd; };   // (a part's row stride)
     if (npu_planning_) {   // the NPU's gate / up rows (one range when up follows gate), all of down
       const std::size_t end = gguf_.tensor_data_size();
       if (bmix) {
@@ -1281,15 +1326,28 @@ class LoomPrefill {
     const std::uint32_t fc = np5 ? 320 : 256;   // (features a call)
     const NpuBytes bs = NpuBytesOf(np5 ? "npubytes5_ffnsw" : "npubytes_ffnsw");
     const bool qffn = geom_.count("npuffnq") != 0;
-    if (np5 && (!qffn || parts[0].second % 5 || weights_.RSegOf(*tg) != F || weights_.RSegOf(*tu) != F))
-      throw LoomError("prefill: the NP 5 FFN gate / up needs Q' parts of 5 passes and its rows in row segments of F");
-    const std::uint32_t qc = 4 * parts[0].second;   // (Q': a part's calls; its H bytes qpart)
-    const std::size_t qpart = std::size_t{B_ / 64} * parts[0].second * 4 * 128 * 144;
-    for (const auto& pp : parts)
-      if (qffn && pp.second != parts[0].second) throw LoomError("prefill: the Q' FFN block's K parts differ in size");
-    const std::uint32_t q5 = parts[0].second * 1024 / 320;   // (np5: a part's calls)
+    bool g5 = true;   // (np5: parts of whole 1280-feature groups)
+    for (const FfnPart& u : parts) g5 = g5 && u.r % 5 == 0;
+    if (np5 && (!qffn || !g5 || weights_.RSegOf(*tg) != F || weights_.RSegOf(*tu) != F))
+      throw LoomError("prefill: the NP 5 FFN gate / up needs Q' parts of whole groups and its rows in row segments of F");
+    const std::uint32_t qc = parts[0].p;   // (Q': a part's calls; its H bytes qpart)
+    const std::size_t qpart = std::size_t{B_ / 64} * parts[0].p * 18432;
+    for (const FfnPart& u : parts)
+      if (qffn && (u.p != parts[0].p || u.r != u.p) && !np5)
+        throw LoomError("prefill: the Q' FFN block's K parts differ in size");
+    // a part's H start: apass, unit U of the M block's [M block][units] (the image's hpass apass); else its own region
+    const auto hbase = [&](std::size_t ci) {
+      std::size_t U = 0;
+      for (std::size_t i = 0; i < ci; ++i) U += parts[i].p;
+      return apass ? U * 18432 : ci * std::size_t{B_ / 64} * parts[ci].p * 18432;
+    };
     const auto c_sw = [&](std::uint32_t j) {
-      if (np5) return NpuView{j / q5 * qpart + std::size_t{(j % q5) / 4} * 5 * 4 * 4608 + (j % 4) * 8 * 144, bs.c};
+      if (np5) {   // (call j: group j / 4, in the part holding units 5 (j / 4) ..)
+        const std::uint32_t u = 5 * (j / 4);
+        std::size_t ci = 0;
+        while (u >= parts[ci].u0 + parts[ci].r) ++ci;
+        return NpuView{hbase(ci) + std::size_t{u - parts[ci].u0} * 18432 + (j % 4) * 8 * 144, bs.c};
+      }
       return NpuView{qffn ? j / qc * qpart + std::size_t{j % qc} * 4 * 4608 : (j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144,
                      bs.c};
     };
@@ -1312,22 +1370,37 @@ class LoomPrefill {
     const bool dn4 = FfnDn4(fd.name);
     const std::string bytes = dn4 ? "npubytes4_ffndn" : "npubytes_ffndn";
     const std::uint32_t rows = FfnBlkRows(dn4), calls = FfnBlkCalls(dn4);
-    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf(bytes + std::to_string(parts[0].second)).c;
+    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf(bytes + DnTag(parts[0], apass)).c;
+    std::vector<std::string> dtag;
     for (std::size_t ci = 0; ci < parts.size(); ++ci) {
-      const auto [p0, passes] = parts[ci];
+      const FfnPart u = parts[ci];
+      dtag.push_back(DnTag(u, apass));
       // (an NP 4 down: its own family, its array state differs from the NP 5 images')
-      const std::string fam = "ffndn" + std::to_string(passes) + (dn4 ? std::string("_") + fd.name : "");
-      const NpuBytes bd = NpuBytesOf(bytes + std::to_string(passes));
+      const std::string fam = "ffndn" + dtag.back() + (dn4 ? std::string("_") + fd.name : "");
+      const NpuBytes bd = NpuBytesOf(bytes + dtag.back());
       if (bd.c != cp) throw LoomError("prefill: the FFN block's down parts differ in C bytes");
       for (std::uint32_t r = 0; r < calls; ++r) {
-        const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + 4 * p0;
+        const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + u.u0;
+        // (a padded part's last row reads p - r blocks on: the next segment's, or past the tensor in its registered pad)
         cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", dn[ci] + ".xdna", DecoderId(fd.name),
-                                        {qffn ? ci * qpart : std::size_t{p0} * 4 * 128 * 144, bd.a, true},
-                                        ks ? pd + td->dims[1] * (*ks)[ci + 1].first * blkd + r0 * srb
+                                        {qffn ? hbase(ci) : std::size_t{u.u0} * 18432, bd.a, true},
+                                        ks ? pd + td->dims[1] * (*ks)[ci + 1].first * blkd + r0 * srb(ci)
                                            : pd + r0 * rbd + k0 * blkd,
-                                        (rows - 1) * srb + 16 * blkd + RecordRow(fd.name),
+                                        (rows - 1) * srb(ci) + (16 + u.p - u.r) * blkd + RecordRow(fd.name),
                                         {doff + (ci * calls + r) * cp, cp}, fam));
       }
+    }
+    // (padded parts) H's pad units zeroed (npu_zpad_<F>.hal): the GPU's write of C orders before the job's gate store
+    // (NpuEnqueue: the store writes C), after every joined job's C
+    const std::string zpad = "npu_zpad_" + std::to_string(F) + ".hal";
+    bool padded = false;
+    for (const FfnPart& u : parts) padded = padded || u.r != u.p;
+    if (padded) {
+      if (!geom_.count(zpad)) throw LoomError("prefill: padded down parts without " + zpad);
+      if (!npu_planning_ && npu_joined_ != flagged_.size())
+        throw LoomError("prefill: " + zpad + " with an NPU job not joined (its C writes unordered)");
+      Dispatch(Exe(zpad), "yah_npu_zpad", geom_.at(zpad).tokens, 1, 1, geom_.at(zpad).rowgrp, 1, 1,
+               {CView({0, FfnBlkHOf(B_, F)})});
     }
     NpuEnqueue(std::move(csw), "ffnsw");
     // the down's K parts as one job when they run one image (no GPU work between them: a job boundary, ~120 us, saved;
@@ -1339,7 +1412,7 @@ class LoomPrefill {
         cdn[ci + 1].insert(cdn[ci + 1].begin(), cdn[ci].begin(), cdn[ci].end());
         continue;
       }
-      NpuEnqueue(std::move(cdn[ci]), "ffndn" + std::to_string(parts[ci].second));
+      NpuEnqueue(std::move(cdn[ci]), "ffndn" + dtag[ci]);
     }
     if (pair) {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
