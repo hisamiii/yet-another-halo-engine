@@ -1410,6 +1410,13 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 for pk in (False, True):
                     unorm["npu_unorm%s.hal" % ("_pk" if pk else "")] = gen_half_norm.gen_unorm(
                         B, list(NPU_KS), NPU_PASSES, len(parts), pk)
+            # after the "_rr" sum: the sum, the stream and the f16 output(s) in one pass ("npu_unorm_rr_<r|t|rt>[_pk]",
+            # TN 64 or 80: gen_unorm indexes each column in full at 80)
+            if {"qkv", "q"} & set(NPU_SPLIT) and (N - rows) == (calls - 1) * NPU_COLS * GN.TN and GN.TN in (64, 80):
+                for pk in (False, True):
+                    for f16 in ("r", "t", "rt"):
+                        unorm["npu_unorm_rr_%s%s.hal" % (f16, "_pk" if pk else "")] = gen_half_norm.gen_unorm(
+                            B, list(NPU_KS), NPU_PASSES, len(parts), pk, remres=True, f16=f16)
     finally:
         GU.CG = cg
     src = os.path.join(tmp, name + ".loom")
@@ -1432,6 +1439,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                               dup=((calls4 - 1) * NPU_COLS, N - rows4))
                 text4_rr = GU.gen(B, calls4 * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
                                   dup=((calls4 - 1) * NPU_COLS, N - rows4), remres=True)
+                if {"qkv", "q"} & set(NPU_SPLIT) and calls4 * rows4 == N:   # (as above, the NP 4 downs at TN 64)
+                    for pk in (False, True):
+                        for f16 in ("r", "t", "rt"):
+                            unorm["npu_unorm4_rr_%s%s.hal" % (f16, "_pk" if pk else "")] = gen_half_norm.gen_unorm(
+                                B, list(NPU_KS), NPU_PASSES, len(parts), pk, remres=True, f16=f16)
                 nj4, wg4 = GN.TN // 8, GU.wg(calls4 * NPU_COLS)
         finally:
             GU.CG = cg

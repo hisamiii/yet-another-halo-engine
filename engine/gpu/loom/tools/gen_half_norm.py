@@ -486,7 +486,7 @@ def bfp_copy_out(e, nkb, wpr, nth, tokens, ks, passes, abv, pre):
             e("  }")
 
 
-def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=False):
+def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=False, remres=False, f16=None):
     """yah_unorm in one pass: the NPU FFN block's sum (hidden + the GPU's f32 down + the NPU's `parts` bf16 partials,
     gen_npu_unpack.gen's order) fused with the next layer's RMS norm into the NPU's BFP16 activation stream
     (gen_bfp16_encode "act" (tokens, ks, passes), as gen_split bfp writes it; with pk also in Q4_K's k-block order).
@@ -495,11 +495,15 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     part p holds row columns 32 m p + l + 32 k (k < m). It stores the sum as it forms it, then normalizes in place;
     the 8 columns of a bfp16ebs8 row block are 8 neighbouring lanes, whose max |h| (the shared exponent) is 3 xor
     shuffles (max is exact in any order), so each lane encodes its own mantissa byte into the LDS staging of
-    split_bfp_out, copied out by bfp_copy_out."""
+    split_bfp_out, copied out by bfp_copy_out.
+    remres: rem already holds hidden + the GPU's down (gen_npu_unpack remres): the sum is rem + the C parts, no resid
+    binding. f16 ("r", "t", "rt"): also the norm's f16 output for the GPU's GEMMs, row-major (binding hf16 after out),
+    fragment-major ([row / 16][col / 16][row % 16][col % 16], binding hf16t), or both, from the same values as the
+    stream (RunNorm's kRow / kTiled / kBoth), so no second norm pass follows."""
     import gen_bfp16_encode as GE
     import gen_npu_gemm as GN
     import gen_npu_unpack as GU
-    assert GN.TN == 64 and GU.CG == 1 and wpr == 4 and split >= 2
+    assert GN.TN in (64, 80) and GU.CG == 1 and wpr == 4 and split >= 2
     n = dim // 32
     m = n // split
     assert (32 * m) % 64 == 0
@@ -524,8 +528,9 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     e(f"  %cwgs = index.constant {NTH} : index")
     e("  %wgs = index.div %rows, %cwpr : index")
     e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%cwgs, %unit, %unit) : index")
-    e("} launch(%c: buffer, %resid: buffer, %rem: buffer, %weight: buffer, %out: buffer, %ab: buffer"
-      + (", %abk: buffer" if pk else "") + ") {")
+    e("} launch(%c: buffer" + ("" if remres else ", %resid: buffer") + ", %rem: buffer, %weight: buffer, %out: buffer"
+      + (", %hf16: buffer" if f16 and "r" in f16 else "") + (", %hf16t: buffer" if f16 and "t" in f16 else "")
+      + ", %ab: buffer" + (", %abk: buffer" if pk else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for p in range(split):
         e(f"  %c{p}i = index.constant {p} : index")
@@ -535,13 +540,22 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     e("  %eps = config.get @yah_half_norm.eps : f32")
     e("  %rows = config.get @yah_half_norm.rows : index")
     e("  %total_elems = index.mul %rows, %dim : index")
-    e("  %c_na, %x_na, %rem_na, %weight_na, %out_na = buffer.assume.noalias %c, %resid, %rem, %weight, %out : "
-      "buffer, buffer, buffer, buffer, buffer")
+    if remres:
+        e("  %c_na, %rem_na, %weight_na, %out_na = buffer.assume.noalias %c, %rem, %weight, %out : "
+          "buffer, buffer, buffer, buffer")
+    else:
+        e("  %c_na, %x_na, %rem_na, %weight_na, %out_na = buffer.assume.noalias %c, %resid, %rem, %weight, %out : "
+          "buffer, buffer, buffer, buffer, buffer")
     e(f"  %nc = index.constant {tokens * dim * parts // 2} : index")   # bf16 pairs
     e("  %cv = buffer.view %c_na[%base] : buffer -> view<[%nc]xi32>")
-    e("  %x_view = buffer.view %x_na[%base] : buffer -> view<[%total_elems]xf32>")
+    if not remres:
+        e("  %x_view = buffer.view %x_na[%base] : buffer -> view<[%total_elems]xf32>")
     e("  %rem_view = buffer.view %rem_na[%base] : buffer -> view<[%total_elems]xf32>")
     e("  %hout_view = buffer.view %out_na[%base] : buffer -> view<[%total_elems]xf32>")
+    if f16 and "r" in f16:
+        e("  %hf16v = buffer.view %hf16[%base] : buffer -> view<[%total_elems]xf16>")
+    if f16 and "t" in f16:
+        e("  %hf16tv = buffer.view %hf16t[%base] : buffer -> view<[%total_elems]xf16>")
     e("  %weight_view = buffer.view %weight_na[%base] : buffer -> view<[%dim]xf32>")
     e(f"  %nab4 = index.constant {nab // 4} : index")
     e("  %abv = buffer.view %ab[%base] : buffer -> view<[%nab4]xi32>")
@@ -595,7 +609,7 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     for k in range(m):
         e(f"  %o{k} = index.constant {32 * k} : index")
         e(f"  %a{k} = index.add %lane_base, %o{k} : index")
-        unpack_x(e, k, tokens, dim, parts)
+        unpack_x(e, k, tokens, dim, parts, remres)
         e(f"  view.store %x{k}, %hout_view[%a{k}] : f32, view<[%total_elems]xf32>")
     for k in range(m):
         e(f"  %q{k} = scalar.mulf %x{k}, %x{k} : f32")
@@ -659,6 +673,15 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     for msk in (1, 2, 4):
         e(f"  %bx{msk} = scalar.constant {msk} : i32")
     e("  %bx32 = scalar.constant 32 : i32")
+    if f16 and "t" in f16:   # (row / 16) (dim / 16) 256 + (row % 16) 16, then (col / 16) 256 + col % 16 per k
+        e("  %uf16 = index.constant 16 : index")
+        e("  %uf256 = index.constant 256 : index")
+        e(f"  %ufrs = index.constant {dim // 16 * 256} : index")
+        e("  %uftr = index.div %row, %uf16 : index")
+        e("  %uftm = index.rem %row, %uf16 : index")
+        e("  %uft0 = index.mul %uftr, %ufrs : index")
+        e("  %uft1 = index.mul %uftm, %uf16 : index")
+        e("  %uftb = index.add %uft0, %uft1 : index")
     for k in range(m):
         w = f"%w{k}"
         e(f"  %wi{k} = index.add %lane_w, %o{k} : index")
@@ -669,6 +692,15 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
         e(f"  %nm{k} = scalar.mulf %x{k}, %inv : f32")
         e(f"  %wt{k} = scalar.mulf %nm{k}, {w} : f32")
         e(f"  %h{k} = scalar.fptrunc %wt{k} : f32 to f16")
+        if f16 and "r" in f16:
+            e(f"  view.store %h{k}, %hf16v[%a{k}] : f16, view<[%total_elems]xf16>")
+        if f16 and "t" in f16:
+            e(f"  %ufc{k} = index.div %wi{k}, %uf16 : index")
+            e(f"  %ufm{k} = index.rem %wi{k}, %uf16 : index")
+            e(f"  %ufd{k} = index.mul %ufc{k}, %uf256 : index")
+            e(f"  %ufe{k} = index.add %uftb, %ufd{k} : index")
+            e(f"  %uff{k} = index.add %ufe{k}, %ufm{k} : index")
+            e(f"  view.store %h{k}, %hf16tv[%uff{k}] : f16, view<[%total_elems]xf16>")
         e(f"  %v{k} = scalar.extf %h{k} : f16 to f32")
         e(f"  %ab{k} = scalar.absf %v{k} : f32")
         cur = f"%ab{k}"
@@ -726,11 +758,22 @@ def unpack_lane(e, m, tokens):
     """yah_unorm's per-lane C word base. Lane l of part p reads output columns o = 32 m p + l + 32 k (k < m); at TN = 64
     (gen_npu_unpack c_lane / c_tok) o's element is c_tok(row) + (o / 64) * 64 tokens + 512 (k % 2) + 256 (l / 16) +
     64 ((l / 8) % 2) + l % 8, a constant per k past the lane's base. Its parity is the lane's: the bf16 is the low half of
-    its word on even lanes (shift left 16), the high half on odd ones (shift 0), then masked."""
+    its word on even lanes (shift left 16), the high half on odd ones (shift 0), then masked. At TN = 80 a lane's columns
+    cross NPU columns unevenly, so unpack_x indexes each one in full (c_lane's split) from the token part %utb."""
+    import gen_npu_gemm as GN
     import gen_npu_unpack as GU
     for nm, v in (("c8u", 8), ("c16u", 16), ("c64u", 64), ("c256u", 256), ("cpcol", m // 2 * 64 * tokens)):
         e(f"  %{nm} = index.constant {v} : index")
     tb = GU.c_tok(e, "ut_", "%row")
+    if GN.TN != 64:
+        e(f"  %utn = index.constant {GN.TN} : index")
+        e(f"  %utcs = index.constant {tokens * GN.TN} : index")
+        e("  %uc4 = index.constant 4 : index")
+        e(f"  %utb = index.add {tb}, %c0i : index")
+        e("  %upar = index.rem %lane, %c2 : index")
+        e("  %uodd = index.cmp eq, %upar, %c1i : index")
+        e("  %ush = scf.select %uodd, %c0i32, %c16i : i32")
+        return
     e("  %ul0 = index.mul %part, %cpcol : index")
     e("  %ul1 = index.div %lane, %c16u : index")
     e("  %ul2 = index.mul %ul1, %c256u : index")
@@ -748,13 +791,35 @@ def unpack_lane(e, m, tokens):
     e("  %ush = scf.select %uodd, %c0i32, %c16i : i32")
 
 
-def unpack_x(e, k, tokens, dim, parts):
-    """x{k} of yah_unorm's first pass: resid + ((C part 0 + part 1 + ..) + rem), gen_npu_unpack.gen's order."""
+def unpack_x(e, k, tokens, dim, parts, remres=False):
+    """x{k} of yah_unorm's first pass: resid + ((C part 0 + part 1 + ..) + rem), gen_npu_unpack.gen's order (remres:
+    (C part 0 + part 1 + ..) + rem, as gen_npu_unpack remres)."""
+    import gen_npu_gemm as GN
+    if GN.TN != 64:   # column o = lane_w + 32 k: col * tokens * TN + (np * 4 + nh) * 64 + jj + the token part
+        e(f"  %xo{k} = index.add %lane_w, %o{k} : index")
+        e(f"  %xc{k} = index.div %xo{k}, %utn : index")
+        e(f"  %xq{k} = index.rem %xo{k}, %utn : index")
+        e(f"  %xj{k} = index.div %xq{k}, %c8u : index")
+        e(f"  %xjj{k} = index.rem %xq{k}, %c8u : index")
+        e(f"  %xnp{k} = index.div %xj{k}, %c2 : index")
+        e(f"  %xnh{k} = index.rem %xj{k}, %c2 : index")
+        e(f"  %xa0{k} = index.mul %xc{k}, %utcs : index")
+        e(f"  %xa1{k} = index.mul %xnp{k}, %uc4 : index")
+        e(f"  %xa2{k} = index.add %xa1{k}, %xnh{k} : index")
+        e(f"  %xa3{k} = index.mul %xa2{k}, %c64u : index")
+        e(f"  %xa4{k} = index.add %xa0{k}, %xa3{k} : index")
+        e(f"  %xa5{k} = index.add %xa4{k}, %xjj{k} : index")
+        e(f"  %xa6{k} = index.add %xa5{k}, %utb : index")
+        e(f"  %uwk{k} = index.div %xa6{k}, %c2 : index")
     val = None
     for p in range(parts):
-        off = (k // 2 * 64 * tokens + 512 * (k % 2) + p * tokens * dim) // 2
-        e(f"  %uo{k}_{p} = index.constant {off} : index")
-        e(f"  %ui{k}_{p} = index.add %uw, %uo{k}_{p} : index")
+        if GN.TN != 64:
+            e(f"  %uo{k}_{p} = index.constant {p * tokens * dim // 2} : index")
+            e(f"  %ui{k}_{p} = index.add %uwk{k}, %uo{k}_{p} : index")
+        else:
+            off = (k // 2 * 64 * tokens + 512 * (k % 2) + p * tokens * dim) // 2
+            e(f"  %uo{k}_{p} = index.constant {off} : index")
+            e(f"  %ui{k}_{p} = index.add %uw, %uo{k}_{p} : index")
         e(f"  %uv{k}_{p} = view.load %cv[%ui{k}_{p}] : view<[%nc]xi32> -> i32")
         e(f"  %us{k}_{p} = scalar.shli %uv{k}_{p}, %ush : i32")
         e(f"  %um{k}_{p} = scalar.andi %us{k}_{p}, %chii : i32")
@@ -765,6 +830,9 @@ def unpack_x(e, k, tokens, dim, parts):
             e(f"  %ua{k}_{p} = scalar.addf {val}, %uf{k}_{p} : f32")
             val = f"%ua{k}_{p}"
     e(f"  %ur{k} = view.load %rem_view[%a{k}] : view<[%total_elems]xf32> -> f32")
+    if remres:
+        e(f"  %x{k} = scalar.addf {val}, %ur{k} : f32")
+        return
     e(f"  %urs{k} = scalar.addf {val}, %ur{k} : f32")
     e(f"  %ux{k} = view.load %x_view[%a{k}] : view<[%total_elems]xf32> -> f32")
     e(f"  %x{k} = scalar.addf %ux{k}, %urs{k} : f32")

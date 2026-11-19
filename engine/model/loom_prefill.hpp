@@ -1282,7 +1282,8 @@ class LoomPrefill {
     // the sum into hidden() waits for the next layer's norm, which fuses it when it feeds the NPU (RunLayerNorm)
     ffn_pending_ = {doff, parts.size() * calls * cp};
     ffn_pending4_ = dn4;
-    if (!geom_.count("npu_unorm.hal") || dn4 || ffn_rr_) FlushFfn();   // (npu_unorm reads the NP 5 downs' C)
+    // (npu_unorm reads the NP 5 downs' C; after the "_rr" sum, "npu_unorm[4]_rr_*" takes any down)
+    if (ffn_rr_ ? !geom_.count(UnormRr(false, NormOut::kTiled)) : !geom_.count("npu_unorm.hal") || dn4) FlushFfn();
     return true;
   }
   // The FFN block's sum (hidden + the GPU's down + the NPU's partials) into hidden(), if RunFfnBlock left it pending.
@@ -1304,8 +1305,32 @@ class LoomPrefill {
   // "npu_unorm[_pk].hal" adds the sum and writes the NPU's BFP16 input (the Q4_K order too with pk) in one pass; the
   // f16 output(s) for the GPU's GEMMs follow in RunPendingNorm, recorded after the NPU job is released, so the job does
   // not wait for them.
+  // The fused sum + norm after the "_rr" sum with the f16 output(s) for mode (YAH_NPU_NOUNORMF=1: none, the sum and
+  // the norm as two passes).
+  std::string UnormRr(bool pk, NormOut mode) const {
+    static const bool off = std::getenv("YAH_NPU_NOUNORMF") != nullptr;
+    if (off) return "-";
+    return std::string(ffn_pending4_ ? "npu_unorm4_rr_" : "npu_unorm_rr_") +
+           (mode == NormOut::kRow ? "r" : mode == NormOut::kTiled ? "t" : "rt") + (pk ? "_pk.hal" : ".hal");
+  }
   void RunLayerNorm(const std::string& wname, NormOut mode, const char* npu_site, bool pk) {
-    if (!ffn_pending_.length || !npu_site || !geom_.count("npunormbfp")) {
+    if (ffn_pending_.length && ffn_rr_ && npu_site && geom_.count("npunormbfp") && geom_.count(UnormRr(pk, mode))) {
+      const std::size_t a = NpuK(5120).a;
+      std::vector<hrx_buffer_ref_t> b{CView(std::exchange(ffn_pending_, {})),
+                                      {ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4}, TRef(*Find(wname)),
+                                      Ref(*hidden2_)};
+      if (mode != NormOut::kTiled) b.push_back(Ref(*scratch_));
+      if (mode != NormOut::kRow) b.push_back(Ref(*normt_));
+      b.push_back({npu_->A().handle, 0, a});
+      if (pk) b.push_back({npu_->A().handle, npu_->A().size / 2, a});
+      const LoomExecutable& exe = Exe(UnormRr(pk, mode));
+      Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1, b,
+               ~std::uint64_t{0} << 3);
+      std::swap(hidden_, hidden2_);
+      norm_bfp_ = npu_site, norm_pk_ = pk ? npu_site : "";
+      return;
+    }
+    if (!ffn_pending_.length || !npu_site || !geom_.count("npunormbfp") || ffn_rr_) {
       FlushFfn();
       RunNorm(wname, mode, npu_site, pk);
       return;
