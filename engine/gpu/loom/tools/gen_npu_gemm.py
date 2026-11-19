@@ -235,7 +235,14 @@ QF_LANE2_PORT = 9   # (GN_QFLANE2) an egress row's second egress lane (its C cha
 def qfl2guard():
     """(GN_QFLANE2, GN_QFL2GUARD=1) in an egress row: its own slab acquires the second lane's slot of the helper copy
     that follows it (the copy skips that acquire), so the own decode starts only once the last copy was sent."""
-    return qflane2_on() and bool(QF4R[0]) and not QF4R[0]["help"] and os.environ.get("GN_QFL2GUARD") == "1"
+    return bool(QF4R[0]) and QF4R[0]["l2"] and not QF4R[0]["help"] and os.environ.get("GN_QFL2GUARD") == "1"
+
+
+def qflane2_side(side):
+    """Lane 2 in a column of this side ("w": a pair's gate (even) columns, "e": its up (odd) columns; images without
+    pairs are all "w"): GN_QFLANE2COLS=w|e (diag) limits it to one side."""
+    m = os.environ.get("GN_QFLANE2COLS", "")
+    return qflane2_on() and (not m or side == m)
 
 
 def qflane2_on():
@@ -2672,9 +2679,21 @@ def qf4r_other(e, NS, rawport, dp, direct):
             e("  %qxt = lda %qxp2, 24")
             e("  %qxn = add.rr %qxt, %qxd")
             e("  st %qxn, %qxp2, 24")
-        e(f"  %f4AE = mova.i32 {-1 if qfegr2_on() or qflane2_on() else -2}")
-        dp = QF_LANE2_PORT if qflane2_on() else dp   # (GN_QFLANE2: the helper's slab on the second egress lane)
+        l2_ = QF4R[0]["l2"]
+        e(f"  %f4AE = mova.i32 {-1 if qfegr2_on() or l2_ else -2}")
+        dp = QF_LANE2_PORT if l2_ else dp   # (GN_QFLANE2: the helper's slab on the second egress lane)
         qfw_wrap(e, "x", 40, [] if qfl2guard() else [f"  acq %f4AE, {dp}"])   # (guard: the own slab took it)
+        if os.environ.get("GN_QFL2DLY"):   # (diag) spin N trips before the copy's loads
+            e(f"  %f4dk = mov.i32 {int(os.environ['GN_QFL2DLY'])}")
+            e("  %f4dz = mova.i32 0")
+            e("  low.br ^f4dh(%f4dk: reg<aie2p.er>)")
+            e("^f4dh(%f4dc: reg<aie2p.er>):")
+            e("  %f4dm = lt %f4dz, %f4dc")
+            e("  low.cond_br %f4dm, ^f4db, ^f4dx : reg<aie2p.er>")
+            e("^f4db:")
+            e("  %f4dn = add %f4dc, -1")
+            e("  low.br ^f4dh(%f4dn: reg<aie2p.er>)")
+            e("^f4dx:")
         e("  %f4pS = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
         e("  %f4pN4 = storage_address %f4s : low.storage<private> -> reg<aie2p.ep>")
         e("  %f4nb = lda %f4pN4, 0")
@@ -2763,7 +2782,7 @@ def qf4r_other(e, NS, rawport, dp, direct):
             e("  st %qxn, %qxp2, 24")
         qfw_wrap(e, "c", 48, [] if os.environ.get("GN_QFNOCOPY") else cl_, mode="2")   # (GN_QFNOCOPY: diag, no copies)
         e("  %f4R2 = mova.i32 2")
-        e(f"  %f4RE = mova.i32 {1 if qfegr2_on() or qflane2_on() else 2}")
+        e(f"  %f4RE = mova.i32 {1 if qfegr2_on() or QF4R[0]['l2'] else 2}")
         e(f"  rel %f4RE, {dp}")
         e(f"  rel %f4R2, {QF4R_NB}")
         e("  %f4ec2 = add %f4ec, 2")
@@ -3150,7 +3169,8 @@ def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=Non
             qf4r_swap() and full_name.split("_")[0] == "tailm")
         QF_HALF[0] = 0 if full_name.startswith(("tailm0e", "tailmh")) else 1
         # (own records: multicast 0's rows (tailm0*) the even ones)
-        QF4R[0] = dict(par=0 if full_name.startswith("tailm0") else 1, help=hlp4)
+        QF4R[0] = dict(par=0 if full_name.startswith("tailm0") else 1, help=hlp4,
+                       l2=qflane2_side("e" if pair == "e" else "w"))   # (GN_QFLANE2: this column's lanes)
     lk = "" if tail and os.environ.get("GN_QUNLOCK") else "schedule(locked) "   # (probe: Loom's scheduler orders it)
     e(f"low.func.def {lk}target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{full_name}() asm {{")
     split_r1 = QF["cfg"] is not None and bool(QF.get("split")) and name.startswith("tailr")   # (row 1 decodes too)

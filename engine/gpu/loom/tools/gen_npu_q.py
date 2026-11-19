@@ -405,18 +405,22 @@ def array_program(L, cfg):
         e(f'  %frb = binding {7 if cfg.gate else 4}, "read"')
         if N.fpair(cfg):   # (column pairs) the up tensor's rows
             e(f'  %frbu = binding {8 if cfg.gate else 5}, "read"')
-        l2 = N.qflane2_on()   # (GN_QFLANE2) a second egress lane per egress row: its helper's records
+        # (GN_QFLANE2) a second egress lane per egress row: its helper's records (GN_QFLANE2COLS: one side's columns)
+        l2c = lambda c: N.qflane2_side("e" if N.fpair(cfg) and c % 2 else "w")
+        l2any, l2all = any(l2c(c) for c in range(cols)), all(l2c(c) for c in range(cols))
         nl_ = cols * len(egr)
-        if l2:
-            nrec //= 2
         e(f"  %fdl = constant.u32 {nl_} : reg<aie2p.array.scalar : index>")
         for i_, g_ in geo.items():
             e(f"  %fun{'u' if i_ else ''} = constant.u32 {g_['nraw']} : reg<aie2p.array.scalar : index>")
         eg2 = N.QF_P1KD["eb"] // N.QF_P1KD["rec"] if N.qfdirect_on() else 1   # (GN_QFEGR2: slab-sized egress records)
-        e(f"  %fdn = constant.u32 {nrec // eg2} : reg<aie2p.array.scalar : index>")
-        e(f"  %fd_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{nl_}x{nrec // eg2}x{fw * eg2}xi32>>")
-        if l2:   # (the second lanes' view of the same dummy binding: slab records)
-            e(f"  %fdb_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{nl_}x{nrec // 2}x{2 * fw}xi32>>")
+        if not l2all:   # (one-lane columns: every record on the first lane)
+            e(f"  %fdn = constant.u32 {nrec // eg2} : reg<aie2p.array.scalar : index>")
+            e(f"  %fd_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{nl_}x{nrec // eg2}x{fw * eg2}xi32>>")
+        if l2any:   # (two-lane columns: half the records on each; the second lane's view: slab records)
+            e(f"  %fdn{'' if l2all else '2'} = constant.u32 {nrec // 2} : reg<aie2p.array.scalar : index>")
+            e(f"  %fd_all{'' if l2all else '2'} = receiver %fdb, 0 : "
+              f"reg<aie2p.array.receiver : tile<{nl_}x{nrec // 2}x{fw}xi32>>")
+            e(f"  %fdb_all = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{nl_}x{nrec // 4}x{2 * fw}xi32>>")
         # records [super-block][slab][16 rows][one block] (super-blocks are BLK apart in a row)
         if qsplit() or qdec():   # (a step's 4 slabs side by side in each row: the decoder's 576 B record row)
             rty = f"16x{NP}x{rw}"
@@ -454,17 +458,19 @@ def array_program(L, cfg):
             for r in drs:   # (row 0 fills; the rows below see its raw rows as W records: gen_npu_gemm.qf_skip_raw)
                 t = f"{c}_{r}"
                 if r in egr:   # (the egressing decoders; raw multicast to every decoder row)
+                    l2 = l2c(c)
+                    sfx = "2" if l2 and not l2all else ""   # (this column's first-lane view and count)
                     e(f"  %fdlane{t} = constant.u32 {c * len(egr) + egr.index(r)} : reg<aie2p.array.scalar : index>")
-                    e(f"  %fdr{t} = partition.receiver %fd_all, %origin, %fdlane{t}, %fdl : reg<aie2p.array.receiver : tile<{fw * eg2}xi32>>")
+                    e(f"  %fdr{t} = partition.receiver %fd_all{sfx}, %origin, %fdlane{t}, %fdl : reg<aie2p.array.receiver : tile<{fw * eg2}xi32>>")
                     e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw * eg2}xi32>>")
-                    e(f"  %chd{t} = channel %fds{t}, %fdr{t}, {'%n4' if N.qfdirect_on() and not l2 else '%two'}, %fdn : "
+                    e(f"  %chd{t} = channel %fds{t}, %fdr{t}, {'%n4' if N.qfdirect_on() and not l2 else '%two'}, %fdn{sfx} : "
                       f"reg<aie2p.array.channel : tile<{fw * eg2}xi32>>")
                     e(f"  constrain.leaf_sync %chd{t}")
                     if l2:   # (its helper's records: ring slots 2-3, on its C channel's DMA)
                         e(f"  %fdlaneb{t} = constant.u32 {c * len(egr) + egr.index(r)} : "
                           "reg<aie2p.array.scalar : index>")
                         # (one slot of a slab, 2 records: gen_npu_gemm.qf_ring_at pins it after the first ring)
-                        e(f"  %fdnb{t} = constant.u32 {nrec // 2} : reg<aie2p.array.scalar : index>")
+                        e(f"  %fdnb{t} = constant.u32 {nrec // 4} : reg<aie2p.array.scalar : index>")
                         e(f"  %fdrb{t} = partition.receiver %fdb_all, %origin, %fdlaneb{t}, %fdl : "
                           f"reg<aie2p.array.receiver : tile<{2 * fw}xi32>>")
                         e(f"  %fdsb{t} = sender {kk[c, r]}, {N.QF_LANE2_PORT} : reg<aie2p.array.sender : tile<{2 * fw}xi32>>")
@@ -472,7 +478,7 @@ def array_program(L, cfg):
                           f"reg<aie2p.array.channel : tile<{2 * fw}xi32>>")
                         e(f"  constrain.leaf_sync %chdb{t}")
                 elif r in h4:   # (GN_QF4R) the helper's records to its egress neighbour (its window reads them)
-                    e(f"  %fhn{t} = constant.u32 {nrec * (2 if l2 else 1) // 2} : reg<aie2p.array.scalar : index>")
+                    e(f"  %fhn{t} = constant.u32 {nrec // 2} : reg<aie2p.array.scalar : index>")
                     e(f"  %fds{t} = sender {kk[c, r]}, {dp} : reg<aie2p.array.sender : tile<{fw}xi32>>")
                     e(f"  %fhr{t} = receiver {kk[c, h4[r]]}, {N.QF4R_NB} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
                     e(f"  %chd{t} = channel %fds{t}, %fhr{t}, %n{N.qf4r_hslots()}, %fhn{t} : "
@@ -498,7 +504,7 @@ def array_program(L, cfg):
             if N.qf4r_on():   # (half 0's panel (rows 0 / 2) by row 2, half 1's (rows 1 / 3) by row 1)
                 e(f"  constrain.fill %chw{c}_0, %chd{c}_2")
                 e(f"  constrain.fill %chw{c}_1, %chd{c}_{0 if N.qf4r_swap() else 1}")
-                if N.qflane2_on():   # (the second writer: the second egress lane)
+                if l2c(c):   # (the second writer: the second egress lane)
                     e(f"  constrain.fill %chw{c}_0, %chdb{c}_2")
                     e(f"  constrain.fill %chw{c}_1, %chdb{c}_0")
             elif N.qfkh_on():   # (a panel per K half, each filled by its decoder: rows 0 / 2 by row 0, 1 / 3 by row 1)
