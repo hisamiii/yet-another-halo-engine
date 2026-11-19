@@ -739,6 +739,9 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=
             b(f"  %f{i}rb{r} = index.mul %f{i}row{r}, {e.ci(rb)} : index")
             b(f"  %f{i}base{r} = index.add %f{i}rb{r}, %f{i}lboff : index")
     b(f"  %xl16 = index.mul %lane, {e.ci(16)} : index")
+    kodd = bool(kseg) and any(k0 % 2 for k0, _ in kseg)   # (a segment on an odd block: by each lane's own block)
+    if kodd:
+        b(f"  %kslb = index.div %lane, {e.ci(16)} : index")
     accs = [f"%a{i}_{r}" for i in range(nw) for r in range(R)]
     b("  %zf = scalar.constant 0.0 : f32")
     inits = ", ".join(f"{a} = %zf : f32" for a in accs)
@@ -754,10 +757,17 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=
             p = f"d{i}_{r}"
             b(f"    %{p}to = index.mul %t, {e.ci(S[i]['tstep'])} : index")
             base = f"%f{i}base{r}"
-            if kseg:   # the step's segment (its two blocks share one: segments start on even blocks)
+            if kseg:   # the step's segment (its two blocks share one when segments start on even blocks; kodd: the
+                # lane's block 2 t + lane / 16)
                 base = f"%f{i}base{r}s0"
+                if kodd:
+                    b(f"    %{p}kt2 = index.mul %t, {e.ci(2)} : index")
+                    b(f"    %{p}kbl = index.add %{p}kt2, %kslb : index")
                 for si, (k0, _) in enumerate(kseg[1:], 1):
-                    b(f"    %{p}in{si} = index.cmp uge, %t, {e.ci(k0 // 2)} : index")
+                    if kodd:
+                        b(f"    %{p}in{si} = index.cmp uge, %{p}kbl, {e.ci(k0)} : index")
+                    else:
+                        b(f"    %{p}in{si} = index.cmp uge, %t, {e.ci(k0 // 2)} : index")
                     b(f"    %{p}bs{si} = scf.select %{p}in{si}, %f{i}base{r}s{si}, {base} : index")
                     base = f"%{p}bs{si}"
             b(f"    %{p}bo = index.add {base}, %{p}to : index")
@@ -869,11 +879,18 @@ def kseg_layout(kb, f_npu, parts):
     return [(0, g)] + [(g + 4 * p0, 4 * n) for p0, n in parts]
 
 
+def kseg_layout_units(kb, f_npu, units):
+    """kseg_layout over parts in blocks ([(first block, blocks, ..)], emit_prefill_pp ffnblk_units)."""
+    g = kb - f_npu // 256
+    return [(0, g)] + [(g + u[0], u[1]) for u in units]
+
+
 def kseg_ok(kseg, K):
-    """Segments that tile K's 256-wide blocks in order, each starting on an even block (a GEMV step's two blocks)."""
+    """Segments that tile K's 256-wide blocks in order (the GEMV: a step's two blocks in one segment when all start
+    on even blocks, else each lane's block picks its own)."""
     k = 0
     for k0, w in kseg:
-        if k0 != k or w <= 0 or k0 % 2:
+        if k0 != k or w <= 0:
             return False
         k += w
     return k * 256 == K
