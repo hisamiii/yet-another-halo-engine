@@ -503,6 +503,8 @@ def main():
                               f"last done +{(u_[7] - u_[6]) % 2**32}")
                     if os.environ.get("GN_QFW") == "7":   # (diag) own egress waits: sum, longest, its acquire (1-based)
                         print(f"  fill row {r_} own egress waits: sum {u_[5]} longest {u_[6]} at acquire {u_[7]}")
+                    if os.environ.get("GN_QFW") == "8":   # (diag) timer low words: the fill's start, acquire 1's end
+                        print(f"  fill row {r_} timer: fill start {u_[5]} own acquire 1 done {u_[6]} (+{u_[6] - u_[5]}) longest {u_[7]}")
                     if os.environ.get("GN_QFW") == "1":   # (diag) the egress slot waits (own, copy), helper waits
                         print(f"  fill row {r_} waits: own egress {u_[5]} helper records {u_[6]} copy egress {u_[7]}")
             if os.environ.get("DQ_CYC") == "1":   # (diag) word 1: the decoder's cycles; word 4: its hot loop's

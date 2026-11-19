@@ -134,6 +134,17 @@ int main(int argc, char** argv) {
                 ? npu.RunGatedOnce(image, entry, views, std::max(1, std::atoi(std::getenv("NPU_RUN_GATED"))))
                 : npu.RunOnceProf(image, entry, views);
         std::printf("npu_run: prof events %s\n", spec);
+        if (const char* lp = std::getenv("YAH_NPU_PROF_LOCKS")) {   // (diag) the raw words, 16 a line, into that file
+          if (std::FILE* lf = std::fopen(lp, "a")) {
+            for (std::size_t j = 0; j < v.size(); j += 16) {
+              std::fprintf(lf, "locks %3zu:", j);
+              for (std::size_t k = j; k < v.size() && k < j + 16; ++k) std::fprintf(lf, " %x", v[k]);
+              std::fprintf(lf, "\n");
+            }
+            std::fclose(lf);
+          }
+          continue;
+        }
         std::size_t at = 0;
         for (std::uint32_t c = 0; c < columns; ++c)
           for (std::uint32_t r = 0; r < 4; ++r, at += 6)

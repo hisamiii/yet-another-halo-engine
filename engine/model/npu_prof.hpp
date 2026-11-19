@@ -59,7 +59,21 @@ class NpuProf {
       for (std::uint32_t r = 0; r < kMt; ++r) addr.push_back((col << 25 | 1u << 20) + 0x91020 + 4 * r);
       for (std::uint32_t r = 0; r < kShim; ++r) addr.push_back((col << 25) + 0x31020 + 4 * r);
     }
+    // (diag) YAH_NPU_PROF_LOCKS=1: column 0's lock values and DMA channel status instead of the counters: tiles (0, 2..5)
+    // locks 0-15 and S2MM 0/1, MM2S 0/1 status, memory tile (0, 1) locks 0-15 and S2MM 0-5, MM2S 0-5 status (110
+    // words with the timer)
+    if (std::getenv("YAH_NPU_PROF_LOCKS")) {
+      addr.clear();
+      for (std::uint32_t row = kRow0; row < kRow0 + kRows; ++row)
+        for (std::uint32_t i = 0; i < 16; ++i) addr.push_back((row << 20) + 0x1F000 + 0x10 * i);
+      for (std::uint32_t row = kRow0; row < kRow0 + kRows; ++row)
+        for (std::uint32_t o : {0x1DF00u, 0x1DF04u, 0x1DF10u, 0x1DF14u}) addr.push_back((row << 20) + o);
+      for (std::uint32_t i = 0; i < 16; ++i) addr.push_back((1u << 20) + 0xC0000 + 0x10 * i);
+      for (std::uint32_t i = 0; i < 6; ++i) addr.push_back((1u << 20) + 0xA0660 + 4 * i);
+      for (std::uint32_t i = 0; i < 6; ++i) addr.push_back((1u << 20) + 0xA0680 + 4 * i);
+    }
     addr.push_back((kRow0 << 20) + 0x340F8), addr.push_back((kRow0 << 20) + 0x340FC);   // tile (0, 2) Timer_Low / High
+    nvals_ = static_cast<std::uint32_t>(addr.size());
     if (const char* e = std::getenv("YAH_NPU_PROF_MT"))
       std::sscanf(e, "%u,%u,%u,%u", &mt_[0], &mt_[1], &mt_[2], &mt_[3]);
     if (const char* e = std::getenv("YAH_NPU_PROF_MT_SEL")) {
@@ -151,7 +165,7 @@ class NpuProf {
     return cols_ * kRows * (3 + kCore + kMem + 4 + 2 + 3) + cols_ * (3 + kMt + kShim + 1 + 3);
   }
   // words per job (kValues with the engine's 8 columns)
-  std::uint32_t Values() const { return cols_ * kRows * kRegs + cols_ * (kMt + kShim) + 2; }
+  std::uint32_t Values() const { return nvals_; }
   const std::vector<std::uint8_t>& Read() const { return read_; }
   // Finish's jobs' timer stamps
   const std::vector<Times>& times() const { return times_; }
@@ -212,6 +226,7 @@ class NpuProf {
 
   std::uint32_t combo_[2] = {};
   std::uint32_t cols_ = kCols;
+  std::uint32_t nvals_ = 0;
   unsigned c_[kCore] = {}, m_[kMem] = {}, mt_[kMt] = {}, sh_[kShim] = {};
   std::uint32_t mt_sel_ = 0;
   std::map<std::string, std::vector<std::uint8_t>> setup_;   // per image

@@ -483,6 +483,9 @@ class LoomNpu {
     program_.Forget();
     ++epoch_;
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k.first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
+    // (diag) NPU_RUN_SETUP_SLEEP_US=<us>: the host waits that long between the setup's end and the job's submit
+    if (const char* d = std::getenv("NPU_RUN_SETUP_SLEEP_US"))
+      std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(d)));
     const Call c = Snapshot(k);
     DumpInvocations(k, c);
     // (diag) NPU_RUN_CSPREAD=1: call i's C at i * C's length (views[2]'s buffer holds all calls'): its own bytes
@@ -538,14 +541,22 @@ class LoomNpu {
     const std::size_t prof_at = std::getenv("NPU_PROF_AT") ? std::atoi(std::getenv("NPU_PROF_AT")) : pre ? 1 : 0;
     // (diag) NPU_PROF_READ_AT=<i>: the counters read before the job's i-th piece (seq.size() - 1: before done)
     // instead of after the last
-    const std::size_t read_at = std::getenv("NPU_PROF_READ_AT") ? std::atoi(std::getenv("NPU_PROF_READ_AT")) : seq.size();
+    // (a list "i,j": a read before each, every read's values in order)
+    std::vector<std::size_t> read_at;
+    for (std::string spec = std::getenv("NPU_PROF_READ_AT") ? std::getenv("NPU_PROF_READ_AT") : ""; !spec.empty();) {
+      const std::size_t comma = spec.find(',');
+      read_at.push_back(std::stoul(spec.substr(0, comma)));
+      spec = comma == std::string::npos ? "" : spec.substr(comma + 1);
+    }
+    if (read_at.empty() && !std::getenv("NPU_PROF_READ_IN_PRE")) read_at.push_back(seq.size());
     for (std::size_t s = 0; s < seq.size(); ++s) {
       const std::vector<std::uint8_t>* b = seq[s];
-      if (s == read_at && prof_) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
+      if (bytes.empty()) bytes.assign(b->begin(), b->begin() + 16);   // (the header first: a read may lead)
+      for (std::size_t r : read_at)
+        if (s == r && prof_) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
       std::uint32_t n = 0, size = 0;
       std::memcpy(&n, b->data() + 8, 4), std::memcpy(&size, b->data() + 12, 4);
       if (size != b->size()) throw LoomError("npu: unexpected command header");
-      if (bytes.empty()) bytes.assign(b->begin(), b->begin() + 16);
       if (s == prof_at) {
         if (prof_) {
           const std::vector<std::uint8_t>& setup = prof_->Setup(path);
@@ -553,10 +564,27 @@ class LoomNpu {
           ops += prof_->SetupOps();
         }
       }
+      // (diag) NPU_PROF_READ_IN_PRE=<k>: a read before the split lead's (lead_pre's) op k, a ~20 us delay there
+      if (const char* ip = std::getenv("NPU_PROF_READ_IN_PRE"); ip && prof_ && pre && s == 0) {
+        const std::size_t at = std::atoi(ip);
+        std::size_t o = 16;
+        for (std::size_t i = 0; o < b->size(); ++i) {
+          const std::uint8_t op = (*b)[o];
+          std::uint32_t len = op == 0 ? 24 : op == 3 ? 28 : 0;
+          if (op == 1) std::memcpy(&len, b->data() + o + 12, 4);
+          else if (op != 0 && op != 3) std::memcpy(&len, b->data() + o + 4, 4);
+          if (i == at) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
+          bytes.insert(bytes.end(), b->begin() + o, b->begin() + o + len);
+          o += len;
+        }
+        ops += n;
+        continue;
+      }
       bytes.insert(bytes.end(), b->begin() + 16, b->end());
       ops += n;
     }
-    if (prof_ && read_at >= seq.size()) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
+    for (std::size_t r : read_at)
+      if (prof_ && r >= seq.size()) bytes.insert(bytes.end(), prof_->Read().begin(), prof_->Read().end()), ops += 1;
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
     // (diag) NPU_RUN_FLAG_DELAY_MS=<ms>: the flag binding's ready word held at 0 and stored that long after the submit
@@ -624,7 +652,7 @@ class LoomNpu {
       std::fprintf(stderr, "npu: DONESNAP after the command: %zu half-words unwritten\n", count_unwritten(snap_c, snap_n));
     }
     CheckHealth();
-    return prof_ ? prof_->Finish(1) : std::vector<std::uint32_t>{};
+    return prof_ ? prof_->Finish(read_at.size() + (std::getenv("NPU_PROF_READ_IN_PRE") && pre)) : std::vector<std::uint32_t>{};
   }
   // RunOnce with the AIE counters (YAH_NPU_PROF): the image's first command with the counters' setup before its ops
   // and their READ_REGS after them. Returns the run's NpuProf values (one job; run/npu_run).
