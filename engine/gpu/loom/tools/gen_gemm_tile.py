@@ -278,6 +278,10 @@ KWIN = None
 # kstore / kres reads each K step's blocks from its segment, in the same order (bit-identical results). With KWIN
 # (kb_start 0): the window is segment 0, its rows w blocks apart (the NPU split's GPU K part).
 KSEG = None
+# RSEG = (M, F, off): an FFN layer's gate / up rows under the NPU's 5-slab gate / up (gen_gemv rseg_phys), the binding
+# from the gate tensor's start over gate and up; logical row grow + off (off 0: gate rows, or a fused ffn's rows over
+# both tensors; M: up rows) at its physical row. Same loads, other addresses (bit-identical results).
+RSEG = None
 
 
 
@@ -495,8 +499,8 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %bprs = index.mul %k_blocks, %cbbs : index")
         e("  %w_bytes = index.mul %m_rows, %bprs : index")
         e("  %w_halfs = index.div %w_bytes, %c2 : index")
-    elif ff:
-        # gate rows then up rows
+    elif ff or RSEG:
+        # gate rows then up rows (RSEG: a gate / up kernel's binding over both tensors)
         e(f"  %w_rows = index.mul {orw()}, %c2 : index")
         e("  %w_bytes = index.mul %w_rows, %bpr : index")
         e("  %w_halfs = index.mul %w_rows, %hpr : index")
@@ -643,9 +647,12 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e(f"  %ff_upr = scf.select %ff_up, {orw()}, %c0 : index")
         e("  %drow_t = index.add %drow_g, %ff_upr : index")
         e("  %drow_gi = index.cast %drow_t : index to i32")
-        e("  %grow_i = scalar.addi %wg_row_i, %drow_gi : i32")
+        e(f"  {'%grow_q_i' if RSEG else '%grow_i'} = scalar.addi %wg_row_i, %drow_gi : i32")
     else:
-        e("  %grow_i = scalar.addi %wg_row_i, %drow_i : i32")
+        e(f"  {'%grow_q_i' if RSEG else '%grow_i'} = scalar.addi %wg_row_i, %drow_i : i32")
+    if RSEG:
+        assert not (MX or KSEG or kwin or OSTRIDE or SPLIT2) and kind in ("kstore", "swiglu", "ffn"), kind
+        __import__("gen_gemv").rseg_emit_i32(e, "%grow_q_i", "%grow_i", *RSEG)
     e("  %k_blocks_i = index.cast %k_blocks : index to i32")
     if KSEG:
         assert kind in ("kstore", "kres") and not (MX or ff or OSTRIDE or SPLIT2) and F.get("kdiv", 1) == 1, kind

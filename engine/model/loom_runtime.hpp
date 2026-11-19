@@ -701,6 +701,20 @@ inline void AliasUnread(std::uint8_t* p, std::size_t bytes) {
 // blocks]): ffn_down under an NPU FFN block (emit_prefill_pp YAH_NPU_DNSEG, gen_gemv kseg_layout).
 using KSeg = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
 
+// Row segments of an FFN layer's gate / up (gen_gemv RSEG, emit_prefill_pp FFNSW5): the NPU's 5-slab gate / up reads
+// its last F features' gate and up rows in blocks of kRSegBlock, up block g kRSegBlock rows after gate block g (a
+// 16-row record's two halves within the shim DMA's 2^20-word step). Logical row L over gate and up ([0, M) gate,
+// [M, 2M) up, up stored right after gate) is at physical row RSegPhys(L) from the gate tensor's start: slot s of the
+// 2 F / kRSegBlock blocks holds gate block s / 2 (s even) or up block s / 2 (s odd), slots over the gate tensor's last
+// F rows, then the up tensor's.
+constexpr std::size_t kRSegBlock = 1280;
+inline std::size_t RSegPhys(std::size_t L, std::size_t M, std::size_t F) {
+  const std::size_t f0 = M - F, ng = F / kRSegBlock, base = L >= M ? M + f0 : f0;
+  if (L < base) return L;
+  const std::size_t g = (L - base) / kRSegBlock, w = (L - base) % kRSegBlock, s = 2 * g + (L >= M);
+  return f0 + kRSegBlock * s + w + (s >= ng ? f0 : 0);
+}
+
 // The model's tensor data on the GPU; Ref(t) binds a tensor. It is copied into device-local buffers of about 1 GiB cut
 // at tensor boundaries, each host range released right after its copy (RAM holds one copy of the model). npu (the NPU
 // split): the buffers are exportable (LoomDevice::AllocateExportable) and the NPU reads its rows from them
@@ -711,11 +725,14 @@ class LoomWeights {
  public:
   // skip: tensors the device never reads (not uploaded; Has() false, Ref() refuses them; Gguf::Rows reads them from
   // the source). kseg: tensors whose rows the device holds in K segments (KSeg), reordered in the host copy (resident,
-  // writable) just before its upload: one tensor's bytes of scratch at a time, no other copy.
+  // writable) just before its upload: one tensor's bytes of scratch at a time, no other copy. rseg: gate / up tensors
+  // (both names) whose rows the device holds in row segments of that F (RSegPhys), reordered so too: one block's
+  // bytes of scratch.
   LoomWeights(LoomDevice& gpu, core::Gguf& gguf, const std::function<bool(const std::string&)>& skip = {},
-              bool npu = false, std::map<std::string, KSeg> kseg = {})
-      : gpu_(gpu), base_(gguf.tensor_data_base()), npu_(npu), kseg_(std::move(kseg)) {
-    if (!kseg_.empty() && !gguf.resident()) throw LoomError("weights: K-segmented rows need the resident model copy");
+              bool npu = false, std::map<std::string, KSeg> kseg = {}, std::map<std::string, std::uint32_t> rseg = {})
+      : gpu_(gpu), base_(gguf.tensor_data_base()), npu_(npu), kseg_(std::move(kseg)), rseg_(std::move(rseg)) {
+    if ((!kseg_.empty() || !rseg_.empty()) && !gguf.resident())
+      throw LoomError("weights: K- or row-segmented rows need the resident model copy");
     constexpr size_t kChunk = size_t{1} << 30;
     // (begin, end, glued): a layer's ffn_gate and ffn_up stay in one buffer (the NPU FFN block reads a gate row through
     // its up row in one view, LoomPrefill::RunFfnBlock)
@@ -724,6 +741,7 @@ class LoomWeights {
       if (skip && skip(t.name)) {
         skipped_.push_back(t.name);
         kseg_.erase(t.name);   // (never read: keeps its rows)
+        if (rseg_.count(t.name)) throw LoomError("weights: row segments on a skipped tensor " + t.name);
         continue;
       }
       const bool glued = t.name.ends_with("ffn_up.weight");
@@ -756,6 +774,12 @@ class LoomWeights {
         if (!t) throw LoomError("weights: no tensor " + name);
         if (t->offset >= begin && t->offset < begin + bytes)
           Segment(const_cast<std::uint8_t*>(gguf.tensor_data_base()) + t->offset, *t, seg, &scratch);
+      }
+      for (const auto& [name, F] : rseg_) {   // (once a layer: from its gate tensor; up is in this range too)
+        const core::TensorInfo* t = name.ends_with("ffn_gate.weight") ? gguf.Find(name) : nullptr;
+        if (t && t->offset >= begin && t->offset < begin + bytes)
+          RowSegment(const_cast<std::uint8_t*>(gguf.tensor_data_base()) + t->offset, *t,
+                     gguf.Find(name.substr(0, name.size() - 15) + "ffn_up.weight"), F, &scratch);
       }
       step(1);
       gpu.H2D(buffer, gguf.tensor_data_base() + begin, bytes);
@@ -795,6 +819,11 @@ class LoomWeights {
     for (const Chunk& c : chunks_) f(c.buffer.handle);
   }
   // The K segments the device holds t's rows in, or nullptr (the GGUF's rows).
+  // The F of t's row segments (a gate or up tensor, RSegPhys), or 0 (the GGUF's rows).
+  [[nodiscard]] std::uint32_t RSegOf(const core::TensorInfo& t) const {
+    const auto it = rseg_.find(t.name);
+    return it == rseg_.end() ? 0 : it->second;
+  }
   [[nodiscard]] const KSeg* KSegOf(const core::TensorInfo& t) const {
     const auto it = kseg_.find(t.name);
     return it == kseg_.end() ? nullptr : &it->second;
@@ -827,6 +856,33 @@ class LoomWeights {
       for (std::size_t r = 0; r < rows; ++r, d += w * bb) std::memcpy(d, p + (r * kb + k0) * bb, w * bb);
     std::memcpy(p, scratch->data(), static_cast<std::size_t>(t.bytes));
   }
+  // Gate (at p, then its up tensor u) into row segments of F (RSegPhys): the blocks moved by cycles, one in scratch.
+  static void RowSegment(std::uint8_t* p, const core::TensorInfo& g, const core::TensorInfo* u, std::uint32_t F,
+                         std::vector<std::uint8_t>* scratch) {
+    const std::size_t M = static_cast<std::size_t>(g.dims[1]), rb = M ? static_cast<std::size_t>(g.bytes) / M : 0;
+    if (!u || u->offset != g.offset + g.bytes || u->dims != g.dims || u->type != g.type || u->bytes != g.bytes ||
+        rb * M != g.bytes || F >= M || F % (2 * kRSegBlock))
+      throw LoomError("weights: bad row segments for " + g.name);
+    const std::size_t ng = F / kRSegBlock, f0 = M - F, n = kRSegBlock * rb;
+    const auto slot = [&](std::size_t s) { return p + (s < ng ? f0 + kRSegBlock * s : M + f0 + kRSegBlock * (s - ng)) * rb; };
+    const auto src = [&](std::size_t t) { return t % 2 ? ng + t / 2 : t / 2; };   // (slot t takes slot src(t)'s block)
+    scratch->resize(n);
+    std::vector<bool> done(2 * ng);
+    for (std::size_t s0 = 0; s0 < 2 * ng; ++s0) {
+      if (done[s0]) continue;
+      std::memcpy(scratch->data(), slot(s0), n);
+      for (std::size_t c = s0;;) {
+        const std::size_t x = src(c);
+        done[c] = true;
+        if (x == s0) {
+          std::memcpy(slot(c), scratch->data(), n);
+          break;
+        }
+        std::memcpy(slot(c), slot(x), n);
+        c = x;
+      }
+    }
+  }
   std::vector<Chunk> chunks_;
   std::vector<std::string> skipped_;
   static constexpr size_t kPad = size_t{64} << 10;  // a kernel's read past its last tensor stays mapped
@@ -834,6 +890,7 @@ class LoomWeights {
   const std::uint8_t* base_;   // the tensor data's host addresses (ForEachShared's keys)
   bool npu_;
   std::map<std::string, KSeg> kseg_;
+  std::map<std::string, std::uint32_t> rseg_;
 };
 
 }  // namespace yah::model

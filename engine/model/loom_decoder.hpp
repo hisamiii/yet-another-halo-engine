@@ -463,6 +463,14 @@ class LoomDecoder {
     name += "_" + std::to_string(M) + "_" + std::to_string(K);
     // K-segmented rows (LoomWeights KSegOf: a prefill set's YAH_NPU_DNSEG): the GEMV of that layout ("_kseg<widths>",
     // emit_decode YAH_DECODE_KSEG)
+    // row-segmented gate / up (LoomWeights RSegOf: a prefill set's NPU 5-slab gate / up): the GEMV of that layout
+    // ("_rseg<F>", emit_decode YAH_DECODE_RSEG), both weight bindings from the gate tensor's start over gate and up
+    if (const std::uint32_t F = ws.size() == 2 ? weights_.RSegOf(*Find(ws[0])) : 0) {
+      if (weights_.RSegOf(*Find(ws[1])) != F) throw LoomError("GEMV: gate / up row segments differ: " + ws[0]);
+      name += "_rseg" + std::to_string(F);
+      b[0].length = 2 * static_cast<std::size_t>(Find(ws[0])->bytes);
+      b[1] = b[0];
+    }
     if (const KSeg* ks = ws.size() == 1 ? weights_.KSegOf(*Find(ws[0])) : nullptr) {
       name += "_kseg";
       for (std::size_t i = 0; i < ks->size(); ++i) name += (i ? "_" : "") + std::to_string((*ks)[i].second);

@@ -8,6 +8,8 @@ usage: emit_decode.py <model> <outdir> [max_context]       (default 4096, multip
                                  plain for the input projections and the head,
                                  resid for attn_output / ssm_out / ffn_down (residual add fused),
                                  swiglu for ffn_gate + ffn_up
+  gv_swiglu_<fmt>_<fmt>_<M>_<K>_rseg<F>  the swiglu GEMV on row-segmented gate / up (gen_gemv rseg) for each F of
+                                 YAH_DECODE_RSEG (default none): a prefill set's 5-slab NPU gate / up layout
   gv_resid_<fmt>_<M>_<K>_kseg<w>_..  ffn_down's resid on K-segmented rows (gen_gemv kseg) for each F of
                                  YAH_DECODE_KSEG (default 8192): a prefill set's YAH_NPU_DNSEG layout
   dattn_{kvappend,part,reduce}   tools/gen_decode_attn.py: attention over the paged fp16 KV pools of the prefill
@@ -51,6 +53,9 @@ PEEL = 1
 # The NPU FFN blocks' F values (emit_prefill_pp YAH_NPU_FFNBLK) whose K-segmented ffn_down rows (YAH_NPU_DNSEG) this set
 # reads: each 256-block down format's resid GEMV also in that layout (gen_gemv kseg, "<gv name>_kseg<widths>").
 KSEG_F = [int(f) for f in os.environ.get("YAH_DECODE_KSEG", "8192").split(",") if f]
+# The NPU 5-slab gate / up's F values (emit_prefill_pp FFNSW5, YAH_NPU_FFNBLKS) whose row-segmented gate / up rows
+# (gen_gemv RSEG) this set reads: each one-format swiglu GEMV also in that layout ("<gv name>_rseg<F>").
+RSEG_F = [int(f) for f in os.environ.get("YAH_DECODE_RSEG", "").split(",") if f]
 
 
 def emit_src(text, name, outdir, configs=("nop=0",)):
@@ -183,6 +188,11 @@ def main():
                 kseg = GV.kseg_layout(K // 256, F, EPP.ffnblk_parts(F))
                 sname = name + GV.kseg_suffix(kseg)
                 emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, kseg=kseg), sname, outdir)
+                grids[sname] = grids[name]
+        if kind == "swiglu" and fmts[0] == fmts[1]:
+            for F in (f for f in RSEG_F if GV.rseg_ok(M, f)):
+                sname = name + GV.rseg_suffix(F)
+                emit_src(GV.gen(kind, fmts, M, K, R, W, peel=peel, rseg=F), sname, outdir)
                 grids[sname] = grids[name]
         if ((kind == "plain") and (M == vocab)):   # the output GEMV
             aname = name.replace("gv_plain_", "gv_plainam_")

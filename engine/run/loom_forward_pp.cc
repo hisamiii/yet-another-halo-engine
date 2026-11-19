@@ -180,7 +180,8 @@ int main(int argc, char** argv) {
         [&](const std::string& n) {
           return (n == "token_embd.weight" && opt.gen == 0) || n.starts_with(mtp);
         },
-        opt.npu && (npu_gemm_set || !npu_attn_set), LoomPrefill::DownKSegs(argv[2], gguf));
+        opt.npu && (npu_gemm_set || !npu_attn_set), LoomPrefill::DownKSegs(argv[2], gguf),
+        LoomPrefill::GateUpRSegs(argv[2]));
     lap("weights");
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights, want);
     lap("prefill set");

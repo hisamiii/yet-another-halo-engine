@@ -81,6 +81,18 @@ class LoomPrefill {
     }
     return out;
   }
+  // The row-segmented gate / up tensors of the set in dir (dispatch.txt "npursegl_<layer> <F>", emit_prefill_pp
+  // FFNSW5): both of that layer's, at F (RSegPhys). LoomWeights holds these rows so; the set's kernels read them so.
+  static std::map<std::string, std::uint32_t> GateUpRSegs(const std::string& dir) {
+    std::ifstream f(dir + "/dispatch.txt");
+    std::map<std::string, std::uint32_t> out;
+    std::string name;
+    Geom g{};
+    while (f >> name >> g.tokens >> g.rowgrp >> g.tt)
+      if (name.starts_with("npursegl_"))
+        for (const char* w : {".ffn_gate.weight", ".ffn_up.weight"}) out["blk." + name.substr(9) + w] = g.tokens;
+    return out;
+  }
   // The K segments of a down of kb blocks under an FFN block of F features: the GPU's K part [0, K - F), then the
   // NPU's K parts (FfnBlkParts) in order.
   static KSeg KSegFor(std::uint32_t F, std::uint32_t kb) {
@@ -1026,6 +1038,19 @@ class LoomPrefill {
     return std::string(kind) + "_" + f->name + "_" + std::to_string(mt) + "_" + std::to_string(kb) + kseg + ".hal";
   }
   std::uint32_t MTiles(const core::TensorInfo& t) const { return static_cast<std::uint32_t>(t.dims[1] / 16); }
+  // (LoomWeights RSegOf: a row-segmented gate / up) the GEMM of that layout: "_rseg<F>" before ".hal" (emit_prefill_pp
+  // rseg_gemms), its weight binding from the gate tensor's start over gate and up
+  std::string RSegHal(std::string hal, const core::TensorInfo& t) const {
+    if (const std::uint32_t F = weights_.RSegOf(t)) hal.insert(hal.size() - 4, "_rseg" + std::to_string(F));
+    return hal;
+  }
+  hrx_buffer_ref_t RSegRef(const core::TensorInfo& t) const {   // (t: the gate or up tensor)
+    const std::string n = t.name.ends_with("ffn_up.weight") ? t.name.substr(0, t.name.size() - 13) + "ffn_gate.weight"
+                                                             : t.name;
+    hrx_buffer_ref_t r = TRef(*Find(n));
+    r.length = 2 * static_cast<std::size_t>(t.bytes);
+    return r;
+  }
   // The GEMM variant for this chunk's real tokens: the set may carry "<hal>.t128.hal" / ".t64.hal" with narrower token
   // tiles. Pick the least (padded token rows x cost per row); a narrow tile pads less but costs more per row (measured:
   // x1.12 at 128 tokens, x1.6 at 64). Every variant computes the same values.
@@ -1248,13 +1273,22 @@ class LoomPrefill {
     // (gen_npu_gemm swcol 32)
     // (dispatch.txt "npuffnq", layout Q': H in K parts of one size (FfnBlkParts, one down each), a part in down's A
     // layout [M block][its qc calls][slab][column][576 B]: call j's records from part j / qc, (j % qc) x 4 x 4608 B)
-    const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
+    // (dispatch.txt "npuffnsw5", emit_prefill_pp FFNSW5: the single-format layers' image at NP 5, 320 features a call:
+    // call j's column c features f0 + 1280 (j / 4) + 64 (j % 4) + 256 b + 8 P8[c] + [0, 8) of its 5 runs b, its records
+    // at K part j / q5's H passes 5 ((j % q5) / 4) .. + 5, 16-token slab slots 8 (j % 4) ..; gen_npu_q qsw5)
+    const bool np5 = !pair && geom_.count("npuffnsw5") != 0;
+    const std::uint32_t fc = np5 ? 320 : 256;   // (features a call)
+    const NpuBytes bs = NpuBytesOf(np5 ? "npubytes5_ffnsw" : "npubytes_ffnsw");
     const bool qffn = geom_.count("npuffnq") != 0;
+    if (np5 && (!qffn || parts[0].second % 5 || weights_.RSegOf(*tg) != F || weights_.RSegOf(*tu) != F))
+      throw LoomError("prefill: the NP 5 FFN gate / up needs Q' parts of 5 passes and its rows in row segments of F");
     const std::uint32_t qc = 4 * parts[0].second;   // (Q': a part's calls; its H bytes qpart)
     const std::size_t qpart = std::size_t{B_ / 64} * parts[0].second * 4 * 128 * 144;
     for (const auto& pp : parts)
       if (qffn && pp.second != parts[0].second) throw LoomError("prefill: the Q' FFN block's K parts differ in size");
+    const std::uint32_t q5 = parts[0].second * 1024 / 320;   // (np5: a part's calls)
     const auto c_sw = [&](std::uint32_t j) {
+      if (np5) return NpuView{j / q5 * qpart + std::size_t{(j % q5) / 4} * 5 * 4 * 4608 + (j % 4) * 8 * 144, bs.c};
       return NpuView{qffn ? j / qc * qpart + std::size_t{j % qc} * 4 * 4608 : (j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144,
                      bs.c};
     };
@@ -1267,11 +1301,11 @@ class LoomPrefill {
                                       cg.p + (f0 + 256 * j) * cg.rb, col_bytes(cg, tg, f),
                                       cu.p + (f0 + 256 * j) * cu.rb, col_bytes(cu, tu, fu), c_sw(j),
                                       "ffnsw" + hord + (qffn ? std::string("_") + f.name + "_" + fu.name : "")));
-    for (std::uint32_t j = 0; j < F / 256 && !cpair; ++j)
+    for (std::uint32_t j = 0; j < F / fc && !cpair; ++j)   // (np5: a call's rows span 4 x 256 + 64)
       csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".xdna", mix && !bmix ? 100 + 16 * DecoderId(f.name) + DecoderId(fu.name) : DecoderId(gdec), ag,
-                                  pg + (f0 + 256 * j) * rb,
-                                  dgu + 255 * rb + 16 * blk + RecordRow(gdec),
-                                  c_sw(j), "ffnsw" + hord + (qffn && mix ? std::string("_") + f.name : "")));
+                                  pg + (np5 ? RSegPhys(f0 + 1280 * (j / 4) + 64 * (j % 4), M, F) : f0 + 256 * j) * rb,
+                                  (np5 ? kRSegBlock * rb : dgu) + (np5 ? 1087 : 255) * rb + 16 * blk + RecordRow(gdec),
+                                  c_sw(j), "ffnsw" + hord + (qffn && mix ? std::string("_") + f.name : "") + (np5 ? "_5" : "")));
     // (Q': a format's qsw image is its own family, its array state differs beyond the decoder tiles)
     // down: per K part, FfnBlkCalls() calls of FfnBlkRows() rows (a last one ending at the last row)
     const bool dn4 = FfnDn4(fd.name);
@@ -1434,7 +1468,7 @@ class LoomPrefill {
     if (tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
     const bool mixed = tg->type != tu->type;
     Fmt f{}, fu{};
-    std::string base = GemmHal("gemm_ffn", *tg, &f);
+    std::string base = RSegHal(GemmHal("gemm_ffn", *tg, &f), *tg);   // (rseg: its layout's GEMM)
     GemmHal("gemm_ffn", *tu, &fu);
     const bool down_af = Af("gemm_kres", pre + "ffn_down.weight");
     const char* sfx = down_af ? ".af.to.hal" : ".af.hal";
@@ -1853,10 +1887,11 @@ class LoomPrefill {
   void RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false) {
     const auto* t = Find(wname);
     Fmt f{};
-    const std::string base = GemmHal("gemm_kstore", *t, &f);
+    const std::string base = RSegHal(GemmHal("gemm_kstore", *t, &f), *t);
     const std::string hal = af ? AfHal(base) : PickGemm(base);
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*t, f);
+    if (weights_.RSegOf(*t)) b[0] = RSegRef(*t);
     const std::size_t first = b.size();
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_})
       b.push_back(Ref(*x));
@@ -1964,11 +1999,12 @@ class LoomPrefill {
   void RunSwiglu(const std::string& wname, bool af = false, bool tout = false) {
     const auto* t = Find(wname);
     Fmt f{};
-    const std::string base = GemmHal("gemm_swiglu", *t, &f);
+    const std::string base = RSegHal(GemmHal("gemm_swiglu", *t, &f), *t);
     const std::string hal = af ? AfHal(base, tout ? ".af.to.hal" : ".af.hal") : PickGemm(base);
     if (hal.empty()) throw LoomError(base + ": the set lacks its afrag form");
     const Geom g = GeomOf(hal);
     auto b = GemmWeights(*t, f);
+    if (weights_.RSegOf(*t)) b[0] = RSegRef(*t);
     const std::size_t first = b.size();
     for (const LoomBuffer* x :
          std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, gateffn_, uwstage_, ostage_, ffnup_})

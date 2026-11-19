@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked] [ostride=<rows>]
-[kfull=<k_blocks of the whole row>]
+[kfull=<k_blocks of the whole row>] [rseg]
 
 Compile the source under the exact config and read each root's declared byte envelope from the compile report.
 Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for that root.
@@ -28,6 +28,9 @@ MO = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("ostride="
 KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")), kb)
 # a split ffn reads the full gate tensor's rows before the up rows
 wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
+# rseg (gen_gemm_tile RSEG): a gate or up kernel's weight binding over both tensors, from the gate's start
+if "rseg" in sys.argv[9:]:
+    wbytes = 2 * M * KBW * bpb
 GRID = {"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096, "iq2s": 8192}
 bound = {"weight": wbytes, "input": B * KBW * qk * 2, "resid": B * MO * 4, "gate": B * MO * 4,
          "output": B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4) // (2 if kind == "kst2" else 1),

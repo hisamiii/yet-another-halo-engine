@@ -342,6 +342,12 @@ def tiles():
 NARROW = ((128, 2), (64, 2))
 
 
+def tkey(out):
+    """A GEMM's key in the tuned tiles: its HAL name without ".hal" and a row-segment suffix (RSEG_GEMMS: the same
+    tile, so the same results)."""
+    return re.sub(r"_rseg\d+$", "", out[:-4])
+
+
 def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
     """Emit "<hal>.t<BN>.hal" for each narrow token tile of this GEMM (the tuner's "variants", else NARROW on the
     default tile), plus the tuner's per-bucket choices as "pick:<hal>:<max tokens> <max tokens> <bn> 0" rows."""
@@ -349,8 +355,8 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
     if fmt not in TILE_FMTS or mt < 4:
         return []
     base, rows = TG.default_tile(fmt, kind, kb), []
-    full = dataclasses.replace(base, **tiles()["tiles"].get(out[:-4], {}))
-    tuned = tiles().get("variants", {}).get(out[:-4])
+    full = dataclasses.replace(base, **tiles()["tiles"].get(tkey(out), {}))
+    tuned = tiles().get("variants", {}).get(tkey(out))
     for knobs in (tuned if tuned is not None else [{"bn": bn, "wn": wn} for bn, wn in NARROW]):
         t = dataclasses.replace(base, **knobs)
         bn = t.bn
@@ -845,6 +851,12 @@ NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
 # up, dispatch.txt "npuffnblk"); the pairs keep YAH_NPU_FFNBLK ("npuffnpair"). Their downs then read their own F's K
 # segments: dispatch.txt "npudnsegl_<layer> <F>", the down GEMMs of that layout "<hal>_kseg<widths>" (FFNBLKS_DOWNS).
 NPU_FFNBLKS = int(os.environ.get("YAH_NPU_FFNBLKS", "0")) or NPU_FFNBLK
+# YAH_NPU_FFNSW5 (Q', default 1 when YAH_NPU_FFNBLKS's K parts are whole 1280-feature groups): the single-format
+# (IQ4_XS) layers' gate / up at NP 5, 320 features a call (gen_npu_q qsw5: call j's 4-call group (j % 16) / 4 of
+# K part j / 16, its 64 features j % 4 of each of 5 runs of 256); dispatch.txt "npuffnsw5 320", "npubytes5_ffnsw".
+# 0: NP 4, 256 a call.
+FFNSW5 = os.environ.get("YAH_NPU_FFNSW5", "1") == "1"
+RSEG_GEMMS = set()   # (fmt, m_tiles, k_blocks) of the FFNSW5 layers' gate / up (row-segmented, gen_gemv RSEG)
 FFNBLKS_DOWNS = set()   # (fmt, m_tiles, k_blocks) of the single-format layers' downs when their F differs (npu_ffnblk)
 KSEG_F = [0]   # (kseg_f) the F whose K segments kseg_for gives the K-segmented downs, 0: NPU_FFNBLK's (DNSEG)
 # YAH_NPU_DNSEG (Q', default 1): ffn_down's rows in K segments, reordered in place at load ([segment][row][its blocks]:
@@ -1379,6 +1391,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     rows = NPU_ROWS if NPU_QP1K else NPU_COLS * 64   # down rows per call (NP 4; Q': the P1K site image's)
     qcalls = 4 * ffnblk_parts(F)[0][1]   # (Q': a K part's qsw calls, its down's passes)
     qcallss = 4 * ffnblk_parts(FS)[0][1]
+    sw5 = FFNSW5 and NPU_Q and all(p % 5 == 0 for _, p in ffnblk_parts(FS))   # (FFNSW5: whole 1280-feature groups)
+    sw5 = sw5 and all(gen_gemv.rseg_ok(l["ffn_gate"][1] * 16, FS) for l in by.values() if l.get("ffn_gate"))
     for f_ in {F, FS}:
         assert not NPU_Q or (NPU_QP1K and len({p for _, p in ffnblk_parts(f_)}) == 1), \
             "YAH_NPU_Q: the FFN block needs YAH_NPU_QP1K and K parts of one size (F = 5120, 8192, 10240, ..)"
@@ -1416,10 +1430,15 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                     split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), FS)
             blk = GN.decoder(gu_fmt(fmt)).BLK
             dfr = fmt in NPU_DFR_FMTS
-            if NPU_Q:   # (Q' qsw at NP 4; its egress ring stays 4 records, GN_QFEGR2 would reach the silu table)
+            if NPU_Q:   # (Q' qsw at NP 4, or FFNSW5's NP 5; its egress ring stays 4 records, GN_QFEGR2 would reach
+                # the silu table)
+                np5 = sw5 and fmt == "iq4xs"
+                # (np5: gate block g's up block 1280 rows on, RSEG; else up a gate tensor on)
+                dgu_ = gen_gemv.RSEG_B * kb * blk if np5 else mt * 16 * kb * blk
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
-                                       kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1, qsw=True, dgu=mt * 16 * kb * blk,
-                                       swcol=32, hpass=qcallss, hord=hord), "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 4))
+                                       kraw=kb * 256, fmt=DCOL_FMTS[fmt][0], rawdma=1, qsw=True, dgu=dgu_,
+                                       swcol=40 if np5 else 32, hpass=qcallss, hord=hord),
+                             "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 5 if np5 else 4))
                 QJOB_ENV[jobs[-1][1]] = dict(GN_QFEGR2="0")
                 continue
             jobs.append((npu_cfg(B, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk,
@@ -1598,9 +1617,15 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         out.append(("npuffnq", 1, 0, 0))
         for fmt, mt, kb in sorted(DNSEG):   # (the engine reorders these formats' down rows: LoomWeights)
             out.append(("npudnseg_%s" % fmt, F, mt, kb))
-    sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
-    with GN.np_override(4):
-        out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
+    for np_, nm_ in ((4, "npubytes_ffnsw"), (5, "npubytes5_ffnsw")):   # (FFNSW5: the NP 5 image's, "npuffnsw5")
+        sw = next((j for j in jobs if j[1].startswith("npu_ffnsw_") and j[2] == np_), None)
+        if sw:
+            with GN.np_override(np_):
+                out.append((nm_,) + tuple(GN.stream_bytes(sw[0])))
+    if sw5 and ok:   # (and their gate / up rows in row segments: LoomWeights, the RSEG GEMMs)
+        out.append(("npuffnsw5", 320, 0, 0))
+        out.extend(("npursegl_" + n, FS, 0, 0) for n, l in sorted(by.items()) if l in ok)
+        RSEG_GEMMS.update(l["ffn_gate"] for l in ok)
     for passes in sorted({p for f_ in {F, FS} for _, p in ffnblk_parts(f_)}):
         dns = [j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes)]
         dn = next((j for j in dns if j[2] == NPU_NP), dns[0])
@@ -1622,8 +1647,8 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     if fmt not in TILE_FMTS:
         return None
     t = TG.default_tile(fmt, kind, kb, geom)
-    if not geom and out[:-4] in tiles()["tiles"]:
-        t = dataclasses.replace(t, **tiles()["tiles"][out[:-4]])
+    if not geom and tkey(out) in tiles()["tiles"]:
+        t = dataclasses.replace(t, **tiles()["tiles"][tkey(out)])
     if mt % t.rowgrp:
         return None
     # a token tile that does not divide the chunk: the last tile is masked (gen_gemm_tile.gen masked=)
@@ -1652,10 +1677,41 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     gate = [sym, fmt, kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []) \
-        + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else [])
+        + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else []) \
+        + (["rseg"] if _TG.RSEG else [])
     E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)]
            + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir, gate=gate)
     return (out, tile, rowgrp, tt)
+
+
+def rseg_gemms(B, T, outdir):
+    """The GPU's GEMMs over the FFNSW5 layers' row-segmented gate / up (RSEG_GEMMS): the fused ffn's afrag forms and
+    the gate kstore / up swiglu (and their variants), named "<plain name>_rseg<F>"; dispatch.txt rows."""
+    import gen_gemm_tile as TG
+    out, F = [], NPU_FFNBLKS
+    for fmt, mt, kb in sorted(RSEG_GEMMS):
+        M, sfx = mt * 16, gen_gemv.rseg_suffix(F)
+        try:
+            TG.RSEG = (M, F, 0)
+            t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
+            for suffix, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
+                TG.check(tt)
+                r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, fmt, mt, kb, B,
+                              "gemm_ffn_%s_%d_%d%s%s" % (fmt, mt, kb, sfx, suffix), outdir, "ffn", tt.rowgrp)
+                assert r, (fmt, suffix)
+                out.append(r)
+            for kind, off in (("kstore", 0), ("swiglu", M)):   # (the up rows from M in the gate-based binding)
+                TG.RSEG = (M, F, off)
+                name = "gemm_%s_%s_%d_%d%s.hal" % (kind, fmt, mt, kb, sfx)
+                r = gemm(fmt, mt, kb, B, name, outdir, kind=kind)
+                assert r, name
+                out.append(r)
+                if T > B:
+                    out.extend(narrow_variants(fmt, mt, kb, B, name, outdir, kind))
+                out.extend(afrag_variants(fmt, mt, kb, B, name, outdir, kind))
+        finally:
+            TG.RSEG = None
+    return out
 
 
 def gemm_combos(rows):
@@ -1784,6 +1840,7 @@ def main():
                 if T > B:
                     geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k))
                 geom.extend(afrag_variants(fmt, mt, kb, B, name(k), outdir, k))
+    geom.extend(rseg_gemms(B, T, outdir))
 
 
     # Attention: tools/gen_attn_fa.py, 32 tokens x 2 heads per workgroup; reads V^T (vtrans.hal, or the paged / quantized pools).

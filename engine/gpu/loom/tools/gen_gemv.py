@@ -94,9 +94,10 @@ class E:
         return nm
 
 
-def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=0, amax=False, kseg=None):
+def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=0, amax=False, kseg=None, rseg=0):
     """kseg (K-segmented weights, kseg_layout): [(first block, blocks)] covering K's 256-wide blocks, the weight rows
     stored segment by segment ([segment][row][its blocks]); the same loop and summation order (bit-identical results).
+    rseg (swiglu, F): row-segmented gate / up (RSEG), both weight bindings the gate tensor's start over gate and up.
     amax (plain): also the argmax of y into a token (bindings ak: u64 key + i32 counter, tok: i32 after y; amax_tail).
     peel: the first peel K iterations run before the loop, their weight loads and decode (which do not read x) ahead
     of a "// chain.wait" marker (gen_chain puts the producer wait there), the x part after it (the same ops)."""
@@ -678,7 +679,8 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=
 
     # ---- kernel body ----
     nw = len(fmts)
-    wnb = [row_bytes(f, K) * M for f in fmts]
+    wnb = [row_bytes(f, K) * M * (2 if rseg else 1) for f in fmts]
+    assert not rseg or (kind == "swiglu" and fmts[0] == fmts[1] and not kseg and rseg_ok(M, rseg)), (kind, fmts, rseg)
     b("  %tid = kernel.workitem.id<x> : index")
     b("  %wg = kernel.workgroup.id<x> : index")
     b(f"  %lane = index.rem %tid, {e.ci(32)} : index")
@@ -700,6 +702,38 @@ def gen(kind, fmts, M, K, R=2, W=4, name="yah_gemv", _e=None, _parts=None, peel=
                     b(f"  %f{i}rb{r}s{si} = index.mul %f{i}row{r}, {e.ci(w * bb)} : index")
                     b(f"  %f{i}rc{r}s{si} = index.add %f{i}rb{r}s{si}, {e.ci((M - 1) * k0 * bb)} : index")
                     b(f"  %f{i}base{r}s{si} = index.add %f{i}rc{r}s{si}, %f{i}lboff : index")
+                continue
+            if rseg:   # (RSEG) logical row row + i M at its physical row
+                lg, f0_ = f"%f{i}row{r}" if not i else f"%f{i}lg{r}", M - rseg
+                if i:
+                    b(f"  {lg} = index.add %f{i}row{r}, {e.ci(M)} : index")
+                q_ = f"%f{i}q{r}"
+                bs_ = e.ci(M + f0_ if i else f0_)   # (gate rows below M, up rows from M: the NPU's from f0 on)
+                b(f"  {q_}npu = index.cmp uge, {lg}, {bs_} : index")
+                b(f"  {q_}lgc = index.max {lg}, {bs_} : index")   # (clamps: the range proof's bounds)
+                b(f"  {q_}rel = index.sub {q_}lgc, {bs_} : index")
+                # (the block by compares: this target refuses index.div / rem by a non-power of two)
+                g_ = e.ci(0)
+                for k_ in range(1, rseg // RSEG_B):
+                    b(f"  {q_}c{k_} = index.cmp uge, {q_}rel, {e.ci(RSEG_B * k_)} : index")
+                    b(f"  {q_}d{k_} = scf.select {q_}c{k_}, {e.ci(1)}, {e.ci(0)} : index")
+                    b(f"  {q_}g{k_} = index.add {g_}, {q_}d{k_} : index")
+                    g_ = f"{q_}g{k_}"
+                b(f"  {q_}gb = index.mul {g_}, {e.ci(RSEG_B)} : index")
+                b(f"  {q_}w0 = index.sub {q_}rel, {q_}gb : index")
+                b(f"  {q_}w1 = index.max {q_}w0, {e.ci(0)} : index")
+                b(f"  {q_}w = index.min {q_}w1, {e.ci(RSEG_B - 1)} : index")
+                b(f"  {q_}s0 = index.mul {g_}, {e.ci(2)} : index")
+                b(f"  {q_}s = index.add {q_}s0, {e.ci(i)} : index")
+                b(f"  {q_}sb = index.mul {q_}s, {e.ci(RSEG_B)} : index")
+                b(f"  {q_}p0 = index.add {q_}sb, {q_}w : index")
+                b(f"  {q_}p1 = index.add {q_}p0, {e.ci(f0_)} : index")
+                b(f"  {q_}hi = index.cmp uge, {q_}s, {e.ci(rseg // RSEG_B)} : index")
+                b(f"  {q_}p2 = index.add {q_}p1, {e.ci(f0_)} : index")
+                b(f"  {q_}p = scf.select {q_}hi, {q_}p2, {q_}p1 : index")
+                b(f"  {q_}r = scf.select {q_}npu, {q_}p, {lg} : index")
+                b(f"  %f{i}rb{r} = index.mul {q_}r, {e.ci(rb)} : index")
+                b(f"  %f{i}base{r} = index.add %f{i}rb{r}, %f{i}lboff : index")
                 continue
             b(f"  %f{i}rb{r} = index.mul %f{i}row{r}, {e.ci(rb)} : index")
             b(f"  %f{i}base{r} = index.add %f{i}rb{r}, %f{i}lboff : index")
@@ -842,6 +876,63 @@ def kseg_ok(kseg, K):
             return False
         k += w
     return k * 256 == K
+
+
+# Row segments (RSEG): an FFN layer whose last F gate / up features the NPU's 5-slab gate / up image reads (emit_prefill_pp
+# FFNSW5, gen_npu_q qsw5). Its 16-row records take 8 gate rows and the same features' 8 up rows, which the shim DMA
+# reaches by a step of under 2^20 words: so those rows are stored in blocks of RSEG_B, gate block g then up block g, a
+# pair per 2 RSEG_B rows over the gate tensor's last F rows and then the up tensor's (LoomWeights, in place at load).
+# Logical row L over gate and up ([0, M) gate, [M, 2M) up) at physical row rseg_phys(L), both from the gate tensor's
+# start; the other rows stay.
+RSEG_B = 1280
+
+
+def rseg_ok(M, F):
+    return 0 < F < M and F % (2 * RSEG_B) == 0
+
+
+def rseg_phys(L, M, F):
+    """The physical row (from the gate tensor's start) of logical row L over gate and up."""
+    f0, ng = M - F, F // RSEG_B
+    base = M + f0 if L >= M else f0
+    if L < base:
+        return L
+    g, w = divmod(L - base, RSEG_B)
+    s_ = 2 * g + (L >= M)
+    return f0 + RSEG_B * s_ + w + (f0 if s_ >= ng else 0)
+
+
+def rseg_emit_i32(e, src, dst, M, F, off=0):
+    """%dst (i32) = rseg_phys(%src + off) (gen_gemm_tile RSEG); e: the emitter's line function."""
+    assert rseg_ok(M, F), (M, F)
+    f0, ng = M - F, F // RSEG_B
+    c = lambda n, v: e(f"  %rs_{n} = scalar.constant {v} : i32")
+    c("off", off), c("m", M), c("b0", f0), c("b1", M + f0), c("bb", RSEG_B), c("two", 2), c("one", 1), c("zero", 0)
+    c("ng", ng)
+    for ln in (f"%rs_l = scalar.addi {src}, %rs_off : i32",
+               "%rs_up = scalar.cmpi uge, %rs_l, %rs_m : i32",
+               "%rs_base = scf.select %rs_up, %rs_b1, %rs_b0 : i32",
+               "%rs_npu = scalar.cmpi uge, %rs_l, %rs_base : i32",
+               "%rs_rel = scalar.subi %rs_l, %rs_base : i32",
+               "%rs_g = scalar.divui %rs_rel, %rs_bb : i32",
+               "%rs_gb = scalar.muli %rs_g, %rs_bb : i32",
+               "%rs_w = scalar.subi %rs_rel, %rs_gb : i32",
+               "%rs_g2 = scalar.muli %rs_g, %rs_two : i32",
+               "%rs_ui = scf.select %rs_up, %rs_one, %rs_zero : i32",
+               "%rs_s = scalar.addi %rs_g2, %rs_ui : i32",
+               "%rs_sb = scalar.muli %rs_s, %rs_bb : i32",
+               "%rs_p0 = scalar.addi %rs_sb, %rs_w : i32",
+               "%rs_p1 = scalar.addi %rs_p0, %rs_b0 : i32",
+               "%rs_hi = scalar.cmpi uge, %rs_s, %rs_ng : i32",
+               "%rs_p2 = scalar.addi %rs_p1, %rs_b0 : i32",
+               "%rs_p = scf.select %rs_hi, %rs_p2, %rs_p1 : i32",
+               f"{dst} = scf.select %rs_npu, %rs_p, %rs_l : i32"):
+        e("  " + ln)
+
+
+def rseg_suffix(F):
+    """A kernel name's suffix for row-segmented gate / up weights."""
+    return "_rseg%d" % F if F else ""
 
 
 def kseg_suffix(kseg):
