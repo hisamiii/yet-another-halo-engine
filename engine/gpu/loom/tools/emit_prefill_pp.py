@@ -2488,7 +2488,8 @@ def main():
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
     assert 640 in O16_MT and B % gen_conv_kq.TB == 0
-    dn_vconv = DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT
+    # (YAH_DNSS=0: the chunked form on GPU-only sets too)
+    dn_vconv = DNSPLIT == (40, 8) and "qkv" not in NPU_SPLIT and os.environ.get("YAH_DNSS", "1") != "0"
     if dn_vconv:
         text = gen_conv_kq.gen(4096)
         geom.append(("dnvconv", gen_conv_kq.tiles(4096), 0, 0))
