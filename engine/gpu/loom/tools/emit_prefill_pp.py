@@ -943,6 +943,8 @@ QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (n
 # wgt p1k); dispatch.txt "npurswap <F>", "npubytes_ffnswap". The engine uses them with YAH_NPU_RSWAP=1 only.
 # The Q' pairs' other gate / up formats get their decoders into the same stream too ("npu_swdec_<fmt>_<g|u>.hal",
 # gen_kq_bfp stream): the swap image reads bfp16 only, so it serves every format.
+# YAH_DNSSC=1 (with a qkv split and dnsplit): DeltaNet as gen_gdn_ss reading the NPU's v channels from C ("dnc_*")
+DNSSC = os.environ.get("YAH_DNSSC") == "1"
 RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT", "1") != "0"   # (default on; "0": off)
 # (RSWAP_EMIT) the gen_r5kq carriers' VGPR ladder (emit_prefill vtry) and the carriers left to the standalone decoders
 # (q3k_iq3s: 204 VGPRs with spills at every budget, +19% vs its plain split)
@@ -1376,6 +1378,19 @@ def npu_split(rows, combos, B, outdir):
             out.append(("npu_unpack_qkv_tail%s.hal" % sfx, n // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))   # 8 tokens x n / 8 items
             out.append(("convkq_g%s.hal" % sfx, gen_conv_kq.tiles(N - n), 256, 0))
             out.append(("convkq_c%s.hal" % sfx, n // gen_conv_kq.cw(n), gen_conv_kq.cw(n), B // gen_conv_kq.TC))
+            if DNSSC:
+                # (YAH_DNSSC) DeltaNet on the state-stationary kernel with the v conv folded in, the NPU's v channels
+                # read from C (gen_gdn_ss cfirst): "dnc_<a|b>.hal" per dnsplit part (row: heads, threads), the conv
+                # only for the q / k heads ("convqk.hal"); convkq_g / convkq_c are not dispatched
+                ha, hb = DNSPLIT
+                for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
+                    hal = "dnc_%s%s.hal" % (tag, sfx)
+                    src = os.path.join(tmp, hal[:-4] + ".loom")
+                    open(src, "w").write(gen_gdn_ss.gen(list(range(h0, h0 + nh)), N - n, n // GN.TN, B))
+                    E.emit(src, ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
+                                 "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
+                                 "yah_deltanet.num_heads=48"], hal, outdir)
+                    out.append((hal, nh, gen_gdn_ss.THREADS, 0))
         if row:
             out.append(("npusplit%s_%s" % (sfx[1:], site), n, 0, 0))
     for site, n in sorted(NPU_SPLIT.items()):
@@ -2481,6 +2496,12 @@ def main():
         text = gen_conv_kq.gen()
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
+    if DNSSC and "qkv" in NPU_SPLIT:   # (the q / k heads' conv beside the dnc_* DeltaNet parts)
+        qk_src = os.path.join(tmp, "yah_ssm_conv_qk.loom")
+        open(qk_src, "w").write(gen_conv_kq.gen(4096))
+        E.emit(qk_src, ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
+                        "yah_ssm_conv_kq.num_key_heads=16"], "convqk.hal", outdir)
+        geom.append(("convqk.hal", gen_conv_kq.tiles(4096), 256, 0))
     prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
     text = open(os.path.join(E.LOOM, "yah_deltanet_prep_ab_f32.loom")).read()
     open(prepab_src, "w").write(prepab_x16(text) if 640 in O16_MT else text)

@@ -45,10 +45,19 @@ V4H = "vector<4xf16>"
 KQ, KT, AF, PP, T2, GA, CW, CS, OS = 0, 17408, 28288, 32896, 35456, 40576, 42880, 44928, 46464
 POOL = OS + 8 * 2 * 16 * 16 * 2
 assert POOL <= 65536
+# (cfirst: the NPU qkv split) a chunk's v channels staged in LDS f16 [token][channel], the NPU's from its C, the GPU's
+# from x: VS (32 rows), VP (the 3 tokens before a chunk, 2 parity buffers of 3 rows + 1 dump row), pitch 136
+VS = POOL
+VP = VS + 32 * 136 * 2
+POOLC = VP + 7 * 136 * 2
+assert POOLC <= 65536
 
 
-def gen(heads):
-    """O as f32 [batch][inner_size] at head h's own columns 128 h .. (gen_gdn_chunk's output, the
+def gen(heads, cfirst=None, ccols=0, batch=0):
+    """cfirst (with ccols NPU columns, batch tokens): a NPU qkv split's form, the v channels cfirst .. 10239 read from
+    the NPU's C (binding cbuf after out, gen_conv_kq.gen_c's addressing and the unpack's ops: bit-identical to the
+    unpacked f16 x), staged per chunk in LDS (VS / VP) with x's for the GPU's heads; the conv reads its taps from there.
+    O as f32 [batch][inner_size] at head h's own columns 128 h .. (gen_gdn_chunk's output, the
     plain postnorm's input), stored from the accumulators (no staging), and the v conv with gen_gdn_chunk's ops and V
     rounded to f16 as its Vt: one chaotic gate token (window 06) fails gate N with the fma / exp2 form (mean KL 2.45e-6
     vs 1.06e-6)."""
@@ -71,9 +80,9 @@ def gen(heads):
     e(f"  %launch_heads = index.constant {nh} : index")
     e("  kernel.launch.config workgroups(%unit, %launch_heads, %unit) workgroup_size(%nthreads, %unit, %unit) : index")
     e("} launch(%conv: buffer, %x: buffer, %cw: buffer, %cst: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, "
-      "%ssm_dt: buffer, %valid: buffer, %state: buffer, %out: buffer) {")
+      "%ssm_dt: buffer, %valid: buffer, %state: buffer, %out: buffer" + (", %cbuf: buffer" if cfirst else "") + ") {")
     e("  %base = index.constant 0 : offset")
-    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 31, 32, 40, 48, 64, 127, 128, 255, 16384):
+    for v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 29, 31, 32, 40, 48, 64, 127, 128, 255, 16384):
         e(f"  %c{v} = index.constant {v} : index")
     e("  %zero = scalar.constant 0.0 : f32")
     e("  %one = scalar.constant 1.0 : f32")
@@ -108,7 +117,7 @@ def gen(heads):
     e("  %valid_view = buffer.view %valid[%base] : buffer -> view<1xi32>")
     e("  %state_view = buffer.view %st_na[%base] : buffer -> view<[%state_total]xf32>")
     e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%out_total]xf32>")
-    e(f"  %pool_bytes = index.constant {POOL} : offset")
+    e(f"  %pool_bytes = index.constant {POOLC if cfirst else POOL} : offset")
     e("  %pool = buffer.alloca<workgroup> align(16) %pool_bytes : buffer")
 
     def region(name, off):
@@ -138,6 +147,21 @@ def gen(heads):
     e(f"  %css = buffer.view %pool[{o}] : buffer -> view<128x3xf32>")
     o = region("os", OS)
     e(f"  %os_v = buffer.view %pool[{o}] : buffer -> view<256x16xf16>")
+    if cfirst:
+        import gen_npu_gemm as GN
+        import gen_npu_unpack as GU
+        nwords = batch * ccols * GN.TN * GU.CG // 2
+        o = region("vs", VS)
+        e(f"  %vs = buffer.view %pool[{o}] : buffer -> view<32x136xf16>")
+        o = region("vp", VP)
+        e(f"  %vp = buffer.view %pool[{o}] : buffer -> view<7x136xf16>")
+        e(f"  %nc = index.constant {nwords} : index")
+        e(f"  %cgs = index.constant {batch * GN.TN} : index")
+        e(f"  %nel = index.constant {2 * nwords - (GU.CG - 1) * batch * GN.TN - 8} : index")
+        e(f"  %cfirst = index.constant {cfirst} : index")
+        e("  %c16i = scalar.constant 16 : i32")
+        e("  %chii = scalar.constant -65536 : i32")
+        e("  %cv = buffer.view %cbuf[%base] : buffer -> view<[%nc]xi32>")
     for i, nm in enumerate(("LG", "G2", "BETA", "BG", "GC", "GG")):
         e(f"  %ga{nm} = index.constant {i} : index")
 
@@ -508,8 +532,103 @@ def gen(heads):
         e(f"{I}{barrier}")
         e("    }")
 
+    def stage_map():
+        """(cfirst) thread (token lt, channels dseg .. +15 of the head): its two 8-channel items' C lane parts"""
+        import gen_npu_unpack as GU
+        e("    %fromc = index.cmp uge, %v_rel, %cfirst : index")
+        las = []
+        for i in range(2):
+            e(f"    %sm{i}c = index.constant {8 * i} : index")
+            e(f"    %sm{i}a = index.add %v_rel, %dseg : index")
+            e(f"    %sm{i}ch = index.add %sm{i}a, %sm{i}c : index")
+            e(f"    %sm{i}m = index.max %sm{i}ch, %cfirst : index")
+            e(f"    %sm{i}n = index.sub %sm{i}m, %cfirst : index")
+            las.append(GU.c_lane(e, f"sl{i}_", f"%sm{i}n", batch))
+        return las
+
+    def stage_load(I, las):
+        """(cfirst) this chunk's items: C words (both replay groups) and x's f16, in flight until stage_store"""
+        import gen_npu_unpack as GU
+        e(f"{I}%sk_tok = index.add %t0, %lt : index")
+        tb = GU.c_tok(e, "skt_", "%sk_tok")
+        e(f"{I}%sk_xr = index.mul %sk_tok, %qkv_size : index")
+        names = []
+        for i in range(2):
+            e(f"{I}%sk{i}i0 = index.add {las[i]}, {tb} : index")
+            e(f"{I}%sk{i}i = index.min %sk{i}i0, %nel : index")   # (in range by construction; for the bound proof)
+            for g in range(GU.CG):
+                src = f"%sk{i}i" if g == 0 else f"%sk{i}j{g}"
+                if g:
+                    e(f"{I}%sk{i}j{g} = index.add {f'%sk{i}i' if g == 1 else f'%sk{i}j{g - 1}'}, %cgs : index")
+                e(f"{I}%sk{i}w{g} = index.div {src}, %c2 : index")
+                e(f"{I}%sk{i}g{g} = vector.load %cv[%sk{i}w{g}] : view<[%nc]xi32> -> vector<4xi32>")
+            e(f"{I}%sk{i}xa0 = index.add %sk_xr, %sm{i}ch : index")
+            e(f"{I}%sk{i}x = vector.load %x_view[%sk{i}xa0] : view<[%conv_total]xf16> -> {V8H}")
+        return names
+
+    def stage_store(I):
+        """(cfirst) the items to VS [lt][channel], tokens 29-31 also to VP's other parity (the next chunk's x[-3..-1])"""
+        import gen_npu_unpack as GU
+        e(f"{I}%sp_isp = index.cmp uge, %lt, %c29 : index")
+        e(f"{I}%sp_l0 = index.max %lt, %c29 : index")
+        e(f"{I}%sp_l = index.sub %sp_l0, %c29 : index")
+        e(f"{I}%sp_np = index.sub %c1, %par : index")
+        e(f"{I}%sp_b = index.mul %sp_np, %c3 : index")
+        e(f"{I}%sp_r0 = index.add %sp_b, %sp_l : index")
+        e(f"{I}%sp_r = scf.select %sp_isp, %sp_r0, %c6 : index")
+        for i in range(2):
+            gs = []
+            for g in range(GU.CG):
+                vals = []
+                for w in range(4):
+                    n = f"%ss{i}_{g}_{w}"
+                    e(f"{I}{n}e = vector.extract %sk{i}g{g}[{w}] : vector<4xi32> -> i32")
+                    e(f"{I}{n}l = scalar.shli {n}e, %c16i : i32")
+                    e(f"{I}{n}h = scalar.andi {n}e, %chii : i32")
+                    e(f"{I}{n}lf = scalar.bitcast {n}l : i32 to f32")
+                    e(f"{I}{n}hf = scalar.bitcast {n}h : i32 to f32")
+                    vals += [f"{n}lf", f"{n}hf"]
+                e(f"{I}%ss{i}v{g} = vector.from_elements {', '.join(vals)} : vector<8xf32>")
+                gs.append(f"%ss{i}v{g}")
+            acc = gs[0]
+            for g in range(1, GU.CG):   # (gen_npu_unpack.load_cg's order)
+                e(f"{I}%ss{i}a{g} = vector.addf {acc}, {gs[g]} : vector<8xf32>")
+                acc = f"%ss{i}a{g}"
+            e(f"{I}%ss{i}h = vector.fptrunc {acc} : vector<8xf32> to {V8H}")
+            e(f"{I}%ss{i}s = scf.select %fromc, %ss{i}h, %sk{i}x : {V8H}")
+            e(f"{I}%ss{i}col0 = index.constant {8 * i} : index")
+            e(f"{I}%ss{i}col = index.add %dseg, %ss{i}col0 : index")
+            e(f"{I}vector.store %ss{i}s, %vs[%lt, %ss{i}col] : {V8H}, view<32x136xf16>")
+            e(f"{I}vector.store %ss{i}s, %vp[%sp_r, %ss{i}col] : {V8H}, view<7x136xf16>")
+
+    def stage_taps(I):
+        """(cfirst) the 34 taps of this lane (channel %row, tokens t0 + half + k - 3) from VS / VP, as fetch_rows'"""
+        e(f"{I}%v_vb = index.add %t0, %half : index")
+        e(f"{I}%tp_pb = index.mul %par, %c3 : index")
+        vx = []
+        for k in range(34):
+            if k < 3:
+                e(f"{I}%tp{k}c = index.constant {k} : index")
+                e(f"{I}%tp{k}j = index.add %half, %tp{k}c : index")
+                e(f"{I}%tp{k}jm = index.min %tp{k}j, %c2 : index")
+                e(f"{I}%tp{k}pr = index.add %tp_pb, %tp{k}jm : index")
+                e(f"{I}%tp{k}p = view.load %vp[%tp{k}pr, %row] : view<7x136xf16> -> f16")
+                if k == 2:   # (half 1: token t0, VS row 0)
+                    e(f"{I}%tp{k}m = view.load %vs[%c0, %row] : view<32x136xf16> -> f16")
+                    e(f"{I}%tp{k} = scf.select %shi, %tp{k}m, %tp{k}p : f16")
+                    vx.append(f"%tp{k}")
+                else:
+                    vx.append(f"%tp{k}p")
+            else:
+                e(f"{I}%tp{k}c = index.constant {k - 3} : index")
+                e(f"{I}%tp{k}r = index.add %half, %tp{k}c : index")
+                e(f"{I}%tp{k} = view.load %vs[%tp{k}r, %row] : view<32x136xf16> -> f16")
+                vx.append(f"%tp{k}")
+        return vx
+
     def rows():
         """waves 0-7: value rows 16 sg .. +15, the state as S^T accumulators"""
+        las = stage_map() if cfirst else None
         ftypes = [V4H] * 8
         fnames = [f"%kv{g}" for g in range(4)] + [f"%qv{g}" for g in range(4)]
         pre = fetch_rows("%c0", "f0_", "    ")
@@ -541,7 +660,10 @@ def gen(heads):
                         e(f"{I}%kt{g}{i}r = index.add %kseg, %kt{g}{i}c : index")
                         e(f"{I}view.store %kt{g}{i}e, %kt_w[%kt{g}{i}r, %lt] : f16, view<136x40xf16>")
         # this chunk's v conv taps: in flight during phases 1-2, the conv runs in phase 5
-        vx = fetch_rows("%ci", "v_", I, kq=False)
+        if cfirst:
+            stage_load(I, las)
+        else:
+            vx = fetch_rows("%ci", "v_", I, kq=False)
         # next chunk's inputs (clamped): in flight during phases 2-5
         e(f"{I}%cn0 = index.add %ci, %c1 : index")
         e(f"{I}%cn = index.min %cn0, %lastc : index")
@@ -610,7 +732,11 @@ def gen(heads):
                 e(f"{I}%oa{tt}_{j} = vector.fragment.load<lhs> %kq_l[%oq{tt}_{j}, %xk{j}] shape [%m, %k] : view<64x136xf16> -> {V16H}")
                 e(f"{I}%oc{tt}_{j} = vector.mma %oa{tt}_{j}, {b}, {oa[tt]} : {V16H}, {V16H}, {V8}")
                 oa[tt] = f"%oc{tt}_{j}"
+        if cfirst:
+            stage_store(I)
         e(f"{I}{barrier}")
+        if cfirst:
+            vx = stage_taps(I)
         # ---- phase 5: the v conv in the accumulator layout (lane: channel %row; tile tt element i: token
         # 16 tt + half + 2 i), Y = V - 2^G KS, Vn = U = T2 Y; Vn' = 2^(G_C - G) Vn, O1 2^G
         for c in range(2):

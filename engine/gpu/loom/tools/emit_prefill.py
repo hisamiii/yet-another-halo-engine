@@ -72,7 +72,7 @@ ASYNC = False
 # Kernels whose waves split into roles (attention's softmax and P.V waves, DeltaNet's row split): each role region runs
 # the same barrier sequence, which Loom cannot prove through their while loops, so the source asserts it
 # (LOOM_EXP_WAVE_ROLE_BARRIERS: workgroup barriers need only wave-uniform control).
-ROLE_SPLIT = ("wmma", "rowsplit")
+ROLE_SPLIT = ("wmma", "rowsplit", "dnc")
 CACHE = os.environ.get("YAH_EMIT_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "yah-emit"))
 JOBS = int(os.environ.get("YAH_EMIT_JOBS", "16"))
 _pool, _pending, _latest, _lock, _lc = None, {}, {}, threading.Lock(), None

@@ -2858,7 +2858,28 @@ class LoomPrefill {
                 Ref(*ab_), Ref(*valid_)},
                0b1100000);
     };
-    if (conv_c.length) {
+    if (const std::string da = QkvHal("dnc_a", wqkv, nq), db = QkvHal("dnc_b", wqkv, nq);
+        conv_c.length && geom_.count(da) && geom_.count(db)) {
+      // dispatch.txt "dnc_<a|b>.hal" (emit_prefill_pp YAH_DNSSC): DeltaNet's parts on the state-stationary kernel with
+      // the v conv and alpha / beta folded in, the NPU's v channels read from C; the conv only takes the q / k heads,
+      // and prep_ab only advances the conv ring after both parts (as dnvconv)
+      const Geom& gq = geom_.at("convqk.hal");
+      Dispatch(Exe("convqk.hal"), "yah_ssm_conv_kq", gq.tokens, B_ / conv_tb, 1, 256, 1, 1,
+               {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
+      const hrx_buffer_ref_t cref{npu_->C().handle, conv_c.offset, conv_c.length};
+      const std::vector<hrx_buffer_ref_t> in{Ref(*conv_out_), Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs,
+                                             Ref(*alpha_), Ref(*beta_), TRef(*Find(pre + "ssm_a")),
+                                             TRef(*Find(pre + "ssm_dt.bias")), Ref(*valid_)};
+      auto ba = in, bb = in;
+      ba.insert(ba.end(), {st, Ref(*raw_), cref});
+      bb.insert(bb.end(), {st, Ref(*raw2_), cref});
+      const Geom& ga = geom_.at(da);
+      const Geom& gb = geom_.at(db);
+      if (ga.tokens != dnsplit_a_ || gb.tokens != dnsplit_b_) throw LoomError("prefill: dnc parts do not match dnsplit");
+      Dispatch(Exe(da), "yah_deltanet", 1, ga.tokens, 1, ga.rowgrp, 1, 1, ba, 0b11000000000);
+      Dispatch(Exe(db), "yah_deltanet", 1, gb.tokens, 1, gb.rowgrp, 1, 1, bb, 0b11000000000);
+      dn_done = true;
+    } else if (conv_c.length) {
       const std::string hg = QkvHal("convkq_g", wqkv, nq), hc = QkvHal("convkq_c", wqkv, nq);
       const Geom& gg = geom_.at(hg);
       const Geom& gc = geom_.at(hc);
