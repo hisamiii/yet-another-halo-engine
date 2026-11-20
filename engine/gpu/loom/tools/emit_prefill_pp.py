@@ -1341,6 +1341,25 @@ def npu_split(rows, combos, B, outdir):
                         E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                                      "yah_half_norm.fused=0"], qname, outdir)
                         out.append((qname, B // 16, 32 * 4 * ONORM_SPLIT, 0))
+        if site == "gate" and DNSPLIT and 384 in O16_MT:
+            # the DeltaNet postnorm parts read the gate's NPU columns straight from C (gen_postnorm_bfp gc), so the gate
+            # unpack goes: "postnorm[_t]_a_bfp[_pk]_gc<sfx>.hal" (part a with the out stream) and "postnorm[_t]_b_gc<sfx>.hal"
+            import gen_postnorm_bfp
+            pn_bfp = "out" in NPU_SPLIT and DNSPLIT[0] * 128 == NPU_KCALL
+            pvars = [(t, "_a_bfp" + pk, 0, DNSPLIT[0], True, perm) for t in (False, True)
+                     for pk, perm in (("", "p4"), ("_pk", "pk")) if pn_bfp]
+            pvars += [(t, "_b", DNSPLIT[0], DNSPLIT[1], False, "p4") for t in (False, True)]
+            for tiled, part, h0, nh, bfp, perm in pvars:
+                gname = "postnorm%s%s_gc%s.hal" % ("_t" if tiled else "", part, sfx)
+                src = os.path.join(tmp, gname[:-4] + ".loom")
+                GE.ACT_PERM = perm
+                try:
+                    text = gen_postnorm_bfp.gen(B, h0, nh, list(NPU_KS), NPU_PASSES, tiled, True, bfp=bfp, gc=n)
+                finally:
+                    GE.ACT_PERM = "p4"
+                open(src, "w").write(text)
+                E.emit(src, ["yah_ssm_postnorm_fp16.head_count=%d" % (nh * B)], gname, outdir)
+                out.append((gname, 1, 0, 0))
         if site == "qkv":
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads

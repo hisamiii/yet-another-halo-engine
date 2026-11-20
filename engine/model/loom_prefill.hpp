@@ -1877,6 +1877,7 @@ class LoomPrefill {
   }
   // GPU work an NPU job does not read, recorded right after that job's release (RunDeltaNet's postnorm part b)
   std::function<void()> after_release_;
+  NpuView gc_read_{};   // (gc) the gate's C range a deferred postnorm part still reads
   void RunAfterRelease() {
     if (after_release_) std::exchange(after_release_, nullptr)();
   }
@@ -2522,6 +2523,9 @@ class LoomPrefill {
         const auto w = NpuRawRows(site, wname, nn);
         std::vector<std::uint32_t> calls;
         const NpuView c = NpuCalls(site, a, w, c_off, calls, wname);
+        // (gc) part b of the DeltaNet postnorm, deferred past this job's release, still reads the gate's C
+        if (gc_read_.length && c.offset < gc_read_.offset + gc_read_.length && gc_read_.offset < c.offset + c.length)
+          throw LoomError("prefill: the out job's C overlaps the gate's C that the postnorm reads (" + wname + ")");
         NpuEnqueue(std::move(calls), site);
         RunAfterRelease();
         const Geom gs = GeomOf(sh);
@@ -2903,35 +2907,47 @@ class LoomPrefill {
                  {Ref(*conv_out_), Ref(*kqbuf_), Ref(*ab_), st, Ref(*raw_)});
       }
     }
+    // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
+    const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
+    const std::string pn = out_af ? "postnorm_t" : "postnorm";
+    // heads [0, a) are ssm_out's NPU K chunk: with "npupostnormbfp" part a also writes the NPU's input into A and
+    // NpuEncode("out") skips the encoder (RunResidual splits only full chunks; an unused A costs nothing)
+    const bool bfp = dnsplit_a_ && geom_.count("npupostnormbfp") && NpuRows("out", pre + "ssm_out.weight") &&
+                     trim_row_ == kAllRows && tail_ == kAllRows;
+    // (a Q4_K ssm_out reads the Q4_K-order stream: "_a_bfp_pk.hal" writes it into A's second half instead)
+    const bool pk = bfp && NpuPk(pre + "ssm_out.weight") && geom_.count("npupostnormbfppk");
+    // gc: the postnorm parts read the gate's NPU columns straight from C ("<pn>_a_bfp[_pk]_gc<sfx>.hal", "<pn>_b_gc<sfx>.hal",
+    // gen_postnorm_bfp gc), so the gate unpack goes; the out job's C must not overlap the gate's (RunResidual checks)
+    std::string gc_sfx;
     if (gate_job >= 0) {   // (the conv and DeltaNet neither read gate's C nor write the A it reads)
       NpuJoin(gate_job);
-      NpuUnpack(RowsHal(Np4Hal("npu_unpack_gate", pre + "attn_gate.weight"), "gate", ng, Np4(pre + "attn_gate.weight")), cg,
-                {Ref(*gate_)}, 2);
+      const std::string un = RowsHal(Np4Hal("npu_unpack_gate", pre + "attn_gate.weight"), "gate", ng, Np4(pre + "attn_gate.weight"));
+      const std::string sfx = un.substr(15, un.size() - 19);   // "npu_unpack_gate<sfx>.hal"
+      if (bfp && geom_.count(pn + (pk ? "_a_bfp_pk_gc" : "_a_bfp_gc") + sfx + ".hal") && geom_.count(pn + "_b_gc" + sfx + ".hal"))
+        gc_sfx = "_gc" + sfx, gc_read_ = cg;
+      else
+        NpuUnpack(un, cg, {Ref(*gate_)}, 2);
     }
     if (tail_ == kNoRows) {  // the recurrent state is written; nothing reads this layer's output
       if (dn_done) ring();
+      gc_read_ = {};
       return;
     }
-    // an afrag ssm_out reads the postnorm output fragment-major (postnorm_t)
-    const bool out_af = Af("gemm_kres", pre + "ssm_out.weight");
     const hrx_buffer_ref_t gate{gate_->handle, 0, std::size_t{B_} * kInner * 4};
+    const hrx_buffer_ref_t gcb{npu_ ? npu_->C().handle : gate_->handle, cg.offset, cg.length};
     if (dnsplit_a_) {
-      const std::string pn = out_af ? "postnorm_t" : "postnorm";
-      // heads [0, a) are ssm_out's NPU K chunk: with "npupostnormbfp" this part also writes the NPU's input into A and
-      // NpuEncode("out") skips the encoder (RunResidual splits only full chunks; an unused A costs nothing)
-      const bool bfp = geom_.count("npupostnormbfp") && NpuRows("out", pre + "ssm_out.weight") && trim_row_ == kAllRows &&
-                       tail_ == kAllRows;
-      // (a Q4_K ssm_out reads the Q4_K-order stream: "_a_bfp_pk.hal" writes it into A's second half instead)
-      const bool pk = bfp && NpuPk(pre + "ssm_out.weight") && geom_.count("npupostnormbfppk");
       norm_bfp_ = bfp && !pk ? "out" : "";
       norm_pk_ = pk ? "out" : "";
       std::vector<hrx_buffer_ref_t> b{Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)};
       if (bfp) b.push_back({npu_->A().handle, pk ? PkA() : 0, NpuK(5120).a});
-      Dispatch(Exe(pn + (pk ? "_a_bfp_pk.hal" : bfp ? "_a_bfp.hal" : "_a.hal")), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1,
-               1, 256, 1, 1, b);
-      const auto part_b = [this, pn, gate, w = TRef(*Find(pre + "ssm_norm.weight"))] {
-        Dispatch(Exe(pn + "_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1,
-                 {Ref(*raw2_), w, gate, Ref(*scratch_)});
+      if (!gc_sfx.empty()) b.push_back(gcb);
+      Dispatch(Exe(pn + (pk ? "_a_bfp_pk" : bfp ? "_a_bfp" : "_a") + gc_sfx + ".hal"), "yah_ssm_postnorm_fp16",
+               dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1, b);
+      const auto part_b = [this, pn, gate, gc_sfx, gcb, w = TRef(*Find(pre + "ssm_norm.weight"))] {
+        std::vector<hrx_buffer_ref_t> bb{Ref(*raw2_), w, gate, Ref(*scratch_)};
+        if (!gc_sfx.empty()) bb.push_back(gcb);
+        Dispatch(Exe(pn + "_b" + gc_sfx + ".hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1, bb);
+        gc_read_ = {};
       };
       // with the NPU's out job reading part a's A, part b (and the conv ring) follow its release (RunResidual), not
       // precede it: the GPU's own out GEMM still reads them after (YAH_NPU_NODEFER=1: before, as without the NPU)
