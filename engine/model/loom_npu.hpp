@@ -100,6 +100,10 @@ class LoomNpu {
     // push with its weight fills unpaced, for the first call of a job (nothing computes yet that pacing would
     // protect). Not streamed (four invocations, one replay group, HRX patch 0017): call runs one whole call.
     bool streamed = true;
+    // The image's gate waiter asks (its first poll's tick) at the top of its core function, so once a job ends it
+    // already asks for the next one (gen_npu_gemm gate_first without GN_QPREFILL: the row 5 swap image). A job of the
+    // same image takes that tick as its first record; a switch away drops it first (AskDrop).
+    bool ask_early = false;
     // Streamed: calls queued ahead of their waits (QueueDepth: 2, or 1 where one call's pushes fill a DMA channel's
     // task queue past half, e.g. layout Q''s 4 W tasks a call: a second call's would overflow it)
     int depth = 2;
@@ -1022,12 +1026,16 @@ class LoomNpu {
     int dec = -1;
     if (PeerRan()) {   // the other context's commands ran on the array: its state is theirs now, set up in full
       std::lock_guard<std::mutex> lock(mu_);
+      if (resident_ && ask_drop_.count(resident_))   // (its setups found our waiter's pending ask; not handled)
+        throw LoomError("npu: an early-asking image ran before the peer's commands (AskDrop)");
       resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, lane_lost_ = true, ++epoch_;
     }
+    const void* ran = nullptr;
     {
       std::lock_guard<std::mutex> lock(mu_);
       resident = resident_ == family;
       dec = resident_dec_;
+      ran = resident_;
     }
     if ((!resident || fresh) && !k->setup.empty()) {
       // FusedCommand splices the setup twin in front of the first job
@@ -1052,7 +1060,7 @@ class LoomNpu {
     std::vector<std::vector<const Call*>> runs;
     for (const GatedJob& g : jobs) runs.push_back(g.calls);
     // commands run in submission order: the next one starts with this one's last family and decoder
-    const Fused fused = FusedCommand(runs, dec, family);
+    const Fused fused = FusedCommand(runs, dec, family, ran);
     const amdf_xdna_kernel_command_t command = fused.command;
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -1765,6 +1773,53 @@ class LoomNpu {
   // The peer's commands ran since the last family setup (EnqueueGated): the next one writes the packet lane's switches
   // itself (no control packets). Engine thread only.
   bool lane_lost_ = false;
+  // per family of an early-asking image (Kernel::ask_early), the ops that take its waiter's pending ask off the tick
+  // channel (AskDrop), from its last job's gate
+  std::map<const void*, std::vector<std::uint8_t>> ask_drop_;
+  // AskDrop's ops: one record of the gate's tick channel into a BD of no lock and no chain (BD 14: no gate uses it),
+  // then a sync on its token (the job's done block synced the tick task's own), so the next setup's channel resets
+  // find the stream empty. The pending ask is the record after the tick task's last (the queue runs in order), so the
+  // sync also waits for the waiter to send it.
+  static constexpr std::uint32_t kAskDropBd = 14, kAskDropOps = 10;
+  static std::vector<std::uint8_t> AskDrop(const std::vector<std::uint8_t>& gate) {
+    std::map<std::uint32_t, std::uint32_t> w;   // every word the gate writes (address -> value)
+    for (std::size_t q = 16; q + 16 <= gate.size();) {
+      std::uint32_t len = gate[q] == 0 ? 24 : gate[q] == 3 ? 28 : 0, a = 0;
+      if (gate[q] == 1) std::memcpy(&len, &gate[q + 12], 4);
+      else if (len == 0) std::memcpy(&len, &gate[q + 4], 4);
+      if (len < 16 || q + len > gate.size()) throw LoomError("npu: AskDrop: unexpected gate op");
+      std::memcpy(&a, &gate[q + 8], 4);
+      const std::uint32_t nw = gate[q] == 1 ? (len - 16) / 4 : gate[q] == 0 ? 1 : 0;
+      for (std::uint32_t i = 0; i < nw; ++i) std::memcpy(&w[a + 4 * i], &gate[q + 16 + 4 * i], 4);
+      q += len;
+    }
+    std::uint32_t col = 0, ch = 0, bd = 0, found = 0;
+    for (const auto& [a, v] : w) {   // the tick task: the shim S2MM task of 256 repeats (the poll task is MM2S)
+      const std::uint32_t row = a >> 20 & 31, off = a & 0xFFFFF;
+      if (row == 0 && (off == 0x1D204 || off == 0x1D20C) && (v >> 16 & 255) == 255)
+        col = a >> 25, ch = (off - 0x1D204) / 8, bd = v & 15, ++found;
+    }
+    if (found != 1 || bd == kAskDropBd) throw LoomError("npu: AskDrop: no single tick task in the gate");
+    std::uint32_t b[8];
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      const auto it = w.find(col << 25 | (0x1D000 + 32 * bd + 4 * i));
+      if (it == w.end()) throw LoomError("npu: AskDrop: the gate does not write its tick BD");
+      b[i] = it->second;
+    }
+    b[7] = 1u << 25;   // valid; no lock, no next BD
+    std::vector<std::uint8_t> o;
+    auto w32 = [&](std::uint32_t a, std::uint32_t v) {
+      std::uint8_t op[24] = {};
+      const std::uint32_t bl = 24;
+      std::memcpy(op + 8, &a, 4), std::memcpy(op + 16, &v, 4), std::memcpy(op + 20, &bl, 4);
+      o.insert(o.end(), op, op + 24);
+    };
+    for (std::uint32_t i = 0; i < 8; ++i) w32(col << 25 | (0x1D000 + 32 * kAskDropBd + 4 * i), b[i]);
+    w32(col << 25 | (0x1D204 + 8 * ch), kAskDropBd | 1u << 31);   // once, with a token
+    const std::uint32_t sync[4] = {0x80, 0x10, col << 16, ch << 24 | 1u << 16 | 1u << 8};   // S2MM ch, 1 col, 1 row
+    o.insert(o.end(), reinterpret_cast<const std::uint8_t*>(sync), reinterpret_cast<const std::uint8_t*>(sync) + 16);
+    return o;
+  }
   // A second context on the same array (a GEMM split's and an NPU attention's, SetPeer): the host orders the two. Each
   // command records the peer's commands enqueued so far (peer_need) and is submitted only once the peer retired them,
   // and a command after the peer's commands sets its image up in full (the peer's ran on the array in between).
@@ -1787,7 +1842,9 @@ class LoomNpu {
   std::atomic<std::uint64_t> epoch_{0};   // Epoch
   Script* recording_ = nullptr;           // Record
   std::vector<std::pair<amdf_memory_t*, amdf_host_mapping_t*>> scripts_;   // sealed scripts' storage
-  Fused FusedCommand(const std::vector<std::vector<const Call*>>& runs, int dec, const void* fam) {
+  // ran: the family whose jobs ran last on the array (nullptr: the array kept nothing), fam: the one set up (nullptr:
+  // the first job sets its own up)
+  Fused FusedCommand(const std::vector<std::vector<const Call*>>& runs, int dec, const void* fam, const void* ran) {
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
     auto append_raw = [&](const std::uint8_t* src, std::size_t length) {
@@ -1799,14 +1856,25 @@ class LoomNpu {
       ops += n;
     };
     auto append = [&](const std::vector<std::uint8_t>& b) { append_raw(b.data(), b.size()); };
-    auto append_ops = [&](const std::vector<std::uint8_t>& b, std::uint32_t n) {
+    auto append_ops = [&](const std::vector<std::uint8_t>& b, std::uint32_t n) {   // ops alone: after a header
+      if (bytes.empty()) throw LoomError("npu: a command starts without its header");
       bytes.insert(bytes.end(), b.begin(), b.end());
       ops += n;
+    };
+    auto remember = [&](const std::vector<const Call*>& calls) {   // the family that ran, its AskDrop
+      ran = FamilyOf(calls[0]->k);
+      if (calls[0]->k->ask_early && !ask_drop_.count(ran)) ask_drop_[ran] = AskDrop(calls.back()->gate);
     };
     for (const auto& calls : runs) {
       int queued = 0, since = 0;
       if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
         if (k0->setup.empty()) throw LoomError("npu: a job switches image families without a setup");
+        // the last image's waiter asked for a job that is not coming: take the ask off its tick channel first (a
+        // setup of the same image too: its cores ask again)
+        if (const auto it = ask_drop_.find(ran); it != ask_drop_.end()) {
+          if (bytes.empty()) bytes.assign(k0->setup.begin(), k0->setup.begin() + 16);   // (a command's first ops)
+          append_ops(it->second, kAskDropOps);
+        }
         // after the peer's commands (another image's routes on the array) the setup writes every switch itself
         // (YAH_NPU_NOPACKETS: diag, every switch)
         static const bool nopk = std::getenv("YAH_NPU_NOPACKETS") != nullptr;
@@ -1881,6 +1949,7 @@ class LoomNpu {
       if (!calls[0]->k->streamed) {
         for (const Call* c : calls) append(c->call);
         append(calls.back()->done);
+        remember(calls);
         if (prof_) append_ops(prof_->Read(), 1);
         continue;
       }
@@ -1919,6 +1988,7 @@ class LoomNpu {
       if (pend) append(pend->wait);
       for (; queued > 0; --queued) append(calls.back()->wait);
       append(calls.back()->done);
+      remember(calls);
       if (static const char* ec = std::getenv("YAH_NPU_ENDCLEAR"); ec && prof_) {   // (diag) writes before the end read
         static const std::vector<std::uint8_t> w = [] {
           std::vector<std::uint8_t> o;
@@ -2466,7 +2536,9 @@ class LoomNpuSplit : public NpuSplit {
                                      {&flags_, slot, plan_.gate_record},
                                      {&flags_, slot + kTick, plan_.gate_record},
                                      {&flags_, slot + kSignal, 2 * plan_.gate_record}};
-    return ids_[key] = BindViews(image, image, kSwapDec, "ffnswap", std::move(views));
+    const std::uint32_t id = BindViews(image, image, kSwapDec, "ffnswap", std::move(views));
+    instances_[image]->ask_early = true;   // (gen_npu_gemm: its tail's gate waits at the top of the core function)
+    return ids_[key] = id;
   }
   static constexpr int kSwapDec = 98;   // (BindSwap's family id: no decoder; the decoders' are below 98)
   void ShareWeights(const void* key, std::size_t bytes, const LoomBuffer& buffer) override {
