@@ -104,6 +104,9 @@ class LoomNpu {
     // already asks for the next one (gen_npu_gemm gate_first without GN_QPREFILL: the row 5 swap image). A job of the
     // same image takes that tick as its first record; a switch away drops it first (AskDrop).
     bool ask_early = false;
+    // (gen_npu_gemm GN_QPANEL) calls a token panel: the job opens panel by panel, and the host pushes each later
+    // panel's first call after that panel's go (GoPart). 0: one gate a job.
+    int panel = 0;
     // Streamed: calls queued ahead of their waits (QueueDepth: 2, or 1 where one call's pushes fill a DMA channel's
     // task queue past half, e.g. layout Q''s 4 W tasks a call: a second call's would overflow it)
     int depth = 2;
@@ -520,9 +523,16 @@ class LoomNpu {
     std::vector<const std::vector<std::uint8_t>*> seq{&c.gate};
     const bool pre = k.streamed && !c.lead_pre.empty();
     if (pre) seq.insert(seq.begin(), &c.lead_pre);
+    // (diag) NPU_RUN_PANEL=<k>: the image's GN_QPANEL (the flag binding then holds the job's final ready value)
+    const int panel = std::getenv("NPU_RUN_PANEL") ? std::atoi(std::getenv("NPU_RUN_PANEL")) : 0;
+    const std::vector<std::uint8_t> go = panel > 0 ? GoPart(c.gate) : std::vector<std::uint8_t>{};
     if (!k.streamed) {
-      for (int i = 0; i < calls; ++i) seq.push_back(&c.call);
+      for (int i = 0; i < calls; ++i) {
+        if (panel > 0 && i > 0 && i % panel == 0) seq.push_back(&go);
+        seq.push_back(&c.call);
+      }
     } else {
+      if (panel > 0) throw LoomError("npu: RunGatedOnce: NPU_RUN_PANEL needs a plain image");
       int queued = 0;
       if (EarlyPush() && k.early && !c.push_pre[1].empty()) {   // (early push)
         seq.push_back(pre ? &cl(0).lead_post : &cl(0).lead);
@@ -1797,6 +1807,41 @@ class LoomNpu {
   // find the stream empty. The pending ask is the record after the tick task's last (the queue runs in order), so the
   // sync also waits for the waiter to send it.
   static constexpr std::uint32_t kAskDropBd = 14, kAskDropOps = 10;
+  // (Kernel::panel) a later panel's go: the gate's go task alone (the shim S2MM task of no repeat: its BD, channel
+  // control, queue write and the token sync on its column), with its own header.
+  static std::vector<std::uint8_t> GoPart(const std::vector<std::uint8_t>& gate) {
+    struct Op {
+      std::size_t at, len;
+      std::uint8_t type;
+      std::uint32_t addr, v;
+    };
+    std::vector<Op> ops;
+    std::uint32_t col = ~0u, found = 0;
+    for (std::size_t q = 16; q + 16 <= gate.size();) {
+      std::uint32_t len = gate[q] == 0 ? 24 : gate[q] == 3 ? 28 : 0, a = 0, v = 0;
+      if (gate[q] == 1) std::memcpy(&len, &gate[q + 12], 4);
+      else if (len == 0) std::memcpy(&len, &gate[q + 4], 4);
+      if (len < 16 || q + len > gate.size()) throw LoomError("npu: GoPart: unexpected gate op");
+      std::memcpy(&a, &gate[q + 8], 4);
+      if (gate[q] == 0) std::memcpy(&v, &gate[q + 16], 4);
+      const std::uint32_t off = a & 0xFFFFF;
+      if (gate[q] == 0 && (a >> 20 & 31) == 0 && (off == 0x1D204 || off == 0x1D20C) && (v >> 16 & 255) == 0 &&
+          (v >> 31))
+        col = a >> 25, ++found;
+      ops.push_back({q, len, gate[q], a, v});
+      q += len;
+    }
+    if (found != 1) throw LoomError("npu: GoPart: no single go task in the gate");
+    std::vector<std::uint8_t> o(gate.begin(), gate.begin() + 16);
+    std::uint32_t n = 0;
+    for (const Op& op : ops)
+      if (op.type >= 128 ? op.addr >> 16 == col : (op.addr >> 25 == col && (op.addr >> 20 & 31) == 0))
+        o.insert(o.end(), gate.begin() + op.at, gate.begin() + op.at + op.len), ++n;
+    if (n != 4) throw LoomError("npu: GoPart: the go task is not BD, control, queue and sync");
+    const std::uint32_t size = static_cast<std::uint32_t>(o.size());
+    std::memcpy(&o[8], &n, 4), std::memcpy(&o[12], &size, 4);
+    return o;
+  }
   static std::vector<std::uint8_t> AskDrop(const std::vector<std::uint8_t>& gate) {
     std::map<std::uint32_t, std::uint32_t> w;   // every word the gate writes (address -> value)
     for (std::size_t q = 16; q + 16 <= gate.size();) {
@@ -1962,8 +2007,12 @@ class LoomNpu {
       if (ProfMid() && prof_) append_ops(prof_->Read(), 1);
       append(calls[0]->gate);
       if (prof_) append_ops(prof_->Setup(calls[0]->k->path), prof_->SetupOps());
+      const int panel = calls[0]->k->panel;   // (a later panel's first call after its go)
       if (!calls[0]->k->streamed) {
-        for (const Call* c : calls) append(c->call);
+        for (std::size_t i = 0; i < calls.size(); ++i) {
+          if (panel > 0 && i > 0 && i % panel == 0) append(GoPart(calls[i]->gate));
+          append(calls[i]->call);
+        }
         append(calls.back()->done);
         remember(calls);
         if (prof_) append_ops(prof_->Read(), 1);
@@ -1972,6 +2021,7 @@ class LoomNpu {
       const Call* pend = nullptr;   // (early push) the call whose wait waits for the next call's push_pre
       for (std::size_t i = 0; i < calls.size(); ++i) {
         const Call& c = *calls[i];
+        if (panel > 0 && i > 0 && i % panel == 0) append(GoPart(c.gate));
         if (c.k->swap && c.k->dec != dec) {
           if (pend) append(pend->wait), pend = nullptr;
           for (; queued > 0; --queued) append(calls[i - 1]->wait);
@@ -2554,9 +2604,11 @@ class LoomNpuSplit : public NpuSplit {
                                      {&flags_, slot + kSignal, 2 * plan_.gate_record}};
     const std::uint32_t id = BindViews(image, image, kSwapDec, "ffnswap", std::move(views));
     instances_[image]->ask_early = true;   // (gen_npu_gemm: its tail's gate waits at the top of the core function)
+    instances_[image]->panel = static_cast<int>(plan_.panel);
     return ids_[key] = id;
   }
-  static constexpr int kSwapDec = 98;   // (BindSwap's family id: no decoder; the decoders' are below 98)
+  static constexpr int kSwapDec = 98;
+  static constexpr std::uint32_t kPanelStep = 16;   // (gen_npu_gemm GATE_QSTEP)   // (BindSwap's family id: no decoder; the decoders' are below 98)
   void ShareWeights(const void* key, std::size_t bytes, const LoomBuffer& buffer) override {
     const auto b = reinterpret_cast<std::uintptr_t>(key);
     raw_.push_back({b, b + bytes, &npu_.ImportGpu(buffer)});
@@ -2695,6 +2747,10 @@ class LoomNpuSplit : public NpuSplit {
       if (fam != job_family_) job_family_ = fam, seq_ = 0;
     }
     j.gate = ++seq_ * plan_.gate_calls + static_cast<std::uint32_t>(calls.size());
+    if (calls_.at(calls.front()).k->panel > 0) {   // (Kernel::panel: calls in the low 4 bits, panel q at + 16 q)
+      if (calls.size() >= kPanelStep) throw LoomError("npu: a panel job of 16 calls or more");
+      j.gate += 3 * kPanelStep;
+    }
     return j;
   }
   // An NPU attention command (the peer context's, LoomNpu::SetPeer) forces the next command's image setup, which

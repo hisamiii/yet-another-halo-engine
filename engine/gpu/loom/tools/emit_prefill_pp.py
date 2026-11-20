@@ -958,6 +958,9 @@ RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "128"))
 RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
                  GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0",   # (no fill at fuse 0)
                  GN_QSWPAIR=os.environ.get("GN_QSWPAIR", "1"))   # 8 A streams (gen_npu_q; 11-20: -53.8 ms pp2048)
+# YAH_NPU_PANEL=1 (with RSWAP_EMIT): the swap image opens a job panel by panel (gen_npu_gemm GN_QPANEL: its calls a
+# 512-token panel, F / 32 / RSWAP_NB), dispatch.txt "npupanel <k>"; the GPU may then open each panel on its own
+PANEL = os.environ.get("YAH_NPU_PANEL") == "1"
 RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP_REPLAY_GROUP"}
 
 
@@ -1655,6 +1658,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                            rawdma=0, gord="P4", qsw=True, dgu=0, swcol=32, hpass=qcallss, hord="P4"),
                                  "npu_ffnswap_iq4xs", 4))
                     QJOB_ENV["npu_ffnswap_iq4xs"] = dict(RSWAP_ENV)
+                    if PANEL:
+                        QJOB_ENV["npu_ffnswap_iq4xs"]["GN_QPANEL"] = str(FS // 32 // RSWAP_NB)
                 continue
             jobs.append((npu_cfg(B, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk,
                                  swcol=32, hpass=FS // 1024, hord=hord, fmt=gu_fmt(fmt), dfr=int(dfr)),
@@ -1877,6 +1882,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         E.emit(src, ["nop=0"], "npu_swpanel.hal", outdir)
         out.append(("npu_swpanel.hal", B // 8 * 640, GE.WG, GE.layout_bytes("wgt", B, RSWAP_KS, RSWAP_PASSES)))
         out.append(("npurswap", FS, 0, 0))
+        if PANEL:
+            out.append(("npupanel", FS // 32 // RSWAP_NB, 0, 0))
         with GN.np_override(4):
             out.append(("npubytes_ffnswap",) + tuple(GN.stream_bytes(swj[0])))
     if NPU_Q:

@@ -618,6 +618,23 @@ GP0, GPR, GRAMP, GPS, GFAST, GB = 5000, 200, 512, 16000, 896, int(os.environ.get
 # sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
 # binding. GATE_FAILED in done: the head gave up (the host sets it too for a failed command; gen_npu_unpack.gen_flag_wait).
 GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
+# GN_QPANEL=<k> (a token-panel outer job, k calls a panel: the swap image): the job opens panel by panel. A job of c calls
+# (c < GATE_QSTEP) ends its ready word at sequence * GATE_CALLS + c + 3 GATE_QSTEP (the host's gate value); the GPU may
+# store sequence * GATE_CALLS + c + q GATE_QSTEP after panel q first. The waiter opens the job at panel 0's value and
+# polls again for panel q GN_QPANEL_LEAD firings before the panel's first call; the relay sends a go for each (the host
+# pushes the panel's first call after it: LoomNpu FusedCommand, Kernel::panel) and done (the final value) at the job's
+# last firing. The polls share the job's supply: the waiter drains none of it before its last panel's poll.
+GATE_QSTEP = 16
+
+
+def qpanel():
+    k = int(os.environ.get("GN_QPANEL", "0"))
+    assert k in (0, 1, 2, 4, 8), "GN_QPANEL: 1, 2, 4 or 8 calls a panel"
+    return k
+
+
+def qpanel_lead():
+    return int(os.environ.get("GN_QPANEL_LEAD", "2"))
 
 
 def decoder(fmt, gord="P4", g8=True):
@@ -3740,8 +3757,11 @@ def gate_first(e, cfg, gate, gn):
     S, FPC = cfg.gate, (cfg.nb // QF.get("rows", 1) if qpass_on() else cfg.nb * cfg.passes)
     nbr = gate_ports(cfg)[gate]["nbr"]
     compact = gate == "waiter" and cfg.ghelp   # (the helper's waiter: firings left at word 0, less program)
+    P, gn0 = qpanel(), gn
+    assert not P or not (compact or pshare() or notick()), "GN_QPANEL: not with ghelp, GN_QPSHARE, GN_QNOTICK"
+    assert not P or P * FPC > qpanel_lead() >= 1, "GN_QPANEL_LEAD: 1 .. a panel's firings - 1"
     e(f"  %gfs = lda %gsp0, {0 if compact else 4}")
-    e("  low.cond_br %gfs, ^gfgo, ^gfw : reg<aie2p.er>")
+    e(f"  low.cond_br %gfs, {'^gfin' if P else '^gfgo'}, ^gfw : reg<aie2p.er>")
     e("^gfw:")
     e("  %gf1 = mova.i32 1")
     e("  %gfm1 = mova.i32 -1")
@@ -3763,7 +3783,14 @@ def gate_first(e, cfg, gate, gn):
         e(f"  %gfpol = lda {gn}, 8")
         e(f"  %gfnc = lda {gn}, 12")
         e(f"  rel %gf1, {nbr}")
-        if not notick():
+        if P:   # go now, done at the job's last firing (gate_count)
+            e("  %gs0 = mova.i32 0")
+            gate_record(e, ("%gfexp", "%gfsts", "%gfpol", "%gs0"), "%gsid0")
+            e("  st %gfexp, %gsp0, 20")
+            e("  st %gfsts, %gsp0, 24")
+            e("  st %gfpol, %gsp0, 28")
+            panel_arm(e, "%gfnc", FPC, 8)   # (relay state: 0, 4 firings; 8, 12 panel; 20-28 done)
+        elif not notick():
             gate_signal(e, "%gfexp", "%gfsts", "%gfpol", "%gf1")
         if pshare():   # (done at the job's last firing: gate_count)
             e("  st %gfexp, %gsp0, 20")
@@ -3774,6 +3801,8 @@ def gate_first(e, cfg, gate, gn):
         e("  %gfNn = mul %gfnc1, %gffpc")
         e("  st %gfNn, %gsp0, 4")
         e("  low.br ^gfgo")
+        if P:
+            panel_relay(e, gn0, nbr, FPC)
         e("^gfgo:")
         return
     # the waiter: ready >= the last job's + GATE_CALLS; poll, then spin the pace (gate_pace)
@@ -3811,8 +3840,18 @@ def gate_first(e, cfg, gate, gn):
     e("^gfhand:")   # opened: [ready, 1, polls, calls]; gave up after S polls: [expected, 2, S, 0] (the job: one call)
     e("  %gfls27 = copy %gflate : reg<aie2p.er> -> reg<aie2p.mr27_select>")
     e("  %gfhs = add %gflate, 1")
-    e("  %gfhv = sel.nez %gfexp, %gfrdy, %gfls27")
-    e("  %gfhc = sub %gfhv, %gfexp")
+    e(f"  %gfhv{'0' if P else ''} = sel.nez %gfexp, %gfrdy, %gfls27")
+    if P:   # calls in the low bits (the GPU's panel stores add GATE_QSTEP q); opened: hand on the final value
+        e("  %gfhr = sub %gfhv0, %gfexp")
+        e(f"  %gfqm = mova.i32 {GATE_QSTEP - 1}")
+        e("  %gfhc = and %gfhr, %gfqm")
+        e("  %gfop = sub %gf1, %gflate")
+        e(f"  %gfq3 = mova.i32 {3 * GATE_QSTEP}")
+        e("  %gfh48 = mul %gfop, %gfq3")
+        e("  %gfhd = add.rr %gfexp, %gfhc")
+        e("  %gfhv = add.rr %gfhd, %gfh48")
+    else:
+        e("  %gfhc = sub %gfhv, %gfexp")
     e(f"  acq %gfm1, {nbr}")
     e(f"  st %gfhv, {gn}, 0")
     e(f"  st %gfhs, {gn}, 4")
@@ -3829,8 +3868,139 @@ def gate_first(e, cfg, gate, gn):
     e(f"  st %gfNn, %gsp0, {0 if compact else 4}")
     e("  st %gfLn, %gsp0, 8")
     e(f"  st {'%gfexp' if compact else '%gfnext'}, %gsp0, 16")
+    if P:
+        panel_arm(e, "%gfhc", FPC, 20)
+        e("  st %gf0, %gsp0, 28")
     e("  low.br ^gfgo")
+    if P:
+        panel_waiter(e, FPC, gn, nbr)
     e("^gfgo:")
+
+
+def panel_arm(e, calls, FPC, at):
+    """(GN_QPANEL) job state at byte at: [firings to the next panel poll, panel polls left] (a job of calls calls:
+    ceil(calls / k) panels)."""
+    P, lead = qpanel(), qpanel_lead()
+    e(f"  %pa{at}g = {imm32(P * FPC - lead)} {P * FPC - lead}")
+    e(f"  st %pa{at}g, %gsp0, {at}")
+    e(f"  %pa{at}1 = mova.i32 1")   # (calls - 1, 0 for a gave-up job's 0) / k: the host's go before calls k, 2k, ..
+    e(f"  %pa{at}z = lt {calls}, %pa{at}1")
+    e(f"  %pa{at}c0 = add.rr {calls}, %pa{at}z")
+    e(f"  %pa{at}c = add %pa{at}c0, -1")
+    e(f"  %pa{at}k = mov.i32 {-(P.bit_length() - 1)}")
+    e(f"  %pa{at}m = lshl %pa{at}c, %pa{at}k")
+    e(f"  st %pa{at}m, %gsp0, {at + 4}")
+
+
+def panel_due(e, at, mid):
+    """(GN_QPANEL) ^gfin: an in-job firing; a panel poll is due (to mid) when its countdown reaches zero with polls left."""
+    e("^gfin:")
+    e(f"  %pdg = lda %gsp0, {at}")
+    e("  %pdg1 = add %pdg, -1")
+    e(f"  st %pdg1, %gsp0, {at}")
+    e("  low.cond_br %pdg1, ^gfgo, ^pdm : reg<aie2p.er>")
+    e("^pdm:")
+    e(f"  %pdm = lda %gsp0, {at + 4}")
+    e(f"  low.cond_br %pdm, {mid}, ^gfgo : reg<aie2p.er>")
+
+
+def panel_rearm(e, FPC, at):
+    """(GN_QPANEL) a panel poll done: the next one a panel later, one poll fewer left."""
+    e(f"  %prg = {imm32(qpanel() * FPC)} {qpanel() * FPC}")
+    e(f"  st %prg, %gsp0, {at}")
+    e(f"  %prm = lda %gsp0, {at + 4}")
+    e("  %prm1 = add %prm, -1")
+    e(f"  st %prm1, %gsp0, {at + 4}")
+
+
+def panel_waiter(e, FPC, gn, nbr):
+    """(GN_QPANEL) the waiter's panel poll: ready >= the job's base + GATE_QSTEP q for panel q, from the job's leftover
+    supply (none left, or used up: gave up, status 2); [ready, status, polls, 0] to the relay."""
+    panel_due(e, 20, "^pwm")
+    e("^pwm:")
+    panel_rearm(e, FPC, 20)
+    e("  %pw1 = mova.i32 1")
+    e("  %pwm1 = mova.i32 -1")
+    e("  %pw0 = mova.i32 0")
+    e("  %pwq = lda %gsp0, 28")
+    e("  %pwq1 = add %pwq, 1")
+    e("  st %pwq1, %gsp0, 28")
+    e(f"  %pw64 = mova.i32 {GATE_CALLS}")
+    e("  %pwseq = lda %gsp0, 16")   # (the job's sequence + 1)
+    e("  %pwb = mul %pwseq, %pw64")
+    e(f"  %pwqs = mova.i32 {GATE_QSTEP}")
+    e("  %pwqo = mul %pwq1, %pwqs")
+    e("  %pwexp = add.rr %pwb, %pwqo")
+    e("  %pwL = lda %gsp0, 8")
+    e("  %pwLm = add %pwL, -1")
+    e("  low.cond_br %pwL, ^pwp0, ^pwno : reg<aie2p.er>")
+    e("^pwno:")   # no supply left: gave up
+    e("  %pwtw = mova.i32 2")
+    e("  low.br ^pwh(%pwexp: reg<aie2p.er>, %pwtw: reg<aie2p.er>, %pw0: reg<aie2p.er>)")
+    e("^pwp0:")
+    e("  low.br ^pwp(%pw0: reg<aie2p.er>, %pw0: reg<aie2p.er>)")
+    e("^pwp(%pwpn: reg<aie2p.er>, %pwpw: reg<aie2p.er>):")
+    e("  low.cond_br %pwpw, ^pwspin, ^pwask : reg<aie2p.er>")
+    e("^pwspin:")
+    e("  %pwpw1 = add %pwpw, -1")
+    e("  low.br ^pwp(%pwpn: reg<aie2p.er>, %pwpw1: reg<aie2p.er>)")
+    e("^pwask:")
+    gate_tick(e, "%pw0", "p")
+    e("  %pwrdy = mov.ss")
+    e("  %pwy1 = mov.ss")
+    e("  %pwy2 = mov.ss")
+    e("  %pwy3 = mov.ss")
+    e("  %pwpn1 = add %pwpn, 1")
+    e("  %pwlate = lt %pwrdy, %pwexp")
+    e("  %pwquit = lt %pwLm, %pwpn1")   # (pn + 1 >= L)
+    e("  %pwwait = lt %pwquit, %pwlate")
+    gate_pace(e, "%pwv", "%pwpn1", "%pwpace")
+    e("  low.cond_br %pwwait, ^pwpgo, ^pwopen : reg<aie2p.er>")
+    e("^pwpgo:")
+    e("  low.br ^pwp(%pwpn1: reg<aie2p.er>, %pwpace: reg<aie2p.er>)")
+    e("^pwopen:")
+    e("  %pwhs = add %pwlate, 1")
+    e("  %pwL2 = sub %pwL, %pwpn1")
+    e("  st %pwL2, %gsp0, 8")
+    e("  low.br ^pwh(%pwrdy: reg<aie2p.er>, %pwhs: reg<aie2p.er>, %pwpn1: reg<aie2p.er>)")
+    e("^pwh(%pwhv: reg<aie2p.er>, %pwhst: reg<aie2p.er>, %pwhp: reg<aie2p.er>):")
+    e(f"  acq %pwm1, {nbr}")
+    e(f"  st %pwhv, {gn}, 0")
+    e(f"  st %pwhst, {gn}, 4")
+    e(f"  st %pwhp, {gn}, 8")
+    e(f"  st %pw0, {gn}, 12")
+    e(f"  rel %pw1, {nbr}")
+    e("  low.br ^gfgo")
+
+
+def panel_relay(e, gn, nbr, FPC):
+    """(GN_QPANEL) the relay's panel go: the waiter's record as a go; a gave-up status (2) kept for done."""
+    panel_due(e, 8, "^prl")
+    e("^prl:")
+    panel_rearm(e, FPC, 8)
+    e("  %pr1 = mova.i32 1")
+    e("  %prm1x = mova.i32 -1")
+    e("  %pr0 = mova.i32 0")
+    e(f"  acq %prm1x, {nbr}")
+    if qlock_on():   # (as the job's gate: the record's loads after a first load's result)
+        e(f"  %prk = lda {gn}, 12")
+        e("  %prk0 = mul %prk, %pr0")
+        e("  %prkm = mov.modifier %prk0")
+        e(f"  %prgn = padda.modifier {gn}, %prkm")
+        gn = "%prgn"
+    e(f"  %prv = lda {gn}, 0")
+    e(f"  %prs = lda {gn}, 4")
+    e(f"  %prp = lda {gn}, 8")
+    e(f"  rel %pr1, {nbr}")
+    gate_record(e, ("%prv", "%prs", "%prp", "%pr0"), "%prid")
+    e("  %pros = lda %gsp0, 24")
+    e("  %prbad = lt %pr1, %prs")   # (gave up: 2 from now on)
+    e("  %pr2 = mova.i32 2")
+    e("  %prd = sub %pr2, %pros")
+    e("  %prbd = mul %prbad, %prd")
+    e("  %prst = add.rr %pros, %prbd")
+    e("  st %prst, %gsp0, 24")
+    e("  low.br ^gfgo")
 
 
 QCSTAGE_AT = (25088, 27648, 30208, 49152)   # (GN_QCSTAGE) the relay row's staging slots (free core memory)
@@ -3990,7 +4160,7 @@ def gate_count(e, cfg, gate):
         e("  %gNn = mul %gN, %gcont")
         e("  st %gFn, %gsp, 0")
         e("  st %gNn, %gsp, 4")
-        if pshare():   # the job's last firing: its done
+        if pshare() or qpanel():   # the job's last firing: its done
             e("  low.cond_br %gcont, ^grx, ^grd : reg<aie2p.er>")
             e("^grd:")
             gate_done_late(e)
@@ -4069,7 +4239,13 @@ def gate_count(e, cfg, gate):
     e("  %glsn = sub %g1, %gls")
     e("  %gb1 = mul %gL, %gls")
     e("  %gb2 = mul %ggb, %glsn")
-    e("  %gbt = add.rr %gb1, %gb2")
+    if qpanel():   # (no drain while a panel poll is left)
+        e("  %gbt0 = add.rr %gb1, %gb2")
+        e("  %gqM = lda %gsp, 24")
+        e("  %gqz = lt %gqM, %g1")
+        e("  %gbt = mul %gbt0, %gqz")
+    else:
+        e("  %gbt = add.rr %gb1, %gb2")
     e("  low.br ^gt(%g0: reg<aie2p.er>)")
     e("^gt(%gti: reg<aie2p.er>):")
     e("  %gtm = lt %gti, %gbt")
