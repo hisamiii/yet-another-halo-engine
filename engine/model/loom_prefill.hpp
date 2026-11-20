@@ -1197,6 +1197,14 @@ class LoomPrefill {
   // one after a layer that could not carry it, decode with npu_swdec_<fmt>_g / _u
   // (gen_r5kq payloads: "<split>.af.to.r5_<gate>_<up>.npu.hal" decodes a next layer of other formats; their grid
   // tables bind between the raw weights and the stream, gate's first, each format once)
+  // (row 5 swap) the FFN norm writes the token panel: the set has its "_pn" forms; YAH_NPU_RSWAP_PANEL=0: off
+  bool PanelNorm() const {
+    static const bool off = [] { const char* e = std::getenv("YAH_NPU_RSWAP_PANEL"); return e && std::strcmp(e, "0") == 0; }();
+    if (off || !RSwapOn()) return false;
+    const std::string oh = OnormHal();
+    return ::access((dir_ + "/norm_t_bfp_g1_pn.hal").c_str(), R_OK) == 0 &&
+           (!geom_.count(oh) || geom_.count(oh.substr(0, oh.size() - 4) + "_pn.hal"));
+  }
   bool R5Fuse() const {
     if (!RSwapOn()) return false;
     static const std::string sfx = ".af.to.r5.npu.hal";
@@ -1384,7 +1392,13 @@ class LoomPrefill {
     const bool dfr = mix ? geom_.count("npuffndfr_" + std::string(f.name) + "_" + fu.name) != 0
                          : !pair && geom_.count("npuffndfr_" + std::string(f.name));
     if (dfr && ::access((dir_ + "/norm_t_bfp_g1s.hal").c_str(), R_OK)) return false;
-    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk");
+    // (row 5 swap) this layer swaps (rswap below, checked equal); panel: its FFN norm writes the swap's token panel
+    // into W ("<norm>_pn.hal", gen_half_norm PANEL) and the swap skips npu_swpanel.hal
+    const bool rsw0 = RSwapOn() && (!pair || mix) && (pair || !geom_.count("npuffnsw5")) && geom_.count("npuffnq") &&
+                      !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) && hord == "_p4" && apass == 0 &&
+                      geom_.at("npurswap").tokens == F && B_ % 512 == 0 && parts[0].p % 4 == 0;
+    const bool panel = rsw0 && !dfr && PanelNorm();
+    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk", false, panel);
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
     // (a mixed pair of one format, emit_prefill_pp NPU_SAME_SW: up follows gate in the GGUF, like a single format's)
@@ -1484,6 +1498,7 @@ class LoomPrefill {
     // (a single format's layer or a mixed pair's: the image reads bfp16 only, the GPU decodes each tensor's format)
     const bool rswap = RSwapOn() && (!pair || mix) && !np5 && qffn && !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) &&
                        hord == "_p4" && apass == 0 && geom_.at("npurswap").tokens == F && B_ % 512 == 0 && qc % 4 == 0;
+    if (rswap != rsw0) throw LoomError("prefill: " + pre + " swap decided differently before the norm");
     for (std::uint32_t j = 0; j < F / 256 && cpair && !rswap; ++j)
       csw.push_back(npu_->BindRawPair(sw + ".xdna", sw + ".xdna", 100 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
                                       cg.p + (f0 + 256 * j) * cg.rb, col_bytes(cg, tg, f),
@@ -1552,8 +1567,9 @@ class LoomPrefill {
                  gd.rowgrp, 1, 1, db, std::uint64_t{1} << (db.size() - 1));
       }
       const Geom& gp = geom_.at("npu_swpanel.hal");
-      Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1, gp.rowgrp,
-               1, 1, {Ref(*normt_), {npu_->W().handle, 0, gp.tt}}, 2);
+      if (!panel)
+        Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1,
+                 gp.rowgrp, 1, 1, {Ref(*normt_), {npu_->W().handle, 0, gp.tt}}, 2);
       // (diag) YAH_NPU_RSWAP_BOUTER=1: calls b-outer, t-inner (a weight block's token panels back to back: its reads
       // after the first can hit the MALL; the panel changes every call); the default t-outer keeps a panel 8 / bpc calls
       static const bool bouter = std::getenv("YAH_NPU_RSWAP_BOUTER") != nullptr;
@@ -1802,20 +1818,29 @@ class LoomPrefill {
   // K = 5120 site reads this norm's output; with "npunormbfp" in the set the norm also writes its BFP16 input into A ("<norm>_bfp.hal") and
   // NpuEncode(npu_site) skips the encoder; pk: also the Q4_K-order stream into A's second half ("<norm>_bfp_pk.hal",
   // with "npunormbfppk" in the set; NpuEncode pk then skips its encoder too).
-  void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow, const char* npu_site = nullptr, bool pk = false) {
+  // panel (ffnblk only): the "_pn.hal" form, its BFP16 output the swap's token panel in W (npu_swpanel.hal's bytes)
+  void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow, const char* npu_site = nullptr, bool pk = false,
+               bool panel = false) {
     // A row takes `split` waves (dispatch.txt norm_split, else 1); a workgroup of w waves takes w / split rows.
     // npu_site "ffnblk": the FFN block's one-replay-group stream (RunFfnBlock, fragment-major output only); "ffnblk_s":
     // in the deferred-epilogue images' K split
     const bool g1s = npu_site && std::strcmp(npu_site, "ffnblk_s") == 0;
     const bool g1 = g1s || (npu_site && std::strcmp(npu_site, "ffnblk") == 0);
+    if (panel && (!g1 || g1s || mode != NormOut::kTiled)) throw LoomError("prefill: a panel norm off the FFN block");
+    // (the NPU input binding, built only where a norm writes one: npu_ is null on GPU-only norms)
+    const auto ab = [&] {
+      return panel ? hrx_buffer_ref_t{npu_->W().handle, 0, geom_.at("npu_swpanel.hal").tt}
+                   : hrx_buffer_ref_t{npu_->A().handle, 0, NpuK(5120).a};
+    };
+    const std::string pn = panel ? "_pn" : "";
     if (out_pending_.length && g1 && !g1s && mode == NormOut::kTiled && geom_.count(OnormHal())) {
       // the out site's sum fused with this norm (gen_half_norm.gen_osum): c, resid, rem, then the norm's bindings with
       // x = hidden2 (the GPU's rows read, the NPU's written by the sum)
-      const LoomExecutable& exe = Exe(OnormHal());
+      const std::string oh = OnormHal();
+      const LoomExecutable& exe = Exe(oh.substr(0, oh.size() - 4) + pn + ".hal");
       Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1,
                {CView(std::exchange(out_pending_, {})), Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * out_nn_ * 4},
-                Ref(*hidden2_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_), Ref(*normt_),
-                {npu_->A().handle, 0, NpuK(5120).a}},
+                Ref(*hidden2_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_), Ref(*normt_), ab()},
                (1u << 3) | (1u << 7) | (1u << 8));
       std::swap(hidden_, hidden2_);
       norm_bfp_.clear(), norm_pk_.clear();
@@ -1827,7 +1852,7 @@ class LoomPrefill {
     const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
     const bool wpk = bfp && !g1 && pk && geom_.count("npunormbfppk");
     norm_pk_ = wpk ? npu_site : "";
-    const LoomExecutable& exe = Exe(g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1.hal"
+    const LoomExecutable& exe = Exe(g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1" + pn + ".hal"
                                     : hal + (wpk ? "_bfp_pk.hal" : bfp ? "_bfp.hal" : ".hal"));
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const auto ns = geom_.find("norm_split");
@@ -1841,7 +1866,7 @@ class LoomPrefill {
                                             Ref(*scratch_), Ref(*normt_)}
             : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_),
                                             Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)};
-    if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
+    if (bfp) b.push_back(ab());
     if (wpk) b.push_back({npu_->A().handle, PkA(), NpuK(5120).a});
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
   }

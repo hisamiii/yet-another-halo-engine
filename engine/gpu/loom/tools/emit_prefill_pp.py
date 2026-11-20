@@ -1261,6 +1261,18 @@ def npu_split(rows, combos, B, outdir):
             E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                          "yah_half_norm.fused=0"], oname, outdir)
             out.append((oname, B // 4, 32 * 4 * ONORM_SPLIT, 0))   # 4 rows a workgroup
+            if RSWAP_EMIT:   # (row 5 swap) its PANEL form: the swap's token panel instead of the act stream
+                pname = "npu_onorm%s_pn.hal" % sfx
+                GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL = (NPU_PASSES,), "p4", (RSWAP_KS, RSWAP_PASSES)
+                try:
+                    text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES))
+                finally:
+                    GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL = groups, perm, None
+                src = os.path.join(tmp, pname[:-4] + ".loom")
+                open(src, "w").write(text)
+                E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                             "yah_half_norm.fused=0"], pname, outdir)
+                out.append((pname, B // 4, 32 * 4 * ONORM_SPLIT, 0))
         if site == "qkv":
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads
@@ -1733,14 +1745,17 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     import gen_half_norm
     groups, perm = GE.GROUPS, GE.ACT_PERM
     dfrs = sorted({j[0].fmt for j in jobs if j[0].dfr})
-    for name, ks in (("norm_t_bfp_g1", NPU_KS),) + ((("norm_t_bfp_g1s", NPU_DFR_KS),) if dfrs else ()):
+    # (RSWAP_EMIT: "norm_t_bfp_g1_pn": the PANEL form, the swap's token panel instead of the act stream)
+    for name, ks in (("norm_t_bfp_g1", NPU_KS),) + ((("norm_t_bfp_g1s", NPU_DFR_KS),) if dfrs else ()) + \
+            ((("norm_t_bfp_g1_pn", NPU_KS),) if RSWAP_EMIT else ()):
         GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
+        gen_half_norm.PANEL = (RSWAP_KS, RSWAP_PASSES) if name.endswith("_pn") else None
         try:
             src = os.path.join(tmp, name + ".loom")
             open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
                                                          bfp=(B, list(ks), NPU_PASSES)))
         finally:
-            GE.GROUPS, GE.ACT_PERM = groups, perm
+            GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL = groups, perm, None
         E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120",
                      "yah_half_norm.eps=1e-06", "yah_half_norm.fused=0"], name + ".hal", outdir)
     for fmt in NPU_DFR_FMTS:
