@@ -1915,11 +1915,24 @@ class LoomPrefill {
       // the out site's sum fused with this norm (gen_half_norm.gen_osum): c, resid, rem, then the norm's bindings with
       // x = hidden2 (the GPU's rows read, the NPU's written by the sum)
       const std::string oh = OnormHal();
-      const LoomExecutable& exe = Exe(oh.substr(0, oh.size() - 4) + pn + ".hal");
-      Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1,
-               {CView(std::exchange(out_pending_, {})), Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * out_nn_ * 4},
-                Ref(*hidden2_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_), Ref(*normt_), ab()},
-               (1u << 3) | (1u << 7) | (1u << 8));
+      const std::string stem = oh.substr(0, oh.size() - 4) + pn;
+      const std::vector<hrx_buffer_ref_t> ob = {
+          CView(std::exchange(out_pending_, {})), Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * out_nn_ * 4},
+          Ref(*hidden2_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_), Ref(*normt_), ab()};
+      // YAH_NPU_PANELQ=1 (chunked FFN norm, the swap's panel form): 4 token-quarter dispatches ("<pn>_q<q>.hal",
+      // emitted with YAH_EMIT_PANELQ=1), in order (they bind the same buffers), so quarter q's panel is done first
+      static const bool panelq = std::getenv("YAH_NPU_PANELQ") && !std::strcmp(std::getenv("YAH_NPU_PANELQ"), "1");
+      if (panel && panelq && geom_.count(stem + "_q0.hal")) {
+        for (int q = 0; q < 4; ++q) {
+          const LoomExecutable& qe = Exe(stem + "_q" + std::to_string(q) + ".hal");
+          Dispatch(qe, "yah_half_norm", B_ / 16, 1, 1, qe.WorkgroupSize(qe.OrdinalOrZero("yah_half_norm")), 1, 1, ob,
+                   (1u << 3) | (1u << 7) | (1u << 8));
+        }
+      } else {
+        const LoomExecutable& exe = Exe(stem + ".hal");
+        Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1, ob,
+                 (1u << 3) | (1u << 7) | (1u << 8));
+      }
       std::swap(hidden_, hidden2_);
       norm_bfp_.clear(), norm_pk_.clear();
       return;

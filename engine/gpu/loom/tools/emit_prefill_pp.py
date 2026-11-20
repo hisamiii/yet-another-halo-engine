@@ -1311,6 +1311,22 @@ def npu_split(rows, combos, B, outdir):
                 E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                              "yah_half_norm.fused=0"], pname, outdir)
                 out.append((pname, B // 4, 32 * 4 * ONORM_SPLIT, 0))
+                # YAH_EMIT_PANELQ=1 (chunked FFN norm): the same kernel per token quarter, "<pn>_q<q>.hal", workgroup 0 =
+                # the quarter's first (gen_half_norm.WG_BASE), dispatched with B / 16 workgroups (LoomPrefill YAH_NPU_PANELQ)
+                if os.environ.get("YAH_EMIT_PANELQ") == "1":
+                    for q in range(4):
+                        qname = "npu_onorm%s_pn_q%d.hal" % (sfx, q)
+                        GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL = (NPU_PASSES,), "p4", (RSWAP_KS, RSWAP_PASSES)
+                        gen_half_norm.WG_BASE = q * B // 16
+                        try:
+                            text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES))
+                        finally:
+                            GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL, gen_half_norm.WG_BASE = groups, perm, None, None
+                        src = os.path.join(tmp, qname[:-4] + ".loom")
+                        open(src, "w").write(text)
+                        E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                                     "yah_half_norm.fused=0"], qname, outdir)
+                        out.append((qname, B // 16, 32 * 4 * ONORM_SPLIT, 0))
         if site == "qkv":
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads

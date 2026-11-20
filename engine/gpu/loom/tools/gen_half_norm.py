@@ -17,6 +17,9 @@ import sys
 # (row 5 swap, WIP) PANEL = (ks, passes): the fused BFP16 output is the swap's token panel (gen_bfp16_encode "wgt",
 # p1k, no k-block permutation, tile 64: what npu_swpanel.hal encodes from the tiled f16 copy) instead of the act stream
 PANEL = None
+# (row 5 swap, chunked FFN norm) WG_BASE: a token-quarter variant of gen_split: its launch is a quarter of the
+# workgroups and workgroup 0 is WG_BASE (the quarter's first 4-row workgroup; LoomPrefill YAH_NPU_PANELQ). None: off
+WG_BASE = None
 
 
 def gen(dim=5120, wpr=1, tiled=False, resadd=False, keep=None, wlds=False):
@@ -204,7 +207,12 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
     e("  %rows = config.get @yah_half_norm.rows : index")
     e(f"  %cwpr = index.constant {wpr} : index")
     e(f"  %cwgs = index.constant {NTH} : index")
-    e("  %wgs = index.div %rows, %cwpr : index")
+    if WG_BASE is not None:
+        e("  %cq4 = index.constant 4 : index")
+        e("  %wgsr = index.div %rows, %cwpr : index")
+        e("  %wgs = index.div %wgsr, %cq4 : index")
+    else:
+        e("  %wgs = index.div %rows, %cwpr : index")
     e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%cwgs, %unit, %unit) : index")
     e("} launch(%x: buffer, %residual: buffer, %weight: buffer, %sum_out: buffer, %out: buffer"
       + (", %out_t: buffer" if both else "") + (", %ab: buffer" if bfp else "")
@@ -225,7 +233,12 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
     e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%total_elems]xf16>")
     if both:
         e("  %out_t_view = buffer.view %out_t_na[%base] : buffer -> view<[%total_elems]xf16>")
-    e("  %wg = kernel.workgroup.id<x> : index")
+    if WG_BASE is not None:
+        e("  %wg_id = kernel.workgroup.id<x> : index")
+        e(f"  %wg_base = index.constant {WG_BASE} : index")
+        e("  %wg = index.add %wg_id, %wg_base : index")
+    else:
+        e("  %wg = kernel.workgroup.id<x> : index")
     e("  %tid = kernel.workitem.id<x> : index")
     e("  %c32w = index.constant 32 : index")
     e(f"  %csplit = index.constant {split} : index")
