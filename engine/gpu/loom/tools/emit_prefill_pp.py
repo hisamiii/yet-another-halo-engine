@@ -1274,11 +1274,18 @@ def npu_split(rows, combos, B, outdir):
     # input (gen_postnorm_bfp): "postnorm[_t]_a_bfp.hal"
     if "out" in NPU_SPLIT and DNSPLIT and DNSPLIT[0] * 128 == NPU_KCALL:
         import gen_postnorm_bfp
-        for tiled, name in ((False, "postnorm_a_bfp.hal"), (True, "postnorm_t_a_bfp.hal")):
+        # ("_pk": the stream in Q4_K's k-block order, into A's second half, for a Q4_K ssm_out)
+        for tiled, name, perm in [(t, n + pk + ".hal", perm) for pk, perm in (("", "p4"), ("_pk", "pk"))
+                                  for t, n in ((False, "postnorm_a_bfp"), (True, "postnorm_t_a_bfp"))]:
             src = os.path.join(tmp, name[:-4] + ".loom")
-            open(src, "w").write(gen_postnorm_bfp.gen(B, 0, DNSPLIT[0], list(NPU_KS), NPU_PASSES, tiled, 384 in O16_MT))
+            GE.ACT_PERM = perm
+            try:
+                open(src, "w").write(gen_postnorm_bfp.gen(B, 0, DNSPLIT[0], list(NPU_KS), NPU_PASSES, tiled, 384 in O16_MT))
+            finally:
+                GE.ACT_PERM = "p4"
             E.emit(src, ["yah_ssm_postnorm_fp16.head_count=%d" % (DNSPLIT[0] * B)], name, outdir)
         out.append(("npupostnormbfp", 1, 0, 0))
+        out.append(("npupostnormbfppk", 1, 0, 0))
     # unpacks (the NP 4 formats' sites: TN 64, "_4")
     def unpacks(site, n, sfx, row=True):
         skind, mt, kb = NPU_SITES[site]

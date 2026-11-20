@@ -2921,10 +2921,14 @@ class LoomPrefill {
       // NpuEncode("out") skips the encoder (RunResidual splits only full chunks; an unused A costs nothing)
       const bool bfp = geom_.count("npupostnormbfp") && NpuRows("out", pre + "ssm_out.weight") && trim_row_ == kAllRows &&
                        tail_ == kAllRows;
-      norm_bfp_ = bfp ? "out" : "";
+      // (a Q4_K ssm_out reads the Q4_K-order stream: "_a_bfp_pk.hal" writes it into A's second half instead)
+      const bool pk = bfp && NpuPk(pre + "ssm_out.weight") && geom_.count("npupostnormbfppk");
+      norm_bfp_ = bfp && !pk ? "out" : "";
+      norm_pk_ = pk ? "out" : "";
       std::vector<hrx_buffer_ref_t> b{Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)};
-      if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
-      Dispatch(Exe(pn + (bfp ? "_a_bfp.hal" : "_a.hal")), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1, b);
+      if (bfp) b.push_back({npu_->A().handle, pk ? PkA() : 0, NpuK(5120).a});
+      Dispatch(Exe(pn + (pk ? "_a_bfp_pk.hal" : bfp ? "_a_bfp.hal" : "_a.hal")), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1,
+               1, 256, 1, 1, b);
       const auto part_b = [this, pn, gate, w = TRef(*Find(pre + "ssm_norm.weight"))] {
         Dispatch(Exe(pn + "_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1,
                  {Ref(*raw2_), w, gate, Ref(*scratch_)});
