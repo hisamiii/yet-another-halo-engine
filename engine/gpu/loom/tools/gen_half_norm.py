@@ -14,6 +14,10 @@ so the second pass reads mostly the weight (a loop form makes ~160 dependent rou
 import os
 import sys
 
+# (row 5 swap, WIP) PANEL = (ks, passes): the fused BFP16 output is the swap's token panel (gen_bfp16_encode "wgt",
+# p1k, no k-block permutation, tile 64: what npu_swpanel.hal encodes from the tiled f16 copy) instead of the act stream
+PANEL = None
+
 
 def gen(dim=5120, wpr=1, tiled=False, resadd=False, keep=None, wlds=False):
     """tiled: the output fragment-major for the afrag GEMMs (gen_gemm_tile Tile.atiled): 16 x 16 tiles (row / 16,
@@ -370,7 +374,10 @@ def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp):
     both = tiled == "both"
     assert wpr == 4, "4 rows per workgroup: half a fragment per k-block"
     nkb, nth = dim // 8, 32 * wpr * split
-    nab = GE.layout_bytes("act", tokens, ks, passes)
+    if PANEL:
+        assert not pk, "PANEL: one stream"
+        ks, passes = list(PANEL[0]), PANEL[1]
+    nab = GE.layout_bytes("wgt" if PANEL else "act", tokens, ks, passes)
     e(f"  %nab4 = index.constant {nab // 4} : index")
     e("  %abv = buffer.view %ab[%base] : buffer -> view<[%nab4]xi32>")
     if pk:
@@ -476,7 +483,11 @@ def bfp_copy_out(e, nkb, wpr, nth, tokens, ks, passes, abv, pre):
             e(f"{ind}%{q}{nm} = index.constant {v} : index")
         e(f"{ind}%{q}kb = index.div %{q}d, %c9 : index")
         e(f"{ind}%{q}w = index.rem %{q}d, %c9 : index")
-        frag = GE.emit_offset(e, "act", tokens, list(ks), passes, 64, True, "%bo_g8", f"%{q}kb", p=q, ind=ind)
+        if PANEL:
+            frag = GE.emit_offset(e, "wgt", tokens, list(ks), passes, 64, True, "%bo_g8", f"%{q}kb", p=q, ind=ind,
+                                  perm=False, p1k=True)
+        else:
+            frag = GE.emit_offset(e, "act", tokens, list(ks), passes, 64, True, "%bo_g8", f"%{q}kb", p=q, ind=ind)
         e(f"{ind}%{q}b0 = index.add {frag}, %bo_ho : index")
         e(f"{ind}%{q}b1 = index.mul %{q}w, %c4o : index")
         e(f"{ind}%{q}b2 = index.add %{q}b0, %{q}b1 : index")
